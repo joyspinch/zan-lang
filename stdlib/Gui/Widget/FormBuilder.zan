@@ -110,8 +110,8 @@ class FormBuilder {
         if (ft == 100) { return "Control"; }
         if (ft == 0 || ft == 2 || ft == 3) { return "Input"; }
         if (ft == 1 || ft == 14) { return "TextArea"; }
-        if (ft == 4) { return "Radio"; }
-        if (ft == 5) { return "Checkbox"; }
+        if (ft == 4) { return "RadioGroup"; }
+        if (ft == 5) { return "CheckboxGroup"; }
         if (ft == 6 || ft == 48) { return "SelectBox"; }
         if (ft == 7) { return "Switch"; }
         if (ft == 8) { return "Rate"; }
@@ -153,7 +153,7 @@ class FormBuilder {
     }
 
     static bool NeedsCaption(int ft) {
-        return ft == 0 || ft == 1 || ft == 2 || ft == 3 || ft == 4
+        return ft == 0 || ft == 1 || ft == 2 || ft == 3 || ft == 4 || ft == 5
             || ft == 6 || ft == 8 || ft == 9 || ft == 29 || ft == 14 || ft == 48;
     }
 
@@ -254,17 +254,21 @@ class FormBuilder {
         if (wt == "Input") { return new Input(o.Str("placeholder", "")); }
         if (wt == "TextArea") { return new TextArea(o.Str("placeholder", "")); }
         if (wt == "Button") { return new Button { Text = cap }; }
-        if (wt == "Checkbox") {
-            Checkbox cb = new Checkbox(cap);
-            if (o.Bool("defOn", false)) { cb.SetChecked(true); }
-            return cb;
+        if (wt == "CheckboxGroup") {
+            CheckboxGroup cg = new CheckboxGroup();
+            cg.SetOptionsText(FormBuilder.JoinOpts(o));
+            return cg;
         }
         if (wt == "Switch") {
             Switch sw = new Switch();
             if (o.Bool("defOn", false)) { sw.SetOn(true); }
             return sw;
         }
-        if (wt == "Radio") { return new Radio(new SignalInt(0), 0, cap); }
+        if (wt == "RadioGroup") {
+            RadioGroup rg = new RadioGroup();
+            rg.SetOptionsText(FormBuilder.JoinOpts(o));
+            return rg;
+        }
         if (wt == "Slider") { return new Slider(0, 100, new SignalInt(0)); }
         if (wt == "SelectBox") {
             SelectBox sb = SelectBox.FromOptions(new List<string>(), "");
@@ -516,6 +520,30 @@ class FormBuilder {
         }
         parent.Add(ctl);
     }
+
+    /// 从设计器的 FormField 构建单个叶子控件（不含标题标签——标题由
+    /// 设计器/表单布局单独绘制）。设计器预览用它渲染真控件，与运行时的
+    /// MakeControl 走同一条构造路径，从根上消除“所见非所得”。
+    static Control FromField(FormField f) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("label", JsonValue.NewStr(f.label));
+        o.Put("name", JsonValue.NewStr(f.fname));
+        o.Put("placeholder", JsonValue.NewStr(f.placeholder));
+        o.Put("custom", JsonValue.NewStr(f.customKind));
+        if (f.defOn) { o.Put("defOn", JsonValue.NewBool(true)); }
+        if (f.wrap) { o.Put("wrap", JsonValue.NewBool(true)); }
+        if (f.OptionCount() > 0) {
+            JsonValue arr = JsonValue.NewArray();
+            for (int i = 0; i < f.OptionCount(); i = i + 1) {
+                arr.Append(JsonValue.NewStr(f.OptionAt(i)));
+            }
+            o.Put("options", arr);
+        }
+        int ft = f.ftype;
+        Control ctl = FormBuilder.MakeControl(o, ft, FormBuilder.WidgetType(ft), false);
+        ctl.name = f.fname;
+        return ctl;
+    }
 }
 
 /// 24 列流式容器（设计器/运行时/FormBuilder 共用的唯一布局原语）。
@@ -673,4 +701,118 @@ class FbStack : Panel {
             }
         }
     }
+}
+
+/// 选项组基类：把若干真实选择控件（Radio/Checkbox）按水平流布局排列，
+/// 超出可用宽度自动换行。设计器预览与运行时窗口经 FormBuilder / formgen
+/// 共用同一实现，使多选项在两侧真实且一致地渲染。无表面。
+class ChoiceGroup : Panel {
+    int gapX;
+    int gapY;
+
+    void InitChoice() {
+        this.InitPanel("choicegroup", 3);
+        this.gapX = 16;
+        this.gapY = 4;
+    }
+
+    /// 供子类实现：为第 index 个选项构造单个选择控件。
+    virtual Control MakeItem(int index, string text) {
+        return null;
+    }
+
+    /// 按 "A|B|C" 追加选项（与 SelectBox.SetOptionsText 同一约定）。
+    void SetOptionsText(string text) {
+        string current = "";
+        for (int i = 0; i <= text.Length; i = i + 1) {
+            string ch = "";
+            if (i < text.Length) { ch = text.Substring(i, 1); }
+            if (ch == "|" || i == text.Length) {
+                if (current != "") {
+                    Control item = this.MakeItem(this.children.Count, current);
+                    if (item != null) { this.Add(item); }
+                }
+                current = "";
+            } else {
+                current = current + ch;
+            }
+        }
+    }
+
+    override void OnPaint(App app) {
+    }
+
+    override void OnMeasure(App app) {
+        int h = 0;
+        int w = 0;
+        for (int i = 0; i < this.children.Count; i = i + 1) {
+            int hh = this.children[i].prefH;
+            if (hh > h) { h = hh; }
+            if (i > 0) { w = w + this.gapX; }
+            w = w + this.children[i].prefW;
+        }
+        if (h == 0) { h = app.Scale(26); }
+        this.prefH = h;
+        this.prefW = w;
+    }
+
+    override void Arrange(int px, int py, int pw, int ph) {
+        if (pw < 0) { pw = 0; }
+        if (ph < 0) { ph = 0; }
+        this.bx = px;
+        this.by = py;
+        this.bw = pw;
+        this.bh = ph;
+        int cx = px;
+        int cy = py;
+        int rowH = 0;
+        for (int i = 0; i < this.children.Count; i = i + 1) {
+            Control c = this.children[i];
+            int cwid = c.prefW;
+            if (cwid < 1) { cwid = pw; }
+            int chh = c.prefH;
+            if (chh < 1) { chh = ph; }
+            if (cx > px && cx + cwid > px + pw) {
+                cx = px;
+                cy = cy + rowH + this.gapY;
+                rowH = 0;
+            }
+            c.Arrange(cx, cy, cwid, chh);
+            cx = cx + cwid + this.gapX;
+            if (chh > rowH) { rowH = chh; }
+        }
+    }
+}
+
+/// 单选按钮组：所有选项共享一个 SignalInt（选中索引），每个选项一个
+/// 真实 Radio。默认选中第 0 项。
+class RadioGroup : ChoiceGroup {
+    SignalInt model;
+
+    RadioGroup() {
+        this.InitChoice();
+        this.model = new SignalInt(0);
+    }
+
+    /// 选中索引信号（供代码后置双向绑定）。
+    SignalInt Selected() { return this.model; }
+
+    override Control MakeItem(int index, string text) {
+        return new Radio(this.model, index, text);
+    }
+
+    override string Kind() { return "RadioGroup"; }
+}
+
+/// 复选框组：每个选项一个独立的真实 Checkbox。
+class CheckboxGroup : ChoiceGroup {
+    CheckboxGroup() {
+        this.InitChoice();
+    }
+
+    override Control MakeItem(int index, string text) {
+        return new Checkbox(text);
+    }
+
+    override string Kind() { return "CheckboxGroup"; }
 }

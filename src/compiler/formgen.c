@@ -180,8 +180,8 @@ static const char *fg_widget_type(int ft) {
     if (ft == 100) return "Control";
     if (ft == 0 || ft == 2 || ft == 3) return "Input";
     if (ft == 1 || ft == 14) return "TextArea";
-    if (ft == 4) return "Radio";
-    if (ft == 5) return "Checkbox";
+    if (ft == 4) return "RadioGroup";
+    if (ft == 5) return "CheckboxGroup";
     if (ft == 6 || ft == 48) return "SelectBox";
     if (ft == 7) return "Switch";
     if (ft == 8) return "Rate";
@@ -224,7 +224,7 @@ static const char *fg_widget_type(int ft) {
 
 /* Whether a field needs a caption Label above it (mirrors FieldNeedsCaption). */
 static bool fg_needs_caption(int ft) {
-    return ft == 0 || ft == 1 || ft == 2 || ft == 3 || ft == 4
+    return ft == 0 || ft == 1 || ft == 2 || ft == 3 || ft == 4 || ft == 5
         || ft == 6 || ft == 8 || ft == 9 || ft == 29 || ft == 14 || ft == 48;
 }
 
@@ -377,16 +377,12 @@ static void fg_ctor(fg_buf_t *b, zan_json_value_t *o, int ft, const char *wt) {
         fg_putf(b, "new Button { Text = \"");
         fg_esc_cstr(b, cap);
         fg_putf(b, "\" }");
-    } else if (strcmp(wt, "Checkbox") == 0) {
-        fg_putf(b, "new Checkbox(\"");
-        fg_esc_cstr(b, cap);
-        fg_putf(b, "\")");
+    } else if (strcmp(wt, "CheckboxGroup") == 0) {
+        fg_putf(b, "new CheckboxGroup()");
     } else if (strcmp(wt, "Switch") == 0) {
         fg_putf(b, "new Switch()");
-    } else if (strcmp(wt, "Radio") == 0) {
-        fg_putf(b, "new Radio(new SignalInt(0), 0, \"");
-        fg_esc_cstr(b, cap);
-        fg_putf(b, "\")");
+    } else if (strcmp(wt, "RadioGroup") == 0) {
+        fg_putf(b, "new RadioGroup()");
     } else if (strcmp(wt, "Slider") == 0) {
         fg_putf(b, "new Slider(0, 100, new SignalInt(0))");
     } else if (strcmp(wt, "SelectBox") == 0) {
@@ -480,8 +476,14 @@ static void fg_ctor(fg_buf_t *b, zan_json_value_t *o, int ft, const char *wt) {
 /* Extra per-widget initialisation (checked/on state, select options). */
 static void fg_field_setup(fg_buf_t *b, zan_json_value_t *o, int ft,
                            const char *wt, const char *vn) {
-    if (strcmp(wt, "Checkbox") == 0 && fg_obj_bool(o, "defOn")) {
-        fg_putf(b, "        %s.SetChecked(true);\n", vn);
+    if (strcmp(wt, "RadioGroup") == 0 || strcmp(wt, "CheckboxGroup") == 0) {
+        char *opts = fg_join_opts(o);
+        if (opts && opts[0]) {
+            fg_putf(b, "        %s.SetOptionsText(\"", vn);
+            fg_esc_cstr(b, opts);
+            fg_putf(b, "\");\n");
+        }
+        free(opts);
     }
     if (strcmp(wt, "Switch") == 0 && fg_obj_bool(o, "defOn")) {
         fg_putf(b, "        %s.SetOn(true);\n", vn);
