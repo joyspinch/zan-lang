@@ -243,11 +243,15 @@ static zan_type_t *promote_numeric(zan_binder_t *b, zan_type_t *a, zan_type_t *b
  * base, a common base class is used, otherwise the conditional is an error. */
 
 /* Structural equality at the level the checker can see: same kind, same name
- * (generic arguments included). */
+ * (generic arguments included). Arrays and nullable compare their element
+ * type instead of the name, which is built inconsistently across construction
+ * paths (resolve_type keeps "byte[]", make_array_type keeps "byte"). */
 static bool checker_type_equal(zan_type_t *a, zan_type_t *b) {
     if (a == b) return true;
     if (!a || !b) return false;
     if (a->kind != b->kind) return false;
+    if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE)
+        return checker_type_equal(a->element_type, b->element_type);
     if (a->name.len != b->name.len ||
         (a->name.len && memcmp(a->name.str, b->name.str, (size_t)a->name.len) != 0))
         return false;
@@ -272,12 +276,14 @@ static bool checker_type_derives_from(zan_type_t *sub, zan_type_t *sup) {
 }
 
 /* Reference kinds: the IR carries them all as one object pointer, so any two
- * of them can share a single PHI; the merged type picks the more general side. */
+ * of them can share a single PHI; the merged type picks the more general side.
+ * Delegates are reference kinds too -- an empty delegate is `null` in Zan, so
+ * `del = null` and `return null` for a delegate slot must stay legal. */
 static bool checker_type_is_ref(zan_type_t *t) {
     if (!t) return false;
     return t->kind == TYPE_OBJECT || t->kind == TYPE_INTERFACE ||
            t->kind == TYPE_STRING || t->kind == TYPE_CLASS ||
-           t->kind == TYPE_ARRAY;
+           t->kind == TYPE_ARRAY || t->kind == TYPE_DELEGATE;
 }
 
 /* Merge the then/else branch types of a conditional expression. NULL means
@@ -319,6 +325,81 @@ static zan_type_t *merge_conditional_types(zan_checker_t *c,
     if (a->kind == TYPE_ENUM || b->kind == TYPE_ENUM) return a;
 
     return NULL; /* unrelated value types, or a value mixed with a reference */
+}
+
+/* ---- return/assignment compatibility (D2) --------------------------------
+ * A return value and an assignment RHS were checked for syntax only, never
+ * compared against the declared target type, so `string F() { return 123; }`
+ * and `intField = "abc"` compiled and either failed later as a sourceless
+ * LLVM verification error or -- worse -- misread the value at runtime (123
+ * dereferenced as a string pointer). Compare the value's type against the
+ * target; the one-way direction of the conditional merge above. */
+
+/* True when a value of type `value` may be assigned to a target of type
+ * `target` (a return statement or an assignment). Numeric widths convert
+ * freely (narrowing stays an irgen warning), references share one pointer
+ * carrier, a derived class converts to its base. Anything the checker cannot
+ * resolve yet -- an error type, an unbound generic parameter -- is deferred
+ * rather than rejected. */
+static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
+    if (!target || !value) return true;
+    if (target == value) return true;
+    if (target->kind == TYPE_ERROR || value->kind == TYPE_ERROR) return true;
+    if (target->kind == TYPE_TYPE_PARAM || value->kind == TYPE_TYPE_PARAM)
+        return true;
+    if (target->kind == value->kind && checker_type_equal(target, value))
+        return true;
+
+    /* A Binding<T>-typed slot assigned a raw T value is not a plain
+     * assignment: irgen lowers it into a binding construction (const value
+     * or live model binding), so the value only needs to fit T. A null
+     * literal also fits because the backing Binding<T> is a class object. */
+    if (target->kind == TYPE_CLASS && target->name.len == 7 &&
+        memcmp(target->name.str, "Binding", 7) == 0 &&
+        target->type_arg_count == 1 && target->type_args[0]) {
+        if (value->kind == TYPE_OBJECT) return true;
+        return checker_type_assignable(target->type_args[0], value);
+    }
+
+    /* Nullable value types accept null and the underlying non-nullable value. */
+    if (target->kind == TYPE_NULLABLE && value->kind == TYPE_OBJECT)
+        return true; /* null -> T? */
+    if (target->kind == TYPE_NULLABLE && value->kind != TYPE_NULLABLE &&
+        value->kind != TYPE_OBJECT && target->element_type)
+        return checker_type_assignable(target->element_type, value); /* T -> T? */
+
+    /* Delegates accept method groups, lambdas and null; the checker doesn't
+     * model method-group types, so defer to irgen's delegate lowering. */
+    if (target->kind == TYPE_DELEGATE) return true;
+    bool tnum = type_is_numeric(target), vnum = type_is_numeric(value);
+    if (tnum && (vnum || value->kind == TYPE_CHAR)) return true;
+    if (target->kind == TYPE_CHAR && (vnum || value->kind == TYPE_CHAR))
+        return true;
+
+    /* reference kinds (and a null literal, typed as object) share one carrier */
+    if (checker_type_is_ref(target) &&
+        (checker_type_is_ref(value) || value->kind == TYPE_OBJECT))
+        return true;
+
+    /* enums ride an integer carrier */
+    if (target->kind == TYPE_ENUM && value->kind == TYPE_ENUM) return true;
+    if (target->kind == TYPE_ENUM && (vnum || value->kind == TYPE_CHAR)) return true;
+    if (value->kind == TYPE_ENUM && (tnum || target->kind == TYPE_CHAR)) return true;
+
+    return false;
+}
+
+/* Emit the D2 diagnostic when `value` is not assignable to `target`. */
+static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
+                                     zan_type_t *value, zan_loc_t loc,
+                                     const char *what) {
+    if (!target || !value || target == c->binder->type_error ||
+        value == c->binder->type_error || value == c->binder->type_void)
+        return;
+    if (checker_type_assignable(target, value)) return;
+    zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                  "cannot convert '%s' to '%s' in %s: no implicit conversion",
+                  type_name(value), type_name(target), what);
 }
 
 /* The member-access rules, taking the object's type as an argument instead of
@@ -618,6 +699,17 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         zan_checker_check_expr(c, expr->binary.left);
         zan_type_t *right = zan_checker_check_expr(c, expr->binary.right);
         check_readonly_assignment(c, expr);
+        /* Only compare explicit member-access LHS (`this.f`, `obj.f`,
+         * `Type.f`). A bare identifier may be a local variable shadowing a
+         * field, and the checker does not track locals. */
+        if (expr->binary.left->kind == AST_MEMBER_ACCESS) {
+            zan_symbol_t *owner = NULL;
+            zan_symbol_t *field = assign_target_field(
+                c, expr->binary.left, &owner);
+            if (field && field->type)
+                checker_check_assignable(c, field->type, right, expr->loc,
+                                         "assignment");
+        }
         return right;
     }
 
@@ -634,6 +726,11 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             return c->binder->type_error;
         }
         type = zan_binder_resolve_type(c->binder, expr->new_expr.type);
+        /* `new byte[256]` parses the element type with is_array set, so the
+         * expression's type is the array of it, not the scalar element. */
+        if (expr->new_expr.is_array && type && type->kind != TYPE_ERROR &&
+            type->kind != TYPE_ARRAY)
+            type = zan_binder_make_array_type(c->binder, type);
         check_generic_constraints(c, type, expr->loc);
         for (int i = 0; i < expr->new_expr.args.count; i++) {
             zan_checker_check_expr(c, expr->new_expr.args.items[i]);
@@ -709,7 +806,13 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
 
     case AST_RETURN_STMT:
         if (stmt->ret.value) {
-            zan_checker_check_expr(c, stmt->ret.value);
+            zan_type_t *rv = zan_checker_check_expr(c, stmt->ret.value);
+            /* Constructors and void methods have no meaningful return target;
+             * current_return_type is the resolved declared return type. */
+            if (c->current_return_type &&
+                c->current_return_type->kind != TYPE_VOID)
+                checker_check_assignable(c, c->current_return_type, rv,
+                                         stmt->loc, "return statement");
         }
         break;
 

@@ -1145,6 +1145,20 @@ add_test(NAME diag_conditional_branch_mismatch
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_conditional_branch_mismatch PROPERTIES TIMEOUT 60)
 
+# A return value / assignment RHS must be implicitly convertible to the
+# declared target type: the checker used to compare nothing, so
+# `string F() { return 123; }` compiled and then dereferenced 123 as a string
+# pointer at runtime. The check runs where the checker can resolve the target
+# (declared return type, this.field / static field assignments).
+add_test(NAME diag_return_type_mismatch
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/return_type_mismatch.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_return_type_mismatch${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'int' to 'string' in return statement"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_return_type_mismatch PROPERTIES TIMEOUT 60)
+
 # Generic type arguments are invariant: List<int> is not a List<Box>, even
 # though both erase to the same object pointer in IR. Passing a mismatched
 # container used to compile and then dereference the elements as the wrong
