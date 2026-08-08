@@ -524,6 +524,12 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
   未修改）；未提交的迁移编译器修好类型检查后暴露出新的 LLVM 验证错误（
   `Point_op_add` 按值结构体返回签名不匹配）——处于迁移中的 checker/irgen 改动范围内，
   未触碰。
+  **gui_runtime\*.c 复核（7331 行，2026-08-08）**：分配点 14 处全部有 NULL 检查或
+  安全降级（mac 的 mask calloc 失败时 `CGBitmapContextCreate(NULL)` 自行分配内存，
+  仅丢失遮罩）；唯一多线程部分是 Linux tray（线程独占自己的 X11 Display、mutex+
+  condvar 协议、`zan_tray_stop` 先 `pthread_join` 再关 fd、事件环带容量上限）——
+  无竞态；surface 表 64 上限 + destroy 置空槽位（resize 重绘有守卫）；文本缓存逐出
+  free-then-replace 单线程内完成，无 UAF。未发现需修复的缺陷，未改动。
 
 ---
 
