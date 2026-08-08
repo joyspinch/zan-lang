@@ -571,6 +571,18 @@ add_test(NAME diag_invalid_zform_kind
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_invalid_zform_kind PROPERTIES TIMEOUT 60)
 
+# A `"role": "control"` .zform is an embeddable Control, not a window: it has
+# no Main/Show, so naming one as the project entry has to fail at formgen time
+# instead of linking a program with no entry point.
+add_test(NAME diag_control_zform_entry
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/control_zform_entry.zform
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_control_zform_entry${_exe_ext}
+    "-DEXPECT_REGEX=control_zform_entry\\.zform: a \\.zform with .role.: .control. cannot be the project entry"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_control_zform_entry PROPERTIES TIMEOUT 60)
+
 # ---- RPC framing test (A3) ----
 add_executable(zan_rpc_framing_test
     tests/unit/rpc_framing_test.c

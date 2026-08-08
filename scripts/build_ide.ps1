@@ -78,6 +78,18 @@ $entry = Join-Path (Get-Location) (Join-Path "src\ide_zan" ($entryRel -replace '
 if (!(Test-Path -LiteralPath $entry)) { Write-Output "PROJECT_ENTRY_NOT_FOUND $entry"; exit 1 }
 Write-Output "[entry] $entry"
 
+# Every designed document in the project is compiled, not just the entry: one
+# .zform per visual unit (window / panel / dialog / page) with a same-named
+# code-behind. The entry is passed separately (first), so skip it here to
+# avoid handing zanc the same path twice.
+$designs = @(Get-ChildItem src\ide_zan -Recurse -Include *.zform |
+    Where-Object { $_.FullName -ne $entry } |
+    ForEach-Object { $_.FullName })
+if ($designs.Count -gt 0) {
+    $files += $designs
+    Write-Output ("[designs] " + ($designs.Count + 1))
+}
+
 $zanArgs = @()
 $zanArgs += $entry
 $zanArgs += $files
