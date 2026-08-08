@@ -1130,7 +1130,7 @@ add_test(NAME conformance_ide_airun
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/ide/airun_test.zan
-    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/src/ide_zan/src/AiRun.zan;--auto-stdlib"
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/src/ide_zan/src/services/AiRun.zan;--auto-stdlib"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/ide/airun_test.out
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_ide_airun${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -1144,7 +1144,7 @@ add_test(NAME conformance_ide_diagstore
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/ide/diagstore_test.zan
-    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/src/ide_zan/src/DiagStore.zan;--auto-stdlib"
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/src/ide_zan/src/services/DiagStore.zan;--auto-stdlib"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/ide/diagstore_test.out
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_ide_diagstore${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
