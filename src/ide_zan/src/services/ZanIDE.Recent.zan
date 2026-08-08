@@ -1,0 +1,175 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+using System.Data;
+using System.Data.Sqlite;
+using Platform;
+
+/// 起始页的数据：最近打开的工程、动态条目和内置的服务商预设。
+partial class ZanIDE {
+    // ---- Recently opened projects (start page MRU, newest first) ----
+    static string RecentProjectsPath() { return ZanIDE.UserConfigDir() + "/recent_projects.txt"; }
+
+    static string TrimWs(string s) {
+        int b = 0;
+        int e = s.Length;
+        while (b < e) {
+            string ch = s.Substring(b, 1);
+            if (ch == " " || ch == "\t" || ch == "\r" || ch == "\n") { b = b + 1; }
+            else { break; }
+        }
+        while (e > b) {
+            string ch = s.Substring(e - 1, 1);
+            if (ch == " " || ch == "\t" || ch == "\r" || ch == "\n") { e = e - 1; }
+            else { break; }
+        }
+        return s.Substring(b, e - b);
+    }
+
+    /// The most recently opened project roots (existing dirs only, max 10).
+    static List<string> ReadRecentProjects() {
+        List<string> outp = new List<string>();
+        if (!File.Exists(ZanIDE.RecentProjectsPath())) { return outp; }
+        List<string> lines = ZanIDE.Lines(File.ReadAllText(ZanIDE.RecentProjectsPath()));
+        for (int i = 0; i < lines.Count && outp.Count < 10; i = i + 1) {
+            string p = ZanIDE.TrimWs(ZanIDE.NormSlashes(lines[i]));
+            bool dup = false;
+            for (int j = 0; j < outp.Count; j = j + 1) {
+                if (outp[j] == p) { dup = true; }
+            }
+            if (p != "" && !dup && Directory.Exists(p)) { outp.Add(p); }
+        }
+        return outp;
+    }
+
+    static void AddRecentProject(string root) {
+        string p = ZanIDE.TrimWs(ZanIDE.NormSlashes(root));
+        if (p == "") { return; }
+        List<string> cur = ZanIDE.ReadRecentProjects();
+        StringBuilder sb = new StringBuilder();
+        sb.Append(p);
+        sb.Append("\n");
+        int n = 1;
+        for (int i = 0; i < cur.Count && n < 10; i = i + 1) {
+            if (cur[i] != p) {
+                sb.Append(cur[i]);
+                sb.Append("\n");
+                n = n + 1;
+            }
+        }
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.RecentProjectsPath(), sb.ToString());
+    }
+
+    /// Drops a single entry from the recent-projects MRU (the start-page × removes
+    /// just that record; the project on disk is untouched).
+    static void RemoveRecentProject(string root) {
+        string p = ZanIDE.TrimWs(ZanIDE.NormSlashes(root));
+        if (p == "") { return; }
+        List<string> cur = ZanIDE.ReadRecentProjects();
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < cur.Count; i = i + 1) {
+            if (cur[i] != p) {
+                sb.Append(cur[i]);
+                sb.Append("\n");
+            }
+        }
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.RecentProjectsPath(), sb.ToString());
+    }
+
+    /// The most-recently-used projects as list models.
+    static List<RecentItem> RecentProjectItems() {
+        List<RecentItem> items = new List<RecentItem>();
+        List<string> paths = ZanIDE.ReadRecentProjects();
+        for (int i = 0; i < paths.Count; i = i + 1) {
+            items.Add(RecentItem.Create(paths[i]));
+        }
+        return items;
+    }
+
+    /// The start-page articles: docs/news.json in the project (or
+    /// start_news.json in the user config dir) when present, else the built-in
+    /// entries. An entry carries its title, its chip label, the chip's *kind*
+    /// ("info", "success", "warning", "error", "primary" or "" for neutral) and
+    /// where it leads ("@docs" opens the built-in help tab) -- meaning only; the
+    /// look of a chip belongs to the style layer.
+    static List<NewsItem> StartNews(string root) {
+        List<NewsItem> items = new List<NewsItem>();
+        string p = root + "/docs/news.json";
+        if (!File.Exists(p)) { p = ZanIDE.UserConfigDir() + "/start_news.json"; }
+        if (File.Exists(p)) {
+            JsonValue v = JsonValue.ParseLenient(File.ReadAllText(p));
+            if (v != null) {
+                JsonValue arr = v.Get("items");
+                if (arr != null && arr.IsArray()) {
+                    for (int i = 0; i < arr.Count(); i = i + 1) {
+                        JsonValue it = arr.At(i);
+                        string ti = it.Str("title", "");
+                        if (ti != "") {
+                            items.Add(NewsItem.Create(ti,
+                                it.Str("tag", ZanIDE.T("Info", "资讯")),
+                                it.Str("kind", ""), it.Str("url", "@docs")));
+                        }
+                    }
+                }
+            }
+            if (items.Count > 0) { return items; }
+        }
+        items.Add(NewsItem.Create(
+            ZanIDE.T("Quick start: create a project and run it", "快速入门：新建项目并运行"),
+            ZanIDE.T("Must read", "必读"), "error", "@docs"));
+        items.Add(NewsItem.Create(
+            ZanIDE.T("Zan language syntax overview", "Zan 语法速览"),
+            ZanIDE.T("Must read", "必读"), "error", "@docs"));
+        items.Add(NewsItem.Create(
+            ZanIDE.T("Design game UI with the scene designer (.zscene)", "用场景设计器制作游戏 UI（.zscene）"),
+            ZanIDE.T("Tutorial", "教程"), "info", "@docs"));
+        items.Add(NewsItem.Create(
+            ZanIDE.T("Visual forms with the form designer (.zform)", "窗体设计器与 .zform 可视化开发"),
+            ZanIDE.T("Tutorial", "教程"), "info", "@docs"));
+        items.Add(NewsItem.Create(
+            ZanIDE.T("Xiao Zan (AI assistant): provider profiles and model switching", "小赞（AI 助手）：多配置与模型切换"),
+            ZanIDE.T("Tool", "工具"), "success", "@docs"));
+        items.Add(NewsItem.Create(
+            ZanIDE.T("Debugger: breakpoints, stepping and watches", "调试器：断点、单步与监视"),
+            ZanIDE.T("Tool", "工具"), "success", "@docs"));
+        items.Add(NewsItem.Create(
+            ZanIDE.T("Hot reload: save to rebuild and restart", "热重载：保存即重建重启"),
+            ZanIDE.T("Tool", "工具"), "success", "@docs"));
+        items.Add(NewsItem.Create(
+            ZanIDE.T("Browse the built-in examples (right panel)", "浏览内置示例（右侧“示例”页签）"),
+            ZanIDE.T("Sample", "示例"), "primary", "@docs"));
+        return items;
+    }
+
+    /// Built-in official AI provider presets.
+    static List<AiPreset> AiPresets() {
+        List<AiPreset> presets = new List<AiPreset>();
+        presets.Add(AiPreset.Create("Agnes AI", "https://platform.agnes-ai.com/v1", "",
+            "https://platform.agnes-ai.com/"));
+        presets.Add(AiPreset.Create(ZanIDE.T("Zhipu GLM", "智谱 GLM"),
+            "https://open.bigmodel.cn/api/paas/v4", "glm-4-flash",
+            "https://open.bigmodel.cn/"));
+        presets.Add(AiPreset.Create("Kimi (Moonshot)", "https://api.moonshot.cn/v1",
+            "moonshot-v1-8k", "https://platform.moonshot.cn/"));
+        presets.Add(AiPreset.Create("DeepSeek", "https://api.deepseek.com/v1",
+            "deepseek-chat", "https://platform.deepseek.com/"));
+        presets.Add(AiPreset.Create(ZanIDE.T("Alibaba Qwen", "通义千问 Qwen"),
+            "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus",
+            "https://bailian.console.aliyun.com/"));
+        presets.Add(AiPreset.Create("OpenAI", "https://api.openai.com/v1", "gpt-4o-mini",
+            "https://platform.openai.com/"));
+        return presets;
+    }
+
+    /// Opens `url` in the system browser (detached).
+    static void OpenExternal(string url) {
+        #if WINDOWS
+        Process.RunDetached("cmd /c start \"\" \"" + url + "\"");
+        #else
+        Process.RunDetached("xdg-open \"" + url + "\"");
+        #endif
+    }
+}

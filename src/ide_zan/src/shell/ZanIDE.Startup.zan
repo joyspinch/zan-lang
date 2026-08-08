@@ -1,0 +1,388 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+using System.Data;
+using System.Data.Sqlite;
+using Platform;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+using Gui.Component;
+using Game.Scene;
+
+/// 启动时的状态装配：窗口与工程、向导目录、对话框、查找替换、发布、
+/// 编辑器外观、调试、设计器、面板与停靠、Git 面板、小助手、运行与侧栏。
+partial class ZanIDE {
+    /// Builds the window state, restores the last project and mounts the
+    /// shell on the designed Form: the control tree (IdeSurface) paints the
+    /// IDE, the frame hook drives the multi-window event routing and the
+    /// per-frame polls, the exit hook saves the session.
+    void InitShell(Form form) {
+        // Restore the last-used window / panel sizes (see SaveSettings).
+        string cfg = "";
+        if (File.Exists(ZanIDE.CfgPath())) { cfg = File.ReadAllText(ZanIDE.CfgPath()); }
+        InitWindowAndProject(form, cfg);
+        // The IDE's own stylesheet: page layout (flex, widths, gaps) lives in
+        // ide.css, layered over whichever skin is active.
+        app.UseAppCss(ZanIDE.PageCss());
+        InitWizardCatalogs();
+        InitDialogState();
+        InitDocState();
+        InitFindReplaceState();
+        InitPublishState();
+        InitEditorAppearance();
+        InitHelpBrowser();
+        InitOutputSelection();
+        InitDebugState();
+        InitDesignerState();
+        InitPanelsAndDock(cfg);
+        InitGitPanel();
+        // Sidebar state (trees, filters, selections) must exist before the
+        // designed dock panels are wired to it.
+        InitSidebarState();
+        InitDockPanels(form);
+        InitHelpPanel();
+        InitAiState();
+        InitRunState(cfg);
+
+        lastPresent = 0;
+        lastSkinIdx = app.ThemeMenuIndex();
+        form.FrameHook(() => { this.FrameTick(); });
+        form.OnExit(() => { this.Shutdown(); });
+    }
+
+/// Creates the main window from the persisted geometry/skin/wallpaper and
+/// reopens the last project (tree, tabs, editor, symbol index, log).
+    void InitWindowAndProject(Form form, string cfg) {
+        // Default is a standard 1080 (logical, 96-dpi) width; App.Show scales it
+        // up by the display DPI, so it stays a sensible size on HiDPI screens.
+        int cfgW = ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "winW", 1080), 640, 4000);
+        int cfgH = ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "winH", 720), 480, 3000);
+        // The window itself comes from src/App.zform; this method only
+        // restores the persisted skin/opacity/wallpaper onto it.
+        app = form.GetApp();
+        // Restore the last-used title-bar skin. New configs persist the pack
+        // NAME (indices shift when skins are added/removed); a legacy numeric
+        // value maps to the index it named and is upgraded on the next save.
+        string skinName = ZanIDE.CfgStr(cfg, "skin", "");
+        bool skinNumeric = skinName.Length > 0;
+        for (int si = 0; si < skinName.Length; si = si + 1) {
+            if (!ZanIDE.IsDigit(skinName.Substring(si, 1))) { skinNumeric = false; break; }
+        }
+        if (skinName != "" && !skinNumeric) {
+            app.ApplySkinName(skinName);
+        } else {
+            app.ApplySkin(ZanIDE.CfgInt(cfg, "skin", 0));
+        }
+        // Whole-window opacity (percent), persisted like the skin.
+        winOpacity = ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "opacity", 100), 30, 100);
+        app.SetWindowOpacity(winOpacity);
+        // Custom window wallpaper (image + blend strength), set in the
+        // appearance drawer and persisted like the skin.
+        wallPath = ZanIDE.CfgStr(cfg, "wallpaper", "");
+        wallOpacity = ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "wallOpacity", 100), 10, 100);
+        if (wallPath != "" && !File.Exists(wallPath)) { wallPath = ""; }
+        // A path that is any installed pack's OWN artwork is a skin-installed
+        // backdrop (older configs persisted it as the wallpaper). The skin we
+        // just applied already installed its own art -- leave it alone instead
+        // of overwriting one pack's background with another's stale path.
+        if (wallPath != "" && !app.IsSkinArtPath(wallPath)) {
+            app.SetUserWallpaper(wallPath, wallOpacity);
+        }
+        savedW = cfgW;
+        savedH = cfgH;
+
+        // Reopen the last project the user worked on; when there is none yet,
+        // start with just the Start page (no sample project is scaffolded).
+        Directory.CreateDirectoryRecursive(ZanIDE.ProjectsHome());
+        string lastProj = ZanIDE.ReadLastProject();
+        haveProject = lastProj != "" && File.Exists(lastProj + "/zan.proj");
+        root = ZanIDE.ProjectsHome();
+        if (haveProject) { root = lastProj; }
+        if (haveProject) { ZanIDE.AddRecentProject(root); }
+
+        // Completion answers from the compiler's own symbol index: load what the
+        // last run left behind and regenerate it behind that, so signatures are
+        // the real ones (stdlib included) and an index left pointing at the
+        // wrong sources is replaced rather than trusted.
+        this.AdoptSymbolIndex();
+        tree = new List<TreeNode>();
+        if (haveProject) { tree = ZanIDE.ScanTree(root); }
+        rescan = false;
+
+        tabs = new List<TabRecord>();
+
+        activeTab = new SignalInt(0);
+        editor = new CodeEditor();
+        statusBar = new StatusBar();
+        sbPosItem = statusBar.AddLeft("Ln 1, Col 1");
+        sbModeItem = statusBar.AddRight("Zan");
+        sbEncItem = statusBar.AddRight("UTF-8");
+        lastActive = 0 - 1;
+        // Which .zform tab the designer is currently bound to, and the last
+        // serialized layout (to detect changes and persist them back to disk).
+        loadedFormPath = "";
+        formCache = "";
+        // Same for the .zscene tab bound to the scene designer.
+        loadedScenePath = "";
+        sceneCache = "";
+
+        if (haveProject) {
+            // Restoring the last project must never be fatal: whatever is
+            // wrong with it (files deleted since, an unreadable path), the
+            // IDE still has to come up on its start page so the user can
+            // pick another project.
+            try {
+                ZanIDE.OpenFirst(tabs, activeTab, root);
+            } catch (Exception e) {
+                tabs.Clear();
+            }
+        }
+        // Start page is a real tab (path sentinel "@start"), shown first like
+        // VS's Start Page. Rendered specially instead of the code editor.
+        tabs.Insert(0, TabRecord.Create("Start", "", "@start"));
+        activeTab.Set(0);
+
+        log = new List<string>();
+        if (haveProject) {
+            log.Add("> " + IdeVersion.Product() + " ready. Workspace: " + root);
+        } else {
+            log.Add("> " + IdeVersion.Product() + " ready. No project is open.");
+        }
+
+        ZanIDE.uiLang = ZanIDE.ReadUiLang();
+        Wizard.lang = ZanIDE.uiLang;
+        Designer.lang = ZanIDE.uiLang;
+        SceneDesigner.lang = ZanIDE.uiLang;
+        ribbonTabs = ZanIDE.RibbonTabs();
+        ribbonTab = new SignalInt(0);
+    }
+
+    /// New Project categories and the New File template catalog.
+    void InitWizardCatalogs() {
+        // ---- New Project categories (built-in + user "Custom") ----
+        catNames = new List<string>{
+            "Console", "Library", "Window App", "WebView", "Server", "Custom" };
+
+        // The template catalog and the wizard's entity view of it; both rebuilt
+        // whenever the New Project wizard opens so freshly-saved custom
+        // templates show up.
+        tpls = new List<Tpl>();
+        wizTpls = new List<WizardTemplate>();
+
+        // ---- New File template catalog ----
+        // Item order IS the kind number: see ZanIDE.FileKind*() in
+        // ZanIDE.Workspace.zan, which names the slots CreateFile branches on.
+        fileItems = new List<WizardItem>{
+            new WizardItem(ZanIDE.T("Program (Main)", "程序 (Main)"), "arrow-right", ZanIDE.T("Code file: class with a static Main() entry point.", "代码文件：带静态 Main() 入口的类。")),
+            new WizardItem(ZanIDE.T("Class", "类"), "grid", ZanIDE.T("Code file: an empty class with fields and methods.", "代码文件：带字段和方法的空类。")),
+            new WizardItem(ZanIDE.T("GUI Window", "GUI 窗口"), "maximize", ZanIDE.T("Code file: a Gui window with an event loop.", "代码文件：带事件循环的 Gui 窗口。")),
+            new WizardItem(ZanIDE.T("Interface", "接口"), "copy", ZanIDE.T("Code file: a base class defining a contract.", "代码文件：定义契约的基类。")),
+            new WizardItem(ZanIDE.T("Empty File", "空文件"), "file", ZanIDE.T("Code file: a blank .zan file.", "代码文件：空白的 .zan 文件。")),
+            new WizardItem(ZanIDE.T("Lua Script", "Lua 脚本"), "file", ZanIDE.T("Script: creates Name.lua, loaded by a Zan host through System.Scripting.Lua (not run on its own).", "脚本：创建 Name.lua，由 Zan 宿主通过 System.Scripting.Lua 加载（不能单独运行）。")),
+            new WizardItem(ZanIDE.T("Python Script", "Python 脚本"), "file", ZanIDE.T("Script: creates Name.py, loaded by a Zan host through System.Scripting.Python (not run on its own).", "脚本：创建 Name.py，由 Zan 宿主通过 System.Scripting.Python 加载（不能单独运行）。")),
+            new WizardItem(ZanIDE.T("Form (Designer)", "表单 (设计器)"), "layout", ZanIDE.T("Form: creates Name.zform (visual layout) + Name.zan (code-behind).", "表单：创建 Name.zform（可视化布局）+ Name.zan（代码后置）。")),
+            new WizardItem(ZanIDE.T("Free Layout Window", "自由布局窗口"), "grid", ZanIDE.T("Form: free-canvas designer, every control absolutely positioned (layoutMode 1).", "表单：自由画布设计器，控件绝对定位（layoutMode 1）。")),
+            new WizardItem(ZanIDE.T("Game Scene (Designer)", "游戏场景 (设计器)"), "maximize", ZanIDE.T("Scene: creates Name.zscene, a free-canvas game window layout.", "场景：创建 Name.zscene，自由画布式游戏窗口布局。")),
+            new WizardItem(ZanIDE.T("Folder", "文件夹"), "folder", ZanIDE.T("Creates a new folder under src/.", "在 src/ 下创建一个新文件夹。")) };
+    }
+
+    /// Wizard windows (New Project / New File / Save as template) and the
+    /// inputs, pickers and target-platform chips they drive.
+    void InitDialogState() {
+        // ---- Dialog state ----
+        // The New Project / New File wizards are REAL secondary top-level windows
+        // (draggable anywhere on the desktop), driven from this same event pump.
+        // dlg is null when no wizard is open.
+        // dlgMode: 1=new-project, 2=new-file, 3=save-as-template.
+        dlg = null;
+        dlgMode = 0;
+        pathPicker = new FilePicker();
+        // The shared picker pumps itself through ChildWindows inside
+        // Form.Run(); this shell only dispatches the picked path.
+        ChildWindows.RegisterPicker(pathPicker);
+        pathPickerOwner = 0;
+        catSel = new SignalInt(0);
+        pSel = new SignalInt(0);
+        fSel = new SignalInt(0);
+        // No preset selected by default; the custom inputs carry the classic
+        // 480x520 window so behavior is unchanged until the user picks one of
+        // the 12 device presets (which refill the inputs) or types a size.
+        fSizeSel = new SignalInt(-1);
+        fSizeWIn = new Input(ZanIDE.T("width", "宽"));
+        fSizeWIn.SetText("480");
+        fSizeHIn = new Input(ZanIDE.T("height", "高"));
+        fSizeHIn.SetText("520");
+        // New Project device size: empty until a sizeable template is selected,
+        // at which point the inputs are seeded with the template's design size
+        // (see PumpWizardWindow) so "Create" without touching the row keeps
+        // exactly what the preview shows.
+        pSizeSel = new SignalInt(-1);
+        pSizeWIn = new Input(ZanIDE.T("width", "宽"));
+        pSizeHIn = new Input(ZanIDE.T("height", "高"));
+        pSizeSeededFor = 0 - 1;
+
+        // Target platforms for New Project (multi-select OS + architecture).
+        // One column per OS; two architecture chips stacked per column. Chip
+        // labels are arch-only (the OS is the column header). Order is
+        // column-major: [Win x64, Win ARM64, Linux x64, Linux ARM64, ...].
+        platformGroups = new List<string>{ "Windows", "Linux", "macOS" };
+        // One entry per (OS column, architecture), column-major, all selected by
+        // default. The order matches PlatformCsv's id list.
+        platforms = new List<WizardTarget>{
+            new WizardTarget("x64", 1), new WizardTarget("ARM64", 1),
+            new WizardTarget("x64", 1), new WizardTarget("ARM64", 1),
+            new WizardTarget("x64", 1), new WizardTarget("ARM64", 1) };
+        pNameInput = new Input(ZanIDE.T("project name", "项目名称"));
+        pNameInput.SetText("NewProject");
+        pLocInput = new Input(ZanIDE.T("location", "位置"));
+        pLocInput.SetText(ZanIDE.ReadLastPickerDirectory(ZanIDE.ProjectsHome()));
+        fNameInput = new Input(ZanIDE.T("file name", "文件名称"));
+        fNameInput.SetText("NewFile");
+
+        // Right-click context menu (file tree + tab bar) state.
+        // ctxKind: 0 = none, 1 = project tree row, 3 = editor tab.
+        ctxKind = 0;
+        ctxX = 0;
+        ctxY = 0;
+        ctxTarget = 0 - 1;
+
+        // Save-current-project-as-custom-template state.
+        tmplCatSel = new SignalInt(0);
+        tmplNameInput = new Input(ZanIDE.T("template name", "模板名称"));
+        tmplNameInput.SetText("MyTemplate");
+        saveItems = new List<WizardItem>{
+            new WizardItem("Console", "menu", ZanIDE.T("Save under the Console category.", "保存到 Console 分类下。")),
+            new WizardItem("Library", "grid", ZanIDE.T("Save under the Library category.", "保存到 Library 分类下。")),
+            new WizardItem("Window App", "maximize", ZanIDE.T("Save under the Window App category.", "保存到 Window App 分类下。")),
+            new WizardItem("WebView", "folder", ZanIDE.T("Save under the WebView category.", "保存到 WebView 分类下。")),
+            new WizardItem("Server", "arrow-right", ZanIDE.T("Save under the Server category.", "保存到 Server 分类下。")),
+            new WizardItem("Custom", "file", ZanIDE.T("Save under the Custom category.", "保存到 Custom 分类下。")) };
+    }
+
+    /// Find / Replace, Go To Line and the project-wide search state.
+    void InitFindReplaceState() {
+        // ---- Find/Replace & GoToLine state ----
+        findMode = 0;    // 0=hidden, 1=find, 2=replace, 3=gotoLine, 4=bpCondition, 5=rename,
+                             // 6=find in files, 7=replace in files
+        // Find in Files results (project-wide, F8/Shift+F8 walk them).
+        fifHits = new List<SearchHit>();
+        fifQuery = "";
+        fifRepl = "";
+        fifSel = 0 - 1;
+        renameWord = "";
+        // 查找 / 替换条和跳转 / 重命名 / 全项目搜索那个小输入条都是保留
+        // 控件：字段是标准 Input，点击能落进去，光标、选择和输入法状态
+        // 在帧之间也留得住。
+        findBar = FindBar.Create();
+        refList = new RefListPopup();
+        refAnchorLine = 0;
+        quickPrompt = new QuickPrompt();
+        promptMode = 0;
+        startPage = new StartPage();
+    }
+
+    /// Publish dialog state.
+    void InitPublishState() {
+        // ---- Publish dialog state ----
+        // pubSel holds a 0/1 flag per platform, parallel to the host-aware id
+        // list in ZanIDE.PublishTargetIds (this OS's native x64/ARM64 plus
+        // Linux x64/ARM64). Populated from zan.proj via ReadProjectPlatforms.
+        pubWin = null;
+        pubPending = false;
+        pubSel = new List<int>();
+        // In-flight detached publish: exe paths to verify on completion plus
+        // the consumed length of its streamed log (see the poll below).
+        pubBusy = false;
+        pubExes = new List<string>();
+        pubLogLen = 0;
+    }
+
+    /// Editor colour theme and code font size (persisted in editor.cfg).
+    void InitEditorAppearance() {
+        // ---- Editor appearance (color theme + font size) ----
+        // edThemeIdx selects a syntax-color preset (see EditorThemeName); edFontPx
+        // is the code font size (0 = follow the UI theme). Persisted to editor.cfg.
+        cfgWin = null;
+        // Asset Manager child window (browse/import/organize assets/ recursively).
+        marketplaceWin = null;
+        marketplaceInstall = null;
+        marketplaceRetryBuild = false;
+        edThemeIdx = ZanIDE.ReadEditorTheme();
+        edFontPx = ZanIDE.ReadEditorFont();
+        defFontPx = app.theme.fontSizeMedium;
+        settingsWindow = null;
+    }
+
+    /// Help / Docs browser state.
+    void InitHelpBrowser() {
+        // ---- Help / Docs browser state ----
+        // The docs page is a real tab (path sentinel "@docs"). Its state
+        // (search text, section, selection, scroll, demo widgets) lives inside
+        // the DocsBridges components, so nothing is initialized here.
+        // Pending "go to definition" jump, applied after the target tab loads.
+        pendingGotoLine = 0 - 1;
+        pendingGotoCol = 0;
+    }
+
+    /// Output console text selection (drag to select, right-click copy).
+    void InitOutputSelection() {
+        // ---- Output console text selection (drag to select, right-click copy) ----
+        // Anchor/head positions are absolute (row = index into `log`, col = char).
+        // Scroll position and selection live in the LogView's own state.
+        // Output/Errors right-click context menu (copy line / copy all / clear).
+        coCtxOpen = false;
+        coCtxX = 0;
+        coCtxY = 0;
+        coCtxRow = 0 - 1;
+    }
+
+    /// Debugger state: breakpoints, stepping and the variable/stack views.
+    void InitDebugState() {
+        // ---- Debug state ----
+        dbgState = 0;
+        dbgExecLine = -1;
+        dbg = null;
+        dbgConsole = new List<string>();
+        dbgVarInfo = new List<DbgVar>();
+        dbgStack = new List<DbgFrame>();
+        dbgPanelTab = new SignalInt(0);
+        // Conditional breakpoints: one entity per 0-based line (edited via
+        // Ctrl+B, passed through DAP setBreakpoints as `condition`).
+        bpConds = new List<DbgBreakpoint>();
+        // Watch expressions, re-evaluated via DAP `evaluate` on every stop.
+        dbgWatches = new List<string>();
+        dbgWatchVals = new List<DbgVar>();
+        // Semantic language server (zan-lsp), started lazily on first
+        // navigation request; falls back to text scanning when unavailable.
+        lspSess = null;
+        lspTried = false;
+    }
+
+    /// Form and scene designer state.
+    void InitDesignerState() {
+        // ---- Designer state ----
+        // The single unified designer: .zform tabs host the component-based
+        // form designer (stdlib Gui.Designer) with palette, containers,
+        // inspector and event bindings. Its design document round-trips
+        // through the .zform file.
+        designerMode = false;
+        formDesigner = new Designer();
+        // Design/Code toggle: codeViewForm holds the path of the .zform currently
+        // shown as code ("" = design view). The code view reuses a dedicated,
+        // in-place editor over the paired code-behind -- it never opens a new tab
+        // or creates a file just from switching modes. Only .zform tabs toggle.
+        codeViewForm = "";
+        formCodeEd = new CodeEditor();
+        formCodeLoaded = "";
+        // .zscene tabs host the free-canvas game scene designer (stdlib
+        // Game.Scene.SceneDesigner): background reference, absolute placement,
+        // nine-grid anchors, grid snapping, slot grid groups, z-order. The
+        // Design/Code toggle shows the .zscene JSON in place.
+        sceneMode = false;
+        sceneDesigner = new SceneDesigner();
+        assetMgr = AssetManager.Create();
+    }
+
+}

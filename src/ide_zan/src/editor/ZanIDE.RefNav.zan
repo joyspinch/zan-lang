@@ -1,0 +1,87 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+using System.Data;
+using System.Data.Sqlite;
+using Platform;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+using Gui.Component;
+using Game.Scene;
+
+/// 「查找所有引用」与跳转：收集引用、记住来处、跳过去并选中那个词。
+/// 列表本身是 views/RefListPopup 那个浮层。
+partial class ZanIDE {
+    /// Collects the uses of the symbol under the caret and opens the reference
+    /// list on them. The count also goes to the output log, so the answer is
+    /// still on record after the list is dismissed.
+    void ShowReferences() {
+        string word = editor.WordAtCaret();
+        if (word.Length == 0) {
+            log.Add(ZanIDE.T("> Find All References: no symbol under caret.",
+                "> 查找所有引用：光标处没有符号。"));
+            return;
+        }
+        List<SearchHit> found = ZanIDE.CollectReferences(
+            lspSess, editor, tabs, activeTab, root);
+        log.Add("> " + Convert.ToString(found.Count) + " reference(s) to '"
+            + word + "'.");
+        if (found.Count == 0) { return; }
+        refAnchorLine = editor.CurLine();
+        refList.Show(word, found, root);
+    }
+
+    /// Opens the reference-list row `idx`, switching to (or opening) its file.
+    void GotoReference(int idx) {
+        if (idx < 0 || idx >= refList.Count()) { return; }
+        this.RememberTabView();
+        int hitLine = ZanIDE.GotoSearchHit(refList.Hits(), idx, tabs, activeTab, log);
+        if (hitLine >= 0) {
+            pendingGotoLine = hitLine;
+            pendingGotoCol = 0;
+            lastActive = 0 - 1;
+        }
+    }
+
+    /// What Ctrl+F should prefill the query with: the selection when it is a
+    /// single line of text, otherwise the word at the caret, like Visual Studio.
+    /// "" leaves whatever the bar already holds.
+    string FindSeed() {
+        if (editor.HasSelection()) {
+            string sel = editor.GetSelectedText();
+            if (sel.Length > 0 && sel.IndexOf("\n") < 0) { return sel; }
+            return "";
+        }
+        return editor.WordAtCaret();
+    }
+
+    /// Records where the active tab is being read, so a jump that leaves it can
+    /// put the caret and the viewport back on return.
+    void RememberTabView() {
+        int a = activeTab.Get();
+        if (a < 0 || a >= tabs.Count) { return; }
+        if (ZanIDE.IsFormPath(tabs[a].path) || ZanIDE.IsScenePath(tabs[a].path)) {
+            return;
+        }
+        tabs[a].caretLine = editor.CurLine();
+        tabs[a].caretCol = editor.CurCol();
+        tabs[a].scrollLine = editor.ScrollLine();
+    }
+
+    /// Applies a navigation result: the caret goes onto `word` itself on the
+    /// destination line, so the next command (references, rename) asks about
+    /// the symbol jumped to rather than about the line's first word.
+    void ApplyGotoResult(int line, string word) {
+        if (line < 0) { return; }
+        pendingGotoLine = line;
+        pendingGotoCol = 0;
+        int a = activeTab.Get();
+        if (a >= 0 && a < tabs.Count) {
+            pendingGotoCol = ZanIDE.ColOfWordAt(tabs[a].body, line, word);
+        }
+        lastActive = 0 - 1;
+        app.RequestRedraw();
+    }
+}

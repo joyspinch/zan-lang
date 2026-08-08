@@ -136,12 +136,16 @@ partial class ZanIDE {
         if (aiSideW > 0) { aiBodyW = aiBodyW - 1; }
         // 团队模式在输入框上方加一条细提示行，说明这条消息将发给谁。
         int aiCueH = 0;
-        if (aiTeamMode) { aiCueH = Tag.Height(app, "") + app.Scale(4); }
+        if (aiTeamMode) { aiCueH = SendCue.HeightOf(app); }
         // 团队条自己拥有「单人 / 团队」开关，所以模式永远只差一次点击；
         // 条子自己量高度（声明的控件树），宿主只送状态。
         aiPanel.TeamStrip().Sync(aiTeamMode, aiBusy.Get() == 1, aiTeamSt,
             aiTasks, aiTeamOpen);
-        int aiPlanH = AiPlanHeight(app);
+        // 「跑到哪了」+ 任务计划：带子自己量高度（声明的控件树），
+        // 宿主只把这次交付和计划交给它。
+        PlanStrip aiBand = aiPanel.PlanBand();
+        int aiPlanH = aiBand.HeightOf(app, aiRun, aiPlan);
+        aiBand.Sync(app, aiRun, aiPlan);
         // 「插入代码」/「替换整文件」：把最后一段 AI 代码写到光标处或
         // 整个文件；没有可用代码（或当前不是可写文件）就不占那一行。
         string aiCode = ZanIDE.AiLastCode(aiMsgs);
@@ -157,6 +161,15 @@ partial class ZanIDE {
             aiAutoText = aiAutoExec ? ZanIDE.T("A:on", "自:开")
                 : ZanIDE.T("A:off", "自:关");
         }
+        if (aiCueH > 0) {
+            // 自动模式下徽标显示当前解析到的成员，所以路由在这里算一次。
+            aiPanel.CueRow().Sync(aiSendTo,
+                AiTeam.RouteUserSt(aiPanel.PromptBox().GetText(), aiMsgs,
+                    aiTeamSt));
+        }
+        // 上下文用量环（头部最右侧那一格）：环、卡片、悬停和钉住都归
+        // 控件，外壳只算这一帧的数字。
+        this.AiSyncCtxRing();
         aiPanel.Prepare(aiSideW, aiTeamMode, aiPlanH, aiCueH, aiApplyH,
             aiBusy.Get(), aiAutoExec, aiAutoText);
         if (aiBusy.Get() == 2) {
@@ -173,12 +186,6 @@ partial class ZanIDE {
         // 从这里驱动，下面的面板只渲染当前会话。
         if (aiSideW > 0) { this.AiRenderSessions(app, aiPanel.SidebarRect()); }
 
-        // ---- 上下文用量环（头部最右侧那一格）----
-        Rect aiRing = aiPanel.RingRect();
-        AiRenderContextRing(app, aiRing.x + aiRing.width / 2,
-            aiRing.y + aiRing.height / 2,
-            aiRing.height / 2 - app.Scale(3));
-
         // ---- 团队条：开关在绘制时处理点击，所以模式在这里回读 ----
         bool aiTeamWas = aiTeamMode;
         aiTeamMode = aiPanel.TeamStrip().TeamOn();
@@ -189,16 +196,21 @@ partial class ZanIDE {
             app.RequestRedraw();
         }
 
-        // ---- 任务计划 ----
-        if (aiPlanH > 0) { AiRenderPlan(app, aiPanel.PlanRect()); }
+        // ---- 任务计划：清空由带子上的按钮给出，计划归外壳所有 ----
+        if (aiBand.TakeClear()) {
+            aiPlan = new List<AiPlanStep>();
+            app.RequestRedraw();
+        }
 
         // ---- 聊天记录：组件自己排版、滚动、折叠与复制 ----
         aiPanel.Transcript().Bind(aiMsgs);
         aiPanel.Transcript().SetBusy(aiBusy.Get() == 1);
 
-        // ---- 发给谁提示行（团队模式）----
-        if (aiTeamMode && aiCueH > 0) {
-            this.AiRenderSendCue(app, aiPanel.CueRect());
+        // ---- 发给谁提示行（团队模式）：下拉自己处理打开和选择，
+        // 外壳只在用户换了收件人时收下这个状态 ----
+        if (aiTeamMode && aiCueH > 0 && aiPanel.CueRow().TakeChanged()) {
+            aiSendTo = aiPanel.CueRow().Recipient();
+            app.RequestRedraw();
         }
 
         // 自动执行开关真正决定的是「谁有权跑操作类工具」，所以把它说
@@ -249,10 +261,6 @@ partial class ZanIDE {
                 app.RequestRedraw();
             }
         }
-
-        // 面板里最后一件事：用量环打开的那张上下文 / 用量卡，所以它盖
-        // 在聊天和输入框之上。
-        AiRenderUsageCard(app);
     }
 
     /// 会话列表（左栏）：标题取用户改过的名字，否则取第一条用户消息。
@@ -367,76 +375,78 @@ partial class ZanIDE {
         if (aiPanel != null) { aiPanel.Transcript().Scroll().Set(0); }
     }
 
-    /// 「将发给」提示行：收件人是状态（aiSendTo）而不是提示里的文字，
-    /// 所以输入框里只有用户写的内容，且恰好一个成员被寻址。空 = 让上下
-    /// 文决定，显示为它当前解析到的成员。
-    void AiRenderSendCue(App app, Rect area) {
-        string cueId = aiSendTo;
-        bool cueAuto = cueId == "";
-        if (cueAuto) {
-            cueId = AiTeam.RouteUserSt(aiPanel.PromptBox().GetText(), aiMsgs,
-                aiTeamSt);
+    /// 本帧的上下文 / 用量数字：正在跑的对话相对压缩预算的开销，以及本次
+    /// IDE 会话的请求与 token 总量。只在这里组装数字 —— 环、卡片、卡片
+    /// 里的行和那段会自动换行的说明都由控件自己画。
+    void AiSyncCtxRing() {
+        int used = AiAgent.ContextChars(aiMsgs);
+        int budget = AiAgent.MaxContextChars();
+        int pct = 0;
+        if (budget > 0) { pct = used * 100 / budget; }
+        int comp = AiAgent.Compactions();
+        List<UsageStat> ctx = new List<UsageStat>();
+        ctx.Add(UsageStat.Of(ZanIDE.T("Used", "已使用"),
+            Convert.ToString(used) + " " + ZanIDE.T("chars", "字符")));
+        // The budget is measured in CHARACTERS (the transcript is not
+        // tokenized locally); the model's configured limit is in tokens, so
+        // both are shown with the ~4 chars/token conversion that derives one
+        // from the other.
+        ctx.Add(UsageStat.Of(ZanIDE.T("Budget", "上限"),
+            Convert.ToString(budget) + " " + ZanIDE.T("chars", "字符")
+            + " ≈ " + Convert.ToString(budget / 4) + " token"));
+        ctx.Add(UsageStat.Of(ZanIDE.T("Filled", "占用"),
+            Convert.ToString(pct) + "%"));
+        // Compaction is why the window never fills up: past the budget the
+        // oldest turns are replaced by a digest before the request is sent,
+        // while the transcript on screen keeps every turn.
+        ctx.Add(UsageStat.Flag(ZanIDE.T("Compacted", "已压缩"),
+            comp == 0
+                ? ZanIDE.T("never", "未发生")
+                : Convert.ToString(comp) + " "
+                    + ZanIDE.T("requests", "次请求"),
+            comp > 0));
+        string note = "";
+        if (comp > 0) {
+            note = ZanIDE.T("Older turns are sent as a digest",
+                    "较早的对话以摘要形式发送")
+                + ZanIDE.T(" (last fold: ", "（上次折叠 ")
+                + Convert.ToString(AiAgent.LastDropped())
+                + ZanIDE.T(" turns; the chat above keeps them all).",
+                    " 条；上方对话仍完整保留）。");
         }
-        string cueName = AiTeam.DisplayName(cueId);
-        string cueCls = AiTeam.RoleTagClass(cueId);
-        if (cueAuto) { cueName = cueName + ZanIDE.T(" (auto)", "（自动）"); }
-        string cueLab = ZanIDE.T("Sending to", "将发给");
-        int cueFs = app.theme.fontSizeSmall;
-        int cueX = area.x + app.Scale(6);
-        int cueTx = cueX;
-        aiCueLbl.Text = cueLab;
-        aiCueLbl.RenderAt(app, cueTx,
-            area.y + (area.height - Canvas.FontHeight(cueFs)) / 2);
-        cueTx = cueTx + Canvas.MeasureText(cueLab, cueFs) + app.Scale(6);
-        int cueChipW = 0;
-        if (cueName != ""
-            && cueTx + Tag.Width(app, cueName, cueCls)
-                <= area.x + area.width - app.Scale(6)) {
-            cueChipW = Tag.Width(app, cueName, cueCls);
-            Tag.Chip(app, cueTx,
-                area.y + (area.height - Tag.Height(app, cueCls)) / 2,
-                cueName, cueCls);
-        }
-        // 小箭头说明这一行可以打开，而整行（标签 + 徽标 + 箭头）都是
-        // 命中区：10px 的字形不该让人去瞄。
-        int cueCarX = cueTx + cueChipW + app.Scale(3);
-        aiCueCaret.RenderAt(app, cueCarX,
-            area.y + (area.height - Canvas.FontHeight(cueFs)) / 2);
-        int cueW = cueCarX + Canvas.MeasureText("▾", cueFs) - cueX;
-        int cueHid = app.focus.AllocId();
-        app.hitTester.Register(new HitRegion(cueHid, cueX, area.y, cueW,
-            area.height, 1));
-        bool cueOpened = false;
-        if (Ui.Clicked(app, cueHid)) {
-            aiCueOpen = !aiCueOpen;
-            cueOpened = aiCueOpen;
-            app.RequestRedraw();
-        }
-        // 菜单等下一帧：打开它的那次点击还是本帧的点击，菜单会把它读成
-        // 「点在外面」而立刻关掉自己。
-        if (aiCueOpen && !cueOpened) {
-            List<string> cueOpts = new List<string>();
-            List<string> cueIds = new List<string>();
-            cueOpts.Add(ZanIDE.T("Auto (by context)", "自动（按上下文）"));
-            cueIds.Add("");
-            List<AiRole> cueRs = AiTeam.Roles();
-            for (int cri = 0; cri < cueRs.Count; cri = cri + 1) {
-                cueOpts.Add(AiTeam.DisplayName(cueRs[cri].id));
-                cueIds.Add(cueRs[cri].id);
-            }
-            // 向上打开，压在这一行上：它下面是输入框和窗口边缘，交给
-            // 夹取的话列表会停在输入框上面。
-            int cuePick = ContextMenu.Render(app, cueX,
-                area.y - ContextMenu.Height(app, cueOpts), cueOpts);
-            if (cuePick >= 0 && cuePick < cueIds.Count) {
-                aiSendTo = cueIds[cuePick];
-                aiCueOpen = false;
-                app.RequestRedraw();
-            } else if (cuePick == 0 - 2) {
-                aiCueOpen = false;
-                app.RequestRedraw();
+        // Token counts only exist for replies whose provider reported usage;
+        // say so rather than showing a zero that looks like a real number.
+        string inTok = ZanIDE.T("no data", "无数据");
+        string outTok = inTok;
+        string cacheTok = inTok;
+        string totTok = inTok;
+        if (ZanIDE.aiStatUsageReplies > 0) {
+            inTok = Convert.ToString(ZanIDE.aiStatPrompt);
+            outTok = Convert.ToString(ZanIDE.aiStatCompletion);
+            totTok = Convert.ToString(ZanIDE.aiStatTotal);
+            cacheTok = Convert.ToString(ZanIDE.aiStatCached);
+            if (ZanIDE.aiStatPrompt > 0) {
+                cacheTok = cacheTok + " ("
+                    + Convert.ToString(ZanIDE.aiStatCached * 100
+                        / ZanIDE.aiStatPrompt) + "%)";
             }
         }
+        List<UsageStat> ses = new List<UsageStat>();
+        ses.Add(UsageStat.Of(ZanIDE.T("Requests", "请求次数"),
+            Convert.ToString(ZanIDE.aiStatReqs)));
+        ses.Add(UsageStat.Flag(ZanIDE.T("Failed", "失败次数"),
+            Convert.ToString(ZanIDE.aiStatFails), ZanIDE.aiStatFails > 0));
+        ses.Add(UsageStat.Of(ZanIDE.T("Input tokens", "输入 token"), inTok));
+        ses.Add(UsageStat.Of(ZanIDE.T("Output tokens", "输出 token"), outTok));
+        ses.Add(UsageStat.Of(ZanIDE.T("Cached input", "缓存命中"), cacheTok));
+        ses.Add(UsageStat.Of(ZanIDE.T("Total tokens", "合计 token"), totTok));
+        if (aiTokTotal > 0 || aiTokPrompt > 0) {
+            ses.Add(UsageStat.Of(ZanIDE.T("Last reply", "上次回复"),
+                Convert.ToString(aiTokPrompt) + " + "
+                + Convert.ToString(aiTokCompletion) + " = "
+                + Convert.ToString(aiTokTotal)));
+        }
+        aiPanel.Ring().Sync(pct, ctx, ses, note);
     }
 
     // ---- 设计里的处理器（panels/AiPanel.zform 的 onClick）----

@@ -1,0 +1,369 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+using System.Data;
+using System.Data.Sqlite;
+using Platform;
+
+/// IDE 自己的路径：可执行文件、缓存与配置目录、工具链和随发布一起
+/// 装的资源。全是纯查询，不碰界面。
+partial class ZanIDE {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetModuleFileNameA")]
+    static extern int WinGetModuleFileName(int hModule, string buf, int size);
+
+    #elif MACOS
+    // _NSGetExecutablePath(char* buf, uint32_t* bufsize): fills buf with the
+    // executable path; bufsize points to a 4-byte little-endian capacity.
+    [DllImport("crt", EntryPoint = "_NSGetExecutablePath")]
+    static extern int MacGetExecutablePath(string buf, string bufsize);
+
+    #else
+    // Linux exposes the running executable via the /proc/self/exe symlink.
+    [DllImport("crt", EntryPoint = "readlink")]
+    static extern int LinuxReadlink(string path, string buf, int bufsize);
+
+    #endif
+
+    /// Full path of the running IDE executable. Platform-specific: Win32
+    /// GetModuleFileNameA, macOS _NSGetExecutablePath, Linux /proc/self/exe.
+    /// The path is cut to the length the API reports (macOS reports none, so
+    /// its NUL terminator is located instead).
+    static string ExePath() {
+        byte[] buf = new byte[4096];
+        int n = 0;
+        #if WINDOWS
+        n = WinGetModuleFileName(0, buf, 4096);
+        #elif MACOS
+        byte[] cap = new byte[4];
+        cap[1] = 16;
+        MacGetExecutablePath(buf, cap);
+        while (n < 4096 && (buf[n] & 255) != 0) { n = n + 1; }
+        #else
+        n = LinuxReadlink("/proc/self/exe", buf, 4096);
+        #endif
+        if (n < 0) { n = 0; }
+        return buf.ToStr(0, n);
+    }
+
+    /// Filters of the Open File dialog: Zan sources plus the scripts a Zan
+    /// program embeds (System.Scripting.Lua, Python), which the editor
+    /// highlights and completes in their own language.
+    static List<FileFilter> OpenFileFilters() {
+        List<FileFilter> fs = new List<FileFilter>();
+        fs.Add(new FileFilter(ZanIDE.T("Zan source", "Zan 源文件"), ".zan"));
+        fs.Add(new FileFilter(ZanIDE.T("Script (Lua / Python)", "脚本 (Lua / Python)"),
+                              ".lua;.py;.pyw"));
+        fs.Add(new FileFilter(ZanIDE.T("All files", "所有文件"), ""));
+        return fs;
+    }
+
+    /// Directory that contains the running IDE executable, with no trailing
+    /// separator. Used so the toolchain (zanc + its stdlib) is located relative
+    /// to the IDE rather than a hard-coded absolute path — makes the IDE portable.
+    static string ExeDir() {
+        string p = ZanIDE.ExePath();
+        int cut = 0 - 1;
+        for (int i = 0; i < p.Length; i = i + 1) {
+            string ch = p.Substring(i, 1);
+            if (ch == "\\" || ch == "/") { cut = i; }
+        }
+        if (cut < 0) { return "."; }
+        return p.Substring(0, cut);
+    }
+
+    /// Executable file suffix for produced binaries: ".exe" on Windows, none
+    /// on POSIX (where the extension is irrelevant and conventionally absent).
+    #if WINDOWS
+    static string ExeSuffix() { return ".exe"; }
+
+    #else
+    static string ExeSuffix() { return ""; }
+
+    #endif
+
+    /// Basename of the Zan compiler shipped next to the IDE.
+    static string ZancName() { return "zanc" + ZanIDE.ExeSuffix(); }
+
+    /// C library getenv, for locating per-user directories (mirrors the
+    /// approach in System.IO.Path). Returns null when the variable is unset.
+    [DllImport("crt")]
+    static extern string getenv(string name);
+
+    /// User home directory (USERPROFILE on Windows, HOME on POSIX).
+    static string HomeDir() {
+        #if WINDOWS
+        string h = getenv("USERPROFILE");
+        #else
+        string h = getenv("HOME");
+        #endif
+        if (h == null || h == "") { return "."; }
+        return h;
+    }
+
+    /// Per-user, writable directory for IDE config + custom templates. Kept out
+    /// of the (possibly read-only) install dir so nothing user-owned lives there.
+    static string UserConfigDir() {
+        #if WINDOWS
+        string a = getenv("APPDATA");
+        if (a == null || a == "") { a = ZanIDE.HomeDir(); }
+        return a + "/ZanIDE";
+        #elif MACOS
+        return ZanIDE.HomeDir() + "/Library/Application Support/ZanIDE";
+        #else
+        string x = getenv("XDG_CONFIG_HOME");
+        if (x != null && x != "") { return x + "/zan-ide"; }
+        return ZanIDE.HomeDir() + "/.config/zan-ide";
+        #endif
+    }
+
+    /// Volatile, per-run files live here: mirrored program logs, terminal
+    /// session transcripts, AI stream/request temp files and the chat-session
+    /// database. It sits beside the IDE executable (<exe dir>/cache) so a run
+    /// never writes into the system profile and logs stay with the install.
+    static string CacheDir() {
+        return ZanIDE.ExeDir() + "/cache";
+    }
+
+    /// Scratch dir of *this* IDE window. Build, run, git, publish and format
+    /// all park their output and their "done" marker in the cache dir, and a
+    /// second window opened on another project wrote to the very same files:
+    /// each window then showed the other's output and stopped waiting on the
+    /// other's marker. Keyed by process id, so every window has its own.
+    static string WindowCacheDir() {
+        return ZanIDE.CacheDir() + "/w" + Convert.ToString(Runtime.GetProcessId());
+    }
+
+    static void EnsureCacheDir() {
+        Directory.CreateDirectoryRecursive(ZanIDE.CacheDir());
+        Directory.CreateDirectoryRecursive(ZanIDE.WindowCacheDir());
+    }
+
+    /// Default parent for user projects. Projects are user-owned and never
+    /// created under the install dir; the wizard lets the user pick any path.
+    static string ProjectsHome() { return ZanIDE.HomeDir() + "/ZanProjects"; }
+
+    /// File remembering the last project the user opened, so the IDE reopens it
+    /// next launch instead of scaffolding a throwaway sample project.
+    static string LastProjectPath() { return ZanIDE.UserConfigDir() + "/lastproject.txt"; }
+
+    static string ReadLastProject() {
+        string f = ZanIDE.LastProjectPath();
+        if (!File.Exists(f)) { return ""; }
+        string s = ZanIDE.NormSlashes(File.ReadAllText(f));
+        int e = s.Length;
+        while (e > 0) {
+            string ch = s.Substring(e - 1, 1);
+            if (ch == " " || ch == "\t" || ch == "\r" || ch == "\n") { e = e - 1; }
+            else { break; }
+        }
+        return s.Substring(0, e);
+    }
+
+    static void WriteLastProject(string root) {
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.LastProjectPath(), root);
+        ZanIDE.AddRecentProject(root);
+    }
+
+    // ---- Dock layout (panel arrangement of the main area) ----
+    /// Where DockHost.SaveLayout() is persisted, so the panels the user dragged,
+    /// resized or closed come back the same way next launch.
+    static string DockLayoutPath() { return ZanIDE.UserConfigDir() + "/dock.cfg"; }
+
+    static string ReadDockLayout() {
+        string f = ZanIDE.DockLayoutPath();
+        if (!File.Exists(f)) { return ""; }
+        return ZanIDE.TrimWs(File.ReadAllText(f));
+    }
+
+    static void WriteDockLayout(string layout) {
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.DockLayoutPath(), layout);
+    }
+
+    /// Converts Windows backslashes to forward slashes, the IDE-internal path
+    /// form (Windows file APIs accept either separator).
+    static string NormSlashes(string p) {
+        string outp = "";
+        for (int i = 0; i < p.Length; i = i + 1) {
+            string ch = p.Substring(i, 1);
+            if (ch == "\\") { outp = outp + "/"; } else { outp = outp + ch; }
+        }
+        return outp;
+    }
+
+    static string LastPickerPath() { return ZanIDE.UserConfigDir() + "/lastpicker.txt"; }
+
+    static string ReadLastPickerDirectory(string fallback) {
+        string dir = "";
+        string f = ZanIDE.LastPickerPath();
+        if (File.Exists(f)) {
+            dir = ZanIDE.NormSlashes(File.ReadAllText(f));
+            dir = ZanIDE.TrimTrailSpaces(ZanIDE.TrimLeadSpaces(dir));
+        }
+        if (Directory.Exists(dir)) { return dir; }
+        fallback = ZanIDE.NormSlashes(fallback);
+        if (File.Exists(fallback)) { fallback = Path.GetDirectoryName(fallback); }
+        if (Directory.Exists(fallback)) { return fallback; }
+        return ZanIDE.ProjectsHome();
+    }
+
+    static void WriteLastPickerDirectory(string dir) {
+        dir = ZanIDE.NormSlashes(dir);
+        if (!Directory.Exists(dir)) { return; }
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.LastPickerPath(), dir);
+    }
+
+    /// The IDE's install directory, where the shipped read-only resources
+    /// (toolchain\, stdlib\, examples\, templates\, tools\) live. Normally the
+    /// exe's own folder; when the exe was started by the self-extract launcher
+    /// (which unpacks the real exe + SDL3 to a per-user cache and runs it from
+    /// there), the launcher passes its own folder via ZAN_APP_DIR so the
+    /// sibling folders still resolve next to the launcher in the install dir.
+    static string BaseDir() {
+        string d = ZanIDE.getenv("ZAN_APP_DIR");
+        if (d != null && d != "" && Directory.Exists(d)) { return d; }
+        return ZanIDE.ExeDir();
+    }
+
+    /// Shipped (read-only) resource roots, laid out relative to the install dir:
+    ///   <BaseDir>/toolchain/zanc[.exe] + linker      <BaseDir>/stdlib
+    /// This matches scripts/publish_ide.ps1: the compiler and its linker bundle
+    /// live together under <BaseDir>/toolchain, and zanc finds its linker next to
+    /// itself in that same folder.
+    static string ToolchainDir() { return ZanIDE.BaseDir() + "/toolchain"; }
+
+    /// 已发布的安装目录里 stdlib 就在 exe 旁边；从构建树跑（build\ZanIDE.exe）
+    /// 时它在上一层。找不到就退回默认路径，让 zanc 自己报错。
+    static string StdlibDir() {
+        string a = ZanIDE.BaseDir() + "/stdlib";
+        if (Directory.Exists(a)) { return a; }
+        string b = ZanIDE.BaseDir() + "/../stdlib";
+        if (Directory.Exists(b)) { return b; }
+        return a;
+    }
+
+    /// The IDE's own stylesheet (page layout): shipped next to the executable,
+    /// or read from the source tree when running from a dev build. Empty when
+    /// neither is present, which leaves pages on the theme's defaults.
+    static string PageCss() {
+        string p = ZanIDE.ExeDir() + "/ide.css";
+        if (!File.Exists(p)) { p = ZanIDE.BaseDir() + "/ide.css"; }
+        if (!File.Exists(p)) { p = ZanIDE.BaseDir() + "/../src/ide_zan/ide.css"; }
+        if (!File.Exists(p)) { return ""; }
+        return File.ReadAllText(p);
+    }
+
+    /// Locates the shipped assets folder (with zan.ico): next to the IDE when
+    /// published (<BaseDir>/assets), or one level up in the build tree.
+    static string ShippedAssetsDir() {
+        string a = ZanIDE.BaseDir() + "/assets";
+        if (Directory.Exists(a)) { return a; }
+        string b = ZanIDE.BaseDir() + "/../assets";
+        if (Directory.Exists(b)) { return b; }
+        return "";
+    }
+
+    /// The Zan application icon (.ico) copied into new projects by default so a
+    /// freshly created project already carries an icon its exe links in.
+    /// Returns "" when no shipped icon is found.
+    static string ZanIconSource() {
+        string ad = ZanIDE.ShippedAssetsDir();
+        if (ad != "") {
+            string c = ad + "/zan.ico";
+            if (File.Exists(c)) { return c; }
+        }
+        string t = ZanIDE.ToolchainDir() + "/zan.ico";
+        if (File.Exists(t)) { return t; }
+        return "";
+    }
+
+    /// Shipped example programs. Published next to the IDE as <BaseDir>/examples
+    /// (scripts/publish_ide.ps1); when running from the build tree it sits one
+    /// level up at the repo root. Returns "" when neither exists.
+    static string ExamplesDir() {
+        string a = ZanIDE.BaseDir() + "/examples";
+        if (Directory.Exists(a)) { return a; }
+        string b = ZanIDE.BaseDir() + "/../examples";
+        if (Directory.Exists(b)) { return b; }
+        return "";
+    }
+
+    /// Shipped IDE tools. Published next to the IDE as <BaseDir>/tools
+    /// (scripts/publish_ide.ps1); when running from the build tree it sits one
+    /// level up at the repo root. Returns "" when neither exists.
+    static string ToolsDir() {
+        string a = ZanIDE.BaseDir() + "/tools";
+        if (Directory.Exists(a)) { return a; }
+        string b = ZanIDE.BaseDir() + "/../tools";
+        if (Directory.Exists(b)) { return b; }
+        return "";
+    }
+
+    /// Per-project build scratch dir (writable, colocated with the sources),
+    /// created on demand so build artifacts never touch the install dir.
+    static string EnsureBuildDir(string root) {
+        string d = root + "/.build";
+        if (!Directory.Exists(d)) { Directory.CreateDirectoryRecursive(d); }
+        return d;
+    }
+
+    /// Resolve the Zan compiler. It lives together with its linker under
+    /// <ExeDir>/toolchain/zanc.exe (see scripts/publish_ide.ps1). Falls back to
+    /// the bare name (PATH) -- no hard-coded absolute path.
+    static string Zanc() {
+        string cand = ZanIDE.ToolchainDir() + "/" + ZanIDE.ZancName();
+        if (File.Exists(cand)) { return cand; }
+        return ZanIDE.ZancName();
+    }
+
+    /// Quoted zanc invocation prefix with an explicit --stdlib-path so stdlib
+    /// resolution never depends on relative (../stdlib) lookup or the cwd.
+    static string ZancCmd() {
+        return "\"" + ZanIDE.Zanc() + "\" --stdlib-path \"" + ZanIDE.StdlibDir() + "\"";
+    }
+
+    /// Reveals a path in the OS file manager: Explorer (Windows), Finder via
+    /// `open -R` (macOS), or the containing directory via `xdg-open` (Linux).
+    static void RevealInFileManager(string path) {
+        #if WINDOWS
+        Process.RunDetached("explorer /select,\"" + ZanIDE.ToWinPath(path) + "\"");
+        #elif MACOS
+        Process.RunDetached("open -R \"" + path + "\"");
+        #else
+        Process.RunDetached("xdg-open \"" + ZanIDE.DirOf(path) + "\"");
+        #endif
+    }
+
+    /// Converts forward slashes to Windows backslashes (for explorer.exe).
+    static string ToWinPath(string p) {
+        string outp = "";
+        for (int i = 0; i < p.Length; i = i + 1) {
+            string ch = p.Substring(i, 1);
+            if (ch == "/") { outp = outp + "\\"; } else { outp = outp + ch; }
+        }
+        return outp;
+    }
+
+    /// 按行切开一段文本（吃掉 \r，末尾的空行不算一行）。服务层不引 Gui，
+    /// 所以不借编辑器那份。
+    static List<string> Lines(string text) {
+        List<string> outl = new List<string>();
+        string cur = "";
+        for (int i = 0; i < text.Length; i = i + 1) {
+            string ch = text.Substring(i, 1);
+            if (ch == "\n") {
+                outl.Add(cur);
+                cur = "";
+            } else if (ch != "\r") {
+                cur = cur + ch;
+            }
+        }
+        if (cur != "") { outl.Add(cur); }
+        return outl;
+    }
+
+}

@@ -1,0 +1,320 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+using System.Data;
+using System.Data.Sqlite;
+using Platform;
+
+/// zan.proj 的读写与编译命令拼装：目标类型（控制台 / GUI / 库）、图标、
+/// 皮肤清单和跨平台链接参数。
+partial class ZanIDE {
+    /// True when the project at `root` targets the GUI runtime (zan.proj
+    /// `type = gui`). GUI apps must link the native GUI runtime and use the
+    /// borderless-window entry, whereas console apps link with the defaults.
+    static bool IsGuiProject(string root) {
+        string pj = root + "/zan.proj";
+        if (!File.Exists(pj)) { return false; }
+        string c = File.ReadAllText(pj);
+        return ZanIDE.Has(c, "type = gui") || ZanIDE.Has(c, "type=gui");
+    }
+
+    /// Extra clang link arguments for GUI projects: the native GUI runtime
+    /// (zan_gui.lib, shipped next to the IDE and under toolchain\), the stdio
+    /// shim sprintf resolves against, and the windowed subsystem/entry the GUI
+    /// runtime expects. Returns "" for console projects (link with defaults).
+    static bool IsGuiTarget(string root, string sourcePath) {
+        bool isGui = ZanIDE.IsGuiProject(root);
+        if (!isGui && File.Exists(sourcePath)) {
+            string source = File.ReadAllText(sourcePath);
+            isGui = ZanIDE.Has(source, "using Gui;");
+        }
+        return isGui;
+    }
+
+    /// True when the program opens its own window: a GUI-runtime app, or a game
+    /// on SDL3/GameKit. Such a target is linked for the windowed subsystem and
+    /// started detached, i.e. without a console attached to it.
+    static bool IsWindowedTarget(string root, string sourcePath) {
+        if (ZanIDE.IsGuiTarget(root, sourcePath)) { return true; }
+        if (File.Exists(sourcePath)) {
+            string source = File.ReadAllText(sourcePath);
+            if (ZanIDE.Has(source, "using SDL3;")) { return true; }
+            if (ZanIDE.Has(source, "using GameKit;")) { return true; }
+        }
+        return false;
+    }
+
+    static string GuiLinkArgs(string root, string sourcePath) {
+        bool isGui = ZanIDE.IsGuiTarget(root, sourcePath);
+        if (!isGui) { return ""; }
+        string args = " -L\"" + ZanIDE.BaseDir() + "\" -L\"" + ZanIDE.ToolchainDir() + "\""
+            + " -lzan_gui -llegacy_stdio_definitions"
+            + " -Xlinker /SUBSYSTEM:WINDOWS -Xlinker /ENTRY:mainCRTStartup"
+            + " -Xlinker /STACK:268435456";
+        return args;
+    }
+
+    /// Extra link input for programs that use the synchronization runtime
+    /// (Thread.Start / AtomicInt / SharedTable / Dispatcher). Those symbols
+    /// (zan_thread_start / zan_atomic_int_* / zan_shared_table_* /
+    /// zan_dispatch_*) live in the prebuilt zanrt_sync object rather than the
+    /// emitted IR, so the IDE's `clang <ir>.ll` step must link it explicitly.
+    /// Prefer the MSVC-target object (zanrt_sync_ide.obj) since the IDE links
+    /// against clang's default MSVC target; the GNU-target zanrt_sync.obj pulls
+    /// in __mingw_* and won't resolve. Returns "" when no object is present so
+    /// ordinary programs still link unchanged. The object only references
+    /// kernel32 (threads / mutexes / file mappings), so linking it into a
+    /// program that doesn't call it is harmless dead code.
+    static string RtSyncArg() {
+        string cand = ZanIDE.ToolchainDir() + "/zanrt_sync_ide.obj";
+        if (File.Exists(cand)) { return " \"" + cand + "\""; }
+        cand = ZanIDE.BaseDir() + "/zanrt_sync_ide.obj";
+        if (File.Exists(cand)) { return " \"" + cand + "\""; }
+        cand = ZanIDE.ToolchainDir() + "/zanrt_sync.obj";
+        if (File.Exists(cand)) { return " \"" + cand + "\""; }
+        cand = ZanIDE.BaseDir() + "/zanrt_sync.obj";
+        if (File.Exists(cand)) { return " \"" + cand + "\""; }
+        return "";
+    }
+
+    /// Produces `exe` from `inputs` through zanc's OWN bundled linker (the GNU
+    /// ld shipped in toolchain\), so Build/Run/Debug/Publish need no external
+    /// clang or LLVM on the machine -- the IDE is as self-contained as the CLI
+    /// (verified with clang/gcc/ld off PATH). GUI targets add --subsystem
+    /// windows; the native GUI runtime is auto-bundled by zanc as the `zan_gui`
+    /// stdlib driver (stdlib\Gui\drivers), copied next to the exe. `ll` is
+    /// retained for signature stability but no longer used. Mode flags:
+    /// `publish` adds --publish (optimize + strip, the Release mode); `debug`
+    /// adds -g instead (DWARF + -O0, keeping runtime checks and source-line
+    /// crash locations for the Debug publish mode). `debug` wins over
+    /// `publish` when both are set.
+    static string CompileToExe(string root, string p, string inputs, string ll, string exe, bool publish, bool debug) {
+        string pub = "";
+        if (debug) { pub = " -g"; }
+        else if (publish) { pub = " --publish"; }
+        if (ZanIDE.IsLibraryProject(root)) {
+            // A library has no subsystem or icon; zanc picks the library
+            // format (shared/static) from the -o extension.
+            return ZanIDE.ZancCmd() + pub + " " + inputs + " -o \"" + exe + "\"";
+        }
+        string sub = "";
+        if (ZanIDE.IsWindowedTarget(root, p)) { sub = " --subsystem windows"; }
+        return ZanIDE.ZancCmd() + pub + " " + inputs + " -o \"" + exe + "\"" + sub
+            + ZanIDE.IconArg(root);
+    }
+
+    /// Like CompileToExe but cross-compiles for an explicit `--target` (e.g.
+    /// win-arm64) through zanc's OWN bundled toolchain, so publishing needs no
+    /// external clang/LLVM. Statically links the native driver so the cross
+    /// output stays a single self-contained file. `debug` swaps --publish for
+    /// -g (Debug publish mode: DWARF + -O0 + runtime checks).
+    static string CompileToExeCross(string root, string p, string inputs, string exe, string target, bool debug) {
+        string sub = "";
+        if (ZanIDE.IsWindowedTarget(root, p)) { sub = " --subsystem windows"; }
+        string mode = " --publish";
+        if (debug) { mode = " -g"; }
+        return ZanIDE.ZancCmd() + mode + " --target " + target
+            + " --link-mode static " + inputs + " -o \"" + exe + "\"" + sub
+            + ZanIDE.IconArg(root);
+    }
+
+    /// Reads a `key = value` field from the project's zan.proj, or "" if absent.
+    static string ProjField(string root, string key) {
+        string proj = root + "/zan.proj";
+        if (!File.Exists(proj)) { return ""; }
+        List<string> ls = ZanIDE.Lines(File.ReadAllText(proj));
+        for (int i = 0; i < ls.Count; i = i + 1) {
+            string tr = ZanIDE.TrimLeadSpaces(ls[i]);
+            if (tr.Length >= key.Length && tr.Substring(0, key.Length) == key) {
+                string rest = ZanIDE.TrimLeadSpaces(tr.Substring(key.Length, tr.Length - key.Length));
+                if (rest.Length > 0 && rest.Substring(0, 1) == "=") {
+                    string val = ZanIDE.TrimLeadSpaces(rest.Substring(1, rest.Length - 1));
+                    int e = val.Length;
+                    while (e > 0) {
+                        string ch = val.Substring(e - 1, 1);
+                        if (ch == " " || ch == "\t" || ch == "\r" || ch == "\n") { e = e - 1; }
+                        else { break; }
+                    }
+                    return val.Substring(0, e);
+                }
+            }
+        }
+        return "";
+    }
+
+    /// Writes/updates the project icon path (relative to the project root) in
+    /// zan.proj, dropping any prior `icon =` line so it stays single-valued.
+    static void SetProjectIcon(string root, string rel) {
+        string proj = root + "/zan.proj";
+        string content = "";
+        if (File.Exists(proj)) { content = File.ReadAllText(proj); }
+        List<string> ls = ZanIDE.Lines(content);
+        string outp = "";
+        for (int i = 0; i < ls.Count; i = i + 1) {
+            string ln = ls[i];
+            string tr = ZanIDE.TrimLeadSpaces(ln);
+            if (tr.Length >= 4 && tr.Substring(0, 4) == "icon") {
+                // drop the previous icon line; the new one is appended below
+            } else if (tr.Length > 0) {
+                outp = outp + ln + "\n";
+            }
+        }
+        outp = outp + "icon = " + rel + "\n";
+        File.WriteAllText(proj, outp);
+    }
+
+    /// Writes/updates a `key = value` field in zan.proj (dropping any prior line
+    /// for that key so it stays single-valued). Used for project settings edited
+    /// through the IDE, e.g. `singleFile`.
+    static void SetProjField(string root, string key, string val) {
+        string proj = root + "/zan.proj";
+        string content = "";
+        if (File.Exists(proj)) { content = File.ReadAllText(proj); }
+        List<string> ls = ZanIDE.Lines(content);
+        string outp = "";
+        for (int i = 0; i < ls.Count; i = i + 1) {
+            string ln = ls[i];
+            string tr = ZanIDE.TrimLeadSpaces(ln);
+            bool isKey = false;
+            if (tr.Length >= key.Length && tr.Substring(0, key.Length) == key) {
+                string rest = ZanIDE.TrimLeadSpaces(tr.Substring(key.Length, tr.Length - key.Length));
+                if (rest.Length > 0 && rest.Substring(0, 1) == "=") { isKey = true; }
+            }
+            if (isKey) {
+                // drop the previous line; the new one is appended below
+            } else if (tr.Length > 0) {
+                outp = outp + ln + "\n";
+            }
+        }
+        outp = outp + key + " = " + val + "\n";
+        File.WriteAllText(proj, outp);
+    }
+
+    /// Project setting: pack a Windows publish into one self-extracting exe
+    /// (DLLs bundled inside). Defaults to true (the historical behavior) unless
+    /// zan.proj explicitly sets `singleFile = false`.
+    static bool ProjSingleFile(string root) {
+        return ZanIDE.ProjField(root, "singleFile") != "false";
+    }
+
+    /// Project setting: publish in Debug mode (zanc -g -- DWARF + -O0, runtime
+    /// checks kept, crash logs resolve to .zan:line) instead of the default
+    /// Release mode (--publish, optimize + strip). Off by default so shipped
+    /// builds stay optimized unless zan.proj sets `pubDebug = true`.
+    static bool ProjPublishDebug(string root) {
+        return ZanIDE.ProjField(root, "pubDebug") == "true";
+    }
+
+    /// Project setting: whether a published GUI app bundles theme skins next to
+    /// its exe. Off by default -- the app then ships only its compiled-in base
+    /// theme and stays small (the full skin set is ~640KB, mostly banner art).
+    /// Turn it on so the produced app's top-right skin picker has packs to load.
+    static bool ProjSkinsEnabled(string root) {
+        return ZanIDE.ProjField(root, "skins") == "1";
+    }
+
+    /// The skin packs available to bundle: the directory names under the shipped
+    /// stdlib Gui/skins folder (base.css and other loose files are not dirs).
+    static List<string> AvailableSkinNames() {
+        List<string> names = new List<string>();
+        string dir = ZanIDE.StdlibDir() + "/Gui/skins";
+        if (!Directory.Exists(dir)) { return names; }
+        List<string> subs = Directory.GetDirectories(dir);
+        for (int i = 0; i < subs.Count; i = i + 1) { names.Add(subs[i]); }
+        return names;
+    }
+
+    /// The skins the project chose to bundle (zan.proj `skinlist = a,b,c`).
+    /// When packaging is on but nothing was saved yet, defaults to dark + light
+    /// so the picker still has something to switch between.
+    static List<string> ProjSkinList(string root) {
+        List<string> outp = new List<string>();
+        string raw = ZanIDE.ProjField(root, "skinlist");
+        int start = 0;
+        for (int i = 0; i <= raw.Length; i = i + 1) {
+            if (i == raw.Length || raw.Substring(i, 1) == ",") {
+                string tok = ZanIDE.TrimLeadSpaces(raw.Substring(start, i - start));
+                int e = tok.Length;
+                while (e > 0) {
+                    string ch = tok.Substring(e - 1, 1);
+                    if (ch == " " || ch == "\t") { e = e - 1; } else { break; }
+                }
+                tok = tok.Substring(0, e);
+                if (tok != "") { outp.Add(tok); }
+                start = i + 1;
+            }
+        }
+        if (outp.Count == 0) {
+            outp.Add("dark");
+            outp.Add("light");
+        }
+        return outp;
+    }
+
+    /// True when the project builds a library instead of a runnable program
+    /// (zan.proj `target = dll/lib/so/dylib/a` or `type = library`). Library
+    /// projects are compiled to the platform's library format and never
+    /// launched after a build.
+    static bool IsLibraryProject(string root) {
+        string t = ZanIDE.ProjField(root, "target");
+        if (t == "dll" || t == "lib" || t == "so" || t == "dylib" || t == "a") {
+            return true;
+        }
+        return ZanIDE.ProjField(root, "type") == "library";
+    }
+
+    /// The shared-library extension of the machine the IDE runs on.
+    static string HostLibExt() {
+        #if WINDOWS
+        return ".dll";
+        #elif MACOS
+        return ".dylib";
+        #else
+        return ".so";
+        #endif
+    }
+
+    /// The shared-library extension for a publish target id
+    /// (windows-* -> .dll, macos-* -> .dylib, linux-* -> .so).
+    static string LibExtFor(string id) {
+        if (ZanIDE.StartsWith(id, "windows")) { return ".dll"; }
+        if (ZanIDE.StartsWith(id, "macos")) { return ".dylib"; }
+        return ".so";
+    }
+
+    /// The static-library extension for a publish target id
+    /// (windows-* -> .lib, everything else -> .a).
+    static string StaticLibExtFor(string id) {
+        if (ZanIDE.StartsWith(id, "windows")) { return ".lib"; }
+        return ".a";
+    }
+
+    /// Whether the library project also publishes static archives
+    /// (zan.proj `staticLib = true`).
+    static bool ProjStaticLib(string root) {
+        return ZanIDE.ProjField(root, "staticLib") == "true";
+    }
+
+    /// The icon a produced executable should carry: the project's configured
+    /// one (zan.proj `icon = ...`), then assets/app.ico, then the shipped Zan
+    /// icon -- so every program the IDE builds, tools and samples included,
+    /// gets an icon. Returns "" when none of them exists.
+    static string IconFile(string root) {
+        string rel = ZanIDE.ProjField(root, "icon");
+        if (rel != "") {
+            string ico = root + "/" + rel;
+            if (File.Exists(ico)) { return ico; }
+        }
+        string a = ZanIDE.AssetsDir(root) + "/app.ico";
+        if (File.Exists(a)) { return a; }
+        return ZanIDE.ZanIconSource();
+    }
+
+    /// The same icon as a zanc `--icon` argument, or "" when there is none.
+    static string IconArg(string root) {
+        string f = ZanIDE.IconFile(root);
+        if (f == "") { return ""; }
+        return " --icon \"" + f + "\"";
+    }
+}

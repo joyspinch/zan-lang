@@ -1,0 +1,473 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+using System.Data;
+using System.Data.Sqlite;
+using Platform;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+using Gui.Component;
+using Game.Scene;
+
+/// 启动时装配的后半段：面板与停靠、Git 面板、小助手、运行状态、侧栏，
+/// 以及新建项目 / 新建文件 / 另存为模板共用的向导宿主。
+partial class ZanIDE {
+    /// Right side panel (AI / tools / examples / git) and the dockable main
+    /// area, seeded from the persisted extents.
+    void InitPanelsAndDock(string cfg) {
+        treeW = new SignalInt(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "treeW", 240), 120, 900));
+        // Seeds for the dock's side extents on a first run (afterwards dock.cfg
+        // carries the sizes the user dragged).
+        bottomPanelH = new SignalInt(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "bottomH", 190), 70, 2000));
+
+        // ---- Right side panel (AI assistant, tools, examples, git) ----
+        rightW = new SignalInt(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "rightW", 600), 120, 1600));
+
+        // ---- Dockable main area ----
+        // The shell around the document area is a DockHost: EXPLORER, the
+        // structure/components outline, STDLIB, OUTPUT and the assistant column
+        // are tab groups the user can drag to another side, tab together,
+        // resize and close (right-click a tab strip to bring a closed one
+        // back). The editor is the fixed center panel everything docks around.
+        // The arrangement is persisted in dock.cfg and restored on launch.
+        // Every tool panel closes; the ribbon's Panels section is the switch
+        // that brings it back (its icon goes dark while the panel is hidden).
+        dock = new DockHost();
+        dock.emptyMenuLabel = ZanIDE.T("No closed panels", "没有已关闭的面板");
+        dock.Register("explorer", "", DockSide.Left(), true, true);
+        dock.Register("structure", "", DockSide.Left(), true, true);
+        dock.Register("stdlib", "", DockSide.Left(), true, true);
+        // 设计器的组件面板和属性面板是 IDE 自己的 dock 面板，
+        // 不再占用设计器画布两侧的位置：设计器里只剩功能区 + 画布。
+        dock.Register("toolbox", "", DockSide.Left(), true, false);
+        dock.RegisterFixed("editor", "Editor");
+        // The assistant column and the bottom band each start as one tab group.
+        dock.Register("ai", "", DockSide.Right(), true, true);
+        dock.Register("tools", "", DockSide.Right(), true, false);
+        dock.Register("examples", "", DockSide.Right(), true, false);
+        dock.Register("git", "", DockSide.Right(), true, false);
+        dock.Register("props", "", DockSide.Right(), true, false);
+        dock.Register("output", "", DockSide.Bottom(), true, true);
+        dock.Register("errors", "", DockSide.Bottom(), true, false);
+        dock.Register("help", "", DockSide.Bottom(), true, false);
+        ZanIDE.ApplyPanelLabels(dock);
+        dock.SetWeight("explorer", 40);
+        dock.SetWeight("structure", 32);
+        dock.SetWeight("stdlib", 28);
+        dock.SetSideExtent(DockSide.Left(), treeW.Get());
+        dock.SetSideExtent(DockSide.Right(), rightW.Get());
+        dock.SetSideExtent(DockSide.Bottom(), bottomPanelH.Get());
+        dock.LoadLayout(ZanIDE.ReadDockLayout());
+        // The outline panel retitles itself between STRUCTURE and COMPONENTS as
+        // the designer opens and closes; this tracks the title in effect.
+        dockOutlineTitle = "";
+        // The errors panel tab carries the diagnostic count; this tracks it.
+        dockErrorsTitle = "";
+    }
+
+    /// Builds the designed dock panels: every panel is a compile-time
+    /// `.zform` control document plus its code-behind (see
+    /// `src/ide_zan/src/panels/`), so the shell only owns the composition --
+    /// which panel goes where, and the rect each one gets. The panels''' own
+    /// widgets stay the source of truth for the state the shell still reads
+    /// (the explorer tree, the console's filter/scroll state), so nothing is
+    /// duplicated.
+    void InitDockPanels(Form form) {
+        explorerPanel = new ExplorerPanel();
+        explorerPanel.Wire(treeSel, treeFilter);
+        explorerTv = ExplorerPanel.Tree;
+        outputPanel = new OutputPanel();
+        coFilter = outputPanel.FilterBox();
+        coLog = outputPanel.State();
+        errorsPanel = new ErrorsPanel();
+        errorList = ErrorsPanel.List;
+        gitPanel = new GitPanel();
+        gitList = gitPanel.FileList();
+        structurePanel = new StructurePanel();
+        structurePanel.Wire(structSel, structFilter);
+        structTv = structurePanel.Tree();
+        stdlibPanel = new StdlibPanel();
+        stdlibPanel.Wire(exSel, exFilter);
+        stdlibTv = stdlibPanel.Tree();
+        toolsPanel = new ToolsPanel();
+        toolsPanel.Wire(rtToolSel, rtToolFilter);
+        toolsTv = toolsPanel.Tree();
+        examplesPanel = new ExamplesPanel();
+        examplesPanel.Wire(rtExSel, rtExFilter);
+        examplesTv = examplesPanel.Tree();
+        // The designed `on<Event>` bindings of every panel go through the
+        // form'''s handler registry, so hand the form over and register them.
+        OutputPanel.__WireForm(form);
+        GitPanel.__WireForm(form);
+        form.On("outputClear", ZanIDE.OutputClearRequested);
+        GitPanel.WireHandlers(form);
+            // 小赞面板：界面在 panels/AiPanel.zform，行为在 ZanIDE.AiPanel.zan。
+            aiPanel = new AiPanel();
+        AiPanel.__WireForm(form);
+        AiPanel.WireHandlers(form);
+            // 团队条是小赞面板设计里的子控件，它的事件走同一份注册表。
+            TeamBoard.__WireForm(form);
+        TeamBoard.WireHandlers(form);
+        aiPanel.SetModelSelect(aiModelSel);
+        // 调试界面（views/DebugPanel.zform / DebugToolbar.zform /
+            // DebugInlineVars.zform）：只在调试时可见，但控件树常驻。
+            // 这样滚动位置与监视表在两次单步之间不会丢。
+            dbgPanel = new DebugPanel();
+        dbgToolbar = new DebugToolbar();
+        dbgInline = new DebugInlineVars();
+    }
+
+    /// Git panel state (the right panel's "Git" tab).
+    void InitGitPanel() {
+        // ---- Git panel state (right panel "Git" tab) ----
+        // gitFiles holds `git status --porcelain` lines; gitLoaded gates the
+        // first (and refresh-triggered) status scan so git only runs on demand.
+        gitFiles = new List<string>();
+        gitBranch = "";
+        gitLoaded = false;
+        // Which detached git job is in flight (0 none, 1 status+branch scan,
+        // 2 a command whose output goes to Output); the frame loop polls it so
+        // git never blocks drawing.
+        gitJob = 0;
+        gitSel = new SignalInt(0 - 1);
+        gitScroll = new SignalInt(0);
+        // Tools / Examples trees for the right panel tabs.
+        rtToolTree = ZanIDE.BuildDirTree(ZanIDE.ToolsDir());
+        rtExTree = ZanIDE.BuildExampleTree();
+        rtToolSel = new SignalInt(-1);
+        rtExSel = new SignalInt(-1);
+        rtToolFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
+        rtExFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
+        rtCtxShow = new List<TreeNode>();
+        // Chat transcript: real message entities (role + text + reason) and
+        // the task-plan steps (text + done flag).
+        aiMsgs = new List<ChatMessage>();
+        aiPlan = new List<AiPlanStep>();
+        aiThinkOpen = new SignalInt(0);
+        // 1 while a completion request is in flight (curl runs detached and the
+        // event loop polls for its done-marker file, so the UI never blocks).
+        aiBusy = new SignalInt(0);
+        aiRunModel = "";
+        aiRunCtxName = "";
+        aiRunCtxCode = "";
+        // Action tools start gated: nothing is written, built or run until the
+        // user approves it, until they flip Auto-execute on.
+        aiPendingCall = "";
+        aiAutoExec = false;
+        aiBuildForAi = false;
+        aiUiPending = false;
+        aiUiRunning = false;
+        aiUiScript = "";
+        aiUiDeadline = 0;
+        aiChatFirstResp = 0;
+        aiWaitStart = 0;
+        aiStreamMsgIdx = 0 - 1;
+        aiStreamLen = 0;
+    }
+
+    /// AI assistant: provider profiles, chat sessions, transcript cache and the
+    /// in-flight request flags.
+    void InitAiState() {
+        // ---- AI provider profiles (ai_profiles.json) ----
+        aiProfiles = new List<AiProfile>();
+        aiProfActive = ZanIDE.AiProfilesLoad(aiProfiles);
+        aiProfHold = ZanIDE.AiProfilesHold(aiProfiles);
+        // The unified AI configuration lives in its own child window
+        // (AiSettingsWindow, built like the editor settings).
+        aiWindow = null;
+        // Chat model switcher: the dropdown lists the active profile's models
+        // (default model first); no selection = the profile's default model.
+        aiModelSel = new Dropdown<ModelOption>(o => o.label);
+        aiModelSel.Hint(ZanIDE.T("Provider / model", "服务商 / 模型"));
+        aiModelOptions = new List<ModelOption>();
+        aiModelSelSig = "";
+        // Chat sessions: switch / new / clear the transcript context. Inactive
+        // sessions are kept serialized in `aiSessions` (ChatPack JSON).
+        aiSessions = new List<AiSession>();
+        aiSessCur = 0;
+        aiSessions.Add(AiSession.Create("", 0));
+        // Team runtime. Default off so the panel is the single assistant until
+        // the user flips the switch; the state is a live object either way so
+        // the pipeline code never has to null-check it.
+        aiTeamMode = false;
+        aiSendTo = "";
+        aiRunAgent = "";
+        aiHandoffs = 0;
+        aiTeamSt = AiTeamState.Create();
+        aiTasks = new List<AiTask>();
+        aiTeamOpen = new SignalInt(0);
+        // Restore sessions persisted on disk so a restart continues the last
+        // conversation instead of starting from an empty chat.
+        LoadAiSessions();
+        aiLastSave = 0;
+        aiSessNav = new SessionList(
+            ZanIDE.T("Search chats...", "搜索会话..."),
+            ZanIDE.T("New chat", "新会话"))
+            .EmptyText(ZanIDE.T("No chats", "暂无会话"))
+            .Labels(
+                ZanIDE.T("Archive / restore this chat (kept, just hidden)",
+                    "归档 / 恢复此会话（保留内容，仅从列表折叠）"),
+                ZanIDE.T("Delete this chat and its whole context",
+                    "删除此会话及其全部上下文"),
+                ZanIDE.T("Archived", "已归档"))
+            .RenameLabel(ZanIDE.T("Rename this chat (Enter keeps, Esc cancels)",
+                "重命名此会话（回车保存，Esc 取消）"));
+        // Chat transcript wrapped-line cache (rebuilt only when the transcript,
+        // width or theme changes — rewrapping every frame is too slow).
+        aiCacheLines = new List<TextRun>();
+        aiToolOpen = new List<int>();
+        aiCacheKey = "";
+        aiCacheSig = "";
+        aiChatSel = new LogState();
+        aiTokPrompt = 0;
+        aiTokCompletion = 0;
+        aiTokTotal = 0;
+        aiTokCached = 0;
+        aiRetry = 0;
+        aiAutoCont = 0;
+    }
+
+    /// Run/build state: the streaming run shell, the detached build's poll
+    /// bookkeeping and hot reload.
+    void InitRunState(string cfg) {
+        // Run shell: a persistent interactive shell session used to stream a
+        // launched program's output into the Output tab without blocking the
+        // UI. Its stdin is a pipe (Process.ShellSend) and its stdout/stderr
+        // stream to a session log file polled each frame.
+        termFp = 0;
+        termLogLen = 0;
+        // Console-program output mirror: a launched console program prints into
+        // its own console window and, teed, into RunLogPath, which is polled
+        // into the Output tab so output shows in both places.
+        runLogLen = 0;
+        runStreaming = false;
+        // Detached (non-blocking) build behind the Run/Build ribbon actions:
+        // the compile runs in a separate shell so the UI never freezes; the
+        // main loop polls a done-marker, then applies diagnostics and launches.
+        buildBusy = false;
+        buildLogLen = 0;
+        buildExe = "";
+        buildIsGui = false;
+        buildThenRun = false;
+        // When the in-flight detached build is a debug (`-g`) build, the poll
+        // opens the debugger on success instead of running the program.
+        dbgBuildPending = false;
+        buildTargetPath = "";
+        // Hot reload: when ON, saving rebuilds and restarts the running app.
+        autoRun = ZanIDE.CfgInt(cfg, "autoRun", 0) == 1;
+        // Set by a save when autoRun is ON; consumed once per loop to kick off a
+        // DETACHED rebuild (never a synchronous compile on the UI thread).
+        hotReloadReq = false;
+        treeSel = new SignalInt(-1);
+    }
+
+    /// Sidebar sections: explorer / structure / stdlib trees, their filters and
+    /// scroll offsets.
+    void InitSidebarState() {
+        // Vertical scroll offsets for the sidebar sections, so long lists stay
+        // inside their region (EXPLORER in pixels, COMPONENTS/EXAMPLES in rows).
+
+        // Third sidebar section: the standard library as a collapsible tree
+        // (browse/open stdlib sources directly, like aardio's 库 pane).
+        exTree = ZanIDE.BuildStdlibTree();
+        exSel = new SignalInt(-1);
+
+        // Per-section filter boxes: each sidebar tree can be narrowed by a
+        // case-insensitive substring; the displayed (possibly filtered) lists
+        // are recomputed every frame so click handlers index into them.
+        treeFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
+        structFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
+        exFilter = new Input(ZanIDE.T("Filter...", "筛选..."));
+        treeShow = new List<TreeNode>();
+        structShow = new List<TreeNode>();
+        exShow = new List<TreeNode>();
+
+        // STRUCTURE (code outline): types + their members for the active code
+        // file, rebuilt only when the buffer signature changes so navigation
+        // stays cheap. Clicking a member jumps the editor to its line.
+        structTree = new List<TreeNode>();
+        structSel = new SignalInt(-1);
+        structSig = "@none";
+    }
+
+    /// Spawns the wizard child window (New Project / New File / Save-as-
+    /// Template) as a WizardHost: a registered child window whose render
+    /// callback draws the immediate-mode Wizard into its own frame -- inside
+    /// ChildWindows.PumpAll, not this shell -- and dispatches the reported
+    /// action back into the shell.
+    WizardHost OpenWizardHost(App parent, string title, int w, int h, int mode) {
+        WizardHost host = new WizardHost(title, w, h);
+        // OS caption / ESC close: dismiss the wizard (and any picker it
+        // opened) without creating anything.
+        host.OnClose(() => {
+            dlg = null;
+            dlgMode = 0;
+            if (pathPickerOwner == 1) {
+                pathPicker.Close();
+                pathPickerOwner = 0;
+            }
+            app.RequestRedraw();
+        });
+        // The wizard is immediate-mode: each frame builds the Wizard for the
+        // current mode, renders it into the child window's own frame and
+        // applies the Create / Cancel / Browse action it reports.
+        host.SetRender(() => {
+            App hApp = host.Host();
+            if (pathPicker.IsOpen()) { return; }
+            hApp.BeginFrame();
+            // The wizard is immediate-mode but shares the process-wide
+            // WidgetId counter with the main window (which the IDE never
+            // rewinds). Pin a fixed high baseline for the dialog's own
+            // frame so its buttons (Create/Cancel/Browse) get identical
+            // ids every frame -- otherwise hover/press/click never match
+            // the pointer target resolved on the previous frame and the
+            // Cancel/Create buttons appear dead. Restore afterwards.
+            int savedSeq = WidgetId.SeqValue();
+            WidgetId.SetSeq(850000);
+            int action = 0;
+            Wizard wiz;
+            if (dlgMode == 1) {
+                // Seed the device-size row from the newly selected template's
+                // own design size, so the size shown (and previewed) is the
+                // one the scaffold would use if Create is pressed right away.
+                int psel = pSel.Get();
+                if (psel != pSizeSeededFor) {
+                    pSizeSeededFor = psel;
+                    pSizeSel.Set(-1);
+                    string sw = "";
+                    string sh = "";
+                    if (psel >= 0 && psel < tpls.Count && tpls[psel].sizeable
+                            && tpls[psel].defW > 0 && tpls[psel].defH > 0) {
+                        sw = Convert.ToString(tpls[psel].defW);
+                        sh = Convert.ToString(tpls[psel].defH);
+                    }
+                    pSizeWIn.SetText(sw);
+                    pSizeHIn.SetText(sh);
+                }
+                wiz = Wizard.Categorized(ZanIDE.T("New Project", "新建项目"), catNames, catSel,
+                                         wizTpls, pSel,
+                                         pNameInput, pLocInput,
+                                         platforms, platformGroups,
+                                         pSizeSel, pSizeWIn, pSizeHIn);
+            } else if (dlgMode == 3) {
+                wiz = new Wizard(ZanIDE.T("Save as Template", "另存为模板"), saveItems,
+                                    tmplCatSel, tmplNameInput, tmplNameInput, false, null);
+            } else {
+                // The size row only makes sense for templates that produce a
+                // designed window (Form / Free Layout / Scene, kinds 7-9);
+                // code files and folders have no window size. Hide it for
+                // everything else instead of showing dead controls.
+                SignalInt szSel = null;
+                int fk = fSel.Get();
+                if (fk >= 7 && fk <= 9) { szSel = fSizeSel; }
+                wiz = new Wizard(ZanIDE.T("New File", "新建文件"), fileItems, fSel,
+                                    fNameInput, fNameInput, false, szSel,
+                                    fSizeWIn, fSizeHIn);
+            }
+            action = wiz.Show(hApp);
+            WidgetId.SetSeq(savedSeq);
+            hApp.PresentFrame();
+
+            if (action == 1) {
+                bool dlgDone = true;
+                if (dlgMode == 1) {
+                    string parentDir = pLocInput.GetText();
+                    string name = pNameInput.GetText();
+                    int gi = pSel.Get();
+                    if (gi >= 0 && gi < tpls.Count && tpls[gi].ptype == "gui" && ZanIDE.IsGuiReservedName(name)) {
+                        Wizard.notice = ZanIDE.T(
+                            "That name conflicts with a built-in Gui/System type. Choose another.",
+                            "该名称与内置的 Gui/System 类型冲突，请换一个名称。");
+                        dlgDone = false;
+                    } else if (!ZanIDE.IsValidProjectName(name)) {
+                        Wizard.notice = ZanIDE.T(
+                            "The name contains invalid characters or is reserved. Use letters, digits, '_' or '-'.",
+                            "名称包含非法字符或是保留名，请使用字母、数字、下划线或连字符。");
+                        dlgDone = false;
+                    } else if (gi >= 0 && gi < tpls.Count) {
+                        string plats = ZanIDE.PlatformCsv(platforms);
+                        ZanIDE.WriteLastPickerDirectory(parentDir);
+                        string newDir = ZanIDE.CreateProjectT(tpls[gi], parentDir, name, plats,
+                            ZanIDE.ParseIntSafe(pSizeWIn.GetText()),
+                            ZanIDE.ParseIntSafe(pSizeHIn.GetText()), log);
+                        if (newDir == "") {
+                            // Creation failed (folder not empty, filesystem
+                            // error, ...): the specific reason is in `log`;
+                            // keep the wizard open so the user can retry.
+                            Wizard.notice = ZanIDE.T(
+                                "Project creation failed. See the Output tab for details.",
+                                "创建项目失败，详情见输出面板。");
+                            dlgDone = false;
+                        } else {
+                            root = newDir;
+                            haveProject = true;
+                            Layer.Notify(ZanIDE.T("Project created: ", "项目已创建：") + name, 3);
+                            ZanIDE.WriteLastProject(root);
+                            this.AdoptSymbolIndex();
+                            this.AdoptProjectChats();
+                            tabs = new List<TabRecord>();
+                            activeTab.Set(0);
+                            lastActive = 0 - 1;
+                            ZanIDE.OpenFirst(tabs, activeTab, root);
+                        }
+                    }
+                } else if (dlgMode == 3) {
+                    string cat = saveItems[tmplCatSel.Get()].name;
+                    string tname = tmplNameInput.GetText();
+                    ZanIDE.SaveAsTemplate(root, cat, tname, log);
+                    Layer.Notify(ZanIDE.T("Template saved: ", "模板已保存：") + tname, 3);
+                } else {
+                    string name = fNameInput.GetText();
+                    if (ZanIDE.FileKindDeclaresType(fSel.Get())
+                            && ZanIDE.IsGuiReservedName(name)) {
+                        Wizard.notice = ZanIDE.T(
+                            "That name conflicts with a built-in Gui/System type. Choose another.",
+                            "该名称与内置的 Gui/System 类型冲突，请换一个名称。");
+                        dlgDone = false;
+                    } else {
+                        string p = ZanIDE.CreateFile(fSel.Get(), root, name, fSizeSel.Get(),
+                            ZanIDE.ParseIntSafe(fSizeWIn.GetText()),
+                            ZanIDE.ParseIntSafe(fSizeHIn.GetText()), log);
+                        if (!Directory.Exists(p)) {
+                            ZanIDE.OpenPath(tabs, activeTab, p, Path.GetFileName(p));
+                        }
+                        Layer.Notify(ZanIDE.T("Created: ", "已创建：") + Path.GetFileName(p), 3);
+                    }
+                }
+                if (dlgDone) {
+                    rescan = true;
+                    Wizard.notice = "";
+                    host.Close();
+                    dlg = null;
+                    dlgMode = 0;
+                } else {
+                    host.RequestRedraw();
+                }
+                app.RequestRedraw();
+            } else if (action == 2) {
+                Wizard.notice = "";
+                host.Close();
+                dlg = null;
+                dlgMode = 0;
+                app.RequestRedraw();
+            } else if (action == 3) {
+                if (dlgMode == 1 && !pathPicker.IsOpen()) {
+                    pathPicker.BeginFolder(ZanIDE.ReadLastPickerDirectory(pLocInput.GetText()),
+                        ZanIDE.T("Select project location", "选择项目位置"));
+                    pathPickerOwner = 1;
+                    host.RequestRedraw();
+                }
+            }
+        });
+        dlg = host;
+        dlgMode = mode;
+        if (mode == 2) {
+            fSel.Set(0);
+            fNameInput.SetText("NewFile");
+        }
+        host.Open(parent);
+        return host;
+    }
+}

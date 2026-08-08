@@ -1,0 +1,239 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+using System.Data;
+using System.Data.Sqlite;
+using Platform;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+using Gui.Component;
+using Game.Scene;
+
+/// 小助手的工具派发：模型回一个工具块，这里执行它并把结果喂回去。
+partial class ZanIDE {
+    /// Ends the member's turn. Outside team mode this is just "go idle".
+    ///
+    /// In team mode the reply's protocol beat decides what happens next: a
+    /// [question] parks the pipeline for the user (nobody guesses on the user's
+    /// behalf), a [handoff]/[block] wakes the next member with a directive
+    /// naming the task, and anything else means the same member still owns the
+    /// work. The chain is bounded by MaxHandoffs() so a pair of members cannot
+    /// volley a task back and forth forever without the user seeing it.
+    void AiTeamTurnEnd(string said) {
+        if (!aiTeamMode) { aiBusy.Set(0); return; }
+        AiEnvelope env = AiTeam.ParseEnvelope(said);
+        string from = aiRunAgent;
+        if (from == "") { from = AiTeam.Pm(); }
+        aiTeamSt = AiTeam.Advance(aiTeamSt, from, env);
+        if (aiTeamSt.awaitingUser) {
+            // Waiting on the user is a real stop: the panel shows who asked.
+            aiBusy.Set(0);
+            return;
+        }
+        string nxt = aiTeamSt.activeAgent;
+        if (nxt == "" || nxt == from) { aiBusy.Set(0); return; }
+        if (aiHandoffs >= AiTeam.MaxHandoffs()) {
+            aiMsgs.Add(ChatMessage.Create("error", ZanIDE.T(
+                "Handoff limit reached; the team stopped so you can look.",
+                "交接次数已达上限，团队已暂停，请你介入查看。")));
+            aiBusy.Set(0);
+            return;
+        }
+        aiHandoffs = aiHandoffs + 1;
+        aiRunAgent = nxt;
+        aiRetry = 0;
+        aiAutoCont = 0;
+        ChatMessage hmsg = ChatMessage.Create("user",
+            AiTeam.HandoffPrompt(from, nxt, env));
+        hmsg.to = nxt;
+        hmsg.kind = AiTeam.KindAssign();
+        hmsg.taskId = aiTeamSt.activeTask;
+        aiMsgs.Add(hmsg);
+        string herr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
+            aiRunCtxName, aiRunCtxCode, root,
+            aiProfiles[aiProfActive].baseUrl,
+            aiProfiles[aiProfActive].key, aiRunModel);
+        if (herr != "") {
+            aiMsgs.Add(ChatMessage.Create("error", herr));
+            aiBusy.Set(0);
+        } else {
+            aiBusy.Set(1);
+        }
+        this.AiChatToEnd();
+        app.RequestRedraw();
+    }
+
+    /// Runs one assistant tool call inside the open project and continues the
+    /// loop. File tools (`write_file` / `edit_file`, and the read tools) run
+    /// here and their result is handed straight back to the model. `build` /
+    /// `run` go through the IDE's detached build so the window never freezes;
+    /// they leave `aiBusy` at 1 and the build-completion poll feeds the
+    /// compiler output back. A launch error stops the loop.
+    void AiDispatchTool(string call) {
+        string tool = AiAgent.ToolName(call);
+        // 工具执行前先推进状态机：读=事实检索，写=实施，build=编译,
+        // run/ui_check=运行验证。结果由构建完成的轮询回填。
+        this.AiRunTool(tool, call);
+        // The whitelist is enforced where the tool actually runs. Asking a
+        // member in its prompt not to touch a tool is not a boundary; refusing
+        // the call is, and naming the owner turns the refusal into a handoff
+        // instead of another blocked attempt.
+        if (aiTeamMode && aiRunAgent != ""
+            && !AiTeam.AllowsTool(aiRunAgent, tool)) {
+            aiMsgs.Add(ChatMessage.Create("tool",
+                AiAgent.Describe(call) + "\n"
+                + AiTeam.DenyTool(aiRunAgent, tool)));
+            string gerr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
+                aiRunCtxName, aiRunCtxCode, root,
+                aiProfiles[aiProfActive].baseUrl,
+                aiProfiles[aiProfActive].key, aiRunModel);
+            if (gerr != "") {
+                aiMsgs.Add(ChatMessage.Create("error", gerr));
+                aiBusy.Set(0);
+            }
+            return;
+        }
+        if (tool == "plan") {
+            aiPlan = new List<AiPlanStep>();
+            int nsteps = AiAgent.ParsePlan(call, aiPlan);
+            aiMsgs.Add(ChatMessage.Create("tool",
+                AiAgent.Describe(call) + "\nplan updated: "
+                + Convert.ToString(nsteps) + " step(s)."));
+            string plerr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs, aiRunCtxName,
+                aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
+                aiProfiles[aiProfActive].key, aiRunModel);
+            if (plerr != "") {
+                aiMsgs.Add(ChatMessage.Create("error", plerr));
+                aiBusy.Set(0);
+            }
+            return;
+        }
+        if (tool == "diff" || tool == "run_errors") {
+            string body = "";
+            if (tool == "diff") {
+                body = ZanIDE.AiDiffResult(root);
+            } else {
+                body = ZanIDE.AiRunErrorsResult();
+            }
+            aiMsgs.Add(ChatMessage.Create("tool",
+                AiAgent.Describe(call) + "\n" + body));
+            string derr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs, aiRunCtxName,
+                aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
+                aiProfiles[aiProfActive].key, aiRunModel);
+            if (derr != "") {
+                aiMsgs.Add(ChatMessage.Create("error", derr));
+                aiBusy.Set(0);
+            }
+            return;
+        }
+        if (tool == "build" || tool == "run" || tool == "ui_check"
+            || tool == "ui_tree") {
+            string apB = ZanIDE.PathOf(tabs, activeTab);
+            string rpB = ZanIDE.RibbonRunTarget(apB, root);
+            if (rpB == "") {
+                aiMsgs.Add(ChatMessage.Create("tool",
+                    AiAgent.Describe(call)
+                    + "\nerror: no buildable/run target is selected in the IDE;"
+                    + " open a program file (with a Main) first."));
+                string e2 = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs, aiRunCtxName,
+                    aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
+                    aiProfiles[aiProfActive].key, aiRunModel);
+                if (e2 != "") {
+                    aiMsgs.Add(ChatMessage.Create("error", e2));
+                    aiBusy.Set(0);
+                }
+                return;
+            }
+            if (tool == "ui_check" || tool == "ui_tree") {
+                // Stage the driver script under _scratch/uidrv, then build; the
+                // completion poll launches the target under ZAN_UI_SCRIPT.
+                JsonValue uv = JsonValue.ParseLenient(call);
+                string script = "";
+                if (uv != null) { script = uv.Str("script", ""); }
+                aiUiTool = tool;
+                aiUiScript = AiAgent.NormalizeUiScript(script,
+                    tool == "ui_tree");
+                string uid = root + "/_scratch/uidrv";
+                Directory.CreateDirectoryRecursive(uid);
+                File.WriteAllText(uid + "/ai_script.txt", aiUiScript);
+                File.WriteAllText(uid + "/results.log", "");
+                if (File.Exists(uid + "/regions.json")) {
+                    File.Delete(uid + "/regions.json");
+                }
+                if (File.Exists(uid + "/theme.json")) {
+                    File.Delete(uid + "/theme.json");
+                }
+                if (File.Exists(uid + "/ai_done.txt")) {
+                    File.Delete(uid + "/ai_done.txt");
+                }
+                aiUiPending = true;
+            }
+            buildBusy = true;
+            buildThenRun = (tool == "run") && !ZanIDE.IsLibraryProject(root);
+            buildExe = ZanIDE.RunBuildBegin(root, rpB);
+            buildIsGui = ZanIDE.IsWindowedTarget(root, rpB);
+            buildTargetPath = apB;
+            buildLogLen = 0;
+            aiBuildForAi = true;
+            dock.Focus("output");
+            log.Add(ZanIDE.T("> [AI] Building ", "> [AI] 正在构建 ") + rpB + " ...");
+            app.RequestAnimationFrame(80);
+            return;
+        }
+        string result = AiAgent.Run(root, call);
+        aiMsgs.Add(ChatMessage.Create("tool",
+            AiAgent.Describe(call) + "\n" + result));
+        // A write may touch a file open in a tab; the disk-change poll picks
+        // that up and offers a reload, so the editor and disk stay in sync.
+        string terr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs, aiRunCtxName,
+            aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
+            aiProfiles[aiProfActive].key, aiRunModel);
+        if (terr != "") {
+            aiMsgs.Add(ChatMessage.Create("error", terr));
+            aiBusy.Set(0);
+        }
+    }
+
+    /// Clears everything the assistant carries between turns of ONE chat:
+    /// the token counters, the retry / auto-continue budgets and any tool call
+    /// parked for approval. Called when the active chat is deleted or replaced
+    /// by a new one, so a fresh chat never inherits the old one's context.
+    void AiResetContextState() {
+        aiTokPrompt = 0;
+        aiTokCompletion = 0;
+        aiTokTotal = 0;
+        aiTokCached = 0;
+        aiRetry = 0;
+        aiAutoCont = 0;
+        aiPendingCall = "";
+    }
+
+    /// How a dropped file is written into the prompt: project-relative when it
+    /// lives under the open project (what the assistant's file tools accept),
+    /// otherwise the absolute path marked as outside the project so the reply
+    /// says so instead of the tool failing with a confusing path error.
+    static string AiDropRef(string path, string root) {
+        string p = path.Replace("\\", "/");
+        string r = root.Replace("\\", "/");
+        while (r != "" && r.Substring(r.Length - 1, 1) == "/") {
+            r = r.Substring(0, r.Length - 1);
+        }
+        if (r != "" && p.Length > r.Length + 1
+            && p.Substring(0, r.Length + 1) == r + "/") {
+            return p.Substring(r.Length + 1, p.Length - r.Length - 1);
+        }
+        return p + " (outside the project)";
+    }
+
+    /// True while the session's plan still has an unchecked step -- the signal
+    /// the poll uses to push the assistant on by itself instead of ending the
+    /// turn halfway down the checklist.
+    bool AiPlanUnfinished() {
+        for (int i = 0; i < aiPlan.Count; i = i + 1) {
+            if (aiPlan[i].done == 0) { return true; }
+        }
+        return false;
+    }
+}

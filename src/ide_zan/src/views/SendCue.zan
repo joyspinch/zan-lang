@@ -1,0 +1,99 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// 团队模式下输入框上方那一行「将发给 …」：收件人是状态（外壳的
+/// `aiSendTo`）而不是提示文本里的一句话，所以输入框里只有用户写的内容，
+/// 而且恰好一个成员被寻址。
+///
+/// 结构在 `views/SendCue.zform` 里声明（说明文字 + 收件人下拉 + 角色徽标）。
+/// 「自动」表示让上下文决定，此时徽标显示它当前解析到的成员。
+///
+/// 下拉框由这里建一次并留着：Dropdown 需要一个取文本的访问器，声明层
+/// 不持有它的类型参数；建好之后打开、命中、按外面点击关闭都归控件。
+partial class SendCue {
+    Dropdown<string> pick;
+    /// 下拉里每一项对应的成员 id（第 0 项是「自动」，id 为空）。
+    List<string> ids;
+    /// 下拉里的显示名，Dropdown 绑的就是这一份。
+    List<string> names;
+    /// 上一帧的成员集合，用来判断要不要重建选项。
+    string roleKey;
+    /// 本帧用户改了收件人。
+    bool changed;
+    static SendCue current;
+
+    void OnInit() {
+        ids = new List<string>();
+        names = new List<string>();
+        roleKey = "";
+        changed = false;
+        SendCue.current = this;
+        SendCue.ToLbl.Text = ZanIDE.T("Sending to", "将发给");
+        pick = new Dropdown<string>(SendCue.NameOf);
+        pick.Class = "small";
+        pick.dock = 5;
+        pick.Bind(names);
+        pick.OnChange(SendCue.Picked);
+        SendCue.PickHost.Add(pick);
+    }
+
+    /// 下拉里一行的文本：绑的就是显示名本身。
+    static string NameOf(string n) { return n; }
+
+    static void Picked() {
+        if (SendCue.current != null) { SendCue.current.changed = true; }
+    }
+
+    /// 这一行要占多高。
+    static int HeightOf(App app) {
+        return app.theme.heightSmall + app.Scale(4);
+    }
+
+    /// 当前选中的成员 id（"" = 自动，按上下文决定）。
+    string Recipient() {
+        int i = pick.SelectedIndex();
+        if (i < 0 || i >= ids.Count) { return ""; }
+        return ids[i];
+    }
+
+    /// 本帧用户换了收件人（取走后清标记）。
+    bool TakeChanged() {
+        bool c = changed;
+        changed = false;
+        return c;
+    }
+
+    /// 把当前收件人铺进控件。`sendTo` 是外壳持有的状态（""=自动），
+    /// `autoId` 是自动模式下当前解析到的成员。
+    void Sync(string sendTo, string autoId) {
+        List<AiRole> rs = AiTeam.Roles();
+        string key = "";
+        for (int i = 0; i < rs.Count; i = i + 1) { key = key + rs[i].id + ","; }
+        if (key != roleKey) {
+            // 成员集合变了（换服务商 / 改配置）才重建选项：每帧重建会
+            // 把下拉的选中项和打开状态冲掉。
+            ids = new List<string>();
+            names = new List<string>();
+            ids.Add("");
+            names.Add(ZanIDE.T("Auto (by context)", "自动（按上下文）"));
+            for (int i = 0; i < rs.Count; i = i + 1) {
+                ids.Add(rs[i].id);
+                names.Add(AiTeam.DisplayName(rs[i].id));
+            }
+            pick.Bind(names);
+            roleKey = key;
+        }
+        int want = 0;
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            if (ids[i] == sendTo) { want = i; }
+        }
+        if (pick.SelectedIndex() != want) { pick.SelectIndex(want); }
+        // 徽标说明这条消息实际会落到谁头上：自动模式下就是解析结果。
+        string who = sendTo;
+        if (who == "") { who = autoId; }
+        SendCue.Chip.Text = AiTeam.DisplayName(who);
+        SendCue.Chip.Class = AiTeam.RoleTagClass(who);
+        SendCue.Chip.SetShown(who != "");
+    }
+}

@@ -1,0 +1,230 @@
+using System;
+using System.IO;
+using Gui;
+using Gui.Widget;
+
+/// 「N 处引用」列表：CodeLens、Shift+F12 或「查找所有引用」在被引用的
+/// 位置不全在当前文件里时打开的那个浮层。
+///
+/// 结构在 `views/RefListPopup.zform` 里声明（标题行 + 关闭按钮、折叠
+/// 按钮的底行、填满中间的 TreeView）。折叠、悬停、选中、滚动和滚动条
+/// 都归控件；这里只把命中构造成节点、说一行代表哪个命中。
+///
+/// 浮层走标准的覆盖层通道：打开时把自己交给 `App.AddOverlay`，由
+/// `OnPaintOverlay` 在所有页面内容之后绘制，因此它压在代码之上、也不会
+/// 把点击漏给下面的编辑器。位置用 `OverlayPopup.FitX/FitY/FitH` 贴在
+/// 打开它的那一行下面，越界自动上翻，不再由外壳算矩形。
+///
+///     点一个命中    跳到那处引用，文件没打开就打开它
+///     点一个文件    折叠 / 展开这个文件的命中
+///     Escape / X    关闭
+///
+/// 列表是快照：打开时构建一次（有 zan-lsp 时由它给出，否则用文本扫描），
+/// 在屏幕上期间不会重新扫描。
+partial class RefListPopup {
+    bool open;
+    string word;
+    List<SearchHit> hits;
+    /// 树的行，以及每行代表的命中（文件行是 -1）。
+    List<TreeNode> nodes;
+    /// 浮层挂在哪里：打开它的那一行的左边缘与底边，绝对像素。
+    /// Visual Studio 把引用列表弹在它所属的代码上，而不是丢进窗口
+    /// 另一头的一个窗格里。
+    int anchorX;
+    int anchorY;
+    /// 本帧被激活的命中，由外壳取走（-1 表示没有）。
+    int picked;
+    /// 树的处理器要说话的对象：处理器是普通 Action，而同一时刻
+    /// 屏幕上只有一个引用列表。
+    static RefListPopup current;
+
+    void OnInit() {
+        open = false;
+        word = "";
+        hits = new List<SearchHit>();
+        nodes = new List<TreeNode>();
+        anchorX = 0 - 1;
+        anchorY = 0 - 1;
+        picked = 0 - 1;
+        RefListPopup.CloseBtn.SetProp("tip", ZanIDE.T("Close (Esc)", "关闭 (Esc)"));
+        RefListPopup.FoldBtn.Text = ZanIDE.T("Collapse All", "全部折叠");
+        RefListPopup.Tree.Bind(nodes);
+        RefListPopup.Tree.OnSelect(RefListPopup.RowPicked);
+        RefListPopup.current = this;
+    }
+
+    /// 一行被点了：文件行折叠（树自己做），命中行就是要打开的引用。
+    static void RowPicked() {
+        RefListPopup r = RefListPopup.current;
+        if (r == null) { return; }
+        int row = RefListPopup.Tree.SelectedIndex();
+        if (row >= 0 && row < r.nodes.Count) {
+            string p = r.nodes[row].payload;
+            if (p != "") { r.picked = ZanIDE.ParseInt(p); }
+        }
+    }
+
+    /// 把浮层挂到绝对坐标 (ax, ay) 的那一行下面。打开期间每帧调用，
+    /// 因此它随视图滚动跟着那一行走。
+    void Anchor(int ax, int ay) {
+        anchorX = ax;
+        anchorY = ay;
+    }
+
+    bool IsOpen() { return open; }
+    void Close() { open = false; }
+    List<SearchHit> Hits() { return hits; }
+    int Count() { return hits.Count; }
+
+    /// 本帧用户激活的命中（-1 表示没有），取走后清空。
+    int TakePicked() {
+        int p = picked;
+        picked = 0 - 1;
+        return p;
+    }
+
+    /// 把 `found` 作为 `symbol` 的引用按文件分组显示。路径相对 `root`
+    /// 标注 —— 项目目录每行都一样，只占宽度。结果为空则关闭列表，
+    /// 而不是留一个空面板在屏幕上。
+    void Show(string symbol, List<SearchHit> found, string root) {
+        word = symbol;
+        picked = 0 - 1;
+        // 一个文件的命中始终挨在一起，即使列表的来源（zan-lsp）把它们
+        // 交错给出：文件按第一次出现的顺序排。
+        List<string> order = new List<string>();
+        for (int i = 0; i < found.Count; i = i + 1) {
+            if (RefListPopup.IndexOfPath(order, found[i].path) < 0) {
+                order.Add(found[i].path);
+            }
+        }
+        hits = new List<SearchHit>();
+        nodes = new List<TreeNode>();
+        for (int g = 0; g < order.Count; g = g + 1) {
+            List<SearchHit> mine = new List<SearchHit>();
+            for (int k = 0; k < found.Count; k = k + 1) {
+                if (found[k].path == order[g]) { mine.Add(found[k]); }
+            }
+            nodes.Add(TreeNode.Dir(RefListPopup.RelPath(order[g], root) + " ("
+                + Convert.ToString(mine.Count) + ")", 0, true));
+            for (int k = 0; k < mine.Count; k = k + 1) {
+                SearchHit hit = mine[k];
+                int idx = hits.Count;
+                hits.Add(hit);
+                nodes.Add(TreeNode.FileIcon(Convert.ToString(hit.line + 1)
+                    + "  " + hit.text, 1, "code").WithPayload(Convert.ToString(idx)));
+            }
+        }
+        RefListPopup.Tree.Bind(nodes);
+        RefListPopup.Tree.ClearSelection();
+        open = hits.Count > 0;
+    }
+
+    /// `p` 在 `paths` 里的下标，没有就是 -1。
+    static int IndexOfPath(List<string> paths, string p) {
+        for (int i = 0; i < paths.Count; i = i + 1) {
+            if (paths[i] == p) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    /// 去掉前面项目根目录的 `path`。
+    static string RelPath(string path, string root) {
+        if (root.Length > 0 && path.Length > root.Length + 1
+                && path.StartsWith(root)) {
+            return path.Substring(root.Length + 1, path.Length - root.Length - 1);
+        }
+        return path;
+    }
+
+    /// 折叠（或展开）每一个文件。
+    void SetAllFolded(bool folded) {
+        for (int g = 0; g < nodes.Count; g = g + 1) {
+            if (nodes[g].isDir) { nodes[g].expanded = !folded; }
+        }
+        RefListPopup.Tree.Refresh();
+    }
+
+    /// 至少有一个文件是展开的。
+    bool AnyUnfolded() {
+        for (int g = 0; g < nodes.Count; g = g + 1) {
+            if (nodes[g].isDir && nodes[g].expanded) { return true; }
+        }
+        return false;
+    }
+
+    /// 每帧调一次：打开时把自己排进覆盖层，关闭时什么都不做。
+    /// 外壳只说「它是开着的」，绘制、定位和输入都在覆盖层阶段。
+    void Frame(App app) {
+        if (!open) { return; }
+        RefListPopup.current = this;
+        app.AddOverlay(OverlayPopup.Host(this));
+    }
+
+    /// 延迟面板：在所有页面内容之后由 App.RunOverlays 绘制并派发事件，
+    /// 因此它在代码之上，并且拿到最上层的点击。
+    override void OnPaintOverlay(App app) {
+        if (!open) { return; }
+        int chromeH = RefListPopup.Bar.prefH + RefListPopup.Foot.prefH
+            + app.Scale(8);
+        // 至多十二行高：弹在代码上的浮层，不是占掉半个编辑器的窗格。
+        int rowH = app.theme.heightSmall;
+        int listH = RefListPopup.Tree.ContentHeight(app);
+        int maxListH = rowH * 12;
+        if (listH > maxListH) { listH = maxListH; }
+        if (listH < rowH) { listH = rowH; }
+        int w = app.Scale(560);
+        int h = OverlayPopup.FitH(app, chromeH + listH);
+        int x = OverlayPopup.FitX(app, anchorX, w);
+        int y = OverlayPopup.FitY(app, anchorY, rowH, h);
+
+        app.BlockHitsBelow();
+        app.BlockHitsRect(x, y, w, h);
+
+        bool unfolded = this.AnyUnfolded();
+        if (unfolded) {
+            RefListPopup.FoldBtn.Text = ZanIDE.T("Collapse All", "全部折叠");
+        } else {
+            RefListPopup.FoldBtn.Text = ZanIDE.T("Expand All", "全部展开");
+        }
+        string head = Convert.ToString(hits.Count) + " "
+            + ZanIDE.T("references to", "处引用") + " '" + word + "'";
+        if (hits.Count == 1) {
+            head = ZanIDE.T("1 reference to", "1 处引用") + " '" + word + "'";
+        }
+        RefListPopup.HeadLbl.Text = head;
+
+        this.RenderInside(app, new Rect(x, y, w, h));
+
+        if (RefListPopup.CloseBtn.WasClicked()) {
+            open = false;
+            app.RequestRedraw();
+            return;
+        }
+        if (RefListPopup.FoldBtn.WasClicked()) {
+            this.SetAllFolded(unfolded);
+            app.RequestRedraw();
+            return;
+        }
+        // 打开一处引用就是列表的活干完了：它关掉，跳过去的代码不必
+        // 隔着一个面板去读。
+        if (picked >= 0) {
+            open = false;
+            app.RequestRedraw();
+            return;
+        }
+        // 别处的按压把浮层收起来，任何弹层都该这样；在按压时判断，
+        // 所以关掉它的那一下手势仍然会把光标放到点的位置。
+        if (app.ClickAvailable()) {
+            bool inside = app.mouseX >= x && app.mouseX < x + w
+                && app.mouseY >= y && app.mouseY < y + h;
+            if (!inside) {
+                open = false;
+                app.RequestRedraw();
+            }
+        }
+        if (app.EventKind() == 4 && app.window.EventKeyCode() == 27) {
+            open = false;
+            app.RequestRedraw();
+        }
+    }
+}

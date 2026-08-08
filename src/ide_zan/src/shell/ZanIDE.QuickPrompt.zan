@@ -1,0 +1,140 @@
+using System;
+using System.IO;
+using System.Json;
+using Platform;
+using Gui;
+using Gui.Widget;
+
+/// 代码视图右上角那个小输入条要做的事：跳转到行（Ctrl+G）、断点条件
+/// （Ctrl+B）、重命名符号（F2）、在文件中查找 / 替换（Ctrl+Shift+F / R）。
+///
+/// 输入条本身是 views/QuickPrompt.zform 那个控件，编辑、选择、剪贴板和
+/// 输入法都归它；这里只负责：换用途时把种子文本铺进去，回车之后按当前
+/// 用途执行一次，然后关掉。
+partial class ZanIDE {
+    /// 上一帧输入条在做哪件事，用来判断要不要重新铺种子文本（否则每帧
+    /// 都会把用户正在输入的内容冲掉）。
+    int promptMode;
+
+    /// `off` 为真表示当前标签页不是代码（设计器 / 起始页 / 帮助），这时
+    /// 这些命令没有落点，直接收起来。
+    void RunQuickPrompt(App app, Rect edRect, bool off) {
+        if (findMode <= 2 || off) {
+            if (quickPrompt.IsOpen()) { quickPrompt.Close(); }
+            promptMode = 0;
+            return;
+        }
+        if (findMode != promptMode) {
+            this.SeedQuickPrompt(app);
+            promptMode = findMode;
+        } else if (findMode == 4) {
+            // 断点条件的标题里带着行号，光标换行时要跟着走。
+            quickPrompt.Caption(ZanIDE.T("Breakpoint Condition (Ctrl+B) - line ",
+                "断点条件 (Ctrl+B) - 行 ")
+                + Convert.ToString(editor.CurLine() + 1));
+        }
+        quickPrompt.Anchor(edRect.x, edRect.y, edRect.width);
+        if (quickPrompt.TakeSubmit()) { this.ApplyQuickPrompt(app); }
+        if (!quickPrompt.IsOpen()) {
+            // 控件自己被 Esc 关掉了。
+            findMode = 0;
+            promptMode = 0;
+            app.RequestRedraw();
+        }
+        quickPrompt.Frame(app);
+    }
+
+    /// 按当前用途铺标题、种子文本和按钮文案。
+    void SeedQuickPrompt(App app) {
+        if (findMode == 3) {
+            quickPrompt.Show(ZanIDE.T("Go to Line (Ctrl+G)", "跳转到行 (Ctrl+G)"),
+                "", null, ZanIDE.T("Go", "转到"));
+        } else if (findMode == 4) {
+            quickPrompt.Show(ZanIDE.T("Breakpoint Condition (Ctrl+B) - line ",
+                    "断点条件 (Ctrl+B) - 行 ")
+                    + Convert.ToString(editor.CurLine() + 1),
+                ZanIDE.CondFor(bpConds, editor.CurLine()), null,
+                ZanIDE.T("Set", "设置"));
+        } else if (findMode == 5) {
+            quickPrompt.Show(ZanIDE.T("Rename Symbol (F2): ", "重命名符号 (F2): ")
+                + renameWord, renameWord, null, ZanIDE.T("Rename", "重命名"));
+        } else if (findMode == 6) {
+            quickPrompt.Show(ZanIDE.T("Find in Files (Ctrl+Shift+F)",
+                "在文件中查找 (Ctrl+Shift+F)"), fifQuery, null,
+                ZanIDE.T("Find", "查找"));
+        } else if (findMode == 7) {
+            quickPrompt.Show(ZanIDE.T("Replace in Files (Ctrl+Shift+R)",
+                "在文件中替换 (Ctrl+Shift+R)"), fifQuery, fifRepl,
+                ZanIDE.T("Replace", "替换"));
+        }
+    }
+
+    /// 回车 / 点按钮之后执行一次。
+    void ApplyQuickPrompt(App app) {
+        string text = quickPrompt.FirstText();
+        if (findMode == 3) {
+            int line = ZanIDE.ParseInt(text);
+            if (line > 0) { editor.GoToLine(line - 1); }
+        } else if (findMode == 4) {
+            int bLine = editor.CurLine();
+            ZanIDE.SetCond(bpConds, bLine, text);
+            // 加了条件却没有断点的话，条件永远不会被问到，所以顺手打上。
+            if (text.Length > 0 && !editor.HasBreakpoint(bLine)) {
+                editor.ToggleBreakpoint(bLine);
+            }
+            if (text.Length > 0) {
+                log.Add("> [Debug] Breakpoint condition on line "
+                    + Convert.ToString(bLine + 1) + ": " + text);
+            } else {
+                log.Add("> [Debug] Breakpoint condition cleared on line "
+                    + Convert.ToString(bLine + 1) + ".");
+            }
+        } else if (findMode == 5) {
+            if (lspSess == null && !lspTried) {
+                lspTried = true;
+                lspSess = LspSession.Start(root);
+                if (lspSess != null) {
+                    log.Add("> zan-lsp connected: semantic rename enabled.");
+                }
+            }
+            ZanIDE.RenameSymbolSmart(lspSess, editor, tabs, activeTab, log,
+                renameWord, text);
+        } else if (findMode == 6) {
+            fifQuery = text;
+            if (fifQuery.Length > 0) {
+                this.SyncActiveTabBody();
+                log.Add("> Find in Files: '" + fifQuery + "'");
+                ZanIDE.FindInFiles(root, fifQuery, false, tabs, fifHits, log);
+                fifSel = 0 - 1;
+                coLog.Reset();
+                dock.Focus("output");
+            }
+        } else if (findMode == 7) {
+            fifQuery = text;
+            fifRepl = quickPrompt.SecondText();
+            if (fifQuery.Length > 0) {
+                this.SyncActiveTabBody();
+                ZanIDE.ReplaceInFiles(root, fifQuery, fifRepl, false, tabs, log);
+                int actR = activeTab.Get();
+                if (actR >= 0 && actR < tabs.Count) {
+                    // 当前文件也可能被替换过，重新载入但停在原来那一行。
+                    int keepR = editor.CurLine();
+                    editor.LoadText(tabs[actR].body);
+                    editor.GoToLine(keepR);
+                }
+                coLog.Reset();
+                dock.Focus("output");
+            }
+        }
+        quickPrompt.Close();
+        findMode = 0;
+        promptMode = 0;
+        app.RequestRedraw();
+    }
+
+    /// 全项目搜索读的是标签页里的文本，所以先把编辑器里未落盘的改动写回去。
+    void SyncActiveTabBody() {
+        int at = activeTab.Get();
+        if (at >= 0 && at < tabs.Count) { tabs[at].body = editor.GetText(); }
+    }
+}

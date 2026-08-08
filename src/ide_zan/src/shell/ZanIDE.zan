@@ -1,0 +1,2067 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+using System.Data;
+using System.Data.Sqlite;
+using Platform;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+using Gui.Component;
+using Game.Scene;
+
+// ---- AI automation-driver entities ---------------------------------------
+// EditorProbeJson publishes a typed editor snapshot; the probe's JSON keys
+// (caretLine/caretCol/completionActive/completionSel/completion/text and the
+// completion item label/kind) are unchanged so existing ZAN_UI_SCRIPT
+// assertions keep matching.
+
+class CompletionItemDoc {
+    string label;
+    string kind;
+}
+
+class EditorProbeDoc {
+    int caretLine;
+    int caretCol;
+    bool completionActive;
+    int completionSel;
+    List<CompletionItemDoc> completion;
+    string text;
+}
+
+/// Describes one project template: the category it appears under, its display
+/// name / icon / description, the scaffolding "kind" (console / dll-class /
+/// gui-empty / webview / server / custom / ...), and, for custom templates, the
+/// source directory to copy from.
+class Tpl {
+    string cat;
+    string name;
+    string icon;
+    string desc;
+    string kind;
+    string src;
+    int order;       // sort key inside the wizard (lower = earlier)
+    string ptype;    // zan.proj type for copied templates (console/gui/library)
+    string ptarget;  // zan.proj target (exe/dll)
+    string pentry;   // zan.proj entry
+    // Shape metadata (manifest `sizeable` / `size` / `shape` / `preview` /
+    // `sketch`): the wizard shows a device-size row for sizeable templates and
+    // draws its right-hand preview from these, so a target size is a parameter
+    // of one template instead of a dozen near-identical catalog entries.
+    bool sizeable;
+    int defW;
+    int defH;
+    bool round;
+    string preview;  // absolute path of a real screenshot, "" when none
+    string sketch;   // wireframe tokens, see Wizard.RenderSketch
+
+    static Tpl Make(string cat, string name, string icon, string kind, string desc) {
+        Tpl t = new Tpl();
+        t.cat = cat;
+        t.name = name;
+        t.icon = icon;
+        t.kind = kind;
+        t.desc = desc;
+        t.src = "";
+        t.order = 1000;
+        t.ptype = "console";
+        t.ptarget = "exe";
+        t.pentry = "src/main.zan";
+        t.sizeable = false;
+        t.defW = 0;
+        t.defH = 0;
+        t.round = false;
+        t.preview = "";
+        t.sketch = "";
+        return t;
+    }
+}
+
+/// A miniature aardio/VS-Code-style IDE built from the enterprise GUI components
+/// (Ribbon / TreeView / Tabs / CodeEditor / Panel / Split / Modal / Input /
+/// Button) wired to a REAL project on disk and the real Zan toolchain.
+///
+///   * Project ("New Project"): a modal wizard with categorized templates
+///     (Console / GUI App / DLL Library / Executable / Empty), a project name
+///     and a location — scaffolds the folder + starter files + zan.proj config.
+///   * New ("New File"): a modal wizard with file templates (Program / Class /
+///     GUI Window / Interface / Empty).
+///   * Explorer tree scanned from disk; click a file to open it in a tab.
+///   * Save writes to disk; Build/Run/Publish invoke zanc via Process and
+///     stream output to the Output panel. Console/library targets link with
+///     zanc's own bundled linker (no external clang/LLVM needed); GUI targets
+///     still route through clang to link the native GUI runtime.
+partial class ZanIDE {
+
+    // ---- UI language (one-click EN / 中文) ----
+    // 0 = English, 1 = 简体中文. Set once at startup from editor.cfg and updated
+    // live from the Settings dialog; read everywhere via T(en, zh).
+    static int uiLang;
+
+
+    /// Attached by `App.OnLoad`: the designed window is handed to the IDE,
+    /// which builds its state, mounts the shell surface and drives the
+    /// per-frame work through Form.FrameHook / Form.OnExit. A crash here
+    /// (before the event loop starts) writes the cache crash log and shows
+    /// it (a Windows GUI program has no console, so the compiler's
+    /// "Unhandled exception" stderr print would be invisible). The handler
+    /// stays on field access and finally-free calls only (A35: a call into a
+    /// finally-bearing method from a try region of this giant module fails
+    /// to compile).
+    static void Attach(Form form) {
+        try {
+            ZanIDE ide = new ZanIDE();
+            ZanIDE.current = ide;
+            ide.InitShell(form);
+        } catch (Exception e) {
+            string m = e.Message;
+            if (m == "") { m = "unknown error"; }
+            string p = ZanIDE.CacheDir() + "/ide_error.log";
+            Directory.CreateDirectoryRecursive(ZanIDE.CacheDir());
+            File.WriteAllText(p, "ZanIDE crashed: " + m + "\n");
+            #if WINDOWS
+            MessageBox.Show("ZanIDE crashed: " + m, "ZanIDE");
+            #endif
+        }
+    }
+
+    /// One frame of work after App.ProcessEvent handled the main window's
+    /// event: follow skin/opacity/wallpaper to the child windows, route
+    /// events addressed to other windows, handle the debug shortcuts, pump
+    /// the secondary windows and rescan the tree when requested.
+    void FrameTick() {
+        // Advance any active AI automation script (ZAN_UI_SCRIPT). This
+        // it injects synthetic events this loop then polls & dispatches.
+        FilePicker.lang = ZanIDE.uiLang;
+        CodeEditor.lang = ZanIDE.uiLang;
+        Designer.lang = ZanIDE.uiLang;
+        pathPicker.ApplySkin(app.ThemeMenuIndex());
+        // Skin follow: App.SyncSkin raises themeMenuChange (delegate event)
+        // when the user picks a new skin; every child window then follows
+        // the main window's look here, once per change.
+        if (app.ThemeMenuIndex() != lastSkinIdx) {
+            lastSkinIdx = app.ThemeMenuIndex();
+            ChildWindows.FollowSkin(lastSkinIdx);
+        }
+        // Opacity follow: the appearance drawer sets it on the main
+        // window; children inherit it and the value is persisted.
+        if (app.WindowOpacity() != winOpacity) {
+            winOpacity = app.WindowOpacity();
+            ChildWindows.FollowOpacity(winOpacity);
+        }
+        // Wallpaper: the appearance drawer asks the host to pick a file
+        // (App has no file dialog), and any change follows to the children.
+        if (app.ConsumeWallpaperPick() && !pathPicker.IsOpen()) {
+            pathPicker.BeginOpenFile(
+                ZanIDE.ReadLastPickerDirectory(root), ".png;.jpg;.jpeg;.bmp",
+                ZanIDE.T("Choose a window background image", "选择窗口背景图片"));
+            pathPickerOwner = 9;
+            app.RequestRedraw();
+        }
+        if (app.UserWallpaperPath() != wallPath
+                || app.UserWallpaperOpacity() != wallOpacity) {
+            wallPath = app.UserWallpaperPath();
+            wallOpacity = app.UserWallpaperOpacity();
+            ChildWindows.FollowWallpaper(wallPath, wallOpacity);
+        }
+
+        // Child-window animation deadlines are folded into the main loop's
+        // idle wait and due windows woken by ChildWindows.FoldDeadlines,
+        // called from Form.Run() after this frame hook.
+        nint evh = Window.EventHwnd();
+        // The raw native kind: this is the router, so it must see events
+        // for every window (a child's close arrives with evh == that child).
+        // Widgets, by contrast, go through App.EventKind(), which hides
+        // events belonging to another window. Main-window events were
+        // already handled by App.ProcessEvent; only events addressed to
+        // other windows reach this router.
+        int kind = app.window.EventKind();
+
+        if (kind == 8) {
+            if (ChildWindows.Route(evh)) {
+                // A child window closed: it drops out of the registry on
+                // the next pump, and the page it fed may need a repaint.
+                lastActive = 0 - 1;
+                app.RequestRedraw();
+            } else if (pathPicker.OwnsWindow(evh)) {
+                pathPicker.ApplyEvent(evh);
+            } else if (evh == app.WindowHandle()) {
+                // Close of the main window: App.ProcessEvent already stopped
+                // the loop, so this frame hook must not keep running.
+                return;
+            } else {
+                app.RequestRedraw();
+            }
+        } else if (pathPicker.OwnsWindow(evh)) {
+            pathPicker.ApplyEvent(evh);
+        } else if (evh != app.WindowHandle()) {
+            // Deliver to the one window the event was addressed to (a wizard
+            // or child window owns it, or nobody does).
+            ChildWindows.Route(evh);
+        }
+        // The form designer is bound to .zform tabs (C#-style form files):
+        // the active tab's extension decides whether the designer or the code
+        // editor is shown, rather than a global toggle.
+        int actDM = activeTab.Get();
+        if (actDM >= 0 && actDM < tabs.Count) {
+            designerMode = ZanIDE.IsFormPath(tabs[actDM].path) && tabs[actDM].path != codeViewForm;
+            sceneMode = ZanIDE.IsScenePath(tabs[actDM].path) && tabs[actDM].path != codeViewForm;
+        } else {
+            designerMode = false;
+            sceneMode = false;
+        }
+
+
+        // ---- keyboard shortcuts for debug ----
+        if (kind == 5) {
+            int kc = app.window.EventKeyCode();
+            if (kc == 116 && dbgState == 0) {
+                // F5 = Start Debug (same as clicking Debug button). The
+                // `-g` build runs DETACHED; the poll opens the debugger on
+                // success so F5 never freezes the window during compilation.
+                if (!buildBusy) {
+                    this.SaveActiveTab();
+                    string dExe = ZanIDE.DebugBuildBegin(tabs, activeTab, root, log);
+                    if (dExe != "") {
+                        buildBusy = true;
+                        buildThenRun = false;
+                        dbgBuildPending = true;
+                        buildExe = dExe;
+                        buildTargetPath = ZanIDE.PathOf(tabs, activeTab);
+                        buildLogLen = 0;
+                        dock.Focus("output");
+                        app.RequestAnimationFrame(80);
+                    }
+                }
+                app.RequestRedraw();
+            } else if (kc == 116 && dbgState == 2) {
+                // F5 = Continue
+                if (dbg != null) { dbg.Continue(); }
+                dbgState = ZanIDE.DbgSync(dbg, editor, log, dbgConsole);
+                dbgExecLine = ZanIDE.DbgLine(dbg);
+                dbgVarInfo = ZanIDE.DbgVars(dbg);
+                dbgStack = ZanIDE.DbgStack(dbg);
+                dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
+                if (dbgState == 2) {
+                    ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
+                } else {
+                    dbg = null;
+                }
+                app.RequestRedraw();
+            } else if (kc == 121 && dbgState == 2) {
+                // F10 = Step Over
+                if (dbg != null) { dbg.StepOver(); }
+                dbgState = ZanIDE.DbgSync(dbg, editor, log, dbgConsole);
+                dbgExecLine = ZanIDE.DbgLine(dbg);
+                dbgVarInfo = ZanIDE.DbgVars(dbg);
+                dbgStack = ZanIDE.DbgStack(dbg);
+                dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
+                if (dbgState == 2) {
+                    ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
+                } else {
+                    dbg = null;
+                }
+                app.RequestRedraw();
+            } else if (kc == 122 && dbgState == 2) {
+                // F11 = Step Into
+                if (dbg != null) { dbg.StepIn(); }
+                dbgState = ZanIDE.DbgSync(dbg, editor, log, dbgConsole);
+                dbgExecLine = ZanIDE.DbgLine(dbg);
+                dbgVarInfo = ZanIDE.DbgVars(dbg);
+                dbgStack = ZanIDE.DbgStack(dbg);
+                dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
+                if (dbgState == 2) {
+                    ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
+                } else {
+                    dbg = null;
+                }
+                app.RequestRedraw();
+            } else if (kc == 27 && dbgState == 2) {
+                // Escape = Stop debugging
+                if (dbg != null) { dbg.Stop(); dbg = null; }
+                dbgState = 0; dbgExecLine = -1; editor.SetExecLine(-1);
+                log.Add("> [Debug] Stopped.");
+                app.RequestRedraw();
+            } else if (kc == 27 && refList.IsOpen()) {
+                // Escape = close the reference list (before the find bar:
+                // it is the thing that opened last).
+                refList.Close();
+                app.RequestRedraw();
+            } else if (kc == 27 && findMode > 0) {
+                // Escape = close find/replace/goto, and hand the keyboard
+                // back to the editor the bar took it from.
+                findMode = 0;
+                app.focus.SetFocused(editor.LastWidgetId());
+                app.RequestRedraw();
+            } else if (kc == 27 && pubWin != null && pubWin.IsOpen()) {
+                // Escape = close publish window
+                pubWin.Close();
+                app.RequestRedraw();
+            } else if (kc == 27 && marketplaceWin != null && marketplaceWin.IsOpen()) {
+                marketplaceWin.Close();
+                app.RequestRedraw();
+            } else if (kc == 123 && !designerMode && dbgState == 0) {
+                // F12 = Go to Definition
+                if (lspSess == null && !lspTried) {
+                    lspTried = true;
+                    lspSess = LspSession.Start(root);
+                    if (lspSess != null) { log.Add("> zan-lsp connected: semantic navigation enabled."); }
+                }
+                string navW_gl12 = editor.WordAtCaret();
+                this.RememberTabView();
+                int gl12 = ZanIDE.GoToDefinitionSmart(lspSess, editor, tabs, activeTab, root, log);
+                this.ApplyGotoResult(gl12, navW_gl12);
+                app.RequestRedraw();
+            } else if (kc == 113 && !designerMode && dbgState == 0) {
+                // F2 = Rename Symbol
+                renameWord = editor.WordAtCaret();
+                if (renameWord.Length > 0) {
+                    findMode = 5;
+                } else {
+                    log.Add("> Rename: no symbol under caret.");
+                }
+                app.RequestRedraw();
+            } else if (kc == 119 && !designerMode && dbgState == 0) {
+                // F8 / Shift+F8 = walk the Find in Files results, opening
+                // the file when the match is in one that is not open.
+                if (fifHits.Count == 0) {
+                    log.Add(ZanIDE.T("> No search results. Ctrl+Shift+F searches the project.",
+                        "> 没有搜索结果。Ctrl+Shift+F 可搜索整个项目。"));
+                } else {
+                    if (Modifiers.HasShift(app.window.EventMods())) {
+                        fifSel = fifSel - 1;
+                        if (fifSel < 0) { fifSel = fifHits.Count - 1; }
+                    } else {
+                        fifSel = fifSel + 1;
+                        if (fifSel >= fifHits.Count) { fifSel = 0; }
+                    }
+                    int hitLine = ZanIDE.GotoSearchHit(fifHits, fifSel,
+                        tabs, activeTab, log);
+                    if (hitLine >= 0) {
+                        pendingGotoLine = hitLine;
+                        pendingGotoCol = 0;
+                        lastActive = 0 - 1;
+                    }
+                }
+                app.RequestRedraw();
+            } else if (kc == 118 && dbgState == 0) {
+                // F7 on a design tab toggles it in place between the visual
+                // designer and a read-only source view (a .zform shows its
+                // design JSON, a .zscene its generated code); on a code
+                // file it opens the .zform paired with it.
+                int actF7 = activeTab.Get();
+                if (actF7 >= 0 && actF7 < tabs.Count
+                        && (ZanIDE.IsFormPath(tabs[actF7].path)
+                            || ZanIDE.IsScenePath(tabs[actF7].path))) {
+                    string fp7 = tabs[actF7].path;
+                    if (codeViewForm == fp7) {
+                        codeViewForm = "";
+                        log.Add(ZanIDE.T("> Design view.", "> 设计视图。"));
+                    } else {
+                        codeViewForm = fp7;
+                        formCodeLoaded = "";
+                        log.Add(ZanIDE.T("> Code view.", "> 代码视图。"));
+                    }
+                    lastActive = 0 - 1;
+                } else if (actF7 >= 0 && actF7 < tabs.Count) {
+                    string ap7 = tabs[actF7].path;
+                    if (ap7.Length > 4 && ap7.Substring(ap7.Length - 4, 4) == ".zan") {
+                        string cand7 = ap7.Substring(0, ap7.Length - 4) + ".zform";
+                        if (File.Exists(cand7)) {
+                            int ci7 = ZanIDE.FindTabByPath(tabs, cand7);
+                            if (ci7 >= 0) { activeTab.Set(ci7); }
+                            else { ZanIDE.OpenPath(tabs, activeTab, cand7, Path.GetFileName(cand7)); }
+                            loadedFormPath = "";
+                            lastActive = 0 - 1;
+                        } else {
+                            log.Add("> No paired .zform for " + Path.GetFileName(ap7) + ".");
+                        }
+                    }
+                }
+                app.RequestRedraw();
+            }
+        }
+        // Ctrl+key via WM_CHAR (kind == 6)
+        if (kind == 6) {
+            int cc = app.window.EventKeyCode();
+            if (cc == 6) {
+                // Ctrl+F = Find in this file, Ctrl+Shift+F = Find in Files
+                if (Modifiers.HasShift(app.window.EventMods())) {
+                    findMode = 6;
+                    fifQuery = "";
+                } else {
+                    if (findMode != 2) { findMode = 1; }
+                    findBar.Open(false, this.FindSeed());
+                }
+                app.RequestRedraw();
+            } else if (cc == 7) {
+                // Ctrl+G = Go to Line
+                findMode = 3;
+                app.RequestRedraw();
+            } else if (cc == 18) {
+                // Ctrl+R = Replace (Ctrl+H is 8 which conflicts with
+                // Backspace); Ctrl+Shift+R = Replace in Files
+                if (Modifiers.HasShift(app.window.EventMods())) {
+                    findMode = 7;
+                    fifRepl = "";
+                } else {
+                    findMode = 2;
+                    findBar.Open(true, this.FindSeed());
+                }
+                app.RequestRedraw();
+            } else if (cc == 2) {
+                // Ctrl+B = edit the breakpoint condition on the caret line
+                if (!designerMode) {
+                    findMode = 4;
+                }
+                app.RequestRedraw();
+            } else if (cc == 5) {
+                // Ctrl+E = Format Document (zanfmt); Ctrl+D is taken by
+                // the editor's duplicate-line.
+                if (!designerMode && !sceneMode && findMode == 0) {
+                    ZanIDE.FormatDocument(editor, log);
+                }
+                app.RequestRedraw();
+            } else if (cc == 19) {
+                // Ctrl+S = Save (+ hot reload when enabled)
+                int aSv = activeTab.Get();
+                if (aSv >= 0 && aSv < tabs.Count
+                        && ZanIDE.IsFormPath(tabs[aSv].path) && codeViewForm == tabs[aSv].path) {
+                    // The .zform code view shows the design JSON, which is
+                    // owned by the designer - it is read-only here.
+                    log.Add(ZanIDE.T("> The design JSON is read-only here; edit the design, or open Name.zan for logic.", "> 设计 JSON 此处只读；请修改设计，或打开 Name.zan 编写逻辑。"));
+                } else if (aSv >= 0 && aSv < tabs.Count
+                        && ZanIDE.IsScenePath(tabs[aSv].path) && codeViewForm == tabs[aSv].path) {
+                    // The .zscene code view shows the code the compiler
+                    // projects from the design - it is read-only here.
+                    log.Add(ZanIDE.T("> The projected scene code is read-only; edit the design, or open Name.zan for logic.", "> 场景投影代码只读；请修改设计，或打开 Name.zan 编写逻辑。"));
+                } else if (!designerMode && !sceneMode && aSv >= 0 && aSv < tabs.Count && tabs[aSv].path != "@start") {
+                    this.SaveActiveTab();
+                    if (autoRun) { hotReloadReq = true; }
+                    rescan = true;
+                    Layer.Msg(ZanIDE.T("Saved", "已保存"), 3);
+                }
+                app.RequestRedraw();
+            }
+        }
+
+        // Apply what the secondary windows reported (Publish / Project
+        // Configuration / Marketplace / Settings / the file picker): each
+        // window class takes its own actions; these pumps only translate
+        // them into shell state. The frames themselves were already
+        // rendered by ChildWindows.PumpAll inside Form.Run().
+        this.PumpPublishWindow();
+        this.PumpConfigWindow();
+        this.PumpMarketplaceWindow();
+        this.PumpSettingsWindows();
+        this.PumpFilePicker();
+
+        if (rescan) {
+            rescan = false;
+            // Keep the user's expanded folders across the rebuild: a
+            // rescan after e.g. deleting a file must not collapse the tree.
+            List<string> expKeep = ZanIDE.ExpandedPaths(tree);
+            tree = new List<TreeNode>();
+            if (haveProject) {
+                tree = ZanIDE.ScanTree(root);
+                ZanIDE.ApplyExpanded(tree, expKeep);
+            }
+            treeSel.Set(-1);
+        }
+    }
+
+    /// Paints the whole shell into the current frame. Called by
+    /// IdeSurface.OnPaint inside Form.Run()'s retained loop (which already
+    /// began the frame and will present it), so the frame must not call
+    /// BeginFrame/RenderChrome/PresentFrame itself. A single bad widget
+    /// must not take the IDE down: the whole frame runs under an exception
+    /// boundary, so a failure is logged (see Gui.UiErrorLog / the Help &
+    /// Feedback panel), this frame is dropped and the next one is repainted
+    /// from scratch.
+    void PaintFrame(App app) {
+    if (pathPicker.IsOpen()) { return; }
+        // The current event kind for the frame's immediate-mode text inputs
+        // (the Go-to-Line prompt etc.): same source the frame hook routes on.
+        int kind = app.window.EventKind();
+        // A single bad widget must not take the IDE down: the whole frame
+        // runs under an exception boundary, so a failure is logged (see
+        // Gui.UiErrorLog / the Help & Feedback panel), this frame is
+        // dropped and the next one is repainted from scratch. The body
+        // keeps its original indentation to stay diffable.
+        try {
+            Canvas c = app.canvas;
+            Theme t = app.theme;
+            int W = c.Width();
+            int H = c.Height();
+            // Persist the LOGICAL (96-dpi) window size, not the physical
+            // canvas size. The window is created from a logical size that the
+            // runtime scales up by the display DPI; saving the scaled size and
+            // re-creating from it would re-scale every launch (the window kept
+            // growing/shrinking). Divide back out by dpiScale (a percentage).
+            int dscale = app.dpiScale;
+            if (dscale <= 0) { dscale = 100; }
+            savedW = W * 100 / dscale;
+            savedH = H * 100 / dscale;
+            int top = app.titlebarH;
+            int ribbonH = Ribbon.HeightTabbed(app);
+            int sbH = app.Scale(22);
+            // Themed window backdrop (gradient/glass wallpaper or flat fill)
+            // behind the whole shell, so the IDE renders every skin exactly
+            // like the gallery. Translucent surfaces below let it show.
+
+            // Enable/disable ribbon commands by context. Build/Publish/Hot/
+            // Config need an open project (zan.proj); Run/Debug/Designer work
+            // on a single open file; all are disabled on the Start page.
+            int atE = activeTab.Get();
+            string apE = "";
+            if (atE >= 0 && atE < tabs.Count) { apE = tabs[atE].path; }
+            bool activeIsFile = apE != "" && apE != "@start";
+            bool haveProj = File.Exists(root + "/zan.proj");
+            // Run/Debug/Build follow the active file, or fall back to the
+            // project entry (so a designer/start tab can still run the app).
+            bool canRun = activeIsFile || haveProj;
+            // The ribbon is rebuilt each frame: its commands are pure
+            // configuration (icon, label, action id) and the View tab is
+            // just the dock's own Panels section.
+            List<int> ribbonActions = new List<int>();
+            List<RibbonGroup> ribbonGroups =
+                ZanIDE.BuildRibbonGroups(ribbonTab.Get(), ribbonActions);
+            ZanIDE.SyncRibbonEnabled(ribbonGroups, ribbonActions, canRun, haveProj);
+            if (ribbonTab.Get() == ZanIDE.RibbonViewTab()) {
+                dock.AddSwitchGroup(ribbonGroups, ZanIDE.T("Panels", "面板"));
+            } else {
+                dock.ClearSwitches();
+            }
+            int rcPos = Ribbon.RenderTabbed(app, 0, top, W, ribbonTabs, ribbonTab,
+                ribbonGroups);
+            if (dock.HandleRibbon(rcPos)) { rcPos = 0 - 1; }
+            int rc = ZanIDE.RibbonAction(ribbonActions, rcPos);
+            this.RunRibbonCommand(app, rc);
+
+            // 调试工具条（正在调试时）：按钮由 views/DebugToolbar.zform
+            // 声明，这里只把它给出的动作接到调试会话上。
+            int dbgBarH = this.RunDebugBar(app, W, top + ribbonH);
+            Rect area = new Rect(0, top + ribbonH + dbgBarH, W, H - top - ribbonH - dbgBarH - sbH);
+            // The dock resolves every panel's rect and owns the tab strips,
+            // split handles and drag/close input; the panels below just draw
+            // into the rect it hands back (off-screen while closed, so each
+            // panel body stays a plain unconditional render).
+            string outlineTitle = ZanIDE.T("STRUCTURE", "结构");
+            if (designerMode || sceneMode) { outlineTitle = ZanIDE.T("COMPONENTS", "组件"); }
+            if (outlineTitle != dockOutlineTitle) {
+                dock.SetTitle("structure", outlineTitle);
+                dockOutlineTitle = outlineTitle;
+            }
+            dock.Begin(app, area);
+
+            // Section 1: Explorer. The tree owns its filter row, scrolling,
+            // scrollbar and selection; opening a file and raising the
+            // context menu are handlers.
+            explorerPanel.Render(app, dock.ContentParked("explorer"), tree);
+            treeShow = explorerPanel.Shown();
+
+            // Section 2: Structure / Components. Shows a code outline for
+            // source tabs, and the form's component tree in the designer.
+            // Rebuild the tree only when the active buffer/form changes so
+            // typing and clicking stay cheap. The signature prefix (C/F)
+            // also flips the panel between code outline and components.
+            int stActTab = activeTab.Get();
+            string newSig = "";
+            if (designerMode) {
+                List<FormField> flatSig = new List<FormField>();
+                ZanIDE.FlattenFields(formDesigner.fields, flatSig);
+                newSig = "F:" + Convert.ToString(stActTab) + ":" + Convert.ToString(flatSig.Count);
+            } else if (sceneMode) {
+                newSig = "S:" + Convert.ToString(stActTab) + ":"
+                    + Convert.ToString(sceneDesigner.doc.Count()) + ":"
+                    + Convert.ToString(sceneDesigner.doc.ToJson().Length);
+            } else {
+                // TextStamp is O(lines) with no allocation; the full text is
+                // only materialised when the outline actually needs rebuilding.
+                newSig = "C:" + Convert.ToString(stActTab) + ":" + Convert.ToString(editor.TextStamp());
+                if (newSig != structSig) { structTree = ZanIDE.BuildOutline(editor.GetText()); }
+            }
+            if (newSig != structSig) {
+                structSig = newSig;
+                if (designerMode) {
+                    string sfn = "Form";
+                    if (stActTab >= 0 && stActTab < tabs.Count) {
+                        sfn = ZanIDE.FormBaseName(tabs[stActTab].path);
+                    }
+                    structTree = ZanIDE.BuildFieldTree(sfn, formDesigner.fields);
+                } else if (sceneMode) {
+                    string scn = "Scene";
+                    if (stActTab >= 0 && stActTab < tabs.Count) {
+                        scn = ZanIDE.BaseName(tabs[stActTab].path);
+                    }
+                    structTree = ZanIDE.BuildSceneTree(scn, sceneDesigner);
+                }
+                structSel.Set(0 - 1);
+            }
+            structurePanel.Render(app, dock.ContentParked("structure"), structTree);
+            structShow = structurePanel.Shown();
+
+            // Section 3: the stdlib / examples tree, click a leaf to open it.
+            stdlibPanel.Render(app, dock.ContentParked("stdlib"), exTree);
+            exShow = stdlibPanel.Shown();
+
+            // The editor is the dock's fixed center panel, so it always has
+            // a rect; every tool panel is parked off-screen while closed.
+            Rect ea = dock.Content("editor");
+            Rect orr = dock.ContentParked("output");
+
+            // Every open file gets a disk baseline (unsaved-edit and
+            // changed-outside detection both read it), and the files are
+            // polled for outside changes a few times a second.
+            this.TrackOpenTabs();
+            this.PollDiskChanges();
+
+            this.SyncEditorTabs();
+            editorTabs.Select(activeTab.Get());
+            editorTabs.TakeChanged();
+            int tabH = editorTabs.HeaderHeight(app);
+            editorTabs.Render(app, ea.x, ea.y, ea.width);
+            int ctxTab = editorTabs.TakeContext();
+            int addTab = editorTabs.TakeAdded();
+            int shutTab = editorTabs.TakeClosed();
+            int chgTab = editorTabs.TakeChanged();
+            if (ctxTab >= 0) {
+                ctxKind = 3; ctxX = app.mouseX; ctxY = app.mouseY;
+                ctxTarget = ctxTab; app.RequestRedraw();
+            } else if (ctxKind == 0) {
+                if (addTab >= 0 && dlg == null) {
+                    dlg = this.OpenWizardHost(app, ZanIDE.T("New File", "新建文件"), 720, 470, 2);
+                    dlgMode = 2;
+                } else if (shutTab >= 0) {
+                    // Asks about unsaved edits first; a clean tab just goes.
+                    this.RequestCloseTab(shutTab);
+                } else if (chgTab >= 0) {
+                    activeTab.Set(chgTab);
+                }
+            }
+
+            int act = activeTab.Get();
+            if (act != lastActive) {
+                // Only sync editor text for code tabs; .zform tabs are owned by
+                // the designer and must not be overwritten with editor contents.
+                if (lastActive >= 0 && lastActive < tabs.Count
+                    && !ZanIDE.IsFormPath(tabs[lastActive].path)
+                    && !ZanIDE.IsScenePath(tabs[lastActive].path)) {
+                    tabs[lastActive].body = editor.GetText();
+                    // Leaving a tab remembers where it was being read.
+                    tabs[lastActive].caretLine = editor.CurLine();
+                    tabs[lastActive].caretCol = editor.CurCol();
+                    tabs[lastActive].scrollLine = editor.ScrollLine();
+                }
+                if (act >= 0 && act < tabs.Count
+                    && !ZanIDE.IsFormPath(tabs[act].path)
+                    && !ZanIDE.IsScenePath(tabs[act].path)) {
+                    // Highlighting, completion and Ctrl+/ follow the file's
+                    // language: an embedded .lua/.py script is not Zan.
+                    editor.SetSyntaxLang(
+                        CodeEditor.LangForName(tabs[act].path));
+                    editor.LoadText(tabs[act].body);
+                    // Feed the project's other sources to the editor so it
+                    // can resolve cross-file types (a `Utils` class in
+                    // another file) and count the uses of a member that
+                    // live outside the file being edited.
+                    editor.SetProjectFiles(
+                        ZanIDE.ProjectSources(tabs, root, act));
+                    // Back to where this tab was left, not to line 1. A
+                    // pending navigation target is applied just below and
+                    // still wins.
+                    editor.GoToLineCol(tabs[act].caretLine, tabs[act].caretCol);
+                    editor.SetScrollLine(tabs[act].scrollLine);
+                }
+                lastActive = act;
+            }
+
+            if (pendingGotoLine >= 0) {
+                editor.GoToLineCol(pendingGotoLine, pendingGotoCol);
+                pendingGotoLine = 0 - 1;
+                app.RequestRedraw();
+            }
+
+            Rect edRect = new Rect(ea.x, ea.y + tabH, ea.width, ea.height - tabH);
+            bool activeIsStart = (act >= 0 && act < tabs.Count && tabs[act].path == "@start");
+            bool activeIsDocs = (act >= 0 && act < tabs.Count && tabs[act].path == "@docs");
+
+            if (designerMode) {
+                // The .zform tab hosts the full component-based form designer
+                // (stdlib Gui.Designer): palette, containers, inspector, event
+                // bindings, JSON drawer. The .zform file stores its design
+                // document; legacy coordinate-based .zform files are converted
+                // on first open.
+                string fpath = tabs[act].path;
+                string fname = ZanIDE.FormBaseName(fpath);
+                if (fpath != loadedFormPath) {
+                    string fbody = tabs[act].body;
+                    if (ZanIDE.LooksLikeJson(fbody)) {
+                        formDesigner.LoadJson(fbody);
+                    } else {
+                        formDesigner.LoadJson(ZanIDE.LegacyFormToJson(fname, fbody));
+                    }
+                    loadedFormPath = fpath;
+                    formCache = formDesigner.SaveJson();
+                    ZanIDE.LoadUserComponents(root, formDesigner);
+                    // Offer the code-behind's variables in the designer's
+                    // bind-path picker (two-way binding targets).
+                    string cbpB = ZanIDE.CodeBehindPath(fpath);
+                    if (File.Exists(cbpB)) {
+                        formDesigner.SetBindVars(ZanIDE.ScanBindVars(File.ReadAllText(cbpB)));
+                    } else {
+                        formDesigner.SetBindVars(new List<string>());
+                    }
+                }
+                // 先画宿主 dock 里的组件/属性面板：设计器据此知道
+                // 左右两栏归宿主管，本体这一帧只排功能区 + 画布。
+                formDesigner.RenderHostPanels(app, dock.ContentParked("toolbox"),
+                    dock.ContentParked("props"));
+                formDesigner.Render(app, edRect.x, edRect.y, edRect.width, edRect.height);
+                // Persist design changes to the .zform file - the single
+                // source of truth (zanc projects typed fields + Main from
+                // it at compile time). The business file (Name.zan) is
+                // never touched here - it is only created when missing.
+                string newser = formDesigner.SaveJson();
+                if (newser != formCache) {
+                    tabs[act].body = newser;
+                    if (fpath.Length > 0 && fpath.Substring(0, 1) != "@") {
+                        File.WriteAllText(fpath, newser);
+                        string cbpS = ZanIDE.CodeBehindPath(fpath);
+                        if (!File.Exists(cbpS)) {
+                            File.WriteAllText(cbpS, ZanIDE.GenBusinessShell(fname));
+                        }
+                        // Push the new design to zan-lsp so the code-behind's
+                        // completion sees added/renamed/deleted controls at once.
+                        if (lspSess != null && lspSess.Alive()) {
+                            lspSess.SyncDoc(fpath, newser);
+                        }
+                    }
+                    formCache = newser;
+                }
+                // "Save as component": persist the whole design as a reusable
+                // project component (components/<name>.zcomp) and refresh the
+                // designer's "My Components" palette group.
+                if (formDesigner.ConsumeSaveComponent()) {
+                    string compName = ZanIDE.SanitizeName(formDesigner.formNameSig.Get());
+                    if (compName == "") { compName = fname; }
+                    string compDir = root + "/components";
+                    Directory.CreateDirectoryRecursive(compDir);
+                    string compPath = compDir + "/" + compName + ".zcomp";
+                    File.WriteAllText(compPath, formDesigner.SaveJson());
+                    ZanIDE.LoadUserComponents(root, formDesigner);
+                    log.Add("> Saved component -> " + compPath + ".");
+                    app.RequestRedraw();
+                }
+            } else if (sceneMode) {
+                // The .zscene tab hosts the free-canvas game scene designer
+                // (stdlib Game.Scene.SceneDesigner). The .zscene file stores
+                // the scene JSON document.
+                string spath = tabs[act].path;
+                if (spath != loadedScenePath) {
+                    string sbody = tabs[act].body;
+                    if (ZanIDE.LooksLikeJson(sbody)) {
+                        sceneDesigner.LoadJson(sbody);
+                    } else {
+                        sceneDesigner.LoadJson(new SceneDoc(
+                            ZanIDE.SceneBaseName(spath), 1280, 720).ToJson());
+                    }
+                    loadedScenePath = spath;
+                    sceneCache = sceneDesigner.SaveJson();
+                }
+                SceneDesigner.assetsDir = ZanIDE.AssetsDir(root);
+                // 先画宿主 dock 里的组件/属性面板：设计器据此知道
+                // 左右两栏归宿主管，本体这一帧只排功能区 + 画布。
+                sceneDesigner.RenderHostPanels(app, dock.ContentParked("toolbox"),
+                    dock.ContentParked("props"));
+                sceneDesigner.Render(app, edRect.x, edRect.y, edRect.width, edRect.height);
+                // Persist design changes to the .zscene file.
+                string snewser = sceneDesigner.SaveJson();
+                if (snewser != sceneCache) {
+                    tabs[act].body = snewser;
+                    if (spath.Length > 0 && spath.Substring(0, 1) != "@") {
+                        File.WriteAllText(spath, snewser);
+                        // The .zscene is the only file the design lives in
+                        // (zanc projects the typed elements at compile
+                        // time); create the business Name.zan only when
+                        // missing - the designer never overwrites it.
+                        string sname = ZanIDE.SceneBaseName(spath);
+                        string scbP = ZanIDE.SceneCodeBehindPath(spath);
+                        if (!File.Exists(scbP)) {
+                            File.WriteAllText(scbP, ZanIDE.GenSceneBusinessShell(sname));
+                        }
+                        // Push the design to zan-lsp, which projects the
+                        // typed elements from the JSON itself, so element
+                        // completion tracks the designer.
+                        if (lspSess != null && lspSess.Alive()) {
+                            lspSess.SyncDoc(spath, snewser);
+                        }
+                    }
+                    sceneCache = snewser;
+                }
+            } else if (activeIsDocs) {
+                DocsPage.RenderDocsPage(app, edRect, log);
+            } else if (activeIsStart) {
+                startPage.SetRecents(ZanIDE.RecentProjectItems());
+                startPage.SetNews(ZanIDE.StartNews(root));
+                startPage.RenderInside(app, edRect);
+                int sact = startPage.TakeAction();
+                string dropped = startPage.TakeRemovedPath();
+                if (dropped != "") {
+                    ZanIDE.RemoveRecentProject(dropped);
+                    startPage.SetRecents(ZanIDE.RecentProjectItems());
+                    app.RequestRedraw();
+                }
+                if (sact == 1 && dlg == null) {
+                    tpls = ZanIDE.BuildCatalog(root);
+                    wizTpls = ZanIDE.WizTemplates(tpls);
+                    catNames = ZanIDE.CatsOf(tpls);
+                    catSel.Set(0);
+                    pSel.Set(0);
+                    pSizeSeededFor = 0 - 1;
+                    pNameInput.SetText("NewProject");
+                    pLocInput.SetText(ZanIDE.ReadLastPickerDirectory(ZanIDE.ProjectsHome()));
+                    Wizard.notice = "";
+                    dlg = this.OpenWizardHost(app, ZanIDE.T("New Project", "新建项目"), 1180, 680, 1);
+                    dlgMode = 1;
+                    app.RequestRedraw();
+                } else if (sact == 2 && dlg == null) {
+                    dlg = this.OpenWizardHost(app, ZanIDE.T("New File", "新建文件"), 720, 470, 2);
+                    dlgMode = 2;
+                    app.RequestRedraw();
+                } else if (sact == 3) {
+                    pathPicker.BeginOpenFileFilters(
+                        ZanIDE.ReadLastPickerDirectory(root),
+                        ZanIDE.OpenFileFilters(),
+                        ZanIDE.T("Open source file", "打开源文件"));
+                    pathPickerOwner = 4;
+                    app.RequestRedraw();
+                } else if (sact == 4) {
+                    pathPicker.BeginFolder(
+                        ZanIDE.ReadLastPickerDirectory(root),
+                        ZanIDE.T("Open a project folder", "打开项目文件夹"));
+                    pathPickerOwner = 10;
+                    app.RequestRedraw();
+                } else if (sact >= 200) {
+                    string nurl = startPage.NewsLink(sact - 200);
+                    if (nurl != "") {
+                        if (nurl == "@docs") {
+                            int di = ZanIDE.FindTabByPath(tabs, "@docs");
+                            if (di < 0) {
+                                tabs.Add(TabRecord.Create(ZanIDE.T("Help", "帮助"), "", "@docs"));
+                                di = tabs.Count - 1;
+                            }
+                            activeTab.Set(di);
+                            lastActive = 0 - 1;
+                        } else {
+                            ZanIDE.OpenExternal(nurl);
+                        }
+                        app.RequestRedraw();
+                    }
+                } else if (sact >= 100) {
+                    string newRoot = startPage.RecentPath(sact - 100);
+                    if (newRoot != "") {
+                        if (newRoot != root && Directory.Exists(newRoot)) {
+                            root = newRoot;
+                            haveProject = true;
+                            ZanIDE.WriteLastProject(root);
+                            this.AdoptSymbolIndex();
+                            this.AdoptProjectChats();
+                            tabs = new List<TabRecord>();
+                            activeTab.Set(0);
+                            lastActive = 0 - 1;
+                            ZanIDE.OpenFirst(tabs, activeTab, root);
+                            rescan = true;
+                            log.Add("> Opened project " + root + ".");
+                        }
+                        app.RequestRedraw();
+                    }
+                }
+            } else if (act >= 0 && act < tabs.Count
+                    && ZanIDE.IsScenePath(tabs[act].path) && codeViewForm == tabs[act].path) {
+                // Code view of the current .zscene: show the strongly-typed
+                // scene code the compiler projects from the design - the
+                // read-only "Designer" half, kept in memory only. The scene
+                // is edited visually; game logic lives in Name.zan.
+                string spC = tabs[act].path;
+                if (formCodeLoaded != spC) {
+                    string sTxt = "";
+                    if (File.Exists(spC)) {
+                        sTxt = ZanIDE.GenSceneFile(ZanIDE.SceneBaseName(spC),
+                            SceneDoc.Parse(File.ReadAllText(spC)));
+                    }
+                    formCodeEd.LoadText(sTxt);
+                    formCodeLoaded = spC;
+                }
+                ZanIDE.ApplyEditorTheme(formCodeEd, edThemeIdx, edFontPx);
+                formCodeEd.Render(app, edRect);
+            } else if (act >= 0 && act < tabs.Count
+                    && ZanIDE.IsFormPath(tabs[act].path) && codeViewForm == tabs[act].path) {
+                // Code view of the current .zform: show the design
+                // document's raw JSON in place (read-only) - the window is
+                // edited visually in the designer, and business logic lives
+                // in the paired Name.zan (2-file model, no generated file).
+                string fpC = tabs[act].path;
+                if (formCodeLoaded != fpC) {
+                    string codeTxt = "";
+                    if (File.Exists(fpC)) {
+                        codeTxt = File.ReadAllText(fpC);
+                    }
+                    formCodeEd.LoadText(codeTxt);
+                    formCodeLoaded = fpC;
+                }
+                ZanIDE.ApplyEditorTheme(formCodeEd, edThemeIdx, edFontPx);
+                formCodeEd.Render(app, edRect);
+            } else {
+                // Sync debug vars into editor for hover tooltips
+                if (dbgState == 2) { editor.SetDebugVars(dbgVarInfo); }
+                else { editor.SetDebugVars(new List<DbgVar>()); }
+                ZanIDE.ApplyEditorTheme(editor, edThemeIdx, edFontPx);
+                editor.Render(app, edRect);
+                // Publish live editor state to the AI automation driver
+                // (ZAN_UI_SCRIPT) so scripts can assert buffer/caret and the
+                // completion popup without screen-scraping. Inert otherwise.
+                if (UiDriver.Active()) {
+                    UiDriver.SetProbe("editor", ZanIDE.EditorProbeJson(editor));
+                    UiDriver.SetProbe("log", string.Join("\n", log));
+                }
+                // Ctrl+click in the editor requests Go to Definition.
+                if (editor.ConsumeGotoRequest()) {
+                    if (lspSess == null && !lspTried) {
+                        lspTried = true;
+                        lspSess = LspSession.Start(root);
+                        if (lspSess != null) { log.Add("> zan-lsp connected: semantic navigation enabled."); }
+                    }
+                    string navW_glc = editor.WordAtCaret();
+                    this.RememberTabView();
+                    int glc = ZanIDE.GoToDefinitionSmart(lspSess, editor, tabs, activeTab, root, log);
+                    this.ApplyGotoResult(glc, navW_glc);
+                    app.RequestRedraw();
+                }
+                // Draw inline debug annotations
+                if (dbgState == 2 && dbgExecLine >= 0) {
+                    dbgInline.Render(app, edRect, dbgVarInfo);
+                }
+            }
+
+            // ---- reference list ("N references" / Shift+F12) ----
+            if (refList.IsOpen() && !designerMode && !sceneMode
+                    && !activeIsStart && !activeIsDocs) {
+                // Hangs on the line the list was opened from, following it
+                // as the view scrolls. Not the caret: a click in the code
+                // moves that, and the panel would chase the pointer.
+                refList.Anchor(edRect.x + app.Scale(56),
+                    editor.LineBottomY(app, refAnchorLine));
+                // A row activated in the overlay phase is read on the next
+                // frame: the popup draws after the page, so the jump happens
+                // once, from here, and not in the middle of painting it.
+                int refPick = refList.TakePicked();
+                if (refPick >= 0) { this.GotoReference(refPick); }
+                refList.Frame(app);
+            } else if (refList.IsOpen()) {
+                // The list belongs to the code view; a designer or start tab
+                // is not where its rows point.
+                refList.Close();
+            }
+
+            // ---- Find / Replace bar (Ctrl+F, Ctrl+R) ----
+            if ((findMode == 1 || findMode == 2) && !designerMode && !sceneMode
+                    && !activeIsStart && !activeIsDocs) {
+                findBar.Render(app, edRect, editor);
+                if (findBar.CloseRequested()) {
+                    findBar.ClearCloseRequest();
+                    findMode = 0;
+                    app.focus.SetFocused(editor.LastWidgetId());
+                    app.RequestRedraw();
+                }
+            }
+
+            // ---- 跳转到行 / 断点条件 / 重命名 / 在文件中查找替换 ----
+            // 一个声明式的小输入条（views/QuickPrompt.zform），编辑、
+            // 选择、剪贴板和输入法都归标准输入框。
+            this.RunQuickPrompt(app, edRect, designerMode || sceneMode
+                || activeIsStart || activeIsDocs);
+
+            // ---- Errors panel: the diagnostics of the last build. Its own
+            // dock panel, so it stays readable next to (or instead of) the
+            // console, and its tab carries the error count.
+            // 「帮助与反馈」：本地聚合的错误 + 复制/导出。它和错误面板并列
+            // 在底部，但收的是全部来源（含界面层异常与程序崩溃），不只是
+            // 这一次编译的诊断。
+            Rect errRect = dock.ContentParked("errors");
+            List<DiagnosticRecord> errors = new List<DiagnosticRecord>();
+            ZanIDE.ParseErrorList(log, errors);
+            string errTitle = ZanIDE.T("Errors", "错误");
+            if (errors.Count > 0) {
+                errTitle = errTitle + " (" + Convert.ToString(errors.Count) + ")";
+            }
+            if (errTitle != dockErrorsTitle) {
+                dock.SetTitle("errors", errTitle);
+                dockErrorsTitle = errTitle;
+            }
+            errorsPanel.Render(app, errRect, errors);
+            // Error rows are widgets: the ErrorList component records clicks
+            // during RenderAt; apply them here.
+            if (!coCtxOpen) {
+                DiagnosticRecord efr = errorsPanel.TakeFix();
+                if (efr != null) {
+                    ZanIDE.AddUsing(editor, tabs, activeTab,
+                        errorsPanel.FixNs(efr), log);
+                    app.RequestRedraw();
+                }
+                DiagnosticRecord ejr = errorsPanel.TakeJump();
+                if (ejr != null) {
+                    int ejt = ZanIDE.FindTabByBase(
+                        tabs, ZanIDE.BaseName(ejr.path));
+                    int ejl = ZanIDE.ParseInt(ejr.line);
+                    if (ejt >= 0) {
+                        activeTab.Set(ejt);
+                        lastActive = 0 - 1;
+                        pendingGotoLine = ejl - 1;
+                        pendingGotoCol = 0;
+                    }
+                    app.RequestRedraw();
+                }
+            }
+
+            if (dbgState == 2) {
+                dbgPanel.Render(app, orr, dbgPanelTab,
+                    dbgConsole, dbgVarInfo, dbgWatchVals, dbgStack);
+                // The Watch tab's field and grid are widgets: typing,
+                // Enter and the row click happen inside them, and the
+                // shell only learns what the user asked for.
+                string wAdd = DebugPanel.TakeWatchAdd();
+                int wDrop = DebugPanel.TakeWatchDrop();
+                if (wAdd.Length > 0) {
+                    dbgWatches.Add(wAdd);
+                    dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
+                    app.RequestRedraw();
+                }
+                if (wDrop >= 0 && wDrop < dbgWatches.Count) {
+                    dbgWatches.RemoveAt(wDrop);
+                    dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
+                    app.RequestRedraw();
+                }
+            } else {
+                // Which bottom panel the pointer is over -- 0 console,
+                // 1 errors -- so copy/clear act on what was right-clicked.
+                int botTab = 0;
+                if (errRect.Contains(app.mouseX, app.mouseY)) { botTab = 1; }
+                // The console is its own designed panel (panels/OutputPanel.zform):
+                // it filters the real log into its own view, colours the rows
+                // and owns the filter box, Clear button and selection. The
+                // real `log` is untouched; copy/selection act on the view.
+                int obTabH = t.heightMedium;
+                int coContentY = orr.y + obTabH;
+                int coContentH = orr.height - obTabH;
+                outputPanel.Render(app, orr, log);
+                List<string> coView = outputPanel.Shown();
+                // Right-click opens the shared context menu (copy
+                // selection / line / all, clear) instead of silently copying.
+                Rect botRect = orr;
+                if (botTab == 1) { botRect = errRect; }
+                if (app.EventKind() == 2 && app.window.EventButton() == 1
+                    && botRect.Contains(app.mouseX, app.mouseY)) {
+                    coCtxOpen = true;
+                    coCtxX = app.mouseX;
+                    coCtxY = app.mouseY;
+                    if (botTab == 0) {
+                        coCtxRow = LogView.RowAt(app, coContentY, coContentH,
+                            coView.Count, coLog.scroll, app.mouseY);
+                    } else {
+                        coCtxRow = (app.mouseY - (errRect.y + app.Scale(6))) / app.Scale(20);
+                    }
+                    app.RequestRedraw();
+                }
+                if (coCtxOpen) {
+                    bool haveSel = botTab == 0 && coLog.HasSelection();
+                    List<string> cmi = new List<string>();
+                    if (haveSel) {
+                        cmi.Add(ZanIDE.T("Copy selection", "复制选中"));
+                    }
+                    cmi.Add(ZanIDE.T("Copy line", "复制该行"));
+                    cmi.Add(ZanIDE.T("Copy all", "复制全部"));
+                    cmi.Add(ZanIDE.T("Clear", "清空"));
+                    int cmHit = ContextMenu.Render(app, coCtxX, coCtxY, cmi);
+                    if (cmHit == 0 - 2) {
+                        coCtxOpen = false;
+                        app.RequestRedraw();
+                    } else if (cmHit >= 0) {
+                        int base2 = 0;
+                        if (haveSel) { base2 = 1; }
+                        string clip = "";
+                        if (haveSel && cmHit == 0) {
+                            clip = LogView.SelectionText(coView, coLog);
+                        } else if (cmHit == base2) {
+                            if (botTab == 0) {
+                                if (coCtxRow >= 0 && coCtxRow < coView.Count) {
+                                    clip = coView[coCtxRow];
+                                }
+                            } else if (coCtxRow >= 0 && coCtxRow < errors.Count) {
+                                DiagnosticRecord error = errors[coCtxRow];
+                                clip = ZanIDE.BaseName(error.path) + ":"
+                                    + error.line + "  " + error.msg;
+                            }
+                        } else if (cmHit == base2 + 1) {
+                            if (botTab == 0) {
+                                for (int ci = 0; ci < coView.Count; ci = ci + 1) { clip = clip + coView[ci] + "\n"; }
+                            } else {
+                                for (int ci = 0; ci < errors.Count; ci = ci + 1) {
+                                    DiagnosticRecord error = errors[ci];
+                                    clip = clip + ZanIDE.BaseName(error.path) + ":" + error.line
+                                        + "  " + error.msg + "\n";
+                                }
+                            }
+                        } else {
+                            log = new List<string>();
+                            coFilter.SetText("");
+                            coLog.Reset();
+                        }
+                        if (clip.Length > 0) {
+                            Clipboard.SetText(clip);
+                            Layer.Msg(ZanIDE.T("Copied to clipboard", "已复制到剪贴板"), 3);
+                        }
+                        coCtxOpen = false;
+                        app.RequestRedraw();
+                    }
+                }
+                // Ctrl+C copies the console selection when the pointer is
+                // over the output panel (the editor keeps its own copy).
+                if (app.EventKind() == 4 && app.window.EventKeyCode() == 67
+                    && Modifiers.HasCtrl(app.window.EventMods())
+                    && coLog.HasSelection()
+                    && orr.Contains(app.mouseX, app.mouseY)) {
+                    Clipboard.SetText(LogView.SelectionText(coView, coLog));
+                    Layer.Msg(ZanIDE.T("Copied to clipboard", "已复制到剪贴板"), 3);
+                    app.RequestRedraw();
+                }
+            }
+
+            // ---- AI 助手面板：界面在 panels/AiPanel.zform 里声明，
+            // 行为在 ZanIDE.AiPanel.zan。助手、工具、示例和 git 是四个
+            // 各自独立的停靠面板，外壳只把 dock 分给它的矩形交出来
+            // （隐藏时停在屏幕外），所以它们可以互相并成页签、换边或关闭
+            this.RenderAiPanel(app, dock.ContentParked("ai"));
+            // ---- Git panel: its own designed panel
+            // (panels/GitPanel.zform): branch header, the command rows, the
+            // changed-file list and the commit row. Every button is a designed
+            // onClick handler, so the shell only hands over the rect.
+            gitPanel.Render(app, dock.ContentParked("git"));
+            // ---- Tools and Examples panels: a tree each, both owning their
+            // filter row, scrolling and selection. A double-click RUNS a
+            // tool (tools are Zan code) or opens an example's source in the
+            // editor; a right-click raises the panel's context menu.
+            toolsPanel.Render(app, dock.ContentParked("tools"), rtToolTree);
+            examplesPanel.Render(app, dock.ContentParked("examples"), rtExTree);
+            // Stream new shell output from a launched program into the
+            // Output tab. Poll on the throttled animation clock so a live
+            // session doesn't spin the CPU but output appears promptly.
+            if (termFp != 0) {
+                int consumed2 = ZanIDE.TermPoll(termLogLen, log);
+                if (consumed2 != termLogLen) {
+                    termLogLen = consumed2;
+                    coLog.Reset();
+                    app.RequestRedraw();
+                }
+                app.RequestAnimationFrame(250);
+            }
+            // Mirror a launched console program's output into the Output tab.
+            if (runStreaming) {
+                int rconsumed = ZanIDE.RunPoll(runLogLen, log);
+                if (rconsumed != runLogLen) {
+                    runLogLen = rconsumed;
+                    coLog.Reset();
+                    app.RequestRedraw();
+                }
+                // The launched program exited: drain any trailing output and
+                // stop streaming so the 4 fps throttle lifts and the log is
+                // no longer polled (it also caps the mirror file's growth).
+                if (File.Exists(ZanIDE.RunDonePath())) {
+                    File.Delete(ZanIDE.RunDonePath());
+                    int rfinal = ZanIDE.RunPoll(runLogLen, log);
+                    if (rfinal != runLogLen) {
+                        runLogLen = rfinal;
+                        coLog.Reset();
+                        app.RequestRedraw();
+                    }
+                    runStreaming = false;
+                }
+                app.RequestAnimationFrame(250);
+            }
+            // Save-triggered hot reload (autoRun ON): rebuild + restart the
+            // active target in a DETACHED shell so saving never freezes the
+            // IDE. The buildBusy poll below streams output and relaunches on
+            // completion, exactly like the Run action.
+            if (hotReloadReq) {
+                hotReloadReq = false;
+                if (!buildBusy) {
+                    int atHr = activeTab.Get();
+                    string apHr = "";
+                    if (atHr >= 0 && atHr < tabs.Count) { apHr = tabs[atHr].path; }
+                    string rpHr = ZanIDE.RibbonRunTarget(apHr, root);
+                    if (rpHr != "") {
+                        string bdHr = ZanIDE.EnsureBuildDir(root);
+                        string exeHr = bdHr + "/.zanrun" + ZanIDE.ExeSuffix();
+                        ZanIDE.HotKillRunExe(exeHr);
+                        buildBusy = true;
+                        buildThenRun = !ZanIDE.IsLibraryProject(root);
+                        buildExe = ZanIDE.RunBuildBegin(root, rpHr);
+                        buildIsGui = ZanIDE.IsWindowedTarget(root, rpHr);
+                        buildTargetPath = apHr;
+                        buildLogLen = 0;
+                        dock.Focus("output");
+                        log.Add("> [Hot] Rebuilding " + rpHr + " ...");
+                        app.RequestAnimationFrame(80);
+                    }
+                }
+            }
+            // Poll the in-flight detached git job (status scan or a panel
+            // command): apply the result when its marker appears, so a slow
+            // repository never freezes the window.
+            if (gitJob != 0) {
+                if (ZanIDE.GitJobDone()) {
+                    List<string> gJob = ZanIDE.GitJobTake();
+                    if (gitJob == 1) {
+                        gitBranch = ZanIDE.GitRefreshApply(gJob, gitFiles);
+                        gitLoaded = true;
+                        gitSel.Set(0 - 1);
+                    } else {
+                        ZanIDE.AppendAll(log, gJob);
+                        coLog.Reset();
+                        // a command may have changed the working tree
+                        gitLoaded = false;
+                    }
+                    gitJob = 0;
+                    app.RequestRedraw();
+                } else {
+                    app.RequestAnimationFrame(120);
+                }
+            }
+            // Poll the on-disk symbol index: a background EmitSymbolsDetach
+            // (or a build) may have written a newer one; reload it so member
+            // completion follows the newest code without a restart.
+            if (haveProject) {
+                string idxP = ZanIDE.SymbolIndexPath(root);
+                if (File.Exists(idxP)) {
+                    long stI = FileInfo.GetLastWriteTime(idxP);
+                    if (stI > symbolIdxStamp) {
+                        if (ZanIDE.LoadSymbolIndexFor(root)) { symbolIdxStamp = stI; }
+                    }
+                }
+            }
+            // Poll the in-flight detached build (Run/Build ribbon): stream
+            // compiler output and, when the done-marker appears, apply
+            // diagnostics and (for Run) launch the program -- no UI freeze.
+            if (buildBusy) {
+                int bConsumed = ZanIDE.BuildPoll(buildLogLen, log);
+                if (bConsumed != buildLogLen) {
+                    buildLogLen = bConsumed;
+                    coLog.Reset();
+                    app.RequestRedraw();
+                }
+                if (File.Exists(ZanIDE.BuildDonePath())) {
+                    File.Delete(ZanIDE.BuildDonePath());
+                    buildLogLen = ZanIDE.BuildPoll(buildLogLen, log);
+                    buildBusy = false;
+                    List<string> bout = CodeEditor.SplitLines(File.ReadAllText(ZanIDE.BuildLogPath()));
+                    ZanIDE.ApplyDiagnostics(editor, buildTargetPath, bout, log);
+                    if (dbgBuildPending) {
+                        dbgBuildPending = false;
+                        if (!File.Exists(buildExe)) {
+                            log.Add("> [Debug] Build failed.");
+                        } else {
+                            log.Add("> [Debug] Build succeeded.");
+                            dbg = ZanIDE.DbgBegin(root, buildTargetPath,
+                                ZanIDE.MergeBreakpoints(editor.Breakpoints(), bpConds),
+                                ZanIDE.FirstDebugLine(editor), log);
+                            dbgState = ZanIDE.DbgSync(dbg, editor, log, dbgConsole);
+                            dbgExecLine = ZanIDE.DbgLine(dbg);
+                            dbgVarInfo = ZanIDE.DbgVars(dbg);
+                            dbgStack = ZanIDE.DbgStack(dbg);
+                            dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
+                            dbgPanelTab.Set(1);
+                            if (dbgState == 2) {
+                                log.Add(">   F5=Continue  F10=StepOver  F11=StepInto  Ctrl+B=Condition  Esc=Stop");
+                                ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
+                            } else {
+                                dbg = null;
+                            }
+                        }
+                    } else if (!File.Exists(buildExe)) {
+                        // 构建失败只报错：把「错误」面板顶到前面，
+                        // 绝不擅自弹别的窗口（缺库只给一行提示）。
+                        string missingPackage = ZanIDE.MissingPackage(bout);
+                        if (missingPackage != "") {
+                            log.Add(ZanIDE.T("> Missing package: ",
+                                "> 缺少库：") + missingPackage
+                                + ZanIDE.T(" (install it from Extensions)",
+                                    "（可到「扩展」里安装）"));
+                        }
+                        log.Add(ZanIDE.T("> Build failed; not run.", "> 构建失败，未运行。"));
+                        dock.Focus("errors");
+                    } else if (buildThenRun) {
+                        // The program starts in the project root, not in the
+                        // IDE's own directory, so its relative paths (an
+                        // example's assets/, config/app.json) resolve.
+                        string runCwd = ZanIDE.RunCwd(root, buildTargetPath, buildExe);
+                        if (buildIsGui) {
+                            #if WINDOWS
+                            Process.RunDetached("cmd /c start \"\" /D \""
+                                + ZanIDE.ToWinPath(runCwd) + "\" \"" + buildExe + "\"");
+                            #else
+                            Process.RunDetached("sh -c 'cd \"" + runCwd + "\" && \""
+                                + buildExe + "\" >/dev/null 2>&1' &");
+                            #endif
+                            log.Add(ZanIDE.T("> GUI app started.", "> GUI 应用已启动。"));
+                        } else {
+                            // Console programs run in their own console window
+                            // (real stdin, so Console.ReadLine works) with
+                            // output teed into the Output tab.
+                            log.Add("> " + buildExe);
+                            ZanIDE.RunConsole(buildExe, runCwd);
+                            runLogLen = 0;
+                            runStreaming = true;
+                        }
+                    } else {
+                        log.Add(ZanIDE.T("> Build succeeded.", "> 构建成功。"));
+                    }
+                    // A build means the code changed: re-index so
+                    // completion follows it, and pick up the index
+                    // the previous build produced.
+                    if (ZanIDE.LoadSymbolIndexFor(root)) {
+                        string idxPB = ZanIDE.SymbolIndexPath(root);
+                        if (File.Exists(idxPB)) {
+                            symbolIdxStamp = FileInfo.GetLastWriteTime(idxPB);
+                        }
+                    }
+                    this.RefreshSymbolIndex(true);
+                    // An AI-initiated build/run: hand the compiler result
+                    // back to the assistant loop so it reads the real
+                    // errors and can fix them, then continue.
+                    if (aiBuildForAi) {
+                        aiBuildForAi = false;
+                        bool aiOk = File.Exists(buildExe);
+                        // 编译/运行的真实结果回填到当前那一拍：失败按故障
+                        // 分类决定重试、进根因回环还是交给用户，不靠循环
+                        // 自己猜。
+                        string aiPhTool = "build";
+                        if (aiUiPending) { aiPhTool = aiUiTool; }
+                        else if (buildThenRun) { aiPhTool = "run"; }
+                        this.AiRunBuildDone(aiOk, aiPhTool, bout);
+                        if (aiUiPending) {
+                            // ui_check: on a good build, launch the target
+                            // under the UiDriver script and let the ui poll
+                            // gather the log + hit regions; a failed build
+                            // goes straight back so the model can fix it.
+                            aiUiPending = false;
+                            if (aiOk) {
+                                string uid = root + "/_scratch/uidrv";
+                                string uiCwd = ZanIDE.RunCwd(root,
+                                    buildTargetPath, buildExe);
+                                ZanIDE.LaunchUnderUiDriver(buildExe, uiCwd,
+                                    uid + "/ai_script.txt", uid,
+                                    uid + "/ai_done.txt");
+                                aiUiRunning = true;
+                                aiUiDeadline = Window.GetTickMs() + 30000;
+                                log.Add(ZanIDE.T("> [AI] Driving UI...",
+                                    "> [AI] 正在驱动 UI 自检..."));
+                                app.RequestAnimationFrame(120);
+                            } else {
+                                aiMsgs.Add(ChatMessage.Create("tool",
+                                    aiUiTool + "\n"
+                                    + AiAgent.BuildResult(bout, false, false)));
+                                string ube = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
+                                    aiRunCtxName, aiRunCtxCode, root,
+                                    aiProfiles[aiProfActive].baseUrl,
+                                    aiProfiles[aiProfActive].key, aiRunModel);
+                                if (ube != "") {
+                                    aiMsgs.Add(ChatMessage.Create("error", ube));
+                                    aiBusy.Set(0);
+                                }
+                                this.AiChatToEnd();
+                            }
+                        } else {
+                            string tb = "build\n";
+                            if (buildThenRun) { tb = "run\n"; }
+                            aiMsgs.Add(ChatMessage.Create("tool",
+                                tb + AiAgent.BuildResult(bout, aiOk, buildThenRun)));
+                            string aiBe = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
+                                aiRunCtxName, aiRunCtxCode, root,
+                                aiProfiles[aiProfActive].baseUrl,
+                                aiProfiles[aiProfActive].key, aiRunModel);
+                            if (aiBe != "") {
+                                aiMsgs.Add(ChatMessage.Create("error", aiBe));
+                                aiBusy.Set(0);
+                            }
+                            this.AiChatToEnd();
+                        }
+                    }
+                    coLog.Reset();
+                    app.RequestRedraw();
+                }
+                app.RequestAnimationFrame(80);
+            }
+            // ui_check in flight: the target is being driven by the
+            // UiDriver script. Wait (without blocking) for its done-marker
+            // or the deadline, then feed the driver log + hit-region dump
+            // back so the model can verify the UI against real geometry.
+            if (aiUiRunning) {
+                string uidP = root + "/_scratch/uidrv";
+                bool uiDone = File.Exists(uidP + "/ai_done.txt");
+                bool uiTo = Window.GetTickMs() > aiUiDeadline;
+                if (uiDone || uiTo) {
+                    aiUiRunning = false;
+                    if (uiDone) { File.Delete(uidP + "/ai_done.txt"); }
+                    string rlog = "";
+                    if (File.Exists(uidP + "/results.log")) {
+                        rlog = File.ReadAllText(uidP + "/results.log");
+                    }
+                    string rjson = "";
+                    if (File.Exists(uidP + "/regions.json")) {
+                        rjson = File.ReadAllText(uidP + "/regions.json");
+                    }
+                    string tjson = "";
+                    if (File.Exists(uidP + "/theme.json")) {
+                        tjson = File.ReadAllText(uidP + "/theme.json");
+                    }
+                    aiMsgs.Add(ChatMessage.Create("tool",
+                        aiUiTool + "\n"
+                        + AiAgent.UiResultOf(aiUiTool, rlog, rjson, tjson,
+                            uiTo && !uiDone)));
+                    string uce = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
+                        aiRunCtxName, aiRunCtxCode, root,
+                        aiProfiles[aiProfActive].baseUrl,
+                        aiProfiles[aiProfActive].key, aiRunModel);
+                    if (uce != "") {
+                        aiMsgs.Add(ChatMessage.Create("error", uce));
+                        aiBusy.Set(0);
+                    }
+                    this.AiChatToEnd();
+                    app.RequestRedraw();
+                } else {
+                    app.RequestAnimationFrame(150);
+                }
+            }
+            // Poll the in-flight detached publish: compiler output streams
+            // into the Output tab and a done-marker file signals completion,
+            // so even a slow cross-compile never blocks the UI.
+            if (pubBusy) {
+                int pubConsumed = ZanIDE.PubPoll(pubLogLen, log);
+                if (pubConsumed != pubLogLen) {
+                    pubLogLen = pubConsumed;
+                    coLog.Reset();
+                    app.RequestRedraw();
+                }
+                if (File.Exists(ZanIDE.PubDonePath())) {
+                    File.Delete(ZanIDE.PubDonePath());
+                    pubLogLen = ZanIDE.PubPoll(pubLogLen, log);
+                    int pubOk = 0;
+                    for (int pe = 0; pe < pubExes.Count; pe = pe + 1) {
+                        if (File.Exists(pubExes[pe])) {
+                            log.Add("> Published " + pubExes[pe]);
+                            pubOk = pubOk + 1;
+                        } else {
+                            log.Add(ZanIDE.T("> Publish failed for ", "> 发布失败：") + pubExes[pe]);
+                        }
+                    }
+                    // Each target has its own output directory, so the
+                    // resources go beside each executable that does not
+                    // already carry them: a packed Windows exe has them
+                    // inside, everything else needs the loose copy.
+                    bool packed = ZanIDE.CanPackSingle() && ZanIDE.ProjSingleFile(root);
+                    for (int pe3 = 0; pe3 < pubExes.Count; pe3 = pe3 + 1) {
+                        if (File.Exists(pubExes[pe3])
+                            && !(packed && ZanIDE.EndsWith(pubExes[pe3], ".exe"))) {
+                            ZanIDE.CopyResources(root, ZanIDE.DirOf(pubExes[pe3]), log);
+                        }
+                    }
+                    pubBusy = false;
+                    pubExes = new List<string>();
+                    coLog.Reset();
+                    app.RequestRedraw();
+                }
+                app.RequestAnimationFrame(250);
+            }
+            // Poll the in-flight AI request. The Net worker thread streams
+            // the decoded response body into an in-memory sink as it
+            // arrives and publishes "ok"/"err: ..." when it ends. Each
+            // frame the panel reads the sink to show the answer building up
+            // live, and a wall-clock backstop times the wait out so the
+            // panel never hangs on 'thinking' if the worker dies silently.
+            if (aiBusy.Get() == 1) {
+                bool aiToolRunning = buildBusy || aiUiRunning || runStreaming;
+                if (aiToolRunning) {
+                    aiWaitStart = 0;
+                }
+                string aiDoneTxt = AiNet.Done();
+                bool aiMarker = aiDoneTxt != "";
+                bool aiTimedOut = false;
+                if (!aiToolRunning && !aiMarker) {
+                    // Live read: re-parse only when the decoded body grew,
+                    // and drop a stale live bubble if a retry just reset
+                    // the sink.
+                    string sraw = AiNet.Text();
+                    if (sraw.Length < aiStreamLen) {
+                        if (aiStreamMsgIdx >= 0
+                            && aiStreamMsgIdx == aiMsgs.Count - 1) {
+                            aiMsgs.RemoveAt(aiStreamMsgIdx);
+                        }
+                        aiStreamMsgIdx = 0 - 1;
+                        aiStreamLen = 0;
+                    }
+                    if (sraw.Length != aiStreamLen) {
+                        aiStreamLen = sraw.Length;
+                        SseAnswer pa = AiAgent.ParseSse(sraw);
+                        string live = pa.content;
+                        if (live == "" && pa.reasoning != "") {
+                            live = ZanIDE.T("(thinking) ", "(思考中) ")
+                                + pa.reasoning;
+                        }
+                        if (live != "") {
+                            if (aiStreamMsgIdx < 0) {
+                                aiMsgs.Add(ChatMessage.Create("assistant", live));
+                                aiStreamMsgIdx = aiMsgs.Count - 1;
+                            } else if (aiStreamMsgIdx < aiMsgs.Count) {
+                                aiMsgs[aiStreamMsgIdx].text = live;
+                            }
+                            this.AiChatToEnd();
+                        }
+                        aiWaitStart = 0;
+                    } else {
+                        int aiNow = Window.GetTickMs();
+                        if (aiWaitStart == 0) { aiWaitStart = aiNow; }
+                        // Mirrors the transport's idle window (600s): a
+                        // model that is still thinking emits nothing for
+                        // minutes, so only give up after the same silence
+                        // the Net layer would time out on. Any byte of
+                        // stream content (or a retry that truncates the
+                        // file) re-arms the wait above.
+                        else if (aiNow - aiWaitStart > 600000) {
+                            aiTimedOut = true;
+                        }
+                    }
+                }
+                if (aiTimedOut) {
+                    aiWaitStart = 0;
+                    if (aiStreamMsgIdx >= 0
+                        && aiStreamMsgIdx == aiMsgs.Count - 1) {
+                        aiMsgs.RemoveAt(aiStreamMsgIdx);
+                    }
+                    aiStreamMsgIdx = 0 - 1;
+                    aiStreamLen = 0;
+                    aiMsgs.Add(ChatMessage.Create("error", ZanIDE.T(
+                        "[error] AI request timed out - no response received.",
+                        "[错误] AI 请求超时——未收到响应。")));
+                    aiBusy.Set(0);
+                    this.AiChatToEnd();
+                } else if (aiMarker) {
+                    aiWaitStart = 0;
+                    string doneTxt = AiAgent.Trim(aiDoneTxt);
+                    // Drop the live preview bubble; the final turns are added
+                    // below from the fully decoded stream.
+                    if (aiStreamMsgIdx >= 0
+                        && aiStreamMsgIdx == aiMsgs.Count - 1) {
+                        aiMsgs.RemoveAt(aiStreamMsgIdx);
+                    }
+                    aiStreamMsgIdx = 0 - 1;
+                    aiStreamLen = 0;
+                    string sraw = AiNet.Text();
+                    AiNet.Abandon();
+                    SseAnswer fa = AiAgent.ParseSse(sraw);
+                    if (fa.totalTokens > 0 || fa.promptTokens > 0) {
+                        aiTokPrompt = fa.promptTokens;
+                        aiTokCompletion = fa.completionTokens;
+                        aiTokTotal = fa.totalTokens;
+                        aiTokCached = fa.cachedTokens;
+                    }
+                    ZanIDE.AiStatAdd(fa);
+                    // A success marker begins with "ok" (the streamer can
+                    // occasionally append it twice -> "okok"); anything
+                    // starting with "err" is a failure.
+                    bool doneOk = doneTxt.Length >= 2
+                        && doneTxt.Substring(0, 2) == "ok";
+                    if (!doneOk || fa.error != "") {
+                        string emsg = doneTxt;
+                        if (emsg.Length >= 5 && emsg.Substring(0, 5) == "err: ") {
+                            emsg = emsg.Substring(5, emsg.Length - 5);
+                        }
+                        if (fa.error != "") {
+                            if (emsg != "" && !doneOk) {
+                                emsg = emsg + ": " + fa.error;
+                            } else { emsg = fa.error; }
+                        }
+                        if (emsg == "") { emsg = "the AI request failed."; }
+                        ZanIDE.aiStatFails = ZanIDE.aiStatFails + 1;
+                        // A dropped connection or an idle timeout is not an
+                        // answer: resend the same request instead of
+                        // dumping the task on the user, who could only do
+                        // the same thing by hand.
+                        bool retryable = fa.error == ""
+                            && AiAgent.IsTransient(emsg)
+                            && aiRetry < AiAgent.MaxRetries();
+                        if (retryable) {
+                            aiRetry = aiRetry + 1;
+                            string rle = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
+                                aiRunCtxName, aiRunCtxCode, root,
+                                aiProfiles[aiProfActive].baseUrl,
+                                aiProfiles[aiProfActive].key, aiRunModel);
+                            if (rle == "") {
+                                log.Add("> 小赞: " + emsg + " - "
+                                    + ZanIDE.T("retrying (", "重试中（")
+                                    + Convert.ToString(aiRetry) + "/"
+                                    + Convert.ToString(AiAgent.MaxRetries())
+                                    + ZanIDE.T(")", "）"));
+                                Layer.Msg(ZanIDE.T("Xiao Zan request failed - retrying",
+                                    "小赞请求失败——正在重试"), 3);
+                            } else {
+                                aiMsgs.Add(ChatMessage.Create("error",
+                                    "[error] " + rle));
+                                aiBusy.Set(0);
+                            }
+                        } else {
+                            aiRetry = 0;
+                            aiMsgs.Add(ChatMessage.Create("error",
+                                "[error] " + emsg));
+                            aiBusy.Set(0);
+                        }
+                    } else {
+                        aiRetry = 0;
+                        // A reply that asks for a tool is one step of the
+                        // assistant loop, not the answer: run the tool inside
+                        // the project, hand the result back and ask again, so
+                        // the model reads the real code instead of guessing.
+                        string reply = fa.content;
+                        string call = AiAgent.ToolBlock(reply);
+                        bool more = call != ""
+                            && AiAgent.StepsSinceUser(aiMsgs) < AiAgent.MaxSteps();
+                        string said = reply;
+                        if (call != "") { said = AiAgent.StripToolBlock(reply); }
+                        string rz = AiAgent.Trim(fa.reasoning);
+                        // A reply that is only a tool block still carries
+                        // thinking worth keeping, so save the reasoning
+                        // even when there is no visible text.
+                        if (said != "" || rz != "") {
+                            ChatMessage amsg = ChatMessage.CreateWithReason(
+                                "assistant", said, rz);
+                            if (aiTeamMode) {
+                                // Record the beat on the message itself, so
+                                // the transcript (and the reload of it) can
+                                // show progress and ownership without
+                                // re-parsing the prose.
+                                AiEnvelope env = AiTeam.ParseEnvelope(said);
+                                AiTeam.ApplyToTasks(aiTasks, aiRunAgent, env);
+                                amsg.agent = aiRunAgent;
+                                amsg.kind = env.kind;
+                                amsg.taskId = env.taskId;
+                                amsg.progress = env.progress;
+                                amsg.to = AiTeam.JoinIds(env.to);
+                            }
+                            aiMsgs.Add(amsg);
+                        }
+                        if (more) {
+                            string tname = AiAgent.ToolName(call);
+                            if (AiAgent.IsMutating(tname) && !aiAutoExec) {
+                                // A write / build / run pauses for the user:
+                                // park the call and switch to the confirm
+                                // state (aiBusy == 2). Nothing touches the
+                                // project until they Approve it in the panel.
+                                aiPendingCall = call;
+                                aiBusy.Set(2);
+                            } else {
+                                AiDispatchTool(call);
+                            }
+                        } else {
+                            // Nothing left to run this turn. Rather than
+                            // stopping half-way through a checklist -- the
+                            // task "not continuing by itself" -- push the
+                            // loop on with a continue turn, which also
+                            // refills the per-question tool budget. Bounded
+                            // by MaxContinues() and never taken when the
+                            // model just asked the user something.
+                            // A read-only tool (read_file / grep /
+                            // list_dir / repo_map) that ran out of budget
+                            // is NOT a reason to keep going on its own: the
+                            // model was only looking, not doing. Only a
+                            // mutating call cut mid-task refills the budget
+                            // -- or an unfinished plan under Auto-execute.
+                            bool limitHit = call != ""
+                                && AiAgent.IsMutating(AiAgent.ToolName(call));
+                            bool cont = aiAutoCont < AiAgent.MaxContinues()
+                                && (limitHit
+                                    || (aiAutoExec && AiPlanUnfinished()
+                                        && !AiAgent.AsksUser(said)));
+                            if (cont) {
+                                aiAutoCont = aiAutoCont + 1;
+                                aiMsgs.Add(ChatMessage.Create("user",
+                                    AiAgent.ContinuePrompt(limitHit)));
+                                string cle = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
+                                    aiRunCtxName, aiRunCtxCode, root,
+                                    aiProfiles[aiProfActive].baseUrl,
+                                    aiProfiles[aiProfActive].key, aiRunModel);
+                                if (cle != "") {
+                                    aiMsgs.Add(ChatMessage.Create("error", cle));
+                                    aiBusy.Set(0);
+                                }
+                            } else {
+                                if (limitHit) {
+                                    aiMsgs.Add(ChatMessage.Create("error", ZanIDE.T(
+                                        "Tool limit reached for this question.",
+                                        "本次提问的工具调用次数已达上限。")));
+                                }
+                                this.AiRunTurnEnd(said);
+                                AiTeamTurnEnd(said);
+                            }
+                        }
+                    }
+                    this.AiChatToEnd();
+                }
+                app.RequestRedraw();
+            }
+
+            // Autosave the AI transcript (throttled to 1/s): every new user
+            // turn, tool result or streamed answer is folded into the
+            // current session and written to disk, so restarting the IDE
+            // keeps the conversation instead of losing it. This runs per
+            // frame, NOT inside the panel's own branch: a chat that keeps
+            // answering while the assistant panel is hidden (or tabbed
+            // behind another dock panel) was never written back, which is
+            // how a reopened session came back cut off mid-answer.
+            this.AutosaveAiSessions(Window.GetTickMs());
+
+            // Close the dock frame: draws the drag ghost / drop highlight
+            // over the panels and applies a finished drag. The arrangement
+            // is written back only when it actually changed.
+            dock.End(app);
+            string dockClosed = dock.TakeClosed();
+            if (dockClosed != "") {
+                Layer.Msg(ZanIDE.T("Panel closed - right-click a tab strip to restore",
+                    "面板已关闭 - 右键标签栏可恢复"), 3);
+            }
+            if (dock.TakeChanged()) { ZanIDE.WriteDockLayout(dock.SaveLayout()); }
+
+            // Status bar. Drawn on the same muted panel surface as the
+            // title bar / side panels (bgSecondary) so the shell reads as
+            // one calm frame; only the debugging state gets a loud tint.
+            int sbY = H - sbH;
+            bool sbDebug = (dbgState == 2);
+            int sbText = t.textPrimary;
+            int sbMuted = t.textSecondary;
+            if (sbDebug) {
+                sbText = t.onScrim;
+                sbMuted = t.tooltipTextMuted;
+            }
+            int curLn = editor.CurLine();
+            int curCl = editor.CurCol();
+            string posInfo = ZanIDE.T("Ln ", "行 ") + Convert.ToString(curLn + 1) + ZanIDE.T(", Col ", "，列 ") + Convert.ToString(curCl + 1);
+            // Language of the buffer, so an embedded .lua/.py script
+            // edited next to its Zan host shows which rules the editor
+            // is applying (highlighting, comment mark, completion).
+            string modeInfo = "Zan";
+            if (editor.SyntaxLang() == 1) { modeInfo = "Lua"; }
+            if (editor.SyntaxLang() == 2) { modeInfo = "Python"; }
+            if (designerMode) { modeInfo = ZanIDE.T("Designer", "设计器"); }
+            if (pubBusy) { modeInfo = ZanIDE.T("Publishing...", "发布中..."); }
+            if (sbDebug) { modeInfo = ZanIDE.T("Debugging", "调试中"); }
+            int sbTint = 0;
+            if (sbDebug) { sbTint = t.statusDebugBg; }
+            statusBar.SetTint(sbTint);
+            statusBar.SetText(sbPosItem, posInfo);
+            statusBar.SetColor(sbPosItem, sbText);
+            statusBar.SetText(sbModeItem, modeInfo);
+            statusBar.SetColor(sbModeItem, sbText);
+            statusBar.SetColor(sbEncItem, sbMuted);
+            statusBar.RenderAt(app, 0, sbY, W, sbH);
+
+            // Top-level editor context menu overlay (drawn last so nothing
+            // paints over it), then bridge its host commands.
+            if (!designerMode && !activeIsStart && !activeIsDocs) {
+                editor.RenderCtxMenu(app);
+                string ecmd = editor.TakeCommand();
+                if (ecmd == "find") {
+                    findMode = 1;
+                    findBar.Open(false, this.FindSeed());
+                    app.RequestRedraw();
+                }
+                else if (ecmd == "gotoline") { findMode = 3; app.RequestRedraw(); }
+                else if (ecmd == "gotodef") {
+                    if (lspSess == null && !lspTried) {
+                        lspTried = true;
+                        lspSess = LspSession.Start(root);
+                        if (lspSess != null) { log.Add("> zan-lsp connected: semantic navigation enabled."); }
+                    }
+                    string navW_gl = editor.WordAtCaret();
+                    this.RememberTabView();
+                    int gl = ZanIDE.GoToDefinitionSmart(lspSess, editor, tabs, activeTab, root, log);
+                    this.ApplyGotoResult(gl, navW_gl);
+                    app.RequestRedraw();
+                } else if (ecmd == "findrefs") {
+                    if (lspSess == null && !lspTried) {
+                        lspTried = true;
+                        lspSess = LspSession.Start(root);
+                        if (lspSess != null) { log.Add("> zan-lsp connected: semantic navigation enabled."); }
+                    }
+                    this.ShowReferences();
+                    app.RequestRedraw();
+                }
+            }
+            // File-tree / tab right-click context menus, drawn above the
+            // editor overlay. ctxKind: 1 = project tree row, 2 = stdlib
+            // tree row, 3 = editor tab, 4 = Tools panel row, 5 = Examples
+            // panel row.
+            if (ctxKind != 0) {
+                List<string> cmLabels = new List<string>();
+                if (ctxKind == 1) {
+                    cmLabels.Add(ZanIDE.T("New File", "新建文件"));
+                    cmLabels.Add(ZanIDE.T("New Folder", "新建文件夹"));
+                    cmLabels.Add("-");
+                    int delN = 1;
+                    if (explorerTv != null && explorerTv.IsMarked(ctxTarget)) {
+                        delN = explorerTv.SelectionCount();
+                    }
+                    if (delN > 1) {
+                        cmLabels.Add(ZanIDE.T("Delete ", "删除 ") + Convert.ToString(delN)
+                            + ZanIDE.T(" items", " 项"));
+                    } else {
+                        cmLabels.Add(ZanIDE.T("Delete", "删除"));
+                    }
+                    cmLabels.Add("-");
+                    cmLabels.Add(ZanIDE.T("Refresh", "刷新"));
+                    cmLabels.Add(ZanIDE.T("Copy Path", "复制路径"));
+                    cmLabels.Add(ZanIDE.T("Reveal in Explorer", "在资源管理器中显示"));
+                } else if (ctxKind == 2) {
+                    cmLabels.Add(ZanIDE.T("Open", "打开"));
+                    cmLabels.Add("-");
+                    cmLabels.Add(ZanIDE.T("Refresh", "刷新"));
+                    cmLabels.Add(ZanIDE.T("Copy Path", "复制路径"));
+                    cmLabels.Add(ZanIDE.T("Reveal in Explorer", "在资源管理器中显示"));
+                } else if (ctxKind == 3) {
+                    cmLabels.Add(ZanIDE.T("Close", "关闭"));
+                    cmLabels.Add(ZanIDE.T("Close Others", "关闭其他"));
+                    cmLabels.Add("-");
+                    cmLabels.Add(ZanIDE.T("Copy Path", "复制路径"));
+                } else if (ctxKind == 4) {
+                    cmLabels.Add(ZanIDE.T("Open in Editor", "在编辑器中打开"));
+                    cmLabels.Add(ZanIDE.T("Run", "运行"));
+                    cmLabels.Add("-");
+                    cmLabels.Add(ZanIDE.T("Copy Path", "复制路径"));
+                    cmLabels.Add(ZanIDE.T("Reveal in Explorer", "在资源管理器中显示"));
+                } else if (ctxKind == 5) {
+                    cmLabels.Add(ZanIDE.T("Open", "打开"));
+                    cmLabels.Add("-");
+                    cmLabels.Add(ZanIDE.T("Copy Path", "复制路径"));
+                    cmLabels.Add(ZanIDE.T("Reveal in Explorer", "在资源管理器中显示"));
+                }
+                int chosen = ContextMenu.Render(app, ctxX, ctxY, cmLabels);
+                if (chosen == 0 - 2) {
+                    ctxKind = 0;
+                    app.RequestRedraw();
+                } else if (chosen >= 0) {
+                    if (ctxKind == 1) {
+                        if (chosen == 0 && dlg == null) {
+                            dlg = this.OpenWizardHost(app, ZanIDE.T("New File", "新建文件"), 720, 470, 2);
+                            dlgMode = 2;
+                        } else if (chosen == 1 && dlg == null) {
+                            dlg = this.OpenWizardHost(app, ZanIDE.T("New Folder", "新建文件夹"), 720, 470, 2);
+                            fNameInput.SetText("NewFolder");
+                            fSel.Set(ZanIDE.FileKindFolder());
+                            dlgMode = 2;
+                        } else if (chosen == 3) {
+                            // Delete every marked row when the right-clicked
+                            // row is part of the multi-selection; otherwise
+                            // just the row the menu was opened on.
+                            List<int> delRows = new List<int>();
+                            if (explorerTv != null && explorerTv.IsMarked(ctxTarget)) {
+                                delRows = explorerTv.SelectedIndices();
+                            } else {
+                                delRows.Add(ctxTarget);
+                            }
+                            int nDel = 0;
+                            string lastName = "";
+                            for (int dj = 0; dj < delRows.Count; dj = dj + 1) {
+                                int rowd = delRows[dj];
+                                if (rowd >= 0 && rowd < treeShow.Count) {
+                                    string dp = treeShow[rowd].path;
+                                    if (haveProject && dp != "" && ZanIDE.StartsWith(dp, root) && dp != root) {
+                                        ZanIDE.DeletePathRecursive(dp);
+                                        log.Add("> Deleted " + dp + ".");
+                                        lastName = Path.GetFileName(dp);
+                                        nDel = nDel + 1;
+                                    }
+                                }
+                            }
+                            if (nDel > 1) {
+                                Layer.Notify(ZanIDE.T("Deleted ", "已删除 ") + Convert.ToString(nDel)
+                                    + ZanIDE.T(" items", " 项"), 3);
+                            } else if (nDel == 1) {
+                                Layer.Notify(ZanIDE.T("Deleted: ", "已删除：") + lastName, 3);
+                            }
+                            if (nDel > 0) {
+                                explorerTv.ClearSelection();
+                                rescan = true;
+                            }
+                        } else if (chosen == 5) {
+                            rescan = true;
+                        } else if (chosen == 6) {
+                            if (ctxTarget >= 0 && ctxTarget < treeShow.Count) {
+                                Clipboard.SetText(treeShow[ctxTarget].path);
+                                log.Add("> Copied path: " + treeShow[ctxTarget].path);
+                            }
+                        } else if (chosen == 7) {
+                            if (ctxTarget >= 0 && ctxTarget < treeShow.Count) {
+                                ZanIDE.RevealInFileManager(treeShow[ctxTarget].path);
+                            }
+                        }
+                    } else if (ctxKind == 2) {
+                        if (ctxTarget >= 0 && ctxTarget < exShow.Count) {
+                            TreeNode exn = exShow[ctxTarget];
+                            bool exReal = exn.path != "" && !ZanIDE.StartsWith(exn.path, "@");
+                            if (chosen == 0) {
+                                if (exReal && !exn.isDir) {
+                                    ZanIDE.OpenPath(tabs, activeTab, exn.path, exn.label);
+                                    log.Add("> Opened " + exn.path + ".");
+                                }
+                            } else if (chosen == 2) {
+                                exTree = ZanIDE.BuildStdlibTree();
+                                log.Add("> Refreshed standard library / tools / examples.");
+                            } else if (chosen == 3) {
+                                if (exReal) {
+                                    Clipboard.SetText(exn.path);
+                                    log.Add("> Copied path: " + exn.path);
+                                }
+                            } else if (chosen == 4) {
+                                if (exReal) { ZanIDE.RevealInFileManager(exn.path); }
+                            }
+                        }
+                    } else if (ctxKind == 3) {
+                        if (chosen == 0) {
+                            this.RequestCloseTab(ctxTarget);
+                        } else if (chosen == 1) {
+                            if (ctxTarget >= 0 && ctxTarget < tabs.Count) {
+                                this.RequestCloseOthers(tabs[ctxTarget].path);
+                            }
+                        } else if (chosen == 3) {
+                            if (ctxTarget >= 0 && ctxTarget < tabs.Count) {
+                                Clipboard.SetText(tabs[ctxTarget].path);
+                                log.Add("> Copied path: " + tabs[ctxTarget].path);
+                            }
+                        }
+                    } else if (ctxKind == 4) {
+                        if (ctxTarget >= 0 && ctxTarget < rtCtxShow.Count) {
+                            TreeNode rtrn = rtCtxShow[ctxTarget];
+                            bool rtReal = rtrn.path != "" && !ZanIDE.StartsWith(rtrn.path, "@");
+                            if (!rtrn.isDir && rtReal) {
+                                if (chosen == 0) {
+                                    ZanIDE.OpenPath(tabs, activeTab, rtrn.path, rtrn.label);
+                                    log.Add("> Opened " + rtrn.path + ".");
+                                } else if (chosen == 1) {
+                                    string rtcT = ZanIDE.RunTarget(rtrn.path, root);
+                                    if (buildBusy) {
+                                        Layer.Msg(ZanIDE.T("Build already running…", "构建进行中…"), 2);
+                                    } else if (rtcT != "") {
+                                        log.Add(ZanIDE.T("> Running tool ", "> 运行工具 ") + rtrn.path + " ...");
+                                        buildBusy = true;
+                                        buildThenRun = true;
+                                        buildExe = ZanIDE.RunBuildBegin(root, rtcT);
+                                        buildIsGui = ZanIDE.IsWindowedTarget(root, rtcT);
+                                        buildTargetPath = rtrn.path;
+                                        buildLogLen = 0;
+                                        dock.Focus("output");
+                                        app.RequestAnimationFrame(80);
+                                    }
+                                } else if (chosen == 3) {
+                                    Clipboard.SetText(rtrn.path);
+                                    log.Add("> Copied path: " + rtrn.path);
+                                } else if (chosen == 4) {
+                                    ZanIDE.RevealInFileManager(rtrn.path);
+                                }
+                            }
+                        }
+                    } else if (ctxKind == 5) {
+                        if (ctxTarget >= 0 && ctxTarget < rtCtxShow.Count) {
+                            TreeNode exrn = rtCtxShow[ctxTarget];
+                            bool exrReal = exrn.path != "" && !ZanIDE.StartsWith(exrn.path, "@");
+                            if (chosen == 0) {
+                                if (!exrn.isDir && exrReal) {
+                                    ZanIDE.OpenPath(tabs, activeTab, exrn.path, exrn.label);
+                                    log.Add("> Opened " + exrn.path + ".");
+                                }
+                            } else if (chosen == 2) {
+                                if (exrReal) {
+                                    Clipboard.SetText(exrn.path);
+                                    log.Add("> Copied path: " + exrn.path);
+                                }
+                            } else if (chosen == 3) {
+                                if (exrReal) { ZanIDE.RevealInFileManager(exrn.path); }
+                            }
+                        }
+                    }
+                    ctxKind = 0;
+                    app.RequestRedraw();
+                }
+            }
+
+            // Publish / Project Configuration / Asset Manager now render in
+            // their own top-level child windows (App.CreateDark) -- see the
+            // pumps right after the main frame below. Only the deferred
+            // publish kick-off (started once the window has closed) stays here.
+            if (pubPending && !pubBusy) {
+                pubPending = false;
+                pubExes = ZanIDE.PublishPlatformsBegin(tabs, activeTab, root, pubSel, log);
+                pubBusy = pubExes.Count > 0;
+                pubLogLen = 0;
+                app.RequestRedraw();
+            }
+            string windowTitle = IdeVersion.Product();
+            if (haveProject) { windowTitle = windowTitle + "  —  " + root; }
+            // Unsaved-changes / changed-on-disk questions, above the page
+            // and below the transient feedback queues.
+            this.RenderDocDialogs();
+            // Global operation feedback: toast + notification queues drawn
+            // above everything so every action gives visible feedback.
+            Layer.RenderToasts(app);
+            Layer.RenderNotifs(app);
+            // Hover tips requested by widgets during the frame, painted on
+            // top of everything they would otherwise hide behind.
+            Tooltip.Flush(app);
+        } catch (Exception frameEx) {
+            app.NoteFrameError("ide-frame", frameEx.Message);
+            app.CancelPartialFrame();
+            app.RequestRedraw();
+        }
+    }
+
+    /// Runs once when the event loop ends: flush the AI chat and persist the
+    /// window + panel sizes before the process goes away.
+    void Shutdown() {
+    // Flush the chat before the process goes away: the 1/s autosave can
+    // still be holding a partially streamed answer when the window closes,
+    // and that half-written turn is exactly what a reopened session showed.
+    SaveAiSessions();
+    // Persist window + panel sizes so the next launch restores them.
+    // Only the USER's own wallpaper is persisted: the skin pack's art is
+    // installed by the skin on launch, so saving it would leak this pack's
+    // backdrop into the next launch (and mix palettes when the skin
+    // changes). Skin.Apply installs the pack art when there is no user
+    // wallpaper, so the distinction is exact.
+    int arv = 0;
+    if (autoRun) { arv = 1; }
+    ZanIDE.SaveSettings(treeW.Get(), bottomPanelH.Get(), savedW, savedH, arv, app.SkinNameAt(app.ThemeMenuIndex()), rightW.Get(), winOpacity, app.UserWallpaperPath(), app.UserWallpaperOpacity());
+}
+
+    /// The console jumps back to the newest line (a fresh run/build starts).
+    void OutputReset() {
+        if (coLog != null) { coLog.Reset(); }
+    }
+
+    /// The console'''s Clear button (designed handler): empties the real log
+    /// and resets the panel'''s filter and scroll state.
+    static void OutputClearRequested() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || ide.coCtxOpen) { return; }
+        ide.log = new List<string>();
+        ide.coFilter.SetText("");
+        ide.OutputReset();
+    }
+}

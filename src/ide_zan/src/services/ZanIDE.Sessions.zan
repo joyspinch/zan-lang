@@ -1,0 +1,279 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+using System.Data;
+using System.Data.Sqlite;
+using Platform;
+
+/// 小助手会话的落盘：SQLite 会话库、按项目归属的对话，以及一次交付的
+/// 存档（记录 + 计划 + 团队状态）。
+partial class ZanIDE {
+    // ---- AI chat sessions (disk persistence) -------------------------------
+    /// Where the AI chat session list lives (a SQLite database in the cache
+    /// dir), so closing the IDE does not lose the conversation: each row is one
+    /// session's ChatPack JSON, plus a meta row holding the active index.
+    /// Saved on every session change and (throttled) whenever the transcript
+    /// grows.
+    ///
+    /// It is the chat list of the open project. Chats are project work -- they cite
+    /// its files and carry its context -- so each project keeps its own list,
+    /// and two IDEs on two projects no longer write over one shared database
+    /// (the whole list is rewritten on every save, so the loser lost its chats).
+    /// With no project open the list is the install-wide one, which is also
+    /// where every pre-project-scoped chat still lives.
+    string AiSessionsDbPath() {
+        if (!haveProject || root == "") { return ZanIDE.SharedSessionsDbPath(); }
+        return ZanIDE.CacheDir() + "/sessions/" + ZanIDE.PathKey(root) + ".db";
+    }
+
+    static string SharedSessionsDbPath() {
+        return ZanIDE.CacheDir() + "/ai_sessions.db";
+    }
+
+    /// A stable, file-name-safe key for a path: its leaf plus a hash of the
+    /// whole thing, so two projects with the same folder name stay apart.
+    static string PathKey(string path) {
+        string leaf = ZanIDE.SanitizeName(Path.GetFileName(path));
+        if (leaf == "") { leaf = "project"; }
+        long h = 2166136261;
+        for (int i = 0; i < path.Length; i = i + 1) {
+            int b = path[i];
+            // Windows paths differ only in case and separator: fold both so the
+            // same project does not get two lists.
+            if (b >= 65 && b <= 90) { b = b + 32; }
+            if (b == 92) { b = 47; }
+            h = (h ^ b) * 16777619;
+            h = h & 0xFFFFFFFF;
+        }
+        return leaf + "_" + Convert.ToString(h);
+    }
+
+    /// 最多每秒写回一次记录，而且只在真的变过时写。每帧从主循环调一次，
+    /// 时钟由调用方给（服务层不引 Gui）。
+    void AutosaveAiSessions(int nowMs) {
+        if (aiSessCur < 0 || aiSessCur >= aiSessions.Count) { return; }
+        if (nowMs - aiLastSave <= 1000) { return; }
+        aiLastSave = nowMs;
+        string curPack = AiPackCur();
+        if (aiSessions[aiSessCur].pack == curPack) { return; }
+        aiSessions[aiSessCur].pack = curPack;
+        SaveAiSessions();
+    }
+
+    void SaveAiSessions() {
+        // Fold the live transcript into the current slot first, so the on-disk
+        // copy always matches what the user sees.
+        if (aiSessCur >= 0 && aiSessCur < aiSessions.Count) {
+            aiSessions[aiSessCur].pack = AiPackCur();
+        }
+        // Archive flags travel beside the packs (one 0/1 per session) rather
+        // than inside them, so an older database still loads.
+        string archCsv = "";
+        for (int ai = 0; ai < aiSessions.Count; ai = ai + 1) {
+            if (ai > 0) { archCsv = archCsv + ","; }
+            archCsv = archCsv + Convert.ToString(aiSessions[ai].archived);
+        }
+        SqliteConnection db = null;
+        try {
+            ZanIDE.EnsureCacheDir();
+            string dbp = this.AiSessionsDbPath();
+            Directory.CreateDirectoryRecursive(ZanIDE.DirOf(dbp));
+            db = SqliteConnection.Open(dbp);
+            if (db == null || !db.IsConnected()) { return; }
+            db.Execute("CREATE TABLE IF NOT EXISTS sessions ("
+                + "id INTEGER PRIMARY KEY, pack TEXT NOT NULL)");
+            db.Execute("CREATE TABLE IF NOT EXISTS meta ("
+                + "key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+            db.Execute("DELETE FROM sessions");
+            for (int i = 0; i < aiSessions.Count; i = i + 1) {
+                db.Execute("INSERT INTO sessions (id, pack) VALUES (?, ?)",
+                    new DbParams().AddInt(i).Add(aiSessions[i].pack));
+            }
+            db.Execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('cur', ?)",
+                new DbParams().Add(Convert.ToString(aiSessCur)));
+            db.Execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('arch', ?)",
+                new DbParams().Add(archCsv));
+            // Names the user typed travel beside the packs too, so a database
+            // written by an older build (no titles row) still loads.
+            AiTitlesDoc td = new AiTitlesDoc();
+            td.t = new List<string>();
+            for (int ti2 = 0; ti2 < aiSessions.Count; ti2 = ti2 + 1) {
+                td.t.Add(aiSessions[ti2].title);
+            }
+            db.Execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('titles', ?)",
+                new DbParams().Add(Json.Serialize<AiTitlesDoc>(td)));
+        } catch (Exception e) {
+            // Never let a storage failure crash the IDE's main loop.
+            int skip = 0;
+        } finally {
+            if (db != null) { db.Close(); }
+        }
+    }
+
+    /// "0,1,0" -> [0, 1, 0]; anything unparsable yields an empty list.
+    static List<int> ParseFlagCsv(string csv) {
+        List<int> outp = new List<int>();
+        string cur = "";
+        for (int i = 0; i <= csv.Length; i = i + 1) {
+            string ch = "";
+            if (i < csv.Length) { ch = csv.Substring(i, 1); }
+            if (ch == "," || i == csv.Length) {
+                if (cur != "") {
+                    int f = 0;
+                    if (ZanIDE.ParseIntSafe(cur) != 0) { f = 1; }
+                    outp.Add(f);
+                }
+                cur = "";
+            } else {
+                cur = cur + ch;
+            }
+        }
+        return outp;
+    }
+
+    void LoadAiSessions() {
+        aiSessions.Clear();
+        aiSessDbPath = this.AiSessionsDbPath();
+        // 同一时机读回这个项目的交付检查点，「继续」才能接上上次那一拍，而不是
+        // 从需求理解重来。
+        this.AiRunLoad();
+        // A project opening for the first time since chats became per-project
+        // inherits the install-wide list, then owns its copy: the shared file is
+        // renamed so the next project starts clean instead of a second copy.
+        if (haveProject && !File.Exists(aiSessDbPath)
+            && File.Exists(ZanIDE.SharedSessionsDbPath())) {
+            try {
+                Directory.CreateDirectoryRecursive(ZanIDE.DirOf(aiSessDbPath));
+                File.Copy(ZanIDE.SharedSessionsDbPath(), aiSessDbPath);
+                File.Move(ZanIDE.SharedSessionsDbPath(),
+                    ZanIDE.CacheDir() + "/ai_sessions.pre-project.db");
+            } catch (Exception e) {
+                int skip2 = 0;
+            }
+        }
+        // One-time migration from the pre-SQLite JSON file (ai_sessions.json in
+        // the config dir) when the cache database does not exist yet.
+        string legacy = ZanIDE.UserConfigDir() + "/ai_sessions.json";
+        if (!File.Exists(aiSessDbPath) && File.Exists(legacy)) {
+            try {
+                JsonValue v = JsonValue.ParseLenient(File.ReadAllText(legacy));
+                if (v != null) {
+                    JsonValue s = v.Get("s");
+                    if (s != null && s.IsArray()) {
+                        for (int i = 0; i < s.Count(); i = i + 1) {
+                            JsonValue it = s.At(i);
+                            if (it != null) {
+                                aiSessions.Add(AiSession.Create(it.AsString(""), 0));
+                            }
+                        }
+                    }
+                    aiSessCur = v.Int("cur", 0);
+                    if (aiSessions.Count == 0) {
+                        aiSessions.Add(AiSession.Create("", 0)); aiSessCur = 0;
+                    }
+                    if (aiSessCur < 0 || aiSessCur >= aiSessions.Count) { aiSessCur = 0; }
+                    // Persist the migrated data immediately (A35 fixed: calling
+                    // the try/catch/finally SaveAiSessions from inside this
+                    // try/catch no longer trips the LLVM "Incorrect number of
+                    // arguments" IR bug).
+                    SaveAiSessions();
+                }
+            } catch (Exception e) {
+                // Corrupt legacy file: fall through to the empty database.
+                int skip = 0;
+            }
+        }
+        if (File.Exists(aiSessDbPath)) {
+            SqliteConnection db = null;
+            try {
+                db = SqliteConnection.Open(aiSessDbPath);
+                if (db != null && db.IsConnected()) {
+                    DbResult rs = db.Query("SELECT id, pack FROM sessions ORDER BY id");
+                    for (int r = 0; r < rs.RowCount(); r = r + 1) {
+                        aiSessions.Add(AiSession.Create(rs.GetString(r, 1), 0));
+                    }
+                    string curS = db.ExecuteScalar("SELECT value FROM meta WHERE key = 'cur'");
+                    int c = ZanIDE.ParseIntSafe(curS);
+                    List<int> arch = ZanIDE.ParseFlagCsv(
+                        db.ExecuteScalar("SELECT value FROM meta WHERE key = 'arch'"));
+                    if (aiSessions.Count == 0) {
+                        aiSessions.Add(AiSession.Create("", 0)); c = 0;
+                    }
+                    if (c < 0 || c >= aiSessions.Count) { c = 0; }
+                    for (int ai = 0; ai < arch.Count && ai < aiSessions.Count; ai = ai + 1) {
+                        aiSessions[ai].archived = arch[ai];
+                    }
+                    string tj = db.ExecuteScalar(
+                        "SELECT value FROM meta WHERE key = 'titles'");
+                    if (tj != "") {
+                        AiTitlesDoc td = Json.Deserialize<AiTitlesDoc>(tj);
+                        if (td != null && td.t != null) {
+                            for (int tk = 0; tk < td.t.Count
+                                && tk < aiSessions.Count; tk = tk + 1) {
+                                aiSessions[tk].title = td.t[tk];
+                            }
+                        }
+                    }
+                    aiSessCur = c;
+                }
+            } catch (Exception e) {
+                if (aiSessions.Count == 0) {
+                    aiSessions.Add(AiSession.Create("", 0)); aiSessCur = 0;
+                }
+            } finally {
+                if (db != null) { db.Close(); }
+            }
+        } else {
+            if (aiSessions.Count == 0) {
+                aiSessions.Add(AiSession.Create("", 0)); aiSessCur = 0;
+            }
+        }
+        // Restore the active session's transcript into the live lists.
+        aiMsgs = new List<ChatMessage>();
+        aiPlan = new List<AiPlanStep>();
+        if (aiSessCur >= 0 && aiSessCur < aiSessions.Count) {
+            AiRestoreSession(aiSessions[aiSessCur].pack);
+        }
+        aiCacheKey = "";
+        aiCacheSig = "";
+        aiToolOpen = new List<int>();
+        if (aiSessNav != null) { aiSessNav.CancelRename(); }
+    }
+
+    /// Moves the chat panel onto the project that just became the open one:
+    /// the chats of the one before are written back to their own database
+    /// first, so nothing of either project ends up in the other's list.
+    void AdoptProjectChats() {
+        // Startup opens its project before the chat panel exists; the load that
+        // sets the panel up runs later and already knows which project it is.
+        if (aiSessions == null) { return; }
+        string want = this.AiSessionsDbPath();
+        if (want == aiSessDbPath) { return; }
+        SaveAiSessions();
+        LoadAiSessions();
+    }
+
+    /// The active session's archive: transcript, plan and -- so a restart lands
+    /// back in the same pipeline stage -- the team mode, state and board.
+    string AiPackCur() {
+        ChatTeamSave sv = ChatTeamSave.Create();
+        if (aiTeamMode) { sv.on = 1; }
+        sv.st = aiTeamSt;
+        sv.tasks = aiTasks;
+        return ChatArea.ChatPack(aiMsgs, aiPlan, sv);
+    }
+
+    /// Loads a session archive into the live lists, including the team half. A
+    /// single-assistant archive restores as team-off, so opening an old chat
+    /// never silently switches the panel into team mode.
+    void AiRestoreSession(string pack) {
+        ChatTeamSave sv = ChatTeamSave.Create();
+        ChatArea.ChatUnpack(pack, aiMsgs, aiPlan, sv);
+        aiTeamMode = sv.on == 1;
+        aiTeamSt = sv.st;
+        aiTasks = sv.tasks;
+        aiRunAgent = "";
+        aiHandoffs = 0;
+    }
+}

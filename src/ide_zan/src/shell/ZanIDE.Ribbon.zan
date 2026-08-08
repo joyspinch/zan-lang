@@ -1,0 +1,214 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+using System.Data;
+using System.Data.Sqlite;
+using Platform;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+using Gui.Component;
+using Game.Scene;
+
+/// 界面语言（一键 EN / 中文）与功能区：选项卡、分组和按上下文的启用
+/// 状态。命令是纯配置（图标、文案、动作号）。
+partial class ZanIDE {
+    /// Picks the string for the current UI language. API names, keywords and
+    /// project-file syntax are never translated — only human-facing labels.
+    static string T(string en, string zh) {
+        if (ZanIDE.uiLang == 1) { return zh; }
+        return en;
+    }
+
+    static int ReadUiLang() {
+        string f = ZanIDE.EditorPrefsPath();
+        if (!File.Exists(f)) { return 0; }
+        return ZanIDE.CfgInt(File.ReadAllText(f), "lang", 0);
+    }
+
+    /// Number of selectable UI languages (see uiLang). The Settings dialog
+    /// renders one language segment per index via LangName(i).
+    static int LangCount() { return 2; }
+
+    /// Display label for UI language `i` (0 = English, 1 = 简体中文).
+    static string LangName(int i) {
+        if (i == 1) { return "中文"; }
+        return "English";
+    }
+
+    /// The ribbon's tab strip, localized to the current UI language.
+    static List<string> RibbonTabs() {
+        List<string> tabs = new List<string>{
+            ZanIDE.T("Home", "开始"), ZanIDE.T("View", "视图") };
+        return tabs;
+    }
+
+    static int RibbonViewTab() { return 1; }
+
+    /// Builds the ribbon band of `tab` and records each item's stable action id,
+    /// in the same order, into `actions` -- dispatch reads `actions[pos]`, never
+    /// the position, so groups can be rearranged and translated freely.
+    /// The View tab holds only the dock's Panels section (DockHost.AddSwitchGroup).
+    static List<RibbonGroup> BuildRibbonGroups(int tab, List<int> actions) {
+        List<RibbonGroup> groups = new List<RibbonGroup>();
+        if (tab != 0) { return groups; }
+
+        RibbonGroup file = new RibbonGroup(ZanIDE.T("File", "文件"));
+        file.Add(RibbonItem.Large("plus", ZanIDE.T("Project", "项目")).SetTip(
+            ZanIDE.T("Create a project from a template, or open an existing one.",
+                "从模板新建工程，或打开已有工程。")));
+        actions.Add(0);
+        file.Add(RibbonItem.Small("file", ZanIDE.T("New", "新建")).SetTip(
+            ZanIDE.T("Add a new source file to the current project.",
+                "在当前工程中新建源文件。")));
+        actions.Add(1);
+        file.Add(RibbonItem.Small("file", ZanIDE.T("Open", "打开")).SetTip(
+            ZanIDE.T("Open a single source file in the editor.",
+                "在编辑器中打开单个源文件。")));
+        actions.Add(2);
+        file.Add(RibbonItem.Small("folder", ZanIDE.T("Open Project", "打开项目")).SetTip(
+            ZanIDE.T("Open a folder as the workspace; its zan.proj becomes the project.",
+                "打开一个文件夹作为工作区，其中的 zan.proj 即为当前工程。")));
+        actions.Add(16);
+        file.Add(RibbonItem.Small("save", ZanIDE.T("Save", "保存")).SetTip(
+            ZanIDE.T("Write the active editor back to disk (Ctrl+S).",
+                "把当前编辑器的内容写回磁盘（Ctrl+S）。")));
+        actions.Add(3);
+        groups.Add(file);
+
+        // Run reads as the primary band: every command in it is a large button.
+        RibbonGroup run = new RibbonGroup(ZanIDE.T("Run", "运行"));
+        run.Add(RibbonItem.Large("play", ZanIDE.T("Run", "运行")).SetTip(
+            ZanIDE.T("Build the project and run it, streaming output to the Output panel.",
+                "编译并运行工程，输出实时打到“输出”面板。")));
+        actions.Add(4);
+        run.Add(RibbonItem.Large("bug", ZanIDE.T("Debug", "调试")).SetTip(
+            ZanIDE.T("Run with the debugger attached and stop on breakpoints.",
+                "以调试方式运行，在断点处中断。")));
+        actions.Add(7);
+        run.Add(RibbonItem.Large("refresh", ZanIDE.T("Hot", "热重载")).SetTip(
+            ZanIDE.T("Reload the running app with the latest code, keeping its state.",
+                "用最新代码热重载正在运行的程序，保留其状态。")));
+        actions.Add(11);
+        // Publish closes the run group: it is the last thing done to a build.
+        run.Add(RibbonItem.Large("upload", ZanIDE.T("Publish", "发布")).SetTip(
+            ZanIDE.T("Produce a release build for the selected platforms and package it.",
+                "为所选平台生成发布版本并打包。")));
+        actions.Add(6);
+        groups.Add(run);
+
+        RibbonGroup design = new RibbonGroup(ZanIDE.T("Design", "设计"));
+        design.Add(RibbonItem.Large("copy", ZanIDE.T("Template", "模板")).SetTip(
+            ZanIDE.T("Insert a ready-made file or UI template into the project.",
+                "向工程插入现成的文件或界面模板。")));
+        actions.Add(8);
+        // Build settings and the asset library are one project-resources entry:
+        // the dialog behind it holds both.
+        design.Add(RibbonItem.Large("grid", ZanIDE.T("Project", "工程配置")).SetTip(
+            ZanIDE.T("Build and run configuration, and the project's images, fonts and other assets.",
+                "构建与运行配置，以及工程的图片、字体等素材。")));
+        actions.Add(12);
+        design.Add(RibbonItem.Large("download", ZanIDE.T("Extensions", "扩展")).SetTip(
+            ZanIDE.T("Browse and install extensions for the current project.",
+                "浏览并为当前工程安装扩展。")));
+        actions.Add(15);
+        groups.Add(design);
+
+        RibbonGroup shell = new RibbonGroup(ZanIDE.T("Application", "应用"));
+        shell.Add(RibbonItem.Large("settings", ZanIDE.T("Settings", "设置")).SetTip(
+            ZanIDE.T("Theme, font, language and editor preferences.",
+                "主题、字体、语言和编辑器偏好。")));
+        actions.Add(13);
+        shell.Add(RibbonItem.Large("info", ZanIDE.T("Help", "帮助")).SetTip(
+            ZanIDE.T("Language documentation, shortcuts and version info.",
+                "语言文档、快捷键和版本信息。")));
+        actions.Add(14);
+        groups.Add(shell);
+        return groups;
+    }
+
+    /// Greys out what the current context can't do: Run/Debug/Publish need
+    /// something runnable, and Hot/Config/Template need a project.
+    static void SyncRibbonEnabled(List<RibbonGroup> groups, List<int> actions,
+            bool canRun, bool haveProj) {
+        int idx = 0;
+        for (int g = 0; g < groups.Count; g = g + 1) {
+            for (int j = 0; j < groups[g].items.Count; j = j + 1) {
+                if (idx < actions.Count) {
+                    int a = actions[idx];
+                    bool on = true;
+                    if (a == 4 || a == 6 || a == 7) { on = canRun; }
+                    else if (a == 8 || a == 11 || a == 12 || a == 15) { on = haveProj; }
+                    groups[g].items[j].SetEnabled(on);
+                }
+                idx = idx + 1;
+            }
+        }
+    }
+
+    /// The dock panels' titles and switch icons, applied after registration and
+    /// again whenever the UI language changes. The dock draws them on the tab
+    /// strips and on the ribbon's panel switches.
+    static void ApplyPanelLabels(DockHost dock) {
+        dock.SetSwitchHints(ZanIDE.T("Click to hide it.", "点击隐藏。"),
+            ZanIDE.T("Click to bring it back.", "点击重新显示。"));
+        dock.SetTitle("explorer", ZanIDE.T("EXPLORER", "资源管理器"));
+        dock.SetIcon("explorer", "folder");
+        dock.SetTip("explorer", ZanIDE.T("The workspace file tree.", "工作区的文件树。"));
+        dock.SetTitle("structure", ZanIDE.T("STRUCTURE", "结构"));
+        dock.SetIcon("structure", "menu");
+        dock.SetTip("structure", ZanIDE.T(
+            "Types and members of the active file; the component tree in the designer.",
+            "当前文件的类型与成员；设计器中为组件树。"));
+        dock.SetTitle("toolbox", ZanIDE.T("TOOLBOX", "工具箱"));
+        dock.SetIcon("toolbox", "layout");
+        dock.SetTip("toolbox", ZanIDE.T("The active designer's component palette.",
+            "当前设计器的组件面板。"));
+        dock.SetTitle("props", ZanIDE.T("PROPERTIES", "属性"));
+        dock.SetIcon("props", "settings");
+        dock.SetTip("props", ZanIDE.T("The active designer's property inspector.",
+            "当前设计器的属性面板。"));
+        dock.SetTitle("stdlib", ZanIDE.T("STDLIB", "标准库"));
+        dock.SetIcon("stdlib", "code");
+        dock.SetTip("stdlib", ZanIDE.T("Browse the standard library by namespace.",
+            "按命名空间浏览标准库。"));
+        dock.SetTitle("ai", ZanIDE.T("Xiao Zan", "小赞"));
+        dock.SetIcon("ai", "user");
+        dock.SetTip("ai", ZanIDE.T("Ask the assistant about the code, or have it edit for you.",
+            "就代码提问，或让助手直接改。"));
+        dock.SetTitle("tools", ZanIDE.T("Tools", "工具"));
+        dock.SetIcon("tools", "settings");
+        dock.SetTip("tools", ZanIDE.T("Compiler and workspace tools.", "编译器与工作区工具。"));
+        dock.SetTitle("examples", ZanIDE.T("Examples", "示例"));
+        dock.SetIcon("examples", "star");
+        dock.SetTip("examples", ZanIDE.T("Sample projects you can open and run.",
+            "可直接打开运行的示例工程。"));
+        dock.SetTitle("git", ZanIDE.T("Git", "Git"));
+        dock.SetIcon("git", "globe");
+        dock.SetTip("git", ZanIDE.T("Changes, commits and branches of the repository.",
+            "仓库的改动、提交与分支。"));
+        dock.SetTitle("output", ZanIDE.T("Output", "输出"));
+        dock.SetIcon("output", "align-left");
+        dock.SetTip("output", ZanIDE.T("Build and program output.", "编译与程序的输出。"));
+        dock.SetTitle("errors", ZanIDE.T("Errors", "错误"));
+        dock.SetIcon("errors", "warning");
+        dock.SetTip("errors", ZanIDE.T("Compiler errors and warnings; click one to jump to it.",
+            "编译错误与警告，点击可跳转。"));
+        dock.SetTitle("help", ZanIDE.T("Help & Feedback", "帮助与反馈"));
+        dock.SetIcon("help", "bug");
+        dock.SetTip("help", ZanIDE.T(
+            "Locally collected IDE / compiler / runtime errors; copy or export a report.",
+            "本地聚合的 IDE / 编译器 / 运行时错误，可复制或导出报告。"));
+    }
+
+    /// The stable action id behind ribbon position `pos` (see BuildRibbonGroups).
+    /// Action ids: 0 Project, 1 New, 2 Open, 3 Save, 4 Run, 6 Publish, 7 Debug,
+    /// 8 Template, 11 Hot, 12 Project settings (assets included), 13 Settings,
+    /// 14 Help. The start page is a tab and the design/code switch is F7, so
+    /// neither takes a band slot.
+    static int RibbonAction(List<int> actions, int pos) {
+        if (pos < 0 || pos >= actions.Count) { return 0 - 1; }
+        return actions[pos];
+    }
+}
