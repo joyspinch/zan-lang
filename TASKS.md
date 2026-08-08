@@ -464,9 +464,21 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
     `Json.Serialize<T>`）；`--no-gen` 不再有 C 回退（旧 jsongen/routegen/dbgen 已删除）。
   - **预存失败（与本次无关，full 层）**：`selfhost_fixed_point` 在 gen1→gen2 处失败——
     `src/selfhost/dbgen.zan:581` 用 `ref` 参数，而自举编译器（selfhost/parser.zan）从未支持
-    `ref` 关键字（e01975ee 引入，parser 无 TK_REF）。另 7 个 `conformance_arpg_*` 在 HEAD
-    就坏（Zgm→Arpg 改名后 `ArpgSaveState` 从未定义、`System/Collections/Generic` 不存在）；
-    `jwt_rs256`/`rsa_oaep_cbc` 的堆损坏退出与 B7-4 的 rt_mem 双重释放哨兵有关。
+    `ref` 关键字（e01975ee 引入，parser 无 TK_REF）。
+  - **2026-08-08 已修复其余 13 个 standard 失败（standard 448/448 全绿）**：
+    - 7 个 `conformance_arpg_*`：`ArpgSaveState` 等 5 个存档类自 2580fa4a 删
+      `Game/Zgm/Engine.zan` 时丢失、引用保留 → 恢复为
+      `Game/Arpg/Data/SaveState.zan`（构造器 + 链式 SetProgress/AddItem 等 + Dispose，
+      按 test 与 Save.zan 的调用面）；`Formula.zan` 两处 double→int 返回缺显式转换
+      （整数求值器语义，补 `(int)`）；`Project.zan` 补回 `databases` 组件列表 +
+      `FindDatabase`；另 2 个过时 golden（`ZgmTcpClient` 未改名、已删的 OpenProject 行）。
+    - `jwt_rs256`/`rsa_oaep_cbc`/`sdk_wechat_tenpay`/`tls_hostname`：根因是 557f91b3
+      的严格 base64 审计（拒绝空白字符）打断了 PEM 解析——RsaKey/TlsStream/MySql 的
+      PEM 正文提取未剥离 64 列软换行（且 TlsStream 用 `IndexOf("END")` 短标记把
+      `-----` 包进正文）。修法：PEM 层剥离 \r\n（RFC 7468 软换行），`Base64.Decode`
+      保持严格；`tls_hostname` 因此从"环境性"归位为真 bug（内嵌证书、loopback）。
+    - `clipboard_roundtrip`/`win_tray_screen_smoke`：桌面环境测试，直跑 5/5 + 全档
+      通过（偶发抖动，无代码缺陷）。
 
 ---
 
