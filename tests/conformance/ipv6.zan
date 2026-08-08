@@ -1,0 +1,72 @@
+// Conformance: IPv6 end-to-end. TCP echo over ::1 (CreateTcp6 + async
+// connect/accept through the reactor), UDP over ::1 (CreateUdp6 +
+// SendToAsync + RecvFromPeerAsync, whose sender address must come back as
+// ::1), and ResolveSockAddr("localhost") yielding a complete sockaddr of
+// either family (16 or 28 bytes). Also pins the Windows AcceptEx family
+// handling (accepted socket + address buffer sized from the listener).
+// Prints OK.
+using System;
+using System.Net.Sockets;
+
+class Program {
+    static async int Echo() {
+        Socket.Initialize();
+
+        // --- TCP over ::1 ---
+        nint listener = Socket.CreateTcp6();
+        Socket.SetReuseAddr(listener);
+        Socket.Bind(listener, "::1", 46210);
+        Socket.Listen(listener, 8);
+        Socket.SetNonBlocking(listener);
+
+        nint client = Socket.CreateTcp6();
+        Socket.SetNonBlocking(client);
+        int rc = await Socket.ConnectAsync(client, "::1", 46210);
+
+        nint server = await Socket.AcceptAsync(listener);
+        Socket.SetNonBlocking(server);
+
+        int sent = await Socket.SendStringAsync(client, "V6");
+        string req = await Socket.RecvAsync(server, 64);
+        int echoed = await Socket.SendStringAsync(server, req);
+        string reply = await Socket.RecvAsync(client, 64);
+
+        Socket.Close(client);
+        Socket.Close(server);
+        Socket.Close(listener);
+
+        // --- UDP over ::1 with sender address ---
+        nint udpSrv = Socket.CreateUdp6();
+        Socket.SetNonBlocking(udpSrv);
+        Socket.Bind(udpSrv, "::1", 46211);
+
+        nint udpCli = Socket.CreateUdp6();
+        Socket.SetNonBlocking(udpCli);
+        int sentUdp = await Socket.SendToAsync(udpCli, "hello6", 6, "::1", 46211);
+        string got = await Socket.RecvFromPeerAsync(udpSrv, 64);
+        string peer = Socket.PeerIp();
+
+        Socket.Close(udpSrv);
+        Socket.Close(udpCli);
+
+        // --- ResolveSockAddr: "localhost" must yield 16 or 28 bytes ---
+        byte[] sa = new byte[28];
+        int salen = await Socket.ResolveSockAddr("localhost", 46210, sa, 28);
+
+        bool ok = reply == "V6" && rc == 0 && got == "hello6" &&
+                  (peer == "::1" || peer == "0:0:0:0:0:0:0:1") &&
+                  (salen == 16 || salen == 28);
+        if (ok) {
+            Console.WriteLine("OK");
+        } else {
+            Console.WriteLine("FAIL reply=" + reply + " rc=" + rc +
+                " got=" + got + " peer=" + peer + " salen=" + salen);
+        }
+        Socket.Cleanup();
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Echo();
+    }
+}

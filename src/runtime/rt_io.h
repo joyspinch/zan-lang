@@ -56,6 +56,27 @@ int64_t zan_io_socket_peer_ipv4(intptr_t fd);
  * Returns 0 when the hostname cannot be resolved. */
 int32_t zan_io_resolve_ipv4(const char *hostname);
 
+/* Resolve `name` (hostname or literal IPv4/IPv6) to a complete sockaddr --
+ * IPv4 or IPv6, whatever the resolver returns first -- and copy it into
+ * `buf` (which must hold at least 28 bytes). Returns the sockaddr length
+ * (16 or 28), or 0 on failure. Keeps the sockaddr layout out of the Zan
+ * standard library. */
+int32_t zan_io_resolve_sa(const char *name, int32_t port, void *buf,
+                          int32_t cap);
+
+/* Format the address part of a sockaddr (IPv4 or IPv6) as a dotted-quad /
+ * colon-hex string. Returns a static buffer (INET6_ADDRSTRLEN), or "" when
+ * the family is neither AF_INET nor AF_INET6. */
+const char *zan_io_sockaddr_ip_str(const void *sa);
+
+/* Async sockaddr resolution: like zan_io_resolve_co, but stores a complete
+ * sockaddr (16 or 28 bytes) into `buf` and writes its length into `*out`
+ * (0 on failure / timeout). `buf` must stay valid until the frame resumes;
+ * the caller keeps it reachable across the await. */
+void zan_io_resolve_sa_co(const char *name, int32_t port, void *buf,
+                          int32_t cap, void *frame, zan_co_step_t step,
+                          int32_t *out);
+
 #if defined(_WIN32)
 /* Read the encoded DER pointer/length from a Windows PCCERT_CONTEXT.
  * Keeps the CERT_CONTEXT layout out of the Zan standard library. */

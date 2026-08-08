@@ -1,0 +1,56 @@
+// Conformance: the ZAN_CO_DRIVER coroutine driver (compiled with
+// --async-workers; a thread pool on Windows, the reactor loop elsewhere).
+// Exercises async DNS delivery through the pool's drain path, a hostname
+// connect, a TCP echo and a timer delay -- a missed DNS drain or an idle
+// misjudgement (pool terminating while a lookup is in flight) shows up as a
+// wrong golden. Prints OK.
+using System;
+using System.Net.Sockets;
+
+class Program {
+    static async int Echo() {
+        Socket.Initialize();
+
+        nint listener = Socket.CreateTcp();
+        Socket.SetReuseAddr(listener);
+        Socket.Bind(listener, "127.0.0.1", 46138);
+        Socket.Listen(listener, 8);
+        Socket.SetNonBlocking(listener);
+
+        nint client = Socket.CreateTcp();
+        Socket.SetNonBlocking(client);
+        // hostname connect: async DNS (worker thread) + WriteReady in the pool
+        int rc = await Socket.ConnectAsync(client, "localhost", 46138);
+
+        nint server = await Socket.AcceptAsync(listener);
+        Socket.SetNonBlocking(server);
+
+        await Task.Delay(20);   // timer path inside the worker pool
+
+        int sent = await Socket.SendStringAsync(client, "PING");
+        string req = await Socket.RecvAsync(server, 64);
+        int echoed = await Socket.SendStringAsync(server, req);
+        string reply = await Socket.RecvAsync(client, 64);
+
+        // async DNS again, must deliver through the pool's drain path
+        int ip = await Socket.ResolveAsync("localhost");
+        int sync = Socket.ResolveIpv4("localhost");
+
+        if (reply == "PING" && ip == sync && ip != 0 && rc == 0) {
+            Console.WriteLine("OK");
+        } else {
+            Console.WriteLine("FAIL reply=" + reply + " rc=" + rc +
+                              " ip=" + ip + " sync=" + sync);
+        }
+
+        Socket.Close(client);
+        Socket.Close(server);
+        Socket.Close(listener);
+        Socket.Cleanup();
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Echo();
+    }
+}

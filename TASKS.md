@@ -524,12 +524,70 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
   未修改）；未提交的迁移编译器修好类型检查后暴露出新的 LLVM 验证错误（
   `Point_op_add` 按值结构体返回签名不匹配）——处于迁移中的 checker/irgen 改动范围内，
   未触碰。
+  **2026-08-08 已随 B 组修复**：checker 的类型检查已在迁移中放行 struct `==`，剩下的
+  codegen 错误根因是 operator-overload 路径（`irgen_expr.c`）把静态 operator 的 struct
+  左操作数按 `self` 溢到 alloca 传指针——静态 `operator +(Point a, Point b)` 两个操作数
+  都按值传递，只有非静态 operator 才有 `self` 指针。`op_is_static` 守卫后
+  `conformance_struct_operators` 通过（`ctest -R struct_operators` 1/1）。
   **gui_runtime\*.c 复核（7331 行，2026-08-08）**：分配点 14 处全部有 NULL 检查或
   安全降级（mac 的 mask calloc 失败时 `CGBitmapContextCreate(NULL)` 自行分配内存，
   仅丢失遮罩）；唯一多线程部分是 Linux tray（线程独占自己的 X11 Display、mutex+
   condvar 协议、`zan_tray_stop` 先 `pthread_join` 再关 fd、事件环带容量上限）——
   无竞态；surface 表 64 上限 + destroy 置空槽位（resize 重绘有守卫）；文本缓存逐出
   free-then-replace 单线程内完成，无 UAF。未发现需修复的缺陷，未改动。
+* **B7-7 ✅（2026-08-08）能力补齐：UDP 异步解析 / DNS 超时 / 多 worker 驱动实测**：
+  1. **`SendToAsync` 异步解析**（`Socket.zan`）：之前与 `ConnectAsync` 同病——先同步
+     `SendTo` → `BuildSockAddr` → 同步 `ResolveIpv4`，向主机名发 UDP 数据报会卡住
+     reactor。改为 `AsyncResolveIp` + `BuildSockAddrResolved` + `WriteReady` 后
+     `SysSendTo`（与 ConnectAsync 同模式）。
+  2. **异步 DNS 超时**（`rt_io.c`）：新增 `g_dns_pending` 链（在飞查找，锁保护）+
+     `deadline_ms`（`ZAN_DNS_TIMEOUT_MS` 10s）。`dns_wait_ms` 把每个后端 poll 的等待
+     上限压到最近 deadline（epoll/kqueue/select/IOCP 四处）；`dns_timeout_scan` 在
+     超时后交付失败（`*out=0`，与解析失败同值）并唤醒 frame。生命周期：worker 完成时
+     若已 `timed_out` 则自行 free（reactor 从不释放在飞 job——worker 可能仍在写
+     result）；线程创建失败路径同步从 pending 摘除。黑洞 DNS 不再永久挂起调度器。
+  3. **`--async-workers` 实测，抓到 2 个真 bug**（回滚验证：HEAD 版驱动下探针静默
+     退出、无输出）：
+     - `co_wait_io`（`ZAN_CO_DRIVER`）把 DNS 唤醒包（NULL overlapped）当普通 wake
+       packet 跳过，从不 `dns_drain()` → 多 worker 模式下 `await Socket.ResolveAsync`
+       永不交付（协程挂死）；
+     - `co_all_idle` 不检查 `g_dns_inflight` → 池在解析未完成时误判全空闲终止（探针
+       表现为静默提前退出）。
+     修复：NULL 包分支调 `dns_drain()`、`!ok` 分支调 `dns_timeout_scan()`、
+     `co_all_idle` 纳入 `g_dns_inflight`、`co_worker` 的阻塞上限纳入 DNS deadline。
+     实测：`ZAN_CO_WORKERS=4` 下 DNS + 主机名 connect + TCP echo + Delay 全过。
+  4. **新增 `tests/conformance/async_mt.zan`**（golden OK）：覆盖 ZAN_CO_DRIVER 路径
+     （Windows 线程池 / POSIX reactor 驱动）；CMake 三个注册块（conformance/
+     determinism/leakcheck）对 `async_mt` 前缀追加 `--async-workers`。
+  5. **IPv6 全链路**（透明支持，零公开 API 变更——所有连接 API 的 ip 本就是 string）：
+     - C 层：`zan_io_resolve_sa`（getaddrinfo → 完整 sockaddr 字节，16/28，port 由
+       getaddrinfo 写入）+ `zan_io_resolve_sa_co`（异步版，挂到 DNS pending/done/
+       超时机制，job 结构扩展 sabuf/sacap/port）+ `zan_io_sockaddr_ip_str`（按族
+       inet_ntop，v4/v6）+ `zan_io_socket_peer_ip` 加 AF_INET6 分支。
+     - 编译器：新增 `await Socket.ResolveSockAddr(name, port, buf, cap)` builtin
+       （irgen_expr 特判，与 ResolveAsync 同构，结果 = sockaddr 长度进 frame RESULT）。
+     - stdlib：`BuildSockAddr`/新增 `BuildSockAddrAsync` 返回**精确长度** sockaddr
+       （v4 16 / v6 28），调用处 `addr.Length` 替代硬编码 16（Connect/SendTo/Bind/
+       ConnectAsync×2/SendToAsync）；`CreateTcp6/CreateUdp6`（**AF_INET6 平台常量：
+       Windows 23 vs POSIX 10**）；`RecvFrom/RecvFromInto/RecvFromPeer` 的 fromAddr
+       16→32 字节（**修 v6 数据报写穿 16 字节 sockaddr_in 缓冲的堆损坏隐患**），
+       RecvFromPeer 的地址提取改走 `NativeSockAddrIp`（C 端按族格式化，删 stdlib 手拼
+       v4 点分）。
+     - **Windows AcceptEx 修复**（实测抓到）：接受套接字硬编码 `WSASocketW(AF_INET)`
+       + 地址缓冲 `sizeof(sockaddr_in)+16`，v6 监听者下 accept 恒失败
+       （accepted=-1）→ 改为 getsockname 探测监听者族，AF_INET6 时用
+       `sizeof(sockaddr_in6)+16` 缓冲。
+     - **hostname 族策略**（async_mt 回归抓到）：getaddrinfo 对 "localhost" 优先返回
+       ::1，而默认 CreateTcp 是 v4 套接字 → connect 挂起。策略：名字含 ':' → AF_UNSPEC
+       （字面量 "::1" 走 v6）；否则优先 AF_INET（hostname 保持旧 v4 行为），v6-only
+       主机名回退 AF_UNSPEC。真正的"多地址族遍历重试"留作后续。
+     - 验证：Windows（IOCP）`tests/conformance/ipv6.zan`（::1 TCP echo + ::1 UDP +
+       ResolveSockAddr）+ WSL linux-musl（epoll）同探针 OK；conformance 359/359；
+       toolchain/linux-{musl,arm64,riscv64}/zanrt_io.o 经 WSL zig 0.13 重建。
+  验证：async 相关 48 测试全过（含新 async_mt）、smoke 103/103；standard 期间一次
+  全量因**残留孤儿 ctest/zanc 进程抢共享产物**假失败 7 例（gui_icon/array_oob 等，
+  与本组改动无关），清进程后 7 例单独重跑全过。POSIX 侧 kqueue 分支按同构人工复核
+  （无实机）；macOS 未测。
 
 ---
 

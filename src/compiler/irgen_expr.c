@@ -4320,6 +4320,70 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 return LLVMBuildLoad2(g->builder, di32, res_slot, "dnsaddr");
             }
         }
+        /* await Socket.ResolveSockAddr(name, port, buf, cap) — async
+         * getaddrinfo: resolves a hostname OR literal IPv4/IPv6 to a complete
+         * sockaddr (16 or 28 bytes) written into the caller's buffer. The
+         * sockaddr length (0 on failure/timeout) lands in this frame's RESULT
+         * slot before the state machine resumes. Same worker-thread machinery
+         * as ResolveAsync, so the reactor never blocks on the resolver. */
+        {
+            if (is_call_to(expr->await_expr.expr, "Socket", "ResolveSockAddr") &&
+                expr->await_expr.expr->call.args.count == 4) {
+                LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
+                LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                if (!(g->current_async_frame && g->current_async_switch)) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "await Socket.ResolveSockAddr is only supported inside an async method");
+                    return LLVMConstInt(di64, 0, 0);
+                }
+                LLVMValueRef name = emit_expr(g, expr->await_expr.expr->call.args.items[0], locals);
+                if (LLVMTypeOf(name) != di8ptr)
+                    name = LLVMBuildBitCast(g->builder, name, di8ptr, "sa.name");
+                LLVMValueRef port = emit_expr(g, expr->await_expr.expr->call.args.items[1], locals);
+                if (LLVMTypeOf(port) != di32)
+                    port = LLVMBuildIntCast2(g->builder, port, di32, 1, "sa.port");
+                LLVMValueRef buf = emit_expr(g, expr->await_expr.expr->call.args.items[2], locals);
+                if (LLVMTypeOf(buf) != di8ptr)
+                    buf = LLVMBuildBitCast(g->builder, buf, di8ptr, "sa.buf");
+                LLVMValueRef cap = emit_expr(g, expr->await_expr.expr->call.args.items[3], locals);
+                if (LLVMTypeOf(cap) != di32)
+                    cap = LLVMBuildIntCast2(g->builder, cap, di32, 1, "sa.cap");
+                g->uses_socket_async = true;
+
+                int k = g->current_async_next_state++;
+                LLVMValueRef selfframe = g->current_async_frame;
+                LLVMTypeRef self_ft = g->current_async_frame_type;
+                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self");
+                /* &self.result viewed as i32* — the reactor stores the
+                 * sockaddr length here before re-readying the frame. */
+                LLVMValueRef res_gep = LLVMBuildStructGEP2(g->builder, self_ft,
+                    selfframe, ASYNC_FRAME_RESULT, "self.sares");
+                LLVMValueRef out32 = LLVMBuildBitCast(g->builder, res_gep,
+                    LLVMPointerType(di32, 0), "self.saout");
+                emit_async_save_slots(g);
+                zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0),
+                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                        ASYNC_FRAME_STATE, "self.state"));
+                zan_call2(g->builder, g->rt_io_resolve_sa_co_type,
+                    g->rt_io_resolve_sa_co, (LLVMValueRef[]){ name, port, buf,
+                        cap, self_i8, g->current_async_resume_fn, out32 }, 7, "");
+                emit_async_eh_unarm(g);
+                LLVMBuildRetVoid(g->builder);
+
+                LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
+                    g->current_async_resume_fn, "co.resume");
+                LLVMAddCase(g->current_async_switch,
+                    LLVMConstInt(di32, (unsigned)k, 0), rk);
+                LLVMPositionBuilderAtEnd(g->builder, rk);
+                emit_async_reload_slots(g);
+                LLVMValueRef res_slot = LLVMBuildBitCast(g->builder,
+                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                        ASYNC_FRAME_RESULT, "self.sares2"),
+                    LLVMPointerType(di32, 0), "self.saout2");
+                return LLVMBuildLoad2(g->builder, di32, res_slot, "salen");
+            }
+        }
 
         /* await <call> — the awaited expression is a call to an async method's
          * ramp, yielding an i8* task handle (heap frame). The sub's resume/step

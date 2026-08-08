@@ -200,6 +200,16 @@ class Socket {
     [DllImport("crt", EntryPoint = "zan_io_resolve_ipv4")]
     static extern int NativeResolveIpv4(string hostname);
 
+    // getaddrinfo 版解析：主机名或字面量 IP（IPv4/IPv6）→ 完整
+    // sockaddr 字节（16 或 28），返回实际长度（失败 0）。sockaddr
+    // 布局（含平台 family 字节序）全部在 C 端填充，不进 stdlib。
+    [DllImport("crt", EntryPoint = "zan_io_resolve_sa")]
+    static extern int NativeResolveSockAddr(string name, int port, byte[] buf, int cap);
+
+    // 把 sockaddr 的地址部分格式化为文本（IPv4 点分 / IPv6 冒号十六进制）。
+    [DllImport("crt", EntryPoint = "zan_io_sockaddr_ip_str")]
+    static extern string NativeSockAddrIp(byte[] sa);
+
     [DllImport("crt")]
     static extern long strlen(string str);
 
@@ -232,9 +242,35 @@ class Socket {
         return s;
     }
 
+    /// <summary>创建 IPv6 TCP 套接字（AF_INET6）。IPv6 连接
+    /// 也可用 IPv4 套接字配 ::ffff: 映射地址，但原生 v6 套接字
+    /// 才能直接绑定/监听 [::1] 这类纯 v6 地址。</summary>
+    static nint CreateTcp6() {
+        // AF_INET6 的平台常量不同：Windows 23（winsock2），
+        // POSIX 10。
+        #if WINDOWS
+        nint s = socket(23, 1, 6);
+        #else
+        nint s = socket(10, 1, 6);
+        #endif
+        if (s < 0) { Socket.CaptureLastError(); }
+        return s;
+    }
+
     /// <summary>创建 UDP 套接字。</summary>
     static nint CreateUdp() {
         nint s = socket(2, 2, 17);
+        if (s < 0) { Socket.CaptureLastError(); }
+        return s;
+    }
+
+    /// <summary>创建 IPv6 UDP 套接字（AF_INET6）。</summary>
+    static nint CreateUdp6() {
+        #if WINDOWS
+        nint s = socket(23, 2, 17);
+        #else
+        nint s = socket(10, 2, 17);
+        #endif
         if (s < 0) { Socket.CaptureLastError(); }
         return s;
     }
@@ -333,8 +369,51 @@ class Socket {
         #endif
     }
 
-    /// <summary>为 IPv4 构建 sockaddr_in 结构。</summary>
+    /// <summary>把主机名或 IP 文本（IPv4/IPv6）解析为完整的
+    /// sockaddr 字节（IPv4 16 字节 / IPv6 28 字节），供
+    /// connect/bind/sendto 使用。字面量 IP 和主机名统一由
+    /// getaddrinfo 处理（C 端按返回地址族填充 sockaddr，布局
+    /// 不进 stdlib）。"0.0.0.0"/空串仍走零地址快路径；解析失败
+    /// 时回退 0.0.0.0（旧行为，随后的 connect/bind 会报错）。
+    /// 返回的数组长度即 sockaddr 实际长度。</summary>
     static byte[] BuildSockAddr(string ip, int port) {
+        if (ip == "0.0.0.0" || ip == "") {
+            return BuildSockAddrResolved(0, port);
+        }
+        byte[] addr = new byte[28];
+        int len = Socket.NativeResolveSockAddr(ip, port, addr, 28);
+        if (len == 28) { return addr; }
+        if (len == 16) {
+            byte[] v4 = new byte[16];
+            for (int i = 0; i < 16; i = i + 1) { v4[i] = addr[i]; }
+            return v4;
+        }
+        return BuildSockAddrResolved(0, port);
+    }
+
+    /// <summary>BuildSockAddr 的异步版本：主机名通过
+    /// <see cref="ResolveSockAddr"/> 在后台线程解析（不会阻塞
+    /// 事件循环），字面量 IP 走同步快路径。供 ConnectAsync /
+    /// SendToAsync 使用。</summary>
+    static async byte[] BuildSockAddrAsync(string ip, int port) {
+        if (ip == "0.0.0.0" || ip == "") {
+            return BuildSockAddrResolved(0, port);
+        }
+        byte[] addr = new byte[28];
+        int len = await Socket.ResolveSockAddr(ip, port, addr, 28);
+        if (len == 28) { return addr; }
+        if (len == 16) {
+            byte[] v4 = new byte[16];
+            for (int i = 0; i < 16; i = i + 1) { v4[i] = addr[i]; }
+            return v4;
+        }
+        return BuildSockAddrResolved(0, port);
+    }
+
+    /// <summary>从已解析的 IPv4 整数地址构建 sockaddr_in（字节序与
+    /// <c>inet_addr</c> 一致）。供异步连接复用——解析已在
+    /// ConnectAsync 中通过异步 DNS 完成，这里不再执行阻塞解析。</summary>
+    static byte[] BuildSockAddrResolved(int ipAddr, int port) {
         byte[] addr = new byte[16];
         #if MACOS
         addr[0] = 16;
@@ -346,15 +425,6 @@ class Socket {
         int nport = (int)htons((ushort)port);
         addr[2] = (byte)(nport & 255);
         addr[3] = (byte)((nport >> 8) & 255);
-        int ipAddr = 0;
-        if (ip == "0.0.0.0" || ip == "") {
-            ipAddr = 0;
-        } else {
-            ipAddr = inet_addr(ip);
-            if (ipAddr == 0 - 1) {
-                ipAddr = Socket.ResolveIpv4(ip);
-            }
-        }
         addr[4] = (byte)(ipAddr & 255);
         addr[5] = (byte)((ipAddr >> 8) & 255);
         addr[6] = (byte)((ipAddr >> 16) & 255);
@@ -365,7 +435,7 @@ class Socket {
     /// <summary>将套接字绑定到地址和端口。</summary>
     static int Bind(nint sock, string ip, int port) {
         byte[] addr = BuildSockAddr(ip, port);
-        int rc = SysBind(sock, addr, 16);
+        int rc = SysBind(sock, addr, addr.Length);
         if (rc != 0) { Socket.CaptureLastError(); }
         return rc;
     }
@@ -413,7 +483,7 @@ class Socket {
     /// <summary>同步连接到远程地址。</summary>
     static int Connect(nint sock, string ip, int port) {
         byte[] addr = BuildSockAddr(ip, port);
-        int rc = SysConnect(sock, addr, 16);
+        int rc = SysConnect(sock, addr, addr.Length);
         if (rc != 0) { Socket.CaptureLastError(); }
         return rc;
     }
@@ -428,8 +498,25 @@ class Socket {
     /// 连接失败通过异常集合报告），因此
     /// 每次唤醒后用 ConnectStatus 检查结果，仍在进行中时
     /// 稍作延迟再轮询。</summary>
+    /// <summary>把 IP 文本解析为 sockaddr 用的 IPv4 整数地址
+    /// （0.0.0.0/空串 → 0）。字面量 IP 直接用 inet_addr；
+    /// 主机名通过异步 DNS 解析（<see cref="ResolveAsync"/>），
+    /// 在后台线程执行，不会阻塞事件循环。</summary>
+    static async int AsyncResolveIp(string ip) {
+        if (ip == "0.0.0.0" || ip == "") {
+            return 0;
+        }
+        int ipAddr = inet_addr(ip);
+        if (ipAddr == 0 - 1) {
+            ipAddr = await Socket.ResolveAsync(ip);
+        }
+        return ipAddr;
+    }
+
     static async int ConnectAsync(nint sock, string ip, int port) {
-        Connect(sock, ip, port);
+        byte[] addr = await Socket.BuildSockAddrAsync(ip, port);
+        int rc = SysConnect(sock, addr, addr.Length);
+        if (rc != 0) { Socket.CaptureLastError(); }
         await Socket.WriteReady(sock);
         while (true) {
             int st = ConnectStatus(sock);
@@ -456,7 +543,9 @@ class Socket {
             int plain = await ConnectAsync(sock, ip, port);
             return plain;
         }
-        Connect(sock, ip, port);
+        byte[] addr = await Socket.BuildSockAddrAsync(ip, port);
+        int rc = SysConnect(sock, addr, addr.Length);
+        if (rc != 0) { Socket.CaptureLastError(); }
         long deadlineUs = NativeMonotonicUs() + timeoutMs * 1000;
         int stepMs = 1;
         while (true) {
@@ -582,26 +671,30 @@ class Socket {
         return buf.ToStr(0, n);
     }
 
-    /// <summary>发送一个 UDP 数据报。</summary>
+    /// <summary>发送一个 UDP 数据报（同步解析地址，含 IPv6）。</summary>
     static int SendTo(nint sock, string data, int len, string ip, int port) {
         byte[] addr = BuildSockAddr(ip, port);
-        return SysSendTo(sock, data, len, 0, addr, 16);
+        return SysSendTo(sock, data, len, 0, addr, addr.Length);
     }
 
     /// <summary>挂起直到可写，然后发送一个 UDP 数据报。需要
-    /// 非阻塞套接字。</summary>
+    /// 非阻塞套接字。主机名通过异步 DNS 解析（<see
+    /// cref="BuildSockAddrAsync"/>），不会阻塞事件循环。</summary>
     static async int SendToAsync(nint sock, string data, int len, string ip, int port) {
+        byte[] addr = await Socket.BuildSockAddrAsync(ip, port);
         await Socket.WriteReady(sock);
-        int result = SendTo(sock, data, len, ip, port);
-        return result;
+        return SysSendTo(sock, data, len, 0, addr, addr.Length);
     }
 
     /// <summary>接收一个 UDP 数据报。</summary>
     static string RecvFrom(nint sock, int bufSize) {
         byte[] buf = new byte[bufSize + 1];
-        byte[] fromAddr = new byte[16];
+        // 32 字节缓冲容纳 sockaddr_storage：IPv6 对端地址是
+        // 28 字节 sockaddr_in6，16 字节的 sockaddr_in 缓冲会被
+        // recvfrom 写穿（堆损坏）。
+        byte[] fromAddr = new byte[32];
         byte[] fromLen = new byte[4];
-        fromLen[0] = 16;
+        fromLen[0] = 32;
         int n = SysRecvFrom(sock, buf, bufSize, 0, fromAddr, fromLen);
         // recvfrom 是 ws2_32 的原始导入，返回 C `int`；-1 错误会
         // 以 0xFFFFFFFF 零扩展返回。对低 32 位做符号归一化，使
@@ -617,9 +710,9 @@ class Socket {
     /// 字符串版本用 strlen 计算长度，会在第一个 NUL
     /// 字节处截断。</summary>
     static int RecvFromInto(nint sock, byte[] buf, int bufSize) {
-        byte[] fromAddr = new byte[16];
+        byte[] fromAddr = new byte[32];
         byte[] fromLen = new byte[4];
-        fromLen[0] = 16;
+        fromLen[0] = 32;
         int n = SysRecvFrom(sock, buf, bufSize, 0, fromAddr, fromLen);
         // 对低 32 位做符号归一化（见 RecvFrom）。
         if (n > 2147483647) { n = n - 4294967296; }
@@ -658,19 +751,20 @@ class Socket {
     /// 为空 ""）。</summary>
     static string RecvFromPeer(nint sock, int bufSize) {
         byte[] buf = new byte[bufSize + 1];
-        byte[] fromAddr = new byte[16];
+        // 32 字节容纳 sockaddr_in6（28 字节）；IPv6 对端地址
+        // 会让 16 字节缓冲被 recvfrom 写穿。
+        byte[] fromAddr = new byte[32];
         byte[] fromLen = new byte[4];
-        fromLen[0] = 16;
+        fromLen[0] = 32;
         int n = SysRecvFrom(sock, buf, bufSize, 0, fromAddr, fromLen);
         // 对低 32 位做符号归一化（见 RecvFrom）。
         if (n > 2147483647) { n = n - 4294967296; }
         if (n < 0) { n = 0; }
         if (n > 0) {
+            // 端口在 sockaddr_in / sockaddr_in6 的同一偏移（2），
+            // 均为网络字节序；地址文本由 C 端按族格式化。
             lastPeerPort = ((fromAddr[2] & 255) << 8) + (fromAddr[3] & 255);
-            lastPeerIp = Convert.ToString(fromAddr[4] & 255) + "."
-                + Convert.ToString(fromAddr[5] & 255) + "."
-                + Convert.ToString(fromAddr[6] & 255) + "."
-                + Convert.ToString(fromAddr[7] & 255);
+            lastPeerIp = Socket.NativeSockAddrIp(fromAddr);
         } else {
             lastPeerPort = 0;
             lastPeerIp = "";
@@ -695,6 +789,14 @@ class Socket {
     /// 避免在 Zan 代码中硬编码 hostent 布局。</summary>
     static int ResolveIpv4(string hostname) {
         return Socket.NativeResolveIpv4(hostname);
+    }
+
+    /// <summary>异步将主机名解析为 IPv4 地址（返回值与
+    /// <see cref="ResolveIpv4"/> 相同：0 表示失败）。解析在
+    /// 后台线程执行，协程在 IO reactor 上挂起直到完成，不会
+    /// 阻塞事件循环——ConnectAsync 用它替代同步解析。</summary>
+    static async int ResolveAsync(string hostname) {
+        return await Socket.ResolveAsync(hostname);
     }
 
     /// <summary>将主机名解析为 IP 地址。若无法解析则返回 ""；

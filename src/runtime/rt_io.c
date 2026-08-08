@@ -113,9 +113,11 @@ static int g_io_started;
  * on Windows); the next zan_io_poll drains the list, stores each result into
  * its frame's RESULT slot and re-readies the frame. g_dns_inflight counts
  * lookups whose completion has not yet been delivered, so the scheduler keeps
- * polling while one is outstanding (zan_io_has_pending). The machinery itself
- * lives in the coroutine-facing ABI section at the bottom; these are the
- * pieces the platform backends must see. */
+ * polling while one is outstanding (zan_io_has_pending). A lookup still in
+ * flight past ZAN_DNS_TIMEOUT_MS is delivered as a failure by the reactor
+ * (dns_timeout_scan); the worker then discards its result. The machinery
+ * itself lives in the coroutine-facing ABI section at the bottom; these are
+ * the pieces the platform backends must see. */
 static int32_t g_dns_inflight;
 static int32_t g_dns_wake_fd = -1;    /* reactor-visible wake fd (POSIX) */
 #if !defined(__linux__) && !defined(_WIN32)
@@ -123,6 +125,9 @@ static int32_t g_dns_wake_wfd = -1;   /* pipe write end (kqueue/select) */
 #endif
 
 static int dns_drain(void);           /* deliver completed lookups (reactor) */
+static int64_t dns_wait_ms(int64_t caller_ms);  /* cap a backend wait at the
+                                                   earliest lookup deadline */
+static int dns_timeout_scan(void);    /* deliver failures for late lookups */
 static void dns_wake_read(void);      /* consume the wake fd signal (POSIX) */
 static void dns_wake_notify(void);    /* worker -> reactor wake (all backends) */
 
@@ -337,7 +342,7 @@ int64_t zan_io_socket_recv(intptr_t fd, void *buf, int64_t len,
 }
 
 const char *zan_io_socket_peer_ip(intptr_t fd) {
-    static char address[INET_ADDRSTRLEN];
+    static char address[INET6_ADDRSTRLEN];
     struct sockaddr_storage peer;
 #if defined(_WIN32)
     int length = (int)sizeof(peer);
@@ -346,10 +351,67 @@ const char *zan_io_socket_peer_ip(intptr_t fd) {
     socklen_t length = (socklen_t)sizeof(peer);
     if (getpeername((int)fd, (struct sockaddr *)&peer, &length) != 0) return "";
 #endif
-    if (peer.ss_family != AF_INET) return "";
-    if (!inet_ntop(AF_INET, &((struct sockaddr_in *)&peer)->sin_addr,
-                   address, sizeof(address))) return "";
-    return address;
+    return zan_io_sockaddr_ip_str(&peer);
+}
+
+/* Format the address part of a sockaddr (IPv4 or IPv6) as text. */
+const char *zan_io_sockaddr_ip_str(const void *sa) {
+    static char address[INET6_ADDRSTRLEN];
+    const struct sockaddr *a = (const struct sockaddr *)sa;
+    if (a->sa_family == AF_INET) {
+        const struct sockaddr_in *in = (const struct sockaddr_in *)a;
+        if (!inet_ntop(AF_INET, &in->sin_addr, address, sizeof(address)))
+            return "";
+        return address;
+    }
+    if (a->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)a;
+        if (!inet_ntop(AF_INET6, &in6->sin6_addr, address, sizeof(address)))
+            return "";
+        return address;
+    }
+    return "";
+}
+
+/* Resolve `name` (hostname or literal IP) to a complete sockaddr. The port is
+ * baked into the sockaddr by getaddrinfo. Returns the sockaddr length (16 or
+ * 28), or 0 on failure.
+ *
+ * Family policy: a name containing ':' is IPv6-or-nothing (AF_UNSPEC), so a
+ * literal like "::1" resolves to v6; everything else prefers IPv4 -- the
+ * default CreateTcp/CreateUdp sockets are v4, and gethostbyname-based
+ * resolution always returned v4, so plain hostnames keep their historical
+ * behavior. A v6-only hostname (only AAAA records) falls back to AF_UNSPEC
+ * below. */
+int32_t zan_io_resolve_sa(const char *name, int32_t port, void *buf,
+                          int32_t cap) {
+    if (!name || !*name) return 0;
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = strchr(name, ':') ? AF_UNSPEC : AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(name, portstr, &hints, &res) != 0 || !res) {
+        if (hints.ai_family == AF_INET) {
+            hints.ai_family = AF_UNSPEC;    /* v6-only hostname */
+            if (getaddrinfo(name, portstr, &hints, &res) != 0 || !res)
+                return 0;
+        } else {
+            return 0;
+        }
+    }
+    int len = (res->ai_family == AF_INET6) ? (int)sizeof(struct sockaddr_in6)
+             : (res->ai_family == AF_INET) ? (int)sizeof(struct sockaddr_in)
+             : 0;
+    int32_t r = 0;
+    if (len && len <= cap && res->ai_addrlen == (size_t)len) {
+        memcpy(buf, res->ai_addr, (size_t)len);
+        r = len;
+    }
+    freeaddrinfo(res);
+    return r;
 }
 
 /* Resolve a hostname to an IPv4 address in the same byte order as inet_addr.
@@ -710,11 +772,13 @@ int32_t zan_io_poll(int64_t timeout_ms) {
         if (g_io_count == 0 && g_dns_inflight == 0) return 0;
     }
     struct epoll_event events[256];
-    int n = epoll_wait(g_epoll_fd, events, 256,
-                       timeout_ms < 0 ? -1 : (int)timeout_ms);
+    int64_t wait = dns_wait_ms(timeout_ms);
+    int n = epoll_wait(g_epoll_fd, events, 256, wait < 0 ? -1 : (int)wait);
     if (n == 0) {
-        int w2 = dns_drain();
+        int w2 = dns_timeout_scan();
         if (w2) return w2;
+        int w3 = dns_drain();
+        if (w3) return w3;
         return io_sweep_slots();
     }
     int woke = 0;
@@ -866,12 +930,14 @@ int32_t zan_io_poll(int64_t timeout_ms) {
         if (g_io_count == 0 && g_dns_inflight == 0) return 0;
     }
     struct kevent events[64];
-    struct timespec ts = { timeout_ms / 1000, (timeout_ms % 1000) * 1000000L };
-    int n = kevent(g_kq_fd, NULL, 0, events, 64,
-                   timeout_ms < 0 ? NULL : &ts);
+    int64_t wait = dns_wait_ms(timeout_ms);
+    struct timespec ts = { wait / 1000, (wait % 1000) * 1000000L };
+    int n = kevent(g_kq_fd, NULL, 0, events, 64, wait < 0 ? NULL : &ts);
     if (n == 0) {
-        int w2 = dns_drain();
+        int w2 = dns_timeout_scan();
         if (w2) return w2;
+        int w3 = dns_drain();
+        if (w3) return w3;
         return io_sweep_slots();
     }
     int woke = 0;
@@ -1249,7 +1315,18 @@ void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
         return;
     }
 
-    SOCKET accepted = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0,
+    /* The accepted socket's family must match the listener's (AcceptEx
+     * rejects a mismatched one), and its local/remote address buffer must
+     * fit a sockaddr of that family plus the extra 16 bytes AcceptEx
+     * appends. Probe the listener's family instead of hard-coding IPv4. */
+    struct sockaddr_storage lss;
+    int llen = (int)sizeof(lss);
+    int fam = AF_INET;
+    if (getsockname(listener, (struct sockaddr *)&lss, &llen) == 0 &&
+        lss.ss_family == AF_INET6)
+        fam = AF_INET6;
+
+    SOCKET accepted = WSASocketW(fam, SOCK_STREAM, IPPROTO_TCP, NULL, 0,
                                  WSA_FLAG_OVERLAPPED);
     if (accepted == INVALID_SOCKET) {
         if (out_fd) *out_fd = -1;
@@ -1257,7 +1334,8 @@ void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
         return;
     }
 
-    const DWORD addr_len = (DWORD)sizeof(struct sockaddr_in) + 16;
+    const DWORD addr_len = (DWORD)((fam == AF_INET6)
+        ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in)) + 16;
     zan_io_op_t *op = op_alloc();
     if (!op) {
         closesocket(accepted);
@@ -1322,9 +1400,12 @@ int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_count == 0 && g_dns_inflight == 0) return 0;
     OVERLAPPED_ENTRY entries[64];
     ULONG removed = 0;
-    DWORD to = (timeout_ms < 0) ? INFINITE : (DWORD)timeout_ms;
+    int64_t wait = dns_wait_ms(timeout_ms);
+    DWORD to = (wait < 0) ? INFINITE : (DWORD)wait;
     if (!GetQueuedCompletionStatusEx(g_iocp, entries, 64, &removed, to, FALSE)) {
         IOTRACE("poll GQCS=0 err=%lu to=%lu cnt=%d", (unsigned long)GetLastError(), (unsigned long)to, g_io_count);
+        int w = dns_timeout_scan();
+        if (w) return w;
         return dns_drain();
     }
     IOTRACE("poll removed=%lu cnt=%d", (unsigned long)removed, g_io_count);
@@ -1449,13 +1530,18 @@ int32_t zan_io_poll(int64_t timeout_ms) {
         e = e->next;
     }
 
+    int64_t wait = dns_wait_ms(timeout_ms);
     struct timeval tv;
-    tv.tv_sec  = (long)(timeout_ms / 1000);
-    tv.tv_usec = (long)((timeout_ms % 1000) * 1000);
+    tv.tv_sec  = (long)(wait / 1000);
+    tv.tv_usec = (long)((wait % 1000) * 1000);
 
     int n = select(max_fd + 1, &read_fds, &write_fds, NULL,
-                   timeout_ms < 0 ? NULL : &tv);
-    if (n <= 0) return dns_drain();
+                   wait < 0 ? NULL : &tv);
+    if (n <= 0) {
+        int w2 = dns_timeout_scan();
+        if (w2) return w2;
+        return dns_drain();
+    }
 
     int woke = 0;
     if (g_dns_wake_fd >= 0 && FD_ISSET(g_dns_wake_fd, &read_fds)) {
@@ -1490,9 +1576,21 @@ int32_t zan_io_poll(int64_t timeout_ms) {
 
 /* ================= ASYNC HOSTNAME RESOLUTION ================= */
 
+/* Lookups still in flight past this deadline are delivered as failures so
+ * the reactor never parks on a black-hole resolver. The worker thread keeps
+ * running and frees its work item when it notices the timeout flag; its
+ * result is discarded. */
+#define ZAN_DNS_TIMEOUT_MS 10000
+
 typedef struct zan_dns_job {
     struct zan_dns_job *next;
-    int32_t  result;        /* resolved IPv4 (network byte order), 0 on failure */
+    int64_t  deadline_ms;   /* reactor-clock deadline; timed out when passed */
+    int      timed_out;     /* reactor delivered a timeout failure for this */
+    int32_t  result;        /* resolved IPv4 (network byte order) or sockaddr
+                               length, 0 on failure */
+    void    *sabuf;         /* sockaddr sink (resolve_sa jobs), else NULL */
+    int32_t  sacap;         /* sink capacity */
+    int32_t  port;          /* target port for resolve_sa jobs */
     void    *frame;         /* stackless frame, or stackful fiber handle */
     zan_co_step_t step;     /* resume fn (NULL => stackful fiber) */
     int32_t *out;           /* result sink (&frame->result) */
@@ -1503,7 +1601,18 @@ typedef struct zan_dns_work {
     char hostname[256];     /* NUL-terminated copy for the worker thread */
 } zan_dns_work_t;
 
-static zan_dns_job_t *g_dns_done;    /* completed, waiting for the reactor */
+static zan_dns_job_t *g_dns_pending;   /* in flight, owned by their workers */
+static zan_dns_job_t *g_dns_done;      /* completed, waiting for the reactor */
+
+static int64_t dns_now_ms(void) {
+#if defined(_WIN32)
+    return (int64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
 
 #if defined(_WIN32)
 static SRWLOCK g_dns_srw = SRWLOCK_INIT;
@@ -1516,15 +1625,35 @@ static void dns_unlock(void) { pthread_mutex_unlock(&g_dns_mx); }
 #endif
 
 /* Worker thread: resolve the hostname (never on the reactor), park the result,
- * then wake the reactor through its backend wake fd. */
+ * then wake the reactor through its backend wake fd. If the reactor already
+ * delivered a timeout failure, nothing was parked: free the work item here,
+ * since the reactor never frees an in-flight job (the worker may still be
+ * writing into it). */
 #if defined(_WIN32)
 static DWORD WINAPI dns_worker(void *arg) {
 #else
 static void *dns_worker(void *arg) {
 #endif
     zan_dns_work_t *w = (zan_dns_work_t *)arg;
-    w->job.result = zan_io_resolve_ipv4(w->hostname);
+    if (w->job.sabuf)
+        w->job.result = zan_io_resolve_sa(w->hostname, w->job.port,
+                                          w->job.sabuf, w->job.sacap);
+    else
+        w->job.result = zan_io_resolve_ipv4(w->hostname);
     dns_lock();
+    if (w->job.timed_out) {
+        dns_unlock();
+        free(w);
+#if defined(_WIN32)
+        return 0;
+#else
+        return NULL;
+#endif
+    }
+    /* Still ours: take it off the pending list and move it to the done list. */
+    zan_dns_job_t **pp = &g_dns_pending;
+    while (*pp != &w->job) pp = &(*pp)->next;
+    *pp = w->job.next;
     w->job.next = g_dns_done;
     g_dns_done = &w->job;
     dns_unlock();
@@ -1534,6 +1663,51 @@ static void *dns_worker(void *arg) {
 #else
     return NULL;
 #endif
+}
+
+/* Milliseconds until the earliest in-flight lookup times out, or caller_ms if
+ * none would fire sooner (-1 meaning unbounded). Caps every backend wait so a
+ * black-hole resolver cannot hang the reactor forever. */
+static int64_t dns_wait_ms(int64_t caller_ms) {
+    if (g_dns_inflight <= 0) return caller_ms;
+    int64_t now = dns_now_ms();
+    int64_t nearest = -1;
+    dns_lock();
+    for (zan_dns_job_t *j = g_dns_pending; j; j = j->next)
+        if (nearest < 0 || j->deadline_ms < nearest) nearest = j->deadline_ms;
+    dns_unlock();
+    if (nearest < 0) return caller_ms;
+    int64_t wait = nearest - now;
+    if (wait <= 0) wait = 0;               /* already late: let the scan fire */
+    if (caller_ms < 0) return wait;
+    return wait < caller_ms ? wait : caller_ms;
+}
+
+/* Deliver timeout failures for lookups past their deadline (reactor thread).
+ * Each job is flagged so its worker frees it when it finishes; the frame is
+ * re-readied with a failure value, same as a resolution failure. */
+static int dns_timeout_scan(void) {
+    int woke = 0;
+    int64_t now = dns_now_ms();
+    dns_lock();
+    zan_dns_job_t **pp = &g_dns_pending;
+    while (*pp) {
+        zan_dns_job_t *j = *pp;
+        if (j->deadline_ms > now) { pp = &j->next; continue; }
+        *pp = j->next;
+        j->timed_out = 1;
+        g_dns_inflight--;
+        void *frame = j->frame;
+        zan_co_step_t step = j->step;
+        int32_t *out = j->out;
+        dns_unlock();
+        if (out) *out = 0;
+        io_wake(frame, step);
+        woke++;
+        dns_lock();
+    }
+    dns_unlock();
+    return woke;
 }
 
 static void dns_wake_notify(void) {
@@ -1583,6 +1757,70 @@ static int dns_drain(void) {
     return woke;
 }
 
+void zan_io_resolve_sa_co(const char *name, int32_t port, void *buf,
+                          int32_t cap, void *frame, zan_co_step_t step,
+                          int32_t *out) {
+    if (!name || !*name) {
+        /* Empty name cannot resolve: fail immediately, same value the worker
+         * would have produced, so the caller never parks on a thread. */
+        if (out) *out = 0;
+        io_wake(frame, step);
+        return;
+    }
+    zan_io_init();     /* ensure the wake fd / IOCP exists before spawning */
+    zan_dns_work_t *w = (zan_dns_work_t *)calloc(1, sizeof(*w));
+    if (!w) {
+        if (out) *out = 0;
+        io_wake(frame, step);
+        return;
+    }
+    strncpy(w->hostname, name, sizeof(w->hostname) - 1);
+    w->hostname[sizeof(w->hostname) - 1] = 0;
+    w->job.frame = frame;
+    w->job.step = step;
+    w->job.out = out;
+    w->job.sabuf = buf;
+    w->job.sacap = cap;
+    w->job.port = port;
+    w->job.deadline_ms = dns_now_ms() + ZAN_DNS_TIMEOUT_MS;
+    dns_lock();
+    w->job.next = g_dns_pending;
+    g_dns_pending = &w->job;
+    g_dns_inflight++;
+    dns_unlock();
+#if defined(_WIN32)
+    HANDLE h = CreateThread(NULL, 0, dns_worker, w, 0, NULL);
+    if (!h) {
+        dns_lock();
+        g_dns_inflight--;
+        zan_dns_job_t **pp = &g_dns_pending;
+        while (*pp != &w->job) pp = &(*pp)->next;
+        *pp = w->job.next;
+        dns_unlock();
+        if (out) *out = 0;
+        io_wake(frame, step);
+        free(w);
+        return;
+    }
+    CloseHandle(h);     /* the thread keeps running detached */
+#else
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, dns_worker, w) != 0) {
+        dns_lock();
+        g_dns_inflight--;
+        zan_dns_job_t **pp = &g_dns_pending;
+        while (*pp != &w->job) pp = &(*pp)->next;
+        *pp = w->job.next;
+        dns_unlock();
+        if (out) *out = 0;
+        io_wake(frame, step);
+        free(w);
+        return;
+    }
+    pthread_detach(tid);
+#endif
+}
+
 void zan_io_resolve_co(const char *hostname, void *frame, zan_co_step_t step,
                        int32_t *out) {
     if (!hostname || !*hostname) {
@@ -1604,7 +1842,10 @@ void zan_io_resolve_co(const char *hostname, void *frame, zan_co_step_t step,
     w->job.frame = frame;
     w->job.step = step;
     w->job.out = out;
+    w->job.deadline_ms = dns_now_ms() + ZAN_DNS_TIMEOUT_MS;
     dns_lock();
+    w->job.next = g_dns_pending;
+    g_dns_pending = &w->job;
     g_dns_inflight++;
     dns_unlock();
 #if defined(_WIN32)
@@ -1612,6 +1853,9 @@ void zan_io_resolve_co(const char *hostname, void *frame, zan_co_step_t step,
     if (!h) {
         dns_lock();
         g_dns_inflight--;
+        zan_dns_job_t **pp = &g_dns_pending;
+        while (*pp != &w->job) pp = &(*pp)->next;
+        *pp = w->job.next;
         dns_unlock();
         if (out) *out = 0;
         io_wake(frame, step);
@@ -1624,6 +1868,9 @@ void zan_io_resolve_co(const char *hostname, void *frame, zan_co_step_t step,
     if (pthread_create(&tid, NULL, dns_worker, w) != 0) {
         dns_lock();
         g_dns_inflight--;
+        zan_dns_job_t **pp = &g_dns_pending;
+        while (*pp != &w->job) pp = &(*pp)->next;
+        *pp = w->job.next;
         dns_unlock();
         if (out) *out = 0;
         io_wake(frame, step);
@@ -2129,9 +2376,19 @@ static void co_wait_io(long long timeout_ms) {
      * whole batch itself on its next loop iterations -- instead of posting a
      * wake packet per completion. */
     InterlockedDecrement(&g_co_idle);
-    if (!ok) return;
+    if (!ok) {
+        /* Timeout or error: deliver DNS timeouts so lookups past their
+         * deadline fail instead of parking their coroutines forever. */
+        dns_timeout_scan();
+        return;
+    }
     for (ULONG i = 0; i < removed; i++) {
-        if (entries[i].lpOverlapped == NULL) continue;   /* wake packet */
+        if (entries[i].lpOverlapped == NULL) {
+            /* Async-DNS completion: deliver every finished lookup. The wake
+             * packet itself means "re-check", so keep scanning the batch. */
+            dns_drain();
+            continue;
+        }
         zan_io_op_t *op = CONTAINING_RECORD(entries[i].lpOverlapped,
                                             zan_io_op_t, ov);
         void *co = op->co;
@@ -2153,7 +2410,8 @@ static void co_wait_io(long long timeout_ms) {
 static int co_all_idle(void) {
     int idle = 1;
     EnterCriticalSection(&g_co_lock);
-    if (zan_timer_pending() != 0 || g_co_running != 0 || g_io_count != 0)
+    if (zan_timer_pending() != 0 || g_co_running != 0 || g_io_count != 0 ||
+        g_dns_inflight != 0)
         idle = 0;
     for (int i = 0; idle && i < g_co_workers; i++) {
         zan_co_worker_queue *q = &g_co_queues[i];
@@ -2199,11 +2457,16 @@ static void co_worker(int worker) {
         /* Choose how long to block. A pending timer bounds it tightest; else
          * with IO in flight block for real completions (with a 1s ceiling as a
          * missed-wake safety net); else nothing is pending, so use a short cap
-         * that keeps termination detection responsive. */
+         * that keeps termination detection responsive. An in-flight DNS lookup
+         * caps the wait at its deadline so it cannot hang the pool. */
         long long to;
         if (tnext >= 0)               to = tnext;
         else if (g_io_count > 0)      to = 1000;
         else                          to = 50;
+        if (g_dns_inflight > 0) {
+            long long dw = dns_wait_ms(-1);
+            if (dw >= 0 && dw < to) to = dw;
+        }
         /* Publish the idle state before the final shard scan. A producer that
          * enqueues first is found by the scan; one that enqueues afterward
          * observes g_co_idle > 0 and posts a wake packet. */
