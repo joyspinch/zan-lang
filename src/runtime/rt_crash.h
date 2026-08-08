@@ -116,12 +116,52 @@ static int zan__crash_find_symbolizer(const char *exe_dir, char *out, size_t out
     return 0;
 }
 
+/* True for a symbolizer line that carries no information about the crashing
+ * program: an unresolved frame (`??`), the compiler support frames DWARF
+ * attributes to cygming-crtbegin.c, and the mingw CRT entry thunks. Dropping
+ * them keeps the resolved block to application frames; the raw
+ * module+offset backtrace above it still lists every address. */
+static int zan__crash_line_is_noise(const char *line) {
+    static const char *const noise[] = {
+        "cygming-crtbegin.c", "__tmainCRTStartup", "WinMainCRTStartup",
+        "mainCRTStartup", "__mingw_", "pre_c_init", "pre_cpp_init",
+        "mingw-w64-crt", "crtexe.c", "crtdll.c", "crt_handler.c",
+    };
+    for (size_t i = 0; i < sizeof(noise) / sizeof(noise[0]); i++)
+        if (strstr(line, noise[i])) return 1;
+    /* `?? at ??:0` / `?? ??:?`: no function and no file. */
+    if (line[0] == '?' && line[1] == '?') return 1;
+    return 0;
+}
+
+/* Copy the symbolizer's output into the log, dropping noise lines. Returns the
+ * number of lines kept. */
+static int zan__crash_append_filtered(const char *logpath, const char *tmppath,
+                                      int keep_all) {
+    FILE *in = fopen(tmppath, "rb");
+    if (!in) return 0;
+    FILE *out = fopen(logpath, "ab");
+    if (!out) { fclose(in); return 0; }
+    char line[1024];
+    int kept = 0;
+    while (fgets(line, (int)sizeof line, in)) {
+        if (!keep_all && zan__crash_line_is_noise(line)) continue;
+        fputs(line, out);
+        kept++;
+    }
+    fclose(out);
+    fclose(in);
+    return kept;
+}
+
 /* Append `function  file:line` for every in-module frame to the (closed) log
- * by spawning the symbolizer with stdout redirected onto the file. Best-effort:
- * any failure leaves the raw log intact. */
+ * by spawning the symbolizer with stdout redirected to a temp file, which is
+ * then filtered into the log. Best-effort: any failure leaves the raw log
+ * intact. */
 static void zan__crash_symbolize(const char *logpath, const char *exe,
                                  const char *exe_dir, uintptr_t exe_base,
-                                 void *fault, void **frames, USHORT nframes) {
+                                 void *fault, void **frames, USHORT nframes,
+                                 int keep_all) {
     uintptr_t image_base = zan__crash_image_base(exe);
     if (!image_base) return;
     char sym[MAX_PATH];
@@ -155,22 +195,17 @@ static void zan__crash_symbolize(const char *logpath, const char *exe,
                  "\"%s\" --obj=\"%s\" --demangle --functions=linkage --inlines%s",
                  sym, exe, addrs);
 
-    /* Header line so the resolved block is easy to find; the child appends its
-     * output after it, in the same order as the frames above. */
-    FILE *hf = fopen(logpath, "ab");
-    if (hf) {
-        fprintf(hf, "resolved source locations (%d in-module frame(s), top first):\n",
-                count);
-        fclose(hf);
-    }
+    char tmppath[MAX_PATH];
+    snprintf(tmppath, sizeof tmppath, "%szan_crash.sym.%lu.tmp", exe_dir,
+             (unsigned long)GetCurrentProcessId());
 
     SECURITY_ATTRIBUTES sa;
     memset(&sa, 0, sizeof sa);
     sa.nLength = sizeof sa;
     sa.bInheritHandle = TRUE;
-    HANDLE h = CreateFileA(logpath, FILE_APPEND_DATA,
+    HANDLE h = CreateFileA(tmppath, GENERIC_WRITE,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
-                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return;
     STARTUPINFOA si;
     memset(&si, 0, sizeof si);
@@ -188,8 +223,41 @@ static void zan__crash_symbolize(const char *logpath, const char *exe,
         CloseHandle(pi.hThread);
     }
     CloseHandle(h);
+
+    /* Header line so the resolved block is easy to find; the filtered child
+     * output follows it, in the same order as the frames above. */
+    FILE *hf = fopen(logpath, "ab");
+    if (hf) {
+        fprintf(hf, "resolved source locations (%d in-module frame(s), top first%s):\n",
+                count, keep_all ? "" : ", CRT frames omitted");
+        fclose(hf);
+    }
+    if (zan__crash_append_filtered(logpath, tmppath, keep_all) == 0) {
+        FILE *nf = fopen(logpath, "ab");
+        if (nf) {
+            fprintf(nf, "  <no source locations: build with `zanc -g` to get "
+                        "file:line; the module+offset backtrace above still "
+                        "resolves offline via scripts\\symbolize_crash.ps1>\n");
+            fclose(nf);
+        }
+    }
+    DeleteFileA(tmppath);
     FILE *tf = fopen(logpath, "ab");
     if (tf) { fprintf(tf, "\n"); fclose(tf); }
+}
+
+/* Resolve a single address (the release that quarantined a block under
+ * --arc-guard) under its own header, so the log shows both the stale use and
+ * the site that freed it. */
+static void zan__crash_symbolize_one(const char *logpath, const char *exe,
+                                    const char *exe_dir, uintptr_t exe_base,
+                                    void *addr) {
+    FILE *hf = fopen(logpath, "ab");
+    if (hf) { fprintf(hf, "released (arc.freed_by) at:\n"); fclose(hf); }
+    /* Keep every line here: a release inside a synthesized destructor has no
+     * line table, and "?? at ??:?" from one address is still the answer that
+     * the freeing code is compiler-generated rather than user code. */
+    zan__crash_symbolize(logpath, exe, exe_dir, exe_base, addr, NULL, 0, 1);
 }
 
 static LONG WINAPI zan__crash_filter(EXCEPTION_POINTERS *ep) {
@@ -220,6 +288,7 @@ static LONG WINAPI zan__crash_filter(EXCEPTION_POINTERS *ep) {
     uintptr_t exe_base = (uintptr_t)GetModuleHandleW(NULL);
     void *frames[62];
     USHORT fn = 0;
+    void *arc_freed_by = NULL;
 
     FILE *f = fopen(logpath, "ab");
     if (!f) f = fopen("zan_crash.log", "ab");
@@ -237,6 +306,35 @@ static LONG WINAPI zan__crash_filter(EXCEPTION_POINTERS *ep) {
         fprintf(f, "code=0x%08lX flags=0x%08lX\n",
                 (unsigned long)er->ExceptionCode,
                 (unsigned long)er->ExceptionFlags);
+        {   /* ARC integrity failures raised by generated code (the codes are
+             * defined in src/compiler/irgen.c): the reported frames are the
+             * retain/release that used a dangling reference, i.e. the cause of
+             * a use-after-free rather than its symptom. */
+            const char *arc = NULL;
+            switch (er->ExceptionCode) {
+            case 0xE0A2C001: arc = "retain of an already-freed object"; break;
+            case 0xE0A2C002: arc = "release of an already-freed object"; break;
+            case 0xE0A2C003: arc = "retain of an already-freed string"; break;
+            case 0xE0A2C004: arc = "release of an already-freed string"; break;
+            case 0xE0A2C005: arc = "use of a freed object through a stale "
+                                   "reference (missing retain when stored)";
+                             break;
+            case 0xE0A2C006: arc = "use of a freed string through a stale "
+                                   "reference (missing retain when stored)";
+                             break;
+            default: break;
+            }
+            if (arc) {
+                fprintf(f, "arc=%s\n", arc);
+                if (er->NumberParameters >= 3) {
+                    fprintf(f, "arc.object=0x%p arc.refcount=%lld\n",
+                            (void *)er->ExceptionInformation[0],
+                            (long long)er->ExceptionInformation[1]);
+                    arc_freed_by = (void *)er->ExceptionInformation[2];
+                    zan__crash_modline(f, arc_freed_by, "arc.freed_by=");
+                }
+            }
+        }
         if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
             er->NumberParameters >= 2) {
             const char *kind = er->ExceptionInformation[0] == 1 ? "write"
@@ -273,7 +371,10 @@ static LONG WINAPI zan__crash_filter(EXCEPTION_POINTERS *ep) {
          * us the addresses. */
         zan__crash_symbolize(logpath, exe, exe_dir[0] ? exe_dir : ".\\",
                              exe_base, ep->ExceptionRecord->ExceptionAddress,
-                             frames, fn);
+                             frames, fn, 0);
+        if (arc_freed_by)
+            zan__crash_symbolize_one(logpath, exe, exe_dir[0] ? exe_dir : ".\\",
+                                     exe_base, arc_freed_by);
     }
     return EXCEPTION_EXECUTE_HANDLER; /* log, then terminate (skip WER dialog) */
 }

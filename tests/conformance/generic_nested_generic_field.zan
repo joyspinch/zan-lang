@@ -1,0 +1,73 @@
+// A generic class holding *another* generic (`Inner<T>` inside `Box<T>`) used to
+// call the erased copy of the inner class, where T is not RC-managed: the
+// returned element came back unretained while the caller released it, so the
+// list's own element was freed and the next read touched freed memory.
+using System;
+using System.Collections.Generic;
+
+namespace T;
+
+delegate string LabelOf<T>(T item);
+
+class Opt {
+    public string model;
+
+    public static Opt Of(string m) {
+        Opt o = new Opt();
+        o.model = m;
+        return o;
+    }
+}
+
+class Inner<T> {
+    List<T> data;
+
+    public Inner<T> Bind(List<T> src) {
+        data = src;
+        return this;
+    }
+
+    public T Sel() { return data[0]; }
+}
+
+class Box<T> {
+    Inner<T> inner;
+    LabelOf<T> label;
+
+    public Box(LabelOf<T> label) {
+        this.label = label;
+        inner = new Inner<T>();
+    }
+
+    public Box<T> Bind(List<T> src) {
+        inner.Bind(src);
+        return this;
+    }
+
+    public T Direct() { return inner.Sel(); }
+
+    public string ViaLocal() {
+        T tmp = inner.Sel();
+        return label(tmp);
+    }
+
+    public string ViaNested() { return label(inner.Sel()); }
+}
+
+class Program {
+    static void Main() {
+        List<Opt> items = new List<Opt>();
+        items.Add(Opt.Of("alpha"));
+        Box<Opt> box = new Box<Opt>(o => o.model);
+        box.Bind(items);
+
+        // Repeated reads: every unbalanced release drops one reference, so a
+        // missing retain shows up as freed memory within a few iterations.
+        for (int i = 0; i < 20; i = i + 1) {
+            Console.WriteLine("direct=" + box.Direct().model);
+            Console.WriteLine("local=" + box.ViaLocal());
+            Console.WriteLine("nested=" + box.ViaNested());
+        }
+        Console.WriteLine("still=" + items[0].model);
+    }
+}

@@ -686,6 +686,144 @@ static void emit_leak_counter_add(zan_irgen_t *g, LLVMValueRef ptr, long long de
         LLVMAtomicOrderingMonotonic, 0);
 }
 
+/* SEH codes for ARC integrity failures, recognized by the crash filter in
+ * src/runtime/rt_crash.h (keep the two in sync). */
+#define ZAN_ARC_FAULT_RETAIN      0xE0A2C001u
+#define ZAN_ARC_FAULT_RELEASE     0xE0A2C002u
+#define ZAN_ARC_FAULT_STR_RETAIN  0xE0A2C003u
+#define ZAN_ARC_FAULT_STR_RELEASE 0xE0A2C004u
+#define ZAN_ARC_FAULT_USE_OBJ     0xE0A2C005u
+#define ZAN_ARC_FAULT_USE_STR     0xE0A2C006u
+
+/* Refcount value written over a quarantined block under --arc-guard. Picked so
+ * it can never be a live count and is recognizable in a memory dump. */
+#define ZAN_ARC_FREED_MARK 0xDEAD0000DEAD0000ull
+
+/* Trap a retain/release of an object whose refcount is already zero: the
+ * reference being used is dangling, so this is the *cause* of a later
+ * use-after-free read, caught at the operation that corrupts the count rather
+ * than frames later when the freed memory is dereferenced.
+ *
+ * On Windows the report is a non-continuable SEH exception carrying
+ * (obj, refcount, site), which the installed crash filter turns into the usual
+ * zan_crash.log record -- with the symbolized backtrace of the offending
+ * retain/release. Elsewhere it prints the same facts and exits, since there is
+ * no filter to hand them to. Ends the current block; never returns. */
+static void emit_arc_fault_report(zan_irgen_t *g, LLVMValueRef obj,
+                                  LLVMValueRef rc_old, LLVMValueRef site,
+                                  unsigned code, const char *what) {
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "zan runtime: ARC integrity failure: %s (refcount %%lld, "
+             "object %%p, site/freed-by 0x%%llX)\n", what);
+    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, msg, "arcfmt");
+    LLVMValueRef pargs[] = { fmt, rc_old, obj,
+                             site ? site : LLVMConstInt(i64t, -1, 1) };
+    zan_call2(g->builder, g->printf_type, g->fn_printf, pargs, 4, "");
+
+    if (g->target_is_windows) {
+        /* RaiseException(code, EXCEPTION_NONCONTINUABLE, 3, args) */
+        LLVMTypeRef re_args[] = { i32t, i32t, i32t, LLVMPointerType(i64t, 0) };
+        LLVMTypeRef re_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                             re_args, 4, 0);
+        LLVMValueRef re = LLVMGetNamedFunction(g->mod, "RaiseException");
+        if (!re) re = LLVMAddFunction(g->mod, "RaiseException", re_ty);
+        LLVMValueRef slots = LLVMBuildArrayAlloca(g->builder, i64t,
+            LLVMConstInt(i32t, 3, 0), "arcargs");
+        LLVMValueRef objn = LLVMBuildPtrToInt(g->builder, obj, i64t, "objn");
+        LLVMValueRef vals[3] = { objn, rc_old,
+                                 site ? site : LLVMConstInt(i64t, -1, 1) };
+        for (int i = 0; i < 3; i++) {
+            LLVMValueRef idx = LLVMConstInt(i32t, (unsigned long long)i, 0);
+            LLVMValueRef slot = LLVMBuildGEP2(g->builder, i64t, slots, &idx, 1, "arcslot");
+            LLVMBuildStore(g->builder, vals[i], slot);
+        }
+        LLVMValueRef cargs[] = { LLVMConstInt(i32t, code, 0),
+                                 LLVMConstInt(i32t, 1 /* NONCONTINUABLE */, 0),
+                                 LLVMConstInt(i32t, 3, 0), slots };
+        zan_call2(g->builder, re_ty, re, cargs, 4, "");
+    }
+    LLVMValueRef exit_code = LLVMConstInt(i32t, 70, 0);
+    zan_call2(g->builder, g->exit_type, g->fn_exit, &exit_code, 1, "");
+    LLVMBuildUnreachable(g->builder);
+}
+
+static void emit_arc_underflow_check(zan_irgen_t *g, LLVMValueRef fn,
+                                    LLVMValueRef rc_old, LLVMValueRef obj,
+                                    LLVMValueRef site, unsigned code,
+                                    const char *what) {
+    /* Diagnostic builds only: an over-release is a real bug, but today it only
+     * leaks (the count never reaches zero, so nothing is freed), and programs
+     * that carry one still run. Aborting them by default would turn a leak into
+     * a crash, so the trap is opt-in with --arc-guard. */
+    if (!g->arc_guard || !g->runtime_checks) return;
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef dead = zan_icmp(g->builder, LLVMIntSLE, rc_old,
+        LLVMConstInt(i64t, 0, 0), "arcdead");
+    LLVMBasicBlockRef bad_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "arc.bad");
+    LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "arc.ok");
+    LLVMBuildCondBr(g->builder, dead, bad_bb, ok_bb);
+    LLVMPositionBuilderAtEnd(g->builder, bad_bb);
+    emit_arc_fault_report(g, obj, rc_old, site, code, what);
+    LLVMPositionBuilderAtEnd(g->builder, ok_bb);
+}
+
+/* --arc-guard: a block whose refcount slot carries the quarantine marker is
+ * being retained or released through a reference that outlived its owner -- a
+ * *missing* retain, which plain refcounting cannot notice because the counts
+ * balanced. Reported at the first later use, whose backtrace names the code
+ * holding the stale reference. */
+static void emit_arc_freed_use_check(zan_irgen_t *g, LLVMValueRef fn,
+                                    LLVMValueRef rc, LLVMValueRef obj,
+                                    unsigned code, const char *what) {
+    if (!g->arc_guard) return;
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+    LLVMValueRef freed = zan_icmp(g->builder, LLVMIntEQ, rc,
+        LLVMConstInt(i64t, ZAN_ARC_FREED_MARK, 0), "arcfreed");
+    LLVMBasicBlockRef bad_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "uaf.bad");
+    LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "uaf.ok");
+    LLVMBuildCondBr(g->builder, freed, bad_bb, ok_bb);
+    LLVMPositionBuilderAtEnd(g->builder, bad_bb);
+    /* The quarantine stashed the address that released the block in the site
+     * word, so the report names both ends of the bug: this backtrace is the
+     * stale use, `freed_by` is the release that ended the block's life. */
+    LLVMValueRef sp = LLVMBuildGEP2(g->builder, i8t, obj,
+        (LLVMValueRef[]){ LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1) }, 1, "uafsp");
+    LLVMValueRef sip = LLVMBuildBitCast(g->builder, sp, LLVMPointerType(i64t, 0), "uafsip");
+    LLVMValueRef freed_by = LLVMBuildLoad2(g->builder, i64t, sip, "freedby");
+    emit_arc_fault_report(g, obj, LLVMConstInt(i64t, 0, 0), freed_by, code, what);
+    LLVMPositionBuilderAtEnd(g->builder, ok_bb);
+}
+
+/* --arc-guard: instead of returning the block to the allocator, mark it
+ * quarantined and poison the first payload byte. The block is intentionally
+ * leaked so its address is never recycled, which is what makes a stale
+ * reference detectable instead of silently pointing at somebody else's data. */
+static void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj,
+                               LLVMValueRef rc_iptr) {
+    LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8p = LLVMPointerType(i8t, 0);
+    LLVMBuildStore(g->builder, LLVMConstInt(i64t, ZAN_ARC_FREED_MARK, 0), rc_iptr);
+    LLVMBuildStore(g->builder, LLVMConstInt(i8t, 0xDD, 0), obj);
+    /* Overwrite the site word with the caller of this release: with the block
+     * quarantined the site index is no longer needed, and the return address
+     * is what tells a later stale use *where* the block was freed. */
+    LLVMTypeRef ra_ty = LLVMFunctionType(i8p, &i32t, 1, 0);
+    LLVMValueRef ra_fn = LLVMGetNamedFunction(g->mod, "llvm.returnaddress");
+    if (!ra_fn) ra_fn = LLVMAddFunction(g->mod, "llvm.returnaddress", ra_ty);
+    LLVMValueRef zero = LLVMConstInt(i32t, 0, 0);
+    LLVMValueRef ra = zan_call2(g->builder, ra_ty, ra_fn, &zero, 1, "retaddr");
+    LLVMValueRef sp = LLVMBuildGEP2(g->builder, i8t, obj,
+        (LLVMValueRef[]){ LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1) }, 1, "qsp");
+    LLVMValueRef sip = LLVMBuildBitCast(g->builder, sp, LLVMPointerType(i64t, 0), "qsip");
+    LLVMBuildStore(g->builder, LLVMBuildPtrToInt(g->builder, ra, i64t, "ran"), sip);
+}
+
 /* On Windows, guard an about-to-be-dereferenced string header pointer (obj-8,
  * the STRING_MAGIC slot) against freed/unmapped pages. The tolerant retain and
  * release probe [obj-8] to decide whether a pointer is a managed string; for a
@@ -720,12 +858,17 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             const char *module_name,
                             const char *target_triple,
                             bool target_is_windows, bool mt_scheduler,
-                            bool check_leaks) {
+                            bool check_leaks, bool runtime_checks,
+                            bool arc_guard) {
     memset(g, 0, sizeof(*g));
     class_index_reset();
     g->arena = arena;
     g->diag = diag;
     g->binder = binder;
+    /* The ARC runtime functions are emitted from this call, so their guards
+     * have to be decided before it runs -- not by a later field assignment. */
+    g->runtime_checks = runtime_checks;
+    g->arc_guard = arc_guard;
     /* Set target before runtime codegen so Sleep/poll selection is correct. */
     if (target_triple && target_triple[0])
         snprintf(g->target_triple, sizeof(g->target_triple), "%s", target_triple);
@@ -1312,8 +1455,18 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "rcptr");
         LLVMValueRef rc_iptr = LLVMBuildBitCast(g->builder, rc_ptr,
             LLVMPointerType(i64, 0), "rciptr");
-        LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpAdd, rc_iptr,
-            LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingMonotonic, 0);
+        if (g->arc_guard) {
+            LLVMValueRef rc_now = LLVMBuildLoad2(g->builder, i64, rc_iptr, "rcnow");
+            emit_arc_freed_use_check(g, g->rt_retain, rc_now, obj,
+                                     ZAN_ARC_FAULT_USE_OBJ,
+                                     "retain through a stale reference (object "
+                                     "was freed: missing retain when stored)");
+        }
+        LLVMValueRef rc_pre = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpAdd,
+            rc_iptr, LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingMonotonic, 0);
+        emit_arc_underflow_check(g, g->rt_retain, rc_pre, obj, NULL,
+                                 ZAN_ARC_FAULT_RETAIN,
+                                 "retain of an already-freed object");
         LLVMBuildBr(g->builder, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, ret_bb);
         LLVMBuildRetVoid(g->builder);
@@ -1340,9 +1493,26 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "rcptr");
         LLVMValueRef rc_iptr = LLVMBuildBitCast(g->builder, rc_ptr,
             LLVMPointerType(i64, 0), "rciptr");
+        if (g->arc_guard) {
+            LLVMValueRef rc_now = LLVMBuildLoad2(g->builder, i64, rc_iptr, "rcnow");
+            emit_arc_freed_use_check(g, g->rt_release, rc_now, obj,
+                                     ZAN_ARC_FAULT_USE_OBJ,
+                                     "release through a stale reference "
+                                     "(object was already freed)");
+        }
         /* atomically decrement; LLVMBuildAtomicRMW returns the pre-op value */
         LLVMValueRef rc_old = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpSub, rc_iptr,
             LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
+        {
+            LLVMValueRef sp = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
+                obj, &neg8, 1, "arcsp");
+            LLVMValueRef sip = LLVMBuildBitCast(g->builder, sp,
+                LLVMPointerType(i64, 0), "arcsip");
+            LLVMValueRef s = LLVMBuildLoad2(g->builder, i64, sip, "arcsite");
+            emit_arc_underflow_check(g, g->rt_release, rc_old, obj, s,
+                                     ZAN_ARC_FAULT_RELEASE,
+                                     "release of an already-freed object");
+        }
         LLVMValueRef rc1 = zan_sub(g->builder, rc_old, LLVMConstInt(i64, 1, 0), "rc1");
         /* if rc1 == 0, free the object (16-byte header precedes obj) */
         LLVMValueRef is_zero = zan_icmp(g->builder, LLVMIntEQ, rc1,
@@ -1361,7 +1531,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef header_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "hdr");
         LLVMTypeRef free_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
             (LLVMTypeRef[]){ i8ptr }, 1, 0);
-        zan_call2(g->builder, free_fn_type, g->fn_free, &header_ptr, 1, "");
+        if (g->arc_guard) emit_arc_quarantine(g, obj, rc_iptr);
+        else zan_call2(g->builder, free_fn_type, g->fn_free, &header_ptr, 1, "");
         if (g->check_leaks) {
             /* leak tracking: one fewer live object, and one fewer at this site */
             emit_leak_counter_add(g, g->g_live, -1);
@@ -1532,8 +1703,15 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef add_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_retain, "add");
         LLVMBuildCondBr(g->builder, is_sent, ret_bb, add_bb);
         LLVMPositionBuilderAtEnd(g->builder, add_bb);
-        LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpAdd, rc_iptr,
-            LLVMConstInt(i64t, 1, 0), LLVMAtomicOrderingMonotonic, 0);
+        emit_arc_freed_use_check(g, g->rt_str_retain, rc, obj,
+                                 ZAN_ARC_FAULT_USE_STR,
+                                 "retain through a stale reference (string was "
+                                 "freed: missing retain when stored)");
+        LLVMValueRef rc_pre = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpAdd,
+            rc_iptr, LLVMConstInt(i64t, 1, 0), LLVMAtomicOrderingMonotonic, 0);
+        emit_arc_underflow_check(g, g->rt_str_retain, rc_pre, obj, NULL,
+                                 ZAN_ARC_FAULT_STR_RETAIN,
+                                 "retain of an already-freed string");
         LLVMBuildBr(g->builder, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, ret_bb);
         LLVMBuildRetVoid(g->builder);
@@ -1571,8 +1749,15 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef dec_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "dec");
         LLVMBuildCondBr(g->builder, is_sent, ret_bb, dec_bb);
         LLVMPositionBuilderAtEnd(g->builder, dec_bb);
+        emit_arc_freed_use_check(g, g->rt_str_release, rc, obj,
+                                 ZAN_ARC_FAULT_USE_STR,
+                                 "release through a stale reference "
+                                 "(string was already freed)");
         LLVMValueRef rc_old = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpSub, rc_iptr,
             LLVMConstInt(i64t, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
+        emit_arc_underflow_check(g, g->rt_str_release, rc_old, obj, NULL,
+                                 ZAN_ARC_FAULT_STR_RELEASE,
+                                 "release of an already-freed string");
         LLVMValueRef rc1 = zan_sub(g->builder, rc_old, LLVMConstInt(i64t, 1, 0), "rc1");
         LLVMValueRef is_zero = zan_icmp(g->builder, LLVMIntEQ, rc1, LLVMConstInt(i64t, 0, 0), "iszero");
         LLVMBasicBlockRef free_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "dofree");
@@ -1581,7 +1766,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef header_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "hdr");
         LLVMTypeRef free_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
             (LLVMTypeRef[]){ i8p }, 1, 0);
-        zan_call2(g->builder, free_fn_type, g->fn_free, &header_ptr, 1, "");
+        if (g->arc_guard) emit_arc_quarantine(g, obj, rc_iptr);
+        else zan_call2(g->builder, free_fn_type, g->fn_free, &header_ptr, 1, "");
         {
             emit_leak_counter_add(g, g->g_live, -1);
         }

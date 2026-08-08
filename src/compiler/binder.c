@@ -737,16 +737,20 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
  * same. Multi-level chains are handled by resolving the base first
  * (recursively); inherited fields are PREPENDED so base fields stay a prefix
  * of the derived layout (upcasts are plain bitcasts). */
-static bool type_has_own_member(zan_symbol_t *type_sym, zan_istr_t name) {
+static zan_symbol_t *type_own_member(zan_symbol_t *type_sym, zan_istr_t name) {
     for (int i = 0; i < type_sym->member_count; i++) {
         if ((type_sym->members[i]->kind == SYM_FIELD ||
              type_sym->members[i]->kind == SYM_PROPERTY) &&
             type_sym->members[i]->name.len == name.len &&
             memcmp(type_sym->members[i]->name.str, name.str, name.len) == 0) {
-            return true;
+            return type_sym->members[i];
         }
     }
-    return false;
+    return NULL;
+}
+
+static bool type_has_own_member(zan_symbol_t *type_sym, zan_istr_t name) {
+    return type_own_member(type_sym, name) != NULL;
 }
 
 static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
@@ -800,11 +804,24 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
                  * prepend them to the derived member list */
                 int ninherit = 0;
                 for (int bi = 0; bi < base_sym->member_count; bi++) {
-                    if ((base_sym->members[bi]->kind == SYM_FIELD ||
-                         base_sym->members[bi]->kind == SYM_PROPERTY) &&
-                        !type_has_own_member(type_sym, base_sym->members[bi]->name)) {
-                        ninherit++;
-                    }
+                    if (base_sym->members[bi]->kind != SYM_FIELD &&
+                        base_sym->members[bi]->kind != SYM_PROPERTY)
+                        continue;
+                    zan_symbol_t *shadow = type_own_member(type_sym,
+                                               base_sym->members[bi]->name);
+                    if (!shadow) { ninherit++; continue; }
+                    /* The derived declaration takes the base field's place in
+                     * the layout instead of adding a slot, so every base method
+                     * that touches a later base field writes through the wrong
+                     * offset (an int read back as an object pointer, then
+                     * released -- an access violation far from here). Shadowing
+                     * a base field is therefore rejected rather than laid out. */
+                    zan_diag_emit(b->diag, DIAG_ERROR,
+                        shadow->decl ? shadow->decl->loc : type_node->loc,
+                        "'%.*s' already exists in base type '%.*s'; remove this "
+                        "declaration and use the inherited member",
+                        (int)shadow->name.len, shadow->name.str,
+                        (int)base_name.len, base_name.str);
                 }
                 if (ninherit > 0) {
                     int total = ninherit + type_sym->member_count;

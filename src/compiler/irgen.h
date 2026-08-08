@@ -196,6 +196,10 @@ struct zan_irgen {
      * (List/Dict) substitute the type parameter to its concrete argument and use
      * content equality (e.g. strcmp) instead of erased identity. Routing a call
      * to a specialized symbol is therefore a pure symbol swap. */
+    zan_type_t *collect_inst_ctx; /* instantiation whose body is being scanned by
+                                   * the discovery pass; substitutes the class's
+                                   * own type parameters so open types inside it
+                                   * (Inner<T>) are recorded concretely */
     zan_type_t *cur_inst;   /* active instantiation while emitting a specialized
                              * body (a class type carrying concrete type_args);
                              * NULL when emitting erased/non-generic code. */
@@ -306,6 +310,9 @@ struct zan_irgen {
     const char  *src_file;        /* source path, for runtime diagnostics */
     bool         runtime_checks;  /* insert div-by-zero (etc.) guards; default true */
     bool         check_leaks;     /* emit a leak report at program exit */
+    bool         arc_guard;       /* quarantine freed objects/strings and trap
+                                   * any later retain/release of them
+                                   * (use-after-free detection; leaks memory) */
     bool         fast_codegen;    /* machine codegen at -O0 (fast turnaround) */
     bool         emit_lib;        /* library output: keep `public` members as
                                      exported (external-linkage) symbols */
@@ -394,6 +401,7 @@ struct zan_irgen {
     bool         uses_socket_async; /* set when a socket await is lowered */
     bool         uses_timer_runtime; /* set by Timer API externs */
     bool         uses_sync_runtime; /* set by AtomicInt/SharedTable externs */
+    bool         uses_file_runtime; /* set by zan_file_* (file IO) externs */
     bool         uses_embed_api;    /* set by zan_embed_* extern references */
     /* goto/label support: label blocks keyed by (function, name), created on
      * first reference from either the label statement or a goto */
@@ -514,7 +522,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             const char *module_name,
                             const char *target_triple,
                             bool target_is_windows, bool mt_scheduler,
-                            bool check_leaks);
+                            bool check_leaks, bool runtime_checks,
+                            bool arc_guard);
 void zan_irgen_destroy(zan_irgen_t *g);
 
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit);

@@ -12,6 +12,15 @@
  * resolve non-concrete and are ignored. */
 static void collect_inst_type(zan_irgen_t *g, zan_type_t *t) {
     if (!t) return;
+    /* Inside a generic class's body a type written with the class's own
+     * parameters (`Inner<T>` as a field of `Box<T>`) is not concrete, so on its
+     * own it records no instantiation and calls into it land in the erased copy
+     * -- where T is not RC-managed, so a returned element comes back unretained
+     * while the caller releases it. Substituting the enclosing instantiation
+     * being scanned turns it into `Inner<Opt>`, which is a real instantiation. */
+    if (g->collect_inst_ctx && !type_is_concrete(t))
+        t = subst_type_param_deep(g, t, g->collect_inst_ctx);
+    if (!t) return;
     add_generic_inst(g, t);
     if (t->kind == TYPE_ARRAY || t->kind == TYPE_NULLABLE)
         collect_inst_type(g, t->element_type);
@@ -175,11 +184,27 @@ static void discover_generic_insts(zan_irgen_t *g, zan_ast_node_t *unit) {
         prev = g->generic_inst_count;
         for (int i = 0; i < unit->comp_unit.decls.count; i++) {
             zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
-            if (decl->kind == AST_CLASS_DECL || decl->kind == AST_STRUCT_DECL ||
-                decl->kind == AST_INTERFACE_DECL) {
+            if (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL &&
+                decl->kind != AST_INTERFACE_DECL)
+                continue;
+            g->collect_inst_ctx = NULL;
+            for (int j = 0; j < decl->type_decl.members.count; j++)
+                collect_inst_member(g, decl->type_decl.members.items[j]);
+            /* Then once per known instantiation of this generic class, so its
+             * body's open types (`Inner<T>`) are discovered as the concrete
+             * instantiations the specialized copies will call into. */
+            zan_istr_t dname = decl->type_decl.name;
+            int snapshot = g->generic_inst_count;
+            for (int k = 0; k < snapshot; k++) {
+                zan_symbol_t *isym = g->generic_insts[k].type_sym;
+                if (!isym || isym->name.len != dname.len ||
+                    memcmp(isym->name.str, dname.str, (size_t)dname.len) != 0)
+                    continue;
+                g->collect_inst_ctx = g->generic_insts[k].inst;
                 for (int j = 0; j < decl->type_decl.members.count; j++)
                     collect_inst_member(g, decl->type_decl.members.items[j]);
             }
+            g->collect_inst_ctx = NULL;
         }
         guard++;
     }
@@ -232,6 +257,16 @@ static LLVMValueRef route_generic_method(zan_irgen_t *g, zan_type_t *recv_ty,
         if (!concrete) {
             args = g->cur_inst->type_args;
             argc = g->cur_inst->type_arg_count;
+        }
+    } else if (g->cur_inst && !type_is_concrete(recv_ty)) {
+        /* A *different* generic held by the instantiation being emitted
+         * (`ListView<T> list` inside `Dropdown<T>`): substitute this body's
+         * concrete arguments so the call reaches ListView<Opt>'s specialized
+         * copy, which retains what it returns. */
+        zan_type_t *sub = subst_type_param_deep(g, recv_ty, g->cur_inst);
+        if (sub && sub->type_arg_count > 0 && type_is_concrete(sub)) {
+            args = sub->type_args;
+            argc = sub->type_arg_count;
         }
     }
     if (argc <= 0) return erased_fn;

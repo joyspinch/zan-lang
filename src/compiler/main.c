@@ -1269,6 +1269,7 @@ static void print_usage(void) {
     fprintf(stderr, "  --emit-ir       Emit LLVM IR to stdout\n");
     fprintf(stderr, "  --check-leaks   Report unreleased objects at program exit\n");
     fprintf(stderr, "  --no-runtime-checks  Disable runtime guards (e.g. division by zero)\n");
+    fprintf(stderr, "  --arc-guard     Quarantine freed objects and trap stale retain/release\n");
     fprintf(stderr, "  --publish        Build optimized release binary (strip debug, optimize)\n");
     fprintf(stderr, "  --link-mode <m>  Native driver linking on publish: shared (copy driver\n");
     fprintf(stderr, "                   libs next to the exe, default) or static (link into the exe)\n");
@@ -1327,6 +1328,7 @@ int main(int argc, char **argv) {
     const char *gen_meta_path = NULL;     /* --gen-meta <file>: export metadata */
     bool do_emit_ir = false;
     bool check_leaks = false;
+    bool arc_guard = false;
     bool runtime_checks = true;
     bool publish_mode = false;
     bool debug_info = false; /* -g / --debug: emit DWARF for source debugging */
@@ -1379,6 +1381,8 @@ int main(int argc, char **argv) {
             do_emit_ir = true;
         } else if (strcmp(argv[i], "--check-leaks") == 0) {
             check_leaks = true;
+        } else if (strcmp(argv[i], "--arc-guard") == 0) {
+            arc_guard = true;
         } else if (strcmp(argv[i], "--no-runtime-checks") == 0) {
             runtime_checks = false;
         } else if (strcmp(argv[i], "--publish") == 0) {
@@ -1939,7 +1943,7 @@ int main(int argc, char **argv) {
     if (zan_irgen_init(&irgen, arena, diag, &binder, input_file,
                        irgen_triple,
                        target.os == ZAN_OS_WINDOWS, mt_scheduler,
-                       check_leaks) != ZAN_OK) {
+                       check_leaks, runtime_checks, arc_guard) != ZAN_OK) {
         fprintf(stderr, "error: failed to initialize code generator\n");
         zan_arena_free(arena);
         free(source);

@@ -103,6 +103,10 @@ $zanArgs += $entry
 $zanArgs += $files
 $zanArgs += @("-DZAN_PROJECT_COMPONENTS")
 $zanArgs += @("-o", "build\ZanIDE.exe", "--subsystem", "windows")
+# DWARF line tables: the crash handler resolves every in-module frame to
+# `function  <file>.zan:line` in build\zan_crash.log, so a dev build always
+# says which source line faulted instead of module+offset.
+$zanArgs += @("-g")
 $zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_ide_gnu")
 $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_gen.o"))
 $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_docs.o"))
@@ -112,6 +116,11 @@ $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")
 $zanArgs += @("--link-lib", "dwmapi", "--link-lib", "gdi32", "--link-lib", "imm32")
 $zanArgs += @("--link-lib", "user32", "--link-lib", "rpcrt4", "--link-lib", "winpthread")
 $zanArgs += @("--icon", (Join-Path (Get-Location) "assets\zan.ico"))
+# Escape hatch for diagnostic builds: ZAN_IDE_ZANC_ARGS="--arc-guard" builds the
+# IDE with extra compiler flags without editing this script.
+if ($env:ZAN_IDE_ZANC_ARGS) {
+    $zanArgs += ($env:ZAN_IDE_ZANC_ARGS -split '\s+' | Where-Object { $_ })
+}
 
 # A running IDE holds a lock on its own executable, so the linker cannot
 # overwrite it ("Permission denied"). Windows does allow RENAMING a running
@@ -136,7 +145,10 @@ $out = & $zanc @zanArgs 2>&1
 $code = $LASTEXITCODE
 $ErrorActionPreference = $prevEap
 if ($code -ne 0) {
-    $out | Select-Object -Last 60
+    # Show every diagnostic, not just the tail: a failed build is read from
+    # this output and a truncated list hides the first (usually root) error.
+    $out | Select-String -Pattern 'error|warning' | ForEach-Object { $_.Line }
+    $out | Select-Object -Last 10
     Write-Output "IDE_LINK_FAILED code=$code"
     exit 1
 }
