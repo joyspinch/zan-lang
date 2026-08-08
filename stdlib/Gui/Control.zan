@@ -549,8 +549,8 @@ class Control {
     /// 追加一个子节点（自动停靠）。返回该子节点，调用方可
     /// 内联持有引用，如 `Button b = panel.Add(save)`。
     Control Add(Control c) {
-        if (c == null) { return null; }
-        c.parent = this;
+        if (!this.Adoptable(c)) { return c; }
+        this.Adopt(c);
         children.Add(c);
         return c;
     }
@@ -560,13 +560,36 @@ class Control {
     /// 此节点有流式布局（列/行），子节点会自动沿
     /// 流式轴停靠，除非它选择了 Grow()。
     Control With(Control c) {
-        if (c == null) { return this; }
+        if (!this.Adoptable(c)) { return this; }
         if (layout != 0 && !c.grow) {
             if (layout == 2) { c.dock = 3; } else { c.dock = 1; }
         }
-        c.parent = this;
+        this.Adopt(c);
         children.Add(c);
         return this;
+    }
+
+    /// 一个控件在树里只能有一个位置。宿主保留控件（画廊、文档预览、
+    /// 设计出来的静态字段）会在重建时被挂到新的父节点上，旧父节点若还
+    /// 留着它，同一个节点就出现在两处；把祖先挂进自己的后代更糟——树
+    /// 成环，任何递归遍历（Wire/RenderTree/Measure）都会无限递归，栈溢
+    /// 出表现为读非法地址的崩溃。因此收养前先判断能不能收养。
+    bool Adoptable(Control c) {
+        if (c == null || c == this) { return false; }
+        /* c 是本节点的祖先：挂进去就成环 */
+        Control up = parent;
+        for (int guard = 0; up != null && guard < 4096; guard = guard + 1) {
+            if (up == c) { return false; }
+            up = up.parent;
+        }
+        return true;
+    }
+
+    /// 收养一个子节点：先从原父节点摘下（含本节点，重复 Add 不会让
+    /// 同一个控件在 children 里出现两次），再指向本节点。
+    void Adopt(Control c) {
+        if (c.parent != null) { c.parent.Remove(c); }
+        c.parent = this;
     }
 
     /// 给定父节点剩余空间时，此子节点停靠的主轴尺寸：
@@ -626,10 +649,11 @@ class Control {
 
     /// 在某个位置插入子节点，索引被钳制在范围内。会重新父化 `c`。
     void InsertAt(int idx, Control c) {
+        if (!this.Adoptable(c)) { return; }
+        this.Adopt(c);
         int at = idx;
         if (at < 0) { at = 0; }
         if (at > children.Count) { at = children.Count; }
-        c.parent = this;
         children.Insert(at, c);
     }
 

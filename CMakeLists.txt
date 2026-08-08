@@ -602,6 +602,18 @@ add_test(NAME diag_invalid_zform_kind
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_invalid_zform_kind PROPERTIES TIMEOUT 60)
 
+# A class that declares constructors has no implicit parameterless one, so
+# `new T()` on it has nothing to run and irgen would hand back a zero-filled
+# object that faults on its first use (the Help page's designed Card).
+add_test(NAME diag_ctor_missing_parameterless
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/ctor_missing_parameterless.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_ctor_missing_parameterless${_exe_ext}
+    "-DEXPECT_REGEX=no constructor of .Box. takes 0 argument"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_ctor_missing_parameterless PROPERTIES TIMEOUT 60)
+
 # A `"role": "control"` .zform is an embeddable Control, not a window: it has
 # no Main/Show, so naming one as the project entry has to fail at formgen time
 # instead of linking a program with no entry point.
@@ -1094,6 +1106,18 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_props${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # The tree invariant every container shares: one place per control, so a
+  # re-parent moves it, and a control never becomes its own descendant (a cycle
+  # makes every recursive walk overflow the stack).
+  add_test(NAME conformance_gui_tree
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/tree_test.zan
+      "-DZANC_ARGS=--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_tree.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_tree${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # The CSS skin pipeline (Css parser -> StyleSheet -> StyleBox) is pure
   # computation, so it is verified headlessly against a golden dump.
   add_test(NAME conformance_gui_css
@@ -1117,7 +1141,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_webview_interop${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable conformance_gui_css conformance_gui_props conformance_gui_webview_interop PROPERTIES
+  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable conformance_gui_css conformance_gui_props conformance_gui_tree conformance_gui_webview_interop PROPERTIES
     ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 

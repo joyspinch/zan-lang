@@ -425,6 +425,73 @@ static const char *type_name(zan_type_t *t) {
     return t->name.str;
 }
 
+/* ---- constructor availability -------------------------------------------
+ * A class that declares constructors has no implicit parameterless one, so
+ * `new T()` on it has nothing to run: irgen zero-fills the object and calls no
+ * constructor, and the first method call on that half-built instance reads a
+ * null field (`List` members are null, not empty). That crash surfaced far
+ * from the `new`, so the arity mismatch is diagnosed here instead. Only
+ * constructors the class itself declares count -- a derived class that
+ * declares none keeps its implicit parameterless constructor. */
+
+/* Number of arguments the constructor `decl` accepts at minimum / at most;
+ * `max` is -1 for a `params T[]` tail (unbounded). */
+static void ctor_arity(zan_ast_node_t *decl, int *min, int *max) {
+    int total = decl->method_decl.params.count;
+    int required = 0;
+    bool variadic = false;
+    for (int i = 0; i < total; i++) {
+        zan_ast_node_t *p = decl->method_decl.params.items[i];
+        if (!p || p->kind != AST_PARAM) { required++; continue; }
+        if (p->param.is_params) { variadic = true; continue; }
+        if (!p->param.default_val) required++;
+    }
+    *min = required;
+    *max = variadic ? -1 : total;
+}
+
+/* Arguments that go to the constructor: an object initializer
+ * (`new T(a) { Field = v }`) is parsed with the field writes appended to the
+ * argument list, so drop that tail (mirrors irgen's init_start). */
+static int ctor_arg_count(zan_checker_t *c, zan_ast_node_t *expr,
+                          zan_symbol_t *type_sym) {
+    int n = expr->new_expr.args.count;
+    while (n > 0) {
+        zan_ast_node_t *a = expr->new_expr.args.items[n - 1];
+        if (!a || a->kind != AST_ASSIGNMENT || !a->binary.left ||
+            a->binary.left->kind != AST_IDENTIFIER ||
+            !checker_find_field(type_sym, a->binary.left->ident.name))
+            break;
+        n--;
+    }
+    (void)c;
+    return n;
+}
+
+static void check_ctor_available(zan_checker_t *c, zan_type_t *type,
+                                 zan_ast_node_t *expr) {
+    if (!type || type->kind != TYPE_CLASS || !type->sym) return;
+    if (expr->new_expr.is_array) return;
+    zan_symbol_t *sym = type->sym;
+    int declared = 0;
+    int argc = ctor_arg_count(c, expr, sym);
+    for (int i = 0; i < sym->member_count; i++) {
+        zan_symbol_t *m = sym->members[i];
+        if (!m || m->kind != SYM_CONSTRUCTOR || !m->decl) continue;
+        if (m->decl->kind != AST_CONSTRUCTOR_DECL) continue;
+        declared++;
+        int lo = 0;
+        int hi = 0;
+        ctor_arity(m->decl, &lo, &hi);
+        if (argc >= lo && (hi < 0 || argc <= hi)) return;
+    }
+    if (declared == 0) return;
+    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+        "no constructor of '%s' takes %d argument(s); a class that declares "
+        "constructors has no implicit parameterless one",
+        type_name(type), argc);
+}
+
 static bool type_is_numeric(zan_type_t *t) {
     if (!t) return false;
     switch (t->kind) {
@@ -1408,6 +1475,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             type->kind != TYPE_ARRAY)
             type = zan_binder_make_array_type(c->binder, type);
         check_generic_constraints(c, type, expr->loc);
+        check_ctor_available(c, type, expr);
         for (int i = 0; i < expr->new_expr.args.count; i++) {
             zan_ast_node_t *arg = expr->new_expr.args.items[i];
             /* Object-initializer assignments are field writes on the newly

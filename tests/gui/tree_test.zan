@@ -1,0 +1,97 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// Covers the tree invariant every container shares: a control has exactly one
+/// place in the tree, so adding it somewhere else moves it there, and a节点
+/// can never become its own descendant.
+///
+/// The IDE hit this as a crash: retained hosts (the docs preview's gallery,
+/// a designed control's static fields) are re-parented on every rebuild while
+/// the old parent still listed them, and one of those re-parents put an
+/// ancestor under its own descendant. Every recursive walk (ChildWindow.Wire,
+/// Control.RenderTree, measure) then recursed forever and the stack overflow
+/// surfaced as a read of an invalid address.
+class TreeTest {
+    static int fails;
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got "
+            + Convert.ToString(got) + " want " + Convert.ToString(want));
+    }
+
+    static void True(string what, bool ok) {
+        if (ok) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    /// Depth of the deepest branch, bounded so a cyclic tree returns instead
+    /// of overflowing the stack: an unbounded walk cannot report the bug it is
+    /// checking for.
+    static int Depth(Control c, int budget) {
+        if (budget <= 0) { return 999; }
+        int deepest = 0;
+        for (int i = 0; i < c.children.Count; i = i + 1) {
+            int d = TreeTest.Depth(c.children[i], budget - 1);
+            if (d + 1 > deepest) { deepest = d + 1; }
+        }
+        return deepest;
+    }
+
+    static void Main() {
+        fails = 0;
+
+        Panel a = new Panel("a");
+        Panel b = new Panel("b");
+        Label leaf = new Label("leaf");
+
+        a.Add(leaf);
+        TreeTest.Eq("adopted", a.children.Count, 1);
+        TreeTest.True("parent is a", leaf.parent == a);
+
+        // Re-parenting moves the control: the old parent must not keep it.
+        b.Add(leaf);
+        TreeTest.Eq("old parent released", a.children.Count, 0);
+        TreeTest.Eq("new parent adopted", b.children.Count, 1);
+        TreeTest.True("parent is b", leaf.parent == b);
+
+        // Adding the same control twice leaves one entry, not two.
+        b.Add(leaf);
+        TreeTest.Eq("no duplicate child", b.children.Count, 1);
+
+        // A control cannot adopt itself or one of its own ancestors.
+        a.Add(b);
+        b.Add(a);
+        TreeTest.True("ancestor rejected", a.parent == null);
+        TreeTest.Eq("cycle not created", b.children.Count, 1);
+        a.Add(a);
+        TreeTest.Eq("self rejected", a.children.Count, 1);
+
+        // With() keeps the same invariants and still returns the container.
+        Panel row = new Panel("row");
+        Label one = new Label("one");
+        Control chained = row.With(one).With(one);
+        TreeTest.True("With returns container", chained == row);
+        TreeTest.Eq("With no duplicate", row.children.Count, 1);
+        row.With(row);
+        TreeTest.Eq("With self rejected", row.children.Count, 1);
+
+        // InsertAt re-parents through the same path.
+        Panel host = new Panel("host");
+        host.InsertAt(0, one);
+        TreeTest.Eq("insert moved", row.children.Count, 0);
+        TreeTest.Eq("insert adopted", host.children.Count, 1);
+
+        // The whole tree is still finite: a - b - leaf, deepest branch is 2.
+        TreeTest.Eq("depth", TreeTest.Depth(a, 64), 2);
+
+        if (fails == 0) { Console.WriteLine("tree_test: OK"); }
+        else {
+            Console.WriteLine("tree_test: " + Convert.ToString(fails)
+                + " failure(s)");
+        }
+    }
+}
