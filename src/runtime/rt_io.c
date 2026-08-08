@@ -130,6 +130,7 @@ static int64_t dns_wait_ms(int64_t caller_ms);  /* cap a backend wait at the
 static int dns_timeout_scan(void);    /* deliver failures for late lookups */
 static void dns_wake_read(void);      /* consume the wake fd signal (POSIX) */
 static void dns_wake_notify(void);    /* worker -> reactor wake (all backends) */
+static void dns_shutdown_cleanup(void); /* free DNS jobs at shutdown */
 
 /* Re-schedule a stackless frame after `ms` milliseconds. Provided by the
  * coroutine driver (emitted inline by the compiler, or by the multi-worker
@@ -625,16 +626,19 @@ static int io_sweep_slots(void) {
         zan_io_slot_t *s = &g_slots[fd];
         if (!s->has_r && !s->has_w) continue;
         if (io_fd_usable(fd)) continue;
-        zan_io_waiter_t ready[8];
-        int nr = io_take(s, fd, 1, ready, 8);
-        nr += io_take(s, fd, 0, ready + nr, 8 - nr);
         s->in_epoll = 0;
-        for (int k = 0; k < nr; k++) {
-            if (ready[k].out_accept)   *ready[k].out_accept = -1;
-            else if (ready[k].out_n)   *ready[k].out_n = 0;
-            g_io_count--;
-            io_wake(ready[k].co, ready[k].step);
-            woke++;
+        for (;;) {
+            zan_io_waiter_t ready[16];
+            int nr = io_take(s, fd, 1, ready, 16);
+            nr += io_take(s, fd, 0, ready + nr, 16 - nr);
+            if (nr == 0) break;
+            for (int k = 0; k < nr; k++) {
+                if (ready[k].out_accept)   *ready[k].out_accept = -1;
+                else if (ready[k].out_n)   *ready[k].out_n = 0;
+                g_io_count--;
+                io_wake(ready[k].co, ready[k].step);
+                woke++;
+            }
         }
     }
     return woke;
@@ -687,6 +691,7 @@ static int g_epoll_fd = -1;void zan_io_init(void) {
     g_io_entries = NULL;
     g_io_count = 0;
     io_dead_clear();
+    dns_shutdown_cleanup();
     if (g_epoll_fd >= 0) { close(g_epoll_fd); g_epoll_fd = -1; }
     if (g_dns_wake_fd >= 0) { close(g_dns_wake_fd); g_dns_wake_fd = -1; }
     g_io_started = 0;
@@ -856,6 +861,7 @@ void zan_io_shutdown(void) {
     }
     g_io_count = 0;
     io_dead_clear();
+    dns_shutdown_cleanup();
     if (g_kq_fd >= 0) { close(g_kq_fd); g_kq_fd = -1; }
     if (g_dns_wake_fd >= 0) { close(g_dns_wake_fd); g_dns_wake_fd = -1; }
     if (g_dns_wake_wfd >= 0) { close(g_dns_wake_wfd); g_dns_wake_wfd = -1; }
@@ -916,7 +922,15 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
     struct kevent kev;
     short filter = (interest == ZAN_IO_READ) ? EVFILT_READ : EVFILT_WRITE;
     EV_SET(&kev, fd, filter, EV_ADD | EV_ONESHOT, 0, 0, NULL);
-    kevent(g_kq_fd, &kev, 1, NULL, 0, NULL);
+    if (kevent(g_kq_fd, &kev, 1, NULL, 0, NULL) != 0) {
+        /* fd was closed or otherwise invalid: fail the waiter so it does not
+         * park forever. */
+        io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);
+        g_pending_rbuf = NULL;
+        g_pending_out_n = NULL;
+        g_pending_accept_out = NULL;
+        return;
+    }
 }
 
 int32_t zan_io_poll(int64_t timeout_ms) {
@@ -1118,6 +1132,7 @@ void zan_io_shutdown(void) {
     g_io_count = 0;
     /* Drop pooled ops: the completion port is gone, so recycled op structs are
      * all stale for any future zan_io_init(). */
+    dns_shutdown_cleanup();
 #if defined(ZAN_CO_DRIVER)
     for (;;) {
         PSLIST_ENTRY e = InterlockedPopEntrySList(&g_op_slist);
@@ -1240,7 +1255,13 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
     e = WSAGetLastError();
     if (e == WSA_IO_PENDING) return;
     /* Hard error: queue a completion so the coroutine is still resumed. */
-    PostQueuedCompletionStatus(g_iocp, 0, (ULONG_PTR)s, &op->ov);
+    if (!PostQueuedCompletionStatus(g_iocp, 0, (ULONG_PTR)s, &op->ov)) {
+        /* IOCP is gone or otherwise unusable; resume the waiter directly so
+         * it does not hang forever, and recycle the op. */
+        io_wake(co, step);
+        op_free(op);
+        IO_CNT_DEC();
+    }
 }
 
 /* Overlapped receive. Issues the real WSARecv into `buf` (no zero-byte probe),
@@ -1462,6 +1483,7 @@ void zan_io_shutdown(void) {
     g_io_entries = NULL;
     g_io_count = 0;
     io_dead_clear();
+    dns_shutdown_cleanup();
     if (g_dns_wake_fd >= 0) { close(g_dns_wake_fd); g_dns_wake_fd = -1; }
     if (g_dns_wake_wfd >= 0) { close(g_dns_wake_wfd); g_dns_wake_wfd = -1; }
     g_io_started = 0;
@@ -1650,10 +1672,28 @@ static void *dns_worker(void *arg) {
         return NULL;
 #endif
     }
-    /* Still ours: take it off the pending list and move it to the done list. */
+    /* Still ours: take it off the pending list and move it to the done list.
+     * If the reactor already timed us out / shut down, the job is no longer in
+     * g_dns_pending; free the work item and let the reactor own the frame. */
+    int found = 0;
     zan_dns_job_t **pp = &g_dns_pending;
-    while (*pp != &w->job) pp = &(*pp)->next;
-    *pp = w->job.next;
+    while (*pp) {
+        if (*pp == &w->job) {
+            *pp = w->job.next;
+            found = 1;
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    if (!found || w->job.timed_out) {
+        dns_unlock();
+        free(w);
+#if defined(_WIN32)
+        return 0;
+#else
+        return NULL;
+#endif
+    }
     w->job.next = g_dns_done;
     g_dns_done = &w->job;
     dns_unlock();
@@ -1689,6 +1729,7 @@ static int64_t dns_wait_ms(int64_t caller_ms) {
 static int dns_timeout_scan(void) {
     int woke = 0;
     int64_t now = dns_now_ms();
+    zan_dns_job_t *timed_out = NULL;
     dns_lock();
     zan_dns_job_t **pp = &g_dns_pending;
     while (*pp) {
@@ -1697,16 +1738,17 @@ static int dns_timeout_scan(void) {
         *pp = j->next;
         j->timed_out = 1;
         g_dns_inflight--;
-        void *frame = j->frame;
-        zan_co_step_t step = j->step;
-        int32_t *out = j->out;
-        dns_unlock();
-        if (out) *out = 0;
-        io_wake(frame, step);
-        woke++;
-        dns_lock();
+        j->next = timed_out;
+        timed_out = j;
     }
     dns_unlock();
+    while (timed_out) {
+        zan_dns_job_t *j = timed_out;
+        timed_out = j->next;
+        if (j->out) *j->out = 0;
+        io_wake(j->frame, j->step);
+        woke++;
+    }
     return woke;
 }
 
@@ -1755,6 +1797,26 @@ static int dns_drain(void) {
         j = n;
     }
     return woke;
+}
+
+/* Free completed jobs and mark pending jobs as timed-out so their workers
+ * release them.  Called from zan_io_shutdown; workers may still be running,
+ * so we must not free jobs out from under them. */
+static void dns_shutdown_cleanup(void) {
+    dns_lock();
+    zan_dns_job_t *j = g_dns_done;
+    g_dns_done = NULL;
+    while (j) {
+        zan_dns_job_t *n = j->next;
+        free(j);
+        j = n;
+    }
+    for (zan_dns_job_t *p = g_dns_pending; p; p = p->next) {
+        p->timed_out = 1;
+    }
+    g_dns_pending = NULL;
+    g_dns_inflight = 0;
+    dns_unlock();
 }
 
 void zan_io_resolve_sa_co(const char *name, int32_t port, void *buf,

@@ -157,6 +157,13 @@ static int zan_mem_owns(const void *p) {
         if (v == base) return 1;
         if (v == 0) return 0;
     }
+    /* The probe chain is full.  This is extremely rare, but returning 0 would
+     * hand a slab block to libc free.  Fall back to a full scan so ownership
+     * is never misreported. */
+    for (unsigned n = 0; n < ZAN_MEM_SET_SIZE; n++) {
+        uintptr_t v = __atomic_load_n(&g_slab_set[n], __ATOMIC_ACQUIRE);
+        if (v == base) return 1;
+    }
     return 0;
 }
 

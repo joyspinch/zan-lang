@@ -11,6 +11,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include "../common/host_oom.h"
 
 #if defined(_WIN32)
 #include <windows.h>

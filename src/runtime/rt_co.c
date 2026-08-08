@@ -36,7 +36,7 @@ void zan_co_set_idle(zan_co_idle_fn fn) {
 static void queue_grow(void) {
     size_t ncap = g_cap ? g_cap * 2 : 16;
     zan_co_slot_t *nq = (zan_co_slot_t *)malloc(ncap * sizeof(*nq));
-    if (!nq) abort();
+    if (!nq) zan_host_oom();
     /* Re-linearise the circular buffer into the new storage. */
     for (size_t i = 0; i < g_len; i++) {
         nq[i] = g_queue[(g_head + i) % g_cap];
