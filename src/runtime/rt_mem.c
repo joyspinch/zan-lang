@@ -24,7 +24,10 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include "../common/zan_abi.h"
 
 #if defined(__linux__) || defined(__APPLE__) || defined(__unix__)
 #include <sys/mman.h>
@@ -42,14 +45,23 @@ void *__real_realloc(void *p, size_t n);
 #define ZAN_MEM_SLAB        (1u << 20)      /* 1 MiB */
 
 /* 16-byte header keeps payloads 16-byte aligned; a freed block stores its
- * free-list link in the payload itself (every class is >= 16 bytes). */
+ * free-list link in the payload itself (every class is >= 16 bytes). The
+ * compiler emits the same-size object header (refcount/site at obj-16/-8,
+ * see ZAN_OBJ_HDR_SIZE in ../common/zan_abi.h) in front of every class
+ * instance, so the allocator header must stay 16 bytes for payloads to keep
+ * that object header 16-byte aligned. */
 typedef struct {
     uint32_t magic;
     uint32_t cls;
     uint64_t pad;
 } zan_mem_hdr_t;
 
+_Static_assert(sizeof(zan_mem_hdr_t) == ZAN_OBJ_HDR_SIZE,
+               "allocator header must keep payloads 16-byte aligned "
+               "for the compiler's object header (zan_abi.h)");
+
 #define ZAN_MEM_MAGIC 0x5A414E4DU     /* "ZANM" */
+#define ZAN_MEM_FREED 0x5A414E46U     /* "ZANF": block currently on a free list */
 #define ZAN_MEM_HDR   ((size_t)sizeof(zan_mem_hdr_t))
 
 /* Payload sizes, all multiples of 16. */
@@ -74,10 +86,25 @@ static uintptr_t g_slab_set[ZAN_MEM_SET_SIZE];
 
 /* Per-thread caches: no locking on the hot path. A block freed by a thread
  * that did not allocate it migrates to the freeing thread's list -- slabs are
- * process-wide and never returned to the OS, so that is safe. */
+ * process-wide and never returned to the OS, so that is safe.
+ *
+ * On MinGW (Windows) __thread is emulated by libgcc's emutls, whose first
+ * access runs pthread_once(emutls_init) -- and emutls_init calls malloc. A
+ * malloc reached from inside __wrap_malloc re-enters __emutls_get_address on
+ * the same not-yet-initialized variable and spins forever on the once lock
+ * (a real deadlock, observed with TDM-GCC 10.3 at CRT startup). The allocator
+ * is only ever linked on POSIX today (mmap slabs; Windows has no mmap path),
+ * so guard the hazard: on Windows use plain statics, which are safe because
+ * the slab path -- the only user of these caches -- is disabled there. */
+#if defined(_WIN32)
+static void *t_free_list[ZAN_MEM_NCLASS];
+static char *t_bump;
+static char *t_bump_end;
+#else
 static __thread void *t_free_list[ZAN_MEM_NCLASS];
 static __thread char *t_bump;
 static __thread char *t_bump_end;
+#endif
 
 static volatile int g_slab_lock;
 
@@ -175,6 +202,12 @@ static void *zan_mem_small(size_t n) {
     void *p = t_free_list[cls];
     if (p) {
         t_free_list[cls] = *(void **)p;
+        /* A popped block is still marked FREED from its last free: reset the
+         * header so the next free of this live block is not mistaken for a
+         * double free (the guard keys on the FREED marker). */
+        zan_mem_hdr_t *h = (zan_mem_hdr_t *)((char *)p - ZAN_MEM_HDR);
+        h->magic = ZAN_MEM_MAGIC;
+        h->cls = (uint32_t)cls;
         return p;
     }
     size_t need = (size_t)k_class_size[cls] + ZAN_MEM_HDR;
@@ -197,12 +230,43 @@ void *__wrap_malloc(size_t n) {
     return __real_malloc(n);
 }
 
+/* Validate the allocator header in front of a slab block. Returns 0 with
+ * *cls set when the block is a live block start; -1 for anything the
+ * allocator does not own (not a block start: callers leave it alone); and
+ * aborts on a block that was already freed or whose header is garbage --
+ * both are aliasing bugs under ARC, and the abort is the detection.
+ * __wrap_free and __wrap_realloc share this so their behavior can never
+ * drift apart. */
+static int zan_mem_hdr_check(const void *p, uint32_t *cls) {
+    zan_mem_hdr_t *h = (zan_mem_hdr_t *)((const char *)p - ZAN_MEM_HDR);
+    /* The allocator header at p-16 is only ever written by this allocator:
+     * the compiler's object header (refcount/site) lives at p..p+15, so these
+     * bytes survive for the block's whole lifetime. A freed block is marked
+     * FREED until it is re-allocated, which turns a second free of the same
+     * block -- a memory-aliasing bug under ARC -- into an immediate abort
+     * instead of two allocations returning the same address. */
+    if (h->magic == ZAN_MEM_FREED) {
+        fprintf(stderr, "zan runtime: double free of block %p\n", (void *)p);
+        abort();
+    }
+    if (h->magic != ZAN_MEM_MAGIC) return -1;   /* not a block start: ignore */
+    uint32_t c = h->cls;
+    if (c >= (uint32_t)ZAN_MEM_NCLASS) {   /* header garbage: refuse to trust it */
+        fprintf(stderr, "zan runtime: corrupt block header at %p (class %u)\n",
+                (void *)p, (unsigned)c);
+        abort();
+    }
+    *cls = c;
+    return 0;
+}
+
 void __wrap_free(void *p) {
     if (!p) return;
     if (!zan_mem_owns(p)) { __real_free(p); return; }
+    uint32_t cls;
+    if (zan_mem_hdr_check(p, &cls) != 0) return;
     zan_mem_hdr_t *h = (zan_mem_hdr_t *)((char *)p - ZAN_MEM_HDR);
-    if (h->magic != ZAN_MEM_MAGIC) return;   /* not a block start: ignore */
-    uint32_t cls = h->cls;
+    h->magic = ZAN_MEM_FREED;
     *(void **)p = t_free_list[cls];
     t_free_list[cls] = p;
 }
@@ -225,8 +289,12 @@ void *__wrap_realloc(void *p, size_t n) {
      * nothing but also pretend the block still exists. */
     if (n == 0) { __wrap_free(p); return NULL; }
     if (!zan_mem_owns(p)) return __real_realloc(p, n);
-    zan_mem_hdr_t *h = (zan_mem_hdr_t *)((char *)p - ZAN_MEM_HDR);
-    size_t old = k_class_size[h->cls];
+    /* Same header checks as free: reallocating a block that is on a free
+     * list (use-after-free) or whose header is garbage must abort, not hand
+     * the caller a block that some other owner may already hold. */
+    uint32_t cls;
+    if (zan_mem_hdr_check(p, &cls) != 0) return p;   /* not a block start: leave it alone */
+    size_t old = k_class_size[cls];
     if (n <= old) return p;
     void *np = __wrap_malloc(n);
     if (!np) return NULL;

@@ -18,6 +18,13 @@
  * to resume when its completion is dequeued.
  */
 
+/* glibc gates poll()/pollfd behind _DEFAULT_SOURCE; musl (the bundled
+ * sysroots) does not, so this only bites native glibc builds (rt_test).
+ * Define it before any header so the feature tests see it. */
+#if !defined(_WIN32) && defined(__GLIBC__)
+#define _DEFAULT_SOURCE
+#endif
+
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0601   /* Windows 7+: GetQueuedCompletionStatusEx */
 #endif
@@ -52,16 +59,20 @@ static int zan_io_trace(void){static int t=-1;if(t<0){const char*e=getenv("ZAN_I
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <errno.h>
 #include <limits.h>
 #include <time.h>
 #endif
 #if defined(__linux__)
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <poll.h>             /* zan_io_wait_readable_timeout (fiber half) */
 #include <fcntl.h>
 #include <unistd.h>
 #elif defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/event.h>
+#include <poll.h>             /* zan_io_wait_readable_timeout (fiber half) */
 #include <fcntl.h>
 #include <unistd.h>
 #elif defined(_WIN32)
@@ -75,12 +86,6 @@ static int zan_io_trace(void){static int t=-1;if(t<0){const char*e=getenv("ZAN_I
 #include <sys/select.h>
 #include <fcntl.h>
 #include <unistd.h>
-#endif
-#ifdef ZAN_CO_DRIVER
-#include <stdlib.h>
-#ifndef _WIN32
-#include <poll.h>
-#endif
 #endif
 #ifndef ZAN_IO_STACKLESS_ONLY
 #include "rt_sched.h"
@@ -100,6 +105,26 @@ static int g_io_count;
 /* Whether the backend has been initialized. Generated async programs never
  * call zan_io_init explicitly, so zan_io_wait_co lazy-inits on first use. */
 static int g_io_started;
+
+/* ---- async hostname resolution (shared by all backends) ----
+ * zan_io_resolve_co runs the lookup on a worker thread so the reactor never
+ * blocks on the resolver. The worker parks the result in g_dns_done and pokes
+ * the backend's wake fd (eventfd/pipe on POSIX, a NULL-overlapped IOCP packet
+ * on Windows); the next zan_io_poll drains the list, stores each result into
+ * its frame's RESULT slot and re-readies the frame. g_dns_inflight counts
+ * lookups whose completion has not yet been delivered, so the scheduler keeps
+ * polling while one is outstanding (zan_io_has_pending). The machinery itself
+ * lives in the coroutine-facing ABI section at the bottom; these are the
+ * pieces the platform backends must see. */
+static int32_t g_dns_inflight;
+static int32_t g_dns_wake_fd = -1;    /* reactor-visible wake fd (POSIX) */
+#if !defined(__linux__) && !defined(_WIN32)
+static int32_t g_dns_wake_wfd = -1;   /* pipe write end (kqueue/select) */
+#endif
+
+static int dns_drain(void);           /* deliver completed lookups (reactor) */
+static void dns_wake_read(void);      /* consume the wake fd signal (POSIX) */
+static void dns_wake_notify(void);    /* worker -> reactor wake (all backends) */
 
 /* Re-schedule a stackless frame after `ms` milliseconds. Provided by the
  * coroutine driver (emitted inline by the compiler, or by the multi-worker
@@ -427,23 +452,16 @@ int32_t zan_io_connect_status(intptr_t fd) {
     return -2;
 }
 
-/* ---- platform backend ---- */
-
-#if defined(__linux__)
-/* ==================== EPOLL ====================
- *
- * Watchers live in an fd-indexed slot table, not a linked list: registering
- * and waking are O(1) with no per-await malloc, and a fd stays a member of
- * the epoll set for its whole life. Readiness is armed with EPOLLONESHOT and
- * re-armed with EPOLL_CTL_MOD, so an await costs one epoll_ctl instead of the
- * ADD + DEL pair (and none of the list walking) the previous version needed.
+/* ---- fd-indexed watcher slots (POSIX readiness backends) ----
+ * Shared by the epoll and kqueue backends: a watcher maps a fd to the
+ * waiting coroutine, and both registering and waking are O(1) with no
+ * per-await malloc. One waiter per direction lives inline in the slot
+ * (the common case: one coroutine reading and/or writing a socket); the
+ * rare extra waiter on the same fd+direction chains through `next`. The
+ * select backend stays on the linked list (FD_SETSIZE keeps it small).
  */
+#if !defined(_WIN32)
 
-static int g_epoll_fd = -1;
-
-/* One waiter per direction is stored inline in the slot (the common case:
- * one coroutine reading and/or writing a socket). The rare extra waiter on
- * the same fd+direction chains through `next`. */
 typedef struct zan_io_waiter {
     void *co;
     zan_co_step_t step;
@@ -465,34 +483,9 @@ typedef struct {
 static zan_io_slot_t *g_slots;
 static int g_slots_cap;
 
-void zan_io_init(void) {
-    if (g_io_started) return;
-    g_io_entries = NULL;
-    g_io_count = 0;
-    g_epoll_fd = epoll_create1(0);
-    g_io_started = 1;
-}
 
-void zan_io_shutdown(void) {
-    if (g_slots) {
-        for (int fd = 0; fd < g_slots_cap; fd++) {
-            zan_io_slot_t *s = &g_slots[fd];
-            if (s->in_epoll) epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-            zan_io_waiter_t *x = s->r.next;
-            while (x) { zan_io_waiter_t *n = x->next; free(x); x = n; }
-            x = s->w.next;
-            while (x) { zan_io_waiter_t *n = x->next; free(x); x = n; }
-        }
-        free(g_slots);
-        g_slots = NULL;
-        g_slots_cap = 0;
-    }
-    g_io_entries = NULL;
-    g_io_count = 0;
-    io_dead_clear();
-    if (g_epoll_fd >= 0) { close(g_epoll_fd); g_epoll_fd = -1; }
-    g_io_started = 0;
-}
+
+
 
 int32_t zan_io_set_nonblocking(intptr_t fd) {
     int flags = fcntl((int)fd, F_GETFL, 0);
@@ -517,73 +510,9 @@ static zan_io_slot_t *io_slot(int fd) {
 /* (Re-)arm `fd` for the directions that still have waiters. EPOLLONESHOT keeps
  * the fd registered but disabled after each wake, so re-arming is a MOD; the
  * ADD/ENOENT fallbacks cover a first registration and a recycled fd number. */
-static void io_arm(int fd, zan_io_slot_t *s) {
-    struct epoll_event ev;
-    memset(&ev, 0, sizeof(ev));
-    ev.data.fd = fd;
-    ev.events = EPOLLONESHOT;
-    if (s->has_r) ev.events |= EPOLLIN;
-    if (s->has_w) ev.events |= EPOLLOUT;
-    if (!s->in_epoll) {
-        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev) == 0) {
-            s->in_epoll = 1;
-        } else if (errno == EEXIST) {
-            epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, fd, &ev);
-            s->in_epoll = 1;
-        }
-        return;
-    }
-    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, fd, &ev) != 0 && errno == ENOENT) {
-        /* fd was closed and its number reused: re-add it. */
-        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev) != 0) s->in_epoll = 0;
-    }
-}
 
-static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
-    if (io_reject_dead_fd(fd, co, step)) return;
-    zan_io_slot_t *s = io_slot((int)fd);
-    if (!s) {   /* slot table could not grow: fail rather than drop the waiter */
-        io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);
-        g_pending_rbuf = NULL;
-        g_pending_out_n = NULL;
-        g_pending_accept_out = NULL;
-        return;
-    }
-    zan_io_waiter_t *w;
-    unsigned char *has = (interest == ZAN_IO_READ) ? &s->has_r : &s->has_w;
-    zan_io_waiter_t *inl = (interest == ZAN_IO_READ) ? &s->r : &s->w;
-    if (!*has) {
-        w = inl;
-        w->next = NULL;
-        *has = 1;
-    } else {
-        /* second waiter on the same fd+direction: chain it (rare) */
-        w = (zan_io_waiter_t *)calloc(1, sizeof(*w));
-        if (!w) {   /* same as a slot table that cannot grow: fail the waiter
-                     * rather than park a coroutine nothing will ever resume */
-            io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);
-            g_pending_rbuf = NULL;
-            g_pending_out_n = NULL;
-            g_pending_accept_out = NULL;
-            return;
-        }
-        zan_io_waiter_t *tail = inl;
-        while (tail->next) tail = tail->next;
-        tail->next = w;
-    }
-    w->co = co;
-    w->step = step;
-    w->rbuf = g_pending_rbuf;
-    w->rlen = g_pending_rlen;
-    w->out_n = g_pending_out_n;
-    w->out_accept = g_pending_accept_out;
-    g_pending_rbuf = NULL;
-    g_pending_out_n = NULL;
-    g_pending_accept_out = NULL;
-    g_io_count++;
 
-    io_arm(fd, s);
-}
+
 
 /* Perform the pending recv/accept for a woken waiter (see io_deliver_recv). */
 static void io_deliver_waiter(int fd, zan_io_waiter_t *w) {
@@ -648,24 +577,155 @@ static int io_sweep_slots(void) {
     }
     return woke;
 }
+#endif /* !_WIN32 */
+
+/* ---- platform backend ---- */
+
+#if defined(__linux__)
+/* ==================== EPOLL ====================
+ *
+ * Watchers live in an fd-indexed slot table, not a linked list: registering
+ * and waking are O(1) with no per-await malloc, and a fd stays a member of
+ * the epoll set for its whole life. Readiness is armed with EPOLLONESHOT and
+ * re-armed with EPOLL_CTL_MOD, so an await costs one epoll_ctl instead of the
+ * ADD + DEL pair (and none of the list walking) the previous version needed.
+ */
+
+static int g_epoll_fd = -1;void zan_io_init(void) {
+    if (g_io_started) return;
+    g_io_entries = NULL;
+    g_io_count = 0;
+    g_epoll_fd = epoll_create1(0);
+    /* Wake fd for async-DNS completions: a persistent (non-ONESHOT) EPOLLIN
+     * member of the set, so a worker thread's eventfd write wakes zan_io_poll
+     * even when no socket watcher is ready. */
+    g_dns_wake_fd = eventfd(0, EFD_NONBLOCK);
+    if (g_dns_wake_fd >= 0 && g_epoll_fd >= 0) {
+        struct epoll_event ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.events = EPOLLIN;
+        ev.data.fd = g_dns_wake_fd;
+        epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_dns_wake_fd, &ev);
+    }
+    g_io_started = 1;
+}void zan_io_shutdown(void) {
+    if (g_slots) {
+        for (int fd = 0; fd < g_slots_cap; fd++) {
+            zan_io_slot_t *s = &g_slots[fd];
+            if (s->in_epoll) epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+            zan_io_waiter_t *x = s->r.next;
+            while (x) { zan_io_waiter_t *n = x->next; free(x); x = n; }
+            x = s->w.next;
+            while (x) { zan_io_waiter_t *n = x->next; free(x); x = n; }
+        }
+        free(g_slots);
+        g_slots = NULL;
+        g_slots_cap = 0;
+    }
+    g_io_entries = NULL;
+    g_io_count = 0;
+    io_dead_clear();
+    if (g_epoll_fd >= 0) { close(g_epoll_fd); g_epoll_fd = -1; }
+    if (g_dns_wake_fd >= 0) { close(g_dns_wake_fd); g_dns_wake_fd = -1; }
+    g_io_started = 0;
+}static void io_arm(int fd, zan_io_slot_t *s) {
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.data.fd = fd;
+    ev.events = EPOLLONESHOT;
+    if (s->has_r) ev.events |= EPOLLIN;
+    if (s->has_w) ev.events |= EPOLLOUT;
+    if (!s->in_epoll) {
+        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev) == 0) {
+            s->in_epoll = 1;
+        } else if (errno == EEXIST) {
+            epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+            s->in_epoll = 1;
+        }
+        return;
+    }
+    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, fd, &ev) != 0 && errno == ENOENT) {
+        /* fd was closed and its number reused: re-add it. */
+        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev) != 0) s->in_epoll = 0;
+    }
+}static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
+    if (io_reject_dead_fd(fd, co, step)) return;
+    zan_io_slot_t *s = io_slot((int)fd);
+    if (!s) {   /* slot table could not grow: fail rather than drop the waiter */
+        io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);
+        g_pending_rbuf = NULL;
+        g_pending_out_n = NULL;
+        g_pending_accept_out = NULL;
+        return;
+    }
+    zan_io_waiter_t *w;
+    unsigned char *has = (interest == ZAN_IO_READ) ? &s->has_r : &s->has_w;
+    zan_io_waiter_t *inl = (interest == ZAN_IO_READ) ? &s->r : &s->w;
+    if (!*has) {
+        w = inl;
+        w->next = NULL;
+        *has = 1;
+    } else {
+        /* second waiter on the same fd+direction: chain it (rare) */
+        w = (zan_io_waiter_t *)calloc(1, sizeof(*w));
+        if (!w) {   /* same as a slot table that cannot grow: fail the waiter
+                     * rather than park a coroutine nothing will ever resume */
+            io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);
+            g_pending_rbuf = NULL;
+            g_pending_out_n = NULL;
+            g_pending_accept_out = NULL;
+            return;
+        }
+        zan_io_waiter_t *tail = inl;
+        while (tail->next) tail = tail->next;
+        tail->next = w;
+    }
+    w->co = co;
+    w->step = step;
+    w->rbuf = g_pending_rbuf;
+    w->rlen = g_pending_rlen;
+    w->out_n = g_pending_out_n;
+    w->out_accept = g_pending_accept_out;
+    g_pending_rbuf = NULL;
+    g_pending_out_n = NULL;
+    g_pending_accept_out = NULL;
+    g_io_count++;
+
+    io_arm(fd, s);
+}
+
+/* One waiter per direction is stored inline in the slot (the common case:
+ * one coroutine reading and/or writing a socket). The rare extra waiter on
+ * the same fd+direction chains through `next`. */
+
 
 int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_dead) return io_flush_dead();
-    if (g_io_count == 0) return 0;
+    if (g_io_count == 0 && g_dns_inflight == 0) return 0;
     /* An unbounded wait is the one that turns a stranded waiter into a hang,
      * so check for dead fds before committing to it. */
     if (timeout_ms < 0) {
         int woke = io_sweep_slots();
         if (woke) return woke;
-        if (g_io_count == 0) return 0;
+        if (g_io_count == 0 && g_dns_inflight == 0) return 0;
     }
     struct epoll_event events[256];
     int n = epoll_wait(g_epoll_fd, events, 256,
                        timeout_ms < 0 ? -1 : (int)timeout_ms);
-    if (n == 0) return io_sweep_slots();
+    if (n == 0) {
+        int w2 = dns_drain();
+        if (w2) return w2;
+        return io_sweep_slots();
+    }
     int woke = 0;
     for (int i = 0; i < n; i++) {
         int fd = events[i].data.fd;
+        if (fd == g_dns_wake_fd) {
+            /* Async-DNS completion: deliver every finished lookup. */
+            dns_wake_read();
+            woke += dns_drain();
+            continue;
+        }
         if (fd < 0 || fd >= g_slots_cap) continue;
         zan_io_slot_t *s = &g_slots[fd];
         uint32_t ev = events[i].events;
@@ -700,20 +760,41 @@ void zan_io_init(void) {
     g_io_entries = NULL;
     g_io_count = 0;
     g_kq_fd = kqueue();
+    /* Async-DNS wake pipe: the read end joins the kqueue with a persistent
+     * (non-ONESHOT) EVFILT_READ, so a worker thread's write wakes zan_io_poll
+     * even when no socket watcher is ready. */
+    if (g_kq_fd >= 0 && g_dns_wake_fd < 0) {
+        int pfd[2];
+        if (pipe(pfd) == 0) {
+            g_dns_wake_fd = pfd[0];
+            g_dns_wake_wfd = pfd[1];
+            fcntl(pfd[0], F_SETFL, O_NONBLOCK);
+            struct kevent kev;
+            EV_SET(&kev, (uintptr_t)pfd[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
+            kevent(g_kq_fd, &kev, 1, NULL, 0, NULL);
+        }
+    }
     g_io_started = 1;
 }
 
 void zan_io_shutdown(void) {
-    zan_io_entry_t *e = g_io_entries;
-    while (e) {
-        zan_io_entry_t *n = e->next;
-        free(e);
-        e = n;
+    if (g_slots) {
+        for (int fd = 0; fd < g_slots_cap; fd++) {
+            zan_io_slot_t *s = &g_slots[fd];
+            zan_io_waiter_t *x = s->r.next;
+            while (x) { zan_io_waiter_t *n = x->next; free(x); x = n; }
+            x = s->w.next;
+            while (x) { zan_io_waiter_t *n = x->next; free(x); x = n; }
+        }
+        free(g_slots);
+        g_slots = NULL;
+        g_slots_cap = 0;
     }
-    g_io_entries = NULL;
     g_io_count = 0;
     io_dead_clear();
     if (g_kq_fd >= 0) { close(g_kq_fd); g_kq_fd = -1; }
+    if (g_dns_wake_fd >= 0) { close(g_dns_wake_fd); g_dns_wake_fd = -1; }
+    if (g_dns_wake_wfd >= 0) { close(g_dns_wake_wfd); g_dns_wake_wfd = -1; }
     g_io_started = 0;
 }
 
@@ -725,23 +806,49 @@ int32_t zan_io_set_nonblocking(intptr_t fd) {
 
 static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
     if (io_reject_dead_fd(fd, co, step)) return;
-    zan_io_entry_t *e = (zan_io_entry_t *)calloc(1, sizeof(*e));
-    if (!e) { io_reject_dead_fd(-1, co, step); return; }
-    e->fd = (int)fd;
-    e->interest = interest;
-    e->co = co;
-    e->step = step;
-    e->rbuf = g_pending_rbuf;
-    e->rlen = g_pending_rlen;
-    e->out_n = g_pending_out_n;
-    e->out_accept = g_pending_accept_out;
+    zan_io_slot_t *s = io_slot((int)fd);
+    if (!s) {   /* slot table could not grow: fail rather than drop the waiter */
+        io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);
+        g_pending_rbuf = NULL;
+        g_pending_out_n = NULL;
+        g_pending_accept_out = NULL;
+        return;
+    }
+    zan_io_waiter_t *w;
+    unsigned char *has = (interest == ZAN_IO_READ) ? &s->has_r : &s->has_w;
+    zan_io_waiter_t *inl = (interest == ZAN_IO_READ) ? &s->r : &s->w;
+    if (!*has) {
+        w = inl;
+        w->next = NULL;
+        *has = 1;
+    } else {
+        /* second waiter on the same fd+direction: chain it (rare) */
+        w = (zan_io_waiter_t *)calloc(1, sizeof(*w));
+        if (!w) {   /* same as a slot table that cannot grow: fail the waiter
+                     * rather than park a coroutine nothing will ever resume */
+            io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);
+            g_pending_rbuf = NULL;
+            g_pending_out_n = NULL;
+            g_pending_accept_out = NULL;
+            return;
+        }
+        zan_io_waiter_t *tail = inl;
+        while (tail->next) tail = tail->next;
+        tail->next = w;
+    }
+    w->co = co;
+    w->step = step;
+    w->rbuf = g_pending_rbuf;
+    w->rlen = g_pending_rlen;
+    w->out_n = g_pending_out_n;
+    w->out_accept = g_pending_accept_out;
     g_pending_rbuf = NULL;
     g_pending_out_n = NULL;
     g_pending_accept_out = NULL;
-    e->next = g_io_entries;
-    g_io_entries = e;
     g_io_count++;
 
+    /* EV_ONESHOT arms the fd for one event; the next io_register issues a
+     * fresh EV_ADD, so there is no per-event re-arm bookkeeping. */
     struct kevent kev;
     short filter = (interest == ZAN_IO_READ) ? EVFILT_READ : EVFILT_WRITE;
     EV_SET(&kev, fd, filter, EV_ADD | EV_ONESHOT, 0, 0, NULL);
@@ -750,35 +857,45 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
 
 int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_dead) return io_flush_dead();
-    if (g_io_count == 0) return 0;
+    if (g_io_count == 0 && g_dns_inflight == 0) return 0;
+    /* An unbounded wait is the one that turns a stranded waiter into a hang,
+     * so check for dead fds before committing to it. */
     if (timeout_ms < 0) {
-        int woke = io_sweep_entries(INT_MAX);
+        int woke = io_sweep_slots();
         if (woke) return woke;
-        if (g_io_count == 0) return 0;
+        if (g_io_count == 0 && g_dns_inflight == 0) return 0;
     }
     struct kevent events[64];
     struct timespec ts = { timeout_ms / 1000, (timeout_ms % 1000) * 1000000L };
     int n = kevent(g_kq_fd, NULL, 0, events, 64,
                    timeout_ms < 0 ? NULL : &ts);
-    if (n == 0) return io_sweep_entries(INT_MAX);
+    if (n == 0) {
+        int w2 = dns_drain();
+        if (w2) return w2;
+        return io_sweep_slots();
+    }
     int woke = 0;
     for (int i = 0; i < n; i++) {
         int fd = (int)events[i].ident;
-        zan_io_entry_t **pp = &g_io_entries;
-        while (*pp) {
-            if ((*pp)->fd == fd) {
-                zan_io_entry_t *e = *pp;
-                void *co = e->co;
-                zan_co_step_t step = e->step;
-                *pp = e->next;
-                io_deliver_recv(e);
-                free(e);
-                g_io_count--;
-                io_wake(co, step);
-                woke++;
-                break;
-            }
-            pp = &(*pp)->next;
+        if (fd == g_dns_wake_fd) {
+            /* Async-DNS completion: deliver every finished lookup. */
+            dns_wake_read();
+            woke += dns_drain();
+            continue;
+        }
+        if (fd < 0 || fd >= g_slots_cap) continue;
+        zan_io_slot_t *s = &g_slots[fd];
+        zan_io_waiter_t ready[8];
+        int nr = 0;
+        if (events[i].filter == EVFILT_READ)
+            nr += io_take(s, fd, 1, ready + nr, 8 - nr);
+        if (events[i].filter == EVFILT_WRITE)
+            nr += io_take(s, fd, 0, ready + nr, 8 - nr);
+        for (int k = 0; k < nr; k++) {
+            io_deliver_waiter(fd, &ready[k]);
+            g_io_count--;
+            io_wake(ready[k].co, ready[k].step);
+            woke++;
         }
     }
     return woke;
@@ -1202,17 +1319,23 @@ static void io_complete_op(zan_io_op_t *op, DWORD transferred,
 }
 
 int32_t zan_io_poll(int64_t timeout_ms) {
-    if (g_io_count == 0) return 0;
+    if (g_io_count == 0 && g_dns_inflight == 0) return 0;
     OVERLAPPED_ENTRY entries[64];
     ULONG removed = 0;
     DWORD to = (timeout_ms < 0) ? INFINITE : (DWORD)timeout_ms;
     if (!GetQueuedCompletionStatusEx(g_iocp, entries, 64, &removed, to, FALSE)) {
         IOTRACE("poll GQCS=0 err=%lu to=%lu cnt=%d", (unsigned long)GetLastError(), (unsigned long)to, g_io_count);
-        return 0;
+        return dns_drain();
     }
     IOTRACE("poll removed=%lu cnt=%d", (unsigned long)removed, g_io_count);
     int woke = 0;
     for (ULONG i = 0; i < removed; i++) {
+        if (!entries[i].lpOverlapped) {
+            /* Async-DNS completion: a NULL-overlapped packet posted by a DNS
+             * worker thread; deliver every finished lookup. */
+            woke += dns_drain();
+            continue;
+        }
         zan_io_op_t *op = CONTAINING_RECORD(entries[i].lpOverlapped,
                                             zan_io_op_t, ov);
         void *co = op->co;
@@ -1235,6 +1358,16 @@ void zan_io_init(void) {
     if (g_io_started) return;
     g_io_entries = NULL;
     g_io_count = 0;
+    /* Async-DNS wake pipe: the read end joins the select set in zan_io_poll,
+     * so a worker thread's write wakes it even when no socket is ready. */
+    if (g_dns_wake_fd < 0) {
+        int pfd[2];
+        if (pipe(pfd) == 0) {
+            g_dns_wake_fd = pfd[0];
+            g_dns_wake_wfd = pfd[1];
+            fcntl(pfd[0], F_SETFL, O_NONBLOCK);
+        }
+    }
     g_io_started = 1;
 }
 
@@ -1248,6 +1381,8 @@ void zan_io_shutdown(void) {
     g_io_entries = NULL;
     g_io_count = 0;
     io_dead_clear();
+    if (g_dns_wake_fd >= 0) { close(g_dns_wake_fd); g_dns_wake_fd = -1; }
+    if (g_dns_wake_wfd >= 0) { close(g_dns_wake_wfd); g_dns_wake_wfd = -1; }
     g_io_started = 0;
 }
 
@@ -1282,7 +1417,7 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
 
 int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_dead) return io_flush_dead();
-    if (g_io_count == 0) return 0;
+    if (g_io_count == 0 && g_dns_inflight == 0) return 0;
 
     /* Every fd goes into an fd_set below, so a watcher whose socket has been
      * closed under it must leave the list first: FD_SET of a negative or
@@ -1292,13 +1427,19 @@ int32_t zan_io_poll(int64_t timeout_ms) {
     {
         int woke = io_sweep_entries(FD_SETSIZE);
         if (woke) return woke;
-        if (g_io_count == 0) return 0;
+        if (g_io_count == 0 && g_dns_inflight == 0) return 0;
     }
 
     fd_set read_fds, write_fds;
     FD_ZERO(&read_fds);
     FD_ZERO(&write_fds);
     int max_fd = 0;
+
+    /* The async-DNS wake pipe read end joins the read set (persistent). */
+    if (g_dns_wake_fd >= 0) {
+        FD_SET(g_dns_wake_fd, &read_fds);
+        max_fd = g_dns_wake_fd;
+    }
 
     zan_io_entry_t *e = g_io_entries;
     while (e) {
@@ -1314,9 +1455,13 @@ int32_t zan_io_poll(int64_t timeout_ms) {
 
     int n = select(max_fd + 1, &read_fds, &write_fds, NULL,
                    timeout_ms < 0 ? NULL : &tv);
-    if (n <= 0) return 0;
+    if (n <= 0) return dns_drain();
 
     int woke = 0;
+    if (g_dns_wake_fd >= 0 && FD_ISSET(g_dns_wake_fd, &read_fds)) {
+        dns_wake_read();
+        woke += dns_drain();
+    }
     zan_io_entry_t **pp = &g_io_entries;
     while (*pp) {
         zan_io_entry_t *cur = *pp;
@@ -1342,6 +1487,152 @@ int32_t zan_io_poll(int64_t timeout_ms) {
 }
 
 #endif /* platform */
+
+/* ================= ASYNC HOSTNAME RESOLUTION ================= */
+
+typedef struct zan_dns_job {
+    struct zan_dns_job *next;
+    int32_t  result;        /* resolved IPv4 (network byte order), 0 on failure */
+    void    *frame;         /* stackless frame, or stackful fiber handle */
+    zan_co_step_t step;     /* resume fn (NULL => stackful fiber) */
+    int32_t *out;           /* result sink (&frame->result) */
+} zan_dns_job_t;
+
+typedef struct zan_dns_work {
+    zan_dns_job_t job;
+    char hostname[256];     /* NUL-terminated copy for the worker thread */
+} zan_dns_work_t;
+
+static zan_dns_job_t *g_dns_done;    /* completed, waiting for the reactor */
+
+#if defined(_WIN32)
+static SRWLOCK g_dns_srw = SRWLOCK_INIT;
+static void dns_lock(void) { AcquireSRWLockExclusive(&g_dns_srw); }
+static void dns_unlock(void) { ReleaseSRWLockExclusive(&g_dns_srw); }
+#else
+static pthread_mutex_t g_dns_mx = PTHREAD_MUTEX_INITIALIZER;
+static void dns_lock(void) { pthread_mutex_lock(&g_dns_mx); }
+static void dns_unlock(void) { pthread_mutex_unlock(&g_dns_mx); }
+#endif
+
+/* Worker thread: resolve the hostname (never on the reactor), park the result,
+ * then wake the reactor through its backend wake fd. */
+#if defined(_WIN32)
+static DWORD WINAPI dns_worker(void *arg) {
+#else
+static void *dns_worker(void *arg) {
+#endif
+    zan_dns_work_t *w = (zan_dns_work_t *)arg;
+    w->job.result = zan_io_resolve_ipv4(w->hostname);
+    dns_lock();
+    w->job.next = g_dns_done;
+    g_dns_done = &w->job;
+    dns_unlock();
+    dns_wake_notify();
+#if defined(_WIN32)
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static void dns_wake_notify(void) {
+#if defined(_WIN32)
+    /* NULL overlapped marks a DNS completion packet in zan_io_poll. */
+    PostQueuedCompletionStatus(g_iocp, 0, (ULONG_PTR)-2, NULL);
+#elif defined(__linux__)
+    uint64_t one = 1;
+    ssize_t r = write(g_dns_wake_fd, &one, sizeof(one));
+    (void)r;
+#else
+    char c = 1;
+    ssize_t r = write(g_dns_wake_fd, &c, 1);
+    (void)r;
+#endif
+}
+
+static void dns_wake_read(void) {
+#if defined(__linux__)
+    uint64_t v;
+    ssize_t r = read(g_dns_wake_fd, &v, sizeof(v));
+    (void)r;
+#elif !defined(_WIN32)
+    char c[64];
+    while (read(g_dns_wake_fd, c, sizeof(c)) > 0) {}
+#endif
+}
+
+/* Deliver every completed lookup to its waiting frame (reactor thread). */
+static int dns_drain(void) {
+    int cnt = 0, woke = 0;
+    zan_dns_job_t *j;
+    dns_lock();
+    j = g_dns_done;
+    g_dns_done = NULL;
+    for (zan_dns_job_t *x = j; x; x = x->next) cnt++;
+    g_dns_inflight -= cnt;
+    dns_unlock();
+    while (j) {
+        zan_dns_job_t *n = j->next;
+        if (j->out) *j->out = j->result;
+        io_wake(j->frame, j->step);
+        free(j);
+        woke++;
+        j = n;
+    }
+    return woke;
+}
+
+void zan_io_resolve_co(const char *hostname, void *frame, zan_co_step_t step,
+                       int32_t *out) {
+    if (!hostname || !*hostname) {
+        /* Empty name cannot resolve: fail immediately, same value the worker
+         * would have produced, so the caller never parks on a thread. */
+        if (out) *out = 0;
+        io_wake(frame, step);
+        return;
+    }
+    zan_io_init();     /* ensure the wake fd / IOCP exists before spawning */
+    zan_dns_work_t *w = (zan_dns_work_t *)calloc(1, sizeof(*w));
+    if (!w) {
+        if (out) *out = 0;
+        io_wake(frame, step);
+        return;
+    }
+    strncpy(w->hostname, hostname, sizeof(w->hostname) - 1);
+    w->hostname[sizeof(w->hostname) - 1] = 0;
+    w->job.frame = frame;
+    w->job.step = step;
+    w->job.out = out;
+    dns_lock();
+    g_dns_inflight++;
+    dns_unlock();
+#if defined(_WIN32)
+    HANDLE h = CreateThread(NULL, 0, dns_worker, w, 0, NULL);
+    if (!h) {
+        dns_lock();
+        g_dns_inflight--;
+        dns_unlock();
+        if (out) *out = 0;
+        io_wake(frame, step);
+        free(w);
+        return;
+    }
+    CloseHandle(h);     /* the thread keeps running detached */
+#else
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, dns_worker, w) != 0) {
+        dns_lock();
+        g_dns_inflight--;
+        dns_unlock();
+        if (out) *out = 0;
+        io_wake(frame, step);
+        free(w);
+        return;
+    }
+    pthread_detach(tid);
+#endif
+}
 
 /* ================= coroutine-facing ABI ================= */
 
@@ -1398,7 +1689,9 @@ int32_t zan_io_has_pending(void) {
 #if !defined(_WIN32)
     if (g_io_dead_count > 0) return 1;   /* stranded watchers still owe a wake */
 #endif
-    return g_io_count > 0;
+    /* An outstanding DNS lookup (or one parked waiting for the reactor) also
+     * owes a wake, so the scheduler must keep polling instead of sleeping. */
+    return (g_io_count > 0) || (g_dns_inflight > 0);
 }
 
 #ifndef ZAN_IO_STACKLESS_ONLY

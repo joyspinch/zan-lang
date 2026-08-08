@@ -64,6 +64,12 @@ static long long g_round;
 static unsigned long long g_sequence;
 static int g_initialized;
 static void (*g_ready_hook)(void *frame, zan_timer_step_t step);
+/* Entry whose callback is currently running (dispatch popped it from the heap
+ * and is executing it outside the lock). zan_timer_clear must reach it too:
+ * without this, a tick callback could not clear itself -- the entry is no
+ * longer in the heap, so the usual scan would miss it and the timer would
+ * reschedule forever. Read/written under the lock. */
+static zan_timer_entry *g_dispatching;
 
 long long zan_timer_now_ms(void) {
 #if defined(_WIN32)
@@ -128,23 +134,6 @@ static zan_timer_entry *heap_pop(void) {
     return root;
 }
 
-static void heap_rebuild(void) {
-    if (g_heap_len < 2) return;
-    for (size_t i = g_heap_len / 2; i-- > 0;) {
-        size_t index = i;
-        for (;;) {
-            size_t left = index * 2 + 1;
-            if (left >= g_heap_len) break;
-            size_t right = left + 1;
-            size_t smallest = right < g_heap_len && timer_less(g_heap[right], g_heap[left])
-                ? right : left;
-            if (!timer_less(g_heap[smallest], g_heap[index])) break;
-            heap_swap(index, smallest);
-            index = smallest;
-        }
-    }
-}
-
 void zan_timer_set_ready_hook(void (*ready)(void *frame, zan_timer_step_t step)) {
     timer_lock();
     g_ready_hook = ready;
@@ -167,12 +156,12 @@ void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step) {
     zan_timer_entry *entry = (zan_timer_entry *)calloc(1, sizeof(*entry));
     if (!entry) abort();
     entry->due_ms = zan_timer_now_ms() + (ms > 0 ? ms : 0);
-    entry->sequence = ++g_sequence;
     entry->kind = ZAN_TIMER_DELAY;
     entry->frame = frame;
     entry->step = step;
     timer_lock();
     g_initialized = 1;
+    entry->sequence = ++g_sequence;   /* shared counter: only touch under the lock */
     heap_push(entry);
     timer_unlock();
 }
@@ -181,6 +170,9 @@ static long long timer_add(long long ms, zan_timer_callback_t callback, int repe
     if (ms < 1 || !callback) return 0;
     zan_timer_entry *entry = (zan_timer_entry *)calloc(1, sizeof(*entry));
     if (!entry) abort();
+    /* Set the callback before publishing the entry: another thread dispatching
+     * due timers must never see a pushed entry with a NULL callback. */
+    entry->callback = callback;
     timer_lock();
     g_initialized = 1;
     entry->id = g_next_id++;
@@ -191,7 +183,6 @@ static long long timer_add(long long ms, zan_timer_callback_t callback, int repe
     entry->kind = ZAN_TIMER_PUBLIC;
     heap_push(entry);
     timer_unlock();
-    entry->callback = callback;
     return entry->id;
 }
 
@@ -230,11 +221,22 @@ size_t zan_timer_dispatch_due(void) {
             entry->exec_count++;
             entry->round = ++g_round;
         }
+        /* Publish the running entry under the lock so a clear() from inside
+         * the callback (or from another thread) can mark it removed. Save the
+         * previous entry: a callback that itself dispatches due timers would
+         * otherwise clobber the outer entry's window. */
+        zan_timer_entry *prev = g_dispatching;
+        g_dispatching = entry;
         timer_unlock();
 
         long long started = zan_timer_now_ms();
         if (entry->kind == ZAN_TIMER_DELAY) {
-            void (*ready)(void *, zan_timer_step_t) = g_ready_hook;
+            /* The hook is installed once at startup but set under the lock;
+             * read it under the same lock so a concurrent install is visible. */
+            void (*ready)(void *, zan_timer_step_t);
+            timer_lock();
+            ready = g_ready_hook;
+            timer_unlock();
             if (ready) ready(entry->frame, entry->step);
             else entry->step(entry->frame);
         } else entry->callback();
@@ -242,6 +244,7 @@ size_t zan_timer_dispatch_due(void) {
         dispatched++;
 
         timer_lock();
+        g_dispatching = prev;
         if (entry->kind == ZAN_TIMER_PUBLIC) entry->exec_msec = elapsed;
         if (entry->kind == ZAN_TIMER_PUBLIC && entry->interval > 0 && !entry->removed) {
             entry->due_ms = zan_timer_now_ms() + entry->interval;
@@ -275,6 +278,13 @@ int zan_timer_clear(long long id) {
             break;
         }
     }
+    /* The entry whose callback is running is not in the heap; clear it here so
+     * a tick callback can cancel itself (it would otherwise reschedule). */
+    if (!found && g_dispatching && g_dispatching->kind == ZAN_TIMER_PUBLIC &&
+        g_dispatching->id == id && !g_dispatching->removed) {
+        g_dispatching->removed = 1;
+        found = 1;
+    }
     timer_unlock();
     return found;
 }
@@ -288,6 +298,13 @@ long long zan_timer_clear_all(void) {
             entry->removed = 1;
             count++;
         }
+    }
+    /* Also cover the running entry: a clear_all from inside a callback (or
+     * from another thread) must stop the timer from rescheduling. */
+    if (g_dispatching && g_dispatching->kind == ZAN_TIMER_PUBLIC &&
+        !g_dispatching->removed) {
+        g_dispatching->removed = 1;
+        count++;
     }
     timer_unlock();
     return count;
@@ -336,9 +353,19 @@ long long zan_timer_list_at(long long index) {
 }
 
 void zan_timer_stats(long long *initialized, long long *num, long long *round) {
+    /* All three are written under the lock (dispatch bumps g_round/exec_count,
+     * add/reset write g_initialized), so take it once and count inline instead
+     * of calling zan_timer_list_count (which would re-lock). */
+    timer_lock();
     if (initialized) *initialized = g_initialized;
-    if (num) *num = zan_timer_list_count();
+    if (num) {
+        size_t count = 0;
+        for (size_t i = 0; i < g_heap_len; i++)
+            if (g_heap[i]->kind == ZAN_TIMER_PUBLIC && !g_heap[i]->removed) count++;
+        *num = (long long)count;
+    }
     if (round) *round = g_round;
+    timer_unlock();
 }
 
 long long swoole_timer_tick(long long interval, zan_timer_callback_t callback) { return zan_timer_tick(interval, callback); }

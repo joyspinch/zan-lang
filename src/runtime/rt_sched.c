@@ -16,12 +16,14 @@
 
 #include "rt_sched.h"
 #include "rt_io.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <sys/mman.h>      /* coroutine stack pool: mmap + PROT_NONE guard */
 #include <ucontext.h>
 #include <time.h>
 #include <unistd.h>
@@ -90,11 +92,53 @@ static void co_trampoline_posix(unsigned hi, unsigned lo);
 
 typedef struct { ucontext_t ctx; char *stack; } posix_fiber_t;
 
+/* Coroutine stacks come from a pool instead of a malloc/free per spawn: a
+ * server that spawns thousands of short coroutines otherwise pays a 128 KB
+ * allocation per coroutine. Each stack has a PROT_NONE guard page at its low
+ * end, so an overflow faults immediately instead of corrupting adjacent
+ * memory. The scheduler is single-threaded (M:1), so the pool needs no lock. */
+#define ZAN_CO_STACK_POOL_MAX 64
+
+static void *g_stack_pool;
+static int g_stack_pool_n;
+
+static char *plat_stack_alloc(void) {
+    if (g_stack_pool) {               /* reuse a retired stack */
+        char *s = (char *)g_stack_pool;
+        g_stack_pool = *(void **)s;
+        g_stack_pool_n--;
+        return s;
+    }
+    long page = sysconf(_SC_PAGESIZE);
+    size_t total = ZAN_CO_STACK + (size_t)page;
+    char *base = (char *)mmap(NULL, total, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) return NULL;
+    if (mprotect(base, (size_t)page, PROT_NONE) != 0) {
+        munmap(base, total);
+        return NULL;
+    }
+    return base + page;               /* usable region starts after the guard */
+}
+
+static void plat_stack_free(char *stack) {
+    if (g_stack_pool_n < ZAN_CO_STACK_POOL_MAX) {
+        *(void **)stack = g_stack_pool;
+        g_stack_pool = stack;
+        g_stack_pool_n++;
+        return;
+    }
+    long page = sysconf(_SC_PAGESIZE);
+    munmap((char *)stack - page, ZAN_CO_STACK + (size_t)page);
+}
+
 static void plat_sched_enter(void) { g_sched_fiber = &g_sched_ctx; }
 static void plat_sched_leave(void) {}
 static void *plat_fiber_new(zan_co_t *co) {
     posix_fiber_t *pf = (posix_fiber_t *)calloc(1, sizeof(*pf));
-    pf->stack = (char *)malloc(ZAN_CO_STACK);
+    if (!pf) abort();                 /* OOM: fail fast, like the rest of rt_* */
+    pf->stack = plat_stack_alloc();
+    if (!pf->stack) abort();          /* OOM: fail fast, like the rest of rt_* */
     getcontext(&pf->ctx);
     pf->ctx.uc_stack.ss_sp = pf->stack;
     pf->ctx.uc_stack.ss_size = ZAN_CO_STACK;
@@ -108,7 +152,7 @@ static void *plat_fiber_new(zan_co_t *co) {
 }
 static void plat_fiber_delete(void *f) {
     posix_fiber_t *pf = (posix_fiber_t *)f;
-    free(pf->stack);
+    plat_stack_free(pf->stack);
     free(pf);
 }
 static void plat_switch(void *to) {
@@ -161,6 +205,7 @@ static zan_co_t *ready_pop(void) {
 
 static zan_task_t *task_new(zan_co_t *owner) {
     zan_task_t *t = (zan_task_t *)calloc(1, sizeof(*t));
+    if (!t) abort();                  /* OOM: fail fast, like the rest of rt_* */
     t->co = owner;
     t->all_next = g_all_tasks;
     g_all_tasks = t;
@@ -177,10 +222,42 @@ static void complete_task(zan_task_t *t, int64_t result) {
     }
 }
 
+/* Detach and free a task the caller no longer references. Tasks stay alive
+ * after completion so zan_task_result remains readable for as long as the
+ * caller needs it; release is the call that declares "done". Safe to call
+ * from any coroutine after its await on the task returned, and idempotent:
+ * releasing an already-released (or never-tracked) pointer is a no-op. */
+void zan_task_release(zan_task_t *task) {
+    if (!task) return;
+    zan_task_t **pp = &g_all_tasks;
+    while (*pp && *pp != task) pp = &(*pp)->all_next;
+    if (!*pp) return;   /* already released: ignore */
+    if (!task->completed) {
+        /* Contract violation and a latent use-after-free: a delay timer still
+         * points at this task (timers_process would complete_task into freed
+         * memory), its coroutine may not have run out, or another coroutine
+         * is parked in await reading its result. There is no safe early
+         * release -- refuse loudly instead of corrupting the heap. */
+        fprintf(stderr, "zan runtime: task released before completion\n");
+        abort();
+    }
+    *pp = task->all_next;
+    free(task);
+}
+
+/* Number of task objects still tracked (live or completed but not released).
+ * Test/diagnostic hook: with every task released, this is 0 at shutdown. */
+size_t zan_task_live(void) {
+    size_t n = 0;
+    for (zan_task_t *t = g_all_tasks; t; t = t->all_next) n++;
+    return n;
+}
+
 /* ================= timers ================= */
 
 static void timer_add(zan_task_t *t, int64_t delay_ms) {
     zan_timer_t *tm = (zan_timer_t *)calloc(1, sizeof(*tm));
+    if (!tm) abort();                 /* OOM: fail fast, like the rest of rt_* */
     tm->due_ms = plat_now_ms() + (delay_ms < 0 ? 0 : delay_ms);
     tm->task = t;
     tm->next = g_timers;
@@ -229,10 +306,12 @@ static void co_trampoline_posix(unsigned hi, unsigned lo) {
 
 zan_task_t *zan_spawn(zan_co_body_t body, void *arg) {
     zan_co_t *co = (zan_co_t *)calloc(1, sizeof(*co));
+    if (!co) abort();                 /* OOM: fail fast, like the rest of rt_* */
     co->body = body;
     co->task = task_new(co);
     co->task->arg = arg;
     co->fiber = plat_fiber_new(co);
+    if (!co->fiber) abort();          /* OOM / fiber limits: fail fast */
     g_live++;
     ready_push(co);
     return co->task;
@@ -311,15 +390,18 @@ void zan_sched_run(void) {
         /* Poll IO events (non-blocking if we have ready coroutines) */
         zan_co_t *co = ready_pop();
         if (!co) {
-            /* Nothing ready -- poll IO with timeout */
-            int64_t poll_timeout = 1; /* 1ms default */
-            if (next_timer >= 0 && next_timer < poll_timeout)
-                poll_timeout = next_timer;
+            /* Nothing ready -- block until an IO event or the nearest timer
+             * instead of polling at a fixed 1 ms. -1 waits forever, which is
+             * safe: zan_io_poll sweeps watchers stranded on dead fds before
+             * committing to the wait, and returns immediately when no
+             * watchers are pending. */
+            int64_t poll_timeout = -1;
+            if (next_timer >= 0) poll_timeout = next_timer;
             if (zan_io_has_pending()) {
                 zan_io_poll(poll_timeout);
                 co = ready_pop();
             } else if (next_timer >= 0) {
-                plat_sleep(next_timer < 10 ? next_timer : 10);
+                plat_sleep(next_timer);
                 continue;
             } else {
                 break; /* no ready coroutines, no timers, no IO: done */

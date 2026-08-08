@@ -480,6 +480,51 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
     - `clipboard_roundtrip`/`win_tray_screen_smoke`：桌面环境测试，直跑 5/5 + 全档
       通过（偶发抖动，无代码缺陷）。
 
+* **B7-6 ✅（2026-08-08）rt_io/rt_sched 二轮复核：8 项清单全部落地**：
+  1. **timer 竞态**（`rt_timer.c`）：删 `heap_rebuild`；新增 `g_dispatching`——回调内
+     `zan_timer_clear`/`clear_all` 能取消正在 dispatch 的 entry（之前 tick 回调无法自取消）。
+  2. **double-free 检测**（`rt_mem.c`）：提取 `zan_mem_hdr_check`，`__wrap_free` 与
+     `__wrap_realloc` 共用（realloc 之前缺哨兵校验，UAF realloc 可能把自由链表上的块
+     返给调用方）；`zan_mem_small` 弹块时重置 magic/cls（修 free→复用→再 free 误报，
+     见 B7-4）。WSL 实测 `rt_mem_dblfree_test`（fork+SIGABRT+stderr 断言）通过。
+  3. **task 回收**（`rt_sched.c`）：`zan_task_release` 对未完成任务 abort（delay 定时器/
+     协程/等待者仍可能引用它）；契约写入 `rt_sched.h`。顺带发现**真 bug**：
+     `task_new`/`timer_add`/`zan_spawn`/`plat_fiber_new(pf)` 的 calloc/CreateFiber
+     结果未查 NULL → 全部补 abort（统一 OOM 策略，rt_co/rt_timer 已是 abort）。
+  4. **空闲轮询改事件驱动**（`rt_sched.c` `plat_sched_run`）：`-1` 无限等待 / 按最近
+     定时器限时，去掉固定 1ms busy-poll。**预存 bug**：`rt_io.c` 的 `poll.h` 被
+     `ZAN_CO_DRIVER` 门控但 `zan_io_wait_readable_timeout` 无条件编译 → 原生 glibc 构建
+     pollfd 未定义（musl 不门控所以 zig 交叉没暴露）；`_DEFAULT_SOURCE` 只在 glibc 下
+     定义。`rt_sync.c:738` 的 `__GLIBC_PREREQ` 在 musl（zig cc -Werror 默认开）下触发
+     -Wundef 报错 → 嵌套 #if 重写（musl 定义 `__GLIBC__` 但从不定义 glibc 特性宏）。
+  5. **协程栈池 + guard page**（`rt_sched.c` POSIX）：mmap + PROT_NONE 底端 guard，
+     池上限 64 个栈（`ZAN_CO_STACK_POOL_MAX`），`plat_stack_alloc/free` 复用；OOM abort。
+  6. **kqueue 链表 → fd 槽表**（`rt_io.c`）：epoll 的 slot-table 基础设施（
+     `zan_io_slot_t`/`io_slot`/`io_take`/`io_sweep_slots`）上提为共享 POSIX 部分，
+     kqueue 重写为同构（EV_ONESHOT，按 `ident` O(1) dispatch），select 保持链表
+     （FD_SETSIZE 限制下无必要）。kqueue 分支在 Linux 上被预处理排除，只经人工复核。
+  7. **异步 DNS**（`rt_io.c` + 编译器内置 + stdlib）：`zan_io_resolve_co(host, frame,
+     step, out)`——worker 线程跑 `gethostbyname`（复用 `zan_io_resolve_ipv4`，worker
+     不阻塞 reactor），完成后经后端唤醒：Linux eventfd（持久 EPOLLIN）/ macOS、select
+     pipe / Windows `PostQueuedCompletionStatus(NULL overlapped)`。`g_dns_inflight`
+     计入 `zan_io_has_pending`，调度器在解析未完成时继续 poll。编译器新增
+     `await Socket.ResolveAsync(hostname)` 内置（irgen 特判，结果写入 frame RESULT 槽，
+     与 RecvOv/AcceptOv 同构）。stdlib：`Socket.ResolveAsync` +
+     `BuildSockAddrResolved`（拆分出已解析地址版本）+ `AsyncResolveIp`，`ConnectAsync`
+     两个重载全部改为异步解析后连接（`TcpClient.ConnectAsync("localhost", …)` 不再阻塞
+     事件循环）。验证：Windows IOCP 直跑 + WSL linux-musl ELF（epoll）双端
+     `async_dns`/hostname 连接回显通过；新增 `tests/conformance/async_dns.zan`（async
+     结果 == 同步 ResolveIpv4，空名即时失败 0）；rt_test 17/17（glibc）；smoke 101/101；
+     standard 452/453。
+  8. **统一 OOM**：rt_co（`queue_grow`）、rt_timer（`heap_push`）、rt_sched（全部
+     calloc/CreateFiber/栈）分配失败一律 abort；rt_io 保持"失败该 waiter"语义
+     （`io_mark_dead`/dns 立即回 0）。
+  **预存失败（与本次无关，确认非本组改动所致）**：`conformance_struct_operators`——
+  用例在 HEAD 编译器下即编译不过（4 个 "cannot compare 'Point'" 类型错误，测试文件
+  未修改）；未提交的迁移编译器修好类型检查后暴露出新的 LLVM 验证错误（
+  `Point_op_add` 按值结构体返回签名不匹配）——处于迁移中的 checker/irgen 改动范围内，
+  未触碰。
+
 ---
 
 # C. 文档
@@ -1014,6 +1059,8 @@ stdlib 改动导致的 `'DbParams' has no member 'Create'` 这类编译错误，
 | A43-A8 | async 泛型方法返回垃圾值（打印 `-1886711216`） | 56 | ✅ 已修（A32-3b，见下 A43-A8 详情） |
 | A43-A9 | `static A()` 只在首次 `new` 时执行：先读 `A.n` 得 0，`new A()` 后才是 7（C# 首次访问静态成员即触发） | 08,40,95–99 | ✅ 已修（见下 A43-A9 详情） |
 | A43-A10 | `readonly` 只解析不强制：`public readonly int x;` 在类外 `a.x = 6;` 编译通过并改值 | 71,72,90–94 | ✅ 已修（见下 A43-A10 详情） |
+| A43-A12 | 重载运算符二元调用 LLVM 校验失败：`v + 5`/`v += 5` 把字面量实参当 i64 传给声明 i32 的形参；多个同名 op 重载时 `get_method_sym` 只取第一个（`w + 2.5` 误调 `op_add(V,int)`） | g43, e01, e02 | ✅ 已修（见下 A43-A12 详情） |
+| A43-A13 | 比较/关系操作符重载（`operator <`、`operator ==` 等）在 checker 层被拒：`a < b` 报 `no implicit numeric conversion` | e02 | [ ] 未修（见下 A43-A13 备注） |
 
 ### A43-A2 详情（已完成 2026-08-04）
 
@@ -1030,6 +1077,35 @@ stdlib 改动导致的 `'DbParams' has no member 'Create'` 这类编译错误，
 * 正式测试：`tests/conformance/default_parameters.zan`。
 * 回归：`ctest -R "default_param|ctor|constructor|overload|params|generic|struct|interface|record|field_decl|int_to"`
   99 项里仅 `field_decl_initializers`（及其 leakcheck）失败，已确认是 A32-1 的既有失败。
+
+### A43-A12 详情（已完成 2026-08-08）
+
+* 现象：`class V { public static V operator +(V a, int b) {...} }`，`v += 5` / `v + 5`
+  编译报 `LLVM verification failed: Call parameter type does not match`（实参 i64 5 对
+  形参 i32）。根因两处，都在 `irgen_expr.c` 的二元操作符 op 路径（`emit_expr_binary`）：
+  1. **实参不按形参类型收窄**：整数字面量/算术结果一律发射为 64 位，而 `get_method_sym`
+     路径直接 `zan_call2(fn_type, fn, {left, right})` 把 i64 塞给声明 i32 的形参。
+     对比 `op_call`/`op_index` 路径都用 `emit_arg_typed` + `method_param_type_at`，
+     二元 op 是唯一没对齐的。
+  2. **同名 op 不重载解析**：`get_method_sym` 只取第一个同名方法；`V` 同时声明
+     `op_add(V,int)`/`op_add(V,long)`/`op_add(V,double)` 时 `w + 2.5` 误调 int 版。
+* 修复（`irgen_expr.c`）：改用 `resolve_op_overload`（构造只含 right 的临时 `AST_CALL`
+  探测，`self` 由参数 0 隐式占用）做重载解析；调用前用 `method_param_type_at` +
+  `subst_type_param_deep`（接收者实例化上下文）取形参类型，`coerce_int_to` 收窄已发射的
+  实参（只收窄一次，有副作用的操作数不重复求值）；struct 接收者按值到达时 spill 到
+  alloca（对齐 `op_call` 路径）；用 `route_generic_method` 路由到具体实例化的特化函数
+  （`Vec_op_add$int`），其签名与擦除变体一致。
+* 实测：`_scratch/csg/e02_op_matrix.zan` —— `+=`/`-=`/`*=`/`/=`/`%=`、long/double 重载、
+  `==` 比较、struct 接收者 `F` 的 `+=`、double 复合赋值全部正确。
+* 正式测试：见下方 `tests/conformance/operator_overload.zan`。
+
+### A43-A13 备注（未修，2026-08-08）
+
+* 现象：`operator <` / `operator >` / `operator <=` / `operator >=` 重载在 checker 层被拒，
+  `a < b` 报 `cannot compare 'V' and 'V' with a relational operator: no implicit numeric
+  conversion`；`operator ==` 经 irgen 路径可用（e02 中 `a == b` 输出 1）。
+* 探针：`_scratch/csg/e02_op_matrix.zan`（含被注释掉的 `<` 用例）。
+* 待办：checker 的二元比较分支需识别用户类上的 `op_lt`/`op_gt`/`op_le`/`op_ge` 并放行。
 
 ### A43-A10 详情（已完成 2026-08-04）
 

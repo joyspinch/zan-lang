@@ -734,9 +734,17 @@ int32_t zan_thread_start(void *body) {
 #if defined(__linux__)
 /* glibc >= 2.30 exposes gettid(); older libcs need the syscall directly.
  * The TID is the per-thread id -- getpid() returns the same PID for every
- * thread, which is exactly the confusion Thread.CurrentId() must avoid. */
-#if defined(__GLIBC__) && (__GLIBC_PREREQ(2, 30))
+ * thread, which is exactly the confusion Thread.CurrentId() must avoid.
+ * Nested #ifs keep __GLIBC_PREREQ out of any #if expression on musl (which
+ * sets __GLIBC__ for compatibility but never defines the glibc-only feature
+ * macro; zig cc escalates the resulting -Wundef to an error). */
+#if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 30)
 #define zan_tid() gettid()
+#else
+#include <sys/syscall.h>
+#define zan_tid() ((long)syscall(SYS_gettid))
+#endif
 #else
 #include <sys/syscall.h>
 #define zan_tid() ((long)syscall(SYS_gettid))

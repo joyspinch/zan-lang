@@ -7,10 +7,12 @@
  *
  * Build (POSIX):
  *   cc -O2 -Wall -Wextra -I. tests/runtime/rt_test.c \
- *        src/runtime/rt_sched.c src/runtime/rt_io.c -o rt_test -lpthread
+ *        src/runtime/rt_sched.c src/runtime/rt_io.c src/runtime/rt_co.c \
+ *        -o rt_test -lpthread
  * Build (Windows, MinGW):
  *   gcc -O2 -Wall -Wextra -I. tests/runtime/rt_test.c \
- *        src/runtime/rt_sched.c src/runtime/rt_io.c -o rt_test.exe -lws2_32 -lmswsock
+ *        src/runtime/rt_sched.c src/runtime/rt_io.c src/runtime/rt_co.c \
+ *        -o rt_test.exe -lws2_32 -lmswsock
  *
  * Exit code 0 = all checks passed, non-zero = at least one failure.
  */
@@ -177,8 +179,10 @@ static void sched_main(zan_task_t *t) {
     zan_task_t *b = zan_spawn(square_body, (void *)(intptr_t)11);
     int64_t ra = zan_task_await(a);
     int64_t rb = zan_task_await(b);
-    /* result readable again after completion */
+    /* result readable again after completion (before releasing the task) */
     int64_t ra2 = zan_task_result(a);
+    zan_task_release(a);
+    zan_task_release(b);
     g_sched_ok = (ra == 49 && rb == 121 && ra2 == 49) ? 1 : 0;
     zan_task_return(t, 0);
 }
@@ -186,8 +190,10 @@ static void sched_main(zan_task_t *t) {
 static void test_scheduler(void) {
     banner("scheduler: spawn / yield / await / result");
     zan_sched_init();
-    zan_spawn(sched_main, NULL);
+    zan_task_t *main_task = zan_spawn(sched_main, NULL);
     zan_sched_run();
+    zan_task_release(main_task);
+    CHECK(zan_task_live() == 0, "tasks leaked: %zu still tracked", zan_task_live());
     zan_sched_shutdown();
     CHECK(g_sched_ok == 1, "expected 7*7=49 and 11*11=121 from awaited coroutines");
 }
@@ -197,7 +203,9 @@ static void test_scheduler(void) {
 static int64_t g_delay_elapsed = -1;
 static void delay_body(zan_task_t *t) {
     int64_t t0 = now_ms();
-    zan_task_await(zan_task_delay(80));
+    zan_task_t *d = zan_task_delay(80);
+    zan_task_await(d);
+    zan_task_release(d);
     g_delay_elapsed = now_ms() - t0;
     zan_task_return(t, 0);
 }
@@ -205,8 +213,10 @@ static void delay_body(zan_task_t *t) {
 static void test_timer(void) {
     banner("scheduler: task_delay honors wall-clock time");
     zan_sched_init();
-    zan_spawn(delay_body, NULL);
+    zan_task_t *main_task = zan_spawn(delay_body, NULL);
     zan_sched_run();
+    zan_task_release(main_task);
+    CHECK(zan_task_live() == 0, "tasks leaked: %zu still tracked", zan_task_live());
     zan_sched_shutdown();
     /* Allow slack for timer granularity/scheduling, but it must actually wait. */
     CHECK(g_delay_elapsed >= 60, "delay(80ms) only waited %lldms", (long long)g_delay_elapsed);
@@ -265,8 +275,9 @@ static void test_io_echo(int port) {
 #else
     pthread_create(&srv, NULL, server_thread, NULL); (void)srv;
 #endif
-    zan_spawn(echo_body, (void *)(intptr_t)port);
+    zan_task_t *main_task = zan_spawn(echo_body, (void *)(intptr_t)port);
     zan_sched_run();
+    zan_task_release(main_task);
     closesock(g_listen); g_listen = BAD_SOCK;
     zan_sched_shutdown();
     CHECK(g_echo_bytes == 5 * 18, "echo returned %lld bytes, expected 90",
@@ -310,7 +321,10 @@ static void conc_main(zan_task_t *t) {
     zan_task_t *ts[CONC_N];
     for (int i = 0; i < CONC_N; i++) ts[i] = zan_spawn(conc_client, NULL);
     int ok = 0;
-    for (int i = 0; i < CONC_N; i++) ok += (int)zan_task_await(ts[i]);
+    for (int i = 0; i < CONC_N; i++) {
+        ok += (int)zan_task_await(ts[i]);
+        zan_task_release(ts[i]);
+    }
     g_conc_ok = ok;
     zan_task_return(t, 0);
 }
@@ -328,8 +342,9 @@ static void test_io_concurrent(int port) {
 #else
     pthread_create(&srv, NULL, server_thread, NULL); (void)srv;
 #endif
-    zan_spawn(conc_main, NULL);
+    zan_task_t *main_task = zan_spawn(conc_main, NULL);
     zan_sched_run();
+    zan_task_release(main_task);
     closesock(g_listen); g_listen = BAD_SOCK;
     zan_sched_shutdown();
     CHECK(g_conc_ok == CONC_N, "only %d/%d concurrent connections echoed", g_conc_ok, CONC_N);
@@ -351,8 +366,9 @@ static void refused_body(zan_task_t *t) {
 static void test_connect_refused(int port) {
     banner("async-io: connect to closed port fails gracefully");
     zan_sched_init();
-    zan_spawn(refused_body, (void *)(intptr_t)port);
+    zan_task_t *main_task = zan_spawn(refused_body, (void *)(intptr_t)port);
     zan_sched_run();
+    zan_task_release(main_task);
     zan_sched_shutdown();
     CHECK(g_refused_rc == -1, "connect to unused port returned %lld, expected -1",
           (long long)g_refused_rc);

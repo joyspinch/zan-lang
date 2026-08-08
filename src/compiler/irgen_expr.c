@@ -4264,6 +4264,63 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
+        /* await Socket.ResolveAsync(hostname) — async DNS. The lookup runs on
+         * a worker thread inside zan_io_resolve_co, so the reactor never
+         * blocks on the resolver; the resolved IPv4 address (0 on failure,
+         * same value as Socket.ResolveIpv4) is written into this frame's
+         * RESULT slot before the suspended state machine is re-readied, and
+         * the resume-k block loads it as the await value. */
+        {
+            if (is_call_to(expr->await_expr.expr, "Socket", "ResolveAsync") &&
+                expr->await_expr.expr->call.args.count == 1) {
+                LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
+                LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                if (!(g->current_async_frame && g->current_async_switch)) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "await Socket.ResolveAsync is only supported inside an async method");
+                    return LLVMConstInt(di64, 0, 0);
+                }
+                LLVMValueRef host = emit_expr(g, expr->await_expr.expr->call.args.items[0], locals);
+                if (LLVMTypeOf(host) != di8ptr)
+                    host = LLVMBuildBitCast(g->builder, host, di8ptr, "dns.host");
+                g->uses_socket_async = true;
+
+                int k = g->current_async_next_state++;
+                LLVMValueRef selfframe = g->current_async_frame;
+                LLVMTypeRef self_ft = g->current_async_frame_type;
+                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self");
+                /* &self.result viewed as i32* — the reactor stores the
+                 * resolved address here (RecvOv stores an i64 count into the
+                 * same slot; both are read before the next suspension). */
+                LLVMValueRef res_gep = LLVMBuildStructGEP2(g->builder, self_ft,
+                    selfframe, ASYNC_FRAME_RESULT, "self.dnsres");
+                LLVMValueRef out32 = LLVMBuildBitCast(g->builder, res_gep,
+                    LLVMPointerType(di32, 0), "self.dnsout");
+                emit_async_save_slots(g);
+                zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0),
+                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                        ASYNC_FRAME_STATE, "self.state"));
+                zan_call2(g->builder, g->rt_io_resolve_co_type,
+                    g->rt_io_resolve_co, (LLVMValueRef[]){ host, self_i8,
+                        g->current_async_resume_fn, out32 }, 4, "");
+                emit_async_eh_unarm(g);
+                LLVMBuildRetVoid(g->builder);
+
+                LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
+                    g->current_async_resume_fn, "co.resume");
+                LLVMAddCase(g->current_async_switch,
+                    LLVMConstInt(di32, (unsigned)k, 0), rk);
+                LLVMPositionBuilderAtEnd(g->builder, rk);
+                emit_async_reload_slots(g);
+                LLVMValueRef res_slot = LLVMBuildBitCast(g->builder,
+                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                        ASYNC_FRAME_RESULT, "self.dnsres2"),
+                    LLVMPointerType(di32, 0), "self.dnsout2");
+                return LLVMBuildLoad2(g->builder, di32, res_slot, "dnsaddr");
+            }
+        }
+
         /* await <call> — the awaited expression is a call to an async method's
          * ramp, yielding an i8* task handle (heap frame). The sub's resume/step
          * fn is `<ramp>$resume`, resolved from the call target's name. Two

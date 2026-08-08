@@ -91,6 +91,14 @@ void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
 void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
                       intptr_t *out_fd);
 
+/* Async hostname resolution: run `hostname` through the resolver on a worker
+ * thread (the reactor never blocks on DNS) and suspend `frame` until it
+ * finishes. The resolved IPv4 address -- same value and byte order as
+ * zan_io_resolve_ipv4, 0 on failure -- is stored into `*out` before the frame
+ * is re-readied via `step`. Returns immediately. */
+void zan_io_resolve_co(const char *hostname, void *frame, zan_co_step_t step,
+                       int32_t *out);
+
 /* Idle bridge for the stackless scheduler: if IO watchers are pending, block
  * until at least one fires (readying its frame via zan_co_ready) and return the
  * number woken; otherwise return 0. Wire into the co driver with
