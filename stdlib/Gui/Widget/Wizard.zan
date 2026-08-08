@@ -108,6 +108,29 @@ class Wizard {
     /// 拒绝 Create 时设置它，对话框关闭时清除。
     static string notice = "";
 
+    /// 三个列表视口各自的滚动位置（条目列表、分类列、模板列）。
+    /// 行数超出可见高度时列表自己滚动，宿主不必再包一层滚动容器。
+    static SignalInt listScroll;
+    static SignalInt catScroll;
+    static SignalInt tplScroll;
+
+    static SignalInt Scroller(SignalInt s) {
+        if (s == null) { return new SignalInt(0); }
+        return s;
+    }
+
+    /// 行列表视口的滚动量：处理滚轮、把偏移夹在
+    /// [0, contentH - h]，返回本帧应使用的偏移。
+    static int ScrollOffset(App app, int x, int y, int w, int h,
+                            int contentH, SignalInt off) {
+        Scrollbar.HandleWheel(app, x, y, w, h, contentH, off);
+        int maxOff = contentH - h;
+        if (maxOff < 0) { maxOff = 0; }
+        if (off.Get() > maxOff) { off.Set(maxOff); }
+        if (off.Get() < 0) { off.Set(0); }
+        return off.Get();
+    }
+
     static string TW(string en, string zh) {
         if (Wizard.lang == 1) { return zh; }
         return en;
@@ -637,25 +660,36 @@ class Wizard {
         Canvas c = app.canvas;
         Theme t = app.theme;
         c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgSecondary);
+        if (items == null || h <= 0) { return; }
 
         int rowH = app.Scale(42);
         int n = items.Count;
+        int contentH = n * rowH;
+        Wizard.listScroll = Wizard.Scroller(Wizard.listScroll);
+        int off = Wizard.ScrollOffset(app, x, y, w, h, contentH, Wizard.listScroll);
+        bool overflow = contentH > h;
+        int barW = app.Scale(10);
+        int rowW = w;
+        if (overflow) { rowW = w - barW; }
+
         int firstId = app.focus.AllocId();
         for (int i = 1; i < n; i = i + 1) { app.focus.AllocId(); }
 
         int selv = sel.Get();
         int glyph = t.fontSizeLarge;
+        c.PushClip(x, y, w, h);
         for (int k = 0; k < n; k = k + 1) {
             WizardItem item = items[k];
             int id = firstId + k;
-            int rowY = y + k * rowH;
+            int rowY = y + k * rowH - off;
+            if (rowY + rowH <= y || rowY >= y + h) { continue; }
             bool hovered = app.focus.IsHovered(id);
             bool active = k == selv;
             if (active) {
-                c.FillRect(x, rowY, w, rowH, t.bgActive);
+                c.FillRect(x, rowY, rowW, rowH, t.bgActive);
                 c.FillRect(x, rowY, app.Scale(3), rowH, t.primary);
             } else if (hovered) {
-                c.FillRect(x, rowY, w, rowH, t.bgHover);
+                c.FillRect(x, rowY, rowW, rowH, t.bgHover);
             }
             int iconColor = t.textSecondary;
             int textColor = t.textPrimary;
@@ -664,7 +698,12 @@ class Wizard {
             int textX = x + t.paddingMedium + glyph + t.gapMedium;
             int textY = Canvas.CenterTextY(rowY, rowH, t.fontSizeMedium);
             c.DrawText(textX, textY, item.name, textColor, t.fontSizeMedium);
-            app.hitTester.Register(new HitRegion(id, x, rowY, w, rowH, 0));
+            app.hitTester.Register(new HitRegion(id, x, rowY, rowW, rowH, 0));
+        }
+        c.PopClip();
+        if (overflow) {
+            Scrollbar.RenderVerticalScroll(app, x + w - barW, y, h, h, contentH,
+                                           Wizard.listScroll);
         }
 
         if (app.EventKind() == 3) {
@@ -733,24 +772,39 @@ class Wizard {
         int catW = app.Scale(150);
         c.FillRoundRect(catX, contentY, catW, listH, t.borderRadiusMedium, t.bgTertiary);
         int nCat = catNames.Count;
+        int catContentH = nCat * rowH;
+        int barW = app.Scale(10);
+        Wizard.catScroll = Wizard.Scroller(Wizard.catScroll);
+        int catOff = Wizard.ScrollOffset(app, catX, contentY, catW, listH,
+                                        catContentH, Wizard.catScroll);
+        bool catOverflow = catContentH > listH;
+        int catRowW = catW;
+        if (catOverflow) { catRowW = catW - barW; }
         int catFirstId = app.focus.AllocId();
         for (int ci = 1; ci < nCat; ci = ci + 1) { app.focus.AllocId(); }
         int catSelV = catSel.Get();
+        c.PushClip(catX, contentY, catW, listH);
         for (int k = 0; k < nCat; k = k + 1) {
             int id = catFirstId + k;
-            int rowY = contentY + k * rowH;
+            int rowY = contentY + k * rowH - catOff;
+            if (rowY + rowH <= contentY || rowY >= contentY + listH) { continue; }
             bool active = k == catSelV;
             if (active) {
-                c.FillRect(catX, rowY, catW, rowH, t.bgActive);
+                c.FillRect(catX, rowY, catRowW, rowH, t.bgActive);
                 c.FillRect(catX, rowY, app.Scale(3), rowH, t.primary);
             } else if (app.focus.IsHovered(id)) {
-                c.FillRect(catX, rowY, catW, rowH, t.bgHover);
+                c.FillRect(catX, rowY, catRowW, rowH, t.bgHover);
             }
             int tc = t.textSecondary;
             if (active) { tc = t.primary; }
             int ty = Canvas.CenterTextY(rowY, rowH, t.fontSizeMedium);
             c.DrawText(catX + t.paddingMedium, ty, catNames[k], tc, t.fontSizeMedium);
-            app.hitTester.Register(new HitRegion(id, catX, rowY, catW, rowH, 0));
+            app.hitTester.Register(new HitRegion(id, catX, rowY, catRowW, rowH, 0));
+        }
+        c.PopClip();
+        if (catOverflow) {
+            Scrollbar.RenderVerticalScroll(app, catX + catW - barW, contentY, listH,
+                                           listH, catContentH, Wizard.catScroll);
         }
 
         string catLabel = "";
@@ -776,19 +830,28 @@ class Wizard {
         int tplX = catX + catW + pad;
         int tplW = app.Scale(240);
         c.FillRoundRect(tplX, contentY, tplW, listH, t.borderRadiusMedium, t.bgSecondary);
+        int tplContentH = vis.Count * rowH;
+        Wizard.tplScroll = Wizard.Scroller(Wizard.tplScroll);
+        int tplOff = Wizard.ScrollOffset(app, tplX, contentY, tplW, listH,
+                                        tplContentH, Wizard.tplScroll);
+        bool tplOverflow = tplContentH > listH;
+        int tplRowW = tplW;
+        if (tplOverflow) { tplRowW = tplW - barW; }
         int tplFirstId = app.focus.AllocId();
         for (int vi = 1; vi < vis.Count; vi = vi + 1) { app.focus.AllocId(); }
+        c.PushClip(tplX, contentY, tplW, listH);
         for (int r2 = 0; r2 < vis.Count; r2 = r2 + 1) {
             int gi = vis[r2];
             WizardTemplate tpl = tpls[gi];
             int id = tplFirstId + r2;
-            int rowY = contentY + r2 * rowH;
+            int rowY = contentY + r2 * rowH - tplOff;
+            if (rowY + rowH <= contentY || rowY >= contentY + listH) { continue; }
             bool active = gi == tplSelV;
             if (active) {
-                c.FillRect(tplX, rowY, tplW, rowH, t.bgActive);
+                c.FillRect(tplX, rowY, tplRowW, rowH, t.bgActive);
                 c.FillRect(tplX, rowY, app.Scale(3), rowH, t.primary);
             } else if (app.focus.IsHovered(id)) {
-                c.FillRect(tplX, rowY, tplW, rowH, t.bgHover);
+                c.FillRect(tplX, rowY, tplRowW, rowH, t.bgHover);
             }
             int iconColor = t.textSecondary;
             int textColor = t.textPrimary;
@@ -797,7 +860,12 @@ class Wizard {
             int textX = tplX + t.paddingMedium + glyph + t.gapMedium;
             int textY = Canvas.CenterTextY(rowY, rowH, t.fontSizeMedium);
             c.DrawText(textX, textY, tpl.name, textColor, t.fontSizeMedium);
-            app.hitTester.Register(new HitRegion(id, tplX, rowY, tplW, rowH, 0));
+            app.hitTester.Register(new HitRegion(id, tplX, rowY, tplRowW, rowH, 0));
+        }
+        c.PopClip();
+        if (tplOverflow) {
+            Scrollbar.RenderVerticalScroll(app, tplX + tplW - barW, contentY, listH,
+                                           listH, tplContentH, Wizard.tplScroll);
         }
 
         WizardTemplate selTpl = null;
