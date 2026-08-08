@@ -1,0 +1,159 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// H: a typed builder for retained-mode Control trees -- the declarative UI
+/// the IDE's child windows are built from. Each node IS a real Control:
+/// fluent setters fill its fields, children nest as real sub-controls via
+/// Add(), and handler names are recorded on the control (SetHandler) for the
+/// ChildWindow to resolve once the tree is complete. There is no JSON
+/// document in between -- what you build is what renders.
+///
+/// Unknown kinds (no built-in match, not in the project component registry)
+/// yield a null node, and every fluent call on it is a no-op, so a tree that
+/// references an unavailable component simply skips that node -- the same
+/// behaviour the older JSON document path had.
+class UiNode {
+    Control ctl;
+
+    /// A node of the given kind ("Panel", "Button", "ThemeCard", ...).
+    static UiNode Of(string type) {
+        UiNode n = new UiNode();
+        n.ctl = UiNode.Make(type);
+        return n;
+    }
+
+    /// Kind -> Control. Built-ins cover the layouts and widgets the windows
+    /// use; everything else falls through to the project component registry
+    /// (scan_components) so `@component` controls resolve the same way.
+    static Control Make(string type) {
+        Control c = ControlFactory.Create(type);
+        if (c != null) { return c; }
+        // Column/Row are layout panels in the document model; Title is a
+        // heading label (LegacyKind mappings the old parser applied).
+        if (type == "Column" || type == "Row" || type == "Card") {
+            return new Panel();
+        }
+        if (type == "Title") {
+            Label l = new Label("");
+            l.Class = "title";
+            return l;
+        }
+        return null;
+    }
+
+    static UiNode Column() { return UiNode.Of("Column"); }
+    static UiNode Row() { return UiNode.Of("Row"); }
+    static UiNode Title(string text) { return UiNode.Of("Title").Text(text); }
+    static UiNode Label(string text) { return UiNode.Of("Label").Text(text); }
+    static UiNode Button(string text) { return UiNode.Of("Button").Text(text); }
+    static UiNode Slider() { return UiNode.Of("Slider"); }
+
+    // ---- fluent field setters (each returns the node for chaining) --------
+
+    /// Sets a string-valued control property.
+    UiNode Str(string key, string val) {
+        if (ctl == null) { return this; }
+        ctl.SetProp(key, val);
+        return this;
+    }
+
+    /// Sets an integer-valued control property.
+    UiNode Num(string key, int val) {
+        if (ctl == null) { return this; }
+        ctl.SetProp(key, Convert.ToString(val));
+        return this;
+    }
+
+    UiNode Text(string t) { return this.Str("text", t); }
+    UiNode Class(string c) {
+        if (ctl == null) { return this; }
+        ctl.Class = c;
+        return this;
+    }
+    UiNode Dock(string d) {
+        if (ctl == null) { return this; }
+        ctl.dock = StyleSheet.DockValue(d);
+        return this;
+    }
+    UiNode Height(int h) {
+        if (ctl == null) { return this; }
+        // Logical pixels: re-resolved against the current DPI on every
+        // measure pass (Control.ApplyDeclaredUnits).
+        ctl.logH = h;
+        ctl.prefH = h;
+        ctl.prefSet = true;
+        return this;
+    }
+    UiNode Width(int w) {
+        if (ctl == null) { return this; }
+        ctl.logW = w;
+        ctl.prefW = w;
+        ctl.prefSet = true;
+        return this;
+    }
+    UiNode Gap(int g) {
+        if (ctl == null) { return this; }
+        ctl.logGap = g;
+        ctl.gap = g;
+        return this;
+    }
+    UiNode Pad(int p) {
+        if (ctl == null) { return this; }
+        ctl.logPad = p;
+        ctl.Pad(p);
+        return this;
+    }
+    UiNode Min(int m) { return this.Num("min", m); }
+    UiNode Max(int m) { return this.Num("max", m); }
+    UiNode Index(int i) { return this.Num("index", i); }
+    UiNode Bind(string path) {
+        if (ctl == null) { return this; }
+        ctl.bindPath = path;
+        if (ctl.bindProp == "") { ctl.bindProp = UiNode.DefaultBindProp(ctl); }
+        return this;
+    }
+    UiNode BindProp(string path, string prop) {
+        if (ctl == null) { return this; }
+        ctl.bindPath = path;
+        ctl.bindProp = prop;
+        return this;
+    }
+    UiNode OnClick(string action) {
+        if (ctl == null) { return this; }
+        ctl.SetHandler("Click", action);
+        return this;
+    }
+    UiNode Name(string n) {
+        if (ctl == null) { return this; }
+        ctl.name = n;
+        return this;
+    }
+
+    /// Appends a child node to this node's control.
+    UiNode Child(UiNode c) {
+        if (ctl == null || c == null || c.ctl == null) { return this; }
+        ctl.Add(c.ctl);
+        return this;
+    }
+
+    /// The built control (null when the kind was unavailable). The window
+    /// mounts this as its tree root.
+    Control Root() { return ctl; }
+
+    /// The default bound property for a control that declared only a bind
+    /// path: "value" when the control exposes it, else "text".
+    static string DefaultBindProp(Control c) {
+        if (UiNode.HasProp(c, "value")) { return "value"; }
+        if (UiNode.HasProp(c, "text")) { return "text"; }
+        return "";
+    }
+
+    static bool HasProp(Control c, string key) {
+        List<PropSpec> ps = c.Props();
+        for (int i = 0; i < ps.Count; i = i + 1) {
+            if (ps[i].key == key) { return true; }
+        }
+        return false;
+    }
+}

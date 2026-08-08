@@ -7,168 +7,13 @@ using Gui.Widget;
 using Gui.Designer;
 using Game.Scene;
 
-/// ZanIDE part: the child-window and file-picker pumps of the main loop.
+/// ZanIDE part: applying what the secondary windows reported.
 ///
-/// Each method renders (at most) one frame of one secondary top-level window
-/// and applies whatever action it reported, operating on the shared instance
-/// state declared in `ZanIDE.State.zan`. `Run()`'s loop calls them in order
-/// after it has drawn the main window.
+/// Each method reads the actions a child window class took (Publish /
+/// Project Configuration / Marketplace / Settings / the file picker) and
+/// translates them into shell state. The frames themselves are rendered by
+/// ChildWindows.PumpAll inside `Form.Run()`; nothing here draws.
 partial class ZanIDE {
-    /// Pumps the New Project / New File / Save-as-Template wizard child window:
-    /// renders one frame with a pinned widget-id baseline, then applies the
-    /// Create / Cancel / Browse action it reports.
-    void PumpWizardWindow() {
-        // ---------------- wizard child window ----------------
-        if (dlg != null) {
-            if (dlg.needsRedraw && !pathPicker.IsOpen()) {
-                dlg.BeginFrame();
-                // The wizard is immediate-mode but shares the process-wide
-                // WidgetId counter with the main window (which the IDE never
-                // rewinds). Pin a fixed high baseline for the dialog's own
-                // frame so its buttons (Create/Cancel/Browse) get identical
-                // ids every frame -- otherwise hover/press/click never match
-                // the pointer target resolved on the previous frame and the
-                // Cancel/Create buttons appear dead. Restore afterwards.
-                int savedSeq = WidgetId.SeqValue();
-                WidgetId.SetSeq(850000);
-                int action = 0;
-                Wizard wiz;
-                if (dlgMode == 1) {
-                    // Seed the device-size row from the newly selected template's
-                    // own design size, so the size shown (and previewed) is the
-                    // one the scaffold would use if Create is pressed right away.
-                    int psel = pSel.Get();
-                    if (psel != pSizeSeededFor) {
-                        pSizeSeededFor = psel;
-                        pSizeSel.Set(-1);
-                        string sw = "";
-                        string sh = "";
-                        if (psel >= 0 && psel < tpls.Count && tpls[psel].sizeable
-                                && tpls[psel].defW > 0 && tpls[psel].defH > 0) {
-                            sw = Convert.ToString(tpls[psel].defW);
-                            sh = Convert.ToString(tpls[psel].defH);
-                        }
-                        pSizeWIn.SetText(sw);
-                        pSizeHIn.SetText(sh);
-                    }
-                    wiz = Wizard.Categorized(ZanIDE.T("New Project", "新建项目"), catNames, catSel,
-                                             wizTpls, pSel,
-                                             pNameInput, pLocInput,
-                                             platforms, platformGroups,
-                                             pSizeSel, pSizeWIn, pSizeHIn);
-                } else if (dlgMode == 3) {
-                    wiz = new Wizard(ZanIDE.T("Save as Template", "另存为模板"), saveItems,
-                                        tmplCatSel, tmplNameInput, tmplNameInput, false, null);
-                } else {
-                    // The size row only makes sense for templates that produce a
-                    // designed window (Form / Free Layout / Scene, kinds 7-9);
-                    // code files and folders have no window size. Hide it for
-                    // everything else instead of showing dead controls.
-                    SignalInt szSel = null;
-                    int fk = fSel.Get();
-                    if (fk >= 7 && fk <= 9) { szSel = fSizeSel; }
-                    wiz = new Wizard(ZanIDE.T("New File", "新建文件"), fileItems, fSel,
-                                        fNameInput, fNameInput, false, szSel,
-                                        fSizeWIn, fSizeHIn);
-                }
-                action = wiz.Show(dlg);
-                WidgetId.SetSeq(savedSeq);
-                dlg.PresentFrame();
-                lastPresent = Window.GetTickMs();
-
-                if (action == 1) {
-                    bool dlgDone = true;
-                    if (dlgMode == 1) {
-                        string parent = pLocInput.GetText();
-                        string name = pNameInput.GetText();
-                        int gi = pSel.Get();
-                        if (gi >= 0 && gi < tpls.Count && tpls[gi].ptype == "gui" && ZanIDE.IsGuiReservedName(name)) {
-                            Wizard.notice = ZanIDE.T(
-                                "That name conflicts with a built-in Gui/System type. Choose another.",
-                                "该名称与内置的 Gui/System 类型冲突，请换一个名称。");
-                            dlgDone = false;
-                        } else if (!ZanIDE.IsValidProjectName(name)) {
-                            Wizard.notice = ZanIDE.T(
-                                "The name contains invalid characters or is reserved. Use letters, digits, '_' or '-'.",
-                                "名称包含非法字符或是保留名，请使用字母、数字、下划线或连字符。");
-                            dlgDone = false;
-                        } else if (gi >= 0 && gi < tpls.Count) {
-                            string plats = ZanIDE.PlatformCsv(platforms);
-                            ZanIDE.WriteLastPickerDirectory(parent);
-                            string newDir = ZanIDE.CreateProjectT(tpls[gi], parent, name, plats,
-                                ZanIDE.ParseIntSafe(pSizeWIn.GetText()),
-                                ZanIDE.ParseIntSafe(pSizeHIn.GetText()), log);
-                            if (newDir == "") {
-                                // Creation failed (folder not empty, filesystem
-                                // error, ...): the specific reason is in `log`;
-                                // keep the wizard open so the user can retry.
-                                Wizard.notice = ZanIDE.T(
-                                    "Project creation failed. See the Output tab for details.",
-                                    "创建项目失败，详情见输出面板。");
-                                dlgDone = false;
-                            } else {
-                                root = newDir;
-                                haveProject = true;
-                                Layer.Notify(ZanIDE.T("Project created: ", "项目已创建：") + name, 3);
-                                ZanIDE.WriteLastProject(root);
-                                this.AdoptSymbolIndex();
-                                this.AdoptProjectChats();
-                                tabs = new List<TabRecord>();
-                                activeTab.Set(0);
-                                lastActive = 0 - 1;
-                                ZanIDE.OpenFirst(tabs, activeTab, root);
-                            }
-                        }
-                    } else if (dlgMode == 3) {
-                        string cat = saveItems[tmplCatSel.Get()].name;
-                        string tname = tmplNameInput.GetText();
-                        ZanIDE.SaveAsTemplate(root, cat, tname, log);
-                        Layer.Notify(ZanIDE.T("Template saved: ", "模板已保存：") + tname, 3);
-                    } else {
-                        string name = fNameInput.GetText();
-                        if (ZanIDE.FileKindDeclaresType(fSel.Get())
-                                && ZanIDE.IsGuiReservedName(name)) {
-                            Wizard.notice = ZanIDE.T(
-                                "That name conflicts with a built-in Gui/System type. Choose another.",
-                                "该名称与内置的 Gui/System 类型冲突，请换一个名称。");
-                            dlgDone = false;
-                        } else {
-                            string p = ZanIDE.CreateFile(fSel.Get(), root, name, fSizeSel.Get(),
-                                ZanIDE.ParseIntSafe(fSizeWIn.GetText()),
-                                ZanIDE.ParseIntSafe(fSizeHIn.GetText()), log);
-                            if (!Directory.Exists(p)) {
-                                ZanIDE.OpenPath(tabs, activeTab, p, Path.GetFileName(p));
-                            }
-                            Layer.Notify(ZanIDE.T("Created: ", "已创建：") + Path.GetFileName(p), 3);
-                        }
-                    }
-                    if (dlgDone) {
-                        rescan = true;
-                        Wizard.notice = "";
-                        dlg.window.Close();
-                        dlg = null;
-                        dlgMode = 0;
-                    } else {
-                        dlg.RequestRedraw();
-                    }
-                    app.RequestRedraw();
-                } else if (action == 2) {
-                    Wizard.notice = "";
-                    dlg.window.Close();
-                    dlg = null;
-                    dlgMode = 0;
-                    app.RequestRedraw();
-                } else if (action == 3) {
-                    if (dlgMode == 1 && !pathPicker.IsOpen()) {
-                        pathPicker.BeginFolder(ZanIDE.ReadLastPickerDirectory(pLocInput.GetText()),
-                            ZanIDE.T("Select project location", "选择项目位置"));
-                        pathPickerOwner = 1;
-                        dlg.RequestRedraw();
-                    }
-                }
-            }
-        }
-    }
 
     /// Applies what the publish child window reported. "Publish" only closes
     /// it and arms `pubPending`, so the blocking cross-compile never runs
@@ -256,7 +101,7 @@ partial class ZanIDE {
         }
     }
 
-    /// Pumps the two UiDoc-based settings windows (editor appearance and AI
+    /// Pumps the two settings windows (editor appearance and AI
     /// providers), applying a language switch, saved editor prefs or reloaded
     /// AI profiles.
     void PumpSettingsWindows() {
@@ -307,10 +152,6 @@ partial class ZanIDE {
     /// Renders the shared file picker and dispatches its result to whoever
     /// opened it (`pathPickerOwner`).
     void PumpFilePicker() {
-        if (pathPicker.NeedsRedraw()) {
-            pathPicker.RenderWindow();
-            lastPresent = Window.GetTickMs();
-        }
         int pickerResult = pathPicker.TakeResult();
         if (pickerResult == 1) {
             string picked = pathPicker.SelectedPath();

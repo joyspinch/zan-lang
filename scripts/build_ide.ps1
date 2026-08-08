@@ -3,10 +3,12 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 # ---- Standard Zan GUI project build for the IDE ---------------------------
-# src/ide_zan is a normal zan.proj project: entry src/App.zform (generates
-# Main via formgen), code-behind src/App.zan + the shell/editor sources under
-# src/. zanc compiles everything, drives the bundled linker, and links the
-# static native GUI runtime (Win32 backend) + the embedded skin packs.
+# src/ide_zan is a normal zan.proj project: the `entry` manifest key names the
+# designed form (src/IdeForm.zform), the GenForm generator projects it into a
+# partial class with the program's Main, code-behind src/IdeForm.zan holds the
+# logic and the rest of the shell/editor lives under src/. zanc compiles
+# everything, drives the bundled linker, and links the static native GUI
+# runtime (Win32 backend) + the embedded skin packs.
 
 Write-Output "IDE_BUILD_START"
 
@@ -38,12 +40,22 @@ Write-Output "[zanc] $zanc"
 
 $registryPath = Join-Path (Get-Location) "build\ProjectComponents.ide.zan"
 & powershell -ExecutionPolicy Bypass -File scripts\scan_components.ps1 `
-    -Source "src\ide_zan\src" -Out "build\ProjectComponents.ide.zan"
+    -Source "src\ide_zan" -Out "build\ProjectComponents.ide.zan"
 if ($LASTEXITCODE -ne 0) { Write-Output "COMPONENT_SCAN_FAILED"; exit 1 }
+# An empty registry links fine and fails only at runtime: UiNode.Make yields a
+# null node for every `type` it cannot resolve, so each declarative child
+# window silently loses its title bar, its cards and the whole docs page while
+# the hand-drawn dialogs still look right. Refuse to ship that build instead
+# of leaving it to be spotted on screen.
+$registryText = [System.IO.File]::ReadAllText($registryPath)
+$componentCount = ([regex]::Matches($registryText, 'k\.Add\(')).Count
+if ($componentCount -lt 1) {
+    Write-Output "COMPONENT_REGISTRY_EMPTY"; exit 1
+}
 
 $files = @()
 # IDE sources (the standard project's own code).
-$files += (Get-ChildItem src\ide_zan\src\*.zan).FullName
+$files += (Get-ChildItem src\ide_zan\*.zan -Recurse).FullName
 $files += $registryPath
 # The GUI stdlib is namespaced across subfolders (Gui root + Widget /
 # Component / Designer / Hmi); recurse so every part is compiled.
@@ -55,8 +67,17 @@ $files += (Join-Path (Get-Location) "stdlib\System\IO\Directory.zan")
 $files += (Join-Path (Get-Location) "stdlib\System\IO\FileInfo.zan")
 $files += (Join-Path (Get-Location) "stdlib\System\Diagnostics\Process.zan")
 
-# Entry FIRST: the primary .zform gets the generated Main().
-$entry = Join-Path (Get-Location) "src\ide_zan\src\App.zform"
+# Entry FIRST: zanc gives the generated Main() to the first design document on
+# the command line (genrun.c passes emitMain only for paths[0]), so the form
+# named by the manifest's `entry` key has to lead the input list.
+$entryRel = ([regex]::Match(
+    [System.IO.File]::ReadAllText((Join-Path (Get-Location) "src\ide_zan\zan.proj")),
+    '(?m)^\s*entry\s*=\s*(.+?)\s*$')).Groups[1].Value
+if ($entryRel -eq "") { Write-Output "PROJECT_ENTRY_MISSING"; exit 1 }
+$entry = Join-Path (Get-Location) (Join-Path "src\ide_zan" ($entryRel -replace '/', '\'))
+if (!(Test-Path -LiteralPath $entry)) { Write-Output "PROJECT_ENTRY_NOT_FOUND $entry"; exit 1 }
+Write-Output "[entry] $entry"
+
 $zanArgs = @()
 $zanArgs += $entry
 $zanArgs += $files

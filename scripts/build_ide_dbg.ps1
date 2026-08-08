@@ -89,10 +89,10 @@ try {
     Write-Output "IDE_VERSION_OK $verNum ($verDate, $verCommit)"
 
     & powershell -ExecutionPolicy Bypass -File scripts\scan_components.ps1 `
-        -Source src\ide_zan\src -Out build\ProjectComponents.ide.zan
+        -Source src\ide_zan -Out build\ProjectComponents.ide.zan
     if ($LASTEXITCODE -ne 0) { throw "SCAN_FAILED" }
-    # An empty registry links fine and fails only at runtime: UiDoc.Make falls
-    # back to a blank Panel for every `type` it cannot resolve, so each UiDoc
+    # An empty registry links fine and fails only at runtime: UiNode.Of yields
+    # a null node for every `type` it cannot resolve, so each declarative
     # window silently loses its WindowShell title bar, its cards and the whole
     # docs page while the hand-drawn dialogs still look right. Refuse to ship
     # that build instead of leaving it to be spotted on screen.
@@ -107,7 +107,6 @@ try {
     # Component/* / Backend / Designer); recurse so every part is compiled.
     $files += (Get-ChildItem stdlib\Gui -Recurse -Include *.zan |
         Where-Object { $_.Name -ne "ProjectComponents.zan" }).FullName
-    $files += (Get-ChildItem src\ide_zan\src\*.zan).FullName
     if (Test-Path src\ide_zan\views) {
         $viewFiles = Get-ChildItem src\ide_zan\views\*.zan -ErrorAction SilentlyContinue
         if ($viewFiles) { $files += $viewFiles.FullName }
@@ -123,7 +122,7 @@ try {
     $files += (Join-Path (Get-Location) "stdlib\System\Resources\ResourcePack.zan")
     # All IDE shell sources: ZanIDE.zan + its partial-class parts,
     # SceneDesigner, AssetManager and the session classes.
-    $files += (Get-ChildItem src\ide_zan\*.zan).FullName
+    $files += (Get-ChildItem src\ide_zan\*.zan -Recurse).FullName
 
     # Link the IDE straight through zanc: it compiles all sources and drives the
     # bundled ld itself, auto-linking the socket-async reactor (rt_io) and the

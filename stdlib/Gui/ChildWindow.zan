@@ -1,0 +1,452 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+/// Base class for every secondary top-level window (dialogs, settings,
+/// pickers that need their own OS window).
+///
+/// A child window is a top-level OS window of its own, so it needs more than a
+/// shared look: it has to be woken, animated, event-routed, pumped and closed
+/// by the main window's loop. Doing that per window meant wiring each new
+/// window into six places in the host loop, and every miss showed up as a
+/// window that stopped repainting. Here the plumbing lives once, and
+/// `ChildWindows` keeps the registry `Form.Run()` iterates, so opening a
+/// window -- including one opened from another child window -- is enough to
+/// make it work.
+///
+/// A subclass supplies the title/size/widget-id baseline, builds `root` (a
+/// retained Control tree), wires handlers, and may override `Pending()`
+/// (extra repaint reasons) and `AfterFrame()` (work to do once the frame is
+/// on screen). Windows rendered by an immediate-mode widget (the Wizard) set
+/// a render callback instead of building a tree.
+class ChildWindow {
+    App host;
+    Control root;
+    HandlerRegistry handlers;
+    JsonValue model;
+    bool open;
+    bool destroyed;
+    int idBase;
+    Action renderCb;
+
+    ChildWindow() {
+        host = null;
+        root = null;
+        handlers = null;
+        model = null;
+        open = false;
+        destroyed = false;
+        idBase = 900000;
+        renderCb = null;
+    }
+
+    /// OS window caption.
+    virtual string Title() { return "Zan"; }
+
+    /// Initial client size, in unscaled pixels.
+    virtual int Width() { return 560; }
+    virtual int Height() { return 560; }
+
+    /// Fixed WidgetId baseline for this window's frames. The main window never
+    /// rewinds the process-wide counter, so a child that did not pin its own
+    /// baseline would get different ids every frame and its buttons would
+    /// never see the hover/press resolved on the previous frame.
+    virtual int IdBase() { return 900000; }
+
+    /// The underlying App, for hosts that render immediate-mode widgets
+    /// (BeginFrame/PresentFrame) from a render callback.
+    App Host() { return host; }
+
+    /// Immediate-mode render mode: when set, the pump calls `a` instead of
+    /// rendering the Control tree. The callback owns BeginFrame/PresentFrame
+    /// and dispatches whatever action its widget reported.
+    void SetRender(Action a) {
+        renderCb = a;
+    }
+
+    /// Mounts the window's control tree and the JSON model the `bind` paths
+    /// of its controls read from / write to. Subclasses call this at the end
+    /// of their BuildUi, then register handler names with Handle() and finish
+    /// with Wire().
+    void SetRoot(Control tree, JsonValue m) {
+        root = tree;
+        model = m;
+        handlers = new HandlerRegistry();
+    }
+
+    /// Registers (or replaces) the Action bound to a design handler name;
+    /// Wire() resolves each control's `on<Event>` names through this table.
+    void Handle(string name, Action a) {
+        if (handlers == null) { handlers = new HandlerRegistry(); }
+        handlers.Set(name, a);
+    }
+
+    /// Resolves every recorded `on<Event>` handler name to its Action and
+    /// pushes the model into the bound controls (state -> UI). Call once
+    /// after all Handle() registrations.
+    void Wire() {
+        if (root == null) { return; }
+        WireNode(root);
+        SyncFromModel();
+    }
+
+    void WireNode(Control c) {
+        for (int i = 0; i < c.events.Count; i = i + 1) {
+            string evt = c.events[i].key;
+            string hname = c.events[i].val;
+            if (hname != "" && handlers != null && handlers.Has(hname)) {
+                Action a = handlers.Get(hname);
+                c.BindEvent(evt, a);
+            }
+        }
+        for (int j = 0; j < c.children.Count; j = j + 1) {
+            WireNode(c.children[j]);
+        }
+    }
+
+    // ---- model binding (state <-> UI) -----------------------------------
+    // The same traversal the old UiDoc document ran: controls that declared a
+    // bind path get their bound property pushed from the model before each
+    // frame, and any change the user made is written back to the model after
+    // the frame.
+
+    /// 把绑定的状态实体值推入每个声明了 `bind` 路径的控件
+    /// （state -> UI）。不通过 SetProp 暴露 “value”/“text” 的控件
+    /// 会忽略写入，因此对所有控件类型都安全。
+    void SyncFromModel() {
+        if (model == null || root == null) { return; }
+        SyncFromNode(root);
+    }
+
+    void SyncFromNode(Control c) {
+        if (c.bindPath != "") {
+            JsonValue v = model.PathGet(c.bindPath);
+            if (v != null) {
+                string s = v.AsString("");
+                if (c.bindProp != "") {
+                    if (c.GetProp(c.bindProp) != s) {
+                        c.SetProp(c.bindProp, s);
+                    }
+                } else {
+                    c.SetProp("value", s);
+                }
+            }
+            c.bindSnapshot = BoundValue(c);
+        }
+        for (int j = 0; j < c.children.Count; j = j + 1) {
+            SyncFromNode(c.children[j]);
+        }
+    }
+
+    /// 把每个绑定控件的当前值读回状态实体（UI -> state）。
+    void SyncChangedNode(Control c) {
+        if (c.bindPath != "") {
+            string s = BoundValue(c);
+            if (s != c.bindSnapshot) { WriteBoundValue(c, s); }
+        }
+        for (int i = 0; i < c.children.Count; i = i + 1) {
+            SyncChangedNode(c.children[i]);
+        }
+    }
+
+    string BoundValue(Control c) {
+        if (c.bindProp != "") { return c.GetProp(c.bindProp); }
+        string s = c.GetProp("value");
+        if (s == "") { s = c.GetProp("text"); }
+        return s;
+    }
+
+    void WriteBoundValue(Control c, string s) {
+        JsonValue cur = model.PathGet(c.bindPath);
+        if (cur != null && cur.IsBool()) {
+            model.PathSetValue(c.bindPath, JsonValue.NewBool(s == "true"));
+        } else if (cur != null && cur.IsNumber()) {
+            model.PathSetValue(c.bindPath, JsonValue.NewNum(s));
+        } else {
+            model.PathSet(c.bindPath, s);
+        }
+    }
+
+    /// Extra reasons to repaint: actions raised by handlers between
+    /// frames, background work still running, ...
+    virtual bool Pending() { return false; }
+
+    /// Runs right after the frame is presented (model sync, deferred work).
+    virtual void AfterFrame() { }
+
+    /// Creates and shows the window with the parent's look, then registers it
+    /// with the pump. Subclasses call this at the end of their `Open`.
+    void OpenHost(App parent) {
+        open = true;
+        idBase = this.IdBase();
+        host = App.CreateDark(this.Title(), this.Width(), this.Height());
+        host.ApplySkin(parent.ThemeMenuIndex());
+        host.Show();
+        host.SetWindowOpacity(parent.WindowOpacity());
+        host.SetUserWallpaper(parent.UserWallpaperPath(),
+                              parent.UserWallpaperOpacity());
+        host.RequestRedraw();
+        ChildWindows.Register(this);
+    }
+
+    /// Renders one frame, with this window's widget ids pinned: the render
+    /// callback when one was set, otherwise the retained Control tree.
+    void Render() {
+        if (!this.NeedsRedraw()) { return; }
+        int saved = WidgetId.SeqValue();
+        WidgetId.SetSeq(idBase);
+        if (renderCb != null) {
+            renderCb();
+        } else {
+            host.BeginFrame();
+            int top = host.ContentTop();
+            if (root != null) {
+                SyncFromModel();
+                root.MeasureTree(host);
+                root.Arrange(0, top, host.ClientWidth(),
+                             host.ClientHeight() - top);
+                root.RenderTree(host);
+                SyncChangedNode(root);
+            }
+            host.RenderChrome(this.Title());
+            host.PresentFrame();
+        }
+        WidgetId.SetSeq(saved);
+        this.AfterFrame();
+    }
+
+    bool NeedsRedraw() {
+        return open && (host.needsRedraw || this.Pending());
+    }
+
+    bool IsOpen() { return open; }
+
+    bool OwnsWindow(nint hwnd) {
+        return open && hwnd == host.WindowHandle();
+    }
+
+    /// Applies one OS event addressed to this window; a close event just marks
+    /// it closed (the main loop drops it on the next pump).
+    void ApplyEvent(nint hwnd) {
+        if (!this.OwnsWindow(hwnd)) { return; }
+        if (host.EventKind() == 8) {
+            this.OnCloseRequested();
+            open = false;
+            this.Teardown();
+            return;
+        }
+        host.ApplyEvent(hwnd);
+    }
+
+    /// Called when the user clicks the window's close button. Subclasses can
+    /// mirror the behaviour of their internal "done"/"cancel" handlers here.
+    virtual void OnCloseRequested() { }
+
+    void Close() {
+        if (open) { host.window.Close(); }
+        open = false;
+        this.Teardown();
+    }
+
+    /// Destroys the OS window for good. `Window.Close()` only *requests* a
+    /// close (it posts the close event to the window's own loop); a child the
+    /// host has already let go of never reads that event, so without this the
+    /// window lingers on screen, unpainted and dead to clicks. Idempotent.
+    void Teardown() {
+        if (destroyed) { return; }
+        destroyed = true;
+        if (host != null) { host.window.Destroy(); }
+    }
+
+    void RequestRedraw() {
+        if (open) { host.RequestRedraw(); }
+    }
+
+    // ---- forwarding: the few App operations the host loop still needs ----
+
+    void ApplySkin(int i) {
+        if (open) { host.ApplySkin(i); }
+    }
+
+    void SetWindowOpacity(int percent) {
+        if (open) { host.SetWindowOpacity(percent); }
+    }
+
+    void SetUserWallpaper(string path, int opacity) {
+        if (open) { host.SetUserWallpaper(path, opacity); }
+    }
+
+    nint WindowHandle() { return host.WindowHandle(); }
+
+    void FollowSkin(int i) {
+        if (!open) { return; }
+        host.ApplySkin(i);
+        host.RequestRedraw();
+    }
+
+    void FollowOpacity(int percent) {
+        if (!open) { return; }
+        host.SetWindowOpacity(percent);
+    }
+
+    void FollowWallpaper(string path, int opacity) {
+        if (!open) { return; }
+        host.SetUserWallpaper(path, opacity);
+    }
+
+    int AnimNextMs() {
+        if (!open) { return 0 - 1; }
+        return host.animNextMs;
+    }
+
+    int FxNextMs() {
+        if (!open) { return 0 - 1; }
+        return host.fxNextMs;
+    }
+}
+
+/// The registry of open child windows the main window's loop drives.
+///
+/// `Form.Run()` asks it, once per iteration, whether anything needs a
+/// repaint, folds in the animation deadlines, routes the OS event to whoever
+/// owns it, and pumps a frame for each open window. Nothing in the loop names
+/// an individual window, so a window opened from a child window is driven the
+/// same way as one opened from the ribbon.
+class ChildWindows {
+    static List<ChildWindow> wins;
+    static FilePicker picker;
+
+    static List<ChildWindow> All() {
+        if (ChildWindows.wins == null) {
+            ChildWindows.wins = new List<ChildWindow>();
+        }
+        return ChildWindows.wins;
+    }
+
+    static void Register(ChildWindow w) {
+        ChildWindows.All().Add(w);
+    }
+
+    /// Registers the shared file picker so the pump renders it while open;
+    /// the picker dispatches its result through its own UiEvents.
+    static void RegisterPicker(FilePicker p) {
+        ChildWindows.picker = p;
+    }
+
+    /// Forgets windows that have closed.
+    static void Prune() {
+        List<ChildWindow> all = ChildWindows.All();
+        List<ChildWindow> keep = new List<ChildWindow>();
+        foreach (ChildWindow w in all) {
+            if (w.IsOpen()) { keep.Add(w); }
+            else { w.Teardown(); }
+        }
+        ChildWindows.wins = keep;
+    }
+
+    static bool AnyOpen() {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            if (w.IsOpen()) { return true; }
+        }
+        return false;
+    }
+
+    /// True when any open window has a frame to draw (so the loop polls
+    /// instead of blocking).
+    static bool Wants() {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            if (w.NeedsRedraw()) { return true; }
+        }
+        return false;
+    }
+
+    /// Folds every open window's animation / effect deadline into `deadline`
+    /// (-1 means "no deadline"), so idle waits wake up for child animations.
+    static int Deadline(int deadline) {
+        int d = deadline;
+        foreach (ChildWindow w in ChildWindows.All()) {
+            int a = w.AnimNextMs();
+            if (a >= 0 && (d < 0 || a < d)) { d = a; }
+            int f = w.FxNextMs();
+            if (f >= 0 && (d < 0 || f < d)) { d = f; }
+        }
+        return d;
+    }
+
+    /// Requests a repaint on every window whose deadline has passed; true when
+    /// at least one was due.
+    static bool TickDue(int now) {
+        bool due = false;
+        foreach (ChildWindow w in ChildWindows.All()) {
+            int a = w.AnimNextMs();
+            int f = w.FxNextMs();
+            if (a >= 0 && now >= a) { due = true; w.RequestRedraw(); }
+            if (f >= 0 && now >= f) { due = true; w.RequestRedraw(); }
+        }
+        return due;
+    }
+
+    /// Hands the event to the window it is addressed to; false when no child
+    /// owns it (it belongs to the main window or the file picker).
+    static bool Route(nint hwnd) {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            if (w.OwnsWindow(hwnd)) {
+                w.ApplyEvent(hwnd);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// One frame of every open window and of the shared file picker, then
+    /// drops (and destroys) the closed ones. Called by `Form.Run()` every
+    /// iteration; safe to call again from a frame hook: a window opened from
+    /// another window's action handler is rendered by the second call instead
+    /// of staying blank until the next OS event.
+    static void PumpAll() {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            if (w.IsOpen()) { w.Render(); }
+        }
+        if (ChildWindows.picker != null) {
+            if (ChildWindows.picker.IsOpen() && ChildWindows.picker.NeedsRedraw()) {
+                ChildWindows.picker.RenderWindow();
+            }
+        }
+        ChildWindows.Prune();
+    }
+
+    /// Folds the child deadlines into the main app's idle wait and wakes the
+    /// main window when a child animation comes due. Call once per loop
+    /// iteration from the frame hook (Form.Run already sleeps on the folded
+    /// deadline).
+    static void FoldDeadlines(App main) {
+        int dl = ChildWindows.Deadline(-1);
+        if (dl >= 0) { main.RequestAnimationFrame(dl); }
+        int now = Window.GetTickMs();
+        if (ChildWindows.TickDue(now)) { main.RequestRedraw(); }
+    }
+
+    static void FollowSkin(int i) {
+        foreach (ChildWindow w in ChildWindows.All()) { w.FollowSkin(i); }
+    }
+
+    static void FollowOpacity(int percent) {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            w.FollowOpacity(percent);
+        }
+    }
+
+    static void FollowWallpaper(string path, int opacity) {
+        foreach (ChildWindow w in ChildWindows.All()) {
+            w.FollowWallpaper(path, opacity);
+        }
+    }
+
+    /// Repaints every open window (used after the shared file picker returns:
+    /// whoever asked for it must show the result).
+    static void RequestRedrawAll() {
+        foreach (ChildWindow w in ChildWindows.All()) { w.RequestRedraw(); }
+    }
+}

@@ -33,7 +33,9 @@ $srcPath = Join-Path $root $Source
 if (Test-Path $srcPath) {
     $files = Get-ChildItem -Path $srcPath -Recurse -Filter *.zan -ErrorAction SilentlyContinue
     foreach ($f in $files) {
-        $lines = Get-Content -LiteralPath $f.FullName
+        # Use ReadAllLines instead of Get-Content; on some systems Get-Content
+        # merges lines that contain certain multi-byte UTF-8 characters.
+        $lines = [System.IO.File]::ReadAllLines($f.FullName)
         $ns = ""
         $pending = $false
         $pendGroup = "Custom"
