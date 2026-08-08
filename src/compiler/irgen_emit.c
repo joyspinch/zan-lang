@@ -251,9 +251,11 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
 
     local_scope_t *locals = local_scope_new(g->arena);
 
+    g->current_fn_is_main = true;
     if (method->method_decl.body) {
         emit_stmt(g, method->method_decl.body, locals);
     }
+    g->current_fn_is_main = false;
 
     /* add return 0 if no terminator */
     if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {

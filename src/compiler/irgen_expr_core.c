@@ -1429,6 +1429,13 @@ static infer_cache_slot_t *infer_cache_slot(zan_irgen_t *g, zan_ast_node_t *e,
     return &g_infer_cache[h & (INFER_CACHE_SLOTS - 1)];
 }
 
+/* Drop every memoized inference result. The table is keyed on the AST node's
+ * address, so a node rewritten in place keeps its cached type from before the
+ * rewrite: the implicit-ctor argument wrap turned `false` into `new Box(false)`
+ * yet callers still read `bool`, saw a non-rc type and skipped the release of
+ * the synthesized temporary (leakcheck_implicit_ctor_argument). */
+static void infer_cache_invalidate(void) { g_infer_ctx.live = false; }
+
 static zan_type_t *infer_expr_type_uncached(zan_irgen_t *g, zan_ast_node_t *e,
                                             local_scope_t *locals) {
     zan_type_t *t = infer_expr_type_raw(g, e, locals);

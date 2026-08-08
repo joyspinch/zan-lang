@@ -8062,6 +8062,8 @@ static bool wrap_implicit_ctor_arg(zan_irgen_t *g, zan_ast_node_t *arg,
     zan_ast_list_init(&replacement.new_expr.args);
     zan_ast_list_push(&replacement.new_expr.args, original, g->arena);
     *arg = replacement;
+    /* the node now describes a different expression at the same address */
+    infer_cache_invalidate();
     return true;
 }
 

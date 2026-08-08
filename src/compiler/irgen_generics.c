@@ -567,7 +567,27 @@ static void emit_leak_report_support(zan_irgen_t *g) {
     LLVMBasicBlockRef body_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "loop.body");
     LLVMBasicBlockRef print_bb = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "loop.print");
     LLVMBasicBlockRef next_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "loop.next");
+    /* The report also goes to a file: a GUI program is linked for the windows
+     * subsystem and has no stdout, so printf alone loses the report exactly
+     * where it is needed (the IDE). `log_*` blocks write the same text to
+     * zan_leaks.log next to the working directory when the file opens. */
+    LLVMBasicBlockRef log_sum_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "log.summary");
+    LLVMBasicBlockRef log_site_bb = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "log.site");
+    LLVMBasicBlockRef close_bb = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "log.close");
     LLVMBasicBlockRef done_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "done");
+
+    LLVMTypeRef fopen_args[2]  = { i8p, i8p };
+    LLVMTypeRef fopen_type = LLVMFunctionType(i8p, fopen_args, 2, 0);
+    LLVMValueRef fn_fopen = LLVMGetNamedFunction(g->mod, "fopen");
+    if (!fn_fopen) fn_fopen = LLVMAddFunction(g->mod, "fopen", fopen_type);
+    LLVMTypeRef fprintf_args[2] = { i8p, i8p };
+    LLVMTypeRef fprintf_type = LLVMFunctionType(i32t, fprintf_args, 2, 1);
+    LLVMValueRef fn_fprintf = LLVMGetNamedFunction(g->mod, "fprintf");
+    if (!fn_fprintf) fn_fprintf = LLVMAddFunction(g->mod, "fprintf", fprintf_type);
+    LLVMTypeRef fclose_args[1] = { i8p };
+    LLVMTypeRef fclose_type = LLVMFunctionType(i32t, fclose_args, 1, 0);
+    LLVMValueRef fn_fclose = LLVMGetNamedFunction(g->mod, "fclose");
+    if (!fn_fclose) fn_fclose = LLVMAddFunction(g->mod, "fclose", fclose_type);
 
     LLVMPositionBuilderAtEnd(b, bb);
     LLVMValueRef live = LLVMBuildLoad2(b, i64, g->g_live, "live");
@@ -580,6 +600,16 @@ static void emit_leak_report_support(zan_irgen_t *g) {
         "zan: memory leak detected: %lld object(s) still reachable at exit\n", "leak_fmt");
     LLVMValueRef pargs[] = { msg, live };
     zan_call2(b, g->printf_type, g->fn_printf, pargs, 2, "");
+    LLVMValueRef log_path = LLVMBuildGlobalStringPtr(b, "zan_leaks.log", "leak_log_path");
+    LLVMValueRef log_mode = LLVMBuildGlobalStringPtr(b, "ab", "leak_log_mode");
+    LLVMValueRef fo_args[2] = { log_path, log_mode };
+    LLVMValueRef log_fh = zan_call2(b, fopen_type, fn_fopen, fo_args, 2, "leaklog");
+    LLVMValueRef have_log = LLVMBuildIsNotNull(b, log_fh, "havelog");
+    LLVMBuildCondBr(b, have_log, log_sum_bb, head_bb);
+
+    LLVMPositionBuilderAtEnd(b, log_sum_bb);
+    LLVMValueRef fsum_args[3] = { log_fh, msg, live };
+    zan_call2(b, fprintf_type, fn_fprintf, fsum_args, 3, "");
     LLVMBuildBr(b, head_bb);
 
     /* iterate the site buckets, printing those with a positive live count */
@@ -587,7 +617,7 @@ static void emit_leak_report_support(zan_irgen_t *g) {
     LLVMValueRef idx = LLVMBuildPhi(b, i64, "i");
     LLVMValueRef in_range = zan_icmp(b, LLVMIntSLT, idx,
         LLVMConstInt(i64, ZAN_MAX_LEAK_SITES, 0), "inrange");
-    LLVMBuildCondBr(b, in_range, body_bb, done_bb);
+    LLVMBuildCondBr(b, in_range, body_bb, close_bb);
 
     LLVMPositionBuilderAtEnd(b, body_bb);
     LLVMValueRef z32 = LLVMConstInt(i32t, 0, 0);
@@ -604,15 +634,28 @@ static void emit_leak_report_support(zan_irgen_t *g) {
         "  %lld object(s) leaked, allocated at %s\n", "leak_site_fmt");
     LLVMValueRef dargs[] = { dmsg, sc, nm };
     zan_call2(b, g->printf_type, g->fn_printf, dargs, 3, "");
+    LLVMBuildCondBr(b, have_log, log_site_bb, next_bb);
+
+    LLVMPositionBuilderAtEnd(b, log_site_bb);
+    LLVMValueRef fsite_args[4] = { log_fh, dmsg, sc, nm };
+    zan_call2(b, fprintf_type, fn_fprintf, fsite_args, 4, "");
     LLVMBuildBr(b, next_bb);
 
     LLVMPositionBuilderAtEnd(b, next_bb);
     LLVMValueRef idx1 = zan_add(b, idx, LLVMConstInt(i64, 1, 0), "i.next");
     LLVMBuildBr(b, head_bb);
 
-    LLVMValueRef phi_vals[2] = { LLVMConstInt(i64, 0, 0), idx1 };
-    LLVMBasicBlockRef phi_bbs[2] = { leak_bb, next_bb };
-    LLVMAddIncoming(idx, phi_vals, phi_bbs, 2);
+    LLVMPositionBuilderAtEnd(b, close_bb);
+    LLVMBasicBlockRef close_do_bb = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "log.close.do");
+    LLVMBuildCondBr(b, have_log, close_do_bb, done_bb);
+    LLVMPositionBuilderAtEnd(b, close_do_bb);
+    LLVMValueRef fc_args[1] = { log_fh };
+    zan_call2(b, fclose_type, fn_fclose, fc_args, 1, "");
+    LLVMBuildBr(b, done_bb);
+
+    LLVMValueRef phi_vals[3] = { LLVMConstInt(i64, 0, 0), LLVMConstInt(i64, 0, 0), idx1 };
+    LLVMBasicBlockRef phi_bbs[3] = { leak_bb, log_sum_bb, next_bb };
+    LLVMAddIncoming(idx, phi_vals, phi_bbs, 3);
 
     LLVMPositionBuilderAtEnd(b, done_bb);
     LLVMBuildRetVoid(b);

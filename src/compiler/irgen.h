@@ -54,6 +54,9 @@ struct zan_irgen {
     zan_symbol_t *current_type_sym;  /* type symbol for 'this' */
     zan_ast_node_t *current_fn_body; /* root AST body of the fn being compiled */
     bool current_fn_is_ctor;         /* the fn being compiled is a constructor */
+    bool current_fn_is_main;         /* the fn being compiled is program entry:
+                                      * every `return` in it leaves the program,
+                                      * so it must also release static fields */
     bool current_fn_no_runtime;      /* [NoRuntime]: emit no ARC in this body */
     /* >0 while emitting a lambda body: lambdas are non-capturing, so current_this
      * is NULL inside them and a `this`/`base` reference would silently load a

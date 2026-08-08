@@ -8,6 +8,8 @@
 /* ---- statement codegen ---- */
 
 /* Find or create the basic block for a goto label in the current function. */
+static void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit);
+
 static LLVMBasicBlockRef irgen_goto_label(zan_irgen_t *g, zan_istr_t name) {
     LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
     for (int i = 0; i < g->goto_label_count; i++) {
@@ -1163,6 +1165,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     val = emit_boundary_coerce(g, val, fn_ret);
                 }
             }
+            /* `return 0;` in Main ends the program: release the static fields
+             * too, exactly like falling off the end of Main does, so a
+             * singleton held in a static field is not reported as a leak. */
+            if (g->current_fn_is_main) emit_release_static_rc_fields(g, NULL);
             LLVMBuildRet(g->builder, val);
         } else {
             emit_pending_finallys(g, locals, 0);
@@ -1175,6 +1181,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
              * there must yield an exit code to match the function's return type
              * (mirrors the implicit end-of-main `ret i32 0`). */
             LLVMTypeRef fn_ret = g->current_fn_ret_type;
+            if (g->current_fn_is_main) emit_release_static_rc_fields(g, NULL);
             if (fn_ret && LLVMGetTypeKind(fn_ret) != LLVMVoidTypeKind) {
                 LLVMBuildRet(g->builder, LLVMConstNull(fn_ret));
             } else {
