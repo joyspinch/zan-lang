@@ -1541,6 +1541,7 @@ partial class ZanIDE {
         InitDesignerState();
         InitPanelsAndDock(cfg);
         InitGitPanel();
+        InitDockPanels(form);
         InitHelpPanel();
         InitAiState();
         InitRunState(cfg);
@@ -2193,15 +2194,8 @@ partial class ZanIDE {
             // Section 1: Explorer. The tree owns its filter row, scrolling,
             // scrollbar and selection; opening a file and raising the
             // context menu are handlers.
-            if (explorerTv == null) {
-                explorerTv = new TreeView();
-                explorerTv.BindSel(treeSel).WithFilter(treeFilter).WithMultiSelect();
-                explorerTv.OnSelect(ZanIDE.ExplorerPicked);
-                explorerTv.OnContext(ZanIDE.ExplorerContext);
-            }
-            treeShow = ZanIDE.FilterNodes(tree, treeFilter.GetText());
-            explorerTv.Bind(treeShow);
-            explorerTv.RenderInside(app, dock.ContentParked("explorer"));
+            explorerPanel.Render(app, dock.ContentParked("explorer"), tree);
+            treeShow = explorerPanel.Shown();
 
             // Section 2: Structure / Components. Shows a code outline for
             // source tabs, and the form's component tree in the designer.
@@ -2817,17 +2811,17 @@ partial class ZanIDE {
                 dock.SetTitle("errors", errTitle);
                 dockErrorsTitle = errTitle;
             }
-            OutputPanel.RenderErrorsPanel(app, c, t, errRect, errors, errorList);
+            errorsPanel.Render(app, errRect, errors);
             // Error rows are widgets: the ErrorList component records clicks
             // during RenderAt; apply them here.
             if (!coCtxOpen) {
-                DiagnosticRecord efr = errorList.TakeFix();
+                DiagnosticRecord efr = errorsPanel.TakeFix();
                 if (efr != null) {
                     ZanIDE.AddUsing(editor, tabs, activeTab,
-                        errorList.FixNs(efr), log);
+                        errorsPanel.FixNs(efr), log);
                     app.RequestRedraw();
                 }
-                DiagnosticRecord ejr = errorList.TakeJump();
+                DiagnosticRecord ejr = errorsPanel.TakeJump();
                 if (ejr != null) {
                     int ejt = ZanIDE.FindTabByBase(
                         tabs, ZanIDE.BaseName(ejr.path));
@@ -2866,28 +2860,15 @@ partial class ZanIDE {
                 // 1 errors -- so copy/clear act on what was right-clicked.
                 int botTab = 0;
                 if (errRect.Contains(app.mouseX, app.mouseY)) { botTab = 1; }
-                // Build the (optionally) filtered view the console shows. The
-                // real `log` is untouched; selection/copy operate on the view.
-                string coFilterText = coFilter.GetText();
-                List<string> coView = log;
-                if (coFilterText != "") {
-                    coView = new List<string>();
-                    for (int cvi = 0; cvi < log.Count; cvi = cvi + 1) {
-                        if (ZanIDE.Has(log[cvi], coFilterText)) { coView.Add(log[cvi]); }
-                    }
-                }
+                // The console is its own designed panel (panels/OutputPanel.zform):
+                // it filters the real log into its own view, colours the rows
+                // and owns the filter box, Clear button and selection. The
+                // real `log` is untouched; copy/selection act on the view.
                 int obTabH = t.heightMedium;
                 int coContentY = orr.y + obTabH;
                 int coContentH = orr.height - obTabH;
-                int clearId = OutputPanel.RenderConsolePanel(app, c, t, orr, coView,
-                    OutputPanel.ConsoleColors(app, coView), coLog, coFilter);
-                // Clear button empties the real log and resets the view state.
-                if (!coCtxOpen && Ui.Clicked(app, clearId)) {
-                    log = new List<string>();
-                    coFilter.SetText("");
-                    coLog.Reset();
-                    app.RequestRedraw();
-                }
+                outputPanel.Render(app, orr, log);
+                List<string> coView = outputPanel.Shown();
                 // Right-click opens the shared context menu (copy
                 // selection / line / all, clear) instead of silently copying.
                 Rect botRect = orr;
@@ -3733,149 +3714,11 @@ partial class ZanIDE {
                 // ring opens, so it sits above the chat and the prompt.
                 AiRenderUsageCard(app);
             }
-            {
-                // ---- Git panel: repository status + stage / commit / sync ----
-                Rect gArea = dock.ContentParked("git");
-                int gPad = app.Scale(6);
-                if (!gitLoaded && gitJob == 0 && Directory.Exists(root + "/.git")) {
-                    ZanIDE.GitRefreshBegin(root);
-                    gitJob = 1;
-                    app.RequestAnimationFrame(120);
-                }
-                bool gitRepo = Directory.Exists(root + "/.git");
-                int gy = gArea.y + gPad;
-                if (!gitRepo) {
-                    gitNoRepoLbl.RenderAt(app, gArea.x + gPad, gy,
-                        gArea.width - gPad * 2);
-                    int giId = new Button { Text = ZanIDE.T("Initialize repository", "初始化仓库"), Class = "primary small" }.Render(app, gArea.x + gPad, gy + app.Scale(24), app.Scale(150));
-                    if (Ui.Clicked(app, giId)) {
-                        if (gitJob == 0) {
-                            ZanIDE.GitBegin(root, "init");
-                            gitJob = 2;
-                            log.Add(ZanIDE.T("> git init ...", "> 正在初始化 git 仓库 ..."));
-                        }
-                        app.RequestRedraw();
-                    }
-                } else {
-                    // Header: current branch + change count, then two rows
-                    // of actions (all git commands echo into Output).
-                    gitBranchLbl.Text = ZanIDE.T("Branch: ", "分支：")
-                        + gitBranch + "   ("
-                        + Convert.ToString(gitFiles.Count)
-                        + ZanIDE.T(" changes", " 处变更") + ")";
-                    gitBranchLbl.RenderAt(app, gArea.x + gPad,
-                        gy + app.Scale(4), gArea.width - gPad * 2);
-                    int gBtnW = (gArea.width - gPad * 4) / 3;
-                    if (gBtnW < app.Scale(50)) { gBtnW = app.Scale(50); }
-                    int gRow1 = gy + app.Scale(22);
-                    int gRefId = new Button { Text = ZanIDE.T("Refresh", "刷新"), Class = "small" }
-                        .Render(app, gArea.x + gPad, gRow1, gBtnW);
-                    int gStgId = new Button { Text = ZanIDE.T("Stage all", "暂存全部"), Class = "small" }
-                        .Render(app, gArea.x + gPad * 2 + gBtnW, gRow1, gBtnW);
-                    int gDifId = new Button { Text = ZanIDE.T("Diff", "差异"), Class = "small" }
-                        .Render(app, gArea.x + gPad * 3 + gBtnW * 2, gRow1, gBtnW);
-                    int gRow2 = gRow1 + app.Scale(28);
-                    int gLogId = new Button { Text = ZanIDE.T("History", "历史"), Class = "small" }
-                        .Render(app, gArea.x + gPad, gRow2, gBtnW);
-                    int gPulId = new Button { Text = ZanIDE.T("Pull", "拉取"), Class = "small" }
-                        .Render(app, gArea.x + gPad * 2 + gBtnW, gRow2, gBtnW);
-                    int gPshId = new Button { Text = ZanIDE.T("Push", "推送"), Class = "small" }
-                        .Render(app, gArea.x + gPad * 3 + gBtnW * 2, gRow2, gBtnW);
-                    if (Ui.Clicked(app, gRefId)) {
-                        gitLoaded = false;
-                        app.RequestRedraw();
-                    }
-                    if (Ui.Clicked(app, gStgId)) {
-                        if (gitJob == 0) {
-                            ZanIDE.GitBegin(root, "add -A");
-                            gitJob = 2;
-                            log.Add(ZanIDE.T("> Staging all changes ...", "> 正在暂存全部变更 ..."));
-                        }
-                        dock.Focus("output");
-                        app.RequestRedraw();
-                    }
-                    if (Ui.Clicked(app, gDifId)) {
-                        int gsv = gitSel.Get();
-                        string gtgt = "";
-                        if (gsv >= 0 && gsv < gitFiles.Count) {
-                            gtgt = " -- \"" + ZanIDE.GitPathOf(gitFiles[gsv]) + "\"";
-                        }
-                        if (gitJob == 0) {
-                            ZanIDE.GitBegin(root, "diff HEAD" + gtgt);
-                            gitJob = 2;
-                            log.Add("> git diff HEAD" + gtgt + " ...");
-                        }
-                        dock.Focus("output");
-                        coLog.Reset();
-                        app.RequestRedraw();
-                    }
-                    if (Ui.Clicked(app, gLogId)) {
-                        if (gitJob == 0) {
-                            ZanIDE.GitBegin(root, "log --oneline --decorate -20");
-                            gitJob = 2;
-                            log.Add("> git log ...");
-                        }
-                        dock.Focus("output");
-                        coLog.Reset();
-                        app.RequestRedraw();
-                    }
-                    if (Ui.Clicked(app, gPulId)) {
-                        if (gitJob == 0) {
-                            log.Add("> git pull ...");
-                            ZanIDE.GitBegin(root, "pull");
-                            gitJob = 2;
-                        }
-                        dock.Focus("output");
-                        app.RequestRedraw();
-                    }
-                    if (Ui.Clicked(app, gPshId)) {
-                        if (gitJob == 0) {
-                            log.Add("> git push ...");
-                            ZanIDE.GitBegin(root, "push");
-                            gitJob = 2;
-                        }
-                        dock.Focus("output");
-                        app.RequestRedraw();
-                    }
-                    // Changed-file list (porcelain "XY path" rows): click
-                    // selects, double-click opens the file in the editor.
-                    int gListY = gRow2 + app.Scale(30);
-                    int gListH = rInY - gPad - gListY;
-                    gitList.Bind(gitFiles);
-                    gitList.Refresh();
-                    gitList.SelectIndex(gitSel.Get());
-                    gitList.RenderInside(app, new Rect(
-                        gArea.x + gPad, gListY,
-                        gArea.width - gPad * 2, gListH));
-                    gitSel.Set(gitList.SelectedIndex());
-                    // Bottom row: commit message + Commit (stages nothing
-                    // itself; commits what is already staged, falling back
-                    // to `commit -a` when nothing is staged yet).
-                    gitMsgIn.Render(app, rp.x + rPad, rInY, rInW, rInH);
-                    int gCmtId = new Button { Text = ZanIDE.T("Commit", "提交"), Class = "primary small" }
-                        .Render(app, rp.x + rPad * 2 + rInW, rInY + app.Scale(2), rBtnW);
-                    if (Ui.Clicked(app, gCmtId)) {
-                        string gMsg = gitMsgIn.GetText();
-                        if (gMsg == "") {
-                            log.Add(ZanIDE.T("> Enter a commit message first.",
-                                "> 请先输入提交信息。"));
-                        } else {
-                            gMsg = ZanIDE.GitEscape(gMsg);
-                            if (gitJob == 0) {
-                                ZanIDE.GitBegin(root,
-                                    "diff --cached --quiet && git -C \"" + root
-                                    + "\" commit -a -m \"" + gMsg
-                                    + "\" || git -C \"" + root + "\" commit -m \"" + gMsg + "\"");
-                                gitJob = 2;
-                                log.Add("> git commit ...");
-                                gitMsgIn.SetText("");
-                            }
-                        }
-                        dock.Focus("output");
-                        app.RequestRedraw();
-                    }
-                }
-            }
+            // ---- Git panel: its own designed panel
+            // (panels/GitPanel.zform): branch header, the command rows, the
+            // changed-file list and the commit row. Every button is a designed
+            // onClick handler, so the shell only hands over the rect.
+            gitPanel.Render(app, dock.ContentParked("git"));
             // ---- Tools and Examples panels: a tree each, both owning their
             // filter row, scrolling and selection. A double-click RUNS a
             // tool (tools are Zan code) or opens an example's source in the
@@ -4861,7 +4704,6 @@ partial class ZanIDE {
         sbPosItem = statusBar.AddLeft("Ln 1, Col 1");
         sbModeItem = statusBar.AddRight("Zan");
         sbEncItem = statusBar.AddRight("UTF-8");
-        errorList = new ErrorList();
         lastActive = 0 - 1;
         // Which .zform tab the designer is currently bound to, and the last
         // serialized layout (to detect changes and persist them back to disk).
@@ -5077,14 +4919,11 @@ partial class ZanIDE {
         // ---- Output console text selection (drag to select, right-click copy) ----
         // Anchor/head positions are absolute (row = index into `log`, col = char).
         // Scroll position and selection live in the LogView's own state.
-        coLog = new LogState();
         // Output/Errors right-click context menu (copy line / copy all / clear).
         coCtxOpen = false;
         coCtxX = 0;
         coCtxY = 0;
         coCtxRow = 0 - 1;
-        coFilter = new Input(
-            ZanIDE.T("Filter output...", "筛选输出..."));
     }
 
     /// Debugger state: breakpoints, stepping and the variable/stack views.
@@ -5188,6 +5027,47 @@ partial class ZanIDE {
         dockErrorsTitle = "";
     }
 
+    /// Builds the designed dock panels: every panel is a compile-time
+    /// `.zform` control document plus its code-behind (see
+    /// `src/ide_zan/src/panels/`), so the shell only owns the composition --
+    /// which panel goes where, and the rect each one gets. The panels''' own
+    /// widgets stay the source of truth for the state the shell still reads
+    /// (the explorer tree, the console's filter/scroll state), so nothing is
+    /// duplicated.
+    void InitDockPanels(Form form) {
+        explorerPanel = new ExplorerPanel();
+        explorerPanel.Wire(treeSel, treeFilter);
+        explorerTv = ExplorerPanel.Tree;
+        outputPanel = new OutputPanel();
+        coFilter = outputPanel.FilterBox();
+        coLog = outputPanel.State();
+        errorsPanel = new ErrorsPanel();
+        errorList = ErrorsPanel.List;
+        gitPanel = new GitPanel();
+        gitList = gitPanel.FileList();
+        // The designed `on<Event>` bindings of every panel go through the
+        // form'''s handler registry, so hand the form over and register them.
+        OutputPanel.__WireForm(form);
+        GitPanel.__WireForm(form);
+        form.On("outputClear", ZanIDE.OutputClearRequested);
+        GitPanel.WireHandlers(form);
+    }
+
+    /// The console jumps back to the newest line (a fresh run/build starts).
+    void OutputReset() {
+        if (coLog != null) { coLog.Reset(); }
+    }
+
+    /// The console'''s Clear button (designed handler): empties the real log
+    /// and resets the panel'''s filter and scroll state.
+    static void OutputClearRequested() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || ide.coCtxOpen) { return; }
+        ide.log = new List<string>();
+        ide.coFilter.SetText("");
+        ide.OutputReset();
+    }
+
     /// Git panel state (the right panel's "Git" tab).
     void InitGitPanel() {
         // ---- Git panel state (right panel "Git" tab) ----
@@ -5201,13 +5081,7 @@ partial class ZanIDE {
         // git never blocks drawing.
         gitJob = 0;
         gitSel = new SignalInt(0 - 1);
-        gitList = new ListView<string>(GitFileRow.Of);
-        gitList.Class = "flat";
-        gitList.EmptyText(ZanIDE.T("Working tree clean.", "工作区无变更。"));
-        gitList.OnActivate(ZanIDE.GitFileActivated);
         gitScroll = new SignalInt(0);
-        gitMsgIn = new Input(
-            ZanIDE.T("Commit message...", "提交信息..."));
         // Tools / Examples trees for the right panel tabs.
         rtToolTree = ZanIDE.BuildDirTree(ZanIDE.ToolsDir());
         rtExTree = ZanIDE.BuildExampleTree();
@@ -5282,11 +5156,6 @@ partial class ZanIDE {
         aiCueCaret.Class = "hint small";
         aiPendLbl = new Label("");
         aiPendLbl.Class = "small";
-        gitNoRepoLbl = new Label(ZanIDE.T("Not a git repository.",
-            "当前项目不是 git 仓库。"));
-        gitNoRepoLbl.Class = "secondary small";
-        gitBranchLbl = new Label("");
-        gitBranchLbl.Class = "small";
         aiPlanList = new ListView<AiPlanStep>(PlanRow.Of);
         aiPlanList.Class = "plan flat";
         aiPlanBound = null;

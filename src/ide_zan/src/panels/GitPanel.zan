@@ -1,0 +1,179 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// GIT 面板：仓库状态 + 暂存 / 提交 / 同步。
+///
+/// 界面在 `GitPanel.zform` 里声明：分支行、两排命令按钮、变更文件
+/// 列表、底部的提交信息行；空仓库时只显示提示和「初始化仓库」。
+/// 每个按钮的 `onClick` 是设计里的处理器名，由 `WireHandlers` 注册
+/// 到宿主 Form 的处理器表上（`.zform` 的事件通路），这里的代码只
+/// 表达意图：真正跑 git 的是 `ZanIDE.GitBegin` 那一层，命令的输出
+/// 全部回到 OUTPUT 面板，界面永不阻塞。
+partial class GitPanel {
+    void OnInit() {
+        GitPanel.Files.WithRow(GitFileRow.Of);
+        GitPanel.Files.EmptyText(ZanIDE.T("Working tree clean.", "工作区无变更。"));
+        GitPanel.Files.OnActivate(ZanIDE.GitFileActivated);
+        GitPanel.NoRepo.Text = ZanIDE.T("Not a git repository.",
+            "当前项目不是 git 仓库。");
+        GitPanel.InitBtn.SetProp("text",
+            ZanIDE.T("Initialize repository", "初始化仓库"));
+        GitPanel.RefreshBtn.SetProp("text", ZanIDE.T("Refresh", "刷新"));
+        GitPanel.StageBtn.SetProp("text", ZanIDE.T("Stage all", "暂存全部"));
+        GitPanel.DiffBtn.SetProp("text", ZanIDE.T("Diff", "差异"));
+        GitPanel.LogBtn.SetProp("text", ZanIDE.T("History", "历史"));
+        GitPanel.PullBtn.SetProp("text", ZanIDE.T("Pull", "拉取"));
+        GitPanel.PushBtn.SetProp("text", ZanIDE.T("Push", "推送"));
+        GitPanel.CommitBtn.SetProp("text", ZanIDE.T("Commit", "提交"));
+        GitPanel.Message.SetProp("placeholder",
+            ZanIDE.T("Commit message...", "提交信息..."));
+    }
+
+    /// 把设计里的 `onClick` 名字接到本面板的处理器上。
+    static void WireHandlers(Form form) {
+        form.On("gitInit", GitPanel.OnInitRepo);
+        form.On("gitRefresh", GitPanel.OnRefresh);
+        form.On("gitStage", GitPanel.OnStage);
+        form.On("gitDiff", GitPanel.OnDiff);
+        form.On("gitLog", GitPanel.OnHistory);
+        form.On("gitPull", GitPanel.OnPull);
+        form.On("gitPush", GitPanel.OnPush);
+        form.On("gitCommit", GitPanel.OnCommit);
+    }
+
+    /// 变更文件列表控件（外壳的行处理器读取选中项）。
+    ListView<string> FileList() { return GitPanel.Files; }
+
+    void Render(App app, Rect area) {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        bool repo = Directory.Exists(ide.root + "/.git");
+        // 第一次显示（以及每次刷新后）按需扫一遍状态：git 在后台跑，
+        // 结果由帧循环轮询，绘制不等它。
+        if (repo && !ide.gitLoaded && ide.gitJob == 0) {
+            ZanIDE.GitRefreshBegin(ide.root);
+            ide.gitJob = 1;
+            app.RequestAnimationFrame(120);
+        }
+        GitPanel.NoRepo.SetShown(!repo);
+        GitPanel.InitBtn.SetShown(!repo);
+        GitPanel.Branch.SetShown(repo);
+        GitPanel.Row1.SetShown(repo);
+        GitPanel.Row2.SetShown(repo);
+        GitPanel.CommitRow.SetShown(repo);
+        GitPanel.Files.SetShown(repo);
+        if (repo) {
+            GitPanel.Branch.Text = ZanIDE.T("Branch: ", "分支：")
+                + ide.gitBranch + "   ("
+                + Convert.ToString(ide.gitFiles.Count)
+                + ZanIDE.T(" changes", " 处变更") + ")";
+            GitPanel.Files.Bind(ide.gitFiles);
+            GitPanel.Files.Refresh();
+            GitPanel.Files.SelectIndex(ide.gitSel.Get());
+        }
+        this.RenderInside(app, area);
+        if (repo) { ide.gitSel.Set(GitPanel.Files.SelectedIndex()); }
+    }
+
+    // ---- 设计里的处理器：每个都只发起一次后台 git 作业 ----
+
+    static void OnInitRepo() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || ide.gitJob != 0) { return; }
+        ZanIDE.GitBegin(ide.root, "init");
+        ide.gitJob = 2;
+        ide.log.Add(ZanIDE.T("> git init ...", "> 正在初始化 git 仓库 ..."));
+    }
+
+    static void OnRefresh() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        ide.gitLoaded = false;
+    }
+
+    static void OnStage() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        if (ide.gitJob == 0) {
+            ZanIDE.GitBegin(ide.root, "add -A");
+            ide.gitJob = 2;
+            ide.log.Add(ZanIDE.T("> Staging all changes ...",
+                "> 正在暂存全部变更 ..."));
+        }
+        ide.dock.Focus("output");
+    }
+
+    static void OnDiff() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        string target = "";
+        int sel = ide.gitSel.Get();
+        if (sel >= 0 && sel < ide.gitFiles.Count) {
+            target = " -- \"" + ZanIDE.GitPathOf(ide.gitFiles[sel]) + "\"";
+        }
+        if (ide.gitJob == 0) {
+            ZanIDE.GitBegin(ide.root, "diff HEAD" + target);
+            ide.gitJob = 2;
+            ide.log.Add("> git diff HEAD" + target + " ...");
+        }
+        ide.dock.Focus("output");
+        ide.OutputReset();
+    }
+
+    static void OnHistory() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        if (ide.gitJob == 0) {
+            ZanIDE.GitBegin(ide.root, "log --oneline --decorate -20");
+            ide.gitJob = 2;
+            ide.log.Add("> git log ...");
+        }
+        ide.dock.Focus("output");
+        ide.OutputReset();
+    }
+
+    static void OnPull() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        if (ide.gitJob == 0) {
+            ide.log.Add("> git pull ...");
+            ZanIDE.GitBegin(ide.root, "pull");
+            ide.gitJob = 2;
+        }
+        ide.dock.Focus("output");
+    }
+
+    static void OnPush() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        if (ide.gitJob == 0) {
+            ide.log.Add("> git push ...");
+            ZanIDE.GitBegin(ide.root, "push");
+            ide.gitJob = 2;
+        }
+        ide.dock.Focus("output");
+    }
+
+    /// 提交:不自行暂存,提交已暂存的内容;什么都没暂存时退回
+    /// `commit -a`,于是「暂存全部 + 提交」和直接提交都成立。
+    static void OnCommit() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        string msg = GitPanel.Message.GetText();
+        if (msg == "") {
+            ide.log.Add(ZanIDE.T("> Enter a commit message first.",
+                "> 请先输入提交信息。"));
+        } else if (ide.gitJob == 0) {
+            msg = ZanIDE.GitEscape(msg);
+            ZanIDE.GitBegin(ide.root,
+                "diff --cached --quiet && git -C \"" + ide.root
+                + "\" commit -a -m \"" + msg
+                + "\" || git -C \"" + ide.root + "\" commit -m \"" + msg + "\"");
+            ide.gitJob = 2;
+            ide.log.Add("> git commit ...");
+            GitPanel.Message.SetText("");
+        }
+        ide.dock.Focus("output");
+    }
+}
