@@ -24,6 +24,8 @@ import sys
 
 RT_IO = ["src/runtime/rt_io.c", "src/runtime/rt_sched.c"]
 RT_SYNC = ["src/runtime/rt_sync.c"]
+RT_FILE = ["src/runtime/rt_file.c"]
+RT_WASM = ["src/runtime/rt_wasm.c", "src/runtime/rt_file.c"]
 GUI = ["src/runtime/gui_runtime.c", "src/runtime/gui_runtime_text.c",
        "src/runtime/gui_runtime_font.c", "src/runtime/gui_runtime_x11.c",
        "src/runtime/gui_runtime_tray.c", "src/runtime/gui_runtime_sdl.c",
@@ -36,16 +38,22 @@ GUI = ["src/runtime/gui_runtime.c", "src/runtime/gui_runtime_text.c",
 ARTIFACTS = [
     ("toolchain/linux-musl/zanrt_io.o", RT_IO, "runtime"),
     ("toolchain/linux-musl/zanrt_sync.o", RT_SYNC, "runtime"),
+    ("toolchain/linux-musl/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/linux-arm64/zanrt_io.o", RT_IO, "runtime"),
     ("toolchain/linux-arm64/zanrt_sync.o", RT_SYNC, "runtime"),
+    ("toolchain/linux-arm64/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/linux-riscv64/zanrt_io.o", RT_IO, "runtime"),
     ("toolchain/linux-riscv64/zanrt_sync.o", RT_SYNC, "runtime"),
+    ("toolchain/linux-riscv64/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/macos/arm64/zanrt_io.o", RT_IO, "runtime"),
     ("toolchain/macos/arm64/zanrt_io_mt.o", RT_IO, "runtime"),
     ("toolchain/macos/arm64/zanrt_sync.o", RT_SYNC, "runtime"),
+    ("toolchain/macos/arm64/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/macos/x64/zanrt_io.o", RT_IO, "runtime"),
     ("toolchain/macos/x64/zanrt_io_mt.o", RT_IO, "runtime"),
     ("toolchain/macos/x64/zanrt_sync.o", RT_SYNC, "runtime"),
+    ("toolchain/macos/x64/zanrt_file.o", RT_FILE, "runtime"),
+    ("toolchain/wasm32/zanrt_wasm.o", RT_WASM, "runtime"),
     ("stdlib/Gui/drivers/win-x64/zan_gui.dll", GUI, "gui"),
     ("stdlib/Gui/drivers/linux-x64/static/libzan_gui.a", GUI, "gui"),
     ("stdlib/Gui/drivers/linux-arm64/static/libzan_gui.a", GUI, "gui"),

@@ -28,11 +28,12 @@ for pair in linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64; do
         -I "$RT" -O2 -c "$RT/rt_io.c" -o "$out/zanrt_io.o"
     "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 \
         -I "$RT" -O2 -c "$RT/rt_sync.c" -o "$out/zanrt_sync.o"
+        -I "$RT" -O2 -c "$RT/rt_file.c" -o "$out/zanrt_file.o"
     # Every emitted program calls zan_timer_* from its inline coroutine driver,
     # so a cross-link needs this object unconditionally (see main.c) -- including
     # when the output is a .so, hence -fPIC (x86_64 otherwise emits absolute
     # 32-bit relocations that a shared object cannot take).
     "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
         -I "$RT" -O2 -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
-    echo "built toolchain/$sub: zanrt_io.o zanrt_sync.o zanrt_timer.o"
+    echo "built toolchain/$sub: zanrt_io.o zanrt_sync.o zanrt_file.o zanrt_timer.o"
 done

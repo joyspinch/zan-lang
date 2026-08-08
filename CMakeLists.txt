@@ -244,6 +244,29 @@ add_custom_command(TARGET zanc POST_BUILD
             ${ZAN_RT_SYNC_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_sync${CMAKE_C_OUTPUT_EXTENSION}
     VERBATIM)
 
+# ---- File metadata + stream-IO runtime (System.IO.FileInfo/FileStream) ----
+# Split out of rt_sync.c so a file-IO program links this small object instead
+# of dragging in the atomics/threads/shared-table runtime. The split is what
+# lets a wasm32 (WASI) cross-build link file-IO programs at all: this file is
+# pure libc + a mutex (see toolchain/wasm32/zanrt_file.o), while rt_sync.c
+# cannot be built for wasm (no pthread/shm).
+set(ZAN_RT_FILE_OBJ "${CMAKE_BINARY_DIR}/zanrt_file${CMAKE_C_OUTPUT_EXTENSION}")
+add_custom_command(
+    OUTPUT ${ZAN_RT_FILE_OBJ}
+    COMMAND ${ZAN_RT_IO_CC} -std=c11
+            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
+            -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_file.c -o ${ZAN_RT_FILE_OBJ}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_file.c
+    COMMENT "Building file IO runtime object (zanrt_file)"
+    VERBATIM)
+add_custom_target(zanrt_file ALL DEPENDS ${ZAN_RT_FILE_OBJ})
+add_dependencies(zanc zanrt_file)
+target_compile_definitions(zanc PRIVATE ZAN_RT_FILE_OBJ="${ZAN_RT_FILE_OBJ}")
+add_custom_command(TARGET zanc POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${ZAN_RT_FILE_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_file${CMAKE_C_OUTPUT_EXTENSION}
+    VERBATIM)
+
 # ---- Self-contained linking toolchain (Windows) ----
 # Bundle a small GNU ld + the redistributable MinGW-w64 runtime next to zanc so
 # that `zanc app.zan -o app.exe` needs only zan: no external clang / gcc / MSVC /
@@ -275,17 +298,24 @@ endif()
 # (its inline coroutine driver calls zan_timer_*).
 foreach(_linux_sub linux-musl linux-arm64 linux-riscv64)
     set(_linux_sys "${CMAKE_SOURCE_DIR}/toolchain/${_linux_sub}")
-    if(EXISTS "${_linux_sys}/libc.a")
-        add_custom_command(TARGET zanc POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:zanc>/${_linux_sub}
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${_linux_sys}/crt1.o" "${_linux_sys}/crti.o"
-                    "${_linux_sys}/crtn.o" "${_linux_sys}/libc.a"
-                    "${_linux_sys}/zanrt_io.o" "${_linux_sys}/zanrt_sync.o"
-                    "${_linux_sys}/zanrt_timer.o"
-                    $<TARGET_FILE_DIR:zanc>/${_linux_sub}/
-            COMMENT "Copying ${_linux_sub} sysroot for cross-compilation"
-            VERBATIM)
+        if(EXISTS "${_linux_sys}/libc.a")
+            add_custom_command(TARGET zanc POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:zanc>/${_linux_sub}
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_linux_sys}/crt1.o" "${_linux_sys}/crti.o"
+                        "${_linux_sys}/crtn.o" "${_linux_sys}/libc.a"
+                        "${_linux_sys}/zanrt_io.o" "${_linux_sys}/zanrt_sync.o"
+                        "${_linux_sys}/zanrt_timer.o"
+                        $<TARGET_FILE_DIR:zanc>/${_linux_sub}/
+                COMMENT "Copying ${_linux_sub} sysroot for cross-compilation"
+                VERBATIM)
+            if(EXISTS "${_linux_sys}/zanrt_file.o")
+                add_custom_command(TARGET zanc POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            "${_linux_sys}/zanrt_file.o"
+                            $<TARGET_FILE_DIR:zanc>/${_linux_sub}/
+                    VERBATIM)
+            endif()
         if(EXISTS "${_linux_sys}/zanrt_mem.o")
             add_custom_command(TARGET zanc POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -507,6 +537,7 @@ enable_testing()
 add_executable(zanrt_sync_test
     tests/runtime/rt_sync_test.c
     src/runtime/rt_sync.c
+    src/runtime/rt_file.c
 )
 target_include_directories(zanrt_sync_test PRIVATE ${CMAKE_SOURCE_DIR})
 set_target_properties(zanrt_sync_test PROPERTIES

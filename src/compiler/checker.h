@@ -26,6 +26,13 @@ struct zan_checker {
      * expression resolves local-first, then fields, then scope -- the same
      * precedence irgen uses */
     struct checker_local *locals;
+    /* the call expression typed most recently and the method it resolved to,
+     * so a member access on a call result can tell whether the callee can
+     * hand back null (`o.PathGet("k").AsString(...)`) */
+    zan_ast_node_t *last_call_node;
+    zan_symbol_t *last_call_method;
+    /* body of the method being checked, scanned for a local's null guard */
+    zan_ast_node_t *current_body;
 };
 
 void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,

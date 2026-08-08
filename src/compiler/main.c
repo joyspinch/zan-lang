@@ -1213,6 +1213,37 @@ static const char *zan_path_basename(const char *p) {
     return b;
 }
 
+/* WASI cross-builds: auto-stdlib compiles whole namespace directories, so the
+ * declaration-level flags (uses_sync_runtime / uses_socket_async) are set for
+ * almost every program even when the runtime object's symbols are never
+ * actually referenced. Before rejecting a wasm32 link for a runtime object
+ * that cannot be built for wasm, check the emitted object's undefined symbols
+ * with llvm-nm: only a real reference needs the object. Returns 1 when `obj`
+ * references any symbol starting with one of `prefixes`; 0 when it references
+ * none (or the check could not run -- the wasm-ld link below still fails on
+ * any symbol that cannot be resolved, so a false "clean" is caught there). */
+static int wasm_obj_refs_any(const char *obj, const char *const *prefixes) {
+    char nmout[1300];
+    snprintf(nmout, sizeof(nmout), "%s.nm", obj);
+    char nmcmd[1600];
+    snprintf(nmcmd, sizeof(nmcmd), "llvm-nm -u \"%s\" > \"%s\" 2>&1", obj, nmout);
+    if (system(nmcmd) != 0) { remove(nmout); return 0; }
+    int found = 0;
+    FILE *f = fopen(nmout, "rb");
+    if (f) {
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            for (int pi = 0; prefixes[pi]; pi++) {
+                if (strstr(line, prefixes[pi])) { found = 1; break; }
+            }
+            if (found) break;
+        }
+        fclose(f);
+    }
+    remove(nmout);
+    return found;
+}
+
 /* Write a single-member ar archive (a static library) containing `obj`.
  * The ar format is trivial: the "!<arch>\n" magic, then one 60-byte member
  * header followed by the member data (padded to even length with '\n').
@@ -1267,9 +1298,10 @@ static void print_usage(void) {
     fprintf(stderr, "  --dump-tokens   Dump lexer tokens\n");
     fprintf(stderr, "  --dump-ast      Dump parse tree\n");
     fprintf(stderr, "  --emit-ir       Emit LLVM IR to stdout\n");
-    fprintf(stderr, "  --check-leaks   Report unreleased objects at program exit\n");
+    fprintf(stderr, "  --check-leaks   Report unreleased objects at program exit (default with -g)\n");
+    fprintf(stderr, "  --arc-guard     Quarantine freed objects and trap stale retain/release (default with -g)\n");
+    fprintf(stderr, "  --no-check-leaks, --no-arc-guard  Turn those off in a debug build\n");
     fprintf(stderr, "  --no-runtime-checks  Disable runtime guards (e.g. division by zero)\n");
-    fprintf(stderr, "  --arc-guard     Quarantine freed objects and trap stale retain/release\n");
     fprintf(stderr, "  --publish        Build optimized release binary (strip debug, optimize)\n");
     fprintf(stderr, "  --link-mode <m>  Native driver linking on publish: shared (copy driver\n");
     fprintf(stderr, "                   libs next to the exe, default) or static (link into the exe)\n");
@@ -1327,8 +1359,11 @@ int main(int argc, char **argv) {
     const char *emit_symbols_path = NULL; /* --emit-symbols <file> */
     const char *gen_meta_path = NULL;     /* --gen-meta <file>: export metadata */
     bool do_emit_ir = false;
-    bool check_leaks = false;
-    bool arc_guard = false;
+    /* Tri-state until the whole command line is known: -g turns both ARC
+     * diagnostics on and --publish turns them off, so an explicit
+     * --check-leaks/--no-check-leaks wins regardless of argument order. */
+    int check_leaks_opt = -1;
+    int arc_guard_opt = -1;
     bool runtime_checks = true;
     bool publish_mode = false;
     bool debug_info = false; /* -g / --debug: emit DWARF for source debugging */
@@ -1380,9 +1415,13 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--emit-ir") == 0) {
             do_emit_ir = true;
         } else if (strcmp(argv[i], "--check-leaks") == 0) {
-            check_leaks = true;
+            check_leaks_opt = 1;
+        } else if (strcmp(argv[i], "--no-check-leaks") == 0) {
+            check_leaks_opt = 0;
         } else if (strcmp(argv[i], "--arc-guard") == 0) {
-            arc_guard = true;
+            arc_guard_opt = 1;
+        } else if (strcmp(argv[i], "--no-arc-guard") == 0) {
+            arc_guard_opt = 0;
         } else if (strcmp(argv[i], "--no-runtime-checks") == 0) {
             runtime_checks = false;
         } else if (strcmp(argv[i], "--publish") == 0) {
@@ -1940,6 +1979,13 @@ int main(int argc, char **argv) {
                     strcmp(ext, ".dylib") == 0))
             lib_shared = true;
     }
+    /* Debug builds carry the ARC diagnostics by default -- a leak or a stale
+     * reference reports itself with a source location instead of surfacing as
+     * a crash days later -- and --publish carries none of their cost. */
+    bool check_leaks = check_leaks_opt >= 0 ? check_leaks_opt != 0
+                                           : (debug_info && !publish_mode);
+    bool arc_guard = arc_guard_opt >= 0 ? arc_guard_opt != 0
+                                        : (debug_info && !publish_mode);
     if (zan_irgen_init(&irgen, arena, diag, &binder, input_file,
                        irgen_triple,
                        target.os == ZAN_OS_WINDOWS, mt_scheduler,
@@ -2202,6 +2248,7 @@ int main(int argc, char **argv) {
         zan_exe_dir(link_exe_dir, sizeof(link_exe_dir));
         char rt_io_buf[1200];
         char rt_sync_buf[1200];
+        char rt_file_buf[1200];
         char rt_embed_buf[1200];
         char rt_timer_buf[1200];
 
@@ -2234,6 +2281,18 @@ int main(int argc, char **argv) {
             snprintf(rt_sync_buf, sizeof(rt_sync_buf), "%s/%s",
                      link_exe_dir, zan_path_basename(ZAN_RT_SYNC_OBJ));
             rt_sync_obj = rt_sync_buf;
+        }
+#endif
+        /* File IO runtime (zan_file_*: System.IO.FileInfo/FileStream). Its own
+         * object so a file-IO program does not link the atomics/threads/
+         * shared-table runtime; wasm32 cross-builds can link this one against
+         * plain libc while rt_sync.o remains unavailable there. */
+        const char *rt_file_obj = NULL;
+#ifdef ZAN_RT_FILE_OBJ
+        if (irgen.uses_file_runtime) {
+            snprintf(rt_file_buf, sizeof(rt_file_buf), "%s/%s",
+                     link_exe_dir, zan_path_basename(ZAN_RT_FILE_OBJ));
+            rt_file_obj = rt_file_buf;
         }
 #endif
         /* Embedded-resource API (zan_embed_read/has/list/raw/register): any
@@ -2298,14 +2357,35 @@ int main(int argc, char **argv) {
         }
         if (cross_compiling && rt_sync_obj && target.os != ZAN_OS_LINUX
             && target.os != ZAN_OS_MACOS && target.os != ZAN_OS_WINDOWS) {
-            fprintf(stderr,
-                    "error: AtomicInt and SharedTable are not available for "
-                    "this cross-compilation target yet\n");
-            remove(obj_tmp);
-            zan_irgen_destroy(&irgen);
-            zan_arena_free(arena);
-            free(source);
-            return 1;
+            /* For WASI the declaration-level `uses_sync_runtime` flag is too
+             * coarse: auto-stdlib compiles whole namespace directories, and
+             * System.IO -> DirectoryWatcher -> System.Threading pulls the
+             * complete sync API declaration (atomics, shared table, threads,
+             * monitor, clock) into almost every program even when nothing is
+             * ever called. What matters is whether the emitted object really
+             * references a sync symbol -- only then does the link need
+             * rt_sync.o, which cannot be built for wasm (no pthread/shm). */
+            int needs_sync = 1;   /* conservative default */
+            if (target.os == ZAN_OS_WASI) {
+                static const char *const sync_pre[] = {
+                    "zan_atomic_int_", "zan_shared_table_",
+                    "zan_thread_", "zan_dispatch_", "zan_monitor_",
+                    "zan_monotonic_", "zan_plat_",
+                    "zan_exe_dir_into", "zan_dir_list_into",
+                    NULL
+                };
+                needs_sync = wasm_obj_refs_any(obj_tmp, sync_pre);
+            }
+            if (needs_sync) {
+                fprintf(stderr,
+                        "error: AtomicInt and SharedTable are not available for "
+                        "this cross-compilation target yet\n");
+                remove(obj_tmp);
+                zan_irgen_destroy(&irgen);
+                zan_arena_free(arena);
+                free(source);
+                return 1;
+            }
         }
 
         /* Extra library search dirs for [DllImport] libs, taken from the
@@ -2585,6 +2665,7 @@ int main(int argc, char **argv) {
                      * (single-pass ld) */
                     if (rt_io_obj && a < 120) argv[a++] = rt_io_obj;
                     if (rt_sync_obj && a < 120) argv[a++] = rt_sync_obj;
+                    if (rt_file_obj && a < 120) argv[a++] = rt_file_obj;
                     if (rt_embed_obj && a < 120) argv[a++] = rt_embed_obj;
                     if (rt_timer_obj && a < 120) argv[a++] = rt_timer_obj;
                     /* Also emit an import library (see implib naming note
@@ -2709,6 +2790,11 @@ int main(int argc, char **argv) {
                         snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
                                  rt_sync_obj);
                     }
+                    if (rt_file_obj) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                                 rt_file_obj);
+                    }
                     if (rt_embed_obj) {
                         size_t cur = strlen(cmd);
                         snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
@@ -2753,6 +2839,11 @@ int main(int argc, char **argv) {
                         size_t cur = strlen(cmd);
                         snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
                                  rt_sync_obj);
+                    }
+                    if (rt_file_obj) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                                 rt_file_obj);
                     }
                     if (rt_embed_obj) {
                         size_t cur = strlen(cmd);
@@ -2855,6 +2946,11 @@ int main(int argc, char **argv) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_sync.o\"", sys);
             }
+            if (irgen.uses_file_runtime) {
+                /* file metadata / stream IO runtime (zan_file_*). */
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_file.o\"", sys);
+            }
             if (irgen.uses_embed_api) {
                 /* embedded-resource API; pure C, compiled for the target in the
                  * same sysroot build that produces zanrt_io.o */
@@ -2924,6 +3020,7 @@ int main(int argc, char **argv) {
              * refreshed by the drivers workflow). */
             char winrt_io[1400] = {0};
             char winrt_sync[1400] = {0};
+            char winrt_file[1400] = {0};
             char winrt_embed[1400] = {0};
             if (rt_io_obj)
                 snprintf(winrt_io, sizeof(winrt_io), "%s/%s/%s", exe_dir2, wsub,
@@ -2931,11 +3028,15 @@ int main(int argc, char **argv) {
             if (rt_sync_obj)
                 snprintf(winrt_sync, sizeof(winrt_sync), "%s/%s/zanrt_sync.o",
                          exe_dir2, wsub);
+            if (rt_file_obj)
+                snprintf(winrt_file, sizeof(winrt_file), "%s/%s/zanrt_file.o",
+                         exe_dir2, wsub);
             if (rt_embed_obj)
                 snprintf(winrt_embed, sizeof(winrt_embed),
                          "%s/%s/zan_embed_api.o", exe_dir2, wsub);
             if ((winrt_io[0] && !zan_file_exists(winrt_io))
                 || (winrt_sync[0] && !zan_file_exists(winrt_sync))
+                || (winrt_file[0] && !zan_file_exists(winrt_file))
                 || (winrt_embed[0] && !zan_file_exists(winrt_embed))) {
                 fprintf(stderr,
                         "error: bundled %s runtime objects not found in "
@@ -2984,6 +3085,10 @@ int main(int argc, char **argv) {
             if (winrt_sync[0]) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", winrt_sync);
+            }
+            if (winrt_file[0]) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", winrt_file);
             }
             if (winrt_embed[0]) {
                 size_t cur = strlen(cmd);
@@ -3047,14 +3152,23 @@ int main(int argc, char **argv) {
                 return 1;
             }
             if (rt_io_obj) {
-                fprintf(stderr,
-                        "error: socket-async programs are not available for "
-                        "the wasm32 target\n");
-                remove(obj_tmp);
-                zan_irgen_destroy(&irgen);
-                zan_arena_free(arena);
-                free(source);
-                return 1;
+                /* Same declaration-level coarseness as the sync flag: the
+                 * flag is set by any compiled zan_io_socket_* / zan_gate_*
+                 * declaration, but only a real undefined reference needs the
+                 * reactor object (which cannot link on wasm). */
+                static const char *const sock_pre[] = {
+                    "zan_io_socket_", "zan_gate_", NULL
+                };
+                if (wasm_obj_refs_any(obj_tmp, sock_pre)) {
+                    fprintf(stderr,
+                            "error: socket-async programs are not available for "
+                            "the wasm32 target\n");
+                    remove(obj_tmp);
+                    zan_irgen_destroy(&irgen);
+                    zan_arena_free(arena);
+                    free(source);
+                    return 1;
+                }
             }
             char cmd[8192];
             snprintf(cmd, sizeof(cmd),
@@ -3065,11 +3179,25 @@ int main(int argc, char **argv) {
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
                          extra_link_inputs[ei]);
             }
+            if (irgen.uses_file_runtime) {
+                /* file metadata / stream IO runtime (zan_file_*): pure libc +
+                 * a mutex, so it links against the wasi-libc sysroot below
+                 * (rt_sync.o cannot -- wasm has no pthread/shm). */
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_file.o\"",
+                         sys);
+            }
+            /* Every emitted program calls zan_timer_* from its inline
+             * coroutine driver, so the timer object links unconditionally.
+             * libzigc.a is zig's C-library companion (strlen/strcmp/abs and
+             * friends): zig's libc.a references them without defining them,
+             * so the link needs this archive on the command line too. */
             { size_t cur = strlen(cmd);
               snprintf(cmd + cur, sizeof(cmd) - cur,
-                       " \"%s/zanrt_wasm.o\" \"%s/libc.a\" \"%s/libm.a\""
+                       " \"%s/zanrt_timer.o\" \"%s/zanrt_wasm.o\""
+                       " \"%s/libc.a\" \"%s/libm.a\" \"%s/libzigc.a\""
                        " \"%s/libclang_rt.builtins-wasm32.a\"",
-                       sys, sys, sys, sys); }
+                       sys, sys, sys, sys, sys, sys); }
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_MACOS) {
             /* Cross-link a Mach-O executable with ld64.lld against the
@@ -3104,6 +3232,7 @@ int main(int argc, char **argv) {
                      (target.arch == ZAN_ARCH_AARCH64) ? "arm64" : "x64");
             char macrt_io[1400] = {0};
             char macrt_sync[1400] = {0};
+            char macrt_file[1400] = {0};
             char macrt_embed[1400] = {0};
             if (rt_io_obj) {
                 snprintf(macrt_io, sizeof(macrt_io), "%s/%s", macrt,
@@ -3113,12 +3242,17 @@ int main(int argc, char **argv) {
                 snprintf(macrt_sync, sizeof(macrt_sync), "%s/zanrt_sync.o",
                          macrt);
             }
+            if (rt_file_obj) {
+                snprintf(macrt_file, sizeof(macrt_file), "%s/zanrt_file.o",
+                         macrt);
+            }
             if (rt_embed_obj) {
                 snprintf(macrt_embed, sizeof(macrt_embed),
                          "%s/zan_embed_api.o", macrt);
             }
             if ((macrt_io[0] && !zan_file_exists(macrt_io))
                 || (macrt_sync[0] && !zan_file_exists(macrt_sync))
+                || (macrt_file[0] && !zan_file_exists(macrt_file))
                 || (macrt_embed[0] && !zan_file_exists(macrt_embed))) {
                 fprintf(stderr,
                         "error: bundled macOS runtime objects not found in "
@@ -3147,6 +3281,10 @@ int main(int argc, char **argv) {
             if (macrt_sync[0]) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", macrt_sync);
+            }
+            if (macrt_file[0]) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", macrt_file);
             }
             if (macrt_embed[0]) {
                 size_t cur = strlen(cmd);
@@ -3241,6 +3379,7 @@ int main(int argc, char **argv) {
             argv[a++] = obj_tmp;
             if (rt_io_obj) argv[a++] = rt_io_obj;
             if (rt_sync_obj) argv[a++] = rt_sync_obj;
+            if (rt_file_obj) argv[a++] = rt_file_obj;
             if (rt_embed_obj) argv[a++] = rt_embed_obj;
             if (rt_timer_obj) argv[a++] = rt_timer_obj;
             /* caller-supplied objects/resources (--link-input) */
@@ -3291,6 +3430,10 @@ int main(int argc, char **argv) {
             if (rt_sync_obj) {
                 size_t cur = strlen(link_cmd);
                 snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_sync_obj);
+            }
+            if (rt_file_obj) {
+                size_t cur = strlen(link_cmd);
+                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_file_obj);
             }
             if (rt_embed_obj) {
                 size_t cur = strlen(link_cmd);
@@ -3356,6 +3499,16 @@ int main(int argc, char **argv) {
 #else
             snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
                      " \"%s\" -pthread -lrt", rt_sync_obj);
+#endif
+        }
+        if (rt_file_obj) {
+            size_t cur = strlen(link_cmd);
+#ifdef __APPLE__
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+                     " \"%s\" -pthread", rt_file_obj);
+#else
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+                     " \"%s\" -pthread", rt_file_obj);
 #endif
         }
         if (rt_timer_obj) {

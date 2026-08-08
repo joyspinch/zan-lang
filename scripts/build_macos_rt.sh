@@ -34,9 +34,10 @@ for pair in arm64:aarch64 x64:x86_64; do
         -I "$RT" -O2 -c "$RT/rt_io.c" -o "$out/zanrt_io_mt.o"
     "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -I "$RT" -O2 \
         -c "$RT/rt_sync.c" -o "$out/zanrt_sync.o"
+        -c "$RT/rt_file.c" -o "$out/zanrt_file.o"
     # Every emitted program calls zan_timer_* from its inline coroutine driver,
     # so a cross-link needs this object unconditionally (see main.c).
     "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -I "$RT" -O2 \
         -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
-    echo "built toolchain/macos/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_timer.o"
+    echo "built toolchain/macos/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o"
 done

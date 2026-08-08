@@ -736,23 +736,11 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
  * --auto-stdlib after the user's sources -- contributes its fields all the
  * same. Multi-level chains are handled by resolving the base first
  * (recursively); inherited fields are PREPENDED so base fields stay a prefix
- * of the derived layout (upcasts are plain bitcasts). */
-static zan_symbol_t *type_own_member(zan_symbol_t *type_sym, zan_istr_t name) {
-    for (int i = 0; i < type_sym->member_count; i++) {
-        if ((type_sym->members[i]->kind == SYM_FIELD ||
-             type_sym->members[i]->kind == SYM_PROPERTY) &&
-            type_sym->members[i]->name.len == name.len &&
-            memcmp(type_sym->members[i]->name.str, name.str, name.len) == 0) {
-            return type_sym->members[i];
-        }
-    }
-    return NULL;
-}
-
-static bool type_has_own_member(zan_symbol_t *type_sym, zan_istr_t name) {
-    return type_own_member(type_sym, name) != NULL;
-}
-
+ * of the derived layout (upcasts are plain bitcasts). A derived field that
+ * repeats a base field's name HIDES it, C#-style: both keep their own slot
+ * (the base one stays in the prefix, so base methods still read and write
+ * the field they were compiled against) and a name resolves to the last
+ * declaration for the static type in hand -- see get_field_index. */
 static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
     zan_symbol_t *type_sym = scope_find(b->current_scope, type_node->type_decl.name);
     if (!type_sym || !type_sym->type || type_sym->decl != type_node) return;
@@ -799,29 +787,13 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
                  * diagnosed at the re-entry site). */
                 if (base_sym->type->bases_resolved != 2) continue;
                 type_sym->type->base_type = base_sym->type;
-                /* inherit base class fields and properties (prefix layout):
-                 * collect the base's non-shadowed fields/properties, then
-                 * prepend them to the derived member list */
+                /* inherit base fields and properties (prefix layout): count
+                 * them, then prepend them to the derived member list */
                 int ninherit = 0;
                 for (int bi = 0; bi < base_sym->member_count; bi++) {
-                    if (base_sym->members[bi]->kind != SYM_FIELD &&
-                        base_sym->members[bi]->kind != SYM_PROPERTY)
-                        continue;
-                    zan_symbol_t *shadow = type_own_member(type_sym,
-                                               base_sym->members[bi]->name);
-                    if (!shadow) { ninherit++; continue; }
-                    /* The derived declaration takes the base field's place in
-                     * the layout instead of adding a slot, so every base method
-                     * that touches a later base field writes through the wrong
-                     * offset (an int read back as an object pointer, then
-                     * released -- an access violation far from here). Shadowing
-                     * a base field is therefore rejected rather than laid out. */
-                    zan_diag_emit(b->diag, DIAG_ERROR,
-                        shadow->decl ? shadow->decl->loc : type_node->loc,
-                        "'%.*s' already exists in base type '%.*s'; remove this "
-                        "declaration and use the inherited member",
-                        (int)shadow->name.len, shadow->name.str,
-                        (int)base_name.len, base_name.str);
+                    if (base_sym->members[bi]->kind == SYM_FIELD ||
+                        base_sym->members[bi]->kind == SYM_PROPERTY)
+                        ninherit++;
                 }
                 if (ninherit > 0) {
                     int total = ninherit + type_sym->member_count;
@@ -829,9 +801,8 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
                         b->arena, sizeof(zan_symbol_t *) * (size_t)total);
                     int mi = 0;
                     for (int bi = 0; bi < base_sym->member_count; bi++) {
-                        if ((base_sym->members[bi]->kind == SYM_FIELD ||
-                             base_sym->members[bi]->kind == SYM_PROPERTY) &&
-                            !type_has_own_member(type_sym, base_sym->members[bi]->name)) {
+                        if (base_sym->members[bi]->kind == SYM_FIELD ||
+                            base_sym->members[bi]->kind == SYM_PROPERTY) {
                             merged[mi++] = base_sym->members[bi];
                         }
                     }

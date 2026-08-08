@@ -28,6 +28,16 @@ static void timer_lock(void) {
     EnterCriticalSection(&g_lock);
 }
 static void timer_unlock(void) { LeaveCriticalSection(&g_lock); }
+#elif defined(__wasm__)
+/* Single-threaded wasm (WASI): the sysroot has no pthreads, and none are
+ * needed -- one thread cannot race the timer heap. */
+#include <time.h>
+/* cloudlibc's time.h defines CLOCK_MONOTONIC (as a clockid) but does not
+ * declare clock_gettime; declare it -- libc.a provides the implementation
+ * as a WASI host-import wrapper. */
+int clock_gettime(clockid_t, struct timespec *);
+static void timer_lock(void) {}
+static void timer_unlock(void) {}
 #else
 #include <pthread.h>
 #include <time.h>
@@ -207,7 +217,7 @@ long long zan_timer_next_timeout(void) {
     return timeout;
 }
 
-size_t zan_timer_dispatch_due(void) {
+long long zan_timer_dispatch_due(void) {
     size_t dispatched = 0;
     for (;;) {
         long long now = zan_timer_now_ms();
@@ -259,7 +269,7 @@ size_t zan_timer_dispatch_due(void) {
     }
 }
 
-size_t zan_timer_pending(void) {
+long long zan_timer_pending(void) {
     size_t count = 0;
     timer_lock();
     for (size_t i = 0; i < g_heap_len; i++)

@@ -16,8 +16,10 @@ void zan_timer_set_ready_hook(void (*ready)(void *frame, zan_timer_step_t step))
 long long zan_timer_now_ms(void);
 void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step);
 long long zan_timer_next_timeout(void);
-size_t zan_timer_dispatch_due(void);
-size_t zan_timer_pending(void);
+/* These return counts; `long long` (not size_t) because the compiler's IR
+ * declares them with Zan's 64-bit int and wasm32's size_t is 32-bit. */
+long long zan_timer_dispatch_due(void);
+long long zan_timer_pending(void);
 
 long long zan_timer_tick(long long interval, zan_timer_callback_t callback);
 long long zan_timer_after(long long delay, zan_timer_callback_t callback);

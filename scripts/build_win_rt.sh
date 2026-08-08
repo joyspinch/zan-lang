@@ -27,7 +27,8 @@ mkdir -p "$OUT"
 "$CC" -O2 -g0 -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER -I "$RT" -c "$RT/rt_io.c" \
     -o "$OUT/zanrt_io_mt.o"
 "$CC" -O2 -g0 -std=c11 -I "$RT" -c "$RT/rt_sync.c" -o "$OUT/zanrt_sync.o"
+"$CC" -O2 -g0 -std=c11 -I "$RT" -c "$RT/rt_file.c" -o "$OUT/zanrt_file.o"
 # Every emitted program calls zan_timer_* from its inline coroutine driver, so a
 # cross-link needs this object unconditionally (see main.c).
 "$CC" -O2 -g0 -std=c11 -I "$RT" -c "$RT/rt_timer.c" -o "$OUT/zanrt_timer.o"
-echo "built toolchain/$SUB: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_timer.o"
+echo "built toolchain/$SUB: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o"

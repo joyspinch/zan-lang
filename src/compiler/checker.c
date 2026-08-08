@@ -71,16 +71,21 @@ static zan_symbol_t *checker_find_method(zan_symbol_t *type_sym, zan_istr_t name
  * initializer is lowered inside that constructor too); everywhere else the
  * assignment is an error. */
 
-/* The declared field of `type_sym` named `name`, walking the base chain. */
+/* The declared field of `type_sym` named `name`, walking the base chain. A
+ * derived field that hides a base one appears twice in the member list
+ * (inherited fields are its prefix), so the last match within a type is the
+ * declaration that type contributes. */
 static zan_symbol_t *checker_find_field(zan_symbol_t *type_sym, zan_istr_t name) {
     while (type_sym) {
+        zan_symbol_t *found = NULL;
         for (int i = 0; i < type_sym->member_count; i++) {
             zan_symbol_t *m = type_sym->members[i];
             if (m && (m->kind == SYM_FIELD || m->kind == SYM_PROPERTY) &&
                 m->name.len == name.len &&
                 memcmp(m->name.str, name.str, (size_t)name.len) == 0)
-                return m;
+                found = m;
         }
+        if (found) return found;
         type_sym = (type_sym->type && type_sym->type->base_type)
             ? type_sym->type->base_type->sym : NULL;
     }
@@ -101,8 +106,21 @@ static zan_symbol_t *checker_find_field(zan_symbol_t *type_sym, zan_istr_t name)
 struct checker_local {
     zan_istr_t name;
     zan_type_t *type;
+    /* the method this local was initialised from when that method can hand
+     * back null; NULL when the initialiser cannot be null */
+    zan_symbol_t *null_src;
     struct checker_local *next;
 };
+
+static struct checker_local *checker_find_local_slot(zan_checker_t *c,
+                                                     zan_istr_t name) {
+    for (struct checker_local *l = c->locals; l; l = l->next) {
+        if (l->name.len == name.len &&
+            memcmp(l->name.str, name.str, (size_t)name.len) == 0)
+            return l;
+    }
+    return NULL;
+}
 
 static zan_type_t *checker_find_local(zan_checker_t *c, zan_istr_t name) {
     for (struct checker_local *l = c->locals; l; l = l->next) {
@@ -120,8 +138,19 @@ static void checker_add_local(zan_checker_t *c, zan_istr_t name,
         zan_arena_alloc(c->arena, sizeof(struct checker_local));
     l->name = name;
     l->type = type;
+    l->null_src = NULL;
     l->next = c->locals;
     c->locals = l;
+}
+
+/* `T v = f();` where `f` can return null: remember which method it came from,
+ * so a later unguarded `v.M()` in this body can name it. */
+static void checker_mark_local_null_src(zan_checker_t *c, zan_ast_node_t *decl) {
+    zan_ast_node_t *init = decl->var_decl.initializer;
+    if (!init || init->kind != AST_CALL || init != c->last_call_node) return;
+    if (!c->last_call_method) return;
+    struct checker_local *l = checker_find_local_slot(c, decl->var_decl.name);
+    if (l) l->null_src = c->last_call_method;
 }
 
 static bool field_is_readonly(zan_symbol_t *field) {
@@ -849,6 +878,7 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
  * never finished checking at all. */
 static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                                        zan_type_t *obj_type);
+static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr);
 
 /* How many arguments `m` accepts: [min..max], min counting the parameters
  * without a default. Returns false when the count cannot be decided here --
@@ -1228,12 +1258,18 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
          * the delegate's return type. The member-access case is resolved here
          * so the two are not conflated. */
         int callee_is_method = 0;
+        zan_symbol_t *called_sym = NULL;
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             recv = zan_checker_check_expr(c, expr->call.callee->member.object);
             if (recv && recv->sym) {
                 zan_symbol_t *m = checker_find_method(recv->sym,
                                                       expr->call.callee->member.name);
                 if (m && m->kind == SYM_METHOD) {
+                    /* the unresolved path below reports through
+                     * check_member_access, so report here only for the
+                     * resolved-method fast path */
+                    checker_reject_null_receiver(c, expr->call.callee);
+                    called_sym = m;
                     callee_type = m->type ? m->type : c->binder->type_error;
                     callee_is_method = 1;
                 }
@@ -1251,6 +1287,13 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (arg && arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;
             zan_checker_check_expr(c, arg);
         }
+        /* Published after the arguments are checked (they are calls too), so a
+         * member access on this call reads *this* call's callee. */
+        if (!called_sym && expr->call.callee &&
+            expr->call.callee->kind == AST_IDENTIFIER)
+            called_sym = zan_binder_lookup(c->binder, expr->call.callee->ident.name);
+        c->last_call_node = expr;
+        c->last_call_method = called_sym;
         check_call_arity(c, expr, recv);
         if (!callee_is_method && callee_type &&
             callee_type->kind == TYPE_DELEGATE) {
@@ -1574,11 +1617,13 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
                                          stmt->loc, "initializer");
             }
             checker_add_local(c, stmt->var_decl.name, dt);
+            checker_mark_local_null_src(c, stmt);
         } else {
             /* `var x = ...`: register with the inferred type so later bare
              * uses in the body resolve to it, not to a field/type of the
              * same name */
             checker_add_local(c, stmt->var_decl.name, iv);
+            checker_mark_local_null_src(c, stmt);
         }
         break;
     }
@@ -1724,8 +1769,205 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
 
 /* See the forward declaration above: the receiver's type is computed by the
  * caller so a fluent chain is checked once per link, not once per subchain. */
+/* ---- "member access on a call that can return null" -----------------------
+ * A member access lowers to a load/call off the receiver pointer with no null
+ * test, so `o.PathGet("k").AsString(d)` faults (read at 0x8) whenever the
+ * lookup misses. The receiver's *declared* type says nothing -- every
+ * reference is implicitly nullable -- so the callee's body is what is
+ * consulted: a method with a literal `return null;` is treated as nullable and
+ * a direct member access on its result is rejected. `?.` and storing the
+ * result in a local first (where the flow can be guarded) both stay legal. */
+static bool expr_is_null_literal(zan_ast_node_t *e) {
+    if (!e) return false;
+    if (e->kind == AST_NULL_LITERAL) return true;
+    if (e->kind == AST_CONDITIONAL)
+        return expr_is_null_literal(e->conditional.then_expr) ||
+               expr_is_null_literal(e->conditional.else_expr);
+    return false;
+}
+
+static bool stmt_returns_null(zan_ast_node_t *n, int depth) {
+    if (!n || depth > CHECKER_DERIVES_MAX_DEPTH) return false;
+    switch (n->kind) {
+    case AST_RETURN_STMT:
+        return expr_is_null_literal(n->ret.value);
+    case AST_BLOCK:
+        for (int i = 0; i < n->block.stmts.count; i++)
+            if (stmt_returns_null(n->block.stmts.items[i], depth + 1)) return true;
+        return false;
+    case AST_IF_STMT:
+        return stmt_returns_null(n->if_stmt.then_body, depth + 1) ||
+               stmt_returns_null(n->if_stmt.else_body, depth + 1);
+    case AST_WHILE_STMT:
+    case AST_DO_WHILE_STMT:
+        return stmt_returns_null(n->while_stmt.body, depth + 1);
+    case AST_FOR_STMT:
+        return stmt_returns_null(n->for_stmt.body, depth + 1);
+    case AST_FOREACH_STMT:
+        return stmt_returns_null(n->foreach_stmt.body, depth + 1);
+    case AST_TRY_STMT: {
+        if (stmt_returns_null(n->try_stmt.try_body, depth + 1)) return true;
+        for (int i = 0; i < n->try_stmt.catches.count; i++) {
+            zan_ast_node_t *cc = n->try_stmt.catches.items[i];
+            if (cc && stmt_returns_null(cc->catch_clause.body, depth + 1)) return true;
+        }
+        return stmt_returns_null(n->try_stmt.finally_body, depth + 1);
+    }
+    case AST_SWITCH_STMT:
+        for (int i = 0; i < n->switch_stmt.cases.count; i++) {
+            zan_ast_node_t *cs = n->switch_stmt.cases.items[i];
+            if (cs && stmt_returns_null(cs->switch_case.body, depth + 1)) return true;
+        }
+        return false;
+    default:
+        return false;
+    }
+}
+
+static bool method_can_return_null(zan_symbol_t *m) {
+    if (!m || m->kind != SYM_METHOD || !m->decl) return false;
+    if (m->decl->kind != AST_METHOD_DECL) return false;
+    if (!m->decl->method_decl.return_type) return false;
+    return stmt_returns_null(m->decl->method_decl.body, 0);
+}
+
+/* Does the body ever compare `name` against null (`x == null`, `x != null`,
+ * `x is null`, `x?.y`, `x ?? y`)? A local that is tested anywhere in its method
+ * is assumed guarded: the checker has no flow graph, and a guard in a sibling
+ * branch is far more often correct code than a bug. */
+static bool node_guards_null(zan_ast_node_t *n, zan_istr_t name, int depth);
+
+static bool list_guards_null(zan_ast_list_t *l, zan_istr_t name, int depth) {
+    for (int i = 0; i < l->count; i++)
+        if (node_guards_null(l->items[i], name, depth + 1)) return true;
+    return false;
+}
+
+static bool is_named_ident(zan_ast_node_t *n, zan_istr_t name) {
+    return n && n->kind == AST_IDENTIFIER &&
+           n->ident.name.len == name.len &&
+           memcmp(n->ident.name.str, name.str, (size_t)name.len) == 0;
+}
+
+static bool node_guards_null(zan_ast_node_t *n, zan_istr_t name, int depth) {
+    if (!n || depth > CHECKER_DERIVES_MAX_DEPTH) return false;
+    switch (n->kind) {
+    case AST_BINARY:
+        /* `x == null` / `x != null` / `x ?? fallback`, either operand order */
+        if ((is_named_ident(n->binary.left, name) &&
+             (n->binary.right && n->binary.right->kind == AST_NULL_LITERAL)) ||
+            (is_named_ident(n->binary.right, name) &&
+             (n->binary.left && n->binary.left->kind == AST_NULL_LITERAL)) ||
+            (n->binary.op == TK_QUESTION_QUESTION &&
+             is_named_ident(n->binary.left, name)))
+            return true;
+        return node_guards_null(n->binary.left, name, depth + 1) ||
+               node_guards_null(n->binary.right, name, depth + 1);
+    case AST_IS_EXPR:
+    case AST_AS_EXPR:
+        if (is_named_ident(n->type_test.expr, name)) return true;
+        return node_guards_null(n->type_test.expr, name, depth + 1);
+    case AST_MEMBER_ACCESS:
+        if (n->member.null_cond && is_named_ident(n->member.object, name))
+            return true;
+        return node_guards_null(n->member.object, name, depth + 1);
+    case AST_UNARY:
+        return node_guards_null(n->unary.operand, name, depth + 1);
+    case AST_CAST_EXPR:
+        return node_guards_null(n->cast.expr, name, depth + 1);
+    case AST_CALL:
+        return node_guards_null(n->call.callee, name, depth + 1) ||
+               list_guards_null(&n->call.args, name, depth + 1);
+    case AST_INDEX:
+        return node_guards_null(n->index.object, name, depth + 1) ||
+               node_guards_null(n->index.index, name, depth + 1);
+    case AST_CONDITIONAL:
+        return node_guards_null(n->conditional.cond, name, depth + 1) ||
+               node_guards_null(n->conditional.then_expr, name, depth + 1) ||
+               node_guards_null(n->conditional.else_expr, name, depth + 1);
+    case AST_ASSIGNMENT:
+        return node_guards_null(n->binary.left, name, depth + 1) ||
+               node_guards_null(n->binary.right, name, depth + 1);
+    case AST_BLOCK:
+        return list_guards_null(&n->block.stmts, name, depth + 1);
+    case AST_EXPR_STMT:
+        return node_guards_null(n->expr_stmt.expr, name, depth + 1);
+    case AST_RETURN_STMT:
+        return node_guards_null(n->ret.value, name, depth + 1);
+    case AST_THROW_STMT:
+        return node_guards_null(n->throw_stmt.value, name, depth + 1);
+    case AST_VAR_DECL:
+        return node_guards_null(n->var_decl.initializer, name, depth + 1);
+    case AST_IF_STMT:
+        return node_guards_null(n->if_stmt.cond, name, depth + 1) ||
+               node_guards_null(n->if_stmt.then_body, name, depth + 1) ||
+               node_guards_null(n->if_stmt.else_body, name, depth + 1);
+    case AST_WHILE_STMT:
+    case AST_DO_WHILE_STMT:
+        return node_guards_null(n->while_stmt.cond, name, depth + 1) ||
+               node_guards_null(n->while_stmt.body, name, depth + 1);
+    case AST_FOR_STMT:
+        return node_guards_null(n->for_stmt.init, name, depth + 1) ||
+               node_guards_null(n->for_stmt.cond, name, depth + 1) ||
+               node_guards_null(n->for_stmt.step, name, depth + 1) ||
+               node_guards_null(n->for_stmt.body, name, depth + 1);
+    case AST_FOREACH_STMT:
+        return node_guards_null(n->foreach_stmt.collection, name, depth + 1) ||
+               node_guards_null(n->foreach_stmt.body, name, depth + 1);
+    case AST_TRY_STMT: {
+        if (node_guards_null(n->try_stmt.try_body, name, depth + 1)) return true;
+        for (int i = 0; i < n->try_stmt.catches.count; i++) {
+            zan_ast_node_t *cc = n->try_stmt.catches.items[i];
+            if (cc && node_guards_null(cc->catch_clause.body, name, depth + 1))
+                return true;
+        }
+        return node_guards_null(n->try_stmt.finally_body, name, depth + 1);
+    }
+    case AST_SWITCH_STMT: {
+        if (node_guards_null(n->switch_stmt.expr, name, depth + 1)) return true;
+        for (int i = 0; i < n->switch_stmt.cases.count; i++) {
+            zan_ast_node_t *cs = n->switch_stmt.cases.items[i];
+            if (cs && node_guards_null(cs->switch_case.body, name, depth + 1))
+                return true;
+        }
+        return false;
+    }
+    default:
+        return false;
+    }
+}
+
+static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr) {
+    if (!expr || expr->kind != AST_MEMBER_ACCESS) return;
+    if (expr->member.null_cond) return;
+    zan_ast_node_t *obj = expr->member.object;
+    if (!obj) return;
+    zan_symbol_t *m = NULL;
+    if (obj->kind == AST_CALL) {
+        if (obj != c->last_call_node) return;
+        m = c->last_call_method;
+    } else if (obj->kind == AST_IDENTIFIER) {
+        /* a local holding a nullable call result, never tested in this body */
+        struct checker_local *l = checker_find_local_slot(c, obj->ident.name);
+        if (!l || !l->null_src) return;
+        if (!c->current_body) return;
+        if (node_guards_null(c->current_body, obj->ident.name, 0)) return;
+        m = l->null_src;
+    } else {
+        return;
+    }
+    if (!method_can_return_null(m)) return;
+    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                  "'%.*s' can return null; accessing '%.*s' on its result "
+                  "faults at runtime -- use '?.', or store it and check for "
+                  "null first",
+                  (int)m->name.len, m->name.str,
+                  (int)expr->member.name.len, expr->member.name.str);
+}
+
 static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                                        zan_type_t *obj_type) {
+    checker_reject_null_receiver(c, expr);
     /* Static enum member access: EnumType.Member must be a declared member.
      * A miss used to fall through to irgen, which silently folded the
      * access to the constant 0 (masking stale references, e.g. a removed
@@ -1757,9 +1999,12 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
             }
         }
     }
-    /* resolve field/method on known struct/class types */
+    /* resolve field/method on known struct/class types. Inherited fields are the
+     * layout prefix, so a field that hides a base one of the same name appears
+     * twice: the search runs back to front, which picks the declaration this
+     * static type contributes (C# hiding). */
     if (obj_type && obj_type->sym) {
-        for (int i = 0; i < obj_type->sym->member_count; i++) {
+        for (int i = obj_type->sym->member_count - 1; i >= 0; i--) {
             zan_symbol_t *m = obj_type->sym->members[i];
             if (m->name.len == expr->member.name.len &&
                 memcmp(m->name.str, expr->member.name.str, m->name.len) == 0) {
@@ -1817,7 +2062,10 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
             checker_add_local(c, p->param.name, pt);
         }
     }
+    zan_ast_node_t *saved_body = c->current_body;
+    c->current_body = method->method_decl.body;
     zan_checker_check_stmt(c, method->method_decl.body);
+    c->current_body = saved_body;
     c->locals = saved_locals;
     c->current_return_type = saved;
     c->in_no_runtime = saved_nrt;

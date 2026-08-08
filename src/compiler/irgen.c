@@ -2097,33 +2097,43 @@ static bool field_member_is_static(zan_symbol_t *m) {
     return false;
 }
 
+/* The slot of `field_name` in `type_sym`'s layout, or -1. Inherited fields form
+ * the prefix (see resolve_bases), so a derived declaration that hides a base
+ * field appears twice in the member list and the LAST match is the one the
+ * static type in hand declares: code compiled against the base sees only the
+ * base member list and keeps the prefix slot, while the derived class reaches
+ * its own. */
 static int get_field_index(zan_symbol_t *type_sym, zan_istr_t field_name) {
     int idx = class_vptr_offset(type_sym);
+    int found = -1;
     for (int i = 0; i < type_sym->member_count; i++) {
         if (type_sym->members[i]->kind == SYM_FIELD ||
             type_sym->members[i]->kind == SYM_PROPERTY) {
             if (field_member_is_static(type_sym->members[i])) continue;
             if (type_sym->members[i]->name.len == field_name.len &&
                 memcmp(type_sym->members[i]->name.str, field_name.str, field_name.len) == 0) {
-                return idx;
+                found = idx;
             }
             idx++;
         }
     }
-    return -1;
+    return found;
 }
 
+/* Last match, for the same reason as get_field_index: the hiding declaration
+ * wins over the inherited one it shadows. */
 static zan_symbol_t *get_field_sym(zan_symbol_t *type_sym, zan_istr_t field_name) {
     zan_class_index_t *ci = class_index_for(type_sym);
+    zan_symbol_t *found = NULL;
     for (int i = member_first_named(ci, field_name); i >= 0;
          i = member_next_named(ci, i)) {
         zan_symbol_t *m = type_sym->members[i];
         if ((m->kind == SYM_FIELD || m->kind == SYM_PROPERTY) &&
             member_name_is(m, field_name)) {
-            return m;
+            found = m;
         }
     }
-    return NULL;
+    return found;
 }
 
 static zan_symbol_t *get_method_sym(zan_symbol_t *type_sym, zan_istr_t method_name) {

@@ -937,13 +937,21 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                              (int)member->method_decl.name.len,
                              member->method_decl.name.str);
                 }
-                if (strncmp(ext_name, "zan_file_", 9) == 0 ||
-                    strncmp(ext_name, "zan_atomic_int_", 15) == 0 ||
+                if (strncmp(ext_name, "zan_file_", 9) == 0) {
+                    /* file metadata + FILE* stream IO (System.IO.FileInfo /
+                     * FileStream): split into its own runtime object so a
+                     * file-IO program does not drag in the atomics/threads/
+                     * shared-table runtime (rt_file.o vs rt_sync.o). */
+                    g->uses_file_runtime = true;
+                }
+                if (strncmp(ext_name, "zan_atomic_int_", 15) == 0 ||
                     strncmp(ext_name, "zan_shared_table_", 17) == 0 ||
                     strncmp(ext_name, "zan_thread_", 11) == 0 ||
                     strncmp(ext_name, "zan_dispatch_", 13) == 0 ||
                     strncmp(ext_name, "zan_monotonic_", 14) == 0 ||
                     strncmp(ext_name, "zan_plat_", 9) == 0) {
+                    if (getenv("ZAN_TRACE_SYNC"))
+                        fprintf(stderr, "[sync-flag] %s\n", ext_name);
                     g->uses_sync_runtime = true;
                 }
                 if (strncmp(ext_name, "zan_io_socket_", 14) == 0) {
@@ -2297,6 +2305,15 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
             { "rmdir", "ip" },       { "opendir", "pp" },
             { "readdir", "pp" },     { "closedir", "ip" },
             { "time", "jp" },        { "poll", "ipii" },
+            /* the startup stdout line-buffering call (irgen_emit.c) declares
+             * size as i64 (Zan int); wasm's setvbuf takes a 32-bit size_t. */
+            { "setvbuf", "ipipi" },
+            /* wasi-libc ships dlfcn stubs that return 0 ("no dynamic
+             * linking"): the IR declares these with 64-bit nint, so adapt
+             * them too, keeping the graceful-failure path the stdlib's
+             * Interop.Entry relies on instead of a wasm-ld trap stub. */
+            { "dlopen", "pip" },     { "dlsym", "ppp" },
+            { "dlclose", "ip" },
             { NULL, NULL }
         };
         LLVMTypeRef w_i32 = LLVMInt32TypeInContext(g->ctx);
