@@ -1,0 +1,655 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component.CodeEditor;
+
+namespace Gui.Component;
+
+/// 一条聊天消息：记录里显示的角色（user / assistant / tool / error）、
+/// 正文，以及这一轮的思考过程（没有则 ""）。
+///
+/// 多智能体（团队）会话再带一层信封：说话的成员 id、寻址给谁、协议
+/// 节拍、所属任务与进度。单助手会话里这些字段全为空，因此**同一种
+/// 记录格式**既能服务单助手也能服务团队，存档也能互相打开。
+class ChatMessage {
+    string role;
+    string text;
+    string reason;
+    string agent;
+    string to;
+    string kind;
+    string taskId;
+    int progress;
+
+    static ChatMessage Create(string role, string text) {
+        ChatMessage m = new ChatMessage();
+        m.role = role;
+        m.text = text;
+        m.reason = "";
+        m.agent = "";
+        m.to = "";
+        m.kind = "";
+        m.taskId = "";
+        m.progress = 0;
+        return m;
+    }
+
+    static ChatMessage CreateWithReason(string role, string text, string reason) {
+        ChatMessage m = ChatMessage.Create(role, text);
+        m.reason = reason;
+        return m;
+    }
+
+    /// 一条带信封的团队消息。
+    static ChatMessage CreateFrom(string role, string text, string agent,
+            string to, string kind, string taskId, int progress) {
+        ChatMessage m = ChatMessage.Create(role, text);
+        m.agent = agent;
+        m.to = to;
+        m.kind = kind;
+        m.taskId = taskId;
+        m.progress = progress;
+        return m;
+    }
+}
+
+/// 一位发言者的外观：显示名、色调与 Tag 类名。多智能体程序用它把
+/// 成员 id 翻成头行上看到的样子；单助手程序用不到。
+class ChatSpeaker {
+    string name;
+    int tint;
+    string tagCls;
+
+    static ChatSpeaker Of(string name, int tint, string tagCls) {
+        ChatSpeaker s = new ChatSpeaker();
+        s.name = name;
+        s.tint = tint;
+        s.tagCls = tagCls;
+        return s;
+    }
+}
+
+/// 把成员 id 解析成外观；返回 null 表示「不认识这个 id，按默认助手画」。
+delegate ChatSpeaker ChatSpeakerOf(string agent);
+
+/// 把协议节拍（`ChatMessage.kind`）翻成头行右侧的状态标签。
+delegate string ChatKindLabel(string kind);
+
+/// 聊天视图要显示的所有文案。全部由宿主给出，组件本身不依赖任何
+/// 翻译层，于是同一个组件可以出现在任意语言的程序里。
+class ChatStrings {
+    string you;
+    string assistant;
+    string tool;
+    string error;
+    string thinkShow;
+    string thinkHide;
+    string codeMorePre;
+    string codeMorePost;
+    string codeCollapse;
+    string busy;
+    string empty;
+
+    /// 英文默认文案；宿主按需覆盖字段即可。
+    static ChatStrings Default() {
+        ChatStrings s = new ChatStrings();
+        s.you = "You";
+        s.assistant = "Assistant";
+        s.tool = "Tool";
+        s.error = "Error";
+        s.thinkShow = "Thinking (click to show)";
+        s.thinkHide = "Thinking (click to hide)";
+        s.codeMorePre = "show ";
+        s.codeMorePost = " more code lines";
+        s.codeCollapse = "collapse code";
+        s.busy = "Thinking...";
+        s.empty = "";
+        return s;
+    }
+}
+
+/// 可复用的**聊天视图控件**：消息流 + markdown-lite 排版 + 思考过程与
+/// 工具调用折叠 + 长代码块折叠 + 选区复制 + 底端锚定滚动 + busy 提示。
+///
+///     ChatView chat = new ChatView();
+///     chat.WithStrings(myStrings).Bind(msgs);
+///     chat.SetBusy(waitingForModel);
+///
+/// 宿主只提供数据与文案：换行缓存（只重排正在流式输出的那一轮）、
+/// 滚轮、选择、折叠状态、Ctrl+C 复制全在控件内部。绘制交给
+/// `Gui.Widget.StyledText`，因此宿主一行画布代码也不需要写。
+///
+/// 声明式界面里可以直接写 `{"kind": "ChatView", "name": "Chat"}`，
+/// code-behind 只调用 `Bind` / `SetBusy`。
+class ChatView : Control {
+    /// 调用方的消息列表（实时视图，不拷贝）。
+    List<ChatMessage> data;
+    ChatStrings str;
+    ChatSpeakerOf speakerOf;
+    ChatKindLabel kindLabelOf;
+
+    /// 预换行的展示行缓存，以及增量重排用的水位线：`cacheTurns` 之前的
+    /// 轮次已定型，`cachePrefix` 是它们占的行数。
+    List<TextRun> cache;
+    int cacheTurns;
+    int cachePrefix;
+    string cacheKey;
+    string cacheSig;
+
+    /// 展开的消息下标（工具结果与长代码块共用一份）。
+    List<int> toolOpen;
+    SignalInt thinkOpen;
+    SignalInt scrollSig;
+    LogState sel;
+    bool busy;
+    /// 记录网格与空态提示：常驻子控件，绘制全在它们内部。
+    StyledText grid;
+    Label emptyLbl;
+
+    ChatView() {
+        this.InitControl("chat", 5);
+        this.Pad(0);
+        this.gap = 0;
+        data = null;
+        str = ChatStrings.Default();
+        speakerOf = null;
+        kindLabelOf = null;
+        cache = new List<TextRun>();
+        cacheTurns = 0;
+        cachePrefix = 0;
+        cacheKey = "";
+        cacheSig = "";
+        toolOpen = new List<int>();
+        thinkOpen = new SignalInt(0);
+        scrollSig = new SignalInt(0);
+        sel = new LogState();
+        busy = false;
+        grid = new StyledText();
+        grid.DockFill();
+        this.Add(grid);
+        emptyLbl = new Label();
+        emptyLbl.wrap = true;
+        emptyLbl.Class = "hint small";
+        emptyLbl.DockFill();
+        this.Add(emptyLbl);
+    }
+
+    override string Kind() { return "ChatView"; }
+
+    override string StyleType() { return "log"; }
+
+    // ---- 宿主接口 ---------------------------------------------------
+
+    /// 绑定调用方的消息列表（实时视图，不拷贝）。
+    ChatView Bind(List<ChatMessage> msgs) {
+        data = msgs;
+        return this;
+    }
+
+    /// 全部可见文案（宿主已本地化）。
+    ChatView WithStrings(ChatStrings s) {
+        if (s != null) { str = s; }
+        this.Invalidate();
+        return this;
+    }
+
+    /// 多智能体会话的外观解析钩子（单助手程序不必调用）。
+    ChatView WithSpeakers(ChatSpeakerOf who, ChatKindLabel kindLabel) {
+        speakerOf = who;
+        kindLabelOf = kindLabel;
+        this.Invalidate();
+        return this;
+    }
+
+    /// 模型正在回答：记录末尾显示 busy 行。
+    void SetBusy(bool on) { busy = on; }
+
+    /// 选区状态（宿主可持久化或复位）。
+    LogState Selection() { return sel; }
+
+    /// 底端锚定的滚动偏移信号（0 = 贴住最新一行）。
+    SignalInt Scroll() { return scrollSig; }
+
+    /// 换掉一整份记录（切换会话）：缓存、折叠、选区与滚动全部归零。
+    void Reset() {
+        cache = new List<TextRun>();
+        cacheTurns = 0;
+        cachePrefix = 0;
+        cacheKey = "";
+        cacheSig = "";
+        toolOpen = new List<int>();
+        sel.Reset();
+        scrollSig.Set(0);
+    }
+
+    /// 下一帧整份重排（文案、字号或钩子变了）。
+    void Invalidate() {
+        cacheKey = "";
+        cacheSig = "";
+    }
+
+    /// 当前选中的文本（未选中则 ""）。
+    string SelectedText() { return ChatView.SelectionText(cache, sel); }
+
+    // ---- retained 钩子 ----------------------------------------------
+
+    override void OnPaint(App app) {
+        bool has = data != null && data.Count > 0;
+        emptyLbl.SetShown(!has && !busy);
+        grid.SetShown(has || busy);
+        if (!has && !busy) {
+            emptyLbl.Text = str.empty;
+            return;
+        }
+        this.TakeWheel(app);
+        this.Build(app);
+        grid.lines = cache;
+        grid.scroll = scrollSig.Get();
+        grid.busy = busy;
+        grid.sel = sel;
+        grid.interactive = true;
+        grid.thinkOpen = thinkOpen;
+        grid.toolOpen = toolOpen;
+        grid.busyText = str.busy;
+        // StyledText 在绘制时算出最大滚动，绘制发生在子控件那一步，
+        // 因此这里读到的是上一帧的界限——足够用来夹住滚动值。
+        int max = grid.maxScroll;
+        if (scrollSig.Get() > max) { scrollSig.Set(max); }
+        if (scrollSig.Get() < 0) { scrollSig.Set(0); }
+        this.TakeCopy(app);
+    }
+
+    /// 指针在记录上时滚轮滚动。
+    void TakeWheel(App app) {
+        if (!app.CaptureWheel(bx, by, bw, bh)) { return; }
+        int d = app.window.EventKeyCode();
+        int step = d / 120;
+        if (step == 0) {
+            if (d > 0) { step = 1; }
+            else if (d < 0) { step = 0 - 1; }
+        }
+        scrollSig.Set(scrollSig.Get() + step);
+        app.RequestRedraw();
+    }
+
+    /// 指针在记录上时 Ctrl+C 复制选中的文本。
+    void TakeCopy(App app) {
+        if (app.EventKind() != 4) { return; }
+        if (app.window.EventKeyCode() != 67) { return; }
+        if (!Modifiers.HasCtrl(app.window.EventMods())) { return; }
+        if (!sel.HasSelection()) { return; }
+        if (app.mouseX < bx || app.mouseX > bx + bw) { return; }
+        if (app.mouseY < by || app.mouseY > by + bh) { return; }
+        Clipboard.SetText(this.SelectedText());
+        app.RequestRedraw();
+    }
+
+    /// 换行缓存：只有记录、宽度、字号或折叠状态变了才重建，而且只有
+    /// 正在流式输出的最后一轮会重排——1000 轮的会话和空会话一样便宜。
+    void Build(App app) {
+        int textW = bw - app.Scale(28);
+        if (textW < app.Scale(20)) { textW = app.Scale(20); }
+        int tailLen = 0;
+        if (data.Count > 0) {
+            tailLen = data[data.Count - 1].text.Length
+                + data[data.Count - 1].reason.Length;
+        }
+        int toolSig = toolOpen.Count;
+        for (int i = 0; i < toolOpen.Count; i = i + 1) {
+            toolSig = toolSig * 131 + toolOpen[i] + 1;
+        }
+        // 布局输入：这里任何变化都让每一行失效，整份记录要重排。
+        string layoutSig = Convert.ToString(textW)
+            + ":" + Convert.ToString(StyledText.FontPx(app))
+            + ":" + Convert.ToString(thinkOpen.Get())
+            + ":" + Convert.ToString(toolSig);
+        string keyNow = layoutSig + ":" + Convert.ToString(data.Count)
+            + ":" + Convert.ToString(tailLen);
+        if (keyNow == cacheKey) { return; }
+        bool full = layoutSig != cacheSig
+            || data.Count < cacheTurns + 1
+            || cache.Count < cachePrefix;
+        int stable = data.Count - 1;
+        if (stable < 0) { stable = 0; }
+        if (full) {
+            cache = new List<TextRun>();
+            cacheTurns = 0;
+            cachePrefix = 0;
+            cacheSig = layoutSig;
+            // 重排会重映射每个行号，留着的选区会高亮错的文本。
+            sel.ClearSelection();
+        } else {
+            while (cache.Count > cachePrefix) {
+                cache.RemoveAt(cache.Count - 1);
+            }
+        }
+        if (cacheTurns < stable) {
+            this.BuildRange(app, cacheTurns, stable, textW);
+            cacheTurns = stable;
+            cachePrefix = cache.Count;
+        }
+        this.BuildRange(app, stable, data.Count, textW);
+        cacheKey = keyNow;
+    }
+
+    // ---- 排版 -------------------------------------------------------
+
+    /// 折叠长代码块前保留的行数。
+    static int CodeFoldLines() { return 14; }
+
+    static bool HasInt(List<int> xs, int v) {
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            if (xs[i] == v) { return true; }
+        }
+        return false;
+    }
+
+    /// 发言者编码，用于整块着色：0 我 / 1 助手 / 2 工具 / 3 错误。
+    static int RoleCode(string role) {
+        if (role == "user") { return 0; }
+        if (role == "tool") { return 2; }
+        if (role == "error") { return 3; }
+        return 1;
+    }
+
+    /// 把 `s` 贪心换行到 `maxW` 像素，结果追加进 `outLines`。
+    static void WrapInto(string s, int maxW, int fontSize,
+            List<string> outLines) {
+        List<string> hard = CodeEditor.SplitLines(s);
+        if (hard.Count == 0) { hard.Add(""); }
+        for (int li = 0; li < hard.Count; li = li + 1) {
+            string line = hard[li];
+            if (line == "") { outLines.Add(""); }
+            while (line != "") {
+                if (Canvas.MeasureText(line, fontSize) <= maxW) {
+                    outLines.Add(line);
+                    line = "";
+                } else {
+                    // 二分出能放下的最长前缀。
+                    int lo = 1;
+                    int hi = line.Length;
+                    while (lo < hi) {
+                        int mid = (lo + hi + 1) / 2;
+                        if (Canvas.MeasureText(line.Substring(0, mid), fontSize)
+                                <= maxW) { lo = mid; }
+                        else { hi = mid - 1; }
+                    }
+                    // 绝不在多字节字符内部断行，且至少保留一个完整字符，
+                    // 保证循环推进。
+                    lo = Text.ClampCharStart(line, lo);
+                    if (lo <= 0) { lo = Text.NextCharEnd(line, 0); }
+                    outLines.Add(line.Substring(0, lo));
+                    line = line.Substring(lo, line.Length - lo);
+                }
+            }
+        }
+    }
+
+    /// 把 `s` 换行后作为展示行追加进缓存（至少追加一行）。
+    void WrapRows(string s, int maxW, int fontSize, int color, int kind) {
+        List<string> wrapped = new List<string>();
+        ChatView.WrapInto(s, maxW, fontSize, wrapped);
+        for (int i = 0; i < wrapped.Count; i = i + 1) {
+            cache.Add(TextRun.Create(wrapped[i], color, kind));
+        }
+    }
+
+    /// 给 `start` 之后新增的行标注所属发言者，以便整块着色。
+    void OwnRows(int start, int owner) {
+        for (int i = start; i < cache.Count; i = i + 1) {
+            cache[i].owner = owner;
+        }
+    }
+
+    /// 去掉轻量 markdown 标记（标题井号、`**` 粗体、单反引号），保留列表短横。
+    static string MdStrip(string ln) {
+        string s = ln;
+        int h = 0;
+        for (; h < s.Length && s.Substring(h, 1) == "#"; h = h + 1) { }
+        if (h > 0 && h < s.Length && s.Substring(h, 1) == " ") {
+            s = s.Substring(h + 1, s.Length - h - 1);
+        }
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "*" && i + 1 < s.Length
+                    && s.Substring(i + 1, 1) == "*") { i = i + 2; }
+            else if (ch == "`") { i = i + 1; }
+            else { sb.Append(ch); i = i + 1; }
+        }
+        return sb.ToString();
+    }
+
+    /// 记录里是否有需要折叠的长代码块。
+    static bool HasLongCode(List<string> src) {
+        int i = 0;
+        while (i < src.Count) {
+            string ln = src[i];
+            bool fence = ln.Length >= 3 && ln.Substring(0, 3) == "```";
+            if (fence) {
+                int endAt = i + 1;
+                for (endAt = i + 1; endAt < src.Count; endAt = endAt + 1) {
+                    string el = src[endAt];
+                    if (el.Length >= 3 && el.Substring(0, 3) == "```") { break; }
+                }
+                if (endAt - i - 1 > ChatView.CodeFoldLines() + 2) { return true; }
+                i = endAt + 1;
+                continue;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// 只排 [from, to) 这几轮并**追加**进缓存。这样切分让已定型轮次的
+    /// 换行结果留下来，只重排正在流式输出的那一轮。
+    void BuildRange(App app, int from, int to, int textW) {
+        Theme t = app.theme;
+        List<int> togPos = new List<int>();
+        List<int> togMsg = new List<int>();
+        int i = from;
+        if (i < 0) { i = 0; }
+        int stop = to;
+        if (stop > data.Count) { stop = data.Count; }
+        while (i < stop) {
+            ChatMessage msg = data[i];
+            string head = str.assistant;
+            int headCol = t.success;
+            int bodyCol = t.textPrimary;
+            string headCls = "success";
+            if (msg.role == "user") {
+                head = str.you;
+                headCol = t.primary;
+                headCls = "primary";
+            } else if (msg.role == "error") {
+                head = str.error;
+                headCol = t.error;
+                bodyCol = t.error;
+                headCls = "danger";
+            } else if (msg.role == "tool") {
+                head = str.tool;
+                headCol = t.textTertiary;
+                bodyCol = t.textTertiary;
+                headCls = "";
+            }
+            // 团队会话里说话的是某位成员，而不是「助手」；读者一眼想看的
+            // 就是谁在做、做到哪了，细节仍然折叠在下面。
+            string headStatus = "";
+            int headPct = 0 - 1;
+            if (msg.agent != "" && speakerOf != null) {
+                ChatSpeaker who = speakerOf(msg.agent);
+                if (who != null) {
+                    head = who.name;
+                    headCol = who.tint;
+                    headCls = who.tagCls;
+                    if (msg.kind != "" && kindLabelOf != null) {
+                        headStatus = kindLabelOf(msg.kind);
+                    }
+                    if (msg.progress > 0) { headPct = msg.progress; }
+                }
+            }
+            // 工具调用/结果折叠成**一行**可点摘要（它的首行，例如
+            // "list_dir src/"），点开才显示完整结果：长输出不再埋掉答案，
+            // 又随时可查。
+            if (msg.role == "tool") {
+                int msgStart = cache.Count;
+                List<string> tl = CodeEditor.SplitLines(msg.text);
+                string summary = "";
+                if (tl.Count > 0) { summary = tl[0]; }
+                bool open = ChatView.HasInt(toolOpen, i);
+                bool expandable = tl.Count > 1;
+                string prefix = "  ";
+                if (expandable) {
+                    if (open) { prefix = "▼ "; } else { prefix = "▶ "; }
+                }
+                List<string> tmp = new List<string>();
+                ChatView.WrapInto(prefix + head + ": " + summary, textW,
+                    t.fontSizeSmall, tmp);
+                string sline = prefix + head;
+                if (tmp.Count > 0) {
+                    sline = tmp[0];
+                    if (tmp.Count > 1) { sline = sline + " …"; }
+                }
+                if (expandable) {
+                    togPos.Add(cache.Count);
+                    togMsg.Add(i);
+                    cache.Add(TextRun.Create(sline, headCol, 5));
+                } else {
+                    cache.Add(TextRun.Create(sline, headCol, 3));
+                }
+                if (open) {
+                    for (int k = 1; k < tl.Count; k = k + 1) {
+                        this.WrapRows(tl[k], textW, t.fontSizeSmall, bodyCol, 0);
+                    }
+                }
+                this.OwnRows(msgStart, 2);
+                TextRun tgap = TextRun.Create("", t.textTertiary, 6);
+                tgap.owner = 2;
+                cache.Add(tgap);
+                i = i + 1;
+                continue;
+            }
+            int msgStart = cache.Count;
+            TextRun hln = TextRun.Create(head, headCol, 3);
+            hln.ava = StyledText.Initial(head);
+            hln.tagCls = headCls;
+            hln.status = headStatus;
+            hln.pct = headPct;
+            cache.Add(hln);
+            // 思考过程是答案上方一段暗色的独立区块，默认折叠成一行可点
+            // 提示，绝不埋掉答案。
+            bool think = thinkOpen.Get() == 1;
+            if (msg.role == "assistant" && msg.reason != "") {
+                if (think) {
+                    cache.Add(TextRun.Create(str.thinkHide, t.textTertiary, 4));
+                } else {
+                    cache.Add(TextRun.Create(str.thinkShow, t.textTertiary, 4));
+                }
+                if (think) {
+                    List<string> rsrc = CodeEditor.SplitLines(msg.reason);
+                    for (int rk = 0; rk < rsrc.Count; rk = rk + 1) {
+                        this.WrapRows(ChatView.MdStrip(rsrc[rk]), textW,
+                            t.fontSizeSmall, t.textTertiary, 0);
+                    }
+                }
+            }
+            // markdown-lite：围栏代码块有代码底纹与配色；标题 / 列表 /
+            // 行内 `code` / `**粗体**` 简化成可读的纯文本。
+            List<string> src = CodeEditor.SplitLines(msg.text);
+            bool inCode = false;
+            // 超长代码块（模型打印的整份文件，或中断答案留下的半份）折叠
+            // 成前若干行加一行「展开剩余 N 行」，和工具结果一个待遇。
+            bool codeOpen = ChatView.HasInt(toolOpen, i);
+            if (codeOpen && ChatView.HasLongCode(src)) {
+                togPos.Add(cache.Count);
+                togMsg.Add(i);
+                cache.Add(TextRun.Create("▼ " + str.codeCollapse,
+                    t.textTertiary, 5));
+            }
+            int li = 0;
+            while (li < src.Count) {
+                string ln = src[li];
+                bool fence = ln.Length >= 3 && ln.Substring(0, 3) == "```";
+                if (fence && !inCode && !codeOpen) {
+                    // 开围栏：先量整块，再决定要不要折叠。
+                    int endAt = li + 1;
+                    for (endAt = li + 1; endAt < src.Count; endAt = endAt + 1) {
+                        string el = src[endAt];
+                        if (el.Length >= 3
+                                && el.Substring(0, 3) == "```") { break; }
+                    }
+                    int blockLen = endAt - li - 1;
+                    if (blockLen > ChatView.CodeFoldLines() + 2) {
+                        int keep = ChatView.CodeFoldLines();
+                        for (int ck = li + 1; ck < li + 1 + keep; ck = ck + 1) {
+                            this.WrapRows(src[ck], textW - app.Scale(8),
+                                t.fontSizeSmall, t.info, 1);
+                        }
+                        togPos.Add(cache.Count);
+                        togMsg.Add(i);
+                        cache.Add(TextRun.Create("▶ " + str.codeMorePre
+                            + Convert.ToString(blockLen - keep)
+                            + str.codeMorePost, t.textTertiary, 5));
+                        li = endAt + 1;
+                        continue;
+                    }
+                }
+                if (fence) {
+                    inCode = !inCode;
+                } else if (inCode) {
+                    this.WrapRows(ln, textW - app.Scale(8), t.fontSizeSmall,
+                        t.info, 1);
+                } else {
+                    string shown = ChatView.MdStrip(ln);
+                    int kind = 0;
+                    int col = bodyCol;
+                    if (ln.Length >= 2 && ln.Substring(0, 1) == "#") {
+                        kind = 2;
+                        col = t.textPrimary;
+                    }
+                    this.WrapRows(shown, textW, t.fontSizeSmall, col, kind);
+                }
+                li = li + 1;
+            }
+            int ownCode = ChatView.RoleCode(msg.role);
+            this.OwnRows(msgStart, ownCode);
+            // 一行不上色的间隔收束一轮：六个成员轮流说话时，紧贴的色块
+            // 会读成一整片。
+            TextRun gap = TextRun.Create("", t.textTertiary, 6);
+            gap.owner = ownCode;
+            cache.Add(gap);
+            i = i + 1;
+        }
+        // kind-5 折叠行控制的消息下标（其余为 -1）。
+        for (int tpi = 0; tpi < togPos.Count; tpi = tpi + 1) {
+            int at = togPos[tpi];
+            if (at >= 0 && at < cache.Count) { cache[at].meta = togMsg[tpi]; }
+        }
+    }
+
+    /// `cache` 中选中的文本（换行拼接，未选中则 ""）。
+    static string SelectionText(List<TextRun> rows, LogState st) {
+        if (!st.HasSelection()) { return ""; }
+        int r0 = st.selR0; int c0 = st.selC0;
+        int r1 = st.selR1; int c1 = st.selC1;
+        if (r0 > r1 || (r0 == r1 && c0 > c1)) {
+            int tr = r0; r0 = r1; r1 = tr;
+            int tc = c0; c0 = c1; c1 = tc;
+        }
+        string outp = "";
+        for (int r = r0; r <= r1 && r < rows.Count; r = r + 1) {
+            string ln = rows[r].text;
+            int s = 0;
+            int e = ln.Length;
+            if (r == r0) { s = c0; }
+            if (r == r1) { e = c1; }
+            if (s < 0) { s = 0; }
+            if (e > ln.Length) { e = ln.Length; }
+            if (s > e) { s = e; }
+            outp = outp + ln.Substring(s, e - s);
+            if (r < r1) { outp = outp + "\n"; }
+        }
+        return outp;
+    }
+}

@@ -1,281 +1,133 @@
 using System;
 using Gui;
 using Gui.Widget;
-using Gui.Component.CodeEditor;
+using Gui.Component;
 
-/// One debug toolbar button, described by data (icon, bilingual label, action
-/// id). The toolbar renders its own Button widgets from this, so callers hold
-/// no component objects.
-class DbgToolbarBtn {
-    string icon;
-    string label;
-    string cls;
-    int action;
-
-    static DbgToolbarBtn Of(string icon, string label, string cls, int action) {
-        DbgToolbarBtn b = new DbgToolbarBtn();
-        b.icon = icon;
-        b.label = label;
-        b.cls = cls;
-        b.action = action;
-        return b;
-    }
-}
-
-/// The debugger's UI chrome, extracted from the shell: the bottom
-/// Console/Variables/Watch/CallStack panel (a Tabs strip bound to the panel-tab
-/// signal over Table-rendered grids), the stepping toolbar and the inline
-/// variables overlay drawn over the editor while stepping.
-class DebugPanel {
-    static Tabs panelTabs;
-    static List<string> panelLbls;
-    static ToolStrip toolbar;
-    static string toolbarSig;
-    static int toolbarAction;
-    /// The grids and the watch expression field. Rows, headers, striping,
-    /// scrolling, the empty state and text editing all belong to the widgets;
-    /// this file only binds the debugger's lists to them.
-    static ListView<DbgVar> varsList;
-    static ListView<DbgVar> watchList;
-    static ListView<DbgFrame> stackList;
-    static Input watchIn;
-    static Label inlineLbl;
-    /// What the user did in the Watch tab this frame, picked up by the shell:
-    /// an expression to add, and the row to drop.
+/// 调试器的底部面板：控制台 / 变量 / 监视 / 调用栈。
+///
+/// 结构在 `views/DebugPanel.zform` 里声明（页签条 + 四块内容），这里只
+/// 绑定调试器的数据、切页签、并把用户在「监视」页里的意图交回外壳。
+/// 表头、行高、条纹、滚动、空状态和文本编辑全部属于控件。
+partial class DebugPanel {
+    /// 一个外壳一块底部面板；静态处理器靠它找回实例。
+    static DebugPanel current;
+    /// 页签标签的上一份内容：切换界面语言才重建，避免每帧重排。
+    static List<string> tabLbls;
+    /// 用户在「监视」页里做的事，外壳每帧取走：要加的表达式、要删的行。
     static string watchAdd;
     static int watchDrop;
 
-    /// A Name / Type / Value grid over the debugger's variable rows.
-    static ListView<DbgVar> VarGrid() {
+    void OnInit() {
+        DebugPanel.current = this;
+        DebugPanel.watchAdd = "";
+        DebugPanel.watchDrop = 0 - 1;
+        DebugPanel.tabLbls = null;
+        DebugPanel.Console.EmptyText(
+            ZanIDE.T("(no debug output)", "（暂无调试输出）"));
+        DebugPanel.Vars.WithColumns(DebugPanel.VarColumns());
+        DebugPanel.Vars.EmptyText(ZanIDE.T("(no variables in scope)",
+            "（作用域内没有变量）"));
+        DebugPanel.WatchGrid.WithColumns(DebugPanel.VarColumns());
+        DebugPanel.WatchGrid.EmptyText(ZanIDE.T("No watches yet.",
+            "还没有监视表达式。"));
+        DebugPanel.WatchGrid.OnSelect(DebugPanel.WatchRowPicked);
+        List<ListColumn<DbgFrame>> fcols = new List<ListColumn<DbgFrame>>();
+        fcols.Add(new ListColumn<DbgFrame>(ZanIDE.T("Call Stack", "调用栈"),
+            f => f.name + " : line " + Convert.ToString(f.line)));
+        DebugPanel.Stack.WithColumns(fcols);
+        DebugPanel.WatchIn.SetProp("placeholder", ZanIDE.T(
+            "Type an expression and press Enter; click a row to remove it",
+            "输入表达式后回车添加；点击行删除"));
+        DebugPanel.WatchIn.Submit.Add(DebugPanel.WatchSubmitted);
+    }
+
+    /// 变量 / 监视共用的「名称 / 类型 / 值」三列。
+    static List<ListColumn<DbgVar>> VarColumns() {
         List<ListColumn<DbgVar>> cols = new List<ListColumn<DbgVar>>();
-        cols.Add(new ListColumn<DbgVar>(ZanIDE.T("Name", "名称"), 2, v => v.name));
-        cols.Add(new ListColumn<DbgVar>(ZanIDE.T("Type", "类型"), 2, v => v.type));
-        cols.Add(new ListColumn<DbgVar>(ZanIDE.T("Value", "值"), 3, v => v.val));
-        return new ListView<DbgVar>(cols);
+        cols.Add(new ListColumn<DbgVar>(ZanIDE.T("Name", "名称"), 2,
+            v => v.name));
+        cols.Add(new ListColumn<DbgVar>(ZanIDE.T("Type", "类型"), 2,
+            v => v.type));
+        cols.Add(new ListColumn<DbgVar>(ZanIDE.T("Value", "值"), 3,
+            v => v.val));
+        return cols;
     }
 
-    static ListView<DbgVar> VarsList() {
-        if (DebugPanel.varsList == null) {
-            DebugPanel.varsList = DebugPanel.VarGrid();
-            DebugPanel.varsList.EmptyText(ZanIDE.T("(no variables in scope)",
-                "（作用域内没有变量）"));
+    /// 控制台的滚动 / 选择状态（外壳在新一轮运行前 Reset）。
+    LogState ConsoleState() { return DebugPanel.Console.State(); }
+
+    /// 画面板：绑定这一帧的数据，选中的页签决定哪一块可见。
+    void Render(App app, Rect area, SignalInt panelTab, List<string> console,
+            List<DbgVar> vars, List<DbgVar> watchRows, List<DbgFrame> stack) {
+        this.SyncTabs(panelTab.Get());
+        int tab = panelTab.Get();
+        DebugPanel.Console.SetShown(tab == 0);
+        DebugPanel.Vars.SetShown(tab == 1);
+        DebugPanel.WatchPane.SetShown(tab == 2);
+        DebugPanel.Stack.SetShown(tab == 3);
+        if (tab == 0) {
+            DebugPanel.Console.Bind(console);
+            DebugPanel.Console.WithColors(
+                OutputPanel.ConsoleColors(app, console));
+        } else if (tab == 1) {
+            DebugPanel.Vars.Bind(vars);
+        } else if (tab == 2) {
+            DebugPanel.WatchGrid.Bind(watchRows);
+        } else if (tab == 3) {
+            DebugPanel.Stack.Bind(stack);
         }
-        return DebugPanel.varsList;
+        this.RenderInside(app, area);
+        // 页签在绘制时处理点击，所以选择在这里回读。
+        int chg = DebugPanel.TabBar.TakeChanged();
+        if (chg >= 0) { panelTab.Set(chg); }
     }
 
-    static ListView<DbgVar> WatchList() {
-        if (DebugPanel.watchList == null) {
-            DebugPanel.watchList = DebugPanel.VarGrid();
-            DebugPanel.watchList.EmptyText(ZanIDE.T("No watches yet.",
-                "还没有监视表达式。"));
-            DebugPanel.watchList.OnSelect(DebugPanel.WatchRowPicked);
+    /// 页签标签跟着界面语言走；只有真的变了才重建那条页签条。
+    void SyncTabs(int tab) {
+        List<string> labels = new List<string>{
+            ZanIDE.T("Console", "控制台"), ZanIDE.T("Variables", "变量"),
+            ZanIDE.T("Watch", "监视"), ZanIDE.T("CallStack", "调用栈") };
+        if (DebugPanel.tabLbls == null
+                || !ZanIDE.StringListsEqual(DebugPanel.tabLbls, labels)) {
+            DebugPanel.TabBar.Clear();
+            for (int i = 0; i < labels.Count; i = i + 1) {
+                DebugPanel.TabBar.Add(labels[i], false);
+            }
+            DebugPanel.tabLbls = labels;
         }
-        return DebugPanel.watchList;
+        DebugPanel.TabBar.Select(tab);
+        DebugPanel.TabBar.TakeChanged();
     }
 
-    static ListView<DbgFrame> StackList() {
-        if (DebugPanel.stackList == null) {
-            List<ListColumn<DbgFrame>> cols = new List<ListColumn<DbgFrame>>();
-            cols.Add(new ListColumn<DbgFrame>(ZanIDE.T("Call Stack", "调用栈"),
-                f => f.name + " : line " + Convert.ToString(f.line)));
-            DebugPanel.stackList = new ListView<DbgFrame>(cols);
-        }
-        return DebugPanel.stackList;
-    }
-
-    static Input WatchInput() {
-        if (DebugPanel.watchIn == null) {
-            DebugPanel.watchIn = new Input(ZanIDE.T(
-                "Type an expression and press Enter; click a row to remove it",
-                "输入表达式后回车添加；点击行删除"));
-            DebugPanel.watchIn.Submit.Add(DebugPanel.WatchSubmitted);
-        }
-        return DebugPanel.watchIn;
-    }
-
-    /// Enter in the expression field: the shell adds it and re-evaluates.
+    /// 监视框里回车：外壳把它加进监视表并重新求值。
     static void WatchSubmitted() {
-        Input box = DebugPanel.WatchInput();
+        DebugPanel dp = DebugPanel.current;
+        if (dp == null) { return; }
+        Input box = DebugPanel.WatchIn;
         if (box.GetText().Length == 0) { return; }
         DebugPanel.watchAdd = box.GetText();
         box.SetText("");
     }
 
-    /// A watch row is clicked to drop that expression, so the selection is
-    /// only ever a gesture and is cleared right away.
+    /// 点一行监视就是删掉那个表达式，所以选择只是一次手势，随即清掉。
     static void WatchRowPicked() {
-        ListView<DbgVar> rows = DebugPanel.WatchList();
-        if (!rows.HasSelection()) { return; }
+        ListView<DbgVar> rows = DebugPanel.WatchGrid;
+        if (rows == null || !rows.HasSelection()) { return; }
         DebugPanel.watchDrop = rows.SelectedIndex();
         rows.ClearSelection();
     }
 
-    /// The expression the user submitted since the last call, or "".
+    /// 用户自上次调用以来提交的表达式，没有则为 ""。
     static string TakeWatchAdd() {
         string s = DebugPanel.watchAdd;
         DebugPanel.watchAdd = "";
         return s;
     }
 
-    /// The watch row the user clicked since the last call, or -1.
+    /// 用户自上次调用以来点掉的监视行，没有则为 -1。
     static int TakeWatchDrop() {
         int i = DebugPanel.watchDrop;
         DebugPanel.watchDrop = 0 - 1;
         return i;
-    }
-
-    static void RenderDebugBottom(App app, Canvas c, Theme t, Rect orr, SignalInt panelTab,
-            List<string> console, List<DbgVar> vars, List<DbgVar> watchRows,
-            List<DbgFrame> stack, List<string> log,
-            LogState dbgLog) {
-        int tab = panelTab.Get();
-        int tabH = t.heightMedium;
-
-        // Tab bar: a retained Tabs (line style) bound to the panelTab signal.
-        // Tabs paints its own strip surface; the dock painted the pane's
-        // surface behind it, so no extra fill here.
-        List<string> tabLabels = new List<string>{
-            ZanIDE.T("Console", "控制台"), ZanIDE.T("Variables", "变量"),
-            ZanIDE.T("Watch", "监视"), ZanIDE.T("CallStack", "调用栈") };
-        if (DebugPanel.panelTabs == null
-                || !ZanIDE.StringListsEqual(DebugPanel.panelLbls, tabLabels)) {
-            Tabs nt = new Tabs(Tabs.Line());
-            for (int li = 0; li < tabLabels.Count; li = li + 1) { nt.Add(tabLabels[li], false); }
-            DebugPanel.panelTabs = nt;
-            DebugPanel.panelLbls = tabLabels;
-        }
-        DebugPanel.panelTabs.Select(panelTab.Get());
-        DebugPanel.panelTabs.TakeChanged();
-        DebugPanel.panelTabs.Render(app, orr.x, orr.y, orr.width);
-        int panelChg = DebugPanel.panelTabs.TakeChanged();
-        if (panelChg >= 0) { panelTab.Set(panelChg); tab = panelChg; }
-
-        // Content area (the dock's own surface shows through)
-        int contentY = orr.y + tabH;
-        int contentH = orr.height - tabH;
-
-        if (tab == 0) {
-            LogView.Render(app, orr.x, contentY, orr.width, contentH, console,
-                OutputPanel.ConsoleColors(app, console), dbgLog, "", true);
-        } else if (tab == 1) {
-            DebugPanel.RenderVarsTab(app, c, t, orr.x, contentY, orr.width, contentH, vars);
-        } else if (tab == 2) {
-            DebugPanel.RenderWatchTab(app, c, t, orr.x, contentY, orr.width, contentH,
-                watchRows);
-        } else if (tab == 3) {
-            DebugPanel.RenderStackTab(app, c, t, orr.x, contentY, orr.width, contentH, stack);
-        }
-    }
-
-    static void RenderVarsTab(App app, Canvas c, Theme t,
-            int x, int y, int w, int h, List<DbgVar> vars) {
-        ListView<DbgVar> grid = DebugPanel.VarsList();
-        grid.Bind(vars);
-        grid.RenderInside(app, new Rect(x, y, w, h));
-    }
-
-    /// Watch tab: an expression field on top (Enter adds, click a row removes),
-    /// then the evaluated expressions in the same grid as Variables.
-    static void RenderWatchTab(App app, Canvas c, Theme t,
-            int x, int y, int w, int h, List<DbgVar> rows) {
-        int inpH = t.heightMedium;
-        DebugPanel.WatchInput().Render(app, x + app.Scale(4), y + app.Scale(3),
-            w - app.Scale(8), inpH);
-        ListView<DbgVar> grid = DebugPanel.WatchList();
-        grid.Bind(rows);
-        int top = y + inpH + app.Scale(6);
-        grid.RenderInside(app, new Rect(x, top, w, y + h - top));
-    }
-
-    static void RenderStackTab(App app, Canvas c, Theme t,
-            int x, int y, int w, int h, List<DbgFrame> stack) {
-        ListView<DbgFrame> grid = DebugPanel.StackList();
-        grid.Bind(stack);
-        grid.RenderInside(app, new Rect(x, y, w, h));
-    }
-
-    static void RenderInlineVars(App app, Canvas c, Theme t, Rect edRect,
-            List<DbgVar> varInfo, int execLine) {
-        if (varInfo.Count == 0) { return; }
-        int fontSize = t.fontSizeSmall;
-        int lineH = Canvas.FontHeight(t.fontSizeMedium) + app.Scale(4);
-        if (lineH < 1) { lineH = 1; }
-        // Build inline text from all variables
-        string inlineText = "";
-        for (int vi = 0; vi < varInfo.Count; vi = vi + 1) {
-            DbgVar entry = varInfo[vi];
-            string vName = entry.name;
-            string vVal = entry.val;
-            if (inlineText.Length > 0) { inlineText = inlineText + "  |  "; }
-            inlineText = inlineText + vName + " = " + vVal;
-        }
-        if (inlineText.Length == 0) { return; }
-        // Draw at top-right of editor area as an overlay
-        int tw = Canvas.MeasureText(inlineText, fontSize) + app.Scale(16);
-        int th = app.Scale(22);
-        int tx = edRect.x + edRect.width - tw - app.Scale(8);
-        int ty = edRect.y + app.Scale(4);
-        Prompt.Surface(app, tx, ty, tw, th, "");
-        if (DebugPanel.inlineLbl == null) {
-            DebugPanel.inlineLbl = new Label("");
-            DebugPanel.inlineLbl.Class = "small string";
-        }
-        DebugPanel.inlineLbl.Text = inlineText;
-        DebugPanel.inlineLbl.RenderAt(app, tx + app.Scale(8), ty + app.Scale(4),
-            tw - app.Scale(16));
-    }
-
-    /// The stepping toolbar's buttons as data (icon, label, class, action id),
-    /// in bar order. The toolbar builds its retained Button widgets from this
-    /// once; callers only ever touch the data.
-    static List<DbgToolbarBtn> ToolbarButtons() {
-        List<DbgToolbarBtn> btns = new List<DbgToolbarBtn>();
-        btns.Add(DbgToolbarBtn.Of("play", ZanIDE.T("Continue", "继续"),
-            "success small", 0));
-        btns.Add(DbgToolbarBtn.Of("arrow-right", ZanIDE.T("Step Over", "单步跳过"),
-            "info small", 1));
-        btns.Add(DbgToolbarBtn.Of("arrow-down", ZanIDE.T("Step Into", "单步进入"),
-            "info small", 2));
-        btns.Add(DbgToolbarBtn.Of("stop", ZanIDE.T("Stop", "停止"),
-            "error small", 3));
-        return btns;
-    }
-
-    static int RenderDebugToolbar(App app, Canvas c, Theme t,
-            int x, int y, int w, int h, int execLine,
-            List<DbgToolbarBtn> btns) {
-        // The toolbar is a retained ToolStrip of Button widgets. It owns its
-        // own background and bottom divider, so the caller only needs to
-        // render it and read any clicked action.
-        // Rebuild the strip if the bilingual labels or order changed.
-        string sig = "";
-        for (int bi = 0; bi < btns.Count; bi = bi + 1) {
-            DbgToolbarBtn bd = btns[bi];
-            sig = sig + bd.icon + ":" + bd.label + ":" + bd.cls + "|";
-        }
-        if (DebugPanel.toolbar == null || sig != DebugPanel.toolbarSig) {
-            DebugPanel.toolbar = new ToolStrip();
-            for (int bi = 0; bi < btns.Count; bi = bi + 1) {
-                DbgToolbarBtn bd = btns[bi];
-                int action = bd.action;
-                int idx = DebugPanel.toolbar.Add(bd.label, bd.icon);
-                Button b = DebugPanel.toolbar.ItemAt(idx);
-                b.Class = bd.cls;
-                b.Click += () => { DebugPanel.toolbarAction = action; };
-            }
-            DebugPanel.toolbarSig = sig;
-        }
-        DebugPanel.toolbar.RenderAt(app, x, y, w, h);
-
-        Label lineLbl = new Label(ZanIDE.T("Line: ", "行：")
-            + Convert.ToString(execLine + 1));
-        lineLbl.Class = "secondary small";
-        int lw = Canvas.MeasureText(lineLbl.Text, t.fontSizeSmall);
-        lineLbl.RenderAt(app, x + w - lw - app.Scale(12),
-            Canvas.CenterTextY(y, h, t.fontSizeSmall));
-
-        int a = DebugPanel.toolbarAction;
-        DebugPanel.toolbarAction = 0 - 1;
-        return a;
     }
 }

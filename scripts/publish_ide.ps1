@@ -93,6 +93,18 @@ $ideCss = Join-Path $root 'src\ide_zan\ide.css'
 if (Test-Path $ideCss) { Copy-Item $ideCss (Join-Path $dist 'ide.css') -Force }
 else { Write-Output "PUBLISH_WARN: src\ide_zan\ide.css missing (IDE uses default layout)" }
 
+# The Help topics are baked into the exe, but a copy next to it wins (see
+# DocsData.DiskPaths): shipping it lets a user or a docs update replace the
+# documentation without a new build.
+$docsJson = Join-Path $root 'src\ide_zan\assets\docs\topics.json'
+if (Test-Path $docsJson) {
+    $distDocs = Join-Path $dist 'docs'
+    New-Item -ItemType Directory -Force -Path $distDocs | Out-Null
+    Copy-Item $docsJson (Join-Path $distDocs 'topics.json') -Force
+} else {
+    Write-Output "PUBLISH_WARN: src\ide_zan\assets\docs\topics.json missing (Help page uses the embedded copy)"
+}
+
 # ---- skin packs are baked into ZanIDE.exe as embedded resources -----------
 # (scripts\gen_embed.ps1, linked in by build_ide.ps1). The skin picker reads
 # them from the exe in memory, so no external skins\ folder ships at the root.

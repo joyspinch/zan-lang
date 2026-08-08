@@ -485,7 +485,7 @@ partial class ZanIDE {
             }
         }
         // Restore the active session's transcript into the live lists.
-        aiMsgs = new List<AiChatMsg>();
+        aiMsgs = new List<ChatMessage>();
         aiPlan = new List<AiPlanStep>();
         if (aiSessCur >= 0 && aiSessCur < aiSessions.Count) {
             AiRestoreSession(aiSessions[aiSessCur].pack);
@@ -1030,7 +1030,7 @@ partial class ZanIDE {
     }
 
     // ---- Editor Settings dialog: declarative tree + two-way binding ----
-    // The Settings modal is built as a UiNode tree bound to a JsonValue model
+    // The Settings modal is declared in EditorSettingsDialog.zform and bound to a JsonValue model
     // {themeIdx, font, lang}. Handlers are parameterless Actions resolved by the
     // registry, so button clicks flip these static flags which Run() consumes.
     static bool setDone;
@@ -1541,11 +1541,13 @@ partial class ZanIDE {
         InitDesignerState();
         InitPanelsAndDock(cfg);
         InitGitPanel();
+        // Sidebar state (trees, filters, selections) must exist before the
+        // designed dock panels are wired to it.
+        InitSidebarState();
         InitDockPanels(form);
         InitHelpPanel();
         InitAiState();
         InitRunState(cfg);
-        InitSidebarState();
 
         lastPresent = 0;
         lastSkinIdx = app.ThemeMenuIndex();
@@ -2134,9 +2136,9 @@ partial class ZanIDE {
             int dbgBarH = 0;
             if (dbgState == 2) {
                 dbgBarH = app.Scale(38);
-                int dbgAction = DebugPanel.RenderDebugToolbar(
-                    app, c, t, 0, top + ribbonH, W, dbgBarH, dbgExecLine,
-                    DebugPanel.ToolbarButtons());
+                int dbgAction = dbgToolbar.Render(app,
+                    new Rect(0, top + ribbonH, W, dbgBarH), dbgExecLine,
+                    DebugToolbar.Buttons());
                 if (dbgAction == 0) {
                     if (dbg != null) { dbg.Continue(); }
                     dbgState = ZanIDE.DbgSync(dbg, editor, log, dbgConsole);
@@ -2235,26 +2237,12 @@ partial class ZanIDE {
                 }
                 structSel.Set(0 - 1);
             }
-            if (structTv == null) {
-                structTv = new TreeView();
-                structTv.BindSel(structSel).WithFilter(structFilter);
-                structTv.EmptyText(ZanIDE.T("No symbols", "无符号"));
-                structTv.OnSelect(ZanIDE.StructurePicked);
-            }
-            structShow = ZanIDE.FilterNodes(structTree, structFilter.GetText());
-            structTv.Bind(structShow);
-            structTv.RenderInside(app, dock.ContentParked("structure"));
+            structurePanel.Render(app, dock.ContentParked("structure"), structTree);
+            structShow = structurePanel.Shown();
 
-            // Section 3: Examples (collapsible tree, click a leaf to open)
-            if (stdlibTv == null) {
-                stdlibTv = new TreeView();
-                stdlibTv.BindSel(exSel).WithFilter(exFilter);
-                stdlibTv.OnSelect(ZanIDE.ExamplePicked);
-                stdlibTv.OnContext(ZanIDE.StdlibContext);
-            }
-            exShow = ZanIDE.FilterNodes(exTree, exFilter.GetText());
-            stdlibTv.Bind(exShow);
-            stdlibTv.RenderInside(app, dock.ContentParked("stdlib"));
+            // Section 3: the stdlib / examples tree, click a leaf to open it.
+            stdlibPanel.Render(app, dock.ContentParked("stdlib"), exTree);
+            exShow = stdlibPanel.Shown();
 
             // The editor is the dock's fixed center panel, so it always has
             // a rect; every tool panel is parked off-screen while closed.
@@ -2591,7 +2579,7 @@ partial class ZanIDE {
                 }
                 // Draw inline debug annotations
                 if (dbgState == 2 && dbgExecLine >= 0) {
-                    DebugPanel.RenderInlineVars(app, c, t, edRect, dbgVarInfo, dbgExecLine);
+                    dbgInline.Render(app, edRect, dbgVarInfo);
                 }
             }
 
@@ -2799,7 +2787,6 @@ partial class ZanIDE {
             // 「帮助与反馈」：本地聚合的错误 + 复制/导出。它和错误面板并列
             // 在底部，但收的是全部来源（含界面层异常与程序崩溃），不只是
             // 这一次编译的诊断。
-            this.RenderHelpPanel(app, dock.ContentParked("help"));
             Rect errRect = dock.ContentParked("errors");
             List<DiagnosticRecord> errors = new List<DiagnosticRecord>();
             ZanIDE.ParseErrorList(log, errors);
@@ -2837,9 +2824,8 @@ partial class ZanIDE {
             }
 
             if (dbgState == 2) {
-                DebugPanel.RenderDebugBottom(app, c, t, orr, dbgPanelTab,
-                    dbgConsole, dbgVarInfo, dbgWatchVals,
-                    dbgStack, log, coLog);
+                dbgPanel.Render(app, orr, dbgPanelTab,
+                    dbgConsole, dbgVarInfo, dbgWatchVals, dbgStack);
                 // The Watch tab's field and grid are widgets: typing,
                 // Enter and the row click happen inside them, and the
                 // shell only learns what the user asked for.
@@ -2950,770 +2936,11 @@ partial class ZanIDE {
                 }
             }
 
-            // ---- AI assistant panel ----
-            // The assistant, tools, examples and git are four dock panels of
-            // their own; each draws into the rect the dock hands it (parked
-            // off-screen while hidden), so any of them can be tabbed
-            // together, moved to another side or closed.
-            Rect rp = dock.ContentParked("ai");
-            int rPad = app.Scale(6);
-            // ---- Session sidebar: a vertical, searchable chat list on
-            // the left; the header/transcript/input fill the rest. A too-
-            // narrow dock drops it so the chat keeps usable width. Session
-            // switch/new/delete are all driven from here, then the panel
-            // below just renders whatever session is current.
-            int aiSideW = app.Scale(154);
-            if (aiSideW > rp.width - app.Scale(150)) { aiSideW = 0; }
-            if (aiSideW > 0) {
-                List<string> aiTitles = new List<string>();
-                List<int> aiArch = new List<int>();
-                for (int sti = 0; sti < aiSessions.Count; sti = sti + 1) {
-                    // A name the user typed wins over the first message,
-                    // which is only this panel's guess at the subject.
-                    string sTtl = aiSessions[sti].title;
-                    if (sTtl == "") {
-                        if (sti == aiSessCur) {
-                            sTtl = ChatArea.FirstUserOf(aiMsgs);
-                        } else {
-                            sTtl = ChatArea.ChatTitle(aiSessions[sti].pack);
-                        }
-                    }
-                    if (sTtl == "") {
-                        sTtl = ZanIDE.T("New chat ", "新会话 ")
-                            + Convert.ToString(sti + 1);
-                    }
-                    aiTitles.Add(sTtl);
-                    aiArch.Add(aiSessions[sti].archived);
-                }
-                SessionListAction sAct = aiSessNav.RenderEx(app,
-                    rp.x + rPad, rp.y + rPad, aiSideW - rPad * 2,
-                    rp.height - rPad * 2, aiTitles, aiSessCur, aiArch);
-                aiSideRule.Prefer(1, rp.height);
-                aiSideRule.RenderAt(app, rp.x + aiSideW, rp.y);
-                if (aiBusy.Get() == 0 && sAct.archived >= 0
-                    && sAct.archived < aiSessions.Count) {
-                    // Archive keeps the chat (and its whole context) but
-                    // folds it out of the list; clicking again restores it.
-                    int sArc = sAct.archived;
-                    if (aiSessions[sArc].archived == 0) { aiSessions[sArc].archived = 1; }
-                    else { aiSessions[sArc].archived = 0; }
-                    SaveAiSessions();
-                    Layer.Msg(aiSessions[sArc].archived == 1
-                        ? ZanIDE.T("Chat archived", "会话已归档")
-                        : ZanIDE.T("Chat restored", "会话已恢复"), 3);
-                    app.RequestRedraw();
-                } else if (aiBusy.Get() == 0 && sAct.deleted >= 0) {
-                    // Delete drops the whole context of that chat: its
-                    // transcript, thinking, task plan and archive flag. The
-                    // last remaining chat is emptied rather than removed,
-                    // so the panel always has a session to write into.
-                    aiSessions[aiSessCur].pack = AiPackCur();
-                    int sDel = sAct.deleted;
-                    bool sDelActive = sDel == aiSessCur;
-                    int sNewCur = aiSessCur;
-                    if (aiSessions.Count > 1) {
-                        aiSessions.RemoveAt(sDel);
-                        if (sDel < aiSessCur) { sNewCur = aiSessCur - 1; }
-                        else if (sDel == aiSessCur) {
-                            if (sNewCur >= aiSessions.Count) {
-                                sNewCur = aiSessions.Count - 1;
-                            }
-                        }
-                    } else {
-                        aiSessions[0].pack = "";
-                        aiSessions[0].archived = 0;
-                        sNewCur = 0;
-                    }
-                    aiMsgs = new List<AiChatMsg>();
-                    aiPlan = new List<AiPlanStep>();
-                    AiRestoreSession(aiSessions[sNewCur].pack);
-                    aiSessCur = sNewCur;
-                    if (sDelActive) { AiResetContextState(); }
-                    aiCacheKey = "";
-                    aiCacheSig = "";
-                    aiToolOpen = new List<int>();
-                    aiScroll.Set(0);
-                    // Rows shifted under the list: a rename left open would
-                    // land on whichever chat took that index.
-                    aiSessNav.CancelRename();
-                    SaveAiSessions();
-                    Layer.Msg(ZanIDE.T("Chat and its context deleted",
-                        "会话及其上下文已删除"), 3);
-                    app.RequestRedraw();
-                } else if (sAct.renamed >= 0
-                    && sAct.renamed < aiSessions.Count) {
-                    // An empty name hands the row back to the derived one.
-                    aiSessions[sAct.renamed].title =
-                        CodeEditor.TrimStr(sAct.title);
-                    SaveAiSessions();
-                    app.RequestRedraw();
-                } else if (aiBusy.Get() == 0 && sAct.created) {
-                    aiSessions[aiSessCur].pack = AiPackCur();
-                    aiSessions.Add(AiSession.Create("", 0));
-                    aiMsgs = new List<AiChatMsg>();
-                    aiPlan = new List<AiPlanStep>();
-                    aiSessCur = aiSessions.Count - 1;
-                    AiResetContextState();
-                    aiCacheKey = "";
-                    aiCacheSig = "";
-                    aiToolOpen = new List<int>();
-                    aiScroll.Set(0);
-                    SaveAiSessions();
-                    app.RequestRedraw();
-                } else if (aiBusy.Get() == 0 && sAct.selected >= 0
-                    && sAct.selected != aiSessCur) {
-                    aiSessions[aiSessCur].pack = AiPackCur();
-                    aiMsgs = new List<AiChatMsg>();
-                    aiPlan = new List<AiPlanStep>();
-                    AiRestoreSession(aiSessions[sAct.selected].pack);
-                    aiSessCur = sAct.selected;
-                    aiCacheKey = "";
-                    aiCacheSig = "";
-                    aiToolOpen = new List<int>();
-                    aiScroll.Set(0);
-                    SaveAiSessions();
-                    app.RequestRedraw();
-                }
-                rp = new Rect(rp.x + aiSideW, rp.y,
-                    rp.width - aiSideW, rp.height);
-            }
-            int rInH = app.Scale(30);
-            // The chat prompt is a multi-line box (Enter sends,
-            // Shift+Enter breaks the line), so it is three rows tall --
-            // pasting a stack trace or writing a paragraph no longer
-            // scrolls inside a 30px slot. The other panels below keep the
-            // one-line row height.
-            int aiInH = app.Scale(76);
-            // Team mode adds a slim cue row above the prompt that names the
-            // member the message is about to go to. Reserving it here (not
-            // painting it over the transcript) is what keeps the strip, the
-            // transcript and the composer from overlapping.
-            int aiCueH = 0;
-            if (aiTeamMode) {
-                aiCueH = Tag.Height(app, "") + app.Scale(4);
-            }
-            int aiInY = rp.y + rp.height - aiInH - rPad;
-            int aiCueY = aiInY - aiCueH;
-            Rect rBody = new Rect(rp.x, rp.y, rp.width,
-                rp.height - aiInH - aiCueH - rPad * 2);
-            int rInY = rp.y + rp.height - rInH - rPad;
-            int rBtnW = app.Scale(56);
-            int rInW = rp.width - rPad * 3 - rBtnW;
-            if (rInW < app.Scale(40)) { rInW = app.Scale(40); }
-            {
-                // ---- Header: provider + model switcher + Continue + Config
-                // One dropdown lists every profile's models as
-                // "<provider> / <model>", so two providers offering the same
-                // model id stay distinguishable; picking one switches both
-                // the enabled provider and the chat model for this session.
-                string aiSelSig = "";
-                {
-                    for (int pfi = 0; pfi < aiProfiles.Count; pfi = pfi + 1) {
-                        AiProfile profile = aiProfiles[pfi];
-                        aiSelSig = aiSelSig + profile.name + "~"
-                            + profile.model + "~" + profile.models
-                            + "~" + profile.limits + ";;";
-                    }
-                }
-                if (aiModelSelSig != aiSelSig) {
-                    aiModelOptions = new List<ModelOption>();
-                    for (int pi = 0; pi < aiProfiles.Count; pi = pi + 1) {
-                        AiProfile profile = aiProfiles[pi];
-                        string pname = profile.name;
-                        List<string> pmods = new List<string>();
-                        string defM = profile.model;
-                        if (defM != "") { pmods.Add(defM); }
-                        List<string> fetched = ZanIDE.SplitList(profile.models);
-                        for (int fmi = 0; fmi < fetched.Count; fmi = fmi + 1) {
-                            bool dup = false;
-                            for (int dk = 0; dk < pmods.Count; dk = dk + 1) {
-                                if (pmods[dk] == fetched[fmi]) { dup = true; }
-                            }
-                            // Models unticked in AI Settings are kept out
-                            // of the picker: a provider lists dozens, a
-                            // session uses two.
-                            bool hidden = ZanIDE.AiLimitInt(profile.limits,
-                                fetched[fmi], "off") == 1;
-                            if (!dup && !hidden) { pmods.Add(fetched[fmi]); }
-                        }
-                        for (int mj = 0; mj < pmods.Count; mj = mj + 1) {
-                            aiModelOptions.Add(ModelOption.Of(pi, pmods[mj],
-                                pname + " / " + pmods[mj]));
-                        }
-                    }
-                    // The settings window can replace profiles between
-                    // frames. Normalize the active index before any
-                    // preselection dereference, not only below the header.
-                    if (aiProfActive < 0 || aiProfActive >= aiProfiles.Count) {
-                        aiProfActive = 0;
-                    }
-                    string activeDefaultModel = "";
-                    if (aiProfiles.Count > 0) {
-                        AiProfile activeProfile = aiProfiles[aiProfActive];
-                        if (activeProfile != null) {
-                            activeDefaultModel = activeProfile.model;
-                        }
-                    }
-                    // Preselect the enabled profile's default model.
-                    int pre = 0 - 1;
-                    for (int oi = 0; oi < aiModelOptions.Count; oi = oi + 1) {
-                        ModelOption opt = aiModelOptions[oi];
-                        if (opt.profile == aiProfActive
-                            && opt.model == activeDefaultModel) {
-                            pre = oi; break;
-                        }
-                    }
-                    if (pre < 0 && aiModelOptions.Count > 0) {
-                        for (int oj = 0; oj < aiModelOptions.Count; oj = oj + 1) {
-                            if (aiModelOptions[oj].profile == aiProfActive) { pre = oj; oj = aiModelOptions.Count; }
-                        }
-                    }
-                    aiModelSel = new Dropdown<ModelOption>(o => o.label);
-                    aiModelSel.Hint(ZanIDE.T("Provider / model", "服务商 / 模型"));
-                    aiModelSel.Bind(aiModelOptions);
-                    if (pre >= 0) { aiModelSel.SelectIndex(pre); }
-                    aiModelSelSig = aiSelSig;
-                }
-                // One header row now (the model switcher); sessions moved
-                // to the left sidebar, so the transcript starts right below.
-                int aiRow1Y = rBody.y + app.Scale(4);
-                int aiRow1H = app.Scale(34);
-                int aiHdrH = app.Scale(4) + aiRow1H + app.Scale(8);
-                int aiSmBtnW = app.Scale(52);
-                // D: reserve a square at the far right of the header for the
-                // context-usage ring. Header holds selector + Config + ring:
-                // a chat just keeps following its own context, so there is
-                // no fork / continue to explain away.
-                int aiRingBox = aiRow1H;
-                int aiSelW = rBody.width - rPad * 4 - aiSmBtnW - aiRingBox;
-                if (aiSelW < app.Scale(60)) {
-                    // A narrow panel cannot hold the natural sizes: share
-                    // the strip instead of letting the buttons run past the
-                    // right edge (and over each other).
-                    int aiStrip = rBody.width - rPad * 4 - aiRingBox;
-                    if (aiStrip < app.Scale(48)) { aiStrip = app.Scale(48); }
-                    aiSmBtnW = aiStrip * 34 / 100;
-                    if (aiSmBtnW < app.Scale(22)) { aiSmBtnW = app.Scale(22); }
-                    aiSelW = aiStrip - aiSmBtnW;
-                    if (aiSelW < app.Scale(24)) { aiSelW = app.Scale(24); }
-                }
-                // Same explicit height for the selector and every button so
-                // the header row's controls line up (a select's natural head
-                // height is otherwise shorter than a `small` button).
-                aiModelSel.RenderInside(app, new Rect(rBody.x + rPad, aiRow1Y, aiSelW, aiRow1H));
-                int aiCfgId = aiCfgBtn.RenderIn(app,
-                    rBody.x + rPad * 2 + aiSelW, aiRow1Y, aiSmBtnW, aiRow1H);
-                int aiRingR = aiRingBox / 2 - app.Scale(3);
-                int aiRingCx = rBody.x + rBody.width - rPad - aiRingBox / 2;
-                int aiRingCy = aiRow1Y + aiRow1H / 2;
-                AiRenderContextRing(app, aiRingCx, aiRingCy, aiRingR);
-                if (Ui.Clicked(app, aiCfgId)) {
-                    if (aiWindow == null || !aiWindow.IsOpen()) {
-                        aiWindow = AiSettingsWindow.Open(app, ZanIDE.uiLang);
-                    }
-                    app.RequestRedraw();
-                }
-                // The provider + model in effect: the dropdown selection
-                // switches the enabled profile too, so the base URL / key
-                // below follow the chosen provider. Falls back to the
-                // enabled profile's default model when nothing is picked.
-                ModelOption selMi = aiModelSel.Selected();
-                if (selMi != null && selMi.profile >= 0
-                        && selMi.profile < aiProfiles.Count) {
-                    aiProfActive = selMi.profile;
-                }
-                // aiProfActive 可能在删改配置后落到越界值；越界索引会返回
-                // null，随后 .model/.limits 解引用崩溃。先夹取到有效范围，
-                // 空列表时用安全默认，避免把悬空/空串喂给 AiLimitInt。
-                if (aiProfActive < 0 || aiProfActive >= aiProfiles.Count) {
-                    aiProfActive = 0;
-                }
-                string chatModel = "";
-                string aiLimMap = "";
-                if (aiProfiles.Count > 0) {
-                    AiProfile aiProf = aiProfiles[aiProfActive];
-                    if (aiProf != null) {
-                        chatModel = aiProf.model;
-                        aiLimMap = aiProf.limits;
-                        // Which model each member runs on, taken from the
-                        // provider in effect: reading it here means switching
-                        // provider (or saving the settings dialog) moves the
-                        // whole team with it.
-                        AiTeam.SetModels(aiProf.roles);
-                    }
-                }
-                if (selMi != null) { chatModel = selMi.model; }
-                // Feed the enabled model's configured context / output limits
-                // to the agent layer, so context compaction, the usage ring
-                // and the request's max_tokens all follow this model. An
-                // unconfigured model uses the default context length.
-                int aiCtxTok = ZanIDE.AiLimitInt(aiLimMap, chatModel, "ctx");
-                if (aiCtxTok <= 0) { aiCtxTok = AiAgent.DefaultCtxTokens(); }
-                AiAgent.SetLimits(aiCtxTok,
-                    ZanIDE.AiLimitInt(aiLimMap, chatModel, "out"));
-                // The team strip owns the single/team switch, so the mode is
-                // always one click away and the panel always says which one
-                // it is in.
-                int aiTeamH = TeamBoard.Height(app, aiTeamMode,
-                    aiTeamOpen.Get() == 1, aiTasks.Count, rBody.width);
-                bool aiTeamWas = aiTeamMode;
-                aiTeamMode = TeamBoard.Render(app,
-                    new Rect(rBody.x, rBody.y + aiHdrH, rBody.width,
-                        aiTeamH),
-                    aiTeamMode, aiBusy.Get() == 1, aiTeamSt, aiTasks,
-                    aiTeamOpen);
-                if (aiTeamMode != aiTeamWas) {
-                    // Switching modes changes who every name row belongs to,
-                    // so the wrapped transcript has to be rebuilt.
-                    aiCacheKey = "";
-                    if (!aiTeamMode) { aiRunAgent = ""; }
-                    app.RequestRedraw();
-                }
-                int aiPlanH = AiPlanHeight(app);
-                if (aiPlanH > 0) {
-                    AiRenderPlan(app,
-                        new Rect(rBody.x, rBody.y + aiHdrH + aiTeamH,
-                        rBody.width, aiPlanH));
-                }
-                Rect aiChat = new Rect(rBody.x,
-                    rBody.y + aiHdrH + aiTeamH + aiPlanH,
-                    rBody.width,
-                    rBody.height - aiHdrH - aiTeamH - aiPlanH);
-                // Wheel-scroll the transcript (lines up from the bottom).
-                bool ownsAiWheel = app.CaptureWheel(aiChat.x, aiChat.y, aiChat.width, aiChat.height);
-                if (ownsAiWheel) {
-                    int awd = app.window.EventKeyCode();
-                    int awstep = awd / 120;
-                    if (awstep == 0) {
-                        if (awd > 0) { awstep = 1; }
-                        else if (awd < 0) { awstep = 0 - 1; }
-                    }
-                    aiScroll.Set(aiScroll.Get() + awstep);
-                    app.RequestRedraw();
-                }
-                // Rebuild the wrapped/markdown line cache only when the
-                // transcript or width changed (rewrapping per frame is slow).
-                int aiTextW = aiChat.width - app.Scale(28);
-                if (aiTextW < app.Scale(20)) { aiTextW = app.Scale(20); }
-                int aiTailLen = 0;
-                if (aiMsgs.Count > 0) {
-                    aiTailLen = aiMsgs[aiMsgs.Count - 1].text.Length
-                        + aiMsgs[aiMsgs.Count - 1].reason.Length;
-                }
-                int aiToolSig = aiToolOpen.Count;
-                for (int aiTsi = 0; aiTsi < aiToolOpen.Count; aiTsi = aiTsi + 1) {
-                    aiToolSig = aiToolSig * 131 + aiToolOpen[aiTsi] + 1;
-                }
-                // Layout inputs: any change here invalidates every wrapped
-                // line, so the whole transcript has to be rebuilt.
-                string aiLayoutSig = Convert.ToString(aiTextW)
-                    + ":" + Convert.ToString(edFontPx)
-                    + ":" + Convert.ToString(aiThinkOpen.Get())
-                    + ":" + Convert.ToString(aiToolSig);
-                string aiKeyNow = aiLayoutSig + ":"
-                    + Convert.ToString(aiMsgs.Count) + ":"
-                    + Convert.ToString(aiTailLen);
-                if (aiKeyNow != aiCacheKey) {
-                    // Only the streaming (last) turn grows from frame to
-                    // frame. Keeping the settled turns' wrapped lines and
-                    // re-wrapping just the tail keeps a 1000-turn chat as
-                    // cheap to stream into as an empty one -- rebuilding
-                    // everything each frame is what made long chats crawl.
-                    bool aiFull = aiLayoutSig != aiCacheSig
-                        || aiMsgs.Count < aiCacheTurns + 1
-                        || aiCacheLines.Count < aiCachePrefix;
-                    int aiStable = aiMsgs.Count - 1;
-                    if (aiStable < 0) { aiStable = 0; }
-                    if (aiFull) {
-                        aiCacheLines = new List<TextRun>();
-                        aiCacheTurns = 0;
-                        aiCachePrefix = 0;
-                        aiCacheSig = aiLayoutSig;
-                        // Rewrapping remaps every line index, so a stale
-                        // selection would highlight the wrong text.
-                        aiChatSel.ClearSelection();
-                    } else {
-                        while (aiCacheLines.Count > aiCachePrefix) {
-                            int aiLast = aiCacheLines.Count - 1;
-                            aiCacheLines.RemoveAt(aiLast);
-                        }
-                    }
-                    if (aiCacheTurns < aiStable) {
-                        ChatArea.ChatBuildRange(app, aiMsgs,
-                            aiCacheTurns, aiStable, aiTextW,
-                            aiThinkOpen.Get() == 1, aiToolOpen,
-                            aiCacheLines);
-                        aiCacheTurns = aiStable;
-                        aiCachePrefix = aiCacheLines.Count;
-                    }
-                    ChatArea.ChatBuildRange(app, aiMsgs,
-                        aiStable, aiMsgs.Count, aiTextW,
-                        aiThinkOpen.Get() == 1, aiToolOpen,
-                        aiCacheLines);
-                    aiCacheKey = aiKeyNow;
-                }
-                int aiMax = ChatArea.RenderChatArea(app, aiChat,
-                    aiCacheLines,
-                    aiToolOpen, aiScroll.Get(), aiBusy.Get() == 1,
-                    aiChatSel, true, aiThinkOpen);
-                if (aiScroll.Get() > aiMax) { aiScroll.Set(aiMax); }
-                if (aiScroll.Get() < 0) { aiScroll.Set(0); }
-                // Ctrl+C copies the selected transcript text when the
-                // pointer is over the chat (like the console output panel).
-                if (app.EventKind() == 4 && app.window.EventKeyCode() == 67
-                    && Modifiers.HasCtrl(app.window.EventMods())
-                    && aiChatSel.HasSelection()
-                    && aiChat.Contains(app.mouseX, app.mouseY)) {
-                    Clipboard.SetText(ChatArea.SelectionText(aiCacheLines, aiChatSel));
-                    Layer.Msg(ZanIDE.T("Copied to clipboard", "已复制到剪贴板"), 3);
-                    app.RequestRedraw();
-                }
-                // "Insert code" / "Replace file": apply the last AI code
-                // block at the editor cursor, or as the whole file.
-                string aiCode = ZanIDE.AiLastCode(aiMsgs);
-                bool aiCanApply = aiCode != "" && act >= 0 && act < tabs.Count
-                    && !designerMode && tabs[act].path != ""
-                    && tabs[act].path.Substring(0, 1) != "@";
-                if (aiCanApply) {
-                    int abW = app.Scale(110);
-                    int abH = aiApplyBtn.AutoHeight(app);
-                    int abId = aiApplyBtn.Render(app,
-                        rp.x + rp.width - abW - rPad,
-                        rBody.y + rBody.height - abH - rPad, abW);
-                    if (Ui.Clicked(app, abId)) {
-                        editor.InsertBlock(aiCode);
-                        tabs[act].body = editor.GetText();
-                        log.Add(ZanIDE.T("> Inserted AI code into ", "> 已将 AI 代码插入 ")
-                            + tabs[act].path + ".");
-                        app.RequestRedraw();
-                    }
-                    int rbId = aiReplaceBtn.Render(app,
-                        rp.x + rp.width - abW * 2 - rPad * 2,
-                        rBody.y + rBody.height - abH - rPad, abW);
-                    if (Ui.Clicked(app, rbId)) {
-                        editor.LoadText(aiCode);
-                        tabs[act].body = aiCode;
-                        log.Add(ZanIDE.T("> Replaced ", "> 已用 AI 代码替换 ")
-                            + tabs[act].path + ZanIDE.T(" with AI code.", "。"));
-                        app.RequestRedraw();
-                    }
-                }
-                // Input row: an [Auto] toggle, the prompt box and Send --
-                // or, while a write / build / run waits, an Approve /
-                // Reject bar. Auto-execute OFF means every action tool asks
-                // first; ON lets the loop edit, build and run on its own.
-                aiAutoBtn.Text = aiAutoExec ? ZanIDE.T("Auto: on", "自动:开")
-                    : ZanIDE.T("Auto: off", "自动:关");
-                aiAutoBtn.Class = aiAutoExec ? "primary small" : "small";
-                int aiAutoW = app.Scale(84);
-                // The prompt box is three rows tall and the buttons beside it
-                // are one, so they are centred on it: top-aligning a 30px
-                // button against a 76px box is the misalignment the user saw
-                // along the bottom of the panel.
-                int aiBtnH = aiAutoBtn.AutoHeight(app);
-                int aiBtnY = aiInY + (aiInH - aiBtnH) / 2;
-                // Narrow panel: the toggle gives up its label width before it
-                // starts pushing the prompt box off the right edge.
-                if (aiAutoW > rInW - app.Scale(60)) {
-                    aiAutoW = rInW - app.Scale(60);
-                    if (aiAutoW < app.Scale(30)) { aiAutoW = app.Scale(30); }
-                    aiAutoBtn.Text = aiAutoExec ? ZanIDE.T("A:on", "自:开")
-                        : ZanIDE.T("A:off", "自:关");
-                }
-                // Team mode: say who Send will address, and let that be
-                // picked. The recipient is state (aiSendTo), not text in the
-                // prompt, so the box holds only what the user wrote and
-                // exactly one member is addressed. Empty = let the context
-                // decide, shown as the member it currently resolves to.
-                if (aiTeamMode && aiCueH > 0) {
-                    string cueId = aiSendTo;
-                    bool cueAuto = cueId == "";
-                    if (cueAuto) {
-                        cueId = AiTeam.RouteUserSt(aiInput.GetText(), aiMsgs,
-                            aiTeamSt);
-                    }
-                    string cueName = AiTeam.DisplayName(cueId);
-                    string cueCls = AiTeam.RoleTagClass(cueId);
-                    if (cueAuto) {
-                        cueName = cueName + ZanIDE.T(" (auto)", "（自动）");
-                    }
-                    string cueLab = ZanIDE.T("Sending to", "将发给");
-                    int cueFs = app.theme.fontSizeSmall;
-                    int cueX = rp.x + rPad;
-                    int cueTx = cueX;
-                    aiCueLbl.Text = cueLab;
-                    aiCueLbl.RenderAt(app, cueTx,
-                        aiCueY + (aiCueH - Canvas.FontHeight(cueFs)) / 2);
-                    cueTx = cueTx + Canvas.MeasureText(cueLab, cueFs)
-                        + app.Scale(6);
-                    int cueChipW = 0;
-                    if (cueName != ""
-                        && cueTx + Tag.Width(app, cueName, cueCls)
-                            <= rp.x + rp.width - rPad) {
-                        cueChipW = Tag.Width(app, cueName, cueCls);
-                        Tag.Chip(app, cueTx,
-                            aiCueY + (aiCueH - Tag.Height(app, cueCls)) / 2,
-                            cueName, cueCls);
-                    }
-                    // The caret says the row opens, and the whole row (label
-                    // + chip + caret) is the hit target: a 10px glyph is not
-                    // something to have to aim at.
-                    int cueCarX = cueTx + cueChipW + app.Scale(3);
-                    aiCueCaret.RenderAt(app, cueCarX,
-                        aiCueY + (aiCueH - Canvas.FontHeight(cueFs)) / 2);
-                    int cueW = cueCarX + Canvas.MeasureText("▾", cueFs) - cueX;
-                    int cueHid = app.focus.AllocId();
-                    app.hitTester.Register(new HitRegion(cueHid, cueX,
-                        aiCueY, cueW, aiCueH, 1));
-                    bool cueOpened = false;
-                    if (Ui.Clicked(app, cueHid)) {
-                        aiCueOpen = !aiCueOpen;
-                        cueOpened = aiCueOpen;
-                        app.RequestRedraw();
-                    }
-                    // The menu waits for the next frame: the click that
-                    // opened it is still the frame's click, and the menu
-                    // would read it as the outside click that dismisses it.
-                    if (aiCueOpen && !cueOpened) {
-                        List<string> cueOpts = new List<string>();
-                        List<string> cueIds = new List<string>();
-                        cueOpts.Add(ZanIDE.T("Auto (by context)", "自动（按上下文）"));
-                        cueIds.Add("");
-                        List<AiRole> cueRs = AiTeam.Roles();
-                        for (int cri = 0; cri < cueRs.Count; cri = cri + 1) {
-                            cueOpts.Add(AiTeam.DisplayName(cueRs[cri].id));
-                            cueIds.Add(cueRs[cri].id);
-                        }
-                        // Opens upward, sitting on the row: below it is the
-                        // prompt box and the window edge, and leaving that
-                        // to the clamp parks the list over the composer.
-                        int cuePick = ContextMenu.Render(app, cueX,
-                            aiCueY - ContextMenu.Height(app, cueOpts),
-                            cueOpts);
-                        if (cuePick >= 0 && cuePick < cueIds.Count) {
-                            aiSendTo = cueIds[cuePick];
-                            aiCueOpen = false;
-                            app.RequestRedraw();
-                        } else if (cuePick == 0 - 2) {
-                            aiCueOpen = false;
-                            app.RequestRedraw();
-                        }
-                    }
-                }
-                int aiAutoId = aiAutoBtn.Render(app, rp.x + rPad, aiBtnY,
-                    aiAutoW);
-                // What the toggle actually decides is who gets to run the
-                // action tools, so say that instead of leaving an
-                // unexplained "Auto" in front of the prompt.
-                string aiAutoTip = ZanIDE.T(
-                    "Auto-execute action tools.\n"
-                    + "OFF: the assistant asks you to approve every"
-                    + " write_file / edit_file / build / run / ui_check /"
-                    + " ui_tree / diff / run_errors.\n"
-                    + "ON: it edits, builds and runs on its own, and keeps"
-                    + " working through the task plan without waiting.",
-                    "自动执行操作类工具。\n"
-                    + "关：写文件 / 改文件 / 构建 / 运行 / UI 检查"
-                    + "每次都要你点“批准”。\n"
-                    + "开：助手自行修改、构建、运行，并按任务计划持续推进。");
-                if (app.mouseX >= rp.x + rPad
-                    && app.mouseX <= rp.x + rPad + aiAutoW
-                    && app.mouseY >= aiBtnY && app.mouseY <= aiBtnY + aiBtnH) {
-                    Tooltip.RequestBox(app, rp.x + rPad, aiBtnY, aiAutoW,
-                        aiBtnH, aiAutoTip, Tooltip.Top(), app.Scale(320));
-                }
-                if (Ui.Clicked(app, aiAutoId)) {
-                    aiAutoExec = !aiAutoExec;
-                    app.RequestRedraw();
-                }
-                if (aiBusy.Get() == 2) {
-                    // Confirm bar: show the parked action and let the user
-                    // Approve (run it) or Reject (tell the model to try
-                    // something else). Nothing ran while it waited here.
-                    string pdesc = ZanIDE.T("Run ", "执行 ")
-                        + AiAgent.Describe(aiPendingCall) + " ?";
-                    int pdW = rp.width - rPad * 4 - aiAutoW - rBtnW * 2;
-                    if (pdW < app.Scale(40)) { pdW = app.Scale(40); }
-                    aiPendLbl.Text = pdesc;
-                    aiPendLbl.RenderAt(app, rp.x + rPad * 2 + aiAutoW,
-                        aiBtnY + (aiBtnH
-                            - Canvas.FontHeight(app.theme.fontSizeSmall)) / 2,
-                        pdW);
-                    int rjId = aiRejectBtn.Render(app,
-                        rp.x + rp.width - rBtnW * 2 - rPad * 2, aiBtnY,
-                        rBtnW);
-                    int apId = aiApproveBtn.Render(app,
-                        rp.x + rp.width - rBtnW - rPad, aiBtnY, rBtnW);
-                    if (Ui.Clicked(app, apId)) {
-                        string capC = aiPendingCall;
-                        aiPendingCall = "";
-                        aiBusy.Set(1);
-                        AiDispatchTool(capC);
-                        aiScroll.Set(0);
-                        app.RequestRedraw();
-                    }
-                    if (Ui.Clicked(app, rjId)) {
-                        string capR = aiPendingCall;
-                        aiPendingCall = "";
-                        aiMsgs.Add(AiChatMsg.Create("tool",
-                            AiAgent.Describe(capR) + "\n"
-                            + "user declined this action; do not repeat it --"
-                            + " propose an alternative or ask what to do instead."));
-                        string rerr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs, aiRunCtxName,
-                            aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
-                            aiProfiles[aiProfActive].key, aiRunModel);
-                        if (rerr != "") {
-                            aiMsgs.Add(AiChatMsg.Create("error", rerr));
-                            aiBusy.Set(0);
-                        } else { aiBusy.Set(1); }
-                        aiScroll.Set(0);
-                        app.RequestRedraw();
-                    }
-                } else {
-                int aiInpX = rp.x + rPad * 2 + aiAutoW;
-                int aiInpW = rInW - aiAutoW - rPad;
-                if (aiInpW < app.Scale(40)) { aiInpW = app.Scale(40); }
-                // No mention picker: an @name is typed like any other word
-                // and the cue row above the box already says who Send will
-                // reach, so a popup that eats Up / Down / Enter / Tab / Esc
-                // buys nothing.
-                int aiInpId = aiInput.Render(app, aiInpX, aiInY, aiInpW, aiInH);
-                // While a request (or an auto-continued tool loop) is in
-                // flight, Send becomes Stop: it abandons the streaming
-                // child and clears the continuation budget, so a task that
-                // is going the wrong way can be interrupted.
-                if (aiBusy.Get() != 0) {
-                    int stopId = aiStopBtn.Render(app,
-                        rp.x + rPad * 2 + rInW, aiBtnY, rBtnW);
-                    if (Ui.Clicked(app, stopId)) {
-                        ZanIDE.AiCancelRequest();
-                        this.AiRunStopped();
-                        aiBusy.Set(0);
-                        aiAutoCont = AiAgent.MaxContinues();
-                        aiRetry = AiAgent.MaxRetries();
-                        aiPendingCall = "";
-                        aiMsgs.Add(AiChatMsg.Create("error",
-                            ZanIDE.T("[stopped] Interrupted by you.",
-                                "[已停止] 任务被你中断。")));
-                        aiCacheKey = "";
-                        aiCacheSig = "";
-                        app.RequestRedraw();
-                    }
-                }
-                int sendId = 0 - 1;
-                if (aiBusy.Get() == 0) {
-                    sendId = aiSendBtn.Render(app,
-                        rp.x + rPad * 2 + rInW, aiBtnY, rBtnW);
-                }
-                bool doSend = sendId >= 0 && Ui.Clicked(app, sendId);
-                // Enter sends, Shift+Enter is a newline. The box handles
-                // the key itself (it is a real multi-line editor), so the
-                // newline it just inserted is trimmed back off below.
-                if (!doSend && app.EventKind() == 6
-                    && app.window.EventKeyCode() == 13
-                    && !Modifiers.HasShift(app.window.EventMods())
-                    && app.focus.IsFocused(aiInpId)) {
-                    doSend = true;
-                }
-                if (doSend && aiBusy.Get() == 0) {
-                    string q = AiAgent.Trim(aiInput.GetText());
-                    aiInput.SetText("");
-                    // An @name that is nobody on the team is a typo, and
-                    // delivering the message to the default recipient
-                    // instead is how a question reached the wrong member
-                    // silently. Say so and keep the text so it can be fixed.
-                    string badAt = "";
-                    if (aiTeamMode && q != "") {
-                        badAt = AiTeam.UnknownMention(q);
-                    }
-                    if (badAt != "") {
-                        aiInput.SetText(q);
-                        aiMsgs.Add(AiChatMsg.Create("error", ZanIDE.T(
-                            "[error] Nobody on the team is called @" + badAt
-                                + ". Members: " + AiTeam.NameList() + ".",
-                            "[错误] 团队里没有 @" + badAt + " 这个成员。可用成员："
-                                + AiTeam.NameList() + "。")));
-                        aiScroll.Set(0);
-                        q = "";
-                    }
-                    if (q != "") {
-                        // Team mode: the member picked in the cue row is the
-                        // address and wins; on "auto" a parked question is
-                        // answered by whoever asked it, so "continue"
-                        // resumes the stage it stopped in instead of
-                        // restarting the pipeline, and otherwise the member
-                        // that spoke last takes it.
-                        string tgt = "";
-                        if (aiTeamMode) {
-                            if (aiSendTo != "") { tgt = aiSendTo; }
-                            else { tgt = AiTeam.RouteUserSt(q, aiMsgs, aiTeamSt); }
-                            aiTeamSt.awaitingUser = false;
-                            aiTeamSt.askedBy = "";
-                        }
-                        aiRunAgent = tgt;
-                        AiChatMsg umsg = AiChatMsg.Create("user", q);
-                        umsg.to = tgt;
-                        aiMsgs.Add(umsg);
-                        // 这句话推进十二拍状态机：新需求开一次交付，停在
-                        // 「用户确认」那一拍的老交付被它放行。
-                        this.AiRunUserTurn(q);
-                        // A fresh question restarts every automatic loop,
-                        // including the handoff chain's budget.
-                        aiRetry = 0;
-                        aiAutoCont = 0;
-                        aiHandoffs = 0;
-                        // Attach the active file as context so the AI can
-                        // help with the code actually on screen.
-                        string aiCtxName = "";
-                        string aiCtxCode = "";
-                        if (act >= 0 && act < tabs.Count && tabs[act].body != ""
-                            && tabs[act].body.Substring(0, 1) != "@") {
-                            aiCtxName = Path.GetFileName(tabs[act].path);
-                            if (ZanIDE.IsFormPath(tabs[act].path)) { aiCtxCode = tabs[act].body; }
-                            else { aiCtxCode = editor.GetText(); }
-                        }
-                        aiRunModel = chatModel;
-                        aiRunCtxName = aiCtxName;
-                        aiRunCtxCode = aiCtxCode;
-                        string aerr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
-                            aiCtxName, aiCtxCode, root,
-                            aiProfiles[aiProfActive].baseUrl, aiProfiles[aiProfActive].key, chatModel);
-                        if (aerr != "") {
-                            aiMsgs.Add(AiChatMsg.Create("error", aerr));
-                        } else {
-                            aiBusy.Set(1);
-                        }
-                        aiScroll.Set(0);
-                        app.RequestRedraw();
-                    }
-                }
-                }
-                // Files dragged from the file manager onto the panel are
-                // appended to the prompt as project-relative paths; the
-                // assistant reads them with its read_file tool instead of
-                // us pasting (possibly huge, possibly binary) contents in.
-                if (app.EventKind() == 9) {
-                    List<string> drops = app.window.TakeDroppedFiles();
-                    int dqx = app.window.EventX();
-                    int dqy = app.window.EventY();
-                    if (drops.Count > 0 && dqx >= rp.x && dqx < rp.x + rp.width
-                        && dqy >= rp.y && dqy < rp.y + rp.height) {
-                        string add = "";
-                        for (int di = 0; di < drops.Count; di = di + 1) {
-                            add = add + " " + AiDropRef(drops[di], root);
-                        }
-                        string cur = aiInput.GetText();
-                        if (cur != "" && cur.Substring(cur.Length - 1, 1) != " ") {
-                            cur = cur + " ";
-                        }
-                        aiInput.SetText(cur + AiAgent.Trim(add) + " ");
-                        app.RequestRedraw();
-                    }
-                }
-                // Last thing in the panel: the context / usage card the
-                // ring opens, so it sits above the chat and the prompt.
-                AiRenderUsageCard(app);
-            }
+            // ---- AI 助手面板：界面在 panels/AiPanel.zform 里声明，
+            // 行为在 ZanIDE.AiPanel.zan。助手、工具、示例和 git 是四个
+            // 各自独立的停靠面板，外壳只把 dock 分给它的矩形交出来
+            // （隐藏时停在屏幕外），所以它们可以互相并成页签、换边或关闭
+            this.RenderAiPanel(app, dock.ContentParked("ai"));
             // ---- Git panel: its own designed panel
             // (panels/GitPanel.zform): branch header, the command rows, the
             // changed-file list and the commit row. Every button is a designed
@@ -3723,25 +2950,8 @@ partial class ZanIDE {
             // filter row, scrolling and selection. A double-click RUNS a
             // tool (tools are Zan code) or opens an example's source in the
             // editor; a right-click raises the panel's context menu.
-            if (toolsTv == null) {
-                toolsTv = new TreeView();
-                toolsTv.BindSel(rtToolSel).WithFilter(rtToolFilter);
-                toolsTv.EmptyText(ZanIDE.T("No files found in ", "没有找到文件：")
-                    + ZanIDE.BaseDir() + "/tools");
-                toolsTv.OnActivate(ZanIDE.ToolActivated);
-                toolsTv.OnContext(ZanIDE.ToolContext);
-                examplesTv = new TreeView();
-                examplesTv.BindSel(rtExSel).WithFilter(rtExFilter);
-                examplesTv.EmptyText(ZanIDE.T("No examples found.", "没有找到示例。"));
-                examplesTv.OnActivate(ZanIDE.ExampleActivated);
-                examplesTv.OnContext(ZanIDE.ExampleContext);
-            }
-            Rect toolsArea = dock.ContentParked("tools");
-            toolsTv.Bind(ZanIDE.FilterNodes(rtToolTree, rtToolFilter.GetText()));
-            toolsTv.RenderInside(app, toolsArea);
-            Rect exsArea = dock.ContentParked("examples");
-            examplesTv.Bind(ZanIDE.FilterNodes(rtExTree, rtExFilter.GetText()));
-            examplesTv.RenderInside(app, exsArea);
+            toolsPanel.Render(app, dock.ContentParked("tools"), rtToolTree);
+            examplesPanel.Render(app, dock.ContentParked("examples"), rtExTree);
             // Stream new shell output from a launched program into the
             // Output tab. Poll on the throttled animation clock so a live
             // session doesn't spin the CPU but output appears promptly.
@@ -3956,7 +3166,7 @@ partial class ZanIDE {
                                     "> [AI] 正在驱动 UI 自检..."));
                                 app.RequestAnimationFrame(120);
                             } else {
-                                aiMsgs.Add(AiChatMsg.Create("tool",
+                                aiMsgs.Add(ChatMessage.Create("tool",
                                     aiUiTool + "\n"
                                     + AiAgent.BuildResult(bout, false, false)));
                                 string ube = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
@@ -3964,25 +3174,25 @@ partial class ZanIDE {
                                     aiProfiles[aiProfActive].baseUrl,
                                     aiProfiles[aiProfActive].key, aiRunModel);
                                 if (ube != "") {
-                                    aiMsgs.Add(AiChatMsg.Create("error", ube));
+                                    aiMsgs.Add(ChatMessage.Create("error", ube));
                                     aiBusy.Set(0);
                                 }
-                                aiScroll.Set(0);
+                                this.AiChatToEnd();
                             }
                         } else {
                             string tb = "build\n";
                             if (buildThenRun) { tb = "run\n"; }
-                            aiMsgs.Add(AiChatMsg.Create("tool",
+                            aiMsgs.Add(ChatMessage.Create("tool",
                                 tb + AiAgent.BuildResult(bout, aiOk, buildThenRun)));
                             string aiBe = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
                                 aiRunCtxName, aiRunCtxCode, root,
                                 aiProfiles[aiProfActive].baseUrl,
                                 aiProfiles[aiProfActive].key, aiRunModel);
                             if (aiBe != "") {
-                                aiMsgs.Add(AiChatMsg.Create("error", aiBe));
+                                aiMsgs.Add(ChatMessage.Create("error", aiBe));
                                 aiBusy.Set(0);
                             }
-                            aiScroll.Set(0);
+                            this.AiChatToEnd();
                         }
                     }
                     coLog.Reset();
@@ -4013,7 +3223,7 @@ partial class ZanIDE {
                     if (File.Exists(uidP + "/theme.json")) {
                         tjson = File.ReadAllText(uidP + "/theme.json");
                     }
-                    aiMsgs.Add(AiChatMsg.Create("tool",
+                    aiMsgs.Add(ChatMessage.Create("tool",
                         aiUiTool + "\n"
                         + AiAgent.UiResultOf(aiUiTool, rlog, rjson, tjson,
                             uiTo && !uiDone)));
@@ -4022,10 +3232,10 @@ partial class ZanIDE {
                         aiProfiles[aiProfActive].baseUrl,
                         aiProfiles[aiProfActive].key, aiRunModel);
                     if (uce != "") {
-                        aiMsgs.Add(AiChatMsg.Create("error", uce));
+                        aiMsgs.Add(ChatMessage.Create("error", uce));
                         aiBusy.Set(0);
                     }
-                    aiScroll.Set(0);
+                    this.AiChatToEnd();
                     app.RequestRedraw();
                 } else {
                     app.RequestAnimationFrame(150);
@@ -4108,12 +3318,12 @@ partial class ZanIDE {
                         }
                         if (live != "") {
                             if (aiStreamMsgIdx < 0) {
-                                aiMsgs.Add(AiChatMsg.Create("assistant", live));
+                                aiMsgs.Add(ChatMessage.Create("assistant", live));
                                 aiStreamMsgIdx = aiMsgs.Count - 1;
                             } else if (aiStreamMsgIdx < aiMsgs.Count) {
                                 aiMsgs[aiStreamMsgIdx].text = live;
                             }
-                            aiScroll.Set(0);
+                            this.AiChatToEnd();
                         }
                         aiWaitStart = 0;
                     } else {
@@ -4138,11 +3348,11 @@ partial class ZanIDE {
                     }
                     aiStreamMsgIdx = 0 - 1;
                     aiStreamLen = 0;
-                    aiMsgs.Add(AiChatMsg.Create("error", ZanIDE.T(
+                    aiMsgs.Add(ChatMessage.Create("error", ZanIDE.T(
                         "[error] AI request timed out - no response received.",
                         "[错误] AI 请求超时——未收到响应。")));
                     aiBusy.Set(0);
-                    aiScroll.Set(0);
+                    this.AiChatToEnd();
                 } else if (aiMarker) {
                     aiWaitStart = 0;
                     string doneTxt = AiAgent.Trim(aiDoneTxt);
@@ -4203,13 +3413,13 @@ partial class ZanIDE {
                                 Layer.Msg(ZanIDE.T("Xiao Zan request failed - retrying",
                                     "小赞请求失败——正在重试"), 3);
                             } else {
-                                aiMsgs.Add(AiChatMsg.Create("error",
+                                aiMsgs.Add(ChatMessage.Create("error",
                                     "[error] " + rle));
                                 aiBusy.Set(0);
                             }
                         } else {
                             aiRetry = 0;
-                            aiMsgs.Add(AiChatMsg.Create("error",
+                            aiMsgs.Add(ChatMessage.Create("error",
                                 "[error] " + emsg));
                             aiBusy.Set(0);
                         }
@@ -4230,7 +3440,7 @@ partial class ZanIDE {
                         // thinking worth keeping, so save the reasoning
                         // even when there is no visible text.
                         if (said != "" || rz != "") {
-                            AiChatMsg amsg = AiChatMsg.CreateWithReason(
+                            ChatMessage amsg = ChatMessage.CreateWithReason(
                                 "assistant", said, rz);
                             if (aiTeamMode) {
                                 // Record the beat on the message itself, so
@@ -4281,19 +3491,19 @@ partial class ZanIDE {
                                         && !AiAgent.AsksUser(said)));
                             if (cont) {
                                 aiAutoCont = aiAutoCont + 1;
-                                aiMsgs.Add(AiChatMsg.Create("user",
+                                aiMsgs.Add(ChatMessage.Create("user",
                                     AiAgent.ContinuePrompt(limitHit)));
                                 string cle = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
                                     aiRunCtxName, aiRunCtxCode, root,
                                     aiProfiles[aiProfActive].baseUrl,
                                     aiProfiles[aiProfActive].key, aiRunModel);
                                 if (cle != "") {
-                                    aiMsgs.Add(AiChatMsg.Create("error", cle));
+                                    aiMsgs.Add(ChatMessage.Create("error", cle));
                                     aiBusy.Set(0);
                                 }
                             } else {
                                 if (limitHit) {
-                                    aiMsgs.Add(AiChatMsg.Create("error", ZanIDE.T(
+                                    aiMsgs.Add(ChatMessage.Create("error", ZanIDE.T(
                                         "Tool limit reached for this question.",
                                         "本次提问的工具调用次数已达上限。")));
                                 }
@@ -4302,7 +3512,7 @@ partial class ZanIDE {
                             }
                         }
                     }
-                    aiScroll.Set(0);
+                    this.AiChatToEnd();
                 }
                 app.RequestRedraw();
             }
@@ -5045,12 +4255,38 @@ partial class ZanIDE {
         errorList = ErrorsPanel.List;
         gitPanel = new GitPanel();
         gitList = gitPanel.FileList();
+        structurePanel = new StructurePanel();
+        structurePanel.Wire(structSel, structFilter);
+        structTv = structurePanel.Tree();
+        stdlibPanel = new StdlibPanel();
+        stdlibPanel.Wire(exSel, exFilter);
+        stdlibTv = stdlibPanel.Tree();
+        toolsPanel = new ToolsPanel();
+        toolsPanel.Wire(rtToolSel, rtToolFilter);
+        toolsTv = toolsPanel.Tree();
+        examplesPanel = new ExamplesPanel();
+        examplesPanel.Wire(rtExSel, rtExFilter);
+        examplesTv = examplesPanel.Tree();
         // The designed `on<Event>` bindings of every panel go through the
         // form'''s handler registry, so hand the form over and register them.
         OutputPanel.__WireForm(form);
         GitPanel.__WireForm(form);
         form.On("outputClear", ZanIDE.OutputClearRequested);
         GitPanel.WireHandlers(form);
+            // 小赞面板：界面在 panels/AiPanel.zform，行为在 ZanIDE.AiPanel.zan。
+            aiPanel = new AiPanel();
+        AiPanel.__WireForm(form);
+        AiPanel.WireHandlers(form);
+            // 团队条是小赞面板设计里的子控件，它的事件走同一份注册表。
+            TeamBoard.__WireForm(form);
+        TeamBoard.WireHandlers(form);
+        aiPanel.SetModelSelect(aiModelSel);
+        // 调试界面（views/DebugPanel.zform / DebugToolbar.zform /
+            // DebugInlineVars.zform）：只在调试时可见，但控件树常驻。
+            // 这样滚动位置与监视表在两次单步之间不会丢。
+            dbgPanel = new DebugPanel();
+        dbgToolbar = new DebugToolbar();
+        dbgInline = new DebugInlineVars();
     }
 
     /// The console jumps back to the newest line (a fresh run/build starts).
@@ -5092,10 +4328,9 @@ partial class ZanIDE {
         rtCtxShow = new List<TreeNode>();
         // Chat transcript: real message entities (role + text + reason) and
         // the task-plan steps (text + done flag).
-        aiMsgs = new List<AiChatMsg>();
+        aiMsgs = new List<ChatMessage>();
         aiPlan = new List<AiPlanStep>();
         aiPlanCollapsed = false;
-        aiScroll = new SignalInt(0);
         aiThinkOpen = new SignalInt(0);
         // 1 while a completion request is in flight (curl runs detached and the
         // event loop polls for its done-marker file, so the UI never blocks).
@@ -5116,21 +4351,6 @@ partial class ZanIDE {
         aiWaitStart = 0;
         aiStreamMsgIdx = 0 - 1;
         aiStreamLen = 0;
-        aiApproveBtn = new Button { Text = ZanIDE.T("Approve", "批准"), Class = "primary small" };
-        aiRejectBtn = new Button { Text = ZanIDE.T("Reject", "拒绝"), Class = "small" };
-        aiAutoBtn = new Button { Text = ZanIDE.T("Auto: off", "自动:关"), Class = "small" };
-        // Multi-line: a question is often a paragraph or a pasted error, and
-        // files dropped on the chat are appended as a line of their own.
-        aiInput = new TextArea(ZanIDE.T(
-            "Ask Xiao Zan about your code...  (Enter sends, Shift+Enter new line)",
-            "向小赞提问，辅助开发...（Enter 发送，Shift+Enter 换行）"));
-        aiSendBtn = new Button { Text = ZanIDE.T("Send", "发送"), Class = "primary small" };
-        aiStopBtn = new Button { Text = ZanIDE.T("Stop", "停止"), Class = "error small" };
-        // "Insert code" applies the code block of the last AI answer at the
-        // editor cursor, making the assistant a real pair-programming tool.
-        aiApplyBtn = new Button { Text = ZanIDE.T("Insert code", "插入代码"), Icon = "code", Class = "small" };
-        // "Replace file" swaps the whole active file for the last AI code block.
-        aiReplaceBtn = new Button { Text = ZanIDE.T("Replace file", "替换整文件"), Class = "small" };
         aiPlanClearBtn = new Button { Text = ZanIDE.T("Clear plan", "清空计划"), Class = "small" };
         aiRunDots = new List<Badge>();
         Panel runDots = Panel.Row();
@@ -5148,14 +4368,10 @@ partial class ZanIDE {
         aiRunStrip.Add(runDots);
         aiRunStrip.Add(aiRunLabel);
         aiRunRule = new Divider();
-        aiSideRule = new Divider();
-        aiSideRule.Class = "vertical";
         aiCueLbl = new Label("");
         aiCueLbl.Class = "hint small";
         aiCueCaret = new Label("▾");
         aiCueCaret.Class = "hint small";
-        aiPendLbl = new Label("");
-        aiPendLbl.Class = "small";
         aiPlanList = new ListView<AiPlanStep>(PlanRow.Of);
         aiPlanList.Class = "plan flat";
         aiPlanBound = null;
@@ -5213,7 +4429,7 @@ partial class ZanIDE {
         string nxt = aiTeamSt.activeAgent;
         if (nxt == "" || nxt == from) { aiBusy.Set(0); return; }
         if (aiHandoffs >= AiTeam.MaxHandoffs()) {
-            aiMsgs.Add(AiChatMsg.Create("error", ZanIDE.T(
+            aiMsgs.Add(ChatMessage.Create("error", ZanIDE.T(
                 "Handoff limit reached; the team stopped so you can look.",
                 "交接次数已达上限，团队已暂停，请你介入查看。")));
             aiBusy.Set(0);
@@ -5223,7 +4439,7 @@ partial class ZanIDE {
         aiRunAgent = nxt;
         aiRetry = 0;
         aiAutoCont = 0;
-        AiChatMsg hmsg = AiChatMsg.Create("user",
+        ChatMessage hmsg = ChatMessage.Create("user",
             AiTeam.HandoffPrompt(from, nxt, env));
         hmsg.to = nxt;
         hmsg.kind = AiTeam.KindAssign();
@@ -5234,12 +4450,12 @@ partial class ZanIDE {
             aiProfiles[aiProfActive].baseUrl,
             aiProfiles[aiProfActive].key, aiRunModel);
         if (herr != "") {
-            aiMsgs.Add(AiChatMsg.Create("error", herr));
+            aiMsgs.Add(ChatMessage.Create("error", herr));
             aiBusy.Set(0);
         } else {
             aiBusy.Set(1);
         }
-        aiScroll.Set(0);
+        this.AiChatToEnd();
         app.RequestRedraw();
     }
 
@@ -5260,7 +4476,7 @@ partial class ZanIDE {
         // instead of another blocked attempt.
         if (aiTeamMode && aiRunAgent != ""
             && !AiTeam.AllowsTool(aiRunAgent, tool)) {
-            aiMsgs.Add(AiChatMsg.Create("tool",
+            aiMsgs.Add(ChatMessage.Create("tool",
                 AiAgent.Describe(call) + "\n"
                 + AiTeam.DenyTool(aiRunAgent, tool)));
             string gerr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
@@ -5268,7 +4484,7 @@ partial class ZanIDE {
                 aiProfiles[aiProfActive].baseUrl,
                 aiProfiles[aiProfActive].key, aiRunModel);
             if (gerr != "") {
-                aiMsgs.Add(AiChatMsg.Create("error", gerr));
+                aiMsgs.Add(ChatMessage.Create("error", gerr));
                 aiBusy.Set(0);
             }
             return;
@@ -5276,14 +4492,14 @@ partial class ZanIDE {
         if (tool == "plan") {
             aiPlan = new List<AiPlanStep>();
             int nsteps = AiAgent.ParsePlan(call, aiPlan);
-            aiMsgs.Add(AiChatMsg.Create("tool",
+            aiMsgs.Add(ChatMessage.Create("tool",
                 AiAgent.Describe(call) + "\nplan updated: "
                 + Convert.ToString(nsteps) + " step(s)."));
             string plerr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs, aiRunCtxName,
                 aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
                 aiProfiles[aiProfActive].key, aiRunModel);
             if (plerr != "") {
-                aiMsgs.Add(AiChatMsg.Create("error", plerr));
+                aiMsgs.Add(ChatMessage.Create("error", plerr));
                 aiBusy.Set(0);
             }
             return;
@@ -5295,13 +4511,13 @@ partial class ZanIDE {
             } else {
                 body = ZanIDE.AiRunErrorsResult();
             }
-            aiMsgs.Add(AiChatMsg.Create("tool",
+            aiMsgs.Add(ChatMessage.Create("tool",
                 AiAgent.Describe(call) + "\n" + body));
             string derr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs, aiRunCtxName,
                 aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
                 aiProfiles[aiProfActive].key, aiRunModel);
             if (derr != "") {
-                aiMsgs.Add(AiChatMsg.Create("error", derr));
+                aiMsgs.Add(ChatMessage.Create("error", derr));
                 aiBusy.Set(0);
             }
             return;
@@ -5311,7 +4527,7 @@ partial class ZanIDE {
             string apB = ZanIDE.PathOf(tabs, activeTab);
             string rpB = ZanIDE.RibbonRunTarget(apB, root);
             if (rpB == "") {
-                aiMsgs.Add(AiChatMsg.Create("tool",
+                aiMsgs.Add(ChatMessage.Create("tool",
                     AiAgent.Describe(call)
                     + "\nerror: no buildable/run target is selected in the IDE;"
                     + " open a program file (with a Main) first."));
@@ -5319,7 +4535,7 @@ partial class ZanIDE {
                     aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
                     aiProfiles[aiProfActive].key, aiRunModel);
                 if (e2 != "") {
-                    aiMsgs.Add(AiChatMsg.Create("error", e2));
+                    aiMsgs.Add(ChatMessage.Create("error", e2));
                     aiBusy.Set(0);
                 }
                 return;
@@ -5361,7 +4577,7 @@ partial class ZanIDE {
             return;
         }
         string result = AiAgent.Run(root, call);
-        aiMsgs.Add(AiChatMsg.Create("tool",
+        aiMsgs.Add(ChatMessage.Create("tool",
             AiAgent.Describe(call) + "\n" + result));
         // A write may touch a file open in a tab; the disk-change poll picks
         // that up and offers a reload, so the editor and disk stay in sync.
@@ -5369,7 +4585,7 @@ partial class ZanIDE {
             aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
             aiProfiles[aiProfActive].key, aiRunModel);
         if (terr != "") {
-            aiMsgs.Add(AiChatMsg.Create("error", terr));
+            aiMsgs.Add(ChatMessage.Create("error", terr));
             aiBusy.Set(0);
         }
     }
@@ -5614,7 +4830,6 @@ partial class ZanIDE {
         aiModelSel.Hint(ZanIDE.T("Provider / model", "服务商 / 模型"));
         aiModelOptions = new List<ModelOption>();
         aiModelSelSig = "";
-        aiCfgBtn = new Button { Text = ZanIDE.T("Config", "配置"), Class = "small" };
         // Chat sessions: switch / new / clear the transcript context. Inactive
         // sessions are kept serialized in `aiSessions` (ChatPack JSON).
         aiSessions = new List<AiSession>();
@@ -5635,10 +4850,6 @@ partial class ZanIDE {
         // conversation instead of starting from an empty chat.
         LoadAiSessions();
         aiLastSave = 0;
-        aiSessPrevBtn = new Button { Text = "<", Class = "small" };
-        aiSessNextBtn = new Button { Text = ">", Class = "small" };
-        aiSessNewBtn = new Button { Text = ZanIDE.T("New chat", "新会话"), Class = "small" };
-        aiSessClearBtn = new Button { Text = ZanIDE.T("Clear", "清空"), Class = "small" };
         aiSessNav = new SessionList(
             ZanIDE.T("Search chats...", "搜索会话..."),
             ZanIDE.T("New chat", "新会话"))

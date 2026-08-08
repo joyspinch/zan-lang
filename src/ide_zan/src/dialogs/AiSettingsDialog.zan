@@ -1,0 +1,148 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component.DataTable;
+
+/// 「小赞配置」对话框的内容：左侧是已保存的配置与官方预设，右侧是
+/// 选中配置的可编辑字段、团队模式的逐成员模型，以及逐模型的
+/// 上下文/最大输出表。
+///
+/// 布局在 `AiSettingsDialog.zform` 里声明；这里只做与数据有关的部分：
+/// 行模板、表格列、按语言的文案，以及按 AiTeam.Roles() 生成的成员行。
+partial class AiSettingsDialog {
+    int lang;
+    /// 当前启用的配置，行模板据此加「已启用」后缀。
+    AiProfile activeProfile;
+
+    void OnInit() {
+        lang = 0;
+        activeProfile = null;
+        AiSettingsDialog.Profiles.WithRow(this.ProfileRow);
+        AiSettingsDialog.Presets.WithRow(AiSettingsDialog.PresetRow);
+        AiSettingsDialog.Limits.BoolCol("Show", 60, r => r.visible)
+            .Editable((ModelLimitRow r, string v) => {
+                r.visible = DataTable.ParseBool(v);
+            });
+        AiSettingsDialog.Limits.Col("Model", 220, r => r.model);
+        AiSettingsDialog.Limits.NumCol("Context", 90, r => r.ctx)
+            .Editable((ModelLimitRow r, string v) => {
+                r.ctx = ZanIDE.ParseInt(v);
+            });
+        AiSettingsDialog.Limits.NumCol("Max out", 90, r => r.maxOut)
+            .Editable((ModelLimitRow r, string v) => {
+                r.maxOut = ZanIDE.ParseInt(v);
+            });
+    }
+
+    ListView<AiProfile> ProfileList() { return AiSettingsDialog.Profiles; }
+    ListView<AiPreset> PresetList() { return AiSettingsDialog.Presets; }
+    DataGrid<ModelLimitRow> LimitTable() { return AiSettingsDialog.Limits; }
+
+    /// 哪个配置正在生效由宿主给出（保存/启用后会变）。
+    void SetActiveProfile(AiProfile p) { activeProfile = p; }
+
+    Control ProfileRow(AiProfile p) {
+        string suffix = "";
+        if (p == activeProfile) {
+            suffix = AiSettingsDialog.Pick(lang, "  (enabled)", "（已启用）");
+        }
+        Label lbl = new Label(p.name + suffix);
+        lbl.Class = "secondary small";
+        return lbl;
+    }
+
+    static Control PresetRow(AiPreset p) {
+        Label lbl = new Label(p.name);
+        lbl.Class = "secondary small";
+        return lbl;
+    }
+
+    /// 按界面语言刷新静态文案；`fetchBusy` 只影响「获取模型」按钮。
+    void ApplyTexts(int uiLang, bool fetchBusy) {
+        lang = uiLang;
+        AiSettingsDialog.ConfigsCap.SetProp("text",
+            AiSettingsDialog.Pick(lang, "Configurations", "配置列表"));
+        AiSettingsDialog.NewProfile.SetProp("text",
+            AiSettingsDialog.Pick(lang, "New", "新增"));
+        AiSettingsDialog.DeleteProfile.SetProp("text",
+            AiSettingsDialog.Pick(lang, "Delete", "删除"));
+        AiSettingsDialog.PresetsCap.SetProp("text",
+            AiSettingsDialog.Pick(lang, "Presets", "预设"));
+        AiSettingsDialog.SignUp.SetProp("text",
+            AiSettingsDialog.Pick(lang, "Sign up", "注册"));
+        AiSettingsDialog.AddPreset.SetProp("text",
+            AiSettingsDialog.Pick(lang, "Add preset", "用预设新增"));
+
+        AiSettingsDialog.NameCap.SetProp("text",
+            AiSettingsDialog.Pick(lang, "Name", "名称"));
+        AiSettingsDialog.EndpointCap.SetProp("text",
+            AiSettingsDialog.Pick(lang, "Endpoint (OpenAI-compatible, /v1)",
+                "接口地址（兼容 OpenAI，/v1）"));
+        AiSettingsDialog.KeyCap.SetProp("text",
+            AiSettingsDialog.Pick(lang, "API Key / Token", "API 密钥 / Token"));
+        AiSettingsDialog.ModelCap.SetProp("text",
+            AiSettingsDialog.Pick(lang, "Default model", "默认模型"));
+        this.SetFetchBusy(fetchBusy);
+        AiSettingsDialog.Save.SetProp("text",
+            AiSettingsDialog.Pick(lang, "Save", "保存"));
+        AiSettingsDialog.SaveEnable.SetProp("text",
+            AiSettingsDialog.Pick(lang, "Save & enable", "保存并启用"));
+        AiSettingsDialog.TeamCap.SetProp("text",
+            AiSettingsDialog.Pick(lang,
+                "Team mode: one model per member (blank = the default above)",
+                "团队模式：每个成员单独的模型（留空 = 上面的默认模型）"));
+        AiSettingsDialog.LimitsCap.SetProp("text",
+            AiSettingsDialog.Pick(lang,
+                "Tick the models to offer in the chat picker; set each one's"
+                + " context / max-output (tokens, blank = default 200000)",
+                "勾选要在聊天模型列表里显示的模型；并设置各自的"
+                + "上下文 / 最大输出（tokens，留空 = 默认 200000）"));
+    }
+
+    void SetFetchBusy(bool busy) {
+        string label = AiSettingsDialog.Pick(lang, "Fetch models", "获取模型");
+        if (busy) {
+            label = AiSettingsDialog.Pick(lang, "Fetching...", "获取中...");
+        }
+        AiSettingsDialog.Fetch.SetProp("text", label);
+    }
+
+    /// 每个团队成员一行：名字 + 绑定到 `rolemodel_<id>` 的输入框，
+    /// 占位文本是当前配置的默认模型。
+    void FillRoles(string defaultModel) {
+        Panel host = AiSettingsDialog.RoleRows;
+        host.RemoveAll();
+        List<AiRole> roles = AiTeam.Roles();
+        for (int i = 0; i < roles.Count; i = i + 1) {
+            AiRole role = roles[i];
+            string rname = role.en;
+            if (lang == 1) { rname = role.zh; }
+
+            Panel row = new Panel("rolerow");
+            row.Pad(0);
+            row.gap = 8;
+            row.Dock(Dock.Top());
+            row.logH = 32;
+
+            Label name = new Label(rname);
+            name.Class = "small";
+            name.Dock(Dock.Left());
+            name.logW = 150;
+            row.Add(name);
+
+            Input model = new Input();
+            model.Dock(Dock.Fill());
+            model.SetProp("placeholder", defaultModel);
+            model.bindPath = "rolemodel_" + role.id;
+            row.Add(model);
+
+            host.Add(row);
+        }
+        host.logH = 32 * roles.Count + 4 * roles.Count;
+    }
+
+    static string Pick(int lang, string en, string zh) {
+        if (lang == 1) { return zh; }
+        return en;
+    }
+}

@@ -1,0 +1,613 @@
+using System;
+using System.IO;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+/// 小赞（AI 助手）面板的宿主侧：本帧数据、需要即时绘制的内容
+/// （会话列表、任务计划、发给谁提示行、用量卡）以及设计里那些
+/// `onClick` 背后的行为。
+///
+/// 聊天记录本身是标准库组件 `Gui.Component.ChatView`：换行缓存、折叠、
+/// 选区复制、滚轮与 busy 行都在组件里，这里只绑消息与状态。
+///
+/// 界面骨架在 `panels/AiPanel.zform` 里声明，控件的显示 / 隐藏与本帧
+/// 尺寸由 `AiPanel.Prepare(...)` 一次性交出去；这里不再手算任何按钮
+/// 或输入框的矩形。
+partial class ZanIDE {
+    /// 画一帧小赞面板。`rp` 是 dock 交给 "ai" 面板的矩形（隐藏时停在
+    /// 屏幕外，所以这里不判断可见性）。
+    void RenderAiPanel(App app, Rect rp) {
+        int rPad = app.Scale(6);
+        int act = activeTab.Get();
+
+        // ---- 模型下拉：一个下拉列出每个 profile 的模型，写成
+        // "<服务商> / <模型>"，所以两家提供同一个模型 id 也能分清；
+        // 选中一项同时切换启用的服务商和本会话的聊天模型。
+        string aiSelSig = "";
+        for (int pfi = 0; pfi < aiProfiles.Count; pfi = pfi + 1) {
+            AiProfile profile = aiProfiles[pfi];
+            aiSelSig = aiSelSig + profile.name + "~" + profile.model + "~"
+                + profile.models + "~" + profile.limits + ";;";
+        }
+        if (aiModelSelSig != aiSelSig) {
+            aiModelOptions = new List<ModelOption>();
+            for (int pi = 0; pi < aiProfiles.Count; pi = pi + 1) {
+                AiProfile profile = aiProfiles[pi];
+                string pname = profile.name;
+                List<string> pmods = new List<string>();
+                string defM = profile.model;
+                if (defM != "") { pmods.Add(defM); }
+                List<string> fetched = ZanIDE.SplitList(profile.models);
+                for (int fmi = 0; fmi < fetched.Count; fmi = fmi + 1) {
+                    bool dup = false;
+                    for (int dk = 0; dk < pmods.Count; dk = dk + 1) {
+                        if (pmods[dk] == fetched[fmi]) { dup = true; }
+                    }
+                    // 在 AI 设置里取消勾选的模型不进选择器：一家服务商
+                    // 列几十个模型，一个会话只用两个。
+                    bool hidden = ZanIDE.AiLimitInt(profile.limits,
+                        fetched[fmi], "off") == 1;
+                    if (!dup && !hidden) { pmods.Add(fetched[fmi]); }
+                }
+                for (int mj = 0; mj < pmods.Count; mj = mj + 1) {
+                    aiModelOptions.Add(ModelOption.Of(pi, pmods[mj],
+                        pname + " / " + pmods[mj]));
+                }
+            }
+            // 设置窗口可能在两帧之间换掉整份 profile 列表：先把启用
+            // 索引夹回有效范围，再做任何预选解引用。
+            if (aiProfActive < 0 || aiProfActive >= aiProfiles.Count) {
+                aiProfActive = 0;
+            }
+            string activeDefaultModel = "";
+            if (aiProfiles.Count > 0) {
+                AiProfile activeProfile = aiProfiles[aiProfActive];
+                if (activeProfile != null) {
+                    activeDefaultModel = activeProfile.model;
+                }
+            }
+            // 预选启用 profile 的默认模型。
+            int pre = 0 - 1;
+            for (int oi = 0; oi < aiModelOptions.Count; oi = oi + 1) {
+                ModelOption opt = aiModelOptions[oi];
+                if (opt.profile == aiProfActive
+                    && opt.model == activeDefaultModel) {
+                    pre = oi; break;
+                }
+            }
+            if (pre < 0 && aiModelOptions.Count > 0) {
+                for (int oj = 0; oj < aiModelOptions.Count; oj = oj + 1) {
+                    if (aiModelOptions[oj].profile == aiProfActive) {
+                        pre = oj; oj = aiModelOptions.Count;
+                    }
+                }
+            }
+            aiModelSel = new Dropdown<ModelOption>(o => o.label);
+            aiModelSel.Hint(ZanIDE.T("Provider / model", "服务商 / 模型"));
+            aiModelSel.Bind(aiModelOptions);
+            if (pre >= 0) { aiModelSel.SelectIndex(pre); }
+            aiModelSelSig = aiSelSig;
+            // 下拉是按签名重建的实例，所以每次重建都要重新挂进
+            // 设计里的宿主格子。
+            aiPanel.SetModelSelect(aiModelSel);
+        }
+
+        // 生效的服务商 + 模型：下拉的选择同时切换启用的 profile，所以
+        // 下面的 base URL / key 跟着选中的服务商走；没有选择时用启用
+        // profile 的默认模型。
+        ModelOption selMi = aiModelSel.Selected();
+        if (selMi != null && selMi.profile >= 0
+                && selMi.profile < aiProfiles.Count) {
+            aiProfActive = selMi.profile;
+        }
+        // aiProfActive 可能在删改配置后落到越界值；越界索引会返回 null，
+        // 随后 .model/.limits 解引用崩溃。先夹取到有效范围。
+        if (aiProfActive < 0 || aiProfActive >= aiProfiles.Count) {
+            aiProfActive = 0;
+        }
+        string chatModel = "";
+        string aiLimMap = "";
+        if (aiProfiles.Count > 0) {
+            AiProfile aiProf = aiProfiles[aiProfActive];
+            if (aiProf != null) {
+                chatModel = aiProf.model;
+                aiLimMap = aiProf.limits;
+                // 每个成员跑在哪个模型上，取自生效的服务商：在这里读
+                // 意味着换服务商（或保存设置）会把整个团队一起搬过去。
+                AiTeam.SetModels(aiProf.roles);
+            }
+        }
+        if (selMi != null) { chatModel = selMi.model; }
+        aiChatModel = chatModel;
+        // 把生效模型配置的上下文 / 输出上限交给 agent 层，于是上下文
+        // 压缩、用量环和请求的 max_tokens 都跟着这个模型；没配过的模型
+        // 用默认上下文长度。
+        int aiCtxTok = ZanIDE.AiLimitInt(aiLimMap, chatModel, "ctx");
+        if (aiCtxTok <= 0) { aiCtxTok = AiAgent.DefaultCtxTokens(); }
+        AiAgent.SetLimits(aiCtxTok,
+            ZanIDE.AiLimitInt(aiLimMap, chatModel, "out"));
+
+        // ---- 本帧的可变尺寸 ----
+        // 会话栏：太窄的停靠位直接收起它，好让聊天保持可用宽度。
+        int aiSideW = app.Scale(154);
+        if (aiSideW > rp.width - app.Scale(150)) { aiSideW = 0; }
+        int aiBodyW = rp.width - aiSideW;
+        if (aiSideW > 0) { aiBodyW = aiBodyW - 1; }
+        // 团队模式在输入框上方加一条细提示行，说明这条消息将发给谁。
+        int aiCueH = 0;
+        if (aiTeamMode) { aiCueH = Tag.Height(app, "") + app.Scale(4); }
+        // 团队条自己拥有「单人 / 团队」开关，所以模式永远只差一次点击；
+        // 条子自己量高度（声明的控件树），宿主只送状态。
+        aiPanel.TeamStrip().Sync(aiTeamMode, aiBusy.Get() == 1, aiTeamSt,
+            aiTasks, aiTeamOpen);
+        int aiPlanH = AiPlanHeight(app);
+        // 「插入代码」/「替换整文件」：把最后一段 AI 代码写到光标处或
+        // 整个文件；没有可用代码（或当前不是可写文件）就不占那一行。
+        string aiCode = ZanIDE.AiLastCode(aiMsgs);
+        bool aiCanApply = aiCode != "" && act >= 0 && act < tabs.Count
+            && !designerMode && tabs[act].path != ""
+            && tabs[act].path.Substring(0, 1) != "@";
+        int aiApplyH = 0;
+        if (aiCanApply) { aiApplyH = app.Scale(34); }
+        // 自动执行开关：窄面板下只留短标签，不挤输入框。
+        string aiAutoText = aiAutoExec ? ZanIDE.T("Auto: on", "自动:开")
+            : ZanIDE.T("Auto: off", "自动:关");
+        if (aiBodyW < app.Scale(240)) {
+            aiAutoText = aiAutoExec ? ZanIDE.T("A:on", "自:开")
+                : ZanIDE.T("A:off", "自:关");
+        }
+        aiPanel.Prepare(aiSideW, aiTeamMode, aiPlanH, aiCueH, aiApplyH,
+            aiBusy.Get(), aiAutoExec, aiAutoText);
+        if (aiBusy.Get() == 2) {
+            // 确认栏：说明被挂起的那个动作，让用户批准（执行）或拒绝
+            // （让模型换个做法）。等待期间什么都没跑。
+            aiPanel.SetPending(ZanIDE.T("Run ", "执行 ")
+                + AiAgent.Describe(aiPendingCall) + " ?");
+        }
+
+        // 画界面：按钮的点击在这一步派发到下面那些处理器。
+        aiPanel.Render(app, rp);
+
+        // ---- 会话栏：可搜索的会话列表；切换 / 新建 / 归档 / 删除都
+        // 从这里驱动，下面的面板只渲染当前会话。
+        if (aiSideW > 0) { this.AiRenderSessions(app, aiPanel.SidebarRect()); }
+
+        // ---- 上下文用量环（头部最右侧那一格）----
+        Rect aiRing = aiPanel.RingRect();
+        AiRenderContextRing(app, aiRing.x + aiRing.width / 2,
+            aiRing.y + aiRing.height / 2,
+            aiRing.height / 2 - app.Scale(3));
+
+        // ---- 团队条：开关在绘制时处理点击，所以模式在这里回读 ----
+        bool aiTeamWas = aiTeamMode;
+        aiTeamMode = aiPanel.TeamStrip().TeamOn();
+        if (aiTeamMode != aiTeamWas) {
+            // 换模式会改变每一行名字的归属，所以换行缓存要重建。
+            this.AiChatInvalidate();
+            if (!aiTeamMode) { aiRunAgent = ""; }
+            app.RequestRedraw();
+        }
+
+        // ---- 任务计划 ----
+        if (aiPlanH > 0) { AiRenderPlan(app, aiPanel.PlanRect()); }
+
+        // ---- 聊天记录：组件自己排版、滚动、折叠与复制 ----
+        aiPanel.Transcript().Bind(aiMsgs);
+        aiPanel.Transcript().SetBusy(aiBusy.Get() == 1);
+
+        // ---- 发给谁提示行（团队模式）----
+        if (aiTeamMode && aiCueH > 0) {
+            this.AiRenderSendCue(app, aiPanel.CueRect());
+        }
+
+        // 自动执行开关真正决定的是「谁有权跑操作类工具」，所以把它说
+        // 清楚，而不是在输入框前面留一个没头没尾的 "Auto"。
+        Rect aiAuto = aiPanel.AutoRect();
+        if (aiAuto.Contains(app.mouseX, app.mouseY)) {
+            Tooltip.RequestBox(app, aiAuto.x, aiAuto.y, aiAuto.width,
+                aiAuto.height, ZanIDE.T(
+                "Auto-execute action tools.\n"
+                + "OFF: the assistant asks you to approve every"
+                + " write_file / edit_file / build / run / ui_check /"
+                + " ui_tree / diff / run_errors.\n"
+                + "ON: it edits, builds and runs on its own, and keeps"
+                + " working through the task plan without waiting.",
+                "自动执行操作类工具。\n"
+                + "关：写文件 / 改文件 / 构建 / 运行 / UI 检查"
+                + "每次都要你点“批准”。\n"
+                + "开：助手自行修改、构建、运行，并按任务计划持续推进。"),
+                Tooltip.Top(), app.Scale(320));
+        }
+
+        // 回车发送，Shift+回车换行。输入框自己处理这个按键（它是真正的
+        // 多行编辑器），所以刚插入的换行会在发送时被 Trim 掉。
+        if (app.EventKind() == 6 && app.window.EventKeyCode() == 13
+            && !Modifiers.HasShift(app.window.EventMods())
+            && aiBusy.Get() == 0
+            && app.focus.IsFocused(aiPanel.PromptBox().Id())) {
+            ZanIDE.AiSendClicked();
+        }
+
+        // 从文件管理器拖到面板上的文件，按项目相对路径追加到提示里；
+        // 内容由助手用 read_file 工具自己读，不在这里粘贴进去。
+        if (app.EventKind() == 9) {
+            List<string> drops = app.window.TakeDroppedFiles();
+            int dqx = app.window.EventX();
+            int dqy = app.window.EventY();
+            if (drops.Count > 0 && rp.Contains(dqx, dqy)) {
+                string add = "";
+                for (int di = 0; di < drops.Count; di = di + 1) {
+                    add = add + " " + AiDropRef(drops[di], root);
+                }
+                TextArea box = aiPanel.PromptBox();
+                string cur = box.GetText();
+                if (cur != "" && cur.Substring(cur.Length - 1, 1) != " ") {
+                    cur = cur + " ";
+                }
+                box.SetText(cur + AiAgent.Trim(add) + " ");
+                app.RequestRedraw();
+            }
+        }
+
+        // 面板里最后一件事：用量环打开的那张上下文 / 用量卡，所以它盖
+        // 在聊天和输入框之上。
+        AiRenderUsageCard(app);
+    }
+
+    /// 会话列表（左栏）：标题取用户改过的名字，否则取第一条用户消息。
+    void AiRenderSessions(App app, Rect area) {
+        int rPad = app.Scale(6);
+        List<string> aiTitles = new List<string>();
+        List<int> aiArch = new List<int>();
+        for (int sti = 0; sti < aiSessions.Count; sti = sti + 1) {
+            string sTtl = aiSessions[sti].title;
+            if (sTtl == "") {
+                if (sti == aiSessCur) {
+                    sTtl = ChatArea.FirstUserOf(aiMsgs);
+                } else {
+                    sTtl = ChatArea.ChatTitle(aiSessions[sti].pack);
+                }
+            }
+            if (sTtl == "") {
+                sTtl = ZanIDE.T("New chat ", "新会话 ")
+                    + Convert.ToString(sti + 1);
+            }
+            aiTitles.Add(sTtl);
+            aiArch.Add(aiSessions[sti].archived);
+        }
+        SessionListAction sAct = aiSessNav.RenderEx(app,
+            area.x + rPad, area.y + rPad, area.width - rPad * 2,
+            area.height - rPad * 2, aiTitles, aiSessCur, aiArch);
+        if (aiBusy.Get() == 0 && sAct.archived >= 0
+            && sAct.archived < aiSessions.Count) {
+            // 归档保留会话（连上下文一起），只把它从列表里折叠起来；
+            // 再点一次就恢复。
+            int sArc = sAct.archived;
+            if (aiSessions[sArc].archived == 0) { aiSessions[sArc].archived = 1; }
+            else { aiSessions[sArc].archived = 0; }
+            SaveAiSessions();
+            Layer.Msg(aiSessions[sArc].archived == 1
+                ? ZanIDE.T("Chat archived", "会话已归档")
+                : ZanIDE.T("Chat restored", "会话已恢复"), 3);
+            app.RequestRedraw();
+        } else if (aiBusy.Get() == 0 && sAct.deleted >= 0) {
+            // 删除会丢掉那个会话的全部上下文：记录、思考、任务计划和
+            // 归档标记。最后一个会话只清空不移除，面板永远有地方可写。
+            aiSessions[aiSessCur].pack = AiPackCur();
+            int sDel = sAct.deleted;
+            bool sDelActive = sDel == aiSessCur;
+            int sNewCur = aiSessCur;
+            if (aiSessions.Count > 1) {
+                aiSessions.RemoveAt(sDel);
+                if (sDel < aiSessCur) { sNewCur = aiSessCur - 1; }
+                else if (sDel == aiSessCur) {
+                    if (sNewCur >= aiSessions.Count) {
+                        sNewCur = aiSessions.Count - 1;
+                    }
+                }
+            } else {
+                aiSessions[0].pack = "";
+                aiSessions[0].archived = 0;
+                sNewCur = 0;
+            }
+            aiMsgs = new List<ChatMessage>();
+            aiPlan = new List<AiPlanStep>();
+            AiRestoreSession(aiSessions[sNewCur].pack);
+            aiSessCur = sNewCur;
+            if (sDelActive) { AiResetContextState(); }
+            this.AiChatReset();
+            // 列表下的行整体上移：留着的重命名会落到接替那个下标的会话上。
+            aiSessNav.CancelRename();
+            SaveAiSessions();
+            Layer.Msg(ZanIDE.T("Chat and its context deleted",
+                "会话及其上下文已删除"), 3);
+            app.RequestRedraw();
+        } else if (sAct.renamed >= 0 && sAct.renamed < aiSessions.Count) {
+            // 名字清空就把这一行交回给推导出来的标题。
+            aiSessions[sAct.renamed].title = CodeEditor.TrimStr(sAct.title);
+            SaveAiSessions();
+            app.RequestRedraw();
+        } else if (aiBusy.Get() == 0 && sAct.created) {
+            aiSessions[aiSessCur].pack = AiPackCur();
+            aiSessions.Add(AiSession.Create("", 0));
+            aiMsgs = new List<ChatMessage>();
+            aiPlan = new List<AiPlanStep>();
+            aiSessCur = aiSessions.Count - 1;
+            AiResetContextState();
+            this.AiChatReset();
+            SaveAiSessions();
+            app.RequestRedraw();
+        } else if (aiBusy.Get() == 0 && sAct.selected >= 0
+            && sAct.selected != aiSessCur) {
+            aiSessions[aiSessCur].pack = AiPackCur();
+            aiMsgs = new List<ChatMessage>();
+            aiPlan = new List<AiPlanStep>();
+            AiRestoreSession(aiSessions[sAct.selected].pack);
+            aiSessCur = sAct.selected;
+            this.AiChatReset();
+            SaveAiSessions();
+            app.RequestRedraw();
+        }
+    }
+
+    /// 换行缓存失效（文案、字号、团队模式或主题变了）：下一帧整份重排。
+    void AiChatInvalidate() {
+        if (aiPanel != null) { aiPanel.Transcript().Invalidate(); }
+    }
+
+    /// 换掉整份记录（新建 / 切换 / 删除会话）：缓存、折叠、选区与滚动
+    /// 一起归零，否则新会话会带着上一份的展开项和高亮。
+    void AiChatReset() {
+        if (aiPanel != null) { aiPanel.Transcript().Reset(); }
+    }
+
+    /// 贴回最新一行（新消息进来时）。
+    void AiChatToEnd() {
+        if (aiPanel != null) { aiPanel.Transcript().Scroll().Set(0); }
+    }
+
+    /// 「将发给」提示行：收件人是状态（aiSendTo）而不是提示里的文字，
+    /// 所以输入框里只有用户写的内容，且恰好一个成员被寻址。空 = 让上下
+    /// 文决定，显示为它当前解析到的成员。
+    void AiRenderSendCue(App app, Rect area) {
+        string cueId = aiSendTo;
+        bool cueAuto = cueId == "";
+        if (cueAuto) {
+            cueId = AiTeam.RouteUserSt(aiPanel.PromptBox().GetText(), aiMsgs,
+                aiTeamSt);
+        }
+        string cueName = AiTeam.DisplayName(cueId);
+        string cueCls = AiTeam.RoleTagClass(cueId);
+        if (cueAuto) { cueName = cueName + ZanIDE.T(" (auto)", "（自动）"); }
+        string cueLab = ZanIDE.T("Sending to", "将发给");
+        int cueFs = app.theme.fontSizeSmall;
+        int cueX = area.x + app.Scale(6);
+        int cueTx = cueX;
+        aiCueLbl.Text = cueLab;
+        aiCueLbl.RenderAt(app, cueTx,
+            area.y + (area.height - Canvas.FontHeight(cueFs)) / 2);
+        cueTx = cueTx + Canvas.MeasureText(cueLab, cueFs) + app.Scale(6);
+        int cueChipW = 0;
+        if (cueName != ""
+            && cueTx + Tag.Width(app, cueName, cueCls)
+                <= area.x + area.width - app.Scale(6)) {
+            cueChipW = Tag.Width(app, cueName, cueCls);
+            Tag.Chip(app, cueTx,
+                area.y + (area.height - Tag.Height(app, cueCls)) / 2,
+                cueName, cueCls);
+        }
+        // 小箭头说明这一行可以打开，而整行（标签 + 徽标 + 箭头）都是
+        // 命中区：10px 的字形不该让人去瞄。
+        int cueCarX = cueTx + cueChipW + app.Scale(3);
+        aiCueCaret.RenderAt(app, cueCarX,
+            area.y + (area.height - Canvas.FontHeight(cueFs)) / 2);
+        int cueW = cueCarX + Canvas.MeasureText("▾", cueFs) - cueX;
+        int cueHid = app.focus.AllocId();
+        app.hitTester.Register(new HitRegion(cueHid, cueX, area.y, cueW,
+            area.height, 1));
+        bool cueOpened = false;
+        if (Ui.Clicked(app, cueHid)) {
+            aiCueOpen = !aiCueOpen;
+            cueOpened = aiCueOpen;
+            app.RequestRedraw();
+        }
+        // 菜单等下一帧：打开它的那次点击还是本帧的点击，菜单会把它读成
+        // 「点在外面」而立刻关掉自己。
+        if (aiCueOpen && !cueOpened) {
+            List<string> cueOpts = new List<string>();
+            List<string> cueIds = new List<string>();
+            cueOpts.Add(ZanIDE.T("Auto (by context)", "自动（按上下文）"));
+            cueIds.Add("");
+            List<AiRole> cueRs = AiTeam.Roles();
+            for (int cri = 0; cri < cueRs.Count; cri = cri + 1) {
+                cueOpts.Add(AiTeam.DisplayName(cueRs[cri].id));
+                cueIds.Add(cueRs[cri].id);
+            }
+            // 向上打开，压在这一行上：它下面是输入框和窗口边缘，交给
+            // 夹取的话列表会停在输入框上面。
+            int cuePick = ContextMenu.Render(app, cueX,
+                area.y - ContextMenu.Height(app, cueOpts), cueOpts);
+            if (cuePick >= 0 && cuePick < cueIds.Count) {
+                aiSendTo = cueIds[cuePick];
+                aiCueOpen = false;
+                app.RequestRedraw();
+            } else if (cuePick == 0 - 2) {
+                aiCueOpen = false;
+                app.RequestRedraw();
+            }
+        }
+    }
+
+    // ---- 设计里的处理器（panels/AiPanel.zform 的 onClick）----
+
+    /// 统一的 AI 配置窗口（和编辑器设置一样是独立子窗口）。
+    static void AiOpenSettings() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        if (ide.aiWindow == null || !ide.aiWindow.IsOpen()) {
+            ide.aiWindow = AiSettingsWindow.Open(ide.app, ZanIDE.uiLang);
+        }
+        ide.app.RequestRedraw();
+    }
+
+    /// 自动执行：关 = 每个操作类工具都先问；开 = 循环自己改、构建、运行。
+    static void AiAutoToggled() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        ide.aiAutoExec = !ide.aiAutoExec;
+        ide.app.RequestRedraw();
+    }
+
+    /// 发送：把提示框里的话作为一轮用户输入交给（团队模式下被寻址的）
+    /// 成员，并附上当前文件作为上下文。
+    static void AiSendClicked() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || ide.aiBusy.Get() != 0) { return; }
+        App app = ide.app;
+        TextArea box = ide.aiPanel.PromptBox();
+        string q = AiAgent.Trim(box.GetText());
+        box.SetText("");
+        // 团队里没有的 @名字 是打字错误，把消息投给默认收件人正是问题
+        // 悄悄发错人的原因。说清楚，并把文字留下来好改。
+        string badAt = "";
+        if (ide.aiTeamMode && q != "") { badAt = AiTeam.UnknownMention(q); }
+        if (badAt != "") {
+            box.SetText(q);
+            ide.aiMsgs.Add(ChatMessage.Create("error", ZanIDE.T(
+                "[error] Nobody on the team is called @" + badAt
+                    + ". Members: " + AiTeam.NameList() + ".",
+                "[错误] 团队里没有 @" + badAt + " 这个成员。可用成员："
+                    + AiTeam.NameList() + "。")));
+            ide.AiChatToEnd();
+            app.RequestRedraw();
+            return;
+        }
+        if (q == "") { return; }
+        // 团队模式：提示行里选中的成员就是地址；「自动」时被挂起的问题
+        // 由问它的人回答，于是「继续」接着停下的那一拍，否则由最后
+        // 说话的成员接手。
+        string tgt = "";
+        if (ide.aiTeamMode) {
+            if (ide.aiSendTo != "") { tgt = ide.aiSendTo; }
+            else { tgt = AiTeam.RouteUserSt(q, ide.aiMsgs, ide.aiTeamSt); }
+            ide.aiTeamSt.awaitingUser = false;
+            ide.aiTeamSt.askedBy = "";
+        }
+        ide.aiRunAgent = tgt;
+        ChatMessage umsg = ChatMessage.Create("user", q);
+        umsg.to = tgt;
+        ide.aiMsgs.Add(umsg);
+        // 这句话推进十二拍状态机：新需求开一次交付，停在「用户确认」
+        // 那一拍的老交付被它放行。
+        ide.AiRunUserTurn(q);
+        // 新问题会重启每一个自动循环，包括交接链的预算。
+        ide.aiRetry = 0;
+        ide.aiAutoCont = 0;
+        ide.aiHandoffs = 0;
+        // 把当前文件作为上下文附上，助手才能帮到屏幕上这段代码。
+        string aiCtxName = "";
+        string aiCtxCode = "";
+        int act = ide.activeTab.Get();
+        if (act >= 0 && act < ide.tabs.Count && ide.tabs[act].body != ""
+            && ide.tabs[act].body.Substring(0, 1) != "@") {
+            aiCtxName = Path.GetFileName(ide.tabs[act].path);
+            if (ZanIDE.IsFormPath(ide.tabs[act].path)) {
+                aiCtxCode = ide.tabs[act].body;
+            } else {
+                aiCtxCode = ide.editor.GetText();
+            }
+        }
+        ide.aiRunModel = ide.aiChatModel;
+        ide.aiRunCtxName = aiCtxName;
+        ide.aiRunCtxCode = aiCtxCode;
+        string aerr = ZanIDE.AiLaunchAs(ide.aiRunAgent, ide.aiMsgs,
+            aiCtxName, aiCtxCode, ide.root,
+            ide.aiProfiles[ide.aiProfActive].baseUrl,
+            ide.aiProfiles[ide.aiProfActive].key, ide.aiChatModel);
+        if (aerr != "") { ide.aiMsgs.Add(ChatMessage.Create("error", aerr)); }
+        else { ide.aiBusy.Set(1); }
+        ide.AiChatToEnd();
+        app.RequestRedraw();
+    }
+
+    /// 停止：丢掉正在流式输出的子进程并清空续跑预算，好中断一个跑偏
+    /// 的任务。
+    static void AiStopClicked() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || ide.aiBusy.Get() == 0) { return; }
+        ZanIDE.AiCancelRequest();
+        ide.AiRunStopped();
+        ide.aiBusy.Set(0);
+        ide.aiAutoCont = AiAgent.MaxContinues();
+        ide.aiRetry = AiAgent.MaxRetries();
+        ide.aiPendingCall = "";
+        ide.aiMsgs.Add(ChatMessage.Create("error",
+            ZanIDE.T("[stopped] Interrupted by you.",
+                "[已停止] 任务被你中断。")));
+        ide.AiChatInvalidate();
+        ide.app.RequestRedraw();
+    }
+
+    /// 批准挂起的动作：现在才真正执行它。
+    static void AiApproveClicked() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || ide.aiBusy.Get() != 2) { return; }
+        string capC = ide.aiPendingCall;
+        ide.aiPendingCall = "";
+        ide.aiBusy.Set(1);
+        ide.AiDispatchTool(capC);
+        ide.AiChatToEnd();
+        ide.app.RequestRedraw();
+    }
+
+    /// 拒绝挂起的动作：告诉模型换个做法，别重复这一个。
+    static void AiRejectClicked() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || ide.aiBusy.Get() != 2) { return; }
+        string capR = ide.aiPendingCall;
+        ide.aiPendingCall = "";
+        ide.aiMsgs.Add(ChatMessage.Create("tool",
+            AiAgent.Describe(capR) + "\n"
+            + "user declined this action; do not repeat it --"
+            + " propose an alternative or ask what to do instead."));
+        string rerr = ZanIDE.AiLaunchAs(ide.aiRunAgent, ide.aiMsgs,
+            ide.aiRunCtxName, ide.aiRunCtxCode, ide.root,
+            ide.aiProfiles[ide.aiProfActive].baseUrl,
+            ide.aiProfiles[ide.aiProfActive].key, ide.aiRunModel);
+        if (rerr != "") {
+            ide.aiMsgs.Add(ChatMessage.Create("error", rerr));
+            ide.aiBusy.Set(0);
+        } else { ide.aiBusy.Set(1); }
+        ide.AiChatToEnd();
+        ide.app.RequestRedraw();
+    }
+
+    /// 「插入代码」：把最后一段 AI 代码插到编辑器光标处。
+    static void AiApplyClicked() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        string code = ZanIDE.AiLastCode(ide.aiMsgs);
+        int act = ide.activeTab.Get();
+        if (code == "" || act < 0 || act >= ide.tabs.Count) { return; }
+        ide.editor.InsertBlock(code);
+        ide.tabs[act].body = ide.editor.GetText();
+        ide.log.Add(ZanIDE.T("> Inserted AI code into ",
+            "> 已将 AI 代码插入 ") + ide.tabs[act].path + ".");
+        ide.app.RequestRedraw();
+    }
+
+    /// 「替换整文件」：用最后一段 AI 代码替换当前文件的全部内容。
+    static void AiReplaceClicked() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        string code = ZanIDE.AiLastCode(ide.aiMsgs);
+        int act = ide.activeTab.Get();
+        if (code == "" || act < 0 || act >= ide.tabs.Count) { return; }
+        ide.editor.LoadText(code);
+        ide.tabs[act].body = code;
+        ide.log.Add(ZanIDE.T("> Replaced ", "> 已用 AI 代码替换 ")
+            + ide.tabs[act].path + ZanIDE.T(" with AI code.", "。"));
+        ide.app.RequestRedraw();
+    }
+}

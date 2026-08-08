@@ -597,6 +597,8 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMValueRef i_a = LLVMBuildAlloca(b, i64, "i");
     LLVMValueRef h_a = LLVMBuildAlloca(b, i64, "h");
     LLVMValueRef cap_a = LLVMBuildAlloca(b, i64, "ncap");
+    LLVMValueRef ix_a = LLVMBuildAlloca(b, i64ptr, "ixcur");
+    LLVMValueRef mask_a = LLVMBuildAlloca(b, i64, "mask");
     LLVMValueRef dnull = zan_icmp(b, LLVMIntEQ, draw, LLVMConstNull(i8ptr), "dnull");
     LLVMBuildCondBr(b, dnull, miss, chk);
     LLVMPositionBuilderAtEnd(b, miss);
@@ -619,9 +621,31 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMValueRef stale = zan_icmp(b, LLVMIntNE, icnt, cnt, "stale");
     LLVMValueRef need = zan_or(b, zan_or(b, noidx, nocap, "o1"), stale, "need");
     LLVMBasicBlockRef live = LLVMAppendBasicBlockInContext(c, fn, "live");
+    LLVMBasicBlockRef needc = LLVMAppendBasicBlockInContext(c, fn, "rb.need");
+    LLVMBasicBlockRef grow = LLVMAppendBasicBlockInContext(c, fn, "rb.grow");
     LLVMBuildCondBr(b, empty, miss, live);
     LLVMPositionBuilderAtEnd(b, live);
-    LLVMBuildCondBr(b, need, capc, probe);
+    /* Add only bumps the count, so the index reads as stale on the next lookup.
+     * Indexing just the appended keys keeps insertion amortized O(1): a full
+     * rebuild per insert made insert-then-lookup loops quadratic in time and in
+     * allocation (gigabytes for a dictionary with tens of thousands of keys). */
+    LLVMValueRef fits = zan_icmp(b, LLVMIntSGE, icap,
+        zan_mul(b, cnt, LLVMConstInt(i64, 4, 0), "want4"), "fits");
+    LLVMValueRef grew = zan_icmp(b, LLVMIntSLT, icnt, cnt, "grew");
+    LLVMValueRef kept = zan_icmp(b, LLVMIntSGT, icnt, LLVMConstInt(i64, 0, 0), "kept");
+    LLVMValueRef append = zan_and(b, zan_and(b, zan_and(b,
+        LLVMBuildNot(b, noidx, "haveidx"), fits, "a1"), grew, "a2"), kept, "append");
+    LLVMBuildCondBr(b, need, needc, probe);
+    LLVMPositionBuilderAtEnd(b, needc);
+    LLVMBuildCondBr(b, append, grow, capc);
+
+    /* incremental: index the entries appended since the last build */
+    LLVMPositionBuilderAtEnd(b, grow);
+    LLVMBuildStore(b, ix, ix_a);
+    LLVMBuildStore(b, zan_sub(b, icap, LLVMConstInt(i64, 1, 0), "gmask"), mask_a);
+    LLVMBuildStore(b, cnt, icntp);
+    LLVMBuildStore(b, icnt, i_a);
+    LLVMBuildBr(b, fcond);
 
     /* rebuild: capacity = next power of two >= 4 * count, at least 16 */
     LLVMPositionBuilderAtEnd(b, capc);
@@ -638,6 +662,13 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMBuildBr(b, caploop);
 
     LLVMPositionBuilderAtEnd(b, alloc);
+    /* The old table is dead once a bigger one is allocated: dropping it on the
+     * floor leaked one table per rebuild. */
+    LLVMTypeRef ixfree_ty = LLVMFunctionType(LLVMVoidTypeInContext(c),
+        (LLVMTypeRef[]){ i8ptr }, 1, 0);
+    LLVMValueRef ixfree = get_libc_fn(g, "free", ixfree_ty);
+    LLVMValueRef oldix8 = LLVMBuildBitCast(b, ix, i8ptr, "oldix8");
+    zan_call2(b, ixfree_ty, ixfree, &oldix8, 1, "");
     LLVMValueRef ncap = LLVMBuildLoad2(b, i64, cap_a, "ncap.v");
     LLVMValueRef nix8 = zan_call2(b, calloc_ty, calloc_fn,
         (LLVMValueRef[]){ ncap, LLVMConstInt(i64, 8, 0) }, 2, "nix8");
@@ -645,8 +676,8 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMBuildStore(b, nix, ixp);
     LLVMBuildStore(b, ncap, icapp);
     LLVMBuildStore(b, cnt, icntp);
-    LLVMValueRef rmask = zan_sub(b, ncap, LLVMConstInt(i64, 1, 0), "rmask");
-    LLVMValueRef rks = LLVMBuildLoad2(b, i8pp, kp, "rks");
+    LLVMBuildStore(b, nix, ix_a);
+    LLVMBuildStore(b, zan_sub(b, ncap, LLVMConstInt(i64, 1, 0), "rmask"), mask_a);
     LLVMValueRef nixnull = zan_icmp(b, LLVMIntEQ, nix8, LLVMConstNull(i8ptr), "nixnull");
     LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), i_a);
     LLVMBuildCondBr(b, nixnull, miss, fcond);
@@ -654,30 +685,35 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMValueRef fi = LLVMBuildLoad2(b, i64, i_a, "fi");
     LLVMBuildCondBr(b, zan_icmp(b, LLVMIntSLT, fi, cnt, "fmore"), fbody, probe);
     LLVMPositionBuilderAtEnd(b, fbody);
+    LLVMValueRef fmask = LLVMBuildLoad2(b, i64, mask_a, "fmask");
+    LLVMValueRef rks = LLVMBuildLoad2(b, i8pp, kp, "rks");
     LLVMValueRef fi2 = LLVMBuildLoad2(b, i64, i_a, "fi2");
     LLVMValueRef fkey = LLVMBuildLoad2(b, i8ptr, LLVMBuildGEP2(b, i8ptr, rks, &fi2, 1, "fksl"), "fkey");
     LLVMValueRef fh = zan_call2(b, hash_ty, hashf, (LLVMValueRef[]){ fkey, is_str }, 2, "fh");
-    LLVMBuildStore(b, zan_and(b, fh, rmask, "fh.m"), h_a);
+    LLVMBuildStore(b, zan_and(b, fh, fmask, "fh.m"), h_a);
     LLVMBuildBr(b, fpcond);
     LLVMPositionBuilderAtEnd(b, fpcond);
+    LLVMValueRef fix = LLVMBuildLoad2(b, i64ptr, ix_a, "fix");
     LLVMValueRef fh2 = LLVMBuildLoad2(b, i64, h_a, "fh2");
-    LLVMValueRef fslotp = LLVMBuildGEP2(b, i64, nix, &fh2, 1, "fslotp");
+    LLVMValueRef fslotp = LLVMBuildGEP2(b, i64, fix, &fh2, 1, "fslotp");
     LLVMValueRef fslot = LLVMBuildLoad2(b, i64, fslotp, "fslot");
     LLVMBuildCondBr(b, zan_icmp(b, LLVMIntEQ, fslot, LLVMConstInt(i64, 0, 0), "ffree"),
                     fput, fdup);
     LLVMPositionBuilderAtEnd(b, fput);
     LLVMValueRef fi3 = LLVMBuildLoad2(b, i64, i_a, "fi3");
     LLVMBuildStore(b, zan_add(b, fi3, LLVMConstInt(i64, 1, 0), "fi3p1"),
-                   LLVMBuildGEP2(b, i64, nix, &fh2, 1, "fslotp2"));
+                   LLVMBuildGEP2(b, i64, fix, &fh2, 1, "fslotp2"));
     LLVMBuildBr(b, fnext);
     LLVMPositionBuilderAtEnd(b, fdup);
+    LLVMValueRef dks = LLVMBuildLoad2(b, i8pp, kp, "dks");
     LLVMValueRef fold = zan_sub(b, fslot, LLVMConstInt(i64, 1, 0), "fold");
-    LLVMValueRef foldk = LLVMBuildLoad2(b, i8ptr, LLVMBuildGEP2(b, i8ptr, rks, &fold, 1, "foldkp"), "foldk");
+    LLVMValueRef foldk = LLVMBuildLoad2(b, i8ptr, LLVMBuildGEP2(b, i8ptr, dks, &fold, 1, "foldkp"), "foldk");
     LLVMValueRef fsame = zan_call2(b, keq_ty, keq, (LLVMValueRef[]){ foldk, fkey, is_str }, 3, "fsame");
     LLVMBuildCondBr(b, fsame, fnext, fpnext);
     LLVMPositionBuilderAtEnd(b, fpnext);
+    LLVMValueRef wmask = LLVMBuildLoad2(b, i64, mask_a, "wmask");
     LLVMBuildStore(b, zan_and(b,
-        zan_add(b, fh2, LLVMConstInt(i64, 1, 0), "fh.inc"), rmask, "fh.wrap"), h_a);
+        zan_add(b, fh2, LLVMConstInt(i64, 1, 0), "fh.inc"), wmask, "fh.wrap"), h_a);
     LLVMBuildBr(b, fpcond);
     LLVMPositionBuilderAtEnd(b, fnext);
     LLVMValueRef fi4 = LLVMBuildLoad2(b, i64, i_a, "fi4");

@@ -1,0 +1,405 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// 组件画廊里那几个「只有即时接口」的标准库组件的宿主：Alert（通知
+/// 条）、Tooltip、Table / DataTable / PivotTable、Menu、Ribbon、
+/// Scrollbar、Chart、Ellipsis、Popover 这些没有保留态控件形态，只有
+/// `X.Render(app, x, y, ...)`。让它们各自占一个声明出来的格子，在自己
+/// 的矩形里绘制，画廊本身就不必再手算任何坐标。
+class GalleryDemoHost : Control {
+    /// 要画哪一个（组件名，和文档主题标题一致）。
+    string demo;
+    /// 这一格希望占的逻辑高度（宽度由所在行/舞台给出）。
+    int logHeight;
+
+    GalleryDemoHost(string name, int h) {
+        this.InitControl("GalleryDemoHost", 1);
+        demo = name;
+        logHeight = h;
+    }
+
+    override string Kind() { return "GalleryDemoHost"; }
+
+    override void OnMeasure(App app) {
+        prefH = app.Scale(logHeight);
+    }
+
+    override void OnPaint(App app) {
+        Theme t = app.theme;
+        if (demo == "Alert") {
+            Layer.DrawNotify(app, bx, by, bw,
+                ZanIDE.T("Build succeeded — the executable is ready.",
+                         "构建成功 — 可执行文件已准备就绪。"), 3);
+        } else if (demo == "Tooltip") {
+            Tooltip.Render(app, bx, by,
+                ZanIDE.T("Helpful context", "辅助说明"));
+        } else if (demo == "Table") {
+            List<string> columns = new List<string>{ "Name", "Status" };
+            List<int> widths = new List<int>{ bw / 2, bw / 2 };
+            Table.RenderHeader(app, bx, by, columns, widths);
+            List<string> cells = new List<string>{ "Zan", "Ready" };
+            Table.RenderRow(app, bx, by + t.heightMedium, cells, widths, true);
+        } else if (demo == "DataTable") {
+            List<DataColumn> cols = new List<DataColumn>{
+                DataColumn.Text("Name", bw / 2),
+                DataColumn.Numeric("Score", bw / 3) };
+            List<DataRow> rows = new List<DataRow>();
+            DataRow row = new DataRow();
+            row.Push("Zan"); row.Push("98"); rows.Add(row);
+            DataTableState state = new DataTableState();
+            DataTable.Render(app, bx, by, bw, bh, cols, rows, state);
+        } else if (demo == "PivotTable") {
+            List<DataRow> rows = new List<DataRow>();
+            DataRow p0 = new DataRow();
+            p0.Push("North"); p0.Push("2026"); p0.Push("42"); rows.Add(p0);
+            DataRow p1 = new DataRow();
+            p1.Push("South"); p1.Push("2026"); p1.Push("35"); rows.Add(p1);
+            PivotConfig cfg = new PivotConfig(0, 1, 2, 0);
+            PivotTable.Render(app, bx, by, bw, bh, rows, cfg);
+        } else if (demo == "Menu") {
+            List<string> items = new List<string>{ "Overview", "Settings" };
+            SignalInt sel = DocsPreviewHost.DemoInt();
+            int id = Menu.RenderVertical(app, bx, by, bw, by + bh,
+                t.heightLarge, items, sel, 0);
+            Menu.HandleClick(app, id, items.Count, sel);
+        } else if (demo == "Ribbon") {
+            List<RibbonCmd> commands = new List<RibbonCmd>{
+                RibbonCmd.Group("play", "Run"), new RibbonCmd("build", "Build") };
+            Ribbon.Render(app, bx, by, bw, Ribbon.Height(app), commands);
+        } else if (demo == "Scrollbar") {
+            // 演示用的底面走组件自己的样式，皮肤给 `panel` 的表面
+            // （插画皮肤下是半透明的）同样适用。
+            StyleBox sb = Style.Of(app, "panel", "", Style.SNormal());
+            sb.Paint(app, bx, by, bw, bh);
+            Scrollbar.RenderVertical(app, bx + bw - app.Scale(10), by, bh,
+                bh * 4, bh);
+        } else if (demo == "Chart") {
+            List<string> labels = new List<string>{ "Q1", "Q2", "Q3", "Q4" };
+            List<int> values = new List<int>{ 12, 28, 20, 35 };
+            ChartOption opt = ChartOption.With(ChartType.Line, "", labels);
+            opt.Add("Series", values);
+            ChartView.Of(opt).Render(app, bx, by, bw, bh);
+        } else if (demo == "Ellipsis") {
+            Ellipsis.Render(app, bx, by, bw, ZanIDE.T(
+                "A very long component example that must fit the available width",
+                "一个必须适应可用宽度的超长组件示例"));
+        }
+    }
+}
+
+/// 组件画廊：文档里每个 GUI 组件主题下方那张「实时状态」卡片。卡片、
+/// 两行紧凑演示和下方的舞台都声明在 `ComponentGallery.zform` 里，这里
+/// 只按当前主题把真正的标准库控件挂进那三个格子——所以整段画廊没有
+/// 一个手算的矩形，尺寸由控件自己测量、由布局分配。
+partial class ComponentGallery {
+    /// 可交互演示的保留实例与它们共享的模型：跨帧存活，用户输入的
+    /// 文字、拖过的滑块、勾上的复选框才不会每帧被重建掉。
+    static DocsDemoModel demoModel;
+    static Checkbox demoCheck;
+    static Switch demoSwitch;
+    static Radio demoRadioA;
+    static Radio demoRadioB;
+    static Slider demoSlider;
+    static SelectBox demoSelect;
+    static Rate demoRate;
+    static Tabs demoTabs;
+    static ListView<string> demoList;
+    static Dropdown<string> demoDropdown;
+    static TreeView demoTree;
+    /// 滑块旁边那个跟着数值走的标签：内容每帧刷新，所以单独持有。
+    static Label valueLbl;
+
+    /// 已经搭好的是哪一个组件（空串表示还没搭过），只有换主题时才重建
+    /// 控件树。
+    string shown;
+    bool built;
+
+    void OnInit() {
+        ComponentGallery.Frame.SetProp("title",
+            ZanIDE.T("LIVE STATES", "实时状态"));
+        shown = "";
+        built = false;
+    }
+
+    /// 声明一个控件希望占的逻辑尺寸（0 表示由控件自己测量）。逻辑像素
+    /// 在测量时按当前缩放解析，所以 150% 下演示不会挤在一起。
+    static Control Sized(Control c, int w, int h) {
+        if (w > 0) { c.logW = w; }
+        if (h > 0) { c.logH = h; }
+        return c;
+    }
+
+    /// 懒建可交互演示，并把每个控件的 `.data` 绑到共享模型的字段上，
+    /// 于是一个字段双向驱动一个演示控件。
+    static void EnsureDemos() {
+        if (ComponentGallery.demoModel != null) { return; }
+        DocsDemoModel m = new DocsDemoModel();
+        m.toggle = true;
+        m.choice = 0;
+        m.level = 50;
+        m.pick = 0;
+        m.stars = 3;
+        ComponentGallery.demoModel = m;
+
+        Checkbox cb = new Checkbox(ZanIDE.T("Checked", "选中"));
+        cb.data = m.toggle;
+        ComponentGallery.demoCheck = cb;
+
+        Switch sw = new Switch();
+        sw.data = m.toggle;
+        ComponentGallery.demoSwitch = sw;
+
+        SignalInt group = new SignalInt(0);
+        Radio ra = new Radio(group, 0, "Option A");
+        ra.data = m.choice;
+        ComponentGallery.demoRadioA = ra;
+        Radio rb = new Radio(group, 1, "Option B");
+        rb.data = m.choice;
+        ComponentGallery.demoRadioB = rb;
+
+        Slider sl = new Slider(0, 100, new SignalInt(50));
+        sl.data = m.level;
+        ComponentGallery.demoSlider = sl;
+
+        List<string> opts = new List<string>{
+            ZanIDE.T("Default", "默认"), ZanIDE.T("Success", "成功"),
+            ZanIDE.T("Warning", "警告") };
+        SelectBox se = SelectBox.FromOptions(opts,
+            ZanIDE.T("Choose a state", "选择状态"));
+        se.data = m.pick;
+        ComponentGallery.demoSelect = se;
+
+        Rate rt = new Rate(new SignalInt(3), 5);
+        rt.data = m.stars;
+        ComponentGallery.demoRate = rt;
+
+        Tabs tb = new Tabs(0);
+        tb.Add("Overview", false);
+        tb.Add("API", false);
+        tb.Add("Examples", false);
+        ComponentGallery.demoTabs = tb;
+
+        List<string> items = new List<string>{ "Alpha", "Beta", "Gamma" };
+        ListView<string> lv =
+            new ListView<string>(new ListColumn<string>("", s => s));
+        lv.Class = "flat";
+        lv.Bind(items);
+        ComponentGallery.demoList = lv;
+
+        List<string> actions = new List<string>{
+            ZanIDE.T("Edit", "编辑"), ZanIDE.T("Duplicate", "复制"),
+            ZanIDE.T("Delete", "删除") };
+        Dropdown<string> dd = new Dropdown<string>(s => s);
+        dd.Hint(ZanIDE.T("Actions", "操作"));
+        dd.Bind(actions);
+        ComponentGallery.demoDropdown = dd;
+
+        List<TreeNode> nodes = new List<TreeNode>{
+            TreeNode.Dir("src", 0, true),
+            TreeNode.FileIcon("main.zan", 1, "file") };
+        TreeView tv = new TreeView();
+        tv.BindSel(DocsPreviewHost.DemoInt()).Bind(nodes);
+        ComponentGallery.demoTree = tv;
+
+        ComponentGallery.valueLbl = new Label("");
+        ComponentGallery.valueLbl.Class = "secondary";
+    }
+
+    /// 按主题搭出这一格的控件树。只有主题变了才重建：保留实例带着
+    /// 用户的编辑状态，重建会把它们连状态一起丢掉。
+    void Show(string name, Input demoInput) {
+        if (built && name == shown) { return; }
+        built = true;
+        shown = name;
+        ComponentGallery.EnsureDemos();
+        Panel row1 = ComponentGallery.Row1;
+        Panel row2 = ComponentGallery.Row2;
+        Panel stage = ComponentGallery.Stage;
+        row1.RemoveAll();
+        row2.RemoveAll();
+        stage.RemoveAll();
+        if (name == "Button") {
+            row1.Add(ComponentGallery.Sized(
+                new Button { Text = "Default" }, 104, 0));
+            row1.Add(ComponentGallery.Sized(
+                new Button { Text = "Primary", Class = "primary" }, 104, 0));
+            row1.Add(ComponentGallery.Sized(
+                new Button { Text = "Disabled", Disabled = true }, 104, 0));
+        } else if (name == "Label") {
+            Label title = new Label("Title");
+            title.Class = "title";
+            row1.Add(title);
+            row2.Add(new Label("Default label"));
+            Label second = new Label("Secondary");
+            second.Class = "secondary";
+            row2.Add(second);
+        } else if (name == ZanIDE.T("Text Input", "文本输入框")) {
+            row1.Add(ComponentGallery.Sized(demoInput, 260, 0));
+        } else if (name == "Checkbox") {
+            row1.Add(ComponentGallery.demoCheck);
+        } else if (name == ZanIDE.T("Radio Group", "单选组")) {
+            row1.Add(ComponentGallery.Sized(ComponentGallery.demoRadioA, 130, 0));
+            row1.Add(ComponentGallery.Sized(ComponentGallery.demoRadioB, 130, 0));
+        } else if (name == "Switch") {
+            row1.Add(ComponentGallery.demoSwitch);
+            row1.Add(new Label(ZanIDE.T("Interactive state", "可交互状态")));
+        } else if (name == "Slider") {
+            row1.Add(ComponentGallery.Sized(ComponentGallery.demoSlider, 300, 0));
+            row1.Add(ComponentGallery.valueLbl);
+        } else if (name == ZanIDE.T("Select (Dropdown)", "下拉选择")) {
+            row1.Add(ComponentGallery.Sized(ComponentGallery.demoSelect, 220, 0));
+        } else if (name == "Tabs") {
+            row1.Add(ComponentGallery.Sized(ComponentGallery.demoTabs, 420, 0));
+        } else if (name == "Card") {
+            Card demo = new Card("Card");
+            Label inner = new Label(
+                ZanIDE.T("Card content and actions", "卡片内容与操作"));
+            inner.dock = 1;
+            demo.Add(inner);
+            stage.Add(ComponentGallery.Sized(demo, 360, 0));
+        } else if (name == "Progress") {
+            row1.Add(ComponentGallery.Sized(new Progress(68, 0), 320, 0));
+            row2.Add(ComponentGallery.Sized(new Progress(42, 1), 320, 0));
+        } else if (name == "Tag") {
+            row1.Add(new Tag { Text = "Default" });
+            row1.Add(new Tag { Text = "Success", Class = "success" });
+            row1.Add(new Tag { Text = "Warning", Class = "warning" });
+            row1.Add(new Tag { Text = "Error", Class = "error" });
+        } else if (name == "Alert") {
+            stage.Add(new GalleryDemoHost("Alert", 44));
+        } else if (name == "Tooltip") {
+            row1.Add(ComponentGallery.Sized(
+                new Button { Text = ZanIDE.T("Hover target", "悬停目标") },
+                130, 0));
+            row1.Add(ComponentGallery.Sized(
+                new GalleryDemoHost("Tooltip", 28), 200, 0));
+        } else if (name == "Avatar") {
+            row1.Add(new Avatar("Z", 42, ""));
+            row1.Add(new Avatar("", 42, "user"));
+        } else if (name == "Badge") {
+            // 计数为 0 的徽标就是圆点形态（Badge.Label() 为空）。
+            row1.Add(new Badge());
+            row1.Add(new Badge(12));
+        } else if (name == "Divider") {
+            stage.Add(new Divider(ZanIDE.T("Section", "区段")));
+        } else if (name == "Empty") {
+            stage.Add(new Empty(ZanIDE.T("No data", "暂无数据")));
+        } else if (name == "ListView") {
+            stage.Add(ComponentGallery.Sized(ComponentGallery.demoList, 260, 96));
+        } else if (name == "Loading") {
+            row1.Add(new Spin(36));
+        } else if (name == "Skeleton") {
+            Skeleton dot = new Skeleton(40, 40);
+            dot.Class = "circle";
+            row1.Add(dot);
+            row1.Add(new Skeleton(260, 14));
+            row2.Add(new Skeleton(180, 14));
+        } else if (name == "Statistic") {
+            row1.Add(new Statistic(
+                ZanIDE.T("Active users", "活跃用户"), "12,480"));
+        } else if (name == "Typography") {
+            stage.Add(Typography.H("Heading", 2));
+            stage.Add(Typography.P(ZanIDE.T(
+                "Readable paragraph text for application content.",
+                "用于应用内容的易读段落文本。")));
+        } else if (name == "Breadcrumb") {
+            List<string> crumbs = new List<string>{
+                "Home", "Components", "Breadcrumb" };
+            row1.Add(Breadcrumb.Of(crumbs));
+        } else if (name == "Carousel") {
+            List<string> slides = new List<string>{
+                "First state", "Second state" };
+            stage.Add(Carousel.Of(slides, DocsPreviewHost.DemoInt()));
+        } else if (name == "Chart") {
+            stage.Add(new GalleryDemoHost("Chart", 104));
+        } else if (name == "Collapse") {
+            List<CollapsePanel> panels = new List<CollapsePanel>{
+                new CollapsePanel("General", "General settings"),
+                new CollapsePanel("Advanced", "Advanced settings") };
+            stage.Add(Collapse.Of(panels, DocsPreviewHost.DemoInt()));
+        } else if (name == "DataTable") {
+            stage.Add(new GalleryDemoHost("DataTable", 100));
+        } else if (name == "Dropdown") {
+            row1.Add(ComponentGallery.Sized(
+                ComponentGallery.demoDropdown, 150, 0));
+        } else if (name == "Ellipsis") {
+            row1.Add(ComponentGallery.Sized(
+                new GalleryDemoHost("Ellipsis", 22), 280, 0));
+        } else if (name == "FloatButton") {
+            row1.Add(new FloatButton("plus") { Size = 48, Class = "primary" });
+            row1.Add(new FloatButton("edit") { Size = 48 });
+        } else if (name == "Menu") {
+            stage.Add(ComponentGallery.Sized(
+                new GalleryDemoHost("Menu", 78), 220, 0));
+        } else if (name == "PageHeader") {
+            stage.Add(new PageHeader(
+                ZanIDE.T("Component page", "组件页面"),
+                ZanIDE.T("Title, subtitle and back action",
+                         "标题、副标题与返回操作")));
+        } else if (name == "Pagination") {
+            row1.Add(Pagination.Of(12, DocsPreviewHost.DemoInt()));
+        } else if (name == "Panel") {
+            Panel box = new Panel("panel")
+                .Titled(ZanIDE.T("Panel title", "面板标题"));
+            Label inner = new Label(ZanIDE.T("Panel content", "面板内容"));
+            inner.dock = 1;
+            box.Add(inner);
+            stage.Add(box);
+        } else if (name == "PivotTable") {
+            stage.Add(new GalleryDemoHost("PivotTable", 100));
+        } else if (name == "Popover") {
+            stage.Add(new Popover(
+                ZanIDE.T("Details", "详情"),
+                ZanIDE.T("Popover", "气泡卡片"),
+                ZanIDE.T("Anchored explanatory content.", "锚定的说明内容。"),
+                280));
+        } else if (name == "Rate") {
+            row1.Add(ComponentGallery.demoRate);
+        } else if (name == "Result") {
+            Result res = new Result(
+                ZanIDE.T("Operation complete", "操作完成"),
+                ZanIDE.T("The requested action succeeded.", "请求的操作已成功。"));
+            res.Class = Result.StatusClass(1);
+            stage.Add(res);
+        } else if (name == "Ribbon") {
+            stage.Add(new GalleryDemoHost("Ribbon", 0));
+        } else if (name == "Scrollbar") {
+            stage.Add(ComponentGallery.Sized(
+                new GalleryDemoHost("Scrollbar", 90), 280, 0));
+        } else if (name == "Spin") {
+            row1.Add(new Spin(36));
+            Spin load = new Spin(36);
+            load.Tip = ZanIDE.T("Loading data...", "正在加载数据...");
+            row1.Add(ComponentGallery.Sized(load, 240, 0));
+        } else if (name == "Steps") {
+            stage.Add(Steps.Of(new List<string>{ "Details", "Review", "Done" },
+                DocsPreviewHost.DemoInt()));
+        } else if (name == "Table") {
+            stage.Add(new GalleryDemoHost("Table", 60));
+        } else if (name == "Timeline") {
+            List<TimelineItem> items = new List<TimelineItem>{
+                new TimelineItem("", "Created", "Project initialized"),
+                new TimelineItem("", "Published", "Executable generated") };
+            stage.Add(Timeline.Of(items));
+        } else if (name == "TreeView") {
+            stage.Add(ComponentGallery.Sized(ComponentGallery.demoTree, 280, 96));
+        } else {
+            // 交互式 / 浮层组件：文档给的是 API 示例，画廊只说明这一点。
+            row1.Add(new Avatar("", 30, "code"));
+            row1.Add(new Label(ZanIDE.T("Interactive / overlay example",
+                                        "交互式 / 浮层示例")));
+            row2.Add(new Label(ZanIDE.T("Copy the current API example below.",
+                                        "复制下方当前 API 示例。")));
+        }
+    }
+
+    /// 每帧刷新那些跟着模型走的文字（滑块数值），控件树本身不动。
+    void Sync() {
+        if (ComponentGallery.demoModel == null) { return; }
+        if (shown == "Slider") {
+            ComponentGallery.valueLbl.Text =
+                Convert.ToString(ComponentGallery.demoModel.level);
+        }
+    }
+}

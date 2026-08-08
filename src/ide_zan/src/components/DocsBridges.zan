@@ -3,21 +3,23 @@ using Gui;
 using Gui.Widget;
 
 /// Bridge components for the Help / documentation page: the pane is declared
-/// as a UiNode document (auto layout), and each retained / immediate-mode
-/// standard widget (Tabs, Input, ListView, Tag, CodeBlock) is hosted by one of
-/// these registered components, so the document tree stays declarative while
-/// the widgets keep their state across frames.
+/// as a control document (`pages/DocsView.zform`, auto layout) and each of
+/// these registered components owns one standard widget -- Tabs, Input,
+/// ListView, Tag, CodeBlock -- as a real child of the control tree. The host
+/// only pushes this frame's data in (through the `Show`/`Bind` entry points)
+/// and the widget paints, measures and keeps its own state; none of these
+/// components draws anything itself.
 
 /// Hosts the section rail: a vertical Tabs strip listing the doc sections, so
 /// the groups stay in place while the topic list beside them scrolls. The
-/// section selection signal is pushed in by the docs page each frame, and tab
-/// changes flow back out through it.
+/// section selection signal lives here, and a tab change writes straight back
+/// into it (the strip's TabChanged runs in the frame of the click).
 /// @component Docs
 class DocsSectionTabs : Control {
-    static List<string> labels;
     static SignalInt sel;
     static Tabs tabs;
     static List<string> lastLabels;
+    static int rows;
 
     /// The section selection signal, created once by the component (never by
     /// the shell), so the docs page cannot touch a half-initialized signal.
@@ -28,42 +30,56 @@ class DocsSectionTabs : Control {
         return DocsSectionTabs.sel;
     }
 
+    /// The rail's tab strip, created once and reused across frames (the strip
+    /// keeps the scroll of a long section list).
+    static Tabs Strip() {
+        if (DocsSectionTabs.tabs == null) {
+            Tabs t = Tabs.CreateVertical(Tabs.Line());
+            t.dock = 5;
+            t.TabChanged.Add(DocsSectionTabs.Changed);
+            DocsSectionTabs.tabs = t;
+        }
+        return DocsSectionTabs.tabs;
+    }
+
+    /// The user picked another section: move the signal the page reads. Runs
+    /// during the strip's own paint, so the page sees the new section in the
+    /// same frame the tab was clicked.
+    static void Changed() {
+        int c = DocsSectionTabs.tabs.TakeChanged();
+        if (c >= 0) { DocsSectionTabs.Sel().Set(c); }
+    }
+
+    /// This frame's section names. The strip is rebuilt only when the names
+    /// actually change (a language switch), so tab state survives a frame.
+    static void Sections(List<string> labels) {
+        Tabs t = DocsSectionTabs.Strip();
+        DocsSectionTabs.rows = labels.Count;
+        if (ZanIDE.StringListsEqual(DocsSectionTabs.lastLabels, labels)) { return; }
+        t.Clear();
+        for (int i = 0; i < labels.Count; i = i + 1) { t.Add(labels[i], false); }
+        DocsSectionTabs.lastLabels = labels;
+    }
+
     DocsSectionTabs() {
         this.InitControl("DocsSectionTabs", 1);
+        this.Add(DocsSectionTabs.Strip());
     }
 
     override string Kind() { return "DocsSectionTabs"; }
 
     override void OnMeasure(App app) {
-        int rows = 1;
-        if (DocsSectionTabs.labels != null) { rows = DocsSectionTabs.labels.Count; }
-        prefH = rows * app.theme.heightMedium;
+        int n = DocsSectionTabs.rows;
+        if (n < 1) { n = 1; }
+        prefH = n * app.theme.heightMedium;
         prefW = app.Scale(104);
-    }
-
-    override void OnPaint(App app) {
-        SignalInt sig = DocsSectionTabs.Sel();
-        if (DocsSectionTabs.labels == null) { return; }
-        if (DocsSectionTabs.tabs == null
-                || !ZanIDE.StringListsEqual(DocsSectionTabs.lastLabels,
-                                            DocsSectionTabs.labels)) {
-            Tabs nt = Tabs.CreateVertical(Tabs.Line());
-            for (int i = 0; i < DocsSectionTabs.labels.Count; i = i + 1) {
-                nt.Add(DocsSectionTabs.labels[i], false);
-            }
-            DocsSectionTabs.tabs = nt;
-            DocsSectionTabs.lastLabels = DocsSectionTabs.labels;
-        }
-        DocsSectionTabs.tabs.Select(sig.Get());
-        DocsSectionTabs.tabs.TakeChanged();
-        DocsSectionTabs.tabs.RenderVertical(app, bx, by, bw, bh);
-        int chg = DocsSectionTabs.tabs.TakeChanged();
-        if (chg >= 0) { sig.Set(chg); }
+        // The strip follows the section the page settled on this frame.
+        DocsSectionTabs.Strip().Select(DocsSectionTabs.Sel().Get());
     }
 }
 
 /// Hosts the sidebar search box (a retained Input, so typed text survives the
-/// per-frame rebuild of the document).
+/// per-frame rebuild of the page's data).
 /// @component Docs
 class DocsSearchHost : Control {
     static Input search;
@@ -72,14 +88,17 @@ class DocsSearchHost : Control {
     /// language-appropriate placeholder.
     static Input Search() {
         if (DocsSearchHost.search == null) {
-            DocsSearchHost.search = new Input(
+            Input box = new Input(
                 ZanIDE.T("Search syntax & components...", "搜索语法与组件..."));
+            box.dock = 5;
+            DocsSearchHost.search = box;
         }
         return DocsSearchHost.search;
     }
 
     DocsSearchHost() {
         this.InitControl("DocsSearchHost", 1);
+        this.Add(DocsSearchHost.Search());
     }
 
     override string Kind() { return "DocsSearchHost"; }
@@ -87,21 +106,15 @@ class DocsSearchHost : Control {
     override void OnMeasure(App app) {
         prefH = app.theme.heightMedium;
     }
-
-    override void OnPaint(App app) {
-        Input box = DocsSearchHost.Search();
-        box.Render(app, bx, by, bw, bh);
-    }
 }
 
 /// Hosts the sidebar topic list: a retained ListView bound to the filtered
-/// topics each frame; picking a row moves the shell's selection signal.
+/// topics each frame; picking a row moves the page's selection signal.
 /// @component Docs
 class DocsTopicList : Control {
-    static List<DocTopic> topics;
     static SignalInt selSig;
     static SignalInt codeScroll;
-    static int selRow;
+    static ListView<DocTopic> list;
 
     /// The selection signal, created once by the component (never by the
     /// shell); TopicPicked moves it when a topic row is picked.
@@ -121,8 +134,34 @@ class DocsTopicList : Control {
         return DocsTopicList.codeScroll;
     }
 
+    /// The topic list itself, created once: rows are DocTopicRow controls, so
+    /// headings and topics differ only by the classes they carry.
+    static ListView<DocTopic> List() {
+        if (DocsTopicList.list == null) {
+            ListView<DocTopic> lv = new ListView<DocTopic>(DocTopicRow.Of);
+            lv.Class = "flat";
+            lv.dock = 5;
+            lv.EmptyText(ZanIDE.T("No topics match your search.",
+                                  "没有匹配搜索的主题。"));
+            lv.OnSelect(DocsPage.TopicPicked);
+            DocsTopicList.list = lv;
+            DocsPage.docList = lv;
+            DocsPage.docSel = DocsTopicList.SelSig();
+            DocsPage.docCodeScroll = DocsTopicList.CodeScroll();
+        }
+        return DocsTopicList.list;
+    }
+
+    /// This frame's rows, and which one is selected.
+    static void Topics(List<DocTopic> topics, int selRow) {
+        ListView<DocTopic> lv = DocsTopicList.List();
+        lv.Bind(topics);
+        lv.SelectIndex(selRow);
+    }
+
     DocsTopicList() {
         this.InitControl("DocsTopicList", 1);
+        this.Add(DocsTopicList.List());
     }
 
     override string Kind() { return "DocsTopicList"; }
@@ -130,55 +169,47 @@ class DocsTopicList : Control {
     override void OnMeasure(App app) {
         prefH = app.Scale(200);
     }
-
-    override void OnPaint(App app) {
-        if (DocsTopicList.topics == null) { return; }
-        if (DocsPage.docList == null) {
-            ListView<DocTopic> lv = new ListView<DocTopic>(DocTopicRow.Of);
-            lv.Class = "flat";
-            lv.EmptyText(ZanIDE.T("No topics match your search.",
-                                  "没有匹配搜索的主题。"));
-            lv.OnSelect(DocsPage.TopicPicked);
-            DocsPage.docList = lv;
-        }
-        DocsPage.docSel = DocsTopicList.SelSig();
-        DocsPage.docCodeScroll = DocsTopicList.CodeScroll();
-        DocsPage.docList.Bind(DocsTopicList.topics);
-        DocsPage.docList.SelectIndex(DocsTopicList.selRow);
-        DocsPage.docList.RenderInside(app, new Rect(bx, by, bw, bh));
-    }
 }
 
-/// Hosts the category chip in the detail pane header (an immediate Tag).
+/// Hosts the category chip in the detail pane header: a real Tag docked at the
+/// start of its row, so it keeps its natural width instead of being stretched.
 /// @component Docs
 class DocsTagHost : Control {
-    static string text;
-    static string cls;
+    static Tag chip;
+
+    static Tag Chip() {
+        if (DocsTagHost.chip == null) {
+            Tag t = new Tag("");
+            t.dock = 3;
+            DocsTagHost.chip = t;
+        }
+        return DocsTagHost.chip;
+    }
+
+    /// The category of the topic being shown, and the chip class it reads in.
+    static void Show(string text, string cls) {
+        Tag t = DocsTagHost.Chip();
+        t.Text = text;
+        t.Class = cls;
+    }
 
     DocsTagHost() {
         this.InitControl("DocsTagHost", 1);
+        this.Add(DocsTagHost.Chip());
     }
 
     override string Kind() { return "DocsTagHost"; }
 
+    /// The row is exactly as tall as the chip measured itself (children are
+    /// measured first), so the header needs no hard-coded chip height.
     override void OnMeasure(App app) {
-        if (DocsTagHost.text == null) { DocsTagHost.text = ""; }
-        if (DocsTagHost.cls == null) { DocsTagHost.cls = ""; }
-        StyleBox s = Style.Of(app, "tag", DocsTagHost.cls, Style.SNormal());
-        prefH = s.HeightOr(app.theme.heightTiny);
-        prefW = Tag.Width(app, DocsTagHost.text, DocsTagHost.cls);
-    }
-
-    override void OnPaint(App app) {
-        if (DocsTagHost.text == null) { DocsTagHost.text = ""; }
-        if (DocsTagHost.cls == null) { DocsTagHost.cls = ""; }
-        Tag.Chip(app, bx, by, DocsTagHost.text, DocsTagHost.cls);
+        prefH = DocsTagHost.Chip().prefH;
     }
 }
 
-/// Hosts the live widget preview card in the detail pane; delegates painting
-/// to DocsPage.RenderComponentPreview so the retained preview widgets (and
-/// their edit state) stay alive across frames.
+/// Hosts the live widget preview card in the detail pane: the declared gallery
+/// (`pages/ComponentGallery.zform`) is simply a child here, so the preview
+/// widgets (and their edit state) stay alive across frames.
 /// @component Docs
 class DocsPreviewHost : Control {
     static string preview;
@@ -212,79 +243,113 @@ class DocsPreviewHost : Control {
         return DocsPreviewHost.demoInput;
     }
 
+    /// 声明出来的画廊（`pages/ComponentGallery.zform`）：这一格只是把它
+    /// 挂进文档的详情列里，控件树、尺寸和布局都由画廊自己负责。
+    static ComponentGallery gallery;
+
+    /// 切到某个组件主题：重搭画廊里的演示控件。在测量之前调用（测量
+    /// 是自下而上的，那时候改子节点就太晚了）。
+    static void Show(string component) {
+        DocsPreviewHost.preview = component;
+        if (DocsPreviewHost.gallery == null) { return; }
+        DocsPreviewHost.gallery.Show(component, DocsPreviewHost.DemoInput());
+    }
+
     DocsPreviewHost() {
         this.InitControl("DocsPreviewHost", 1);
+        if (DocsPreviewHost.gallery == null) {
+            DocsPreviewHost.gallery = new ComponentGallery();
+        }
+        DocsPreviewHost.gallery.dock = 5;
+        this.Add(DocsPreviewHost.gallery);
     }
 
     override string Kind() { return "DocsPreviewHost"; }
 
     override void OnMeasure(App app) {
         prefH = app.Scale(142);
-    }
-
-    override void OnPaint(App app) {
-        if (DocsPreviewHost.preview == "") { return; }
-        DocsPage.RenderComponentPreview(
-            app, app.theme, DocsPreviewHost.preview,
-            bx, by, bw,
-            DocsPreviewHost.DemoBool(), DocsPreviewHost.DemoInt(),
-            DocsPreviewHost.DemoInput());
+        DocsPreviewHost.gallery.Sync();
     }
 }
 
-/// Hosts the copyable code example (a CodeBlock). Lines, the code scroll
-/// signal and the copy action's clipboard target are pushed in per frame.
+/// Hosts the copyable code example: one retained CodeBlock whose lines are
+/// replaced when another topic is shown, so its scroll position and text
+/// selection survive the per-frame rebuild of the page's data.
 /// @component Docs
 class DocsCodeBlockHost : Control {
-    static List<string> lines;
-    static SignalInt scroll;
-    static string copyLabel;
+    static CodeBlock code;
     static string copyTitle;
     static string copyText;
     static List<string> log;
+    /// The example currently loaded into the block, so identical frames do not
+    /// reset its scroll (SetLines rewinds by design).
+    static string loaded;
+    static int lineCount;
 
     /// The code scroll signal, created once by the component (the same one the
     /// topic list resets on a pick, so the two stay in sync).
     static SignalInt Scroll() {
-        if (DocsCodeBlockHost.scroll == null) {
-            DocsCodeBlockHost.scroll = new SignalInt(0);
+        return DocsTopicList.CodeScroll();
+    }
+
+    static CodeBlock Block() {
+        if (DocsCodeBlockHost.code == null) {
+            CodeBlock cb = new CodeBlock("Zan", new List<string>());
+            cb.dock = 5;
+            cb.UseScroll(DocsCodeBlockHost.Scroll());
+            cb.Copy.Add(DocsCodeBlockHost.Copied);
+            DocsCodeBlockHost.code = cb;
+            DocsCodeBlockHost.loaded = "";
         }
-        return DocsCodeBlockHost.scroll;
+        return DocsCodeBlockHost.code;
+    }
+
+    /// The example of the topic being shown: title and text for the clipboard,
+    /// lines for the block. An unchanged example is left alone.
+    static void Example(string title, string text, List<string> lines,
+                        string copyLabel) {
+        CodeBlock cb = DocsCodeBlockHost.Block();
+        DocsCodeBlockHost.copyTitle = title;
+        DocsCodeBlockHost.copyText = text;
+        cb.CopyLabel = copyLabel;
+        if (lines == null) {
+            DocsCodeBlockHost.lineCount = 0;
+            cb.SetShown(false);
+            return;
+        }
+        cb.SetShown(true);
+        DocsCodeBlockHost.lineCount = lines.Count;
+        if (DocsCodeBlockHost.loaded == text) { return; }
+        cb.SetLines(lines);
+        DocsCodeBlockHost.loaded = text;
+    }
+
+    /// The copy action fired. The clipboard is invisible and the output log is
+    /// behind the help page, so a copy that worked looked like a button that
+    /// did nothing: say so where the click happened.
+    static void Copied() {
+        Clipboard.SetText(DocsCodeBlockHost.copyText);
+        if (DocsCodeBlockHost.log != null) {
+            DocsCodeBlockHost.log.Add("> Copied \""
+                + DocsCodeBlockHost.copyTitle
+                + "\" example to the clipboard.");
+        }
+        Layer.Msg(ZanIDE.T("Example copied to the clipboard",
+                           "示例已复制到剪贴板"), 3);
     }
 
     DocsCodeBlockHost() {
         this.InitControl("DocsCodeBlockHost", 1);
+        this.Add(DocsCodeBlockHost.Block());
     }
 
     override string Kind() { return "DocsCodeBlockHost"; }
 
     override void OnMeasure(App app) {
-        if (DocsCodeBlockHost.lines == null) {
+        if (DocsCodeBlockHost.lineCount == 0) {
             prefH = app.Scale(40);
             return;
         }
-        prefH = CodeBlock.Height(app, DocsCodeBlockHost.lines.Count);
-    }
-
-    override void OnPaint(App app) {
-        if (DocsCodeBlockHost.lines == null) { return; }
-        CodeBlock code = new CodeBlock("Zan", DocsCodeBlockHost.lines);
-        code.UseScroll(DocsCodeBlockHost.Scroll());
-        code.CopyLabel = DocsCodeBlockHost.copyLabel;
-        code.RenderInside(app, new Rect(bx, by, bw, bh));
-        if (code.Copied()) {
-            Clipboard.SetText(DocsCodeBlockHost.copyText);
-            if (DocsCodeBlockHost.log != null) {
-                DocsCodeBlockHost.log.Add("> Copied \""
-                    + DocsCodeBlockHost.copyTitle
-                    + "\" example to the clipboard.");
-            }
-            // The clipboard is invisible and the output log is behind the help
-            // page, so a copy that worked looked like a button that did
-            // nothing. Say so where the click happened.
-            Layer.Msg(ZanIDE.T("Example copied to the clipboard",
-                               "示例已复制到剪贴板"), 3);
-            app.RequestRedraw();
-        }
+        prefH = CodeBlock.Height(app, DocsCodeBlockHost.lineCount);
     }
 }

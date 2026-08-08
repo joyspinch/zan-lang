@@ -58,6 +58,12 @@ if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
     -OutC build\embed_gen.c -OutO build\embed_gen.o -Clang clang
 if ($LASTEXITCODE -ne 0) { Write-Output "EMBED_GEN_FAILED"; exit 1 }
 
+# The Help page's topics.json ships inside the exe the same way.
+& powershell -ExecutionPolicy Bypass -File scripts\gen_embed.ps1 `
+    -Root src\ide_zan\assets\docs -Prefix docs `
+    -OutC build\embed_docs.c -OutO build\embed_docs.o -Clang clang
+if ($LASTEXITCODE -ne 0) { Write-Output "EMBED_DOCS_FAILED"; exit 1 }
+
 
 $zanc = if (Test-Path "build\zanc.exe") { "build\zanc.exe" } else { "dist\win-x64\toolchain\zanc.exe" }
 Write-Output "[zanc] $zanc"
@@ -135,6 +141,7 @@ try {
     $zanArgs += @("-g")
     $zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_ide_gnu")
     $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_gen.o"))
+    $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_docs.o"))
     $zanArgs += @("--link-lib", "SDL3_s")
     $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")
     $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")

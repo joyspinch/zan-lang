@@ -34,6 +34,14 @@ if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
     -OutC build\embed_gen.c -OutO build\embed_gen.o -Clang clang
 if ($LASTEXITCODE -ne 0) { Write-Output "EMBED_GEN_FAILED"; exit 1 }
 
+# The IDE's own text assets (the Help page's topics.json) ship the same way:
+# a second embed object registers its files with the same runtime registry, so
+# the documentation is available offline without an external data file.
+& powershell -ExecutionPolicy Bypass -File scripts\gen_embed.ps1 `
+    -Root src\ide_zan\assets\docs -Prefix docs `
+    -OutC build\embed_docs.c -OutO build\embed_docs.o -Clang clang
+if ($LASTEXITCODE -ne 0) { Write-Output "EMBED_DOCS_FAILED"; exit 1 }
+
 # ---- 3) sources: entry first, then project + Gui stdlib -------------------
 $zanc = if (Test-Path "build\zanc.exe") { "build\zanc.exe" } else { "dist\win-x64\toolchain\zanc.exe" }
 Write-Output "[zanc] $zanc"
@@ -97,6 +105,7 @@ $zanArgs += @("-DZAN_PROJECT_COMPONENTS")
 $zanArgs += @("-o", "build\ZanIDE.exe", "--subsystem", "windows")
 $zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_ide_gnu")
 $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_gen.o"))
+$zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_docs.o"))
 # Native Win32 backend system deps (dwmapi/user32/gdi32/imm32 + reactor).
 $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")
 $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")

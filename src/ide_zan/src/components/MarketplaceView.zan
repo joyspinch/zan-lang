@@ -2,23 +2,120 @@ using System;
 using Gui;
 using Gui.Widget;
 
+/// 扩展市场视图：目录表格 + 详情列 + 刷新 / 安装。
+///
+/// 界面在 `MarketplaceView.zform` 里声明（工具条一行、左侧详情列、
+/// 右侧目录表格），目录与网络状态在 Gui 无关的 `MarketplaceCatalog`
+/// 里。这里只做三件事：建表头、把这一帧的状态铺进控件、把按钮点击
+/// 转成目录操作或安装意图。
 /// @component Marketplace view
-class MarketplaceView : Control {
-    MarketplaceView() {
-        this.InitControl("marketplaceview", 4);
+partial class MarketplaceView {
+    /// 当前视图：按钮与列表的回调是普通函数指针，靠它找回实例。
+    static MarketplaceView current;
+
+    void OnInit() {
+        MarketplaceView.current = this;
+        MarketplaceView.RefreshBtn.SetProp("text",
+            MarketplaceCatalog.T("Refresh", "刷新"));
+        MarketplaceView.RefreshBtn.Icon = "refresh";
+        MarketplaceView.RefreshBtn.Click.Add(MarketplaceView.Refresh);
+        MarketplaceView.InstallBtn.Icon = "download";
+        MarketplaceView.InstallBtn.Click.Add(MarketplaceView.Install);
+        MarketplaceView.Paid.Text = MarketplaceCatalog.T("Purchase required",
+                                                         "需要购买");
+        MarketplaceView.Packages.WithColumns(MarketplaceView.Columns());
+        MarketplaceView.Packages.EmptyText(
+            MarketplaceCatalog.T("No extensions available.", "暂无可用扩展。"));
+        MarketplaceView.Packages.OnSelect(MarketplaceView.Picked);
     }
 
-    override string Kind() { return "MarketplaceView"; }
+    /// 目录表格的列：名称、命名空间、分类，价格右对齐。
+    static List<ListColumn<MarketplacePackage>> Columns() {
+        List<ListColumn<MarketplacePackage>> cols =
+            new List<ListColumn<MarketplacePackage>>();
+        cols.Add(new ListColumn<MarketplacePackage>(
+            MarketplaceCatalog.T("Extension", "扩展"), 3,
+            package => package.displayName));
+        cols.Add(new ListColumn<MarketplacePackage>(
+            MarketplaceCatalog.T("Namespace", "命名空间"), 2,
+            package => package.packageName));
+        cols.Add(new ListColumn<MarketplacePackage>(
+            MarketplaceCatalog.T("Category", "分类"), 2,
+            package => package.category));
+        cols.Add(new ListColumn<MarketplacePackage>(
+            MarketplaceCatalog.T("Price", "价格"), 1,
+            package => MarketplaceCatalog.PriceLabel(package)).Right());
+        return cols;
+    }
 
+    static MarketplaceCatalog Cat() { return MarketplaceCatalog.current; }
+
+    /// 选中一行：拉这个扩展的详情。
+    static void Picked() {
+        MarketplaceCatalog cat = MarketplaceView.Cat();
+        if (cat == null) { return; }
+        if (!MarketplaceView.Packages.HasSelection()) { return; }
+        cat.Select(MarketplaceView.Packages.Selected());
+    }
+
+    static void Refresh() {
+        MarketplaceCatalog cat = MarketplaceView.Cat();
+        if (cat != null) { cat.Refresh(); }
+    }
+
+    /// 安装是要花钱 / 改环境的动作，所以第一次点是「请确认」，第二次
+    /// 才把意图交给子窗口去装。
+    static void Install() {
+        MarketplaceCatalog cat = MarketplaceView.Cat();
+        if (cat == null) { return; }
+        if (cat.Confirm()) { MarketplaceWindow.SetAction(2); }
+    }
+
+    /// 选中行由目录持有（刷新、按名定位都会改它），每帧对齐到表格。
+    static void SyncSelection(MarketplaceCatalog cat) {
+        MarketplaceView.Packages.Bind(cat.Packages());
+        int row = cat.SelectedRow();
+        if (row < 0) {
+            MarketplaceView.Packages.ClearSelection();
+        } else if (row != MarketplaceView.Packages.SelectedIndex()) {
+            MarketplaceView.Packages.SelectIndex(row);
+        }
+    }
+
+    /// 每帧把目录状态铺进控件：详情列里没有内容的行直接隐藏，于是
+    /// 未选中时不会留下一排空标签。子窗口按这里的首选尺寸开，所以
+    /// 目录表格一开始就有一屏的宽度，不是一条缝。
     override void OnMeasure(App app) {
         prefW = app.Scale(940);
         prefH = app.Scale(640);
-    }
-
-    override void OnPaint(App app) {
-        MarketplaceBrowser browser = MarketplaceWindow.Browser();
-        if (browser == null) { return; }
-        int action = browser.RenderInside(app, bx, by, bw, bh);
-        MarketplaceWindow.SetAction(action);
+        MarketplaceCatalog cat = MarketplaceView.Cat();
+        if (cat == null) { return; }
+        cat.Poll();
+        MarketplaceView.SyncSelection(cat);
+        MarketplaceView.Status.Text = cat.Status();
+        MarketplacePackage sel = cat.SelectedPackage();
+        bool has = sel != null;
+        MarketplaceVersion version = null;
+        if (has) { version = sel.LatestVersion(); }
+        MarketplaceView.Name.SetShown(has);
+        MarketplaceView.Ns.SetShown(has);
+        MarketplaceView.Ver.SetShown(has && version != null);
+        MarketplaceView.Paid.SetShown(has && !sel.IsFree());
+        MarketplaceView.InstallBtn.SetShown(has && sel.IsFree() && version != null);
+        if (has) {
+            MarketplaceView.Name.Text = sel.displayName;
+            MarketplaceView.Ns.Text = sel.packageName;
+            if (version != null) {
+                MarketplaceView.Ver.Text =
+                    MarketplaceCatalog.T("Version ", "版本 ") + version.version;
+            }
+            if (cat.Confirming()) {
+                MarketplaceView.InstallBtn.Text =
+                    MarketplaceCatalog.T("Confirm install", "确认安装");
+            } else {
+                MarketplaceView.InstallBtn.Text =
+                    MarketplaceCatalog.T("Install", "安装");
+            }
+        }
     }
 }

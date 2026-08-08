@@ -5,10 +5,9 @@ using Gui;
 using Gui.Component.DataTable;
 
 /// @component AI settings window
-/// The unified AI configuration window (a ChildWindow, same scheme as
-/// EditorSettingsWindow): the saved provider profiles as a selectable list,
-/// editable fields, add/delete, official presets, model-list fetching and a
-/// default-model picker. Persists to ai_profiles.json via ZanIDE.AiProfilesSave.
+/// 「小赞配置」子窗口：只做宿主——配置的读写、选择、增删、模型列表
+/// 抓取与持久化（ai_profiles.json，经 ZanIDE.AiProfilesSave）。界面由
+/// `AiSettingsDialog.zform` 声明。
 class AiSettingsWindow : ChildWindow {
     JsonValue model;
     bool saved;
@@ -22,6 +21,7 @@ class AiSettingsWindow : ChildWindow {
     int sel;
     int modelSel;
 
+    AiSettingsDialog content;
     ListView<AiProfile> profileList;
     ListView<AiPreset> presetList;
     DataGrid<ModelLimitRow> limitGrid;
@@ -63,110 +63,6 @@ class AiSettingsWindow : ChildWindow {
         return s;
     }
 
-    UiNode Doc() {
-        // Rebuild the limits-table entities + their bound inputs for the
-        // current profile before laying out (fetch/add/switch all rebuild).
-        this.SeedModelLimits();
-        // ---- Left column: saved configurations + presets ----
-        UiNode left = UiNode.Column().Dock("left").Width(230).Gap(6);
-        left.Child(UiNode.Label(AiSettingsWindow.T(lang, "Configurations", "配置列表"))
-            .Class("secondary small").Dock("top").Height(20));
-        left.Child(UiNode.Of("Panel").Name("profileList")
-            .Dock("top").Height(180));
-        UiNode cfgRow = UiNode.Row().Dock("top").Height(34).Gap(8);
-        cfgRow.Child(UiNode.Button(AiSettingsWindow.T(lang, "New", "新增"))
-            .OnClick("add").Dock("left").Width(106));
-        cfgRow.Child(UiNode.Button(AiSettingsWindow.T(lang, "Delete", "删除"))
-            .OnClick("del").Dock("right").Width(106));
-        left.Child(cfgRow);
-        left.Child(UiNode.Label(AiSettingsWindow.T(lang, "Presets", "预设"))
-            .Class("secondary small").Dock("top").Height(22));
-        left.Child(UiNode.Of("Panel").Name("presetList")
-            .Dock("top").Height(140));
-        // Dock the fixed-width button first so the "fill" one takes only the
-        // space that is left -- otherwise the two overlap.
-        UiNode preRow = UiNode.Row().Dock("top").Height(34).Gap(8);
-        preRow.Child(UiNode.Button(AiSettingsWindow.T(lang, "Sign up", "注册"))
-            .OnClick("reg").Dock("right").Width(70));
-        preRow.Child(UiNode.Button(AiSettingsWindow.T(lang, "Add preset", "用预设新增"))
-            .OnClick("preAdd").Dock("fill"));
-        left.Child(preRow);
-
-        // ---- Right column: editable fields of the selected profile ----
-        UiNode right = UiNode.Column().Dock("fill").Gap(6);
-        right.Child(UiNode.Label(AiSettingsWindow.T(lang, "Name", "名称"))
-            .Dock("top").Height(22));
-        right.Child(UiNode.Of("Input").Dock("top").Height(34).Bind("name"));
-        right.Child(UiNode.Label(AiSettingsWindow.T(
-            lang, "Endpoint (OpenAI-compatible, /v1)", "接口地址（兼容 OpenAI，/v1）"))
-            .Dock("top").Height(22));
-        right.Child(UiNode.Of("Input").Dock("top").Height(34).Bind("base")
-            .Str("hint", "https://api.openai.com/v1"));
-        right.Child(UiNode.Label(AiSettingsWindow.T(lang, "API Key / Token", "API 密钥 / Token"))
-            .Dock("top").Height(22));
-        right.Child(UiNode.Of("Input").Dock("top").Height(34).Bind("key")
-            .Str("hint", "sk-...").Str("iconLead", "lock").Str("password", "true"));
-        right.Child(UiNode.Label(AiSettingsWindow.T(lang, "Default model", "默认模型"))
-            .Dock("top").Height(22));
-        string fetchLbl = AiSettingsWindow.T(lang, "Fetch models", "获取模型");
-        if (fetchBusy) { fetchLbl = AiSettingsWindow.T(lang, "Fetching...", "获取中..."); }
-        UiNode modelRow = UiNode.Row().Dock("top").Height(34).Gap(8);
-        // Fixed-width button first: under dock layout a "fill" sibling keeps the
-        // whole remaining width, so it must be added after the docked button.
-        modelRow.Child(UiNode.Button(fetchLbl).OnClick("fetch").Dock("right").Width(100));
-        modelRow.Child(UiNode.Of("Input").Dock("fill").Bind("model")
-            .Str("hint", "gpt-4o-mini"));
-        right.Child(modelRow);
-        right.Child(UiNode.Of("Label").Dock("top").Height(22)
-            .BindProp("status", "text"));
-        // Actions are pinned to the bottom, reserved before the model list
-        // fills the space between them and the status line.
-        UiNode actRow = UiNode.Row().Dock("bottom").Height(40).Gap(10);
-        actRow.Child(UiNode.Button(AiSettingsWindow.T(lang, "Save", "保存"))
-            .OnClick("save").Dock("left").Width(110));
-        actRow.Child(UiNode.Button(AiSettingsWindow.T(lang, "Save & enable", "保存并启用"))
-            .OnClick("enable").Class("primary").Dock("left").Width(150));
-        right.Child(actRow);
-        // Team mode: which model each member runs on under this provider. Blank
-        // = the default model above, so a config that never touches this page
-        // behaves exactly as before. Docked before the limits table, which
-        // fills whatever is left.
-        right.Child(UiNode.Label(AiSettingsWindow.T(lang,
-            "Team mode: one model per member (blank = the default above)",
-            "团队模式：每个成员单独的模型（留空 = 上面的默认模型）"))
-            .Class("secondary small").Dock("top").Height(22));
-        List<AiRole> teamRoles = AiTeam.Roles();
-        for (int r = 0; r < teamRoles.Count; r = r + 1) {
-            AiRole role = teamRoles[r];
-            string rname = role.en;
-            if (lang == 1) { rname = role.zh; }
-            UiNode rrow = UiNode.Row().Dock("top").Height(32).Gap(8);
-            rrow.Child(UiNode.Label(rname).Class("small")
-                .Dock("left").Width(150));
-            rrow.Child(UiNode.Of("Input").Dock("fill")
-                .Bind("rolemodel_" + role.id)
-                .Str("hint", profiles[SelClamped()].model));
-            right.Child(rrow);
-        }
-        // Per-model limits as a table: one entity (ModelLimitRow) per fetched
-        // model, columns = model / context length / max output. Clicking the
-        // model cell also picks it as the default. The list scrolls.
-        right.Child(UiNode.Label(AiSettingsWindow.T(lang,
-            "Tick the models to offer in the chat picker; set each one's"
-            + " context / max-output (tokens, blank = default 200000)",
-            "勾选要在聊天模型列表里显示的模型；并设置各自的"
-            +"上下文 / 最大输出（tokens，留空 = 默认 200000）"))
-            .Class("secondary small").Dock("top").Height(22));
-        right.Child(UiNode.Of("Panel").Name("limitGrid").Dock("fill"));
-
-        UiNode row = UiNode.Row().Dock("fill").Pad(16).Gap(14);
-        row.Child(left);
-        row.Child(right);
-        UiNode root = UiNode.Of("Panel").Dock("fill");
-        root.Child(row);
-        return root;
-    }
-
     override void OnCloseRequested() { AiSettingsWindow.OnDone(); }
 
     int SelClamped() {
@@ -175,83 +71,40 @@ class AiSettingsWindow : ChildWindow {
     }
 
     void BuildUi() {
-        this.SetRoot(Doc().Root(), model);
-        this.Handle("done", AiSettingsWindow.OnDone);
-        this.Handle("add", AiSettingsWindow.OnAdd);
-        this.Handle("del", AiSettingsWindow.OnDel);
-        this.Handle("save", AiSettingsWindow.OnSave);
-        this.Handle("enable", AiSettingsWindow.OnEnable);
-        this.Handle("fetch", AiSettingsWindow.OnFetch);
-        this.Handle("preAdd", AiSettingsWindow.OnPreAdd);
-        this.Handle("reg", AiSettingsWindow.OnReg);
+        content = new AiSettingsDialog();
+        this.SetRoot(content, model);
+        this.Handle("aiProfileAdd", AiSettingsWindow.OnAdd);
+        this.Handle("aiProfileDelete", AiSettingsWindow.OnDel);
+        this.Handle("aiProfileSave", AiSettingsWindow.OnSave);
+        this.Handle("aiProfileEnable", AiSettingsWindow.OnEnable);
+        this.Handle("aiModelsFetch", AiSettingsWindow.OnFetch);
+        this.Handle("aiPresetAdd", AiSettingsWindow.OnPreAdd);
+        this.Handle("aiPresetSignUp", AiSettingsWindow.OnReg);
         this.Wire();
 
-        this.MountLists();
+        profileList = content.ProfileList();
+        presetList = content.PresetList();
+        limitGrid = content.LimitTable();
+        profileList.OnSelect(this.ProfileSelected);
+        presetList.OnSelect(this.PresetSelected);
+        limitGrid.OnRowClick(this.LimitRowClicked);
+        presetList.Bind(presets);
+        this.Refresh();
     }
 
-    /// Replace the three placeholder panels with generic entity-bound lists views
-    /// so the profiles / presets / limits are rendered by standard components.
-    void MountLists() {
-        Control profileHost = root.Find("profileList");
-        Control presetHost = root.Find("presetList");
-        Control limitHost = root.Find("limitGrid");
-
-        profileList = new ListView<AiProfile>(this.ProfileRowOf);
-        profileList.dock = 5;
-        profileList.OnSelect(this.ProfileSelected);
+    /// 把当前状态铺到界面上：文案、配置行、成员行与逐模型限额表。
+    /// 每次配置切换/增删/抓取完成后调用（不重建控件树）。
+    void Refresh() {
+        this.SeedModelLimits();
+        content.ApplyTexts(lang, fetchBusy);
+        content.SetActiveProfile(profiles[active]);
+        content.FillRoles(profiles[SelClamped()].model);
         profileList.Bind(profiles);
-        this.ReplaceChild(profileHost, profileList);
         if (sel >= 0 && sel < profiles.Count) {
             profileList.SelectIndex(sel);
         }
-
-        presetList = new ListView<AiPreset>(this.PresetRowOf);
-        presetList.dock = 5;
-        presetList.OnSelect(this.PresetSelected);
-        presetList.Bind(presets);
-        this.ReplaceChild(presetHost, presetList);
-
-        limitGrid = new DataGrid<ModelLimitRow>();
-        limitGrid.dock = 5;
-        limitGrid.BoolCol("Show", 60, r => r.visible)
-            .Editable((ModelLimitRow r, string v) => {
-                r.visible = DataTable.ParseBool(v);
-            });
-        limitGrid.Col("Model", 220, r => r.model);
-        limitGrid.NumCol("Context", 90, r => r.ctx)
-            .Editable((ModelLimitRow r, string v) => {
-                r.ctx = ZanIDE.ParseInt(v);
-            });
-        limitGrid.NumCol("Max out", 90, r => r.maxOut)
-            .Editable((ModelLimitRow r, string v) => {
-                r.maxOut = ZanIDE.ParseInt(v);
-            });
-        limitGrid.OnRowClick(this.LimitRowClicked);
         limitGrid.Bind(modelRows);
-        this.ReplaceChild(limitHost, limitGrid);
-    }
-
-    void ReplaceChild(Control host, Control replacement) {
-        if (host == null) { return; }
-        Control p = host.parent;
-        if (p == null) { return; }
-        int idx = p.IndexOf(host);
-        replacement.dock = host.dock;
-        p.Remove(host);
-        p.InsertAt(idx, replacement);
-    }
-
-    Control ProfileRowOf(AiProfile p) {
-        Label lbl = new Label(p.name + (p == profiles[active]
-            ? AiSettingsWindow.T(lang, "  (enabled)", "（已启用）") : ""));
-        lbl.Class = "secondary small";
-        return lbl;
-    }
-
-    Control PresetRowOf(AiPreset p) {
-        Label lbl = new Label(p.name);
-        lbl.Class = "secondary small";
-        return lbl;
+        this.SyncFromModel();
     }
 
     void ProfileSelected() {
@@ -417,10 +270,9 @@ class AiSettingsWindow : ChildWindow {
 
     override bool Pending() { return fetchBusy; }
 
-    /// Rebuilds the document (profile rows / model options changed) keeping
-    /// the bound state.
+    /// 配置行 / 模型列表变了：只刷新数据，保留控件树与绑定状态。
     void Rebuild() {
-        this.BuildUi();
+        this.Refresh();
         host.RequestRedraw();
     }
 

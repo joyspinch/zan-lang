@@ -2,134 +2,162 @@ using System;
 using Gui;
 using Gui.Widget;
 
-/// The assistant panel's team strip: the team-mode switch, who is working right
-/// now, and -- expanded -- the pipeline position and the task board.
+/// 小赞面板的团队条：团队模式开关、当前谁在工作、（展开后）流水线
+/// 位置和任务板。
 ///
-/// Everything here is assembled from the shared widgets (Switch, Avatar, Tag,
-/// Steps, Progress, Button) rather than painted by hand, so the strip picks up
-/// the active skin's colours, radii and paddings for free and cannot drift away
-/// from the rest of the IDE the way a bespoke chat header does.
+/// 结构在 `views/TeamBoard.zform` 里声明（开关 / 标签 / 徽标行 / 展开
+/// 箭头 / 流水线 / 任务板），这里只把每帧的状态喂给这些控件：没有一处
+/// 坐标运算，行高、间距和圆点大小全部由控件与皮肤自己决定。
 ///
-/// Collapsed is the default on purpose: the reader wants "who / what beat / how
-/// far", and the prose, tool output and full board are one click away.
-class TeamBoard {
-    static Switch modeSw;
-    static Button openBtn;
+/// 默认折叠：读者关心的是「谁 / 哪一拍 / 到哪了」，完整任务板一次点击
+/// 就能展开。
+partial class TeamBoard {
+    /// 一个面板一条团队条；设计里的 onClick 是无参处理器，靠它找回实例。
+    static TeamBoard current;
+    /// 徽标行的常驻控件：头像 + 名字 + 状态 + 进度，各自是标准控件，
+    /// 所以皮肤换了它们跟着变。
     static Avatar ava;
-    static Steps steps;
-    static SignalInt stage;
-    static Progress bar;
-    static Label text;
+    static Tag nameTag;
+    static Tag stateTag;
+    static Tag pctTag;
+    /// 徽标行上一帧的内容签名：只有真的换人 / 换状态才重建那一行。
+    static string chipSig;
+    static SignalInt openSig;
 
-    /// The strip's one reusable text run: rendered by a Label so the font,
-    /// colour and ellipsis rules are the widget's, not this file's.
-    static Label Text(string cls) {
-        if (TeamBoard.text == null) { TeamBoard.text = new Label(""); }
-        TeamBoard.text.Class = cls;
-        return TeamBoard.text;
+    void OnInit() {
+        TeamBoard.current = this;
+        this.logGap = 4;
+        TeamBoard.TeamLbl.SetProp("text", ZanIDE.T("Team", "团队"));
+        TeamBoard.Pipeline.AddStep(ZanIDE.T("PM", "产品"));
+        TeamBoard.Pipeline.AddStep(ZanIDE.T("Arch", "架构"));
+        TeamBoard.Pipeline.AddStep(ZanIDE.T("Dev", "开发"));
+        TeamBoard.Pipeline.AddStep(ZanIDE.T("QA", "测试"));
+        TeamBoard.Pipeline.AddStep(ZanIDE.T("Rev", "审查"));
+        TeamBoard.Pipeline.AddStep(ZanIDE.T("Sec", "安全"));
+        TeamBoard.Pipeline.ErrorIndex = 0 - 1;
+        TeamBoard.Board.WithRow(TeamBoard.TaskRow);
+        TeamBoard.ava = new Avatar();
+        TeamBoard.ava.Size = 18;
+        TeamBoard.nameTag = new Tag("");
+        TeamBoard.stateTag = new Tag("");
+        TeamBoard.pctTag = new Tag("");
+        TeamBoard.pctTag.Class = "primary";
+        TeamBoard.chipSig = "~";
+        TeamBoard.openSig = null;
+        TeamBoard.Pipeline.visible = false;
+        TeamBoard.Board.visible = false;
     }
 
-    /// A chip's real height, asked of the widget that paints it: the strip's
-    /// rows are laid out against this, so a skin with taller tags cannot make
-    /// them overlap each other.
-    static int ChipH(App app) { return Tag.Height(app, ""); }
-
-    /// Row 1 has to clear the switch, whose natural height comes from the skin.
-    static int HeadRowH(App app) {
-        Switch sw = TeamBoard.ModeSwitch();
-        sw.MeasureTree(app);
-        int h = sw.prefH;
-        if (h < TeamBoard.RowH(app)) { h = TeamBoard.RowH(app); }
-        return h;
-    }
-
-    /// A board row: tall enough for the chips it holds plus a gap, and for a
-    /// line of the small font.
-    static int RowH(App app) {
-        int h = TeamBoard.ChipH(app) + app.Scale(6);
-        int text = Canvas.FontHeight(app.theme.fontSizeSmall) + app.Scale(8);
-        if (h < text) { h = text; }
-        return h;
-    }
-
-    static int StepsH(App app) { return app.Scale(46); }
-
-    /// The y a chip of `cls` is painted at to sit centred on a `rowH` row.
-    static int ChipY(App app, int y, int rowH, string cls) {
-        int cy = y + (rowH - Tag.Height(app, cls)) / 2;
-        if (cy < y) { cy = y; }
-        return cy;
-    }
-
-    /// True when the panel is too narrow for the six-stage pipeline strip. Its
-    /// labels are already the short forms, so the honest answer in a narrow
-    /// panel is to leave the strip out rather than paint six labels over each
-    /// other.
-    static bool Compact(App app, int width) {
-        return width < app.Scale(230);
-    }
-
-    static Switch ModeSwitch() {
-        if (TeamBoard.modeSw == null) {
-            TeamBoard.modeSw = Switch.Bind(new SignalBool(false));
-            TeamBoard.modeSw.Class = "small";
+    /// 自身高度 = 头行 +（展开时）流水线 + 任务板。子控件已在
+    /// MeasureTree 里量过，所以这里只做加法，不碰任何像素常量。
+    override void OnMeasure(App app) {
+        int h = TeamBoard.Head.prefH;
+        if (TeamBoard.Pipeline.visible) {
+            h = h + gap + TeamBoard.Pipeline.prefH;
         }
-        return TeamBoard.modeSw;
-    }
-
-    static Button OpenButton() {
-        if (TeamBoard.openBtn == null) {
-            TeamBoard.openBtn = new Button { Text = "", Class = "small text" };
+        if (TeamBoard.Board.visible) {
+            h = h + gap + TeamBoard.Board.prefH;
         }
-        return TeamBoard.openBtn;
+        prefH = h;
     }
 
-    static Avatar Ava() {
-        if (TeamBoard.ava == null) { TeamBoard.ava = new Avatar(); }
-        return TeamBoard.ava;
+    /// 展开 / 收起任务板。开合状态属于宿主（面板要跨帧记住它），
+    /// 所以这里写回宿主交来的信号。
+    static void ToggleOpen() {
+        TeamBoard tb = TeamBoard.current;
+        if (tb == null || TeamBoard.openSig == null) { return; }
+        TeamBoard.openSig.Set(1 - TeamBoard.openSig.Get());
     }
 
-    static Progress Bar() {
-        if (TeamBoard.bar == null) { TeamBoard.bar = new Progress(0, 1); }
-        return TeamBoard.bar;
+    /// 把设计里的事件接到处理器上：宿主只需在拿到 Form 后调一次。
+    static void WireHandlers(Form form) {
+        form.On("teamToggleOpen", TeamBoard.ToggleOpen);
     }
 
-    static ListView<AiTask> taskList;
+    /// 团队模式开关的状态。绘制时开关自己处理点击，所以宿主在渲染之后
+    /// 读这里，仍是那份状态的唯一持有者。
+    bool TeamOn() { return TeamBoard.ModeSw.IsOn(); }
 
-    /// The pipeline strip. Labels are the short forms because the assistant
-    /// panel is narrow and six full role names never fit.
-    static Steps Pipeline() {
-        if (TeamBoard.steps == null) {
-            TeamBoard.stage = new SignalInt(0);
-            List<string> labels = new List<string>();
-            labels.Add(ZanIDE.T("PM", "产品"));
-            labels.Add(ZanIDE.T("Arch", "架构"));
-            labels.Add(ZanIDE.T("Dev", "开发"));
-            labels.Add(ZanIDE.T("QA", "测试"));
-            labels.Add(ZanIDE.T("Rev", "审查"));
-            labels.Add(ZanIDE.T("Sec", "安全"));
-            TeamBoard.steps = Steps.Of(labels, TeamBoard.stage);
-            TeamBoard.steps.Class = "small";
+    /// 本帧的状态：谁在忙、任务到哪了、板子是否展开。渲染前调用一次。
+    void Sync(bool teamOn, bool busy, AiTeamState st, List<AiTask> tasks,
+            SignalInt open) {
+        TeamBoard.openSig = open;
+        TeamBoard.ModeSw.SetOn(teamOn);
+        bool nowOn = teamOn;
+        bool isOpen = open.Get() == 1;
+        if (isOpen) { TeamBoard.OpenBtn.SetProp("text", "▼"); }
+        else { TeamBoard.OpenBtn.SetProp("text", "▶"); }
+        TeamBoard.OpenBtn.visible = nowOn;
+
+        if (!nowOn) {
+            // 关：面板就是单个助手，团队条如实说明，而不是假装有人待命。
+            this.ShowSolo();
+            TeamBoard.Pipeline.visible = false;
+            TeamBoard.Board.visible = false;
+            return;
         }
-        return TeamBoard.steps;
-    }
 
-    /// How tall the strip is for the current mode. One row when the team is off
-    /// (just the switch), one row plus the board when it is on and open.
-    static int Height(App app, bool teamOn, bool open, int taskCount,
-            int width) {
-        int h = TeamBoard.HeadRowH(app) + app.Scale(4);
-        if (!teamOn || !open) { return h; }
-        if (!TeamBoard.Compact(app, width)) {
-            h = h + TeamBoard.StepsH(app);
+        int pct = 0 - 1;
+        int at = AiTeam.IndexOfTask(tasks, st.activeTask);
+        if (at >= 0) { pct = tasks[at].progress; }
+        this.ShowMember(st.activeAgent, TeamBoard.StatusOf(st, busy),
+            TeamBoard.StatusClass(st, busy), pct);
+
+        TeamBoard.Pipeline.visible = isOpen;
+        TeamBoard.Board.visible = isOpen;
+        if (!isOpen) { return; }
+
+        TeamBoard.Pipeline.SetProp("current",
+            Convert.ToString(AiTeam.StageOf(st.activeAgent)));
+        // 任务板：最近四条，新的在上，由标准 ListView 按行模板渲染。
+        List<AiTask> recent = new List<AiTask>();
+        int ti = tasks.Count - 1;
+        while (ti >= 0 && recent.Count < 4) {
+            recent.Add(tasks[ti]);
+            ti = ti - 1;
         }
-        int shown = taskCount;
-        if (shown > 4) { shown = 4; }
-        h = h + shown * TeamBoard.RowH(app);
-        return h + app.Scale(6);
+        TeamBoard.Board.Bind(recent);
     }
 
-    /// What the active member is doing, as a short chip label.
+    /// 单人模式的说明文字，占住徽标行的位置。
+    void ShowSolo() {
+        string sig = "solo";
+        if (TeamBoard.chipSig == sig) { return; }
+        TeamBoard.chipSig = sig;
+        TeamBoard.Chips.RemoveAll();
+        TeamBoard.nameTag.Text = ZanIDE.T("single assistant", "单人小赞");
+        TeamBoard.nameTag.Class = "";
+        TeamBoard.Chips.With(TeamBoard.nameTag);
+    }
+
+    /// 「头像 + 名字 + 状态 + 进度」一行：谁在工作、到哪一步了。消息
+    /// 发给谁由输入框上方的提示行决定，这里只读不写。
+    void ShowMember(string roleId, string state, string stateCls, int pct) {
+        string sig = roleId + "|" + state + "|" + stateCls + "|"
+            + Convert.ToString(pct);
+        if (TeamBoard.chipSig == sig) { return; }
+        TeamBoard.chipSig = sig;
+        string cls = AiTeam.RoleTagClass(roleId);
+        string name = AiTeam.DisplayName(roleId);
+        TeamBoard.Chips.RemoveAll();
+        TeamBoard.ava.Text = StyledText.Initial(name);
+        TeamBoard.ava.Class = cls;
+        TeamBoard.Chips.With(TeamBoard.ava);
+        TeamBoard.nameTag.Text = name;
+        TeamBoard.nameTag.Class = cls;
+        TeamBoard.Chips.With(TeamBoard.nameTag);
+        if (state != "") {
+            TeamBoard.stateTag.Text = state;
+            TeamBoard.stateTag.Class = stateCls;
+            TeamBoard.Chips.With(TeamBoard.stateTag);
+        }
+        if (pct >= 0) {
+            TeamBoard.pctTag.Text = Convert.ToString(pct) + "%";
+            TeamBoard.Chips.With(TeamBoard.pctTag);
+        }
+    }
+
+    /// 当前成员在做什么，写成一个短徽标。
     static string StatusOf(AiTeamState st, bool busy) {
         if (st.awaitingUser) { return ZanIDE.T("waiting for you", "等你确认"); }
         if (busy) { return ZanIDE.T("working", "工作中"); }
@@ -142,123 +170,7 @@ class TeamBoard {
         return "";
     }
 
-    /// Paints one "avatar + name tag + state tag" line: who is working, and how
-    /// far along. Reading only -- the member a message goes to is decided by the
-    /// @name in the composer, which the cue row above it reports.
-    static void MemberRowH(App app, int x, int y, int rightEdge, string roleId,
-            string state, string stateCls, int pct, int rowH) {
-        string cls = AiTeam.RoleTagClass(roleId);
-        string name = AiTeam.DisplayName(roleId);
-        Avatar av = TeamBoard.Ava();
-        av.Text = StyledText.Initial(name);
-        av.Size = 18;
-        av.Class = cls;
-        int d = av.Diameter(app);
-        int cy = y + (rowH - d) / 2;
-        av.RenderAt(app, x, cy, d);
-        int cx = x + d + app.Scale(6);
-        int nw = Tag.Width(app, name, cls);
-        if (cx + nw > rightEdge) { return; }
-        Tag.Chip(app, cx, TeamBoard.ChipY(app, y, rowH, cls), name, cls);
-        cx = cx + nw + app.Scale(4);
-        if (state != "") {
-            int sw2 = Tag.Width(app, state, stateCls);
-            if (cx + sw2 <= rightEdge) {
-                Tag.Chip(app, cx, TeamBoard.ChipY(app, y, rowH, stateCls),
-                    state, stateCls);
-                cx = cx + sw2 + app.Scale(4);
-            }
-        }
-        if (pct >= 0) {
-            string pl = Convert.ToString(pct) + "%";
-            if (cx + Tag.Width(app, pl, "primary") <= rightEdge) {
-                Tag.Chip(app, cx, TeamBoard.ChipY(app, y, rowH, "primary"),
-                    pl, "primary");
-            }
-        }
-    }
-
-    /// Renders the strip and returns the team-mode flag after the user's click,
-    /// so the caller stays the single owner of that state.
-    static bool Render(App app, Rect area, bool teamOn, bool busy,
-            AiTeamState st, List<AiTask> tasks, SignalInt open) {
-        int pad = app.Scale(6);
-        int rowH = TeamBoard.RowH(app);
-        int headH = TeamBoard.HeadRowH(app);
-        int x = area.x + pad;
-        int right = area.x + area.width - pad;
-        int y = area.y + app.Scale(2);
-
-        // Row 1: the switch owns the mode, and its label says what it does.
-        Switch sw = TeamBoard.ModeSwitch();
-        sw.SetOn(teamOn);
-        sw.MeasureTree(app);
-        int swW = sw.prefW;
-        sw.Render(app, x, y + (headH - sw.prefH) / 2);
-        int cx = x + swW + app.Scale(6);
-        string lab = ZanIDE.T("Team", "团队");
-        int labY = y + (headH - Canvas.FontHeight(app.theme.fontSizeSmall)) / 2;
-        Label labLbl = TeamBoard.Text("small secondary");
-        labLbl.Text = lab;
-        labLbl.RenderAt(app, cx, labY);
-        cx = cx + Canvas.MeasureText(lab, app.theme.fontSizeSmall) + app.Scale(8);
-        bool nowOn = sw.IsOn();
-
-        if (!nowOn) {
-            // Off: the panel is the single assistant, and the strip says so
-            // rather than pretending a team is standing by.
-            Label soloLbl = TeamBoard.Text("small hint");
-            soloLbl.Text = ZanIDE.T("single assistant", "单人小赞");
-            soloLbl.RenderAt(app, cx, labY);
-            return nowOn;
-        }
-
-        // On, collapsed: who is working, on which beat, how far along.
-        int caretW = app.Scale(22);
-        bool isOpen = open.Get() == 1;
-        Button ob = TeamBoard.OpenButton();
-        if (isOpen) { ob.Text = "▼"; } else { ob.Text = "▶"; }
-        int obId = ob.RenderIn(app, right - caretW, y + app.Scale(2),
-            caretW, headH - app.Scale(4));
-        if (Ui.Clicked(app, obId)) {
-            open.Set(1 - open.Get());
-            app.RequestRedraw();
-        }
-        int pct = 0 - 1;
-        int at = AiTeam.IndexOfTask(tasks, st.activeTask);
-        if (at >= 0) { pct = tasks[at].progress; }
-        TeamBoard.MemberRowH(app, cx, y, right - caretW - app.Scale(4),
-            st.activeAgent, TeamBoard.StatusOf(st, busy),
-            TeamBoard.StatusClass(st, busy), pct, headH);
-        y = y + headH + app.Scale(4);
-        if (!isOpen) { return nowOn; }
-
-        // Expanded: where the pipeline stands, then everybody, then the board.
-        if (!TeamBoard.Compact(app, area.width)) {
-            Steps ps = TeamBoard.Pipeline();
-            TeamBoard.stage.Set(AiTeam.StageOf(st.activeAgent));
-            ps.ErrorIndex = 0 - 1;
-            ps.RenderAt(app, x, y, right - x);
-            y = y + TeamBoard.StepsH(app);
-        }
-
-        // The board: the four most recent tasks, newest first, rendered by a
-        // standard ListView bound to a slice of the task list.
-        if (TeamBoard.taskList == null) {
-            TeamBoard.taskList = new ListView<AiTask>(TeamBoard.TaskRow);
-        }
-        List<AiTask> recent = new List<AiTask>();
-        int ti = tasks.Count - 1;
-        while (ti >= 0 && recent.Count < 4) {
-            recent.Add(tasks[ti]);
-            ti = ti - 1;
-        }
-        TeamBoard.taskList.Bind(recent);
-        int shownH = (recent.Count < 4 ? recent.Count : 4) * rowH;
-        TeamBoard.taskList.RenderInside(app, new Rect(x, y, right - x, shownH));
-        return nowOn;
-    }
-
+    /// 任务板的一行：负责人、状态、进度条和标题，全是标准控件。
     static Control TaskRow(AiTask t) {
         Panel row = Panel.Row();
         row.gap = 6;

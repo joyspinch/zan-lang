@@ -1,0 +1,155 @@
+using System;
+using System.Json;
+using Gui;
+
+/// 「项目」子窗口：项目自身的一切——应用图标与资源摘要，以及资源
+/// 管理器——同一个窗口的两页。窗口只做宿主：状态实体、生命周期、
+/// 回写 zan.proj；界面由 `ProjectConfigDialog.zform` 声明。
+class ConfigWindow : ChildWindow {
+    ProjectConfigDialog content;
+    string root;
+    List<string> log;
+    int lang;           // 0 English, 1 Chinese
+    int tab;            // 0 configuration, 1 assets
+    JsonValue model;
+    static bool done;
+    static bool choose;
+    static bool clear;
+
+    static string T(int lang, string en, string zh) {
+        if (lang == 1) { return zh; }
+        return en;
+    }
+
+    static void OnDone() { ConfigWindow.done = true; }
+    static void OnChoose() { ConfigWindow.choose = true; }
+    static void OnClear() { ConfigWindow.clear = true; }
+
+    override void OnCloseRequested() { ConfigWindow.OnDone(); }
+
+    void BuildUi() {
+        content = new ProjectConfigDialog();
+        content.Fill(lang, root);
+        content.ShowTab(tab);
+        this.SetRoot(content, model);
+        this.Handle("projectConfigDone", ConfigWindow.OnDone);
+        this.Handle("projectIconChoose", ConfigWindow.OnChoose);
+        this.Handle("projectIconClear", ConfigWindow.OnClear);
+        this.Wire();
+    }
+
+    static ConfigWindow Open(App parent, string root, List<string> log,
+                             int uiLang, int tab) {
+        ConfigWindow w = new ConfigWindow();
+        w.root = root;
+        w.log = log;
+        w.lang = uiLang;
+        w.tab = tab;
+        w.open = true;
+        ConfigWindow.done = false;
+        ConfigWindow.choose = false;
+        ConfigWindow.clear = false;
+        AssetManager.BindView(root, log, uiLang);
+        w.model = JsonValue.NewObject();
+        w.model.Set("tab", JsonValue.NewNum(Convert.ToString(tab)));
+        // Skin packaging: reflect the saved zan.proj settings into the model so
+        // the toggle and per-skin checkboxes come up matching the project.
+        string skinsOn = "0";
+        if (ZanIDE.ProjSkinsEnabled(root)) { skinsOn = "1"; }
+        w.model.Set("skins", JsonValue.NewStr(skinsOn));
+        List<string> avail = ZanIDE.AvailableSkinNames();
+        List<string> chosen = ZanIDE.ProjSkinList(root);
+        for (int i = 0; i < avail.Count; i = i + 1) {
+            string v = "0";
+            for (int j = 0; j < chosen.Count; j = j + 1) {
+                if (chosen[j] == avail[i]) { v = "1"; }
+            }
+            w.model.Set("skin_" + avail[i], JsonValue.NewStr(v));
+        }
+        w.BuildUi();
+        w.OpenHost(parent);
+        return w;
+    }
+
+    override string Title() {
+        return ConfigWindow.T(lang, "Project", "项目配置");
+    }
+
+    override int Width() { return 900; }
+    override int Height() { return 680; }
+    override int IdBase() { return 870000; }
+
+    override bool Pending() {
+        return ConfigWindow.done || ConfigWindow.choose
+            || ConfigWindow.clear || AssetManager.viewAction != 0;
+    }
+
+    override void AfterFrame() {
+        if (ConfigWindow.clear) {
+            ConfigWindow.clear = false;
+            ZanIDE.SetProjectIcon(root, "");
+            log.Add("> App icon cleared (default icon will be used).");
+            content.Fill(lang, root);
+            if (open) { host.RequestRedraw(); }
+        }
+        // The tab strip is a bound selector, so the switch shows up as a model
+        // change rather than as an action: the page swap follows the value the
+        // segments now agree on.
+        int picked = model.Int("tab", tab);
+        if (picked != tab) {
+            tab = picked;
+            content.ShowTab(tab);
+            if (open) { host.RequestRedraw(); }
+        }
+        this.SyncSkins();
+    }
+
+    /// Writes the skin-packaging toggle and per-skin checkboxes back to
+    /// zan.proj (`skins` + `skinlist`), only when they actually changed.
+    void SyncSkins() {
+        string enabled = "0";
+        string mv = model.PathGet("skins").AsString("0");
+        if (mv == "1" || mv == "true") { enabled = "1"; }
+        if (ZanIDE.ProjField(root, "skins") != enabled) {
+            ZanIDE.SetProjField(root, "skins", enabled);
+        }
+        List<string> avail = ZanIDE.AvailableSkinNames();
+        string list = "";
+        for (int i = 0; i < avail.Count; i = i + 1) {
+            string v = model.PathGet("skin_" + avail[i]).AsString("0");
+            if (v == "1" || v == "true") {
+                if (list != "") { list = list + ","; }
+                list = list + avail[i];
+            }
+        }
+        if (ZanIDE.ProjField(root, "skinlist") != list) {
+            ZanIDE.SetProjField(root, "skinlist", list);
+        }
+    }
+
+    /// True once the user pressed Done or the shell close button.
+    bool TakeDone() {
+        if (ConfigWindow.done) {
+            ConfigWindow.done = false;
+            open = false;
+            return true;
+        }
+        return false;
+    }
+
+    /// True once the user pressed "Choose .ico..." (opens the file picker).
+    bool TakeChoose() {
+        if (ConfigWindow.choose) {
+            ConfigWindow.choose = false;
+            return true;
+        }
+        return false;
+    }
+
+    /// What the Asset Manager tab asked for on its last paint (0 none,
+    /// 2 import file, 3 import folder, 4 link resource); 1 (its own close
+    /// button) closes the window.
+    int TakeAssetAction() {
+        return AssetManager.TakeAction();
+    }
+}

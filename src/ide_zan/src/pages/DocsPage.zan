@@ -1,0 +1,261 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// Plain model behind the live component previews. Widgets bind their
+/// `.data` to these fields, so a single field drives (and is driven by) the
+/// preview widget both ways, mirroring the new instance + `.data` paradigm.
+class DocsDemoModel {
+    bool toggle;
+    int choice;
+    int level;
+    int pick;
+    int stars;
+}
+
+/// One rendered documentation topic. Display text and section membership stay
+/// together so filtering and detail rendering cannot desynchronise fields.
+class DocsTopic {
+    string category;
+    string title;
+    string body;
+    string code;
+    int section;
+
+    static DocsTopic From(DocEntry entry) {
+        DocsTopic topic = new DocsTopic();
+        topic.category = entry.Cat();
+        topic.title = entry.Title();
+        topic.body = entry.Body();
+        topic.code = entry.Code();
+        topic.section = DocsData.SectionOf(entry.CatEn());
+        return topic;
+    }
+}
+
+/// One line of the topic menu. A row is a topic (`doc` indexes the doc
+/// arrays), a category heading (`doc` = -1) or a section row (`doc` = -2)
+/// that opens its group; `sec` carries the section index of a section row.
+class DocTopic {
+    int doc;
+    int sec;
+    bool open;
+    string text;
+
+    static DocTopic Of(int doc, string text) {
+        DocTopic t = new DocTopic();
+        t.doc = doc;
+        t.sec = 0 - 1;
+        t.open = false;
+        t.text = text;
+        return t;
+    }
+
+    static DocTopic Header(string text) { return DocTopic.Of(0 - 1, text); }
+
+    /// A collapsible group row; picking it opens that section.
+    static DocTopic Section(int sec, string text, bool open) {
+        DocTopic t = DocTopic.Of(0 - 2, text);
+        t.sec = sec;
+        t.open = open;
+        return t;
+    }
+
+    bool IsSection() { return doc == 0 - 2; }
+
+    bool IsHeader() { return doc < 0; }
+}
+
+/// A sidebar line as a control of its own: a heading and a topic differ only in
+/// which label class they carry, which is what makes the sidebar a list of
+/// custom rows rather than a list with a row model.
+class DocTopicRow : Control {
+    /// Row template for `new ListView<DocTopic>(DocTopicRow.Of)`.
+    static Control Of(DocTopic t) { return new DocTopicRow(t); }
+
+    DocTopicRow(DocTopic t) {
+        this.InitControl("docTopic", 1);
+        string caption = t.text;
+        if (t.IsSection()) {
+            if (t.open) { caption = "▾  " + caption; }
+            else { caption = "▸  " + caption; }
+        } else if (!t.IsHeader()) {
+            caption = "   " + caption;
+        }
+        Label text = new Label(caption);
+        if (t.IsSection()) {
+            Class = "section";
+            text.Class = "small strong";
+        } else if (t.IsHeader()) {
+            Class = "header";
+            text.Class = "hint tiny";
+        } else {
+            text.Class = "small";
+        }
+        text.dock = 5;
+        this.Add(text);
+    }
+
+    override string Kind() { return "DocTopicRow"; }
+
+    override string StyleType() { return "listrow"; }
+
+    override void OnMeasure(App app) {
+        StyleBox s = this.ResolveStyleAs(app, "listrow", Class, Style.SNormal());
+        prefH = s.HeightOr(app.theme.heightMedium);
+    }
+}
+
+/// The Help / documentation browser, extracted from the shell: the doc
+/// content lists (BuildDocs), the searchable sidebar + detail pane with a
+/// copyable code example (RenderDocsPage) and the live widget previews.
+class DocsPage {
+    static ListView<DocTopic> docList;
+    /// 保留的文档页界面实例（声明在 DocsView.zform 里），跨帧存活。
+    static DocsView view;
+    // Where a picked topic goes: the page is rendered from signals the shell
+    // owns, and the list handler is a method, so they are held here for it.
+    static SignalInt docSel;
+    static SignalInt docCodeScroll;
+
+    /// A picked topic moves the shell's selection signal; a category heading is
+    /// not a topic, so it selects nothing.
+    static void TopicPicked() {
+        if (DocsPage.docList == null) { return; }
+        if (!DocsPage.docList.HasSelection()) { return; }
+        DocTopic t = DocsPage.docList.Selected();
+        if (t.IsHeader()) { return; }
+        if (DocsPage.docSel != null) { DocsPage.docSel.Set(t.doc); }
+        if (DocsPage.docCodeScroll != null) { DocsPage.docCodeScroll.Set(0); }
+    }
+
+    /// Builds the rendered documentation topics from DocsData. The source keeps
+    /// both languages side by side; each topic resolves the active language once.
+    static List<DocsTopic> BuildDocs() {
+        List<DocsTopic> topics = new List<DocsTopic>();
+        List<DocEntry> all = DocsData.All();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            topics.Add(DocsTopic.From(all[i]));
+        }
+        return topics;
+    }
+
+    /// Renders the Help / documentation browser: a searchable sidebar of topics
+    /// (language + GUI components) and a detail pane with a copyable code
+    /// example, in the spirit of a component showcase. The whole pane is a
+    /// declared control (`DocsView.zform`) whose retained widgets (section
+    /// tabs, search box, topic list) and immediate widgets (tag, code block,
+    /// preview) are hosted by the bridge components in components/DocsBridges.
+    /// All state (search text, section, selection, scroll, demo widgets) lives
+    /// inside those components; the shell only supplies the frame rectangle and
+    /// the IDE output log.
+    static void RenderDocsPage(App app, Rect area, List<string> log) {
+        // No surface fill: the dock painted this pane's surface (frosted under
+        // a glass skin), and the sidebar + detail pane share that material.
+        SignalInt sectionSig = DocsSectionTabs.Sel();
+        Input search = DocsSearchHost.Search();
+        SignalInt selSig = DocsTopicList.SelSig();
+
+        List<DocsTopic> docs = DocsPage.BuildDocs();
+
+        // Search box.
+        string query = ZanIDE.ToLowerS(search.GetText());
+
+        // Entries matching the query, whatever section they live in: the menu
+        // opens the groups that have a hit, so a search reaches every section.
+        List<int> hit = new List<int>();
+        for (int fi = 0; fi < docs.Count; fi = fi + 1) {
+            DocsTopic docTopic = docs[fi];
+            string hay = ZanIDE.ToLowerS(docTopic.title + " "
+                + docTopic.category + " " + docTopic.body);
+            if (ZanIDE.ContainsS(hay, query)) { hit.Add(fi); }
+        }
+
+        // The section the rail is on, and a selection that belongs to it: a
+        // search jumps the rail to the first hit, and picking another section
+        // opens that section's first topic.
+        int openSec = sectionSig.Get();
+        if (openSec < 0 || openSec >= DocsData.SectionCount()) { openSec = 0; }
+        bool searching = query.Length > 0;
+        int selAbs = selSig.Get();
+        bool selOk = hit.IndexOf(selAbs) >= 0 && docs[selAbs].section == openSec;
+        if (!selOk && searching && hit.Count > 0
+                && (selAbs < 0 || hit.IndexOf(selAbs) < 0)) {
+            openSec = docs[hit[0]].section;
+            sectionSig.Set(openSec);
+        }
+        if (!selOk) {
+            selAbs = 0 - 1;
+            for (int h0 = 0; h0 < hit.Count; h0 = h0 + 1) {
+                if (docs[hit[h0]].section == openSec) { selAbs = hit[h0]; break; }
+            }
+            selSig.Set(selAbs);
+        }
+
+        // Topic list: the entries of the selected section (a search reaches
+        // every section, and then the rail follows the hit). Sections live in
+        // the vertical rail beside the list, so they never scroll away.
+        List<string> secLabels = new List<string>();
+        for (int sl = 0; sl < DocsData.SectionCount(); sl = sl + 1) {
+            secLabels.Add(DocsData.SectionName(sl));
+        }
+
+        List<DocTopic> topics = new List<DocTopic>();
+        int selRow = 0 - 1;
+        string lastCat = "";
+        for (int k = 0; k < hit.Count; k = k + 1) {
+            int dix = hit[k];
+            DocsTopic docTopic = docs[dix];
+            if (docTopic.section == openSec) {
+                if (docTopic.category != lastCat) {
+                    topics.Add(DocTopic.Header(docTopic.category));
+                    lastCat = docTopic.category;
+                }
+                if (dix == selAbs) { selRow = topics.Count; }
+                topics.Add(DocTopic.Of(dix, docTopic.title));
+            }
+        }
+
+        // Push this frame's data into the bridge components. Each of them owns
+        // its widget (and the signals behind it), so only the data flows.
+        string copyLabel = ZanIDE.T("Copy", "复制");
+        DocsSectionTabs.Sections(secLabels);
+        DocsTopicList.Topics(topics, selRow);
+        DocsPreviewHost.preview = "";
+        DocsCodeBlockHost.log = log;
+        if (selAbs >= 0) {
+            DocsTagHost.Show(DocsPage.ToUpperCat(docs[selAbs].category),
+                             "primary");
+        }
+
+        if (DocsPage.view == null) { DocsPage.view = new DocsView(); }
+        DocsView view = DocsPage.view;
+        if (selAbs < 0) {
+            DocsCodeBlockHost.Example("", "", null, copyLabel);
+            view.ShowEmpty(ZanIDE.T("No topics match your search.",
+                                    "没有匹配搜索的主题。"));
+        } else {
+            // Detail pane: category chip, title, rule, wrapped body, live
+            // preview (for widgets) and the copyable code example, inside the
+            // declared ScrollColumn so a long article scrolls in the pane.
+            DocsTopic selected = docs[selAbs];
+            DocsCodeBlockHost.Example(selected.title, selected.code,
+                                      CodeEditor.SplitLines(selected.code),
+                                      copyLabel);
+            bool preview =
+                selected.category == ZanIDE.T("GUI - Widgets", "GUI - 组件");
+            if (preview) { DocsPreviewHost.Show(selected.title); }
+            view.ShowTopic(selected.title, selected.body, preview);
+        }
+        view.MeasureTree(app);
+        view.Arrange(area.x, area.y, area.width, area.height);
+        view.RenderTree(app);
+    }
+
+    /// Renders a category label as an uppercase-ish section header. (Kept simple:
+    /// returns the category text prefixed for visual separation.)
+    static string ToUpperCat(string s) {
+        return s;
+    }
+
+}

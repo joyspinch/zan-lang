@@ -1,0 +1,171 @@
+using System;
+
+/// 扩展市场的目录与网络状态：拉目录、拉详情、选中哪个扩展、安装前的
+/// 二次确认。
+///
+/// 这里**没有界面**：所有像素都在 `components/MarketplaceView.zform`
+/// 和它的 code-behind 里，于是目录逻辑可以脱离窗口单独推进和测试。
+class MarketplaceCatalog {
+    static MarketplaceCatalog current;
+    static int lang;
+
+    List<MarketplacePackage> packages;
+    MarketplacePackage selectedPackage;
+    /// 选中的行号（-1 = 没有选中）：视图每帧对齐到它，于是「按名定位」
+    /// 和「刷新后清空」都由目录说了算，而不是靠界面记住。
+    int selectedRow;
+    string status;
+    bool loading;
+    bool confirmInstall;
+    /// 还没在目录里出现、但已经被点名要装的扩展（缺库提示里点进来的）。
+    string requestedPackage;
+
+    static string T(string en, string zh) {
+        if (MarketplaceCatalog.lang == 1) { return zh; }
+        return en;
+    }
+
+    static string PriceLabel(MarketplacePackage package) {
+        if (package.IsFree()) { return T("Free", "免费"); }
+        return Convert.ToString(package.pricePoints) + T(" pts", " 积分");
+    }
+
+    static MarketplaceCatalog Create(int uiLang) {
+        MarketplaceCatalog.lang = uiLang;
+        MarketplaceCatalog cat = new MarketplaceCatalog();
+        cat.packages = new List<MarketplacePackage>();
+        cat.selectedPackage = null;
+        cat.selectedRow = 0 - 1;
+        cat.status = T("Loading extensions...", "正在加载扩展...");
+        cat.loading = true;
+        cat.confirmInstall = false;
+        cat.requestedPackage = "";
+        MarketplaceCatalog.current = cat;
+        string err = MarketplaceClient.StartCatalog();
+        if (err != "") {
+            cat.loading = false;
+            cat.status = err;
+        }
+        return cat;
+    }
+
+    List<MarketplacePackage> Packages() { return packages; }
+    MarketplacePackage SelectedPackage() { return selectedPackage; }
+    int SelectedRow() { return selectedRow; }
+    string Status() { return status; }
+    bool Loading() { return loading; }
+    bool Confirming() { return confirmInstall; }
+
+    /// 用户选了一个扩展：拉它的详情（价格、版本在详情里才准）。
+    void Select(MarketplacePackage package) {
+        if (package == selectedPackage) { return; }
+        selectedPackage = package;
+        selectedRow = this.RowOf(package.packageName);
+        confirmInstall = false;
+        loading = true;
+        status = T("Loading extension details...", "正在加载扩展详情...");
+        string err = MarketplaceClient.StartProduct(package.id);
+        if (err != "") {
+            loading = false;
+            status = err;
+        }
+    }
+
+    /// 按下安装：第一次只是把按钮变成「确认安装」，返回 true 才是真装。
+    bool Confirm() {
+        if (!confirmInstall) {
+            confirmInstall = true;
+            status = T("Confirm installing this free extension.",
+                       "请确认安装这个免费扩展。");
+            return false;
+        }
+        confirmInstall = false;
+        return true;
+    }
+
+    static bool Prefix(string text, string prefix) {
+        return text.Length >= prefix.Length
+            && text.Substring(0, prefix.Length) == prefix;
+    }
+
+    int RowOf(string packageName) {
+        for (int i = 0; i < packages.Count; i = i + 1) {
+            if (packages[i].packageName == packageName) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    /// 有请求在飞时每帧调用：一次把到达的响应处理完。
+    void Poll() {
+        if (!loading) { return; }
+        string done = MarketplaceClient.Done();
+        if (done == "") { return; }
+        MarketplaceClient.Clear();
+        loading = false;
+        if (MarketplaceCatalog.Prefix(done, "err:")) {
+            status = done.Substring(4, done.Length - 4);
+            return;
+        }
+        if (!MarketplaceCatalog.Prefix(done, "ok:")) {
+            status = T("Invalid registry response.", "扩展仓库响应无效。");
+            return;
+        }
+        string body = done.Substring(3, done.Length - 3);
+        if (selectedPackage != null && packages.Count > 0) {
+            MarketplacePackage detail = MarketplaceResponse.Product(body);
+            if (detail == null) {
+                status = T("Could not load package details.", "无法加载库详情。");
+                return;
+            }
+            selectedPackage = detail;
+            status = T("Package details loaded.", "库详情已加载。");
+            return;
+        }
+        if (!MarketplaceResponse.IsRegistryResponse(body)) {
+            status = T("No extension registry at ", "扩展仓库未接入：")
+                + MarketplaceClient.BaseUrl();
+            return;
+        }
+        packages = MarketplaceResponse.Catalog(body);
+        status = Convert.ToString(packages.Count) + T(" extensions", " 个扩展");
+        if (requestedPackage == "") { return; }
+        int row = this.RowOf(requestedPackage);
+        if (row >= 0) {
+            requestedPackage = "";
+            selectedRow = row;
+            this.Select(packages[row]);
+            return;
+        }
+        status = T("Missing package is not listed: ", "扩展仓库中未找到缺失库：")
+            + requestedPackage;
+        requestedPackage = "";
+    }
+
+    /// 定位一个扩展（编辑器里缺库提示点进来的路径）：目录里有就选中它，
+    /// 没有就刷新一次，等目录到了再选。
+    void Locate(string packageName) {
+        int row = this.RowOf(packageName);
+        if (row >= 0) {
+            requestedPackage = "";
+            selectedRow = row;
+            this.Select(packages[row]);
+            return;
+        }
+        requestedPackage = packageName;
+        if (!loading) { this.Refresh(); }
+    }
+
+    void Refresh() {
+        if (loading) { return; }
+        selectedPackage = null;
+        selectedRow = 0 - 1;
+        confirmInstall = false;
+        loading = true;
+        status = T("Loading extensions...", "正在加载扩展...");
+        string err = MarketplaceClient.StartCatalog();
+        if (err != "") {
+            loading = false;
+            status = err;
+        }
+    }
+}

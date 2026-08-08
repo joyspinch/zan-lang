@@ -72,56 +72,6 @@ class AiProfile {
     }
 }
 
-/// One chat message: the role shown in the transcript (user / assistant /
-/// tool / error), the message text and the per-message reasoning ("" when
-/// none). One entity instead of parallel role/text/reason lists.
-class AiChatMsg {
-    string role;
-    string text;
-    string reason;
-    /// Team sessions only: the role id of the member that spoke ("" for the
-    /// user and for a single-assistant session), the comma-joined role ids the
-    /// message is addressed to, the protocol beat (AiTeam.Kind*) and the task
-    /// it belongs to. Empty on every message a single-assistant session
-    /// produces, which is what lets one transcript format serve both modes.
-    string agent;
-    string to;
-    string kind;
-    string taskId;
-    int progress;
-
-    static AiChatMsg Create(string role, string text) {
-        AiChatMsg m = new AiChatMsg();
-        m.role = role;
-        m.text = text;
-        m.reason = "";
-        m.agent = "";
-        m.to = "";
-        m.kind = "";
-        m.taskId = "";
-        m.progress = 0;
-        return m;
-    }
-
-    /// One message from a team member, with its parsed envelope attached.
-    static AiChatMsg CreateFrom(string role, string text, string agent,
-            string to, string kind, string taskId, int progress) {
-        AiChatMsg m = AiChatMsg.Create(role, text);
-        m.agent = agent;
-        m.to = to;
-        m.kind = kind;
-        m.taskId = taskId;
-        m.progress = progress;
-        return m;
-    }
-
-    static AiChatMsg CreateWithReason(string role, string text, string reason) {
-        AiChatMsg m = AiChatMsg.Create(role, text);
-        m.reason = reason;
-        return m;
-    }
-}
-
 /// One step of the per-session task plan checklist (text + 0/1 done). One
 /// entity instead of parallel text/done lists.
 class AiPlanStep {
@@ -386,13 +336,8 @@ partial class ZanIDE {
     Input rtToolFilter;
     Input rtExFilter;
     List<TreeNode> rtCtxShow;
-    List<AiChatMsg> aiMsgs;
-    SignalInt aiScroll;
+    List<ChatMessage> aiMsgs;
     SignalInt aiBusy;
-    TextArea aiInput;
-    Button aiSendBtn;
-    Button aiApplyBtn;
-    Button aiReplaceBtn;
     List<AiProfile> aiProfiles;
     /// Stop-gap keep-alive for the AiProfile objects. The AI panel reads their
     /// string fields (`name`/`model`/`limits`...) every frame; an ARC
@@ -405,13 +350,13 @@ partial class ZanIDE {
     int aiProfActive;
     AiSettingsWindow aiWindow;
     Dropdown<ModelOption> aiModelSel;
+        /// 本帧生效的聊天模型（下拉的选择，或启用 profile 的默认模型）。
+        /// 发送处理器、agent 层都读它，所以它由绘制那一步先算好。
+        string aiChatModel;
     List<ModelOption> aiModelOptions;
     /// Signature of the profile set the model dropdown was last built from;
     /// the dropdown is rebuilt when it changes.
     string aiModelSelSig;
-    Button aiCfgBtn;
-    /// Replaces Send while a request is in flight: abandons it.
-    Button aiStopBtn;
     List<AiSession> aiSessions;
     int aiSessCur;
     /// Database the chats in `aiSessions` came from, so a project switch writes
@@ -421,10 +366,6 @@ partial class ZanIDE {
     /// at most once per second so streaming a long answer does not hammer the
     /// filesystem, but a crash never loses more than a second of chat.
     int aiLastSave;
-    Button aiSessPrevBtn;
-    Button aiSessNextBtn;
-    Button aiSessNewBtn;
-    Button aiSessClearBtn;
     SessionList aiSessNav;
     // G: per-session task plan drawn as a checklist above the chat. The plan
     // is stored inside the session record (ChatPack/ChatUnpack) so switching
@@ -444,41 +385,15 @@ partial class ZanIDE {
     List<Badge> aiRunDots;
     Label aiRunLabel;
     Divider aiRunRule;
-    /// The AI panel's one-off text runs and rules, kept as widgets so the
-    /// skin owns their colour, font and thickness.
-    Divider aiSideRule;
     Label aiCueLbl;
     Label aiCueCaret;
-    Label aiPendLbl;
     ListView<AiPlanStep> aiPlanList;
     List<AiPlanStep> aiPlanBound;
     Label aiPlanTitle;
     Divider aiPlanRule;
-    // Chat transcript wrapped-line cache, one TextRun entity per display row
-    // (text/color/kind/meta/owner); rebuilt only when the transcript, width or
-    // theme changes — rewrapping every frame is too slow.
-    List<TextRun> aiCacheLines;
-    // Message indices of tool results currently expanded (empty = all collapsed
-    // to a single summary line). Ephemeral view state; cleared on session
-    // switch / fork like the scroll offset.
-    List<int> aiToolOpen;
-    string aiCacheKey;
-    /// Layout inputs (width / font / expanded sections) the cache was wrapped
-    /// with; when these change every line must be re-wrapped.
-    string aiCacheSig;
-    /// Turns whose wrapped lines are already in the cache and cannot change
-    /// any more (everything except the last, streaming, turn).
-    int aiCacheTurns;
-    /// Line count of those settled turns: the tail is truncated back to here
-    /// and only the last turn is re-wrapped while an answer streams in.
-    int aiCachePrefix;
-    // C: drag-to-select / copy state for the chat transcript (LogView model,
-    // over the wrapped display lines in aiCacheLines).
-    LogState aiChatSel;
-    // F: 1 while the "Thinking" reasoning sections are expanded; collapsed (0)
-    // by default so the model's thinking never buries the answer. Toggled by
-    // clicking a reasoning header row in the transcript.
-    SignalInt aiThinkOpen;
+    // Transcript wrapping cache, expanded sections, selection, scroll and the
+    // "Thinking" toggle all live inside the ChatView component (see
+    // AiPanel.Transcript()); the shell only owns the message list.
     // D: token usage of the last reply (from the stream's usage object), shown
     // in the context-usage ring's tooltip; the ring itself measures the live
     // transcript against AiAgent.MaxContextChars().
@@ -518,9 +433,6 @@ partial class ZanIDE {
     string aiPendingCall;
     bool aiAutoExec;
     bool aiBuildForAi;
-    Button aiApproveBtn;
-    Button aiRejectBtn;
-    Button aiAutoBtn;
     // ui_check (batch-3 self-verification): a build kicked off for ui_check
     // sets aiUiPending, and once it links the target is launched under the Gui
     // UiDriver with the model's script; aiUiRunning then waits for the driven
@@ -618,4 +530,13 @@ partial class ZanIDE {
     OutputPanel outputPanel;
     ErrorsPanel errorsPanel;
     GitPanel gitPanel;
+    StructurePanel structurePanel;
+    StdlibPanel stdlibPanel;
+    ToolsPanel toolsPanel;
+    ExamplesPanel examplesPanel;
+    AiPanel aiPanel;
+        // 调试器的三块界面：底部面板、步进工具条、编辑器右上角的行内变量条。
+        DebugPanel dbgPanel;
+    DebugToolbar dbgToolbar;
+    DebugInlineVars dbgInline;
 }
