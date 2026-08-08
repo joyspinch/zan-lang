@@ -26,12 +26,13 @@ Capabilities advertised on `initialize`:
 | Signature help                   | `textDocument/signatureHelp`    |
 | Go to definition                 | `textDocument/definition`       |
 | Find references                  | `textDocument/references`       |
+| Rename                           | `textDocument/rename`           |
+| Workspace symbols                | `workspace/symbol`              |
 | Document symbols (outline)       | `textDocument/documentSymbol`   |
 | Code actions / quick fixes       | `textDocument/codeAction`       |
 | Commands                         | `workspace/executeCommand`      |
 
-Not yet implemented: `rename`, `workspace/symbol`, semantic tokens, inlay
-hints, incremental document sync.
+Not yet implemented: semantic tokens, inlay hints, incremental document sync.
 
 Diagnostics are produced by running the real compiler front-end
 (lexer → parser → binder → checker) and mapping each `zan_diag_t` entry to an
@@ -145,7 +146,7 @@ which would otherwise silently break reproducible builds.
 ```
 $ ctest --test-dir build --output-on-failure
 ...
-100% tests passed, 0 tests failed out of 47
+100% tests passed, 0 tests failed out of 456
 ```
 
 ## Testing without an editor

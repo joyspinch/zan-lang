@@ -12,44 +12,60 @@ Following aardio's model:
 
 - **No global state pollution** — each module is self-contained
 - **Lazy loading** — modules are loaded only when `using` imports them
-- **Bundled native deps** — DLLs/SOs live in `native/` subdirectories alongside the module
-- **Override-friendly** — users can shadow stdlib modules with local versions
-- **No package manager required** — files exist, they work
+- **Bundled native deps** — DLLs/SOs live in `drivers/<platform>/` directories next to the module, listed in a `driver.manifest` and bundled on `--publish`
+- **Package-extensible** — namespaces can also be supplied by installed packages (`.zan-packages/` + `zan.lock`, see §4)
+- **No package manager required for stdlib** — the stdlib ships with the compiler as source; files exist, they work
 
 ### 1.3 Platform Abstraction
 
-Platform-specific code is isolated in `native/` directories:
+There is no `native/{win,linux,macos}/` tree. Native driver binaries live in a
+`drivers/` subdirectory of the module that owns them, one subdirectory per
+target (named after the cross-compile toolchain, see `zan_driver_subdir` in
+`src/compiler/main.c`):
 
 ```
-System/Net/
-├── Http.zan                # Cross-platform Zan API
-├── Socket.zan              # Cross-platform Zan API
-└── native/
-    ├── win/
-    │   └── ws2_32.zan      # Windows socket bindings
-    ├── linux/
-    │   └── socket.zan      # Linux socket bindings
-    └── macos/
-        └── socket.zan      # macOS socket bindings
+stdlib/Gui/drivers/           # GUI native driver (zan_gui)
+├── driver.manifest           # one `-l` basename per line, e.g. "zan_gui"
+├── win-x64/                  # zan_gui.dll + import lib + WebView2 loader
+├── win-arm64/
+├── linux-x64/
+├── linux-arm64/
+├── macos-x64/
+└── macos-arm64/
 ```
 
-The cross-platform module (`Http.zan`) uses conditional compilation:
+`zanc` discovers every `drivers/driver.manifest` under the stdlib root at
+compile time (`zan_discover_drivers`, `src/compiler/main.c`); on `--publish`
+the listed libraries are copied next to the executable (default
+`--link-mode shared`; `--link-mode static` folds a driver into the exe where
+a static archive exists). `stdlib/SDL3/drivers/` works the same way
+(`zan_sdl3`).
+
+Cross-platform code is written with conditional compilation. The predefined
+symbols are `WINDOWS`, `WIN32`, `LINUX`, `MACOS`, `APPLE`, `ARM64`, `X86_64`,
+`RISCV64`, `WASM32`, `WASI`, `MUSL` and `ZAN` (defined in `src/compiler/
+main.c`); stdlib code tests them directly, e.g.:
 
 ```csharp
-using System.Runtime;
+using System;
 
-public class HttpClient {
-    public async Task<HttpResponse> Get(string url) {
-        #if PLATFORM_WINDOWS
-        return await WindowsHttp.Get(url);
-        #elif PLATFORM_LINUX
-        return await LinuxHttp.Get(url);
-        #elif PLATFORM_MACOS
-        return await MacosHttp.Get(url);
+class PlatformProbe {
+    static string Os() {
+        #if WINDOWS
+        return "windows";
+        #elif MACOS
+        return "macos";
+        #elif WASI
+        return "wasi";
+        #else
+        return "linux";
         #endif
     }
 }
 ```
+
+(`#if WINDOWS` / `#if LINUX` / `#if MACOS` are the forms actually used across
+`stdlib/`, e.g. `System/Interop.zan` and `Gui/Backend/Native.zan`.)
 
 ---
 
@@ -57,128 +73,123 @@ public class HttpClient {
 
 ```
 stdlib/
-├── System/
-│   ├── mod.zan                     # System namespace entry point
-│   ├── Console.zan                 # Console I/O
-│   ├── Math.zan                    # Math functions
-│   ├── String.zan                  # String type extensions
-│   ├── Convert.zan                 # Type conversions
-│   ├── Environment.zan             # Environment variables, platform info
-│   ├── DateTime.zan                # Date and time
-│   ├── Guid.zan                    # UUID generation
+├── System/                          # namespace System
+│   ├── ConsoleColor.zan             # ConsoleColor enum
+│   ├── DateTime.zan                 # Date and time
+│   ├── Guid.zan                     # UUID generation
+│   ├── Random.zan                   # Random numbers
+│   ├── TimeSpan.zan                 # Time span
+│   ├── Interop.zan                  # FFI helpers ([DllImport] wrappers)
+│   ├── NativeMemory.zan             # Low-level memory operations
+│   ├── Exception.zan                # Exception base types
+│   ├── Binding.zan                  # late binding / dynamic dispatch helpers
+│   ├── TaskJoin.zan                 # async task join helpers
+│   ├── ZanVersion.zan               # version constants (generated from .in)
+│   ├── ListExtensions.zan           # Remove / GetRange / Sort (extensions)
+│   ├── StringExtensions.zan         # String extension methods
 │   │
-│   ├── IO/
-│   │   ├── mod.zan                 # IO namespace entry
-│   │   ├── File.zan                # File read/write
-│   │   ├── Directory.zan           # Directory operations
-│   │   ├── Path.zan                # Path manipulation
-│   │   ├── Stream.zan              # Stream abstractions
-│   │   ├── BinaryReader.zan        # Binary reading
-│   │   ├── BinaryWriter.zan        # Binary writing
-│   │   ├── TextReader.zan          # Text reading
-│   │   ├── TextWriter.zan          # Text writing
-│   │   └── native/
-│   │       ├── win/
-│   │       │   └── fileapi.zan     # Win32 file API bindings
-│   │       └── unix/
-│   │           └── unistd.zan      # POSIX file API bindings
+│   ├── IO/                          # System.IO
+│   │   ├── File.zan                 # file read/write (static helpers)
+│   │   ├── Directory.zan            # directory operations
+│   │   ├── Path.zan                 # path manipulation
+│   │   ├── Stream.zan               # base stream class
+│   │   ├── StreamReader.zan         # text reading
+│   │   ├── StreamWriter.zan         # text writing
+│   │   ├── FileStream.zan           # file stream
+│   │   ├── MemoryStream.zan         # in-memory stream
+│   │   ├── ByteBuffer.zan           # growable byte buffer
+│   │   ├── FileInfo.zan / FileInfoEx.zan
+│   │   ├── PathEx.zan               # extended path helpers
+│   │   ├── DirectoryTree.zan        # directory tree enumeration
+│   │   ├── DirectoryWatcher.zan     # directory change watching
+│   │   ├── IniFile.zan              # INI parsing
+│   │   ├── Shortcut.zan             # .lnk / .desktop shortcuts
+│   │   ├── KnownFolders.zan         # OS known-folder lookup
+│   │   ├── MemoryMappedFile.zan     # memory-mapped files
+│   │   └── Compression/             # Deflate / GZip / Zip / Tar / Crc32
 │   │
-│   ├── Collections/
-│   │   ├── mod.zan
-│   │   ├── List.zan                # Dynamic array (COW)
-│   │   ├── Dict.zan                # Hash map
-│   │   ├── Set.zan                 # Hash set
-│   │   ├── Queue.zan               # FIFO queue
-│   │   ├── Stack.zan               # LIFO stack
-│   │   ├── SortedList.zan          # Sorted list (binary search)
-│   │   ├── SortedDict.zan          # Sorted map (red-black tree)
-│   │   └── LinkedList.zan          # Doubly linked list
+│   ├── Collections/                 # System.Collections
+│   │   ├── Generic/
+│   │   │   └── KeyValuePair.zan     # KVP(K, V) key/value pair
+│   │   ├── HashSet.zan              # hash set
+│   │   ├── LinkedList.zan           # doubly linked list
+│   │   ├── Queue.zan                # FIFO queue
+│   │   └── Stack.zan                # LIFO stack
 │   │
-│   ├── Text/
-│   │   ├── mod.zan
-│   │   ├── Encoding.zan            # UTF-8/16/32 encoding
-│   │   ├── StringBuilder.zan       # Mutable string builder
-│   │   ├── Regex.zan               # Regular expressions
-│   │   └── native/
-│   │       └── re2/                # RE2 regex engine (bundled)
+│   ├── Text/                        # System.Text
+│   │   ├── Encoding.zan             # UTF-8/16/32 encoding
+│   │   ├── TextTable.zan            # aligned text tables
+│   │   ├── Pinyin.zan               # pinyin conversion
+│   │   ├── Bm25Index.zan            # BM25 full-text index
+│   │   ├── Csv.zan                  # CSV read/write
+│   │   ├── Markdown.zan             # Markdown parsing
+│   │   ├── Template.zan             # text templates
+│   │   ├── FuzzyMatching.zan        # fuzzy string matching
+│   │   └── RegularExpressions/      # Match.zan, Regex.zan, RegexProgram.zan
 │   │
-│   ├── Net/
-│   │   ├── mod.zan
-│   │   ├── Http.zan                # HTTP client
-│   │   ├── HttpServer.zan          # Simple HTTP server
-│   │   ├── Socket.zan              # TCP/UDP sockets
-│   │   ├── Dns.zan                 # DNS resolution
-│   │   ├── Url.zan                 # URL parsing
-│   │   └── native/
-│   │       ├── win/
-│   │       │   ├── winhttp.zan     # WinHTTP bindings
-│   │       │   └── ws2_32.zan      # Winsock bindings
-│   │       └── unix/
-│   │           └── curl.zan        # libcurl bindings
+│   ├── Net/                         # System.Net
+│   │   ├── Net.zan / NetworkInterface.zan / ServerBanner.zan
+│   │   ├── Ping.zan                 # ICMP ping
+│   │   ├── Worker.zan               # background worker helpers
+│   │   ├── Http/                    # Client/ (HttpClient, CookieJar, SseSink),
+│   │   │                            # HttpServer.zan, HttpRequest.zan,
+│   │   │                            # HttpResponse.zan, Proxy/ (HttpForwarder)
+│   │   ├── Https/                   # HttpsServer.zan
+│   │   ├── Sockets/                 # Socket, TcpClient, TcpListener,
+│   │   │                            # UdpClient, AsyncSocket
+│   │   ├── Tls/                     # TlsStream.zan (+ drivers/)
+│   │   ├── WebSocket/               # WebSocket.zan (+ Secure/)
+│   │   ├── Sse/                     # server-sent events
+│   │   ├── Mqtt/                    # MqttClient, MqttBroker
+│   │   ├── Coap/                    # CoapClient
+│   │   ├── Modbus/                  # ModbusClient
+│   │   ├── Sip/                     # SipClient, SipMessage
+│   │   ├── Ntp/                     # NtpClient
+│   │   ├── WebDav/                  # WebDavClient
+│   │   └── Rpc/                     # RpcClient/RpcServer, codecs, transports
 │   │
-│   ├── Threading/
-│   │   ├── mod.zan
-│   │   ├── Task.zan                # Async task / future
-│   │   ├── Thread.zan              # OS thread
-│   │   ├── Mutex.zan               # Mutual exclusion lock
-│   │   ├── Semaphore.zan           # Counting semaphore
-│   │   ├── Channel.zan             # Typed message passing
-│   │   ├── Atomic.zan              # Atomic operations
-│   │   └── ThreadPool.zan          # Thread pool
+│   ├── Threading/                   # System.Threading
+│   │   ├── Threading.zan            # Thread, Mutex, Semaphore, Stopwatch,
+│   │   │                            # AtomicInt, SharedTable, Channel
+│   │   ├── AsyncGate.zan / AsyncRwLock.zan / BlockingQueue.zan
+│   │   ├── Gate.zan / SemaphoreSlim.zan / Timer.zan
 │   │
-│   ├── Diagnostics/
-│   │   ├── mod.zan
-│   │   ├── Stopwatch.zan           # High-resolution timer
-│   │   ├── Debug.zan               # Debug assertions
-│   │   └── Trace.zan               # Tracing/logging
+│   ├── Diagnostics/                 # Process, ProcessList, ProcessHost,
+│   │   │                            # ProcessControl, Privileges,
+│   │   │                            # ServerMetrics, Stopwatch
+│   ├── Json/                        # Json.zan, JsonValue.zan
+│   ├── Linq/                        # Enumerable.zan, Expression.zan
 │   │
-│   ├── Runtime/
-│   │   ├── mod.zan
-│   │   ├── ARC.zan                 # ARC runtime hooks
-│   │   ├── Memory.zan              # Low-level memory operations
-│   │   ├── Interop.zan             # FFI helpers
-│   │   ├── TypeInfo.zan            # Runtime type information
-│   │   └── Platform.zan            # Platform detection
-│   │
-│   └── Serialization/
-│       ├── mod.zan
-│       ├── Json.zan                # JSON serialization
-│       ├── Xml.zan                 # XML parsing
-│       └── Binary.zan              # Binary serialization
+│   └── (Automation, Compiler, Data/, Drawing/, Globalization, Input,
+│       Management, Resources, Scripting/, Security/, ServiceProcess,
+│       Web/, Windows/)
 │
-├── Graphics/
-│   ├── mod.zan
-│   ├── Canvas.zan                  # 2D drawing API
-│   ├── Color.zan                   # Color types
-│   ├── Image.zan                   # Image loading/saving
-│   ├── Font.zan                    # Font rendering
-│   └── native/
-│       ├── win/
-│       │   ├── d2d.zan             # Direct2D bindings
-│       │   └── gdi.zan             # GDI bindings
-│       └── unix/
-│           └── cairo.zan           # Cairo bindings
+├── Gui/                             # self-hosted GUI framework (Zan source)
+│   ├── App.zan / Types.zan / Theme.zan / Reactive.zan / Layout.zan
+│   ├── Render.zan / Event.zan / Text.zan / Icon.zan / Css.zan / Style*.zan
+│   ├── Backend/                     # Native.zan, UiDriver.zan, Win32Shell.zan
+│   ├── Component/                   # Chart, CodeEditor, DataTable, WebView, ...
+│   ├── Widget/                      # 60 controls (Button, Input, Label, ...)
+│   ├── Designer/ / Hmi/
+│   ├── drivers/                     # driver.manifest + win-x64/... (zan_gui)
+│   └── skins/                       # CSS theme skins (light, dark, ...)
 │
-├── UI/
-│   ├── mod.zan
-│   ├── Window.zan                  # Window management
-│   ├── Control.zan                 # Base UI control
-│   ├── Button.zan                  # Button control
-│   ├── TextBox.zan                 # Text input
-│   ├── Label.zan                   # Text label
-│   ├── Panel.zan                   # Container panel
-│   ├── Layout.zan                  # Layout managers
-│   └── native/
-│       ├── win/
-│       │   └── user32.zan          # Win32 UI bindings
-│       └── unix/
-│           └── gtk.zan             # GTK bindings
-│
+├── Game/                            # Arcade2D, Arpg, Board, Cards, Core,
+│   │                                # Foundation, Render, Scene
+├── Sdk/                             # Jd, Wechat
+├── SDL3/                            # Core, Event, Gpu, Native, Renderer,
+│   │                                # Texture, Window + drivers/ + native/
 └── Platform/
-    ├── Windows.zan                 # Win32 API (comprehensive)
-    ├── Posix.zan                   # POSIX API
-    └── Darwin.zan                  # macOS-specific API
+    └── Runtime.zan                  # platform runtime hooks (#if WINDOWS, ...)
 ```
+
+**Compiler builtins are not files.** `Console`, `Math`, `String`, `Convert`,
+`Environment`, `List<T>`, `Dict<K,V>`, `StringBuilder` and the array/string
+types are implemented inside the compiler (`src/compiler/builtin_api.c`), so
+there are no `System/Console.zan`, `System/Math.zan`, `System/String.zan`,
+`System/Convert.zan`, `System/Environment.zan`, `Collections/List.zan` or
+`Text/StringBuilder.zan` files. There are no `mod.zan` entry points anywhere:
+a namespace is simply a directory (see §4).
 
 ---
 
@@ -186,138 +197,123 @@ stdlib/
 
 ### 3.1 System.Console
 
+`Console` is a **compiler builtin** (`src/compiler/builtin_api.c`) — there is
+no `System/Console.zan` file. Its members are:
+
 ```csharp
-namespace System;
+// Output
+static void WriteLine(object value);
+static void Write(object value);
+static void PrintLine(object value);    // alias of WriteLine (same lowering)
 
-public static class Console {
-    // Output
-    public static void Write(string text);
-    public static void Write(object value);
-    public static void WriteLine(string text);
-    public static void WriteLine();
-    public static void Error(string text);
+// Input
+static string ReadLine();
+static int Read();                      // reads one character
+static int ReadKey([bool intercept]);   // waits for a keypress
 
-    // Input
-    public static string ReadLine();
-    public static int ReadKey();
-
-    // Formatting
-    public static void SetColor(ConsoleColor fg);
-    public static void SetColor(ConsoleColor fg, ConsoleColor bg);
-    public static void ResetColor();
-
-    // Cursor
-    public static void SetCursorPosition(int x, int y);
-    public static void Clear();
-}
+// Appearance
+static void Clear();
+static void ResetColor();
+static ConsoleColor ForegroundColor;    // get/set property
+static ConsoleColor BackgroundColor;    // get/set property
+static string Title;                    // get/set property (console window title)
 ```
+
+`ConsoleColor` comes from `stdlib/System/ConsoleColor.zan`. There is no
+`Error`, `SetCursorPosition` or `SetColor` member.
 
 ### 3.2 System.Math
 
+`Math` is also a **compiler builtin**. Its members are:
+
 ```csharp
-namespace System;
-
-public static class Math {
-    public const double PI = 3.14159265358979323846;
-    public const double E = 2.71828182845904523536;
-
-    public static double Sqrt(double x);
-    public static double Pow(double base, double exp);
-    public static double Sin(double x);
-    public static double Cos(double x);
-    public static double Tan(double x);
-    public static double Log(double x);
-    public static double Log2(double x);
-    public static double Log10(double x);
-    public static double Abs(double x);
-    public static int Abs(int x);
-    public static double Floor(double x);
-    public static double Ceil(double x);
-    public static double Round(double x, int digits = 0);
-    public static T Min<T>(T a, T b) where T : IComparable<T>;
-    public static T Max<T>(T a, T b) where T : IComparable<T>;
-    public static T Clamp<T>(T value, T min, T max) where T : IComparable<T>;
-}
+static double Abs(double value);
+static double Max(double a, double b);
+static double Min(double a, double b);
+static double Pow(double x, double y);
+static double Sqrt(double value);
+static double Round(double value);
+static double Floor(double value);
+static double Ceiling(double value);
 ```
+
+There are no `PI`/`E` constants, no trigonometry (`Sin`/`Cos`/`Tan`), no
+logarithms (`Log`/`Log2`/`Log10`), no `Clamp`, and no generic `Min`/`Max`.
 
 ### 3.3 System.Collections.List<T>
 
+`List<T>` is a **compiler builtin** (dynamic array with copy-on-write
+semantics; `src/compiler/builtin_api.c`). Its built-in members are:
+
 ```csharp
-namespace System.Collections;
+// Properties
+int Count { get; }
+T this[int index] { get; set; }         // indexer
 
-public class List<T> {
-    // Constructors
-    public List();
-    public List(int capacity);
-    public List(T[] items);
+// Modification
+void Add(T item);
+void AddRange(List<T> items);
+void Insert(int index, T item);
+void RemoveAt(int index);
+void Clear();
 
-    // Properties
-    public int Count { get; }
-    public int Capacity { get; }
+// Query
+bool Contains(T item);
+int IndexOf(T item);
+int LastIndexOf(T item);
 
-    // Indexer
-    public T this[int index] { get; set; }
-
-    // Modification
-    public void Add(T item);
-    public void AddRange(List<T> items);
-    public void Insert(int index, T item);
-    public bool Remove(T item);
-    public void RemoveAt(int index);
-    public void Clear();
-
-    // Query
-    public bool Contains(T item);
-    public int IndexOf(T item);
-    public T? Find(Func<T, bool> predicate);
-    public List<T> FindAll(Func<T, bool> predicate);
-    public bool Any(Func<T, bool> predicate);
-    public bool All(Func<T, bool> predicate);
-
-    // Transformation
-    public List<U> Map<U>(Func<T, U> transform);
-    public List<T> Where(Func<T, bool> predicate);
-    public T Aggregate<U>(U seed, Func<U, T, U> func);
-    public void Sort();
-    public void Sort(Comparison<T> comparison);
-    public List<T> Slice(int start, int count);
-    public T[] ToArray();
-
-    // LINQ-style
-    public T First();
-    public T? FirstOrDefault();
-    public T Last();
-    public int Sum() where T : int;
-    public List<T> OrderBy<K>(Func<T, K> keySelector) where K : IComparable<K>;
-    public List<T> Distinct();
-}
+// Order
+void Reverse();
 ```
+
+There is no `Capacity`, `Find`, `FindAll`, `Map`, `Aggregate`, `ToArray` or
+`Slice` on `List<T>` itself.
+
+**Extensions.** Additional operations come from extension methods:
+
+- `System.ListExtensions` (`stdlib/System/ListExtensions.zan`):
+  `Remove(item)`, `GetRange(start, count)`, and `Sort()` overloads for
+  `List<int>`, `List<double>` and `List<string>`.
+- `System.Linq.Enumerable` (`stdlib/System/Linq/Enumerable.zan`, see §3.6):
+  `Where`, `Select`, `SelectMany`, `Any`, `All`, `Count`, `First(OrDefault)`,
+  `Last(OrDefault)`, `Single(OrDefault)`, `Take`, `Skip`, `Reverse`,
+  `OrderBy*`, `GroupBy`, `Contains`, `Distinct`, `In`, `Like`, `Aggregate`,
+  `Sum`, `Min`, `Max`, `Average`, `ToList`.
+
+So `list.Remove(x)`, `list.Sort()` and `list.Where(...)` resolve to the
+extensions, not to built-in members (this is why `ListExtensions`/`Enumerable`
+need a `using` — see §3.6).
 
 ### 3.4 System.IO.File
 
-```csharp
-namespace System.IO;
+`File` is a static helper class in `stdlib/System/IO/File.zan`:
 
-public static class File {
-    public static string ReadAllText(string path);
-    public static byte[] ReadAllBytes(string path);
-    public static string[] ReadAllLines(string path);
-    public static void WriteAllText(string path, string content);
-    public static void WriteAllBytes(string path, byte[] data);
-    public static void AppendAllText(string path, string content);
-    public static bool Exists(string path);
-    public static void Delete(string path);
-    public static void Copy(string source, string dest);
-    public static void Move(string source, string dest);
-    public static long GetSize(string path);
-    public static Stream Open(string path, FileMode mode);
-}
+```csharp
+static string ReadAllText(string path);
+static string ReadAllTextAsync(string path);   // synchronous wrapper
+static byte[] ReadAllBytes(string path);
+static string[] ReadAllLines(string path);
+static void WriteAllText(string path, string content);
+static void WriteAllTextAsync(string path, string content);  // synchronous wrapper
+static void WriteAllBytes(string path, byte[] data);
+static void AppendAllText(string path, string content);
+static void AppendAllTextAsync(string path, string content); // synchronous wrapper
+static bool Exists(string path);
+static void Delete(string path);
+static void Copy(string source, string dest);
+static void Move(string source, string dest);
+static long GetSize(string path);
 ```
+
+There is no `Stream Open(path, FileMode)` — there is no `FileMode` enum; use
+`FileStream` (`System.IO`) for stream-style access. The `*Async` variants are
+plain synchronous wrappers around the sync methods (no actual `async` IO), as
+noted in their doc comments.
 
 **Error model (C#-aligned).** Failures throw instead of silently returning
 empty/default values:
 
-- `ReadAllText` / `ReadAllLines` / `ReadBytes` / `GetSize` / `Copy` (source)
+- `ReadAllText` / `ReadAllLines` / `ReadAllBytes` / `GetSize` / `Copy` (source)
   throw `FileNotFoundException` when the file cannot be opened.
 - `WriteAllText` / `WriteAllLines` / `AppendAllText` / `Copy` (destination)
   throw `IOException` when the file cannot be opened for writing.
@@ -333,30 +329,65 @@ the process with `cannot read file` / `cannot write file` on failure.
 ### 3.5 System.Net.Http
 
 ```csharp
-namespace System.Net;
+namespace System.Net.Http;
 
-public class HttpClient {
-    public HttpClient();
-    public HttpClient(string baseUrl);
+class HttpClient {                       // stdlib/System/Net/Http/Client/HttpClient.zan
+    HttpClient(string host, int port);   // host:port base; no base-URL form
 
-    public async Task<HttpResponse> Get(string url);
-    public async Task<HttpResponse> Post(string url, string body);
-    public async Task<HttpResponse> Put(string url, string body);
-    public async Task<HttpResponse> Delete(string url);
+    // configuration (fluent, return this)
+    HttpClient UseTls();                 // HTTPS client
+    HttpClient DisableTlsVerify();       // self-signed / dev certificates
+    HttpClient SetClientCertificate(string certFile, string keyFile);
+    HttpClient SetHeader(string name, string value);   // default request header
+    HttpClient SetTimeout(int milliseconds);
+    HttpClient PinPublicKey(string spkiSha256Base64);
+    HttpClient UseCookies();
 
-    public void SetHeader(string name, string value);
-    public void SetTimeout(int milliseconds);
+    // requests — verb helpers return the body string only
+    async HttpResponse SendAsync(string method, string path, string body);
+    async string GetAsync(string path);
+    async string PostAsync(string path, string body);
+    async string PutAsync(string path, string body);
+    async string DeleteAsync(string path);
+
+    // static one-shot helpers (no client instance needed)
+    static async string GetAsync(string host, int port, string path);
+    static async string PostAsync(string host, int port, string path, string body);
+    static async string GetHttpsAsync(string host, int port, string path);
 }
 
-public class HttpResponse {
-    public int StatusCode { get; }
-    public string StatusText { get; }
-    public string Body { get; }
-    public byte[] BodyBytes { get; }
-    public Dict<string, string> Headers { get; }
-    public bool IsSuccess { get; }
+class HttpResponse {                     // builder + parser, no public properties
+    // state lives in plain fields (readable within the System.Net.Http
+    // namespace): statusCode, statusText, body, bodyBytes, bodyBytesLen,
+    // contentType, headers, keepAlive
+
+    // static factories
+    static HttpResponse Ok(string body);
+    static HttpResponse Json(string jsonBody);
+    static HttpResponse Text(string text);
+    static HttpResponse Bytes(byte[] data, int len, string ct);
+    static HttpResponse Redirect(string url);
+    static HttpResponse NotFound();
+    static HttpResponse ServerError(string message);
+    static HttpResponse WithStatus(int code, string text, string body);
+    static HttpResponse Parse(string raw);
+
+    // fluent setters (return this)
+    HttpResponse SetHeader(string name, string value);
+    HttpResponse SetContentType(string ct);
+    HttpResponse SetKeepAlive(bool keep);
 }
 ```
+
+`HttpResponse` has **no public properties** — `StatusCode`, `StatusText`,
+`Body`, `Headers`, `IsSuccess` etc. do not exist as accessors. Its state is
+held in plain fields (visible inside the `System.Net.Http` namespace, so
+`HttpClient` reads `resp.body` directly) and is normally populated through
+the static factories, or from a raw wire response via `HttpResponse.Parse`.
+The verb helpers `GetAsync`/`PostAsync`/`PutAsync`/`DeleteAsync` return the
+body string only; use `SendAsync(method, path, body)` when you need the
+parsed `HttpResponse` (`statusCode` / `statusText` / headers — see "Status
+codes" below).
 
 **Error model (C#-aligned).** Connection failures throw instead of silently
 returning empty responses:
@@ -537,50 +568,70 @@ Differences from C# (by design or pending compiler work — see
 
 ### 4.1 Search Order
 
-When the compiler encounters `using System.IO`:
+When the compiler encounters `using System.IO`, it **auto-includes every
+`*.zan` file in the `System/IO/` directory** of the stdlib root
+(`scan_using_tokens` → `auto_include_namespace` → `glob_stdlib_dir` in
+`src/compiler/main.c`):
 
-1. **Project local**: `<project_root>/lib/System/IO.zan` or `<project_root>/lib/System/IO/mod.zan`
-2. **Standard library**: `<stdlib_path>/System/IO.zan` or `<stdlib_path>/System/IO/mod.zan`
+1. All `*.zan` files directly under `<stdlib_path>/System/IO/` (one level —
+   subdirectories are separate namespaces that need their own `using`).
+2. Any additional `*.zan` files found under the same namespace in installed
+   packages (`.zan-packages/`, resolved via `zan_pkg_find_namespace`).
 
-Project-local modules take priority (allowing stdlib overrides).
+There is **no `<project_root>/lib/` override** and no `mod.zan` entry point:
+a `using` maps directly to a directory glob. `using System;` imports the
+compiler/runtime core names (builtin types like `Console`, `List<T>`) rather
+than a directory.
 
 ### 4.2 Module Entry Point
 
-A module can be either:
-- **Single file**: `System/IO.zan` — the file IS the module
-- **Directory**: `System/IO/mod.zan` — `mod.zan` is the entry point, other `.zan` files in the directory are sub-modules
+There is no entry-point file. A namespace is a directory; every `.zan` file in
+it is compiled together when the namespace is `using`-ed, and the file names
+are irrelevant to the API surface (all types in the directory are visible).
 
-### 4.3 Native Dependency Resolution
+### 4.3 Native Driver Resolution
 
-When a module has a `native/` subdirectory:
+Native binaries are owned by the module that uses them, in a `drivers/`
+subdirectory:
 
-1. Compiler checks target platform
-2. Selects appropriate subdirectory (`win/`, `linux/`, `macos/`)
-3. Compiles native binding `.zan` files
-4. Links native libraries (`.dll`, `.so`, `.dylib`) at link time
-5. Copies native libraries to output directory
+1. `<module>/drivers/driver.manifest` lists one `-l` basename per line
+   (e.g. `zan_gui`, `zan_sdl3`); blank lines and `#` comments are ignored.
+2. `zan_discover_drivers` (`src/compiler/main.c`) scans the stdlib root for
+   every manifest and indexes the per-target driver directories
+   (`win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `linux-riscv64`,
+   `macos-x64`, `macos-arm64` — matching the cross-compile toolchain names).
+3. Native code is called from Zan through `[DllImport]`/`extern` declarations
+   (e.g. `stdlib/Gui/Backend/Win32Shell.zan`); the driver DLL/SO is loaded at
+   runtime.
+4. On `--publish`, the manifest's libraries are copied next to the output
+   executable (`--link-mode shared`, the default) or folded in where a static
+   archive exists (`--link-mode static`).
 
 ### 4.4 Conditional Compilation
 
-Platform-specific code uses `#if` directives:
+Platform-specific code uses `#if` directives with the predefined symbols
+`WINDOWS`, `WIN32`, `LINUX`, `MACOS`, `APPLE`, `ARM64`, `X86_64`, `RISCV64`,
+`WASM32`, `WASI`, `MUSL` and `ZAN` (defined in `src/compiler/main.c`; the
+stdlib itself is written against these, e.g. `#if WINDOWS`):
 
 ```csharp
-#if PLATFORM_WINDOWS
-    [DllImport("kernel32.dll")]
+#if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
     static extern int GetCurrentProcessId();
-#elif PLATFORM_LINUX
-    [CImport("unistd.h")]
+#elif LINUX
+    [DllImport("crt")]
     static extern int getpid();
-#elif PLATFORM_MACOS
-    [CImport("unistd.h")]
+#elif MACOS
+    [DllImport("crt")]
     static extern int getpid();
 #endif
 ```
 
-Predefined symbols:
-- `PLATFORM_WINDOWS`, `PLATFORM_LINUX`, `PLATFORM_MACOS`
-- `ARCH_X64`, `ARCH_ARM64`
-- `DEBUG`, `RELEASE`
+Note the `[DllImport]` conventions used across the stdlib: the library name
+has **no `.dll`/`.so` suffix** (`[DllImport("kernel32")]`, not
+`"kernel32.dll"`; the C runtime is imported as `[DllImport("crt")]`), and
+renamed functions spell out the exported symbol with `EntryPoint = "..."`.
+There is no `[CImport("unistd.h")]` attribute.
 
 ---
 
@@ -624,4 +675,8 @@ public static string ReadAllText(string path) {
 }
 ```
 
-The `zan doc` command generates HTML documentation from these comments.
+The **`zandoc`** tool generates documentation from these comments. It is a
+standalone program written in Zan (`src/doc/zandoc.zan`, built to
+`build/zandoc.exe` by CMake): it extracts the `/// <summary>` / `/// <returns>`
+comments and the declarations they precede, and renders them as Markdown or
+HTML. There is no `zan doc` compiler subcommand.

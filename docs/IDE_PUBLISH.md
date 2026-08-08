@@ -3,8 +3,12 @@
 The IDE is released as a **self-contained folder** at the canonical location:
 
 ```
-d:\project\zan-lang\dist
+d:\project\zan-lang\dist\win-x64
 ```
+
+Other platforms get their own `dist\<platform>` (e.g. `dist\linux-x64`) when
+their builds exist; the publish scripts only rebuild the current platform's
+folder.
 
 This is the single, clean release output. It contains **only** the files an end
 user needs — nothing else should be dropped here. Re-run the publish script to
@@ -30,7 +34,7 @@ The script (`scripts/publish_ide.ps1`):
 | Path            | Purpose                                                              |
 | --------------- | -------------------------------------------------------------------- |
 | `ZanIDE.exe`    | The IDE.                                                             |
-| `SDL3.dll`      | SDL3 runtime the IDE window uses; must sit next to `ZanIDE.exe`.     |
+| *(none)*        | No `SDL3.dll` ships: SDL3 is statically linked into `ZanIDE.exe` (see `scripts/build_ide.ps1` / `scripts/publish_ide.ps1`). |
 | `toolchain\`    | The compiler and everything it links with, as siblings: `zanc.exe`, `zan-lsp.exe`, `zan-dap.exe`, `zanfmt`/`zandoc`, the bundled linker (`ld.exe` + `mingw\` MinGW-w64 runtime), cross sysroots (`linux-musl\` …), runtime objects (`zanrt_io*`, `zanrt_sync*`), `zan_gui.lib`, and `debugger\bin\gdb.exe`. |
 | `stdlib\`       | Standard library sources. `zanc` auto-includes what it needs.        |
 | `examples\`     | Sample programs for the IDE's Examples pane (optional).              |

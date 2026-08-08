@@ -1,5 +1,8 @@
 ﻿# Zan Security Specification
 
+> ⚠️ **本文档部分章节描述的是设计目标而非当前实现，且引用了不存在的 API。**
+> 2026-08-08 审计后修正如下，未逐节重写的部分请勿当作现状引用。
+
 ## 1. Overview
 
 Zan is designed for **memory safety by default** with an explicit `unsafe` escape hatch. The compiler enforces safety guarantees at compile time wherever possible, with minimal runtime checks where necessary.
@@ -33,16 +36,13 @@ All array and collection access is bounds-checked:
 
 ```csharp
 var arr = new int[] { 1, 2, 3 };
-int x = arr[5];    // Runtime error: IndexOutOfRangeException
+int x = arr[5];    // Runtime hard error: "array index out of bounds"
+                   // (there is no IndexOutOfRangeException type; the guard
+                   // prints the source location and aborts with status 70)
 ```
 
-In performance-critical code, unchecked access is available via `unsafe`:
-
-```csharp
-unsafe {
-    int x = arr.UnsafeGet(5);   // No bounds check — developer responsibility
-}
-```
+There is no unchecked access path: `unsafe` blocks are a no-op scope and there
+is no `UnsafeGet` method (see §3).
 
 ### 2.3 Null Safety
 
@@ -66,34 +66,23 @@ int safeLen = name?.Length ?? 0;
 
 ### 2.4 Integer Overflow
 
-By default, integer arithmetic wraps on overflow (like C#/Go). In debug builds, overflow is checked:
-
-```csharp
-int x = int.MaxValue;
-x++;                    // Debug: OverflowException
-                        // Release: wraps to int.MinValue
-
-// Explicit checked/unchecked (future feature)
-checked {
-    x++;                // Always throws on overflow
-}
-```
+Integer arithmetic wraps on overflow (two's complement) in every build
+configuration — there is no overflow checking. There is no `int.MaxValue`
+constant. The `checked`/`unchecked` keywords are accepted for C# source
+compatibility but are **no-ops** (`src/compiler/parser.c`: "Overflow checking
+is always off in this runtime (wrapping semantics), so both forms lower to a
+plain expression"); `checked(x + 1)` wraps exactly like `x + 1`
+(`tests/conformance/cs_b14_checked.zan`).
 
 ### 2.5 Uninitialized Variables
 
-The compiler enforces definite assignment:
+There is no definite-assignment analysis. An unassigned local simply reads as
+its zero value (`0` / `false` / `""` for numeric, bool and string locals);
+using it before assignment does not error.
 
 ```csharp
 int x;
-Console.WriteLine(x);  // Compile error: use of uninitialized variable 'x'
-
-int y;
-if (condition) {
-    y = 42;
-} else {
-    y = 0;
-}
-Console.WriteLine(y);  // OK — all paths assign y
+Console.WriteLine(x);  // prints 0 (no compile error)
 ```
 
 ---
@@ -102,59 +91,50 @@ Console.WriteLine(y);  // OK — all paths assign y
 
 ### 3.1 Unsafe Scope
 
-The `unsafe` keyword creates a scope where safety checks are relaxed:
+The language has **no pointer types** — the only raw-address type is `nint`
+(an integer of pointer width). Heap access goes through the `NativeMemory`
+facade (`stdlib/System/NativeMemory.zan`): `Alloc`/`Free`/`Copy`/`Fill`/
+`Compare`/`GetString`/`PutString`/`Crc32`. The old `NativeAlloc`/`NativeFree`/
+`GetRawPointer` names do not exist.
 
 ```csharp
 unsafe {
-    // Allowed in unsafe blocks:
-    nint ptr = NativeAlloc(1024);       // Raw pointer allocation
-    byte* data = (byte*)ptr;             // Pointer casting
-    data[0] = 0xFF;                      // Pointer arithmetic
-    NativeFree(ptr);                     // Manual deallocation
-
-    // Calling unsafe functions
-    UnsafeSort(array.GetRawPointer(), array.Count);
+    // `unsafe { }` is accepted but is a no-op scope — everything is treated
+    // as "unsafe" already (src/compiler/parser.c).
+    nint buf = NativeMemory.Alloc(1024);     // raw allocation
+    NativeMemory.Fill(buf, 0, 1024);         // zero it
+    NativeMemory.PutString(buf, 0, "hi", 2); // write bytes
+    string s = NativeMemory.GetString(buf, 0, 2);
+    NativeMemory.Free(buf);                  // manual deallocation
 }
 ```
 
+There is no pointer arithmetic, no `byte*` syntax, and no pointer casting.
+
 ### 3.2 Unsafe Functions
 
-Functions that require unsafe context must be marked:
+The `unsafe` modifier is accepted on functions, but — like `unsafe { }`
+blocks — it is a no-op: there is no separate unsafe context to require or
+enforce, and no raw pointer types to expose (`parser.c`: *everything is
+"unsafe" here*).
 
 ```csharp
 unsafe static void FastCopy(nint dst, nint src, int size) {
-    byte* d = (byte*)dst;
-    byte* s = (byte*)src;
-    for (int i = 0; i < size; i++) {
-        d[i] = s[i];
-    }
-}
-
-// Can only be called from unsafe context
-unsafe {
-    FastCopy(dest, source, 1024);
+    NativeMemory.Copy(dst, src, size);
 }
 ```
 
 ### 3.3 Unsafe Restrictions
 
-Even in `unsafe` blocks, certain operations are still prevented:
+The language-wide rules that apply regardless of `unsafe`:
+
 - Cannot modify ARC refcount directly
 - Cannot access private fields of other classes
-- Cannot bypass type system (no reinterpret_cast between unrelated types)
+- Cannot bypass the type system (no reinterpret_cast between unrelated types)
 - Cannot disable the scheduler or corrupt task state
 
-### 3.4 Module-Level Unsafe
-
-Modules that extensively use unsafe code can declare themselves unsafe:
-
-```csharp
-#[unsafe_allow("ptr", "native")]
-namespace System.Runtime.Internal;
-
-// All functions in this module can use unsafe operations
-// without individual unsafe blocks
-```
+(There is no module-level `#[unsafe_allow]` attribute; module-level unsafe
+declarations do not exist.)
 
 ---
 
@@ -174,45 +154,40 @@ static extern void ProcessString(string text);
 
 // UNSAFE: returning a native string requires explicit marshaling
 [DllImport("native.dll")]
-static extern unsafe nint GetString();
+static extern nint GetString();
 
-unsafe {
-    nint ptr = GetString();
-    string result = Marshal.PtrToString(ptr);
-    Marshal.FreeNative(ptr);    // Developer must know ownership
-}
+// There is no Marshal class (no Marshal.PtrToString / Marshal.FreeNative).
+// Copy the bytes out with NativeMemory.GetString(ptr, 0, len) — you must know
+// the byte length — and call NativeMemory.Free(ptr) if ownership is yours.
+nint ptr = GetString();
+string result = NativeMemory.GetString(ptr, 0, len);
 ```
 
 ### 4.2 Callback Safety
 
 When passing managed callbacks to native code:
-- Callback delegate is pinned for the duration of the native call
-- If callback outlives the call, developer must explicitly pin:
-
-```csharp
-var callback = new CompareFunc((a, b) => { ... });
-var handle = GCHandle.Pin(callback);    // Prevent GC/ARC collection
-
-NativeSort(data, count, callback);
-
-handle.Free();                           // Unpin when done
-```
+- A delegate is marshaled as a plain C function pointer
+- There is no `GCHandle`/GC pinning — keep a managed reference to the callback
+  (ARC) alive for the duration of the native call; if the native side stores
+  the callback beyond the call, you must ensure a managed reference outlives
+  it, or the delegate may be freed
 
 ### 4.3 Struct Layout Verification
 
-`[repr("C")]` structs are verified at compile time:
-- Field alignment matches C ABI
-- No managed references in repr(C) structs (use `nint` instead)
-- Size matches expected C struct size (optional `[StructSize(N)]` assertion)
+C-compatible layout is controlled with `[StructLayout]` (Sequential or
+Explicit) plus `[FieldOffset(n)]` — there is no `[repr("C")]` attribute and no
+`[StructSize(N)]` assertion.
 
 ```csharp
-[repr("C")]
-[StructSize(16)]    // Compile error if actual size != 16
+[StructLayout(Sequential)]   // default; plain structs already match C layout
 struct POINT {
     public long X;
     public long Y;
 }
 ```
+
+Note: a struct containing `char` fields or 64-bit enums does **not** match the
+C layout (see `docs/ABI.md` §3.2).
 
 ---
 
@@ -220,31 +195,17 @@ struct POINT {
 
 ### 5.1 Data Race Prevention
 
-The compiler warns about potential data races:
+There is **no static data-race analysis** and no `ZAN2001`-style warning: the
+compiler does not analyze sharing across tasks. Synchronizing access to shared
+mutable state is the developer's responsibility. The shipped primitive is the
+static, handle-style `Mutex` (`stdlib/System/Threading/Threading.zan`):
 
 ```csharp
-var shared = new List<int>();
-
-Task.Run(() => {
-    shared.Add(1);      // WARNING ZAN2001: potential data race on 'shared'
-});
-
-Task.Run(() => {
-    shared.Add(2);      // WARNING ZAN2001: potential data race on 'shared'
-});
-```
-
-**Fix:** Use synchronization:
-
-```csharp
-var mutex = new Mutex();
-var shared = new List<int>();
-
-Task.Run(async () => {
-    using (await mutex.Lock()) {
-        shared.Add(1);  // OK — mutex protected
-    }
-});
+nint mtx = Mutex.Create();
+Mutex.Lock(mtx);
+shared.Add(1);          // protected
+Mutex.Unlock(mtx);
+Mutex.Destroy(mtx);     // when no longer needed
 ```
 
 ### 5.2 Channel Safety
@@ -265,42 +226,11 @@ Reference counting uses atomic operations:
 
 ## 6. Compiler Security Checks
 
-### 6.1 Error Codes
-
-| Code | Category | Description |
-|------|----------|-------------|
-| ZAN1001 | Memory | Use of uninitialized variable |
-| ZAN1002 | Memory | Potential null dereference |
-| ZAN1003 | Memory | Potential use-after-free (weak ref without check) |
-| ZAN1004 | Memory | Potential reference cycle (strong refs both ways) |
-| ZAN1005 | Memory | Buffer size mismatch in FFI call |
-| ZAN2001 | Concurrency | Potential data race on shared mutable state |
-| ZAN2002 | Concurrency | Non-sendable type in task closure |
-| ZAN2003 | Concurrency | Potential deadlock (lock ordering) |
-| ZAN3001 | Type | Unsafe cast without explicit conversion |
-| ZAN3002 | Type | Lossy numeric conversion |
-| ZAN3003 | Type | Implicit nullable-to-non-nullable conversion |
-| ZAN4001 | FFI | Missing null check on native return value |
-| ZAN4002 | FFI | String lifetime exceeds native call |
-| ZAN4003 | FFI | Managed reference in repr(C) struct |
-
-### 6.2 Warning Levels
-
-```bash
-zan build --warn-level=0    # Errors only
-zan build --warn-level=1    # + important warnings (default)
-zan build --warn-level=2    # + informational warnings
-zan build --warn-level=3    # All warnings (pedantic)
-zan build --warnings-as-errors  # Treat all warnings as errors
-```
-
-### 6.3 Suppressing Warnings
-
-```csharp
-#pragma warning disable ZAN2001
-var shared = state;         // I know what I'm doing
-#pragma warning restore ZAN2001
-```
+There are **no numbered diagnostic codes** (no `ZAN1001`/`ZAN2001` family), no
+`--warn-level` flag, and no `#pragma warning` directives: none of the tables
+in the original draft of this section exist. Diagnostics are plain
+`file:line:col: message` compiler messages, and the binary is **`zanc`** —
+there is no `zan build` subcommand.
 
 ---
 
@@ -312,7 +242,7 @@ When using external libraries:
 - Source-based distribution (auditable)
 - SHA256 hash verification for downloaded sources
 - No binary-only dependencies in safe mode
-- Dependency tree is explicit in `project.zan`
+- Dependency tree is explicit in `zan.proj`
 
 ### 7.2 Sandboxing
 
@@ -338,12 +268,12 @@ project MyApp {
 
 ## 8. Security Checklist for Library Authors
 
-- [ ] Mark all functions that use raw pointers as `unsafe`
+- [ ] Mark all functions that use raw pointers as `unsafe` (`nint`-based APIs)
 - [ ] Validate all input sizes before native calls
 - [ ] Use `weak` references to break potential cycles
-- [ ] Pin callbacks that outlive native call duration
-- [ ] Verify `[repr("C")]` struct sizes match native expectations
+- [ ] Keep managed references alive for callbacks that outlive native call duration
+- [ ] Verify `[StructLayout]` struct sizes match native expectations (mind the `char`/enum layout exception in `docs/ABI.md`)
 - [ ] Document ownership semantics for native resources
-- [ ] Provide safe wrappers around unsafe operations
-- [ ] Test with address sanitizer (`zan build --sanitize=address`)
+- [ ] Provide safe wrappers around `NativeMemory` operations
+- [ ] Run the runtime/leak checks: compile with `--check-leaks` and run the leakcheck test family (`scripts/test.ps1`)
 

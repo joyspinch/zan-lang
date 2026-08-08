@@ -17,7 +17,7 @@ This file is the source of truth for target support. Keep it in sync with:
 
 ## 1. Target table (`--list-targets`)
 
-Nine targets are currently declared in `crosscomp.c`:
+Ten targets are currently declared in `crosscomp.c` (`s_targets[]`):
 
 | Name          | Triple                          | Notes                    |
 |---------------|---------------------------------|--------------------------|
@@ -29,11 +29,12 @@ Nine targets are currently declared in `crosscomp.c`:
 | `macos-x64`   | `x86_64-apple-macosx`           | macOS Intel              |
 | `macos-arm64` | `aarch64-apple-macosx`          | macOS Apple Silicon      |
 | `wasm32`      | `wasm32-unknown-wasi`           | WebAssembly (WASI)       |
-| `riscv64`     | `riscv64-unknown-linux-gnu`     | RISC-V 64-bit Linux      |
+| `linux-riscv64` | `riscv64-unknown-linux-musl`   | RISC-V 64-bit Linux (musl, static) |
+| `riscv64`     | `riscv64-unknown-linux-musl`    | RISC-V 64-bit Linux (alias of `linux-riscv64`) |
 
 Being listed here means the triple parses and platform macros
 (`WINDOWS`/`LINUX`/`MACOS`) plus arch macros (`ARM64`/`X86_64`) are defined for the
-target. All nine now also have a working link path — see §2 for the per-target
+target. All ten now also have a working link path — see §2 for the per-target
 runtime restrictions that apply when cross-compiling.
 
 ---
@@ -51,7 +52,7 @@ the declared targets fall there today.
 
 | Target                     | Native link path                                                     |
 |----------------------------|----------------------------------------------------------------------|
-| `win-x64` / `win-arm64`    | Bundled `ld.lld` + MinGW-w64 / llvm-mingw runtime (`<zanc>/win-<arch>/mingw`), `*-w64-windows-gnu` ABI. |
+| `win-x64` / `win-arm64`    | Bundled GNU `ld.exe` (`<zanc>/ld.exe`; `ld.lld` is only a fallback) + MinGW-w64 runtime (`<zanc>/mingw`), `*-w64-windows-gnu` ABI. `win-<arch>/mingw` is for cross-compiling only. |
 | `linux-x64` / `linux-arm64`| Host toolchain / bundled musl (see cross below).                     |
 | `macos-x64` / `macos-arm64`| Host toolchain on the matching Mac (Cocoa GUI, threads, async all available). |
 
@@ -63,20 +64,22 @@ because it is the same code path a normal `zanc` invocation on that OS takes.
 | Cross target                       | How it links (from any host)                                       | Restrictions when cross-compiling |
 |------------------------------------|--------------------------------------------------------------------|-----------------------------------|
 | `linux-x64` / `linux-musl` / `linux-arm64` / `riscv64` | `ld.lld -static` + bundled musl sysroot `<zanc>/{linux-musl,linux-arm64,linux-riscv64}` → a dependency-free static ELF. | **None** — async-socket (`zanrt_io.o`) *and* the sync runtime (`zanrt_sync.o`: `AtomicInt`/`SharedTable`) are both linked in. "Build on Windows/macOS → upload → run on Linux" just works. |
-| `win-x64` / `win-arm64`            | `ld.lld` MinGW driver + bundled `win-<arch>/mingw/lib`; PE output. | **No async-socket**, and **no `AtomicInt`/`SharedTable`** (sync runtime is Linux-only when cross-compiling). Ordinary console/GUI programs link fine. |
+| `win-x64` / `win-arm64`            | `ld.lld` MinGW driver + bundled `win-<arch>/mingw/lib`; PE output. | Async-socket (`zanrt_io.o` / `zanrt_io_mt.o`), sync runtime (`zanrt_sync.o`), timer (`zanrt_timer.o`) and embed-API (`zan_embed_api.o`) objects are staged at `win-<arch>/` and linked on demand — no remaining cross restriction. Objects are maintained by `scripts/build_win_rt.sh` and refreshed by the drivers workflow. |
 | `macos-x64` / `macos-arm64`        | `ld64.lld -arch <arch> -platform_version macos 11.0` + bundled `macos/libSystem.tbd` (MIT symbol stub; no Apple SDK redistributed) + the Mach-O runtime objects in `macos/<arch>/` for async/atomics; Mach-O output linking `-lSystem` plus, for GUI programs, the prebuilt `stdlib/Gui/drivers/macos-<arch>/libzan_gui.dylib` (`@rpath` install name; its own Cocoa/WebKit dependencies bind on the target Mac, so no framework stubs are needed here). arm64 output is ad-hoc code-signed by the linker (`LC_CODE_SIGNATURE`, `CS_ADHOC|CS_LINKER_SIGNED`), which is what Apple Silicon requires to execute it at all. | Async-socket, `AtomicInt`/`SharedTable` and Cocoa GUI all link. Both `macos-arm64` and `macos-x64` GUI dylibs are committed. Nothing here has been run on a real Mac — verification stops at "links + correct Mach-O/signature structure". Developer ID signing/notarization is a separate, not-yet-implemented step needed only for distribution. |
 | `wasm32` (WASI)                    | `wasm-ld` + bundled wasm32 sysroot (`crt1.o`); WASI command module. | **No async-socket**; single-threaded WASI model. |
 
 Key properties:
 - **Linux is the universal cross target** — full-featured and self-contained from
   any host.
-- **Windows cross is the restricted one**: no async-socket and no atomics/shared-
-  table. For a full-feature Windows program, build **natively on Windows**.
+- **Windows cross used to be the restricted one**; the committed `win-<arch>/`
+  runtime objects (async-socket, sync, timer, embed) now link on demand, so no
+  cross restriction remains — building natively on Windows is still the
+  fastest path for local iteration.
 - **macOS cross is link-complete for both architectures** (console, async, atomics,
   Cocoa GUI), but only link-verified — no real-Mac run has happened yet.
 - The sync runtime (`AtomicInt`/`SharedTable`) is available natively everywhere and,
-  when cross-compiling, for **Linux and macOS** targets (`main.c` errors early on the
-  remaining ones).
+  when cross-compiling, for **Linux, macOS and Windows** targets (`main.c` errors
+  early on targets outside that set, e.g. WASI).
 
 ### macOS: covering both architectures
 
@@ -96,8 +99,8 @@ A target is only "complete" when these back ends exist for it. Current coverage:
 
 | Subsystem            | Windows | Linux | macOS | Notes / mechanism                         |
 |----------------------|:-------:|:-----:|:-----:|-------------------------------------------|
-| I/O reactor          | IOCP    | epoll | kqueue| `src/runtime` async socket/file reactor; **cross builds to Win/WASI cannot link it yet** (macOS cross links `macos/<arch>/zanrt_io{,_mt}.o`) |
-| Threads / sync       | Win32   | pthread| pthread| mutex, semaphore (macOS uses GCD dispatch), atomics; **`AtomicInt`/`SharedTable` cross to Linux and macOS** |
+| I/O reactor          | IOCP    | epoll | kqueue| `src/runtime` async socket/file reactor; **cross builds to WASI cannot link it** (macOS cross links `macos/<arch>/zanrt_io{,_mt}.o`; Windows cross links `win-<arch>/zanrt_io{,_mt}.o`) |
+| Threads / sync       | Win32   | pthread| pthread| mutex, semaphore (macOS uses GCD dispatch), atomics; **`AtomicInt`/`SharedTable` cross to Linux, macOS and Windows** |
 | C FFI (`DllImport`)  | crt/msvcrt → CRT | libc | libc | resolved by the linker; names unified as `crt` |
 | Filesystem / dirent  | ✅      | glibc layout | Darwin layout | `Directory.zan` branches on dirent offsets |
 | Monotonic clock      | ✅      | `CLOCK_MONOTONIC`=1 | =6 | `Stopwatch` |
@@ -113,7 +116,7 @@ yet.
 
 Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on each.
 
-### Async-socket / sync runtime for Windows cross — small–medium
+### Async-socket / sync runtime for Windows cross — ✅ done
 - Done for macOS: `scripts/build_macos_rt.sh` compiles `rt_io.c` (kqueue) and
   `rt_sync.c` for `{aarch64,x86_64}-macos.11.0` with `zig cc` (it carries the Darwin
   libc headers, so no Apple SDK and no Mac are needed) into
@@ -121,8 +124,12 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
   linked on demand. Every symbol they import is in the bundled `libSystem.tbd` —
   `scripts/check_macos_rt.py` asserts that, so a missing stub is caught here instead
   of in a user's link.
-- Still open for Windows: the same objects in the mingw ABI, staged beside
-  `toolchain/win-<arch>/`.
+- Done for Windows: `scripts/build_win_rt.sh` compiles `rt_io.c` (IOCP),
+  `rt_sync.c` and `rt_timer.c` for `{x86_64,aarch64}-windows-gnu` into
+  `toolchain/win-<arch>/zanrt_{io,io_mt,sync,timer}.o` (plus `zan_embed_api.o`),
+  staged beside the mingw runtime and linked on demand by the `ld.lld` MinGW
+  cross path in `main.c` — lifting the former async-socket / sync-runtime cross
+  restrictions.
 
 ### macOS GUI cross (Cocoa) — link-complete for arm64 and x64
 - `src/runtime/gui_runtime_mac.m` is Objective-C against Cocoa/CoreText/QuartzCore/
@@ -171,26 +178,27 @@ that would fail:
 
 | IDE host   | Targets offered                                              |
 |------------|--------------------------------------------------------------|
-| Windows    | `windows-x64`, `windows-arm64`, `linux-x64`, `linux-arm64`   |
-| macOS      | `macos-x64`, `macos-arm64`, `linux-x64`, `linux-arm64`       |
-| Linux      | `linux-x64`, `linux-arm64`                                   |
+| Windows    | `windows-x64`, `windows-arm64`                               |
+| macOS      | `macos-arm64`, `macos-x64`, `linux-x64`, `linux-arm64`       |
+| Linux      | `linux-x64`, `linux-arm64`, `macos-arm64`, `macos-x64`       |
 
 - The host's **own** OS/arch is built natively; the other same-OS architecture
   and all Linux targets use the cross paths in §2.
-- Cross to a *different* desktop OS (Windows ⇄ macOS) is currently not offered by
-  `ZanIDE.PublishTargetIds`. This is a conservative IDE product policy, not a
-  compiler/linker limitation: `zanc --target macos-{x64,arm64}` can link console,
-  async, atomics and Cocoa GUI from another host as described in §2, but those
-  outputs have not yet been executed on real Mac hardware. The CLI remains the
-  source of truth for cross-target capability.
+- Cross to a *different* desktop OS is offered from the Linux and macOS hosts
+  (each lists the other OS's targets); the **Windows** host offers only Windows
+  targets, so Windows ⇄ macOS cross is not offered there. This is a conservative
+  IDE product policy, not a compiler/linker limitation: `zanc --target
+  macos-{x64,arm64}` can link console, async, atomics and Cocoa GUI from another
+  host as described in §2, but those outputs have not yet been executed on real
+  Mac hardware. The CLI remains the source of truth for cross-target capability.
 
 ---
 
 ## 6. Recommended order
 
-1. Stage `zanrt_io.o` / `zanrt_sync.o` for the Windows ABI to lift its
-   async-socket / sync-runtime cross restrictions (§4). macOS runtime objects are
-   already staged for both architectures.
-2. Android / OHOS CLI (Linux-like reactor, per-NDK sysroot).
-3. `wasm32` WASI networking/threads model.
-4. iOS, then bare-metal.
+1. Android / OHOS CLI (Linux-like reactor, per-NDK sysroot).
+2. `wasm32` WASI networking/threads model.
+3. iOS, then bare-metal.
+
+(Windows cross's async-socket / sync-runtime staging — the former item 1 — is
+done; see §4.)

@@ -82,8 +82,9 @@ A typical AI edit loop:
 3. read the file → apply an `apply_patch`/write → run build via `run_command`.
 
 Regenerate the indices (`repomap.exe`) after structural edits so the resources
-stay current; the routes index is also produced by the server templates' own
-`tools/routegen`.
+stay current; the routes index is also produced by the server templates' route
+generator, `stdlib/System/Compiler/GenRoute.zan` (the server templates emit the
+route table as `src/framework/Routes.gen.zan`).
 
 ---
 

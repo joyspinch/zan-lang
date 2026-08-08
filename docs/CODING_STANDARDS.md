@@ -121,22 +121,26 @@ int offset = (size + 7) & ~7;  /* align to 8 bytes */
 ### 2.5 Error Handling
 
 ```c
-/* Pattern: return status code, out-parameter for result */
-zan_status_t zan_parser_parse_expr(zan_parser_t *parser, zan_ast_node_t **out_node) {
-    if (parser == NULL || out_node == NULL) {
-        return ZAN_STATUS_INVALID_ARG;
-    }
-
-    *out_node = NULL;
-
-    zan_token_t token = zan_lexer_next(parser->lexer);
-    if (token.kind == TK_ERROR) {
-        return ZAN_STATUS_PARSE_ERROR;
+/* Pattern: status codes are the zan_status_t enum from zan.h:
+   ZAN_OK = 0, ZAN_ERROR, ZAN_OOM */
+zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
+    if (g == NULL || unit == NULL) {
+        return ZAN_ERROR;
     }
 
     /* ... */
-    *out_node = node;
-    return ZAN_STATUS_OK;
+    return ZAN_OK;
+}
+
+/* Pattern: result returned directly; failure is reported via the diag
+   context (parser.h) */
+zan_ast_node_t *zan_parser_parse(zan_parser_t *parser) {
+    if (parser == NULL) {
+        return NULL;
+    }
+
+    /* ... */
+    return unit;
 }
 
 /* Pattern: emit diagnostic and continue (error recovery) */
@@ -154,11 +158,13 @@ static void parser_error(zan_parser_t *parser, const char *message) {
 ### 3.1 Module Dependencies
 
 ```
-main.c → driver.c → parser.c → lexer.c
-                   → binder.c → ast.c
-                   → checker.c → ast.c
-                   → irgen.c → ast.c, LLVM
-                   → diag.c
+main.c → lexer.c / parser.c / binder.c / checker.c / irgen.c
+       → nsresolve.c / package.c / crosscomp.c / builtin_api.c
+       → genmeta.c / genrun.c（Zan 脚本化生成器的 C 管道）
+       → incremental.c / winres.c / optimizer.c / diag.c
+
+irgen.c 按职责拆分：irgen_expr.c / irgen_stmt.c / irgen_call.c / irgen_generics.c
+        / irgen_arc.c / irgen_async.c / irgen_abi.c / irgen_builtins.c / irgen_emit.c
 
 All modules → zan.h (common types)
 ```
@@ -230,11 +236,20 @@ All state lives in explicitly passed context structs. This enables:
 
 ### 4.3 Test File Format
 
+There is no `// TEST:` / `// EXPECT:` header convention. Tests are plain
+programs with golden-file expectations:
+
+- `tests/conformance/<name>.zan` — compile + run; stdout is diffed against the
+  sibling `<name>.out` golden file. Files may carry a short
+  `// Conformance: ...` description comment at the top.
+- `tests/diag/<name>.zan` — negative cases that must fail compilation with the
+  expected diagnostics.
+- `tests/runtime/*.c` — C-level runtime tests.
+
+Example (`tests/conformance/hello.zan`):
+
 ```csharp
-// TEST: descriptive name
-// EXPECT: expected stdout output
-// ERROR: expected error message (for negative tests)
-// SKIP: platform (if platform-specific)
+using System;
 
 class Program {
     static void Main() {
@@ -245,13 +260,17 @@ class Program {
 
 ### 4.4 Running Tests
 
+测试分三档(`scripts\test.ps1 <tier>` 或 `ctest -L <tier>`,详见 `AGENTS.md`):
+
 ```bash
-zan test                        # All tests
-zan test tests/lexer/           # Specific directory
-zan test --filter "generic"     # Name filter
-zan test --verbose              # Show details
-zan test --update-snapshots     # Update golden files
+scripts\test.ps1 smoke      # 快速档：goldens、诊断、ABI、runtimes、工具、GUI（每次编辑后跑）
+scripts\test.ps1 standard   # 提交门禁：smoke + 全部 conformance 程序与库发射（~1 min）
+scripts\test.ps1 full       # 发布门禁：加 determinism/leakcheck twins 与自举（数十分钟）
+ctest -R "generic|leak"     # 按名称过滤
 ```
+
+用例布局:`tests/conformance/<name>.zan` + `<name>.out`(stdout golden 对)、
+`tests/diag/`(负例,期望编译报错)、`tests/runtime/`(C 运行时测试)。
 
 ---
 
@@ -259,11 +278,9 @@ zan test --update-snapshots     # Update golden files
 
 ### 5.1 Branch Strategy
 
-- `main` — stable, always compiles, tests pass
-- `dev` — integration branch for features
-- `feature/xxx` — individual features
-- `fix/xxx` — bug fixes
-- `docs/xxx` — documentation only
+**不建分支**（`AGENTS.md` 硬规则 9）：所有改动直接提交 `main` 并推送。
+`main` 保持稳定——每次提交必须编译通过、对应档位测试通过（改动小跑 smoke，
+改动大跑 standard）。
 
 ### 5.2 Commit Messages
 
@@ -324,9 +341,8 @@ test: add negative tests for type checker errors
 ### 6.3 Profiling
 
 ```bash
-zan build --time-report       # Show time per compilation phase
-zan build --mem-report        # Show memory usage per phase
-zan build --stats             # Show statistics (tokens, AST nodes, types, etc.)
+zanc main.zan --auto-stdlib --time      # Show time per compiler phase
+zanc main.zan --auto-stdlib --emit-ir   # Dump LLVM IR (inspect generated code)
 ```
 
 ---
@@ -344,10 +360,9 @@ Semantic versioning: `MAJOR.MINOR.PATCH`
 ### 7.2 Release Checklist
 
 - [ ] All tests pass on Windows, Linux, macOS
-- [ ] Changelog updated
-- [ ] Version number updated in CMakeLists.txt
-- [ ] Binary size within target (< 20MB with IDE, < 5MB compiler only)
+- [ ] Version number bumped in the root `VERSION` file (single source of truth; the build generates `zan_version.h` from it — see `docs/RELEASE.md` §1.1)
+- [ ] Binary size within target (zanc ~49.8 MB static-LLVM today; optimization path to ~10–15 MB is in `docs/SELF_CONTAINED_TOOLCHAIN.md` §3)
 - [ ] Performance benchmarks within targets
-- [ ] Self-hosting verification passes (when applicable)
+- [ ] Self-hosting verification passes (when applicable; currently red — see `docs/BOOTSTRAP.md` B6-SH1)
 - [ ] Documentation updated for new features
 

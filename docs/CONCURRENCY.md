@@ -1,5 +1,8 @@
 # Zan Concurrency Model
 
+> ⚠️ **本文档为设计目标与当前实现混写。** 2026-08-08 审计：§2.1 与 §8.3 描述现状，
+> 其余章节多为设计目标（其中引用的部分 API 不存在）。修正见文内，未逐节重写。
+
 ## 1. Overview
 
 Zan provides **Go-style native concurrency** with lightweight tasks (coroutines) and typed channels, combined with C#-style async/await syntax. The runtime includes a work-stealing scheduler for efficient parallel execution.
@@ -36,8 +39,12 @@ Zan provides **Go-style native concurrency** with lightweight tasks (coroutines)
 > A handle is not a `Task<T>`: the joins observe *completion only*: no result,
 > no exception hand-off. A spawned coroutine publishes its result through shared
 > state (a static field, a queue, `System.Threading.BlockingQueue`) that the
-> joiner reads after the join. Channels, `TaskGroup`, lambda-form `Task.Run` and
+> joiner reads after the join. `TaskGroup`, lambda-form `Task.Run` and
 > `CancellationToken` parameters below are not implemented yet.
+>
+> `Channel` **is** implemented, but it is **string-only** (non-generic):
+> `Send(string)` / `async string Receive()`; a closed-and-drained channel
+> returns `""` (`stdlib/System/Threading/Threading.zan:738`).
 
 ```csharp
 using System;
@@ -75,6 +82,9 @@ class Program {
 | Stack | Segmented/growable | Fixed size |
 
 Tasks are multiplexed onto a pool of OS threads (M:N scheduling). The runtime manages scheduling, so creating millions of tasks is practical.
+
+> The stack/creation-cost figures are design targets; the shipped model is
+> stackless CPS frames on the heap (see §5).
 
 ### 2.3 Structured Concurrency
 
@@ -117,6 +127,12 @@ await task;
 ---
 
 ## 3. Channels (Go-style Communication)
+
+> **Design target.** The shipped `Channel` (`stdlib/System/Threading/Threading.zan:738`)
+> is **string-only** (non-generic): `Send(string)` / `async string Receive()`,
+> closed-and-drained receive returns `""`. The generic `Channel<T>`,
+> capacity-constructor generics, `Channel.Select` and tuple returns in this
+> section are **not implemented**.
 
 ### 3.1 Unbuffered Channel
 
@@ -180,6 +196,11 @@ while (true) {
 
 ### 3.4 Channel Patterns
 
+> **Design target.** The `Task.Run(lambda)` / `await foreach` forms below do
+> **not** compile: `Task.Run` lowering in `irgen` (`src/compiler/irgen_call.c`)
+> only accepts a *named async call* as its single argument, not a lambda, and
+> there are no async iterators.
+
 ```csharp
 // Fan-out: one producer, multiple consumers
 static async Task FanOut<T>(Channel<T> input, int workers, Func<T, Task> handler) {
@@ -218,58 +239,57 @@ var parsed = Pipeline(pages, page => ParseHtml(page));
 
 ### 4.1 Mutex
 
-```csharp
-var mutex = new Mutex();
-var counter = 0;
+`Mutex` is **static and handle-based** — there is no `new Mutex()` and no
+awaitable `Lock()`:
 
-await TaskGroup.Run(async group => {
-    for (int i = 0; i < 100; i++) {
-        group.Spawn(async () => {
-            using (await mutex.Lock()) {
-                counter++;
-            }
-        });
-    }
-});
-// counter == 100 (guaranteed)
+```csharp
+nint mtx = Mutex.Create();
+Mutex.Lock(mtx);
+counter++;
+Mutex.Unlock(mtx);
+Mutex.Destroy(mtx);     // when no longer needed
 ```
+
+(`stdlib/System/Threading/Threading.zan`; the handle is `nint` on Windows,
+`string` on POSIX.)
 
 ### 4.2 RWLock (Read-Write Lock)
 
+There is no plain `RWLock`. The shipped read-write lock is **`AsyncRwLock`**
+(`stdlib/System/Threading/AsyncRwLock.zan`), writer-preferring and genuinely
+async (waiters suspend on `AsyncGate`, no polling):
+
 ```csharp
-var rwlock = new RWLock();
-var cache = new Dict<string, string>();
-
-// Multiple concurrent readers
-Task.Run(async () => {
-    using (await rwlock.ReadLock()) {
-        var value = cache["key"];
-    }
-});
-
-// Exclusive writer
-Task.Run(async () => {
-    using (await rwlock.WriteLock()) {
-        cache["key"] = "new_value";
-    }
-});
+var rwlock = new AsyncRwLock();
+await rwlock.EnterRead();
+...
+rwlock.ExitRead();
+// exclusive write side:
+await rwlock.EnterWrite();
+...
+rwlock.ExitWrite();
 ```
+
+The `ReadLock()`/`WriteLock()` + `using` forms in the original draft are a
+design target.
 
 ### 4.3 Semaphore
 
+`Semaphore` is **static and handle-based** — there is no `new Semaphore(n)`
+and no instance `Acquire()`:
+
 ```csharp
 // Limit concurrent connections to 10
-var sem = new Semaphore(10);
-
-async Task FetchUrl(string url) {
-    await sem.Acquire();
-    try {
-        return await Http.Get(url);
-    } finally {
-        sem.Release();
-    }
+nint sem = Semaphore.Create(10, 10);   // (initial count, max count)
+Semaphore.Wait(sem);                   // decrement; blocks at 0
+try {
+    ...
+} finally {
+    Semaphore.Release(sem);
 }
 ```
+
+(`stdlib/System/Threading/Threading.zan`.)
 
 ### 4.4 Atomic Operations
 
@@ -311,88 +331,42 @@ with `SharedTable.Open(name)` and call `Close()` when done.
 
 ### 4.6 Once (One-time Initialization)
 
-```csharp
-var once = new Once();
-Connection? sharedConn = null;
-
-async Task<Connection> GetConnection() {
-    await once.Do(async () => {
-        sharedConn = await Connection.Open("db://localhost");
-    });
-    return sharedConn!;
-}
-```
+There is no `Once` type. One-time initialization is done with a plain `bool`
+guarded by a `Mutex`/`Gate`.
 
 ---
 
 ## 5. Runtime Scheduler Architecture
 
-### 5.1 M:N Scheduling
+### 5.1 Coroutine driver (current implementation)
 
-```
-┌──────────────────────────────────────────┐
-│              User Tasks (M)              │
-│  [T1] [T2] [T3] [T4] [T5] ... [Tn]    │
-└──────────────┬───────────────────────────┘
-               │ multiplexed onto
-               ▼
-┌──────────────────────────────────────────┐
-│           Worker Threads (N)             │
-│  [W1: T1,T3] [W2: T2,T5] [W3: T4]     │
-│  Each has a local run queue              │
-│  Work-stealing from other workers        │
-└──────────────────────────────────────────┘
-```
+The shipped runtime is a **stackless coroutine driver** (`src/runtime/rt_co.h`):
+each coroutine is a heap-allocated CPS frame (the compiler emits a `ramp`
+entry and a `$resume` continuation per async function; see
+`docs/ASYNC_CPS_DESIGN.md`). `rt_co` keeps a cooperative ready queue; IO
+awaits register one-shot watchers with the `rt_io` reactor (`src/runtime/rt_io.c`),
+which resumes the coroutine when its fd is ready. The default driver is
+single-threaded; OS-worker parallelism is opt-in via the **`--async-workers`**
+compiler flag, which links `zanrt_io_mt` (an OS worker pool) instead.
 
-N = number of CPU cores (configurable via `Runtime.SetMaxWorkers(n)`)
+There is **no `Runtime.SetMaxWorkers`** — the worker count is controlled by
+the `--async-workers` CLI flag, not at runtime.
 
-### 5.2 Work-Stealing
+### 5.2 Work-Stealing / Preemption / Segmented Stacks (design targets)
 
-Each worker thread has a local double-ended queue (deque):
-- Push/pop from the tail (LIFO — cache locality)
-- Other workers steal from the head (FIFO — large tasks first)
-- Global queue for overflow and external submissions
+The original draft's M:N work-stealing picture is **not** the shipped
+implementation:
 
-### 5.3 Task States
+- **No per-worker local deque / work-stealing**: the single-threaded driver
+  uses one cooperative ready queue; with `--async-workers`, `zanrt_io_mt`
+  provides the same ABI on an OS worker pool.
+- **No ~10μs preemption checks**: scheduling is cooperative at `await` points
+  only; there is no periodic preemption of compute-bound coroutines.
+- **No segmented stacks (4KB → 1MB)**: coroutines are stackless — their state
+  lives in heap frames, so there are no stack segments to grow or shrink.
 
-```
-    ┌────────┐
-    │ Created│
-    └───┬────┘
-        │ schedule
-        ▼
-    ┌────────┐    preempt     ┌──────────┐
-    │Running │───────────────▶│  Queued   │
-    └───┬────┘                └────┬─────┘
-        │                          │ schedule
-        │ await/channel            │
-        ▼                          │
-    ┌────────┐    wake up          │
-    │Blocked │─────────────────────┘
-    └───┬────┘
-        │ complete
-        ▼
-    ┌────────┐
-    │  Done  │
-    └────────┘
-```
-
-### 5.4 Preemption
-
-Tasks are cooperatively scheduled at:
-- `await` points
-- Channel send/receive
-- Function call prologues (periodic check, ~10μs intervals)
-
-This prevents long-running compute tasks from starving other tasks.
-
-### 5.5 Stack Management
-
-Tasks use segmented stacks:
-- Initial stack: 4KB (configurable)
-- Grows on demand by allocating new segments
-- Shrinks when segments are no longer needed
-- Maximum stack size: 1MB (configurable, prevents stack overflow)
+Task states (Created → Running → Blocked on IO/await → Done) do exist, but the
+transitions are cooperative (await/wake) rather than preemptive.
 
 ---
 
@@ -401,66 +375,36 @@ Tasks use segmented stacks:
 ### 6.1 Async Functions
 
 ```csharp
-async Task<string> FetchData(string url) {
+async string FetchData(string url) {
     var response = await Http.Get(url);       // yields to scheduler
     var body = await response.ReadString();   // yields again
     return body;
 }
 ```
 
-The compiler transforms async functions into state machines:
-
-```
-// Conceptual transformation:
-// async Task<string> FetchData(string url)
-// →
-// struct FetchData_StateMachine {
-//     int state;
-//     string url;
-//     HttpResponse response;
-//     string body;
-//     Task<string> result;
-//
-//     void MoveNext() {
-//         switch (state) {
-//             case 0:
-//                 state = 1;
-//                 Http.Get(url).ContinueWith(this);
-//                 return;
-//             case 1:
-//                 response = awaiter.GetResult();
-//                 state = 2;
-//                 response.ReadString().ContinueWith(this);
-//                 return;
-//             case 2:
-//                 body = awaiter.GetResult();
-//                 result.SetResult(body);
-//                 return;
-//         }
-//     }
-// }
-```
+The actual model is **not** a `Task<T>` state machine with `ContinueWith`
+(see `docs/ASYNC_CPS_DESIGN.md`): an async function must return `int`,
+`string` or `void`, and the compiler lowers it to a heap **CPS frame** — a
+`ramp` entry that allocates the frame, plus a `$resume` continuation, with the
+body split at each `await` into resume blocks. There is no `Task<T>` type, no
+`ContinueWith`, and no `.Result`-style access; async results are returned by
+the CPS frame's result slot and joined through `Task.IsDone`/`Task.WhenAll`/
+`Task.WhenAny` (completion-only, see §2.1).
 
 ### 6.2 Async Iterators
 
-```csharp
-async IAsyncEnumerable<string> ReadLines(string path) {
-    var stream = await File.OpenRead(path);
-    var reader = new TextReader(stream);
-    while (await reader.ReadLine() is string line) {
-        yield return line;
-    }
-}
-
-// Usage
-await foreach (var line in ReadLines("data.txt")) {
-    Console.WriteLine(line);
-}
-```
+> **Design target.** There are no async iterators: no `IAsyncEnumerable`, no
+> `await foreach`, and `yield` inside an `async` function is not supported.
+> The example below is not compilable.
 
 ---
 
 ## 7. Thread Safety Model
+
+> **Design target.** There is no sendability analysis and no compiler warning
+> about sharing mutable state across tasks (§7.1–§7.2 describe an analysis
+> that does not exist); synchronizing shared state is the developer's
+> responsibility (see §4).
 
 ### 7.1 Sendable Types
 
@@ -478,10 +422,10 @@ Types that can be safely shared between tasks:
 
 ### 7.2 Compiler Checks
 
-The compiler provides warnings (not errors, for pragmatism) when:
-- A non-sendable type is captured by a task closure
-- A mutable reference type is shared without synchronization
-- A channel carries a non-sendable type
+> **Design target.** The warnings described in the original draft (non-sendable
+> type captured by a task closure, mutable reference type shared without
+> synchronization, channel carrying a non-sendable type) are **not emitted** —
+> there is no such analysis.
 
 ```csharp
 class Counter {
@@ -490,7 +434,7 @@ class Counter {
 
 var c = new Counter();
 Task.Run(() => {
-    c.Value++;              // WARNING: sharing mutable state without synchronization
+    c.Value++;              // no warning is emitted today
 });
 ```
 
@@ -519,7 +463,9 @@ Task.Run(() => counter.Increment());
 
 // Pattern 4: Immutable data
 let config = new AppConfig { Port = 8080, Host = "localhost" };
-// config is immutable (let), safe to share without locks
+// Note: `let` is parsed and recorded (var_decl.is_let) but NOT enforced —
+// there is no immutability checking, so `config` is not actually guaranteed
+// immutable; treat sharing as Mutex/Atomic-protected like any other state.
 ```
 
 ---
@@ -545,11 +491,12 @@ await Task.Delay(1000);    // yields for 1 second
 
 | Platform | Backend | Mechanism |
 |----------|---------|-----------|
-| Linux | io_uring / epoll | Kernel async I/O |
+| Linux | epoll | readiness notifications (`select` as fallback) |
 | Windows | IOCP | I/O Completion Ports |
-| macOS | kqueue | BSD event notification |
+| macOS/BSD | kqueue | BSD event notification |
 
-The runtime abstracts platform differences. User code is identical across platforms.
+There is **no io_uring** backend. The runtime abstracts platform differences
+(`src/runtime/rt_io.c`); user code is identical across platforms.
 
 ### 8.3 Implementation status
 
@@ -578,6 +525,11 @@ Windows (CI runs the loopback-echo conformance tests on all three):
 ---
 
 ## 9. Examples
+
+> **以下为设计目标示例，当前不可编译。** They use lambda-form `Task.Run`,
+> `async Task Main`, generic `Channel<T>`, tuple destructuring and
+> `await foreach` — none of which the current compiler accepts (see §2.1, §3
+> and §6).
 
 ### 9.1 Concurrent Web Scraper
 

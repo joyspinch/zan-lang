@@ -17,7 +17,8 @@
 - 产物：例如 `hello.exe` 仅 **~141 KB**，运行时只导入系统自带的 `msvcrt.dll` / `kernel32.dll`，
   装机即跑，零外部依赖。
 - 验证：在 **PATH 中彻底去掉 clang/gcc/ld** 的情况下，`zanc hello.zan -o hello.exe` 仍能编译并正常运行；
-  完整 `ctest` **51/51 全过**（含 GUI 用例，覆盖 user32/gdi32 等 `DllImport` 链接路径），ABI 切换无回归。
+  ctest 现按三档套件运行（`smoke` 103 / `standard` 462 / `full` 1170）——文中"完整 ctest **51/51 全过**"
+  是 ABI 切换当时的历史快照（含 GUI 用例，覆盖 user32/gdi32 等 `DllImport` 链接路径），现套件规模已大幅增长。
 
 ---
 
@@ -60,11 +61,11 @@ ld.exe -m i386pep -Bdynamic --stack 268435456 [-s] -o app.exe \
 | 组成 | 全量（当前） | 可优化到 |
 |---|---|---|
 | 编译产物（发给最终用户的 exe） | ~141 KB | — |
-| `zanc.exe`（静态链 LLVM） | ~37 MB | ~10–15 MB（动态链 LLVM / 只留 x86 后端） |
+| `zanc.exe`（静态链 LLVM） | ~49.8 MB | ~10–15 MB（动态链 LLVM / 只留 x86 后端） |
 | 链接器 `ld.exe` | 1.7 MB | —（已是 GNU ld，比 50 MB 的 ld.lld 小得多） |
 | MinGW 运行时 `mingw/lib` | ~81.6 MB | ~10–20 MB（只留常用导入库；见下） |
 | `libgcc.a` | 7.4 MB | — |
-| **工具链包合计** | **~90 MB + zanc** | **~30 MB 量级** |
+| **工具链包合计** | **~189 MB**（含跨平台 musl sysroot、CLI 工具与 `zan_gui.lib`） | **~30 MB 量级** |
 
 > 运行时目前保留**完整导入库**以保证任意 `DllImport` 都能链接。后续可做「按需/精简 sysroot」：
 > 只保留 CRT + 常用导入库（kernel32/user32/gdi32/advapi32/shell32/ws2_32/winhttp/ole32/…），
@@ -72,24 +73,25 @@ ld.exe -m i386pep -Bdynamic --stack 268435456 [-s] -o app.exe \
 
 ---
 
-## 4. Linux / macOS 计划（同一原理，尚未落地）
+## 4. Linux / macOS（同一原理，已落地）
 
-原理一致：**内置 lld + 链接该平台“人人都有”的系统 libc**，用户机器上除 zan 外什么都不装。
+原理一致：**内置 lld + 链接该平台”人人都有”的系统 libc**，用户机器上除 zan 外什么都不装。
 
-- **Linux**：codegen `x86_64-unknown-linux-gnu`；随包 `ld.lld`（或 GNU ld），**动态链接系统 glibc**
-  （每台 Linux 都有 → 等于零外部依赖）。极致单文件可选 **musl 静态链接**（随包 musl + crt）。
-  链接需 `crt1.o/crti.o/crtn.o` + `-dynamic-linker /lib64/ld-linux-x86-64.so.2` + `-lc`。
-- **macOS**：codegen `arm64/x86_64-apple-macos`；随包 `ld64.lld`，链接系统 `libSystem`
-  （在 dyld 共享缓存里，无需装 Xcode）；需处理 SDK 的 `.tbd` 存根 + 内置 ad-hoc 代码签名。
-  比前两者“娇气”：最低系统版本、`-platform_version`、签名不可省。
+- **Linux**：✅ 已落地。交叉默认产出 **musl 静态 ELF**（`ld.lld -static` + 随包
+  `toolchain/linux-{musl,arm64,riscv64}` musl sysroot，含 `crt1.o/crti.o/crtn.o` 与 `libc.a`），
+  **零外部依赖**，任何宿主（Windows/macOS/Linux）都能产出。
+- **macOS**：✅ 已落地。随包 `ld64.lld` + `toolchain/macos/libSystem.tbd`（MIT 符号存根，
+  无需 Apple SDK/Xcode）+ Mach-O 运行时对象（`macos/<arch>/zanrt_{io,io_mt,sync,timer}.o`）；
+  arm64 输出由链接器做 **ad-hoc 代码签名**（`LC_CODE_SIGNATURE`）。Cocoa GUI dylib
+  （`libzan_gui.dylib`）亦已签入。残留真项：**实机运行验证**与发布分发用的 **Developer ID 公证**。
 
-实现落点：`src/compiler/crosscomp.c`（各交叉目标复用同一“内置 linker + 该平台常在的系统 libc”模型）。
-Linux/macOS 需在对应平台上实机验证（当前开发机为 Windows，只能设计、无法直接跑测）。
+实现落点：`src/compiler/crosscomp.c`（各交叉目标复用同一”内置 linker + 该平台常在的系统 libc”模型）。
+macOS 实机验证需在 Mac 上执行（当前开发机为 Windows，只做链接/结构验证）。
 
 ---
 
 ## 5. 现状小结
 
-- ✅ Windows：自包含链接**已完成并验证**（stripped-PATH 编译通过、51/51 测试通过）。
-- ⬜ Linux/macOS：设计已定，待实机落地。
-- ⏭ 之后：回到 **M1 协程运行时**（fiber 调度器 / `Task<T>` / async-await 降级 / 事件循环）。
+- ✅ Windows：自包含链接**已完成并验证**（stripped-PATH 编译通过，三档 ctest 套件通过）。
+- ✅ Linux：静态 musl 自包含链接**已落地**（`ld.lld -static` + 随包 musl sysroot，零外部依赖）。
+- ✅ macOS：`ld64.lld` + `libSystem.tbd` + ad-hoc 签名**已落地**；仅剩实机运行验证与 Developer ID 公证。

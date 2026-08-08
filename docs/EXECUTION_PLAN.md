@@ -39,8 +39,11 @@
      保留为 `JsonValue.ParseLenient`，现有调用点（UI 文档/RPC/IDE）已
      迁移到 lenient，行为不变（`tests/conformance/json_errors.zan`）。
    - A3 IDE 长时运行泄漏验证（`--check-leaks` 2h+ 零净增长）。
-2. **P1 编辑体验 + 质量保障**（阶段 2.1–2.3、4.1–4.2）：LSP rename、
-   workspace/symbol、IDE 接入 zanfmt、IDE golden-path UI 测试、发布包冒烟测试。
+2. **P1 编辑体验 + 质量保障**（阶段 2.1–2.3、4.1–4.2）：
+   - ✅ LSP rename（`src/lsp/lsp_main.c` `handle_rename`）、workspace/symbol
+     （`handle_workspace_symbol`）、IDE 接入 zanfmt（ZanIDE.zan Ctrl+E
+     Format Document）已完成。
+   - 剩余：IDE golden-path UI 测试、发布包冒烟测试。
 3. **P1 产品化**（阶段 3）：代码签名 → 自动更新 → 崩溃上报 → 包商店。
 4. **P1 收尾**（阶段 2.4–2.5、4.3）：增量文档同步/大文件、崩溃恢复、Regex。
 5. **P2 跨平台**（阶段 5）：Linux/macOS 自包含工具链与 IDE 发布。

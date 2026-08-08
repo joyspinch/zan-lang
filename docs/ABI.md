@@ -21,6 +21,12 @@ This document is layered into **current implementation** and **target design**:
   These describe the intended runtime object model and were **not** re-verified in
   this pass; treat offsets/fields as design intent, not a guaranteed layout.
 
+> The object header actually emitted today (16 bytes in front of every payload:
+> `[i64 rc / array count @ obj-16][i64 leak-site / STRING_MAGIC @ obj-8]`, with
+> the program pointer pointing at the payload) is defined once, as constants, in
+> `src/common/zan_abi.h` — that header is the source of truth for the current
+> implementation; §3.3–§3.5 are the longer-term design.
+
 Remaining ABI capability work is tracked in `TASKS.md` (A0-2 FFI bit-width, A0-3
 struct alignment corner cases, A2 variadic `DllImport` + `signext`/`zeroext`).
 
@@ -68,6 +74,10 @@ Notes (`src/compiler/binder.c`, `irgen.c` `map_type`):
   `double`.
 - `char` currently lowers to a 64-bit word (wider than C#'s 16-bit `char`); it
   still holds a single Unicode scalar value.
+  Note: the binder records a size of 4 for `char` (`src/compiler/binder.c`,
+  `make_type(..., "char", 4)`), which conflicts with the 8-byte LLVM storage
+  that `irgen` actually emits. **The storage width (8 bytes) is authoritative**
+  for layout and ABI purposes; treat the binder's 4 as internal bookkeeping.
 
 ### 3.2 Struct Layout (Value Types)
 
@@ -101,6 +111,10 @@ Layout control (`src/compiler/irgen.c` `register_struct_type`):
   layout a C compiler would produce (this is also what `[StructLayout(Sequential)]`
   asks for). Base fields are flattened in first, so a derived instance stays
   layout-compatible with its base.
+  **Exception**: a struct containing `char` fields (mapped to 8-byte LLVM
+  words, whereas C's `char` is 1 byte) or a 64-bit enum (lowered to `i64`,
+  whereas C enums are typically `int`) does **not** match the layout a C
+  compiler would produce.
 - **Explicit** — a `[StructLayout(Explicit)]` (explicit-layout) type places every
   field at its own `[FieldOffset(n)]`. Offsets are validated for the field's
   natural alignment; two fields may share an offset (that is how a union is

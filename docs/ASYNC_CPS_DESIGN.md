@@ -215,8 +215,9 @@ The original staged plan has landed:
   try/catch/finally across suspension, cross-coroutine exception propagation,
   frame-resident ownership cleanup and cooperative cancellation.
 
-Async generic-method monomorphization remains a separate compiler limitation;
-it requires cloning the specialized frame, ramp and `$resume` together.
+Async generic-method monomorphization is **complete** (A32-3b, 2026-08-04):
+the specialized frame, ramp and `$resume` are cloned together, covered by
+`tests/conformance/async_generic_method.zan`.
 
 ## Test strategy
 - Runnable conformance cases cover compute and chained awaits, loop/foreach and

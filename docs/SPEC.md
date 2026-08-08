@@ -1,4 +1,9 @@
-# Zan Language Specification v0.1
+# Zan Language Specification
+
+> 本文档描述 Zan 语言的**当前实测语义**（zanc v0.2.1，2026-08-08 复核）。
+> 所有声称的特性均在 `tests/conformance/` 有对应用例或经编译探针验证；
+> 未实现/行为不标准的特性不在此列，见文末附录 A。
+> 本文件由 `docs/DOCS_MAINTENANCE.md` 的分层规则维护：只写现状，不写设计意图。
 
 ## 1. Overview
 
@@ -7,7 +12,7 @@ Zan is a statically-typed, AOT-compiled systems programming language with C# syn
 **Design goals:**
 - C# familiar syntax — no lifetime annotations, no cryptic symbols
 - Native performance — zero-cost abstractions, stack allocation for value types
-- Memory safety — ARC with compile-time cycle detection, no dangling pointers
+- Memory safety — ARC with compile-time cycle detection (via `weak`), no dangling pointers
 - Practical — easy FFI, source-based stdlib, lightweight tooling
 
 ---
@@ -26,7 +31,7 @@ Source files are UTF-8 encoded with `.zan` extension.
 /* Multi-line
    comment */
 
-/// XML doc comment (for API documentation)
+/// XML doc comment (consumed by zandoc)
 ```
 
 ### 2.3 Identifiers
@@ -41,18 +46,23 @@ Identifiers are case-sensitive. Unicode letters are allowed in identifiers.
 
 ```
 abstract   as         async      await      base       bool
-break      byte       case       catch      char       class
-const      continue   default    do         double     else
-enum       extern     false      finally    float      for
-foreach    get        if         in         int        interface
-internal   is         let        long       namespace  new
-nint       null       object     out        override   private
-protected  public     readonly   ref        return     sealed
-set        short      sizeof     static     string     struct
-switch     this       throw      true       try        typeof
-unsafe     using      value      var        virtual    void
-weak       when       where      while
+break      byte       case       catch      char       checked
+class      const      continue   decimal    default    delegate
+do         double     else       enum       extern     false
+finally    fixed      float      for        foreach    get
+goto       if         in         int        interface  internal
+is         let        lock       long       namespace  new
+nint       null       object     operator   out        override
+private    protected  public     readonly   ref        return
+sbyte      sealed     set        short      sizeof     static
+string     struct     switch     this       throw      true
+try        typeof     uint       ulong      unchecked  unsafe
+ushort     using      var        virtual    void       weak
+when       where      while
 ```
+
+`checked` / `unchecked` 为 no-op（溢出检查始终关闭，见附录 A）。
+`value` 是上下文关键字：仅在属性 setter 体内表示隐式传入值，其余位置可作普通标识符。
 
 ### 2.5 Literals
 
@@ -66,8 +76,8 @@ weak       when       where      while
 ```
 
 Integer literals are `int` (32-bit signed) by default. Suffixes:
-- `L` or `l` — `long` (64-bit; `int` is 32-bit)
-- `u` — unsigned
+- `L` or `l` — `long` (64-bit; `int` is 32-bit, `long` is a distinct type)
+- `u` or `U` — unsigned (`uint`/`ulong` per literal size)
 
 #### Floating-Point Literals
 ```
@@ -80,34 +90,30 @@ Integer literals are `int` (32-bit signed) by default. Suffixes:
 ```csharp
 "hello"                     // regular string
 "line1\nline2"              // escape sequences
-@"C:\path\to\file"         // verbatim string (no escapes)
-$"Hello {name}"            // interpolated string
-$@"Path: {dir}\{file}"    // verbatim + interpolated
-"""
-multi-line
-raw string
-"""                         // raw string literal
+@"C:\path\to\file"          // verbatim string (no escapes)
+$"Hello {name}"             // interpolated string
 ```
 
-Escape sequences: `\n \r \t \\ \" \' \0 \x41 \u0041 \U00010000`
+Escape sequences: `\n \r \t \\ \" \' \0`（不支持 `\x` / `\u` / `\U` 十六进制与码点转义，也不支持 `$@"..."` 组合形式与 `"""` 原始字符串）。
 
 #### Character Literals
 ```
 'A'         // Unicode character
 '\n'        // escape sequence
-'\x41'      // hex
 ```
+
+`char` 是 8 字节的 Unicode 码点字（存储宽度对齐 64 位，`sizeof(char) == 8`）。
 
 ### 2.6 Operators (by precedence, high to low)
 
 | Precedence | Operators | Associativity | Description |
 |------------|-----------|---------------|-------------|
-| 1 | `x.y` `x?.y` `x[i]` `f(x)` `x++` `x--` | Left | Member access, indexing, call, postfix |
+| 1 | `x.y` `x[i]` `f(x)` `x++` `x--` | Left | Member access, indexing, call, postfix |
 | 2 | `+x` `-x` `!x` `~x` `++x` `--x` `(T)x` | Right | Unary, cast |
 | 3 | `*` `/` `%` | Left | Multiplicative |
 | 4 | `+` `-` | Left | Additive |
 | 5 | `<<` `>>` | Left | Shift |
-| 6 | `<` `>` `<=` `>=` `is` `as` | Left | Relational |
+| 6 | `<` `>` `<=` `>=` `is` `as` | Left | Relational, type test |
 | 7 | `==` `!=` | Left | Equality |
 | 8 | `&` | Left | Bitwise AND |
 | 9 | `^` | Left | Bitwise XOR |
@@ -118,6 +124,8 @@ Escape sequences: `\n \r \t \\ \" \' \0 \x41 \u0041 \U00010000`
 | 14 | `? :` | Right | Conditional |
 | 15 | `=` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` | Right | Assignment |
 | 16 | `=>` | Right | Lambda |
+
+Note: `?.`（null-conditional）**未实现**——`x?.y` 会被当作普通访问解析，行为与 C# 不一致，勿用。
 
 ---
 
@@ -131,16 +139,19 @@ Type
 │   ├── Primitive Types
 │   │   ├── bool           (1 byte)
 │   │   ├── byte           (1 byte, unsigned)
+│   │   ├── sbyte          (1 byte, signed)
 │   │   ├── short          (2 bytes, signed)
-│   │   ├── int            (8 bytes, signed, 64-bit)
-│   │   ├── long           (8 bytes, signed, alias for int)
+│   │   ├── ushort         (2 bytes, unsigned)
+│   │   ├── int            (4 bytes, signed, 32-bit)
+│   │   ├── uint           (4 bytes, unsigned)
+│   │   ├── long           (8 bytes, signed, 64-bit — distinct from int)
+│   │   ├── ulong          (8 bytes, unsigned)
 │   │   ├── float          (4 bytes, IEEE 754)
 │   │   ├── double         (8 bytes, IEEE 754)
-│   │   ├── char           (4 bytes, Unicode scalar)
+│   │   ├── char           (8 bytes, Unicode scalar)
 │   │   └── nint           (pointer-sized integer)
 │   ├── struct             (user-defined value type)
-│   ├── enum               (named constants or tagged union)
-│   └── tuple              (anonymous product type)
+│   └── enum               (named constants, integer-backed)
 │
 ├── Reference Types (heap allocated, ARC managed)
 │   ├── class              (user-defined reference type)
@@ -148,15 +159,14 @@ Type
 │   ├── delegate           (function pointer type)
 │   └── array T[]          (managed array)
 │
-├── Special Types
-│   ├── string             (immutable UTF-8, interned)
-│   ├── object             (root type for reference types)
-│   ├── void               (no value)
-│   └── T?                 (nullable wrapper)
-│
-└── Unsafe Types
-    └── nint               (raw pointer, unsafe context only)
+└── Special Types
+    ├── string             (immutable UTF-8)
+    ├── object             (root type for reference types)
+    ├── void               (no value)
+    └── T?                 (nullable wrapper)
 ```
+
+`nint` 是普通有符号整数类型（指针宽度），原生内存访问通过 `NativeMemory` / `[DllImport]` 完成，见 §7。`decimal` 是保留关键字，尚无对应类型。
 
 ### 3.2 Type Inference
 
@@ -172,24 +182,22 @@ var list = new List<int>(); // inferred as List<int>
 
 ### 3.3 Nullable Types
 
-Any type can be made nullable with `?`:
+Value types can be made nullable with `?`（引用类型本身可空，无需 `?`）:
 
 ```csharp
 int? x = null;              // nullable int
-string? name = null;        // nullable string (reference type)
 Point? p = null;            // nullable struct
 
-// Null checking
-if (x != null) {
+// Null checking via HasValue / Value
+if (x.HasValue) {
     int value = x.Value;    // safe access after check
 }
 
 // Null coalescing
 int y = x ?? 0;
-
-// Null-conditional
-int? len = name?.Length;
 ```
+
+注意：`?.` 未实现（见 §2.6），判空请用 `HasValue` 或 `!= null` 后再访问。
 
 ### 3.4 Generics
 
@@ -199,40 +207,20 @@ class List<T> {
     public T this[int index] { get; }
 }
 
-// Constraints
+// Interface constraint
 class SortedList<T> where T : IComparable<T> {
     ...
 }
 
-// Multiple constraints
-T Max<T>(T a, T b) where T : struct, IComparable<T> {
+// Value-type constraint
+T Max<T>(T a, T b) where T : struct {
     return a.CompareTo(b) > 0 ? a : b;
 }
 ```
 
-**Constraint types:**
-- `where T : struct` — T must be a value type
-- `where T : class` — T must be a reference type
-- `where T : new()` — T must have a parameterless constructor
-- `where T : BaseClass` — T must derive from BaseClass
-- `where T : IInterface` — T must implement IInterface
+**Constraint types:** `where T : struct`（值类型）、`where T : BaseClass`（基类）、`where T : IInterface`（接口）。
 
 **Implementation:** Generics are monomorphized for value types (separate code per type) and use type erasure with virtual dispatch for reference types.
-
-### 3.5 Tuples
-
-```csharp
-// Anonymous tuple
-(int, string) pair = (42, "hello");
-int x = pair.Item1;
-
-// Named tuple
-(int Count, string Name) info = (42, "hello");
-int x = info.Count;
-
-// Destructuring
-var (count, name) = GetInfo();
-```
 
 ---
 
@@ -254,14 +242,12 @@ namespace MyApp.Core {
 ```csharp
 using System;               // Import namespace
 using System.IO;
-using static Math;          // Import static members
-using Pos = System.Drawing.Point;  // Type alias
 ```
 
 ### 4.3 Struct Declaration
 
 ```csharp
-[repr("C")]                 // Optional: C-compatible layout
+[StructLayout]              // Optional: C-compatible (sequential) layout
 public struct Vector3 {
     public float X;
     public float Y;
@@ -290,12 +276,12 @@ Structs:
 
 ```csharp
 public class Window {
-    // Fields
-    private string _title;
+    // Fields (initializers allowed)
+    private string _title = "";
     private int _width;
     private int _height;
 
-    // Constructor
+    // Constructor (overloads, `: this(...)` / `: base(...)` chaining supported)
     public Window(string title, int width, int height) {
         _title = title;
         _width = width;
@@ -309,15 +295,12 @@ public class Window {
 
     // Properties
     public string Title {
-        get => _title;
+        get { return _title; }
         set {
-            _title = value;
+            _title = value;     // `value` is the implicit setter parameter
             Invalidate();
         }
     }
-
-    // Auto-property
-    public bool Visible { get; set; } = true;
 
     // Methods
     public virtual void Show() { ... }
@@ -341,20 +324,10 @@ Classes:
 ```csharp
 public interface ISerializable {
     byte[] Serialize();
-    static ISerializable Deserialize(byte[] data);
 }
 
 public interface IComparable<T> {
     int CompareTo(T other);
-}
-
-// Default interface methods (optional)
-public interface ILogger {
-    void Log(string message);
-
-    void LogError(string message) {
-        Log($"ERROR: {message}");    // default implementation
-    }
 }
 ```
 
@@ -374,18 +347,9 @@ public enum HttpStatus : int {
     NotFound = 404,
     ServerError = 500
 }
-
-// Tagged union (algebraic data type)
-public enum Option<T> {
-    Some(T value),
-    None
-}
-
-public enum Result<T, E> {
-    Ok(T value),
-    Error(E error)
-}
 ```
+
+枚举是纯整数常量集合，**不支持** tagged union（代数数据类型）语法。
 
 ### 4.7 Delegate Declaration
 
@@ -394,6 +358,8 @@ public delegate int Comparison<T>(T x, T y);
 public delegate void Action<T>(T item);
 public delegate TResult Func<T, TResult>(T arg);
 ```
+
+支持捕获的 lambda（闭包）与无捕获 lambda。
 
 ---
 
@@ -404,12 +370,12 @@ public delegate TResult Func<T, TResult>(T arg);
 ```csharp
 int x = 42;
 var name = "hello";         // type inferred
-let pi = 3.14;              // immutable (like C# readonly local)
+let pi = 3.14;              // inferred; let 是声明语法（见下）
 const int MAX = 100;        // compile-time constant
 ```
 
-- `var` — mutable, type inferred
-- `let` — immutable after initialization
+- `var` — type inferred, mutable
+- `let` — type inferred；目前仅是声明语法（AST 带只读标记），**尚无可变性强制检查**
 - `const` — compile-time constant (must be computable at compile time)
 
 ### 5.2 Control Flow
@@ -444,40 +410,33 @@ foreach (var item in collection) {
     ...
 }
 
-// Switch (with pattern matching)
+// Switch
 switch (value) {
     case 0:
         ...
         break;
-    case int n when n > 0:
-        ...
-        break;
-    case string s:
-        ...
+    case 1:
+    case 2:
+        ...                 // fallthrough is explicit
         break;
     default:
         ...
         break;
 }
-
-// Switch expression
-var desc = value switch {
-    0 => "zero",
-    int n when n > 0 => "positive",
-    _ => "negative"
-};
 ```
+
+switch 目前是**语句**形态（常量 case + default）；`value switch { ... }` 表达式形态未实现，case 守卫 `when` 未实现。
 
 ### 5.3 Exception Handling
 
 ```csharp
 try {
-    var data = File.ReadAll("input.txt");
+    var data = File.ReadAllText("input.txt");
     Process(data);
 } catch (FileNotFoundException e) {
-    Console.Error($"File not found: {e.Path}");
+    Console.WriteLine("File not found");
 } catch (Exception e) {
-    Console.Error($"Error: {e.Message}");
+    Console.WriteLine("Error: " + e.Message);
 } finally {
     Cleanup();
 }
@@ -486,20 +445,22 @@ try {
 throw new ArgumentException("invalid value");
 ```
 
+`Console.Error` 不存在——错误输出用 `Console.WriteLine`。
+
 ---
 
 ## 6. Memory Model
 
 ### 6.1 Value Types — Stack Allocation
 
-Value types (primitives, structs, enums, tuples) are allocated on the stack. They are copied by value on assignment and parameter passing. No heap allocation, no reference counting.
+Value types (primitives, structs, enums) are allocated on the stack. They are copied by value on assignment and parameter passing. No heap allocation, no reference counting.
 
 ```csharp
 struct Point { public float X; public float Y; }
 
-var a = Point { X = 1, Y = 2 };    // stack allocated
+var a = new Point { X = 1, Y = 2 };  // stack allocated
 var b = a;                           // copied (independent)
-b.X = 99;                           // a.X is still 1
+b.X = 99;                            // a.X is still 1
 ```
 
 ### 6.2 Reference Types — ARC
@@ -544,37 +505,17 @@ class Child {
 }
 ```
 
-Accessing a weak reference returns `null` if the object has been deallocated.
+### 6.5 Native Memory (no raw pointers)
 
-### 6.5 Copy-on-Write (COW)
-
-Collections (List, Dict, etc.) use COW semantics:
+Zan 没有 `T*` 指针类型。低层内存操作经 `nint` 与 `NativeMemory` 完成：
 
 ```csharp
-var a = new List<int> { 1, 2, 3 };
-var b = a;              // b shares a's storage (refcount 2)
-b.Add(4);               // triggers copy — b gets independent storage
-// a = [1,2,3], b = [1,2,3,4]
+nint ptr = NativeMemory.Alloc(1024);
+NativeMemory.Fill(ptr, 0, 1024);
+NativeMemory.Free(ptr);
 ```
 
-### 6.6 Unsafe Context
-
-For low-level operations, use `unsafe` blocks:
-
-```csharp
-unsafe {
-    nint ptr = NativeAlloc(1024);
-    byte* data = (byte*)ptr;
-    data[0] = 0xFF;
-    NativeFree(ptr);
-}
-```
-
-In `unsafe` context:
-- Raw pointer arithmetic is allowed
-- Manual memory management
-- No bounds checking
-- No ARC for raw pointers
+`unsafe { }` 块与 `fixed (T name = expr)` 语句是合法语法（`fixed` 仅作作用域别名，无 GC 需要固定），但原生访问仍走 `nint`。
 
 ---
 
@@ -583,173 +524,113 @@ In `unsafe` context:
 ### 7.1 DllImport
 
 ```csharp
-[DllImport("user32.dll")]
+[DllImport("user32.dll", EntryPoint = "MessageBoxA")]
 static extern int MessageBox(nint hwnd, string text, string caption, uint type);
 
 [DllImport("kernel32.dll", EntryPoint = "GetTickCount64")]
 static extern long GetTickCount();
 ```
 
-### 7.2 C Header Import
+### 7.2 Struct Layout for Interop
 
 ```csharp
-[CImport("math.h")]
-static extern double sin(double x);
-
-[CImport("stdio.h")]
-static extern int printf(string format, ...);
-```
-
-### 7.3 Struct Layout for Interop
-
-```csharp
-[repr("C")]
+[StructLayout]
 struct POINT {
     public int X;
     public int Y;
 }
-
-[repr("C")]
-struct RECT {
-    public int Left;
-    public int Top;
-    public int Right;
-    public int Bottom;
-}
 ```
 
-### 7.4 Callback (Managed → Native → Managed)
+`[StructLayout]` 使结构体按 C 顺序布局（默认已是 sequential；无显式 `[StructLayout]` 的 struct 编译器也可能按需重排）。
+
+### 7.3 Function Pointers
+
+原生函数指针经 delegate 与 `nint` 互转（`System.Interop` 提供 `LoadLibrary`/`GetProcAddress`/`dlopen`/`dlsym` 封装）：
 
 ```csharp
 delegate int CompareFunc(nint a, nint b);
 
-[DllImport("libc")]
-static extern void qsort(nint base, int count, int size, CompareFunc cmp);
-
-// Usage:
-qsort(ptr, count, sizeof(int), (a, b) => {
-    return *(int*)a - *(int*)b;
-});
+// Load a native function by name, cast the nint to the delegate type, and call it
 ```
 
-### 7.5 String Marshaling
+### 7.4 String Marshaling
 
 | Zan Type | Native Type | Marshaling |
 |----------|-------------|------------|
 | `string` | `const char*` | UTF-8, null-terminated, temporary |
-| `string` | `const wchar_t*` | UTF-16 on Windows |
-| `byte[]` | `void*` + length | Pin and pass pointer |
+
+`[CImport]` 不存在；C 头文件不能直接导入，通过 `[DllImport]` + `System.Interop` 加载。
 
 ---
 
 ## 8. Standard Library Structure
 
-The standard library is distributed as Zan source files. Native dependencies are bundled alongside in `native/` subdirectories.
+标准库是 Zan 源码（`stdlib/`），与编译器一同发布；`--auto-stdlib` 让编译器自动定位。
 
 ```
 stdlib/
-├── System/
-│   ├── Console.zan            # Console I/O
-│   ├── Math.zan               # Math functions
-│   ├── String.zan             # String extensions
-│   ├── Convert.zan            # Type conversions
-│   ├── IO/
-│   │   ├── File.zan           # File operations
-│   │   ├── Path.zan           # Path manipulation
-│   │   ├── Stream.zan         # Stream abstractions
-│   │   └── native/            # Platform-specific native code
-│   ├── Collections/
-│   │   ├── List.zan           # Dynamic array
-│   │   ├── Dict.zan           # Hash map
-│   │   ├── Set.zan            # Hash set
-│   │   ├── Queue.zan          # Queue
-│   │   └── Stack.zan          # Stack
-│   ├── Text/
-│   │   ├── Encoding.zan       # UTF-8/16/32 encoding
-│   │   ├── Regex.zan          # Regular expressions
-│   │   └── StringBuilder.zan  # Mutable string builder
-│   ├── Net/
-│   │   ├── Http.zan           # HTTP client
-│   │   ├── Socket.zan         # TCP/UDP sockets
-│   │   └── native/
-│   │       ├── win/            # Windows native (ws2_32.dll)
-│   │       └── unix/           # Unix native (libcurl.so)
-│   ├── Threading/
-│   │   ├── Task.zan           # Async task
-│   │   ├── Thread.zan         # OS threads
-│   │   ├── Mutex.zan          # Synchronization
-│   │   └── Channel.zan        # Message passing
-│   └── Runtime/
-│       ├── GC.zan             # ARC runtime interface
-│       ├── Memory.zan         # Low-level memory ops
-│       └── Interop.zan        # FFI helpers
-├── Graphics/
-│   ├── Canvas.zan
-│   └── native/
-└── Platform/
-    ├── Windows.zan             # Win32 API bindings
-    └── Posix.zan               # POSIX API bindings
+├── System/        # 语言核心：集合、IO、文本、网络、线程、JSON 等
+├── Gui/           # 自托管 IDE 使用的 UI 框架（纯 Zan，标准库组件）
+├── Game/          # 游戏/图形库
+├── Sdk/           # 平台 SDK 绑定（生成代码为主）
+├── SDL3/          # SDL3 绑定层
+└── Platform/      # 平台占位
 ```
+
+`System/` 下按子命名空间组织：`Collections`、`Compiler`（Zan 脚本化代码生成器）、`Data`、`Diagnostics`、`Drawing`、`Globalization`、`IO`、`Input`、`Json`、`Linq`、`Management`、`Net`、`Resources`、`Scripting`（Python/Lua 嵌入）、`Security`、`ServiceProcess`、`Text`（正则等）、`Threading`、`Web`、`Windows`。
+
+以下类型由编译器内建（`src/compiler/builtin_api.c`），不必写实现即可用：
+
+| 类型 | 说明 |
+|------|------|
+| `string` | 不可变 UTF-8 字符串 |
+| `List<T>` / `Dictionary<K,V>` | 动态数组 / 哈希表 |
+| `StringBuilder` | 可变字符串构造器 |
+| `Console` | `WriteLine`/`Write`/`PrintLine`/`ReadLine`/`Read`/`ReadKey`/`Clear`/`ResetColor` + `ForegroundColor`/`BackgroundColor`/`Title` 属性 |
+| `Math` | `Abs`/`Max`/`Min`/`Pow`/`Sqrt`/`Round`/`Floor`/`Ceiling` |
+| `Convert` | `ToDouble`/`ToInt32`/`ToInt64` |
+| `String` | `Format`/`Join`/`IsNullOrEmpty`/`CompareOrdinal` |
+| `File` / `Directory` / `Path` | 文件系统 |
+| `Environment` | `ArgCount`/`ArgAt`/`ExeDir` |
+| `NativeMemory` | `Alloc`/`Free`/`Copy`/`Fill`/`Compare`/`GetString`/`PutString` |
+| `Task` | 协程：`Spawn`/`Run`/`Delay`/`WhenAll`/`WhenAny`/`IsDone`/`Cancel` |
+
+原生依赖（如 `libcrypto`、平台驱动 DLL/SO）以 driver bundle 形式随各模块发布，`--publish` 时按 `--link-mode shared|static` 链接到可执行文件旁或并入 exe。
 
 ### 8.1 Import Resolution
 
-When the compiler encounters `using System.IO`, it searches:
-
-1. `<stdlib_path>/System/IO.zan` (single file module)
-2. `<stdlib_path>/System/IO/` directory (multi-file module, entry = `mod.zan`)
-
-Native dependencies in `native/` are automatically linked based on target platform.
+`using System.Collections.Generic;` 按命名空间路径解析到 `stdlib/` 下的目录或文件。编译器选项 `--stdlib-path <dir>` 指定根目录，`--auto-stdlib` 自动查找。包（第三方命名空间）经 `--package-install` / `--package-scope` 安装到项目作用域或全局作用域。
 
 ### 8.2 Non-Intrusive Design
 
 - Standard library modules are loaded **only when imported** (not preloaded)
-- Each module is self-contained — its `native/` directory holds all required DLLs/SOs
+- Each module is self-contained — its driver bundle holds all required DLLs/SOs
 - User code and stdlib use the same module system — no special treatment
-- Users can override stdlib modules by placing files in their project's `lib/` directory
 
 ---
 
-## 9. Project Configuration
+## 9. Building Projects
 
-### 9.1 project.zan
-
-```
-project MyApp {
-    type = "exe"                    // exe, lib, dll
-    version = "1.0.0"
-    authors = ["Author Name"]
-    target = "windows-x64"         // or linux-x64, macos-arm64, auto
-
-    dependencies {
-        std = "builtin"            // standard library
-    }
-
-    native {
-        link "user32.dll"          // native libraries to link
-        link "gdi32.dll"
-        include "vendor/include"   // C header search paths
-    }
-
-    build {
-        optimize = "release"       // debug, release, size
-        debug_info = true
-        warnings_as_errors = false
-    }
-}
-```
-
-### 9.2 Build Commands
+没有 `project.zan` 项目文件——项目就是一组 `.zan` 源文件，用 `zanc` 直接编译：
 
 ```bash
-zan build                   # Build project
-zan run                     # Build and run
-zan test                    # Run test suite
-zan check                   # Type check without building
-zan fmt                     # Format source code
-zan doc                     # Generate documentation
-zan build --release         # Optimized build
-zan build --target linux-x64  # Cross-compile
+zanc main.zan --auto-stdlib -o app.exe          # build and link
+zanc main.zan --auto-stdlib --publish -o app.exe # optimized release
+zanc main.zan --auto-stdlib -o lib.dll --emit-lib # shared library
 ```
+
+常用选项（完整见 `zanc --help`）：
+
+- `-o <output>` — 输出文件
+- `--publish` — 发布构建（`-Os`、剥离调试信息、链接原生驱动）
+- `--link-mode shared|static` — 驱动链接方式
+- `--target <name>` — 交叉编译（`--list-targets` 列出）
+- `-O0..-O3/-Os/-Oz` — 优化级别
+- `-g` — DWARF 调试信息
+- `--check-leaks` — 退出时报告未释放对象
+- `--package-*` — 包管理（安装/清单/API 地址）
+
+配套工具：`zanfmt`（格式化）、`zandoc`（文档生成）、`zan-lsp`（语言服务器）、`zan-dap`（调试适配器）。
 
 ---
 
@@ -803,7 +684,7 @@ statement       = var_decl | expr_stmt | if_stmt | while_stmt | for_stmt
                 | continue_stmt | throw_stmt | try_stmt | block ;
 
 expr            = assignment | conditional | binary | unary | postfix
-                | primary | lambda | switch_expr ;
+                | primary | lambda ;
 primary         = literal | IDENT | "this" | "base" | "(" expr ")"
                 | "new" type [ "(" arg_list ")" ] [ "{" init_list "}" ]
                 | "typeof" "(" type ")" | "sizeof" "(" type ")"
@@ -817,17 +698,21 @@ qualified_name  = IDENT { "." IDENT } ;
 
 ---
 
-## Appendix A: Reserved for Future
+## Appendix A: 已实现与保留
 
-Since implemented (moved out of this appendix): `yield return` / `yield break`
-(eagerly lowered to a hidden `List<T>` accumulator, not a lazy iterator),
-`fixed`, `lock`, and `record` — see `tests/conformance/yield_iterators.zan`,
-`lock_goto_unsafe_fixed.zan`, and `record_types.zan`.
+以下特性已实现（有 conformance 用例）：`yield return` / `yield break`（急切降级为隐藏 `List<T>` 累加器，非惰性迭代器）、`fixed`、`lock`、`goto`、`record`、属性 `get`/`set`、运算符重载、可空值类型（`int?` 的 `.HasValue`/`.Value`）、命名空间限定调用、`--check-leaks`。
 
-Still reserved:
+以下 C# 特性**尚未实现**，不要在 Zan 代码中使用：
 
-- `checked` / `unchecked` — overflow checking
+- `checked` / `unchecked` — 关键字存在但均为 **no-op**：溢出检查始终关闭（环绕语义），`checked(x + 1)` 与 `x + 1` 行为相同（`tests/conformance/cs_b14_checked.zan`）
 - `using` statement — deterministic disposal (like C# IDisposable)
 - `init` — init-only property setter
 - lazy iterators (`IEnumerable<T>` protocol) — `yield` currently materializes a list
 - LINQ query syntax (`from x in xs where ... select`) — method chains only
+- 元组 `(int, string)` / 解构
+- tagged union 枚举（代数数据类型）
+- `?.` null-conditional（会被当作普通访问解析，行为不标准）
+- `\x` / `\u` / `\U` 字符转义
+- `$@"..."` 组合字符串、`"""` 原始字符串
+- COW（copy-on-write）集合——`List` 赋值是引用共享，修改即共享
+- `[CImport]`、`project.zan` 项目文件、`zan` CLI（实际为 `zanc`）

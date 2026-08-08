@@ -41,15 +41,11 @@ event loop (`UiDriver.Tick`). The standard `App.Run`/`ProcessEvent` loop ticks i
 automatically; ZanIDE's custom loop ticks it explicitly. When active it also
 publishes the `editor` and `log` probes each frame.
 
-Helper launcher (`_scratch/run_uidrv.ps1`):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File _scratch\run_uidrv.ps1 `
-    -Script _scratch\uidrv\my_script.zscript -TimeoutSec 30
-```
-
-It sets `ZAN_UI_SCRIPT`/`ZAN_UI_OUT`, launches `build\ZanIDE.exe`, and kills it
-if it does not exit within the timeout.
+A helper launcher script (setting `ZAN_UI_SCRIPT`/`ZAN_UI_OUT`, launching
+`build\ZanIDE.exe`, and killing it if it does not exit within a timeout) is a
+convenient way to drive the IDE from a command line. It is a throwaway helper,
+so per workspace convention it lives in `_scratch/` (git-ignored) and is
+rebuilt on demand — it is not part of the repo.
 
 ## Command grammar
 

@@ -17,7 +17,7 @@
 规则：
 - 用户默认只需要门面层。示例必须体现"Workerman 式"体验：
   ```csharp
-  HttpServer s = new HttpServer(8080);      // 一行可用
+  HttpServer s = new HttpServer("0.0.0.0", 8080);  // 一行可用
   s.OnRequest((req, resp) => { ... });
   await s.Start();
   ```
@@ -62,14 +62,17 @@
 
 ## 6. 现存违规清单（改造 backlog）
 
+以下已解决项移出待办（✅）；未解决项仍有效。
+
 | 组件 | 违规 | 处置 |
 |---|---|---|
-| Orm/QueryBuilder, Model | SQL 值内联拼接、标识符不校验 | 参数化改造（进行中） |
-| Sqlite/MySql/Postgres/ODBC | 无参数绑定 | bind FFI / binary protocol / PQexecParams / SQLBindParameter |
-| Orm/ModelRow.ToJson | 手拼 JSON，值含引号即产出非法 JSON | 改走 JsonValue |
-| Threading/Channel | Send/Receive 不阻塞，假实现 | 基于 AsyncGate 重写 |
-| Thread.SleepAsync / File.*Async / Model.*Async | 同步冒充异步 | 真异步或去 Async 后缀 |
-| IO/File | 整读整写、无流式、错误静默、`int` 句柄 | Stream 家族 + 异常 |
-| Socket 旧 `*Async` | select busy-wait | 迁移 AsyncSocket，标记废弃 |
-| Enumerable.OrderBy | 冒泡 O(n²) | 归并排序 |
-| 各驱动/File | `int` 承载指针 | 统一句柄封装（长期：语言级 nint） |
+| Orm/QueryBuilder, Model | ~~SQL 值内联拼接、标识符不校验~~ | ✅ 已解决：参数化绑定 |
+| Sqlite/MySql/Postgres | ~~无参数绑定~~ | ✅ 已解决：bind FFI / 二进制协议 / PQexecParams |
+| Orm/ModelRow.ToJson | ~~手拼 JSON，值含引号即产出非法 JSON~~ | ✅ 已解决：改走 JsonValue |
+| Threading/Channel | ~~Send/Receive 不阻塞，假实现~~ | ✅ 已解决：基于 Gate/异步锁重写（现为 string 专属非泛型） |
+| Socket 旧 `*Async` | ~~select busy-wait~~ | ✅ 已解决：迁移 AsyncSocket，标记废弃 |
+| Enumerable.OrderBy | ~~冒泡 O(n²)~~ | ✅ 已解决：归并排序 |
+| 各驱动/File | ~~`int` 承载指针~~ | ✅ 已解决：统一句柄封装 |
+| ODBC | 无参数绑定（`OdbcConnector.zan` 无 Param/Bind） | 未解决 |
+| Thread.SleepAsync / File.*Async / Model.*Async | 同步冒充异步（如 `File.zan` 的 `ReadAllTextAsync` 仍是同步包装） | 未解决：真异步或去 Async 后缀 |
+| IO/File | 整读整写仍为主流形态，流式路径不普及 | 未解决：逐步提供 Stream 家族 |
