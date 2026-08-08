@@ -83,6 +83,11 @@ ZanIDE禁止任何自绘必须全部用标准库组件来完成
 
 ## Build / dev quickstart
 
+**The toolchain of each platform is fixed — see [`docs/BUILD_TOOLCHAIN.md`](docs/BUILD_TOOLCHAIN.md).**
+On Windows always configure with clang plus the mozbuild LLVM: letting CMake pick
+up TDM-GCC from PATH cannot link zanc, and the failed link deletes
+`build\zanc.exe`, taking the whole test suite with it.
+
 ```bash
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build            # zanc, zan-lsp, zan-dap, tools

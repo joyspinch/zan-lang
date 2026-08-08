@@ -3202,6 +3202,8 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
         return cn;
     }
 ordinary_member:
+    /* C17 requires a statement after a label, not a declaration. */
+    ;
     /* type or identifier */
     zan_ast_node_t *type = parse_type_ref(p);
 

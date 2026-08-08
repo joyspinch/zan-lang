@@ -1042,6 +1042,18 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
 
   # The property protocol (Props() specs -> Control.GetProp/SetProp) is what
   # the designer and the serializer talk to, and it is pure computation.
+  # A `"role": "control"` .zform must build an embeddable Control: the designed
+  # tree lands under the control itself and the designer's `label` reaches every
+  # control publishing a `text` property (containers keep it as a design note).
+  add_test(NAME conformance_gui_zform_control
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/zform_control_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/zform_control.zform;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_zform_control.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_zform_control${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   add_test(NAME conformance_gui_props
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
