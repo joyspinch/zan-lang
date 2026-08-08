@@ -4144,7 +4144,8 @@ static int q_synth_counter = 0;
 
 static zan_istr_t query_fresh_name(zan_irgen_t *g, const char *prefix) {
     char buf[40];
-    snprintf(buf, sizeof buf, "__q%s%d", prefix, q_synth_counter++);
+    int n = (int)__atomic_fetch_add(&q_synth_counter, 1, __ATOMIC_SEQ_CST);
+    snprintf(buf, sizeof buf, "__q%s%d", prefix, n);
     char *p = zan_arena_strdup(g->arena, buf, (size_t)strlen(buf));
     return (zan_istr_t){ p, (uint32_t)strlen(buf) };
 }
@@ -7398,7 +7399,8 @@ static LLVMValueRef emit_box_cell(zan_irgen_t *g, zan_loc_t loc,
     LLVMTypeRef rec_ty = box_cell_type(g, payload);
     static int box_id = 0;
     char bname[64];
-    snprintf(bname, sizeof(bname), "box_%d", box_id++);
+    snprintf(bname, sizeof(bname), "box_%d",
+             (int)__atomic_fetch_add(&box_id, 1, __ATOMIC_SEQ_CST));
     lambda_capture_t val = { .name = (zan_istr_t){ NULL, 0 }, .slot = NULL,
                              .type = vtype, .llvm = payload, .boxed = 0 };
     LLVMValueRef dtor = build_closure_dtor(g, bname, rec_ty, &val, 1, 0);
@@ -7565,7 +7567,8 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
 
     char lname[64];
     static int lambda_id = 0;
-    snprintf(lname, sizeof(lname), "lambda_%d", lambda_id++);
+    snprintf(lname, sizeof(lname), "lambda_%d",
+             (int)__atomic_fetch_add(&lambda_id, 1, __ATOMIC_SEQ_CST));
     LLVMValueRef lambda_fn = LLVMAddFunction(g->mod, lname, fn_type);
 
     /* { ptr fn, ptr dtor, ptr target, <captures>, [ptr this] }; a lambda has no

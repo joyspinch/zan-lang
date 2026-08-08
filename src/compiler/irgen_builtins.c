@@ -2095,9 +2095,8 @@ static LLVMValueRef emit_null_cond(zan_irgen_t *g, zan_ast_node_t *expr,
     zan_type_t *oty = infer_expr_type(g, qmem->member.object, locals);
     char nm[32];
     snprintf(nm, sizeof(nm), "__qdot%d", g->qdot_counter++);
-    char *nmp = (char *)zan_arena_alloc(g->arena, strlen(nm) + 1);
-    strcpy(nmp, nm);
-    zan_istr_t iname = { nmp, (int)strlen(nmp) };
+    zan_istr_t iname = { zan_arena_strdup(g->arena, nm, strlen(nm)),
+                           (int)strlen(nm) };
     LLVMValueRef slot = emit_entry_alloca(g, LLVMTypeOf(obj), nm);
     LLVMBuildStore(g->builder, obj, slot);
     local_add(locals, iname, slot, oty);

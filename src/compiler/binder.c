@@ -176,20 +176,20 @@ zan_type_t *zan_binder_make_grouping_type(zan_binder_t *b, zan_type_t *elem) {
 static void tuple_sig_type(zan_type_t *t, char *buf, size_t cap) {
     if (!t || cap == 0) return;
     size_t used = strlen(buf);
-    if (used >= cap - 1) return;
+    if (used + 1 >= cap) return;
     if (t->kind == TYPE_ARRAY && t->element_type) {
         tuple_sig_type(t->element_type, buf, cap);
-        if (strlen(buf) < cap - 4) {
+        if (strlen(buf) + 4 < cap) {
             strcat(buf, "[");
             for (int r = 1; r < (t->array_rank > 1 ? t->array_rank : 1); r++)
-                if (strlen(buf) < cap - 2) strcat(buf, ",");
+                if (strlen(buf) + 2 < cap) strcat(buf, ",");
             strcat(buf, "]");
         }
         return;
     }
     if (t->kind == TYPE_NULLABLE && t->element_type) {
         tuple_sig_type(t->element_type, buf, cap);
-        if (strlen(buf) < cap - 1) strcat(buf, "?");
+        if (strlen(buf) + 1 < cap) strcat(buf, "?");
         return;
     }
     const char *nm = t->name.str ? t->name.str : "?";
@@ -199,12 +199,12 @@ static void tuple_sig_type(zan_type_t *t, char *buf, size_t cap) {
     if (used + (size_t)nl + 8 >= cap) return;
     strncat(buf, nm, (size_t)nl);
     if (t->type_arg_count > 0) {
-        if (strlen(buf) < cap - 2) strcat(buf, "<");
+        if (strlen(buf) + 2 < cap) strcat(buf, "<");
         for (int i = 0; i < t->type_arg_count; i++) {
-            if (i > 0 && strlen(buf) < cap - 2) strcat(buf, ",");
+            if (i > 0 && strlen(buf) + 2 < cap) strcat(buf, ",");
             tuple_sig_type(t->type_args[i], buf, cap);
         }
-        if (strlen(buf) < cap - 1) strcat(buf, ">");
+        if (strlen(buf) + 1 < cap) strcat(buf, ">");
     }
 }
 

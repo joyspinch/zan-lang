@@ -213,8 +213,8 @@ static void *zan_mem_small(size_t n) {
          * header so the next free of this live block is not mistaken for a
          * double free (the guard keys on the FREED marker). */
         zan_mem_hdr_t *h = (zan_mem_hdr_t *)((char *)p - ZAN_MEM_HDR);
-        h->magic = ZAN_MEM_MAGIC;
-        h->cls = (uint32_t)cls;
+        __atomic_store_n(&h->magic, ZAN_MEM_MAGIC, __ATOMIC_RELEASE);
+        __atomic_store_n(&h->cls, (uint32_t)cls, __ATOMIC_RELEASE);
         return p;
     }
     size_t need = (size_t)k_class_size[cls] + ZAN_MEM_HDR;
@@ -223,8 +223,8 @@ static void *zan_mem_small(size_t n) {
     }
     zan_mem_hdr_t *h = (zan_mem_hdr_t *)t_bump;
     t_bump += need;
-    h->magic = ZAN_MEM_MAGIC;
-    h->cls = (uint32_t)cls;
+    __atomic_store_n(&h->magic, ZAN_MEM_MAGIC, __ATOMIC_RELEASE);
+    __atomic_store_n(&h->cls, (uint32_t)cls, __ATOMIC_RELEASE);
     return (char *)h + ZAN_MEM_HDR;
 }
 
@@ -246,18 +246,18 @@ void *__wrap_malloc(size_t n) {
  * drift apart. */
 static int zan_mem_hdr_check(const void *p, uint32_t *cls) {
     zan_mem_hdr_t *h = (zan_mem_hdr_t *)((const char *)p - ZAN_MEM_HDR);
-    /* The allocator header at p-16 is only ever written by this allocator:
-     * the compiler's object header (refcount/site) lives at p..p+15, so these
-     * bytes survive for the block's whole lifetime. A freed block is marked
-     * FREED until it is re-allocated, which turns a second free of the same
-     * block -- a memory-aliasing bug under ARC -- into an immediate abort
-     * instead of two allocations returning the same address. */
-    if (h->magic == ZAN_MEM_FREED) {
+    /* The allocator header at p-16 is only ever written by this allocator,
+     * but it can be read by a thread different from the one that allocated the
+     * block (per-thread free lists allow a block to be freed by another
+     * thread).  Atomic acquire/release accesses on the header fields synchronize
+     * those cross-thread operations. */
+    uint32_t magic = __atomic_load_n(&h->magic, __ATOMIC_ACQUIRE);
+    if (magic == ZAN_MEM_FREED) {
         fprintf(stderr, "zan runtime: double free of block %p\n", (void *)p);
         abort();
     }
-    if (h->magic != ZAN_MEM_MAGIC) return -1;   /* not a block start: ignore */
-    uint32_t c = h->cls;
+    if (magic != ZAN_MEM_MAGIC) return -1;   /* not a block start: ignore */
+    uint32_t c = __atomic_load_n(&h->cls, __ATOMIC_ACQUIRE);
     if (c >= (uint32_t)ZAN_MEM_NCLASS) {   /* header garbage: refuse to trust it */
         fprintf(stderr, "zan runtime: corrupt block header at %p (class %u)\n",
                 (void *)p, (unsigned)c);
@@ -273,7 +273,7 @@ void __wrap_free(void *p) {
     uint32_t cls;
     if (zan_mem_hdr_check(p, &cls) != 0) return;
     zan_mem_hdr_t *h = (zan_mem_hdr_t *)((char *)p - ZAN_MEM_HDR);
-    h->magic = ZAN_MEM_FREED;
+    __atomic_store_n(&h->magic, ZAN_MEM_FREED, __ATOMIC_RELEASE);
     *(void **)p = t_free_list[cls];
     t_free_list[cls] = p;
 }

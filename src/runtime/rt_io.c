@@ -416,13 +416,22 @@ int32_t zan_io_resolve_sa(const char *name, int32_t port, void *buf,
 }
 
 /* Resolve a hostname to an IPv4 address in the same byte order as inet_addr.
- * Returns 0 on failure.  The implementation uses gethostbyname/AF_INET and
- * avoids hard-coding the hostent layout in Zan code. */
+ * Returns 0 on failure.  Uses getaddrinfo/AF_INET so concurrent lookups are
+ * thread-safe (gethostbyname returns a process-wide static buffer). */
 int32_t zan_io_resolve_ipv4(const char *hostname) {
-    struct hostent *he = gethostbyname(hostname);
-    if (!he || !he->h_addr_list || !he->h_addr_list[0]) return 0;
-    unsigned char *a = (unsigned char *)he->h_addr_list[0];
-    return (int32_t)(a[0] | (a[1] << 8) | (a[2] << 16) | (a[3] << 24));
+    if (!hostname || !*hostname) return 0;
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(hostname, NULL, &hints, &res) != 0 || !res) return 0;
+    struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
+    int32_t addr = 0;
+    if (res->ai_family == AF_INET && sin->sin_family == AF_INET)
+        addr = (int32_t)sin->sin_addr.s_addr;
+    freeaddrinfo(res);
+    return addr;
 }
 
 #if defined(_WIN32)

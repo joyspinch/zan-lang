@@ -200,7 +200,7 @@ static LONG WINAPI zan__crash_filter(EXCEPTION_POINTERS *ep) {
     exe_dir[0] = '\0';
     DWORD n = GetModuleFileNameA(NULL, logpath, (DWORD)sizeof logpath);
     if (n == 0 || n >= sizeof logpath) {
-        strcpy(logpath, "zan_crash.log");
+        snprintf(logpath, sizeof(logpath), "zan_crash.log");
     } else {
         char *slash = strrchr(logpath, '\\');
         if (slash) {
@@ -211,7 +211,7 @@ static LONG WINAPI zan__crash_filter(EXCEPTION_POINTERS *ep) {
             strncat(logpath, "zan_crash.log",
                     sizeof(logpath) - strlen(logpath) - 1);
         } else {
-            strcpy(logpath, "zan_crash.log");
+            snprintf(logpath, sizeof(logpath), "zan_crash.log");
         }
     }
 

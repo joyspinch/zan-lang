@@ -13,6 +13,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../common/host_oom.h"
+
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>

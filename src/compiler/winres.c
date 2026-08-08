@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../common/host_oom.h"
+
 #include "winres.h"
 
 #define RES_LANG 1033           /* en-US: what every toolchain defaults to */

@@ -13,6 +13,8 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include "../common/host_oom.h"
+
 typedef struct {
     const char*          name;
     const unsigned char* data;

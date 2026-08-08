@@ -21,6 +21,8 @@
 #include <string.h>
 #include <time.h>
 
+#include "../common/host_oom.h"
+
 #ifdef _WIN32
 #include <windows.h>
 #else

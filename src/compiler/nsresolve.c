@@ -34,6 +34,8 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
+#include "../common/host_oom.h"
+
 /* ---- istr helpers ---- */
 
 static zan_istr_t mk_istr(zan_arena_t *a, const char *s, size_t n) {

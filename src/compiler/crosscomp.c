@@ -69,6 +69,7 @@ bool zan_target_parse(const char *triple_str, zan_target_t *out) {
     }
 
     strncpy(out->triple, triple_str, sizeof(out->triple) - 1);
+    out->triple[sizeof(out->triple) - 1] = '\0';
     out->arch = parse_arch(triple_str);
     out->os = parse_os(triple_str);
     out->abi = parse_abi(triple_str, out->os);

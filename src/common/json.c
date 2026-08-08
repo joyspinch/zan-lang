@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include <math.h>
 #include <limits.h>
+#include <stdint.h>
 
 #include "host_oom.h"
 /* ============================ construction ============================ */
@@ -55,6 +56,7 @@ json_value *json_new_arr(void) { return json_alloc(JSON_ARR); }
 void json_arr_add(json_value *arr, json_value *val) {
     if (!arr || arr->type != JSON_ARR || !val) return;
     if (arr->as.arr.count >= arr->as.arr.cap) {
+        if (arr->as.arr.cap > INT_MAX / 2) zan_host_oom();
         int nc = arr->as.arr.cap ? arr->as.arr.cap * 2 : 8;
         json_value **grown = (json_value **)realloc(arr->as.arr.items,
                                                     sizeof(json_value *) * (size_t)nc);
@@ -259,7 +261,10 @@ static json_value *jp_string(jparser *j) {
                     utf8[n++] = (char)(0x80 | (code & 0x3F));
                 }
                 for (int i = 0; i < n; i++) {
-                    if (len + 1 >= cap) { cap *= 2; buf = (char *)realloc(buf, cap); }
+                    if (len + 1 >= cap) {
+                        if (cap > SIZE_MAX / 2) { free(buf); j->ok = false; return NULL; }
+                        cap *= 2; buf = (char *)realloc(buf, cap);
+                    }
                     buf[len++] = utf8[i];
                 }
                 continue;
@@ -268,6 +273,7 @@ static json_value *jp_string(jparser *j) {
             }
         }
         if (len + 1 >= cap) {
+            if (cap > SIZE_MAX / 2) { free(buf); j->ok = false; return NULL; }
             cap *= 2;
             char *g = (char *)realloc(buf, cap);
             if (!g) { free(buf); j->ok = false; return NULL; }

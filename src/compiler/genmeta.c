@@ -27,6 +27,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../common/host_oom.h"
+
 typedef struct {
     json_value *calls;   /* json array */
     int call_id;

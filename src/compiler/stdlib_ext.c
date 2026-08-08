@@ -225,15 +225,37 @@ void zan_mutex_lock(zan_mutex_t mtx) { pthread_mutex_lock((pthread_mutex_t *)mtx
 void zan_mutex_unlock(zan_mutex_t mtx) { pthread_mutex_unlock((pthread_mutex_t *)mtx); }
 void zan_mutex_destroy(zan_mutex_t mtx) { pthread_mutex_destroy((pthread_mutex_t *)mtx); free(mtx); }
 
+typedef struct {
+    pthread_mutex_t mtx;
+    pthread_cond_t cond;
+} zan_event_posix_t;
+
 zan_event_t zan_event_create(void) {
-    /* Simplified: use mutex+cond pair */
-    pthread_cond_t *c = (pthread_cond_t *)malloc(sizeof(pthread_cond_t));
-    pthread_cond_init(c, NULL);
-    return (zan_event_t)c;
+    zan_event_posix_t *e = (zan_event_posix_t *)malloc(sizeof(*e));
+    if (!e) return NULL;
+    pthread_mutex_init(&e->mtx, NULL);
+    pthread_cond_init(&e->cond, NULL);
+    return (zan_event_t)e;
 }
-void zan_event_signal(zan_event_t evt) { pthread_cond_signal((pthread_cond_t *)evt); }
-void zan_event_wait(zan_event_t evt) { (void)evt; /* simplified */ }
-void zan_event_destroy(zan_event_t evt) { pthread_cond_destroy((pthread_cond_t *)evt); free(evt); }
+void zan_event_signal(zan_event_t evt) {
+    zan_event_posix_t *e = (zan_event_posix_t *)evt;
+    pthread_mutex_lock(&e->mtx);
+    pthread_cond_signal(&e->cond);
+    pthread_mutex_unlock(&e->mtx);
+}
+void zan_event_wait(zan_event_t evt) {
+    zan_event_posix_t *e = (zan_event_posix_t *)evt;
+    pthread_mutex_lock(&e->mtx);
+    pthread_cond_wait(&e->cond, &e->mtx);
+    pthread_mutex_unlock(&e->mtx);
+}
+void zan_event_destroy(zan_event_t evt) {
+    zan_event_posix_t *e = (zan_event_posix_t *)evt;
+    if (!e) return;
+    pthread_cond_destroy(&e->cond);
+    pthread_mutex_destroy(&e->mtx);
+    free(e);
+}
 
 int64_t zan_atomic_add(volatile int64_t *ptr, int64_t val) { return __sync_fetch_and_add(ptr, val); }
 int64_t zan_atomic_load(volatile int64_t *ptr) { return __sync_val_compare_and_swap(ptr, 0, 0); }
