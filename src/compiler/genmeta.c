@@ -551,8 +551,17 @@ static void gm_walk_stmt(zan_ast_node_t *n, gm_ctx_t *c) {
         break;
     case AST_QUERY_EXPR:
         gm_walk_expr(n->query.source, c);
-        for (int i = 0; i < n->query.wheres.count; i++)
-            gm_walk_expr(n->query.wheres.items[i], c);
+        for (int i = 0; i < n->query.clauses.count; i++) {
+            zan_ast_node_t *cl = n->query.clauses.items[i];
+            gm_walk_expr(cl->query_clause.expr, c);
+            if (cl->kind == AST_QUERY_JOIN) {
+                gm_walk_expr(cl->query_clause.source, c);
+                gm_walk_expr(cl->query_clause.left_key, c);
+                gm_walk_expr(cl->query_clause.right_key, c);
+            }
+        }
+        gm_walk_expr(n->query.group_expr, c);
+        gm_walk_expr(n->query.group_key, c);
         gm_walk_expr(n->query.select, c);
         break;
     default:
@@ -914,8 +923,17 @@ static void gm_find_stmt(zan_ast_node_t *n, gm_find_ctx_t *f) {
         break;
     case AST_QUERY_EXPR:
         gm_find_expr(n->query.source, f);
-        for (int i = 0; i < n->query.wheres.count; i++)
-            gm_find_expr(n->query.wheres.items[i], f);
+        for (int i = 0; i < n->query.clauses.count; i++) {
+            zan_ast_node_t *cl = n->query.clauses.items[i];
+            gm_find_expr(cl->query_clause.expr, f);
+            if (cl->kind == AST_QUERY_JOIN) {
+                gm_find_expr(cl->query_clause.source, f);
+                gm_find_expr(cl->query_clause.left_key, f);
+                gm_find_expr(cl->query_clause.right_key, f);
+            }
+        }
+        gm_find_expr(n->query.group_expr, f);
+        gm_find_expr(n->query.group_key, f);
         gm_find_expr(n->query.select, f);
         break;
     default:

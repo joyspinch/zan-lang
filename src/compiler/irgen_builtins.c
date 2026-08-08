@@ -818,16 +818,8 @@ static LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
  * are needed past claiming its table slot. Handler slots carry their jmp_buf
  * (1024 bytes, covering every supported target's) plus the unwind-stack depth
  * the handler was armed at, which a throw uses to release the skipped frames'
- * locals while they are still alive (see emit_eh_unwind_to_handler). */
-#define ZAN_EH_CHUNKS      64     /* chunk-table entries, both stacks */
-#define ZAN_EH_SLOT_SHIFT  6      /* 64 handler slots per chunk */
-#define ZAN_EH_SLOT_BYTES  1040   /* jmp_buf (1024) + mark, 16-byte aligned */
-#define ZAN_EH_MARK_OFF    1024
-#define ZAN_EH_TMP_SHIFT   12     /* 4096 unwind-stack entries per chunk */
-#define ZAN_EH_THREADS     1024   /* live threads that can raise exceptions */
-/* A slot whose thread released its block: claimable again, but a probe must
- * pass through it or it would cut the chain of the keys stored after it. */
-#define ZAN_EH_TOMBSTONE   0xFFFFFFFFFFFFFFFFULL
+ * locals while they are still alive (see emit_eh_unwind_to_handler).
+ * The numeric constants (ZAN_EH_*) are in ../common/zan_abi.h. */
 
 /* Fields of the per-thread state block. */
 enum {
@@ -1958,7 +1950,12 @@ static LLVMValueRef emit_dict_find(zan_irgen_t *g, zan_type_t *dict_type,
  * correct ordering. Returns NULL when `fsym` is not a static field. */
 static LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_sym,
                                             zan_symbol_t *fsym) {
-    if (!class_sym || !fsym || !fsym->decl || fsym->decl->kind != AST_FIELD_DECL)
+    /* plain fields and automatic properties (`{ get; set; }`) share a backing
+     * global; custom-accessor properties are dispatched to their getter/setter
+     * methods and never reach here */
+    if (!class_sym || !fsym || !fsym->decl ||
+        (fsym->decl->kind != AST_FIELD_DECL &&
+         fsym->decl->kind != AST_PROPERTY_DECL))
         return NULL;
     if (!((fsym->modifiers & MOD_STATIC) ||
           (fsym->decl->field_decl.modifiers & MOD_STATIC)))
@@ -2158,12 +2155,107 @@ static LLVMValueRef emit_null_cond(zan_irgen_t *g, zan_ast_node_t *expr,
  * once the argument list is full there is nothing left to append. A trailing
  * `params` tail and operator methods (whose declared list carries an injected
  * receiver) are left to pack_params_args. */
+/* Reorder named call arguments (`F(b: 2, x: 10)`) to the callee's parameter
+ * order once the method symbol is known. Positional arguments fill the
+ * remaining slots left to right, mirroring C#: a named argument binds to the
+ * parameter of the same name, and the position of a named argument is
+ * irrelevant. Unknown names and duplicates are diagnosed. */
+static void reorder_named_args_impl(zan_irgen_t *g, zan_ast_list_t *args,
+                                    zan_loc_t loc, zan_ast_node_t *decl) {
+    if (!args || !decl) return;
+    if (decl->kind != AST_METHOD_DECL &&
+        decl->kind != AST_CONSTRUCTOR_DECL) return;
+    int n = args->count;
+    int has_named = 0;
+    for (int i = 0; i < n; i++) {
+        if (args->items[i] &&
+            args->items[i]->kind == AST_NAMED_ARG) { has_named = 1; break; }
+    }
+    if (!has_named) return;
+
+    zan_ast_list_t *ps = &decl->method_decl.params;
+    int m = ps->count;
+    /* slot[i] = call-arg index placed at AST-parameter position i, or -1. */
+    int *slot = (int *)malloc(sizeof(int) * (size_t)(m > n ? m : n));
+    for (int i = 0; i < (m > n ? m : n); i++) slot[i] = -1;
+    int *used_name = (int *)malloc(sizeof(int) * (size_t)n);
+    for (int i = 0; i < n; i++) used_name[i] = 0;
+
+    /* First pass: bind named arguments by parameter name. */
+    for (int i = 0; i < n; i++) {
+        zan_ast_node_t *arg = args->items[i];
+        if (!arg || arg->kind != AST_NAMED_ARG) continue;
+        int found = -1;
+        for (int j = 0; j < m; j++) {
+            zan_ast_node_t *p = ps->items[j];
+            if (!p || p->kind != AST_PARAM) continue;
+            if (p->param.is_this) continue; /* extension receiver: not nameable */
+            if (p->param.name.len == arg->named_arg.name.len &&
+                memcmp(p->param.name.str, arg->named_arg.name.str,
+                       (size_t)p->param.name.len) == 0) {
+                found = j;
+                break;
+            }
+        }
+        if (found < 0) {
+            zan_diag_emit(g->diag, DIAG_ERROR, arg->loc,
+                          "no parameter named '%.*s'",
+                          (int)arg->named_arg.name.len,
+                          arg->named_arg.name.str);
+        } else if (slot[found] >= 0) {
+            zan_diag_emit(g->diag, DIAG_ERROR, arg->loc,
+                          "parameter '%.*s' is already assigned",
+                          (int)arg->named_arg.name.len,
+                          arg->named_arg.name.str);
+        } else {
+            slot[found] = i;
+            used_name[i] = 1;
+        }
+    }
+
+    /* Second pass: positional arguments fill the leftmost free slots. */
+    int j = 0;
+    for (int i = 0; i < n; i++) {
+        if (used_name[i]) continue;
+        while (j < m && (slot[j] >= 0 || ps->items[j]->param.is_this)) j++;
+        if (j >= m) break;
+        slot[j] = i;
+        j++;
+    }
+
+    /* Rebuild: each named arg contributes its expression; positional args
+     * move to their slot. The result list keeps the original length. */
+    zan_ast_node_t **reb = (zan_ast_node_t **)malloc(sizeof(zan_ast_node_t *) *
+                                                     (size_t)n);
+    for (int i = 0; i < n; i++) {
+        int src = slot[i];
+        if (src < 0 || src >= n) { reb[i] = NULL; continue; }
+        zan_ast_node_t *arg = args->items[src];
+        if (arg && arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;
+        reb[i] = arg;
+    }
+    for (int i = 0; i < n; i++)
+        args->items[i] = reb[i];
+    free(reb);
+    free(slot);
+    free(used_name);
+}
+
+static void reorder_named_args(zan_irgen_t *g, zan_ast_node_t *call,
+                               zan_symbol_t *method_sym) {
+    if (!call || call->kind != AST_CALL) return;
+    if (!method_sym || !method_sym->decl) return;
+    reorder_named_args_impl(g, &call->call.args, call->loc,
+                            method_sym->decl);
+}
+
 static void fill_default_args(zan_irgen_t *g, zan_ast_node_t *call,
                               zan_symbol_t *method_sym) {
     if (!call || call->kind != AST_CALL) return;
     if (!method_sym || !method_sym->decl) return;
     if (method_sym->decl->kind != AST_METHOD_DECL &&
         method_sym->decl->kind != AST_CONSTRUCTOR_DECL) return;
+    reorder_named_args(g, call, method_sym);
     if (method_is_params_variadic(method_sym)) return;
     if (method_sym->name.len > 3 &&
         memcmp(method_sym->name.str, "op_", 3) == 0) return;
@@ -2181,10 +2273,12 @@ static void pack_params_args(zan_irgen_t *g, zan_ast_node_t *call,
         method_sym->decl->kind != AST_METHOD_DECL) return;
     if (!method_is_params_variadic(method_sym)) return;
     zan_ast_list_t *ps = &method_sym->decl->method_decl.params;
-    /* Operator methods declare an injected receiver (`self`) which does not
-     * appear in the source call's argument list. */
+    /* A static op_call operator declares an injected receiver (`self`) which
+     * does not appear in the source call's argument list; an instance
+     * operator's receiver is `this` and its params start at the real ones. */
     int injected = method_sym->name.len == 7 &&
-        memcmp(method_sym->name.str, "op_call", 7) == 0;
+        memcmp(method_sym->name.str, "op_call", 7) == 0 &&
+        (method_sym->modifiers & MOD_STATIC) != 0;
     int visible = ps->count - injected;
     int fixed = visible - 1;
     int argc = call->call.args.count;

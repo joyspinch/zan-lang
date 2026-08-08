@@ -52,6 +52,30 @@ static void diagnose_unresolved_static_chain(zan_irgen_t *g,
     }
 }
 
+/* Formats a name path (`Foo.Bar.Baz`) into `buf` as a dotted string for
+ * diagnostics. Returns the length written. Non-path nodes write nothing. */
+static int format_name_path(zan_ast_node_t *n, char *buf, int cap) {
+    if (!n || cap <= 0) return 0;
+    if (n->kind == AST_IDENTIFIER) {
+        int l = (int)n->ident.name.len;
+        if (l > cap) l = cap;
+        memcpy(buf, n->ident.name.str, (size_t)l);
+        return l;
+    }
+    if (n->kind == AST_MEMBER_ACCESS) {
+        int off = format_name_path(n->member.object, buf, cap);
+        if (off > 0 && off < cap) {
+            buf[off++] = '.';
+            int l = (int)n->member.name.len;
+            if (l > cap - off) l = cap - off;
+            memcpy(buf + off, n->member.name.str, (size_t)l);
+            off += l;
+        }
+        return off;
+    }
+    return 0;
+}
+
 /* True when the call's receiver names a class compiled from source (user or
  * stdlib) that defines the called method. Builtin lowerings that duplicate a
  * stdlib class (File.*) step aside so the source implementation — with its
@@ -219,6 +243,46 @@ static LLVMValueRef emit_string_copy_range(zan_irgen_t *g,
     return buf;
 }
 
+/* True when `n` (a lambda body) contains a `return <expr>;` anywhere below it.
+ * Task.Run's delegate parameter is an Action (void), so a value-returning body
+ * would be emitted into a void function and fail LLVM verification; report it
+ * like C# would instead. */
+static bool lambda_body_has_value_return(zan_ast_node_t *n) {
+    if (!n) return false;
+    switch (n->kind) {
+    case AST_RETURN_STMT:
+        return n->ret.value != NULL;
+    case AST_BLOCK:
+        for (int i = 0; i < n->block.stmts.count; i++)
+            if (lambda_body_has_value_return(n->block.stmts.items[i])) return true;
+        return false;
+    case AST_IF_STMT:
+        return lambda_body_has_value_return(n->if_stmt.then_body) ||
+               lambda_body_has_value_return(n->if_stmt.else_body);
+    case AST_WHILE_STMT:
+        return lambda_body_has_value_return(n->while_stmt.body);
+    case AST_DO_WHILE_STMT:
+        return lambda_body_has_value_return(n->while_stmt.body);
+    case AST_FOR_STMT:
+        return lambda_body_has_value_return(n->for_stmt.body);
+    case AST_FOREACH_STMT:
+        return lambda_body_has_value_return(n->foreach_stmt.body);
+    case AST_SWITCH_STMT:
+        for (int i = 0; i < n->switch_stmt.cases.count; i++) {
+            zan_ast_node_t *cs = n->switch_stmt.cases.items[i];
+            if (!cs) continue;
+            if (lambda_body_has_value_return(cs->switch_case.body)) return true;
+        }
+        return false;
+    case AST_TRY_STMT:
+        return lambda_body_has_value_return(n->try_stmt.try_body) ||
+               (n->try_stmt.finally_body &&
+                lambda_body_has_value_return(n->try_stmt.finally_body));
+    default:
+        return false;
+    }
+}
+
 static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* `v.GetValueOrDefault()` / `v.ToString()` on a nullable value type:
@@ -239,20 +303,141 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
+        /* `md.GetLength(dim)` on a rank-N rectangular array: load the
+         * dimension from the shape in the allocation header (dims[d] at
+         * arr + 8*d, see zan_mdarray_alloc). */
+        if (expr->call.callee->kind == AST_MEMBER_ACCESS &&
+            expr->call.args.count == 1) {
+            zan_ast_node_t *recv = expr->call.callee->member.object;
+            zan_istr_t mname = expr->call.callee->member.name;
+            if (mname.len == 9 && memcmp(mname.str, "GetLength", 9) == 0) {
+                zan_type_t *at = infer_expr_type(g, recv, locals);
+                if (at && at->kind == TYPE_ARRAY && at->array_rank > 1) {
+                    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                    LLVMValueRef arr = emit_expr(g, recv, locals);
+                    LLVMValueRef dim = emit_expr(g, expr->call.args.items[0], locals);
+                    dim = emit_index_i64(g, dim, "gl.dim");
+                    LLVMValueRef oob = zan_icmp(g->builder, LLVMIntUGE, dim,
+                        LLVMConstInt(i64, at->array_rank, 0), "gl.oob");
+                    emit_runtime_check(g, oob, expr->loc,
+                        "GetLength dimension out of range");
+                    LLVMValueRef dim_ptr = LLVMBuildBitCast(g->builder, arr,
+                        LLVMPointerType(i64, 0), "gl.dp");
+                    LLVMValueRef slot = LLVMBuildGEP2(g->builder, i64, dim_ptr,
+                        &dim, 1, "gl.slot");
+                    return LLVMBuildLoad2(g->builder, i64, slot, "gl.val");
+                }
+            }
+        }
+
+        /* Task instance members — `t.Wait()`, `t.Result`, `t.IsCompleted` on
+         * a Task/Task<T> value. The value is the coroutine handle Task.Run/
+         * Task.Spawn hands back (the frame pointer as an i64). Wait pumps the
+         * cooperative driver until that frame is done — the only way a
+         * synchronous context can let a spawned coroutine make progress —
+         * IsCompleted is a non-pumping probe, and Result reads the frame's
+         * result slot for a Task<T> (whose spawn deliberately left the frame
+         * unreaped so the result survives; see below). */
+        if (expr->call.callee->kind == AST_MEMBER_ACCESS &&
+            expr->call.args.count == 0) {
+            zan_ast_node_t *recv = expr->call.callee->member.object;
+            zan_istr_t mname = expr->call.callee->member.name;
+            zan_type_t *ot = infer_expr_type(g, recv, locals);
+            if (ot && ot->kind == TYPE_TASK) {
+                bool is_wait = mname.len == 4 && memcmp(mname.str, "Wait", 4) == 0;
+                bool is_res  = mname.len == 6 && memcmp(mname.str, "Result", 6) == 0;
+                bool is_comp = mname.len == 11 && memcmp(mname.str, "IsCompleted", 11) == 0;
+                if (is_wait || is_res || is_comp) {
+                    LLVMTypeRef ti64 = LLVMInt64TypeInContext(g->ctx);
+                    if (is_res && ot->type_arg_count != 1) {
+                        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                            "Task.Result requires a Task<T> value");
+                        return LLVMConstInt(ti64, 0, 0);
+                    }
+                    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                    LLVMValueRef h = emit_expr(g, recv, locals);
+                    if (LLVMGetTypeKind(LLVMTypeOf(h)) == LLVMPointerTypeKind)
+                        h = LLVMBuildPtrToInt(g->builder, h, ti64, "task.h");
+                    else if (LLVMGetIntTypeWidth(LLVMTypeOf(h)) < 64)
+                        h = zan_iwiden(g->builder, h, ti64);
+                    LLVMValueRef hp = LLVMBuildIntToPtr(g->builder, h, i8ptr, "task.fp");
+                    int mode = is_comp ? 2 : (is_res ? 1 :
+                              (ot->type_arg_count == 1 ? 3 : 0));
+                    return emit_task_member(g, hp,
+                        ot->type_arg_count == 1 ? ot->type_args[0] : NULL, mode);
+                }
+            }
+        }
+
         /* Task.Spawn(<asyncCall>) — fire-and-forget: run an async call as an
          * independent coroutine WITHOUT awaiting it. Task.Run is the same
-         * lowering under the name the design docs use. Emits the callee's ramp
-         * (heap frame) then schedules it on the cooperative driver with no
-         * awaiter and without suspending the caller (contrast await, which
-         * registers self as awaiter and suspends). This is the concurrency
-         * primitive a server accept loop uses to handle each connection on its
-         * own coroutine instead of serially. See docs/ASYNC_CPS_DESIGN.md. */
+         * lowering under the name the design docs use, except that when the
+         * async call returns a value the frame is left unreaped so the caller
+         * can read it through `Task<T>.Result` / `Wait()` (Task.Spawn always
+         * reaps: its handles are only polled with IsDone/Cancel). Emits the
+         * callee's ramp (heap frame) then schedules it on the cooperative
+         * driver with no awaiter and without suspending the caller (contrast
+         * await, which registers self as awaiter and suspends). This is the
+         * concurrency primitive a server accept loop uses to handle each
+         * connection on its own coroutine instead of serially. See
+         * docs/ASYNC_CPS_DESIGN.md. */
         if ((is_call_to(expr, "Task", "Spawn") || is_call_to(expr, "Task", "Run")) &&
-            expr->call.args.count == 1 &&
-            expr->call.args.items[0]->kind == AST_CALL) {
+            expr->call.args.count == 1) {
             LLVMTypeRef sp_i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMTypeRef sp_i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             zan_ast_node_t *sub_arg = expr->call.args.items[0];
+            zan_type_t *sub_ty = infer_expr_type(g, sub_arg, locals);
+            bool is_del = sub_ty && sub_ty->kind == TYPE_DELEGATE;
+            if (sub_arg->kind != AST_CALL && sub_arg->kind != AST_LAMBDA && !is_del) {
+                /* not a shape this lowering handles (e.g. Task.Run(5)): leave
+                 * it to the normal call path so the unresolved-call
+                 * diagnostic fires instead of silently lowering to 0 */
+            } else {
+
+            /* Task.Run(<delegate>) / Task.Spawn(<delegate>): the body runs to
+             * completion right here and the task is done before Run returns.
+             * Any awaits inside it pump the driver via the root-await path, so
+             * this is observably identical to scheduling it on the pool in the
+             * cooperative single-threaded model. The handle 0 is "already
+             * done": __zan_co_isdone(0) returns 1 because no live frame
+             * matches it, so Wait()/IsCompleted return at once. */
+            if (sub_arg->kind == AST_LAMBDA || is_del) {
+                int pc = 0;
+                LLVMValueRef lv = NULL;
+                LLVMTypeRef vret = LLVMVoidTypeInContext(g->ctx);
+                if (sub_arg->kind == AST_LAMBDA) {
+                    if (sub_arg->lambda.params.count != 0 ||
+                        lambda_body_has_value_return(sub_arg->lambda.body)) {
+                        zan_diag_emit(g->diag, DIAG_ERROR, sub_arg->loc,
+                            "Task.Run delegate must be a parameterless void body "
+                            "(an Action); pass an async call for results");
+                        return LLVMConstInt(sp_i64, 0, 0);
+                    }
+                    zan_type_t *adt = (zan_type_t *)zan_arena_alloc(
+                        g->arena, sizeof(zan_type_t));
+                    memset(adt, 0, sizeof(*adt));
+                    adt->kind = TYPE_DELEGATE;
+                    adt->name = (zan_istr_t){ (char *)"__TaskAction", 12 };
+                    adt->delegate_is_async = 0;
+                    adt->delegate_param_count = 0;
+                    adt->delegate_ret_type = g->binder->type_void;
+                    lv = emit_lambda_typed(g, sub_arg, adt, locals);
+                } else {
+                    if (sub_ty->delegate_param_count != 0) {
+                        zan_diag_emit(g->diag, DIAG_ERROR, sub_arg->loc,
+                            "Task.Run delegate must take no parameters");
+                        return LLVMConstInt(sp_i64, 0, 0);
+                    }
+                    lv = emit_expr(g, sub_arg, locals);
+                    vret = sub_ty->delegate_ret_type
+                        ? map_type(g, sub_ty->delegate_ret_type)
+                        : vret;
+                }
+                LLVMTypeRef fn_type = LLVMFunctionType(vret, NULL, 0, 0);
+                emit_delegate_invoke(g, lv, fn_type, vret, NULL, 0, "");
+                emit_release_owned_call_temp(g, sub_arg, lv, locals);
+                return LLVMConstInt(sp_i64, 0, 0);
+            }
             LLVMValueRef sub = emit_expr(g, sub_arg, locals);
             LLVMValueRef sub_resume = NULL;
             if (LLVMIsACallInst(sub)) {
@@ -275,12 +460,19 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                  * reaper as its own awaiter step (awaiter = the frame itself, a
                  * non-null marker) so emit_async_complete's awaiter-wake path
                  * re-enqueues (frame, __zan_co_reap) and the driver frees the
-                 * frame after the body finishes. */
-                LLVMTypeRef hdr = g->co_header_type;
-                LLVMBuildStore(g->builder, sub_i8,
-                    LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER, "spawn.aw"));
-                LLVMBuildStore(g->builder, get_co_reap_fn(g),
-                    LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER_STEP, "spawn.aws"));
+                 * frame after the body finishes. A result-carrying Task.Run
+                 * skips the reaper: the frame must stay alive (tracked, DONE
+                 * set at completion) until Result/Wait reads it and reaps. */
+                bool keep_result = is_call_to(expr, "Task", "Run") &&
+                    !is_call_to(expr, "Task", "Spawn") &&
+                    sub_ty && sub_ty->kind != TYPE_VOID;
+                if (!keep_result) {
+                    LLVMTypeRef hdr = g->co_header_type;
+                    LLVMBuildStore(g->builder, sub_i8,
+                        LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER, "spawn.aw"));
+                    LLVMBuildStore(g->builder, get_co_reap_fn(g),
+                        LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER_STEP, "spawn.aws"));
+                }
                 LLVMValueRef sched_args[] = { sub_i8, sub_resume };
                 zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
                 /* the handle Spawn hands back outlives the coroutine, so the
@@ -297,6 +489,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
             emit_release_owned_call_temp(g, sub_arg, sub, locals);
             return LLVMConstInt(sp_i64, 0, 0);
+            }
         }
 
         /* Task.Cancel(handle) — request cooperative cancellation of a spawned
@@ -459,13 +652,27 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         g->rt_println, &cs, 1, "");
                     emit_string_release(g, cs);
                 } else {
-                    /* ensure integer arg is i64 for print_int */
-                    arg = emit_widen_i64_for_print(g, arg);
+                    /* ensure integer arg is i64 for print_int; an unsigned
+                     * value (uint/ulong/ushort/byte) must zero-extend so
+                     * `uint.MaxValue` (0xFFFFFFFF in an i32 slot) prints as
+                     * 4294967295 and not 18446744073709551615 */
+                    bool print_unsigned = expr_is_unsigned_int(g, arg_ast, locals);
+                    if (print_unsigned) {
+                        LLVMTypeRef vt = LLVMTypeOf(arg);
+                        if (LLVMGetTypeKind(vt) == LLVMIntegerTypeKind &&
+                            LLVMGetIntTypeWidth(vt) < 64)
+                            arg = LLVMBuildZExt(g->builder, arg,
+                                LLVMInt64TypeInContext(g->ctx), "print.zext");
+                        else
+                            arg = emit_widen_i64_for_print(g, arg);
+                    } else {
+                        arg = emit_widen_i64_for_print(g, arg);
+                    }
                     LLVMTypeRef fn_type = LLVMFunctionType(
                         LLVMVoidTypeInContext(g->ctx),
                         (LLVMTypeRef[]){ LLVMInt64TypeInContext(g->ctx) },
                         1, 0);
-                    LLVMValueRef print_fn = expr_is_ulong(g, arg_ast, locals)
+                    LLVMValueRef print_fn = print_unsigned
                         ? g->rt_print_uint : g->rt_print_int;
                     zan_call2(g->builder, fn_type, print_fn, &arg, 1, "");
                 }
@@ -3372,11 +3579,15 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                 recv_eh_pushed = 1;
                             }
                             for (int k = 0; k < expr->call.args.count; k++) {
-                                /* declared parameter k+1: slot 0 is the injected
-                                 * receiver `self` */
+                                /* declared parameter k+self_off: slot 0 is the
+                                 * injected receiver (static op_call's explicit
+                                 * `self`, or `this` for an instance one) */
+                                int self_off =
+                                    (op_sym->modifiers & MOD_STATIC) ? 1 : 0;
                                 call_args[k + 1] = emit_arg_typed(g,
                                     expr->call.args.items[k],
-                                    method_param_type_at(g, op_sym, k + 1, expr,
+                                    method_param_type_at(g, op_sym,
+                                        k + self_off, expr,
                                         expr->call.callee, locals), locals);
                             }
                             LLVMTypeRef mft = g->functions[fi].fn_type;
@@ -4027,33 +4238,45 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
          * (Console.*, Math.*, ...) and resolved user methods return earlier, so
          * only genuinely unresolved references reach this point; keying on the
          * object being an unknown name (rather than a known class missing the
-         * method) keeps this from firing on extern/DllImport members. */
+         * method) keeps this from firing on extern/DllImport members.
+         *
+         * `X` may itself be a dotted name path (`Foo.Bar.Baz.Quux(...)`) whose
+         * head is a namespace and whose rightmost segment is the type name. The
+         * AST nests such a path inside member accesses, so the single-identifier
+         * check below would silently pass it through; walk the chain instead. A
+         * chain rooted in a local (`a.b.c.M()`) is a genuine instance chain and
+         * is left to the instance handlers above. */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
-            expr->call.callee->member.object->kind == AST_IDENTIFIER) {
-            zan_istr_t on = expr->call.callee->member.object->ident.name;
-            zan_istr_t mn = expr->call.callee->member.name;
-            zan_symbol_t *osym = local_find(locals, on) ? NULL
-                : zan_binder_lookup(g->binder, on);
-            if (!local_find(locals, on) && !osym) {
-                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
-                    "unresolved call '%.*s.%.*s': '%.*s' is not a known variable, "
-                    "type, or namespace (is the class imported and registered in "
-                    "the stdlib map?)",
-                    (int)on.len, on.str, (int)mn.len, mn.str,
-                    (int)on.len, on.str);
-            }
-            /* The object is a known class/struct but the method does not exist
-             * on it (and no builtin lowering claimed the call earlier). This is
-             * the method-call twin of the check above: silently lowering to
-             * 0/null turns a typo or a missing stdlib method into a runtime
-             * null-pointer crash far from the call site. */
-            else if (osym && (osym->kind == SYM_CLASS || osym->kind == SYM_STRUCT) &&
-                     !get_method_sym(osym, mn)) {
-                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
-                    "unresolved call '%.*s.%.*s': type '%.*s' has no method "
-                    "'%.*s'",
-                    (int)on.len, on.str, (int)mn.len, mn.str,
-                    (int)on.len, on.str, (int)mn.len, mn.str);
+            is_name_path(expr->call.callee->member.object)) {
+            zan_ast_node_t *obj = expr->call.callee->member.object;
+            zan_ast_node_t *head = name_path_head(obj);
+            if (head && !local_find(locals, head->ident.name)) {
+                zan_istr_t on = (obj->kind == AST_IDENTIFIER)
+                    ? obj->ident.name : obj->member.name;
+                zan_istr_t mn = expr->call.callee->member.name;
+                zan_symbol_t *osym = zan_binder_lookup(g->binder, on);
+                char path[256];
+                int plen = format_name_path(expr->call.callee, path,
+                                            (int)sizeof(path));
+                if (!osym) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "unresolved call '%.*s': '%.*s' is not a known variable, "
+                        "type, or namespace (is the class imported and registered "
+                        "in the stdlib map?)",
+                        plen, path, (int)on.len, on.str);
+                }
+                /* The type name is a known class/struct but the method does not
+                 * exist on it (and no builtin lowering claimed the call earlier).
+                 * This is the method-call twin of the check above: silently
+                 * lowering to 0/null turns a typo or a missing stdlib method into
+                 * a runtime null-pointer crash far from the call site. */
+                else if (osym && (osym->kind == SYM_CLASS || osym->kind == SYM_STRUCT) &&
+                         !get_method_sym(osym, mn)) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "unresolved call '%.*s': type '%.*s' has no method "
+                        "'%.*s'",
+                        plen, path, (int)on.len, on.str, (int)mn.len, mn.str);
+                }
             }
         }
 

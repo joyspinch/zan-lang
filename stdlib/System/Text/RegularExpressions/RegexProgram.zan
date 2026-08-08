@@ -370,7 +370,12 @@ class RegexProgram {
             this.ppos = this.ppos + 1;
             int lo = this.ParseInt();
             if (lo < 0) {
+                // '{' 后面不是数字：按字面量处理（PCRE 同）
                 this.ppos = save;
+                return;
+            }
+            if (lo > 65535) {
+                this.error = "quantifier out of range (max 65535) at " + save;
                 return;
             }
             int hi = lo;
@@ -381,13 +386,20 @@ class RegexProgram {
                 } else {
                     hi = this.ParseInt();
                     if (hi < 0) {
-                        this.ppos = save;
+                        // "{2,x"：{ 后已有数字，缺上界是错误而不是字面量
+                        this.error = "malformed quantifier at " + save;
+                        return;
+                    }
+                    if (hi > 65535) {
+                        this.error = "quantifier out of range (max 65535) at "
+                            + save;
                         return;
                     }
                 }
             }
             if (this.Peek() != 125) {
-                this.ppos = save;
+                // "a{2" / "a{2,3"：PCRE/.NET 都当作写了一半的量词报错
+                this.error = "missing '}' for quantifier at " + save;
                 return;
             }
             this.ppos = this.ppos + 1;
@@ -1077,7 +1089,17 @@ class RegexProgram {
         if (e == 118) { return 11; }          // \v
         if (e == 97) { return 7; }            // \a
         if (e == 101) { return 27; }          // \e
-        if (e == 48) { return 0; }            // \0
+        if (e == 48) {                        // \0
+            // PCRE 里 `\012` 是八进制；这里只支持 `\0` = NUL，后面再跟
+            // 八进制数字时明确报错，而不是静默当成 NUL 加字面数字
+            int nxt = this.Peek();
+            if (nxt >= 48 && nxt <= 55) {
+                this.error = "octal escapes are not supported at " + this.ppos
+                    + "; use \\xHH";
+                return 0;
+            }
+            return 0;
+        }
         if (e == 120) { return this.ParseHexEscape(); }        // \xHH / \x{...}
         if (e == 117) { return this.ParseFixedHex(4); }        // \uXXXX
         if (e == 85) { return this.ParseFixedHex(8); }         // \UXXXXXXXX

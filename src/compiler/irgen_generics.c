@@ -331,6 +331,13 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
         return 1;
     if (e->kind == AST_NEW_EXPR || e->kind == AST_CALL ||
         e->kind == AST_QUERY_EXPR) return 1;
+    /* A switch expression yields the owned (+1) value that its matching arm
+     * stored into the hidden result local (emit_expr_switch_expr): the store
+     * moves an owned arm or retains a borrowed one, leaving the slot with +1,
+     * and the hidden local is removed from scope so nothing releases it. The
+     * receiving local must therefore treat it as owned and take that +1, or
+     * the reference leaks at exit (leakcheck_cs_b06_switch_expr). */
+    if (e->kind == AST_SWITCH_EXPR) return 1;
     /* A capturing lambda, and an instance method group used as a value, each
      * allocate a fresh closure record (+1): whoever receives it owns that
      * count and must not retain again. Non-capturing lambdas and static
@@ -972,7 +979,7 @@ static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
 
     LLVMPositionBuilderAtEnd(g->builder, panic_bb);
     char buf[640];
-    const char *file = g->src_file ? g->src_file : "<unknown>";
+    const char *file = loc_site_file(g, loc);
     snprintf(buf, sizeof(buf), "%s:%u:%u: runtime error: %s\n",
              file, loc.line, loc.col, msg);
     LLVMValueRef text = LLVMBuildGlobalStringPtr(g->builder, buf, "rterr");
@@ -1021,32 +1028,37 @@ static void emit_index_bounds_check(zan_irgen_t *g, LLVMValueRef index,
     emit_index_range_check(g, index, length, false, loc, kind);
 }
 
-/* Strings and byte[] share the payload pointer ABI. A Zan string has the
- * string magic in the second header word; a byte[] has its element count in
- * the first header word and no string magic. Use the carried array length for
- * byte buffers so embedded NUL bytes do not truncate indexing bounds. */
+/* Length of a `string`-typed payload for bounds checking. Strings, byte[] and
+ * bare C pointers all share the payload pointer ABI, and the second header
+ * word says which one this is: ZAN_ARRAY_MAGIC marks a byte buffer, whose
+ * carried element count is used so embedded NUL bytes do not truncate
+ * indexing bounds. Everything else -- a managed string, or a pointer an extern
+ * returned, which has no Zan header at all -- is NUL-terminated and measured
+ * with strlen, the same definition `string.Length` uses. Never read the count
+ * word for those: for a foreign pointer it is whatever the C allocator left in
+ * front of the buffer, which used to reject every valid index. */
 static LLVMValueRef emit_string_buffer_len(zan_irgen_t *g, LLVMValueRef payload) {
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-    LLVMValueRef back = LLVMConstInt(i64, (uint64_t)-16, 1);
+    LLVMValueRef back = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1);
     LLVMValueRef header = LLVMBuildGEP2(g->builder, i8, payload, &back, 1,
                                         "strbuf.header");
     LLVMValueRef count = LLVMBuildLoad2(g->builder, i64,
         LLVMBuildBitCast(g->builder, header, LLVMPointerType(i64, 0),
                          "strbuf.countp"), "strbuf.count");
     LLVMValueRef magic_ptr = LLVMBuildGEP2(g->builder, i8, payload,
-        &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)-8, 1) }, 1,
+        &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1) }, 1,
         "strbuf.magicp");
     LLVMValueRef magic = LLVMBuildLoad2(g->builder, i64,
         LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64, 0),
                          "strbuf.magicc"), "strbuf.magic");
-    LLVMValueRef is_string = zan_icmp(g->builder, LLVMIntEQ, magic,
-        LLVMConstInt(i64, ZAN_STRING_MAGIC, 0), "strbuf.isstr");
+    LLVMValueRef is_array = zan_icmp(g->builder, LLVMIntEQ, magic,
+        LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "strbuf.isarr");
     LLVMTypeRef strlen_ty = LLVMFunctionType(i64,
         (LLVMTypeRef[]){ LLVMPointerType(i8, 0) }, 1, 0);
     LLVMValueRef string_len = zan_call2(g->builder, strlen_ty, g->fn_strlen,
                                         &payload, 1, "strbuf.strlen");
-    return LLVMBuildSelect(g->builder, is_string, string_len, count,
+    return LLVMBuildSelect(g->builder, is_array, count, string_len,
                            "strbuf.len");
 }
 
@@ -1429,6 +1441,18 @@ static LLVMValueRef emit_string_literal_rc(zan_irgen_t *g, zan_istr_t text) {
     return user_ptr;
 }
 
+/* A string operand may be NULL at the IR level (an unassigned string local
+ * reads as NULL); C# semantics treat it as "" for comparisons, ordering and
+ * concatenation, so strcmp/strlen must never receive a NULL pointer. Coerce
+ * a NULL string to the empty literal before it reaches the runtime. */
+static LLVMValueRef emit_str_nonnull(zan_irgen_t *g, LLVMValueRef v) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef empty = emit_string_literal_rc(g, (zan_istr_t){ "", 0 });
+    LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, v,
+        LLVMConstNull(i8ptr), "s.null");
+    return LLVMBuildSelect(g->builder, isnull, empty, v, "s.nn");
+}
+
 void zan_irgen_emit_string_deobf(zan_irgen_t *g) {
     if (!g->obfuscate_strings || g->obf_literal_count <= 0) return;
     int n = g->obf_literal_count;
@@ -1721,10 +1745,13 @@ static LLVMValueRef emit_to_cstr_of(zan_irgen_t *g, LLVMValueRef val,
 }
 
 /* Emit `a + b` for two string (i8*) operands as a heap-allocated concatenation:
- * malloc(strlen(a)+strlen(b)+1); memcpy left, memcpy right, NUL terminate. */
+ * malloc(strlen(a)+strlen(b)+1); memcpy left, memcpy right, NUL terminate.
+ * A NULL operand concatenates as "" (C#), so neither strlen may see a NULL. */
 static LLVMValueRef emit_str_concat(zan_irgen_t *g, LLVMValueRef a, LLVMValueRef b) {
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    a = emit_str_nonnull(g, a);
+    b = emit_str_nonnull(g, b);
     LLVMTypeRef strlen_type = LLVMFunctionType(i64t, (LLVMTypeRef[]){ i8ptr }, 1, 0);
     LLVMValueRef la = zan_call2(g->builder, strlen_type, g->fn_strlen, &a, 1, "cla");
     LLVMValueRef lb = zan_call2(g->builder, strlen_type, g->fn_strlen, &b, 1, "clb");
@@ -1794,6 +1821,7 @@ static LLVMValueRef emit_str_concat_n(zan_irgen_t *g, zan_ast_node_t *expr,
     for (int i = 0; i < n; i++) {
         LLVMValueRef v = emit_expr(g, ops[i], locals);
         LLVMValueRef s = emit_to_cstr_of(g, v, ops[i], locals);
+        s = emit_str_nonnull(g, s);
         vals[i] = s;
         owned[i] = !is_string_expr(g, ops[i], locals) ||
                    expr_yields_owned_rc_value(g, ops[i], locals);

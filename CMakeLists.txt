@@ -680,7 +680,6 @@ foreach(_src ${_conf_srcs})
   if(_name MATCHES "^rts_")
     set(_extra_args "${_rts_stdlib_zanc_args}")
   elseif(_name MATCHES "^async_mt")
-    # ZAN_CO_DRIVER tests: exercise the multi-worker coroutine driver.
     set(_extra_args "--async-workers")
   else()
     set(_extra_args "")
@@ -739,7 +738,6 @@ foreach(_src ${_conf_srcs})
   if(_name MATCHES "^rts_")
     set(_extra_args "${_rts_stdlib_zanc_args}")
   elseif(_name MATCHES "^async_mt")
-    # ZAN_CO_DRIVER tests: exercise the multi-worker coroutine driver.
     set(_extra_args "--async-workers")
   else()
     set(_extra_args "")
@@ -1077,7 +1075,7 @@ add_test(NAME conformance_ide_airun
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/ide/airun_test.zan
-    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/src/ide_zan/AiRun.zan;--auto-stdlib"
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/src/ide_zan/src/AiRun.zan;--auto-stdlib"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/ide/airun_test.out
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_ide_airun${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -1091,7 +1089,7 @@ add_test(NAME conformance_ide_diagstore
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/ide/diagstore_test.zan
-    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/src/ide_zan/DiagStore.zan;--auto-stdlib"
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/src/ide_zan/src/DiagStore.zan;--auto-stdlib"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/ide/diagstore_test.out
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_ide_diagstore${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -1130,6 +1128,41 @@ add_test(NAME diag_property_call
   COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/property_call.zan
     -o ${CMAKE_BINARY_DIR}/diag_property_call${_exe_ext})
 set_tests_properties(diag_property_call PROPERTIES
+  WILL_FAIL TRUE TIMEOUT 60)
+
+# A fully-qualified call whose whole name path is unknown (`Foo.Bar.Baz.Quux`)
+# must be a compile error, not a silent no-op. The single-segment check that
+# catches `X.Method()` used to miss the deeper path.
+add_test(NAME diag_fully_qualified_unresolved
+  COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/fully_qualified_unresolved.zan
+    -o ${CMAKE_BINARY_DIR}/diag_fully_qualified_unresolved${_exe_ext})
+set_tests_properties(diag_fully_qualified_unresolved PROPERTIES
+  WILL_FAIL TRUE TIMEOUT 60)
+
+# A write to a getter-only property (no setter) -- plain `=`, `+=`, `++`, or an
+# object-initializer entry -- must be a compile error, not a silent store into
+# the backing slot that a custom getter never reads back.
+add_test(NAME diag_readonly_property_write
+  COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/readonly_property_write.zan
+    -o ${CMAKE_BINARY_DIR}/diag_readonly_property_write${_exe_ext})
+set_tests_properties(diag_readonly_property_write PROPERTIES
+  WILL_FAIL TRUE TIMEOUT 60)
+
+# An `init` accessor is a setter restricted to object initialization; a plain
+# `obj.Prop = v` after construction must be a compile error.
+add_test(NAME diag_init_only_write
+  COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/init_only_write.zan
+    -o ${CMAKE_BINARY_DIR}/diag_init_only_write${_exe_ext})
+set_tests_properties(diag_init_only_write PROPERTIES
+  WILL_FAIL TRUE TIMEOUT 60)
+
+# A tuple literal is a fresh synthesized struct; assigning through it
+# (`(a, b) = rhs`) would write to a discarded temp. It must be a compile error
+# pointing at deconstruction, not a silent no-op.
+add_test(NAME diag_tuple_assignment
+  COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/tuple_assignment.zan
+    -o ${CMAKE_BINARY_DIR}/diag_tuple_assignment${_exe_ext})
+set_tests_properties(diag_tuple_assignment PROPERTIES
   WILL_FAIL TRUE TIMEOUT 60)
 
 # A shared table column wider than the runtime's ceiling is refused where it is

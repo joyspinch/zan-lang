@@ -2618,9 +2618,13 @@ int main(int argc, char **argv) {
                      * each other, so a single-pass scan needs the group (the
                      * runtime objects above are already on the link line). */
                     argv[a++] = "--start-group";
+                    /* -lwinpthread: libgcc's unwinder reaches its per-thread
+                     * state through gthr-default.h, which is the POSIX one in
+                     * the bundled mingw, so -lgcc leaves pthread_* undefined
+                     * without it (the exe link line below carries it too). */
                     static const char *const dllcrt[] = {
                         "-lmingw32", "-lgcc", "-lmoldname", "-lmingwex",
-                        "-lmsvcrt", "-lkernel32", NULL };
+                        "-lmsvcrt", "-lkernel32", "-lwinpthread", NULL };
                     for (int li = 0; dllcrt[li] && a < 150; li++)
                         argv[a++] = dllcrt[li];
                     /* the IO reactor uses Winsock */

@@ -39,6 +39,8 @@ struct zan_lexer {
     zan_diag_t *diag;
     int interp_depth;       /* > 0 when inside $"...{expr}..." */
     int interp_brace_depth; /* tracks nested {} inside interpolation expr */
+    int interp_paren_depth; /* tracks nested () inside interpolation expr */
+    int interp_bracket_depth; /* tracks nested [] inside interpolation expr */
 
     /* ---- Preprocessor state ---- */
     zan_pp_define_t defines[ZAN_PP_MAX_DEFINES];

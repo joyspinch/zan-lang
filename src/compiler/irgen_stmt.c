@@ -56,6 +56,28 @@ static void emit_eh_hook_call(zan_irgen_t *g, const char *name) {
 
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
 
+/* B5: bind a switch case's pattern variable (`case T x:`) to the discriminant.
+ * Each call gets a fresh slot in the current scope, so `when` guards and case
+ * bodies can reference x. The case-body loop rebinds after every body has
+ * truncated locals back to switch_start (the chain-time binding lives at a
+ * higher index and is wiped by the first body's scope-exit release). */
+static void emit_switch_pattern_bind(zan_irgen_t *g, local_scope_t *locals,
+                                     zan_ast_node_t *sc, LLVMValueRef switch_val) {
+    if (!sc->switch_case.type_pattern || sc->switch_case.var_name.len == 0) return;
+    zan_type_t *pt = resolve_type_ctx(g, sc->switch_case.type_pattern);
+    if (!pt) return;
+    LLVMTypeRef ptll = map_type(g, pt);
+    LLVMValueRef slot = emit_entry_alloca(g, ptll, "cpat");
+    zan_store_fit(g, LLVMConstNull(ptll), slot);
+    LLVMValueRef cv = switch_val;
+    if (LLVMTypeOf(cv) != ptll &&
+        LLVMGetTypeKind(ptll) == LLVMPointerTypeKind &&
+        LLVMGetTypeKind(LLVMTypeOf(cv)) == LLVMPointerTypeKind)
+        cv = LLVMBuildBitCast(g->builder, cv, ptll, "cpat.cast");
+    zan_store_fit(g, cv, slot);
+    local_add(locals, sc->switch_case.var_name, slot, pt);
+}
+
 /* Run the `finally` bodies of the try statements this exit path leaves, from
  * the innermost open one down to (and including) `base`. C# runs them on every
  * way out of a try, and this lowering has nothing to hang a cleanup off, so the
@@ -259,6 +281,35 @@ static void emit_eh_propagate_tail(zan_irgen_t *g) {
     LLVMBuildUnreachable(g->builder);
 }
 
+/* True when `expr` is a call to an extern/DllImport function. Extern calls
+ * hand back raw pointers typed `string` (calloc/malloc views, FFI buffers);
+ * their NUL terminator is not a reliable ordinal bound, so a string local fed
+ * from one is treated as an opaque byte buffer by the string index guards. */
+static int call_targets_extern(zan_irgen_t *g, zan_ast_node_t *expr) {
+    if (!expr || expr->kind != AST_CALL || !expr->call.callee) return 0;
+    zan_symbol_t *sym = NULL;
+    if (expr->call.callee->kind == AST_IDENTIFIER) {
+        /* A static method of the enclosing class (`calloc(...)` inside the
+         * class that declares it) resolves through the type's own members;
+         * zan_binder_lookup keys off the binder's current scope, which irgen
+         * may not still sit in. */
+        if (g->current_type_sym)
+            sym = get_method_sym(g->current_type_sym,
+                                 expr->call.callee->ident.name);
+        if (!sym)
+            sym = zan_binder_lookup(g->binder, expr->call.callee->ident.name);
+    } else if (expr->call.callee->kind == AST_MEMBER_ACCESS &&
+               expr->call.callee->member.object->kind == AST_IDENTIFIER) {
+        /* ClassName.ExternMethod(...) */
+        zan_symbol_t *cls = zan_binder_lookup(g->binder,
+            expr->call.callee->member.object->ident.name);
+        if (cls) sym = get_method_sym(cls, expr->call.callee->member.name);
+    }
+    if (!sym || !sym->decl || sym->decl->kind != AST_METHOD_DECL) return 0;
+    return sym->decl->method_decl.extern_lib.str != NULL ||
+           (sym->decl->method_decl.modifiers & MOD_EXTERN) != 0;
+}
+
 /* A33-2b: declare a local that a lambda assigns to. Its storage is a heap cell
  * shared with every closure that captures it (see the boxed-local comment in
  * irgen_expr.c), so both sides read and write the one variable. Returns 0 for
@@ -290,6 +341,9 @@ static int emit_boxed_var_decl(zan_irgen_t *g, zan_ast_node_t *stmt,
     locals->vars[locals->count - 1].box_cell = cell;
     locals->vars[locals->count - 1].box_owned = 1;
     if (rc) locals->vars[locals->count - 1].arc_owned = 1;
+    if (type && type->kind == TYPE_STRING && stmt->var_decl.initializer &&
+        call_targets_extern(g, stmt->var_decl.initializer))
+        locals->vars[locals->count - 1].opaque_string = 1;
     if (stmt->var_decl.initializer) {
         LLVMValueRef init =
             (type->kind == TYPE_DELEGATE &&
@@ -419,6 +473,12 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                             }
                         }
                         if (arc_own) pre->arc_owned = 1;
+                        /* A frame-resident string fed from an extern call is a
+                         * raw byte buffer (same rule as the sync path). */
+                        if (type && type->kind == TYPE_STRING &&
+                            stmt->var_decl.initializer &&
+                            call_targets_extern(g, stmt->var_decl.initializer))
+                            pre->opaque_string = 1;
                         return;
                     }
                 }
@@ -563,11 +623,22 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                 for (int i = 0; i < init->new_expr.args.count; i++) {
                                     zan_ast_node_t *arg = init->new_expr.args.items[i];
                                     if (arg->kind == AST_ASSIGNMENT && arg->binary.left->kind == AST_IDENTIFIER) {
+                                        zan_symbol_t *fsym = get_field_sym(sym, arg->binary.left->ident.name);
+                                        /* custom-setter property in an object
+                                         * initializer: `new Foo { Prop = v }`
+                                         * dispatches to set_Prop(v) */
+                                        zan_symbol_t *setter = property_setter_sym(g, fsym);
+                                        if (setter) {
+                                            emit_property_setter_call(g, setter,
+                                                new_inst ? new_inst : sym->type,
+                                                alloca, emit_expr(g, arg->binary.right, locals),
+                                                arg->binary.left, arg->binary.right, locals);
+                                            continue;
+                                        }
                                         int fi = get_field_index(sym, arg->binary.left->ident.name);
                                         if (fi >= 0) {
                                             LLVMValueRef fptr = emit_field_ptr(g, sym, st, alloca, fi, "finit");
                                             LLVMValueRef fval = emit_expr(g, arg->binary.right, locals);
-                                            zan_symbol_t *fsym = get_field_sym(sym, arg->binary.left->ident.name);
                                             if (fsym && fsym->type) {
                                                 LLVMTypeRef target_t = map_type(g, fsym->type);
                                                 LLVMTypeRef val_t = LLVMTypeOf(fval);
@@ -587,6 +658,34 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                             local_add(locals, stmt->var_decl.name, alloca, type);
                             return;
                         }
+                    }
+                }
+            }
+
+            /* tuple initializer: `var t = (a, b, ...)` is a value of the
+             * synthesized anonymous tuple struct; the local keeps the whole
+             * struct (so `t.Item1` resolves), copied by value from the temp
+             * slot the tuple emitter built. */
+            if (init->kind == AST_TUPLE_EXPR) {
+                zan_type_t *ttype = infer_expr_type(g, init, locals);
+                if (ttype && ttype->kind == TYPE_STRUCT && ttype->sym) {
+                    /* map_type lazily registers a synthesized tuple struct
+                     * that was never seen by irgen pass 1 (e.g. a decon RHS
+                     * the checker did not visit); fall back to it so the
+                     * slot and the local are both typed as the struct. */
+                    LLVMTypeRef st = get_struct_llvm_type(g, ttype->sym);
+                    if (!st) st = map_type(g, ttype);
+                    if (st) {
+                        LLVMValueRef alloca = emit_entry_alloca(g, st, "tup");
+                        zan_store_fit(g, LLVMConstNull(st), alloca);
+                        LLVMValueRef tup = emit_expr(g, init, locals);
+                        LLVMValueRef tupval =
+                            LLVMGetTypeKind(LLVMTypeOf(tup)) == LLVMPointerTypeKind
+                                ? LLVMBuildLoad2(g->builder, st, tup, "tup.load")
+                                : tup;
+                        zan_store_fit(g, tupval, alloca);
+                        local_add(locals, stmt->var_decl.name, alloca, ttype);
+                        return;
                     }
                 }
             }
@@ -620,6 +719,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 zan_store_fit(g, LLVMConstNull(llvm_string), slot);
                 emit_rc_capture_local(g, type, slot, init_val, init, locals);
                 local_add(locals, stmt->var_decl.name, slot, type);
+                if (call_targets_extern(g, init))
+                    locals->vars[locals->count - 1].opaque_string = 1;
                 arc_own_local(g, locals);
                 return;
             }
@@ -677,8 +778,29 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                  stmt->var_decl.initializer->kind == AST_LAMBDA)
                     ? emit_lambda_typed(g, stmt->var_decl.initializer, type, locals)
                     : emit_expr(g, stmt->var_decl.initializer, locals);
+            /* user-defined implicit conversion in a typed initializer:
+             * `double d = c;` / `Fahrenheit t = 7.25;` (B12). A conversion
+             * whose target is rc-managed yields an owned (+1) reference (the
+             * conversion method's `return new T(...)`), exactly like an
+             * AST_CALL result; hand the store below a dummy `new` node so it
+             * moves that reference instead of retaining a second one (mirrors
+             * the binding-lowering path). */
+            zan_ast_node_t *init_src = stmt->var_decl.initializer;
+            bool conv_owned = false;
+            if (type) {
+                zan_type_t *ity = infer_expr_type(g, init_src, locals);
+                if (ity) {
+                    conv_owned =
+                        (find_user_conversion(g, ity, type, "op_implicit") != NULL) &&
+                        is_rc_managed_type(type);
+                    init_val = emit_user_conversion(g, ity, type, "op_implicit",
+                                                    init_val, init_src, locals);
+                }
+            }
             if (arc_own) {
-                emit_rc_capture_local(g, type, alloca, init_val, stmt->var_decl.initializer, locals);
+                emit_rc_capture_local(g, type, alloca, init_val,
+                    conv_owned ? owned_rhs_marker(g, init_src->loc) : init_src,
+                    locals);
             } else if (obj_own) {
                 emit_obj_local_store(g, &obj_slot, init_val,
                     infer_expr_type(g, stmt->var_decl.initializer, locals),
@@ -706,6 +828,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
 
         local_add(locals, stmt->var_decl.name, alloca, type);
+        /* `string buf = calloc(...)`: an extern call's string is a raw buffer,
+         * so its bounds come from the caller's explicit length, not strlen. */
+        if (type && type->kind == TYPE_STRING && stmt->var_decl.initializer &&
+            call_targets_extern(g, stmt->var_decl.initializer))
+            locals->vars[locals->count - 1].opaque_string = 1;
         if (arc_own) arc_own_local(g, locals);
         if (obj_own)
             locals->vars[locals->count - 1].obj_rc_flag = obj_slot.obj_rc_flag;
@@ -768,6 +895,84 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 zan_store_fit(g, szv, lslot);
                 locals->vars[locals->count - 1].arr_len_slot = lslot;
             }
+        }
+        break;
+    }
+
+    case AST_TUPLE_DECON: {
+        /* `var (a, b) = rhs;` / `(int a, string b) = rhs;` — evaluate rhs into
+         * a temporary tuple slot, then declare each name initialized from its
+         * ItemN field. */
+        zan_ast_node_t *init = stmt->tuple_decon.initializer;
+        zan_type_t *ttype = infer_expr_type(g, init, locals);
+        if (!ttype || ttype->kind != TYPE_STRUCT || !ttype->sym) {
+            zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                          "right-hand side of a deconstruction is not a tuple");
+            break;
+        }
+        LLVMTypeRef st = get_struct_llvm_type(g, ttype->sym);
+        if (!st) st = map_type(g, ttype); /* lazily register synthesized struct */
+        LLVMValueRef tmp = NULL;
+        if (st) {
+            tmp = emit_entry_alloca(g, st, "dtmp");
+            zan_store_fit(g, LLVMConstNull(st), tmp);
+            if (init->kind == AST_TUPLE_EXPR) {
+                /* the initializer is itself a tuple literal: build it in place
+                 * so the temp slot is filled once, not copied twice */
+                int n = init->tuple_expr.items.count;
+                for (int i = 0; i < n; i++) {
+                    zan_ast_node_t *item = init->tuple_expr.items.items[i];
+                    char fname[16];
+                    snprintf(fname, sizeof fname, "Item%d", i + 1);
+                    zan_istr_t f_istr = { fname, (uint32_t)strlen(fname) };
+                    zan_symbol_t *fsym = get_field_sym(ttype->sym, f_istr);
+                    if (!fsym) continue;
+                    int fi = get_field_index(ttype->sym, f_istr);
+                    if (fi < 0) fi = i;
+                    LLVMValueRef fptr = emit_field_ptr(g, ttype->sym, st, tmp,
+                                                       fi, "df");
+                    LLVMValueRef fval = emit_arg_typed(g, item, fsym->type,
+                                                       locals);
+                    zan_store_fit(g, fval, fptr);
+                }
+            } else {
+                LLVMValueRef tv = emit_expr(g, init, locals);
+                LLVMValueRef tvv =
+                    LLVMGetTypeKind(LLVMTypeOf(tv)) == LLVMPointerTypeKind
+                        ? LLVMBuildLoad2(g->builder, st, tv, "dtmp.load")
+                        : tv;
+                zan_store_fit(g, tvv, tmp);
+            }
+        }
+        for (int i = 0; i < stmt->tuple_decon.names.count; i++) {
+            zan_ast_node_t *nm = stmt->tuple_decon.names.items[i];
+            zan_ast_node_t *ty = stmt->tuple_decon.types.items[i];
+            if (!nm || nm->kind != AST_IDENTIFIER) continue;
+            zan_type_t *et = ty ? resolve_type_ctx(g, ty) : NULL;
+            if (!et) {
+                char fname[16];
+                snprintf(fname, sizeof fname, "Item%d", i + 1);
+                zan_istr_t f_istr = { fname, (uint32_t)strlen(fname) };
+                zan_symbol_t *fsym = ttype->sym
+                    ? get_field_sym(ttype->sym, f_istr) : NULL;
+                et = fsym ? fsym->type : g->binder->type_int;
+            }
+            LLVMTypeRef elt = map_type(g, et);
+            LLVMValueRef slot = emit_entry_alloca(g, elt, "d");
+            zan_store_fit(g, LLVMConstNull(elt), slot);
+            if (st && tmp) {
+                char fname[16];
+                snprintf(fname, sizeof fname, "Item%d", i + 1);
+                zan_istr_t f_istr = { fname, (uint32_t)strlen(fname) };
+                int fi = get_field_index(ttype->sym, f_istr);
+                if (fi < 0) fi = i;
+                LLVMValueRef fptr = emit_field_ptr(g, ttype->sym, st, tmp,
+                                                   fi, "de");
+                LLVMValueRef fval = LLVMBuildLoad2(g->builder, elt, fptr,
+                                                   "de.load");
+                zan_store_fit(g, fval, slot);
+            }
+            local_add(locals, nm->ident.name, slot, et);
         }
         break;
     }
@@ -852,13 +1057,31 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
         if (stmt->ret.value) {
             LLVMValueRef val = emit_expr(g, stmt->ret.value, locals);
+            /* user-defined implicit conversion: `return c;` from a method
+             * declared to return double where the source type declares
+             * `implicit operator double` (B12). */
+            bool conv_ret = false;
+            if (g->current_fn_zan_ret_type) {
+                zan_type_t *vty = infer_expr_type(g, stmt->ret.value, locals);
+                if (find_user_conversion(g, vty, g->current_fn_zan_ret_type,
+                                         "op_implicit")) {
+                    val = emit_user_conversion(g, vty, g->current_fn_zan_ret_type,
+                                               "op_implicit", val,
+                                               stmt->ret.value, locals);
+                    conv_ret = true;
+                }
+            }
             /* ARC: hand the caller an owned (+1) reference, then release our
              * owning locals. Retaining a borrowed return value first keeps it
-             * alive when it aliases a local about to be released. */
+             * alive when it aliases a local about to be released. A converted
+             * value is already owned (+1) like a method-call result, so it is
+             * moved rather than retained. */
             zan_type_t *ret_type = concretize(g,
                 infer_expr_type(g, stmt->ret.value, locals));
+            if (conv_ret) ret_type = g->current_fn_zan_ret_type;
             if (is_rc_managed_type(ret_type) &&
-                !expr_yields_owned_rc_value(g, stmt->ret.value, locals)) {
+                !expr_yields_owned_rc_value(g, stmt->ret.value, locals) &&
+                !conv_ret) {
                 emit_rc_retain_for_type(g, ret_type, val);
             }
             if (g->finally_count > 0) {
@@ -916,6 +1139,16 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     } else if (fn_bits < val_bits) {
                         val = LLVMBuildTrunc(g->builder, val, fn_ret, "rettrunc");
                     }
+                } else if (LLVMGetTypeKind(fn_ret) == LLVMStructTypeKind &&
+                           LLVMGetTypeKind(val_t) == LLVMPointerTypeKind) {
+                    /* A value struct returns by value: `new Pair(3,4)` is a
+                     * stack slot behind a pointer, but the function signature
+                     * returns the aggregate. Loading it here makes
+                     * `return new Pair(...)` verifiable (it used to `ret ptr`
+                     * into a `%struct.Pair` function and fail verification).
+                     * Must precede the pointer-coercion branches below, since
+                     * the stack slot is itself a pointer. */
+                    val = LLVMBuildLoad2(g->builder, fn_ret, val, "ret.struct");
                 } else if (LLVMGetTypeKind(fn_ret) == LLVMPointerTypeKind &&
                            LLVMGetTypeKind(val_t) == LLVMPointerTypeKind) {
                     /* e.g. `return null` (i8*) from a method returning a
@@ -1154,39 +1387,152 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * (`continue` keeps targeting the loop, so it is left alone) */
         LLVMBasicBlockRef sw_saved_break = g->break_target;
         g->break_target = end_bb;
+        /* ARC: a `break` out of a case body releases owning locals via
+         * g->loop_locals_base (see AST_BREAK_STMT). Point that base at the
+         * switch discriminant's slot, so the break releases only locals
+         * declared inside the switch -- not the discriminant itself, which
+         * stays owned until the enclosing scope exits. Without this the
+         * release range started at 0 and freed the switch value, so `case
+         * T x:` followed by `x is T` read a dangling pointer. */
+        int sw_saved_loop_base = g->loop_locals_base;
+        g->loop_locals_base = switch_start;
 
-        if (is_string_expr(g, stmt->switch_stmt.expr, locals)) {
-            /* string switch: strcmp chain (LLVMBuildSwitch requires integers) */
+        /* B5: pattern cases — `case T x:`, `case null:`, `case ... when g:`.
+         * A type match is a runtime is-check, a null match a pointer compare,
+         * and a guard a side condition, so none of them can ride
+         * LLVMBuildSwitch; any switch containing one is lowered to a chain of
+         * per-case comparisons instead. */
+        bool has_patterns = false;
+        for (int i = 0; i < stmt->switch_stmt.cases.count && !has_patterns; i++) {
+            zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
+            if (sc->switch_case.type_pattern || sc->switch_case.when_cond ||
+                sc->switch_case.var_name.len > 0 ||
+                (sc->switch_case.pattern &&
+                 sc->switch_case.pattern->kind == AST_NULL_LITERAL))
+                has_patterns = true;
+        }
+        if (has_patterns) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
-            LLVMValueRef strcmp_fn = LLVMGetNamedFunction(g->mod, "strcmp");
-            LLVMTypeRef strcmp_ty = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
-            if (!strcmp_fn) strcmp_fn = LLVMAddFunction(g->mod, "strcmp", strcmp_ty);
-
-            LLVMBasicBlockRef *case_bbs = (LLVMBasicBlockRef *)calloc(
-                (size_t)(num_cases > 0 ? num_cases : 1), sizeof(LLVMBasicBlockRef));
-            int ci = 0;
-            for (int i = 0; i < stmt->switch_stmt.cases.count; i++) {
-                zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
-                if (!sc->switch_case.pattern) continue;
-                LLVMValueRef case_val = emit_expr(g, sc->switch_case.pattern, locals);
-                LLVMBasicBlockRef case_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.case");
-                LLVMBasicBlockRef next_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.next");
-                LLVMValueRef cmp = zan_call2(g->builder, strcmp_ty, strcmp_fn,
-                    (LLVMValueRef[]){ switch_val, case_val }, 2, "swcmp");
-                LLVMValueRef eq = zan_icmp(g->builder, LLVMIntEQ, cmp,
-                    LLVMConstInt(i32, 0, 0), "sweq");
-                LLVMBuildCondBr(g->builder, eq, case_bb, next_bb);
-                LLVMPositionBuilderAtEnd(g->builder, next_bb);
-                case_bbs[ci++] = case_bb;
+            bool sw_string = is_string_expr(g, stmt->switch_stmt.expr, locals);
+            LLVMValueRef strcmp_fn = NULL;
+            LLVMTypeRef strcmp_ty = NULL;
+            if (sw_string) {
+                strcmp_fn = LLVMGetNamedFunction(g->mod, "strcmp");
+                strcmp_ty = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
+                if (!strcmp_fn) strcmp_fn = LLVMAddFunction(g->mod, "strcmp", strcmp_ty);
             }
-            LLVMBuildBr(g->builder, default_bb);
 
-            ci = 0;
-            for (int i = 0; i < stmt->switch_stmt.cases.count; i++) {
+            int nc = stmt->switch_stmt.cases.count;
+            LLVMBasicBlockRef *pmatch = (LLVMBasicBlockRef *)calloc(
+                (size_t)(nc > 0 ? nc : 1), sizeof(LLVMBasicBlockRef));
+            int *psrc = (int *)calloc((size_t)(nc > 0 ? nc : 1), sizeof(int));
+            int ci = 0;
+
+            LLVMBasicBlockRef test_bb = LLVMAppendBasicBlockInContext(
+                g->ctx, g->current_fn, "sw.ptest");
+            LLVMBuildBr(g->builder, test_bb);
+
+            for (int i = 0; i < nc; i++) {
                 zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
-                if (!sc->switch_case.pattern) continue;
-                LLVMPositionBuilderAtEnd(g->builder, case_bbs[ci++]);
+                if (!sc->switch_case.pattern && !sc->switch_case.type_pattern)
+                    continue; /* default handled after the chain */
+                LLVMPositionBuilderAtEnd(g->builder, test_bb);
+                LLVMBasicBlockRef match_bb = LLVMAppendBasicBlockInContext(
+                    g->ctx, g->current_fn, "sw.pmatch");
+                /* always a fresh fail block: it either hosts the next case's
+                 * test or is wired to default/end after the chain. */
+                LLVMBasicBlockRef fail_bb = LLVMAppendBasicBlockInContext(
+                    g->ctx, g->current_fn, "sw.pnext");
+
+                /* pattern variable: bind before the guard so `when` can read
+                 * it. The case body rebinds it separately (see below) because
+                 * each body's scope-exit release truncates locals back to
+                 * switch_start, wiping every chain-time binding. */
+                emit_switch_pattern_bind(g, locals, sc, switch_val);
+
+                /* the match condition */
+                LLVMValueRef cond;
+                if (sc->switch_case.type_pattern) {
+                    zan_type_t *pt = resolve_type_ctx(g, sc->switch_case.type_pattern);
+                    if (pt && (pt->kind == TYPE_CLASS || pt->kind == TYPE_STRING ||
+                               pt->kind == TYPE_OBJECT || pt->kind == TYPE_INTERFACE))
+                        cond = emit_runtime_is_check_name(g, switch_val, pt);
+                    else
+                        cond = LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
+                } else if (sc->switch_case.pattern->kind == AST_NULL_LITERAL) {
+                    cond = zan_icmp(g->builder, LLVMIntEQ, switch_val,
+                        LLVMConstNull(LLVMTypeOf(switch_val)), "sw.null");
+                } else if (sw_string) {
+                    LLVMValueRef case_val = emit_expr(g, sc->switch_case.pattern, locals);
+                    LLVMValueRef cmp = zan_call2(g->builder, strcmp_ty, strcmp_fn,
+                        (LLVMValueRef[]){ switch_val, case_val }, 2, "swcmp");
+                    cond = zan_icmp(g->builder, LLVMIntEQ, cmp,
+                        LLVMConstInt(i32, 0, 0), "sweq");
+                } else {
+                    LLVMValueRef case_val = emit_expr(g, sc->switch_case.pattern, locals);
+                    cond = zan_icmp(g->builder, LLVMIntEQ, switch_val, case_val,
+                                    "sw.eq");
+                }
+                /* `when` guard: evaluated only after the pattern matched.
+                 * The guard runs in its own block so a failed match (null
+                 * discriminant, wrong runtime type) never evaluates it --
+                 * the pattern variable is only safe to read after the match
+                 * held. A plain `and` would evaluate it unconditionally and
+                 * crash on `case Dog d when d.Legs > 3:` for a null value. */
+                if (sc->switch_case.when_cond) {
+                    LLVMBasicBlockRef guard_bb = LLVMAppendBasicBlockInContext(
+                        g->ctx, g->current_fn, "sw.pguard");
+                    LLVMBuildCondBr(g->builder, cond, guard_bb, fail_bb);
+                    LLVMPositionBuilderAtEnd(g->builder, guard_bb);
+                    LLVMValueRef gv = emit_expr(g, sc->switch_case.when_cond, locals);
+                    if (LLVMGetTypeKind(LLVMTypeOf(gv)) != LLVMIntegerTypeKind ||
+                        LLVMGetIntTypeWidth(LLVMTypeOf(gv)) != 1)
+                        gv = LLVMBuildICmp(g->builder, LLVMIntNE, gv,
+                            LLVMConstInt(LLVMTypeOf(gv), 0, 0), "sw.guard");
+                    LLVMBuildCondBr(g->builder, gv, match_bb, fail_bb);
+                } else {
+                    LLVMBuildCondBr(g->builder, cond, match_bb, fail_bb);
+                }
+                pmatch[ci] = match_bb;
+                psrc[ci] = i;
+                ci++;
+                test_bb = fail_bb;
+            }
+
+            /* the last test's failure lands in default / end */
+            LLVMPositionBuilderAtEnd(g->builder, test_bb);
+            if (default_case)
+                LLVMBuildBr(g->builder, default_bb);
+            else
+                LLVMBuildBr(g->builder, end_bb);
+
+            /* case bodies */
+            for (int k = 0; k < ci; k++) {
+                int i = psrc[k];
+                zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
+                LLVMPositionBuilderAtEnd(g->builder, pmatch[k]);
+                bool case_empty = (sc->switch_case.body &&
+                                   sc->switch_case.body->block.stmts.count == 0);
+                if (case_empty) {
+                    LLVMBasicBlockRef fall = NULL;
+                    for (int k2 = k + 1; k2 < ci; k2++) {
+                        zan_ast_node_t *nxt = stmt->switch_stmt.cases.items[psrc[k2]];
+                        if (nxt->switch_case.body &&
+                            nxt->switch_case.body->block.stmts.count > 0) {
+                            fall = pmatch[k2];
+                            break;
+                        }
+                    }
+                    if (!fall) fall = default_bb;
+                    LLVMBuildBr(g->builder, fall);
+                    continue;
+                }
+                /* rebind the pattern variable in this body's scope: previous
+                 * bodies' scope-exit release truncated locals past the chain
+                 * time binding, so the body must see its own copy */
+                emit_switch_pattern_bind(g, locals, sc, switch_val);
                 emit_stmt(g, sc->switch_case.body, locals);
                 if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
                     emit_release_owned_locals_from(g, locals, switch_start);
@@ -1195,7 +1541,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     emit_release_owned_locals_from(g, locals, switch_start);
                 }
             }
-            free(case_bbs);
+            free(pmatch);
+            free(psrc);
 
             if (default_case) {
                 LLVMPositionBuilderAtEnd(g->builder, default_bb);
@@ -1209,13 +1556,107 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             }
 
             g->break_target = sw_saved_break;
+            g->loop_locals_base = sw_saved_loop_base;
+            LLVMPositionBuilderAtEnd(g->builder, end_bb);
+            break;
+        }
+
+        if (is_string_expr(g, stmt->switch_stmt.expr, locals)) {
+            /* string switch: strcmp chain (LLVMBuildSwitch requires integers) */
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+            LLVMValueRef strcmp_fn = LLVMGetNamedFunction(g->mod, "strcmp");
+            LLVMTypeRef strcmp_ty = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
+            if (!strcmp_fn) strcmp_fn = LLVMAddFunction(g->mod, "strcmp", strcmp_ty);
+
+            LLVMBasicBlockRef *case_bbs = (LLVMBasicBlockRef *)calloc(
+                (size_t)(num_cases > 0 ? num_cases : 1), sizeof(LLVMBasicBlockRef));
+            int *case_src = (int *)calloc((size_t)(num_cases > 0 ? num_cases : 1),
+                                          sizeof(int));
+            int ci = 0;
+            for (int i = 0; i < stmt->switch_stmt.cases.count; i++) {
+                zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
+                if (!sc->switch_case.pattern) continue;
+                LLVMValueRef case_val = emit_expr(g, sc->switch_case.pattern, locals);
+                LLVMBasicBlockRef case_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.case");
+                LLVMBasicBlockRef next_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.next");
+                LLVMValueRef cmp = zan_call2(g->builder, strcmp_ty, strcmp_fn,
+                    (LLVMValueRef[]){ switch_val, case_val }, 2, "swcmp");
+                LLVMValueRef eq = zan_icmp(g->builder, LLVMIntEQ, cmp,
+                    LLVMConstInt(i32, 0, 0), "sweq");
+                LLVMBuildCondBr(g->builder, eq, case_bb, next_bb);
+                LLVMPositionBuilderAtEnd(g->builder, next_bb);
+                case_bbs[ci] = case_bb;
+                case_src[ci] = i;
+                ci++;
+            }
+            LLVMBuildBr(g->builder, default_bb);
+
+            for (int k = 0; k < ci; k++) {
+                int i = case_src[k];
+                zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
+                LLVMPositionBuilderAtEnd(g->builder, case_bbs[k]);
+                /* an empty case falls through into the next non-empty case
+                 * (or default), mirroring the integer-switch fix */
+                bool case_empty = (sc->switch_case.body &&
+                                   sc->switch_case.body->block.stmts.count == 0);
+                if (case_empty) {
+                    LLVMBasicBlockRef fall_bb = NULL;
+                    for (int k2 = k + 1; k2 < ci; k2++) {
+                        zan_ast_node_t *nxt =
+                            stmt->switch_stmt.cases.items[case_src[k2]];
+                        if (nxt->switch_case.body &&
+                            nxt->switch_case.body->block.stmts.count > 0) {
+                            fall_bb = case_bbs[k2];
+                            break;
+                        }
+                    }
+                    if (!fall_bb) fall_bb = default_bb;
+                    LLVMBuildBr(g->builder, fall_bb);
+                    continue;
+                }
+                emit_stmt(g, sc->switch_case.body, locals);
+                if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
+                    emit_release_owned_locals_from(g, locals, switch_start);
+                    LLVMBuildBr(g->builder, end_bb);
+                } else {
+                    emit_release_owned_locals_from(g, locals, switch_start);
+                }
+            }
+            free(case_bbs);
+            free(case_src);
+
+            if (default_case) {
+                LLVMPositionBuilderAtEnd(g->builder, default_bb);
+                emit_stmt(g, default_case->switch_case.body, locals);
+                if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
+                    emit_release_owned_locals_from(g, locals, switch_start);
+                    LLVMBuildBr(g->builder, end_bb);
+                } else {
+                    emit_release_owned_locals_from(g, locals, switch_start);
+                }
+            }
+
+            g->break_target = sw_saved_break;
+            g->loop_locals_base = sw_saved_loop_base;
             LLVMPositionBuilderAtEnd(g->builder, end_bb);
             break;
         }
 
         LLVMValueRef sw = LLVMBuildSwitch(g->builder, switch_val, default_bb, (unsigned)num_cases);
 
-        /* emit each case block */
+        /* C# case fallthrough: `case 1: case 2: body` lets both labels share
+         * one body -- an empty case falls through into the next case (or, at
+         * the tail, into default). Each case gets its own block and empty
+         * cases are wired to the next non-empty one. */
+        LLVMBasicBlockRef *case_bbs = (LLVMBasicBlockRef *)calloc(
+            (size_t)(num_cases > 0 ? num_cases : 1), sizeof(LLVMBasicBlockRef));
+        /* case_src[i] = index in stmt->cases of the i-th non-default case;
+         * lets an empty case find the block of the next non-empty case */
+        int *case_src = (int *)calloc((size_t)(num_cases > 0 ? num_cases : 1),
+                                      sizeof(int));
+        int nci = 0;
+        /* pass 1: create a block for every case, add it to the switch */
         for (int i = 0; i < stmt->switch_stmt.cases.count; i++) {
             zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
             if (!sc->switch_case.pattern) continue; /* default handled separately */
@@ -1236,8 +1677,40 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 case_val = LLVMConstInt(swty, (unsigned long long)cv, 1);
             }
             LLVMAddCase(sw, case_val, case_bb);
+            case_bbs[nci] = case_bb;
+            case_src[nci] = i;
+            nci++;
+        }
+
+        /* pass 2: emit each case body; an empty case (no statements) is a
+         * fallthrough label and just branches into the next case's block */
+        for (int k = 0; k < nci; k++) {
+            int i = case_src[k];
+            zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
+            LLVMBasicBlockRef case_bb = case_bbs[k];
+            bool case_empty = (sc->switch_case.body &&
+                               sc->switch_case.body->block.stmts.count == 0);
+            /* the next label this case falls into: the next case with a
+             * non-empty body, else default (or the switch end) */
+            LLVMBasicBlockRef fall_bb = NULL;
+            if (case_empty) {
+                for (int k2 = k + 1; k2 < nci; k2++) {
+                    zan_ast_node_t *nxt =
+                        stmt->switch_stmt.cases.items[case_src[k2]];
+                    if (nxt->switch_case.body &&
+                        nxt->switch_case.body->block.stmts.count > 0) {
+                        fall_bb = case_bbs[k2];
+                        break;
+                    }
+                }
+                if (!fall_bb) fall_bb = default_bb;
+            }
 
             LLVMPositionBuilderAtEnd(g->builder, case_bb);
+            if (case_empty) {
+                LLVMBuildBr(g->builder, fall_bb);
+                continue;
+            }
             emit_stmt(g, sc->switch_case.body, locals);
             if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
                 emit_release_owned_locals_from(g, locals, switch_start);
@@ -1246,6 +1719,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 emit_release_owned_locals_from(g, locals, switch_start);
             }
         }
+        free(case_bbs);
+        free(case_src);
 
         /* emit default block */
         if (default_case) {
@@ -1260,6 +1735,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
 
         g->break_target = sw_saved_break;
+        g->loop_locals_base = sw_saved_loop_base;
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         break;
     }

@@ -73,6 +73,13 @@ typedef enum {
     AST_POSTFIX_UNARY,
     AST_STRING_INTERP,  /* $"text {expr} text" */
 
+    /* tuple: (e1, e2, ...) literal and its type (T1, T2) */
+    AST_TUPLE_EXPR,
+    AST_TUPLE_TYPE,
+
+    /* deconstruction statement: var (a, b) = rhs; */
+    AST_TUPLE_DECON,
+
     /* type references */
     AST_TYPE_REF,
     AST_ARRAY_TYPE,
@@ -82,6 +89,9 @@ typedef enum {
 
     /* `ref x` / `out x` / `out T x` call argument */
     AST_REF_ARG,
+
+    /* named call argument: `F(b: 2)` */
+    AST_NAMED_ARG,
 
     /* misc */
     AST_ATTRIBUTE,
@@ -94,6 +104,12 @@ typedef enum {
     AST_GOTO_STMT,    /* goto label; */
     AST_LABEL_STMT,   /* label: */
     AST_QUERY_EXPR,   /* from x in src where c ... select e */
+    AST_QUERY_WHERE,  /* query clause: where c */
+    AST_QUERY_LET,    /* query clause: let v = e */
+    AST_QUERY_ORDERBY,/* query clause: orderby k [ascending|descending] */
+    AST_QUERY_JOIN,   /* query clause: join y in s on k1 equals k2 [into g] */
+    AST_SWITCH_EXPR,  /* `expr switch { arm, ... }` (expression form) */
+    AST_SWITCH_ARM,   /* one arm of a switch expression */
 
     AST__COUNT,
 } zan_ast_kind_t;
@@ -178,9 +194,11 @@ struct zan_ast_node {
         } member;
 
         /* index: expr[idx] */
+        /* index: obj[i] or obj[i,j] (multi-dimensional) */
         struct {
             zan_ast_node_t *object;
-            zan_ast_node_t *index;
+            zan_ast_node_t *index;   /* first index */
+            zan_ast_list_t extra;    /* remaining indices for rank > 1 */
         } index;
 
         /* conditional: cond ? then : else */
@@ -196,6 +214,8 @@ struct zan_ast_node {
             zan_ast_list_t args;
             bool is_array;       /* new Type[size] */
             bool array_init;     /* new Type[] { a, b } -- args are elements */
+            int array_rank;      /* number of dimension sizes at args start
+                                  * (0 = no dims: plain object or unsized init) */
         } new_expr;
 
         /* cast: (Type)expr */
@@ -208,16 +228,37 @@ struct zan_ast_node {
         struct {
             zan_ast_node_t *expr;
             zan_ast_node_t *type;
+            zan_istr_t var_name; /* pattern variable: `is T x` (empty if none) */
+            bool is_not;         /* `is not T` / `is not null` */
         } type_test;
 
-        /* var / let declaration */
-        struct {
-            zan_istr_t name;
-            zan_ast_node_t *type;        /* NULL if var (inferred) */
-            zan_ast_node_t *initializer; /* NULL if none */
-            bool is_const;               /* const */
-            bool is_let;                 /* let (immutable) */
-        } var_decl;
+    /* var / let declaration */
+    struct {
+        zan_istr_t name;
+        zan_ast_node_t *type;        /* NULL if var (inferred) */
+        zan_ast_node_t *initializer; /* NULL if none */
+        bool is_const;               /* const */
+        bool is_let;                 /* let (immutable) */
+    } var_decl;
+
+    /* tuple expression: (e1, e2, ...) */
+    struct {
+        zan_ast_list_t items;
+    } tuple_expr;
+
+    /* tuple type: (T1, T2, ...) in type position */
+    struct {
+        zan_ast_list_t elems;
+    } tuple_type;
+
+    /* deconstruction: var (a, b) = rhs;  /  (int a, string b) = rhs;
+     * names[i] is the variable name, types[i] its declared type (NULL for a
+     * `var` element). Lowered to field reads of the initializer's ItemN. */
+    struct {
+        zan_ast_list_t names;
+        zan_ast_list_t types;
+        zan_ast_node_t *initializer;
+    } tuple_decon;
 
         /* block: { statements } */
         struct {
@@ -285,9 +326,28 @@ struct zan_ast_node {
 
         /* switch case */
         struct {
-            zan_ast_node_t *pattern; /* NULL for default */
+            zan_ast_node_t *pattern; /* constant expr, or NULL for default */
+            zan_ast_node_t *type_pattern; /* `case T x:` type node (else NULL) */
+            zan_ast_node_t *when_cond;    /* `case ... when guard:` guard (else NULL) */
             zan_ast_node_t *body;
+            zan_istr_t var_name; /* pattern variable for `case T x:` */
         } switch_case;
+
+        /* switch expression: `expr switch { arm, ... }` */
+        struct {
+            zan_ast_node_t *expr;
+            zan_ast_list_t arms;
+        } switch_expr;
+
+        /* switch expression arm: `pattern => result` / `pattern when g => result` */
+        struct {
+            zan_ast_node_t *pattern;     /* constant expr, NULL for default/discard */
+            zan_ast_node_t *type_pattern; /* `int i =>` type node (else NULL) */
+            zan_ast_node_t *when_cond;    /* `... when g =>` guard (else NULL) */
+            zan_ast_node_t *result;
+            zan_istr_t var_name;          /* pattern variable for `int i =>` */
+            bool is_default;              /* `_ =>` / `default =>` */
+        } switch_arm;
 
         /* expression statement */
         struct {
@@ -349,6 +409,24 @@ struct zan_ast_node {
             zan_ast_node_t *type;
             zan_ast_node_t *initializer;
             uint32_t modifiers;
+            /* Property accessor bodies (AST_PROPERTY_DECL only). NULL means an
+             * automatic accessor (`{ get; }` / `{ set; }`) backed by the field
+             * slot; a block/expression body means the read/write lowers to the
+             * synthesized get_<name>/set_<name> method. Plain fields keep both
+             * NULL. */
+            zan_ast_node_t *getter_body;
+            zan_ast_node_t *setter_body;
+            /* Whether the corresponding accessor keyword was present at all
+             * (`get`/`set` in the `{ ... }` list). `{ get; }` has has_setter
+             * false and is read-only; `{ get; set; }` has both true even though
+             * the automatic setter's body is NULL. `has_init` marks an `init`
+             * accessor (`{ get; init; }`): a setter that is only writable while
+             * the object is being initialized (object initializer / ctor). Its
+             * body (if any) is stored in setter_body and lowers to set_<name>,
+             * same as `set`. */
+            bool has_getter;
+            bool has_setter;
+            bool has_init;
         } field_decl;
 
         /* generic constraint clause: where T : C1, C2 */
@@ -368,13 +446,32 @@ struct zan_ast_node {
             zan_ast_node_t *body;
         } lock_stmt;
 
-        /* from var in source where c1 where c2 select proj */
+        /* from var in source [clauses]* [group e by k [into g]]? [select p]
+         * -- sub-clauses (where/let/orderby/join) sit in `clauses` in source
+         * order; group is a single trailing clause (its `into` makes the
+         * range variable that `select` sees a Grouping). */
         struct {
             zan_istr_t var;
             zan_ast_node_t *source;
-            zan_ast_list_t wheres;
+            zan_ast_list_t clauses; /* AST_QUERY_WHERE/LET/ORDERBY/JOIN, in
+                                     * source order */
+            zan_ast_node_t *group_expr; /* `group <expr> by <key>` element */
+            zan_ast_node_t *group_key;  /* group key expression */
+            zan_istr_t group_into;      /* `into <name>` var (empty = none) */
             zan_ast_node_t *select;
         } query;
+
+        /* sub-clause payloads (AST_QUERY_WHERE, AST_QUERY_LET,
+         * AST_QUERY_ORDERBY, AST_QUERY_JOIN) */
+        struct {
+            zan_istr_t name;        /* let v / join y / into g var name */
+            zan_ast_node_t *expr;   /* where cond, let value or orderby key */
+            int descending;         /* orderby: 1 = descending */
+            zan_ast_node_t *source;     /* join source collection */
+            zan_ast_node_t *left_key;   /* join left key (outer range var) */
+            zan_ast_node_t *right_key;  /* join right key (inner range var) */
+            zan_istr_t into;            /* join ... into g (group join) */
+        } query_clause;
 
         /* parameter */
         struct {
@@ -393,12 +490,29 @@ struct zan_ast_node {
             int is_out;
         } ref_arg;
 
+        /* named call argument: `F(b: 2)` -- the arg name and its expression.
+         * Stored in the call's args list; irgen reorders it to the parameter
+         * position once the callee symbol is known. */
+        struct {
+            zan_istr_t name;
+            zan_ast_node_t *expr;
+        } named_arg;
+
         /* type reference */
         struct {
             zan_istr_t name;
             zan_ast_list_t type_args;
             bool is_nullable;
             bool is_array;
+            /* Array shape beyond the boolean: `array_rank` is 1 for `[]`,
+             * 2 for `[,]`, 3 for `[,,]` ... A *jagged* declaration wraps the
+             * inner declaration: `int[][]` parses as an outer node whose
+             * array_element points at the `int[]` node. C# folds the
+             * leftmost rank specifier as the OUTERMOST array, so `int[][,]`
+             * is a 1D array of `int[,]`. NULL array_element means the node
+             * itself is the element (plain `int[]` / `int[,]`). */
+            int array_rank;
+            zan_ast_node_t *array_element;
         } type_ref;
 
         /* qualified name: a.b.c */
@@ -432,6 +546,10 @@ struct zan_ast_node {
         /* string interpolation: $"text {expr} text" */
         struct {
             zan_ast_list_t parts; /* alternating STRING_LITERAL and expr nodes */
+            /* Parallel to the expr parts: the format specifier of each hole
+             * (e.g. "D4" in {v:D4}) as an AST_STRING_LITERAL, or NULL when the
+             * hole has none. Index i corresponds to the i-th expr part. */
+            zan_ast_list_t formats;
         } string_interp;
     };
 };
@@ -454,6 +572,7 @@ struct zan_ast_node {
 #define MOD_WEAK      0x2000
 #define MOD_EVENT     0x4000
 #define MOD_PARTIAL   0x8000
+#define MOD_REF       0x10000  /* `ref struct` / `ref` return-annotated member */
 
 /* ---- utility functions ---- */
 

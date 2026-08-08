@@ -19,6 +19,7 @@ typedef enum {
     TK_INTERP_START,    /* $" ... start of interpolated string */
     TK_INTERP_MID,      /* ... } text { ... middle fragment */
     TK_INTERP_END,      /* ... } text " end fragment */
+    TK_INTERP_FMT,      /* {expr:D4} — the format specifier inside a hole */
 
     /* identifier */
     TK_IDENT,
@@ -62,6 +63,7 @@ typedef enum {
     TK_NAMESPACE,
     TK_NEW,
     TK_NINT,
+    TK_NOT,
     TK_NULL,
     TK_OPERATOR,
     TK_OBJECT,

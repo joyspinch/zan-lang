@@ -677,7 +677,7 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMValueRef isnull = zan_icmp(b, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
     LLVMBuildCondBr(b, isnull, ret, cont);
     LLVMPositionBuilderAtEnd(b, cont);
-    LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)-16, 1);
+    LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
     LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
     LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
     LLVMValueRef rc = LLVMBuildLoad2(b, i64, rcip, "rc");
@@ -751,7 +751,7 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
     LLVMValueRef isnull = zan_icmp(b, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
     LLVMBuildCondBr(b, isnull, ret, cont);
     LLVMPositionBuilderAtEnd(b, cont);
-    LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)-16, 1);
+    LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
     LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
     LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
     LLVMValueRef rc = LLVMBuildLoad2(b, i64, rcip, "rc");
@@ -1167,8 +1167,11 @@ static bool types_equal(zan_type_t *a, zan_type_t *b) {
     if (a->name.len != b->name.len ||
         (a->name.len && memcmp(a->name.str, b->name.str, (size_t)a->name.len) != 0))
         return false;
-    if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE)
+    if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE) {
+        if (a->kind == TYPE_ARRAY && a->array_rank != b->array_rank)
+            return false; /* int[,] is not int[] */
         return types_equal(a->element_type, b->element_type);
+    }
     if (a->type_arg_count != b->type_arg_count) return false;
     for (int i = 0; i < a->type_arg_count; i++)
         if (!types_equal(a->type_args[i], b->type_args[i])) return false;

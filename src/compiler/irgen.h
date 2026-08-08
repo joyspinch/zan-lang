@@ -73,6 +73,10 @@ struct zan_irgen {
     LLVMValueRef fn_strlen;
     LLVMValueRef fn_strcpy;
     LLVMValueRef fn_strcat;
+    /* shared "" literal: a null string concatenates as empty (C#), and
+     * strlen/memcpy on NULL are UB, so concat sites coerce NULL operands to
+     * this pointer instead of branching on every operand. */
+    LLVMValueRef str_empty;
 
     /* struct type registry (grown on demand: a class whose layout does not fit
      * would silently lower to a non-pointer and fail LLVM verification) */

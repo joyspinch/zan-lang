@@ -426,6 +426,9 @@ static void collect_shadows(nr_ctx_t *c, zan_ast_node_t *n) {
     case AST_REF_ARG:
         collect_shadows(c, n->ref_arg.expr);
         break;
+    case AST_NAMED_ARG:
+        collect_shadows(c, n->named_arg.expr);
+        break;
     case AST_THROW_STMT:
         collect_shadows(c, n->throw_stmt.value);
         break;
@@ -656,12 +659,26 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
 
     case AST_QUERY_EXPR:
         nr_walk(c, n->query.source, ns, usings);
-        nr_walk_list(c, &n->query.wheres, ns, usings);
+        for (int ci = 0; ci < n->query.clauses.count; ci++) {
+            zan_ast_node_t *cl = n->query.clauses.items[ci];
+            nr_walk(c, cl->query_clause.expr, ns, usings);
+            if (cl->kind == AST_QUERY_JOIN) {
+                nr_walk(c, cl->query_clause.source, ns, usings);
+                nr_walk(c, cl->query_clause.left_key, ns, usings);
+                nr_walk(c, cl->query_clause.right_key, ns, usings);
+            }
+        }
+        nr_walk(c, n->query.group_expr, ns, usings);
+        nr_walk(c, n->query.group_key, ns, usings);
         nr_walk(c, n->query.select, ns, usings);
         break;
 
     case AST_ENUM_MEMBER:
         nr_walk(c, n->enum_member.value, ns, usings);
+        break;
+
+    case AST_NAMED_ARG:
+        nr_walk(c, n->named_arg.expr, ns, usings);
         break;
 
     default:

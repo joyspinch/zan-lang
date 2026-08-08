@@ -62,6 +62,7 @@ static const keyword_entry_t s_keywords[] = {
     {"long",      TK_LONG},
     {"namespace", TK_NAMESPACE},
     {"new",       TK_NEW},
+    {"not",       TK_NOT},
     {"nint",      TK_NINT},
     {"null",      TK_NULL},
     {"operator",  TK_OPERATOR},
@@ -866,6 +867,8 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
         lexer_advance(lex); /* { */
         lex->interp_depth++;
         lex->interp_brace_depth = 0;
+        lex->interp_paren_depth = 0;
+        lex->interp_bracket_depth = 0;
         kind = start_kind; /* INTERP_START or INTERP_MID */
     } else {
         /* closing " or EOF */
@@ -875,6 +878,23 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
     }
 
     zan_token_t tok = lexer_make(lex, kind, loc);
+    tok.str_val.str = zan_arena_strdup(lex->arena, buf, bi);
+    tok.str_val.len = (uint32_t)bi;
+    return tok;
+}
+
+/* Format specifier of an interpolation hole: the text between the `:` and the
+ * closing `}` of `{expr:D4}`. Captured verbatim (it is arbitrary text, not
+ * tokens); the `}` is left for the next lexer call, which routes it through
+ * the normal INTERP_MID/END path. */
+static zan_token_t lexer_interp_format(zan_lexer_t *lex, zan_loc_t loc) {
+    char buf[256];
+    size_t bi = 0;
+    while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '}') {
+        if (bi < sizeof(buf) - 1) buf[bi++] = lexer_advance(lex);
+        else lexer_advance(lex); /* format longer than the buffer: skip it */
+    }
+    zan_token_t tok = lexer_make(lex, TK_INTERP_FMT, loc);
     tok.str_val.str = zan_arena_strdup(lex->arena, buf, bi);
     tok.str_val.len = (uint32_t)bi;
     return tok;
@@ -988,8 +1008,13 @@ pp_retry:
     lexer_advance(lex);
 
     switch (ch) {
-    case '(': return lexer_make(lex, TK_LPAREN, loc);
-    case ')': return lexer_make(lex, TK_RPAREN, loc);
+    case '(':
+        if (lex->interp_depth > 0) lex->interp_paren_depth++;
+        return lexer_make(lex, TK_LPAREN, loc);
+    case ')':
+        if (lex->interp_depth > 0 && lex->interp_paren_depth > 0)
+            lex->interp_paren_depth--;
+        return lexer_make(lex, TK_RPAREN, loc);
     case '{':
         if (lex->interp_depth > 0) lex->interp_brace_depth++;
         return lexer_make(lex, TK_LBRACE, loc);
@@ -1000,10 +1025,25 @@ pp_retry:
         }
         if (lex->interp_depth > 0) lex->interp_brace_depth--;
         return lexer_make(lex, TK_RBRACE, loc);
-    case '[': return lexer_make(lex, TK_LBRACKET, loc);
-    case ']': return lexer_make(lex, TK_RBRACKET, loc);
+    case '[':
+        if (lex->interp_depth > 0) lex->interp_bracket_depth++;
+        return lexer_make(lex, TK_LBRACKET, loc);
+    case ']':
+        if (lex->interp_depth > 0 && lex->interp_bracket_depth > 0)
+            lex->interp_bracket_depth--;
+        return lexer_make(lex, TK_RBRACKET, loc);
     case ';': return lexer_make(lex, TK_SEMICOLON, loc);
-    case ':': return lexer_make(lex, TK_COLON, loc);
+    case ':':
+        /* Inside a $"..." hole, a `:` at the top nesting level (no surrounding
+         * (), [] or {}) starts the format specifier: `{v:D4}`. A conditional
+         * or slice colon sits at paren/bracket depth > 0 and stays a plain
+         * colon. The format text runs to the closing `}` (C#: everything after
+         * `:` is the format), so it is captured verbatim, not tokenized. */
+        if (lex->interp_depth > 0 && lex->interp_brace_depth == 0 &&
+            lex->interp_paren_depth == 0 && lex->interp_bracket_depth == 0) {
+            return lexer_interp_format(lex, loc);
+        }
+        return lexer_make(lex, TK_COLON, loc);
     case ',': return lexer_make(lex, TK_COMMA, loc);
     case '~': return lexer_make(lex, TK_TILDE, loc);
 
@@ -1091,6 +1131,8 @@ zan_token_t zan_lexer_peek(zan_lexer_t *lex) {
     uint32_t col = lex->col;
     int idepth = lex->interp_depth;
     int ibrace = lex->interp_brace_depth;
+    int iparen = lex->interp_paren_depth;
+    int ibrack = lex->interp_bracket_depth;
 
     zan_token_t tok = zan_lexer_next(lex);
 
@@ -1100,6 +1142,8 @@ zan_token_t zan_lexer_peek(zan_lexer_t *lex) {
     lex->col = col;
     lex->interp_depth = idepth;
     lex->interp_brace_depth = ibrace;
+    lex->interp_paren_depth = iparen;
+    lex->interp_bracket_depth = ibrack;
 
     return tok;
 }

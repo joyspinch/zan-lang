@@ -1,0 +1,145 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+
+/// <summary>
+/// 桌面提示框。Windows 用 MessageBoxA；Linux 用 zenity 或 kdialog；
+/// macOS 用 osascript 的 display dialog。返回值沿用 Win32 的
+/// IDOK=1 / IDCANCEL=2 / IDYES=6 / IDNO=7，因此三个平台的判断代码一致。
+///
+/// 提示文本与标题都通过临时文件/参数文件传给后端，不拼进 shell 命令，
+/// 因此内容里的引号和 `$(...)` 不会被解释。
+/// </summary>
+class MessageBox {
+    #if WINDOWS
+    [DllImport("user32")]
+    static extern int MessageBoxA(nint hwnd, string text, string caption, int flags);
+    #endif
+
+    /// IDOK。
+    static int Ok() { return 1; }
+    /// IDCANCEL。
+    static int Cancel() { return 2; }
+    /// IDYES。
+    static int Yes() { return 6; }
+    /// IDNO。
+    static int No() { return 7; }
+
+    /// <summary>只有"确定"的提示框；始终返回 IDOK。</summary>
+    static int Show(string text, string caption) {
+        #if WINDOWS
+        return MessageBoxA(0, text, caption, 0);
+        #else
+        MessageBox.Posix(text, caption, 0);
+        return MessageBox.Ok();
+        #endif
+    }
+
+    /// <summary>是/否提示框；返回 IDYES 或 IDNO。</summary>
+    static int ShowYesNo(string text, string caption) {
+        #if WINDOWS
+        return MessageBoxA(0, text, caption, 4);
+        #else
+        return MessageBox.Posix(text, caption, 1)
+            ? MessageBox.Yes() : MessageBox.No();
+        #endif
+    }
+
+    /// <summary>确定/取消提示框；返回 IDOK 或 IDCANCEL。</summary>
+    static int ShowOkCancel(string text, string caption) {
+        #if WINDOWS
+        return MessageBoxA(0, text, caption, 1);
+        #else
+        return MessageBox.Posix(text, caption, 2)
+            ? MessageBox.Ok() : MessageBox.Cancel();
+        #endif
+    }
+
+    #if !WINDOWS
+    /// kind: 0 = 只有确定，1 = 是/否，2 = 确定/取消。
+    /// 返回用户是否选择了肯定按钮。
+    static bool Posix(string text, string caption, int kind) {
+        #if MACOS
+        string buttons = "buttons {\"OK\"} default button 1";
+        if (kind == 1) {
+            buttons = "buttons {\"No\", \"Yes\"} default button 2";
+        } else if (kind == 2) {
+            buttons = "buttons {\"Cancel\", \"OK\"} default button 2";
+        }
+        string script = "display dialog \"" + MessageBox.OsaQuote(text)
+            + "\" with title \"" + MessageBox.OsaQuote(caption) + "\" "
+            + buttons;
+        // osascript 在用户选否/取消时以非零退出（user canceled）
+        return MessageBox.RunOsa(script) && kind != 0;
+        #else
+        // 文本走参数文件（zenity --text-info / kdialog --textbox 都读文件），
+        // 这样文本内容永远不进命令行
+        string tmp = Path.GetTempPath() + "zan_msg_"
+            + Convert.ToString(ProcessHost.Pid()) + ".txt";
+        File.WriteAllText(tmp, text);
+        string cmd = "";
+        if (MessageBox.Have("zenity")) {
+            string mode = "--info";
+            if (kind == 1) { mode = "--question"; }
+            else if (kind == 2) { mode = "--question --ok-label=OK --cancel-label=Cancel"; }
+            // 正文经 "$(cat file)" 传入：双引号内的命令替换结果不再被
+            // 重新解析，因此文本里的元字符不会被执行
+            cmd = "zenity " + mode + " --title='" + MessageBox.Sanitize(caption)
+                + "' --text=\"$(cat '" + tmp + "')\"";
+        } else if (MessageBox.Have("kdialog")) {
+            string mode = "--msgbox";
+            if (kind == 1) { mode = "--yesno"; }
+            else if (kind == 2) { mode = "--warningcontinuecancel"; }
+            cmd = "kdialog --title '" + MessageBox.Sanitize(caption) + "' "
+                + mode + " \"$(cat '" + tmp + "')\"";
+        } else if (MessageBox.Have("xmessage")) {
+            string btns = kind == 0 ? "OK:0" : "Yes:0,No:1";
+            if (kind == 2) { btns = "OK:0,Cancel:1"; }
+            cmd = "xmessage -center -buttons '" + btns + "' -file '" + tmp + "'";
+        } else {
+            File.Delete(tmp);
+            throw new PlatformNotSupportedException(
+                "MessageBox needs a desktop dialog tool: install zenity, "
+                + "kdialog or xmessage");
+        }
+        int rc = Process.Run(cmd + " >/dev/null 2>&1");
+        File.Delete(tmp);
+        return rc == 0;
+        #endif
+    }
+
+    static bool Have(string tool) {
+        return Process.Capture("command -v " + tool + " >/dev/null 2>&1").Ok();
+    }
+
+    /// 标题要进单引号命令行，因此去掉单引号（标题是短标签，
+    /// 丢掉引号比冒被解释的风险好）。
+    static string Sanitize(string s) {
+        string outp = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch != "'") { outp = outp + ch; }
+        }
+        return outp;
+    }
+
+    static string OsaQuote(string s) {
+        string outp = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\\" || ch == "\"") { outp = outp + "\\"; }
+            outp = outp + ch;
+        }
+        return outp;
+    }
+
+    static bool RunOsa(string script) {
+        string tmp = Path.GetTempPath() + "zan_msg_"
+            + Convert.ToString(ProcessHost.Pid()) + ".applescript";
+        File.WriteAllText(tmp, script);
+        int rc = Process.Run("osascript '" + tmp + "' >/dev/null 2>&1");
+        File.Delete(tmp);
+        return rc == 0;
+    }
+    #endif
+}

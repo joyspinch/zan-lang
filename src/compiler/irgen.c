@@ -186,12 +186,13 @@ static LLVMMetadataRef di_file_for(zan_irgen_t *g, uint32_t file_id) {
     return f;
 }
 
-/* Resolve the source file for a leak-site descriptor from a node's location.
- * Allocations that originate in an included file (notably the stdlib pulled in
- * by --auto-stdlib) carry their own loc.file_id, so attribute the leak to that
+/* Resolve the source file a node's location belongs to (leak-site descriptors,
+ * runtime-check messages). Code that originates in an included file (notably
+ * the stdlib pulled in by --auto-stdlib, or the source a design document is
+ * projected into) carries its own loc.file_id, so attribute the site to that
  * file instead of the top-level module (g->src_file), which mislabels every
  * site as the program being compiled. */
-static const char *leak_site_file(zan_irgen_t *g, zan_loc_t loc) {
+static const char *loc_site_file(zan_irgen_t *g, zan_loc_t loc) {
     if (g->diag && g->diag->file_names &&
         (int)loc.file_id < g->diag->file_count) {
         const char *p = g->diag->file_names[loc.file_id];
@@ -324,6 +325,7 @@ static void di_declare_var(zan_irgen_t *g, zan_istr_t name, LLVMValueRef storage
 static zan_irgen_t *g_di_emit_ctx = NULL;
 
 #include "../common/host_oom.h"
+#include "../common/zan_abi.h"
 /* Maximum number of distinct ARC destructor shapes tracked by the runtime.
  * Allocation sites with the same concrete class/generic/collection shape share
  * one slot; aliasing different shapes would dispatch the wrong destructor. */
@@ -379,10 +381,8 @@ static int reserve_closure_site(zan_irgen_t *g) {
     return site_idx;
 }
 
-/* String RC header magic and sentinel refcount.
- * The second header word doubles as a guard for tolerant retain/release. */
-#define ZAN_STRING_MAGIC UINT64_C(0x5a414e5354524d47) /* ZANSTRMG */
-#define ZAN_STRING_SENTINEL_RC UINT64_C(0xffffffffffffffff)
+/* String RC header magic and sentinel refcount, and the object header layout
+ * (ZAN_OBJ_* / ZAN_STRING_*), are defined in ../common/zan_abi.h. */
 
 /* ---- initialization ---- */
 
@@ -1308,7 +1308,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBuildCondBr(g->builder, is_null, ret_bb, do_retain);
         LLVMPositionBuilderAtEnd(g->builder, do_retain);
         /* refcount is the first header word, at (int64_t*)(obj - 16) */
-        LLVMValueRef neg16 = LLVMConstInt(i64, (uint64_t)-16, 1);
+        LLVMValueRef neg16 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1);
         LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "rcptr");
         LLVMValueRef rc_iptr = LLVMBuildBitCast(g->builder, rc_ptr,
             LLVMPointerType(i64, 0), "rciptr");
@@ -1335,8 +1335,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "ret");
         LLVMBuildCondBr(g->builder, is_null, ret_bb, do_release);
         LLVMPositionBuilderAtEnd(g->builder, do_release);
-        LLVMValueRef neg16 = LLVMConstInt(i64, (uint64_t)-16, 1);
-        LLVMValueRef neg8  = LLVMConstInt(i64, (uint64_t)-8, 1);
+        LLVMValueRef neg16 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1);
+        LLVMValueRef neg8  = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
         LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "rcptr");
         LLVMValueRef rc_iptr = LLVMBuildBitCast(g->builder, rc_ptr,
             LLVMPointerType(i64, 0), "rciptr");
@@ -1395,7 +1395,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "ret");
         LLVMBuildCondBr(g->builder, is_null, ret_bb, cont);
         LLVMPositionBuilderAtEnd(g->builder, cont);
-        LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)-8, 1);
+        LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
         LLVMValueRef sptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "sptr");
         LLVMValueRef siptr = LLVMBuildBitCast(g->builder, sptr, LLVMPointerType(i64, 0), "siptr");
         LLVMValueRef site = LLVMBuildLoad2(g->builder, i64, siptr, "site");
@@ -1438,22 +1438,22 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef size = LLVMGetParam(g->rt_alloc, 0);
         LLVMValueRef site = LLVMGetParam(g->rt_alloc, 1);
         LLVMValueRef name = LLVMGetParam(g->rt_alloc, 2);
-        /* total = size + 16 (for the 16-byte header) */
-        LLVMValueRef total = zan_add(g->builder, size, LLVMConstInt(i64, 16, 0), "total");
+        /* total = size + the 16-byte header */
+        LLVMValueRef total = zan_add(g->builder, size, LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0), "total");
         LLVMTypeRef malloc_fn_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0);
         LLVMValueRef raw = zan_call2(g->builder, malloc_fn_type, g->fn_malloc, &total, 1, "raw");
         emit_oom_check(g, g->rt_alloc, raw);
         /* refcount = 1 at raw[0..7] */
         LLVMValueRef rc_ptr = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "rcptr");
         LLVMBuildStore(g->builder, LLVMConstInt(i64, 1, 0), rc_ptr);
-        /* site index at raw[8..15] */
-        LLVMValueRef eight = LLVMConstInt(i64, 8, 0);
+        /* site index at raw[8..15] (second header word) */
+        LLVMValueRef eight = LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
         LLVMValueRef site_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &eight, 1, "sptr");
         LLVMValueRef site_iptr = LLVMBuildBitCast(g->builder, site_ptr, LLVMPointerType(i64, 0), "siptr");
         LLVMBuildStore(g->builder, site, site_iptr);
-        /* user data = raw + 16 */
-        LLVMValueRef sixteen = LLVMConstInt(i64, 16, 0);
-        LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &sixteen, 1, "usr");
+        /* user data = raw + header */
+        LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
+        LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &hdr_off, 1, "usr");
         if (g->check_leaks) {
             /* leak tracking: total + per-site count, and record the site name */
             LLVMValueRef z32 = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
@@ -1480,18 +1480,18 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_alloc, "entry");
         LLVMPositionBuilderAtEnd(g->builder, bb);
         LLVMValueRef size = LLVMGetParam(g->rt_str_alloc, 0);
-        LLVMValueRef total = zan_add(g->builder, size, LLVMConstInt(i64, 16, 0), "total");
+        LLVMValueRef total = zan_add(g->builder, size, LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0), "total");
         LLVMTypeRef malloc_fn_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0);
         LLVMValueRef raw = zan_call2(g->builder, malloc_fn_type, g->fn_malloc, &total, 1, "raw");
         emit_oom_check(g, g->rt_str_alloc, raw);
         LLVMValueRef rc_ptr = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "rcptr");
         LLVMBuildStore(g->builder, LLVMConstInt(i64, 1, 0), rc_ptr);
-        LLVMValueRef eight = LLVMConstInt(i64, 8, 0);
+        LLVMValueRef eight = LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
         LLVMValueRef magic_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &eight, 1, "magicp");
         LLVMValueRef magic_iptr = LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64, 0), "magicip");
         LLVMBuildStore(g->builder, LLVMConstInt(i64, ZAN_STRING_MAGIC, 0), magic_iptr);
-        LLVMValueRef sixteen = LLVMConstInt(i64, 16, 0);
-        LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &sixteen, 1, "usr");
+        LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
+        LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &hdr_off, 1, "usr");
         if (g->check_leaks) {
             emit_leak_counter_add(g, g->g_live, 1);
         }
@@ -1513,7 +1513,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_retain, "cont");
         LLVMBuildCondBr(g->builder, is_null, ret_bb, cont_bb);
         LLVMPositionBuilderAtEnd(g->builder, cont_bb);
-        LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)-8, 1);
+        LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
         LLVMValueRef magic_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "magicp");
         emit_header_read_guard(g, g->rt_str_retain, magic_ptr, ret_bb);
         LLVMValueRef magic_iptr = LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64t, 0), "magicip");
@@ -1523,7 +1523,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef retain_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_retain, "retain");
         LLVMBuildCondBr(g->builder, has_magic, retain_bb, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, retain_bb);
-        LLVMValueRef neg16 = LLVMConstInt(i64t, (uint64_t)-16, 1);
+        LLVMValueRef neg16 = LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_RC_OFF, 1);
         LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "rcptr");
         LLVMValueRef rc_iptr = LLVMBuildBitCast(g->builder, rc_ptr, LLVMPointerType(i64t, 0), "rciptr");
         LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64t, rc_iptr, "rc");
@@ -1552,7 +1552,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "cont");
         LLVMBuildCondBr(g->builder, is_null, ret_bb, cont_bb);
         LLVMPositionBuilderAtEnd(g->builder, cont_bb);
-        LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)-8, 1);
+        LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
         LLVMValueRef magic_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "magicp");
         emit_header_read_guard(g, g->rt_str_release, magic_ptr, ret_bb);
         LLVMValueRef magic_iptr = LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64t, 0), "magicip");
@@ -1562,7 +1562,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef rel_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "release");
         LLVMBuildCondBr(g->builder, has_magic, rel_bb, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, rel_bb);
-        LLVMValueRef neg16 = LLVMConstInt(i64t, (uint64_t)-16, 1);
+        LLVMValueRef neg16 = LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_RC_OFF, 1);
         LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "rcptr");
         LLVMValueRef rc_iptr = LLVMBuildBitCast(g->builder, rc_ptr, LLVMPointerType(i64t, 0), "rciptr");
         LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64t, rc_iptr, "rc");
@@ -1736,6 +1736,29 @@ static LLVMValueRef nullable_get_payload(zan_irgen_t *g, LLVMValueRef v) {
     return LLVMBuildExtractValue(g->builder, v, 0, "nv.get");
 }
 
+static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym);
+
+/* A synthesized tuple struct (`(T1, T2, ...)`, see zan_binder_make_tuple_type)
+ * is created lazily -- often during expression typing, after pass 1 registered
+ * the source-declared structs -- so map_type registers it on first use. Its
+ * symbol has no AST declaration (it is synthesized in the binder), which is
+ * how it is told apart from a user struct that pass 1 would have covered. */
+static LLVMTypeRef map_tuple_struct(zan_irgen_t *g, zan_type_t *type) {
+    if (!type || !type->sym) return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    for (int i = 0; i < g->struct_type_count; i++) {
+        if (g->struct_types[i].sym == type->sym) {
+            return g->struct_types[i].llvm_type;
+        }
+    }
+    if (!type->sym->decl) register_struct_type(g, type->sym);
+    for (int i = 0; i < g->struct_type_count; i++) {
+        if (g->struct_types[i].sym == type->sym) {
+            return g->struct_types[i].llvm_type;
+        }
+    }
+    return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+}
+
 static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     if (!type) return LLVMVoidTypeInContext(g->ctx);
     switch (type->kind) {
@@ -1750,6 +1773,7 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     case TYPE_UINT:   return LLVMInt32TypeInContext(g->ctx);
     case TYPE_ULONG:  return LLVMInt64TypeInContext(g->ctx);
     case TYPE_NINT:   return LLVMInt64TypeInContext(g->ctx);
+    case TYPE_TASK:   return LLVMInt64TypeInContext(g->ctx); /* coroutine handle */
     case TYPE_FLOAT:  return LLVMFloatTypeInContext(g->ctx);
     case TYPE_DOUBLE: return LLVMDoubleTypeInContext(g->ctx);
     case TYPE_CHAR:   return LLVMInt64TypeInContext(g->ctx);
@@ -1796,7 +1820,8 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
                 return g->struct_types[i].llvm_type;
             }
         }
-        return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        /* a synthesized tuple struct created after pass 1 registers on demand */
+        return map_tuple_struct(g, type);
     }
     default:          return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     }
@@ -1968,6 +1993,28 @@ static int method_is_params_variadic(zan_symbol_t *m) {
     return last->kind == AST_PARAM && last->param.is_params;
 }
 
+/* True when a call with `argc` arguments can invoke `m`: the exact declared
+ * arity, a params tail covering the rest, or trailing default parameters
+ * filling the missing arguments (`Mix(1)` matches
+ * `Mix(int a, int b = 2, string s = "xy")`; fill_default_args completes the
+ * call). The default-parameter case is what lets a caller omit trailing
+ * arguments, so an arity-exact resolver must accept it or every such call
+ * falls through to no method and reads garbage parameters. */
+static int method_accepts_arity(zan_symbol_t *m, int argc) {
+    if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return 0;
+    int pc = m->decl->method_decl.params.count;
+    if (pc == argc) return 1;
+    if (method_is_params_variadic(m) && argc >= pc - 1) return 1;
+    if (argc < pc) {
+        for (int i = argc; i < pc; i++) {
+            zan_ast_node_t *p = m->decl->method_decl.params.items[i];
+            if (!p || p->kind != AST_PARAM || !p->param.default_val) return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name,
                                       int argc) {
     int depth = 0;
@@ -1978,11 +2025,15 @@ static zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name,
              i = member_next_named(ci, i)) {
             zan_symbol_t *m = type_sym->members[i];
             if (m->kind != SYM_METHOD || !member_name_is(m, name)) continue;
-            if (m->decl && m->decl->method_decl.params.count == argc)
-                return m;
-            if (!variadic && method_is_params_variadic(m) &&
-                argc >= m->decl->method_decl.params.count - 1)
-                variadic = m;
+            if (m->decl && method_accepts_arity(m, argc)) {
+                /* keep variadic as a fallback: an exact/default-filled
+                 * overload wins over the params tail */
+                if (method_is_params_variadic(m)) {
+                    if (!variadic) variadic = m;
+                } else {
+                    return m;
+                }
+            }
         }
         if (variadic) return variadic;
         if (!type_sym->type || !type_sym->type->base_type ||
@@ -2243,6 +2294,9 @@ typedef struct {
     /* 1 when this binding owns a reference to the cell (the declaring scope);
      * a lambda body's binding borrows the cell its closure record holds. */
     int          box_owned;
+    /* String parameters are also used as raw byte buffers with an explicit
+     * length; their NUL terminator is not a reliable bounds source. */
+    int          opaque_string;
     /* An `object` slot holds whatever the language puts in a pointer-wide slot:
      * a heap class reference, a string literal in static storage, or an
      * unboxed scalar. Its static type therefore cannot decide ownership, so an
@@ -2310,6 +2364,7 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].arr_len_slot = NULL;
     scope->vars[scope->count].box_cell = NULL;
     scope->vars[scope->count].box_owned = 0;
+    scope->vars[scope->count].opaque_string = 0;
     scope->vars[scope->count].obj_rc_flag = NULL;
     scope->count++;
     /* Record the variable for the debugger (no-op unless building with -g). The
@@ -2569,7 +2624,7 @@ static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *exp
     LLVMValueRef site_name = LLVMConstNull(i8ptr);
     if (g->check_leaks) {
         char site_buf[600];
-        const char *sfile = leak_site_file(g, expr->loc);
+        const char *sfile = loc_site_file(g, expr->loc);
         const char *knm = (coll_kind == 2) ? "StringBuilder"
                         : (coll_kind == 3) ? "Dictionary" : "List";
         int elen = (elem_type && elem_type->name.len) ? elem_type->name.len : 1;
@@ -2589,10 +2644,7 @@ static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *exp
 /* Unwind-stack entry flavours (see emit_eh_tmp_push_slot): a throw releases
  * what a registered variable slot holds, and the release differs by type --
  * strings carry their own header, a delegate may be a bare function pointer
- * that must not be released at all. */
-#define ZAN_EH_SLOT_OBJ 0
-#define ZAN_EH_SLOT_STR 1
-#define ZAN_EH_SLOT_DLG 2
+ * that must not be released at all. (Constants: ZAN_EH_SLOT_* in zan_abi.h) */
 
 static int eh_slot_kind_of(zan_type_t *t) {
     if (!t) return ZAN_EH_SLOT_OBJ;

@@ -123,6 +123,7 @@ static LLVMValueRef coerce_async_ret(zan_irgen_t *g, LLVMValueRef val);
 static void emit_async_cancel_check(zan_irgen_t *g, local_scope_t *locals);
 static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g);
 static LLVMValueRef get_co_isdone_fn(zan_irgen_t *g);
+static LLVMValueRef get_co_reap_fn(zan_irgen_t *g);
 static LLVMValueRef get_co_track_fn(zan_irgen_t *g);
 static LLVMValueRef get_co_untrack_fn(zan_irgen_t *g);
 static bool anf_stmt_contains_await(zan_ast_node_t *s);
@@ -130,6 +131,61 @@ static void emit_async_save_slots(zan_irgen_t *g);
 static void emit_async_reload_slots(zan_irgen_t *g);
 static void emit_async_eh_unarm(zan_irgen_t *g);
 static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub);
+
+/* Shared lowering for the Task instance members (`t.Wait()`, `t.Result`,
+ * `t.IsCompleted`; the Task.Run/Spawn spawn-side lives in irgen_call.c).
+ * `hp` is the task's frame pointer (a spawned coroutine handle). Wait pumps
+ * the cooperative driver until that frame is done — the only way a
+ * synchronous context can let a spawned coroutine make progress —
+ * IsCompleted is a non-pumping probe, and Result reads the frame's result
+ * slot (decoded to `rt`) and reaps the frame so the value survives the
+ * coroutine. mode: 0 = Wait on a plain Task (pump only; its spawn installed
+ * the reaper), 1 = Result (pump, read, reap), 2 = IsCompleted, 3 = Wait on a
+ * Task<T> (pump, reap; the result is discarded). */
+static LLVMValueRef emit_task_member(zan_irgen_t *g, LLVMValueRef hp,
+                                     zan_type_t *rt, int mode) {
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    if (mode == 2) {
+        LLVMValueRef idf = get_co_isdone_fn(g);
+        return zan_call2(g->builder, LLVMGlobalGetValueType(idf), idf,
+                         &hp, 1, "task.done");
+    }
+    LLVMValueRef fn = g->current_fn;
+    LLVMBasicBlockRef test_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "tk.test");
+    LLVMBasicBlockRef pump_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "tk.pump");
+    LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "tk.done");
+    LLVMBuildBr(g->builder, test_bb);
+    LLVMPositionBuilderAtEnd(g->builder, test_bb);
+    LLVMValueRef idf = get_co_isdone_fn(g);
+    LLVMValueRef dn = zan_call2(g->builder, LLVMGlobalGetValueType(idf), idf,
+                                &hp, 1, "tk.dn");
+    LLVMValueRef dn1 = zan_icmp(g->builder, LLVMIntNE, dn,
+                                LLVMConstInt(LLVMTypeOf(dn), 0, 0), "tk.dn1");
+    LLVMBuildCondBr(g->builder, dn1, done_bb, pump_bb);
+    LLVMPositionBuilderAtEnd(g->builder, pump_bb);
+    zan_call2(g->builder, g->rt_co_sched_run_type, g->rt_co_sched_run, NULL, 0, "");
+    LLVMBuildBr(g->builder, test_bb);
+    LLVMPositionBuilderAtEnd(g->builder, done_bb);
+    if (mode == 1) {
+        /* Task<T>.Result: read the frame's result slot, decode it to T, then
+         * reap the frame (untrack + free): its spawn left it alive precisely
+         * so the result could be read here. */
+        LLVMValueRef rp = LLVMBuildStructGEP2(g->builder, g->co_header_type,
+            hp, ASYNC_FRAME_RESULT, "tk.resp");
+        LLVMValueRef raw = LLVMBuildLoad2(g->builder, i64t, rp, "tk.raw");
+        LLVMValueRef val = coerce_from_frame_result(g, raw, rt);
+        LLVMValueRef reap = get_co_reap_fn(g);
+        zan_call2(g->builder, LLVMGlobalGetValueType(reap), reap, &hp, 1, "");
+        return val;
+    }
+    if (mode == 3) {
+        /* Wait on a Task<T> owns the frame too (Result is the other consumer,
+         * so exactly one of them terminates the task): reap it once done. */
+        LLVMValueRef reap = get_co_reap_fn(g);
+        zan_call2(g->builder, LLVMGlobalGetValueType(reap), reap, &hp, 1, "");
+    }
+    return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+}
 
 /* A "name path" is a chain of identifiers joined by member access, e.g.
  * `Foo.Bar.Widget` — the syntactic form of a namespace-qualified type
@@ -268,6 +324,10 @@ static void check_implicit_narrowing(zan_irgen_t *g, zan_type_t *dst,
                   dst->name.str ? dst->name.str : "?", what);
 }
 
+/* user-defined conversion lookup (defined in irgen_expr.c) */
+static zan_symbol_t *find_user_conversion(zan_irgen_t *g, zan_type_t *from_type,
+                                          zan_type_t *to_type, const char *op_name);
+
 /* A value struct and a primitive are unrelated types. Without this check the
  * mismatch only surfaces as an LLVM verification failure with no source
  * location ("Call parameter type does not match function signature"), which is
@@ -278,6 +338,9 @@ static void check_value_type_mismatch(zan_irgen_t *g, zan_type_t *dst, zan_type_
     if (dst->kind == src->kind) return;
     bool dst_struct = dst->kind == TYPE_STRUCT, src_struct = src->kind == TYPE_STRUCT;
     if (dst_struct == src_struct) return;
+    /* A user-defined implicit conversion makes a struct↔primitive pair a real
+     * conversion rather than an unrelated-type mistake (B12). */
+    if (find_user_conversion(g, src, dst, "op_implicit")) return;
     bool other_prim = (dst_struct ? conv_rank(src) : conv_rank(dst)) != 0 ||
                       (dst_struct ? src->kind : dst->kind) == TYPE_FLOAT ||
                       (dst_struct ? src->kind : dst->kind) == TYPE_DOUBLE ||
@@ -298,7 +361,12 @@ static int render_type_full(zan_type_t *t, char *buf, int cap) {
     int n = 0;
     if (t->kind == TYPE_ARRAY && t->element_type) {
         n = render_type_full(t->element_type, buf, cap);
-        if (n < cap - 1) { buf[n++] = '['; buf[n++] = ']'; }
+        if (n < cap - 1) {
+            buf[n++] = '[';
+            for (int r = 1; r < (t->array_rank > 1 ? t->array_rank : 1); r++)
+                if (n < cap - 1) buf[n++] = ',';
+            if (n < cap - 1) buf[n++] = ']';
+        }
         if (n < cap) buf[n] = '\0';
         return n;
     }
@@ -595,8 +663,11 @@ static bool types_concrete_equal(zan_type_t *a, zan_type_t *b) {
          a->kind == TYPE_INTERFACE || a->kind == TYPE_ENUM) &&
         a->sym != b->sym)
         return false;
-    if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE)
+    if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE) {
+        if (a->kind == TYPE_ARRAY && a->array_rank != b->array_rank)
+            return false; /* int[,] is not int[] */
         return types_concrete_equal(a->element_type, b->element_type);
+    }
     if (a->type_arg_count != b->type_arg_count) return false;
     for (int i = 0; i < a->type_arg_count; i++)
         if (!types_concrete_equal(a->type_args[i], b->type_args[i]))
@@ -617,8 +688,11 @@ static bool types_match_modulo_tp(zan_type_t *a, zan_type_t *b) {
          a->kind == TYPE_INTERFACE || a->kind == TYPE_ENUM) &&
         a->sym != b->sym)
         return false;
-    if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE)
+    if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE) {
+        if (a->kind == TYPE_ARRAY && a->array_rank != b->array_rank)
+            return false; /* int[,] is not int[] */
         return types_match_modulo_tp(a->element_type, b->element_type);
+    }
     if (a->type_arg_count != b->type_arg_count) return false;
     for (int i = 0; i < a->type_arg_count; i++)
         if (!types_match_modulo_tp(a->type_args[i], b->type_args[i]))
@@ -746,6 +820,41 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
         bool compatible = true;
         if (entry->decl && locals) {
             for (int j = 0; j < argc; j++) {
+                /* A named argument (`new T(y: 2, x: 1)`) does not occupy the
+                 * slot its name targets before reorder_named_args_impl runs
+                 * (after selection). Score it against the parameter whose
+                 * name matches, so the right overload is chosen and the
+                 * argument list is then reordered in place. */
+                zan_ast_node_t *arg = args->items[j];
+                if (arg && arg->kind == AST_NAMED_ARG) {
+                    int target = -1;
+                    for (int q = 0; q < entry->decl->method_decl.params.count; q++) {
+                        zan_ast_node_t *pp = entry->decl->method_decl.params.items[q];
+                        if (pp && pp->kind == AST_PARAM &&
+                            pp->param.name.len == arg->named_arg.name.len &&
+                            memcmp(pp->param.name.str, arg->named_arg.name.str,
+                                   (size_t)arg->named_arg.name.len) == 0) {
+                            target = q;
+                            break;
+                        }
+                    }
+                    if (target < 0) {
+                        compatible = false;
+                        break;
+                    }
+                    if (target < argc && args->items[target] &&
+                        args->items[target]->kind != AST_NAMED_ARG) {
+                        /* the positional argument already claims that slot */
+                        compatible = false;
+                        break;
+                    }
+                    arg = arg->named_arg.expr;
+                    zan_type_t *nt = zan_binder_resolve_type(g->binder,
+                        entry->decl->method_decl.params.items[target]->param.type);
+                    zan_type_t *nat = infer_expr_type(g, arg, locals);
+                    if (nt && nat && types_concrete_equal(nt, nat)) score += 4;
+                    continue;
+                }
                 zan_ast_node_t *param = entry->decl->method_decl.params.items[j];
                 zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
                 /* A lambda converts to a delegate parameter and to nothing
@@ -958,6 +1067,13 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
         if (ai >= call->call.args.count) break;
         zan_ast_node_t *a = call->call.args.items[ai];
         if (!a) continue;
+        if (a->kind == AST_NAMED_ARG) {
+            /* A named argument's position in the source list does not match
+             * its parameter slot before reorder_named_args runs; it cannot be
+             * scored here. Stay neutral (score unchanged) and let arity decide,
+             * which is exact: named and positional arguments both count. */
+            continue;
+        }
         if (a->kind == AST_LAMBDA) {
             zan_type_t *dp = method_param_type_at(g, m, j, call, recv_expr, locals);
             if (!dp || dp->kind != TYPE_DELEGATE) continue;
@@ -1154,7 +1270,7 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
                 m->decl->kind != AST_METHOD_DECL) continue;
             if (m->name.len != name.len ||
                 memcmp(m->name.str, name.str, name.len) != 0) continue;
-            if (m->decl->method_decl.params.count != argc) continue;
+            if (!method_accepts_arity(m, argc)) continue;
             arity_matches++;
             int score = method_args_score(g, m, call, NULL, locals, 0);
             if (score > best_score) {
@@ -1193,13 +1309,23 @@ static zan_symbol_t *resolve_op_overload(zan_irgen_t *g,
             memcmp(m->name.str, name.str, (size_t)name.len) != 0) continue;
         zan_ast_list_t *ps = &m->decl->method_decl.params;
         if (ps->count < 1) continue;
+        /* A static operator carries an explicit self parameter (op_index
+         * (self, index)) while an instance operator does not (the receiver is
+         * `this`), so the declared-parameter count that matches `argc` call
+         * arguments differs: static needs argc+1, instance needs argc. */
+        int is_static = (m->modifiers & MOD_STATIC) != 0;
+        int p0 = is_static ? 1 : 0; /* first AST param that takes an argument */
         int variadic = method_is_params_variadic(m);
         int score = 0;
         if (variadic) {
-            int fixed = ps->count - 2; /* drop self and the params tail */
+            /* fixed params before the params tail: drop the tail and the
+             * injected receiver (a static operator carries self, an instance
+             * one does not), so a call with no tail arguments never lets the
+             * scoring loop below start at a negative index (args[-1] read). */
+            int fixed = ps->count - 1 - p0;
             if (argc < fixed) continue;
             if (!first_variadic) first_variadic = m;
-            score = method_args_score(g, m, call, NULL, locals, 1);
+            score = method_args_score(g, m, call, NULL, locals, p0);
             if (score < 0 && fixed > 0) continue;
             /* method_args_score sees the params array itself. Rank each
              * expanded tail argument against its element type instead. */
@@ -1221,8 +1347,8 @@ static zan_symbol_t *resolve_op_overload(zan_irgen_t *g,
                 break;
             }
         } else {
-            if (ps->count != argc + 1) continue;
-            score = method_args_score(g, m, call, NULL, locals, 1);
+            if (ps->count != argc + p0) continue;
+            score = method_args_score(g, m, call, NULL, locals, p0);
         }
         if (score > best_score) {
             best_score = score;
@@ -1231,6 +1357,15 @@ static zan_symbol_t *resolve_op_overload(zan_irgen_t *g,
     }
     if (best && best_score >= 0) return best;
     return first_variadic;
+}
+
+/* Index into an op_index/op_index_set method's AST parameter list for the
+ * index argument (and, +1, the value argument of op_index_set). A static
+ * operator takes an explicit self parameter first (op_index(self, index)),
+ * while an instance operator's receiver is `this` and the AST list starts at
+ * the index directly. */
+static int op_index_param_offset(zan_symbol_t *m) {
+    return (m->modifiers & MOD_STATIC) ? 1 : 0;
 }
 
 static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
@@ -1398,13 +1533,59 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
          * call — i.e. the callee's declared return type. */
         return infer_expr_type(g, e->await_expr.expr, locals);
     case AST_QUERY_EXPR: {
-        /* query yields List<select-type>; the range var is briefly registered
-         * (type only) so the projection can be inferred through it */
+        /* query yields List<select-type>; the range var, `let` variables and
+         * join variables are briefly registered (type only) in clause order
+         * so the projection can be inferred through them. A terminal
+         * `group e by k` yields List<Grouping<elem>> instead (the grouping
+         * list itself); `group e by k into g` gives the select only g. */
         zan_type_t *src_ty = infer_expr_type(g, e->query.source, locals);
         zan_type_t *elem = container_elem_type(src_ty);
         if (!elem) elem = g->binder->type_int;
         int mark = locals->count;
         local_add(locals, e->query.var, NULL, elem);
+        for (int ci = 0; ci < e->query.clauses.count; ci++) {
+            zan_ast_node_t *cl = e->query.clauses.items[ci];
+            switch (cl->kind) {
+            case AST_QUERY_LET: {
+                zan_type_t *lt =
+                    infer_expr_type(g, cl->query_clause.expr, locals);
+                if (!lt) lt = g->binder->type_int;
+                local_add(locals, cl->query_clause.name, NULL, lt);
+                break;
+            }
+            case AST_QUERY_JOIN: {
+                zan_type_t *jty =
+                    infer_expr_type(g, cl->query_clause.source, locals);
+                zan_type_t *je = container_elem_type(jty);
+                if (!je) je = g->binder->type_int;
+                if (cl->query_clause.into.len > 0)
+                    local_add(locals, cl->query_clause.into, NULL,
+                              zan_binder_make_list_type(g->binder, je));
+                else
+                    local_add(locals, cl->query_clause.name, NULL, je);
+                break;
+            }
+            default:
+                break; /* where / orderby register nothing */
+            }
+        }
+        if (e->query.group_expr) {
+            zan_type_t *ge = infer_expr_type(g, e->query.group_expr, locals);
+            if (!ge) ge = elem;
+            zan_type_t *grp = zan_binder_make_grouping_type(g->binder, ge);
+            if (e->query.group_into.len > 0) {
+                /* `group e by k into g select ...`: g is one Grouping */
+                int mark2 = locals->count;
+                local_add(locals, e->query.group_into, NULL, grp);
+                zan_type_t *sel = infer_expr_type(g, e->query.select, locals);
+                locals->count = mark2;
+                locals->count = mark;
+                if (!sel) sel = ge;
+                return zan_binder_make_list_type(g->binder, sel);
+            }
+            locals->count = mark;
+            return zan_binder_make_list_type(g->binder, grp);
+        }
         zan_type_t *sel = infer_expr_type(g, e->query.select, locals);
         locals->count = mark;
         if (!sel) sel = elem;
@@ -1419,6 +1600,63 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
             if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
                 zan_symbol_t *fs = get_field_sym(cs, e->member.name);
                 if (fs) return fs->type;
+            }
+        }
+        /* builtin scalar-type constants (`int.MaxValue`, `double.NaN`, ...):
+         * the receiver is a primitive type name with no class symbol, so the
+         * lookup above misses; without this the inferred type is NULL and the
+         * constant value emitted by emit_expr_member_access gets printed as
+         * an int (PositiveInfinity showed as 0). Mirror the emit-side table:
+         * MaxValue/MinValue/NaN/±Infinity/Epsilon resolve to the receiver
+         * type. */
+        if (e->member.object->kind == AST_IDENTIFIER &&
+            !local_find(locals, e->member.object->ident.name)) {
+            zan_istr_t on = e->member.object->ident.name;
+            zan_istr_t mn = e->member.name;
+            bool is_scalar = (on.len == 3 && memcmp(on.str, "int", 3) == 0) ||
+                (on.len == 4 && (memcmp(on.str, "uint", 4) == 0 ||
+                                 memcmp(on.str, "long", 4) == 0 ||
+                                 memcmp(on.str, "byte", 4) == 0 ||
+                                 memcmp(on.str, "char", 4) == 0)) ||
+                (on.len == 5 && (memcmp(on.str, "ulong", 5) == 0 ||
+                                 memcmp(on.str, "short", 5) == 0 ||
+                                 memcmp(on.str, "sbyte", 5) == 0 ||
+                                 memcmp(on.str, "float", 5) == 0)) ||
+                (on.len == 6 && (memcmp(on.str, "ushort", 6) == 0 ||
+                                 memcmp(on.str, "double", 6) == 0));
+            if (is_scalar) {
+                bool is_const = (mn.len == 8 &&
+                                 (memcmp(mn.str, "MaxValue", 8) == 0 ||
+                                  memcmp(mn.str, "MinValue", 8) == 0)) ||
+                    (mn.len == 3 && memcmp(mn.str, "NaN", 3) == 0) ||
+                    (mn.len == 16 &&
+                     (memcmp(mn.str, "PositiveInfinity", 16) == 0 ||
+                      memcmp(mn.str, "NegativeInfinity", 16) == 0)) ||
+                    (mn.len == 7 && memcmp(mn.str, "Epsilon", 7) == 0);
+                if (is_const) {
+                    if (on.len == 3 && memcmp(on.str, "int", 3) == 0)
+                        return g->binder->type_int;
+                    if (on.len == 4 && memcmp(on.str, "uint", 4) == 0)
+                        return g->binder->type_uint;
+                    if (on.len == 4 && memcmp(on.str, "long", 4) == 0)
+                        return g->binder->type_long;
+                    if (on.len == 5 && memcmp(on.str, "ulong", 5) == 0)
+                        return g->binder->type_ulong;
+                    if (on.len == 5 && memcmp(on.str, "short", 5) == 0)
+                        return g->binder->type_short;
+                    if (on.len == 6 && memcmp(on.str, "ushort", 6) == 0)
+                        return g->binder->type_ushort;
+                    if (on.len == 4 && memcmp(on.str, "byte", 4) == 0)
+                        return g->binder->type_byte;
+                    if (on.len == 5 && memcmp(on.str, "sbyte", 5) == 0)
+                        return g->binder->type_sbyte;
+                    if (on.len == 4 && memcmp(on.str, "char", 4) == 0)
+                        return g->binder->type_char;
+                    if (on.len == 5 && memcmp(on.str, "float", 5) == 0)
+                        return g->binder->type_float;
+                    if (on.len == 6 && memcmp(on.str, "double", 6) == 0)
+                        return g->binder->type_double;
+                }
             }
         }
         zan_type_t *ot = infer_expr_type(g, e->member.object, locals);
@@ -1523,7 +1761,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 if (bot && bot->kind == TYPE_STRING)
                     return zan_binder_make_array_type(g->binder, g->binder->type_byte);
             }
-            if (mm.len == 17 && memcmp(mm.str, "GetValueOrDefault", 17) == 0) {
+            if (mm.len == 16 && memcmp(mm.str, "GetValueOrDefault", 17) == 0) {
                 zan_type_t *nvt = infer_expr_type(g, callee->member.object, locals);
                 if (nvt && nvt->kind == TYPE_NULLABLE) return nvt->element_type;
             }
@@ -1664,8 +1902,20 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         return NULL;
     }
     case AST_NEW_EXPR:
-        /* `new T(...)` yields a T; array `new T[n]` is not a single rc object. */
-        if (e->new_expr.is_array) return NULL;
+        /* `new T(...)` yields a T. An array expression is not a single rc
+         * object (the NULL was meant to keep rc release logic off it), but
+         * callers like foreach's collection-type dispatch need the real
+         * element layout: returning NULL there made `new int[]{...}` fall
+         * through to the List path and dereference a bare array as a List
+         * struct (crash on the first element). Resolve the `T[]` type node
+         * (it is written `T[]` for both `new T[n]` and `new T[]{...}`) and
+         * strip to the array type; the caller decides what to do with it. */
+        if (e->new_expr.is_array) {
+            if (!e->new_expr.type) return NULL;
+            zan_type_t *at = resolve_type_ctx(g, e->new_expr.type);
+            if (at && at->kind == TYPE_ARRAY) return at;
+            return NULL;
+        }
         return resolve_type_ctx(g, e->new_expr.type);
     case AST_BINARY:
         /* string concatenation (`a + b`) yields a freshly heap-allocated,
@@ -1709,6 +1959,25 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
          * type into narrowing checks and lets the ternary IR unify both sides
          * against the same target. */
         return infer_expr_type(g, e->conditional.then_expr, locals);
+    case AST_TUPLE_EXPR: {
+        /* (a, b, ...) has the synthesized anonymous struct type with Item1..N
+         * fields, built from the inferred element types. */
+        if (!g->binder) return NULL;
+        int n = e->tuple_expr.items.count;
+        zan_type_t **elems = (zan_type_t **)zan_arena_alloc(
+            g->arena, sizeof(zan_type_t *) * (size_t)(n > 0 ? n : 1));
+        for (int i = 0; i < n; i++) {
+            elems[i] = infer_expr_type(g, e->tuple_expr.items.items[i], locals);
+            if (!elems[i]) return NULL;
+        }
+        return zan_binder_make_tuple_type(g->binder, elems, n);
+    }
+    case AST_SWITCH_EXPR:
+        /* `x switch { ... }` types as its first arm's result (the checker
+         * merges arms to a common type). */
+        if (e->switch_expr.arms.count == 0) return NULL;
+        return infer_expr_type(g, e->switch_expr.arms.items[0]->switch_arm.result,
+                               locals);
     default:
         return NULL;
     }
@@ -1719,6 +1988,20 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
 static bool expr_is_ulong(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
     zan_type_t *t = infer_expr_type(g, e, locals);
     return t && t->kind == TYPE_ULONG;
+}
+
+/* True when the expression's static type is any unsigned integer (uint,
+ * ulong, ushort, byte) or a member-access constant over one -- such values
+ * live in a slot whose high bit is set for their max, so they must print
+ * with the unsigned format rather than as a negative signed integer. */
+static bool expr_is_unsigned_int(zan_irgen_t *g, zan_ast_node_t *e,
+                                 local_scope_t *locals) {
+    zan_type_t *t = infer_expr_type(g, e, locals);
+    if (!t) return false;
+    if (t->kind == TYPE_ULONG || t->kind == TYPE_UINT ||
+        t->kind == TYPE_USHORT || t->kind == TYPE_BYTE)
+        return true;
+    return false;
 }
 
 /* True when an expression's static type is `char`, which prints and
@@ -1785,10 +2068,10 @@ static bool zan_type_defines(zan_irgen_t *g, const char *type_name,
     return get_method_sym(sym, mn) != NULL;
 }
 
-/* Arrays carry their element count in a 16-byte header that sits in front of
- * the buffer; the value a program holds points at the first element, so the
- * pointer can still be handed to C unchanged. */
-#define ZAN_ARRAY_HEADER 16
+/* Arrays carry their element count in the same 16-byte object header (see
+ * ZAN_OBJ_HDR_SIZE in ../common/zan_abi.h): the count occupies the first
+ * header word at obj - 16, and the value a program holds points at the first
+ * element, so the pointer can still be handed to C unchanged. */
 
 static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
                                zan_loc_t loc, const char *msg);
@@ -1799,7 +2082,7 @@ static LLVMValueRef zan_array_alloc(zan_irgen_t *g, LLVMValueRef total,
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
     LLVMValueRef max_i64 = LLVMConstInt(i64, UINT64_MAX, 0);
-    LLVMValueRef header = LLVMConstInt(i64, ZAN_ARRAY_HEADER, 0);
+    LLVMValueRef header = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
     LLVMValueRef max_total = LLVMBuildSub(g->builder, max_i64, header, "arr.max");
     LLVMValueRef overflow = zan_icmp(g->builder, LLVMIntUGT, total,
         max_total, "arr.overflow");
@@ -1810,20 +2093,77 @@ static LLVMValueRef zan_array_alloc(zan_irgen_t *g, LLVMValueRef total,
         get_calloc_fn(g), (LLVMValueRef[]){ bytes, LLVMConstInt(i64, 1, 0) }, 2, "arr.raw");
     LLVMValueRef null_raw = LLVMBuildIsNull(g->builder, raw, "arr.null");
     emit_runtime_check(g, null_raw, (zan_loc_t){0}, "array allocation failed");
+    /* count at the first header word (obj - 16 = raw + 0) */
     LLVMBuildStore(g->builder, count,
         LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "arr.hdr"));
-    LLVMValueRef off = LLVMConstInt(i64, ZAN_ARRAY_HEADER, 0);
+    /* array magic in the second word (obj - 8 = raw + 8): it is what lets a
+     * byte[] reaching `string`-typed code be told apart from a bare pointer an
+     * extern returned, whose payload has no count word in front of it. */
+    LLVMValueRef magic_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE + ZAN_OBJ_SITE_OFF, 0);
+    LLVMBuildStore(g->builder, LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0),
+        LLVMBuildBitCast(g->builder,
+            LLVMBuildGEP2(g->builder, i8, raw, &magic_off, 1, "arr.magicp"),
+            LLVMPointerType(i64, 0), "arr.magic"));
+    LLVMValueRef off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
     return LLVMBuildGEP2(g->builder, i8, raw, &off, 1, "arr");
 }
 
 static LLVMValueRef zan_array_len(zan_irgen_t *g, LLVMValueRef arr) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
-    LLVMValueRef off = LLVMConstInt(i64, (unsigned long long)-ZAN_ARRAY_HEADER, 1);
+    LLVMValueRef off = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
     LLVMValueRef hdr = LLVMBuildGEP2(g->builder, i8, arr, &off, 1, "arr.hdrp");
     return LLVMBuildLoad2(g->builder, i64,
         LLVMBuildBitCast(g->builder, hdr, LLVMPointerType(i64, 0), "arr.hdrc"),
         "arr.len");
+}
+
+/* Rank-N rectangular array (`int[,]`): the header extends the plain layout
+ * with the shape, and the value still points at the first element so
+ * zan_array_len (count at raw+0) keeps reporting the total element count:
+ *   raw+0         : total element count (= product of the dims)
+ *   raw+8         : rank (i64)
+ *   raw+16        : dims[0..rank-1]
+ *   raw+16 + 8*r  : elements, row-major
+ * So dims[d] lives at arr + 8*d and the data at arr + 8*rank. */
+static LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
+                                      int rank, LLVMTypeRef elem_llvm) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMValueRef total = LLVMConstInt(i64, 1, 0);
+    for (int d = 0; d < rank; d++)
+        total = zan_mul(g->builder, total, dims[d], "md.total");
+    /* the dims are non-negative (checked by the caller), so a negative
+     * product means the multiply wrapped */
+    LLVMValueRef neg = zan_icmp(g->builder, LLVMIntSLT, total,
+        LLVMConstInt(i64, 0, 0), "md.neg");
+    emit_runtime_check(g, neg, (zan_loc_t){0}, "array allocation overflow");
+    LLVMValueRef hdr = LLVMConstInt(i64,
+        (unsigned long long)(ZAN_OBJ_HDR_SIZE + 8 * rank), 0);
+    LLVMValueRef bytes = zan_add(g->builder, hdr,
+        zan_mul(g->builder, total, LLVMSizeOf(elem_llvm), "md.bytes"), "md.totalb");
+    LLVMValueRef nbytes = zan_icmp(g->builder, LLVMIntSLT, bytes,
+        LLVMConstInt(i64, 0, 0), "md.nb");
+    emit_runtime_check(g, nbytes, (zan_loc_t){0}, "array allocation overflow");
+    LLVMValueRef raw = zan_call2(g->builder,
+        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
+        get_calloc_fn(g), (LLVMValueRef[]){ bytes, LLVMConstInt(i64, 1, 0) }, 2, "md.raw");
+    LLVMValueRef null_raw = LLVMBuildIsNull(g->builder, raw, "md.null");
+    emit_runtime_check(g, null_raw, (zan_loc_t){0}, "array allocation failed");
+    LLVMValueRef hdri64 = LLVMBuildBitCast(g->builder, raw,
+        LLVMPointerType(i64, 0), "md.hdr");
+    LLVMValueRef one = LLVMConstInt(i64, 1, 0);
+    LLVMBuildStore(g->builder, total, hdri64); /* count */
+    LLVMBuildStore(g->builder, LLVMConstInt(i64, rank, 0),
+        LLVMBuildGEP2(g->builder, i64, hdri64, &one, 1, "md.rk"));
+    for (int d = 0; d < rank; d++) {
+        LLVMValueRef off = LLVMConstInt(i64, 2 + (unsigned long long)d, 0);
+        LLVMBuildStore(g->builder, dims[d],
+            LLVMBuildGEP2(g->builder, i64, hdri64, &off, 1, "md.dim"));
+    }
+    LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
+    return LLVMBuildGEP2(g->builder, i8, raw, &hdr_off, 1, "md.arr");
 }
 
 static bool is_call_to(zan_ast_node_t *expr, const char *obj, const char *method) {

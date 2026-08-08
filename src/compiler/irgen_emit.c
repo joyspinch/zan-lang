@@ -156,9 +156,15 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
             g->current_type_sym = csym;
             for (int mi = 0; mi < d->type_decl.members.count; mi++) {
                 zan_ast_node_t *m = d->type_decl.members.items[mi];
-                if (m->kind != AST_FIELD_DECL) continue;
+                if (m->kind != AST_FIELD_DECL && m->kind != AST_PROPERTY_DECL) continue;
                 if (!(m->field_decl.modifiers & MOD_STATIC)) continue;
                 if (!m->field_decl.initializer) continue;
+                /* a custom-accessor static property has no backing global; only
+                 * automatic static properties (`static T P { get; set; }`)
+                 * accept an initializer */
+                if (m->kind == AST_PROPERTY_DECL &&
+                    (m->field_decl.getter_body || m->field_decl.setter_body))
+                    continue;
                 zan_symbol_t *fs = get_field_sym(csym, m->field_decl.name);
                 LLVMValueRef gv = get_static_field_global(g, csym, fs);
                 if (!gv) continue;
@@ -580,6 +586,8 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             LLVMValueRef pa = LLVMBuildAlloca(g->builder, pty, "p");
             zan_type_t *pt = resolve_type_ctx(g, param->param.type);
             local_add(locals, param->param.name, pa, pt);
+            if (pt && pt->kind == TYPE_STRING)
+                locals->vars[locals->count - 1].opaque_string = 1;
             /* Balances the retain the ramp performed for ARC-managed by-value
              * params: the frame owns them, so release at coroutine completion. */
             if (!param->param.by_ref && is_rc_managed_type(pt) &&
@@ -1253,11 +1261,15 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                  * reads/writes go straight through to the caller's variable. */
                 local_add(locals, param->param.name,
                           LLVMGetParam(fn, (unsigned)(k + param_offset)), pt);
+                if (pt && pt->kind == TYPE_STRING)
+                    locals->vars[locals->count - 1].opaque_string = 1;
                 continue;
             }
             LLVMValueRef param_alloca = LLVMBuildAlloca(g->builder, param_types[k + param_offset], "p");
             LLVMBuildStore(g->builder, LLVMGetParam(fn, (unsigned)(k + param_offset)), param_alloca);
             local_add(locals, param->param.name, param_alloca, pt);
+            if (pt && pt->kind == TYPE_STRING)
+                locals->vars[locals->count - 1].opaque_string = 1;
         }
 
         LLVMValueRef saved_fn = g->current_fn;
@@ -1926,6 +1938,10 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
             } else if (LLVMGetTypeKind(llvm_ret) == LLVMDoubleTypeKind &&
                        LLVMGetTypeKind(val_t) == LLVMFloatTypeKind) {
                 val = LLVMBuildFPExt(g->builder, val, llvm_ret, "ext");
+            } else if (LLVMGetTypeKind(llvm_ret) == LLVMStructTypeKind &&
+                       LLVMGetTypeKind(val_t) == LLVMPointerTypeKind) {
+                /* value struct return: `Pair Make() => new Pair(3, 4);` */
+                val = LLVMBuildLoad2(g->builder, llvm_ret, val, "ret.struct");
             }
         }
         if (is_rc_managed_type(ret_type) &&
