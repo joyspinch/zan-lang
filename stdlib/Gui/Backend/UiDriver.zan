@@ -23,6 +23,27 @@ class HitRegionsDoc {
     List<HitRegionDoc> regions;
 }
 
+/// 一个控件节点，由 `dump tree` 写出：控件树的形状和布局
+/// 结果。截图只能看到“这里是空的”，节点才能说出是控件
+/// 没挂上、高度算成了 0，还是被制成了不可见。
+class ControlNode {
+    string kind;
+    string name;
+    int dock;
+    int visible;
+    int x;
+    int y;
+    int w;
+    int h;
+    int prefW;
+    int prefH;
+    List<ControlNode> kids;
+}
+
+class ControlTreeDoc {
+    ControlNode root;
+}
+
 /// 当前皮肤解析后的样式 token，由 `dump theme` 写出。
 ///
 /// 仅靠几何（hitregions）不足以评判 UI："文本没有
@@ -110,6 +131,7 @@ class ThemeDoc {
 ///   ev &lt;kind&gt; &lt;x&gt; &lt;y&gt; &lt;btn&gt; &lt;code&gt; &lt;mods&gt; — 原始事件（逃生通道）
 ///   dump hitregions &lt;file&gt; — 将所有注册的命中区域写入为 JSON
 ///   dump theme &lt;file&gt; — 将当前皮肤的样式 token 写入为 JSON
+///   dump tree &lt;file&gt; — 将保留模式控件树写入为 JSON
 ///   dump probe &lt;name&gt; &lt;file&gt; — 写入指定 probe 的当前值
 ///   assert probe &lt;name&gt; contains &lt;text&gt; — 对照 probe 值记录 PASS/FAIL
 ///   assert probe &lt;name&gt; equals &lt;text&gt;
@@ -125,6 +147,8 @@ class UiDriver {
     static bool active;
     static bool finished;
     static App app;
+    /// 保留模式的根（Form.Run 登记），供 `dump tree` 遍历。
+    static Control root;
     static List<string> cmds;
     static int pc;
     static int waitUntil;          // 绝对毫秒；0 = 无挂起等待
@@ -168,6 +192,11 @@ class UiDriver {
             "# UiDriver session: " + path + " (" + Convert.ToString(cmds.Count)
             + " lines)\n");
         app.needsRedraw = true;
+    }
+
+    /// 宿主钩子：登记保留模式的根，供 `dump tree`（Form.Run 调用）。
+    static void SetRoot(Control c) {
+        root = c;
     }
 
     static string Env(string name) {
@@ -358,6 +387,12 @@ class UiDriver {
                 + Convert.ToString(app.hitTester.RegionCount()) + " regions)");
             return;
         }
+        if (what == "tree") {
+            string treeFile = t[2];
+            File.WriteAllText(UiDriver.OutPath(treeFile), UiDriver.TreeJson());
+            UiDriver.Note("dump tree -> " + treeFile);
+            return;
+        }
         if (what == "theme") {
             string file = t[2];
             File.WriteAllText(UiDriver.OutPath(file), UiDriver.ThemeJson());
@@ -428,6 +463,34 @@ class UiDriver {
             o.regions.Add(doc);
         }
         return Json.Serialize<HitRegionsDoc>(o);
+    }
+
+    /// 当前窗口的控件树（形状 + 布局结果）。根由 Form.Run
+    /// 登记；没有保留模式根时写出一棵空树。
+    static string TreeJson() {
+        ControlTreeDoc o = new ControlTreeDoc();
+        if (root != null) { o.root = UiDriver.NodeOf(root); }
+        return Json.Serialize<ControlTreeDoc>(o);
+    }
+
+    static ControlNode NodeOf(Control c) {
+        ControlNode n = new ControlNode();
+        n.kind = c.Kind();
+        n.name = c.name;
+        n.dock = c.dock;
+        n.visible = 0;
+        if (c.visible) { n.visible = 1; }
+        n.x = c.bx;
+        n.y = c.by;
+        n.w = c.bw;
+        n.h = c.bh;
+        n.prefW = c.prefW;
+        n.prefH = c.prefH;
+        n.kids = new List<ControlNode>();
+        for (int i = 0; i < c.children.Count; i = i + 1) {
+            n.kids.Add(UiDriver.NodeOf(c.children[i]));
+        }
+        return n;
     }
 
     /// 当前皮肤解析后的样式 token，外加 DPI 缩放，调用方可
