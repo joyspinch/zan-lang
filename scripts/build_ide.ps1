@@ -107,6 +107,13 @@ $zanArgs += @("-o", "build\ZanIDE.exe", "--subsystem", "windows")
 # `function  <file>.zan:line` in build\zan_crash.log, so a dev build always
 # says which source line faulted instead of module+offset.
 $zanArgs += @("-g")
+# ...but not the debug ARC guards -g turns on by default. --arc-guard never
+# returns a released object to the allocator (it quarantines it so a stale
+# retain/release traps), and --check-leaks adds an atomic pair to every
+# allocation and release. In a long-running editor that reads as an
+# ever-growing process and a permanent CPU tax. Ask for them explicitly with
+# ZAN_IDE_ZANC_ARGS="--arc-guard --check-leaks" when chasing a leak.
+$zanArgs += @("--no-arc-guard", "--no-check-leaks")
 $zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_ide_gnu")
 $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_gen.o"))
 $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_docs.o"))
