@@ -92,6 +92,7 @@ add_executable(zanc
     src/compiler/nsresolve.c
     src/compiler/binder.c
     src/compiler/checker.c
+    src/compiler/definite.c
     src/compiler/irgen.c
     src/compiler/optimizer.c
     src/compiler/incremental.c
@@ -391,6 +392,7 @@ add_executable(zan-lsp
     src/compiler/parser.c
     src/compiler/binder.c
     src/compiler/checker.c
+    src/compiler/definite.c
     src/lsp/intellisense.c
 )
 target_include_directories(zan-lsp PRIVATE src/compiler src/common src/lsp)
@@ -649,6 +651,42 @@ add_test(NAME diag_static_field_via_instance
     "-DEXPECT_REGEX=.other. is a static field of .Holder."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_static_field_via_instance PROPERTIES TIMEOUT 60)
+
+# Definite assignment: a local read on a path that never assigned it is a
+# garbage stack slot at runtime (a null control field, a count nobody set), so
+# the checker rejects the read instead of emitting the load.
+add_test(NAME diag_unassigned_local
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unassigned_local.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unassigned_local${_exe_ext}
+    "-DEXPECT_REGEX=use of unassigned local variable .total."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_unassigned_local PROPERTIES TIMEOUT 60)
+
+# An `out` parameter is a promise that the slot is written before the method
+# returns; an early return that skips the write hands the caller an
+# uninitialised value.
+add_test(NAME diag_unassigned_out_param
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unassigned_out_param.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unassigned_out_param${_exe_ext}
+    "-DEXPECT_REGEX=out parameter .v. must be assigned before control leaves"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_unassigned_out_param PROPERTIES TIMEOUT 60)
+
+# The same rule for a string local, which irgen still starts empty so a stray
+# read cannot dereference null: the default is a backstop, not a licence to
+# read a variable no path has written.
+add_test(NAME diag_unassigned_local_string
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unassigned_local_string.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unassigned_local_string${_exe_ext}
+    "-DEXPECT_REGEX=use of unassigned local variable .plain."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_unassigned_local_string PROPERTIES TIMEOUT 60)
 
 # ---- RPC framing test (A3) ----
 add_executable(zan_rpc_framing_test

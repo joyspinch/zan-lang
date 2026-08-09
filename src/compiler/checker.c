@@ -8,6 +8,7 @@
  */
 
 #include "checker.h"
+#include "definite.h"
 #include "diag.h"
 #include "arena.h"
 #include <string.h>
@@ -2172,6 +2173,7 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
     zan_ast_node_t *saved_body = c->current_body;
     c->current_body = method->method_decl.body;
     zan_checker_check_stmt(c, method->method_decl.body);
+    zan_definite_check(c->diag, method);
     c->current_body = saved_body;
     c->locals = saved_locals;
     c->current_return_type = saved;
