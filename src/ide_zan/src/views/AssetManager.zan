@@ -45,6 +45,11 @@ class AssetManager {
     /// The IDE opens one asset manager at a time; the list handlers are bound
     /// as methods and reach it through this.
     static AssetManager current;
+    /// The panel showing this manager. A control document can be instanced
+    /// more than once, so the widgets are reached through the instance that
+    /// bound itself here, never through the class.
+    AssetPanel panel;
+    static AssetPanel pending;
     /// The project the panel browses, its log, and what the user last asked the
     /// host window to do (0 none, 1 close, 2 import file, 3 import folder,
     /// 4 link resource) — the pickers belong to the window, not to the panel.
@@ -86,12 +91,12 @@ class AssetManager {
     /// whether it is a folder, so no index arithmetic is involved.
     static void EntryActivated() {
         AssetManager m = AssetManager.current;
-        if (m == null || !AssetPanel.List.HasSelection()) { return; }
-        AssetEntry e = AssetPanel.List.Selected();
+        if (m == null || m.panel == null || !m.panel.List.HasSelection()) { return; }
+        AssetEntry e = m.panel.List.Selected();
         if (!e.IsDir()) { return; }
         if (m.curRel.Length > 0) { m.curRel = m.curRel + "/" + e.name; }
         else { m.curRel = e.name; }
-        AssetPanel.List.ClearSelection();
+        m.panel.List.ClearSelection();
     }
 
     /// Moving the selection takes back a pending delete confirmation.
@@ -113,7 +118,15 @@ class AssetManager {
         m.renameFor = "";
         m.animFor = "";
         AssetManager.current = m;
+        m.panel = AssetManager.pending;
         return m;
+    }
+
+    /// The panel hands itself over when its designed tree is built; the
+    /// manager may not exist yet, so the last one built is remembered.
+    static void BindPanel(AssetPanel p) {
+        AssetManager.pending = p;
+        if (AssetManager.current != null) { AssetManager.current.panel = p; }
     }
 
     // ---- small local helpers (no dependency on ZanIDE) ----
@@ -500,16 +513,16 @@ class AssetManager {
     /// press is a `Click` handler below, so this half only reads state.
     void Sync() {
         string root = AssetManager.viewRoot;
-        if (root == null || root == "") { return; }
+        if (root == null || root == "" || this.panel == null) { return; }
         string ad = this.curDir(root);
         Directory.CreateDirectoryRecursive(root + "/assets");
 
         string crumb = "assets/";
         if (this.curRel.Length > 0) { crumb = crumb + this.curRel; }
-        AssetPanel.Localize();
-        AssetPanel.SetCrumb(crumb);
-        AssetPanel.SetMessage(this.msg);
-        AssetPanel.SetPackLabel(AssetManager.PackEnabled(root));
+        this.panel.Localize();
+        this.panel.SetCrumb(crumb);
+        this.panel.SetMessage(this.msg);
+        this.panel.SetPackLabel(AssetManager.PackEnabled(root));
 
         // ---- listing ----
         // Linked (referenced-in-place) resources are project-global, so they
@@ -534,19 +547,19 @@ class AssetManager {
             e.path = lnks[ri];
             this.entries.Add(e);
         }
-        AssetPanel.List.Bind(this.entries);
+        this.panel.List.Bind(this.entries);
 
         // ---- what the detail column shows ----
-        if (!AssetPanel.List.HasSelection()) {
-            AssetPanel.ShowEmpty();
+        if (!this.panel.List.HasSelection()) {
+            this.panel.ShowEmpty();
             return;
         }
-        if (AssetPanel.List.SelectedIndices().Count > 1) {
-            AssetPanel.ShowMulti(AssetPanel.List.SelectedIndices().Count,
+        if (this.panel.List.SelectedIndices().Count > 1) {
+            this.panel.ShowMulti(this.panel.List.SelectedIndices().Count,
                                  this.confirmDel);
             return;
         }
-        AssetEntry sel = AssetPanel.List.Selected();
+        AssetEntry sel = this.panel.List.Selected();
         bool isImage = this.SelIsImage();
         string meta = T("Folder", "文件夹");
         if (sel.IsLink()) {
@@ -559,21 +572,21 @@ class AssetManager {
         // The two editors are loaded from the entry once, not every frame, so
         // what the user typed survives until the selection moves.
         if (!sel.IsLink() && this.renameFor != sel.name) {
-            AssetPanel.RenameIn.SetText(sel.name);
+            this.panel.RenameIn.SetText(sel.name);
             this.renameFor = sel.name;
         }
         if (isImage && this.animFor != sel.name) {
             this.loadAnimFields(ad, sel.name);
             this.animFor = sel.name;
         }
-        AssetPanel.ShowEntry(sel, meta, this.confirmDel, isImage, this.loopMode);
+        this.panel.ShowEntry(sel, meta, this.confirmDel, isImage, this.loopMode);
     }
 
     /// The selected entry, or null when nothing (or more than one row) is.
     AssetEntry Sel() {
-        if (!AssetPanel.List.HasSelection()) { return null; }
-        if (AssetPanel.List.SelectedIndices().Count > 1) { return null; }
-        return AssetPanel.List.Selected();
+        if (this.panel == null || !this.panel.List.HasSelection()) { return null; }
+        if (this.panel.List.SelectedIndices().Count > 1) { return null; }
+        return this.panel.List.Selected();
     }
 
     /// Only images carry an anim clip, so only they show the clip editor.
@@ -594,9 +607,9 @@ class AssetManager {
 
     static void GoUp() {
         AssetManager m = AssetManager.current;
-        if (m == null || m.curRel.Length == 0) { return; }
+        if (m == null || m.panel == null || m.curRel.Length == 0) { return; }
         m.curRel = dirPart(m.curRel);
-        AssetPanel.List.ClearSelection();
+        m.panel.List.ClearSelection();
     }
 
     /// Flips how publishing ships assets/: plain copies, or one encrypted
@@ -618,21 +631,21 @@ class AssetManager {
 
     static void MakeFolder() {
         AssetManager m = AssetManager.current;
-        if (m == null) { return; }
-        string name = AssetPanel.FolderIn.GetText();
+        if (m == null || m.panel == null) { return; }
+        string name = m.panel.FolderIn.GetText();
         if (name.Length == 0) { return; }
         Directory.CreateDirectoryRecursive(m.curDir(AssetManager.viewRoot)
                                            + "/" + name);
-        AssetPanel.FolderIn.SetText("");
+        m.panel.FolderIn.SetText("");
         m.msg = T("Folder created: ", "已创建文件夹：") + name;
     }
 
     static void RenameSelected() {
         AssetManager m = AssetManager.current;
-        if (m == null) { return; }
+        if (m == null || m.panel == null) { return; }
         AssetEntry sel = m.Sel();
         if (sel == null || sel.IsLink()) { return; }
-        string name = AssetPanel.RenameIn.GetText();
+        string name = m.panel.RenameIn.GetText();
         if (name.Length == 0 || name == sel.name) { return; }
         string ad = m.curDir(AssetManager.viewRoot);
         File.Move(ad + "/" + sel.name, ad + "/" + name);
@@ -641,15 +654,15 @@ class AssetManager {
         m.msg = T("Renamed to ", "已重命名为 ") + name;
         m.renameFor = "";
         m.animFor = "";
-        AssetPanel.List.ClearSelection();
+        m.panel.List.ClearSelection();
     }
 
     /// Delete asks once (the button turns into "confirm"), then deletes what
     /// is selected: one entry, or the whole multi-selection.
     static void DeleteSelected() {
         AssetManager m = AssetManager.current;
-        if (m == null || !AssetPanel.List.HasSelection()) { return; }
-        List<int> rows = AssetPanel.List.SelectedIndices();
+        if (m == null || m.panel == null || !m.panel.List.HasSelection()) { return; }
+        List<int> rows = m.panel.List.SelectedIndices();
         AssetEntry one = m.Sel();
         // Removing a link only edits zan.proj, so it needs no confirmation.
         if (one != null && one.IsLink()) {
@@ -657,7 +670,7 @@ class AssetManager {
             AssetManager.viewLog.Add("> Removed linked resource: " + one.path);
             m.msg = T("Link removed", "已移除链接");
             m.confirmDel = false;
-            AssetPanel.List.ClearSelection();
+            m.panel.List.ClearSelection();
             return;
         }
         if (!m.confirmDel) {
@@ -696,7 +709,7 @@ class AssetManager {
                 + T(" items", " 项");
         }
         m.confirmDel = false;
-        AssetPanel.List.ClearSelection();
+        m.panel.List.ClearSelection();
     }
 
     static void CycleLoop() {
@@ -710,7 +723,7 @@ class AssetManager {
     /// editor fields.
     static void WriteAnimClip() {
         AssetManager m = AssetManager.current;
-        if (m == null || !m.SelIsImage()) { return; }
+        if (m == null || m.panel == null || !m.SelIsImage()) { return; }
         AssetEntry sel = m.Sel();
         if (sel == null) { return; }
         string loop = "once";
@@ -718,12 +731,12 @@ class AssetManager {
         if (m.loopMode == 2) { loop = "section"; }
         string relNoExt = stripExt(m.relOf(sel.name));
         writeAnim(AssetManager.viewRoot, relNoExt, sel.name,
-            parseInt(AssetPanel.FrameWIn.GetText(), 0),
-            parseInt(AssetPanel.FrameHIn.GetText(), 0),
-            parseInt(AssetPanel.DirsIn.GetText(), 8),
-            parseInt(AssetPanel.FpdIn.GetText(), 1),
-            parseInt(AssetPanel.FpsIn.GetText(), 12), loop,
-            parseInt(AssetPanel.StartIn.GetText(), 0));
+            parseInt(m.panel.FrameWIn.GetText(), 0),
+            parseInt(m.panel.FrameHIn.GetText(), 0),
+            parseInt(m.panel.DirsIn.GetText(), 8),
+            parseInt(m.panel.FpdIn.GetText(), 1),
+            parseInt(m.panel.FpsIn.GetText(), 12), loop,
+            parseInt(m.panel.StartIn.GetText(), 0));
         AssetManager.viewLog.Add("> Anim clip written: assets/" + relNoExt
             + ".anim");
         m.msg = T("Wrote ", "已写入 ") + relNoExt + ".anim";
@@ -731,23 +744,23 @@ class AssetManager {
 
     /// Preloads the anim editor from an existing side-car .anim file, if any.
     void loadAnimFields(string ad, string imgName) {
-        AssetPanel.FpdIn.SetText("6");
-        AssetPanel.DirsIn.SetText("8");
-        AssetPanel.FpsIn.SetText("12");
-        AssetPanel.StartIn.SetText("0");
-        AssetPanel.FrameWIn.SetText("0");
-        AssetPanel.FrameHIn.SetText("0");
+        this.panel.FpdIn.SetText("6");
+        this.panel.DirsIn.SetText("8");
+        this.panel.FpsIn.SetText("12");
+        this.panel.StartIn.SetText("0");
+        this.panel.FrameWIn.SetText("0");
+        this.panel.FrameHIn.SetText("0");
         this.loopMode = 1;
         string af = ad + "/" + stripExt(imgName) + ".anim";
         if (!File.Exists(af)) { return; }
         JsonValue v = JsonValue.ParseLenient(File.ReadAllText(af));
         if (v == null) { return; }
-        AssetPanel.FpdIn.SetText(Convert.ToString(v.Int("framesPerDir", 6)));
-        AssetPanel.DirsIn.SetText(Convert.ToString(v.Int("dirs", 8)));
-        AssetPanel.FpsIn.SetText(Convert.ToString(v.Int("fps", 12)));
-        AssetPanel.StartIn.SetText(Convert.ToString(v.Int("loopStart", 0)));
-        AssetPanel.FrameWIn.SetText(Convert.ToString(v.Int("frameW", 0)));
-        AssetPanel.FrameHIn.SetText(Convert.ToString(v.Int("frameH", 0)));
+        this.panel.FpdIn.SetText(Convert.ToString(v.Int("framesPerDir", 6)));
+        this.panel.DirsIn.SetText(Convert.ToString(v.Int("dirs", 8)));
+        this.panel.FpsIn.SetText(Convert.ToString(v.Int("fps", 12)));
+        this.panel.StartIn.SetText(Convert.ToString(v.Int("loopStart", 0)));
+        this.panel.FrameWIn.SetText(Convert.ToString(v.Int("frameW", 0)));
+        this.panel.FrameHIn.SetText(Convert.ToString(v.Int("frameH", 0)));
         string loop = v.Str("loop", "loop");
         this.loopMode = 1;
         if (loop == "once") { this.loopMode = 0; }

@@ -164,7 +164,7 @@ class GenForm {
          * 控件经自己的 __Dispatch 走(宿主可能还没接上 Form)。
          * 必须用 Call:Handle 只查表返回 Action,不会执行它。 */
         string dispatch = "__form.Call";
-        if (ctl) { dispatch = name + ".__Dispatch"; }
+        if (ctl) { dispatch = "this.__Dispatch"; }
 
         if (fields != null && fields.IsArray()) {
             int id = 0;
@@ -178,7 +178,7 @@ class GenForm {
             for (int i = 0; i < fields.Count(); i = i + 1) {
                 id = GenForm.EmitField(decls, body, wire, valid, fields.At(i),
                                        rootParent, id, used, free_mode,
-                                       !free_mode, dispatch);
+                                       !free_mode, dispatch, ctl);
             }
         }
 
@@ -204,9 +204,22 @@ class GenForm {
         } else {
             out0.Append("partial class " + name + " {\n");
         }
-        out0.Append("    /// The live form, kept for the non-capturing handler\n");
-        out0.Append("    /// lambdas (delegates are plain function pointers).\n");
-        out0.Append("    static Form __form;\n");
+        if (ctl) {
+            out0.Append("    /// The host form this instance delivers its designed\n");
+            out0.Append("    /// events to. The framework hands it over when this\n");
+            out0.Append("    /// control is attached to a window tree (OnHostForm),\n");
+            out0.Append("    /// so a host never wires anything by hand; it is null\n");
+            out0.Append("    /// while the control lives outside any window.\n");
+            out0.Append("    Form __form;\n");
+        } else {
+            out0.Append("    /// The live form, kept for the non-capturing handler\n");
+            out0.Append("    /// lambdas (delegates are plain function pointers).\n");
+            out0.Append("    /// A window document is a singleton: these fields are\n");
+            out0.Append("    /// assigned by __BuildForm() and are only valid once\n");
+            out0.Append("    /// __CreateWindow() has returned; showing the window\n");
+            out0.Append("    /// again rebuilds the tree and overwrites them.\n");
+            out0.Append("    static Form __form;\n");
+        }
         if (decls.Length > 0) {
             out0.Append(decls.ToString());
             out0.Append("\n");
@@ -228,7 +241,7 @@ class GenForm {
                 out0.Append("        this.gap = 10;\n");
             }
             if (body.Length > 0) { out0.Append(body.ToString()); }
-            if (wire.Length > 0) { out0.Append("        " + name + ".__WireControl();\n"); }
+            if (wire.Length > 0) { out0.Append("        this.__WireControl();\n"); }
             out0.Append("        this.OnInit();\n");
             out0.Append("    }\n\n");
             out0.Append("    /// The designed class name, so the designer and the\n");
@@ -257,7 +270,11 @@ class GenForm {
         out0.Append("    /// input (red border + message) and reports whether the form is\n");
         out0.Append("    /// OK to submit. Call it from the submit handler:\n");
         out0.Append("    ///     if (!__ValidateForm()) { return; }\n");
-        out0.Append("    static bool __ValidateForm() {\n");
+        if (ctl) {
+            out0.Append("    bool __ValidateForm() {\n");
+        } else {
+            out0.Append("    static bool __ValidateForm() {\n");
+        }
         out0.Append("        bool ok = true;\n");
         if (valid.Length > 0) { out0.Append(valid.ToString()); }
         out0.Append("        return ok;\n");
@@ -266,20 +283,20 @@ class GenForm {
         out0.Append("    /// registry on the form (see Form.On / Form.Handle). Unregistered\n");
         out0.Append("    /// handler names simply never fire.\n");
         if (ctl) {
-            out0.Append("    static void __WireForm(Form form) {\n");
-            out0.Append("        __form = form;\n");
+            out0.Append("    override void OnHostForm(Form form) {\n");
+            out0.Append("        this.__form = form;\n");
             out0.Append("    }\n\n");
             out0.Append("    /// Routes a designed binding to the host form's handler\n");
             out0.Append("    /// registry; a control built before its host is attached\n");
             out0.Append("    /// (or hosted without one) simply drops the event.\n");
-            out0.Append("    static void __Dispatch(string handler) {\n");
-            out0.Append("        if (__form != null) { __form.Call(handler); }\n");
+            out0.Append("    void __Dispatch(string handler) {\n");
+            out0.Append("        if (this.__form != null) { this.__form.Call(handler); }\n");
             out0.Append("    }\n\n");
             if (wire.Length > 0) {
                 out0.Append("    /// Binds the designed events to __Dispatch; called from\n");
-                out0.Append("    /// the constructor, so a host only has to hand the form\n");
-                out0.Append("    /// over through __WireForm.\n");
-                out0.Append("    static void __WireControl() {\n");
+                out0.Append("    /// the constructor, so a host only has to add this control\n");
+                out0.Append("    /// to a window tree.\n");
+                out0.Append("    void __WireControl() {\n");
                 out0.Append(wire.ToString());
                 out0.Append("    }\n\n");
             }
@@ -534,7 +551,8 @@ class GenForm {
                          StringBuilder wire, StringBuilder valid,
                          JsonValue o, string parent, int id,
                          List<string> used, bool freeMode,
-                         bool parentIsFlow, string dispatch) {
+                         bool parentIsFlow, string dispatch,
+                         bool instanceFields) {
         string kind = GenForm.TypeOf(o);
         string fname = GenForm.ObjStr(o, "name");
         int next = id + 1;
@@ -546,9 +564,16 @@ class GenForm {
         bool typed = GenCommon.IsIdent(fname) && fname.Length > 0 &&
                      !used.Contains(fname);
         if (typed) {
-            vn = fname;
             used.Add(fname);
-            decls.Append("    static " + kind + " " + vn + ";\n");
+            /* 控件文档可以有多个实例,具名控件因此是实例字段:两个
+             * DocsView 各有自己的控件树。窗体文档是单例,保持 static。 */
+            if (instanceFields) {
+                vn = "this." + fname;
+                decls.Append("    " + kind + " " + fname + ";\n");
+            } else {
+                vn = fname;
+                decls.Append("    static " + kind + " " + vn + ";\n");
+            }
         } else {
             vn = "c" + Convert.ToString(id);
             body.Append("        " + kind + " " + vn + ";\n");
@@ -692,7 +717,7 @@ class GenForm {
             for (int i = 0; i < kids.Count(); i = i + 1) {
                 next = GenForm.EmitField(decls, body, wire, valid, kids.At(i),
                                          vn, next, used, freeMode, false,
-                                         dispatch);
+                                         dispatch, instanceFields);
             }
         }
         return next;

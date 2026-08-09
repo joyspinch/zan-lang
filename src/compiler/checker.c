@@ -2033,6 +2033,28 @@ static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr)
                   (int)expr->member.name.len, expr->member.name.str);
 }
 
+/* True when the receiver of a member access is a value (a local, parameter,
+ * field, call result, ...) rather than a type name. `Type.StaticField` is the
+ * only valid way to reach a static field; through a value it used to lower to
+ * the constant 0, which then either compared an int against a pointer (invalid
+ * IR) or was dereferenced as an object. */
+static bool receiver_is_value_expr(zan_checker_t *c, zan_ast_node_t *obj) {
+    switch (obj->kind) {
+    case AST_IDENTIFIER: {
+        if (checker_find_local_slot(c, obj->ident.name)) return true;
+        zan_symbol_t *s = zan_binder_lookup(c->binder, obj->ident.name);
+        if (!s) return false;
+        return s->kind == SYM_FIELD || s->kind == SYM_PROPERTY ||
+               s->kind == SYM_PARAM || s->kind == SYM_LOCAL;
+    }
+    case AST_CALL:
+    case AST_INDEX:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                                        zan_type_t *obj_type) {
     checker_reject_null_receiver(c, expr);
@@ -2084,6 +2106,23 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                  * delegate assignability rule expects for method groups. */
                 if (m->kind == SYM_METHOD)
                     return c->binder->type_error;
+                if (m->kind == SYM_FIELD && (m->modifiers & MOD_STATIC) &&
+                    expr->member.object &&
+                    receiver_is_value_expr(c, expr->member.object)) {
+                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                                  "'%.*s' is a static field of '%.*s'; "
+                                  "qualify it with the type name "
+                                  "('%.*s.%.*s'), not an instance",
+                                  (int)expr->member.name.len,
+                                  expr->member.name.str,
+                                  (int)obj_type->sym->name.len,
+                                  obj_type->sym->name.str,
+                                  (int)obj_type->sym->name.len,
+                                  obj_type->sym->name.str,
+                                  (int)expr->member.name.len,
+                                  expr->member.name.str);
+                    return c->binder->type_error;
+                }
                 return m->type ? m->type : c->binder->type_error;
             }
         }

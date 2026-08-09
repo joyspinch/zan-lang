@@ -638,6 +638,18 @@ add_test(NAME diag_member_name_clash
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_member_name_clash PROPERTIES TIMEOUT 60)
 
+# A static field is reachable only through its type name: through a value
+# receiver the access used to fold to the constant 0 (crashing irgen on the
+# resulting int-vs-pointer compare).
+add_test(NAME diag_static_field_via_instance
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/static_field_via_instance.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_static_field_via_instance${_exe_ext}
+    "-DEXPECT_REGEX=.other. is a static field of .Holder."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_static_field_via_instance PROPERTIES TIMEOUT 60)
+
 # ---- RPC framing test (A3) ----
 add_executable(zan_rpc_framing_test
     tests/unit/rpc_framing_test.c
