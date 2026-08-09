@@ -540,6 +540,16 @@ class HitRegion {
         if (py >= y + height) { return false; }
         return true;
     }
+
+    /// 就地改写（供 HitTester 复用池中的对象）。
+    void Set(int id, int x, int y, int w, int h, int wtype) {
+        this.id = id;
+        this.x = x;
+        this.y = y;
+        this.width = w;
+        this.height = h;
+        this.widgetType = wtype;
+    }
 }
 
 class HitTester {
@@ -553,9 +563,21 @@ class HitTester {
     // 来确认自己位于阻挡之上并保持可用。
     List<HitRegion> blockers;
     List<HitRegion> prevBlockers;
+    // 命中区对象池。每帧每个控件注册一个命中区，一个稠密
+    // 界面一秒就要新建上万个 HitRegion；池化后只在控件数
+    // 创新高时才分配。两个池交替使用，因为 prevBlockers 还
+    // 引用着上一帧的对象，不能被本帧就地改写。
+    List<HitRegion> poolA;
+    List<HitRegion> poolB;
+    bool useA;
+    int used;
 
     HitTester() {
-        regions = new List<HitRegion>();
+        poolA = new List<HitRegion>();
+        poolB = new List<HitRegion>();
+        useA = true;
+        used = 0;
+        regions = poolA;
         blockers = new List<HitRegion>();
         prevBlockers = new List<HitRegion>();
     }
@@ -563,12 +585,33 @@ class HitTester {
     void Clear() {
         prevBlockers = blockers;
         blockers = new List<HitRegion>();
-        regions = new List<HitRegion>();
+        useA = !useA;
+        if (useA) { regions = poolA; } else { regions = poolB; }
+        used = 0;
+    }
+
+    /// 本帧已注册的命中区数量（`regions` 是复用池，末尾
+    /// 可能残留上一帧的对象，遍历要以此为界）。
+    int RegionCount() { return used; }
+    HitRegion RegionAt(int i) { return regions[i]; }
+
+    /// 注册一个命中区，复用池中的对象（首选形式：不分配）。
+    void RegisterRect(int id, int x, int y, int w, int h, int wtype) {
+        HitRegion r;
+        if (used < regions.Count) {
+            r = regions[used];
+            r.Set(id, x, y, w, h, wtype);
+        } else {
+            r = new HitRegion(id, x, y, w, h, wtype);
+            regions.Add(r);
+        }
+        used = used + 1;
+        if (wtype == -1) { blockers.Add(r); }
     }
 
     void Register(HitRegion region) {
-        regions.Add(region);
-        if (region.widgetType == -1) { blockers.Add(region); }
+        this.RegisterRect(region.id, region.x, region.y,
+            region.width, region.height, region.widgetType);
     }
 
     /// 当本帧已注册的阻挡层覆盖该点时返回 true——即
@@ -596,7 +639,7 @@ class HitTester {
     }
 
     int HitTest(int px, int py) {
-        int i = regions.Count - 1;
+        int i = used - 1;
         while (i >= 0) {
             HitRegion r = regions[i];
             if (r.Contains(px, py)) {
@@ -612,7 +655,7 @@ class HitTester {
     /// 状态变化的控件，而不是整个窗口。
     List<int> RectOf(int id) {
         if (id < 0) { return null; }
-        for (int i = 0; i < regions.Count; i = i + 1) {
+        for (int i = 0; i < used; i = i + 1) {
             HitRegion r = regions[i];
             if (r.id == id) {
                 List<int> box = new List<int>{
@@ -627,7 +670,7 @@ class HitTester {
     }
 
     int GetWidgetType(int id) {
-        for (int i = 0; i < regions.Count; i = i + 1) {
+        for (int i = 0; i < used; i = i + 1) {
             if (regions[i].id == id) {
                 return regions[i].widgetType;
             }
@@ -961,7 +1004,7 @@ class OverlayPopup {
                     c.DrawGlyphIn("check", popupX + popupW - t.paddingLarge - t.iconSizeSmall,
                                         optY, t.iconSizeSmall, optH, t.iconSizeSmall, t.primary);
                 }
-                app.hitTester.Register(new HitRegion(optId, popupX, optY, popupW, optH, 0));
+                app.hitTester.RegisterRect(optId, popupX, optY, popupW, optH, 0);
             }
         }
         c.PopClip();
@@ -1072,7 +1115,7 @@ class OverlayPopup {
         c.FillCircle(cbx + cbtn / 2, cby + cbtn / 2, cbtn / 2, closeBg);
         c.DrawGlyphIn("close", cbx, cby, cbtn, cbtn,
                             t.iconSizeSmall, t.textSecondary);
-        app.hitTester.Register(new HitRegion(idClose, cbx, cby, cbtn, cbtn, 0));
+        app.hitTester.RegisterRect(idClose, cbx, cby, cbtn, cbtn, 0);
 
         // ---- 分段选项卡 ----
         int segX = dx + pad;
@@ -1104,8 +1147,7 @@ class OverlayPopup {
             int lw = Canvas.MeasureText(lbl, fs);
             c.DrawText(tx + (tabW - lw) / 2,
                        Canvas.CenterTextY(segY, segH, fs), lbl, lc, fs);
-            app.hitTester.Register(
-                new HitRegion(idTab0 + ti, tx, segY, tabW, segH, 0));
+            app.hitTester.RegisterRect(idTab0 + ti, tx, segY, tabW, segH, 0);
         }
 
         c.PushClip(dx, viewY, dw, viewH);
@@ -1242,8 +1284,7 @@ class OverlayPopup {
             int row = i / cols;
             int cx = dx + pad + col * (cardW + pad);
             int cy = yy - rows * (cardH + pad) + row * (cardH + pad);
-            app.hitTester.Register(
-                new HitRegion(baseId + i, cx, cy, cardW, cardH, 0));
+            app.hitTester.RegisterRect(baseId + i, cx, cy, cardW, cardH, 0);
             i = i + 1;
         }
         return yy;
@@ -1284,8 +1325,7 @@ class OverlayPopup {
                 c.DrawGlyphIn("check", sx, yy, swatch, swatch,
                                     t.iconSizeSmall, t.textInverse);
             }
-            app.hitTester.Register(
-                new HitRegion(optId, sx, yy, swatch, swatch, 0));
+            app.hitTester.RegisterRect(optId, sx, yy, swatch, swatch, 0);
         }
         yy = yy + swatch + pad;
         return yy;
@@ -1330,8 +1370,7 @@ class OverlayPopup {
             c.DrawText(sx + (chipW - chipLw) / 2,
                        Canvas.CenterTextY(yy, chipH, t.fontSizeSmall),
                        chipLbl, chipTc, t.fontSizeSmall);
-            app.hitTester.Register(
-                new HitRegion(optId, sx, yy, chipW, chipH, 0));
+            app.hitTester.RegisterRect(optId, sx, yy, chipW, chipH, 0);
         }
         yy = yy + chipH + pad;
         return yy;
@@ -1385,8 +1424,7 @@ class OverlayPopup {
                    Canvas.CenterTextY(yy, rowH, t.fontSizeSmall),
                    pickLbl, t.textPrimary, t.fontSizeSmall);
         if (pickLw > pickW - app.Scale(16)) { c.PopClip(); }
-        app.hitTester.Register(
-            new HitRegion(idWallPick, dx + pad, yy, pickW, rowH, 0));
+        app.hitTester.RegisterRect(idWallPick, dx + pad, yy, pickW, rowH, 0);
 
         int clearX = dx + pad + pickW + btnGap;
         bool clrHov = app.focus.IsHovered(idWallClear);
@@ -1402,8 +1440,7 @@ class OverlayPopup {
                    Canvas.CenterTextY(yy, rowH, t.fontSizeSmall),
                    "Clear", clrTc, t.fontSizeSmall);
         if (hasWall) {
-            app.hitTester.Register(
-                new HitRegion(idWallClear, clearX, yy, clearW, rowH, 0));
+            app.hitTester.RegisterRect(idWallClear, clearX, yy, clearW, rowH, 0);
         }
         yy = yy + rowH + pad;
 
@@ -1429,8 +1466,7 @@ class OverlayPopup {
             c.DrawText(sx + (chipW - wLw) / 2,
                        Canvas.CenterTextY(yy, chipH, t.fontSizeSmall),
                        wLbl, wTc, t.fontSizeSmall);
-            app.hitTester.Register(
-                new HitRegion(optId, sx, yy, chipW, chipH, 0));
+            app.hitTester.RegisterRect(optId, sx, yy, chipW, chipH, 0);
         }
         yy = yy + chipH;
         return yy;
@@ -1466,8 +1502,7 @@ class OverlayPopup {
         if (app.fxEnabled) { kx = px + pillW - knob - app.Scale(3); }
         c.FillCircle(kx + knob / 2, py + pillH / 2, knob / 2,
                      Theme.Rgb(255, 255, 255));
-        app.hitTester.Register(
-            new HitRegion(idToggle, dx, yy, dw, rowH, 0));
+        app.hitTester.RegisterRect(idToggle, dx, yy, dw, rowH, 0);
         yy = yy + rowH * 2;
 
         yy = this.DrawerSection(app, dx, yy - rowH, dw, "Backdrop effect");
@@ -1493,8 +1528,7 @@ class OverlayPopup {
             c.DrawText(dx + pad + rr * 2 + app.Scale(10),
                        Canvas.CenterTextY(yy, rowH, fs),
                        kinds[i], tc, fs);
-            app.hitTester.Register(
-                new HitRegion(optId, dx, yy, dw, rowH, 0));
+            app.hitTester.RegisterRect(optId, dx, yy, dw, rowH, 0);
             yy = yy + rowH;
         }
     }
@@ -1702,7 +1736,7 @@ class OverlayPopup {
                         t.textTertiary, t.fontSizeSmall);
                 }
                 if (hovered) { hoverRow = i; }
-                app.hitTester.Register(new HitRegion(idBase + i, px, rowY, pw, rowH, 0));
+                app.hitTester.RegisterRect(idBase + i, px, rowY, pw, rowH, 0);
                 rowY = rowY + rowH;
             }
         }

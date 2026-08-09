@@ -19,40 +19,51 @@ class SceneView {
             || kind == "bagslot" || kind == "itemslot";
     }
 
+    // 缓存最近一次拆分的 items 串：同一元素每帧都要拆一次，
+    // 而 items 只在编辑时变化，所以重复的那次直接命中。
+    static string sSplitKey;
+    static List<string> sSplitVal;
+
     static List<string> SplitItems(string items) {
-        List<string> o = new List<string>();
-        string cur = "";
-        for (int i = 0; i < items.Length; i = i + 1) {
-            string c = items.Substring(i, 1);
-            if (c == ";") { o.Add(cur); cur = ""; }
-            else { cur = cur + c; }
+        if (SceneView.sSplitVal != null && SceneView.sSplitKey == items) {
+            return SceneView.sSplitVal;
         }
-        if (cur.Length > 0) { o.Add(cur); }
+        // 逐字符拼接是 O(n^2)（每个字符都新建一个字符串）；
+        // 按分隔符切片只按段分配。
+        List<string> o = new List<string>();
+        int start = 0;
+        for (int i = 0; i < items.Length; i = i + 1) {
+            if (items.Substring(i, 1) == ";") {
+                o.Add(items.Substring(start, i - start));
+                start = i + 1;
+            }
+        }
+        if (items.Length > start) {
+            o.Add(items.Substring(start, items.Length - start));
+        }
+        SceneView.sSplitKey = items;
+        SceneView.sSplitVal = o;
         return o;
     }
 
-    // 元素列表的副本，按 z 升序排序（近似稳定的插入排序），
-    // 使 z 小的先绘制（在底层）。
+    // 元素列表的副本，按 z 升序排序（稳定），使 z 小的先绘制
+    // （在底层）。二分插入：代价随元素数量增长，而不随 z 的
+    // 取值范围增长——按 z 值逐个筛选时，一个 z 跨到几千的
+    // 场景每帧都要扫上百万次。
     static List<SceneElement> OrderByZ(SceneDoc doc) {
         List<SceneElement> o = new List<SceneElement>();
         int n = doc.Count();
-        if (n == 0) { return o; }
-        int lo = doc.ElementAt(0).Z();
-        int hi = lo;
-        int i = 1;
-        while (i < n) {
-            int z = doc.ElementAt(i).Z();
-            if (z < lo) { lo = z; }
-            if (z > hi) { hi = z; }
-            i = i + 1;
-        }
-        // 按 z 分桶（小的先）；相同 z 内保持稳定。绘制顺序数量很小。
-        int zv = lo;
-        while (zv <= hi) {
-            for (int j = 0; j < n; j = j + 1) {
-                if (doc.ElementAt(j).Z() == zv) { o.Add(doc.ElementAt(j)); }
+        for (int i = 0; i < n; i = i + 1) {
+            SceneElement e = doc.ElementAt(i);
+            int z = e.Z();
+            // 插到最后一个 z <= 本元素的位置之后：相同 z 保持原序。
+            int lo = 0;
+            int hi = o.Count;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                if (o[mid].Z() <= z) { lo = mid + 1; } else { hi = mid; }
             }
-            zv = zv + 1;
+            o.Insert(lo, e);
         }
         return o;
     }
@@ -80,8 +91,24 @@ class SceneView {
             i = i + 1;
             if (!e.Visible()) { continue; }
             SceneRect r = doc.Resolve(e, cw, ch);
-            SceneView.DrawElement(app, c, t, e,
-                r.Xi(), r.Yi() + top, r.Wi(), r.Hi(), psMilli);
+            int ex = r.Xi();
+            int ey = r.Yi() + top;
+            int ew = r.Wi();
+            int eh = r.Hi();
+            // 视口裁剪：滚动/摄像机移动时，屏幕外的元素不必再走
+            // 一遍绘制（每个元素都会发出若干次填充/描边/文字调用，
+            // 底层再逐像素裁掉，白花代价）。格子类元素按整个网格
+            // 的外框判断。
+            int bw = ew;
+            int bh = eh;
+            if (SceneView.IsSlotKind(e.Kind())) {
+                int cwc = e.W() * psMilli / 1000;
+                int chh = e.H() * psMilli / 1000;
+                bw = e.Cols() * (cwc + e.GapX() * psMilli / 1000);
+                bh = e.Rows() * (chh + e.GapY() * psMilli / 1000);
+            }
+            if (ex + bw <= 0 || ey + bh <= top || ex >= W || ey >= H) { continue; }
+            SceneView.DrawElement(app, c, t, e, ex, ey, ew, eh, psMilli);
         }
     }
 

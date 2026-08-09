@@ -238,6 +238,14 @@ class App {
     // RequestRedraw，这样事件循环在帧间休眠，并以低频
     // 重绘它们，而不是以 60fps 忙碌地渲染整个页面。
     int animNextMs;
+    // 本帧登记的动画所声明的像素范围（并集）。animRectAll 表示
+    // 至少有一个动画没有声明范围，于是由动画唤醒的下一帧仍整窗重绘。
+    bool animRectValid;
+    bool animRectAll;
+    int animRX;
+    int animRY;
+    int animRW;
+    int animRH;
 
     // 当前帧处理了真实操作系统事件（输入、缩放、
     // 等）时为 true。纯动画重绘（转圈、缓动步进）在没有
@@ -400,6 +408,10 @@ class App {
         this.perfBeginMs = 0;
         this.lastPresentMs = 0;
         this.animNextMs = -1;
+        this.animRectValid = false;
+        this.animRectAll = false;
+        this.animRW = 0;
+        this.animRH = 0;
         this.fxEnabled = true;
         this.fxNextMs = -1;
         this.fxSnapValid = false;
@@ -1802,22 +1814,18 @@ class App {
         c.DrawGlyphIn("close", closeX, 0, bw, hbar, gl, xcolor);
 
         if (showThemeButton) {
-            hitTester.Register(
-                new HitRegion(themeId, themeX, 0, bw, hbar, 3));
+            hitTester.RegisterRect(themeId, themeX, 0, bw, hbar, 3);
         }
         if (showPinButton) {
-            hitTester.Register(
-                new HitRegion(pinId, pinX, 0, bw, hbar, 3));
+            hitTester.RegisterRect(pinId, pinX, 0, bw, hbar, 3);
         }
         if (showMinimizeButton) {
-            hitTester.Register(
-                new HitRegion(minId, minX, 0, bw, hbar, 3));
+            hitTester.RegisterRect(minId, minX, 0, bw, hbar, 3);
         }
         if (showMaximizeButton) {
-            hitTester.Register(
-                new HitRegion(maxId, maxX, 0, bw, hbar, 3));
+            hitTester.RegisterRect(maxId, maxX, 0, bw, hbar, 3);
         }
-        hitTester.Register(new HitRegion(closeId, closeX, 0, bw, hbar, 3));
+        hitTester.RegisterRect(closeId, closeX, 0, bw, hbar, 3);
 
         if (this.EventKind() == 3) {
             int hit = hitTester.HitTest(mouseX, mouseY);
@@ -1862,6 +1870,40 @@ class App {
     void RequestAnimationFrame(int minIntervalMs) {
         int due = Window.GetTickMs() + minIntervalMs;
         if (animNextMs < 0 || due < animNextMs) { animNextMs = due; }
+        // 没有声明范围：下一次动画帧只能整窗重绘。
+        animRectAll = true;
+    }
+
+    /// 与 RequestAnimationFrame 相同，但同时声明这个动画只会
+    /// 改变 [x,y,w,h] 这块像素。若一帧里所有动画都声明了范围，
+    /// 由动画唤醒的那一帧就裁剪到它们的并集：转圈指示器、
+    /// 边框流光、卡片光泽只重绘自己那一小块，而不是让整页
+    /// 每 16~90ms 重新混合一遍（这正是空闲时 CPU 居高不下的原因）。
+    void RequestAnimationFrameIn(int minIntervalMs, int x, int y, int w, int h) {
+        int due = Window.GetTickMs() + minIntervalMs;
+        if (animNextMs < 0 || due < animNextMs) { animNextMs = due; }
+        if (w <= 0 || h <= 0) { animRectAll = true; return; }
+        int pad = this.Scale(6);
+        int x0 = x - pad;
+        int y0 = y - pad;
+        int x1 = x + w + pad;
+        int y1 = y + h + pad;
+        if (animRectValid) {
+            if (animRX < x0) { x0 = animRX; }
+            if (animRY < y0) { y0 = animRY; }
+            if (animRX + animRW > x1) { x1 = animRX + animRW; }
+            if (animRY + animRH > y1) { y1 = animRY + animRH; }
+        }
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > canvas.Width()) { x1 = canvas.Width(); }
+        if (y1 > canvas.Height()) { y1 = canvas.Height(); }
+        if (x1 - x0 <= 0 || y1 - y0 <= 0) { animRectAll = true; return; }
+        animRX = x0;
+        animRY = y0;
+        animRW = x1 - x0;
+        animRH = y1 - y0;
+        animRectValid = true;
     }
 
     /// 当本帧玻璃表面之后的内容可能已变化时为 true
@@ -2235,6 +2277,16 @@ class App {
                         // 已就地呈现；继续等待下一个 tick。
                     } else {
                         needsRedraw = true;
+                        // 纯动画唤醒：若上一帧所有动画都声明了范围，
+                        // 把这一帧裁剪到它们的并集。
+                        if (!fxOnly && animRectValid && !animRectAll
+                            && !this.HasOverlays()) {
+                            dmgX = animRX;
+                            dmgY = animRY;
+                            dmgW = animRW;
+                            dmgH = animRH;
+                            partialPending = true;
+                        }
                         waiting = false;
                     }
                 } else {
@@ -2761,6 +2813,8 @@ class App {
         // 同样清除节流动画的截止时间；仍在运行的动画
         // （spinner 等）会在渲染期间通过 RequestAnimationFrame 重新武装。
         animNextMs = -1;
+        animRectValid = false;
+        animRectAll = false;
         // 本帧正在重新渲染，槽位 7 的 fx 快照已过期。
         fxSnapValid = false;
         // 玻璃表面从头开始重新分配稳定的模糊缓存槽位。
@@ -2873,7 +2927,7 @@ class App {
     /// 处处优先。返回拦截器 id。
     int BlockHitsRect(int x, int y, int w, int h) {
         int id = focus.AllocId();
-        hitTester.Register(new HitRegion(id, x, y, w, h, -1));
+        hitTester.RegisterRect(id, x, y, w, h, -1);
         return id;
     }
 

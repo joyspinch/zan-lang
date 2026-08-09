@@ -148,6 +148,76 @@ static u32 blend_over(u32 dst, u32 src) {
     return (oa << 24) | (or_ << 16) | (og << 8) | ob;
 }
 
+/* SSE2 is baseline on x86-64 (the Windows/Linux desktop targets); anything
+ * else takes the scalar run below, which produces the same pixels. */
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#include <emmintrin.h>
+#define ZAN_HAS_SSE2 1
+#else
+#define ZAN_HAS_SSE2 0
+#endif
+
+/* Source-over of one constant colour across a run of pixels.
+ *
+ * The per-pixel blend_over above divides three channels by 255; a frame spends
+ * most of its raster time in translucent fills (scrims, tints, frosted panels,
+ * selection washes), so the run form keeps the identical arithmetic but pays
+ * for it once per run instead of once per channel per pixel:
+ *   - src * sa is hoisted out of the loop (the colour is constant),
+ *   - red and blue ride in one word as two 16-bit lanes (their products are
+ *     <= 255*255, so lanes never carry into each other),
+ *   - v / 255 becomes (v + 1 + (v >> 8)) >> 8, exact for v <= 65025, which is
+ *     the range of s*sa + d*(255-sa).
+ * The output is bit-identical to blend_over. Destinations that are not opaque
+ * (shaped/glass windows clear the surface to alpha 0) take the general path. */
+static void blend_run_const(u32 *row, int n, u32 src) {
+    u32 sa = (src >> 24) & 0xFF;
+    if (sa == 0 || n <= 0) return;
+    if (sa == 255) {
+        for (int i = 0; i < n; i++) row[i] = src;
+        return;
+    }
+    u32 inv = 255 - sa;
+    u32 srb = (src & 0x00FF00FFu) * sa;
+    u32 sg = ((src >> 8) & 0xFFu) * sa;
+    int i = 0;
+#if ZAN_HAS_SSE2
+    /* Four pixels per step, same integer expression in 16-bit lanes. A group
+     * that contains a non-opaque destination falls back to the scalar loop for
+     * those four pixels. */
+    if (n >= 4) {
+        __m128i zero = _mm_setzero_si128();
+        __m128i amask = _mm_set1_epi32((int)0xFF000000u);
+        __m128i invv = _mm_set1_epi16((short)inv);
+        __m128i one = _mm_set1_epi16(1);
+        __m128i s4 = _mm_set1_epi32((int)src);
+        __m128i sav = _mm_set1_epi16((short)sa);
+        __m128i sLo = _mm_mullo_epi16(_mm_unpacklo_epi8(s4, zero), sav);
+        __m128i sHi = _mm_mullo_epi16(_mm_unpackhi_epi8(s4, zero), sav);
+        for (; i + 4 <= n; i += 4) {
+            __m128i d = _mm_loadu_si128((const __m128i *)(row + i));
+            __m128i da = _mm_and_si128(d, amask);
+            if (_mm_movemask_epi8(_mm_cmpeq_epi8(da, amask)) != 0xFFFF) break;
+            __m128i lo = _mm_add_epi16(_mm_mullo_epi16(_mm_unpacklo_epi8(d, zero), invv), sLo);
+            __m128i hi = _mm_add_epi16(_mm_mullo_epi16(_mm_unpackhi_epi8(d, zero), invv), sHi);
+            lo = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(lo, one), _mm_srli_epi16(lo, 8)), 8);
+            hi = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(hi, one), _mm_srli_epi16(hi, 8)), 8);
+            __m128i out = _mm_or_si128(_mm_packus_epi16(lo, hi), amask);
+            _mm_storeu_si128((__m128i *)(row + i), out);
+        }
+    }
+#endif
+    for (; i < n; i++) {
+        u32 d = row[i];
+        if ((d >> 24) != 0xFFu) { row[i] = blend_over(d, src); continue; }
+        u32 vrb = (d & 0x00FF00FFu) * inv + srb;
+        vrb = (vrb + 0x00010001u + ((vrb >> 8) & 0x00FF00FFu)) >> 8;
+        u32 vg = ((d >> 8) & 0xFFu) * inv + sg;
+        vg = (vg + 1 + (vg >> 8)) >> 8;
+        row[i] = 0xFF000000u | (vrb & 0x00FF00FFu) | (vg << 8);
+    }
+}
+
 /* Reset the clip window to the whole surface (frame start / new surface). */
 static void clip_reset_full(zan_surface_t *s) {
     s->clip_x0 = 0;
@@ -449,8 +519,7 @@ EXPORT void zan_gui_fill_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 co
          * the row instead of re-clipping every pixel via set_pixel -- these
          * translucent fills (scrims, hover/selection tints) cover large areas. */
         for (int py = y0; py < y1; py++) {
-            u32 *row = s->pixels + py * s->stride;
-            for (int px = x0; px < x1; px++) row[px] = blend_over(row[px], c);
+            blend_run_const(s->pixels + py * s->stride + x0, x1 - x0, c);
         }
     }
 }
@@ -1258,7 +1327,15 @@ EXPORT void zan_gui_shadow_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w, i32
     }
 }
 
-/* Anti-aliased filled circle */
+/* Anti-aliased filled circle.
+ *
+ * Scanline form: per row the interior is the run |dx| <= dxIn (dx^2 + dy^2 <=
+ * (r-0.5)^2) and only the two 1px edge runs out to dxOut need a distance. The
+ * interior therefore costs one blended run instead of a sqrt, a compare and a
+ * clip test per pixel -- which is what a scene full of round sprites, slots,
+ * bullets and particle glows spends its frame on. Pixels are identical to the
+ * per-pixel form: the two radii squared are never integers plus 0.25, so no
+ * sample can sit exactly on a boundary and change side. */
 EXPORT void zan_gui_fill_circle(i32 surface_id, i32 cx, i32 cy, i32 radius, i32 color) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
@@ -1266,16 +1343,37 @@ EXPORT void zan_gui_fill_circle(i32 surface_id, i32 cx, i32 cy, i32 radius, i32 
     u32 c = (u32)color;
     int r = (int)radius;
     int icx = (int)cx, icy = (int)cy;
+    double rin = (double)r - 0.5, rout = (double)r + 0.5;
+    double rin2 = rin * rin, rout2 = rout * rout;
 
     for (int dy = -r - 1; dy <= r + 1; dy++) {
-        for (int dx = -r - 1; dx <= r + 1; dx++) {
-            double dist = sqrt((double)(dx*dx + dy*dy));
-            if (dist <= r - 0.5) {
-                set_pixel(s, icx + dx, icy + dy, c);
-            } else if (dist <= r + 0.5) {
-                int cov = (int)((r + 0.5 - dist) * 255.0);
-                set_pixel_aa(s, icx + dx, icy + dy, c, cov);
-            }
+        int py = icy + dy;
+        if (py < s->clip_y0 || py >= s->clip_y1) continue;
+        double dy2 = (double)(dy * dy);
+        if (dy2 > rout2) continue;
+        /* Widest dx still inside each radius; nudged so floating-point slack
+         * in sqrt can never move a pixel across the boundary. */
+        int dxOut = (int)sqrt(rout2 - dy2);
+        while (dxOut >= 0 && (double)(dxOut * dxOut) + dy2 > rout2) dxOut--;
+        while ((double)((dxOut + 1) * (dxOut + 1)) + dy2 <= rout2) dxOut++;
+        if (dxOut < 0) continue;
+        int dxIn = -1;
+        if (rin >= 0.0 && rin2 >= dy2) {
+            dxIn = (int)sqrt(rin2 - dy2);
+            while (dxIn >= 0 && (double)(dxIn * dxIn) + dy2 > rin2) dxIn--;
+            while ((double)((dxIn + 1) * (dxIn + 1)) + dy2 <= rin2) dxIn++;
+        }
+        u32 *row = s->pixels + py * s->stride;
+        if (dxIn >= 0) {
+            int x0 = clamp_i(icx - dxIn, s->clip_x0, s->clip_x1);
+            int x1 = clamp_i(icx + dxIn + 1, s->clip_x0, s->clip_x1);
+            if (x1 > x0) blend_run_const(row + x0, x1 - x0, c);
+        }
+        for (int dx = dxIn + 1; dx <= dxOut; dx++) {
+            double dist = sqrt((double)(dx * dx) + dy2);
+            int cov = (int)((rout - dist) * 255.0);
+            set_pixel_aa(s, icx + dx, py, c, cov);
+            if (dx > 0) set_pixel_aa(s, icx - dx, py, c, cov);
         }
     }
 }
@@ -1330,16 +1428,33 @@ EXPORT void zan_gui_fill_radial(i32 surface_id, i32 cx, i32 cy, i32 radius, i32 
      * the centre and 0 at the edge, squared for a bright tight core and a soft
      * tail. This is called hundreds of times per animated frame, so the hot
      * loop stays entirely in integer math. */
-    for (int dy = -r; dy <= r; dy++) {
-        int py = icy + dy;
+    /* Row bounds instead of a bounding-square walk with a reject test: glows
+     * are drawn by the hundred per animated frame, and the corners of the
+     * square (21% of it) were visited only to be discarded. Rows and columns
+     * outside the clip window are dropped up front too, so a glow clipped to a
+     * control costs only the pixels it can actually write. */
+    int y_lo = icy - r, y_hi = icy + r;
+    if (y_lo < s->clip_y0) y_lo = s->clip_y0;
+    if (y_hi > s->clip_y1 - 1) y_hi = s->clip_y1 - 1;
+    for (int py = y_lo; py <= y_hi; py++) {
+        int dy = py - icy;
         int dy2 = dy * dy;
-        for (int dx = -r; dx <= r; dx++) {
+        int span = r2 - dy2;
+        if (span <= 0) continue;
+        int dxMax = (int)sqrt((double)span);
+        while (dxMax > 0 && dxMax * dxMax >= span) dxMax--;
+        while ((dxMax + 1) * (dxMax + 1) < span) dxMax++;
+        int x_lo = icx - dxMax, x_hi = icx + dxMax;
+        if (x_lo < s->clip_x0) x_lo = s->clip_x0;
+        if (x_hi > s->clip_x1 - 1) x_hi = s->clip_x1 - 1;
+        u32 *row = s->pixels + (size_t)py * (size_t)s->stride;
+        for (int px = x_lo; px <= x_hi; px++) {
+            int dx = px - icx;
             int d2 = dx * dx + dy2;
-            if (d2 >= r2) continue;
             int t = ((r2 - d2) << 8) / r2;
             int a = (peak * t * t) >> 16;
             if (a <= 0) continue;
-            set_pixel(s, icx + dx, py, ((u32)a << 24) | rgb);
+            row[px] = blend_over(row[px], ((u32)a << 24) | rgb);
         }
     }
 }
@@ -1465,8 +1580,51 @@ EXPORT void zan_gui_draw_line(i32 surface_id, i32 x0, i32 y0, i32 x1, i32 y1, i3
         int hiy = (y0 > y1 ? (int)y0 : (int)y1);
         int minx = lox - t - 1, maxx = hix + t + 1;
         int miny = loy - t - 1, maxy = hiy + t + 1;
+        /* Walk only the pixels a row can actually cover. The covered set is a
+         * capsule (segment + round caps), so each row meets it in one interval
+         * whose ends are where the row crosses the two offset edges or the two
+         * end circles. A steep 150px stroke used to test its whole 150x150
+         * bounding box -- ~50x the pixels it paints -- which is what made
+         * charts, spark lines and animated vector art expensive. */
+        double ux = 0.0, uy = 0.0, seglen = sqrt(len2);
+        if (seglen > 0.0001) { ux = dx / seglen; uy = dy / seglen; }
+        double rr = half + 0.5;
+        if (miny < s->clip_y0) miny = s->clip_y0;
+        if (maxy > s->clip_y1 - 1) maxy = s->clip_y1 - 1;
+        if (minx < s->clip_x0) minx = s->clip_x0;
+        if (maxx > s->clip_x1 - 1) maxx = s->clip_x1 - 1;
         for (int py = miny; py <= maxy; py++) {
-            for (int px = minx; px <= maxx; px++) {
+            double yc = (double)py;
+            double lo = 1e30, hi = -1e30;
+            for (int e = 0; e < 2; e++) {
+                double ecx = e ? (double)x1 : (double)x0;
+                double ecy = e ? (double)y1 : (double)y0;
+                double dyc = yc - ecy;
+                if (dyc * dyc > rr * rr) continue;
+                double half_w = sqrt(rr * rr - dyc * dyc);
+                if (ecx - half_w < lo) lo = ecx - half_w;
+                if (ecx + half_w > hi) hi = ecx + half_w;
+            }
+            if (seglen > 0.0001) {
+                double nx = -uy * rr, ny = ux * rr;   /* perpendicular offset */
+                for (int e = 0; e < 2; e++) {
+                    double sgn = e ? -1.0 : 1.0;
+                    double ax = (double)x0 + sgn * nx, ay = (double)y0 + sgn * ny;
+                    double bx = (double)x1 + sgn * nx, by = (double)y1 + sgn * ny;
+                    double span = by - ay;
+                    if (span > -0.0001 && span < 0.0001) continue;
+                    double tt = (yc - ay) / span;
+                    if (tt < 0.0 || tt > 1.0) continue;
+                    double xs = ax + (bx - ax) * tt;
+                    if (xs < lo) lo = xs;
+                    if (xs > hi) hi = xs;
+                }
+            }
+            if (lo > hi) continue;
+            int rowLo = (int)floor(lo) - 1, rowHi = (int)ceil(hi) + 1;
+            if (rowLo < minx) rowLo = minx;
+            if (rowHi > maxx) rowHi = maxx;
+            for (int px = rowLo; px <= rowHi; px++) {
                 double proj = 0.0;
                 if (len2 > 0.0001) {
                     proj = ((px - (double)x0) * dx + (py - (double)y0) * dy) / len2;
@@ -1812,14 +1970,34 @@ EXPORT void zan_gui_blit_image(
     x1 = idx2 + idw < s->clip_x1 ? idx2 + idw : s->clip_x1;
     y1 = idy  + idh < s->clip_y1 ? idy  + idh : s->clip_y1;
     ZAN_STAT(g_st_img, (long long)(x1 - x0) * (long long)(y1 - y0));
+    /* Nearest-neighbour walk with a fixed-point source step: the source column
+     * used to cost an integer divide per pixel, and every pixel went through
+     * the general blend even where the sprite is fully transparent (most of a
+     * tile sheet's cell) or fully opaque. Sprites and tiles are the bulk of a
+     * game frame's pixels, so both are worth avoiding. */
+    if (idw <= 0 || idh <= 0) return;
+    /* Exactly (i * isw) / idw, stepped instead of divided (i >= 0 always: the
+     * loop starts at the clipped destination edge, never left of it). */
+    int qxStep = isw / idw, rxStep = isw % idw;
     for (py = y0; py < y1; py++) {
         int sry = isy + (py - idy) * ish / idh;
         if (sry < 0 || sry >= img->h) continue;
+        const u32 *srow = img->pix + (size_t)sry * (size_t)img->w;
+        u32 *drow = s->pixels + (size_t)py * (size_t)s->stride;
+        int i0 = x0 - idx2;
+        int qx = (int)(((long long)i0 * isw) / idw);
+        int rx = (int)(((long long)i0 * isw) % idw);
         for (px = x0; px < x1; px++) {
-            int srx = isx + (px - idx2) * isw / idw;
+            int srx = isx + qx;
+            qx += qxStep;
+            rx += rxStep;
+            if (rx >= idw) { rx -= idw; qx++; }
             if (srx < 0 || srx >= img->w) continue;
-            s->pixels[py * s->stride + px] =
-                blend_over(s->pixels[py * s->stride + px], img->pix[sry * img->w + srx]);
+            u32 sp = srow[srx];
+            u32 sa = sp >> 24;
+            if (sa == 0) continue;
+            if (sa == 0xFF) { drow[px] = sp; continue; }
+            drow[px] = blend_over(drow[px], sp);
         }
     }
 }
