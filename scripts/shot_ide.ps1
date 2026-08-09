@@ -32,7 +32,7 @@ public class WGI{
  public static bool CB(IntPtr h,IntPtr l){
    if(!IsWindowVisible(h))return true;
    var s=new StringBuilder(512);GetWindowText(h,s,512);
-   if(s.ToString().Contains("Zan IDE")){ Found=h; return false; }
+   if(s.ToString().Contains("ZanIDE")||s.ToString().Contains("Zan IDE")){ Found=h; return false; }
    return true;
  }
 }

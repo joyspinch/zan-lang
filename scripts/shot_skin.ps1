@@ -32,7 +32,7 @@ public class WS{
  public static bool CB(IntPtr h,IntPtr l){
    if(!IsWindowVisible(h))return true;
    var s=new StringBuilder(512);GetWindowText(h,s,512);
-   if(s.ToString().Contains("Zan IDE")){ Found=h; return false; }
+   if(s.ToString().Contains("ZanIDE")||s.ToString().Contains("Zan IDE")){ Found=h; return false; }
    return true;
  }
  public static void Wheel(int x,int y,int steps){ SetCursorPos(x,y); System.Threading.Thread.Sleep(120); int i=0; while(i<System.Math.Abs(steps)){ uint d=(uint)(steps>0?120:-120); mouse_event(0x0800,0,0,d,IntPtr.Zero); System.Threading.Thread.Sleep(60); i++; } }

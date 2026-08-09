@@ -21,6 +21,9 @@ class DocsTopic {
     string body;
     string code;
     int section;
+    /// The component this topic shows live, "" when it shows none. It is the
+    /// document's key, so the page never matches on a displayed title.
+    string preview;
 
     static DocsTopic From(DocEntry entry) {
         DocsTopic topic = new DocsTopic();
@@ -29,6 +32,7 @@ class DocsTopic {
         topic.body = entry.Body();
         topic.code = entry.Code();
         topic.section = DocsData.SectionOf(entry.CatEn());
+        topic.preview = entry.Preview();
         return topic;
     }
 }
@@ -118,6 +122,48 @@ class DocsPage {
     static SignalInt docSel;
     static SignalInt docCodeScroll;
 
+    // What the page built last time, and the inputs it was built from. The
+    // page is drawn every frame but its content only changes when one of
+    // these moves, so nothing here is rebuilt per frame: the topics come from
+    // the parsed document, the hits from the query, the rows from the query
+    // and the open section, and the detail pane from the selected topic.
+    static List<DocsTopic> docs;
+    static int docsVer;
+    static int docsLang;
+    static List<int> hits;
+    static string hitQuery;
+    static List<DocTopic> rows;
+    static string rowQuery;
+    static int rowSec;
+    static int shownSel;
+
+    /// This language's topics, rebuilt only when the document is reloaded or
+    /// the UI language changes.
+    static List<DocsTopic> Docs() {
+        int ver = DocsData.Version();
+        if (DocsPage.docs != null && DocsPage.docsVer == ver
+            && DocsPage.docsLang == ZanIDE.uiLang) {
+            return DocsPage.docs;
+        }
+        DocsPage.docs = DocsPage.BuildDocs();
+        DocsPage.docsVer = ver;
+        DocsPage.docsLang = ZanIDE.uiLang;
+        // Everything downstream was built from the old topics.
+        DocsPage.hits = null;
+        DocsPage.rows = null;
+        DocsPage.shownSel = 0 - 2;
+        return DocsPage.docs;
+    }
+
+    /// Which row shows the topic at `doc`, -1 when the rows do not list it.
+    static int RowOf(int doc) {
+        if (doc < 0 || DocsPage.rows == null) { return 0 - 1; }
+        for (int i = 0; i < DocsPage.rows.Count; i = i + 1) {
+            if (DocsPage.rows[i].doc == doc) { return i; }
+        }
+        return 0 - 1;
+    }
+
     /// A picked topic moves the shell's selection signal; a category heading is
     /// not a topic, so it selects nothing.
     static void TopicPicked() {
@@ -156,20 +202,28 @@ class DocsPage {
         Input search = DocsSearchHost.Search();
         SignalInt selSig = DocsTopicList.SelSig();
 
-        List<DocsTopic> docs = DocsPage.BuildDocs();
+        List<DocsTopic> docs = DocsPage.Docs();
 
         // Search box.
         string query = ZanIDE.ToLowerS(search.GetText());
 
         // Entries matching the query, whatever section they live in: the menu
         // opens the groups that have a hit, so a search reaches every section.
-        List<int> hit = new List<int>();
-        for (int fi = 0; fi < docs.Count; fi = fi + 1) {
-            DocsTopic docTopic = docs[fi];
-            string hay = ZanIDE.ToLowerS(docTopic.title + " "
-                + docTopic.category + " " + docTopic.body);
-            if (ZanIDE.ContainsS(hay, query)) { hit.Add(fi); }
+        // Matching the whole document is a per-keystroke cost, not a per-frame
+        // one: the hits stand until the query changes.
+        if (DocsPage.hits == null || DocsPage.hitQuery != query) {
+            List<int> found = new List<int>();
+            for (int fi = 0; fi < docs.Count; fi = fi + 1) {
+                DocsTopic docTopic = docs[fi];
+                string hay = ZanIDE.ToLowerS(docTopic.title + " "
+                    + docTopic.category + " " + docTopic.body);
+                if (ZanIDE.ContainsS(hay, query)) { found.Add(fi); }
+            }
+            DocsPage.hits = found;
+            DocsPage.hitQuery = query;
+            DocsPage.rows = null;
         }
+        List<int> hit = DocsPage.hits;
 
         // The section the rail is on, and a selection that belongs to it.
         // While a query is typed the rail stops filtering: the list is every
@@ -194,65 +248,71 @@ class DocsPage {
 
         // Topic list: the entries of the selected section, or every hit while
         // searching. Sections live in the vertical rail beside the list, so
-        // they never scroll away.
-        List<string> secLabels = new List<string>();
-        for (int sl = 0; sl < DocsData.SectionCount(); sl = sl + 1) {
-            secLabels.Add(DocsData.SectionName(sl));
+        // they never scroll away. The rows are rebuilt when the query or the
+        // open section moves, not once a frame.
+        if (DocsPage.rows == null || DocsPage.rowQuery != query
+            || DocsPage.rowSec != openSec) {
+            List<string> secLabels = new List<string>();
+            for (int sl = 0; sl < DocsData.SectionCount(); sl = sl + 1) {
+                secLabels.Add(DocsData.SectionName(sl));
+            }
+            List<DocTopic> topics = new List<DocTopic>();
+            string lastCat = "";
+            for (int k = 0; k < hit.Count; k = k + 1) {
+                int dix = hit[k];
+                DocsTopic docTopic = docs[dix];
+                if (!searching && docTopic.section != openSec) { continue; }
+                string cat = docTopic.category;
+                // A cross-section result list has to say which section a group
+                // came from, otherwise two identically named categories merge.
+                if (searching) {
+                    cat = DocsData.SectionName(docTopic.section) + " · " + cat;
+                }
+                if (cat != lastCat) {
+                    topics.Add(DocTopic.Header(cat));
+                    lastCat = cat;
+                }
+                topics.Add(DocTopic.Of(dix, docTopic.title));
+            }
+            DocsSectionTabs.Sections(secLabels);
+            DocsTopicList.Rows(topics);
+            DocsPage.rows = topics;
+            DocsPage.rowQuery = query;
+            DocsPage.rowSec = openSec;
+            DocsPage.shownSel = 0 - 2;
         }
 
-        List<DocTopic> topics = new List<DocTopic>();
-        int selRow = 0 - 1;
-        string lastCat = "";
-        for (int k = 0; k < hit.Count; k = k + 1) {
-            int dix = hit[k];
-            DocsTopic docTopic = docs[dix];
-            if (!searching && docTopic.section != openSec) { continue; }
-            string cat = docTopic.category;
-            // A cross-section result list has to say which section a group
-            // came from, otherwise two identically named categories merge.
-            if (searching) {
-                cat = DocsData.SectionName(docTopic.section) + " · " + cat;
-            }
-            if (cat != lastCat) {
-                topics.Add(DocTopic.Header(cat));
-                lastCat = cat;
-            }
-            if (dix == selAbs) { selRow = topics.Count; }
-            topics.Add(DocTopic.Of(dix, docTopic.title));
-        }
-
-        // Push this frame's data into the bridge components. Each of them owns
-        // its widget (and the signals behind it), so only the data flows.
-        string copyLabel = ZanIDE.T("Copy", "复制");
-        DocsSectionTabs.Sections(secLabels);
-        DocsTopicList.Topics(topics, selRow);
-        DocsPreviewHost.preview = "";
         DocsCodeBlockHost.log = log;
-        if (selAbs >= 0) {
-            DocsTagHost.Show(DocsPage.ToUpperCat(docs[selAbs].category),
-                             "primary");
-        }
-
         if (DocsPage.view == null) { DocsPage.view = new DocsView(); }
         DocsView view = DocsPage.view;
-        if (selAbs < 0) {
-            DocsCodeBlockHost.Example("", "", null, copyLabel);
-            view.ShowEmpty(ZanIDE.T("No topics match your search.",
-                                    "没有匹配搜索的主题。"));
-        } else {
-            // Detail pane: category chip, title, rule, wrapped body, live
-            // preview (for widgets) and the copyable code example, inside the
-            // declared ScrollColumn so a long article scrolls in the pane.
-            DocsTopic selected = docs[selAbs];
-            DocsCodeBlockHost.Example(selected.title, selected.code,
-                                      CodeEditor.SplitLines(selected.code),
-                                      copyLabel);
-            bool preview =
-                selected.category == ZanIDE.T("GUI - Widgets", "GUI - 组件");
-            if (preview) { DocsPreviewHost.Show(selected.title); }
-            view.ShowTopic(app, area.width, selected.title, selected.body,
-                           preview);
+
+        // The detail pane follows the selection, so it is written when the
+        // selected topic changes -- not on every frame that shows it.
+        if (DocsPage.shownSel != selAbs) {
+            DocsPage.shownSel = selAbs;
+            DocsTopicList.Select(DocsPage.RowOf(selAbs));
+            string copyLabel = ZanIDE.T("Copy", "复制");
+            DocsPreviewHost.preview = "";
+            if (selAbs < 0) {
+                DocsCodeBlockHost.Example("", "", null, copyLabel);
+                view.ShowEmpty(ZanIDE.T("No topics match your search.",
+                                        "没有匹配搜索的主题。"));
+            } else {
+                // Detail pane: category chip, title, rule, wrapped body, live
+                // preview (for widgets) and the copyable code example, inside
+                // the declared ScrollColumn so a long article scrolls.
+                DocsTopic selected = docs[selAbs];
+                DocsTagHost.Show(DocsPage.ToUpperCat(selected.category),
+                                 "primary");
+                DocsCodeBlockHost.Example(selected.title, selected.code,
+                                          CodeEditor.SplitLines(selected.code),
+                                          copyLabel);
+                bool preview = selected.preview != "";
+                if (preview) { DocsPreviewHost.Show(selected.preview); }
+                view.ShowTopic(selected.title, selected.body, preview);
+            }
         }
+        if (selAbs >= 0) { view.WrapBody(app, area.width); }
         view.MeasureTree(app);
         view.Arrange(area.x, area.y, area.width, area.height);
         view.RenderTree(app);

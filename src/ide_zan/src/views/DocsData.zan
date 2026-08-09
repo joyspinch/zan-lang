@@ -14,9 +14,16 @@ class DocEntry {
     string bodyEn;
     string bodyZh;
     string code;
+    /// The import lines the sample is shown with (from the topic, or from its
+    /// category's default). Empty when the sample already stands alone.
+    List<string> imports;
+    /// The component this topic previews live, "" for topics without one.
+    /// It is a stable key from the document, never a displayed title.
+    string preview;
 
     static DocEntry Of(string catEn, string catZh, string titleEn, string titleZh,
-                       string bodyEn, string bodyZh, string code) {
+                       string bodyEn, string bodyZh, string code,
+                       List<string> imports, string preview) {
         DocEntry d = new DocEntry();
         d.catEn = catEn;
         d.catZh = catZh;
@@ -25,6 +32,8 @@ class DocEntry {
         d.bodyEn = bodyEn;
         d.bodyZh = bodyZh;
         d.code = code;
+        d.imports = imports;
+        d.preview = preview;
         return d;
     }
 
@@ -34,14 +43,32 @@ class DocEntry {
     string Title() { return ZanIDE.T(titleEn, titleZh); }
     string Body() { return ZanIDE.T(bodyEn, bodyZh); }
 
-    /// The sample, with the GUI imports prepended for widget entries so every
-    /// widget snippet compiles as shown.
+    /// The component to preview live next to this topic, "" for none.
+    string Preview() { return preview; }
+
+    /// The sample, with the imports the document asks for prepended, so every
+    /// snippet compiles as shown. Which imports (and whether any) is data:
+    /// nothing here knows what a category is called.
     string Code() {
-        if (catEn == "GUI - Widgets" && !ZanIDE.Has(code, "using Gui;")) {
-            return "using System;\nusing Gui;\nusing Gui.Widget;\n\n" + code;
+        if (imports == null || imports.Count == 0) { return code; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < imports.Count; i = i + 1) {
+            if (ZanIDE.Has(code, imports[i])) { continue; }
+            sb.Append(imports[i]);
+            sb.Append("\n");
         }
-        return code;
+        if (sb.Length == 0) { return code; }
+        sb.Append("\n");
+        sb.Append(code);
+        return sb.ToString();
     }
+}
+
+/// Per-category defaults from the document: the imports its samples are shown
+/// with, so the rule lives next to the content instead of in the page.
+class DocCategoryDef {
+    string en;
+    List<string> imports;
 }
 
 /// One section tab of the Help page and the categories it collects.
@@ -68,8 +95,12 @@ class DocSectionDef {
 class DocsData {
     static List<DocEntry> cache;
     static List<DocSectionDef> sections;
+    static List<DocCategoryDef> categories;
     /// Empty while the document loaded; otherwise why it did not.
     static string loadError;
+    /// Bumped every time the document is parsed. Readers cache what they built
+    /// from it and rebuild when this moves (a reload, a language switch).
+    static int version;
 
     /// The name the document is baked under, and the paths it is looked for on
     /// disk (exe folder first, then the repo working copy).
@@ -92,10 +123,17 @@ class DocsData {
         return Skin.EmbedRead(DocsData.EmbedName());
     }
 
+    /// The generation of the loaded document.
+    static int Version() {
+        DocsData.All();
+        return DocsData.version;
+    }
+
     /// Forgets the parsed document so the next read picks up an edited file.
     static void Reload() {
         DocsData.cache = null;
         DocsData.sections = null;
+        DocsData.categories = null;
     }
 
     /// Every documentation entry, parsed once per process (or after `Reload`).
@@ -103,6 +141,8 @@ class DocsData {
         if (DocsData.cache != null) { return DocsData.cache; }
         DocsData.cache = new List<DocEntry>();
         DocsData.sections = new List<DocSectionDef>();
+        DocsData.categories = new List<DocCategoryDef>();
+        DocsData.version = DocsData.version + 1;
         DocsData.loadError = "";
         string text = DocsData.ReadDocument();
         if (text == "") {
@@ -115,6 +155,7 @@ class DocsData {
             return DocsData.cache;
         }
         DocsData.ParseSections(doc.Get("sections"));
+        DocsData.ParseCategories(doc.Get("categories"));
         DocsData.ParseTopics(doc.Get("topics"));
         return DocsData.cache;
     }
@@ -137,15 +178,50 @@ class DocsData {
         }
     }
 
+    static void ParseCategories(JsonValue arr) {
+        if (arr == null || !arr.IsArray()) { return; }
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            JsonValue c = arr.At(i);
+            DocCategoryDef def = new DocCategoryDef();
+            def.en = c.Str("en", "");
+            def.imports = DocsData.Strings(c.Get("imports"));
+            DocsData.categories.Add(def);
+        }
+    }
+
+    static List<string> Strings(JsonValue arr) {
+        if (arr == null || !arr.IsArray()) { return null; }
+        List<string> lines = new List<string>();
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            lines.Add(arr.At(i).AsString(""));
+        }
+        return lines;
+    }
+
+    /// The imports a topic's sample is shown with: its own when it names them,
+    /// otherwise its category's.
+    static List<string> ImportsFor(JsonValue topic, string catEn) {
+        List<string> own = DocsData.Strings(topic.Get("imports"));
+        if (own != null) { return own; }
+        for (int i = 0; i < DocsData.categories.Count; i = i + 1) {
+            if (DocsData.categories[i].en == catEn) {
+                return DocsData.categories[i].imports;
+            }
+        }
+        return null;
+    }
+
     static void ParseTopics(JsonValue arr) {
         if (arr == null || !arr.IsArray()) { return; }
         for (int i = 0; i < arr.Count(); i = i + 1) {
             JsonValue t = arr.At(i);
+            string catEn = DocsData.Text(t, "cat", "en");
             DocsData.cache.Add(DocEntry.Of(
-                DocsData.Text(t, "cat", "en"), DocsData.Text(t, "cat", "zh"),
+                catEn, DocsData.Text(t, "cat", "zh"),
                 DocsData.Text(t, "title", "en"), DocsData.Text(t, "title", "zh"),
                 DocsData.Text(t, "body", "en"), DocsData.Text(t, "body", "zh"),
-                t.Str("code", "")));
+                t.Str("code", ""), DocsData.ImportsFor(t, catEn),
+                t.Str("preview", "")));
         }
     }
 
