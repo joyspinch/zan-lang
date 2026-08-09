@@ -117,6 +117,8 @@ class App {
     // 上次通过 SetWindowOpacity 设置的整窗不透明度百分比（0 = 从未设置，
     // 视为 100/不透明）。
     int windowOpacity;
+    // 用户能否拖边框 / 最大化改变窗口大小（设计里的 resizable）。
+    bool windowResizable;
     // 窗口轮廓：0 = 矩形，1 = 异形。非零值窗口按
     // 逐像素 alpha（分层窗口）合成；当
     // DWM 关闭时使用经典区域：BeginFrame 将表面完全清除为透明，控件树
@@ -366,6 +368,7 @@ class App {
         this.shapeMode = 0;
         this.shapeRadius = 0;
         this.shapeSpec = "";
+        this.windowResizable = true;
         this.showChrome = true;
         this.showThemeButton = true;
         this.showPinButton = true;
@@ -623,6 +626,22 @@ class App {
         windowOpacity = percent;
         window.SetOpacity(percent);
     }
+
+    /// 用户能否改变窗口大小。关闭后边框不再充当尺寸手柄、
+    /// 双击标题栏不再最大化，标题栏也不再显示最大化按钮
+    /// （一个点了没反应的按钮比没有更糟）。
+    void SetResizable(bool on) {
+        windowResizable = on;
+        window.SetResizable(on);
+        if (!on && showMaximizeButton) {
+            this.SetChromeButtons(showThemeButton, showPinButton,
+                showMinimizeButton, false);
+        }
+        needsRedraw = true;
+    }
+
+    /// 见 SetResizable。
+    bool Resizable() { return windowResizable; }
 
     /// 最近一次通过 SetWindowOpacity 设置的不透明度（未设置时为 100）。
     int WindowOpacity() {
@@ -1052,12 +1071,13 @@ class App {
     void RenderBackground(int x, int y, int w, int h, int slot) {
         Canvas c = canvas;
         Theme t = theme;
-        // 异形窗口：轮廓完全由控件树绘制，因此
-        // 背景保持透明（表面在 BeginFrame 中已清除为 alpha 0，
-        // 由 OS 按像素合成形状）。柔和的投影
-        // （SetWindowShadow）先绘制，位于控件树之下。
+        // 异形窗口：表面在 BeginFrame 里被清成 alpha 0，操作系统
+        // 只负责按轮廓合成，轮廓内的像素仍要自己画——所以这里
+        // 用皮肤底色铺满每个形状区域（先画投影，再铺底），
+        // 设计里没有铺满窗口的背景控件时，窗口才不会整个透明。
         if (shapeMode != 0) {
             if (shapeShadow > 0) { this.PaintShapeShadow(); }
+            this.PaintShapeFill();
             return;
         }
         // 原生玻璃：窗口是一张扁平的半透明薄片（在
@@ -1105,6 +1125,69 @@ class App {
         } else {
             c.FillRect(x, y, w, h, t.bgPrimary);
         }
+    }
+
+    /// 用皮肤底色铺满异形窗口的轮廓（见 RenderBackground）。
+    /// 类型 3 的阴影带只是把系统表面撑大，不参与填充。
+    void PaintShapeFill() {
+        if (shapeRects.Count == 0) { return; }
+        Canvas c = canvas;
+        int col = theme.bgPrimary;
+        int i = 0;
+        while (i + 5 < shapeRects.Count) {
+            int t = shapeRects[i];
+            if (t != 3) {
+                int x = this.Scale(shapeRects[i + 1]);
+                int y = this.Scale(shapeRects[i + 2]);
+                int w = this.Scale(shapeRects[i + 3]);
+                int h = this.Scale(shapeRects[i + 4]);
+                int r = this.Scale(shapeRects[i + 5]);
+                if (t == 2) {
+                    this.FillEllipse(x, y, w, h, col);
+                } else {
+                    c.FillRoundRect(x, y, w, h, r, col);
+                }
+            }
+            i = i + 6;
+        }
+    }
+
+    /// 椭圆填充（渲染器只有正圆），按行扫描：轮廓由
+    /// 操作系统裁剪，这里只要把里面填实。
+    void FillEllipse(int x, int y, int w, int h, int col) {
+        if (w <= 0 || h <= 0) { return; }
+        Canvas c = canvas;
+        int rx = w / 2;
+        int ry = h / 2;
+        if (rx <= 0 || ry <= 0) { return; }
+        int cx = x + rx;
+        int cy = y + ry;
+        for (int dy = 0 - ry; dy <= ry; dy = dy + 1) {
+            int inside = ry * ry - dy * dy;
+            if (inside <= 0) { continue; }
+            int hw = rx * App.ISqrt(inside) / ry;
+            if (hw <= 0) { continue; }
+            c.FillRect(cx - hw, cy + dy, hw * 2, 1, col);
+        }
+    }
+
+    /// 整数平方根（向下取整）。
+    static int ISqrt(int v) {
+        if (v <= 0) { return 0; }
+        int r = 0;
+        int bit = 1073741824;
+        int rest = v;
+        while (bit > rest) { bit = bit / 4; }
+        while (bit != 0) {
+            if (rest >= r + bit) {
+                rest = rest - r - bit;
+                r = (r / 2) + bit;
+            } else {
+                r = r / 2;
+            }
+            bit = bit / 4;
+        }
+        return r;
     }
 
     /// 将异形轮廓的柔和投影绘制到表面，
@@ -2732,7 +2815,13 @@ class App {
     void RunOverlays() {
         for (int i = 0; i < overlays.Count; i = i + 1) {
             OverlayPopup p = overlays[i];
+            // 每个浮层自成一段 id：一个下拉打开时会多领两个
+            // 拦截区 id，若共用一条递增序号，排在它后面的
+            // 浮层（以及浮层里的行）就会整体移位，上一帧解析出的
+            // 点击目标随之对不上——表现为“点了穿透到下面”。
+            focus.PushIds(950000 + i * 1000);
             p.Render(this);
+            focus.PopIds();
         }
     }
 

@@ -262,6 +262,10 @@ class Win32Shell {
     // 系统按钮在子窗口打开的瞬间就不再作为客户区参与命中测试。
     static List<nint> capHwnd;
     static List<int> capCount;
+    // 不可调整大小的窗口（设计里的 resizable = false）。外壳是无
+    // 边框的，尺寸手柄全靠 WM_NCHITTEST 给出，所以“不能拉”
+    // 就是不再把边缘报成手柄，并挡住双击标题栏 / 最大化。
+    static List<nint> fixedHwnd;
     static int imeX;
     static int imeY;
 
@@ -332,6 +336,7 @@ class Win32Shell {
         Win32Shell.ready = true;
         Win32Shell.capHwnd = new List<nint>();
         Win32Shell.capCount = new List<int>();
+        Win32Shell.fixedHwnd = new List<nint>();
         Win32Shell.dpi = 96;
         Win32Shell.titlebarH = 32;
         Win32Shell.buttonW = 46;
@@ -613,6 +618,14 @@ class Win32Shell {
         } else if (msg == 0x0084) {                // WM_NCHITTEST
             return Win32Shell.HitTest(hwnd, Win32Shell.LoWord(lp),
                 Win32Shell.HiWord(lp));
+        } else if (msg == 0x00A3) {                // WM_NCLBUTTONDBLCLK
+            // 双击标题栏默认最大化；固定尺寸的窗口吃掉它。
+            if (!Win32Shell.ResizableOf(hwnd)) { return 0; }
+        } else if (msg == 0x0112) {                // WM_SYSCOMMAND
+            int cmd = ((int)wp) & 0xFFF0;
+            if (!Win32Shell.ResizableOf(hwnd) && (cmd == 0xF030 || cmd == 0xF000)) {
+                return 0;                          // SC_MAXIMIZE / SC_SIZE
+            }
         } else if (msg == 15) {                    // WM_PAINT
             nint ps = NativeMemory.Alloc(72);
             Win32Shell.BeginPaint(hwnd, ps);
@@ -649,7 +662,7 @@ class Win32Shell {
         bool maxed = Win32Shell.IsMaximized(hwnd);
         bool inButtons = y < Win32Shell.titlebarH
             && x >= w - Win32Shell.CaptionButtonsOf(hwnd) * Win32Shell.buttonW;
-        if (!maxed && !inButtons) {
+        if (!maxed && !inButtons && Win32Shell.ResizableOf(hwnd)) {
             bool onLeft = x < b;
             bool onRight = x >= w - b;
             bool onTop = y < b;
@@ -1193,6 +1206,25 @@ class Win32Shell {
             if (Win32Shell.capHwnd[i] == hwnd) { return Win32Shell.capCount[i]; }
         }
         return 5;
+    }
+
+    /// 窗口是否允许用户拖边框 / 最大化改变尺寸（默认允许）。
+    static bool ResizableOf(nint hwnd) {
+        Win32Shell.Init();
+        for (int i = 0; i < Win32Shell.fixedHwnd.Count; i = i + 1) {
+            if (Win32Shell.fixedHwnd[i] == hwnd) { return false; }
+        }
+        return true;
+    }
+
+    static void SetResizable(nint hwnd, bool on) {
+        Win32Shell.Init();
+        List<nint> keep = new List<nint>();
+        for (int i = 0; i < Win32Shell.fixedHwnd.Count; i = i + 1) {
+            if (Win32Shell.fixedHwnd[i] != hwnd) { keep.Add(Win32Shell.fixedHwnd[i]); }
+        }
+        if (!on) { keep.Add(hwnd); }
+        Win32Shell.fixedHwnd = keep;
     }
 
     static void SetCaptionButtons(nint hwnd, int count) {
