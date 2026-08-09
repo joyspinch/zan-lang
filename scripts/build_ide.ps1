@@ -161,8 +161,7 @@ if ($code -ne 0) {
 }
 
 # The IDE's own stylesheet (page layout) ships next to the executable.
-Copy-Item -LiteralPath (Join-Path (Get-Location) "src\ide_zan\ide.css") `
-    -Destination (Join-Path (Get-Location) "build\ide.css") -Force `
-    -ErrorAction SilentlyContinue
+Copy-Item -LiteralPath (Join-Path (Get-Location) "src\ide_zan\assets\ide.css") `
+    -Destination (Join-Path (Get-Location) "build\ide.css") -Force
 
 Write-Output "IDE_BUILD_OK build\ZanIDE.exe"
