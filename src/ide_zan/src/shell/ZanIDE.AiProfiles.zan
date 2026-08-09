@@ -136,35 +136,58 @@ partial class ZanIDE {
     // Error list (parsed from build/run output) + tabbed bottom panel
     // ================================================================
 
-    /// Scans the log for compiler/linker diagnostics of the form
-    /// `...<file>.zan:<line>[:col]: ... message`.
+    /// Scans build output for diagnostics of the form
+    /// `<path>:<line>[:<col>]: error: <message>`. The compiler colours the
+    /// `error` word and reads more than one kind of source (a module, a
+    /// design), so the escapes are stripped and the location is taken as
+    /// "the trailing numeric segments of whatever precedes the marker"
+    /// instead of matching one file extension. A diagnostic with no
+    /// location at all is still recorded, so a failed build never reads as
+    /// "no errors".
     static void ParseErrorList(List<string> log, List<DiagnosticRecord> records) {
         for (int i = 0; i < log.Count; i = i + 1) {
-            string ln = log[i];
-            int idx = ZanIDE.StrFind(ln, ".zan:");
-            if (idx >= 0) {
-                // path: from first non-prefix char up to and including ".zan"
-                int ps = 0;
-                while (ps < ln.Length) {
-                    string pc = ln.Substring(ps, 1);
-                    if (pc == " " || pc == ">" || pc == "\t") { ps = ps + 1; } else { break; }
+            string ln = ZanIDE.TrimLogPrefix(ZanIDE.StripAnsi(log[i]));
+            int ep = ZanIDE.IndexOfStr(ln, ": error:");
+            if (ep < 0) { ep = ZanIDE.IndexOfStr(ln, ": warning:"); }
+            if (ep < 0) {
+                if (ZanIDE.StartsWith(ln, "error:")
+                    || ZanIDE.StartsWith(ln, "warning:")) {
+                    records.Add(new DiagnosticRecord("", "", ln));
                 }
-                string path = ln.Substring(ps, (idx + 4) - ps);
-                int p = idx + 5;
-                string num = "";
-                while (p < ln.Length) {
-                    string ch = ln.Substring(p, 1);
-                    if (ZanIDE.IsDigit(ch)) { num = num + ch; p = p + 1; } else { break; }
-                }
-                if (num.Length > 0) {
-                    string msg = ln;
-                    int me = ZanIDE.StrFind(ln, "error");
-                    if (me < 0) { me = ZanIDE.StrFind(ln, "warning"); }
-                    if (me >= 0) { msg = ln.Substring(me, ln.Length - me); }
-                    records.Add(new DiagnosticRecord(path, num, msg));
-                }
+                continue;
             }
+            string msg = ZanIDE.TrimLeadSpaces(
+                ln.Substring(ep + 2, ln.Length - (ep + 2)));
+            string head = ln.Substring(0, ep);
+            string col = ZanIDE.CutTrailingNumber(head);
+            if (col != "") { head = head.Substring(0, head.Length - (col.Length + 1)); }
+            string line = ZanIDE.CutTrailingNumber(head);
+            if (line != "") { head = head.Substring(0, head.Length - (line.Length + 1)); }
+            // `<path>:<line>:<col>` and `<path>:<line>` both end with the
+            // line, so the outer segment wins when there are two.
+            if (line == "") { line = col; }
+            records.Add(new DiagnosticRecord(head, line, msg));
         }
+    }
+
+    /// The digits of a trailing `:<number>` segment, or "" when the text does
+    /// not end in one.
+    static string CutTrailingNumber(string s) {
+        int p = s.Length;
+        while (p > 0 && ZanIDE.IsDigit(s.Substring(p - 1, 1))) { p = p - 1; }
+        if (p >= s.Length || p == 0) { return ""; }
+        if (s.Substring(p - 1, 1) != ":") { return ""; }
+        return s.Substring(p, s.Length - p);
+    }
+
+    /// Drops the console gutter the log writes in front of a line.
+    static string TrimLogPrefix(string s) {
+        int p = 0;
+        while (p < s.Length) {
+            string c = s.Substring(p, 1);
+            if (c == " " || c == "\t" || c == ">") { p = p + 1; } else { break; }
+        }
+        return s.Substring(p, s.Length - p);
     }
 
     static string DiagnosticName(string msg) {
