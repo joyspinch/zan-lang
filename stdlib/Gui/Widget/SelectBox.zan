@@ -78,6 +78,9 @@ class SelectBox : Control {
     /// 且未按行注册命中区域，因此没有其他机制
     /// 会请求重绘光标下那行的帧。
     int hoverRow;
+    /// 弹层列数：0 = 自动（多选框选项多于一屏时分成等宽多列，
+    /// 而不是拉成一条长条），否则固定列数。
+    int cols;
 
     static int Small() { return 0; }
     static int Medium() { return 1; }
@@ -106,6 +109,7 @@ class SelectBox : Control {
         this.size = 1;
         this.status = 0;
         this.maxVisible = 6;
+        this.cols = 0;
         this.wid = WidgetId.Next();
         this.lastH = 0;
         this.hoverRow = 0 - 1;
@@ -160,6 +164,36 @@ class SelectBox : Control {
             }
         }
         scrollY = 0;
+    }
+
+    /// 固定弹层列数（等宽）；0 恢复自动。选项按列优先填，
+    /// 先从第一列自上而下。
+    SelectBox Columns(int n) {
+        if (n < 0) { n = 0; }
+        cols = n;
+        scrollY = 0;
+        return this;
+    }
+
+    /// 本次开层实际的列数。自动时：单选保持单列（下拉就该是
+    /// 一条列表）；多选超过一屏时按 maxVisible 分列，最多 4 列，
+    /// 这样一屏就能成行成列地看完。
+    int ColumnCount() {
+        if (cols > 0) { return cols; }
+        if (!multi) { return 1; }
+        if (maxVisible <= 0) { return 1; }
+        int n = (opts.Count + maxVisible - 1) / maxVisible;
+        if (n < 1) { n = 1; }
+        if (n > 4) { n = 4; }
+        return n;
+    }
+
+    /// 当前列数下每列的行数。
+    int RowCount() {
+        int n = this.ColumnCount();
+        int rows = (opts.Count + n - 1) / n;
+        if (rows < 1) { rows = 1; }
+        return rows;
     }
 
     int Value() { return selected; }
@@ -389,10 +423,12 @@ class SelectBox : Control {
 
         int ek = app.EventKind();
         int eb = app.window.EventButton();
-        bool leftUp = ek == 3 && eb == 0;
+        // 触发器按几何判断悬停/点击，因此必须问过弹层：直接读
+        // 原始事件时，画在它上面的下拉/菜单/模态的点击会一路
+        // 穿透下来，把这个选择框也打开。
+        bool leftUp = app.ClickAvailable() && eb == 0;
 
-        bool overHead = app.mouseX >= x && app.mouseX < x + w
-            && app.mouseY >= y && app.mouseY < y + h;
+        bool overHead = Ui.Over(app, x, y, w, h);
 
         // 有值时的清除按钮几何（箭头左侧）。
         int partState = Style.StateOf(app, wid, false);
@@ -480,16 +516,19 @@ class SelectBox : Control {
         }
     }
 
-    /// 弹层宽度：不窄于触发器，但至少能放下最长的一条。
-    /// 按触发器宽度开弹层会把每一条都截成同一个前缀，选项之间
-    /// 看不出区别。
+    /// 弹层宽度：不窄于触发器，但至少能放下最长的一条；
+    /// 多列时按列数等宽扩开。按触发器宽度开弹层会把每一条
+    /// 都截成同一个前缀，选项之间看不出区别。
     int PopupWidth(App app, Theme t, int trigWidth, int fs, int arrowSlot) {
-        int w = trigWidth;
+        int n = this.ColumnCount();
+        int colW = trigWidth / n;
         int chrome = t.paddingSmall * 2 + arrowSlot;
         for (int i = 0; i < opts.Count; i = i + 1) {
             int tw = Canvas.MeasureText(opts[i].label, fs) + chrome;
-            if (tw > w) { w = tw; }
+            if (tw > colW) { colW = tw; }
         }
+        int w = colW * n;
+        if (w < trigWidth) { w = trigWidth; }
         int room = app.canvas.Width() - app.Scale(8);
         if (w > room) { w = room; }
         return w;
@@ -514,10 +553,12 @@ class SelectBox : Control {
 
         int ek = app.EventKind();
 
-        int visRows = opts.Count;
+        int nCols = this.ColumnCount();
+        int nRows = this.RowCount();
+        int visRows = nRows;
         if (visRows > maxVisible) { visRows = maxVisible; }
         int viewH = OverlayPopup.FitH(app, visRows * optH);
-        int contentH = opts.Count * optH;
+        int contentH = nRows * optH;
         // 由框架放置，保证列表不超出窗口：
         // 靠近底部边缘时向上翻转，而不是
         // 掉落到窗口末尾内容之下。
@@ -532,10 +573,15 @@ class SelectBox : Control {
         // 在弹层内移动不会改变悬停 id，也不会调度新帧；只有悬停行
         // 真的变了才重绘（每一个鼠标移动事件都重绘一整帧，只要
         // 弹层开着就是持续满载）。
+        int colW = w / nCols;
+        if (colW < 1) { colW = 1; }
         int over = 0 - 1;
         if (overPopup) {
             int row = (app.mouseY - popY + scrollY) / optH;
-            if (row >= 0 && row < opts.Count) { over = row; }
+            int col = (app.mouseX - popX) / colW;
+            if (col >= nCols) { col = nCols - 1; }
+            int idx = col * nRows + row;
+            if (row >= 0 && row < nRows && idx < opts.Count) { over = idx; }
         }
         if (over != hoverRow) {
             hoverRow = over;
@@ -566,7 +612,10 @@ class SelectBox : Control {
 
         c.PushClip(popX, popY, w, viewH);
         for (int i = 0; i < opts.Count; i = i + 1) {
-            int oy = popY + i * optH - scrollY;
+            int oCol = i / nRows;
+            int oRow = i % nRows;
+            int ox = popX + oCol * colW;
+            int oy = popY + oRow * optH - scrollY;
             if (oy + optH > popY && oy < popY + viewH) {
                 bool overRow = i == hoverRow;
                 bool isSel = false;
@@ -580,11 +629,11 @@ class SelectBox : Control {
                 if (isSel) { st = st + Style.SSelected(); }
                 StyleBox row = this.ResolvePartAs(app, "select", "option", "option",
                                                    Class, st);
-                row.Paint(app, popX + 1, oy, w - 2, optH);
+                row.Paint(app, ox + 1, oy, colW - 2, optH);
                 int rowFs = row.FontOr(fs);
                 int rowPad = row.PadLOr(t.paddingSmall);
-                int oMaxW = w - rowPad - arrowSlot - t.paddingSmall;
-                c.DrawText(popX + rowPad,
+                int oMaxW = colW - rowPad - arrowSlot - t.paddingSmall;
+                c.DrawText(ox + rowPad,
                     Canvas.CenterTextY(oy, optH, rowFs),
                     Ellipsis.Fit(opts[i].label, oMaxW, rowFs),
                     row.FgOr(States.Text(t, isSel, false)), rowFs);
@@ -592,7 +641,7 @@ class SelectBox : Control {
                     StyleBox checkStyle = this.ResolvePartAs(app, "select", "checkmark", "",
                                                               Class, st);
                     int checkSize = checkStyle.FontOr(t.iconSizeSmall);
-                    c.DrawGlyphIn("check", popX + w - arrowSlot, oy,
+                    c.DrawGlyphIn("check", ox + colW - arrowSlot, oy,
                         arrowSlot, optH, checkSize,
                         checkStyle.FgOr(checkStyle.AccentOr(row.AccentOr(t.primary))));
                 }
@@ -630,7 +679,10 @@ class SelectBox : Control {
         if (app.ClickAvailable()) {
             if (overPopup) {
                 int rel = app.mouseY - popY + scrollY;
-                int idx = rel / optH;
+                int col = (app.mouseX - popX) / colW;
+                if (col >= nCols) { col = nCols - 1; }
+                if (col < 0) { col = 0; }
+                int idx = col * nRows + rel / optH;
                 if (idx >= 0 && idx < opts.Count) {
                     this.Choose(idx);
                     if (!multi) { this.SetOpen(false); }
