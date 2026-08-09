@@ -442,16 +442,30 @@ class FbStack : Panel {
 class ChoiceGroup : Panel {
     int gapX;
     int gapY;
+    /// 与 children 对齐的选项标签，供 OptionsText 往返（子控件
+    /// 的 label 字段不统一，不能靠 GetProp 读回）。
+    List<string> labels;
 
     void InitChoice() {
         this.InitPanel("choicegroup", 3);
         this.gapX = 16;
         this.gapY = 4;
+        this.labels = new List<string>();
     }
 
     /// 供子类实现：为第 index 个选项构造单个选择控件。
     virtual Control MakeItem(int index, string text) {
         return null;
+    }
+
+    /// 选项以 `a|b|c` 字符串表示（设计器 / .zform 属性往返）。
+    string OptionsText() {
+        string outp = "";
+        for (int i = 0; i < this.labels.Count; i = i + 1) {
+            if (i > 0) { outp = outp + "|"; }
+            outp = outp + this.labels[i];
+        }
+        return outp;
     }
 
     /// 按 "A|B|C" 追加选项（与 SelectBox.SetOptionsText 同一约定）。
@@ -463,13 +477,27 @@ class ChoiceGroup : Panel {
             if (ch == "|" || i == text.Length) {
                 if (current != "") {
                     Control item = this.MakeItem(this.children.Count, current);
-                    if (item != null) { this.Add(item); }
+                    if (item != null) {
+                        this.labels.Add(current);
+                        this.Add(item);
+                    }
                 }
                 current = "";
             } else {
                 current = current + ch;
             }
         }
+    }
+
+    override string GetExtra(string key) {
+        if (key == "options") { return this.OptionsText(); }
+        return "";
+    }
+
+    override bool SetExtra(string key, string val) {
+        if (key != "options") { return false; }
+        this.SetOptionsText(val);
+        return true;
     }
 
     override void OnPaint(App app) {
@@ -537,14 +565,67 @@ class RadioGroup : ChoiceGroup {
     override string Kind() { return "RadioGroup"; }
 }
 
-/// 复选框组：每个选项一个独立的真实 Checkbox。
+/// 复选框组：每个选项一个独立的真实 Checkbox。提供聚合
+/// 查询（IsChecked/CheckedCount）与组级 Change 事件：任一
+/// 选项被用户切换时组事件一并触发，便于表单读取全部勾选。
 class CheckboxGroup : ChoiceGroup {
+    /// 任一子复选框被用户切换时触发（C# 风格：`group.Change += h;`）。
+    UiEvent Change;
+
     CheckboxGroup() {
         this.InitChoice();
+        this.Change = new UiEvent();
     }
 
     override Control MakeItem(int index, string text) {
-        return new Checkbox(text);
+        Checkbox cb = new Checkbox(text);
+        cb.Change.Add(() => { this.Change.Raise(); });
+        return cb;
+    }
+
+    /// 第 index 个选项的勾选状态；越界或该项不是复选框时返回 false。
+    bool IsChecked(int index) {
+        if (index < 0 || index >= this.children.Count) { return false; }
+        Control c = this.children[index];
+        if (c != null && c is Checkbox) { return ((Checkbox)c).IsChecked(); }
+        return false;
+    }
+
+    /// 程序化设置第 index 个选项的勾选状态（不触发组 Change，
+    /// 与 Checkbox.SetChecked 的静默语义一致）。
+    void SetChecked(int index, bool v) {
+        if (index < 0 || index >= this.children.Count) { return; }
+        Control c = this.children[index];
+        if (c != null && c is Checkbox) { ((Checkbox)c).SetChecked(v); }
+    }
+
+    /// 已勾选的选项数。
+    int CheckedCount() {
+        int n = 0;
+        for (int i = 0; i < this.children.Count; i = i + 1) {
+            Control c = this.children[i];
+            if (c != null && c is Checkbox && ((Checkbox)c).IsChecked()) { n = n + 1; }
+        }
+        return n;
+    }
+
+    /// 全选 / 全不选。
+    void SetAllChecked(bool v) {
+        for (int i = 0; i < this.children.Count; i = i + 1) {
+            Control c = this.children[i];
+            if (c != null && c is Checkbox) { ((Checkbox)c).SetChecked(v); }
+        }
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change" || evt == "Toggle") { Change.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        return e;
     }
 
     override string Kind() { return "CheckboxGroup"; }
