@@ -301,6 +301,9 @@ class App {
     // 因此成本降到脏区条带，Present 只上传这些部分。
     bool partialPending;
     bool partialFrame;
+    // 本帧出现了未声明范围的重绘请求（RequestRedraw）：下一帧
+    // 整窗重绘，声明过范围的损伤区不再生效。
+    bool partialBlocked;
     int dmgX;
     int dmgY;
     int dmgW;
@@ -399,6 +402,7 @@ class App {
         this.fxSnapValid = false;
         this.partialPending = false;
         this.partialFrame = false;
+        this.partialBlocked = false;
         this.dmgW = 0;
         this.dmgH = 0;
         this.fxDamage = null;
@@ -1286,6 +1290,48 @@ class App {
         partialPending = true;
     }
 
+    /// 把接下来绘制的区域放进以 `first` 开头的即时模式 id 段，直到
+    /// EndIdScope()。宿主用它隔开各个大区域（功能区、面板、标签条、
+    /// 编辑区）：某个区域这一帧多画 / 少画了控件，也不会让别处的
+    /// id 移位，从而把点击错投到另一个控件上。段之间要留足间隔。
+    void BeginIdScope(int first) { focus.PushIds(first); }
+    void EndIdScope() { focus.PopIds(); }
+
+    /// 声明本次状态变化只改变 [x,y,w,h] 这块像素：下一帧被裁剪
+    /// 到它（与本帧其他声明合并），而不是重绘整个窗口。切换
+    /// 标签页、勾选复选框一类的控件用它取代 RequestRedraw；
+    /// 同一帧里任何 RequestRedraw 都会让下一帧回到整窗重绘。
+    void NoteDamage(int x, int y, int w, int h) {
+        needsRedraw = true;
+        if (partialBlocked || this.HasOverlays()) {
+            partialPending = false;
+            return;
+        }
+        int x0 = x;
+        int y0 = y;
+        int x1 = x + w;
+        int y1 = y + h;
+        if (partialPending) {
+            if (dmgX < x0) { x0 = dmgX; }
+            if (dmgY < y0) { y0 = dmgY; }
+            if (dmgX + dmgW > x1) { x1 = dmgX + dmgW; }
+            if (dmgY + dmgH > y1) { y1 = dmgY + dmgH; }
+        }
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > canvas.Width()) { x1 = canvas.Width(); }
+        if (y1 > canvas.Height()) { y1 = canvas.Height(); }
+        if (x1 - x0 <= 0 || y1 - y0 <= 0) {
+            partialPending = false;
+            return;
+        }
+        dmgX = x0;
+        dmgY = y0;
+        dmgW = x1 - x0;
+        dmgH = y1 - y0;
+        partialPending = true;
+    }
+
     /// 强制下一帧完整重绘（任何非单纯
     /// 悬停移动的情况：滚动、输入、缩放、动画、换肤……）。
     void CancelPartialFrame() {
@@ -1692,6 +1738,10 @@ class App {
     }
 
     void RequestRedraw() {
+        // 未声明范围的重绘：无法知道哪些像素变了，因此
+        // 下一帧整窗重绘（NoteDamage 是声明了范围的那一个）。
+        partialBlocked = true;
+        partialPending = false;
         needsRedraw = true;
         // 由状态（而非单纯悬停移动）请求的重绘可能触及任意
         // 像素，因此它会取消悬停移动在同一事件处理中
@@ -2626,6 +2676,7 @@ class App {
         focus.ResetIds();
         overlays = new List<OverlayPopup>();
         partialFrame = false;
+        partialBlocked = false;
         if (partialPending && dmgW > 0 && dmgH > 0) {
             partialFrame = true;
         }
