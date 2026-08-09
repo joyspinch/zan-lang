@@ -417,6 +417,21 @@ partial class ZanIDE {
                 + "\ntarget = " + target + "\nplatform = " + platforms + "\n";
             if (iconRel != "") { projc = projc + "icon = " + iconRel + "\n"; }
             File.WriteAllText(dir + "/zan.proj", projc);
+        } else if (kind != "custom" && iconRel != "") {
+            // The template shipped its own manifest (so it is a project on
+            // disk too, openable and buildable without being instantiated).
+            // It cannot name the icon that is only copied here, and the
+            // selected platform is not its business either, so both are
+            // completed on the copy.
+            string projc = File.ReadAllText(dir + "/zan.proj");
+            if (ZanIDE.IndexOfStr(projc, "icon =") < 0
+                && ZanIDE.IndexOfStr(projc, "icon=") < 0) {
+                projc = projc + "icon = " + iconRel + "\n";
+            }
+            if (ZanIDE.IndexOfStr(projc, "platform") < 0) {
+                projc = projc + "platform = " + platforms + "\n";
+            }
+            File.WriteAllText(dir + "/zan.proj", projc);
         }
         log.Add("> Created " + typeName + " project for [" + platforms + "] at " + dir + " (template: " + tpl.name + ").");
         return dir;
@@ -1319,15 +1334,15 @@ partial class ZanIDE {
         // Relative paths inside a program (an example's assets/, config/app.json)
         // are written relative to ITS OWN project root, which is not the
         // workspace root when a file is run from outside the workspace (an
-        // examples/game/* source while the workspace is a user project). Anchor
-        // on the nearest ancestor of the source file that marks a project.
+        // examples/game/* source while the workspace is a user project), so the
+        // same owner the build used decides the working directory (TargetRoot).
+        // A `.git` ancestor is deliberately NOT a fallback here: it made a
+        // manifest-less example run from the whole repository, where its
+        // assets/ do not resolve.
+        string troot = ZanIDE.TargetRoot(root, target);
+        if (troot != "" && Directory.Exists(troot)) { return troot; }
         string d = ZanIDE.DirOf(target);
-        for (int up = 0; d != "" && up < 24; up = up + 1) {
-            if (File.Exists(d + "/zan.proj") || Directory.Exists(d + "/.git")) { return d; }
-            string parent = ZanIDE.DirOf(d);
-            if (parent == d) { break; }
-            d = parent;
-        }
+        if (d != "" && Directory.Exists(d)) { return d; }
         if (root != "" && Directory.Exists(root)) { return root; }
         return ZanIDE.DirOf(exe);
     }
@@ -1351,24 +1366,50 @@ partial class ZanIDE {
         return "";
     }
 
+    /// The project that owns `target`: its nearest ancestor holding a zan.proj,
+    /// else the open project when the file lives inside it, else the file's own
+    /// directory. Everything derived from a build -- output directory, library
+    /// vs. program, subsystem, icon, working directory -- has to key on THIS
+    /// root and not on whatever project the IDE happens to have open: running
+    /// an example while another project was open put `.zanrun.exe` into that
+    /// other project's `.build`, so the example silently launched the other
+    /// program and, once it was running and holding the file, the next build
+    /// failed to link ("cannot open output file ... Permission denied").
+    static string TargetRoot(string root, string target) {
+        string owner = ZanIDE.FindProjectRoot(target);
+        if (owner != "") { return owner; }
+        string dir = ZanIDE.DirOf(target);
+        // A manifest-less folder opened as the project keeps its own root, so
+        // its files still share one .build; a file from outside it does not.
+        if (root != "" && ZanIDE.StartsWith(ZanIDE.NormSlashes(target) + "/",
+                                            ZanIDE.NormSlashes(root) + "/")) {
+            return root;
+        }
+        if (dir == "" || dir == ".") { return root; }
+        return dir;
+    }
+
     /// Starts a DETACHED Run build of `target` and returns the executable it
     /// will produce, so every caller (Run ribbon, hot reload, the Tools panel)
     /// only has to record the poll state. The stale exe is removed first so a
     /// failed compile cannot look like a successful one.
     static string RunBuildBegin(string root, string target) {
-        string bd = ZanIDE.EnsureBuildDir(root);
+        string troot = ZanIDE.TargetRoot(root, target);
+        string bd = ZanIDE.EnsureBuildDir(troot);
         string exe = bd + "/.zanrun" + ZanIDE.ExeSuffix();
-        if (ZanIDE.IsLibraryProject(root)) {
+        if (ZanIDE.IsLibraryProject(troot)) {
             // Library project: build the platform's shared library (zanc picks
             // library output from the -o extension) instead of a runnable exe.
-            string baseName = Path.GetFileName(root);
+            string baseName = Path.GetFileName(troot);
             if (baseName == "") { baseName = "lib"; }
             exe = bd + "/" + baseName + ZanIDE.HostLibExt();
         }
         if (File.Exists(exe)) { File.Delete(exe); }
-        string inputs = ZanIDE.SmartInputs(root, ZanIDE.DirOf(target), target);
+        string inputs = ZanIDE.InputsArg(bd, ".zanrun_inputs",
+            ZanIDE.SmartInputs(troot, ZanIDE.DirOf(target), target));
         ZanIDE.BuildDetach(
-            ZanIDE.CompileToExe(root, target, inputs, bd + "/.zanrun.ll", exe, false, false));
+            ZanIDE.CompileToExe(troot, target, inputs, bd + "/.zanrun.ll", exe, false, false),
+            bd);
         return exe;
     }
 
@@ -1413,7 +1454,8 @@ partial class ZanIDE {
     static void EmitSymbolsDetach(string root, string target) {
         string idx = ZanIDE.SymbolIndexPath(root);
         string tmp = idx + ".tmp";
-        string inputs = ZanIDE.SmartInputs(root, ZanIDE.DirOf(target), target);
+        string inputs = ZanIDE.InputsArg(ZanIDE.EnsureBuildDir(root), ".symbols_inputs",
+            ZanIDE.SmartInputs(root, ZanIDE.DirOf(target), target));
         string cmd = ZanIDE.ZancCmd() + " --emit-symbols \"" + tmp + "\" " + inputs
             + " --auto-stdlib";
         #if WINDOWS
@@ -1493,18 +1535,66 @@ partial class ZanIDE {
     /// Runs `cmd` detached, teeing its output into BuildLogPath and dropping
     /// BuildDonePath on completion. The main loop polls both to stream compiler
     /// output and, once done, apply diagnostics + launch the built program.
-    static void BuildDetach(string cmd) {
+    static void BuildDetach(string cmd, string bd) {
         ZanIDE.EnsureCacheDir();
         File.WriteAllText(ZanIDE.BuildLogPath(), "");
         if (File.Exists(ZanIDE.BuildDonePath())) { File.Delete(ZanIDE.BuildDonePath()); }
+        List<string> steps = new List<string>();
+        steps.Add(cmd);
+        ZanIDE.ScriptSeqDetach(steps, ZanIDE.BuildLogPath(), ZanIDE.BuildDonePath(),
+                               bd, "zanbuild");
+    }
+
+    /// Runs `steps` detached, one command per script line, teeing all output
+    /// into `logPath` and writing the combined exit status ("ok" / "fail") to
+    /// `donePath`. Every step runs even if an earlier one fails, matching the
+    /// previous `&`-chained behaviour, but a failure is now REPORTED instead of
+    /// being inferred from which outputs happen to exist.
+    ///
+    /// A script (rather than one long command line) is what makes a many-target
+    /// publish work at all: a command line above the shell's limit -- 8191
+    /// characters for cmd.exe -- is not run, and since the redirection is part
+    /// of that same line the failure leaves no log and no marker, which is
+    /// exactly how a publish came to hang on "Publishing ..." forever.
+    static void ScriptSeqDetach(List<string> steps, string logPath, string donePath,
+                                string bd, string name) {
+        StringBuilder sb = new StringBuilder();
         #if WINDOWS
-        string sep = " & ";
+        sb.Append("@echo off\r\nset ZANFAIL=0\r\n");
+        for (int i = 0; i < steps.Count; i = i + 1) {
+            sb.Append("(" + steps[i] + ") >> \"" + logPath + "\" 2>&1\r\n");
+            sb.Append("if errorlevel 1 set ZANFAIL=1\r\n");
+        }
+        sb.Append("if \"%ZANFAIL%\"==\"0\" (echo ok> \"" + donePath + "\") "
+            + "else (echo fail> \"" + donePath + "\")\r\n");
+        string path = bd + "/" + name + ".cmd";
+        File.WriteAllText(path, sb.ToString());
+        int rc = Process.RunDetached("cmd /c \"" + ZanIDE.ToWinPath(path) + "\"");
+        // A shell that never started writes neither log nor marker, and the
+        // caller would poll for a result that can never arrive: report the
+        // failure through the same marker the poll already reads.
+        if (rc != 0) { File.WriteAllText(donePath, "fail"); }
         #else
-        string sep = " ; ";
+        sb.Append("#!/bin/sh\nfail=0\n");
+        for (int i = 0; i < steps.Count; i = i + 1) {
+            sb.Append("(" + steps[i] + ") >> \"" + logPath + "\" 2>&1 || fail=1\n");
+        }
+        sb.Append("if [ $fail -eq 0 ] ; then echo ok > \"" + donePath + "\" ;"
+            + " else echo fail > \"" + donePath + "\" ; fi\n");
+        string path = bd + "/" + name + ".sh";
+        File.WriteAllText(path, sb.ToString());
+        int rc = Process.RunDetached("sh \"" + path + "\"");
+        if (rc != 0) { File.WriteAllText(donePath, "fail"); }
         #endif
-        string run = "((" + cmd + ") >> \"" + ZanIDE.BuildLogPath() + "\" 2>&1)"
-            + sep + "echo ok > \"" + ZanIDE.BuildDonePath() + "\"";
-        Process.RunDetached(run);
+    }
+
+    /// True when the finished detached command reported success. An unreadable
+    /// or empty marker counts as failure: a build whose status we cannot see is
+    /// not one to launch.
+    static bool DoneOk(string donePath) {
+        if (!File.Exists(donePath)) { return false; }
+        string st = File.ReadAllText(donePath).Trim();
+        return st == "ok";
     }
 
     /// Appends new complete lines of the detached build's log to the Output tab.
@@ -1560,14 +1650,14 @@ partial class ZanIDE {
         Directory.CreateDirectory(root + "/publish");
         string bd = ZanIDE.EnsureBuildDir(root);
         string zc = ZanIDE.ZancCmd();
-        string inputs = ZanIDE.ProjectInputs(ZanIDE.DirOf(p), p, "");
+        // One response file for every target's compile: a publish chains
+        // several whole-project commands, so inline inputs blow past the
+        // shell's command-line limit and nothing runs (the publish then hung
+        // forever on "Publishing ..." with an empty log).
+        string inputs = ZanIDE.InputsArg(bd, ".zanpub_inputs",
+            ZanIDE.ProjectInputs(ZanIDE.DirOf(p), p, ""));
         string baseName = Path.GetFileName(root);
-        #if WINDOWS
-        string sep = " & ";
-        #else
-        string sep = " ; ";
-        #endif
-        string seq = "";
+        List<string> steps = new List<string>();
         bool isLib = ZanIDE.IsLibraryProject(root);
         bool wantPack = ZanIDE.ProjSingleFile(root) && !isLib;
         bool pack = ZanIDE.CanPackSingle() && wantPack;
@@ -1628,9 +1718,8 @@ partial class ZanIDE {
                         if (id == "linux-x64") { ct = "linux-musl"; }
                         ct = " --target " + ct;
                     }
-                    if (seq != "") { seq = seq + sep; }
-                    seq = seq + "(" + zc + pubFlag + ct + " " + inputs
-                        + " -o \"" + lib + "\")";
+                    steps.Add(zc + pubFlag + ct + " " + inputs
+                        + " -o \"" + lib + "\"");
                     exes.Add(lib);
                     log.Add("> Publishing " + id + " library ...");
                     // Optional static archive next to the shared library
@@ -1639,15 +1728,14 @@ partial class ZanIDE {
                     if (ZanIDE.ProjStaticLib(root)) {
                         string slib = outDir + "/" + baseName + "-" + id
                             + ZanIDE.StaticLibExtFor(id);
-                        seq = seq + sep + "(" + zc + pubFlag + ct + " "
-                            + inputs + " -o \"" + slib + "\")";
+                        steps.Add(zc + pubFlag + ct + " "
+                            + inputs + " -o \"" + slib + "\"");
                         exes.Add(slib);
                         log.Add("> Publishing " + id + " static library ...");
                     }
                 } else if (id == "windows-x64") {
                     string exe = outDir + "/" + baseName + "-windows-x64.exe";
                     string ll = bd + "/.zanpub_x64.ll";
-                    if (seq != "") { seq = seq + sep; }
                     if (pack) {
                         // Compile into a staging dir (zanc drops any driver DLLs
                         // next to the exe there), add the project resources, then
@@ -1656,16 +1744,15 @@ partial class ZanIDE {
                         string sexe = stage + "/" + baseName + "-windows-x64.exe";
                         ZanIDE.CopyResources(root, stage, log);
                         ZanIDE.CopyThemeSkins(root, stage, log);
-                        seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, ll, sexe, !dbg, dbg)
-                            + " && " + ZanIDE.PackCmd(root, stage, exe) + ")";
+                        steps.Add(ZanIDE.CompileToExe(root, p, inputs, ll, sexe, !dbg, dbg)
+                            + " && " + ZanIDE.PackCmd(root, stage, exe));
                     } else {
-                        seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, ll, exe, !dbg, dbg) + ")";
+                        steps.Add(ZanIDE.CompileToExe(root, p, inputs, ll, exe, !dbg, dbg));
                     }
                     exes.Add(exe);
                     log.Add("> Publishing windows-x64 ...");
                 } else if (id == "windows-arm64") {
                     string exe = outDir + "/" + baseName + "-windows-arm64.exe";
-                    if (seq != "") { seq = seq + sep; }
                     // Cross-compile ARM64 through zanc's bundled toolchain
                     // (win-arm64 target) -- no external clang needed.
                     if (pack) {
@@ -1673,10 +1760,10 @@ partial class ZanIDE {
                         string sexe = stage + "/" + baseName + "-windows-arm64.exe";
                         ZanIDE.CopyResources(root, stage, log);
                         ZanIDE.CopyThemeSkins(root, stage, log);
-                        seq = seq + "(" + ZanIDE.CompileToExeCross(root, p, inputs, sexe, "win-arm64", dbg)
-                            + " && " + ZanIDE.PackCmd(root, stage, exe) + ")";
+                        steps.Add(ZanIDE.CompileToExeCross(root, p, inputs, sexe, "win-arm64", dbg)
+                            + " && " + ZanIDE.PackCmd(root, stage, exe));
                     } else {
-                        seq = seq + "(" + ZanIDE.CompileToExeCross(root, p, inputs, exe, "win-arm64", dbg) + ")";
+                        steps.Add(ZanIDE.CompileToExeCross(root, p, inputs, exe, "win-arm64", dbg));
                     }
                     exes.Add(exe);
                     log.Add("> Publishing windows-arm64 ...");
@@ -1687,34 +1774,31 @@ partial class ZanIDE {
                     // Cocoa driver). Either way the output is a bare Mach-O, so
                     // there is no single-file pack step.
                     string exe = outDir + "/" + baseName + "-" + id;
-                    if (seq != "") { seq = seq + sep; }
                     if (id == hostId) {
-                        seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, "", exe, !dbg, dbg) + ")";
+                        steps.Add(ZanIDE.CompileToExe(root, p, inputs, "", exe, !dbg, dbg));
                     } else {
-                        seq = seq + "(" + ZanIDE.CompileToExeCross(root, p, inputs, exe, id, dbg) + ")";
+                        steps.Add(ZanIDE.CompileToExeCross(root, p, inputs, exe, id, dbg));
                     }
                     exes.Add(exe);
                     log.Add("> Publishing " + id + " ...");
                 } else if (id == "linux-x64") {
                     // Self-contained musl static single file (cross from any host).
                     string exe = outDir + "/" + baseName + "-linux-x64";
-                    if (seq != "") { seq = seq + sep; }
-                    seq = seq + "(" + zc + pubFlag + " " + inputs
-                        + " --target linux-musl --link-mode static -o \"" + exe + "\")";
+                    steps.Add(zc + pubFlag + " " + inputs
+                        + " --target linux-musl --link-mode static -o \"" + exe + "\"");
                     exes.Add(exe);
                     log.Add("> Publishing linux-x64 ...");
                 } else if (id == "linux-arm64") {
                     // Same musl static path as linux-x64; only triple/sysroot differ.
                     string exe = outDir + "/" + baseName + "-linux-arm64";
-                    if (seq != "") { seq = seq + sep; }
-                    seq = seq + "(" + zc + pubFlag + " " + inputs
-                        + " --target linux-arm64 --link-mode static -o \"" + exe + "\")";
+                    steps.Add(zc + pubFlag + " " + inputs
+                        + " --target linux-arm64 --link-mode static -o \"" + exe + "\"");
                     exes.Add(exe);
                     log.Add("> Publishing linux-arm64 ...");
                 }
             }
         }
-        if (seq == "") {
+        if (steps.Count == 0) {
             log.Add("> No target selected; nothing published.");
             return exes;
         }
@@ -1726,9 +1810,12 @@ partial class ZanIDE {
         ZanIDE.EnsureCacheDir();
         File.WriteAllText(ZanIDE.PubLogPath(), "");
         if (File.Exists(ZanIDE.PubDonePath())) { File.Delete(ZanIDE.PubDonePath()); }
-        string run = "((" + seq + ") >> \"" + ZanIDE.PubLogPath() + "\" 2>&1)"
-            + sep + "echo ok > \"" + ZanIDE.PubDonePath() + "\"";
-        Process.RunDetached(run);
+        // One script line per target: even with response files for the inputs,
+        // chaining every target into a single command line adds up, and a
+        // truncated command line fails silently (no log, no marker, a publish
+        // that never finishes).
+        ZanIDE.ScriptSeqDetach(steps, ZanIDE.PubLogPath(), ZanIDE.PubDonePath(),
+                               bd, "zanpub");
         return exes;
     }
 

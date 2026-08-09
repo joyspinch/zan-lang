@@ -3,8 +3,16 @@
  * package_games.ps1 appends a zip payload (game exe + SDL DLLs + assets) and a
  * 16-byte footer: <8-byte LE payload size> "ZANPKG1\0". On launch the stub
  * extracts the payload to %LOCALAPPDATA%\ZanGames\<exe-name>\ (skipped when the
- * cache already holds this exact payload) and starts the inner game with that
- * directory as its working directory, so asset paths resolve.
+ * cache already holds this exact payload) and starts the inner program with
+ * the LAUNCHER's OWN directory as its working directory.
+ *
+ * The working directory is deliberately not the extraction directory: a
+ * program launched there resolves every relative path -- including everything
+ * it writes: save games, logs, config -- inside a per-user cache the next
+ * publish replaces, which is not where the user put the program. Bundled
+ * read-only resources are still found: the payload directory is exported as
+ * ZAN_PKG_DIR and the runtime retries a relative read there (see
+ * zan_pkg_fopen in src/runtime/rt_file.c).
  *
  * Extraction hands the launcher itself to bsdtar (tar.exe, shipped with Windows
  * since 10/1803): libarchive finds the zip's end-of-central-directory record
@@ -191,8 +199,10 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
     char *sl = strrchr(selfdir, '\\');
     if (sl) *sl = 0;
     SetEnvironmentVariableA("ZAN_APP_DIR", selfdir);
+    /* where the payload was unpacked, for the runtime's read fallback */
+    SetEnvironmentVariableA("ZAN_PKG_DIR", dir);
 
-    /* launch the real program with the extraction dir as cwd: game.exe when
+    /* launch the real program from the LAUNCHER's directory: game.exe when
      * present (game packages), otherwise <stub-basename>.exe (app packages) */
     char game[MAX_PATH];
     snprintf(game, MAX_PATH, "%s\\game.exe", dir);
@@ -200,7 +210,8 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
         snprintf(game, MAX_PATH, "%s\\%s.exe", dir, base);
     STARTUPINFOA si; PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
-    if (!CreateProcessA(game, NULL, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi))
+    if (!CreateProcessA(game, NULL, NULL, NULL, FALSE, 0, NULL, selfdir, &si,
+                        &pi))
         die("failed to start program");
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
     return 0;

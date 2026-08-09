@@ -1,0 +1,130 @@
+using System;
+
+namespace SDL3;
+
+/// <summary>音频设备：一次打开，之后所有声音都混到这一个设备上。
+///
+/// <see cref="SdlAudioClip"/> 是解码好的 WAV 采样，
+/// <see cref="SdlVoice"/> 是它的一次播放；同一个 clip 可以同时起多个
+/// voice（叠加音效），混音由 SDL 完成。</summary>
+class SdlAudio {
+    /// <summary>打开默认播放设备（已打开时直接返回 true）。</summary>
+    static bool Open() {
+        return SdlNative.zan_audio_open() != 0;
+    }
+
+    static bool IsOpen() {
+        return SdlNative.zan_audio_is_open() != 0;
+    }
+
+    /// <summary>主音量（0..1，可放大到 1 以上）。对已经在响的声音同样
+    /// 生效，所以静音/淡出立即听得到。</summary>
+    static void SetVolume(double volume) {
+        SdlNative.zan_audio_set_volume(volume);
+    }
+
+    static double Volume() {
+        return SdlNative.zan_audio_volume();
+    }
+
+    /// <summary>SDL 选中的音频驱动名（wasapi、pulseaudio、dummy…）。</summary>
+    static string DriverName() {
+        return SdlNative.zan_audio_driver_name();
+    }
+
+    /// <summary>还在响的声音数：一次性音效播完即回收，不用调用方登记。</summary>
+    static int ActiveVoices() {
+        return SdlNative.zan_audio_active_voices();
+    }
+
+    /// <summary>立刻停掉所有声音（切场景/退出时用）。</summary>
+    static void StopAll() {
+        SdlNative.zan_audio_stop_all();
+    }
+
+    /// <summary>关闭设备，并停掉设备上剩下的声音。</summary>
+    static void Close() {
+        SdlNative.zan_audio_close();
+    }
+}
+
+/// <summary>一次播放（voice）。
+///
+/// 句柄带世代号：声音播完后句柄失效，<see cref="IsPlaying"/> 老实返回
+/// false、<see cref="Stop"/> 什么也不做，因此一个存活时间比声音长的
+/// SdlVoice 变量是安全的，不会碰到被回收的槽位。</summary>
+class SdlVoice {
+    long handle;
+
+    /// <summary>包装一个原生 voice 句柄；0 表示没起来的声音，此时对象
+    /// 依然可用（IsPlaying 为 false），调用方不需要判空。</summary>
+    static SdlVoice Of(long handle) {
+        SdlVoice voice = new SdlVoice();
+        voice.handle = handle;
+        return voice;
+    }
+
+    /// <summary>声音是否成功起播（设备没开、voice 池满时为 false）。</summary>
+    bool IsValid() { return this.handle != 0; }
+
+    bool IsPlaying() {
+        return SdlNative.zan_audio_voice_playing(this.handle) != 0;
+    }
+
+    /// <summary>这一个声音的音量（会再乘上主音量）。</summary>
+    void SetGain(double gain) {
+        SdlNative.zan_audio_voice_set_gain(this.handle, gain);
+    }
+
+    void Stop() {
+        SdlNative.zan_audio_voice_stop(this.handle);
+        this.handle = 0;
+    }
+}
+
+/// <summary>加载到内存的 WAV 采样。<see cref="Play"/> 每次返回一个新的
+/// <see cref="SdlVoice"/>，所以同一个 clip 可以叠着响。</summary>
+class SdlAudioClip {
+    nint handle;
+
+    /// <summary>加载 WAV 文件。失败时返回的对象 IsValid() 为 false
+    /// （原因见 <c>Sdl.Error()</c>），不返回 null。</summary>
+    static SdlAudioClip LoadWav(string path) {
+        SdlAudioClip clip = new SdlAudioClip();
+        clip.handle = SdlNative.zan_audio_load_wav(path);
+        return clip;
+    }
+
+    bool IsValid() { return this.handle != 0; }
+
+    /// <summary>采样率（Hz）。</summary>
+    int Frequency() { return SdlNative.zan_audio_clip_frequency(this.handle); }
+
+    int Channels() { return SdlNative.zan_audio_clip_channels(this.handle); }
+
+    int DurationMs() { return SdlNative.zan_audio_clip_duration_ms(this.handle); }
+
+    /// <summary>用默认音量播一次。</summary>
+    SdlVoice Play() {
+        return this.Play(1.0, 0);
+    }
+
+    /// <summary>播一次。<paramref name="gain"/> 是这一个声音的音量，
+    /// <paramref name="loop"/> 非 0 表示循环（背景音乐）。</summary>
+    SdlVoice Play(double gain, int loop) {
+        return SdlVoice.Of(SdlNative.zan_audio_play(this.handle, gain, loop));
+    }
+
+    /// <summary>循环播放，直到 <see cref="SdlVoice.Stop"/>。</summary>
+    SdlVoice PlayLooping(double gain) {
+        return this.Play(gain, 1);
+    }
+
+    /// <summary>释放采样，并停掉还在读它的声音。</summary>
+    void Close() {
+        if (this.handle != 0) {
+            SdlNative.zan_audio_free_clip(this.handle);
+            this.handle = 0;
+        }
+    }
+}

@@ -66,7 +66,19 @@ int zan_gen_cache_dir(char *dir, size_t dir_size) {
     base = getenv("LOCALAPPDATA");
     if (!base || !*base) return -1;
     if (snprintf(dir, dir_size, "%s\\Zan\\gen", base) <= 0) return -1;
-    CreateDirectoryA(dir, NULL); /* ok if it already exists */
+    /* Create every missing level: CreateDirectory only makes the last one, so
+     * a machine without %LOCALAPPDATA%\Zan yet got no cache directory at all
+     * and the generator compile failed with "cannot emit object file". */
+    for (char *p = dir + 1; *p; p++) {
+        if (*p != '\\' && *p != '/') continue;
+        char sep = *p;
+        *p = '\0';
+        CreateDirectoryA(dir, NULL); /* ok if it already exists */
+        *p = sep;
+    }
+    if (!CreateDirectoryA(dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        return -1;
+    }
     return 0;
 #else
     base = getenv("XDG_CACHE_HOME");

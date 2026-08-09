@@ -1331,9 +1331,121 @@ static void print_usage(void) {
     fprintf(stderr, "  -D<name>[=value] Define preprocessor symbol\n");
     fprintf(stderr, "  --version, -v    Print version and exit\n");
     fprintf(stderr, "  --help, -h       Show this help and exit\n");
+    fprintf(stderr, "  @<file>          Read further arguments from <file> (one per line or\n");
+    fprintf(stderr, "                   whitespace separated, \"quoted\" for paths with spaces)\n");
+}
+
+/* Argument lists grow past what a shell accepts long before a project is big:
+ * cmd.exe truncates a command line at 8191 characters, which a whole-project
+ * build of a few dozen sources plus absolute paths reaches easily. `@file`
+ * moves those arguments into a file, the way linkers and other compilers take
+ * response files. Tokens are whitespace-separated, "quoted" when they contain
+ * spaces, and `#` starts a comment line. */
+typedef struct {
+    char **items;
+    int count;
+    int cap;
+} arg_list_t;
+
+static void arg_list_push(arg_list_t *list, char *item) {
+    if (list->count == list->cap) {
+        list->cap = list->cap ? list->cap * 2 : 32;
+        list->items = (char **)realloc(list->items, sizeof(char *) * (size_t)list->cap);
+        if (!list->items) {
+            fprintf(stderr, "error: out of memory expanding arguments\n");
+            exit(1);
+        }
+    }
+    list->items[list->count++] = item;
+}
+
+static bool expand_arg_file(const char *path, arg_list_t *out, int depth);
+
+/* Appends one argument, expanding a nested `@file` (bounded, so a response
+ * file that names itself cannot loop forever). */
+static void arg_list_add(arg_list_t *out, const char *token, int depth) {
+    if (token[0] == '@' && token[1] != '\0') {
+        if (!expand_arg_file(token + 1, out, depth + 1)) { exit(1); }
+        return;
+    }
+    char *copy = strdup(token);
+    if (!copy) {
+        fprintf(stderr, "error: out of memory expanding arguments\n");
+        exit(1);
+    }
+    arg_list_push(out, copy);
+}
+
+static bool expand_arg_file(const char *path, arg_list_t *out, int depth) {
+    if (depth > 8) {
+        fprintf(stderr, "error: argument file '%s' nested too deeply\n", path);
+        return false;
+    }
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "error: cannot open argument file '%s'\n", path);
+        return false;
+    }
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (size < 0) { fclose(fp); return false; }
+    char *text = (char *)malloc((size_t)size + 1);
+    if (!text) { fclose(fp); return false; }
+    size_t got = fread(text, 1, (size_t)size, fp);
+    fclose(fp);
+    text[got] = '\0';
+
+    char *token = (char *)malloc(got + 1);
+    if (!token) { free(text); return false; }
+    size_t i = 0;
+    /* Editors and PowerShell write UTF-8 with a BOM; it would otherwise glue
+     * itself to the first argument. */
+    if (got >= 3 && (unsigned char)text[0] == 0xEF && (unsigned char)text[1] == 0xBB
+        && (unsigned char)text[2] == 0xBF) {
+        i = 3;
+    }
+    while (i < got) {
+        while (i < got && (unsigned char)text[i] <= ' ') { i++; }
+        if (i >= got) { break; }
+        if (text[i] == '#') {
+            while (i < got && text[i] != '\n') { i++; }
+            continue;
+        }
+        size_t n = 0;
+        bool quoted = false;
+        while (i < got) {
+            char c = text[i];
+            if (c == '"') { quoted = !quoted; i++; continue; }
+            if (!quoted && (unsigned char)c <= ' ') { break; }
+            token[n++] = c;
+            i++;
+        }
+        token[n] = '\0';
+        if (n > 0) { arg_list_add(out, token, depth); }
+    }
+    free(token);
+    free(text);
+    return true;
+}
+
+/* Rewrites argv with every `@file` replaced by the arguments it holds. */
+static void expand_arg_files(int *argc, char ***argv) {
+    bool any = false;
+    for (int i = 1; i < *argc; i++) {
+        if ((*argv)[i][0] == '@' && (*argv)[i][1] != '\0') { any = true; break; }
+    }
+    if (!any) { return; }
+    arg_list_t out = {NULL, 0, 0};
+    arg_list_add(&out, (*argv)[0], 0);
+    for (int i = 1; i < *argc; i++) { arg_list_add(&out, (*argv)[i], 0); }
+    arg_list_push(&out, NULL);
+    *argc = out.count - 1;
+    *argv = out.items;
 }
 
 int main(int argc, char **argv) {
+    expand_arg_files(&argc, &argv);
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
             printf("zanc %s\n", ZAN_VERSION);

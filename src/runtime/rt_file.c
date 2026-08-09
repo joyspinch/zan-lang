@@ -91,8 +91,61 @@ long long zan_file_length(const char *path) {
 #endif
 }
 
+/* Packaged (single-file) programs: a launcher that had to unpack a payload
+ * exports ZAN_PKG_DIR pointing at the unpacked directory and starts the program
+ * with the LAUNCHER's own directory as its working directory -- running from a
+ * per-user cache directory is wrong for everything the program writes, and it
+ * is what made a published single-file app operate on the extraction path.
+ * Read-only resources still live in the payload, so a relative path that does
+ * not exist in the working directory is retried there.
+ *
+ * Writes never take this path: a program that creates `save/state.json` must
+ * create it next to itself, not inside a cache the next publish replaces.
+ *
+ * Returns `out` on success, NULL when there is nothing to try. */
+static const char *zan_pkg_path(const char *path, char *out, size_t cap) {
+    if (!path || !path[0]) return NULL;
+    /* absolute or drive-relative: nothing to resolve */
+    if (path[0] == '/' || path[0] == '\\') return NULL;
+    if (path[1] == ':') return NULL;
+    const char *base = getenv("ZAN_PKG_DIR");
+    if (!base || !base[0]) return NULL;
+    size_t bl = strlen(base);
+    size_t pl = strlen(path);
+    if (bl + pl + 2 > cap) return NULL;
+    memcpy(out, base, bl);
+    out[bl] = '/';
+    memcpy(out + bl + 1, path, pl + 1);
+    return out;
+}
+
+/* fopen() that falls back to the unpacked payload for reads (see
+ * zan_pkg_path). The stdlib's read paths import this instead of fopen so a
+ * packaged program finds its resources without being run from the cache. */
+void *zan_pkg_fopen(const char *path, const char *mode) {
+    FILE *f = fopen(path, mode);
+    if (f) return f;
+    if (!mode || mode[0] != 'r') return NULL;
+    if (strchr(mode, '+')) return NULL;
+    char alt[4096];
+    const char *p = zan_pkg_path(path, alt, sizeof(alt));
+    if (!p) return NULL;
+    return fopen(p, mode);
+}
+
 /* Bit 0 read-only, bit 1 hidden, bit 2 directory; -1 when missing. */
+static long long zan_file_attributes_at(const char *path);
+
 long long zan_file_attributes(const char *path) {
+    long long r = zan_file_attributes_at(path);
+    if (r >= 0) return r;
+    char alt[4096];
+    const char *p = zan_pkg_path(path, alt, sizeof(alt));
+    if (!p) return -1;
+    return zan_file_attributes_at(p);
+}
+
+static long long zan_file_attributes_at(const char *path) {
     if (!path || !path[0]) return -1;
 #ifdef _WIN32
     DWORD a = GetFileAttributesA(path);

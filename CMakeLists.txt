@@ -885,6 +885,20 @@ add_test(NAME conformance_multifile
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_multifile${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+# ---- Response file: `zanc @file` takes its arguments from a file, so a
+#      whole-project build is not capped by the shell's command-line limit
+#      (cmd.exe truncates at 8191 characters). ----
+add_test(NAME conformance_argfile
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/main.zan
+    "-DEXTRA=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/box.zan;${CMAKE_SOURCE_DIR}/tests/conformance/multifile/util.zan"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/expected.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_argfile${_exe_ext}
+    -DRSP=${CMAKE_BINARY_DIR}/conf_argfile.rsp
+    -P ${CMAKE_SOURCE_DIR}/tests/run_argfile.cmake)
+set_tests_properties(conformance_argfile PROPERTIES TIMEOUT 120)
+
 # ---- Namespace collisions: two namespaces declaring the same simple names,
 #      including static calls through them (see nsresolve.c). ----
 add_test(NAME conformance_nsdup

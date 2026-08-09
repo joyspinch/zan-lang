@@ -11,7 +11,7 @@
 #if defined(_WIN32)
 #define ZAN_SDL_API __declspec(dllexport)
 #else
-#define ZAN_SDL_API __attribute__((visibility("默认")))
+#define ZAN_SDL_API __attribute__((visibility("default")))
 #endif
 
 typedef int32_t zan_i32;
@@ -1087,4 +1087,420 @@ ZAN_SDL_API void zan_gpu_end(zan_iptr handle) {
         SDL_SubmitGPUCommandBuffer(ctx->cmd);
     }
     ctx->cmd = NULL; ctx->swap = NULL;
+}
+
+/* ===================================================================
+ * Audio: WAV clips and mixed playback voices.
+ *
+ * One physical playback device is opened by zan_audio_open; every voice is an
+ * SDL_AudioStream bound to it, so SDL does the mixing and a clip can be
+ * playing several times at once. A looping voice re-queues its clip from the
+ * stream's get-callback, which is how SDL3 asks for more data.
+ *
+ * A finished voice frees its stream but keeps its pool slot, and a handle
+ * carries the slot's generation: a Zan `SdlVoice` that outlives its sound
+ * therefore answers "not playing" instead of dereferencing a recycled slot.
+ * =================================================================== */
+
+#define ZAN_VOICE_SLOTS 64
+
+typedef struct {
+    Uint8 *pcm;
+    Uint32 len;
+    SDL_AudioSpec spec;
+} ZanAudioClip;
+
+typedef struct {
+    SDL_AudioStream *stream;
+    ZanAudioClip *clip;
+    zan_i32 loop;
+    zan_i32 gen;
+} ZanVoice;
+
+static zan_i32 zan_audio_ready;
+static ZanVoice zan_voices[ZAN_VOICE_SLOTS];
+static zan_i32 zan_voice_gen = 1;
+static float zan_audio_gain = 1.0f;
+
+static zan_i64 zan_voice_pack(zan_i32 slot, zan_i32 gen) {
+    return ((zan_i64)gen << 8) | (zan_i64)(slot + 1);
+}
+
+/* The live voice a handle names, or NULL once its sound ended (or the slot was
+ * handed to a newer voice). */
+static ZanVoice *zan_voice_of(zan_i64 handle) {
+    zan_i32 slot = (zan_i32)((handle & 255) - 1);
+    zan_i32 gen = (zan_i32)(handle >> 8);
+    if (slot < 0 || slot >= ZAN_VOICE_SLOTS) return NULL;
+    ZanVoice *v = &zan_voices[slot];
+    if (!v->stream || v->gen != gen) return NULL;
+    return v;
+}
+
+static void zan_voice_release(ZanVoice *v) {
+    if (!v->stream) return;
+    /* Destroying the stream also closes the logical device it opened. */
+    SDL_DestroyAudioStream(v->stream);
+    v->stream = NULL;
+    v->clip = NULL;
+    v->loop = 0;
+}
+
+/* Samples of a bound stream that have not reached the device yet. A playback
+ * stream converts on demand, so the queued (input) side is what says whether a
+ * sound is still to be heard -- the converted side reads 0 for most of it. */
+static int zan_voice_pending(const ZanVoice *v) {
+    int queued = (int)SDL_GetAudioStreamQueued(v->stream);
+    if (queued > 0) return queued;
+    return (int)SDL_GetAudioStreamAvailable(v->stream);
+}
+
+/* Frees the streams of one-shot voices that have played out, so the pool is
+ * never exhausted by sounds nobody stopped explicitly. */
+static void zan_voice_reap(void) {
+    for (int i = 0; i < ZAN_VOICE_SLOTS; i++) {
+        ZanVoice *v = &zan_voices[i];
+        if (!v->stream || v->loop) continue;
+        if (zan_voice_pending(v) <= 0) zan_voice_release(v);
+    }
+}
+
+static void SDLCALL zan_voice_feed(
+    void *userdata, SDL_AudioStream *stream, int additional, int total) {
+    ZanVoice *v = (ZanVoice *)userdata;
+    (void)total;
+    if (!v || !v->loop || !v->clip || additional <= 0) return;
+    SDL_PutAudioStreamData(stream, v->clip->pcm, (int)v->clip->len);
+}
+
+ZAN_SDL_API zan_i32 zan_audio_open(void) {
+    if (zan_audio_ready) return 1;
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) return 0;
+    zan_audio_ready = 1;
+    return 1;
+}
+
+ZAN_SDL_API void zan_audio_close(void) {
+    for (int i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_release(&zan_voices[i]);
+    zan_audio_ready = 0;
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+}
+
+ZAN_SDL_API zan_i32 zan_audio_is_open(void) {
+    return zan_bool(zan_audio_ready != 0);
+}
+
+/* Master gain: applied to voices started from now on and to the ones still
+ * playing, so a fade or a mute takes effect immediately. */
+ZAN_SDL_API void zan_audio_set_volume(double volume) {
+    if (volume < 0.0) volume = 0.0;
+    zan_audio_gain = (float)volume;
+    for (int i = 0; i < ZAN_VOICE_SLOTS; i++) {
+        ZanVoice *v = &zan_voices[i];
+        if (v->stream) SDL_SetAudioStreamGain(v->stream, zan_audio_gain);
+    }
+}
+
+ZAN_SDL_API double zan_audio_volume(void) {
+    return (double)zan_audio_gain;
+}
+
+ZAN_SDL_API const char *zan_audio_driver_name(void) {
+    const char *name = SDL_GetCurrentAudioDriver();
+    return name ? name : "";
+}
+
+ZAN_SDL_API zan_i32 zan_audio_active_voices(void) {
+    zan_voice_reap();
+    zan_i32 n = 0;
+    for (int i = 0; i < ZAN_VOICE_SLOTS; i++) {
+        if (zan_voices[i].stream) n++;
+    }
+    return n;
+}
+
+ZAN_SDL_API zan_iptr zan_audio_load_wav(const char *path) {
+    if (!path || !path[0]) return 0;
+    ZanAudioClip *clip = (ZanAudioClip *)SDL_calloc(1, sizeof(ZanAudioClip));
+    if (!clip) return 0;
+    if (!SDL_LoadWAV(path, &clip->spec, &clip->pcm, &clip->len)) {
+        SDL_free(clip);
+        return 0;
+    }
+    return zan_handle(clip);
+}
+
+ZAN_SDL_API void zan_audio_free_clip(zan_iptr clip) {
+    ZanAudioClip *c = (ZanAudioClip *)zan_ptr(clip);
+    if (!c) return;
+    /* Voices reading this clip's samples have to go first. */
+    for (int i = 0; i < ZAN_VOICE_SLOTS; i++) {
+        if (zan_voices[i].clip == c) zan_voice_release(&zan_voices[i]);
+    }
+    SDL_free(c->pcm);
+    SDL_free(c);
+}
+
+ZAN_SDL_API zan_i32 zan_audio_clip_frequency(zan_iptr clip) {
+    ZanAudioClip *c = (ZanAudioClip *)zan_ptr(clip);
+    return c ? (zan_i32)c->spec.freq : 0;
+}
+
+ZAN_SDL_API zan_i32 zan_audio_clip_channels(zan_iptr clip) {
+    ZanAudioClip *c = (ZanAudioClip *)zan_ptr(clip);
+    return c ? (zan_i32)c->spec.channels : 0;
+}
+
+ZAN_SDL_API zan_i32 zan_audio_clip_duration_ms(zan_iptr clip) {
+    ZanAudioClip *c = (ZanAudioClip *)zan_ptr(clip);
+    if (!c || c->spec.freq <= 0 || c->spec.channels <= 0) return 0;
+    int frame = SDL_AUDIO_FRAMESIZE(c->spec);
+    if (frame <= 0) return 0;
+    zan_i64 frames = (zan_i64)c->len / (zan_i64)frame;
+    return (zan_i32)((frames * 1000) / (zan_i64)c->spec.freq);
+}
+
+/* Starts one voice for `clip`. `loop` re-queues the clip forever (background
+ * music); a one-shot voice is reaped once it has played out. Returns 0 when
+ * the device is closed, the pool is full or the stream could not be created. */
+ZAN_SDL_API zan_i64 zan_audio_play(zan_iptr clip, double gain, zan_i32 loop) {
+    ZanAudioClip *c = (ZanAudioClip *)zan_ptr(clip);
+    if (!c || !zan_audio_ready) return 0;
+    zan_voice_reap();
+    int slot = -1;
+    for (int i = 0; i < ZAN_VOICE_SLOTS; i++) {
+        if (!zan_voices[i].stream) { slot = i; break; }
+    }
+    if (slot < 0) return 0;
+    ZanVoice *v = &zan_voices[slot];
+    v->clip = c;
+    v->loop = loop != 0 ? 1 : 0;
+    v->gen = zan_voice_gen++;
+    /* A logical device per voice: SDL converts the clip's format to the
+     * hardware's and mixes the logical devices together, which is what lets one
+     * clip sound several times at once. */
+    SDL_AudioStream *stream = SDL_OpenAudioDeviceStream(
+        SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &c->spec,
+        v->loop ? zan_voice_feed : NULL, v);
+    if (!stream) {
+        v->clip = NULL;
+        v->loop = 0;
+        return 0;
+    }
+    v->stream = stream;
+    if (gain < 0.0) gain = 0.0;
+    SDL_SetAudioStreamGain(stream, (float)gain * zan_audio_gain);
+    /* Streams from SDL_OpenAudioDeviceStream start paused. */
+    if (!SDL_PutAudioStreamData(stream, c->pcm, (int)c->len) ||
+        !SDL_ResumeAudioStreamDevice(stream)) {
+        zan_voice_release(v);
+        return 0;
+    }
+    return zan_voice_pack((zan_i32)slot, v->gen);
+}
+
+ZAN_SDL_API zan_i32 zan_audio_voice_playing(zan_i64 voice) {
+    ZanVoice *v = zan_voice_of(voice);
+    if (!v) return 0;
+    if (v->loop) return 1;
+    if (zan_voice_pending(v) > 0) return 1;
+    zan_voice_release(v);
+    return 0;
+}
+
+ZAN_SDL_API void zan_audio_voice_stop(zan_i64 voice) {
+    ZanVoice *v = zan_voice_of(voice);
+    if (v) zan_voice_release(v);
+}
+
+ZAN_SDL_API void zan_audio_voice_set_gain(zan_i64 voice, double gain) {
+    ZanVoice *v = zan_voice_of(voice);
+    if (!v) return;
+    if (gain < 0.0) gain = 0.0;
+    SDL_SetAudioStreamGain(v->stream, (float)gain * zan_audio_gain);
+}
+
+ZAN_SDL_API void zan_audio_stop_all(void) {
+    for (int i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_release(&zan_voices[i]);
+}
+
+/* ===================================================================
+ * Gamepads. Handles are SDL_Gamepad pointers; the joystick instance id
+ * ("which") is what the ADDED/REMOVED events report.
+ * =================================================================== */
+
+ZAN_SDL_API zan_i32 zan_gamepad_init(void) {
+    return zan_bool(SDL_InitSubSystem(SDL_INIT_GAMEPAD));
+}
+
+ZAN_SDL_API zan_i32 zan_gamepad_count(void) {
+    int count = 0;
+    SDL_JoystickID *ids = SDL_GetGamepads(&count);
+    SDL_free(ids);
+    return (zan_i32)count;
+}
+
+ZAN_SDL_API zan_i32 zan_gamepad_id_at(zan_i32 index) {
+    int count = 0;
+    SDL_JoystickID *ids = SDL_GetGamepads(&count);
+    zan_i32 id = 0;
+    if (ids && index >= 0 && index < count) id = (zan_i32)ids[index];
+    SDL_free(ids);
+    return id;
+}
+
+ZAN_SDL_API zan_iptr zan_gamepad_open(zan_i32 which) {
+    if (which <= 0) return 0;
+    return zan_handle(SDL_OpenGamepad((SDL_JoystickID)which));
+}
+
+ZAN_SDL_API zan_iptr zan_gamepad_open_first(void) {
+    zan_i32 id = zan_gamepad_id_at(0);
+    return id ? zan_gamepad_open(id) : 0;
+}
+
+ZAN_SDL_API void zan_gamepad_close(zan_iptr pad) {
+    if (pad) SDL_CloseGamepad((SDL_Gamepad *)zan_ptr(pad));
+}
+
+ZAN_SDL_API const char *zan_gamepad_name(zan_iptr pad) {
+    const char *name = pad ? SDL_GetGamepadName((SDL_Gamepad *)zan_ptr(pad)) : NULL;
+    return name ? name : "";
+}
+
+ZAN_SDL_API zan_i32 zan_gamepad_id(zan_iptr pad) {
+    if (!pad) return 0;
+    return (zan_i32)SDL_GetGamepadID((SDL_Gamepad *)zan_ptr(pad));
+}
+
+ZAN_SDL_API zan_i32 zan_gamepad_button(zan_iptr pad, zan_i32 button) {
+    if (!pad || button < 0) return 0;
+    return zan_bool(SDL_GetGamepadButton(
+        (SDL_Gamepad *)zan_ptr(pad), (SDL_GamepadButton)button));
+}
+
+/* Raw axis value, -32768..32767 (triggers report 0..32767). */
+ZAN_SDL_API zan_i32 zan_gamepad_axis(zan_iptr pad, zan_i32 axis) {
+    if (!pad || axis < 0) return 0;
+    return (zan_i32)SDL_GetGamepadAxis(
+        (SDL_Gamepad *)zan_ptr(pad), (SDL_GamepadAxis)axis);
+}
+
+ZAN_SDL_API zan_i32 zan_gamepad_rumble(
+    zan_iptr pad, zan_i32 low, zan_i32 high, zan_i32 milliseconds) {
+    if (!pad) return 0;
+    if (low < 0) low = 0;
+    if (low > 65535) low = 65535;
+    if (high < 0) high = 0;
+    if (high > 65535) high = 65535;
+    if (milliseconds < 0) milliseconds = 0;
+    return zan_bool(SDL_RumbleGamepad((SDL_Gamepad *)zan_ptr(pad),
+        (Uint16)low, (Uint16)high, (Uint32)milliseconds));
+}
+
+ZAN_SDL_API zan_i32 zan_sdl_event_gamepad_which(void) {
+    switch (zan_last_event.type) {
+    case SDL_EVENT_GAMEPAD_ADDED:
+    case SDL_EVENT_GAMEPAD_REMOVED:
+    case SDL_EVENT_GAMEPAD_REMAPPED:
+        return (zan_i32)zan_last_event.gdevice.which;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+    case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        return (zan_i32)zan_last_event.gbutton.which;
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+        return (zan_i32)zan_last_event.gaxis.which;
+    default:
+        return 0;
+    }
+}
+
+ZAN_SDL_API zan_i32 zan_sdl_event_gamepad_button(void) {
+    return (zan_i32)zan_last_event.gbutton.button;
+}
+
+ZAN_SDL_API zan_i32 zan_sdl_event_gamepad_axis(void) {
+    return (zan_i32)zan_last_event.gaxis.axis;
+}
+
+ZAN_SDL_API zan_i32 zan_sdl_event_gamepad_axis_value(void) {
+    return (zan_i32)zan_last_event.gaxis.value;
+}
+
+/* ===================================================================
+ * Touch. Finger ids are 64-bit SDL_FingerID values; positions are
+ * normalized 0..1 inside the window.
+ * =================================================================== */
+
+ZAN_SDL_API zan_i32 zan_touch_device_count(void) {
+    int count = 0;
+    SDL_TouchID *ids = SDL_GetTouchDevices(&count);
+    SDL_free(ids);
+    return (zan_i32)count;
+}
+
+ZAN_SDL_API zan_i64 zan_touch_device_at(zan_i32 index) {
+    int count = 0;
+    SDL_TouchID *ids = SDL_GetTouchDevices(&count);
+    zan_i64 id = 0;
+    if (ids && index >= 0 && index < count) id = (zan_i64)ids[index];
+    SDL_free(ids);
+    return id;
+}
+
+ZAN_SDL_API const char *zan_touch_device_name(zan_i64 device) {
+    const char *name = SDL_GetTouchDeviceName((SDL_TouchID)device);
+    return name ? name : "";
+}
+
+ZAN_SDL_API zan_i64 zan_sdl_event_finger_id(void) {
+    return (zan_i64)zan_last_event.tfinger.fingerID;
+}
+
+ZAN_SDL_API zan_i64 zan_sdl_event_touch_device(void) {
+    return (zan_i64)zan_last_event.tfinger.touchID;
+}
+
+ZAN_SDL_API double zan_sdl_event_finger_x(void) {
+    return (double)zan_last_event.tfinger.x;
+}
+
+ZAN_SDL_API double zan_sdl_event_finger_y(void) {
+    return (double)zan_last_event.tfinger.y;
+}
+
+ZAN_SDL_API double zan_sdl_event_finger_dx(void) {
+    return (double)zan_last_event.tfinger.dx;
+}
+
+ZAN_SDL_API double zan_sdl_event_finger_dy(void) {
+    return (double)zan_last_event.tfinger.dy;
+}
+
+ZAN_SDL_API double zan_sdl_event_finger_pressure(void) {
+    return (double)zan_last_event.tfinger.pressure;
+}
+
+/* ===================================================================
+ * GPU device introspection: which backend SDL picked and which shader
+ * format it consumes, so a program can report (or refuse) the backend it
+ * got instead of guessing from the platform.
+ * =================================================================== */
+
+ZAN_SDL_API const char *zan_gpu_driver_name(zan_iptr handle) {
+    ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
+    if (!ctx || !ctx->device) return "";
+    const char *name = SDL_GetGPUDeviceDriver(ctx->device);
+    return name ? name : "";
+}
+
+ZAN_SDL_API const char *zan_gpu_shader_format(zan_iptr handle) {
+    ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
+    if (!ctx || !ctx->device) return "";
+    SDL_GPUShaderFormat f = SDL_GetGPUShaderFormats(ctx->device);
+    if (f & SDL_GPU_SHADERFORMAT_MSL) return "msl";
+    if (f & SDL_GPU_SHADERFORMAT_SPIRV) return "spirv";
+    if (f & SDL_GPU_SHADERFORMAT_DXIL) return "dxil";
+    if (f & SDL_GPU_SHADERFORMAT_METALLIB) return "metallib";
+    if (f & SDL_GPU_SHADERFORMAT_PRIVATE) return "private";
+    return "invalid";
 }

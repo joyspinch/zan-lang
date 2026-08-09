@@ -226,6 +226,7 @@ partial class ZanIDE {
                     string dExe = ZanIDE.DebugBuildBegin(tabs, activeTab, root, log);
                     if (dExe != "") {
                         buildBusy = true;
+                        buildStartMs = Window.GetTickMs();
                         buildThenRun = false;
                         dbgBuildPending = true;
                         buildExe = dExe;
@@ -1247,6 +1248,7 @@ partial class ZanIDE {
                         string exeHr = bdHr + "/.zanrun" + ZanIDE.ExeSuffix();
                         ZanIDE.HotKillRunExe(exeHr);
                         buildBusy = true;
+                        buildStartMs = Window.GetTickMs();
                         buildThenRun = !ZanIDE.IsLibraryProject(root);
                         buildExe = ZanIDE.RunBuildBegin(root, rpHr);
                         buildIsGui = ZanIDE.IsWindowedTarget(root, rpHr);
@@ -1304,6 +1306,14 @@ partial class ZanIDE {
                     app.RequestRedraw();
                 }
                 if (File.Exists(ZanIDE.BuildDonePath())) {
+                    // The compiler's own exit status decides success. Asking
+                    // "does the exe exist?" called a failed build successful
+                    // whenever an older executable was still there (a failed
+                    // link leaves the previous image untouched), and the IDE
+                    // then launched that stale program instead of showing the
+                    // error.
+                    bool buildOk = ZanIDE.DoneOk(ZanIDE.BuildDonePath())
+                        && File.Exists(buildExe);
                     File.Delete(ZanIDE.BuildDonePath());
                     buildLogLen = ZanIDE.BuildPoll(buildLogLen, log);
                     buildBusy = false;
@@ -1311,7 +1321,7 @@ partial class ZanIDE {
                     ZanIDE.ApplyDiagnostics(editor, buildTargetPath, bout, log);
                     if (dbgBuildPending) {
                         dbgBuildPending = false;
-                        if (!File.Exists(buildExe)) {
+                        if (!buildOk) {
                             log.Add("> [Debug] Build failed.");
                         } else {
                             log.Add("> [Debug] Build succeeded.");
@@ -1331,7 +1341,7 @@ partial class ZanIDE {
                                 dbg = null;
                             }
                         }
-                    } else if (!File.Exists(buildExe)) {
+                    } else if (!buildOk) {
                         // 构建失败只报错：把「错误」面板顶到前面，
                         // 绝不擅自弹别的窗口（缺库只给一行提示）。
                         string missingPackage = ZanIDE.MissingPackage(bout);
@@ -1384,7 +1394,7 @@ partial class ZanIDE {
                     // errors and can fix them, then continue.
                     if (aiBuildForAi) {
                         aiBuildForAi = false;
-                        bool aiOk = File.Exists(buildExe);
+                        bool aiOk = buildOk;
                         // 编译/运行的真实结果回填到当前那一拍：失败按故障
                         // 分类决定重试、进根因回环还是交给用户，不靠循环
                         // 自己猜。
@@ -1443,6 +1453,21 @@ partial class ZanIDE {
                     coLog.Reset();
                     app.RequestRedraw();
                 }
+                // A compiler that never reports back (a shell that failed to
+                // start it, a killed process) must not leave the IDE stuck in
+                // "building": Run/Build stay disabled while buildBusy is set,
+                // which is indistinguishable from a frozen IDE.
+                if (buildBusy && buildStartMs != 0
+                    && Window.GetTickMs() - buildStartMs > 600000) {
+                    buildBusy = false;
+                    dbgBuildPending = false;
+                    aiBuildForAi = false;
+                    log.Add(ZanIDE.T("> Build timed out; no compiler result.",
+                                     "> 构建超时，未拿到编译结果。"));
+                    dock.Focus("errors");
+                    coLog.Reset();
+                    app.RequestRedraw();
+                }
                 app.RequestAnimationFrame(80);
             }
             // ui_check in flight: the target is being driven by the
@@ -1497,8 +1522,13 @@ partial class ZanIDE {
                     app.RequestRedraw();
                 }
                 if (File.Exists(ZanIDE.PubDonePath())) {
+                    bool pubStatusOk = ZanIDE.DoneOk(ZanIDE.PubDonePath());
                     File.Delete(ZanIDE.PubDonePath());
                     pubLogLen = ZanIDE.PubPoll(pubLogLen, log);
+                    if (!pubStatusOk) {
+                        log.Add(ZanIDE.T("> A publish step reported an error (see the log above).",
+                                         "> 有发布步骤报错（见上方日志）。"));
+                    }
                     int pubOk = 0;
                     for (int pe = 0; pe < pubExes.Count; pe = pe + 1) {
                         if (File.Exists(pubExes[pe])) {
@@ -1521,6 +1551,15 @@ partial class ZanIDE {
                     }
                     pubBusy = false;
                     pubExes = new List<string>();
+                    coLog.Reset();
+                    app.RequestRedraw();
+                }
+                if (pubBusy && pubStartMs != 0
+                    && Window.GetTickMs() - pubStartMs > 1800000) {
+                    pubBusy = false;
+                    pubExes = new List<string>();
+                    log.Add(ZanIDE.T("> Publish timed out; no result reported.",
+                                     "> 发布超时，未拿到结果。"));
                     coLog.Reset();
                     app.RequestRedraw();
                 }
@@ -1914,6 +1953,15 @@ partial class ZanIDE {
                     }
                     cmLabels.Add(ZanIDE.T("Copy Name", "复制名称"));
                 }
+                // An open context menu owns the pointer. Without this, the
+                // click that dismisses it also reached whatever was under it
+                // (a tree row got selected / a file opened / a tab switched by
+                // the same click that closed the menu), which is what made the
+                // right-click menus look like they fired the wrong action.
+                // Registering the block here -- after the panels below have
+                // rendered, before the menu itself -- is what keeps the menu's
+                // own items clickable (see App.ClickAvailable).
+                app.BlockHitsBelow();
                 int chosen = ContextMenu.Render(app, ctxX, ctxY, cmLabels);
                 if (chosen == 0 - 2) {
                     ctxKind = 0;
@@ -2023,6 +2071,7 @@ partial class ZanIDE {
                                     } else if (rtcT != "") {
                                         log.Add(ZanIDE.T("> Running tool ", "> 运行工具 ") + rtrn.path + " ...");
                                         buildBusy = true;
+                                        buildStartMs = Window.GetTickMs();
                                         buildThenRun = true;
                                         buildExe = ZanIDE.RunBuildBegin(root, rtcT);
                                         buildIsGui = ZanIDE.IsWindowedTarget(root, rtcT);
@@ -2088,10 +2137,20 @@ partial class ZanIDE {
             // their own top-level child windows (App.CreateDark) -- see the
             // pumps right after the main frame below. Only the deferred
             // publish kick-off (started once the window has closed) stays here.
+            // Deferred AI-settings open (see aiCfgPending): between frames,
+            // where creating a top-level window is safe.
+            if (aiCfgPending) {
+                aiCfgPending = false;
+                if (aiWindow == null || !aiWindow.IsOpen()) {
+                    aiWindow = AiSettingsWindow.Open(app, ZanIDE.uiLang);
+                }
+                app.RequestRedraw();
+            }
             if (pubPending && !pubBusy) {
                 pubPending = false;
                 pubExes = ZanIDE.PublishPlatformsBegin(tabs, activeTab, root, pubSel, log);
                 pubBusy = pubExes.Count > 0;
+                pubStartMs = Window.GetTickMs();
                 pubLogLen = 0;
                 app.RequestRedraw();
             }

@@ -939,7 +939,8 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                              (int)member->method_decl.name.len,
                              member->method_decl.name.str);
                 }
-                if (strncmp(ext_name, "zan_file_", 9) == 0) {
+                if (strncmp(ext_name, "zan_file_", 9) == 0 ||
+                    strncmp(ext_name, "zan_pkg_", 8) == 0) {
                     /* file metadata + FILE* stream IO (System.IO.FileInfo /
                      * FileStream): split into its own runtime object so a
                      * file-IO program does not drag in the atomics/threads/
