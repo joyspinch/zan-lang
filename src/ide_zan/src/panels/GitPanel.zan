@@ -21,6 +21,8 @@ partial class GitPanel {
             ZanIDE.T("Initialize repository", "初始化仓库"));
         GitPanel.RefreshBtn.SetProp("text", ZanIDE.T("Refresh", "刷新"));
         GitPanel.StageBtn.SetProp("text", ZanIDE.T("Stage all", "暂存全部"));
+        GitPanel.StageOneBtn.SetProp("text", ZanIDE.T("Stage file", "暂存所选"));
+        GitPanel.UnstageBtn.SetProp("text", ZanIDE.T("Unstage", "撤销暂存"));
         GitPanel.DiffBtn.SetProp("text", ZanIDE.T("Diff", "差异"));
         GitPanel.LogBtn.SetProp("text", ZanIDE.T("History", "历史"));
         GitPanel.PullBtn.SetProp("text", ZanIDE.T("Pull", "拉取"));
@@ -35,6 +37,8 @@ partial class GitPanel {
         form.On("gitInit", GitPanel.OnInitRepo);
         form.On("gitRefresh", GitPanel.OnRefresh);
         form.On("gitStage", GitPanel.OnStage);
+        form.On("gitStageOne", GitPanel.OnStageSelected);
+        form.On("gitUnstage", GitPanel.OnUnstageSelected);
         form.On("gitDiff", GitPanel.OnDiff);
         form.On("gitLog", GitPanel.OnHistory);
         form.On("gitPull", GitPanel.OnPull);
@@ -57,7 +61,7 @@ partial class GitPanel {
             app.RequestAnimationFrame(120);
         }
         GitPanel.NoRepo.SetShown(!repo);
-        GitPanel.InitBtn.SetShown(!repo);
+        GitPanel.InitRow.SetShown(!repo);
         GitPanel.Branch.SetShown(repo);
         GitPanel.Row1.SetShown(repo);
         GitPanel.Row2.SetShown(repo);
@@ -65,7 +69,7 @@ partial class GitPanel {
         GitPanel.Files.SetShown(repo);
         if (repo) {
             GitPanel.Branch.Text = ZanIDE.T("Branch: ", "分支：")
-                + ide.gitBranch + "   ("
+                + GitPanel.BranchText(ide) + "   ("
                 + Convert.ToString(ide.gitFiles.Count)
                 + ZanIDE.T(" changes", " 处变更") + ")";
             GitPanel.Files.Bind(ide.gitFiles);
@@ -74,6 +78,29 @@ partial class GitPanel {
         }
         this.RenderInside(app, area);
         if (repo) { ide.gitSel.Set(GitPanel.Files.SelectedIndex()); }
+    }
+
+    /// 分支行的文字。仓库还没有提交时 HEAD 是「未出生」的，那时既没有
+    /// 提交也不算游离，写清楚这一点，而不是把 git 的 stderr 抄到界面上。
+    static string BranchText(ZanIDE ide) {
+        if (ide.gitBranch != "") {
+            if (ide.gitHead == "") {
+                return ide.gitBranch
+                    + ZanIDE.T(" (no commits yet)", "（尚无提交）");
+            }
+            return ide.gitBranch;
+        }
+        if (ide.gitHead != "") {
+            return ZanIDE.T("detached at ", "游离于 ") + ide.gitHead;
+        }
+        return ZanIDE.T("(unknown)", "（未知）");
+    }
+
+    /// 列表当前选中的变更路径（没有选中时是 ""）。
+    static string SelectedPath(ZanIDE ide) {
+        int sel = ide.gitSel.Get();
+        if (sel < 0 || sel >= ide.gitFiles.Count) { return ""; }
+        return ZanIDE.GitPathOf(ide.gitFiles[sel]);
     }
 
     // ---- 设计里的处理器：每个都只发起一次后台 git 作业 ----
@@ -104,18 +131,55 @@ partial class GitPanel {
         ide.dock.Focus("output");
     }
 
+    /// 暂存所选：只把列表里选中的那一个路径加进索引。
+    static void OnStageSelected() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || ide.gitJob != 0) { return; }
+        string p = GitPanel.SelectedPath(ide);
+        if (p == "") {
+            ide.log.Add(ZanIDE.T("> Select a changed file first.",
+                "> 请先在列表里选择一个文件。"));
+            ide.dock.Focus("output");
+            return;
+        }
+        ZanIDE.GitBegin(ide.root, "add -- \"" + p + "\"");
+        ide.gitJob = 2;
+        ide.log.Add("> git add -- \"" + p + "\" ...");
+        ide.dock.Focus("output");
+    }
+
+    /// 撤销暂存：`reset -- <path>` 而不是 `restore --staged`，因为还没有
+    /// 提交的仓库里没有 HEAD 可以拿来恢复。
+    static void OnUnstageSelected() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || ide.gitJob != 0) { return; }
+        string p = GitPanel.SelectedPath(ide);
+        if (p == "") {
+            ide.log.Add(ZanIDE.T("> Select a changed file first.",
+                "> 请先在列表里选择一个文件。"));
+            ide.dock.Focus("output");
+            return;
+        }
+        ZanIDE.GitBegin(ide.root, "reset -q -- \"" + p + "\"");
+        ide.gitJob = 2;
+        ide.log.Add("> git reset -q -- \"" + p + "\" ...");
+        ide.dock.Focus("output");
+    }
+
+    /// 差异：还没有提交时和 HEAD 比会报 `ambiguous argument 'HEAD'`，那时
+    /// 唯一有意义的比较是索引本身（`diff --cached`）。
     static void OnDiff() {
         ZanIDE ide = ZanIDE.current;
         if (ide == null) { return; }
         string target = "";
-        int sel = ide.gitSel.Get();
-        if (sel >= 0 && sel < ide.gitFiles.Count) {
-            target = " -- \"" + ZanIDE.GitPathOf(ide.gitFiles[sel]) + "\"";
-        }
+        string p = GitPanel.SelectedPath(ide);
+        if (p != "") { target = " -- \"" + p + "\""; }
+        string what = "diff HEAD";
+        if (ide.gitHead == "") { what = "diff --cached"; }
         if (ide.gitJob == 0) {
-            ZanIDE.GitBegin(ide.root, "diff HEAD" + target);
+            ZanIDE.GitBegin(ide.root, what + target);
             ide.gitJob = 2;
-            ide.log.Add("> git diff HEAD" + target + " ...");
+            ide.log.Add("> git " + what + target + " ...");
         }
         ide.dock.Focus("output");
         ide.OutputReset();
@@ -124,6 +188,11 @@ partial class GitPanel {
     static void OnHistory() {
         ZanIDE ide = ZanIDE.current;
         if (ide == null) { return; }
+        if (ide.gitHead == "") {
+            ide.log.Add(ZanIDE.T("> No commits yet.", "> 仓库还没有提交。"));
+            ide.dock.Focus("output");
+            return;
+        }
         if (ide.gitJob == 0) {
             ZanIDE.GitBegin(ide.root, "log --oneline --decorate -20");
             ide.gitJob = 2;
