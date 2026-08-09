@@ -1108,7 +1108,20 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
             continue;
         }
         zan_type_t *pt = zan_binder_resolve_type(g->binder, ps->items[j]->param.type);
-        if (!pt || type_mentions_tp(pt)) continue;
+        if (!pt) continue;
+        if (type_mentions_tp(pt)) {
+            /* A parameter written over the class's own type parameters has no
+             * family to rank by, but its shape still tells it apart from an
+             * inherited overload: `DataGrid<T>.Add(GridColumn<T>)` has to beat
+             * `Control.Add(Control)` for a GridColumn argument, or the column
+             * lands in the child-control list and the next tree walk reads it
+             * as a Control. A bare `T` matches anything, so it stays neutral. */
+            if (pt->kind != TYPE_TYPE_PARAM) {
+                zan_type_t *gat = infer_expr_type(g, a, locals);
+                if (gat && types_match_modulo_tp(pt, gat)) score += 3;
+            }
+            continue;
+        }
         /* An interface parameter takes any implementing class; scoring
          * cannot see the implements list, so it stays neutral here
          * instead of disqualifying the candidate. */
