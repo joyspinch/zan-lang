@@ -3812,7 +3812,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             }
                             for (int k = 0; k < expr->call.args.count; k++) {
                                 call_args[k + 1] = emit_arg_typed(g, expr->call.args.items[k],
-                                    method_param_type(g, method_sym, k), locals);
+                                    method_param_type_at(g, method_sym, k, expr,
+                                                         callee->member.object, locals),
+                                    locals);
                             }
                             zan_type_t *recv_ty = infer_expr_type(g, callee->member.object, locals);
                             LLVMTypeRef mft = g->functions[fi].fn_type;
@@ -3876,7 +3878,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                                                 sizeof(LLVMValueRef));
                     for (int k = 0; k < uargc; k++)
                         avals[k] = emit_arg_typed(g, expr->call.args.items[k],
-                                                  method_param_type(g, iface_m, k), locals);
+                                                  method_param_type_at(g, iface_m, k, expr,
+                                                      callee->member.object, locals),
+                                                  locals);
                     LLVMValueRef recv_pp = LLVMBuildBitCast(g->builder, recv,
                                               LLVMPointerType(i8ptr, 0), "ifc.recvpp");
                     LLVMValueRef tag = LLVMBuildLoad2(g->builder, i8ptr, recv_pp, "ifc.tag");
@@ -4126,7 +4130,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             for (int k = 0; k < argc; k++) {
                                 call_args[k + extra] = emit_arg_typed(g,
                                     expr->call.args.items[k],
-                                    method_param_type(g, method_sym, k), locals);
+                                    method_param_type_at(g, method_sym, k, expr,
+                                                         NULL, locals),
+                                    locals);
                             }
                             /* self-call inside a specialized variant stays in
                              * the same instantiation (receiver is `this`). */

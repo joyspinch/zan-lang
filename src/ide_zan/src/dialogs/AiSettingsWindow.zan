@@ -22,6 +22,10 @@ class AiSettingsWindow : ChildWindow {
     int active;
     int sel;
     int modelSel;
+    /// 当前页签：0 = 模型配置，i>0 = 第 i 个助手。
+    int tab;
+    /// 当前助手页对应的成员 id（模型页时为 ""）。
+    string curRoleId;
 
     AiSettingsDialog content;
     ListView<AiProfile> profileList;
@@ -94,19 +98,66 @@ class AiSettingsWindow : ChildWindow {
         this.Refresh();
     }
 
-    /// 把当前状态铺到界面上：文案、配置行、成员行与逐模型限额表。
+    /// 把当前状态铺到界面上：文案、页签、当前页与逐模型限额表。
     /// 每次配置切换/增删/抓取完成后调用（不重建控件树）。
     void Refresh() {
         this.SeedModelLimits();
         content.ApplyTexts(lang, fetchBusy);
         content.SetActiveProfile(profiles[active]);
-        content.FillRoles(profiles[SelClamped()].model);
+        this.RefreshTabs();
         profileList.Bind(profiles);
         if (sel >= 0 && sel < profiles.Count) {
             profileList.SelectIndex(sel);
         }
         limitGrid.Bind(modelRows);
         this.SyncFromModel();
+    }
+
+    /// 页签标签：第一页是模型配置，之后每个助手一页（跟着界面语言走）。
+    List<string> TabLabels() {
+        List<string> labels = new List<string>();
+        labels.Add(AiSettingsWindow.T(lang, "Models", "模型"));
+        List<AiRole> rs = AiTeam.Roles();
+        for (int r = 0; r < rs.Count; r = r + 1) {
+            if (lang == 1) { labels.Add(rs[r].zh); } else { labels.Add(rs[r].en); }
+        }
+        return labels;
+    }
+
+    /// 铺当前页：模型页只要下拉的选项，助手页换一次绑定路径与下拉选项，
+    /// 一套控件服务所有助手（不按成员数量堆控件）。
+    void RefreshTabs() {
+        List<AiRole> rs = AiTeam.Roles();
+        if (tab < 0 || tab > rs.Count) { tab = 0; }
+        content.SyncTabs(this.TabLabels(), tab);
+        content.ShowPage(tab);
+
+        AiProfile profile = profiles[SelClamped()];
+        content.FillModelOptions(this.DefaultModelOptions(profile),
+            profile.model);
+
+        if (tab == 0) { curRoleId = ""; return; }
+        AiRole role = rs[tab - 1];
+        curRoleId = role.id;
+        string rname = role.en;
+        if (lang == 1) { rname = role.zh; }
+        content.BindRolePrompt(role.id);
+        // 助手的模型下拉列所有服务商的启用模型，和聊天框那个下拉同源。
+        content.FillRole(rname, ZanIDE.AiModelOptions(profiles),
+            ZanIDE.AiRoleModel(profile.roles, role.id));
+    }
+
+    /// 默认模型下拉的选项：这家服务商抓到的全部模型（勾选与否是限额表
+    /// 的事），外加当前默认模型 —— 老配置里的模型可能已经不在最新的
+    /// 抓取结果里，漏掉它会让下拉选不中、保存时把默认模型改掉。
+    List<string> DefaultModelOptions(AiProfile profile) {
+        List<string> opts = ZanIDE.SplitList(profile.models);
+        if (profile.model.IsNullOrEmpty()) { return opts; }
+        for (int i = 0; i < opts.Count; i = i + 1) {
+            if (opts[i] == profile.model) { return opts; }
+        }
+        opts.Insert(0, profile.model);
+        return opts;
     }
 
     void ProfileSelected() {
@@ -139,6 +190,7 @@ class AiSettingsWindow : ChildWindow {
         model.Set("base", JsonValue.NewStr(profile.baseUrl));
         model.Set("key", JsonValue.NewStr(profile.key));
         model.Set("model", JsonValue.NewStr(profile.model));
+        curRoleId = "";
         this.SeedModelLimits();
         this.SeedRoleModels();
         this.SyncModelSel();
@@ -149,11 +201,8 @@ class AiSettingsWindow : ChildWindow {
     /// the built-in charter, so every member starts from a usable default the
     /// user can edit instead of an empty box.
     void SeedRoleModels() {
-        AiProfile profile = profiles[SelClamped()];
         List<AiRole> rs = AiTeam.Roles();
         for (int r = 0; r < rs.Count; r = r + 1) {
-            model.Set("rolemodel_" + rs[r].id, JsonValue.NewStr(
-                ZanIDE.AiRoleModel(profile.roles, rs[r].id)));
             string text = ZanIDE.AiRoleModel(rolePrompts, rs[r].id);
             if (text == "") { text = AiTeam.DefaultDuty(rs[r].id); }
             model.Set("roleprompt_" + rs[r].id, JsonValue.NewStr(text));
@@ -164,15 +213,13 @@ class AiSettingsWindow : ChildWindow {
     /// built-in text is stored as empty, so a member that was never customised
     /// keeps following the built-in charter when it changes.
     void CommitRoleModels() {
+        if (curRoleId == "") { return; }
         AiProfile profile = profiles[SelClamped()];
-        List<AiRole> rs = AiTeam.Roles();
-        for (int r = 0; r < rs.Count; r = r + 1) {
-            profile.roles = ZanIDE.AiRoleModelSet(profile.roles, rs[r].id,
-                model.PathStr("rolemodel_" + rs[r].id, ""));
-            string text = model.PathStr("roleprompt_" + rs[r].id, "");
-            if (text == AiTeam.DefaultDuty(rs[r].id)) { text = ""; }
-            rolePrompts = ZanIDE.AiRoleModelSet(rolePrompts, rs[r].id, text);
-        }
+        profile.roles = ZanIDE.AiRoleModelSet(profile.roles, curRoleId,
+            content.RoleModelValue());
+        string text = model.PathStr("roleprompt_" + curRoleId, "");
+        if (text == AiTeam.DefaultDuty(curRoleId)) { text = ""; }
+        rolePrompts = ZanIDE.AiRoleModelSet(rolePrompts, curRoleId, text);
     }
 
     /// Builds one ModelLimitRow entity per fetched model of the current profile
@@ -229,7 +276,8 @@ class AiSettingsWindow : ChildWindow {
         profile.name = model.PathStr("name", profile.name);
         profile.baseUrl = model.PathStr("base", profile.baseUrl);
         profile.key = model.PathStr("key", profile.key);
-        profile.model = model.PathStr("model", profile.model);
+        profile.model = content.ModelValue(
+            model.PathStr("model", profile.model));
         this.CommitModelLimits();
         this.CommitRoleModels();
     }
@@ -269,6 +317,8 @@ class AiSettingsWindow : ChildWindow {
         w.model.Set("status", JsonValue.NewStr(""));
         w.model.Set("ctx", JsonValue.NewStr(""));
         w.model.Set("out", JsonValue.NewStr(""));
+        w.tab = 0;
+        w.curRoleId = "";
         w.LoadFields();
         w.BuildUi();
         w.OpenHost(parent);
@@ -298,6 +348,14 @@ class AiSettingsWindow : ChildWindow {
     }
 
     override void AfterFrame() {
+
+        // 换页签：先把正在编辑的这一页收下来，再铺下一页。
+        int nextTab = content.TakeTabChanged();
+        if (nextTab >= 0 && nextTab != tab) {
+            this.CommitFields();
+            tab = nextTab;
+            this.Rebuild();
+        }
 
         // Selecting another profile in the list: keep edits in memory, then
         // load the newly selected profile into the inputs.

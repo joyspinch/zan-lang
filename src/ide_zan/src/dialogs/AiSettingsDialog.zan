@@ -3,22 +3,30 @@ using Gui;
 using Gui.Widget;
 using Gui.Component.DataTable;
 
-/// 「小赞配置」对话框的内容：左侧是已保存的配置与官方预设，右侧是
-/// 选中配置的可编辑字段、团队模式的逐成员模型，以及逐模型的
-/// 上下文/最大输出表。
+/// 「小赞配置」对话框的内容：页签条下面第一页是模型配置（已保存的配置、
+/// 官方预设、接口地址与密钥、默认模型下拉、逐模型的上下文/最大输出表），
+/// 之后每个助手各一页（自己的模型与提示词）。
 ///
 /// 布局在 `AiSettingsDialog.zform` 里声明；这里只做与数据有关的部分：
-/// 行模板、表格列、按语言的文案，以及按 AiTeam.Roles() 生成的成员行。
+/// 行模板、表格列、按语言的文案，以及页签与助手页的填充。
 partial class AiSettingsDialog {
     int lang;
     /// 当前启用的配置，行模板据此加「已启用」后缀。
     AiProfile activeProfile;
+    /// 页签标签的上一份内容：只有真的变了才重建那条页签条。
+    List<string> tabLbls;
+    /// 助手页模型下拉的候选（与聊天框同一来源）：下拉里显示的是
+    /// 「服务商 / 模型」，存回配置的必须是真正的模型 id，所以选项和
+    /// 候选实体一起留着，不靠显示文本反推。
+    List<ModelOption> roleOpts;
 
     void OnInit() {
         lang = 0;
         activeProfile = null;
+        tabLbls = null;
+        roleOpts = new List<ModelOption>();
         AiSettingsDialog.Profiles.WithRow(this.ProfileRow);
-        AiSettingsDialog.Presets.WithRow(AiSettingsDialog.PresetRow);
+        AiSettingsDialog.Presets.WithRow(this.PresetRow);
         AiSettingsDialog.Limits.BoolCol("Show", 60, r => r.visible)
             .Editable((ModelLimitRow r, string v) => {
                 r.visible = DataTable.ParseBool(v);
@@ -37,6 +45,7 @@ partial class AiSettingsDialog {
     ListView<AiProfile> ProfileList() { return AiSettingsDialog.Profiles; }
     ListView<AiPreset> PresetList() { return AiSettingsDialog.Presets; }
     DataGrid<ModelLimitRow> LimitTable() { return AiSettingsDialog.Limits; }
+    SelectBox ModelPicker() { return AiSettingsDialog.ModelPick; }
 
     /// 哪个配置正在生效由宿主给出（保存/启用后会变）。
     void SetActiveProfile(AiProfile p) { activeProfile = p; }
@@ -51,10 +60,110 @@ partial class AiSettingsDialog {
         return lbl;
     }
 
-    static Control PresetRow(AiPreset p) {
+    Control PresetRow(AiPreset p) {
         Label lbl = new Label(p.name);
         lbl.Class = "secondary small";
         return lbl;
+    }
+
+    /// 页签条：第 0 页是模型配置，之后每个助手一页。标签跟着界面语言
+    /// 走，只有真的变了才重建。
+    void SyncTabs(List<string> labels, int active) {
+        if (tabLbls == null || !ZanIDE.StringListsEqual(tabLbls, labels)) {
+            AiSettingsDialog.TabBar.Clear();
+            for (int i = 0; i < labels.Count; i = i + 1) {
+                AiSettingsDialog.TabBar.Add(labels[i], false);
+            }
+            tabLbls = labels;
+        }
+        AiSettingsDialog.TabBar.Select(active);
+        AiSettingsDialog.TabBar.TakeChanged();
+    }
+
+    /// 用户这一帧点了哪个页签（没点则 -1）。
+    int TakeTabChanged() { return AiSettingsDialog.TabBar.TakeChanged(); }
+
+    void ShowPage(int tab) {
+        AiSettingsDialog.ModelsPage.SetShown(tab == 0);
+        AiSettingsDialog.RolePage.SetShown(tab > 0);
+    }
+
+    /// 默认模型：拉到过模型列表就用下拉选，还没有列表时回落成手输，
+    /// 这样第一次配置（还没有密钥/接口）也填得进去。
+    void FillModelOptions(List<string> models, string current) {
+        bool has = models.Count > 0;
+        AiSettingsDialog.ModelPick.SetShown(has);
+        AiSettingsDialog.Model.SetShown(!has);
+        if (!has) { return; }
+        AiSettingsDialog.ModelPick.SetOptionsText(
+            AiSettingsDialog.Options(models));
+        AiSettingsDialog.ModelPick.Select(
+            AiSettingsDialog.IndexOf(models, current));
+    }
+
+    /// 一个助手页：名字、说明、模型下拉（第一项＝跟随默认模型）与提示词。
+    /// `opts` 是聊天框那套「启用模型」候选，所以两处列的东西一样。
+    void FillRole(string title, List<ModelOption> opts, string current) {
+        AiSettingsDialog.RoleTitle.SetProp("text", title);
+        AiSettingsDialog.RoleDuty.SetProp("text", AiSettingsDialog.Pick(lang,
+            "Its own model (first entry = follow the default model) and its own"
+            + " prompt (clear it to fall back to the built-in one).",
+            "这个助手自己的模型（第一项＝跟随默认模型）与自己的提示词"
+            + "（清空则回到内置默认提示词）。"));
+        AiSettingsDialog.RoleModelCap.SetProp("text",
+            AiSettingsDialog.Pick(lang, "Model", "模型"));
+        AiSettingsDialog.RolePromptCap.SetProp("text",
+            AiSettingsDialog.Pick(lang, "Prompt", "提示词"));
+
+        roleOpts = opts;
+        List<string> labels = new List<string>();
+        labels.Add(AiSettingsDialog.Pick(lang, "(default model)", "（默认模型）"));
+        int sel = 0;
+        for (int i = 0; i < opts.Count; i = i + 1) {
+            labels.Add(opts[i].label);
+            if (sel == 0 && opts[i].model == current) { sel = i + 1; }
+        }
+        AiSettingsDialog.RoleModel.SetOptionsText(
+            AiSettingsDialog.Options(labels));
+        AiSettingsDialog.RoleModel.Select(sel);
+    }
+
+    /// 助手页的提示词框绑到 `roleprompt_<id>`，一套控件服务所有助手，
+    /// 切页只换绑定路径，不重建控件。
+    void BindRolePrompt(string roleId) {
+        AiSettingsDialog.RolePrompt.bindPath = "roleprompt_" + roleId;
+    }
+
+    /// 当前助手页选中的模型 id（跟随默认模型时是 ""）。存的是候选实体里
+    /// 的模型 id，不是下拉显示的「服务商 / 模型」文本。
+    string RoleModelValue() {
+        int i = AiSettingsDialog.RoleModel.Value();
+        if (i <= 0 || i > roleOpts.Count) { return ""; }
+        return roleOpts[i - 1].model;
+    }
+
+    /// 默认模型下拉当前选中的模型（没有列表时用手输框的值）。
+    string ModelValue(string fallback) {
+        if (AiSettingsDialog.ModelPick.HasValue()) {
+            return AiSettingsDialog.ModelPick.Text();
+        }
+        return fallback;
+    }
+
+    static string Options(List<string> xs) {
+        string s = "";
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            if (i > 0) { s = s + "|"; }
+            s = s + xs[i];
+        }
+        return s;
+    }
+
+    static int IndexOf(List<string> xs, string v) {
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            if (xs[i] == v) { return i; }
+        }
+        return 0 - 1;
     }
 
     /// 按界面语言刷新静态文案；`fetchBusy` 只影响「获取模型」按钮。
@@ -87,12 +196,6 @@ partial class AiSettingsDialog {
             AiSettingsDialog.Pick(lang, "Save", "保存"));
         AiSettingsDialog.SaveEnable.SetProp("text",
             AiSettingsDialog.Pick(lang, "Save & enable", "保存并启用"));
-        AiSettingsDialog.TeamCap.SetProp("text",
-            AiSettingsDialog.Pick(lang,
-                "Team mode: each member's own model (blank = the default"
-                + " above) and its own prompt (blank = the built-in one)",
-                "团队模式：每个成员自己的模型（留空 = 上面的默认模型）"
-                + "与自己的提示词（留空 = 内置默认提示词）"));
         AiSettingsDialog.LimitsCap.SetProp("text",
             AiSettingsDialog.Pick(lang,
                 "Tick the models to offer in the chat picker; set each one's"
@@ -107,49 +210,6 @@ partial class AiSettingsDialog {
             label = AiSettingsDialog.Pick(lang, "Fetching...", "获取中...");
         }
         AiSettingsDialog.Fetch.SetProp("text", label);
-    }
-
-    /// 每个团队成员一段：名字 + 绑定到 `rolemodel_<id>` 的模型输入框，
-    /// 下面是绑定到 `roleprompt_<id>` 的提示词编辑框。模型输入框的占位
-    /// 文本是当前配置的默认模型。
-    void FillRoles(string defaultModel) {
-        Panel host = AiSettingsDialog.RoleRows;
-        host.RemoveAll();
-        List<AiRole> roles = AiTeam.Roles();
-        for (int i = 0; i < roles.Count; i = i + 1) {
-            AiRole role = roles[i];
-            string rname = role.en;
-            if (lang == 1) { rname = role.zh; }
-
-            Panel row = new Panel("rolerow");
-            row.Pad(0);
-            row.gap = 8;
-            row.Dock(Dock.Top());
-            row.logH = 32;
-
-            Label name = new Label(rname);
-            name.Class = "small";
-            name.Dock(Dock.Left());
-            name.logW = 150;
-            row.Add(name);
-
-            Input model = new Input();
-            model.Dock(Dock.Fill());
-            model.SetProp("placeholder", defaultModel);
-            model.bindPath = "rolemodel_" + role.id;
-            row.Add(model);
-
-            host.Add(row);
-
-            // 每个成员自己的提示词：初值是内置默认，改完保存即生效；
-            // 清空则回到默认。
-            TextArea prompt = new TextArea();
-            prompt.Dock(Dock.Top());
-            prompt.logH = 96;
-            prompt.bindPath = "roleprompt_" + role.id;
-            host.Add(prompt);
-        }
-        host.logH = (32 + 96 + 8) * roles.Count;
     }
 
     static string Pick(int lang, string en, string zh) {
