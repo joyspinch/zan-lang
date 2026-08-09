@@ -30,8 +30,13 @@
 
 int zan_gen_enabled = 1;
 
+#ifdef _WIN32
 #define GEN_DIR_SEP_STR "\\"
 #define GEN_EXE_SUFFIX ".exe"
+#else
+#define GEN_DIR_SEP_STR "/"
+#define GEN_EXE_SUFFIX ""
+#endif
 
 /* The generator sources, relative to <stdlib_root>/System/Compiler/. A
  * fixed list (no directory scan): adding a source file means extending it. */
@@ -71,6 +76,13 @@ int zan_gen_cache_dir(char *dir, size_t dir_size) {
         base = getenv("HOME");
         if (!base || !*base) return -1;
         if (snprintf(dir, dir_size, "%s/.cache/zan/gen", base) <= 0) return -1;
+    }
+    /* Create every missing level: the cache root itself may not exist yet. */
+    for (char *p = dir + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (mkdir(dir, 0755) != 0 && errno != EEXIST) { *p = '/'; return -1; }
+        *p = '/';
     }
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) return -1;
     return 0;
@@ -133,20 +145,23 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
      * protocol and the generator executable must match (the compiler binary
      * carries the exporter, the cached exe carries the consumers). */
     long long exe_mt = zan_file_mtime(exe);
+    long long newest_input = -1;   /* newest generator input, for a re-check */
     int stale = (exe_mt < 0);
-    if (!stale) {
+    {
         char zexe[ZAN_GEN_MAX_PATH];
         zan_self_exe(zexe, sizeof(zexe));
         long long self_mt = zexe[0] ? zan_file_mtime(zexe) : -1;
-        if (self_mt > exe_mt) stale = 1;
+        if (self_mt > newest_input) newest_input = self_mt;
+        if (!stale && self_mt > exe_mt) stale = 1;
     }
-    for (int i = 0; i < GEN_SOURCE_COUNT && !stale; i++) {
+    for (int i = 0; i < GEN_SOURCE_COUNT; i++) {
         char src[ZAN_GEN_MAX_PATH];
         snprintf(src, sizeof(src), "%s%cSystem%cCompiler%c%s",
                  stdlib_root, GEN_DIR_SEP_STR[0], GEN_DIR_SEP_STR[0],
                  GEN_DIR_SEP_STR[0], kGenSources[i]);
         long long mt = zan_file_mtime(src);
-        if (mt < 0 || mt > exe_mt) stale = 1;
+        if (mt > newest_input) newest_input = mt;
+        if (!stale && (mt < 0 || mt > exe_mt)) stale = 1;
     }
 
     if (stale) {
@@ -161,13 +176,40 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
                  stdlib_root, GEN_DIR_SEP_STR[0], GEN_DIR_SEP_STR[0],
                  GEN_DIR_SEP_STR[0]);
         fprintf(stderr, "zan: compiling code generators (first use; cached at %s)\n", exe);
+        /* Compile to a per-process path and rename into place: parallel
+         * builds share this cache, and a compile straight onto `exe` makes
+         * them fight over the same intermediate object file. */
+        char tmp[ZAN_GEN_MAX_PATH];
+#ifdef _WIN32
+        int pid = (int)_getpid();
+#else
+        int pid = (int)getpid();
+#endif
+        snprintf(tmp, sizeof(tmp), "%s%cZanGen_%d%s", dir,
+                 GEN_DIR_SEP_STR[0], pid, GEN_EXE_SUFFIX);
         char *argv[] = {
             zexe, src, "--stdlib-path", (char *)stdlib_root, "--auto-stdlib",
-            "--no-gen", "-DZAN_GEN_MAIN=1", "-o", exe, NULL
+            "--no-gen", "-DZAN_GEN_MAIN=1", "-o", tmp, NULL
         };
         int r = zan_spawn_wait(argv);
         if (r != 0) {
+            remove(tmp);
             fprintf(stderr, "error: code-generator compile failed (exit %d)\n", r);
+            return -1;
+        }
+#ifdef _WIN32
+        if (!MoveFileExA(tmp, exe, MOVEFILE_REPLACE_EXISTING)) {
+#else
+        if (rename(tmp, exe) != 0) {
+#endif
+            /* A parallel build compiling the same generator may hold the
+             * published image open (Windows cannot replace a running exe).
+             * That is harmless as long as what it published is itself current,
+             * so drop our copy and reuse theirs; a missing or stale
+             * destination is a real failure. */
+            remove(tmp);
+            if (zan_file_mtime(exe) >= newest_input) return 0;
+            fprintf(stderr, "error: cannot publish the compiled code generator\n");
             return -1;
         }
     }

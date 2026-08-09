@@ -2531,6 +2531,7 @@ int main(int argc, char **argv) {
                  * the archives from the "static" subdir so shared import libs
                  * and static archives can coexist without ld ambiguity. */
                 char linkdir[1100];
+                bool added_shared = false;
                 if (link_static_drivers)
                     snprintf(linkdir, sizeof(linkdir), "%s/static", driver_dirs[d]);
                 else
@@ -2546,6 +2547,22 @@ int main(int argc, char **argv) {
                             (size_t)zan_lib_ndirs * sizeof(zan_lib_dirs[0]));
                     snprintf(zan_lib_dirs[0], sizeof(zan_lib_dirs[0]), "%s", linkdir);
                     zan_lib_ndirs++;
+                    added_shared = true;
+                }
+                /* Fallback: a target may ship only the static archive of a
+                 * driver (no shared library). Keep its dir right after the
+                 * shared one so ld resolves -l<driver> from the archive
+                 * instead of failing, while a shared library still wins. */
+                if (added_shared && !link_static_drivers) {
+                    char statdir[1100];
+                    snprintf(statdir, sizeof(statdir), "%s/static", driver_dirs[d]);
+                    if (zan_lib_ndirs < 16 && zan_file_exists(statdir) &&
+                        strlen(statdir) < sizeof(zan_lib_dirs[0])) {
+                        memmove(&zan_lib_dirs[2], &zan_lib_dirs[1],
+                                (size_t)(zan_lib_ndirs - 1) * sizeof(zan_lib_dirs[0]));
+                        snprintf(zan_lib_dirs[1], sizeof(zan_lib_dirs[1]), "%s", statdir);
+                        zan_lib_ndirs++;
+                    }
                 }
             }
         }
@@ -3510,6 +3527,10 @@ int main(int argc, char **argv) {
             snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
                      " \"%s\" -pthread", rt_file_obj);
 #endif
+        }
+        if (rt_embed_obj) {
+            size_t cur = strlen(link_cmd);
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_embed_obj);
         }
         if (rt_timer_obj) {
             size_t cur = strlen(link_cmd);
