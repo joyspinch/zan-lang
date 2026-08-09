@@ -626,6 +626,18 @@ add_test(NAME diag_control_zform_entry
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_control_zform_entry PROPERTIES TIMEOUT 60)
 
+# A member name denotes storage (field/property) or code (method), never both:
+# `Class.Name` in a value context reads the slot, so a same-named method is
+# unreachable and a delegate built from it calls a data pointer.
+add_test(NAME diag_member_name_clash
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/member_name_clash.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_member_name_clash${_exe_ext}
+    "-DEXPECT_REGEX=.Row. is declared both as a field and as a method in .Design."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_member_name_clash PROPERTIES TIMEOUT 60)
+
 # ---- RPC framing test (A3) ----
 add_executable(zan_rpc_framing_test
     tests/unit/rpc_framing_test.c

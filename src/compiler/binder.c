@@ -124,6 +124,37 @@ void zan_binder_init(zan_binder_t *b, zan_arena_t *arena, zan_diag_t *diag) {
     b->type_error  = make_type(arena, TYPE_ERROR,  "<error>", 7);
 }
 
+/* A member name may denote either storage (field/property) or code (method),
+ * never both: `Class.Name` in a value context reads the storage slot, so a
+ * method sharing that name becomes unreachable and a delegate built from it
+ * silently loads the field instead (a data pointer called as a function).
+ * Partial classes make this easy to hit - one part declares the field, the
+ * other the method - so both parts are checked against the merged type. */
+static void check_member_name_clash(zan_binder_t *b, zan_symbol_t *type_sym,
+                                    zan_symbol_t *added) {
+    for (int i = 0; i < type_sym->member_count; i++) {
+        zan_symbol_t *m = type_sym->members[i];
+        if (m == added) continue;
+        if (m->name.len != added->name.len ||
+            memcmp(m->name.str, added->name.str, (size_t)added->name.len) != 0)
+            continue;
+        bool m_is_code = m->kind == SYM_METHOD;
+        bool a_is_code = added->kind == SYM_METHOD;
+        bool m_is_data = m->kind == SYM_FIELD || m->kind == SYM_PROPERTY;
+        bool a_is_data = added->kind == SYM_FIELD || added->kind == SYM_PROPERTY;
+        if ((m_is_code && a_is_data) || (m_is_data && a_is_code)) {
+            zan_symbol_t *data = a_is_data ? added : m;
+            zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
+                          "'%.*s' is declared both as a %s and as a method in "
+                          "'%.*s'; give one of them a different name",
+                          added->name.len, added->name.str,
+                          data->kind == SYM_PROPERTY ? "property" : "field",
+                          type_sym->name.len, type_sym->name.str);
+            return;
+        }
+    }
+}
+
 /* ---- type resolution ---- */
 
 static bool istr_eq(zan_istr_t a, const char *b, int len) {
@@ -1058,6 +1089,7 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
                 member->field_decl.modifiers);
             scope_add(b->arena, b->current_scope, field_sym);
             symbol_add_member(b->arena, type_sym, field_sym);
+            check_member_name_clash(b, type_sym, field_sym);
             break;
         }
         case AST_METHOD_DECL: {
@@ -1069,6 +1101,7 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
                 member->method_decl.modifiers);
             scope_add(b->arena, b->current_scope, method_sym);
             symbol_add_member(b->arena, type_sym, method_sym);
+            check_member_name_clash(b, type_sym, method_sym);
 
             /* bind parameters */
             for (int j = 0; j < member->method_decl.params.count; j++) {
