@@ -127,6 +127,13 @@ class Control {
     string computedStyleType;
     string computedStyleClass;
     string computedStyleId;
+    /// 记住 computedStyle 是按哪个状态解析出来的（-1 = 由
+    /// 悬停/按下插值出的过渡态，不可复用）。测量按常态进行，
+    /// 有了它，一帧里没有变化的节点就不必重新走一遍样式解析。
+    int computedStyleState;
+    /// Kind() 的小写形式（默认的类型选择器）。每帧每节点都要问
+    /// 好几次，现算就是每次一个新字符串。
+    string styleTypeLower;
     bool styleSurfaceOwned;
 
     // --- 类 CSS 样式层（全 0 = 未设置）。PaintStyleBox 对表面生效，
@@ -199,6 +206,8 @@ class Control {
         computedStyleType = "";
         computedStyleClass = "";
         computedStyleId = "";
+        computedStyleState = 0 - 1;
+        styleTypeLower = "";
         styleSurfaceOwned = false;
         styleBg = 0;
         styleBgTo = 0;
@@ -307,7 +316,8 @@ class Control {
     /// 这样针对表面的样式表规则
     /// （内边距、背景、模糊）不会作用于布局节点。
     virtual string StyleType() {
-        return this.Kind().ToLower();
+        if (styleTypeLower == "") { styleTypeLower = this.Kind().ToLower(); }
+        return styleTypeLower;
     }
 
     StyleBox ResolveStyle(App app, int state) {
@@ -322,7 +332,20 @@ class Control {
         computedStyleType = type;
         computedStyleClass = Class;
         computedStyleId = name;
+        computedStyleState = state;
         return box;
+    }
+
+    /// 与 ResolveStyleAs 相同，但上一次解析仍然有效时直接复用它。
+    /// 控件在一帧里往往要问同一份样式两次（OnMeasure 一次、OnPaint
+    /// 一次），每次都要拼缓存键、查表并克隆一个 StyleBox。
+    StyleBox ResolveStyleCached(App app, string type, string cls, int state) {
+        if (computedStyle != null && computedStyleGen == app.bgThemeGen
+            && computedStyleState == state && computedStyleType == type
+            && computedStyleClass == Class && computedStyleId == name) {
+            return computedStyle;
+        }
+        return this.ResolveStyleAs(app, type, cls, state);
     }
 
     StyleBox ResolveEasedStyleAs(App app, int id, string type, string cls,
@@ -334,6 +357,7 @@ class Control {
         computedStyleType = type;
         computedStyleClass = Class;
         computedStyleId = name;
+        computedStyleState = 0 - 1;
         return box;
     }
 
@@ -349,6 +373,7 @@ class Control {
         computedStyleType = type;
         computedStyleClass = Class;
         computedStyleId = name;
+        computedStyleState = 0 - 1;
         return box;
     }
 
@@ -760,7 +785,14 @@ class Control {
 
     void MeasureTree(App app) {
         this.ApplyDeclaredUnits(app);
-        this.ResolveStyle(app, Style.SNormal());
+        // 常态样式只在它真的过期时才重新解析：解析一次要拼一条
+        // 缓存键、查一次表并克隆一个 StyleBox，一屏几百个节点
+        // 每帧一次就是白花的几十万纳秒。状态样式（悬停/按下的
+        // 过渡态）标记为 -1，因此永远不会被当成常态复用。
+        if (!this.ComputedStyleCurrent(app)
+            || computedStyleState != Style.SNormal()) {
+            this.ResolveStyle(app, Style.SNormal());
+        }
         if (!this.StyleVisible()) { return; }
         for (int i = 0; i < children.Count; i = i + 1) {
             children[i].MeasureTree(app);
