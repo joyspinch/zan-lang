@@ -789,9 +789,26 @@ typedef struct {
               * (that painted one window's pixels into another during e.g. a
               * child-window open animation). */
     int x0, y0, rw, rh, r;
+    u32 src_sum; /* sampled checksum of the pre-blur backdrop, see zan_src_sum */
     u32 *pixels;
     size_t cap;
 } zan_blur_cache_t;
+
+/* Sampled checksum of a region's current pixels: every 8th pixel of every 8th
+ * row, which is 1/64th of the work of the blur it guards. A "the content behind
+ * the glass may have changed" hint from the caller (any click, scroll or key)
+ * is thus verified against the pixels themselves, so the frosted panels only
+ * re-blur when their backdrop really did change. */
+static u32 zan_src_sum(zan_surface_t *s, int x0, int y0, int rw, int rh) {
+    u32 sum = 2166136261u;
+    for (int j = 0; j < rh; j += 8) {
+        u32 *row = s->pixels + (y0 + j) * s->stride + x0;
+        for (int i = 0; i < rw; i += 8) {
+            sum = (sum ^ row[i]) * 16777619u;
+        }
+    }
+    return sum ^ (u32)(rw * 31 + rh);
+}
 static zan_blur_cache_t g_blur_cache[ZAN_BLUR_CACHE_SLOTS];
 
 static void zan_blur_cached_core(
@@ -819,9 +836,11 @@ static void zan_blur_cached_core(
 
     /* Reuse path: same geometry, not dirtied -> restore cached blurred pixels
      * over the (freshly redrawn, identical) backdrop without re-blurring. */
-    if (!dirty && c->valid && c->pixels && c->sid == (int)surface_id
+    int geom_ok = c->valid && c->pixels && c->sid == (int)surface_id
         && c->x0 == x0 && c->y0 == y0 && c->rw == rw && c->rh == rh
-        && c->r == r) {
+        && c->r == r;
+    u32 sum = geom_ok ? zan_src_sum(s, x0, y0, rw, rh) : 0;
+    if (geom_ok && (!dirty || sum == c->src_sum)) {
         ZAN_STAT(g_st_blur_hit, (long long)rw * (long long)rh);
         for (int j = 0; j < rh; j++) {
             u32 *row = s->pixels + (y0 + j) * s->stride + x0;
@@ -835,6 +854,7 @@ static void zan_blur_cached_core(
     }
 
     /* Recompute in place (identical clamping), then snapshot into the slot. */
+    u32 fresh = geom_ok ? sum : zan_src_sum(s, x0, y0, rw, rh);
     zan_blur_rect_core(surface_id, x, y, w, h, radius, cr, cmask);
     if (c->cap < n) {
         u32 *np = (u32 *)realloc(c->pixels, n * sizeof(u32));
@@ -848,6 +868,7 @@ static void zan_blur_cached_core(
         for (int i = 0; i < rw; i++) dst[i] = row[i];
     }
     c->x0 = x0; c->y0 = y0; c->rw = rw; c->rh = rh; c->r = r;
+    c->src_sum = fresh;
     c->sid = (int)surface_id;
     c->valid = 1;
 }
