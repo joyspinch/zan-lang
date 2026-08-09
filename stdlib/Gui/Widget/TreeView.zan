@@ -126,6 +126,18 @@ class TreeView : Control {
     /// 行被左键按下时（读取 ContextRow / ContextX / ContextY）。
     /// 供把行当拖拽源的宿主使用，例如设计器工具箱。
     UiEvent Press;
+    /// 拖动行改变次序后（读取 MoveFrom / MoveTo）。
+    UiEvent Move;
+
+    /// 拖动排序（WithReorder）的状态：按下的行、是否已经拖起来、
+    /// 松手时的插入位置，以及本帧是否要吃掉点击（拖完不应该
+    /// 顺带选中或展开落点那一行）。
+    bool reorder;
+    bool pressed;
+    int dragRow;
+    bool dragging;
+    int dropAt;
+    bool dropDone;
 
     void InitTree() {
         this.InitControl("tree", 5);
@@ -151,6 +163,13 @@ class TreeView : Control {
         Context = new UiEvent();
         Check = new UiEvent();
         Press = new UiEvent();
+        Move = new UiEvent();
+        reorder = false;
+        pressed = false;
+        dragRow = 0 - 1;
+        dragging = false;
+        dropAt = 0 - 1;
+        dropDone = false;
     }
 
     TreeView() { InitTree(); }
@@ -224,6 +243,20 @@ class TreeView : Control {
         return this;
     }
 
+    /// 启用拖动排序：按住一行拖动时画出插入位置，松手后触发
+    /// Move。树只报告「哪一行拖到了哪个插入点」，真正的次序由
+    /// 宿主在自己的模型上完成（树的节点列表下一帧照常重建）。
+    TreeView WithReorder() {
+        reorder = true;
+        return this;
+    }
+
+    /// 被拖动的行。
+    int MoveFrom() { return dragRow; }
+
+    /// 插入位置：行要放到这个索引之前；等于 Count() 表示放到末尾。
+    int MoveTo() { return dropAt; }
+
     int Count() { return data.Count; }
 
     /// 滚到底部；下一帧绘制时会被钳到实际最大偏移。
@@ -292,6 +325,7 @@ class TreeView : Control {
     TreeView OnContext(Action a) { Context.Add(a); return this; }
     TreeView OnCheck(Action a) { Check.Add(a); return this; }
     TreeView OnPress(Action a) { Press.Add(a); return this; }
+    TreeView OnMove(Action a) { Move.Add(a); return this; }
 
     /// 树为空时显示的文本。
     TreeView EmptyText(string text) { Empty = text; return this; }
@@ -453,8 +487,17 @@ class TreeView : Control {
             ctxRow = index;
             ctxX = app.mouseX;
             ctxY = app.mouseY;
+            if (reorder) {
+                pressed = true;
+                dragRow = index;
+                dragging = false;
+                dropAt = 0 - 1;
+            }
             Press.Post();
         }
+        // 刚刚拖完的那一次松手不是点击：否则落点那一行会被
+        // 顺带选中，目录还会被展开 / 折叠。
+        if (dropDone) { return id; }
         if (app.ClickAvailable()) {
             TreeNode n = data[index];
             int mods = app.window.EventMods();
@@ -472,8 +515,7 @@ class TreeView : Control {
                     else { marks.Add(index); }
                 }
                 ctxRow = index;
-                app.RequestRedraw();
-                app.window.Wake();
+                this.NoteSelfDamage(app);
                 return id;
             }
             if (multi && Modifiers.HasShift(mods) && sel.Get() >= 0) {
@@ -489,8 +531,7 @@ class TreeView : Control {
                     r = r + 1;
                 }
                 ctxRow = index;
-                app.RequestRedraw();
-                app.window.Wake();
+                this.NoteSelfDamage(app);
                 return id;
             }
             bool moved = sel.Get() != index;
@@ -504,8 +545,7 @@ class TreeView : Control {
             }
             if (moved) { Select.Post(); }
             if (app.DoubleClickNow()) { Activate.Post(); }
-            app.RequestRedraw();
-            app.window.Wake();
+            this.NoteSelfDamage(app);
         } else if (app.EventKind() == 2 && app.window.EventButton() == 1) {
             // 右键点击会把选择移到菜单所针对的行，
             // 但不触发 Select：打开上下文菜单不是选中。
@@ -519,10 +559,19 @@ class TreeView : Control {
             ctxX = app.mouseX;
             ctxY = app.mouseY;
             Context.Post();
-            app.RequestRedraw();
-            app.window.Wake();
+            this.NoteSelfDamage(app);
         }
         return id;
+    }
+
+    /// 选择、展开、折叠只改变树自己的那块像素，因此把损伤
+    /// 限定在控件矩形内：整窗重绘会把功能区、编辑器、预览
+    /// 一起重画，展开一个目录的 CPU 峰值就是这么来的。需要
+    /// 更大范围的宿主在它们的 Select/Expand 处理器里自行
+    /// 调用 RequestRedraw（处理器在下一帧之前执行）。
+    void NoteSelfDamage(App app) {
+        app.NoteDamage(bx, by, bw, bh);
+        app.window.Wake();
     }
 
     /// 行前的复选框：绘制三态框，点击时切换节点
@@ -551,7 +600,7 @@ class TreeView : Control {
             TreeView.ToggleCheck(data, row);
             ctxRow = row;
             Check.Post();
-            app.RequestRedraw();
+            this.NoteSelfDamage(app);
             return true;
         }
         return false;
@@ -599,11 +648,50 @@ class TreeView : Control {
         return scroll.Get();
     }
 
+    /// 拖动排序的每帧状态机：移动时更新插入位置，松手时把
+    /// 结果交给宿主。返回本帧是否刚刚完成一次拖放。
+    void UpdateDrag(App app, Rect rows) {
+        if (!reorder || !pressed || dragRow < 0) { return; }
+        int ek = app.EventKind();
+        if (ek == 1) {
+            if (!dragging && app.mouseY >= rows.y
+                && app.mouseY < rows.y + rows.height) {
+                dragging = true;
+            }
+            if (dragging) { this.NoteSelfDamage(app); }
+            return;
+        }
+        if (ek != 3) { return; }
+        bool moved = dragging && dropAt >= 0 && dropAt != dragRow
+            && dropAt != dragRow + 1;
+        if (moved) {
+            dropDone = true;
+            Move.Post();
+            rowsStale = true;
+        }
+        dragging = false;
+        pressed = false;
+        this.NoteSelfDamage(app);
+    }
+
+    /// 插入位置的横线（拖动排序时画在两行之间）。
+    void PaintDropLine(App app, Rect rows, int y) {
+        int h = app.Scale(2);
+        int py = y - h / 2;
+        if (py < rows.y) { py = rows.y; }
+        if (py > rows.y + rows.height - h) { py = rows.y + rows.height - h; }
+        app.canvas.FillRect(rows.x, py, rows.width, h, app.theme.primary);
+    }
+
     void PaintRows(App app, Rect rows) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int rowH = this.RowHeight(app);
         if (rows.height <= 0 || rowH <= 0) { return; }
+        this.UpdateDrag(app, rows);
+        bool dragNow = reorder && dragging;
+        int dropY = 0 - 1;
+        if (dragNow) { dropAt = data.Count; }
         int contentH = this.ContentHeight(app);
         int off = this.ScrollOffset(app, rows, contentH);
         bool overflow = contentH > rows.height;
@@ -635,6 +723,10 @@ class TreeView : Control {
                 }
                 bool onscreen = y + rh > rows.y && y < rows.y + rows.height;
                 Rect rb = new Rect(rows.x, y, rowW, rh);
+                if (dragNow && dropY < 0 && app.mouseY < y + rh / 2) {
+                    dropAt = k;
+                    dropY = y;
+                }
                 if (child != null) {
                     child.Arrange(rb.x, rb.y, rb.width, rb.height);
                     child.visible = onscreen;
@@ -668,7 +760,15 @@ class TreeView : Control {
                 children[k].visible = false;
             }
         }
+        if (dragNow) {
+            if (dropY < 0) { dropY = y; }
+            this.PaintDropLine(app, rows, dropY);
+        }
         c.PopClip();
+        // 本帧已经吃掉了拖放那一次松手；拖动源的行号留到下一次
+        // 按下才重置，因为 Move 处理器在本帧之后才跑，还要读
+        // MoveFrom()。
+        dropDone = false;
 
         if (overflow) {
             Scrollbar.RenderVerticalScroll(app, rows.x + rows.width - barW,

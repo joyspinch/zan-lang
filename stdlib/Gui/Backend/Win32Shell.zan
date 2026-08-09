@@ -250,6 +250,9 @@ class Win32Shell {
 
     static int windowWidth;
     static int windowHeight;
+    // 主框架可被拖到的最小物理尺寸（0 = 还没建窗口，用默认值）。
+    static int minTrackW;
+    static int minTrackH;
     static int dpi;
     static int titlebarH;
     static int buttonW;
@@ -520,15 +523,19 @@ class Win32Shell {
         } else if (msg == 0x0024 && hwnd == Win32Shell.mainHwnd
                 && Win32Shell.shapeMode == 0) {
             // WM_GETMINMAXINFO：MINMAXINFO.ptMinTrackSize（偏移 24）。
-            // 外壳布局低于 800x600 逻辑像素后不可用，因此
-            // 主框架拒绝被拖得更小（子窗口保持
-            // 默认限制）。异形窗口例外：其尺寸为
-            // 形状的包围盒（SetShape 调用 FitShapeWindow），
-            // 通常远小于 800x600。
+            // 外壳布局低于 800x600 逻辑像素后不可用，因此主框架拒绝
+            // 被拖得更小（子窗口保持默认限制）；但下限不会大于窗口
+            // 创建时的尺寸，否则小窗口程序一开就被撑成 800x600。
+            // 异形窗口例外：其尺寸为形状的包围盒
+            // （SetShape 调用 FitShapeWindow），通常远小于 800x600。
             int scale = Win32Shell.dpi;
             if (scale <= 0) { scale = 96; }
-            new Span<int>(lp + 24, 1)[0] = 800 * scale / 96;
-            new Span<int>(lp + 28, 1)[0] = 600 * scale / 96;
+            int mtW = Win32Shell.minTrackW;
+            int mtH = Win32Shell.minTrackH;
+            if (mtW <= 0) { mtW = 800 * scale / 96; }
+            if (mtH <= 0) { mtH = 600 * scale / 96; }
+            new Span<int>(lp + 24, 1)[0] = mtW;
+            new Span<int>(lp + 28, 1)[0] = mtH;
             return 0;
         } else if (msg == 0x0233) {                // WM_DROPFILES
             Win32Shell.OnDropFiles(hwnd, wp);
@@ -988,16 +995,26 @@ class Win32Shell {
             if (maxW > 0 && scaledW > maxW) { scaledW = maxW; }
             if (maxH > 0 && scaledH > maxH) { scaledH = maxH; }
         }
-        // ……并且，仅主框架，不低于缩放
-        // 限制强制的最小值（子窗口保持请求的任意尺寸）。
-        if (Win32Shell.mainHwnd == 0) {
-            int minW = 800 * deviceDpi / 96;
-            int minH = 600 * deviceDpi / 96;
-            if (scaledW < minW) { scaledW = minW; }
-            if (scaledH < minH) { scaledH = minH; }
-        }
+        // ……下限只保证窗口还画得出标题栏和一点客户区。设计出
+        // 160x450 这种窄窗口就得开成 160x450：以前主窗口被强行抬到
+        // 800x600，设计器里设的尺寸在运行时一律失效。
+        int minW = 120 * deviceDpi / 96;
+        int minH = (Win32Shell.titlebarH + 40 * deviceDpi / 96);
+        if (scaledW < minW) { scaledW = minW; }
+        if (scaledH < minH) { scaledH = minH; }
         Win32Shell.windowWidth = scaledW;
         Win32Shell.windowHeight = scaledH;
+        if (Win32Shell.mainHwnd == 0) {
+            // 主框架拖小的下限：外壳布局低于 800x600 就不能用了，
+            // 但本来就比它小的窗口（设计器里的 160x450）不能反过来
+            // 被这个下限撑大。
+            int trackW = 800 * deviceDpi / 96;
+            int trackH = 600 * deviceDpi / 96;
+            if (scaledW < trackW) { trackW = scaledW; }
+            if (scaledH < trackH) { trackH = scaledH; }
+            Win32Shell.minTrackW = trackW;
+            Win32Shell.minTrackH = trackH;
+        }
 
         nint rc = NativeMemory.Alloc(16);
         new Span<int>(rc, 1)[0] = 0;
@@ -1761,6 +1778,22 @@ class Win32Shell {
 
     // ---- 剪贴板 ----------------------------------------------------------
 
+    /// 剪贴板同一时刻只能被一个进程打开，而剪贴板查看器、
+    /// 输入法、浏览器都会在内容变化后瞬间打开它。只试一次就
+    /// 放弃，就是“复制粘贴时灵时不灵”的来源：短暂重试几次，
+    /// 对方用完就轮到我们。
+    static bool OpenClipboardRetry() {
+        int tries = 0;
+        while (tries < 12) {
+            if (Win32Shell.OpenClipboard(Win32Shell.mainHwnd) != 0) {
+                return true;
+            }
+            Win32Shell.SleepW(10);
+            tries = tries + 1;
+        }
+        return false;
+    }
+
     static bool SetClipboard(string text) {
         Win32Shell.Init();
         nint wide = Wide.Of(text);
@@ -1777,7 +1810,7 @@ class Win32Shell {
         NativeMemory.Copy(dst, wide, (units + 1) * 2);
         Win32Shell.GlobalUnlock(mem);
         Wide.Free(wide);
-        if (Win32Shell.OpenClipboard(Win32Shell.mainHwnd) == 0) {
+        if (!Win32Shell.OpenClipboardRetry()) {
             Win32Shell.GlobalFree(mem);
             return false;
         }
@@ -1794,7 +1827,7 @@ class Win32Shell {
     static string GetClipboard() {
         Win32Shell.Init();
         if (Win32Shell.IsClipboardFormatAvailable(13) == 0) { return ""; }
-        if (Win32Shell.OpenClipboard(Win32Shell.mainHwnd) == 0) { return ""; }
+        if (!Win32Shell.OpenClipboardRetry()) { return ""; }
         nint handle = Win32Shell.GetClipboardData(13);
         if (handle == 0) {
             Win32Shell.CloseClipboard();

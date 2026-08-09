@@ -19,10 +19,16 @@ class DropdownChrome {
         c.SurfaceRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary,
                            border, 1);
         int textY = Canvas.CenterTextY(y, h, t.fontSizeMedium);
-        c.DrawText(x + t.paddingMedium, textY, label, t.textPrimary,
-                   t.fontSizeMedium);
-        c.DrawGlyphIn("chevron-down",
-                      x + w - t.paddingLarge - t.iconSizeSmall, y,
+        // 标签只能用左内边距到箭头之间的宽度；超出的一律截断，
+        // 否则长模型名这类文本会直接画出触发器边框（盖到旁边的
+        // 控件上）。
+        int textX = x + t.paddingMedium;
+        int chevX = x + w - t.paddingLarge - t.iconSizeSmall;
+        c.DrawText(textX, textY,
+                   Ellipsis.Fit(label, chevX - textX - t.paddingSmall,
+                                t.fontSizeMedium),
+                   t.textPrimary, t.fontSizeMedium);
+        c.DrawGlyphIn("chevron-down", chevX, y,
                       t.iconSizeSmall, h, t.iconSizeSmall, t.textSecondary);
 
         app.hitTester.Register(new HitRegion(id, x, y, w, h, 0));
@@ -63,6 +69,8 @@ class Dropdown<T> : Control {
     int trigH;
     int lastSel;
     int maxVisible;
+    /// 条目是文本行（可以按最长文本量出面板宽度），还是模板控件行。
+    bool textRows;
 
     /// 选中不同条目时触发。
     UiEvent Change;
@@ -87,6 +95,7 @@ class Dropdown<T> : Control {
     /// 文本条目：`new Dropdown<City>(c => c.name)`。
     Dropdown(CellOf<T> text) {
         textOf = text;
+        textRows = true;
         this.InitDropdown(new ListView<T>(new ListColumn<T>("", text)));
     }
 
@@ -112,6 +121,11 @@ class Dropdown<T> : Control {
 
     /// 未选中任何条目时显示的提示文本。
     Dropdown<T> Hint(string text) { hint = text; return this; }
+
+    /// 组件条目（`new Dropdown<User>(u => UserCard(u))`）的触发器文本：
+    /// 模板行画的是控件，没有可显示的文本，不给这个的话触发器选中后
+    /// 仍然只显示提示语。
+    Dropdown<T> Label(CellOf<T> text) { textOf = text; return this; }
 
     /// 面板在滚动前显示的条目数。
     Dropdown<T> Rows(int n) {
@@ -187,6 +201,26 @@ class Dropdown<T> : Control {
 
     /// 延迟面板：在所有内容之后绘制并分发事件，因此位于
     /// 所有控件之上并接收最上层的点击。
+    /// 面板宽度：不窄于触发器，但至少能放下最长的一条文本。
+    /// 按触发器宽度开面板会把每一条都截成 "Agnes AI / agnes-2..."，
+    /// 选项之间看不出区别。模板行（组件条目）没有可量的文本，
+    /// 保持触发器宽度。
+    int PopupWidth(App app) {
+        int w = trigW;
+        if (!textRows || textOf == null) { return w; }
+        Theme t = app.theme;
+        // 列表行的左右内边距 + 滚动条位置（参见 ListView.PaintColumnRows）。
+        int chrome = t.paddingMedium * 3 + app.Scale(10);
+        int n = list.Count();
+        for (int i = 0; i < n; i = i + 1) {
+            int tw = Canvas.MeasureText(textOf(list.ItemAt(i)), t.fontSizeSmall);
+            if (tw + chrome > w) { w = tw + chrome; }
+        }
+        int room = app.canvas.Width() - app.Scale(8);
+        if (w > room) { w = room; }
+        return w;
+    }
+
     override void OnPaintOverlay(App app) {
         if (!open) { return; }
         Theme t = app.theme;
@@ -195,17 +229,18 @@ class Dropdown<T> : Control {
         if (vis > maxVisible) { vis = maxVisible; }
         if (vis < 1) { vis = 1; }
         int viewH = OverlayPopup.FitH(app, vis * rowH + app.Scale(2));
-        int popX = OverlayPopup.FitX(app, trigX, trigW);
+        int popW = this.PopupWidth(app);
+        int popX = OverlayPopup.FitX(app, trigX, popW);
         int popY = OverlayPopup.FitY(app, trigY + trigH + app.Scale(4),
                                      trigH, viewH);
 
         app.BlockHitsBelow();
         StyleBox pop = this.ResolvePartAs(app, "select", "popup", "popup",
                                           Class, Style.SSelected());
-        pop.Paint(app, popX, popY, trigW, viewH);
-        app.BlockHitsRect(popX, popY, trigW, viewH);
+        pop.Paint(app, popX, popY, popW, viewH);
+        app.BlockHitsRect(popX, popY, popW, viewH);
 
-        list.RenderInside(app, new Rect(popX, popY, trigW, viewH));
+        list.RenderInside(app, new Rect(popX, popY, popW, viewH));
 
         // 选择由列表负责；选中变化时关闭面板，并以一次 Change
         // 事件上报。
@@ -218,7 +253,7 @@ class Dropdown<T> : Control {
             return;
         }
         if (app.ClickAvailable()) {
-            bool inside = app.mouseX >= popX && app.mouseX < popX + trigW
+            bool inside = app.mouseX >= popX && app.mouseX < popX + popW
                 && app.mouseY >= popY && app.mouseY < popY + viewH;
             if (!inside) {
                 this.SetOpen(false);

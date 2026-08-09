@@ -1,0 +1,196 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// STRUCTURE（组件）面板的宿主侧行为：右键菜单、多选删除和拖动排序。
+///
+/// 面板本身只是标准库的 TreeView（多选、右键、拖放插入位置都在控件
+/// 里），这里做的只是把「第几行」翻译成设计器模型里的组件，再调用
+/// 设计器已有的删除 / 复制 / 排序接口——结构面板不持有第二份模型。
+partial class ZanIDE {
+    /// 组件树的一行对应的扁平下标（root 行和过滤不到的行返回 -1）。
+    int StructIndexAt(int row) {
+        if (row < 0 || structShow == null || row >= structShow.Count) {
+            return 0 - 1;
+        }
+        string p = structShow[row].path;
+        if (p == "" || ZanIDE.StartsWith(p, "@")) { return 0 - 1; }
+        return ZanIDE.OutlineLineOf(p);
+    }
+
+    /// 右键（或当前选中）涉及的所有行：右键点在多选里就作用于整组。
+    List<int> StructTargetRows() {
+        List<int> rows = new List<int>();
+        if (structTv == null) { return rows; }
+        if (structTv.IsMarked(ctxTarget)) {
+            rows = structTv.SelectedIndices();
+        } else if (ctxTarget >= 0) {
+            rows.Add(ctxTarget);
+        }
+        return rows;
+    }
+
+    /// 结构面板的组件可以改：表单设计器和场景设计器都有自己的模型，
+    /// 代码大纲只是符号列表，不参与删除 / 排序。
+    bool StructEditable() { return designerMode || sceneMode; }
+
+    static void StructureContext() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        ide.ctxKind = 6;
+        ide.ctxX = ide.structTv.ContextX();
+        ide.ctxY = ide.structTv.ContextY();
+        ide.ctxTarget = ide.structTv.ContextRow();
+    }
+
+    /// 删除结构面板里选中的组件（多选一起删），删完让树重建。
+    void StructureDeleteSelection() {
+        if (!this.StructEditable()) { return; }
+        List<int> rows = this.StructTargetRows();
+        int n = 0;
+        if (designerMode) {
+            List<FormField> flat = new List<FormField>();
+            ZanIDE.FlattenFields(formDesigner.fields, flat);
+            List<FormField> hit = new List<FormField>();
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                int fi = this.StructIndexAt(rows[i]);
+                if (fi >= 0 && fi < flat.Count) { hit.Add(flat[fi]); }
+            }
+            if (hit.Count == 0) { return; }
+            formDesigner.ClearExtraSel();
+            formDesigner.sel = hit[0];
+            for (int j = 1; j < hit.Count; j = j + 1) {
+                formDesigner.ToggleExtraSel(hit[j]);
+            }
+            n = hit.Count;
+            formDesigner.DeleteSelGroup();
+        } else {
+            List<SceneElement> ord = sceneDesigner.OrderedByZ();
+            List<SceneElement> hit = new List<SceneElement>();
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                int si = this.StructIndexAt(rows[i]);
+                if (si >= 0 && si < ord.Count) { hit.Add(ord[si]); }
+            }
+            if (hit.Count == 0) { return; }
+            sceneDesigner.sel = hit[0];
+            sceneDesigner.selExtra = new List<SceneElement>();
+            for (int j = 1; j < hit.Count; j = j + 1) {
+                sceneDesigner.ToggleExtraSel(hit[j]);
+            }
+            n = hit.Count;
+            sceneDesigner.DeleteSel();
+        }
+        structTv.ClearSelection();
+        structSig = "";
+        if (n > 1) {
+            Layer.Notify(ZanIDE.T("Deleted ", "已删除 ") + Convert.ToString(n)
+                + ZanIDE.T(" components", " 个组件"), 3);
+        } else {
+            Layer.Notify(ZanIDE.T("Deleted component", "已删除组件"), 3);
+        }
+    }
+
+    /// 复制右键那一个组件（表单是就地再来一份，场景走它自己的剪贴板）。
+    void StructureDuplicate() {
+        if (!this.StructEditable()) { return; }
+        int idx = this.StructIndexAt(ctxTarget);
+        if (idx < 0) { return; }
+        if (designerMode) {
+            List<FormField> flat = new List<FormField>();
+            ZanIDE.FlattenFields(formDesigner.fields, flat);
+            if (idx >= flat.Count) { return; }
+            formDesigner.ClearExtraSel();
+            formDesigner.sel = flat[idx];
+            formDesigner.DuplicateSel();
+        } else {
+            List<SceneElement> ord = sceneDesigner.OrderedByZ();
+            if (idx >= ord.Count) { return; }
+            sceneDesigner.sel = ord[idx];
+            sceneDesigner.selExtra = new List<SceneElement>();
+            sceneDesigner.CopySel();
+            sceneDesigner.PasteClip();
+        }
+        structSig = "";
+    }
+
+    /// 拖动排序：树给出「第几行拖到了哪个插入点」，这里换算成模型里
+    /// 的次序。表单只在同一个父容器内排序（跨层级要改的是归属，不是
+    /// 次序）；场景按行序重排 z 值。
+    static void StructureMoved() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || !ide.StructEditable()) { return; }
+        if (ide.structFilter != null && ide.structFilter.GetText() != "") {
+            Layer.Notify(ZanIDE.T("Clear the filter to reorder",
+                "清空筛选后才能拖动排序"), 3);
+            return;
+        }
+        int fromIdx = ide.StructIndexAt(ide.structTv.MoveFrom());
+        if (fromIdx < 0) { return; }
+        int toRow = ide.structTv.MoveTo();
+        if (ide.designerMode) { ide.MoveField(fromIdx, toRow); }
+        else { ide.MoveSceneElement(fromIdx, toRow); }
+        ide.structSig = "";
+    }
+
+    void MoveField(int fromIdx, int toRow) {
+        List<FormField> flat = new List<FormField>();
+        ZanIDE.FlattenFields(formDesigner.fields, flat);
+        if (fromIdx >= flat.Count) { return; }
+        FormField moved = flat[fromIdx];
+        FormField owner = formDesigner.ParentContainerOf(moved);
+        List<FormField> lst = formDesigner.fields;
+        if (owner != null) { lst = owner.kids; }
+        int at = lst.Count;
+        int toIdx = this.StructIndexAt(toRow);
+        if (toIdx >= 0 && toIdx < flat.Count) {
+            FormField before = flat[toIdx];
+            if (formDesigner.ParentContainerOf(before) != owner) {
+                Layer.Notify(ZanIDE.T("Reorder within the same container",
+                    "只能在同一个容器内排序"), 3);
+                return;
+            }
+            at = formDesigner.IndexIn(lst, before);
+        }
+        int from = formDesigner.IndexIn(lst, moved);
+        if (from < 0 || at < 0 || at == from) { return; }
+        if (at > from) { at = at - 1; }
+        List<FormField> res = formDesigner.ListMove(lst, from, at);
+        if (owner == null) { formDesigner.fields = res; }
+        else { owner.kids = res; }
+    }
+
+    /// 场景树最上面一行是 z 最大的元素，所以行序是 z 序的逆序：按新的
+    /// 行序把 z 重新编号，避免只调一个元素的 z 时和别人撞号。
+    void MoveSceneElement(int fromIdx, int toRow) {
+        List<SceneElement> ord = sceneDesigner.OrderedByZ();
+        int n = ord.Count;
+        if (fromIdx >= n) { return; }
+        List<SceneElement> rows = new List<SceneElement>();
+        for (int i = n - 1; i >= 0; i = i - 1) { rows.Add(ord[i]); }
+        int from = n - 1 - fromIdx;
+        // 行 0 是场景根节点，元素行从 1 开始。
+        int at = toRow - 1;
+        if (at < 0) { at = 0; }
+        if (at > rows.Count) { at = rows.Count; }
+        if (at == from) { return; }
+        if (at > from) { at = at - 1; }
+        SceneElement mv = rows[from];
+        List<SceneElement> res = new List<SceneElement>();
+        int k = 0;
+        for (; k < rows.Count; k = k + 1) {
+            if (k != from) { res.Add(rows[k]); }
+        }
+        List<SceneElement> outp = new List<SceneElement>();
+        k = 0;
+        while (k < res.Count) {
+            if (k == at) { outp.Add(mv); }
+            outp.Add(res[k]);
+            k = k + 1;
+        }
+        if (at >= res.Count) { outp.Add(mv); }
+        sceneDesigner.PushUndo();
+        for (k = 0; k < outp.Count; k = k + 1) {
+            outp[k].Order(outp.Count - k);
+        }
+    }
+}

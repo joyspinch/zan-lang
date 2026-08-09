@@ -84,6 +84,11 @@ class ListView<T> : Control {
     /// 未重建任何行的帧里，选择状态也能保留。
     bool rowsStale;
     int builtFor;
+    /// 模板行独占的 WidgetId 段起点（-1 = 还没建过行）。
+    int rowSeqBase;
+
+    /// 模板行独占的 id 段长度：够放几百行、每行十来个控件。
+    static int RowIdReserve() { return 4096; }
 
     /// 某行被选中（读取 SelectedIndex / Selected）。
     UiEvent Select;
@@ -105,6 +110,7 @@ class ListView<T> : Control {
         scroll = new SignalInt(0);
         rowsStale = true;
         builtFor = -1;
+        rowSeqBase = -1;
         wiresOwnEvents = true;
         Select = new UiEvent();
         Activate = new UiEvent();
@@ -159,6 +165,11 @@ class ListView<T> : Control {
     /// 绑定调用方的列表。列表不拷贝，因此这是其实时视图；
     /// 需要重建自定义行的变更之后，调用 Refresh()。
     ListView<T> Bind(List<T> src) {
+        // 模板行重建一次，行里的控件就拿到一批新的 WidgetId；而点击
+        // 是拿上一帧的命中区解析的，每帧都重建的话行内按钮永远对不
+        // 上号，看着能按却没反应（点击落到行上）。绑的还是同一个
+        // 列表就不重建。
+        if (data == src) { return this; }
         data = src;
         rowsStale = true;
         if (sel >= this.Count()) { sel = -1; }
@@ -254,6 +265,17 @@ class ListView<T> : Control {
     /// 它们。
     void BuildRows(App app) {
         if (!rowsStale && builtFor == this.Count()) { return; }
+        // 行控件的 WidgetId 是构造时领的，重建就换一批；而指针目标是
+        // 按上一帧的 id 解析的，所以行内按钮（关闭 ×、开关）会永远
+        // 收不到自己的点击，点击落到行上，看起来就是点了没反应 / 穿透。
+        // 因此首次构建时独占一段 id，每次重建都从这段的起点重新
+        // 发号，行控件的 id 因而跨重建稳定，也不会和别人撞号。
+        int resume = WidgetId.SeqValue();
+        if (rowSeqBase < 0) {
+            rowSeqBase = resume;
+            resume = resume + ListView.RowIdReserve();
+        }
+        WidgetId.SetSeq(rowSeqBase);
         children = new List<Control>();
         int n = this.Count();
         for (int i = 0; i < n; i = i + 1) {
@@ -266,6 +288,11 @@ class ListView<T> : Control {
         }
         rowsStale = false;
         builtFor = n;
+        // 行用掉的 id 超出预留段时，以实际用量为准往后推，
+        // 宁可丢一次点击也不能把 id 发给两个控件。
+        int used = WidgetId.SeqValue();
+        if (used < resume) { WidgetId.SetSeq(resume); }
+        else { rowSeqBase = used; }
         for (int k = 0; k < children.Count; k = k + 1) {
             children[k].MeasureTree(app);
         }
@@ -307,8 +334,7 @@ class ListView<T> : Control {
         if (app.EventKind() == 2 && app.window.EventButton() == 1) {
             sel = index;
             Context.Post();
-            app.RequestRedraw();
-            app.window.Wake();
+            this.NoteSelfDamage(app);
             return id;
         }
         if (app.ClickAvailable()) {
@@ -340,10 +366,18 @@ class ListView<T> : Control {
                 if (again) { Activate.Post(); }
                 else { Select.Post(); }
             }
-            app.RequestRedraw();
-            app.window.Wake();
+            this.NoteSelfDamage(app);
         }
         return id;
+    }
+
+    /// 选中一行只改变列表自己的像素，因此把损伤限定在控件矩形
+    /// 内，而不是整窗重绘（弹层里的列表会自动退回整窗重绘：
+    /// 覆盖层存在时 NoteDamage 本就不生效）。需要更大范围的宿主
+    /// 在自己的 Select/Activate 处理器里调用 RequestRedraw。
+    void NoteSelfDamage(App app) {
+        app.NoteDamage(bx, by, bw, bh);
+        app.window.Wake();
     }
 
     void PaintEmpty(App app) {

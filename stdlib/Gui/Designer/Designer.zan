@@ -70,6 +70,12 @@ partial class Designer {
     List<TreeNode> palNodes;
     List<int> palKind;
     List<string> palCustom;
+    // 单击工具箱添加组件被推迟到抬起：按下时还不知道这是一次点击
+    // 还是一次拖拽，立刻添加会让拖入的第一个组件变成两个
+    // （点击加一个、放下再加一个）。
+    bool palClickPending;
+    int palClickKind;
+    string palClickCustom;
     bool palBuilt;      // 节点表是否已构建
     string palBuiltQ;   // 上次构建节点时的过滤串
     int palBuiltUser;   // 上次构建节点时的用户组件数量
@@ -321,6 +327,9 @@ partial class Designer {
         this.hideStar = false;
         this.showSubmit = false;
         this.showReset = false;
+        this.palClickPending = false;
+        this.palClickKind = 0;
+        this.palClickCustom = "";
         this.dragging = false;
         this.dragFromPalette = false;
         this.dragCustomKind = "";
@@ -425,11 +434,37 @@ partial class Designer {
 
     // --- 字段变更 ------------------------------------------------------
 
-    /// 添加新组件。有活动容器时组件会嵌套
-    /// 进去（Tabs 则进入活动标签页）；否则追加到
-    /// 顶层表单。添加容器后会把它设为活动容器，
-    /// 可以立刻往里面放置组件。
+    /// `f` 是否还挂在设计树上。删除组件后 activeContainer /
+    /// dropContainer 这类引用可能指向已经被删掉的容器，往里加组件
+    /// 会得到一个谁也看不见、也存不下去的字段。
+    bool FieldAlive(List<FormField> lst, FormField f) {
+        for (int i = 0; i < lst.Count; i = i + 1) {
+            if (lst[i] == f) { return true; }
+            if (this.FieldAlive(lst[i].kids, f)) { return true; }
+        }
+        return false;
+    }
+
+    /// 丢弃指向已删组件的容器引用。
+    void DropDeadRefs() {
+        if (activeContainer != null && !this.FieldAlive(fields, activeContainer)) {
+            activeContainer = null;
+        }
+        if (dropContainer != null && !this.FieldAlive(fields, dropContainer)) {
+            dropContainer = null;
+        }
+        if (sel != null && !this.FieldAlive(fields, sel)) {
+            sel = null;
+            selPrev = null;
+            freeExtra = new List<FormField>();
+        }
+    }
+
+    /// 添加新组件。有活动容器时组件会嵌套进去（Tabs 则进入活动
+    /// 标签页）；否则追加到顶层表单。添加容器后会把它设为活动
+    /// 容器，可以立刻往里面放置组件。
     void AddField(int ftype) {
+        this.DropDeadRefs();
         FormField f = FormField.New(ftype, seq);
         seq = seq + 1;
         if (FormField.IsNonVisualOf(ftype)) {
@@ -479,6 +514,7 @@ partial class Designer {
     /// Card 包裹（WinForms UserControl 风格）。
     void AddUserComponent(int k) {
         if (k < 0 || k >= userComps.Count) { return; }
+        this.DropDeadRefs();
         List<FormField> parsed = ParseComponentFields(userComps[k].json);
         FormField f;
         if (parsed.Count == 1 && parsed[0].IsContainer()) {
@@ -507,6 +543,7 @@ partial class Designer {
     /// 按 ProjectComponents tag 添加发现的项目自定义组件
     /// 到表单/活动容器，与内置组件的 AddField 对应。
     void AddCustomField(string kind) {
+        this.DropDeadRefs();
         FormField f = FormField.NewCustom(kind, seq);
         seq = seq + 1;
         if (activeContainer != null) {
@@ -710,6 +747,12 @@ partial class Designer {
     /// 无论从功能区按钮还是 Delete 键触发，都走这里，
     /// 保证多选里的每一个都被删掉（而不是只删主选中项）。
     void DeleteSelGroup() {
+        dropContainer = null;
+        activeContainer = null;
+        dragging = false;
+        dragFromPalette = false;
+        dragMoved = false;
+        dragIndex = -1;
         List<FormField> extra = freeExtra;
         freeExtra = new List<FormField>();
         int n = 0;
@@ -859,8 +902,11 @@ partial class Designer {
         if (hostPanels) { inspX = palX + avail; }
         RenderStatus(app, c, t, palX, bot + app.Scale(4), inspX + inspW - palX);
 
-        // 在表单外结束的拖拽直接取消。
+        // 在表单外结束的拖拽直接取消。指针没动过就是一次点击，
+        // 按工具箱的点击添加处理。
         if (dragging && ek == 3) {
+            if (dragFromPalette && !dragMoved) { this.PalClickRelease(); }
+            palClickPending = false;
             dragging = false;
             dragFromPalette = false;
             dragMoved = false;
@@ -1070,20 +1116,28 @@ partial class Designer {
     }
 
     /// 单击工具箱里的组件即添加一个；随后清掉选中，
-    /// 这样连点同一行可以连续添加。
+    /// 这样连点同一行可以连续添加。实际添加发生在抬起时
+    /// （见 PalClickRelease），因为按下这一刻还分不清点击和拖拽。
     void PalActivate() {
         int row = this.PalLeafRow();
         if (row < 0) { return; }
-        int kind = palKind[row];
-        string custom = palCustom[row];
+        palClickKind = palKind[row];
+        palClickCustom = palCustom[row];
+        palClickPending = true;
         palTv.ClearSelection();
-        if (kind == 200) {
-            int k = this.UserCompIndex(custom);
+    }
+
+    /// 在工具箱上按下又原地抬起：这是一次点击，添加组件。
+    void PalClickRelease() {
+        if (!palClickPending) { return; }
+        palClickPending = false;
+        if (palClickKind == 200) {
+            int k = this.UserCompIndex(palClickCustom);
             if (k >= 0) { AddUserComponent(k); }
-        } else if (custom != "") {
-            AddCustomField(custom);
+        } else if (palClickCustom != "") {
+            AddCustomField(palClickCustom);
         } else {
-            AddField(kind);
+            AddField(palClickKind);
         }
     }
 
