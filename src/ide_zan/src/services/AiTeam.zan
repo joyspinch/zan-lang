@@ -4,7 +4,7 @@ using System;
 ///
 /// `next` is the role work flows to when this member's stage passes, which is
 /// what makes the pipeline a fixed chain instead of six agents guessing who
-/// goes next: 产品经理 -> 架构师 -> 开发者 -> 测试工程师 -> 代码审查员 ->
+/// goes next: 产品经理 -> 架构师 -> 素材设计师 -> 开发者 -> 测试工程师 -> 代码审查员 ->
 /// 安全审计员 -> 产品经理. A member that finds a defect always sends it back
 /// to the developer (`AiTeam.FixOwner()`), never onward.
 class AiRole {
@@ -118,6 +118,7 @@ class AiTeam {
     static string Qa() { return "qa"; }
     static string Rev() { return "rev"; }
     static string Sec() { return "sec"; }
+    static string Art() { return "art"; }
 
     /// The member a defect always goes back to.
     static string FixOwner() { return AiTeam.Dev(); }
@@ -133,6 +134,22 @@ class AiTeam {
 
     static void SetModels(string mapJson) { AiTeam.sRoleModels = mapJson; }
 
+    /// The user's per-member prompt overrides (role id -> prompt), refreshed
+    /// alongside the models. An empty entry means "use the built-in charter".
+    static string sRolePrompts;
+
+    static void SetPrompts(string mapJson) { AiTeam.sRolePrompts = mapJson; }
+
+    /// The member's own charter as configured: the user's text when it set
+    /// one, else the built-in default.
+    static string PromptOf(string roleId) {
+        if (AiTeam.sRolePrompts != null) {
+            string custom = ZanIDE.AiRoleModel(AiTeam.sRolePrompts, roleId);
+            if (custom != null && custom != "") { return custom; }
+        }
+        return AiTeam.DefaultDuty(roleId);
+    }
+
     /// The model `roleId` runs on, or "" to use the provider's default model.
     static string ModelOf(string roleId) {
         if (AiTeam.sRoleModels == null) { return ""; }
@@ -145,8 +162,11 @@ class AiTeam {
             AiTeam.Arch(),
             "澄清需求、写需求卡、对用户负责", 0));
         rs.Add(AiRole.Create(AiTeam.Arch(), "Architect", "架构师",
-            AiTeam.Dev(),
+            AiTeam.Art(),
             "拆任务、定接口与文件边界、写验收标准", 1));
+        rs.Add(AiRole.Create(AiTeam.Art(), "Asset Designer", "素材设计师",
+            AiTeam.Dev(),
+            "产出界面与游戏素材：图标、皮肤、精灵图与配色", 6));
         rs.Add(AiRole.Create(AiTeam.Dev(), "Developer", "开发者",
             AiTeam.Qa(),
             "实现任务卡并保证能编译通过", 2));
@@ -221,6 +241,10 @@ class AiTeam {
             || low == "reviewer" || low == "rev") { return AiTeam.Rev(); }
         if (n == "安全" || n == "安全审计" || low == "sec"
             || low == "security" || low == "auditor") { return AiTeam.Sec(); }
+        if (n == "素材" || n == "美术" || n == "设计师" || low == "art"
+            || low == "artist" || low == "asset" || low == "designer") {
+            return AiTeam.Art();
+        }
         return "";
     }
 
@@ -581,6 +605,9 @@ class AiTeam {
         if (roleId == AiTeam.Rev() || roleId == AiTeam.Sec()) {
             return tool == "diff";
         }
+        if (roleId == AiTeam.Art()) {
+            return tool == "write_file" || tool == "edit_file";
+        }
         // Product manager and architect stay read-only.
         return false;
     }
@@ -668,11 +695,11 @@ class AiTeam {
     /// park on a question instead of guessing).
     static string ProtocolPrompt() {
         StringBuilder sb = new StringBuilder();
-        sb.Append("TEAM PROTOCOL. You are one member of a six-member team in a"
-            + " group chat with the user. Members: @产品经理 (Product Manager),"
-            + " @架构师 (Architect), @开发者 (Developer), @测试工程师 (Test"
-            + " Engineer), @代码审查员 (Code Reviewer), @安全审计员 (Security"
-            + " Auditor).\n"
+        sb.Append("TEAM PROTOCOL. You are one member of a seven-member team in"
+            + " a group chat with the user. Members: @产品经理 (Product"
+            + " Manager), @架构师 (Architect), @素材设计师 (Asset Designer),"
+            + " @开发者 (Developer), @测试工程师 (Test Engineer), @代码审查员"
+            + " (Code Reviewer), @安全审计员 (Security Auditor).\n"
             + "Every message you send starts with a routing header:\n"
             + "  @<member> [<kind> <taskId> <NN%>] then your text\n"
             + "Kinds: assign (hand a task over), ack (you accept a task --"
@@ -723,13 +750,30 @@ class AiTeam {
             return "YOUR TOOLS: the read tools, plus diff. You are read-only"
                 + " by design -- you judge the change, you never edit it.\n\n";
         }
+        if (roleId == AiTeam.Art()) {
+            return "YOUR TOOLS: the read tools, plus write_file and edit_file"
+                + " for asset files only (icons, skins, sprite sheets, style"
+                + " sheets). You do NOT have build/run: hand the assets to the"
+                + " developer.\n\n";
+        }
         return "YOUR TOOLS: the read tools and plan only. You do not edit,"
             + " build or run anything.\n\n";
     }
 
-    /// The member's own charter: what it is for, what it must produce, and who
-    /// it hands to.
+    /// The member's own charter: the configured prompt when the user wrote
+    /// one in the settings, else the built-in default below.
     static string DutyPrompt(string roleId) {
+        if (AiTeam.sRolePrompts != null) {
+            string custom = ZanIDE.AiRoleModel(AiTeam.sRolePrompts, roleId);
+            if (custom != null && custom != "") { return custom + "\n\n"; }
+        }
+        return AiTeam.DefaultDuty(roleId);
+    }
+
+    /// The built-in charter of a member: what it is for, what it must produce,
+    /// and who it hands to. This is also what the settings window offers as
+    /// the default text of a member's prompt box.
+    static string DefaultDuty(string roleId) {
         if (roleId == AiTeam.Pm()) {
             return "YOU ARE @产品经理 (Product Manager). You are the only member"
                 + " who owns the conversation with the user.\n"
@@ -796,6 +840,25 @@ class AiTeam {
                 + " personal taste. Cite path:line for every point.\n"
                 + "- Problems -> [block] to @开发者, one concrete change each."
                 + " Clean -> [handoff] to @安全审计员.\n\n";
+        }
+        if (roleId == AiTeam.Art()) {
+            return "YOU ARE @素材设计师 (Asset Designer). You produce the UI and"
+                + " game assets a task needs, as files in the project.\n"
+                + "- Icons and UI marks: write vector glyph / SVG-style assets"
+                + " that read at 16px as well as at 64px, on one grid, in one"
+                + " stroke weight.\n"
+                + "- Skins and palettes: derive a full palette (surfaces, text,"
+                + " border, accent, states) from the requested mood, keep text"
+                + " on surface contrast readable, and write it as a skin /"
+                + " style sheet the app can load.\n"
+                + "- Game assets: sprite sheets, tiles and simple animation"
+                + " frames at a stated pixel size, with a consistent light"
+                + " direction and a named frame layout the code can index.\n"
+                + "- Always state the asset's path, size, and how the code"
+                + " should reference it; reuse the project's existing assets"
+                + " and naming instead of inventing a parallel set.\n"
+                + "- Then [handoff] to @开发者 to wire the assets in. You do not"
+                + " write program logic.\n\n";
         }
         if (roleId == AiTeam.Sec()) {
             return "YOU ARE @安全审计员 (Security Auditor). You audit the change"
@@ -957,6 +1020,7 @@ class AiTeam {
         if (id == AiTeam.Qa()) { return "warning"; }
         if (id == AiTeam.Rev()) { return "info"; }
         if (id == AiTeam.Sec()) { return "danger"; }
+        if (id == AiTeam.Art()) { return "primary"; }
         return "";
     }
 
