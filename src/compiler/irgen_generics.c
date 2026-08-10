@@ -680,6 +680,9 @@ static void emit_eh_tmp_drop(zan_irgen_t *g, LLVMValueRef obj);
  * it must release the previous occupant and retain the new one. */
 static int local_slot_owns_rc(local_var_t *v) {
     if (!v || v->arc_owned != 1 || !v->type || !is_rc_managed_type(v->type)) return 0;
+    /* A `ref`/`out` parameter writes through the caller's owning slot, whose
+     * storage is a pointer parameter rather than an alloca instruction. */
+    if (v->byref_slot) return 1;
     /* A boxed local (A33-2b) keeps its value in a heap cell; `alloca` points
      * into that cell rather than being an alloca instruction. */
     if (v->box_cell) return 1;
@@ -700,7 +703,7 @@ static int local_is_dyn_obj(zan_irgen_t *g, local_var_t *v) {
  * local is released as a whole cell instead (its destructor releases the value
  * inside), so releasing the slot here as well would double-release. */
 static int local_owns_arc(local_var_t *v) {
-    return local_slot_owns_rc(v) && !v->box_cell;
+    return local_slot_owns_rc(v) && !v->box_cell && !v->byref_slot;
 }
 
 /* Boxed locals are released as a whole cell: the last reference out (this

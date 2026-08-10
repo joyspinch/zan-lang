@@ -1274,6 +1274,14 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                           LLVMGetParam(fn, (unsigned)(k + param_offset)), pt);
                 if (pt && pt->kind == TYPE_STRING)
                     locals->vars[locals->count - 1].opaque_string = 1;
+                /* The caller's slot owns the reference it holds, so writing
+                 * through it must retain the new value and release the old
+                 * one; scope exit leaves it alone (byref_slot). Without this
+                 * `out string s; s = v;` handed the caller a borrowed value
+                 * it then released -- a refcount deficit that double-frees. */
+                if (is_rc_managed_type(pt))
+                    locals->vars[locals->count - 1].byref_slot =
+                        locals->vars[locals->count - 1].arc_owned = 1;
                 continue;
             }
             LLVMValueRef param_alloca = LLVMBuildAlloca(g->builder, param_types[k + param_offset], "p");
@@ -1896,6 +1904,11 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
         unsigned pi = (unsigned)(k + this_off);
         if (param->param.by_ref) {
             local_add(locals, param->param.name, LLVMGetParam(sp.fn, pi), pt);
+            if (pt && pt->kind == TYPE_STRING)
+                locals->vars[locals->count - 1].opaque_string = 1;
+            if (is_rc_managed_type(pt))
+                locals->vars[locals->count - 1].byref_slot =
+                    locals->vars[locals->count - 1].arc_owned = 1;
             continue;
         }
         LLVMValueRef param_alloca = LLVMBuildAlloca(g->builder, param_types[pi], "p");

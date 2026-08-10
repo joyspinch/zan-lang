@@ -2500,6 +2500,11 @@ typedef struct {
      * reference; the next store and scope exit release it only when set. NULL
      * for every other local. */
     LLVMValueRef obj_rc_flag;
+    /* 1 for a `ref`/`out` parameter: `alloca` is the caller's slot, not an
+     * alloca in this frame. The caller owns the reference it holds, so a
+     * write through the slot must release the old occupant and retain the
+     * new one -- while scope exit must NOT release it. */
+    int          byref_slot;
 } local_var_t;
 
 /* A function's locals live in a single flat scope. The backing array grows
