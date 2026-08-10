@@ -480,7 +480,9 @@ class Worker {
             return;
         }
 
-        PrintBanner(procs);
+        // The banner is printed inside RunAsMaster, once the control port is
+        // actually claimed: a second instance used to announce "Start
+        // success." and only then die on the port conflict.
         await RunAsMaster(procs);
     }
 
@@ -658,6 +660,21 @@ class Worker {
     static List<TcpClient> chConn = new List<TcpClient>();
     static int rrCounter = 0;
 
+    /// The platform error text for the socket call that just failed. Read it
+    /// immediately: any later socket call -- even a successful close --
+    /// overwrites the platform error.
+    static string SocketErr() {
+        #if WINDOWS
+        return "WSA error " + Convert.ToString(Socket.LastSocketError());
+        #else
+        return "errno " + Convert.ToString(Socket.LastSocketError());
+        #endif
+    }
+
+    // Error from the last failed BindSocket, captured there because the
+    // failure path closes the socket before the caller can read it.
+    static string lastBindErr;
+
     /// True when something ACCEPTS a connection on the control port, i.e. a
     /// master really is running. A port that merely refuses the connection is
     /// a leftover socket (TIME_WAIT) and can be reclaimed.
@@ -675,6 +692,16 @@ class Worker {
         // master (e.g. env vars failed to propagate), its bind fails here and
         // it exits instead of spawning children of its own.
         nint ctlSock = Socket.CreateTcp();
+        if (ctlSock < 0) {
+            // Not a port problem at all: the socket layer itself is
+            // unavailable (on Windows, WSAStartup never ran -- error 10093).
+            // Blaming the control port here sent people hunting for a
+            // conflict that does not exist.
+            Console.WriteLine("[Worker] FATAL: cannot create the control"
+                + " socket (" + SocketErr() + "); the socket layer is"
+                + " unavailable, so no port would work");
+            exit(1);
+        }
         #if !WINDOWS
         // Lets a restart rebind while the previous master's control
         // connections are still in TIME_WAIT. On POSIX this does not allow a
@@ -685,6 +712,9 @@ class Worker {
         #endif
         int ctlBind = Socket.Bind(ctlSock, "127.0.0.1", ControlPort());
         if (ctlBind != 0) {
+            // The error code has to be read now: the probe and close below
+            // both overwrite it.
+            string firstErr = SocketErr();
             // A failed bind does not mean a master owns the port: on Windows
             // the previous master's control port sits in TIME_WAIT for about
             // two minutes after it exits, and SO_REUSEADDR is not set there
@@ -701,18 +731,30 @@ class Worker {
             }
             Socket.Close(ctlSock);
             ctlSock = Socket.CreateTcp();
+            if (ctlSock < 0) {
+                Console.WriteLine("[Worker] FATAL: cannot create the control"
+                    + " socket (" + SocketErr() + ")");
+                exit(1);
+            }
             Socket.SetReuseAddr(ctlSock);
             ctlBind = Socket.Bind(ctlSock, "127.0.0.1", ControlPort());
             if (ctlBind != 0) {
+                // Both attempts failed and nothing answers on the port, so
+                // the reason is neither a running master nor a leftover
+                // socket. Print what the OS said instead of guessing.
                 Console.WriteLine("[Worker] FATAL: cannot bind control port "
                     + Convert.ToString(ControlPort())
-                    + "; start with --ctl-port N to pick another one");
+                    + " (" + firstErr + ", retry with SO_REUSEADDR: "
+                    + SocketErr() + "); nothing answers on it, so it is not a"
+                    + " running master -- start with --ctl-port N to pick"
+                    + " another one");
                 exit(1);
             }
             Console.WriteLine("[Worker] control port "
                 + Convert.ToString(ControlPort())
                 + " was left behind by a previous run; reclaimed it");
         }
+        PrintBanner(procs);
         Socket.Listen(ctlSock, 64);
         Socket.SetNonBlocking(ctlSock);
 
@@ -725,7 +767,8 @@ class Worker {
             nint s = w.BindSocket(false);
             if (s < 0) {
                 Console.WriteLine("[Worker] FATAL: cannot bind " + w.protocol
-                    + "://" + w.host + ":" + Convert.ToString(w.port));
+                    + "://" + w.host + ":" + Convert.ToString(w.port)
+                    + " (" + Worker.lastBindErr + ")");
                 exit(1);
             }
             if (w.protocol == "udp") {
@@ -1351,7 +1394,11 @@ class Worker {
             Socket.SetReuseAddr(u);
             if (reusePort) { Socket.SetReusePort(u); }
             int r = Socket.Bind(u, this.host, this.port);
-            if (r != 0) { Socket.Close(u); return -1; }
+            if (r != 0) {
+                Worker.lastBindErr = SocketErr();
+                Socket.Close(u);
+                return -1;
+            }
             Socket.SetNonBlocking(u);
             return u;
         }
@@ -1359,7 +1406,11 @@ class Worker {
         Socket.SetReuseAddr(s);
         if (reusePort) { Socket.SetReusePort(s); }
         int r2 = Socket.Bind(s, this.host, this.port);
-        if (r2 != 0) { Socket.Close(s); return -1; }
+        if (r2 != 0) {
+            Worker.lastBindErr = SocketErr();
+            Socket.Close(s);
+            return -1;
+        }
         Socket.Listen(s, 511);
         Socket.SetNonBlocking(s);
         return s;
@@ -1369,7 +1420,8 @@ class Worker {
         nint s = this.BindSocket(false);
         if (s < 0) {
             Console.WriteLine("[Worker] FATAL: cannot bind " + this.protocol
-                + "://" + this.host + ":" + Convert.ToString(this.port));
+                + "://" + this.host + ":" + Convert.ToString(this.port)
+                + " (" + Worker.lastBindErr + ")");
             return;
         }
         await this.RunOnSocket(s);
