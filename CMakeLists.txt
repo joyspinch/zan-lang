@@ -639,6 +639,18 @@ add_test(NAME diag_ctor_missing_parameterless
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_ctor_missing_parameterless PROPERTIES TIMEOUT 60)
 
+# A complete object initializer builds the object itself, so it may stand in
+# for the parameterless constructor the class does not have; a partial one
+# leaves the members it skips zero-filled and must still be rejected.
+add_test(NAME diag_ctor_initializer_partial
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/ctor_initializer_partial.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_ctor_initializer_partial${_exe_ext}
+    "-DEXPECT_REGEX=no constructor of .Box. takes 0 argument"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_ctor_initializer_partial PROPERTIES TIMEOUT 60)
+
 # A cast is the one expression whose operand and target the checker used to
 # skip entirely, so an impossible conversion reinterpreted the operand's bits
 # instead of failing: `(int)"abc"` handed back the string pointer.

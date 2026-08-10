@@ -469,6 +469,39 @@ static int ctor_arg_count(zan_checker_t *c, zan_ast_node_t *expr,
     return n;
 }
 
+/* True when `expr`'s object initializer writes every instance field and
+ * property the type (and its bases) declare -- the one case where running no
+ * constructor still leaves a whole object, so `new T { A = 1, B = 2 }` needs
+ * no parameterless constructor to stand in. A partial initializer does not
+ * qualify: the members it skips would stay zero-filled, which is exactly the
+ * half-built instance the diagnostic below exists to prevent. */
+static bool initializer_covers_all_members(zan_ast_node_t *expr,
+                                           zan_symbol_t *type_sym,
+                                           int init_start) {
+    int covered = 0;
+    int members = 0;
+    for (zan_symbol_t *t = type_sym; t; ) {
+        for (int i = 0; i < t->member_count; i++) {
+            zan_symbol_t *m = t->members[i];
+            if (!m || (m->kind != SYM_FIELD && m->kind != SYM_PROPERTY))
+                continue;
+            if (m->modifiers & MOD_STATIC) continue;
+            members++;
+            for (int a = init_start; a < expr->new_expr.args.count; a++) {
+                zan_ast_node_t *as = expr->new_expr.args.items[a];
+                zan_istr_t n = as->binary.left->ident.name;
+                if (n.len == m->name.len &&
+                    memcmp(n.str, m->name.str, (size_t)n.len) == 0) {
+                    covered++;
+                    break;
+                }
+            }
+        }
+        t = (t->type && t->type->base_type) ? t->type->base_type->sym : NULL;
+    }
+    return members > 0 && covered == members;
+}
+
 static void check_ctor_available(zan_checker_t *c, zan_type_t *type,
                                  zan_ast_node_t *expr) {
     if (!type || type->kind != TYPE_CLASS || !type->sym) return;
@@ -476,6 +509,12 @@ static void check_ctor_available(zan_checker_t *c, zan_type_t *type,
     zan_symbol_t *sym = type->sym;
     int declared = 0;
     int argc = ctor_arg_count(c, expr, sym);
+    /* `new T { ... }` with no constructor arguments but a complete object
+     * initializer builds the object itself; see above. */
+    if (argc == 0 && argc < expr->new_expr.args.count &&
+        initializer_covers_all_members(expr, sym, argc)) {
+        return;
+    }
     for (int i = 0; i < sym->member_count; i++) {
         zan_symbol_t *m = sym->members[i];
         if (!m || m->kind != SYM_CONSTRUCTOR || !m->decl) continue;
