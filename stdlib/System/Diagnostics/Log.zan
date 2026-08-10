@@ -1,0 +1,160 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+
+namespace System.Diagnostics;
+
+/// <summary>
+/// 进程级滚动文件日志。写文件是日志的默认去处：服务跑在后台（worker、
+/// 守护进程、Windows 上没有控制台）时，只写 stdout 等于什么都没记，
+/// 出事后无从查起。
+///
+/// 文件名是一个**模式**，每次写入时展开，展开结果变化即为一次滚动：
+///   {yyyy} 年   {MM} 月   {dd} 日   {HH} 时
+///   {pid}  进程号        {wid} worker 序号（master 为 0）
+/// 例如 `"{yyyy}-{MM}-{dd}.log"` 每天一个文件，
+///      `"app-{yyyy}{MM}{dd}-{HH}.log"` 每小时一个，
+///      `"worker{wid}-{yyyy}{MM}{dd}.log"` 每个 worker 每天一个。
+/// 另外可设上限字节数，超过就切到 `名字.1`、`名字.2` …（见 MaxFileSize）。
+///
+/// 用法：
+/// <code>
+/// Log.Configure("logs", "{yyyy}-{MM}-{dd}.log", Log.INFO);
+/// Log.MaxFileSize(64 * 1024 * 1024);
+/// Log.Info("server listening on :8080");
+/// Log.Error("db connect failed: " + err);
+/// </code>
+/// </summary>
+class Log {
+    /// <summary>级别常量，供 Configure / Write 使用。</summary>
+    static int TRACE = 0;
+    static int DEBUG = 1;
+    static int INFO = 2;
+    static int WARN = 3;
+    static int ERROR = 4;
+    static int FATAL = 5;
+
+    static string dir = "";
+    static string pattern = "{yyyy}-{MM}-{dd}.log";
+    static int minLevel = 2;
+    static long maxBytes = 0;
+    static bool toConsole = true;
+    static bool enabled = false;
+    static string lastPath = "";
+
+    /// <summary>启用文件日志：`dir` 目录（不存在则创建），`pattern`
+    /// 见类说明，`minLevel` 以下的记录被丢弃。</summary>
+    static void Configure(string dir, string pattern, int minLevel) {
+        Log.dir = dir;
+        if (pattern != "") { Log.pattern = pattern; }
+        Log.minLevel = minLevel;
+        Log.enabled = true;
+        if (dir != "" && !Directory.Exists(dir)) {
+            Directory.CreateDirectoryRecursive(dir);
+        }
+    }
+
+    /// <summary>单个文件的字节上限，超过后滚动到 `名字.1`、`名字.2` …
+    /// 传 0 关闭按大小滚动（只按文件名模式滚动）。</summary>
+    static void MaxFileSize(long bytes) { Log.maxBytes = bytes; }
+
+    /// <summary>是否同时写到控制台（默认写）。后台服务应关掉。</summary>
+    static void EchoToConsole(bool on) { Log.toConsole = on; }
+
+    /// <summary>当前生效的日志文件完整路径。</summary>
+    static string CurrentPath() {
+        DateTime t = DateTime.Now();
+        string name = Log.Expand(Log.pattern, t);
+        if (Log.dir == "") { return name; }
+        return Log.dir + Log.Sep() + name;
+    }
+
+    static void Trace(string msg) { Log.Write(Log.TRACE, msg); }
+    static void Debug(string msg) { Log.Write(Log.DEBUG, msg); }
+    static void Info(string msg) { Log.Write(Log.INFO, msg); }
+    static void Warn(string msg) { Log.Write(Log.WARN, msg); }
+    static void Error(string msg) { Log.Write(Log.ERROR, msg); }
+    static void Fatal(string msg) { Log.Write(Log.FATAL, msg); }
+
+    /// <summary>写一条记录：`时间 [级别] pid/wid 正文`。</summary>
+    static void Write(int level, string msg) {
+        if (level < Log.minLevel) { return; }
+        DateTime t = DateTime.Now();
+        string line = t.ToString() + " [" + Log.LevelName(level) + "] "
+            + Convert.ToString(ProcessHost.WorkerId()) + " " + msg + "\n";
+        if (Log.toConsole || !Log.enabled) { Console.Write(line); }
+        if (!Log.enabled) { return; }
+        string path = Log.CurrentPath();
+        if (Log.maxBytes > 0 && File.Exists(path)
+            && File.GetSize(path) >= Log.maxBytes) {
+            path = Log.RollBySize(path);
+        }
+        Log.lastPath = path;
+        File.AppendAllText(path, line);
+    }
+
+    /// <summary>把已写满的 `path` 改名为第一个空闲的 `path.N`，返回仍然
+    /// 可写的原路径。改名失败（文件被占用）时原样返回，宁可让文件超限
+    /// 也不能丢日志。</summary>
+    static string RollBySize(string path) {
+        for (int n = 1; n < 1000; n = n + 1) {
+            string target = path + "." + Convert.ToString(n);
+            if (!File.Exists(target)) {
+                File.Move(path, target);
+                return path;
+            }
+        }
+        return path;
+    }
+
+    static string LevelName(int level) {
+        if (level <= Log.TRACE) { return "TRACE"; }
+        if (level == Log.DEBUG) { return "DEBUG"; }
+        if (level == Log.INFO) { return "INFO "; }
+        if (level == Log.WARN) { return "WARN "; }
+        if (level == Log.ERROR) { return "ERROR"; }
+        return "FATAL";
+    }
+
+    static string Sep() {
+        #if WINDOWS
+        return "\\";
+        #else
+        return "/";
+        #endif
+    }
+
+    /// <summary>展开文件名模式中的 {yyyy} {MM} {dd} {HH} {pid} {wid}。</summary>
+    static string Expand(string pattern, DateTime t) {
+        return Log.ExpandFor(pattern, t, ProcessHost.WorkerId());
+    }
+
+    /// <summary>同 <see cref="Expand"/>，但 {wid} 用给定的序号展开：
+    /// master 要为**即将派生**的 worker 算出文件名，那不是它自己的序号。</summary>
+    static string ExpandFor(string pattern, DateTime t, int wid) {
+        string s = pattern;
+        s = Log.Replace(s, "{yyyy}", Convert.ToString(t.Year()));
+        s = Log.Replace(s, "{MM}", DateTime.Pad2(t.Month()));
+        s = Log.Replace(s, "{dd}", DateTime.Pad2(t.Day()));
+        s = Log.Replace(s, "{HH}", DateTime.Pad2(t.Hour()));
+        s = Log.Replace(s, "{pid}", Convert.ToString(ProcessHost.Pid()));
+        s = Log.Replace(s, "{wid}", Convert.ToString(wid));
+        return s;
+    }
+
+    static string Replace(string text, string from, string to) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        int flen = from.Length;
+        while (i < text.Length) {
+            if (i + flen <= text.Length && text.Substring(i, flen) == from) {
+                sb.Append(to);
+                i = i + flen;
+            } else {
+                sb.Append(text.Substring(i, 1));
+                i = i + 1;
+            }
+        }
+        return sb.ToString();
+    }
+}
