@@ -913,6 +913,63 @@ partial class Designer {
         }
     }
 
+    /// 把设计文档改到 devW x devH 画布，并把绝对定位的控件夹回
+    /// 新画布内。就地编辑 JSON：.zform 每个字段携带的状态（kind、
+    /// placeholder、绑定、事件、options、容器 kids）远多于这里要动的
+    /// 几何，任何「反序列化到模型再序列化回去」的写法都会静默丢掉
+    /// 其余键——控件会全部退化成默认 Input。
+    /// 返回 true 表示文档被改动。
+    static bool RetargetDoc(JsonValue doc, int devW, int devH) {
+        if (doc == null || !doc.IsObject()) { return false; }
+        JsonValue fields = doc.Get("fields");
+        if (fields == null || !fields.IsArray()) { return false; }
+        if (doc.Int("winW", 0) == devW && doc.Int("winH", 0) == devH) {
+            return false;
+        }
+        Designer.FitFieldsToCanvas(fields, devW, devH, 16);
+        doc.Set("winW", JsonValue.NewNum(Convert.ToString(devW)));
+        doc.Set("winH", JsonValue.NewNum(Convert.ToString(devH)));
+        return true;
+    }
+
+    /// 把每个字段的绝对矩形夹进 boxW x boxH，边距 margin。容器的 kids
+    /// 用的是父级坐标系，所以递归时换成父级矩形、不再留窗口边距。
+    static void FitFieldsToCanvas(JsonValue fields, int boxW, int boxH, int margin) {
+        for (int k = 0; k < fields.Count(); k = k + 1) {
+            JsonValue f = fields.At(k);
+            if (f == null || !f.IsObject()) { continue; }
+            JsonValue kids = f.Get("kids");
+            // 流式布局的字段没有矩形；在这里补一个会把它钉死在
+            // 设计从未指定的绝对位置上。
+            if (!f.Has("fx") && !f.Has("fy")
+                && !f.Has("fw") && !f.Has("fh")) {
+                if (kids != null && kids.IsArray()) {
+                    Designer.FitFieldsToCanvas(kids, boxW, boxH, margin);
+                }
+                continue;
+            }
+            int fx = f.Int("fx", 0);
+            int fy = f.Int("fy", 0);
+            int fw = f.Int("fw", 0);
+            int fh = f.Int("fh", 0);
+            if (fw > boxW - 2 * margin) { fw = boxW - 2 * margin; }
+            if (fh > boxH - 2 * margin) { fh = boxH - 2 * margin; }
+            if (fw < 0) { fw = 0; }
+            if (fh < 0) { fh = 0; }
+            if (fx + fw > boxW - margin) { fx = boxW - margin - fw; }
+            if (fx < margin) { fx = margin; }
+            if (fy + fh > boxH - margin) { fy = boxH - margin - fh; }
+            if (fy < margin) { fy = margin; }
+            f.Set("fx", JsonValue.NewNum(Convert.ToString(fx)));
+            f.Set("fy", JsonValue.NewNum(Convert.ToString(fy)));
+            f.Set("fw", JsonValue.NewNum(Convert.ToString(fw)));
+            f.Set("fh", JsonValue.NewNum(Convert.ToString(fh)));
+            if (kids != null && kids.IsArray()) {
+                Designer.FitFieldsToCanvas(kids, fw, fh, 0);
+            }
+        }
+    }
+
     /// 从 JSON 对象构建一个 FormField。先应用 "type"，这样
     /// 字段的事件集（Events()）和容器属性反映真实类型，
     /// 然后才读取 handlers、options 和子级。

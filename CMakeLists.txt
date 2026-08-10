@@ -1149,6 +1149,33 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_tabs${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # The New Project wizard rescales a template's .zform designs to the chosen
+  # device. Retargeting must touch geometry only: an earlier round-trip through
+  # a geometry-only model dropped every control's "kind", so a scaffolded
+  # project came out with all-Input controls and would not compile.
+  # Every template the New Project wizard offers must produce a project that
+  # compiles; nothing else in the suite compiles templates/, so a stdlib API
+  # change rots them silently until a user hits the error in the IDE.
+  add_test(NAME templates_build
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DTEMPLATES=${CMAKE_SOURCE_DIR}/templates
+      -DSTDLIB=${CMAKE_SOURCE_DIR}/stdlib
+      -DDRIVER_DIR=$<TARGET_FILE_DIR:zan_gui>
+      -DWORK=${CMAKE_BINARY_DIR}/templates_build
+      -DEXE_EXT=${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_templates.cmake)
+  set_tests_properties(templates_build PROPERTIES TIMEOUT 900)
+
+  add_test(NAME conformance_gui_retarget
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/retarget_test.zan
+      "-DZANC_ARGS=--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_retarget.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_retarget${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   add_test(NAME conformance_gui_icon
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
