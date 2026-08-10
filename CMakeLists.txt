@@ -559,6 +559,28 @@ endif()
 add_test(NAME runtime_sync COMMAND zanrt_sync_test)
 add_dependencies(zanc zanrt_sync_test)
 
+# A hung-up peer (a closed SSE tab) must not kill the process with SIGPIPE.
+# POSIX only: Windows has no such signal.
+if(NOT WIN32)
+    add_executable(zanrt_sigpipe_test
+        tests/runtime/rt_sigpipe_test.c
+        src/runtime/rt_io.c
+        src/runtime/rt_co.c
+        src/runtime/rt_timer.c
+    )
+    target_compile_definitions(zanrt_sigpipe_test PRIVATE ZAN_IO_STACKLESS_ONLY)
+    target_include_directories(zanrt_sigpipe_test PRIVATE ${CMAKE_SOURCE_DIR})
+    set_target_properties(zanrt_sigpipe_test PROPERTIES
+        C_STANDARD 11
+        C_STANDARD_REQUIRED YES
+    )
+    find_package(Threads REQUIRED)
+    target_link_libraries(zanrt_sigpipe_test PRIVATE Threads::Threads)
+    add_test(NAME runtime_sigpipe COMMAND zanrt_sigpipe_test)
+    set_tests_properties(runtime_sigpipe PROPERTIES TIMEOUT 30)
+    add_dependencies(zanc zanrt_sigpipe_test)
+endif()
+
 # ---- json OOM recovery test (A1) ----
 # json.c is built with -DZAN_ALLOC_INJECT so its abort-on-OOM policy is replaced
 # by NULL-return and the Nth allocation can be forced to fail; the test then

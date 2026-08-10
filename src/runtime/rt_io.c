@@ -62,7 +62,28 @@ static int zan_io_trace(void){static int t=-1;if(t<0){const char*e=getenv("ZAN_I
 #include <pthread.h>
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <time.h>
+
+/* A peer that hangs up while the process is writing to it raises SIGPIPE,
+ * whose default action is to terminate the process -- so a browser closing a
+ * Server-Sent Events stream, or any client walking away mid-response, would
+ * kill the whole server without a word. Every send site already classifies
+ * EPIPE/ECONNRESET as a dead connection, so the signal carries nothing the
+ * caller does not learn from the return value. */
+static void zan_io_ignore_sigpipe(void) {
+    struct sigaction sa;
+    struct sigaction cur;
+    /* Only if the program has not chosen its own disposition. */
+    if (sigaction(SIGPIPE, NULL, &cur) == 0
+        && cur.sa_handler != SIG_DFL) {
+        return;
+    }
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGPIPE, &sa, NULL);
+}
 #endif
 #if defined(__linux__)
 #include <sys/epoll.h>
@@ -324,6 +345,9 @@ int64_t zan_io_socket_send(intptr_t fd, const void *buf, int64_t len,
     IOTRACE("send fd=%lld len=%lld -> %d", (long long)fd, (long long)len, _sr);
     return (int64_t)_sr;
 #else
+#if defined(MSG_NOSIGNAL)
+    flags |= MSG_NOSIGNAL;   /* a dead peer is a return value, not a signal */
+#endif
     ssize_t r = send((int)fd, buf, (size_t)len, (int)flags);
     if (r < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
@@ -668,6 +692,7 @@ static int io_sweep_slots(void) {
 
 static int g_epoll_fd = -1;void zan_io_init(void) {
     if (g_io_started) return;
+    zan_io_ignore_sigpipe();
     g_io_entries = NULL;
     g_io_count = 0;
     g_epoll_fd = epoll_create1(0);
@@ -835,6 +860,7 @@ static int g_kq_fd = -1;
 
 void zan_io_init(void) {
     if (g_io_started) return;
+    zan_io_ignore_sigpipe();
     g_io_entries = NULL;
     g_io_count = 0;
     g_kq_fd = kqueue();
@@ -1461,6 +1487,7 @@ int32_t zan_io_poll(int64_t timeout_ms) {
 
 void zan_io_init(void) {
     if (g_io_started) return;
+    zan_io_ignore_sigpipe();
     g_io_entries = NULL;
     g_io_count = 0;
     /* Async-DNS wake pipe: the read end joins the select set in zan_io_poll,
