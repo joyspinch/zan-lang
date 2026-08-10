@@ -233,8 +233,41 @@ partial class ZanIDE {
     /// When packaging is on but nothing was saved yet, defaults to dark + light
     /// so the picker still has something to switch between.
     static List<string> ProjSkinList(string root) {
+        List<string> outp = ZanIDE.ProjCsvItems(ZanIDE.ProjField(root, "skinlist"));
+        if (outp.Count == 0) {
+            outp.Add("dark");
+            outp.Add("light");
+        }
+        return outp;
+    }
+
+    /// Runtime content directories: the folders a published program must find
+    /// next to its executable to run at all -- a server's config/, its views/
+    /// and wwwroot/. `content = a,b,c` in zan.proj names them explicitly;
+    /// with no such line the conventional three are shipped when they exist,
+    /// which is what makes a published server read its own config/app.json
+    /// instead of silently starting on the built-in defaults. `content = -`
+    /// ships nothing.
+    static List<string> ProjContentDirs(string root) {
         List<string> outp = new List<string>();
-        string raw = ZanIDE.ProjField(root, "skinlist");
+        string raw = ZanIDE.ProjField(root, "content");
+        if (raw == "-") { return outp; }
+        if (raw == "") {
+            List<string> conv = new List<string>();
+            conv.Add("config");
+            conv.Add("views");
+            conv.Add("wwwroot");
+            for (int i = 0; i < conv.Count; i = i + 1) {
+                if (Directory.Exists(root + "/" + conv[i])) { outp.Add(conv[i]); }
+            }
+            return outp;
+        }
+        return ZanIDE.ProjCsvItems(raw);
+    }
+
+    /// Splits a `a, b, c` project field into trimmed, non-empty items.
+    static List<string> ProjCsvItems(string raw) {
+        List<string> outp = new List<string>();
         int start = 0;
         for (int i = 0; i <= raw.Length; i = i + 1) {
             if (i == raw.Length || raw.Substring(i, 1) == ",") {
@@ -249,11 +282,208 @@ partial class ZanIDE {
                 start = i + 1;
             }
         }
-        if (outp.Count == 0) {
-            outp.Add("dark");
-            outp.Add("light");
+        return outp;
+    }
+
+    /// Normalizes a project-relative path for rule matching: backslashes to
+    /// '/', no "./" prefix, no trailing '/'. The tree, zan.proj and the
+    /// compiler's --embed names must agree on one spelling or a rule saved
+    /// from the tree would never match the item it was saved for.
+    static string NormRel(string rel) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < rel.Length; i = i + 1) {
+            string ch = rel.Substring(i, 1);
+            if (ch == "\\") { ch = "/"; }
+            sb.Append(ch);
+        }
+        string s = sb.ToString();
+        while (s.Length >= 2 && s.Substring(0, 2) == "./") {
+            s = s.Substring(2, s.Length - 2);
+        }
+        while (s.Length > 0 && s.Substring(s.Length - 1, 1) == "/") {
+            s = s.Substring(0, s.Length - 1);
+        }
+        while (s.Length > 0 && s.Substring(0, 1) == "/") {
+            s = s.Substring(1, s.Length - 1);
+        }
+        return s;
+    }
+
+    /// The paths a project marked with one generation action, from zan.proj's
+    /// `gen.copy` / `gen.embed` / `gen.none` lines.
+    static List<string> ProjGenList(string root, string action) {
+        List<string> outp = new List<string>();
+        List<string> raw = ZanIDE.ProjCsvItems(ZanIDE.ProjField(root, "gen." + action));
+        for (int i = 0; i < raw.Count; i = i + 1) {
+            string p = ZanIDE.NormRel(raw[i]);
+            if (p != "") { outp.Add(p); }
         }
         return outp;
+    }
+
+    /// The generation action recorded for exactly this path: "copy", "embed",
+    /// "none", or "" when the item was never given one (it then inherits from
+    /// its folder, or falls back to the convention -- see ProjGenAction).
+    static string ProjGenRule(string root, string rel) {
+        string p = ZanIDE.NormRel(rel);
+        if (p == "") { return ""; }
+        List<string> acts = ZanIDE.GenActions();
+        for (int a = 0; a < acts.Count; a = a + 1) {
+            List<string> items = ZanIDE.ProjGenList(root, acts[a]);
+            for (int i = 0; i < items.Count; i = i + 1) {
+                if (items[i] == p) { return acts[a]; }
+            }
+        }
+        return "";
+    }
+
+    /// The three generation actions, in the order rules are looked up.
+    static List<string> GenActions() {
+        List<string> acts = new List<string>();
+        acts.Add("copy");
+        acts.Add("embed");
+        acts.Add("none");
+        return acts;
+    }
+
+    /// What publishing actually does with `rel`: its own rule if it has one,
+    /// otherwise the nearest parent folder's rule, otherwise the convention
+    /// (config/, views/, wwwroot/ are copied -- see ProjContentDirs), and
+    /// "none" for everything else.
+    static string ProjGenAction(string root, string rel) {
+        string p = ZanIDE.NormRel(rel);
+        string q = p;
+        while (p != "") {
+            string r = ZanIDE.ProjGenRule(root, p);
+            if (r != "") { return r; }
+            int cut = 0 - 1;
+            for (int i = 0; i < p.Length; i = i + 1) {
+                if (p.Substring(i, 1) == "/") { cut = i; }
+            }
+            if (cut < 0) { break; }
+            p = p.Substring(0, cut);
+        }
+        List<string> def = ZanIDE.ProjContentDirs(root);
+        for (int i = 0; i < def.Count; i = i + 1) {
+            string d = ZanIDE.NormRel(def[i]);
+            if (q == d) { return "copy"; }
+            if (q.Length > d.Length + 1
+                && q.Substring(0, d.Length + 1) == d + "/") { return "copy"; }
+        }
+        return "none";
+    }
+
+    /// Records (or clears) the generation action for one file or folder.
+    /// Choosing the action an item already has by convention still writes the
+    /// rule, so the choice survives a later change to the conventions.
+    static void SetProjGenAction(string root, string rel, string action) {
+        string p = ZanIDE.NormRel(rel);
+        if (p == "") { return; }
+        List<string> acts = ZanIDE.GenActions();
+        for (int a = 0; a < acts.Count; a = a + 1) {
+            List<string> items = ZanIDE.ProjGenList(root, acts[a]);
+            string joined = "";
+            for (int i = 0; i < items.Count; i = i + 1) {
+                if (items[i] == p) { continue; }
+                if (joined != "") { joined = joined + ","; }
+                joined = joined + items[i];
+            }
+            if (acts[a] == action) {
+                if (joined != "") { joined = joined + ","; }
+                joined = joined + p;
+            }
+            ZanIDE.SetProjField(root, "gen." + acts[a], joined);
+        }
+    }
+
+    /// The items a publish copies next to the executable: everything marked
+    /// "copy", plus the conventional content folders that were not given some
+    /// other action.
+    static List<string> ProjCopyItems(string root) {
+        List<string> outp = ZanIDE.ProjGenList(root, "copy");
+        List<string> def = ZanIDE.ProjContentDirs(root);
+        for (int i = 0; i < def.Count; i = i + 1) {
+            string d = ZanIDE.NormRel(def[i]);
+            if (d == "") { continue; }
+            if (ZanIDE.ProjGenRule(root, d) != "") { continue; }
+            bool seen = false;
+            for (int k = 0; k < outp.Count; k = k + 1) {
+                if (outp[k] == d) { seen = true; break; }
+            }
+            if (!seen) { outp.Add(d); }
+        }
+        return outp;
+    }
+
+    /// The items a publish compiles into the executable itself.
+    static List<string> ProjEmbedItems(string root) {
+        return ZanIDE.ProjGenList(root, "embed");
+    }
+
+    /// True when something inside `rel` was given an action of its own, so the
+    /// folder cannot go in as a single --embed spec.
+    static bool GenTreeHasRules(string root, string rel) {
+        string dir = root + "/" + rel;
+        List<string> fs = Directory.GetFiles(dir);
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            if (ZanIDE.ProjGenRule(root, rel + "/" + fs[i]) != "") { return true; }
+        }
+        List<string> ds = Directory.GetDirectories(dir);
+        for (int i = 0; i < ds.Count; i = i + 1) {
+            string sub = rel + "/" + ds[i];
+            if (ZanIDE.ProjGenRule(root, sub) != "") { return true; }
+            if (ZanIDE.GenTreeHasRules(root, sub)) { return true; }
+        }
+        return false;
+    }
+
+    /// Collects the project-relative files below `rel` that still belong to
+    /// `rel`'s action -- anything given an action of its own is left out.
+    static void GenCollectFiles(string root, string rel, List<string> outp) {
+        string dir = root + "/" + rel;
+        List<string> fs = Directory.GetFiles(dir);
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            string f = rel + "/" + fs[i];
+            if (ZanIDE.ProjGenRule(root, f) != "") { continue; }
+            outp.Add(f);
+        }
+        List<string> ds = Directory.GetDirectories(dir);
+        for (int i = 0; i < ds.Count; i = i + 1) {
+            string sub = rel + "/" + ds[i];
+            if (ZanIDE.ProjGenRule(root, sub) != "") { continue; }
+            ZanIDE.GenCollectFiles(root, sub, outp);
+        }
+    }
+
+    /// zanc `--embed path=name` arguments for the items marked "embed": the
+    /// program then reads them through the ordinary File / Directory calls
+    /// (disk first, embedded copy as the fallback), so config/app.json keeps
+    /// working with no code change. A folder goes in as one spec unless
+    /// something below it has its own action, in which case each kept file is
+    /// named individually -- the compiler embeds whole folders and cannot skip
+    /// parts of one.
+    static string EmbedArgs(string root) {
+        List<string> items = ZanIDE.ProjEmbedItems(root);
+        string s = "";
+        for (int i = 0; i < items.Count; i = i + 1) {
+            string rel = items[i];
+            string src = root + "/" + rel;
+            if (Directory.Exists(src)) {
+                if (!ZanIDE.GenTreeHasRules(root, rel)) {
+                    s = s + " --embed \"" + src + "=" + rel + "\"";
+                } else {
+                    List<string> fs = new List<string>();
+                    ZanIDE.GenCollectFiles(root, rel, fs);
+                    for (int k = 0; k < fs.Count; k = k + 1) {
+                        s = s + " --embed \"" + root + "/" + fs[k]
+                            + "=" + fs[k] + "\"";
+                    }
+                }
+            } else if (File.Exists(src)) {
+                s = s + " --embed \"" + src + "=" + rel + "\"";
+            }
+        }
+        return s;
     }
 
     /// True when the project builds a library instead of a runnable program

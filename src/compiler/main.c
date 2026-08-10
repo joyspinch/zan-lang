@@ -18,6 +18,7 @@
 #include "optimizer.h"
 #include "crosscomp.h"
 #include "winres.h"
+#include "embedres.h"
 #include "symbols.h"
 #include "package.h"
 /* zan.ico compiled into zanc, so every Windows executable carries an icon even
@@ -1323,6 +1324,8 @@ static void print_usage(void) {
     fprintf(stderr, "  --link-lib <name>  Link an extra native library (-> -l<name>)\n");
     fprintf(stderr, "  --link-input <f>   Link an extra object/resource/library file\n");
     fprintf(stderr, "  --icon <f.ico>   Embed an icon in the Windows executable\n");
+    fprintf(stderr, "  --embed <p[=n]>  Bake a file/directory into the executable as\n");
+    fprintf(stderr, "                   resources named <n>/<relative path> (repeatable)\n");
     fprintf(stderr, "  --no-icon        Do not embed any icon (skip the built-in default)\n");
     fprintf(stderr, "  --emit-symbols <f> Write the type/member index (IDE completion) and exit\n");
     fprintf(stderr, "  --no-gen         Disable the Zan-scripted code generators (bootstrap)\n");
@@ -1504,6 +1507,7 @@ int main(int argc, char **argv) {
     bool emit_lib = false;          /* --emit-lib / -o lib suffix: library output */
     bool lib_shared = false;        /* library is shared (.dll/.so/.dylib), not static */
     const char *extra_link_inputs[32]; int extra_link_input_count = 0;
+    const char *embed_specs[64]; int embed_spec_count = 0;
     const char *extra_link_libs[32];   int extra_link_lib_count = 0;
     const char *extra_lib_paths[16];   int extra_lib_path_count = 0;
     /* Resolved stdlib root, hoisted so the native-driver block (which lives
@@ -1606,6 +1610,9 @@ int main(int argc, char **argv) {
             no_icon = true;
         } else if (strcmp(argv[i], "--icon") == 0 && i + 1 < argc) {
             icon_path = argv[++i];
+        } else if (strcmp(argv[i], "--embed") == 0 && i + 1 < argc) {
+            if (embed_spec_count < 64) embed_specs[embed_spec_count++] = argv[++i];
+            else { fprintf(stderr, "error: too many --embed (max 64)\n"); return 1; }
         } else if (strcmp(argv[i], "--link-input") == 0 && i + 1 < argc) {
             if (extra_link_input_count < 32) extra_link_inputs[extra_link_input_count++] = argv[++i];
             else { fprintf(stderr, "error: too many --link-input (max 32)\n"); return 1; }
@@ -2298,6 +2305,21 @@ int main(int argc, char **argv) {
                     continue;
                 zan_irgen_stub_extern_lib(&irgen, irgen.extern_libs[li].str,
                                           (int)irgen.extern_libs[li].len);
+            }
+        }
+
+        /* --embed: the project files that ship inside the executable rather
+         * than beside it. Baked into this module (not a separately compiled
+         * object) so it works for every target with no external C compiler.
+         * The read API is emitted with it -- and also for a program that only
+         * calls it -- so no target needs a shipped zan_embed_api object. */
+        if (embed_spec_count > 0 || irgen.uses_embed_api) {
+            int nres = zan_embed_emit_specs(&irgen, embed_specs, embed_spec_count);
+            if (nres < 0) {
+                zan_irgen_destroy(&irgen);
+                zan_arena_free(arena);
+                free(source);
+                return 1;
             }
         }
 

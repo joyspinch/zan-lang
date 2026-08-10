@@ -82,6 +82,24 @@ Write-Output "[3/4] Copying IDE + compiler + stdlib ..."
 $distTc = Join-Path $dist 'toolchain'
 New-Item -ItemType Directory -Path $distTc | Out-Null
 Copy-Item $ideExe (Join-Path $dist 'ZanIDE.exe')
+# The dev build carries DWARF line tables (build_ide.ps1 passes -g) so
+# build\zan_crash.log can name source lines. An end user has no source tree to
+# resolve them against and they are ~1.6 MB of the image, so strip the
+# published copy; build\ZanIDE.exe keeps its debug info.
+$distIde = Join-Path $dist 'ZanIDE.exe'
+$stripped = $false
+foreach ($stripTool in @('llvm-strip', 'strip')) {
+    if (Get-Command $stripTool -ErrorAction SilentlyContinue) {
+        & $stripTool $distIde
+        if ($LASTEXITCODE -eq 0) { $stripped = $true; break }
+    }
+}
+if ($stripped) {
+    Write-Output ("Stripped ZanIDE.exe -> {0:N1} MB" -f ((Get-Item $distIde).Length / 1MB))
+} else {
+    Write-Output 'PUBLISH_WARN: no llvm-strip/strip on PATH; ZanIDE.exe ships with debug info'
+}
+
 # SDL3 is statically linked into ZanIDE.exe (build_ide.ps1), so no SDL3.dll
 # ships beside the IDE.
 Copy-Item $stdlib (Join-Path $dist 'stdlib') -Recurse

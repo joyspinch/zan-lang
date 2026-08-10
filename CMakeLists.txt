@@ -100,6 +100,7 @@ add_executable(zanc
     src/compiler/stdlib_ext.c
     src/compiler/crosscomp.c
     src/compiler/winres.c
+    src/compiler/embedres.c
     src/compiler/builtin_api.c
     src/compiler/symbols.c
 )

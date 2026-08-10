@@ -127,6 +127,32 @@ partial class ZanIDE {
         }
     }
 
+    /// The project-relative path of the right-clicked file-tree row, or ""
+    /// when there is no project or the row is the root itself. Generation
+    /// actions are stored per relative path, so the tree and zan.proj stay in
+    /// agreement when the project moves.
+    string CtxProjRel() {
+        if (!haveProject) { return ""; }
+        if (ctxTarget < 0 || ctxTarget >= treeShow.Count) { return ""; }
+        string p = treeShow[ctxTarget].path;
+        if (p == "" || p == root) { return ""; }
+        if (!ZanIDE.StartsWith(p, root)) { return ""; }
+        return ZanIDE.NormRel(p.Substring(root.Length, p.Length - root.Length));
+    }
+
+    /// Marks the generation action an item currently has in the menu.
+    static string GenMark(string cur, string act) {
+        if (cur == act) { return "✓ "; }
+        return "   ";
+    }
+
+    /// The generation action's name in the UI language.
+    static string GenLabel(string act) {
+        if (act == "copy") { return ZanIDE.T("Copy to Output", "复制到输出"); }
+        if (act == "embed") { return ZanIDE.T("Embed", "内嵌到程序"); }
+        return ZanIDE.T("None", "不处理");
+    }
+
     /// One frame of work after App.ProcessEvent handled the main window's
     /// event: follow skin/opacity/wallpaper to the child windows, route
     /// events addressed to other windows, handle the debug shortcuts, pump
@@ -1879,7 +1905,9 @@ partial class ZanIDE {
             // Top-level editor context menu overlay (drawn last so nothing
             // paints over it), then bridge its host commands.
             if (!designerMode && !activeIsStart && !activeIsDocs) {
+                app.BeginIdScope(930000);
                 editor.RenderCtxMenu(app);
+                app.EndIdScope();
                 string ecmd = editor.TakeCommand();
                 if (ecmd == "find") {
                     findMode = 1;
@@ -1932,6 +1960,19 @@ partial class ZanIDE {
                     cmLabels.Add(ZanIDE.T("Refresh", "刷新"));
                     cmLabels.Add(ZanIDE.T("Copy Path", "复制路径"));
                     cmLabels.Add(ZanIDE.T("Reveal in Explorer", "在资源管理器中显示"));
+                    // 生成操作：这一项发布时是复制到输出目录、编进可执行
+                    // 文件，还是不处理（默认按约定复制 config/views/wwwroot）。
+                    string genRel = this.CtxProjRel();
+                    if (genRel != "") {
+                        string cur = ZanIDE.ProjGenAction(root, genRel);
+                        cmLabels.Add("-");
+                        cmLabels.Add(ZanIDE.GenMark(cur, "none")
+                            + ZanIDE.T("Build Action: None", "生成操作：不处理"));
+                        cmLabels.Add(ZanIDE.GenMark(cur, "copy")
+                            + ZanIDE.T("Build Action: Copy to Output", "生成操作：复制到输出"));
+                        cmLabels.Add(ZanIDE.GenMark(cur, "embed")
+                            + ZanIDE.T("Build Action: Embed", "生成操作：内嵌到程序"));
+                    }
                 } else if (ctxKind == 2) {
                     cmLabels.Add(ZanIDE.T("Open", "打开"));
                     cmLabels.Add("-");
@@ -1982,8 +2023,15 @@ partial class ZanIDE {
                 // Registering the block here -- after the panels below have
                 // rendered, before the menu itself -- is what keeps the menu's
                 // own items clickable (see App.ClickAvailable).
+                // The scope is what keeps the menu from renumbering every id
+                // allocated after it (dialogs, toasts, the window caption):
+                // an open menu consumed two root ids, so the frame that opened
+                // or closed it resolved the pointer against a different
+                // control than the one that ends up with that id.
+                app.BeginIdScope(935000);
                 app.BlockHitsMenu();
                 int chosen = ContextMenu.Render(app, ctxX, ctxY, cmLabels);
+                app.EndIdScope();
                 if (chosen == 0 - 2) {
                     ctxKind = 0;
                     app.RequestRedraw();
@@ -2041,6 +2089,17 @@ partial class ZanIDE {
                         } else if (chosen == 7) {
                             if (ctxTarget >= 0 && ctxTarget < treeShow.Count) {
                                 ZanIDE.RevealInFileManager(treeShow[ctxTarget].path);
+                            }
+                        } else if (chosen >= 9 && chosen <= 11) {
+                            string grel = this.CtxProjRel();
+                            if (grel != "") {
+                                string act = "none";
+                                if (chosen == 10) { act = "copy"; }
+                                if (chosen == 11) { act = "embed"; }
+                                ZanIDE.SetProjGenAction(root, grel, act);
+                                log.Add("> Build action for " + grel + ": " + act
+                                    + " (zan.proj).");
+                                Layer.Notify(grel + " → " + ZanIDE.GenLabel(act), 3);
                             }
                         }
                     } else if (ctxKind == 2) {
@@ -2170,14 +2229,18 @@ partial class ZanIDE {
             if (haveProject) { windowTitle = windowTitle + "  —  " + root; }
             // Unsaved-changes / changed-on-disk questions, above the page
             // and below the transient feedback queues.
+            app.BeginIdScope(940000);
             this.RenderDocDialogs();
+            app.EndIdScope();
             // Global operation feedback: toast + notification queues drawn
             // above everything so every action gives visible feedback.
+            app.BeginIdScope(945000);
             Layer.RenderToasts(app);
             Layer.RenderNotifs(app);
             // Hover tips requested by widgets during the frame, painted on
             // top of everything they would otherwise hide behind.
             Tooltip.Flush(app);
+            app.EndIdScope();
         } catch (Exception frameEx) {
             app.NoteFrameError("ide-frame", frameEx.Message);
             app.CancelPartialFrame();

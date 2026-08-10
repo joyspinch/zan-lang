@@ -947,6 +947,15 @@ partial class ZanIDE {
             string scene = p.Substring(0, p.Length - 4) + ".zscene";
             if (File.Exists(scene)) { return scene; }
         }
+        // 非源文件（config/app.json、views/*.html、wwwroot 里的资源…）
+        // 不是编译输入：它们只是被复制到输出目录（见 ProjCopyItems），
+        // 所以在这种标签页上运行 / 构建回到项目入口，
+        // 而不是把 JSON 当源码交给编译器。
+        if (!ZanIDE.IsZanFilePath(p)) {
+            string pentry = ZanIDE.ProjectEntry(root);
+            if (File.Exists(pentry)) { return pentry; }
+            return "";
+        }
         return p;
     }
 
@@ -1719,6 +1728,13 @@ partial class ZanIDE {
         // remaining arch.
         List<string> ids = ZanIDE.PublishTargetIds();
         string hostId = ZanIDE.HostTargetId();
+        // Items marked "embed" go into every target's executable; the copied
+        // ones are staged per target by CopyPayload below.
+        string emb = ZanIDE.EmbedArgs(root);
+        if (emb != "") {
+            log.Add(ZanIDE.T("> Embedding project items into the executable.",
+                             "> 内嵌项目资源到可执行文件。"));
+        }
         for (int ti = 0; ti < ids.Count; ti = ti + 1) {
             if (ti < sel.Count && sel[ti] == 1) {
                 string id = ids[ti];
@@ -1763,12 +1779,12 @@ partial class ZanIDE {
                         // wrap the whole stage into one self-extracting exe.
                         string stage = ZanIDE.ResetStage(bd + "/pub_win_x64");
                         string sexe = stage + "/" + baseName + "-windows-x64.exe";
-                        ZanIDE.CopyResources(root, stage, log);
-                        ZanIDE.CopyThemeSkins(root, stage, log);
+                        ZanIDE.CopyPayloadPacked(root, stage, outDir, log);
                         steps.Add(ZanIDE.CompileToExe(root, p, inputs, ll, sexe, !dbg, dbg)
-                            + " && " + ZanIDE.PackCmd(root, stage, exe));
+                            + emb + " && " + ZanIDE.PackCmd(root, stage, exe));
                     } else {
-                        steps.Add(ZanIDE.CompileToExe(root, p, inputs, ll, exe, !dbg, dbg));
+                        ZanIDE.CopyPayload(root, outDir, log);
+                        steps.Add(ZanIDE.CompileToExe(root, p, inputs, ll, exe, !dbg, dbg) + emb);
                     }
                     exes.Add(exe);
                     log.Add("> Publishing windows-x64 ...");
@@ -1779,12 +1795,12 @@ partial class ZanIDE {
                     if (pack) {
                         string stage = ZanIDE.ResetStage(bd + "/pub_win_arm64");
                         string sexe = stage + "/" + baseName + "-windows-arm64.exe";
-                        ZanIDE.CopyResources(root, stage, log);
-                        ZanIDE.CopyThemeSkins(root, stage, log);
+                        ZanIDE.CopyPayloadPacked(root, stage, outDir, log);
                         steps.Add(ZanIDE.CompileToExeCross(root, p, inputs, sexe, "win-arm64", dbg)
-                            + " && " + ZanIDE.PackCmd(root, stage, exe));
+                            + emb + " && " + ZanIDE.PackCmd(root, stage, exe));
                     } else {
-                        steps.Add(ZanIDE.CompileToExeCross(root, p, inputs, exe, "win-arm64", dbg));
+                        ZanIDE.CopyPayload(root, outDir, log);
+                        steps.Add(ZanIDE.CompileToExeCross(root, p, inputs, exe, "win-arm64", dbg) + emb);
                     }
                     exes.Add(exe);
                     log.Add("> Publishing windows-arm64 ...");
@@ -1795,25 +1811,28 @@ partial class ZanIDE {
                     // Cocoa driver). Either way the output is a bare Mach-O, so
                     // there is no single-file pack step.
                     string exe = outDir + "/" + baseName + "-" + id;
+                    ZanIDE.CopyPayload(root, outDir, log);
                     if (id == hostId) {
-                        steps.Add(ZanIDE.CompileToExe(root, p, inputs, "", exe, !dbg, dbg));
+                        steps.Add(ZanIDE.CompileToExe(root, p, inputs, "", exe, !dbg, dbg) + emb);
                     } else {
-                        steps.Add(ZanIDE.CompileToExeCross(root, p, inputs, exe, id, dbg));
+                        steps.Add(ZanIDE.CompileToExeCross(root, p, inputs, exe, id, dbg) + emb);
                     }
                     exes.Add(exe);
                     log.Add("> Publishing " + id + " ...");
                 } else if (id == "linux-x64") {
                     // Self-contained musl static single file (cross from any host).
                     string exe = outDir + "/" + baseName + "-linux-x64";
+                    ZanIDE.CopyPayload(root, outDir, log);
                     steps.Add(zc + pubFlag + " " + inputs
-                        + " --target linux-musl --link-mode static -o \"" + exe + "\"");
+                        + " --target linux-musl --link-mode static -o \"" + exe + "\"" + emb);
                     exes.Add(exe);
                     log.Add("> Publishing linux-x64 ...");
                 } else if (id == "linux-arm64") {
                     // Same musl static path as linux-x64; only triple/sysroot differ.
                     string exe = outDir + "/" + baseName + "-linux-arm64";
+                    ZanIDE.CopyPayload(root, outDir, log);
                     steps.Add(zc + pubFlag + " " + inputs
-                        + " --target linux-arm64 --link-mode static -o \"" + exe + "\"");
+                        + " --target linux-arm64 --link-mode static -o \"" + exe + "\"" + emb);
                     exes.Add(exe);
                     log.Add("> Publishing linux-arm64 ...");
                 }
@@ -1996,6 +2015,82 @@ partial class ZanIDE {
             }
         }
         log.Add("> Bundled " + Convert.ToString(res.Count + scopied + lcopied) + " resource file(s) into " + dst);
+    }
+
+    /// Copies the items whose generation action is "copy to output" (the
+    /// conventional config/, views/ and wwwroot/ unless the project says
+    /// otherwise -- see ProjCopyItems) into an output directory. A published
+    /// program that cannot find its config next to itself falls back to
+    /// built-in defaults without saying so, which is indistinguishable from a
+    /// config that was read and ignored.
+    static void CopyContent(string root, string outDir, List<string> log) {
+        List<string> items = ZanIDE.ProjCopyItems(root);
+        int copied = 0;
+        for (int i = 0; i < items.Count; i = i + 1) {
+            string sd = root + "/" + items[i];
+            if (!Directory.Exists(sd) && !File.Exists(sd)) {
+                log.Add("> WARNING: content item missing, skipped: " + items[i]);
+                continue;
+            }
+            copied = copied + ZanIDE.CopyRuleTree(root, items[i], outDir, log);
+        }
+        if (items.Count > 0) {
+            log.Add("> Bundled " + Convert.ToString(copied)
+                + " content file(s) into " + outDir);
+        }
+    }
+
+    /// Copies one project item into the output directory, keeping its relative
+    /// path. Anything below it that was given a generation action of its own
+    /// is left out: a folder marked "copy" with one file marked "embed" (or
+    /// "none") must not also ship that file loose.
+    static int CopyRuleTree(string root, string rel, string outDir, List<string> log) {
+        string src = root + "/" + rel;
+        string dst = outDir + "/" + rel;
+        if (!Directory.Exists(src)) {
+            if (!File.Exists(src)) { return 0; }
+            Directory.CreateDirectoryRecursive(Path.GetDirectoryName(dst));
+            File.Copy(src, dst);
+            return 1;
+        }
+        Directory.CreateDirectoryRecursive(dst);
+        int n = 0;
+        List<string> fs = Directory.GetFiles(src);
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            string f = rel + "/" + fs[i];
+            if (ZanIDE.ProjGenRule(root, f) != "") { continue; }
+            File.Copy(src + "/" + fs[i], dst + "/" + fs[i]);
+            n = n + 1;
+        }
+        List<string> ds = Directory.GetDirectories(src);
+        for (int i = 0; i < ds.Count; i = i + 1) {
+            string d = rel + "/" + ds[i];
+            if (ZanIDE.ProjGenRule(root, d) != "") { continue; }
+            n = n + ZanIDE.CopyRuleTree(root, d, outDir, log);
+        }
+        return n;
+    }
+
+    /// Everything a published program needs beside its executable: bundled
+    /// resources, optional theme skins and the runtime content folders. The
+    /// single-file path stages this before packing; every other target gets it
+    /// in the publish directory itself.
+    static void CopyPayload(string root, string dir, List<string> log) {
+        ZanIDE.CopyResources(root, dir, log);
+        ZanIDE.CopyThemeSkins(root, dir, log);
+        ZanIDE.CopyContent(root, dir, log);
+    }
+
+    /// The single-file variant: assets and skins are packed into the staged
+    /// executable, but an item whose generation action is "copy to output"
+    /// asked to stay a file the user can edit after publishing -- packing it
+    /// into the exe is the one thing that action rules out. It ships in the
+    /// publish directory next to the packed exe.
+    static void CopyPayloadPacked(string root, string stage, string outDir,
+                                  List<string> log) {
+        ZanIDE.CopyResources(root, stage, log);
+        ZanIDE.CopyThemeSkins(root, stage, log);
+        ZanIDE.CopyContent(root, outDir, log);
     }
 
     /// Copies the project's selected theme skins into <outDir>/skins so a
