@@ -220,13 +220,17 @@ Set `worker.count` in `config/app.json`:
 Restart-on-crash is delegated to the process supervisor (systemd
 `Restart=always`, Docker `restart: unless-stopped`, Kubernetes), the standard
 way to supervise horizontally scaled services. `main.zan` boots via
-`WebServer.Run(app, count, daemon)` from the standard library; swapping it for
-`WebServer.RunCommand(app, count)` turns the binary into a service that answers
-`start`, `start -d`, `stop`, `restart`, `reload` (rolling worker replacement)
-and `status` on the command line. Listener handoff, respawn-on-crash,
-daemonization and the control port live in `System.Net.Worker` /
-`System.Diagnostics.ProcessHost`, so any server gets them, not just this
-template.
+`WebServer.RunCommand(app, count, daemon)` from the standard library, so the
+binary is a service that answers `start`, `start -d`, `stop`, `restart`,
+`reload` (rolling worker replacement) and `status` on the command line; the
+running instance is addressed through its control port (the HTTP port +
+10000, or `--ctl-port N`). `WebServer.Run(app, count, daemon)` is the plain
+variant that only ever starts in the foreground. `-d` / `daemon: true` detach
+on Linux only -- on Windows the process stays in the foreground (use NSSM or a
+Windows service to run it in the background). Listener handoff,
+respawn-on-crash, daemonization and the control port live in
+`System.Net.Worker` / `System.Diagnostics.ProcessHost`, so any server gets
+them, not just this template.
 
 ## Observability (`GET /admin/stats`)
 
