@@ -1740,11 +1740,17 @@ class App {
         if (showPinButton) { nextX = nextX - bw; pinX = nextX; }
         if (showThemeButton) { nextX = nextX - bw; themeX = nextX; }
 
+        // 标题按钮的 id 固定在专属段内：它们在一帧的最后分配，
+        // 若跟随帧内计数器，任何条件出现的表面（右键菜单、
+        // 对话框、toast）都会把它们整体挪位，于是上一帧解析出的
+        // 指针目标落到本帧的另一个控件上（信号乱串）。
+        focus.PushIds(990000);
         int themeId = focus.AllocId();
         int pinId = focus.AllocId();
         int minId = focus.AllocId();
         int maxId = focus.AllocId();
         int closeId = focus.AllocId();
+        focus.PopIds();
 
         bool themeH = focus.IsHovered(themeId);
         bool pinH = focus.IsHovered(pinId);
@@ -2133,8 +2139,9 @@ class App {
         return a + (b - a) * p / 1000;
     }
 
-    /// 按千分值 p (0..1000) 混合两个打包的 RGB 颜色，返回不透明
-    /// （alpha 为 0xFF）的颜色。对以负符号整数存储的颜色同样稳健。
+    /// 按千分值 p (0..1000) 混合两个打包的 ARGB 颜色，alpha 与 RGB
+    /// 一同插值（两端不透明时结果仍不透明）。对以负符号整数
+    /// 存储的颜色同样稳健。
     static int LerpColor(int c0, int c1, int p) {
         // 打包的 0xAARRGGBB 颜色以有符号整数存储，因此任何
         // alpha 为 0xFF 的颜色都是负数。先用向下取整的
@@ -2148,10 +2155,16 @@ class App {
         int r1 = rgb1 / 65536;
         int g1 = (rgb1 / 256) % 256;
         int b1 = rgb1 % 256;
+        int a0 = (c0 - rgb0) / 16777216; if (a0 < 0) { a0 = a0 + 256; }
+        int a1 = (c1 - rgb1) / 16777216; if (a1 < 0) { a1 = a1 + 256; }
         int r = r0 + (r1 - r0) * p / 1000;
         int g = g0 + (g1 - g0) * p / 1000;
         int b = b0 + (b1 - b0) * p / 1000;
-        return (int)4278190080 + r * 65536 + g * 256 + b;
+        // alpha 与 RGB 一同插值：半透明 token（玻璃皮肤的
+        // `--border-primary: #38ffffff`）过去被强制成不透明，
+        // 于是深色皮肤上的复选框、边框都描出一道白边。
+        int a = a0 + (a1 - a0) * p / 1000;
+        return a * 16777216 + r * 65536 + g * 256 + b;
     }
 
     /// 按千分值 p (0..1000) 将打包颜色向不透明黑色调暗：
@@ -2397,20 +2410,29 @@ class App {
         if (kind == 2) {
             mouseX = window.EventX();
             mouseY = window.EventY();
-            int hitId = hitTester.HitTest(mouseX, mouseY);
+            int hitId = hitTester.AnchorAt(0, mouseX, mouseY, false);
             if (window.EventButton() == 1) {
                 // 次要按钮：记录 Ui.RightClicked 的目标，
                 // 但不动主焦点/按下状态，这样右键
                 // 点击永远不会抢走键盘焦点或触发主点击。
-                rightPressTargetId = this.RightHitTest(mouseX, mouseY);
+                rightPressTargetId = hitTester.AnchorAt(2, mouseX, mouseY,
+                    menuBlockPrevious);
                 // 主目标是跨帧保留的（上一次左键点在哪个控件上），
                 // 而 Ui.Pressed/Ui.Clicked 只看事件类型不看按钮，
                 // 所以必须在这里清掉：否则右键会把上一次左键点过的
                 // 控件（例如功能区的“发布”）重新触发一次。
                 pressTargetId = -1;
+                hitTester.ClearAnchor(0);
             } else {
                 focus.SetPressed(hitId);
                 focus.SetFocused(hitId);
+                // 主键按下作废上一次右键解析出的目标：否则被右键
+                // 点过的控件会一直认为自己是次要目标，之后在别处的
+                // 每一次点击它都会跟着响应（树行被莫名展开/折叠）。
+                hitTester.ClearAnchor(2);
+                hitTester.ClearAnchor(3);
+                rightPressTargetId = -1;
+                rightClickTargetId = -1;
                 pressTargetId = hitId;
                 NotePressStart(hitId, mouseX, mouseY);
             }
@@ -2420,12 +2442,14 @@ class App {
         if (kind == 3) {
             mouseX = window.EventX();
             mouseY = window.EventY();
-            int hitId = hitTester.HitTest(mouseX, mouseY);
+            int hitId = hitTester.AnchorAt(1, mouseX, mouseY, false);
             if (window.EventButton() == 1) {
                 // 次要按钮释放：仅解析右键点击目标，并清掉主点击
                 // 目标，这样这一帧没有任何控件看到 Ui.Clicked。
-                rightClickTargetId = this.RightHitTest(mouseX, mouseY);
+                rightClickTargetId = hitTester.AnchorAt(3, mouseX, mouseY,
+                    menuBlockPrevious);
                 clickTargetId = -1;
+                hitTester.ClearAnchor(1);
             } else {
                 // 对照上一帧仍然完整的
                 // 命中区域（含弹层，最上层优先）解析点击目标，
@@ -2595,13 +2619,22 @@ class App {
         if (kind == 2) {
             mouseX = window.EventX();
             mouseY = window.EventY();
-            int hitId = hitTester.HitTest(mouseX, mouseY);
+            int hitId = hitTester.AnchorAt(0, mouseX, mouseY, false);
             if (window.EventButton() == 1) {
-                rightPressTargetId = this.RightHitTest(mouseX, mouseY);
+                rightPressTargetId = hitTester.AnchorAt(2, mouseX, mouseY,
+                    menuBlockPrevious);
                 pressTargetId = -1;
+                hitTester.ClearAnchor(0);
             } else {
                 focus.SetPressed(hitId);
                 focus.SetFocused(hitId);
+                // 主键按下作废上一次右键解析出的目标：否则被右键
+                // 点过的控件会一直认为自己是次要目标，之后在别处的
+                // 每一次点击它都会跟着响应（树行被莫名展开/折叠）。
+                hitTester.ClearAnchor(2);
+                hitTester.ClearAnchor(3);
+                rightPressTargetId = -1;
+                rightClickTargetId = -1;
                 pressTargetId = hitId;
                 pointerDown = true;
                 NotePressStart(hitId, mouseX, mouseY);
@@ -2612,10 +2645,12 @@ class App {
         if (kind == 3) {
             mouseX = window.EventX();
             mouseY = window.EventY();
-            int hitId = hitTester.HitTest(mouseX, mouseY);
+            int hitId = hitTester.AnchorAt(1, mouseX, mouseY, false);
             if (window.EventButton() == 1) {
-                rightClickTargetId = this.RightHitTest(mouseX, mouseY);
+                rightClickTargetId = hitTester.AnchorAt(3, mouseX, mouseY,
+                    menuBlockPrevious);
                 clickTargetId = -1;
+                hitTester.ClearAnchor(1);
             } else {
                 clickTargetId = hitId;
                 pointerDown = false;
@@ -3038,16 +3073,16 @@ class App {
     void ClaimClick() { clickClaimed = true; }
 
     /// 当前点击（mouse-up）落到的控件 id，无则 -1。
-    int ClickTarget() { return clickTargetId; }
+    int ClickTarget() { return hitTester.AnchorIdOf(1); }
 
     /// 当前按下（mouse-down）落到的控件 id，无则 -1。
-    int PressTarget() { return pressTargetId; }
+    int PressTarget() { return hitTester.AnchorIdOf(0); }
 
     /// 当前次要（右键）点击落到的控件 id，无则 -1。
-    int RightClickTarget() { return rightClickTargetId; }
+    int RightClickTarget() { return hitTester.AnchorIdOf(3); }
 
     /// 当前次要（右键）按下落到的控件 id，无则 -1。
-    int RightPressTarget() { return rightPressTargetId; }
+    int RightPressTarget() { return hitTester.AnchorIdOf(2); }
 
     /// 当完成的点击在双击时间窗内是同一控件上的第二次点击时
     /// 为真（见 Ui.DoubleClicked）。

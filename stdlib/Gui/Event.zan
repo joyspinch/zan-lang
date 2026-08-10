@@ -572,6 +572,23 @@ class HitTester {
     bool useA;
     int used;
 
+    // 目标锚点（0 按下、1 点击、2 右键按下、3 右键点击）。鼠标事件
+    // 在上一帧的命中区上解析出目标，而控件要到下一帧渲染时才去对比
+    // 自己的 id。控件 id 是即时模式的分配序号，只要中间多出或少掉
+    // 一个控件（典型如右键菜单开/关），其后所有 id 都会整体平移，
+    // 于是上一帧解析出的 id 在本帧落到了另一个控件上——这就是
+    // “开过右键菜单后信号乱串”的根源。矩形来自布局，不随 id 平移，
+    // 因此锚点同时记住命中区的矩形；本帧哪个控件注册到同一个矩形，
+    // 哪个才是真正的目标，注册时就地把锚点 id 改写过去。
+    List<int> anchorId;
+    List<int> anchorX;
+    List<int> anchorY;
+    List<int> anchorW;
+    List<int> anchorH;
+    List<int> anchorType;
+    List<int> anchorSet;
+    List<int> anchorDone;
+
     HitTester() {
         poolA = new List<HitRegion>();
         poolB = new List<HitRegion>();
@@ -580,6 +597,14 @@ class HitTester {
         regions = poolA;
         blockers = new List<HitRegion>();
         prevBlockers = new List<HitRegion>();
+        anchorId = new List<int>{ -1, -1, -1, -1 };
+        anchorX = new List<int>{ 0, 0, 0, 0 };
+        anchorY = new List<int>{ 0, 0, 0, 0 };
+        anchorW = new List<int>{ 0, 0, 0, 0 };
+        anchorH = new List<int>{ 0, 0, 0, 0 };
+        anchorType = new List<int>{ 0, 0, 0, 0 };
+        anchorSet = new List<int>{ 0, 0, 0, 0 };
+        anchorDone = new List<int>{ 0, 0, 0, 0 };
     }
 
     void Clear() {
@@ -588,7 +613,41 @@ class HitTester {
         useA = !useA;
         if (useA) { regions = poolA; } else { regions = poolB; }
         used = 0;
+        for (int k = 0; k < 4; k = k + 1) { anchorDone[k] = 0; }
     }
+
+    /// 在上一帧的命中区上解析 (px, py) 的目标并记入锚点 `k`；
+    /// `below` 为真时跳过阻挡区，解析其下方的控件（右键用）。
+    int AnchorAt(int k, int px, int py, bool below) {
+        int i = used - 1;
+        while (i >= 0) {
+            HitRegion r = regions[i];
+            bool skip = below && r.widgetType == -1;
+            if (!skip && r.Contains(px, py)) {
+                anchorId[k] = r.id;
+                anchorX[k] = r.x;
+                anchorY[k] = r.y;
+                anchorW[k] = r.width;
+                anchorH[k] = r.height;
+                anchorType[k] = r.widgetType;
+                anchorSet[k] = 1;
+                anchorDone[k] = 0;
+                return r.id;
+            }
+            i = i - 1;
+        }
+        this.ClearAnchor(k);
+        return -1;
+    }
+
+    void ClearAnchor(int k) {
+        anchorId[k] = -1;
+        anchorSet[k] = 0;
+        anchorDone[k] = 0;
+    }
+
+    /// 锚点 `k` 当前对应的控件 id（本帧已按矩形改写过）。
+    int AnchorIdOf(int k) { return anchorId[k]; }
 
     /// 本帧已注册的命中区数量（`regions` 是复用池，末尾
     /// 可能残留上一帧的对象，遍历要以此为界）。
@@ -607,6 +666,15 @@ class HitTester {
         }
         used = used + 1;
         if (wtype == -1) { blockers.Add(r); }
+        for (int k = 0; k < 4; k = k + 1) {
+            if (anchorSet[k] == 1 && anchorDone[k] == 0
+                && anchorType[k] == wtype
+                && anchorX[k] == x && anchorY[k] == y
+                && anchorW[k] == w && anchorH[k] == h) {
+                anchorId[k] = id;
+                anchorDone[k] = 1;
+            }
+        }
     }
 
     void Register(HitRegion region) {
