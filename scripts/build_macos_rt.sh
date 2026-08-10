@@ -28,21 +28,22 @@ for pair in arm64:aarch64 x64:x86_64; do
     # The .11.0 target suffix stamps LC_BUILD_VERSION minos 11.0, matching the
     # -platform_version zanc passes to ld64.lld; without it every link warns
     # that the object is newer than the target minimum.
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -DZAN_IO_STACKLESS_ONLY -I "$RT" -O2 \
+    # -fPIC throughout: these objects are linked into dylibs as well as into
+    # executables, and Mach-O shared output rejects the absolute relocations a
+    # non-PIC object emits.
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I "$RT" -O2 \
         -c "$RT/rt_io.c" -o "$out/zanrt_io.o"
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER \
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER -fPIC \
         -I "$RT" -O2 -c "$RT/rt_io.c" -o "$out/zanrt_io_mt.o"
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -I "$RT" -O2 \
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 \
         -c "$RT/rt_sync.c" -o "$out/zanrt_sync.o"
-    # Its own command: this line used to be a dangling continuation of the
-    # rt_sync one, so zanrt_file.o was silently never produced and every
-    # cross-link of a program touching System.IO.File failed with
-    # "cannot open .../zanrt_file.o".
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -I "$RT" -O2 \
+    # File metadata / stream IO runtime (zan_file_*), linked by any program
+    # that touches System.IO.File.
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 \
         -c "$RT/rt_file.c" -o "$out/zanrt_file.o"
     # Every emitted program calls zan_timer_* from its inline coroutine driver,
     # so a cross-link needs this object unconditionally (see main.c).
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -I "$RT" -O2 \
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 \
         -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
     echo "built toolchain/macos/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o"
 done

@@ -877,12 +877,6 @@ void zan_io_shutdown(void) {
     g_io_started = 0;
 }
 
-int32_t zan_io_set_nonblocking(intptr_t fd) {
-    int flags = fcntl((int)fd, F_GETFL, 0);
-    if (flags < 0) return -1;
-    return fcntl((int)fd, F_SETFL, flags | O_NONBLOCK);
-}
-
 static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
     if (io_reject_dead_fd(fd, co, step)) return;
     zan_io_slot_t *s = io_slot((int)fd);
@@ -1496,12 +1490,6 @@ void zan_io_shutdown(void) {
     if (g_dns_wake_fd >= 0) { close(g_dns_wake_fd); g_dns_wake_fd = -1; }
     if (g_dns_wake_wfd >= 0) { close(g_dns_wake_wfd); g_dns_wake_wfd = -1; }
     g_io_started = 0;
-}
-
-int32_t zan_io_set_nonblocking(intptr_t fd) {
-    int flags = fcntl((int)fd, F_GETFL, 0);
-    if (flags < 0) return -1;
-    return fcntl((int)fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {

@@ -24,20 +24,20 @@ for pair in linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64; do
     arch=${pair#*:}
     out="$ROOT/toolchain/$sub"
     mkdir -p "$out"
-    "$ZIG" cc -target "$arch-linux-musl" -g0 -DZAN_IO_STACKLESS_ONLY \
+    # -fPIC throughout: the same objects are linked both into static
+    # executables (where ld.lld relaxes the PIC sequences) and into shared
+    # libraries, which reject the absolute and static-TLS relocations a
+    # non-PIC object emits.
+    "$ZIG" cc -target "$arch-linux-musl" -g0 -DZAN_IO_STACKLESS_ONLY -fPIC \
         -I "$RT" -O2 -c "$RT/rt_io.c" -o "$out/zanrt_io.o"
-    "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 \
+    "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
         -I "$RT" -O2 -c "$RT/rt_sync.c" -o "$out/zanrt_sync.o"
-    # Its own command: this line used to be a dangling continuation of the
-    # rt_sync one, so zanrt_file.o was silently never produced and every
-    # cross-link of a program touching System.IO.File failed with
-    # "cannot open .../zanrt_file.o".
-    "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 \
+    # File metadata / stream IO runtime (zan_file_*), linked by any program
+    # that touches System.IO.File.
+    "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
         -I "$RT" -O2 -c "$RT/rt_file.c" -o "$out/zanrt_file.o"
     # Every emitted program calls zan_timer_* from its inline coroutine driver,
-    # so a cross-link needs this object unconditionally (see main.c) -- including
-    # when the output is a .so, hence -fPIC (x86_64 otherwise emits absolute
-    # 32-bit relocations that a shared object cannot take).
+    # so a cross-link needs this object unconditionally (see main.c).
     "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
         -I "$RT" -O2 -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
     echo "built toolchain/$sub: zanrt_io.o zanrt_sync.o zanrt_file.o zanrt_timer.o"

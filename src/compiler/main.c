@@ -2434,6 +2434,9 @@ int main(int argc, char **argv) {
             rt_timer_obj = rt_timer_buf;
         }
 #endif
+        /* Toolchain subdirectory holding the target-ABI runtime objects; NULL
+         * on a native build or for a target that ships none. */
+        const char *target_rt_sub = NULL;
         if (cross_compiling) {
             /* The object zanc built for itself is host-ABI, so a cross link
              * takes the target's own copy from that target's toolchain
@@ -2465,6 +2468,7 @@ int main(int argc, char **argv) {
                     return 1;
                 }
                 rt_timer_obj = rt_timer_buf;
+                target_rt_sub = tsub;
             }
         }
         if (cross_compiling && rt_sync_obj && target.os != ZAN_OS_LINUX
@@ -2688,13 +2692,14 @@ int main(int argc, char **argv) {
              * (LLVMRelocPIC in zan_irgen_write_obj), so the same object works
              * for both static and shared on every target.
              *
-             * Runtime objects (IO reactor, sync runtime, embed API) are only
-             * pulled in when the library actually uses them (irgen.uses_*);
-             * a pure-function library links with no runtime at all. On a
-             * cross build the host-side rt_*_obj pointers below are host
-             * objects, not target ones, so a cross shared library that needs
-             * the runtime is rejected (cross static archives are fine: the
-             * consumer links the runtime). */
+             * Runtime objects (IO reactor, sync runtime, file IO, embed API)
+             * are only pulled in when the library actually uses them
+             * (irgen.uses_*); a pure-function library links with no runtime at
+             * all. The rt_*_obj pointers resolved above are host-ABI objects,
+             * so a cross build repoints them at the target's own copies in the
+             * toolchain subdirectory, exactly like the executable link paths
+             * do. (Cross static archives need none of this: the consumer links
+             * the runtime.) */
             if (!lib_shared) {
                 /* static library: ar archive of the single object */
                 if (zan_write_static_lib(obj_tmp, obj_path) != 0) {
@@ -2708,19 +2713,62 @@ int main(int argc, char **argv) {
                 }
                 link_ret = 0;
             } else {
-                bool need_rt = (irgen.uses_socket_async || irgen.uses_sync_runtime
-                                || irgen.uses_embed_api);
-                if (cross_compiling && need_rt) {
-                    fprintf(stderr,
-                            "error: cross-compiled shared libraries that use the "
-                            "Zan runtime are not supported yet (link a static "
-                            "library, or build the shared library on the target "
-                            "host)\n");
-                    remove(obj_tmp);
-                    zan_irgen_destroy(&irgen);
-                    zan_arena_free(arena);
-                    free(source);
-                    return 1;
+                if (cross_compiling
+                    && (rt_io_obj || rt_sync_obj || rt_file_obj
+                        || rt_embed_obj)) {
+                    if (!target_rt_sub) {
+                        fprintf(stderr,
+                                "error: no bundled runtime objects for this "
+                                "cross-compilation target; link a static "
+                                "library instead\n");
+                        remove(obj_tmp);
+                        zan_irgen_destroy(&irgen);
+                        zan_arena_free(arena);
+                        free(source);
+                        return 1;
+                    }
+                    const char *missing = NULL;
+                    if (rt_io_obj) {
+                        snprintf(rt_io_buf, sizeof(rt_io_buf), "%s/%s/%s",
+                                 link_exe_dir, target_rt_sub,
+                                 mt_scheduler ? "zanrt_io_mt.o" : "zanrt_io.o");
+                        rt_io_obj = rt_io_buf;
+                        if (!zan_file_exists(rt_io_obj)) missing = rt_io_obj;
+                    }
+                    if (rt_sync_obj) {
+                        snprintf(rt_sync_buf, sizeof(rt_sync_buf),
+                                 "%s/%s/zanrt_sync.o", link_exe_dir,
+                                 target_rt_sub);
+                        rt_sync_obj = rt_sync_buf;
+                        if (!zan_file_exists(rt_sync_obj)) missing = rt_sync_obj;
+                    }
+                    if (rt_file_obj) {
+                        snprintf(rt_file_buf, sizeof(rt_file_buf),
+                                 "%s/%s/zanrt_file.o", link_exe_dir,
+                                 target_rt_sub);
+                        rt_file_obj = rt_file_buf;
+                        if (!zan_file_exists(rt_file_obj)) missing = rt_file_obj;
+                    }
+                    if (rt_embed_obj) {
+                        snprintf(rt_embed_buf, sizeof(rt_embed_buf),
+                                 "%s/%s/zan_embed_api.o", link_exe_dir,
+                                 target_rt_sub);
+                        rt_embed_obj = rt_embed_buf;
+                        if (!zan_file_exists(rt_embed_obj)) missing = rt_embed_obj;
+                    }
+                    if (missing) {
+                        fprintf(stderr,
+                                "error: bundled %s runtime object not found at "
+                                "'%s'; reinstall zan or rebuild with "
+                                "toolchain/%s present (see "
+                                "scripts/build_*_rt.sh)\n",
+                                target_rt_sub, missing, target_rt_sub);
+                        remove(obj_tmp);
+                        zan_irgen_destroy(&irgen);
+                        zan_arena_free(arena);
+                        free(source);
+                        return 1;
+                    }
                 }
                 char cmd[8192];
                 bool lib_spawned = false; /* Windows: linked via _spawnv */
@@ -2907,8 +2955,8 @@ int main(int argc, char **argv) {
                 } else if (target.os == ZAN_OS_LINUX) {
                     snprintf(cmd, sizeof(cmd),
                              "ld.lld -shared -o \"%s\" \"%s\"", obj_path, obj_tmp);
-                    /* native Linux build: link host runtime objects the library
-                     * actually uses (cross builds needing them were rejected) */
+                    /* link the runtime objects the library actually uses:
+                     * host copies natively, target copies on a cross build */
                     if (rt_io_obj) {
                         size_t cur = strlen(cmd);
                         snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
@@ -2957,8 +3005,8 @@ int main(int argc, char **argv) {
                              "ld64.lld -dylib -arch %s -platform_version macos "
                              "11.0 11.0 -o \"%s\" \"%s\" \"%s\"",
                              march, obj_path, obj_tmp, tbd);
-                    /* native macOS build: link host runtime objects the
-                     * library actually uses (cross builds rejected above) */
+                    /* link the runtime objects the library actually uses:
+                     * host copies natively, target copies on a cross build */
                     if (rt_io_obj) {
                         size_t cur = strlen(cmd);
                         snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
