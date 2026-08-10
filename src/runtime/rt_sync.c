@@ -12,6 +12,11 @@
 #if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
 #define _DARWIN_C_SOURCE
 #endif
+/* glibc declares gettid() only under _GNU_SOURCE; without it the call below
+ * is an implicit declaration, which clang 16+ rejects outright. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
 
 #include "rt_sync.h"
 
