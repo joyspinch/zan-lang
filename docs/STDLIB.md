@@ -167,6 +167,7 @@ stdlib/
 ├── Gui/                             # self-hosted GUI framework (Zan source)
 │   ├── App.zan / Types.zan / Theme.zan / Reactive.zan / Layout.zan
 │   ├── Render.zan / Event.zan / Text.zan / Icon.zan / Css.zan / Style*.zan
+│   ├── Tailwind.zan                 # Tailwind 工具类 -> CSS 声明（docs/GUI_TAILWIND.md）
 │   ├── Backend/                     # Native.zan, UiDriver.zan, Win32Shell.zan
 │   ├── Component/                   # Chart, CodeEditor, DataTable, WebView, ...
 │   ├── Widget/                      # 60 controls (Button, Input, Label, ...)
