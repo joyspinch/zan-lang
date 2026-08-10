@@ -29,6 +29,9 @@ class PoolCore<T> {
     int waiting;        // 当前停泊等待连接的协程数
     Gate gate;          // 面向等待者的事件驱动唤醒（取代轮询）
     bool closed;
+    bool openFailed;    // 自上次成功建连以来，最近一次建连是否失败
+    int skipped;        // 退避期间已快速失败的获取次数
+    int retryEvery;     // 退避期间每多少次获取放行一次真正的重试
 
     /// <summary>创建核心，存活连接数上限为 <paramref name="maxSize"/>
     /// （至少一个）。</summary>
@@ -43,6 +46,9 @@ class PoolCore<T> {
         this.waiting = 0;
         this.gate = new Gate();
         this.closed = false;
+        this.openFailed = false;
+        this.skipped = 0;
+        this.retryEvery = 64;
     }
 
     /// <summary>从空闲列表取出最近归还的连接，
@@ -123,6 +129,44 @@ class PoolCore<T> {
             i = i + 1;
         }
         return false;
+    }
+
+    /// <summary>建连失败后，本次获取是否应跳过建连尝试。
+    ///
+    /// 后端不可达时，池里永远没有空闲连接，于是每个获取者都会
+    /// 重新尝试建连；建连失败本身是有代价的（一次失败的
+    /// sqlite3_open 约 125us，网络驱动还要等一个 RTT 或超时），
+    /// 代价会摊到每个请求上。失败后只放行每 <c>retryEvery</c>
+    /// 次获取中的一次去真正重试，其余立即失败，让后端宕机变成
+    /// 快速失败而不是吞吐塌方；重试一旦成功便恢复常态。
+    /// 不依赖时钟，因此各平台行为一致。</summary>
+    bool OpenBlocked() {
+        if (!this.openFailed) {
+            return false;
+        }
+        this.skipped = this.skipped + 1;
+        if (this.skipped >= this.retryEvery) {
+            this.skipped = 0;
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>登记一次失败的建连，开启（或延续）退避。</summary>
+    void NoteOpenFailed() {
+        this.openFailed = true;
+        this.skipped = 0;
+    }
+
+    /// <summary>登记一次成功的建连，结束退避。</summary>
+    void NoteOpenOk() {
+        this.openFailed = false;
+        this.skipped = 0;
+    }
+
+    /// <summary>最近一次建连是否失败（即连接池是否处于退避中）。</summary>
+    bool OpenFailing() {
+        return this.openFailed;
     }
 
     /// <summary>连接池饱和时停泊获取者的闸门。其计数

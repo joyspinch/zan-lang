@@ -50,9 +50,9 @@ class FakeConnection : IDbConnection {
     void BeginTransaction() { }
     void Commit() { }
     void Rollback() { }
-    async void BeginTransactionAsync() { }
-    async void CommitAsync() { }
-    async void RollbackAsync() { }
+    async bool BeginTransactionAsync() { return true; }
+    async bool CommitAsync() { return true; }
+    async bool RollbackAsync() { return true; }
     bool IsConnected() { return this.alive; }
     void Close() { this.alive = false; }
     int GetProvider() { return DbProvider.SQLite; }
@@ -69,6 +69,9 @@ class FakeConnector : IDbConnector {
 
     static FakeConnector Create() { return new FakeConnector(false); }
     static FakeConnector Failing() { return new FakeConnector(true); }
+
+    // The backend comes back up: later opens succeed.
+    void Heal() { this.failing = false; }
 
     int Opened() { return this.opened; }
 
@@ -236,6 +239,39 @@ class Program {
         pool.Close();
     }
 
+    static async void FailedOpenBackoff() {
+        // A pool whose backend is down has no idle connections, so every
+        // acquirer would otherwise re-attempt the connect -- and a failing
+        // connect costs real time (a failed sqlite3_open is ~125us, a network
+        // driver waits a round trip). That cost lands on every request. After a
+        // failure the pool fails fast and only lets a periodic acquire retry.
+        FakeConnector f = FakeConnector.Failing();
+        DbPool pool = new DbPool(f, 4);
+
+        IDbConnection a = await pool.AcquireAsync();
+        Check.True(a == null, "backoff: first open fails");
+        Check.Eq(f.Opened(), 1, "backoff: the first acquire did try to connect");
+
+        for (int i = 0; i < 20; i = i + 1) {
+            IDbConnection c = await pool.AcquireAsync();
+            Check.True(c == null, "backoff: acquire keeps failing while down");
+        }
+        Check.Eq(f.Opened(), 1, "backoff: no reconnect storm behind the failure");
+
+        // Recovery: the periodic retry picks the backend back up on its own.
+        f.Heal();
+        IDbConnection ok = null;
+        for (int i = 0; i < 200; i = i + 1) {
+            ok = await pool.AcquireAsync();
+            if (ok != null) {
+                break;
+            }
+        }
+        Check.True(ok != null, "backoff: pool recovers once the backend is back");
+        pool.Release(ok);
+        pool.Close();
+    }
+
     static async void CloseWakesWaiters() {
         FakeConnector f = FakeConnector.Create();
         DbPool pool = new DbPool(f, 1);
@@ -264,6 +300,7 @@ class Program {
         await Program.CapAndWait();
         await Program.Eviction();
         await Program.FailedOpen();
+        await Program.FailedOpenBackoff();
         await Program.CloseWakesWaiters();
     }
 

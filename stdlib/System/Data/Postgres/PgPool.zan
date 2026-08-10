@@ -59,12 +59,20 @@ class PgPool {
                 this.core.Drop(pooled);
                 pooled = this.core.TakeIdle();
             }
+            // 上一次建连失败后退避：后端不可达时，若每次获取都重试建连，
+            // 失败本身就成了每请求的固定开销（失败的本地 open 也要约
+            // 125us），足以让命中路由的吞吐掉一个数量级。
+            if (this.core.OpenBlocked()) {
+                return null;
+            }
             if (this.core.TryReserve()) {
                 PgConnection opened = await this.OpenOne();
                 if (opened == null || !opened.IsConnected()) {
+                    this.core.NoteOpenFailed();
                     this.core.UndoReserve();
                     return null;
                 }
+                this.core.NoteOpenOk();
                 this.core.Borrow(opened);
                 return opened;
             }
