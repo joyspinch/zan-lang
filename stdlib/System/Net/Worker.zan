@@ -391,6 +391,12 @@ class Worker {
             string a = Environment.ArgAt(i);
             if (a == "-d" || a == "--daemon") {
                 detach = true;
+            } else if (a == "--ctl-port" && i + 1 < Environment.ArgCount()) {
+                // The control port is derived (first Worker's port + 10000),
+                // so two servers on nearby ports collide with no way out but
+                // an environment variable. Name it on the command line, and
+                // stop/status/reload address the same instance.
+                controlPort = Convert.ToInt32(Environment.ArgAt(i + 1));
             } else if (i == 0) {
                 cmd = a;
             }
@@ -578,7 +584,8 @@ class Worker {
 
     /// <summary>The command line a CLI-driven server answers.</summary>
     static string Usage() {
-        return "<app> [start [-d] | stop | restart [-d] | reload | status]";
+        return "<app> [start [-d] | stop | restart [-d] | reload | status]"
+            + " [--ctl-port N]";
     }
 
     /// <summary>Stops all workers in this process (single-process mode).</summary>
@@ -651,6 +658,17 @@ class Worker {
     static List<TcpClient> chConn = new List<TcpClient>();
     static int rrCounter = 0;
 
+    /// True when something ACCEPTS a connection on the control port, i.e. a
+    /// master really is running. A port that merely refuses the connection is
+    /// a leftover socket (TIME_WAIT) and can be reclaimed.
+    static async bool ControlPortHasMaster() {
+        TcpClient probe = await TcpClient.ConnectAsync("127.0.0.1", ControlPort());
+        if (probe == null) { return false; }
+        bool live = probe.IsConnected();
+        probe.Close();
+        return live;
+    }
+
     static async void RunAsMaster(int procs) {
         // Fork-bomb guard: claim the control port exclusively (no SO_REUSEADDR)
         // BEFORE spawning anything. If a child ever mistakes itself for a
@@ -667,10 +685,33 @@ class Worker {
         #endif
         int ctlBind = Socket.Bind(ctlSock, "127.0.0.1", ControlPort());
         if (ctlBind != 0) {
-            Console.WriteLine("[Worker] FATAL: control port "
+            // A failed bind does not mean a master owns the port: on Windows
+            // the previous master's control port sits in TIME_WAIT for about
+            // two minutes after it exits, and SO_REUSEADDR is not set there
+            // (it would let one process steal a live listener). So ask the
+            // port itself -- only something that ACCEPTS a connection is a
+            // running master; a lingering socket refuses it.
+            bool live = await ControlPortHasMaster();
+            if (live) {
+                Console.WriteLine("[Worker] FATAL: control port "
+                    + Convert.ToString(ControlPort())
+                    + " is served by a running master; stop it first"
+                    + " (<app> stop), or start this one with --ctl-port N");
+                exit(1);
+            }
+            Socket.Close(ctlSock);
+            ctlSock = Socket.CreateTcp();
+            Socket.SetReuseAddr(ctlSock);
+            ctlBind = Socket.Bind(ctlSock, "127.0.0.1", ControlPort());
+            if (ctlBind != 0) {
+                Console.WriteLine("[Worker] FATAL: cannot bind control port "
+                    + Convert.ToString(ControlPort())
+                    + "; start with --ctl-port N to pick another one");
+                exit(1);
+            }
+            Console.WriteLine("[Worker] control port "
                 + Convert.ToString(ControlPort())
-                + " is taken (another master running?); refusing to spawn workers");
-            exit(1);
+                + " was left behind by a previous run; reclaimed it");
         }
         Socket.Listen(ctlSock, 64);
         Socket.SetNonBlocking(ctlSock);
@@ -999,8 +1040,17 @@ class Worker {
         Socket.SetReuseAddr(ctlSock);
         #endif
         if (Socket.Bind(ctlSock, "127.0.0.1", ControlPort()) != 0) {
+            // Same as the master: a refused port is a leftover socket from the
+            // previous run, so stop/status/reload still reach this server
+            // instead of silently going unanswered for two minutes.
             Socket.Close(ctlSock);
-            return;
+            if (await ControlPortHasMaster()) { return; }
+            ctlSock = Socket.CreateTcp();
+            Socket.SetReuseAddr(ctlSock);
+            if (Socket.Bind(ctlSock, "127.0.0.1", ControlPort()) != 0) {
+                Socket.Close(ctlSock);
+                return;
+            }
         }
         Socket.Listen(ctlSock, 16);
         Socket.SetNonBlocking(ctlSock);
