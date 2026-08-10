@@ -11,6 +11,7 @@ class TcpClient {
     string host;
     int port;
     bool connected;
+    bool nonBlocking;
     int recvBufSize;
     string recvBuf;
 
@@ -22,6 +23,7 @@ class TcpClient {
         this.host = "";
         this.port = 0;
         this.connected = false;
+        this.nonBlocking = false;
         this.recvBufSize = 65536;
         this.recvBuf = null;
     }
@@ -111,8 +113,22 @@ class TcpClient {
         return client;
     }
 
+    /// <summary>把套接字切到非阻塞模式（幂等）。异步操作把描述符
+    /// 交给 IO reactor，阻塞描述符会让整个调度线程停在一次
+    /// recv/send 上；同步 Connect 与 FromSocket 交出的套接字
+    /// 未必已经是非阻塞的，因此在每个异步入口处保证一次，而不是
+    /// 依赖调用方的构造路径。同步 Send/Recv 不经过这里，仍是
+    /// 阻塞语义。</summary>
+    void EnsureNonBlocking() {
+        if (this.nonBlocking) { return; }
+        if (this.sock < 0) { return; }
+        Socket.SetNonBlocking(this.sock);
+        this.nonBlocking = true;
+    }
+
     /// <summary>发送数据，必要时在 IO reactor 上挂起。</summary>
     async int SendAsync(string data) {
+        this.EnsureNonBlocking();
         int len = (int)strlen(data);
         int r = await Socket.SendAsync(this.sock, data, len);
         return r;
@@ -120,12 +136,14 @@ class TcpClient {
 
     /// <summary>发送原始字节，必要时在 IO reactor 上挂起。</summary>
     async int SendBytesAsync(string data, int len) {
+        this.EnsureNonBlocking();
         int r = await Socket.SendAsync(this.sock, data, len);
         return r;
     }
 
     /// <summary>接收数据，在 IO reactor 上挂起直到可读。</summary>
     async string RecvAsync(int bufSize) {
+        this.EnsureNonBlocking();
         string r = await Socket.RecvAsync(this.sock, bufSize);
         return r;
     }
@@ -134,6 +152,7 @@ class TcpClient {
     /// 没有数据到达时返回空串（用 Socket.LastRecvTimedOut 与对端关闭
     /// 区分）。非正超时表示"不设截止时间"。</summary>
     async string RecvAsync(int bufSize, int timeoutMs) {
+        this.EnsureNonBlocking();
         string r = await Socket.RecvAsync(this.sock, bufSize, timeoutMs);
         return r;
     }
