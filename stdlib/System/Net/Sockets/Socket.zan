@@ -648,6 +648,53 @@ class Socket {
         return buf.ToStr(0, n);
     }
 
+    /// <summary>受 <paramref name="timeoutMs"/> 限制的 RecvAsync：时限内
+    /// 没有数据到达时返回空串（用 LastRecvTimedOut 与对端关闭区分）。
+    /// 非正超时表示"不设截止时间"，转而使用 reactor 驱动的重载。
+    ///
+    /// 用零超时的 select() 轮询可读性，而不是等 reactor 唤醒：唤醒
+    /// 无法取消，所以对一个接受了连接却永不回话的对端，不带截止
+    /// 时间的接收会永远挂起。</summary>
+    static async string RecvAsync(nint sock, int bufSize, int timeoutMs) {
+        if (timeoutMs <= 0) {
+            string plain = await Socket.RecvAsync(sock, bufSize);
+            return plain;
+        }
+        Socket.MarkRecvTimeout(false);
+        long deadlineUs = NativeMonotonicUs() + timeoutMs * 1000;
+        int stepMs = 1;
+        while (true) {
+            if (Socket.IsReadable(sock)) {
+                byte[] buf = new byte[bufSize + 1];
+                int n = (int)ReactorRecv(sock, buf, bufSize, 0);
+                if (n > 0) { return buf.ToStr(0, n); }
+                // 0 是对端关闭；负数是"会阻塞"或错误——套接字还活着
+                // 就继续等，否则按对端关闭处理。
+                if (n == 0 || !Socket.IsOpen(sock)) { return ""; }
+            }
+            if (NativeMonotonicUs() >= deadlineUs) {
+                Socket.MarkRecvTimeout(true);
+                return "";
+            }
+            await Task.Delay(stepMs);
+            if (stepMs < 16) { stepMs = stepMs * 2; }
+        }
+        return "";
+    }
+
+    /// <summary>本协程最近一次带超时的接收是因超时放弃、而非对端
+    /// 关闭时为 true。通过同步辅助函数写入，因为在 async 方法内给
+    /// 静态变量赋值会被按值捕获。</summary>
+    static bool LastRecvTimedOut() {
+        return Socket.recvTimedOut;
+    }
+
+    static bool recvTimedOut = false;
+
+    static void MarkRecvTimeout(bool timedOut) {
+        Socket.recvTimedOut = timedOut;
+    }
+
     /// <summary>挂起直到可读，然后最多接收 <paramref
     /// name="bufSize"/> 字节到调用方提供的缓冲区，在接收
     /// 字节数处补 NUL。返回读取的字节数（对端关闭时为 0）。让
