@@ -91,27 +91,69 @@ long long zan_file_length(const char *path) {
 #endif
 }
 
-/* Packaged (single-file) programs: a launcher that had to unpack a payload
- * exports ZAN_PKG_DIR pointing at the unpacked directory and starts the program
- * with the LAUNCHER's own directory as its working directory -- running from a
- * per-user cache directory is wrong for everything the program writes, and it
- * is what made a published single-file app operate on the extraction path.
- * Read-only resources still live in the payload, so a relative path that does
- * not exist in the working directory is retried there.
+/* Bundled read-only resources: a program's data (config/, views/, wwwroot/,
+ * assets/) ships next to its executable, but a relative path only resolves
+ * against the WORKING directory -- which is the launcher's directory for a
+ * single-file package, and whatever directory a service manager, a shortcut or
+ * a shell happened to start the program in otherwise. A published program then
+ * silently falls back to its built-in defaults because "config/app.json" was
+ * looked up somewhere it was never installed.
+ *
+ * So a relative READ that misses in the working directory is retried against,
+ * in order:
+ *   0. ZAN_PKG_DIR -- where a single-file launcher unpacked the payload,
+ *   1. the executable's own directory (ZAN_APP_DIR when a launcher exported
+ *      it, so the fallback is the installed program's directory rather than
+ *      the per-user extraction cache).
  *
  * Writes never take this path: a program that creates `save/state.json` must
- * create it next to itself, not inside a cache the next publish replaces.
- *
- * Returns `out` on success, NULL when there is nothing to try. */
-static const char *zan_pkg_path(const char *path, char *out, size_t cap) {
+ * create it next to itself, not inside a cache the next publish replaces. */
+
+/* The directory the running executable lives in ("" when it cannot be
+ * determined), cached after the first call. */
+const char *zan_file_app_dir(void) {
+    static char dir[4096];
+    static int resolved = 0;
+    if (resolved) return dir;
+    resolved = 1;
+    const char *env = getenv("ZAN_APP_DIR");
+    if (env && env[0] && strlen(env) < sizeof(dir)) {
+        memcpy(dir, env, strlen(env) + 1);
+        return dir;
+    }
+    char exe[4096];
+    exe[0] = 0;
+#ifdef _WIN32
+    DWORD n = GetModuleFileNameA(NULL, exe, (DWORD)sizeof(exe));
+    if (n == 0 || n >= sizeof(exe)) exe[0] = 0;
+#elif defined(__APPLE__)
+    uint32_t cap = (uint32_t)sizeof(exe);
+    if (_NSGetExecutablePath(exe, &cap) != 0) exe[0] = 0;
+#elif defined(__linux__)
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) exe[0] = 0;
+    else exe[n] = 0;
+#endif
+    if (!exe[0]) return dir;
+    char *fwd = strrchr(exe, '/');
+    char *back = strrchr(exe, '\\');
+    char *sep = fwd > back ? fwd : back;
+    if (!sep || sep == exe) return dir;
+    *sep = 0;
+    if (strlen(exe) < sizeof(dir)) memcpy(dir, exe, strlen(exe) + 1);
+    return dir;
+}
+
+/* `<base>/<path>` for candidate `which` (0 payload, 1 executable directory),
+ * or NULL when that base is unknown or `path` is not relative. */
+static const char *zan_alt_path(const char *path, int which, char *out,
+                                size_t cap) {
     if (!path || !path[0]) return NULL;
-    /* absolute or drive-relative: nothing to resolve */
     if (path[0] == '/' || path[0] == '\\') return NULL;
     if (path[1] == ':') return NULL;
-    const char *base = getenv("ZAN_PKG_DIR");
+    const char *base = which == 0 ? getenv("ZAN_PKG_DIR") : zan_file_app_dir();
     if (!base || !base[0]) return NULL;
-    size_t bl = strlen(base);
-    size_t pl = strlen(path);
+    size_t bl = strlen(base), pl = strlen(path);
     if (bl + pl + 2 > cap) return NULL;
     memcpy(out, base, bl);
     out[bl] = '/';
@@ -119,31 +161,59 @@ static const char *zan_pkg_path(const char *path, char *out, size_t cap) {
     return out;
 }
 
-/* fopen() that falls back to the unpacked payload for reads (see
- * zan_pkg_path). The stdlib's read paths import this instead of fopen so a
- * packaged program finds its resources without being run from the cache. */
+#define ZAN_ALT_BASES 2
+
+/* Bit 0 read-only, bit 1 hidden, bit 2 directory; -1 when missing. */
+static long long zan_file_attributes_at(const char *path);
+
+/* The bundled copy of a relative read path that is missing in the working
+ * directory, or "" when there is no better candidate. Directory listings
+ * (System.IO.Directory) resolve through this, so a published program finds its
+ * views/ and wwwroot/ the same way File does.
+ *
+ * Never returns its own argument: a managed Zan string handed back as the
+ * return value would be released once more than it was retained. */
+const char *zan_file_read_path(const char *path) {
+    if (zan_file_attributes_at(path) >= 0) return "";
+    static char alt[4096];
+    for (int which = 0; which < ZAN_ALT_BASES; which++) {
+        const char *p = zan_alt_path(path, which, alt, sizeof(alt));
+        if (p && zan_file_attributes_at(p) >= 0) return p;
+    }
+    return "";
+}
+
+/* fopen() that falls back to the bundled copies for reads (see zan_file_read_path).
+ * The stdlib's read paths import this instead of fopen so a published or
+ * packaged program finds its resources whatever directory it was started in. */
 void *zan_pkg_fopen(const char *path, const char *mode) {
     FILE *f = fopen(path, mode);
     if (f) return f;
     if (!mode || mode[0] != 'r') return NULL;
     if (strchr(mode, '+')) return NULL;
     char alt[4096];
-    const char *p = zan_pkg_path(path, alt, sizeof(alt));
-    if (!p) return NULL;
-    return fopen(p, mode);
+    for (int which = 0; which < ZAN_ALT_BASES; which++) {
+        const char *p = zan_alt_path(path, which, alt, sizeof(alt));
+        if (!p) continue;
+        f = fopen(p, mode);
+        if (f) return f;
+    }
+    return NULL;
 }
-
-/* Bit 0 read-only, bit 1 hidden, bit 2 directory; -1 when missing. */
-static long long zan_file_attributes_at(const char *path);
 
 long long zan_file_attributes(const char *path) {
     long long r = zan_file_attributes_at(path);
     if (r >= 0) return r;
     char alt[4096];
-    const char *p = zan_pkg_path(path, alt, sizeof(alt));
-    if (!p) return -1;
-    return zan_file_attributes_at(p);
+    for (int which = 0; which < ZAN_ALT_BASES; which++) {
+        const char *p = zan_alt_path(path, which, alt, sizeof(alt));
+        if (!p) continue;
+        r = zan_file_attributes_at(p);
+        if (r >= 0) return r;
+    }
+    return -1;
 }
+
 
 static long long zan_file_attributes_at(const char *path) {
     if (!path || !path[0]) return -1;

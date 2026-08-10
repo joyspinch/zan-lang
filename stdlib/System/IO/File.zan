@@ -50,11 +50,45 @@ class File {
     [DllImport("crt")]
     static extern long zan_file_attributes(string path);
 
+    // 内嵌资源：发布时被编进可执行文件的只读文件，按项目相对路径寻址
+    // （zanc --embed，IDE 里给文件/文件夹选「内嵌」）。磁盘上找不到时
+    // 才回退到内嵌副本，本地同名文件仍然优先，开发时改一改就能生效。
+    [DllImport("crt")]
+    static extern int zan_embed_has(string name);
+
+    [DllImport("crt")]
+    static extern string zan_embed_read(string name);
+
+    /// <summary>把路径规范成内嵌资源名：内嵌资源以项目相对路径命名，
+    /// "./config/app.json" 与 "config\\app.json" 都指向
+    /// "config/app.json"。</summary>
+    static string EmbedName(string path) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < path.Length; i = i + 1) {
+            string ch = path.Substring(i, 1);
+            if (ch == "\\") { ch = "/"; }
+            sb.Append(ch);
+        }
+        string s = sb.ToString();
+        while (s.Length >= 2 && s.Substring(0, 2) == "./") {
+            s = s.Substring(2, s.Length - 2);
+        }
+        if (s == ".") { return ""; }
+        return s;
+    }
+
+    /// <summary>该路径是否有内嵌副本。</summary>
+    static bool EmbedExists(string path) {
+        return zan_embed_has(File.EmbedName(path)) != 0;
+    }
+
     /// <summary>以字符串形式读取整个文件内容。
     /// 文件无法打开时抛出 FileNotFoundException。</summary>
     static string ReadAllText(string path) {
         nint fp = zan_pkg_fopen(path, "rb");
         if (fp == 0) {
+            string emb = File.EmbedName(path);
+            if (zan_embed_has(emb) != 0) { return zan_embed_read(emb); }
             throw new FileNotFoundException("Could not open file: " + path);
         }
         fseek(fp, 0, 0);
@@ -134,7 +168,7 @@ class File {
     /// 而 Windows 上同一调用失败 —— 同一份代码在两个平台行为相反。</summary>
     static bool Exists(string path) {
         long a = zan_file_attributes(path);
-        if (a < 0) { return false; }
+        if (a < 0) { return File.EmbedExists(path); }
         return ((a / 4) % 2) == 0;
     }
 

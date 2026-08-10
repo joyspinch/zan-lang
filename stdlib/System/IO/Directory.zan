@@ -9,6 +9,79 @@ namespace System.IO;
 /// （见 direntTypeOffset/direntNameOffset）。
 /// </summary>
 class Directory {
+    // 只读资源的落地位置：相对路径在当前工作目录下不存在时，运行时会
+    // 依次回退到单文件包的解包目录（ZAN_PKG_DIR）与可执行文件所在目录，
+    // 返回第一个真实存在的路径，都不存在（或本来就存在）时返回 ""。
+    // File 的读取走同一套回退，这里让目录枚举也走，发布后的程序才能
+    // 找到自己的 views/、wwwroot/，而不受启动时的工作目录影响。
+    [DllImport("crt")]
+    static extern string zan_file_read_path(string path);
+
+    /// <summary>把只读枚举用的相对路径解析到程序随附的那一份。</summary>
+    static string ReadPath(string path) {
+        if (path.Length == 0) { return path; }
+        string r = zan_file_read_path(path);
+        if (r == null || r.Length == 0) { return path; }
+        return r;
+    }
+
+    // 内嵌进可执行文件的资源名清单（按 '\n' 分隔，见 File 的内嵌读取）。
+    [DllImport("crt")]
+    static extern string zan_embed_list(string prefix);
+
+    /// <summary>内嵌资源里 `path` 下的直接子项：dirs 为真取子目录名，
+    /// 否则取文件名。磁盘上的同名目录仍然优先，这里只补上磁盘里没有的
+    /// 那部分，发布成单个可执行文件后 views/ 之类照样能枚举。</summary>
+    static List<string> EmbedChildren(string path, bool dirs) {
+        List<string> outp = new List<string>();
+        string pre = File.EmbedName(path);
+        if (pre.Length > 0 && pre.Substring(pre.Length - 1, 1) != "/") {
+            pre = pre + "/";
+        }
+        string raw = zan_embed_list(pre);
+        if (raw == null || raw.Length == 0) { return outp; }
+        int start = 0;
+        for (int i = 0; i <= raw.Length; i = i + 1) {
+            if (i != raw.Length && raw.Substring(i, 1) != "\n") { continue; }
+            string name = raw.Substring(start, i - start);
+            start = i + 1;
+            if (name.Length <= pre.Length) { continue; }
+            string rest = name.Substring(pre.Length, name.Length - pre.Length);
+            int slash = -1;
+            for (int k = 0; k < rest.Length; k = k + 1) {
+                if (rest.Substring(k, 1) == "/") { slash = k; break; }
+            }
+            string item = rest;
+            if (slash >= 0) { item = rest.Substring(0, slash); }
+            if (dirs != (slash >= 0)) { continue; }
+            bool seen = false;
+            for (int k = 0; k < outp.Count; k = k + 1) {
+                if (outp[k] == item) { seen = true; break; }
+            }
+            if (!seen) { outp.Add(item); }
+        }
+        return outp;
+    }
+
+    /// <summary>内嵌资源里是否有这个目录（即有资源以它为前缀）。</summary>
+    static bool EmbedExists(string path) {
+        if (Directory.EmbedChildren(path, false).Count > 0) { return true; }
+        return Directory.EmbedChildren(path, true).Count > 0;
+    }
+
+    /// <summary>把内嵌资源里的子项并进磁盘枚举结果（磁盘优先，不重复）。</summary>
+    static List<string> MergeEmbed(List<string> disk, string path, bool dirs) {
+        List<string> emb = Directory.EmbedChildren(path, dirs);
+        for (int i = 0; i < emb.Count; i = i + 1) {
+            bool seen = false;
+            for (int k = 0; k < disk.Count; k = k + 1) {
+                if (disk[k] == emb[i]) { seen = true; break; }
+            }
+            if (!seen) { disk.Add(emb[i]); }
+        }
+        return disk;
+    }
+
     #if WINDOWS
     [DllImport("kernel32", EntryPoint = "GetFileAttributesW")]
     static extern int WinGetFileAttributes(string path);
@@ -162,6 +235,11 @@ class Directory {
 
     /// <summary>检查目录是否存在。</summary>
     static bool Exists(string path) {
+        if (Directory.ExistsOnDisk(path)) { return true; }
+        return Directory.EmbedExists(path);
+    }
+
+    static bool ExistsOnDisk(string path) {
         #if WINDOWS
         int attrs = winAttributesUtf8(path);
         // GetFileAttributesW 失败时返回 32 位 DWORD 常量 INVALID_FILE_ATTRIBUTES
@@ -332,42 +410,50 @@ class Directory {
 
     /// <summary>列出目录中的文件（不递归）。</summary>
     static List<string> GetFiles(string path) {
+        string p = Directory.ReadPath(path);
         #if WINDOWS
-        return winList(path, false, true);
+        List<string> r = winList(p, false, true);
         #else
-        return posixList(path, false, true);
+        List<string> r = posixList(p, false, true);
         #endif
+        return Directory.MergeEmbed(r, path, false);
     }
 
     /// <summary>列出目录中的子目录。</summary>
     static List<string> GetDirectories(string path) {
+        string p = Directory.ReadPath(path);
         #if WINDOWS
-        return winList(path, true, true);
+        List<string> r = winList(p, true, true);
         #else
-        return posixList(path, true, true);
+        List<string> r = posixList(p, true, true);
         #endif
+        return Directory.MergeEmbed(r, path, true);
     }
 
     static List<string> GetFilesFiltered(
         string path,
         bool includeHidden
     ) {
+        string p = Directory.ReadPath(path);
         #if WINDOWS
-        return winList(path, false, includeHidden);
+        List<string> r = winList(p, false, includeHidden);
         #else
-        return posixList(path, false, includeHidden);
+        List<string> r = posixList(p, false, includeHidden);
         #endif
+        return Directory.MergeEmbed(r, path, false);
     }
 
     static List<string> GetDirectoriesFiltered(
         string path,
         bool includeHidden
     ) {
+        string p = Directory.ReadPath(path);
         #if WINDOWS
-        return winList(path, true, includeHidden);
+        List<string> r = winList(p, true, includeHidden);
         #else
-        return posixList(path, true, includeHidden);
+        List<string> r = posixList(p, true, includeHidden);
         #endif
+        return Directory.MergeEmbed(r, path, true);
     }
 
     /// <summary>递归创建路径中的所有目录。</summary>

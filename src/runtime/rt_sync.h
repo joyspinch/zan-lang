@@ -130,6 +130,10 @@ long long zan_dir_list_into(const char *pattern, char *out, long long cap);
 long long zan_file_time(const char *path, int which);
 long long zan_file_length(const char *path);
 long long zan_file_attributes(const char *path);
+/* bundled read-only resources: the executable's own directory, and the
+ * copy of a relative read path that a published/packaged program ships */
+const char *zan_file_app_dir(void);
+const char *zan_file_read_path(const char *path);
 long long zan_file_set_readonly(const char *path, int on);
 long long zan_file_set_time(const char *path, int which, long long unix_sec);
 long long zan_file_open(const char *path, const char *mode);
