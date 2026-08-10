@@ -148,6 +148,7 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref);
 zan_type_t *zan_binder_make_list_type(zan_binder_t *b, zan_type_t *elem);
 zan_type_t *zan_binder_make_span_type(zan_binder_t *b, zan_type_t *elem);
 zan_type_t *zan_binder_make_array_type(zan_binder_t *b, zan_type_t *elem);
+zan_type_t *zan_binder_make_nullable_type(zan_binder_t *b, zan_type_t *elem);
 /* Construct a Grouping<elem> instantiation (query `group e by k` lowering). */
 zan_type_t *zan_binder_make_grouping_type(zan_binder_t *b, zan_type_t *elem);
 

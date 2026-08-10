@@ -28,6 +28,16 @@ struct zan_token {
     };
 };
 
+#define ZAN_MAX_INTERP_DEPTH 16
+
+/* Bracket nesting inside one interpolation hole, so that a `}` is told apart
+ * from the one that closes the hole and a `:` from a conditional's colon. */
+typedef struct {
+    int brace;
+    int paren;
+    int bracket;
+} zan_interp_level_t;
+
 struct zan_lexer {
     const char *source;
     size_t source_len;
@@ -37,10 +47,12 @@ struct zan_lexer {
     uint32_t file_id;
     zan_arena_t *arena;
     zan_diag_t *diag;
-    int interp_depth;       /* > 0 when inside $"...{expr}..." */
-    int interp_brace_depth; /* tracks nested {} inside interpolation expr */
-    int interp_paren_depth; /* tracks nested () inside interpolation expr */
-    int interp_bracket_depth; /* tracks nested [] inside interpolation expr */
+    /* Interpolation holes currently open, innermost last. A hole can hold
+     * another $"..." with holes of its own, so the bracket counters are per
+     * hole: with one shared set the inner string's closing quote ended
+     * interpolation for the outer one too. */
+    int interp_depth;
+    zan_interp_level_t interp_stack[ZAN_MAX_INTERP_DEPTH];
 
     /* ---- Preprocessor state ---- */
     zan_pp_define_t defines[ZAN_PP_MAX_DEFINES];

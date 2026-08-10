@@ -166,8 +166,28 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
                     (m->field_decl.getter_body || m->field_decl.setter_body))
                     continue;
                 zan_symbol_t *fs = get_field_sym(csym, m->field_decl.name);
-                LLVMValueRef gv = get_static_field_global(g, csym, fs);
-                if (!gv) continue;
+                /* A generic class's static is per closed instantiation, so its
+                 * initializer runs once for each instantiation the program
+                 * uses -- one store into one shared global would leave every
+                 * other instantiation at zero. */
+                zan_type_t *insts[64];
+                int ninst = 0;
+                if (d->type_decl.type_params.count > 0) {
+                    for (int gi = 0; gi < g->generic_inst_count && ninst < 64; gi++) {
+                        if (g->generic_insts[gi].type_sym != csym) continue;
+                        bool seen = false;
+                        for (int k = 0; k < ninst && !seen; k++)
+                            seen = types_equal(insts[k], g->generic_insts[gi].inst);
+                        if (!seen) insts[ninst++] = g->generic_insts[gi].inst;
+                    }
+                } else {
+                    insts[ninst++] = NULL;
+                }
+                for (int ii = 0; ii < ninst; ii++) {
+                zan_type_t *saved_field_inst = g->cur_inst;
+                g->cur_inst = insts[ii];
+                LLVMValueRef gv = get_static_field_global(g, csym, fs, insts[ii]);
+                if (gv) {
                 zan_type_t *source_type = infer_expr_type(
                     g, m->field_decl.initializer, sf_locals);
                 check_implicit_narrowing(g, fs->type, source_type,
@@ -186,6 +206,9 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
                     LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
                                               : LLVMInt64TypeInContext(g->ctx);
                     LLVMBuildStore(g->builder, coerce_int_to(g, v, ft), gv);
+                }
+                }
+                g->cur_inst = saved_field_inst;
                 }
             }
         }
@@ -1089,9 +1112,14 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 param_offset = 1;
             }
 
+            /* A specialized variant is monomorphic: its signature must use the
+             * instantiation's concrete types. Leaving a value-type argument
+             * erased to a pointer made the caller pass a struct by value to a
+             * ptr parameter (Box<GVec>.Put), which LLVM rejects. */
             for (int k = 0; k < param_count; k++) {
                 zan_ast_node_t *param = member->method_decl.params.items[k];
                 zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
+                if (cur_variant) pt = subst_type_param_deep(g, pt, cur_variant);
                 param_types[k + param_offset] = param->param.by_ref
                     ? LLVMPointerType(map_type(g, pt), 0)
                     : map_type(g, pt);
@@ -1101,6 +1129,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 : (member->method_decl.return_type
                     ? zan_binder_resolve_type(g->binder, member->method_decl.return_type)
                     : g->binder->type_void);
+            if (cur_variant) ret_type = subst_type_param_deep(g, ret_type, cur_variant);
             LLVMTypeRef llvm_ret = map_type(g, ret_type);
             /* async methods lower to a heap frame + ramp + resume (see
              * docs/ASYNC_CPS_DESIGN.md); ctors are never async. */
@@ -1267,6 +1296,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         for (int k = 0; k < param_count; k++) {
             zan_ast_node_t *param = member->method_decl.params.items[k];
             zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
+            if (g->cur_inst) pt = subst_type_param_deep(g, pt, g->cur_inst);
             if (param->param.by_ref) {
                 /* `ref`/`out`: the incoming pointer IS the storage slot, so
                  * reads/writes go straight through to the caller's variable. */
@@ -2031,6 +2061,11 @@ static void emit_windows_dll_main(zan_irgen_t *g) {
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return ZAN_ERROR;
     g_di_emit_ctx = g; /* so local_add can forward variables to di_declare_var */
+
+    /* Instantiations first: a generic class's field slots are sized from the
+     * concrete types bound to its type parameters, so they must be known
+     * before the layout below is fixed. */
+    discover_generic_insts(g, unit);
 
     /* Pass 1: register all struct/class types */
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {

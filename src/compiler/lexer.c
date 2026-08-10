@@ -837,6 +837,15 @@ static zan_token_t lexer_char(zan_lexer_t *lex) {
     return tok;
 }
 
+/* The bracket counters of the innermost open interpolation hole, or NULL when
+ * the lexer is not inside one. */
+static zan_interp_level_t *lexer_interp_top(zan_lexer_t *lex) {
+    if (lex->interp_depth <= 0) return NULL;
+    int i = lex->interp_depth - 1;
+    if (i >= ZAN_MAX_INTERP_DEPTH) i = ZAN_MAX_INTERP_DEPTH - 1;
+    return &lex->interp_stack[i];
+}
+
 /* ---- interpolated string $"..." ---- */
 
 static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_t start_kind) {
@@ -865,16 +874,22 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
     zan_token_kind_t kind;
     if (lexer_peek_ch(lex) == '{') {
         lexer_advance(lex); /* { */
+        if (lex->interp_depth >= ZAN_MAX_INTERP_DEPTH) {
+            zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                          "interpolated strings nested more than %d deep",
+                          ZAN_MAX_INTERP_DEPTH);
+        } else {
+            lex->interp_stack[lex->interp_depth].brace = 0;
+            lex->interp_stack[lex->interp_depth].paren = 0;
+            lex->interp_stack[lex->interp_depth].bracket = 0;
+        }
         lex->interp_depth++;
-        lex->interp_brace_depth = 0;
-        lex->interp_paren_depth = 0;
-        lex->interp_bracket_depth = 0;
         kind = start_kind; /* INTERP_START or INTERP_MID */
     } else {
-        /* closing " or EOF */
+        /* Closing " or EOF. The hole this segment followed was already popped
+         * by its `}`, so the depth is that of the enclosing hole, if any. */
         if (!lexer_at_end(lex)) lexer_advance(lex); /* " */
         kind = (start_kind == TK_INTERP_START) ? TK_STRING_LIT : TK_INTERP_END;
-        lex->interp_depth = 0;
     }
 
     zan_token_t tok = lexer_make(lex, kind, loc);
@@ -1009,28 +1024,30 @@ pp_retry:
 
     switch (ch) {
     case '(':
-        if (lex->interp_depth > 0) lex->interp_paren_depth++;
+        if (lexer_interp_top(lex)) lexer_interp_top(lex)->paren++;
         return lexer_make(lex, TK_LPAREN, loc);
     case ')':
-        if (lex->interp_depth > 0 && lex->interp_paren_depth > 0)
-            lex->interp_paren_depth--;
+        if (lexer_interp_top(lex) && lexer_interp_top(lex)->paren > 0)
+            lexer_interp_top(lex)->paren--;
         return lexer_make(lex, TK_RPAREN, loc);
     case '{':
-        if (lex->interp_depth > 0) lex->interp_brace_depth++;
+        if (lexer_interp_top(lex)) lexer_interp_top(lex)->brace++;
         return lexer_make(lex, TK_LBRACE, loc);
     case '}':
-        if (lex->interp_depth > 0 && lex->interp_brace_depth == 0) {
-            /* end of interpolation expression — scan next text segment */
+        if (lexer_interp_top(lex) && lexer_interp_top(lex)->brace == 0) {
+            /* end of interpolation expression — pop the hole and scan the
+             * text segment that follows it */
+            lex->interp_depth--;
             return lexer_interp_string_segment(lex, TK_INTERP_MID);
         }
-        if (lex->interp_depth > 0) lex->interp_brace_depth--;
+        if (lexer_interp_top(lex)) lexer_interp_top(lex)->brace--;
         return lexer_make(lex, TK_RBRACE, loc);
     case '[':
-        if (lex->interp_depth > 0) lex->interp_bracket_depth++;
+        if (lexer_interp_top(lex)) lexer_interp_top(lex)->bracket++;
         return lexer_make(lex, TK_LBRACKET, loc);
     case ']':
-        if (lex->interp_depth > 0 && lex->interp_bracket_depth > 0)
-            lex->interp_bracket_depth--;
+        if (lexer_interp_top(lex) && lexer_interp_top(lex)->bracket > 0)
+            lexer_interp_top(lex)->bracket--;
         return lexer_make(lex, TK_RBRACKET, loc);
     case ';': return lexer_make(lex, TK_SEMICOLON, loc);
     case ':':
@@ -1039,9 +1056,10 @@ pp_retry:
          * or slice colon sits at paren/bracket depth > 0 and stays a plain
          * colon. The format text runs to the closing `}` (C#: everything after
          * `:` is the format), so it is captured verbatim, not tokenized. */
-        if (lex->interp_depth > 0 && lex->interp_brace_depth == 0 &&
-            lex->interp_paren_depth == 0 && lex->interp_bracket_depth == 0) {
-            return lexer_interp_format(lex, loc);
+        {
+            zan_interp_level_t *lv = lexer_interp_top(lex);
+            if (lv && lv->brace == 0 && lv->paren == 0 && lv->bracket == 0)
+                return lexer_interp_format(lex, loc);
         }
         return lexer_make(lex, TK_COLON, loc);
     case ',': return lexer_make(lex, TK_COMMA, loc);
@@ -1130,9 +1148,10 @@ zan_token_t zan_lexer_peek(zan_lexer_t *lex) {
     uint32_t line = lex->line;
     uint32_t col = lex->col;
     int idepth = lex->interp_depth;
-    int ibrace = lex->interp_brace_depth;
-    int iparen = lex->interp_paren_depth;
-    int ibrack = lex->interp_bracket_depth;
+    int nsave = idepth < ZAN_MAX_INTERP_DEPTH ? idepth : ZAN_MAX_INTERP_DEPTH;
+    zan_interp_level_t istack[ZAN_MAX_INTERP_DEPTH];
+    if (nsave > 0)
+        memcpy(istack, lex->interp_stack, sizeof(istack[0]) * (size_t)nsave);
 
     zan_token_t tok = zan_lexer_next(lex);
 
@@ -1141,9 +1160,8 @@ zan_token_t zan_lexer_peek(zan_lexer_t *lex) {
     lex->line = line;
     lex->col = col;
     lex->interp_depth = idepth;
-    lex->interp_brace_depth = ibrace;
-    lex->interp_paren_depth = iparen;
-    lex->interp_bracket_depth = ibrack;
+    if (nsave > 0)
+        memcpy(lex->interp_stack, istack, sizeof(istack[0]) * (size_t)nsave);
 
     return tok;
 }

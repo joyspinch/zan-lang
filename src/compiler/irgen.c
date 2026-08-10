@@ -1849,6 +1849,13 @@ static zan_type_t *resolve_type_ctx(zan_irgen_t *g, zan_ast_node_t *tref) {
     return t;
 }
 
+/* The type a field of the enclosing type has in the body being emitted: in
+ * Box<Vec>'s specialization a `T` field holds a Vec. */
+static zan_type_t *field_type_here(zan_irgen_t *g, zan_type_t *t) {
+    if (t && g->cur_inst) t = subst_type_param_deep(g, t, g->cur_inst);
+    return t;
+}
+
 /* ---- nullable value types (`int?`, `Point?`) -------------------------------
  *
  * A nullable value type lowers to `{ payload, i1 }`: the value itself plus a
@@ -2294,6 +2301,31 @@ static bool field_offset_attr(zan_symbol_t *field, unsigned long *out) {
     return false;
 }
 
+/* A `T`-typed field is one erased slot shared by every instantiation, so the
+ * slot must be wide enough for the widest concrete type bound to T: a
+ * Box<Vec> stores the struct itself into the slot, and a pointer-sized slot
+ * would have written over the next field. */
+static zan_type_t *subst_type_param_deep(zan_irgen_t *g, zan_type_t *t,
+                                         zan_type_t *recv);
+static unsigned long abi_size_of(LLVMTypeRef t);
+
+static LLVMTypeRef generic_field_slot(zan_irgen_t *g, zan_symbol_t *sym,
+                                      zan_type_t *ftype, LLVMTypeRef base) {
+    if (!ftype || ftype->kind != TYPE_TYPE_PARAM) return base;
+    unsigned long have = abi_size_of(base), need = have;
+    for (int i = 0; i < g->generic_inst_count; i++) {
+        if (g->generic_insts[i].type_sym != sym) continue;
+        zan_type_t *ct = subst_type_param_deep(g, ftype,
+                                               g->generic_insts[i].inst);
+        if (!ct || ct == ftype) continue;
+        unsigned long sz = abi_size_of(map_type(g, ct));
+        if (sz > need) need = sz;
+    }
+    if (need <= have) return base;
+    return LLVMArrayType(LLVMInt64TypeInContext(g->ctx),
+                         (unsigned)((need + 7) / 8));
+}
+
 static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     if (get_struct_llvm_type(g, sym)) return;
     g->struct_types = irgen_grow(g->struct_types, &g->struct_type_cap,
@@ -2333,7 +2365,8 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
         if ((sym->members[i]->kind == SYM_FIELD ||
              sym->members[i]->kind == SYM_PROPERTY) &&
             !field_member_is_static(sym->members[i])) {
-            field_types[fi++] = map_type(g, sym->members[i]->type);
+            field_types[fi++] = generic_field_slot(g, sym,
+                sym->members[i]->type, map_type(g, sym->members[i]->type));
         }
     }
 
@@ -2593,6 +2626,14 @@ static local_var_t *local_find(local_scope_t *scope, zan_istr_t name) {
         }
     }
     return NULL;
+}
+
+/* Name-based recognition of the intrinsic collections. An array type carries
+ * its element's name (List<string>[] is named "List"), so the kind test is
+ * what keeps `new List<string>[3]` from being lowered as a bare list. */
+static int type_named(zan_type_t *t, const char *n, int len) {
+    return t && t->kind != TYPE_ARRAY && t->name.str &&
+           (int)t->name.len == len && memcmp(t->name.str, n, (size_t)len) == 0;
 }
 
 /* The built-in generic collections (List/Dict) and StringBuilder share

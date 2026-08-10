@@ -499,15 +499,18 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMValueRef alloca = emit_entry_alloca(g, ptr_type, "arr");
                 zan_store_fit(g, arr_val, alloca);
 
-                zan_type_t *elem_type = resolve_type_ctx(g, init->new_expr.type);
-                if (!elem_type) elem_type = g->binder->type_int;
-                zan_type_t *arr_type = (zan_type_t *)zan_arena_alloc(g->arena, sizeof(zan_type_t));
-                arr_type->kind = TYPE_ARRAY;
-                arr_type->element_type = elem_type;
-                arr_type->name = (zan_istr_t){NULL, 0};
-                arr_type->sym = NULL;
-                arr_type->type_args = NULL;
-                arr_type->type_arg_count = 0;
+                /* the allocation node is written `T[]`, so it already resolves
+                 * to the array type: wrapping it again made `var a = new T[n]`
+                 * a T[][] and lost T's own type arguments. */
+                zan_type_t *arr_type = resolve_type_ctx(g, init->new_expr.type);
+                if (!arr_type || arr_type->kind != TYPE_ARRAY) {
+                    zan_type_t *elem_type = arr_type ? arr_type : g->binder->type_int;
+                    arr_type = (zan_type_t *)zan_arena_alloc(g->arena, sizeof(zan_type_t));
+                    memset(arr_type, 0, sizeof(zan_type_t));
+                    arr_type->kind = TYPE_ARRAY;
+                    arr_type->element_type = elem_type;
+                    arr_type->array_rank = 1;
+                }
                 local_add(locals, stmt->var_decl.name, alloca, arr_type);
                 return;
             }
@@ -818,10 +821,13 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * if it were a buffer. Reject it rather than corrupting memory. */
         if (type && type->kind == TYPE_ARRAY && stmt->var_decl.initializer) {
             zan_type_t *it = infer_expr_type(g, stmt->var_decl.initializer, locals);
-            if (it && it->name.str &&
-                ((it->name.len == 4 && memcmp(it->name.str, "List", 4) == 0) ||
-                 (it->name.len == 10 && memcmp(it->name.str, "Dictionary", 10) == 0) ||
-                 (it->name.len == 4 && memcmp(it->name.str, "Dict", 4) == 0)))
+            /* An array type carries its element's name ("List" for
+             * List<string>[]), so the name test alone rejected the legal
+             * `List<string>[] rows = new List<string>[3]`. */
+            if (it && it->kind != TYPE_ARRAY && it->name.str &&
+                ((type_named(it, "List", 4)) ||
+                 (type_named(it, "Dictionary", 10)) ||
+                 (type_named(it, "Dict", 4))))
                 zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
                     "cannot initialize an array from '%.*s': declare the "
                     "variable as '%.*s' instead",
@@ -841,8 +847,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         /* A local initialized with a freshly-built dict owns the dict's
          * rc-managed keys/values and releases them at scope exit. */
         if (type &&
-            ((type->name.len == 4 && memcmp(type->name.str, "Dict", 4) == 0) ||
-             (type->name.len == 10 && memcmp(type->name.str, "Dictionary", 10) == 0)) &&
+            ((type_named(type, "Dict", 4)) ||
+             (type_named(type, "Dictionary", 10))) &&
             stmt->var_decl.initializer &&
             stmt->var_decl.initializer->kind == AST_NEW_EXPR)
             arc_own_local(g, locals);

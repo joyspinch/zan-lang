@@ -617,6 +617,31 @@ add_test(NAME diag_ctor_missing_parameterless
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_ctor_missing_parameterless PROPERTIES TIMEOUT 60)
 
+# A cast is the one expression whose operand and target the checker used to
+# skip entirely, so an impossible conversion reinterpreted the operand's bits
+# instead of failing: `(int)"abc"` handed back the string pointer.
+add_test(NAME diag_cast_no_conversion
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/cast_no_conversion.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_cast_no_conversion${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert .string. to .int."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_cast_no_conversion PROPERTIES TIMEOUT 60)
+
+# The builtin collections lower every member they have by name, so one they
+# do not have used to reach the string fallback and answer the strlen of the
+# List's own storage -- a plausible-looking number from a member that does
+# not exist.
+add_test(NAME diag_collection_unknown_member
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/collection_unknown_member.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_collection_unknown_member${_exe_ext}
+    "-DEXPECT_REGEX=.List. has no member .Length."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_collection_unknown_member PROPERTIES TIMEOUT 60)
+
 # A `"role": "control"` .zform is an embeddable Control, not a window: it has
 # no Main/Show, so naming one as the project entry has to fail at formgen time
 # instead of linking a program with no entry point.

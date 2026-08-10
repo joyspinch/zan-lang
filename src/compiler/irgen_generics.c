@@ -402,7 +402,7 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
         ((e->member.name.len == 4 && memcmp(e->member.name.str, "Keys", 4) == 0) ||
          (e->member.name.len == 6 && memcmp(e->member.name.str, "Values", 6) == 0))) {
         zan_type_t *ot = infer_expr_type(g, e->member.object, locals);
-        if (ot && ot->name.len == 4 && memcmp(ot->name.str, "Dict", 4) == 0)
+        if (ot && type_named(ot, "Dict", 4))
             return 1;
     }
     if (e->kind == AST_BINARY) {

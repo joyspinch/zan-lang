@@ -575,10 +575,10 @@ static LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMPointerType(st, 0), g->current_this, "this");
                     LLVMValueRef fptr = emit_field_ptr(g, g->current_type_sym, st, this_ptr, fi, "fld");
                     zan_symbol_t *fsym = get_field_sym(g->current_type_sym, expr->ident.name);
-                    LLVMTypeRef ft = fsym ? map_type(g, fsym->type) : LLVMInt64TypeInContext(g->ctx);
+                    zan_type_t *fty = fsym ? field_type_here(g, fsym->type) : NULL;
+                    LLVMTypeRef ft = fty ? map_type(g, fty) : LLVMInt64TypeInContext(g->ctx);
                     return promote_loaded(g,
-                        LLVMBuildLoad2(g->builder, ft, fptr, "fval"),
-                        fsym ? fsym->type : NULL);
+                        LLVMBuildLoad2(g->builder, ft, fptr, "fval"), fty);
                 }
             }
         }
@@ -586,7 +586,7 @@ static LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
          * Works in both static and instance methods. */
         if (g->current_type_sym) {
             zan_symbol_t *fsym = get_field_sym(g->current_type_sym, expr->ident.name);
-            LLVMValueRef gv = get_static_field_global(g, g->current_type_sym, fsym);
+            LLVMValueRef gv = get_static_field_global(g, g->current_type_sym, fsym, NULL);
             if (gv) {
                 LLVMTypeRef ft = fsym->type ? map_type(g, fsym->type)
                                             : LLVMInt64TypeInContext(g->ctx);
@@ -1131,6 +1131,45 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
         return emit_binary_op_values(g, expr, left, right, locals);
 }
 
+/* True when `e` can carry a string at run time: a string, an untyped
+ * `object`, or an expression whose type could not be inferred. Used to gate
+ * the string-only member fallbacks, which would otherwise answer for any
+ * rc-managed receiver (every one of them is a pointer). */
+static bool recv_is_stringlike(zan_irgen_t *g, zan_ast_node_t *e,
+                               local_scope_t *locals) {
+    zan_type_t *t = infer_expr_type(g, e, locals);
+    if (!t) return true;
+    return t->kind == TYPE_STRING || t->kind == TYPE_OBJECT ||
+           t->kind == TYPE_ERROR || t->kind == TYPE_TYPE_PARAM;
+}
+
+/* A shift counts modulo the width of its left operand: `1 << 33` is `1 << 1`
+ * on an int and `1 << 33` on a long. Zan promotes both operands to i64 before
+ * arithmetic, so the hardware masked every count mod 64 and a 32-bit shift by
+ * 33 silently produced a value the truncation back to int turned into 0.
+ * Mask the count against the *declared* width of the left operand instead. */
+static LLVMValueRef mask_shift_count(zan_irgen_t *g, zan_ast_node_t *lhs,
+                                     LLVMValueRef count, local_scope_t *locals) {
+    if (LLVMGetTypeKind(LLVMTypeOf(count)) != LLVMIntegerTypeKind)
+        return count;
+    unsigned bits = 64;
+    zan_type_t *lt = infer_expr_type(g, lhs, locals);
+    if (lt) {
+        switch (lt->kind) {
+        case TYPE_BYTE: case TYPE_SBYTE:
+        case TYPE_SHORT: case TYPE_USHORT:
+        case TYPE_CHAR:
+        case TYPE_INT: case TYPE_UINT:
+            bits = 32; /* C# promotes anything narrower than int to int */
+            break;
+        default:
+            break;
+        }
+    }
+    return zan_and(g->builder, count,
+                   LLVMConstInt(LLVMTypeOf(count), bits - 1, 0), "sh.mask");
+}
+
 static LLVMValueRef emit_binary_op_values(zan_irgen_t *g, zan_ast_node_t *expr,
                                           LLVMValueRef left, LLVMValueRef right,
                                           local_scope_t *locals) {
@@ -1188,8 +1227,10 @@ static LLVMValueRef emit_binary_op_values(zan_irgen_t *g, zan_ast_node_t *expr,
         case TK_CARET:
             return zan_xor(g->builder, left, right, "xor");
         case TK_LESS_LESS:
+            right = mask_shift_count(g, expr->binary.left, right, locals);
             return zan_shl(g->builder, left, right, "shl");
         case TK_GREATER_GREATER:
+            right = mask_shift_count(g, expr->binary.left, right, locals);
             return is_unsigned ? zan_lshr(g->builder, left, right, "shr")
                                : zan_ashr(g->builder, left, right, "shr");
         case TK_EQ_EQ:
@@ -1659,6 +1700,41 @@ static LLVMValueRef emit_binding_value(zan_irgen_t *g, zan_type_t *bind_t,
     return LLVMBuildBitCast(g->builder, objp, i8ptr, "bindv");
 }
 
+/* The slot holding the colour Console.ForegroundColor/BackgroundColor was last
+ * set to. A terminal cannot be asked for its current SGR state, so the getter
+ * reads back what the setter wrote; the initial value is the C# default
+ * (Gray on Black), which is also what ResetColor() restores. */
+#define ZAN_CONSOLE_FG_DEFAULT 7 /* ConsoleColor.Gray */
+#define ZAN_CONSOLE_BG_DEFAULT 0 /* ConsoleColor.Black */
+
+static LLVMValueRef console_color_slot(zan_irgen_t *g, int is_bg) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    const char *nm = is_bg ? "__zan_console_bg" : "__zan_console_fg";
+    LLVMValueRef slot = LLVMGetNamedGlobal(g->mod, nm);
+    if (!slot) {
+        slot = LLVMAddGlobal(g->mod, i64, nm);
+        LLVMSetInitializer(slot, LLVMConstInt(i64,
+            is_bg ? ZAN_CONSOLE_BG_DEFAULT : ZAN_CONSOLE_FG_DEFAULT, 0));
+        LLVMSetLinkage(slot, LLVMPrivateLinkage);
+    }
+    return slot;
+}
+
+/* Read Console.ForegroundColor / Console.BackgroundColor. */
+static LLVMValueRef emit_console_color_get(zan_irgen_t *g, int is_bg) {
+    return LLVMBuildLoad2(g->builder, LLVMInt64TypeInContext(g->ctx),
+                          console_color_slot(g, is_bg), "concolor");
+}
+
+/* Restore both channels to their defaults, for Console.ResetColor(). */
+static void emit_console_color_reset(zan_irgen_t *g) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMBuildStore(g->builder,
+        LLVMConstInt(i64, ZAN_CONSOLE_FG_DEFAULT, 0), console_color_slot(g, 0));
+    LLVMBuildStore(g->builder,
+        LLVMConstInt(i64, ZAN_CONSOLE_BG_DEFAULT, 0), console_color_slot(g, 1));
+}
+
 /* Emit `\e[<code>m` for a Console.ForegroundColor/BackgroundColor assignment,
  * mapping a C# ConsoleColor (0..15) to its ANSI SGR code via a private lookup
  * table indexed by the (runtime) colour value. */
@@ -1685,6 +1761,7 @@ static void emit_console_color(zan_irgen_t *g, LLVMValueRef color, int is_bg) {
     else if (LLVMGetIntTypeWidth(LLVMTypeOf(color)) < 64)
         color = LLVMBuildSExt(g->builder, color, i64, "csx");
     LLVMValueRef idx = zan_and(g->builder, color, LLVMConstInt(i64, 15, 0), "cidx");
+    LLVMBuildStore(g->builder, idx, console_color_slot(g, is_bg));
     LLVMValueRef gep = LLVMBuildInBoundsGEP2(g->builder, arrTy, tbl,
         (LLVMValueRef[]){ LLVMConstInt(i64, 0, 0), idx }, 2, "ansip");
     LLVMValueRef code = LLVMBuildLoad2(g->builder, i32, gep, "ansicode");
@@ -1994,7 +2071,8 @@ binding_lowered:
                 zan_store_fit(g, sv, local->alloca);
             } else if (g->current_type_sym &&
                        get_static_field_global(g, g->current_type_sym,
-                           get_field_sym(g->current_type_sym, expr->binary.left->ident.name))) {
+                           get_field_sym(g->current_type_sym,
+                               expr->binary.left->ident.name), NULL)) {
                 /* bare-name static field of the enclosing class: `field = v` */
                 zan_symbol_t *fs = get_field_sym(g->current_type_sym,
                     expr->binary.left->ident.name);
@@ -2006,7 +2084,7 @@ binding_lowered:
                         NULL, right, expr->binary.left,
                         expr->binary.right, locals);
                 } else {
-                LLVMValueRef gv = get_static_field_global(g, g->current_type_sym, fs);
+                LLVMValueRef gv = get_static_field_global(g, g->current_type_sym, fs, NULL);
                 if (fs->type && is_rc_managed_type(fs->type)) {
                     emit_rc_store_field(g, fs->type, gv, right, expr->binary.right, locals,
                                         (fs->modifiers & MOD_WEAK) ? 1 : 0);
@@ -2173,8 +2251,7 @@ binding_lowered:
             }
             if (arr_expr->kind == AST_IDENTIFIER) {
                 local_var_t *local = local_find(locals, arr_expr->ident.name);
-                if (local && local->type && local->type->name.len == 4 &&
-                    memcmp(local->type->name.str, "Dict", 4) == 0) {
+                if (local && local->type && type_named(local->type, "Dict", 4)) {
                     /* dict[key] = value — upsert via the shared helper */
                     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -2196,8 +2273,7 @@ binding_lowered:
                     emit_dict_value_set(g, local->type, raw, key, right,
                         expr->binary.left->index.index, expr->binary.right,
                         locals);
-                } else if (local && local->type && local->type->name.len == 4 &&
-                    memcmp(local->type->name.str, "List", 4) == 0) {
+                } else if (local && local->type && type_named(local->type, "List", 4)) {
                     /* list[i] = value — store into the list's i64 data slots */
                     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                     LLVMValueRef raw = LLVMBuildLoad2(g->builder, i8ptr, local->alloca, "lraw");
@@ -2318,8 +2394,7 @@ binding_lowered:
                             emit_index_bounds_check(g, idx, zan_array_len(g, arr_ptr),
                                 expr->loc, "array");
                         }
-                        if (fsym->type && fsym->type->name.len == 4 &&
-                            memcmp(fsym->type->name.str, "List", 4) == 0) {
+                        if (fsym->type && type_named(fsym->type, "List", 4)) {
                             LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
                             LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, arr_ptr,
                                 LLVMPointerType(g->list_struct_type, 0), "lptr");
@@ -2341,8 +2416,7 @@ binding_lowered:
                             LLVMValueRef slot_ptr = LLVMBuildGEP2(g->builder, i64t, data, &idx, 1, "ep");
                             emit_collection_slot_store(g, container_elem_type(fsym->type), i64t, slot_ptr,
                                 right, expr->binary.right, locals, 1);
-                        } else if (fsym->type && fsym->type->name.len == 4 &&
-                                   memcmp(fsym->type->name.str, "Dict", 4) == 0) {
+                        } else if (fsym->type && type_named(fsym->type, "Dict", 4)) {
                             /* implicit this.dict[key] = value — upsert via the
                              * shared helper (same shape as the local path) */
                             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -2434,7 +2508,7 @@ binding_lowered:
                 if (at) {
                     LLVMValueRef arr_ptr = emit_expr(g, arr_expr, locals);
                     LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
-                    if (at->name.len == 4 && memcmp(at->name.str, "List", 4) == 0) {
+                    if (type_named(at, "List", 4)) {
                         /* List field: index into the data buffer, not the
                          * struct — otherwise the store clobbers count/cap/data. */
                         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -2453,7 +2527,7 @@ binding_lowered:
                         LLVMValueRef slot_ptr = LLVMBuildGEP2(g->builder, i64t, data, &idx, 1, "ep");
                         emit_collection_slot_store(g, container_elem_type(at), i64t, slot_ptr,
                             right, expr->binary.right, locals, 1);
-                    } else if (at->name.len == 4 && memcmp(at->name.str, "Dict", 4) == 0) {
+                    } else if (type_named(at, "Dict", 4)) {
                         /* obj.dict[key] = value — upsert via the shared helper */
                         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -2621,7 +2695,8 @@ binding_lowered:
                             right, obj_expr, expr->binary.right, locals);
                         stored = true;
                     } else {
-                    LLVMValueRef gv = get_static_field_global(g, cs, fs);
+                    LLVMValueRef gv = get_static_field_global(g, cs, fs,
+                        static_access_inst(g, obj_expr));
                     if (gv) {
                         if (fs->type && is_rc_managed_type(fs->type)) {
                             emit_rc_store_field(g, fs->type, gv, right,
@@ -2788,7 +2863,8 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 prop_recv_type = g->current_type_sym->type;
                 prop_recv = NULL;
             } else {
-            LLVMValueRef gv = fs ? get_static_field_global(g, g->current_type_sym, fs) : NULL;
+            LLVMValueRef gv = fs ? get_static_field_global(g, g->current_type_sym, fs, NULL)
+                                 : NULL;
             if (gv) {
                 slot_ptr = gv;
                 slot_ty = fs->type ? map_type(g, fs->type) : i64;
@@ -2830,7 +2906,8 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     prop_recv_type = cs->type;
                     prop_recv = NULL;
                 } else {
-                LLVMValueRef gv = get_static_field_global(g, cs, fs);
+                LLVMValueRef gv = get_static_field_global(g, cs, fs,
+                    static_access_inst(g, obj_expr));
                 if (gv) {
                     slot_ptr = gv;
                     slot_ty = fs->type ? map_type(g, fs->type) : i64;
@@ -3230,6 +3307,19 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
 
 static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
+        /* Console.ForegroundColor / Console.BackgroundColor read back the
+         * colour the setter last wrote (the store side is in
+         * emit_expr_assignment); without this they lowered to a zeroed slot. */
+        if (expr->member.object->kind == AST_IDENTIFIER &&
+            expr->member.object->ident.name.len == 7 &&
+            memcmp(expr->member.object->ident.name.str, "Console", 7) == 0 &&
+            !local_find(locals, expr->member.object->ident.name) &&
+            expr->member.name.len == 15) {
+            if (memcmp(expr->member.name.str, "ForegroundColor", 15) == 0)
+                return emit_console_color_get(g, 0);
+            if (memcmp(expr->member.name.str, "BackgroundColor", 15) == 0)
+                return emit_console_color_get(g, 1);
+        }
         /* `v.HasValue` / `v.Value` on a nullable value type. `Value` on a null
          * one is a program error, reported like the other runtime checks
          * instead of handing back the zeroed payload. */
@@ -3430,7 +3520,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
          * (works for local vars and fields). */
         if (expr->member.name.len == 5 && memcmp(expr->member.name.str, "Count", 5) == 0) {
             zan_type_t *lt = infer_expr_type(g, expr->member.object, locals);
-            if (lt && lt->name.len == 4 && memcmp(lt->name.str, "List", 4) == 0) {
+            if (lt && type_named(lt, "List", 4)) {
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMValueRef raw_ptr = emit_expr(g, expr->member.object, locals);
                 LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, raw_ptr,
@@ -3452,7 +3542,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
          * count read. */
         if (expr->member.name.len == 5 && memcmp(expr->member.name.str, "Count", 5) == 0) {
             zan_type_t *dt = infer_expr_type(g, expr->member.object, locals);
-            if (dt && dt->name.len == 4 && memcmp(dt->name.str, "Dict", 4) == 0) {
+            if (dt && type_named(dt, "Dict", 4)) {
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 LLVMValueRef raw = emit_expr(g, expr->member.object, locals);
@@ -3471,7 +3561,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
         if ((expr->member.name.len == 4 && memcmp(expr->member.name.str, "Keys", 4) == 0) ||
             (expr->member.name.len == 6 && memcmp(expr->member.name.str, "Values", 6) == 0)) {
             zan_type_t *dt = infer_expr_type(g, expr->member.object, locals);
-            if (dt && dt->name.len == 4 && memcmp(dt->name.str, "Dict", 4) == 0) {
+            if (dt && type_named(dt, "Dict", 4)) {
                 bool want_keys = (expr->member.name.len == 4);
                 zan_type_t *elem = want_keys ? dict_key_type(g, dt) : dict_value_type(dt);
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -3555,8 +3645,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
         /* StringBuilder.Length: load the count field. */
         if (expr->member.name.len == 6 && memcmp(expr->member.name.str, "Length", 6) == 0) {
             zan_type_t *sbt = infer_expr_type(g, expr->member.object, locals);
-            if (sbt && sbt->name.len == 13 &&
-                memcmp(sbt->name.str, "StringBuilder", 13) == 0) {
+            if (sbt && type_named(sbt, "StringBuilder", 13)) {
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMValueRef raw = emit_expr(g, expr->member.object, locals);
                 LLVMValueRef sbp = LLVMBuildBitCast(g->builder, raw,
@@ -3568,8 +3657,12 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             }
         }
 
-        /* String.Length property — call strlen on string pointer */
-        if (expr->member.name.len == 6 && memcmp(expr->member.name.str, "Length", 6) == 0) {
+        /* String.Length property — call strlen on string pointer. Only for a
+         * receiver that really is a string: every rc-managed value is a
+         * pointer, so an unguarded fallback answered `list.Length` with the
+         * strlen of the List's own storage instead of rejecting the member. */
+        if (expr->member.name.len == 6 && memcmp(expr->member.name.str, "Length", 6) == 0 &&
+            recv_is_stringlike(g, expr->member.object, locals)) {
             LLVMValueRef obj_val = emit_expr(g, expr->member.object, locals);
             if (LLVMGetTypeKind(LLVMTypeOf(obj_val)) == LLVMPointerTypeKind) {
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -3649,7 +3742,8 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                     return emit_property_getter_call(g, getter, cs->type, NULL,
                         expr->member.object, locals);
                 }
-                LLVMValueRef gv = get_static_field_global(g, cs, fs);
+                LLVMValueRef gv = get_static_field_global(g, cs, fs,
+                    static_access_inst(g, expr->member.object));
                 if (gv) {
                     LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
                                               : LLVMInt64TypeInContext(g->ctx);
@@ -3701,14 +3795,17 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                             LLVMValueRef struct_ptr = struct_base_ptr(g, local, st);
                             LLVMValueRef field_ptr = emit_field_ptr(g, type_sym, st, struct_ptr, fi, "fld");
                             zan_symbol_t *fsym = get_field_sym(type_sym, expr->member.name);
-                            LLVMTypeRef field_type = fsym ? map_type(g, fsym->type) : LLVMInt64TypeInContext(g->ctx);
+                            /* A `T` field of Box<Vec> holds a Vec, not a
+                             * pointer to one: read the slot at the concrete
+                             * type so a value type comes back by value. */
+                            zan_type_t *fty = fsym
+                                ? subst_type_param(fsym->type, local->type)
+                                : NULL;
+                            LLVMTypeRef field_type = fty ? map_type(g, fty)
+                                : LLVMInt64TypeInContext(g->ctx);
                             LLVMValueRef fv = promote_loaded(g,
                                 LLVMBuildLoad2(g->builder, field_type, field_ptr, "fval"),
-                                fsym ? fsym->type : NULL);
-                            if (fsym) {
-                                zan_type_t *ct = subst_type_param(fsym->type, local->type);
-                                if (ct != fsym->type) fv = emit_boundary_coerce(g, fv, map_type(g, ct));
-                            }
+                                fty);
                             return fv;
                         }
                     }
@@ -3753,16 +3850,14 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                     if (st && LLVMGetTypeKind(LLVMTypeOf(obj_val)) == LLVMPointerTypeKind) {
                         LLVMValueRef field_ptr = emit_field_ptr(g, cls, st, obj_val, fi, "gfld");
                         zan_symbol_t *fsym = get_field_sym(cls, expr->member.name);
-                        LLVMTypeRef ft = fsym ? map_type(g, fsym->type)
-                                              : LLVMInt64TypeInContext(g->ctx);
+                        zan_type_t *rct = infer_expr_type(g, expr->member.object, locals);
+                        zan_type_t *fty = fsym
+                            ? subst_type_param(fsym->type, rct) : NULL;
+                        LLVMTypeRef ft = fty ? map_type(g, fty)
+                                             : LLVMInt64TypeInContext(g->ctx);
                         LLVMValueRef gfv = promote_loaded(g,
                             LLVMBuildLoad2(g->builder, ft, field_ptr, "gfval"),
-                            fsym ? fsym->type : NULL);
-                        zan_type_t *rct = infer_expr_type(g, expr->member.object, locals);
-                        if (fsym) {
-                            zan_type_t *ct = subst_type_param(fsym->type, rct);
-                            if (ct != fsym->type) gfv = emit_boundary_coerce(g, gfv, map_type(g, ct));
-                        }
+                            fty);
                         return finish_member_of_temp(g, expr, locals, rct,
                                                      obj_val, gfv);
                     }
@@ -3811,6 +3906,16 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                     "'%.*s' has no member '%.*s'",
                     (int)rcls->name.len, rcls->name.str,
                     (int)expr->member.name.len, expr->member.name.str);
+            } else if (!rcls) {
+                /* Same for a builtin collection: its members are all handled
+                 * above, so anything reaching here is a member it does not
+                 * have (`list.Length`) and used to read as the 0 below. */
+                zan_type_t *rt = infer_expr_type(g, expr->member.object, locals);
+                if (rt && is_builtin_collection_type(rt))
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "'%.*s' has no member '%.*s'",
+                        (int)rt->name.len, rt->name.str,
+                        (int)expr->member.name.len, expr->member.name.str);
             }
         }
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
@@ -3934,7 +4039,7 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
                     local->alloca, "arrload");
                 arr_type = local->type;
                 /* detect List type by checking if type name is "List" */
-                if (arr_type && arr_type->name.len == 4 && memcmp(arr_type->name.str, "List", 4) == 0) {
+                if (arr_type && type_named(arr_type, "List", 4)) {
                     is_list = 1;
                 }
             } else if (g->current_type_sym) {
@@ -3943,7 +4048,7 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
                 if (fsym) {
                     arr_type = fsym->type;
                     arr_ptr = emit_expr(g, expr->index.object, locals);
-                    if (arr_type && arr_type->name.len == 4 && memcmp(arr_type->name.str, "List", 4) == 0) {
+                    if (arr_type && type_named(arr_type, "List", 4)) {
                         is_list = 1;
                     }
                 }
@@ -3955,7 +4060,7 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
             arr_type = member_access_field_type(g, locals, expr->index.object);
             if (arr_type) {
                 arr_ptr = emit_expr(g, expr->index.object, locals);
-                if (arr_type->name.len == 4 && memcmp(arr_type->name.str, "List", 4) == 0) {
+                if (type_named(arr_type, "List", 4)) {
                     is_list = 1;
                 }
             }
@@ -3969,7 +4074,7 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
             arr_type = infer_expr_type(g, expr->index.object, locals);
             if (arr_type) {
                 arr_ptr = emit_expr(g, expr->index.object, locals);
-                if (arr_type->name.len == 4 && memcmp(arr_type->name.str, "List", 4) == 0) {
+                if (type_named(arr_type, "List", 4)) {
                     is_list = 1;
                 }
             }
@@ -4015,7 +4120,7 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
         }
         /* Dict indexer: dict[key] -> hash probe for the entry, then its value
          * (0 when the key is absent, as the linear scan this replaces did). */
-        if (arr_ptr && arr_type && arr_type->name.len == 4 && memcmp(arr_type->name.str, "Dict", 4) == 0) {
+        if (arr_ptr && arr_type && type_named(arr_type, "Dict", 4)) {
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMValueRef dp = LLVMBuildBitCast(g->builder, arr_ptr,
                 LLVMPointerType(g->dict_struct_type, 0), "dp");
@@ -5164,8 +5269,11 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 return v;
             }
         }
-        /* new List<T>() — built-in dynamic list */
-        if (expr->new_expr.type && expr->new_expr.type->kind == AST_TYPE_REF) {
+        /* new List<T>() — built-in dynamic list. `new List<string>[3]` is an
+         * array of lists, not a list: the type node carries the collection's
+         * name at every array level, so the array paths below own it. */
+        if (expr->new_expr.type && expr->new_expr.type->kind == AST_TYPE_REF &&
+            !expr->new_expr.is_array) {
             zan_istr_t tname = expr->new_expr.type->type_ref.name;
             if (tname.len == 4 && memcmp(tname.str, "List", 4) == 0) {
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -5216,7 +5324,8 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* new StringBuilder() — built-in growable byte buffer */
-        if (expr->new_expr.type && expr->new_expr.type->kind == AST_TYPE_REF) {
+        if (expr->new_expr.type && expr->new_expr.type->kind == AST_TYPE_REF &&
+            !expr->new_expr.is_array) {
             zan_istr_t sbname = expr->new_expr.type->type_ref.name;
             if (sbname.len == 13 && memcmp(sbname.str, "StringBuilder", 13) == 0) {
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -5238,7 +5347,8 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* new Dict<K,V>() — built-in hash map */
-        if (expr->new_expr.type && expr->new_expr.type->kind == AST_TYPE_REF) {
+        if (expr->new_expr.type && expr->new_expr.type->kind == AST_TYPE_REF &&
+            !expr->new_expr.is_array) {
             zan_istr_t tname2 = expr->new_expr.type->type_ref.name;
             if ((tname2.len == 4 && memcmp(tname2.str, "Dict", 4) == 0) ||
                 (tname2.len == 10 && memcmp(tname2.str, "Dictionary", 10) == 0)) {

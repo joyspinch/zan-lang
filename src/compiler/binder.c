@@ -363,6 +363,17 @@ static bool type_is_value_kind(zan_type_t *t) {
     }
 }
 
+/* `T?` for a type no type reference spells, such as the result of `a?.v`.
+ * Over a reference type it is just T, exactly as in zan_binder_resolve_type. */
+zan_type_t *zan_binder_make_nullable_type(zan_binder_t *b, zan_type_t *elem) {
+    if (!elem || elem == b->type_error || elem->kind == TYPE_NULLABLE ||
+        !type_is_value_kind(elem))
+        return elem;
+    zan_type_t *t = make_type(b->arena, TYPE_NULLABLE, elem->name.str, elem->name.len);
+    t->element_type = elem;
+    return t;
+}
+
 zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     if (!type_ref) return b->type_error;
     if (type_ref->kind == AST_TUPLE_TYPE) {

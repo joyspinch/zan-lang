@@ -582,7 +582,7 @@ static bool is_string_expr(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *loc
          * is still owned by the container). */
         zan_type_t *ot = infer_expr_type(g, e->index.object, locals);
         zan_type_t *et;
-        if (ot && ot->name.len == 4 && memcmp(ot->name.str, "Dict", 4) == 0 &&
+        if (ot && type_named(ot, "Dict", 4) &&
             ot->type_arg_count == 2)
             et = ot->type_args[1];   /* dict[key] yields the VALUE type */
         else
@@ -1449,9 +1449,21 @@ static infer_cache_slot_t *infer_cache_slot(zan_irgen_t *g, zan_ast_node_t *e,
  * the synthesized temporary (leakcheck_implicit_ctor_argument). */
 static void infer_cache_invalidate(void) { g_infer_ctx.live = false; }
 
+/* The type of a null-conditional access is the member's type made nullable:
+ * `a?.v` over an `int` field is an `int?`, because the access answers none
+ * when the receiver is null. */
+static zan_type_t *null_cond_result_type(zan_irgen_t *g, zan_ast_node_t *e,
+                                         zan_type_t *t) {
+    zan_ast_node_t *m = NULL;
+    if (e->kind == AST_MEMBER_ACCESS) m = e;
+    else if (e->kind == AST_CALL && e->call.callee) m = e->call.callee;
+    if (!m || m->kind != AST_MEMBER_ACCESS || !m->member.null_cond) return t;
+    return zan_binder_make_nullable_type(g->binder, t);
+}
+
 static zan_type_t *infer_expr_type_uncached(zan_irgen_t *g, zan_ast_node_t *e,
                                             local_scope_t *locals) {
-    zan_type_t *t = infer_expr_type_raw(g, e, locals);
+    zan_type_t *t = null_cond_result_type(g, e, infer_expr_type_raw(g, e, locals));
     if (!t || !g->cur_inst || type_is_concrete(t)) return t;
     /* Delegates keep their type parameters: a T-returning delegate is invoked
      * through an erased signature, so resolving T would disagree with it. */
@@ -1681,7 +1693,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         }
         zan_type_t *ot = infer_expr_type(g, e->member.object, locals);
         /* Dict.Keys / Dict.Values yield a fresh List of the key/value type */
-        if (ot && ot->name.len == 4 && memcmp(ot->name.str, "Dict", 4) == 0) {
+        if (ot && type_named(ot, "Dict", 4)) {
             if (e->member.name.len == 4 &&
                 memcmp(e->member.name.str, "Keys", 4) == 0)
                 return zan_binder_make_list_type(g->binder, dict_key_type(g, ot));
@@ -1731,7 +1743,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
             if (op) return op->type;
         }
         /* dict[key] yields the VALUE type (second type arg), not the key */
-        if (ot && ot->name.len == 4 && memcmp(ot->name.str, "Dict", 4) == 0 &&
+        if (ot && type_named(ot, "Dict", 4) &&
             ot->type_arg_count == 2)
             return ot->type_args[1];
         return container_elem_type(ot);

@@ -1659,18 +1659,18 @@ static zan_token_t lexer_peek_n(zan_parser_t *p, int k) {
     uint32_t line = p->lex->line;
     uint32_t col = p->lex->col;
     int idepth = p->lex->interp_depth;
-    int ibrace = p->lex->interp_brace_depth;
-    int iparen = p->lex->interp_paren_depth;
-    int ibrack = p->lex->interp_bracket_depth;
+    int nsave = idepth < ZAN_MAX_INTERP_DEPTH ? idepth : ZAN_MAX_INTERP_DEPTH;
+    zan_interp_level_t istack[ZAN_MAX_INTERP_DEPTH];
+    if (nsave > 0)
+        memcpy(istack, p->lex->interp_stack, sizeof(istack[0]) * (size_t)nsave);
     zan_token_t tok = {0};
     for (int i = 0; i < k; i++) tok = zan_lexer_next(p->lex);
     p->lex->pos = pos;
     p->lex->line = line;
     p->lex->col = col;
     p->lex->interp_depth = idepth;
-    p->lex->interp_brace_depth = ibrace;
-    p->lex->interp_paren_depth = iparen;
-    p->lex->interp_bracket_depth = ibrack;
+    if (nsave > 0)
+        memcpy(p->lex->interp_stack, istack, sizeof(istack[0]) * (size_t)nsave);
     return tok;
 }
 
@@ -1818,9 +1818,44 @@ static bool looks_like_var_decl(zan_parser_t *p) {
         /* could be type or expression; peek for identifier after */
         zan_token_t peek = zan_lexer_peek(p->lex);
         /* save lexer state is handled by peek */
-        /* heuristic: ident followed by ident or `<` is likely a type declaration */
-        if (peek.kind == TK_IDENT || peek.kind == TK_LESS) {
+        /* heuristic: ident followed by ident is likely a type declaration */
+        if (peek.kind == TK_IDENT) {
             return true;
+        }
+        /* `List<int> name` / `List<string>[] rows` declare a variable, but
+         * `Stat<int>.s = 7;` and `Stat<int>.F();` are statements about a
+         * generic instantiation. Treating every `Ident <` as a declaration
+         * sent those to the declaration parser, which reported "expected
+         * variable name" at the dot. Only a name after the matching `>` (past
+         * any array rank) makes this a declaration. */
+        if (peek.kind == TK_LESS) {
+            const char *s = p->lex->source;
+            size_t q = p->lex->pos, n = p->lex->source_len;
+            #define ZAN_GA_WS(ch) ((ch)==' '||(ch)=='\t'||(ch)=='\r'||(ch)=='\n')
+            #define ZAN_GA_IDSTART(ch) (((ch)>='a'&&(ch)<='z')||((ch)>='A'&&(ch)<='Z')||(ch)=='_')
+            while (q < n && ZAN_GA_WS(s[q])) q++;
+            if (q >= n || s[q] != '<') return false;
+            int gd = 0;
+            while (q < n) {
+                char gc = s[q];
+                if (gc == '<') { gd++; }
+                else if (gc == '>') { gd--; if (gd == 0) { q++; break; } }
+                else if (gc == ';' || gc == '(' || gc == ')' ||
+                         gc == '{' || gc == '}' || gc == '=') break;
+                q++;
+            }
+            if (gd != 0) return false;
+            while (q < n && ZAN_GA_WS(s[q])) q++;
+            while (q < n && s[q] == '[') {
+                size_t r = q + 1;
+                while (r < n && ZAN_GA_WS(s[r])) r++;
+                if (r >= n || s[r] != ']') return false;
+                q = r + 1;
+                while (q < n && ZAN_GA_WS(s[q])) q++;
+            }
+            return q < n && ZAN_GA_IDSTART(s[q]);
+            #undef ZAN_GA_WS
+            #undef ZAN_GA_IDSTART
         }
         /* qualified type decl: `A.B.C name` / `A.B<T> name` / `A.B[] name`.
          * Scan the raw source across the dotted chain, then check what

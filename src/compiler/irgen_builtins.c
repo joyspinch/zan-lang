@@ -1984,8 +1984,20 @@ static LLVMValueRef emit_dict_find(zan_irgen_t *g, zan_type_t *dict_type,
  * field's declared initializer is applied once at main() entry as a runtime
  * store (see emit_main_method), so any initializer expression works with
  * correct ordering. Returns NULL when `fsym` is not a static field. */
+/* The instantiation a static access names, if any: `Stat<int>.s` parses as an
+ * identifier carrying `inst_type_ref`. Inside a specialized body the reference
+ * is still written in terms of the type parameters (`Stat<T>.s`), so it is
+ * substituted through the active instantiation. */
+static zan_type_t *static_access_inst(zan_irgen_t *g, zan_ast_node_t *obj_expr) {
+    if (!obj_expr || !obj_expr->inst_type_ref) return NULL;
+    zan_type_t *t = zan_binder_resolve_type(g->binder, obj_expr->inst_type_ref);
+    if (t && g->cur_inst) t = subst_type_param_deep(g, t, g->cur_inst);
+    return (t && t->type_arg_count > 0) ? t : NULL;
+}
+
 static LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_sym,
-                                            zan_symbol_t *fsym) {
+                                            zan_symbol_t *fsym,
+                                            zan_type_t *inst) {
     /* plain fields and automatic properties (`{ get; set; }`) share a backing
      * global; custom-accessor properties are dispatched to their getter/setter
      * methods and never reach here */
@@ -1996,10 +2008,19 @@ static LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_
     if (!((fsym->modifiers & MOD_STATIC) ||
           (fsym->decl->field_decl.modifiers & MOD_STATIC)))
         return NULL;
+    /* A static of a generic class is per closed instantiation (C# rules):
+     * Stat<int>.s and Stat<string>.s are separate storage, so the backing
+     * global carries the instantiation suffix. A single unsuffixed global made
+     * every instantiation share one slot. */
+    if (!inst && g->cur_inst && g->cur_inst->sym == class_sym) inst = g->cur_inst;
+    char suffix[256];
+    suffix[0] = '\0';
+    if (inst && inst->sym == class_sym && inst->type_arg_count > 0)
+        mangle_inst_suffix(suffix, sizeof(suffix), inst);
     char name[512];
-    snprintf(name, sizeof(name), "__zan_sf_%.*s_%.*s",
+    snprintf(name, sizeof(name), "__zan_sf_%.*s_%.*s%s",
              (int)class_sym->name.len, class_sym->name.str,
-             (int)fsym->name.len, fsym->name.str);
+             (int)fsym->name.len, fsym->name.str, suffix);
     LLVMValueRef gv = LLVMGetNamedGlobal(g->mod, name);
     if (gv) return gv;
     LLVMTypeRef ft = fsym->type ? map_type(g, fsym->type)
@@ -2047,7 +2068,7 @@ static void emit_invalidate_freed_string(zan_irgen_t *g, zan_ast_node_t *arg,
         if (g->current_type_sym) {
             zan_symbol_t *field = get_field_sym(g->current_type_sym, arg->ident.name);
             if (!field || !field->type || field->type->kind != TYPE_STRING) return;
-            LLVMValueRef global = get_static_field_global(g, g->current_type_sym, field);
+            LLVMValueRef global = get_static_field_global(g, g->current_type_sym, field, NULL);
             LLVMTypeRef field_type = map_type(g, field->type);
             if (global) {
                 LLVMBuildStore(g->builder, LLVMConstNull(field_type), global);
@@ -2082,7 +2103,8 @@ static void emit_invalidate_freed_string(zan_irgen_t *g, zan_ast_node_t *arg,
             if (class_sym && (class_sym->kind == SYM_CLASS ||
                               class_sym->kind == SYM_STRUCT)) {
                 zan_symbol_t *field = get_field_sym(class_sym, arg->member.name);
-                LLVMValueRef global = get_static_field_global(g, class_sym, field);
+                LLVMValueRef global = get_static_field_global(g, class_sym, field,
+                    static_access_inst(g, obj));
                 if (global) {
                     LLVMBuildStore(g->builder,
                         LLVMConstNull(map_type(g, field_type)), global);
@@ -2117,7 +2139,10 @@ static void emit_invalidate_freed_string(zan_irgen_t *g, zan_ast_node_t *arg,
  * non-null; a null receiver yields the result type's zero value. The member
  * node is temporarily rewired to read the synthetic local so the ordinary
  * member/call codegen paths apply unchanged, then restored (the same AST may
- * be re-emitted, e.g. per generic instantiation). */
+ * be re-emitted, e.g. per generic instantiation). A value-typed result is
+ * wrapped as `T?`, as in C#: a value type has no null of its own, so handing
+ * back its zero would make the null receiver indistinguishable from a member
+ * that really holds zero. */
 static LLVMValueRef emit_null_cond(zan_irgen_t *g, zan_ast_node_t *expr,
                                    zan_ast_node_t *qmem, local_scope_t *locals) {
     LLVMValueRef obj = emit_expr(g, qmem->member.object, locals);
@@ -2153,6 +2178,12 @@ static LLVMValueRef emit_null_cond(zan_irgen_t *g, zan_ast_node_t *expr,
 
     LLVMPositionBuilderAtEnd(g->builder, then_bb);
     LLVMValueRef v = emit_expr(g, expr, locals);
+    LLVMTypeRef rt = LLVMTypeOf(v);
+    if (LLVMGetTypeKind(rt) != LLVMVoidTypeKind &&
+        LLVMGetTypeKind(rt) != LLVMPointerTypeKind && !llvm_is_nullable(rt)) {
+        LLVMValueRef some = nullable_some(g, nullable_type_of(g, rt), v);
+        if (some) v = some;
+    }
     LLVMBasicBlockRef then_end = LLVMGetInsertBlock(g->builder);
     LLVMBuildBr(g->builder, merge_bb);
 
@@ -2322,7 +2353,7 @@ static void pack_params_args(zan_irgen_t *g, zan_ast_node_t *call,
         zan_ast_node_t *la = call->call.args.items[argc - 1];
         if (la->kind == AST_NEW_EXPR) return; /* already packed / explicit list */
         zan_type_t *lt = infer_expr_type(g, la, locals);
-        if (lt && lt->name.len == 4 && memcmp(lt->name.str, "List", 4) == 0) return;
+        if (lt && type_named(lt, "List", 4)) return;
     }
     zan_ast_node_t *last_p = ps->items[ps->count - 1];
     zan_ast_node_t *lst = zan_ast_new(g->arena, AST_NEW_EXPR, call->loc);

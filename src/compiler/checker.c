@@ -855,9 +855,10 @@ static bool integral_conversion_is_safe(zan_type_t *target, zan_type_t *value,
  * parser as a static `op_implicit` member; like C#, it may be declared on
  * either the source type (T1) or the target type (T2). */
 static bool checker_conversion_method(zan_checker_t *c, zan_symbol_t *sym,
-                                      zan_type_t *from, zan_type_t *to) {
+                                      zan_type_t *from, zan_type_t *to,
+                                      const char *op_name) {
     if (!sym) return false;
-    zan_istr_t op = { (char *)"op_implicit", 11 };
+    zan_istr_t op = { (char *)op_name, (int)strlen(op_name) };
     for (int i = 0; i < sym->member_count; i++) {
         zan_symbol_t *m = sym->members[i];
         if (!m || m->kind != SYM_METHOD || !(m->modifiers & MOD_STATIC)) continue;
@@ -877,16 +878,62 @@ static bool checker_conversion_method(zan_checker_t *c, zan_symbol_t *sym,
     return false;
 }
 
-static bool checker_has_user_conversion(zan_checker_t *c, zan_type_t *target,
-                                        zan_type_t *value) {
+static bool checker_user_conversion(zan_checker_t *c, zan_type_t *target,
+                                    zan_type_t *value, const char *op_name) {
     if (!value || !target) return false;
     if (value->kind == TYPE_CLASS || value->kind == TYPE_STRUCT) {
-        if (checker_conversion_method(c, value->sym, value, target)) return true;
+        if (checker_conversion_method(c, value->sym, value, target, op_name))
+            return true;
     }
     if (target->kind == TYPE_CLASS || target->kind == TYPE_STRUCT) {
-        if (checker_conversion_method(c, target->sym, value, target)) return true;
+        if (checker_conversion_method(c, target->sym, value, target, op_name))
+            return true;
     }
     return false;
+}
+
+static bool checker_has_user_conversion(zan_checker_t *c, zan_type_t *target,
+                                        zan_type_t *value) {
+    return checker_user_conversion(c, target, value, "op_implicit");
+}
+
+/* Everything that lowers to a numeric register and so converts to any other
+ * such type by a value conversion. bool is deliberately absent: C# has no
+ * conversion between bool and a number in either direction. */
+static bool cast_is_scalar(zan_type_t *t) {
+    return t && (type_is_numeric(t) || t->kind == TYPE_CHAR ||
+                 t->kind == TYPE_ENUM || t->kind == TYPE_NINT);
+}
+
+/* Whether `(dst)src` is a conversion the language has. Explicit casts share a
+ * carrier with the target for most kinds, so an unchecked cast reinterprets
+ * whatever bits it is given -- `(int)"abc"` handed back the string's pointer
+ * and `(double)obj` a denormal. Anything the checker cannot judge (an error
+ * type, an unsubstituted type parameter, object, nint) is left alone. */
+static bool checker_cast_is_valid(zan_checker_t *c, zan_type_t *dst,
+                                  zan_type_t *src) {
+    if (!dst || !src) return true;
+    if (dst == c->binder->type_error || src == c->binder->type_error ||
+        src == c->binder->type_void)
+        return true;
+    if (dst->kind == TYPE_TYPE_PARAM || src->kind == TYPE_TYPE_PARAM) return true;
+    /* object is the boxed carrier (and the null literal's type). */
+    if (dst->kind == TYPE_OBJECT || src->kind == TYPE_OBJECT) return true;
+    /* nint is the native pointer/handle carrier of the interop surface, and a
+     * delegate is built from one; both convert to and from anything. */
+    if (dst->kind == TYPE_NINT || src->kind == TYPE_NINT) return true;
+    if (dst->kind == TYPE_DELEGATE || src->kind == TYPE_DELEGATE) return true;
+    if (checker_type_equal(dst, src)) return true;
+    if (dst->kind == TYPE_NULLABLE || src->kind == TYPE_NULLABLE)
+        return checker_cast_is_valid(c, checker_nullable_base(dst),
+                                     checker_nullable_base(src));
+    if (cast_is_scalar(dst) && cast_is_scalar(src)) return true;
+    /* A reference conversion (up, down or to an interface) is checked at run
+     * time, so any pair of reference types is a legal cast to write. */
+    if (checker_type_is_ref(dst) && checker_type_is_ref(src)) return true;
+    if (checker_user_conversion(c, dst, src, "op_explicit")) return true;
+    if (checker_user_conversion(c, dst, src, "op_implicit")) return true;
+    return checker_type_assignable(dst, src);
 }
 
 static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
@@ -1021,6 +1068,48 @@ static void check_call_arity(zan_checker_t *c, zan_ast_node_t *call,
                   (int)name.len, name.str, want_min, want_max, argc);
 }
 
+/* Comparisons, which consume the *value* of both operands. `+`/`-` are left
+ * out: they combine delegates and register event handlers, both of which take
+ * a method group. */
+static bool binary_op_compares(zan_token_kind_t op) {
+    switch (op) {
+    case TK_EQ_EQ: case TK_BANG_EQ:
+    case TK_LESS: case TK_GREATER: case TK_LESS_EQ: case TK_GREATER_EQ:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* The method a value-position member access names, if any: `set.Count`
+ * without an argument list is a method group. Only simple receivers are
+ * resolved, so no expression is type-checked (and no diagnostic duplicated)
+ * on this path. */
+static zan_symbol_t *expr_method_group(zan_checker_t *c, zan_ast_node_t *e) {
+    if (!e || e->kind != AST_MEMBER_ACCESS) return NULL;
+    zan_ast_node_t *obj = e->member.object;
+    if (!obj || (obj->kind != AST_IDENTIFIER && obj->kind != AST_THIS_EXPR))
+        return NULL;
+    zan_type_t *ot = zan_checker_check_expr(c, obj);
+    if (!ot || !ot->sym) return NULL;
+    for (int i = ot->sym->member_count - 1; i >= 0; i--) {
+        zan_symbol_t *m = ot->sym->members[i];
+        if (m->name.len == e->member.name.len &&
+            memcmp(m->name.str, e->member.name.str, (size_t)m->name.len) == 0)
+            return m->kind == SYM_METHOD ? m : NULL;
+    }
+    return NULL;
+}
+
+static void reject_method_group(zan_checker_t *c, zan_ast_node_t *e) {
+    zan_symbol_t *m = expr_method_group(c, e);
+    if (!m) return;
+    zan_diag_emit(c->diag, DIAG_ERROR, e->loc,
+                  "'%.*s' is a method, not a value; call it as '%.*s()'",
+                  (int)m->name.len, m->name.str,
+                  (int)m->name.len, m->name.str);
+}
+
 zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     if (!expr) return c->binder->type_error;
 
@@ -1087,6 +1176,18 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     case AST_BINARY: {
         zan_type_t *left = zan_checker_check_expr(c, expr->binary.left);
         zan_type_t *right = zan_checker_check_expr(c, expr->binary.right);
+        /* A method group as an operand is a forgotten '()'. It types as
+         * type_error, which every operand rule below waves through, and irgen
+         * then lowers the group to a closure pointer -- `set.Count == 2`
+         * reached LLVM as `icmp eq ptr, i64`. Delegate operands (event
+         * `+=`/`-=`, delegate combination) legitimately take one, so the
+         * report is limited to comparisons with a non-delegate other side. */
+        if (binary_op_compares(expr->binary.op)) {
+            if (right->kind != TYPE_DELEGATE)
+                reject_method_group(c, expr->binary.left);
+            if (left->kind != TYPE_DELEGATE)
+                reject_method_group(c, expr->binary.right);
+        }
 
         switch (expr->binary.op) {
         case TK_PLUS:
@@ -1113,8 +1214,12 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
              * plain integer arithmetic (the stdlib folds enum flags into
              * hash sums), so accept them as integers here too. promote_numeric
              * already defaults an enum operand to int. */
-            if ((type_is_numeric(left) || left->kind == TYPE_ENUM) &&
-                (type_is_numeric(right) || right->kind == TYPE_ENUM)) {
+            /* char is an integer in arithmetic (C#: `c1 + c2` is an int),
+             * which is why `(char)(c1 + c2)` is the way to add two of them. */
+            if ((type_is_numeric(left) || left->kind == TYPE_ENUM ||
+                 left->kind == TYPE_CHAR) &&
+                (type_is_numeric(right) || right->kind == TYPE_ENUM ||
+                 right->kind == TYPE_CHAR)) {
                 return promote_numeric(c->binder, left, right);
             }
             /* User-defined operator overloading: `a + b` on a class/struct left
@@ -1133,7 +1238,10 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
         case TK_AMP: case TK_PIPE: case TK_CARET:
         case TK_LESS_LESS: case TK_GREATER_GREATER:
-            if (type_is_integral(left) && type_is_integral(right)) {
+            if ((type_is_integral(left) || left->kind == TYPE_CHAR ||
+                 left->kind == TYPE_ENUM) &&
+                (type_is_integral(right) || right->kind == TYPE_CHAR ||
+                 right->kind == TYPE_ENUM)) {
                 return promote_numeric(c->binder, left, right);
             }
             return c->binder->type_error;
@@ -1646,6 +1754,17 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             }
         }
         return has_result ? merged : c->binder->type_error;
+    }
+
+    case AST_CAST_EXPR: {
+        zan_type_t *src = zan_checker_check_expr(c, expr->cast.expr);
+        zan_type_t *dst = zan_binder_resolve_type(c->binder, expr->cast.type);
+        if (!dst) return c->binder->type_error;
+        if (!checker_cast_is_valid(c, dst, src))
+            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                          "cannot convert '%s' to '%s': no such conversion",
+                          type_name(src), type_name(dst));
+        return dst;
     }
 
     case AST_BASE_EXPR:
