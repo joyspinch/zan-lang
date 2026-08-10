@@ -1653,13 +1653,39 @@ void zan_irgen_emit_string_deobf(zan_irgen_t *g) {
     LLVMBuildRetVoid(b);
     LLVMDisposeBuilder(b);
 
-    /* register in llvm.global_ctors: [{ i32 priority, void()* fn, i8* data }] */
-    LLVMValueRef fields[] = { LLVMConstInt(i32, 65535, 0), fn, LLVMConstNull(ptr) };
-    LLVMValueRef entryc = LLVMConstStruct(fields, 3, 0);
-    LLVMTypeRef arrty = LLVMArrayType(LLVMTypeOf(entryc), 1);
-    LLVMValueRef gc = LLVMAddGlobal(g->mod, arrty, "llvm.global_ctors");
-    LLVMSetLinkage(gc, LLVMAppendingLinkage);
-    LLVMSetInitializer(gc, LLVMConstArray(LLVMTypeOf(entryc), &entryc, 1));
+    /* Arrange for the constructor to run before main. llvm.global_ctors is the
+     * portable mechanism, but the LLVM C API builds every TargetMachine with
+     * UseInitArray=false, so on ELF it lowers to a legacy .ctors section. Our
+     * Linux binaries static-link musl with crt1/crti/crtn only (no
+     * crtbegin/crtend), and musl's startup iterates .init_array, never .ctors
+     * -- so the .ctors entry is dead and published literals stay scrambled at
+     * runtime. Emit the constructor pointer straight into .init_array for ELF
+     * targets, and keep llvm.global_ctors elsewhere (Windows .ctors are run by
+     * the mingw CRT, Darwin uses __mod_init_func, wasm __wasm_call_ctors). */
+    bool is_elf = !g->target_is_windows && !g->target_is_macos
+        && strncmp(g->target_triple, "wasm", 4) != 0;
+    if (is_elf) {
+        LLVMValueRef ent = LLVMAddGlobal(g->mod, ptr, "__zan.init_array.deobf");
+        LLVMSetLinkage(ent, LLVMInternalLinkage);
+        LLVMSetSection(ent, ".init_array");
+        LLVMSetInitializer(ent, fn);
+        /* An internal, otherwise-unreferenced global is dropped by GlobalDCE at
+         * -O (publish always optimizes), taking the .init_array slot with it;
+         * llvm.used keeps it alive to the linker. */
+        LLVMTypeRef usedty = LLVMArrayType(ptr, 1);
+        LLVMValueRef usedg = LLVMAddGlobal(g->mod, usedty, "llvm.used");
+        LLVMSetLinkage(usedg, LLVMAppendingLinkage);
+        LLVMSetSection(usedg, "llvm.metadata");
+        LLVMSetInitializer(usedg, LLVMConstArray(ptr, &ent, 1));
+    } else {
+        /* register in llvm.global_ctors: [{ i32 priority, void()* fn, i8* data }] */
+        LLVMValueRef fields[] = { LLVMConstInt(i32, 65535, 0), fn, LLVMConstNull(ptr) };
+        LLVMValueRef entryc = LLVMConstStruct(fields, 3, 0);
+        LLVMTypeRef arrty = LLVMArrayType(LLVMTypeOf(entryc), 1);
+        LLVMValueRef gc = LLVMAddGlobal(g->mod, arrty, "llvm.global_ctors");
+        LLVMSetLinkage(gc, LLVMAppendingLinkage);
+        LLVMSetInitializer(gc, LLVMConstArray(LLVMTypeOf(entryc), &entryc, 1));
+    }
 }
 
 /* Coerce a value to an i8* C string. Pointers pass through unchanged; integer

@@ -1693,6 +1693,26 @@ foreach(_abi_target win-x64 linux-x64 linux-arm64 macos-arm64)
   set_tests_properties(abi_int_ext_${_abi_target} PROPERTIES TIMEOUT 120)
 endforeach()
 
+# ---- --publish string de-obfuscation: startup constructor registration ----
+# The constructor that un-scrambles string literals must be registered the way
+# the target's startup path actually walks, or a published binary prints pure
+# garbage (ELF needs .init_array; llvm.global_ctors lowers to a dead legacy
+# .ctors there). Nothing is linked, so these run wherever the compiler builds.
+foreach(_obf_case linux-x64:init_array linux-arm64:init_array
+                  win-x64:global_ctors macos-arm64:global_ctors)
+  string(REPLACE ":" ";" _obf_parts ${_obf_case})
+  list(GET _obf_parts 0 _obf_target)
+  list(GET _obf_parts 1 _obf_kind)
+  add_test(NAME publish_obf_ctor_${_obf_target} COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/publish/obf_ctor.zan
+    -DTARGET=${_obf_target}
+    -DKIND=${_obf_kind}
+    -DWORKDIR=${CMAKE_BINARY_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_publish_obf_ctor.cmake)
+  set_tests_properties(publish_obf_ctor_${_obf_target} PROPERTIES TIMEOUT 180)
+endforeach()
+
 # ---- DAP integration test (real gdb-backed debug session) ----
 add_executable(dap_integration_test
     tests/dap/dap_integration_test.c
