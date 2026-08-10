@@ -5,6 +5,7 @@ using System.Net.WebSocket;
 using System.Net.Sse;
 using System.Net.Mqtt;
 using System.Diagnostics;
+using System.IO;
 using System.Text;
 using System.Threading;
 
@@ -137,8 +138,14 @@ class Worker {
     static List<TcpClient> wkChannels = new List<TcpClient>();
     #endif
     static int controlPort = 0;
+    // Set when the control port was named (--ctl-port, SetControlPort, or the
+    // ZAN_CTL_PORT a worker inherits): the master then uses it as given instead
+    // of moving to a free one, and the command line does not consult the
+    // record left by a running instance.
+    static bool ctlPortFixed = false;
     static int nextConnId = 1;
     static string logDir = "";
+    static string logPattern = "worker{wid}-{yyyy}{MM}{dd}.log";
 
     // ---- status/statistics (workerman-style `status`) ----
     // Requests/messages served by this process, across all Workers.
@@ -331,9 +338,12 @@ class Worker {
     }
 
     /// <summary>Overrides the loopback control port used by the master/worker
-    /// handshake (default: first Worker's port + 10000).</summary>
+    /// handshake (default: first Worker's port + 10000, and the master moves
+    /// off that default if something else holds it). A port named here is
+    /// used as given: the master fails instead of moving.</summary>
     static void SetControlPort(int port) {
         controlPort = port;
+        ctlPortFixed = true;
     }
 
     /// <summary>Seconds between status lines printed by the foreground
@@ -344,10 +354,28 @@ class Worker {
     }
 
     /// <summary>When set, each worker process redirects its stdout/stderr to
-    /// <dir>/worker_<id>.log (like Workerman's stdout_file). Otherwise worker
-    /// output is discarded (workers run detached without a console).</summary>
+    /// a file under <dir> (like Workerman's stdout_file). Otherwise worker
+    /// output is discarded (workers run detached without a console).
+    /// The file name comes from <see cref="SetLogPattern"/>.</summary>
     static void SetLogDir(string dir) {
         logDir = dir;
+    }
+
+    /// <summary>File-name pattern for the per-worker output file, expanded by
+    /// <see cref="Log.Expand"/>: {yyyy} {MM} {dd} {HH} {pid} {wid}. The
+    /// default `worker{wid}-{yyyy}{MM}{dd}.log` starts a new file each day, so
+    /// a long-running service does not end up with one unbounded log that is
+    /// useless to search and impossible to rotate.</summary>
+    static void SetLogPattern(string pattern) {
+        if (pattern != "") { logPattern = pattern; }
+    }
+
+    /// <summary>Where worker <paramref name="wid"/> writes its output, or ""
+    /// when no log directory is configured.</summary>
+    static string WorkerLogPath(int wid) {
+        if (logDir == "") { return ""; }
+        return logDir + Path.Separator()
+            + Log.ExpandFor(logPattern, DateTime.Now(), wid);
     }
 
     static int MaxCount() {
@@ -361,9 +389,154 @@ class Worker {
     static int ControlPort() {
         if (controlPort > 0) { return controlPort; }
         string env = ProcessHost.Env("ZAN_CTL_PORT");
-        if (env != "") { return Convert.ToInt32(env); }
+        if (env != "") {
+            // A worker inherits the port its master claimed and must not go
+            // looking for another one.
+            controlPort = Convert.ToInt32(env);
+            ctlPortFixed = true;
+            return controlPort;
+        }
         if (workers.Count > 0) { return workers[0].port + 10000; }
         return 19999;
+    }
+
+    /// The default control port is derived from the service port, so an
+    /// unrelated program holding it used to be fatal even though nothing
+    /// outside the process group ever talks to it. The master may move to
+    /// another port and records the one it claimed here, so stop/status/reload
+    /// still find it. Keyed by the service port, which is all the command line
+    /// knows.
+    static string CtlPortFile() {
+        int key = 19999;
+        if (workers.Count > 0) { key = workers[0].port; }
+        return Path.Combine(Path.GetTempPath(),
+            "zan-worker-" + Convert.ToString(key) + ".ctl");
+    }
+
+    static void RecordControlPort() {
+        File.WriteAllText(CtlPortFile(), Convert.ToString(ControlPort()));
+    }
+
+    static void ForgetControlPort() {
+        File.Delete(CtlPortFile());
+    }
+
+    /// The port a running instance recorded, or 0 when there is no usable
+    /// record. Only for the CLI side: the master writes the file.
+    static int RecordedControlPort() {
+        string f = CtlPortFile();
+        if (!File.Exists(f)) { return 0; }
+        string body = File.ReadAllText(f);
+        int port = 0;
+        for (int i = 0; i < body.Length; i = i + 1) {
+            int c = body[i] & 255;
+            if (c < 48 || c > 57) { break; }
+            port = port * 10 + (c - 48);
+        }
+        if (port < 1 || port > 65535) { return 0; }
+        return port;
+    }
+
+    // How long the control port is given to answer: connect and reply budgets
+    // for the liveness probe, and how long the CLI waits for stop/status/
+    // reload. Loopback and a master that is not wedged answer in microseconds;
+    // the budget only bounds the pathological cases (ghost listener, wedged
+    // master), which used to hang the caller for good.
+    static int ctlProbeMs = 1500;
+    static int ctlCmdMs = 10000;
+
+    // Why the last BindCtl failed. Kept here because closing the socket in the
+    // failure path overwrites the platform error before the caller sees it.
+    static string lastCtlErr = "";
+
+    // Binds the control socket on one port. Returns the socket, or -1 with the
+    // reason in lastCtlErr.
+    static nint BindCtl(int port, bool reuse) {
+        nint s = Socket.CreateTcp();
+        if (s < 0) {
+            lastCtlErr = SocketErr();
+            return -1;
+        }
+        if (reuse) { Socket.SetReuseAddr(s); }
+        if (Socket.Bind(s, "127.0.0.1", port) != 0) {
+            lastCtlErr = SocketErr();
+            Socket.Close(s);
+            return -1;
+        }
+        return s;
+    }
+
+    // Claims a control port for this instance: the wanted one if it is free, a
+    // reclaimed leftover from a previous run, or -- unless the port was named
+    // explicitly -- the next free port after it. Returns the bound socket and
+    // leaves ControlPort() reporting the port actually claimed, or -1.
+    static async nint ClaimControlPort() {
+        int want = ControlPort();
+        #if WINDOWS
+        // No SO_REUSEADDR on the first try: on Windows it would let this
+        // process steal a live master's port instead of failing, which is what
+        // keeps a child that mistook itself for a master from spawning
+        // children of its own.
+        nint s = BindCtl(want, false);
+        #else
+        // Lets a restart rebind while the previous master's control
+        // connections are still in TIME_WAIT. On POSIX this does not allow a
+        // second listener on the port, so the check below still catches a
+        // master that is actually running.
+        nint s = BindCtl(want, true);
+        #endif
+        if (s >= 0) { return s; }
+        string wantErr = lastCtlErr;
+
+        // Only something that ANSWERS is a running master; a lingering socket
+        // (TIME_WAIT, or a listener left behind by a dead master whose handle
+        // an exiting child still held) either refuses the connection or
+        // accepts it and never replies -- both are reclaimable below.
+        if (await ControlPortHasMaster()) {
+            Console.WriteLine("[Worker] FATAL: control port "
+                + Convert.ToString(want)
+                + " is served by a running master; stop it first"
+                + " (<app> stop), or start this one with --ctl-port N");
+            exit(1);
+        }
+
+        s = BindCtl(want, true);
+        if (s >= 0) {
+            Console.WriteLine("[Worker] control port " + Convert.ToString(want)
+                + " was left behind by a previous run; reclaimed it");
+            return s;
+        }
+
+        if (ctlPortFixed) {
+            Console.WriteLine("[Worker] FATAL: cannot bind control port "
+                + Convert.ToString(want) + " (" + wantErr + ", retry: "
+                + lastCtlErr + "); nothing answers on it, so it is not a"
+                + " running master -- name a free one with --ctl-port N");
+            exit(1);
+        }
+
+        // The control port is internal: only this master and its own workers
+        // ever connect to it, and they are told which port to use. So an
+        // unrelated program sitting on the derived default is no reason to
+        // refuse to start -- move to the next free port and record it for
+        // stop/status/reload.
+        int probe = want + 1;
+        while (probe <= want + 64) {
+            s = BindCtl(probe, false);
+            if (s >= 0) {
+                controlPort = probe;
+                Console.WriteLine("[Worker] control port "
+                    + Convert.ToString(want) + " is taken (" + wantErr
+                    + "); using " + Convert.ToString(probe) + " instead");
+                return s;
+            }
+            probe = probe + 1;
+        }
+        Console.WriteLine("[Worker] FATAL: no free control port in "
+            + Convert.ToString(want) + "-" + Convert.ToString(want + 64)
+            + " (" + lastCtlErr + "); name one with --ctl-port N");
+        exit(1);
+        return -1;
     }
 
     /// <summary>Runs the process-management command line, workerman-style:
@@ -395,8 +568,9 @@ class Worker {
                 // The control port is derived (first Worker's port + 10000),
                 // so two servers on nearby ports collide with no way out but
                 // an environment variable. Name it on the command line, and
-                // stop/status/reload address the same instance.
-                controlPort = Convert.ToInt32(Environment.ArgAt(i + 1));
+                // stop/status/reload address the same instance -- and the
+                // master uses it as given instead of moving off it.
+                SetControlPort(Convert.ToInt32(Environment.ArgAt(i + 1)));
             } else if (i == 0) {
                 cmd = a;
             }
@@ -419,6 +593,9 @@ class Worker {
             // Give the old master time to drop the control port before the new
             // one claims it exclusively.
             await Task.Delay(1500);
+            // STOP addressed the old instance's port, which may have been a
+            // fallback. The new one starts from the default again.
+            if (!ctlPortFixed) { controlPort = 0; }
             cmd = "start";
         }
         if (cmd != "start") {
@@ -429,24 +606,45 @@ class Worker {
         await RunAll();
     }
 
-    // Sends one command line to the running master and prints its answer.
+    // Sends one command line to the running master and prints its answer. The
+    // running instance may have moved off the derived port, so its record wins
+    // over the default -- unless the port was named on the command line.
     static async void SendCommand(string cmd) {
         Socket.Initialize();
-        TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", ControlPort());
+        if (!ctlPortFixed) {
+            int recorded = RecordedControlPort();
+            if (recorded > 0) { controlPort = recorded; }
+        }
+        TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", ControlPort(),
+            ctlProbeMs);
         if (c == null || !c.IsConnected()) {
             Console.WriteLine("[Worker] no server on control port "
                 + Convert.ToString(ControlPort()));
             return;
         }
         int _s = await c.SendAsync(cmd + "\n");
+        // Bounded read: a socket left listening by a dead master accepts and
+        // then says nothing, and an unbounded read left `stop`/`status`
+        // hanging on it forever (the reactor wakeup can never be cancelled).
         string reply = "";
+        bool timedOut = false;
         while (true) {
-            string chunk = await c.RecvAsync(4096);
-            if (chunk.Length == 0) { break; }
+            string chunk = await c.RecvAsync(4096, ctlCmdMs);
+            if (chunk.Length == 0) {
+                timedOut = Socket.LastRecvTimedOut();
+                break;
+            }
             reply = reply + chunk;
         }
         c.Close();
         if (reply.Length > 0) { Console.Write(reply); }
+        if (timedOut) {
+            Console.WriteLine("[Worker] control port "
+                + Convert.ToString(ControlPort()) + " accepted the connection"
+                + " but did not answer " + cmd + " within "
+                + Convert.ToString(ctlCmdMs / 1000) + "s; it is not a live"
+                + " master (leftover listening socket?)");
+        }
     }
 
     /// <summary>Runs every registered Worker. Never returns. In the master
@@ -625,28 +823,24 @@ class Worker {
         int ctl = ControlPort();
         #if WINDOWS
         // Set the variables in our own environment so the child inherits them
-        // via CreateProcess (cmd-level `set X=..&&` does not survive the
-        // cmd.exe /c hop that Process.RunDetached uses), then clear them so
-        // the master itself never looks like a worker.
+        // via CreateProcess, then clear them so the master itself never looks
+        // like a worker.
         SetEnvironmentVariableA("ZAN_WORKER_ID", Convert.ToString(wid));
         SetEnvironmentVariableA("ZAN_CTL_PORT", Convert.ToString(ctl));
-        string cmd = "\"" + exe + "\"";
-        if (logDir != "") {
-            // Extra outer quotes so cmd.exe /c does not strip the quote around
-            // the exe path when the command also contains a quoted log path.
-            cmd = "\"" + cmd + " > \"" + logDir + "\\worker_" + Convert.ToString(wid)
-                + ".log\" 2>&1\"";
-        }
-        Process.RunDetached(cmd);
+        // Started directly, NOT through `cmd.exe /c`: a shell hop would leave
+        // one cmd.exe plus one conhost.exe alive alongside every worker for as
+        // long as it runs, so N workers (and every respawn) pile up as a crowd
+        // of "Windows command processor" / console host entries.
+        Process.StartProgram(exe, Worker.WorkerLogPath(wid));
         SetEnvironmentVariableA("ZAN_WORKER_ID", "");
         SetEnvironmentVariableA("ZAN_CTL_PORT", "");
         #else
         string cmd = "ZAN_WORKER_ID=" + Convert.ToString(wid)
             + " ZAN_CTL_PORT=" + Convert.ToString(ctl)
             + " \"" + exe + "\"";
-        if (logDir != "") {
-            cmd = cmd + " > \"" + logDir + "/worker_" + Convert.ToString(wid)
-                + ".log\" 2>&1";
+        string log = Worker.WorkerLogPath(wid);
+        if (log != "") {
+            cmd = cmd + " >> \"" + log + "\" 2>&1";
         }
         Process.RunDetached(cmd);
         #endif
@@ -675,85 +869,33 @@ class Worker {
     // failure path closes the socket before the caller can read it.
     static string lastBindErr;
 
-    /// True when something ACCEPTS a connection on the control port, i.e. a
-    /// master really is running. A port that merely refuses the connection is
-    /// a leftover socket (TIME_WAIT) and can be reclaimed.
+    /// True when a live Zan master answers PING on the control port.
+    ///
+    /// Accepting the connection is not enough: a listening socket outlives the
+    /// process that created it whenever a handle to it was inherited or
+    /// duplicated (Windows worker handoff), and the kernel completes the
+    /// handshake from the backlog with nobody left to accept it. Treating that
+    /// ghost as a running master made every later start fail with "served by a
+    /// running master" until the leftover handle was found and killed -- a
+    /// reboot being the usual cure. So talk to it: only something that answers
+    /// PONG owns the port as a master.
     static async bool ControlPortHasMaster() {
-        TcpClient probe = await TcpClient.ConnectAsync("127.0.0.1", ControlPort());
-        if (probe == null) { return false; }
-        bool live = probe.IsConnected();
+        TcpClient probe = await TcpClient.ConnectAsync("127.0.0.1",
+            ControlPort(), ctlProbeMs);
+        if (probe == null || !probe.IsConnected()) { return false; }
+        int _s = await probe.SendAsync("PING\n");
+        string reply = await probe.RecvAsync(64, ctlProbeMs);
         probe.Close();
-        return live;
+        return reply.Length >= 4 && reply.Substring(0, 4) == "PONG";
     }
 
     static async void RunAsMaster(int procs) {
-        // Fork-bomb guard: claim the control port exclusively (no SO_REUSEADDR)
-        // BEFORE spawning anything. If a child ever mistakes itself for a
-        // master (e.g. env vars failed to propagate), its bind fails here and
-        // it exits instead of spawning children of its own.
-        nint ctlSock = Socket.CreateTcp();
-        if (ctlSock < 0) {
-            // Not a port problem at all: the socket layer itself is
-            // unavailable (on Windows, WSAStartup never ran -- error 10093).
-            // Blaming the control port here sent people hunting for a
-            // conflict that does not exist.
-            Console.WriteLine("[Worker] FATAL: cannot create the control"
-                + " socket (" + SocketErr() + "); the socket layer is"
-                + " unavailable, so no port would work");
-            exit(1);
-        }
-        #if !WINDOWS
-        // Lets a restart rebind while the previous master's control
-        // connections are still in TIME_WAIT. On POSIX this does not allow a
-        // second listener on the port, so the exclusivity check below still
-        // catches a master that is actually running. (Not on Windows, where
-        // SO_REUSEADDR would let one process steal another's port.)
-        Socket.SetReuseAddr(ctlSock);
-        #endif
-        int ctlBind = Socket.Bind(ctlSock, "127.0.0.1", ControlPort());
-        if (ctlBind != 0) {
-            // The error code has to be read now: the probe and close below
-            // both overwrite it.
-            string firstErr = SocketErr();
-            // A failed bind does not mean a master owns the port: on Windows
-            // the previous master's control port sits in TIME_WAIT for about
-            // two minutes after it exits, and SO_REUSEADDR is not set there
-            // (it would let one process steal a live listener). So ask the
-            // port itself -- only something that ACCEPTS a connection is a
-            // running master; a lingering socket refuses it.
-            bool live = await ControlPortHasMaster();
-            if (live) {
-                Console.WriteLine("[Worker] FATAL: control port "
-                    + Convert.ToString(ControlPort())
-                    + " is served by a running master; stop it first"
-                    + " (<app> stop), or start this one with --ctl-port N");
-                exit(1);
-            }
-            Socket.Close(ctlSock);
-            ctlSock = Socket.CreateTcp();
-            if (ctlSock < 0) {
-                Console.WriteLine("[Worker] FATAL: cannot create the control"
-                    + " socket (" + SocketErr() + ")");
-                exit(1);
-            }
-            Socket.SetReuseAddr(ctlSock);
-            ctlBind = Socket.Bind(ctlSock, "127.0.0.1", ControlPort());
-            if (ctlBind != 0) {
-                // Both attempts failed and nothing answers on the port, so
-                // the reason is neither a running master nor a leftover
-                // socket. Print what the OS said instead of guessing.
-                Console.WriteLine("[Worker] FATAL: cannot bind control port "
-                    + Convert.ToString(ControlPort())
-                    + " (" + firstErr + ", retry with SO_REUSEADDR: "
-                    + SocketErr() + "); nothing answers on it, so it is not a"
-                    + " running master -- start with --ctl-port N to pick"
-                    + " another one");
-                exit(1);
-            }
-            Console.WriteLine("[Worker] control port "
-                + Convert.ToString(ControlPort())
-                + " was left behind by a previous run; reclaimed it");
-        }
+        // Fork-bomb guard: claim the control port BEFORE spawning anything. If
+        // a child ever mistakes itself for a master (e.g. env vars failed to
+        // propagate), the claim fails here and it exits instead of spawning
+        // children of its own.
+        nint ctlSock = await ClaimControlPort();
+        RecordControlPort();
         PrintBanner(procs);
         Socket.Listen(ctlSock, 64);
         Socket.SetNonBlocking(ctlSock);
@@ -886,7 +1028,8 @@ class Worker {
 
         // Commands from the CLI (`app stop|reload|status`) share the control
         // port with the worker handshake: they are single words.
-        if (f[0] == "STOP" || f[0] == "RELOAD" || f[0] == "STATUS") {
+        if (f[0] == "PING" || f[0] == "STOP" || f[0] == "RELOAD"
+                || f[0] == "STATUS") {
             await HandleCliCommand(conn, f[0]);
             return;
         }
@@ -956,6 +1099,14 @@ class Worker {
     //         so the port is served throughout.
     // status: send back the same table the foreground master prints.
     static async void HandleCliCommand(TcpClient conn, string cmd) {
+        if (cmd == "PING") {
+            // Liveness probe (ClaimControlPort): proves a master is accepting
+            // AND serving, not just a socket left listening by a dead one.
+            int _p = await conn.SendAsync("PONG "
+                + Convert.ToString(ProcessHost.Pid()) + "\n");
+            conn.Close();
+            return;
+        }
         if (cmd == "STATUS") {
             int _s = await conn.SendAsync(StatusText());
             conn.Close();
@@ -986,6 +1137,7 @@ class Worker {
             await Task.Delay(200);
             waited = waited + 200;
         }
+        ForgetControlPort();
         Console.WriteLine("[Worker] master stopped");
         exit(0);
     }
@@ -1078,23 +1230,31 @@ class Worker {
     // Control listener for a single-process server started through RunCommand:
     // the same stop/reload/status commands, answered without a master.
     static async void SingleProcessControlLoop() {
-        nint ctlSock = Socket.CreateTcp();
-        #if !WINDOWS
-        Socket.SetReuseAddr(ctlSock);
+        #if WINDOWS
+        nint ctlSock = BindCtl(ControlPort(), false);
+        #else
+        nint ctlSock = BindCtl(ControlPort(), true);
         #endif
-        if (Socket.Bind(ctlSock, "127.0.0.1", ControlPort()) != 0) {
+        if (ctlSock < 0) {
             // Same as the master: a refused port is a leftover socket from the
             // previous run, so stop/status/reload still reach this server
             // instead of silently going unanswered for two minutes.
-            Socket.Close(ctlSock);
             if (await ControlPortHasMaster()) { return; }
-            ctlSock = Socket.CreateTcp();
-            Socket.SetReuseAddr(ctlSock);
-            if (Socket.Bind(ctlSock, "127.0.0.1", ControlPort()) != 0) {
-                Socket.Close(ctlSock);
-                return;
+            ctlSock = BindCtl(ControlPort(), true);
+        }
+        if (ctlSock < 0 && !ctlPortFixed) {
+            int want = ControlPort();
+            int probe = want + 1;
+            while (probe <= want + 64 && ctlSock < 0) {
+                ctlSock = BindCtl(probe, false);
+                if (ctlSock >= 0) { controlPort = probe; }
+                probe = probe + 1;
             }
         }
+        // Losing the control port only costs this server its command line, not
+        // its ability to serve, so it gives up quietly.
+        if (ctlSock < 0) { return; }
+        RecordControlPort();
         Socket.Listen(ctlSock, 16);
         Socket.SetNonBlocking(ctlSock);
         while (true) {
@@ -1117,6 +1277,12 @@ class Worker {
         }
         List<string> f = SplitWords(line);
         if (f.Count == 0) { conn.Close(); return; }
+        if (f[0] == "PING") {
+            int _p = await conn.SendAsync("PONG "
+                + Convert.ToString(ProcessHost.Pid()) + "\n");
+            conn.Close();
+            return;
+        }
         if (f[0] == "STATUS") {
             int _s = await conn.SendAsync(StatusText());
             conn.Close();
@@ -1161,6 +1327,9 @@ class Worker {
             await Task.Delay(100);
             waited = waited + 100;
         }
+        // A worker never wrote the record; only the process that claimed the
+        // control port drops it.
+        if (!ProcessHost.IsWorker()) { ForgetControlPort(); }
         exit(0);
     }
 

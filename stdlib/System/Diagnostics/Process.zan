@@ -45,6 +45,9 @@ class Process {
     [DllImport("kernel32", EntryPoint = "MultiByteToWideChar")]
     static extern int WinMultiToWide(int page, int flags, nint mb, int mbLen,
                                      nint wide, int wideLen);
+    [DllImport("kernel32", EntryPoint = "CreateFileA")]
+    static extern nint WinCreateFile(string path, int access, int share, byte[] sa,
+                                     int disposition, int flags, nint template);
     #else
     // Linux、macOS 等 POSIX 系统都在 libc 中提供 popen/pclose。
     [DllImport("crt", EntryPoint = "popen")]
@@ -127,6 +130,22 @@ class Process {
             mul = mul * 256;
         }
         return h;
+    }
+
+    // 把 8 字节小端 HANDLE 写入结构体缓冲区。
+    static void WinPutHandle(byte[] buf, int off, nint h) {
+        nint v = h;
+        for (int k = 0; k < 8; k = k + 1) {
+            buf[off + k] = (byte)(v % 256);
+            v = v / 256;
+        }
+    }
+
+    static void WinPutInt(byte[] buf, int off, int v) {
+        buf[off] = (byte)(v & 255);
+        buf[off + 1] = (byte)((v >> 8) & 255);
+        buf[off + 2] = (byte)((v >> 16) & 255);
+        buf[off + 3] = (byte)((v >> 24) & 255);
     }
 
     // 通过 cmd.exe 启动 `command`，不显示控制台窗口。当 `waitFor`
@@ -299,6 +318,66 @@ class Process {
         return WinSpawn(cmd, false);
         #else
         return system("(" + cmd + ") >/dev/null 2>&1 &");
+        #endif
+    }
+
+    /// <summary>直接启动一个程序，不经过 shell，可选把
+    /// stdout/stderr 追加重定向到 `logPath`（为 "" 时丢弃输出）。
+    /// 启动成功返回 0，失败返回 -1。
+    ///
+    /// 与 <see cref="RunDetached"/> 的区别：不产生 cmd.exe /bin/sh 中间进程。
+    /// 长期运行的子进程（如 worker）必须用它：`cmd.exe /c app.exe` 会让
+    /// 每个 worker 多挂一个 cmd.exe 加一个 conhost.exe，在任务管理器里堆成
+    /// 一片“Windows 命令处理程序 / 控制台窗口主机”，崩溃重启时更甚。
+    /// 参数不经 shell 解释，因此路径中的空格由本方法自己加引号处理。</summary>
+    static int StartProgram(string exe, string logPath) {
+        #if WINDOWS
+        // STARTUPINFOA(64 位)：cb@0 dwFlags@60 wShowWindow@64
+        //                      hStdInput@80 hStdOutput@88 hStdError@96，共 104 字节。
+        byte[] si = new byte[128];
+        si[0] = 104;
+        byte[] pi = new byte[32];
+        int DETACHED_PROCESS = 8;
+        int CREATE_NO_WINDOW = 134217728;      // 0x08000000
+        int flags = DETACHED_PROCESS;
+        nint log = 0;
+        int inherit = 0;
+        if (logPath != "") {
+            // SECURITY_ATTRIBUTES{ nLength=24, lpSecurityDescriptor=0,
+            //                      bInheritHandle=TRUE }：句柄必须可继承，
+            // 子进程才能把它当作自己的 stdout。
+            byte[] sa = new byte[24];
+            WinPutInt(sa, 0, 24);
+            WinPutInt(sa, 16, 1);
+            int GENERIC_WRITE = 1073741824;    // 0x40000000
+            int FILE_SHARE_RW = 3;
+            int OPEN_ALWAYS = 4;
+            int FILE_ATTRIBUTE_NORMAL = 128;
+            log = WinCreateFile(logPath, GENERIC_WRITE, FILE_SHARE_RW,
+                                sa, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+            if (log == 0 - 1) { log = 0; }
+        }
+        if (log != 0) {
+            int STARTF_USESTDHANDLES = 256;    // 0x00000100
+            WinPutInt(si, 60, STARTF_USESTDHANDLES);
+            WinPutHandle(si, 88, log);
+            WinPutHandle(si, 96, log);
+            inherit = 1;
+            // 有重定向就不必给子进程分配控制台，用 CREATE_NO_WINDOW 让
+            // 它保持控制台程序语义但没有窗口，也没有多余的 conhost。
+            flags = CREATE_NO_WINDOW;
+        }
+        int ok = WinCreateProcess(0, "\"" + exe + "\"", 0, 0, inherit, flags,
+                                  0, 0, si, pi);
+        if (log != 0) { WinCloseHandle(log); }
+        if (ok == 0) { return 0 - 1; }
+        WinCloseHandle(WinHandleAt(pi, 0));
+        WinCloseHandle(WinHandleAt(pi, 8));
+        return 0;
+        #else
+        string redirect = " >/dev/null 2>&1";
+        if (logPath != "") { redirect = " >>\"" + logPath + "\" 2>&1"; }
+        return system("\"" + exe + "\"" + redirect + " &");
         #endif
     }
 
