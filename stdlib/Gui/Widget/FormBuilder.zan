@@ -159,11 +159,16 @@ class FormBuilder {
         Control ctl = ControlFactory.Create(kind);
         if (ctl == null) { return null; }
         ctl.name = o.Str("name", "");
+        // 样式类（皮肤规则 / `grid-cols-3 gap-y-2` 这类原子类）。
+        string cls = o.Str("class", "");
+        if (cls != "") { ctl.Class = cls; }
         string opts = FormBuilder.JoinOpts(o);
         if (opts != "") { ctl.SetProp("options", opts); }
         string placeholder = o.Str("placeholder", "");
         if (placeholder != "") { ctl.SetProp("placeholder", placeholder); }
         if (o.Bool("defOn", false)) { ctl.SetProp("defOn", "true"); }
+        int cols = o.Int("columns", 0);
+        if (cols > 0) { ctl.SetProp("columns", Convert.ToString(cols)); }
         return ctl;
     }
 
@@ -212,6 +217,12 @@ class FormBuilder {
             ctl.Prefer(0, FormBuilder.PrefH(o));
             cell.Add(ctl);
             return cell;
+        }
+        // 选项组自己算高度（行数 x 行高）：字段高度在这里是“行高”，
+        // 不能当成整体高度钉死，否则换行的第二行会被裁掉。
+        if (ctl is ChoiceGroup) {
+            ((ChoiceGroup)ctl).SetRowHeight(FormBuilder.PrefH(o));
+            return ctl;
         }
         ctl.Prefer(0, FormBuilder.PrefH(o));
         return ctl;
@@ -263,6 +274,7 @@ class FormBuilder {
         o.Put("name", JsonValue.NewStr(f.fname));
         o.Put("placeholder", JsonValue.NewStr(f.placeholder));
         o.Put("kind", JsonValue.NewStr(f.KindName()));
+        o.Put("class", JsonValue.NewStr(f.Class));
         if (f.defOn) { o.Put("defOn", JsonValue.NewBool(true)); }
         if (f.wrap) { o.Put("wrap", JsonValue.NewBool(true)); }
         if (f.OptionCount() > 0) {
@@ -440,17 +452,67 @@ class FbStack : Panel {
 /// 超出可用宽度自动换行。设计器预览与运行时窗口经 FormBuilder / formgen
 /// 共用同一实现，使多选项在两侧真实且一致地渲染。无表面。
 class ChoiceGroup : Panel {
+    /// 列距 / 行距的回退值：样式表的 `column-gap` / `row-gap` / `gap`
+    /// （Tailwind 的 `gap-x-*` / `gap-y-*`）优先。
     int gapX;
     int gapY;
+    /// 每行放几个（0 = 按可用宽度自动换行）。样式表的 `columns`
+    /// （Tailwind 的 `grid-cols-N`）优先。大于 0 时该行按可用宽度等分。
+    int columns;
+    /// 行高（0 = 按最高的选项）。样式表的 `line-height` 优先。
+    int rowHeight;
     /// 与 children 对齐的选项标签，供 OptionsText 往返（子控件
     /// 的 label 字段不统一，不能靠 GetProp 读回）。
     List<string> labels;
+    /// OnMeasure 解析出的行几何，供没有 App 的 Arrange 复用。
+    int mCols;
+    int mColGap;
+    int mRowGap;
+    int mRowH;
+    /// 测量时假定的行数与实际排布出的行数：不一致说明可用宽度
+    /// 变了（自动换行模式），下一帧按新宽度重新测量。
+    int mRows;
+    int aRows;
 
     void InitChoice() {
         this.InitPanel("choicegroup", 3);
         this.gapX = 16;
         this.gapY = 4;
+        this.columns = 0;
+        this.rowHeight = 0;
         this.labels = new List<string>();
+        this.mCols = 0;
+        this.mColGap = 16;
+        this.mRowGap = 4;
+        this.mRowH = 0;
+        this.mRows = 0;
+        this.aRows = 0;
+    }
+
+    /// 每行的选项个数（0 = 自动换行）。设为 N 后该行按可用宽度等分成
+    /// N 列，最后一行不足 N 个也保持同样的列宽。
+    void SetColumns(int n) {
+        if (n < 0) { n = 0; }
+        this.columns = n;
+    }
+
+    int Columns() { return this.columns; }
+
+    /// 每行的高度（0 = 按最高的选项自适应）。选项在行内垂直居中，
+    /// 所以调大行高只会拉开行距，不会让相邻行互相压住。
+    void SetRowHeight(int h) {
+        if (h < 0) { h = 0; }
+        this.rowHeight = h;
+    }
+
+    int RowHeight() { return this.rowHeight; }
+
+    /// 选项组是自己的 CSS 类型（`checkboxgroup` / `radiogroup`），而不是
+    /// Panel 的 `stack`：皮肤要能单独给它写 `columns` / `row-gap` /
+    /// `column-gap` / `line-height`，而不影响所有布局容器。
+    override string StyleType() {
+        if (styleTypeLower == "") { styleTypeLower = this.Kind().ToLower(); }
+        return styleTypeLower;
     }
 
     /// 供子类实现：为第 index 个选项构造单个选择控件。
@@ -500,21 +562,124 @@ class ChoiceGroup : Panel {
         return true;
     }
 
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec cols = PropSpec.Int("columns", "Columns")
+            .WithTip("每行几个选项，0 = 按宽度自动换行；大于 0 时按可用宽度等分")
+            .Step(1, 0, 24);
+        cols.num = columns;
+        ps.Add(cols);
+        PropSpec rh = PropSpec.Int("rowHeight", "Row height")
+            .WithTip("每行的高度，0 = 按最高的选项自适应")
+            .Step(2, 0, 200);
+        rh.num = rowHeight;
+        ps.Add(rh);
+        return ps;
+    }
+
     override void OnPaint(App app) {
+        // 自动换行模式下，测量用的是上一帧的宽度：宽度一变行数就变，
+        // 此时按新行数重新测量一次，避免高度停留在旧行数上（选项被裁掉）。
+        if (this.aRows != this.mRows) {
+            this.mRows = this.aRows;
+            this.prefH = this.RowsHeight(this.aRows);
+            app.RequestRedraw();
+        }
+    }
+
+    /// 内容区宽度（去掉内边距）。
+    int InnerW(int pw) {
+        int w = pw - this.StylePadL() - this.StylePadR();
+        if (w < 0) { return 0; }
+        return w;
+    }
+
+    /// `rows` 行占用的总高度（含内边距与行距）。
+    int RowsHeight(int rows) {
+        if (rows < 1) { return this.StylePadT() + this.StylePadB(); }
+        return this.StylePadT() + this.StylePadB()
+             + rows * this.mRowH + (rows - 1) * this.mRowGap;
+    }
+
+    /// 自动换行模式下，宽度 `avail` 内能排下的行数。
+    int FlowRows(int avail) {
+        int n = this.children.Count;
+        if (n == 0) { return 0; }
+        int rows = 1;
+        int used = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int cwid = this.children[i].prefW;
+            if (cwid < 1) { cwid = avail; }
+            if (used > 0 && used + cwid > avail) {
+                rows = rows + 1;
+                used = 0;
+            }
+            used = used + cwid + this.mColGap;
+        }
+        return rows;
+    }
+
+    /// 解析行几何（列数 / 行距 / 列距 / 行高）。全部取自已解析的
+    /// 样式盒与子项尺寸，不需要 App，因此 Arrange 也能自己调（不
+    /// 依赖先跑过 OnMeasure）。
+    void ResolveMetrics() {
+        int n = this.children.Count;
+        this.mColGap = this.StyleColGap(this.gapX);
+        this.mRowGap = this.StyleRowGap(this.gapY);
+        // 控件上显式配置的列数优先；没配就听样式表的
+        // （皮肤的 `columns` / 原子类 `grid-cols-N`）。
+        this.mCols = this.columns;
+        if (this.mCols < 1) { this.mCols = this.StyleColumns(0); }
+        if (this.mCols < 0) { this.mCols = 0; }
+        if (this.mCols > n && n > 0) { this.mCols = n; }
+
+        // 行高：样式表的 line-height 优先（皮肤可整体调大行高），
+        // 其次是字段配置的行高，最后才是最高的选项。选项自身的
+        // 高度同样来自样式（checkbox 的 height），所以调大控件
+        // 高度只会拉开行距，不会让相邻行互相重叠。
+        int itemH = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int hh = this.children[i].prefH;
+            if (hh > itemH) { itemH = hh; }
+        }
+        int lineH = this.StyleLineHeight();
+        if (lineH < 1) { lineH = this.rowHeight; }
+        if (lineH > itemH) { itemH = lineH; }
+        this.mRowH = itemH;
     }
 
     override void OnMeasure(App app) {
-        int h = 0;
-        int w = 0;
-        for (int i = 0; i < this.children.Count; i = i + 1) {
-            int hh = this.children[i].prefH;
-            if (hh > h) { h = hh; }
-            if (i > 0) { w = w + this.gapX; }
-            w = w + this.children[i].prefW;
+        int n = this.children.Count;
+        this.ResolveMetrics();
+        if (this.mRowH < 1) { this.mRowH = app.Scale(26); }
+        int itemW = 0;
+        int sumW = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int ww = this.children[i].prefW;
+            if (ww > itemW) { itemW = ww; }
+            if (i > 0) { sumW = sumW + this.mColGap; }
+            sumW = sumW + ww;
         }
-        if (h == 0) { h = app.Scale(26); }
-        this.prefH = h;
-        this.prefW = w;
+
+        int rows = 0;
+        if (n > 0) {
+            if (this.mCols > 0) {
+                rows = (n + this.mCols - 1) / this.mCols;
+            } else {
+                // 自动换行：只有已经排布过一次才知道可用宽度。
+                int avail = this.InnerW(this.bw);
+                if (avail > 0) { rows = this.FlowRows(avail); }
+                else { rows = 1; }
+            }
+        }
+        this.mRows = rows;
+        this.prefH = this.RowsHeight(rows);
+        if (this.mCols > 0) {
+            this.prefW = this.StylePadL() + this.StylePadR()
+                       + this.mCols * itemW + (this.mCols - 1) * this.mColGap;
+        } else {
+            this.prefW = this.StylePadL() + this.StylePadR() + sumW;
+        }
     }
 
     override void Arrange(int px, int py, int pw, int ph) {
@@ -524,24 +689,65 @@ class ChoiceGroup : Panel {
         this.by = py;
         this.bw = pw;
         this.bh = ph;
-        int cx = px;
-        int cy = py;
-        int rowH = 0;
-        for (int i = 0; i < this.children.Count; i = i + 1) {
+        int n = this.children.Count;
+        if (n == 0) { this.aRows = 0; return; }
+        this.ResolveMetrics();
+        int cx0 = px + this.StylePadL();
+        int cy = py + this.StylePadT();
+        int avail = this.InnerW(pw);
+        int rowH = this.mRowH;
+        if (rowH < 1) { rowH = ph; }
+
+        if (this.mCols > 0) {
+            int cols = this.mCols;
+            int span = avail - this.mColGap * (cols - 1);
+            if (span < 0) { span = 0; }
+            int cell = span / cols;
+            int extra = span - cell * cols;
+            int rows = (n + cols - 1) / cols;
+            for (int i = 0; i < n; i = i + 1) {
+                int col = i % cols;
+                int row = i / cols;
+                // 余数摊给前几列，各列宽度最多相差 1px。
+                int x = cx0 + col * (cell + this.mColGap);
+                if (col < extra) { x = x + col; } else { x = x + extra; }
+                int w = cell;
+                if (col < extra) { w = w + 1; }
+                int y = cy + row * (rowH + this.mRowGap);
+                this.ArrangeItem(this.children[i], x, y, w, rowH);
+            }
+            this.aRows = rows;
+            return;
+        }
+
+        // 自动换行：按选项自身宽度流式排列，行高统一。
+        int cx = cx0;
+        int rows2 = 1;
+        int used = 0;
+        for (int i = 0; i < n; i = i + 1) {
             Control c = this.children[i];
             int cwid = c.prefW;
-            if (cwid < 1) { cwid = pw; }
-            int chh = c.prefH;
-            if (chh < 1) { chh = ph; }
-            if (cx > px && cx + cwid > px + pw) {
-                cx = px;
-                cy = cy + rowH + this.gapY;
-                rowH = 0;
+            if (cwid < 1) { cwid = avail; }
+            if (used > 0 && used + cwid > avail) {
+                cx = cx0;
+                cy = cy + rowH + this.mRowGap;
+                used = 0;
+                rows2 = rows2 + 1;
             }
-            c.Arrange(cx, cy, cwid, chh);
-            cx = cx + cwid + this.gapX;
-            if (chh > rowH) { rowH = chh; }
+            this.ArrangeItem(c, cx, cy, cwid, rowH);
+            cx = cx + cwid + this.mColGap;
+            used = used + cwid + this.mColGap;
         }
+        this.aRows = rows2;
+    }
+
+    /// 把一个选项放进行高为 `rowH` 的单元格里：选项按自身高度
+    /// 垂直居中，行高调大只会拉开行距，不会让相邻行互相压住。
+    void ArrangeItem(Control c, int x, int y, int w, int rowH) {
+        int hh = c.prefH;
+        if (hh < 1 || hh > rowH) { hh = rowH; }
+        int dy = (rowH - hh) / 2;
+        c.Arrange(x, y + dy, w, hh);
     }
 }
 
