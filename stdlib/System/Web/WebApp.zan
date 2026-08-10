@@ -66,6 +66,7 @@ class WebApp {
     int maxUploadBytes;    // streaming upload cap for .Upload() routes
     int requestTimeoutMs;  // per-request deadline: a connection that stops
                            // making progress is closed (slowloris)
+    int maxConnections;    // concurrent connections served at once (0 = no cap)
     string uploadDir;      // where streamed uploads land
     int uploadSeq;
     string loginPath;      // where a browser is sent when a page needs a session
@@ -92,6 +93,7 @@ class WebApp {
         this.maxBodyBytes = 2 * 1024 * 1024;      // 2MB default
         this.maxUploadBytes = 512 * 1024 * 1024;  // 512MB streamed-upload default
         this.requestTimeoutMs = 30000;
+        this.maxConnections = 10000;
         this.uploadDir = "uploads";
         this.uploadSeq = 0;
         this.loginPath = "";
@@ -115,6 +117,12 @@ class WebApp {
     /// the connection is closed. Applies per request, not per connection, so a
     /// keep-alive client that keeps sending is never cut off.</summary>
     WebApp Timeout(int ms) { this.requestTimeoutMs = ms; return this; }
+    /// <summary>How many connections may be served at once. Past the cap a
+    /// connection is answered 503 and closed instead of being queued: every
+    /// live connection owns a coroutine and a 64KB buffer, and an unbounded
+    /// number of them is how a server dies rather than sheds load. 0 removes
+    /// the cap.</summary>
+    WebApp MaxConnections(int n) { this.maxConnections = n; return this; }
     WebApp UploadDir(string dir) { this.uploadDir = dir; return this; }
     WebApp GlobalLimit(int perSecond) { this.globalLimit = perSecond; return this; }
     /// <summary>The sign-in page a navigation is sent to when the route needs a
@@ -209,6 +217,7 @@ class WebApp {
         while (this.running) {
             nint clientSock = await this.listener.AcceptAsync();
             if (clientSock >= 0) {
+                if (await this.RefuseOverCapacity(clientSock)) { continue; }
                 this.activeConnections = this.activeConnections + 1;
                 Task.Spawn(HandleConnection(clientSock));
             }
@@ -235,8 +244,22 @@ class WebApp {
     static async void ServeSock(nint clientSock) {
         WebApp app = active;
         if (app == null) { Socket.Close(clientSock); return; }
+        if (await app.RefuseOverCapacity(clientSock)) { return; }
         app.activeConnections = app.activeConnections + 1;
         await app.HandleConnection(clientSock);
+    }
+
+    /// <summary>Sheds a connection the server has no capacity for: 503 and
+    /// close, rather than a coroutine and a buffer it cannot afford. True when
+    /// the connection was refused and is already closed.</summary>
+    async bool RefuseOverCapacity(nint clientSock) {
+        if (this.maxConnections <= 0) { return false; }
+        if (this.activeConnections < this.maxConnections) { return false; }
+        TcpClient c = TcpClient.FromSocket(clientSock);
+        int _s = await c.SendAsync(WebApp.SimpleResponse(503,
+            "Service Unavailable", "server is at capacity"));
+        c.Close();
+        return true;
     }
 
     async void HandleConnection(nint clientSock) {
