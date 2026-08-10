@@ -5,6 +5,52 @@
  * irgen_expr.c; not compiled standalone.
  */
 
+/* Detach an async call nobody awaits: `sub` is the frame its ramp returned.
+ * Install the reaper as the frame's own awaiter step (awaiter = the frame
+ * itself, a non-null marker) so emit_async_complete's awaiter-wake path
+ * re-enqueues (frame, __zan_co_reap) and the driver frees the frame once the
+ * body finishes; then schedule the frame and track it, so the driver can tell
+ * a live frame from a reaped one before Task.Cancel writes through it.
+ *
+ * `keep_result` skips the reaper for a frame whose result is still to be read
+ * (Task.Run of a value-returning method): Result/Wait reaps it instead.
+ *
+ * Returns the frame as i8*, or NULL when `sub` is not an async ramp result --
+ * the caller then lowers the expression as an ordinary call. Shared by
+ * Task.Spawn/Task.Run and by a discarded async call statement, which is a
+ * spawn in every respect (see AST_EXPR_STMT in irgen_stmt.c). */
+static LLVMValueRef emit_detach_async_call(zan_irgen_t *g, LLVMValueRef sub,
+                                           bool keep_result) {
+    if (!sub || LLVMGetTypeKind(LLVMTypeOf(sub)) != LLVMPointerTypeKind ||
+        !LLVMIsACallInst(sub))
+        return NULL;
+    LLVMValueRef callee = LLVMGetCalledValue(sub);
+    if (!callee) return NULL;
+    size_t nl = 0;
+    const char *cn = LLVMGetValueName2(callee, &nl);
+    if (!cn || nl == 0 || nl >= 240) return NULL;
+    char rn[256];
+    memcpy(rn, cn, nl);
+    memcpy(rn + nl, "$resume", 8); /* includes NUL */
+    LLVMValueRef sub_resume = LLVMGetNamedFunction(g->mod, rn);
+    if (!sub_resume) return NULL;
+
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef sub_i8 = LLVMBuildBitCast(g->builder, sub, i8ptr, "spawn.sub");
+    if (!keep_result) {
+        LLVMTypeRef hdr = g->co_header_type;
+        LLVMBuildStore(g->builder, sub_i8,
+            LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER, "spawn.aw"));
+        LLVMBuildStore(g->builder, get_co_reap_fn(g),
+            LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER_STEP, "spawn.aws"));
+    }
+    LLVMValueRef sched_args[] = { sub_i8, sub_resume };
+    zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
+    LLVMValueRef track = get_co_track_fn(g);
+    zan_call2(g->builder, LLVMGlobalGetValueType(track), track, &sub_i8, 1, "");
+    return sub_i8;
+}
+
 /* True when the identifier names a field of the class being compiled -- an
  * instance field (it reads as `this.<name>`) or a static one. Such a field
  * shadows a type of the same name wherever a receiver is resolved. Statics
@@ -439,55 +485,18 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 return LLVMConstInt(sp_i64, 0, 0);
             }
             LLVMValueRef sub = emit_expr(g, sub_arg, locals);
-            LLVMValueRef sub_resume = NULL;
-            if (LLVMIsACallInst(sub)) {
-                LLVMValueRef callee = LLVMGetCalledValue(sub);
-                if (callee) {
-                    size_t nl = 0;
-                    const char *cn = LLVMGetValueName2(callee, &nl);
-                    if (cn && nl > 0 && nl < 240) {
-                        char rn[256];
-                        memcpy(rn, cn, nl);
-                        memcpy(rn + nl, "$resume", 8); /* includes NUL */
-                        sub_resume = LLVMGetNamedFunction(g->mod, rn);
-                    }
-                }
-            }
-            if (sub_resume && LLVMGetTypeKind(LLVMTypeOf(sub)) == LLVMPointerTypeKind) {
-                LLVMValueRef sub_i8 = LLVMBuildBitCast(g->builder, sub, sp_i8ptr, "spawn.sub");
-                /* A spawned coroutine is detached: no caller awaits it, so
-                 * nobody frees its heap frame when it completes. Install the
-                 * reaper as its own awaiter step (awaiter = the frame itself, a
-                 * non-null marker) so emit_async_complete's awaiter-wake path
-                 * re-enqueues (frame, __zan_co_reap) and the driver frees the
-                 * frame after the body finishes. A result-carrying Task.Run
-                 * skips the reaper: the frame must stay alive (tracked, DONE
-                 * set at completion) until Result/Wait reads it and reaps. */
-                bool keep_result = is_call_to(expr, "Task", "Run") &&
-                    !is_call_to(expr, "Task", "Spawn") &&
-                    sub_ty && sub_ty->kind != TYPE_VOID;
-                if (!keep_result) {
-                    LLVMTypeRef hdr = g->co_header_type;
-                    LLVMBuildStore(g->builder, sub_i8,
-                        LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER, "spawn.aw"));
-                    LLVMBuildStore(g->builder, get_co_reap_fn(g),
-                        LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER_STEP, "spawn.aws"));
-                }
-                LLVMValueRef sched_args[] = { sub_i8, sub_resume };
-                zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
-                /* the handle Spawn hands back outlives the coroutine, so the
-                 * driver has to be able to tell a live frame from a reaped one
-                 * before Task.Cancel writes through it */
-                LLVMValueRef track = get_co_track_fn(g);
-                zan_call2(g->builder, LLVMGlobalGetValueType(track), track,
-                          &sub_i8, 1, "");
-                emit_release_owned_call_temp(g, sub_arg, sub, locals);
-                /* Task.Spawn yields the task handle, so the program can later
-                 * cancel the detached coroutine (Task.Cancel). Discarding it
-                 * stays fire-and-forget. */
-                return LLVMBuildPtrToInt(g->builder, sub_i8, sp_i64, "spawn.h");
-            }
+            /* A result-carrying Task.Run keeps its frame: it must stay alive
+             * (tracked, DONE set at completion) until Result/Wait reads the
+             * result and reaps it. */
+            bool keep_result = is_call_to(expr, "Task", "Run") &&
+                !is_call_to(expr, "Task", "Spawn") &&
+                sub_ty && sub_ty->kind != TYPE_VOID;
+            LLVMValueRef sub_i8 = emit_detach_async_call(g, sub, keep_result);
             emit_release_owned_call_temp(g, sub_arg, sub, locals);
+            /* Task.Spawn yields the task handle, so the program can later
+             * cancel the detached coroutine (Task.Cancel). Discarding it
+             * stays fire-and-forget. */
+            if (sub_i8) return LLVMBuildPtrToInt(g->builder, sub_i8, sp_i64, "spawn.h");
             return LLVMConstInt(sp_i64, 0, 0);
             }
         }

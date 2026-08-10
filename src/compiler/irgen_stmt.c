@@ -982,6 +982,14 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     case AST_EXPR_STMT: {
         zan_ast_node_t *e = stmt->expr_stmt.expr;
         LLVMValueRef ev = emit_expr(g, e, locals);
+        /* `Foo();` where Foo is async: the ramp allocated a heap frame and
+         * handed back its task handle, and the statement drops it. Nothing
+         * else ever schedules that frame, so the body never ran and the frame
+         * never reached a free -- the call was a silent no-op leaking one
+         * frame per execution. Detach it exactly as `Task.Spawn(Foo())` does:
+         * the body runs and the reaper frees the frame at completion. */
+        if (ev && e->kind == AST_CALL && emit_detach_async_call(g, ev, false))
+            break;
         /* A discarded expression statement whose value is a freshly owned (+1)
          * rc reference must release it, or it leaks. This covers fluent method
          * chains used as statements (e.g. `builder.Add(x);` where Add returns
