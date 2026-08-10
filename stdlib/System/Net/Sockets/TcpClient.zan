@@ -152,19 +152,52 @@ class TcpClient {
     /// 仅在该客户端下一次接收前有效。</summary>
     async string RecvReuseAsync() {
         if (this.recvBuf == null) {
-            // 把复用缓冲区分配为真正的 ARC 托管字符串（每条连接
-            // 只构建一次）。与原始 calloc 块不同，它带有
-            // 字符串引用计数头，因此 ARC 能在 Close() 时正确释放；原始
-            // 缓冲区会被手动释放，之后又可能被后续的
-            // str_release 再次读取，一旦堆回收了那 64KB 页面就会出错。
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < this.recvBufSize; i = i + 1) {
-                sb.Append(" ");
-            }
-            this.recvBuf = sb.ToString();
+            this.recvBuf = TcpClient.RentRecvBuffer(this.recvBufSize);
         }
         int _n = await Socket.RecvIntoAsync(this.sock, this.recvBuf, this.recvBufSize);
         return this.recvBuf;
+    }
+
+    // 复用缓冲区的进程级空闲池。缓冲区本身是 ARC 托管字符串
+    // （见 RentRecvBuffer），构建一个的代价是按字节填充 64KB
+    // ——每条连接付一次的话，短连接（Connection: close）负载下
+    // 它比处理请求本身还贵。连接关闭时把缓冲区还回池中，
+    // 下一条连接直接借用：稳定状态下既没有构建开销，
+    // 也没有 64KB 的分配/释放抖动。
+    static List<string> recvPool = new List<string>();
+    static int recvPoolSize = 65536;
+    static int recvPoolMax = 256;
+
+    /// <summary>借一个至少 <paramref name="size"/> 字节的接收缓冲区。
+    /// 只有默认大小的缓冲区进池：池里的每一项都是本方法按
+    /// recvPoolSize 构建的，所以借出的容量总是已知且足够。</summary>
+    static string RentRecvBuffer(int size) {
+        if (size == TcpClient.recvPoolSize) {
+            int n = TcpClient.recvPool.Count;
+            if (n > 0) {
+                string buf = TcpClient.recvPool[n - 1];
+                TcpClient.recvPool.RemoveAt(n - 1);
+                return buf;
+            }
+        }
+        // 把复用缓冲区分配为真正的 ARC 托管字符串。与原始 calloc
+        // 块不同，它带有字符串引用计数头，因此 ARC 能正确释放；
+        // 原始缓冲区会被手动释放，之后又可能被后续的
+        // str_release 再次读取，一旦堆回收了那 64KB 页面就会出错。
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < size; i = i + 1) {
+            sb.Append(" ");
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>把缓冲区还回池中。调用方在归还后不得再读取它
+    /// （RecvReuseAsync 的返回值本来就只在下一次接收前有效）。</summary>
+    static void ReturnRecvBuffer(string buf, int size) {
+        if (buf == null) { return; }
+        if (size != TcpClient.recvPoolSize) { return; }
+        if (TcpClient.recvPool.Count >= TcpClient.recvPoolMax) { return; }
+        TcpClient.recvPool.Add(buf);
     }
 
     /// <summary>同步发送数据。</summary>
@@ -184,9 +217,10 @@ class TcpClient {
             this.connected = false;
             this.sock = -1;
         }
-        // 释放每条连接的接收缓冲区。它是 ARC 托管的字符串，
-        // 清空该字段即释放最后一个引用，由运行时完成回收。
+        // 归还每条连接的接收缓冲区，供下一条连接复用；池满时
+        // 直接丢弃，清空该字段即释放最后一个引用（ARC 托管字符串）。
         if (this.recvBuf != null) {
+            TcpClient.ReturnRecvBuffer(this.recvBuf, this.recvBufSize);
             this.recvBuf = null;
         }
     }
