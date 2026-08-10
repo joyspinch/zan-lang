@@ -64,6 +64,8 @@ class WebApp {
 
     int maxBodyBytes;      // in-memory request body cap (413 above this)
     int maxUploadBytes;    // streaming upload cap for .Upload() routes
+    int requestTimeoutMs;  // per-request deadline: a connection that stops
+                           // making progress is closed (slowloris)
     string uploadDir;      // where streamed uploads land
     int uploadSeq;
     string loginPath;      // where a browser is sent when a page needs a session
@@ -89,6 +91,7 @@ class WebApp {
         this.metrics = ServerMetrics.Global();
         this.maxBodyBytes = 2 * 1024 * 1024;      // 2MB default
         this.maxUploadBytes = 512 * 1024 * 1024;  // 512MB streamed-upload default
+        this.requestTimeoutMs = 30000;
         this.uploadDir = "uploads";
         this.uploadSeq = 0;
         this.loginPath = "";
@@ -108,6 +111,10 @@ class WebApp {
     WebApp Views(string dir) { this.views = View.LoadDir(dir); return this; }
     WebApp MaxBody(int bytes) { this.maxBodyBytes = bytes; return this; }
     WebApp MaxUpload(int bytes) { this.maxUploadBytes = bytes; return this; }
+    /// <summary>How long one request may take to arrive and be served before
+    /// the connection is closed. Applies per request, not per connection, so a
+    /// keep-alive client that keeps sending is never cut off.</summary>
+    WebApp Timeout(int ms) { this.requestTimeoutMs = ms; return this; }
     WebApp UploadDir(string dir) { this.uploadDir = dir; return this; }
     WebApp GlobalLimit(int perSecond) { this.globalLimit = perSecond; return this; }
     /// <summary>The sign-in page a navigation is sent to when the route needs a
@@ -233,26 +240,62 @@ class WebApp {
     }
 
     async void HandleConnection(nint clientSock) {
+        Socket.SetNoDelay(clientSock);
         TcpClient client = TcpClient.FromSocket(clientSock);
         // Connection-owned receive buffer. Socket.RecvIntoAsync reports the
         // EXACT byte count received (Zan string length is strlen-based, so
         // binary payloads containing NUL bytes must be counted at the socket
         // level, never via .Length on the raw data).
         byte[] connBuf = WebApp.MakeBuffer(65536);
+        // Every request is given a deadline. Without one a client that opens a
+        // connection and dribbles header bytes (slowloris) holds a coroutine
+        // and its 64KB buffer indefinitely, and a few thousand such
+        // connections are all it takes to stop the worker serving anyone.
+        int watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
         bool keepAlive = true;
+        // Bytes read past the request being served. A client may send the next
+        // request in the same packet (pipelining) and a large body arrives
+        // over several: both are the same buffer, carried across iterations.
+        string carry = "";
         while (keepAlive) {
-            int firstN = await Socket.RecvIntoAsync(clientSock, connBuf, 65535);
-            if (firstN <= 0) { break; }
-            connBuf[firstN] = 0;
-            string rawData = connBuf;
-
-            // Guard: header block must stay under the receive buffer (64KB).
-            // Only scanned when the first recv actually filled the buffer.
-            if (firstN >= 65000 && WebApp.FindHeaderEnd(rawData) < 0) {
-                int _s = await client.SendAsync(WebApp.SimpleResponse(431,
-                    "Request Header Fields Too Large", "header block too large"));
-                break;
+            HttpDeadline.Touch(watch, this.requestTimeoutMs);
+            string rawData = carry;
+            int rawN = carry.Length;
+            carry = "";
+            // True while rawData still aliases connBuf: the next receive
+            // overwrites it, so it is copied out before one is issued.
+            bool aliased = false;
+            bool closed = false;
+            int headerEnd = WebApp.FindHeaderEnd(rawData);
+            while (headerEnd < 0) {
+                // The header block must stay under the receive buffer (64KB):
+                // a client that never sends the blank line is answered and
+                // dropped rather than buffered without limit.
+                if (rawN >= 65000) {
+                    int _s = await client.SendAsync(WebApp.SimpleResponse(431,
+                        "Request Header Fields Too Large",
+                        "header block too large"));
+                    closed = true;
+                    break;
+                }
+                if (aliased) {
+                    rawData = rawData.Substring(0, rawN);
+                    aliased = false;
+                }
+                int n = await Socket.RecvIntoAsync(clientSock, connBuf, 65535);
+                if (n <= 0) { closed = true; break; }
+                connBuf[n] = 0;
+                if (rawN == 0) {
+                    rawData = connBuf;
+                    rawN = n;
+                    aliased = true;
+                } else {
+                    rawData = rawData + connBuf;
+                    rawN = rawData.Length;
+                }
+                headerEnd = WebApp.FindHeaderEnd(rawData);
             }
+            if (closed) { break; }
 
             HttpRequest request = HttpRequest.Parse(rawData);
             // 定界失败（Content-Length 溢出/重复不一致、非数字、
@@ -281,8 +324,8 @@ class WebApp {
                         "Payload Too Large", "upload exceeds limit"));
                     break;
                 }
-                string tmp = await this.StreamBodyToFile(clientSock, connBuf,
-                    firstN, request);
+                string tmp = await this.StreamBodyToFile(clientSock, rawData,
+                    rawN, request);
                 if (tmp.Length == 0) {
                     int _s3 = await client.SendAsync(WebApp.SimpleResponse(400,
                         "Bad Request", "upload failed"));
@@ -297,6 +340,16 @@ class WebApp {
                     int _s4 = await client.SendAsync(WebApp.SimpleResponse(413,
                         "Payload Too Large", "body exceeds limit"));
                     break;
+                }
+                // Parse hands back everything after the header block, which on
+                // a pipelined connection is this body FOLLOWED BY the next
+                // request: the body is exactly Content-Length bytes and the
+                // rest belongs to the request after it.
+                if (request.body.Length > request.contentLength) {
+                    carry = request.body.Substring(request.contentLength);
+                    request.body = request.body.Substring(0,
+                        request.contentLength);
+                    HttpContext.ParseFormBody(request, ctx);
                 }
                 // The first recv may not contain the full body; keep reading
                 // until Content-Length is satisfied (bounded above).
@@ -331,9 +384,21 @@ class WebApp {
             // finished; there is nothing left to send and nothing to reuse.
             if (ctx.Hijacked()) { keepAlive = false; break; }
             int _sent = await client.SendAsync(responseData);
+            // A byte body is not part of the built string (it would be cut at
+            // its first NUL): it follows the header block, written by count.
+            if (ctx.IsBinary()) {
+                int blen = ctx.BodyLength();
+                if (blen > 0 && ctx.method != "HEAD") {
+                    int _sb = await client.SendBytesAsync(ctx.bodyBytes, blen);
+                }
+            }
             Worker.BumpSent();
             if (!keepAlive) { break; }
+            // A carried-over pipelined request must not alias connBuf: the
+            // next receive would rewrite it underneath.
+            if (carry.Length > 0) { carry = carry.Substring(0, carry.Length); }
         }
+        HttpDeadline.Disarm(watch);
         client.Close();
         this.activeConnections = this.activeConnections - 1;
     }
@@ -359,11 +424,14 @@ class WebApp {
         // Body bytes that arrived in the same packet as the headers: computed
         // from the socket byte count, NOT string length (binary-safe), and
         // copied out with an explicit-length Substring (byte-accurate memcpy).
+        // FindHeaderEnd already answers the index PAST the blank line, i.e.
+        // the first body byte; adding the terminator's length again skipped
+        // four bytes of every upload that arrived with its headers.
         int headerEnd = WebApp.FindHeaderEnd(firstBuf);
-        if (headerEnd >= 0 && firstN > headerEnd + 4) {
-            int bodyInFirst = firstN - headerEnd - 4;
+        if (headerEnd >= 0 && firstN > headerEnd) {
+            int bodyInFirst = firstN - headerEnd;
             if (bodyInFirst > total) { bodyInFirst = total; }
-            string firstChunk = firstBuf.Substring(headerEnd + 4, bodyInFirst);
+            string firstChunk = firstBuf.Substring(headerEnd, bodyInFirst);
             int _w0 = (int)fwrite(firstChunk, 1, bodyInFirst, fp);
             have = bodyInFirst;
         }

@@ -41,6 +41,12 @@ class HttpContext {
     string statusText;
     string contentType;
     string body;
+    // A body that is bytes rather than text. Zan string length is
+    // strlen-based, so an image, a font or any other payload containing a NUL
+    // byte cannot travel as `body`: it is carried here with an explicit length
+    // and written to the socket by byte count.
+    byte[] bodyBytes;
+    int bodyBytesLen;
     List<string> headers;
     bool ended;        // a hook or handler already produced the response
 
@@ -77,6 +83,8 @@ class HttpContext {
         this.statusText = "OK";
         this.contentType = "text/html; charset=utf-8";
         this.body = "";
+        this.bodyBytes = null;
+        this.bodyBytesLen = 0;
         this.headers = null;
         this.ended = false;
         this.conn = null;
@@ -190,15 +198,47 @@ class HttpContext {
         return this;
     }
 
+    /// <summary>A header name or value with CR, LF and NUL removed. Applied at
+    /// the sink rather than left to the caller: a value that reaches a header
+    /// is often a redirect target, a filename or a token read straight from the
+    /// request, and one CRLF in it ends the header block and lets the client
+    /// write the rest of the response (header injection / response
+    /// splitting).</summary>
+    static string HeaderSafe(string s) {
+        int n = s.Length;
+        int i = 0;
+        while (i < n) {
+            int c = s[i] & 255;
+            if (c == 13 || c == 10 || c == 0) { break; }
+            i = i + 1;
+        }
+        if (i == n) { return s; }
+        StringBuilder sb = new StringBuilder();
+        int flush = 0;
+        int k = 0;
+        while (k < n) {
+            int c = s[k] & 255;
+            if (c == 13 || c == 10 || c == 0) {
+                if (k > flush) { sb.Append(s.Substring(flush, k - flush)); }
+                flush = k + 1;
+            }
+            k = k + 1;
+        }
+        if (n > flush) { sb.Append(s.Substring(flush, n - flush)); }
+        return sb.ToString();
+    }
+
     HttpContext SetHeader(string name, string val) {
         if (this.headers == null) { this.headers = new List<string>(); }
-        this.headers.Add(name + ": " + val);
+        this.headers.Add(HttpContext.HeaderSafe(name) + ": "
+            + HttpContext.HeaderSafe(val));
         return this;
     }
 
     HttpContext SetCookie(string name, string val, int maxAgeSeconds) {
         if (this.headers == null) { this.headers = new List<string>(); }
-        this.headers.Add("Set-Cookie: " + name + "=" + val
+        this.headers.Add("Set-Cookie: " + HttpContext.HeaderSafe(name) + "="
+            + HttpContext.HeaderSafe(val)
             + "; Max-Age=" + Convert.ToString(maxAgeSeconds)
             + "; Path=/; HttpOnly; SameSite=Lax");
         return this;
@@ -214,6 +254,27 @@ class HttpContext {
         this.contentType = "text/plain; charset=utf-8";
         this.body = text;
         this.ended = true;
+    }
+
+    /// <summary>Answers with `len` raw bytes of `data`. The only way to serve
+    /// binary content correctly: a byte array plus its length, never a string
+    /// whose length stops at the first NUL.</summary>
+    void Binary(string mime, byte[] data, int len) {
+        this.contentType = mime;
+        this.bodyBytes = data;
+        this.bodyBytesLen = len;
+        this.body = "";
+        this.ended = true;
+    }
+
+    /// <summary>True when the response body is bytes: the server sends the
+    /// header block and then <c>bodyBytes</c> by count.</summary>
+    bool IsBinary() { return this.bodyBytes != null; }
+
+    /// <summary>Response body size in bytes, whichever form it takes.</summary>
+    int BodyLength() {
+        if (this.bodyBytes != null) { return this.bodyBytesLen; }
+        return this.body.Length;
     }
 
     void Json(string json) {
@@ -234,7 +295,8 @@ class HttpContext {
         }
         string name = safe.ToString();
         if (name.Length == 0) { name = "export.txt"; }
-        this.SetHeader("Content-Disposition", "attachment; filename=\"" + name + "\"");
+        this.SetHeader("Content-Disposition",
+            "attachment; filename=\"" + name + "\"");
         this.contentType = mime;
         this.body = body;
         this.ended = true;
@@ -258,7 +320,7 @@ class HttpContext {
         this.status = 302;
         this.statusText = "Found";
         if (this.headers == null) { this.headers = new List<string>(); }
-        this.headers.Add("Location: " + url);
+        this.headers.Add("Location: " + HttpContext.HeaderSafe(url));
         this.body = "";
         this.ended = true;
     }
@@ -356,7 +418,7 @@ class HttpContext {
         sb.Append("\r\nContent-Type: ");
         sb.Append(this.contentType);
         sb.Append("\r\nContent-Length: ");
-        sb.Append(HttpContext.Itoa(this.body.Length));
+        sb.Append(HttpContext.Itoa(this.BodyLength()));
         if (keepAlive) { sb.Append("\r\nConnection: keep-alive"); }
         else { sb.Append("\r\nConnection: close"); }
         sb.Append("\r\nServer: ZanWeb/0.1");
@@ -367,7 +429,9 @@ class HttpContext {
             sb.Append(this.headers[i]);
         }
         sb.Append("\r\n\r\n");
-        sb.Append(this.body);
+        // A byte body is NOT appended: it would be cut at its first NUL. The
+        // caller sends this header block and then the bytes by count.
+        if (this.bodyBytes == null) { sb.Append(this.body); }
         return sb.ToString();
     }
 

@@ -104,6 +104,11 @@ class HttpRequest {
         bool clSeen = false;
         long firstCl = 0;
         bool teSeen = false;
+        // Connection, as sent: HTTP/1.0 defaults to close and HTTP/1.1 to
+        // keep-alive, so the header is only an override and the version has
+        // to be read before the default is applied.
+        bool connClose = false;
+        bool connKeep = false;
         while (pos < len) {
             int hEnd = pos;
             while (hEnd < len && (raw[hEnd] & 255) != 10) {
@@ -181,7 +186,25 @@ class HttpRequest {
                     // 顺序无关，循环结束后统一裁决。
                     teSeen = true;
                 } else if (RegionIs(raw, pos, colonPos, "connection")) {
-                    req.keepAlive = !RegionIs(raw, vStart, lineStop, "close");
+                    // A comma separated list ("keep-alive, Upgrade"), matched
+                    // token by token: an exact compare against the whole value
+                    // missed "close" in every list and kept a connection the
+                    // client had asked to end.
+                    int t = vStart;
+                    while (t < lineStop) {
+                        int tEnd = t;
+                        while (tEnd < lineStop && (raw[tEnd] & 255) != 44) {
+                            tEnd = tEnd + 1;
+                        }
+                        int tStop = tEnd;
+                        while (tStop > t && (raw[tStop - 1] & 255) == 32) {
+                            tStop = tStop - 1;
+                        }
+                        if (RegionIs(raw, t, tStop, "close")) { connClose = true; }
+                        if (RegionIs(raw, t, tStop, "keep-alive")) { connKeep = true; }
+                        t = tEnd + 1;
+                        while (t < lineStop && (raw[t] & 255) == 32) { t = t + 1; }
+                    }
                 }
             }
             pos = hEnd + 1;
@@ -189,6 +212,14 @@ class HttpRequest {
         // Transfer-Encoding 与 Content-Length 的共存裁决
         //（RFC 7230 §3.3.3）：两者同时出现是走私特征 → 400；
         // 只有 TE（chunked，未实现）→ 501。
+        // HTTP/1.0 has no persistent connection unless the client asks for
+        // one; answering keep-alive to a 1.0 client that did not leaves it
+        // waiting for a close that never comes.
+        if (RegionIs(req.version, 0, req.version.Length, "http/1.0")) {
+            req.keepAlive = connKeep;
+        } else {
+            req.keepAlive = !connClose;
+        }
         if (teSeen && req.parseStatus == 0) {
             req.parseStatus = clSeen ? 400 : 501;
         }
@@ -247,7 +278,8 @@ class HttpRequest {
         return "";
     }
 
-    /// <summary>按名称获取查询参数值。</summary>
+    /// <summary>按名称获取查询参数值（值已 url 解码，与
+    /// <see cref="GetFormField"/> 一致）。</summary>
     string GetQueryParam(string name) {
         if (this.queryString.Length == 0) { return ""; }
         int pos = 0;
@@ -267,7 +299,8 @@ class HttpRequest {
                 while (valEnd < len && (qs[valEnd] & 255) != 38) { // '&'
                     valEnd = valEnd + 1;
                 }
-                paramValue = qs.Substring(eqPos + 1, valEnd - eqPos - 1);
+                paramValue = Encoding.UrlDecode(
+                    qs.Substring(eqPos + 1, valEnd - eqPos - 1));
                 pos = valEnd + 1;
             } else {
                 pos = eqPos + 1;

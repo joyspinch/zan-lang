@@ -30,8 +30,14 @@ class StaticFiles {
     static string prefix = "";
     static string root = "";
     static int maxAge = 86400;
-    static StrMap bodies = null;
-    static StrMap types = null;
+    // Per-worker asset cache, parallel by index: an asset is read once and
+    // then served straight from these. Bodies are byte arrays with an explicit
+    // length -- a string body would end at the first NUL, which is how a PNG
+    // or a woff2 arrives truncated.
+    static List<string> paths = null;
+    static List<byte[]> blobs = null;
+    static List<int> sizes = null;
+    static List<string> types = null;
 
     /// <summary>Mounts `dir` under `urlPrefix` and registers the hook on the
     /// app. `urlPrefix` is matched literally ("/static" answers
@@ -40,8 +46,10 @@ class StaticFiles {
     static void Mount(WebApp app, string urlPrefix, string dir) {
         StaticFiles.prefix = urlPrefix;
         StaticFiles.root = dir;
-        StaticFiles.bodies = new StrMap();
-        StaticFiles.types = new StrMap();
+        StaticFiles.paths = new List<string>();
+        StaticFiles.blobs = new List<byte[]>();
+        StaticFiles.sizes = new List<int>();
+        StaticFiles.types = new List<string>();
         app.Before(StaticFiles.Serve);
     }
 
@@ -63,26 +71,42 @@ class StaticFiles {
             ctx.Status(404, "Not Found").Text("not found");
             return false;
         }
-        string body = StaticFiles.bodies.Get(rel);
-        string ctype = StaticFiles.types.Get(rel);
-        if (body.Length == 0) {
+        int hit = StaticFiles.Cached(rel);
+        if (hit < 0) {
             string full = StaticFiles.root + "/" + rel;
             if (!File.Exists(full)) {
                 ctx.Status(404, "Not Found").Text("not found");
                 return false;
             }
-            body = File.ReadAllText(full);
-            ctype = StaticFiles.ContentType(rel);
-            StaticFiles.bodies.Set(rel, body);
-            StaticFiles.types.Set(rel, ctype);
+            int size = File.GetSize(full);
+            if (size < 0) {
+                ctx.Status(404, "Not Found").Text("not found");
+                return false;
+            }
+            StaticFiles.paths.Add(rel);
+            StaticFiles.blobs.Add(File.ReadAllBytes(full));
+            StaticFiles.sizes.Add(size);
+            StaticFiles.types.Add(StaticFiles.ContentType(rel));
+            hit = StaticFiles.paths.Count - 1;
         }
         ctx.SetHeader("Cache-Control", "public, max-age="
             + Convert.ToString(StaticFiles.maxAge));
-        ctx.contentType = ctype;
-        ctx.body = body;
-        if (ctx.method == "HEAD") { ctx.body = ""; }
-        ctx.ended = true;
+        // HEAD answers the same headers, Content-Length included, with the
+        // body suppressed by the server rather than by a shortened length.
+        ctx.Binary(StaticFiles.types[hit], StaticFiles.blobs[hit],
+            StaticFiles.sizes[hit]);
         return false;
+    }
+
+    /// <summary>Index of an already-read asset, or -1. The table holds one
+    /// entry per file served since start-up, so the scan is over a handful of
+    /// deployed assets, not over anything a request can grow.</summary>
+    static int Cached(string rel) {
+        if (StaticFiles.paths == null) { return -1; }
+        for (int i = 0; i < StaticFiles.paths.Count; i = i + 1) {
+            if (StaticFiles.paths[i] == rel) { return i; }
+        }
+        return -1;
     }
 
     /// <summary>The path below the mount point, or null when the request is not

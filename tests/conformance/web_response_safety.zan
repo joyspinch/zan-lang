@@ -1,0 +1,99 @@
+// Conformance: what the server puts ON THE WIRE cannot be steered by the
+// request. Three properties, each of which was once wrong:
+//   1. persistence follows the protocol version and the Connection token list,
+//      not an exact compare against the whole header value;
+//   2. a value that reaches a response header (redirect target, cookie,
+//      filename) cannot carry CR/LF and open a second response;
+//   3. a byte body is measured and written by length, so content with NUL
+//      bytes (images, fonts) is neither truncated nor mis-counted.
+using System;
+using System.Net.Http;
+using System.Web;
+
+class Program {
+    static string Req(string version, string connection) {
+        string raw = "GET /p?q=a%20b&n=%2B1 " + version + "\r\nHost: t\r\n";
+        if (connection.Length > 0) {
+            raw = raw + "Connection: " + connection + "\r\n";
+        }
+        return raw + "\r\n";
+    }
+
+    static void ShowKeepAlive(string version, string connection) {
+        HttpRequest r = HttpRequest.Parse(Program.Req(version, connection));
+        string label = version;
+        if (connection.Length > 0) { label = label + " [" + connection + "]"; }
+        Console.WriteLine(label + " -> keepAlive="
+            + Convert.ToString(r.keepAlive));
+    }
+
+    static HttpContext Ctx() {
+        HttpRequest r = HttpRequest.Parse(Program.Req("HTTP/1.1", ""));
+        return new HttpContext(r, "127.0.0.1");
+    }
+
+    static void Main() {
+        // 1. Persistence.
+        Program.ShowKeepAlive("HTTP/1.1", "");
+        Program.ShowKeepAlive("HTTP/1.1", "close");
+        Program.ShowKeepAlive("HTTP/1.1", "keep-alive, Upgrade");
+        Program.ShowKeepAlive("HTTP/1.1", "keep-alive, close");
+        Program.ShowKeepAlive("HTTP/1.0", "");
+        Program.ShowKeepAlive("HTTP/1.0", "keep-alive");
+
+        // Query values arrive decoded, the same as form fields.
+        HttpRequest q = HttpRequest.Parse(Program.Req("HTTP/1.1", ""));
+        Console.WriteLine("query q=[" + q.GetQueryParam("q") + "] n=["
+            + q.GetQueryParam("n") + "]");
+
+        // 2. Header injection: every sink strips CR/LF.
+        HttpContext ctx = Program.Ctx();
+        ctx.SetHeader("X-Trace", "abc\r\nX-Injected: 1");
+        ctx.SetCookie("sid", "v\r\nSet-Cookie: admin=1", 60);
+        ctx.Text("hi");
+        string resp = ctx.BuildResponse(true);
+        // The text survives as part of the value; what must NOT exist is a
+        // new header line, i.e. the name at the start of one.
+        Console.WriteLine("injected header line: "
+            + Convert.ToString(resp.IndexOf("\r\nX-Injected") >= 0));
+        Console.WriteLine("injected cookie line: "
+            + Convert.ToString(resp.IndexOf("\r\nSet-Cookie: admin=1") >= 0));
+        Console.WriteLine("header lines: "
+            + Convert.ToString(Program.CountLines(resp)));
+
+        HttpContext red = Program.Ctx();
+        red.Redirect("/next\r\nX-Injected: 1");
+        string rresp = red.BuildResponse(false);
+        Console.WriteLine("redirect injected line: "
+            + Convert.ToString(rresp.IndexOf("\r\nX-Injected") >= 0));
+
+        // 3. A byte body is counted, and left out of the header block: the
+        // server writes it by length after the headers.
+        HttpContext bin = Program.Ctx();
+        byte[] data = new byte[6];
+        data[0] = 137;
+        data[1] = 80;
+        data[2] = 0;      // the NUL a string body would stop at
+        data[3] = 78;
+        data[4] = 0;
+        data[5] = 71;
+        bin.Binary("image/png", data, 6);
+        string bresp = bin.BuildResponse(true);
+        Console.WriteLine("binary length=" + Convert.ToString(bin.BodyLength())
+            + " isBinary=" + Convert.ToString(bin.IsBinary()));
+        Console.WriteLine("content-length header: "
+            + Convert.ToString(bresp.IndexOf("Content-Length: 6") >= 0));
+        Console.WriteLine("headers only: "
+            + Convert.ToString(bresp.Length == bresp.IndexOf("\r\n\r\n") + 4));
+    }
+
+    /// Response lines, so an injected CRLF would show up as extra ones even if
+    /// the header name changed.
+    static int CountLines(string s) {
+        int n = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            if ((s[i] & 255) == 10) { n = n + 1; }
+        }
+        return n;
+    }
+}
