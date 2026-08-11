@@ -89,7 +89,13 @@ class SqlAgg {
 /// entry with its own count / average / maximum, instead of a flat list of
 /// individual samples dominated by long-lived connections.</summary>
 class ReqAgg {
-    string req;      // "METHOD /normalized/path"
+    // The two fields an interface is named by, kept apart on purpose: the
+    // verb and the endpoint are separate columns everywhere they are shown or
+    // stored, and re-splitting one joined string to get them back is how a
+    // path containing a space becomes a wrong row.
+    string method;   // "GET"
+    string path;     // route pattern ("/user/{id}") or asset path
+    string req;      // "METHOD path", the joined form the JSON has always used
     long count;      // times served
     long totalMs;    // summed elapsed ms
     long maxMs;      // slowest single hit
@@ -97,8 +103,10 @@ class ReqAgg {
     long failed;     // 4xx and 5xx: everything the caller did not get served
     long rejected;   // 429: refused by a rate limit, not by the handler
 
-    ReqAgg(string req) {
-        this.req = req;
+    ReqAgg(string method, string path) {
+        this.method = method;
+        this.path = path;
+        this.req = method + " " + path;
         this.count = 0;
         this.totalMs = 0;
         this.maxMs = 0;
@@ -113,6 +121,14 @@ class ReqAgg {
 // the compiler's generator bootstrap path (pulled in through System.IO), so it
 // must not call Json.Serialize<T> -- the keys still match the documented
 // /admin/stats shape exactly.
+
+// One instance is shared by every request in the process, and requests run on
+// per-worker threads (--async-workers), so every counter, ring and aggregate
+// list is touched under `lock (this)`: List.Add from two workers at once, or a
+// reader walking `reqAgg` while a writer appends to it, corrupts the list. The
+// expensive pure work (NormalizePath, NormalizeSql) and every IO (the error
+// sink and the log file) stay OUTSIDE the lock, so the critical section is only
+// counter arithmetic and list bookkeeping -- and it never contains an await.
 
 class ServerMetrics {
     #if WINDOWS
@@ -146,6 +162,8 @@ class ServerMetrics {
     int reqFailed;    // 4xx + 5xx
     int reqRejected;  // 429: a refusal is not a success, and hiding it makes a
                       // throttled server look idle
+    int reqUnmatched; // requests no route and no asset claimed (404/405, path
+                      // scans): counted, never keyed by the URL they asked for
     long reqTotalMs;
     long reqMaxMs;
     int slowReqMs;                 // slow-request threshold (ms)
@@ -161,6 +179,11 @@ class ServerMetrics {
     int sqlAggCap;                 // distinct statement shapes kept
     List<ReqAgg> reqAgg;           // per-endpoint request leaderboard
     int reqAggCap;                 // distinct endpoints kept
+    // The same rows again, indexed by Route.idx, so a routed request finds its
+    // aggregate with one array read instead of a scan-and-compare over every
+    // endpoint. Sized by the route table (fixed at start-up), so traffic never
+    // grows it; entries are the very same objects as in reqAgg.
+    List<ReqAgg> routeSlots;
 
     // ---- error log ----
     List<ErrEntry> errors;         // most-recent-first ring for the backend view
@@ -213,6 +236,7 @@ class ServerMetrics {
         this.reqErrors = 0;
         this.reqFailed = 0;
         this.reqRejected = 0;
+        this.reqUnmatched = 0;
         this.reqTotalMs = 0;
         this.reqMaxMs = 0;
         this.slowReqMs = 500;
@@ -226,6 +250,7 @@ class ServerMetrics {
         this.sqlAggCap = 200;
         this.reqAgg = new List<ReqAgg>();
         this.reqAggCap = 200;
+        this.routeSlots = new List<ReqAgg>();
         this.errors = new List<ErrEntry>();
         this.errCap = 100;
         this.errTotal = 0;
@@ -261,24 +286,32 @@ class ServerMetrics {
     /// <summary>A request started. Paired with Left() in the dispatcher, so the
     /// counter is exact rather than sampled.</summary>
     void Entered() {
-        this.concurrent = this.concurrent + 1;
-        if (this.concurrent > this.concurrentPeak) {
-            this.concurrentPeak = this.concurrent;
+        lock (this) {
+            this.concurrent = this.concurrent + 1;
+            if (this.concurrent > this.concurrentPeak) {
+                this.concurrentPeak = this.concurrent;
+            }
         }
     }
 
     void Left() {
-        if (this.concurrent > 0) { this.concurrent = this.concurrent - 1; }
+        lock (this) {
+            if (this.concurrent > 0) { this.concurrent = this.concurrent - 1; }
+        }
     }
 
     /// <summary>A long-lived connection opened / closed, and what it pushed
     /// while it was open. Frames and bytes, never a duration.</summary>
-    void StreamOpened() { this.streams = this.streams + 1; }
+    void StreamOpened() {
+        lock (this) { this.streams = this.streams + 1; }
+    }
 
     void StreamClosed(long frames, long bytes) {
-        if (this.streams > 0) { this.streams = this.streams - 1; }
-        this.streamFrames = this.streamFrames + frames;
-        this.streamBytes = this.streamBytes + bytes;
+        lock (this) {
+            if (this.streams > 0) { this.streams = this.streams - 1; }
+            this.streamFrames = this.streamFrames + frames;
+            this.streamBytes = this.streamBytes + bytes;
+        }
     }
 
     // Latency histogram edges in ms. Fixed buckets are what make a percentile
@@ -310,10 +343,13 @@ class ServerMetrics {
     }
 
     /// <summary>The bucket for `sec`, cleared and CPU/RSS-sampled if this is the
-    /// first write to it. Sampling here (rather than on a timer) keeps the
+    /// first write to it. Locked like every other bucket access: two workers
+    /// recording in the same second must not both clear the slot.
+    /// Sampling here (rather than on a timer) keeps the
     /// series free of a background coroutine: a second with no traffic has
     /// nothing worth plotting anyway, and SeriesJson fills those gaps.</summary>
     int SeriesSlot(long sec) {
+        lock (this) {
         int idx = (int)(sec % (long)this.seriesCap);
         if (this.sSec[idx] == sec) { return idx; }
         this.sSec[idx] = sec;
@@ -341,14 +377,18 @@ class ServerMetrics {
             this.seriesLastCpu = cpuMs;
         }
         return idx;
+        }
     }
 
     // ---- shared singleton ----
     static ServerMetrics inst;
     // Reusable timeval buffer for MonoMillis: allocated once, never freed, so
     // the per-request hot path costs a single vDSO gettimeofday with zero heap
-    // churn. Safe to share: coroutines yield only at `await`, and MonoMillis
-    // never awaits, so two calls can never interleave mid-read.
+    // churn. Only the POSIX branch uses it, and POSIX still drives every
+    // coroutine from one thread -- MonoMillis never awaits, so two calls on
+    // that thread cannot interleave mid-read. The multi-worker path (Windows
+    // --async-workers) takes the GetTickCount64 branch and touches no buffer;
+    // giving POSIX real worker threads means this buffer has to go per-thread.
     static byte[] monoBuf;
     static ServerMetrics Global() {
         if (inst == null) { inst = new ServerMetrics(); }
@@ -401,10 +441,14 @@ class ServerMetrics {
     /// from the caller so this class needs no clock of its own. The detail must
     /// already be redacted by the caller -- no keys/tokens/passwords.</summary>
     void RecordError(long ts, string origin, string detail) {
-        this.errTotal = this.errTotal + 1;
+        lock (this) {
+            this.errTotal = this.errTotal + 1;
+            this.errors.Add(new ErrEntry(ts, origin, detail));
+            while (this.errors.Count > this.errCap) { this.errors.RemoveAt(0); }
+        }
+        // The sink and the file are outside the lock: a database write or an
+        // fopen must not hold the monitor that every request path takes.
         if (this.errSink != null) { this.errSink(ts, origin, detail); }
-        this.errors.Add(new ErrEntry(ts, origin, detail));
-        while (this.errors.Count > this.errCap) { this.errors.RemoveAt(0); }
         this.AppendErrLine("[" + DateTime.FromUnixSeconds(ts).ToString() + "] "
             + origin + " | " + detail + "\n");
         if (this.errDebug) {
@@ -421,14 +465,16 @@ class ServerMetrics {
     /// <summary>Recent errors, most-recent first, for a backend log screen.</summary>
     List<ServerErrorDoc> RecentErrors(int limit) {
         List<ServerErrorDoc> outp = new List<ServerErrorDoc>();
-        int n = this.errors.Count;
-        for (int i = n - 1; i >= 0 && outp.Count < limit; i = i - 1) {
-            ErrEntry e = this.errors[i];
-            ServerErrorDoc d = new ServerErrorDoc();
-            d.ts = e.ts;
-            d.origin = e.origin;
-            d.detail = e.detail;
-            outp.Add(d);
+        lock (this) {
+            int n = this.errors.Count;
+            for (int i = n - 1; i >= 0 && outp.Count < limit; i = i - 1) {
+                ErrEntry e = this.errors[i];
+                ServerErrorDoc d = new ServerErrorDoc();
+                d.ts = e.ts;
+                d.origin = e.origin;
+                d.detail = e.detail;
+                outp.Add(d);
+            }
         }
         return outp;
     }
@@ -540,8 +586,66 @@ class ServerMetrics {
 
     // ---- recording ----
 
-    /// <summary>Records one completed HTTP request.</summary>
+    /// <summary>Records one completed request that the server actually served,
+    /// keyed by what served it: `pattern` is a route's registration pattern
+    /// ("/user/{id}") or a mounted asset's path ("/static/js/app.js") -- a
+    /// fixed string the server chose, never the URL the caller typed, so the
+    /// leaderboard has one row per interface and none per probe.
+    ///
+    /// `slot` is the route's index (Route.idx), which makes the per-endpoint
+    /// aggregate an array read rather than a scan over every endpoint; -1 for
+    /// anything that has no route index (an asset) and is looked up by name
+    /// over the handful of such rows.</summary>
+    void RecordRoute(int slot, string method, string pattern, int status, long ms) {
+        lock (this) {
+        this.CountRequest(status, ms);
+        this.FoldEndpoint(slot, method, pattern, ms, status);
+        if (ms >= this.slowReqMs) {
+            this.slowReqs.Add(new SlowEntry(method + " " + pattern + " -> "
+                + Convert.ToString(status), ms));
+            if (this.slowReqs.Count > this.ringCap) {
+                this.slowReqs.RemoveAt(0);
+            }
+        }
+        }
+    }
+
+    /// <summary>A request nothing claimed: a 404, a 405, a vulnerability scan.
+    /// It counts in the totals and the series -- a server being probed is not
+    /// an idle server -- but it gets no row of its own, because the only name
+    /// it has is the one the caller invented.</summary>
+    void RecordUnmatched(int status, long ms) {
+        lock (this) {
+        this.reqUnmatched = this.reqUnmatched + 1;
+        this.CountRequest(status, ms);
+        }
+    }
+
+    /// <summary>Records one completed HTTP request by raw path, folding numeric
+    /// segments to :id. For a caller outside the dispatcher (a proxy or a hand
+    /// written server) that has no route to name: the served path is the only
+    /// key available. The dispatcher itself uses RecordRoute, which needs no
+    /// normalization at all.</summary>
     void RecordRequest(string method, string path, int status, long ms) {
+        // NormalizePath is pure and allocates; keep it out of the critical
+        // section so the lock only spans the counter updates.
+        string folded = ServerMetrics.FoldPath(path);
+        lock (this) {
+        this.CountRequest(status, ms);
+        this.FoldEndpoint(0 - 1, method, folded, ms, status);
+        if (ms >= this.slowReqMs) {
+            this.slowReqs.Add(new SlowEntry(method + " " + path + " -> " + Convert.ToString(status), ms));
+            if (this.slowReqs.Count > this.ringCap) {
+                this.slowReqs.RemoveAt(0);
+            }
+        }
+        }
+    }
+
+    /// <summary>The counters and the chart series every request feeds,
+    /// whatever served it -- no strings, no lookups. Callers hold the
+    /// lock.</summary>
+    void CountRequest(int status, long ms) {
         this.reqCount = this.reqCount + 1;
         this.reqTotalMs = this.reqTotalMs + ms;
         if (ms > this.reqMaxMs) { this.reqMaxMs = ms; }
@@ -556,30 +660,36 @@ class ServerMetrics {
         if (status >= 500) { this.sErr[idx] = this.sErr[idx] + 1; }
         int hb = idx * ServerMetrics.HIST_BINS + ServerMetrics.HistBin(ms);
         this.sHist[hb] = this.sHist[hb] + 1;
-
-        // Aggregate by endpoint ("METHOD /path" with ids folded) so the monitor
-        // ranks interfaces by cost instead of listing raw samples.
-        this.RecordReqAgg(ServerMetrics.NormalizePath(method, path), ms, status);
-
-        if (ms >= this.slowReqMs) {
-            this.slowReqs.Add(new SlowEntry(method + " " + path + " -> " + Convert.ToString(status), ms));
-            if (this.slowReqs.Count > this.ringCap) {
-                this.slowReqs.RemoveAt(0);
-            }
-        }
     }
 
-    /// <summary>Folds one request into the per-endpoint aggregate that backs the
-    /// request leaderboard. Bounded to `reqAggCap` distinct endpoints.</summary>
-    void RecordReqAgg(string key, long ms, int status) {
+    /// <summary>Folds one hit into the aggregate row for its endpoint, created
+    /// on the first hit. A route (`slot` >= 0) has a direct slot in a table
+    /// sized by the route table itself, so a request costs one array read and
+    /// no string comparison; anything without a route index (a mounted asset, a
+    /// caller with only a raw path) is found by name and bounded to
+    /// `reqAggCap` rows, past which a never-seen endpoint is left out of the
+    /// leaderboard rather than growing the process -- it still counts in the
+    /// totals. Callers hold the lock.</summary>
+    void FoldEndpoint(int slot, string method, string path, long ms, int status) {
         ReqAgg a = null;
-        for (int k = 0; k < this.reqAgg.Count; k = k + 1) {
-            if (this.reqAgg[k].req == key) { a = this.reqAgg[k]; break; }
-        }
-        if (a == null) {
-            if (this.reqAgg.Count >= this.reqAggCap) { return; }
-            a = new ReqAgg(key);
-            this.reqAgg.Add(a);
+        if (slot >= 0) {
+            while (this.routeSlots.Count <= slot) { this.routeSlots.Add(null); }
+            a = this.routeSlots[slot];
+            if (a == null) {
+                a = new ReqAgg(method, path);
+                this.routeSlots[slot] = a;
+                this.reqAgg.Add(a);
+            }
+        } else {
+            for (int k = 0; k < this.reqAgg.Count; k = k + 1) {
+                ReqAgg r = this.reqAgg[k];
+                if (r.method == method && r.path == path) { a = r; break; }
+            }
+            if (a == null) {
+                if (this.reqAgg.Count >= this.reqAggCap) { return; }
+                a = new ReqAgg(method, path);
+                this.reqAgg.Add(a);
+            }
         }
         a.count = a.count + 1;
         a.totalMs = a.totalMs + ms;
@@ -599,10 +709,18 @@ class ServerMetrics {
         return true;
     }
 
-    /// <summary>Endpoint key for aggregation: drops the query string and folds
-    /// numeric path segments to :id, so /admin/users/1 and /admin/users/2 map to
-    /// the same "GET /admin/users/:id".</summary>
+    /// <summary>Endpoint key for aggregation: "METHOD " plus the folded path.
+    /// Only for a caller that has nothing but a raw path -- a routed request is
+    /// named by its pattern and never comes through here.</summary>
     static string NormalizePath(string method, string path) {
+        return method + " " + ServerMetrics.FoldPath(path);
+    }
+
+    /// <summary>The path an aggregate is keyed by when the raw URL is all there
+    /// is: the query string dropped and numeric segments folded to :id, so
+    /// /admin/users/1 and /admin/users/2 map to the same /admin/users/:id.
+    /// </summary>
+    static string FoldPath(string path) {
         string p = path;
         for (int i = 0; i < p.Length; i = i + 1) {
             if (p.Substring(i, 1) == "?") { p = p.Substring(0, i); break; }
@@ -624,11 +742,15 @@ class ServerMetrics {
             if (ServerMetrics.IsAllDigits(parts[i])) { outp.Append(":id"); }
             else { outp.Append(parts[i]); }
         }
-        return method + " " + outp.ToString();
+        return outp.ToString();
     }
 
     /// <summary>Records one completed database query.</summary>
     void RecordQuery(string sql, long ms) {
+        // Normalizing is the expensive part and needs no shared state.
+        string norm = ServerMetrics.NormalizeSql(sql);
+        if (norm.Length > 200) { norm = norm.Substring(0, 200); }
+        lock (this) {
         this.queryCount = this.queryCount + 1;
         this.queryTotalMs = this.queryTotalMs + ms;
         if (ms > this.queryMaxMs) { this.queryMaxMs = ms; }
@@ -637,11 +759,9 @@ class ServerMetrics {
         this.sQuery[idx] = this.sQuery[idx] + 1;
         this.sQueryMs[idx] = this.sQueryMs[idx] + ms;
 
-        // Normalize once: literal values and variable-length IN lists collapse
-        // to placeholders, so every execution of the same query SHAPE lands on
-        // the same leaderboard row regardless of its arguments.
-        string norm = ServerMetrics.NormalizeSql(sql);
-        if (norm.Length > 200) { norm = norm.Substring(0, 200); }
+        // Normalized once above: literal values and variable-length IN lists
+        // collapse to placeholders, so every execution of the same query SHAPE
+        // lands on the same leaderboard row regardless of its arguments.
         this.RecordSqlAgg(norm, ms);
 
         if (ms >= this.slowQueryMs) {
@@ -650,6 +770,7 @@ class ServerMetrics {
                 this.slowQueries.RemoveAt(0);
             }
         }
+        }
     }
 
     /// <summary>Folds one execution into the per-shape aggregate that backs the
@@ -657,6 +778,7 @@ class ServerMetrics {
     /// a never-before-seen shape is dropped rather than growing without limit --
     /// a monitor should not become a memory leak under a query it cannot fold.</summary>
     void RecordSqlAgg(string norm, long ms) {
+        lock (this) {
         SqlAgg a = null;
         for (int k = 0; k < this.sqlAgg.Count; k = k + 1) {
             if (this.sqlAgg[k].sql == norm) { a = this.sqlAgg[k]; break; }
@@ -669,6 +791,7 @@ class ServerMetrics {
         a.count = a.count + 1;
         a.totalMs = a.totalMs + ms;
         if (ms > a.maxMs) { a.maxMs = ms; }
+        }
     }
 
     static bool IsDigit(string c) {
@@ -761,7 +884,9 @@ class ServerMetrics {
     JsonValue TopSqlJson(int limit) {
         JsonValue outp = JsonValue.NewArray();
         List<SqlAgg> pool = new List<SqlAgg>();
-        for (int k = 0; k < this.sqlAgg.Count; k = k + 1) { pool.Add(this.sqlAgg[k]); }
+        lock (this) {
+            for (int k = 0; k < this.sqlAgg.Count; k = k + 1) { pool.Add(this.sqlAgg[k]); }
+        }
         while (outp.Count() < limit && pool.Count > 0) {
             int best = 0;
             for (int k = 1; k < pool.Count; k = k + 1) {
@@ -786,8 +911,10 @@ class ServerMetrics {
     JsonValue TopReqJson(int limit) {
         JsonValue outp = JsonValue.NewArray();
         List<ReqAgg> pool = new List<ReqAgg>();
-        for (int k = 0; k < this.reqAgg.Count; k = k + 1) {
-            pool.Add(this.reqAgg[k]);
+        lock (this) {
+            for (int k = 0; k < this.reqAgg.Count; k = k + 1) {
+                pool.Add(this.reqAgg[k]);
+            }
         }
         while (outp.Count() < limit && pool.Count > 0) {
             int best = 0;
@@ -796,7 +923,12 @@ class ServerMetrics {
             }
             ReqAgg a = pool[best];
             JsonValue d = JsonValue.NewObject();
+            // Verb and endpoint as their own fields (what a table shows and a
+            // history row stores), plus the joined form the shape has always
+            // carried so a reader written against it keeps working.
             d.Put("req", ServerMetrics.DocStr(a.req));
+            d.Put("method", ServerMetrics.DocStr(a.method));
+            d.Put("path", ServerMetrics.DocStr(a.path));
             d.Put("count", ServerMetrics.DocNum(a.count));
             d.Put("total_ms", ServerMetrics.DocNum(a.totalMs));
             d.Put("avg_ms", ServerMetrics.DocNum(a.count > 0 ? a.totalMs / a.count : 0));
@@ -812,22 +944,26 @@ class ServerMetrics {
 
     JsonValue SlowReqJson() {
         JsonValue outp = JsonValue.NewArray();
-        foreach (SlowEntry e in this.slowReqs) {
-            JsonValue o = JsonValue.NewObject();
-            o.Put("req", ServerMetrics.DocStr(e.text));
-            o.Put("ms", ServerMetrics.DocNum(e.ms));
-            outp.Append(o);
+        lock (this) {
+            foreach (SlowEntry e in this.slowReqs) {
+                JsonValue o = JsonValue.NewObject();
+                o.Put("req", ServerMetrics.DocStr(e.text));
+                o.Put("ms", ServerMetrics.DocNum(e.ms));
+                outp.Append(o);
+            }
         }
         return outp;
     }
 
     JsonValue SlowQueryJson() {
         JsonValue outp = JsonValue.NewArray();
-        foreach (SlowEntry e in this.slowQueries) {
-            JsonValue o = JsonValue.NewObject();
-            o.Put("sql", ServerMetrics.DocStr(e.text));
-            o.Put("ms", ServerMetrics.DocNum(e.ms));
-            outp.Append(o);
+        lock (this) {
+            foreach (SlowEntry e in this.slowQueries) {
+                JsonValue o = JsonValue.NewObject();
+                o.Put("sql", ServerMetrics.DocStr(e.text));
+                o.Put("ms", ServerMetrics.DocNum(e.ms));
+                outp.Append(o);
+            }
         }
         return outp;
     }
@@ -873,6 +1009,7 @@ class ServerMetrics {
     /// The series is per PROCESS, like every other counter here: with several
     /// workers each answers for the requests it served.</summary>
     string SeriesJson(int seconds) {
+        lock (this) {
         int want = seconds;
         if (want <= 0) { want = 60; }
         if (want > this.seriesCap) { want = this.seriesCap; }
@@ -932,6 +1069,7 @@ class ServerMetrics {
         }
         sb.Append("]}");
         return sb.ToString();
+        }
     }
 
     /// <summary>Full metrics snapshot as JSON. Recomputes CPU% from the delta
@@ -946,6 +1084,7 @@ class ServerMetrics {
     }
 
     string SnapshotJson() {
+        lock (this) {
         long nowWall = ServerMetrics.MonoMillis();
         long cpuMs = ServerMetrics.CpuMillis();
         long uptime = nowWall - this.startMillis;
@@ -969,6 +1108,7 @@ class ServerMetrics {
         requests.Put("errors", ServerMetrics.DocNum(this.reqErrors));
         requests.Put("failed", ServerMetrics.DocNum(this.reqFailed));
         requests.Put("rejected", ServerMetrics.DocNum(this.reqRejected));
+        requests.Put("unmatched", ServerMetrics.DocNum(this.reqUnmatched));
         requests.Put("avg_ms", ServerMetrics.DocNum(reqAvg));
         requests.Put("max_ms", ServerMetrics.DocNum(this.reqMaxMs));
         requests.Put("slow_threshold_ms", ServerMetrics.DocNum(this.slowReqMs));
@@ -1003,5 +1143,6 @@ class ServerMetrics {
         o.Put("top_sql", this.TopSqlJson(20));
         o.Put("top_requests", this.TopReqJson(20));
         return o.ToJson();
+        }
     }
 }

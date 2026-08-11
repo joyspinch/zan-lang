@@ -32,11 +32,15 @@ class Monitor : AdminController {
     [Description("运行监控")]
     async void Index() {
         ViewData d = await this.Layout("运行监控");
-        JsonValue m = JsonValue.ParseLenient(WebHost.Current().MetricsJson());
+        JsonValue m = JsonValue.ParseLenient(await MetricsCluster.SnapshotJson());
         JsonValue req = m.Get("requests");
         if (req == null) { req = JsonValue.NewObject(); }
+        long workers = m.Long("workers", 1);
+        d.Set("workers", Convert.ToString(workers));
+        string wl = m.Str("worker_list", "");
+        if (wl.Length == 0) { wl = Convert.ToString(m.Long("worker_id", 0)); }
+        d.Set("worker", wl);
         d.Set("pid", Convert.ToString(m.Long("pid", 0)));
-        d.Set("worker", Convert.ToString(m.Long("worker_id", 0)));
         d.Set("uptime", Fmt.Uptime(m.Long("uptime_ms", 0)));
         d.Set("slowMs", Convert.ToString(req.Long("slow_threshold_ms", 0)));
         this.Page(d);
@@ -50,10 +54,12 @@ class Monitor : AdminController {
         HttpContext ctx = this.Ctx();
         if (!await ctx.SseOpen()) { return; }
 
-        WebApp app = WebHost.Current();
         // The first frame carries the recent history so the charts are drawn
-        // full rather than filling up over the next two minutes.
-        if (!await ctx.SseSend("series", app.MetricsSeriesJson(120))) { return; }
+        // full rather than filling up over the next two minutes. Every frame
+        // is the merge of every live worker, not this process's own numbers.
+        if (!await ctx.SseSend("series", await MetricsCluster.SeriesJson(120))) {
+            return;
+        }
 
         int elapsed = 0;
         int sinceSeries = 0;
@@ -61,10 +67,12 @@ class Monitor : AdminController {
             await Task.Delay(2000);
             elapsed = elapsed + 2;
             sinceSeries = sinceSeries + 2;
-            if (!await ctx.SseSend("metrics", app.MetricsJson())) { return; }
+            if (!await ctx.SseSend("metrics",
+                    await MetricsCluster.SnapshotJson())) { return; }
             if (sinceSeries >= 10) {
                 sinceSeries = 0;
-                if (!await ctx.SseSend("series", app.MetricsSeriesJson(120))) {
+                if (!await ctx.SseSend("series",
+                        await MetricsCluster.SeriesJson(120))) {
                     return;
                 }
             }
@@ -76,58 +84,131 @@ class Monitor : AdminController {
     [HttpGet]
     [Description("运行指标快照")]
     async void Snapshot() {
-        this.Json(WebHost.Current().MetricsJson());
+        this.Json(await MetricsCluster.SnapshotJson());
     }
 
     [HttpGet]
     [Description("运行指标时序")]
     async void Series() {
-        this.Json(WebHost.Current().MetricsSeriesJson(this.InInt("sec", 120)));
+        this.Json(await MetricsCluster.SeriesJson(this.InInt("sec", 120)));
     }
 
-    /// <summary>The history the live stream cannot show: per-minute, per-route
-    /// counters from metrics.db, which outlive the worker and the in-memory
-    /// ring.</summary>
+    /// <summary>The analysis the live stream cannot do: which hour (or day)
+    /// carried how much traffic at what throughput and latency, and which
+    /// interfaces carried it. Both tables are grouped by the database -- per
+    /// time bucket (minute/hour/day via `g`) and per interface over the window
+    /// -- not assembled from raw minute rows on the screen. An interface is a
+    /// method and a path ("GET" + "/api/index/index"), the two filters `m` and
+    /// `route` narrow to; a request no route or asset served has no path of its
+    /// own and was never filed, so nothing here comes from a scanner's URL.
+    /// </summary>
     [HttpGet]
     [Route("/admin/monitor/history")]
     [Custom(IsMenu = true, Icon = "mdi:chart-timeline-variant")]
     [Description("历史统计")]
     async void History() {
         ViewData d = await this.Layout("历史统计");
-        int hours = Monitor.Hours(this.InInt("h", 6));
+        string method = this.In("m");
         string route = this.In("route");
-        long to = (long)WebApp.NowSeconds();
-        long from = to - (long)hours * 3600;
+        // Two ways to pick the window, because they answer different
+        // questions: `h` is "the last N hours" (what is happening now) and
+        // `d`/`d2` are calendar dates (what happened that day). A dated window
+        // is closed on both ends, so its buckets are the same rows every time
+        // it is opened -- a rolling window's are not.
+        MetricWindow w = Monitor.Window(this.In("d"), this.In("d2"),
+            this.InInt("h", 24));
+        string gran = Monitor.Gran(this.In("g"), w.hours);
+        long step = Monitor.Step(gran);
+        long from = w.from;
+        long to = w.to;
 
         // The window is flushed first, so "the last hour" includes the minute
         // that is still being filled instead of stopping ten minutes short.
         int _w = await MetricsStore.Flush();
-        List<MetricMinute> rows = await MetricsStore.History(from, to, route,
-            Monitor.MaxRows);
+        List<MetricMinute> rows = await MetricsStore.HistoryBuckets(from, to,
+            method, route, step, Monitor.MaxRows);
+        List<MetricMinute> tops = await MetricsStore.RouteTotals(from, to,
+            method, route, Monitor.MaxRoutes);
+        // A dated window shows every bucket it contains, including the ones
+        // with no traffic: "03:00 had nothing" is a fact about the day, and a
+        // table that silently skips those hours cannot be read as a timeline.
+        if (w.dated) { rows = Monitor.FillGaps(rows, from, to, step); }
+
         List<StrMap> items = d.AddList("rows");
         long calls = 0;
         long errors = 0;
+        long peakQps10 = 0;    // peak bucket throughput, in tenths of req/s
         for (int i = 0; i < rows.Count; i = i + 1) {
             MetricMinute b = rows[i];
             calls = calls + b.calls;
             errors = errors + b.errors;
+            long qps10 = b.calls * 10 / step;
+            if (qps10 > peakQps10) { peakQps10 = qps10; }
             StrMap r = new StrMap();
-            r.Set("minute", Fmt.Stamp(b.minute));
-            r.Set("route", b.route);
+            r.Set("bucket", Monitor.BucketLabel(b.minute, gran));
             r.Set("calls", Convert.ToString(b.calls));
+            r.Set("qps", Monitor.Tenths(qps10));
             r.Set("errors", Convert.ToString(b.errors));
+            r.Set("errRate", Monitor.Rate(b.errors, b.calls));
             r.Set("avgMs", Convert.ToString(Monitor.Avg(b.totalMs, b.calls)));
             r.Set("maxMs", Convert.ToString(b.maxMs));
             r.Set("frames", Convert.ToString(b.frames));
             r.Set("bytes", Fmt.Bytes(b.bytes));
             items.Add(r);
         }
-        d.Set("hours", Convert.ToString(hours));
+
+        List<StrMap> routes = d.AddList("routes");
+        for (int i = 0; i < tops.Count; i = i + 1) {
+            MetricMinute b = tops[i];
+            StrMap r = new StrMap();
+            // Two cells, because they are two things: the verb and the
+            // interface. The old single "route" cell is still filled with the
+            // pair so a view that has not been updated keeps rendering.
+            r.Set("method", b.method);
+            r.Set("path", b.path);
+            r.Set("route", b.method + " " + b.path);
+            r.Set("calls", Convert.ToString(b.calls));
+            r.Set("share", Monitor.Rate(b.calls, calls));
+            r.Set("errors", Convert.ToString(b.errors));
+            r.Set("errRate", Monitor.Rate(b.errors, b.calls));
+            r.Set("avgMs", Convert.ToString(Monitor.Avg(b.totalMs, b.calls)));
+            r.Set("maxMs", Convert.ToString(b.maxMs));
+            r.Set("frames", Convert.ToString(b.frames));
+            r.Set("bytes", Fmt.Bytes(b.bytes));
+            routes.Add(r);
+        }
+
+        d.Set("hours", Convert.ToString(w.hours));
+        d.Set("m", method);
         d.Set("route", route);
+        d.Set("g", gran);
+        d.Set("g_" + gran, "1");
+        d.Set("d", w.day);
+        d.Set("d2", w.day2);
+        d.Set("from", Fmt.Stamp(from));
+        d.Set("to", Fmt.Stamp(to));
+        if (w.dated) { d.Set("dated", "1"); }
+        if (w.invalid) { d.Set("badDate", "1"); }
+        // The window as one label, built here rather than in the template: the
+        // view engine has no {{else}}, and a KPI that reads "24 小时" for a
+        // dated query would describe the wrong window.
+        string label = Convert.ToString(w.hours) + " 小时";
+        if (w.dated) {
+            label = w.day;
+            if (w.day2 != w.day) { label = label + " → " + w.day2; }
+        }
+        d.Set("window", label);
         d.Set("calls", Convert.ToString(calls));
         d.Set("errors", Convert.ToString(errors));
+        long windowQps10 = 0;
+        long span = to - from;
+        if (span > 0) { windowQps10 = calls * 10 / span; }
+        d.Set("avgQps", Monitor.Tenths(windowQps10));
+        d.Set("peakQps", Monitor.Tenths(peakQps10));
         d.Set("shown", Convert.ToString(rows.Count));
-        if (rows.Count == 0) { d.Set("empty", "1"); }
+        // A dated window always has its buckets (zero-filled), so "nothing
+        // here" is about the traffic, not about how many rows came back.
+        if (calls == 0) { d.Set("empty", "1"); }
         if (rows.Count >= Monitor.MaxRows) { d.Set("capped", "1"); }
         this.Page(d);
     }
@@ -138,24 +219,33 @@ class Monitor : AdminController {
     [HttpGet]
     [Description("导出历史统计")]
     async void Export() {
-        int hours = Monitor.Hours(this.InInt("h", 6));
+        string method = this.In("m");
         string route = this.In("route");
-        long to = (long)WebApp.NowSeconds();
-        long from = to - (long)hours * 3600;
+        MetricWindow win = Monitor.Window(this.In("d"), this.In("d2"),
+            this.InInt("h", 24));
+        string gran = Monitor.Gran(this.In("g"), win.hours);
+        long step = Monitor.Step(gran);
+        long from = win.from;
+        long to = win.to;
         int _w = await MetricsStore.Flush();
-        List<MetricMinute> rows = await MetricsStore.History(from, to, route,
-            Monitor.MaxRows);
+        List<MetricMinute> rows = await MetricsStore.HistoryBuckets(from, to,
+            method, route, step, Monitor.MaxRows);
+        if (win.dated) { rows = Monitor.FillGaps(rows, from, to, step); }
 
         if (this.In("format") == "json") {
             MetricsExportDoc doc = new MetricsExportDoc();
             doc.from = from;
             doc.to = to;
             doc.rows = new List<MetricsRowDoc>();
+            doc.step_seconds = step;
             for (int i = 0; i < rows.Count; i = i + 1) {
                 MetricMinute b = rows[i];
                 MetricsRowDoc o = new MetricsRowDoc();
-                o.minute = b.minute;
-                o.route = b.route;
+                o.bucket = b.minute;
+                // What the rows were filtered to: a bucket row is a sum over
+                // interfaces, so it carries the filter, not a name of its own.
+                o.method = method;
+                o.path = route;
                 o.calls = b.calls;
                 o.errors = b.errors;
                 o.avg_ms = Monitor.Avg(b.totalMs, b.calls);
@@ -170,12 +260,14 @@ class Monitor : AdminController {
         }
 
         StringBuilder sb = new StringBuilder();
-        sb.Append("minute,route,calls,errors,avg_ms,max_ms,frames,bytes\n");
+        sb.Append("bucket,method,path,calls,errors,avg_ms,max_ms,frames,bytes\n");
         for (int i = 0; i < rows.Count; i = i + 1) {
             MetricMinute b = rows[i];
             sb.Append(Convert.ToString(b.minute));
             sb.Append(",");
-            sb.Append(Monitor.Cell(b.route));
+            sb.Append(Monitor.Cell(method));
+            sb.Append(",");
+            sb.Append(Monitor.Cell(route));
             sb.Append(",");
             sb.Append(Convert.ToString(b.calls));
             sb.Append(",");
@@ -230,11 +322,144 @@ class Monitor : AdminController {
     /// request reads.</summary>
     static int MaxRows = 5000;
     static int MaxHours = 720;
+    /// How many interfaces the per-interface table shows: enough for every real
+    /// API, bounded so a long route table cannot grow the page without limit.
+    static int MaxRoutes = 100;
 
     static int Hours(int h) {
         if (h < 1) { return 1; }
         if (h > Monitor.MaxHours) { return Monitor.MaxHours; }
         return h;
+    }
+
+    /// <summary>The window a screen asked for: a calendar day (or a range of
+    /// them) when `day` parses, otherwise the last `h` hours. A dated window
+    /// covers whole days -- 00:00:00 through 23:59:59 -- so the same date always
+    /// answers with the same buckets, and it is clamped to MaxHours like the
+    /// rolling one: a query string does not get to ask for a year at a
+    /// time.</summary>
+    static MetricWindow Window(string day, string day2, int h) {
+        MetricWindow w = new MetricWindow();
+        w.day = "";
+        w.day2 = "";
+        w.dated = false;
+        w.invalid = false;
+        long start = Monitor.DaySeconds(day);
+        if (day.Length > 0 && start < 0) { w.invalid = true; }
+        if (start >= 0) {
+            long end = Monitor.DaySeconds(day2);
+            if (day2.Length > 0 && end < 0) { w.invalid = true; }
+            if (end < start) { end = start; }
+            long span = (end - start) / 3600 + 24;
+            if (span > (long)Monitor.MaxHours) {
+                end = start + ((long)Monitor.MaxHours - 24) * 3600;
+                span = (long)Monitor.MaxHours;
+            }
+            w.from = start;
+            w.to = end + 86399;
+            w.hours = (int)span;
+            w.dated = true;
+            w.day = Fmt.Day(start);
+            w.day2 = Fmt.Day(end);
+            return w;
+        }
+        w.hours = Monitor.Hours(h);
+        w.to = (long)WebApp.NowSeconds();
+        w.from = w.to - (long)w.hours * 3600;
+        return w;
+    }
+
+    /// <summary>"YYYY-MM-DD" as the UTC second that day starts, or -1 when it
+    /// is not a date. Parsed by hand rather than trusted: this value picks the
+    /// rows a page reads.</summary>
+    static long DaySeconds(string s) {
+        if (s == null || s.Length != 10) { return 0 - 1; }
+        if (s.Substring(4, 1) != "-" || s.Substring(7, 1) != "-") {
+            return 0 - 1;
+        }
+        int y = Monitor.Digits(s, 0, 4);
+        int m = Monitor.Digits(s, 5, 2);
+        int dd = Monitor.Digits(s, 8, 2);
+        if (y < 1970 || m < 1 || m > 12 || dd < 1) { return 0 - 1; }
+        if (dd > DateTime.DaysInMonth(y, m)) { return 0 - 1; }
+        return DateTime.FromDate(y, m, dd).ToUnixSeconds();
+    }
+
+    /// <summary>`n` digits of `s` at `at` as a number, or -1 if any of them is
+    /// not a digit.</summary>
+    static int Digits(string s, int at, int n) {
+        int v = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = s[at + i] & 255;
+            if (c < 48 || c > 57) { return 0 - 1; }
+            v = v * 10 + (c - 48);
+        }
+        return v;
+    }
+
+    /// <summary>The same rows with every empty bucket of the window filled in
+    /// as a zero row, newest first -- what makes a day 24 hours long on screen
+    /// whether or not it had traffic. Bounded by MaxRows like the query
+    /// itself.</summary>
+    static List<MetricMinute> FillGaps(List<MetricMinute> rows, long from,
+                                       long to, long step) {
+        List<MetricMinute> outp = new List<MetricMinute>();
+        long first = (from / step) * step;
+        long last = (to / step) * step;
+        int at = 0;
+        for (long b = last; b >= first; b = b - step) {
+            if (outp.Count >= Monitor.MaxRows) { break; }
+            if (at < rows.Count && rows[at].minute == b) {
+                outp.Add(rows[at]);
+                at = at + 1;
+                continue;
+            }
+            MetricMinute z = new MetricMinute();
+            z.minute = b;
+            z.method = "";
+            z.path = "";
+            outp.Add(z);
+        }
+        return outp;
+    }
+
+    /// <summary>The granularity, validated; unset picks the one whose table
+    /// stays readable for the window (minutes up to 3h, hours up to 3 days,
+    /// days beyond).</summary>
+    static string Gran(string g, int hours) {
+        if (g == "min" || g == "hour" || g == "day") { return g; }
+        if (hours <= 3) { return "min"; }
+        if (hours <= 72) { return "hour"; }
+        return "day";
+    }
+
+    static long Step(string gran) {
+        if (gran == "min") { return 60; }
+        if (gran == "day") { return 86400; }
+        return 3600;
+    }
+
+    /// <summary>The bucket as the screen names it: a day by its date, an hour
+    /// as "date hh:00", a minute with its full clock.</summary>
+    static string BucketLabel(long sec, string gran) {
+        if (gran == "day") { return Fmt.Day(sec); }
+        string s = Fmt.Stamp(sec);
+        if (gran == "hour" && s.Length >= 3) {
+            return s.Substring(0, s.Length - 3);
+        }
+        return s;
+    }
+
+    /// <summary>A count in tenths, as "12.3". Integer arithmetic: the number
+    /// is for a table cell, not for further math.</summary>
+    static string Tenths(long v10) {
+        return Convert.ToString(v10 / 10) + "." + Convert.ToString(v10 % 10);
+    }
+
+    /// <summary>`part` of `whole` as a percentage with one decimal.</summary>
+    static string Rate(long part, long whole) {
+        if (whole <= 0) { return "0.0"; }
+        return Monitor.Tenths(part * 1000 / whole);
     }
 
     static long Avg(long totalMs, long calls) {
@@ -260,8 +485,9 @@ class Monitor : AdminController {
 /// <summary>What an export answers with: the window and its rows, serialized by
 /// the JSON writer rather than assembled as text.</summary>
 class MetricsRowDoc {
-    long minute;
-    string route;
+    long bucket;
+    string method;
+    string path;
     long calls;
     long errors;
     long avg_ms;
@@ -273,5 +499,19 @@ class MetricsRowDoc {
 class MetricsExportDoc {
     long from;
     long to;
+    long step_seconds;
     List<MetricsRowDoc> rows;
+}
+
+/// <summary>The time window a screen or an export is looking at, and how it was
+/// asked for: `dated` distinguishes "that day" from "the last N hours", which
+/// decides whether empty buckets are shown as zeros.</summary>
+class MetricWindow {
+    long from;
+    long to;
+    int hours;
+    bool dated;
+    bool invalid;
+    string day;
+    string day2;
 }

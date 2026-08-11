@@ -30,9 +30,15 @@ class Program {
     static int Main() {
         ServerMetrics m = ServerMetrics.Global();
         m.SlowRequestMs(10).SlowQueryMs(20).ErrorLog("", false);
-        m.RecordRequest("GET", "/api/a", 200, 5);
-        m.RecordRequest("POST", "/api/b", 201, 12);
-        m.RecordRequest("GET", "/slow", 500, 25);
+        // A served request is keyed by what served it: a route by its pattern
+        // (slot = Route.idx), an asset by its path (no slot). Two calls of the
+        // same route are one row whatever the id in the URL was.
+        m.RecordRoute(0, "GET", "/api/a", 200, 5);
+        m.RecordRoute(1, "POST", "/api/b", 201, 12);
+        m.RecordRoute(2, "GET", "/slow", 500, 25);
+        // Nothing claimed these: counted, but never a row of their own.
+        m.RecordUnmatched(404, 1);
+        m.RecordUnmatched(404, 1);
         m.RecordError(1000, "db", "timeout");
         m.RecordQuery("select * from t where id = ?", 3);
         m.RecordQuery("select count(*) from big", 40);
@@ -54,13 +60,14 @@ class Program {
         JsonValue req = v.Get("requests");
         if (req == null) { Console.WriteLine("null:req"); return; }
         CheckKeys(req, new List<string> { "count", "errors", "failed", "rejected",
-                  "avg_ms", "max_ms", "slow_threshold_ms", "slow_count" },
-                  "requests");
-        Check(req.Int("count", -1) == 3, "requests.count");
+                  "unmatched", "avg_ms", "max_ms", "slow_threshold_ms",
+                  "slow_count" }, "requests");
+        Check(req.Int("count", -1) == 5, "requests.count");
         Check(req.Int("errors", -1) == 1, "requests.errors");
-        Check(req.Int("failed", -1) == 1, "requests.failed");
+        Check(req.Int("failed", -1) == 3, "requests.failed");
         Check(req.Int("rejected", -1) == 0, "requests.rejected");
-        Check(req.Int("avg_ms", -1) == 14, "requests.avg_ms");
+        Check(req.Int("unmatched", -1) == 2, "requests.unmatched");
+        Check(req.Int("avg_ms", -1) == 8, "requests.avg_ms");
         Check(req.Int("max_ms", -1) == 25, "requests.max_ms");
         Check(req.Int("slow_threshold_ms", -1) == 10, "requests.slow_threshold_ms");
         Check(req.Int("slow_count", -1) == 2, "requests.slow_count");
@@ -106,9 +113,12 @@ class Program {
         Check(ts.At(1).Get("sql").AsString("") == "select * from t where id = ?" &&
               ts.At(1).Int("total_ms", -1) == 3, "top_sql[1]");
 
+        // Three rows for three routes: the two unmatched requests added none.
         JsonValue tr = v.Get("top_requests");
         Check(tr != null && tr.IsArray() && tr.Count() == 3, "top_requests size");
         Check(tr.At(0).Get("req").AsString("") == "GET /slow" &&
+              tr.At(0).Get("method").AsString("") == "GET" &&
+              tr.At(0).Get("path").AsString("") == "/slow" &&
               tr.At(0).Int("total_ms", -1) == 25 && tr.At(0).Int("errors", -1) == 1 &&
               tr.At(0).Int("failed", -1) == 1 && tr.At(0).Int("rejected", -1) == 0,
               "top_requests[0]");

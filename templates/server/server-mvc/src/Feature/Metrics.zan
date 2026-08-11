@@ -8,14 +8,18 @@ using System.Web;
 
 namespace ZanWeb;
 
-/// <summary>One minute of traffic for one route: how often it was called, how
+/// <summary>One minute of traffic for one interface: how often it was called, how
 /// long it took, how badly it went, and -- for a stream -- how much was pushed
 /// over it. This is the row the history screen reads and the shape kept in
 /// memory between flushes.</summary>
 class MetricMinute {
     long minute;     // epoch seconds truncated to the minute
-    string route;    // route action ("Users.Save"), or "METHOD /path" for a
-                     // request no attribute route claimed
+    // The interface, as two fields rather than one joined string: the request
+    // method and what served it -- a route's registration pattern
+    // ("/api/index/index") or a mounted asset's path ("/static/js/admin.js").
+    // A request nothing served has no name of its own and is never filed here.
+    string method;
+    string path;
     long calls;
     long errors;
     long totalMs;
@@ -24,6 +28,14 @@ class MetricMinute {
     /// how a stream is measured, since its duration is not a latency.
     long frames;
     long bytes;
+}
+
+/// <summary>One worker's published live row: which worker, how many seconds
+/// ago it published, and the JSON it published.</summary>
+class LiveRow {
+    int worker;
+    long age;
+    string json;
 }
 
 /// <summary>One persisted server error, for the backend error screen.</summary>
@@ -73,13 +85,20 @@ class MetricsStore {
             // WAL: the flusher writes while the history screen reads.
             int _w = await db.ExecuteAsync("PRAGMA journal_mode=WAL");
             int _s = await db.ExecuteAsync("PRAGMA synchronous=NORMAL");
+            // A history written by an older build keyed a row by one `route`
+            // column holding an action name or a raw request line. That is a
+            // different measurement, not a renamed one, so it is set aside
+            // under its own name instead of being guessed apart into the new
+            // columns -- and the new table starts clean.
+            await MetricsStore.RetireLegacyMinutes(db);
             int _a = await db.ExecuteAsync(
                 "CREATE TABLE IF NOT EXISTS metrics_minute ("
-                + "minute INTEGER NOT NULL, route TEXT NOT NULL, "
+                + "minute INTEGER NOT NULL, method TEXT NOT NULL, "
+                + "path TEXT NOT NULL, "
                 + "calls INTEGER NOT NULL, errors INTEGER NOT NULL, "
                 + "total_ms INTEGER NOT NULL, max_ms INTEGER NOT NULL, "
                 + "frames INTEGER NOT NULL, bytes INTEGER NOT NULL, "
-                + "PRIMARY KEY (minute, route))");
+                + "PRIMARY KEY (minute, method, path))");
             int _b = await db.ExecuteAsync(
                 "CREATE TABLE IF NOT EXISTS metrics_error ("
                 + "id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, "
@@ -87,6 +106,14 @@ class MetricsStore {
             int _i = await db.ExecuteAsync(
                 "CREATE INDEX IF NOT EXISTS ix_metrics_error_ts "
                 + "ON metrics_error (ts)");
+            // One row per worker process, overwritten in place: the live
+            // monitor reads ALL of them and shows the whole server, not
+            // whichever worker happened to accept the page request.
+            int _l = await db.ExecuteAsync(
+                "CREATE TABLE IF NOT EXISTS metrics_live ("
+                + "worker INTEGER PRIMARY KEY, pid INTEGER NOT NULL, "
+                + "updated INTEGER NOT NULL, snapshot TEXT NOT NULL, "
+                + "series TEXT NOT NULL)");
         } finally {
             MetricsStore.Give(db);
         }
@@ -112,6 +139,33 @@ class MetricsStore {
     /// <summary>The minute a timestamp belongs to.</summary>
     static long Minute(long sec) { return sec - (sec % 60); }
 
+    /// <summary>Sets aside a metrics_minute written by an older build, which
+    /// keyed a row by a single `route` column holding either an action name
+    /// ("Users.Save") or a raw request line ("GET /wp-login.php"). Those rows
+    /// are kept under metrics_minute_legacy rather than migrated: an action
+    /// name is not a request path, and a raw line from a scanner is not an
+    /// interface, so splitting them into (method, path) would invent data.
+    /// </summary>
+    static async void RetireLegacyMinutes(IDbConnection db) {
+        try {
+            DbResult r = await db.QueryAsync(
+                "SELECT COUNT(*) FROM pragma_table_info('metrics_minute') "
+                + "WHERE name = 'route'");
+            if (r.RowCount() == 0) { return; }
+            if (Convert.ToInt64(r.GetString(0, 0)) == 0) { return; }
+            int _d = await db.ExecuteAsync(
+                "DROP TABLE IF EXISTS metrics_minute_legacy");
+            int _m = await db.ExecuteAsync(
+                "ALTER TABLE metrics_minute RENAME TO metrics_minute_legacy");
+            Console.WriteLine("[metrics] history schema changed: previous "
+                + "per-route rows kept in metrics_minute_legacy");
+        } catch (Exception ex) {
+            // A history that cannot be inspected must not stop the server.
+            Console.WriteLine("[metrics] legacy history check failed: "
+                + ex.Message);
+        }
+    }
+
     /// <summary>Starts the flusher on the first thing worth flushing. It is
     /// started here rather than at startup because a coroutine only runs once
     /// the server is pumping its event loop: spawned from Start() it would sit
@@ -120,11 +174,12 @@ class MetricsStore {
         if (MetricsStore.flushing || !MetricsStore.ready) { return; }
         MetricsStore.flushing = true;
         Task.Spawn(MetricsStore.Loop());
+        Task.Spawn(MetricsCluster.Loop());
     }
 
-    /// <summary>The bucket for this minute and route, created if this is the
-    /// first thing that happened to it.</summary>
-    static MetricMinute Bucket(string route) {
+    /// <summary>The bucket for this minute and interface, created if this is
+    /// the first thing that happened to it.</summary>
+    static MetricMinute Bucket(string method, string path) {
         MetricsStore.Arm();
         long m = MetricsStore.Minute((long)WebApp.NowSeconds());
         int n = MetricsStore.buckets.Count;
@@ -133,11 +188,12 @@ class MetricsStore {
         for (int i = n - 1; i >= 0; i = i - 1) {
             MetricMinute b = MetricsStore.buckets[i];
             if (b.minute != m) { break; }
-            if (b.route == route) { return b; }
+            if (b.method == method && b.path == path) { return b; }
         }
         MetricMinute b2 = new MetricMinute();
         b2.minute = m;
-        b2.route = route;
+        b2.method = method;
+        b2.path = path;
         MetricsStore.buckets.Add(b2);
         while (MetricsStore.buckets.Count > MetricsStore.MaxBuckets) {
             MetricsStore.buckets.RemoveAt(0);
@@ -147,9 +203,9 @@ class MetricsStore {
 
     /// <summary>One finished request. `ms` is the whole pipeline; a hijacked
     /// connection (SSE/WebSocket) does not come through here -- see Pushed.</summary>
-    static void Record(string route, int status, long ms) {
+    static void Record(string method, string path, int status, long ms) {
         if (!Cfg.Metrics.enabled) { return; }
-        MetricMinute b = MetricsStore.Bucket(route);
+        MetricMinute b = MetricsStore.Bucket(method, path);
         b.calls = b.calls + 1;
         b.totalMs = b.totalMs + ms;
         if (ms > b.maxMs) { b.maxMs = ms; }
@@ -158,9 +214,9 @@ class MetricsStore {
 
     /// <summary>What a long-lived connection is measured by: frames and bytes
     /// pushed, never elapsed time.</summary>
-    static void Pushed(string route, long frames, long bytes) {
+    static void Pushed(string method, string path, long frames, long bytes) {
         if (!Cfg.Metrics.enabled) { return; }
-        MetricMinute b = MetricsStore.Bucket(route);
+        MetricMinute b = MetricsStore.Bucket(method, path);
         b.frames = b.frames + frames;
         b.bytes = b.bytes + bytes;
     }
@@ -216,18 +272,19 @@ class MetricsStore {
             await db.BeginTransactionAsync();
             for (int i = 0; i < mine.Count; i = i + 1) {
                 MetricMinute b = mine[i];
-                DbParams p = new DbParams().Add(b.route);
+                DbParams p = new DbParams().Add(b.method).Add(b.path);
                 int _n = await db.ExecuteAsync(
                     "INSERT INTO metrics_minute "
-                    + "(minute, route, calls, errors, total_ms, max_ms, frames, bytes) "
-                    + "VALUES (" + Convert.ToString(b.minute) + ", ?, "
+                    + "(minute, method, path, calls, errors, total_ms, max_ms, "
+                    + "frames, bytes) "
+                    + "VALUES (" + Convert.ToString(b.minute) + ", ?, ?, "
                     + Convert.ToString(b.calls) + ", "
                     + Convert.ToString(b.errors) + ", "
                     + Convert.ToString(b.totalMs) + ", "
                     + Convert.ToString(b.maxMs) + ", "
                     + Convert.ToString(b.frames) + ", "
                     + Convert.ToString(b.bytes) + ") "
-                    + "ON CONFLICT (minute, route) DO UPDATE SET "
+                    + "ON CONFLICT (minute, method, path) DO UPDATE SET "
                     + "calls = calls + excluded.calls, "
                     + "errors = errors + excluded.errors, "
                     + "total_ms = total_ms + excluded.total_ms, "
@@ -270,33 +327,127 @@ class MetricsStore {
             + Convert.ToString(cut));
     }
 
-    /// <summary>History for the screen: one row per minute per route in the
-    /// window, newest first. `limit` is clamped by the caller's own ceiling.</summary>
-    static async List<MetricMinute> History(long from, long to, string route,
-                                            int limit) {
+    /// <summary>Aggregated history: one row per `stepSec` time bucket (a
+    /// minute, an hour, a day or any other span), summed across interfaces --
+    /// or over one of them when `method`/`path` filter -- newest first. The
+    /// database does the grouping: the screen never loads raw minutes to add
+    /// them up itself.</summary>
+    static async List<MetricMinute> HistoryBuckets(long from, long to,
+                                                   string method, string path,
+                                                   long stepSec, int limit) {
         List<MetricMinute> outp = new List<MetricMinute>();
         if (!MetricsStore.ready) { return outp; }
         IDbConnection db = await MetricsStore.Lease();
         if (db == null) { return outp; }
         try {
-            string sql = "SELECT minute, route, calls, errors, total_ms, max_ms, "
-                + "frames, bytes FROM metrics_minute WHERE minute >= "
-                + Convert.ToString(from) + " AND minute <= " + Convert.ToString(to);
+            string sql = "SELECT (minute / " + Convert.ToString(stepSec)
+                + ") * " + Convert.ToString(stepSec) + " AS bucket, "
+                + "SUM(calls), SUM(errors), SUM(total_ms), MAX(max_ms), "
+                + "SUM(frames), SUM(bytes) FROM metrics_minute WHERE minute >= "
+                + Convert.ToString(from) + " AND minute <= "
+                + Convert.ToString(to);
             DbParams p = new DbParams();
-            if (route.Length > 0) { sql = sql + " AND route = ?"; p.Add(route); }
-            sql = sql + " ORDER BY minute DESC, calls DESC LIMIT "
+            sql = sql + MetricsStore.Filter(method, path, p);
+            sql = sql + " GROUP BY bucket ORDER BY bucket DESC LIMIT "
                 + Convert.ToString(limit);
             DbResult r = await db.QueryAsync(sql, p);
             for (int i = 0; i < r.RowCount(); i = i + 1) {
                 MetricMinute b = new MetricMinute();
                 b.minute = Convert.ToInt64(r.GetString(i, 0));
-                b.route = r.GetString(i, 1);
+                b.method = "";
+                b.path = "";
+                b.calls = Convert.ToInt64(r.GetString(i, 1));
+                b.errors = Convert.ToInt64(r.GetString(i, 2));
+                b.totalMs = Convert.ToInt64(r.GetString(i, 3));
+                b.maxMs = Convert.ToInt64(r.GetString(i, 4));
+                b.frames = Convert.ToInt64(r.GetString(i, 5));
+                b.bytes = Convert.ToInt64(r.GetString(i, 6));
+                outp.Add(b);
+            }
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return outp;
+    }
+
+    /// <summary>Per-interface totals over the window, busiest first: which
+    /// endpoints carried the traffic, which were slow and which erred.
+    /// `minute` is 0 -- these rows have no time axis.</summary>
+    static async List<MetricMinute> RouteTotals(long from, long to,
+                                                string method, string path,
+                                                int limit) {
+        List<MetricMinute> outp = new List<MetricMinute>();
+        if (!MetricsStore.ready) { return outp; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return outp; }
+        try {
+            string sql = "SELECT method, path, SUM(calls) AS c, SUM(errors), "
+                + "SUM(total_ms), MAX(max_ms), SUM(frames), SUM(bytes) "
+                + "FROM metrics_minute WHERE minute >= "
+                + Convert.ToString(from) + " AND minute <= "
+                + Convert.ToString(to);
+            DbParams p = new DbParams();
+            sql = sql + MetricsStore.Filter(method, path, p);
+            sql = sql + " GROUP BY method, path ORDER BY c DESC LIMIT "
+                + Convert.ToString(limit);
+            DbResult r = await db.QueryAsync(sql, p);
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                MetricMinute b = new MetricMinute();
+                b.minute = 0;
+                b.method = r.GetString(i, 0);
+                b.path = r.GetString(i, 1);
                 b.calls = Convert.ToInt64(r.GetString(i, 2));
                 b.errors = Convert.ToInt64(r.GetString(i, 3));
                 b.totalMs = Convert.ToInt64(r.GetString(i, 4));
                 b.maxMs = Convert.ToInt64(r.GetString(i, 5));
                 b.frames = Convert.ToInt64(r.GetString(i, 6));
                 b.bytes = Convert.ToInt64(r.GetString(i, 7));
+                outp.Add(b);
+            }
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return outp;
+    }
+
+    /// <summary>The WHERE clause for an interface filter: the method, the path,
+    /// either or neither. Both go in as parameters -- what a screen typed is
+    /// never spliced into the statement.</summary>
+    static string Filter(string method, string path, DbParams p) {
+        string sql = "";
+        if (method.Length > 0) { sql = sql + " AND method = ?"; p.Add(method); }
+        if (path.Length > 0) { sql = sql + " AND path = ?"; p.Add(path); }
+        return sql;
+    }
+
+    /// <summary>History for the screen: one row per minute per interface in the
+    /// window, newest first. `limit` is clamped by the caller's own ceiling.</summary>
+    static async List<MetricMinute> History(long from, long to, string method,
+                                            string path, int limit) {
+        List<MetricMinute> outp = new List<MetricMinute>();
+        if (!MetricsStore.ready) { return outp; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return outp; }
+        try {
+            string sql = "SELECT minute, method, path, calls, errors, total_ms, "
+                + "max_ms, frames, bytes FROM metrics_minute WHERE minute >= "
+                + Convert.ToString(from) + " AND minute <= " + Convert.ToString(to);
+            DbParams p = new DbParams();
+            sql = sql + MetricsStore.Filter(method, path, p);
+            sql = sql + " ORDER BY minute DESC, calls DESC LIMIT "
+                + Convert.ToString(limit);
+            DbResult r = await db.QueryAsync(sql, p);
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                MetricMinute b = new MetricMinute();
+                b.minute = Convert.ToInt64(r.GetString(i, 0));
+                b.method = r.GetString(i, 1);
+                b.path = r.GetString(i, 2);
+                b.calls = Convert.ToInt64(r.GetString(i, 3));
+                b.errors = Convert.ToInt64(r.GetString(i, 4));
+                b.totalMs = Convert.ToInt64(r.GetString(i, 5));
+                b.maxMs = Convert.ToInt64(r.GetString(i, 6));
+                b.frames = Convert.ToInt64(r.GetString(i, 7));
+                b.bytes = Convert.ToInt64(r.GetString(i, 8));
                 outp.Add(b);
             }
         } finally {
@@ -328,5 +479,405 @@ class MetricsStore {
             MetricsStore.Give(db);
         }
         return outp;
+    }
+}
+
+/// <summary>
+/// The whole server's live numbers, not one worker's. Every counter behind
+/// the monitor lives in the worker process that served the request, so with
+/// [worker].count > 1 a page that read its own process would show a different
+/// worker on every refresh. Instead each worker publishes its snapshot into
+/// metrics_live (one row per worker, overwritten in place, every couple of
+/// seconds), and the reader merges every row that is still fresh: counters
+/// add, maxima take the max, averages are weighted by their counts, CPU and
+/// RSS add across processes. With a single worker the merge degenerates to
+/// that worker's own snapshot.
+/// </summary>
+class MetricsCluster {
+    /// How often each worker publishes, and how old a row may be before its
+    /// per-second series is too stale to plot. Totals are NOT subject to this
+    /// window: a cumulative counter that disappears makes the whole page jump
+    /// backwards (the symptom is numbers that come and go on refresh), so a
+    /// worker's last published totals keep counting until its row is replaced
+    /// -- the row is keyed by worker id, so a restarted worker overwrites its
+    /// own row rather than adding a second one.
+    static int PublishSeconds = 2;
+    static int FreshSeconds = 30;
+
+    /// <summary>One background coroutine per worker (spawned from
+    /// MetricsStore.Arm), so the row is fresh even for workers the monitor's
+    /// own requests never land on.</summary>
+    static async void Loop() {
+        while (true) {
+            await Task.Delay(MetricsCluster.PublishSeconds * 1000);
+            await MetricsCluster.Publish();
+        }
+    }
+
+    /// <summary>Writes this worker's snapshot + series over its own row.</summary>
+    static async void Publish() {
+        if (!MetricsStore.ready) { return; }
+        WebApp app = WebHost.Current();
+        if (app == null) { return; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return; }
+        try {
+            DbParams p = new DbParams().Add(app.MetricsJson())
+                .Add(app.MetricsSeriesJson(120));
+            int _n = await db.ExecuteAsync(
+                "INSERT INTO metrics_live (worker, pid, updated, snapshot, series)"
+                + " VALUES (" + Convert.ToString(ProcessHost.WorkerId()) + ", "
+                + Convert.ToString(ProcessHost.Pid()) + ", "
+                + Convert.ToString((long)WebApp.NowSeconds()) + ", ?, ?) "
+                + "ON CONFLICT (worker) DO UPDATE SET pid = excluded.pid, "
+                + "updated = excluded.updated, snapshot = excluded.snapshot, "
+                + "series = excluded.series", p);
+        } catch (Exception ex) {
+            Console.WriteLine("[metrics] live publish failed: " + ex.Message);
+        } finally {
+            MetricsStore.Give(db);
+        }
+    }
+
+    /// <summary>Every worker's published `col` ("snapshot" or "series") with
+    /// how old it is, in worker order. `maxAgeSec` 0 means every row however
+    /// old: for cumulative totals an old row is a lagging total, and dropping
+    /// it would subtract that worker's whole history from the page. Only the
+    /// per-second series passes an age limit, because a stale point plotted at
+    /// "now" is a wrong point rather than a late one.</summary>
+    static async List<LiveRow> LiveRows(string col, int maxAgeSec) {
+        List<LiveRow> outp = new List<LiveRow>();
+        if (!MetricsStore.ready) { return outp; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return outp; }
+        try {
+            long now = (long)WebApp.NowSeconds();
+            string sql = "SELECT worker, updated, " + col
+                + " FROM metrics_live";
+            if (maxAgeSec > 0) {
+                sql = sql + " WHERE updated >= "
+                    + Convert.ToString(now - (long)maxAgeSec);
+            }
+            DbResult r = await db.QueryAsync(sql + " ORDER BY worker");
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                LiveRow w = new LiveRow();
+                w.worker = (int)Convert.ToInt64(r.GetString(i, 0));
+                w.age = now - Convert.ToInt64(r.GetString(i, 1));
+                if (w.age < 0) { w.age = 0; }
+                w.json = r.GetString(i, 2);
+                outp.Add(w);
+            }
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return outp;
+    }
+
+    /// <summary>The merged snapshot: same shape MetricsJson produces, so the
+    /// page's painter does not know how many processes it is looking at. Adds
+    /// `workers` (how many are live) and `worker_list`.</summary>
+    static async string SnapshotJson() {
+        WebApp app = WebHost.Current();
+        await MetricsCluster.Publish();   // this worker is always current
+        List<LiveRow> rows = await MetricsCluster.LiveRows("snapshot", 0);
+        if (rows.Count <= 1) { return app.MetricsJson(); }
+        List<JsonValue> ms = new List<JsonValue>();
+        int live = 0;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            LiveRow w = rows[i];
+            JsonValue m = JsonValue.ParseLenient(w.json);
+            if (m == null || !m.IsObject()) { continue; }
+            ms.Add(m);
+            if (w.age <= (long)MetricsCluster.FreshSeconds) { live = live + 1; }
+        }
+        if (ms.Count <= 1) { return app.MetricsJson(); }
+        return MetricsCluster.MergeSnapshots(ms, live);
+    }
+
+    static string MergeSnapshots(List<JsonValue> ms, int live) {
+        long upt = 0;
+        long cpuPct = 0;
+        long rss = 0;
+        long rCount = 0;
+        long rErrors = 0;
+        long rFailed = 0;
+        long rRejected = 0;
+        long rAvgW = 0;
+        long rMax = 0;
+        long rSlowTh = 0;
+        long rSlowN = 0;
+        long qCount = 0;
+        long qAvgW = 0;
+        long qMax = 0;
+        long qSlowTh = 0;
+        long qSlowN = 0;
+        long lConc = 0;
+        long lPeak = 0;
+        long lStreams = 0;
+        long lFrames = 0;
+        long lBytes = 0;
+        StringBuilder wl = new StringBuilder();
+        JsonValue topReq = JsonValue.NewArray();
+        JsonValue topSql = JsonValue.NewArray();
+        for (int i = 0; i < ms.Count; i = i + 1) {
+            JsonValue m = ms[i];
+            if (i > 0) { wl.Append(","); }
+            wl.Append(Convert.ToString(m.Long("worker_id", 0)));
+            if (m.Long("uptime_ms", 0) > upt) { upt = m.Long("uptime_ms", 0); }
+            long c = m.Long("cpu_percent", 0 - 1);
+            if (c > 0) { cpuPct = cpuPct + c; }
+            long rb = m.Long("mem_rss_bytes", 0 - 1);
+            if (rb > 0) { rss = rss + rb; }
+            JsonValue rq = m.Get("requests");
+            if (rq != null) {
+                long n = rq.Long("count", 0);
+                rCount = rCount + n;
+                rErrors = rErrors + rq.Long("errors", 0);
+                rFailed = rFailed + rq.Long("failed", 0);
+                rRejected = rRejected + rq.Long("rejected", 0);
+                rAvgW = rAvgW + n * rq.Long("avg_ms", 0);
+                if (rq.Long("max_ms", 0) > rMax) { rMax = rq.Long("max_ms", 0); }
+                rSlowTh = rq.Long("slow_threshold_ms", 0);
+                rSlowN = rSlowN + rq.Long("slow_count", 0);
+            }
+            JsonValue qs = m.Get("queries");
+            if (qs != null) {
+                long n2 = qs.Long("count", 0);
+                qCount = qCount + n2;
+                qAvgW = qAvgW + n2 * qs.Long("avg_ms", 0);
+                if (qs.Long("max_ms", 0) > qMax) { qMax = qs.Long("max_ms", 0); }
+                qSlowTh = qs.Long("slow_threshold_ms", 0);
+                qSlowN = qSlowN + qs.Long("slow_count", 0);
+            }
+            JsonValue ld = m.Get("load");
+            if (ld != null) {
+                lConc = lConc + ld.Long("concurrent", 0);
+                lPeak = lPeak + ld.Long("peak", 0);
+                lStreams = lStreams + ld.Long("streams", 0);
+                lFrames = lFrames + ld.Long("stream_frames", 0);
+                lBytes = lBytes + ld.Long("stream_bytes", 0);
+            }
+            MetricsCluster.MergeTop(topReq, m.Get("top_requests"), "req");
+            MetricsCluster.MergeTop(topSql, m.Get("top_sql"), "sql");
+        }
+
+        JsonValue requests = JsonValue.NewObject();
+        requests.Put("count", MetricsCluster.Num(rCount));
+        requests.Put("errors", MetricsCluster.Num(rErrors));
+        requests.Put("failed", MetricsCluster.Num(rFailed));
+        requests.Put("rejected", MetricsCluster.Num(rRejected));
+        long rAvg = 0;
+        if (rCount > 0) { rAvg = rAvgW / rCount; }
+        requests.Put("avg_ms", MetricsCluster.Num(rAvg));
+        requests.Put("max_ms", MetricsCluster.Num(rMax));
+        requests.Put("slow_threshold_ms", MetricsCluster.Num(rSlowTh));
+        requests.Put("slow_count", MetricsCluster.Num(rSlowN));
+
+        JsonValue queries = JsonValue.NewObject();
+        queries.Put("count", MetricsCluster.Num(qCount));
+        long qAvg = 0;
+        if (qCount > 0) { qAvg = qAvgW / qCount; }
+        queries.Put("avg_ms", MetricsCluster.Num(qAvg));
+        queries.Put("max_ms", MetricsCluster.Num(qMax));
+        queries.Put("slow_threshold_ms", MetricsCluster.Num(qSlowTh));
+        queries.Put("slow_count", MetricsCluster.Num(qSlowN));
+
+        JsonValue load = JsonValue.NewObject();
+        load.Put("concurrent", MetricsCluster.Num(lConc));
+        load.Put("peak", MetricsCluster.Num(lPeak));
+        load.Put("streams", MetricsCluster.Num(lStreams));
+        load.Put("stream_frames", MetricsCluster.Num(lFrames));
+        load.Put("stream_bytes", MetricsCluster.Num(lBytes));
+
+        JsonValue o = JsonValue.NewObject();
+        o.Put("uptime_ms", MetricsCluster.Num(upt));
+        o.Put("pid", MetricsCluster.Num(ProcessHost.Pid()));
+        o.Put("worker_id", MetricsCluster.Num(ProcessHost.WorkerId()));
+        o.Put("workers", MetricsCluster.Num(live));
+        // Every worker whose totals are in this merge, including ones that have
+        // stopped publishing: the difference is what tells a reader that a
+        // worker died rather than that traffic vanished.
+        o.Put("workers_counted", MetricsCluster.Num(ms.Count));
+        o.Put("worker_list", JsonValue.NewStr(wl.ToString()));
+        o.Put("cpu_percent", MetricsCluster.Num(cpuPct));
+        o.Put("mem_rss_bytes", MetricsCluster.Num(rss));
+        o.Put("requests", requests);
+        o.Put("queries", queries);
+        o.Put("load", load);
+        o.Put("top_requests", MetricsCluster.SortTop(topReq));
+        o.Put("top_sql", MetricsCluster.SortTop(topSql));
+        return o.ToJson();
+    }
+
+    /// <summary>Folds one worker's top list into the merged one: rows with the
+    /// same key add their counts and total_ms, keep the larger max, and the
+    /// average is recomputed from the merged totals.</summary>
+    static void MergeTop(JsonValue merged, JsonValue add, string key) {
+        if (add == null || !add.IsArray()) { return; }
+        for (int i = 0; i < add.Count(); i = i + 1) {
+            JsonValue s = add.At(i);
+            string k = s.Str(key, "");
+            JsonValue hit = null;
+            for (int j = 0; j < merged.Count(); j = j + 1) {
+                if (merged.At(j).Str(key, "") == k) { hit = merged.At(j); break; }
+            }
+            if (hit == null) {
+                JsonValue row = JsonValue.NewObject();
+                row.Put(key, JsonValue.NewStr(k));
+                row.Put("count", MetricsCluster.Num(s.Long("count", 0)));
+                row.Put("errors", MetricsCluster.Num(s.Long("errors", 0)));
+                row.Put("failed", MetricsCluster.Num(s.Long("failed", 0)));
+                row.Put("rejected", MetricsCluster.Num(s.Long("rejected", 0)));
+                row.Put("total_ms", MetricsCluster.Num(s.Long("total_ms", 0)));
+                row.Put("max_ms", MetricsCluster.Num(s.Long("max_ms", 0)));
+                MetricsCluster.Reavg(row);
+                merged.Append(row);
+                continue;
+            }
+            hit.Set("count", MetricsCluster.Num(hit.Long("count", 0)
+                + s.Long("count", 0)));
+            hit.Set("errors", MetricsCluster.Num(hit.Long("errors", 0)
+                + s.Long("errors", 0)));
+            hit.Set("failed", MetricsCluster.Num(hit.Long("failed", 0)
+                + s.Long("failed", 0)));
+            hit.Set("rejected", MetricsCluster.Num(hit.Long("rejected", 0)
+                + s.Long("rejected", 0)));
+            hit.Set("total_ms", MetricsCluster.Num(hit.Long("total_ms", 0)
+                + s.Long("total_ms", 0)));
+            if (s.Long("max_ms", 0) > hit.Long("max_ms", 0)) {
+                hit.Set("max_ms", MetricsCluster.Num(s.Long("max_ms", 0)));
+            }
+            MetricsCluster.Reavg(hit);
+        }
+    }
+
+    static void Reavg(JsonValue row) {
+        long n = row.Long("count", 0);
+        long avg = 0;
+        if (n > 0) { avg = row.Long("total_ms", 0) / n; }
+        row.Set("avg_ms", MetricsCluster.Num(avg));
+    }
+
+    /// <summary>Busiest first, by cumulative time, capped at 20 like the
+    /// per-worker lists. Selection sort: the list is at most a few dozen
+    /// rows.</summary>
+    static JsonValue SortTop(JsonValue arr) {
+        int n = arr.Count();
+        List<JsonValue> rows = new List<JsonValue>();
+        for (int i = 0; i < n; i = i + 1) { rows.Add(arr.At(i)); }
+        for (int a = 0; a < rows.Count - 1; a = a + 1) {
+            int best = a;
+            for (int b = a + 1; b < rows.Count; b = b + 1) {
+                if (rows[b].Long("total_ms", 0) > rows[best].Long("total_ms", 0)) {
+                    best = b;
+                }
+            }
+            if (best != a) {
+                JsonValue tmp = rows[a];
+                rows[a] = rows[best];
+                rows[best] = tmp;
+            }
+        }
+        JsonValue outp = JsonValue.NewArray();
+        int keep = rows.Count;
+        if (keep > 20) { keep = 20; }
+        for (int i = 0; i < keep; i = i + 1) { outp.Append(rows[i]); }
+        return outp;
+    }
+
+    /// <summary>The merged per-second series: requests and errors add, latency
+    /// averages weight by requests, p95/max take the worst worker, CPU and RSS
+    /// add across processes.</summary>
+    static async string SeriesJson(int seconds) {
+        WebApp app = WebHost.Current();
+        List<LiveRow> rows = await MetricsCluster.LiveRows("series",
+            MetricsCluster.FreshSeconds);
+        if (rows.Count <= 1) { return app.MetricsSeriesJson(seconds); }
+        int want = seconds;
+        if (want <= 0) { want = 120; }
+        long[] req = new long[want];
+        long[] err = new long[want];
+        long[] avgW = new long[want];
+        long[] p95 = new long[want];
+        long[] max = new long[want];
+        long[] q = new long[want];
+        long[] qavgW = new long[want];
+        long[] cpu = new long[want];
+        long[] rssArr = new long[want];
+        int merged = 0;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            JsonValue s = JsonValue.ParseLenient(rows[i].json);
+            if (s == null || !s.IsObject()) { continue; }
+            JsonValue pts = s.Get("points");
+            if (pts == null || !pts.IsArray()) { continue; }
+            merged = merged + 1;
+            // Each worker numbers its points from its OWN "now", so a row
+            // published two seconds ago describes two seconds ago: shifting it
+            // back by its age is what keeps one second of the chart made of the
+            // same second from every worker (unshifted, the last buckets mix
+            // full seconds with partial ones and the line flickers).
+            int shift = (int)rows[i].age;
+            for (int j = 0; j < pts.Count(); j = j + 1) {
+                JsonValue p = pts.At(j);
+                long t = p.Long("t", 1);
+                if (t > 0) { continue; }
+                int idx = want - 1 + (int)t - shift;    // t: -(want-1)..0
+                if (idx < 0 || idx >= want) { continue; }
+                long r = p.Long("req", 0);
+                req[idx] = req[idx] + r;
+                err[idx] = err[idx] + p.Long("err", 0);
+                avgW[idx] = avgW[idx] + r * p.Long("avg_ms", 0);
+                if (p.Long("p95_ms", 0) > p95[idx]) { p95[idx] = p.Long("p95_ms", 0); }
+                if (p.Long("max_ms", 0) > max[idx]) { max[idx] = p.Long("max_ms", 0); }
+                long qn = p.Long("queries", 0);
+                q[idx] = q[idx] + qn;
+                qavgW[idx] = qavgW[idx] + qn * p.Long("query_avg_ms", 0);
+                long c = p.Long("cpu_percent", 0 - 1);
+                if (c > 0) { cpu[idx] = cpu[idx] + c; }
+                long rb = p.Long("mem_rss_bytes", 0 - 1);
+                if (rb > 0) { rssArr[idx] = rssArr[idx] + rb; }
+            }
+        }
+        if (merged <= 1) { return app.MetricsSeriesJson(seconds); }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"step_ms\":1000,\"count\":");
+        sb.Append(Convert.ToString(want));
+        sb.Append(",\"workers\":");
+        sb.Append(Convert.ToString(merged));
+        sb.Append(",\"points\":[");
+        for (int idx = 0; idx < want; idx = idx + 1) {
+            if (idx > 0) { sb.Append(","); }
+            long avg = 0;
+            if (req[idx] > 0) { avg = avgW[idx] / req[idx]; }
+            long qavg = 0;
+            if (q[idx] > 0) { qavg = qavgW[idx] / q[idx]; }
+            sb.Append("{\"t\":");
+            sb.Append(Convert.ToString((long)idx - (long)want + 1));
+            sb.Append(",\"req\":");
+            sb.Append(Convert.ToString(req[idx]));
+            sb.Append(",\"err\":");
+            sb.Append(Convert.ToString(err[idx]));
+            sb.Append(",\"avg_ms\":");
+            sb.Append(Convert.ToString(avg));
+            sb.Append(",\"p95_ms\":");
+            sb.Append(Convert.ToString(p95[idx]));
+            sb.Append(",\"max_ms\":");
+            sb.Append(Convert.ToString(max[idx]));
+            sb.Append(",\"queries\":");
+            sb.Append(Convert.ToString(q[idx]));
+            sb.Append(",\"query_avg_ms\":");
+            sb.Append(Convert.ToString(qavg));
+            sb.Append(",\"cpu_percent\":");
+            sb.Append(Convert.ToString(cpu[idx]));
+            sb.Append(",\"mem_rss_bytes\":");
+            sb.Append(Convert.ToString(rssArr[idx]));
+            sb.Append("}");
+        }
+        sb.Append("]}");
+        return sb.ToString();
+    }
+
+    static JsonValue Num(long v) {
+        return JsonValue.NewNum(Convert.ToString(v));
     }
 }
