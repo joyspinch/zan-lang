@@ -1,0 +1,330 @@
+using System;
+using System.IO;
+using System.Net.Sockets;
+using System.Net.Tls;
+
+namespace System.Net.Http;
+
+/// <summary>
+/// 一条 HTTP/1.1 连接上的请求拆包器：把字节流切成请求，
+/// 全程按显式字节数处理。
+///
+/// stdlib 里的每个 HTTP 连接循环（HttpServer/Worker 的 "http" 协议、
+/// System.Web 的 WebApp、HttpsServer 的 TLS 连接）都用它拆包，因此
+/// 定界的修复对所有入口同时生效，不会再出现多套实现各自漂移。
+///
+/// 为什么不能用字符串拼接来攒请求：Zan 字符串以 NUL 结尾，
+/// <c>s.Length</c> 是 strlen，<c>a + b</c> 也按 strlen 定长。请求体
+/// （文件上传、protobuf、gzip 内容）里的 NUL 会让长度提前截断，于是
+/// 声明的 Content-Length 永远读不满，请求超时或被判 400。这里把未
+/// 消费的字节放在带显式长度的 <see cref="ByteBuffer"/> 里，接收用
+/// <see cref="Socket.RecvIntoAsync"/> 的精确返回值，切片用带长度的
+/// <see cref="ByteBuffer.Str"/>，全程不依赖 NUL。
+///
+/// 用法（一次请求）：
+///   HttpFramer f = HttpFramer.Create(sock);
+///   int he = await f.ReadHead(maxHeaderBytes);        // 头部块到齐
+///   HttpRequest req = HttpRequest.Parse(f.Head(he), he);
+///   int st = await f.ReadBody(req, maxBodyBytes);     // 正文到齐
+///   f.Consume(f.RequestBytes());                     // 只丢弃本请求
+/// 剩余字节留在拆包器里，就是下一条流水线请求的开头。
+/// </summary>
+class HttpFramer {
+    nint sock;
+    // TLS 连接时的字节源（为空则直接从 sock 读）。HTTPS 的拆包
+    // 与明文 HTTP 完全一致，只是读字节的一步走 TLS 记录层。
+    TlsStream tls;
+    // 接收暂存区：从连接池借来的 64KB 复用缓冲区（每条连接构建一块
+    // 的代价在短连接负载下比处理请求本身还贵）。
+    string buf;
+    int bufCap;
+    // 已收到但尚未消费的字节，带显式长度。
+    ByteBuffer pend;
+    // pend 中已扫描过、确认不含头部结束空行的前缀长度。跨包到达的
+    // 头部不必每次接收后从头再扫一遍（慢客户端一个字节一个字节地
+    // 发时，重扫是 O(n²)）。
+    int scanned;
+    // 对端关闭且缓冲区已空。
+    bool closed;
+    // 最近一次 ReadBody 定下的本请求线路字节数（头部 + 正文，
+    // 分块编码则是整个分块序列）。
+    int wireBytes;
+
+    HttpFramer() {
+        this.sock = -1;
+        this.tls = null;
+        this.buf = null;
+        this.bufCap = 65536;
+        this.pend = null;
+        this.scanned = 0;
+        this.closed = false;
+        this.wireBytes = 0;
+    }
+
+    static HttpFramer Create(nint sock) {
+        HttpFramer f = new HttpFramer();
+        f.sock = sock;
+        f.buf = TcpClient.RentRecvBuffer(65536);
+        f.bufCap = 65536;
+        f.pend = ByteBuffer.Alloc(4096);
+        return f;
+    }
+
+    /// <summary>从 TLS 连接拆包：除了字节源不同，定界规则与明文
+    /// HTTP 完全一样（TlsStream.RecvIntoAsync 同样给出精确字节数）。</summary>
+    static HttpFramer CreateTls(TlsStream stream) {
+        HttpFramer f = new HttpFramer();
+        f.tls = stream;
+        f.buf = TcpClient.RentRecvBuffer(65536);
+        f.bufCap = 65536;
+        f.pend = ByteBuffer.Alloc(4096);
+        return f;
+    }
+
+    /// <summary>把已经从套接字读出的字节放回流头部。同一端口同时
+    /// 服务 HTTP 与 WebSocket 时，要先看过请求头才能判断协议，
+    /// 已消费的字节由此交还拆包器。</summary>
+    void Prime(string bytes, int len) {
+        if (len > 0) { this.pend.WriteRaw(bytes, len); }
+    }
+
+    /// <summary>尚未消费的字节数。</summary>
+    int Pending() { return this.pend.Length(); }
+
+    /// <summary>对端已关闭且缓冲区里没有剩余字节。</summary>
+    bool Closed() { return this.closed; }
+
+    /// <summary>接收一次，把收到的字节追加到待处理缓冲区。
+    /// 返回收到的字节数，0 表示对端关闭。</summary>
+    async int Fill() {
+        int n = 0;
+        if (this.tls != null) {
+            n = await this.tls.RecvIntoAsync(this.buf, this.bufCap);
+        } else {
+            n = await Socket.RecvIntoAsync(this.sock, this.buf, this.bufCap);
+        }
+        if (n <= 0) {
+            this.closed = true;
+            return 0;
+        }
+        this.pend.WriteRaw(this.buf, n);
+        return n;
+    }
+
+    /// <summary>头部结束空行之后的下标（即正文首字节的位置），
+    /// 空行尚未到达时返回 -1。同时识别 CRLF 与单独 LF 分隔。</summary>
+    int HeaderEnd() {
+        int len = this.pend.Length();
+        int i = this.scanned;
+        while (i < len) {
+            if (this.pend.ByteAt(i) == 10) {
+                if (i + 1 < len && this.pend.ByteAt(i + 1) == 10) { return i + 2; }
+                if (i + 2 < len && this.pend.ByteAt(i + 1) == 13
+                    && this.pend.ByteAt(i + 2) == 10) {
+                    return i + 3;
+                }
+            }
+            i = i + 1;
+        }
+        // 结束空行可能被切在包边界上（"\r\n" | "\r\n"），因此回退
+        // 两个字节重扫，其余前缀不再看。
+        this.scanned = len - 2;
+        if (this.scanned < 0) { this.scanned = 0; }
+        return -1;
+    }
+
+    /// <summary>一直接收，直到完整的头部块到齐。
+    /// 返回头部块长度（含结束空行）；对端在请求中途关闭返回 0；
+    /// 头部块超过 <paramref name="maxHeaderBytes"/> 返回 -431——
+    /// 违规字节在被无限缓冲之前就被拒绝（slowloris 的一种形态是
+    /// 只发头部却永不发空行）。</summary>
+    async int ReadHead(int maxHeaderBytes) {
+        int he = this.HeaderEnd();
+        while (he < 0) {
+            if (this.pend.Length() > maxHeaderBytes) { return -431; }
+            int n = await this.Fill();
+            if (n == 0) { return 0; }
+            he = this.HeaderEnd();
+        }
+        return he;
+    }
+
+    /// <summary>头部块（前 <paramref name="headerLen"/> 个字节）的字符串
+    /// 切片，交给 <see cref="HttpRequest.Parse"/>。</summary>
+    string Head(int headerLen) {
+        return this.pend.Str(0, headerLen);
+    }
+
+    /// <summary>待处理字节中 [off, off+count) 的切片（按长度复制，
+    /// 内嵌 NUL 得以保留）。流式上传用它取出"与头部同包到达"的
+    /// 那段正文，其余部分直接从套接字续读。</summary>
+    string Slice(int off, int count) {
+        return this.pend.Str(off, count);
+    }
+
+    /// <summary>一直接收，直到 <paramref name="req"/> 的正文到齐，并按
+    /// 精确字节数写入 <c>req.body</c> / <c>req.bodyLength</c>。
+    ///
+    /// 返回 0 表示成功；返回 HTTP 状态码表示应当据此拒绝
+    /// （413 超限、400 分块编码畸形）；返回 -1 表示对端在正文
+    /// 中途关闭。分块编码在这里解码，解码后的正文与固定长度
+    /// 正文一样，对处理器不可区分。</summary>
+    async int ReadBody(HttpRequest req, int maxBodyBytes) {
+        int he = req.bodyStart;
+        if (req.chunked) {
+            int st = await this.ReadChunked(req, he, maxBodyBytes);
+            return st;
+        }
+        int total = req.contentLength;
+        if (total <= 0) {
+            req.body = "";
+            req.bodyLength = 0;
+            this.wireBytes = he;
+            return 0;
+        }
+        // 超限的正文在缓冲之前就拒绝：依据声明的长度判定，而不是
+        // 先收完再看。
+        if (total > maxBodyBytes) { return 413; }
+        while (this.pend.Length() - he < total) {
+            int n = await this.Fill();
+            if (n == 0) { return -1; }
+        }
+        req.body = this.pend.Str(he, total);
+        req.bodyLength = total;
+        this.wireBytes = he + total;
+        return 0;
+    }
+
+    /// <summary>本请求在线路上占用的字节数（头部 + 正文，分块编码则
+    /// 是整个分块序列）。<see cref="Consume"/> 用它精确丢弃，
+    /// 缓冲区里剩下的字节属于下一条流水线请求。</summary>
+    int RequestBytes() { return this.wireBytes; }
+
+    /// <summary>丢弃已处理请求的字节，保留其后的流水线字节。</summary>
+    void Consume(int count) {
+        this.pend.Discard(count);
+        this.scanned = 0;
+    }
+
+    /// <summary>解码 Transfer-Encoding: chunked 的请求体。
+    ///
+    /// 逐块读取 "长度(十六进制)[;扩展]CRLF 数据 CRLF"，直到长度为 0 的
+    /// 结束块，其后的尾部头部（trailer）一并跳过。解码结果按字节
+    /// 累积，因此块里的 NUL 不会截断正文；累计长度超过
+    /// <paramref name="maxBodyBytes"/> 立即拒绝，避免用无限多个小块
+    /// 撑爆内存。畸形的长度行按 400 拒绝——不能猜，猜错就等于把
+    /// 剩余字节当成下一条请求（走私）。</summary>
+    async int ReadChunked(HttpRequest req, int he, int maxBodyBytes) {
+        ByteBuffer acc = ByteBuffer.Alloc(4096);
+        int pos = he;              // 线路上的读游标
+        int decoded = 0;
+        while (true) {
+            // 长度行：至少要有一个 LF 才能确定它已完整到达。
+            int lf = this.IndexOfLf(pos);
+            while (lf < 0) {
+                int n = await this.Fill();
+                if (n == 0) { acc.Free(); return -1; }
+                lf = this.IndexOfLf(pos);
+            }
+            int size = 0;
+            int i = pos;
+            bool any = false;
+            bool bad = false;
+            while (i < lf) {
+                int c = this.pend.ByteAt(i);
+                if (c == 13) { break; }
+                if (c == 59) { break; }          // ';' 块扩展，忽略其内容
+                int d = HttpFramer.HexVal(c);
+                if (d < 0) { bad = true; break; }
+                size = size * 16 + d;
+                if (size > maxBodyBytes) { acc.Free(); return 413; }
+                any = true;
+                i = i + 1;
+            }
+            if (bad || !any) { acc.Free(); return 400; }
+            pos = lf + 1;
+            if (size == 0) {
+                // 结束块之后是可选的 trailer，以一个空行收尾。
+                int end = await this.SkipTrailer(pos);
+                if (end < 0) { acc.Free(); return -1; }
+                pos = end;
+                break;
+            }
+            if (decoded + size > maxBodyBytes) { acc.Free(); return 413; }
+            while (this.pend.Length() - pos < size + 2) {
+                int n = await this.Fill();
+                if (n == 0) { acc.Free(); return -1; }
+            }
+            acc.WriteRaw(this.pend.Str(pos, size), size);
+            decoded = decoded + size;
+            pos = pos + size;
+            // 块数据后必须紧跟 CRLF；缺失说明长度撒了谎。
+            int c1 = this.pend.ByteAt(pos);
+            int c2 = this.pend.ByteAt(pos + 1);
+            if (c1 == 13 && c2 == 10) {
+                pos = pos + 2;
+            } else if (c1 == 10) {
+                pos = pos + 1;
+            } else {
+                acc.Free();
+                return 400;
+            }
+        }
+        req.body = acc.Str(0, decoded);
+        req.bodyLength = decoded;
+        // 解码后的正文自定界，处理器看到的与固定长度请求一致。
+        req.contentLength = decoded;
+        acc.Free();
+        this.wireBytes = pos;
+        return 0;
+    }
+
+    /// <summary>跳过结束块之后的 trailer 头部，返回其后的线路下标；
+    /// 对端中途关闭返回 -1。</summary>
+    async int SkipTrailer(int from) {
+        int pos = from;
+        while (true) {
+            int lf = this.IndexOfLf(pos);
+            while (lf < 0) {
+                int n = await this.Fill();
+                if (n == 0) { return -1; }
+                lf = this.IndexOfLf(pos);
+            }
+            int stop = lf;
+            if (stop > pos && this.pend.ByteAt(stop - 1) == 13) { stop = stop - 1; }
+            bool blank = stop == pos;
+            pos = lf + 1;
+            if (blank) { return pos; }
+        }
+        return pos;
+    }
+
+    /// <summary>从 <paramref name="from"/> 起第一个 LF 的下标，没有则 -1。</summary>
+    int IndexOfLf(int from) {
+        int len = this.pend.Length();
+        for (int i = from; i < len; i = i + 1) {
+            if (this.pend.ByteAt(i) == 10) { return i; }
+        }
+        return -1;
+    }
+
+    static int HexVal(int c) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        if (c >= 97 && c <= 102) { return c - 87; }
+        if (c >= 65 && c <= 70) { return c - 55; }
+        return -1;
+    }
+
+    /// <summary>归还接收缓冲区并释放待处理缓冲区。连接关闭时调用；
+    /// 之后不得再使用本拆包器。</summary>
+    void Dispose() {
+        if (this.buf != null) {
+            TcpClient.ReturnRecvBuffer(this.buf, this.bufCap);
+            this.buf = null;
+        }
+        if (this.pend != null) {
+            this.pend.Free();
+            this.pend = null;
+        }
+    }
+}

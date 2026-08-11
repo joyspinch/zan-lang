@@ -194,6 +194,53 @@ class ByteBuffer {
         return this;
     }
 
+    /// <summary>追加 <paramref name="src"/> 开头的 count 个字节，不写
+    /// 长度前缀。长度由调用方给出，因此二进制安全：字符串本身
+    /// 以 NUL 结尾，<c>s.Length</c> 只数到第一个 NUL，而网络收到的
+    /// 字节（HTTP 二进制请求体、上传内容）本就可能含 NUL。</summary>
+    ByteBuffer WriteRaw(string src, int count) {
+        if (count <= 0) { return this; }
+        EnsureRoom(count);
+        NativeMemory.PutString(this.data, this.length, src, count);
+        this.length = this.length + count;
+        return this;
+    }
+
+    /// <summary>已写入字节中下标 i 处的字节（0-255）；越界返回 -1。
+    /// 供扫描分隔符（HTTP 头部空行、分块长度行）时逐字节查看，
+    /// 无需先把缓冲区复制成字符串。</summary>
+    int ByteAt(int i) {
+        if (i < 0 || i >= this.length) { return -1; }
+        Span<byte> sp = new Span<byte>(this.data, this.capacity);
+        return sp[i] & 255;
+    }
+
+    /// <summary>已写入字节中 [off, off+count) 的切片，以字符串返回
+    /// （二进制安全：长度显式给出，内嵌 NUL 得以保留）。
+    /// 越界的区间被钳制到已写入范围内。</summary>
+    string Str(int off, int count) {
+        int start = off;
+        if (start < 0) { start = 0; }
+        if (start > this.length) { start = this.length; }
+        int n = count;
+        if (n < 0) { n = 0; }
+        if (start + n > this.length) { n = this.length - start; }
+        return NativeMemory.GetString(this.data, start, n);
+    }
+
+    /// <summary>丢弃开头的 count 个字节，将其余字节左移。保留内存
+    /// 分配，供“消费完一个消息、把流水线剩余字节留到下轮”的
+    /// 拆包循环复用同一块缓冲区。</summary>
+    ByteBuffer Discard(int count) {
+        int n = count;
+        if (n <= 0) { return this; }
+        if (n >= this.length) { return this.Clear(); }
+        NativeMemory.Copy(this.data, this.data + n, this.length - n);
+        this.length = this.length - n;
+        this.rpos = 0;
+        return this;
+    }
+
     /// <summary>写入长度前缀（varint）UTF-8 字符串。</summary>
     ByteBuffer WriteString(string s) {
         int n = s.Length;

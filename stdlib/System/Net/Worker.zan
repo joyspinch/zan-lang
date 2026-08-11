@@ -91,7 +91,12 @@ class Worker {
     int port;
     string name;
     bool running;
-    int connectionCount;
+    // Live connections on this Worker. Incremented by the accept loop and
+    // decremented by each connection coroutine, which with --async-workers
+    // runs on a different thread than the accept loop: a plain int loses
+    // decrements and the count drifts up until maxConnections rejects
+    // everything.
+    AtomicInt connectionCount;
     int maxConnections;
 
     // ---- http limits (see HttpServer.ServeConnection) ----
@@ -149,28 +154,28 @@ class Worker {
 
     // ---- status/statistics (workerman-style `status`) ----
     // Requests/messages served by this process, across all Workers.
-    static int statRequests = 0;
+    static AtomicInt statRequests = new AtomicInt(0);
 
     // Static-context increment. Do NOT inline `statRequests = statRequests+1`
     // into the instance async handlers: the async lowering captures statics
     // referenced from instance async methods by value, so increments there
     // write to a per-coroutine copy and are lost.
     static void BumpStat() {
-        statRequests = statRequests + 1;
+        long _r = statRequests.Increment();
     }
 
     // Messages/frames/datagrams written back to peers by this process.
-    static int statSent = 0;
+    static AtomicInt statSent = new AtomicInt(0);
 
     static void BumpSent() {
-        statSent = statSent + 1;
+        long _s = statSent.Increment();
     }
 
     // Live connections across every Worker in this process.
     static int LiveConnections() {
         int n = 0;
         for (int i = 0; i < workers.Count; i = i + 1) {
-            n = n + workers[i].connectionCount;
+            n = n + (int)workers[i].connectionCount.Load();
         }
         return n;
     }
@@ -225,7 +230,7 @@ class Worker {
         this.port = port;
         this.name = protocol + "-worker";
         this.running = false;
-        this.connectionCount = 0;
+        this.connectionCount = new AtomicInt(0);
         this.maxConnections = 10000;
         this.maxHeaderBytes = 16384;
         this.maxRequestBytes = 1048576;
@@ -761,8 +766,8 @@ class Worker {
         if (!t.IsOpen()) { return; }
         string key = StatsKey(ProcessHost.WorkerId());
         t.SetInt(key, "pid", ProcessHost.Pid());
-        t.SetInt(key, "recv", statRequests);
-        t.SetInt(key, "sent", statSent);
+        t.SetInt(key, "recv", statRequests.Load());
+        t.SetInt(key, "sent", statSent.Load());
         t.SetInt(key, "conns", LiveConnections());
         t.SetInt(key, "cpu", ServerMetrics.CpuMillis());
         t.SetInt(key, "rss", ServerMetrics.MemoryRssBytes());
@@ -799,8 +804,13 @@ class Worker {
         this.running = false;
     }
 
+    // One connection arrived / left. Wrapped so the atomic's return value is
+    // discarded in one place instead of a throwaway local at every call site.
+    void AddConn() { long _n = this.connectionCount.Increment(); }
+    void DropConn() { long _n = this.connectionCount.Decrement(); }
+
     int GetConnectionCount() {
-        return this.connectionCount;
+        return (int)this.connectionCount.Load();
     }
 
     // ======================================================================
@@ -1321,7 +1331,7 @@ class Worker {
         while (waited < 30000) {
             int conns = 0;
             for (int i = 0; i < workers.Count; i = i + 1) {
-                conns = conns + workers[i].connectionCount;
+                conns = conns + (int)workers[i].connectionCount.Load();
             }
             if (conns <= 0) { break; }
             await Task.Delay(100);
@@ -1499,15 +1509,16 @@ class Worker {
             if (dWall <= 0) { continue; }
             long cpu = ServerMetrics.CpuMillis();
             long rss = ServerMetrics.MemoryRssBytes();
-            long qps = ((statRequests - prevReq) * 1000) / dWall;
+            long nowReq = statRequests.Load();
+            long qps = ((nowReq - prevReq) * 1000) / dWall;
             long cpuPct = -1;
             if (cpu >= 0) { cpuPct = ((cpu - prevCpu) * 100) / dWall; }
-            prevReq = statRequests;
+            prevReq = nowReq;
             prevCpu = cpu;
             Console.WriteLine("[status] pid=" + Convert.ToString(ProcessHost.Pid())
-                + " reqs=" + Convert.ToString(statRequests)
+                + " reqs=" + Convert.ToString(nowReq)
                 + " qps=" + Convert.ToString(qps)
-                + " sent=" + Convert.ToString(statSent)
+                + " sent=" + Convert.ToString(statSent.Load())
                 + " conns=" + Convert.ToString(LiveConnections())
                 + " cpu=" + Convert.ToString(cpuPct) + "%"
                 + " mem=" + Convert.ToString(rss / 1048576) + "MB");
@@ -1625,11 +1636,11 @@ class Worker {
             Task.Spawn(this.RunRaw(clientSock));
             return;
         }
-        if (this.connectionCount >= this.maxConnections) {
+        if (this.connectionCount.Load() >= (long)this.maxConnections) {
             Socket.Close(clientSock);
             return;
         }
-        this.connectionCount = this.connectionCount + 1;
+        this.AddConn();
         if (this.protocol == "http") {
             // An HTTP port with WebSocket callbacks answers both, the way
             // swoole's WebSocket\Server does: the request head decides.
@@ -1694,7 +1705,7 @@ class Worker {
         }
         client.Close();
         conn.closed = true;
-        this.connectionCount = this.connectionCount - 1;
+        this.DropConn();
         if (this.onClose != null) { await this.onClose(conn); }
     }
 
@@ -1706,7 +1717,7 @@ class Worker {
     async void HandleHttp(nint clientSock) {
         await HttpServer.ServeConnection(clientSock, this.RequestHandler(),
             this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeout);
-        this.connectionCount = this.connectionCount - 1;
+        this.DropConn();
     }
 
     // ---- websocket ----
@@ -1718,32 +1729,27 @@ class Worker {
     async void HandleWebSocket(nint clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
 
-        string rawReq = "";
-        int headerEnd = -1;
-        while (headerEnd < 0) {
-            if (rawReq.Length > this.maxHeaderBytes) {
-                client.Close();
-                this.connectionCount = this.connectionCount - 1;
-                return;
-            }
-            string chunk = await client.RecvAsync(65536);
-            if (chunk.Length == 0) {
-                client.Close();
-                this.connectionCount = this.connectionCount - 1;
-                return;
-            }
-            rawReq = rawReq + chunk;
-            headerEnd = HttpServer.FindHeaderEnd(rawReq);
+        // The head is read with the shared HTTP framer, so the bytes that
+        // arrive with it (an HTTP body, pipelined WebSocket frames) keep their
+        // exact count instead of being length-counted with strlen.
+        HttpFramer framer = HttpFramer.Create(clientSock);
+        int headerEnd = await framer.ReadHead(this.maxHeaderBytes);
+        if (headerEnd <= 0) {
+            framer.Dispose();
+            client.Close();
+            this.DropConn();
+            return;
         }
-        HttpRequest req = HttpRequest.Parse(rawReq);
+        HttpRequest req = HttpRequest.Parse(framer.Head(headerEnd), headerEnd);
         string wsKey = req.GetHeader("Sec-WebSocket-Key");
 
         if (wsKey.Length == 0) {
-            // Plain HTTP on the same port. The head is already consumed, so it
-            // is replayed into the HTTP loop rather than re-read.
-            await HttpServer.ServePrimed(clientSock, this.RequestHandler(), rawReq,
+            // Plain HTTP on the same port. The framer already holds the head
+            // (and whatever followed it), so it is handed to the HTTP loop
+            // as-is rather than re-read or converted back to a string.
+            await HttpServer.ServeFramed(clientSock, this.RequestHandler(), framer,
                 this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeout);
-            this.connectionCount = this.connectionCount - 1;
+            this.DropConn();
             return;
         }
 
@@ -1763,10 +1769,13 @@ class Worker {
         // Reassemble whole frames via WsReader (handles partial and coalesced
         // frames), rather than assuming one recv == one frame.
         WsReader reader = new WsReader(clientSock);
-        if (rawReq.Length > headerEnd) {
-            // The client pipelined frames behind the handshake.
-            reader.Prime(rawReq.Substring(headerEnd), rawReq.Length - headerEnd);
+        int afterHead = framer.Pending() - headerEnd;
+        if (afterHead > 0) {
+            // The client pipelined frames behind the handshake. Frame bytes are
+            // binary, so they are sliced out of the framer by exact count.
+            reader.Prime(framer.Slice(headerEnd, afterHead), afterHead);
         }
+        framer.Dispose();
         WsWriter writer = new WsWriter();
         MessageHandler onFrameData = this.MessageHandlerOf();
         bool active = true;
@@ -1820,7 +1829,7 @@ class Worker {
 
         client.Close();
         conn.closed = true;
-        this.connectionCount = this.connectionCount - 1;
+        this.DropConn();
         if (this.onClose != null) { await this.onClose(conn); }
     }
 
@@ -1835,7 +1844,7 @@ class Worker {
             string chunk = await client.RecvAsync(4096);
             if (chunk.Length == 0) {
                 client.Close();
-                this.connectionCount = this.connectionCount - 1;
+                this.DropConn();
                 return;
             }
             req = req + chunk;
@@ -1859,7 +1868,7 @@ class Worker {
             sse.Close();
         }
         // The application owns the SseConnection from here.
-        this.connectionCount = this.connectionCount - 1;
+        this.DropConn();
     }
 
     // ---- mqtt ----
@@ -1867,7 +1876,7 @@ class Worker {
     async void HandleMqtt(nint clientSock) {
         BumpStat();
         await MqttBroker.Global().HandleConnection(clientSock);
-        this.connectionCount = this.connectionCount - 1;
+        this.DropConn();
     }
 
     // ---- udp ----

@@ -213,20 +213,28 @@ class HttpServer {
                                   string pending,
                                   int maxHeaderBytes, int maxRequestBytes,
                                   int timeoutMs) {
+        // 拆包交给 HttpFramer：它按显式字节数攒未消费的字节，因此
+        // 跨包到达的头部、跨包到达的正文、一个包里的多条流水线请求、
+        // 以及含 NUL 的二进制正文都能精确定界（字符串拼接按 strlen
+        // 定长，二进制正文会在第一个 NUL 处截断，声明的
+        // Content-Length 就永远读不满）。
+        HttpFramer framer = HttpFramer.Create(clientSock);
+        framer.Prime(pending, pending.Length);
+        await HttpServer.ServeFramed(clientSock, handler, framer,
+            maxHeaderBytes, maxRequestBytes, timeoutMs);
+    }
+
+    /// <summary>已经用 <see cref="HttpFramer"/> 读过若干字节的连接
+    /// （如 WebSocket 端口先读握手头部）交回 HTTP 循环：拆包器连同
+    /// 其中未消费的字节一并交接，无需把字节转成字符串再放回——
+    /// 二进制正文在这一步转换里会被 NUL 截断。</summary>
+    static async void ServeFramed(nint clientSock, HttpRequestHandler handler,
+                                  HttpFramer framer,
+                                  int maxHeaderBytes, int maxRequestBytes,
+                                  int timeoutMs) {
         TcpClient client = TcpClient.FromSocket(clientSock);
         int watch = HttpDeadline.Arm(clientSock, timeoutMs);
         bool keepAlive = true;
-        // 已收到但尚未构成完整请求的字节。在 keep-alive 循环中
-        // 保留该缓冲是帧解析正确的关键：一次读取可能
-        // 只送来部分请求（下次读取时补全），也可能一次送来多个
-        // 流水线请求（剩余部分留在缓冲区供下轮处理，
-        // 而不会混入当前请求的请求体）。
-        string buffer = pending;
-        // 当整个请求在一次接收中到达（常见情况）时，
-        // `buffer` 直接别名连接共享的接收缓冲区，而非
-        // 复制。该别名只在下次接收前有效，因此
-        // 在后续任何 RecvReuseAsync 之前都会先脱离（复制）。
-        bool aliased = false;
         int reject = 0;
 
         while (keepAlive) {
@@ -236,29 +244,17 @@ class HttpServer {
             HttpDeadline.Touch(watch, timeoutMs);
 
             // 1) 一直读取，直到完整请求头块到达。
-            int headerEnd = HttpServer.FindHeaderEnd(buffer);
-            while (headerEnd < 0) {
-                if (buffer.Length > maxHeaderBytes) { reject = 431; break; }
-                if (aliased) { buffer = buffer.Substring(0, buffer.Length); aliased = false; }
-                string chunk = await client.RecvReuseAsync();
-                if (chunk.Length == 0) { keepAlive = false; break; }
-                if (buffer.Length == 0) {
-                    buffer = chunk;
-                    aliased = true;
-                } else {
-                    buffer = buffer + chunk;
-                }
-                headerEnd = HttpServer.FindHeaderEnd(buffer);
-            }
-            if (reject != 0) { break; }
-            if (!keepAlive) { break; }
+            int headerEnd = await framer.ReadHead(maxHeaderBytes);
+            if (headerEnd == -431) { reject = 431; break; }
+            if (headerEnd <= 0) { keepAlive = false; break; }
 
             // 2) 只解析一次：此时请求头已完整，每个请求头字段
             //    都是最终值；只有请求体可能仍在传输中。然后
             //    继续读取，直到请求体声明的字节数全部到齐。
-            HttpRequest request = HttpRequest.Parse(buffer);
+            HttpRequest request = HttpRequest.Parse(framer.Head(headerEnd),
+                                                   headerEnd);
             // 定界失败（Content-Length 溢出/重复不一致、非数字、
-            // Transfer-Encoding 未实现等）→ 拒绝，不切分正文：
+            // 未实现的 Transfer-Encoding 等）→ 拒绝，不切分正文：
             // 剩余字节可能是走私的伪装请求，绝不能进入下轮。
             if (request.parseStatus != 0) {
                 reject = request.parseStatus;
@@ -266,29 +262,14 @@ class HttpServer {
             }
             int bodyLen = request.contentLength;
             if (bodyLen < 0) { bodyLen = 0; }
-            int need = headerEnd + bodyLen;
-            if (need > maxRequestBytes) { reject = 413; break; }
-            while (buffer.Length < need) {
-                if (aliased) { buffer = buffer.Substring(0, buffer.Length); aliased = false; }
-                string chunk = await client.RecvReuseAsync();
-                if (chunk.Length == 0) { keepAlive = false; break; }
-                buffer = buffer + chunk;
-            }
-            if (!keepAlive && buffer.Length < need) { break; }
-
-            // 3) 精确切出本请求的请求体；剩余字节
-            //    作为下一个流水线请求的开头。
-            if (bodyLen > 0) {
-                request.body = buffer.Substring(headerEnd, bodyLen);
-            } else {
-                request.body = "";
-            }
-            if (buffer.Length > need) {
-                buffer = buffer.Substring(need);
-            } else {
-                buffer = "";
-            }
-            aliased = false;
+            if (headerEnd + bodyLen > maxRequestBytes) { reject = 413; break; }
+            // 3) 正文到齐（分块编码在此解码），随后精确丢弃本请求的
+            //    字节，剩余字节即下一条流水线请求的开头。
+            int bodyStatus = await framer.ReadBody(request,
+                maxRequestBytes - headerEnd);
+            if (bodyStatus > 0) { reject = bodyStatus; break; }
+            if (bodyStatus < 0) { keepAlive = false; break; }
+            framer.Consume(framer.RequestBytes());
             keepAlive = request.keepAlive;
             Worker.BumpStat();
 
@@ -351,6 +332,7 @@ class HttpServer {
         }
 
         HttpDeadline.Disarm(watch);
+        framer.Dispose();
         client.Close();
     }
 
@@ -399,6 +381,13 @@ class HttpDeadlineSlot {
 /// 协程会因读取到 0 字节被唤醒，沿正常断连路径
 /// 展开（释放槽位）；若在此处直接关闭描述符，会卡住
 /// 该协程并泄漏槽位。
+///
+/// 槽位表是进程级的，而连接协程可能跑在不同 worker 线程上
+/// （<c>--async-workers</c>），因此每一处表访问都在
+/// <c>lock (slots)</c> 里：否则 <see cref="Arm"/> 的 <c>slots.Add</c>
+/// 会与另一个线程的 <c>slots[slot]</c> 同时发生，或两个连接
+/// 从自由列表拿到同一个槽位。临界区里只有列表操作和
+/// shutdown 系统调用，不包含 await。
 /// </summary>
 class HttpDeadline {
     static List<HttpDeadlineSlot> slots = new List<HttpDeadlineSlot>();
@@ -413,29 +402,33 @@ class HttpDeadline {
     /// 截止时间被禁用（timeoutMs &lt;= 0）时返回 -1。</summary>
     static int Arm(nint sock, int timeoutMs) {
         if (timeoutMs <= 0) { return -1; }
-        if (!sweeping) {
-            sweeping = true;
-            nowMs = Stopwatch.GetMilliseconds();
-            Task.Spawn(HttpDeadline.Sweep());
+        lock (slots) {
+            if (!sweeping) {
+                sweeping = true;
+                nowMs = Stopwatch.GetMilliseconds();
+                Task.Spawn(HttpDeadline.Sweep());
+            }
+            int n = freeSlots.Count;
+            if (n > 0) {
+                int slot = freeSlots[n - 1];
+                freeSlots.RemoveAt(n - 1);
+                slots[slot].sock = sock;
+                slots[slot].deadline = nowMs + timeoutMs;
+                slots[slot].fired = false;
+                return slot;
+            }
+            slots.Add(new HttpDeadlineSlot(sock, nowMs + timeoutMs));
+            return slots.Count - 1;
         }
-        int n = freeSlots.Count;
-        if (n > 0) {
-            int slot = freeSlots[n - 1];
-            freeSlots.RemoveAt(n - 1);
-            slots[slot].sock = sock;
-            slots[slot].deadline = nowMs + timeoutMs;
-            slots[slot].fired = false;
-            return slot;
-        }
-        slots.Add(new HttpDeadlineSlot(sock, nowMs + timeoutMs));
-        return slots.Count - 1;
     }
 
     /// <summary>为某个槽位重启时间窗口（每个请求调用一次）。</summary>
     static void Touch(int slot, int timeoutMs) {
         if (slot < 0) { return; }
-        slots[slot].deadline = nowMs + timeoutMs;
-        slots[slot].fired = false;
+        lock (slots) {
+            slots[slot].deadline = nowMs + timeoutMs;
+            slots[slot].fired = false;
+        }
     }
 
     /// <summary>当扫描器已对该槽位执行挂断时返回 true，即唤醒
@@ -443,14 +436,18 @@ class HttpDeadline {
     /// 超时的调用方（HTTP 客户端）必须在 Disarm 之前查询。</summary>
     static bool Expired(int slot) {
         if (slot < 0) { return false; }
-        return slots[slot].fired;
+        lock (slots) {
+            return slots[slot].fired;
+        }
     }
 
     /// <summary>连接结束时释放槽位。</summary>
     static void Disarm(int slot) {
         if (slot < 0) { return; }
-        slots[slot].sock = -1;
-        freeSlots.Add(slot);
+        lock (slots) {
+            slots[slot].sock = -1;
+            freeSlots.Add(slot);
+        }
     }
 
     // 单次扫描：刷新粗粒度时钟并对超时的连接执行挂断。
@@ -458,24 +455,28 @@ class HttpDeadline {
     // 按值捕获——时钟更新会丢失，
     // 导致所有连接都看起来超时。
     static bool SweepOnce() {
-        nowMs = Stopwatch.GetMilliseconds();
-        int n = slots.Count;
-        for (int i = 0; i < n; i = i + 1) {
-            HttpDeadlineSlot slot = slots[i];
-            nint s = slot.sock;
-            if (s >= 0 && nowMs > slot.deadline) {
-                // 将截止时间推远，确保每个槽位只被挂断一次；
-                // 归属协程在展开时会通过 Disarm 释放它。
-                slot.deadline = nowMs + 3600000;
-                slot.fired = true;
-                Socket.ShutdownBoth(s);
+        lock (slots) {
+            nowMs = Stopwatch.GetMilliseconds();
+            int n = slots.Count;
+            for (int i = 0; i < n; i = i + 1) {
+                HttpDeadlineSlot slot = slots[i];
+                nint s = slot.sock;
+                if (s >= 0 && nowMs > slot.deadline) {
+                    // 将截止时间推远，确保每个槽位只被挂断一次；
+                    // 归属协程在展开时会通过 Disarm 释放它。
+                    slot.deadline = nowMs + 3600000;
+                    slot.fired = true;
+                    Socket.ShutdownBoth(s);
+                }
             }
+            return slots.Count > freeSlots.Count;
         }
-        return slots.Count > freeSlots.Count;
     }
 
     static void StopSweeping() {
-        sweeping = false;
+        lock (slots) {
+            sweeping = false;
+        }
     }
 
     // 扫描器只在有连接被 Arm 时存活：让一个协程常驻于

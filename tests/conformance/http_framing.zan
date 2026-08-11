@@ -1,0 +1,181 @@
+// Conformance: HTTP/1.1 request framing is byte-accurate.
+// The connection loop must frame requests by explicit byte counts, not by
+// strlen: a binary body carrying NUL bytes has to arrive whole, a body split
+// across TCP segments has to be reassembled, two pipelined requests inside one
+// segment must not bleed into each other, and chunked bodies (including chunks
+// split across segments, chunk extensions and trailers) must decode to the
+// exact same bytes as an equivalent Content-Length body.
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+
+class Program {
+    static int PORT = 9531;
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    // 回显收到的正文字节数与校验和：长度用 bodyLength（正文可能含
+    // NUL，body.Length 只数到第一个 NUL），校验和保证收到的是原始
+    // 字节而不是被截断/错位的一段。
+    static async HttpResponse Handle(HttpRequest req) {
+        int n = req.bodyLength;
+        long sum = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            sum = sum + (long)(req.body[i] & 255);
+        }
+        return HttpResponse.Text(req.path + " " + Convert.ToString(n)
+            + " " + Convert.ToString(sum));
+    }
+
+    // 响应正文（Content-Length 之后的部分）。
+    static string BodyOf(string resp) {
+        int len = resp.Length;
+        for (int i = 0; i + 3 < len; i = i + 1) {
+            if ((resp[i] & 255) == 13 && (resp[i + 1] & 255) == 10
+                && (resp[i + 2] & 255) == 13 && (resp[i + 3] & 255) == 10) {
+                return resp.Substring(i + 4);
+            }
+        }
+        return "";
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer server = new HttpServer("127.0.0.1", PORT);
+        server.OnRequest(Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(50);
+
+        // 1. 含 NUL 的二进制正文：256 字节 0..255。strlen 语义下正文在
+        //    第 1 个字节（0x00）就结束，Content-Length 永远读不满。
+        {
+            StringBuilder sb = new StringBuilder();
+            long expect = 0;
+            for (int i = 0; i < 256; i = i + 1) {
+                byte[] one = new byte[2];
+                one[0] = (byte)i;
+                one[1] = 0;
+                sb.Append(one.ToStr(0, 1));
+                expect = expect + (long)i;
+            }
+            string body = sb.ToString();
+            string head = "POST /bin HTTP/1.1\r\nHost: t\r\nContent-Length: 256\r\n\r\n";
+            TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT, 3000);
+            int _h = await c.SendAsync(head);
+            int _b = await c.SendBytesAsync(body, 256);
+            string resp = await c.RecvAsync(4096);
+            Check(BodyOf(resp) == "/bin 256 " + Convert.ToString(expect),
+                "binary body with NUL bytes");
+            c.Close();
+        }
+
+        // 2. 正文跨 TCP 分段到达：头部先到，正文分三次发。
+        {
+            TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT, 3000);
+            int _h = await c.SendAsync(
+                "POST /split HTTP/1.1\r\nHost: t\r\nContent-Length: 9\r\n\r\n");
+            await Task.Delay(20);
+            int _a = await c.SendAsync("abc");
+            await Task.Delay(20);
+            int _b = await c.SendAsync("def");
+            await Task.Delay(20);
+            int _d = await c.SendAsync("ghi");
+            string resp = await c.RecvAsync(4096);
+            // 'a'..'i' = 97..105，和 = 909
+            Check(BodyOf(resp) == "/split 9 909", "body split across segments");
+            c.Close();
+        }
+
+        // 3. 一次发出两条带正文的请求（流水线）：第一条的正文不能把
+        //    第二条吞掉，第二条也必须被完整处理。
+        {
+            TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT, 3000);
+            int _p = await c.SendAsync(
+                "POST /one HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\nabc"
+                + "POST /two HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n\r\nde");
+            string resp = "";
+            for (int i = 0; i < 4; i = i + 1) {
+                string part = await c.RecvAsync(4096, 1000);
+                if (part.Length == 0) { break; }
+                resp = resp + part;
+                if (resp.Length >= 2 && Program.Count(resp, "/two ") > 0) { break; }
+            }
+            Check(Program.Count(resp, "/one 3 294") > 0
+                && Program.Count(resp, "/two 2 201") > 0,
+                "two pipelined requests with bodies");
+            c.Close();
+        }
+
+        // 4. 分块编码：块跨分段发送，带块扩展与 trailer，解码结果必须
+        //    与等价的 Content-Length 正文一致。
+        {
+            TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT, 3000);
+            int _h = await c.SendAsync(
+                "POST /chunk HTTP/1.1\r\nHost: t\r\n"
+                + "Transfer-Encoding: chunked\r\n\r\n");
+            await Task.Delay(20);
+            int _c1 = await c.SendAsync("3;ext=1\r\nabc\r\n");
+            await Task.Delay(20);
+            int _c2 = await c.SendAsync("6\r\ndefghi");
+            await Task.Delay(20);
+            int _c3 = await c.SendAsync("\r\n0\r\nX-Trace: t\r\n\r\n");
+            string resp = await c.RecvAsync(4096, 2000);
+            // 'a'..'i' = 909
+            Check(BodyOf(resp) == "/chunk 9 909", "chunked body decoded");
+            c.Close();
+        }
+
+        // 5. 分块请求之后紧跟一条普通请求（同一连接）：分块序列的
+        //    结束位置必须精确，否则下一条请求会被错位解析。
+        {
+            TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT, 3000);
+            int _p = await c.SendAsync(
+                "POST /c1 HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n"
+                + "2\r\nhi\r\n0\r\n\r\n"
+                + "POST /c2 HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n\r\nhi");
+            string resp = "";
+            for (int i = 0; i < 4; i = i + 1) {
+                string part = await c.RecvAsync(4096, 1000);
+                if (part.Length == 0) { break; }
+                resp = resp + part;
+                if (Program.Count(resp, "/c2 ") > 0) { break; }
+            }
+            Check(Program.Count(resp, "/c1 2 209") > 0
+                && Program.Count(resp, "/c2 2 209") > 0,
+                "request after chunked body");
+            c.Close();
+        }
+
+        server.Stop();
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        return 0;
+    }
+
+    // needle 在 hay 中出现的次数。
+    static int Count(string hay, string needle) {
+        int hl = hay.Length;
+        int nl = needle.Length;
+        if (nl == 0 || hl < nl) { return 0; }
+        int hits = 0;
+        for (int i = 0; i + nl <= hl; i = i + 1) {
+            int j = 0;
+            while (j < nl && (hay[i + j] & 255) == (needle[j] & 255)) {
+                j = j + 1;
+            }
+            if (j == nl) { hits = hits + 1; }
+        }
+        return hits;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

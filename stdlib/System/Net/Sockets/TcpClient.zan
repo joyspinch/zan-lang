@@ -192,11 +192,16 @@ class TcpClient {
     /// recvPoolSize 构建的，所以借出的容量总是已知且足够。</summary>
     static string RentRecvBuffer(int size) {
         if (size == TcpClient.recvPoolSize) {
-            int n = TcpClient.recvPool.Count;
-            if (n > 0) {
-                string buf = TcpClient.recvPool[n - 1];
-                TcpClient.recvPool.RemoveAt(n - 1);
-                return buf;
+            // 池是进程级的，而协程运行在多个 worker 线程上
+            // （--async-workers），两条连接同时借用时，"看 Count
+            // 再按下标取" 会读到已被另一线程摘走的位置。
+            lock (TcpClient.recvPool) {
+                int n = TcpClient.recvPool.Count;
+                if (n > 0) {
+                    string buf = TcpClient.recvPool[n - 1];
+                    TcpClient.recvPool.RemoveAt(n - 1);
+                    return buf;
+                }
             }
         }
         // 把复用缓冲区分配为真正的 ARC 托管字符串。与原始 calloc
@@ -215,8 +220,10 @@ class TcpClient {
     static void ReturnRecvBuffer(string buf, int size) {
         if (buf == null) { return; }
         if (size != TcpClient.recvPoolSize) { return; }
-        if (TcpClient.recvPool.Count >= TcpClient.recvPoolMax) { return; }
-        TcpClient.recvPool.Add(buf);
+        lock (TcpClient.recvPool) {
+            if (TcpClient.recvPool.Count >= TcpClient.recvPoolMax) { return; }
+            TcpClient.recvPool.Add(buf);
+        }
     }
 
     /// <summary>同步发送数据。</summary>

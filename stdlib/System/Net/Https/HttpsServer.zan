@@ -114,50 +114,34 @@ class HttpsServer {
 
         int watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
         bool keepAlive = true;
-        string buffer = "";
+        // 与明文 HTTP 用同一个拆包器（字节源换成 TLS 记录层）：跨包
+        // 头部/正文、流水线、含 NUL 的二进制正文、分块编码的定界规则
+        // 因此只有一份实现。
+        HttpFramer framer = HttpFramer.CreateTls(stream);
         int reject = 0;
 
         while (keepAlive) {
-            int headerEnd = HttpServer.FindHeaderEnd(buffer);
-            while (headerEnd < 0) {
-                if (buffer.Length > this.maxHeaderBytes) { reject = 431; break; }
-                string chunk = await stream.RecvAsync(65536);
-                if (chunk.Length == 0) { keepAlive = false; break; }
-                buffer = buffer + chunk;
-                headerEnd = HttpServer.FindHeaderEnd(buffer);
-            }
-            if (reject != 0) { break; }
-            if (!keepAlive) { break; }
+            int headerEnd = await framer.ReadHead(this.maxHeaderBytes);
+            if (headerEnd == -431) { reject = 431; break; }
+            if (headerEnd <= 0) { keepAlive = false; break; }
 
-            HttpRequest request = HttpRequest.Parse(buffer);
+            HttpRequest request = HttpRequest.Parse(framer.Head(headerEnd),
+                                                   headerEnd);
             // 定界失败（Content-Length 溢出/重复不一致、非数字、
-            // Transfer-Encoding 未实现等）→ 拒绝，不切分正文。
+            // 未实现的 Transfer-Encoding 等）→ 拒绝，不切分正文。
             if (request.parseStatus != 0) {
                 reject = request.parseStatus;
                 break;
             }
             int bodyLen = request.contentLength;
             if (bodyLen < 0) { bodyLen = 0; }
-            int need = headerEnd + bodyLen;
-            if (need > this.maxRequestBytes) { reject = 413; break; }
-            while (buffer.Length < need) {
-                HttpDeadline.Touch(watch, this.requestTimeoutMs);
-                string chunk = await stream.RecvAsync(65536);
-                if (chunk.Length == 0) { keepAlive = false; break; }
-                buffer = buffer + chunk;
-            }
-            if (!keepAlive && buffer.Length < need) { break; }
-
-            if (bodyLen > 0) {
-                request.body = buffer.Substring(headerEnd, bodyLen);
-            } else {
-                request.body = "";
-            }
-            if (buffer.Length > need) {
-                buffer = buffer.Substring(need);
-            } else {
-                buffer = "";
-            }
+            if (headerEnd + bodyLen > this.maxRequestBytes) { reject = 413; break; }
+            HttpDeadline.Touch(watch, this.requestTimeoutMs);
+            int bodyStatus = await framer.ReadBody(request,
+                this.maxRequestBytes - headerEnd);
+            if (bodyStatus > 0) { reject = bodyStatus; break; }
+            if (bodyStatus < 0) { keepAlive = false; break; }
+            framer.Consume(framer.RequestBytes());
             keepAlive = request.keepAlive;
 
             HttpDeadline.Touch(watch, this.requestTimeoutMs);
@@ -198,6 +182,7 @@ class HttpsServer {
         }
 
         HttpDeadline.Disarm(watch);
+        framer.Dispose();
         stream.Close();
         Socket.Close(clientSock);
         this.activeConnections = this.activeConnections - 1;

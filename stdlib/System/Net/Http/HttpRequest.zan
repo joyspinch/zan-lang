@@ -18,6 +18,18 @@ class HttpRequest {
     string contentType;
     int contentLength;
     bool keepAlive;
+    // 正文的真实字节数。字符串以 NUL 结尾，body.Length 只数到第一个
+    // NUL，二进制请求体（上传、protobuf、压缩内容）会因此被截断，
+    // 所以长度单独记录，凡按长度处理正文的地方都用它。
+    int bodyLength;
+    // 请求体采用分块传输编码（Transfer-Encoding: chunked）。头部解析
+    // 只负责识别它：解码要读取头部之后的字节，是连接循环
+    // （HttpFramer）的职责。
+    bool chunked;
+    // 头部块结束之后的字节下标，即正文首字节在 raw 中的位置。
+    // 流水线连接上其后的字节是"本请求正文 + 下一条请求"，只有按
+    // contentLength 精确切分才不会把下一条请求吞进正文。
+    int bodyStart;
     // 请求定界/头部解析失败的原因（HTTP 状态码；0 = 正常）。
     // 服务器在信任 contentLength 切分正文之前必须检查它——
     // 回绕的 Content-Length、重复且不一致的 Content-Length、
@@ -35,6 +47,9 @@ class HttpRequest {
         this.contentType = "";
         this.contentLength = 0;
         this.keepAlive = true;
+        this.bodyLength = 0;
+        this.chunked = false;
+        this.bodyStart = 0;
         this.parseStatus = 0;
     }
 
@@ -46,8 +61,17 @@ class HttpRequest {
     /// 本实现原地遍历缓冲区，只分配
     /// 实际提取的那几个字段。</summary>
     static HttpRequest Parse(string raw) {
+        return HttpRequest.Parse(raw, raw.Length);
+    }
+
+    /// <summary>把 <paramref name="raw"/> 开头的 <paramref name="rawLen"/>
+    /// 个字节解析为请求。字节数由调用方给出：连接循环从套接字
+    /// 得到的是精确计数，而 <c>raw.Length</c> 会在正文的第一个 NUL
+    /// 处停下，据此切分正文会把二进制上传截断。</summary>
+    static HttpRequest Parse(string raw, int rawLen) {
         HttpRequest req = new HttpRequest();
-        int len = raw.Length;
+        int len = rawLen;
+        if (len < 0) { len = 0; }
         if (len == 0) { return req; }
 
         // 请求行：扫描到 '\n'，再去掉末尾的 '\r'。
@@ -178,6 +202,16 @@ class HttpRequest {
                         req.contentLength = (int)clAcc;
                     }
                 } else if (RegionIs(raw, pos, colonPos, "transfer-encoding")) {
+                    // 只有值恰好是 chunked 时正文才自定界
+                    // （RFC 7230 §3.3.3）。其它编码（gzip 等）或
+                    // 叠加编码无法据此找到正文结尾，仍按未实现处理。
+                    int teStop = lineStop;
+                    while (teStop > vStart && (raw[teStop - 1] & 255) == 32) {
+                        teStop = teStop - 1;
+                    }
+                    if (RegionIs(raw, vStart, teStop, "chunked")) {
+                        req.chunked = true;
+                    }
                     // 服务器不实现 chunked 解码，绝不能忽略
                     // Transfer-Encoding——否则按 Content-Length（或无）
                     // 切分正文，而真实正文是分块编码，剩余 chunk 就被
@@ -221,15 +255,30 @@ class HttpRequest {
             req.keepAlive = !connClose;
         }
         if (teSeen && req.parseStatus == 0) {
-            req.parseStatus = clSeen ? 400 : 501;
+            // TE 与 CL 同时出现是走私特征 → 400。单独的 chunked
+            // 由连接循环解码；其它编码找不到正文边界 → 501。
+            if (clSeen) {
+                req.parseStatus = 400;
+                req.chunked = false;
+            } else if (!req.chunked) {
+                req.parseStatus = 501;
+            }
         }
         if (headersStop > headersStart) {
             req.rawHeaders = raw.Substring(headersStart, headersStop - headersStart);
         }
 
-        // 正文
-        if (pos < len) {
-            req.body = raw.Substring(pos);
+        // 正文。pos 此时指向头部块之后的第一个字节；缓冲区里的
+        // 剩余字节在流水线连接上是"本请求正文 + 下一条请求"，因此
+        // 最多取 contentLength 字节；剩下的由调用方（连接循环）
+        // 按 bodyStart/bodyLength 切分并留到下轮。
+        req.bodyStart = pos;
+        if (pos < len && !req.chunked) {
+            int avail = len - pos;
+            int take = avail;
+            if (clSeen && req.contentLength < avail) { take = req.contentLength; }
+            req.body = raw.Substring(pos, take);
+            req.bodyLength = take;
         }
 
         return req;

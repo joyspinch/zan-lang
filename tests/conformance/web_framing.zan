@@ -1,0 +1,171 @@
+// Conformance: the MVC (System.Web) connection loop frames requests by exact
+// byte counts, exactly like the standalone HttpServer loop. Both loops now
+// share HttpFramer, and this test pins the WebApp side of that contract:
+// a binary body with NUL bytes, a body split across TCP segments, two
+// pipelined requests with bodies, and a chunked body.
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Web;
+
+class Program {
+    static int PORT = 9541;
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    // 回显正文字节数与校验和：长度取 request.bodyLength（正文可能含
+    // NUL），校验和保证收到的是原始字节而非截断/错位的一段。
+    static async bool Echo(HttpContext ctx) {
+        int n = ctx.request.bodyLength;
+        long sum = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            sum = sum + (long)(ctx.request.body[i] & 255);
+        }
+        ctx.Text(ctx.path + " " + Convert.ToString(n) + " " + Convert.ToString(sum));
+        return true;
+    }
+
+    static string BodyOf(string resp) {
+        int len = resp.Length;
+        for (int i = 0; i + 3 < len; i = i + 1) {
+            if ((resp[i] & 255) == 13 && (resp[i + 1] & 255) == 10
+                && (resp[i + 2] & 255) == 13 && (resp[i + 3] & 255) == 10) {
+                return resp.Substring(i + 4);
+            }
+        }
+        return "";
+    }
+
+    static int Count(string hay, string needle) {
+        int hl = hay.Length;
+        int nl = needle.Length;
+        if (nl == 0 || hl < nl) { return 0; }
+        int hits = 0;
+        for (int i = 0; i + nl <= hl; i = i + 1) {
+            int j = 0;
+            while (j < nl && (hay[i + j] & 255) == (needle[j] & 255)) {
+                j = j + 1;
+            }
+            if (j == nl) { hits = hits + 1; }
+        }
+        return hits;
+    }
+
+    static TcpListener listener;
+    static bool listening = true;
+
+    static async void Accept(WebApp app) {
+        TcpListener l = new TcpListener("127.0.0.1", PORT);
+        l.Start();
+        Program.listener = l;
+        while (Program.listening) {
+            nint sock = await l.AcceptAsync();
+            if (sock >= 0) { Task.Spawn(app.HandleConnection(sock)); }
+        }
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        WebApp app = new WebApp("127.0.0.1", PORT);
+        Route _r1 = app.Post("/bin", Echo);
+        Route _r2 = app.Post("/split", Echo);
+        Route _r3 = app.Post("/one", Echo);
+        Route _r4 = app.Post("/two", Echo);
+        Route _r5 = app.Post("/chunk", Echo);
+        // 直接驱动被测的连接循环，而不是 app.Start()：启动横幅会打印
+        // pid，输出就不再可复现（determinism 用例要求两次运行逐字节
+        // 相同）。accept 之后走的是同一个 HandleConnection。
+        Task.Spawn(Accept(app));
+        await Task.Delay(100);
+
+        // 1. 含 NUL 的二进制正文（0..255）。
+        {
+            StringBuilder sb = new StringBuilder();
+            long expect = 0;
+            for (int i = 0; i < 256; i = i + 1) {
+                byte[] one = new byte[2];
+                one[0] = (byte)i;
+                one[1] = 0;
+                sb.Append(one.ToStr(0, 1));
+                expect = expect + (long)i;
+            }
+            string body = sb.ToString();
+            TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT, 3000);
+            int _h = await c.SendAsync(
+                "POST /bin HTTP/1.1\r\nHost: t\r\nContent-Length: 256\r\n\r\n");
+            int _b = await c.SendBytesAsync(body, 256);
+            string resp = await c.RecvAsync(4096, 2000);
+            Check(BodyOf(resp) == "/bin 256 " + Convert.ToString(expect),
+                "mvc binary body with NUL bytes");
+            c.Close();
+        }
+
+        // 2. 正文跨 TCP 分段。
+        {
+            TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT, 3000);
+            int _h = await c.SendAsync(
+                "POST /split HTTP/1.1\r\nHost: t\r\nContent-Length: 9\r\n\r\n");
+            await Task.Delay(20);
+            int _a = await c.SendAsync("abc");
+            await Task.Delay(20);
+            int _b = await c.SendAsync("def");
+            await Task.Delay(20);
+            int _d = await c.SendAsync("ghi");
+            string resp = await c.RecvAsync(4096, 2000);
+            Check(BodyOf(resp) == "/split 9 909", "mvc body split across segments");
+            c.Close();
+        }
+
+        // 3. 同一分段里的两条带正文请求（流水线）。
+        {
+            TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT, 3000);
+            int _p = await c.SendAsync(
+                "POST /one HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\nabc"
+                + "POST /two HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n\r\nde");
+            string resp = "";
+            for (int i = 0; i < 4; i = i + 1) {
+                string part = await c.RecvAsync(4096, 1000);
+                if (part.Length == 0) { break; }
+                resp = resp + part;
+                if (Count(resp, "/two ") > 0) { break; }
+            }
+            Check(Count(resp, "/one 3 294") > 0 && Count(resp, "/two 2 201") > 0,
+                "mvc two pipelined requests with bodies");
+            c.Close();
+        }
+
+        // 4. 分块编码正文（跨分段 + 块扩展 + trailer）。
+        {
+            TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT, 3000);
+            int _h = await c.SendAsync(
+                "POST /chunk HTTP/1.1\r\nHost: t\r\n"
+                + "Transfer-Encoding: chunked\r\n\r\n");
+            await Task.Delay(20);
+            int _c1 = await c.SendAsync("3;ext=1\r\nabc\r\n");
+            await Task.Delay(20);
+            int _c2 = await c.SendAsync("6\r\ndefghi");
+            await Task.Delay(20);
+            int _c3 = await c.SendAsync("\r\n0\r\nX-Trace: t\r\n\r\n");
+            string resp = await c.RecvAsync(4096, 2000);
+            Check(BodyOf(resp) == "/chunk 9 909", "mvc chunked body decoded");
+            c.Close();
+        }
+
+        Program.listening = false;
+        if (Program.listener != null) { Program.listener.Stop(); }
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}
