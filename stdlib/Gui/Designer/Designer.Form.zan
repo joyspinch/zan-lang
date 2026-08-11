@@ -112,14 +112,15 @@ partial class Designer {
         // --- 缩放与平移（两种布局通用）---
         RibbonGroup gz = new RibbonGroup(Designer.T("Zoom", "缩放"));
         int zpct = winZoom;
-        if (zpct <= 0) { zpct = 1000; }
+        if (zpct <= 0) { zpct = lastFitPct; }
         string zs = Convert.ToString(zpct / 10) + "%";
+        if (winZoom <= 0) { zs = Designer.T("Fit ", "适应 ") + zs; }
         RibbonItem zout = RibbonItem.Small("minus", Designer.T("Zoom out", "缩小"));
-        zout.SetTip(Designer.T("Zoom out 10% (50%-200%)", "缩小 10%（50%–200%）"));
+        zout.SetTip(Designer.T("Zoom out 10% (25%-200%)", "缩小 10%（25%–200%）"));
         RibbonItem zlvl = RibbonItem.Small("search", zs).SetMenu();
-        zlvl.SetTip(Designer.T("Pick a zoom level (50%-200%)", "选择缩放比例（50%–200%）"));
+        zlvl.SetTip(Designer.T("Pick a zoom level, or Fit to see the whole design", "选择缩放比例，或用「适应」看到整张设计"));
         RibbonItem zin = RibbonItem.Small("plus", Designer.T("Zoom in", "放大"));
-        zin.SetTip(Designer.T("Zoom in 10% (50%-200%)", "放大 10%（50%–200%）"));
+        zin.SetTip(Designer.T("Zoom in 10% (25%-200%)", "放大 10%（25%–200%）"));
         gz.Add(zout);
         acts.Add("zout");
         gz.Add(zlvl);
@@ -237,28 +238,30 @@ partial class Designer {
         }
     }
 
-    /// 放大/缩小一级（10%），钳制在 50%–200%。
+    /// 放大/缩小一级（10%），钳制在 25%–200%。从「适应」
+    /// 起步时以上一帧实际算出的适应比例为基准，缩放是连续的。
     void ZoomStep(int dir) {
         int z = winZoom;
-        if (z <= 0) { z = 1000; }
+        if (z <= 0) { z = lastFitPct; }
         z = z + dir * 100;
-        if (z < 500) { z = 500; }
+        if (z < 250) { z = 250; }
         if (z > 2000) { z = 2000; }
         winZoom = z;
     }
 
-    /// 缩放档位（千分比，1000 = 100%），50%–200% 与
+    /// 缩放档位（千分比，1000 = 100%），0 = 适应视口，与
     /// 缩放下拉菜单一一对应。
     List<int> ZoomPresets() {
-        return new List<int>{ 500, 600, 700, 800, 900, 1000,
+        return new List<int>{ 0, 250, 330, 500, 600, 700, 800, 900, 1000,
                               1100, 1200, 1300, 1400, 1500, 2000 };
     }
 
-    /// 缩放下拉菜单的显示标签（"50%" .. "200%"）。
+    /// 缩放下拉菜单的显示标签（"适应"、"25%" .. "200%"）。
     List<string> ZoomMenuLabels() {
         List<int> ps = this.ZoomPresets();
         List<string> ls = new List<string>();
         for (int i = 0; i < ps.Count; i = i + 1) {
+            if (ps[i] <= 0) { ls.Add(Designer.T("Fit", "适应")); continue; }
             ls.Add(Convert.ToString(ps[i] / 10) + "%");
         }
         return ls;
@@ -392,10 +395,7 @@ partial class Designer {
     /// 的 +6 / +26 偏移一致），返回内容框高度。
     int LayoutFlowKids(FormField f) {
         int tab = 0 - 1;
-        if (f.kind == "Tabs") {
-            tab = f.uiState.Get();
-            if (tab < 0 || tab >= f.OptionCount()) { tab = 0; }
-        }
+        if (f.kind == "Tabs") { tab = Designer.TabActivePage(f); }
         int w0 = f.fw - 12;
         if (w0 < 40) { w0 = 40; }
         int endY = this.LayoutFlowList(f.kids, 0, 8, w0, tab);
@@ -502,8 +502,9 @@ partial class Designer {
                 // （Tabs 则为活动标签）。
                 fields = ListRemove(fields, mv);
                 mv.childTab = 0;
-                if (dropContainer.kind == "Tabs"
-                    || dropContainer.kind == "SplitPanel") {
+                if (dropContainer.kind == "Tabs") {
+                    mv.childTab = Designer.TabActivePage(dropContainer);
+                } else if (dropContainer.kind == "SplitPanel") {
                     mv.childTab = dropContainer.uiState.Get();
                 }
                 dropContainer.kids.Add(mv);
@@ -611,18 +612,33 @@ partial class Designer {
             // 容器：装饰 + 标题，子节点放在内容框内。
             c.FillRoundRect(ex, ey, ew, eh, app.Scale(4), t.bgTertiary);
             c.DrawRoundRect(ex, ey, ew, eh, app.Scale(4), t.borderSecondary, 1);
-            c.DrawText(ex + app.Scale(6), ey + app.Scale(4), f.label, t.textSecondary, fs);
             int kidPX = px + f.fx + 6;
             int kidPY = py + f.fy + 26;
             int tab = 0 - 1;
             if (f.kind == "Tabs") {
-                tab = f.uiState.Get();
-                if (tab < 0 || tab >= f.OptionCount()) { tab = 0; }
+                // 标签页容器画成真正的标签条：每一页一个页签，点
+                // 哪个就翻到哪一页，页里的子级照常渲染、选中、拖动，
+                // 于是每一页都能单独设计。
+                tab = Designer.TabActivePage(f);
+                RenderTabStrip(app, c, t, f, ex, ey, ew, psMilli, tab);
+            } else {
+                c.DrawText(ex + app.Scale(6), ey + app.Scale(4), f.label, t.textSecondary, fs);
             }
+            int onPage = 0;
             for (int k = 0; k < f.KidCount(); k = k + 1) {
                 FormField kf = f.KidAt(k);
                 if (tab >= 0 && kf.childTab != tab) { continue; }
                 RenderFreeField(app, c, t, kf, ox, oy, psMilli, kidPX, kidPY);
+                onPage = onPage + 1;
+            }
+            if (tab >= 0 && onPage == 0 && !preview) {
+                pvScale = psMilli * 100 / app.dpiScale;
+                if (pvScale < 1) { pvScale = 1; }
+                c.DrawText(ex + PvS(app, 10), ey + PvS(app, 34),
+                    Designer.T("empty page - drop components here",
+                        "空白页 —— 把组件拖到这一页"),
+                    t.textTertiary, PvFont(t.fontSizeSmall));
+                pvScale = 1000;
             }
         } else {
             // 预览跟随画布缩放，文本和装饰随
@@ -689,19 +705,92 @@ partial class Designer {
         }
     }
 
+    /// Tabs 容器的页数：没写选项时仍算一页，容器里总有地方放组件。
+    static int TabPageCount(FormField f) {
+        int n = f.OptionCount();
+        if (n < 1) { n = 1; }
+        return n;
+    }
+
+    /// Tabs 容器当前活动页的序号，钳制到有效范围。
+    static int TabActivePage(FormField f) {
+        int p = f.uiState.Get();
+        if (p < 0 || p >= Designer.TabPageCount(f)) { p = 0; }
+        return p;
+    }
+
+    /// 第 i 页的页签标题（没写选项时是 "Tab i"）。
+    static string TabPageTitle(FormField f, int i) {
+        if (i >= 0 && i < f.OptionCount()) { return f.OptionAt(i); }
+        return "Tab " + Convert.ToString(i + 1);
+    }
+
+    /// 画 Tabs 容器的标签条（跟随画布缩放），并把每个页签的屏幕
+    /// 矩形登记到 tabHits，供画布的指针处理切页。
+    void RenderTabStrip(App app, Canvas c, Theme t, FormField f,
+            int ex, int ey, int ew, int psMilli, int active) {
+        pvScale = psMilli * 100 / app.dpiScale;
+        if (pvScale < 1) { pvScale = 1; }
+        int fs = PvFont(t.fontSizeSmall);
+        int hh = PvS(app, 24);
+        int pad = PvS(app, 10);
+        int und = PvS(app, 2);
+        if (und < 1) { und = 1; }
+        c.FillRect(ex, ey + hh, ew, 1, t.divider);
+        int gx = ex;
+        int n = Designer.TabPageCount(f);
+        for (int i = 0; i < n; i = i + 1) {
+            string title = Designer.TabPageTitle(f, i);
+            int tw = Canvas.MeasureText(title, fs) + pad * 2;
+            if (gx + tw > ex + ew) { tw = ex + ew - gx; }
+            if (tw <= 0) { break; }
+            int col = t.textTertiary;
+            if (i == active) {
+                c.FillRect(gx, ey, tw, hh, t.bgPrimary);
+                c.FillRect(gx, ey + hh - und, tw, und, t.primary);
+                col = t.primary;
+            }
+            c.DrawText(gx + pad, ey + PvS(app, 5), title, col, fs);
+            tabHits.Add(new TabHeaderHit(f, i, gx, ey, tw, hh));
+            gx = gx + tw;
+        }
+        pvScale = 1000;
+    }
+
+    /// 指针位置上的页签（后画的在上层），没有则 null。
+    TabHeaderHit PickTabHeader(int mx, int my) {
+        int i = tabHits.Count - 1;
+        while (i >= 0) {
+            TabHeaderHit h = tabHits[i];
+            if (InRect(mx, my, h.x, h.y, h.w, h.h)) { return h; }
+            i = i - 1;
+        }
+        return null;
+    }
+
     /// 设计空间 (mx, my) 处最上层的字段，从后往前搜索 `lst`，
     /// 后面的兄弟节点优先；子节点优先于其容器。父节点的
     /// 内容框原点存入 freeSelPX/freeSelPY，供拖拽使用。
     FormField FreePick(List<FormField> lst, int mx, int my, int px, int py) {
+        return this.FreePickIn(lst, mx, my, px, py, 0 - 1);
+    }
+
+    /// `tabFilter >= 0` 时只看该标签页下的子级——看不见的页里的
+    /// 组件也点不中。
+    FormField FreePickIn(List<FormField> lst, int mx, int my, int px, int py,
+            int tabFilter) {
         int i = lst.Count - 1;
         while (i >= 0) {
             FormField f = lst[i];
             if (f.IsNonVisual()) { i = i - 1; continue; }
+            if (tabFilter >= 0 && f.childTab != tabFilter) { i = i - 1; continue; }
             int ex = px + f.fx;
             int ey = py + f.fy;
             if (mx >= ex && mx < ex + f.fw && my >= ey && my < ey + f.fh) {
                 if (f.IsContainer() && f.KidCount() > 0) {
-                    FormField ch = FreePick(f.kids, mx, my, ex + 6, ey + 26);
+                    int kidTab = 0 - 1;
+                    if (f.kind == "Tabs") { kidTab = Designer.TabActivePage(f); }
+                    FormField ch = this.FreePickIn(f.kids, mx, my, ex + 6, ey + 26, kidTab);
                     if (ch != null) { return ch; }
                 }
                 freeSelPX = px;
@@ -847,7 +936,18 @@ partial class Designer {
         // 面板自动缩放。视图缩放仅由用户显式设定，钳制在 50%–200%；
         // 放大后超出面板的部分用抓手/滚轮平移，不缩小、不显示滚动条。
         int effZoom = winZoom;
-        if (effZoom < 500) { effZoom = 1000; }
+        if (effZoom <= 0) {
+            // 「适应」：整张设计（含 DPI 放大）缩到视口内，不放大
+            // 超过 1:1。设计比视口大时——高 DPI 屏上一个 1000 逻辑
+            // 像素宽的窗口必然如此——100% 只能看到中间一块空白，
+            // 所以这是新打开设计的默认视图。
+            int fitX = inW * 100000 / (dw * app.dpiScale);
+            int fitY = inH * 100000 / (dh * app.dpiScale);
+            effZoom = fitX;
+            if (fitY < effZoom) { effZoom = fitY; }
+            if (effZoom > 1000) { effZoom = 1000; }
+        }
+        if (effZoom < 250) { effZoom = 250; }
         if (effZoom > 2000) { effZoom = 2000; }
         lastFitPct = effZoom;
         psMilli = effZoom * app.dpiScale / 100;
@@ -914,10 +1014,10 @@ partial class Designer {
             if (app.CaptureWheel(inX, inY, inW, inH)) {
                 int wdelta = app.window.EventKeyCode();
                 int z = winZoom;
-                if (z <= 0) { z = 1000; }
+                if (z <= 0) { z = lastFitPct; }
                 if (wdelta > 0) { z = z + 100; }
                 else if (wdelta < 0) { z = z - 100; }
-                if (z < 500) { z = 500; }
+                if (z < 250) { z = 250; }
                 if (z > 2000) { z = 2000; }
                 winZoom = z;
                 app.RequestRedraw();
@@ -952,6 +1052,7 @@ partial class Designer {
         // 渲染可视的顶层字段（非可视的在托盘中）。
         c.PushClip(ox, oy, cw2, ch2);
         int visCount = 0;
+        tabHits = new List<TabHeaderHit>();
         if (!free) {
             // 流式布局的表单抬头：名称 + 分隔线，跟随画布缩放。
             pvScale = psMilli * 100 / app.dpiScale;
@@ -1013,7 +1114,19 @@ partial class Designer {
         if (!freeHand && !dragging && ek == 2 && app.window.EventButton() == 0
                 && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
             bool started = false;
-            if (free && sel != null && !sel.locked) {
+            TabHeaderHit th = this.PickTabHeader(app.mouseX, app.mouseY);
+            if (th != null) {
+                // 点页签就是翻页：顺带把这个 Tabs 设为活动容器，
+                // 接着添加/放下的组件落在正看着的这一页上。
+                th.tabs.uiState.Set(th.page);
+                sel = th.tabs;
+                inspTab = 0;
+                activeContainer = th.tabs;
+                this.ClearExtraSel();
+                msg = Designer.T("tab ", "标签页 ") + Convert.ToString(th.page + 1);
+                started = true;
+            }
+            if (!started && free && sel != null && !sel.locked) {
                 int sx = ox + (freeSelPX + sel.fx) * psMilli / 1000;
                 int sy = oy + (freeSelPY + sel.fy) * psMilli / 1000;
                 int sw2 = sel.fw * psMilli / 1000;
@@ -1881,7 +1994,8 @@ partial class Designer {
         czBase = t.SnapshotMetrics();
         czDpi = app.dpiScale;
         int z = winZoom;
-        if (z < 500) { z = 1000; }
+        if (z <= 0) { z = lastFitPct; }
+        if (z < 250) { z = 250; }
         if (z > 2000) { z = 2000; }
         t.ApplyMetricsScaled(czBase, z, 1000);
         app.dpiScale = czDpi * z / 1000;
