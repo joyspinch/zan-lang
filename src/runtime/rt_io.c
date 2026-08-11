@@ -2182,10 +2182,10 @@ int64_t zan_io_connect(intptr_t fd, const char *ip, int32_t port) {
  * zan_co_sched_run / zan_co_delay), but runs the ready queue across a pool of
  * OS worker threads that all pull completions from the shared IOCP and resume
  * coroutines concurrently -- so CPU-bound coroutine work (e.g. HTTP parsing)
- * scales across cores. Ready frames and active-frame state are sharded by
- * frame address so workers do not serialize on one scheduler lock; the timer
- * list remains shared and the IOCP itself is kernel-thread-safe. Worker count
- * comes from ZAN_CO_WORKERS, defaulting to the logical processor count.
+ * scales across cores. Each worker owns a private run queue and steals from
+ * the others when it runs dry (see the Windows section below); the timer heap
+ * remains shared and the IOCP itself is kernel-thread-safe. Worker count comes
+ * from ZAN_CO_WORKERS, defaulting to the logical processor count.
  * ====================================================================== */
 #ifdef ZAN_CO_DRIVER
 
@@ -2198,109 +2198,322 @@ typedef struct zan_co_node {
 static zan_co_node *g_rq_head, *g_rq_tail;
 
 #if defined(_WIN32)
-/* ---------------- Windows: real multi-worker pool over IOCP ------------- */
-typedef struct zan_co_worker_queue {
-    CRITICAL_SECTION lock;
-    zan_co_node      *head;
-    zan_co_node      *tail;
-    void             *active[64];
-    int               active_count;
-    /* Open-addressed set of frames currently queued, so the duplicate check
-     * in zan_co_ready is O(1) instead of walking the whole list (which made
-     * enqueue O(n^2) under load). Tombstones mark removed slots. */
-    void            **qset;
-    size_t            qset_cap;   /* power of two */
-    size_t            qset_len;   /* live entries */
-    size_t            qset_tombs;
-    zan_co_node      *free_nodes; /* recycled list nodes */
-} zan_co_worker_queue;
+/* ---------------- Windows: multi-worker pool over IOCP ------------------
+ * Scheduler shape (the Go/Tokio arrangement):
+ *
+ *   - Every worker owns a bounded FIFO run queue plus a one-slot LIFO cell.
+ *     A ready frame is pushed by the thread that readied it, so a coroutine
+ *     woken by an IO completion is resumed on the core that reaped the
+ *     completion -- its frame is already in that core's cache.
+ *   - The LIFO cell holds the most recently readied frame and is run next,
+ *     ahead of the queue, with a budget (ZAN_LIFO_BUDGET) so a pair of
+ *     coroutines that keep waking each other cannot monopolise a worker.
+ *   - A worker with nothing left steals half of a random victim's queue.
+ *     At most half the pool searches at once (g_co_searching) -- past that,
+ *     searchers mostly contend on each other's queue heads.
+ *   - Readies from non-worker threads and local-queue overflow go to a
+ *     shared injector queue, which every worker polls every 61st schedule
+ *     so injected work cannot starve behind a busy worker's LIFO chain.
+ *   - Parking is coordinated by g_co_searching / g_co_parked: a burst of
+ *     readies costs at most one wake packet per parked worker instead of one
+ *     per frame, and a worker publishes itself as parked *before* its last
+ *     queue scan, so a producer either is seen by that scan or sees the
+ *     parked worker and posts a packet (no lost wakeup).
+ *
+ * Per-frame scheduler state lives in the first two frame-header slots
+ * (ASYNC_FRAME_SCHED / ASYNC_FRAME_SCHED_STEP, see irgen_expr_core.c):
+ * duplicate-ready suppression, the "already running on another worker"
+ * guard and the deferred-free handshake are all CAS on that one word. The
+ * previous design needed a per-shard lock, an open-addressed hash set of
+ * queued frames and a linear scan of the frames a shard was running.
+ * ----------------------------------------------------------------------- */
 
-#define ZAN_QSET_TOMB ((void *)(uintptr_t)1)
+#define ZAN_CO_MAXW      64
+#define ZAN_LQ_CAP       256u        /* per-worker ring slots, power of two */
+#define ZAN_LQ_MASK      (ZAN_LQ_CAP - 1u)
+#define ZAN_LIFO_BUDGET  3           /* consecutive LIFO-cell resumes */
+#define ZAN_GLOBAL_TICK  61          /* injector fairness poll (Go's number) */
+#define ZAN_STEAL_ROUNDS 2           /* randomized victim scans per search */
+#define ZAN_WAKE_KEY     ((ULONG_PTR)-3)  /* scheduler wake packet (DNS is -2) */
 
-static size_t qset_hash(void *f) {
-    return (size_t)((((uintptr_t)f) >> 4) * (uintptr_t)2654435761u);
+/* Scheduler-owned prefix of every async frame. Mirrors the LLVM struct
+ * { i64, void(i8*)* } the compiler emits at frame indices 0 and 1. */
+typedef struct {
+    volatile long long sched;    /* CO_* bits */
+    zan_co_step_t      pending;  /* resume step banked by a notify */
+} zan_co_fhdr;
+
+#define CO_QUEUED    1LL   /* a task naming this frame sits in a run queue */
+#define CO_RUNNING   2LL   /* a worker is inside step(frame) right now */
+#define CO_NOTIFIED  4LL   /* readied while running: re-queue after the step */
+#define CO_DEAD      8LL   /* released; whoever holds it does the free */
+
+typedef struct { void *frame; zan_co_step_t step; } zan_co_task;
+
+typedef struct {
+    /* Ring: consumers (the owner and thieves) move `head` with CAS, only the
+     * owner moves `tail`. A slot is never overwritten while a consumer may
+     * still read it: the owner refuses to push past head + ZAN_LQ_CAP. */
+    volatile long long head;
+    volatile long long tail;
+    zan_co_task        buf[ZAN_LQ_CAP];
+    zan_co_task        lifo;
+    int                lifo_full;
+    int                lifo_budget;
+    int                index;
+    int                searching;
+    unsigned           tick;
+    unsigned           rng;
+    char               pad[64];      /* keep neighbours off this cache line */
+} zan_co_worker_t;
+
+static CRITICAL_SECTION g_co_lock;
+static volatile LONG    g_co_running;    /* workers inside a step or a pump */
+static volatile LONG    g_co_parked;     /* workers blocked on the port */
+static volatile LONG    g_co_searching;  /* workers hunting for work */
+static volatile LONG    g_co_wake;       /* posted, unconsumed wake packets */
+static volatile LONG    g_co_stop;
+static int              g_co_inited;
+static int              g_co_workers;
+static DWORD            g_co_tls = TLS_OUT_OF_INDEXES;
+static zan_co_worker_t  g_wk[ZAN_CO_MAXW];
+
+/* Shared injector queue: readies from threads that are not workers (program
+ * start-up, DNS workers) and local-queue overflow. */
+static CRITICAL_SECTION g_inj_lock;
+static zan_co_node     *g_inj_head, *g_inj_tail, *g_inj_free;
+static volatile LONG    g_inj_len;
+
+static long long co_now_ms(void) { return (long long)GetTickCount64(); }
+
+/* Timer pumping state. The timer heap sits behind one global lock, so having
+ * every worker dispatch due timers per loop iteration turned that lock into
+ * the pool's hottest contention point (16 workers burned 20x the
+ * single-threaded driver's CPU for the same 2M messages). One worker at a
+ * time owns the pump, at most once per millisecond for the whole pool;
+ * workers that lose the race reuse the cached deadline instead of queueing on
+ * the lock. */
+static volatile LONG      g_timer_owner;
+static volatile long long g_timer_pumped_ms;
+static volatile long long g_timer_next_ms;
+
+/* Bumped whenever work is created (a frame is queued or a timer armed). The
+ * termination check samples it around a short re-check window: nothing may be
+ * declared quiescent if any work appeared while we were looking. */
+static volatile LONG      g_co_activity;
+
+static void co_wake_port(void) {
+    if (g_iocp) PostQueuedCompletionStatus(g_iocp, 0, ZAN_WAKE_KEY, NULL);
 }
 
-static void qset_rehash(zan_co_worker_queue *q, size_t ncap) {
-    void **ns = (void **)calloc(ncap, sizeof(void *));
-    if (!ns) abort();
-    for (size_t i = 0; i < q->qset_cap; i++) {
-        void *f = q->qset[i];
-        if (f && f != ZAN_QSET_TOMB) {
-            size_t j = qset_hash(f) & (ncap - 1);
-            while (ns[j]) j = (j + 1) & (ncap - 1);
-            ns[j] = f;
-        }
+/* Wake one parked worker -- but only when nobody is searching already (that
+ * worker will find the task) and only up to one unconsumed packet per parked
+ * worker. Posting one packet per ready frame is what made --async-workers
+ * burn CPU linearly in the worker count at flat throughput. */
+static void co_notify(void) {
+    if (g_co_searching > 0) return;
+    if (g_co_parked <= 0) return;
+    if (InterlockedIncrement(&g_co_wake) > g_co_parked) {
+        InterlockedDecrement(&g_co_wake);
+        return;
     }
-    free(q->qset);
-    q->qset = ns;
-    q->qset_cap = ncap;
-    q->qset_tombs = 0;
+    co_wake_port();
 }
 
-/* Insert frame; returns 0 when it was already present. Caller holds q->lock. */
-static int qset_add(zan_co_worker_queue *q, void *f) {
-    if (q->qset_cap == 0) qset_rehash(q, 64);
-    else if ((q->qset_len + q->qset_tombs + 1) * 4 >= q->qset_cap * 3)
-        qset_rehash(q, q->qset_len * 4 >= q->qset_cap ? q->qset_cap * 2
-                                                      : q->qset_cap);
-    size_t mask = q->qset_cap - 1;
-    size_t j = qset_hash(f) & mask;
-    size_t tomb = (size_t)-1;
-    while (q->qset[j]) {
-        if (q->qset[j] == f) return 0;
-        if (q->qset[j] == ZAN_QSET_TOMB && tomb == (size_t)-1) tomb = j;
-        j = (j + 1) & mask;
-    }
-    if (tomb != (size_t)-1) { j = tomb; q->qset_tombs--; }
-    q->qset[j] = f;
-    q->qset_len++;
-    return 1;
+static zan_co_worker_t *co_self(void) {
+    if (g_co_tls == TLS_OUT_OF_INDEXES) return NULL;
+    return (zan_co_worker_t *)TlsGetValue(g_co_tls);
 }
 
-static void qset_remove(zan_co_worker_queue *q, void *f) {
-    if (q->qset_cap == 0) return;
-    size_t mask = q->qset_cap - 1;
-    size_t j = qset_hash(f) & mask;
-    while (q->qset[j]) {
-        if (q->qset[j] == f) {
-            q->qset[j] = ZAN_QSET_TOMB;
-            q->qset_len--;
-            q->qset_tombs++;
-            return;
-        }
-        j = (j + 1) & mask;
-    }
+static unsigned co_rand(zan_co_worker_t *w) {
+    unsigned x = w->rng;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    w->rng = x ? x : 0x9e3779b9u;
+    return w->rng;
 }
 
-/* Append a ready frame if it is not already queued. Caller holds q->lock. */
-static int co_enqueue_locked(zan_co_worker_queue *q, void *frame,
-                             zan_co_step_t step) {
-    if (!qset_add(q, frame)) return 0;
-    zan_co_node *n = q->free_nodes;
-    if (n) q->free_nodes = n->next;
+/* ---- injector ---- */
+
+static void inj_push(zan_co_task t) {
+    EnterCriticalSection(&g_inj_lock);
+    zan_co_node *n = g_inj_free;
+    if (n) g_inj_free = n->next;
     else {
         n = (zan_co_node *)malloc(sizeof(*n));
         if (!n) abort();
     }
-    n->next = NULL; n->frame = frame; n->step = step;
-    if (q->tail) q->tail->next = n; else q->head = n;
-    q->tail = n;
-    return 1;
+    n->next = NULL; n->frame = t.frame; n->step = t.step;
+    if (g_inj_tail) g_inj_tail->next = n; else g_inj_head = n;
+    g_inj_tail = n;
+    InterlockedIncrement(&g_inj_len);
+    LeaveCriticalSection(&g_inj_lock);
 }
 
-static CRITICAL_SECTION g_co_lock;
-static volatile LONG    g_co_running;   /* workers currently inside a step() */
-static volatile LONG    g_co_idle;      /* workers blocked in co_wait_io */
-static volatile LONG    g_co_stop;
-static int              g_co_inited;
-static int              g_co_workers;
-static zan_co_worker_queue g_co_queues[64];
+static int inj_pop(zan_co_task *out) {
+    if (g_inj_len <= 0) return 0;          /* unlocked hint */
+    EnterCriticalSection(&g_inj_lock);
+    zan_co_node *n = g_inj_head;
+    if (n) {
+        g_inj_head = n->next;
+        if (!g_inj_head) g_inj_tail = NULL;
+        out->frame = n->frame; out->step = n->step;
+        n->next = g_inj_free; g_inj_free = n;
+        InterlockedDecrement(&g_inj_len);
+    }
+    LeaveCriticalSection(&g_inj_lock);
+    return n != NULL;
+}
 
-static long long co_now_ms(void) { return (long long)GetTickCount64(); }
+/* ---- per-worker ring ---- */
 
-static void co_wake_port(void) {
-    if (g_iocp) PostQueuedCompletionStatus(g_iocp, 0, 0, NULL);
+static void lq_push(zan_co_worker_t *w, zan_co_task t);
+
+/* Move half of the owner's queue to the injector, so an overflowing producer
+ * never blocks and the backlog stays visible to every worker. */
+static void lq_spill(zan_co_worker_t *w) {
+    zan_co_task tmp[ZAN_LQ_CAP / 2];
+    for (;;) {
+        long long h = __atomic_load_n(&w->head, __ATOMIC_ACQUIRE);
+        long long t = __atomic_load_n(&w->tail, __ATOMIC_RELAXED);
+        long long n = (t - h) / 2;
+        if (n <= 0) return;
+        if (n > (long long)(ZAN_LQ_CAP / 2)) n = (long long)(ZAN_LQ_CAP / 2);
+        for (long long i = 0; i < n; i++)
+            tmp[i] = w->buf[(unsigned long long)(h + i) & ZAN_LQ_MASK];
+        if (!__atomic_compare_exchange_n(&w->head, &h, h + n, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            continue;
+        for (long long i = 0; i < n; i++) inj_push(tmp[i]);
+        return;
+    }
+}
+
+static void lq_push(zan_co_worker_t *w, zan_co_task t) {
+    long long tail = __atomic_load_n(&w->tail, __ATOMIC_RELAXED);
+    long long head = __atomic_load_n(&w->head, __ATOMIC_ACQUIRE);
+    if (tail - head >= (long long)ZAN_LQ_CAP) {
+        lq_spill(w);
+        head = __atomic_load_n(&w->head, __ATOMIC_ACQUIRE);
+        if (tail - head >= (long long)ZAN_LQ_CAP) { inj_push(t); return; }
+    }
+    w->buf[(unsigned long long)tail & ZAN_LQ_MASK] = t;
+    __atomic_store_n(&w->tail, tail + 1, __ATOMIC_RELEASE);
+}
+
+static int lq_pop(zan_co_worker_t *w, zan_co_task *out) {
+    for (;;) {
+        long long h = __atomic_load_n(&w->head, __ATOMIC_ACQUIRE);
+        long long t = __atomic_load_n(&w->tail, __ATOMIC_ACQUIRE);
+        if (h >= t) return 0;
+        zan_co_task task = w->buf[(unsigned long long)h & ZAN_LQ_MASK];
+        if (__atomic_compare_exchange_n(&w->head, &h, h + 1, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            *out = task;
+            return 1;
+        }
+    }
+}
+
+/* Take half of `v`'s queue: one task is returned to run now, the rest goes
+ * into the thief's own queue (so one steal feeds several schedules and the
+ * victim's head is touched once instead of per task). */
+static int lq_steal(zan_co_worker_t *v, zan_co_worker_t *w, zan_co_task *out) {
+    zan_co_task tmp[ZAN_LQ_CAP / 2];
+    for (;;) {
+        long long h = __atomic_load_n(&v->head, __ATOMIC_ACQUIRE);
+        long long t = __atomic_load_n(&v->tail, __ATOMIC_ACQUIRE);
+        long long n = t - h;
+        if (n <= 0) return 0;
+        n = n - n / 2;                                   /* half, rounded up */
+        if (n > (long long)(ZAN_LQ_CAP / 2)) n = (long long)(ZAN_LQ_CAP / 2);
+        for (long long i = 0; i < n; i++)
+            tmp[i] = v->buf[(unsigned long long)(h + i) & ZAN_LQ_MASK];
+        if (!__atomic_compare_exchange_n(&v->head, &h, h + n, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            continue;
+        *out = tmp[0];
+        for (long long i = 1; i < n; i++) lq_push(w, tmp[i]);
+        return 1;
+    }
+}
+
+/* ---- frame state ---- */
+
+static zan_co_fhdr *co_hdr(void *frame) { return (zan_co_fhdr *)frame; }
+
+static void co_submit(void *frame, zan_co_step_t step) {
+    zan_co_task t;
+    t.frame = frame; t.step = step;
+    InterlockedIncrement(&g_co_activity);
+    zan_co_worker_t *w = co_self();
+    if (!w) { inj_push(t); co_notify(); return; }
+    if (!w->lifo_full) {
+        /* Run-next cell: the frame a worker just readied is almost always the
+         * continuation of the work it is already doing (the IO completion of
+         * the request it is serving), so keep it on this core. */
+        w->lifo = t;
+        w->lifo_full = 1;
+        return;
+    }
+    lq_push(w, t);
+    co_notify();
+}
+
+void zan_co_ready(void *frame, zan_co_step_t step) {
+    if (!step || !frame) return;
+    zan_co_fhdr *h = co_hdr(frame);
+    for (;;) {
+        long long s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
+        if (s & CO_DEAD) return;                 /* frame is being released */
+        if (s & CO_QUEUED) return;               /* already queued: dedup */
+        if (s & CO_RUNNING) {
+            /* Readied while it runs (an IO completion racing the step that
+             * issued the next op). Bank the resume step; the worker running
+             * it re-queues the frame when the step returns. */
+            __atomic_store_n(&h->pending, step, __ATOMIC_RELAXED);
+            if (__atomic_compare_exchange_n(&h->sched, &s, s | CO_NOTIFIED, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                return;
+            continue;
+        }
+        if (__atomic_compare_exchange_n(&h->sched, &s, s | CO_QUEUED, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            break;
+    }
+    co_submit(frame, step);
+}
+
+/* Release an async frame. Called by the compiler (--async-workers) instead of
+ * free() wherever an awaiter, a reaper or the frame's own cleanup drops a
+ * frame, because the scheduler may still hold a reference to it:
+ *   - running: the worker frees it when the step returns (it must still read
+ *     the state word afterwards, and the awaiter that completed can run
+ *     concurrently on another core);
+ *   - queued: whoever pops the stale task frees it and skips the step.
+ * Anything else is unreferenced and freed right here. */
+void __zan_co_frame_free(void *frame) {
+    if (!frame) return;
+    zan_co_fhdr *h = co_hdr(frame);
+    for (;;) {
+        long long s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
+        if (s & CO_DEAD) return;                 /* already handed over */
+        if (s & (CO_QUEUED | CO_RUNNING)) {
+            if (__atomic_compare_exchange_n(&h->sched, &s, s | CO_DEAD, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                return;
+            continue;
+        }
+        if (__atomic_compare_exchange_n(&h->sched, &s, CO_DEAD, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            break;
+    }
+    free(frame);
+}
+
+void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {
+    zan_timer_delay(ms, frame, step);
+    InterlockedIncrement(&g_co_activity);
+    co_notify();
 }
 
 static int co_worker_count(void) {
@@ -2313,20 +2526,15 @@ static int co_worker_count(void) {
         w = (int)si.dwNumberOfProcessors;
     }
     if (w < 1) w = 1;
-    if (w > 64) w = 64;
+    if (w > ZAN_CO_MAXW) w = ZAN_CO_MAXW;
     return w;
-}
-
-static int co_queue_index(void *frame) {
-    uintptr_t value = (uintptr_t)frame;
-    return (int)((value >> 4) % (uintptr_t)g_co_workers);
 }
 
 void zan_co_sched_init(void) {
     if (!g_co_inited) {
         InitializeCriticalSection(&g_co_lock);
-        for (int i = 0; i < 64; i++)
-            InitializeCriticalSection(&g_co_queues[i].lock);
+        InitializeCriticalSection(&g_inj_lock);
+        g_co_tls = TlsAlloc();
         g_co_inited = 1;
     }
     g_co_workers = co_worker_count();
@@ -2334,134 +2542,192 @@ void zan_co_sched_init(void) {
     zan_timer_runtime_reset();
     zan_timer_set_ready_hook(zan_co_ready);
     g_co_running = 0;
-    g_co_idle = 0;
+    g_co_parked = 0;
+    g_co_searching = 0;
+    g_co_wake = 0;
     g_co_stop = 0;
-    for (int i = 0; i < 64; i++) {
-        g_co_queues[i].head = NULL;
-        g_co_queues[i].tail = NULL;
-        g_co_queues[i].active_count = 0;
-        g_co_queues[i].qset_len = 0;
-        g_co_queues[i].qset_tombs = 0;
-        if (g_co_queues[i].qset)
-            memset(g_co_queues[i].qset, 0,
-                   g_co_queues[i].qset_cap * sizeof(void *));
+    g_timer_owner = 0;
+    g_timer_pumped_ms = 0;
+    g_timer_next_ms = -1;
+    g_co_activity = 0;
+    EnterCriticalSection(&g_inj_lock);
+    while (g_inj_head) {
+        zan_co_node *n = g_inj_head;
+        g_inj_head = n->next;
+        n->next = g_inj_free;
+        g_inj_free = n;
+    }
+    g_inj_tail = NULL;
+    g_inj_len = 0;
+    LeaveCriticalSection(&g_inj_lock);
+    for (int i = 0; i < ZAN_CO_MAXW; i++) {
+        zan_co_worker_t *w = &g_wk[i];
+        w->head = w->tail = 0;
+        w->lifo_full = 0;
+        w->lifo_budget = ZAN_LIFO_BUDGET;
+        w->index = i;
+        w->searching = 0;
+        w->tick = 0;
+        w->rng = 0x9e3779b9u ^ (unsigned)(i * 2654435761u);
     }
 }
 
-void zan_co_ready(void *frame, zan_co_step_t step) {
-    if (!step) return;
-    zan_co_worker_queue *q = &g_co_queues[co_queue_index(frame)];
-    EnterCriticalSection(&q->lock);
-    int added = co_enqueue_locked(q, frame, step);
-    LeaveCriticalSection(&q->lock);
-    if (!added) return;
-    /* Only nudge the port when a worker is actually blocked waiting for work.
-     * While every worker is busy (g_co_idle == 0) the frame will be picked up
-     * by a worker's own run-loop iteration, so posting a completion packet per
-     * ready is pure overhead -- that wake storm is what made --async-workers
-     * slower than single-threaded under load. The idle count is registered
-     * under g_co_lock together with a final queue check in co_worker, so a
-     * worker about to block is guaranteed visible here (no lost wakeup). */
-    if (g_co_idle > 0) co_wake_port();
+/* ---- work discovery ---- */
+
+static int co_search_begin(zan_co_worker_t *w) {
+    if (w->searching) return 1;
+    LONG s = g_co_searching;
+    if (2 * s >= g_co_workers) return 0;   /* enough hunters already */
+    InterlockedIncrement(&g_co_searching);
+    w->searching = 1;
+    return 1;
 }
 
-void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {
-    zan_timer_delay(ms, frame, step);
-    if (g_co_idle > 0) co_wake_port();
+static void co_search_end(zan_co_worker_t *w, int found) {
+    if (!w->searching) return;
+    w->searching = 0;
+    /* The last searcher leaving with work in hand hands the search on: the
+     * queues it did not reach may still hold tasks nobody is looking for. */
+    if (InterlockedDecrement(&g_co_searching) == 0 && found) co_notify();
 }
 
-/* Pop one ready frame, marking a worker busy (g_co_running) atomically with
- * the dequeue so the idle test can never race a just-popped-but-not-yet-run
- * step. Returns 1 and fills *frame/*step when a node was taken. */
-static int co_pop(int worker, void **frame, zan_co_step_t *step) {
-    for (int offset = 0; offset < g_co_workers; offset++) {
-        int index = (worker + offset) % g_co_workers;
-        zan_co_worker_queue *q = &g_co_queues[index];
-        EnterCriticalSection(&q->lock);
-        zan_co_node *prev = NULL;
-        zan_co_node *n = q->head;
-        while (n) {
-            int active = 0;
-            for (int i = 0; i < q->active_count; i++) {
-                if (q->active[i] == n->frame) { active = 1; break; }
-            }
-            if (!active) break;
-            prev = n;
-            n = n->next;
+static int co_steal(zan_co_worker_t *w, zan_co_task *out) {
+    if (g_co_workers <= 1) return 0;
+    if (!co_search_begin(w)) return 0;
+    for (int round = 0; round < ZAN_STEAL_ROUNDS; round++) {
+        int start = (int)(co_rand(w) % (unsigned)g_co_workers);
+        for (int k = 0; k < g_co_workers; k++) {
+            int idx = (start + k) % g_co_workers;
+            if (idx == w->index) continue;
+            if (lq_steal(&g_wk[idx], w, out)) return 1;
         }
-        if (n) {
-            if (prev) prev->next = n->next;
-            else q->head = n->next;
-            if (q->tail == n) q->tail = prev;
-            *frame = n->frame;
-            *step = n->step;
-            qset_remove(q, n->frame);
-            n->next = q->free_nodes;
-            q->free_nodes = n;
-            q->active[q->active_count++] = *frame;
-            InterlockedIncrement(&g_co_running);
-            LeaveCriticalSection(&q->lock);
+        if (inj_pop(out)) return 1;
+    }
+    return 0;
+}
+
+static int co_next_task(zan_co_worker_t *w, zan_co_task *out) {
+    /* Fairness poll: a worker fed by its own LIFO cell would never look at the
+     * injector, starving frames readied by non-worker threads. */
+    if (++w->tick % ZAN_GLOBAL_TICK == 0 && inj_pop(out)) {
+        w->lifo_budget = ZAN_LIFO_BUDGET;
+        return 1;
+    }
+    if (w->lifo_full) {
+        if (w->lifo_budget > 0) {
+            *out = w->lifo;
+            w->lifo_full = 0;
+            w->lifo_budget--;
             return 1;
         }
-        LeaveCriticalSection(&q->lock);
+        /* Budget spent: demote the cell into the queue, where it is stealable
+         * and takes its turn behind the frames waiting there. */
+        lq_push(w, w->lifo);
+        w->lifo_full = 0;
     }
-    return 0;
+    w->lifo_budget = ZAN_LIFO_BUDGET;
+    if (lq_pop(w, out)) return 1;
+    if (inj_pop(out)) return 1;
+    return co_steal(w, out);
 }
 
+/* Is there a task somewhere for a worker about to park? Called after the
+ * worker published itself as parked, so a producer that pushes after this
+ * scan is guaranteed to see g_co_parked > 0 and post a wake packet. */
 static int co_has_runnable(void) {
-    for (int index = 0; index < g_co_workers; index++) {
-        zan_co_worker_queue *q = &g_co_queues[index];
-        EnterCriticalSection(&q->lock);
-        for (zan_co_node *n = q->head; n; n = n->next) {
-            int active = 0;
-            for (int i = 0; i < q->active_count; i++) {
-                if (q->active[i] == n->frame) { active = 1; break; }
-            }
-            if (!active) {
-                LeaveCriticalSection(&q->lock);
-                return 1;
-            }
-        }
-        LeaveCriticalSection(&q->lock);
+    if (g_inj_len > 0) return 1;
+    for (int i = 0; i < g_co_workers; i++) {
+        zan_co_worker_t *w = &g_wk[i];
+        if (w->lifo_full) return 1;
+        if (__atomic_load_n(&w->tail, __ATOMIC_ACQUIRE) !=
+            __atomic_load_n(&w->head, __ATOMIC_ACQUIRE)) return 1;
     }
     return 0;
 }
 
-static void co_step_done(void *frame) {
-    int wake;
-    zan_co_worker_queue *q = &g_co_queues[co_queue_index(frame)];
-    EnterCriticalSection(&q->lock);
-    for (int i = 0; i < q->active_count; i++) {
-        if (q->active[i] == frame) {
-            q->active[i] = q->active[--q->active_count];
+/* Run one task. The frame is claimed (CO_QUEUED -> CO_RUNNING) before the
+ * step and released afterwards; a concurrent free saw CO_RUNNING and only set
+ * CO_DEAD, so the state word is still ours to read when the step returns. */
+static void co_run(zan_co_worker_t *w, zan_co_task *t) {
+    zan_co_fhdr *h = co_hdr(t->frame);
+    long long s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
+    for (;;) {
+        if (s & CO_DEAD) {
+            /* Released while it sat in a queue: drop the stale task. */
+            free(t->frame);
+            return;
+        }
+        long long n = (s & ~(CO_QUEUED | CO_NOTIFIED)) | CO_RUNNING;
+        if (__atomic_compare_exchange_n(&h->sched, &s, n, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            break;
+    }
+    InterlockedIncrement(&g_co_running);
+    t->step(t->frame);
+    for (;;) {
+        s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
+        if (s & CO_DEAD) { free(t->frame); break; }
+        if (s & CO_NOTIFIED) {
+            zan_co_step_t step = __atomic_load_n(&h->pending, __ATOMIC_RELAXED);
+            if (!__atomic_compare_exchange_n(&h->sched, &s, CO_QUEUED, 0,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                continue;
+            co_submit(t->frame, step ? step : t->step);
             break;
         }
+        if (__atomic_compare_exchange_n(&h->sched, &s, 0LL, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            break;
     }
     InterlockedDecrement(&g_co_running);
-    wake = q->head != NULL && g_co_idle > 0;
-    LeaveCriticalSection(&q->lock);
-    if (wake) co_wake_port();
+    (void)w;
 }
 
-/* Dispatch due Delay and public timers; return ms until the next deadline. */
-static long long co_pump_timers(void) {
+/* Dispatch due Delay and public timers; return ms until the next deadline.
+ * Serialized to one worker and throttled pool-wide to ~1ms (see
+ * g_timer_owner); a caller that skips the pump gets the cached deadline,
+ * floored at 1ms so "a timer is due right now" cannot turn into a spin while
+ * another worker is dispatching it. */
+static long long co_pump_timers_now(void) {
+    /* Count the pump as running work. Dispatching a Delay pops its entry from
+     * the timer heap before the ready hook queues the coroutine, and in that
+     * window the pool has no timer pending, no queued frame and no running
+     * step -- another worker reaching co_all_idle right then would declare the
+     * whole pool finished and stop a live program. */
+    InterlockedIncrement(&g_co_running);
     zan_timer_dispatch_due();
-    return zan_timer_next_timeout();
+    long long next = zan_timer_next_timeout();
+    g_timer_next_ms = next;
+    g_timer_pumped_ms = co_now_ms();
+    InterlockedDecrement(&g_co_running);
+    return next;
+}
+
+static long long co_pump_timers(void) {
+    long long now = co_now_ms();
+    if (now - g_timer_pumped_ms < 1 ||
+        InterlockedCompareExchange(&g_timer_owner, 1, 0) != 0) {
+        long long cached = g_timer_next_ms;
+        return (cached == 0) ? 1 : cached;
+    }
+    long long next = co_pump_timers_now();
+    InterlockedExchange(&g_timer_owner, 0);
+    return next;
 }
 
 /* Block on the completion port, re-readying coroutines whose IO completed.
- * Wake packets (lpOverlapped == NULL) just unblock a worker to re-check. */
+ * A NULL overlapped is a notification packet: the scheduler's wake (key
+ * ZAN_WAKE_KEY) or a DNS completion. */
 static void co_wait_io(long long timeout_ms) {
     OVERLAPPED_ENTRY entries[64];
     ULONG removed = 0;
     DWORD to = (timeout_ms < 0) ? INFINITE : (DWORD)timeout_ms;
     BOOL ok = GetQueuedCompletionStatusEx(g_iocp, entries, 64, &removed, to, FALSE);
-    /* We are no longer parked: drop the idle count before re-readying the
-     * completed coroutines below. This lets those zan_co_ready calls skip the
-     * wake syscall when this worker is the only idle one -- it will drain the
-     * whole batch itself on its next loop iterations -- instead of posting a
-     * wake packet per completion. */
-    InterlockedDecrement(&g_co_idle);
+    /* No longer parked. Dropping this before re-readying the completed
+     * coroutines below lets those zan_co_ready calls skip the wake syscall
+     * when this worker is the only idle one -- it drains the whole batch
+     * itself on its next loop iterations. */
+    InterlockedDecrement(&g_co_parked);
     if (!ok) {
         /* Timeout or error: deliver DNS timeouts so lookups past their
          * deadline fail instead of parking their coroutines forever. */
@@ -2470,9 +2736,13 @@ static void co_wait_io(long long timeout_ms) {
     }
     for (ULONG i = 0; i < removed; i++) {
         if (entries[i].lpOverlapped == NULL) {
-            /* Async-DNS completion: deliver every finished lookup. The wake
-             * packet itself means "re-check", so keep scanning the batch. */
-            dns_drain();
+            if (entries[i].lpCompletionKey == ZAN_WAKE_KEY) {
+                /* Our own nudge: consuming it lets the next producer post a
+                 * fresh one. */
+                if (g_co_wake > 0) InterlockedDecrement(&g_co_wake);
+            } else {
+                dns_drain();
+            }
             continue;
         }
         zan_io_op_t *op = CONTAINING_RECORD(entries[i].lpOverlapped,
@@ -2494,52 +2764,74 @@ static void co_wait_io(long long timeout_ms) {
 }
 
 static int co_all_idle(void) {
-    int idle = 1;
+    /* Cheap unlocked reject first: this runs on the empty-queue path of every
+     * worker, and a live server almost always has IO in flight or a timer
+     * pending. */
+    if (g_co_running != 0 || g_io_count != 0 || g_dns_inflight != 0 ||
+        zan_timer_pending() != 0)
+        return 0;
+    int idle;
     EnterCriticalSection(&g_co_lock);
-    if (zan_timer_pending() != 0 || g_co_running != 0 || g_io_count != 0 ||
-        g_dns_inflight != 0)
-        idle = 0;
-    for (int i = 0; idle && i < g_co_workers; i++) {
-        zan_co_worker_queue *q = &g_co_queues[i];
-        EnterCriticalSection(&q->lock);
-        if (q->head != NULL) idle = 0;
-        LeaveCriticalSection(&q->lock);
-    }
+    idle = !(zan_timer_pending() != 0 || g_co_running != 0 ||
+             g_io_count != 0 || g_dns_inflight != 0 || co_has_runnable());
     LeaveCriticalSection(&g_co_lock);
     return idle;
 }
 
 static void co_worker(int worker) {
-    long long last_pump = 0;
+    zan_co_worker_t *w = &g_wk[worker];
+    if (g_co_tls != TLS_OUT_OF_INDEXES) TlsSetValue(g_co_tls, w);
+    /* Quiescence is confirmed, not assumed: see the co_all_idle call below. */
+    LONG idle_seen = -1;
     for (;;) {
         if (g_co_stop) return;
-        /* Pump due timers even while the ready queue stays busy. Otherwise, at
-         * high request rates co_pop always succeeds first and co_pump_timers
-         * (only reached when the queue drains) never runs, starving timer-driven
-         * work -- notably the accept-readiness poll that keeps the listen loop
-         * alive -- so new connections stop being accepted. Throttle to ~1ms to
-         * bound lock traffic; g_tq is read unlocked as a cheap hint. */
-        if (zan_timer_pending() > 0) {
-            long long now = co_now_ms();
-            if (now - last_pump >= 1) { co_pump_timers(); last_pump = now; }
-        }
-        void *frame; zan_co_step_t step;
-        if (co_pop(worker, &frame, &step)) {
-            step(frame);
-            co_step_done(frame);
+        /* Pump due timers even while the run queues stay busy. Otherwise, at
+         * high request rates co_next_task always succeeds first and the pump
+         * (only reached when the queues drain) never runs, starving
+         * timer-driven work -- notably the accept-readiness poll that keeps
+         * the listen loop alive -- so new connections stop being accepted.
+         * co_pump_timers throttles itself pool-wide and the pending count is
+         * an unlocked read, so this costs nothing without timer work. */
+        if (zan_timer_pending() > 0) co_pump_timers();
+        zan_co_task t;
+        if (co_next_task(w, &t)) {
+            co_search_end(w, 1);
+            idle_seen = -1;
+            co_run(w, &t);
             continue;
         }
-        long long tnext = co_pump_timers();
-        if (co_pop(worker, &frame, &step)) {
-            step(frame);
-            co_step_done(frame);
+        /* About to park: pump for real rather than reusing a cached deadline.
+         * The throttled variant above exists to keep the timer lock cold while
+         * the pool is busy; here the deadline decides how long this worker
+         * blocks, and a stale one turns every timer-driven step into a
+         * multi-millisecond stall. */
+        long long tnext = co_pump_timers_now();
+        if (co_next_task(w, &t)) {
+            co_search_end(w, 1);
+            idle_seen = -1;
+            co_run(w, &t);
             continue;
         }
+        co_search_end(w, 0);
+        /* Terminate only on quiescence observed twice with no activity in
+         * between. A single observation is not proof: dispatching a timer or
+         * completing an IO passes through a window where the work is no longer
+         * in the timer heap / in-flight count and not yet in a run queue, and
+         * a worker sampling exactly then would stop a live program. Requiring
+         * an unchanged activity counter across a 1ms re-check closes that
+         * window -- any queued frame or armed timer bumps the counter. */
         if (co_all_idle()) {
-            g_co_stop = 1;
-            for (int i = 0; i < g_co_workers; i++) co_wake_port();
-            return;
+            LONG seq = g_co_activity;
+            if (idle_seen == seq) {
+                g_co_stop = 1;
+                for (int i = 0; i < g_co_workers; i++) co_wake_port();
+                return;
+            }
+            idle_seen = seq;
+            Sleep(1);
+            continue;
         }
+        idle_seen = -1;
         /* Choose how long to block. A pending timer bounds it tightest; else
          * with IO in flight block for real completions (with a 1s ceiling as a
          * missed-wake safety net); else nothing is pending, so use a short cap
@@ -2553,16 +2845,22 @@ static void co_worker(int worker) {
             long long dw = dns_wait_ms(-1);
             if (dw >= 0 && dw < to) to = dw;
         }
-        /* Publish the idle state before the final shard scan. A producer that
-         * enqueues first is found by the scan; one that enqueues afterward
-         * observes g_co_idle > 0 and posts a wake packet. */
-        InterlockedIncrement(&g_co_idle);
-        int have_work = co_has_runnable();
-        if (have_work) {
-            InterlockedDecrement(&g_co_idle);
+        /* Publish the parked state before the final scan. A producer that
+         * pushes first is found by the scan; one that pushes afterward
+         * observes g_co_parked > 0 and posts a wake packet. */
+        InterlockedIncrement(&g_co_parked);
+        /* Re-sample the timer deadline now that this worker counts as parked.
+         * An armed timer is not a queued frame, so co_has_runnable cannot see
+         * it: a timer armed between the pump above and this point would
+         * otherwise leave the worker parked for the full fallback timeout
+         * (Task.Delay(2) taking tens of milliseconds instead of two). */
+        long long tnow = zan_timer_next_timeout();
+        if (tnow >= 0 && tnow < to) to = tnow;
+        if (tnow == 0 || co_has_runnable()) {
+            InterlockedDecrement(&g_co_parked);
             continue;
         }
-        co_wait_io(to);            /* decrements g_co_idle on return */
+        co_wait_io(to);            /* decrements g_co_parked on return */
     }
 }
 
@@ -2576,7 +2874,7 @@ void zan_co_sched_run(void) {
     int w = g_co_workers;
     g_co_stop = 0;
 
-    HANDLE th[64]; int nt = 0;
+    HANDLE th[ZAN_CO_MAXW]; int nt = 0;
     for (int i = 1; i < w; i++) {
         th[nt] = CreateThread(NULL, 0, co_worker_thunk,
                               (LPVOID)(uintptr_t)i, 0, NULL);
@@ -2591,16 +2889,16 @@ void zan_co_sched_run(void) {
 }
 
 size_t zan_co_pending(void) {
-    size_t n = 0;
+    size_t n = (size_t)(g_inj_len > 0 ? g_inj_len : 0);
     for (int i = 0; i < g_co_workers; i++) {
-        zan_co_worker_queue *q = &g_co_queues[i];
-        EnterCriticalSection(&q->lock);
-        for (zan_co_node *p = q->head; p; p = p->next) n++;
-        LeaveCriticalSection(&q->lock);
+        zan_co_worker_t *w = &g_wk[i];
+        long long h = __atomic_load_n(&w->head, __ATOMIC_ACQUIRE);
+        long long t = __atomic_load_n(&w->tail, __ATOMIC_ACQUIRE);
+        if (t > h) n += (size_t)(t - h);
+        if (w->lifo_full) n++;
     }
     return n;
 }
-
 #else
 /* ---------------- Non-Windows: single-threaded fallback ---------------- */
 
@@ -2621,6 +2919,11 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
 void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {
     zan_timer_delay(ms, frame, step);
 }
+
+/* Frame release hook the compiler emits under --async-workers. This driver is
+ * single-threaded, so nothing can hold a reference the program does not know
+ * about and the free needs no handshake. */
+void __zan_co_frame_free(void *frame) { free(frame); }
 
 size_t zan_co_pending(void) {
     size_t n = 0;

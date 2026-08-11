@@ -1304,6 +1304,10 @@ static void print_usage(void) {
     fprintf(stderr, "  --no-check-leaks, --no-arc-guard  Turn those off in a debug build\n");
     fprintf(stderr, "  --no-runtime-checks  Disable runtime guards (e.g. division by zero)\n");
     fprintf(stderr, "  --publish        Build optimized release binary (strip debug, optimize)\n");
+    fprintf(stderr, "  --async-workers, --mt  Run async programs on the multi-worker coroutine\n");
+    fprintf(stderr, "                   scheduler (worker count from ZAN_CO_WORKERS)\n");
+    fprintf(stderr, "  --fast-alloc     Front-end malloc with the per-thread small-object\n");
+    fprintf(stderr, "                   allocator (server workloads; native targets only)\n");
     fprintf(stderr, "  --link-mode <m>  Native driver linking on publish: shared (copy driver\n");
     fprintf(stderr, "                   libs next to the exe, default) or static (link into the exe)\n");
     fprintf(stderr, "  --driver-dir <d> Override the bundled native driver directory\n");
@@ -1483,6 +1487,7 @@ int main(int argc, char **argv) {
     bool publish_mode = false;
     bool debug_info = false; /* -g / --debug: emit DWARF for source debugging */
     bool mt_scheduler = false;
+    bool fast_alloc = false;
     const char *stdlib_path = NULL;
     bool auto_stdlib = true;
     const char *package_api = NULL;
@@ -1550,6 +1555,15 @@ int main(int argc, char **argv) {
              * their ready queue across a thread pool (worker count from the
              * ZAN_CO_WORKERS env var at run time; default = CPU count). */
             mt_scheduler = true;
+        } else if (strcmp(argv[i], "--fast-alloc") == 0) {
+            /* Link the small-object allocator (src/runtime/rt_mem.c) in front
+             * of the CRT's malloc: per-thread caches, size-class free lists
+             * and owner-directed cross-thread frees, which is what an ARC
+             * program's one-block-per-string/object/frame traffic wants.
+             * Opt-in on native Windows because it wraps malloc/free for the
+             * whole image: a block that crosses into a DLL carrying its own
+             * CRT and is freed there would not come back through our free. */
+            fast_alloc = true;
         } else if (strcmp(argv[i], "--link-mode") == 0 && i + 1 < argc) {
             const char *m = argv[++i];
             if (strcmp(m, "static") == 0) link_static_drivers = true;
@@ -2385,6 +2399,7 @@ int main(int argc, char **argv) {
         char rt_file_buf[1200];
         char rt_embed_buf[1200];
         char rt_timer_buf[1200];
+        char rt_mem_buf[1200];
 
         /* Socket-async programs (await Socket.ReadReady/WriteReady) link the
          * readiness reactor object shipped with zanc; it provides zan_io_wait_co
@@ -2456,6 +2471,22 @@ int main(int argc, char **argv) {
             rt_timer_obj = rt_timer_buf;
         }
 #endif
+        /* Small-object allocator (--fast-alloc): wraps malloc/free/calloc/
+         * realloc for the whole image, so it is only linked when asked for. */
+        const char *rt_mem_obj = NULL;
+#ifdef ZAN_RT_MEM_OBJ
+        if (fast_alloc && !cross_compiling) {
+            snprintf(rt_mem_buf, sizeof(rt_mem_buf), "%s/%s",
+                     link_exe_dir, zan_path_basename(ZAN_RT_MEM_OBJ));
+            if (zan_file_exists(rt_mem_buf)) rt_mem_obj = rt_mem_buf;
+        }
+#endif
+        if (fast_alloc && !rt_mem_obj) {
+            fprintf(stderr,
+                    "warning: --fast-alloc ignored: no allocator object for "
+                    "this target\n");
+        }
+
         /* Toolchain subdirectory holding the target-ABI runtime objects; NULL
          * on a native build or for a target that ships none. */
         const char *target_rt_sub = NULL;
@@ -3581,6 +3612,11 @@ int main(int argc, char **argv) {
             if (rt_file_obj) argv[a++] = rt_file_obj;
             if (rt_embed_obj) argv[a++] = rt_embed_obj;
             if (rt_timer_obj) argv[a++] = rt_timer_obj;
+            if (rt_mem_obj && a < 118) {
+                argv[a++] = rt_mem_obj;
+                argv[a++] = "--wrap=malloc";  argv[a++] = "--wrap=free";
+                argv[a++] = "--wrap=calloc"; argv[a++] = "--wrap=realloc";
+            }
             /* caller-supplied objects/resources (--link-input) */
             for (int ei = 0; ei < extra_link_input_count && a < 130; ei++)
                 argv[a++] = extra_link_inputs[ei];
@@ -3641,6 +3677,12 @@ int main(int argc, char **argv) {
             if (rt_timer_obj) {
                 size_t cur = strlen(link_cmd);
                 snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_timer_obj);
+            }
+            if (rt_mem_obj) {
+                size_t cur = strlen(link_cmd);
+                snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+                         " \"%s\" -Wl,--wrap=malloc -Wl,--wrap=free"
+                         " -Wl,--wrap=calloc -Wl,--wrap=realloc", rt_mem_obj);
             }
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 size_t cur = strlen(link_cmd);

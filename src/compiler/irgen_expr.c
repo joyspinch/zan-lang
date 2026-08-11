@@ -6453,8 +6453,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                  * owns it once the sub is done). Without this, every awaited
                  * async call leaks its frame -- a per-request leak that grows a
                  * long-running socket server's memory without bound. */
-                zan_call2(g->builder, LLVMGlobalGetValueType(g->fn_free),
-                    g->fn_free, &sub_rl, 1, "");
+                zan_emit_frame_free(g, sub_rl);
                 return coerce_await_result(g, expr, awres, locals);
             }
 
@@ -6472,8 +6471,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef awres = LLVMBuildLoad2(g->builder, i64, rptr, "awres");
             /* Root-driven sub has run to completion; copy out its result then
              * free its heap frame (no awaiter will). */
-            zan_call2(g->builder, LLVMGlobalGetValueType(g->fn_free),
-                g->fn_free, &sub_i8, 1, "");
+            zan_emit_frame_free(g, sub_i8);
             return coerce_await_result(g, expr, awres, locals);
         }
 

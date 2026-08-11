@@ -227,6 +227,28 @@ add_custom_command(TARGET zanc POST_BUILD
             ${ZAN_RT_IO_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_io${CMAKE_C_OUTPUT_EXTENSION}
     VERBATIM)
 
+# ---- Small-object allocator (--fast-alloc) ----
+# Per-thread caches, size-class free lists and owner-directed cross-thread
+# frees in front of the CRT's malloc (src/runtime/rt_mem.c). zanc links this
+# object -- with --wrap=malloc/free/calloc/realloc -- only for a program built
+# with --fast-alloc, because the wrap applies to the whole image.
+set(ZAN_RT_MEM_OBJ "${CMAKE_BINARY_DIR}/zanrt_mem${CMAKE_C_OUTPUT_EXTENSION}")
+add_custom_command(
+    OUTPUT ${ZAN_RT_MEM_OBJ}
+    COMMAND ${ZAN_RT_IO_CC} -std=c11
+            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
+            -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_mem.c -o ${ZAN_RT_MEM_OBJ}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_mem.c
+    COMMENT "Building small-object allocator object (zanrt_mem)"
+    VERBATIM)
+add_custom_target(zanrt_mem ALL DEPENDS ${ZAN_RT_MEM_OBJ})
+add_dependencies(zanc zanrt_mem)
+target_compile_definitions(zanc PRIVATE ZAN_RT_MEM_OBJ="${ZAN_RT_MEM_OBJ}")
+add_custom_command(TARGET zanc POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${ZAN_RT_MEM_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_mem${CMAKE_C_OUTPUT_EXTENSION}
+    VERBATIM)
+
 # ---- Atomics and cross-process shared-memory table runtime ----
 set(ZAN_RT_SYNC_OBJ "${CMAKE_BINARY_DIR}/zanrt_sync${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
@@ -782,6 +804,26 @@ if(NOT WIN32 AND NOT APPLE)
   )
   add_test(NAME runtime_mem_dblfree COMMAND zan_rt_mem_dblfree_test)
   set_tests_properties(runtime_mem_dblfree PROPERTIES TIMEOUT 30)
+
+  # Cross-thread frees: a block freed by a thread that did not allocate it must
+  # go back to the owning cache, or a server's allocate-here/free-there traffic
+  # drifts every block one way and the allocating thread maps slabs forever.
+  add_executable(zan_rt_mem_remote_test
+    tests/runtime/rt_mem_remote_test.c
+    src/runtime/rt_mem.c
+  )
+  target_include_directories(zan_rt_mem_remote_test PRIVATE ${CMAKE_SOURCE_DIR})
+  set_target_properties(zan_rt_mem_remote_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+  )
+  find_package(Threads REQUIRED)
+  target_link_libraries(zan_rt_mem_remote_test PRIVATE Threads::Threads)
+  target_link_options(zan_rt_mem_remote_test PRIVATE
+    -Wl,--wrap=malloc -Wl,--wrap=free -Wl,--wrap=calloc -Wl,--wrap=realloc
+  )
+  add_test(NAME runtime_mem_remote COMMAND zan_rt_mem_remote_test)
+  set_tests_properties(runtime_mem_remote PROPERTIES TIMEOUT 60)
 endif()
 
 # ---- Conformance suite: compile each program, run it, diff stdout vs golden ----

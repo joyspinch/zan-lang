@@ -432,6 +432,27 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
     return call;
 }
 
+/* Release an async coroutine frame (`frame` as i8*).
+ *
+ * Plain free() is only correct while one thread owns the frame. Under
+ * --async-workers the scheduler can still hold a reference when the program
+ * drops the frame -- an awaiter freeing a completed sub-task runs concurrently
+ * with the worker whose step() just completed it, and a cancelled or reaped
+ * frame may still name a task sitting in some worker's queue. So the
+ * multi-worker driver takes the free through __zan_co_frame_free, which frees
+ * immediately when nothing references the frame and otherwise hands the free
+ * to the worker that will drop the last reference. */
+static void zan_emit_frame_free(zan_irgen_t *g, LLVMValueRef frame_i8) {
+    if (g->mt_scheduler && g->rt_co_frame_free) {
+        zan_call2(g->builder, g->rt_co_frame_free_type, g->rt_co_frame_free,
+                  &frame_i8, 1, "");
+        return;
+    }
+    zan_call2(g->builder, LLVMGlobalGetValueType(g->fn_free), g->fn_free,
+              &frame_i8, 1, "");
+}
+
+
 /* Grow one of the IR registries to hold `need` entries. */
 static void *irgen_grow(void *base, int *cap, int need, size_t elem) {
     if (need <= *cap) return base;
@@ -1094,6 +1115,13 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef co_ready_args[] = { i8ptr, g->co_step_ptr };
     g->rt_co_ready_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), co_ready_args, 2, 0);
     g->rt_co_ready = LLVMAddFunction(g->mod, "zan_co_ready", g->rt_co_ready_type);
+    /* void __zan_co_frame_free(void *frame): release an async frame through the
+     * multi-worker driver, which defers the free while the scheduler still
+     * references the frame (running on some worker, or queued on another). */
+    g->rt_co_frame_free_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                                (LLVMTypeRef[]){ i8ptr }, 1, 0);
+    g->rt_co_frame_free = LLVMAddFunction(g->mod, "__zan_co_frame_free",
+                                          g->rt_co_frame_free_type);
     /* void zan_co_sched_init(void) / void zan_co_sched_run(void): root drive */
     g->rt_co_sched_init_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
     g->rt_co_sched_init = LLVMAddFunction(g->mod, "zan_co_sched_init", g->rt_co_sched_init_type);
@@ -1383,6 +1411,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
      * protocol can touch a sub-frame's header fields through an i8* without
      * knowing its concrete frame type (see ASYNC_FRAME_* indices). */
     LLVMTypeRef co_hdr_fields[] = {
+        i64, g->co_step_ptr,   /* SCHED, SCHED_STEP: scheduler-owned */
         LLVMInt32TypeInContext(g->ctx), LLVMInt32TypeInContext(g->ctx),
         i8ptr, g->co_step_ptr, i64,
         g->co_step_ptr, LLVMInt32TypeInContext(g->ctx),
@@ -1396,7 +1425,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
      * function (one slot per try in that body), so they are not part of the
      * shared prefix. Only the fields above are reached through this type. */
     g->co_header_type = LLVMStructCreateNamed(g->ctx, "zan.co.header");
-    LLVMStructSetBody(g->co_header_type, co_hdr_fields, 14, 0);
+    LLVMStructSetBody(g->co_header_type, co_hdr_fields, 16, 0);
     g->current_async_frame = NULL;
     g->current_async_frame_type = NULL;
     g->current_async_resume_fn = NULL;

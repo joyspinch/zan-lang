@@ -30,6 +30,13 @@ void   zan_co_ready(void *frame, zan_co_step_t step);
 void   zan_co_sched_run(void);
 size_t zan_co_pending(void);
 
+/* Release an async frame. Emitted code (--async-workers) calls this instead of
+ * free() for coroutine frames: under the multi-worker driver the scheduler may
+ * still hold a reference (the frame is running, or a task naming it sits in a
+ * worker queue), and the driver defers the free until that reference is gone.
+ * The single-threaded drivers free immediately. */
+void   __zan_co_frame_free(void *frame);
+
 /* Optional idle hook. When the ready queue empties, the scheduler calls this to
  * block for external events (the IO reactor / timers) and enqueue any newly
  * runnable frames. It returns the number of frames it made ready; a return of 0
@@ -39,5 +46,15 @@ size_t zan_co_pending(void);
  */
 typedef int (*zan_co_idle_fn)(void);
 void   zan_co_set_idle(zan_co_idle_fn fn);
+
+/* Registry of live detached (Task.Spawn) frames (rt_colive.c). A spawn handle
+ * is a raw frame pointer that outlives the coroutine once the reaper frees the
+ * frame, so emitted code (Task.Cancel, Task.WhenAll) asks whether a handle is
+ * still live before dereferencing it. Safe to call from any thread the driver
+ * runs on. */
+void   zan_co_live_add(void *frame);
+void   zan_co_live_del(void *frame);
+int    zan_co_live_has(void *frame);
+void   zan_co_live_reset(void);
 
 #endif /* ZAN_RT_CO_H */

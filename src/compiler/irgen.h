@@ -370,9 +370,11 @@ struct zan_irgen {
     /* async/await CPS lowering (see docs/ASYNC_CPS_DESIGN.md) */
     LLVMTypeRef  co_step_type;    /* void(i8*) — a frame's resume/step fn */
     LLVMTypeRef  co_step_ptr;     /* void(i8*)* — pointer to a step fn */
-    LLVMTypeRef  co_header_type;  /* shared frame header {i32,i32,i8*,step*,i64} */
+    LLVMTypeRef  co_header_type;  /* shared frame header {i64,step*,i32,i32,i8*,step*,i64} */
     LLVMValueRef rt_co_ready;     /* void zan_co_ready(void* frame, step) */
     LLVMTypeRef  rt_co_ready_type;
+    LLVMValueRef rt_co_frame_free;/* void __zan_co_frame_free(void* frame) */
+    LLVMTypeRef  rt_co_frame_free_type;
     LLVMValueRef rt_co_sched_init;/* void zan_co_sched_init(void) */
     LLVMTypeRef  rt_co_sched_init_type;
     LLVMValueRef rt_co_sched_run; /* void zan_co_sched_run(void) */

@@ -259,8 +259,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
             LLVMValueRef rptr = LLVMBuildStructGEP2(g->builder, g->co_header_type,
                 sub_i8, ASYNC_FRAME_RESULT, "main.res.p");
             LLVMValueRef res = LLVMBuildLoad2(g->builder, i64, rptr, "main.res");
-            zan_call2(g->builder, LLVMGlobalGetValueType(g->fn_free),
-                g->fn_free, &sub_i8, 1, "");
+            zan_emit_frame_free(g, sub_i8);
             emit_release_static_rc_fields(g, unit);
             /* void Main: the result slot is zero-initialized, so this still
              * returns 0. */
@@ -412,6 +411,8 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         w->sub_base = locals_base + w->alocal_count;
         int nfields = w->sub_base + w->await_count;
         LLVMTypeRef *fields = (LLVMTypeRef *)calloc((size_t)nfields, sizeof(LLVMTypeRef));
+        fields[ASYNC_FRAME_SCHED] = i64;
+        fields[ASYNC_FRAME_SCHED_STEP] = g->co_step_ptr;
         fields[ASYNC_FRAME_STATE] = i32;
         fields[ASYNC_FRAME_DONE] = i32;
         fields[ASYNC_FRAME_AWAITER] = i8ptr;
@@ -832,8 +833,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
                     w->alocals[k].llvm, sp, "cl.lv");
                 emit_rc_release_for_type(g, w->alocals[k].ztype, v);
             }
-            zan_call2(g->builder, LLVMGlobalGetValueType(g->fn_free),
-                g->fn_free, &cparam, 1, "");
+            zan_emit_frame_free(g, cparam);
             LLVMBuildRetVoid(g->builder);
             g->current_fn = saved_cl_fn;
         }

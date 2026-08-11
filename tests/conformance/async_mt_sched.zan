@@ -1,0 +1,84 @@
+// Conformance: the multi-worker scheduler's queueing rules (compiled with
+// --async-workers). A wide fan-out forces work off the spawning worker's own
+// queue into the other workers' (steal path), the ping-pong chain keeps two
+// coroutines readying each other so the LIFO slot's budget has to hand control
+// back to the queue, timers deliver readies from the pump while workers run,
+// and the cancelled batch frees frames the scheduler may still hold a
+// reference to (queued or running). Counters are atomic because these bodies
+// really do run on different threads. Prints deterministic totals.
+using System;
+using System.Threading;
+
+class Program {
+    static AtomicInt hits;
+    static AtomicInt pong;
+    static AtomicInt cancelled;
+
+    // Fan-out leaf: suspends on a timer, so the resume comes from the timer
+    // pump on whichever worker owns it and not from the spawner.
+    static async int Leaf(int ms) {
+        await Task.Delay(ms);
+        Program.hits.Add(1);
+        return 0;
+    }
+
+    // Two coroutines readying each other through zero-length delays: the run
+    // queue must not starve while this pair bounces.
+    static async int Ping(int rounds) {
+        for (int i = 0; i < rounds; i = i + 1) {
+            await Task.Delay(0);
+            Program.pong.Add(1);
+        }
+        return 0;
+    }
+
+    // Cancelled before or during its long wait: the frame is released while a
+    // task naming it may still sit in a queue.
+    static async int Slow() {
+        await Task.Delay(5000);
+        Program.cancelled.Add(1);
+        return 0;
+    }
+
+    static async int Run() {
+        Program.hits = new AtomicInt(0);
+        Program.pong = new AtomicInt(0);
+        Program.cancelled = new AtomicInt(0);
+
+        // 96 frames queued back to back: more than one worker's private ring
+        // holds, so both the spill-to-global and the steal path run.
+        List<long> fan = new List<long>();
+        for (int i = 0; i < 96; i = i + 1) {
+            fan.Add(Task.Spawn(Program.Leaf(i % 4)));
+        }
+        int joined = await Task.WhenAll(fan);
+        Console.WriteLine("joined=" + Convert.ToString(joined));
+        Console.WriteLine("hits=" + Convert.ToString(Program.hits.Load()));
+
+        List<long> pair = new List<long>();
+        pair.Add(Task.Spawn(Program.Ping(50)));
+        pair.Add(Task.Spawn(Program.Ping(50)));
+        await Task.WhenAll(pair);
+        Console.WriteLine("pong=" + Convert.ToString(Program.pong.Load()));
+
+        List<long> slow = new List<long>();
+        for (int i = 0; i < 16; i = i + 1) {
+            slow.Add(Task.Spawn(Program.Slow()));
+        }
+        TaskJoin.CancelAll(slow);
+        int drained = await Task.WhenAll(slow);
+        Console.WriteLine("drained=" + Convert.ToString(drained));
+        Console.WriteLine("cancelled=" + Convert.ToString(Program.cancelled.Load()));
+
+        // the pool must still be alive and fair after all of that
+        await Task.Delay(5);
+        int tail = await Program.Leaf(1);
+        Console.WriteLine("hits2=" + Convert.ToString(Program.hits.Load()));
+        return tail;
+    }
+
+    static async void Main() {
+        await Program.Run();
+        Console.WriteLine("ok");
+    }
+}

@@ -214,16 +214,29 @@ static void emit_async_complete(zan_irgen_t *g, local_scope_t *locals, LLVMValue
     LLVMBuildRetVoid(g->builder);
 }
 
-/* Head of the module's list of live detached (Task.Spawn) frames, linked
- * through ASYNC_FRAME_LNEXT. Created on first use. */
-static LLVMValueRef get_co_live_head(zan_irgen_t *g) {
-    LLVMValueRef gv = LLVMGetNamedGlobal(g->mod, "__zan_co_live");
-    if (gv) return gv;
+/* Declare one of the runtime's live-frame registry entry points
+ * (zan_co_live_add / _del / _has, rt_colive.c), creating the declaration once
+ * per module. The registry replaced a compiler-emitted intrusive list rooted in
+ * a global: unlinking walked the list (O(live coroutines) per completion) and,
+ * with the multi-worker driver, two OS threads splicing it concurrently
+ * corrupted it -- a crash inside the emitted unlink helper. */
+static LLVMValueRef get_co_live_fn(zan_irgen_t *g, const char *name,
+                                   bool returns_i32, LLVMTypeRef *out_ty) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    gv = LLVMAddGlobal(g->mod, i8ptr, "__zan_co_live");
-    LLVMSetInitializer(gv, LLVMConstNull(i8ptr));
-    LLVMSetLinkage(gv, LLVMInternalLinkage);
-    return gv;
+    LLVMTypeRef ret = returns_i32 ? LLVMInt32TypeInContext(g->ctx)
+                                  : LLVMVoidTypeInContext(g->ctx);
+    LLVMTypeRef ty = LLVMFunctionType(ret, &i8ptr, 1, 0);
+    if (out_ty) *out_ty = ty;
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, name);
+    if (!fn) fn = LLVMAddFunction(g->mod, name, ty);
+    return fn;
+}
+
+/* Emit `zan_co_live_has(frame)` at the current insertion point. */
+static LLVMValueRef emit_co_live_has(zan_irgen_t *g, LLVMValueRef frame) {
+    LLVMTypeRef ty;
+    LLVMValueRef fn = get_co_live_fn(g, "zan_co_live_has", true, &ty);
+    return zan_call2(g->builder, ty, fn, &frame, 1, "co.live");
 }
 
 /* Open an internal `void f(i8*)` helper: creates it, positions the builder in a
@@ -251,81 +264,27 @@ static void close_co_helper(zan_irgen_t *g, LLVMBasicBlockRef saved,
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
 }
 
-/* __zan_co_track(f): push a detached frame onto the live list. */
+/* __zan_co_track(f): record a detached frame as live. */
 static LLVMValueRef get_co_track_fn(zan_irgen_t *g) {
     LLVMValueRef fn; LLVMBasicBlockRef saved; LLVMValueRef saved_fn;
     if (!open_co_helper(g, "__zan_co_track", &fn, &saved, &saved_fn)) return fn;
-    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMValueRef head = get_co_live_head(g);
+    LLVMTypeRef ty;
+    LLVMValueRef add = get_co_live_fn(g, "zan_co_live_add", false, &ty);
     LLVMValueRef f = LLVMGetParam(fn, 0);
-    LLVMValueRef old = LLVMBuildLoad2(g->builder, i8ptr, head, "live.head");
-    LLVMBuildStore(g->builder, old,
-        LLVMBuildStructGEP2(g->builder, g->co_header_type, f,
-                            ASYNC_FRAME_LNEXT, "tr.next"));
-    LLVMBuildStore(g->builder, f, head);
+    zan_call2(g->builder, ty, add, &f, 1, "");
     LLVMBuildRetVoid(g->builder);
     close_co_helper(g, saved, saved_fn);
     return fn;
 }
 
-/* __zan_co_untrack(f): unlink a frame from the live list (before it is freed). */
+/* __zan_co_untrack(f): drop a frame from the live registry (before it is freed). */
 static LLVMValueRef get_co_untrack_fn(zan_irgen_t *g) {
     LLVMValueRef fn; LLVMBasicBlockRef saved; LLVMValueRef saved_fn;
     if (!open_co_helper(g, "__zan_co_untrack", &fn, &saved, &saved_fn)) return fn;
-    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMTypeRef hdr = g->co_header_type;
-    LLVMValueRef head = get_co_live_head(g);
+    LLVMTypeRef ty;
+    LLVMValueRef del = get_co_live_fn(g, "zan_co_live_del", false, &ty);
     LLVMValueRef f = LLVMGetParam(fn, 0);
-    LLVMValueRef prev = LLVMBuildAlloca(g->builder, i8ptr, "ut.prev");
-    LLVMValueRef cur = LLVMBuildAlloca(g->builder, i8ptr, "ut.cur");
-    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), prev);
-    LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i8ptr, head, "h"), cur);
-    LLVMBasicBlockRef loop = LLVMAppendBasicBlockInContext(g->ctx, fn, "ut.loop");
-    LLVMBasicBlockRef test = LLVMAppendBasicBlockInContext(g->ctx, fn, "ut.test");
-    LLVMBasicBlockRef hit = LLVMAppendBasicBlockInContext(g->ctx, fn, "ut.hit");
-    LLVMBasicBlockRef first = LLVMAppendBasicBlockInContext(g->ctx, fn, "ut.first");
-    LLVMBasicBlockRef mid = LLVMAppendBasicBlockInContext(g->ctx, fn, "ut.mid");
-    LLVMBasicBlockRef step = LLVMAppendBasicBlockInContext(g->ctx, fn, "ut.step");
-    LLVMBasicBlockRef out = LLVMAppendBasicBlockInContext(g->ctx, fn, "ut.out");
-    LLVMBuildBr(g->builder, loop);
-
-    LLVMPositionBuilderAtEnd(g->builder, loop);
-    LLVMValueRef c = LLVMBuildLoad2(g->builder, i8ptr, cur, "ut.c");
-    LLVMBuildCondBr(g->builder,
-        zan_icmp(g->builder, LLVMIntNE, c, LLVMConstNull(i8ptr), "ut.nn"), test, out);
-
-    LLVMPositionBuilderAtEnd(g->builder, test);
-    LLVMValueRef c2 = LLVMBuildLoad2(g->builder, i8ptr, cur, "ut.c2");
-    LLVMBuildCondBr(g->builder,
-        zan_icmp(g->builder, LLVMIntEQ, c2, f, "ut.eq"), hit, step);
-
-    LLVMPositionBuilderAtEnd(g->builder, hit);
-    LLVMValueRef next = LLVMBuildLoad2(g->builder, i8ptr,
-        LLVMBuildStructGEP2(g->builder, hdr, f, ASYNC_FRAME_LNEXT, "ut.np"), "ut.n");
-    LLVMValueRef p = LLVMBuildLoad2(g->builder, i8ptr, prev, "ut.p");
-    LLVMBuildCondBr(g->builder,
-        zan_icmp(g->builder, LLVMIntEQ, p, LLVMConstNull(i8ptr), "ut.isfirst"),
-        first, mid);
-
-    LLVMPositionBuilderAtEnd(g->builder, first);
-    LLVMBuildStore(g->builder, next, head);
-    LLVMBuildBr(g->builder, out);
-
-    LLVMPositionBuilderAtEnd(g->builder, mid);
-    LLVMValueRef p2 = LLVMBuildLoad2(g->builder, i8ptr, prev, "ut.p2");
-    LLVMBuildStore(g->builder, next,
-        LLVMBuildStructGEP2(g->builder, hdr, p2, ASYNC_FRAME_LNEXT, "ut.pn"));
-    LLVMBuildBr(g->builder, out);
-
-    LLVMPositionBuilderAtEnd(g->builder, step);
-    LLVMValueRef c3 = LLVMBuildLoad2(g->builder, i8ptr, cur, "ut.c3");
-    LLVMBuildStore(g->builder, c3, prev);
-    LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i8ptr,
-        LLVMBuildStructGEP2(g->builder, hdr, c3, ASYNC_FRAME_LNEXT, "ut.cn"),
-        "ut.cnv"), cur);
-    LLVMBuildBr(g->builder, loop);
-
-    LLVMPositionBuilderAtEnd(g->builder, out);
+    zan_call2(g->builder, ty, del, &f, 1, "");
     LLVMBuildRetVoid(g->builder);
     close_co_helper(g, saved, saved_fn);
     return fn;
@@ -343,7 +302,7 @@ static LLVMValueRef get_co_untrack_fn(zan_irgen_t *g) {
  * timer or socket wait is only cancelled once that wait completes.
  *
  * The handle comes from Task.Spawn and may name a frame the reaper has already
- * freed, so the root handle is looked up in the live detached-frame list
+ * freed, so the root handle is looked up in the runtime's live-frame registry
  * first; the CHILD chain below it is alive by construction (a suspended
  * awaiter owns its sub-frame until it resumes). */
 static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g) {
@@ -360,9 +319,6 @@ static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g) {
     LLVMValueRef saved_fn = g->current_fn;
     g->current_fn = fn;
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
-    LLVMBasicBlockRef scan_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cc.scan");
-    LLVMBasicBlockRef scmp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cc.scmp");
-    LLVMBasicBlockRef snext_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cc.snext");
     LLVMBasicBlockRef head_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cc.head");
     LLVMBasicBlockRef mark_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cc.mark");
     LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cc.ret");
@@ -370,30 +326,12 @@ static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g) {
     di_clear(g);
     LLVMValueRef arg = LLVMGetParam(fn, 0);
     LLVMValueRef cur = LLVMBuildAlloca(g->builder, i8ptr, "cc.cur");
-    LLVMValueRef scan = LLVMBuildAlloca(g->builder, i8ptr, "cc.scan.p");
     LLVMBuildStore(g->builder, arg, cur);
-    LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i8ptr,
-        get_co_live_head(g), "cc.live"), scan);
-    LLVMBuildBr(g->builder, scan_bb);
-
     /* is `arg` still a live detached frame? */
-    LLVMPositionBuilderAtEnd(g->builder, scan_bb);
-    LLVMValueRef s = LLVMBuildLoad2(g->builder, i8ptr, scan, "cc.s");
+    LLVMValueRef live = emit_co_live_has(g, arg);
     LLVMBuildCondBr(g->builder,
-        zan_icmp(g->builder, LLVMIntNE, s, LLVMConstNull(i8ptr), "cc.snn"),
-        scmp_bb, ret_bb);
-
-    LLVMPositionBuilderAtEnd(g->builder, scmp_bb);
-    LLVMValueRef s2 = LLVMBuildLoad2(g->builder, i8ptr, scan, "cc.s2");
-    LLVMBuildCondBr(g->builder,
-        zan_icmp(g->builder, LLVMIntEQ, s2, arg, "cc.seq"), head_bb, snext_bb);
-
-    LLVMPositionBuilderAtEnd(g->builder, snext_bb);
-    LLVMValueRef s3 = LLVMBuildLoad2(g->builder, i8ptr, scan, "cc.s3");
-    LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i8ptr,
-        LLVMBuildStructGEP2(g->builder, hdr, s3, ASYNC_FRAME_LNEXT, "cc.sn"),
-        "cc.snv"), scan);
-    LLVMBuildBr(g->builder, scan_bb);
+        zan_icmp(g->builder, LLVMIntNE, live, LLVMConstInt(i32, 0, 0), "cc.islive"),
+        head_bb, ret_bb);
 
     /* while (cur != null) { cur->cancel = 1; cur = cur->child; } */
     LLVMPositionBuilderAtEnd(g->builder, head_bb);
@@ -424,9 +362,10 @@ static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g) {
  * (Task.WhenAll) can join detached coroutines instead of every caller wiring
  * its own counter and gate. Two states mean "finished":
  *
- *   - the handle is no longer in the live detached-frame list: the reaper has
- *     already run and freed the frame (dereferencing it would be a use after
- *     free, which is why the list is scanned rather than the flag read blind);
+ *   - the handle is no longer in the runtime's live-frame registry: the reaper
+ *     has already run and freed the frame (dereferencing it would be a use
+ *     after free, which is why the registry is consulted rather than the flag
+ *     read blind);
  *   - the frame is still live but its DONE flag is set: the body ran to
  *     completion and the frame is only queued for reaping.
  *
@@ -447,36 +386,15 @@ static LLVMValueRef get_co_isdone_fn(zan_irgen_t *g) {
     LLVMValueRef saved_fn = g->current_fn;
     g->current_fn = fn;
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
-    LLVMBasicBlockRef scan_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "id.scan");
-    LLVMBasicBlockRef cmp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "id.cmp");
-    LLVMBasicBlockRef next_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "id.next");
     LLVMBasicBlockRef live_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "id.live");
     LLVMBasicBlockRef gone_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "id.gone");
     LLVMPositionBuilderAtEnd(g->builder, entry);
     di_clear(g);
     LLVMValueRef arg = LLVMGetParam(fn, 0);
-    LLVMValueRef scan = LLVMBuildAlloca(g->builder, i8ptr, "id.scan.p");
-    LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i8ptr,
-        get_co_live_head(g), "id.live.head"), scan);
-    LLVMBuildBr(g->builder, scan_bb);
-
-    LLVMPositionBuilderAtEnd(g->builder, scan_bb);
-    LLVMValueRef s = LLVMBuildLoad2(g->builder, i8ptr, scan, "id.s");
+    LLVMValueRef live = emit_co_live_has(g, arg);
     LLVMBuildCondBr(g->builder,
-        zan_icmp(g->builder, LLVMIntNE, s, LLVMConstNull(i8ptr), "id.snn"),
-        cmp_bb, gone_bb);
-
-    LLVMPositionBuilderAtEnd(g->builder, cmp_bb);
-    LLVMValueRef s2 = LLVMBuildLoad2(g->builder, i8ptr, scan, "id.s2");
-    LLVMBuildCondBr(g->builder,
-        zan_icmp(g->builder, LLVMIntEQ, s2, arg, "id.seq"), live_bb, next_bb);
-
-    LLVMPositionBuilderAtEnd(g->builder, next_bb);
-    LLVMValueRef s3 = LLVMBuildLoad2(g->builder, i8ptr, scan, "id.s3");
-    LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, i8ptr,
-        LLVMBuildStructGEP2(g->builder, hdr, s3, ASYNC_FRAME_LNEXT, "id.sn"),
-        "id.snv"), scan);
-    LLVMBuildBr(g->builder, scan_bb);
+        zan_icmp(g->builder, LLVMIntNE, live, LLVMConstInt(i32, 0, 0), "id.islive"),
+        live_bb, gone_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, live_bb);
     LLVMValueRef done = LLVMBuildLoad2(g->builder, i32,
@@ -1687,7 +1605,7 @@ static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub) {
     LLVMBuildStore(g->builder, tv, get_eh_exc_tid_global(g));
     LLVMBuildStore(g->builder, ov, get_eh_exc_owned_global(g));
     /* the sub-frame is dead once its exception has been taken over */
-    zan_call2(g->builder, LLVMGlobalGetValueType(g->fn_free), g->fn_free, &sub, 1, "");
+    zan_emit_frame_free(g, sub);
     emit_eh_rethrow_current(g);
     if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
         LLVMBuildUnreachable(g->builder);
