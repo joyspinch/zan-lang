@@ -20,6 +20,7 @@
 #define ZAN_RT_CO_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* Resume/step function emitted per async method: re-enters the state machine
  * whose saved state lives in `frame`. */
@@ -56,5 +57,18 @@ void   zan_co_live_add(void *frame);
 void   zan_co_live_del(void *frame);
 int    zan_co_live_has(void *frame);
 void   zan_co_live_reset(void);
+
+/* Per-program async runtime settings (rt_timer.c, i.e. always linked), exposed
+ * to Zan code as System.Threading.AsyncRuntime. Set them from Main, before the
+ * pool starts; the multi-worker driver reads them in zan_co_sched_run. An
+ * unset value (0, or -1 for sync_fast) keeps the driver's own default, which
+ * still honours the ZAN_CO_WORKERS / ZAN_IO_SHARDS / ZAN_IO_SYNCFAST
+ * environment variables. */
+void    zan_async_set_workers(int32_t workers);
+void    zan_async_set_io_shards(int32_t shards);
+void    zan_async_set_sync_fast(int32_t on);
+int32_t zan_async_cfg_workers(void);
+int32_t zan_async_cfg_io_shards(void);
+int32_t zan_async_cfg_sync_fast(void);
 
 #endif /* ZAN_RT_CO_H */

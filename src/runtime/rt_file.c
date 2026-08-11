@@ -36,6 +36,9 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>   /* _NSGetExecutablePath */
+#endif
 #endif
 
 #if !defined(_WIN32) && !defined(O_NOFOLLOW)

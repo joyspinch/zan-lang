@@ -7,6 +7,13 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
+/* GetTickCount64 needs Vista+ headers; without this the strict -std=c11 MinGW
+ * build only gets an implicit declaration and truncates the 64-bit tick count
+ * to int. */
+#if defined(_WIN32) && !defined(_WIN32_WINNT)
+#define _WIN32_WINNT 0x0601
+#endif
+
 #include "rt_timer.h"
 
 #include <stdlib.h>
@@ -81,6 +88,12 @@ static void (*g_ready_hook)(void *frame, zan_timer_step_t step);
  * longer in the heap, so the usual scan would miss it and the timer would
  * reschedule forever. Read/written under the lock. */
 static zan_timer_entry *g_dispatching;
+/* Live (not removed) entries currently in the heap. Maintained on every push /
+ * pop / removal so zan_timer_pending() is an O(1) unlocked read: the
+ * multi-worker driver calls it once per scheduler loop iteration on every
+ * worker, and the old "take the global lock and walk the whole heap" version
+ * made the timer lock the pool's hottest contention point. */
+static volatile long long g_live;
 
 long long zan_timer_now_ms(void) {
 #if defined(_WIN32)
@@ -115,6 +128,7 @@ static void heap_push(zan_timer_entry *entry) {
         g_heap = heap;
         g_heap_cap = cap;
     }
+    if (!entry->removed) g_live++;
     size_t index = g_heap_len++;
     g_heap[index] = entry;
     while (index > 0) {
@@ -128,6 +142,7 @@ static void heap_push(zan_timer_entry *entry) {
 static zan_timer_entry *heap_pop(void) {
     if (g_heap_len == 0) return NULL;
     zan_timer_entry *root = g_heap[0];
+    if (!root->removed) g_live--;
     zan_timer_entry *last = g_heap[--g_heap_len];
     if (g_heap_len == 0) return root;
     g_heap[0] = last;
@@ -155,6 +170,7 @@ void zan_timer_runtime_reset(void) {
     timer_lock();
     for (size_t i = 0; i < g_heap_len; i++) free(g_heap[i]);
     g_heap_len = 0;
+    g_live = 0;
     g_next_id = 1;
     g_round = 0;
     g_sequence = 0;
@@ -270,13 +286,9 @@ long long zan_timer_dispatch_due(void) {
 }
 
 long long zan_timer_pending(void) {
-    size_t count = 0;
-    timer_lock();
-    for (size_t i = 0; i < g_heap_len; i++)
-        if (!g_heap[i]->removed) count++;
-    timer_unlock();
-    return count;
+    return g_live;
 }
+
 
 int zan_timer_clear(long long id) {
     int found = 0;
@@ -285,6 +297,7 @@ int zan_timer_clear(long long id) {
         zan_timer_entry *entry = g_heap[i];
         if (entry->kind == ZAN_TIMER_PUBLIC && entry->id == id && !entry->removed) {
             entry->removed = 1;
+            g_live--;
             found = 1;
             break;
         }
@@ -307,6 +320,7 @@ long long zan_timer_clear_all(void) {
         zan_timer_entry *entry = g_heap[i];
         if (entry->kind == ZAN_TIMER_PUBLIC && !entry->removed) {
             entry->removed = 1;
+            g_live--;
             count++;
         }
     }
@@ -387,3 +401,173 @@ int swoole_timer_info(long long id, long long *a, long long *b, long long *c, lo
 long long swoole_timer_list_count(void) { return zan_timer_list_count(); }
 long long swoole_timer_list_at(long long index) { return zan_timer_list_at(index); }
 void swoole_timer_stats(long long *a, long long *b, long long *c) { zan_timer_stats(a, b, c); }
+
+/* ---- registry of live detached (Task.Spawn) coroutine frames ----
+ *
+ * A spawn handle is a raw frame pointer that can outlive the coroutine (the
+ * reaper frees the frame), so Task.Cancel / Task.WhenAll must ask "is this
+ * frame still alive?" before dereferencing it. That used to be an intrusive
+ * singly-linked list rooted in a compiler-emitted global (__zan_co_live),
+ * walked and spliced by emitted code with plain loads and stores. Two problems:
+ *
+ *   - unlinking scanned the list, so a server holding N live coroutines paid
+ *     O(N) per completion -- at 1000 connections, a walk of a thousand frames
+ *     per finished coroutine;
+ *   - the splice was unsynchronized, which the multi-worker driver
+ *     (--async-workers) turns into a crash: workers on different OS threads
+ *     mutate the list concurrently and one follows a stale link (an access
+ *     violation inside the emitted __zan_co_untrack).
+ *
+ * Same registry as an open-addressed hash set of frame pointers behind a spin
+ * lock: O(1) expected for all operations and safe from any thread the driver
+ * runs. It lives in this object rather than rt_co.c because emitted code calls
+ * it unconditionally and zanc links this object into every native program,
+ * while rt_co.c is replaced wholesale by the multi-worker driver.
+ */
+
+
+/* Tombstone: a slot whose frame was removed. Linear probing cannot simply
+ * clear a slot without breaking the probe chains that run through it, and no
+ * real frame pointer can be 1 (frames are at least 16-byte aligned). */
+#define ZAN_LIVE_DEAD ((void *)(uintptr_t)1)
+
+static void  **g_colive_slots;
+static size_t   g_colive_cap;    /* power of two, 0 until first insert */
+static size_t   g_colive_live;   /* occupied slots */
+static size_t   g_colive_dead;   /* tombstones */
+
+static volatile int g_colive_lock;
+
+static void live_lock(void) {
+    while (__sync_lock_test_and_set(&g_colive_lock, 1)) {
+        while (g_colive_lock) {
+#if defined(__i386__) || defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+        }
+    }
+}
+
+static void live_unlock(void) { __sync_lock_release(&g_colive_lock); }
+
+/* Pointer mix (splitmix64 finaliser): frames come from the allocator in
+ * 16-byte-aligned runs, so the low bits alone would collide heavily. */
+static size_t live_hash(void *p) {
+    uint64_t x = (uint64_t)(uintptr_t)p;
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return (size_t)x;
+}
+
+/* Grow (or compact, when tombstones are what filled the table) to `ncap`. */
+static void live_rehash(size_t ncap) {
+    void **old = g_colive_slots;
+    size_t ocap = g_colive_cap;
+    void **ns = (void **)calloc(ncap, sizeof(*ns));
+    if (!ns) zan_host_oom();
+    g_colive_slots = ns;
+    g_colive_cap = ncap;
+    g_colive_dead = 0;
+    g_colive_live = 0;
+    for (size_t i = 0; i < ocap; i++) {
+        void *f = old[i];
+        if (!f || f == ZAN_LIVE_DEAD) continue;
+        size_t j = live_hash(f) & (ncap - 1);
+        while (ns[j]) j = (j + 1) & (ncap - 1);
+        ns[j] = f;
+        g_colive_live++;
+    }
+    free(old);
+}
+
+void zan_co_live_add(void *frame) {
+    if (!frame) return;
+    live_lock();
+    /* Keep the load factor at or below 3/4 counting tombstones: probe chains
+     * stay short, and a table churning in place (a server where coroutines
+     * come and go) compacts instead of growing without bound. */
+    if ((g_colive_live + g_colive_dead + 1) * 4 > g_colive_cap * 3)
+        live_rehash(g_colive_cap ? (g_colive_live * 4 > g_colive_cap ? g_colive_cap * 2 : g_colive_cap) : 64);
+    size_t mask = g_colive_cap - 1;
+    size_t i = live_hash(frame) & mask;
+    size_t reuse = (size_t)-1;
+    for (;;) {
+        void *cur = g_colive_slots[i];
+        if (!cur) break;
+        if (cur == frame) { live_unlock(); return; }
+        if (cur == ZAN_LIVE_DEAD && reuse == (size_t)-1) reuse = i;
+        i = (i + 1) & mask;
+    }
+    if (reuse != (size_t)-1) { i = reuse; g_colive_dead--; }
+    g_colive_slots[i] = frame;
+    g_colive_live++;
+    live_unlock();
+}
+
+void zan_co_live_del(void *frame) {
+    if (!frame || !g_colive_cap) return;
+    live_lock();
+    size_t mask = g_colive_cap - 1;
+    size_t i = live_hash(frame) & mask;
+    for (;;) {
+        void *cur = g_colive_slots[i];
+        if (!cur) break;
+        if (cur == frame) {
+            g_colive_slots[i] = ZAN_LIVE_DEAD;
+            g_colive_live--;
+            g_colive_dead++;
+            break;
+        }
+        i = (i + 1) & mask;
+    }
+    live_unlock();
+}
+
+int zan_co_live_has(void *frame) {
+    if (!frame || !g_colive_cap) return 0;
+    live_lock();
+    size_t mask = g_colive_cap - 1;
+    size_t i = live_hash(frame) & mask;
+    int found = 0;
+    for (;;) {
+        void *cur = g_colive_slots[i];
+        if (!cur) break;
+        if (cur == frame) { found = 1; break; }
+        i = (i + 1) & mask;
+    }
+    live_unlock();
+    return found;
+}
+
+void zan_co_live_reset(void) {
+    live_lock();
+    free(g_colive_slots);
+    g_colive_slots = NULL;
+    g_colive_cap = g_colive_live = g_colive_dead = 0;
+    live_unlock();
+}
+
+/* ---- async runtime configuration ----
+ * Per-program scheduler/reactor settings, written by System.Threading
+ * .AsyncRuntime from Main and read by the multi-worker driver when it starts
+ * (the generated main calls zan_co_sched_init at entry and zan_co_sched_run
+ * after the body, so a call in Main lands between the two).
+ *
+ * They live here, not in rt_io.c, because this object is linked into every
+ * program while the reactor object is linked only for socket-async ones -- a
+ * program that only configures the runtime must still link. Programs that
+ * configure nothing keep the previous behaviour: the driver falls back to the
+ * ZAN_CO_WORKERS / ZAN_IO_SHARDS / ZAN_IO_SYNCFAST environment variables,
+ * which stay available for A/B measurements without a rebuild. */
+static volatile int g_cfg_workers   = 0;    /* 0  = unset (CPU count) */
+static volatile int g_cfg_io_shards = 0;    /* 0  = unset (one per worker) */
+static volatile int g_cfg_sync_fast = -1;   /* -1 = unset */
+
+void zan_async_set_workers(int32_t n)    { g_cfg_workers = (n > 0) ? (int)n : 0; }
+void zan_async_set_io_shards(int32_t n)  { g_cfg_io_shards = (n > 0) ? (int)n : 0; }
+void zan_async_set_sync_fast(int32_t on) { g_cfg_sync_fast = on ? 1 : 0; }
+
+int32_t zan_async_cfg_workers(void)   { return (int32_t)g_cfg_workers; }
+int32_t zan_async_cfg_io_shards(void) { return (int32_t)g_cfg_io_shards; }
+int32_t zan_async_cfg_sync_fast(void) { return (int32_t)g_cfg_sync_fast; }

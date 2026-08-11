@@ -1037,7 +1037,78 @@ enum {
 
 static HANDLE g_iocp;
 #if defined(ZAN_CO_DRIVER)
-static volatile LONG g_skip_mode = -1;  /* -1 unknown, 1 on, 0 unsupported */
+/* Opt-in synchronous-completion fast path (see ensure_assoc). */
+static volatile LONG g_syncfast = -1;   /* -1 unread, 1 on, 0 off */
+
+static volatile LONG g_sync_inline;     /* completions delivered without a packet */
+
+static int syncfast_on(void) {
+    LONG v = g_syncfast;
+    if (v < 0) {
+        const char *e = getenv("ZAN_IO_SYNCFAST");
+        v = (e && *e && e[0] != '0') ? 1 : 0;
+        InterlockedExchange(&g_syncfast, v);
+    }
+    return (int)v;
+}
+
+/* ---- reactor shards ----
+ * One completion port per worker instead of one for the whole pool. A socket is
+ * owned by the shard its handle hashes to, so every completion for that socket
+ * reaches the same worker: the connection's steps run on one thread (hot LIFO
+ * slot, no steal) and readying them needs no cross-worker wake packet. The
+ * measured cost of the single shared port was a park/wake round trip per few
+ * messages -- 418k parks and 134k wake packets for 2M messages on 4 workers.
+ *
+ * Shard 0 is g_iocp, and shards exist only while the worker pool runs: a port
+ * nobody waits on would strand its completions, so anything that runs outside
+ * the pool (or ZAN_IO_SHARDS=1) keeps using the single port it used before. */
+#define ZAN_IO_MAXSHARD 64
+static HANDLE        g_shard[ZAN_IO_MAXSHARD];
+static volatile LONG g_shards = 1;
+
+static HANDLE io_shard(int i) {
+    if (i <= 0 || i >= (int)g_shards) return g_iocp;
+    return g_shard[i] ? g_shard[i] : g_iocp;
+}
+
+/* Owning shard of a socket. Hashing the handle keeps the answer stable without
+ * a registry -- important because association is issued before every op and
+ * must always name the same port -- and spreads accepted connections over the
+ * workers, which binding "to the caller's shard" would not: an accepted socket's
+ * first op runs on the worker that got the accept completion, i.e. always the
+ * listener's. Windows socket handles are multiples of 4, hence the shift. */
+static HANDLE io_shard_of(SOCKET s) {
+    int n = (int)g_shards;
+    if (n <= 1) return g_iocp;
+    return io_shard((int)((((uintptr_t)s) >> 2) % (unsigned)n));
+}
+
+/* Open `n` shards (shard 0 is the already-created g_iocp). Called by the pool
+ * before its workers start, so every shard has a waiter from the first packet
+ * on. ZAN_IO_SHARDS overrides the count: 1 restores the single shared port,
+ * which is the escape hatch for comparing the two reactors. */
+static void io_shards_start(int n) {
+    const char *e = getenv("ZAN_IO_SHARDS");
+    if (e && *e) {
+        int v = atoi(e);
+        if (v > 0 && v < n) n = v;
+    }
+    if (n > ZAN_IO_MAXSHARD) n = ZAN_IO_MAXSHARD;
+    for (int i = 1; i < n; i++) {
+        if (!g_shard[i])
+            g_shard[i] = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+        if (!g_shard[i]) { n = i; break; }   /* keep only what we could open */
+    }
+    InterlockedExchange(&g_shards, n < 1 ? 1 : n);
+}
+
+static void io_shards_stop(void) {
+    InterlockedExchange(&g_shards, 1);
+    for (int i = 1; i < ZAN_IO_MAXSHARD; i++) {
+        if (g_shard[i]) { CloseHandle(g_shard[i]); g_shard[i] = NULL; }
+    }
+}
 #endif
 
 /* ---- overlapped-op pool ----
@@ -1102,11 +1173,18 @@ static void op_free(zan_io_op_t *op) {
 
 /* Associate a brand-new kernel socket with the port. */
 static void mark_assoc(SOCKET s) {
-    if (CreateIoCompletionPort((HANDLE)s, g_iocp, (ULONG_PTR)s, 0) == NULL) {
+#if defined(ZAN_CO_DRIVER)
+    HANDLE port = io_shard_of(s);
+#else
+    HANDLE port = g_iocp;
+#endif
+    if (CreateIoCompletionPort((HANDLE)s, port, (ULONG_PTR)s, 0) == NULL) {
         DWORD e = GetLastError();
         (void)e;
     }
 }
+
+static void io_complete_op(zan_io_op_t *op, DWORD transferred, ULONG_PTR status);
 
 /* Associate a socket with the completion port before its first overlapped op.
  *
@@ -1121,26 +1199,42 @@ static void mark_assoc(SOCKET s) {
  * IOCP entirely and its completion (connect/recv) was never delivered -- a
  * lost-wakeup hang that surfaced at low activity, where handle reuse is
  * common. Re-associating an already-bound socket is a cheap, harmless no-op,
- * so always doing it is the correct and race-free choice. */
-static void ensure_assoc(SOCKET s) {
+ * so always doing it is the correct and race-free choice.
+ *
+ * Returns 1 when this socket will NOT post a packet for an operation that
+ * completes inline (FILE_SKIP_COMPLETION_PORT_ON_SUCCESS), so the op site must
+ * deliver that completion itself. The answer is returned rather than kept in a
+ * global because the mode is per socket and may fail for one handle while
+ * holding for others: a stale global would either lose a completion or deliver
+ * it twice. Callers ask right before issuing their op, on the same thread. */
+static int ensure_assoc(SOCKET s) {
 #if defined(ZAN_CO_DRIVER)
-    /* Do NOT enable FILE_SKIP_COMPLETION_PORT_ON_SUCCESS under the multi-worker
-     * driver. Skip-on-success means an inline completion posts no IOCP packet,
-     * so the op site must resume the waiter itself -- but that resume happens
-     * mid-step, while the coroutine is still executing (before it saves its live
-     * slots, advances its resume state, and returns). Re-queueing the frame that
-     * early lets another worker pop and re-enter it at the wrong state, racing
-     * the still-running step and eventually deadlocking the pool under load.
-     * Leaving skip-on-success off makes every completion (inline or pending)
-     * arrive as an IOCP packet that co_wait_io delivers only after the frame has
-     * fully suspended -- the serialization point the pool needs. g_skip_mode
-     * stays 0 so io_register / zan_io_recv_co never take the inline shortcut. */
-    if (g_skip_mode < 0) InterlockedExchange(&g_skip_mode, 0);
+    HANDLE port = io_shard_of(s);
+#else
+    HANDLE port = g_iocp;
 #endif
-    if (CreateIoCompletionPort((HANDLE)s, g_iocp, (ULONG_PTR)s, 0) == NULL) {
+    if (CreateIoCompletionPort((HANDLE)s, port, (ULONG_PTR)s, 0) == NULL) {
         DWORD e = GetLastError();
         (void)e;   /* ERROR_INVALID_PARAMETER == already bound to this port */
     }
+#if defined(ZAN_CO_DRIVER)
+    /* Skip-on-success saves a kernel packet and, when the pool is otherwise
+     * idle, the park/wake round trip behind it -- on this workload most recvs
+     * complete inline because the bytes are already in the socket buffer.
+     *
+     * Resuming from the op site happens mid-step, while the coroutine that
+     * issued the op is still executing. That is safe with the frame state word:
+     * zan_co_ready sees CO_RUNNING and banks the step (CO_NOTIFIED) instead of
+     * queueing, and co_run re-submits the frame after the step has saved its
+     * live slots and returned. It was NOT safe before that state word existed,
+     * which is why this used to be disabled outright under the multi-worker
+     * driver -- hence the ZAN_IO_SYNCFAST gate rather than a silent default. */
+    if (!syncfast_on()) return 0;
+    return SetFileCompletionNotificationModes(
+               (HANDLE)s, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS) ? 1 : 0;
+#else
+    return 0;
+#endif
 }
 
 void zan_io_init(void) {
@@ -1157,6 +1251,9 @@ void zan_io_init(void) {
 }
 
 void zan_io_shutdown(void) {
+#if defined(ZAN_CO_DRIVER)
+    io_shards_stop();
+#endif
     if (g_iocp) { CloseHandle(g_iocp); g_iocp = NULL; }
     g_io_count = 0;
     /* Drop pooled ops: the completion port is gone, so recycled op structs are
@@ -1229,7 +1326,8 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
     }
 #endif
 
-    ensure_assoc(s);
+    int skip = ensure_assoc(s);
+    (void)skip;   /* only the multi-worker driver completes inline */
     IOTRACE("io_register(READY) fd=%lld interest=%d cnt=%d", (long long)s, interest, g_io_count);
 
     zan_io_op_t *op = op_alloc();
@@ -1271,9 +1369,10 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
          * completion that never comes. If skip-on-success is unsupported, a
          * packet is still queued -- leave it to the IOCP to avoid a double
          * completion. */
-        if (g_skip_mode == 1) {
+        if (skip) {
             op_free(op);
             IO_CNT_DEC();
+            InterlockedIncrement(&g_sync_inline);
             if (step) zan_co_ready(co, step);
         }
         return;
@@ -1284,7 +1383,11 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
     e = WSAGetLastError();
     if (e == WSA_IO_PENDING) return;
     /* Hard error: queue a completion so the coroutine is still resumed. */
+#if defined(ZAN_CO_DRIVER)
+    if (!PostQueuedCompletionStatus(io_shard_of(s), 0, (ULONG_PTR)s, &op->ov)) {
+#else
     if (!PostQueuedCompletionStatus(g_iocp, 0, (ULONG_PTR)s, &op->ov)) {
+#endif
         /* IOCP is gone or otherwise unusable; resume the waiter directly so
          * it does not hang forever, and recycle the op. */
         io_wake(co, step);
@@ -1302,7 +1405,8 @@ void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
                     zan_co_step_t step, int64_t *out_n) {
     zan_io_init();
     SOCKET s = (SOCKET)fd;
-    ensure_assoc(s);
+    int skip = ensure_assoc(s);
+    (void)skip;
 
     zan_io_op_t *op = op_alloc();
     if (!op) {
@@ -1329,10 +1433,11 @@ void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
         /* Immediate completion. With skip-on-success no packet is queued, so
          * deliver the count and resume here; otherwise a packet is still queued
          * and zan_io_poll/co_wait_io will deliver it (avoid double-completion). */
-        if (g_skip_mode == 1) {
+        if (skip) {
             if (out_n) *out_n = (int64_t)got;
             op_free(op);
             IO_CNT_DEC();
+            InterlockedIncrement(&g_sync_inline);
             if (step) zan_co_ready(frame, step);
         }
         return;
@@ -1344,7 +1449,11 @@ void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
     if (e == WSA_IO_PENDING) return;
     /* Hard error: report 0 bytes (peer-close semantics) via a queued packet. */
     if (out_n) *out_n = 0;
+#if defined(ZAN_CO_DRIVER)
+    PostQueuedCompletionStatus(io_shard_of(s), 0, (ULONG_PTR)s, &op->ov);
+#else
     PostQueuedCompletionStatus(g_iocp, 0, (ULONG_PTR)s, &op->ov);
+#endif
 }
 
 void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
@@ -1352,7 +1461,8 @@ void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
     zan_io_init();
     SOCKET listener = (SOCKET)fd;
     IOTRACE("accept_co ENTER listener=%lld", (long long)fd);
-    ensure_assoc(listener);
+    int skip = ensure_assoc(listener);
+    (void)skip;
 
     LPFN_ACCEPTEX accept_ex = NULL;
     GUID guid = WSAID_ACCEPTEX;
@@ -1406,6 +1516,17 @@ void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
     BOOL ok = accept_ex(listener, accepted, op->accept_buf, 0,
                         addr_len, addr_len, &got, &op->ov);
     IOTRACE("accept_co listener=%lld op=%p ok=%d err=%d cnt=%d", (long long)listener, (void*)op, (int)ok, WSAGetLastError(), g_io_count);
+#if defined(ZAN_CO_DRIVER)
+    /* Inline accept, no packet coming: deliver it here (as for recv above). */
+    if (ok && skip) {
+        io_complete_op(op, got, 0);
+        op_free(op);
+        IO_CNT_DEC();
+        InterlockedIncrement(&g_sync_inline);
+        if (step) zan_co_ready(frame, step);
+        return;
+    }
+#endif
     if (ok || WSAGetLastError() == WSA_IO_PENDING) return;
 
     closesocket(accepted);
@@ -1446,13 +1567,42 @@ static void io_complete_op(zan_io_op_t *op, DWORD transferred,
     if (op->out_n) *op->out_n = (int64_t)transferred;
 }
 
+#if defined(ZAN_CO_DRIVER)
+/* Blocking dequeue for the legacy pump (zan_io_pump / a Task.Wait outside the
+ * pool). With the reactor sharded there is no one port to block on, so walk the
+ * shards with a short bounded wait each: blocking on a single shard would miss
+ * completions sitting on the others. This path is off the pool's hot loop --
+ * workers use co_wait_io, which waits on their own shard only. */
+static BOOL io_poll_any(OVERLAPPED_ENTRY *entries, ULONG cap, ULONG *removed,
+                        DWORD to) {
+    int n = (int)g_shards;
+    if (n <= 1)
+        return GetQueuedCompletionStatusEx(g_iocp, entries, cap, removed, to, FALSE);
+    DWORD slice = (to == INFINITE || to > 2) ? 2 : to;
+    for (;;) {
+        for (int i = 0; i < n; i++) {
+            if (GetQueuedCompletionStatusEx(io_shard(i), entries, cap, removed,
+                                            slice, FALSE))
+                return TRUE;
+        }
+        if (to == INFINITE) continue;
+        if (to <= (DWORD)slice * (DWORD)n) return FALSE;
+        to -= (DWORD)slice * (DWORD)n;
+    }
+}
+#endif
+
 int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_count == 0 && g_dns_inflight == 0) return 0;
     OVERLAPPED_ENTRY entries[64];
     ULONG removed = 0;
     int64_t wait = dns_wait_ms(timeout_ms);
     DWORD to = (wait < 0) ? INFINITE : (DWORD)wait;
+#if defined(ZAN_CO_DRIVER)
+    if (!io_poll_any(entries, 64, &removed, to)) {
+#else
     if (!GetQueuedCompletionStatusEx(g_iocp, entries, 64, &removed, to, FALSE)) {
+#endif
         IOTRACE("poll GQCS=0 err=%lu to=%lu cnt=%d", (unsigned long)GetLastError(), (unsigned long)to, g_io_count);
         int w = dns_timeout_scan();
         if (w) return w;
@@ -1779,7 +1929,15 @@ static int dns_timeout_scan(void) {
 static void dns_wake_notify(void) {
 #if defined(_WIN32)
     /* NULL overlapped marks a DNS completion packet in zan_io_poll. */
+#if defined(ZAN_CO_DRIVER)
+    /* A lookup belongs to no socket, so it has no owning shard: nudge them all
+     * (dns_drain is idempotent) rather than pick one whose worker may be parked
+     * on a long timeout. Lookups are rare enough for the extra packets. */
+    for (int i = 0; i < (int)g_shards; i++)
+        PostQueuedCompletionStatus(io_shard(i), 0, (ULONG_PTR)-2, NULL);
+#else
     PostQueuedCompletionStatus(g_iocp, 0, (ULONG_PTR)-2, NULL);
+#endif
 #elif defined(__linux__)
     uint64_t one = 1;
     ssize_t r = write(g_dns_wake_fd, &one, sizeof(one));
@@ -2251,6 +2409,22 @@ typedef struct {
 typedef struct { void *frame; zan_co_step_t step; } zan_co_task;
 
 typedef struct {
+    unsigned long long ran;         /* frames stepped */
+    unsigned long long lifo_put;    /* readied into the run-next cell */
+    unsigned long long lifo_hit;    /* resumed straight from that cell */
+    unsigned long long lifo_demote; /* cell pushed to the queue, budget spent */
+    unsigned long long lq_push;
+    unsigned long long lq_pop;
+    unsigned long long spill;       /* queue overflow halves moved to injector */
+    unsigned long long inj_push;
+    unsigned long long inj_pop;
+    unsigned long long steal_ok;
+    unsigned long long steal_fail;  /* searches that found nothing */
+    unsigned long long park;        /* blocking waits on the port */
+    unsigned long long wake_post;   /* wake packets this worker posted */
+} zan_co_stats_t;
+
+typedef struct {
     /* Ring: consumers (the owner and thieves) move `head` with CAS, only the
      * owner moves `tail`. A slot is never overwritten while a consumer may
      * still read it: the owner refuses to push past head + ZAN_LQ_CAP. */
@@ -2262,8 +2436,17 @@ typedef struct {
     int                lifo_budget;
     int                index;
     int                searching;
+    /* Set while this worker blocks on its shard, so a producer can aim the wake
+     * packet at a port that actually has a waiter. */
+    volatile LONG      parked;
     unsigned           tick;
     unsigned           rng;
+    /* Scheduling counters, written only by the owning worker (plain adds, no
+     * atomics) and read once at shutdown. They exist so a scheduler change can
+     * be attributed: throughput alone cannot say whether a worker ran its own
+     * LIFO cell, drained its queue, stole, or spun searching. Printed when
+     * ZAN_CO_STATS is set in the environment. */
+    zan_co_stats_t     st;
     char               pad[64];      /* keep neighbours off this cache line */
 } zan_co_worker_t;
 
@@ -2283,6 +2466,8 @@ static zan_co_worker_t  g_wk[ZAN_CO_MAXW];
 static CRITICAL_SECTION g_inj_lock;
 static zan_co_node     *g_inj_head, *g_inj_tail, *g_inj_free;
 static volatile LONG    g_inj_len;
+/* Readies that arrived from a thread outside the pool (no worker to charge). */
+static volatile LONG    g_inj_push_ext;
 
 static long long co_now_ms(void) { return (long long)GetTickCount64(); }
 
@@ -2302,14 +2487,24 @@ static volatile long long g_timer_next_ms;
  * declared quiescent if any work appeared while we were looking. */
 static volatile LONG      g_co_activity;
 
-static void co_wake_port(void) {
-    if (g_iocp) PostQueuedCompletionStatus(g_iocp, 0, ZAN_WAKE_KEY, NULL);
+static void co_wake_shard(int shard) {
+    HANDLE p = io_shard(shard);
+    if (p) PostQueuedCompletionStatus(p, 0, ZAN_WAKE_KEY, NULL);
+}
+
+/* Shard a worker waits on. Workers and shards are 1:1 unless ZAN_IO_SHARDS
+ * lowered the count, in which case several workers share one port. */
+static int co_worker_shard(int worker) {
+    int n = (int)g_shards;
+    return (n <= 1) ? 0 : (worker % n);
 }
 
 /* Wake one parked worker -- but only when nobody is searching already (that
  * worker will find the task) and only up to one unconsumed packet per parked
  * worker. Posting one packet per ready frame is what made --async-workers
  * burn CPU linearly in the worker count at flat throughput. */
+static zan_co_worker_t *co_self(void);
+
 static void co_notify(void) {
     if (g_co_searching > 0) return;
     if (g_co_parked <= 0) return;
@@ -2317,7 +2512,15 @@ static void co_notify(void) {
         InterlockedDecrement(&g_co_wake);
         return;
     }
-    co_wake_port();
+    zan_co_worker_t *self = co_self();
+    if (self) self->st.wake_post++;
+    /* Aim the packet at a worker that is actually parked. With one port per
+     * worker a packet posted to the wrong shard wakes nobody, so the wake
+     * budget above would be spent without anyone picking the frame up. */
+    for (int i = 0; i < g_co_workers; i++) {
+        if (g_wk[i].parked) { co_wake_shard(co_worker_shard(i)); return; }
+    }
+    co_wake_shard(0);
 }
 
 static zan_co_worker_t *co_self(void) {
@@ -2384,6 +2587,8 @@ static void lq_spill(zan_co_worker_t *w) {
                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             continue;
         for (long long i = 0; i < n; i++) inj_push(tmp[i]);
+        w->st.spill++;
+        w->st.inj_push += (unsigned long long)n;
         return;
     }
 }
@@ -2394,10 +2599,15 @@ static void lq_push(zan_co_worker_t *w, zan_co_task t) {
     if (tail - head >= (long long)ZAN_LQ_CAP) {
         lq_spill(w);
         head = __atomic_load_n(&w->head, __ATOMIC_ACQUIRE);
-        if (tail - head >= (long long)ZAN_LQ_CAP) { inj_push(t); return; }
+        if (tail - head >= (long long)ZAN_LQ_CAP) {
+            inj_push(t);
+            w->st.inj_push++;
+            return;
+        }
     }
     w->buf[(unsigned long long)tail & ZAN_LQ_MASK] = t;
     __atomic_store_n(&w->tail, tail + 1, __ATOMIC_RELEASE);
+    w->st.lq_push++;
 }
 
 static int lq_pop(zan_co_worker_t *w, zan_co_task *out) {
@@ -2446,13 +2656,19 @@ static void co_submit(void *frame, zan_co_step_t step) {
     t.frame = frame; t.step = step;
     InterlockedIncrement(&g_co_activity);
     zan_co_worker_t *w = co_self();
-    if (!w) { inj_push(t); co_notify(); return; }
+    if (!w) {
+        inj_push(t);
+        InterlockedIncrement(&g_inj_push_ext);
+        co_notify();
+        return;
+    }
     if (!w->lifo_full) {
         /* Run-next cell: the frame a worker just readied is almost always the
          * continuation of the work it is already doing (the IO completion of
          * the request it is serving), so keep it on this core. */
         w->lifo = t;
         w->lifo_full = 1;
+        w->st.lifo_put++;
         return;
     }
     lq_push(w, t);
@@ -2559,6 +2775,7 @@ void zan_co_sched_init(void) {
     }
     g_inj_tail = NULL;
     g_inj_len = 0;
+    g_inj_push_ext = 0;
     LeaveCriticalSection(&g_inj_lock);
     for (int i = 0; i < ZAN_CO_MAXW; i++) {
         zan_co_worker_t *w = &g_wk[i];
@@ -2567,8 +2784,10 @@ void zan_co_sched_init(void) {
         w->lifo_budget = ZAN_LIFO_BUDGET;
         w->index = i;
         w->searching = 0;
+        w->parked = 0;
         w->tick = 0;
         w->rng = 0x9e3779b9u ^ (unsigned)(i * 2654435761u);
+        memset(&w->st, 0, sizeof(w->st));
     }
 }
 
@@ -2611,6 +2830,7 @@ static int co_next_task(zan_co_worker_t *w, zan_co_task *out) {
      * injector, starving frames readied by non-worker threads. */
     if (++w->tick % ZAN_GLOBAL_TICK == 0 && inj_pop(out)) {
         w->lifo_budget = ZAN_LIFO_BUDGET;
+        w->st.inj_pop++;
         return 1;
     }
     if (w->lifo_full) {
@@ -2618,17 +2838,21 @@ static int co_next_task(zan_co_worker_t *w, zan_co_task *out) {
             *out = w->lifo;
             w->lifo_full = 0;
             w->lifo_budget--;
+            w->st.lifo_hit++;
             return 1;
         }
         /* Budget spent: demote the cell into the queue, where it is stealable
          * and takes its turn behind the frames waiting there. */
         lq_push(w, w->lifo);
         w->lifo_full = 0;
+        w->st.lifo_demote++;
     }
     w->lifo_budget = ZAN_LIFO_BUDGET;
-    if (lq_pop(w, out)) return 1;
-    if (inj_pop(out)) return 1;
-    return co_steal(w, out);
+    if (lq_pop(w, out)) { w->st.lq_pop++; return 1; }
+    if (inj_pop(out)) { w->st.inj_pop++; return 1; }
+    if (co_steal(w, out)) { w->st.steal_ok++; return 1; }
+    w->st.steal_fail++;
+    return 0;
 }
 
 /* Is there a task somewhere for a worker about to park? Called after the
@@ -2663,6 +2887,7 @@ static void co_run(zan_co_worker_t *w, zan_co_task *t) {
             break;
     }
     InterlockedIncrement(&g_co_running);
+    w->st.ran++;
     t->step(t->frame);
     for (;;) {
         s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
@@ -2680,7 +2905,6 @@ static void co_run(zan_co_worker_t *w, zan_co_task *t) {
             break;
     }
     InterlockedDecrement(&g_co_running);
-    (void)w;
 }
 
 /* Dispatch due Delay and public timers; return ms until the next deadline.
@@ -2718,15 +2942,19 @@ static long long co_pump_timers(void) {
 /* Block on the completion port, re-readying coroutines whose IO completed.
  * A NULL overlapped is a notification packet: the scheduler's wake (key
  * ZAN_WAKE_KEY) or a DNS completion. */
-static void co_wait_io(long long timeout_ms) {
+static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
     OVERLAPPED_ENTRY entries[64];
     ULONG removed = 0;
     DWORD to = (timeout_ms < 0) ? INFINITE : (DWORD)timeout_ms;
-    BOOL ok = GetQueuedCompletionStatusEx(g_iocp, entries, 64, &removed, to, FALSE);
+    /* Own shard only: every socket this worker's connections use is bound to
+     * it, so their completions arrive here and nowhere else. */
+    BOOL ok = GetQueuedCompletionStatusEx(io_shard(co_worker_shard(w->index)),
+                                          entries, 64, &removed, to, FALSE);
     /* No longer parked. Dropping this before re-readying the completed
      * coroutines below lets those zan_co_ready calls skip the wake syscall
      * when this worker is the only idle one -- it drains the whole batch
      * itself on its next loop iterations. */
+    InterlockedExchange(&w->parked, 0);
     InterlockedDecrement(&g_co_parked);
     if (!ok) {
         /* Timeout or error: deliver DNS timeouts so lookups past their
@@ -2824,7 +3052,8 @@ static void co_worker(int worker) {
             LONG seq = g_co_activity;
             if (idle_seen == seq) {
                 g_co_stop = 1;
-                for (int i = 0; i < g_co_workers; i++) co_wake_port();
+                for (int i = 0; i < g_co_workers; i++)
+                    co_wake_shard(co_worker_shard(i));
                 return;
             }
             idle_seen = seq;
@@ -2849,6 +3078,8 @@ static void co_worker(int worker) {
          * pushes first is found by the scan; one that pushes afterward
          * observes g_co_parked > 0 and posts a wake packet. */
         InterlockedIncrement(&g_co_parked);
+        InterlockedExchange(&w->parked, 1);
+        w->st.park++;
         /* Re-sample the timer deadline now that this worker counts as parked.
          * An armed timer is not a queued frame, so co_has_runnable cannot see
          * it: a timer armed between the pump above and this point would
@@ -2857,11 +3088,50 @@ static void co_worker(int worker) {
         long long tnow = zan_timer_next_timeout();
         if (tnow >= 0 && tnow < to) to = tnow;
         if (tnow == 0 || co_has_runnable()) {
+            InterlockedExchange(&w->parked, 0);
             InterlockedDecrement(&g_co_parked);
             continue;
         }
-        co_wait_io(to);            /* decrements g_co_parked on return */
+        co_wait_io(w, to);         /* clears parked state on return */
     }
+}
+
+/* Dump the per-worker counters when ZAN_CO_STATS is set, one line per worker
+ * plus a total, on stderr so a benchmark's stdout stays machine-readable. The
+ * lines are `key=value` pairs for the same reason. */
+static void co_stats_dump(void) {
+    const char *e = getenv("ZAN_CO_STATS");
+    if (!e || !*e || e[0] == '0') return;
+    zan_co_stats_t tot;
+    memset(&tot, 0, sizeof(tot));
+    for (int i = 0; i < g_co_workers; i++) {
+        zan_co_stats_t *s = &g_wk[i].st;
+        fprintf(stderr,
+                "COSTAT worker=%d ran=%llu lifo_put=%llu lifo_hit=%llu "
+                "lifo_demote=%llu lq_push=%llu lq_pop=%llu spill=%llu "
+                "inj_push=%llu inj_pop=%llu steal_ok=%llu steal_fail=%llu "
+                "park=%llu wake_post=%llu\n",
+                i, s->ran, s->lifo_put, s->lifo_hit, s->lifo_demote,
+                s->lq_push, s->lq_pop, s->spill, s->inj_push, s->inj_pop,
+                s->steal_ok, s->steal_fail, s->park, s->wake_post);
+        tot.ran += s->ran;                 tot.lifo_put += s->lifo_put;
+        tot.lifo_hit += s->lifo_hit;       tot.lifo_demote += s->lifo_demote;
+        tot.lq_push += s->lq_push;         tot.lq_pop += s->lq_pop;
+        tot.spill += s->spill;             tot.inj_push += s->inj_push;
+        tot.inj_pop += s->inj_pop;         tot.steal_ok += s->steal_ok;
+        tot.steal_fail += s->steal_fail;   tot.park += s->park;
+        tot.wake_post += s->wake_post;
+    }
+    fprintf(stderr,
+            "COSTAT total workers=%d shards=%d ran=%llu lifo_put=%llu lifo_hit=%llu "
+            "lifo_demote=%llu lq_push=%llu lq_pop=%llu spill=%llu "
+            "inj_push=%llu inj_pop=%llu steal_ok=%llu steal_fail=%llu "
+            "park=%llu wake_post=%llu inj_push_ext=%ld sync_inline=%ld\n",
+            g_co_workers, (int)g_shards, tot.ran, tot.lifo_put, tot.lifo_hit,
+            tot.lifo_demote, tot.lq_push, tot.lq_pop, tot.spill,
+            tot.inj_push, tot.inj_pop, tot.steal_ok, tot.steal_fail,
+            tot.park, tot.wake_post, (long)g_inj_push_ext, (long)g_sync_inline);
+    fflush(stderr);
 }
 
 static DWORD WINAPI co_worker_thunk(LPVOID p) {
@@ -2873,6 +3143,9 @@ void zan_co_sched_run(void) {
     zan_io_init();   /* ensure the port exists before workers block on it */
     int w = g_co_workers;
     g_co_stop = 0;
+    /* Shard the reactor before any worker starts: a shard with no waiter would
+     * hold completions nobody dequeues. */
+    io_shards_start(w);
 
     HANDLE th[ZAN_CO_MAXW]; int nt = 0;
     for (int i = 1; i < w; i++) {
@@ -2885,6 +3158,7 @@ void zan_co_sched_run(void) {
         WaitForSingleObject(th[i], INFINITE);
         CloseHandle(th[i]);
     }
+    co_stats_dump();
     zan_io_shutdown();
 }
 

@@ -320,40 +320,33 @@ endif()
 # pre-built zanrt_io.o for socket-async programs, zanrt_sync.o for
 # atomics/shared-memory programs, and zanrt_timer.o, which every program needs
 # (its inline coroutine driver calls zan_timer_*).
+#
+# These copies are collected into one ALL target instead of zanc POST_BUILD
+# commands: POST_BUILD runs only when zanc itself relinks, so rebuilding a
+# runtime object (scripts/build_linux_rt.sh, scripts/build_cross_rt.cmd) left
+# the stale copy next to zanc and cross-links kept failing on symbols the
+# rebuilt object had (e.g. "undefined symbol: zan_co_live_add"). An ALL target
+# re-checks copy_if_different on every build.
+set(_cross_sysroot_cmds "")
 foreach(_linux_sub linux-musl linux-arm64 linux-riscv64)
     set(_linux_sys "${CMAKE_SOURCE_DIR}/toolchain/${_linux_sub}")
-        if(EXISTS "${_linux_sys}/libc.a")
-            add_custom_command(TARGET zanc POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:zanc>/${_linux_sub}
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        "${_linux_sys}/crt1.o" "${_linux_sys}/crti.o"
-                        "${_linux_sys}/crtn.o" "${_linux_sys}/libc.a"
-                        "${_linux_sys}/zanrt_io.o" "${_linux_sys}/zanrt_sync.o"
-                        "${_linux_sys}/zanrt_timer.o"
-                        $<TARGET_FILE_DIR:zanc>/${_linux_sub}/
-                COMMENT "Copying ${_linux_sub} sysroot for cross-compilation"
-                VERBATIM)
-            if(EXISTS "${_linux_sys}/zanrt_file.o")
-                add_custom_command(TARGET zanc POST_BUILD
+    if(EXISTS "${_linux_sys}/libc.a")
+        list(APPEND _cross_sysroot_cmds
+            COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:zanc>/${_linux_sub}
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_linux_sys}/crt1.o" "${_linux_sys}/crti.o"
+                    "${_linux_sys}/crtn.o" "${_linux_sys}/libc.a"
+                    "${_linux_sys}/zanrt_io.o" "${_linux_sys}/zanrt_sync.o"
+                    "${_linux_sys}/zanrt_timer.o"
+                    $<TARGET_FILE_DIR:zanc>/${_linux_sub}/)
+        foreach(_linux_opt zanrt_file.o zanrt_mem.o libgcc.a)
+            if(EXISTS "${_linux_sys}/${_linux_opt}")
+                list(APPEND _cross_sysroot_cmds
                     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                            "${_linux_sys}/zanrt_file.o"
-                            $<TARGET_FILE_DIR:zanc>/${_linux_sub}/
-                    VERBATIM)
+                            "${_linux_sys}/${_linux_opt}"
+                            $<TARGET_FILE_DIR:zanc>/${_linux_sub}/)
             endif()
-        if(EXISTS "${_linux_sys}/zanrt_mem.o")
-            add_custom_command(TARGET zanc POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        "${_linux_sys}/zanrt_mem.o"
-                        $<TARGET_FILE_DIR:zanc>/${_linux_sub}/
-                VERBATIM)
-        endif()
-        if(EXISTS "${_linux_sys}/libgcc.a")
-            add_custom_command(TARGET zanc POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        "${_linux_sys}/libgcc.a"
-                        $<TARGET_FILE_DIR:zanc>/${_linux_sub}/
-                VERBATIM)
-        endif()
+        endforeach()
     endif()
 endforeach()
 
@@ -364,32 +357,35 @@ endforeach()
 foreach(_win_sub win-x64 win-arm64)
     set(_win_sys "${CMAKE_SOURCE_DIR}/toolchain/${_win_sub}")
     if(EXISTS "${_win_sys}/mingw/lib/crt2.o")
-        add_custom_command(TARGET zanc POST_BUILD
+        list(APPEND _cross_sysroot_cmds
             COMMAND ${CMAKE_COMMAND} -E copy_directory
-                    "${_win_sys}" $<TARGET_FILE_DIR:zanc>/${_win_sub}
-            COMMENT "Copying ${_win_sub} mingw runtime for cross-compilation"
-            VERBATIM)
+                    "${_win_sys}" $<TARGET_FILE_DIR:zanc>/${_win_sub})
     endif()
 endforeach()
 
 # ---- macOS libSystem stub (macos-x64/macos-arm64 cross-compilation) ----
 if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/macos/libSystem.tbd")
-    add_custom_command(TARGET zanc POST_BUILD
+    list(APPEND _cross_sysroot_cmds
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_SOURCE_DIR}/toolchain/macos"
-                $<TARGET_FILE_DIR:zanc>/macos
-        COMMENT "Copying macOS libSystem stub for cross-compilation"
-        VERBATIM)
+                $<TARGET_FILE_DIR:zanc>/macos)
 endif()
 
 # ---- WASI sysroot (wasm32 cross-compilation) ----
 if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/wasm32/libc.a")
-    add_custom_command(TARGET zanc POST_BUILD
+    list(APPEND _cross_sysroot_cmds
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_SOURCE_DIR}/toolchain/wasm32"
-                $<TARGET_FILE_DIR:zanc>/wasm32
-        COMMENT "Copying wasm32 wasi sysroot for cross-compilation"
+                $<TARGET_FILE_DIR:zanc>/wasm32)
+endif()
+
+# Stage every cross sysroot on each build, so a rebuilt runtime object reaches
+# the copy zanc actually links against (see the Linux sysroot note above).
+if(_cross_sysroot_cmds)
+    add_custom_target(cross_sysroots ALL ${_cross_sysroot_cmds}
+        COMMENT "Staging cross-compilation sysroots next to zanc"
         VERBATIM)
+    add_dependencies(cross_sysroots zanc)
 endif()
 
 # ---- Native database drivers (publish-time bundling) ----

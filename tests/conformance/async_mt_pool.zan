@@ -1,0 +1,151 @@
+// Conformance: the coroutine connection pool under the multi-worker driver
+// (compiled with --async-workers, so coroutines really do run on several
+// threads). PoolCore's bookkeeping -- the idle/borrowed lists, the live count
+// and the waiter count -- is shared by every acquirer, and without a monitor
+// TakeIdle's "check Count, then index" tore between two workers and aborted
+// with "list index out of bounds". Many coroutines hammer one small pool here,
+// so an unsynchronised core crashes or loses a slot instead of printing OK.
+using System;
+using System.Data;
+using System.Threading;
+
+class FakeConnection : IDbConnection {
+    int id;
+    bool alive;
+
+    FakeConnection(int id) {
+        this.id = id;
+        this.alive = true;
+    }
+
+    DbResult Query(string sql) {
+        DbResult r = new DbResult();
+        r.SetColumnCount(1);
+        r.AddColumnName("id");
+        List<string> row = new List<string>();
+        row.Add(Convert.ToString(this.id));
+        r.AddRow(row);
+        return r;
+    }
+
+    DbResult Query(string sql, DbParams prms) { return this.Query(sql); }
+    int Execute(string sql) { return 1; }
+    int Execute(string sql, DbParams prms) { return this.Execute(sql); }
+    string ExecuteScalar(string sql) { return Convert.ToString(this.id); }
+    string ExecuteScalar(string sql, DbParams prms) { return this.ExecuteScalar(sql); }
+    async DbResult QueryAsync(string sql) { return this.Query(sql); }
+    async DbResult QueryAsync(string sql, DbParams prms) { return this.Query(sql, prms); }
+    async int ExecuteAsync(string sql) { return this.Execute(sql); }
+    async int ExecuteAsync(string sql, DbParams prms) { return this.Execute(sql, prms); }
+    async string ExecuteScalarAsync(string sql) { return this.ExecuteScalar(sql); }
+    async string ExecuteScalarAsync(string sql, DbParams prms) { return this.ExecuteScalar(sql, prms); }
+    void BeginTransaction() { }
+    void Commit() { }
+    void Rollback() { }
+    async bool BeginTransactionAsync() { return true; }
+    async bool CommitAsync() { return true; }
+    async bool RollbackAsync() { return true; }
+    bool IsConnected() { return this.alive; }
+    void Close() { this.alive = false; }
+    int GetProvider() { return DbProvider.SQLite; }
+}
+
+class FakeConnector : IDbConnector {
+    // Opens are counted atomically: the connector is shared and ConnectAsync
+    // runs on whichever worker the acquiring coroutine sits on.
+    AtomicInt opened;
+
+    FakeConnector() { this.opened = new AtomicInt(0); }
+
+    int Opened() { return (int)this.opened.Load(); }
+
+    async IDbConnection ConnectAsync() {
+        // A real driver suspends here on the reactor; the delay stands in for
+        // that, so the reservation really is held across a scheduling point
+        // and the coroutine can resume on a different worker than it left.
+        await Task.Delay(1);
+        long n = this.opened.Increment();
+        return new FakeConnection((int)n);
+    }
+
+    int GetProvider() { return DbProvider.SQLite; }
+}
+
+class Program {
+    static const int WORKERS = 64;    // concurrent acquirers
+    static const int ROUNDS = 20;     // acquire/release cycles each
+    static const int POOL_SIZE = 4;
+
+    // Completed round-trips and failed acquires, atomic because every worker
+    // thread reports into them.
+    static AtomicInt served = new AtomicInt(0);
+    static AtomicInt missed = new AtomicInt(0);
+
+    static async void Hammer(DbPool pool) {
+        for (int i = 0; i < Program.ROUNDS; i = i + 1) {
+            IDbConnection c = await pool.AcquireAsync();
+            if (c == null) {
+                long _m = Program.missed.Increment();
+                return;
+            }
+            string id = await c.ExecuteScalarAsync("SELECT 1");
+            if (id.Length > 0) { long _s = Program.served.Increment(); }
+            pool.Release(c);
+            // Releasing twice must be a no-op: the second one is not borrowed,
+            // so it may neither pool the connection again nor free a slot that
+            // is still occupied.
+            if (i == 0) { pool.Release(c); }
+        }
+    }
+
+    static async int Run() {
+        FakeConnector f = new FakeConnector();
+        DbPool pool = new DbPool(f, Program.POOL_SIZE);
+
+        for (int i = 0; i < Program.WORKERS; i = i + 1) {
+            Task.Spawn(Program.Hammer(pool));
+        }
+
+        // Wait for every acquirer to finish, bounded so a lost wakeup fails the
+        // golden instead of hanging the suite.
+        int want = Program.WORKERS * Program.ROUNDS;
+        for (int spin = 0; spin < 600; spin = spin + 1) {
+            if (Program.served.Load() + Program.missed.Load() >= (long)want) { break; }
+            await Task.Delay(10);
+        }
+
+        long served = Program.served.Load();
+        long missed = Program.missed.Load();
+        int live = pool.LiveCount();
+        int idle = pool.IdleCount();
+        int opened = f.Opened();
+
+        if (served != (long)want) {
+            Console.WriteLine("FAIL served=" + Convert.ToString(served)
+                + " want=" + Convert.ToString(want)
+                + " missed=" + Convert.ToString(missed));
+        } else if (opened > Program.POOL_SIZE || live > Program.POOL_SIZE) {
+            // Over-opening is how a torn liveCount shows up: the cap is the
+            // only thing bounding connections to the backend.
+            Console.WriteLine("FAIL cap opened=" + Convert.ToString(opened)
+                + " live=" + Convert.ToString(live));
+        } else if (idle != live) {
+            // Everything was released, so every live connection must be idle:
+            // a leaked borrow (or a double release that pooled a connection
+            // twice) shows up right here.
+            Console.WriteLine("FAIL idle=" + Convert.ToString(idle)
+                + " live=" + Convert.ToString(live));
+        } else if (pool.WaitingCount() != 0) {
+            Console.WriteLine("FAIL waiting=" + Convert.ToString(pool.WaitingCount()));
+        } else {
+            Console.WriteLine("OK");
+        }
+
+        pool.Close();
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Program.Run();
+    }
+}
