@@ -12,7 +12,11 @@ namespace Gui.Component.CodeEditor;
 /// 下一行继承它作为起始状态。</summary>
 class CeHlLine {
     string src;
+    // null while the line is only a block-comment-state checkpoint: catching
+    // up after a jump tokenises the skipped lines but does not keep their
+    // spans, which are built on demand when the line is actually drawn.
     List<CodeSpan> spans;
+    bool blockIn;
     bool blockOpen;
 }
 
@@ -241,11 +245,18 @@ partial class CodeEditor {
     // 因此大文件上每帧只算一次答案，
     // 而非每行一次（InvalidateDiagStale 在输入处理后运行）。
     int diagStaleFrame;
-    // 本缓冲区声明的类型（名称 + 空格分隔的成员列表），
-    // 按解析时的 TextStamp() 缓存。见 EnsureBufTypes。
+    // 本缓冲区声明的类型（名称 + 空格分隔的成员列表），以及解析它时
+    // 的行快照：类型表只依赖声明行与花括号层次，所以快照能告诉
+    // EnsureBufTypes 哪些编辑根本不必重扫。
     List<string> muTypeNames;
     List<string> muTypeMembers;
-    int muTypesStamp;
+    List<string> btLineSrc;
+    // 与光标无关的补全候选（片段/关键字/标准库/项目与缓冲区类型），
+    // 及其构建时的代次；项目扫描或缓冲区类型表重建时代次 +1。
+    List<string> cbItems;
+    List<string> cbKinds;
+    int cbGen;
+    int candBaseGen;
 
     // ---- 符号索引（精确、感知 using 的补全） ----
     // 项目其他文件中声明的类型（class/struct/enum），以及
@@ -296,6 +307,22 @@ partial class CodeEditor {
     // 缺失 using 的快速修复：每个把出错行映射到
     // 要导入的命名空间以解决错误。
     List<QuickFix> fixes;
+    // Missing-`using` scan cache, indexed like `lines`: the line text it was
+    // computed from plus the namespace and type name it found ("" for none).
+    // muCtx fingerprints everything outside the line the answer depends on
+    // (file namespace, imports, known type counts); muStamp is the buffer
+    // fingerprint the cache was last completed for.
+    List<string> muLineSrc;
+    List<string> muLineNs;
+    List<string> muLineWord;
+    string muCtx;
+    int muStamp;
+    // 括号配平扫描的按行缓存，同样以 `lines` 为下标：行文本、它带来的
+    // 花括号/圆括号增量，以及它是否是缺分号的 using 行。
+    List<string> ceLineSrc;
+    List<int> ceBrace;
+    List<int> ceParen;
+    List<int> ceUsingBad;
 
     // ---- 调试 ----
     List<int> bps;
@@ -449,7 +476,15 @@ partial class CodeEditor {
         this.diagStaleFrame = -1;
         this.muTypeNames = null;
         this.muTypeMembers = null;
-        this.muTypesStamp = -1;
+        this.btLineSrc = null;
+        this.cbItems = null;
+        this.cbKinds = null;
+        this.cbGen = -1;
+        this.candBaseGen = 0;
+        this.ceLineSrc = null;
+        this.ceBrace = null;
+        this.ceParen = null;
+        this.ceUsingBad = null;
         this.projTypes = new List<ProjType>();
         this.projFileSrc = new List<string>();
         this.projScanDirty = false;
@@ -469,6 +504,11 @@ partial class CodeEditor {
         this.hlCache = new List<CeHlLine>();
         this.hlThemeSig = 0;
         this.fixes = new List<QuickFix>();
+        this.muLineSrc = null;
+        this.muLineNs = null;
+        this.muLineWord = null;
+        this.muCtx = "";
+        this.muStamp = 0 - 1;
         this.bps = new List<int>();
         this.execLine = -1;
         this.dbgVars = new List<DbgVar>();
@@ -1324,13 +1364,15 @@ partial class CodeEditor {
     }
 
     static string LTrim(string s) {
+        int len = s.Length;
         int i = 0;
-        while (i < s.Length) {
-            string ch = s.Substring(i, 1);
-            if (ch == " " || ch == "\t") { i = i + 1; }
+        while (i < len) {
+            int ch = s[i];
+            if (ch == 32 || ch == 9) { i = i + 1; }
             else { break; }
         }
-        return s.Substring(i, s.Length - i);
+        if (i == 0) { return s; }
+        return s.Substring(i, len - i);
     }
 
     /// 删除前导空白后的第一个"// "（或"//"）。
@@ -1521,56 +1563,22 @@ partial class CodeEditor {
     // ---- 错误诊断 ----
     void CheckErrors() {
         errors = new List<Diagnostic>();
+        EnsureLineScan();
         int braceDepth = 0;
         int parenDepth = 0;
         for (int li = 0; li < lines.Count; li = li + 1) {
-            string ln = lines[li];
-            string tr = ln;
-            // 去掉前导空白
-            int si = 0;
-            int trLen = tr.Length;
-            while (si < trLen) {
-                int sch = tr[si];
-                if (sch == 32 || sch == 9) { si = si + 1; }
-                else { break; }
+            braceDepth = braceDepth + ceBrace[li];
+            parenDepth = parenDepth + ceParen[li];
+            if (braceDepth < 0) {
+                errors.Add(new Diagnostic(li, "Unexpected '}'"));
+                braceDepth = 0;
             }
-            if (si > 0) { tr = tr.Substring(si, tr.Length - si); }
-            // 跳过空行/注释行
-            if (tr.Length > 0 && tr.Substring(0, 1) != "/" && tr.Substring(0, 1) != "*") {
-                // 逐行检查括号配平
-                // 用字节比较而非 Substring(ci, 1)：此循环会遍历
-                // 文档的每个字符，为每个字节分配
-                // 单字符字符串会拖慢大文件的
-                // 扫描。
-                int lnLen = ln.Length;
-                for (int ci = 0; ci < lnLen; ci = ci + 1) {
-                    int ch = ln[ci];
-                    if (ch == 123) { braceDepth = braceDepth + 1; }
-                    else if (ch == 125) { braceDepth = braceDepth - 1; }
-                    else if (ch == 40) { parenDepth = parenDepth + 1; }
-                    else if (ch == 41) { parenDepth = parenDepth - 1; }
-                }
-                if (braceDepth < 0) {
-                    errors.Add(new Diagnostic(li, "Unexpected '}'"));
-                    braceDepth = 0;
-                }
-                if (parenDepth < 0) {
-                    errors.Add(new Diagnostic(li, "Unexpected ')'"));
-                    parenDepth = 0;
-                }
-                // 这里保留的唯一启发式：`using` 指令
-                // 不以 ';' 结尾。通用的"缺分号"猜测
-                // 误报过多（多行调用、
-                // 特性、泛型），早已被禁用；真正的
-                // 诊断来自 Run/Build 后的编译器。它的
-                // 关键字测试和前向行扫描会对光标换行即重跑的
-                // 遍历中的每一行执行，因此一并
-                // 移除。
-                if (tr.Length >= 1 && li != curLine
-                    && CodeEditor.StartsWithP(tr, "using ")
-                    && tr.Substring(tr.Length - 1, 1) != ";") {
-                    errors.Add(new Diagnostic(li, "Missing ';' after using"));
-                }
+            if (parenDepth < 0) {
+                errors.Add(new Diagnostic(li, "Unexpected ')'"));
+                parenDepth = 0;
+            }
+            if (ceUsingBad[li] == 1 && li != curLine) {
+                errors.Add(new Diagnostic(li, "Missing ';' after using"));
             }
         }
         if (braceDepth > 0) {
@@ -1581,5 +1589,82 @@ partial class CodeEditor {
         }
         // 标记使用了却缺少 `using` 导入的 stdlib 类型。
         AnalyzeMissingUsings();
+    }
+
+    /// 刷新括号扫描的按行缓存。诊断在每次光标换行时重跑，而整篇
+    /// 逐字符扫描在 30 万行上是百毫秒级；改成只重扫文本真的变了的行
+    /// 后，一次击键只重扫一行。
+    void EnsureLineScan() {
+        if (ceLineSrc == null) {
+            ceLineSrc = new List<string>();
+            ceBrace = new List<int>();
+            ceParen = new List<int>();
+            ceUsingBad = new List<int>();
+        }
+        while (ceLineSrc.Count < lines.Count) {
+            ceLineSrc.Add(null);
+            ceBrace.Add(0);
+            ceParen.Add(0);
+            ceUsingBad.Add(0);
+        }
+        while (ceLineSrc.Count > lines.Count) {
+            int last = ceLineSrc.Count - 1;
+            ceLineSrc.RemoveAt(last);
+            ceBrace.RemoveAt(last);
+            ceParen.RemoveAt(last);
+            ceUsingBad.RemoveAt(last);
+        }
+        for (int li = 0; li < lines.Count; li = li + 1) {
+            if (ceLineSrc[li] != lines[li]) { ScanLineBrackets(li); }
+        }
+    }
+
+    /// 重算一行的括号增量和 using 启发式，写回按行缓存。
+    void ScanLineBrackets(int li) {
+        string ln = lines[li];
+        ceLineSrc[li] = ln;
+        ceBrace[li] = 0;
+        ceParen[li] = 0;
+        ceUsingBad[li] = 0;
+        string tr = ln;
+        // 去掉前导空白
+        int si = 0;
+        int trLen = tr.Length;
+        while (si < trLen) {
+            int sch = tr[si];
+            if (sch == 32 || sch == 9) { si = si + 1; }
+            else { break; }
+        }
+        if (si > 0) { tr = tr.Substring(si, tr.Length - si); }
+        // 跳过空行/注释行
+        if (tr.Length == 0 || tr.Substring(0, 1) == "/" || tr.Substring(0, 1) == "*") {
+            return;
+        }
+        // 逐行检查括号配平
+        // 用字节比较而非 Substring(ci, 1)：此循环会遍历
+        // 文档的每个字符，为每个字节分配
+        // 单字符字符串会拖慢大文件的
+        // 扫描。
+        int brace = 0;
+        int paren = 0;
+        int lnLen = ln.Length;
+        for (int ci = 0; ci < lnLen; ci = ci + 1) {
+            int ch = ln[ci];
+            if (ch == 123) { brace = brace + 1; }
+            else if (ch == 125) { brace = brace - 1; }
+            else if (ch == 40) { paren = paren + 1; }
+            else if (ch == 41) { paren = paren - 1; }
+        }
+        ceBrace[li] = brace;
+        ceParen[li] = paren;
+        // 这里保留的唯一启发式：`using` 指令
+        // 不以 ';' 结尾。通用的“缺分号”猜测
+        // 误报过多（多行调用、
+        // 特性、泛型），早已被禁用；真正的
+        // 诊断来自 Run/Build 后的编译器。
+        if (CodeEditor.StartsWithP(tr, "using ")
+            && tr.Substring(tr.Length - 1, 1) != ";") {
+            ceUsingBad[li] = 1;
+        }
     }
 }

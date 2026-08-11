@@ -543,17 +543,52 @@ partial class Designer {
 
     /// 停靠布局：设了停靠边的组件在所在层里自动吸边——按顺序
     /// 从剩余矩形上切走一条（厚度沿用组件自己的宽/高），Fill
-    /// 吃掉剩下的全部；停靠为「自由」(0) 的组件不参与，保持
+    /// 铺满剩下的全部；停靠为「自由」(0) 的组件不参与，保持
     /// 绝对定位。每帧算一遍并写回 fx/fy/fw/fh，所以画布、命中
     /// 测试和保存的 JSON 看到的是同一份矩形。
     void ApplyDockLayout(List<FormField> lst, int ax, int ay, int aw, int ah) {
+        this.ApplyDockLayer(lst, ax, ay, aw, ah, 0 - 1);
+        this.ApplyDockNested(lst);
+    }
+
+    /// 对每个容器的内容框再停靠一层（与 RenderFreeField 的
+    /// +6 / +26 内边距一致）。标签页容器的每一页各自为一层：
+    /// 否则看不见的页里的停靠组件会吃掉当前页的空间，
+    /// 当前页的 Fill 就只剩 0。
+    void ApplyDockNested(List<FormField> lst) {
+        for (int i = 0; i < lst.Count; i = i + 1) {
+            FormField f = lst[i];
+            if (f.KidCount() == 0) { continue; }
+            int iw = f.fw - 12;
+            int ih = f.fh - 32;
+            if (iw < 0) { iw = 0; }
+            if (ih < 0) { ih = 0; }
+            if (f.kind == "Tabs") {
+                int pages = Designer.TabPageCount(f);
+                for (int p = 0; p < pages; p = p + 1) {
+                    this.ApplyDockLayer(f.kids, 0, 0, iw, ih, p);
+                }
+            } else {
+                this.ApplyDockLayer(f.kids, 0, 0, iw, ih, 0 - 1);
+            }
+            this.ApplyDockNested(f.kids);
+        }
+    }
+
+    /// 把一层停靠组件排进 (ax, ay, aw, ah)。`tabFilter >= 0` 时
+    /// 只排该标签页下的子级。
+    void ApplyDockLayer(List<FormField> lst, int ax, int ay, int aw, int ah,
+            int tabFilter) {
         int rx = ax;
         int ry = ay;
         int rw = aw;
         int rh = ah;
+        if (rw < 0) { rw = 0; }
+        if (rh < 0) { rh = 0; }
         for (int i = 0; i < lst.Count; i = i + 1) {
             FormField f = lst[i];
             if (f.IsNonVisual()) { continue; }
+            if (tabFilter >= 0 && f.childTab != tabFilter) { continue; }
             int d = f.dockSide;
             if (d == 1 || d == 2) {
                 int th = f.fh;
@@ -574,22 +609,16 @@ partial class Designer {
                 else { f.fx = rx + rw - tw; }
                 rw = rw - tw;
             } else if (d == 5) {
+                // Fill 铺满剩下的矩形但不吃掉它（跟运行时
+                // Control.Arrange 一致）：否则同一层里第二个 Fill
+                // 以及 Fill 后面的组件全部只能拿到 0×0。
                 f.fx = rx;
                 f.fy = ry;
                 f.fw = rw;
                 f.fh = rh;
-                rw = 0;
-                rh = 0;
             }
             if (rw < 0) { rw = 0; }
             if (rh < 0) { rh = 0; }
-        }
-        // 容器内部是自己的一层：子组件相对容器内容框停靠。
-        for (int i = 0; i < lst.Count; i = i + 1) {
-            FormField f = lst[i];
-            if (f.KidCount() > 0) {
-                this.ApplyDockLayout(f.kids, 0, 0, f.fw - 12, f.fh - 32);
-            }
         }
     }
 
@@ -1374,26 +1403,79 @@ partial class Designer {
         c.PopClip();
     }
 
+    /// 自由画布上 (dx, dy) 落入的容器，其内容框原点写入
+    /// freeDropPX/freeDropPY；null 表示顶层表单。指到已有组件上
+    /// 时取它所在的容器，于是拖到标签页内任何地方都是
+    /// 「加到正看着的这一页」。
+    FormField FreeDropContainer(int dx, int dy) {
+        FormField pick = this.FreePick(fields, dx, dy, 0, 0);
+        if (pick == null) { return null; }
+        int px = freeSelPX;
+        int py = freeSelPY;
+        if (pick.IsContainer()) {
+            freeDropPX = px + pick.fx + 6;
+            freeDropPY = py + pick.fy + 26;
+            return pick;
+        }
+        FormField cont = this.ParentContainerOf(pick);
+        if (cont == null) { return null; }
+        // pick 的父内容框原点就是 cont 的内容框原点。
+        freeDropPX = px;
+        freeDropPY = py;
+        return cont;
+    }
+
+    /// 把新组件以容器内容框坐标 (lx, ly) 为中心放进 cont
+    /// （null = 顶层）；标签页容器落在正看着的那一页。
+    void PlaceFree(FormField f, FormField cont, int lx, int ly) {
+        f.fx = lx - f.fw / 2;
+        f.fy = ly - f.fh / 2;
+        if (f.fx < 0) { f.fx = 0; }
+        if (f.fy < 0) { f.fy = 0; }
+        if (cont == null) {
+            fields.Add(f);
+            freeSelPX = 0;
+            freeSelPY = 0;
+        } else {
+            f.childTab = 0;
+            if (cont.kind == "Tabs") { f.childTab = Designer.TabActivePage(cont); }
+            else if (cont.kind == "SplitPanel") { f.childTab = cont.uiState.Get(); }
+            cont.kids.Add(f);
+            activeContainer = cont;
+            freeSelPX = freeDropPX;
+            freeSelPY = freeDropPY;
+        }
+        sel = f;
+        inspTab = 0;
+        this.ClearExtraSel();
+    }
+
     /// 在设计空间 (dx, dy) 处把面板字段添加到自由画布，
-    /// 新元素以光标为中心。
+    /// 新元素以光标为中心；光标下有容器则成为它的子级。
     void DropFreePalette(int dx, int dy) {
         int ftype = dragKind;
+        FormField cont = this.FreeDropContainer(dx, dy);
+        int cx = 0;
+        int cy = 0;
+        if (cont != null) {
+            cx = freeDropPX;
+            cy = freeDropPY;
+        }
         if (ftype == 100) {
             FormField nf = FormField.NewCustom(dragCustomKind, seq);
             seq = seq + 1;
-            nf.fx = dx - nf.fw / 2;
-            nf.fy = dy - nf.fh / 2;
-            fields.Add(nf);
-            sel = nf;
-            inspTab = 0;
+            this.PlaceFree(nf, cont, dx - cx, dy - cy);
             msg = Designer.T("added ", "已添加 ") + dragCustomKind;
             return;
         }
         if (ftype == 200) {
+            activeContainer = cont;
             AddUserComponent(dragUserComp);
             if (sel != null) {
-                sel.fx = dx - sel.fw / 2;
-                sel.fy = dy - sel.fh / 2;
+                sel.fx = dx - cx - sel.fw / 2;
+                sel.fy = dy - cy - sel.fh / 2;
+                if (sel.fx < 0) { sel.fx = 0; }
+                if (sel.fy < 0) { sel.fy = 0; }
             }
             return;
         }
@@ -1408,11 +1490,7 @@ partial class Designer {
         }
         f.fw = DefaultFreeW(f);
         f.fh = DefaultFreeH(f);
-        f.fx = dx - f.fw / 2;
-        f.fy = dy - f.fh / 2;
-        fields.Add(f);
-        sel = f;
-        inspTab = 0;
+        this.PlaceFree(f, cont, dx - cx, dy - cy);
         if (f.IsContainer()) { activeContainer = f; }
         msg = Designer.T("added ", "已添加 ") + FormField.TypeName(ftype);
     }

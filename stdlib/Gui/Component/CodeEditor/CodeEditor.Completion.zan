@@ -16,10 +16,15 @@ partial class CodeEditor {
         return false;
     }
 
-    /// `s` 以 `pre` 开头时返回 true。
+    /// `s` 以 `pre` 开头时返回 true。按字节比：扫描路径会对每行
+    /// 调用它，而 Substring 要为每次测试分配一个字符串。
     static bool StartsWithP(string s, string pre) {
-        if (pre.Length > s.Length) { return false; }
-        return s.Substring(0, pre.Length) == pre;
+        int n = pre.Length;
+        if (n > s.Length) { return false; }
+        for (int i = 0; i < n; i = i + 1) {
+            if (s[i] != pre[i]) { return false; }
+        }
+        return true;
     }
 
     /// 把语言关键字追加到 `outk`。
@@ -60,24 +65,38 @@ partial class CodeEditor {
     /// 收集缓冲区中出现的唯一标识符 token（长度 >= 2），
     /// 使编辑器能补全用户已输入过的符号。
     static void CollectWords(List<string> ls, List<string> outw) {
-        string idstart = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_";
-        string idrest = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
-        for (int li = 0; li < ls.Count; li = li + 1) {
+        CodeEditor.CollectWordsRange(ls, 0, ls.Count, outw);
+    }
+
+    /// 同上，但只扫描 [from, to) 区间。两处写法差异都是为了让代价
+    /// 与规模无关：逐字节推进并且整词只分配一次字符串（原来每个字符
+    /// 一个 Substring 再逐字符拼接），去重走哈希表（原来对已收集的词
+    /// 线性查找，于是一次收集是 词数×字符数 的平方级）。
+    static void CollectWordsRange(List<string> ls, int from, int to,
+                                  List<string> outw) {
+        Dict<string, bool> seen = new Dict<string, bool>();
+        for (int i = 0; i < outw.Count; i = i + 1) {
+            if (!seen.ContainsKey(outw[i])) { seen.Add(outw[i], true); }
+        }
+        if (from < 0) { from = 0; }
+        if (to > ls.Count) { to = ls.Count; }
+        for (int li = from; li < to; li = li + 1) {
             string line = ls[li];
             int n = line.Length;
             int i = 0;
             while (i < n) {
-                string ch = line.Substring(i, 1);
-                if (CodeEditor.InSet(idstart, ch)) {
-                    int j = i;
-                    string w = "";
-                    while (j < n) {
-                        string cj = line.Substring(j, 1);
-                        if (CodeEditor.InSet(idrest, cj)) { w = w + cj; j = j + 1; }
-                        else { break; }
+                int ch = line[i];
+                bool digit = ch >= 48 && ch <= 57;
+                if (CodeEditor.IdentByte(ch) && !digit) {
+                    int s = i;
+                    while (i < n && CodeEditor.IdentByte(line[i])) { i = i + 1; }
+                    if (i - s >= 2) {
+                        string w = line.Substring(s, i - s);
+                        if (!seen.ContainsKey(w)) {
+                            seen.Add(w, true);
+                            outw.Add(w);
+                        }
                     }
-                    if (w.Length >= 2 && !CodeEditor.Has(outw, w)) { outw.Add(w); }
-                    i = j;
                 } else {
                     i = i + 1;
                 }
@@ -153,19 +172,20 @@ partial class CodeEditor {
     /// `pfx` 拼出 `cand` 的大写字母（加首字符）时返回 true：
     /// `rdal` 和 `RAL` 都能匹配 `ReadAllLines`。
     static bool HumpMatch(string cand, string pfx) {
-        string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        List<string> humps = new List<string>();
-        for (int i = 0; i < cand.Length; i = i + 1) {
-            string ch = cand.Substring(i, 1);
-            if (i == 0 || CodeEditor.InSet(upper, ch) || ch == "_") {
-                if (ch != "_") { humps.Add(ch); }
+        int pi = 0;
+        int n = cand.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int ch = cand[i];
+            bool hump = (i == 0 || (ch >= 65 && ch <= 90)) && ch != 95;
+            if (hump) {
+                if (CodeEditor.LowerByte(ch) != CodeEditor.LowerByte(pfx[pi])) {
+                    return false;
+                }
+                pi = pi + 1;
+                if (pi >= pfx.Length) { return true; }
             }
         }
-        if (humps.Count < pfx.Length) { return false; }
-        for (int h = 0; h < pfx.Length; h = h + 1) {
-            if (!CodeEditor.EqI(humps[h], pfx.Substring(h, 1))) { return false; }
-        }
-        return true;
+        return false;
     }
 
     /// `pfx` 的每个字符按顺序出现在 `cand` 中时返回 true，
@@ -173,7 +193,9 @@ partial class CodeEditor {
     static bool SubseqMatchI(string cand, string pfx) {
         int pi = 0;
         for (int ci = 0; pi < pfx.Length && ci < cand.Length; ci = ci + 1) {
-            if (CodeEditor.EqI(cand.Substring(ci, 1), pfx.Substring(pi, 1))) { pi = pi + 1; }
+            if (CodeEditor.LowerByte(cand[ci]) == CodeEditor.LowerByte(pfx[pi])) {
+                pi = pi + 1;
+            }
         }
         return pi >= pfx.Length;
     }
@@ -201,6 +223,47 @@ partial class CodeEditor {
             kinds[j + 1] = kd;
             scores[j + 1] = sc;
             i = i + 1;
+        }
+    }
+
+    /// 按相关度降序保留最好的 `limit` 个候选。弹窗只显示前几十个，而
+    /// 一次击键的候选可能上千：对全部候选做插入排序是平方级的，这里
+    /// 只维护一个长度有界的有序前缀，代价降到 候选数×limit。
+    /// 与 SortByScore 一样是稳定的（同分保持收集顺序）。
+    static void SortByScoreTop(List<string> items, List<string> kinds,
+                               List<int> scores, int limit) {
+        List<string> ti = new List<string>();
+        List<string> tk = new List<string>();
+        List<int> ts = new List<int>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            int sc = scores[i];
+            if (ts.Count >= limit && sc <= ts[ts.Count - 1]) { continue; }
+            ti.Add(items[i]);
+            tk.Add(kinds[i]);
+            ts.Add(sc);
+            int j = ts.Count - 2;
+            while (j >= 0 && ts[j] < sc) {
+                ti[j + 1] = ti[j];
+                tk[j + 1] = tk[j];
+                ts[j + 1] = ts[j];
+                j = j - 1;
+            }
+            ti[j + 1] = items[i];
+            tk[j + 1] = kinds[i];
+            ts[j + 1] = sc;
+            if (ts.Count > limit) {
+                ti.RemoveAt(ti.Count - 1);
+                tk.RemoveAt(tk.Count - 1);
+                ts.RemoveAt(ts.Count - 1);
+            }
+        }
+        items.Clear();
+        kinds.Clear();
+        scores.Clear();
+        for (int k = 0; k < ti.Count; k = k + 1) {
+            items.Add(ti[k]);
+            kinds.Add(tk[k]);
+            scores.Add(ts[k]);
         }
     }
 
@@ -251,42 +314,68 @@ partial class CodeEditor {
         string pfx = ln.Substring(st, curCol - st);
         if (pfx.Length < 1 && !acForced) { acActive = false; return; }
 
-        List<string> cand = new List<string>();
-        List<string> candKinds = new List<string>();
+        List<string> cand;
+        List<string> candKinds;
+        List<string> words = new List<string>();
         if (InAttributeContext()) {
             // 在 `[ ... ]` 内：这里只有真正的特性。编译器
             // 只识别 DllImport 和 StructLayout（见 parser.c）。
+            cand = new List<string>();
+            candKinds = new List<string>();
             CodeEditor.AddKindWords(cand, candKinds, "DllImport StructLayout", "M");
         } else {
-            CodeEditor.SnippetListK(cand, candKinds);
-            CodeEditor.KeywordListK(cand, candKinds);
-            AddStdlibCandidates(cand, candKinds);
-            AddProjectCandidates(cand, candKinds);
-            CodeEditor.CollectWordsK(lines, cand, candKinds);
+            EnsureCandBase();
+            cand = cbItems;
+            candKinds = cbKinds;
+            int radius = CodeEditor.WordScanRadius();
+            CodeEditor.CollectWordsRange(lines, curLine - radius,
+                                         curLine + radius, words);
         }
         acAllItems = new List<string>();
         acAllKinds = new List<string>();
         List<int> scores = new List<int>();
-        for (int i = 0; i < cand.Count; i = i + 1) {
-            string w = cand[i];
+        Dict<string, bool> taken = new Dict<string, bool>();
+        ScoreCandidates(cand, candKinds, "W", pfx, taken, scores);
+        ScoreCandidates(words, null, "W", pfx, taken, scores);
+        if (acAllItems.Count == 0) { acActive = false; return; }
+        // 排序后保留最优的少数：按收集顺序截断会
+        // 在明显候选项扫描较晚时将其丢弃。
+        CodeEditor.SortByScoreTop(acAllItems, acAllKinds, scores, 60);
+        acSel = 0;
+        ApplyKindFilter();
+    }
+
+    /// 把 `items` 中匹配 `pfx` 的候选追加到弹窗列表，`taken` 跟踪已入选的
+    /// 词（多个来源会给出同一个名字）。`kinds` 为 null 时统一用 `defKind`。
+    void ScoreCandidates(List<string> items, List<string> kinds, string defKind,
+                         string pfx, Dict<string, bool> taken, List<int> scores) {
+        for (int i = 0; i < items.Count; i = i + 1) {
+            string w = items[i];
             int sc = CodeEditor.MatchScore(w, pfx);
-            if (w != pfx && sc >= 0 && !CodeEditor.Has(acAllItems, w)) {
+            if (w != pfx && sc >= 0 && !taken.ContainsKey(w)) {
+                taken.Add(w, true);
                 acAllItems.Add(w);
-                if (i < candKinds.Count) { acAllKinds.Add(candKinds[i]); }
-                else { acAllKinds.Add("W"); }
+                if (kinds != null && i < kinds.Count) { acAllKinds.Add(kinds[i]); }
+                else { acAllKinds.Add(defKind); }
                 scores.Add(sc);
             }
         }
-        if (acAllItems.Count == 0) { acActive = false; return; }
-        // 先排序再保留最优的少数：按收集顺序截断会
-        // 在明显候选项扫描较晚时将其丢弃。
-        CodeEditor.SortByScore(acAllItems, acAllKinds, scores);
-        while (acAllItems.Count > 60) {
-            acAllItems.RemoveAt(acAllItems.Count - 1);
-            acAllKinds.RemoveAt(acAllKinds.Count - 1);
-        }
-        acSel = 0;
-        ApplyKindFilter();
+    }
+
+    /// 补全候选中与光标位置无关的那一半：代码片段、关键字、标准库、
+    /// 项目类型与成员。它只在项目扫描或缓冲区类型表变化时才会变，而
+    /// 重建一次要走遍上千个类型和成员，因此跨击键复用。
+    void EnsureCandBase() {
+        EnsureProjectScan();
+        EnsureBufTypes();
+        if (cbItems != null && cbGen == candBaseGen) { return; }
+        cbItems = new List<string>();
+        cbKinds = new List<string>();
+        CodeEditor.SnippetListK(cbItems, cbKinds);
+        CodeEditor.KeywordListK(cbItems, cbKinds);
+        AddStdlibCandidates(cbItems, cbKinds);
+        AddProjectCandidates(cbItems, cbKinds);
+        cbGen = candBaseGen;
     }
 
     /// 成员名的启发式种类标签：camelCase → 字段，已知名词 →
@@ -660,32 +749,42 @@ partial class CodeEditor {
     }
 
     /// `s` 中从 `start` 起 `sub` 首次出现的索引，无则 -1。
+    /// 先比首字节再逐字节比，不为每个位置切一个子串。
     static int FindFrom(string s, string sub, int start) {
-        if (sub.Length == 0) { return start; }
-        int limit = s.Length - sub.Length;
+        int m = sub.Length;
+        if (m == 0) { return start; }
+        int limit = s.Length - m;
         int i = start;
         if (i < 0) { i = 0; }
+        int first = sub[0];
         while (i <= limit) {
-            if (s.Substring(i, sub.Length) == sub) { return i; }
+            if (s[i] == first) {
+                int k = 1;
+                while (k < m && s[i + k] == sub[k]) { k = k + 1; }
+                if (k == m) { return i; }
+            }
             i = i + 1;
         }
         return 0 - 1;
     }
 
-    /// 去除 `s` 首尾的空格和制表符。
+    /// 去除 `s` 首尾的空格和制表符。整个编辑器的扫描都逐行调用它，
+    /// 因此按字节定界，且无需裁剪时直接返回原串（不分配）。
     static string TrimStr(string s) {
+        int len = s.Length;
         int a = 0;
-        while (a < s.Length) {
-            string ch = s.Substring(a, 1);
-            if (ch == " " || ch == "\t") { a = a + 1; }
+        while (a < len) {
+            int ch = s[a];
+            if (ch == 32 || ch == 9) { a = a + 1; }
             else { break; }
         }
-        int b = s.Length;
+        int b = len;
         while (b > a) {
-            string ch = s.Substring(b - 1, 1);
-            if (ch == " " || ch == "\t" || ch == "\r") { b = b - 1; }
+            int ch = s[b - 1];
+            if (ch == 32 || ch == 9 || ch == 13) { b = b - 1; }
             else { break; }
         }
+        if (a == 0 && b == len) { return s; }
         return s.Substring(a, b - a);
     }
 
@@ -718,32 +817,34 @@ partial class CodeEditor {
     }
 
     static void CollectWordsK(List<string> ls, List<string> outw, List<string> kinds) {
-        List<string> tmp = new List<string>();
-        CodeEditor.CollectWords(ls, tmp);
-        for (int i = 0; i < tmp.Count; i = i + 1) {
-            if (!CodeEditor.Has(outw, tmp[i])) {
-                outw.Add(tmp[i]);
-                kinds.Add("W");
-            }
-        }
+        CodeEditor.CollectWordsRangeK(ls, 0, ls.Count, outw, kinds);
     }
 
-    /// 不区分大小写的 StartsWith 检查。
+    static void CollectWordsRangeK(List<string> ls, int from, int to,
+                                   List<string> outw, List<string> kinds) {
+        CodeEditor.CollectWordsRange(ls, from, to, outw);
+        while (kinds.Count < outw.Count) { kinds.Add("W"); }
+    }
+
+    /// 词补全向光标上下各看多少行。整篇扫描会让每次击键的代价随文件
+    /// 规模增长（30 万行时是秒级），而窗口外的符号本来就由项目扫描、
+    /// 缓冲区类型表和符号索引提供，这里只补“刚写过的局部标识符”。
+    static int WordScanRadius() { return 1200; }
+
+    /// ASCII 大写字母折叠为小写，其余字节原样返回。
+    static int LowerByte(int b) {
+        if (b >= 65 && b <= 90) { return b + 32; }
+        return b;
+    }
+
+    /// 不区分大小写的 StartsWith 检查（按字节；匹配函数会对每个候选
+    /// 逐字符调用，为每个字符分配字符串太贵）。
     static bool StartsWithI(string s, string pre) {
         if (pre.Length > s.Length) { return false; }
-        string lower = "abcdefghijklmnopqrstuvwxyz";
-        string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         for (int i = 0; i < pre.Length; i = i + 1) {
-            string a = s.Substring(i, 1);
-            string b = pre.Substring(i, 1);
-            // 统一为相同大小写
-            string la = a;
-            string lb = b;
-            for (int ai = 0; ai < 26; ai = ai + 1) {
-                if (upper.Substring(ai, 1) == a) { la = lower.Substring(ai, 1); }
-                if (upper.Substring(ai, 1) == b) { lb = lower.Substring(ai, 1); }
+            if (CodeEditor.LowerByte(s[i]) != CodeEditor.LowerByte(pre[i])) {
+                return false;
             }
-            if (la != lb) { return false; }
         }
         return true;
     }
@@ -1304,13 +1405,21 @@ partial class CodeEditor {
     /// 扫描 `src` 中每个 class/struct/enum 声明，把每个类型名
     /// 追加到 `names`，其空格分隔的直接成员名追加到 `membersJoined`。
     static void ScanTypesInto(string src, List<string> names, List<string> membersJoined) {
-        List<string> ls = CodeEditor.SplitLines(src);
+        CodeEditor.ScanTypeLinesInto(CodeEditor.SplitLines(src), names, membersJoined);
+    }
+
+    /// 同上，但直接吃行表：编辑器自己的缓冲区本来就是行表，
+    /// 先 GetText() 拼成一个整文档字符串再 SplitLines() 拆回去，在 30 万行
+    /// 上就是每次重扫都要分配十兆级的字符串。
+    static void ScanTypeLinesInto(List<string> ls, List<string> names,
+                                  List<string> membersJoined) {
         int i = 0;
         while (i < ls.Count) {
             string tr = CodeEditor.TrimStr(ls[i]);
             string tname = CodeEditor.TypeDeclName(tr);
             if (tname.Length > 0) {
-                string members = " ";
+                List<string> members = new List<string>();
+                Dict<string, bool> seen = new Dict<string, bool>();
                 int depth = 0;
                 bool started = false;
                 int j = i;
@@ -1318,20 +1427,22 @@ partial class CodeEditor {
                     string lj = ls[j];
                     if (started && depth == 1 && j != i) {
                         string mn = CodeEditor.MemberDeclName(CodeEditor.TrimStr(lj));
-                        if (mn.Length > 0 && CodeEditor.Find(members, " " + mn + " ") < 0) {
-                            members = members + mn + " ";
+                        if (mn.Length > 0 && !seen.ContainsKey(mn)) {
+                            seen.Add(mn, true);
+                            members.Add(mn);
                         }
                     }
-                    for (int k = 0; k < lj.Length; k = k + 1) {
-                        string ch = lj.Substring(k, 1);
-                        if (ch == "{") { depth = depth + 1; started = true; }
-                        else if (ch == "}") { depth = depth - 1; }
+                    int n = lj.Length;
+                    for (int k = 0; k < n; k = k + 1) {
+                        int ch = lj[k];
+                        if (ch == 123) { depth = depth + 1; started = true; }
+                        else if (ch == 125) { depth = depth - 1; }
                     }
                     j = j + 1;
                     if (started && depth <= 0) { break; }
                 }
                 names.Add(tname);
-                membersJoined.Add(CodeEditor.TrimStr(members));
+                membersJoined.Add(String.Join(" ", members));
                 i = j;
             } else {
                 i = i + 1;
@@ -1353,6 +1464,7 @@ partial class CodeEditor {
     void EnsureProjectScan() {
         if (!projScanDirty) { return; }
         projScanDirty = false;
+        candBaseGen = candBaseGen + 1;
         projTypes = new List<ProjType>();
         for (int i = 0; i < projFileSrc.Count; i = i + 1) {
             List<string> tn = new List<string>();
@@ -1497,36 +1609,64 @@ partial class CodeEditor {
         }
     }
 
+    static List<string> nsTypeNames;
+    static List<string> nsTypeNs;
+
+    /// Builds the name -> namespace table once. It used to be rebuilt as a
+    /// dozen packed strings on every lookup, and the lookup runs for every
+    /// capitalised identifier in the buffer each time the diagnostics rerun.
+    static void EnsureNsTable() {
+        if (CodeEditor.nsTypeNames != null) { return; }
+        List<string> names = new List<string>();
+        List<string> nss = new List<string>();
+        CodeEditor.AddNsGroup(names, nss, "System.IO", "File Directory Path");
+        CodeEditor.AddNsGroup(names, nss, "System.Diagnostics", "Process");
+        CodeEditor.AddNsGroup(names, nss, "System.Text", "Encoding");
+        CodeEditor.AddNsGroup(names, nss, "System.Json", "JsonBuilder JsonParser");
+        CodeEditor.AddNsGroup(names, nss, "System.Threading",
+            "Thread Mutex Semaphore Stopwatch AtomicInt SharedTable");
+        CodeEditor.AddNsGroup(names, nss, "System.Net.Sockets",
+            "Socket TcpListener TcpClient UdpClient AsyncSocket");
+        CodeEditor.AddNsGroup(names, nss, "System.Net.Http",
+            "HttpClient HttpRequest HttpResponse HttpServer HttpRouter");
+        CodeEditor.AddNsGroup(names, nss, "System.Net.WebSocket",
+            "WebSocketClient WebSocketServer");
+        CodeEditor.AddNsGroup(names, nss, "System.Data", "DbConnection DbResult");
+        CodeEditor.AddNsGroup(names, nss, "System.Data.Orm", "QueryBuilder");
+        CodeEditor.AddNsGroup(names, nss, "Gui", "App Canvas Theme");
+        CodeEditor.AddNsGroup(names, nss, "Gui.Widget",
+            "CodeEditor TreeView Ribbon Modal DataTable Dropdown Carousel Pagination");
+        CodeEditor.nsTypeNs = nss;
+        CodeEditor.nsTypeNames = names;
+    }
+
+    /// Appends every space-separated name in `words` with namespace `ns`.
+    static void AddNsGroup(List<string> names, List<string> nss, string ns,
+                           string words) {
+        int i = 0;
+        int n = words.Length;
+        while (i < n) {
+            while (i < n && words[i] == 32) { i = i + 1; }
+            int s2 = i;
+            while (i < n && words[i] != 32) { i = i + 1; }
+            if (i > s2) {
+                names.Add(words.Substring(s2, i - s2));
+                nss.Add(ns);
+            }
+        }
+    }
+
     /// 使用 stdlib 类型 `name` 必须导入的命名空间，
     /// `name` 是内置 / 有歧义 / 非 stdlib 类型时返回 ""。刻意只收录
     /// 独特无歧义的名称，使缺失 using 的诊断绝不
     /// 误报在用户自己的标识符上。
     static string NsForStdlibType(string name) {
-        string io = " File Directory Path ";
-        string diag = " Process ";
-        string text = " Encoding ";
-        string json = " JsonBuilder JsonParser ";
-        string thread = " Thread Mutex Semaphore Stopwatch AtomicInt SharedTable ";
-        string sock = " Socket TcpListener TcpClient UdpClient AsyncSocket ";
-        string http = " HttpClient HttpRequest HttpResponse HttpServer HttpRouter ";
-        string ws = " WebSocketClient WebSocketServer ";
-        string data = " DbConnection DbResult ";
-        string orm = " QueryBuilder ";
-        string gui = " App Canvas Theme ";
-        string widget = " CodeEditor TreeView Ribbon Modal DataTable Dropdown Carousel Pagination ";
-        string key = " " + name + " ";
-        if (CodeEditor.Find(io, key) >= 0) { return "System.IO"; }
-        if (CodeEditor.Find(diag, key) >= 0) { return "System.Diagnostics"; }
-        if (CodeEditor.Find(text, key) >= 0) { return "System.Text"; }
-        if (CodeEditor.Find(json, key) >= 0) { return "System.Json"; }
-        if (CodeEditor.Find(thread, key) >= 0) { return "System.Threading"; }
-        if (CodeEditor.Find(sock, key) >= 0) { return "System.Net.Sockets"; }
-        if (CodeEditor.Find(http, key) >= 0) { return "System.Net.Http"; }
-        if (CodeEditor.Find(ws, key) >= 0) { return "System.Net.WebSocket"; }
-        if (CodeEditor.Find(data, key) >= 0) { return "System.Data"; }
-        if (CodeEditor.Find(orm, key) >= 0) { return "System.Data.Orm"; }
-        if (CodeEditor.Find(gui, key) >= 0) { return "Gui"; }
-        if (CodeEditor.Find(widget, key) >= 0) { return "Gui.Widget"; }
+        CodeEditor.EnsureNsTable();
+        List<string> names = CodeEditor.nsTypeNames;
+        List<string> nss = CodeEditor.nsTypeNs;
+        for (int i = 0; i < names.Count; i = i + 1) {
+            if (names[i] == name) { return nss[i]; }
+        }
         return "";
     }
 
@@ -1634,26 +1774,45 @@ partial class CodeEditor {
         }
     }
 
+    /// 已在候选表里的词的哈希集。项目类型和成员动辄上千，逐个对
+    /// 候选表线性查重会把一次补全变成平方级。
+    static Dict<string, bool> SeenOf(List<string> cand) {
+        Dict<string, bool> seen = new Dict<string, bool>();
+        for (int i = 0; i < cand.Count; i = i + 1) {
+            if (!seen.ContainsKey(cand[i])) { seen.Add(cand[i], true); }
+        }
+        return seen;
+    }
+
+    static void AddCand(List<string> cand, List<string> kinds,
+                        Dict<string, bool> seen, string w, string kind) {
+        if (w.Length == 0 || seen.ContainsKey(w)) { return; }
+        seen.Add(w, true);
+        cand.Add(w);
+        kinds.Add(kind);
+    }
+
     /// 把项目声明的类型（及其成员）加入补全。
     void AddProjectCandidates(List<string> cand, List<string> kinds) {
         EnsureProjectScan();
+        Dict<string, bool> seen = CodeEditor.SeenOf(cand);
         for (int i = 0; i < projTypes.Count; i = i + 1) {
-            if (!CodeEditor.Has(cand, projTypes[i].name)) { cand.Add(projTypes[i].name); kinds.Add("T"); }
+            CodeEditor.AddCand(cand, kinds, seen, projTypes[i].name, "T");
             List<string> mem = new List<string>();
             CodeEditor.AddWords(mem, projTypes[i].members);
             for (int j = 0; j < mem.Count; j = j + 1) {
-                if (!CodeEditor.Has(cand, mem[j])) { cand.Add(mem[j]); kinds.Add("M"); }
+                CodeEditor.AddCand(cand, kinds, seen, mem[j], "M");
             }
         }
         EnsureBufTypes();
         List<string> tn = muTypeNames;
         List<string> tm = muTypeMembers;
         for (int a = 0; a < tn.Count; a = a + 1) {
-            if (!CodeEditor.Has(cand, tn[a])) { cand.Add(tn[a]); kinds.Add("T"); }
+            CodeEditor.AddCand(cand, kinds, seen, tn[a], "T");
             List<string> mem2 = new List<string>();
             CodeEditor.AddWords(mem2, tm[a]);
             for (int b = 0; b < mem2.Count; b = b + 1) {
-                if (!CodeEditor.Has(cand, mem2[b])) { cand.Add(mem2[b]); kinds.Add("M"); }
+                CodeEditor.AddCand(cand, kinds, seen, mem2[b], "M");
             }
         }
     }
@@ -1676,18 +1835,49 @@ partial class CodeEditor {
 
     /// 扫描缓冲区中使用 `using X;` 类型却缺少所需导入之处，
     /// 为每个出错行记录诊断 + 快速修复。
-    /// 当前缓冲区声明的类型名（及其成员），
-    /// 每次缓冲区变化至多解析一次。GetText() 会实例化整个文档，
-    /// ScanTypesInto 重新解析它，而补全/诊断在每次击键和光标移动时
-    /// 都需要它，因此结果按
-    /// TextStamp() 记忆化。
+    /// 当前缓冲区声明的类型名（及其成员）。补全与诊断每次击键、
+    /// 每次光标移动都要用到它，而重扫是一整篇解析，因此只在结构
+    /// 真的变了时重扫（见 BufTypesStructuralChange）。
     void EnsureBufTypes() {
-        int stamp = TextStamp();
-        if (muTypeNames != null && stamp == muTypesStamp) { return; }
+        if (muTypeNames != null && !BufTypesStructuralChange()) { return; }
         muTypeNames = new List<string>();
         muTypeMembers = new List<string>();
-        CodeEditor.ScanTypesInto(GetText(), muTypeNames, muTypeMembers);
-        muTypesStamp = stamp;
+        CodeEditor.ScanTypeLinesInto(lines, muTypeNames, muTypeMembers);
+        candBaseGen = candBaseGen + 1;
+        btLineSrc = new List<string>();
+        for (int i = 0; i < lines.Count; i = i + 1) { btLineSrc.Add(lines[i]); }
+    }
+
+    /// 自上次扫描以来，缓冲区里发生了能改变类型表的变化时返回 true。
+    /// 类型表只取决于声明行和花括号层次，所以在方法体里敲一个字
+    /// （最常见的编辑）不必重扫：只有声明形状或花括号变了才算数。
+    bool BufTypesStructuralChange() {
+        if (btLineSrc == null || btLineSrc.Count != lines.Count) { return true; }
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string now = lines[i];
+            string was = btLineSrc[i];
+            if (now == was) { continue; }
+            if (CodeEditor.BraceKey(now) != CodeEditor.BraceKey(was)) { return true; }
+            string trNow = CodeEditor.TrimStr(now);
+            string trWas = CodeEditor.TrimStr(was);
+            if (CodeEditor.TypeDeclName(trNow) != CodeEditor.TypeDeclName(trWas)) { return true; }
+            if (CodeEditor.MemberDeclName(trNow) != CodeEditor.MemberDeclName(trWas)) { return true; }
+            btLineSrc[i] = now;
+        }
+        return false;
+    }
+
+    /// 一行里 '{' 与 '}' 的个数，合成一个可比较的键。
+    static int BraceKey(string s) {
+        int open = 0;
+        int close = 0;
+        int n = s.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int ch = s[i];
+            if (ch == 123) { open = open + 1; }
+            else if (ch == 125) { close = close + 1; }
+        }
+        return open * 1048576 + close;
     }
 
     /// 对构成标识符的字节（ASCII 字母、数字、
@@ -1701,53 +1891,123 @@ partial class CodeEditor {
         return b == 95;
     }
 
+    /// Missing-`using` diagnostics for the whole buffer. The scan walks every
+    /// character of every line, so it is cached twice over: once per line (a
+    /// line whose text is unchanged reuses its result, so typing rescans one
+    /// line) and once per buffer (the caller reruns this on every caret line
+    /// change, and an unchanged buffer answers from the cache).
     void AnalyzeMissingUsings() {
+        // Fast path: no line changed since the last scan, so nothing outside
+        // the buffer can have changed the answer either -- replay the cache
+        // without reparsing the imports or rescanning a character.
+        if (ReplayMissingUsings()) { return; }
         EnsureProjectScan();
-        fixes = new List<QuickFix>();
         List<string> usings = new List<string>();
         ParseUsingsInto(usings);
         string fileNs = FileNamespace();
         EnsureBufTypes();
+        // Everything outside the line itself that the answer depends on. A
+        // change here (a new using, a type declared elsewhere) drops the
+        // per-line cache.
+        string ctx = fileNs + "|" + string.Join(",", usings) + "|"
+            + Convert.ToString(muTypeNames.Count) + ":"
+            + Convert.ToString(projTypes.Count);
+        if (muCtx != ctx || muLineSrc == null) {
+            muCtx = ctx;
+            muLineSrc = new List<string>();
+            muLineNs = new List<string>();
+            muLineWord = new List<string>();
+        }
+        fixes = new List<QuickFix>();
         List<string> tn = muTypeNames;
         int li = 0;
         while (li < lines.Count) {
-            string tr = CodeEditor.TrimStr(lines[li]);
-            if (tr.Length == 0 || tr.Substring(0, 1) == "/" || tr.Substring(0, 1) == "*"
-                || CodeEditor.StartsWithP(tr, "using ") || CodeEditor.StartsWithP(tr, "namespace ")) {
-                li = li + 1; continue;
+            while (muLineSrc.Count <= li) {
+                muLineSrc.Add(null);
+                muLineNs.Add("");
+                muLineWord.Add("");
             }
-            string ln = lines[li];
-            int p = 0;
-            int n = ln.Length;
-            while (p < n) {
-                if (CodeEditor.IdentByte(ln[p])) {
-                    int s2 = p;
-                    while (p < n && CodeEditor.IdentByte(ln[p])) { p = p + 1; }
-                    bool dotAfter = (p < n && ln[p] == 46);
-                    bool dotBefore = (s2 > 0 && ln[s2 - 1] == 46);
-                    int first = ln[s2];
-                    bool cap = (first >= 65 && first <= 90);
-                    if (dotAfter && !dotBefore && cap) {
-                        string w = ln.Substring(s2, p - s2);
-                        string ns = CodeEditor.NsForStdlibType(w);
-                        if (ns.Length > 0) {
-                            bool imported = CodeEditor.Has(usings, ns);
-                            if (!imported && fileNs.Length > 0) {
-                                if (fileNs == ns) { imported = true; }
-                                else if (fileNs.Length > ns.Length && CodeEditor.StartsWithP(fileNs, ns + ".")) { imported = true; }
-                            }
-                            bool userType = CodeEditor.Has(tn, w) || CodeEditor.HasProjType(projTypes, w);
-                            if (!imported && !userType && !CodeEditor.QuickFixHas(fixes, li)) {
-                                errors.Add(new Diagnostic(li, "'" + w + "' needs 'using " + ns + ";'"));
-                                fixes.Add(new QuickFix(li, ns));
-                            }
-                        }
-                    }
-                } else {
-                    p = p + 1;
-                }
+            if (muLineSrc[li] != lines[li]) {
+                ScanLineMissingUsing(li, usings, fileNs, tn);
+            }
+            if (muLineNs[li].Length > 0) {
+                errors.Add(new Diagnostic(li, "'" + muLineWord[li]
+                    + "' needs 'using " + muLineNs[li] + ";'"));
+                fixes.Add(new QuickFix(li, muLineNs[li]));
             }
             li = li + 1;
+        }
+        while (muLineSrc.Count > lines.Count) {
+            muLineSrc.RemoveAt(muLineSrc.Count - 1);
+            muLineNs.RemoveAt(muLineNs.Count - 1);
+            muLineWord.RemoveAt(muLineWord.Count - 1);
+        }
+        muStamp = TextStamp();
+    }
+
+    /// Rebuilds the diagnostics and quick fixes from the per-line cache when
+    /// every line still holds the text it was scanned from. Returns false
+    /// when the buffer moved on and a real scan is needed.
+    bool ReplayMissingUsings() {
+        if (muLineSrc == null || muLineSrc.Count != lines.Count) { return false; }
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (muLineSrc[i] != lines[i]) { return false; }
+        }
+        fixes = new List<QuickFix>();
+        for (int j = 0; j < lines.Count; j = j + 1) {
+            if (muLineNs[j].Length > 0) {
+                errors.Add(new Diagnostic(j, "'" + muLineWord[j]
+                    + "' needs 'using " + muLineNs[j] + ";'"));
+                fixes.Add(new QuickFix(j, muLineNs[j]));
+            }
+        }
+        return true;
+    }
+
+    /// Scans one line for the first stdlib type used without its `using` and
+    /// records the answer (namespace + type name, both "" for none) in the
+    /// per-line cache.
+    void ScanLineMissingUsing(int li, List<string> usings, string fileNs,
+                              List<string> tn) {
+        muLineSrc[li] = lines[li];
+        muLineNs[li] = "";
+        muLineWord[li] = "";
+        string tr = CodeEditor.TrimStr(lines[li]);
+        if (tr.Length == 0 || tr.Substring(0, 1) == "/" || tr.Substring(0, 1) == "*"
+            || CodeEditor.StartsWithP(tr, "using ") || CodeEditor.StartsWithP(tr, "namespace ")) {
+            return;
+        }
+        string ln = lines[li];
+        int p = 0;
+        int n = ln.Length;
+        while (p < n) {
+            if (CodeEditor.IdentByte(ln[p])) {
+                int s2 = p;
+                while (p < n && CodeEditor.IdentByte(ln[p])) { p = p + 1; }
+                bool dotAfter = (p < n && ln[p] == 46);
+                bool dotBefore = (s2 > 0 && ln[s2 - 1] == 46);
+                int first = ln[s2];
+                bool cap = (first >= 65 && first <= 90);
+                if (dotAfter && !dotBefore && cap) {
+                    string w = ln.Substring(s2, p - s2);
+                    string ns = CodeEditor.NsForStdlibType(w);
+                    if (ns.Length > 0) {
+                        bool imported = CodeEditor.Has(usings, ns);
+                        if (!imported && fileNs.Length > 0) {
+                            if (fileNs == ns) { imported = true; }
+                            else if (fileNs.Length > ns.Length && CodeEditor.StartsWithP(fileNs, ns + ".")) { imported = true; }
+                        }
+                        bool userType = CodeEditor.Has(tn, w) || CodeEditor.HasProjType(projTypes, w);
+                        if (!imported && !userType) {
+                            muLineNs[li] = ns;
+                            muLineWord[li] = w;
+                            return;
+                        }
+                    }
+                }
+            } else {
+                p = p + 1;
+            }
         }
     }
 
