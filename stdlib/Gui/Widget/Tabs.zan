@@ -53,6 +53,18 @@ class Tabs : Control {
     bool follow;
     bool hostModel;
     int ctxIndex;
+    /// 设计出来的页容器（下标 = 标签索引）。有了它，标签条
+    /// 本身就是容器：设计器 / .zform 里放在某个标签下的控件
+    /// 经 SlotHost 落进对应的页，切换标签即切换页面，宿主
+    /// 不必自己隐藏和摆放每一页。为空时控件行为与从前一致
+    /// （只画标签条，页面由宿主自行绘制）。
+    List<Panel> pages;
+    /// `options` 的原样文本，供检查器 / 序列化按原样回读。
+    string itemsSpec;
+    /// 上一次测量出的表头高度与侧栏宽度：Arrange 拿不到 App，
+    /// 而页面区正是表头之外的那块。
+    int hdrH;
+    int trackW;
 
     int changedIndex;
     int closedIndex;
@@ -109,6 +121,10 @@ class Tabs : Control {
         this.follow = false;
         this.hostModel = false;
         this.ctxIndex = 0 - 1;
+        this.pages = new List<Panel>();
+        this.itemsSpec = "";
+        this.hdrH = 0;
+        this.trackW = 0;
         this.changedIndex = 0 - 1;
         this.closedIndex = 0 - 1;
         this.addedIndex = 0 - 1;
@@ -138,6 +154,61 @@ class Tabs : Control {
 
     override string StyleType() { return "tabs"; }
 
+    /// 标签 i 的页容器，按需补齐（缺页的标签是空白页）。
+    /// 页是透明的停靠容器，因此页里的控件既能停靠也能
+    /// 绝对摆放，和窗口根一样。
+    Panel Page(int i) {
+        int want = i;
+        if (want < 0) { want = 0; }
+        while (pages.Count <= want) {
+            Panel p = Panel.Root("page" + Convert.ToString(pages.Count));
+            p.Pad(0);
+            p.Dock(Dock.Fill());
+            pages.Add(p);
+            this.With(p);
+        }
+        return pages[want];
+    }
+
+    int PageCount() { return pages.Count; }
+
+    /// 设计里放在某个标签下的控件（.zform 的 `childTab`）真正的
+    /// 父节点就是那一页。
+    override Control SlotHost(int slot) {
+        return this.Page(slot);
+    }
+
+    /// 按序列化文本重建标签：每条一个标题，`|` 分隔，
+    /// 前缀 `x` 表示该标签可关闭。设计器与 .zform 走这条路径。
+    void SetItemsText(string spec) {
+        itemsSpec = spec;
+        tabs = new List<TabItem>();
+        List<string> parts = spec.Split("|");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string it = parts[i];
+            if (it == "") { continue; }
+            bool canClose = false;
+            if (it.Substring(0, 1) == "x") {
+                canClose = true;
+                it = it.Substring(1, it.Length - 1);
+            }
+            tabs.Add(new TabItem(it, canClose));
+        }
+        if (active >= tabs.Count) { active = tabs.Count - 1; }
+        if (active < 0 && tabs.Count > 0) { active = 0; }
+        scroll = 0;
+    }
+
+    override string GetExtra(string key) {
+        if (key == "options") { return itemsSpec; }
+        return "";
+    }
+
+    override bool SetExtra(string key, string val) {
+        if (key == "options") { this.SetItemsText(val); return true; }
+        return false;
+    }
+
     override List<string> Events() {
         List<string> e = Control.CommonEvents();
         e.Add("TabChanged");
@@ -163,21 +234,63 @@ class Tabs : Control {
     /// 此时出现溢出箭头）；垂直
     /// 轨道取固定列宽，每个标签占一行。
     override void OnMeasure(App app) {
+        hdrH = this.HeaderHeight(app);
+        trackW = app.Scale(160);
         if (orient == 1) {
-            prefW = app.Scale(160);
-            prefH = this.HeaderHeight(app) * (tabs.Count + 1);
+            prefW = trackW;
+            prefH = hdrH * (tabs.Count + 1);
             return;
         }
-        prefH = this.HeaderHeight(app);
+        prefH = hdrH;
         prefW = this.ContentWidth(app);
+    }
+
+    /// 页面区是表头（或侧栏）之外的那块：活动页铺满它，
+    /// 其余页隐藏（因此不测量、不绘制、不接事件）。没有
+    /// 设计页时退化为基类的停靠布局。
+    override void Arrange(int px, int py, int pw, int ph) {
+        int w = pw;
+        int h = ph;
+        if (w < 0) { w = 0; }
+        if (h < 0) { h = 0; }
+        bx = px;
+        by = py;
+        bw = w;
+        bh = h;
+        if (pages.Count == 0) { return; }
+        int cx = px;
+        int cy = py;
+        int cw = w;
+        int ch = h;
+        if (orient == 1) {
+            int tw = trackW;
+            if (tw > w) { tw = w; }
+            cx = px + tw;
+            cw = w - tw;
+        } else {
+            int th = hdrH;
+            if (th > h) { th = h; }
+            cy = py + th;
+            ch = h - th;
+        }
+        for (int i = 0; i < pages.Count; i = i + 1) {
+            Panel p = pages[i];
+            p.SetShown(i == active);
+            if (i == active) { p.Arrange(cx, cy, cw, ch); }
+        }
     }
 
     /// 标签条停靠在控件树中时，会绘制到自己的
     /// 布局边界内；显式的 Render/RenderVertical 入口保留
     /// 给自行定位头部的宿主。
     override void OnPaint(App app) {
-        if (orient == 1) { this.RenderVertical(app, bx, by, bw, bh); }
-        else { this.Render(app, bx, by, bw); }
+        int headW = bw;
+        // 有设计页时侧栏只占轨道宽，剩下的是页面区。
+        if (orient == 1 && pages.Count > 0 && trackW > 0 && trackW < bw) {
+            headW = trackW;
+        }
+        if (orient == 1) { this.RenderVertical(app, bx, by, headW, bh); }
+        else { this.Render(app, bx, by, headW); }
     }
 
     int TakeContext() {
