@@ -392,7 +392,223 @@ __attribute__((constructor)) static void zan__crash_ctor(void) {
 #endif
 
 #else /* !_WIN32 */
-static void zan__crash_install(void) {}
+/* POSIX counterpart: a fatal signal (SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGABRT)
+ * otherwise kills the process without a word, which is exactly the case that
+ * matters for a supervised worker -- the master only sees its control socket
+ * close. The handler writes one record to stderr (so a worker whose output is
+ * redirected to a log file leaves it there) and appends the same record to
+ * <exe_dir>/zan_crash.log, then re-raises with the default disposition so the
+ * wait status still reports the signal.
+ *
+ * Everything here is async-signal-safe: write(2) plus hand-rolled integer
+ * formatting, no malloc/stdio. The backtrace uses backtrace_symbols_fd, which
+ * writes with the raw fd for that reason (glibc only; musl has no execinfo). */
+#include <signal.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#if defined(__GLIBC__) || defined(__APPLE__)
+#include <execinfo.h>
+#define ZAN_CRASH_HAVE_BACKTRACE 1
+#endif
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
+static void zan__crash_wr(int fd, const char *s) {
+    size_t n = strlen(s);
+    while (n) {
+        ssize_t w = write(fd, s, n);
+        if (w <= 0) return;
+        s += (size_t)w;
+        n -= (size_t)w;
+    }
+}
+
+/* Decimal, into a caller-owned buffer (>= 24 bytes). */
+static const char *zan__crash_dec(unsigned long long v, char *buf) {
+    char *p = buf + 23;
+    *p = '\0';
+    do { *--p = (char)('0' + (v % 10)); v /= 10; } while (v);
+    return p;
+}
+
+static const char *zan__crash_hex(unsigned long long v, char *buf) {
+    static const char d[] = "0123456789abcdef";
+    char *p = buf + 23;
+    *p = '\0';
+    do { *--p = d[v & 0xF]; v >>= 4; } while (v);
+    *--p = 'x';
+    *--p = '0';
+    return p;
+}
+
+static const char *zan__crash_signame(int sig) {
+    switch (sig) {
+    case SIGSEGV: return "SIGSEGV";
+    case SIGBUS:  return "SIGBUS";
+    case SIGFPE:  return "SIGFPE";
+    case SIGILL:  return "SIGILL";
+    case SIGABRT: return "SIGABRT";
+    default:      return "signal";
+    }
+}
+
+/* Own program path, and the directory the dated crash log goes in: $ZAN_LOG_DIR
+ * when the process was started with one (the server master exports it for its
+ * workers, so a worker's crash file sits next to its worker{wid}-{date}.log),
+ * else <exe_dir>/logs. Both are resolved at install time -- reading /proc or
+ * the environment from inside a signal handler would be one more thing that
+ * can fault. */
+static char zan__crash_exe[4096];
+static char zan__crash_logdir[4096];
+/* $ZAN_WORKER_ID, so a record tells which worker of the pool died. */
+static char zan__crash_wid[32];
+
+static void zan__crash_resolve_paths(void) {
+    ssize_t n = -1;
+#if defined(__linux__)
+    n = readlink("/proc/self/exe", zan__crash_exe, sizeof(zan__crash_exe) - 1);
+#elif defined(__APPLE__)
+    uint32_t cap = (uint32_t)(sizeof(zan__crash_exe) - 1);
+    if (_NSGetExecutablePath(zan__crash_exe, &cap) == 0) {
+        n = (ssize_t)strlen(zan__crash_exe);
+    }
+#endif
+    if (n <= 0) {
+        memcpy(zan__crash_exe, "<unknown>", 10);
+        n = 0;
+    } else {
+        zan__crash_exe[n] = '\0';
+    }
+
+    const char *wid = getenv("ZAN_WORKER_ID");
+    if (wid && *wid && strlen(wid) < sizeof(zan__crash_wid)) {
+        memcpy(zan__crash_wid, wid, strlen(wid) + 1);
+    }
+
+    const char *env = getenv("ZAN_LOG_DIR");
+    if (env && *env && strlen(env) < sizeof(zan__crash_logdir)) {
+        memcpy(zan__crash_logdir, env, strlen(env) + 1);
+        return;
+    }
+    /* <exe_dir>/logs */
+    memcpy(zan__crash_logdir, "logs", 5);
+    if (n <= 0) return;
+    char *slash = strrchr(zan__crash_exe, '/');
+    if (!slash) return;
+    size_t dl = (size_t)(slash + 1 - zan__crash_exe);
+    if (dl + 5 >= sizeof(zan__crash_logdir)) return;
+    memcpy(zan__crash_logdir, zan__crash_exe, dl);
+    memcpy(zan__crash_logdir + dl, "logs", 5);
+}
+
+/* <logdir>/crash-{yyyy}{MM}{dd}.log -- the same one-file-per-day convention the
+ * worker output files follow, so a long-running service does not accumulate one
+ * unbounded crash log. */
+static void zan__crash_logpath_for(const struct tm *tmv, char *out, size_t cap) {
+    char day[16];
+    day[0] = '\0';
+    if (tmv) strftime(day, sizeof day, "%Y%m%d", tmv);
+    snprintf(out, cap, "%s/crash-%s.log", zan__crash_logdir,
+             day[0] ? day : "unknown");
+}
+
+static void zan__crash_record(int fd, int sig, void *addr, const char *stamp) {
+    char num[24];
+    zan__crash_wr(fd, "==== ZAN CRASH ");
+    zan__crash_wr(fd, stamp);
+    zan__crash_wr(fd, " ====\n");
+    zan__crash_wr(fd, "exe=");
+    zan__crash_wr(fd, zan__crash_exe);
+    zan__crash_wr(fd, " pid=");
+    zan__crash_wr(fd, zan__crash_dec((unsigned long long)getpid(), num));
+    if (zan__crash_wid[0]) {
+        zan__crash_wr(fd, " worker=");
+        zan__crash_wr(fd, zan__crash_wid);
+    }
+    zan__crash_wr(fd, "\nsignal=");
+    zan__crash_wr(fd, zan__crash_signame(sig));
+    zan__crash_wr(fd, "(");
+    zan__crash_wr(fd, zan__crash_dec((unsigned long long)sig, num));
+    zan__crash_wr(fd, ") addr=");
+    zan__crash_wr(fd, zan__crash_hex((unsigned long long)(size_t)addr, num));
+    zan__crash_wr(fd, "\n");
+#if defined(ZAN_CRASH_HAVE_BACKTRACE)
+    {
+        void *frames[64];
+        int n = backtrace(frames, 64);
+        zan__crash_wr(fd, "backtrace (");
+        zan__crash_wr(fd, zan__crash_dec((unsigned long long)n, num));
+        zan__crash_wr(fd, " frames):\n");
+        backtrace_symbols_fd(frames, n, fd);
+    }
+#else
+    zan__crash_wr(fd, "backtrace unavailable (no execinfo)\n");
+#endif
+    zan__crash_wr(fd, "\n");
+}
+
+static void zan__crash_handler(int sig, siginfo_t *info, void *ctx) {
+    (void)ctx;
+    void *addr = info ? info->si_addr : NULL;
+    time_t now = time(NULL);
+    struct tm tmv;
+    struct tm *lt = localtime_r(&now, &tmv);
+    char stamp[32];
+    stamp[0] = '\0';
+    if (lt) strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M:%S", lt);
+
+    /* stderr first: a supervised worker has it redirected to its dated output
+     * file, which is where the operator looks anyway. */
+    zan__crash_record(STDERR_FILENO, sig, addr, stamp);
+
+    char path[4096];
+    zan__crash_logpath_for(lt, path, sizeof path);
+    mkdir(zan__crash_logdir, 0755); /* best effort; already-exists is fine */
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        zan__crash_record(fd, sig, addr, stamp);
+        close(fd);
+    }
+    /* Die of the original signal so waitpid() reports WIFSIGNALED with it. */
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void zan__crash_install(void) {
+    static volatile int once = 0;
+    if (once) return;
+    once = 1;
+    zan__crash_resolve_paths();
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = zan__crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+    sigemptyset(&sa.sa_mask);
+    static const int sigs[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT };
+    for (unsigned i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+        struct sigaction cur;
+        /* Leave a disposition the program chose for itself alone. */
+        if (sigaction(sigs[i], NULL, &cur) == 0 && cur.sa_handler != SIG_DFL) {
+            continue;
+        }
+        sigaction(sigs[i], &sa, NULL);
+    }
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((constructor)) static void zan__crash_ctor(void) {
+    zan__crash_install();
+}
+#endif
 #endif
 
 #endif /* ZAN_RT_CRASH_H */
