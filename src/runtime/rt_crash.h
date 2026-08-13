@@ -463,7 +463,7 @@ static const char *zan__crash_signame(int sig) {
 
 /* Own program path, and the directory the dated crash log goes in: $ZAN_LOG_DIR
  * when the process was started with one (the server master exports it for its
- * workers, so a worker's crash file sits next to its worker{wid}-{date}.log),
+ * workers, so a worker's crash record lands in the pool's shared daily log),
  * else <exe_dir>/logs. Both are resolved at install time -- reading /proc or
  * the environment from inside a signal handler would be one more thing that
  * can fault. */
@@ -510,15 +510,26 @@ static void zan__crash_resolve_paths(void) {
     memcpy(zan__crash_logdir + dl, "logs", 5);
 }
 
-/* <logdir>/crash-{yyyy}{MM}{dd}.log -- the same one-file-per-day convention the
- * worker output files follow, so a long-running service does not accumulate one
- * unbounded crash log. */
-static void zan__crash_logpath_for(const struct tm *tmv, char *out, size_t cap) {
+/* <logdir>/{yyyy}{MM}/{dd}.log -- the very file the master and the workers log
+ * to, so the crash record sits right where the operator is already reading,
+ * between the request that triggered it and the master's respawn line. Returns
+ * 0 when the directory could not be made. */
+static int zan__crash_logpath_for(const struct tm *tmv, char *out, size_t cap) {
+    char month[16];
     char day[16];
+    month[0] = '\0';
     day[0] = '\0';
-    if (tmv) strftime(day, sizeof day, "%Y%m%d", tmv);
-    snprintf(out, cap, "%s/crash-%s.log", zan__crash_logdir,
-             day[0] ? day : "unknown");
+    if (tmv) {
+        strftime(month, sizeof month, "%Y%m", tmv);
+        strftime(day, sizeof day, "%d", tmv);
+    }
+    if (!month[0] || !day[0]) return 0;
+    char dir[4096];
+    if ((size_t)snprintf(dir, sizeof dir, "%s/%s", zan__crash_logdir, month)
+            >= sizeof dir) return 0;
+    mkdir(zan__crash_logdir, 0755); /* best effort; already-exists is fine */
+    mkdir(dir, 0755);
+    return (size_t)snprintf(out, cap, "%s/%s.log", dir, day) < cap;
 }
 
 static void zan__crash_record(int fd, int sig, void *addr, const char *stamp) {
@@ -571,12 +582,17 @@ static void zan__crash_handler(int sig, siginfo_t *info, void *ctx) {
     zan__crash_record(STDERR_FILENO, sig, addr, stamp);
 
     char path[4096];
-    zan__crash_logpath_for(lt, path, sizeof path);
-    mkdir(zan__crash_logdir, 0755); /* best effort; already-exists is fine */
-    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd >= 0) {
-        zan__crash_record(fd, sig, addr, stamp);
-        close(fd);
+    if (zan__crash_logpath_for(lt, path, sizeof path)) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            /* A supervised worker already has stderr pointing at this same
+             * file; writing the record a second time would only double it. */
+            struct stat a, b;
+            int same = fstat(STDERR_FILENO, &a) == 0 && fstat(fd, &b) == 0
+                       && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+            if (!same) zan__crash_record(fd, sig, addr, stamp);
+            close(fd);
+        }
     }
     /* Die of the original signal so waitpid() reports WIFSIGNALED with it. */
     signal(sig, SIG_DFL);

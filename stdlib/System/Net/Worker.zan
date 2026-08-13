@@ -153,10 +153,14 @@ class Worker {
     // on Windows, no controlling terminal after daemonize), so anything it
     // prints -- including the runtime's crash record for a fatal signal -- is
     // gone unless it lands in a file. Pass "" to SetLogDir to opt out.
+    //
+    // master and every worker append to the same file, one per day: a request is
+    // served by whichever process the kernel picked, so splitting per worker
+    // only means the line explaining a failure sits in a file nobody opens.
+    // Nothing holds the file open (Log writes are open-append-close, a worker's
+    // redirected stdout is just an appending descriptor), so sharing it is safe.
     static string logDir = "logs";
-    static string logPattern = "worker{wid}-{yyyy}{MM}{dd}.log";
-    // The master's own file, same one-per-day convention as the workers'.
-    static string masterLogPattern = "master-{yyyy}{MM}{dd}.log";
+    static string logPattern = "{yyyy}{MM}/{dd}.log";
 
     // ---- status/statistics (workerman-style `status`) ----
     // Requests/messages served by this process, across all Workers.
@@ -364,9 +368,10 @@ class Worker {
         statusInterval = seconds;
     }
 
-    /// <summary>Directory each worker process redirects its stdout/stderr into
-    /// (like Workerman's stdout_file); defaults to `logs`, created on first
-    /// spawn. The file name comes from <see cref="SetLogPattern"/>. Pass "" to
+    /// <summary>Directory the master and every worker log into -- their
+    /// stdout/stderr (like Workerman's stdout_file) plus the supervision
+    /// records -- all in one file per day; defaults to `logs`, created on
+    /// demand. The file name comes from <see cref="SetLogPattern"/>. Pass "" to
     /// discard worker output instead -- then a worker that dies of a fatal
     /// signal leaves no record anywhere, so only do that when the application
     /// already routes its own logging elsewhere.</summary>
@@ -379,30 +384,22 @@ class Worker {
         return logDir;
     }
 
-    /// <summary>File-name pattern for the per-worker output file, expanded by
-    /// <see cref="Log.Expand"/>: {yyyy} {MM} {dd} {HH} {pid} {wid}. The
-    /// default `worker{wid}-{yyyy}{MM}{dd}.log` starts a new file each day, so
-    /// a long-running service does not end up with one unbounded log that is
-    /// useless to search and impossible to rotate.</summary>
+    /// <summary>File-name pattern for that shared file, expanded by
+    /// <see cref="Log.Expand"/>: {yyyy} {MM} {dd} {HH} {pid} {wid}, and it may
+    /// contain directories (missing ones are created). The default
+    /// `{yyyy}{MM}/{dd}.log` gives `logs/202608/13.log`: a new file each day,
+    /// grouped by month, so a long-running service neither ends up with one
+    /// unbounded log nor with a directory of thousands of entries.</summary>
     static void SetLogPattern(string pattern) {
         if (pattern != "") { logPattern = pattern; }
     }
 
-    /// <summary>Where worker <paramref name="wid"/> writes its output, or ""
-    /// when no log directory is configured.</summary>
-    static string WorkerLogPath(int wid) {
+    /// <summary>The file master and workers write to right now, or "" when
+    /// logging to a file is disabled.</summary>
+    static string LogPath() {
         if (logDir == "") { return ""; }
         return logDir + Path.Separator()
-            + Log.ExpandFor(logPattern, DateTime.Now(), wid);
-    }
-
-    /// <summary>Where the master's own output goes in daemon mode, and the file
-    /// <see cref="Log"/> writes to when the application configured no other
-    /// destination. "" when worker logging is disabled.</summary>
-    static string MasterLogPath() {
-        if (logDir == "") { return ""; }
-        return logDir + Path.Separator()
-            + Log.ExpandFor(masterLogPattern, DateTime.Now(), 0);
+            + Log.ExpandFor(logPattern, DateTime.Now(), ProcessHost.WorkerId());
     }
 
     // Master side, before anything else happens: make sure supervision events
@@ -412,65 +409,15 @@ class Worker {
         if (logDir == "") { return; }
         EnsureLogDir();
         if (Log.IsEnabled()) { return; }
-        Log.Configure(logDir, masterLogPattern, Log.INFO);
+        Log.Configure(logDir, logPattern, Log.INFO);
     }
 
-    // Creates the worker output directory; called before every spawn because
-    // the release directory of a fresh deployment does not have it yet.
+    // Creates the directory the current log file lives in; called before every
+    // spawn because the release directory of a fresh deployment does not have
+    // it yet, and because a dated pattern needs a new one every month.
     static void EnsureLogDir() {
         if (logDir == "") { return; }
-        if (Directory.Exists(logDir)) { return; }
-        Directory.CreateDirectoryRecursive(logDir);
-    }
-
-    // Where the exit status of worker `wid` is recorded, so the master can say
-    // *how* a worker died instead of just that its control socket closed. On
-    // POSIX the spawning shell writes `$?` here after the worker returns; that
-    // is 128+N when a signal killed it (139 = SIGSEGV, 137 = SIGKILL/OOM).
-    static string WorkerExitPath(int wid) {
-        if (logDir == "") { return ""; }
-        return logDir + Path.Separator() + "worker" + Convert.ToString(wid)
-            + ".exit";
-    }
-
-    // Reads and consumes that record, as " code=1" / " signal=SIGSEGV(11)".
-    // Returns "" when nothing was written (no log dir, or the shell has not
-    // got round to it yet).
-    static string TakeExitStatus(int wid) {
-        string p = WorkerExitPath(wid);
-        if (p == "") { return ""; }
-        if (!File.Exists(p)) { return ""; }
-        string raw = File.ReadAllText(p).Trim();
-        File.Delete(p);
-        if (raw == "") { return ""; }
-        int status = Convert.ToInt32(raw);
-        if (status > 128) {
-            int sig = status - 128;
-            return " signal=" + SignalName(sig) + "("
-                + Convert.ToString(sig) + ")";
-        }
-        return " code=" + Convert.ToString(status);
-    }
-
-    // Discards the record without reporting it (a requested exit).
-    static void ClearExitStatus(int wid) {
-        string p = WorkerExitPath(wid);
-        if (p == "") { return; }
-        if (File.Exists(p)) { File.Delete(p); }
-    }
-
-    // The signals a server worker actually dies of; anything else is reported
-    // by number alone.
-    static string SignalName(int sig) {
-        if (sig == 4) { return "SIGILL"; }
-        if (sig == 6) { return "SIGABRT"; }
-        if (sig == 7) { return "SIGBUS"; }
-        if (sig == 8) { return "SIGFPE"; }
-        if (sig == 9) { return "SIGKILL"; }
-        if (sig == 11) { return "SIGSEGV"; }
-        if (sig == 13) { return "SIGPIPE"; }
-        if (sig == 15) { return "SIGTERM"; }
-        return "signal";
+        Log.EnsureDirFor(LogPath());
     }
 
     static int MaxCount() {
@@ -851,7 +798,7 @@ class Worker {
             // file the supervision lines (worker N exited signal=...) go to
             // /dev/null with the terminal, which is exactly why a restart loop
             // on a server leaves nothing behind to read.
-            if (ProcessHost.DaemonizeTo(MasterLogPath(), logDir)) {
+            if (ProcessHost.DaemonizeTo(LogPath(), logDir)) {
                 exit(0);
             }
         }
@@ -1077,11 +1024,7 @@ class Worker {
         string exe = ProcessHost.SelfExe();
         int ctl = ControlPort();
         EnsureLogDir();
-        string logPath = Worker.WorkerLogPath(wid);
-        // A record left by the previous life of this worker must not be read as
-        // the status of the one about to start.
-        string exitPath = Worker.WorkerExitPath(wid);
-        if (exitPath != "" && File.Exists(exitPath)) { File.Delete(exitPath); }
+        string logPath = Worker.LogPath();
         #if WINDOWS
         // Set the variables in our own environment so the child inherits them
         // via CreateProcess, then clear them so the master itself never looks
@@ -1115,23 +1058,14 @@ class Worker {
             + " ZAN_LOG_DIR=\"" + logDir + "\""
             + " \"" + exe + "\"";
         if (logPath != "") {
+            // Append only, and nothing after the command: the spawning shell
+            // execs the worker instead of waiting for it, so a worker costs one
+            // process, not a shell parked next to it for its whole life.
             cmd = cmd + " >> \"" + logPath + "\" 2>&1";
-        }
-        if (exitPath != "") {
-            // The spawning shell outlives the worker, so it -- not the master,
-            // which never waits on this process -- is what can report how the
-            // worker ended. $? is 128+N for a signal death, which is the only
-            // evidence that separates a crash (139/SIGSEGV) from an OOM kill
-            // (137/SIGKILL) from an orderly exit with a non-zero code.
-            cmd = "{ " + cmd + "; } ; printf '%s' \"$?\" > \""
-                + exitPath + "\"";
         }
         Process.RunDetached(cmd);
         #endif
-        if (logPath != "") {
-            Log.Info("[Worker] worker " + Convert.ToString(wid)
-                + " spawned; output -> " + logPath);
-        }
+        Log.Info("[Worker] worker " + Convert.ToString(wid) + " spawned");
     }
 
     // ---- master-side handoff channel registry (Windows) ----
@@ -1420,23 +1354,18 @@ class Worker {
         if (stopping) {
             Log.Info("[Worker] worker " + Convert.ToString(childWid)
                 + " (pid " + Convert.ToString(childPid) + ") stopped");
-            // Requested exits leave no status record behind; the next start of
-            // this worker id must not find one either way (SpawnChild deletes
-            // whatever survives the race with the writing shell).
-            await Task.Delay(300);
-            ClearExitStatus(childWid);
             return;
         }
         // Pace respawns so a worker that dies instantly on startup cannot
-        // drive a rapid spawn loop. Waiting first also gives the spawning
-        // shell time to record the exit status.
+        // drive a rapid spawn loop.
         await Task.Delay(1000);
-        string how = TakeExitStatus(childWid);
-        if (how == "") { how = " status=unknown"; }
-        string logRef = Worker.WorkerLogPath(childWid);
-        if (logRef != "") { logRef = " log=" + logRef; }
+        // The master is not the worker's parent (it is spawned detached), so
+        // there is no wait status to report here. What the worker died of is in
+        // this same file: the runtime's crash record for a fatal signal and
+        // anything it printed are redirected into it.
         Log.Error("[Worker] worker " + Convert.ToString(childWid) + " pid="
-            + Convert.ToString(childPid) + how + logRef + "; respawning");
+            + Convert.ToString(childPid)
+            + " exited; see the records above for its last output; respawning");
         SpawnChild(childWid);
     }
 
