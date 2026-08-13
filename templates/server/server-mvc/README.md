@@ -172,7 +172,7 @@ edit it and restart to change settings. Ship it next to the executable.
 ```json
 {
   "server":   { "host": "127.0.0.1", "port": 8080, "maxBodyMB": 2, "globalLimitPerSec": 0 },
-  "database": { "driver": "sqlite", "sqlitePath": "app.db",
+  "database": { "driver": "sqlite", "sqlitePath": "data/app.db",
                 "host": "127.0.0.1", "port": 3306, "name": "app", "user": "root", "password": "" },
   "worker":   { "count": 1, "daemon": false },
   "cache":    { "driver": "memory", "redisHost": "127.0.0.1", "redisPort": 6379 }
@@ -300,8 +300,9 @@ wwwroot/
 Of the DLLs, only the driver for the database in use is needed: `libsqlite3-0.dll`
 for SQLite, `libpq.dll` + `libssl-3-x64.dll` + `libcrypto-3-x64.dll` +
 `libiconv-2.dll` + `libintl-8.dll` for PostgreSQL (MySQL speaks its protocol
-without a client library). `app.db` is not copied — `Schema` creates the tables
-and the seed account on first start. Set the session key — `[auth].secret` in `config/app.json`, or the
+without a client library). `data/app.db` is not copied — the directory and the
+database are created on first start, and `Schema` fills in the tables and the
+seed account. Set the session key — `[auth].secret` in `config/app.json`, or the
 `ZAN_AUTH_SECRET` environment variable which overrides it — to 32+ characters,
 or sign-in fails with a configuration error.
 
@@ -314,12 +315,15 @@ git-ignored, but it does land in the working directory:
 |---|---|---|
 | `build/` | compiler output: `app.exe` + driver DLLs | no — delete freely |
 | `publish/<platform>/` | the IDE's Publish output | no |
-| `app.db` | SQLite database (`database.sqlitePath`) | it *is* your data in dev |
+| `data/` | SQLite database + metrics history (`database.sqlitePath`, `metrics.path`) | it *is* your data in dev |
 | `uploads/` | streamed upload target | runtime state |
 | `*.log`, `*.err` | whatever you redirected stdout/stderr to | no |
 
-Point `database.sqlitePath` at a directory of your own (e.g. `var/app.db`, created
-beforehand) if you would rather not have the database file in the project root.
+Point `database.sqlitePath` anywhere else (e.g. `var/app.db`) if `data/` does not
+suit you: the directory is created for you, but keep the path RELATIVE — an
+absolute `/data/app.db` is the root of the drive, where the file cannot be
+created, and the server then runs with no database at all (schema unapplied,
+every sign-in "wrong password").
 
 ## Endpoints
 
@@ -366,7 +370,7 @@ StaticFiles.Mount(app, "/static", "wwwroot");   // GET /static/css/app.css
 ```
 
 **`wwwroot/` is the whole public surface.** One mounted directory, nothing else:
-`src/`, `config/app.json`, `app.db` and every log sit outside it, so no path
+`src/`, `config/app.json`, `data/` and every log sit outside it, so no path
 trick reaches them even if a check were wrong — the files simply are not under
 the served root. A file becomes downloadable by being moved into `wwwroot/`,
 which makes "is this public?" a question about the directory rather than about
