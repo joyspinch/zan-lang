@@ -127,6 +127,11 @@ if (-not (Test-Path -LiteralPath $stub) -or
     # plus an explicit user32 (WinMain calls MessageBoxA). Try both, and treat
     # failure as a warning: the IDE already degrades to a loose-file publish
     # when the stub is absent (ZanIDE.CanPackSingle).
+    # A stale stub must go first: keeping it would make the "did the build
+    # produce one?" check below succeed on the OLD file, so the msvc-target
+    # fallback never ran and a published program kept launching a stub from
+    # before the fix (no ZAN_PKG_DIR, wrong working directory).
+    Remove-Item -LiteralPath $stub -Force -ErrorAction SilentlyContinue
     try { & clang -O2 -mwindows $stubSrc -o $stub 2>$null } catch { }
     if (-not (Test-Path -LiteralPath $stub)) {
         try {
