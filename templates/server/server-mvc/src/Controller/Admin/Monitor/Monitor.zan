@@ -1,6 +1,8 @@
 ﻿using System;
+using System.Diagnostics;
 using System.Json;
 using System.Text;
+using System.Threading;
 using System.Web;
 using ZanWeb;
 
@@ -42,6 +44,20 @@ class Monitor : AdminController {
         d.Set("worker", wl);
         d.Set("pid", Convert.ToString(m.Long("pid", 0)));
         d.Set("slow", Fmt.Dur(req.Long("slow_threshold_us", 0)));
+
+        // The day's four figures are rendered with the page, so the first
+        // paint already shows today's total instead of this worker's counter
+        // (which is 0 on a worker that has just been spawned). The page keeps
+        // them current from /admin/monitor/today.
+        long now = (long)WebApp.NowSeconds();
+        long from = (now / 86400) * 86400;
+        int _f = await MetricsStore.Flush();
+        MetricMinute day = await MetricsStore.WindowTotals(from, now, "", "");
+        d.Set("day", Fmt.Day(from));
+        d.Set("dayCalls", Convert.ToString(day.calls));
+        d.Set("dayErrors", Convert.ToString(day.errors));
+        d.Set("dayAvg", Fmt.Dur(Monitor.Avg(day.totalUs, day.calls)));
+        d.Set("dayMax", Fmt.Dur(day.maxUs));
         this.Page(d);
     }
 
@@ -76,6 +92,96 @@ class Monitor : AdminController {
                 }
             }
         }
+    }
+
+    /// How the day is bucketed on the live page: five minutes, so a whole day
+    /// is 288 points -- enough to see a spike, few enough to draw.
+    static long DayStep = 300;
+    /// How many interfaces each of the two day rankings shows.
+    static int DayRoutes = 20;
+
+    /// <summary>Today so far, read from the persisted minute rows rather than
+    /// from any process's counters.
+    ///
+    /// Why not the live snapshot: a worker's counters start at zero when it
+    /// starts, so a restarted (or newly spawned) worker makes the page's
+    /// totals, its ranking and its charts jump backwards -- the numbers "come
+    /// and go" without anything having happened to the traffic. The minute
+    /// table is written by every worker into one database, keyed by minute and
+    /// interface, so it accumulates across restarts and across the fleet: the
+    /// same request is counted once, whichever worker served it, and a chart
+    /// drawn from it grows through the day instead of being replaced by the
+    /// last two minutes of live samples.
+    ///
+    /// This worker's own unflushed buckets are flushed first, so the current
+    /// minute is included. Another worker's are not: its last flush is at most
+    /// [metrics].flushSeconds old, which is what `as_of` reports.</summary>
+    static async string TodayJson() {
+        long now = (long)WebApp.NowSeconds();
+        long from = (now / 86400) * 86400;
+        int _w = await MetricsStore.Flush();
+        MetricMinute tot = await MetricsStore.WindowTotals(from, now, "", "");
+        List<MetricMinute> rows = await MetricsStore.HistoryBuckets(from, now,
+            "", "", Monitor.DayStep, Monitor.MaxRows);
+        rows = Monitor.FillGaps(rows, from, now, Monitor.DayStep);
+
+        // Oldest first: the chart's x axis runs forwards.
+        JsonValue pts = JsonValue.NewArray();
+        for (int i = rows.Count - 1; i >= 0; i = i - 1) {
+            MetricMinute b = rows[i];
+            JsonValue p = JsonValue.NewObject();
+            p.Put("t", MetricsCluster.Num(b.minute));
+            p.Put("calls", MetricsCluster.Num(b.calls));
+            p.Put("errors", MetricsCluster.Num(b.errors));
+            p.Put("avg_us", MetricsCluster.Num(Monitor.Avg(b.totalUs, b.calls)));
+            p.Put("max_us", MetricsCluster.Num(b.maxUs));
+            pts.Append(p);
+        }
+
+        JsonValue o = JsonValue.NewObject();
+        o.Put("day", JsonValue.NewStr(Fmt.Day(from)));
+        o.Put("from", MetricsCluster.Num(from));
+        o.Put("as_of", MetricsCluster.Num(now));
+        o.Put("step", MetricsCluster.Num(Monitor.DayStep));
+        o.Put("calls", MetricsCluster.Num(tot.calls));
+        o.Put("errors", MetricsCluster.Num(tot.errors));
+        o.Put("avg_us", MetricsCluster.Num(Monitor.Avg(tot.totalUs, tot.calls)));
+        o.Put("max_us", MetricsCluster.Num(tot.maxUs));
+        o.Put("total_us", MetricsCluster.Num(tot.totalUs));
+        o.Put("frames", MetricsCluster.Num(tot.frames));
+        o.Put("bytes", MetricsCluster.Num(tot.bytes));
+        o.Put("points", pts);
+        o.Put("top_calls", await Monitor.DayTop(from, now, "calls"));
+        o.Put("top_time", await Monitor.DayTop(from, now, "time"));
+        return o.ToJson();
+    }
+
+    /// <summary>Today's interfaces ranked by `rank`: "calls" (how often) or
+    /// "time" (how much of the server's day the interface consumed).</summary>
+    static async JsonValue DayTop(long from, long to, string rank) {
+        List<MetricMinute> tops = await MetricsStore.RouteTotalsBy(from, to,
+            "", "", Monitor.DayRoutes, rank);
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < tops.Count; i = i + 1) {
+            MetricMinute b = tops[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("req", JsonValue.NewStr(b.method + " " + b.path));
+            o.Put("calls", MetricsCluster.Num(b.calls));
+            o.Put("errors", MetricsCluster.Num(b.errors));
+            o.Put("avg_us", MetricsCluster.Num(Monitor.Avg(b.totalUs, b.calls)));
+            o.Put("max_us", MetricsCluster.Num(b.maxUs));
+            o.Put("total_us", MetricsCluster.Num(b.totalUs));
+            arr.Append(o);
+        }
+        return arr;
+    }
+
+    /// <summary>Today's cumulative figures as one request, for tooling and for
+    /// the page's first paint.</summary>
+    [HttpGet]
+    [Description("当天累计指标")]
+    async void Today() {
+        this.Json(await Monitor.TodayJson());
     }
 
     /// <summary>The same snapshot as one request, for tooling that is not a
@@ -126,8 +232,14 @@ class Monitor : AdminController {
         int _w = await MetricsStore.Flush();
         List<MetricMinute> rows = await MetricsStore.HistoryBuckets(from, to,
             method, route, step, Monitor.MaxRows);
-        List<MetricMinute> tops = await MetricsStore.RouteTotals(from, to,
-            method, route, Monitor.MaxRoutes);
+        // Two orders, because they answer different questions: which
+        // interface was called most, and which one the server spent the
+        // window inside. The parameter picks between them by name; it never
+        // reaches the statement.
+        string by = "calls";
+        if (this.In("by") == "time") { by = "time"; }
+        List<MetricMinute> tops = await MetricsStore.RouteTotalsBy(from, to,
+            method, route, Monitor.MaxRoutes, by);
         // A dated window shows every bucket it contains, including the ones
         // with no traffic: "03:00 had nothing" is a fact about the day, and a
         // table that silently skips those hours cannot be read as a timeline.
@@ -172,11 +284,14 @@ class Monitor : AdminController {
             r.Set("errRate", Monitor.Rate(b.errors, b.calls));
             r.Set("avg", Fmt.Dur(Monitor.Avg(b.totalUs, b.calls)));
             r.Set("max", Fmt.Dur(b.maxUs));
+            r.Set("total", Fmt.Dur(b.totalUs));
             r.Set("frames", Convert.ToString(b.frames));
             r.Set("bytes", Fmt.Bytes(b.bytes));
             routes.Add(r);
         }
 
+        d.Set("by", by);
+        d.Set("by_" + by, "1");
         d.Set("hours", Convert.ToString(w.hours));
         d.Set("m", method);
         d.Set("route", route);
@@ -313,6 +428,60 @@ class Monitor : AdminController {
         d.Set("hours", Convert.ToString(hours));
         d.Set("shown", Convert.ToString(rows.Count));
         if (rows.Count == 0) { d.Set("empty", "1"); }
+        this.Page(d);
+    }
+
+    /// <summary>The shared memory this process has mapped, read-only: one row
+    /// per table with what it holds and what it costs. A table's mapping is
+    /// reserved address space -- rows are addressable without being paid for --
+    /// so the size it was created with and the part of it that is actually
+    /// resident are two columns, never one. The numbers are per process: this
+    /// page is answered by the worker that served the request, and the same
+    /// table is mapped by every other worker at its own residency.</summary>
+    [HttpGet]
+    [Route("/admin/monitor/tables")]
+    [Custom(IsMenu = true, Icon = "mdi:memory")]
+    [Description("共享内存表")]
+    async void Tables() {
+        ViewData d = await this.Layout("共享内存表");
+        List<StrMap> items = d.AddList("rows");
+        long reserved = 0;
+        long resident = 0;
+        bool partial = false;
+        int n = SharedTable.OpenCount();
+        for (int i = 0; i < n; i = i + 1) {
+            long res = SharedTable.OpenStat(i, SharedTable.STAT_RESERVED);
+            long live = SharedTable.OpenStat(i, SharedTable.STAT_RESIDENT);
+            long cap = SharedTable.OpenStat(i, SharedTable.STAT_CAPACITY);
+            long used = SharedTable.OpenStat(i, SharedTable.STAT_COUNT);
+            StrMap r = new StrMap();
+            r.Set("name", SharedTable.OpenLabel(i));
+            r.Set("used", Convert.ToString(used));
+            r.Set("capacity", Convert.ToString(cap));
+            r.Set("fill", Monitor.Rate(used, cap));
+            r.Set("stride", Convert.ToString(
+                SharedTable.OpenStat(i, SharedTable.STAT_ROW_STRIDE)));
+            r.Set("keySize", Convert.ToString(
+                SharedTable.OpenStat(i, SharedTable.STAT_KEY_SIZE)));
+            r.Set("columns", Convert.ToString(
+                SharedTable.OpenStat(i, SharedTable.STAT_COLUMNS)));
+            r.Set("reserved", Fmt.Bytes(res));
+            r.Set("resident", Fmt.Bytes(live));
+            items.Add(r);
+            reserved = reserved + res;
+            // A platform that cannot report residency reports -1, and one
+            // unknown row makes the total an underestimate rather than a lie.
+            if (live < 0) { partial = true; } else { resident = resident + live; }
+        }
+        d.Set("count", Convert.ToString(n));
+        d.Set("reserved", Fmt.Bytes(reserved));
+        d.Set("resident", Fmt.Bytes(resident));
+        if (partial) { d.Set("partial", "1"); }
+        d.Set("pid", Convert.ToString(ProcessHost.Pid()));
+        int wid = ProcessHost.WorkerId();
+        if (wid <= 0) { d.Set("role", "主进程 / 单进程"); }
+        else { d.Set("role", "worker " + Convert.ToString(wid)); }
+        if (n == 0) { d.Set("empty", "1"); }
         this.Page(d);
     }
 

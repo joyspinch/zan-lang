@@ -1100,7 +1100,12 @@ static int zan_table_layout_of(
 static void zan_table_init_header(
     zan_shared_table *table, const zan_table_layout *layout) {
     table->mapped_size = layout->total_size;
-    memset(table->header, 0, layout->total_size);
+    /* Only the header is zeroed. The rows and the index behind it are already
+     * zero -- the mapping is freshly created, page-file backed (Windows) or a
+     * newly created, ftruncate'd file (POSIX), and both hand out zero pages --
+     * and writing them here would fault in the whole mapping, making a table's
+     * reserved size its resident size in every process that maps it. */
+    memset(table->header, 0, sizeof(zan_shared_header));
     table->header->magic = ZAN_TABLE_MAGIC;
     table->header->version = ZAN_TABLE_VERSION;
     table->header->total_size = layout->total_size;
@@ -1458,6 +1463,124 @@ int32_t zan_shared_table_destroy(int64_t handle) {
 #endif
     zan_shared_table_free(table);
     return result;
+}
+
+#ifdef _WIN32
+typedef struct {
+    void *VirtualAddress;
+    ULONG_PTR VirtualAttributes;
+} zan_ws_ex_info;
+
+typedef BOOL(WINAPI *zan_query_ws_ex_fn)(HANDLE, zan_ws_ex_info *, DWORD);
+#endif
+
+/* How much of the mapping this process is actually paying for. A table reserves
+ * its whole capacity up front, but a page only becomes resident when a row on
+ * it is touched, so the reserved size says nothing about memory in use. */
+static int64_t zan_table_resident_bytes(const zan_shared_table *table) {
+    if (!table->header || !table->mapped_size) return 0;
+#ifdef _WIN32
+    static zan_query_ws_ex_fn query_ws_ex = NULL;
+    static int query_ws_ex_resolved = 0;
+    if (!query_ws_ex_resolved) {
+        HMODULE kernel = GetModuleHandleA("kernel32.dll");
+        if (kernel) {
+            query_ws_ex = (zan_query_ws_ex_fn)(void *)GetProcAddress(
+                kernel, "K32QueryWorkingSetEx");
+        }
+        query_ws_ex_resolved = 1;
+    }
+    if (!query_ws_ex) return -1;
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    size_t page_size = info.dwPageSize ? (size_t)info.dwPageSize : 4096u;
+    size_t pages = (table->mapped_size + page_size - 1) / page_size;
+    enum { ZAN_WS_BATCH = 4096 };
+    zan_ws_ex_info *batch = (zan_ws_ex_info *)calloc(
+        ZAN_WS_BATCH, sizeof(zan_ws_ex_info));
+    if (!batch) return -1;
+    HANDLE self = GetCurrentProcess();
+    unsigned char *base = (unsigned char *)table->header;
+    int64_t resident = 0;
+    for (size_t first = 0; first < pages; first += ZAN_WS_BATCH) {
+        size_t n = pages - first;
+        if (n > ZAN_WS_BATCH) n = ZAN_WS_BATCH;
+        for (size_t i = 0; i < n; i++) {
+            batch[i].VirtualAddress = base + (first + i) * page_size;
+            batch[i].VirtualAttributes = 0;
+        }
+        if (!query_ws_ex(
+                self, batch, (DWORD)(n * sizeof(zan_ws_ex_info)))) {
+            free(batch);
+            return -1;
+        }
+        for (size_t i = 0; i < n; i++) {
+            if (batch[i].VirtualAttributes & 1u) resident += (int64_t)page_size;
+        }
+    }
+    free(batch);
+    if (resident > (int64_t)table->mapped_size) {
+        resident = (int64_t)table->mapped_size;
+    }
+    return resident;
+#else
+    long page_conf = sysconf(_SC_PAGESIZE);
+    size_t page_size = page_conf > 0 ? (size_t)page_conf : 4096u;
+    enum { ZAN_MINCORE_BATCH = 16384 };  /* pages per call: 16 KB of vector */
+    unsigned char *vec = (unsigned char *)malloc(ZAN_MINCORE_BATCH);
+    if (!vec) return -1;
+    unsigned char *base = (unsigned char *)table->header;
+    size_t pages = (table->mapped_size + page_size - 1) / page_size;
+    int64_t resident = 0;
+    for (size_t first = 0; first < pages; first += ZAN_MINCORE_BATCH) {
+        size_t n = pages - first;
+        if (n > ZAN_MINCORE_BATCH) n = ZAN_MINCORE_BATCH;
+        size_t offset = first * page_size;
+        size_t length = n * page_size;
+        if (offset + length > table->mapped_size) {
+            length = table->mapped_size - offset;
+        }
+#if defined(__APPLE__)
+        if (mincore((void *)(base + offset), length, (char *)vec) != 0) {
+#else
+        if (mincore((void *)(base + offset), length, vec) != 0) {
+#endif
+            free(vec);
+            return -1;
+        }
+        for (size_t i = 0; i < n; i++) {
+            if (vec[i] & 1u) resident += (int64_t)page_size;
+        }
+    }
+    free(vec);
+    if (resident > (int64_t)table->mapped_size) {
+        resident = (int64_t)table->mapped_size;
+    }
+    return resident;
+#endif
+}
+
+int64_t zan_shared_table_stat(int64_t handle, int32_t what) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (!table || !table->header) return 0;
+    switch (what) {
+        case ZAN_TABLE_STAT_RESERVED:
+            return (int64_t)table->mapped_size;
+        case ZAN_TABLE_STAT_RESIDENT:
+            return zan_table_resident_bytes(table);
+        case ZAN_TABLE_STAT_CAPACITY:
+            return (int64_t)table->header->capacity;
+        case ZAN_TABLE_STAT_COUNT:
+            return (int64_t)table->header->count;
+        case ZAN_TABLE_STAT_ROW_STRIDE:
+            return (int64_t)table->header->row_stride;
+        case ZAN_TABLE_STAT_KEY_SIZE:
+            return (int64_t)table->header->key_size;
+        case ZAN_TABLE_STAT_COLUMNS:
+            return (int64_t)table->header->column_count;
+        default:
+            return 0;
+    }
 }
 
 int32_t zan_shared_table_set_int(

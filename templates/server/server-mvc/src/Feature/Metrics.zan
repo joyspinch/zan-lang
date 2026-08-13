@@ -382,20 +382,35 @@ class MetricsStore {
     static async List<MetricMinute> RouteTotals(long from, long to,
                                                 string method, string path,
                                                 int limit) {
+        return await MetricsStore.RouteTotalsBy(from, to, method, path, limit,
+            "calls");
+    }
+
+    /// <summary>The same per-interface totals ranked by something else:
+    /// "calls" (how often) or "time" (how much of the server's time the
+    /// interface consumed). The two answer different questions -- an endpoint
+    /// called twice a day can still be the one the server spends its
+    /// afternoon in -- and the ordering is chosen here rather than taken from
+    /// the caller's string, which never reaches the statement.</summary>
+    static async List<MetricMinute> RouteTotalsBy(long from, long to,
+                                                  string method, string path,
+                                                  int limit, string rank) {
         List<MetricMinute> outp = new List<MetricMinute>();
         if (!MetricsStore.ready) { return outp; }
         IDbConnection db = await MetricsStore.Lease();
         if (db == null) { return outp; }
         try {
             string sql = "SELECT method, path, SUM(calls) AS c, SUM(errors), "
-                + "SUM(total_us), MAX(max_us), SUM(frames), SUM(bytes) "
+                + "SUM(total_us) AS t, MAX(max_us), SUM(frames), SUM(bytes) "
                 + "FROM metrics_minute WHERE minute >= "
                 + Convert.ToString(from) + " AND minute <= "
                 + Convert.ToString(to);
             DbParams p = new DbParams();
             sql = sql + MetricsStore.Filter(method, path, p);
-            sql = sql + " GROUP BY method, path ORDER BY c DESC LIMIT "
-                + Convert.ToString(limit);
+            string order = "c";
+            if (rank == "time") { order = "t"; }
+            sql = sql + " GROUP BY method, path ORDER BY " + order
+                + " DESC LIMIT " + Convert.ToString(limit);
             DbResult r = await db.QueryAsync(sql, p);
             for (int i = 0; i < r.RowCount(); i = i + 1) {
                 MetricMinute b = new MetricMinute();
@@ -460,6 +475,46 @@ class MetricsStore {
             MetricsStore.Give(db);
         }
         return outp;
+    }
+
+    /// <summary>One row: everything the window holds, added up. This is what a
+    /// cumulative figure ("today so far") is read from -- the persisted minute
+    /// rows, which survive a worker restart and keep counting across the whole
+    /// day, unlike a process counter that starts again from zero. `calls` is 0
+    /// when the window is empty; the row is never null.</summary>
+    static async MetricMinute WindowTotals(long from, long to, string method,
+                                           string path) {
+        MetricMinute b = new MetricMinute();
+        b.minute = from;
+        b.method = method;
+        b.path = path;
+        if (!MetricsStore.ready) { return b; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return b; }
+        try {
+            // COALESCE, because SUM over no rows is NULL, and an empty window
+            // has to read as a zero rather than as a parse of "".
+            string sql = "SELECT COALESCE(SUM(calls),0), "
+                + "COALESCE(SUM(errors),0), COALESCE(SUM(total_us),0), "
+                + "COALESCE(MAX(max_us),0), COALESCE(SUM(frames),0), "
+                + "COALESCE(SUM(bytes),0) "
+                + "FROM metrics_minute WHERE minute >= "
+                + Convert.ToString(from) + " AND minute <= "
+                + Convert.ToString(to);
+            DbParams p = new DbParams();
+            sql = sql + MetricsStore.Filter(method, path, p);
+            DbResult r = await db.QueryAsync(sql, p);
+            if (r.RowCount() == 0) { return b; }
+            b.calls = Convert.ToInt64(r.GetString(0, 0));
+            b.errors = Convert.ToInt64(r.GetString(0, 1));
+            b.totalUs = Convert.ToInt64(r.GetString(0, 2));
+            b.maxUs = Convert.ToInt64(r.GetString(0, 3));
+            b.frames = Convert.ToInt64(r.GetString(0, 4));
+            b.bytes = Convert.ToInt64(r.GetString(0, 5));
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return b;
     }
 
     /// <summary>Persisted errors, newest first.</summary>

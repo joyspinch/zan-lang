@@ -763,15 +763,28 @@ class Worker {
 
         int procs = MaxCount();
         if (procs <= 1) {
+            // Bind BEFORE the banner, like the master does: a port that is
+            // already taken used to be announced as "Start success." and only
+            // then reported as a fatal bind failure two lines below.
+            List<nint> socks = new List<nint>();
+            for (int i = 0; i < workers.Count; i = i + 1) {
+                nint s = workers[i].BindSocket(false);
+                if (s < 0) {
+                    Console.WriteLine(BindFailure(workers[i]));
+                    exit(1);
+                }
+                socks.Add(s);
+            }
             StatsCreate(1);
             Task.Spawn(StatsPublishLoop());
             PrintBanner(1);
+            PrintSharedTables();
             // stop/status/reload have to reach a single-process server too, so
             // it listens on the control port just like a master does. Only
             // under RunCommand: a program that just calls RunAll gets exactly
             // the behaviour it had before, with no extra port bound.
             if (cliMode) { Task.Spawn(SingleProcessControlLoop()); }
-            await RunAllLoopsInProcess(true);
+            await RunAllLoopsOnSockets(socks);
             return;
         }
 
@@ -831,6 +844,7 @@ class Worker {
 
     static SharedTable StatsTable(int procs) {
         SharedTable t = new SharedTable("", procs + 8);
+        t.Label("worker stats");
         t.KeySize(16);
         t.ColumnInt("pid");
         t.ColumnInt("recv");
@@ -889,7 +903,10 @@ class Worker {
         string env = ProcessHost.Env("ZAN_STATS_HANDLE");
         if (env == "") { return; }
         SharedTable t = SharedTable.Attach(Convert.ToInt64(env));
-        if (t.IsOpen()) { statTable = t; }
+        if (t.IsOpen()) {
+            t.Label("worker stats");
+            statTable = t;
+        }
     }
 
     /// Publishes this process's counters into its row.
@@ -1020,6 +1037,35 @@ class Worker {
     // failure path closes the socket before the caller can read it.
     static string lastBindErr;
 
+    // The listen address is the one thing a user can act on, and the platform
+    // error number alone ((errno 48) on macOS, 98 on Linux, WSA 10048) says
+    // nothing about what to do, so name the condition and the two fixes.
+    static string BindFailure(Worker w) {
+        string at = w.protocol + "://" + w.host + ":" + Convert.ToString(w.port);
+        string s = "[Worker] FATAL: cannot bind " + at + " ("
+            + Worker.lastBindErr + ")";
+        if (Worker.lastBindErrInUse) {
+            s = s + "; the address is already in use -- another program (or a"
+                + " previous run of this one that is still alive) is listening"
+                + " on it. Stop it, or give this server a free port.";
+        }
+        return s;
+    }
+
+    // Whether that failure was "address already in use": EADDRINUSE is 48 on
+    // macOS/BSD, 98 on Linux and WSAEADDRINUSE 10048 on Windows.
+    static bool lastBindErrInUse;
+
+    static bool IsAddrInUse(int err) {
+        #if WINDOWS
+        return err == 10048;
+        #elif MACOS
+        return err == 48;
+        #else
+        return err == 98;
+        #endif
+    }
+
     /// True when a live Zan master answers PING on the control port.
     ///
     /// Accepting the connection is not enough: a listening socket outlives the
@@ -1087,9 +1133,7 @@ class Worker {
             Worker w = workers[i];
             nint s = w.BindSocket(false);
             if (s < 0) {
-                Console.WriteLine("[Worker] FATAL: cannot bind " + w.protocol
-                    + "://" + w.host + ":" + Convert.ToString(w.port)
-                    + " (" + Worker.lastBindErr + ")");
+                Console.WriteLine(BindFailure(w));
                 exit(1);
             }
             if (w.protocol == "udp") {
@@ -1104,6 +1148,12 @@ class Worker {
         // The stats table must exist before the first worker starts, so a
         // worker's Open always finds it.
         StatsCreate(procs);
+        // The master serves no request but is a process like any other: it has
+        // a pid, burns CPU supervising and holds memory, so it publishes its
+        // own row (worker id 0) instead of being missing from the table.
+        StatsPublish();
+        Task.Spawn(StatsPublishLoop());
+        PrintSharedTables();
 
         int wid = 1;
         while (wid <= procs) {
@@ -1378,8 +1428,13 @@ class Worker {
             // Single process: publish first so the row is this second's truth.
             StatsPublish();
             sb.Append(StatusRow("self", 0));
+            sb.Append(SharedTablesText());
             return sb.ToString();
         }
+        // Row 0 is the master's own: it answers this query, so publishing here
+        // makes its counters as current as the workers' last report.
+        StatsPublish();
+        sb.Append(StatusRow("master", 0));
         long totRecv = 0;
         long totSent = 0;
         long totConns = 0;
@@ -1396,7 +1451,24 @@ class Worker {
         sb.Append("total   received: " + Convert.ToString(totRecv)
             + "   sent: " + Convert.ToString(totSent)
             + "   clients: " + Convert.ToString(totConns) + "\n");
+        sb.Append(SharedTablesText());
         return sb.ToString();
+    }
+
+    // What this process is holding in shared memory. Reserved is the whole
+    // mapping a table sets aside for its capacity; "in memory" is the part of
+    // it that is actually resident -- the number that belongs in a memory
+    // report, and usually a small fraction of the first.
+    static string SharedTablesText() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(Rule("SHARED TABLES"));
+        sb.Append("\n");
+        sb.Append(SharedTable.StatusText());
+        return sb.ToString();
+    }
+
+    static void PrintSharedTables() {
+        Console.Write(SharedTablesText());
     }
 
     // One process row of the status table, read from the shared stats table.
@@ -1638,6 +1710,9 @@ class Worker {
             if (dWall <= 0) { continue; }
             StringBuilder sb = new StringBuilder();
             sb.Append("[status]");
+            sb.Append(" master pid=" + Convert.ToString(ProcessHost.Pid())
+                + " mem=" + Convert.ToString(StatsRead(0, "rss") / 1048576)
+                + "MB");
             long totQps = 0;
             int procs = MaxCount();
             while (stPrevReq.Count <= procs) {
@@ -1729,15 +1804,18 @@ class Worker {
     // ======================================================================
 
     /// <summary>Runs all registered workers concurrently on this process's
-    /// scheduler. Every worker but the last is spawned as its own coroutine;
-    /// the last is awaited so this call drives the scheduler forever.</summary>
-    static async void RunAllLoopsInProcess(bool bindOwn) {
-        int n = workers.Count;
+    /// scheduler, on sockets the caller has already bound (one per registered
+    /// worker, in order) -- binding first is what lets a bind failure be
+    /// reported before anything is printed about the server having started.
+    /// Every worker but the last is spawned as its own coroutine; the last is
+    /// awaited so this call drives the scheduler forever.</summary>
+    static async void RunAllLoopsOnSockets(List<nint> socks) {
+        int n = socks.Count;
         for (int j = 0; j < n - 1; j = j + 1) {
-            Task.Spawn(workers[j].RunOwnSocket());
+            Task.Spawn(workers[j].RunOnSocket(socks[j]));
         }
         if (n > 0) {
-            await workers[n - 1].RunOwnSocket();
+            await workers[n - 1].RunOnSocket(socks[n - 1]);
         }
     }
 
@@ -1752,6 +1830,7 @@ class Worker {
             if (reusePort) { Socket.SetReusePort(u); }
             int r = Socket.Bind(u, this.host, this.port);
             if (r != 0) {
+                Worker.lastBindErrInUse = IsAddrInUse(Socket.LastSocketError());
                 Worker.lastBindErr = SocketErr();
                 Socket.Close(u);
                 return -1;
@@ -1764,6 +1843,7 @@ class Worker {
         if (reusePort) { Socket.SetReusePort(s); }
         int r2 = Socket.Bind(s, this.host, this.port);
         if (r2 != 0) {
+            Worker.lastBindErrInUse = IsAddrInUse(Socket.LastSocketError());
             Worker.lastBindErr = SocketErr();
             Socket.Close(s);
             return -1;
@@ -1771,17 +1851,6 @@ class Worker {
         Socket.Listen(s, 511);
         Socket.SetNonBlocking(s);
         return s;
-    }
-
-    async void RunOwnSocket() {
-        nint s = this.BindSocket(false);
-        if (s < 0) {
-            Console.WriteLine("[Worker] FATAL: cannot bind " + this.protocol
-                + "://" + this.host + ":" + Convert.ToString(this.port)
-                + " (" + Worker.lastBindErr + ")");
-            return;
-        }
-        await this.RunOnSocket(s);
     }
 
     /// <summary>Serves this worker's protocol on an already-bound socket.</summary>

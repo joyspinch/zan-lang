@@ -34,6 +34,12 @@
 #define _WIN32_WINNT 0x0601   /* Windows 7+: FlsAlloc and its thread-exit callback */
 #endif
 
+/* MAP_ANONYMOUS is an extension: a strict -std=c11 glibc build hides it
+ * unless the default feature set is requested explicitly. */
+#if (defined(__linux__) || defined(__unix__)) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE 1
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -45,6 +51,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #define ZAN_MEM_HAVE_MMAP 1
+#if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
+#define MAP_ANONYMOUS MAP_ANON
+#endif
 #endif
 #if defined(_WIN32)
 #include <windows.h>

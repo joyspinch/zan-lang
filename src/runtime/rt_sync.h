@@ -108,6 +108,21 @@ int32_t zan_shared_table_exists(int64_t handle, const char *key);
 int64_t zan_shared_table_count(int64_t handle);
 void zan_shared_table_clear(int64_t handle);
 
+/* One number about the mapping itself, selected by `what`:
+ *   0 reserved bytes (the whole mapping: rows are addressable, not paid for)
+ *   1 resident bytes (the pages of it this process actually has in memory)
+ *   2 capacity (rows)   3 used rows        4 row stride
+ *   5 key size          6 column count
+ * -1 means "not available on this platform". */
+#define ZAN_TABLE_STAT_RESERVED 0
+#define ZAN_TABLE_STAT_RESIDENT 1
+#define ZAN_TABLE_STAT_CAPACITY 2
+#define ZAN_TABLE_STAT_COUNT 3
+#define ZAN_TABLE_STAT_ROW_STRIDE 4
+#define ZAN_TABLE_STAT_KEY_SIZE 5
+#define ZAN_TABLE_STAT_COLUMNS 6
+int64_t zan_shared_table_stat(int64_t handle, int32_t what);
+
 /* Hash-keyed variants of the shared-table operations. The stdlib precomputes
  * zan_shared_table_hash() on the hot path so lookups skip the string scan;
  * the keyed API above is the same operations keyed by name. */

@@ -51,6 +51,7 @@ partial class ZanIDE {
         if (ident == "") { ident = "com.zanlang." + ZanIDE.BundleIdSafe(baseName); }
         bool icon = ZanIDE.WriteIcns(ZanIDE.IconFile(root),
                                      app + "/Contents/Resources/app.icns");
+        if (!windowed) { ZanIDE.WriteMacLauncher(app, baseName); }
         File.WriteAllText(app + "/Contents/Info.plist",
             ZanIDE.InfoPlist(baseName, ident, ver, icon, windowed));
         // A bundle without PkgInfo still launches, but Finder reads the type
@@ -85,15 +86,39 @@ partial class ZanIDE {
         return outp;
     }
 
+    /// The name of the bundle executable of a console publish: not the program
+    /// itself but the script below, which is what CFBundleExecutable points at.
+    static string MacLauncherName = "launch";
+
+    /// A console program IS the bundle executable today, and Finder answers a
+    /// double click on it with "the application is not responding": the process
+    /// never connects to the window server, and with LSBackgroundOnly set it is
+    /// not launchable from Finder at all. So the bundle executable of a console
+    /// publish is this two-line script, which hands the real program to
+    /// Terminal -- a double click opens the server in a terminal window, and
+    /// running the binary directly from a shell still works unchanged.
+    static void WriteMacLauncher(string app, string baseName) {
+        string p = app + "/Contents/MacOS/" + ZanIDE.MacLauncherName;
+        File.WriteAllText(p,
+            "#!/bin/sh\n"
+            + "dir=$(cd \"$(dirname \"$0\")\" && pwd)\n"
+            + "exec /usr/bin/open -a Terminal \"$dir/" + baseName + "\"\n");
+        // Only has an effect when the publish itself runs on macOS/Linux; a
+        // publish from Windows carries the mode in the tar entry instead.
+        bool _x = File.SetExecutable(p, true);
+    }
+
     static string InfoPlist(string baseName, string ident, string ver,
                             bool icon, bool windowed) {
+        string exe = baseName;
+        if (!windowed) { exe = ZanIDE.MacLauncherName; }
         string s = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
             + "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\""
             + " \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
             + "<plist version=\"1.0\">\n<dict>\n"
             + "\t<key>CFBundleName</key>\n\t<string>" + baseName + "</string>\n"
             + "\t<key>CFBundleDisplayName</key>\n\t<string>" + baseName + "</string>\n"
-            + "\t<key>CFBundleExecutable</key>\n\t<string>" + baseName + "</string>\n"
+            + "\t<key>CFBundleExecutable</key>\n\t<string>" + exe + "</string>\n"
             + "\t<key>CFBundleIdentifier</key>\n\t<string>" + ident + "</string>\n"
             + "\t<key>CFBundleVersion</key>\n\t<string>" + ver + "</string>\n"
             + "\t<key>CFBundleShortVersionString</key>\n\t<string>" + ver + "</string>\n"
@@ -103,11 +128,6 @@ partial class ZanIDE {
             + "\t<key>NSHighResolutionCapable</key>\n\t<true/>\n";
         if (icon) {
             s = s + "\t<key>CFBundleIconFile</key>\n\t<string>app.icns</string>\n";
-        }
-        // A console program shipped as a bundle would otherwise take a Dock
-        // icon and keyboard focus it has no window for.
-        if (!windowed) {
-            s = s + "\t<key>LSBackgroundOnly</key>\n\t<true/>\n";
         }
         return s + "</dict>\n</plist>\n";
     }
@@ -172,10 +192,14 @@ partial class ZanIDE {
 
     /// The icns block type that holds a PNG of `px` pixels, "" for a size icns
     /// has no name for (24 and 48 in a Windows .ico).
+    /// 16 and 32 px are NOT written as icp4/icp5: those two types predate PNG
+    /// in icns and Finder still reads them as raw pixels, which is the garbled
+    /// icon a bundle built from a Windows .ico used to show. The retina names
+    /// (ic11 = 16pt@2x = 32 px, ic12 = 32pt@2x = 64 px) are PNG-only and are
+    /// what the system scales the small sizes from.
     static string IcnsTypeFor(int px) {
-        if (px == 16) { return "icp4"; }
-        if (px == 32) { return "icp5"; }
-        if (px == 64) { return "icp6"; }
+        if (px == 32) { return "ic11"; }
+        if (px == 64) { return "ic12"; }
         if (px == 128) { return "ic07"; }
         if (px == 256) { return "ic08"; }
         if (px == 512) { return "ic09"; }
@@ -231,19 +255,20 @@ partial class ZanIDE {
             return "";
         }
         string name = Path.GetFileName(ZanIDE.DirOf(ZanIDE.DirOf(dir)));
-        string tarPath = ZanIDE.DirOf(dir) + "/" + name + "-" + id + ".tar";
+        string tarPath = ZanIDE.DirOf(dir) + "/" + name + "-" + id + ".tar.gz";
         for (int i = 0; i < already.Count; i = i + 1) {
             if (already[i] == tarPath) { return ""; }
         }
         return ZanIDE.TarPublish(dir, name, tarPath, log);
     }
 
-    /// Archives a published target directory as `<publish>/<name>-<id>.tar`.
+    /// Archives a published target directory as `<publish>/<name>-<id>.tar.gz`.
     /// tar, not zip: the archive is built here with an explicit POSIX mode per
     /// entry, so the Mach-O / ELF binary arrives on macOS or Linux already
     /// executable. A zip (or 7z) written on Windows carries no unix mode at
     /// all, which is why an unpacked publish greets its user with
-    /// "permission denied".
+    /// "permission denied". gzipped, because .tar.gz is what a double click in
+    /// Finder and `tar xf` both open without a word.
     /// Returns the archive path, or "" when there was nothing to archive.
     static string TarPublish(string outDir, string topName, string tarPath,
                              List<string> log) {
@@ -251,7 +276,7 @@ partial class ZanIDE {
         List<TarEntry> entries = new List<TarEntry>();
         ZanIDE.TarCollect(outDir, topName, entries);
         if (entries.Count == 0) { return ""; }
-        File.WriteAllBytes(tarPath, Tar.Create(entries));
+        File.WriteAllBytes(tarPath, GZip.Compress(Tar.Create(entries), 6));
         log.Add(ZanIDE.T("> Archived " + Convert.ToString(entries.Count)
                 + " entries (unix permissions kept) -> " + tarPath,
             "> 已打包 " + Convert.ToString(entries.Count)

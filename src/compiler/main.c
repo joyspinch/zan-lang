@@ -30,14 +30,17 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <sys/stat.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
 #else
 #include <unistd.h>
 #include <dirent.h>
 #include <strings.h>
-#include <sys/stat.h>
 #endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -75,6 +78,14 @@ static void phase(const char *name) {
 /* ---- file reading ---- */
 
 static char *read_file(const char *path, size_t *out_len) {
+    struct stat st;
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        /* A directory opens and seeks like a file on POSIX, and its "length"
+         * is then large enough that the allocation below fails -- reporting a
+         * directory passed as a source file as an out-of-memory abort. */
+        fprintf(stderr, "error: '%s' is a directory, not a source file\n", path);
+        return NULL;
+    }
     FILE *f = fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "error: cannot open file '%s'\n", path);
@@ -83,6 +94,11 @@ static char *read_file(const char *path, size_t *out_len) {
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
+    if (len < 0) {
+        fclose(f);
+        fprintf(stderr, "error: cannot read file '%s'\n", path);
+        return NULL;
+    }
     char *buf = (char *)malloc((size_t)len + 1);
     if (!buf) {
         fclose(f);

@@ -568,6 +568,9 @@
 
   function stopStream() {
     if (stream) { stream.close(); stream = null; }
+    if (dayTimer) { clearInterval(dayTimer); dayTimer = null; }
+    dayPts = {};
+    dayDay = '';
   }
 
   function startStream() {
@@ -582,6 +585,89 @@
       paintSeries(JSON.parse(ev.data));
     });
     stream.onerror = function () { /* EventSource retries by itself */ };
+    startDay(host.getAttribute('data-day'));
+  }
+
+  // ---- today, cumulative --------------------------------------------------
+
+  // The day's figures come from the metrics database, not from the live
+  // stream: a worker's counters restart with the worker, so anything drawn
+  // from them walks backwards whenever the fleet changes. Polled slowly on
+  // purpose -- it is a whole day of five-minute buckets, and it only grows.
+  var dayTimer = null;
+  var dayPts = {};      // bucket second -> point, so history is merged, not replaced
+  var dayDay = '';
+
+  function startDay(url) {
+    if (!url) { return; }
+    var tick = function () {
+      fetch(url, { credentials: 'same-origin' })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (j) { if (j) { paintDay(j); } })
+        .catch(function () { /* the next tick tries again */ });
+    };
+    tick();
+    dayTimer = setInterval(tick, 60000);
+  }
+
+  function paintDay(d) {
+    // Midnight: the day being drawn has changed, so yesterday's buckets are
+    // not the start of this one.
+    if (d.day !== dayDay) { dayPts = {}; dayDay = d.day || ''; }
+    put('day_calls', d.calls || 0);
+    put('day_errors', d.errors || 0);
+    put('day_avg_us', dur(d.avg_us));
+    put('day_max_us', dur(d.max_us));
+    put('day_total_us', dur(d.total_us));
+    put('day_label', d.day || '');
+
+    // Merged, not assigned: a bucket already on screen is updated by a later
+    // answer and never removed by one, so a partial or failed read cannot
+    // shorten the chart.
+    (d.points || []).forEach(function (p) { dayPts[p.t] = p; });
+    var pts = Object.keys(dayPts).map(function (k) { return dayPts[k]; })
+      .sort(function (a, b) { return a.t - b.t; })
+      .map(function (p) {
+        return { t: p.t, label: clock(p.t), calls: p.calls || 0,
+                 errors: p.errors || 0, avg_us: p.avg_us || 0,
+                 max_us: p.max_us || 0 };
+      });
+    draw('chart-day-req', [
+      { color: '#1f6feb', label: '请求', values: pts.map(function (p) { return p.calls; }) },
+      { color: '#b42318', label: '错误', values: pts.map(function (p) { return p.errors; }) }
+    ], pts, '');
+    draw('chart-day-lat', [
+      { color: '#7c3aed', label: '平均', values: pts.map(function (p) { return ms(p.avg_us); }) },
+      { color: '#d97706', label: '最慢', values: pts.map(function (p) { return ms(p.max_us); }) }
+    ], pts, ' ms');
+
+    paintDayTop('[data-daycalls]', d.top_calls, d.calls || 0);
+    paintDayTop('[data-daytime]', d.top_time, d.calls || 0);
+  }
+
+  function paintDayTop(sel, rows, total) {
+    var tb = panel.querySelector(sel);
+    if (!tb) { return; }
+    rows = rows || [];
+    tb.innerHTML = rows.length
+      ? rows.map(function (s) {
+          var share = total > 0 ? ((s.calls || 0) * 100 / total).toFixed(1) : '0.0';
+          return '<tr><td class="ellip mono" title="' + esc(s.req) + '">' +
+                 esc(s.req) + '</td><td class="num">' + (s.calls || 0) +
+                 '</td><td class="num muted">' + share +
+                 '%</td><td class="num">' + (s.errors || 0) +
+                 '</td><td class="num">' + dur(s.avg_us) +
+                 '</td><td class="num">' + dur(s.max_us) +
+                 '</td><td class="num">' + dur(s.total_us) + '</td></tr>';
+        }).join('')
+      : '<tr><td colspan="7" class="muted">今天还没有请求</td></tr>';
+  }
+
+  // A bucket's wall clock as "hh:mm", for a chart whose x axis is one day.
+  function clock(sec) {
+    var d = new Date(sec * 1000);
+    var p2 = function (n) { return (n < 10 ? '0' : '') + n; };
+    return p2(d.getHours()) + ':' + p2(d.getMinutes());
   }
 
   function put(name, value) {
@@ -809,8 +895,11 @@
         if (idx > n - 1) { idx = n - 1; }
         c._render(idx);
         var sp = c._pts, un = c._unit;
-        var when = (sp && sp[idx] && typeof sp[idx].t === 'number')
-          ? (sp[idx].t === 0 ? '现在' : (-sp[idx].t) + ' 秒前') : '';
+        // A live sample counts seconds back from now; a day bucket carries the
+        // clock time it stands for.
+        var when = (sp && sp[idx] && sp[idx].label) ? sp[idx].label
+          : ((sp && sp[idx] && typeof sp[idx].t === 'number')
+              ? (sp[idx].t === 0 ? '现在' : (-sp[idx].t) + ' 秒前') : '');
         var html = when ? '<b>' + when + '</b>' : '';
         sv.forEach(function (s) {
           html += '<div><i style="display:inline-block;width:8px;height:8px;'

@@ -422,6 +422,13 @@ class SharedTable {
     int tableCapacity;
     int tableKeySize;
     string tableSchema;
+    string tableLabel;
+
+    // Every table this process has mapped, by handle, so the server can report
+    // what shared memory it is holding. Only the handle is kept: holding the
+    // object would keep the mapping alive for the life of the process.
+    static List<string> openLabels = null;
+    static List<nint> openHandles = null;
 
     [DllImport("crt", EntryPoint = "zan_shared_table_create")]
     static extern nint NativeCreate(string name, int capacity, int keySize, string schema);
@@ -503,6 +510,9 @@ class SharedTable {
     [DllImport("crt", EntryPoint = "zan_shared_table_hash")]
     static extern long NativeHash(string text);
 
+    [DllImport("crt", EntryPoint = "zan_shared_table_stat")]
+    static extern long NativeStat(nint handle, int what);
+
     [DllImport("crt", EntryPoint = "zan_shared_table_set_int_at")]
     static extern int NativeSetIntAt(nint handle, long keyHash, string column, long newValue);
 
@@ -537,6 +547,45 @@ class SharedTable {
         this.tableCapacity = capacity;
         this.tableKeySize = 64;
         this.tableSchema = "";
+        this.tableLabel = name;
+    }
+
+    /// <summary>给这张表一个便于识别的名字，用于状态输出。匿名表没有
+    /// 名字，不设置就显示为 "(anonymous)"。</summary>
+    void Label(string text) {
+        this.tableLabel = text;
+        if (this.handle != 0) {
+            Track(this);
+        }
+    }
+
+    static void Track(SharedTable table) {
+        if (table.handle == 0) { return; }
+        if (SharedTable.openHandles == null) {
+            SharedTable.openHandles = new List<nint>();
+            SharedTable.openLabels = new List<string>();
+        }
+        string label = table.tableLabel;
+        if (label == "") { label = "(anonymous)"; }
+        for (int i = 0; i < SharedTable.openHandles.Count; i = i + 1) {
+            if (SharedTable.openHandles[i] == table.handle) {
+                SharedTable.openLabels[i] = label;
+                return;
+            }
+        }
+        SharedTable.openHandles.Add(table.handle);
+        SharedTable.openLabels.Add(label);
+    }
+
+    static void Untrack(nint handle) {
+        if (SharedTable.openHandles == null) { return; }
+        for (int i = 0; i < SharedTable.openHandles.Count; i = i + 1) {
+            if (SharedTable.openHandles[i] == handle) {
+                SharedTable.openHandles.RemoveAt(i);
+                SharedTable.openLabels.RemoveAt(i);
+                return;
+            }
+        }
     }
 
     ~SharedTable() {
@@ -566,12 +615,14 @@ class SharedTable {
         }
         this.handle = NativeCreate(
             this.tableName, this.tableCapacity, this.tableKeySize, this.tableSchema);
+        Track(this);
         return this.handle != 0;
     }
 
     static SharedTable Open(string name) {
         SharedTable table = new SharedTable(name, 1);
         table.handle = NativeOpen(name);
+        Track(table);
         return table;
     }
 
@@ -588,6 +639,7 @@ class SharedTable {
         }
         this.handle = NativeCreateAnon(
             this.tableCapacity, this.tableKeySize, this.tableSchema);
+        Track(this);
         return this.handle != 0;
     }
 
@@ -603,6 +655,7 @@ class SharedTable {
     static SharedTable Attach(long osHandle) {
         SharedTable table = new SharedTable("", 1);
         table.handle = NativeAttach(osHandle);
+        Track(table);
         return table;
     }
 
@@ -612,8 +665,10 @@ class SharedTable {
 
     void Close() {
         if (this.handle != 0) {
-            NativeClose(this.handle);
+            nint current = this.handle;
             this.handle = 0;
+            Untrack(current);
+            NativeClose(current);
         }
     }
 
@@ -623,6 +678,7 @@ class SharedTable {
         }
         nint current = this.handle;
         this.handle = 0;
+        Untrack(current);
         return NativeDestroy(current) != 0;
     }
 
@@ -705,6 +761,121 @@ class SharedTable {
 
     void Clear() {
         NativeClear(this.handle);
+    }
+
+    // ---- 内存占用 ----
+    //
+    // 表在创建时就按容量预留了整块映射，但一页只有在有行落在上面时
+    // 才会真正进入物理内存。因此「预留」远大于「占用」是正常的：
+    // 报告内存时必须用 Resident，而不是 Reserved。
+
+    static int STAT_RESERVED = 0;
+    static int STAT_RESIDENT = 1;
+    static int STAT_CAPACITY = 2;
+    static int STAT_COUNT = 3;
+    static int STAT_ROW_STRIDE = 4;
+    static int STAT_KEY_SIZE = 5;
+    static int STAT_COLUMNS = 6;
+
+    /// <summary>整块映射的大小（预留的虚拟地址空间，不是内存占用）。</summary>
+    long ReservedBytes() {
+        return NativeStat(this.handle, SharedTable.STAT_RESERVED);
+    }
+
+    /// <summary>本进程真正驻留在物理内存中的部分；平台不支持时为 -1。</summary>
+    long ResidentBytes() {
+        return NativeStat(this.handle, SharedTable.STAT_RESIDENT);
+    }
+
+    /// <summary>表能容纳的行数（向上取整到 2 的幂）。</summary>
+    int Capacity() {
+        return (int)NativeStat(this.handle, SharedTable.STAT_CAPACITY);
+    }
+
+    /// <summary>每行占用的字节数（键 + 各列 + 行头）。</summary>
+    int RowStride() {
+        return (int)NativeStat(this.handle, SharedTable.STAT_ROW_STRIDE);
+    }
+
+    /// <summary>键的最大字节数。</summary>
+    int KeyBytes() {
+        return (int)NativeStat(this.handle, SharedTable.STAT_KEY_SIZE);
+    }
+
+    int ColumnCount() {
+        return (int)NativeStat(this.handle, SharedTable.STAT_COLUMNS);
+    }
+
+    // ---- 本进程映射的所有表 ----
+
+    /// <summary>本进程当前映射着的共享表数量。</summary>
+    static int OpenCount() {
+        if (SharedTable.openHandles == null) { return 0; }
+        return SharedTable.openHandles.Count;
+    }
+
+    static string OpenLabel(int index) {
+        if (SharedTable.openLabels == null) { return ""; }
+        if (index < 0 || index >= SharedTable.openLabels.Count) { return ""; }
+        return SharedTable.openLabels[index];
+    }
+
+    /// <summary>第 `index` 张表的某项统计，取值见 STAT_* 常量。</summary>
+    static long OpenStat(int index, int what) {
+        if (SharedTable.openHandles == null) { return 0; }
+        if (index < 0 || index >= SharedTable.openHandles.Count) { return 0; }
+        return NativeStat(SharedTable.openHandles[index], what);
+    }
+
+    static string StatPad(string s, int width) {
+        string t = s;
+        while (t.Length < width) { t = t + " "; }
+        return t + " ";
+    }
+
+    static string StatBytes(long bytes) {
+        if (bytes < 0) { return "n/a"; }
+        if (bytes < 1024) { return Convert.ToString(bytes) + "B"; }
+        if (bytes < 1048576) {
+            return Convert.ToString(bytes / 1024) + "KB";
+        }
+        return Convert.ToString(bytes / 1048576) + "MB";
+    }
+
+    /// <summary>本进程所有共享表的一张文本表格：行数、每行大小、预留的
+    /// 映射大小，以及真正驻留在内存中的部分。</summary>
+    static string StatusText() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(StatPad("shared table", 24) + StatPad("rows", 16)
+            + StatPad("row size", 10) + StatPad("reserved", 12)
+            + "in memory\n");
+        int n = SharedTable.OpenCount();
+        if (n == 0) {
+            sb.Append("(none)\n");
+            return sb.ToString();
+        }
+        long totalReserved = 0;
+        long totalResident = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            long reserved = SharedTable.OpenStat(i, SharedTable.STAT_RESERVED);
+            long resident = SharedTable.OpenStat(i, SharedTable.STAT_RESIDENT);
+            totalReserved = totalReserved + reserved;
+            if (resident > 0) { totalResident = totalResident + resident; }
+            string rows = Convert.ToString(
+                    SharedTable.OpenStat(i, SharedTable.STAT_COUNT))
+                + "/" + Convert.ToString(
+                    SharedTable.OpenStat(i, SharedTable.STAT_CAPACITY));
+            sb.Append(StatPad(SharedTable.OpenLabel(i), 24)
+                + StatPad(rows, 16)
+                + StatPad(Convert.ToString(
+                    SharedTable.OpenStat(i, SharedTable.STAT_ROW_STRIDE)), 10)
+                + StatPad(SharedTable.StatBytes(reserved), 12)
+                + SharedTable.StatBytes(resident) + "\n");
+        }
+        sb.Append(StatPad("total", 24) + StatPad("", 16) + StatPad("", 10)
+            + StatPad(SharedTable.StatBytes(totalReserved), 12)
+            + SharedTable.StatBytes(totalResident) + "\n");
+        return sb.ToString();
     }
 
     // ---- 按预计算哈希寻址的行 ----
