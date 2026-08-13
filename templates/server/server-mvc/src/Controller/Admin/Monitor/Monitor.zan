@@ -46,14 +46,20 @@ class Monitor : AdminController {
         d.Set("slow", Fmt.Dur(req.Long("slow_threshold_us", 0)));
 
         // The day's four figures are rendered with the page, so the first
-        // paint already shows today's total instead of this worker's counter
+        // paint already shows the day's total instead of this worker's counter
         // (which is 0 on a worker that has just been spawned). The page keeps
         // them current from /admin/monitor/today.
         long now = (long)WebApp.NowSeconds();
-        long from = (now / 86400) * 86400;
+        long today = Monitor.Today(now);
+        long from = Monitor.PickedDay(this.In("d"), today);
+        long to = Monitor.DayEnd(from, today, now);
         int _f = await MetricsStore.Flush();
-        MetricMinute day = await MetricsStore.WindowTotals(from, now, "", "");
+        MetricMinute day = await MetricsStore.WindowTotals(from, to, "", "");
         d.Set("day", Fmt.Day(from));
+        d.Set("d", Fmt.Day(from));
+        // A past day's cumulative half is finished history; the live half of
+        // the page still describes right now, whichever day is being read.
+        if (from < today) { d.Set("past", "1"); }
         d.Set("dayCalls", Convert.ToString(day.calls));
         d.Set("dayErrors", Convert.ToString(day.errors));
         d.Set("dayAvg", Fmt.Dur(Monitor.Avg(day.totalUs, day.calls)));
@@ -100,8 +106,8 @@ class Monitor : AdminController {
     /// How many interfaces the day ranking shows per ordering it is taken by.
     static int DayRoutes = 20;
 
-    /// <summary>Today so far, read from the persisted minute rows rather than
-    /// from any process's counters.
+    /// <summary>One day -- today so far, or a picked one in full -- read from
+    /// the persisted minute rows rather than from any process's counters.
     ///
     /// Why not the live snapshot: a worker's counters start at zero when it
     /// starts, so a restarted (or newly spawned) worker makes the page's
@@ -116,14 +122,12 @@ class Monitor : AdminController {
     /// This worker's own unflushed buckets are flushed first, so the current
     /// minute is included. Another worker's are not: its last flush is at most
     /// [metrics].flushSeconds old, which is what `as_of` reports.</summary>
-    static async string TodayJson() {
-        long now = (long)WebApp.NowSeconds();
-        long from = (now / 86400) * 86400;
+    static async string DayJson(long from, long to) {
         int _w = await MetricsStore.Flush();
-        MetricMinute tot = await MetricsStore.WindowTotals(from, now, "", "");
-        List<MetricMinute> rows = await MetricsStore.HistoryBuckets(from, now,
+        MetricMinute tot = await MetricsStore.WindowTotals(from, to, "", "");
+        List<MetricMinute> rows = await MetricsStore.HistoryBuckets(from, to,
             "", "", Monitor.DayStep, Monitor.MaxRows);
-        rows = Monitor.FillGaps(rows, from, now, Monitor.DayStep);
+        rows = Monitor.FillGaps(rows, from, to, Monitor.DayStep);
 
         // Oldest first: the chart's x axis runs forwards.
         JsonValue pts = JsonValue.NewArray();
@@ -141,7 +145,7 @@ class Monitor : AdminController {
         JsonValue o = JsonValue.NewObject();
         o.Put("day", JsonValue.NewStr(Fmt.Day(from)));
         o.Put("from", MetricsCluster.Num(from));
-        o.Put("as_of", MetricsCluster.Num(now));
+        o.Put("as_of", MetricsCluster.Num(to));
         o.Put("step", MetricsCluster.Num(Monitor.DayStep));
         o.Put("calls", MetricsCluster.Num(tot.calls));
         o.Put("errors", MetricsCluster.Num(tot.errors));
@@ -151,7 +155,7 @@ class Monitor : AdminController {
         o.Put("frames", MetricsCluster.Num(tot.frames));
         o.Put("bytes", MetricsCluster.Num(tot.bytes));
         o.Put("points", pts);
-        o.Put("top", await Monitor.DayTop(from, now));
+        o.Put("top", await Monitor.DayTop(from, to));
         return o.ToJson();
     }
 
@@ -195,12 +199,38 @@ class Monitor : AdminController {
         }
     }
 
-    /// <summary>Today's cumulative figures as one request, for tooling and for
-    /// the page's first paint.</summary>
+    /// <summary>A day's cumulative figures as one request, for tooling and for
+    /// the page's first paint. `d` (YYYY-MM-DD) picks the day; today by
+    /// default.</summary>
     [HttpGet]
     [Description("当天累计指标")]
     async void Today() {
-        this.Json(await Monitor.TodayJson());
+        long now = (long)WebApp.NowSeconds();
+        long today = Monitor.Today(now);
+        long from = Monitor.PickedDay(this.In("d"), today);
+        this.Json(await Monitor.DayJson(from,
+            Monitor.DayEnd(from, today, now)));
+    }
+
+    /// <summary>The second today started.</summary>
+    static long Today(long now) { return (now / 86400) * 86400; }
+
+    /// <summary>The day a screen asked for: the picked date when it parses and
+    /// is not in the future, otherwise today. A day that has not happened has
+    /// no rows, and answering with an empty screen would read as lost
+    /// history.</summary>
+    static long PickedDay(string day, long today) {
+        long start = Monitor.DaySeconds(day);
+        if (start < 0 || start > today) { return today; }
+        return start;
+    }
+
+    /// <summary>Where the day being read ends: midnight for a finished day, and
+    /// now for today -- a window that ran to tonight's midnight would report
+    /// the hours that have not happened yet as a day with no traffic.</summary>
+    static long DayEnd(long from, long today, long now) {
+        if (from >= today) { return now; }
+        return from + 86399;
     }
 
     /// <summary>The same snapshot as one request, for tooling that is not a
