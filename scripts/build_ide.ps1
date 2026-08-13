@@ -74,6 +74,9 @@ $files += (Join-Path (Get-Location) "stdlib\System\IO\File.zan")
 $files += (Join-Path (Get-Location) "stdlib\System\IO\Directory.zan")
 $files += (Join-Path (Get-Location) "stdlib\System\IO\FileInfo.zan")
 $files += (Join-Path (Get-Location) "stdlib\System\Diagnostics\Process.zan")
+# The publish path archives a macOS/Linux output directory as tar (the only
+# common format that carries the unix mode bit) -- see ZanIDE.Package.zan.
+$files += (Join-Path (Get-Location) "stdlib\System\IO\Compression\Tar.zan")
 
 # Entry FIRST: zanc gives the generated Main() to the first design document on
 # the command line (genrun.c passes emitMain only for paths[0]), so the form

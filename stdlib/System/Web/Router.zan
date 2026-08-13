@@ -131,6 +131,10 @@ class Router {
     // Precomputed key string for each route in flat order.
     // Stored separately so RecordHit never touches a Route object (no ARC).
     List<string> flatKeys;
+    // The same keys hashed once, at InitStats. Rows in the shared table are
+    // addressed by this hash, so recording a hit neither re-hashes the key
+    // string nor copies it into shared memory.
+    List<long> flatHashes;
     // Cross-process shared stats table (SharedTable backed by named shared
     // memory). Columns: "hits" (int), "total_us" (int). Keyed by route.key.
     // Null until InitStats is called. All workers share the same table so
@@ -145,6 +149,7 @@ class Router {
         this.hashMask = 0;
         this.flat = new List<Route>();
         this.flatKeys = new List<string>();
+        this.flatHashes = new List<long>();
         this.routeStats = null;
     }
 
@@ -176,6 +181,10 @@ class Router {
     void InitStats(string name) {
         int cap = this.flat.Count;
         if (cap == 0) { return; }
+        this.flatHashes = new List<long>();
+        for (int h = 0; h < this.flatKeys.Count; h = h + 1) {
+            this.flatHashes.Add(SharedTable.Hash(this.flatKeys[h]));
+        }
         SharedTable t = new SharedTable(name, cap + 4);
         t.KeySize(128);
         t.ColumnInt("hits");
@@ -184,9 +193,9 @@ class Router {
             // Master (or single process): seed every route row so workers
             // can Increment on a pre-existing row without triggering a
             // capacity-limited auto-create under concurrent first requests.
-            for (int i = 0; i < this.flatKeys.Count; i = i + 1) {
-                t.SetInt(this.flatKeys[i], "hits", 0);
-                t.SetInt(this.flatKeys[i], "total_us", 0);
+            for (int i = 0; i < this.flatHashes.Count; i = i + 1) {
+                t.SetIntAt(this.flatHashes[i], "hits", 0);
+                t.SetIntAt(this.flatHashes[i], "total_us", 0);
             }
             this.routeStats = t;
         } else {
@@ -202,10 +211,10 @@ class Router {
     /// computation.</summary>
     void RecordHit(int idx, long us) {
         if (this.routeStats == null) { return; }
-        if (idx < 0 || idx >= this.flatKeys.Count) { return; }
-        string key = this.flatKeys[idx];
-        this.routeStats.Increment(key, "hits", 1);
-        this.routeStats.Increment(key, "total_us", us);
+        if (idx < 0 || idx >= this.flatHashes.Count) { return; }
+        long key = this.flatHashes[idx];
+        this.routeStats.IncrementAt(key, "hits", 1);
+        this.routeStats.IncrementAt(key, "total_us", us);
     }
 
     /// <summary>Every registered route (statics then dynamics) -- used by the
@@ -227,14 +236,14 @@ class Router {
     List<RouteHitDoc> Stats() {
         List<RouteHitDoc> outp = new List<RouteHitDoc>();
         if (this.routeStats == null) { return outp; }
-        for (int i = 0; i < this.flatKeys.Count; i = i + 1) {
-            string key = this.flatKeys[i];
-            long hits = this.routeStats.GetInt(key, "hits");
+        for (int i = 0; i < this.flatHashes.Count; i = i + 1) {
+            long key = this.flatHashes[i];
+            long hits = this.routeStats.GetIntAt(key, "hits");
             if (hits > 0) {
-                long totalUs = this.routeStats.GetInt(key, "total_us");
+                long totalUs = this.routeStats.GetIntAt(key, "total_us");
                 long avgUs = totalUs / hits;
                 RouteHitDoc o = new RouteHitDoc();
-                o.route = key;
+                o.route = this.flatKeys[i];
                 o.count = hits;
                 o.avg_us = avgUs;
                 outp.Add(o);

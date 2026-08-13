@@ -1,0 +1,298 @@
+using System;
+using System.IO;
+using System.IO.Compression;
+using Game.Scene;
+
+/// ZanIDE part: what a publish produces for the POSIX targets -- the macOS
+/// application bundle (Contents/MacOS + Info.plist + Resources/app.icns) and
+/// the tar archive that carries a published directory off Windows with its
+/// unix permissions intact.
+partial class ZanIDE {
+    /// The bundle directory of a macOS publish, `<outDir>/<name>.app`. macOS
+    /// launches an application by its bundle, not by a bare Mach-O: a loose
+    /// executable has no icon, no name in the Dock and no window activation,
+    /// which is exactly what a "double click does nothing" report looks like.
+    static string MacAppDir(string outDir, string baseName) {
+        return outDir + "/" + baseName + ".app";
+    }
+
+    /// Where the executable of a macOS bundle lives.
+    static string MacAppExe(string outDir, string baseName) {
+        return ZanIDE.MacAppDir(outDir, baseName) + "/Contents/MacOS/" + baseName;
+    }
+
+    /// True when `exe` is the executable inside a .app bundle.
+    static bool IsMacAppExe(string exe) {
+        return ZanIDE.ContainsS(exe, ".app/Contents/MacOS/");
+    }
+
+    /// The directory a published program's resources belong in: Contents/Resources
+    /// for a .app bundle (where NSBundle looks), next to the executable for
+    /// every other target.
+    static string PayloadDirFor(string exe) {
+        string dir = ZanIDE.DirOf(exe);
+        if (ZanIDE.IsMacAppExe(exe)) {
+            return ZanIDE.DirOf(dir) + "/Resources";
+        }
+        return dir;
+    }
+
+    /// Creates the bundle skeleton and writes Info.plist + the icon, so the
+    /// compile can link straight into Contents/MacOS. Returns the executable
+    /// path zanc should produce.
+    static string MacAppPrepare(string root, string outDir, string baseName,
+                                bool windowed, List<string> log) {
+        string app = ZanIDE.MacAppDir(outDir, baseName);
+        Directory.CreateDirectoryRecursive(app + "/Contents/MacOS");
+        Directory.CreateDirectoryRecursive(app + "/Contents/Resources");
+        string ver = ZanIDE.ProjField(root, "version");
+        if (ver == "") { ver = "1.0.0"; }
+        string ident = ZanIDE.ProjField(root, "bundleId");
+        if (ident == "") { ident = "com.zanlang." + ZanIDE.BundleIdSafe(baseName); }
+        bool icon = ZanIDE.WriteIcns(ZanIDE.IconFile(root),
+                                     app + "/Contents/Resources/app.icns");
+        File.WriteAllText(app + "/Contents/Info.plist",
+            ZanIDE.InfoPlist(baseName, ident, ver, icon, windowed));
+        // A bundle without PkgInfo still launches, but Finder reads the type
+        // from it, so write the two words every .app carries.
+        File.WriteAllText(app + "/Contents/PkgInfo", "APPL????");
+        if (icon) {
+            log.Add(ZanIDE.T("> macOS bundle: " + baseName
+                    + ".app (icon Contents/Resources/app.icns).",
+                "> macOS 应用包：" + baseName
+                    + ".app（图标 Contents/Resources/app.icns）。"));
+        } else {
+            log.Add(ZanIDE.T("> macOS bundle: " + baseName
+                    + ".app (no icon: assets/app.ico has no PNG frame).",
+                "> macOS 应用包：" + baseName
+                    + ".app（无图标：assets/app.ico 里没有 PNG 帧）。"));
+        }
+        return ZanIDE.MacAppExe(outDir, baseName);
+    }
+
+    /// Bundle identifiers are reverse-DNS: keep letters, digits and hyphens and
+    /// drop everything else (a space or a Chinese project name would make an
+    /// identifier macOS rejects).
+    static string BundleIdSafe(string name) {
+        string outp = "";
+        for (int i = 0; i < name.Length; i = i + 1) {
+            int c = name[i] & 255;
+            bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122) || c == 45;
+            if (ok) { outp = outp + name.Substring(i, 1); }
+        }
+        if (outp == "") { outp = "app"; }
+        return outp;
+    }
+
+    static string InfoPlist(string baseName, string ident, string ver,
+                            bool icon, bool windowed) {
+        string s = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            + "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\""
+            + " \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+            + "<plist version=\"1.0\">\n<dict>\n"
+            + "\t<key>CFBundleName</key>\n\t<string>" + baseName + "</string>\n"
+            + "\t<key>CFBundleDisplayName</key>\n\t<string>" + baseName + "</string>\n"
+            + "\t<key>CFBundleExecutable</key>\n\t<string>" + baseName + "</string>\n"
+            + "\t<key>CFBundleIdentifier</key>\n\t<string>" + ident + "</string>\n"
+            + "\t<key>CFBundleVersion</key>\n\t<string>" + ver + "</string>\n"
+            + "\t<key>CFBundleShortVersionString</key>\n\t<string>" + ver + "</string>\n"
+            + "\t<key>CFBundlePackageType</key>\n\t<string>APPL</string>\n"
+            + "\t<key>CFBundleInfoDictionaryVersion</key>\n\t<string>6.0</string>\n"
+            + "\t<key>LSMinimumSystemVersion</key>\n\t<string>11.0</string>\n"
+            + "\t<key>NSHighResolutionCapable</key>\n\t<true/>\n";
+        if (icon) {
+            s = s + "\t<key>CFBundleIconFile</key>\n\t<string>app.icns</string>\n";
+        }
+        // A console program shipped as a bundle would otherwise take a Dock
+        // icon and keyboard focus it has no window for.
+        if (!windowed) {
+            s = s + "\t<key>LSBackgroundOnly</key>\n\t<true/>\n";
+        }
+        return s + "</dict>\n</plist>\n";
+    }
+
+    // ---- .ico -> .icns -------------------------------------------------
+    // The IDE's icon of record is a Windows .ico, and every icon it ships or
+    // accepts stores its frames as PNG (the format Vista+ .ico uses at 256px
+    // and the exporters use throughout). An .icns is a typed container of the
+    // same PNG frames, so the conversion is a re-wrap: no decoder, no resampler
+    // and no external tool (iconutil only exists on macOS, and the publish runs
+    // on the developer's machine).
+
+    /// Writes `icnsPath` from the PNG frames of a Windows .ico. False when the
+    /// source is missing or carries no PNG frame of a size icns names.
+    static bool WriteIcns(string icoPath, string icnsPath) {
+        if (icoPath == "" || !File.Exists(icoPath)) { return false; }
+        int size = File.GetSize(icoPath);
+        if (size < 22) { return false; }
+        byte[] ico = File.ReadBytes(icoPath, 0, size);
+        if (ZanIDE.LeU16(ico, 2) != 1) { return false; }
+        int count = ZanIDE.LeU16(ico, 4);
+        if (count <= 0) { return false; }
+        List<string> types = new List<string>();
+        List<int> offs = new List<int>();
+        List<int> lens = new List<int>();
+        int total = 8;
+        for (int i = 0; i < count; i = i + 1) {
+            int e = 6 + 16 * i;
+            if (e + 16 > size) { break; }
+            int w = ico[e] & 255;
+            if (w == 0) { w = 256; }
+            int len = (int)ZanIDE.LeU32(ico, e + 8);
+            int off = (int)ZanIDE.LeU32(ico, e + 12);
+            if (len <= 8 || off < 0 || off + len > size) { continue; }
+            // PNG frames only: a DIB frame would need a full encoder here.
+            if (!ZanIDE.IsPngAt(ico, off)) { continue; }
+            string ty = ZanIDE.IcnsTypeFor(w);
+            if (ty == "") { continue; }
+            types.Add(ty);
+            offs.Add(off);
+            lens.Add(len);
+            total = total + 8 + len;
+        }
+        if (types.Count == 0) { return false; }
+        byte[] outp = new byte[total];
+        ZanIDE.PutAscii(outp, 0, "icns");
+        ZanIDE.PutBeU32(outp, 4, total);
+        int pos = 8;
+        for (int i = 0; i < types.Count; i = i + 1) {
+            ZanIDE.PutAscii(outp, pos, types[i]);
+            ZanIDE.PutBeU32(outp, pos + 4, 8 + lens[i]);
+            pos = pos + 8;
+            int src = offs[i];
+            for (int k = 0; k < lens[i]; k = k + 1) {
+                outp[pos + k] = ico[src + k];
+            }
+            pos = pos + lens[i];
+        }
+        File.WriteAllBytes(icnsPath, outp);
+        return true;
+    }
+
+    /// The icns block type that holds a PNG of `px` pixels, "" for a size icns
+    /// has no name for (24 and 48 in a Windows .ico).
+    static string IcnsTypeFor(int px) {
+        if (px == 16) { return "icp4"; }
+        if (px == 32) { return "icp5"; }
+        if (px == 64) { return "icp6"; }
+        if (px == 128) { return "ic07"; }
+        if (px == 256) { return "ic08"; }
+        if (px == 512) { return "ic09"; }
+        if (px == 1024) { return "ic10"; }
+        return "";
+    }
+
+    static bool IsPngAt(byte[] b, int off) {
+        if (off + 8 > b.Length) { return false; }
+        return (b[off] & 255) == 137 && (b[off + 1] & 255) == 80
+            && (b[off + 2] & 255) == 78 && (b[off + 3] & 255) == 71
+            && (b[off + 4] & 255) == 13 && (b[off + 5] & 255) == 10
+            && (b[off + 6] & 255) == 26 && (b[off + 7] & 255) == 10;
+    }
+
+    static int LeU16(byte[] b, int off) {
+        return (b[off] & 255) | ((b[off + 1] & 255) << 8);
+    }
+
+    static long LeU32(byte[] b, int off) {
+        return (long)(b[off] & 255) | ((long)(b[off + 1] & 255) << 8)
+            | ((long)(b[off + 2] & 255) << 16) | ((long)(b[off + 3] & 255) << 24);
+    }
+
+    static void PutAscii(byte[] b, int off, string s) {
+        for (int i = 0; i < s.Length; i = i + 1) { b[off + i] = (byte)s[i]; }
+    }
+
+    static void PutBeU32(byte[] b, int off, int v) {
+        b[off] = (byte)((v >> 24) & 255);
+        b[off + 1] = (byte)((v >> 16) & 255);
+        b[off + 2] = (byte)((v >> 8) & 255);
+        b[off + 3] = (byte)(v & 255);
+    }
+
+    // ---- tar of a published directory ----------------------------------
+
+    /// Archives the publish directory a POSIX target's output sits in, named
+    /// `<publish>/<name>-<target>.tar` (the archive travels alone, so it is the
+    /// one place the target id still belongs). Windows targets are skipped: the
+    /// .exe needs no mode bit, and `already` holds the archives written for this
+    /// publish so a target with two outputs is packed once.
+    /// Returns the archive path, or "" when nothing was written.
+    static string TarPublishFor(string exe, List<string> already,
+                                List<string> log) {
+        string dir = ZanIDE.DirOf(exe);
+        if (ZanIDE.IsMacAppExe(exe)) {
+            // <dir>/<name>.app/Contents/MacOS/<name> -> the publish directory.
+            dir = ZanIDE.DirOf(ZanIDE.DirOf(ZanIDE.DirOf(dir)));
+        }
+        string id = Path.GetFileName(dir);
+        if (!ZanIDE.StartsWith(id, "macos") && !ZanIDE.StartsWith(id, "linux")) {
+            return "";
+        }
+        string name = Path.GetFileName(ZanIDE.DirOf(ZanIDE.DirOf(dir)));
+        string tarPath = ZanIDE.DirOf(dir) + "/" + name + "-" + id + ".tar";
+        for (int i = 0; i < already.Count; i = i + 1) {
+            if (already[i] == tarPath) { return ""; }
+        }
+        return ZanIDE.TarPublish(dir, name, tarPath, log);
+    }
+
+    /// Archives a published target directory as `<publish>/<name>-<id>.tar`.
+    /// tar, not zip: the archive is built here with an explicit POSIX mode per
+    /// entry, so the Mach-O / ELF binary arrives on macOS or Linux already
+    /// executable. A zip (or 7z) written on Windows carries no unix mode at
+    /// all, which is why an unpacked publish greets its user with
+    /// "permission denied".
+    /// Returns the archive path, or "" when there was nothing to archive.
+    static string TarPublish(string outDir, string topName, string tarPath,
+                             List<string> log) {
+        if (!Directory.Exists(outDir)) { return ""; }
+        List<TarEntry> entries = new List<TarEntry>();
+        ZanIDE.TarCollect(outDir, topName, entries);
+        if (entries.Count == 0) { return ""; }
+        File.WriteAllBytes(tarPath, Tar.Create(entries));
+        log.Add(ZanIDE.T("> Archived " + Convert.ToString(entries.Count)
+                + " entries (unix permissions kept) -> " + tarPath,
+            "> 已打包 " + Convert.ToString(entries.Count)
+                + " 个条目（保留 unix 权限）-> " + tarPath));
+        return tarPath;
+    }
+
+    /// Walks `dir` into tar entries named `<rel>` under the archive root.
+    static void TarCollect(string dir, string rel, List<TarEntry> entries) {
+        TarEntry d = new TarEntry(rel + "/");
+        d.isDirectory = true;
+        d.mode = 493;                   // 0755
+        entries.Add(d);
+        List<string> fs = Directory.GetFiles(dir);
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            string path = dir + "/" + fs[i];
+            int sz = File.GetSize(path);
+            if (sz < 0) { continue; }
+            TarEntry e = new TarEntry(rel + "/" + fs[i]);
+            e.data = sz == 0 ? new byte[0] : File.ReadBytes(path, 0, sz);
+            e.mode = ZanIDE.PosixMode(rel + "/" + fs[i]);
+            entries.Add(e);
+        }
+        List<string> ds = Directory.GetDirectories(dir);
+        for (int i = 0; i < ds.Count; i = i + 1) {
+            ZanIDE.TarCollect(dir + "/" + ds[i], rel + "/" + ds[i], entries);
+        }
+    }
+
+    /// 0755 for what has to be executable after unpacking (the bundle's
+    /// Contents/MacOS binary, a shared library, a shell script and the bare
+    /// program of a console publish -- which has no extension), 0644 otherwise.
+    static int PosixMode(string rel) {
+        string lo = SceneDesigner.AsciiLower(rel);
+        if (ZanIDE.ContainsS(rel, "/Contents/MacOS/")) { return 493; }
+        if (ZanIDE.EndsWith(lo, ".dylib") || ZanIDE.EndsWith(lo, ".so")
+            || ZanIDE.EndsWith(lo, ".sh")) { return 493; }
+        if (ZanIDE.ContainsS(lo, ".so.")) { return 493; }
+        int slash = lo.LastIndexOf("/");
+        string nm = slash >= 0 ? lo.Substring(slash + 1, lo.Length - slash - 1) : lo;
+        if (nm.LastIndexOf(".") < 0) { return 493; }
+        return 420;                     // 0644
+    }
+}
