@@ -97,7 +97,7 @@ class Monitor : AdminController {
     /// How the day is bucketed on the live page: five minutes, so a whole day
     /// is 288 points -- enough to see a spike, few enough to draw.
     static long DayStep = 300;
-    /// How many interfaces each of the two day rankings shows.
+    /// How many interfaces the day ranking shows per ordering it is taken by.
     static int DayRoutes = 20;
 
     /// <summary>Today so far, read from the persisted minute rows rather than
@@ -151,21 +151,41 @@ class Monitor : AdminController {
         o.Put("frames", MetricsCluster.Num(tot.frames));
         o.Put("bytes", MetricsCluster.Num(tot.bytes));
         o.Put("points", pts);
-        o.Put("top_calls", await Monitor.DayTop(from, now, "calls"));
-        o.Put("top_time", await Monitor.DayTop(from, now, "time"));
+        o.Put("top", await Monitor.DayTop(from, now));
         return o.ToJson();
     }
 
-    /// <summary>Today's interfaces ranked by `rank`: "calls" (how often) or
-    /// "time" (how much of the server's day the interface consumed).</summary>
-    static async JsonValue DayTop(long from, long to, string rank) {
+    /// <summary>Today's interfaces, one row each, for a table the operator
+    /// sorts by whichever column the question is about.
+    ///
+    /// Taken by both orderings the database can rank by and merged: the top
+    /// interfaces by call count and the top ones by time spent are different
+    /// sets -- the interface that ate the day is often not the busiest one --
+    /// so ranking by only one of them would hide the other's leaders no matter
+    /// which column the screen is then sorted by. An interface reached by both
+    /// queries is kept once.</summary>
+    static async JsonValue DayTop(long from, long to) {
+        JsonValue arr = JsonValue.NewArray();
+        Dictionary<string,int> seen = new Dictionary<string,int>();
+        await Monitor.AppendDayTop(arr, seen, from, to, "calls");
+        await Monitor.AppendDayTop(arr, seen, from, to, "time");
+        return arr;
+    }
+
+    /// <summary>Appends today's interfaces ranked by `rank` -- "calls" (how
+    /// often) or "time" (how much of the server's day the interface consumed)
+    /// -- skipping the ones already in `arr`.</summary>
+    static async void AppendDayTop(JsonValue arr, Dictionary<string,int> seen,
+            long from, long to, string rank) {
         List<MetricMinute> tops = await MetricsStore.RouteTotalsBy(from, to,
             "", "", Monitor.DayRoutes, rank);
-        JsonValue arr = JsonValue.NewArray();
         for (int i = 0; i < tops.Count; i = i + 1) {
             MetricMinute b = tops[i];
+            string req = b.method + " " + b.path;
+            if (seen.ContainsKey(req)) { continue; }
+            seen[req] = 1;
             JsonValue o = JsonValue.NewObject();
-            o.Put("req", JsonValue.NewStr(b.method + " " + b.path));
+            o.Put("req", JsonValue.NewStr(req));
             o.Put("calls", MetricsCluster.Num(b.calls));
             o.Put("errors", MetricsCluster.Num(b.errors));
             o.Put("avg_us", MetricsCluster.Num(Monitor.Avg(b.totalUs, b.calls)));
@@ -173,7 +193,6 @@ class Monitor : AdminController {
             o.Put("total_us", MetricsCluster.Num(b.totalUs));
             arr.Append(o);
         }
-        return arr;
     }
 
     /// <summary>Today's cumulative figures as one request, for tooling and for

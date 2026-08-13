@@ -571,6 +571,9 @@
     if (dayTimer) { clearInterval(dayTimer); dayTimer = null; }
     dayPts = {};
     dayDay = '';
+    topDay = {};
+    topLive = {};
+    topTotal = 0;
   }
 
   function startStream() {
@@ -585,6 +588,7 @@
       paintSeries(JSON.parse(ev.data));
     });
     stream.onerror = function () { /* EventSource retries by itself */ };
+    wireTopSort();
     startDay(host.getAttribute('data-day'));
   }
 
@@ -641,26 +645,100 @@
       { color: '#d97706', label: '最慢', values: pts.map(function (p) { return ms(p.max_us); }) }
     ], pts, ' ms');
 
-    paintDayTop('[data-daycalls]', d.top_calls, d.calls || 0);
-    paintDayTop('[data-daytime]', d.top_time, d.calls || 0);
+    topTotal = d.calls || 0;
+    topDay = {};
+    (d.top || []).forEach(function (s) { topDay[s.req] = s; });
+    paintTop();
   }
 
-  function paintDayTop(sel, rows, total) {
-    var tb = panel.querySelector(sel);
+  // ---- one interface ranking ----------------------------------------------
+
+  // One row per interface, sorted by whichever column was clicked. The three
+  // tables this replaces were the same interfaces ordered three ways, which is
+  // what sorting a table already does.
+  //
+  // Two sources, because neither answers the whole question: the day's counts
+  // and durations come from the database (they survive a worker restart and
+  // include the workers that are gone), while `failed` and `rejected` are only
+  // counted live, in the processes that are up. An interface the live snapshot
+  // has but the database has not yet (another worker's minute is not flushed)
+  // is still listed, with its cumulative columns blank rather than as zeros.
+  var topDay = {};       // req -> today's row, from the metrics database
+  var topLive = {};      // req -> live row, from the snapshot stream
+  var topTotal = 0;      // today's calls, for the share column
+  var topSort = { key: 'calls', dir: -1 };
+
+  function wireTopSort() {
+    panel.querySelectorAll('[data-toptable] th[data-sort]').forEach(function (th) {
+      if (!th.getAttribute('data-label')) {
+        th.setAttribute('data-label', th.textContent);
+      }
+      th.style.cursor = 'pointer';
+      th.addEventListener('click', function () {
+        var key = th.getAttribute('data-sort');
+        // Same column again reverses it; a new column starts descending,
+        // except the name, which reads better A-Z.
+        if (topSort.key === key) { topSort.dir = -topSort.dir; }
+        else { topSort = { key: key, dir: key === 'req' ? 1 : -1 }; }
+        paintTop();
+      });
+    });
+    paintTopHead();
+  }
+
+  function paintTopHead() {
+    panel.querySelectorAll('[data-toptable] th[data-sort]').forEach(function (th) {
+      var label = th.getAttribute('data-label') || th.textContent;
+      var on = th.getAttribute('data-sort') === topSort.key;
+      th.textContent = label + (on ? (topSort.dir < 0 ? ' \u2193' : ' \u2191') : '');
+    });
+  }
+
+  function paintTop() {
+    var tb = panel.querySelector('[data-daytop]');
     if (!tb) { return; }
-    rows = rows || [];
+    var rows = [];
+    var keys = {};
+    Object.keys(topDay).forEach(function (k) { keys[k] = 1; });
+    Object.keys(topLive).forEach(function (k) { keys[k] = 1; });
+    Object.keys(keys).forEach(function (req) {
+      var d = topDay[req], l = topLive[req] || {};
+      rows.push({
+        req: req,
+        day: !!d,
+        calls: d ? (d.calls || 0) : 0,
+        errors: d ? (d.errors || 0) : 0,
+        avg_us: d ? (d.avg_us || 0) : 0,
+        max_us: d ? (d.max_us || 0) : 0,
+        total_us: d ? (d.total_us || 0) : 0,
+        failed: l.failed || 0,
+        rejected: l.rejected || 0
+      });
+    });
+    // The share column is the call count as a percentage, so it sorts by it.
+    var k = topSort.key === 'share' ? 'calls' : topSort.key, dir = topSort.dir;
+    rows.sort(function (a, b) {
+      if (k === 'req') { return a.req < b.req ? -dir : (a.req > b.req ? dir : 0); }
+      return (a[k] - b[k]) * dir;
+    });
+    paintTopHead();
     tb.innerHTML = rows.length
       ? rows.map(function (s) {
-          var share = total > 0 ? ((s.calls || 0) * 100 / total).toFixed(1) : '0.0';
+          var share = s.day && topTotal > 0
+            ? (s.calls * 100 / topTotal).toFixed(1) + '%' : '—';
+          var num = function (v) { return s.day ? String(v) : '—'; };
+          var d2 = function (v) { return s.day ? dur(v) : '—'; };
           return '<tr><td class="ellip mono" title="' + esc(s.req) + '">' +
-                 esc(s.req) + '</td><td class="num">' + (s.calls || 0) +
+                 esc(s.req) + '</td><td class="num">' + num(s.calls) +
                  '</td><td class="num muted">' + share +
-                 '%</td><td class="num">' + (s.errors || 0) +
-                 '</td><td class="num">' + dur(s.avg_us) +
-                 '</td><td class="num">' + dur(s.max_us) +
-                 '</td><td class="num">' + dur(s.total_us) + '</td></tr>';
+                 '</td><td class="num">' + num(s.errors) +
+                 '</td><td class="num">' + d2(s.avg_us) +
+                 '</td><td class="num">' + d2(s.max_us) +
+                 '</td><td class="num">' + d2(s.total_us) +
+                 '</td><td class="num">' + s.failed +
+                 '</td><td class="num">' + s.rejected + '</td></tr>';
         }).join('')
-      : '<tr><td colspan="7" class="muted">今天还没有请求</td></tr>';
+      : '<tr><td colspan="9" class="muted">今天还没有请求</td></tr>';
   }
 
   // A bucket's wall clock as "hh:mm", for a chart whose x axis is one day.
@@ -752,22 +830,9 @@
     put('cpu', m.cpu_percent < 0 ? 'n/a' : m.cpu_percent + '%');
     put('mem', bytes(m.mem_rss_bytes));
     paintProcs(m.processes);
-    var topreq = panel.querySelector('[data-topreq]');
-    if (topreq) {
-      var tr = m.top_requests || [];
-      topreq.innerHTML = tr.length
-        ? tr.map(function (s) {
-            return '<tr><td class="ellip mono" title="' + esc(s.req) + '">' +
-                   esc(s.req) + '</td><td class="num">' + (s.count || 0) +
-                   '</td><td class="num">' + (s.errors || 0) +
-                   '</td><td class="num">' + (s.failed || 0) +
-                   '</td><td class="num">' + (s.rejected || 0) +
-                   '</td><td class="num">' + dur(s.avg_us) +
-                   '</td><td class="num">' + dur(s.max_us) +
-                   '</td><td class="num">' + dur(s.total_us) + '</td></tr>';
-          }).join('')
-        : '<tr><td colspan="8" class="muted">暂无请求记录</td></tr>';
-    }
+    topLive = {};
+    (m.top_requests || []).forEach(function (s) { topLive[s.req] = s; });
+    paintTop();
     var top = panel.querySelector('[data-topsql]');
     if (top) {
       var ts = m.top_sql || [];
