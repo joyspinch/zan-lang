@@ -27,6 +27,7 @@
 #include <time.h>
 
 #include "../common/host_oom.h"
+#include "../common/zan_abi.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -110,6 +111,11 @@ typedef struct {
     size_t mapped_size;
     char map_name[96];
     char lock_name[96];
+    /* Anonymous tables have no name at all: they are reached through an
+     * inherited descriptor, so map_name/lock_name stay empty and there is
+     * nothing for destroy to unlink. */
+    int anonymous;
+    int attached;   /* mapped a handle a parent created, does not own the table */
 #ifdef _WIN32
     HANDLE mapping;
     HANDLE mutex;
@@ -837,12 +843,21 @@ void zan_monitor_exit(void *obj) {
 #endif
 
 /* ---- UI-thread dispatch queue (Control.Invoke equivalent) --------------
- * A fixed-capacity ring of Zan delegate function pointers. Background threads
- * enqueue with zan_dispatch_post(); the UI thread drains with
- * zan_dispatch_take() once per frame and invokes each on the UI thread. Only
- * the raw function pointer crosses the thread boundary here — no Zan heap
- * object is allocated off-thread — so the ARC runtime is never touched from a
- * background thread. The queue itself is guarded by an OS mutex. */
+ * A fixed-capacity ring of Zan delegate values. Background threads enqueue
+ * with zan_dispatch_post(); the UI thread drains with zan_dispatch_take()
+ * once per frame and invokes each on the UI thread. The queue itself is
+ * guarded by an OS mutex.
+ *
+ * A queued entry is an owning reference: a capturing lambda is a heap closure
+ * record (see ZAN_CLOSURE_* in zan_abi.h), and while it sits in the ring the
+ * only thing keeping it alive is this queue. Post retains it, take hands that
+ * count to the caller (emitted code treats a call result as owned and releases
+ * it after invoking), and clear releases what it drops. Without the retain the
+ * drain's release dropped a count the queue never held, so a handler an event
+ * still owned -- `btn.Click += () => { ... }` -- was freed the first time it
+ * was posted, and the next use or rebuild of that handler list read freed
+ * memory. Posting still allocates nothing, so a background thread only touches
+ * the record's refcount, never the Zan allocator. */
 
 #define ZAN_DISPATCH_CAP 1024
 static void *g_dispatch_ring[ZAN_DISPATCH_CAP];
@@ -885,6 +900,39 @@ void zan_dispatch_init(void) {
     zan_dispatch_unlock();
 }
 
+/* Is this delegate value a heap closure record (rather than a bare function
+ * pointer, which owns nothing and needs no counting)? */
+static void *zan_delegate_record(void *d) {
+    uintptr_t v = (uintptr_t)d;
+    if (!(v & (uintptr_t)ZAN_CLOSURE_TAG)) return NULL;
+    return (void *)(v & ~(uintptr_t)ZAN_CLOSURE_TAG);
+}
+
+/* Take a reference to a queued delegate. Safe from any thread: the refcount is
+ * the first header word and is updated atomically, exactly as emitted code
+ * does it (zan_rt_retain). */
+static void zan_delegate_retain(void *d) {
+    void *rec = zan_delegate_record(d);
+    if (!rec) return;
+    volatile int64_t *rc = (volatile int64_t *)((char *)rec + ZAN_OBJ_RC_OFF);
+#ifdef _WIN32
+    InterlockedIncrement64((volatile LONG64 *)rc);
+#else
+    __atomic_add_fetch((int64_t *)rc, (int64_t)1, __ATOMIC_SEQ_CST);
+#endif
+}
+
+/* Drop a reference the queue held. Goes through the record's own destructor,
+ * which releases the captured values and frees the record at zero -- so this
+ * touches the Zan heap and belongs on the UI thread (its only caller,
+ * zan_dispatch_clear, is documented as UI-thread only). */
+static void zan_delegate_release(void *d) {
+    void *rec = zan_delegate_record(d);
+    if (!rec) return;
+    void *dtor = *(void **)((char *)rec + ZAN_CLOSURE_DTOR_OFF);
+    if (dtor) ((void (*)(void *))dtor)(rec);
+}
+
 /* Enqueue a delegate to run on the UI thread. Thread-safe. Returns 1 on
  * success, 0 if the delegate was null or the queue was full. */
 int32_t zan_dispatch_post(void *fn) {
@@ -893,6 +941,7 @@ int32_t zan_dispatch_post(void *fn) {
     zan_dispatch_lock();
     int next = (g_dispatch_tail + 1) % ZAN_DISPATCH_CAP;
     if (next != g_dispatch_head) {
+        zan_delegate_retain(fn);
         g_dispatch_ring[g_dispatch_tail] = fn;
         g_dispatch_tail = next;
         ok = 1;
@@ -901,7 +950,9 @@ int32_t zan_dispatch_post(void *fn) {
     return ok;
 }
 
-/* Pop the next queued delegate (UI thread), or NULL when the queue is empty. */
+/* Pop the next queued delegate (UI thread), or NULL when the queue is empty.
+ * The queue's reference travels with the value: the caller invokes it and then
+ * releases it, which is what emitted code does with any call result. */
 void *zan_dispatch_take(void) {
     void *fn = NULL;
     zan_dispatch_lock();
@@ -917,10 +968,19 @@ void *zan_dispatch_take(void) {
  * work a background worker posted for the dead window must not run on the
  * next window, whose frame loop reuses the same global queue. */
 void zan_dispatch_clear(void) {
+    void *drop[ZAN_DISPATCH_CAP];
+    int n = 0;
     zan_dispatch_lock();
+    while (g_dispatch_head != g_dispatch_tail) {
+        drop[n++] = g_dispatch_ring[g_dispatch_head];
+        g_dispatch_head = (g_dispatch_head + 1) % ZAN_DISPATCH_CAP;
+    }
     g_dispatch_head = 0;
     g_dispatch_tail = 0;
     zan_dispatch_unlock();
+    /* Released outside the lock: a record's destructor runs Zan code, which
+     * must not re-enter the queue while it is held. */
+    for (int i = 0; i < n; i++) zan_delegate_release(drop[i]);
 }
 
 int64_t zan_atomic_int_create(int64_t initial_value) {
@@ -993,44 +1053,252 @@ int64_t zan_atomic_int_add(int64_t handle, int64_t delta) {
 #endif
 }
 
-int64_t zan_shared_table_create(
-    const char *name, int32_t capacity_value, int32_t key_size_value,
-    const char *schema) {
-    if (!name || !*name || capacity_value <= 0 ||
+/* The geometry a schema implies: how big the mapping has to be and what the
+ * header must say about it. Shared by the named and the anonymous constructor,
+ * which differ only in where the memory comes from. */
+typedef struct {
+    uint64_t capacity;
+    uint32_t key_size;
+    uint32_t column_count;
+    uint32_t row_stride;
+    size_t total_size;
+    zan_shared_column columns[ZAN_TABLE_MAX_COLUMNS];
+} zan_table_layout;
+
+static int zan_table_layout_of(
+    int32_t capacity_value, int32_t key_size_value, const char *schema,
+    zan_table_layout *out) {
+    if (capacity_value <= 0 ||
         capacity_value > (int32_t)ZAN_TABLE_MAX_CAPACITY ||
         key_size_value <= 0 || key_size_value > ZAN_TABLE_MAX_KEY) {
         return 0;
     }
-
-    uint64_t capacity = zan_round_capacity((uint64_t)capacity_value);
-    uint32_t key_size = (uint32_t)key_size_value;
-    zan_shared_column columns[ZAN_TABLE_MAX_COLUMNS];
-    uint32_t column_count = 0;
-    uint32_t row_stride = 0;
-    memset(columns, 0, sizeof(columns));
+    memset(out, 0, sizeof(*out));
+    out->capacity = zan_round_capacity((uint64_t)capacity_value);
+    out->key_size = (uint32_t)key_size_value;
     if (!zan_parse_schema(
-            schema, key_size, columns, &column_count, &row_stride)) {
+            schema, out->key_size, out->columns, &out->column_count,
+            &out->row_stride)) {
         return 0;
     }
 
     size_t rows_offset = zan_align8(sizeof(zan_shared_header));
-    if ((size_t)capacity > (SIZE_MAX - rows_offset) / row_stride) return 0;
-    size_t rows_size = (size_t)capacity * row_stride;
-    if ((size_t)capacity > (SIZE_MAX - rows_offset - rows_size) / sizeof(uint64_t)) return 0;
-    size_t total_size = rows_offset + rows_size +
-        (size_t)capacity * sizeof(uint64_t);
+    if ((size_t)out->capacity > (SIZE_MAX - rows_offset) / out->row_stride) {
+        return 0;
+    }
+    size_t rows_size = (size_t)out->capacity * out->row_stride;
+    if ((size_t)out->capacity >
+        (SIZE_MAX - rows_offset - rows_size) / sizeof(uint64_t)) {
+        return 0;
+    }
+    out->total_size =
+        rows_offset + rows_size + (size_t)out->capacity * sizeof(uint64_t);
+    return 1;
+}
 
+/* Stamps the header of a freshly mapped table and publishes it. */
+static void zan_table_init_header(
+    zan_shared_table *table, const zan_table_layout *layout) {
+    table->mapped_size = layout->total_size;
+    memset(table->header, 0, layout->total_size);
+    table->header->magic = ZAN_TABLE_MAGIC;
+    table->header->version = ZAN_TABLE_VERSION;
+    table->header->total_size = layout->total_size;
+    table->header->capacity = layout->capacity;
+    table->header->key_size = layout->key_size;
+    table->header->row_stride = layout->row_stride;
+    table->header->column_count = layout->column_count;
+    memcpy(table->header->columns, layout->columns,
+           sizeof(table->header->columns));
+#ifdef _WIN32
+    MemoryBarrier();
+#else
+    __sync_synchronize();
+#endif
+    table->header->ready = 1;
+}
+
+static zan_shared_table *zan_table_alloc(void) {
     zan_shared_table *table = (zan_shared_table *)calloc(1, sizeof(*table));
-    if (!table) return 0;
+    if (!table) return NULL;
 #ifndef _WIN32
     table->fd = -1;
     table->lock_fd = -1;
     if (pthread_mutex_init(&table->local_mutex, NULL) != 0) {
         free(table);
-        return 0;
+        return NULL;
     }
     table->local_mutex_ready = 1;
 #endif
+    return table;
+}
+
+/* ---- anonymous tables: no name, reached through an inherited handle ----
+ *
+ * A named table is addressable by anything running on the machine, which makes
+ * it two problems at once: an unrelated process can read and write a server's
+ * table, and on POSIX the name is a file that outlives a killed process, so the
+ * next run finds the previous run's rows. Anonymous tables have neither: the
+ * memory is owned by the process that created it and handed to its children as
+ * an inheritable descriptor (POSIX fd / Windows HANDLE), the way Swoole's
+ * fork-inherited tables are reachable only inside the server. The kernel frees
+ * it when the last of those processes goes, whether they exited or were killed.
+ *
+ * The creator passes zan_shared_table_handle() to a child (an environment
+ * variable), and the child attaches to it with zan_shared_table_attach(). */
+int64_t zan_shared_table_create_anon(
+    int32_t capacity_value, int32_t key_size_value, const char *schema) {
+    zan_table_layout layout;
+    if (!zan_table_layout_of(capacity_value, key_size_value, schema, &layout)) {
+        return 0;
+    }
+
+    zan_shared_table *table = zan_table_alloc();
+    if (!table) return 0;
+    table->anonymous = 1;
+
+#ifdef _WIN32
+    /* Inheritable, so CreateProcess with bInheritHandles hands the child the
+     * same handle value; NULL name keeps it out of the object namespace. */
+    SECURITY_ATTRIBUTES sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    DWORD size_high = (DWORD)(((uint64_t)layout.total_size) >> 32);
+    DWORD size_low = (DWORD)((uint64_t)layout.total_size & UINT32_MAX);
+    table->mapping = CreateFileMappingA(
+        INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE,
+        size_high, size_low, NULL);
+    if (!table->mapping) {
+        zan_shared_table_free(table);
+        return 0;
+    }
+    table->header = (zan_shared_header *)MapViewOfFile(
+        table->mapping, FILE_MAP_ALL_ACCESS, 0, 0, layout.total_size);
+    if (!table->header) {
+        zan_shared_table_free(table);
+        return 0;
+    }
+#else
+    /* shm_open + immediate shm_unlink: the mapping keeps living through the fd
+     * while its name is gone the moment it exists, so nothing can open it by
+     * name and nothing is left in /dev/shm if this process is killed. The name
+     * only has to survive between the two calls, hence pid + a counter.
+     *
+     * memfd_create would do the same in one call, but it is Linux-only and this
+     * runtime also builds for macOS. */
+    static uint32_t anon_seq = 0;
+    char shm_name[64];
+    snprintf(shm_name, sizeof(shm_name), "/zan_table_%ld_%u_%u",
+             (long)getpid(), (unsigned)time(NULL), anon_seq++);
+    int fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
+        zan_shared_table_free(table);
+        return 0;
+    }
+    shm_unlink(shm_name);
+    /* shm_open sets FD_CLOEXEC, which a worker started by exec would lose the
+     * table to; the descriptor has to survive into the child. */
+    if (fcntl(fd, F_SETFD, 0) != 0) {
+        close(fd);
+        zan_shared_table_free(table);
+        return 0;
+    }
+    table->fd = fd;
+    if (ftruncate(fd, (off_t)layout.total_size) != 0) {
+        zan_shared_table_free(table);
+        return 0;
+    }
+    table->header = (zan_shared_header *)mmap(
+        NULL, layout.total_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (table->header == MAP_FAILED) {
+        table->header = NULL;
+        zan_shared_table_free(table);
+        return 0;
+    }
+#endif
+
+    zan_table_init_header(table, &layout);
+    return (int64_t)(intptr_t)table;
+}
+
+/* The value a child needs to attach: a file descriptor on POSIX, a handle on
+ * Windows. 0 for a named table, which is reached by name instead. */
+int64_t zan_shared_table_handle(int64_t handle) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (!table || !table->anonymous) return 0;
+#ifdef _WIN32
+    return (int64_t)(intptr_t)table->mapping;
+#else
+    return (int64_t)table->fd;
+#endif
+}
+
+/* Child side: map the table its parent created, given the inherited handle.
+ * Everything the mapping needs to be read is inside it, so no schema is
+ * passed -- and a handle that is not a table of this version is rejected. */
+int64_t zan_shared_table_attach(int64_t os_handle) {
+    if (os_handle <= 0) return 0;
+    zan_shared_table *table = zan_table_alloc();
+    if (!table) return 0;
+    table->anonymous = 1;
+    table->attached = 1;
+
+#ifdef _WIN32
+    table->mapping = (HANDLE)(intptr_t)os_handle;
+    table->header = (zan_shared_header *)MapViewOfFile(
+        table->mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+    if (!table->header) {
+        zan_shared_table_free(table);
+        return 0;
+    }
+    table->mapped_size = (size_t)table->header->total_size;
+#else
+    table->fd = (int)os_handle;
+    struct stat stat_buf;
+    if (fstat(table->fd, &stat_buf) != 0 || stat_buf.st_size <= 0) {
+        zan_shared_table_free(table);
+        return 0;
+    }
+    table->mapped_size = (size_t)stat_buf.st_size;
+    table->header = (zan_shared_header *)mmap(
+        NULL, table->mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+        table->fd, 0);
+    if (table->header == MAP_FAILED) {
+        table->header = NULL;
+        zan_shared_table_free(table);
+        return 0;
+    }
+#endif
+
+#ifdef _WIN32
+    MemoryBarrier();
+#else
+    __sync_synchronize();
+#endif
+    if (table->header->ready != 1 ||
+        table->header->magic != ZAN_TABLE_MAGIC ||
+        table->header->version != ZAN_TABLE_VERSION ||
+        table->header->total_size < sizeof(zan_shared_header) ||
+        table->header->total_size > table->mapped_size) {
+        zan_shared_table_free(table);
+        return 0;
+    }
+    return (int64_t)(intptr_t)table;
+}
+
+int64_t zan_shared_table_create(
+    const char *name, int32_t capacity_value, int32_t key_size_value,
+    const char *schema) {
+    if (!name || !*name) return 0;
+    zan_table_layout layout;
+    if (!zan_table_layout_of(capacity_value, key_size_value, schema, &layout)) {
+        return 0;
+    }
+    size_t total_size = layout.total_size;
+
+    zan_shared_table *table = zan_table_alloc();
+    if (!table) return 0;
     zan_make_names(name, table->map_name, table->lock_name);
 
 #ifdef _WIN32
@@ -1083,22 +1351,7 @@ int64_t zan_shared_table_create(
     }
 #endif
 
-    table->mapped_size = total_size;
-    memset(table->header, 0, total_size);
-    table->header->magic = ZAN_TABLE_MAGIC;
-    table->header->version = ZAN_TABLE_VERSION;
-    table->header->total_size = total_size;
-    table->header->capacity = capacity;
-    table->header->key_size = key_size;
-    table->header->row_stride = row_stride;
-    table->header->column_count = column_count;
-    memcpy(table->header->columns, columns, sizeof(columns));
-#ifdef _WIN32
-    MemoryBarrier();
-#else
-    __sync_synchronize();
-#endif
-    table->header->ready = 1;
+    zan_table_init_header(table, &layout);
     return (int64_t)(intptr_t)table;
 }
 
@@ -1196,8 +1449,12 @@ int32_t zan_shared_table_destroy(int64_t handle) {
     if (!table) return 0;
     int32_t result = 1;
 #ifndef _WIN32
-    if (unlink(table->map_name) != 0 && errno != ENOENT) result = 0;
-    if (unlink(table->lock_name) != 0 && errno != ENOENT) result = 0;
+    /* An anonymous table has no name in the filesystem to remove: dropping the
+     * last reference IS its destruction. */
+    if (!table->anonymous) {
+        if (unlink(table->map_name) != 0 && errno != ENOENT) result = 0;
+        if (unlink(table->lock_name) != 0 && errno != ENOENT) result = 0;
+    }
 #endif
     zan_shared_table_free(table);
     return result;

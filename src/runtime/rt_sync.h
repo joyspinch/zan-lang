@@ -34,7 +34,9 @@ void zan_monitor_enter(void *obj);
 void zan_monitor_exit(void *obj);
 
 /* UI-thread dispatch queue: post a delegate from any thread, drain on the UI
- * thread. */
+ * thread. A queued entry is owned by the queue -- post retains a closure
+ * record, take hands that reference to the caller (which invokes and then
+ * releases it), clear releases what it drops. */
 void zan_dispatch_init(void);
 int32_t zan_dispatch_post(void *fn);
 void *zan_dispatch_take(void);
@@ -63,6 +65,14 @@ int64_t zan_monotonic_ns(void);
 int64_t zan_shared_table_create(
     const char *name, int32_t capacity, int32_t key_size, const char *schema);
 int64_t zan_shared_table_open(const char *name);
+/* Anonymous table: no name in any namespace, so nothing outside this process
+ * tree can reach it and nothing survives the last reference. The creator hands
+ * zan_shared_table_handle() -- a descriptor its children inherit -- to a child,
+ * which maps the same memory with zan_shared_table_attach(). */
+int64_t zan_shared_table_create_anon(
+    int32_t capacity, int32_t key_size, const char *schema);
+int64_t zan_shared_table_handle(int64_t handle);
+int64_t zan_shared_table_attach(int64_t os_handle);
 void zan_shared_table_close(int64_t handle);
 int32_t zan_shared_table_destroy(int64_t handle);
 int32_t zan_shared_table_set_int(

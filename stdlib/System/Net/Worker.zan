@@ -405,21 +405,36 @@ class Worker {
         return 19999;
     }
 
+    /// What identifies this server among everything else on the machine: its
+    /// own executable, the way workerman keys a server by its entry script. Two
+    /// copies in two directories are two servers and share nothing; the same
+    /// copy started again is the same server, so it finds what its previous run
+    /// left behind. NOT the port -- a port is configuration, it changes, and
+    /// the control port even moves at startup when something else holds it.
+    static string appId = "";
+
+    static string AppId() {
+        if (appId == "") {
+            long h = SharedTable.Hash(ProcessHost.SelfExe());
+            if (h < 0) { h = 0 - h; }
+            appId = Convert.ToString(h);
+        }
+        return appId;
+    }
+
     /// The default control port is derived from the service port, so an
     /// unrelated program holding it used to be fatal even though nothing
     /// outside the process group ever talks to it. The master may move to
     /// another port and records the one it claimed here, so stop/status/reload
-    /// still find it. Keyed by the service port, which is all the command line
-    /// knows.
+    /// still find it.
     static string CtlPortFile() {
-        int key = 19999;
-        if (workers.Count > 0) { key = workers[0].port; }
         return Path.Combine(Path.GetTempPath(),
-            "zan-worker-" + Convert.ToString(key) + ".ctl");
+            "zan-worker-" + AppId() + ".ctl");
     }
 
     static void RecordControlPort() {
-        File.WriteAllText(CtlPortFile(), Convert.ToString(ControlPort()));
+        File.WriteAllText(CtlPortFile(), Convert.ToString(ControlPort())
+            + " " + CtlToken());
     }
 
     static void ForgetControlPort() {
@@ -440,6 +455,53 @@ class Worker {
         }
         if (port < 1 || port > 65535) { return 0; }
         return port;
+    }
+
+    // ---- instance identity on the control port ----
+    // A master is identified by a token, not just by answering the port:
+    // "something answers PONG on 18099" also happens when an unrelated
+    // instance is reachable there -- a server inside WSL, say, whose port WSL
+    // mirrors onto Windows' loopback. That instance is not this app's master
+    // and must not make this one refuse to start.
+    //
+    // The token is minted by whoever claims the port and written next to the
+    // port in the record file, which lives in this system's temp directory: an
+    // instance from another OS or another user cannot have written it, so its
+    // PONG carries a token that does not match the record and is recognised as
+    // foreign. A worker of THIS master reads the same file its master wrote,
+    // so the fork-bomb guard still sees its own master.
+    static string ctlToken = "";
+
+    static string CtlToken() {
+        if (ctlToken == "") {
+            ctlToken = Convert.ToString(ProcessHost.Pid()) + "-"
+                + Convert.ToString(DateTime.UtcNow().ToUnixSeconds());
+        }
+        return ctlToken;
+    }
+
+    /// The token of the instance that recorded the control port, or "" when
+    /// there is no record.
+    static string RecordedCtlToken() {
+        string f = CtlPortFile();
+        if (!File.Exists(f)) { return ""; }
+        string body = File.ReadAllText(f);
+        int sp = 0 - 1;
+        for (int i = 0; i < body.Length; i = i + 1) {
+            if ((body[i] & 255) == 32) { sp = i; break; }
+        }
+        if (sp < 0) { return ""; }
+        return Worker.TrimEol(body.Substring(sp + 1));
+    }
+
+    static string TrimEol(string s) {
+        int n = s.Length;
+        while (n > 0) {
+            int c = s[n - 1] & 255;
+            if (c != 10 && c != 13 && c != 32 && c != 9) { break; }
+            n = n - 1;
+        }
+        return s.Substring(0, n);
     }
 
     // How long the control port is given to answer: connect and reply budgets
@@ -497,12 +559,30 @@ class Worker {
         // (TIME_WAIT, or a listener left behind by a dead master whose handle
         // an exiting child still held) either refuses the connection or
         // accepts it and never replies -- both are reclaimable below.
-        if (await ControlPortHasMaster()) {
+        int probed = await ProbeControlPort();
+        if (probed == Worker.CTL_OURS) {
             Console.WriteLine("[Worker] FATAL: control port "
                 + Convert.ToString(want)
                 + " is served by a running master; stop it first"
                 + " (<app> stop), or start this one with --ctl-port N");
             exit(1);
+        }
+
+        // Someone else is alive on the port -- or something that cannot show it
+        // is this instance. Reclaiming it would be stealing a live listener, so
+        // the derived default gives way instead: nothing outside this process
+        // group ever talks to it. If that live listener really is another copy
+        // of this server, its SERVICE port is the one that fails to bind, and
+        // that error names the actual conflict.
+        if (probed == Worker.CTL_FOREIGN || probed == Worker.CTL_UNKNOWN) {
+            if (ctlPortFixed) {
+                Console.WriteLine("[Worker] FATAL: control port "
+                    + Convert.ToString(want) + " is held by another program"
+                    + " that is not this app's master (" + wantErr
+                    + "); name a free one with --ctl-port N");
+                exit(1);
+            }
+            return MoveOffControlPort(want, wantErr);
         }
 
         s = BindCtl(want, true);
@@ -520,14 +600,17 @@ class Worker {
             exit(1);
         }
 
-        // The control port is internal: only this master and its own workers
-        // ever connect to it, and they are told which port to use. So an
-        // unrelated program sitting on the derived default is no reason to
-        // refuse to start -- move to the next free port and record it for
-        // stop/status/reload.
+        return MoveOffControlPort(want, wantErr);
+    }
+
+    // The control port is internal: only this master and its own workers ever
+    // connect to it, and they are told which port to use. So an unrelated
+    // program sitting on the derived default is no reason to refuse to start --
+    // move to the next free port and record it for stop/status/reload.
+    static nint MoveOffControlPort(int want, string wantErr) {
         int probe = want + 1;
         while (probe <= want + 64) {
-            s = BindCtl(probe, false);
+            nint s = BindCtl(probe, false);
             if (s >= 0) {
                 controlPort = probe;
                 Console.WriteLine("[Worker] control port "
@@ -619,6 +702,15 @@ class Worker {
         if (!ctlPortFixed) {
             int recorded = RecordedControlPort();
             if (recorded > 0) { controlPort = recorded; }
+        }
+        // stop/reload/status must not be delivered to whatever else happens to
+        // answer on the port: a foreign server there would be stopped in this
+        // app's place. Only an instance whose token matches the record is it.
+        if (await ProbeControlPort() == Worker.CTL_FOREIGN) {
+            Console.WriteLine("[Worker] control port "
+                + Convert.ToString(ControlPort()) + " is answered by another"
+                + " program, not by this app -- ignoring " + cmd);
+            return;
         }
         TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", ControlPort(),
             ctlProbeMs);
@@ -721,19 +813,24 @@ class Worker {
 
     // ---- shared stats table ----
 
-    static string StatsName() {
-        return "zanworker_" + Convert.ToString(ControlPort());
-    }
+    // The table is ANONYMOUS: it has no name, so nothing else on the machine
+    // can open it -- a server's process table is not something an unrelated
+    // program should be able to read, let alone write -- and nothing is left
+    // behind when the server goes, however it goes. The master creates it before
+    // spawning anyone and each worker inherits the handle through the
+    // environment, which is what fork gives Swoole for free and what we have to
+    // hand over explicitly because a worker here is a freshly exec'd process.
+    //
+    // The handle the children attach to. Only meaningful in the master.
+    static long statOsHandle = 0;
 
     static string StatsKey(int wid) {
         if (wid <= 0) { return "self"; }
         return "w" + Convert.ToString(wid);
     }
 
-    /// Master (or single process): create the shared stats table, one row per
-    /// process. Workers open the same table by name.
-    static void StatsCreate(int procs) {
-        SharedTable t = new SharedTable(StatsName(), procs + 8);
+    static SharedTable StatsTable(int procs) {
+        SharedTable t = new SharedTable("", procs + 8);
         t.KeySize(16);
         t.ColumnInt("pid");
         t.ColumnInt("recv");
@@ -741,21 +838,57 @@ class Worker {
         t.ColumnInt("conns");
         t.ColumnInt("cpu");
         t.ColumnInt("rss");
-        if (t.Create()) {
-            // Seed the rows so a worker's first publish writes into an
-            // existing row instead of racing to create one.
-            for (int wid = 0; wid <= procs; wid = wid + 1) {
-                t.SetInt(StatsKey(wid), "pid", 0);
-            }
-            statTable = t;
-            return;
-        }
-        SharedTable existing = SharedTable.Open(StatsName());
-        if (existing.IsOpen()) { statTable = existing; }
+        return t;
     }
 
-    static void StatsOpen() {
-        SharedTable t = SharedTable.Open(StatsName());
+    // Seeds the rows so a worker's first publish writes into an existing row
+    // instead of racing to create one.
+    static void StatsSeed(SharedTable t, int procs) {
+        for (int wid = 0; wid <= procs; wid = wid + 1) {
+            t.SetInt(StatsKey(wid), "pid", 0);
+            t.SetInt(StatsKey(wid), "recv", 0);
+            t.SetInt(StatsKey(wid), "sent", 0);
+            t.SetInt(StatsKey(wid), "conns", 0);
+            t.SetInt(StatsKey(wid), "cpu", 0);
+            t.SetInt(StatsKey(wid), "rss", 0);
+        }
+    }
+
+    /// Master (or single process): create the stats table, one row per process.
+    /// Must run before the first worker is spawned -- a worker can only be given
+    /// a handle that already exists.
+    static void StatsCreate(int procs) {
+        SharedTable t = StatsTable(procs);
+        if (!t.CreateAnonymous()) {
+            Console.WriteLine("[Worker] cannot create the shared stats table;"
+                + " per-process counters will read as zero");
+            return;
+        }
+        StatsSeed(t, procs);
+        statTable = t;
+        statOsHandle = t.OsHandle();
+    }
+
+    // Master only, on the way out. The kernel would reclaim the memory anyway
+    // once the last worker holding it is gone -- there is no name and no file to
+    // clean up -- but dropping it here means a master that keeps running after
+    // its workers (a failed start) is not sitting on a mapping.
+    static void StatsDestroy() {
+        SharedTable t = statTable;
+        statOsHandle = 0;
+        if (t == null) { return; }
+        statTable = null;
+        if (t.IsOpen()) { bool _d = t.Destroy(); }
+    }
+
+    // Worker side: map the table the master created and handed down. Nothing to
+    // attach to (a stats table that failed to be created, or an executable run
+    // as a worker by something other than our master) leaves the worker without
+    // one, which only costs it its row in `status`.
+    static void StatsAttach() {
+        string env = ProcessHost.Env("ZAN_STATS_HANDLE");
+        if (env == "") { return; }
+        SharedTable t = SharedTable.Attach(Convert.ToInt64(env));
         if (t.IsOpen()) { statTable = t; }
     }
 
@@ -837,6 +970,10 @@ class Worker {
         // like a worker.
         SetEnvironmentVariableA("ZAN_WORKER_ID", Convert.ToString(wid));
         SetEnvironmentVariableA("ZAN_CTL_PORT", Convert.ToString(ctl));
+        // The stats table is anonymous; this handle is the only way in, and the
+        // child gets it because StartProgram creates the process with handle
+        // inheritance on.
+        SetEnvironmentVariableA("ZAN_STATS_HANDLE", Convert.ToString(statOsHandle));
         // Started directly, NOT through `cmd.exe /c`: a shell hop would leave
         // one cmd.exe plus one conhost.exe alive alongside every worker for as
         // long as it runs, so N workers (and every respawn) pile up as a crowd
@@ -844,9 +981,13 @@ class Worker {
         Process.StartProgram(exe, Worker.WorkerLogPath(wid));
         SetEnvironmentVariableA("ZAN_WORKER_ID", "");
         SetEnvironmentVariableA("ZAN_CTL_PORT", "");
+        SetEnvironmentVariableA("ZAN_STATS_HANDLE", "");
         #else
+        // The descriptor is not close-on-exec, so it survives the shell hop and
+        // arrives in the worker under the same number.
         string cmd = "ZAN_WORKER_ID=" + Convert.ToString(wid)
             + " ZAN_CTL_PORT=" + Convert.ToString(ctl)
+            + " ZAN_STATS_HANDLE=" + Convert.ToString(statOsHandle)
             + " \"" + exe + "\"";
         string log = Worker.WorkerLogPath(wid);
         if (log != "") {
@@ -889,14 +1030,42 @@ class Worker {
     /// running master" until the leftover handle was found and killed -- a
     /// reboot being the usual cure. So talk to it: only something that answers
     /// PONG owns the port as a master.
-    static async bool ControlPortHasMaster() {
+    ///
+    /// And only a master of THIS instance is one this process must stand down
+    /// for: the answer carries the token from the record file (see CtlToken),
+    /// so an unrelated server reachable on the same loopback port -- one inside
+    /// WSL, whose ports Windows mirrors -- is reported as foreign instead of
+    /// stopping this app from starting.
+    ///
+    /// Returns CTL_FREE (nothing answers, the port is reclaimable), CTL_OURS
+    /// (this app's master is running -- it proved it by echoing the token from
+    /// the record file), CTL_FOREIGN (a master of some other instance) or
+    /// CTL_UNKNOWN (something answered PONG but named no token, which is how a
+    /// build from before the token answers).
+    static const int CTL_FREE = 0;
+    static const int CTL_OURS = 1;
+    static const int CTL_FOREIGN = 2;
+    static const int CTL_UNKNOWN = 3;
+
+    static async int ProbeControlPort() {
         TcpClient probe = await TcpClient.ConnectAsync("127.0.0.1",
             ControlPort(), ctlProbeMs);
-        if (probe == null || !probe.IsConnected()) { return false; }
+        if (probe == null || !probe.IsConnected()) { return Worker.CTL_FREE; }
         int _s = await probe.SendAsync("PING\n");
         string reply = await probe.RecvAsync(64, ctlProbeMs);
         probe.Close();
-        return reply.Length >= 4 && reply.Substring(0, 4) == "PONG";
+        if (reply.Length < 4 || reply.Substring(0, 4) != "PONG") {
+            return Worker.CTL_FREE;
+        }
+        // "PONG <pid> <token>", and only a matching token proves the answer
+        // comes from this instance: an unproven claim of ownership is what made
+        // a stranger on the port fatal in the first place.
+        List<string> f = SplitWords(reply);
+        if (f.Count < 3) { return Worker.CTL_UNKNOWN; }
+        string mine = RecordedCtlToken();
+        if (mine != "" && f[2] == mine) { return Worker.CTL_OURS; }
+        if (ctlToken != "" && f[2] == ctlToken) { return Worker.CTL_OURS; }
+        return Worker.CTL_FOREIGN;
     }
 
     static async void RunAsMaster(int procs) {
@@ -1111,9 +1280,12 @@ class Worker {
     static async void HandleCliCommand(TcpClient conn, string cmd) {
         if (cmd == "PING") {
             // Liveness probe (ClaimControlPort): proves a master is accepting
-            // AND serving, not just a socket left listening by a dead one.
+            // AND serving, not just a socket left listening by a dead one. The
+            // token says WHICH instance answered, so a server that merely
+            // shares the loopback port is not mistaken for this app's master.
             int _p = await conn.SendAsync("PONG "
-                + Convert.ToString(ProcessHost.Pid()) + "\n");
+                + Convert.ToString(ProcessHost.Pid()) + " " + CtlToken()
+                + "\n");
             conn.Close();
             return;
         }
@@ -1148,6 +1320,7 @@ class Worker {
             waited = waited + 200;
         }
         ForgetControlPort();
+        StatsDestroy();
         Console.WriteLine("[Worker] master stopped");
         exit(0);
     }
@@ -1289,7 +1462,8 @@ class Worker {
         if (f.Count == 0) { conn.Close(); return; }
         if (f[0] == "PING") {
             int _p = await conn.SendAsync("PONG "
-                + Convert.ToString(ProcessHost.Pid()) + "\n");
+                + Convert.ToString(ProcessHost.Pid()) + " " + CtlToken()
+                + "\n");
             conn.Close();
             return;
         }
@@ -1337,9 +1511,12 @@ class Worker {
             await Task.Delay(100);
             waited = waited + 100;
         }
-        // A worker never wrote the record; only the process that claimed the
-        // control port drops it.
-        if (!ProcessHost.IsWorker()) { ForgetControlPort(); }
+        // A worker never wrote the record and does not own the stats table;
+        // only the process that claimed the control port drops them.
+        if (!ProcessHost.IsWorker()) {
+            ForgetControlPort();
+            StatsDestroy();
+        }
         exit(0);
     }
 
@@ -1391,7 +1568,7 @@ class Worker {
         #endif
 
         // Publish this worker's counters into the shared stats table.
-        StatsOpen();
+        StatsAttach();
         Task.Spawn(StatsPublishLoop());
 
         // Liveness watch: the master holds this connection open for our whole

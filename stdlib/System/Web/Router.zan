@@ -5,11 +5,12 @@ using System.Json;
 namespace System.Web;
 
 /// One routed endpoint's shared-memory counters in Router.StatsJson. Keys
-/// (route/count/avg_ms) match the documented JSON array shape.
+/// (route/count/avg_us) match the documented JSON array shape; the average is
+/// in microseconds, the unit every duration the server records is kept in.
 class RouteHitDoc {
     string route;
     long count;
-    long avg_ms;
+    long avg_us;
 }
 
 /// <summary>Request handler signature: fill the response on ctx. Async so an
@@ -131,7 +132,7 @@ class Router {
     // Stored separately so RecordHit never touches a Route object (no ARC).
     List<string> flatKeys;
     // Cross-process shared stats table (SharedTable backed by named shared
-    // memory). Columns: "hits" (int), "total_ms" (int). Keyed by route.key.
+    // memory). Columns: "hits" (int), "total_us" (int). Keyed by route.key.
     // Null until InitStats is called. All workers share the same table so
     // /admin/stats reflects the aggregate across every worker process.
     SharedTable routeStats;
@@ -178,14 +179,14 @@ class Router {
         SharedTable t = new SharedTable(name, cap + 4);
         t.KeySize(128);
         t.ColumnInt("hits");
-        t.ColumnInt("total_ms");
+        t.ColumnInt("total_us");
         if (t.Create()) {
             // Master (or single process): seed every route row so workers
             // can Increment on a pre-existing row without triggering a
             // capacity-limited auto-create under concurrent first requests.
             for (int i = 0; i < this.flatKeys.Count; i = i + 1) {
                 t.SetInt(this.flatKeys[i], "hits", 0);
-                t.SetInt(this.flatKeys[i], "total_ms", 0);
+                t.SetInt(this.flatKeys[i], "total_us", 0);
             }
             this.routeStats = t;
         } else {
@@ -199,12 +200,12 @@ class Router {
     /// <summary>Record one served request. Two atomic increments into the
     /// shared stats table -- no Route object touched, no per-process
     /// computation.</summary>
-    void RecordHit(int idx, long ms) {
+    void RecordHit(int idx, long us) {
         if (this.routeStats == null) { return; }
         if (idx < 0 || idx >= this.flatKeys.Count) { return; }
         string key = this.flatKeys[idx];
         this.routeStats.Increment(key, "hits", 1);
-        this.routeStats.Increment(key, "total_ms", ms);
+        this.routeStats.Increment(key, "total_us", us);
     }
 
     /// <summary>Every registered route (statics then dynamics) -- used by the
@@ -218,26 +219,33 @@ class Router {
         return outp;
     }
 
-    /// <summary>Per-route request stats as a JSON array (only routes with at
-    /// least one hit), read from the cross-process shared table. Returns "[]"
-    /// when InitStats has not been called yet.</summary>
-    string StatsJson() {
-        if (this.routeStats == null) { return "[]"; }
+    /// <summary>Per-route request stats (only routes with at least one hit),
+    /// read from the cross-process shared table. Empty when InitStats has not
+    /// been called yet. Callers that embed this in a larger document take the
+    /// list rather than StatsJson, so the numbers are written out once instead
+    /// of being serialised, parsed back and serialised again.</summary>
+    List<RouteHitDoc> Stats() {
         List<RouteHitDoc> outp = new List<RouteHitDoc>();
+        if (this.routeStats == null) { return outp; }
         for (int i = 0; i < this.flatKeys.Count; i = i + 1) {
             string key = this.flatKeys[i];
             long hits = this.routeStats.GetInt(key, "hits");
             if (hits > 0) {
-                long totalMs = this.routeStats.GetInt(key, "total_ms");
-                long avgMs = totalMs / hits;
+                long totalUs = this.routeStats.GetInt(key, "total_us");
+                long avgUs = totalUs / hits;
                 RouteHitDoc o = new RouteHitDoc();
                 o.route = key;
                 o.count = hits;
-                o.avg_ms = avgMs;
+                o.avg_us = avgUs;
                 outp.Add(o);
             }
         }
-        return Json.Serialize<List<RouteHitDoc>>(outp);
+        return outp;
+    }
+
+    /// <summary>Stats() as a JSON array.</summary>
+    string StatsJson() {
+        return Json.Serialize<List<RouteHitDoc>>(this.Stats());
     }
 
     Route Get(string pattern, HttpHandler handler) { return this.Add("GET", pattern, handler); }

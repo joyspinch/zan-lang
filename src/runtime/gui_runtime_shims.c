@@ -36,6 +36,9 @@ EXPORT void zan_gui_webview_set_frame(i32 h, i32 x, i32 y, i32 w, i32 hh) {
 EXPORT void zan_gui_webview_set_visible(i32 h, i32 visible) {
     (void)h; (void)visible;
 }
+EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
+    (void)h; (void)spec;
+}
 EXPORT void zan_gui_webview_navigate(i32 h, const char *url) {
     (void)h; (void)url;
 }

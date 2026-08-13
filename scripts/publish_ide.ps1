@@ -107,9 +107,27 @@ Copy-Item $stdlib (Join-Path $dist 'stdlib') -Recurse
 # ---- the IDE's own page-layout stylesheet, beside the install root ----
 # ide.css (flex/widths/gaps) is resolved from BaseDir()/ExeDir(); ship it in the
 # install root so it loads without falling back to the source tree.
-$ideCss = Join-Path $root 'src\ide_zan\ide.css'
+# (same source path build_ide.ps1 copies from -- it lives under assets\)
+$ideCss = Join-Path $root 'src\ide_zan\assets\ide.css'
 if (Test-Path $ideCss) { Copy-Item $ideCss (Join-Path $dist 'ide.css') -Force }
-else { Write-Output "PUBLISH_WARN: src\ide_zan\ide.css missing (IDE uses default layout)" }
+else { Write-Output "PUBLISH_WARN: src\ide_zan\assets\ide.css missing (IDE uses default layout)" }
+
+# ---- native driver DLLs the IDE itself loads at run time -------------------
+# ZanIDE.exe imports the driver DLLs of the stdlib namespaces it uses (TLS ->
+# libssl/libcrypto, Sqlite -> libsqlite3). zanc stages them next to the exe it
+# produces and reports each one, and build_ide.ps1 records that report in
+# build\ZanIDE.deps.txt; ship exactly those files. Without them the published
+# IDE cannot start on a machine that has no copy of them on PATH.
+$depsList = Join-Path $b 'ZanIDE.deps.txt'
+if (Test-Path $depsList) {
+    foreach ($dep in (Get-Content $depsList | Where-Object { $_.Trim() -ne "" })) {
+        $depSrc = Join-Path $b $dep.Trim()
+        if (Test-Path $depSrc) { Copy-Item $depSrc (Join-Path $dist $dep.Trim()) -Force }
+        else { Write-Output "PUBLISH_WARN: missing build\$dep (the IDE will not start without it)" }
+    }
+} else {
+    Write-Output "PUBLISH_WARN: build\ZanIDE.deps.txt missing (run scripts\build_ide.ps1); driver DLLs the IDE needs may be absent from the release"
+}
 
 # The Help topics are baked into the exe, but a copy next to it wins (see
 # DocsData.DiskPaths): shipping it lets a user or a docs update replace the

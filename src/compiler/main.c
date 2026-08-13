@@ -2933,13 +2933,18 @@ int main(int argc, char **argv) {
                      * each other, so a single-pass scan needs the group (the
                      * runtime objects above are already on the link line). */
                     argv[a++] = "--start-group";
-                    /* -lwinpthread: libgcc's unwinder reaches its per-thread
+                    /* winpthread: libgcc's unwinder reaches its per-thread
                      * state through gthr-default.h, which is the POSIX one in
                      * the bundled mingw, so -lgcc leaves pthread_* undefined
-                     * without it (the exe link line below carries it too). */
+                     * without it (the exe link line below carries it too).
+                     * Named as a static archive: the bundled mingw ships both
+                     * libwinpthread.a and libwinpthread.dll.a, and -lwinpthread
+                     * picks the import library, which makes every artifact need
+                     * libwinpthread_64-1.dll beside it at run time - a DLL that
+                     * is not part of the toolchain. */
                     static const char *const dllcrt[] = {
                         "-lmingw32", "-lgcc", "-lmoldname", "-lmingwex",
-                        "-lmsvcrt", "-lkernel32", "-lwinpthread", NULL };
+                        "-lmsvcrt", "-lkernel32", "-l:libwinpthread.a", NULL };
                     for (int li = 0; dllcrt[li] && a < 150; li++)
                         argv[a++] = dllcrt[li];
                     /* the IO reactor uses Winsock */
@@ -3632,7 +3637,7 @@ int main(int argc, char **argv) {
             argv[a++] = "-lmoldname"; argv[a++] = "-lmingwex";
             argv[a++] = "-lmsvcrt";   argv[a++] = "-lkernel32";
             argv[a++] = "-ladvapi32"; argv[a++] = "-lshell32";
-            argv[a++] = "-luser32";   argv[a++] = "-lwinpthread";
+            argv[a++] = "-luser32";   argv[a++] = "-l:libwinpthread.a";
             if (rt_io_obj) argv[a++] = "-lws2_32";
             /* extern [DllImport] libraries (skip those already in the CRT) */
             char libbufs[24][128]; int nb = 0;
@@ -3706,7 +3711,8 @@ int main(int argc, char **argv) {
             }
             {
                 size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -lwinpthread");
+                snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+                         " -l:libwinpthread.a");
             }
             for (int li = 0; li < irgen.extern_lib_count; li++) {
                 int nlen;
@@ -3982,3 +3988,4 @@ int main(int argc, char **argv) {
     free(source);
     return 0;
 }
+

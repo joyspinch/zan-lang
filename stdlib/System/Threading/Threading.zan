@@ -429,6 +429,15 @@ class SharedTable {
     [DllImport("crt", EntryPoint = "zan_shared_table_open")]
     static extern nint NativeOpen(string name);
 
+    [DllImport("crt", EntryPoint = "zan_shared_table_create_anon")]
+    static extern nint NativeCreateAnon(int capacity, int keySize, string schema);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_handle")]
+    static extern long NativeOsHandle(nint handle);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_attach")]
+    static extern nint NativeAttach(long osHandle);
+
     [DllImport("crt", EntryPoint = "zan_shared_table_close")]
     static extern void NativeClose(nint handle);
 
@@ -563,6 +572,37 @@ class SharedTable {
     static SharedTable Open(string name) {
         SharedTable table = new SharedTable(name, 1);
         table.handle = NativeOpen(name);
+        return table;
+    }
+
+    /// <summary>建一张匿名表：不占用任何全局命名空间，机器上的其它程序
+    /// 既打不开也读不到，也不会在文件系统里留下东西——最后一个引用消失
+    /// （包括进程被强杀）内核就回收。子进程要用它，只能由建表的进程把
+    /// OsHandle() 传下去（子进程继承该句柄/描述符），再用 Attach() 映射
+    /// 同一块内存，就像 fork 出来的那样。
+    ///
+    /// 因此必须在派生子进程之前建好：之后才建的表，已有的子进程拿不到。</summary>
+    bool CreateAnonymous() {
+        if (this.handle != 0) {
+            return false;
+        }
+        this.handle = NativeCreateAnon(
+            this.tableCapacity, this.tableKeySize, this.tableSchema);
+        return this.handle != 0;
+    }
+
+    /// <summary>匿名表要交给子进程的句柄（POSIX 是文件描述符，Windows 是
+    /// 可继承 HANDLE）。按名字建的表返回 0：它本来就按名字打开。</summary>
+    long OsHandle() {
+        return NativeOsHandle(this.handle);
+    }
+
+    /// <summary>子进程侧：映射父进程建好并继承下来的匿名表。表的结构写在
+    /// 内存自身的头部，所以不用重复声明列；句柄不是一张本版本的表时返回
+    /// 未打开的表。</summary>
+    static SharedTable Attach(long osHandle) {
+        SharedTable table = new SharedTable("", 1);
+        table.handle = NativeAttach(osHandle);
         return table;
     }
 

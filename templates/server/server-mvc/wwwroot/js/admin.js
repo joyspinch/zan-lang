@@ -597,18 +597,75 @@
     return (v / 1048576).toFixed(1) + ' MB';
   }
 
+  // Every duration the server publishes is MICROSECONDS (*_us). The unit is
+  // picked per value because the range spans four orders of magnitude: a served
+  // request is hundreds of microseconds, a stuck one is seconds -- and the
+  // millisecond integers this replaces showed every fast endpoint as "0 ms".
+  function dur(us) {
+    us = us || 0;
+    if (us < 0) { return 'n/a'; }
+    if (us < 1000) { return us + ' \u00b5s'; }
+    if (us < 1000000) { return (us / 1000).toFixed(2) + ' ms'; }
+    return (us / 1000000).toFixed(2) + ' s';
+  }
+
+  // Microseconds as fractional milliseconds, for a chart whose axis is one
+  // unit: 890us plots as 0.89, not as a flat 0.
+  function ms(us) { return Math.round((us || 0) / 10) / 100; }
+
+  // Uptime in the same shape the server-rendered fields use (Fmt.Uptime):
+  // "d hh:mm:ss" once it has been up for a day.
+  function upt(msv) {
+    var t = Math.floor((msv || 0) / 1000);
+    var p2 = function (n) { return (n < 10 ? '0' : '') + n; };
+    var clock = p2(Math.floor((t % 86400) / 3600)) + ':' +
+                p2(Math.floor((t % 3600) / 60)) + ':' + p2(t % 60);
+    var d = Math.floor(t / 86400);
+    return d > 0 ? d + 'd ' + clock : clock;
+  }
+
+  // One row per server process. Everything else on the page is the merge of
+  // every worker, so this table is where an uneven or dead worker shows up:
+  // `live` is 0 once a worker has stopped publishing, and its last totals stay
+  // on screen (marked stale) instead of silently leaving the table.
+  function paintProcs(rows) {
+    var tb = panel.querySelector('[data-procs]');
+    if (!tb) { return; }
+    rows = rows || [];
+    tb.innerHTML = rows.length
+      ? rows.map(function (p) {
+          var stale = !p.live;
+          return '<tr' + (stale ? ' class="muted"' : '') + '><td class="mono">' +
+                 (p.worker || 0) + '</td><td class="mono">' + (p.pid || 0) +
+                 '</td><td class="mono">' + upt(p.uptime_ms) +
+                 '</td><td class="num">' + (p.requests || 0) +
+                 '</td><td class="num">' + (p.errors || 0) +
+                 '</td><td class="num">' + dur(p.avg_us) +
+                 '</td><td class="num">' + dur(p.max_us) +
+                 '</td><td class="num">' + (p.concurrent || 0) +
+                 '</td><td class="num">' + (p.streams || 0) +
+                 '</td><td class="num">' + (p.queries || 0) +
+                 '</td><td class="num">' + (p.cpu_percent < 0 ? 'n/a' : p.cpu_percent + '%') +
+                 '</td><td class="num">' + bytes(p.mem_rss_bytes) +
+                 '</td><td class="num">' + (stale ? (p.age || 0) + 's 未上报' : '正常') +
+                 '</td></tr>';
+        }).join('')
+      : '<tr><td colspan="13" class="muted">等待数据…</td></tr>';
+  }
+
   function paintSnapshot(m) {
     var r = m.requests || {}, q = m.queries || {};
     put('requests', r.count || 0);
     put('errors', r.errors || 0);
     put('failed', r.failed || 0);
     put('rejected', r.rejected || 0);
-    put('avg_ms', (r.avg_ms || 0) + ' ms');
-    put('max_ms', (r.max_ms || 0) + ' ms');
+    put('avg_us', dur(r.avg_us));
+    put('max_us', dur(r.max_us));
     put('queries', q.count || 0);
-    put('query_avg_ms', (q.avg_ms || 0) + ' ms');
+    put('query_avg_us', dur(q.avg_us));
     put('cpu', m.cpu_percent < 0 ? 'n/a' : m.cpu_percent + '%');
     put('mem', bytes(m.mem_rss_bytes));
+    paintProcs(m.processes);
     var topreq = panel.querySelector('[data-topreq]');
     if (topreq) {
       var tr = m.top_requests || [];
@@ -619,9 +676,9 @@
                    '</td><td class="num">' + (s.errors || 0) +
                    '</td><td class="num">' + (s.failed || 0) +
                    '</td><td class="num">' + (s.rejected || 0) +
-                   '</td><td class="num">' + (s.avg_ms || 0) +
-                   '</td><td class="num">' + (s.max_ms || 0) +
-                   '</td><td class="num">' + (s.total_ms || 0) + '</td></tr>';
+                   '</td><td class="num">' + dur(s.avg_us) +
+                   '</td><td class="num">' + dur(s.max_us) +
+                   '</td><td class="num">' + dur(s.total_us) + '</td></tr>';
           }).join('')
         : '<tr><td colspan="8" class="muted">暂无请求记录</td></tr>';
     }
@@ -632,9 +689,9 @@
         ? ts.map(function (s) {
             return '<tr><td class="ellip mono" title="' + esc(s.sql) + '">' +
                    esc(s.sql) + '</td><td class="num">' + (s.count || 0) +
-                   '</td><td class="num">' + (s.avg_ms || 0) +
-                   '</td><td class="num">' + (s.max_ms || 0) +
-                   '</td><td class="num">' + (s.total_ms || 0) + '</td></tr>';
+                   '</td><td class="num">' + dur(s.avg_us) +
+                   '</td><td class="num">' + dur(s.max_us) +
+                   '</td><td class="num">' + dur(s.total_us) + '</td></tr>';
           }).join('')
         : '<tr><td colspan="5" class="muted">暂无 SQL 记录</td></tr>';
     }
@@ -653,12 +710,12 @@
       { color: '#b42318', label: '错误', values: pts.map(function (p) { return p.err; }) }
     ], pts, '');
     draw('chart-lat', [
-      { color: '#7c3aed', label: '平均', values: pts.map(function (p) { return p.avg_ms; }) },
-      { color: '#d97706', label: 'P95', values: pts.map(function (p) { return p.p95_ms; }) }
+      { color: '#7c3aed', label: '平均', values: pts.map(function (p) { return ms(p.avg_us); }) },
+      { color: '#d97706', label: 'P95', values: pts.map(function (p) { return ms(p.p95_us); }) }
     ], pts, ' ms');
     draw('chart-db', [
       { color: '#0f766e', label: '查询数', values: pts.map(function (p) { return p.queries; }) },
-      { color: '#0891b2', label: '平均 ms', values: pts.map(function (p) { return p.query_avg_ms; }) }
+      { color: '#0891b2', label: '平均 ms', values: pts.map(function (p) { return ms(p.query_avg_us); }) }
     ], pts, '');
     draw('chart-sys', [
       { color: '#15803d', label: 'CPU %', values: pts.map(function (p) { return Math.max(p.cpu_percent, 0); }) },

@@ -1,0 +1,268 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace Gui;
+
+/// <summary>
+/// 把一个原生浮层的可见区域下发给它的后端。`spec` 是
+/// "x,y,w,h;x,y,w,h;..." 的矩形并集（画布坐标，与
+/// Render 收到的矩形同一坐标系）；空串表示本帧完全被遮挡，
+/// 后端应把视图隐藏起来。
+/// </summary>
+delegate void NativeClipFn(int handle, string spec);
+
+/// <summary>
+/// 一个原生浮层本帧申请占用的矩形，以及下发裁剪结果的回调。
+/// </summary>
+class NativeLayerReq {
+    /// 登记它的窗口：一个进程可以开多个窗口，结算某个窗口这一帧时
+    /// 不能去动别的窗口的浮层。
+    App owner;
+    int handle;
+    int x;
+    int y;
+    int w;
+    int h;
+    NativeClipFn apply;
+
+    NativeLayerReq(App owner, int handle, int x, int y, int w, int h,
+                   NativeClipFn apply) {
+        this.owner = owner;
+        this.handle = handle;
+        this.x = x;
+        this.y = y;
+        this.w = w;
+        this.h = h;
+        this.apply = apply;
+    }
+}
+
+/// <summary>
+/// 原生浮层（WebView2 的子 HWND、WKWebView 的 NSView 等）的遮挡裁剪。
+///
+/// 这些视图是 OS 层的兄弟层，永远画在软件画布之上：不管 Zan 侧的
+/// 绘制顺序如何，标签条、右键菜单、下拉、模态对话框都会被网页盖住。
+/// 唯一的解法是在原生层按区域裁剪，因此控件不再自己决定可见性，
+/// 而是每帧向 App 登记「我要占这个矩形」（Register），由
+/// App.PresentFrame 在所有自绘 UI（含 RunOverlays）之后统一结算：
+/// 可见区域 = 自身矩形 − 本帧所有遮挡区，再经 NativeClipFn 下发。
+///
+/// 遮挡区有两个来源：命中测试里的拦截区（App.BlockHitsRect 注册的
+/// 弹层/遮罩，widgetType == -1），以及不铺遮罩但确实画在上面的浮动
+/// 内容自行调用的 Occlude()（提示气泡、Toast 之类）。
+/// </summary>
+class NativeLayer {
+    /// 单个浮层最多保留的可见矩形数。菜单/弹层通常只切出
+    /// 三五块；上限只是防止病态的遮挡组合把矩形炸开，超出后
+    /// 停止继续切分（宁可少切一块也不要每帧算爆）。
+    static int MaxRects() { return 24; }
+
+    /// 曾经登记过的浮层（跨帧保留，每个句柄一条）。某一帧没有
+    /// 登记的浮层说明它这帧不该上屏：设计出来的控件树在隐藏的
+    /// 标签页上根本不会走 OnPaint，没有任何代码替它调 Hide()，
+    /// 原生兄弟层就会一直挂在窗口上盖住新的活动页。这里兜底把
+    /// 它裁成空区域（后端即隐藏）。
+    static List<NativeLayerReq> tracked;
+
+    /// 登记本帧的原生浮层。`handle` 是后端句柄，矩形是画布坐标，
+    /// `apply` 必须是普通静态方法（委托是纯函数指针）。
+    static void Register(App app, int handle, int x, int y, int w, int h,
+                         NativeClipFn apply) {
+        if (app == null || handle == 0 || apply == null) { return; }
+        if (w <= 0 || h <= 0) { return; }
+        NativeLayerReq req = new NativeLayerReq(app, handle, x, y, w, h, apply);
+        app.nativeLayers.Add(req);
+        NativeLayer.Track(req);
+    }
+
+    /// 记住这个句柄（同一句柄只留最新一条）。
+    static void Track(NativeLayerReq req) {
+        if (NativeLayer.tracked == null) {
+            NativeLayer.tracked = new List<NativeLayerReq>();
+        }
+        for (int i = 0; i < NativeLayer.tracked.Count; i = i + 1) {
+            if (NativeLayer.tracked[i].handle == req.handle) {
+                NativeLayer.tracked[i] = req;
+                return;
+            }
+        }
+        NativeLayer.tracked.Add(req);
+    }
+
+    /// 忘掉一个已销毁的句柄（后端句柄可被复用，留着会把裁剪
+    /// 下发到别人的视图上）。
+    static void Forget(int handle) {
+        if (NativeLayer.tracked == null || handle == 0) { return; }
+        List<NativeLayerReq> keep = new List<NativeLayerReq>();
+        for (int i = 0; i < NativeLayer.tracked.Count; i = i + 1) {
+            if (NativeLayer.tracked[i].handle != handle) {
+                keep.Add(NativeLayer.tracked[i]);
+            }
+        }
+        NativeLayer.tracked = keep;
+    }
+
+    /// 本帧 `app` 是否登记过该句柄。
+    static bool Registered(App app, int handle) {
+        for (int i = 0; i < app.nativeLayers.Count; i = i + 1) {
+            if (app.nativeLayers[i].handle == handle) { return true; }
+        }
+        return false;
+    }
+
+    /// 声明一块画在原生浮层之上、但没有注册命中拦截区的区域。
+    static void Occlude(App app, int x, int y, int w, int h) {
+        if (app == null) { return; }
+        if (w <= 0 || h <= 0) { return; }
+        app.nativeOccluders.Add(x);
+        app.nativeOccluders.Add(y);
+        app.nativeOccluders.Add(w);
+        app.nativeOccluders.Add(h);
+    }
+
+    /// 结算本帧：给每个登记的浮层算出可见区域并下发。由
+    /// App.PresentFrame 在弹层渲染之后调用。
+    static void Flush(App app) {
+        if (app == null) { return; }
+        NativeLayer.HideUnregistered(app);
+        if (app.nativeLayers.Count == 0) { return; }
+        List<int> occ = NativeLayer.Occluders(app);
+        for (int i = 0; i < app.nativeLayers.Count; i = i + 1) {
+            NativeLayerReq req = app.nativeLayers[i];
+            List<int> vis = new List<int>();
+            vis.Add(req.x);
+            vis.Add(req.y);
+            vis.Add(req.w);
+            vis.Add(req.h);
+            int k = 0;
+            while (k + 3 < occ.Count) {
+                if (vis.Count == 0) { break; }
+                if (vis.Count > NativeLayer.MaxRects() * 4) { break; }
+                vis = NativeLayer.Subtract(vis, occ[k], occ[k + 1],
+                                           occ[k + 2], occ[k + 3]);
+                k = k + 4;
+            }
+            req.apply(req.handle, NativeLayer.Spec(vis));
+        }
+    }
+
+    /// 本窗口本帧没有登记的已知浮层：裁成空区域，后端隐藏它。
+    static void HideUnregistered(App app) {
+        if (NativeLayer.tracked == null) { return; }
+        for (int i = 0; i < NativeLayer.tracked.Count; i = i + 1) {
+            NativeLayerReq k = NativeLayer.tracked[i];
+            if (k.owner != app) { continue; }
+            if (NativeLayer.Registered(app, k.handle)) { continue; }
+            k.apply(k.handle, "");
+        }
+    }
+
+    /// 本帧的遮挡矩形：命中拦截区 + 显式登记的浮动内容。
+    static List<int> Occluders(App app) {
+        List<int> outp = new List<int>();
+        List<HitRegion> blk = app.hitTester.blockers;
+        for (int i = 0; i < blk.Count; i = i + 1) {
+            HitRegion r = blk[i];
+            if (r.width <= 0 || r.height <= 0) { continue; }
+            if (NativeLayer.HitOnly(app, r.id)) { continue; }
+            outp.Add(r.x);
+            outp.Add(r.y);
+            outp.Add(r.width);
+            outp.Add(r.height);
+        }
+        for (int i = 0; i < app.nativeOccluders.Count; i = i + 1) {
+            outp.Add(app.nativeOccluders[i]);
+        }
+        return outp;
+    }
+
+    /// 该拦截区是否只吞点击、不画像素（BlockHitsBelow 的全窗口
+    /// 捕获层）：这种拦截区不遮挡原生浮层。
+    static bool HitOnly(App app, int id) {
+        for (int i = 0; i < app.hitOnlyBlockers.Count; i = i + 1) {
+            if (app.hitOnlyBlockers[i] == id) { return true; }
+        }
+        return false;
+    }
+
+    /// rects（x,y,w,h 四元组）减去矩形 (ox,oy,ow,oh)。每块被切中的
+    /// 矩形最多裂成上/下/左/右四块。
+    static List<int> Subtract(List<int> rects, int ox, int oy, int ow, int oh) {
+        List<int> outp = new List<int>();
+        int ox2 = ox + ow;
+        int oy2 = oy + oh;
+        int i = 0;
+        while (i + 3 < rects.Count) {
+            int x = rects[i];
+            int y = rects[i + 1];
+            int w = rects[i + 2];
+            int h = rects[i + 3];
+            i = i + 4;
+            int x2 = x + w;
+            int y2 = y + h;
+            // 不相交：原样保留。
+            if (ox2 <= x || ox >= x2 || oy2 <= y || oy >= y2) {
+                outp.Add(x);
+                outp.Add(y);
+                outp.Add(w);
+                outp.Add(h);
+                continue;
+            }
+            // 上带。
+            if (oy > y) {
+                outp.Add(x);
+                outp.Add(y);
+                outp.Add(w);
+                outp.Add(oy - y);
+            }
+            // 下带。
+            if (oy2 < y2) {
+                outp.Add(x);
+                outp.Add(oy2);
+                outp.Add(w);
+                outp.Add(y2 - oy2);
+            }
+            // 中间行的左右两块。
+            int midY = y;
+            if (oy > midY) { midY = oy; }
+            int midY2 = y2;
+            if (oy2 < midY2) { midY2 = oy2; }
+            if (midY2 > midY) {
+                if (ox > x) {
+                    outp.Add(x);
+                    outp.Add(midY);
+                    outp.Add(ox - x);
+                    outp.Add(midY2 - midY);
+                }
+                if (ox2 < x2) {
+                    outp.Add(ox2);
+                    outp.Add(midY);
+                    outp.Add(x2 - ox2);
+                    outp.Add(midY2 - midY);
+                }
+            }
+        }
+        return outp;
+    }
+
+    /// 把矩形并集编码成后端的 "x,y,w,h;..." 规格；空集合返回 ""。
+    static string Spec(List<int> rects) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i + 3 < rects.Count) {
+            if (rects[i + 2] > 0 && rects[i + 3] > 0) {
+                if (sb.Length > 0) { sb.Append(";"); }
+                sb.Append(Convert.ToString(rects[i]));
+                sb.Append(",");
+                sb.Append(Convert.ToString(rects[i + 1]));
+                sb.Append(",");
+                sb.Append(Convert.ToString(rects[i + 2]));
+                sb.Append(",");
+                sb.Append(Convert.ToString(rects[i + 3]));
+            }
+            i = i + 4;
+        }
+        return sb.ToString();
+    }
+}

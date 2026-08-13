@@ -77,8 +77,9 @@ static void emit_string_release(zan_irgen_t *g, LLVMValueRef v) {
  *           `event -= obj.Handler`) C#'s target+method identity.
  * Retain/release therefore test the tag at run time: on a bare function
  * pointer both are no-ops, on a closure they drive the record's refcount and,
- * at zero, its dtor (which releases the captured rc values). */
-#define ZAN_CLOSURE_TAG 1
+ * at zero, its dtor (which releases the captured rc values).
+ * The shape itself (ZAN_CLOSURE_*) lives in ../common/zan_abi.h: runtime code
+ * that keeps a delegate alive across calls has to read the same layout. */
 
 static LLVMValueRef emit_closure_is_tagged(zan_irgen_t *g, LLVMValueRef v) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);

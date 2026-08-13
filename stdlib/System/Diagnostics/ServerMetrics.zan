@@ -21,9 +21,16 @@ delegate void ErrorSink(long ts, string origin, string detail);
 ///      the most recent SLOW requests and SLOW queries, and emits the whole
 ///      thing as JSON for a /admin/stats-style endpoint.
 ///
+/// EVERY DURATION HERE IS IN MICROSECONDS (fields named *Us, JSON keys named
+/// *_us). A request served in 200us is not measurable in milliseconds -- the
+/// Windows millisecond clock steps ~15.6ms -- so a millisecond average of a
+/// fast endpoint reads as a flat zero. Thresholds stay configured in ms
+/// (SlowRequestMs/SlowQueryMs), because that is the scale an operator thinks in.
+///
 /// PLATFORM SUPPORT for the OS probes:
+///   - MonoMicros: all platforms (the runtime's monotonic microsecond clock).
 ///   - MonoMillis: all platforms (GetTickCount64 on Windows, gettimeofday
-///     elsewhere).
+///     elsewhere), coarse -- kept for timers and uptime, not for a request.
 ///   - CpuMillis:  Windows (GetProcessTimes) and Linux (/proc/self/stat).
 ///     Returns -1 on platforms where it cannot be read (e.g. macOS here).
 ///   - MemoryRssBytes: Windows (GetProcessMemoryInfo) and Linux
@@ -33,15 +40,16 @@ delegate void ErrorSink(long ts, string origin, string detail);
 /// can tell "not measured" apart from a real zero.
 /// </summary>
 
-/// <summary>One slow-operation sample: its description and elapsed ms. One
-/// entity so the text and its duration cannot drift apart in the ring buffer.</summary>
+/// <summary>One slow-operation sample: its description and elapsed
+/// MICROSECONDS. One entity so the text and its duration cannot drift apart in
+/// the ring buffer.</summary>
 class SlowEntry {
     string text;
-    long ms;
+    long us;
 
-    SlowEntry(string text, long ms) {
+    SlowEntry(string text, long us) {
         this.text = text;
-        this.ms = ms;
+        this.us = us;
     }
 }
 
@@ -72,14 +80,14 @@ class ServerErrorDoc {
 class SqlAgg {
     string sql;      // normalized statement
     long count;      // times executed
-    long totalMs;    // summed elapsed ms across executions
-    long maxMs;      // slowest single execution
+    long totalUs;    // summed elapsed microseconds across executions
+    long maxUs;      // slowest single execution
 
     SqlAgg(string sql) {
         this.sql = sql;
         this.count = 0;
-        this.totalMs = 0;
-        this.maxMs = 0;
+        this.totalUs = 0;
+        this.maxUs = 0;
     }
 }
 
@@ -97,8 +105,8 @@ class ReqAgg {
     string path;     // route pattern ("/user/{id}") or asset path
     string req;      // "METHOD path", the joined form the JSON has always used
     long count;      // times served
-    long totalMs;    // summed elapsed ms
-    long maxMs;      // slowest single hit
+    long totalUs;    // summed elapsed microseconds
+    long maxUs;      // slowest single hit
     long errors;     // 5xx responses
     long failed;     // 4xx and 5xx: everything the caller did not get served
     long rejected;   // 429: refused by a rate limit, not by the handler
@@ -108,8 +116,8 @@ class ReqAgg {
         this.path = path;
         this.req = method + " " + path;
         this.count = 0;
-        this.totalMs = 0;
-        this.maxMs = 0;
+        this.totalUs = 0;
+        this.maxUs = 0;
         this.errors = 0;
         this.failed = 0;
         this.rejected = 0;
@@ -156,6 +164,16 @@ class ServerMetrics {
     [DllImport("crt")]
     static extern int fclose(nint fp);
 
+    // Monotonic microseconds. Every duration this class stores is in
+    // microseconds, because a request is faster than the millisecond clock can
+    // see: GetTickCount64 steps ~15.6ms on Windows, which reports every
+    // sub-15ms request as "0 ms" and makes an average meaningless. Declared
+    // here rather than reached for through System.Threading.Stopwatch: this
+    // class sits on the compiler's bootstrap path and must not grow module
+    // dependencies (the runtime entry point is the same one Stopwatch uses).
+    [DllImport("crt", EntryPoint = "zan_monotonic_us")]
+    static extern long NativeMonotonicUs();
+
     // Aggregated request metrics.
     int reqCount;
     int reqErrors;
@@ -164,17 +182,17 @@ class ServerMetrics {
                       // throttled server look idle
     int reqUnmatched; // requests no route and no asset claimed (404/405, path
                       // scans): counted, never keyed by the URL they asked for
-    long reqTotalMs;
-    long reqMaxMs;
-    int slowReqMs;                 // slow-request threshold (ms)
-    List<SlowEntry> slowReqs;      // "METHOD path -> status" + elapsed ms
+    long reqTotalUs;
+    long reqMaxUs;
+    int slowReqMs;                 // slow-request threshold, configured in ms
+    List<SlowEntry> slowReqs;      // "METHOD path -> status" + elapsed us
 
     // Aggregated query metrics.
     int queryCount;
-    long queryTotalMs;
-    long queryMaxMs;
-    int slowQueryMs;               // slow-query threshold (ms)
-    List<SlowEntry> slowQueries;   // truncated SQL + elapsed ms
+    long queryTotalUs;
+    long queryMaxUs;
+    int slowQueryMs;               // slow-query threshold, configured in ms
+    List<SlowEntry> slowQueries;   // truncated SQL + elapsed us
     List<SqlAgg> sqlAgg;           // per-normalized-statement leaderboard
     int sqlAggCap;                 // distinct statement shapes kept
     List<ReqAgg> reqAgg;           // per-endpoint request leaderboard
@@ -195,6 +213,7 @@ class ServerMetrics {
     long startMillis;
     long lastWallMs;               // for CPU% delta sampling
     long lastCpuMs;
+    long lastCpuPct;               // last percentage measured over a real window
     int ringCap;
 
     // ---- per-second series (for charts) ----
@@ -207,10 +226,10 @@ class ServerMetrics {
     long[] sSec;                   // the second this slot holds (-1 = empty)
     int[] sReq;
     int[] sErr;
-    long[] sTotalMs;
-    long[] sMaxMs;
+    long[] sTotalUs;
+    long[] sMaxUs;
     int[] sQuery;
-    long[] sQueryMs;
+    long[] sQueryUs;
     int[] sCpu;                    // process CPU% at that second (-1 unknown)
     long[] sRss;                   // resident bytes at that second (-1 unknown)
     int[] sHist;                   // seriesCap * HIST_BINS latency histogram
@@ -237,13 +256,13 @@ class ServerMetrics {
         this.reqFailed = 0;
         this.reqRejected = 0;
         this.reqUnmatched = 0;
-        this.reqTotalMs = 0;
-        this.reqMaxMs = 0;
+        this.reqTotalUs = 0;
+        this.reqMaxUs = 0;
         this.slowReqMs = 500;
         this.slowReqs = new List<SlowEntry>();
         this.queryCount = 0;
-        this.queryTotalMs = 0;
-        this.queryMaxMs = 0;
+        this.queryTotalUs = 0;
+        this.queryMaxUs = 0;
         this.slowQueryMs = 200;
         this.slowQueries = new List<SlowEntry>();
         this.sqlAgg = new List<SqlAgg>();
@@ -259,16 +278,17 @@ class ServerMetrics {
         this.startMillis = ServerMetrics.MonoMillis();
         this.lastWallMs = this.startMillis;
         this.lastCpuMs = 0;
+        this.lastCpuPct = 0 - 1;
         this.ringCap = 32;
 
         this.seriesCap = 300;      // five minutes of one-second buckets
         this.sSec = new long[this.seriesCap];
         this.sReq = new int[this.seriesCap];
         this.sErr = new int[this.seriesCap];
-        this.sTotalMs = new long[this.seriesCap];
-        this.sMaxMs = new long[this.seriesCap];
+        this.sTotalUs = new long[this.seriesCap];
+        this.sMaxUs = new long[this.seriesCap];
         this.sQuery = new int[this.seriesCap];
-        this.sQueryMs = new long[this.seriesCap];
+        this.sQueryUs = new long[this.seriesCap];
         this.sCpu = new int[this.seriesCap];
         this.sRss = new long[this.seriesCap];
         this.sHist = new int[this.seriesCap * ServerMetrics.HIST_BINS];
@@ -314,29 +334,31 @@ class ServerMetrics {
         }
     }
 
-    // Latency histogram edges in ms. Fixed buckets are what make a percentile
-    // affordable: one increment per request, no sorting and no sample retention.
+    // Latency histogram edges in MICROSECONDS. Fixed buckets are what make a
+    // percentile affordable: one increment per request, no sorting and no
+    // sample retention. The low edges are what a millisecond histogram could
+    // not express: a server whose requests all land in "<= 1ms" has no p95.
     static const int HIST_BINS = 13;
     static long HistEdge(int bin) {
-        if (bin == 0) { return 1; }
-        if (bin == 1) { return 2; }
-        if (bin == 2) { return 5; }
-        if (bin == 3) { return 10; }
-        if (bin == 4) { return 20; }
-        if (bin == 5) { return 50; }
-        if (bin == 6) { return 100; }
-        if (bin == 7) { return 200; }
-        if (bin == 8) { return 500; }
-        if (bin == 9) { return 1000; }
-        if (bin == 10) { return 2000; }
-        if (bin == 11) { return 5000; }
+        if (bin == 0) { return 100; }
+        if (bin == 1) { return 250; }
+        if (bin == 2) { return 500; }
+        if (bin == 3) { return 1000; }
+        if (bin == 4) { return 2500; }
+        if (bin == 5) { return 5000; }
+        if (bin == 6) { return 10000; }
+        if (bin == 7) { return 25000; }
+        if (bin == 8) { return 50000; }
+        if (bin == 9) { return 100000; }
+        if (bin == 10) { return 500000; }
+        if (bin == 11) { return 2000000; }
         return 9223372036854775807;
     }
 
-    static int HistBin(long ms) {
+    static int HistBin(long us) {
         int b = 0;
         while (b < ServerMetrics.HIST_BINS - 1) {
-            if (ms <= ServerMetrics.HistEdge(b)) { return b; }
+            if (us <= ServerMetrics.HistEdge(b)) { return b; }
             b = b + 1;
         }
         return ServerMetrics.HIST_BINS - 1;
@@ -355,10 +377,10 @@ class ServerMetrics {
         this.sSec[idx] = sec;
         this.sReq[idx] = 0;
         this.sErr[idx] = 0;
-        this.sTotalMs[idx] = 0;
-        this.sMaxMs[idx] = 0;
+        this.sTotalUs[idx] = 0;
+        this.sMaxUs[idx] = 0;
         this.sQuery[idx] = 0;
-        this.sQueryMs[idx] = 0;
+        this.sQueryUs[idx] = 0;
         int hbase = idx * ServerMetrics.HIST_BINS;
         for (int b = 0; b < ServerMetrics.HIST_BINS; b = b + 1) {
             this.sHist[hbase + b] = 0;
@@ -491,8 +513,16 @@ class ServerMetrics {
         return v;
     }
 
+    /// <summary>Monotonic MICROSECONDS: the clock every duration recorded here
+    /// is measured with, resolving a single request instead of rounding it to a
+    /// 15ms tick. Use deltas, not the absolute value.</summary>
+    static long MonoMicros() {
+        return NativeMonotonicUs();
+    }
+
     /// <summary>Monotonic wall-clock milliseconds (not affected by clock resets
-    /// the way a seconds epoch is); use deltas, not the absolute value.</summary>
+    /// the way a seconds epoch is); use deltas, not the absolute value. Coarse
+    /// on Windows (~15ms): for anything request-sized use MonoMicros.</summary>
     static long MonoMillis() {
         #if WINDOWS
         return GetTickCount64();
@@ -595,14 +625,17 @@ class ServerMetrics {
     /// `slot` is the route's index (Route.idx), which makes the per-endpoint
     /// aggregate an array read rather than a scan over every endpoint; -1 for
     /// anything that has no route index (an asset) and is looked up by name
-    /// over the handful of such rows.</summary>
-    void RecordRoute(int slot, string method, string pattern, int status, long ms) {
+    /// over the handful of such rows.
+    ///
+    /// `us` is the elapsed time in MICROSECONDS (see MonoMicros): milliseconds
+    /// cannot express a request this server serves in 200us.</summary>
+    void RecordRoute(int slot, string method, string pattern, int status, long us) {
         lock (this) {
-        this.CountRequest(status, ms);
-        this.FoldEndpoint(slot, method, pattern, ms, status);
-        if (ms >= this.slowReqMs) {
+        this.CountRequest(status, us);
+        this.FoldEndpoint(slot, method, pattern, us, status);
+        if (us >= (long)this.slowReqMs * 1000) {
             this.slowReqs.Add(new SlowEntry(method + " " + pattern + " -> "
-                + Convert.ToString(status), ms));
+                + Convert.ToString(status), us));
             if (this.slowReqs.Count > this.ringCap) {
                 this.slowReqs.RemoveAt(0);
             }
@@ -614,10 +647,10 @@ class ServerMetrics {
     /// It counts in the totals and the series -- a server being probed is not
     /// an idle server -- but it gets no row of its own, because the only name
     /// it has is the one the caller invented.</summary>
-    void RecordUnmatched(int status, long ms) {
+    void RecordUnmatched(int status, long us) {
         lock (this) {
         this.reqUnmatched = this.reqUnmatched + 1;
-        this.CountRequest(status, ms);
+        this.CountRequest(status, us);
         }
     }
 
@@ -626,15 +659,15 @@ class ServerMetrics {
     /// written server) that has no route to name: the served path is the only
     /// key available. The dispatcher itself uses RecordRoute, which needs no
     /// normalization at all.</summary>
-    void RecordRequest(string method, string path, int status, long ms) {
+    void RecordRequest(string method, string path, int status, long us) {
         // NormalizePath is pure and allocates; keep it out of the critical
         // section so the lock only spans the counter updates.
         string folded = ServerMetrics.FoldPath(path);
         lock (this) {
-        this.CountRequest(status, ms);
-        this.FoldEndpoint(0 - 1, method, folded, ms, status);
-        if (ms >= this.slowReqMs) {
-            this.slowReqs.Add(new SlowEntry(method + " " + path + " -> " + Convert.ToString(status), ms));
+        this.CountRequest(status, us);
+        this.FoldEndpoint(0 - 1, method, folded, us, status);
+        if (us >= (long)this.slowReqMs * 1000) {
+            this.slowReqs.Add(new SlowEntry(method + " " + path + " -> " + Convert.ToString(status), us));
             if (this.slowReqs.Count > this.ringCap) {
                 this.slowReqs.RemoveAt(0);
             }
@@ -645,20 +678,20 @@ class ServerMetrics {
     /// <summary>The counters and the chart series every request feeds,
     /// whatever served it -- no strings, no lookups. Callers hold the
     /// lock.</summary>
-    void CountRequest(int status, long ms) {
+    void CountRequest(int status, long us) {
         this.reqCount = this.reqCount + 1;
-        this.reqTotalMs = this.reqTotalMs + ms;
-        if (ms > this.reqMaxMs) { this.reqMaxMs = ms; }
+        this.reqTotalUs = this.reqTotalUs + us;
+        if (us > this.reqMaxUs) { this.reqMaxUs = us; }
         if (status >= 500) { this.reqErrors = this.reqErrors + 1; }
         if (status >= 400) { this.reqFailed = this.reqFailed + 1; }
         if (status == 429) { this.reqRejected = this.reqRejected + 1; }
 
-        int idx = this.SeriesSlot(ServerMetrics.MonoMillis() / 1000);
+        int idx = this.SeriesSlot(ServerMetrics.MonoMicros() / 1000000);
         this.sReq[idx] = this.sReq[idx] + 1;
-        this.sTotalMs[idx] = this.sTotalMs[idx] + ms;
-        if (ms > this.sMaxMs[idx]) { this.sMaxMs[idx] = ms; }
+        this.sTotalUs[idx] = this.sTotalUs[idx] + us;
+        if (us > this.sMaxUs[idx]) { this.sMaxUs[idx] = us; }
         if (status >= 500) { this.sErr[idx] = this.sErr[idx] + 1; }
-        int hb = idx * ServerMetrics.HIST_BINS + ServerMetrics.HistBin(ms);
+        int hb = idx * ServerMetrics.HIST_BINS + ServerMetrics.HistBin(us);
         this.sHist[hb] = this.sHist[hb] + 1;
     }
 
@@ -670,7 +703,7 @@ class ServerMetrics {
     /// `reqAggCap` rows, past which a never-seen endpoint is left out of the
     /// leaderboard rather than growing the process -- it still counts in the
     /// totals. Callers hold the lock.</summary>
-    void FoldEndpoint(int slot, string method, string path, long ms, int status) {
+    void FoldEndpoint(int slot, string method, string path, long us, int status) {
         ReqAgg a = null;
         if (slot >= 0) {
             while (this.routeSlots.Count <= slot) { this.routeSlots.Add(null); }
@@ -692,8 +725,8 @@ class ServerMetrics {
             }
         }
         a.count = a.count + 1;
-        a.totalMs = a.totalMs + ms;
-        if (ms > a.maxMs) { a.maxMs = ms; }
+        a.totalUs = a.totalUs + us;
+        if (us > a.maxUs) { a.maxUs = us; }
         if (status >= 500) { a.errors = a.errors + 1; }
         if (status >= 400) { a.failed = a.failed + 1; }
         if (status == 429) { a.rejected = a.rejected + 1; }
@@ -745,27 +778,27 @@ class ServerMetrics {
         return outp.ToString();
     }
 
-    /// <summary>Records one completed database query.</summary>
-    void RecordQuery(string sql, long ms) {
+    /// <summary>Records one completed database query. `us` is microseconds.</summary>
+    void RecordQuery(string sql, long us) {
         // Normalizing is the expensive part and needs no shared state.
         string norm = ServerMetrics.NormalizeSql(sql);
         if (norm.Length > 200) { norm = norm.Substring(0, 200); }
         lock (this) {
         this.queryCount = this.queryCount + 1;
-        this.queryTotalMs = this.queryTotalMs + ms;
-        if (ms > this.queryMaxMs) { this.queryMaxMs = ms; }
+        this.queryTotalUs = this.queryTotalUs + us;
+        if (us > this.queryMaxUs) { this.queryMaxUs = us; }
 
-        int idx = this.SeriesSlot(ServerMetrics.MonoMillis() / 1000);
+        int idx = this.SeriesSlot(ServerMetrics.MonoMicros() / 1000000);
         this.sQuery[idx] = this.sQuery[idx] + 1;
-        this.sQueryMs[idx] = this.sQueryMs[idx] + ms;
+        this.sQueryUs[idx] = this.sQueryUs[idx] + us;
 
         // Normalized once above: literal values and variable-length IN lists
         // collapse to placeholders, so every execution of the same query SHAPE
         // lands on the same leaderboard row regardless of its arguments.
-        this.RecordSqlAgg(norm, ms);
+        this.RecordSqlAgg(norm, us);
 
-        if (ms >= this.slowQueryMs) {
-            this.slowQueries.Add(new SlowEntry(norm, ms));
+        if (us >= (long)this.slowQueryMs * 1000) {
+            this.slowQueries.Add(new SlowEntry(norm, us));
             if (this.slowQueries.Count > this.ringCap) {
                 this.slowQueries.RemoveAt(0);
             }
@@ -777,7 +810,7 @@ class ServerMetrics {
     /// slow-SQL leaderboard. Bounded to `sqlAggCap` distinct shapes: once full,
     /// a never-before-seen shape is dropped rather than growing without limit --
     /// a monitor should not become a memory leak under a query it cannot fold.</summary>
-    void RecordSqlAgg(string norm, long ms) {
+    void RecordSqlAgg(string norm, long us) {
         lock (this) {
         SqlAgg a = null;
         for (int k = 0; k < this.sqlAgg.Count; k = k + 1) {
@@ -789,8 +822,8 @@ class ServerMetrics {
             this.sqlAgg.Add(a);
         }
         a.count = a.count + 1;
-        a.totalMs = a.totalMs + ms;
-        if (ms > a.maxMs) { a.maxMs = ms; }
+        a.totalUs = a.totalUs + us;
+        if (us > a.maxUs) { a.maxUs = us; }
         }
     }
 
@@ -890,15 +923,15 @@ class ServerMetrics {
         while (outp.Count() < limit && pool.Count > 0) {
             int best = 0;
             for (int k = 1; k < pool.Count; k = k + 1) {
-                if (pool[k].totalMs > pool[best].totalMs) { best = k; }
+                if (pool[k].totalUs > pool[best].totalUs) { best = k; }
             }
             SqlAgg a = pool[best];
             JsonValue d = JsonValue.NewObject();
             d.Put("sql", ServerMetrics.DocStr(a.sql));
             d.Put("count", ServerMetrics.DocNum(a.count));
-            d.Put("total_ms", ServerMetrics.DocNum(a.totalMs));
-            d.Put("avg_ms", ServerMetrics.DocNum(a.count > 0 ? a.totalMs / a.count : 0));
-            d.Put("max_ms", ServerMetrics.DocNum(a.maxMs));
+            d.Put("total_us", ServerMetrics.DocNum(a.totalUs));
+            d.Put("avg_us", ServerMetrics.DocNum(a.count > 0 ? a.totalUs / a.count : 0));
+            d.Put("max_us", ServerMetrics.DocNum(a.maxUs));
             outp.Append(d);
             pool.RemoveAt(best);
         }
@@ -919,7 +952,7 @@ class ServerMetrics {
         while (outp.Count() < limit && pool.Count > 0) {
             int best = 0;
             for (int k = 1; k < pool.Count; k = k + 1) {
-                if (pool[k].totalMs > pool[best].totalMs) { best = k; }
+                if (pool[k].totalUs > pool[best].totalUs) { best = k; }
             }
             ReqAgg a = pool[best];
             JsonValue d = JsonValue.NewObject();
@@ -930,9 +963,9 @@ class ServerMetrics {
             d.Put("method", ServerMetrics.DocStr(a.method));
             d.Put("path", ServerMetrics.DocStr(a.path));
             d.Put("count", ServerMetrics.DocNum(a.count));
-            d.Put("total_ms", ServerMetrics.DocNum(a.totalMs));
-            d.Put("avg_ms", ServerMetrics.DocNum(a.count > 0 ? a.totalMs / a.count : 0));
-            d.Put("max_ms", ServerMetrics.DocNum(a.maxMs));
+            d.Put("total_us", ServerMetrics.DocNum(a.totalUs));
+            d.Put("avg_us", ServerMetrics.DocNum(a.count > 0 ? a.totalUs / a.count : 0));
+            d.Put("max_us", ServerMetrics.DocNum(a.maxUs));
             d.Put("errors", ServerMetrics.DocNum(a.errors));
             d.Put("failed", ServerMetrics.DocNum(a.failed));
             d.Put("rejected", ServerMetrics.DocNum(a.rejected));
@@ -948,7 +981,7 @@ class ServerMetrics {
             foreach (SlowEntry e in this.slowReqs) {
                 JsonValue o = JsonValue.NewObject();
                 o.Put("req", ServerMetrics.DocStr(e.text));
-                o.Put("ms", ServerMetrics.DocNum(e.ms));
+                o.Put("us", ServerMetrics.DocNum(e.us));
                 outp.Append(o);
             }
         }
@@ -961,7 +994,7 @@ class ServerMetrics {
             foreach (SlowEntry e in this.slowQueries) {
                 JsonValue o = JsonValue.NewObject();
                 o.Put("sql", ServerMetrics.DocStr(e.text));
-                o.Put("ms", ServerMetrics.DocNum(e.ms));
+                o.Put("us", ServerMetrics.DocNum(e.us));
                 outp.Append(o);
             }
         }
@@ -989,15 +1022,15 @@ class ServerMetrics {
         for (int b = 0; b < ServerMetrics.HIST_BINS; b = b + 1) {
             seen = seen + this.sHist[hbase + b];
             if (seen >= want) {
-                if (b == ServerMetrics.HIST_BINS - 1) { return this.sMaxMs[idx]; }
+                if (b == ServerMetrics.HIST_BINS - 1) { return this.sMaxUs[idx]; }
                 long edge = ServerMetrics.HistEdge(b);
                 // The bin's upper edge can exceed everything actually observed;
                 // reporting a p95 above the maximum would be nonsense on a chart.
-                if (edge > this.sMaxMs[idx]) { return this.sMaxMs[idx]; }
+                if (edge > this.sMaxUs[idx]) { return this.sMaxUs[idx]; }
                 return edge;
             }
         }
-        return this.sMaxMs[idx];
+        return this.sMaxUs[idx];
     }
 
     /// <summary>The last `seconds` one-second buckets as JSON, oldest first, for
@@ -1014,7 +1047,7 @@ class ServerMetrics {
         if (want <= 0) { want = 60; }
         if (want > this.seriesCap) { want = this.seriesCap; }
 
-        long now = ServerMetrics.MonoMillis() / 1000;
+        long now = ServerMetrics.MonoMicros() / 1000000;
         long from = now - (long)want + 1;
         int lastCpu = 0 - 1;
         long lastRss = 0 - 1;
@@ -1037,11 +1070,11 @@ class ServerMetrics {
             if (live) {
                 req = this.sReq[idx];
                 err = this.sErr[idx];
-                if (this.sReq[idx] > 0) { avg = this.sTotalMs[idx] / this.sReq[idx]; }
+                if (this.sReq[idx] > 0) { avg = this.sTotalUs[idx] / this.sReq[idx]; }
                 p95 = this.SeriesPercentile(idx, 95);
-                max = this.sMaxMs[idx];
+                max = this.sMaxUs[idx];
                 q = this.sQuery[idx];
-                if (this.sQuery[idx] > 0) { qavg = this.sQueryMs[idx] / this.sQuery[idx]; }
+                if (this.sQuery[idx] > 0) { qavg = this.sQueryUs[idx] / this.sQuery[idx]; }
                 if (this.sCpu[idx] >= 0) { lastCpu = this.sCpu[idx]; }
                 if (this.sRss[idx] >= 0) { lastRss = this.sRss[idx]; }
             }
@@ -1051,15 +1084,15 @@ class ServerMetrics {
             sb.Append(Convert.ToString(req));
             sb.Append(",\"err\":");
             sb.Append(Convert.ToString(err));
-            sb.Append(",\"avg_ms\":");
+            sb.Append(",\"avg_us\":");
             sb.Append(Convert.ToString(avg));
-            sb.Append(",\"p95_ms\":");
+            sb.Append(",\"p95_us\":");
             sb.Append(Convert.ToString(p95));
-            sb.Append(",\"max_ms\":");
+            sb.Append(",\"max_us\":");
             sb.Append(Convert.ToString(max));
             sb.Append(",\"queries\":");
             sb.Append(Convert.ToString(q));
-            sb.Append(",\"query_avg_ms\":");
+            sb.Append(",\"query_avg_us\":");
             sb.Append(Convert.ToString(qavg));
             sb.Append(",\"cpu_percent\":");
             sb.Append(Convert.ToString(lastCpu));
@@ -1077,6 +1110,9 @@ class ServerMetrics {
     /// meaningful "cpu_percent".</summary>
     /// JsonValue leaf builders for the snapshot (number text goes through
     /// Convert.ToString, exactly like the generated __JsonBind tree writers).
+    /// The shortest interval a CPU percentage may be computed over.
+    static int CpuWindowMs = 200;
+
     static JsonValue DocNum(long v) { return JsonValue.NewNum(Convert.ToString(v)); }
     static JsonValue DocStr(string s) {
         if (s == null) { return JsonValue.NewNull(); }
@@ -1089,19 +1125,28 @@ class ServerMetrics {
         long cpuMs = ServerMetrics.CpuMillis();
         long uptime = nowWall - this.startMillis;
 
-        long cpuPct = 0 - 1;
+        // CPU% is the delta between two samples, so it needs an interval to
+        // divide by. Two snapshots taken back to back -- a worker publishing
+        // its row and the read that immediately follows it -- are the same
+        // millisecond apart, and dividing by that reported "n/a" (or a wild
+        // percentage) for the caller that asked last. Under CpuWindowMs the
+        // previous measurement is repeated and the baseline is left alone, so
+        // the next call still has a window to measure over.
+        long cpuPct = this.lastCpuPct;
         if (cpuMs >= 0) {
             long dWall = nowWall - this.lastWallMs;
-            long dCpu = cpuMs - this.lastCpuMs;
-            if (dWall > 0) { cpuPct = (dCpu * 100) / dWall; }
-            this.lastWallMs = nowWall;
-            this.lastCpuMs = cpuMs;
+            if (dWall >= (long)ServerMetrics.CpuWindowMs) {
+                cpuPct = ((cpuMs - this.lastCpuMs) * 100) / dWall;
+                this.lastWallMs = nowWall;
+                this.lastCpuMs = cpuMs;
+                this.lastCpuPct = cpuPct;
+            }
         }
 
         long reqAvg = 0;
-        if (this.reqCount > 0) { reqAvg = this.reqTotalMs / this.reqCount; }
+        if (this.reqCount > 0) { reqAvg = this.reqTotalUs / this.reqCount; }
         long qAvg = 0;
-        if (this.queryCount > 0) { qAvg = this.queryTotalMs / this.queryCount; }
+        if (this.queryCount > 0) { qAvg = this.queryTotalUs / this.queryCount; }
 
         JsonValue requests = JsonValue.NewObject();
         requests.Put("count", ServerMetrics.DocNum(this.reqCount));
@@ -1109,16 +1154,20 @@ class ServerMetrics {
         requests.Put("failed", ServerMetrics.DocNum(this.reqFailed));
         requests.Put("rejected", ServerMetrics.DocNum(this.reqRejected));
         requests.Put("unmatched", ServerMetrics.DocNum(this.reqUnmatched));
-        requests.Put("avg_ms", ServerMetrics.DocNum(reqAvg));
-        requests.Put("max_ms", ServerMetrics.DocNum(this.reqMaxMs));
-        requests.Put("slow_threshold_ms", ServerMetrics.DocNum(this.slowReqMs));
+        requests.Put("total_us", ServerMetrics.DocNum(this.reqTotalUs));
+        requests.Put("avg_us", ServerMetrics.DocNum(reqAvg));
+        requests.Put("max_us", ServerMetrics.DocNum(this.reqMaxUs));
+        requests.Put("slow_threshold_us",
+            ServerMetrics.DocNum((long)this.slowReqMs * 1000));
         requests.Put("slow_count", ServerMetrics.DocNum(this.slowReqs.Count));
 
         JsonValue queries = JsonValue.NewObject();
         queries.Put("count", ServerMetrics.DocNum(this.queryCount));
-        queries.Put("avg_ms", ServerMetrics.DocNum(qAvg));
-        queries.Put("max_ms", ServerMetrics.DocNum(this.queryMaxMs));
-        queries.Put("slow_threshold_ms", ServerMetrics.DocNum(this.slowQueryMs));
+        queries.Put("total_us", ServerMetrics.DocNum(this.queryTotalUs));
+        queries.Put("avg_us", ServerMetrics.DocNum(qAvg));
+        queries.Put("max_us", ServerMetrics.DocNum(this.queryMaxUs));
+        queries.Put("slow_threshold_us",
+            ServerMetrics.DocNum((long)this.slowQueryMs * 1000));
         queries.Put("slow_count", ServerMetrics.DocNum(this.slowQueries.Count));
 
         JsonValue load = JsonValue.NewObject();

@@ -19,7 +19,7 @@ class ApiErrorBody {
 class WebAppStatusDoc {
     int total_requests;
     int active_connections;
-    JsonValue routes;
+    List<RouteHitDoc> routes;
 }
 
 /// <summary>
@@ -442,19 +442,22 @@ class WebApp {
     }
 
     /// <summary>Full request pipeline: hooks -> rate limit -> auth -> route.
-    /// Times the whole pipeline with a monotonic ms clock and feeds the shared
-    /// ServerMetrics (throughput / latency / slow requests) for /admin/stats.</summary>
+    /// Times the whole pipeline with a monotonic MICROSECOND clock and feeds the
+    /// shared ServerMetrics (throughput / latency / slow requests) for
+    /// /admin/stats. Microseconds because a request served in 200us is invisible
+    /// to the millisecond clock (~15.6ms per tick on Windows), which reported
+    /// every fast endpoint as "0 ms".</summary>
     async string Dispatch(HttpContext ctx, Route route, bool keepAlive) {
-        long startMs = ServerMetrics.MonoMillis();
+        long startUs = ServerMetrics.MonoMicros();
         long _n = this.totalRequests.Increment();
         this.metrics.Entered();
         string resp = "";
         try {
-            resp = await this.DispatchInner(ctx, route, keepAlive, startMs);
+            resp = await this.DispatchInner(ctx, route, keepAlive, startUs);
         } finally {
             this.metrics.Left();
         }
-        long elapsedMs = ServerMetrics.MonoMillis() - startMs;
+        long elapsedUs = ServerMetrics.MonoMicros() - startUs;
         // A stream is counted by what it pushed, not by how long it was held:
         // it has ended by the time it returns here, so it is closed with its
         // frame and byte totals.
@@ -474,17 +477,17 @@ class WebApp {
         // strings, so the hot path normalizes nothing.
         if (!ctx.MetricsExcluded()) {
             if (ctx.routePattern.Length == 0) {
-                this.metrics.RecordUnmatched(ctx.status, elapsedMs);
+                this.metrics.RecordUnmatched(ctx.status, elapsedUs);
             } else {
                 this.metrics.RecordRoute(ctx.routeSlot, ctx.method,
-                    ctx.routePattern, ctx.status, elapsedMs);
+                    ctx.routePattern, ctx.status, elapsedUs);
             }
         }
-        this.hooks.RunAfter(ctx, elapsedMs);
+        this.hooks.RunAfter(ctx, elapsedUs);
         return resp;
     }
 
-    async string DispatchInner(HttpContext ctx, Route route, bool keepAlive, long startMs) {
+    async string DispatchInner(HttpContext ctx, Route route, bool keepAlive, long startUs) {
 
         string uid = await this.AuthUser(ctx);
         ctx.uid = uid;
@@ -613,8 +616,8 @@ class WebApp {
         // slow request and skew the route's average. Mirrors the guard around
         // ServerMetrics.RecordRequest in Dispatch.
         if (!ctx.MetricsExcluded()) {
-            long elapsedMs = ServerMetrics.MonoMillis() - startMs;
-            this.router.RecordHit(rIdx, elapsedMs);
+            long elapsedUs = ServerMetrics.MonoMicros() - startUs;
+            this.router.RecordHit(rIdx, elapsedUs);
         }
         return ctx.BuildResponse(keepAlive);
     }
@@ -674,7 +677,7 @@ class WebApp {
         WebAppStatusDoc o = new WebAppStatusDoc();
         o.total_requests = (int)this.totalRequests.Load();
         o.active_connections = (int)this.activeConnections.Load();
-        o.routes = JsonValue.ParseLenient(this.router.StatsJson());
+        o.routes = this.router.Stats();
         return Json.Serialize<WebAppStatusDoc>(o);
     }
 
@@ -734,8 +737,10 @@ class WebHost {
 /// (the hook must have written a response into ctx first).</summary>
 delegate bool HookFn(HttpContext ctx);
 
-/// <summary>Post-request hook (logging, metrics); cannot short-circuit.</summary>
-delegate void AfterFn(HttpContext ctx, int elapsedMs);
+/// <summary>Post-request hook (logging, metrics); cannot short-circuit.
+/// The elapsed time is MICROSECONDS, and 64-bit: a connection held open for an
+/// hour is 3.6 billion of them, past what an int can hold.</summary>
+delegate void AfterFn(HttpContext ctx, long elapsedUs);
 
 /// <summary>
 /// Explicit, typed replacement for runtime `include`-style plugin hooks:
@@ -763,10 +768,10 @@ class Hooks {
         return true;
     }
 
-    void RunAfter(HttpContext ctx, long elapsedMs) {
+    void RunAfter(HttpContext ctx, long elapsedUs) {
         for (int i = 0; i < this.after.Count; i = i + 1) {
             AfterFn fn = this.after[i];
-            fn(ctx, elapsedMs);
+            fn(ctx, elapsedUs);
         }
     }
 }

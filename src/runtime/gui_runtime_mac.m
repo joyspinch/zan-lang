@@ -1172,6 +1172,7 @@ typedef struct {
     char *lastReqBuf;
     char *evalBuf;
     char *cookieBuf;
+    char *clipSpec;   /* last region handed to set_clip, NULL = none yet */
 } zan_webview_t;
 
 static zan_webview_t g_webviews[ZAN_MAX_WEBVIEWS];
@@ -1349,6 +1350,7 @@ EXPORT i32 zan_gui_webview_create(iptr hwnd_val, const char *profile_id) {
         w->lastReqBuf = NULL;
         w->evalBuf = NULL;
         w->cookieBuf = NULL;
+        w->clipSpec = NULL;
     }
     return (i64)(slot + 1);
 }
@@ -1370,19 +1372,104 @@ EXPORT void zan_gui_webview_destroy(i32 h) {
     free(w->lastReqBuf);
     free(w->evalBuf);
     free(w->cookieBuf);
+    free(w->clipSpec);
     memset(w, 0, sizeof(*w));
 }
 
 EXPORT void zan_gui_webview_set_frame(i32 h, i32 x, i32 y, i32 w, i32 hh) {
     WKWebView *wv = wv_get(h);
     if (!wv) return;
-    [wv setFrame:NSMakeRect((CGFloat)x, (CGFloat)y, (CGFloat)w, (CGFloat)hh)];
+    NSRect want = NSMakeRect((CGFloat)x, (CGFloat)y, (CGFloat)w, (CGFloat)hh);
+    if (NSEqualRects([wv frame], want)) return;
+    [wv setFrame:want];
+    /* The mask was built for the old frame; force the next set_clip to
+     * rebuild it instead of matching its cached spec. */
+    if (h >= 1 && h <= ZAN_MAX_WEBVIEWS) {
+        zan_webview_t *slot = &g_webviews[(int)h - 1];
+        free(slot->clipSpec);
+        slot->clipSpec = NULL;
+    }
 }
 
 EXPORT void zan_gui_webview_set_visible(i32 h, i32 visible) {
     WKWebView *wv = wv_get(h);
     if (!wv) return;
     [wv setHidden:(visible ? NO : YES)];
+}
+
+/* Visible region of a web view, as "x,y,w,h;x,y,w,h;..." in the same
+ * (flipped, top-left origin) coordinates as set_frame. The native view is a
+ * sibling layer that always draws over the software canvas, so menus, popups
+ * and modal dialogs above it can only be honoured by punching them out of the
+ * view itself: the union is turned into a mask layer. An empty spec means the
+ * view is fully covered this frame and is hidden instead; a single rect that
+ * covers the whole frame drops the mask entirely (no mask = no compositing
+ * cost while nothing overlaps the page). */
+EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
+    WKWebView *wv = wv_get(h);
+    if (!wv) return;
+    if (!spec || !*spec) {
+        [wv setHidden:YES];
+        return;
+    }
+    zan_webview_t *slot = &g_webviews[(int)h - 1];
+    /* Called every frame; rebuilding the mask each time would thrash the
+     * compositor, so only act when the region actually changed. */
+    if (slot->clipSpec && strcmp(slot->clipSpec, spec) == 0) {
+        [wv setHidden:NO];
+        return;
+    }
+    @autoreleasepool {
+        NSRect frame = [wv frame];
+        CGFloat fw = frame.size.width;
+        CGFloat fh = frame.size.height;
+        /* The web view lives in a flipped superview, so incoming rects are
+         * top-left based while the view's own layer is bottom-left based. */
+        CGMutablePathRef path = CGPathCreateMutable();
+        int rects = 0;
+        int whole = 0;
+        const char *p = spec;
+        while (*p) {
+            int rx = (int)strtol(p, (char **)&p, 10);
+            if (*p == ',') p++;
+            int ry = (int)strtol(p, (char **)&p, 10);
+            if (*p == ',') p++;
+            int rw = (int)strtol(p, (char **)&p, 10);
+            if (*p == ',') p++;
+            int rh = (int)strtol(p, (char **)&p, 10);
+            while (*p && *p != ';') p++;
+            if (*p == ';') p++;
+            if (rw <= 0 || rh <= 0) continue;
+            CGFloat lx = (CGFloat)rx - frame.origin.x;
+            CGFloat ly = (CGFloat)ry - frame.origin.y;
+            CGFloat layerY = fh - ly - (CGFloat)rh;
+            CGPathAddRect(path, NULL,
+                          CGRectMake(lx, layerY, (CGFloat)rw, (CGFloat)rh));
+            rects++;
+            if (lx <= 0 && layerY <= 0
+                && lx + (CGFloat)rw >= fw && layerY + (CGFloat)rh >= fh) {
+                whole = 1;
+            }
+        }
+        if (rects == 0) {
+            CGPathRelease(path);
+            [wv setHidden:YES];
+            return;
+        }
+        wv.wantsLayer = YES;
+        if (rects == 1 && whole) {
+            wv.layer.mask = nil;
+        } else {
+            CAShapeLayer *mask = [CAShapeLayer layer];
+            mask.frame = wv.layer.bounds;
+            mask.path = path;
+            wv.layer.mask = mask;
+        }
+        CGPathRelease(path);
+        [wv setHidden:NO];
+    }
+    free(slot->clipSpec);
+    slot->clipSpec = strdup(spec);
 }
 
 EXPORT void zan_gui_webview_navigate(i32 h, const char *url) {

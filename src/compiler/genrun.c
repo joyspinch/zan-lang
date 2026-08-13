@@ -317,9 +317,17 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
             free(outs);
             return NULL;
         }
+        /* A design document is JSON, and JSON must not start with a byte order
+         * mark: an editor that saves the .zform as "UTF-8 with BOM" (Notepad,
+         * PowerShell's Set-Content) would otherwise make the generator fail
+         * with "cannot translate design document". Drop it. */
+        const char *body = text;
+        if (tlen >= 3 && (unsigned char)body[0] == 0xEF &&
+            (unsigned char)body[1] == 0xBB && (unsigned char)body[2] == 0xBF)
+            body += 3;
         json_value *f = json_new_obj();
         json_obj_set(f, "name", json_new_str(paths[i]));
-        json_obj_set(f, "text", json_new_str(text));
+        json_obj_set(f, "text", json_new_str(body));
         json_obj_set(f, "emitMain", json_new_bool(i == 0));
         json_arr_add(files, f);
         free(text);
@@ -894,3 +902,4 @@ done:
     remove(out_path);
     return rc;
 }
+

@@ -28,12 +28,39 @@ delegate int WvCreateEnvFn(nint browserFolder, nint userDataFolder,
 /// 状态字中，事件正是借此找回它的视图。
 /// </summary>
 class WebView2 {
+    // 宿主子窗口用到的 user32/gdi32。WebView2 的可视层挂在它被
+    // 创建时指定的父窗口上，因此每个视图都拿一个自己的子 HWND
+    // 当宿主：这样才能按区域裁剪（SetWindowRgn），让右键菜单、
+    // 下拉、模态对话框显示在网页之上，而不是被网页盖住。
+    [DllImport("user32", EntryPoint = "CreateWindowExW")]
+    static extern nint CreateWindowExW(int exStyle, nint cls, nint title,
+                                       int style, int x, int y, int w, int h,
+                                       nint parent, nint menu, nint inst,
+                                       nint param);
+    [DllImport("user32", EntryPoint = "DestroyWindow")]
+    static extern int DestroyWindow(nint hwnd);
+    [DllImport("user32", EntryPoint = "SetWindowPos")]
+    static extern int SetWindowPos(nint hwnd, nint after, int x, int y,
+                                   int w, int h, int flags);
+    [DllImport("user32", EntryPoint = "ShowWindow")]
+    static extern int ShowWindow(nint hwnd, int cmd);
+    [DllImport("user32", EntryPoint = "SetWindowRgn")]
+    static extern int SetWindowRgn(nint hwnd, nint rgn, bool redraw);
+    [DllImport("gdi32", EntryPoint = "CreateRectRgn")]
+    static extern nint CreateRectRgn(int l, int t, int r, int b);
+    [DllImport("gdi32", EntryPoint = "CombineRgn")]
+    static extern int CombineRgn(nint dst, nint src1, nint src2, int mode);
+    [DllImport("gdi32", EntryPoint = "DeleteObject")]
+    static extern int DeleteObject(nint obj);
+
     static List<WebView2> views;
     static nint loader;
     static nint createEnv;
     static bool comReady;
 
     int handle;
+    /// 本视图独占的宿主子窗口（WebView2 controller 的父窗口）。
+    nint host;
     nint env;
     nint ctrl;
     nint core;
@@ -54,6 +81,17 @@ class WebView2 {
     string evalResult;
     string cookieResult;
     PumpGate gate;
+    // 最近下发的位置/裁剪/可见性。put_Bounds 与 SetWindowRgn 每帧
+    // 重复下发既浪费又会让网页闪烁，因此只在真的变化时才调用。
+    int fx;
+    int fy;
+    int fw;
+    int fh;
+    bool frameSet;
+    string clipSpec;
+    bool clipSet;
+    bool visible;
+    bool visibleSet;
 
     /// ICoreWebView2 的 vtable 槽。
     static int SlotGetSource() { return 4; }
@@ -136,9 +174,15 @@ class WebView2 {
         }
 
         WebView2 w = new WebView2();
+        w.host = 0;
         w.env = 0;
         w.ctrl = 0;
         w.core = 0;
+        w.frameSet = false;
+        w.clipSpec = "";
+        w.clipSet = false;
+        w.visible = false;
+        w.visibleSet = false;
         w.navSeq = 0;
         w.lastStatus = 0;
         w.loading = false;
@@ -173,7 +217,26 @@ class WebView2 {
         return obj;
     }
 
+    /// 本视图的宿主子窗口：一个不做事的 STATIC 子窗口，WebView2
+    /// 的可视层就长在它里。多一层宿主主要为了裁剪：子窗口可以用
+    /// SetWindowRgn 按区域露出/遮住，而 put_Bounds 只能给一个矩形；
+    /// 同时也让多个标签各自拥有一个能单独寻址的 HWND。
+    /// 创建时不带 WS_VISIBLE：第一帧结算出可见区域后才显示。
+    static nint CreateHost(nint parent) {
+        nint cls = Wide.Of("STATIC");
+        nint text = Wide.Of("");
+        // WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS
+        int style = 0x40000000 | 0x02000000 | 0x04000000;
+        nint h = WebView2.CreateWindowExW(0, cls, text, style, 0, 0, 0, 0,
+                                         parent, 0, 0, 0);
+        Wide.Free(cls);
+        Wide.Free(text);
+        return h;
+    }
+
     bool Start(nint hwnd, string profileId) {
+        host = WebView2.CreateHost(hwnd);
+        if (host == 0) { return false; }
         envSink = this.Sink((nint)WebView2.OnEnvironment);
         nint folder = Wide.Of(WebView2.ProfileDir(profileId));
         WvCreateEnvFn create = (WvCreateEnvFn)WebView2.createEnv;
@@ -186,7 +249,7 @@ class WebView2 {
 
         ctlSink = this.Sink((nint)WebView2.OnController);
         gate.Reset();
-        hr = Com.Call2(env, WebView2.SlotCreateController(), hwnd, ctlSink);
+        hr = Com.Call2(env, WebView2.SlotCreateController(), host, ctlSink);
         if (Com.Ok(hr)) { Pump.Until(gate, 12000); }
         if (core == 0) { return false; }
 
@@ -366,23 +429,98 @@ class WebView2 {
 
     // ---- 操作 ----
 
+    /// 把视图摆到客户区的 [x,y,w,h]：宿主子窗口移到该位置，
+    /// controller 在宿主内部铺满。每帧都会调，所以矩形未变时不
+    /// 重复下发（put_Bounds 会触发一次重布局）。
     void SetFrame(int x, int y, int w, int h) {
         if (ctrl == 0) { return; }
+        if (frameSet && x == fx && y == fy && w == fw && h == fh) { return; }
+        fx = x;
+        fy = y;
+        fw = w;
+        fh = h;
+        frameSet = true;
+        if (host != 0) {
+            // SWP_NOZORDER | SWP_NOACTIVATE
+            WebView2.SetWindowPos(host, 0, x, y, w, h, 4 | 16);
+        }
         nint rect = NativeMemory.Alloc(16);
-        new Span<int>(rect, 1)[0] = x;
-        new Span<int>(rect + 4, 1)[0] = y;
-        new Span<int>(rect + 8, 1)[0] = x + w;
-        new Span<int>(rect + 12, 1)[0] = y + h;
+        new Span<int>(rect, 1)[0] = 0;
+        new Span<int>(rect + 4, 1)[0] = 0;
+        new Span<int>(rect + 8, 1)[0] = w;
+        new Span<int>(rect + 12, 1)[0] = h;
         // 在 Windows x64 ABI 中，16 字节的 RECT 按地址传递。
         Com.Call1(ctrl, WebView2.SlotPutBounds(), rect);
         NativeMemory.Free(rect);
+        // 宿主换了尺寸，上一帧的区域已经对不上了。
+        clipSet = false;
     }
 
     void SetVisible(bool visible) {
         if (ctrl == 0) { return; }
+        if (visibleSet && visible == this.visible) { return; }
+        this.visible = visible;
+        visibleSet = true;
         int v = 0;
         if (visible) { v = 1; }
         Com.Call1(ctrl, WebView2.SlotPutIsVisible(), v);
+        if (host != 0) {
+            // SW_SHOWNOACTIVATE / SW_HIDE：网页出现不得抢焦点。
+            int cmd = 0;
+            if (visible) { cmd = 4; }
+            WebView2.ShowWindow(host, cmd);
+        }
+    }
+
+    /// 把本帧未被遮挡的区域（"x,y,w,h;..."，客户区坐标）下发给
+    /// 宿主子窗口。区域为空则隐藏；刚好盖满自身矩形则去掉区域
+    /// （SetWindowRgn(0)），没有弹层时不给系统多余的剪裁负担。
+    void SetClip(string spec) {
+        if (ctrl == 0) { return; }
+        if (spec.Length == 0) {
+            this.SetVisible(false);
+            return;
+        }
+        if (clipSet && spec == clipSpec) {
+            this.SetVisible(true);
+            return;
+        }
+        clipSpec = spec;
+        clipSet = true;
+        if (host != 0) {
+            nint rgn = 0;
+            bool whole = false;
+            List<string> parts = spec.Split(";");
+            for (int i = 0; i < parts.Count; i = i + 1) {
+                List<string> n = parts[i].Split(",");
+                if (n.Count < 4) { continue; }
+                // 宿主窗口坐标：区域相对宿主自身的左上角。
+                int l = Convert.ToInt32(n[0]) - fx;
+                int t = Convert.ToInt32(n[1]) - fy;
+                int r = l + Convert.ToInt32(n[2]);
+                int b = t + Convert.ToInt32(n[3]);
+                if (parts.Count == 1 && l <= 0 && t <= 0
+                        && r >= fw && b >= fh) {
+                    whole = true;
+                }
+                nint piece = WebView2.CreateRectRgn(l, t, r, b);
+                if (piece == 0) { continue; }
+                if (rgn == 0) {
+                    rgn = piece;
+                } else {
+                    WebView2.CombineRgn(rgn, rgn, piece, 2);   // RGN_OR
+                    WebView2.DeleteObject(piece);
+                }
+            }
+            if (whole) {
+                if (rgn != 0) { WebView2.DeleteObject(rgn); }
+                WebView2.SetWindowRgn(host, 0, true);
+            } else if (rgn != 0) {
+                // 成功后区域归系统所有，不能再 DeleteObject。
+                WebView2.SetWindowRgn(host, rgn, true);
+            }
+        }
+        this.SetVisible(true);
     }
 
     void Navigate(string target) {
@@ -544,6 +682,10 @@ class WebView2 {
         if (env != 0) {
             Com.Release(env);
             env = 0;
+        }
+        if (host != 0) {
+            WebView2.DestroyWindow(host);
+            host = 0;
         }
     }
 }

@@ -214,6 +214,21 @@ class App {
     // 在帧内收集，由 RunOverlays 排空，在 BeginFrame 中清除。
     List<OverlayPopup> overlays;
 
+    // 本帧登记的原生浮层（WebView 等 OS 兄弟层）与遮挡区。原生视图
+    // 永远画在软件画布之上，所以它们不自己决定可见性，而是登记
+    // 想占的矩形，由 PresentFrame 在弹层之后统一算出可见区域并
+    // 下发裁剪（见 NativeLayer）。同样在 BeginFrame 中清除。
+    List<NativeLayerReq> nativeLayers;
+    List<int> nativeOccluders;
+    // 只吞点击、不画任何像素的全窗口拦截区（BlockHitsBelow）。菜单/
+    // 下拉铺它是为了让外部点击关掉自己，画的只有那一小块菜单体，
+    // 因此它不能算作原生浮层的遮挡区——否则一开右键菜单，整页网页
+    // 就被裁成空区域消失。真正遮住整窗的变暗遮罩自己调
+    // NativeLayer.Occlude 声明。
+    List<int> hitOnlyBlockers;
+    // 最近下发给外壳的缩放填充色（-1 = 尚未下发）。
+    int lastResizeBg;
+
     // --- 动画时钟 ---
     // 按键的补间状态。控件每帧调用 AnimTo()/AnimPx() 传入
     // 目标；数值向目标缓动，并持续请求重绘直到
@@ -378,6 +393,10 @@ class App {
         this.longPressFired = false;
         this.swipeDir = 0;
         this.overlays = new List<OverlayPopup>();
+        this.nativeLayers = new List<NativeLayerReq>();
+        this.nativeOccluders = new List<int>();
+        this.hitOnlyBlockers = new List<int>();
+        this.lastResizeBg = 0 - 1;
         this.isDark = false;
         this.isTopmost = false;
         this.shapeMode = 0;
@@ -1598,6 +1617,10 @@ class App {
     static void PaintFromWndProc() {
         App a = App.frameApp;
         if (a == null || a.frameBody == null) { return; }
+        // 帧体的持有者是进程级的（窗口过程回调拿不到实例），而
+        // 尺寸消息属于某一个窗口：正在缩放的不是它自己的窗口时
+        // 什么都别画，否则会把别的窗口的一帧画进这个 App 的表面。
+        if (!a.EventIsMine()) { return; }
         a.SyncSurface();
         a.SafeFrame(a.frameBody);
     }
@@ -2709,6 +2732,10 @@ class App {
         // 最后绘制并分发弹层，使其位于所有内容之上并拥有
         // 最顶层命中区域（框架拥有的遮罩/层叠层）。
         RunOverlays();
+        // 弹层落定之后再结算原生浮层：此刻本帧所有拦截区都已注册，
+        // 能算出网页视图真正该露出的区域（菜单/对话框压住的部分被
+        // 裁掉），否则原生层会盖住它上面的一切。
+        NativeLayer.Flush(this);
         int perfT1 = 0;
         if (App.PerfOn()) { perfT1 = Window.GetTickMs(); }
         // 标志性皮肤动画：快照完成后的帧（槽位 7），然后
@@ -2888,6 +2915,9 @@ class App {
         window.ClearHitGuards();
         focus.ResetIds();
         overlays = new List<OverlayPopup>();
+        nativeLayers = new List<NativeLayerReq>();
+        nativeOccluders = new List<int>();
+        hitOnlyBlockers = new List<int>();
         partialFrame = false;
         partialBlocked = false;
         if (partialPending && dmgW > 0 && dmgH > 0) {
@@ -2898,6 +2928,15 @@ class App {
             // 下方内容照常绘制；裁剪将其限制在
             // 损坏条带内，上一帧未触及的像素得以保留。
             canvas.PushClip(dmgX, dmgY, dmgW, dmgH);
+        }
+        // 实时缩放露出的边距由外壳按此色填充（见
+        // Window.SetResizeBackground）：拖动窗口边框时 OS 先放大窗口、
+        // 应用才画出新尺寸的一帧，这条边距若按默认的 0 填充就是闪黑边。
+        int resizeBg = theme.bgPrimary;
+        if (shapeMode != 0) { resizeBg = 0; }
+        if (resizeBg != lastResizeBg) {
+            lastResizeBg = resizeBg;
+            Window.SetResizeBackground(resizeBg);
         }
         if (shapeMode != 0) {
             // 异形窗口：将整个表面清为完全透明，
@@ -3019,6 +3058,7 @@ class App {
         bool firstBlock = !blocksInputBelow;
         blocksInputBelow = true;
         int id = BlockHitsRect(0, 0, canvas.Width(), canvas.Height());
+        hitOnlyBlockers.Add(id);
         if (firstBlock && !inputBlockPrevious) {
             focus.SetFocused(id);
             // 模态在本帧出现，因此正在

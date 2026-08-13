@@ -1,0 +1,60 @@
+using System;
+using Gui;
+
+// A posted delegate outlives the call that posted it: it sits in the dispatch
+// queue until the UI thread drains it. The queue must therefore own it, or the
+// drain (which releases what it took, as with any call result) drops a count
+// nobody granted -- and a capturing lambda an event still holds is freed under
+// its owner. That is invisible until the memory is reused, so the loop below
+// posts, drains and allocates in between, then keeps using the same handler:
+// pre-fix this read a freed closure record (the IDE crashed rebuilding the
+// start page's recent-projects rows, ListView.BuildRows releasing the rows'
+// List<Action>).
+
+class Counter {
+    int hits;
+    string tag;
+
+    Counter(string tag) {
+        this.hits = 0;
+        this.tag = tag;
+    }
+
+    void Bump() { hits = hits + 1; }
+}
+
+class Program {
+    static void Main() {
+        Counter c = new Counter("recent");
+        UiEvent ev = new UiEvent();
+        // A capturing lambda: a heap closure record, unlike a static method
+        // group (which is a bare function pointer and owns nothing).
+        ev.Add(() => { c.Bump(); });
+
+        for (int i = 0; i < 200; i = i + 1) {
+            ev.Post();
+            // Churn the heap between post and drain, so a prematurely freed
+            // closure record is handed out to somebody else.
+            string junk = "junk" + i;
+            if (junk == "") { Console.WriteLine("unreachable"); }
+            Action h = Dispatcher.Take();
+            while (h != null) {
+                h();
+                h = Dispatcher.Take();
+            }
+            // The event still owns its handler, so raising it stays valid.
+            ev.Raise();
+        }
+
+        Console.WriteLine(ev.Count());
+        Console.WriteLine(c.hits);
+        Console.WriteLine(c.tag);
+
+        // Posted-but-never-drained handlers are dropped when the window closes;
+        // the queue releases what it drops.
+        ev.Post();
+        Dispatcher.Clear();
+        ev.Raise();
+        Console.WriteLine(c.hits);
+    }
+}

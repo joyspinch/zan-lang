@@ -242,14 +242,20 @@ The request lifecycle and database queries are instrumented into the shared
 {
   "uptime_ms": 2015, "pid": 31084, "worker_id": 0,
   "cpu_ms": 31, "cpu_percent": 1, "mem_rss_bytes": 6852608,
-  "requests": {"count":4,"errors":2,"avg_ms":3,"max_ms":15,
-               "slow_threshold_ms":500,"slow_count":0},
-  "queries":  {"count":2,"avg_ms":6,"max_ms":8,
-               "slow_threshold_ms":200,"slow_count":0},
-  "slow_requests": [{"req":"GET /slow -> 200","ms":750}],
-  "slow_queries":  [{"sql":"SELECT * FROM huge_join","ms":320}]
+  "requests": {"count":4,"errors":2,"total_us":13120,"avg_us":3280,
+               "max_us":15400,"slow_threshold_us":500000,"slow_count":0},
+  "queries":  {"count":2,"total_us":12800,"avg_us":6400,"max_us":8100,
+               "slow_threshold_us":200000,"slow_count":0},
+  "slow_requests": [{"req":"GET /slow -> 200","us":750000}],
+  "slow_queries":  [{"sql":"SELECT * FROM huge_join","us":320000}]
 }
 ```
+
+- Every duration is MICROSECONDS (`*_us`). A request this server serves in
+  200us is not measurable in milliseconds -- the Windows millisecond clock steps
+  ~15.6ms -- so a millisecond average of a fast endpoint read as a flat `0`.
+  The slow thresholds are still *configured* in ms (`SlowRequestMs`,
+  `[log].slowMs`) and reported here converted.
 
 - `cpu_ms` / `cpu_percent` / `mem_rss_bytes` are read from the OS
   (Windows `GetProcessTimes`/`GetProcessMemoryInfo`, Linux `/proc/self`). On a

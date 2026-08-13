@@ -54,6 +54,23 @@
  * `string`. */
 #define ZAN_ARRAY_MAGIC        UINT64_C(0x5a414e4152524159) /* "ZANARRAY" */
 
+/* Delegate values. One pointer with two shapes, told apart by bit 0:
+ *   even -- a bare function pointer (static method or non-capturing lambda),
+ *           so it can be handed to C as a plain callback;
+ *   odd  -- a tagged pointer to a heap closure record
+ *           { void *fn, void *dtor, void *target, <captured values> },
+ *           allocated with the object allocator above (so it carries the
+ *           16-byte rc header) and invoked as fn(record, args...).
+ * Retain is an increment of the record's refcount; release goes through the
+ * record's own dtor, which drops what the record captured and frees it at
+ * zero. Runtime code that *keeps* a delegate past the call it arrived on (the
+ * UI dispatch queue in rt_sync.c) must retain it, or the closure is freed
+ * while its owner -- an event's handler list -- still holds it. */
+#define ZAN_CLOSURE_TAG        1
+#define ZAN_CLOSURE_FN_OFF     0
+#define ZAN_CLOSURE_DTOR_OFF   8
+#define ZAN_CLOSURE_TARGET_OFF 16
+
 /* ---- 2. emitted-code ABI (no runtime counterpart yet) ----
  * Exception-handling chunk tables. The state is per-thread, reached through
  * __zan_eh_state(); the full design rationale lives in

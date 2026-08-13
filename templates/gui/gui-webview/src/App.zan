@@ -1,0 +1,147 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component.WebView;
+
+// {{NAME}} 的业务逻辑：一个多标签浏览器。
+//
+// BrowserTabs 每页放一个 WebViewBox，也就是一个独立的原生浏览器实例，
+// 所以每个标签都有自己的历史、Cookie 和加载状态；标签条只决定哪一页
+// 可见，隐藏页的原生视图由框架自动收起。设计里已经有第一个标签和它的
+// Tab1View，这里只负责开/关标签和把网页状态回填到工具条与状态栏。
+partial class {{NAME}} {
+    /// 新标签打开的地址。
+    static string Home() { return "https://www.example.com"; }
+
+    /// 与标签一一对应的网页视图（下标 = 标签下标）。
+    static List<WebViewBox> views;
+    /// 地址栏当前显示的地址：用户正在输入时不要被回填覆盖。
+    static string shownUrl;
+    /// 供每帧钩子查焦点用（回填地址栏前要先知道用户是不是
+    /// 正在里面打字）。
+    static App ui;
+
+    static void OnLoad(Form form) {
+        views = new List<WebViewBox>();
+        views.Add(Tab1View);
+        shownUrl = Tab1View.StartUrl();
+        ui = form.GetApp();
+        BrowserTabs.SetShowAdd(true);
+        AddressBar.SetText(shownUrl);
+
+        NavStrip.OnItemClick((int index) => { {{NAME}}.Command(index); });
+        AddressBar.Submit += () => { {{NAME}}.Go(); };
+        // 点进地址栏就整条选中（浏览器都这样：进来就是要换掉它）。
+        AddressBar.On.Focus += () => { AddressBar.SelectAll(); };
+        BrowserTabs.TabAdded += () => { {{NAME}}.OpenTab(); };
+        BrowserTabs.TabClosed += () => { {{NAME}}.Reap(); };
+        BrowserTabs.TabChanged += () => { {{NAME}}.Switched(); };
+        // 地址、标题、加载状态是网页自己变的（没有哪个控件事件能代表
+        // 它们），因此每帧回读一次。用每帧钩子而不是周期任务：它不额外
+        // 请求重绘，网页真的变了时框架已经会重绘。
+        form.FrameHook(() => { {{NAME}}.Sync(); });
+    }
+
+    /// 工具条：0 后退，1 前进，2 刷新，3 分隔条，4 新建标签。
+    static void Command(int index) {
+        if (index == 4) {
+            BrowserTabs.AddNew();
+            return;
+        }
+        WebViewBox v = {{NAME}}.Active();
+        if (v == null) { return; }
+        if (index == 0) { v.Back(); }
+        else if (index == 1) { v.Forward(); }
+        else if (index == 2) { v.Reload(); }
+    }
+
+    /// 地址栏回车：在当前标签里打开输入的地址（WebView 会补全
+    /// 协议，直接输 example.com 也可以）。
+    static void Go() {
+        WebViewBox v = {{NAME}}.Active();
+        if (v == null) { return; }
+        shownUrl = AddressBar.GetText();
+        v.Navigate(shownUrl);
+    }
+
+    /// 用户正在地址栏里打字：网页一改地址就想回填地址栏，编辑
+    /// 期间必须让位，否则输到一半就被网页的地址盖掉。按焦点判断
+    /// （而不是记一个「在编辑」的标志），焦点走了状态自然复位。
+    static bool Editing() {
+        return ui != null && ui.focus.IsFocused(AddressBar.WidgetId());
+    }
+
+    /// 新标签：AddNew()（或「+」、右键菜单）已经把标签建好并切了过去，
+    /// 这里给它那一页配一个自己的浏览器。
+    static void OpenTab() {
+        int i = BrowserTabs.Active();
+        WebViewBox v = new WebViewBox();
+        BrowserTabs.Page(i).Add(v);
+        if (i >= views.Count) { views.Add(v); }
+        else { views.Insert(i, v); }
+        v.Navigate({{NAME}}.Home());
+        shownUrl = "";
+    }
+
+    /// 标签关闭后：被关掉的那一页已经从标签条上摘下，它的浏览器
+    /// 成了孤儿，销毁它释放原生资源；最后一个标签关掉时补开一个，
+    /// 窗口不至于变成一片空白。
+    static void Reap() {
+        List<WebViewBox> keep = new List<WebViewBox>();
+        for (int i = 0; i < views.Count; i = i + 1) {
+            WebViewBox v = views[i];
+            if (v.HostForm() == null) { v.Destroy(); }
+            else { keep.Add(v); }
+        }
+        views = keep;
+        shownUrl = "";
+        if (BrowserTabs.Count() == 0) { BrowserTabs.AddNew(); }
+    }
+
+    static void Switched() {
+        shownUrl = "";
+    }
+
+    static WebViewBox Active() {
+        int i = BrowserTabs.Active();
+        if (i < 0 || i >= views.Count) { return null; }
+        return views[i];
+    }
+
+    /// 把浏览器状态回填到界面：活动标签的地址、每个标签的网页标题、
+    /// 状态栏的加载进度 / HTTP 状态。
+    static void Sync() {
+        for (int i = 0; i < views.Count; i = i + 1) {
+            string label = views[i].CurrentTitle();
+            if (label == "") { label = "New Tab"; }
+            if (label.Length > 24) { label = label.Substring(0, 24) + "..."; }
+            if (BrowserTabs.LabelAt(i) != label) {
+                BrowserTabs.SetLabel(i, label);
+            }
+        }
+        MainStatusBar.SetText(1, Convert.ToString(views.Count) + " tab(s)");
+        WebViewBox v = {{NAME}}.Active();
+        if (v == null) { return; }
+        string url = v.CurrentUrl();
+        if ({{NAME}}.Editing()) { return; }
+        if (url != "" && url != shownUrl) {
+            shownUrl = url;
+            AddressBar.SetText(url);
+        }
+        MainStatusBar.SetText(0, {{NAME}}.Status(v));
+    }
+
+    static string Status(WebViewBox v) {
+        if (v.IsLoading()) {
+            string req = v.View().LastRequest();
+            if (req == "") { req = v.CurrentUrl(); }
+            return "Loading " + req;
+        }
+        string s = v.CurrentTitle();
+        if (v.LastStatus() > 0) {
+            s = s + "  (" + Convert.ToString(v.LastStatus()) + ")";
+        }
+        if (s == "") { s = "Ready"; }
+        return s;
+    }
+}

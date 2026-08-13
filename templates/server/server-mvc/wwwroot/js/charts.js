@@ -7,13 +7,13 @@
 
      <div id="charts" data-src="/admin/metrics/series" data-window="120">
        <figure class="chart" data-metric="req" data-title="QPS" data-unit="/s"></figure>
-       <figure class="chart" data-metric="p95_ms,avg_ms" data-title="延迟"
-               data-unit="ms" data-legend="p95,平均"></figure>
+       <figure class="chart" data-metric="p95_us,avg_us" data-title="延迟"
+               data-unit="ms" data-scale="1000" data-legend="p95,平均"></figure>
      </div>
 
    data-metric may name several point fields; the first is the filled series and
    the rest are drawn as lines over it. data-scale divides the raw value (RSS in
-   bytes -> MB). A field that is -1 for the whole window (a probe the current OS
+   bytes -> MB, latency in microseconds -> ms). A field that is -1 for the whole window (a probe the current OS
    cannot answer) renders as "不支持" rather than a flat line at zero. */
 
 (function () {

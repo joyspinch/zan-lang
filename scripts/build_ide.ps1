@@ -121,7 +121,11 @@ $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_docs.o"))
 $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")
 $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")
 $zanArgs += @("--link-lib", "dwmapi", "--link-lib", "gdi32", "--link-lib", "imm32")
-$zanArgs += @("--link-lib", "user32", "--link-lib", "rpcrt4", "--link-lib", "winpthread")
+# (winpthread is not named here: zanc already links it as the static archive
+# libwinpthread.a. Naming it makes ld prefer libwinpthread.dll.a instead, and
+# the exe then needs libwinpthread_64-1.dll beside it -- a DLL the toolchain
+# does not ship, so the IDE would not start on another machine.)
+$zanArgs += @("--link-lib", "user32", "--link-lib", "rpcrt4")
 $zanArgs += @("--icon", (Join-Path (Get-Location) "assets\zan.ico"))
 # Escape hatch for diagnostic builds: ZAN_IDE_ZANC_ARGS="--arc-guard" builds the
 # IDE with extra compiler flags without editing this script.
@@ -163,5 +167,52 @@ if ($code -ne 0) {
 # The IDE's own stylesheet (page layout) ships next to the executable.
 Copy-Item -LiteralPath (Join-Path (Get-Location) "src\ide_zan\assets\ide.css") `
     -Destination (Join-Path (Get-Location) "build\ide.css") -Force
+
+# ---- record the non-system DLLs the IDE needs beside it -------------------
+# ZanIDE.exe imports more than the Windows API: the runtime objects pull in
+# OpenSSL and SQLite, and zanc stages driver DLLs (zan_gui, WebView2Loader)
+# next to the exe. A release that ships the exe without them dies on launch
+# with "cannot find <dll>" on any machine that has no copy on PATH -- which is
+# every machine but this one. Read the truth from the exe's own import table
+# (llvm-readobj is already required by this script for clang/llvm-ar) and let
+# publish_ide.ps1 ship exactly that list.
+$sysDll = @(
+    'kernel32','kernelbase','user32','gdi32','gdiplus','advapi32','shell32',
+    'shlwapi','shcore','ole32','oleaut32','comctl32','comdlg32','crypt32',
+    'ws2_32','mswsock','iphlpapi','psapi','rpcrt4','dwmapi','imm32','uxtheme',
+    'winmm','version','dbghelp','setupapi','bcrypt','ncrypt','secur32',
+    'wintrust','userenv','netapi32','powrprof','ntdll','msvcrt','msimg32',
+    'winspool','wtsapi32','dnsapi','normaliz','usp10','opengl32','d3d11',
+    'dxgi','avrt','propsys','windowscodecs'
+)
+# Dynamically loaded ones never show up in the import table (WebView2Loader is
+# LoadLibrary'd on demand), so union in whatever zanc reported staging.
+$staged = @($out | ForEach-Object {
+    $m = [regex]::Match([string]$_, "^\s*bundled driver '[^']+' \S+ (?<f>\S+\.dll)\s*$")
+    if ($m.Success) { $m.Groups['f'].Value }
+})
+$imports = @(& llvm-readobj --coff-imports (Join-Path (Get-Location) "build\ZanIDE.exe") 2>&1 |
+    ForEach-Object {
+        $m = [regex]::Match([string]$_, '^\s*Name:\s*(?<f>\S+\.dll)\s*$')
+        if ($m.Success) { $m.Groups['f'].Value }
+    } | Sort-Object -Unique)
+if ($imports.Count -eq 0) {
+    Write-Output "IDE_DEPS_WARN: could not read the import table (llvm-readobj missing?); build\ZanIDE.deps.txt left as-is"
+} else {
+    $deps = @($imports | Where-Object {
+        $base = [IO.Path]::GetFileNameWithoutExtension($_).ToLower()
+        ($sysDll -notcontains $base) -and ($base -notlike 'api-ms-*') -and
+        ($base -notlike 'ext-ms-*')
+    })
+    $deps = @(($deps + $staged) | Sort-Object -Unique)
+    foreach ($dep in $deps) {
+        if (-not (Test-Path (Join-Path (Get-Location) "build\$dep"))) {
+            Write-Output "IDE_DEPS_WARN: $dep is imported but not in build\ (the release cannot ship it)"
+        }
+    }
+    [System.IO.File]::WriteAllLines(
+        (Join-Path (Get-Location) "build\ZanIDE.deps.txt"), $deps)
+    Write-Output ("[deps] " + ($deps -join " "))
+}
 
 Write-Output "IDE_BUILD_OK build\ZanIDE.exe"
