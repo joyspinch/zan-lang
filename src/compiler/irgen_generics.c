@@ -1372,6 +1372,20 @@ static LLVMValueRef emit_string_alloc_rc(zan_irgen_t *g, LLVMValueRef payload_si
 static LLVMValueRef emit_widen_i64_for_print(zan_irgen_t *g, LLVMValueRef v);
 static LLVMValueRef emit_string_literal_rc(zan_irgen_t *g, zan_istr_t text);
 
+/* A fixed-size scratch byte buffer for one emit site, allocated in the entry
+ * block: a formatting buffer emitted inside a loop body would otherwise grow
+ * the stack once per iteration and overflow it (each site keeps its own slot,
+ * so buffers that are live at the same time never share storage). */
+static LLVMValueRef emit_entry_scratch(zan_irgen_t *g, unsigned size,
+                                       const char *name) {
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef arr = LLVMArrayType(i8, size);
+    LLVMValueRef slot = emit_entry_alloca(g, arr, name);
+    LLVMValueRef idxs[] = { LLVMConstInt(i64, 0, 0), LLVMConstInt(i64, 0, 0) };
+    return LLVMBuildInBoundsGEP2(g->builder, arr, slot, idxs, 2, name);
+}
+
 /* Convert a scalar (int/float/bool/char) to a NUL-terminated C string in a
  * stack buffer so it can feed byte-level string machinery (StringBuilder
  * append, etc.). Pointer (string) values are returned unchanged. */
@@ -1386,8 +1400,7 @@ static LLVMValueRef emit_value_as_cstr(zan_irgen_t *g, LLVMValueRef v) {
         return LLVMBuildSelect(g->builder, v,
             emit_string_literal_rc(g, t), emit_string_literal_rc(g, f), "b2s");
     }
-    LLVMValueRef buf = LLVMBuildArrayAlloca(g->builder, i8,
-        LLVMConstInt(i64, 40, 0), "v2s.buf");
+    LLVMValueRef buf = emit_entry_scratch(g, 40, "v2s.buf");
     const char *fmt;
     LLVMValueRef arg;
     if (LLVMGetTypeKind(vt) == LLVMDoubleTypeKind || LLVMGetTypeKind(vt) == LLVMFloatTypeKind) {
@@ -1742,7 +1755,6 @@ static LLVMValueRef emit_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
 
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef snprintf_type = LLVMFunctionType(
         LLVMInt32TypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr, i64, i8ptr }, 3, 1);
     LLVMValueRef fmt;
@@ -1758,7 +1770,7 @@ static LLVMValueRef emit_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
         return ibuf;
     }
     LLVMValueRef tmp_sz = LLVMConstInt(i64, 1024, 0);
-    LLVMValueRef tmp = LLVMBuildArrayAlloca(g->builder, i8, tmp_sz, "fmt.tmp");
+    LLVMValueRef tmp = emit_entry_scratch(g, 1024, "fmt.tmp");
     LLVMValueRef a1[] = { tmp, tmp_sz, fmt, arg };
     zan_call2(g->builder, snprintf_type, g->fn_snprintf, a1, 4, "");
     LLVMValueRef needed = zan_call2(g->builder,
@@ -1864,6 +1876,20 @@ static LLVMValueRef emit_to_cstr_of(zan_irgen_t *g, LLVMValueRef val,
     return emit_to_cstr(g, val);
 }
 
+/* Byte length of the C string `s` produced by `ast`. A string literal's length
+ * is known at compile time (the same length string interpolation already uses),
+ * so the byte-level string machinery never runs strlen over it. */
+static LLVMValueRef emit_cstr_len_of(zan_irgen_t *g, LLVMValueRef s,
+                                     zan_ast_node_t *ast) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    if (ast && ast->kind == AST_STRING_LITERAL)
+        return LLVMConstInt(i64, (uint64_t)ast->str_val.len, 0);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    return zan_call2(g->builder,
+        LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0),
+        g->fn_strlen, &s, 1, "cslen");
+}
+
 /* Emit `a + b` for two string (i8*) operands as a heap-allocated concatenation:
  * malloc(strlen(a)+strlen(b)+1); memcpy left, memcpy right, NUL terminate.
  * A NULL operand concatenates as "" (C#), so neither strlen may see a NULL. */
@@ -1929,7 +1955,6 @@ static LLVMValueRef emit_str_concat_n(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8t, 0);
-    LLVMTypeRef strlen_type = LLVMFunctionType(i64t, (LLVMTypeRef[]){ i8ptr }, 1, 0);
     LLVMTypeRef memcpy_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64t }, 3, 0);
     LLVMValueRef memcpy_fn = LLVMGetNamedFunction(g->mod, "memcpy");
     if (!memcpy_fn) memcpy_fn = LLVMAddFunction(g->mod, "memcpy", memcpy_type);
@@ -1945,7 +1970,7 @@ static LLVMValueRef emit_str_concat_n(zan_irgen_t *g, zan_ast_node_t *expr,
         vals[i] = s;
         owned[i] = !is_string_expr(g, ops[i], locals) ||
                    expr_yields_owned_rc_value(g, ops[i], locals);
-        lens[i] = zan_call2(g->builder, strlen_type, g->fn_strlen, &s, 1, "cl");
+        lens[i] = emit_cstr_len_of(g, s, ops[i]);
         total = zan_add(g->builder, total, lens[i], "ct");
     }
     LLVMValueRef buf = emit_string_alloc_rc(g, total);

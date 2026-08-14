@@ -616,11 +616,22 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         int char_arg =
                             LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMIntegerTypeKind &&
                             expr_is_char(g, arg0, locals);
-                        LLVMValueRef s = char_arg ? emit_char_to_cstr(g, v)
-                                                  : emit_value_as_cstr(g, v);
-                        LLVMValueRef slen = zan_call2(g->builder,
-                            LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0),
-                            g->fn_strlen, &s, 1, "sblen");
+                        /* An integer formats straight into a stack buffer and
+                         * yields its digit count, so neither the int nor a
+                         * string literal needs a strlen to be appended. */
+                        int int_arg = !char_arg &&
+                            LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMIntegerTypeKind &&
+                            LLVMGetIntTypeWidth(LLVMTypeOf(v)) > 1;
+                        LLVMValueRef s, slen;
+                        if (int_arg) {
+                            s = emit_entry_scratch(g, 40, "sb.i2s");
+                            slen = emit_itoa_into(g, s,
+                                emit_widen_i64_for_print(g, v), 0);
+                        } else {
+                            s = char_arg ? emit_char_to_cstr(g, v)
+                                         : emit_value_as_cstr(g, v);
+                            slen = emit_cstr_len_of(g, s, arg0);
+                        }
                         emit_sb_append_bytes(g, sbp, s, slen);
                         if (char_arg)
                             emit_string_release(g, s);
