@@ -14,6 +14,7 @@ static zan_type_t *concretize(zan_irgen_t *g, zan_type_t *t);
 static zan_type_t *subst_type_param_deep(zan_irgen_t *g, zan_type_t *t,
                                          zan_type_t *recv);
 static bool type_is_concrete(zan_type_t *t);
+static LLVMValueRef get_libc_fn(zan_irgen_t *g, const char *name, LLVMTypeRef ty);
 
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
@@ -2211,6 +2212,116 @@ static LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
     }
     LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
     return LLVMBuildGEP2(g->builder, i8, raw, &hdr_off, 1, "md.arr");
+}
+
+/* Decimal formatting of a 64-bit integer, emitted as a self-contained
+ * function so integer-to-string conversions do not go through snprintf
+ * (parsing "%lld" and running the whole vfprintf machinery costs an order of
+ * magnitude more than the division loop; on the JSON serializer path it was a
+ * quarter of all instructions). Signature:
+ *   i64 __zan_itoa(i8 *buf, i64 val, i32 is_unsigned)
+ * Writes the digits plus a NUL terminator into `buf` (needs 21 bytes) and
+ * returns the digit count, terminator excluded. */
+static LLVMValueRef zan_itoa_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_itoa");
+    if (fn) return fn;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef fnty = LLVMFunctionType(i64t,
+        (LLVMTypeRef[]){ i8ptr, i64t, i32t }, 3, 0);
+    fn = LLVMAddFunction(g->mod, "__zan_itoa", fnty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef loop = LLVMAppendBasicBlockInContext(g->ctx, fn, "loop");
+    LLVMBasicBlockRef sign = LLVMAppendBasicBlockInContext(g->ctx, fn, "sign");
+    LLVMBasicBlockRef neg_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "neg");
+    LLVMBasicBlockRef copy = LLVMAppendBasicBlockInContext(g->ctx, fn, "copy");
+
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef buf = LLVMGetParam(fn, 0);
+    LLVMValueRef val = LLVMGetParam(fn, 1);
+    LLVMValueRef uns = LLVMGetParam(fn, 2);
+    /* digits land in a scratch buffer back to front, then move to `buf` */
+    LLVMTypeRef tmp_ty = LLVMArrayType(i8, 24);
+    LLVMValueRef tmp = LLVMBuildAlloca(g->builder, tmp_ty, "itoa.tmp");
+    LLVMValueRef zero64 = LLVMConstInt(i64t, 0, 0);
+    LLVMValueRef ten = LLVMConstInt(i64t, 10, 0);
+    /* negative only when the value is signed: -x as unsigned is the same bit
+     * pattern for INT64_MIN, so no special case is needed for it. */
+    LLVMValueRef is_signed = zan_icmp(g->builder, LLVMIntEQ, uns,
+        LLVMConstInt(i32t, 0, 0), "itoa.signed");
+    LLVMValueRef is_lt0 = zan_icmp(g->builder, LLVMIntSLT, val, zero64, "itoa.lt0");
+    LLVMValueRef is_neg = LLVMBuildAnd(g->builder, is_signed, is_lt0, "itoa.neg");
+    LLVMValueRef mag = LLVMBuildSelect(g->builder, is_neg,
+        LLVMBuildNeg(g->builder, val, "itoa.abs"), val, "itoa.mag");
+    LLVMBuildBr(g->builder, loop);
+
+    LLVMPositionBuilderAtEnd(g->builder, loop);
+    LLVMValueRef v = LLVMBuildPhi(g->builder, i64t, "itoa.v");
+    LLVMValueRef pos = LLVMBuildPhi(g->builder, i64t, "itoa.pos");
+    LLVMValueRef q = LLVMBuildUDiv(g->builder, v, ten, "itoa.q");
+    LLVMValueRef r = LLVMBuildURem(g->builder, v, ten, "itoa.r");
+    LLVMValueRef next_pos = LLVMBuildSub(g->builder, pos,
+        LLVMConstInt(i64t, 1, 0), "itoa.pos1");
+    LLVMValueRef digit = LLVMBuildTrunc(g->builder,
+        LLVMBuildAdd(g->builder, r, LLVMConstInt(i64t, '0', 0), "itoa.ch"),
+        i8, "itoa.ch8");
+    LLVMValueRef gep_idx[] = { zero64, next_pos };
+    LLVMBuildStore(g->builder, digit,
+        LLVMBuildGEP2(g->builder, tmp_ty, tmp, gep_idx, 2, "itoa.dp"));
+    LLVMValueRef more = zan_icmp(g->builder, LLVMIntNE, q, zero64, "itoa.more");
+    LLVMBuildCondBr(g->builder, more, loop, sign);
+    LLVMAddIncoming(v, (LLVMValueRef[]){ mag, q },
+        (LLVMBasicBlockRef[]){ entry, loop }, 2);
+    LLVMAddIncoming(pos, (LLVMValueRef[]){ LLVMConstInt(i64t, 24, 0), next_pos },
+        (LLVMBasicBlockRef[]){ entry, loop }, 2);
+
+    LLVMPositionBuilderAtEnd(g->builder, sign);
+    LLVMBuildCondBr(g->builder, is_neg, neg_bb, copy);
+
+    LLVMPositionBuilderAtEnd(g->builder, neg_bb);
+    LLVMValueRef minus_pos = LLVMBuildSub(g->builder, next_pos,
+        LLVMConstInt(i64t, 1, 0), "itoa.mpos");
+    LLVMValueRef minus_idx[] = { zero64, minus_pos };
+    LLVMBuildStore(g->builder, LLVMConstInt(i8, '-', 0),
+        LLVMBuildGEP2(g->builder, tmp_ty, tmp, minus_idx, 2, "itoa.mp"));
+    LLVMBuildBr(g->builder, copy);
+
+    LLVMPositionBuilderAtEnd(g->builder, copy);
+    LLVMValueRef start = LLVMBuildPhi(g->builder, i64t, "itoa.start");
+    LLVMAddIncoming(start, (LLVMValueRef[]){ next_pos, minus_pos },
+        (LLVMBasicBlockRef[]){ sign, neg_bb }, 2);
+    LLVMValueRef len = LLVMBuildSub(g->builder, LLVMConstInt(i64t, 24, 0),
+        start, "itoa.len");
+    LLVMValueRef src_idx[] = { zero64, start };
+    LLVMValueRef src = LLVMBuildGEP2(g->builder, tmp_ty, tmp, src_idx, 2, "itoa.src");
+    LLVMTypeRef memcpy_ty = LLVMFunctionType(i8ptr,
+        (LLVMTypeRef[]){ i8ptr, i8ptr, i64t }, 3, 0);
+    zan_call2(g->builder, memcpy_ty, get_libc_fn(g, "memcpy", memcpy_ty),
+        (LLVMValueRef[]){ buf, src, len }, 3, "");
+    LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0),
+        LLVMBuildGEP2(g->builder, i8, buf, &len, 1, "itoa.end"));
+    LLVMBuildRet(g->builder, len);
+
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    return fn;
+}
+
+/* Emit `__zan_itoa(buf, val, is_unsigned)`; `val` must already be i64. */
+static LLVMValueRef zan_emit_itoa(zan_irgen_t *g, LLVMValueRef buf,
+                                 LLVMValueRef val, bool is_unsigned) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef fnty = LLVMFunctionType(i64t,
+        (LLVMTypeRef[]){ i8ptr, i64t, i32t }, 3, 0);
+    return zan_call2(g->builder, fnty, zan_itoa_fn(g),
+        (LLVMValueRef[]){ buf, val, LLVMConstInt(i32t, is_unsigned ? 1 : 0, 0) },
+        3, "itoa.n");
 }
 
 static bool is_call_to(zan_ast_node_t *expr, const char *obj, const char *method) {

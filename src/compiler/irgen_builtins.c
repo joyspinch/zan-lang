@@ -878,6 +878,33 @@ static LLVMValueRef eh_add_global(zan_irgen_t *g, LLVMTypeRef ty,
     return v;
 }
 
+/* The calling thread's cached EH state pointer: `__zan_eh_state` otherwise
+ * repeats pthread_self plus an open-addressed probe of the thread table on
+ * every use, and a keep-alive HTTP request makes ~36 of them (each temporary
+ * pushed for exception safety asks twice). A thread-local slot answers the
+ * steady-state call in two instructions; the table stays the source of truth,
+ * and `__zan_eh_release` clears the slot when it drops the block.
+ *
+ * The TLS model is picked rather than left to the default: an executable or a
+ * load-time shared object can use initial-exec (a GOT-relative load), while a
+ * dlopen'able library must stay general-dynamic so it never runs out of the
+ * static TLS surplus. WASM has one thread and no TLS -- a plain global there
+ * is the same thing. */
+static LLVMValueRef get_eh_self_slot(zan_irgen_t *g) {
+    LLVMValueRef v = LLVMGetNamedGlobal(g->mod, "__zan_eh_self");
+    if (v) return v;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    v = LLVMAddGlobal(g->mod, i8ptr, "__zan_eh_self");
+    LLVMSetLinkage(v, LLVMInternalLinkage);
+    LLVMSetInitializer(v, LLVMConstNull(i8ptr));
+    if (!strstr(g->target_triple, "wasm")) {
+        LLVMSetThreadLocal(v, 1);
+        LLVMSetThreadLocalMode(v, g->emit_shared ? LLVMGeneralDynamicTLSModel
+                                                 : LLVMInitialExecTLSModel);
+    }
+    return v;
+}
+
 /* The layout of a thread's EH state. Private to emitted code (nothing outside
  * this module allocates or reads a block), so it needs no fixed ABI. */
 static LLVMTypeRef get_eh_state_ty(zan_irgen_t *g) {
@@ -1125,6 +1152,10 @@ static void emit_eh_release_fn(zan_irgen_t *g, LLVMTypeRef keys_ty,
     LLVMPositionBuilderAtEnd(g->builder, drop);
     LLVMValueRef stv = LLVMBuildLoad2(g->builder, i8ptr, st_slot, "st.v2");
     zan_call2(g->builder, free_ty, free_fn, &stv, 1, "");
+    /* The block is gone, so the caller's cached pointer must go with it: this
+     * thread may enter a try again (a detached foreign thread that calls back
+     * in) and would otherwise reuse freed memory. */
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), get_eh_self_slot(g));
     LLVMBuildStore(g->builder, LLVMConstNull(i8ptr),
         LLVMBuildLoad2(g->builder, LLVMPointerType(i8ptr, 0), sp_slot, "sp.v2"));
     LLVMValueRef tomb = LLVMBuildStore(g->builder,
@@ -1173,7 +1204,10 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
     LLVMTypeRef caty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64t, i64t }, 2, 0);
     LLVMValueRef calloc_fn = get_libc_fn(g, "calloc", caty);
+    LLVMValueRef self_slot = get_eh_self_slot(g);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef hit   = LLVMAppendBasicBlockInContext(g->ctx, fn, "hit");
+    LLVMBasicBlockRef look  = LLVMAppendBasicBlockInContext(g->ctx, fn, "look");
     LLVMBasicBlockRef probe = LLVMAppendBasicBlockInContext(g->ctx, fn, "probe");
     LLVMBasicBlockRef mine  = LLVMAppendBasicBlockInContext(g->ctx, fn, "mine");
     LLVMBasicBlockRef claim = LLVMAppendBasicBlockInContext(g->ctx, fn, "claim");
@@ -1184,7 +1218,20 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef next  = LLVMAppendBasicBlockInContext(g->ctx, fn, "next");
     LLVMBasicBlockRef full  = LLVMAppendBasicBlockInContext(g->ctx, fn, "full");
 
+    /* Allocas stay in the entry block so mem2reg still promotes them; the
+     * thread-local fast path is the entry block's only other content. */
     LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef i_slot = LLVMBuildAlloca(g->builder, i64t, "i");
+    LLVMValueRef cached = LLVMBuildLoad2(g->builder, i8ptr, self_slot,
+                                        "st.cached");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntNE, cached, LLVMConstNull(i8ptr),
+                 "cached.ok"), hit, look);
+
+    LLVMPositionBuilderAtEnd(g->builder, hit);
+    LLVMBuildRet(g->builder, cached);
+
+    LLVMPositionBuilderAtEnd(g->builder, look);
     /* Key 0 marks a free slot, so shift the id out of that value. */
     LLVMValueRef key = zan_add(g->builder, emit_eh_thread_id(g),
         LLVMConstInt(i64t, 1, 0), "key");
@@ -1193,7 +1240,6 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
             LLVMBuildLShr(g->builder, key, LLVMConstInt(i64t, 32, 0), "key.hi"),
             "key.mix"),
         LLVMConstInt(i64t, ZAN_EH_THREADS - 1, 0), "h");
-    LLVMValueRef i_slot = LLVMBuildAlloca(g->builder, i64t, "i");
     LLVMBuildStore(g->builder, LLVMConstInt(i64t, 0, 0), i_slot);
     LLVMBuildBr(g->builder, probe);
 
@@ -1213,7 +1259,9 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
         zan_icmp(g->builder, LLVMIntEQ, k, key, "is.mine"), mine, claim);
 
     LLVMPositionBuilderAtEnd(g->builder, mine);
-    LLVMBuildRet(g->builder, LLVMBuildLoad2(g->builder, i8ptr, sp, "st"));
+    LLVMValueRef st_found = LLVMBuildLoad2(g->builder, i8ptr, sp, "st");
+    LLVMBuildStore(g->builder, st_found, self_slot);
+    LLVMBuildRet(g->builder, st_found);
 
     LLVMPositionBuilderAtEnd(g->builder, claim);
     /* Free (never used) or a tombstone left by a thread that released its
@@ -1254,6 +1302,7 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
             LLVMBuildBitCast(g->builder, st, LLVMPointerType(state_ty, 0),
                 "st.typed"), EH_F_TOP, "st.top"));
     LLVMBuildStore(g->builder, st, sp);
+    LLVMBuildStore(g->builder, st, self_slot);
     LLVMBuildRet(g->builder, st);
 
     LLVMPositionBuilderAtEnd(g->builder, next);

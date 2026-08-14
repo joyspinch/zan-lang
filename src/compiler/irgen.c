@@ -1211,6 +1211,13 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef g_tail = LLVMAddGlobal(g->mod, i8ptr, "__zan_co_tail");
         LLVMSetInitializer(g_tail, LLVMConstNull(i8ptr));
         LLVMSetLinkage(g_tail, LLVMInternalLinkage);
+        /* Retired queue nodes are recycled through this free list instead of
+         * going back to malloc: every await costs one enqueue, so a keep-alive
+         * HTTP request paid six malloc/free pairs purely for queue plumbing.
+         * The list is bounded by the peak ready-queue depth. */
+        LLVMValueRef g_nodes = LLVMAddGlobal(g->mod, i8ptr, "__zan_co_nodes");
+        LLVMSetInitializer(g_nodes, LLVMConstNull(i8ptr));
+        LLVMSetLinkage(g_nodes, LLVMInternalLinkage);
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
 
         /* The unified timer runtime owns a dynamic-array min-heap shared by
@@ -1310,8 +1317,34 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildCondBr(g->builder, step_null, ret, cont);
 
             LLVMPositionBuilderAtEnd(g->builder, cont);
-            LLVMValueRef node = zan_call2(g->builder, malloc_type, g->fn_malloc,
+            /* node = freelist ? pop(freelist) : malloc(node) */
+            LLVMBasicBlockRef reuse_bb = LLVMAppendBasicBlockInContext(g->ctx,
+                g->rt_co_ready, "node.reuse");
+            LLVMBasicBlockRef alloc_bb = LLVMAppendBasicBlockInContext(g->ctx,
+                g->rt_co_ready, "node.alloc");
+            LLVMBasicBlockRef have_bb = LLVMAppendBasicBlockInContext(g->ctx,
+                g->rt_co_ready, "node.have");
+            LLVMValueRef spare = LLVMBuildLoad2(g->builder, i8ptr, g_nodes, "spare");
+            LLVMValueRef has_spare = zan_icmp(g->builder, LLVMIntNE, spare,
+                LLVMConstNull(i8ptr), "has.spare");
+            LLVMBuildCondBr(g->builder, has_spare, reuse_bb, alloc_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, reuse_bb);
+            LLVMValueRef spare_next = LLVMBuildLoad2(g->builder, i8ptr,
+                LLVMBuildStructGEP2(g->builder, node_ty, spare, 0, "spare.next.p"),
+                "spare.next");
+            LLVMBuildStore(g->builder, spare_next, g_nodes);
+            LLVMBuildBr(g->builder, have_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, alloc_bb);
+            LLVMValueRef fresh = zan_call2(g->builder, malloc_type, g->fn_malloc,
                 (LLVMValueRef[]){ LLVMSizeOf(node_ty) }, 1, "node");
+            LLVMBuildBr(g->builder, have_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, have_bb);
+            LLVMValueRef node = LLVMBuildPhi(g->builder, i8ptr, "node");
+            LLVMAddIncoming(node, (LLVMValueRef[]){ spare, fresh },
+                (LLVMBasicBlockRef[]){ reuse_bb, alloc_bb }, 2);
             LLVMValueRef nnext = LLVMBuildStructGEP2(g->builder, node_ty, node, 0, "n.next");
             LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), nnext);
             LLVMValueRef nframe = LLVMBuildStructGEP2(g->builder, node_ty, node, 1, "n.frame");
@@ -1399,8 +1432,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildBr(g->builder, after_bb);
 
             LLVMPositionBuilderAtEnd(g->builder, after_bb);
-            zan_call2(g->builder, free_type, g->fn_free,
-                (LLVMValueRef[]){ head }, 1, "");
+            /* recycle the node (push on the free list) rather than free it;
+             * the step below may enqueue again and pop it right back. */
+            LLVMBuildStore(g->builder,
+                LLVMBuildLoad2(g->builder, i8ptr, g_nodes, "nodes.head"),
+                LLVMBuildStructGEP2(g->builder, node_ty, head, 0, "n.recycle"));
+            LLVMBuildStore(g->builder, head, g_nodes);
             zan_call2(g->builder, g->co_step_type, st,
                 (LLVMValueRef[]){ fr }, 1, "");
             LLVMBuildBr(g->builder, head_bb);
@@ -2960,6 +2997,116 @@ static int eh_slot_kind_of(zan_type_t *t) {
     if (t->kind == TYPE_STRING) return ZAN_EH_SLOT_STR;
     if (t->kind == TYPE_DELEGATE) return ZAN_EH_SLOT_DLG;
     return ZAN_EH_SLOT_OBJ;
+}
+
+/* i64 __zan_itoa64(i8 *buf, i64 v, i32 uns): write `v` in decimal into `buf`
+ * (at least 21 bytes), NUL-terminate it and return the digit count; `uns` != 0
+ * formats the value as unsigned. Integer formatting used to go through
+ * snprintf("%lld"), whose vfprintf machinery dominated JSON serialization
+ * (25% of the instructions of a response built from numbers) while the actual
+ * work is a division loop. Built once per module on first use. */
+static LLVMValueRef get_itoa64_fn(zan_irgen_t *g) {
+    if (g->fn_itoa64) return g->fn_itoa64;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef fn_ty = LLVMFunctionType(i64,
+        (LLVMTypeRef[]){ i8ptr, i64, i32 }, 3, 0);
+    LLVMValueRef fn = LLVMAddFunction(g->mod, "__zan_itoa64", fn_ty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    g->fn_itoa64 = fn;
+
+    LLVMBasicBlockRef save = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef digit = LLVMAppendBasicBlockInContext(g->ctx, fn, "digit");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
+    LLVMBasicBlockRef sign = LLVMAppendBasicBlockInContext(g->ctx, fn, "sign");
+    LLVMBasicBlockRef copy = LLVMAppendBasicBlockInContext(g->ctx, fn, "copy");
+
+    LLVMValueRef buf = LLVMGetParam(fn, 0);
+    LLVMValueRef v = LLVMGetParam(fn, 1);
+    LLVMValueRef uns = LLVMGetParam(fn, 2);
+    LLVMValueRef zero64 = LLVMConstInt(i64, 0, 0);
+    LLVMValueRef ten = LLVMConstInt(i64, 10, 0);
+    LLVMValueRef one = LLVMConstInt(i64, 1, 0);
+    /* digits are produced least-significant first, so they land at the end of
+     * a scratch buffer and the finished run is copied out in one go */
+    LLVMValueRef cap = LLVMConstInt(i64, 24, 0);
+
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef tmp = LLVMBuildArrayAlloca(g->builder, i8, cap, "itoa.tmp");
+    LLVMValueRef is_neg = LLVMBuildAnd(g->builder,
+        LLVMBuildICmp(g->builder, LLVMIntSLT, v, zero64, "itoa.slt"),
+        LLVMBuildICmp(g->builder, LLVMIntEQ, uns,
+                      LLVMConstInt(i32, 0, 0), "itoa.signed"), "itoa.neg");
+    /* negating INT64_MIN wraps to itself, which is the right magnitude read as
+     * unsigned -- the digit loop divides unsigned */
+    LLVMValueRef mag = LLVMBuildSelect(g->builder, is_neg,
+        LLVMBuildNeg(g->builder, v, "itoa.negv"), v, "itoa.mag");
+    LLVMBuildBr(g->builder, digit);
+
+    LLVMPositionBuilderAtEnd(g->builder, digit);
+    LLVMValueRef rest = LLVMBuildPhi(g->builder, i64, "itoa.rest");
+    LLVMValueRef pos = LLVMBuildPhi(g->builder, i64, "itoa.pos");
+    LLVMValueRef next_pos = LLVMBuildSub(g->builder, pos, one, "itoa.pos.n");
+    LLVMValueRef d = LLVMBuildURem(g->builder, rest, ten, "itoa.d");
+    LLVMValueRef ch = LLVMBuildTrunc(g->builder,
+        LLVMBuildAdd(g->builder, d, LLVMConstInt(i64, '0', 0), "itoa.dc"),
+        i8, "itoa.ch");
+    LLVMBuildStore(g->builder, ch,
+        LLVMBuildInBoundsGEP2(g->builder, i8, tmp, &next_pos, 1, "itoa.dp"));
+    LLVMValueRef next_rest = LLVMBuildUDiv(g->builder, rest, ten, "itoa.rest.n");
+    LLVMAddIncoming(rest, (LLVMValueRef[]){ mag, next_rest },
+                    (LLVMBasicBlockRef[]){ entry, digit }, 2);
+    LLVMAddIncoming(pos, (LLVMValueRef[]){ cap, next_pos },
+                    (LLVMBasicBlockRef[]){ entry, digit }, 2);
+    LLVMBuildCondBr(g->builder,
+        LLVMBuildICmp(g->builder, LLVMIntEQ, next_rest, zero64, "itoa.last"),
+        done, digit);
+
+    LLVMPositionBuilderAtEnd(g->builder, done);
+    LLVMBuildCondBr(g->builder, is_neg, sign, copy);
+
+    LLVMPositionBuilderAtEnd(g->builder, sign);
+    LLVMValueRef sign_pos = LLVMBuildSub(g->builder, next_pos, one, "itoa.sp");
+    LLVMBuildStore(g->builder, LLVMConstInt(i8, '-', 0),
+        LLVMBuildInBoundsGEP2(g->builder, i8, tmp, &sign_pos, 1, "itoa.spp"));
+    LLVMBuildBr(g->builder, copy);
+
+    LLVMPositionBuilderAtEnd(g->builder, copy);
+    LLVMValueRef start = LLVMBuildPhi(g->builder, i64, "itoa.start");
+    LLVMAddIncoming(start, (LLVMValueRef[]){ next_pos, sign_pos },
+                    (LLVMBasicBlockRef[]){ done, sign }, 2);
+    LLVMValueRef len = LLVMBuildSub(g->builder, cap, start, "itoa.len");
+    LLVMValueRef src = LLVMBuildInBoundsGEP2(g->builder, i8, tmp, &start, 1,
+                                             "itoa.src");
+    LLVMTypeRef memcpy_ty = LLVMFunctionType(i8ptr,
+        (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
+    LLVMValueRef memcpy_fn = LLVMGetNamedFunction(g->mod, "memcpy");
+    if (!memcpy_fn) memcpy_fn = LLVMAddFunction(g->mod, "memcpy", memcpy_ty);
+    zan_call2(g->builder, memcpy_ty, memcpy_fn,
+              (LLVMValueRef[]){ buf, src, len }, 3, "");
+    LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0),
+        LLVMBuildInBoundsGEP2(g->builder, i8, buf, &len, 1, "itoa.end"));
+    LLVMBuildRet(g->builder, len);
+
+    if (save) LLVMPositionBuilderAtEnd(g->builder, save);
+    return fn;
+}
+
+/* Format `v` (already widened to i64) into `buf`, which must hold at least 21
+ * bytes, and return the number of bytes written. */
+static LLVMValueRef emit_itoa_into(zan_irgen_t *g, LLVMValueRef buf,
+                                   LLVMValueRef v, int is_unsigned) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef fn = get_itoa64_fn(g);
+    LLVMTypeRef fn_ty = LLVMFunctionType(i64,
+        (LLVMTypeRef[]){ i8ptr, i64, i32 }, 3, 0);
+    LLVMValueRef args[] = { buf, v, LLVMConstInt(i32, is_unsigned ? 1 : 0, 0) };
+    return zan_call2(g->builder, fn_ty, fn, args, 3, "itoa");
 }
 
 /* ---- irgen translation-unit parts (order matters) ---------------------

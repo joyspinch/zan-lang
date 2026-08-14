@@ -365,6 +365,32 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
         return true;
     }
 
+    /* Find(p, off, b, n) -> memchr(p + off, b, n), reported as an offset from
+     * `p` (not from `p + off`) so a scan can be resumed with the returned
+     * index, and -1 when the byte is absent. A byte-at-a-time Zan loop pays a
+     * bounds check and a load per byte; memchr is the vectorised equivalent
+     * and it is what the framer's header scan spends its time in. */
+    if (is_call_to(expr, "NativeMemory", "Find") && expr->call.args.count == 4) {
+        LLVMValueRef p = nm_arg(g, expr, 0, locals);
+        LLVMValueRef off = nm_arg(g, expr, 1, locals);
+        LLVMValueRef b = nm_arg(g, expr, 2, locals);
+        LLVMValueRef n = nm_arg(g, expr, 3, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i8ptr,
+            (LLVMTypeRef[]){ i8ptr, i32t, i64t }, 3, 0);
+        LLVMValueRef fn = get_libc_fn(g, "memchr", ty);
+        LLVMValueRef hit = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, p, off),
+            LLVMBuildTrunc(g->builder, b, i32t, "nm.find.b"), n }, 3,
+            "nm.find");
+        LLVMValueRef found = zan_icmp(g->builder, LLVMIntNE, hit,
+                                      LLVMConstNull(i8ptr), "nm.find.ok");
+        LLVMValueRef at = LLVMBuildPtrToInt(g->builder, hit, i64t, "nm.find.a");
+        LLVMValueRef rel = LLVMBuildSub(g->builder, at, p, "nm.find.rel");
+        *out = LLVMBuildSelect(g->builder, found, rel,
+                               LLVMConstInt(i64t, (uint64_t)-1, 1), "nm.find.r");
+        return true;
+    }
+
     if (is_call_to(expr, "NativeMemory", "GetString") && expr->call.args.count == 3) {
         LLVMValueRef p = nm_arg(g, expr, 0, locals);
         LLVMValueRef off = nm_arg(g, expr, 1, locals);
@@ -3217,7 +3243,11 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
                      * {v:D4}/{v:X2} spec lowered by interp_format_to_printf.
                      * A fixed/scientific spec (F2, E2, 0.00) on an integer
                      * widens it to double first, like C#. */
-                    LLVMValueRef val64 = val;
+                    /* zan_iwiden, not a bare SExt: `byte` is unsigned in this
+                     * lowering, so 200 must widen to 200 not -56 */
+                    LLVMValueRef val64 =
+                        (LLVMGetIntTypeWidth(vt) < 64)
+                            ? zan_iwiden(g->builder, val, i64) : val;
                     bool iu = expr_is_ulong(g, part, locals);
                     char fbuf[32];
                     bool want_f = false;
@@ -3247,16 +3277,19 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
                         owns[i] = 1;
                         continue;
                     }
-                    if (LLVMGetIntTypeWidth(vt) < 64) {
-                        val64 = LLVMBuildSExt(g->builder, val, i64, "ext");
+                    if (flen <= 0) {
+                        /* plain {v}: the digits fit in 21 bytes, so format them
+                         * straight into the result instead of paying for two
+                         * snprintf calls (one just to measure) */
+                        LLVMValueRef buf = emit_string_alloc_rc(g,
+                            LLVMConstInt(i64, 24, 0));
+                        strs[i] = buf;
+                        lens[i] = emit_itoa_into(g, buf, val64, iu ? 1 : 0);
+                        owns[i] = 1;
+                        continue;
                     }
-                    LLVMValueRef fmt;
-                    if (flen > 0)
-                        fmt = LLVMBuildGlobalStringPtr(g->builder, fbuf, "ifmt");
-                    else
-                        fmt = iu
-                            ? LLVMBuildGlobalStringPtr(g->builder, "%llu", "ufmt")
-                            : LLVMBuildGlobalStringPtr(g->builder, "%lld", "ifmt");
+                    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
+                        fbuf, "ifmt");
                     LLVMValueRef null_ptr = LLVMConstNull(i8ptr);
                     LLVMValueRef zero = LLVMConstInt(i64, 0, 0);
                     LLVMValueRef snp_args1[] = { null_ptr, zero, fmt, val64 };

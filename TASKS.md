@@ -1147,6 +1147,20 @@ yet`（`src/compiler/main.c` 的 `need_rt && cross_compiling` 分支）。
 POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败。已在
 `dllcrt` 列表补上（exe 链接行本来就有），用例恢复通过。
 
+# A49 · 整数文本化的两处旧缺陷（2026-08-14）
+
+整数直写 itoa 替掉 `snprintf` 时（`irgen.c` 的 `__zan_itoa64`）核对边界，发现两处
+与新老降级无关、基线同样存在的语义缺陷（`3a5f6ec1` 与本轮产物逐字节相同）：
+
+* [x] **A49-1 `byte` 插值按有符号扩展** —— ✅ 已修。`byte b = 200; $"{b}"` 打印
+  `-56`：`irgen_expr.c` 的插值整数分支对窄整数一律 `SExt`，而 `byte`/`bool` 在本
+  降级里是无符号。改成走 `zan_iwiden`（≤8 位零扩展），`{b:F2}` 的 `SIToFP` 也
+  一并拿到正确的宽化值。用例 `tests/conformance/int_format_boundaries.zan`。
+* [ ] **A49-2 `StringBuilder.Append(ulong)` 丢无符号语义**：`sb.Append(umax)`
+  打印 `-1`。`emit_value_as_cstr` 只看 LLVM 值宽度、拿不到 Zan 静态类型，无从
+  判断该按 `ulong` 输出；要么给它传入静态类型，要么在 append 侧分流。基线同样
+  如此，不在本轮性能改动范围内，用例里因此只放了 `long` 的 append，修好后补行。
+
 # 已撤回的结论（早期草稿中的错误，勿再引用）
 
 1. ~~"无符号/窄类型只是语法别名，IR 层全塌成 i64，语义是假的"~~ ——

@@ -1459,14 +1459,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     LLVMDoubleTypeInContext(g->ctx), "ext");
                             }
                         } else {
-                            /* signed by default; a ulong argument must print
-                             * with %llu or values >= 2^63 come out negative. */
+                            /* signed by default; a ulong argument formats
+                             * unsigned or values >= 2^63 come out negative. */
                             bool is_ul = expr_is_ulong(
                                 g, expr->call.args.items[0], locals);
-                            fmt = is_ul
-                                ? LLVMBuildGlobalStringPtr(g->builder, "%llu", "utoa_fmt")
-                                : LLVMBuildGlobalStringPtr(g->builder, "%lld", "itoa_fmt");
-                            num_arg = emit_widen_i64_for_print(g, arg);
+                            emit_itoa_into(g, buf,
+                                emit_widen_i64_for_print(g, arg), is_ul ? 1 : 0);
+                            return buf;
                         }
                         LLVMValueRef sn_args[] = { buf, LLVMConstInt(i64, 32, 0), fmt, num_arg };
                         zan_call2(g->builder,
@@ -1825,12 +1824,10 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             num_arg = LLVMBuildFPExt(g->builder, v,
                                 LLVMDoubleTypeInContext(g->ctx), "ext");
                         }
-                    } else if (rt_ty->kind == TYPE_ULONG) {
-                        fmt = LLVMBuildGlobalStringPtr(g->builder, "%llu", "utoa_fmt");
-                        num_arg = emit_widen_i64_for_print(g, v);
                     } else {
-                        fmt = LLVMBuildGlobalStringPtr(g->builder, "%lld", "itoa_fmt");
-                        num_arg = emit_widen_i64_for_print(g, v);
+                        emit_itoa_into(g, buf, emit_widen_i64_for_print(g, v),
+                                       rt_ty->kind == TYPE_ULONG ? 1 : 0);
+                        return buf;
                     }
                     LLVMValueRef sn_args[] = { buf, LLVMConstInt(i64, 32, 0), fmt, num_arg };
                     zan_call2(g->builder,

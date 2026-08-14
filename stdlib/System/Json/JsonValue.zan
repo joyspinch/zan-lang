@@ -453,17 +453,24 @@ class JsonValue {
     // ---- 解析 -----------------------------------------------------------
 
     /// 将 JSON 文档解析为值树。格式错误时抛出
-    /// JsonException（与 C# 一致）。先用一次
-    /// 零分配扫描校验文档，再构建树，因此错误路径不会
-    /// 持有任何存活分配。
+    /// JsonException（与 C# 一致）。校验与建树在同一遍扫描里
+    /// 完成：出错只记录位置并停止，抛异常前先丢掉部分树，
+    /// 所以错误路径依然不持有存活分配。
     static JsonValue Parse(string src) {
-        int errPos = JsonReader.FirstErrorPos(src);
+        JsonReader r = JsonReader.OfStrict(src);
+        JsonValue v = r.ReadValue();
+        if (r.errPos < 0) {
+            r.SkipWs();
+            if (r.pos < r.len) { r.errPos = r.pos; }   // 尾部有多余内容
+        }
+        int errPos = r.errPos;
         if (errPos >= 0) {
+            v = null;
+            r = null;
             throw new JsonException("Malformed JSON at position "
                 + Convert.ToString(errPos));
         }
-        JsonReader r = JsonReader.Of(src);
-        return r.ReadValue();
+        return v;
     }
 
     /// 尽力而为的解析：输入格式错误时返回已解析的部分
@@ -485,13 +492,33 @@ class JsonReader {
     /// 调用栈（约 20-40 万层时解析器崩溃），必须显式限制。
     static int MaxDepth = 512;
 
+    /// 严格模式（JsonValue.Parse）：边建树边校验，首个错误位置
+    /// 记在 errPos 上；宽松模式（ParseLenient）行为保持不变。
+    bool strict;
+    int errPos;
+
     static JsonReader Of(string src) {
         JsonReader r = new JsonReader();
         r.s = src;
         r.pos = 0;
         r.len = src.Length;
+        r.strict = false;
+        r.errPos = -1;
         return r;
     }
+
+    static JsonReader OfStrict(string src) {
+        JsonReader r = JsonReader.Of(src);
+        r.strict = true;
+        return r;
+    }
+
+    /// 记录首个错误位置（后来的错误不覆盖它）。
+    void Fail() {
+        if (errPos < 0) { errPos = pos; }
+    }
+
+    bool Failed() { return errPos >= 0; }
 
     /// 游标处的字节，输入结束时为 -1。
     int CurB() {
@@ -515,14 +542,35 @@ class JsonReader {
     }
 
     JsonValue ReadValueAt(int depth) {
-        if (depth > JsonReader.MaxDepth) { return JsonValue.NewNull(); }
+        if (depth > JsonReader.MaxDepth) {
+            if (strict) { Fail(); }
+            return JsonValue.NewNull();
+        }
         SkipWs();
         int c = CurB();
         if (c == 123) { return ReadObjectAt(depth); }              // '{'
         if (c == 91) { return ReadArrayAt(depth); }                // '['
         if (c == 34) { return JsonValue.NewStr(ReadString()); }
-        if (c == 116 || c == 102) { return ReadBool(); }    // 't' / 'f'
-        if (c == 110) { pos = pos + 4; return JsonValue.NewNull(); }
+        if (c == 116 || c == 102) {                        // 't' / 'f'
+            if (strict) {
+                string lit = "false";
+                if (c == 116) { lit = "true"; }
+                if (!ValidLiteral(lit)) {
+                    Fail();
+                    return JsonValue.NewNull();
+                }
+                return JsonValue.NewBool(c == 116);
+            }
+            return ReadBool();
+        }
+        if (c == 110) {
+            if (strict) {
+                if (!ValidLiteral("null")) { Fail(); }
+            } else {
+                pos = pos + 4;
+            }
+            return JsonValue.NewNull();
+        }
         return ReadNumber();
     }
 
@@ -533,17 +581,24 @@ class JsonReader {
         if (CurB() == 125) { pos = pos + 1; return obj; }   // '}'
         while (pos < len) {
             SkipWs();
+            if (strict && CurB() != 34) { Fail(); return obj; }
             string key = ReadString();
             SkipWs();
             if (CurB() == 58) { pos = pos + 1; }            // ':'
+            else if (strict) { Fail(); return obj; }
             JsonValue v = ReadValueAt(depth + 1);
+            if (strict && Failed()) { return obj; }
             obj.Put(key, v);
             SkipWs();
             int c = CurB();
             if (c == 44) { pos = pos + 1; }                 // ','
             else if (c == 125) { pos = pos + 1; return obj; } // '}'
-            else { return obj; }
+            else {
+                if (strict) { Fail(); }
+                return obj;
+            }
         }
+        if (strict) { Fail(); }                             // 未闭合
         return obj;
     }
 
@@ -554,13 +609,18 @@ class JsonReader {
         if (CurB() == 93) { pos = pos + 1; return arr; }    // ']'
         while (pos < len) {
             JsonValue v = ReadValueAt(depth + 1);
+            if (strict && Failed()) { return arr; }
             arr.Append(v);
             SkipWs();
             int c = CurB();
             if (c == 44) { pos = pos + 1; }                 // ','
             else if (c == 93) { pos = pos + 1; return arr; } // ']'
-            else { return arr; }
+            else {
+                if (strict) { Fail(); }
+                return arr;
+            }
         }
+        if (strict) { Fail(); }                             // 未闭合
         return arr;
     }
 
@@ -570,7 +630,10 @@ class JsonReader {
     /// 含转义的字符串则回退到 StringBuilder，批量复制
     /// 转义之间的普通片段。
     string ReadString() {
-        if (CurB() != 34) { return ""; }
+        if (CurB() != 34) {
+            if (strict) { Fail(); }
+            return "";
+        }
         pos = pos + 1;                 // 消费起始引号
         int start = pos;
         while (pos < len) {
@@ -605,7 +668,16 @@ class JsonReader {
                     // "\u4e2d\u6587" 变成字面量 "u4e2du6587"。
                     pos = pos + 2;
                     int cp = JsonReader.Hex4(s, pos, len);
-                    if (cp < 0) { sb.Append("u"); continue; }
+                    if (cp < 0) {
+                        // 错误位置按转义起点报（游标已越过 "\u"）。
+                        if (strict) {
+                            pos = pos - 2;
+                            Fail();
+                            return sb.ToString();
+                        }
+                        sb.Append("u");
+                        continue;
+                    }
                     pos = pos + 4;
                     if (cp >= 55296 && cp <= 56319 && pos + 5 < len
                         && (s[pos] & 255) == 92 && (s[pos + 1] & 255) == 117) {
@@ -626,7 +698,11 @@ class JsonReader {
                     sb.Append(Encoding.Utf8FromCodePoint(cp));
                     continue;
                 }
-                else { sb.Append(s.Substring(pos + 1, 1)); }
+                else {
+                    // \" \\ \/ \b \f \n \r \t \u 之外的转义在 JSON 里非法。
+                    if (strict) { Fail(); return sb.ToString(); }
+                    sb.Append(s.Substring(pos + 1, 1));
+                }
                 pos = pos + 2;
             } else {
                 int run = pos;
@@ -639,6 +715,7 @@ class JsonReader {
                 pos = run;
             }
         }
+        if (strict) { Fail(); }                             // 未闭合
         return sb.ToString();
     }
 
@@ -663,6 +740,15 @@ class JsonReader {
 
     JsonValue ReadNumber() {
         int start = pos;
+        if (strict) {
+            // 严格模式下用 JSON 数字语法逐字节推进游标，省掉
+            // 事先整篇校验的那一遍扫描。
+            if (!ValidNumber()) {
+                Fail();
+                return JsonValue.NewNull();
+            }
+            return JsonValue.NewNum(s.Substring(start, pos - start));
+        }
         while (pos < len) {
             int c = s[pos] & 255;
             if ((c >= 48 && c <= 57) || c == 45 || c == 43 || c == 46
@@ -675,41 +761,7 @@ class JsonReader {
         return JsonValue.NewNum(s.Substring(start, pos - start));
     }
 
-    // ---- 校验（JsonValue.Parse 使用的零分配扫描） -----------------------
-
-    /// `src` 中首个语法错误的位置；有效时返回 -1
-    /// 的 JSON。正常返回，调用者可抛出异常而不必在
-    /// 栈帧中保留 reader 对象（异常回退目前不会释放局部变量）。
-    static int FirstErrorPos(string src) {
-        JsonReader v = JsonReader.Of(src);
-        if (v.ValidDocument()) { return -1; }
-        return v.pos;
-    }
-
-    /// 不分配任何值地扫描整个文档以校验 JSON 语法；
-    /// 失败时游标停留在出错位置。
-    bool ValidDocument() {
-        if (!ValidValue()) { return false; }
-        SkipWs();
-        return pos >= len;
-    }
-
-    bool ValidValue() {
-        return ValidValueAt(0);
-    }
-
-    bool ValidValueAt(int depth) {
-        if (depth > JsonReader.MaxDepth) { return false; }
-        SkipWs();
-        int c = CurB();
-        if (c == 123) { return ValidObjectAt(depth); }          // '{'
-        if (c == 91) { return ValidArrayAt(depth); }            // '['
-        if (c == 34) { return ValidString(); }
-        if (c == 116) { return ValidLiteral("true"); }
-        if (c == 102) { return ValidLiteral("false"); }
-        if (c == 110) { return ValidLiteral("null"); }
-        return ValidNumber();
-    }
+    // ---- 语法校验（严格模式解析时就地调用） -------------------------
 
     bool ValidLiteral(string lit) {
         int n = lit.Length;
@@ -717,69 +769,6 @@ class JsonReader {
         if (s.Substring(pos, n) != lit) { return false; }
         pos = pos + n;
         return true;
-    }
-
-    bool ValidObjectAt(int depth) {
-        pos = pos + 1;                 // 消费 '{'
-        SkipWs();
-        if (CurB() == 125) { pos = pos + 1; return true; }  // '}'
-        while (pos < len) {
-            SkipWs();
-            if (CurB() != 34) { return false; }
-            if (!ValidString()) { return false; }
-            SkipWs();
-            if (CurB() != 58) { return false; }             // ':'
-            pos = pos + 1;
-            if (!ValidValueAt(depth + 1)) { return false; }
-            SkipWs();
-            int c = CurB();
-            if (c == 44) { pos = pos + 1; }                 // ','
-            else if (c == 125) { pos = pos + 1; return true; } // '}'
-            else { return false; }
-        }
-        return false;
-    }
-
-    bool ValidArrayAt(int depth) {
-        pos = pos + 1;                 // 消费 '['
-        SkipWs();
-        if (CurB() == 93) { pos = pos + 1; return true; }   // ']'
-        while (pos < len) {
-            if (!ValidValueAt(depth + 1)) { return false; }
-            SkipWs();
-            int c = CurB();
-            if (c == 44) { pos = pos + 1; }                 // ','
-            else if (c == 93) { pos = pos + 1; return true; } // ']'
-            else { return false; }
-        }
-        return false;
-    }
-
-    bool ValidString() {
-        if (CurB() != 34) { return false; }
-        pos = pos + 1;                 // 消费起始引号
-        while (pos < len) {
-            int c = s[pos] & 255;
-            if (c == 34) { pos = pos + 1; return true; }
-            if (c == 92) {
-                if (pos + 1 >= len) { return false; }
-                int e = s[pos + 1] & 255;
-                // 合法转义：" \ / b f n r t u；\u 后面必须跟 4 位十六进制。
-                if (e == 117) {
-                    if (JsonReader.Hex4(s, pos + 2, len) < 0) { return false; }
-                    pos = pos + 6;
-                    continue;
-                }
-                if (e != 34 && e != 92 && e != 47 && e != 98 && e != 102
-                    && e != 110 && e != 114 && e != 116) {
-                    return false;
-                }
-                pos = pos + 2;
-            } else {
-                pos = pos + 1;
-            }
-        }
-        return false;                  // 未闭合
     }
 
     bool ValidNumber() {

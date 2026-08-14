@@ -213,8 +213,23 @@ typedef struct zan_io_dead {
     struct zan_io_dead *next;
 } zan_io_dead_t;
 
+/* Longest an otherwise unbounded reactor wait may sleep. It bounds how long a
+ * waiter stranded on a closed fd stays parked before io_sweep_slots finds it,
+ * and it is what keeps that sweep off the hot path. */
+#define ZAN_IO_SWEEP_MS 20
+
+/* How many reads may be served straight from the socket buffer (zan_io_recv_co's
+ * speculative recv) between two reactor turns. The fast path keeps a coroutine
+ * out of the epoll round trip, but a coroutine that never parks also never lets
+ * the ready queue empty -- and the queue emptying is what gives the reactor its
+ * turn. Spending the budget makes the next read park, so connections whose data
+ * arrived while the queue was busy wait a bounded number of requests, not a
+ * whole burst. */
+#define ZAN_IO_FAST_BURST 64
+
 static zan_io_dead_t *g_io_dead;
 static int g_io_dead_count;
+static int g_io_fast_budget = ZAN_IO_FAST_BURST;
 
 /* An fd the kernel still knows (zan_io_socket_alive: a single fcntl here). */
 static int io_fd_usable(intptr_t fd) {
@@ -690,7 +705,9 @@ static int io_sweep_slots(void) {
  * ADD + DEL pair (and none of the list walking) the previous version needed.
  */
 
-static int g_epoll_fd = -1;void zan_io_init(void) {
+static int g_epoll_fd = -1;
+
+void zan_io_init(void) {
     if (g_io_started) return;
     zan_io_ignore_sigpipe();
     g_io_entries = NULL;
@@ -803,22 +820,29 @@ static int g_epoll_fd = -1;void zan_io_init(void) {
 int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_dead) return io_flush_dead();
     if (g_io_count == 0 && g_dns_inflight == 0) return 0;
-    /* An unbounded wait is the one that turns a stranded waiter into a hang,
-     * so check for dead fds before committing to it. */
-    if (timeout_ms < 0) {
-        int woke = io_sweep_slots();
-        if (woke) return woke;
-        if (g_io_count == 0 && g_dns_inflight == 0) return 0;
-    }
+    /* A waiter whose fd was closed under it is invisible to the backend, so it
+     * is the sweep below -- reached when the (now bounded) wait times out --
+     * that keeps it from becoming a hang. Sweeping before every wait instead
+     * costs one liveness probe per parked waiter, i.e. a syscall per connection
+     * on every idle turn of the loop. */
     struct epoll_event events[256];
-    int64_t wait = dns_wait_ms(timeout_ms);
-    int n = epoll_wait(g_epoll_fd, events, 256, wait < 0 ? -1 : (int)wait);
-    if (n == 0) {
+    int n;
+    for (;;) {
+        int64_t wait = dns_wait_ms(timeout_ms);
+        int capped = (wait < 0 || wait > ZAN_IO_SWEEP_MS);
+        if (capped) wait = ZAN_IO_SWEEP_MS;
+        n = epoll_wait(g_epoll_fd, events, 256, (int)wait);
+        if (n != 0) break;
         int w2 = dns_timeout_scan();
         if (w2) return w2;
         int w3 = dns_drain();
         if (w3) return w3;
-        return io_sweep_slots();
+        int w4 = io_sweep_slots();
+        if (w4) return w4;
+        /* A wait shortened only to schedule the sweep has not expired for the
+         * caller: keep waiting rather than report "nothing to wait for". */
+        if (!capped || (g_io_count == 0 && g_dns_inflight == 0)) return 0;
+        if (timeout_ms >= 0) return 0;
     }
     int woke = 0;
     for (int i = 0; i < n; i++) {
@@ -965,23 +989,30 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
 int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_dead) return io_flush_dead();
     if (g_io_count == 0 && g_dns_inflight == 0) return 0;
-    /* An unbounded wait is the one that turns a stranded waiter into a hang,
-     * so check for dead fds before committing to it. */
-    if (timeout_ms < 0) {
-        int woke = io_sweep_slots();
-        if (woke) return woke;
-        if (g_io_count == 0 && g_dns_inflight == 0) return 0;
-    }
+    /* A waiter whose fd was closed under it is invisible to the backend, so it
+     * is the sweep below -- reached when the (now bounded) wait times out --
+     * that keeps it from becoming a hang. Sweeping before every wait instead
+     * costs one liveness probe per parked waiter, i.e. a syscall per connection
+     * on every idle turn of the loop. */
     struct kevent events[64];
-    int64_t wait = dns_wait_ms(timeout_ms);
-    struct timespec ts = { wait / 1000, (wait % 1000) * 1000000L };
-    int n = kevent(g_kq_fd, NULL, 0, events, 64, wait < 0 ? NULL : &ts);
-    if (n == 0) {
+    int n;
+    for (;;) {
+        int64_t wait = dns_wait_ms(timeout_ms);
+        int capped = (wait < 0 || wait > ZAN_IO_SWEEP_MS);
+        if (capped) wait = ZAN_IO_SWEEP_MS;
+        struct timespec ts = { wait / 1000, (wait % 1000) * 1000000L };
+        n = kevent(g_kq_fd, NULL, 0, events, 64, &ts);
+        if (n != 0) break;
         int w2 = dns_timeout_scan();
         if (w2) return w2;
         int w3 = dns_drain();
         if (w3) return w3;
-        return io_sweep_slots();
+        int w4 = io_sweep_slots();
+        if (w4) return w4;
+        /* A wait shortened only to schedule the sweep has not expired for the
+         * caller: keep waiting rather than report "nothing to wait for". */
+        if (!capped || (g_io_count == 0 && g_dns_inflight == 0)) return 0;
+        if (timeout_ms >= 0) return 0;
     }
     int woke = 0;
     for (int i = 0; i < n; i++) {
@@ -2141,6 +2172,26 @@ void zan_io_wait_co(intptr_t fd, int32_t interest, void *frame, zan_co_step_t st
 void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
                     zan_co_step_t step, int64_t *out_n) {
     zan_io_init();
+#if defined(MSG_DONTWAIT)
+    /* A keep-alive peer usually has its next request in the socket buffer
+     * already, so try the recv before parking: the readiness round trip costs
+     * an epoll_ctl re-arm, an epoll_wait wake and a liveness probe per request
+     * for data that is there. MSG_DONTWAIT makes the attempt non-blocking
+     * whatever the fd's own O_NONBLOCK state is, and the coroutine is readied
+     * rather than resumed inline so the caller still returns to the scheduler
+     * exactly as a parked await would. */
+    if (fd >= 0 && buf && len > 0 && out_n && g_io_fast_budget > 0) {
+        ssize_t rn = recv((int)fd, buf, (size_t)len, MSG_DONTWAIT);
+        int again = (rn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK
+                               || errno == EINTR));
+        if (!again) {
+            g_io_fast_budget--;
+            *out_n = (rn < 0) ? 0 : (int64_t)rn;
+            io_wake(frame, step);
+            return;
+        }
+    }
+#endif
     g_pending_rbuf = buf;
     g_pending_rlen = len;
     g_pending_out_n = out_n;
@@ -2156,6 +2207,9 @@ void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
 #endif
 
 int32_t zan_io_pump_timeout(int64_t timeout_ms) {
+#if !defined(_WIN32)
+    g_io_fast_budget = ZAN_IO_FAST_BURST;   /* a reactor turn refills the burst */
+#endif
     if (zan_io_has_pending())
         return zan_io_poll(timeout_ms);
     if (timeout_ms <= 0)

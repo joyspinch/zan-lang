@@ -1,0 +1,76 @@
+// HttpContext.Cookie 与 HttpRequest 头名匹配的行为契约。
+// Cookie 改成就地比较（不再切片+拼前缀）、头名先按长度分流之后，
+// 这里锁住三类容易被"顺手优化"改坏的语义：名字必须整段相等（不是前缀，
+// 也不是后缀）、空值算未命中、头名大小写不敏感而 cookie 名大小写敏感。
+using System;
+using System.Net.Http;
+using System.Web;
+
+class Program {
+    static int failures = 0;
+
+    static void Eq(string what, string got, string want) {
+        if (got == want) {
+            Console.WriteLine("ok " + what);
+        } else {
+            Console.WriteLine("FAIL " + what + ": got '" + got
+                              + "' want '" + want + "'");
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static HttpContext Ctx(string cookieHeader) {
+        string raw = "GET /p HTTP/1.1\r\nHost: h\r\nCookie: " + cookieHeader
+                     + "\r\n\r\n";
+        return new HttpContext(HttpRequest.Parse(raw), "127.0.0.1");
+    }
+
+    static void Main() {
+        HttpContext c = Program.Ctx("sid=abc; theme=dark");
+        Program.Eq("first cookie", c.Cookie("sid"), "abc");
+        Program.Eq("second cookie", c.Cookie("theme"), "dark");
+        Program.Eq("absent cookie", c.Cookie("nope"), "");
+        // 名字必须整段相等：前缀/后缀/空名都不算命中。
+        Program.Eq("name is not a prefix", c.Cookie("si"), "");
+        Program.Eq("name is not a suffix", c.Cookie("id"), "");
+        // cookie 名大小写敏感（与 RFC 6265 一致）。
+        Program.Eq("name is case sensitive", c.Cookie("SID"), "");
+
+        // 空值 = 未命中，且不能吞掉后面同名的有值项之前的扫描位置。
+        HttpContext e = Program.Ctx("sid=; theme=dark");
+        Program.Eq("empty value misses", e.Cookie("sid"), "");
+        Program.Eq("scan continues past empty", e.Cookie("theme"), "dark");
+
+        // 无空格分隔、末尾分号、单个 cookie。
+        HttpContext t = Program.Ctx("a=1;b=2;");
+        Program.Eq("no space separator", t.Cookie("b"), "2");
+        Program.Eq("trailing semicolon", t.Cookie("a"), "1");
+
+        // 值里含 '=' 全部保留（base64 padding 这么写才不会被截断）。
+        HttpContext q = Program.Ctx("tok=YWJj==; x=1");
+        Program.Eq("equals kept in value", q.Cookie("tok"), "YWJj==");
+
+        // 没有 Cookie 头时返回空串而不是崩。
+        HttpContext n = new HttpContext(
+            HttpRequest.Parse("GET / HTTP/1.1\r\nHost: h\r\n\r\n"), "1.2.3.4");
+        Program.Eq("no cookie header", n.Cookie("sid"), "");
+
+        // 头名按长度分流后仍然大小写不敏感，且长度相同的别名不会串味：
+        // "cookie"(6) 与同长度的 "origin"(6) 都是 6 字节。
+        HttpRequest r = HttpRequest.Parse(
+            "POST /x HTTP/1.1\r\nHOST: up.example\r\n"
+            + "Origin: http://evil\r\nCoOkIe: sid=zz\r\n"
+            + "Content-Type: text/plain\r\nContent-Length: 3\r\n"
+            + "Connection: keep-alive\r\n\r\nabc");
+        Program.Eq("host case insensitive", r.host, "up.example");
+        Program.Eq("cookie case insensitive", r.GetHeader("Cookie"), "sid=zz");
+        Program.Eq("same-length header not confused",
+                   r.GetHeader("Origin"), "http://evil");
+        Program.Eq("content type", r.contentType, "text/plain");
+        Program.Eq("content length", Convert.ToString(r.contentLength), "3");
+        Program.Eq("keep alive", Convert.ToString(r.keepAlive), "1");
+        Program.Eq("body", r.body, "abc");
+
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+    }
+}

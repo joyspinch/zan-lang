@@ -16,6 +16,12 @@ class HttpRequest {
     string queryString;
     string host;
     string contentType;
+    // 解析时顺带捕获的两个请求级头部。头部块的每次按名查找都要重扫
+    // 一遍整块字节，而这两个头部是服务器每个请求都要问的（认证：
+    // Authorization / 会话 cookie），所以和 host/contentType 一样在
+    // 唯一的那次扫描里就取出来，GetHeader 直接命中。
+    string authorization;
+    string cookie;
     int contentLength;
     bool keepAlive;
     // 正文的真实字节数。字符串以 NUL 结尾，body.Length 只数到第一个
@@ -45,6 +51,8 @@ class HttpRequest {
         this.queryString = "";
         this.host = "";
         this.contentType = "";
+        this.authorization = "";
+        this.cookie = "";
         this.contentLength = 0;
         this.keepAlive = true;
         this.bodyLength = 0;
@@ -158,11 +166,29 @@ class HttpRequest {
                 if (vStart < lineStop && (raw[vStart] & 255) == 32) {
                     vStart = vStart + 1;
                 }
-                if (RegionIs(raw, pos, colonPos, "host")) {
+                // 头名先按长度分流：本方法关心的七个头名长度互不相同
+                // （4/6/10/12/13/14/17），所以每行最多做一次 RegionIs。
+                // 逐个 RegionIs 试下去的话，每个头名都要把余下的候选串
+                // 全量 strlen 一遍——实测每请求 36 次比较、36 次 strlen。
+                int nameLen = colonPos - pos;
+                if (nameLen == 4 && RegionIs(raw, pos, colonPos, "host")) {
                     req.host = raw.Substring(vStart, lineStop - vStart);
-                } else if (RegionIs(raw, pos, colonPos, "content-type")) {
+                } else if (nameLen == 12
+                           && RegionIs(raw, pos, colonPos, "content-type")) {
                     req.contentType = raw.Substring(vStart, lineStop - vStart);
-                } else if (RegionIs(raw, pos, colonPos, "content-length")) {
+                } else if (nameLen == 13
+                           && RegionIs(raw, pos, colonPos, "authorization")) {
+                    // 重复出现取第一条，与按名查找的结果一致。
+                    if (req.authorization.Length == 0) {
+                        req.authorization = raw.Substring(vStart, lineStop - vStart);
+                    }
+                } else if (nameLen == 6
+                           && RegionIs(raw, pos, colonPos, "cookie")) {
+                    if (req.cookie.Length == 0) {
+                        req.cookie = raw.Substring(vStart, lineStop - vStart);
+                    }
+                } else if (nameLen == 14
+                           && RegionIs(raw, pos, colonPos, "content-length")) {
                     // 用 64 位累加：32 位 int 下 `4294967297` 会回绕成 1，
                     // 剩下的正文就被当成下一条流水线请求（经典走私）。
                     // 任何非数字字符、或超出 int 上限的值都置 413/400，
@@ -201,7 +227,8 @@ class HttpRequest {
                         firstCl = clAcc;
                         req.contentLength = (int)clAcc;
                     }
-                } else if (RegionIs(raw, pos, colonPos, "transfer-encoding")) {
+                } else if (nameLen == 17
+                           && RegionIs(raw, pos, colonPos, "transfer-encoding")) {
                     // 只有值恰好是 chunked 时正文才自定界
                     // （RFC 7230 §3.3.3）。其它编码（gzip 等）或
                     // 叠加编码无法据此找到正文结尾，仍按未实现处理。
@@ -219,7 +246,8 @@ class HttpRequest {
                     // 出现 → 400（冲突）；单独 TE（chunked）→ 501。
                     // 顺序无关，循环结束后统一裁决。
                     teSeen = true;
-                } else if (RegionIs(raw, pos, colonPos, "connection")) {
+                } else if (nameLen == 10
+                           && RegionIs(raw, pos, colonPos, "connection")) {
                     // A comma separated list ("keep-alive, Upgrade"), matched
                     // token by token: an exact compare against the whole value
                     // missed "close" in every list and kept a connection the
@@ -296,10 +324,40 @@ class HttpRequest {
         return true;
     }
 
+    /// <summary>当 name 与 lower（须为小写字面量）相等（ASCII 大小写不敏感）
+    /// 时为 true。不分配：用于按名查找头部前的常见头部判定。</summary>
+    static bool NameIs(string name, string lower) {
+        if (name.Length != lower.Length) { return false; }
+        int n = lower.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = name[i] & 255;
+            if (c >= 65 && c <= 90) { c = c + 32; }
+            if (c != (lower[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
+    /// <summary>与 <see cref="RegionIs"/> 相同，但 name 的大小写也不敏感——
+    /// 调用方传进来的名字不保证是小写，而把它 ToLower 一份只为比较，
+    /// 等于每次查找都在堆上分配一个副本。</summary>
+    static bool RegionIsCi(string raw, int pos, int stop, string name) {
+        if (stop - pos != name.Length) { return false; }
+        for (int i = 0; pos + i < stop; i = i + 1) {
+            int c = raw[pos + i] & 255;
+            if (c >= 65 && c <= 90) { c = c + 32; }
+            int d = name[i] & 255;
+            if (d >= 65 && d <= 90) { d = d + 32; }
+            if (c != d) { return false; }
+        }
+        return true;
+    }
+
     /// <summary>按名称获取某个头部值（大小写不敏感）。</summary>
     string GetHeader(string name) {
+        // 解析时已捕获的头部不必重扫头部块。
+        if (HttpRequest.NameIs(name, "authorization")) { return this.authorization; }
+        if (HttpRequest.NameIs(name, "cookie")) { return this.cookie; }
         // 在 rawHeaders 中搜索（按字节扫描；只分配返回值本身）
-        string lname = name.ToLower();
         int pos = 0;
         int len = this.rawHeaders.Length;
         while (pos < len) {
@@ -314,7 +372,7 @@ class HttpRequest {
                 colonPos = colonPos + 1;
             }
             if (colonPos < lineStop) {
-                if (RegionIs(this.rawHeaders, pos, colonPos, lname)) {
+                if (RegionIsCi(this.rawHeaders, pos, colonPos, name)) {
                     int vStart = colonPos + 1;
                     if (vStart < lineStop && (this.rawHeaders[vStart] & 255) == 32) {
                         vStart = vStart + 1;

@@ -1,0 +1,48 @@
+// ByteBuffer.IndexOfByte scans with NativeMemory.Find (memchr): the result is
+// an index into the buffer, the search honours the written length rather than
+// the capacity (so a NUL or a stale byte past the high-water mark is never
+// reported), and `from` is clamped the same way the byte-at-a-time scan was.
+using System;
+using System.IO;
+
+class Program {
+    static int bad;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); bad = bad + 1; }
+    }
+
+    static void Main() {
+        ByteBuffer b = ByteBuffer.FromStr("ab\r\ncd\r\n\r\n");
+        Check(b.IndexOfByte(0, 10) == 3, "first lf");
+        Check(b.IndexOfByte(4, 10) == 7, "resume after hit");
+        Check(b.IndexOfByte(8, 10) == 9, "last lf");
+        Check(b.IndexOfByte(0, 13) == 2, "cr");
+        Check(b.IndexOfByte(-5, 97) == 0, "negative from clamps");
+        Check(b.IndexOfByte(0, 122) == -1, "absent byte");
+        Check(b.IndexOfByte(10, 10) == -1, "from at end");
+        Check(b.IndexOfByte(999, 10) == -1, "from past end");
+        // 0x0A + 256 must be masked back to a LF, matching the old `b & 255`.
+        Check(b.IndexOfByte(0, 266) == 3, "byte masked");
+        b.Free();
+
+        // Only the written prefix is searched: the buffer is allocated zeroed,
+        // so a match past `length` would show up as index 2 without the bound.
+        ByteBuffer c = ByteBuffer.Alloc(16);
+        c.WriteU8(65).WriteU8(66);
+        Check(c.IndexOfByte(0, 66) == 1, "written byte found");
+        Check(c.IndexOfByte(0, 0) == -1, "nul past length ignored");
+        c.Free();
+
+        // Raw memchr through the intrinsic, offset-relative and -1 on miss.
+        nint p = NativeMemory.Alloc(8);
+        NativeMemory.PutString(p, 0, "xyzzy", 5);
+        Check(NativeMemory.Find(p, 0, 122, 5) == 2, "find first z");
+        Check(NativeMemory.Find(p, 3, 122, 2) == 3, "find from offset");
+        Check(NativeMemory.Find(p, 0, 113, 5) == -1, "find miss");
+        Check(NativeMemory.Find(p, 0, 122, 0) == -1, "find zero length");
+        NativeMemory.Free(p);
+
+        Console.WriteLine("bytebuffer-indexof-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

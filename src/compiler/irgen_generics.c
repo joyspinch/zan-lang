@@ -1395,8 +1395,8 @@ static LLVMValueRef emit_value_as_cstr(zan_irgen_t *g, LLVMValueRef v) {
         arg = (LLVMGetTypeKind(vt) == LLVMFloatTypeKind)
             ? LLVMBuildFPExt(g->builder, v, LLVMDoubleTypeInContext(g->ctx), "f2d") : v;
     } else {
-        fmt = "%lld";
-        arg = emit_widen_i64_for_print(g, v);
+        emit_itoa_into(g, buf, emit_widen_i64_for_print(g, v), 0);
+        return buf;
     }
     zan_istr_t fs = { fmt, (int)strlen(fmt) };
     LLVMValueRef fmt_ptr = emit_string_literal_rc(g, fs);
@@ -1423,11 +1423,21 @@ static void emit_sb_append_bytes(zan_irgen_t *g, LLVMValueRef sbp,
     LLVMBasicBlockRef grow_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sb.grow");
     LLVMBasicBlockRef st_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sb.st");
     LLVMBuildCondBr(g->builder, full, grow_bb, st_bb);
-    /* grow: newcap = max(cap*2, need); realloc data */
+    /* grow: newcap = max(cap*2, need, 64); realloc data.
+     *
+     * The floor matters: capacity started at 0 and doubling 0 is 0, so a
+     * builder filled by a series of short appends grew exactly to `need` every
+     * time -- "HTTP/1.1 " + status + reason + headers reallocated once per
+     * append (measured: 8 allocations per HTTP response). One 64-byte block
+     * covers the common line/header case, and the doubling above it keeps the
+     * amortised behaviour for big builders. */
     LLVMPositionBuilderAtEnd(g->builder, grow_bb);
     LLVMValueRef nc0 = zan_mul(g->builder, cap, LLVMConstInt(i64, 2, 0), "sbnc0");
     LLVMValueRef small = zan_icmp(g->builder, LLVMIntSLT, nc0, need, "sbsm");
     LLVMValueRef nc = LLVMBuildSelect(g->builder, small, need, nc0, "sbnc");
+    LLVMValueRef tiny = zan_icmp(g->builder, LLVMIntSLT, nc,
+                                 LLVMConstInt(i64, 64, 0), "sbtiny");
+    nc = LLVMBuildSelect(g->builder, tiny, LLVMConstInt(i64, 64, 0), nc, "sbnc2");
     LLVMValueRef dptr = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sbp, 2, "sbdp");
     LLVMValueRef olddata = LLVMBuildLoad2(g->builder, i8ptr, dptr, "sbod");
     LLVMValueRef newdata = zan_call2(g->builder,
@@ -1741,8 +1751,11 @@ static LLVMValueRef emit_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
         fmt = LLVMBuildGlobalStringPtr(g->builder, "%g", "dfmt");
         arg = val;
     } else {
-        fmt = LLVMBuildGlobalStringPtr(g->builder, "%lld", "ifmt");
-        arg = emit_widen_i64_for_print(g, val);
+        /* integers format straight into the result string: the digits are at
+         * most 20 plus a sign, so the length is known without a probe run */
+        LLVMValueRef ibuf = emit_string_alloc_rc(g, LLVMConstInt(i64, 24, 0));
+        emit_itoa_into(g, ibuf, emit_widen_i64_for_print(g, val), 0);
+        return ibuf;
     }
     LLVMValueRef tmp_sz = LLVMConstInt(i64, 1024, 0);
     LLVMValueRef tmp = LLVMBuildArrayAlloca(g->builder, i8, tmp_sz, "fmt.tmp");

@@ -89,6 +89,109 @@ class FwdChannel {
     bool IsClosed() {
         return this.closed;
     }
+
+    /// <summary>底层套接字（连接池用它做零阻塞的存活检查）。</summary>
+    nint Sock() {
+        return this.sock;
+    }
+}
+
+/// <summary>
+/// 上游连接池：转发器只有一个上游（host:port + 是否 TLS），因此
+/// 池子不需要键，一条空闲链路对下一个请求总是可用的。
+///
+/// 意义在于握手：转发 AI 接口时每个请求都要一次 TCP 三次握手加
+/// 一次 TLS 握手（跨机房是毫秒级，比转发本身贵一到两个数量级），
+/// 而复用一条已握手的链路把这部分降到零。
+///
+/// 借出前用 <c>select()</c> 零超时检查一次：空闲链路上"可读"只
+/// 意味着对端已关闭或发来了不属于任何请求的字节，两种都不可再用，
+/// 直接丢弃。上游在检查与发送之间关闭的竞态由调用方兜底
+/// （无正文的请求换新连接重发一次）。
+///
+/// 池表是转发器实例级的，而连接协程可能落在不同 worker 线程上，
+/// 因此每处访问都在 <c>lock (idle)</c> 内；临界区里只有列表操作与
+/// 关闭套接字，不含 await。
+/// </summary>
+class FwdPool {
+    List<FwdChannel> idle;
+    List<long> expiry;
+    int maxIdle;
+    int idleMs;
+    long hits;
+    long misses;
+
+    FwdPool(int maxIdle, int idleMs) {
+        this.idle = new List<FwdChannel>();
+        this.expiry = new List<long>();
+        this.maxIdle = maxIdle;
+        this.idleMs = idleMs;
+        this.hits = 0;
+        this.misses = 0;
+    }
+
+    /// <summary>取一条可用的空闲链路，没有则返回 null（调用方新建）。</summary>
+    FwdChannel Take() {
+        lock (idle) {
+            long now = Stopwatch.GetMilliseconds();
+            while (this.idle.Count > 0) {
+                int last = this.idle.Count - 1;
+                FwdChannel ch = this.idle[last];
+                long exp = this.expiry[last];
+                this.idle.RemoveAt(last);
+                this.expiry.RemoveAt(last);
+                if (now > exp || ch.IsClosed()
+                    || !Socket.IsOpen(ch.Sock())
+                    || Socket.IsReadable(ch.Sock())) {
+                    ch.Close();
+                } else {
+                    this.hits = this.hits + 1;
+                    return ch;
+                }
+            }
+            this.misses = this.misses + 1;
+            return null;
+        }
+    }
+
+    /// <summary>归还一条仍然干净的链路（响应已按声明的长度读完）。
+    /// 池满时直接关闭，空闲链路数因此有上界。</summary>
+    void Give(FwdChannel ch) {
+        if (ch == null) { return; }
+        if (ch.IsClosed()) { return; }
+        lock (idle) {
+            if (this.idle.Count >= this.maxIdle) {
+                ch.Close();
+                return;
+            }
+            this.idle.Add(ch);
+            this.expiry.Add(Stopwatch.GetMilliseconds() + (long)this.idleMs);
+        }
+    }
+
+    /// <summary>关闭所有空闲链路（转发器停止时调用）。</summary>
+    void CloseAll() {
+        lock (idle) {
+            for (int i = 0; i < this.idle.Count; i = i + 1) {
+                this.idle[i].Close();
+            }
+            this.idle.Clear();
+            this.expiry.Clear();
+        }
+    }
+
+    /// <summary>复用成功的次数（省下的握手数）。</summary>
+    long Hits() { return this.hits; }
+
+    /// <summary>池中无可用链路、必须新建的次数。</summary>
+    long Misses() { return this.misses; }
+
+    /// <summary>当前空闲链路数。</summary>
+    int IdleCount() {
+        lock (idle) {
+            return this.idle.Count;
+        }
+    }
 }
 
 /// <summary>
@@ -187,6 +290,12 @@ class FwdReader {
     bool AtEof() {
         return this.eof && this.buf.Length == 0;
     }
+
+    /// <summary>缓冲已空且对端未关闭——即这条链路正好停在一帧的
+    /// 边界上，可以安全地留给下一个请求。</summary>
+    bool Drained() {
+        return this.buf.Length == 0 && !this.eof;
+    }
 }
 
 /// <summary>
@@ -207,10 +316,16 @@ class FwdReader {
 ///   await f.Start();
 ///
 /// 逐跳（hop-by-hop）头部按 RFC 7230 6.1 剥离，Host 改写为上游
-/// 主机，并追加 X-Forwarded-For。上游连接按请求建立、请求结束
-/// 即关闭（<c>Connection: close</c>）：流式转发的价值在首字节
-/// 延迟，而不是连接复用，这样也不需要在两侧维护 keep-alive
-/// 帧状态。
+/// 主机，并追加 X-Forwarded-For。
+///
+/// 上游连接默认复用（<c>Connection: keep-alive</c> + <see cref="FwdPool"/>）：
+/// 转发 AI 接口时，每个请求重新做一次 TCP+TLS 握手是毫秒级的
+/// 开销，比搬字节本身贵得多。只有帧格式能确定结尾的响应
+/// （Content-Length、chunked、或按定义无正文的 204/304/HEAD）才会把
+/// 链路归还进池；以连接关闭定界的响应（无长度的流）、101
+/// Upgrade 与 CONNECT 仍照旧方式用完即关。用
+/// <see cref="DisableUpstreamKeepAlive"/> 可退回每请求一连。
+/// 下游仍然是每连接一个请求（向客户端声明 <c>Connection: close</c>）。
 /// </summary>
 class HttpForwarder {
     string listenHost;
@@ -227,6 +342,10 @@ class HttpForwarder {
     int active;
     bool running;
     TcpListener listener;
+    // 上游 keep-alive：pool 为 null 即每请求一连。
+    FwdPool pool;
+    int maxIdleUp;
+    int idleUpMs;
 
     /// <summary>
     /// `upstream` 可写为 <c>https://host[:port]</c>、
@@ -248,6 +367,9 @@ class HttpForwarder {
         this.active = 0;
         this.running = false;
         this.listener = null;
+        this.maxIdleUp = 64;
+        this.idleUpMs = 55000;
+        this.pool = new FwdPool(this.maxIdleUp, this.idleUpMs);
         this.ParseUpstream(upstream);
     }
 
@@ -302,6 +424,33 @@ class HttpForwarder {
         return this;
     }
 
+    /// <summary>上游空闲链路上限与空闲存活时长（毫秒）。
+    /// 存活时长应短于上游自己的 keep-alive 超时，否则每次复用
+    /// 都要先碰一下已被对端关掉的链路。</summary>
+    HttpForwarder SetUpstreamKeepAlive(int maxIdle, int idleMs) {
+        this.maxIdleUp = maxIdle;
+        this.idleUpMs = idleMs;
+        if (this.pool != null) { this.pool.CloseAll(); }
+        this.pool = new FwdPool(maxIdle, idleMs);
+        return this;
+    }
+
+    /// <summary>关掉上游连接复用，退回“每请求一连 + Connection:
+    /// close”的旧行为（上游对 keep-alive 处理有问题时的逃生口）。</summary>
+    HttpForwarder DisableUpstreamKeepAlive() {
+        if (this.pool != null) {
+            this.pool.CloseAll();
+            this.pool = null;
+        }
+        return this;
+    }
+
+    /// <summary>上游连接池（未启用复用时为 null）：命中/未命中
+    /// 次数与当前空闲数可直接报给监控。</summary>
+    FwdPool UpstreamPool() {
+        return this.pool;
+    }
+
     /// <summary>不校验上游证书（自签名上游/抓包调试用）。</summary>
     HttpForwarder DisableTlsVerify() {
         this.verifyTls = false;
@@ -325,6 +474,7 @@ class HttpForwarder {
         if (this.listener != null) {
             this.listener.Stop();
         }
+        if (this.pool != null) { this.pool.CloseAll(); }
     }
 
     /// <summary>
@@ -385,7 +535,14 @@ class HttpForwarder {
             return;
         }
 
-        FwdChannel up = await this.ConnectUpstream();
+        // 上游链路优先从池里拿（省一次 TCP+TLS 握手）。
+        bool pooled = false;
+        FwdChannel up = null;
+        if (this.pool != null) {
+            up = this.pool.Take();
+            pooled = up != null;
+        }
+        if (up == null) { up = await this.ConnectUpstream(); }
         if (up == null) {
             int _b = await client.SendAllAsync(
                 "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n"
@@ -404,11 +561,30 @@ class HttpForwarder {
             return;
         }
         string upHead = this.RewriteRequestHead(head, peer);
+        // 无正文的请求可以原样重发：复用链路在"存活检查"与"真正
+        // 发送"之间被上游关掉是 keep-alive 固有的竞态，换条新链路
+        // 重发一次就能盖住；带正文的请求不行（正文是从下游流式
+        // 搬过来的，无法回放）。
+        bool replayable = pooled && !HttpForwarder.HasRequestBody(head);
         int sent = await up.SendAllAsync(upHead);
         if (sent < upHead.Length) {
             up.Close();
-            client.Close();
-            return;
+            up = null;
+            if (replayable) {
+                pooled = false;
+                up = await this.ConnectUpstream();
+                if (up != null) {
+                    sent = await up.SendAllAsync(upHead);
+                    if (sent < upHead.Length) { up.Close(); up = null; }
+                }
+            }
+            if (up == null) {
+                int _r = await client.SendAllAsync(
+                    "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\n"
+                    + "Connection: close\r\n\r\nupstream failed");
+                client.Close();
+                return;
+            }
         }
 
         // 请求体：Content-Length 精确搬运，chunked 逐块搬运，
@@ -417,11 +593,28 @@ class HttpForwarder {
 
         FwdReader ureader = new FwdReader(up, this.chunkBytes);
         string rhead = await ureader.ReadHeadAsync(this.maxHeadBytes);
-        if (rhead.Length == 0) {
+        if (rhead.Length == 0 && replayable) {
+            // 同一个竞态的另一种表现：头部写进了内核缓冲区，但对端
+            // 其实已经在关连接，于是读到的是 EOF 而不是响应。
+            up.Close();
+            pooled = false;
+            up = await this.ConnectUpstream();
+            if (up != null) {
+                int s2 = await up.SendAllAsync(upHead);
+                if (s2 < upHead.Length) {
+                    up.Close();
+                    up = null;
+                } else {
+                    ureader = new FwdReader(up, this.chunkBytes);
+                    rhead = await ureader.ReadHeadAsync(this.maxHeadBytes);
+                }
+            }
+        }
+        if (up == null || rhead.Length == 0) {
             int _g = await client.SendAllAsync(
                 "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 17\r\n"
                 + "Connection: close\r\n\r\nno upstream reply");
-            up.Close();
+            if (up != null) { up.Close(); }
             client.Close();
             return;
         }
@@ -442,9 +635,34 @@ class HttpForwarder {
                                        this.chunkBytes);
             return;
         }
-        await HttpForwarder.PumpBody(ureader, client, rhead, false,
-                                     this.chunkBytes);
-        up.Close();
+        // 204/304/1xx 与 HEAD 的响应按定义没有正文：这里不能再等
+        // "搬到对端关闭"，否则复用链路上会一直挂到空闲超时。
+        bool noBody = HttpForwarder.RespHasNoBody(method, status);
+        long moved = 0;
+        if (!noBody) {
+            moved = await HttpForwarder.PumpBody(ureader, client, rhead, false,
+                                                 this.chunkBytes);
+        }
+        // 只有"响应结尾能被帧格式确定 + 链路上没有剩余字节"时才归还：
+        // 否则下一个请求会读到上一条响应的尾巴（响应走私）。
+        bool reusable = this.pool != null && !up.IsClosed()
+            && HttpForwarder.RespKeepsAlive(rhead)
+            && (noBody || HttpForwarder.RespSelfDelimited(rhead))
+            && ureader.Drained();
+        if (reusable && !noBody) {
+            if (moved < 0) {
+                // 分块流未读到终结块（或长度非法）。
+                reusable = false;
+            } else if (!HttpForwarder.HeadIsChunked(rhead)) {
+                long want = HttpForwarder.ContentLengthOf(rhead);
+                if (want >= 0 && moved != want) { reusable = false; }
+            }
+        }
+        if (reusable) {
+            this.pool.Give(up);
+        } else {
+            up.Close();
+        }
         client.Close();
     }
 
@@ -544,8 +762,47 @@ class HttpForwarder {
         if (fwd.Length > 0) {
             outHead = outHead + "X-Forwarded-For: " + fwd + "\r\n";
         }
-        outHead = outHead + "Connection: close\r\n\r\n";
+        if (this.pool != null) {
+            outHead = outHead + "Connection: keep-alive\r\n\r\n";
+        } else {
+            outHead = outHead + "Connection: close\r\n\r\n";
+        }
         return outHead;
+    }
+
+    /// <summary>请求头声明了正文（Content-Length &gt; 0 或 chunked）。
+    /// 无正文的请求才可以在复用链路失效时原样重发。</summary>
+    static bool HasRequestBody(string head) {
+        if (HttpForwarder.HeadIsChunked(head)) { return true; }
+        return HttpForwarder.ContentLengthOf(head) > 0;
+    }
+
+    /// <summary>该响应按定义没有正文：1xx、204、304，以及对
+    /// HEAD 的应答（后者即使带 Content-Length 也不发正文）。</summary>
+    static bool RespHasNoBody(string method, int status) {
+        if (method == "HEAD") { return true; }
+        if (status == 204 || status == 304) { return true; }
+        return status >= 100 && status < 200;
+    }
+
+    /// <summary>响应的结尾可由帧格式自行确定（chunked 或
+    /// Content-Length），而不是靠连接关闭。</summary>
+    static bool RespSelfDelimited(string head) {
+        if (HttpForwarder.HeadIsChunked(head)) { return true; }
+        return HttpForwarder.ContentLengthOf(head) >= 0;
+    }
+
+    /// <summary>上游愿意保持这条链路：HTTP/1.1 且 Connection 里没有
+    /// close。HTTP/1.0 响应默认关闭，不复用。</summary>
+    static bool RespKeepsAlive(string head) {
+        if (!HttpForwarder.StartsWith(head, "HTTP/1.1")) { return false; }
+        string conn = HttpForwarder.Lower(
+            HttpForwarder.HeaderValue(head, "connection"));
+        List<string> parts = HttpForwarder.SplitCsv(conn);
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (parts[i] == "close") { return false; }
+        }
+        return true;
     }
 
     /// <summary>改写响应头：剥离逐跳头部并标明连接将关闭。
@@ -623,31 +880,35 @@ class HttpForwarder {
 
     /// <summary>逐块搬运分块编码：长度行原样透传，随后转发该块
     /// 的数据与 CRLF；0 长度块后转发尾部直到空行结束。逐块转发
-    /// 正是流式聊天在下游能立刻显示的原因。</summary>
+    /// 正是流式聊天在下游能立刻显示的原因。
+    ///
+    /// 返回搬运的数据字节数；未读到终结块就中断（对端先关、分块头
+    /// 非法、下游写失败）时返回 -1：这条链路停在了帧中间，不能再
+    /// 留给下一个请求用。</summary>
     static async long PumpChunked(FwdReader src, FwdChannel dst,
             int chunkBytes) {
         long total = 0;
         while (true) {
             string sizeLine = await src.ReadLineAsync(chunkBytes);
-            if (sizeLine.Length == 0) { return total; }
+            if (sizeLine.Length == 0) { return -1; }
             int w = await dst.SendAllAsync(sizeLine);
-            if (w < sizeLine.Length) { return total; }
+            if (w < sizeLine.Length) { return -1; }
             long size = HttpForwarder.ParseChunkSize(sizeLine);
-            if (size < 0) { return total; }
+            if (size < 0) { return -1; }
             if (size == 0) {
                 // 尾部头部（可能为空）以空行结束。
                 while (true) {
                     string trailer = await src.ReadLineAsync(chunkBytes);
-                    if (trailer.Length == 0) { return total; }
+                    if (trailer.Length == 0) { return -1; }
                     int tw = await dst.SendAllAsync(trailer);
-                    if (tw < trailer.Length) { return total; }
+                    if (tw < trailer.Length) { return -1; }
                     if (trailer == "\r\n") { return total; }
                 }
             }
             long moved = await HttpForwarder.PumpExact(src, dst, size + 2L,
                                                        chunkBytes);
+            if (moved < size + 2L) { return -1; }
             total = total + moved;
-            if (moved < size + 2L) { return total; }
         }
         return total;
     }

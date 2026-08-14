@@ -441,6 +441,9 @@ class HttpForwarder {
     HttpForwarder SetMaxConnections(int max);
     HttpForwarder DisableTlsVerify();          // self-signed upstream
     HttpForwarder DenyConnect();               // refuse CONNECT tunnels
+    HttpForwarder SetUpstreamKeepAlive(int maxIdle, int idleMs);
+    HttpForwarder DisableUpstreamKeepAlive();  // back to one link per request
+    FwdPool UpstreamPool();                    // Hits()/Misses()/IdleCount()
 
     async void Start();                        // accept loop; one coroutine per conn
     void Stop();
@@ -458,9 +461,16 @@ class HttpForwarder {
   byte tunnels (TLS through CONNECT is passed through, not decrypted); either
   direction ending closes both, so no half-open tunnel is left parked.
 - Hop-by-hop headers (RFC 7230 6.1) are stripped, `Host` is rewritten to the
-  upstream authority and `X-Forwarded-For` is appended. Upstream connections
-  are per-request (`Connection: close`): streaming wins on first-byte latency,
-  not on connection reuse.
+  upstream authority and `X-Forwarded-For` is appended.
+- Upstream links are pooled and reused (`Connection: keep-alive`), which is
+  what makes forwarding a remote API affordable: otherwise every request pays
+  a TCP round trip plus, over TLS, a full handshake. A link only goes back to
+  the pool when the response end is framed (`Content-Length`, chunked, or a
+  by-definition empty 204/304/HEAD body) and nothing is left unread on it, so
+  no response tail can leak into the next request; close-delimited streams,
+  `101` upgrades and `CONNECT` tunnels still end with the connection. A
+  body-less request whose pooled link turns out to be dead is retried once on a
+  fresh link. `DisableUpstreamKeepAlive()` restores one-link-per-request.
 - https upstreams go through `TlsStream`, so the forwarder itself needs no
   extra TLS plumbing.
 

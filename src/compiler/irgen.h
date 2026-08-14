@@ -75,6 +75,9 @@ struct zan_irgen {
     LLVMValueRef fn_free;
     LLVMValueRef fn_strlen;
     LLVMValueRef fn_strcpy;
+    /* __zan_itoa64(i8 *buf, i64 v, i32 unsigned): decimal formatting without
+     * the printf machinery, built on first use (see get_itoa64_fn). */
+    LLVMValueRef fn_itoa64;
     LLVMValueRef fn_strcat;
     /* shared "" literal: a null string concatenates as empty (C#), and
      * strlen/memcpy on NULL are UB, so concat sites coerce NULL operands to
