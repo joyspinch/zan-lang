@@ -202,6 +202,12 @@ class ServerMetrics {
     // endpoint. Sized by the route table (fixed at start-up), so traffic never
     // grows it; entries are the very same objects as in reqAgg.
     List<ReqAgg> routeSlots;
+    // The rows once more, keyed by "METHOD path", for the callers that have no
+    // route index (a mounted asset, a raw path): a hash probe instead of a scan
+    // over up to reqAggCap rows with two string compares each. Holds the same
+    // objects as reqAgg and, like it, only ever grows up to the cap.
+    Dictionary<string, ReqAgg> reqIdx;
+    Dictionary<string, SqlAgg> sqlIdx;
 
     // ---- error log ----
     List<ErrEntry> errors;         // most-recent-first ring for the backend view
@@ -270,6 +276,8 @@ class ServerMetrics {
         this.reqAgg = new List<ReqAgg>();
         this.reqAggCap = 200;
         this.routeSlots = new List<ReqAgg>();
+        this.reqIdx = new Dictionary<string, ReqAgg>();
+        this.sqlIdx = new Dictionary<string, SqlAgg>();
         this.errors = new List<ErrEntry>();
         this.errCap = 100;
         this.errTotal = 0;
@@ -717,17 +725,14 @@ class ServerMetrics {
             if (a == null) {
                 a = new ReqAgg(method, path);
                 this.routeSlots[slot] = a;
-                this.reqAgg.Add(a);
+                this.AddAgg(a);
             }
         } else {
-            for (int k = 0; k < this.reqAgg.Count; k = k + 1) {
-                ReqAgg r = this.reqAgg[k];
-                if (r.method == method && r.path == path) { a = r; break; }
-            }
-            if (a == null) {
+            string key = method + " " + path;
+            if (!this.reqIdx.TryGetValue(key, out a)) {
                 if (this.reqAgg.Count >= this.reqAggCap) { return; }
                 a = new ReqAgg(method, path);
-                this.reqAgg.Add(a);
+                this.AddAgg(a);
             }
         }
         a.count = a.count + 1;
@@ -738,12 +743,28 @@ class ServerMetrics {
         if (status == 429) { a.rejected = a.rejected + 1; }
     }
 
+    /// <summary>Appends a row to the leaderboard and to the by-name index. The
+    /// index keeps the FIRST row registered under a name, which is what the
+    /// scan it replaced found. Callers hold the lock.</summary>
+    void AddAgg(ReqAgg a) {
+        this.reqAgg.Add(a);
+        string key = a.method + " " + a.path;
+        if (!this.reqIdx.ContainsKey(key)) { this.reqIdx.Add(key, a); }
+    }
+
     /// <summary>True when s is non-empty and every character is a digit; such a
     /// path segment is a record id and is folded to :id for grouping.</summary>
     static bool IsAllDigits(string s) {
-        if (s.Length == 0) { return false; }
-        for (int i = 0; i < s.Length; i = i + 1) {
-            if (!ServerMetrics.IsDigit(s.Substring(i, 1))) { return false; }
+        return ServerMetrics.RangeIsDigits(s, 0, s.Length);
+    }
+
+    /// <summary>IsAllDigits over a half-open range, so folding a path needs no
+    /// substring per segment.</summary>
+    static bool RangeIsDigits(string s, int start, int end) {
+        if (end <= start) { return false; }
+        for (int i = start; i < end; i = i + 1) {
+            int c = s[i];
+            if (c < 48 || c > 57) { return false; }
         }
         return true;
     }
@@ -760,26 +781,21 @@ class ServerMetrics {
     /// /admin/users/1 and /admin/users/2 map to the same /admin/users/:id.
     /// </summary>
     static string FoldPath(string path) {
-        string p = path;
-        for (int i = 0; i < p.Length; i = i + 1) {
-            if (p.Substring(i, 1) == "?") { p = p.Substring(0, i); break; }
-        }
-        List<string> parts = new List<string>();
-        StringBuilder cur = new StringBuilder();
-        int n = p.Length;
-        for (int i = 0; i <= n; i = i + 1) {
-            if (i == n || p.Substring(i, 1) == "/") {
-                parts.Add(cur.ToString());
-                cur = new StringBuilder();
-            } else {
-                cur.Append(p.Substring(i, 1));
-            }
-        }
+        int n = path.Length;
+        int q = 0;
+        while (q < n && path[q] != '?') { q = q + 1; }
         StringBuilder outp = new StringBuilder();
-        for (int i = 0; i < parts.Count; i = i + 1) {
-            if (i > 0) { outp.Append("/"); }
-            if (ServerMetrics.IsAllDigits(parts[i])) { outp.Append(":id"); }
-            else { outp.Append(parts[i]); }
+        int i = 0;
+        bool first = true;
+        while (true) {
+            int st = i;
+            while (i < q && path[i] != '/') { i = i + 1; }
+            if (!first) { outp.Append("/"); }
+            first = false;
+            if (ServerMetrics.RangeIsDigits(path, st, i)) { outp.Append(":id"); }
+            else if (i > st) { outp.Append(path.Substring(st, i - st)); }
+            if (i >= q) { break; }
+            i = i + 1;
         }
         return outp.ToString();
     }
@@ -819,23 +835,16 @@ class ServerMetrics {
     void RecordSqlAgg(string norm, long us) {
         lock (this) {
         SqlAgg a = null;
-        for (int k = 0; k < this.sqlAgg.Count; k = k + 1) {
-            if (this.sqlAgg[k].sql == norm) { a = this.sqlAgg[k]; break; }
-        }
-        if (a == null) {
+        if (!this.sqlIdx.TryGetValue(norm, out a)) {
             if (this.sqlAgg.Count >= this.sqlAggCap) { return; }
             a = new SqlAgg(norm);
             this.sqlAgg.Add(a);
+            this.sqlIdx.Add(norm, a);
         }
         a.count = a.count + 1;
         a.totalUs = a.totalUs + us;
         if (us > a.maxUs) { a.maxUs = us; }
         }
-    }
-
-    static bool IsDigit(string c) {
-        return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
-            || c == "5" || c == "6" || c == "7" || c == "8" || c == "9";
     }
 
     /// <summary>Reduces a statement to its "net" form: single-quoted string
@@ -847,39 +856,60 @@ class ServerMetrics {
         StringBuilder sb = new StringBuilder();
         int n = sql.Length;
         int i = 0;
+        int holes = 0;
         bool lastSpace = false;
         while (i < n) {
-            string c = sql.Substring(i, 1);
-            if (c == "'") {
+            int c = sql[i];
+            if (c == '\'') {
                 i = i + 1;
                 while (i < n) {
-                    string d = sql.Substring(i, 1);
-                    if (d == "'") {
-                        if (i + 1 < n && sql.Substring(i + 1, 1) == "'") {
+                    if (sql[i] == '\'') {
+                        if (i + 1 < n && sql[i + 1] == '\'') {
                             i = i + 2; continue;
                         }
                         i = i + 1; break;
                     }
                     i = i + 1;
                 }
-                sb.Append("?"); lastSpace = false; continue;
+                sb.Append("?"); holes = holes + 1; lastSpace = false; continue;
             }
-            if (ServerMetrics.IsDigit(c)) {
+            if (c >= 48 && c <= 57) {
                 while (i < n) {
-                    string d = sql.Substring(i, 1);
-                    if (ServerMetrics.IsDigit(d) || d == "." || d == "e"
-                        || d == "E" || d == "x" || d == "X") { i = i + 1; }
+                    int d = sql[i];
+                    if ((d >= 48 && d <= 57) || d == '.' || d == 'e'
+                        || d == 'E' || d == 'x' || d == 'X') { i = i + 1; }
                     else { break; }
                 }
-                sb.Append("?"); lastSpace = false; continue;
+                sb.Append("?"); holes = holes + 1; lastSpace = false; continue;
             }
-            if (c == " " || c == "\t" || c == "\n" || c == "\r") {
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
                 if (!lastSpace) { sb.Append(" "); lastSpace = true; }
                 i = i + 1; continue;
             }
-            sb.Append(c); lastSpace = false; i = i + 1;
+            // A placeholder the caller wrote itself counts as one too: it takes
+            // part in the same runs that get collapsed below.
+            if (c == '?') {
+                sb.Append("?"); holes = holes + 1; lastSpace = false;
+                i = i + 1; continue;
+            }
+            // Everything else is copied verbatim, in runs rather than one
+            // character at a time: a statement is mostly plain text, and a
+            // substring per character is what made normalizing the dominant
+            // cost of recording a query.
+            int st = i;
+            while (i < n) {
+                int d = sql[i];
+                if (d == '\'' || d == '?' || (d >= 48 && d <= 57) || d == ' '
+                    || d == '\t' || d == '\n' || d == '\r') { break; }
+                i = i + 1;
+            }
+            sb.Append(sql.Substring(st, i - st)); lastSpace = false;
         }
-        return ServerMetrics.CollapsePlaceholders(sb.ToString()).Trim();
+        string flat = sb.ToString();
+        // Collapsing can only change a statement that has a run of two
+        // placeholders to merge, so a statement with fewer skips the pass.
+        if (holes < 2) { return flat.Trim(); }
+        return ServerMetrics.CollapsePlaceholders(flat).Trim();
     }
 
     /// <summary>Collapses a comma-separated run of two or more `?` into one `?`.
@@ -890,17 +920,17 @@ class ServerMetrics {
         int n = s.Length;
         int i = 0;
         while (i < n) {
-            if (s.Substring(i, 1) == "?") {
+            if (s[i] == '?') {
                 int j = i;
                 int cnt = 0;
                 bool more = true;
                 while (more) {
-                    if (j < n && s.Substring(j, 1) == "?") {
+                    if (j < n && s[j] == '?') {
                         cnt = cnt + 1; j = j + 1;
-                        while (j < n && s.Substring(j, 1) == " ") { j = j + 1; }
-                        if (j < n && s.Substring(j, 1) == ",") {
+                        while (j < n && s[j] == ' ') { j = j + 1; }
+                        if (j < n && s[j] == ',') {
                             j = j + 1;
-                            while (j < n && s.Substring(j, 1) == " ") { j = j + 1; }
+                            while (j < n && s[j] == ' ') { j = j + 1; }
                         } else {
                             more = false;
                         }
@@ -912,7 +942,9 @@ class ServerMetrics {
                 if (cnt >= 2) { i = j; } else { i = i + 1; }
                 continue;
             }
-            sb.Append(s.Substring(i, 1)); i = i + 1;
+            int st = i;
+            while (i < n && s[i] != '?') { i = i + 1; }
+            sb.Append(s.Substring(st, i - st));
         }
         return sb.ToString();
     }
