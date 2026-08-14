@@ -1654,7 +1654,12 @@ static LLVMValueRef get_eh_tmp_pop_fn(zan_irgen_t *g) {
  * a different header and are not valid inputs to the dynamic object releaser;
  * delegate slots go through the closure release, which leaves a bare function
  * pointer -- a static method, a non-capturing lambda, a native address --
- * alone instead of decrementing a refcount it never had. */
+ * alone instead of decrementing a refcount it never had. Array slots use
+ * zan_rt_arr_release: an array keeps its refcount in its own prefix, and its
+ * count word sits where an object header keeps a refcount, so the dynamic
+ * releaser would decrement the length instead. (An unwound array of
+ * rc-managed elements drops the buffer but not the elements: the element type
+ * is a compile-time property the runtime entry does not carry.) */
 static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_tmp_unwind");
     if (fn) return fn;
@@ -1674,6 +1679,8 @@ static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef rel_obj = LLVMAppendBasicBlockInContext(g->ctx, fn, "rel.obj");
     LLVMBasicBlockRef rel_dyn = LLVMAppendBasicBlockInContext(g->ctx, fn, "rel.dyn");
     LLVMBasicBlockRef rel_str = LLVMAppendBasicBlockInContext(g->ctx, fn, "rel.str");
+    LLVMBasicBlockRef rel_arr = LLVMAppendBasicBlockInContext(g->ctx, fn, "rel.arr");
+    LLVMBasicBlockRef rel_pick2 = LLVMAppendBasicBlockInContext(g->ctx, fn, "rel.pick2");
     LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
     LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMValueRef top_g = get_eh_tmp_top_global(g);
@@ -1726,7 +1733,18 @@ static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMBuildCondBr(g->builder,
         zan_icmp(g->builder, LLVMIntEQ, kind,
             LLVMConstInt(i64t, ZAN_EH_SLOT_STR << 1, 0), "isstr"),
-        rel_str, rel_dyn);
+        rel_str, rel_pick2);
+
+    LLVMPositionBuilderAtEnd(g->builder, rel_pick2);
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, kind,
+            LLVMConstInt(i64t, ZAN_EH_SLOT_ARR << 1, 0), "isarr"),
+        rel_arr, rel_dyn);
+
+    LLVMPositionBuilderAtEnd(g->builder, rel_arr);
+    zan_call2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
+        g->rt_arr_release, &vobj, 1, "");
+    LLVMBuildBr(g->builder, head);
 
     LLVMPositionBuilderAtEnd(g->builder, rel_dlg);
     emit_closure_release(g, vobj);
@@ -1738,7 +1756,7 @@ static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, rel_dyn);
     LLVMValueRef dyn_obj = LLVMBuildPhi(g->builder, i8ptr, "dyn.obj");
     LLVMValueRef dyn_v[2] = { vobj, obj };
-    LLVMBasicBlockRef dyn_b[2] = { rel_pick, rel_obj };
+    LLVMBasicBlockRef dyn_b[2] = { rel_pick2, rel_obj };
     LLVMAddIncoming(dyn_obj, dyn_v, dyn_b, 2);
     zan_call2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
         g->rt_release_dyn, &dyn_obj, 1, "");

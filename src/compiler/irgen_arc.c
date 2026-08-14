@@ -256,12 +256,17 @@ static LLVMValueRef emit_delegate_invoke(zan_irgen_t *g, LLVMValueRef dv,
     return phi;
 }
 
+static void emit_array_retain(zan_irgen_t *g, LLVMValueRef v);
+static void emit_array_release(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v);
+
 static void emit_rc_retain_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v) {
     if (!type) return;
     if (type->kind == TYPE_STRING) {
         emit_string_retain(g, v);
     } else if (type->kind == TYPE_DELEGATE) {
         emit_closure_retain(g, v);
+    } else if (type->kind == TYPE_ARRAY) {
+        emit_array_retain(g, v);
     } else if (is_arc_managed_type(type)) {
         emit_arc_retain(g, v);
     }
@@ -273,6 +278,8 @@ static void emit_rc_release_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValue
         emit_string_release(g, v);
     } else if (type->kind == TYPE_DELEGATE) {
         emit_closure_release(g, v);
+    } else if (type->kind == TYPE_ARRAY) {
+        emit_array_release(g, type, v);
     } else if (is_arc_managed_type(type)) {
         emit_arc_release_typed(g, type, v);
     }
@@ -611,9 +618,9 @@ static void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type, LLVMV
     LLVMPositionBuilderAtEnd(b, done);
 }
 
-/* Release the rc-managed elements of a bare `new T[n]` array buffer. Arrays
- * carry no length header, so the count is threaded in explicitly (captured at
- * the declaration). Null buffer is a no-op. */
+/* Release the rc-managed elements of an array payload. The count is threaded
+ * in explicitly so the same walk serves a plain array (count at arr-16, data
+ * at arr) and a rectangular one (data behind the shape). Null is a no-op. */
 static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
                                      LLVMValueRef arr, LLVMValueRef len) {
     if (!elem_type || !is_rc_managed_type(elem_type)) return;
@@ -657,31 +664,114 @@ static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
     LLVMPositionBuilderAtEnd(b, done);
 }
 
-/* Free the buffer of a non-escaping `new T[n]` local at scope exit. The value a
- * program holds points at the first element, so the allocation starts one
- * header back (ZAN_OBJ_RC_OFF); `free` tolerates the null a never-initialized
- * slot holds. Only a local whose buffer provably does not escape is marked
- * owned, which is the same condition that lets its elements be released. */
-static void emit_owned_array_free(zan_irgen_t *g, local_var_t *v) {
-    if (!v || !v->arr_owned || !v->alloca) return;
-    LLVMBuilderRef b = g->builder;
-    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+/* Retain of an array value: the tolerant runtime helper only touches a buffer
+ * carrying the array rc guard, so a `T[]`-typed value that never came from
+ * `new T[n]` (an extern's buffer, a span base) costs a load and a compare. */
+static void emit_array_retain(zan_irgen_t *g, LLVMValueRef v) {
+    if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef a = (LLVMTypeOf(v) == i8ptr) ? v
+        : LLVMBuildBitCast(g->builder, v, i8ptr, "arr.rt8");
+    zan_call2(g->builder,
+        LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
+        g->rt_arr_retain, &a, 1, "");
+}
+
+/* Per-element-type array destructor __zan_arr_release_<T>: release the
+ * elements when this release is the one that takes the count to zero, then let
+ * zan_rt_arr_release do the decrement and the free. Emitted only for element
+ * types that own something; a `byte[]`/`int[]` release is the plain helper. */
+static void mangle_type_token(char *buf, size_t n, size_t *off, zan_type_t *t);
+
+static LLVMValueRef get_array_release_decl(zan_irgen_t *g, zan_type_t *elem_type,
+                                           int rect) {
+    char tok[192];
+    size_t off = 0;
+    tok[0] = '\0';
+    mangle_type_token(tok, sizeof(tok), &off, elem_type);
+    char name[256];
+    snprintf(name, sizeof(name), "__zan_arr_release_%s%s", tok, rect ? "_md" : "");
+    LLVMValueRef existing = LLVMGetNamedFunction(g->mod, name);
+    if (existing) return existing;
+
+    LLVMContextRef c = g->ctx;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(c);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
-    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-    LLVMValueRef cur = LLVMBuildLoad2(b, i8ptr, v->alloca, "arr.own");
-    LLVMValueRef off = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
-    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(b));
-    LLVMBasicBlockRef free_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "arr.free");
-    LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "arr.fcont");
-    LLVMValueRef isn = zan_icmp(b, LLVMIntEQ, cur, LLVMConstNull(i8ptr), "arr.isn");
-    LLVMBuildCondBr(b, isn, cont_bb, free_bb);
-    LLVMPositionBuilderAtEnd(b, free_bb);
-    LLVMValueRef raw = LLVMBuildGEP2(b, i8, cur, &off, 1, "arr.raw");
-    zan_call2(b, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
-              g->fn_free, &raw, 1, "");
-    LLVMBuildStore(b, LLVMConstNull(i8ptr), v->alloca);
-    LLVMBuildBr(b, cont_bb);
-    LLVMPositionBuilderAtEnd(b, cont_bb);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+    LLVMValueRef fn = LLVMAddFunction(g->mod, name,
+        LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0));
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+
+    LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
+    di_clear(g); /* synthetic fn: don't inherit a user fn's DISubprogram scope */
+    LLVMBuilderRef b = g->builder;
+    LLVMValueRef arr = LLVMGetParam(fn, 0);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(c, fn, "entry");
+    LLVMBasicBlockRef guard = LLVMAppendBasicBlockInContext(c, fn, "guard");
+    LLVMBasicBlockRef relel = LLVMAppendBasicBlockInContext(c, fn, "relel");
+    LLVMBasicBlockRef dorel = LLVMAppendBasicBlockInContext(c, fn, "dorel");
+    LLVMBasicBlockRef ret   = LLVMAppendBasicBlockInContext(c, fn, "ret");
+    LLVMPositionBuilderAtEnd(b, entry);
+    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntEQ, arr, LLVMConstNull(i8ptr), "isnull"),
+                    ret, guard);
+    LLVMPositionBuilderAtEnd(b, guard);
+    /* only a buffer with the rc guard has a count word to walk */
+    LLVMValueRef gmoff = LLVMConstInt(i64, (unsigned long long)ZAN_ARR_RC_MAGIC_OFF, 1);
+    LLVMValueRef gmp = LLVMBuildGEP2(b, i8, arr, &gmoff, 1, "magicp");
+    emit_header_read_guard(g, fn, gmp, ret);
+    LLVMValueRef magic = LLVMBuildLoad2(b, i64,
+        LLVMBuildBitCast(b, gmp, LLVMPointerType(i64, 0), "magicip"), "magic");
+    LLVMValueRef has_magic = zan_icmp(b, LLVMIntEQ, magic,
+        LLVMConstInt(i64, ZAN_ARRAY_RC_MAGIC, 0), "hasmagic");
+    LLVMBasicBlockRef peek = LLVMAppendBasicBlockInContext(c, fn, "peek");
+    LLVMBuildCondBr(b, has_magic, peek, ret);
+    LLVMPositionBuilderAtEnd(b, peek);
+    LLVMValueRef rcoff = LLVMConstInt(i64, (unsigned long long)ZAN_ARR_RC_OFF, 1);
+    LLVMValueRef rc = LLVMBuildLoad2(b, i64,
+        LLVMBuildBitCast(b, LLVMBuildGEP2(b, i8, arr, &rcoff, 1, "rcp"),
+                         LLVMPointerType(i64, 0), "rcip"), "rc");
+    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntEQ, rc, LLVMConstInt(i64, 1, 0), "is1"),
+                    relel, dorel);
+    LLVMPositionBuilderAtEnd(b, relel);
+    LLVMValueRef data = arr;
+    if (rect) {
+        /* a rectangular array keeps its shape between the count word and the
+         * payload: rank at arr-8, dims at arr+0, elements at arr + 8*rank
+         * (see zan_mdarray_alloc) */
+        LLVMValueRef rkoff = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_SITE_OFF, 1);
+        LLVMValueRef rank = LLVMBuildLoad2(b, i64,
+            LLVMBuildBitCast(b, LLVMBuildGEP2(b, i8, arr, &rkoff, 1, "rankp"),
+                             LLVMPointerType(i64, 0), "rankip"), "rank");
+        LLVMValueRef shape = LLVMBuildMul(b, rank, LLVMConstInt(i64, 8, 0), "shape");
+        data = LLVMBuildGEP2(b, i8, arr, &shape, 1, "md.data");
+    }
+    emit_array_release_elems(g, elem_type, data, zan_array_len(g, arr));
+    LLVMBuildBr(b, dorel);
+    LLVMPositionBuilderAtEnd(b, dorel);
+    zan_call2(b, LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0),
+              g->rt_arr_release, &arr, 1, "");
+    LLVMBuildBr(b, ret);
+    LLVMPositionBuilderAtEnd(b, ret);
+    LLVMBuildRetVoid(b);
+    if (saved_bb) LLVMPositionBuilderAtEnd(b, saved_bb);
+    return fn;
+}
+
+/* Release of an array value: an element type that owns something goes through
+ * the per-element-type destructor (rectangular arrays get the shape-aware
+ * variant), anything else through the plain runtime helper. */
+static void emit_array_release(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v) {
+    if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef a = (LLVMTypeOf(v) == i8ptr) ? v
+        : LLVMBuildBitCast(g->builder, v, i8ptr, "arr.rl8");
+    zan_type_t *et = type ? type->element_type : NULL;
+    LLVMValueRef fn = g->rt_arr_release;
+    if (et && is_rc_managed_type(et))
+        fn = get_array_release_decl(g, et, type->array_rank > 1);
+    zan_call2(g->builder,
+        LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
+        fn, &a, 1, "");
 }
 
 /* Emit the body of __zan_release_<T>: null-guard, peek the refcount, release the
@@ -739,6 +829,14 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
                                                   (unsigned)idx, "fp");
             LLVMValueRef dv = LLVMBuildLoad2(g->builder, i8ptr, fp, "fd");
             emit_closure_release(g, dv);
+        } else if (ft->kind == TYPE_ARRAY) {
+            /* An array field holds the same +1 a local would (field stores
+             * retain), so the owner drops it here; a field that was never
+             * given a `new T[n]` buffer -- an extern's pointer -- lacks the
+             * rc prefix and the release is a no-op. */
+            LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
+            LLVMValueRef av = LLVMBuildLoad2(b, i8ptr, fp, "fa");
+            emit_array_release(g, ft, av);
         } else if (is_arc_managed_type(ft)) {
             /* User class instances and the refcounted collections List/
              * StringBuilder: release via the recorded site destructor (which

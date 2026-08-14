@@ -742,12 +742,8 @@ static void pop_eh_slot(zan_irgen_t *g, local_var_t *v) {
  * scope: used on `break`/`continue` edges, where the same locals remain in
  * scope on the fall-through path and are released there separately. */
 /* Release every owning local at function exit, except `keep` (when non-null).
- *
- * A bare `new T[n]` array has no rc header, so a function that returns one
- * hands over the only reference: its elements must not be released on the way
- * out, or the caller receives an array full of dangling pointers. Rc-managed
- * returns (including Dict, see A8-2) don't need the exclusion -- `return`
- * retains them before the release pass. */
+ * A returned value needs no exclusion: `return` retains what it hands back
+ * (arrays included) before this pass runs. */
 static void emit_release_owned_locals_except(zan_irgen_t *g, local_scope_t *locals,
                                              local_var_t *keep) {
     if (!locals) return;
@@ -763,14 +759,7 @@ static void emit_release_owned_locals_except(zan_irgen_t *g, local_scope_t *loca
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
             emit_rc_release_for_type(g, locals->vars[i].type, cur);
-        } else if (locals->vars[i].arr_len && locals->vars[i].type) {
-            LLVMValueRef a = LLVMBuildLoad2(g->builder, i8ptr,
-                                            locals->vars[i].alloca, "arr.rel");
-            LLVMValueRef nn = LLVMBuildLoad2(g->builder,
-                LLVMInt64TypeInContext(g->ctx), locals->vars[i].arr_len, "arr.n");
-            emit_array_release_elems(g, locals->vars[i].type->element_type, a, nn);
         }
-        emit_owned_array_free(g, &locals->vars[i]);
     }
 }
 
@@ -791,14 +780,7 @@ static void emit_release_owned_locals_range(zan_irgen_t *g, local_scope_t *local
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
             emit_rc_release_for_type(g, locals->vars[i].type, cur);
-        } else if (locals->vars[i].arr_len && locals->vars[i].type) {
-            LLVMValueRef a = LLVMBuildLoad2(g->builder, i8ptr,
-                                            locals->vars[i].alloca, "arr.rel");
-            LLVMValueRef nn = LLVMBuildLoad2(g->builder,
-                LLVMInt64TypeInContext(g->ctx), locals->vars[i].arr_len, "arr.n");
-            emit_array_release_elems(g, locals->vars[i].type->element_type, a, nn);
         }
-        emit_owned_array_free(g, &locals->vars[i]);
     }
 }
 
@@ -846,10 +828,6 @@ static void emit_clear_owned_locals_range(zan_irgen_t *g, local_scope_t *locals,
         if (local_owns_arc(&locals->vars[i])) {
             LLVMBuildStore(g->builder, LLVMConstNull(i8ptr),
                            locals->vars[i].alloca);
-        } else if (locals->vars[i].arr_len && locals->vars[i].type) {
-            LLVMBuildStore(g->builder,
-                           LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0),
-                           locals->vars[i].arr_len);
         }
     }
 }
@@ -875,17 +853,7 @@ static void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
             emit_rc_release_for_type(g, locals->vars[i].type, cur);
-        } else if (!terminated && locals->vars[i].arr_len && locals->vars[i].type) {
-            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-            LLVMValueRef a = LLVMBuildLoad2(g->builder, i8ptr,
-                                            locals->vars[i].alloca, "arr.rel");
-            LLVMValueRef nn = LLVMBuildLoad2(g->builder,
-                LLVMInt64TypeInContext(g->ctx), locals->vars[i].arr_len, "arr.n");
-            emit_array_release_elems(g, locals->vars[i].type->element_type, a, nn);
         }
-        if (!terminated) emit_owned_array_free(g, &locals->vars[i]);
-        locals->vars[i].arr_len = NULL;
-        locals->vars[i].arr_owned = 0;
         locals->vars[i].arc_owned = 0;
     }
     locals->count = start;

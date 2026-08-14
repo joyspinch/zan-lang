@@ -10,30 +10,6 @@
 /* Find or create the basic block for a goto label in the current function. */
 static void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit);
 
-/* True when a local declared as `T[] a = new T[n]` is the only holder of that
- * buffer, so scope exit frees it. Arrays carry no refcount, so without this an
- * array allocated per request (a sockaddr, a scratch buffer) stays on the heap
- * for the life of the process.
- *
- * Ownership uses the same escape analysis that decides element release: any use
- * of the bare name other than `a[i]` / `a.Length` -- return, argument, store,
- * reassignment -- shares the pointer and gives up ownership. Rank-N buffers
- * keep their shape in an extended header and are left alone.
- *
- * An async body qualifies too: its slot lives in the heap frame, the free reads
- * the pointer back out of that slot, and a scope spanning a suspension runs its
- * exit after the resume. (A frame abandoned by cancellation keeps the buffer --
- * a leak, not a double free.) */
-static int rc_array_local_escapes(zan_irgen_t *g, zan_istr_t nm);
-static int array_local_owns_buffer(zan_irgen_t *g, zan_ast_node_t *stmt,
-                                   zan_type_t *type) {
-    zan_ast_node_t *init = stmt ? stmt->var_decl.initializer : NULL;
-    return type && type->kind == TYPE_ARRAY && init &&
-           init->kind == AST_NEW_EXPR && init->new_expr.is_array &&
-           init->new_expr.array_rank <= 1 && init->new_expr.args.count > 0 &&
-           !rc_array_local_escapes(g, stmt->var_decl.name);
-}
-
 static LLVMBasicBlockRef irgen_goto_label(zan_irgen_t *g, zan_istr_t name) {
     LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
     for (int i = 0; i < g->goto_label_count; i++) {
@@ -479,17 +455,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                          * so emit_rc_capture_local's release-of-old correctly frees
                          * the previous iteration's occupant instead of a clobbered
                          * null. */
-                        int arr_own = array_local_owns_buffer(g, stmt, type);
-                        if (arr_own) pre->arr_owned = 1;
                         if (stmt->var_decl.initializer) {
                             LLVMValueRef iv = emit_expr(g, stmt->var_decl.initializer, locals);
                             LLVMTypeRef slot_ty = g->current_async_slots[i].llvm;
-                            /* A frame slot is reused by every iteration of the
-                             * loop that declares it, and the per-block release
-                             * pass does not reach a pre-registered slot, so the
-                             * previous iteration's buffer is freed here -- the
-                             * same release-of-old emit_rc_capture_local does. */
-                            if (arr_own) emit_owned_array_free(g, pre);
                             if (arc_own) {
                                 emit_rc_capture_local(g, type, pre->alloca, iv,
                                     stmt->var_decl.initializer, locals);
@@ -544,8 +512,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     arr_type->array_rank = 1;
                 }
                 local_add(locals, stmt->var_decl.name, alloca, arr_type);
-                if (array_local_owns_buffer(g, stmt, arr_type))
-                    locals->vars[locals->count - 1].arr_owned = 1;
+                /* `new T[n]` yields an owned (+1) buffer that was stored
+                 * directly above, so the slot owns it: scope exit releases. */
+                arc_own_local(g, locals);
                 return;
             }
 
@@ -886,38 +855,6 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             stmt->var_decl.initializer &&
             stmt->var_decl.initializer->kind == AST_NEW_EXPR)
             arc_own_local(g, locals);
-        /* A `new T[n]` buffer this local is the only holder of is freed at
-         * scope exit. Arrays carry no refcount, so an array allocated per
-         * request (a sockaddr, a scratch buffer) otherwise stayed on the heap
-         * for the life of the process. Ownership uses the same escape analysis
-         * that decides element release: any use of the bare name other than
-         * `a[i]` / `a.Length` -- return, argument, store, reassignment --
-         * shares the pointer and gives up ownership (see
-         * array_local_owns_buffer). */
-        if (array_local_owns_buffer(g, stmt, type))
-            locals->vars[locals->count - 1].arr_owned = 1;
-        /* rc-element array from `new T[n]`: remember the element count so its
-         * elements can be released at scope exit (arrays have no length header). */
-        if (type && type->kind == TYPE_ARRAY && type->element_type &&
-            is_rc_managed_type(type->element_type) &&
-            !g->current_async_frame &&
-            stmt->var_decl.initializer &&
-            stmt->var_decl.initializer->kind == AST_NEW_EXPR &&
-            stmt->var_decl.initializer->new_expr.is_array &&
-            stmt->var_decl.initializer->new_expr.args.count > 0 &&
-            !rc_array_local_escapes(g, stmt->var_decl.name)) {
-            zan_ast_node_t *sz = stmt->var_decl.initializer->new_expr.args.items[0];
-            if (sz->kind == AST_INT_LITERAL || sz->kind == AST_IDENTIFIER) {
-                LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
-                LLVMValueRef szv = emit_expr(g, sz, locals);
-                if (LLVMGetTypeKind(LLVMTypeOf(szv)) == LLVMIntegerTypeKind &&
-                    LLVMGetIntTypeWidth(LLVMTypeOf(szv)) < 64)
-                    szv = LLVMBuildSExt(g->builder, szv, i64t, "arr.len");
-                LLVMValueRef lenslot = emit_entry_alloca(g, i64t, "arr.lenslot");
-                zan_store_fit(g, szv, lenslot);
-                locals->vars[locals->count - 1].arr_len = lenslot;
-            }
-        }
         /* any `new T[n]` initializer: capture the element count so `a.Length`
          * reads it (the raw buffer has no length header; strlen over binary
          * data returned garbage). Size limited to side-effect-free exprs. */
@@ -1154,15 +1091,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 val = LLVMBuildLoad2(g->builder, LLVMTypeOf(val), v_slot,
                                      "ret.fin");
             }
-            /* `return a;` where a is a local `new T[n]` buffer hands the
-             * caller the array itself; the exit pass must leave its elements
-             * alone (a bare array carries no rc header, so no retain can keep
-             * them alive). */
-            local_var_t *ret_local =
-                stmt->ret.value->kind == AST_IDENTIFIER
-                    ? local_find(locals, stmt->ret.value->ident.name) : NULL;
-            if (ret_local && !ret_local->arr_len) ret_local = NULL;
-            emit_release_owned_locals_except(g, locals, ret_local);
+            /* `return a;` needs no exclusion from the exit release pass: an
+             * array is retained above like any other rc-managed return, so the
+             * release of the local it aliases leaves the caller's +1. */
+            emit_release_owned_locals(g, locals);
             emit_release_active_catch_excs(g, 0);
             /* convert return value to match function return type */
             LLVMTypeRef fn_ret = g->current_fn_ret_type;

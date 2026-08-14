@@ -277,6 +277,8 @@ struct zan_irgen {
     LLVMValueRef rt_str_retain;  /* zan_rt_str_retain(void*) */
     LLVMValueRef rt_str_release; /* zan_rt_str_release(void*) */
     LLVMValueRef rt_str_alloc;   /* zan_rt_str_alloc(int64_t size) -> void* */
+    LLVMValueRef rt_arr_retain;  /* zan_rt_arr_retain(void*) */
+    LLVMValueRef rt_arr_release; /* zan_rt_arr_release(void*) */
 
     /* runtime diagnostics & leak detection */
     LLVMValueRef fn_printf;       /* int printf(const char*, ...) */

@@ -715,6 +715,9 @@ static void emit_leak_counter_add(zan_irgen_t *g, LLVMValueRef ptr, long long de
 #define ZAN_ARC_FAULT_STR_RELEASE 0xE0A2C004u
 #define ZAN_ARC_FAULT_USE_OBJ     0xE0A2C005u
 #define ZAN_ARC_FAULT_USE_STR     0xE0A2C006u
+#define ZAN_ARC_FAULT_ARR_RETAIN  0xE0A2C007u
+#define ZAN_ARC_FAULT_ARR_RELEASE 0xE0A2C008u
+#define ZAN_ARC_FAULT_USE_ARR     0xE0A2C009u
 
 /* Refcount value written over a quarantined block under --arc-guard. Picked so
  * it can never be a live count and is recognizable in a memory dump. */
@@ -1880,6 +1883,84 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBuildRetVoid(g->builder);
     }
 
+    /* ARC runtime for arrays: tolerant retain/release guarded by
+     * ZAN_ARRAY_RC_MAGIC in the array prefix (see zan_abi.h). A pointer that
+     * did not come from zan_array_alloc -- an extern's buffer, a span base, a
+     * `T[]`-typed field never assigned -- has no guard word and is left alone,
+     * so the two are safe to call on any array-typed value. Elements are not
+     * touched here: a release site whose element type is itself rc-managed
+     * goes through the per-type wrapper (__zan_arr_release_*), which drops the
+     * elements just before this decrement takes the count to zero. */
+    for (int rel = 0; rel < 2; rel++) {
+        LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+        LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+        LLVMTypeRef i8p = LLVMPointerType(i8t, 0);
+        LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                            (LLVMTypeRef[]){ i8p }, 1, 0);
+        LLVMValueRef fn = LLVMAddFunction(g->mod,
+            rel ? "zan_rt_arr_release" : "zan_rt_arr_retain", fnty);
+        if (rel) g->rt_arr_release = fn; else g->rt_arr_retain = fn;
+        LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+        LLVMPositionBuilderAtEnd(g->builder, bb);
+        LLVMValueRef obj = LLVMGetParam(fn, 0);
+        LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "ret");
+        LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cont");
+        LLVMBuildCondBr(g->builder,
+            zan_icmp(g->builder, LLVMIntEQ, obj, LLVMConstNull(i8p), "isnull"),
+            ret_bb, cont_bb);
+        LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+        LLVMValueRef gmoff = LLVMConstInt(i64t, (uint64_t)ZAN_ARR_RC_MAGIC_OFF, 1);
+        LLVMValueRef magic_ptr = LLVMBuildGEP2(g->builder, i8t, obj, &gmoff, 1, "magicp");
+        emit_header_read_guard(g, fn, magic_ptr, ret_bb);
+        LLVMValueRef magic = LLVMBuildLoad2(g->builder, i64t,
+            LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64t, 0), "magicip"),
+            "magic");
+        LLVMValueRef has_magic = zan_icmp(g->builder, LLVMIntEQ, magic,
+            LLVMConstInt(i64t, ZAN_ARRAY_RC_MAGIC, 0), "hasmagic");
+        LLVMBasicBlockRef work_bb = LLVMAppendBasicBlockInContext(g->ctx, fn,
+            rel ? "release" : "retain");
+        LLVMBuildCondBr(g->builder, has_magic, work_bb, ret_bb);
+        LLVMPositionBuilderAtEnd(g->builder, work_bb);
+        LLVMValueRef rcoff = LLVMConstInt(i64t, (uint64_t)ZAN_ARR_RC_OFF, 1);
+        LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, i8t, obj, &rcoff, 1, "rcptr");
+        LLVMValueRef rc_iptr = LLVMBuildBitCast(g->builder, rc_ptr,
+            LLVMPointerType(i64t, 0), "rciptr");
+        LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64t, rc_iptr, "rc");
+        emit_arc_freed_use_check(g, fn, rc, obj, ZAN_ARC_FAULT_USE_ARR,
+            rel ? "release through a stale reference (array was already freed)"
+                : "retain through a stale reference (array was freed: missing "
+                  "retain when stored)");
+        if (!rel) {
+            LLVMValueRef rc_pre = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpAdd,
+                rc_iptr, LLVMConstInt(i64t, 1, 0), LLVMAtomicOrderingMonotonic, 0);
+            emit_arc_underflow_check(g, fn, rc_pre, obj, NULL,
+                ZAN_ARC_FAULT_ARR_RETAIN, "retain of an already-freed array");
+            LLVMBuildBr(g->builder, ret_bb);
+        } else {
+            LLVMValueRef rc_old = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpSub,
+                rc_iptr, LLVMConstInt(i64t, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
+            emit_arc_underflow_check(g, fn, rc_old, obj, NULL,
+                ZAN_ARC_FAULT_ARR_RELEASE, "release of an already-freed array");
+            LLVMValueRef rc1 = zan_sub(g->builder, rc_old, LLVMConstInt(i64t, 1, 0), "rc1");
+            LLVMBasicBlockRef free_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "dofree");
+            LLVMBuildCondBr(g->builder,
+                zan_icmp(g->builder, LLVMIntEQ, rc1, LLVMConstInt(i64t, 0, 0), "iszero"),
+                free_bb, ret_bb);
+            LLVMPositionBuilderAtEnd(g->builder, free_bb);
+            if (g->arc_guard) {
+                emit_arc_quarantine(g, obj, rc_iptr);
+            } else {
+                LLVMValueRef raw = LLVMBuildGEP2(g->builder, i8t, obj, &rcoff, 1, "raw");
+                zan_call2(g->builder,
+                    LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8p, 1, 0),
+                    g->fn_free, &raw, 1, "");
+            }
+            LLVMBuildBr(g->builder, ret_bb);
+        }
+        LLVMPositionBuilderAtEnd(g->builder, ret_bb);
+        LLVMBuildRetVoid(g->builder);
+    }
+
     return ZAN_OK;
 }
 
@@ -2608,19 +2689,9 @@ typedef struct {
      * on overwrite and at function exit; 0 for params, borrowed, escaped or
      * non-class locals. See the ARC helpers below. */
     int arc_owned;
-    /* For a local owning an rc-element array from `new T[n]`, the i64 alloca
-     * holding its element count; NULL otherwise. Elements are released at
-     * scope exit. */
-    LLVMValueRef arr_len;
     /* For any local initialized with `new T[n]`, the i64 alloca holding the
      * element count so `a.Length` can read it; NULL when unknown. */
     LLVMValueRef arr_len_slot;
-    /* 1 when this local holds the only reference to a `new T[n]` buffer (it
-     * never escapes the function, by the same analysis that decides element
-     * release), so scope exit frees the buffer itself. An array carries no
-     * refcount, so without this every array allocated in a request loop stayed
-     * on the heap for the life of the process. */
-    int arr_owned;
     /* 1 when this local's slot is registered on the unwind stack, so an
      * exception thrown below this frame releases it (A8-12). Scope exit pops
      * the entry along with the release it emits. */
@@ -2704,9 +2775,7 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].type = type;
     scope->vars[scope->count].arc_owned = 0;
     scope->vars[scope->count].eh_slot = 0;
-    scope->vars[scope->count].arr_len = NULL;
     scope->vars[scope->count].arr_len_slot = NULL;
-    scope->vars[scope->count].arr_owned = 0;
     scope->vars[scope->count].box_cell = NULL;
     scope->vars[scope->count].box_owned = 0;
     scope->vars[scope->count].opaque_string = 0;
@@ -2792,9 +2861,14 @@ static int is_arc_managed_type(zan_type_t *t) {
 
 static int is_rc_managed_type(zan_type_t *t) {
     /* A delegate is rc-managed in the closure shape only; the retain/release
-     * helpers test the tag bit, so a bare function pointer costs nothing. */
+     * helpers test the tag bit, so a bare function pointer costs nothing.
+     * An array carries a refcount in its prefix (see zan_abi.h) and its
+     * retain/release are guarded by that prefix, so a `T[]`-typed value that
+     * never came from `new T[n]` -- an extern's buffer, a span base -- is left
+     * alone. Ownership then follows the same rules as any other reference:
+     * returning an array hands the caller +1, passing one lends it. */
     return t && (t->kind == TYPE_STRING || t->kind == TYPE_DELEGATE ||
-                 is_arc_managed_type(t));
+                 t->kind == TYPE_ARRAY || is_arc_managed_type(t));
 }
 
 static void emit_rc_release_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v);
@@ -2808,7 +2882,6 @@ static void emit_list_release_elems(zan_irgen_t *g, zan_type_t *elem_type, LLVMV
 static void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type, LLVMValueRef col);
 static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
                                      LLVMValueRef arr, LLVMValueRef len);
-static void emit_owned_array_free(zan_irgen_t *g, local_var_t *v);
 static void emit_release_obj_local(zan_irgen_t *g, local_var_t *v);
 static LLVMValueRef zan_store_fit(zan_irgen_t *g, LLVMValueRef val, LLVMValueRef ptr);
 
@@ -3004,6 +3077,7 @@ static int eh_slot_kind_of(zan_type_t *t) {
     if (!t) return ZAN_EH_SLOT_OBJ;
     if (t->kind == TYPE_STRING) return ZAN_EH_SLOT_STR;
     if (t->kind == TYPE_DELEGATE) return ZAN_EH_SLOT_DLG;
+    if (t->kind == TYPE_ARRAY) return ZAN_EH_SLOT_ARR;
     return ZAN_EH_SLOT_OBJ;
 }
 

@@ -322,6 +322,11 @@ static LONG WINAPI zan__crash_filter(EXCEPTION_POINTERS *ep) {
             case 0xE0A2C006: arc = "use of a freed string through a stale "
                                    "reference (missing retain when stored)";
                              break;
+            case 0xE0A2C007: arc = "retain of an already-freed array"; break;
+            case 0xE0A2C008: arc = "release of an already-freed array"; break;
+            case 0xE0A2C009: arc = "use of a freed array through a stale "
+                                   "reference (missing retain when stored)";
+                             break;
             default: break;
             }
             if (arc) {

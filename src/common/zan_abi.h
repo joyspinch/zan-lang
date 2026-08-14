@@ -54,6 +54,24 @@
  * `string`. */
 #define ZAN_ARRAY_MAGIC        UINT64_C(0x5a414e4152524159) /* "ZANARRAY" */
 
+/* Arrays prepend two further words to that pair, so an array payload sits
+ * behind a 32-byte prefix:
+ *   arr - 32: i64 refcount
+ *   arr - 24: i64 ZAN_ARRAY_RC_MAGIC -- the guard tolerant array
+ *             retain/release probe before touching the refcount, so a bare
+ *             pointer typed `T[]` (an extern's buffer, a span base) costs
+ *             nothing and is never freed
+ *   arr - 16: i64 element count      (unchanged)
+ *   arr -  8: i64 ZAN_ARRAY_MAGIC, or the rank of a rectangular array
+ * The count/magic pair keeps its offsets, so every reader of a length, a rank
+ * or the byte[]-vs-`char*` discriminator is unaffected; only the allocation
+ * and the free need the wider prefix. 32 is a multiple of 16, so payloads stay
+ * 16-byte aligned. */
+#define ZAN_ARR_HDR_SIZE       32
+#define ZAN_ARR_RC_OFF         (-32)
+#define ZAN_ARR_RC_MAGIC_OFF   (-24)
+#define ZAN_ARRAY_RC_MAGIC     UINT64_C(0x5a414e41525243) /* "ZANARRC" */
+
 /* Delegate values. One pointer with two shapes, told apart by bit 0:
  *   even -- a bare function pointer (static method or non-capturing lambda),
  *           so it can be handed to C as a plain callback;
@@ -91,7 +109,8 @@
 enum {
     ZAN_EH_SLOT_OBJ = 0,
     ZAN_EH_SLOT_STR = 1,
-    ZAN_EH_SLOT_DLG = 2
+    ZAN_EH_SLOT_DLG = 2,
+    ZAN_EH_SLOT_ARR = 3
 };
 
 #endif /* ZAN_ABI_H */

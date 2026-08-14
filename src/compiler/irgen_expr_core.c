@@ -2116,13 +2116,24 @@ static bool zan_type_defines(zan_irgen_t *g, const char *type_name,
     return get_method_sym(sym, mn) != NULL;
 }
 
-/* Arrays carry their element count in the same 16-byte object header (see
- * ZAN_OBJ_HDR_SIZE in ../common/zan_abi.h): the count occupies the first
- * header word at obj - 16, and the value a program holds points at the first
- * element, so the pointer can still be handed to C unchanged. */
+/* Arrays carry their element count in the object header word at obj - 16 and
+ * their refcount in the wider array prefix in front of it (see
+ * ZAN_ARR_HDR_SIZE in ../common/zan_abi.h). The value a program holds points
+ * at the first element, so the pointer can still be handed to C unchanged. */
 
 static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
                                zan_loc_t loc, const char *msg);
+
+/* Store one i64 header word at `raw + off` of a fresh array allocation. */
+static void zan_arr_hdr_store(zan_irgen_t *g, LLVMValueRef raw, int off,
+                              LLVMValueRef val, const char *name) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMValueRef o = LLVMConstInt(i64, (unsigned long long)off, 0);
+    LLVMValueRef p = LLVMBuildGEP2(g->builder, i8, raw, &o, 1, name);
+    LLVMBuildStore(g->builder, val,
+        LLVMBuildBitCast(g->builder, p, LLVMPointerType(i64, 0), name));
+}
 
 static LLVMValueRef zan_array_alloc(zan_irgen_t *g, LLVMValueRef total,
                                     LLVMValueRef count) {
@@ -2130,7 +2141,7 @@ static LLVMValueRef zan_array_alloc(zan_irgen_t *g, LLVMValueRef total,
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
     LLVMValueRef max_i64 = LLVMConstInt(i64, UINT64_MAX, 0);
-    LLVMValueRef header = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
+    LLVMValueRef header = LLVMConstInt(i64, ZAN_ARR_HDR_SIZE, 0);
     LLVMValueRef max_total = LLVMBuildSub(g->builder, max_i64, header, "arr.max");
     LLVMValueRef overflow = zan_icmp(g->builder, LLVMIntUGT, total,
         max_total, "arr.overflow");
@@ -2141,18 +2152,18 @@ static LLVMValueRef zan_array_alloc(zan_irgen_t *g, LLVMValueRef total,
         get_calloc_fn(g), (LLVMValueRef[]){ bytes, LLVMConstInt(i64, 1, 0) }, 2, "arr.raw");
     LLVMValueRef null_raw = LLVMBuildIsNull(g->builder, raw, "arr.null");
     emit_runtime_check(g, null_raw, (zan_loc_t){0}, "array allocation failed");
-    /* count at the first header word (obj - 16 = raw + 0) */
-    LLVMBuildStore(g->builder, count,
-        LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "arr.hdr"));
-    /* array magic in the second word (obj - 8 = raw + 8): it is what lets a
-     * byte[] reaching `string`-typed code be told apart from a bare pointer an
-     * extern returned, whose payload has no count word in front of it. */
-    LLVMValueRef magic_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE + ZAN_OBJ_SITE_OFF, 0);
-    LLVMBuildStore(g->builder, LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0),
-        LLVMBuildBitCast(g->builder,
-            LLVMBuildGEP2(g->builder, i8, raw, &magic_off, 1, "arr.magicp"),
-            LLVMPointerType(i64, 0), "arr.magic"));
-    LLVMValueRef off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
+    /* refcount = 1 and the rc guard, then the count and the array magic; see
+     * the prefix layout in zan_abi.h. The array magic is what lets a byte[]
+     * reaching `string`-typed code be told apart from a bare pointer an extern
+     * returned, whose payload has no count word in front of it. */
+    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_RC_OFF,
+                      LLVMConstInt(i64, 1, 0), "arr.rc");
+    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_RC_MAGIC_OFF,
+                      LLVMConstInt(i64, ZAN_ARRAY_RC_MAGIC, 0), "arr.rcmagic");
+    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_RC_OFF, count, "arr.count");
+    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_SITE_OFF,
+                      LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "arr.magic");
+    LLVMValueRef off = LLVMConstInt(i64, ZAN_ARR_HDR_SIZE, 0);
     return LLVMBuildGEP2(g->builder, i8, raw, &off, 1, "arr");
 }
 
@@ -2168,11 +2179,13 @@ static LLVMValueRef zan_array_len(zan_irgen_t *g, LLVMValueRef arr) {
 
 /* Rank-N rectangular array (`int[,]`): the header extends the plain layout
  * with the shape, and the value still points at the first element so
- * zan_array_len (count at raw+0) keeps reporting the total element count:
- *   raw+0         : total element count (= product of the dims)
- *   raw+8         : rank (i64)
- *   raw+16        : dims[0..rank-1]
- *   raw+16 + 8*r  : elements, row-major
+ * zan_array_len keeps reporting the total element count. Counting from the
+ * payload the array prefix holds, ahead of the shape:
+ *   arr-32, arr-24: refcount and its guard (as for any array)
+ *   arr-16        : total element count (= product of the dims)
+ *   arr- 8        : rank (i64), in place of the array magic
+ *   arr+0         : dims[0..rank-1]
+ *   arr+8*rank    : elements, row-major
  * So dims[d] lives at arr + 8*d and the data at arr + 8*rank. */
 static LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
                                       int rank, LLVMTypeRef elem_llvm) {
@@ -2188,7 +2201,7 @@ static LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
         LLVMConstInt(i64, 0, 0), "md.neg");
     emit_runtime_check(g, neg, (zan_loc_t){0}, "array allocation overflow");
     LLVMValueRef hdr = LLVMConstInt(i64,
-        (unsigned long long)(ZAN_OBJ_HDR_SIZE + 8 * rank), 0);
+        (unsigned long long)(ZAN_ARR_HDR_SIZE + 8 * rank), 0);
     LLVMValueRef bytes = zan_add(g->builder, hdr,
         zan_mul(g->builder, total, LLVMSizeOf(elem_llvm), "md.bytes"), "md.totalb");
     LLVMValueRef nbytes = zan_icmp(g->builder, LLVMIntSLT, bytes,
@@ -2201,16 +2214,20 @@ static LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
     emit_runtime_check(g, null_raw, (zan_loc_t){0}, "array allocation failed");
     LLVMValueRef hdri64 = LLVMBuildBitCast(g->builder, raw,
         LLVMPointerType(i64, 0), "md.hdr");
-    LLVMValueRef one = LLVMConstInt(i64, 1, 0);
-    LLVMBuildStore(g->builder, total, hdri64); /* count */
-    LLVMBuildStore(g->builder, LLVMConstInt(i64, rank, 0),
-        LLVMBuildGEP2(g->builder, i64, hdri64, &one, 1, "md.rk"));
+    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_RC_OFF,
+                      LLVMConstInt(i64, 1, 0), "md.rc");
+    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_RC_MAGIC_OFF,
+                      LLVMConstInt(i64, ZAN_ARRAY_RC_MAGIC, 0), "md.rcmagic");
+    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_RC_OFF, total, "md.count");
+    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_SITE_OFF,
+                      LLVMConstInt(i64, rank, 0), "md.rank");
     for (int d = 0; d < rank; d++) {
-        LLVMValueRef off = LLVMConstInt(i64, 2 + (unsigned long long)d, 0);
+        LLVMValueRef off = LLVMConstInt(i64,
+            ZAN_ARR_HDR_SIZE / 8 + (unsigned long long)d, 0);
         LLVMBuildStore(g->builder, dims[d],
             LLVMBuildGEP2(g->builder, i64, hdri64, &off, 1, "md.dim"));
     }
-    LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
+    LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_ARR_HDR_SIZE, 0);
     return LLVMBuildGEP2(g->builder, i8, raw, &hdr_off, 1, "md.arr");
 }
 
