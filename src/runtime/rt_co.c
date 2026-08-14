@@ -56,20 +56,26 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
     g_len++;
 }
 
-void zan_co_sched_run(void) {
+void zan_co_sched_run_until(const volatile int *done) {
     for (;;) {
         while (g_len > 0) {
+            if (done && *done) return;
             zan_co_slot_t slot = g_queue[g_head];
             g_head = (g_head + 1) % g_cap;
             g_len--;
             slot.step(slot.frame);
         }
+        if (done && *done) return;
         /* Ready queue drained. If an idle bridge (IO reactor) is wired, block
          * for external events that may enqueue more work; stop when it reports
          * nothing left to wait for. */
         if (!g_idle) return;
         if (g_idle() <= 0) return;
     }
+}
+
+void zan_co_sched_run(void) {
+    zan_co_sched_run_until(NULL);
 }
 
 size_t zan_co_pending(void) {

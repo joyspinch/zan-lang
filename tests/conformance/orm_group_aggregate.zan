@@ -1,0 +1,135 @@
+// Grouped aggregate projection: the shape of the result, the aggregates and
+// the sort key all come from the entity plus lambdas -- the business code
+// never writes or concatenates SQL.
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+[Table(Name = "metrics_minute")]
+class MetricMinute {
+    [Column(IsPrimary = true)]
+    long minute;
+    [Column(IsPrimary = true, StringLength = 8)]
+    string method;
+    [Column(IsPrimary = true, StringLength = 200)]
+    string path;
+    long calls;
+    [Column(Name = "total_us")]
+    long totalUs;
+    [Column(Name = "max_us")]
+    long maxUs;
+
+    static MetricMinute Of(long minute, string method, string path, long calls,
+                           long totalUs, long maxUs) {
+        MetricMinute m = new MetricMinute();
+        m.minute = minute;
+        m.method = method;
+        m.path = path;
+        m.calls = calls;
+        m.totalUs = totalUs;
+        m.maxUs = maxUs;
+        return m;
+    }
+}
+
+/* 分组结果的形状:业务侧自己声明,ORM 按字段名映射列 */
+class RouteStat {
+    string method;
+    string path;
+    long calls;
+    long totalUs;
+    long maxUs;
+    double avgUs;
+    int rows;
+}
+
+class Totals {
+    long calls;
+    long totalUs;
+    long maxUs;
+}
+
+class Program {
+    static void Main() {
+        string file = "orm_group_aggregate.tmp.db";
+        File.Delete(file);
+        SqliteConnection db = SqliteConnection.Open(file);
+        db.SyncStructure<MetricMinute>();
+
+        List<MetricMinute> batch = new List<MetricMinute> {
+            MetricMinute.Of(100, "GET", "/a", 2, 200, 150),
+            MetricMinute.Of(101, "GET", "/a", 3, 600, 400),
+            MetricMinute.Of(100, "GET", "/b", 10, 500, 90),
+            MetricMinute.Of(101, "POST", "/b", 1, 50, 50)
+        };
+        db.Insert<MetricMinute>(batch).ExecuteAffrows();
+
+        // 1. group + aggregate projection, ordered by an aggregate
+        List<RouteStat> top = db.Select<MetricMinute>()
+            .Where(a => a.minute >= 100L)
+            .GroupBy(a => new { a.method, a.path })
+            .OrderByDescending(a => a.Sum(x => x.calls))
+            .ToList<RouteStat>(a => new RouteStat {
+                method = a.method,
+                path = a.path,
+                calls = a.Sum(x => x.calls),
+                totalUs = a.Sum(x => x.totalUs),
+                maxUs = a.Max(x => x.maxUs),
+                avgUs = a.Avg(x => x.totalUs),
+                rows = a.Count()
+            });
+        int i = 0;
+        while (i < top.Count) {
+            RouteStat s = top[i];
+            Console.WriteLine("top: " + s.method + " " + s.path
+                + " calls=" + Convert.ToString(s.calls)
+                + " total=" + Convert.ToString(s.totalUs)
+                + " max=" + Convert.ToString(s.maxUs)
+                + " avg=" + Convert.ToString(s.avgUs)
+                + " rows=" + Convert.ToString(s.rows));
+            i = i + 1;
+        }
+
+        // 2. HAVING on an aggregate, paged, ascending aggregate order
+        List<RouteStat> busy = db.Select<MetricMinute>()
+            .GroupBy(a => new { a.method, a.path })
+            .Having(a => a.Sum(x => x.calls) >= 5L)
+            .OrderBy(a => a.Sum(x => x.calls))
+            .Page(1, 5)
+            .ToList<RouteStat>(a => new RouteStat {
+                method = a.method,
+                path = a.path,
+                calls = a.Sum(x => x.calls)
+            });
+        i = 0;
+        while (i < busy.Count) {
+            Console.WriteLine("busy: " + busy[i].method + " " + busy[i].path
+                + " calls=" + Convert.ToString(busy[i].calls));
+            i = i + 1;
+        }
+
+        // 3. one-row window totals (no GROUP BY)
+        Totals t = db.Select<MetricMinute>()
+            .Where(a => a.method.Eq("GET"))
+            .ToOne<Totals>(a => new Totals {
+                calls = a.Sum(x => x.calls),
+                totalUs = a.Sum(x => x.totalUs),
+                maxUs = a.Max(x => x.maxUs)
+            });
+        Console.WriteLine("win: calls=" + Convert.ToString(t.calls)
+            + " total=" + Convert.ToString(t.totalUs)
+            + " max=" + Convert.ToString(t.maxUs));
+
+        // 4. plain column projection stays available
+        List<string> paths = db.Select<MetricMinute>()
+            .Where(a => a.method.Eq("POST"))
+            .ToList(a => a.path);
+        Console.WriteLine("paths: " + Convert.ToString(paths.Count) + " "
+            + paths[0]);
+
+        db.Close();
+        File.Delete(file);
+    }
+}

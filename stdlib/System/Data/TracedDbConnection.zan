@@ -1,0 +1,151 @@
+using System;
+
+namespace System.Data;
+
+/// <summary>
+/// A connection that times what runs through it and reports it to
+/// <see cref="DbTrace"/>, forwarding everything else to the connection it wraps.
+///
+/// Why a wrapper and not the drivers: a statement is executed in six different
+/// implementations (SQLite, MySQL sync/async, PostgreSQL, ODBC, TDengine), each
+/// with the six executor entry points. Timing them one by one would put the same
+/// four lines in three dozen places and would still miss the next driver. The
+/// wrapper is the interface, so a driver added tomorrow is traced without being
+/// touched -- and a connection the application uses for its own bookkeeping (a
+/// metrics database writing the trace down) simply is not wrapped, which is what
+/// keeps a trace from tracing itself.
+///
+/// The pool never sees this object: whoever wraps a lease unwraps it before
+/// giving it back (see <see cref="Unwrap"/>).
+/// </summary>
+class TracedDbConnection : IDbConnection {
+    IDbConnection inner;
+
+    TracedDbConnection(IDbConnection inner) {
+        this.inner = inner;
+    }
+
+    /// <summary>The connection underneath.</summary>
+    IDbConnection Inner() { return this.inner; }
+
+    /// <summary>`db` timed, or `db` itself when nothing is listening: an
+    /// untraced server must not pay for a wrapper on every lease.</summary>
+    static IDbConnection Wrap(IDbConnection db) {
+        if (db == null) { return null; }
+        if (!DbTrace.Enabled()) { return db; }
+        if (db is TracedDbConnection) { return db; }
+        return new TracedDbConnection(db);
+    }
+
+    /// <summary>The connection a pool handed out, however many times it was
+    /// wrapped -- what has to go back to the pool is the pooled object, not a
+    /// wrapper the pool has never seen.</summary>
+    static IDbConnection Unwrap(IDbConnection db) {
+        IDbConnection cur = db;
+        while (cur != null && cur is TracedDbConnection) {
+            cur = ((TracedDbConnection)cur).Inner();
+        }
+        return cur;
+    }
+
+    // ---- timed: everything that carries a statement ----
+    // Reported after the call returns, whatever it returned: a statement that
+    // failed still spent the time, and a failure that is slow is exactly what
+    // an operator goes looking for.
+
+    DbResult Query(string sql) {
+        long t = DbTrace.NowUs();
+        DbResult r = this.inner.Query(sql);
+        DbTrace.Report(sql, t);
+        return r;
+    }
+
+    DbResult Query(string sql, DbParams prms) {
+        long t = DbTrace.NowUs();
+        DbResult r = this.inner.Query(sql, prms);
+        DbTrace.Report(sql, t);
+        return r;
+    }
+
+    int Execute(string sql) {
+        long t = DbTrace.NowUs();
+        int n = this.inner.Execute(sql);
+        DbTrace.Report(sql, t);
+        return n;
+    }
+
+    int Execute(string sql, DbParams prms) {
+        long t = DbTrace.NowUs();
+        int n = this.inner.Execute(sql, prms);
+        DbTrace.Report(sql, t);
+        return n;
+    }
+
+    string ExecuteScalar(string sql) {
+        long t = DbTrace.NowUs();
+        string s = this.inner.ExecuteScalar(sql);
+        DbTrace.Report(sql, t);
+        return s;
+    }
+
+    string ExecuteScalar(string sql, DbParams prms) {
+        long t = DbTrace.NowUs();
+        string s = this.inner.ExecuteScalar(sql, prms);
+        DbTrace.Report(sql, t);
+        return s;
+    }
+
+    async DbResult QueryAsync(string sql) {
+        long t = DbTrace.NowUs();
+        DbResult r = await this.inner.QueryAsync(sql);
+        DbTrace.Report(sql, t);
+        return r;
+    }
+
+    async DbResult QueryAsync(string sql, DbParams prms) {
+        long t = DbTrace.NowUs();
+        DbResult r = await this.inner.QueryAsync(sql, prms);
+        DbTrace.Report(sql, t);
+        return r;
+    }
+
+    async int ExecuteAsync(string sql) {
+        long t = DbTrace.NowUs();
+        int n = await this.inner.ExecuteAsync(sql);
+        DbTrace.Report(sql, t);
+        return n;
+    }
+
+    async int ExecuteAsync(string sql, DbParams prms) {
+        long t = DbTrace.NowUs();
+        int n = await this.inner.ExecuteAsync(sql, prms);
+        DbTrace.Report(sql, t);
+        return n;
+    }
+
+    async string ExecuteScalarAsync(string sql) {
+        long t = DbTrace.NowUs();
+        string s = await this.inner.ExecuteScalarAsync(sql);
+        DbTrace.Report(sql, t);
+        return s;
+    }
+
+    async string ExecuteScalarAsync(string sql, DbParams prms) {
+        long t = DbTrace.NowUs();
+        string s = await this.inner.ExecuteScalarAsync(sql, prms);
+        DbTrace.Report(sql, t);
+        return s;
+    }
+
+    // ---- forwarded: no statement of the application's, nothing to rank ----
+
+    int GetProvider() { return this.inner.GetProvider(); }
+    bool IsConnected() { return this.inner.IsConnected(); }
+    void Close() { this.inner.Close(); }
+    void BeginTransaction() { this.inner.BeginTransaction(); }
+    void Commit() { this.inner.Commit(); }
+    void Rollback() { this.inner.Rollback(); }
+    async bool BeginTransactionAsync() { return await this.inner.BeginTransactionAsync(); }
+    async bool CommitAsync() { return await this.inner.CommitAsync(); }
+    async bool RollbackAsync() { return await this.inner.RollbackAsync(); }
+}

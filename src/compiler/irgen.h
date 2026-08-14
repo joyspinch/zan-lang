@@ -379,6 +379,12 @@ struct zan_irgen {
     LLVMTypeRef  rt_co_sched_init_type;
     LLVMValueRef rt_co_sched_run; /* void zan_co_sched_run(void) */
     LLVMTypeRef  rt_co_sched_run_type;
+    /* void zan_co_sched_run_until(i32* done): pump like zan_co_sched_run but
+     * stop as soon as *done is non-zero (the awaited frame's DONE flag), so a
+     * synchronous context waiting on one coroutine is not held by unrelated
+     * background coroutines that never finish. A null pointer drains. */
+    LLVMValueRef rt_co_sched_run_until;
+    LLVMTypeRef  rt_co_sched_run_until_type;
     LLVMValueRef rt_co_delay;     /* void zan_co_delay(i64 ms, void* frame, step) */
     LLVMTypeRef  rt_co_delay_type;
     /* socket async (S4b-2): the readiness reactor, provided by the shipped
@@ -456,6 +462,12 @@ struct zan_irgen {
     /* per-function id of the next `foreach` emitted inside an async body;
      * indexes its frame-resident iteration state (see AST_FOREACH_STMT) */
     int          current_async_foreach_next;
+    /* the frame of the async body being emitted owns a +1 on its receiver
+     * (the ramp retained it), so completion releases it -- see the receiver
+     * retain in declare_async_method */
+    int          current_async_this_owned;
+    /* the receiver type that +1 belongs to */
+    zan_type_t  *current_async_this_type;
 
     /* DllImport: tracked extern libraries for linker */
     zan_istr_t extern_libs[64];

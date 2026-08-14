@@ -11,21 +11,31 @@ namespace ZanWeb;
 /// <summary>One minute of traffic for one interface: how often it was called, how
 /// long it took, how badly it went, and -- for a stream -- how much was pushed
 /// over it. This is the row the history screen reads and the shape kept in
-/// memory between flushes.</summary>
+/// memory between flushes.
+///
+/// It is also the table: the column names, the composite key `(minute, method,
+/// path)` and every statement over it are derived from this declaration by the
+/// ORM, so nothing below writes or concatenates SQL.</summary>
+[Table(Name = "metrics_minute")]
 class MetricMinute {
+    [Column(IsPrimary = true)]
     long minute;     // epoch seconds truncated to the minute
     // The interface, as two fields rather than one joined string: the request
     // method and what served it -- a route's registration pattern
     // ("/api/index/index") or a mounted asset's path ("/static/js/admin.js").
     // A request nothing served has no name of its own and is never filed here.
+    [Column(IsPrimary = true, StringLength = 16)]
     string method;
+    [Column(IsPrimary = true, StringLength = 400)]
     string path;
     long calls;
     long errors;
     // MICROSECONDS, like every duration the server records: a request served
     // in 200us rounds to "0 ms", so a millisecond history of a fast endpoint
     // is a column of zeroes.
+    [Column(Name = "total_us")]
     long totalUs;
+    [Column(Name = "max_us")]
     long maxUs;
     /// Frames/messages pushed over a long-lived connection (SSE/WebSocket) --
     /// how a stream is measured, since its duration is not a latency.
@@ -33,18 +43,56 @@ class MetricMinute {
     long bytes;
 }
 
+/// <summary>One day of one statement shape: how often it ran, how long it took
+/// and how much of that was slow. A shape is the normalized statement (literals
+/// replaced by placeholders), so `WHERE id = 7` and `WHERE id = 9` are one row
+/// -- and no value a caller typed is ever stored here.</summary>
+[Table(Name = "metrics_sql_day")]
+class MetricSql {
+    [Column(IsPrimary = true)]
+    long day;        // epoch seconds truncated to midnight
+    [Column(IsPrimary = true, StringLength = 400)]
+    string sql;      // normalized statement shape
+    long calls;
+    long slow;       // executions at or over [log].slowSqlMs
+    [Column(Name = "total_us")]
+    long totalUs;    // MICROSECONDS, like every duration the server records
+    [Column(Name = "max_us")]
+    long maxUs;
+}
+
 /// <summary>One worker's published live row: which worker, how many seconds
-/// ago it published, and the JSON it published.</summary>
+/// ago it published, and the JSON it published. A read shape, not a table --
+/// `age` is "now minus updated", computed per read.</summary>
 class LiveRow {
     int worker;
     long age;
     string json;
 }
 
+/// <summary>One worker's row in the live table, overwritten in place on every
+/// publish: the monitor reads ALL of them and shows the whole server, not
+/// whichever worker happened to accept the page request. Keyed by worker id --
+/// NOT an autoincrement id -- so a restarted worker replaces its own row
+/// instead of adding a second one.</summary>
+[Table(Name = "metrics_live")]
+class MetricLive {
+    [Column(IsPrimary = true, IsIdentity = false)]
+    int worker;
+    int pid;
+    long updated;
+    string snapshot;
+    string series;
+}
+
 /// <summary>One persisted server error, for the backend error screen.</summary>
+[Table(Name = "metrics_error")]
+[Index(Name = "ix_metrics_error_ts", Fields = "ts")]
 class MetricError {
+    [Column(IsPrimary = true, IsIdentity = true)]
     long id;
     long ts;
+    [Column(StringLength = 64)]
     string origin;
     string detail;
 }
@@ -67,10 +115,23 @@ class MetricError {
 class MetricsStore {
     static List<MetricMinute> buckets = new List<MetricMinute>();
     static List<MetricError> errors = new List<MetricError>();
+    /// Statement shapes waiting to be written, accumulated per shape rather than
+    /// per execution: a query that runs ten thousand times an hour is ten
+    /// thousand additions to one entry, not ten thousand entries.
+    static List<MetricSql> sqlBuckets = new List<MetricSql>();
     /// Hard ceiling on unflushed state: at one bucket per route per minute this
     /// is hours of traffic, and dropping the oldest beats growing forever.
     static int MaxBuckets = 8192;
     static int MaxErrors = 4096;
+    /// Distinct statement shapes carried in memory. A shape past the ceiling is
+    /// folded into one `OtherSql` row instead of being dropped: the day's query
+    /// count has to stay a count of the queries that ran.
+    static int MaxSqlShapes = 512;
+    /// Ceiling on the rows one monitor read pulls out of the minute table. The
+    /// summaries are folded in memory, so this is what keeps a wide window from
+    /// loading a whole archive: at a hundred interfaces it is days of history.
+    static int MaxScanRows = 200000;
+    static string OtherSql = "(其他语句)";
     static DbPool pool = null;
     static bool ready = false;
     static bool flushing = false;
@@ -87,8 +148,7 @@ class MetricsStore {
         if (db == null) { return false; }
         try {
             // WAL: the flusher writes while the history screen reads.
-            int _w = await db.ExecuteAsync("PRAGMA journal_mode=WAL");
-            int _s = await db.ExecuteAsync("PRAGMA synchronous=NORMAL");
+            await DbSchema.UseWriteAheadLogAsync(db);
             // A history written by an older build measured something else: it
             // keyed a row by one `route` column holding an action name or a raw
             // request line, and it stored durations in whole milliseconds.
@@ -96,29 +156,22 @@ class MetricsStore {
             // set aside under their own name instead of being guessed into the
             // new columns -- and the new table starts clean.
             await MetricsStore.RetireLegacyMinutes(db);
-            int _a = await db.ExecuteAsync(
-                "CREATE TABLE IF NOT EXISTS metrics_minute ("
-                + "minute INTEGER NOT NULL, method TEXT NOT NULL, "
-                + "path TEXT NOT NULL, "
-                + "calls INTEGER NOT NULL, errors INTEGER NOT NULL, "
-                + "total_us INTEGER NOT NULL, max_us INTEGER NOT NULL, "
-                + "frames INTEGER NOT NULL, bytes INTEGER NOT NULL, "
-                + "PRIMARY KEY (minute, method, path))");
-            int _b = await db.ExecuteAsync(
-                "CREATE TABLE IF NOT EXISTS metrics_error ("
-                + "id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, "
-                + "origin TEXT NOT NULL, detail TEXT NOT NULL)");
-            int _i = await db.ExecuteAsync(
-                "CREATE INDEX IF NOT EXISTS ix_metrics_error_ts "
-                + "ON metrics_error (ts)");
-            // One row per worker process, overwritten in place: the live
-            // monitor reads ALL of them and shows the whole server, not
-            // whichever worker happened to accept the page request.
-            int _l = await db.ExecuteAsync(
-                "CREATE TABLE IF NOT EXISTS metrics_live ("
-                + "worker INTEGER PRIMARY KEY, pid INTEGER NOT NULL, "
-                + "updated INTEGER NOT NULL, snapshot TEXT NOT NULL, "
-                + "series TEXT NOT NULL)");
+            // CodeFirst: the four tables are the four entities. Missing tables
+            // are created, missing columns added, declared indexes ensured --
+            // which is also the upgrade path for a database an older build
+            // left behind with fewer columns.
+            //
+            // SQL statistics are archived by DAY, not by minute: what an
+            // operator asks of a statement ("how often did it run today, how
+            // much of the day did it cost, how often was it slow") is a daily
+            // question, and a per-minute row per shape would be a table tens of
+            // times the size of the traffic history for an answer nothing reads.
+            // The minute is only how OFTEN memory is emptied out -- the flusher
+            // merges what it drained into today's row.
+            await db.SyncStructureAsync<MetricMinute>();
+            await db.SyncStructureAsync<MetricError>();
+            await db.SyncStructureAsync<MetricSql>();
+            await db.SyncStructureAsync<MetricLive>();
         } finally {
             MetricsStore.Give(db);
         }
@@ -144,6 +197,9 @@ class MetricsStore {
     /// <summary>The minute a timestamp belongs to.</summary>
     static long Minute(long sec) { return sec - (sec % 60); }
 
+    /// <summary>The day a timestamp belongs to.</summary>
+    static long Day(long sec) { return sec - (sec % 86400); }
+
     /// <summary>Sets aside a metrics_minute written by an older build: one that
     /// keyed a row by a single `route` column holding either an action name
     /// ("Users.Save") or a raw request line ("GET /wp-login.php"), or one that
@@ -154,15 +210,17 @@ class MetricsStore {
     /// publish invented precision.</summary>
     static async void RetireLegacyMinutes(IDbConnection db) {
         try {
-            DbResult r = await db.QueryAsync(
-                "SELECT COUNT(*) FROM pragma_table_info('metrics_minute') "
-                + "WHERE name IN ('route', 'total_ms')");
-            if (r.RowCount() == 0) { return; }
-            if (Convert.ToInt64(r.GetString(0, 0)) == 0) { return; }
-            int _d = await db.ExecuteAsync(
-                "DROP TABLE IF EXISTS metrics_minute_legacy");
-            int _m = await db.ExecuteAsync(
-                "ALTER TABLE metrics_minute RENAME TO metrics_minute_legacy");
+            bool exists = await DbSchema.TableExistsAsync(db,
+                MetricMinuteCols.Table);
+            if (!exists) { return; }
+            // The tell is a column the current entity does not have: `route`
+            // (the old key) or `total_ms` (the old unit).
+            List<string> gone = new List<string> { "route", "total_ms" };
+            bool old = await DbSchema.HasAnyColumnAsync(db,
+                MetricMinuteCols.Table, gone);
+            if (!old) { return; }
+            await DbSchema.RenameTableAsync(db, MetricMinuteCols.Table,
+                MetricMinuteCols.Table + "_legacy");
             Console.WriteLine("[metrics] history schema changed: previous "
                 + "rows kept in metrics_minute_legacy");
         } catch (Exception ex) {
@@ -228,6 +286,49 @@ class MetricsStore {
         b.bytes = b.bytes + bytes;
     }
 
+    /// <summary>One finished statement, folded into its shape's entry for today.
+    /// `norm` is the NORMALIZED statement (ServerMetrics.NormalizeSql), so a
+    /// literal a caller typed -- an address, a token, a password being checked --
+    /// never reaches the database or the log. `us` is microseconds.
+    ///
+    /// Called from the DbTrace sink, on the coroutine that ran the statement:
+    /// this adds to a list in memory and never writes, so a query costs a query.
+    /// </summary>
+    static void RecordSql(string norm, long us, bool slow) {
+        if (!Cfg.Metrics.enabled) { return; }
+        MetricsStore.Arm();
+        MetricSql e = MetricsStore.SqlEntry(norm);
+        e.calls = e.calls + 1;
+        e.totalUs = e.totalUs + us;
+        if (us > e.maxUs) { e.maxUs = us; }
+        if (slow) { e.slow = e.slow + 1; }
+    }
+
+    /// <summary>Today's entry for a shape, created if this is the first time it
+    /// ran. Once `MaxSqlShapes` shapes are held, everything new folds into the
+    /// `OtherSql` entry -- a server generating unbounded statement shapes must
+    /// not turn the monitor into a leak, and must not lose the count either.
+    /// </summary>
+    static MetricSql SqlEntry(string norm) {
+        long d = MetricsStore.Day((long)WebApp.NowSeconds());
+        for (int i = MetricsStore.sqlBuckets.Count - 1; i >= 0; i = i - 1) {
+            MetricSql e = MetricsStore.sqlBuckets[i];
+            if (e.day == d && e.sql == norm) { return e; }
+        }
+        if (MetricsStore.sqlBuckets.Count >= MetricsStore.MaxSqlShapes) {
+            for (int i = 0; i < MetricsStore.sqlBuckets.Count; i = i + 1) {
+                MetricSql o = MetricsStore.sqlBuckets[i];
+                if (o.day == d && o.sql == MetricsStore.OtherSql) { return o; }
+            }
+            norm = MetricsStore.OtherSql;
+        }
+        MetricSql n = new MetricSql();
+        n.day = d;
+        n.sql = norm;
+        MetricsStore.sqlBuckets.Add(n);
+        return n;
+    }
+
     /// <summary>Queues one error for the error screen. The detail is already
     /// redacted by the caller.</summary>
     static void Failed(long ts, string origin, string detail) {
@@ -251,7 +352,8 @@ class MetricsStore {
             waited = waited + 1;
             bool due = waited >= Cfg.Metrics.flushSeconds;
             bool full = MetricsStore.buckets.Count >= Cfg.Metrics.flushRows
-                || MetricsStore.errors.Count >= Cfg.Metrics.flushRows;
+                || MetricsStore.errors.Count >= Cfg.Metrics.flushRows
+                || MetricsStore.sqlBuckets.Count >= Cfg.Metrics.flushRows;
             if (!due && !full) { continue; }
             waited = 0;
             await MetricsStore.Flush();
@@ -264,49 +366,55 @@ class MetricsStore {
     /// already there.</summary>
     static async int Flush() {
         if (!MetricsStore.ready) { return 0; }
-        if (MetricsStore.buckets.Count == 0 && MetricsStore.errors.Count == 0) {
+        if (MetricsStore.buckets.Count == 0 && MetricsStore.errors.Count == 0
+            && MetricsStore.sqlBuckets.Count == 0) {
             return 0;
         }
         List<MetricMinute> mine = MetricsStore.buckets;
         List<MetricError> errs = MetricsStore.errors;
+        List<MetricSql> sqls = MetricsStore.sqlBuckets;
         MetricsStore.buckets = new List<MetricMinute>();
         MetricsStore.errors = new List<MetricError>();
+        MetricsStore.sqlBuckets = new List<MetricSql>();
 
         IDbConnection db = await MetricsStore.Lease();
         if (db == null) { return 0; }
         int written = 0;
         try {
             await db.BeginTransactionAsync();
-            for (int i = 0; i < mine.Count; i = i + 1) {
-                MetricMinute b = mine[i];
-                DbParams p = new DbParams().Add(b.method).Add(b.path);
-                int _n = await db.ExecuteAsync(
-                    "INSERT INTO metrics_minute "
-                    + "(minute, method, path, calls, errors, total_us, max_us, "
-                    + "frames, bytes) "
-                    + "VALUES (" + Convert.ToString(b.minute) + ", ?, ?, "
-                    + Convert.ToString(b.calls) + ", "
-                    + Convert.ToString(b.errors) + ", "
-                    + Convert.ToString(b.totalUs) + ", "
-                    + Convert.ToString(b.maxUs) + ", "
-                    + Convert.ToString(b.frames) + ", "
-                    + Convert.ToString(b.bytes) + ") "
-                    + "ON CONFLICT (minute, method, path) DO UPDATE SET "
-                    + "calls = calls + excluded.calls, "
-                    + "errors = errors + excluded.errors, "
-                    + "total_us = total_us + excluded.total_us, "
-                    + "max_us = max(max_us, excluded.max_us), "
-                    + "frames = frames + excluded.frames, "
-                    + "bytes = bytes + excluded.bytes", p);
-                written = written + 1;
+            // Merged on write: the batch goes in as one statement and a row
+            // that is already there for this (minute, method, path) takes the
+            // counters ADDED to it and keeps the larger maximum. So a minute
+            // re-flushed by this worker, or flushed by four workers at once,
+            // ends as ONE row -- nothing raw is stored to be added up later.
+            if (mine.Count > 0) {
+                written = written + await db.Insert<MetricMinute>(mine)
+                    .OnConflict(a => new { a.minute, a.method, a.path })
+                    .SetIncr(a => a.calls)
+                    .SetIncr(a => a.errors)
+                    .SetIncr(a => a.totalUs)
+                    .SetMax(a => a.maxUs)
+                    .SetIncr(a => a.frames)
+                    .SetIncr(a => a.bytes)
+                    .ExecuteAffrowsAsync();
             }
-            for (int j = 0; j < errs.Count; j = j + 1) {
-                MetricError e = errs[j];
-                DbParams p2 = new DbParams().Add(e.origin).Add(e.detail);
-                int _m = await db.ExecuteAsync(
-                    "INSERT INTO metrics_error (ts, origin, detail) VALUES ("
-                    + Convert.ToString(e.ts) + ", ?, ?)", p2);
-                written = written + 1;
+            // The same merge by (day, sql): this worker flushes every minute,
+            // the other workers flush their own, and all of it accumulates
+            // into one row per shape per day.
+            if (sqls.Count > 0) {
+                written = written + await db.Insert<MetricSql>(sqls)
+                    .OnConflict(a => new { a.day, a.sql })
+                    .SetIncr(a => a.calls)
+                    .SetIncr(a => a.slow)
+                    .SetIncr(a => a.totalUs)
+                    .SetMax(a => a.maxUs)
+                    .ExecuteAffrowsAsync();
+            }
+            // Errors are events, not counters: each one is its own row, and
+            // `id` is filled by the database.
+            if (errs.Count > 0) {
+                written = written + await db.Insert<MetricError>(errs)
+                    .ExecuteAffrowsAsync();
             }
             await db.CommitAsync();
             await MetricsStore.Sweep(db);
@@ -328,51 +436,98 @@ class MetricsStore {
         if (now - MetricsStore.lastSweep < 3600) { return; }
         MetricsStore.lastSweep = now;
         long cut = now - (long)Cfg.Metrics.keepDays * 86400;
-        int _a = await db.ExecuteAsync("DELETE FROM metrics_minute WHERE minute < "
-            + Convert.ToString(cut));
-        int _b = await db.ExecuteAsync("DELETE FROM metrics_error WHERE ts < "
-            + Convert.ToString(cut));
+        long dayCut = MetricsStore.Day(cut);
+        int _a = await db.Delete<MetricMinute>()
+            .Where(a => a.minute < cut).ExecuteAffrowsAsync();
+        int _b = await db.Delete<MetricError>()
+            .Where(a => a.ts < cut).ExecuteAffrowsAsync();
+        int _c = await db.Delete<MetricSql>()
+            .Where(a => a.day < dayCut).ExecuteAffrowsAsync();
+    }
+
+    /// <summary>The statements the window was spent on, one row per shape,
+    /// ranked by "calls" (how often it ran), "time" (how much of the window it
+    /// cost) or "slow" (how often it was over the threshold). The window is
+    /// given in seconds like every other query here and snapped to whole days,
+    /// because that is the resolution the archive keeps.
+    ///
+    /// The database hands back the day rows in the window and nothing else:
+    /// folding them per shape and ranking them happens here, in Zan. The
+    /// caller's ranking name picks a comparison, never a fragment of a
+    /// statement.</summary>
+    static async List<MetricSql> SqlTotals(long from, long to, int limit,
+                                           string rank) {
+        List<MetricSql> rows = new List<MetricSql>();
+        if (!MetricsStore.ready) { return rows; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return rows; }
+        long a0 = MetricsStore.Day(from);
+        long b0 = MetricsStore.Day(to);
+        try {
+            rows = await db.Select<MetricSql>()
+                .Where(a => a.day >= a0 && a.day <= b0)
+                .OrderByDescending(a => a.day)
+                .Limit(MetricsStore.MaxScanRows)
+                .ToListAsync();
+        } finally {
+            MetricsStore.Give(db);
+        }
+        // Sorted by shape, the rows of one shape land next to each other, so
+        // one pass folds the window's days into one row per shape.
+        List<MetricSql> byShape = rows.OrderByStr(a => a.sql);
+        List<MetricSql> totals = new List<MetricSql>();
+        MetricSql cur = null;
+        for (int i = 0; i < byShape.Count; i = i + 1) {
+            MetricSql r = byShape[i];
+            if (cur == null || cur.sql != r.sql) {
+                cur = new MetricSql();
+                cur.day = a0;
+                cur.sql = r.sql;
+                totals.Add(cur);
+            }
+            cur.calls = cur.calls + r.calls;
+            cur.slow = cur.slow + r.slow;
+            cur.totalUs = cur.totalUs + r.totalUs;
+            if (r.maxUs > cur.maxUs) { cur.maxUs = r.maxUs; }
+        }
+        List<MetricSql> ranked = totals;
+        if (rank == "time") {
+            ranked = totals.OrderByNumDescending(a => (double)a.totalUs);
+        } else if (rank == "slow") {
+            ranked = totals.OrderByNumDescending(a => (double)a.slow);
+        } else {
+            ranked = totals.OrderByNumDescending(a => (double)a.calls);
+        }
+        return ranked.Take(limit);
     }
 
     /// <summary>Aggregated history: one row per `stepSec` time bucket (a
     /// minute, an hour, a day or any other span), summed across interfaces --
-    /// or over one of them when `method`/`path` filter -- newest first. The
-    /// database does the grouping: the screen never loads raw minutes to add
-    /// them up itself.</summary>
+    /// or over one of them when `method`/`path` filter -- newest first.
+    ///
+    /// The read is the plain one: the window's minute rows, newest first. They
+    /// arrive ordered by minute, so a bucket's rows are contiguous and one pass
+    /// adds them up; `limit` buckets in, the walk stops.</summary>
     static async List<MetricMinute> HistoryBuckets(long from, long to,
                                                    string method, string path,
                                                    long stepSec, int limit) {
         List<MetricMinute> outp = new List<MetricMinute>();
-        if (!MetricsStore.ready) { return outp; }
-        IDbConnection db = await MetricsStore.Lease();
-        if (db == null) { return outp; }
-        try {
-            string sql = "SELECT (minute / " + Convert.ToString(stepSec)
-                + ") * " + Convert.ToString(stepSec) + " AS bucket, "
-                + "SUM(calls), SUM(errors), SUM(total_us), MAX(max_us), "
-                + "SUM(frames), SUM(bytes) FROM metrics_minute WHERE minute >= "
-                + Convert.ToString(from) + " AND minute <= "
-                + Convert.ToString(to);
-            DbParams p = new DbParams();
-            sql = sql + MetricsStore.Filter(method, path, p);
-            sql = sql + " GROUP BY bucket ORDER BY bucket DESC LIMIT "
-                + Convert.ToString(limit);
-            DbResult r = await db.QueryAsync(sql, p);
-            for (int i = 0; i < r.RowCount(); i = i + 1) {
-                MetricMinute b = new MetricMinute();
-                b.minute = Convert.ToInt64(r.GetString(i, 0));
-                b.method = "";
-                b.path = "";
-                b.calls = Convert.ToInt64(r.GetString(i, 1));
-                b.errors = Convert.ToInt64(r.GetString(i, 2));
-                b.totalUs = Convert.ToInt64(r.GetString(i, 3));
-                b.maxUs = Convert.ToInt64(r.GetString(i, 4));
-                b.frames = Convert.ToInt64(r.GetString(i, 5));
-                b.bytes = Convert.ToInt64(r.GetString(i, 6));
-                outp.Add(b);
+        if (stepSec < 1) { stepSec = 60; }
+        List<MetricMinute> rows = await MetricsStore.Scan(from, to, method,
+            path);
+        MetricMinute cur = null;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            MetricMinute r = rows[i];
+            long key = r.minute / stepSec * stepSec;
+            if (cur == null || cur.minute != key) {
+                if (outp.Count >= limit) { break; }
+                cur = new MetricMinute();
+                cur.minute = key;
+                cur.method = method;
+                cur.path = path;
+                outp.Add(cur);
             }
-        } finally {
-            MetricsStore.Give(db);
+            MetricsStore.Fold(cur, r);
         }
         return outp;
     }
@@ -391,91 +546,91 @@ class MetricsStore {
     /// "calls" (how often) or "time" (how much of the server's time the
     /// interface consumed). The two answer different questions -- an endpoint
     /// called twice a day can still be the one the server spends its
-    /// afternoon in -- and the ordering is chosen here rather than taken from
-    /// the caller's string, which never reaches the statement.</summary>
+    /// afternoon in.
+    ///
+    /// Same plain read as everything else here; the interfaces are folded and
+    /// ranked in memory.</summary>
     static async List<MetricMinute> RouteTotalsBy(long from, long to,
                                                   string method, string path,
                                                   int limit, string rank) {
-        List<MetricMinute> outp = new List<MetricMinute>();
-        if (!MetricsStore.ready) { return outp; }
-        IDbConnection db = await MetricsStore.Lease();
-        if (db == null) { return outp; }
-        try {
-            string sql = "SELECT method, path, SUM(calls) AS c, SUM(errors), "
-                + "SUM(total_us) AS t, MAX(max_us), SUM(frames), SUM(bytes) "
-                + "FROM metrics_minute WHERE minute >= "
-                + Convert.ToString(from) + " AND minute <= "
-                + Convert.ToString(to);
-            DbParams p = new DbParams();
-            sql = sql + MetricsStore.Filter(method, path, p);
-            string order = "c";
-            if (rank == "time") { order = "t"; }
-            sql = sql + " GROUP BY method, path ORDER BY " + order
-                + " DESC LIMIT " + Convert.ToString(limit);
-            DbResult r = await db.QueryAsync(sql, p);
-            for (int i = 0; i < r.RowCount(); i = i + 1) {
-                MetricMinute b = new MetricMinute();
-                b.minute = 0;
-                b.method = r.GetString(i, 0);
-                b.path = r.GetString(i, 1);
-                b.calls = Convert.ToInt64(r.GetString(i, 2));
-                b.errors = Convert.ToInt64(r.GetString(i, 3));
-                b.totalUs = Convert.ToInt64(r.GetString(i, 4));
-                b.maxUs = Convert.ToInt64(r.GetString(i, 5));
-                b.frames = Convert.ToInt64(r.GetString(i, 6));
-                b.bytes = Convert.ToInt64(r.GetString(i, 7));
-                outp.Add(b);
+        List<MetricMinute> rows = await MetricsStore.Scan(from, to, method,
+            path);
+        // One interface is (method, path): sorted by the pair, its minutes are
+        // contiguous and one pass folds them into one row.
+        List<MetricMinute> byRoute = rows.OrderByStr(
+            a => a.method + "\t" + a.path);
+        List<MetricMinute> totals = new List<MetricMinute>();
+        MetricMinute cur = null;
+        for (int i = 0; i < byRoute.Count; i = i + 1) {
+            MetricMinute r = byRoute[i];
+            if (cur == null || cur.method != r.method || cur.path != r.path) {
+                cur = new MetricMinute();
+                cur.minute = 0;
+                cur.method = r.method;
+                cur.path = r.path;
+                totals.Add(cur);
             }
-        } finally {
-            MetricsStore.Give(db);
+            MetricsStore.Fold(cur, r);
         }
-        return outp;
-    }
-
-    /// <summary>The WHERE clause for an interface filter: the method, the path,
-    /// either or neither. Both go in as parameters -- what a screen typed is
-    /// never spliced into the statement.</summary>
-    static string Filter(string method, string path, DbParams p) {
-        string sql = "";
-        if (method.Length > 0) { sql = sql + " AND method = ?"; p.Add(method); }
-        if (path.Length > 0) { sql = sql + " AND path = ?"; p.Add(path); }
-        return sql;
+        List<MetricMinute> ranked = totals;
+        if (rank == "time") {
+            ranked = totals.OrderByNumDescending(a => (double)a.totalUs);
+        } else {
+            ranked = totals.OrderByNumDescending(a => (double)a.calls);
+        }
+        return ranked.Take(limit);
     }
 
     /// <summary>History for the screen: one row per minute per interface in the
-    /// window, newest first. `limit` is clamped by the caller's own ceiling.</summary>
+    /// window, newest first. `limit` is clamped by the caller's own ceiling.
+    ///
+    /// This is the one read every other figure on the screens is folded out of:
+    /// a filtered range of rows, ordered, capped. Nothing more is asked of the
+    /// database.</summary>
     static async List<MetricMinute> History(long from, long to, string method,
                                             string path, int limit) {
         List<MetricMinute> outp = new List<MetricMinute>();
         if (!MetricsStore.ready) { return outp; }
         IDbConnection db = await MetricsStore.Lease();
         if (db == null) { return outp; }
+        bool byMethod = method.Length > 0;
+        bool byPath = path.Length > 0;
         try {
-            string sql = "SELECT minute, method, path, calls, errors, total_us, "
-                + "max_us, frames, bytes FROM metrics_minute WHERE minute >= "
-                + Convert.ToString(from) + " AND minute <= " + Convert.ToString(to);
-            DbParams p = new DbParams();
-            sql = sql + MetricsStore.Filter(method, path, p);
-            sql = sql + " ORDER BY minute DESC, calls DESC LIMIT "
-                + Convert.ToString(limit);
-            DbResult r = await db.QueryAsync(sql, p);
-            for (int i = 0; i < r.RowCount(); i = i + 1) {
-                MetricMinute b = new MetricMinute();
-                b.minute = Convert.ToInt64(r.GetString(i, 0));
-                b.method = r.GetString(i, 1);
-                b.path = r.GetString(i, 2);
-                b.calls = Convert.ToInt64(r.GetString(i, 3));
-                b.errors = Convert.ToInt64(r.GetString(i, 4));
-                b.totalUs = Convert.ToInt64(r.GetString(i, 5));
-                b.maxUs = Convert.ToInt64(r.GetString(i, 6));
-                b.frames = Convert.ToInt64(r.GetString(i, 7));
-                b.bytes = Convert.ToInt64(r.GetString(i, 8));
-                outp.Add(b);
-            }
+            outp = await db.Select<MetricMinute>()
+                .Where(a => a.minute >= from && a.minute <= to)
+                .WhereIf(byMethod, a => a.method == method)
+                .WhereIf(byPath, a => a.path == path)
+                .OrderByDescending(a => a.minute)
+                .OrderByDescending(a => a.calls)
+                .Limit(limit)
+                .ToListAsync();
         } finally {
             MetricsStore.Give(db);
         }
         return outp;
+    }
+
+    /// <summary>The window's minute rows, newest first, up to `MaxScanRows`.
+    /// Every summary below is folded out of this list, so the ceiling is what
+    /// bounds a monitor read: past it the OLDEST minutes of the window are the
+    /// ones missing, which is the truncation a newest-first screen can show
+    /// without lying about the recent past.</summary>
+    static async List<MetricMinute> Scan(long from, long to, string method,
+                                         string path) {
+        return await MetricsStore.History(from, to, method, path,
+            MetricsStore.MaxScanRows);
+    }
+
+    /// <summary>Adds one minute row into an accumulator: counters add, the
+    /// maximum takes the larger. The one place the arithmetic behind every
+    /// summary is written.</summary>
+    static void Fold(MetricMinute t, MetricMinute r) {
+        t.calls = t.calls + r.calls;
+        t.errors = t.errors + r.errors;
+        t.totalUs = t.totalUs + r.totalUs;
+        if (r.maxUs > t.maxUs) { t.maxUs = r.maxUs; }
+        t.frames = t.frames + r.frames;
+        t.bytes = t.bytes + r.bytes;
     }
 
     /// <summary>One row: everything the window holds, added up. This is what a
@@ -489,31 +644,10 @@ class MetricsStore {
         b.minute = from;
         b.method = method;
         b.path = path;
-        if (!MetricsStore.ready) { return b; }
-        IDbConnection db = await MetricsStore.Lease();
-        if (db == null) { return b; }
-        try {
-            // COALESCE, because SUM over no rows is NULL, and an empty window
-            // has to read as a zero rather than as a parse of "".
-            string sql = "SELECT COALESCE(SUM(calls),0), "
-                + "COALESCE(SUM(errors),0), COALESCE(SUM(total_us),0), "
-                + "COALESCE(MAX(max_us),0), COALESCE(SUM(frames),0), "
-                + "COALESCE(SUM(bytes),0) "
-                + "FROM metrics_minute WHERE minute >= "
-                + Convert.ToString(from) + " AND minute <= "
-                + Convert.ToString(to);
-            DbParams p = new DbParams();
-            sql = sql + MetricsStore.Filter(method, path, p);
-            DbResult r = await db.QueryAsync(sql, p);
-            if (r.RowCount() == 0) { return b; }
-            b.calls = Convert.ToInt64(r.GetString(0, 0));
-            b.errors = Convert.ToInt64(r.GetString(0, 1));
-            b.totalUs = Convert.ToInt64(r.GetString(0, 2));
-            b.maxUs = Convert.ToInt64(r.GetString(0, 3));
-            b.frames = Convert.ToInt64(r.GetString(0, 4));
-            b.bytes = Convert.ToInt64(r.GetString(0, 5));
-        } finally {
-            MetricsStore.Give(db);
+        List<MetricMinute> rows = await MetricsStore.Scan(from, to, method,
+            path);
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            MetricsStore.Fold(b, rows[i]);
         }
         return b;
     }
@@ -525,18 +659,11 @@ class MetricsStore {
         IDbConnection db = await MetricsStore.Lease();
         if (db == null) { return outp; }
         try {
-            DbResult r = await db.QueryAsync(
-                "SELECT id, ts, origin, detail FROM metrics_error WHERE ts >= "
-                + Convert.ToString(from) + " AND ts <= " + Convert.ToString(to)
-                + " ORDER BY id DESC LIMIT " + Convert.ToString(limit));
-            for (int i = 0; i < r.RowCount(); i = i + 1) {
-                MetricError e = new MetricError();
-                e.id = Convert.ToInt64(r.GetString(i, 0));
-                e.ts = Convert.ToInt64(r.GetString(i, 1));
-                e.origin = r.GetString(i, 2);
-                e.detail = r.GetString(i, 3);
-                outp.Add(e);
-            }
+            outp = await db.Select<MetricError>()
+                .Where(a => a.ts >= from && a.ts <= to)
+                .OrderByDescending(a => a.id)
+                .Limit(limit)
+                .ToListAsync();
         } finally {
             MetricsStore.Give(db);
         }
@@ -584,16 +711,17 @@ class MetricsCluster {
         IDbConnection db = await MetricsStore.Lease();
         if (db == null) { return; }
         try {
-            DbParams p = new DbParams().Add(app.MetricsJson())
-                .Add(app.MetricsSeriesJson(120));
-            int _n = await db.ExecuteAsync(
-                "INSERT INTO metrics_live (worker, pid, updated, snapshot, series)"
-                + " VALUES (" + Convert.ToString(ProcessHost.WorkerId()) + ", "
-                + Convert.ToString(ProcessHost.Pid()) + ", "
-                + Convert.ToString((long)WebApp.NowSeconds()) + ", ?, ?) "
-                + "ON CONFLICT (worker) DO UPDATE SET pid = excluded.pid, "
-                + "updated = excluded.updated, snapshot = excluded.snapshot, "
-                + "series = excluded.series", p);
+            MetricLive row = new MetricLive();
+            row.worker = ProcessHost.WorkerId();
+            row.pid = ProcessHost.Pid();
+            row.updated = (long)WebApp.NowSeconds();
+            row.snapshot = app.MetricsJson();
+            row.series = app.MetricsSeriesJson(120);
+            // One row per worker, overwritten in place: on a conflicting
+            // `worker` the columns not named as counters take the new values.
+            int _n = await db.Insert<MetricLive>(row)
+                .OnConflict(a => a.worker)
+                .ExecuteAffrowsAsync();
         } catch (Exception ex) {
             Console.WriteLine("[metrics] live publish failed: " + ex.Message);
         } finally {
@@ -614,19 +742,21 @@ class MetricsCluster {
         if (db == null) { return outp; }
         try {
             long now = (long)WebApp.NowSeconds();
-            string sql = "SELECT worker, updated, " + col
-                + " FROM metrics_live";
-            if (maxAgeSec > 0) {
-                sql = sql + " WHERE updated >= "
-                    + Convert.ToString(now - (long)maxAgeSec);
-            }
-            DbResult r = await db.QueryAsync(sql + " ORDER BY worker");
-            for (int i = 0; i < r.RowCount(); i = i + 1) {
+            long cut = now - (long)maxAgeSec;
+            bool fresh = maxAgeSec > 0;
+            List<MetricLive> rows = await db.Select<MetricLive>()
+                .WhereIf(fresh, a => a.updated >= cut)
+                .OrderBy(a => a.worker)
+                .ToListAsync();
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                MetricLive m = rows[i];
                 LiveRow w = new LiveRow();
-                w.worker = (int)Convert.ToInt64(r.GetString(i, 0));
-                w.age = now - Convert.ToInt64(r.GetString(i, 1));
+                w.worker = m.worker;
+                w.age = now - m.updated;
                 if (w.age < 0) { w.age = 0; }
-                w.json = r.GetString(i, 2);
+                // Which of the two published documents the caller asked for --
+                // a field pick in Zan, not a column name in a statement.
+                w.json = col == "series" ? m.series : m.snapshot;
                 outp.Add(w);
             }
         } finally {

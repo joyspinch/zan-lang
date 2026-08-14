@@ -1,0 +1,56 @@
+using System;
+using System.Diagnostics;
+
+namespace System.Data;
+
+/// <summary>One finished statement: the SQL as it was submitted and how long it
+/// took in MICROSECONDS -- the same shape <see cref="ServerMetrics.RecordQuery"/>
+/// takes, so a server can hand this straight to its metrics.</summary>
+delegate void SqlTraceSink(string sql, long us);
+
+/// <summary>
+/// Where timed statements are reported, set once at startup by the application
+/// that wants them. Nothing here knows what a metric or a log file is: the sink
+/// is a delegate, so the data layer stays free of the monitoring it feeds.
+///
+/// Without a sink the whole thing costs one null check and no clock read --
+/// timing is not something a library should charge for when nobody is reading.
+///
+/// <code>
+/// DbTrace.Sink(Program.SqlTrace);                 // once, at startup
+/// IDbConnection db = TracedDbConnection.Wrap(await pool.AcquireAsync());
+/// </code>
+/// </summary>
+class DbTrace {
+    static SqlTraceSink sink = null;
+
+    /// <summary>Sends every timed statement to `fn`; null stops tracing.
+    /// The sink runs on the coroutine that ran the statement, right after it
+    /// finished, so it must not itself go to the database that is being traced
+    /// -- that is a statement reporting a statement, without end.</summary>
+    static void Sink(SqlTraceSink fn) { DbTrace.sink = fn; }
+
+    /// <summary>Whether anything is listening. Call sites use it to skip the
+    /// wrapper and the clock entirely.</summary>
+    static bool Enabled() { return DbTrace.sink != null; }
+
+    /// <summary>Monotonic microseconds: the reading a duration is measured from.
+    /// Monotonic, because a statement timed across an NTP correction would
+    /// otherwise be reported as hours long (or negative).</summary>
+    static long NowUs() {
+        long freq = Stopwatch.Frequency();
+        long perUs = freq / 1000000;
+        if (perUs < 1) { perUs = 1; }
+        return Stopwatch.NowTicks() / perUs;
+    }
+
+    /// <summary>Reports the statement that started at `startUs` (a
+    /// <see cref="NowUs"/> reading) as having just finished.</summary>
+    static void Report(string sql, long startUs) {
+        SqlTraceSink fn = DbTrace.sink;
+        if (fn == null) { return; }
+        long us = DbTrace.NowUs() - startUs;
+        if (us < 0) { us = 0; }
+        fn(sql, us);
+    }
+}

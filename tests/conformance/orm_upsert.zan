@@ -1,0 +1,116 @@
+// Upsert over a composite primary key: one statement per row, the
+// conflict behaviour (accumulate / keep the larger value / overwrite)
+// comes from the entity and the lambdas, never from hand-written SQL.
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+[Table(Name = "metrics_minute")]
+class MetricMinute {
+    [Column(IsPrimary = true)]
+    long minute;
+    [Column(IsPrimary = true, StringLength = 8)]
+    string method;
+    [Column(IsPrimary = true, StringLength = 200)]
+    string path;
+    long calls;
+    [Column(Name = "total_us")]
+    long totalUs;
+    [Column(Name = "max_us")]
+    long maxUs;
+    double score;
+
+    static MetricMinute Of(long minute, string method, string path, long calls,
+                           long totalUs, long maxUs, double score) {
+        MetricMinute m = new MetricMinute();
+        m.minute = minute;
+        m.method = method;
+        m.path = path;
+        m.calls = calls;
+        m.totalUs = totalUs;
+        m.maxUs = maxUs;
+        m.score = score;
+        return m;
+    }
+}
+
+class Program {
+    static void Dump(SqliteConnection db, string tag) {
+        List<MetricMinute> rows = db.Select<MetricMinute>()
+            .OrderBy(a => a.path)
+            .ToList();
+        int i = 0;
+        while (i < rows.Count) {
+            MetricMinute m = rows[i];
+            Console.WriteLine(tag + ": " + m.method + " " + m.path
+                + " calls=" + Convert.ToString(m.calls)
+                + " total=" + Convert.ToString(m.totalUs)
+                + " max=" + Convert.ToString(m.maxUs)
+                + " score=" + Convert.ToString(m.score));
+            i = i + 1;
+        }
+    }
+
+    static void Main() {
+        string path = "orm_upsert.tmp.db";
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+
+        // 1. CodeFirst builds the composite primary key
+        db.SyncStructure<MetricMinute>();
+        db.SyncStructure<MetricMinute>();
+
+        // 2. First flush: plain inserts, nothing to merge yet
+        List<MetricMinute> batch = new List<MetricMinute> {
+            MetricMinute.Of(100, "GET", "/a", 2, 300, 200, 1.5),
+            MetricMinute.Of(100, "GET", "/b", 1, 90, 90, 2.5)
+        };
+        Console.WriteLine("ins: " + Convert.ToString(
+            db.Insert<MetricMinute>(batch)
+                .OnConflict(a => new { a.minute, a.method, a.path })
+                .SetIncr(a => a.calls)
+                .SetIncr(a => a.totalUs)
+                .SetMax(a => a.maxUs)
+                .ExecuteAffrows()));
+        Dump(db, "one");
+
+        // 3. Second flush of the same keys: counters accumulate, max_us
+        //    keeps the larger value, score is overwritten
+        List<MetricMinute> again = new List<MetricMinute> {
+            MetricMinute.Of(100, "GET", "/a", 3, 600, 150, 4.5),
+            MetricMinute.Of(100, "GET", "/b", 5, 500, 400, 6.5)
+        };
+        Console.WriteLine("upd: " + Convert.ToString(
+            db.Insert<MetricMinute>(again)
+                .OnConflict(a => new { a.minute, a.method, a.path })
+                .SetIncr(a => a.calls)
+                .SetIncr(a => a.totalUs)
+                .SetMax(a => a.maxUs)
+                .ExecuteAffrows()));
+        Dump(db, "two");
+
+        // 4. The conflict target defaults to the entity primary key
+        Console.WriteLine("dft: " + Convert.ToString(
+            db.Insert<MetricMinute>(MetricMinute.Of(100, "GET", "/a", 1, 10,
+                                                    10, 9.5))
+                .SetIncr(a => a.calls)
+                .SetMin(a => a.maxUs)
+                .ExecuteAffrows()));
+
+        // 5. Keep the stored row untouched when the key already exists
+        Console.WriteLine("nop: " + Convert.ToString(
+            db.Insert<MetricMinute>(MetricMinute.Of(100, "GET", "/a", 77, 77,
+                                                    77, 77.5))
+                .IfExistsDoNothing()
+                .ExecuteAffrows()));
+        Dump(db, "end");
+
+        Console.WriteLine("rows: " + Convert.ToString(
+            db.Select<MetricMinute>().Count()));
+
+        db.Close();
+        File.Delete(path);
+    }
+}

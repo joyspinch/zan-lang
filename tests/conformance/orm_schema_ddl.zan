@@ -1,0 +1,74 @@
+// ORM: a table whose shape is only known at runtime (a table designer, an
+// imported sheet) is created and migrated through DbSchema -- logical column
+// definitions in, dialect-specific DDL out, and the columns the table already
+// has are read back the same way on every engine.
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+class Program {
+    static void Names(List<string> cols, string tag) {
+        string line = tag + ":";
+        for (int i = 0; i < cols.Count; i = i + 1) { line = line + " " + cols[i]; }
+        Console.WriteLine(line);
+    }
+
+    static void Main() {
+        string path = "orm_schema_ddl.tmp.db";
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+
+        Console.WriteLine("exists: " + Convert.ToString(
+            await DbSchema.TableExistsAsync(db, "goods")));
+
+        List<DbColumnDef> defs = new List<DbColumnDef>();
+        defs.Add(DbColumnDef.Identity("id"));
+        defs.Add(DbColumnDef.Of("name", "string").WithSize(64).NotNull());
+        defs.Add(DbColumnDef.Of("price", "decimal").WithDefault("0"));
+        defs.Add(DbColumnDef.Of("note", "text").WithDefault("it's new"));
+
+        Console.WriteLine("created: " + Convert.ToString(
+            await DbSchema.MigrateAsync(db, "goods", defs)));
+        Console.WriteLine("exists: " + Convert.ToString(
+            await DbSchema.TableExistsAsync(db, "goods")));
+        Names(await DbSchema.ColumnsAsync(db, "goods"), "cols");
+
+        // The design grows a column; the table keeps its rows.
+        DbTable t = DbTable.Of(db, "goods");
+        Console.WriteLine("ins: " + Convert.ToString(await t.InsertAsync(
+            new DbValues().Set("name", "apple").Set("price", 1.5))));
+
+        defs.Add(DbColumnDef.Of("stock", "int").WithDefault("7"));
+        Console.WriteLine("added: " + Convert.ToString(
+            await DbSchema.MigrateAsync(db, "goods", defs)));
+        Console.WriteLine("again: " + Convert.ToString(
+            await DbSchema.MigrateAsync(db, "goods", defs)));
+        Names(await DbSchema.ColumnsAsync(db, "goods"), "cols");
+
+        List<string> read = new List<string> { "id", "name", "price", "note",
+                                               "stock" };
+        DbResult r = await t.ReadAsync("id", 1);
+        string line = "row:";
+        for (int i = 0; i < read.Count; i = i + 1) {
+            line = line + " " + read[i] + "=" + r.GetByName(0, read[i]);
+        }
+        Console.WriteLine(line);
+
+        // A name that did not come from the design never reaches the DDL.
+        try {
+            DbColumnDef.Of("x); DROP TABLE goods; --", "int");
+            Console.WriteLine("guard: not rejected");
+        } catch (Exception e) {
+            Console.WriteLine("guard: " + e.Message);
+        }
+
+        await DbSchema.DropTableAsync(db, "goods");
+        Console.WriteLine("exists: " + Convert.ToString(
+            await DbSchema.TableExistsAsync(db, "goods")));
+
+        db.Close();
+        File.Delete(path);
+    }
+}

@@ -537,6 +537,8 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
                                   fsize }, 3, "");
         }
         LLVMValueRef rframe = LLVMBuildBitCast(g->builder, raw, frame_ptr_ty, "frame");
+        int this_owned = 0;
+        zan_type_t *this_owned_type = NULL;
         LLVMBuildStore(g->builder, LLVMConstInt(i32, 0, 0),
             LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_STATE, "st"));
         LLVMBuildStore(g->builder, LLVMConstInt(i32, 0, 0),
@@ -565,9 +567,23 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
              * the frame takes ownership of ARC-managed by-value arguments: it
              * retains here (synchronously, before the caller's release) and
              * releases them from emit_async_complete (see the matching
-             * arc_owned marking on the resume-body param locals). `this`
-             * (k < param_offset) stays a borrow, as in synchronous methods. */
-            if (k >= param_offset) {
+             * arc_owned marking on the resume-body param locals).
+             *
+             * The receiver needs the same treatment: a fluent receiver temp
+             * (`db.Select<T>().Where(..).ToListAsync()`, `Make().RunAsync()`)
+             * is an owned temp the caller releases as soon as the ramp
+             * returns -- before the body has run a single statement -- so a
+             * borrowed `this` would be a use-after-free (unlike a synchronous
+             * method, whose body has already finished by then). */
+            if (k < param_offset) {
+                zan_type_t *rt = type_sym ? type_sym->type : NULL;
+                if (is_rc_managed_type(rt) &&
+                    LLVMGetTypeKind(LLVMTypeOf(pv)) == LLVMPointerTypeKind) {
+                    emit_rc_retain_for_type(g, rt, pv);
+                    this_owned = 1;
+                    this_owned_type = rt;
+                }
+            } else {
                 zan_ast_node_t *pn = member->method_decl.params.items[k - param_offset];
                 if (!pn->param.by_ref) {
                     zan_type_t *pt = resolve_type_ctx(g, pn->param.type);
@@ -671,6 +687,8 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         int saved_handler_next = g->current_async_handler_next;
         int saved_handler_cap = g->current_async_handler_cap;
         int saved_foreach_next = g->current_async_foreach_next;
+        int saved_this_owned = g->current_async_this_owned;
+        zan_type_t *saved_this_owned_type = g->current_async_this_type;
 
         g->current_fn = resume_fn;
         g->current_fn_ret_type = LLVMVoidTypeInContext(g->ctx);
@@ -706,6 +724,8 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_handler_next = 0;
         g->current_async_handler_cap = w->handler_cap;
         g->current_async_foreach_next = 0;
+        g->current_async_this_owned = this_owned;
+        g->current_async_this_type = this_owned_type;
 
         /* arm this invocation's exception trampoline (and re-arm the
          * handlers of the tries the frame is suspended inside) before the
@@ -794,6 +814,8 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_handler_next = saved_handler_next;
         g->current_async_handler_cap = saved_handler_cap;
         g->current_async_foreach_next = saved_foreach_next;
+        g->current_async_this_owned = saved_this_owned;
+        g->current_async_this_type = saved_this_owned_type;
 
         /* ---- cleanup: release owned rc slots from the frame, free it.
          * Mirrors the arc_owned marking above: by-value rc params (the
@@ -810,6 +832,12 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             LLVMValueRef cparam = LLVMGetParam(cleanup_fn, 0);
             LLVMValueRef cframe = LLVMBuildBitCast(g->builder, cparam,
                 frame_ptr_ty, "frame");
+            if (this_owned && this_owned_type) {
+                LLVMValueRef sp = LLVMBuildStructGEP2(g->builder, frame_type,
+                    cframe, (unsigned)ASYNC_FRAME_FIRST_PARAM, "cl.this");
+                emit_rc_release_for_type(g, this_owned_type,
+                    LLVMBuildLoad2(g->builder, param_types[0], sp, "cl.thisv"));
+            }
             for (int k = 0; k < param_count; k++) {
                 zan_ast_node_t *param = member->method_decl.params.items[k];
                 if (param->param.by_ref) continue;

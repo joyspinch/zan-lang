@@ -1,0 +1,208 @@
+using System;
+using System.Data;
+
+namespace System.Data.Orm;
+
+/// <summary>
+/// 运行期成形的表网关：表名与列名在编译期还不知道（代码生成器
+/// 设计出来的表、导入的电子表格、外部库），因此无法用
+/// <c>Select&lt;T&gt;</c> 那样的实体链，但业务代码同样不该去拼 SQL。
+///
+///   DbTable t = DbTable.Of(db, "sys_user");
+///   long total = await t.Query().WhereContains("name", kw).CountAsync();
+///   DbResult rows = await t.Query().WhereContains("name", kw)
+///       .OrderByDesc("id").Page(20, 40).ToResultAsync(cols);
+///   await t.InsertAsync(form);                  // form 是 DbValues
+///   await t.UpdateAsync(form, "id", id);
+///   await t.DeleteAsync("id", id);
+///
+/// 表名与每个列名都按标识符规则校验（<see cref="QueryBuilder"/>
+/// 的 RequireIdent），值一律作为绑定参数，绝不进入 SQL 文本。
+/// SQL 文本由 <see cref="QueryBuilder"/> 生成 —— 调用方只描述
+/// 要读写什么。
+/// </summary>
+class DbTable {
+    IDbConnection conn;
+    string table;
+
+    DbTable(IDbConnection conn, string table) {
+        this.conn = conn;
+        this.table = QueryBuilder.RequireIdent(table);
+    }
+
+    /// <summary>某个连接上的一张运行期表。</summary>
+    static DbTable Of(IDbConnection conn, string table) {
+        return new DbTable(conn, table);
+    }
+
+    /// <summary>表名（已校验）。</summary>
+    string Name() { return this.table; }
+
+    /// <summary>这张表上的一次读取：条件、排序、分页。</summary>
+    DbTableQuery Query() {
+        return new DbTableQuery(this.conn, this.table);
+    }
+
+    /// <summary>按主键读取一行的全部列，没有该行时返回 null。</summary>
+    async DbResult ReadAsync(string keyColumn, long key) {
+        DbTableQuery q = this.Query().WhereEq(keyColumn, key).Limit(1);
+        DbResult r = await q.ToResultAsync();
+        if (r == null || r.RowCount() == 0) { return null; }
+        return r;
+    }
+
+    /// <summary>写入一行动态列，返回写入行数。</summary>
+    async int InsertAsync(DbValues row) {
+        if (row.Count() == 0) { throw new Exception("insert without columns"); }
+        QueryBuilder qb = QueryBuilder.InsertInto(this.table);
+        DbParams ps = new DbParams();
+        for (int i = 0; i < row.Count(); i = i + 1) {
+            qb.SetParam(row.NameAt(i));
+            row.BindTo(ps, i);
+        }
+        return await this.conn.ExecuteAsync(qb.BuildInsertParams(), ps);
+    }
+
+    /// <summary>按主键更新一行的动态列，返回更新行数。</summary>
+    async int UpdateAsync(DbValues row, string keyColumn, long key) {
+        if (row.Count() == 0) { throw new Exception("update without columns"); }
+        QueryBuilder qb = QueryBuilder.Update(this.table);
+        DbParams ps = new DbParams();
+        for (int i = 0; i < row.Count(); i = i + 1) {
+            qb.SetParam(row.NameAt(i));
+            row.BindTo(ps, i);
+        }
+        qb.Where(QueryBuilder.RequireIdent(keyColumn) + " = ?");
+        ps.AddLong(key);
+        return await this.conn.ExecuteAsync(qb.BuildUpdateParams(), ps);
+    }
+
+    /// <summary>按主键删除一行，返回删除行数。</summary>
+    async int DeleteAsync(string keyColumn, long key) {
+        DbTableQuery q = this.Query().WhereEq(keyColumn, key);
+        return await q.ExecuteDeleteAsync();
+    }
+}
+
+/// <summary>
+/// <see cref="DbTable"/> 上的一次读取：条件、排序、分页都用列名
+/// 描述，执行时才由 <see cref="QueryBuilder"/> 变成参数化 SQL。
+/// </summary>
+class DbTableQuery {
+    IDbConnection conn;
+    QueryBuilder qb;
+    int limitVal;
+    int offsetVal;
+
+    DbTableQuery(IDbConnection conn, string table) {
+        this.conn = conn;
+        this.qb = QueryBuilder.From(table);
+        this.limitVal = 0 - 1;
+        this.offsetVal = 0 - 1;
+    }
+
+    /// <summary>column = 文本值。</summary>
+    DbTableQuery WhereEq(string column, string val) {
+        this.qb.WhereEq(column, val);
+        return this;
+    }
+
+    /// <summary>column = 整数值。</summary>
+    DbTableQuery WhereEq(string column, long val) {
+        this.qb.WhereEqLong(column, val);
+        return this;
+    }
+
+    /// <summary>column >= 整数值。</summary>
+    DbTableQuery WhereGe(string column, long val) {
+        this.qb.WhereGeLong(column, val);
+        return this;
+    }
+
+    /// <summary>column &lt;= 整数值。</summary>
+    DbTableQuery WhereLe(string column, long val) {
+        this.qb.WhereLeLong(column, val);
+        return this;
+    }
+
+    /// <summary>column LIKE %val%（子串匹配）。</summary>
+    DbTableQuery WhereContains(string column, string val) {
+        this.qb.WhereContains(column, val);
+        return this;
+    }
+
+    /// <summary>DbValues 里的每一列都按等值匹配（提交上来的
+    /// 筛选表单原样交给 ORM）。</summary>
+    DbTableQuery WhereDict(DbValues cond) {
+        for (int i = 0; i < cond.Count(); i = i + 1) {
+            this.qb.WhereValueAt(cond, i);
+        }
+        return this;
+    }
+
+    /// <summary>升序排序。</summary>
+    DbTableQuery OrderBy(string column) {
+        this.qb.OrderBy(column);
+        return this;
+    }
+
+    /// <summary>降序排序。</summary>
+    DbTableQuery OrderByDesc(string column) {
+        this.qb.OrderByDesc(column);
+        return this;
+    }
+
+    /// <summary>最多读多少行。</summary>
+    DbTableQuery Limit(int count) {
+        this.limitVal = count;
+        return this;
+    }
+
+    /// <summary>跳过多少行。</summary>
+    DbTableQuery Offset(int count) {
+        this.offsetVal = count;
+        return this;
+    }
+
+    /// <summary>一页：take 行，跳过 skip 行。</summary>
+    DbTableQuery Page(int take, int skip) {
+        return this.Limit(take).Offset(skip);
+    }
+
+    /// <summary>符合条件的行数（分页不参与计数）。</summary>
+    async long CountAsync() {
+        string text = await this.conn.ExecuteScalarAsync(
+            this.qb.BuildSelectParams("COUNT(*)"), this.qb.SelectParams());
+        if (text == null || text.Length == 0) { return 0; }
+        return Convert.ToInt64(text);
+    }
+
+    /// <summary>读取全部列。</summary>
+    async DbResult ToResultAsync() {
+        return await this.run("*");
+    }
+
+    /// <summary>只读取列出的列（每个列名都会校验）。</summary>
+    async DbResult ToResultAsync(List<string> columns) {
+        if (columns == null || columns.Count == 0) { return await this.run("*"); }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < columns.Count; i = i + 1) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append(QueryBuilder.RequireIdent(columns[i]));
+        }
+        return await this.run(sb.ToString());
+    }
+
+    /// <summary>删除符合条件的行，返回删除行数。</summary>
+    async int ExecuteDeleteAsync() {
+        return await this.conn.ExecuteAsync(this.qb.BuildDeleteParams(),
+                                           this.qb.SelectParams());
+    }
+
+    async DbResult run(string columns) {
+        if (this.limitVal >= 0) { this.qb.Limit(this.limitVal); }
+        if (this.offsetVal >= 0) { this.qb.Offset(this.offsetVal); }
+        return await this.conn.QueryAsync(this.qb.BuildSelectParams(columns),
+                                         this.qb.SelectParams());
+    }
+}

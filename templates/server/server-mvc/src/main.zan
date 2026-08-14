@@ -15,6 +15,9 @@ using System.Web;
 class Program {
     // Slow-request threshold (ms), loaded from [log].slowMs at startup.
     static int slowMs = 1000;
+    // Slow-statement threshold, in MICROSECONDS: [log].slowSqlMs converted once
+    // here, because every statement is compared against it.
+    static long slowSqlUs = 200000;
 
     static void Main() {
         // config/, views/, wwwroot/ and the databases are read by relative path,
@@ -23,6 +26,22 @@ class Program {
         // (macOS hands a bundle the root directory) or started from elsewhere.
         bool _cd = ProcessHost.UseAppDir("config/app.json");
         Cfg.Load("config/app.json");
+
+        // Logging goes to a FILE before anything else can go wrong: a worker is
+        // a background process (and on Windows may have no console at all), so
+        // a line printed to stdout is a line nobody will ever read. One file a
+        // day for the whole pool -- logs/{yyyyMM}/{dd}.log by default, the same
+        // file the master writes its supervision records to -- so what the
+        // application logged and what happened to the process that logged it sit
+        // next to each other, in order.
+        if (Cfg.Log.dir.Length > 0) {
+            int level = Log.INFO;
+            if (Cfg.Log.debug) { level = Log.DEBUG; }
+            Log.Configure(Cfg.Log.dir, Cfg.Log.pattern, level);
+            // The console echo would double every line in a worker, whose
+            // stdout is already redirected into that same file.
+            Log.EchoToConsole(Cfg.Log.debug);
+        }
 
         // ---- assemble + inject dependencies ----
         // Every worker is its own process re-running Main, so each builds its
@@ -112,7 +131,14 @@ class Program {
             app.Before(Program.AccessLog);
         }
         Program.slowMs = Cfg.Log.slowMs;
+        Program.slowSqlUs = (long)Cfg.Log.slowSqlMs * 1000;
         app.After(Program.Metrics);
+        // Every statement the application runs is timed and reported here: the
+        // pool leases go out wrapped (DbContext.Acquire), so this covers the
+        // DAOs, the ORM and the code generator's output whatever the driver is,
+        // with no stopwatch at any call site.
+        ServerMetrics.Global().SlowQueryMs(Cfg.Log.slowSqlMs);
+        DbTrace.Sink(Program.SqlTrace);
         // Errors always persist -- to the log file and, so the backend screen
         // can query them, to metrics.db. The console echo is a debug
         // convenience, off in production and toggleable at runtime.
@@ -174,6 +200,28 @@ class Program {
     }
 
     // ---- hooks ----
+
+    /// <summary>One finished statement: `us` is MICROSECONDS.
+    ///
+    /// Three destinations, one measurement: the live monitor's query counters,
+    /// the day's per-statement archive in metrics.db (accumulated in memory and
+    /// written by the flusher, never per query), and -- only when it was slow --
+    /// a line in the log file, which is where an operator looks after the fact.
+    ///
+    /// What is recorded is the NORMALIZED statement: literals collapse to `?`,
+    /// so every execution of one query lands on one row, and no value a caller
+    /// typed (an address, a token, the password being checked) is written to the
+    /// archive or the log.</summary>
+    static void SqlTrace(string sql, long us) {
+        ServerMetrics.Global().RecordQuery(sql, us);
+        string norm = ServerMetrics.NormalizeSql(sql);
+        if (norm.Length > 200) { norm = norm.Substring(0, 200); }
+        bool slow = us >= Program.slowSqlUs;
+        MetricsStore.RecordSql(norm, us, slow);
+        if (slow) {
+            Log.Warn("[slow-sql] " + Convert.ToString(us) + "us " + norm);
+        }
+    }
 
     static bool AccessLog(HttpContext ctx) {
         Console.WriteLine("[req] " + ctx.method + " " + ctx.path);

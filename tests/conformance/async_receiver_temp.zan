@@ -1,0 +1,46 @@
+// The receiver of an awaited call may be a temporary the caller drops as soon
+// as the ramp returns -- long before the coroutine body runs (fluent builders:
+// `Make(..).Where(..).RunAsync()`). The frame therefore owns a +1 on `this`,
+// retained by the ramp and released at completion; without it the body reads a
+// freed receiver (garbage fields / crash).
+using System;
+
+class Leaf {
+    int v;
+    string tag;
+    Leaf(int v, string tag) { this.v = v; this.tag = tag; }
+    Leaf Scale(int k) { return new Leaf(this.v * k, this.tag); }
+    async long SumAsync(long extra) { return (long)this.v + extra; }
+    async string TagAsync() { return this.tag + ":" + Convert.ToString(this.v); }
+}
+
+class Box {
+    Leaf leaf;
+    Box(Leaf leaf) { this.leaf = leaf; }
+    Leaf Get() { return this.leaf; }
+
+    static Leaf Make(int v) { return new Leaf(v, "leaf"); }
+
+    // a temp receiver inside an async body: crosses the suspension too
+    static async long ChainAsync() {
+        long a = await Box.Make(3).SumAsync(1);
+        long b = await Box.Make(5).Scale(2).SumAsync(0);
+        return a + b;
+    }
+}
+
+class Program {
+    static void Main() {
+        // owned temp receiver at a non-async root
+        Console.WriteLine(Convert.ToString(await Box.Make(7).SumAsync(1)));
+        Console.WriteLine(await Box.Make(4).Scale(3).TagAsync());
+        // borrowed receivers keep working (local, field access)
+        Leaf keep = Box.Make(2);
+        Console.WriteLine(Convert.ToString(await keep.SumAsync(10)));
+        Box b = new Box(keep);
+        Console.WriteLine(Convert.ToString(await b.Get().SumAsync(20)));
+        Console.WriteLine(Convert.ToString(await Box.ChainAsync()));
+        // the receiver survives the whole await chain
+        Console.WriteLine(Convert.ToString(await keep.SumAsync(0)));
+    }
+}

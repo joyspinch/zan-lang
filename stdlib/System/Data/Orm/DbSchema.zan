@@ -1,0 +1,272 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Text;
+
+namespace System.Data.Orm;
+
+/// <summary>一列的逻辑定义：列名、逻辑类型、宽度、可空性、默认值，
+/// 以及它是不是自增主键。逻辑类型是引擎无关的词汇
+/// （`int` / `long` / `bool` / `datetime` / `decimal` / `string` / `text`），
+/// 具体落到哪个物理类型由 <see cref="DbSchema"/> 按 provider 决定 ——
+/// 运行期才知道形状的表（表设计器、数据字典）这样建表，业务代码
+/// 就不必知道自己跑在谁上面，也不必拼 DDL。</summary>
+class DbColumnDef {
+    string name;
+    string kind;
+    int size;
+    bool nullable;
+    bool identity;
+    string defText;
+
+    DbColumnDef(string name, string kind) {
+        this.name = QueryBuilder.RequireIdent(name);
+        this.kind = kind;
+        this.size = 0;
+        this.nullable = true;
+        this.identity = false;
+        this.defText = "";
+    }
+
+    /// <summary>一个普通列。</summary>
+    static DbColumnDef Of(string name, string kind) {
+        return new DbColumnDef(name, kind);
+    }
+
+    /// <summary>自增整型主键列（每家方言写法不同，这里只表达意图）。</summary>
+    static DbColumnDef Identity(string name) {
+        DbColumnDef c = new DbColumnDef(name, "int");
+        c.identity = true;
+        c.nullable = false;
+        return c;
+    }
+
+    /// <summary>字符串列的宽度（其余类型忽略；&lt;= 0 表示按默认 255）。</summary>
+    DbColumnDef WithSize(int n) { this.size = n; return this; }
+
+    /// <summary>可空性。</summary>
+    DbColumnDef WithNull(bool ok) { this.nullable = ok; return this; }
+
+    /// <summary>NOT NULL。</summary>
+    DbColumnDef NotNull() { this.nullable = false; return this; }
+
+    /// <summary>默认值，按逻辑类型校验后写成字面量：数值类型只接受
+    /// 数字，其余按文本加引号（引号翻倍）。无法用作字面量时忽略。
+    /// DDL 里没有参数占位，默认值只能内联，所以这一步的校验就是
+    /// 这里唯一的防线。</summary>
+    DbColumnDef WithDefault(string v) { this.defText = v; return this; }
+
+    /// <summary>列名（构造时已通过标识符校验）。</summary>
+    string Name() { return this.name; }
+}
+
+/// <summary>
+/// 库表层面的内省与运维动作：一张表在不在、有哪些列、改个名、丢掉、
+/// 以及 SQLite 的写前日志。CodeFirst（`SyncStructure&lt;T&gt;()`）负责
+/// 让实体对应的表长成实体的样子，这里补的是它管不到的那一半：一个
+/// 更早版本留下的表要不要让路、一个诊断库要不要开 WAL。
+///
+/// 为什么在标准库而不是业务里：这些语句每家方言都不一样（SQLite 问
+/// `sqlite_master` 和 `PRAGMA`，别家问 `information_schema`），业务
+/// 代码不该知道自己跑在谁上面，也不该自己拼语句。表名一律按标识符
+/// 校验后才进语句，其余全部走参数。
+/// </summary>
+class DbSchema {
+    /// <summary>表的列名，顺序同表定义；表不存在时是空列表。</summary>
+    static async List<string> ColumnsAsync(IDbExecutor db, string table) {
+        List<string> cols = new List<string>();
+        string t = QueryBuilder.RequireIdent(table);
+        int p = db.GetProvider();
+        DbResult r;
+        int nameCol = 0;
+        if (p == DbProvider.SQLite) {
+            r = await db.QueryAsync("PRAGMA table_info(" + t + ")");
+            nameCol = 1;
+        } else {
+            r = await db.QueryAsync(
+                "SELECT column_name FROM information_schema.columns "
+                + "WHERE table_name = ?", new DbParams().Add(t));
+        }
+        for (int i = 0; i < r.RowCount(); i = i + 1) {
+            cols.Add(r.GetString(i, nameCol));
+        }
+        return cols;
+    }
+
+    /// <summary>该表是否有这一列。</summary>
+    static async bool HasColumnAsync(IDbExecutor db, string table,
+                                     string column) {
+        List<string> cols = await DbSchema.ColumnsAsync(db, table);
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            if (cols[i] == column) { return true; }
+        }
+        return false;
+    }
+
+    /// <summary>该表是否有其中任意一列。一个换过形状的旧表就是这么认出
+    /// 来的：它带着新实体里已经没有的列。</summary>
+    static async bool HasAnyColumnAsync(IDbExecutor db, string table,
+                                        List<string> columns) {
+        List<string> cols = await DbSchema.ColumnsAsync(db, table);
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            for (int k = 0; k < columns.Count; k = k + 1) {
+                if (cols[i] == columns[k]) { return true; }
+            }
+        }
+        return false;
+    }
+
+    /// <summary>表是否存在。</summary>
+    static async bool TableExistsAsync(IDbExecutor db, string table) {
+        int p = db.GetProvider();
+        string sql = "SELECT COUNT(*) FROM information_schema.tables "
+            + "WHERE table_name = ?";
+        if (p == DbProvider.SQLite) {
+            sql = "SELECT COUNT(*) FROM sqlite_master "
+                + "WHERE type = 'table' AND name = ?";
+        }
+        DbResult r = await db.QueryAsync(sql, new DbParams().Add(table));
+        if (r.RowCount() == 0) { return false; }
+        return r.GetInt(0, 0) > 0;
+    }
+
+    /// <summary>逻辑类型在该 provider 上的物理类型。</summary>
+    static string SqlType(string kind, int size, int provider) {
+        bool sqlite = provider == DbProvider.SQLite;
+        if (kind == "int" || kind == "bool") {
+            if (sqlite) { return "INTEGER"; }
+            return "INT";
+        }
+        if (kind == "long" || kind == "datetime") {
+            if (sqlite) { return "INTEGER"; }
+            return "BIGINT";
+        }
+        if (kind == "decimal" || kind == "double") {
+            if (sqlite) { return "REAL"; }
+            return "DECIMAL(18,4)";
+        }
+        if (kind == "text") { return "TEXT"; }
+        int n = size;
+        if (n <= 0) { n = 255; }
+        if (sqlite) { return "TEXT"; }
+        return "VARCHAR(" + Convert.ToString(n) + ")";
+    }
+
+    /// <summary>默认值的字面量，无法安全内联时是空串。</summary>
+    static string DefaultLiteral(DbColumnDef c) {
+        string v = c.defText;
+        if (v.Length == 0) { return ""; }
+        if (c.kind == "int" || c.kind == "long" || c.kind == "bool"
+            || c.kind == "decimal" || c.kind == "double"
+            || c.kind == "datetime") {
+            for (int i = 0; i < v.Length; i = i + 1) {
+                string ch = v.Substring(i, 1);
+                bool digit = ch >= "0" && ch <= "9";
+                if (!digit && ch != "-" && ch != ".") { return ""; }
+            }
+            return v;
+        }
+        return "'" + QueryBuilder.EscapeString(v) + "'";
+    }
+
+    /// <summary>一列的 DDL 片段。</summary>
+    static string ColumnSql(DbColumnDef c, int provider) {
+        if (c.identity) {
+            if (provider == DbProvider.SQLite) {
+                return c.name + " INTEGER PRIMARY KEY AUTOINCREMENT";
+            }
+            if (provider == DbProvider.PostgreSQL
+                || provider == DbProvider.Kingbase
+                || provider == DbProvider.OpenGauss) {
+                return c.name + " SERIAL PRIMARY KEY";
+            }
+            return c.name + " INT NOT NULL AUTO_INCREMENT PRIMARY KEY";
+        }
+        string sql = c.name + " " + DbSchema.SqlType(c.kind, c.size, provider);
+        if (!c.nullable) { sql = sql + " NOT NULL"; }
+        string lit = DbSchema.DefaultLiteral(c);
+        if (lit.Length > 0) { sql = sql + " DEFAULT " + lit; }
+        return sql;
+    }
+
+    /// <summary>建表语句（列顺序即给定顺序；表已存在时不报错）。</summary>
+    static string CreateTableSql(string table, List<DbColumnDef> cols,
+                                 int provider) {
+        string t = QueryBuilder.RequireIdent(table);
+        StringBuilder b = new StringBuilder();
+        b.Append("CREATE TABLE IF NOT EXISTS ");
+        b.Append(t);
+        b.Append(" (");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            if (i > 0) { b.Append(", "); }
+            b.Append(DbSchema.ColumnSql(cols[i], provider));
+        }
+        b.Append(")");
+        return b.ToString();
+    }
+
+    /// <summary>按逻辑列定义建表。形状在运行期才知道的表（表设计器、
+    /// 数据字典）走这里，业务代码不必拼 DDL，也不必分方言。</summary>
+    static async void CreateTableAsync(IDbExecutor db, string table,
+                                       List<DbColumnDef> cols) {
+        if (cols.Count == 0) { throw new Exception("create table without columns"); }
+        int _n = await db.ExecuteAsync(
+            DbSchema.CreateTableSql(table, cols, db.GetProvider()));
+    }
+
+    /// <summary>给已有表加一列（不改类型、不删列 —— 那会丢数据）。
+    /// </summary>
+    static async void AddColumnAsync(IDbExecutor db, string table,
+                                     DbColumnDef col) {
+        string t = QueryBuilder.RequireIdent(table);
+        int _n = await db.ExecuteAsync("ALTER TABLE " + t + " ADD COLUMN "
+            + DbSchema.ColumnSql(col, db.GetProvider()));
+    }
+
+    /// <summary>把设计里有、表里没有的列补上，返回补了几列；表还不
+    /// 存在时先建表，返回列数。列永不删除、永不改类型。</summary>
+    static async int MigrateAsync(IDbExecutor db, string table,
+                                  List<DbColumnDef> cols) {
+        List<string> have = await DbSchema.ColumnsAsync(db, table);
+        if (have.Count == 0) {
+            await DbSchema.CreateTableAsync(db, table, cols);
+            return cols.Count;
+        }
+        int added = 0;
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            DbColumnDef c = cols[i];
+            bool found = false;
+            for (int j = 0; j < have.Count; j = j + 1) {
+                if (have[j] == c.name) { found = true; }
+            }
+            if (found) { continue; }
+            await DbSchema.AddColumnAsync(db, table, c);
+            added = added + 1;
+        }
+        return added;
+    }
+
+    /// <summary>把一张表改名（目标名已被占用时先丢掉目标）。</summary>
+    static async void RenameTableAsync(IDbExecutor db, string from,
+                                       string to) {
+        string a = QueryBuilder.RequireIdent(from);
+        string b = QueryBuilder.RequireIdent(to);
+        await DbSchema.DropTableAsync(db, b);
+        int _n = await db.ExecuteAsync("ALTER TABLE " + a + " RENAME TO " + b);
+    }
+
+    /// <summary>丢掉一张表（不存在也不报错）。</summary>
+    static async void DropTableAsync(IDbExecutor db, string table) {
+        string t = QueryBuilder.RequireIdent(table);
+        int _n = await db.ExecuteAsync("DROP TABLE IF EXISTS " + t);
+    }
+
+    /// <summary>SQLite 的写前日志：写的人不再挡住读的人。别的 provider
+    /// 上是空操作 —— 日志形态是它们自己的服务端配置，不是连接属性。
+    /// </summary>
+    static async void UseWriteAheadLogAsync(IDbExecutor db) {
+        if (db.GetProvider() != DbProvider.SQLite) { return; }
+        int _j = await db.ExecuteAsync("PRAGMA journal_mode=WAL");
+        int _s = await db.ExecuteAsync("PRAGMA synchronous=NORMAL");
+    }
+}

@@ -427,20 +427,22 @@ class ServerMetrics {
     /// operator can turn off. Empty path disables the file sink.
     ///
     /// The path is a pattern expanded per write by <see cref="Log.Expand"/>:
-    /// {yyyy} {MM} {dd} {HH} {pid} {wid}. `logs/error-{yyyy}{MM}{dd}.log`
-    /// therefore starts a new file each day and `-w{wid}` keeps workers from
-    /// interleaving into one file. A path without tokens behaves as before:
-    /// one file that grows forever.</summary>
+    /// {yyyy} {MM} {dd} {HH} {pid} {wid}, and it may contain directories --
+    /// missing ones are created. `logs/{yyyy}{MM}/{dd}.log` is the file the
+    /// master and every worker already log into, so an error and whatever
+    /// happened to the process that raised it are read in one place; each record
+    /// is open-append-close, so sharing the file needs no {wid} of its own. A
+    /// path without tokens behaves as before: one file that grows
+    /// forever.</summary>
     ServerMetrics ErrorLog(string path, bool debugConsole) {
         this.errLogPath = path;
         this.errDebug = debugConsole;
+        // The directory of the EXPANDED name: a pattern whose directory part
+        // carries a token (`logs/{yyyy}{MM}/{dd}.log`) would otherwise create a
+        // directory literally called "{yyyy}{MM}" and never the one the write
+        // needs. Recursive, so a nested pattern works on a fresh deployment.
         if (path.Length > 0) {
-            int cut = 0 - 1;
-            for (int i = 0; i < path.Length; i = i + 1) {
-                string ch = path.Substring(i, 1);
-                if (ch == "/" || ch == "\\") { cut = i; }
-            }
-            if (cut > 0) { Directory.CreateDirectory(path.Substring(0, cut)); }
+            Log.EnsureDirFor(Log.Expand(path, DateTime.Now()));
         }
         return this;
     }
@@ -452,7 +454,11 @@ class ServerMetrics {
     // any hot path; the request path never touches disk.
     void AppendErrLine(string line) {
         if (this.errLogPath.Length == 0) { return; }
-        nint fp = fopen(Log.Expand(this.errLogPath, DateTime.Now()), "ab");
+        string path = Log.Expand(this.errLogPath, DateTime.Now());
+        // Per write, because a dated pattern moves into a directory that does
+        // not exist yet on the first of the month.
+        Log.EnsureDirFor(path);
+        nint fp = fopen(path, "ab");
         if (fp == 0) { return; }
         long _w = fwrite(line, 1, line.Length, fp);
         int _c = fclose(fp);

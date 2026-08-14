@@ -1,0 +1,91 @@
+// ORM: a table whose name and columns are only known at runtime (designed by
+// the code generator, imported from a sheet) is still read and written through
+// the ORM -- DbTable takes column names and DbValues, builds the parameterised
+// SQL itself, and rejects anything that is not an identifier.
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+class Program {
+    static void Show(DbResult r, string tag, List<string> cols) {
+        if (r == null) { Console.WriteLine(tag + ": null"); return; }
+        for (int i = 0; i < r.RowCount(); i = i + 1) {
+            string line = tag + ":";
+            for (int k = 0; k < cols.Count; k = k + 1) {
+                line = line + " " + cols[k] + "=" + r.GetByName(i, cols[k]);
+            }
+            Console.WriteLine(line);
+        }
+    }
+
+    static void Main() {
+        string path = "orm_runtime_table.tmp.db";
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+        // The table itself is created by the design/migration step; here it is
+        // the fixture the runtime gateway then works over.
+        db.Execute("CREATE TABLE goods (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            + " name TEXT, price REAL, stock INTEGER)");
+
+        DbTable t = DbTable.Of(db, "goods");
+        List<string> cols = new List<string> { "id", "name", "price", "stock" };
+
+        Console.WriteLine("ins: " + Convert.ToString(await t.InsertAsync(
+            new DbValues().Set("name", "apple").Set("price", 1.5)
+                .Set("stock", 10))));
+        Console.WriteLine("ins: " + Convert.ToString(await t.InsertAsync(
+            new DbValues().Set("name", "banana").Set("price", 2.5)
+                .Set("stock", 20))));
+        Console.WriteLine("ins: " + Convert.ToString(await t.InsertAsync(
+            new DbValues().Set("name", "apple pie").Set("price", 9.0)
+                .Set("stock", 3))));
+
+        Console.WriteLine("all: " + Convert.ToString(
+            await t.Query().CountAsync()));
+        Console.WriteLine("like: " + Convert.ToString(
+            await t.Query().WhereContains("name", "apple").CountAsync()));
+
+        Show(await t.Query().OrderByDesc("id").Page(2, 0).ToResultAsync(cols),
+             "page1", cols);
+        Show(await t.Query().OrderByDesc("id").Page(2, 2).ToResultAsync(cols),
+             "page2", cols);
+
+        List<string> two = new List<string> { "name", "stock" };
+        Show(await t.Query().WhereGe("stock", 10).OrderBy("name")
+                 .ToResultAsync(two), "stocked", two);
+
+        // A filter form arrives as a bag of runtime values.
+        DbValues filter = new DbValues().Set("name", "banana");
+        Show(await t.Query().WhereDict(filter).ToResultAsync(two), "filter", two);
+
+        Console.WriteLine("upd: " + Convert.ToString(await t.UpdateAsync(
+            new DbValues().Set("price", "7.5").Set("stock", "1"), "id", 1)));
+        Show(await t.ReadAsync("id", 1), "read", cols);
+        Console.WriteLine("missing: " + Convert.ToString(
+            await t.ReadAsync("id", 999) == null));
+
+        Console.WriteLine("del: " + Convert.ToString(await t.DeleteAsync("id", 2)));
+        Console.WriteLine("left: " + Convert.ToString(
+            await t.Query().CountAsync()));
+
+        // Identifiers are checked, so a column name that did not come from the
+        // design never reaches the database.
+        try {
+            await t.Query().WhereEq("name = 1 OR 1", "x").CountAsync();
+            Console.WriteLine("guard: not rejected");
+        } catch (Exception e) {
+            Console.WriteLine("guard: " + e.Message);
+        }
+        try {
+            DbTable.Of(db, "goods; DROP TABLE goods");
+            Console.WriteLine("table: not rejected");
+        } catch (Exception e2) {
+            Console.WriteLine("table: " + e2.Message);
+        }
+
+        db.Close();
+        File.Delete(path);
+    }
+}

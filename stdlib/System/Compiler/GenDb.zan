@@ -28,6 +28,7 @@ class DbField {
     string Col;
     bool IsPk;
     bool IsIdent;
+    bool IdentSet;  // IsIdentity 是显式写出来的(而不是按主键推断)
     bool NotNull;
     int StrLen;
 }
@@ -42,6 +43,7 @@ class GenDb {
     static int RwCount;                       // 已发出的重写指令数(链登记用)
     static bool Any;
     static bool SyncAll;
+    static List<JsonValue> Projs;             // 聚合/列投影形状(生成 Pj<N>)
 
     // ---- 类/枚举查找 ----
 
@@ -123,6 +125,11 @@ class GenDb {
         return n == "double" || n == "float" || n == "decimal";
     }
 
+    /// 声明类型是否是 64 位整数(列走 BIGINT 与 64 位绑定/读取)。
+    static bool Is64(string type) {
+        return type == "long" || type == "ulong" || type == "nint";
+    }
+
     static int ClassifyKind(string type) {
         if (GenDb.IsIntName(type)) { return 0; }
         if (GenDb.IsFloatName(type)) { return 1; }
@@ -141,6 +148,17 @@ class GenDb {
     static List<DbField> FieldsOf(string cls, int depth) {
         List<DbField> outl = new List<DbField>();
         GenDb.FieldsInto(cls, depth, outl);
+        /* 复合主键里没有自增列:单列整数主键才按 identity 推断,
+         * 多列主键各自都是普通列(除非实体显式写了 IsIdentity) */
+        int pks = 0;
+        for (int i = 0; i < outl.Count; i = i + 1) {
+            if (outl[i].IsPk) { pks = pks + 1; }
+        }
+        if (pks > 1) {
+            for (int i = 0; i < outl.Count; i = i + 1) {
+                if (!outl[i].IdentSet) { outl[i].IsIdent = false; }
+            }
+        }
         return outl;
     }
 
@@ -169,6 +187,7 @@ class GenDb {
             string cn = GenDb.AttrStr(ca, "Name");
             df.Col = cn.Length > 0 ? cn : df.Name;
             df.IsPk = GenDb.AttrBool(ca, "IsPrimary", df.Name == "id");
+            df.IdentSet = GenDb.AttrArg(ca, "IsIdentity") != null;
             df.IsIdent = GenDb.AttrBool(ca, "IsIdentity",
                                         df.IsPk && df.Kind == 0);
             df.NotNull = !GenDb.AttrBool(ca, "IsNullable", !df.IsPk);
@@ -188,6 +207,22 @@ class GenDb {
         JsonValue decl = GenDb.ClassGet(cls);
         string n = GenDb.AttrStr(GenDb.AttrOf(decl, "Table"), "Name");
         return n.Length > 0 ? n : cls;
+    }
+
+    /// 实体上的 `[Index(Name = "...", Fields = "a,b", IsUnique = true)]`,
+    /// 按声明顺序;一个实体可以带多条。
+    static List<JsonValue> IndexAttrs(string cls) {
+        List<JsonValue> outl = new List<JsonValue>();
+        JsonValue decl = GenDb.ClassGet(cls);
+        if (decl == null) { return outl; }
+        JsonValue attrs = decl.Get("attrs");
+        if (attrs == null || !attrs.IsArray()) { return outl; }
+        for (int i = 0; i < attrs.Count(); i = i + 1) {
+            JsonValue a = attrs.At(i);
+            if (a == null) { continue; }
+            if (a.Str("name", "") == "Index") { outl.Add(a); }
+        }
+        return outl;
     }
 
     static bool IsTableEntity(string cls) {
@@ -500,7 +535,7 @@ class GenDb {
 
     static void WfCol(Wf w, DbField f) {
         GenDb.WfText(w, "t.");
-        GenDb.WfText(w, f.Name);
+        GenDb.WfText(w, f.Col);
     }
 
     /// 字面量/字段类型匹配(编译期)。不匹配返回消息,匹配返回 ""。
@@ -550,7 +585,7 @@ class GenDb {
         if (!GenDb.CheckValueType(w, f, e)) { return; }
         GenDb.WfText(w, "?");
         if (f.Kind == 0) {
-            GenDb.WfBind(w, 1, e);
+            GenDb.WfBind(w, GenDb.Is64(f.TypeName) ? 6 : 1, e);
         } else if (f.Kind == 4) {
             GenDb.WfBind(w, 1, GenDb.TreeCast("int", e));
         } else if (f.Kind == 1) {
@@ -638,6 +673,8 @@ class GenDb {
         if (kind == 3) { return "InI"; }
         if (kind == 4) { return "InS"; }
         if (kind == 5) { return "InD"; }
+        if (kind == 6) { return "Pl"; }
+        if (kind == 7) { return "InL"; }
         return "P";
     }
 
@@ -681,7 +718,9 @@ class GenDb {
                     GenDb.TreeMem(GenDb.TreeId("__DbBind"), "M"),
                     GenDb.TreeMem(list, "Count")));
                 GenDb.WfText(w, ")");
-                if (inner.Kind == 0 || inner.Kind == 4) {
+                if (inner.Kind == 0 && GenDb.Is64(inner.TypeName)) {
+                    GenDb.WfBind(w, 7, list);
+                } else if (inner.Kind == 0 || inner.Kind == 4) {
                     GenDb.WfBind(w, 3, list);
                 } else if (inner.Kind == 3) {
                     GenDb.WfBind(w, 4, list);
@@ -804,7 +843,9 @@ class GenDb {
                 GenDb.TreeMem(GenDb.TreeId("__DbBind"), "M"),
                 GenDb.TreeMem(arg1, "Count")));
             GenDb.WfText(w, ")");
-            if (col.Kind == 0 || col.Kind == 4) {
+            if (col.Kind == 0 && GenDb.Is64(col.TypeName)) {
+                GenDb.WfBind(w, 7, arg1);
+            } else if (col.Kind == 0 || col.Kind == 4) {
                 GenDb.WfBind(w, 3, arg1);
             } else if (col.Kind == 3) {
                 GenDb.WfBind(w, 4, arg1);
@@ -1388,7 +1429,11 @@ class GenDb {
         string m = "";
         JsonValue arg = val;
         if (col.Kind == 0) {
-            m = incr ? "SetIncrI" : "SetI";
+            if (GenDb.Is64(col.TypeName)) {
+                m = incr ? "SetIncrL" : "SetL";
+            } else {
+                m = incr ? "SetIncrI" : "SetI";
+            }
         } else if (col.Kind == 4) {
             m = incr ? "SetIncrI" : "SetI";
             arg = GenDb.TreeCast("int", val);
@@ -1427,6 +1472,7 @@ class GenDb {
         }
         bool asInt = col.Kind == 0 && fn != "AVG";
         string m = asInt ? "AggI" : "AggD";
+        if (asInt && GenDb.Is64(col.TypeName)) { m = "AggL"; }
         JsonValue ops = JsonValue.NewArray();
         ops.Append(GenDb.OneOp(m, GenDb.TreeStr(fn + "(t." + col.Col + ")")));
         JsonValue op = GenDb.NewOp("db_chain", call);
@@ -1447,6 +1493,54 @@ class GenDb {
         JsonValue op = GenDb.NewOp("db_chain", call);
         op.Put("ops", ops);
         GenDb.AddRewrite(op);
+    }
+
+    /// GroupBy 的标量表达式 -> 运行时拼出 SQL 片段的树:
+    /// `a => a.minute / step * step` 变成
+    /// `"(t.minute / " + Convert.ToString(step) + " * " + ... + ")"`。
+    /// 列出自实体字段,数值出自业务侧的整数表达式(由 ORM 自己格式化成
+    /// 十进制,业务侧仍然不出现 SQL)。不是这个形状时返回 null。
+    static JsonValue GbTree(JsonValue e, string pname, List<DbField> fields,
+                            out bool anyCol) {
+        anyCol = false;
+        if (e == null) { return null; }
+        string k = e.Str("k", "");
+        if (k == "mem") {
+            JsonValue o = e.Get("o");
+            if (o != null && o.Str("k", "") == "id" &&
+                o.Str("n", "") == pname) {
+                DbField f = GenDb.FieldFind(fields, e.Str("n", ""));
+                if (f == null || f.Kind != 0) { return null; }
+                anyCol = true;
+                return GenDb.TreeStr("t." + f.Col);
+            }
+        }
+        if (k == "bin") {
+            string op = e.Str("op", "");
+            if (op != "+" && op != "-" && op != "*" && op != "/" &&
+                op != "%") {
+                return null;
+            }
+            bool lc = false;
+            bool rc = false;
+            JsonValue l = GenDb.GbTree(e.Get("l"), pname, fields, out lc);
+            JsonValue r = GenDb.GbTree(e.Get("r"), pname, fields, out rc);
+            if (l == null || r == null) { return null; }
+            anyCol = lc || rc;
+            /* ("(" + L) + " op " + R + ")" */
+            JsonValue t = GenDb.TreeBin("+", GenDb.TreeStr("("), l);
+            t = GenDb.TreeBin("+", t, GenDb.TreeStr(" " + op + " "));
+            t = GenDb.TreeBin("+", t, r);
+            return GenDb.TreeBin("+", t, GenDb.TreeStr(")"));
+        }
+        /* 业务侧的整数值(字面量、局部变量、字段、调用…):
+         * Convert.ToString(v) 由生成侧格式化 */
+        if (GenDb.MentionsParam(e, pname)) { return null; }
+        if (k == "lit" && e.Str("t", "") == "int") {
+            return GenDb.TreeStr(Convert.ToString(e.Int("v", 0)));
+        }
+        return GenDb.TreeCall1(
+            GenDb.TreeMem(GenDb.TreeId("Convert"), "ToString"), e);
     }
 
     /// `GroupBy(p => p.col)` -> `.GB("t.col")`。
@@ -1486,7 +1580,7 @@ class GenDb {
                     break;
                 }
                 if (!first) { gb.Append(", "); }
-                gb.Append("t." + col.Name);
+                gb.Append("t." + col.Col);
                 first = false;
             }
             if (ok && first) {
@@ -1502,16 +1596,109 @@ class GenDb {
                     col = GenDb.FieldFind(fields, body.Str("n", ""));
                 }
             }
-            if (col == null || col.Kind == 5) {
-                GenDb.Diag(call, "GroupBy expects p => p.<scalar field>");
-                ok = false;
+            if (col != null && col.Kind != 5) {
+                gb.Append("t." + col.Col);
             } else {
-                gb.Append("t." + col.Name);
+                /* 时间桶之类的算术分组键:GroupBy(a => a.minute / step * step) */
+                bool anyCol = false;
+                JsonValue tree = GenDb.GbTree(body, pname, fields,
+                                              out anyCol);
+                if (tree == null || !anyCol) {
+                    GenDb.Diag(call, "GroupBy expects p => p.<scalar field>, " +
+                                     "p => new { ... } or integer arithmetic " +
+                                     "over one field");
+                    return;
+                }
+                JsonValue ops2 = JsonValue.NewArray();
+                ops2.Append(GenDb.OneOp("GB", tree));
+                JsonValue op2 = GenDb.NewOp("db_chain", call);
+                op2.Put("ops", ops2);
+                GenDb.AddRewrite(op2);
+                return;
             }
         }
         if (!ok) { return; }
         JsonValue ops = JsonValue.NewArray();
         ops.Append(GenDb.OneOp("GB", GenDb.TreeStr(gb.ToString())));
+        JsonValue op = GenDb.NewOp("db_chain", call);
+        op.Put("ops", ops);
+        GenDb.AddRewrite(op);
+    }
+
+    /// Insert 链上的 `OnConflict(a => a.col)` /
+    /// `OnConflict(a => new { a.c1, a.c2 })` -> 每个键列一个 `.OC("col")`。
+    /// 不写 OnConflict 时冲突键取实体主键(生成侧的 Keys())。
+    static void RewriteConflict(JsonValue call, string cls) {
+        JsonValue lambda = GenDb.ArgAt(call, 0);
+        JsonValue ps = lambda != null ? lambda.Get("p") : null;
+        if (ps == null || ps.Count() != 1) {
+            GenDb.Diag(call,
+                       "OnConflict expects a => a.<key> or a => new { ... }");
+            return;
+        }
+        string pname = ps.At(0).AsString("");
+        JsonValue body = lambda.Get("b");
+        List<DbField> fields = GenDb.FieldsOf(cls, 0);
+        JsonValue members = JsonValue.NewArray();
+        if (body != null && body.Str("k", "") == "new") {
+            JsonValue args = body.Get("a");
+            if (args != null) {
+                for (int i = 0; i < args.Count(); i = i + 1) {
+                    members.Append(args.At(i));
+                }
+            }
+        } else {
+            members.Append(body);
+        }
+        if (members.Count() == 0) {
+            GenDb.Diag(body, "OnConflict must name at least one key column");
+            return;
+        }
+        JsonValue ops = JsonValue.NewArray();
+        for (int i = 0; i < members.Count(); i = i + 1) {
+            JsonValue m = members.At(i);
+            DbField col = null;
+            if (m != null && m.Str("k", "") == "mem") {
+                JsonValue obj = m.Get("o");
+                if (obj != null && obj.Str("k", "") == "id" &&
+                    obj.Str("n", "") == pname) {
+                    col = GenDb.FieldFind(fields, m.Str("n", ""));
+                }
+            }
+            if (col == null || col.Kind == 5) {
+                GenDb.Diag(m, "OnConflict key must be a => a.<scalar field>");
+                return;
+            }
+            ops.Append(GenDb.OneOp("OC", GenDb.TreeStr(col.Col)));
+        }
+        JsonValue op = GenDb.NewOp("db_chain", call);
+        op.Put("ops", ops);
+        GenDb.AddRewrite(op);
+    }
+
+    /// Insert 链上的冲突动作 `SetIncr/SetMax/SetMin(a => a.col)`:
+    /// 该列在冲突时累加 / 取大 / 取小,其余列被新值覆盖。
+    static void RewriteUpsertSet(JsonValue call, string cls, string what) {
+        List<DbField> fields = GenDb.FieldsOf(cls, 0);
+        DbField col = GenDb.SelColumn(call, cls, fields, what);
+        if (col == null) { return; }
+        if (col.Kind != 0 && col.Kind != 1) {
+            GenDb.Diag(call, what + " requires an int or double column");
+            return;
+        }
+        string m = what == "SetIncr" ? "ACC"
+                 : what == "SetMax" ? "GMX" : "GMN";
+        JsonValue ops = JsonValue.NewArray();
+        ops.Append(GenDb.OneOp(m, GenDb.TreeStr(col.Col)));
+        JsonValue op = GenDb.NewOp("db_chain", call);
+        op.Put("ops", ops);
+        GenDb.AddRewrite(op);
+    }
+
+    /// Insert 链上的 `IfExistsDoNothing()` -> `.NOP()`。
+    static void RewriteDoNothing(JsonValue call) {
+        JsonValue ops = JsonValue.NewArray();
+        ops.Append(GenDb.OpObj("NOP", JsonValue.NewArray()));
         JsonValue op = GenDb.NewOp("db_chain", call);
         op.Put("ops", ops);
         GenDb.AddRewrite(op);
@@ -1535,29 +1722,192 @@ class GenDb {
             if (ps != null && ps.Count() == 1) { body = lambda.Get("b"); }
         }
         List<DbField> fields = GenDb.FieldsOf(cls, 0);
-        DbField col = null;
-        if (body != null && body.Str("k", "") == "mem") {
-            JsonValue obj = body.Get("o");
-            if (obj != null && obj.Str("k", "") == "id" &&
-                obj.Str("n", "") == GenDb.LamParam(lambda)) {
-                col = GenDb.FieldFind(fields, body.Str("n", ""));
+        string sort = "";
+        if (body != null && body.Str("k", "") == "mem" &&
+            body.Str("n", "") == "Key") {
+            /* 按分组键排序:键的 SQL 只有 GroupBy 知道,交给生成侧复用 */
+            JsonValue kobj = body.Get("o");
+            if (kobj != null && kobj.Str("k", "") == "id" &&
+                kobj.Str("n", "") == GenDb.LamParam(lambda)) {
+                JsonValue kops = JsonValue.NewArray();
+                kops.Append(GenDb.OpObj(desc ? "OBDK" : "OBK",
+                                        JsonValue.NewArray()));
+                JsonValue kop = GenDb.NewOp("db_chain", call);
+                kop.Put("ops", kops);
+                GenDb.AddRewrite(kop);
+                return;
             }
         }
-        if (col == null || col.Kind == 5) {
-            GenDb.Diag(call, "OrderBy expects p => p.<scalar field>");
-            return;
+        if (body != null && body.Str("k", "") == "call") {
+            /* 按聚合结果排序:OrderByDescending(p => p.Sum(x => x.col)) */
+            sort = GenDb.AggText(call, body, GenDb.LamParam(lambda), fields);
+            if (sort.Length == 0) {
+                GenDb.Diag(call, "OrderBy expects p => p.<scalar field> or " +
+                                 "an aggregate of it");
+                return;
+            }
+        } else {
+            DbField col = null;
+            if (body != null && body.Str("k", "") == "mem") {
+                JsonValue obj = body.Get("o");
+                if (obj != null && obj.Str("k", "") == "id" &&
+                    obj.Str("n", "") == GenDb.LamParam(lambda)) {
+                    col = GenDb.FieldFind(fields, body.Str("n", ""));
+                }
+            }
+            if (col == null || col.Kind == 5) {
+                GenDb.Diag(call, "OrderBy expects p => p.<scalar field>");
+                return;
+            }
+            sort = "t." + col.Col;
         }
         JsonValue ops = JsonValue.NewArray();
-        ops.Append(GenDb.OneOp(desc ? "OBD" : "OB",
-                               GenDb.TreeStr("t." + col.Name)));
+        ops.Append(GenDb.OneOp(desc ? "OBD" : "OB", GenDb.TreeStr(sort)));
         JsonValue op = GenDb.NewOp("db_chain", call);
         op.Put("ops", ops);
         GenDb.AddRewrite(op);
     }
 
-    /// `ToList(a => a.field)` -> `.ToListCol("t.field")`;
-    /// `ToList<TDto>(a => new Dto { ... })` -> `.ToListDto(...)`。
-    static void RewriteToList(JsonValue call, string cls) {
+    /// 聚合调用 `a.Sum(x => x.col)` / `a.Count()` 的 SQL 文本(不是聚合
+    /// 时返回 "";畸形聚合已发诊断,同样返回 "")。聚合不带参数,因此
+    /// 投影列表不会打乱 WHERE 的参数顺序。
+    static string AggText(JsonValue call, JsonValue e, string pname,
+                          List<DbField> fields) {
+        Wf w = new Wf();
+        w.Call = call;
+        w.Pname = pname;
+        w.Fields = fields;
+        w.Lit = new StringBuilder();
+        w.Binds = new List<JsonValue>();
+        w.Ok = true;
+        int kind = 0;
+        string fn = GenDb.AggCall(w, e, out kind);
+        if (fn.Length == 0 || !w.Ok) { return ""; }
+        return w.Lit.ToString();
+    }
+
+    /// 投影形状登记:返回生成侧的方法名前缀 `Pj<N>`。
+    /// items 每项是 { col: SQL 片段, field: 目标字段名, get: 读取器 }。
+    static string ProjAdd(string cls, string target, JsonValue items) {
+        JsonValue p = JsonValue.NewObject();
+        string name = "Pj" + Convert.ToString(GenDb.Projs.Count);
+        p.Put("entity", JsonValue.NewStr(cls));
+        p.Put("target", JsonValue.NewStr(target));
+        p.Put("name", JsonValue.NewStr(name));
+        p.Put("items", items);
+        GenDb.Projs.Add(p);
+        return name;
+    }
+
+    /// `ToList<T>(a => new T { f = a.col, g = a.Sum(x => x.col), ... })`:
+    /// 分组聚合投影。列与聚合都由实体字段推导,业务侧不出现 SQL。
+    /// 终端:ToList/ToListAsync/ToOne/ToOneAsync。
+    static void RewriteProj(JsonValue call, string cls, string term) {
+        JsonValue lambda = GenDb.ArgAt(call, 0);
+        JsonValue ps = lambda != null ? lambda.Get("p") : null;
+        if (ps == null || ps.Count() != 1) {
+            GenDb.Diag(call, term + "<T> expects a one-parameter lambda");
+            return;
+        }
+        string pname = ps.At(0).AsString("");
+        JsonValue body = lambda.Get("b");
+        JsonValue targs = call.Get("targs");
+        if (targs == null || targs.Count() != 1) { return; }
+        string target = targs.At(0).AsString("");
+        if (body == null || body.Str("k", "") != "new") {
+            GenDb.Diag(call, term + "<T> expects a => new T { f = a.col, " +
+                             "g = a.Sum(x => x.col), ... }");
+            return;
+        }
+        List<DbField> fields = GenDb.FieldsOf(cls, 0);
+        List<DbField> tfields = GenDb.FieldsOf(target, 0);
+        if (tfields.Count == 0) {
+            GenDb.Diag(call, term + "<T>: " + target + " has no fields");
+            return;
+        }
+        JsonValue items = JsonValue.NewArray();
+        JsonValue args = body.Get("a");
+        if (args == null) { args = JsonValue.NewArray(); }
+        for (int i = 0; i < args.Count(); i = i + 1) {
+            JsonValue arg = args.At(i);
+            JsonValue src = arg;
+            string tname = "";
+            if (arg.Str("k", "") == "assign") {
+                src = arg.Get("r");
+                JsonValue l = arg.Get("l");
+                tname = l != null ? l.Str("n", "") : "";
+            } else if (arg.Str("k", "") == "mem") {
+                tname = arg.Str("n", "");
+            }
+            if (tname.Length == 0) {
+                GenDb.Diag(arg, term + "<T> member must be f = <column or " +
+                                "aggregate>");
+                return;
+            }
+            DbField tf = GenDb.FieldFind(tfields, tname);
+            if (tf == null || tf.Kind == 5) {
+                GenDb.Diag(arg, term + "<T>: " + target + " has no scalar " +
+                                "field " + tname);
+                return;
+            }
+            /* a.Key:分组键本身(GroupBy 写的那个表达式,生成侧复用) */
+            bool isKey = false;
+            if (src != null && src.Str("k", "") == "mem" &&
+                src.Str("n", "") == "Key") {
+                JsonValue kobj = src.Get("o");
+                isKey = kobj != null && kobj.Str("k", "") == "id" &&
+                        kobj.Str("n", "") == pname;
+            }
+            string colsql = isKey ? ""
+                                  : GenDb.AggText(call, src, pname, fields);
+            /* SUM/MAX/MIN/AVG 在空集合上是 NULL,而投影的目标字段是数字:
+             * 空窗口要读成 0,不是读成一个解析不了的空串。COUNT 本身就
+             * 已经是 0,不用包。 */
+            if (colsql.Length > 0 && !colsql.StartsWith("COUNT(")) {
+                colsql = "COALESCE(" + colsql + ", 0)";
+            }
+            if (!isKey && colsql.Length == 0) {
+                DbField col = null;
+                if (src != null && src.Str("k", "") == "mem") {
+                    JsonValue obj = src.Get("o");
+                    if (obj != null && obj.Str("k", "") == "id" &&
+                        obj.Str("n", "") == pname) {
+                        col = GenDb.FieldFind(fields, src.Str("n", ""));
+                    }
+                }
+                if (col == null || col.Kind == 5) {
+                    GenDb.Diag(arg, term + "<T> member must read a.<column> " +
+                                    "or an aggregate of it");
+                    return;
+                }
+                colsql = "t." + col.Col;
+            }
+            JsonValue it = JsonValue.NewObject();
+            it.Put("col", JsonValue.NewStr(colsql));
+            it.Put("key", JsonValue.NewBool(isKey));
+            it.Put("field", JsonValue.NewStr(tf.Name));
+            it.Put("kind", JsonValue.NewNum(Convert.ToString(tf.Kind)));
+            it.Put("i64", JsonValue.NewBool(GenDb.Is64(tf.TypeName)));
+            items.Append(it);
+        }
+        if (items.Count() == 0) {
+            GenDb.Diag(body, term + "<T> must project at least one member");
+            return;
+        }
+        string pj = GenDb.ProjAdd(cls, target, items);
+        bool one = term == "ToOne" || term == "ToOneAsync";
+        bool isAsync = term == "ToListAsync" || term == "ToOneAsync";
+        string m = pj + (one ? "One" : "") + (isAsync ? "Async" : "");
+        JsonValue ops = JsonValue.NewArray();
+        ops.Append(GenDb.OpObj(m, JsonValue.NewArray()));
+        JsonValue op = GenDb.NewOp("db_chain", call);
+        op.Put("ops", ops);
+        GenDb.AddRewrite(op);
+    }
+
+    /// `ToList(a => a.field)` -> `.ToListCol("t.field")`(async 变体走
+    /// `ToListColAsync`)。带类型实参的 `ToList<T>(...)` 走 RewriteProj。
+    static void RewriteToList(JsonValue call, string cls, bool isAsync) {
         JsonValue lambda = GenDb.ArgAt(call, 0);
         if (lambda == null || lambda.Str("k", "") != "lam") {
             GenDb.Diag(call, "ToList expects a one-parameter lambda");
@@ -1571,57 +1921,6 @@ class GenDb {
         JsonValue body = lambda.Get("b");
         string pname = ps.At(0).AsString("");
         List<DbField> fields = GenDb.FieldsOf(cls, 0);
-        JsonValue targs = call.Get("targs");
-        if (targs != null && targs.Count() == 1) {
-            /* DTO 映射:ToList<TDto>(a => new Dto { f1 = a.x, ... }) */
-            string dtc = targs.At(0).AsString("");
-            if (body == null || body.Str("k", "") != "new") {
-                GenDb.Diag(body, "ToList<Dto> expects a => new Dto { f = a.col, ... }");
-                return;
-            }
-            StringBuilder cols = new StringBuilder();
-            bool first = true;
-            bool ok = true;
-            JsonValue args = body.Get("a");
-            if (args == null) { args = JsonValue.NewArray(); }
-            for (int i = 0; i < args.Count(); i = i + 1) {
-                JsonValue arg = args.At(i);
-                JsonValue src = arg;
-                if (arg.Str("k", "") == "assign") {
-                    src = arg.Get("r");
-                }
-                DbField col = null;
-                if (src != null && src.Str("k", "") == "mem") {
-                    JsonValue obj = src.Get("o");
-                    if (obj != null && obj.Str("k", "") == "id" &&
-                        obj.Str("n", "") == pname) {
-                        col = GenDb.FieldFind(fields, src.Str("n", ""));
-                    }
-                }
-                if (col == null || col.Kind == 5) {
-                    GenDb.Diag(src, "ToList<Dto> member must read p => p.<scalar field>");
-                    ok = false;
-                    break;
-                }
-                if (!first) { cols.Append(", "); }
-                cols.Append("t." + col.Name);
-                first = false;
-            }
-            if (!ok) { return; }
-            if (first) {
-                GenDb.Diag(body, "ToList<Dto> must name at least one member");
-                return;
-            }
-            JsonValue ops = JsonValue.NewArray();
-            JsonValue oargs = JsonValue.NewArray();
-            oargs.Append(GenDb.TreeStr(cols.ToString()));
-            oargs.Append(GenDb.TreeStr(dtc));
-            ops.Append(GenDb.OpObj("ToListDto", oargs));
-            JsonValue op = GenDb.NewOp("db_chain", call);
-            op.Put("ops", ops);
-            GenDb.AddRewrite(op);
-            return;
-        }
         /* 标量投影:ToList(a => a.field) */
         DbField col = null;
         if (body != null && body.Str("k", "") == "mem") {
@@ -1636,7 +1935,8 @@ class GenDb {
             return;
         }
         JsonValue ops = JsonValue.NewArray();
-        ops.Append(GenDb.OneOp("ToListCol", GenDb.TreeStr("t." + col.Name)));
+        ops.Append(GenDb.OneOp(isAsync ? "ToListColAsync" : "ToListCol",
+                               GenDb.TreeStr("t." + col.Col)));
         JsonValue op = GenDb.NewOp("db_chain", call);
         op.Put("ops", ops);
         GenDb.AddRewrite(op);
@@ -1944,6 +2244,11 @@ class GenDb {
             GenDb.RewriteDistinct(call);
             return;
         }
+        if (name == "IfExistsDoNothing" && ck == 2 && nargs == 0) {
+            GenDb.RewriteDoNothing(call);
+            GenDb.MarkChain(call, entity, ck);
+            return;
+        }
         if (is_whereif) {
             if (nargs != 2) { return; }
             JsonValue l1 = GenDb.ArgAt(call, 1);
@@ -1973,10 +2278,21 @@ class GenDb {
             GenDb.RewriteGroupBy(call, entity);
         } else if (is_having && ck == 1) {
             GenDb.RewriteHaving(call, entity);
-        } else if (name == "ToList" && ck == 1) {
-            GenDb.RewriteToList(call, entity);
+        } else if ((name == "ToList" || name == "ToListAsync" ||
+                    name == "ToOne" || name == "ToOneAsync") && ck == 1) {
+            JsonValue targs = call.Get("targs");
+            if (targs != null && targs.Count() == 1) {
+                GenDb.RewriteProj(call, entity, name);
+            } else if (name == "ToList" || name == "ToListAsync") {
+                GenDb.RewriteToList(call, entity, name == "ToListAsync");
+            }
         } else if ((is_only || is_skip) && (ck == 2 || ck == 3)) {
             GenDb.RewriteCols(call, entity, is_only);
+        } else if (name == "OnConflict" && ck == 2) {
+            GenDb.RewriteConflict(call, entity);
+        } else if (ck == 2 && (is_incr || name == "SetMax" ||
+                               name == "SetMin")) {
+            GenDb.RewriteUpsertSet(call, entity, name);
         }
         if (GenDb.RwCount > before) { GenDb.MarkChain(call, entity, ck); }
     }
@@ -2013,6 +2329,7 @@ class GenDb {
         GenDb.RwCount = 0;
         GenDb.Any = false;
         GenDb.SyncAll = false;
+        GenDb.Projs = new List<JsonValue>();
         JsonValue classes = GenDb.Unit.Get("classes");
         if (classes != null && classes.IsArray()) {
             for (int i = 0; i < classes.Count(); i = i + 1) {

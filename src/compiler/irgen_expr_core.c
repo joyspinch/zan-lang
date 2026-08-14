@@ -174,6 +174,10 @@ static LLVMValueRef emit_task_member(zan_irgen_t *g, LLVMValueRef hp,
                                 LLVMConstInt(LLVMTypeOf(dn), 0, 0), "tk.dn1");
     LLVMBuildCondBr(g->builder, dn1, done_bb, pump_bb);
     LLVMPositionBuilderAtEnd(g->builder, pump_bb);
+    /* Drains rather than stopping at this frame's DONE flag: a spawned frame is
+     * reaped (freed) once it completes, so its flag must not be watched from
+     * outside -- the loop above re-tests through __zan_co_isdone, which checks
+     * the live registry first. */
     zan_call2(g->builder, g->rt_co_sched_run_type, g->rt_co_sched_run, NULL, 0, "");
     LLVMBuildBr(g->builder, test_bb);
     LLVMPositionBuilderAtEnd(g->builder, done_bb);

@@ -3162,6 +3162,14 @@ void zan_co_sched_run(void) {
     zan_io_shutdown();
 }
 
+/* The multi-worker driver owns the whole thread pool for the duration of a run,
+ * so it has no way to hand control back mid-pool: awaiting one frame from a
+ * synchronous context drains, as it always has. */
+void zan_co_sched_run_until(const volatile int *done) {
+    (void)done;
+    zan_co_sched_run();
+}
+
 size_t zan_co_pending(void) {
     size_t n = (size_t)(g_inj_len > 0 ? g_inj_len : 0);
     for (int i = 0; i < g_co_workers; i++) {
@@ -3205,15 +3213,17 @@ size_t zan_co_pending(void) {
     return n;
 }
 
-void zan_co_sched_run(void) {
+void zan_co_sched_run_until(const volatile int *done) {
     for (;;) {
         while (g_rq_head) {
+            if (done && *done) return;
             zan_co_node *n = g_rq_head;
             g_rq_head = n->next; if (!g_rq_head) g_rq_tail = NULL;
             void *frame = n->frame; zan_co_step_t step = n->step;
             free(n);
             step(frame);
         }
+        if (done && *done) return;
         long long timeout = zan_timer_next_timeout();
         if (timeout >= 0) {
             if (timeout > 0) {
@@ -3226,6 +3236,10 @@ void zan_co_sched_run(void) {
         if (zan_io_pump() > 0) continue;
         return;
     }
+}
+
+void zan_co_sched_run(void) {
+    zan_co_sched_run_until(NULL);
 }
 #endif /* _WIN32 */
 #endif /* ZAN_CO_DRIVER */

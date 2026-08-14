@@ -15,11 +15,13 @@ namespace ZanWeb.Admin.Monitor;
 /// writes from it, so a table designed at 10:00 is being maintained at 10:01
 /// without a rebuild.
 ///
-/// The SQL is assembled, not written, so the rules are strict: table and column
-/// names come only from the saved design (and each is re-checked with
-/// Gen.Safe()), values only ever reach the database as bound parameters, and the
-/// permission codes checked are the design's own. A caller who names a column
-/// that is not in the design is ignored, not trusted.
+/// Nothing here writes SQL: the reads and writes go through DbTable, the ORM's
+/// gateway for a table whose shape is only known at run time. The rules stay
+/// strict: table and column names come only from the saved design (each
+/// re-checked with Gen.Safe(), and again as an identifier by the ORM), values
+/// only ever reach the database as bound parameters, and the permission codes
+/// checked are the design's own. A caller who names a column that is not in the
+/// design is ignored, not trusted.
 /// </summary>
 [Route("admin/monitor/data/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
@@ -50,40 +52,35 @@ class Data : AdminController {
         for (int i = 0; i < cols.Count; i = i + 1) {
             if (cols[i].inFilter == 1) { filters.Add(cols[i]); }
         }
-        string cond = "";
-        DbParams prms = new DbParams();
+        DbTable dt = DbTable.Of(db, t.tableName);
+        DbTableQuery query = dt.Query();
         for (int i = 0; i < filters.Count; i = i + 1) {
             GenColumn c = filters[i];
             string v = this.In("f_" + c.name);
             if (v.Length == 0) { continue; }
-            if (cond.Length > 0) { cond = cond + " AND "; }
-            if (Gen.ZanType(c.kind) == "string") {
-                cond = cond + c.name + " LIKE ?";
-                prms.Add("%" + v + "%");
+            string zt = Gen.ZanType(c.kind);
+            if (zt == "string") {
+                query.WhereContains(c.name, v);
+            } else if (zt == "double") {
+                DbValues one = new DbValues().Set(c.name, Filter.ToDouble(v, 0.0));
+                query.WhereDict(one);
             } else {
-                cond = cond + c.name + " = ?";
-                prms.Add(v);
+                query.WhereEq(c.name, (long)Filter.ToInt(v, 0));
             }
         }
-        string tail = "";
-        if (cond.Length > 0) { tail = " WHERE " + cond; }
 
-        string countSql = "SELECT COUNT(*) FROM " + t.tableName + tail;
-        string totalText = await db.ExecuteScalarAsync(countSql, prms);
-        int total = Filter.ToInt(totalText, 0);
+        int total = (int)(await query.CountAsync());
 
-        string names = "id";
+        List<string> names = new List<string>();
+        names.Add("id");
         List<GenColumn> shown = new List<GenColumn>();
         for (int i = 0; i < cols.Count; i = i + 1) {
             if (cols[i].inList != 1 || cols[i].name == "id") { continue; }
             shown.Add(cols[i]);
-            names = names + ", " + cols[i].name;
+            names.Add(cols[i].name);
         }
-        string order = " ORDER BY id DESC";
-        string sql = "SELECT " + names + " FROM " + t.tableName + tail + order
-            + " LIMIT " + Convert.ToString(q.Limit())
-            + " OFFSET " + Convert.ToString(q.Skip());
-        DbResult res = await db.QueryAsync(sql, prms);
+        DbResult res = await query.OrderByDesc("id")
+            .Page(q.Limit(), q.Skip()).ToResultAsync(names);
 
         // The columns differ per table, so the table markup is built here and
         // inserted raw. Every value goes through Esc() on the way in.
@@ -148,12 +145,8 @@ class Data : AdminController {
         DbResult cur = null;
         if (id > 0) {
             d.Set("dialogTitle", "编辑" + t.title);
-            DbParams p = new DbParams().AddInt(id);
-            cur = await db.QueryAsync("SELECT * FROM " + t.tableName
-                + " WHERE id = ?", p);
-            if (cur == null || cur.RowCount() == 0) {
-                this.Fail(404, "0404", "记录不存在");
-            }
+            cur = await DbTable.Of(db, t.tableName).ReadAsync("id", (long)id);
+            if (cur == null) { this.Fail(404, "0404", "记录不存在"); }
         }
 
         StringBuilder fb = new StringBuilder();
@@ -215,11 +208,9 @@ class Data : AdminController {
         IDbConnection db = await this.Conn();
         if (db == null) { this.Fail(503, "2001", "数据库不可用"); }
 
-        string sets = "";
-        string names = "";
-        string marks = "";
-        DbParams prms = new DbParams();
-        int used = 0;
+        // The columns to write are the design's, so the row is a DbValues --
+        // a name/value bag the ORM binds by the type each column declares.
+        DbValues row = new DbValues();
         for (int i = 0; i < cols.Count; i = i + 1) {
             GenColumn c = cols[i];
             if (c.name == "id") { continue; }
@@ -233,29 +224,22 @@ class Data : AdminController {
             if (c.required == 1 && v.Length == 0) {
                 this.Fail(400, "0003", Data.LabelOf(c) + "不能为空");
             }
-            if (used > 0) { sets = sets + ", "; names = names + ", "; marks = marks + ", "; }
-            sets = sets + c.name + " = ?";
-            names = names + c.name;
-            marks = marks + "?";
-            if (Gen.ZanType(c.kind) == "string") { prms.Add(v); }
-            else if (Gen.ZanType(c.kind) == "double") {
-                prms.AddDouble(Filter.ToDouble(v, 0.0));
-            } else { prms.AddInt(Filter.ToInt(v, 0)); }
-            used = used + 1;
+            string zt = Gen.ZanType(c.kind);
+            if (zt == "string") { row.Set(c.name, v); }
+            else if (zt == "double") { row.Set(c.name, Filter.ToDouble(v, 0.0)); }
+            else { row.Set(c.name, Filter.ToInt(v, 0)); }
         }
-        if (used == 0) { this.Fail(400, "0004", "没有可写入的字段"); }
+        if (row.Count() == 0) { this.Fail(400, "0004", "没有可写入的字段"); }
 
+        DbTable dt = DbTable.Of(db, t.tableName);
         if (id > 0) {
-            prms.AddInt(id);
-            int n = await db.ExecuteAsync("UPDATE " + t.tableName + " SET " + sets
-                + " WHERE id = ?", prms);
+            int n = await dt.UpdateAsync(row, "id", (long)id);
             await this.Note("编辑" + t.title,
                 Convert.ToString(id), n > 0, "");
             this.Saved("已保存");
             return;
         }
-        int rows = await db.ExecuteAsync("INSERT INTO " + t.tableName + " (" + names
-            + ") VALUES (" + marks + ")", prms);
+        int rows = await dt.InsertAsync(row);
         await this.Note("新增" + t.title, t.tableName,
             rows > 0, "");
         this.Saved("已创建");
@@ -270,9 +254,7 @@ class Data : AdminController {
         int id = this.InInt("id", 0);
         IDbConnection db = await this.Conn();
         if (db == null) { this.Fail(503, "2001", "数据库不可用"); }
-        DbParams p = new DbParams().AddInt(id);
-        int n = await db.ExecuteAsync("DELETE FROM " + t.tableName
-            + " WHERE id = ?", p);
+        int n = await DbTable.Of(db, t.tableName).DeleteAsync("id", (long)id);
         await this.Note("删除" + t.title,
             Convert.ToString(id), n > 0, "");
         this.Saved("已删除");
@@ -321,13 +303,16 @@ class Data : AdminController {
         if (!Gen.Safe(c.relTable) || !Gen.Safe(c.relValue) || !Gen.Safe(c.relLabel)) {
             return outRows;
         }
-        DbResult r = await db.QueryAsync("SELECT " + c.relValue + " AS v, "
-            + c.relLabel + " AS l FROM " + c.relTable + " LIMIT 500");
+        List<string> pick = new List<string>();
+        pick.Add(c.relValue);
+        if (c.relLabel != c.relValue) { pick.Add(c.relLabel); }
+        DbResult r = await DbTable.Of(db, c.relTable).Query().Limit(500)
+            .ToResultAsync(pick);
         if (r == null) { return outRows; }
         for (int i = 0; i < r.RowCount(); i = i + 1) {
             StrMap row = new StrMap();
-            row.Set("value", r.GetByName(i, "v"));
-            row.Set("label", r.GetByName(i, "l"));
+            row.Set("value", r.GetByName(i, c.relValue));
+            row.Set("label", r.GetByName(i, c.relLabel));
             outRows.Add(row);
         }
         return outRows;

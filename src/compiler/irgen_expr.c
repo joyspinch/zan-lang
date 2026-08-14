@@ -6464,7 +6464,14 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
              * in a concurrent client/server program would never run. */
             LLVMValueRef sched_args[] = { sub_i8, sub_resume };
             zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
-            zan_call2(g->builder, g->rt_co_sched_run_type, g->rt_co_sched_run, NULL, 0, "");
+            /* Pump until *this* coroutine is done, not until the whole queue
+             * drains: a background coroutine spawned meanwhile (a metrics
+             * flusher, a spawned server) never completes, and draining would
+             * turn a root-level await into a program that never continues. */
+            LLVMValueRef done_p = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
+                ASYNC_FRAME_DONE, "sub.done.p");
+            zan_call2(g->builder, g->rt_co_sched_run_until_type,
+                g->rt_co_sched_run_until, (LLVMValueRef[]){ done_p }, 1, "");
             emit_async_check_sub_exc(g, sub_i8);
             LLVMValueRef rptr = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
                 ASYNC_FRAME_RESULT, "sub.result");

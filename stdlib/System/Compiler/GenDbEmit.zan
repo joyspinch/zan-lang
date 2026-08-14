@@ -13,6 +13,11 @@
 namespace System.Compiler;
 
 class GenDbEmit {
+    /// 声明类型是否是 64 位整数(需要 BIGINT 列与 64 位绑定/读取)。
+    static bool Is64(string type) {
+        return type == "long" || type == "ulong" || type == "nint";
+    }
+
     /// 行的 Getter 名(按字段类型)。
     static string Getter(int kind) {
         if (kind == 0 || kind == 4) { return "GetInt"; }
@@ -21,7 +26,97 @@ class GenDbEmit {
         return "GetString";
     }
 
-    /// __DbBind.Ty 的列类型码:0 int/enum, 1 double, 2 bool, 3 string。
+    /// 行的 Getter 名(64 位整数列走 GetLong,否则同 Getter(kind))。
+    static string GetterOf(DbField f) {
+        if (f.Kind == 0 && GenDbEmit.Is64(f.TypeName)) { return "GetLong"; }
+        return GenDbEmit.Getter(f.Kind);
+    }
+
+    /// 聚合/列投影终端:GenDb.Projs 里属于本实体的每个形状生成
+    /// `Pj<N>()` / `Pj<N>Async()` / `Pj<N>One()` / `Pj<N>OneAsync()`,
+    /// 结果映射到业务侧声明的目标类型(类型安全,业务侧不出现 SQL)。
+    static void Projections(StringBuilder b, string cls) {
+        for (int i = 0; i < GenDb.Projs.Count; i = i + 1) {
+            JsonValue p = GenDb.Projs[i];
+            if (p.Str("entity", "") != cls) { continue; }
+            string t = p.Str("target", "");
+            string nm = p.Str("name", "");
+            JsonValue items = p.Get("items");
+            if (items == null) { continue; }
+            /* 列清单是一段生成侧的 string 表达式:固定片段是字面量,
+             * 分组键(a.Key)是运行时的 this.gb */
+            StringBuilder cols = new StringBuilder();
+            StringBuilder lit = new StringBuilder();
+            bool open = false;
+            for (int k = 0; k < items.Count(); k = k + 1) {
+                if (k > 0) { lit.Append(", "); }
+                if (items.At(k).Bool("key", false)) {
+                    if (lit.ToString().Length > 0) {
+                        cols.Append((open ? " + " : "") + "\"" +
+                                    lit.ToString() + "\"");
+                        open = true;
+                        lit = new StringBuilder();
+                    }
+                    cols.Append((open ? " + " : "") + "this.gb");
+                    open = true;
+                } else {
+                    lit.Append(items.At(k).Str("col", ""));
+                }
+            }
+            if (lit.ToString().Length > 0) {
+                cols.Append((open ? " + " : "") + "\"" + lit.ToString() +
+                            "\"");
+                open = true;
+            }
+            if (!open) { cols.Append("\"\""); }
+            b.Append("    List<" + t + "> " + nm + "Map(DbResult r) {\n" +
+                     "        List<" + t + "> outp = new List<" + t +
+                     ">();\n" +
+                     "        int row = 0;\n" +
+                     "        while (row < r.RowCount()) {\n" +
+                     "            " + t + " o = new " + t + "();\n");
+            for (int k = 0; k < items.Count(); k = k + 1) {
+                JsonValue it = items.At(k);
+                int kind = it.Int("kind", 0);
+                string gtr = kind == 0 && it.Bool("i64", false)
+                                 ? "GetLong"
+                                 : GenDbEmit.Getter(kind);
+                b.Append("            o." + it.Str("field", "") + " = r." +
+                         gtr + "(row, " + Convert.ToString(k) + ");\n");
+            }
+            b.Append("            outp.Add(o);\n" +
+                     "            row = row + 1;\n" +
+                     "        }\n" +
+                     "        return outp;\n" +
+                     "    }\n");
+            b.Append("    List<" + t + "> " + nm + "() {\n" +
+                     "        return " + nm + "Map(this.db.Query(BuildDto(" +
+                     cols.ToString() + "), this.ps));\n" +
+                     "    }\n" +
+                     "    async List<" + t + "> " + nm + "Async() {\n" +
+                     "        string sql = BuildDto(" + cols.ToString() +
+                     ");\n" +
+                     "        DbResult r = await this.db.QueryAsync(sql, " +
+                     "this.ps);\n" +
+                     "        return " + nm + "Map(r);\n" +
+                     "    }\n" +
+                     "    " + t + " " + nm + "One() {\n" +
+                     "        this.limN = 1;\n" +
+                     "        List<" + t + "> l = " + nm + "();\n" +
+                     "        if (l.Count > 0) { return l[0]; }\n" +
+                     "        return null;\n" +
+                     "    }\n" +
+                     "    async " + t + " " + nm + "OneAsync() {\n" +
+                     "        this.limN = 1;\n" +
+                     "        List<" + t + "> l = await " + nm + "Async();\n" +
+                     "        if (l.Count > 0) { return l[0]; }\n" +
+                     "        return null;\n" +
+                     "    }\n");
+        }
+    }
+
+    /// __DbBind.Ty 的列类型码:0 int/enum, 1 double, 2 bool, 3 string,
+    /// 4 64 位整数。
     static int TyCode(int kind) {
         if (kind == 1) { return 1; }
         if (kind == 2) { return 2; }
@@ -29,11 +124,19 @@ class GenDbEmit {
         return 0;
     }
 
+    /// 字段的列类型码(在 TyCode 之上区分 64 位整数)。
+    static int TyCodeOf(DbField f) {
+        if (f.Kind == 0 && GenDbEmit.Is64(f.TypeName)) { return 4; }
+        return GenDbEmit.TyCode(f.Kind);
+    }
+
     /// 输出 `ps.AddXxx(o.<field>);` 绑定语句(ind 为缩进)。
     static void BindField(StringBuilder b, string ind, DbField f,
                           string obj) {
         if (f.Kind == 0) {
-            b.Append(ind + "ps.AddInt(" + obj + "." + f.Name + ");\n");
+            string add = GenDbEmit.Is64(f.TypeName) ? "ps.AddLong("
+                                                    : "ps.AddInt(";
+            b.Append(ind + add + obj + "." + f.Name + ");\n");
         } else if (f.Kind == 4) {
             /* enum -> int 隐式;临时变量把它移出表达式 */
             b.Append(ind + "int ev_" + f.Name + " = " + obj + "." + f.Name +
@@ -49,9 +152,15 @@ class GenDbEmit {
         }
     }
 
-    /// `<Entity>Cols`:列名常量 + Has/Kind/Require。
-    static void GenCols(StringBuilder b, string cls, List<DbField> fs) {
+    /// `<Entity>Cols`:表名 + 列名常量 + Has/Kind/Require。
+    static void GenCols(StringBuilder b, string cls, List<DbField> fs,
+                        string tbl) {
         b.Append("class " + cls + "Cols {\n");
+        /* 表名常量:让内省/运维接口拿到物理表名,而不是业务侧再写一遍
+         * 字面量。实体自己有 Table 字段时让位给它。 */
+        if (GenDb.FieldFind(fs, "Table") == null) {
+            b.Append("    static string Table = \"" + tbl + "\";\n");
+        }
         for (int i = 0; i < fs.Count; i = i + 1) {
             DbField f = fs[i];
             if (f.Kind == 5) { continue; }
@@ -164,6 +273,10 @@ class GenDbEmit {
                  "        if (this.on) { this.ps.AddInt(v); }\n" +
                  "        return this;\n" +
                  "    }\n");
+        b.Append("    __DbQ_" + cls + " Pl(long v) {\n" +
+                 "        if (this.on) { this.ps.AddLong(v); }\n" +
+                 "        return this;\n" +
+                 "    }\n");
         b.Append("    __DbQ_" + cls + " Pd(double v) {\n" +
                  "        if (this.on) { this.ps.AddDouble(v); }\n" +
                  "        return this;\n" +
@@ -172,6 +285,13 @@ class GenDbEmit {
                  "        if (!this.on) { return this; }\n" +
                  "        int i = 0;\n" +
                  "        while (i < vs.Count) { this.ps.AddInt(vs[i]); " +
+                 "i = i + 1; }\n" +
+                 "        return this;\n" +
+                 "    }\n");
+        b.Append("    __DbQ_" + cls + " InL(List<long> vs) {\n" +
+                 "        if (!this.on) { return this; }\n" +
+                 "        int i = 0;\n" +
+                 "        while (i < vs.Count) { this.ps.AddLong(vs[i]); " +
                  "i = i + 1; }\n" +
                  "        return this;\n" +
                  "    }\n");
@@ -198,6 +318,9 @@ class GenDbEmit {
                  "\" DESC\"); }\n");
         b.Append("    __DbQ_" + cls + " GB(string col) { this.gb = col; " +
                  "return this; }\n");
+        /* 按分组键排序:键的 SQL 就是 GroupBy 存下的那一段 */
+        b.Append("    __DbQ_" + cls + " OBK() { return OB(this.gb); }\n");
+        b.Append("    __DbQ_" + cls + " OBDK() { return OBD(this.gb); }\n");
         b.Append("    __DbQ_" + cls + " H(string f) {\n" +
                  "        if (this.h.Length == 0) { this.h = f; }\n" +
                  "        else { this.h = this.h + \" AND \" + f; }\n" +
@@ -316,7 +439,7 @@ class GenDbEmit {
                              "row, " + Convert.ToString(ci) + ");\n");
                 } else {
                     b.Append("            o." + fs[i].Name + " = r." +
-                             GenDbEmit.Getter(fs[i].Kind) + "(row, " +
+                             GenDbEmit.GetterOf(fs[i]) + "(row, " +
                              Convert.ToString(ci) + ");\n");
                 }
                 ci = ci + 1;
@@ -349,7 +472,7 @@ class GenDbEmit {
                              Convert.ToString(nk) + ");\n");
                 } else {
                     b.Append("                    nv." + nfs[k].Name +
-                             " = r." + GenDbEmit.Getter(nfs[k].Kind) +
+                             " = r." + GenDbEmit.GetterOf(nfs[k]) +
                              "(row, ci + " + Convert.ToString(nk) + ");\n");
                 }
                 nk = nk + 1;
@@ -419,15 +542,13 @@ class GenDbEmit {
                  "this.h); }\n" +
                  "        if (this.ob.Length > 0) { sb.Append(\" ORDER BY \" + " +
                  "this.ob); }\n" +
+                 "        if (this.limN >= 0) { sb.Append(\" LIMIT \" + " +
+                 "Convert.ToString(this.limN)); }\n" +
+                 "        if (this.offN >= 0) { sb.Append(\" OFFSET \" + " +
+                 "Convert.ToString(this.offN)); }\n" +
                  "        return sb.ToString();\n" +
-                 "    }\n" +
-                 "    DbResult ToListDtoR(string cols) {\n" +
-                 "        return this.db.Query(BuildDto(cols), this.ps);\n" +
-                 "    }\n" +
-                 "    async DbResult ToListDtoRAsync(string cols) {\n" +
-                 "        string sql = BuildDto(cols);\n" +
-                 "        return await this.db.QueryAsync(sql, this.ps);\n" +
                  "    }\n");
+        GenDbEmit.Projections(b, cls);
         b.Append("    " + cls + " First() {\n" +
                  "        this.limN = 1;\n" +
                  "        List<" + cls + "> l = ToList();\n" +
@@ -481,6 +602,11 @@ class GenDbEmit {
                  "        if (r.RowCount() == 0) { return 0; }\n" +
                  "        return r.GetInt(0, 0);\n" +
                  "    }\n" +
+                 "    async long AggLAsync(string expr) {\n" +
+                 "        DbResult r = await AggRAsync(expr);\n" +
+                 "        if (r.RowCount() == 0) { return 0; }\n" +
+                 "        return r.GetLong(0, 0);\n" +
+                 "    }\n" +
                  "    async double AggDAsync(string expr) {\n" +
                  "        DbResult r = await AggRAsync(expr);\n" +
                  "        if (r.RowCount() == 0) { return 0.0; }\n" +
@@ -516,6 +642,11 @@ class GenDbEmit {
                  "        if (r.RowCount() == 0) { return 0; }\n" +
                  "        return r.GetInt(0, 0);\n" +
                  "    }\n" +
+                 "    long AggL(string expr) {\n" +
+                 "        DbResult r = AggR(expr);\n" +
+                 "        if (r.RowCount() == 0) { return 0; }\n" +
+                 "        return r.GetLong(0, 0);\n" +
+                 "    }\n" +
                  "    double AggD(string expr) {\n" +
                  "        DbResult r = AggR(expr);\n" +
                  "        if (r.RowCount() == 0) { return 0.0; }\n" +
@@ -534,6 +665,12 @@ class GenDbEmit {
                  "    List<DbValues> dicts;\n" +
                  "    List<string> only;\n" +
                  "    List<string> skip;\n" +
+                 "    List<string> conf;\n" +
+                 "    List<string> acc;\n" +
+                 "    List<string> gmx;\n" +
+                 "    List<string> gmn;\n" +
+                 "    bool upsert;\n" +
+                 "    bool nop;\n" +
                  "    string sql;\n" +
                  "    DbParams bound;\n" +
                  "    static __DbI_" + cls + " Create(IDbExecutor db) {\n" +
@@ -544,6 +681,12 @@ class GenDbEmit {
                  "        q.dicts = new List<DbValues>();\n" +
                  "        q.only = new List<string>();\n" +
                  "        q.skip = new List<string>();\n" +
+                 "        q.conf = new List<string>();\n" +
+                 "        q.acc = new List<string>();\n" +
+                 "        q.gmx = new List<string>();\n" +
+                 "        q.gmn = new List<string>();\n" +
+                 "        q.upsert = false;\n" +
+                 "        q.nop = false;\n" +
                  "        q.sql = \"\";\n" +
                  "        q.bound = new DbParams();\n" +
                  "        return q;\n" +
@@ -583,11 +726,66 @@ class GenDbEmit {
                  "return this; }\n" +
                  "    __DbI_" + cls + " Skip(string c) { this.skip.Add(c); " +
                  "return this; }\n" +
+                 /* Upsert:键列 OC,冲突时累加 ACC / 取大 GMX / 取小 GMN,
+                  * 没点名的列冲突时被新值覆盖 */
+                 "    __DbI_" + cls + " OC(string c) { this.conf.Add(c); " +
+                 "this.upsert = true; return this; }\n" +
+                 "    __DbI_" + cls + " ACC(string c) { this.acc.Add(c); " +
+                 "this.upsert = true; return this; }\n" +
+                 "    __DbI_" + cls + " GMX(string c) { this.gmx.Add(c); " +
+                 "this.upsert = true; return this; }\n" +
+                 "    __DbI_" + cls + " GMN(string c) { this.gmn.Add(c); " +
+                 "this.upsert = true; return this; }\n" +
+                 "    __DbI_" + cls + " NOP() { this.nop = true; " +
+                 "this.upsert = true; return this; }\n" +
                  "    bool Use(string c, bool identity) {\n" +
                  "        if (this.only.Count > 0) { return " +
                  "__DbBind.Has(this.only, c); }\n" +
                  "        if (identity) { return false; }\n" +
                  "        return !__DbBind.Has(this.skip, c);\n" +
+                 "    }\n");
+        /* 冲突子句。键列缺省取实体主键;方言差异(excluded 对
+         * VALUES()、max 对 GREATEST)在 __DbBind 里解决 */
+        b.Append("    List<string> Keys() {\n" +
+                 "        List<string> k = new List<string>();\n");
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            DbField f = fs[i];
+            if (f.Kind == 5 || !f.IsPk) { continue; }
+            b.Append("        k.Add(\"" + f.Col + "\");\n");
+        }
+        b.Append("        return k;\n" +
+                 "    }\n" +
+                 "    string Conflict() {\n" +
+                 "        if (!this.upsert) { return \"\"; }\n" +
+                 "        int p = this.db.GetProvider();\n" +
+                 "        List<string> keys = this.conf;\n" +
+                 "        if (keys.Count == 0) { keys = Keys(); }\n" +
+                 "        if (keys.Count == 0) {\n" +
+                 "            throw new Exception(\"" + cls +
+                 ": OnConflict needs key columns\");\n" +
+                 "        }\n" +
+                 "        StringBuilder sb = new StringBuilder();\n" +
+                 "        sb.Append(__DbBind.ConflictHead(p, keys, " +
+                 "this.nop));\n" +
+                 "        if (this.nop) { return sb.ToString(); }\n" +
+                 "        int n = 0;\n");
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            DbField f = fs[i];
+            if (f.Kind == 5) { continue; }
+            b.Append("        if (this.Use(\"" + f.Col + "\", " +
+                     (f.IsIdent ? "true" : "false") +
+                     ") && !__DbBind.Has(keys, \"" + f.Col + "\")) {\n" +
+                     "            if (n > 0) { sb.Append(\", \"); }\n" +
+                     "            sb.Append(__DbBind.Excl(p, \"" + f.Col +
+                     "\", __DbBind.Mode(this.acc, this.gmx, this.gmn, \"" +
+                     f.Col + "\")));\n" +
+                     "            n = n + 1;\n" +
+                     "        }\n");
+        }
+        /* 冲突时无列可写(整表都是键)= 保留已有行 */
+        b.Append("        if (n == 0) { return __DbBind.ConflictHead(p, " +
+                 "keys, true); }\n" +
+                 "        return sb.ToString();\n" +
                  "    }\n");
         /* 语句构建到 this.sql / this.bound,由一对终端执行,同步与异步
          * 形式共享每一行 SQL 拼装 */
@@ -624,6 +822,7 @@ class GenDbEmit {
                  "            sb.Append(\")\");\n" +
                  "            i = i + 1;\n" +
                  "        }\n" +
+                 "        sb.Append(Conflict());\n" +
                  "        this.sql = sb.ToString();\n" +
                  "        this.bound = ps;\n" +
                  "        return 1;\n" +
@@ -679,6 +878,7 @@ class GenDbEmit {
                  "            sb.Append(\")\");\n" +
                  "            i = i + 1;\n" +
                  "        }\n" +
+                 "        sb.Append(Conflict());\n" +
                  "        this.sql = sb.ToString();\n" +
                  "        this.bound = ps;\n" +
                  "        return 1;\n" +
@@ -794,6 +994,10 @@ class GenDbEmit {
                  "        if (this.on) { this.wp.AddInt(v); }\n" +
                  "        return this;\n" +
                  "    }\n" +
+                 "    __DbU_" + cls + " Pl(long v) {\n" +
+                 "        if (this.on) { this.wp.AddLong(v); }\n" +
+                 "        return this;\n" +
+                 "    }\n" +
                  "    __DbU_" + cls + " Pd(double v) {\n" +
                  "        if (this.on) { this.wp.AddDouble(v); }\n" +
                  "        return this;\n" +
@@ -802,6 +1006,13 @@ class GenDbEmit {
                  "        if (!this.on) { return this; }\n" +
                  "        int i = 0;\n" +
                  "        while (i < vs.Count) { this.wp.AddInt(vs[i]); " +
+                 "i = i + 1; }\n" +
+                 "        return this;\n" +
+                 "    }\n" +
+                 "    __DbU_" + cls + " InL(List<long> vs) {\n" +
+                 "        if (!this.on) { return this; }\n" +
+                 "        int i = 0;\n" +
+                 "        while (i < vs.Count) { this.wp.AddLong(vs[i]); " +
                  "i = i + 1; }\n" +
                  "        return this;\n" +
                  "    }\n" +
@@ -829,6 +1040,10 @@ class GenDbEmit {
                  "        this.sp.AddInt(v);\n" +
                  "        return Frag(c + \" = ?\");\n" +
                  "    }\n" +
+                 "    __DbU_" + cls + " SetL(string c, long v) {\n" +
+                 "        this.sp.AddLong(v);\n" +
+                 "        return Frag(c + \" = ?\");\n" +
+                 "    }\n" +
                  "    __DbU_" + cls + " SetD(string c, double v) {\n" +
                  "        this.sp.AddDouble(v);\n" +
                  "        return Frag(c + \" = ?\");\n" +
@@ -844,6 +1059,10 @@ class GenDbEmit {
                  "    }\n" +
                  "    __DbU_" + cls + " SetIncrI(string c, int v) {\n" +
                  "        this.sp.AddInt(v);\n" +
+                 "        return Frag(c + \" = \" + c + \" + ?\");\n" +
+                 "    }\n" +
+                 "    __DbU_" + cls + " SetIncrL(string c, long v) {\n" +
+                 "        this.sp.AddLong(v);\n" +
                  "        return Frag(c + \" = \" + c + \" + ?\");\n" +
                  "    }\n" +
                  "    __DbU_" + cls + " SetIncrD(string c, double v) {\n" +
@@ -964,6 +1183,10 @@ class GenDbEmit {
                  "        if (this.on) { this.ps.AddInt(v); }\n" +
                  "        return this;\n" +
                  "    }\n" +
+                 "    __DbD_" + cls + " Pl(long v) {\n" +
+                 "        if (this.on) { this.ps.AddLong(v); }\n" +
+                 "        return this;\n" +
+                 "    }\n" +
                  "    __DbD_" + cls + " Pd(double v) {\n" +
                  "        if (this.on) { this.ps.AddDouble(v); }\n" +
                  "        return this;\n" +
@@ -972,6 +1195,13 @@ class GenDbEmit {
                  "        if (!this.on) { return this; }\n" +
                  "        int i = 0;\n" +
                  "        while (i < vs.Count) { this.ps.AddInt(vs[i]); " +
+                 "i = i + 1; }\n" +
+                 "        return this;\n" +
+                 "    }\n" +
+                 "    __DbD_" + cls + " InL(List<long> vs) {\n" +
+                 "        if (!this.on) { return this; }\n" +
+                 "        int i = 0;\n" +
+                 "        while (i < vs.Count) { this.ps.AddLong(vs[i]); " +
                  "i = i + 1; }\n" +
                  "        return this;\n" +
                  "    }\n" +
@@ -1004,9 +1234,85 @@ class GenDbEmit {
                  "}\n");
     }
 
+    /// 复合主键的列清单(两列及以上时才有:一列的主键仍写在列定义里)。
+    /// identity 列自带 PRIMARY KEY,不参与表级约束。
+    static string PkList(List<DbField> fs) {
+        StringBuilder sb = new StringBuilder();
+        int n = 0;
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            DbField f = fs[i];
+            if (f.Kind == 5 || !f.IsPk || f.IsIdent) { continue; }
+            if (n > 0) { sb.Append(", "); }
+            sb.Append(f.Col);
+            n = n + 1;
+        }
+        if (n < 2) { return ""; }
+        return sb.ToString();
+    }
+
+    /// 只有标识符字符的名字才写进 DDL:索引名来自实体上的字面量,
+    /// 但生成侧仍然自己把关,不把任何别的东西拼进语句。
+    static bool IsIdent(string s) {
+        if (s.Length == 0) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            char c = s[i];
+            bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                      || (c >= '0' && c <= '9') || c == '_';
+            if (!ok) { return false; }
+        }
+        return true;
+    }
+
+    /// 实体 `[Index(Name=, Fields=, IsUnique=)]` -> 每条索引一行
+    /// `__DbBind.EnsureIndex(db, name, tbl, cols, unique)` 的实参文本。
+    /// `Fields` 写的是实体字段名,进语句的是它们的物理列名;既有表也补建
+    /// 缺失的索引(存在性由 __DbBind 按方言判断)。
+    static List<string> IndexArgs(string cls, List<DbField> fs, string tbl) {
+        List<string> outl = new List<string>();
+        List<JsonValue> attrs = GenDb.IndexAttrs(cls);
+        for (int i = 0; i < attrs.Count; i = i + 1) {
+            JsonValue a = attrs[i];
+            List<string> parts = GenDb.AttrStr(a, "Fields").Split(",");
+            StringBuilder cols = new StringBuilder();
+            int n = 0;
+            for (int k = 0; k < parts.Count; k = k + 1) {
+                string fn = parts[k].Trim();
+                if (fn.Length == 0) { continue; }
+                DbField f = GenDb.FieldFind(fs, fn);
+                if (f == null) {
+                    GenDb.Diag(a, "Index: " + cls + " has no field " + fn);
+                    return new List<string>();
+                }
+                if (n > 0) { cols.Append(", "); }
+                cols.Append(f.Col);
+                n = n + 1;
+            }
+            if (n == 0) {
+                GenDb.Diag(a, "Index needs Fields = \"field, field\"");
+                return new List<string>();
+            }
+            string nm = GenDb.AttrStr(a, "Name");
+            if (nm.Length == 0) {
+                nm = "ix_" + tbl + "_" + Convert.ToString(i + 1);
+            }
+            if (!GenDbEmit.IsIdent(nm)) {
+                GenDb.Diag(a, "Index Name must be an identifier: " + nm);
+                return new List<string>();
+            }
+            outl.Add("db, \"" + nm + "\", t, \"" + cols.ToString() + "\", " +
+                     (GenDb.AttrBool(a, "IsUnique", false) ? "true"
+                                                           : "false"));
+        }
+        return outl;
+    }
+
     /// __DbCF_<E>:CodeFirst(缺表建表,缺列加列;同步 + 异步)。
     static void GenCodeFirst(StringBuilder b, string cls, List<DbField> fs,
                              string tbl) {
+        /* 复合主键:列定义里不能各自带 PRIMARY KEY,键写成表级约束 */
+        string pks = GenDbEmit.PkList(fs);
+        bool comp = pks.Length > 0;
+        List<string> ixs = GenDbEmit.IndexArgs(cls, fs, tbl);
         b.Append("class __DbCF_" + cls + " {\n" +
                  "    static void Sync(IDbExecutor db) {\n" +
                  "        int p = db.GetProvider();\n" +
@@ -1019,15 +1325,23 @@ class GenDbEmit {
             if (f.Kind == 5) { continue; }
             b.Append("            ddl = ddl + \"" +
                      (first ? "" : ", ") + f.Col + " \" + __DbBind.Ty(p, " +
-                     Convert.ToString(GenDbEmit.TyCode(f.Kind)) + ", " +
-                     (f.IsPk ? "true" : "false") + ", " +
+                     Convert.ToString(GenDbEmit.TyCodeOf(f)) + ", " +
+                     (f.IsPk && !comp ? "true" : "false") + ", " +
                      (f.IsIdent ? "true" : "false") + ", " +
                      Convert.ToString(f.StrLen) + ");\n");
             first = false;
         }
+        if (comp) {
+            b.Append("            ddl = ddl + \", PRIMARY KEY (" + pks +
+                     ")\";\n");
+        }
         b.Append("            ddl = ddl + \")\";\n" +
-                 "            db.Execute(ddl);\n" +
-                 "            return;\n" +
+                 "            db.Execute(ddl);\n");
+        for (int i = 0; i < ixs.Count; i = i + 1) {
+            b.Append("            __DbBind.EnsureIndex(" + ixs[i] +
+                     ");\n");
+        }
+        b.Append("            return;\n" +
                  "        }\n" +
                  "        List<string> have = __DbBind.Cols(db, t);\n");
         for (int i = 0; i < fs.Count; i = i + 1) {
@@ -1038,10 +1352,13 @@ class GenDbEmit {
                      "            db.Execute(\"ALTER TABLE \" + t + " +
                      "\" ADD COLUMN " + f.Col + " \"\n" +
                      "                + __DbBind.Ty(p, " +
-                     Convert.ToString(GenDbEmit.TyCode(f.Kind)) +
+                     Convert.ToString(GenDbEmit.TyCodeOf(f)) +
                      ", false, false, " + Convert.ToString(f.StrLen) +
                      "));\n" +
                      "        }\n");
+        }
+        for (int i = 0; i < ixs.Count; i = i + 1) {
+            b.Append("        __DbBind.EnsureIndex(" + ixs[i] + ");\n");
         }
         b.Append("    }\n");
         /* 异步孪生:同样的 DDL,await,非阻塞驱动可用 */
@@ -1057,15 +1374,23 @@ class GenDbEmit {
             if (f.Kind == 5) { continue; }
             b.Append("            ddl = ddl + \"" +
                      (first ? "" : ", ") + f.Col + " \" + __DbBind.Ty(p, " +
-                     Convert.ToString(GenDbEmit.TyCode(f.Kind)) + ", " +
-                     (f.IsPk ? "true" : "false") + ", " +
+                     Convert.ToString(GenDbEmit.TyCodeOf(f)) + ", " +
+                     (f.IsPk && !comp ? "true" : "false") + ", " +
                      (f.IsIdent ? "true" : "false") + ", " +
                      Convert.ToString(f.StrLen) + ");\n");
             first = false;
         }
+        if (comp) {
+            b.Append("            ddl = ddl + \", PRIMARY KEY (" + pks +
+                     ")\";\n");
+        }
         b.Append("            ddl = ddl + \")\";\n" +
-                 "            int _c = await db.ExecuteAsync(ddl);\n" +
-                 "            return;\n" +
+                 "            int _c = await db.ExecuteAsync(ddl);\n");
+        for (int i = 0; i < ixs.Count; i = i + 1) {
+            b.Append("            await __DbBind.EnsureIndexAsync(" +
+                     ixs[i] + ");\n");
+        }
+        b.Append("            return;\n" +
                  "        }\n" +
                  "        List<string> have = await " +
                  "__DbBind.ColsAsync(db, t);\n");
@@ -1077,10 +1402,14 @@ class GenDbEmit {
                      "            string alter = \"ALTER TABLE \" + t + " +
                      "\" ADD COLUMN " + f.Col + " \"\n" +
                      "                + __DbBind.Ty(p, " +
-                     Convert.ToString(GenDbEmit.TyCode(f.Kind)) +
+                     Convert.ToString(GenDbEmit.TyCodeOf(f)) +
                      ", false, false, " + Convert.ToString(f.StrLen) + ");\n" +
                      "            int _a = await db.ExecuteAsync(alter);\n" +
                      "        }\n");
+        }
+        for (int i = 0; i < ixs.Count; i = i + 1) {
+            b.Append("        await __DbBind.EnsureIndexAsync(" + ixs[i] +
+                     ");\n");
         }
         b.Append("    }\n}\n");
     }
@@ -1150,6 +1479,66 @@ class GenDbEmit {
                     "        }\n" +
                     "        return false;\n" +
                     "    }\n");
+        /* Upsert 的方言差异集中在这三个helper里:PostgreSQL/SQLite 写
+         * `ON CONFLICT (keys) DO UPDATE SET c = excluded.c`,MySQL 写
+         * `ON DUPLICATE KEY UPDATE c = VALUES(c)`(它按已有的唯一键判冲
+         * 突,不接受键列表)。取大/取小在 SQLite 是 max/min,别的方言是
+         * GREATEST/LEAST。MERGE 方言(SQL Server/Oracle)没有等价单句写
+         * 法,与其发一条会在运行时报语法错的语句,不如当场说清楚。 */
+        outb.Append("    static string ConflictHead(int p, List<string> keys, " +
+                    "bool nop) {\n" +
+                    "        bool my = p == DbProvider.MySQL || p == " +
+                    "DbProvider.MariaDB;\n" +
+                    "        bool pg = p == DbProvider.PostgreSQL" +
+                    " || p == DbProvider.OpenGauss || p == DbProvider.Kingbase;\n" +
+                    "        if (!my && !pg && p != DbProvider.SQLite) {\n" +
+                    "            throw new Exception(\"Upsert (OnConflict) is " +
+                    "not supported on this provider\");\n" +
+                    "        }\n" +
+                    "        if (my) {\n" +
+                    "            if (nop) {\n" +
+                    "                return \" ON DUPLICATE KEY UPDATE \" + " +
+                    "keys[0] + \" = \" + keys[0];\n" +
+                    "            }\n" +
+                    "            return \" ON DUPLICATE KEY UPDATE \";\n" +
+                    "        }\n" +
+                    "        StringBuilder sb = new StringBuilder();\n" +
+                    "        sb.Append(\" ON CONFLICT (\");\n" +
+                    "        int i = 0;\n" +
+                    "        while (i < keys.Count) {\n" +
+                    "            if (i > 0) { sb.Append(\", \"); }\n" +
+                    "            sb.Append(keys[i]);\n" +
+                    "            i = i + 1;\n" +
+                    "        }\n" +
+                    "        sb.Append(\")\");\n" +
+                    "        if (nop) { sb.Append(\" DO NOTHING\"); }\n" +
+                    "        else { sb.Append(\" DO UPDATE SET \"); }\n" +
+                    "        return sb.ToString();\n" +
+                    "    }\n" +
+                    "    static string Excl(int p, string c, int md) {\n" +
+                    "        bool my = p == DbProvider.MySQL || p == " +
+                    "DbProvider.MariaDB;\n" +
+                    "        string src = my ? \"VALUES(\" + c + \")\" : " +
+                    "\"excluded.\" + c;\n" +
+                    "        if (md == 1) { return c + \" = \" + c + \" + \" + " +
+                    "src; }\n" +
+                    "        if (md == 2 || md == 3) {\n" +
+                    "            string fn = md == 2 ? \"GREATEST\" : " +
+                    "\"LEAST\";\n" +
+                    "            if (p == DbProvider.SQLite) { fn = md == 2 ? " +
+                    "\"max\" : \"min\"; }\n" +
+                    "            return c + \" = \" + fn + \"(\" + c + \", \" + " +
+                    "src + \")\";\n" +
+                    "        }\n" +
+                    "        return c + \" = \" + src;\n" +
+                    "    }\n" +
+                    "    static int Mode(List<string> acc, List<string> mx, " +
+                    "List<string> mn, string c) {\n" +
+                    "        if (__DbBind.Has(acc, c)) { return 1; }\n" +
+                    "        if (__DbBind.Has(mx, c)) { return 2; }\n" +
+                    "        if (__DbBind.Has(mn, c)) { return 3; }\n" +
+                    "        return 0;\n" +
+                    "    }\n");
         /* UPDATE/DELETE 在 SQLite 等没有表别名,WHERE 构建器发的
          * `t.` 前缀在这里去掉 */
         outb.Append("    static string Unalias(string f) { return " +
@@ -1165,7 +1554,7 @@ class GenDbEmit {
                     "        while (i < src.Count()) {\n" +
                     "            int k = src.KindAt(i);\n" +
                     "            if (k == DbParams.KindInt) { " +
-                    "dst.AddInt(src.IntAt(i)); }\n" +
+                    "dst.AddLong(src.IntAt(i)); }\n" +
                     "            else if (k == DbParams.KindDouble) { " +
                     "dst.AddDouble(src.DoubleAt(i)); }\n" +
                     "            else if (k == DbParams.KindText) { " +
@@ -1255,6 +1644,50 @@ class GenDbEmit {
                     "        }\n" +
                     "        return \"\";\n" +
                     "    }\n" +
+                    /* 二级索引:声明在实体上,缺了就补,已有就不动。
+                     * `CREATE INDEX IF NOT EXISTS` 不是各家都有的写法
+                     * (MySQL 没有),所以存在性自己按方言查。 */
+                    "    static string HasIndexSql(int p) {\n" +
+                    "        if (p == DbProvider.SQLite) {\n" +
+                    "            return \"SELECT COUNT(*) FROM sqlite_master" +
+                    " WHERE type = 'index' AND name = ?\";\n" +
+                    "        }\n" +
+                    "        bool my = p == DbProvider.MySQL || p == " +
+                    "DbProvider.MariaDB;\n" +
+                    "        if (my) {\n" +
+                    "            return \"SELECT COUNT(*) FROM " +
+                    "information_schema.statistics WHERE index_name = ?" +
+                    " AND table_schema = DATABASE()\";\n" +
+                    "        }\n" +
+                    "        return \"SELECT COUNT(*) FROM pg_indexes WHERE" +
+                    " indexname = ?\";\n" +
+                    "    }\n" +
+                    "    static string IndexDdl(int p, string nm, string t, " +
+                    "string cols, bool uniq) {\n" +
+                    "        return \"CREATE \" + (uniq ? \"UNIQUE \" : \"\")" +
+                    " + \"INDEX \" + nm + \" ON \" + t + \" (\" + cols + " +
+                    "\")\";\n" +
+                    "    }\n" +
+                    "    static void EnsureIndex(IDbExecutor db, string nm, " +
+                    "string t, string cols, bool uniq) {\n" +
+                    "        int p = db.GetProvider();\n" +
+                    "        DbResult r = db.Query(__DbBind.HasIndexSql(p), " +
+                    "new DbParams().Add(nm));\n" +
+                    "        if (r.RowCount() > 0 && r.GetInt(0, 0) > 0) { " +
+                    "return; }\n" +
+                    "        db.Execute(__DbBind.IndexDdl(p, nm, t, cols, " +
+                    "uniq));\n" +
+                    "    }\n" +
+                    "    static async void EnsureIndexAsync(IDbExecutor db, " +
+                    "string nm, string t, string cols, bool uniq) {\n" +
+                    "        int p = db.GetProvider();\n" +
+                    "        DbResult r = await db.QueryAsync(" +
+                    "__DbBind.HasIndexSql(p), new DbParams().Add(nm));\n" +
+                    "        if (r.RowCount() > 0 && r.GetInt(0, 0) > 0) { " +
+                    "return; }\n" +
+                    "        int _n = await db.ExecuteAsync(" +
+                    "__DbBind.IndexDdl(p, nm, t, cols, uniq));\n" +
+                    "    }\n" +
                     "    static string HasTableSql(IDbExecutor db) {\n" +
                     "        int p = db.GetProvider();\n" +
                     "        string sql = \"SELECT COUNT(*) FROM " +
@@ -1324,6 +1757,12 @@ class GenDbEmit {
                     "            return \"INTEGER PRIMARY KEY AUTOINCREMENT\";\n" +
                     "        }\n" +
                     "        string t = \"INTEGER\";\n" +
+                    "        if (kind == 4) {\n" +
+                    "            if (p == DbProvider.SQLite) { t = " +
+                    "\"INTEGER\"; } else { t = \"BIGINT\"; }\n" +
+                    "            if (pk) { t = t + \" PRIMARY KEY\"; }\n" +
+                    "            return t;\n" +
+                    "        }\n" +
                     "        if (kind == 1) {\n" +
                     "            t = \"DOUBLE PRECISION\";\n" +
                     "            if (my) { t = \"DOUBLE\"; }\n" +
@@ -1351,7 +1790,7 @@ class GenDbEmit {
         for (int i = 0; i < need.Count; i = i + 1) {
             string cls = need[i];
             List<DbField> fs = GenDb.FieldsOf(cls, 0);
-            GenDbEmit.GenCols(outb, cls, fs);
+            GenDbEmit.GenCols(outb, cls, fs, GenDb.TableOf(cls));
             GenDbEmit.GenEntity(outb, cls);
             GenDbEmit.GenInsert(outb, cls, fs, GenDb.TableOf(cls));
             GenDbEmit.GenUpdate(outb, cls, fs, GenDb.TableOf(cls));

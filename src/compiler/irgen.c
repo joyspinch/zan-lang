@@ -1127,6 +1127,14 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->rt_co_sched_init = LLVMAddFunction(g->mod, "zan_co_sched_init", g->rt_co_sched_init_type);
     g->rt_co_sched_run_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
     g->rt_co_sched_run = LLVMAddFunction(g->mod, "zan_co_sched_run", g->rt_co_sched_run_type);
+    /* void zan_co_sched_run_until(i32* done): the same pump, stopping as soon as
+     * the flag it is given is set. A synchronous context awaiting one coroutine
+     * uses it so that a background coroutine which never completes (a flusher
+     * loop, a spawned server) cannot keep the await from returning. */
+    g->rt_co_sched_run_until_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+        (LLVMTypeRef[]){ LLVMPointerType(LLVMInt32TypeInContext(g->ctx), 0) }, 1, 0);
+    g->rt_co_sched_run_until = LLVMAddFunction(g->mod, "zan_co_sched_run_until",
+        g->rt_co_sched_run_until_type);
     {
         LLVMTypeRef i64d = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef delay_args[] = { i64d, i8ptr, g->co_step_ptr };
@@ -1332,24 +1340,43 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildRetVoid(g->builder);
         }
 
-        /* void zan_co_sched_run(void): drain the ready queue, invoking each
-         * step. When it empties, poll IO up to the earliest timer deadline.
-         * Re-check after every wake or timeout and exit only when ready work,
-         * timers, and IO are all exhausted. */
+        /* void zan_co_sched_run_until(i32* done): drain the ready queue,
+         * invoking each step. When it empties, poll IO up to the earliest timer
+         * deadline. Re-check after every wake or timeout and exit when ready
+         * work, timers, and IO are all exhausted -- or, before every step, as
+         * soon as `done` (an awaited frame's DONE flag; null = drain) is set.
+         * zan_co_sched_run() below is this function with a null flag. */
         {
-            LLVMBasicBlockRef entry_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "entry");
-            LLVMBasicBlockRef head_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "loop");
-            LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "body");
-            LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "last");
-            LLVMBasicBlockRef after_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "after");
-            LLVMBasicBlockRef timers_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "timers");
-            LLVMBasicBlockRef wait_timer = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "timer.wait");
-            LLVMBasicBlockRef io_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "io.pump");
-            LLVMBasicBlockRef exit_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "exit");
+            LLVMValueRef runfn = g->rt_co_sched_run_until;
+            LLVMTypeRef i32p = LLVMPointerType(i32t, 0);
+            LLVMBasicBlockRef entry_bb = LLVMAppendBasicBlockInContext(g->ctx, runfn, "entry");
+            LLVMBasicBlockRef head_bb = LLVMAppendBasicBlockInContext(g->ctx, runfn, "loop");
+            LLVMBasicBlockRef chk_bb = LLVMAppendBasicBlockInContext(g->ctx, runfn, "done.chk");
+            LLVMBasicBlockRef pump_bb = LLVMAppendBasicBlockInContext(g->ctx, runfn, "pump");
+            LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, runfn, "body");
+            LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(g->ctx, runfn, "last");
+            LLVMBasicBlockRef after_bb = LLVMAppendBasicBlockInContext(g->ctx, runfn, "after");
+            LLVMBasicBlockRef timers_bb = LLVMAppendBasicBlockInContext(g->ctx, runfn, "timers");
+            LLVMBasicBlockRef wait_timer = LLVMAppendBasicBlockInContext(g->ctx, runfn, "timer.wait");
+            LLVMBasicBlockRef io_bb = LLVMAppendBasicBlockInContext(g->ctx, runfn, "io.pump");
+            LLVMBasicBlockRef exit_bb = LLVMAppendBasicBlockInContext(g->ctx, runfn, "exit");
             LLVMPositionBuilderAtEnd(g->builder, entry_bb);
+            LLVMValueRef doneptr = LLVMGetParam(runfn, 0);
             LLVMBuildBr(g->builder, head_bb);
 
+            /* loop head: stop early once the flag we were handed is set. */
             LLVMPositionBuilderAtEnd(g->builder, head_bb);
+            LLVMValueRef no_flag = zan_icmp(g->builder, LLVMIntEQ, doneptr,
+                LLVMConstNull(i32p), "done.noflag");
+            LLVMBuildCondBr(g->builder, no_flag, pump_bb, chk_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, chk_bb);
+            LLVMValueRef dflag = LLVMBuildLoad2(g->builder, i32t, doneptr, "done.flag");
+            LLVMValueRef is_done = zan_icmp(g->builder, LLVMIntNE, dflag,
+                LLVMConstInt(i32t, 0, 0), "done.set");
+            LLVMBuildCondBr(g->builder, is_done, exit_bb, pump_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, pump_bb);
             LLVMValueRef head = LLVMBuildLoad2(g->builder, i8ptr, g_head, "head");
             LLVMValueRef empty = zan_icmp(g->builder, LLVMIntEQ, head,
                 LLVMConstNull(i8ptr), "q.empty");
@@ -1403,6 +1430,17 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildCondBr(g->builder, continue_run, head_bb, exit_bb);
 
             LLVMPositionBuilderAtEnd(g->builder, exit_bb);
+            LLVMBuildRetVoid(g->builder);
+        }
+
+        /* void zan_co_sched_run(void): pump with no stop flag, i.e. drain. */
+        {
+            LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx,
+                g->rt_co_sched_run, "entry");
+            LLVMPositionBuilderAtEnd(g->builder, bb);
+            zan_call2(g->builder, g->rt_co_sched_run_until_type,
+                g->rt_co_sched_run_until,
+                (LLVMValueRef[]){ LLVMConstNull(LLVMPointerType(i32t, 0)) }, 1, "");
             LLVMBuildRetVoid(g->builder);
         }
         (void)voidt;

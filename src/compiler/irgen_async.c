@@ -189,6 +189,15 @@ static void emit_async_complete(zan_irgen_t *g, local_scope_t *locals, LLVMValue
         LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_HCOUNT, "fr.hc"));
 
     emit_release_owned_locals(g, locals);
+    /* balance the ramp's receiver retain: the frame owns a +1 on `this` for
+     * as long as the coroutine runs (its caller may have dropped the temp
+     * that produced it long before) */
+    if (g->current_async_this_owned && g->current_this &&
+        g->current_async_this_type) {
+        LLVMTypeRef tty = LLVMGetAllocatedType(g->current_this);
+        emit_rc_release_for_type(g, g->current_async_this_type,
+            LLVMBuildLoad2(g->builder, tty, g->current_this, "this.rel"));
+    }
     emit_async_eh_unarm(g);
 
     /* if (awaiter != null) zan_co_ready(awaiter, awaiter_step); */

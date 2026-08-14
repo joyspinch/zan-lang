@@ -29,6 +29,11 @@ typedef void (*zan_co_step_t)(void *frame);
 void   zan_co_sched_init(void);
 void   zan_co_ready(void *frame, zan_co_step_t step);
 void   zan_co_sched_run(void);
+/* Pump like zan_co_sched_run, but return as soon as *done is non-zero. Emitted
+ * code passes the DONE flag of the frame a synchronous context is awaiting, so
+ * a background coroutine that never completes (a flusher loop, a spawned
+ * server) cannot hold that await open. NULL = drain, i.e. zan_co_sched_run. */
+void   zan_co_sched_run_until(const volatile int *done);
 size_t zan_co_pending(void);
 
 /* Release an async frame. Emitted code (--async-workers) calls this instead of

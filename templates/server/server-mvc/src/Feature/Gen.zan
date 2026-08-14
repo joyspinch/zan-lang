@@ -40,123 +40,29 @@ class Gen {
         return true;
     }
 
-    /// <summary>Physical type for a designed kind on the connected engine.</summary>
-    static string SqlType(string kind, int size, int provider) {
-        bool sqlite = provider == DbProvider.SQLite;
-        if (kind == "int" || kind == "bool") {
-            if (sqlite) { return "INTEGER"; }
-            return "INT";
-        }
-        if (kind == "long" || kind == "datetime") {
-            if (sqlite) { return "INTEGER"; }
-            return "BIGINT";
-        }
-        if (kind == "decimal") {
-            if (sqlite) { return "REAL"; }
-            return "DECIMAL(18,4)";
-        }
-        if (kind == "text") { return "TEXT"; }
-        int n = size;
-        if (n <= 0) { n = 255; }
-        if (sqlite) { return "TEXT"; }
-        return "VARCHAR(" + Convert.ToString(n) + ")";
-    }
-
-    /// <summary>One column's DDL fragment.</summary>
-    static string ColumnSql(GenColumn c, int provider) {
-        string sql = c.name + " " + Gen.SqlType(c.kind, c.size, provider);
-        if (c.nullable != 1) { sql = sql + " NOT NULL"; }
-        if (c.defValue.Length > 0 && Gen.Literal(c).Length > 0) {
-            sql = sql + " DEFAULT " + Gen.Literal(c);
-        }
-        return sql;
-    }
-
-    /// <summary>The default value as a literal, or "" when it cannot be used as
-    /// one. Text defaults are quoted with the quote doubled, numbers are only
-    /// accepted when they really are numbers.</summary>
-    static string Literal(GenColumn c) {
-        string v = c.defValue;
-        if (v.Length == 0) { return ""; }
-        if (c.kind == "int" || c.kind == "long" || c.kind == "bool"
-            || c.kind == "decimal" || c.kind == "datetime") {
-            for (int i = 0; i < v.Length; i = i + 1) {
-                string ch = v.Substring(i, 1);
-                bool digit = ch >= "0" && ch <= "9";
-                if (!digit && ch != "-" && ch != ".") { return ""; }
-            }
-            return v;
-        }
-        return "'" + v.Replace("'", "''") + "'";
-    }
-
-    /// <summary>CREATE TABLE for a design. Every table gets an identity `id`,
-    /// which the screens and the generated code rely on for row identity.</summary>
-    static string CreateSql(GenTable t, List<GenColumn> cols, int provider) {
-        string idCol = "id INTEGER PRIMARY KEY AUTOINCREMENT";
-        if (provider != DbProvider.SQLite) {
-            idCol = "id INT NOT NULL AUTO_INCREMENT PRIMARY KEY";
-        }
-        string sql = "CREATE TABLE " + t.tableName + " (" + idCol;
+    /// <summary>The design as logical column definitions. Every table gets an
+    /// identity `id`, which the screens and the generated code rely on for row
+    /// identity; the physical types are the ORM's business, not the
+    /// designer's.</summary>
+    static List<DbColumnDef> Columns(List<GenColumn> cols) {
+        List<DbColumnDef> defs = new List<DbColumnDef>();
+        defs.Add(DbColumnDef.Identity("id"));
         for (int i = 0; i < cols.Count; i = i + 1) {
-            if (cols[i].name == "id") { continue; }
-            sql = sql + ", " + Gen.ColumnSql(cols[i], provider);
+            GenColumn c = cols[i];
+            if (c.name == "id") { continue; }
+            DbColumnDef d = DbColumnDef.Of(c.name, c.kind).WithSize(c.size)
+                .WithNull(c.nullable == 1);
+            if (c.defValue.Length > 0) { d = d.WithDefault(c.defValue); }
+            defs.Add(d);
         }
-        return sql + ")";
-    }
-
-    /// <summary>The column names the physical table already has.</summary>
-    static async List<string> Existing(IDbConnection db, string table) {
-        List<string> names = new List<string>();
-        int provider = db.GetProvider();
-        string sql = "SELECT * FROM " + table + " WHERE 1 = 0";
-        if (provider == DbProvider.SQLite) {
-            sql = "PRAGMA table_info(" + table + ")";
-        }
-        DbResult r = await db.QueryAsync(sql);
-        if (r == null) { return names; }
-        if (provider == DbProvider.SQLite) {
-            for (int i = 0; i < r.RowCount(); i = i + 1) {
-                names.Add(r.GetByName(i, "name"));
-            }
-            return names;
-        }
-        for (int i = 0; i < r.ColumnCount(); i = i + 1) {
-            names.Add(r.GetColumnName(i));
-        }
-        return names;
+        return defs;
     }
 
     /// <summary>Creates the table, or adds the columns the design has and the
     /// table does not. Columns are never dropped or retyped here: that destroys
     /// data, and an operator who wants it should say so in SQL.</summary>
     static async int Migrate(IDbConnection db, GenTable t, List<GenColumn> cols) {
-        int provider = db.GetProvider();
-        List<string> have = new List<string>();
-        bool exists = true;
-        try {
-            have = await Gen.Existing(db, t.tableName);
-        } catch {
-            exists = false;
-        }
-        if (!exists || have.Count == 0) {
-            int _c = await db.ExecuteAsync(Gen.CreateSql(t, cols, provider));
-            return cols.Count;
-        }
-        int added = 0;
-        for (int i = 0; i < cols.Count; i = i + 1) {
-            GenColumn c = cols[i];
-            if (c.name == "id") { continue; }
-            bool found = false;
-            for (int j = 0; j < have.Count; j = j + 1) {
-                if (have[j] == c.name) { found = true; }
-            }
-            if (found) { continue; }
-            int _a = await db.ExecuteAsync("ALTER TABLE " + t.tableName
-                + " ADD COLUMN " + Gen.ColumnSql(c, provider));
-            added = added + 1;
-        }
-        return added;
+        return await DbSchema.MigrateAsync(db, t.tableName, Gen.Columns(cols));
     }
 
     // ---- source generation --------------------------------------------------
