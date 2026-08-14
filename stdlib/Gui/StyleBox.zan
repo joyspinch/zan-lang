@@ -65,6 +65,12 @@ class StyleBox {
     int emboss;      // 0 无，1 凸起，2 凹陷（新拟态）
     int specular;    // 1 = 边框上跟随光标的高光
     int fxId;        // 高光跟踪悬停所用的控件 id（0 = 无）
+    /// 玻璃光泽（`-zan-sheen`）：盒子内侧的一道自上而下衰减的
+    /// 高光加一圈内缘亮边，强度为 0..1000 千分比（0 = 关闭）。
+    /// 这是真实玻璃“上沿受光、边缘出亮线”的部分，声明在 CSS 里，
+    /// 由绘制盒子的每个控件统一应用。
+    int sheen;
+    int sheenColor;  // 光泽颜色（0 = 白）
 
     // ---- box metrics --------------------------------------------------------
     int padL; int padT; int padR; int padB;
@@ -127,6 +133,7 @@ class StyleBox {
         this.radiusTL = 0 - 1; this.radiusTR = 0 - 1; this.radiusBR = 0 - 1; this.radiusBL = 0 - 1;
         this.shadow = 0; this.shadowDx = 0; this.shadowDy = 0; this.shadowBlur = 0; this.shadowInset = 0;
         this.borderStyle = 0; this.emboss = 0; this.specular = 0; this.fxId = 0;
+        this.sheen = 0; this.sheenColor = 0;
         this.padL = 0 - 1; this.padT = 0 - 1; this.padR = 0 - 1; this.padB = 0 - 1;
         this.marL = 0; this.marT = 0; this.marR = 0; this.marB = 0;
         this.width = 0 - 1; this.height = 0 - 1;
@@ -169,6 +176,7 @@ class StyleBox {
         d.shadowBlur = shadowBlur; d.shadowInset = shadowInset;
         d.borderStyle = borderStyle; d.emboss = emboss;
         d.specular = specular; d.fxId = fxId;
+        d.sheen = sheen; d.sheenColor = sheenColor;
         d.padL = padL; d.padT = padT; d.padR = padR; d.padB = padB;
         d.marL = marL; d.marT = marT; d.marR = marR; d.marB = marB;
         d.width = width; d.height = height;
@@ -331,6 +339,8 @@ class StyleBox {
         d.shadow = StyleBox.MixColor(a.shadow, b.shadow, p);
         d.opacity = App.Lerp(a.opacity, b.opacity, p);
         d.blur = App.Lerp(a.blur, b.blur, p);
+        d.sheen = App.Lerp(a.sheen, b.sheen, p);
+        d.sheenColor = StyleBox.MixColor(a.sheenColor, b.sheenColor, p);
         d.borderW = StyleBox.MixMetric(a.borderW, b.borderW, p);
         d.borderTopW = StyleBox.MixMetric(a.borderTopW, b.borderTopW, p);
         d.borderRightW = StyleBox.MixMetric(a.borderRightW, b.borderRightW, p);
@@ -439,8 +449,16 @@ class StyleBox {
         if (r > rmax) { r = rmax; }
 
         if (blur > 0) {
-            c.BlurRectCached(rx, ry, rw, rh, app.Scale(blur),
-                             app.NextBlurSlot(), app.BackdropDirty());
+            // 把磨砂输出裁进盒子的圆角内：方形模糊会把角落
+            // 的背景一起糊掉，之后的圆角填充再也补不回来。
+            if (r > 0) {
+                c.BlurRoundCached(rx, ry, rw, rh, app.Scale(blur),
+                                  app.NextBlurSlot(), app.BackdropDirty(),
+                                  r, this.Corners());
+            } else {
+                c.BlurRectCached(rx, ry, rw, rh, app.Scale(blur),
+                                 app.NextBlurSlot(), app.BackdropDirty());
+            }
         }
 
         if (shadow != 0 && shadowInset == 0) {
@@ -469,6 +487,10 @@ class StyleBox {
                                 App.ScaleAlpha(this.Fade(shadow), 1000 - ia * 250), 1);
                 ia = ia + 1;
             }
+        }
+
+        if (sheen > 0) {
+            this.PaintSheen(app, rx, ry, rw, rh, r);
         }
 
         this.PaintBorders(app, rx, ry, rw, rh, r);
@@ -543,6 +565,55 @@ class StyleBox {
         c.PopClip();
     }
 
+    /// 玻璃光泽（`-zan-sheen`）：上半部分一道自上而下衰减到透明的
+    /// 高光带（裁进盒子的上圆角），加一圈 1px 内缘亮边，上沿最亮。
+    /// 这就是液态玻璃“受光面 + 出亮线”的部分，皮肤按强度声明，
+    /// 所有画 box 的控件统一得到同样的质感。
+    void PaintSheen(App app, int x, int y, int w, int h, int r) {
+        Canvas c = app.canvas;
+        int str = sheen;
+        if (opacity < 1000) { str = str * opacity / 1000; }
+        if (str <= 0) { return; }
+        int col = sheenColor;
+        if (col == 0) { col = (int)4294967295; }
+        int corners = this.Corners();
+
+        // 受光带：盒子上半部（至多 120px），顶部最亮、向下淡出。
+        // 逐行填充并按圆角内缩（与分带渐变同一套轮廓），高光因此
+        // 不会溢出圆角；FillRect 对半透明色按 alpha 混合，磨砂背景
+        // 仍然透出来。
+        int bandH = h / 2;
+        int cap = app.Scale(120);
+        if (bandH > cap) { bandH = cap; }
+        int peak = App.ScaleAlpha(col, str * 55 / 100);
+        int row = 0;
+        while (row < bandH) {
+            int fade = 1000 - row * 1000 / bandH;
+            int insetL = 0;
+            int insetR = 0;
+            if (row < r) {
+                int ins = StyleBox.CornerInsetAt(r, row);
+                if ((corners / Corner.TL() % 2) == 1) { insetL = ins; }
+                if ((corners / Corner.TR() % 2) == 1) { insetR = ins; }
+            }
+            int rowW = w - insetL - insetR;
+            if (rowW > 0) {
+                c.FillRect(x + insetL, y + row, rowW, 1,
+                           App.ScaleAlpha(peak, fade));
+            }
+            row = row + 1;
+        }
+
+        // 内缘亮边：整圈一道细光，上沿再压一条更亮的高光线。
+        c.DrawRoundRectIn(x, y, w, h, r, corners,
+                          App.ScaleAlpha(col, str * 45 / 100), 1);
+        int lipX = x + r;
+        int lipW = w - r * 2;
+        if (lipW > 0) {
+            c.FillRect(lipX, y, lipW, 1, App.ScaleAlpha(col, str * 85 / 100));
+        }
+    }
+
     /// 带圆角半径的渐变填充：盒子为方形时直接用 FillVGrad，
     /// 否则使用内缩到圆角轮廓的分带填充（渲染器
     /// 没有圆角渐变原语）。
@@ -553,7 +624,11 @@ class StyleBox {
         if (bgDir == 3) {
             int sw = from; from = to; to = sw;
         }
-        if (r <= 0 && bgDir != 1) {
+        bool opaque = StyleBox.AlphaOf(from) == 255 && StyleBox.AlphaOf(to) == 255;
+        if (r <= 0 && bgDir != 1 && opaque) {
+            // FillVGrad 直接覆写像素（壁纸/实心按钮要的就是这个），会
+            // 盖掉底下的磨砂背景，因此半透明端点走下面的分带路径
+            // （逐行 FillRect 会按 alpha 混合）。
             c.FillVGrad(x, y, w, h, from, to);
             return;
         }
