@@ -227,6 +227,25 @@ static void clip_reset_full(zan_surface_t *s) {
     s->clip_depth = 0;
 }
 
+/* Rect (x1/y1 exclusive) versus the active clip window: 0 when the region
+ * cannot write a single pixel this frame. Region operations whose cost is paid
+ * up front (blur: downsample + 3 box passes, plus the source checksum) test
+ * this first, instead of computing the result and then having the per-pixel
+ * clip test throw all of it away -- which is what a damage-clipped frame did
+ * to every frosted panel outside the damage strip. */
+static int clip_hits(zan_surface_t *s, int x0, int y0, int x1, int y1) {
+    if (x1 <= s->clip_x0 || x0 >= s->clip_x1) return 0;
+    if (y1 <= s->clip_y0 || y0 >= s->clip_y1) return 0;
+    return 1;
+}
+
+/* True when the clip window contains the whole rect, i.e. every pixel of the
+ * region is writable this frame. */
+static int clip_covers(zan_surface_t *s, int x0, int y0, int x1, int y1) {
+    return x0 >= s->clip_x0 && y0 >= s->clip_y0
+        && x1 <= s->clip_x1 && y1 <= s->clip_y1;
+}
+
 /* True when (x,y) lies outside the surface or the active clip window. */
 static int clipped_out(zan_surface_t *s, int x, int y) {
     if (x < 0 || x >= s->width || y < 0 || y >= s->height) return 1;
@@ -675,6 +694,7 @@ static void zan_blur_rect_core(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 r
     int y1 = clamp_i((int)(y + h), 0, s->height);
     int rw = x1 - x0, rh = y1 - y0;
     if (rw <= 0 || rh <= 0) return;
+    if (!clip_hits(s, x0, y0, x1, y1)) return;
     int r = (int)radius;
     if (r < 1) return;
     if (r > 40) r = 40;
@@ -896,6 +916,11 @@ static void zan_blur_cached_core(
     int y1 = clamp_i((int)(y + h), 0, s->height);
     int rw = x1 - x0, rh = y1 - y0;
     if (rw <= 0 || rh <= 0) return;
+    /* Damage-clipped frame, panel outside the strip: nothing of this region is
+     * writable, so neither the cached restore nor a re-blur would change a
+     * pixel. Leave the slot untouched (it stays valid for the next full frame)
+     * and skip even the checksum. */
+    if (!clip_hits(s, x0, y0, x1, y1)) return;
     int r = (int)radius;
     if (r < 1) return;
     if (r > 40) r = 40;
@@ -925,6 +950,12 @@ static void zan_blur_cached_core(
     /* Recompute in place (identical clamping), then snapshot into the slot. */
     u32 fresh = geom_ok ? sum : zan_src_sum(s, x0, y0, rw, rh);
     zan_blur_rect_core(surface_id, x, y, w, h, radius, cr, cmask);
+    /* Only part of the region was writable (the panel straddles the damage
+     * strip), so the surface now holds blurred pixels inside the strip and the
+     * untouched backdrop outside it. Snapshotting that mixture would hand a
+     * later frame a half-sharp "blur"; drop the slot and let the next full
+     * frame refill it. */
+    if (!clip_covers(s, x0, y0, x1, y1)) { c->valid = 0; return; }
     if (c->cap < n) {
         u32 *np = (u32 *)realloc(c->pixels, n * sizeof(u32));
         if (!np) { c->valid = 0; return; }

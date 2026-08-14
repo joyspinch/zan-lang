@@ -273,9 +273,23 @@ class App {
     // 可以从缓存提供。参见 BackdropDirty()。
     bool backdropDirty;
 
-    // 逐帧计数器，按绘制顺序为每个玻璃表面分配稳定的模糊缓存槽位
+    // 匿名玻璃表面的逐帧序号（按绘制顺序编身份）。
     // 在 BeginFrame 中重置；由 NextBlurSlot() 递增。
     int blurSlotSeq;
+
+    // 模糊缓存槽的常驻分配表：blurSlotKey[i] 是占用第 i 槽的
+    // 元素身份（0=空槽），blurSlotUse[i] 是它最后被用到的帧号。
+    // 槽位过去按绘制顺序逐帧发放，于是某一帧多画/少画一个玻璃
+    // 面板，它后面所有面板都会平移一格，各自捡到别人的缓存——
+    // 几何不符 => 全部重新模糊。改为按身份查表后，同一元素每帧
+    // 拿回同一槽，与绘制顺序和邻居的出现/消失无关；表满时淘汰
+    // 最久未用的槽。
+    List<int> blurSlotKey;
+    List<int> blurSlotUse;
+    // blurSlotNew[i] 是第 i 槽最后一次换手（分配给新身份）的帧号：
+    // 换手的槽里是别的元素的像素，本帧必须当作脏区重算一次（几何
+    // 恰好相同时运行时的几何校验发现不了）。
+    List<int> blurSlotNew;
 
     // 壁纸背景缓存失效。渐变 + 柔和色块
     // 是静态的：它们只取决于窗口大小和当前皮肤，而不取决于
@@ -449,6 +463,16 @@ class App {
         this.fxDamage = null;
         this.backdropDirty = true;
         this.blurSlotSeq = 0;
+        this.blurSlotKey = new List<int>();
+        this.blurSlotUse = new List<int>();
+        this.blurSlotNew = new List<int>();
+        int bs = 0;
+        while (bs < 64) {
+            this.blurSlotKey.Add(0);
+            this.blurSlotUse.Add(0);
+            this.blurSlotNew.Add(-1);
+            bs = bs + 1;
+        }
         // gen != snapGen 时壁纸只绘制（并快照）一次，
         // 之后从缓存恢复，直到皮肤/尺寸变化。
         this.bgThemeGen = 1;
@@ -546,7 +570,21 @@ class App {
     void ApplyAppCss() {
         if (appCss == "") { return; }
         if (sheet == null) { sheet = new StyleSheet(); }
-        sheet.MergeSheet(StyleSheet.FromCss(appCss));
+        // 应用 CSS 认得当前主题 token 与皮肤的 :root 变量：写
+        // `color: var(--text-primary)` 的应用样式表跟着皮肤走，而不是
+        // 展开成空值（var() 过去只在同一份源文本内查找）。这些外来
+        // 变量只用于展开，不写进 sheet.vars——那份表代表皮肤自己声明
+        // 了什么（Skin.ThemeOf 按它推导主题）。
+        List<string> vn = new List<string>();
+        List<string> vv = new List<string>();
+        Css.CollectVars(Style.RootFromTheme(theme), vn, vv);
+        if (sheet.vars != null) {
+            for (int i = 0; i < sheet.vars.Count(); i = i + 1) {
+                vn.Add(sheet.vars.KeyAt(i));
+                vv.Add(sheet.vars.ValAt(i).AsString(""));
+            }
+        }
+        sheet.MergeSheet(Css.ParseWith(appCss, vn, vv));
     }
 
     /// 直接安装样式表（应用内编写的 CSS 文本，或以
@@ -1711,8 +1749,10 @@ class App {
         // （模糊 + 半透明主题着色 + 微弱白色光泽），
         // 使边框与玻璃主体协调，而非落在扁平的实色条上。
         if (t.glass != 0) {
+            // 标题栏是每帧同一个元素：固定身份，永不换槽。
+            int tslot = this.BlurSlotFor(1);
             c.BlurRectCached(0, 0, W, hbar, Scale(22),
-                NextBlurSlot(), BackdropDirty());
+                tslot, this.BackdropDirtyIn(tslot, 0, 0, W, hbar));
             c.FillRect(0, 0, W, hbar, 200 * 16777216 + (t.bgSecondary % 16777216));
             c.FillRect(0, 0, W, hbar, 26 * 16777216 + (t.textPrimary % 16777216));
         } else {
@@ -1955,6 +1995,22 @@ class App {
         return backdropDirty;
     }
 
+    /// 这块玻璃区域本帧是否需要重新模糊。整窗帧同 BackdropDirty()；
+    /// 损伤裁剪帧只有与脏矩形相交的区域才算脏——条带外的面板一个
+    /// 像素也写不出去，重算纯属白费（连校验和都不用算）。
+    /// 另外 slot 本帧刚换手时必须重算：里面是上一位主人的像素。
+    bool BackdropDirtyIn(int slot, int x, int y, int w, int h) {
+        if (slot < 0) { return true; }
+        if (slot < blurSlotNew.Count && blurSlotNew[slot] == frameCount) {
+            return true;
+        }
+        if (!backdropDirty) { return false; }
+        if (!partialFrame) { return true; }
+        if (x + w <= dmgX || dmgX + dmgW <= x) { return false; }
+        if (y + h <= dmgY || dmgY + dmgH <= y) { return false; }
+        return true;
+    }
+
     void ReuseBackdrop() {
         backdropDirty = false;
     }
@@ -1963,13 +2019,66 @@ class App {
         return focus.pressedId >= 0;
     }
 
-    /// 分配下一个稳定的每帧模糊缓存槽（按绘制顺序）。超出
-    /// 缓存容量的槽回退为未缓存模糊。
+    /// 为匿名玻璃表面（没有控件身份可用）取模糊缓存槽：以
+    /// 「本帧第 n 个匿名面板」为身份，等价于旧的按绘制顺序分配。
     int NextBlurSlot() {
-        int s = blurSlotSeq;
         blurSlotSeq = blurSlotSeq + 1;
-        if (s > 63) { return -1; }
-        return s;
+        return this.BlurSlotFor(0 - blurSlotSeq);
+    }
+
+    /// 玻璃面板的身份键。控件 id（StyleBox.fxId 之类）给 idKey；
+    /// 没有 id 可用时用 BlurKey(kind, 几何)：位置/尺寸不变的面板
+    /// 至少能每帧拿回同一个槽。两者分奇偶两个命名空间（id 键为奇、
+    /// 几何键为偶），不会互相撞车；匿名面板用负键。
+    int BlurKeyId(int id) {
+        if (id == 0) { return 0; }
+        int k = id;
+        if (k < 0) { k = 0 - k; }
+        return k * 2 + 1;
+    }
+
+    int BlurKey(int kind, int x, int y, int w, int h) {
+        int k = kind * 1000003 + x * 9176 + y * 313 + w * 31 + h;
+        if (k < 0) { k = 0 - k; }
+        return k * 2 + 2;
+    }
+
+    /// 按稳定身份 `key` 取该玻璃面板的模糊缓存槽：同一元素每帧
+    /// 拿到同一个槽，因此绘制顺序变化、别处的面板出现或消失都不再
+    /// 让它丢掉缓存。key=0 视为匿名，退回按绘制顺序。返回 -1 表示
+    /// 无槽可用（回退为未缓存模糊）。
+    int BlurSlotFor(int key) {
+        if (key == 0) { return this.NextBlurSlot(); }
+        int free = -1;
+        int lru = 0;
+        int lruUse = -1;
+        int i = 0;
+        while (i < 64) {
+            if (blurSlotKey[i] == key) {
+                blurSlotUse[i] = frameCount;
+                return i;
+            }
+            if (blurSlotKey[i] == 0) {
+                if (free < 0) { free = i; }
+            } else if (blurSlotUse[i] != frameCount
+                       && (lruUse < 0 || blurSlotUse[i] < lruUse)) {
+                // 本帧已经用过的槽不参与淘汰：否则一屏超过 64 块
+                // 玻璃时，后面的面板会抢走前面面板刚拿到的槽，
+                // 每帧互相踢来踢去，谁的缓存都留不住。
+                lru = i;
+                lruUse = blurSlotUse[i];
+            }
+            i = i + 1;
+        }
+        int slot = free;
+        if (slot < 0) {
+            if (lruUse < 0) { return -1; }
+            slot = lru;
+        }
+        blurSlotKey[slot] = key;
+        blurSlotUse[slot] = frameCount;
+        blurSlotNew[slot] = frameCount;
+        return slot;
     }
 
     /// 上报焦点文本控件的插入符位置（客户区像素），使 IME
@@ -2265,13 +2374,14 @@ class App {
             // 将磨砂模糊裁剪到面板的圆角半径内，
             // 使角落保留锐利的壁纸；方形模糊上叠加半透明圆角色调
             // 永远无法把模糊的角落重新画回背景。
+            int gslot = this.BlurSlotFor(this.BlurKey(1, x, y, w, h));
+            bool gdirty = this.BackdropDirtyIn(gslot, x, y, w, h);
             if (radius > 0) {
                 canvas.BlurRoundCached(x, y, w, h, this.Scale(36),
-                                       this.NextBlurSlot(), this.BackdropDirty(),
-                                       radius, 15);
+                                       gslot, gdirty, radius, 15);
             } else {
                 canvas.BlurRectCached(x, y, w, h, this.Scale(36),
-                                      this.NextBlurSlot(), this.BackdropDirty());
+                                      gslot, gdirty);
             }
             canvas.FillRoundRect(x, y, w, h, radius, Style.Fade(color, 520));
         } else {
@@ -2284,6 +2394,9 @@ class App {
         theme.ScaleByDpi(dpiScale);
         this.ApplySurfaceTranslucency();
         bgThemeGen = bgThemeGen + 1;
+        // 应用 CSS 里的 var(--token) 是按主题展开的，换了主题就要
+        // 按新调色板重新展开一遍（否则应用样式表还挂着旧颜色）。
+        this.ApplyAppCss();
         needsRedraw = true;
     }
 
@@ -2898,7 +3011,8 @@ class App {
         animRectAll = false;
         // 本帧正在重新渲染，槽位 7 的 fx 快照已过期。
         fxSnapValid = false;
-        // 玻璃表面从头开始重新分配稳定的模糊缓存槽位。
+        // 匿名玻璃表面的逐帧编号从头开始（有身份的面板走
+        // BlurSlotFor 的常驻表，跨帧保持自己的槽）。
         blurSlotSeq = 0;
         wheelOwnerOrder = wheelCapOrder;
         wheelClaimSeq = 0;
