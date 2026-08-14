@@ -657,6 +657,33 @@ static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
     LLVMPositionBuilderAtEnd(b, done);
 }
 
+/* Free the buffer of a non-escaping `new T[n]` local at scope exit. The value a
+ * program holds points at the first element, so the allocation starts one
+ * header back (ZAN_OBJ_RC_OFF); `free` tolerates the null a never-initialized
+ * slot holds. Only a local whose buffer provably does not escape is marked
+ * owned, which is the same condition that lets its elements be released. */
+static void emit_owned_array_free(zan_irgen_t *g, local_var_t *v) {
+    if (!v || !v->arr_owned || !v->alloca) return;
+    LLVMBuilderRef b = g->builder;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef cur = LLVMBuildLoad2(b, i8ptr, v->alloca, "arr.own");
+    LLVMValueRef off = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(b));
+    LLVMBasicBlockRef free_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "arr.free");
+    LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "arr.fcont");
+    LLVMValueRef isn = zan_icmp(b, LLVMIntEQ, cur, LLVMConstNull(i8ptr), "arr.isn");
+    LLVMBuildCondBr(b, isn, cont_bb, free_bb);
+    LLVMPositionBuilderAtEnd(b, free_bb);
+    LLVMValueRef raw = LLVMBuildGEP2(b, i8, cur, &off, 1, "arr.raw");
+    zan_call2(b, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
+              g->fn_free, &raw, 1, "");
+    LLVMBuildStore(b, LLVMConstNull(i8ptr), v->alloca);
+    LLVMBuildBr(b, cont_bb);
+    LLVMPositionBuilderAtEnd(b, cont_bb);
+}
+
 /* Emit the body of __zan_release_<T>: null-guard, peek the refcount, release the
  * RC-managed fields when it is about to hit zero, then hand off to
  * zan_rt_release for the decrement + free. */

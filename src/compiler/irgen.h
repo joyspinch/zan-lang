@@ -432,6 +432,9 @@ struct zan_irgen {
     LLVMValueRef current_async_frame;
     LLVMTypeRef  current_async_frame_type;
     LLVMValueRef current_async_resume_fn; /* the $resume fn being emitted */
+    /* body AST of that async method: current_fn_body stays NULL while a
+     * $resume is lowered, so whole-body analyses (array escape) read this. */
+    zan_ast_node_t *current_async_body;
     /* declared return type of the async method being emitted: the frame result
      * slot is encoded/decoded against it (see coerce_to_frame_result) */
     zan_type_t  *current_async_ret_type;

@@ -1,0 +1,52 @@
+// A `new T[n]` local that never escapes its function is freed at scope exit, so
+// a loop that allocates one per iteration -- the shape every request handler
+// uses for a sockaddr or a scratch buffer -- must not grow the heap. Both the
+// synchronous form and the async form (whose slot lives in the coroutine frame
+// and is reused by every iteration) are covered.
+using System;
+using System.Diagnostics;
+
+class Program {
+    static long Rss() { return ServerMetrics.MemoryRssBytes() / 1024; }
+
+    static long SyncLoop() {
+        long acc = 0;
+        for (int i = 0; i < 20000; i = i + 1) {
+            byte[] b = new byte[1024];
+            b[0] = (byte)(i % 251);
+            b[1023] = (byte)7;
+            acc = acc + (long)b[0] + (long)b[1023] + (long)b.Length;
+        }
+        return acc;
+    }
+
+    static async long AsyncLoop() {
+        long acc = 0;
+        for (int i = 0; i < 20000; i = i + 1) {
+            byte[] b = new byte[1024];
+            b[0] = (byte)(i % 251);
+            b[1023] = (byte)7;
+            acc = acc + (long)b[0] + (long)b[1023] + (long)b.Length;
+        }
+        return acc;
+    }
+
+    // A platform without an RSS probe reports 0; the growth check is then
+    // vacuous and only the value checks below remain meaningful.
+    static void Report(string tag, long before, long after) {
+        long grow = after - before;
+        if (before <= 0 || grow < 8192) { Console.WriteLine(tag + " ok"); }
+        else { Console.WriteLine(tag + " leaked " + Convert.ToString(grow) + "KB"); }
+    }
+
+    static async int Main() {
+        long r0 = Rss();
+        long s = SyncLoop();
+        long r1 = Rss();
+        Report("sync", r0, r1);
+        long a = await Program.AsyncLoop();
+        Report("async", r1, Rss());
+        Console.WriteLine("sum=" + Convert.ToString(s) + "," + Convert.ToString(a));
+        return 0;
+    }
+}

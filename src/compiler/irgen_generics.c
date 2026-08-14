@@ -770,6 +770,7 @@ static void emit_release_owned_locals_except(zan_irgen_t *g, local_scope_t *loca
                 LLVMInt64TypeInContext(g->ctx), locals->vars[i].arr_len, "arr.n");
             emit_array_release_elems(g, locals->vars[i].type->element_type, a, nn);
         }
+        emit_owned_array_free(g, &locals->vars[i]);
     }
 }
 
@@ -797,6 +798,7 @@ static void emit_release_owned_locals_range(zan_irgen_t *g, local_scope_t *local
                 LLVMInt64TypeInContext(g->ctx), locals->vars[i].arr_len, "arr.n");
             emit_array_release_elems(g, locals->vars[i].type->element_type, a, nn);
         }
+        emit_owned_array_free(g, &locals->vars[i]);
     }
 }
 
@@ -881,7 +883,9 @@ static void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals
                 LLVMInt64TypeInContext(g->ctx), locals->vars[i].arr_len, "arr.n");
             emit_array_release_elems(g, locals->vars[i].type->element_type, a, nn);
         }
+        if (!terminated) emit_owned_array_free(g, &locals->vars[i]);
         locals->vars[i].arr_len = NULL;
+        locals->vars[i].arr_owned = 0;
         locals->vars[i].arc_owned = 0;
     }
     locals->count = start;

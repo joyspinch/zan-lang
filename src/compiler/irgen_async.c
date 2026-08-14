@@ -1358,7 +1358,9 @@ static void arr_escape_stmt(zan_istr_t nm, zan_ast_node_t *st, int *esc) {
 }
 static int rc_array_local_escapes(zan_irgen_t *g, zan_istr_t nm) {
     int esc = 0;
-    if (g->current_fn_body) arr_escape_stmt(nm, g->current_fn_body, &esc);
+    zan_ast_node_t *body = g->current_fn_body ? g->current_fn_body
+                                             : g->current_async_body;
+    if (body) arr_escape_stmt(nm, body, &esc);
     else esc = 1; /* unknown body: conservative */
     return esc;
 }

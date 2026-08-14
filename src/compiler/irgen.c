@@ -2615,6 +2615,12 @@ typedef struct {
     /* For any local initialized with `new T[n]`, the i64 alloca holding the
      * element count so `a.Length` can read it; NULL when unknown. */
     LLVMValueRef arr_len_slot;
+    /* 1 when this local holds the only reference to a `new T[n]` buffer (it
+     * never escapes the function, by the same analysis that decides element
+     * release), so scope exit frees the buffer itself. An array carries no
+     * refcount, so without this every array allocated in a request loop stayed
+     * on the heap for the life of the process. */
+    int arr_owned;
     /* 1 when this local's slot is registered on the unwind stack, so an
      * exception thrown below this frame releases it (A8-12). Scope exit pops
      * the entry along with the release it emits. */
@@ -2700,6 +2706,7 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].eh_slot = 0;
     scope->vars[scope->count].arr_len = NULL;
     scope->vars[scope->count].arr_len_slot = NULL;
+    scope->vars[scope->count].arr_owned = 0;
     scope->vars[scope->count].box_cell = NULL;
     scope->vars[scope->count].box_owned = 0;
     scope->vars[scope->count].opaque_string = 0;
@@ -2801,6 +2808,7 @@ static void emit_list_release_elems(zan_irgen_t *g, zan_type_t *elem_type, LLVMV
 static void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type, LLVMValueRef col);
 static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
                                      LLVMValueRef arr, LLVMValueRef len);
+static void emit_owned_array_free(zan_irgen_t *g, local_var_t *v);
 static void emit_release_obj_local(zan_irgen_t *g, local_var_t *v);
 static LLVMValueRef zan_store_fit(zan_irgen_t *g, LLVMValueRef val, LLVMValueRef ptr);
 

@@ -674,6 +674,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         LLVMValueRef saved_async_frame = g->current_async_frame;
         LLVMTypeRef saved_async_frame_type = g->current_async_frame_type;
         LLVMValueRef saved_async_resume_fn = g->current_async_resume_fn;
+        zan_ast_node_t *saved_async_body = g->current_async_body;
         zan_type_t *saved_async_ret_type = g->current_async_ret_type;
         LLVMValueRef saved_async_switch = g->current_async_switch;
         int saved_next_state = g->current_async_next_state;
@@ -708,6 +709,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_frame = sframe;
         g->current_async_frame_type = frame_type;
         g->current_async_resume_fn = resume_fn;
+        g->current_async_body = member->method_decl.body;
         g->current_async_ret_type = concretize(g,
             member->method_decl.return_type
                 ? zan_binder_resolve_type(g->binder, member->method_decl.return_type)
@@ -801,6 +803,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_frame = saved_async_frame;
         g->current_async_frame_type = saved_async_frame_type;
         g->current_async_resume_fn = saved_async_resume_fn;
+        g->current_async_body = saved_async_body;
         g->current_async_ret_type = saved_async_ret_type;
         g->current_async_switch = saved_async_switch;
         g->current_async_next_state = saved_next_state;
