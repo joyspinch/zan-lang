@@ -507,6 +507,15 @@ partial class CodeEditor {
     /// 不变，偏移仍可映射回原文），扫描因此永远不会
     /// 匹配到注释文字或字面量中的名称。
     static string StripCode(string line) {
+        // 绝大多数行既无字面量也无注释：先按字节看一眼，那样的行
+        // 原串就是结果，不必逐字符重建一份。扫描把整个
+        // 项目的每一行都过一遍，这里的分配量就是总体开销。
+        bool plain = true;
+        for (int s = 0; s < line.Length; s = s + 1) {
+            int b = line[s];
+            if (b == 34 || b == 39 || b == 47) { plain = false; break; }
+        }
+        if (plain) { return line; }
         string outp = "";
         int i = 0;
         bool inStr = false;
@@ -565,14 +574,19 @@ partial class CodeEditor {
     int ScanRefs(string name, int declLine, List<int> outLines) {
         // 成员的引用应通过其所属类型到达。仅按名称
         // 时，`WebApp.Create` 的列表曾包含其他所有类型的 `Create`。
-        string owner = CodeEditor.EnclosingTypeAt(lines, declLine);
+        EnsureRefIndex();
+        string owner = "";
+        if (declLine >= 0 && declLine < refIdx.owners.Count) {
+            owner = refIdx.owners[declLine];
+        }
         if (owner.Length > 0) {
-            return CodeEditor.CountMemberRefsIn(lines, name, owner, outLines);
+            return CodeEditor.CountMemberRefsPre(refIdx, name, owner, outLines);
         }
         int total = 0;
-        for (int li = 0; li < lines.Count; li = li + 1) {
-            if (li != declLine && CodeEditor.DeclNameAt(lines[li]) != name) {
-                string s = CodeEditor.StripCode(lines[li]);
+        for (int li = 0; li < lines.Count && li < refIdx.stripped.Count;
+             li = li + 1) {
+            if (li != declLine && refIdx.decls[li] != name) {
+                string s = refIdx.stripped[li];
                 int from = 0;
                 while (true) {
                     int p = CodeEditor.FindCallSite(s, name, from);
@@ -590,40 +604,109 @@ partial class CodeEditor {
     /// 以 "Owner.member" 为键。一次性遍历其他项目源码构建
     /// —— 每个声明只拆分一次 —— 并保留到宿主重新提供
     /// 源码或加载其他文件为止。
-    void EnsureExternRefs() {
-        if (!extRefDirty) { return; }
+    void EnsureExternRefs() { StepExternRefs(0); }
+
+    /// 当前缓冲区的扫描索引，按 TextStamp() 记忆。跳转、CodeLens
+    /// 和引用列表都靠它，而它与被查的成员无关：一屏几十个声明
+    /// 各自重建一份时，单个声明的统计就要 50 ms。
+    void EnsureRefIndex() {
+        int stamp = TextStamp();
+        if (refIdx != null && refStamp == stamp) { return; }
+        refIdx = CeFileIndex.Of(lines);
+        refStamp = stamp;
+    }
+
+    /// 开始一轮跨文件统计：收集本缓冲区的声明，计数清零。
+    void BeginExternRefs() {
         extRefDirty = false;
         extRefKeys = new List<string>();
         extRefVals = new List<int>();
-        List<string> owners = new List<string>();
-        CodeEditor.OwnerPerLine(lines, owners);
-        List<string> dOwner = new List<string>();
-        List<string> dName = new List<string>();
-        for (int li = 0; li < lines.Count; li = li + 1) {
-            string dn = CodeEditor.DeclNameAt(lines[li]);
-            if (dn.Length > 0 && li < owners.Count && owners[li].Length > 0) {
-                string key = owners[li] + "." + dn;
-                if (!CodeEditor.Has(extRefKeys, key)) {
-                    extRefKeys.Add(key);
-                    extRefVals.Add(0);
-                    dOwner.Add(owners[li]);
-                    dName.Add(dn);
-                }
+        extRefDeclOwner = new List<string>();
+        extRefDeclName = new List<string>();
+        // 上一轮可能停在某个文件中间，那份进度对新一轮无效。
+        extRefFileIdx = null;
+        extRefDeclAt = 0;
+        extRefOwnerCur = "";
+        extRefFamily = null;
+        extRefRecvs = null;
+        EnsureRefIndex();
+        for (int li = 0; li < refIdx.decls.Count; li = li + 1) {
+            string dn = refIdx.decls[li];
+            if (dn.Length == 0) { continue; }
+            if (li >= refIdx.owners.Count || refIdx.owners[li].Length == 0) {
+                continue;
             }
+            string key = refIdx.owners[li] + "." + dn;
+            if (CodeEditor.Has(extRefKeys, key)) { continue; }
+            extRefKeys.Add(key);
+            extRefVals.Add(0);
+            extRefDeclOwner.Add(refIdx.owners[li]);
+            extRefDeclName.Add(dn);
         }
-        if (dName.Count == 0) { return; }
-        for (int f = 0; f < projFileSrc.Count; f = f + 1) {
-            List<string> fl = CodeEditor.SplitLines(projFileSrc[f]);
-            for (int d = 0; d < dName.Count; d = d + 1) {
-                extRefVals[d] = extRefVals[d]
-                    + CodeEditor.CountMemberRefsIn(fl, dName[d], dOwner[d], null);
-            }
-        }
+        extRefAt = 0;
+        if (extRefDeclName.Count == 0) { extRefAt = 0 - 1; }
     }
 
-    /// 本缓冲区之外 `owner.member` 的调用点数（未知为 0）。
+    /// 跨文件统计推进至多 `kbBudget` KB 的扫描量（一个声明扫一个
+    /// 文件即该文件的字节数），<=0 表示一口气做完。一口气做完
+    /// 意味着打开文件后的第一帧要扫完整个项目：实测本 IDE 工程
+    /// 3 s，更大的工程两分钟。因此绘制路径只给预算，进度
+    /// （文件下标、声明下标、当前文件的索引与接收者）留在帧之间；
+    /// 未算完时 CodeLens 先不显示数字，靠 lensPending 请求的重绘
+    /// 接着算下一批。预算按字节而非文件计，一个大文件也不会
+    /// 独占一帧。
+    void StepExternRefs(int kbBudget) {
+        if (extRefDirty) { BeginExternRefs(); }
+        if (extRefAt < 0) { return; }
+        int spent = 0;
+        while (extRefAt < projFileSrc.Count) {
+            string body = projFileSrc[extRefAt];
+            int kb = body.Length / 1024 + 1;
+            if (extRefFileIdx == null) {
+                if (kbBudget > 0 && spent >= kbBudget) { return; }
+                extRefFileIdx = CeFileIndex.OfText(body);
+                extRefDeclAt = 0;
+                extRefOwnerCur = "";
+                extRefFamily = null;
+                extRefRecvs = null;
+                // 建索引要拆行、抹除、划分 owner、逐行取声明名。
+                spent = spent + kb * 4;
+            }
+            while (extRefDeclAt < extRefDeclName.Count) {
+                if (kbBudget > 0 && spent >= kbBudget) { return; }
+                // 同一声明类型的接收者在一个文件里只收集一次
+                // （声明按行序归类，同类型的连成一段）。
+                if (extRefFamily == null
+                    || extRefDeclOwner[extRefDeclAt] != extRefOwnerCur) {
+                    extRefOwnerCur = extRefDeclOwner[extRefDeclAt];
+                    extRefFamily = new List<string>();
+                    extRefRecvs = new List<string>();
+                    CodeEditor.MemberRecvsPre(extRefFileIdx.stripped,
+                        extRefOwnerCur, extRefFamily, extRefRecvs);
+                    // 收集接收者要为类型家族的每个成员扫一遍本文件。
+                    spent = spent + kb * extRefFamily.Count;
+                }
+                extRefVals[extRefDeclAt] = extRefVals[extRefDeclAt]
+                    + CodeEditor.CountMemberRefsWith(extRefFileIdx,
+                        extRefFamily, extRefRecvs,
+                        extRefDeclName[extRefDeclAt], null);
+                extRefDeclAt = extRefDeclAt + 1;
+                spent = spent + kb;
+            }
+            extRefAt = extRefAt + 1;
+            extRefFileIdx = null;
+        }
+        extRefAt = 0 - 1;
+        extRefFileIdx = null;
+    }
+
+    /// 本缓冲区之外 `owner.member` 的调用点数（未知为 0）；跨文件
+    /// 统计尚未算完时返回 -1。
     int ExternRefCount(string owner, string member) {
-        EnsureExternRefs();
+        // 一次最多扫 512 KB 源码（实测约 4 ms）；一帧里绘制路径
+        // 至多取 lensBudget 个计数，因此一帧的统计开销有上限。
+        StepExternRefs(512);
+        if (extRefAt >= 0) { return 0 - 1; }
         string key = owner + "." + member;
         for (int i = 0; i < extRefKeys.Count; i = i + 1) {
             if (extRefKeys[i] == key) { return extRefVals[i]; }
@@ -635,11 +718,20 @@ partial class CodeEditor {
     /// 项目其他文件中的。只统计缓冲区时，调用方在其他文件的方法
     /// 会显示 "0 references"，而这正是
     /// 项目对外暴露内容的常态。
+    /// 跨文件统计还没算完时返回 -1，与预算耗尽同义：调用方
+    /// 不绘制未统计完的数字。
     int LensRefCount(string name, int declLine) {
-        int local = ScanRefs(name, declLine, null);
-        string owner = CodeEditor.EnclosingTypeAt(lines, declLine);
-        if (owner.Length == 0) { return local; }
-        return local + ExternRefCount(owner, name);
+        EnsureRefIndex();
+        string owner = "";
+        if (declLine >= 0 && declLine < refIdx.owners.Count) {
+            owner = refIdx.owners[declLine];
+        }
+        if (owner.Length == 0) { return ScanRefs(name, declLine, null); }
+        // 先推进跨文件统计：没算完就不必扫本缓冲区，
+        // 这一帧的数字反正画不出来。
+        int ext = ExternRefCount(owner, name);
+        if (ext < 0) { return 0 - 1; }
+        return ScanRefs(name, declLine, null) + ext;
     }
 
     /// LensRefCount() 按成员名记忆化，每帧至多重算 `lensBudget`
@@ -659,6 +751,13 @@ partial class CodeEditor {
         }
         lensBudget = lensBudget - 1;
         int v = LensRefCount(name, declLine);
+        // 跨文件统计还在分批推进：本帧没有可写入的计数，
+        // 保留上次的值（或先不画），下一帧接着算。
+        if (v < 0) {
+            lensPending = true;
+            if (at >= 0) { return lensVals[at]; }
+            return 0 - 1;
+        }
         if (at >= 0) {
             lensVals[at] = v;
             lensFresh[at] = 1;

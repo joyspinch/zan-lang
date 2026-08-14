@@ -5,6 +5,35 @@ using Gui.Widget;
 
 namespace Gui.Component.CodeEditor;
 
+/// 一份源文件的扫描预处理：抹除了字面量/注释的行、每行所在
+/// 类型体的 owner，以及每行声明的成员名（未声明为 ""）。
+/// 引用统计对每个成员都要走一遍全文，这三份数据与成员无关，
+/// 因此按文件算一次就够：CodeLens 统计一屏声明的代价原本
+/// 与「声明数 × 项目字节数」相乘，就出在这里。
+class CeFileIndex {
+    List<string> stripped;
+    List<string> owners;
+    List<string> decls;
+
+    static CeFileIndex Of(List<string> ls) {
+        CeFileIndex idx = new CeFileIndex();
+        idx.stripped = new List<string>();
+        CodeEditor.StripCodeInto(ls, idx.stripped);
+        idx.owners = new List<string>();
+        CodeEditor.OwnerPerLinePre(idx.stripped, idx.owners);
+        idx.decls = new List<string>();
+        for (int i = 0; i < idx.stripped.Count; i = i + 1) {
+            idx.decls.Add(CodeEditor.DeclNameAt(idx.stripped[i]));
+        }
+        return idx;
+    }
+
+    /// 源文本的索引（宿主给的项目源码是整篇文本）。
+    static CeFileIndex OfText(string body) {
+        return CeFileIndex.Of(CodeEditor.SplitLines(body));
+    }
+}
+
 /// CodeEditor 分部：由 `zanc --emit-symbols` 生成的符号索引。
 ///
 /// 补全此前用 CodeEditor.Completion.zan 中手写的表回答成员查询，
@@ -122,20 +151,25 @@ partial class CodeEditor {
             int p = CodeEditor.FindFrom(s, word, at);
             if (p < 0) { return 0 - 1; }
             at = p + word.Length;
-            bool okL = p == 0 || !CodeEditor.IsIdentChar(s.Substring(p - 1, 1));
-            bool okR = at >= s.Length || !CodeEditor.IsIdentChar(s.Substring(at, 1));
+            bool okL = p == 0 || !CodeEditor.IsIdentByte(s[p - 1]);
+            bool okR = at >= s.Length || !CodeEditor.IsIdentByte(s[at]);
             if (okL && okR) { return p; }
         }
     }
 
     /// `line` 贡献的净花括号嵌套量，忽略字面量和注释。
     static int BraceDelta(string line) {
-        string s = CodeEditor.StripCode(line);
+        return CodeEditor.BraceDeltaPre(CodeEditor.StripCode(line));
+    }
+
+    /// 已抹除字面量/注释的行的净花括号嵌套量。谁持有
+    /// 抹除结果就由谁传入，同一行不必为了数花括号再抹一遍。
+    static int BraceDeltaPre(string s) {
         int d = 0;
         for (int i = 0; i < s.Length; i = i + 1) {
-            string ch = s.Substring(i, 1);
-            if (ch == "{") { d = d + 1; }
-            else if (ch == "}") { d = d - 1; }
+            int b = s[i];
+            if (b == 123) { d = d + 1; }
+            else if (b == 125) { d = d - 1; }
         }
         return d;
     }
@@ -143,15 +177,31 @@ partial class CodeEditor {
     /// 对 `ls` 的每一行，给出包含该行的类型体的类型名
     /// （类型外为 ""），按行序追加到 `outOwners`。
     static void OwnerPerLine(List<string> ls, List<string> outOwners) {
+        List<string> stripped = new List<string>();
+        CodeEditor.StripCodeInto(ls, stripped);
+        CodeEditor.OwnerPerLinePre(stripped, outOwners);
+    }
+
+    /// 按行抹除字面量/注释，结果追加到 `outStripped`。一份
+    /// 抹除结果可供 owner 划分、变量收集和引用统计共用。
+    static void StripCodeInto(List<string> ls, List<string> outStripped) {
+        for (int i = 0; i < ls.Count; i = i + 1) {
+            outStripped.Add(CodeEditor.StripCode(ls[i]));
+        }
+    }
+
+    /// OwnerPerLine，但行已经抹除过。
+    static void OwnerPerLinePre(List<string> stripped, List<string> outOwners) {
         List<string> stack = new List<string>();
         List<int> depths = new List<int>();
         int depth = 0;
-        for (int i = 0; i < ls.Count; i = i + 1) {
-            string tn = CodeEditor.TypeNameOn(CodeEditor.StripCode(ls[i]));
+        for (int i = 0; i < stripped.Count; i = i + 1) {
+            string s = stripped[i];
+            string tn = CodeEditor.TypeNameOn(s);
             if (tn.Length > 0) { stack.Add(tn); depths.Add(depth); }
             if (stack.Count > 0) { outOwners.Add(stack[stack.Count - 1]); }
             else { outOwners.Add(""); }
-            depth = depth + CodeEditor.BraceDelta(ls[i]);
+            depth = depth + CodeEditor.BraceDeltaPre(s);
             while (stack.Count > 0 && depth <= depths[depths.Count - 1]) {
                 stack.RemoveAt(stack.Count - 1);
                 depths.RemoveAt(depths.Count - 1);
@@ -172,7 +222,7 @@ partial class CodeEditor {
     /// （该处字符不属于标识符时返回 ""）。
     static string IdentBefore(string s, int end) {
         int a = end;
-        while (a > 0 && CodeEditor.IsIdentChar(s.Substring(a - 1, 1))) { a = a - 1; }
+        while (a > 0 && CodeEditor.IsIdentByte(s[a - 1])) { a = a - 1; }
         if (a >= end) { return ""; }
         return s.Substring(a, end - a);
     }
@@ -183,8 +233,16 @@ partial class CodeEditor {
     /// `app.MaxBody` 正是借此被识别为 WebApp 的 MaxBody。
     static void CollectTypedVars(List<string> ls, string typeName,
             List<string> outNames) {
-        for (int i = 0; i < ls.Count; i = i + 1) {
-            string s = CodeEditor.StripCode(ls[i]);
+        List<string> stripped = new List<string>();
+        CodeEditor.StripCodeInto(ls, stripped);
+        CodeEditor.CollectTypedVarsPre(stripped, typeName, outNames);
+    }
+
+    /// CollectTypedVars，但行已经抹除过。
+    static void CollectTypedVarsPre(List<string> stripped, string typeName,
+            List<string> outNames) {
+        for (int i = 0; i < stripped.Count; i = i + 1) {
+            string s = stripped[i];
             int at = 0;
             while (true) {
                 int p = CodeEditor.FindWordFrom(s, typeName, at);
@@ -241,32 +299,57 @@ partial class CodeEditor {
     /// 同名声明会被跳过。给定 `outLines` 时行号追加到其中。
     static int CountMemberRefsIn(List<string> ls, string member, string owner,
             List<int> outLines) {
-        List<string> recvs = new List<string>();
-        recvs.Add("this");
-        recvs.Add("base");
-        // 成员属于 `owner`，但可通过任何
-        // 继承它的类型*到达*：写在派生类型名上，或
-        // 声明为该派生类型的变量上，都是对同一成员的引用。
+        return CodeEditor.CountMemberRefsPre(CeFileIndex.Of(ls), member, owner,
+            outLines);
+    }
+
+    /// CountMemberRefsIn，但行索引已由调用方备好。统计一个
+    /// 文件里的多个成员时预处理只做一次；每个成员都重做
+    /// 一遍曾让 CodeLens 的跳转代价与声明数相乘。
+    static int CountMemberRefsPre(CeFileIndex idx, string member, string owner,
+            List<int> outLines) {
         List<string> family = new List<string>();
-        family.Add(owner);
-        CodeEditor.SymbolSubtypesOf(owner, family);
-        for (int fi = 0; fi < family.Count; fi = fi + 1) {
-            if (!CodeEditor.Has(recvs, family[fi])) { recvs.Add(family[fi]); }
-            CodeEditor.CollectTypedVars(ls, family[fi], recvs);
+        List<string> recvs = new List<string>();
+        CodeEditor.MemberRecvsPre(idx.stripped, owner, family, recvs);
+        return CodeEditor.CountMemberRefsWith(idx, family, recvs, member,
+            outLines);
+    }
+
+    /// `owner` 成员在这些行上的可能接收者（及类型家族）。
+    /// 成员属于 `owner`，但可通过任何继承它的类型*到达*：
+    /// 写在派生类型名上，或声明为该派生类型的变量上，
+    /// 都是对同一成员的引用。
+    static void MemberRecvsPre(List<string> stripped, string owner,
+            List<string> outFamily, List<string> outRecvs) {
+        outRecvs.Add("this");
+        outRecvs.Add("base");
+        outFamily.Add(owner);
+        CodeEditor.SymbolSubtypesOf(owner, outFamily);
+        for (int fi = 0; fi < outFamily.Count; fi = fi + 1) {
+            if (!CodeEditor.Has(outRecvs, outFamily[fi])) {
+                outRecvs.Add(outFamily[fi]);
+            }
+            CodeEditor.CollectTypedVarsPre(stripped, outFamily[fi], outRecvs);
         }
-        List<string> owners = new List<string>();
-        CodeEditor.OwnerPerLine(ls, owners);
+    }
+
+    /// 成员引用统计的内层：抹除行、逐行 owner、类型家族与
+    /// 接收者均已备好。
+    static int CountMemberRefsWith(CeFileIndex idx, List<string> family,
+            List<string> recvs, string member, List<int> outLines) {
+        List<string> stripped = idx.stripped;
+        List<string> owners = idx.owners;
         int total = 0;
-        for (int li = 0; li < ls.Count; li = li + 1) {
-            if (CodeEditor.DeclNameAt(ls[li]) != member) {
-                string s = CodeEditor.StripCode(ls[li]);
+        for (int li = 0; li < stripped.Count; li = li + 1) {
+            string s = stripped[li];
+            if (idx.decls[li] != member) {
                 int from = 0;
                 while (true) {
                     int p = CodeEditor.FindWordFrom(s, member, from);
                     if (p < 0) { break; }
                     from = p + member.Length;
                     bool ok = false;
-                    if (p > 0 && s.Substring(p - 1, 1) == ".") {
+                    if (p > 0 && s[p - 1] == 46) {
                         ok = CodeEditor.Has(recvs, CodeEditor.IdentBefore(s, p - 1));
                     } else if (li < owners.Count) {
                         ok = CodeEditor.Has(family, owners[li]);
