@@ -43,10 +43,30 @@ class ViewData {
 }
 
 /// <summary>
+/// One node of a compiled template: templates are parsed once (View.LoadDir)
+/// into a tree, so rendering is a walk that only appends -- no scanning for
+/// tags and no substring copies on the request path.
+/// </summary>
+class VNode {
+    // 0 literal, 1 escaped variable, 2 raw variable, 3 #if, 4 #each,
+    // 5 {{content}} (layout hole)
+    int kind;
+    string text;        // literal text, or the variable/list name
+    List<VNode> body;   // children of #if / #each
+
+    VNode(int kind, string text) {
+        this.kind = kind;
+        this.text = text;
+        this.body = null;
+    }
+}
+
+/// <summary>
 /// In-memory template engine. All templates under the views directory are
-/// read from disk ONCE at startup (View.LoadDir) and rendered from memory
-/// afterwards -- request handling never touches the filesystem, mirroring
-/// the "templates live in memory" design of the original swoole framework.
+/// read from disk and compiled ONCE at startup (View.LoadDir) and rendered
+/// from memory afterwards -- request handling never touches the filesystem
+/// nor re-parses the template text, mirroring the "templates live in memory"
+/// design of the original swoole framework.
 ///
 /// Syntax:
 ///   {{name}}                  HTML-escaped variable
@@ -56,12 +76,12 @@ class ViewData {
 ///   layout.html + {{content}} wraps every RenderPage() body
 /// </summary>
 class View {
-    StrMap templates;      // name -> template source (in memory)
+    Dictionary<string, List<VNode>> compiled;  // name -> parsed template
     string dir;
     bool devReload;        // dev only: re-read templates on each render
 
     View() {
-        this.templates = new StrMap();
+        this.compiled = new Dictionary<string, List<VNode>>();
         this.dir = "";
         this.devReload = false;
     }
@@ -79,7 +99,20 @@ class View {
         return v;
     }
 
-    void LoadAll() { this.LoadRec(this.dir, ""); }
+    void LoadAll() {
+        this.compiled = new Dictionary<string, List<VNode>>();
+        this.LoadRec(this.dir, "");
+    }
+
+    // Store a template under `key`, compiled once so renders never re-parse.
+    void Put(string key, string body) {
+        List<VNode> nodes = View.Compile(body);
+        if (this.compiled.ContainsKey(key)) {
+            this.compiled[key] = nodes;
+        } else {
+            this.compiled.Add(key, nodes);
+        }
+    }
 
     // Recursively load templates, keying each by its module-qualified path so
     // that same-named controllers in different modules don't collide. A file
@@ -95,11 +128,11 @@ class View {
             if (fn.Length > 5 && fn.Substring(fn.Length - 5, 5) == ".html") {
                 string stem = fn.Substring(0, fn.Length - 5);
                 string body = File.ReadAllText(d + "/" + fn);
-                this.templates.Set(prefix + stem, body);
+                this.Put(prefix + stem, body);
                 // Only a root-level layout.html (no module prefix) becomes the
                 // global fallback -- a per-module one (e.g. "Admin.layout")
                 // stays scoped to that module so it doesn't clobber others.
-                if (stem == "layout" && prefix.Length == 0) { this.templates.Set("layout", body); }
+                if (stem == "layout" && prefix.Length == 0) { this.Put("layout", body); }
             }
         }
         List<string> dirs = Directory.GetDirectories(d);
@@ -116,9 +149,13 @@ class View {
     /// <summary>Renders a template by name from the in-memory cache.</summary>
     string Render(string name, ViewData data) {
         if (this.devReload) { this.LoadAll(); }
-        string tpl = this.templates.Get(name);
-        if (tpl.Length == 0) { return "<!-- view not found: " + name + " -->"; }
-        return View.RenderStr(tpl, data, null);
+        List<VNode> nodes = null;
+        if (!this.compiled.TryGetValue(name, out nodes)) {
+            return "<!-- view not found: " + name + " -->";
+        }
+        StringBuilder sb = new StringBuilder();
+        View.Emit(nodes, data, null, null, sb);
+        return sb.ToString();
     }
 
     /// <summary>Renders `name` wrapped in the nearest layout.html:
@@ -133,71 +170,104 @@ class View {
         int dot = name.IndexOf(".");
         if (dot > 0) {
             string modLayout = name.Substring(0, dot) + ".layout";
-            if (this.templates.Get(modLayout).Length > 0) { layoutKey = modLayout; }
+            if (this.compiled.ContainsKey(modLayout)) { layoutKey = modLayout; }
         }
-        string layout = this.templates.Get(layoutKey);
-        if (layout.Length == 0) { return inner; }
-        return View.ReplaceOnce(View.RenderStr(layout, data, null), "{{content}}", inner);
+        List<VNode> layout = null;
+        if (!this.compiled.TryGetValue(layoutKey, out layout)) { return inner; }
+        // The layout's {{content}} hole receives the rendered view directly,
+        // so wrapping a page costs no extra scan of the finished layout.
+        StringBuilder sb = new StringBuilder();
+        View.Emit(layout, data, null, inner, sb);
+        return sb.ToString();
     }
 
     // ---- engine core ----
 
-    static string RenderStr(string tpl, ViewData data, StrMap row) {
-        StringBuilder sb = new StringBuilder();
+    /// <summary>Parses template text into nodes. Called once per template at
+    /// load time; the scanning and slicing here never happens on a render.</summary>
+    static List<VNode> Compile(string tpl) {
+        List<VNode> nodes = new List<VNode>();
         int i = 0;
         int n = tpl.Length;
         while (i < n) {
             int open = View.Find(tpl, "{{", i);
             if (open < 0) {
-                sb.Append(tpl.Substring(i, n - i));
-                return sb.ToString();
+                nodes.Add(new VNode(0, tpl.Substring(i, n - i)));
+                return nodes;
             }
-            sb.Append(tpl.Substring(i, open - i));
+            if (open > i) { nodes.Add(new VNode(0, tpl.Substring(i, open - i))); }
             // {{{raw}}}
-            if (open + 2 < n && tpl.Substring(open + 2, 1) == "{") {
+            if (open + 2 < n && (tpl[open + 2] & 255) == 123) {
                 int close = View.Find(tpl, "}}}", open + 3);
-                if (close < 0) { return sb.ToString(); }
-                string key = View.Trim(tpl.Substring(open + 3, close - open - 3));
-                sb.Append(View.Lookup(key, data, row));
+                if (close < 0) { return nodes; }
+                nodes.Add(new VNode(2,
+                    View.Trim(tpl.Substring(open + 3, close - open - 3))));
                 i = close + 3;
             } else {
                 int close = View.Find(tpl, "}}", open + 2);
-                if (close < 0) { return sb.ToString(); }
+                if (close < 0) { return nodes; }
                 string tag = View.Trim(tpl.Substring(open + 2, close - open - 2));
                 if (tag.Length > 4 && tag.Substring(0, 4) == "#if ") {
-                    string key = View.Trim(tag.Substring(4, tag.Length - 4));
                     int endIf = View.FindTag(tpl, "{{/if}}", close + 2);
-                    if (endIf < 0) { return sb.ToString(); }
-                    string body = tpl.Substring(close + 2, endIf - close - 2);
-                    string val = View.Lookup(key, data, row);
-                    if (val.Length > 0 && val != "0" && val != "false") {
-                        sb.Append(View.RenderStr(body, data, row));
-                    }
+                    if (endIf < 0) { return nodes; }
+                    VNode node = new VNode(3,
+                        View.Trim(tag.Substring(4, tag.Length - 4)));
+                    node.body = View.Compile(
+                        tpl.Substring(close + 2, endIf - close - 2));
+                    nodes.Add(node);
                     i = endIf + 7;
                 } else if (tag.Length > 6 && tag.Substring(0, 6) == "#each ") {
-                    string key = View.Trim(tag.Substring(6, tag.Length - 6));
                     int endEach = View.FindTag(tpl, "{{/each}}", close + 2);
-                    if (endEach < 0) { return sb.ToString(); }
-                    string body = tpl.Substring(close + 2, endEach - close - 2);
-                    List<StrMap> rows = null;
-                    if (data != null) { rows = data.ListOf(key); }
-                    if (rows != null) {
-                        for (int r = 0; r < rows.Count; r = r + 1) {
-                            sb.Append(View.RenderStr(body, data, rows[r]));
-                        }
-                    }
+                    if (endEach < 0) { return nodes; }
+                    VNode node = new VNode(4,
+                        View.Trim(tag.Substring(6, tag.Length - 6)));
+                    node.body = View.Compile(
+                        tpl.Substring(close + 2, endEach - close - 2));
+                    nodes.Add(node);
                     i = endEach + 9;
                 } else if (tag == "content") {
-                    // handled by RenderPage; emit placeholder unchanged
-                    sb.Append("{{content}}");
+                    nodes.Add(new VNode(5, ""));
                     i = close + 2;
                 } else {
-                    sb.Append(View.HtmlEscape(View.Lookup(tag, data, row)));
+                    nodes.Add(new VNode(1, tag));
                     i = close + 2;
                 }
             }
         }
-        return sb.ToString();
+        return nodes;
+    }
+
+    // Walk a compiled template, appending to `sb`. `content` fills a layout's
+    // {{content}} hole; outside a layout the placeholder is emitted unchanged,
+    // matching the old text-substitution behavior.
+    static void Emit(List<VNode> nodes, ViewData data, StrMap row,
+                     string content, StringBuilder sb) {
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            VNode nd = nodes[i];
+            if (nd.kind == 0) {
+                sb.Append(nd.text);
+            } else if (nd.kind == 1) {
+                sb.Append(View.HtmlEscape(View.Lookup(nd.text, data, row)));
+            } else if (nd.kind == 2) {
+                sb.Append(View.Lookup(nd.text, data, row));
+            } else if (nd.kind == 3) {
+                string val = View.Lookup(nd.text, data, row);
+                if (val.Length > 0 && val != "0" && val != "false") {
+                    View.Emit(nd.body, data, row, content, sb);
+                }
+            } else if (nd.kind == 4) {
+                List<StrMap> rows = null;
+                if (data != null) { rows = data.ListOf(nd.text); }
+                if (rows != null) {
+                    for (int r = 0; r < rows.Count; r = r + 1) {
+                        View.Emit(nd.body, data, rows[r], content, sb);
+                    }
+                }
+            } else {
+                if (content == null) { sb.Append("{{content}}"); }
+                else { sb.Append(content); }
+            }
+        }
     }
 
     static string Lookup(string key, ViewData data, StrMap row) {
@@ -265,12 +335,6 @@ class View {
             }
         }
         return -1;
-    }
-
-    static string ReplaceOnce(string s, string what, string with) {
-        int p = View.Find(s, what, 0);
-        if (p < 0) { return s; }
-        return s.Substring(0, p) + with + s.Substring(p + what.Length);
     }
 
     static string Trim(string s) {
