@@ -586,29 +586,21 @@ class StyleBox {
         int corners = this.Corners();
 
         // 受光带：盒子上半部（至多 120px），顶部最亮、向下淡出。
-        // 逐行填充并按圆角内缩（与分带渐变同一套轮廓），高光因此
-        // 不会溢出圆角；FillRect 对半透明色按 alpha 混合，磨砂背景
-        // 仍然透出来。
+        // 用圆角渐变原语画，上圆角由栅格化器按覆盖率抗锯齿（与
+        // 圆角填充同一轮廓），高光既不溢出圆角也不在角上留阶梯；
+        // 端点带 alpha，逐像素混合，磨砂背景仍然透出来。
         int bandH = h / 2;
         int cap = app.Scale(120);
         if (bandH > cap) { bandH = cap; }
         int peak = App.ScaleAlpha(col, str * 55 / 100);
-        int row = 0;
-        while (row < bandH) {
-            int fade = 1000 - row * 1000 / bandH;
-            int insetL = 0;
-            int insetR = 0;
-            if (row < r) {
-                int ins = StyleBox.CornerInsetAt(r, row);
-                if ((corners / Corner.TL() % 2) == 1) { insetL = ins; }
-                if ((corners / Corner.TR() % 2) == 1) { insetR = ins; }
-            }
-            int rowW = w - insetL - insetR;
-            if (rowW > 0) {
-                c.FillRect(x + insetL, y + row, rowW, 1,
-                           App.ScaleAlpha(peak, fade));
-            }
-            row = row + 1;
+        if (bandH > 0) {
+            // 渐变矩形取 2*bandH 高、中间色停靠点设为全透明：在
+            // bandH 处正好淡到 0，其后各行 alpha 为 0（不落像素），
+            // 于此同时矩形足够高，圆角半径不会被原语按半高夹小、
+            // 高光也就不会溢出盒子的圆角。
+            int clear = App.ScaleAlpha(peak, 0);
+            c.FillGradMask(x, y, w, bandH * 2, r, corners & Corner.Top(), 0,
+                           peak, clear, clear);
         }
 
         // 内缘亮边：整圈一道细光，上沿再压一条更亮的高光线。
@@ -621,9 +613,8 @@ class StyleBox {
         }
     }
 
-    /// 带圆角半径的渐变填充：盒子为方形时直接用 FillVGrad，
-    /// 否则使用内缩到圆角轮廓的分带填充（渲染器
-    /// 没有圆角渐变原语）。
+    /// 带圆角半径的渐变填充：方形不透明渐变直接用 FillVGrad，
+    /// 其余交给抗锯齿的圆角渐变原语 FillGradMask。
     void PaintGradient(App app, int x, int y, int w, int h, int r) {
         Canvas c = app.canvas;
         int from = this.Fade(bg);
@@ -633,207 +624,21 @@ class StyleBox {
         }
         bool opaque = StyleBox.AlphaOf(from) == 255 && StyleBox.AlphaOf(to) == 255;
         if (r <= 0 && bgDir != 1 && opaque) {
-            // FillVGrad 直接覆写像素（壁纸/实心按钮要的就是这个），会
-            // 盖掉底下的磨砂背景，因此半透明端点走下面的分带路径
-            // （逐行 FillRect 会按 alpha 混合）。
+            // FillVGrad 直接覆写像素（壁纸/实心按钮要的就是这个），
+            // 是方形不透明渐变的最快路径。
             c.FillVGrad(x, y, w, h, from, to);
             return;
         }
-        if (bgDir == 1) {
-            // 水平：垂直条带（无原生原语）。穿过
-            // 圆角弧的列做逐列内缩（与
-            // 垂直路径的逐行内缩镜像对应），使弧成为平滑的 1px
-            // 贴合圆角遮罩的切口；中间直线部分用
-            // 满高条带填充。在此之前，圆角只是在方形填充上
-            // 描一圈 1px 轮廓，导致每个渐变
-            // 按钮方形上都带着一道淡淡的弧。
-            int bands = w / 4;
-            if (bands < 8) { bands = 8; }
-            if (bands > 96) { bands = 96; }
-            int bw = (w + bands - 1) / bands;
-            int corners = this.Corners();
-            int i = 0;
-            while (i < bands) {
-                int bx = x + i * bw;
-                if (bx >= x + w) { i = bands; }
-                else {
-                    int seg = bw;
-                    if (bx + seg > x + w) { seg = x + w - bx; }
-                    int p = i * 1000 / bands;
-                    int col = StyleBox.MixColor(from, to, p);
-                    if (bgVia != 0) { col = StyleBox.ViaColor(from, bgVia, to, p); }
-                    if (r > 0 && (bx < x + r || bx + seg > x + w - r)) {
-                        int colX = bx;
-                        while (colX < bx + seg) {
-                            int insetT = 0;
-                            int insetB = 0;
-                            int dl = colX - x;
-                            int dr = x + w - colX - 1;
-                            if (dl < r) {
-                                int ins = StyleBox.CornerInsetAt(r, dl);
-                                if ((corners / Corner.TL() % 2) == 1) { insetT = ins; }
-                                if ((corners / Corner.BL() % 2) == 1) { insetB = ins; }
-                            }
-                            if (dr < r) {
-                                int ins = StyleBox.CornerInsetAt(r, dr);
-                                if ((corners / Corner.TR() % 2) == 1) {
-                                    if (ins > insetT) { insetT = ins; }
-                                }
-                                if ((corners / Corner.BR() % 2) == 1) {
-                                    if (ins > insetB) { insetB = ins; }
-                                }
-                            }
-                            int top = y + insetT;
-                            int bot = y + h - insetB;
-                            if (bot > top) { c.FillRect(colX, top, 1, bot - top, col); }
-                            colX = colX + 1;
-                        }
-                    } else {
-                        c.FillRect(bx, y, seg, h, col);
-                    }
-                    i = i + 1;
-                }
-            }
-            if (r > 0) { this.PaintCornerMask(app, x, y, w, h, r); }
-            return;
-        }
-        // 垂直（或近似垂直的对角线）带圆角：
-        // 中间直线部分用条带，圆角弧用单像素行。
-        // 整条条带内缩到弧内会把圆角变成
-        // 与条带等高的阶梯，在大表面上看起来像锯齿；
-        // 逐行内缩遵循 FillRoundRect 绘制的同一轮廓，并且
-        // 尊重圆角遮罩，使焊接邻居的方形接缝保持
-        // 方形，而不会被圆成小凸块。
-        int corners = this.Corners();
-        int bands = h / 3;
-        if (bands < 8) { bands = 8; }
-        if (bands > 96) { bands = 96; }
-        int bh = (h + bands - 1) / bands;
-        int k = 0;
-        while (k < bands) {
-            int by = y + k * bh;
-            if (by >= y + h) { k = bands; }
-            else {
-                int seg = bh;
-                if (by + seg > y + h) { seg = y + h - by; }
-                int p = k * 1000 / bands;
-                int col = StyleBox.MixColor(from, to, p);
-                if (bgVia != 0) { col = StyleBox.ViaColor(from, bgVia, to, p); }
-                if (by < y + r || by + seg > y + h - r) {
-                    int row = by;
-                    while (row < by + seg) {
-                        int rowRel = row - y;
-                        int insetL = 0;
-                        int insetR = 0;
-                        if (rowRel < r) {
-                            int ins = StyleBox.CornerInsetAt(r, rowRel);
-                            if ((corners / Corner.TL() % 2) == 1) { insetL = ins; }
-                            if ((corners / Corner.TR() % 2) == 1) { insetR = ins; }
-                        }
-                        if (rowRel >= h - r) {
-                            int ins = StyleBox.CornerInsetAt(r, h - rowRel - 1);
-                            if ((corners / Corner.BL() % 2) == 1) {
-                                if (ins > insetL) { insetL = ins; }
-                            }
-                            if ((corners / Corner.BR() % 2) == 1) {
-                                if (ins > insetR) { insetR = ins; }
-                            }
-                        }
-                        c.FillRect(x + insetL, row, w - insetL - insetR, 1, col);
-                        row = row + 1;
-                    }
-                } else {
-                    c.FillRect(x, by, w, seg, col);
-                }
-                k = k + 1;
-            }
-        }
-        if (r > 0) { this.PaintCornerMask(app, x, y, w, h, r); }
-    }
-
-    /// 重新绘制圆角轮廓，使分带渐变填充保持干净的
-    /// 抗锯齿圆角。裁剪到每个角的方形区域，只描弧的 AA
-    /// 环——条带的直线边已经是精确的
-    /// 像素填充，用单一平色重画会让渐变
-    /// 出现条纹。每个弧使用盒子对应端的渐变颜色（左/上角用
-    /// 起始色，右/下角用结束色），并且
-    /// 只有盒子实际圆角的角（圆角遮罩）才画弧，因此
-    /// 焊接组的方形接缝保持方形。
-    void PaintCornerMask(App app, int x, int y, int w, int h, int r) {
-        Canvas c = app.canvas;
-        int corners = this.Corners();
-        if (corners == 0 || r <= 0) { return; }
-        int colA = this.Fade(bg);
-        int colB = colA;
-        if (bgTo != 0) {
-            colB = this.Fade(bgTo);
-            if (bgDir == 3) { int sw = colA; colA = colB; colB = sw; }
-        }
-        // 水平：渐变从左到右，左角取
-        // 起始色，右角取结束色。垂直/对角：
-        // 渐变从上到下，上角取起始色。
-        bool horiz = bgDir == 1;
-        int colTL = colA;
-        int colTR = 0;
-        int colBL = 0;
-        int colBR = colB;
-        if (horiz) { colTR = colB; colBL = colA; }
-        else { colTR = colA; colBL = colB; }
-        if ((corners / Corner.TL() % 2) == 1) {
-            c.PushClip(x, y, r, r);
-            c.DrawRoundRectIn(x, y, w, h, r, Corner.TL(), colTL, 1);
-            c.PopClip();
-        }
-        if ((corners / Corner.TR() % 2) == 1) {
-            c.PushClip(x + w - r, y, r, r);
-            c.DrawRoundRectIn(x + w - r, y, w, h, r, Corner.TR(), colTR, 1);
-            c.PopClip();
-        }
-        if ((corners / Corner.BL() % 2) == 1) {
-            c.PushClip(x, y + h - r, r, r);
-            c.DrawRoundRectIn(x, y + h - r, w, h, r, Corner.BL(), colBL, 1);
-            c.PopClip();
-        }
-        if ((corners / Corner.BR() % 2) == 1) {
-            c.PushClip(x + w - r, y + h - r, r, r);
-            c.DrawRoundRectIn(x + w - r, y + h - r, w, h, r, Corner.BR(), colBR, 1);
-            c.PopClip();
-        }
-    }
-
-    /// 圆角矩形在行偏移 `dy` 处的水平内缩（在圆角弧
-    /// 之外为 0），使条带能贴合轮廓。
-    static int CornerInset(int r, int dy, int seg, int h) {
-        if (r <= 0) { return 0; }
-        int d = dy;
-        if (dy > h - r) { d = h - dy - seg; }
-        else { d = dy; }
-        if (d >= r) { return 0; }
-        if (d < 0) { d = 0; }
-        int arm = r - d;
-        int inner = r * r - arm * arm;
-        if (inner < 0) { inner = 0; }
-        return r - Fx.Isqrt(inner);
-    }
-
-    /// 距盒子边缘 `d` px 处圆角弧的内缩量（边缘处为 0，弧顶处为 r）：
-    /// 该偏移处轮廓的内缩量，超出弧之后为 0。
-    /// 让渐变条带能沿任一轴跟随圆角轮廓——
-    /// 垂直条带在其所在列按弧内缩上下，
-    /// 水平条带在其所在行内缩左右——无需逐像素采样。
-    static int CornerInsetAt(int r, int d) {
-        if (r <= 0 || d >= r) { return 0; }
-        if (d < 0) { d = 0; }
-        int arm = r - d;
-        int inner = r * r - arm * arm;
-        if (inner < 0) { inner = 0; }
-        return r - Fx.Isqrt(inner);
-    }
-
-    /// 三段渐变采样（`from` -> 50% 处的 `via` -> `to`）。
-    static int ViaColor(int from, int via, int to, int p) {
-        if (p < 500) { return StyleBox.MixColor(from, via, p * 2); }
-        return StyleBox.MixColor(via, to, (p - 500) * 2);
+        // 圆角/半透明/水平渐变都交给 FillGradMask：圆角弧由
+        // 栅格化器按覆盖率抗锯齿（与 FillRoundRect 同一轮廓），
+        // 半透明端点逐像素混合。此前这里用逐行/逐列内缩的
+        // 分带填充近似圆角，边缘是整像素阶梯，再描一圈 1px 弧
+        // 也盖不住，渐变面板/按钮的圆角因此有毛刺。
+        int dirCode = 0;
+        if (bgDir == 1) { dirCode = 1; }
+        int via = 0;
+        if (bgVia != 0) { via = this.Fade(bgVia); }
+        c.FillGradMask(x, y, w, h, r, this.Corners(), dirCode, from, via, to);
     }
 
     /// 任一侧已设置时绘制各边边框，否则绘制统一边框。
@@ -851,20 +656,67 @@ class StyleBox {
             }
             return;
         }
+        // 各边边框：圆角处的直条要按半径内缩，缺口用抗锯齿的
+        // 圆角描边（裁剪到该角的方块）补上——否则直条会顶到
+        // 盒子的方角外面，圆角上就露出一段直角毛刺。
+        int cn = this.Corners();
+        int rTL = 0; int rTR = 0; int rBL = 0; int rBR = 0;
+        if (r > 0) {
+            if ((cn / Corner.TL() % 2) == 1) { rTL = r; }
+            if ((cn / Corner.TR() % 2) == 1) { rTR = r; }
+            if ((cn / Corner.BL() % 2) == 1) { rBL = r; }
+            if ((cn / Corner.BR() % 2) == 1) { rBR = r; }
+        }
         if (borderTopW > 0) {
-            c.FillRect(x, y, w, borderTopW, this.SideColor(borderTopColor));
+            c.FillRect(x + rTL, y, w - rTL - rTR, borderTopW,
+                       this.SideColor(borderTopColor));
         }
         if (borderBottomW > 0) {
-            c.FillRect(x, y + h - borderBottomW, w, borderBottomW,
-                       this.SideColor(borderBottomColor));
+            c.FillRect(x + rBL, y + h - borderBottomW, w - rBL - rBR,
+                       borderBottomW, this.SideColor(borderBottomColor));
         }
         if (borderLeftW > 0) {
-            c.FillRect(x, y, borderLeftW, h, this.SideColor(borderLeftColor));
+            c.FillRect(x, y + rTL, borderLeftW, h - rTL - rBL,
+                       this.SideColor(borderLeftColor));
         }
         if (borderRightW > 0) {
-            c.FillRect(x + w - borderRightW, y, borderRightW, h,
-                       this.SideColor(borderRightColor));
+            c.FillRect(x + w - borderRightW, y + rTR, borderRightW,
+                       h - rTR - rBR, this.SideColor(borderRightColor));
         }
+        if (r > 0) {
+            this.PaintSideArc(app, x, y, w, h, r, rTL, x, y,
+                              borderTopW, borderLeftW,
+                              borderTopColor, borderLeftColor);
+            this.PaintSideArc(app, x, y, w, h, r, rTR, x + w - r, y,
+                              borderTopW, borderRightW,
+                              borderTopColor, borderRightColor);
+            this.PaintSideArc(app, x, y, w, h, r, rBL, x, y + h - r,
+                              borderBottomW, borderLeftW,
+                              borderBottomColor, borderLeftColor);
+            this.PaintSideArc(app, x, y, w, h, r, rBR, x + w - r, y + h - r,
+                              borderBottomW, borderRightW,
+                              borderBottomColor, borderRightColor);
+        }
+    }
+
+    /// 补画一个圆角上的边框弧：裁剪到该角的 r×r 方块，再用整盒
+    /// 圆角描边（与圆角填充同一轮廓、已抗锯齿）画出弧段。粗细取
+    /// 相邻两边中较粗的一边，颜色取水平边、缺省用竖直边。
+    void PaintSideArc(App app, int x, int y, int w, int h, int r, int on,
+                      int cx, int cy, int hw, int vw, int hcol, int vcol) {
+        if (on <= 0) { return; }
+        int bw = hw;
+        if (vw > bw) { bw = vw; }
+        if (bw <= 0) { return; }
+        int col = hcol;
+        if (hw <= 0 || col == 0) { col = vcol; }
+        if (col == 0) { col = borderColor; }
+        col = this.Fade(col);
+        if (col == 0) { return; }
+        Canvas c = app.canvas;
+        c.PushClip(cx, cy, r, r);
+        c.DrawRoundRectIn(x, y, w, h, r, this.Corners(), col, bw);
+        c.PopClip();
     }
 
     int SideColor(int col) {

@@ -629,32 +629,83 @@ EXPORT void zan_gui_fill_vgrad_mask(
     }
 }
 
-/* Is local pixel (i,j) inside a rounded-rect mask of size rw*rh with corner
- * radius cr (corner bits per ZAN_CORNER_*)? Corner geometry matches
- * zan_gui_fill_rounded_rect_mask so a rounded blur lines up exactly with the
- * translucent rounded tint drawn over it. cr<=0 means the whole rect. */
-static int zan_round_in(int i, int j, int rw, int rh, int cr, int cmask) {
-    if (cr <= 0) return 1;
-    if (cr > rw / 2) cr = rw / 2;
-    if (cr > rh / 2) cr = rh / 2;
-    if (cr <= 0) return 1;
-    if ((i >= cr && i < rw - cr) || (j >= cr && j < rh - cr)) return 1;
-    int cx, cy, bit;
-    if (i < cr && j < cr)              { cx = cr;      cy = cr;      bit = 1; }
-    else if (i >= rw - cr && j < cr)   { cx = rw - cr; cy = cr;      bit = 2; }
-    else if (i < cr && j >= rh - cr)   { cx = cr;      cy = rh - cr; bit = 8; }
-    else                               { cx = rw - cr; cy = rh - cr; bit = 4; }
-    if (!(cmask & bit)) return 1;                 /* square (welded) corner */
-    double dx = (double)i + 0.5 - (double)cx;
-    double dy = (double)j + 0.5 - (double)cy;
-    return (dx * dx + dy * dy) <= (double)cr * (double)cr ? 1 : 0;
+/* Two- or three-stop linear gradient sample at position t (0..1000), lerping
+ * alpha as well so a translucent gradient keeps its ends' alpha. */
+static u32 grad_sample(u32 from, u32 via, u32 to, int t) {
+    u32 a = from, b = to;
+    if (via != 0) {
+        if (t < 500) { b = via; t = t * 2; }
+        else { a = via; t = (t - 500) * 2; }
+    }
+    int out = 0;
+    for (int sh = 0; sh <= 24; sh += 8) {
+        int ca = (int)((a >> sh) & 0xFF);
+        int cb = (int)((b >> sh) & 0xFF);
+        out |= (ca + (cb - ca) * t / 1000) << sh;
+    }
+    return (u32)out;
+}
+
+/* Linear gradient fill cut to a rounded-rect mask, in the direction `dir`
+ * (0 = top-to-bottom, 1 = left-to-right) with an optional middle stop.
+ * Blended per pixel (so translucent stops composite over the backdrop) and
+ * anti-aliased on the corner arcs: a gradient painted as bands of FillRect
+ * inset row by row leaves the corners as a staircase that a 1px arc outline
+ * drawn over it cannot hide. */
+EXPORT void zan_gui_fill_grad_mask(
+    i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 mask, i32 dir,
+    i32 color_from, i32 color_via, i32 color_to) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    int x0 = clamp_i((int)x, s->clip_x0, s->clip_x1);
+    int y0 = clamp_i((int)y, s->clip_y0, s->clip_y1);
+    int x1 = clamp_i((int)(x + w), s->clip_x0, s->clip_x1);
+    int y1 = clamp_i((int)(y + h), s->clip_y0, s->clip_y1);
+    if (x1 <= x0 || y1 <= y0) return;
+    int r = (int)radius;
+    int m = (int)mask;
+    if (r < 0) r = 0;
+    if (r > 0 && (m & 15) == 0) r = 0;
+    if (r > (int)w / 2) r = (int)w / 2;
+    if (r > (int)h / 2) r = (int)h / 2;
+    int span = (int)(((int)dir == 1) ? w : h);
+    if (span < 1) span = 1;
+    int denom = span > 1 ? span - 1 : 1;
+    ZAN_STAT(g_st_grad, (long long)(x1 - x0) * (long long)(y1 - y0));
+    u32 cf = (u32)color_from, cv = (u32)color_via, ct = (u32)color_to;
+    for (int py = y0; py < y1; py++) {
+        u32 *row = s->pixels + py * s->stride;
+        u32 c = 0;
+        if ((int)dir != 1) {
+            c = grad_sample(cf, cv, ct,
+                clamp_i(py - (int)y, 0, denom) * 1000 / denom);
+            /* Straight part of a vertical gradient: one colour for the whole
+             * row, so blend it as a run instead of pixel by pixel. */
+            int j = py - (int)y;
+            if (r <= 0 || (j >= r && j < (int)h - r)) {
+                blend_run_const(row + x0, x1 - x0, c);
+                continue;
+            }
+        }
+        for (int px = x0; px < x1; px++) {
+            if ((int)dir == 1) c = grad_sample(cf, cv, ct,
+                clamp_i(px - (int)x, 0, denom) * 1000 / denom);
+            int cov = r <= 0 ? 255
+                : zan_round_cov(px - (int)x, py - (int)y, (int)w, (int)h, r, m);
+            if (cov <= 0) continue;
+            if (cov >= 255) row[px] = blend_over(row[px], c);
+            else set_pixel_aa(s, px, py, c, cov);
+        }
+    }
 }
 
 /* Anti-aliased rounded-rect mask: 0..255 coverage of pixel (i,j) for a
  * rounded rect of size rw*rh and radius cr (corner bits per ZAN_CORNER_*).
  * 255 = fully inside, 0 = outside, in between = the 1px corner arc edge.
- * Shares the corner geometry of zan_round_in so translucent fills that blend
- * per-pixel (gradients) cut the same silhouette FillRoundRect draws. */
+ * Shares zan_gui_fill_rounded_rect_mask's corner geometry, so every masked
+ * operation (gradient fill, frosted blur) cuts the silhouette the plain
+ * rounded fill draws and a glass panel's layers land on one arc. */
 static int zan_round_cov(int i, int j, int rw, int rh, int cr, int cmask) {
     if (cr <= 0) return 255;
     if (cr > rw / 2) cr = rw / 2;
@@ -684,7 +735,21 @@ static int zan_round_cov(int i, int j, int rw, int rh, int cr, int cmask) {
  * When cr>0 the blurred output is written only inside a rounded-rect mask, so
  * the panel's corners keep the sharp backdrop instead of a blurred square that
  * a translucent rounded tint can never paint back over. */
-static void zan_blur_rect_core(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, int cr, int cmask) {
+/* Write one blurred pixel through the rounded mask: full coverage overwrites,
+ * the ~1px arc edge blends the blur over the sharp backdrop underneath, so the
+ * silhouette is anti-aliased instead of a staircase of whole pixels. */
+static void blur_put(zan_surface_t *s, int px, int py, u32 c, int cov) {
+    if (cov <= 0 || clipped_out(s, px, py)) return;
+    if (cov >= 255) { s->pixels[py * s->stride + px] = c; return; }
+    set_pixel_aa(s, px, py, c, cov);
+}
+
+/* `capture`, when non-NULL, receives the rw*rh region as it ends up on the
+ * surface (blur inside the mask, the anti-aliased blend on the arc, untouched
+ * backdrop outside). The blur cache stores that, so a cached frame restores it
+ * with a plain copy: re-blending the arc over an already-composited edge would
+ * darken it a little more every frame. */
+static void zan_blur_rect_core(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, int cr, int cmask, u32 *capture) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
@@ -802,7 +867,6 @@ static void zan_blur_rect_core(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 r
      * acrylic texture instead of a perfectly smooth plastic sheet. */
     if (ds == 1) {
         for (int j = 0; j < rh; j++) {
-            u32 *row = s->pixels + (y0 + j) * s->stride + x0;
             u32 *src = a + j * dw;
             for (int i = 0; i < rw; i++) {
                 u32 px = src[i];
@@ -810,9 +874,12 @@ static void zan_blur_rect_core(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 r
                 int rC = clamp_i((int)((px >> 16) & 0xFF) + nz, 0, 255);
                 int gC = clamp_i((int)((px >> 8) & 0xFF) + nz, 0, 255);
                 int bC = clamp_i((int)(px & 0xFF) + nz, 0, 255);
-                if ((cr <= 0 || zan_round_in(i, j, rw, rh, cr, cmask))
-                    && !clipped_out(s, x0 + i, y0 + j))
-                    row[i] = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
+                u32 out = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
+                blur_put(s, x0 + i, y0 + j, out,
+                         cr <= 0 ? 255 : zan_round_cov(i, j, rw, rh, cr, cmask));
+                if (capture)
+                    capture[(size_t)j * rw + i] =
+                        s->pixels[(y0 + j) * s->stride + x0 + i];
             }
         }
     } else {
@@ -824,7 +891,6 @@ static void zan_blur_rect_core(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 r
             int gy = fy >> 8; int wy = fy & 255;
             if (gy > dh - 1) { gy = dh - 1; wy = 0; }
             int gy1 = gy + 1; if (gy1 > dh - 1) gy1 = dh - 1;
-            u32 *row = s->pixels + (y0 + j) * s->stride + x0;
             for (int i = 0; i < rw; i++) {
                 int fx = ((i * 2 + 1) * 256) / (ds * 2) - 128;
                 if (fx < 0) fx = 0;
@@ -849,9 +915,12 @@ static void zan_blur_rect_core(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 r
                 rC = clamp_i(rC + nz, 0, 255);
                 gC = clamp_i(gC + nz, 0, 255);
                 bC = clamp_i(bC + nz, 0, 255);
-                if ((cr <= 0 || zan_round_in(i, j, rw, rh, cr, cmask))
-                    && !clipped_out(s, x0 + i, y0 + j))
-                    row[i] = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
+                u32 out = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
+                blur_put(s, x0 + i, y0 + j, out,
+                         cr <= 0 ? 255 : zan_round_cov(i, j, rw, rh, cr, cmask));
+                if (capture)
+                    capture[(size_t)j * rw + i] =
+                        s->pixels[(y0 + j) * s->stride + x0 + i];
             }
         }
     }
@@ -859,7 +928,7 @@ static void zan_blur_rect_core(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 r
 }
 
 EXPORT void zan_gui_blur_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius) {
-    zan_blur_rect_core(surface_id, x, y, w, h, radius, 0, 15);
+    zan_blur_rect_core(surface_id, x, y, w, h, radius, 0, 15, NULL);
 }
 
 /* --- Frosted-glass blur cache ---------------------------------------------
@@ -878,6 +947,7 @@ typedef struct {
               * (that painted one window's pixels into another during e.g. a
               * child-window open animation). */
     int x0, y0, rw, rh, r;
+    int cr, cmask; /* corner mask baked into the snapshot's anti-aliased edge */
     u32 src_sum; /* sampled checksum of the pre-blur backdrop, see zan_src_sum */
     u32 *pixels;
     size_t cap;
@@ -907,7 +977,7 @@ static void zan_blur_cached_core(
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
     if (slot < 0 || slot >= ZAN_BLUR_CACHE_SLOTS) {
-        zan_blur_rect_core(surface_id, x, y, w, h, radius, cr, cmask);
+        zan_blur_rect_core(surface_id, x, y, w, h, radius, cr, cmask, NULL);
         return;
     }
     int x0 = clamp_i((int)x, 0, s->width);
@@ -932,42 +1002,35 @@ static void zan_blur_cached_core(
      * over the (freshly redrawn, identical) backdrop without re-blurring. */
     int geom_ok = c->valid && c->pixels && c->sid == (int)surface_id
         && c->x0 == x0 && c->y0 == y0 && c->rw == rw && c->rh == rh
-        && c->r == r;
+        && c->r == r && c->cr == cr && c->cmask == cmask;
     u32 sum = geom_ok ? zan_src_sum(s, x0, y0, rw, rh) : 0;
     if (geom_ok && (!dirty || sum == c->src_sum)) {
         ZAN_STAT(g_st_blur_hit, (long long)rw * (long long)rh);
         for (int j = 0; j < rh; j++) {
-            u32 *row = s->pixels + (y0 + j) * s->stride + x0;
             u32 *src = c->pixels + (size_t)j * rw;
             for (int i = 0; i < rw; i++)
-                if ((cr <= 0 || zan_round_in(i, j, rw, rh, cr, cmask))
-                    && !clipped_out(s, x0 + i, y0 + j))
-                    row[i] = src[i];
+                blur_put(s, x0 + i, y0 + j, src[i], 255);
         }
         return;
     }
 
-    /* Recompute in place (identical clamping), then snapshot into the slot. */
+    /* Recompute in place (identical clamping), capturing the composited region
+     * straight into the slot. */
     u32 fresh = geom_ok ? sum : zan_src_sum(s, x0, y0, rw, rh);
-    zan_blur_rect_core(surface_id, x, y, w, h, radius, cr, cmask);
+    if (c->cap < n) {
+        u32 *np = (u32 *)realloc(c->pixels, n * sizeof(u32));
+        if (np) { c->pixels = np; c->cap = n; }
+    }
+    zan_blur_rect_core(surface_id, x, y, w, h, radius, cr, cmask,
+                       c->cap >= n ? c->pixels : NULL);
     /* Only part of the region was writable (the panel straddles the damage
      * strip), so the surface now holds blurred pixels inside the strip and the
      * untouched backdrop outside it. Snapshotting that mixture would hand a
      * later frame a half-sharp "blur"; drop the slot and let the next full
      * frame refill it. */
-    if (!clip_covers(s, x0, y0, x1, y1)) { c->valid = 0; return; }
-    if (c->cap < n) {
-        u32 *np = (u32 *)realloc(c->pixels, n * sizeof(u32));
-        if (!np) { c->valid = 0; return; }
-        c->pixels = np;
-        c->cap = n;
-    }
-    for (int j = 0; j < rh; j++) {
-        u32 *row = s->pixels + (y0 + j) * s->stride + x0;
-        u32 *dst = c->pixels + (size_t)j * rw;
-        for (int i = 0; i < rw; i++) dst[i] = row[i];
-    }
+    if (!clip_covers(s, x0, y0, x1, y1) || c->cap < n) { c->valid = 0; return; }
     c->x0 = x0; c->y0 = y0; c->rw = rw; c->rh = rh; c->r = r;
+    c->cr = cr; c->cmask = cmask;
     c->src_sum = fresh;
     c->sid = (int)surface_id;
     c->valid = 1;

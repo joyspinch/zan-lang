@@ -73,7 +73,7 @@ $registryPath = Join-Path $root "build\ProjectComponents.ide.zan"
 # only know it if the build stamps it in: VERSION + date + commit are compiled
 # into IdeVersion.zan the same way the component registry is -- generated for
 # the compile, restored afterwards, so the source tree stays neutral.
-$versionPath = Join-Path $root "src\ide_zan\IdeVersion.zan"
+$versionPath = Join-Path $root "src\ide_zan\src\services\IdeVersion.zan"
 $versionOriginal = [System.IO.File]::ReadAllText($versionPath)
 $failed = $false
 
@@ -129,6 +129,10 @@ try {
     # All IDE shell sources: ZanIDE.zan + its partial-class parts,
     # SceneDesigner, AssetManager and the session classes.
     $files += (Get-ChildItem src\ide_zan\*.zan -Recurse).FullName
+    # Every designed document is an input too: a `X.zform` carries the `: Control`
+    # base, the constructor and Kind() of its `partial class X` code-behind, so
+    # leaving them out makes the designed components fail to type-check.
+    $files += (Get-ChildItem src\ide_zan -Recurse -Include *.zform).FullName
 
     # Link the IDE straight through zanc: it compiles all sources and drives the
     # bundled ld itself, auto-linking the socket-async reactor (rt_io) and the
