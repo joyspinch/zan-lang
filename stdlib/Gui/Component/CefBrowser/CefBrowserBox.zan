@@ -1,0 +1,119 @@
+using System;
+using Gui;
+
+namespace Gui.Component.CefBrowser;
+
+/// 可摆放的 Chromium 浏览器控件：把原生 CefBrowser 包成一个普通的保留式
+/// Control，因此设计器 / .zform 里的 CEF 浏览器和别的控件一样，由布局给它
+/// 一块矩形、由它自己负责绘制（与 WebViewBox 同构，只是引擎换成自带的
+/// Chromium）。
+///
+///     CefBrowserBox box = new CefBrowserBox();
+///     box.SetStartUrl("https://example.com");
+///     tabs.Page(0).Add(box);              // 标签页里放一个浏览器
+///     box.View().NavComplete += () => { ... };
+///
+/// 可见时按自己的已解析边界 Render，落在隐藏的标签页 / 折叠容器里时整棵
+/// 子树不参与渲染，由 NativeLayer 兜底把没登记的原生层裁空（即隐藏）。
+class CefBrowserBox : Control {
+    /// 本控件拥有的原生浏览器（每个 CefBrowserBox 一个 Chromium 视图，
+    /// 因此多标签浏览器就是多个 CefBrowserBox）。
+    CefBrowser view;
+    /// 设计期填写的起始地址，首帧导航一次。
+    string startUrl;
+    bool navigated;
+
+    CefBrowserBox() {
+        this.InitControl("cefbrowser", 5);
+        this.view = new CefBrowser();
+        this.startUrl = "";
+        this.navigated = false;
+    }
+
+    /// 底层原生浏览器：历史、JS、CDP、事件都在它上面。
+    CefBrowser View() { return view; }
+
+    /// 起始地址（设计属性 `url`，.zform 里也可写成 `placeholder`）。
+    /// 首帧之前设置只改起始地址；之后设置等同于导航。
+    void SetStartUrl(string u) {
+        startUrl = u;
+        if (navigated && u != "") { view.Navigate(u); }
+    }
+
+    string StartUrl() { return startUrl; }
+
+    void Navigate(string target) {
+        navigated = true;
+        view.Navigate(target);
+    }
+
+    void Back() { view.Back(); }
+    void Forward() { view.Forward(); }
+    void Reload() { view.Reload(); }
+    void Stop() { view.Stop(); }
+    bool CanGoBack() { return view.CanGoBack(); }
+    bool CanGoForward() { return view.CanGoForward(); }
+    bool IsLoading() { return view.IsLoading(); }
+    int LastStatus() { return view.LastStatus(); }
+    string CurrentUrl() { return view.CurrentUrl(); }
+    string CurrentTitle() { return view.CurrentTitle(); }
+
+    /// 隐藏原生浏览器（本控件不再上屏时调用；隐藏的标签页由 NativeLayer
+    /// 自动兜底，这里供宿主显式收起）。
+    void Hide() { view.Hide(); }
+
+    /// 关闭原生浏览器（关闭标签页时调用），并把控件从树上摘下。
+    void Destroy() {
+        view.Destroy();
+        if (parent != null) { parent.Remove(this); }
+    }
+
+    // ---- 设计器 / 序列化模型 --------------------------------------
+
+    override string Kind() { return "CefBrowserBox"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        // 设计器把每个字段的文本属性存成 `placeholder`，所以起始地址
+        // 同时应答这个键：在检查器里填的地址能原样往返。
+        PropSpec u = PropSpec.Text("url", "Start URL").Also("placeholder");
+        u.str = startUrl;
+        ps.Add(u);
+        return ps;
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("NavStart");
+        e.Add("NavComplete");
+        e.Add("TitleChanged");
+        e.Add("LoadingChanged");
+        return e;
+    }
+
+    /// 浏览器的语义事件挂在原生视图上，设计里的 `onNavComplete` 之类
+    /// 因此直接落到它的 UiEvent，宿主不必自己接线。
+    override void BindEvent(string evt, Action a) {
+        if (evt == "NavStart") { view.NavStart.Add(a); return; }
+        if (evt == "NavComplete") { view.NavComplete.Add(a); return; }
+        if (evt == "TitleChanged") { view.TitleChanged.Add(a); return; }
+        if (evt == "LoadingChanged") { view.LoadingChanged.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    // ---- 保留式钩子（Control） ---------------------------------------
+
+    override void OnPaint(App app) {
+        if (bw <= 0 || bh <= 0) {
+            view.Hide();
+            return;
+        }
+        // 导航要早于第一次 Render：原生浏览器在 Render 里才创建，创建时
+        // 会消费这次挂起的导航。
+        if (!navigated && startUrl != "") {
+            navigated = true;
+            view.Navigate(startUrl);
+        }
+        view.Render(app, bx, by, bw, bh);
+    }
+}

@@ -1,0 +1,120 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+
+namespace Gui.Component.CefBrowser;
+
+/// <summary>
+/// CEF 的进程级生命周期：浏览器进程初始化、每帧消息循环、退出时 shutdown。
+/// 一个进程只有一份 CEF 上下文，所以这些都是静态的，多个
+/// <see cref="CefBrowser"/> 共享它。
+///
+/// 这里刻意只依赖 Interop（driver 的 dlopen）——运行时的探测/下载/解包在
+/// <see cref="CefBootstrap"/>，它才会牵进 HTTP/TLS/解压那一整套。控件树
+/// （ControlFactory → CefBrowserBox）只经过本类，所以「随便一个 GUI 程序
+/// 都被迫链上一个 HTTP 栈」不会发生。
+///
+/// 正常用法是让 <see cref="CefBootstrap.StartAsync"/> 顺带把运行时装好；
+/// 已经自备一份 CEF 运行时目录时可以直接
+/// <see cref="Start"/>（完全不联网）。
+/// </summary>
+class CefHost {
+    static bool started;
+    static bool stopped;
+    static string runtimeDir = "";
+    static string cefVersion = "";
+    static string lastError = "";
+
+    /// <summary>CEF 已初始化且未 shutdown。</summary>
+    static bool IsRunning() {
+        return CefHost.started && !CefHost.stopped && CefBackend.Ready();
+    }
+
+    /// <summary>最近一次失败的原因（driver / CEF 初始化 / 运行时自举），
+    /// 成功为 ""。</summary>
+    static string Error() {
+        if (CefHost.lastError != "") { return CefHost.lastError; }
+        return CefBackend.Error();
+    }
+
+    /// <summary>记下失败原因（供 CefBootstrap 汇报运行时自举的失败）。
+    /// </summary>
+    static void Fail(string msg) { CefHost.lastError = msg; }
+
+    /// <summary>已使用的运行时目录（未启动为 ""）。</summary>
+    static string RuntimeDir() { return CefHost.runtimeDir; }
+
+    /// <summary>已使用的 CEF 版本（未启动为 ""）。</summary>
+    static string CefVersion() { return CefHost.cefVersion; }
+
+    /// <summary>就绪标记文件名（内容为已安装的 CEF 版本）。</summary>
+    static string ReadyMarker() { return ".zan-cef-ready"; }
+
+    /// <summary>读运行时目录里的就绪标记，得到其 CEF 版本（读不到为 ""）。
+    /// driver 变体（109 / 最新）按它来挑。</summary>
+    static string MarkerVersion(string dir) {
+        string p = dir + "/" + CefHost.ReadyMarker();
+        if (!File.Exists(p)) { return ""; }
+        return File.ReadAllText(p).Trim();
+    }
+
+    /// <summary>浏览器进程的 CEF profile 目录（Cookie/缓存/localStorage）。
+    /// 默认放运行时目录旁边，ZAN_CEF_PROFILE 可覆盖。</summary>
+    static string ProfileDir(string dir) {
+        string forced = ProcessHost.Env("ZAN_CEF_PROFILE");
+        if (forced != "") { return forced; }
+        return CefHost.ParentDir(dir) + "/profile";
+    }
+
+    static string ParentDir(string path) {
+        int slash = 0 - 1;
+        for (int i = 0; i < path.Length; i = i + 1) {
+            if (path[i] == '/' || path[i] == '\\') { slash = i; }
+        }
+        if (slash <= 0) { return "."; }
+        return path.Substring(0, slash);
+    }
+
+    /// <summary>用已经装好的运行时目录初始化 CEF（不联网）。
+    /// <paramref name="helperPath"/> 是 Chromium 子进程用的可执行文件，
+    /// ""=复用本程序，此时 Main 首句必须调用
+    /// <see cref="CefBootstrap.RunHelper"/>。</summary>
+    static bool Start(string dir, string helperPath) {
+        if (CefHost.started) { return CefHost.IsRunning(); }
+        if (CefHost.stopped) {
+            CefHost.lastError = "CEF 已在本进程内 shutdown，无法再次启动";
+            return false;
+        }
+        CefHost.lastError = "";
+        CefHost.runtimeDir = dir;
+        CefHost.cefVersion = CefHost.MarkerVersion(dir);
+        string helper = helperPath;
+        if (helper == "") { helper = ProcessHost.SelfExe(); }
+        string cache = CefHost.ProfileDir(dir);
+        Directory.CreateDirectoryRecursive(cache);
+        bool ok = CefBackend.Init(dir, CefHost.cefVersion, cache, helper, "",
+                                  "", false);
+        if (!ok) {
+            CefHost.lastError = "CEF 初始化失败：" + CefBackend.Error();
+            return false;
+        }
+        CefHost.started = true;
+        return true;
+    }
+
+    /// <summary>推一轮 CEF 消息循环。由 <see cref="CefBrowser.Render"/> 每帧
+    /// 调用，宿主也可以在自己的循环里调用（幂等、未启动时是空操作）。
+    /// </summary>
+    static void Work() {
+        if (!CefHost.started || CefHost.stopped) { return; }
+        CefBackend.Work();
+    }
+
+    /// <summary>关闭所有浏览器并 shutdown CEF（进程退出前调用一次）。
+    /// </summary>
+    static void Shutdown() {
+        if (!CefHost.started || CefHost.stopped) { return; }
+        CefBackend.Shutdown();
+        CefHost.stopped = true;
+    }
+}

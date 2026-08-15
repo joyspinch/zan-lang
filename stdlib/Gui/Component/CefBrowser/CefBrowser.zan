@@ -1,0 +1,338 @@
+using System;
+using Gui;
+
+namespace Gui.Component.CefBrowser;
+
+/// 内嵌的 Chromium 浏览器（CEF）视图。
+///
+/// 和 Gui.Component.WebView 的分工：WebView 用系统自带引擎（Windows
+/// WebView2 / macOS WKWebView），装机即用但能力受系统摆布；CefBrowser 自带
+/// Chromium——完整的 H.264/AAC 媒体栈、统一的行为、CDP（Chrome DevTools
+/// Protocol）自动化通道，代价是首次运行要下载官方 CEF 运行时
+/// （<see cref="CefRuntime"/> 负责，按系统挑分支：Win7/8/8.1 用 109，
+/// 其余用最新 stable）。两者独立并存，按需选用。
+///
+/// 原生浏览器窗口是浮在软件渲染表面之上的兄弟图层，因此要由所属区域
+/// 每帧驱动它（和 WebView 一致）：
+///   CefBrowser web = new CefBrowser();
+///   web.NavComplete += () => { ... };
+///   web.Navigate("https://example.com");
+///   // 每帧，针对可见标签：
+///   web.Render(app, x, y, w, h);
+///   // 每帧，针对隐藏标签：
+///   web.Hide();
+///
+/// 进程级初始化在 <see cref="CefBootstrap"/>：Main 首句
+/// CefBootstrap.RunHelper()、之后 await CefBootstrap.StartAsync()。没启动成功时
+/// IsSupported() 为 false，Render 画一个画布内占位符（说明原因），而不是崩掉。
+class CefBrowser {
+    int handle;         // 原生浏览器句柄（0 = 尚未创建/不可用）
+    bool created;       // 已尝试原生创建
+    bool supported;     // 原生侧给出了可用的浏览器
+    int lastNavSeq;     // 最近观察到的导航计数器
+    string pendingUrl;  // 原生创建前请求的导航
+
+    string lastSeenTitle;
+    bool lastSeenLoading;
+
+    SignalString url;
+    SignalString title;
+
+    /// 导航完成（或失败）时触发，即当前 URL/标题可能已变化。
+    /// 响应式 Url()/Title() 会在其触发前更新。
+    UiEvent NavComplete;
+    /// 主框架开始加载时触发。
+    UiEvent NavStart;
+    /// 文档标题变化时触发，包括页面内的更新。
+    UiEvent TitleChanged;
+    /// 加载开始或结束时触发（IsLoading() 指示是哪种）。
+    UiEvent LoadingChanged;
+
+    CefBrowser() {
+        this.handle = 0;
+        this.created = false;
+        this.supported = true;
+        this.lastNavSeq = 0;
+        this.pendingUrl = "";
+        this.lastSeenTitle = "";
+        this.lastSeenLoading = false;
+        this.url = new SignalString("");
+        this.title = new SignalString("");
+        this.NavComplete = new UiEvent();
+        this.NavStart = new UiEvent();
+        this.TitleChanged = new UiEvent();
+        this.LoadingChanged = new UiEvent();
+    }
+
+    /// 原生浏览器可用（CEF 已启动且这个视图创建成功）时为 true。
+    /// 首帧之前它是乐观的 true——创建发生在第一次 Render。
+    bool IsSupported() { return supported; }
+
+    /// 原生句柄（0 = 尚未创建）。
+    int Handle() { return handle; }
+
+    /// 响应式当前 URL/文档标题（每次导航后更新）。
+    SignalString Url() { return url; }
+    SignalString Title() { return title; }
+    string CurrentUrl() { return url.Get(); }
+    string CurrentTitle() { return title.Get(); }
+
+    void EnsureCreated(App app, int x, int y, int w, int h) {
+        if (created) { return; }
+        if (!CefHost.IsRunning()) {
+            // CEF 还没起来（宿主没调 CefHost.StartAsync，或运行时下载失败）：
+            // 不标记 created，下一帧再试，这样“下载完成后自动出现”成立。
+            supported = false;
+            return;
+        }
+        created = true;
+        handle = CefBackend.Create(app.window.GetHandle(), x, y, w, h,
+                                   pendingUrl);
+        if (handle == 0) {
+            supported = false;
+            return;
+        }
+        supported = true;
+        pendingUrl = "";
+    }
+
+    /// 导航到 URL。无协议的裸主机名视为 https://。
+    void Navigate(string target) {
+        string u = CefBrowser.Normalize(target);
+        if (handle == 0) {
+            pendingUrl = u;
+            return;
+        }
+        CefBackend.Navigate(handle, u);
+    }
+
+    /// 加载内存中的 HTML 字符串（走 data: URL，因此适合中小片段）。
+    void LoadHtml(string html) {
+        Navigate("data:text/html;charset=utf-8," + CefBrowser.UrlEscape(html));
+    }
+
+    void Back() { if (handle != 0) { CefBackend.Back(handle); } }
+    void Forward() { if (handle != 0) { CefBackend.Forward(handle); } }
+    void Stop() { if (handle != 0) { CefBackend.Stop(handle); } }
+    void Reload() { if (handle != 0) { CefBackend.Reload(handle, false); } }
+    /// 忽略缓存的强制刷新（Ctrl+F5）。
+    void ReloadIgnoreCache() {
+        if (handle != 0) { CefBackend.Reload(handle, true); }
+    }
+
+    bool CanGoBack() {
+        if (handle == 0) { return false; }
+        return CefBackend.CanGoBack(handle);
+    }
+    bool CanGoForward() {
+        if (handle == 0) { return false; }
+        return CefBackend.CanGoForward(handle);
+    }
+    bool IsLoading() {
+        if (handle == 0) { return false; }
+        return CefBackend.IsLoading(handle);
+    }
+
+    /// 最近一次主框架响应的 HTTP 状态码（无响应或非 HTTP 时为 0）。
+    int LastStatus() {
+        if (handle == 0) { return 0; }
+        return CefBackend.LastStatus(handle);
+    }
+
+    /// 最近一次加载失败的 CEF 错误码（成功为 0）。
+    int LastErrorCode() {
+        if (handle == 0) { return 0; }
+        return CefBackend.LastErrorCode(handle);
+    }
+
+    /// 在页面里执行 JavaScript（不取返回值）。要拿结果用
+    /// <see cref="Evaluate"/>（走 CDP）。
+    void ExecuteJs(string code) {
+        if (handle != 0) { CefBackend.ExecuteJs(handle, code, "", 0); }
+    }
+
+    /// 键盘焦点交给/收回浏览器。
+    void SetFocus(bool focus) {
+        if (handle != 0) { CefBackend.SetFocus(handle, focus); }
+    }
+
+    // ---- CDP（Chrome DevTools Protocol）----------------------------------
+
+    /// 发一条 CDP 命令，返回其消息 id（失败 0）。回复和事件从
+    /// <see cref="TakeCdpMessage"/> 取，因此调用是异步的：
+    ///   int id = web.SendCdp("Page.captureScreenshot", "{}");
+    ///   // 之后的帧里
+    ///   string msg = web.TakeCdpMessage();
+    int SendCdp(string method, string paramsJson) {
+        if (handle == 0) { return 0; }
+        return CefBackend.CdpSend(handle, method, paramsJson);
+    }
+
+    /// 用 CDP 求值一个 JavaScript 表达式，返回其消息 id：结果会以
+    /// Runtime.evaluate 的回复出现在 <see cref="TakeCdpMessage"/> 里。
+    int Evaluate(string expression) {
+        return SendCdp("Runtime.evaluate",
+            "{\"expression\":" + CefBrowser.JsonString(expression)
+            + ",\"returnByValue\":true}");
+    }
+
+    /// 队列里待取的 CDP 消息数。
+    int CdpPending() {
+        if (handle == 0) { return 0; }
+        return CefBackend.CdpPending(handle);
+    }
+
+    /// 因为迟迟没被取走而丢掉的 CDP 消息数（队列有界，防止跑飞的页面
+    /// 事件把内存吃光）。
+    int CdpDropped() {
+        if (handle == 0) { return 0; }
+        return CefBackend.CdpDropped(handle);
+    }
+
+    /// CDP 通道已挂上（DevTools agent 已附着）。
+    bool CdpAttached() {
+        if (handle == 0) { return false; }
+        return CefBackend.CdpAttached(handle);
+    }
+
+    /// 取走一条 CDP 消息（命令回复或事件的原始 JSON），空队列为 ""。
+    string TakeCdpMessage() {
+        if (handle == 0) { return ""; }
+        return CefBackend.CdpTake(handle);
+    }
+
+    // ---- 生命周期 --------------------------------------------------------
+
+    /// 隐藏原生窗口（对不在屏幕上的标签/面板调用）。
+    void Hide() {
+        if (handle != 0) { CefBackend.SetVisible(handle, false); }
+    }
+
+    /// 关闭浏览器并释放原生资源。
+    void Destroy() {
+        if (handle != 0) {
+            NativeLayer.Forget(handle);
+            CefBackend.Close(handle);
+        }
+        handle = 0;
+        created = false;
+    }
+
+    /// 把原生浏览器放到给定的客户区矩形里，推一轮 CEF 消息循环，然后
+    /// 轮询引擎的变化，更新 Url()/Title() 并触发
+    /// NavStart / LoadingChanged / TitleChanged / NavComplete。浏览器跑在
+    /// 自己的进程/线程上，因此它的事件以这种每帧差异的形式到达 UI。
+    /// CEF 不可用时画一个占位符（说明原因）。
+    int Render(App app, int x, int y, int w, int h) {
+        EnsureCreated(app, x, y, w, h);
+        if (handle == 0) {
+            CefBrowser.PaintPlaceholder(app, x, y, w, h);
+            return 0;
+        }
+        // Chromium 的 UI 线程就是宿主线程（single-process message loop），
+        // 所以每帧必须推它一轮，否则页面不动。
+        CefHost.Work();
+        CefBackend.SetBounds(handle, x, y, w, h);
+        // 可见性不在这里定：原生窗口是 OS 兄弟层，永远画在画布之上，直接
+        // 显示就会把右键菜单、下拉、模态对话框一起盖住。改为向 App 登记
+        // 本帧占位，由 PresentFrame 在所有自绘 UI 之后算出未被遮挡的
+        // 区域再下发（完全被盖住时隐藏）。
+        NativeLayer.Register(app, handle, x, y, w, h, CefBackend.ApplyClip);
+
+        bool dirty = false;
+        bool busy = CefBackend.IsLoading(handle);
+        if (busy != lastSeenLoading) {
+            lastSeenLoading = busy;
+            if (busy) { NavStart.Raise(); }
+            LoadingChanged.Raise();
+            dirty = true;
+        }
+
+        int seq = CefBackend.NavSeq(handle);
+        if (seq != lastNavSeq) {
+            lastNavSeq = seq;
+            url.Set(CefBackend.GetUrl(handle));
+            title.Set(CefBackend.GetTitle(handle));
+            NavComplete.Raise();
+            dirty = true;
+        }
+        string docTitle = CefBackend.GetTitle(handle);
+        if (docTitle != lastSeenTitle) {
+            lastSeenTitle = docTitle;
+            title.Set(docTitle);
+            TitleChanged.Raise();
+            dirty = true;
+        }
+        // 浏览器画面变化不会经过 Zan 的重绘逻辑，但原生窗口是自己刷新的，
+        // 这里只在有语义变化时请求重绘（省电）。
+        if (dirty) { app.RequestRedraw(); }
+        return handle;
+    }
+
+    static void PaintPlaceholder(App app, int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        c.FillRect(x, y, w, h, t.bgSecondary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, t.borderWidth);
+        c.DrawGlyphIn("globe", x, y - app.Scale(28), w, h, t.iconSizeLarge,
+            t.textTertiary);
+        c.DrawTextCentered(x, y + app.Scale(18), w, h,
+            CefBrowser.PlaceholderText(), t.textSecondary, t.fontSizeMedium);
+    }
+
+    static string PlaceholderText() {
+        string err = CefHost.Error();
+        if (err != "") { return err; }
+        return "CEF 未启动：Main 里先 CefBootstrap.RunHelper()"
+            + " 再 await CefBootstrap.StartAsync()";
+    }
+
+    static string Normalize(string target) {
+        if (target == "") { return ""; }
+        if (CefBrowser.HasScheme(target)) { return target; }
+        return "https://" + target;
+    }
+
+    static bool HasScheme(string s) {
+        int n = s.Length;
+        for (int i = 0; i + 2 < n; i = i + 1) {
+            if (s[i] == ':' && s[i + 1] == '/' && s[i + 2] == '/') { return true; }
+        }
+        if (s.StartsWith("data:")) { return true; }
+        if (s.StartsWith("about:")) { return true; }
+        return false;
+    }
+
+    /// data: URL 里必须转义的字符（其余按 UTF-8 原样传，Chromium 接受）。
+    static string UrlEscape(string s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 35) { sb.Append("%23"); }
+            else if (c == 37) { sb.Append("%25"); }
+            else if (c == 38) { sb.Append("%26"); }
+            else if (c == 63) { sb.Append("%3F"); }
+            else if (c == 32) { sb.Append("%20"); }
+            else { sb.Append(s.Substring(i, 1)); }
+        }
+        return sb.ToString();
+    }
+
+    /// 把字符串包成 JSON 字面量（CDP 参数拼装用）。
+    static string JsonString(string s) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("\"");
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 34) { sb.Append("\\\""); }
+            else if (c == 92) { sb.Append("\\\\"); }
+            else if (c == 10) { sb.Append("\\n"); }
+            else if (c == 13) { sb.Append("\\r"); }
+            else if (c == 9) { sb.Append("\\t"); }
+            else if (c < 32) { sb.Append(" "); }
+            else { sb.Append(s.Substring(i, 1)); }
+        }
+        sb.Append("\"");
+        return sb.ToString();
+    }
+}

@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "include/cef_api_hash.h"
 #include "include/capi/cef_app_capi.h"
 #include "include/capi/cef_browser_capi.h"
 #include "include/capi/cef_client_capi.h"
@@ -78,7 +79,10 @@ typedef cef_browser_t *(*zc_fn_create_browser_sync)(const cef_window_info_t *,
                                                     cef_dictionary_value_t *,
                                                     cef_request_context_t *);
 typedef int (*zc_fn_utf8_to_utf16)(const char *, size_t, cef_string_utf16_t *);
-typedef int (*zc_fn_utf16_to_utf8)(const char16_t *, size_t, cef_string_utf8_t *);
+/* The UTF-16 code unit is spelled `char16` before CEF 120 and `char16_t` after,
+ * so the source string is taken as void* to keep one source for both branches
+ * (only its address is passed through). */
+typedef int (*zc_fn_utf16_to_utf8)(const void *, size_t, cef_string_utf8_t *);
 typedef void (*zc_fn_utf16_clear)(cef_string_utf16_t *);
 typedef void (*zc_fn_utf8_clear)(cef_string_utf8_t *);
 typedef void (*zc_fn_userfree_utf16_free)(cef_string_userfree_utf16_t);
@@ -188,6 +192,26 @@ static int zc_load(const char *runtime_dir) {
                 CEF_API_VERSION);
         return 0;
     }
+#else
+    /* CEF 109 predates the versioned API: cef_api_hash takes just the entry
+     * index (0 = platform hash), and it is still the only reliable check that
+     * the installed runtime matches the headers this variant was built with. */
+    void *h = zc_sym(lib, "cef_api_hash");
+    if (!h) {
+        zc_fail("libcef export missing: cef_api_hash");
+        return 0;
+    }
+    {
+        typedef const char *(*zc_fn_api_hash_legacy)(int);
+        zc_fn_api_hash_legacy hash_fn;
+        memcpy(&hash_fn, &h, sizeof(void *));
+        const char *runtime_hash = hash_fn(0);
+        if (!runtime_hash || strcmp(runtime_hash, CEF_API_HASH_PLATFORM) != 0) {
+            zc_fail("cef api hash mismatch: runtime %s, driver %s",
+                    runtime_hash ? runtime_hash : "?", CEF_API_HASH_PLATFORM);
+            return 0;
+        }
+    }
 #endif
     zc.lib = lib;
     return 1;
@@ -254,6 +278,7 @@ typedef struct zc_browser_s {
     cef_display_handler_t display;
     cef_dev_tools_message_observer_t observer;
 
+    int bx, by, bw, bh;         /* last requested bounds, host coordinates */
     char url[2048];
     char title[512];
     int loading, can_back, can_forward;
@@ -771,11 +796,18 @@ ZC_EXPORT int zan_cef_create(void *parent, int x, int y, int w, int h,
     memset(b->title, 0, sizeof(b->title));
     b->used = 1;
     b->gone = 0;
+    b->bx = x;
+    b->by = y;
+    b->bw = w > 0 ? w : 1;
+    b->bh = h > 0 ? h : 1;
     zc_browser_init_handlers(b);
 
     cef_window_info_t wi;
     memset(&wi, 0, sizeof(wi));
+#ifndef ZAN_CEF_LEGACY
+    /* Sized structs arrived with the versioned C API; CEF 109 has no field. */
     wi.size = sizeof(wi);
+#endif
     wi.bounds.x = x;
     wi.bounds.y = y;
     wi.bounds.width = w > 0 ? w : 1;
@@ -852,6 +884,10 @@ ZC_EXPORT void zan_cef_set_bounds(int h, int x, int y, int w, int hh) {
     if (!wnd) return;
     if (w < 1) w = 1;
     if (hh < 1) hh = 1;
+    {
+        zc_browser_t *bb = zc_get(h);
+        if (bb) { bb->bx = x; bb->by = y; bb->bw = w; bb->bh = hh; }
+    }
 #ifdef _WIN32
     SetWindowPos((HWND)wnd, NULL, x, y, w, hh, SWP_NOZORDER | SWP_NOACTIVATE);
 #else
@@ -923,6 +959,52 @@ ZC_EXPORT void zan_cef_set_visible(int h, int visible) {
         host->was_hidden(host, visible ? 0 : 1);
         host->base.release(&host->base);
     }
+}
+
+/* Apply the host's per-frame occlusion result: `spec` is a "x,y,w,h;..." union
+ * of visible rectangles in host coordinates ("" = fully covered). Windows can
+ * clip the child window to that region; elsewhere this degrades to show/hide,
+ * matching what the WebView backend does on macOS. */
+ZC_EXPORT void zan_cef_set_clip(int h, const char *spec) {
+    zc_browser_t *b = zc_get(h);
+    if (!b) return;
+    int visible = spec && spec[0];
+#ifdef _WIN32
+    void *wnd = zan_cef_window(h);
+    if (visible && wnd) {
+        HRGN total = CreateRectRgn(0, 0, 0, 0);
+        const char *p = spec;
+        while (*p) {
+            int v[4] = { 0, 0, 0, 0 };
+            int n = 0;
+            while (n < 4 && *p) {
+                int sign = 1;
+                if (*p == '-') { sign = -1; p++; }
+                int acc = 0, digits = 0;
+                while (*p >= '0' && *p <= '9') {
+                    acc = acc * 10 + (*p - '0');
+                    p++;
+                    digits++;
+                }
+                if (!digits) break;
+                v[n++] = sign * acc;
+                if (*p == ',' || *p == ';') p++;
+                else break;
+            }
+            if (n == 4 && v[2] > 0 && v[3] > 0) {
+                HRGN r = CreateRectRgn(v[0] - b->bx, v[1] - b->by,
+                                       v[0] - b->bx + v[2],
+                                       v[1] - b->by + v[3]);
+                CombineRgn(total, total, r, RGN_OR);
+                DeleteObject(r);
+            }
+            while (*p && *p != ';' && (*p < '0' || *p > '9') && *p != '-') p++;
+        }
+        /* SetWindowRgn takes ownership of the region. */
+        SetWindowRgn((HWND)wnd, total, TRUE);
+    }
+#endif
+    zan_cef_set_visible(h, visible);
 }
 
 ZC_EXPORT void zan_cef_set_focus(int h, int focus) {

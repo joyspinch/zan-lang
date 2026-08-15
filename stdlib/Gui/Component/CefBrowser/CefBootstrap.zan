@@ -1,0 +1,86 @@
+using System;
+using System.Diagnostics;
+
+namespace Gui.Component.CefBrowser;
+
+/// <summary>
+/// CEF 的启动入口：把「运行时自举（<see cref="CefRuntime"/>）」和「进程
+/// 初始化（<see cref="CefHost"/>）」接在一起，再加上 Chromium helper 子进程
+/// 的分发。
+///
+/// Chromium 是多进程的：除浏览器进程外还要有 render/gpu/utility 子进程。
+/// 默认让程序把自己当 helper 重新执行（browser_subprocess_path = 本程序），
+/// 因此 **Main 的第一件事** 必须是让 helper 分支跑完并退出：
+///
+/// <code>
+/// async int Main() {
+///     CefBootstrap.RunHelper();              // helper 进程在这里就退出了
+///     if (!await CefBootstrap.StartAsync()) { // 首次会下载官方 CEF 运行时
+///         Console.WriteLine(CefHost.Error());
+///         return 1;
+///     }
+///     App app = new App("browser", 1280, 800);
+///     CefBrowserBox box = new CefBrowserBox();
+///     box.SetStartUrl("https://example.com");
+///     app.root.Add(box);
+///     app.Show();                            // 每帧由 CefBrowser.Render 推循环
+///     CefHost.Shutdown();
+///     return 0;
+/// }
+/// </code>
+///
+/// 想避免「主程序被当 helper 再跑一遍」，用
+/// <see cref="StartAsyncWithHelper"/> 指定一个独立的 helper 可执行文件。
+/// </summary>
+class CefBootstrap {
+    [DllImport("crt", EntryPoint = "exit")]
+    static extern void CrtExit(int code);
+
+    /// <summary>本进程若是 Chromium helper（render/gpu/utility），跑完它的
+    /// 消息循环并直接退出进程（不返回）；是浏览器进程时什么都不做。
+    /// 必须是 Main 的第一句：Chromium 用同一个可执行文件启动子进程，
+    /// helper 分支不能走到宿主程序自己的逻辑里。</summary>
+    static void RunHelper() {
+        string dir = CefBootstrap.LocalRuntimeDir();
+        if (dir == "") { return; }
+        int code = CefBackend.ExecuteProcess(dir, CefHost.MarkerVersion(dir));
+        if (code >= 0) { CefBootstrap.CrtExit(code); }
+    }
+
+    /// <summary>不联网地找出本机已装好的运行时目录（helper 进程用；
+    /// ZAN_CEF_RUNTIME 可显式指定）。</summary>
+    static string LocalRuntimeDir() {
+        string forced = ProcessHost.Env("ZAN_CEF_RUNTIME");
+        if (forced != "") { return forced; }
+        return CefRuntime.Installed();
+    }
+
+    /// <summary>确保本机有 CEF 运行时（首次会按系统版本从官方 CDN 下载并
+    /// 校验，几百 MB），然后初始化浏览器进程。已启动时直接返回 true，
+    /// 失败原因见 <see cref="CefHost.Error"/>。</summary>
+    static async bool StartAsync() {
+        return await CefBootstrap.StartAsyncWithHelper("");
+    }
+
+    /// <summary>同 <see cref="StartAsync"/>，但用 <paramref name="helperPath"/>
+    /// 作为 Chromium 子进程的可执行文件（""=复用本程序，此时 Main 首句必须
+    /// 调用 <see cref="RunHelper"/>）。</summary>
+    static async bool StartAsyncWithHelper(string helperPath) {
+        if (CefHost.IsRunning()) { return true; }
+        string dir = CefBootstrap.LocalRuntimeDir();
+        if (dir == "") {
+            dir = await CefRuntime.EnsureAsync();
+        }
+        if (dir == "") {
+            CefHost.Fail("CEF 运行时自举失败：" + CefRuntime.Error());
+            return false;
+        }
+        return CefHost.Start(dir, helperPath);
+    }
+
+    /// <summary>当前下载进度（"已收/总计" 字节），未在下载时为 ""。
+    /// 首次启动要拉几百 MB，宿主可以用它做进度显示。</summary>
+    static string Progress(string archiveFileName) {
+        return CefRuntime.Progress(archiveFileName);
+    }
+}

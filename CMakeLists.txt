@@ -547,6 +547,34 @@ if(ZAN_BUILD_SDL3 AND NOT WIN32)
     endif()
 endif()
 
+# ---- Native CEF drivers (zan_cef / zan_cef109) ----
+# Chromium-backed browser component (Gui.Component.CefBrowser), independent of
+# the system-engine WebView component. The drivers are thin C shims over CEF's
+# C API that dlopen the libcef of the runtime downloaded on the user's machine,
+# so building them needs only the CEF headers -- fetched into the build tree
+# from the official minimal archive by cmake/ZanCef.cmake. OFF by default
+# because that fetch is a few hundred MB.
+option(ZAN_BUILD_CEF "Build the native zan_cef browser drivers" OFF)
+set(ZAN_CEF_AVAILABLE FALSE)
+if(ZAN_BUILD_CEF)
+    include(cmake/ZanCef.cmake)
+    zan_cef_add_variant(zan_cef "${ZAN_CEF_VERSION}" current)
+    # CEF 109 is the last branch supporting Windows 7/8/8.1, and only there is
+    # the legacy variant of any use -- elsewhere the current branch runs
+    # everywhere, so off Windows building 109 costs a download for nothing
+    # (still switchable on, to keep the legacy source path compilable there).
+    if(WIN32)
+        set(ZAN_CEF_LEGACY_DEFAULT ON)
+    else()
+        set(ZAN_CEF_LEGACY_DEFAULT OFF)
+    endif()
+    option(ZAN_BUILD_CEF_LEGACY "Also build the CEF 109 driver (Win7/8/8.1)"
+        ${ZAN_CEF_LEGACY_DEFAULT})
+    if(ZAN_BUILD_CEF_LEGACY)
+        zan_cef_add_variant(zan_cef109 "${ZAN_CEF_VERSION_LEGACY}" legacy)
+    endif()
+endif()
+
 # ---- IDE ----
 # The IDE is built from src/ide_zan/ZanIDE.zan using the Zan compiler (zanc).
 # It is compiled separately: zanc src/ide_zan/ZanIDE.zan -o build/ZanIDE.exe

@@ -1,0 +1,390 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+
+namespace Gui.Component.CefBrowser;
+
+/// <summary>
+/// 原生 zan_cef driver 的扁平句柄 API。
+///
+/// 和 WebViewBackend 不同，这里不能用 [DllImport]：CEF 的 C 结构体布局
+/// 按版本绑定，同一份 driver 只能配一个 CEF 分支，而分支是运行时按系统
+/// 决定的（旧 Windows → 109，其余 → 最新 stable），所以 driver 本身也要
+/// 在运行时挑：zan_cef（最新）/ zan_cef109（109 变体），用 Interop
+/// （LoadLibrary/dlopen）解析，缺失时 IsAvailable() 为 false 而不是加载
+/// 失败——与 System.Scripting.Python 对待可选原生依赖的方式一致。
+///
+/// driver 自己再 dlopen CefRuntime 装好的 libcef，并在调用任何版本相关
+/// 结构体前校验 CEF API hash，因此“driver 变体和运行时对不上”是一个
+/// 明确的错误而不是内存踩踏。
+/// </summary>
+class CefBackend {
+    static nint mod;
+    static bool resolved;
+    static string lastError = "";
+    static string libName = "";
+
+    static nint addr_lastError;
+    static nint addr_ready;
+    static nint addr_executeProcess;
+    static nint addr_init;
+    static nint addr_work;
+    static nint addr_shutdown;
+    static nint addr_create;
+    static nint addr_close;
+    static nint addr_alive;
+    static nint addr_window;
+    static nint addr_setBounds;
+    static nint addr_setVisible;
+    static nint addr_setClip;
+    static nint addr_setFocus;
+    static nint addr_navigate;
+    static nint addr_back;
+    static nint addr_forward;
+    static nint addr_reload;
+    static nint addr_stop;
+    static nint addr_canGoBack;
+    static nint addr_canGoForward;
+    static nint addr_isLoading;
+    static nint addr_navSeq;
+    static nint addr_lastStatus;
+    static nint addr_lastErrorCode;
+    static nint addr_url;
+    static nint addr_title;
+    static nint addr_executeJs;
+    static nint addr_cdpSend;
+    static nint addr_cdpPending;
+    static nint addr_cdpDropped;
+    static nint addr_cdpAttached;
+    static nint addr_cdpTake;
+
+    /// <summary>能加载到匹配当前运行时分支的 zan_cef driver 时为 true。
+    /// </summary>
+    static bool IsAvailable() {
+        return CefBackend.Resolve("");
+    }
+
+    /// <summary>最近一次失败的原因（加载/解析/原生侧），成功为 ""。
+    /// </summary>
+    static string Error() {
+        if (CefBackend.resolved && CefBackend.addr_lastError != 0) {
+            CefStrFn f = (CefStrFn)CefBackend.addr_lastError;
+            string native = f();
+            if (native != "") { return native; }
+        }
+        return CefBackend.lastError;
+    }
+
+    /// <summary>已加载的 driver 文件名（未加载为 ""）。</summary>
+    static string LibraryName() { return CefBackend.libName; }
+
+    // ---------------------------------------------------------- 加载与解析
+
+    /// <summary>加载 driver 并解析全部入口点。<paramref name="cefVersion"/>
+    /// 是运行时的 CEF 版本（""=未知，按最新变体处理），用来在 109 与最新
+    /// 两个变体之间挑选。幂等。</summary>
+    static bool Resolve(string cefVersion) {
+        if (CefBackend.resolved) { return true; }
+        List<string> cands = CefBackend.Candidates(cefVersion);
+        for (int i = 0; i < cands.Count; i = i + 1) {
+            CefBackend.mod = Interop.Load(cands[i]);
+            if (CefBackend.mod != 0) {
+                CefBackend.libName = cands[i];
+                break;
+            }
+        }
+        if (CefBackend.mod == 0) {
+            CefBackend.lastError = "找不到原生 zan_cef driver（" + cands[0]
+                + "）：" + Interop.LastError();
+            return false;
+        }
+        if (!CefBackend.ResolveSymbols()) {
+            Interop.Unload(CefBackend.mod);
+            CefBackend.mod = 0;
+            CefBackend.libName = "";
+            return false;
+        }
+        CefBackend.resolved = true;
+        return true;
+    }
+
+    /// <summary>按平台命名规则和 CEF 分支列出候选 driver 路径：先按
+    /// ZAN_CEF_DRIVER 指定的绝对路径，再是可执行文件同目录（--publish
+    /// 会把 driver 拷到这里），最后交给系统加载器按名字找。</summary>
+    static List<string> Candidates(string cefVersion) {
+        string baseName = "zan_cef";
+        if (cefVersion.StartsWith("109.")) { baseName = "zan_cef109"; }
+        #if WINDOWS
+        string file = baseName + ".dll";
+        #elif MACOS
+        string file = "lib" + baseName + ".dylib";
+        #else
+        string file = "lib" + baseName + ".so";
+        #endif
+        List<string> cands = new List<string>();
+        string forced = ProcessHost.Env("ZAN_CEF_DRIVER");
+        if (forced != "") {
+            if (Directory.Exists(forced)) { cands.Add(forced + "/" + file); }
+            else { cands.Add(forced); }
+        }
+        string dir = ProcessHost.AppDir();
+        if (dir != "") { cands.Add(dir + "/" + file); }
+        cands.Add(file);
+        return cands;
+    }
+
+    static bool ResolveSymbols() {
+        CefBackend.missing = "";
+        CefBackend.addr_lastError = CefBackend.Sym("zan_cef_last_error");
+        CefBackend.addr_ready = CefBackend.Sym("zan_cef_ready");
+        CefBackend.addr_executeProcess = CefBackend.Sym("zan_cef_execute_process");
+        CefBackend.addr_init = CefBackend.Sym("zan_cef_init");
+        CefBackend.addr_work = CefBackend.Sym("zan_cef_work");
+        CefBackend.addr_shutdown = CefBackend.Sym("zan_cef_shutdown");
+        CefBackend.addr_create = CefBackend.Sym("zan_cef_create");
+        CefBackend.addr_close = CefBackend.Sym("zan_cef_close");
+        CefBackend.addr_alive = CefBackend.Sym("zan_cef_alive");
+        CefBackend.addr_window = CefBackend.Sym("zan_cef_window");
+        CefBackend.addr_setBounds = CefBackend.Sym("zan_cef_set_bounds");
+        CefBackend.addr_setVisible = CefBackend.Sym("zan_cef_set_visible");
+        CefBackend.addr_setClip = CefBackend.Sym("zan_cef_set_clip");
+        CefBackend.addr_setFocus = CefBackend.Sym("zan_cef_set_focus");
+        CefBackend.addr_navigate = CefBackend.Sym("zan_cef_navigate");
+        CefBackend.addr_back = CefBackend.Sym("zan_cef_back");
+        CefBackend.addr_forward = CefBackend.Sym("zan_cef_forward");
+        CefBackend.addr_reload = CefBackend.Sym("zan_cef_reload");
+        CefBackend.addr_stop = CefBackend.Sym("zan_cef_stop");
+        CefBackend.addr_canGoBack = CefBackend.Sym("zan_cef_can_go_back");
+        CefBackend.addr_canGoForward = CefBackend.Sym("zan_cef_can_go_forward");
+        CefBackend.addr_isLoading = CefBackend.Sym("zan_cef_is_loading");
+        CefBackend.addr_navSeq = CefBackend.Sym("zan_cef_nav_seq");
+        CefBackend.addr_lastStatus = CefBackend.Sym("zan_cef_last_status");
+        CefBackend.addr_lastErrorCode = CefBackend.Sym("zan_cef_last_error_code");
+        CefBackend.addr_url = CefBackend.Sym("zan_cef_url");
+        CefBackend.addr_title = CefBackend.Sym("zan_cef_title");
+        CefBackend.addr_executeJs = CefBackend.Sym("zan_cef_execute_js");
+        CefBackend.addr_cdpSend = CefBackend.Sym("zan_cef_cdp_send");
+        CefBackend.addr_cdpPending = CefBackend.Sym("zan_cef_cdp_pending");
+        CefBackend.addr_cdpDropped = CefBackend.Sym("zan_cef_cdp_dropped");
+        CefBackend.addr_cdpAttached = CefBackend.Sym("zan_cef_cdp_attached");
+        CefBackend.addr_cdpTake = CefBackend.Sym("zan_cef_cdp_take");
+        return CefBackend.missing == "";
+    }
+
+    static string missing = "";
+
+    static nint Sym(string name) {
+        nint a = Interop.Symbol(CefBackend.mod, name);
+        if (a == 0) {
+            CefBackend.missing = name;
+            CefBackend.lastError = "zan_cef driver 缺少导出符号 " + name
+                + "（" + CefBackend.libName + "）";
+        }
+        return a;
+    }
+
+    // ---------------------------------------------------------- 进程级 API
+
+    /// <summary>本进程是 Chromium helper（render/gpu/utility）时跑完并返回
+    /// 其退出码；是浏览器进程时返回 -1，调用方继续往下走。</summary>
+    static int ExecuteProcess(string runtimeDir, string cefVersion) {
+        if (!CefBackend.Resolve(cefVersion)) { return 0 - 1; }
+        CefIntStrFn f = (CefIntStrFn)CefBackend.addr_executeProcess;
+        return f(runtimeDir);
+    }
+
+    /// <summary>初始化 CEF 浏览器进程（driver 变体按 CEF 版本选）。
+    /// </summary>
+    static bool Init(string runtimeDir, string cefVersion, string cachePath,
+                     string helperPath, string locale, string switches,
+                     bool windowless) {
+        if (!CefBackend.Resolve(cefVersion)) { return false; }
+        CefInitFn f = (CefInitFn)CefBackend.addr_init;
+        int wl = 0;
+        if (windowless) { wl = 1; }
+        return f(runtimeDir, cachePath, helperPath, locale, switches, wl) != 0;
+    }
+
+    static bool Ready() {
+        if (!CefBackend.resolved) { return false; }
+        CefIntFn f = (CefIntFn)CefBackend.addr_ready;
+        return f() != 0;
+    }
+
+    /// <summary>推一轮 CEF 消息循环（每帧从宿主 UI 线程调用）。</summary>
+    static void Work() {
+        if (!CefBackend.resolved) { return; }
+        CefVoidFn f = (CefVoidFn)CefBackend.addr_work;
+        f();
+    }
+
+    static void Shutdown() {
+        if (!CefBackend.resolved) { return; }
+        CefVoidFn f = (CefVoidFn)CefBackend.addr_shutdown;
+        f();
+    }
+
+    // ---------------------------------------------------------- 浏览器 API
+
+    static int Create(nint parent, int x, int y, int w, int h, string url) {
+        if (!CefBackend.resolved) { return 0; }
+        CefCreateFn f = (CefCreateFn)CefBackend.addr_create;
+        return f(parent, x, y, w, h, url);
+    }
+
+    static void Close(int h) { CefBackend.CallVoid(CefBackend.addr_close, h); }
+
+    static bool Alive(int h) {
+        return CefBackend.CallInt(CefBackend.addr_alive, h) != 0;
+    }
+
+    /// <summary>浏览器的原生窗口句柄（HWND / X11 Window），无则 0。
+    /// </summary>
+    static nint Window(int h) {
+        if (!CefBackend.resolved) { return 0; }
+        CefNintIntFn f = (CefNintIntFn)CefBackend.addr_window;
+        return f(h);
+    }
+
+    static void SetBounds(int h, int x, int y, int w, int hh) {
+        if (!CefBackend.resolved) { return; }
+        CefBoundsFn f = (CefBoundsFn)CefBackend.addr_setBounds;
+        f(h, x, y, w, hh);
+    }
+
+    static void SetVisible(int h, bool visible) {
+        if (!CefBackend.resolved) { return; }
+        CefIntIntFn f = (CefIntIntFn)CefBackend.addr_setVisible;
+        f(h, visible ? 1 : 0);
+    }
+
+    /// <summary>把本帧未被遮挡的区域下发给原生窗口。签名匹配
+    /// Gui.NativeClipFn，由 CefBrowser.Render 登记给 App，帧末统一回调
+    /// （委托是纯函数指针，所以这里是静态方法）。</summary>
+    static void ApplyClip(int h, string spec) {
+        if (!CefBackend.resolved) { return; }
+        CefIntStrVoidFn f = (CefIntStrVoidFn)CefBackend.addr_setClip;
+        f(h, spec);
+    }
+
+    static void SetFocus(int h, bool focus) {
+        if (!CefBackend.resolved) { return; }
+        CefIntIntFn f = (CefIntIntFn)CefBackend.addr_setFocus;
+        f(h, focus ? 1 : 0);
+    }
+
+    static void Navigate(int h, string url) {
+        if (!CefBackend.resolved) { return; }
+        CefIntStrVoidFn f = (CefIntStrVoidFn)CefBackend.addr_navigate;
+        f(h, url);
+    }
+
+    static void Back(int h) { CefBackend.CallVoid(CefBackend.addr_back, h); }
+    static void Forward(int h) { CefBackend.CallVoid(CefBackend.addr_forward, h); }
+    static void Stop(int h) { CefBackend.CallVoid(CefBackend.addr_stop, h); }
+
+    static void Reload(int h, bool ignoreCache) {
+        if (!CefBackend.resolved) { return; }
+        CefIntIntFn f = (CefIntIntFn)CefBackend.addr_reload;
+        f(h, ignoreCache ? 1 : 0);
+    }
+
+    static bool CanGoBack(int h) {
+        return CefBackend.CallInt(CefBackend.addr_canGoBack, h) != 0;
+    }
+    static bool CanGoForward(int h) {
+        return CefBackend.CallInt(CefBackend.addr_canGoForward, h) != 0;
+    }
+    static bool IsLoading(int h) {
+        return CefBackend.CallInt(CefBackend.addr_isLoading, h) != 0;
+    }
+    static int NavSeq(int h) {
+        return CefBackend.CallInt(CefBackend.addr_navSeq, h);
+    }
+    static int LastStatus(int h) {
+        return CefBackend.CallInt(CefBackend.addr_lastStatus, h);
+    }
+    /// <summary>最近一次加载失败的 CEF 错误码（成功为 0）。</summary>
+    static int LastErrorCode(int h) {
+        return CefBackend.CallInt(CefBackend.addr_lastErrorCode, h);
+    }
+
+    static string GetUrl(int h) {
+        return CefBackend.CallStr(CefBackend.addr_url, h);
+    }
+    static string GetTitle(int h) {
+        return CefBackend.CallStr(CefBackend.addr_title, h);
+    }
+
+    /// <summary>在主框架里执行 JavaScript（无返回值；要取结果走 CDP 的
+    /// Runtime.evaluate）。</summary>
+    static void ExecuteJs(int h, string code, string scriptUrl, int startLine) {
+        if (!CefBackend.resolved) { return; }
+        CefJsFn f = (CefJsFn)CefBackend.addr_executeJs;
+        f(h, code, scriptUrl, startLine);
+    }
+
+    // -------------------------------------------------------------- CDP
+
+    /// <summary>发一条 CDP 命令，返回其消息 id（失败 0）。</summary>
+    static int CdpSend(int h, string method, string paramsJson) {
+        if (!CefBackend.resolved) { return 0; }
+        CefCdpSendFn f = (CefCdpSendFn)CefBackend.addr_cdpSend;
+        return f(h, method, paramsJson);
+    }
+    static int CdpPending(int h) {
+        return CefBackend.CallInt(CefBackend.addr_cdpPending, h);
+    }
+    /// <summary>因为 Zan 侧没有及时取走而被丢掉的消息数（队列有界）。
+    /// </summary>
+    static int CdpDropped(int h) {
+        return CefBackend.CallInt(CefBackend.addr_cdpDropped, h);
+    }
+    static bool CdpAttached(int h) {
+        return CefBackend.CallInt(CefBackend.addr_cdpAttached, h) != 0;
+    }
+    /// <summary>取走一条 CDP 消息（结果或事件的原始 JSON），空队列为 ""。
+    /// </summary>
+    static string CdpTake(int h) {
+        return CefBackend.CallStr(CefBackend.addr_cdpTake, h);
+    }
+
+    // ---------------------------------------------------------- 调用小工具
+
+    static void CallVoid(nint addr, int h) {
+        if (!CefBackend.resolved || addr == 0) { return; }
+        CefVoidIntFn f = (CefVoidIntFn)addr;
+        f(h);
+    }
+
+    static int CallInt(nint addr, int h) {
+        if (!CefBackend.resolved || addr == 0) { return 0; }
+        CefIntIntRetFn f = (CefIntIntRetFn)addr;
+        return f(h);
+    }
+
+    static string CallStr(nint addr, int h) {
+        if (!CefBackend.resolved || addr == 0) { return ""; }
+        CefStrIntFn f = (CefStrIntFn)addr;
+        return f(h);
+    }
+}
+
+// ---- driver 入口点的委托签名（与 native/zan_cef.c 的导出一一对应）----
+
+delegate void CefVoidFn();
+delegate int CefIntFn();
+delegate string CefStrFn();
+delegate int CefIntStrFn(string s);
+delegate int CefInitFn(string runtimeDir, string cachePath, string helperPath,
+                       string locale, string switches, int windowless);
+delegate int CefCreateFn(nint parent, int x, int y, int w, int h, string url);
+delegate void CefVoidIntFn(int h);
+delegate int CefIntIntRetFn(int h);
+delegate string CefStrIntFn(int h);
+delegate nint CefNintIntFn(int h);
+delegate void CefIntIntFn(int h, int v);
+delegate void CefIntStrVoidFn(int h, string s);
+delegate void CefBoundsFn(int h, int x, int y, int w, int hh);
+delegate void CefJsFn(int h, string code, string scriptUrl, int startLine);
+delegate int CefCdpSendFn(int h, string method, string paramsJson);

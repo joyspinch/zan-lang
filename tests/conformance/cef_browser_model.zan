@@ -1,0 +1,147 @@
+// CefBrowser 组件的离线部分：URL 归一化与 data:/JSON 转义、CefBrowserBox 的
+// 设计模型（Kind/属性/事件）、CefHost 的就绪标记与 profile 目录推导。
+// 真正的浏览器行为需要下载 CEF 运行时，不在冒烟范围内。
+using System;
+using Gui;
+using Gui.Component.CefBrowser;
+
+class Program {
+    static int bad;
+
+    static void Eq(string got, string want, string label) {
+        if (got != want) {
+            Console.WriteLine("FAIL " + label + ": got '" + got
+                + "' want '" + want + "'");
+            bad = bad + 1;
+        }
+    }
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); bad = bad + 1; }
+    }
+
+    static void Normalize() {
+        Eq(CefBrowser.Normalize("https://example.com"), "https://example.com",
+            "normalize keeps scheme");
+        Eq(CefBrowser.Normalize("example.com/a?b=1"),
+            "https://example.com/a?b=1", "normalize bare host");
+        Eq(CefBrowser.Normalize("data:text/html,<h1>x</h1>"),
+            "data:text/html,<h1>x</h1>", "normalize keeps data:");
+        Eq(CefBrowser.Normalize("about:blank"), "about:blank",
+            "normalize keeps about:");
+        Eq(CefBrowser.Normalize("file:///tmp/a.html"), "file:///tmp/a.html",
+            "normalize keeps file:");
+        Eq(CefBrowser.Normalize(""), "", "normalize empty");
+    }
+
+    static void Escaping() {
+        // data: URL 里 '#' 会被当片段、'&'/'?' 会被当查询，必须转义。
+        Eq(CefBrowser.UrlEscape("<p>a & b #c?d</p>"),
+            "<p>a%20%26%20b%20%23c%3Fd</p>", "data url escape");
+        Eq(CefBrowser.JsonString("a\"b\\c\nd\te"),
+            "\"a\\\"b\\\\c\\nd\\te\"", "json string escape");
+    }
+
+    static void BoxModel() {
+        CefBrowserBox box = new CefBrowserBox();
+        Eq(box.Kind(), "CefBrowserBox", "box kind");
+        Eq(box.StartUrl(), "", "box start url default");
+        box.SetStartUrl("https://example.com");
+        Eq(box.StartUrl(), "https://example.com", "box start url set");
+
+        List<PropSpec> ps = box.Props();
+        Check(ps.Count == 1, "box exposes one property");
+        Eq(ps[0].key, "url", "box property name");
+        Eq(ps[0].Read(), "https://example.com", "box property value");
+        // 设计器/.zform 里写 placeholder 也要落到起始地址。
+        ps[0].Write("https://zan.example");
+        Eq(box.StartUrl(), "https://zan.example", "box property writes back");
+
+        List<string> evts = box.Events();
+        Check(Program.Has(evts, "NavStart"), "box event NavStart");
+        Check(Program.Has(evts, "NavComplete"), "box event NavComplete");
+        Check(Program.Has(evts, "TitleChanged"), "box event TitleChanged");
+        Check(Program.Has(evts, "LoadingChanged"), "box event LoadingChanged");
+
+        // 没有 CEF 运行时时一切都是安全的空操作，而不是崩溃：控件可以放进
+        // 设计器/表单里，运行时缺失只体现为占位符。
+        box.Back();
+        box.Forward();
+        box.Reload();
+        box.Stop();
+        box.Hide();
+        Check(!box.CanGoBack(), "no runtime: cannot go back");
+        Check(!box.CanGoForward(), "no runtime: cannot go forward");
+        Check(!box.IsLoading(), "no runtime: not loading");
+        Check(box.LastStatus() == 0, "no runtime: no status");
+        Eq(box.CurrentUrl(), "", "no runtime: empty url");
+        Eq(box.CurrentTitle(), "", "no runtime: empty title");
+    }
+
+    static bool Has(List<string> xs, string want) {
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            if (xs[i] == want) { return true; }
+        }
+        return false;
+    }
+
+    static void Factory() {
+        // 控件树里的 CEF 浏览器：设计器面板与 JSON 反序列化都要认识它。
+        Control c = ControlFactory.Create("CefBrowserBox");
+        Check(c != null, "factory creates CefBrowserBox");
+        if (c != null) { Eq(c.Kind(), "CefBrowserBox", "factory kind"); }
+        Check(Program.Has(ControlFactory.Kinds(), "CefBrowserBox"),
+            "designer lists CefBrowserBox");
+    }
+
+    static void HostPaths() {
+        Eq(CefHost.ReadyMarker(), ".zan-cef-ready", "ready marker name");
+        Eq(CefRuntime.ReadyMarker(), CefHost.ReadyMarker(),
+            "runtime and host agree on the marker");
+        Eq(CefHost.MarkerVersion("/nonexistent/cef-runtime"), "",
+            "missing marker reads empty");
+        Eq(CefHost.ParentDir("/home/u/.cache/zan/cef/linux64-151.3.18"),
+            "/home/u/.cache/zan/cef", "parent dir posix");
+        Eq(CefHost.ParentDir("C:/Users/u/AppData/Local/Zan/cef/win-151"),
+            "C:/Users/u/AppData/Local/Zan/cef", "parent dir windows");
+        Eq(CefHost.ParentDir("nodir"), ".", "parent dir of bare name");
+        // 版本策略：旧 Windows 钉在 109，其他钉在当前分支（driver 的头文件
+        // 版本），不能是「最新 stable」——那会和 driver 的结构体布局脱钩。
+        Check(CefRuntime.LegacyBranch() == "109.", "legacy branch pinned");
+        Check(CefRuntime.CurrentBranch() != "", "current branch pinned");
+        Eq(CefRuntime.VersionPrefix(),
+            CefRuntime.LegacyWindows() ? CefRuntime.LegacyBranch()
+                                       : CefRuntime.CurrentBranch(),
+            "version prefix follows the platform");
+    }
+
+    static void DriverChoice() {
+        // driver 变体按运行时版本挑：109 运行时配 zan_cef109，其余配 zan_cef。
+        List<string> legacy = CefBackend.Candidates("109.1.18+gf1c41e4");
+        List<string> cur = CefBackend.Candidates("151.3.18+gbeff58d");
+        Check(legacy.Count > 0 && cur.Count > 0, "candidates non-empty");
+        Check(Program.EndsWithAny(legacy, "zan_cef109"),
+            "109 runtime picks the legacy driver");
+        Check(!Program.EndsWithAny(cur, "zan_cef109"),
+            "current runtime avoids the legacy driver");
+    }
+
+    static bool EndsWithAny(List<string> xs, string stem) {
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            if (xs[i].Contains(stem)) { return true; }
+        }
+        return false;
+    }
+
+    static int Main() {
+        bad = 0;
+        Normalize();
+        Escaping();
+        BoxModel();
+        Factory();
+        HostPaths();
+        DriverChoice();
+        if (bad == 0) { Console.WriteLine("cef browser model ok"); }
+        return bad == 0 ? 0 : 1;
+    }
+}
