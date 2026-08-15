@@ -34,3 +34,7 @@ $next = "$major.$minor.$patch"
 # well-formed text file.
 [System.IO.File]::WriteAllText($file, "$next`n")
 Write-Output "VERSION_BUMPED $current -> $next"
+# 显式成功退出：调用方（publish_ide.ps1）按 $LASTEXITCODE 判断这一步，
+# 而纯 PowerShell 脚本不设置它——不写这一行，上一条原生命令留下的
+# 退出码就会被当成"版本号没升上去"，发布在第一步直接失败。
+exit 0
