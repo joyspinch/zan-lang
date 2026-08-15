@@ -1,0 +1,68 @@
+// Tar.ExtractFile 的流式解包：目录/长名/可执行位/路径越界拒绝，
+// 外加 Directory.DeleteRecursive 的清理。
+using System;
+using System.IO;
+using System.IO.Compression;
+
+class Program {
+    static int bad;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); bad = bad + 1; }
+    }
+
+    static byte[] Bytes(string s) {
+        byte[] b = new byte[s.Length];
+        for (int i = 0; i < s.Length; i = i + 1) { b[i] = s[i] & 255; }
+        return b;
+    }
+
+    static TarEntry FileEntry(string name, string text) {
+        TarEntry e = new TarEntry(name);
+        e.data = Bytes(text);
+        return e;
+    }
+
+    static void Main() {
+        string deep = "pkg/a/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            + "/cccccccccccccccccccccccccccccccccccccccccccccccccc"
+            + "/dddddddddddddddddddddddddddddddddddddddddddddddddd/leaf.txt";
+
+        List<TarEntry> entries = new List<TarEntry>();
+        TarEntry dir = new TarEntry("pkg/Release/");
+        dir.isDirectory = true;
+        entries.Add(dir);
+        entries.Add(FileEntry("pkg/Release/libcef.txt", "stand-in for libcef\n"));
+        TarEntry exe = FileEntry("pkg/Release/helper", "#!/bin/sh\nexit 0\n");
+        exe.mode = 493;                                  // 0755
+        entries.Add(exe);
+        entries.Add(FileEntry(deep, "deep-entry\n"));
+
+        File.WriteAllBytes("tarx_conf.tar", Tar.Create(entries));
+        int n = Tar.ExtractFile("tarx_conf.tar", "tarx_conf_out");
+        Check(n == 4, "entry-count");
+        Check(Directory.Exists("tarx_conf_out/pkg/Release"), "dir-created");
+        Check(File.ReadAllText("tarx_conf_out/pkg/Release/libcef.txt")
+              == "stand-in for libcef\n", "file-content");
+        Check(File.ReadAllText("tarx_conf_out/" + deep) == "deep-entry\n", "long-name");
+        Check(File.IsExecutable("tarx_conf_out/pkg/Release/helper"), "exec-bit");
+
+        // 归档里的 ".." 段必须让解包失败，不能写到目标目录之外。
+        List<TarEntry> evil = new List<TarEntry>();
+        evil.Add(FileEntry("../tarx_conf_escape.txt", "pwn\n"));
+        File.WriteAllBytes("tarx_evil.tar", Tar.Create(evil));
+        Check(Tar.ExtractFile("tarx_evil.tar", "tarx_conf_out") == 0 - 1, "traversal-rejected");
+        Check(!File.Exists("tarx_conf_escape.txt"), "no-escape-file");
+
+        // 不存在的归档要返回 -1 而不是崩溃。
+        Check(Tar.ExtractFile("tarx_missing.tar", "tarx_conf_out") == 0 - 1, "missing-archive");
+
+        Check(Directory.DeleteRecursive("tarx_conf_out"), "delete-recursive");
+        Check(!Directory.Exists("tarx_conf_out"), "deleted");
+        Check(Directory.DeleteRecursive("tarx_conf_out"), "delete-missing-ok");
+        File.Delete("tarx_conf.tar");
+        File.Delete("tarx_evil.tar");
+
+        Console.WriteLine("tar-extract-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

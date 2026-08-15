@@ -5,6 +5,15 @@ namespace System.Security.Cryptography;
 /// <summary>FIPS 180-4 SHA-1。仅供遗留/互操作场景（如 HMAC-SHA1）使用；
 /// 不建议用于新的安全场景。</summary>
 class Sha1 {
+    [DllImport("crt", EntryPoint = "fopen")]
+    static extern nint PlatFopen(string path, string mode);
+
+    [DllImport("crt", EntryPoint = "fread")]
+    static extern long PlatFread(byte[] buf, long size, long count, nint fp);
+
+    [DllImport("crt", EntryPoint = "fclose")]
+    static extern int PlatFclose(nint fp);
+
     /// <summary>计算 SHA-1；返回 20 字节摘要。</summary>
     static byte[] Hash(string msg, int len) {
         int h0=1732584193; int h1=4023233417; int h2=2562383102; int h3=271733878; int h4=3285377520;
@@ -17,34 +26,160 @@ class Sha1 {
         long bits = (long)len * 8; int bi = plen - 8;
         m[bi+0]=(bits>>56)&255; m[bi+1]=(bits>>48)&255; m[bi+2]=(bits>>40)&255; m[bi+3]=(bits>>32)&255;
         m[bi+4]=(bits>>24)&255; m[bi+5]=(bits>>16)&255; m[bi+6]=(bits>>8)&255; m[bi+7]=bits&255;
-        int blocks = plen / 64; 
+        int blocks = plen / 64;
+        int[] h = new int[5];
+        h[0]=h0; h[1]=h1; h[2]=h2; h[3]=h3; h[4]=h4;
         for (int b = 0; b < blocks; b = b + 1) {
-            int off = b * 64;
-            List<int> w = new List<int>();
-            int t = 0;
-            for (; t < 16; t = t + 1) {
-                int j = off + t*4;
-                w.Add((((m[j]&255)<<24)|((m[j+1]&255)<<16)|((m[j+2]&255)<<8)|(m[j+3]&255)) & 4294967295);
-            }
-            t = 16;
-            while (t < 80) { w.Add(Bits.Rotl32(w[t-3]^w[t-8]^w[t-14]^w[t-16], 1)); t = t + 1; }
-            int a=h0; int bb=h1; int c=h2; int d=h3; int e=h4;
-            t = 0;
-            while (t < 80) {
-                int f; int kk;
-                if (t < 20) { f = (bb & c) | (((bb ^ 4294967295)&4294967295) & d); kk = 1518500249; }
-                else if (t < 40) { f = bb ^ c ^ d; kk = 1859775393; }
-                else if (t < 60) { f = (bb & c) | (bb & d) | (c & d); kk = 2400959708; }
-                else { f = bb ^ c ^ d; kk = 3395469782; }
-                int tmp = (Bits.Rotl32(a,5) + f + e + kk + w[t]) & 4294967295;
-                e = d; d = c; c = Bits.Rotl32(bb,30); bb = a; a = tmp;
-                t = t + 1;
-            }
-            h0=(h0+a)&4294967295; h1=(h1+bb)&4294967295; h2=(h2+c)&4294967295; h3=(h3+d)&4294967295; h4=(h4+e)&4294967295;
+            Sha1.Block(h, m, b * 64);
         }
         byte[] o = new byte[20];
-        wBE(o,0,h0); wBE(o,4,h1); wBE(o,8,h2); wBE(o,12,h3); wBE(o,16,h4);
+        wBE(o,0,h[0]); wBE(o,4,h[1]); wBE(o,8,h[2]); wBE(o,12,h[3]); wBE(o,16,h[4]);
         return o;
     }
+
+    /// <summary>对字节缓冲区的前 <paramref name="len"/> 字节计算 SHA-1。</summary>
+    static byte[] HashBytes(byte[] data, int len) {
+        if (data == null) { return null; }
+        if (len > data.Length) { len = data.Length; }
+        int[] h = Sha1.NewState();
+        int off = 0;
+        while (off + 64 <= len) {
+            Sha1.Block(h, data, off);
+            off = off + 64;
+        }
+        byte[] carry = new byte[64];
+        int carryLen = len - off;
+        for (int i = 0; i < carryLen; i = i + 1) { carry[i] = data[off + i]; }
+        return Sha1.Finish(h, carry, carryLen, (long)len);
+    }
+
+    /// <summary>流式计算文件的 SHA-1（不把文件整体读入内存），返回
+    /// 20 字节摘要；打开失败返回 null。</summary>
+    static byte[] HashFile(string path) {
+        nint fp = PlatFopen(path, "rb");
+        if (fp == 0) { return null; }
+        int[] h = Sha1.NewState();
+        byte[] buf = new byte[65536];
+        byte[] carry = new byte[64];
+        int carryLen = 0;
+        long total = 0;
+        bool more = true;
+        while (more) {
+            long got = PlatFread(buf, 1, 65536, fp);
+            if (got <= 0) {
+                more = false;
+            } else {
+                int n = (int)got;
+                total = total + got;
+                int pos = 0;
+                if (carryLen > 0) {
+                    int need = 64 - carryLen;
+                    if (need > n) { need = n; }
+                    for (int i = 0; i < need; i = i + 1) { carry[carryLen + i] = buf[i]; }
+                    carryLen = carryLen + need;
+                    pos = need;
+                    if (carryLen == 64) {
+                        Sha1.Block(h, carry, 0);
+                        carryLen = 0;
+                    }
+                }
+                while (pos + 64 <= n) {
+                    Sha1.Block(h, buf, pos);
+                    pos = pos + 64;
+                }
+                int tail = n - pos;
+                for (int i = 0; i < tail; i = i + 1) { carry[carryLen + i] = buf[pos + i]; }
+                carryLen = carryLen + tail;
+            }
+        }
+        PlatFclose(fp);
+        return Sha1.Finish(h, carry, carryLen, total);
+    }
+
+    /// <summary>流式计算文件的 SHA-1 并返回小写十六进制串；失败返回空串。</summary>
+    static string HashFileHex(string path) {
+        byte[] d = Sha1.HashFile(path);
+        if (d == null) { return ""; }
+        return Sha1.ToHex(d);
+    }
+
+    /// <summary>把摘要编码为小写十六进制串。</summary>
+    static string ToHex(byte[] digest) {
+        string hexDigits = "0123456789abcdef";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < digest.Length; i = i + 1) {
+            int v = digest[i] & 255;
+            sb.Append(hexDigits.Substring(v >> 4, 1));
+            sb.Append(hexDigits.Substring(v & 15, 1));
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>按十六进制摘要校验文件（大小写不敏感）。</summary>
+    static bool VerifyFile(string path, string expectedHex) {
+        if (expectedHex == null || expectedHex.Length != 40) { return false; }
+        string got = Sha1.HashFileHex(path);
+        if (got.Length != 40) { return false; }
+        for (int i = 0; i < 40; i = i + 1) {
+            int a = expectedHex[i] & 255;
+            if (a >= 65 && a <= 70) { a = a + 32; }
+            if (a != (got[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
+    static int[] NewState() {
+        int[] h = new int[5];
+        h[0]=1732584193; h[1]=4023233417; h[2]=2562383102; h[3]=271733878; h[4]=3285377520;
+        return h;
+    }
+
+    // 追加 FIPS 填充（0x80、零、64 位大端比特长度）并返回摘要；
+    // tail 保存最后一个不完整块（tailLen < 64）。
+    static byte[] Finish(int[] h, byte[] tail, int tailLen, long totalBytes) {
+        byte[] last = new byte[128];
+        for (int i = 0; i < tailLen; i = i + 1) { last[i] = tail[i]; }
+        last[tailLen] = 128;
+        int plen = 64;
+        if (tailLen + 1 + 8 > 64) { plen = 128; }
+        long bits = totalBytes * 8;
+        int bi = plen - 8;
+        last[bi+0]=(bits>>56)&255; last[bi+1]=(bits>>48)&255;
+        last[bi+2]=(bits>>40)&255; last[bi+3]=(bits>>32)&255;
+        last[bi+4]=(bits>>24)&255; last[bi+5]=(bits>>16)&255;
+        last[bi+6]=(bits>>8)&255;  last[bi+7]=bits&255;
+        Sha1.Block(h, last, 0);
+        if (plen == 128) { Sha1.Block(h, last, 64); }
+        byte[] o = new byte[20];
+        wBE(o,0,h[0]); wBE(o,4,h[1]); wBE(o,8,h[2]); wBE(o,12,h[3]); wBE(o,16,h[4]);
+        return o;
+    }
+
+    // 单个 64 字节块的压缩函数，原地更新 h[0..4]。
+    static void Block(int[] h, byte[] m, int off) {
+        int[] w = new int[80];
+        int t = 0;
+        for (; t < 16; t = t + 1) {
+            int j = off + t*4;
+            w[t] = ((m[j]&255)<<24)|((m[j+1]&255)<<16)|((m[j+2]&255)<<8)|(m[j+3]&255);
+        }
+        t = 16;
+        while (t < 80) { w[t] = Bits.Rotl32(w[t-3]^w[t-8]^w[t-14]^w[t-16], 1); t = t + 1; }
+        int a=h[0]; int bb=h[1]; int c=h[2]; int d=h[3]; int e=h[4];
+        t = 0;
+        while (t < 80) {
+            int f; int kk;
+            if (t < 20) { f = (bb & c) | (((bb ^ 4294967295)&4294967295) & d); kk = 1518500249; }
+            else if (t < 40) { f = bb ^ c ^ d; kk = 1859775393; }
+            else if (t < 60) { f = (bb & c) | (bb & d) | (c & d); kk = 2400959708; }
+            else { f = bb ^ c ^ d; kk = 3395469782; }
+            int tmp = (Bits.Rotl32(a,5) + f + e + kk + w[t]) & 4294967295;
+            e = d; d = c; c = Bits.Rotl32(bb,30); bb = a; a = tmp;
+            t = t + 1;
+        }
+        h[0]=(h[0]+a)&4294967295; h[1]=(h[1]+bb)&4294967295; h[2]=(h[2]+c)&4294967295;
+        h[3]=(h[3]+d)&4294967295; h[4]=(h[4]+e)&4294967295;
+    }
+
     static void wBE(byte[] b, int o, int v) { b[o]=(v>>24)&255; b[o+1]=(v>>16)&255; b[o+2]=(v>>8)&255; b[o+3]=v&255; }
 }

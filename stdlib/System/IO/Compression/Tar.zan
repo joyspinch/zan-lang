@@ -26,6 +26,18 @@ class TarEntry {
 /// ustar 前缀字段，因此长路径也能保留。
 /// </summary>
 class Tar {
+    [DllImport("crt", EntryPoint = "fopen")]
+    static extern nint PlatFopen(string path, string mode);
+
+    [DllImport("crt", EntryPoint = "fread")]
+    static extern long PlatFread(byte[] buf, long size, long count, nint fp);
+
+    [DllImport("crt", EntryPoint = "fwrite")]
+    static extern long PlatFwrite(byte[] buf, long size, long count, nint fp);
+
+    [DllImport("crt", EntryPoint = "fclose")]
+    static extern int PlatFclose(nint fp);
+
     /// <summary>在内存中构建 tar 归档。目录条目应
     /// 标记 isDirectory（或名称以 "/" 结尾）。</summary>
     static byte[] Create(List<TarEntry> entries) {
@@ -105,13 +117,21 @@ class Tar {
         string name = e.name;
         string prefix = "";
         if (name.Length > 100) {
-            int slash = name.LastIndexOf("/", 100);
-            if (slash > 0 && name.Length - slash - 1 <= 100) {
-                prefix = name.Substring(0, slash + 1);
-                name = name.Substring(slash + 1, name.Length - slash - 1);
-                if (prefix.Length > 155) { prefix = prefix.Substring(0, 155); }
+            // ustar 拆分：取最靠前的 '/'，使名称部分 ≤ 100 且前缀 ≤ 155
+            // （前缀不含末尾的 '/'，读取端按 prefix + "/" + name 复原）。
+            int split = 0 - 1;
+            for (int i = 0; i < name.Length && i <= 155; i = i + 1) {
+                if ((name[i] & 255) == 47 && name.Length - i - 1 <= 100) {
+                    split = i;
+                    break;
+                }
             }
-            if (name.Length > 100) { name = name.Substring(0, 100); }
+            if (split > 0) {
+                prefix = name.Substring(0, split);
+                name = name.Substring(split + 1, name.Length - split - 1);
+            } else {
+                name = name.Substring(0, 100);   // 无法拆分：只能截断
+            }
         }
         Tar.WriteStr(b, off, name, 100);
         Tar.WriteOctal(b, off + 100, e.mode == 0 ? (e.isDirectory ? 493 : 420) : e.mode, 8);
@@ -227,5 +247,145 @@ class Tar {
             }
         }
         return v;
+    }
+
+    /// <summary>把 tar 归档流式解包到目录（按 64 KiB 分块读写，不把归档
+    /// 整体读入内存，适合数百 MB 的运行时包）。支持 ustar 前缀长名与
+    /// GNU 长名（'L'）条目；符号链接/设备等条目被跳过。返回写出的文件与
+    /// 目录数，归档损坏或路径越界时返回 -1。</summary>
+    static int ExtractFile(string tarPath, string destDir) {
+        nint fp = PlatFopen(tarPath, "rb");
+        if (fp == 0) { return 0 - 1; }
+        string root = destDir;
+        if (!root.EndsWith("/") && !root.EndsWith("\\")) { root = root + "/"; }
+        Directory.CreateDirectoryRecursive(root);
+
+        byte[] hdr = new byte[512];
+        byte[] buf = new byte[65536];
+        string longName = "";
+        int count = 0;
+        int failed = 0;
+        bool more = true;
+        while (more) {
+            long got = PlatFread(hdr, 1, 512, fp);
+            if (got <= 0) {
+                more = false;
+            } else if (got < 512) {
+                failed = 1; more = false;
+            } else if (Tar.IsZeroBlock(hdr, 0)) {
+                more = false;
+            } else if (Tar.ParseOctal(hdr, 148, 8) != Tar.HeaderSum(hdr, 0)) {
+                failed = 1; more = false;
+            } else {
+                string name = Tar.ReadStr(hdr, 0, 100);
+                string prefix = Tar.ReadStr(hdr, 345, 155);
+                if (prefix.Length > 0) { name = prefix + "/" + name; }
+                if (longName.Length > 0) { name = longName; longName = ""; }
+                long size = Tar.ParseSize(hdr, 124);
+                int mode = Tar.ParseOctal(hdr, 100, 8);
+                int type = hdr[156] & 255;
+                long pad = ((size + 511) / 512) * 512 - size;
+
+                if (size < 0) {
+                    failed = 1; more = false;
+                } else if (type == 76) {                       // GNU 长名条目
+                    longName = Tar.ReadName(fp, buf, size);
+                    if (longName == null) { failed = 1; more = false; }
+                    else if (!Tar.SkipBytes(fp, buf, pad)) { failed = 1; more = false; }
+                } else if (!Tar.SafeName(name)) {
+                    failed = 1; more = false;
+                } else if (type == 53 || name.EndsWith("/")) { // 目录
+                    Directory.CreateDirectoryRecursive(root + name);
+                    count = count + 1;
+                    if (!Tar.SkipBytes(fp, buf, size + pad)) { failed = 1; more = false; }
+                } else if (type == 0 || type == 48) {          // 普通文件
+                    string outPath = root + name;
+                    int slash = Tar.LastSlash(outPath);
+                    if (slash > 0) {
+                        Directory.CreateDirectoryRecursive(outPath.Substring(0, slash));
+                    }
+                    if (!Tar.WriteMember(fp, buf, outPath, size)) {
+                        failed = 1; more = false;
+                    } else {
+                        count = count + 1;
+                        if ((mode & 73) != 0) { File.SetExecutable(outPath, true); }
+                        if (!Tar.SkipBytes(fp, buf, pad)) { failed = 1; more = false; }
+                    }
+                } else {                                       // 链接/设备/其他
+                    if (!Tar.SkipBytes(fp, buf, size + pad)) { failed = 1; more = false; }
+                }
+            }
+        }
+        PlatFclose(fp);
+        if (failed != 0) { return 0 - 1; }
+        return count;
+    }
+
+    // 归档内路径必须是相对路径且不含 ".." 段，否则解包会写到目标目录之外。
+    static bool SafeName(string name) {
+        if (name.Length == 0) { return false; }
+        int c0 = name[0] & 255;
+        if (c0 == 47 || c0 == 92) { return false; }                  // 绝对路径
+        if (name.Length >= 2 && (name[1] & 255) == 58) { return false; } // "C:"
+        int n = name.Length;
+        int seg = 0;
+        for (int i = 0; i <= n; i = i + 1) {
+            int c = i < n ? (name[i] & 255) : 47;
+            if (c == 47 || c == 92) {
+                if (i - seg == 2 && (name[seg] & 255) == 46 && (name[seg+1] & 255) == 46) {
+                    return false;
+                }
+                seg = i + 1;
+            }
+        }
+        return true;
+    }
+
+    static int LastSlash(string path) {
+        int last = 0 - 1;
+        for (int i = 0; i < path.Length; i = i + 1) {
+            int c = path[i] & 255;
+            if (c == 47 || c == 92) { last = i; }
+        }
+        return last;
+    }
+
+    // 把条目数据（size 字节）写到 outPath；失败返回 false。
+    static bool WriteMember(nint fp, byte[] buf, string outPath, long size) {
+        nint ofp = PlatFopen(outPath, "wb");
+        if (ofp == 0) { return false; }
+        long left = size;
+        bool ok = true;
+        while (ok && left > 0) {
+            long want = left > 65536 ? 65536 : left;
+            long got = PlatFread(buf, 1, want, fp);
+            if (got <= 0) { ok = false; }
+            else {
+                long put = PlatFwrite(buf, 1, got, ofp);
+                if (put != got) { ok = false; }
+                left = left - got;
+            }
+        }
+        PlatFclose(ofp);
+        return ok;
+    }
+
+    // 读取 GNU 长名条目的数据（NUL 结尾的路径）。
+    static string ReadName(nint fp, byte[] buf, long size) {
+        if (size <= 0 || size > 65536) { return null; }
+        long got = PlatFread(buf, 1, size, fp);
+        if (got != size) { return null; }
+        return Tar.ReadStr(buf, 0, (int)size);
+    }
+
+    static bool SkipBytes(nint fp, byte[] buf, long count) {
+        long left = count;
+        while (left > 0) {
+            long want = left > 65536 ? 65536 : left;
+            long got = PlatFread(buf, 1, want, fp);
+            if (got <= 0) { return false; }
+            left = left - got;
+        }
+        return true;
     }
 }
