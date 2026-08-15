@@ -51,6 +51,14 @@ class WebApp {
     int port;
     bool running;
     TcpListener listener;
+    // Namespace of every shared-memory table this app owns. Those tables are
+    // machine-global (their name is hashed into one /tmp mapping or one
+    // Local\ mapping), so two servers on one machine must not pick the same
+    // one or they would share rate counters, request locks and route stats.
+    // The listening port is the only discriminator known without being told,
+    // so it is the default; Scope() replaces it with a name that survives a
+    // port change.
+    string scope;
 
     Router router;
     Hooks hooks;
@@ -105,9 +113,11 @@ class WebApp {
         this.totalRequests = new AtomicInt(0);
         this.activeConnections = new AtomicInt(0);
         this.reusePort = false;
-        string suffix = Convert.ToString(port);
-        this.limiter = new RateLimiter("zanweb_rate_" + suffix, 1000);
-        this.locks = new LockManager("zanweb_lock_" + suffix);
+        this.scope = Convert.ToString(port);
+        // Shared tables are created by InitShared (before workers fork), not
+        // here: Scope() may still rename them.
+        this.limiter = null;
+        this.locks = null;
     }
 
     // ---- configuration ----
@@ -134,12 +144,57 @@ class WebApp {
     /// the JSON body, which is what an API-only server wants.</summary>
     WebApp LoginPath(string path) { this.loginPath = path; return this; }
     WebApp ReusePort(bool on) { this.reusePort = on; return this; }
+    /// <summary>Names this app instance for shared memory. Every table the app
+    /// owns is then "zan.web.&lt;name&gt;.&lt;part&gt;" -- rate, lock, route and
+    /// whatever the application adds through <see cref="SharedName"/>. Defaults
+    /// to the listening port. Set it before starting the server (and to the
+    /// same value in every process of one server), and use a distinct name per
+    /// deployed server on the machine.</summary>
+    WebApp Scope(string name) {
+        if (name.Length > 0) { this.scope = name; }
+        return this;
+    }
+    string Scope() { return this.scope; }
+    /// <summary>The shared-memory name of one part of this app:
+    /// "zan.web.8080.rate", "zan.web.shop.perm.roles". The single place these
+    /// names are built, so an application's own tables are namespaced with the
+    /// framework's instead of inventing a prefix.</summary>
+    string SharedName(string part) {
+        return "zan.web." + this.scope + "." + part;
+    }
     /// <summary>Initialise cross-process route stats. Call after all routes are
     /// registered and before starting the server or running workers. Safe to
     /// call in every process: the first call creates the shared table; subsequent
     /// calls (workers) open it. name must be unique per server instance --
-    /// "zanroute_8080" by convention.</summary>
+    /// <see cref="SharedName"/> is what produces one.</summary>
     void InitStats(string name) { this.router.InitStats(name); }
+    void InitStats() { this.router.InitStats(this.SharedName("route")); }
+
+    /// <summary>Creates every shared-memory table of this app (rate limiter,
+    /// request locks, route stats) under the current scope. Called by WebServer
+    /// in the master before workers fork, so a worker opens tables that already
+    /// exist instead of racing another worker to create them. Idempotent.</summary>
+    void InitShared() {
+        RateLimiter _l = this.Limiter();
+        LockManager _k = this.Locks();
+        this.InitStats();
+    }
+
+    // Created on demand so Scope() can still rename them after construction;
+    // InitShared does it up front in the process that owns the tables.
+    RateLimiter Limiter() {
+        if (this.limiter == null) {
+            this.limiter = new RateLimiter(this.SharedName("rate"), 1000);
+        }
+        return this.limiter;
+    }
+
+    LockManager Locks() {
+        if (this.locks == null) {
+            this.locks = new LockManager(this.SharedName("lock"));
+        }
+        return this.locks;
+    }
     WebApp Before(HookFn fn) { this.hooks.Before(fn); return this; }
     WebApp After(AfterFn fn) { this.hooks.After(fn); return this; }
     WebApp AuthResolver(AuthFn fn) { this.authResolver = fn; return this; }
@@ -213,6 +268,7 @@ class WebApp {
     /// <summary>Runs the accept loop forever. Await this from Main so the
     /// coroutine scheduler drives the server: `int r = await app.Start();`</summary>
     async int Start() {
+        this.InitShared();
         Socket.Initialize();
         this.listener = new TcpListener(this.host, this.port);
         if (this.reusePort) { this.listener.StartReusePort(); } else { this.listener.Start(); }
@@ -498,7 +554,7 @@ class WebApp {
         if (principal.Length == 0) { principal = "_unknown_"; }
 
         if (this.globalLimit > 0
-            && !this.limiter.Allow("_global_:" + principal, this.globalLimit)) {
+            && !this.Limiter().Allow("_global_:" + principal, this.globalLimit)) {
             ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
             ctx.Json(WebApp.ErrorJson("429", "too many requests"));
             return ctx.BuildResponse(keepAlive);
@@ -536,7 +592,7 @@ class WebApp {
             rateKey = rateKey + ":ip:" + ctx.RemoteIp();
         }
         if (route.rateLimit > 0
-            && !this.limiter.Allow(rateKey, route.rateLimit)) {
+            && !this.Limiter().Allow(rateKey, route.rateLimit)) {
             ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
             ctx.Json(WebApp.ErrorJson("429", "route rate limit exceeded"));
             return ctx.BuildResponse(keepAlive);
@@ -573,7 +629,7 @@ class WebApp {
         // the duration of the handler and released right after it returns.
         LockLease lockLease = null;
         if (route.lockScope.Length > 0) {
-            lockLease = this.locks.TryAcquire(
+            lockLease = this.Locks().TryAcquire(
                 LockManager.KeyFor(route, principal));
             if (lockLease == null) {
                 ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
@@ -606,7 +662,7 @@ class WebApp {
                 ctx.Json(WebApp.ErrorJson("500", "internal server error"));
             }
         }
-        if (lockLease != null) { this.locks.Release(lockLease); }
+        if (lockLease != null) { this.Locks().Release(lockLease); }
         if (!ctx.ended) {
             ctx.Status(500, "Internal Server Error");
             ctx.Json(WebApp.ErrorJson("500", "handler produced no response"));
@@ -864,7 +920,6 @@ class WebServer {
                 Console.WriteLine("[server] daemonized; parent process exiting.");
                 return 0;
             }
-            app.InitStats(WebServer.StatsName(app));
             int r = await app.Start();
             return r;
         }
@@ -896,15 +951,11 @@ class WebServer {
     // the pipeline is plugged into the worker as a raw-connection handler so
     // routing/hooks/uploads run exactly as they do single-process.
     static void Prepare(WebApp app, int count, bool daemon) {
-        app.InitStats(WebServer.StatsName(app));
+        app.InitShared();
         WebApp.SetActive(app);
         Worker w = new Worker("http", app.Host(), app.Port());
         w.SetCount(count);
         w.onRawConnection = WebApp.ServeSock;
         if (daemon) { Worker.SetDaemonize(true); }
-    }
-
-    static string StatsName(WebApp app) {
-        return "zanroute_" + Convert.ToString(app.Port());
     }
 }
