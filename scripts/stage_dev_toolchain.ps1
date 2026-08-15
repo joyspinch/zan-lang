@@ -115,33 +115,11 @@ if (-not (Stage-File (Join-Path $Build "zan_gui.lib") "zan_gui.lib")) {
     $missing += "zan_gui.lib"
 }
 
-# single-file packing (ZanIDE.CanPackSingle): the pack script plus the
-# self-extract launcher stub, built here so a dev tree packs like a release.
-Stage-File (Join-Path $root "scripts\pack_single.ps1") "pack_single.ps1" | Out-Null
-$stub = Join-Path $destFull "pkg_stub.exe"
-$stubSrc = Join-Path $root "scripts\pkg_stub.c"
-if (-not (Test-Path -LiteralPath $stub) -or
-    (Get-Item -LiteralPath $stubSrc).LastWriteTime -gt (Get-Item -LiteralPath $stub).LastWriteTime) {
-    # -mwindows is the GNU-target spelling; a clang defaulting to
-    # x86_64-pc-windows-msvc rejects it outright and wants the linker switch
-    # plus an explicit user32 (WinMain calls MessageBoxA). Try both, and treat
-    # failure as a warning: the IDE already degrades to a loose-file publish
-    # when the stub is absent (ZanIDE.CanPackSingle).
-    # A stale stub must go first: keeping it would make the "did the build
-    # produce one?" check below succeed on the OLD file, so the msvc-target
-    # fallback never ran and a published program kept launching a stub from
-    # before the fix (no ZAN_PKG_DIR, wrong working directory).
-    Remove-Item -LiteralPath $stub -Force -ErrorAction SilentlyContinue
-    try { & clang -O2 -mwindows $stubSrc -o $stub 2>$null } catch { }
-    if (-not (Test-Path -LiteralPath $stub)) {
-        try {
-            & clang -O2 -D_CRT_SECURE_NO_WARNINGS $stubSrc -o $stub `
-                  -Xlinker /SUBSYSTEM:WINDOWS -luser32 2>$null
-        } catch { }
-    }
-    if (Test-Path -LiteralPath $stub) { $copied = $copied + 1 }
-    else { $missing += "pkg_stub.exe (clang build failed)" }
-}
+# A single-file publish embeds the resources in the exe (zanc --embed) and
+# links the drivers statically, so no launcher stub is staged any more. Remove
+# one left by an older dev tree, or the IDE would keep finding it.
+Remove-Item -LiteralPath (Join-Path $destFull "pkg_stub.exe") -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $destFull "pack_single.ps1") -Force -ErrorAction SilentlyContinue
 
 # new projects get their icon from here when no assets\zan.ico is shipped
 Stage-File (Join-Path $root "assets\zan.ico") "zan.ico" | Out-Null

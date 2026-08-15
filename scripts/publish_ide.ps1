@@ -441,27 +441,12 @@ Write-Output "STAGE_OK -> $dist ($n files)"
 # directory -- no %LOCALAPPDATA% extraction, no ZAN_APP_DIR indirection.
 Write-Output "[6/6] Finalizing flat layout (real exe, no dlls) ..."
 
-# Still ship the single-file packer into the toolchain so the published IDE can
-# wrap USER programs into single-file exes (its Publish flow calls
-# toolchain\pack_single.ps1 with toolchain\pkg_stub.exe). This is independent of
-# how the IDE itself ships; skip gracefully if no C compiler is available.
-$gcc = 'C:\TDM-GCC-64\bin\gcc.exe'
-if (-not (Test-Path $gcc)) {
-    $cc = Get-Command gcc -ErrorAction SilentlyContinue
-    if ($cc) { $gcc = $cc.Source } else { $gcc = $null }
-}
-if ($gcc) {
-    $stub = Join-Path $b 'pkg_stub.exe'
-    & $gcc -O2 -mwindows (Join-Path $root 'scripts\pkg_stub.c') -o $stub
-    if ($LASTEXITCODE -eq 0 -and (Test-Path $stub)) {
-        Copy-Item $stub (Join-Path $distTc 'pkg_stub.exe') -Force
-        Copy-Item (Join-Path $root 'scripts\pack_single.ps1') (Join-Path $distTc 'pack_single.ps1') -Force
-    } else {
-        Write-Output "PUBLISH_WARN: launcher stub build failed; user single-file publish unavailable"
-    }
-} else {
-    Write-Output "PUBLISH_WARN: gcc not found; user single-file publish unavailable (IDE itself ships flat, unaffected)"
-}
+# No self-extract launcher ships any more, for the IDE or for user programs:
+# a single-file publish bakes the resources into the exe with zanc --embed and
+# links the native drivers statically, so nothing is ever unpacked into a cache
+# directory and run from there. Drop a stub left by an older publish.
+Remove-Item (Join-Path $distTc 'pkg_stub.exe') -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $distTc 'pack_single.ps1') -Force -ErrorAction SilentlyContinue
 
 if (-not (Test-Path (Join-Path $dist 'ZanIDE.exe'))) { Write-Output "PUBLISH_FAILED: dist\ZanIDE.exe missing"; exit 1 }
 $sz = (Get-Item (Join-Path $dist 'ZanIDE.exe')).Length

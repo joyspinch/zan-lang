@@ -1622,16 +1622,6 @@ partial class ZanIDE {
         return ZanIDE.PollLogFile(ZanIDE.BuildLogPath(), consumed, log);
     }
 
-    /// True when the shipped single-file packer is available: the self-extract
-    /// launcher stub plus the pack script, both living in toolchain\ (put there
-    /// by scripts/publish_ide.ps1). With them, Windows publishes become ONE exe
-    /// carrying its resources; without them (e.g. a dev build tree) the publish
-    /// falls back to a plain exe + loose assets.
-    static bool CanPackSingle() {
-        return File.Exists(ZanIDE.ToolchainDir() + "/pkg_stub.exe")
-            && File.Exists(ZanIDE.ToolchainDir() + "/pack_single.ps1");
-    }
-
     /// Fresh (emptied and recreated) staging directory for single-file packing.
     static string ResetStage(string dir) {
         if (Directory.Exists(dir)) { AssetManager.deleteTree(dir); }
@@ -1639,18 +1629,23 @@ partial class ZanIDE {
         return dir;
     }
 
-    /// The packer invocation appended after a Windows publish compile: wraps
-    /// the staged exe + resources into one self-extracting exe at `outExe`.
-    static string PackCmd(string root, string stage, string outExe) {
-        string cmd = "powershell -NoProfile -ExecutionPolicy Bypass -File \""
-            + ZanIDE.ToolchainDir() + "/pack_single.ps1\""
-            + " -Stage \"" + stage + "\" -Stub \"" + ZanIDE.ToolchainDir() + "/pkg_stub.exe\""
-            + " -Out \"" + outExe + "\"";
-        // The launcher stub is a prebuilt exe, so its icon is stamped by the
-        // packer; use the very icon the payload exe was built with.
-        string ico = ZanIDE.IconFile(root);
-        if (ico != "") { cmd = cmd + " -Icon \"" + ico + "\""; }
-        return cmd;
+    /// zanc `--embed` specs for a staged payload: every top-level entry of the
+    /// stage is embedded under its own name, so the program finds
+    /// "assets/logo.png" or "skins/dark/skin.css" inside its own image exactly
+    /// where it would have found the file next to the exe (File/Directory try
+    /// the disk first, the embedded copy second). One spec per top-level entry
+    /// keeps this well inside zanc's --embed limit.
+    static string StageEmbedArgs(string stage) {
+        string s = "";
+        List<string> fs = Directory.GetFiles(stage);
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            s = s + " --embed \"" + stage + "/" + fs[i] + "=" + fs[i] + "\"";
+        }
+        List<string> ds = Directory.GetDirectories(stage);
+        for (int i = 0; i < ds.Count; i = i + 1) {
+            s = s + " --embed \"" + stage + "/" + ds[i] + "=" + ds[i] + "\"";
+        }
+        return s;
     }
 
     /// Starts publishing the selected targets in a DETACHED shell so the UI
@@ -1679,8 +1674,12 @@ partial class ZanIDE {
         string baseName = Path.GetFileName(root);
         List<string> steps = new List<string>();
         bool isLib = ZanIDE.IsLibraryProject(root);
-        bool wantPack = ZanIDE.ProjSingleFile(root) && !isLib;
-        bool pack = ZanIDE.CanPackSingle() && wantPack;
+        // "Single file" means the resources travel INSIDE the executable
+        // (zanc --embed, read straight from the exe image) -- never a
+        // self-extracting launcher that unpacks a payload to a cache directory
+        // and runs the program from there. A native driver that only ships as
+        // a shared library still travels beside the exe; zanc puts it there.
+        bool pack = ZanIDE.ProjSingleFile(root) && !isLib;
         // Release (--publish, optimize + strip) vs Debug (-g, DWARF + -O0,
         // runtime checks kept so published-build crashes resolve to .zan:line).
         // The choice lives in zan.proj (toggled in the Publish window) and is
@@ -1697,18 +1696,19 @@ partial class ZanIDE {
                 "> Publish mode: Release (--publish, optimized + stripped).",
                 "> 发布模式：Release（--publish，优化并去除调试信息）。"));
         }
-        // Silently falling back to loose DLLs is what makes "I checked
-        // single-file and still got DLLs" look like a bug, so say why.
+        // Say which of the two publish shapes this is: "I checked single-file
+        // and still got loose files beside the exe" is only a bug report
+        // because the publish never said what it did.
         if (isLib) {
             log.Add(ZanIDE.T("> Library project: publishing shared libraries.",
                              "> 库项目：发布为共享库。"));
-        } else if (wantPack && !pack) {
+        } else if (pack) {
             log.Add(ZanIDE.T(
-                "> Single-file packing unavailable (no pkg_stub.exe / pack_single.ps1 in "
-                    + ZanIDE.ToolchainDir() + "); publishing loose files.",
-                "> 单文件打包不可用（" + ZanIDE.ToolchainDir()
-                    + " 下缺 pkg_stub.exe / pack_single.ps1），改为普通发布。"));
-        } else if (!wantPack) {
+                "> Single file: resources are embedded in the executable"
+                    + " (read from the exe itself, nothing is unpacked).",
+                "> 单文件：资源内嵌进可执行文件（直接从 exe 自身读取，"
+                    + "不解包到任何目录）。"));
+        } else {
             log.Add(ZanIDE.T("> Single-file packing is off for this project.",
                              "> 本项目未启用单文件打包。"));
         }
@@ -1767,14 +1767,14 @@ partial class ZanIDE {
                     string exe = outDir + "/" + baseName + ".exe";
                     string ll = bd + "/.zanpub_x64.ll";
                     if (pack) {
-                        // Compile into a staging dir (zanc drops any driver DLLs
-                        // next to the exe there), add the project resources, then
-                        // wrap the whole stage into one self-extracting exe.
+                        // Stage the payload, then bake the stage INTO the exe:
+                        // the program reads its resources from its own image
+                        // (File/Directory fall back to the embedded copy), so
+                        // there is nothing to unpack and nowhere else to run.
                         string stage = ZanIDE.ResetStage(bd + "/pub_win_x64");
-                        string sexe = stage + "/" + baseName + ".exe";
                         ZanIDE.CopyPayloadPacked(root, stage, outDir, log);
-                        steps.Add(ZanIDE.CompileToExe(root, p, inputs, ll, sexe, !dbg, dbg)
-                            + emb + " && " + ZanIDE.PackCmd(root, stage, exe));
+                        steps.Add(ZanIDE.CompileToExe(root, p, inputs, ll, exe, !dbg, dbg)
+                            + emb + ZanIDE.StageEmbedArgs(stage));
                     } else {
                         ZanIDE.CopyPayload(root, outDir, log);
                         steps.Add(ZanIDE.CompileToExe(root, p, inputs, ll, exe, !dbg, dbg) + emb);
@@ -1787,10 +1787,9 @@ partial class ZanIDE {
                     // (win-arm64 target) -- no external clang needed.
                     if (pack) {
                         string stage = ZanIDE.ResetStage(bd + "/pub_win_arm64");
-                        string sexe = stage + "/" + baseName + ".exe";
                         ZanIDE.CopyPayloadPacked(root, stage, outDir, log);
-                        steps.Add(ZanIDE.CompileToExeCross(root, p, inputs, sexe, "win-arm64", dbg)
-                            + emb + " && " + ZanIDE.PackCmd(root, stage, exe));
+                        steps.Add(ZanIDE.CompileToExeCross(root, p, inputs, exe, "win-arm64", dbg)
+                            + emb + ZanIDE.StageEmbedArgs(stage));
                     } else {
                         ZanIDE.CopyPayload(root, outDir, log);
                         steps.Add(ZanIDE.CompileToExeCross(root, p, inputs, exe, "win-arm64", dbg) + emb);
@@ -2078,11 +2077,11 @@ partial class ZanIDE {
         ZanIDE.CopyContent(root, dir, log);
     }
 
-    /// The single-file variant: assets and skins are packed into the staged
-    /// executable, but an item whose generation action is "copy to output"
-    /// asked to stay a file the user can edit after publishing -- packing it
-    /// into the exe is the one thing that action rules out. It ships in the
-    /// publish directory next to the packed exe.
+    /// The single-file variant: assets and skins are staged so they can be
+    /// embedded into the executable (StageEmbedArgs), but an item whose
+    /// generation action is "copy to output" asked to stay a file the user can
+    /// edit after publishing -- baking it into the exe is the one thing that
+    /// action rules out. It ships in the publish directory next to the exe.
     static void CopyPayloadPacked(string root, string stage, string outDir,
                                   List<string> log) {
         ZanIDE.CopyResources(root, stage, log);

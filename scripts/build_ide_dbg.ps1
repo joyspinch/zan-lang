@@ -210,11 +210,10 @@ try {
 
 if ($failed) { exit 1 }
 
-# An IDE started from build\ resolves zanc + zan-lsp/zan-dap/zanfmt and the
-# single-file packer under build\toolchain (ZanIDE.ToolchainDir), so stage that
-# folder the way publish_ide.ps1 lays out the shipped one. Without it a dev
-# build cannot compile projects at all, and silently publishes loose DLLs even
-# with "single-file exe" checked.
+# An IDE started from build\ resolves zanc + zan-lsp/zan-dap/zanfmt under
+# build\toolchain (ZanIDE.ToolchainDir), so stage that folder the way
+# publish_ide.ps1 lays out the shipped one. Without it a dev build cannot
+# compile projects at all.
 & powershell -NoProfile -ExecutionPolicy Bypass `
     -File (Join-Path (Get-Location) "scripts\stage_dev_toolchain.ps1")
 
