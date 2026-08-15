@@ -32,6 +32,13 @@ typedef struct {
 /* Nesting depth of try/finally regions a single function body may be inside. */
 #define ZAN_MAX_FINALLY_DEPTH 16
 
+/* Armed try handlers tracked at once. Nested bodies (lambdas, async $resume)
+ * stack their own entries on top of the enclosing body's, so this is deeper
+ * than the per-body try nesting; overflowing it drops the extra entries, so an
+ * early exit out of those levels falls back to the old grow-only behaviour --
+ * it never restores a wrong depth. */
+#define ZAN_MAX_ARMED_TRY 64
+
 struct zan_irgen {
     zan_arena_t *arena;
     zan_diag_t *diag;
@@ -182,6 +189,23 @@ struct zan_irgen {
     int finally_count;
     /* finallys entered inside the innermost loop: break/continue run only those */
     int finally_loop_base;
+
+    /* try statements whose handler is currently armed, innermost last. Entering
+     * a try raises __zan_eh_top by one and the normal fallthrough out of its
+     * body lowers it again, but `return`/`break`/`continue` branch past that
+     * epilogue, so those paths restore the top from here -- otherwise the
+     * handler stack only ever grows (one 1040-byte slot per call for a
+     * `try { ... return x; }`: a per-frame GUI loop fills all 4096 slots
+     * within seconds and aborts with "exception handler stack exhausted"). */
+    struct {
+        LLVMValueRef old_top_slot; /* i32 alloca: __zan_eh_top at try entry */
+    } eh_armed[ZAN_MAX_ARMED_TRY];
+    int eh_armed_count;
+    /* entries belonging to the body being emitted: a nested body (lambda,
+     * async $resume) leaves the enclosing function's handlers alone */
+    int eh_armed_base;
+    /* entries armed inside the innermost loop: break/continue leave only those */
+    int eh_armed_loop_base;
 
     /* constructors */
     struct zan_ctor_entry {

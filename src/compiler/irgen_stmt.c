@@ -99,6 +99,23 @@ static void emit_monitor_exit(zan_irgen_t *g, LLVMValueRef obj_slot) {
     zan_call2(g->builder, mon_ty, exit_fn, &obj, 1, "");
 }
 
+/* Restore __zan_eh_top for an exit path that jumps out of the try statements
+ * armed from `base` up (their handlers are disarmed by leaving). Reads the top
+ * the outermost of them was armed at, so nested tries need no arithmetic. In an
+ * async body the handlers are frame-resident and re-armed per invocation, and
+ * the try-entry allocas do not survive a suspension, so those keep their own
+ * bookkeeping (frame.hcount). */
+static void emit_eh_disarm_from(zan_irgen_t *g, int base) {
+    if (base < g->eh_armed_base) base = g->eh_armed_base;
+    if (g->eh_armed_count <= base || g->current_async_frame) return;
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef top_g, bufs_g, exc_g;
+    get_eh_globals(g, &top_g, &bufs_g, &exc_g);
+    LLVMValueRef ot = LLVMBuildLoad2(g->builder, i32t,
+        g->eh_armed[base].old_top_slot, "eh.old.exit");
+    zan_store_fit(g, ot, top_g);
+}
+
 static void emit_pending_finallys(zan_irgen_t *g, local_scope_t *locals, int base) {
     if (base < 0) base = 0;
     int saved = g->finally_count;
@@ -1159,6 +1176,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
              * too, exactly like falling off the end of Main does, so a
              * singleton held in a static field is not reported as a leak. */
             if (g->current_fn_is_main) emit_release_static_rc_fields(g, NULL);
+            emit_eh_disarm_from(g, 0);
             LLVMBuildRet(g->builder, val);
         } else {
             emit_pending_finallys(g, locals, 0);
@@ -1172,6 +1190,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
              * (mirrors the implicit end-of-main `ret i32 0`). */
             LLVMTypeRef fn_ret = g->current_fn_ret_type;
             if (g->current_fn_is_main) emit_release_static_rc_fields(g, NULL);
+            emit_eh_disarm_from(g, 0);
             if (fn_ret && LLVMGetTypeKind(fn_ret) != LLVMVoidTypeKind) {
                 LLVMBuildRet(g->builder, LLVMConstNull(fn_ret));
             } else {
@@ -1237,6 +1256,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->loop_locals_base = body_start;
         g->loop_catch_base = g->catch_cleanup_count;
         g->finally_loop_base = g->finally_count;
+        int saved_loop_ehbase = g->eh_armed_loop_base;
+        g->eh_armed_loop_base = g->eh_armed_count;
 
         LLVMBuildBr(g->builder, cond_bb);
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
@@ -1262,6 +1283,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->loop_locals_base = saved_loop_base;
         g->loop_catch_base = saved_loop_cbase;
         g->finally_loop_base = saved_loop_fbase;
+        g->eh_armed_loop_base = saved_loop_ehbase;
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         break;
@@ -1295,6 +1317,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->loop_locals_base = for_body_start;
         g->loop_catch_base = g->catch_cleanup_count;
         g->finally_loop_base = g->finally_count;
+        int saved_loop_ehbase = g->eh_armed_loop_base;
+        g->eh_armed_loop_base = g->eh_armed_count;
 
         LLVMBuildBr(g->builder, cond_bb);
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
@@ -1328,6 +1352,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->loop_locals_base = saved_loop_base;
         g->loop_catch_base = saved_loop_cbase;
         g->finally_loop_base = saved_loop_fbase;
+        g->eh_armed_loop_base = saved_loop_ehbase;
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         /* Drop the loop variables (and any owned init-clause locals) now that
@@ -1344,6 +1369,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 break;
             emit_release_owned_locals_range(g, locals, g->loop_locals_base);
             emit_release_active_catch_excs(g, g->loop_catch_base);
+            emit_eh_disarm_from(g, g->eh_armed_loop_base);
             LLVMBuildBr(g->builder, g->break_target);
         }
         break;
@@ -1355,6 +1381,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 break;
             emit_release_owned_locals_range(g, locals, g->loop_locals_base);
             emit_release_active_catch_excs(g, g->loop_catch_base);
+            emit_eh_disarm_from(g, g->eh_armed_loop_base);
             LLVMBuildBr(g->builder, g->continue_target);
         }
         break;
@@ -1854,7 +1881,15 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
                 "too many nested try/finally blocks in one function body");
         }
+        int armed_idx = -1;
+        if (g->eh_armed_count < ZAN_MAX_ARMED_TRY) {
+            armed_idx = g->eh_armed_count++;
+            g->eh_armed[armed_idx].old_top_slot = old_top_slot;
+        }
         emit_stmt(g, stmt->try_stmt.try_body, locals);
+        /* the handler covers the body only: the catches below run with it
+         * already disarmed, so an exit path there leaves the enclosing tries */
+        if (armed_idx >= 0) g->eh_armed_count = armed_idx;
         if (fin_idx >= 0) g->finallys[fin_idx].in_try_body = false;
         g->throw_locals_base = saved_throw_base;
         g->throw_catch_base = saved_throw_cbase;
@@ -2254,11 +2289,13 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         int fe_saved_loop_base = g->loop_locals_base;
         int fe_saved_loop_cbase = g->loop_catch_base;
         int fe_saved_loop_fbase = g->finally_loop_base;
+        int fe_saved_loop_ehbase = g->eh_armed_loop_base;
         g->break_target = end_bb;
         g->continue_target = step_bb;
         g->loop_locals_base = fe_start;
         g->loop_catch_base = g->catch_cleanup_count;
         g->finally_loop_base = g->finally_count;
+        g->eh_armed_loop_base = g->eh_armed_count;
 
         LLVMBuildBr(g->builder, cond_bb);
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
@@ -2330,6 +2367,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             g->loop_locals_base = fe_saved_loop_base;
             g->loop_catch_base = fe_saved_loop_cbase;
             g->finally_loop_base = fe_saved_loop_fbase;
+            g->eh_armed_loop_base = fe_saved_loop_ehbase;
             LLVMPositionBuilderAtEnd(g->builder, end_bb);
             emit_release_owned_call_temp(g, stmt->foreach_stmt.collection,
                                          collection, locals);
@@ -2379,6 +2417,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->loop_locals_base = fe_saved_loop_base;
         g->loop_catch_base = fe_saved_loop_cbase;
         g->finally_loop_base = fe_saved_loop_fbase;
+        g->eh_armed_loop_base = fe_saved_loop_ehbase;
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         /* an owned temporary collection (e.g. iterating a call result) is

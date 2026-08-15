@@ -1,0 +1,153 @@
+// Leaving a try by `return`/`break`/`continue` branches past the epilogue that
+// lowers the handler top again, so the handler stack used to keep one 1040-byte
+// slot per call and, after 4096 of them, abort with "exception handler stack
+// exhausted" -- an idle GUI frame loop (Gui.App.PumpSafe/SafeFrame are both
+// `try { ... return x; }`) grew hundreds of MB that way. Each shape below runs
+// far more than the stack holds, so an unbalanced exit shows up as an abort.
+using System;
+
+delegate int Fn(int x);
+
+class Program {
+    static int Body(int i) {
+        if (i % 7 == 0)
+            throw new Exception("boom");
+        return i + 1;
+    }
+
+    static int RetFromTry(int i) {
+        try {
+            return Program.Body(i);
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    // the inner return leaves two armed handlers at once
+    static int RetFromNested(int i) {
+        try {
+            try {
+                return Program.Body(i);
+            } catch (Exception e) {
+                return -2;
+            }
+        } catch (Exception e2) {
+            return -3;
+        }
+    }
+
+    // the finally still runs exactly once on the way out
+    static int RetWithFinally(int i, int[] hits) {
+        try {
+            return Program.Body(i);
+        } catch (Exception e) {
+            return -1;
+        } finally {
+            hits[0] = hits[0] + 1;
+        }
+    }
+
+    // break/continue leave only the trys entered inside the loop
+    static int LoopExits(int n) {
+        int acc = 0;
+        int i = 0;
+        while (i < n) {
+            i = i + 1;
+            try {
+                if (i % 3 == 0) continue;
+                if (i == n) break;
+                acc = acc + 1;
+            } catch (Exception e) {
+                acc = acc - 1;
+            }
+        }
+        return acc;
+    }
+
+    static int ForeachExit(int[] xs) {
+        int acc = 0;
+        foreach (int x in xs) {
+            try {
+                if (x < 0) break;
+                acc = acc + x;
+            } catch (Exception e) {
+                acc = 0;
+            }
+        }
+        return acc;
+    }
+
+    // a lambda's own try/return must not restore the enclosing body's top
+    static int LambdaRet(int i) {
+        Fn f = (int x) => {
+            try {
+                return Program.Body(x);
+            } catch (Exception e) {
+                return -1;
+            }
+        };
+        try {
+            return f(i) + f(i + 1);
+        } catch (Exception e2) {
+            return -9;
+        }
+    }
+
+    static int Deep(int d) {
+        if (d == 0)
+            throw new Exception("deep");
+        return Program.Deep(d - 1);
+    }
+
+    static void Main() {
+        int n = 20000;
+        int[] hits = new int[1];
+        int a = 0;
+        int b = 0;
+        int c = 0;
+        int l = 0;
+        int i = 0;
+        while (i < n) {
+            a = a + Program.RetFromTry(i);
+            b = b + Program.RetFromNested(i);
+            c = c + Program.RetWithFinally(i, hits);
+            l = l + Program.LambdaRet(i);
+            i = i + 1;
+        }
+        // 17143 of the 20000 calls return i+1, the other 2857 (i % 7 == 0) the
+        // handler's value: the nested shape differs from the flat one by 1 each
+        Console.WriteLine("ret " + Convert.ToString(a));
+        Console.WriteLine("nested " + Convert.ToString(b));
+        Console.WriteLine("finally " + Convert.ToString(c) + " " + Convert.ToString(hits[0]));
+        Console.WriteLine("lambda " + Convert.ToString(l));
+
+        int[] xs = new int[5];
+        xs[0] = 1;
+        xs[1] = 2;
+        xs[2] = -1;
+        xs[3] = 4;
+        xs[4] = 5;
+        int loops = 0;
+        int fe = 0;
+        int k = 0;
+        while (k < n) {
+            loops = loops + Program.LoopExits(10);
+            fe = fe + Program.ForeachExit(xs);
+            k = k + 1;
+        }
+        Console.WriteLine("loop " + Convert.ToString(loops) + " " + Convert.ToString(fe));
+
+        // the stack is back where it started, so a throw still finds its handler
+        int caught = 0;
+        k = 0;
+        while (k < n) {
+            try {
+                Program.Deep(8);
+            } catch (Exception e) {
+                caught = caught + 1;
+            }
+            k = k + 1;
+        }
+        Console.WriteLine("caught " + Convert.ToString(caught));
+    }
+}

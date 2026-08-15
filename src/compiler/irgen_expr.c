@@ -7778,9 +7778,14 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     int saved_throw_base = g->throw_locals_base;
     int saved_catch_cc = g->catch_cleanup_count;
     int saved_throw_cb = g->throw_catch_base;
+    int saved_eh_c = g->eh_armed_count;
+    int saved_eh_b = g->eh_armed_base;
+    int saved_eh_lb = g->eh_armed_loop_base;
     g->throw_locals_base = 0;
     g->catch_cleanup_count = 0;
     g->throw_catch_base = 0;
+    g->eh_armed_base = g->eh_armed_count;
+    g->eh_armed_loop_base = g->eh_armed_count;
     g->current_this = NULL;
     g->current_async_frame = NULL;
     g->lambda_depth++;
@@ -7874,6 +7879,9 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     g->throw_locals_base = saved_throw_base;
     g->catch_cleanup_count = saved_catch_cc;
     g->throw_catch_base = saved_throw_cb;
+    g->eh_armed_count = saved_eh_c;
+    g->eh_armed_base = saved_eh_b;
+    g->eh_armed_loop_base = saved_eh_lb;
     g->current_this = saved_this;
     g->current_async_frame = saved_async_frame;
     g->current_fn_body = saved_fn_body;
