@@ -40,7 +40,12 @@ class Panel : Control {
     }
 
     /// Default design-time constructor; the form supplies the field name.
-    Panel() : this("") { }
+    /// 设计里的面板默认只做布局（不画表面）：设计器里的容器绝大多数
+    /// 是分组行、工具条或列，画成卡片就会和里面控件自己的边框叠在
+    /// 一起。要一张卡片就在设计里声明 style = card。
+    Panel() {
+        InitPanel("", 3);
+    }
 
     /// 保留模式构造函数：卡片容器 `new Panel("main")`。
     Panel(string name) {
@@ -183,11 +188,11 @@ class Panel : Control {
         }
     }
 
-    /// 当解析出的盒子 `s` 与裸 `panel` 解析结果不同时返回 true——
-    /// 即 `panel.<class>` / `#<name>` 规则或内联
-    /// Bg()/Gradient()/Radius() 设置器给了该面板自己的表面。
-    bool StyledSurface(App app, StyleBox s) {
-        StyleBox d = Style.Of(app, "panel", "", Style.SNormal());
+    /// 当解析出的盒子 `s` 与该类型的裸规则解析结果不同时返回 true——
+    /// 即 `<type>.<class>` / `#<name>` 规则或内联 Bg()/Gradient()/Radius()
+    /// 设置器专门给了这个容器一张表面。
+    bool StyledSurface(App app, string type, StyleBox s) {
+        StyleBox d = Style.Of(app, type, "", Style.SNormal());
         return s.bg != d.bg || s.bgTo != d.bgTo || s.radius != d.radius
             || s.borderColor != d.borderColor || s.borderW != d.borderW
             || s.shadow != d.shadow || s.blur != d.blur;
@@ -197,29 +202,41 @@ class Panel : Control {
         Canvas c = app.canvas;
         Theme t = app.theme;
         if (style == 3) {
+            // 布局容器自己没有表面，但样式表专门给它背景/边框时
+            // （`stack.reflist-head { background: ... }` 这类）照画，
+            // 否则一行分组行就得为了一条底色被迫做成卡片。
+            StyleBox ls = Style.Full(app, "stack", Class, name, Style.SNormal());
+            Style.Inline(ls, this);
+            if (this.StyledSurface(app, "stack", ls)) {
+                ls.Paint(app, bx, by, bw, bh);
+            }
             return;
         }
-        // 面板拥有自己的表面，因此基类 PaintStyleBox 特意
-        // 跳过它：在这里解析 CSS 盒子，当样式表（或内联设置器）
-        // 专门为此面板设置了样式时绘制，
-        // 使 `#Card { background: linear-gradient(...) }` 和 `panel.Gradient(a,b)`
-        // 都能生效。未设置样式的面板保持普通主题表面。
-        StyleBox s = Style.Full(app, "panel", Class, name, Style.SNormal());
-        Style.Inline(s, this);
-        if (this.StyledSurface(app, s)) {
-            s.Paint(app, bx, by, bw, bh);
-        } else if (app.WindowShape() != 0 && parent != null && parent is Form) {
+        if (app.WindowShape() != 0 && parent != null && parent is Form) {
             // 异形窗口的窗口根：轮廓就是窗口本身，
             // 全窗口主题表面会填满阴影带并把设计
             // 变方正。设计自身的卡片自行绘制。
-        } else if (style == 1) {
+            return;
+        }
+        // 表面完全由样式表决定：base.css 的 `panel` 规则把主题 token
+        // 展开成背景/边框/圆角/投影/磨砂，皮肤只要改写那条规则或
+        // 它用到的 token 即可，控件这里不再硬编码任何一种画法。
+        // 基类 PaintStyleBox 特意跳过面板，好让 `#Card { background:
+        // linear-gradient(...) }` 与内联的 Bg()/Gradient()/Radius() 走同一条路。
+        StyleBox s = Style.Full(app, "panel", Class, name, Style.SNormal());
+        Style.Inline(s, this);
+        if (style == 1) {
+            // 纯表面：只填色，不要边框/圆角/投影。Plain(color) 是显式的
+            // 内联覆盖，因此优先于样式表给出的背景。
             int col = surfaceColor;
             if (col == 0) { col = t.bgSecondary; }
-            c.FillRect(bx, by, bw, bh, col);
-        } else {
-            c.SurfaceRoundRect(bx, by, bw, bh, t.borderRadiusLarge,
-                               t.bgPrimary, t.borderSecondary, 1);
+            s.bg = col;
+            s.bgTo = col;
+            s.borderW = 0;
+            s.radius = 0;
+            s.shadow = 0;
         }
+        s.Paint(app, bx, by, bw, bh);
         Fx.Apply(app, bx, by, bw, bh, t.borderRadiusLarge, fx);
         if (style == 2 && title != "") {
             int pad = t.paddingLarge;
