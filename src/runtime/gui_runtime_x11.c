@@ -725,6 +725,33 @@ EXPORT i32 zan_gui_set_title(iptr hwnd_val, const char *title) {
     return 0;
 }
 
+EXPORT i32 zan_gui_set_window_pos(iptr hwnd_val, i32 x, i32 y) {
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
+    if (!g_display || !xid) return 1;
+    XMoveWindow(g_display, xid, (int)x, (int)y);
+    XFlush(g_display);
+    return 0;
+}
+
+EXPORT i32 zan_gui_center_window(iptr hwnd_val) {
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
+    if (!g_display || !xid) return 1;
+    Window root; int wx = 0, wy = 0;
+    unsigned int ww = 0, wh = 0, bw = 0, depth = 0;
+    if (!XGetGeometry(g_display, xid, &root, &wx, &wy, &ww, &wh, &bw, &depth))
+        return 1;
+    int screen = DefaultScreen(g_display);
+    int sw = DisplayWidth(g_display, screen);
+    int sh = DisplayHeight(g_display, screen);
+    int nx = (sw - (int)ww) / 2;
+    int ny = (sh - (int)wh) / 2;
+    if (nx < 0) nx = 0;
+    if (ny < 0) ny = 0;
+    XMoveWindow(g_display, xid, nx, ny);
+    XFlush(g_display);
+    return 0;
+}
+
 EXPORT i32 zan_gui_set_cursor(i32 cursor_type) {
     if (!g_display || g_lwin_count == 0) return 1;
     int slot = (int)cursor_type;
