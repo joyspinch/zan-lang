@@ -48,7 +48,7 @@ $version = (Get-Content (Join-Path $root 'VERSION') -Raw).Trim()
 Write-Output "Publishing version $version"
 
 if (-not $SkipBuild) {
-    Write-Output "[1/4] Building the IDE (scripts\build_ide.ps1) ..."
+    Write-Output "[1/6] Building the IDE (scripts\build_ide.ps1) ..."
     & (Join-Path $root 'scripts\build_ide.ps1')
     if ($LASTEXITCODE -ne 0) { Write-Output "PUBLISH_FAILED: build error"; exit 1 }
 }
@@ -63,7 +63,7 @@ foreach ($p in @($ideExe, $zancExe, $stdlib)) {
 }
 
 # ---- clean + recreate dist (release output only) ----
-Write-Output "[2/4] Preparing clean dist directory: $dist"
+Write-Output "[2/6] Preparing clean dist directory: $dist"
 if (Test-Path $dist) {
     # (dist\ itself may hold other platform folders; only win-x64 is rebuilt)
     try { Remove-Item $dist -Recurse -Force -ErrorAction Stop }
@@ -78,7 +78,7 @@ if (Test-Path $dist) {
 if (-not (Test-Path $dist)) { New-Item -ItemType Directory -Path $dist -Force | Out-Null }
 
 # ---- copy the toolchain ----
-Write-Output "[3/4] Copying IDE + compiler + stdlib ..."
+Write-Output "[3/6] Copying IDE + compiler + stdlib ..."
 $distTc = Join-Path $dist 'toolchain'
 New-Item -ItemType Directory -Path $distTc | Out-Null
 Copy-Item $ideExe (Join-Path $dist 'ZanIDE.exe')
@@ -269,8 +269,80 @@ if (Test-Path $toolsDir) {
 & (Join-Path $root 'scripts\gen_knowledge.ps1') `
     -Zanc $zancExe -Stdlib $stdlib -OutDir (Join-Path $dist 'knowledge')
 
+# ---- AI onboarding pack (AGENTS.md + skills + stdio MCP + client configs) --
+# Any external AI tool (Claude Code / Cursor / Copilot / Windsurf) can drive
+# this SDK without reading its sources: it launches zan-mcp.exe --stdio and
+# calls zan_start_here. The pack is what makes that a copy-one-file step, so it
+# ships with the release. Non-fatal throughout: a missing piece degrades the
+# assistance, it does not break the IDE.
+Write-Output "[4/6] Building the AI onboarding pack ..."
+$aiPack = Join-Path $root 'tools\ai_pack'
+$mcpSrc = Join-Path $root 'tools\mcp_server\mcp_server.zan'
+$mcpExe = Join-Path $dist 'zan-mcp.exe'
+if (Test-Path $mcpSrc) {
+    # Beside ZanIDE.exe on purpose: the server resolves knowledge\,
+    # toolchain\zanc.exe and stdlib\ from its own directory, so the published
+    # tree stays relocatable.
+    # zanc writes its optimization report to stderr, and under
+    # $ErrorActionPreference = "Stop" PowerShell turns a native command's stderr
+    # into a terminating error whichever way the streams are redirected. Launch
+    # it as a process instead so its output only ever reaches the log files, and
+    # judge the result by the exit code.
+    $mcpLog = Join-Path $root '_scratch\publish_zan_mcp.log'
+    New-Item -ItemType Directory -Force -Path (Split-Path $mcpLog) | Out-Null
+    $mcpProc = Start-Process -FilePath $zancExe -Wait -PassThru -NoNewWindow `
+        -ArgumentList @($mcpSrc, '--auto-stdlib', '--publish', '-o', $mcpExe) `
+        -RedirectStandardOutput $mcpLog -RedirectStandardError "$mcpLog.err"
+    if ($mcpProc.ExitCode -ne 0) {
+        Write-Output "PUBLISH_WARN: zanc exited $($mcpProc.ExitCode) building zan-mcp.exe; see $mcpLog.err"
+    }
+    if (Test-Path $mcpExe) {
+        Write-Output "PUBLISH_MCP_OK -> $mcpExe"
+    } else {
+        Write-Output "PUBLISH_WARN: could not build zan-mcp.exe; AI clients must run tools\mcp_server\mcp_server.zan themselves"
+    }
+} else {
+    Write-Output "PUBLISH_WARN: tools\mcp_server\mcp_server.zan missing; no MCP server published"
+}
+
+if (Test-Path (Join-Path $aiPack 'AGENTS.md')) {
+    Copy-Item (Join-Path $aiPack 'AGENTS.md') (Join-Path $dist 'AGENTS.md') -Force
+    $distSkills = Join-Path $dist '.agents\skills'
+    New-Item -ItemType Directory -Force -Path $distSkills | Out-Null
+    Get-ChildItem (Join-Path $aiPack 'skills') -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object { Copy-Item $_.FullName $distSkills -Recurse -Force }
+
+    # The client configs must name a real command, so the SDK's own path is
+    # baked in here; moving the folder means re-running this script (or editing
+    # the one 'command' line).
+    $sdkPath = $dist.Replace('\', '/')
+    New-Item -ItemType Directory -Force -Path (Join-Path $dist '.cursor') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $dist '.vscode') | Out-Null
+    foreach ($cfg in @(@('mcp.json', '.mcp.json'),
+                       @('cursor.mcp.json', '.cursor\mcp.json'),
+                       @('vscode.mcp.json', '.vscode\mcp.json'))) {
+        $srcCfg = Join-Path $aiPack $cfg[0]
+        if (Test-Path $srcCfg) {
+            (Get-Content $srcCfg -Raw).Replace('<ZAN_SDK>', $sdkPath) |
+                Set-Content -Path (Join-Path $dist $cfg[1]) -Encoding UTF8
+        }
+    }
+    $onboarding = Join-Path $root 'docs\AI_ONBOARDING.md'
+    if (Test-Path $onboarding) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $dist 'docs') | Out-Null
+        Copy-Item $onboarding (Join-Path $dist 'docs\AI_ONBOARDING.md') -Force
+    }
+    foreach ($doc in @('TOOLING.md', 'ai-assist.md')) {
+        $p = Join-Path $root "docs\$doc"
+        if (Test-Path $p) { Copy-Item $p (Join-Path $dist "docs\$doc") -Force }
+    }
+    Write-Output "PUBLISH_AIPACK_OK -> AGENTS.md, .agents\skills, .mcp.json, .cursor\, .vscode\, docs\AI_ONBOARDING.md"
+} else {
+    Write-Output "PUBLISH_WARN: tools\ai_pack missing; released SDK has no AGENTS.md/skills for AI clients"
+}
+
 # ---- release readme ----
-Write-Output "[4/4] Writing README.txt ..."
+Write-Output "[5/6] Writing README.txt ..."
 $readme = @"
 Zan IDE - self-contained release
 ================================
@@ -309,6 +381,31 @@ Contents
                  to run it; right-click to open its source in the editor.
                  Drop your own .zan tools here -- no rebuild needed.
 
+AI coding tools (Claude Code / Cursor / Copilot / Windsurf)
+  zan-mcp.exe    MCP server. Started by AI clients as
+                   zan-mcp.exe --stdio .
+                 and it answers the questions a model would otherwise guess at:
+                 zan_start_here (project layout, commands, rules, tools in one
+                 call), zan_api_search (exact stdlib signatures), zan_example
+                 (shipped, build-verified programs), zan_compile /
+                 zan_build_project (structured diagnostics), plus workspace
+                 file access. Add --read-only or --no-exec to restrict it;
+                 without --stdio it serves the same API over HTTP.
+  AGENTS.md      The rules an AI agent must follow in a Zan project. Copy it
+                 into your own project; Claude Code, Cursor, Copilot and Devin
+                 read it automatically.
+  .agents\skills\  zan-development and zan-debugging: the fixed workflows
+                 (look the API up -> edit -> compile -> run; diagnostics ->
+                 leak check -> zan-lsp -> zan-dap).
+  .mcp.json      Ready-made client configs -- copy the matching one into your
+  .cursor\       project and restart the editor: .mcp.json (Claude Code and
+  .vscode\       most clients), .cursor\mcp.json, .vscode\mcp.json. They point
+                 at this folder's zan-mcp.exe, so update the command if you
+                 move the SDK.
+  docs\AI_ONBOARDING.md
+                 The full connection guide (also covers zan-lsp / zan-dap for
+                 editors that speak LSP/DAP directly).
+
 Requirement
   None for normal use: zanc links via the bundled toolchain\ folder, so no
   external LLVM/clang install is needed. (If the linker files under toolchain\
@@ -331,7 +428,7 @@ Write-Output "STAGE_OK -> $dist ($n files)"
 # No self-extract wrapper. ZanIDE.exe (the real IDE) ships loose in $dist and
 # runs right here, so ide.css/stdlib/toolchain resolve from the exe's own
 # directory -- no %LOCALAPPDATA% extraction, no ZAN_APP_DIR indirection.
-Write-Output "[5/5] Finalizing flat layout (real exe, no dlls) ..."
+Write-Output "[6/6] Finalizing flat layout (real exe, no dlls) ..."
 
 # Still ship the single-file packer into the toolchain so the published IDE can
 # wrap USER programs into single-file exes (its Publish flow calls

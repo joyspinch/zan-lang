@@ -23,7 +23,7 @@ param(
 $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $PSScriptRoot
 if (-not $RepomapSrc) { $RepomapSrc = Join-Path $root 'tools\repomap\RepoMap.zan' }
-if (-not $GallerySrc) { $GallerySrc = Join-Path $root 'examples\mcp_server\gallery.json' }
+if (-not $GallerySrc) { $GallerySrc = Join-Path $root 'tools\mcp_server\gallery.json' }
 
 # Everything past a Push-Location must be an absolute path.
 $Zanc   = (Resolve-Path $Zanc).Path

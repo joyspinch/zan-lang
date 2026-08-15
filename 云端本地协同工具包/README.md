@@ -54,3 +54,38 @@ curl -s -X POST "$ZAN_BRIDGE_BASE/api/terminal/exec" \
 - 找东西用 `GET /api/search?q=...&matchLines=1`（支持 `mode=regex`、`ext=`、`glob=`），
   比下载全文再翻便宜得多；
 - 只读需要的行：`GET /api/file?path=...&offset=&limit=`。
+
+## 6. 本机跑长任务（构建 / 发布，几分钟以上）
+
+`/api/terminal/exec` 是同步的，长任务会超时断连；用常驻终端三件套（`create` → `write` → `output`）：
+
+```bash
+# 1) 建终端（返回 id；shell 是 cmd.exe，不是 PowerShell）
+curl -s -X POST "$ZAN_BRIDGE_BASE/api/terminal/create" \
+  -H "Authorization: Bearer $ZAN_BRIDGE_TOKEN" -H "Content-Type: application/json" -A "Mozilla/5.0" -d '{}'
+
+# 2) 送命令：字段名是 input（写成 data 会被静默忽略，只送进一个换行，看着像“命令没执行”）
+curl -s -X POST "$ZAN_BRIDGE_BASE/api/terminal/write" \
+  -H "Authorization: Bearer $ZAN_BRIDGE_TOKEN" -H "Content-Type: application/json" -A "Mozilla/5.0" \
+  -d '{"id":"t_xxx","input":"powershell -ExecutionPolicy Bypass -NoProfile -File scripts\\publish_ide.ps1 -NoBump > _scratch\\publish.log 2>&1 & echo DONE_RC=%ERRORLEVEL%\r\n"}'
+
+# 3) 轮询：offset= 拿增量；也可以直接读重定向出来的日志文件
+curl -s -H "Authorization: Bearer $ZAN_BRIDGE_TOKEN" -A "Mozilla/5.0" "$ZAN_BRIDGE_BASE/api/terminal/output?id=t_xxx&offset=0"
+```
+
+要点：
+
+- 终端是 `cmd.exe`，PowerShell 语法（`Select-Object` 等）必须用 `powershell -NoProfile -Command "..."` 包起来；
+- 把输出重定向到 `_scratch\*.log` 再用 `/api/file` 读，比翻终端缓冲稳，也便于只读尾部；
+- 单条命令用 `... & echo DONE_RC=%ERRORLEVEL%` 收尾，轮询看到 `DONE_RC=` 就知道跑完了（cmd 的 `&` 是顺序执行，不是后台）。
+
+## 7. 发布 IDE 预览版到 dist
+
+```
+powershell -ExecutionPolicy Bypass -NoProfile -File scripts\publish_ide.ps1 [-NoBump] [-SkipBuild]
+```
+
+`publish_ide.ps1` 默认先 `bump_version.ps1` 升补丁号再编译；`VERSION` 已升过但上次发布失败时用
+`-NoBump` 复用当前版本，别把版本号白升一格。成功的收尾行是
+`PUBLISH_OK v<版本> -> ...\dist\win-x64\ZanIDE.exe`，产物为扁平布局（exe + 几个驱动 dll +
+`toolchain\ stdlib\ examples\ templates\ knowledge\ docs\`）。

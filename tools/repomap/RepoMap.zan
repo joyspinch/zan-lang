@@ -16,7 +16,8 @@ namespace RepoMap;
 //   symbols.json     flat symbol index  [{name,kind,file,line,sig}] -- lets the
 //                    AI (or the MCP bridge) jump straight to a definition.
 //   routes.json      HTTP route table extracted from controller attributes
-//                    (only when a src/controller folder exists).
+//                    [{method,path,action,title,auth}] -- only when a
+//                    src/Controller folder exists.
 //
 //   Build:  zanc tools/repomap/RepoMap.zan --auto-stdlib -o repomap.exe
 //   Run  :  repomap.exe [root]          (root defaults to ".")
@@ -192,7 +193,8 @@ class Program {
         File.WriteAllText(Program.OUT_DIR + "/symbols.json", Program.RenderSymbols(files));
 
         // Route table, when this looks like a ZanWeb server project.
-        string controllerDir = root + "/src/controller";
+        string controllerDir = root + "/src/Controller";
+        if (!Directory.Exists(controllerDir)) { controllerDir = root + "/src/controller"; }
         int routeCount = 0;
         if (Directory.Exists(controllerDir)) {
             string routes = Program.RenderRoutes(controllerDir);
@@ -538,70 +540,127 @@ class Program {
         }
     }
 
+    /// <summary>Extracts one controller file's routes. Mirrors what the compiler
+    /// does with System.Web attributes: [Route("api/[controller]/[action]")] on
+    /// the class supplies the path template, [HttpGet]/[HttpPost]/... on the
+    /// action supplies the verb, and [Custom(Authorization =
+    /// CustomAuthorization.X)] supplies the auth gate, method overriding
+    /// class.</summary>
     static void ScanControllerFile(string path, string prefix, List<string> rows) {
         List<string> lines = Program.SplitLines(File.ReadAllText(path));
         string cbase = "";
         string controller = "";
+        string classRoute = "";
+        string classAuth = "";
+        // Attributes seen since the last declaration; they belong to whatever
+        // declaration comes next (the class, or one action).
         string verb = "";
         string routePath = "";
         string title = "";
-        bool auth = false;
-        bool login = false;
-        int rank = 0;
-        bool isRoute = false;
+        string auth = "";
         int i = 0;
         while (i < lines.Count) {
             string t = Str.Trim(lines[i]);
             i = i + 1;
-            if (t.Length == 0) { continue; }
-            if (Str.Word(t, "class") && Str.Contains(t, "Controller")) {
-                controller = Program.IdentAfter(t, "class");
-                cbase = Program.ControllerBase(controller);
+            if (t.Length == 0 || Str.StartsWith(t, "//") || Str.StartsWith(t, "*")) {
                 continue;
             }
             if (Str.StartsWith(t, "[")) {
                 string a = Program.AttrName(t);
-                if (a == "Get") { verb = "GET"; isRoute = true; }
-                else if (a == "Post") { verb = "POST"; isRoute = true; }
-                else if (a == "Put") { verb = "PUT"; isRoute = true; }
-                else if (a == "Delete") { verb = "DELETE"; isRoute = true; }
-                else if (a == "Patch") { verb = "PATCH"; isRoute = true; }
-                else if (a == "Route") { isRoute = true; routePath = Str.FirstQuoted(t); }
-                else if (a == "Title") { title = Str.FirstQuoted(t); }
-                else if (a == "Auth") { auth = true; }
-                else if (a == "Login") { login = true; }
-                else if (a == "Rank") { rank = Str.ParenInt(t, 0); }
+                if (a == "HttpGet" || a == "Get") { verb = "GET"; }
+                else if (a == "HttpPost" || a == "Post") { verb = "POST"; }
+                else if (a == "HttpPut" || a == "Put") { verb = "PUT"; }
+                else if (a == "HttpDelete" || a == "Delete") { verb = "DELETE"; }
+                else if (a == "HttpPatch" || a == "Patch") { verb = "PATCH"; }
+                else if (a == "Route") { routePath = Str.FirstQuoted(t); }
+                else if (a == "Description" || a == "Title") { title = Str.FirstQuoted(t); }
+                else if (a == "Custom") { auth = Program.AuthOf(t); }
+                else if (a == "Login") { auth = "Login"; }
+                else if (a == "Auth") { auth = "Auth"; }
                 continue;
             }
-            if (Str.Contains(t, "static") && Str.Contains(t, "(HttpContext")) {
-                if (isRoute && controller.Length > 0) {
-                    string m = Program.NameBefore(t, Str.Find(t, "(", 0));
-                    if (verb.Length == 0) { verb = "GET"; }
-                    string pth = routePath;
-                    if (pth.Length == 0) { pth = Program.ConventionPath(prefix, cbase, m); }
+            if (Str.Word(t, "class")) {
+                controller = Program.IdentAfter(t, "class");
+                cbase = Program.ControllerBase(controller);
+                classRoute = routePath;
+                classAuth = auth;
+                verb = ""; routePath = ""; title = ""; auth = "";
+                continue;
+            }
+            int lp = Str.Find(t, "(", 0);
+            if (lp > 0 && controller.Length > 0 && (verb.Length > 0 || routePath.Length > 0)) {
+                string m = Program.NameBefore(t, lp);
+                if (m.Length > 0) {
+                    string v = verb;
+                    if (v.Length == 0) { v = "GET"; }
+                    string tpl = routePath;
+                    if (tpl.Length == 0) { tpl = classRoute; }
+                    string pth = "";
+                    if (tpl.Length == 0) {
+                        pth = Program.ConventionPath(prefix, cbase, m);
+                    } else {
+                        pth = Program.ExpandRoute(tpl, cbase, m);
+                    }
+                    string ga = auth;
+                    if (ga.Length == 0) { ga = classAuth; }
+                    if (ga.Length == 0) { ga = "Unknown"; }
                     StringBuilder r = new StringBuilder();
                     r.Append("{\"method\":\"");
-                    r.Append(verb);
+                    r.Append(v);
                     r.Append("\",\"path\":\"");
                     r.Append(Str.JsonEsc(pth));
                     r.Append("\",\"action\":\"");
                     r.Append(Str.JsonEsc(controller + "." + m));
                     r.Append("\",\"title\":\"");
                     r.Append(Str.JsonEsc(title));
-                    r.Append("\",\"auth\":");
-                    r.Append(auth ? "true" : "false");
-                    r.Append(",\"login\":");
-                    r.Append((login || auth) ? "true" : "false");
-                    r.Append(",\"rank\":");
-                    r.Append(Convert.ToString(rank));
-                    r.Append("}");
+                    r.Append("\",\"auth\":\"");
+                    r.Append(Str.JsonEsc(ga));
+                    r.Append("\"}");
                     rows.Add(r.ToString());
                 }
-                verb = ""; routePath = ""; title = ""; auth = false; login = false; rank = 0; isRoute = false;
+            }
+            verb = ""; routePath = ""; title = ""; auth = "";
+        }
+    }
+
+    /// <summary>"...CustomAuthorization.Login..." -> "Login".</summary>
+    static string AuthOf(string line) {
+        string key = "CustomAuthorization.";
+        int p = Str.Find(line, key, 0);
+        if (p < 0) { return ""; }
+        int i = p + key.Length;
+        StringBuilder sb = new StringBuilder();
+        while (i < line.Length) {
+            string c = line.Substring(i, 1);
+            if (!Str.IsAlnum(c)) { break; }
+            sb.Append(c);
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Fills the [controller] / [action] placeholders of a route
+    /// template and guarantees a single leading slash.</summary>
+    static string ExpandRoute(string tpl, string cbase, string method) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < tpl.Length) {
+            if (i + 12 <= tpl.Length && tpl.Substring(i, 12) == "[controller]") {
+                sb.Append(cbase);
+                i = i + 12;
                 continue;
             }
-            verb = ""; routePath = ""; title = ""; auth = false; login = false; rank = 0; isRoute = false;
+            if (i + 8 <= tpl.Length && tpl.Substring(i, 8) == "[action]") {
+                sb.Append(Str.Lower(method));
+                i = i + 8;
+                continue;
+            }
+            sb.Append(tpl.Substring(i, 1));
+            i = i + 1;
         }
+        string p = sb.ToString();
+        if (Str.StartsWith(p, "/")) { return p; }
+        return "/" + p;
     }
 
     static string AttrName(string line) {
