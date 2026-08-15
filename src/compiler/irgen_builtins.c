@@ -960,6 +960,7 @@ static LLVMValueRef emit_eh_thread_id(zan_irgen_t *g) {
 }
 
 static LLVMValueRef get_eh_state_fn(zan_irgen_t *g);
+static LLVMValueRef get_eh_state_fast_fn(zan_irgen_t *g);
 
 /* Position the builder in the current function's entry block, where the EH
  * state pointer and its field addresses are materialized (see irgen.h). */
@@ -982,7 +983,7 @@ static LLVMValueRef emit_eh_state(zan_irgen_t *g) {
     if (fn && fn == g->eh_state_owner && g->eh_state_cached)
         return g->eh_state_cached;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMValueRef state_fn = get_eh_state_fn(g);
+    LLVMValueRef state_fn = get_eh_state_fast_fn(g);
     eh_enter_entry_block(g);
     LLVMValueRef p = zan_call2(g->builder, LLVMFunctionType(i8ptr, NULL, 0, 0),
         state_fn, NULL, 0, "eh.st");
@@ -993,6 +994,49 @@ static LLVMValueRef emit_eh_state(zan_irgen_t *g) {
     g->eh_state_cached = typed;
     for (int i = 0; i < EH_F_COUNT; i++) g->eh_state_fields[i] = NULL;
     return typed;
+}
+
+static void add_enum_attr(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef call,
+                          const char *name);
+
+/* i8* __zan_eh_state_fast(): the thread-local cache read, with the table
+ * lookup left out of line. Every push and pop of an owned temporary asks for
+ * the state block, and an out-of-line call for what is a GOT-relative load
+ * plus a null test showed up as ~6% of a keep-alive request's user time.
+ * alwaysinline rather than a hint: the wrapper only pays off when the fast
+ * path lands in the caller, and the optimizer's own size-based hint stops at
+ * four blocks. Falls back to the table accessor where there is no cache
+ * (see get_eh_self_slot). */
+static LLVMValueRef get_eh_state_fast_fn(zan_irgen_t *g) {
+    LLVMValueRef slow = get_eh_state_fn(g);
+    LLVMValueRef self_slot = get_eh_self_slot(g);
+    if (!self_slot) return slow;
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_state_fast");
+    if (fn) return fn;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef fnty = LLVMFunctionType(i8ptr, NULL, 0, 0);
+    fn = LLVMAddFunction(g->mod, "__zan_eh_state_fast", fnty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    add_enum_attr(g, fn, NULL, "alwaysinline");
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef slowbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "slow");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef cached = LLVMBuildLoad2(g->builder, i8ptr, self_slot, "st.c");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, cached, LLVMConstNull(i8ptr), "st.miss"),
+        slowbb, done);
+    LLVMPositionBuilderAtEnd(g->builder, slowbb);
+    LLVMValueRef fresh = zan_call2(g->builder, fnty, slow, NULL, 0, "st.slow");
+    LLVMBuildBr(g->builder, done);
+    LLVMPositionBuilderAtEnd(g->builder, done);
+    LLVMValueRef phi = LLVMBuildPhi(g->builder, i8ptr, "st.r");
+    LLVMAddIncoming(phi, (LLVMValueRef[]){ cached, fresh },
+        (LLVMBasicBlockRef[]){ entry, slowbb }, 2);
+    LLVMBuildRet(g->builder, phi);
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    return fn;
 }
 
 static LLVMValueRef emit_eh_field_ptr(zan_irgen_t *g, unsigned field,
@@ -1514,11 +1558,74 @@ static LLVMValueRef get_eh_tmp_top_global(zan_irgen_t *g) {
     return emit_eh_field_ptr(g, EH_F_TMPS_TOP, "eh.tmptopp");
 }
 
+/* i8* __zan_eh_tmp_slot_fast(i8* state, i32 idx): entry `idx` when it lives in
+ * the unwind stack's first chunk, which is every entry a program under 4096
+ * live owned temporaries per thread ever asks for. Only chunk creation and the
+ * deeper chunks stay out of line; the accessor call itself was ~6% of a
+ * keep-alive request's user time, paid twice per stacked temporary. */
+static LLVMValueRef get_eh_tmp_slot_fast_fn(zan_irgen_t *g, LLVMValueRef slow) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_tmp_slot_fast");
+    if (fn) return fn;
+    LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8t, 0);
+    LLVMTypeRef state_ty = get_eh_state_ty(g);
+    LLVMTypeRef tab_ty = LLVMArrayType(i8ptr, ZAN_EH_CHUNKS);
+    LLVMTypeRef fnty = LLVMFunctionType(i8ptr,
+        (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0);
+    fn = LLVMAddFunction(g->mod, "__zan_eh_tmp_slot_fast", fnty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    add_enum_attr(g, fn, NULL, "alwaysinline");
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef look = LLVMAppendBasicBlockInContext(g->ctx, fn, "look");
+    LLVMBasicBlockRef have = LLVMAppendBasicBlockInContext(g->ctx, fn, "have");
+    LLVMBasicBlockRef slowbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "slow");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
+    LLVMValueRef st = LLVMGetParam(fn, 0);
+    LLVMValueRef idx = LLVMGetParam(fn, 1);
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntUGE, idx,
+            LLVMConstInt(i32t, 1u << ZAN_EH_TMP_SHIFT, 0), "tmp.deep"),
+        slowbb, look);
+    LLVMPositionBuilderAtEnd(g->builder, look);
+    LLVMValueRef tab = LLVMBuildStructGEP2(g->builder, state_ty,
+        LLVMBuildBitCast(g->builder, st, LLVMPointerType(state_ty, 0), "st.t"),
+        EH_F_TMPS, "tmp.tab");
+    LLVMValueRef c0p = LLVMBuildGEP2(g->builder, tab_ty, tab,
+        (LLVMValueRef[]){ LLVMConstInt(i32t, 0, 0), LLVMConstInt(i32t, 0, 0) }, 2,
+        "tmp.c0p");
+    LLVMValueRef c0 = LLVMBuildLoad2(g->builder, i8ptr, c0p, "tmp.c0");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, c0, LLVMConstNull(i8ptr), "tmp.fresh"),
+        slowbb, have);
+    LLVMPositionBuilderAtEnd(g->builder, have);
+    LLVMValueRef off = LLVMBuildMul(g->builder,
+        LLVMBuildZExt(g->builder, idx, i64t, "tmp.i64"),
+        LLVMConstInt(i64t, 8, 0), "tmp.off");
+    LLVMValueRef ep = LLVMBuildGEP2(g->builder, i8t, c0, &off, 1, "tmp.ep");
+    LLVMBuildBr(g->builder, done);
+    LLVMPositionBuilderAtEnd(g->builder, slowbb);
+    LLVMValueRef sp = zan_call2(g->builder, fnty, slow,
+        (LLVMValueRef[]){ st, idx }, 2, "tmp.slow");
+    LLVMBuildBr(g->builder, done);
+    LLVMPositionBuilderAtEnd(g->builder, done);
+    LLVMValueRef phi = LLVMBuildPhi(g->builder, i8ptr, "tmp.r");
+    LLVMAddIncoming(phi, (LLVMValueRef[]){ ep, sp },
+        (LLVMBasicBlockRef[]){ have, slowbb }, 2);
+    LLVMBuildRet(g->builder, phi);
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    return fn;
+}
+
 /* i8** to unwind-stack entry `idx`. */
 static LLVMValueRef emit_eh_tmp_slot_ptr(zan_irgen_t *g, LLVMValueRef idx) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMValueRef fn = get_eh_chunk_fn(g, "__zan_eh_tmp_slot", EH_F_TMPS,
-        ZAN_EH_TMP_SHIFT, 8, "zan: exception unwind stack exhausted\n");
+    LLVMValueRef fn = get_eh_tmp_slot_fast_fn(g,
+        get_eh_chunk_fn(g, "__zan_eh_tmp_slot", EH_F_TMPS,
+            ZAN_EH_TMP_SHIFT, 8, "zan: exception unwind stack exhausted\n"));
     return LLVMBuildBitCast(g->builder,
         emit_eh_chunk_call(g, fn, idx, "eh.tslot"),
         LLVMPointerType(i8ptr, 0), "eh.tslotp");
