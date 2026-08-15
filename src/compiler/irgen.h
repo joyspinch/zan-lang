@@ -411,6 +411,35 @@ struct zan_irgen {
     LLVMValueRef fn_refl_get_str;   /* i8* (i8* ti, i8* obj, i8* name) */
     LLVMValueRef fn_refl_fname;     /* i8* (i8* ti, i64 idx, i64 which) */
     LLVMValueRef fn_refl_obj_type;  /* i8* (i8* obj, i8* fallback) */
+    /* second layer: the method / constructor tables. A record is
+     * { i8* name, i8* retType, i64 retKind, i64 paramCount, i8* paramTypes,
+     *   i8* thunk, i64 flags }; the thunk unpacks an i64 argument array and
+     * calls the real function, so a call by name needs no signature. */
+    LLVMTypeRef  refl_method_type;
+    /* Method tables are shaped when the record is emitted but filled at the
+     * end of the module: a typeof(T) lowered from a top-level function runs
+     * before the class's methods are even declared. */
+    struct {
+        LLVMValueRef  gv;        /* [n x method record] global */
+        LLVMTypeRef   arr_ty;
+        zan_symbol_t *sym;       /* the declaring type */
+        int           n;
+        bool          ctors;     /* constructor table, not method table */
+    } *refl_mtabs;
+    int refl_mtab_count;
+    int refl_mtab_cap;
+    int refl_thunk_count;         /* thunks emitted, for unique names */
+    LLVMValueRef fn_refl_mfind;     /* i64 (i8* ti, i8* name, i64 flags) */
+    LLVMValueRef fn_refl_mstr;      /* i8* (i8* ti, i64 tbl, i64 i, i64 which, i64 k) */
+    LLVMValueRef fn_refl_mi64;      /* i64 (i8* ti, i64 tbl, i64 i, i64 which) */
+    LLVMValueRef fn_refl_invoke;    /* i64 (i8* ti, i64 tbl, i64 i, i8* obj,
+                                     *      i64* args, i64* ok) */
+    LLVMValueRef fn_refl_set;       /* i64 (i8* ti, i8* obj, i8* name, i64 v,
+                                     *      i64 vkind) */
+    LLVMValueRef fn_refl_pget;      /* i64 (i8* ti, i8* obj, i8* name,
+                                     *      i64* kindout) */
+    LLVMValueRef fn_refl_cfind;     /* i64 (i8* ti, i64 nargs) */
+    LLVMValueRef fn_refl_tainfo;    /* i64 (i8* ti, i64 idx, i64 which) */
 
     /* --publish string obfuscation. Literal text is stored XOR-scrambled in
      * the image (emit_string_literal_rc); a .ctors constructor un-scrambles it

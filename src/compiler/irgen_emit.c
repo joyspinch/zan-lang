@@ -2168,6 +2168,10 @@ done:
     emit_site_tyname_table(g);
     emit_site_meta_table(g);
     emit_vtables(g);
+    /* Reflected method/constructor tables: their records point at the real
+     * functions and at thunks over them, so they can only be filled in once
+     * every function, specialization and vtable above exists. */
+    refl_finalize_mtabs(g);
     /* A Windows DLL must carry a real entry point: without one the PE
      * AddressOfEntryPoint falls back to the start of .text, so the Windows
      * loader calls the first exported function (often zan_rt_println) as

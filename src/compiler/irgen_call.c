@@ -368,23 +368,22 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
          * TypeInfo, and `obj.GetType()` / `obj.GetFieldInt("x")` on any class
          * or struct value. A user member of the same name wins, so these are
          * only claimed when the receiver's type declares no such member. */
-        if (expr->call.callee->kind == AST_MEMBER_ACCESS &&
-            expr->call.args.count <= 1) {
+        if (expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *recv = expr->call.callee->member.object;
             zan_istr_t mname = expr->call.callee->member.name;
-            zan_ast_node_t *arg0 = expr->call.args.count == 1
-                                 ? expr->call.args.items[0] : NULL;
+            zan_ast_node_t **cargs = expr->call.args.items;
+            int cargc = expr->call.args.count;
             zan_type_t *rt = infer_expr_type(g, recv, locals);
             LLVMValueRef rv = NULL;
             if (zan_refl_is_typeinfo(rt)) {
                 if (refl_emit_typeinfo_member(g, emit_expr(g, recv, locals),
-                                              mname, arg0, locals, &rv))
+                                              mname, cargs, cargc, locals, &rv))
                     return rv;
             } else if (zan_refl_is_reflectable(rt) &&
                        (!rt->sym || !get_method_sym(rt->sym, mname)) &&
                        zan_refl_instance_method(mname, NULL)) {
                 if (refl_emit_instance_call(g, rt, emit_expr(g, recv, locals),
-                                            mname, arg0, locals, &rv))
+                                            mname, cargs, cargc, locals, &rv))
                     return rv;
             }
         }

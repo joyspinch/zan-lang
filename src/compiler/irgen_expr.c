@@ -3361,7 +3361,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                 LLVMValueRef rv = NULL;
                 if (refl_emit_typeinfo_member(g,
                         emit_expr(g, expr->member.object, locals),
-                        expr->member.name, NULL, locals, &rv))
+                        expr->member.name, NULL, 0, locals, &rv))
                     return rv;
             }
         }
