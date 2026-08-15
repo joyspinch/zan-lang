@@ -129,10 +129,12 @@ try {
     # All IDE shell sources: ZanIDE.zan + its partial-class parts,
     # SceneDesigner, AssetManager and the session classes.
     $files += (Get-ChildItem src\ide_zan\*.zan -Recurse).FullName
-    # Every designed document is an input too: a `X.zform` carries the `: Control`
-    # base, the constructor and Kind() of its `partial class X` code-behind, so
-    # leaving them out makes the designed components fail to type-check.
-    $files += (Get-ChildItem src\ide_zan -Recurse -Include *.zform).FullName
+    # NOTE: this legacy script predates the project layout (src\ide_zan\zan.proj
+    # + IdeForm.zform entry) and cannot build the IDE any more: without the
+    # .zform designs the designed components lose their `: Control` half, and
+    # with them there is still no entry point (zanc emits main only for the
+    # entry design passed first). Use scripts\build_ide.ps1 instead - it takes
+    # ZAN_IDE_ZANC_ARGS="--arc-guard --check-leaks" for leak hunts.
 
     # Link the IDE straight through zanc: it compiles all sources and drives the
     # bundled ld itself, auto-linking the socket-async reactor (rt_io) and the
