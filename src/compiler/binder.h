@@ -125,6 +125,13 @@ struct zan_binder {
     zan_type_t *type_object;
     zan_type_t *type_nint;
     zan_type_t *type_error;
+    /* `TypeInfo`, the static type of `typeof(T)` and `obj.GetType()`. A value
+     * of it is a pointer to a compiler-emitted type record whose payload
+     * starts at the type's display name, so a TypeInfo IS a valid (immortal)
+     * Zan string carrying that name: printing or concatenating one keeps
+     * working, and the record's reflection slots sit at negative offsets in
+     * front of it (see irgen_reflect.c). */
+    zan_type_t *type_typeinfo;
 
     /* Set once every declaration is bound: a type reference's meaning is only
      * stable after that, so zan_binder_resolve_type memoizes from here on. */

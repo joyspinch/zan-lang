@@ -2166,6 +2166,7 @@ done:
     emit_all_class_releases(g);
     emit_site_dtor_table(g);
     emit_site_tyname_table(g);
+    emit_site_meta_table(g);
     emit_vtables(g);
     /* A Windows DLL must carry a real entry point: without one the PE
      * AddressOfEntryPoint falls back to the start of .text, so the Windows

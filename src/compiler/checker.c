@@ -8,6 +8,7 @@
  */
 
 #include "checker.h"
+#include "reflect_api.h"
 #include "definite.h"
 #include "diag.h"
 #include "arena.h"
@@ -2285,6 +2286,13 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                 return m->type ? m->type : c->binder->type_error;
             }
         }
+    }
+    /* Reflection members (`ti.Name`, `obj.GetType`, ...): checked after the
+     * declared members above, so a user member of the same name wins. */
+    {
+        zan_type_t *rt = zan_refl_member_type(c->binder, obj_type,
+                                              expr->member.name);
+        if (rt) return rt;
     }
     /* Builtin scalar types (string, int, ...) declare no fields; the only
      * member they carry is the string.Length property (lowered by irgen).

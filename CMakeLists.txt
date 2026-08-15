@@ -694,16 +694,16 @@ add_test(NAME diag_collection_unknown_member
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_collection_unknown_member PROPERTIES TIMEOUT 60)
 
-# An unresolved method call whose result is then read (`t.GetType().Name`) never
+# An unresolved method call whose result is then read (`t.Describe().Name`) never
 # emitted the inner call, so the chain answered the member fallback's 0 instead
-# of reporting the missing method -- the unchained `var g = t.GetType();` was
+# of reporting the missing method -- the unchained `var g = t.Describe();` was
 # diagnosed all along.
 add_test(NAME diag_unresolved_call_member_chain
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unresolved_call_member_chain.zan
     -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unresolved_call_member_chain${_exe_ext}
-    "-DEXPECT_REGEX=.Thing. has no member .GetType."
+    "-DEXPECT_REGEX=.Thing. has no member .Describe."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unresolved_call_member_chain PROPERTIES TIMEOUT 60)
 

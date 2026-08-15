@@ -331,6 +331,10 @@ struct zan_irgen {
     LLVMValueRef g_site_tynames;  /* [N x i8*] global: ancestor-name list ptr
                                    * per site, for runtime `is`/`as` checks */
     LLVMTypeRef  site_tynames_type; /* [N x i8*] array type */
+    LLVMValueRef g_site_meta;     /* [N x i8*] global: reflection type record
+                                   * per alloc site, so obj.GetType() answers
+                                   * the object's CONCRETE type (irgen_reflect.c) */
+    LLVMTypeRef  site_meta_type;  /* [N x i8*] array type */
     zan_symbol_t **site_syms;    /* concrete class symbol per alloc site */
     zan_type_t   **site_inst;    /* per site: the instantiated class type, so a
                                   * generic class's destructor releases the
@@ -385,6 +389,28 @@ struct zan_irgen {
         LLVMValueRef value;
     } string_literals[2048];
     int string_literal_count;
+
+    /* reflection (irgen_reflect.c): per-type static records, emitted on first
+     * use by typeof(T) / obj.GetType(). `metas` caches one record per
+     * (symbol, display name) so repeated typeof's share it. */
+    struct {
+        zan_symbol_t *sym;      /* declaring symbol; NULL for builtin types */
+        const char   *name;     /* display name the record carries */
+        LLVMValueRef  rec;      /* i8* to the record's name payload */
+    } *refl_metas;
+    int refl_meta_count;
+    int refl_meta_cap;
+    int refl_str_count;           /* names emitted, for unique global names */
+    bool refl_used;               /* a typeof/GetType was lowered: emit the
+                                   * per-site record table */
+    LLVMTypeRef  refl_field_type;   /* { i8* name, i8* typeName, i64 kind, i64 off } */
+    LLVMValueRef refl_empty_str;    /* "" as an immortal Zan string */
+    LLVMValueRef fn_refl_find;      /* i64 (i8* ti, i8* name) */
+    LLVMValueRef fn_refl_get_i64;   /* i64 (i8* ti, i8* obj, i8* name) */
+    LLVMValueRef fn_refl_get_f64;   /* double (i8* ti, i8* obj, i8* name) */
+    LLVMValueRef fn_refl_get_str;   /* i8* (i8* ti, i8* obj, i8* name) */
+    LLVMValueRef fn_refl_fname;     /* i8* (i8* ti, i64 idx, i64 which) */
+    LLVMValueRef fn_refl_obj_type;  /* i8* (i8* obj, i8* fallback) */
 
     /* --publish string obfuscation. Literal text is stored XOR-scrambled in
      * the image (emit_string_literal_rc); a .ctors constructor un-scrambles it

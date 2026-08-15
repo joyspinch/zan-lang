@@ -3353,6 +3353,18 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             if (memcmp(expr->member.name.str, "BackgroundColor", 15) == 0)
                 return emit_console_color_get(g, 1);
         }
+        /* `ti.Name` / `ti.Kind` / `ti.FieldCount` on a TypeInfo, read straight
+         * off the reflection record (irgen_reflect.c). */
+        {
+            zan_type_t *tit = infer_expr_type(g, expr->member.object, locals);
+            if (zan_refl_is_typeinfo(tit)) {
+                LLVMValueRef rv = NULL;
+                if (refl_emit_typeinfo_member(g,
+                        emit_expr(g, expr->member.object, locals),
+                        expr->member.name, NULL, locals, &rv))
+                    return rv;
+            }
+        }
         /* `v.HasValue` / `v.Value` on a nullable value type. `Value` on a null
          * one is a program error, reported like the other runtime checks
          * instead of handing back the zeroed payload. */
@@ -7100,11 +7112,14 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
     }
 
     case AST_TYPEOF_EXPR: {
-        /* typeof(T) — the type's display name as a string */
+        /* typeof(T) — the type's reflection record (irgen_reflect.c). The
+         * record's payload IS the display name as a managed string, so the
+         * older `Console.WriteLine(typeof(int))` spelling still prints
+         * "int". */
         char buf[256];
         int len = render_type_ref_name(expr->cast.type, buf, (int)sizeof(buf));
-        char *copy = zan_arena_strdup(g->arena, buf, (size_t)len);
-        return emit_string_literal_rc(g, (zan_istr_t){ copy, (uint32_t)len });
+        zan_type_t *t = resolve_type_ctx(g, expr->cast.type);
+        return refl_meta_for(g, t, buf, len);
     }
 
     case AST_THIS_EXPR: {

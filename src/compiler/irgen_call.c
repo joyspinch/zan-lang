@@ -364,6 +364,31 @@ static void release_string_like_arg(zan_irgen_t *g, zan_ast_node_t *e,
 
 static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
+        /* Reflection (irgen_reflect.c): `ti.GetFieldName(i)` and friends on a
+         * TypeInfo, and `obj.GetType()` / `obj.GetFieldInt("x")` on any class
+         * or struct value. A user member of the same name wins, so these are
+         * only claimed when the receiver's type declares no such member. */
+        if (expr->call.callee->kind == AST_MEMBER_ACCESS &&
+            expr->call.args.count <= 1) {
+            zan_ast_node_t *recv = expr->call.callee->member.object;
+            zan_istr_t mname = expr->call.callee->member.name;
+            zan_ast_node_t *arg0 = expr->call.args.count == 1
+                                 ? expr->call.args.items[0] : NULL;
+            zan_type_t *rt = infer_expr_type(g, recv, locals);
+            LLVMValueRef rv = NULL;
+            if (zan_refl_is_typeinfo(rt)) {
+                if (refl_emit_typeinfo_member(g, emit_expr(g, recv, locals),
+                                              mname, arg0, locals, &rv))
+                    return rv;
+            } else if (zan_refl_is_reflectable(rt) &&
+                       (!rt->sym || !get_method_sym(rt->sym, mname)) &&
+                       zan_refl_instance_method(mname, NULL)) {
+                if (refl_emit_instance_call(g, rt, emit_expr(g, recv, locals),
+                                            mname, arg0, locals, &rv))
+                    return rv;
+            }
+        }
+
         /* `v.GetValueOrDefault()` / `v.ToString()` on a nullable value type:
          * the payload (already zero when null) and the C# text form. */
         if (expr->call.callee->kind == AST_MEMBER_ACCESS &&

@@ -11,6 +11,7 @@
 
 #include "irgen.h"
 #include "builtin_api.h"
+#include "reflect_api.h"
 #include "arena.h"
 #include "diag.h"
 #include <stdarg.h>
@@ -968,6 +969,11 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->g_site_tynames = LLVMAddGlobal(g->mod, g->site_tynames_type, "__zan_site_tynames");
         LLVMSetInitializer(g->g_site_tynames, LLVMConstNull(g->site_tynames_type));
         LLVMSetLinkage(g->g_site_tynames, LLVMInternalLinkage);
+        /* per-site reflection type record, for obj.GetType() */
+        g->site_meta_type = LLVMArrayType(i8p, ZAN_MAX_LEAK_SITES);
+        g->g_site_meta = LLVMAddGlobal(g->mod, g->site_meta_type, "__zan_site_meta");
+        LLVMSetInitializer(g->g_site_meta, LLVMConstNull(g->site_meta_type));
+        LLVMSetLinkage(g->g_site_meta, LLVMInternalLinkage);
         g->site_syms = (zan_symbol_t **)calloc(ZAN_MAX_LEAK_SITES, sizeof(zan_symbol_t *));
         g->site_coll = (int *)calloc(ZAN_MAX_LEAK_SITES, sizeof(int));
         g->site_coll_elem = (zan_type_t **)calloc(ZAN_MAX_LEAK_SITES, sizeof(zan_type_t *));
@@ -3199,6 +3205,7 @@ static LLVMValueRef emit_itoa_into(zan_irgen_t *g, LLVMValueRef buf,
 #include "irgen_expr_core.c"
 #include "irgen_arc.c"
 #include "irgen_generics.c"
+#include "irgen_reflect.c"
 #include "irgen_builtins.c"
 #include "irgen_expr.c"
 #include "irgen_abi.c"

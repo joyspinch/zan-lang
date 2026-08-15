@@ -122,6 +122,8 @@ void zan_binder_init(zan_binder_t *b, zan_arena_t *arena, zan_diag_t *diag) {
     b->type_object = make_type(arena, TYPE_OBJECT, "object", 6);
     b->type_nint   = make_type(arena, TYPE_NINT,   "nint",   4);
     b->type_error  = make_type(arena, TYPE_ERROR,  "<error>", 7);
+    /* reflection: opaque handle on a type record (irgen_reflect.c) */
+    b->type_typeinfo = make_type(arena, TYPE_STRUCT, "TypeInfo", 8);
 }
 
 /* A member name may denote either storage (field/property) or code (method),
@@ -434,6 +436,8 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         base = make_type(b->arena, TYPE_CLASS, "StringBuilder", 13);
     else if (istr_eq(name, "Span", 4))
         base = make_type(b->arena, TYPE_STRUCT, "Span", 4);
+    /* TypeInfo: what typeof(T)/obj.GetType() yields (see binder.h) */
+    else if (istr_eq(name, "TypeInfo", 8)) base = b->type_typeinfo;
     /* Task / Task<T>: a coroutine handle (opaque i64 at codegen). The static
      * `Task.Spawn/Run/IsDone/...` call surface stays a compiler-intercepted
      * builtin (builtin_api.c); this makes the *type* usable as a value:

@@ -1640,6 +1640,16 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         return zan_binder_make_list_type(g->binder, sel);
     }
     case AST_MEMBER_ACCESS: {
+        /* reflection members (`ti.Name`, `ti.FieldCount`): the receiver's own
+         * members win, so this only answers for a TypeInfo receiver. */
+        {
+            zan_type_t *rt = infer_expr_type(g, e->member.object, locals);
+            if (zan_refl_is_typeinfo(rt)) {
+                zan_type_t *mt = zan_refl_member_type(g->binder, rt,
+                                                      e->member.name);
+                if (mt) return mt;
+            }
+        }
         /* static field: ClassName.StaticField (class name, not a local). */
         if (e->member.object->kind == AST_IDENTIFIER &&
             !local_find(locals, e->member.object->ident.name)) {
@@ -1799,6 +1809,18 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
          * chained member access (e.g. Next().field) can find the struct. */
         zan_ast_node_t *callee = e->call.callee;
         if (!callee) return NULL;
+        /* reflection calls (`obj.GetType()`, `ti.GetFieldName(i)`, ...): a
+         * user-declared member of the same name is resolved below instead. */
+        if (callee->kind == AST_MEMBER_ACCESS) {
+            zan_type_t *rt = infer_expr_type(g, callee->member.object, locals);
+            if (zan_refl_is_typeinfo(rt) ||
+                (zan_refl_is_reflectable(rt) &&
+                 (!rt->sym || !get_method_sym(rt->sym, callee->member.name)))) {
+                zan_type_t *mt = zan_refl_member_type(g->binder, rt,
+                                                      callee->member.name);
+                if (mt) return mt;
+            }
+        }
         /* op_call: `<class instance>(args)` has the static type of the
          * class's op_call method return. */
         {
@@ -2026,7 +2048,10 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         default:
             return NULL;
         }
+    /* typeof(T) is a TypeInfo (its payload is the type name, so the string
+     * operations on it keep working -- see irgen_reflect.c). */
     case AST_TYPEOF_EXPR:
+        return g->binder->type_typeinfo;
     case AST_STRING_INTERP:
         return g->binder->type_string;
     case AST_CAST_EXPR:
