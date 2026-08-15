@@ -1,0 +1,133 @@
+// CefRuntime 的离线部分：官方索引结构的版本挑选（最新 stable / 109 分支）、
+// 归档 URL 转义、目录名与版本比较、缓存路径推导。
+using System;
+using System.IO;
+using Gui.Component.CefBrowser;
+
+class Program {
+    static int bad;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); bad = bad + 1; }
+    }
+
+    // 与 https://cef-builds.spotifycdn.com/index.json 同构的最小索引：
+    // versions 按新到旧排列，files 里混有 minimal 之外的类型。
+    static string Index() {
+        return "{\"linux64\":{\"versions\":["
+            + Version("152.0.1+gaaa+chromium-152.0.1.1", "beta", "linux64")
+            + "," + Version("151.3.18+gbbb+chromium-151.0.7922.138", "stable", "linux64")
+            + "," + Version("109.1.18+gccc+chromium-109.0.5414.120", "stable", "linux64")
+            + "]},\"windows64\":{\"versions\":["
+            + Version("151.3.18+gbbb+chromium-151.0.7922.138", "stable", "windows64")
+            + "," + Version("110.0.25+gddd+chromium-110.0.5481.97", "stable", "windows64")
+            + "," + Version("109.1.18+gccc+chromium-109.0.5414.120", "stable", "windows64")
+            + "]}}";
+    }
+
+    static string Version(string ver, string channel, string plat) {
+        string stem = "cef_binary_" + ver + "_" + plat;
+        return "{\"cef_version\":\"" + ver + "\",\"channel\":\"" + channel
+            + "\",\"chromium_version\":\"1.2.3.4\",\"files\":["
+            + "{\"last_modified\":\"x\",\"name\":\"" + stem
+            + "_release_symbols.tar.bz2\",\"sha1\":\"" + Sha("s")
+            + "\",\"size\":10,\"type\":\"release_symbols\"},"
+            + "{\"last_modified\":\"x\",\"name\":\"" + stem
+            + "_minimal.tar.bz2\",\"sha1\":\"" + Sha("m")
+            + "\",\"size\":170713250,\"type\":\"minimal\"},"
+            + "{\"last_modified\":\"x\",\"name\":\"" + stem
+            + ".tar.bz2\",\"sha1\":\"" + Sha("d")
+            + "\",\"size\":20,\"type\":\"standard\"}],"
+            + "\"sandbox_compat\":\"deadbeef\"}";
+    }
+
+    static string Sha(string tag) {
+        string s = "";
+        for (int i = 0; i < 39; i = i + 1) { s = s + "a"; }
+        return s + tag;
+    }
+
+    static void Main() {
+        string index = Program.Index();
+
+        CefArchive latest = CefRuntime.SelectArchive(index, "windows64", "");
+        Program.Check(latest != null, "win64-latest-found");
+        if (latest != null) {
+            Program.Check(latest.cefVersion
+                == "151.3.18+gbbb+chromium-151.0.7922.138", "win64-latest-version");
+            Program.Check(latest.platform == "windows64", "win64-latest-platform");
+            Program.Check(latest.fileName.EndsWith("_windows64_minimal.tar.bz2"),
+                "win64-latest-minimal");
+            Program.Check(latest.size == 170713250, "win64-latest-size");
+            Program.Check(latest.sha1.Length == 40, "win64-latest-sha1");
+            Program.Check(latest.Path()
+                == "/cef_binary_151.3.18%2Bgbbb%2Bchromium-151.0.7922.138"
+                    + "_windows64_minimal.tar.bz2", "win64-latest-path");
+        }
+
+        CefArchive legacy = CefRuntime.SelectArchive(index, "windows64", "109.");
+        Program.Check(legacy != null, "win64-109-found");
+        if (legacy != null) {
+            Program.Check(legacy.cefVersion
+                == "109.1.18+gccc+chromium-109.0.5414.120", "win64-109-version");
+            Program.Check(legacy.fileName.IndexOf("_windows64_") > 0,
+                "win64-109-platform-file");
+        }
+
+        // beta 不参选，且不会串到别的平台去。
+        CefArchive lin = CefRuntime.SelectArchive(index, "linux64", "");
+        Program.Check(lin != null, "linux64-found");
+        if (lin != null) {
+            Program.Check(lin.cefVersion
+                == "151.3.18+gbbb+chromium-151.0.7922.138", "linux64-skips-beta");
+            Program.Check(lin.fileName.IndexOf("_linux64_") > 0, "linux64-file");
+        }
+
+        // 该平台不存在 / 该平台没有要求的分支。
+        Program.Check(CefRuntime.SelectArchive(index, "solaris9", "") == null,
+            "unknown-platform");
+        Program.Check(CefRuntime.Error().Length > 0, "unknown-platform-error");
+        Program.Check(CefRuntime.SelectArchive(index, "linux64", "42.") == null,
+            "missing-branch");
+        Program.Check(CefRuntime.SelectArchive("", "linux64", "") == null,
+            "empty-index");
+        Program.Check(CefRuntime.SelectArchive("{\"linux64\":{\"versions\":[{",
+            "linux64", "") == null, "truncated-index");
+
+        // 版本比较（缓存目录里的形式，'+' 已换成 '-'）。
+        Program.Check(CefRuntime.VersionNewer("151.3.18-gbbb", "109.1.18-gccc"),
+            "newer-151-109");
+        Program.Check(!CefRuntime.VersionNewer("109.1.18", "151.3.18"),
+            "not-newer-109-151");
+        Program.Check(!CefRuntime.VersionNewer("109.1.18", "109.1.18"),
+            "not-newer-equal");
+        Program.Check(CefRuntime.VersionNewer("109.2.0", "109.1.18"),
+            "newer-minor");
+        Program.Check(CefRuntime.VersionNewer("109.1.18", ""), "newer-than-empty");
+
+        // 目录名安全化：'+' 之类换成 '-'，其余保留。
+        Program.Check(CefRuntime.SafeVersion("109.1.18+gccc+chromium-109.0.1")
+            == "109.1.18-gccc-chromium-109.0.1", "safe-version");
+        Program.Check(CefRuntime.UrlEncode("a+b c") == "a%2Bb%20c", "url-encode");
+
+        // 平台标识与缓存路径。
+        string plat = CefRuntime.Platform();
+        Program.Check(plat == "windows64" || plat == "windowsarm64"
+            || plat == "linux64" || plat == "linuxarm64"
+            || plat == "macosx64" || plat == "macosarm64", "platform-id");
+        string root = CefRuntime.CacheRoot();
+        Program.Check(root.Length > 0, "cache-root");
+        Program.Check(root.IndexOf("\\") < 0, "cache-root-slashes");
+        Program.Check(CefRuntime.DownloadDir() == root + "/download",
+            "download-dir");
+        string dir = CefRuntime.RuntimeDir("109.1.18+gccc+chromium-109.0.5414.120");
+        Program.Check(dir.StartsWith(root + "/" + plat + "-109.1.18-gccc-"),
+            "runtime-dir");
+        Program.Check(!CefRuntime.IsReady(root + "/no-such-runtime"),
+            "not-ready");
+        Program.Check(CefRuntime.Progress("no-such-archive.tar.bz2") == "",
+            "no-progress");
+
+        Console.WriteLine("cef-runtime-ok: " + Convert.ToString(Program.bad == 0));
+    }
+}

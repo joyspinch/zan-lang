@@ -1,0 +1,565 @@
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Json;
+using System.Diagnostics;
+using System.Management;
+using System.Net.Http.Client;
+using System.Security.Cryptography;
+
+namespace Gui.Component.CefBrowser;
+
+/// <summary>CEF 官方构建索引里的一个归档条目。</summary>
+class CefArchive {
+    /// <summary>完整 CEF 版本，如
+    /// "109.1.18+gf1c41e4+chromium-109.0.5414.120"。</summary>
+    public string cefVersion;
+    /// <summary>对应的 Chromium 版本。</summary>
+    public string chromiumVersion;
+    /// <summary>官方平台标识，如 "windows64"。</summary>
+    public string platform;
+    /// <summary>归档文件名（.tar.bz2）。</summary>
+    public string fileName;
+    /// <summary>官方给出的 SHA-1（小写十六进制）。</summary>
+    public string sha1;
+    /// <summary>归档字节数。</summary>
+    public long size;
+
+    CefArchive() {
+        this.cefVersion = "";
+        this.chromiumVersion = "";
+        this.platform = "";
+        this.fileName = "";
+        this.sha1 = "";
+        this.size = 0;
+    }
+
+    /// <summary>该归档在官方 CDN 上的请求路径（"+" 已按 URL 规则转义）。</summary>
+    string Path() {
+        return "/" + CefRuntime.UrlEncode(this.fileName);
+    }
+}
+
+/// <summary>本地 CEF 运行时的自举：探测平台与应当使用的 CEF 主版本、
+/// 从官方 CDN 拉取构建索引、下载（可断点续传）并按官方 SHA-1 校验归档、
+/// 解压到本地缓存并打上就绪标记，最后给出稳定的运行时目录，供原生
+/// zan_cef driver 加载 libcef。
+///
+/// 版本策略：Windows 7/8/8.1 只能用 CEF 109（最后一个支持它们的分支），
+/// 其他系统用当前最新的 stable。运行时二进制不入库，只落在用户缓存目录。
+///
+/// 用法：
+/// <code>
+/// string dir = await CefRuntime.EnsureAsync();
+/// if (dir == "") { Console.WriteLine(CefRuntime.Error()); }
+/// </code>
+/// </summary>
+class CefRuntime {
+    /// <summary>官方构建索引所在主机。</summary>
+    static string IndexHost() { return "cef-builds.spotifycdn.com"; }
+
+    /// <summary>索引路径。</summary>
+    static string IndexPath() { return "/index.json"; }
+
+    /// <summary>使用的归档类型：包含 include/、libcef_dll/、Release/、
+    /// Resources/，但不含调试符号与静态库，足够构建
+    /// libcef_dll_wrapper 并运行。</summary>
+    static string ArchiveType() { return "minimal"; }
+
+    /// <summary>就绪标记文件名，内容为已安装的 CEF 版本。</summary>
+    static string ReadyMarker() { return ".zan-cef-ready"; }
+
+    static string lastError;
+
+    /// <summary>最近一次失败的原因，成功时为 ""。</summary>
+    static string Error() {
+        if (CefRuntime.lastError == null) { return ""; }
+        return CefRuntime.lastError;
+    }
+
+    static void Fail(string msg) {
+        CefRuntime.lastError = msg;
+    }
+
+    // ---------------------------------------------------------------- 平台
+
+    /// <summary>官方平台标识（"windows64" / "linux64" / "macosarm64" …），
+    /// 无法映射时返回 ""。</summary>
+    static string Platform() {
+        #if WINDOWS
+        #if ARM64
+        return "windowsarm64";
+        #else
+        return "windows64";
+        #endif
+        #elif LINUX
+        #if ARM64
+        return "linuxarm64";
+        #else
+        return "linux64";
+        #endif
+        #elif MACOS
+        #if ARM64
+        return "macosarm64";
+        #else
+        return "macosx64";
+        #endif
+        #else
+        return "";
+        #endif
+    }
+
+    /// <summary>当前系统是否只能用 CEF 109：Windows 7 / 8 / 8.1
+    /// （内核 6.0—6.3）。</summary>
+    static bool LegacyWindows() {
+        #if WINDOWS
+        string kernel = SystemInfo.KernelVersion();
+        int dot = kernel.IndexOf(".");
+        if (dot <= 0) { return false; }
+        int major = CefRuntime.ParseInt(kernel.Substring(0, dot));
+        if (major <= 0) { return false; }
+        if (major >= 10) { return false; }
+        if (major < 6) { return true; }
+        return true;
+        #else
+        return false;
+        #endif
+    }
+
+    /// <summary>需要的版本前缀："109."（旧 Windows）或 ""（取最新
+    /// stable）。</summary>
+    static string VersionPrefix() {
+        if (CefRuntime.LegacyWindows()) { return "109."; }
+        return "";
+    }
+
+    // ---------------------------------------------------------------- 缓存
+
+    /// <summary>本地缓存根目录（可用 ZAN_CEF_CACHE 覆盖）。</summary>
+    static string CacheRoot() {
+        string custom = ProcessHost.Env("ZAN_CEF_CACHE");
+        if (custom != "") { return CefRuntime.Slashes(custom); }
+        #if WINDOWS
+        string local = ProcessHost.Env("LOCALAPPDATA");
+        if (local == "") { local = ProcessHost.Env("TEMP"); }
+        if (local == "") { local = "C:/Temp"; }
+        return CefRuntime.Slashes(local) + "/Zan/cef";
+        #elif MACOS
+        string home = ProcessHost.Env("HOME");
+        if (home == "") { home = "/tmp"; }
+        return CefRuntime.Slashes(home) + "/Library/Caches/Zan/cef";
+        #else
+        string xdg = ProcessHost.Env("XDG_CACHE_HOME");
+        if (xdg == "") {
+            string home2 = ProcessHost.Env("HOME");
+            if (home2 == "") { home2 = "/tmp"; }
+            xdg = CefRuntime.Slashes(home2) + "/.cache";
+        }
+        return CefRuntime.Slashes(xdg) + "/zan/cef";
+        #endif
+    }
+
+    /// <summary>下载目录（归档与进度文件）。</summary>
+    static string DownloadDir() {
+        return CefRuntime.CacheRoot() + "/download";
+    }
+
+    /// <summary>某个 CEF 版本解包后的运行时目录。</summary>
+    static string RuntimeDir(string cefVersion) {
+        return CefRuntime.CacheRoot() + "/" + CefRuntime.Platform()
+            + "-" + CefRuntime.SafeVersion(cefVersion);
+    }
+
+    /// <summary>该目录是否已完整安装（存在就绪标记与 Resources）。</summary>
+    static bool IsReady(string dir) {
+        if (!File.Exists(dir + "/" + CefRuntime.ReadyMarker())) { return false; }
+        if (!Directory.Exists(dir + "/Resources")) { return false; }
+        return true;
+    }
+
+    /// <summary>本地已安装且符合当前版本策略的运行时目录，没有则 ""。
+    /// 不联网。</summary>
+    static string Installed() {
+        string root = CefRuntime.CacheRoot();
+        if (!Directory.Exists(root)) { return ""; }
+        string plat = CefRuntime.Platform();
+        if (plat == "") { return ""; }
+        string want = CefRuntime.VersionPrefix();
+        string best = "";
+        string bestVer = "";
+        List<string> subs = Directory.GetDirectories(root);
+        for (int i = 0; i < subs.Count; i = i + 1) {
+            string name = subs[i];
+            if (!name.StartsWith(plat + "-")) { continue; }
+            string ver = name.Substring(plat.Length + 1,
+                name.Length - plat.Length - 1);
+            if (want != "" && !ver.StartsWith(CefRuntime.SafeVersion(want))) {
+                continue;
+            }
+            string dir = root + "/" + name;
+            if (!CefRuntime.IsReady(dir)) { continue; }
+            if (best == "" || CefRuntime.VersionNewer(ver, bestVer)) {
+                best = dir;
+                bestVer = ver;
+            }
+        }
+        return best;
+    }
+
+    /// <summary>删除整个 CEF 缓存（运行时与已下载归档）。</summary>
+    static bool CleanCache() {
+        return Directory.DeleteRecursive(CefRuntime.CacheRoot());
+    }
+
+    // ---------------------------------------------------------------- 索引
+
+    /// <summary>把官方构建索引下载到 <paramref name="destPath"/>，
+    /// 成功返回 true。索引每次都重新拉取（不做断点续传，避免续到
+    /// 过期的半截文件上）。</summary>
+    static async bool FetchIndexAsync(string destPath) {
+        Directory.CreateDirectoryRecursive(CefRuntime.ParentDir(destPath));
+        if (File.Exists(destPath)) { File.Delete(destPath); }
+        HttpClient client = HttpClient.CreateHttps(CefRuntime.IndexHost(), 443);
+        client.SetTimeout(60000);
+        long n = await client.DownloadBinaryToFileAsync(CefRuntime.IndexPath(),
+            destPath, destPath + ".progress");
+        if (n <= 0) {
+            CefRuntime.Fail("下载 CEF 构建索引失败：" + CefRuntime.IndexHost()
+                + CefRuntime.IndexPath());
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>从索引文本里挑出该平台上符合前缀的最新 stable 归档。
+    /// 纯函数，便于离线测试。失败返回 null。</summary>
+    static CefArchive SelectArchive(string index, string platform,
+            string versionPrefix) {
+        int region = index.IndexOf("\"" + platform + "\"");
+        if (region < 0) {
+            CefRuntime.Fail("CEF 索引里没有平台 " + platform);
+            return null;
+        }
+        int at = region;
+        while (true) {
+            int key = index.IndexOf("\"cef_version\"", at);
+            if (key < 0) { break; }
+            // 索引有 10 MB 量级，逐字符扫描整串代价太高：只在
+            // "cef_version" 附近开一个足够放下整个版本对象的窗口。
+            int winStart = key - 64;
+            if (winStart < 0) { winStart = 0; }
+            int winLen = 65536;
+            if (winStart + winLen > index.Length) {
+                winLen = index.Length - winStart;
+            }
+            string win = index.Substring(winStart, winLen);
+            int open = CefRuntime.PrevBrace(win, key - winStart);
+            if (open < 0) { at = key + 13; continue; }
+            int close = CefRuntime.MatchBrace(win, open);
+            if (close < 0) { at = key + 13; continue; }
+            at = winStart + close;
+            string text = win.Substring(open, close - open + 1);
+            CefArchive found = CefRuntime.ReadVersion(text, platform,
+                versionPrefix);
+            if (found != null) { return found; }
+            // 已经越过本平台的区段（版本对象里的文件名属于别的平台）。
+            if (CefRuntime.OtherPlatform(text, platform)) { break; }
+        }
+        CefRuntime.Fail("CEF 索引里找不到 " + platform + " 的 stable 版本"
+            + CefRuntime.PrefixNote(versionPrefix));
+        return null;
+    }
+
+    /// <summary>解析单个版本对象，符合条件时返回归档，否则 null。</summary>
+    static CefArchive ReadVersion(string text, string platform,
+            string versionPrefix) {
+        JsonValue v = JsonValue.Parse(text);
+        if (v == null || !v.IsObject()) { return null; }
+        if (v.Str("channel", "") != "stable") { return null; }
+        string ver = v.Str("cef_version", "");
+        if (ver == "") { return null; }
+        if (versionPrefix != "" && !ver.StartsWith(versionPrefix)) { return null; }
+        JsonValue files = v.Get("files");
+        if (files == null || !files.IsArray()) { return null; }
+        for (int i = 0; i < files.Count(); i = i + 1) {
+            JsonValue f = files.At(i);
+            if (f == null || !f.IsObject()) { continue; }
+            if (f.Str("type", "") != CefRuntime.ArchiveType()) { continue; }
+            string name = f.Str("name", "");
+            if (name.IndexOf("_" + platform) < 0) { return null; }
+            if (!name.EndsWith(".tar.bz2")) { return null; }
+            CefArchive a = new CefArchive();
+            a.cefVersion = ver;
+            a.chromiumVersion = v.Str("chromium_version", "");
+            a.platform = platform;
+            a.fileName = name;
+            a.sha1 = f.Str("sha1", "").ToLower();
+            a.size = f.Long("size", 0);
+            if (a.sha1.Length != 40) { return null; }
+            return a;
+        }
+        return null;
+    }
+
+    /// <summary>版本对象里的文件名是否属于别的平台。</summary>
+    static bool OtherPlatform(string text, string platform) {
+        int at = text.IndexOf("\"name\"");
+        if (at < 0) { return false; }
+        return text.IndexOf("_" + platform, at) < 0;
+    }
+
+    static string PrefixNote(string versionPrefix) {
+        if (versionPrefix == "") { return ""; }
+        return "（要求前缀 " + versionPrefix + "）";
+    }
+
+    /// <summary>联网确定当前系统该用哪个 CEF 归档。</summary>
+    static async CefArchive ResolveAsync() {
+        string plat = CefRuntime.Platform();
+        if (plat == "") {
+            CefRuntime.Fail("当前平台没有官方 CEF 构建");
+            return null;
+        }
+        string indexPath = CefRuntime.CacheRoot() + "/index.json";
+        bool ok = await CefRuntime.FetchIndexAsync(indexPath);
+        if (!ok) { return null; }
+        string text = File.ReadAllText(indexPath);
+        if (text.Length == 0) {
+            CefRuntime.Fail("CEF 构建索引为空");
+            return null;
+        }
+        return CefRuntime.SelectArchive(text, plat, CefRuntime.VersionPrefix());
+    }
+
+    // ---------------------------------------------------------------- 安装
+
+    /// <summary>确保本地有可用的 CEF 运行时，返回其目录；失败返回 ""
+    /// （原因见 <see cref="Error"/>）。已装好时不联网。</summary>
+    static async string EnsureAsync() {
+        CefRuntime.lastError = "";
+        string have = CefRuntime.Installed();
+        if (have != "") { return have; }
+
+        CefArchive a = await CefRuntime.ResolveAsync();
+        if (a == null) { return ""; }
+        string dir = CefRuntime.RuntimeDir(a.cefVersion);
+        if (CefRuntime.IsReady(dir)) { return dir; }
+
+        string archive = CefRuntime.DownloadDir() + "/" + a.fileName;
+        bool got = await CefRuntime.DownloadArchiveAsync(a, archive);
+        if (!got) { return ""; }
+        if (!CefRuntime.Install(archive, dir, a.cefVersion)) { return ""; }
+        return dir;
+    }
+
+    /// <summary>下载归档（断点续传）并按官方 SHA-1 校验；校验不过会
+    /// 重下一次。</summary>
+    static async bool DownloadArchiveAsync(CefArchive a, string archive) {
+        Directory.CreateDirectoryRecursive(CefRuntime.DownloadDir());
+        if (File.Exists(archive) && Sha1.VerifyFile(archive, a.sha1)) {
+            return true;
+        }
+        HttpClient client = HttpClient.CreateHttps(CefRuntime.IndexHost(), 443);
+        client.SetTimeout(120000);
+        for (int attempt = 0; attempt < 2; attempt = attempt + 1) {
+            long n = await client.DownloadBinaryToFileAsync(a.Path(), archive,
+                archive + ".progress");
+            if (n > 0 && Sha1.VerifyFile(archive, a.sha1)) { return true; }
+            // 半截或损坏：清掉后整包重下。
+            if (File.Exists(archive)) { File.Delete(archive); }
+        }
+        CefRuntime.Fail("CEF 归档下载或 SHA-1 校验失败：" + a.fileName);
+        return false;
+    }
+
+    /// <summary>下载进度（"已收/总计" 字节），未在下载时返回 ""。</summary>
+    static string Progress(string fileName) {
+        string p = CefRuntime.DownloadDir() + "/" + fileName + ".progress";
+        if (!File.Exists(p)) { return ""; }
+        return File.ReadAllText(p).Trim();
+    }
+
+    /// <summary>解压 .tar.bz2 归档到运行时目录并打上就绪标记：归档里
+    /// 只有一层 cef_binary_… 顶层目录，会被剥掉。</summary>
+    static bool Install(string archive, string dir, string cefVersion) {
+        string tar = archive + ".tar";
+        string staging = dir + ".tmp";
+        Directory.DeleteRecursive(staging);
+        Directory.DeleteRecursive(dir);
+        if (!BZip2.DecompressFile(archive, tar)) {
+            CefRuntime.Fail("CEF 归档 bzip2 解压失败：" + archive);
+            File.Delete(tar);
+            return false;
+        }
+        int n = Tar.ExtractFile(tar, staging);
+        File.Delete(tar);
+        if (n <= 0) {
+            CefRuntime.Fail("CEF 归档 tar 解包失败：" + archive);
+            Directory.DeleteRecursive(staging);
+            return false;
+        }
+        string src = staging;
+        List<string> subs = Directory.GetDirectories(staging);
+        List<string> tops = Directory.GetFiles(staging);
+        if (subs.Count == 1 && tops.Count == 0) {
+            src = staging + "/" + subs[0];
+        }
+        Directory.CreateDirectoryRecursive(CefRuntime.ParentDir(dir));
+        File.Move(src, dir);
+        if (!Directory.Exists(dir + "/Resources")) {
+            CefRuntime.Fail("CEF 归档内容异常：缺少 Resources/（" + archive + "）");
+            Directory.DeleteRecursive(staging);
+            return false;
+        }
+        Directory.DeleteRecursive(staging);
+        CefRuntime.MarkExecutables(dir);
+        File.WriteAllText(dir + "/" + CefRuntime.ReadyMarker(), cefVersion);
+        return true;
+    }
+
+    /// <summary>POSIX 上给 Release/ 下的产物补上可执行位（tar 里的 mode
+    /// 已经带了，这里只是兜底 helper 进程能起来）。</summary>
+    static void MarkExecutables(string dir) {
+        #if WINDOWS
+        #else
+        string rel = dir + "/Release";
+        if (!Directory.Exists(rel)) { return; }
+        List<string> files = Directory.GetFiles(rel);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string name = files[i];
+            if (name.EndsWith(".so") || name.EndsWith(".dylib")
+                || name.IndexOf(".") < 0 || name.EndsWith("Helper")) {
+                File.SetExecutable(rel + "/" + name, true);
+            }
+        }
+        #endif
+    }
+
+    // ---------------------------------------------------------- 小工具
+
+    /// <summary>把归档文件名转成 URL 路径片段（"+" → "%2B"）。</summary>
+    static string UrlEncode(string name) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < name.Length; i = i + 1) {
+            int c = name[i] & 255;
+            if (c == 43) { sb.Append("%2B"); }
+            else if (c == 32) { sb.Append("%20"); }
+            else { sb.Append(name.Substring(i, 1)); }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>把版本串里不适合做目录名的字符换成 "-"。</summary>
+    static string SafeVersion(string v) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < v.Length; i = i + 1) {
+            int c = v[i] & 255;
+            bool ok = (c >= 48 && c <= 57) || (c >= 97 && c <= 122)
+                || (c >= 65 && c <= 90) || c == 46 || c == 45 || c == 95;
+            if (ok) { sb.Append(v.Substring(i, 1)); }
+            else { sb.Append("-"); }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>比较两个目录名里的版本，a 是否比 b 新（按点分数字段）。
+    /// </summary>
+    static bool VersionNewer(string a, string b) {
+        if (b == "") { return true; }
+        int ia = 0;
+        int ib = 0;
+        while (ia < a.Length || ib < b.Length) {
+            int na = 0 - 1;
+            int nb = 0 - 1;
+            int ja = ia;
+            while (ja < a.Length && (a[ja] & 255) >= 48 && (a[ja] & 255) <= 57) {
+                if (na < 0) { na = 0; }
+                na = na * 10 + ((a[ja] & 255) - 48);
+                ja = ja + 1;
+            }
+            int jb = ib;
+            while (jb < b.Length && (b[jb] & 255) >= 48 && (b[jb] & 255) <= 57) {
+                if (nb < 0) { nb = 0; }
+                nb = nb * 10 + ((b[jb] & 255) - 48);
+                jb = jb + 1;
+            }
+            if (na != nb) { return na > nb; }
+            if (na < 0) { return false; }
+            ia = ja + 1;
+            ib = jb + 1;
+            if (ia > a.Length) { ia = a.Length; }
+            if (ib > b.Length) { ib = b.Length; }
+            if (ja >= a.Length && jb >= b.Length) { return false; }
+        }
+        return false;
+    }
+
+    static int ParseInt(string s) {
+        int v = 0;
+        bool any = false;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { break; }
+            v = v * 10 + (c - 48);
+            any = true;
+        }
+        if (!any) { return 0 - 1; }
+        return v;
+    }
+
+    static string Slashes(string p) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < p.Length; i = i + 1) {
+            if ((p[i] & 255) == 92) { sb.Append("/"); }
+            else { sb.Append(p.Substring(i, 1)); }
+        }
+        string s = sb.ToString();
+        while (s.Length > 1 && s.EndsWith("/")) {
+            s = s.Substring(0, s.Length - 1);
+        }
+        return s;
+    }
+
+    static string ParentDir(string path) {
+        int cut = 0 - 1;
+        for (int i = 0; i < path.Length; i = i + 1) {
+            int c = path[i] & 255;
+            if (c == 47 || c == 92) { cut = i; }
+        }
+        if (cut <= 0) { return "."; }
+        return path.Substring(0, cut);
+    }
+
+    /// <summary>from 之前最近的一个 '{'。</summary>
+    static int PrevBrace(string s, int from) {
+        for (int i = from; i >= 0; i = i - 1) {
+            int c = s[i] & 255;
+            if (c == 123) { return i; }
+            if (c == 125 || c == 91 || c == 93) { return 0 - 1; }
+        }
+        return 0 - 1;
+    }
+
+    /// <summary>与 open 处 '{' 配对的 '}'，考虑字符串字面量与转义。</summary>
+    static int MatchBrace(string s, int open) {
+        int depth = 0;
+        bool inStr = false;
+        bool esc = false;
+        for (int i = open; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (inStr) {
+                if (esc) { esc = false; }
+                else if (c == 92) { esc = true; }
+                else if (c == 34) { inStr = false; }
+                continue;
+            }
+            if (c == 34) { inStr = true; }
+            else if (c == 123) { depth = depth + 1; }
+            else if (c == 125) {
+                depth = depth - 1;
+                if (depth == 0) { return i; }
+            }
+        }
+        return 0 - 1;
+    }
+}

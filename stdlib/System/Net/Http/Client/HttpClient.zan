@@ -1108,5 +1108,194 @@ class HttpClient {
         if (late) { return 0 - 1; }
         return written;
     }
+
+    /// <summary>把 <paramref name="path"/> 下载到
+    /// <paramref name="localPath"/>，正文按字节搬运——正文里的 NUL
+    /// 不会被当成结尾，因此适合 .tar.bz2 / .zip 之类的二进制归档
+    /// （<see cref="DownloadRangeToFileAsync"/> 把正文当字符串拼接，
+    /// 遇到第一个 NUL 就会以为对端关闭了）。
+    ///
+    /// 语义与 <see cref="DownloadRangeToFileAsync"/> 一致：发送
+    /// `Range: bytes=&lt;已有&gt;-` 续传，206 追加、200 重下、416 视为
+    /// 已完成；超时是空闲窗口。进度（"&lt;已收&gt;/&lt;总计&gt;"）写入
+    /// <paramref name="progressFile"/>。返回磁盘上的字节数；连接/握手
+    /// 失败、响应不完整、或对端用 chunked 传输（本方法只支持带
+    /// Content-Length/Range 的 identity 正文）时返回 -1。</summary>
+    async long DownloadBinaryToFileAsync(string path, string localPath,
+            string progressFile) {
+        int have = 0;
+        nint probe = fopen(localPath, "rb");
+        if (probe != 0) {
+            fseek(probe, 0, 2);
+            have = ftell(probe);
+            fclose(probe);
+        }
+
+        Socket.Initialize();
+        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port, this.timeout);
+        if (conn == null) { return 0 - 1; }
+        TlsStream stream = null;
+        TlsContext ctx = null;
+        if (this.useTls) {
+            if (this.clientCertificateFile.Length > 0
+                && this.clientPrivateKeyFile.Length > 0) {
+                ctx = TlsContext.CreateClientWithCertificate(
+                    this.clientCertificateFile, this.clientPrivateKeyFile);
+            } else {
+                ctx = TlsContext.CreateClient();
+            }
+            if (ctx == null) { conn.Close(); return 0 - 1; }
+            if (!this.verifyTls) { ctx.DisableVerify(); }
+            this.ApplyPinning(ctx);
+            stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host);
+            if (stream == null) { conn.Close(); ctx.Free(); return 0 - 1; }
+        }
+
+        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
+        StringBuilder sb = new StringBuilder();
+        sb.Append("GET ");
+        sb.Append(path);
+        sb.Append(" HTTP/1.1\r\n");
+        sb.Append("Host: ");
+        sb.Append(this.host);
+        sb.Append("\r\n");
+        for (int hi = 0; hi < this.defaultHeaders.Count; hi = hi + 1) {
+            sb.Append(this.defaultHeaders[hi]);
+            sb.Append("\r\n");
+        }
+        if (have > 0) {
+            sb.Append("Range: bytes=");
+            sb.Append(Convert.ToString(have));
+            sb.Append("-\r\n");
+        }
+        sb.Append("Connection: close\r\n\r\n");
+        string req = sb.ToString();
+        if (this.useTls) { int _s = await stream.SendAsync(req, req.Length); }
+        else { int _s2 = await conn.SendAsync(req); }
+
+        // 头部是 ASCII，逐字节读到 CRLFCRLF 为止——这样正文的第一个
+        // 字节仍留在连接里，不会和头部一起被读进字符串。
+        string one = HttpClient.NewBuffer(2);
+        StringBuilder head = new StringBuilder();
+        int seen = 0;
+        int hlen = 0;
+        bool endOfHead = false;
+        bool closed = false;
+        while (!endOfHead && !closed && hlen < 262144) {
+            int got;
+            if (this.useTls) { got = await stream.RecvIntoAsync(one, 1); }
+            else { got = await Socket.RecvIntoAsync(conn.Sock(), one, 1); }
+            if (got <= 0) { closed = true; }
+            else {
+                int c = one[0] & 255;
+                head.Append(one.Substring(0, 1));
+                hlen = hlen + 1;
+                if (c == 13 && (seen == 0 || seen == 2)) { seen = seen + 1; }
+                else if (c == 10 && (seen == 1 || seen == 3)) { seen = seen + 1; }
+                else { seen = 0; }
+                if (seen == 4) { endOfHead = true; }
+                HttpDeadline.Touch(watch, this.timeout);
+            }
+        }
+        if (!endOfHead) {
+            HttpDeadline.Disarm(watch);
+            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+            else { conn.Close(); }
+            return 0 - 1;
+        }
+        string headText = head.ToString();
+        int status = HttpClient.HeadStatus(headText);
+        if (HttpClient.HeadIsChunked(headText)) {
+            HttpDeadline.Disarm(watch);
+            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+            else { conn.Close(); }
+            return 0 - 1;
+        }
+
+        // 416 Range Not Satisfiable：本地文件已经是完整的了。
+        if (status == 416) {
+            HttpDeadline.Disarm(watch);
+            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+            else { conn.Close(); }
+            File.WriteAllText(progressFile,
+                Convert.ToString(have) + "/" + Convert.ToString(have));
+            return have;
+        }
+        if (status < 200 || status >= 300) {
+            HttpDeadline.Disarm(watch);
+            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+            else { conn.Close(); }
+            return 0 - 1;
+        }
+
+        bool resume = status == 206;
+        long total = HttpClient.RangeTotal(headText);
+        long written = 0;
+        if (resume) {
+            written = have;
+            if (total <= 0) {
+                int cl = HttpClient.HeaderInt(headText, "content-length");
+                if (cl > 0) { total = have + cl; }
+            }
+        } else {
+            have = 0;
+            if (total <= 0) {
+                total = HttpClient.HeaderInt(headText, "content-length");
+            }
+        }
+
+        string mode = "wb";
+        if (resume) { mode = "ab"; }
+        nint outfp = fopen(localPath, mode);
+        if (outfp == 0) {
+            HttpDeadline.Disarm(watch);
+            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+            else { conn.Close(); }
+            return 0 - 1;
+        }
+
+        string buf = HttpClient.NewBuffer(65537);
+        bool finished = false;
+        long lastReport = 0 - 1;
+        while (!finished) {
+            int n;
+            if (this.useTls) { n = await stream.RecvIntoAsync(buf, 65536); }
+            else { n = await Socket.RecvIntoAsync(conn.Sock(), buf, 65536); }
+            if (n <= 0) { finished = true; }
+            else {
+                long w = fwrite(buf, 1, n, outfp);
+                if (w < n) { finished = true; }
+                written = written + w;
+                if (written - lastReport >= 1048576 || lastReport < 0) {
+                    File.WriteAllText(progressFile,
+                        Convert.ToString(written) + "/" + Convert.ToString(total));
+                    lastReport = written;
+                }
+                if (total > 0 && written >= total) { finished = true; }
+                if (!HttpDeadline.Expired(watch)) {
+                    HttpDeadline.Touch(watch, this.timeout);
+                }
+            }
+        }
+        fclose(outfp);
+
+        bool late = HttpDeadline.Expired(watch);
+        HttpDeadline.Disarm(watch);
+        if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+        else { conn.Close(); }
+        File.WriteAllText(progressFile,
+            Convert.ToString(written) + "/" + Convert.ToString(total));
+        if (late) { return 0 - 1; }
+        if (total > 0 && written < total) { return 0 - 1; }
+        return written;
+    }
+
+    /// <summary>分配一个可写的 ARC 托管字节缓冲区（内容为空格）。
+    /// 原始 calloc 块不带字符串引用计数头，交给 ARC 会出错。</summary>
+    static string NewBuffer(int size) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < size; i = i + 1) { sb.Append(" "); }
+        return sb.ToString();
+    }
 }
 
