@@ -1,43 +1,59 @@
 # Connecting an AI coding tool to Zan
 
 Goal: your AI editor writes correct Zan **without** crawling the sources. One
-config file connects it to the SDK's MCP server; from then on the model asks the
-toolchain instead of guessing — signatures, working examples, real compiler
-diagnostics.
+command connects your project to the SDK's MCP server; from then on the model
+asks the toolchain instead of guessing — signatures, working examples, real
+compiler diagnostics.
 
-Everything below ships inside the published SDK (`dist\win-x64`, referred to as
-`<ZAN_SDK>`):
+Two directories, and the difference matters: the **SDK installation**
+(`dist\win-x64`, referred to as `<ZAN_SDK>`) is where the IDE and the toolchain
+live, and your **project** is wherever you write code. AI configuration belongs
+in the project — nobody develops inside the SDK folder — so the SDK only keeps
+the templates:
 
 ```
-<ZAN_SDK>\zan-mcp.exe        MCP server (stdio + HTTP)
-<ZAN_SDK>\AGENTS.md          the rules an agent must follow in a Zan project
-<ZAN_SDK>\.agents\skills\    zan-development / zan-debugging workflows
-<ZAN_SDK>\.mcp.json          ready-made config (Claude Code / generic)
-<ZAN_SDK>\.cursor\mcp.json   ready-made config (Cursor)
-<ZAN_SDK>\.vscode\mcp.json   ready-made config (VS Code + Copilot)
+<ZAN_SDK>\tools\zan-mcp.exe  MCP server (stdio + HTTP)
+<ZAN_SDK>\ai\                templates installed into a project by --init-agent:
+                             AGENTS.md, skills\, mcp.json,
+                             cursor.mcp.json, vscode.mcp.json
 <ZAN_SDK>\knowledge\         symbols.json (API index), gallery.json (examples)
 <ZAN_SDK>\toolchain\         zanc, zan-lsp, zan-dap, linker, gdb
 ```
 
-The shipped configs already contain the absolute path of the SDK that produced
-them. Move the SDK and you must update that one `command` string.
-
 ## 1. Connect
 
-Copy the matching file into **your project** (not the SDK) and restart the
-editor:
-
-| Tool                     | Copy from                    | To                          |
-|--------------------------|------------------------------|-----------------------------|
-| Claude Code              | `<ZAN_SDK>\.mcp.json`        | `<project>\.mcp.json`       |
-| Cursor                   | `<ZAN_SDK>\.cursor\mcp.json` | `<project>\.cursor\mcp.json`|
-| VS Code (Copilot agent)  | `<ZAN_SDK>\.vscode\mcp.json` | `<project>\.vscode\mcp.json`|
-| Windsurf / other clients | `<ZAN_SDK>\.mcp.json`        | that client's `mcpServers` config |
-
-They all launch the same thing:
+One command, run once per project:
 
 ```
-<ZAN_SDK>\zan-mcp.exe --stdio .
+<ZAN_SDK>\tools\zan-mcp.exe --init-agent D:\path\to\your-project   [--force]
+```
+
+In the Zan IDE the assistant panel's **“为当前项目启用 AI 接入”** button does
+exactly this for the project you have open.
+
+It installs, filling in this installation's paths and keeping any file that is
+already there (`--force` overwrites):
+
+| Into the project    | Used by                                        |
+|---------------------|------------------------------------------------|
+| `AGENTS.md`         | Claude Code, Cursor, Copilot, Devin            |
+| `.agents\skills\`   | the same, as reusable workflows                |
+| `.mcp.json`         | Claude Code and most clients                   |
+| `.cursor\mcp.json`  | Cursor                                         |
+| `.vscode\mcp.json`  | VS Code + Copilot agent mode                   |
+
+Restart the editor afterwards. Other clients (Windsurf, …) take the
+`mcpServers` block out of `.mcp.json` as-is.
+
+Do not copy the files out of `ai\` by hand: they still carry the `<ZAN_MCP>` /
+`<ZAN_SDK>` / `<ZAN_PROJECT>` placeholders that `--init-agent` expands, and a
+client cannot launch a server whose path is a literal placeholder. If you move
+the SDK, re-run `--init-agent --force`.
+
+All clients then launch the same thing:
+
+```
+<ZAN_SDK>\tools\zan-mcp.exe --stdio <project>
 ```
 
 `--stdio` speaks newline-delimited JSON-RPC 2.0 on stdin/stdout (nothing else is
@@ -49,22 +65,22 @@ rejected.
 Verify by hand:
 
 ```
-echo {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}} | <ZAN_SDK>\zan-mcp.exe --stdio .
+echo {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}} | <ZAN_SDK>\tools\zan-mcp.exe --stdio .
 ```
 
 One JSON line back = connected.
 
-## 2. Copy the rules into the project
+## 2. What the installed rules are for
 
-```
-copy <ZAN_SDK>\AGENTS.md          <project>\AGENTS.md
-xcopy /E /I <ZAN_SDK>\.agents     <project>\.agents
-```
+`AGENTS.md` is read automatically by Claude Code, Cursor, Copilot and Devin: it
+is the house style of Zan code, so the model stops inventing C#-isms.
+`.agents\skills\` holds the workflows worth having verbatim: `zan-development`
+(look up → edit → compile → run), `zan-debugging` (diagnostics → leak check →
+LSP → DAP) and `zan-mcp` (the server's own tool catalog).
 
-`AGENTS.md` is read automatically by Claude Code, Cursor, Copilot and Devin.
-`.agents\skills\` holds the two workflows worth having verbatim:
-`zan-development` (look up → edit → compile → run) and `zan-debugging`
-(diagnostics → leak check → LSP → DAP).
+The server finds `knowledge\`, `toolchain\zanc.exe` and `stdlib\` from the SDK
+root above `tools\` on its own; `--sdk-root <dir>` overrides that if you moved
+the executable out of the SDK.
 
 ## 3. The workflow the model should follow
 
@@ -93,6 +109,7 @@ routes) — as produced by `tools/repomap` into `.zanmap/`.
 ## 4. Options worth knowing
 
 ```
+zan-mcp.exe --init-agent <project> [--force] # install the pack into a project
 zan-mcp.exe --stdio .                        # what the configs use
 zan-mcp.exe --stdio . --read-only            # refuse every mutating tool
 zan-mcp.exe --stdio . --no-exec              # keep files, drop run_command
@@ -104,8 +121,8 @@ Give `--read-only` to a tool you do not want writing to disk, and always pair a
 non-loopback `--host` with a token (`--token-env` keeps it out of the process
 list). Never put a token in a config file you commit.
 
-The optional `zan_*` tools register only when their backing files exist next to
-the server: `knowledge\symbols.json` for `zan_api_search`,
+The optional `zan_*` tools register only when their backing files exist in the
+SDK root: `knowledge\symbols.json` for `zan_api_search`,
 `knowledge\gallery.json` for `zan_example`, `toolchain\zanc.exe` for
 `zan_compile` / `zan_build_project`. `zan_start_here` reports which of them are
 live under `available`.

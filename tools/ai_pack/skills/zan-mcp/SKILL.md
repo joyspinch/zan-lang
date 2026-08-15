@@ -8,7 +8,7 @@ description: How to drive the Zan SDK through its MCP server (stdio or HTTP) —
 ## Start it
 
 ```
-<ZAN_SDK>\zan-mcp.exe --stdio .        # newline-delimited JSON-RPC 2.0 on stdin/stdout
+<ZAN_MCP> --stdio .        # newline-delimited JSON-RPC 2.0 on stdin/stdout
 ```
 
 The trailing argument is the workspace root (`.` = the launch directory). stdout
@@ -22,8 +22,8 @@ project. Full guide: `docs\AI_ONBOARDING.md`.
 HTTP is the same API on `POST /`, `/mcp` or `/rpc`:
 
 ```
-<ZAN_SDK>\zan-mcp.exe . --port 18848
-<ZAN_SDK>\zan-mcp.exe . --host 0.0.0.0 --token-env ZAN_MCP_TOKEN
+<ZAN_MCP> . --port 18848
+<ZAN_MCP> . --host 0.0.0.0 --token-env ZAN_MCP_TOKEN
 ```
 
 A non-loopback host without a token is refused a clean bill of health for good

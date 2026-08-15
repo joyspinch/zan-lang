@@ -25,22 +25,20 @@ if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_COMPILE_FAILED"; exit 1 }
 llvm-ar rcs $runtimeLib build\zan_gui_ide_gnu.o
 if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
 
-# ---- 2) embedded resources (skins) ----------------------------------------
-# The skin packs ship inside the exe: bake stdlib/Gui/skins into an object the
-# runtime's zan_embed_* API reads by name. Regenerate every build so a skin
-# edit shows up without a manual step.
+# ---- 2) embedded resources (skins, help topics, ide.css) -------------------
+# Everything the IDE reads as data ships inside the exe and is looked up by name
+# through zan_embed_*: skin packs, the Help page's topics.json and the
+# page-layout stylesheet. Regenerate every build so editing one shows up without
+# a manual step.
+#
+# All three groups go into ONE object on purpose: zan_embed_register replaces the
+# registered table, so a second generated object would hide the first one's
+# resources (that is how ide.css and topics.json used to need disk copies).
+# The 'ide' group is filtered to *.css because assets\ also holds docs\.
 & powershell -ExecutionPolicy Bypass -File scripts\gen_embed.ps1 `
-    -Root stdlib\Gui\skins -Prefix skins `
+    -Group "stdlib\Gui\skins=skins;src\ide_zan\assets\docs=docs;src\ide_zan\assets=ide:*.css" `
     -OutC build\embed_gen.c -OutO build\embed_gen.o -Clang clang
 if ($LASTEXITCODE -ne 0) { Write-Output "EMBED_GEN_FAILED"; exit 1 }
-
-# The IDE's own text assets (the Help page's topics.json) ship the same way:
-# a second embed object registers its files with the same runtime registry, so
-# the documentation is available offline without an external data file.
-& powershell -ExecutionPolicy Bypass -File scripts\gen_embed.ps1 `
-    -Root src\ide_zan\assets\docs -Prefix docs `
-    -OutC build\embed_docs.c -OutO build\embed_docs.o -Clang clang
-if ($LASTEXITCODE -ne 0) { Write-Output "EMBED_DOCS_FAILED"; exit 1 }
 
 # ---- 3) sources: entry first, then project + Gui stdlib -------------------
 $zanc = if (Test-Path "build\zanc.exe") { "build\zanc.exe" } else { "dist\win-x64\toolchain\zanc.exe" }
@@ -119,7 +117,6 @@ $zanArgs += @("-g")
 $zanArgs += @("--no-arc-guard", "--no-check-leaks")
 $zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_ide_gnu")
 $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_gen.o"))
-$zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_docs.o"))
 # Native Win32 backend system deps (dwmapi/user32/gdi32/imm32 + reactor).
 $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")
 $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")
@@ -167,9 +164,11 @@ if ($code -ne 0) {
     exit 1
 }
 
-# The IDE's own stylesheet (page layout) ships next to the executable.
-Copy-Item -LiteralPath (Join-Path (Get-Location) "src\ide_zan\assets\ide.css") `
-    -Destination (Join-Path (Get-Location) "build\ide.css") -Force
+# The stylesheet is baked into the exe (embed_gen above) and read from memory;
+# a copy beside the executable would only shadow it, so drop any stale one --
+# and the dev build then exercises the same path the release ships.
+Remove-Item -LiteralPath (Join-Path (Get-Location) "build\ide.css") `
+    -Force -ErrorAction SilentlyContinue
 
 # ---- record the non-system DLLs the IDE needs beside it -------------------
 # ZanIDE.exe imports more than the Windows API: the runtime objects pull in

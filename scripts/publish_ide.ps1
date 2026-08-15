@@ -104,13 +104,11 @@ if ($stripped) {
 # ships beside the IDE.
 Copy-Item $stdlib (Join-Path $dist 'stdlib') -Recurse
 
-# ---- the IDE's own page-layout stylesheet, beside the install root ----
-# ide.css (flex/widths/gaps) is resolved from BaseDir()/ExeDir(); ship it in the
-# install root so it loads without falling back to the source tree.
-# (same source path build_ide.ps1 copies from -- it lives under assets\)
-$ideCss = Join-Path $root 'src\ide_zan\assets\ide.css'
-if (Test-Path $ideCss) { Copy-Item $ideCss (Join-Path $dist 'ide.css') -Force }
-else { Write-Output "PUBLISH_WARN: src\ide_zan\assets\ide.css missing (IDE uses default layout)" }
+# ---- the IDE's own page-layout stylesheet is baked into the exe ------------
+# ide.css travels as an embedded resource (scripts\gen_embed.ps1 -Prefix ide,
+# linked in by build_ide.ps1) and is read from memory, so nothing ships in the
+# install root. A file next to the exe still wins, which is how a user overrides
+# the layout without a rebuild -- we just do not create one.
 
 # ---- native driver DLLs the IDE itself loads at run time -------------------
 # ZanIDE.exe imports the driver DLLs of the stdlib namespaces it uses (TLS ->
@@ -129,17 +127,10 @@ if (Test-Path $depsList) {
     Write-Output "PUBLISH_WARN: build\ZanIDE.deps.txt missing (run scripts\build_ide.ps1); driver DLLs the IDE needs may be absent from the release"
 }
 
-# The Help topics are baked into the exe, but a copy next to it wins (see
-# DocsData.DiskPaths): shipping it lets a user or a docs update replace the
-# documentation without a new build.
-$docsJson = Join-Path $root 'src\ide_zan\assets\docs\topics.json'
-if (Test-Path $docsJson) {
-    $distDocs = Join-Path $dist 'docs'
-    New-Item -ItemType Directory -Force -Path $distDocs | Out-Null
-    Copy-Item $docsJson (Join-Path $distDocs 'topics.json') -Force
-} else {
-    Write-Output "PUBLISH_WARN: src\ide_zan\assets\docs\topics.json missing (Help page uses the embedded copy)"
-}
+# The Help topics travel inside the exe as well (embed group 'docs'), so no
+# topics.json ships here. A docs\topics.json next to the exe still wins (see
+# DocsData.DiskPaths), which is how a user replaces the documentation without a
+# new build -- we just do not create one.
 
 # ---- skin packs are baked into ZanIDE.exe as embedded resources -----------
 # (scripts\gen_embed.ps1, linked in by build_ide.ps1). The skin picker reads
@@ -278,11 +269,13 @@ if (Test-Path $toolsDir) {
 Write-Output "[4/6] Building the AI onboarding pack ..."
 $aiPack = Join-Path $root 'tools\ai_pack'
 $mcpSrc = Join-Path $root 'tools\mcp_server\mcp_server.zan'
-$mcpExe = Join-Path $dist 'zan-mcp.exe'
+$distTools = Join-Path $dist 'tools'
+New-Item -ItemType Directory -Force -Path $distTools | Out-Null
+$mcpExe = Join-Path $distTools 'zan-mcp.exe'
 if (Test-Path $mcpSrc) {
-    # Beside ZanIDE.exe on purpose: the server resolves knowledge\,
-    # toolchain\zanc.exe and stdlib\ from its own directory, so the published
-    # tree stays relocatable.
+    # Under tools\ so the install root stays clean: the server resolves
+    # knowledge\, toolchain\zanc.exe and stdlib\ from the SDK root it finds one
+    # level up (McpServer.ResolveSdkDir), so the tree stays relocatable.
     # zanc writes its optimization report to stderr, and under
     # $ErrorActionPreference = "Stop" PowerShell turns a native command's stderr
     # into a terminating error whichever way the streams are redirected. Launch
@@ -299,34 +292,34 @@ if (Test-Path $mcpSrc) {
     if (Test-Path $mcpExe) {
         Write-Output "PUBLISH_MCP_OK -> $mcpExe"
     } else {
-        Write-Output "PUBLISH_WARN: could not build zan-mcp.exe; AI clients must run tools\mcp_server\mcp_server.zan themselves"
+        Write-Output "PUBLISH_WARN: could not build tools\zan-mcp.exe; AI clients must run tools\mcp_server\mcp_server.zan themselves"
     }
 } else {
     Write-Output "PUBLISH_WARN: tools\mcp_server\mcp_server.zan missing; no MCP server published"
 }
 
 if (Test-Path (Join-Path $aiPack 'AGENTS.md')) {
-    Copy-Item (Join-Path $aiPack 'AGENTS.md') (Join-Path $dist 'AGENTS.md') -Force
-    $distSkills = Join-Path $dist '.agents\skills'
+    # The pack ships as a TEMPLATE under ai\, never as live config in the
+    # install root: AGENTS.md / .mcp.json / .cursor\ / .vscode\ only mean
+    # anything inside the project you are working on, and nobody develops inside
+    # the SDK folder. "tools\zan-mcp.exe --init-agent <project>" (or the IDE
+    # assistant's one-click button) copies it into a project and expands
+    # <ZAN_MCP> / <ZAN_SDK> / <ZAN_PROJECT> there -- which is also why the
+    # placeholders are left intact here.
+    $distAi = Join-Path $dist 'ai'
+    New-Item -ItemType Directory -Force -Path $distAi | Out-Null
+    Copy-Item (Join-Path $aiPack 'AGENTS.md') (Join-Path $distAi 'AGENTS.md') -Force
+    foreach ($cfg in @('mcp.json', 'cursor.mcp.json', 'vscode.mcp.json')) {
+        $srcCfg = Join-Path $aiPack $cfg
+        if (Test-Path $srcCfg) { Copy-Item $srcCfg (Join-Path $distAi $cfg) -Force }
+    }
+    $aiReadme = Join-Path $aiPack 'README.md'
+    if (Test-Path $aiReadme) { Copy-Item $aiReadme (Join-Path $distAi 'README.md') -Force }
+    $distSkills = Join-Path $distAi 'skills'
     New-Item -ItemType Directory -Force -Path $distSkills | Out-Null
     Get-ChildItem (Join-Path $aiPack 'skills') -Directory -ErrorAction SilentlyContinue |
         ForEach-Object { Copy-Item $_.FullName $distSkills -Recurse -Force }
 
-    # The client configs must name a real command, so the SDK's own path is
-    # baked in here; moving the folder means re-running this script (or editing
-    # the one 'command' line).
-    $sdkPath = $dist.Replace('\', '/')
-    New-Item -ItemType Directory -Force -Path (Join-Path $dist '.cursor') | Out-Null
-    New-Item -ItemType Directory -Force -Path (Join-Path $dist '.vscode') | Out-Null
-    foreach ($cfg in @(@('mcp.json', '.mcp.json'),
-                       @('cursor.mcp.json', '.cursor\mcp.json'),
-                       @('vscode.mcp.json', '.vscode\mcp.json'))) {
-        $srcCfg = Join-Path $aiPack $cfg[0]
-        if (Test-Path $srcCfg) {
-            (Get-Content $srcCfg -Raw).Replace('<ZAN_SDK>', $sdkPath) |
-                Set-Content -Path (Join-Path $dist $cfg[1]) -Encoding UTF8
-        }
-    }
     $onboarding = Join-Path $root 'docs\AI_ONBOARDING.md'
     if (Test-Path $onboarding) {
         New-Item -ItemType Directory -Force -Path (Join-Path $dist 'docs') | Out-Null
@@ -336,7 +329,7 @@ if (Test-Path (Join-Path $aiPack 'AGENTS.md')) {
         $p = Join-Path $root "docs\$doc"
         if (Test-Path $p) { Copy-Item $p (Join-Path $dist "docs\$doc") -Force }
     }
-    Write-Output "PUBLISH_AIPACK_OK -> AGENTS.md, .agents\skills, .mcp.json, .cursor\, .vscode\, docs\AI_ONBOARDING.md"
+    Write-Output "PUBLISH_AIPACK_OK -> ai\ (AGENTS.md, skills\, mcp configs), docs\AI_ONBOARDING.md"
 } else {
     Write-Output "PUBLISH_WARN: tools\ai_pack missing; released SDK has no AGENTS.md/skills for AI clients"
 }
@@ -347,13 +340,17 @@ $readme = @"
 Zan IDE - self-contained release
 ================================
 
+This folder is the SDK installation. It is not a workspace: create your Zan
+projects anywhere else and run the IDE from here.
+
 Contents
   ZanIDE.exe     The Zan IDE. It runs from this folder; SDL3 is statically
-                 linked in, and ide.css/stdlib/toolchain resolve from here.
-  ide.css        The IDE's page-layout stylesheet.
-  (skins)        Skin packs are baked into ZanIDE.exe (embedded resources) and
-                 read from memory -- no skins\ folder is required. Drop a
-                 skins\ folder next to the exe only to override/add packs.
+                 linked in, and stdlib/toolchain resolve from here.
+  (skins, ide.css, help topics)
+                 Baked into ZanIDE.exe as embedded resources and read from
+                 memory -- no files required beside the exe. A file of the same
+                 name next to the exe (ide.css, skins\, docs\topics.json) still
+                 wins, which is how you override one without a rebuild.
   toolchain\     The Zan compiler and everything it links with, all as siblings:
                    zanc.exe                the compiler
                    zan-lsp.exe             language server (for external editors)
@@ -377,31 +374,45 @@ Contents
   templates\     Built-in New Project templates (one folder each, with a
                  template.manifest). Edit or drop in your own folders to add
                  templates -- no rebuild needed.
-  tools\         Zan tools shown in the IDE's Tools panel. Double-click a tool
-                 to run it; right-click to open its source in the editor.
-                 Drop your own .zan tools here -- no rebuild needed.
+  tools\         Zan tools shown in the IDE's Tools panel (double-click to run,
+                 right-click to open the source), plus zan-mcp.exe -- the MCP
+                 server for AI clients. See the AI section below.
+  ai\            Templates installed into your own projects by
+                 "tools\zan-mcp.exe --init-agent" (see below).
 
 AI coding tools (Claude Code / Cursor / Copilot / Windsurf)
-  zan-mcp.exe    MCP server. Started by AI clients as
-                   zan-mcp.exe --stdio .
-                 and it answers the questions a model would otherwise guess at:
+  Enable them per PROJECT, not here. Two ways, same implementation:
+
+    In the IDE   Assistant panel -> "为当前项目启用 AI 接入" (one click on the
+                 project you have open).
+    Without it   tools\zan-mcp.exe --init-agent D:\path\to\your-project
+                 (add --force to overwrite files that already exist)
+
+  Either one writes into THAT project, with this SDK's paths filled in:
+    AGENTS.md            the rules an AI agent must follow in Zan code
+    .agents\skills\      zan-development / zan-debugging / zan-mcp workflows
+    .mcp.json            Claude Code and most clients
+    .cursor\mcp.json     Cursor
+    .vscode\mcp.json     VS Code / Copilot
+  Then open that project in your AI editor and it starts the server itself.
+  Existing files are kept, not overwritten, and reported.
+
+  tools\zan-mcp.exe
+                 The MCP server behind all of it, run as
+                   tools\zan-mcp.exe --stdio <your project dir>
+                 It answers what a model would otherwise guess at:
                  zan_start_here (project layout, commands, rules, tools in one
                  call), zan_api_search (exact stdlib signatures), zan_example
                  (shipped, build-verified programs), zan_compile /
                  zan_build_project (structured diagnostics), plus workspace
                  file access. Add --read-only or --no-exec to restrict it;
-                 without --stdio it serves the same API over HTTP.
-  AGENTS.md      The rules an AI agent must follow in a Zan project. Copy it
-                 into your own project; Claude Code, Cursor, Copilot and Devin
-                 read it automatically.
-  .agents\skills\  zan-development and zan-debugging: the fixed workflows
-                 (look the API up -> edit -> compile -> run; diagnostics ->
-                 leak check -> zan-lsp -> zan-dap).
-  .mcp.json      Ready-made client configs -- copy the matching one into your
-  .cursor\       project and restart the editor: .mcp.json (Claude Code and
-  .vscode\       most clients), .cursor\mcp.json, .vscode\mcp.json. They point
-                 at this folder's zan-mcp.exe, so update the command if you
-                 move the SDK.
+                 without --stdio it serves the same API over HTTP. It finds
+                 knowledge\, toolchain\ and stdlib\ one level up on its own
+                 (--sdk-root <dir> overrides).
+  ai\            The templates the two commands above install (AGENTS.md,
+                 skills\, mcp.json / cursor.mcp.json / vscode.mcp.json). They
+                 still carry <ZAN_MCP> / <ZAN_SDK> / <ZAN_PROJECT> placeholders,
+                 so use --init-agent rather than copying them by hand.
   docs\AI_ONBOARDING.md
                  The full connection guide (also covers zan-lsp / zan-dap for
                  editors that speak LSP/DAP directly).

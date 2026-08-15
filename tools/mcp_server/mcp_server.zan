@@ -55,6 +55,18 @@ using System.Threading;
 ///     --knowledge <dir>  directory holding symbols.json / gallery.json
 ///     --zanc <path>      Zan compiler used by the optional zan_* tools
 ///     --stdlib <dir>     stdlib passed to that compiler
+///     --sdk-root <dir>   SDK installation root; defaults to the directory the
+///                        executable lives in, or its parent when the exe sits
+///                        in a subdirectory of the SDK (the release ships it as
+///                        <sdk>\tools\zan-mcp.exe)
+///
+/// One-shot mode, no server involved:
+///   mcp_server --init-agent [project-dir] [--force]
+///     Installs the AI onboarding pack from <sdk>\ai into a project:
+///     AGENTS.md, .agents\skills\, .mcp.json, .cursor\mcp.json,
+///     .vscode\mcp.json, with <ZAN_SDK> / <ZAN_MCP> / <ZAN_PROJECT> expanded
+///     for this installation. Existing files are kept unless --force is given.
+///     project-dir defaults to the current directory.
 ///
 /// Environment fallbacks: MCP_HOST, MCP_PORT, MCP_TOKEN, MCP_ROOT.
 ///
@@ -85,6 +97,8 @@ class McpServer {
     static string galleryPath;
     static string zancPath;
     static string stdlibPath;
+    /// SDK installation root (holds stdlib\, toolchain\, knowledge\, ai\).
+    static string sdkRoot;
     static string workRoot;
     static int compileSeq;
 
@@ -157,6 +171,10 @@ class McpServer {
         McpServer.compileSeq = 0;
         McpServer.parseError = "";
         McpServer.stdio = false;
+        McpServer.sdkRoot = "";
+        bool initAgent = false;
+        string initTarget = "";
+        bool force = false;
 
         int i = 0;
         int argc = Environment.ArgCount();
@@ -197,6 +215,19 @@ class McpServer {
             if (a == "--stdlib" && hasNext) {
                 McpServer.stdlibPath = Environment.ArgAt(i + 1); i = i + 2; continue;
             }
+            if (a == "--sdk-root" && hasNext) {
+                McpServer.sdkRoot = Environment.ArgAt(i + 1); i = i + 2; continue;
+            }
+            if (a == "--init-agent") {
+                initAgent = true;
+                if (hasNext && !McpServer.IsOption(Environment.ArgAt(i + 1))) {
+                    initTarget = Environment.ArgAt(i + 1); i = i + 2; continue;
+                }
+                i = i + 1; continue;
+            }
+            if (a == "--force") {
+                force = true; i = i + 1; continue;
+            }
             if (a == "--stdio") {
                 McpServer.stdio = true; i = i + 1; continue;
             }
@@ -217,18 +248,37 @@ class McpServer {
         }
         McpServer.root = McpServer.TrimTrailingSep(McpServer.root);
 
-        // The optional Zan tools look next to the executable first, so the
-        // published package (exe + toolchain/ + stdlib/ + knowledge/) stays
-        // relocatable, then fall back to the workspace for repo checkouts.
+        // The optional Zan tools resolve against the SDK root, so the published
+        // package (ZanIDE.exe + toolchain/ + stdlib/ + knowledge/ + ai/ with the
+        // server under tools/) stays relocatable, then fall back to the
+        // workspace for repo checkouts.
         string exeDir = McpServer.TrimTrailingSep(Environment.ExeDir());
+        if (McpServer.sdkRoot == "") {
+            McpServer.sdkRoot = McpServer.ResolveSdkDir(exeDir);
+        }
+        McpServer.sdkRoot = McpServer.TrimTrailingSep(McpServer.sdkRoot);
+        string sdk = McpServer.sdkRoot;
+
+        if (initAgent) {
+            int initRc = McpServer.InitAgent(initTarget, exeDir, force);
+            McpServer.PlatExit(initRc);
+            return;
+        }
+
         if (McpServer.knowledge == "") {
-            McpServer.knowledge = exeDir + "/knowledge";
+            McpServer.knowledge = sdk + "/knowledge";
+            if (!Directory.Exists(McpServer.knowledge)) {
+                McpServer.knowledge = exeDir + "/knowledge";
+            }
             if (!Directory.Exists(McpServer.knowledge)) {
                 McpServer.knowledge = McpServer.root + "/.zanmap";
             }
         }
         if (McpServer.zancPath == "") {
-            McpServer.zancPath = exeDir + "/toolchain/zanc" + McpServer.ExeSuffix();
+            McpServer.zancPath = sdk + "/toolchain/zanc" + McpServer.ExeSuffix();
+            if (!File.Exists(McpServer.zancPath)) {
+                McpServer.zancPath = exeDir + "/toolchain/zanc" + McpServer.ExeSuffix();
+            }
             if (!File.Exists(McpServer.zancPath)) {
                 McpServer.zancPath = exeDir + "/zanc" + McpServer.ExeSuffix();
             }
@@ -237,7 +287,10 @@ class McpServer {
             }
         }
         if (McpServer.stdlibPath == "") {
-            McpServer.stdlibPath = exeDir + "/stdlib";
+            McpServer.stdlibPath = sdk + "/stdlib";
+            if (!Directory.Exists(McpServer.stdlibPath)) {
+                McpServer.stdlibPath = exeDir + "/stdlib";
+            }
             if (!Directory.Exists(McpServer.stdlibPath)) {
                 McpServer.stdlibPath = McpServer.root + "/stdlib";
             }
@@ -299,6 +352,235 @@ class McpServer {
 
     static bool ZanToolsAvailable() {
         return File.Exists(McpServer.zancPath);
+    }
+
+    // ---- SDK layout ---------------------------------------------------------
+
+    [DllImport("crt", EntryPoint = "exit")]
+    static extern void PlatExit(int code);
+
+    static bool IsOption(string a) {
+        return a.Length >= 2 && a.Substring(0, 2) == "--";
+    }
+
+    /// True when `dir` looks like an installed SDK (or a repo checkout): the
+    /// pieces the server hands to zanc live directly under it.
+    static bool LooksLikeSdk(string dir) {
+        if (Directory.Exists(dir + "/stdlib")) { return true; }
+        if (Directory.Exists(dir + "/toolchain")) { return true; }
+        return Directory.Exists(dir + "/ai");
+    }
+
+    /// Where the SDK is installed, given the directory the executable sits in.
+    /// The release ships the server as <sdk>\tools\zan-mcp.exe, so the parent
+    /// wins whenever the exe's own directory carries none of the SDK folders.
+    static string ResolveSdkDir(string exeDir) {
+        if (McpServer.LooksLikeSdk(exeDir)) { return exeDir; }
+        string up = McpServer.ParentOf(exeDir);
+        if (up != "" && McpServer.LooksLikeSdk(up)) { return up; }
+        return exeDir;
+    }
+
+    // ---- --init-agent -------------------------------------------------------
+
+    /// Installs the AI onboarding pack into a project directory. The pack ships
+    /// as a template under <sdk>\ai because AGENTS.md / .mcp.json / .cursor\ /
+    /// .vscode\ only mean anything inside the project being worked on, never in
+    /// the SDK folder. Returns a process exit code.
+    static int InitAgent(string target, string exeDir, bool force) {
+        string project = target;
+        if (project == "" || project == "." || project == "./") {
+            project = Directory.GetCurrentDirectory();
+        }
+        project = McpServer.TrimTrailingSep(project);
+        // The configs record this path for the client, which runs from its own
+        // working directory: only an absolute one survives.
+        if (!McpServer.IsAbsolute(project)) {
+            project = McpServer.TrimTrailingSep(Directory.GetCurrentDirectory())
+                + "/" + project;
+        }
+        if (!Directory.Exists(project)) {
+            Console.WriteLine("error: project directory not found: " + project);
+            return 2;
+        }
+
+        string pack = McpServer.sdkRoot + "/ai";
+        if (!Directory.Exists(pack)) {
+            // Repo checkout: the same files live where they are authored.
+            pack = McpServer.sdkRoot + "/tools/ai_pack";
+        }
+        if (!Directory.Exists(pack)) {
+            Console.WriteLine("error: AI pack not found; looked for "
+                + McpServer.ToNative(McpServer.sdkRoot + "/ai") + " and "
+                + McpServer.ToNative(McpServer.sdkRoot + "/tools/ai_pack"));
+            Console.WriteLine("       pass --sdk-root <sdk install dir> if the"
+                + " server was moved out of the SDK.");
+            return 2;
+        }
+
+        string mcpExe = exeDir + "/zan-mcp" + McpServer.ExeSuffix();
+        if (!File.Exists(mcpExe)) {
+            mcpExe = exeDir + "/mcp_server" + McpServer.ExeSuffix();
+        }
+
+        Console.WriteLine("Installing the Zan AI pack");
+        Console.WriteLine("  sdk     : " + McpServer.ToNative(McpServer.sdkRoot));
+        Console.WriteLine("  pack    : " + McpServer.ToNative(pack));
+        Console.WriteLine("  project : " + McpServer.ToNative(project));
+
+        int written = 0;
+        // AGENTS.md and the skills are documentation: they read better with the
+        // platform's own separators. The mcp configs are JSON, where a Windows
+        // backslash would have to be escaped, so those keep forward slashes --
+        // CreateProcess accepts them just as well.
+        written = written + McpServer.InstallOne(pack + "/AGENTS.md",
+            project + "/AGENTS.md", project, mcpExe, false, force);
+        written = written + McpServer.InstallOne(pack + "/mcp.json",
+            project + "/.mcp.json", project, mcpExe, true, force);
+        written = written + McpServer.InstallOne(pack + "/cursor.mcp.json",
+            project + "/.cursor/mcp.json", project, mcpExe, true, force);
+        written = written + McpServer.InstallOne(pack + "/vscode.mcp.json",
+            project + "/.vscode/mcp.json", project, mcpExe, true, force);
+
+        string skills = pack + "/skills";
+        if (Directory.Exists(skills)) {
+            written = written + McpServer.InstallTree(skills,
+                project + "/.agents/skills", project, mcpExe, force);
+        }
+
+        Console.WriteLine("INIT_AGENT_OK " + Convert.ToString(written)
+            + " file(s) written into " + McpServer.ToNative(project));
+        if (!File.Exists(mcpExe)) {
+            Console.WriteLine("  note: could not locate the server executable in "
+                + McpServer.ToNative(exeDir) + "; the mcp configs point at "
+                + mcpExe + " -- edit them if that path is wrong.");
+        }
+        Console.WriteLine("  next : open the project in your AI client; it starts"
+            + " the server over stdio and should call zan_start_here first.");
+        Console.WriteLine("  files: AGENTS.md, .mcp.json, .cursor\\mcp.json,"
+            + " .vscode\\mcp.json, .agents\\skills\\");
+        if (!force) {
+            Console.WriteLine("  (files that already existed were left alone;"
+                + " pass --force to overwrite)");
+        }
+        return 0;
+    }
+
+    /// Copies one template file, expanding the installation placeholders.
+    /// Returns 1 when it wrote something, 0 when it skipped.
+    static int InstallOne(string src, string dest, string project,
+                          string mcpExe, bool json, bool force) {
+        if (!File.Exists(src)) { return 0; }
+        if (File.Exists(dest) && !force) {
+            Console.WriteLine("  keep  " + McpServer.RelOf(dest, project)
+                + " (exists)");
+            return 0;
+        }
+        string text = McpServer.Expand(File.ReadAllText(src), project, mcpExe, json);
+        McpServer.EnsureParent(dest);
+        File.WriteAllText(dest, text);
+        Console.WriteLine("  write " + McpServer.RelOf(dest, project));
+        return 1;
+    }
+
+    /// Recursively installs a template directory (the skills tree).
+    static int InstallTree(string srcDir, string destDir, string project,
+                           string mcpExe, bool force) {
+        int n = 0;
+        List<string> files = Directory.GetFiles(srcDir);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            n = n + McpServer.InstallOne(srcDir + "/" + files[i],
+                destDir + "/" + files[i], project, mcpExe, false, force);
+        }
+        List<string> dirs = Directory.GetDirectories(srcDir);
+        for (int i = 0; i < dirs.Count; i = i + 1) {
+            n = n + McpServer.InstallTree(srcDir + "/" + dirs[i],
+                destDir + "/" + dirs[i], project, mcpExe, force);
+        }
+        return n;
+    }
+
+    /// Replaces <ZAN_SDK> / <ZAN_MCP> / <ZAN_PROJECT> with this installation's
+    /// paths. JSON destinations keep forward slashes so no escaping is needed.
+    static string Expand(string text, string project, string mcpExe, bool json) {
+        string sdk = McpServer.sdkRoot;
+        string exe = mcpExe;
+        string proj = project;
+        if (json) {
+            // A lone backslash starts an escape in JSON, and every client here
+            // hands the command straight to CreateProcess, which takes forward
+            // slashes just as well -- so JSON gets the posix spelling.
+            sdk = McpServer.ToPosix(sdk);
+            exe = McpServer.ToPosix(exe);
+            proj = McpServer.ToPosix(proj);
+        } else {
+            sdk = McpServer.ToNative(sdk);
+            exe = McpServer.ToNative(exe);
+            proj = McpServer.ToNative(proj);
+        }
+        string s = McpServer.Substitute(text, "<ZAN_MCP>", exe);
+        s = McpServer.Substitute(s, "<ZAN_SDK>", sdk);
+        s = McpServer.Substitute(s, "<ZAN_PROJECT>", proj);
+        return s;
+    }
+
+    /// Replaces every occurrence of `pat` in `s` with `rep`.
+    static string Substitute(string s, string pat, string rep) {
+        if (pat.Length == 0) { return s; }
+        int at = McpServer.Find(s, pat);
+        if (at < 0) { return s; }
+        StringBuilder sb = new StringBuilder();
+        string rest = s;
+        while (at >= 0) {
+            sb.Append(rest.Substring(0, at));
+            sb.Append(rep);
+            int cut = at + pat.Length;
+            rest = rest.Substring(cut, rest.Length - cut);
+            at = McpServer.Find(rest, pat);
+        }
+        sb.Append(rest);
+        return sb.ToString();
+    }
+
+    /// True for `/x`, `\x` and `C:\x`; everything else needs the cwd prefixed.
+    static bool IsAbsolute(string p) {
+        if (p.Length == 0) { return false; }
+        int c0 = p[0] & 255;
+        if (c0 == 47 || c0 == 92) { return true; }
+        return p.Length > 1 && (p[1] & 255) == 58;
+    }
+
+    /// Path with forward slashes only, safe to embed in JSON.
+    static string ToPosix(string p) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < p.Length; i = i + 1) {
+            int c = p[i] & 255;
+            if (c == 92) { sb.Append("/"); } else { sb.Append(p.Substring(i, 1)); }
+        }
+        return sb.ToString();
+    }
+
+    /// Path with the platform's separators, for text a human reads.
+    static string ToNative(string p) {
+        #if WINDOWS
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < p.Length; i = i + 1) {
+            int c = p[i] & 255;
+            if (c == 47) { sb.Append("\\"); } else { sb.Append(p.Substring(i, 1)); }
+        }
+        return sb.ToString();
+        #else
+        return p;
+        #endif
+    }
+
+    /// `full` relative to `baseDir`, for compact progress output.
+    static string RelOf(string full, string baseDir) {
+        int n = baseDir.Length;
+        if (full.Length > n + 1 && full.Substring(0, n) == baseDir) {
+            return McpServer.ToNative(full.Substring(n + 1, full.Length - n - 1));
+        }
+        return McpServer.ToNative(full);
     }
 
     // ---- stdio transport ----------------------------------------------------

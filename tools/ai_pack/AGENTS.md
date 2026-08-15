@@ -36,8 +36,8 @@ diagnostics from the top; a later error is often a consequence of the first.
 Without MCP:
 
 ```
-<sdk>/toolchain/zanc <entry.zan> --auto-stdlib -o build/app      # debug build
-<sdk>/toolchain/zanc <entry.zan> --auto-stdlib --publish -o app  # release
+<ZAN_SDK>/toolchain/zanc <entry.zan> --auto-stdlib -o build/app      # debug build
+<ZAN_SDK>/toolchain/zanc <entry.zan> --auto-stdlib --publish -o app  # release
 ```
 
 Say what you actually ran. "Should work" is not a result.

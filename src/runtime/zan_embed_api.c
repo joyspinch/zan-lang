@@ -7,6 +7,11 @@
  * registered every read returns empty, so callers transparently fall back to
  * the filesystem.
  *
+ * A registration REPLACES the previous one (as does the copy zanc emits into an
+ * embedding program, src/compiler/embedres.c), so a program links exactly one
+ * generated object: gen_embed.ps1 takes several -Group arguments to put every
+ * resource group in that one table.
+ *
  * Kept as its own translation unit (not baked into a specific runtime) so it is
  * a single definition every consumer links against, while the *data* lives in
  * the per-program generated object. */

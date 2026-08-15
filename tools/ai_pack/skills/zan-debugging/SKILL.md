@@ -12,7 +12,7 @@ Escalate in this order; most problems die at step 1 or 2.
 ```
 zan_build_project()        # MCP: {ok, exitCode, diagnostics[], raw}
 zan_compile(content)       # MCP: same, for one snippet
-<sdk>/toolchain/zanc <entry.zan> --auto-stdlib -o build/app
+<ZAN_SDK>/toolchain/zanc <entry.zan> --auto-stdlib -o build/app
 ```
 
 Fix the **first** diagnostic first — the rest are often its fallout. Each one
@@ -35,7 +35,7 @@ does not exist; error text also goes through `Console.WriteLine`.
 ## 3. Memory / ARC
 
 ```
-<sdk>/toolchain/zanc <entry.zan> --auto-stdlib --check-leaks -o build/app
+<ZAN_SDK>/toolchain/zanc <entry.zan> --auto-stdlib --check-leaks -o build/app
 build/app
 ```
 
@@ -49,7 +49,7 @@ debugging.
 
 ## 4. Semantic questions: `zan-lsp`
 
-`<sdk>/toolchain/zan-lsp` speaks **LSP over stdio with `Content-Length`
+`<ZAN_SDK>/toolchain/zan-lsp` speaks **LSP over stdio with `Content-Length`
 framing**. Point your editor's language client at it (`command: zan-lsp`,
 `transport: stdio`, language id `zan`) and use hover / go-to-definition /
 references / completion instead of reading the standard library by hand.
@@ -62,7 +62,7 @@ There is no MCP wrapper around it: it is a protocol server, so it is the editor
 
 ## 5. Stepping: `zan-dap`
 
-`<sdk>/toolchain/zan-dap` speaks **DAP over stdio with `Content-Length`
+`<ZAN_SDK>/toolchain/zan-dap` speaks **DAP over stdio with `Content-Length`
 framing**, and drives a real native session through gdb: the bundled
 `toolchain/debugger/bin/gdb`, else `ZAN_GDB`, else a system gdb. If the bundle
 omitted gdb (it is not always relocatable), set `ZAN_GDB` to a gdb you have.

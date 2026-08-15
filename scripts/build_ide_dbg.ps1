@@ -51,18 +51,15 @@ if ($LASTEXITCODE -ne 0) { Write-Output "EMBED_API_COMPILE_FAILED"; exit 1 }
 llvm-ar rcs build\libzan_gui_ide_gnu.a build\zan_gui_ide_gnu.o build\zan_embed_api.o
 if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
 
-# Bake the skin packs (skin.css + base.css + artwork) into the IDE as embedded
-# resources so they ship inside ZanIDE.exe -- no external skins\ folder needed.
+# Bake the skin packs (skin.css + base.css + artwork), the Help page's
+# topics.json and the page-layout stylesheet into the IDE as embedded resources
+# so they ship inside ZanIDE.exe -- no external files needed. One object holds
+# all groups: registering a table replaces the previous one, so a second
+# generated object would hide these (see scripts\gen_embed.ps1).
 & powershell -ExecutionPolicy Bypass -File scripts\gen_embed.ps1 `
-    -Root stdlib\Gui\skins -Prefix skins `
+    -Group "stdlib\Gui\skins=skins;src\ide_zan\assets\docs=docs;src\ide_zan\assets=ide:*.css" `
     -OutC build\embed_gen.c -OutO build\embed_gen.o -Clang clang
 if ($LASTEXITCODE -ne 0) { Write-Output "EMBED_GEN_FAILED"; exit 1 }
-
-# The Help page's topics.json ships inside the exe the same way.
-& powershell -ExecutionPolicy Bypass -File scripts\gen_embed.ps1 `
-    -Root src\ide_zan\assets\docs -Prefix docs `
-    -OutC build\embed_docs.c -OutO build\embed_docs.o -Clang clang
-if ($LASTEXITCODE -ne 0) { Write-Output "EMBED_DOCS_FAILED"; exit 1 }
 
 
 $zanc = if (Test-Path "build\zanc.exe") { "build\zanc.exe" } else { "dist\win-x64\toolchain\zanc.exe" }
@@ -147,7 +144,6 @@ try {
     $zanArgs += @("-g")
     $zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_ide_gnu")
     $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_gen.o"))
-    $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_docs.o"))
     $zanArgs += @("--link-lib", "SDL3_s")
     $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")
     $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")
@@ -188,9 +184,10 @@ try {
     # SDL3 is statically linked: make sure no stale SDL3.dll shadows that fact.
     Remove-Item -LiteralPath (Join-Path (Get-Location) "build\SDL3.dll") `
         -Force -ErrorAction SilentlyContinue
-    # The IDE's own stylesheet (page layout) ships next to the executable.
-    Copy-Item -LiteralPath (Join-Path (Get-Location) "src\ide_zan\ide.css") `
-        -Destination (Join-Path (Get-Location) "build\ide.css") -Force
+    # The stylesheet is baked into the exe (embed_gen above); a copy beside the
+    # executable would only shadow it, so drop any stale one.
+    Remove-Item -LiteralPath (Join-Path (Get-Location) "build\ide.css") `
+        -Force -ErrorAction SilentlyContinue
     # File-backed IDE forms stay beside the dev executable during migration;
     # the shared ChildWindow loader also falls back to the source tree.
     $formsOut = Join-Path (Get-Location) "build\ide_forms"

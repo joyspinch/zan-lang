@@ -62,9 +62,9 @@ zan_compile(content)           # one snippet in an isolated dir
 Direct:
 
 ```
-<sdk>/toolchain/zanc <entry.zan> --auto-stdlib -o build/app
-<sdk>/toolchain/zanc <entry.zan> --auto-stdlib --publish -o app   # release
-<sdk>/toolchain/zanc <entry.zan> --auto-stdlib --check-leaks -o build/app
+<ZAN_SDK>/toolchain/zanc <entry.zan> --auto-stdlib -o build/app
+<ZAN_SDK>/toolchain/zanc <entry.zan> --auto-stdlib --publish -o app   # release
+<ZAN_SDK>/toolchain/zanc <entry.zan> --auto-stdlib --check-leaks -o build/app
 ```
 
 Read `diagnostics[]` (file, line, column, message) and fix from the first one
