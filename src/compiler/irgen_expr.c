@@ -3949,6 +3949,26 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                         "'%.*s' has no member '%.*s'",
                         (int)rt->name.len, rt->name.str,
                         (int)expr->member.name.len, expr->member.name.str);
+                /* And when the receiver is itself a call the class does not
+                 * declare (`t.GetType().Name`): the chain returns the 0 below
+                 * without ever emitting the inner call, so the unresolved
+                 * method went undiagnosed -- only the unchained form
+                 * (`var g = t.GetType();`) reported it. */
+                zan_ast_node_t *ro = expr->member.object;
+                if (!rt && ro->kind == AST_CALL && ro->call.callee &&
+                    ro->call.callee->kind == AST_MEMBER_ACCESS) {
+                    zan_ast_node_t *inner = ro->call.callee;
+                    zan_symbol_t *icls = expr_class_sym(g, inner->member.object,
+                                                        locals);
+                    if (icls &&
+                        (icls->kind == SYM_CLASS || icls->kind == SYM_STRUCT) &&
+                        !type_declares_member(icls, inner->member.name))
+                        zan_diag_emit(g->diag, DIAG_ERROR, inner->loc,
+                            "'%.*s' has no member '%.*s'",
+                            (int)icls->name.len, icls->name.str,
+                            (int)inner->member.name.len,
+                            inner->member.name.str);
+                }
             }
         }
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);

@@ -694,6 +694,19 @@ add_test(NAME diag_collection_unknown_member
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_collection_unknown_member PROPERTIES TIMEOUT 60)
 
+# An unresolved method call whose result is then read (`t.GetType().Name`) never
+# emitted the inner call, so the chain answered the member fallback's 0 instead
+# of reporting the missing method -- the unchained `var g = t.GetType();` was
+# diagnosed all along.
+add_test(NAME diag_unresolved_call_member_chain
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unresolved_call_member_chain.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unresolved_call_member_chain${_exe_ext}
+    "-DEXPECT_REGEX=.Thing. has no member .GetType."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_unresolved_call_member_chain PROPERTIES TIMEOUT 60)
+
 # A `"role": "control"` .zform is an embeddable Control, not a window: it has
 # no Main/Show, so naming one as the project entry has to fail at formgen time
 # instead of linking a program with no entry point.

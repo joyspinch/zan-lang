@@ -1741,6 +1741,36 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 return ft;
             }
         }
+        /* Properties of the compiler's built-in types (string.Length,
+         * List.Count, Dictionary.Count, StringBuilder.Length, array.Length)
+         * have no field symbol, so everything above misses them and the
+         * inferred type was NULL. Any lowering that keys off the receiver's
+         * static type then declined the expression -- `xs.Count.ToString()`
+         * fell through to the constant-0 fallback and printed "0". The result
+         * type comes from the same table the diagnostics and --emit-symbols
+         * use (builtin_api.c). */
+        if (ot) {
+            const char *bt = NULL;
+            if (ot->kind == TYPE_STRING) bt = "string";
+            else if (type_named(ot, "List", 4)) bt = "List";
+            else if (type_named(ot, "Dict", 4)) bt = "Dict";
+            else if (type_named(ot, "StringBuilder", 13)) bt = "StringBuilder";
+            if (bt && zan_builtin_member_kind(bt, e->member.name.str,
+                                              (int)e->member.name.len) == 'P') {
+                const char *res = zan_builtin_member_result(
+                    bt, e->member.name.str, (int)e->member.name.len);
+                if (res) {
+                    if (strcmp(res, "int") == 0) return g->binder->type_int;
+                    if (strcmp(res, "long") == 0) return g->binder->type_long;
+                    if (strcmp(res, "bool") == 0) return g->binder->type_bool;
+                    if (strcmp(res, "double") == 0) return g->binder->type_double;
+                    if (strcmp(res, "string") == 0) return g->binder->type_string;
+                }
+            }
+            if (ot->kind == TYPE_ARRAY && e->member.name.len == 6 &&
+                memcmp(e->member.name.str, "Length", 6) == 0)
+                return g->binder->type_int;
+        }
         return NULL;
     }
     case AST_INDEX: {
