@@ -647,7 +647,10 @@ static u32 grad_sample(u32 from, u32 via, u32 to, int t) {
 }
 
 /* Linear gradient fill cut to a rounded-rect mask, in the direction `dir`
- * (0 = top-to-bottom, 1 = left-to-right) with an optional middle stop.
+ * (0 = top-to-bottom, 1 = left-to-right, 2 = to bottom-right, 3 = to
+ * bottom-left) with an optional middle stop. A diagonal samples the stop at
+ * the pixel's distance along the diagonal axis, so both ends sit on the
+ * corners the CSS keyword names.
  * Blended per pixel (so translucent stops composite over the backdrop) and
  * anti-aliased on the corner arcs: a gradient painted as bands of FillRect
  * inset row by row leaves the corners as a staircase that a 1px arc outline
@@ -669,7 +672,9 @@ EXPORT void zan_gui_fill_grad_mask(
     if (r > 0 && (m & 15) == 0) r = 0;
     if (r > (int)w / 2) r = (int)w / 2;
     if (r > (int)h / 2) r = (int)h / 2;
-    int span = (int)(((int)dir == 1) ? w : h);
+    int d = (int)dir;
+    int span = (d == 1) ? (int)w : (int)h;
+    if (d == 2 || d == 3) span = (int)w + (int)h - 1;
     if (span < 1) span = 1;
     int denom = span > 1 ? span - 1 : 1;
     ZAN_STAT(g_st_grad, (long long)(x1 - x0) * (long long)(y1 - y0));
@@ -677,7 +682,7 @@ EXPORT void zan_gui_fill_grad_mask(
     for (int py = y0; py < y1; py++) {
         u32 *row = s->pixels + py * s->stride;
         u32 c = 0;
-        if ((int)dir != 1) {
+        if (d == 0) {
             c = grad_sample(cf, cv, ct,
                 clamp_i(py - (int)y, 0, denom) * 1000 / denom);
             /* Straight part of a vertical gradient: one colour for the whole
@@ -689,8 +694,14 @@ EXPORT void zan_gui_fill_grad_mask(
             }
         }
         for (int px = x0; px < x1; px++) {
-            if ((int)dir == 1) c = grad_sample(cf, cv, ct,
-                clamp_i(px - (int)x, 0, denom) * 1000 / denom);
+            if (d != 0) {
+                int i = px - (int)x;
+                int pos = i;
+                if (d == 2) pos = i + (py - (int)y);
+                else if (d == 3) pos = ((int)w - 1 - i) + (py - (int)y);
+                c = grad_sample(cf, cv, ct,
+                    clamp_i(pos, 0, denom) * 1000 / denom);
+            }
             int cov = r <= 0 ? 255
                 : zan_round_cov(px - (int)x, py - (int)y, (int)w, (int)h, r, m);
             if (cov <= 0) continue;
