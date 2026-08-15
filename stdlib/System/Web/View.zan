@@ -164,7 +164,11 @@ class View {
     /// Each module can therefore have its own look-and-feel while sharing a
     /// global default when no per-module layout is present.</summary>
     string RenderPage(string name, ViewData data) {
-        string inner = this.Render(name, data);
+        if (this.devReload) { this.LoadAll(); }
+        List<VNode> page = null;
+        if (!this.compiled.TryGetValue(name, out page)) {
+            page = View.Compile("<!-- view not found: " + name + " -->");
+        }
         // Derive module from the first segment of the view key ("A.B.C" -> "A").
         string layoutKey = "layout";
         int dot = name.IndexOf(".");
@@ -172,12 +176,16 @@ class View {
             string modLayout = name.Substring(0, dot) + ".layout";
             if (this.compiled.ContainsKey(modLayout)) { layoutKey = modLayout; }
         }
-        List<VNode> layout = null;
-        if (!this.compiled.TryGetValue(layoutKey, out layout)) { return inner; }
-        // The layout's {{content}} hole receives the rendered view directly,
-        // so wrapping a page costs no extra scan of the finished layout.
         StringBuilder sb = new StringBuilder();
-        View.Emit(layout, data, null, inner, sb);
+        List<VNode> layout = null;
+        if (!this.compiled.TryGetValue(layoutKey, out layout)) {
+            View.Emit(page, data, null, null, sb);
+            return sb.ToString();
+        }
+        // The page is emitted straight into the layout's {{content}} hole:
+        // wrapping costs no intermediate page string and no second pass over
+        // the finished layout.
+        View.Emit(layout, data, null, page, sb);
         return sb.ToString();
     }
 
@@ -237,11 +245,12 @@ class View {
         return nodes;
     }
 
-    // Walk a compiled template, appending to `sb`. `content` fills a layout's
-    // {{content}} hole; outside a layout the placeholder is emitted unchanged,
-    // matching the old text-substitution behavior.
+    // Walk a compiled template, appending to `sb`. `content` are the page nodes
+    // that fill a layout's {{content}} hole; without them (a plain Render) the
+    // placeholder is emitted unchanged, matching the old text-substitution
+    // behavior.
     static void Emit(List<VNode> nodes, ViewData data, StrMap row,
-                     string content, StringBuilder sb) {
+                     List<VNode> content, StringBuilder sb) {
         for (int i = 0; i < nodes.Count; i = i + 1) {
             VNode nd = nodes[i];
             if (nd.kind == 0) {
@@ -265,21 +274,31 @@ class View {
                 }
             } else {
                 if (content == null) { sb.Append("{{content}}"); }
-                else { sb.Append(content); }
+                else { View.Emit(content, data, row, null, sb); }
             }
         }
     }
 
+    // Row fields shadow the global ViewData. Each map is scanned once (StrMap
+    // is a small linear map, so Has()+Get() used to walk it twice per tag).
     static string Lookup(string key, ViewData data, StrMap row) {
-        if (row != null && row.Has(key)) { return row.Get(key); }
-        if (data != null) { return data.vars.Get(key); }
+        if (row != null) {
+            int at = row.IndexOfKey(key);
+            if (at >= 0) { return row.ValAt(at); }
+        }
+        if (data != null) {
+            int g = data.vars.IndexOfKey(key);
+            if (g >= 0) { return data.vars.ValAt(g); }
+        }
         return "";
     }
 
     /// <summary>Escapes &lt; &gt; &amp; " so variables are XSS-safe by default.</summary>
     static string HtmlEscape(string s) {
-        // Fast path: nothing to escape (the common case) -- avoid the
-        // per-character StringBuilder scan entirely.
+        // Fast path: nothing to escape (the common case). The four native
+        // IndexOf() scans beat a per-character loop here -- indexing a string
+        // from Zan costs far more than a strchr pass (measured: a single-pass
+        // char loop cost ~16% throughput on the MVC home page).
         if (s.IndexOf("<") < 0 && s.IndexOf(">") < 0
             && s.IndexOf("&") < 0 && s.IndexOf("\"") < 0) {
             return s;
@@ -289,16 +308,13 @@ class View {
         int start = 0;
         for (int i = 0; i < n; i = i + 1) {
             int c = s[i] & 255;
-            string esc = "";
-            if (c == 60) { esc = "&lt;"; }        // '<'
-            else if (c == 62) { esc = "&gt;"; }   // '>'
-            else if (c == 38) { esc = "&amp;"; }  // '&'
-            else if (c == 34) { esc = "&quot;"; } // '"'
-            if (esc.Length > 0) {
-                if (i > start) { sb.Append(s.Substring(start, i - start)); }
-                sb.Append(esc);
-                start = i + 1;
-            }
+            if (c != 60 && c != 62 && c != 38 && c != 34) { continue; }
+            if (i > start) { sb.Append(s.Substring(start, i - start)); }
+            if (c == 60) { sb.Append("&lt;"); }
+            else if (c == 62) { sb.Append("&gt;"); }
+            else if (c == 38) { sb.Append("&amp;"); }
+            else { sb.Append("&quot;"); }
+            start = i + 1;
         }
         if (n > start) { sb.Append(s.Substring(start, n - start)); }
         return sb.ToString();
