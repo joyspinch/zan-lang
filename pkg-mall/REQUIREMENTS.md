@@ -50,7 +50,7 @@ Zan 语言生态的**扩展与程序商城**（package mall）：为 Zan 语言�
 
 - 角色：`user` / `developer` / `admin`；开发者审核通过后 role 升为 `developer`。
 
-### 3.2 开发者与商品（Developer + MallAdmin）`[完成]`
+### 3.2 开发者与商品（Developer + admin）`[完成]`
 
 | 接口 | 说明 | 约束 |
 |---|---|---|
@@ -59,12 +59,12 @@ Zan 语言生态的**扩展与程序商城**（package mall）：为 Zan 语言�
 | `POST api/developer/version` | 提交版本 | 需归属商品；version、major_version≥1、artifact_url 必填；status=pending |
 | `POST api/developer/plan` | 添加价格方案 | license_mode ∈ {once, periodic}；price_points≥0；periodic 需 duration_days≥1；佣金默认 10% |
 | `POST api/developer/withdraw` | 申请提现 | 余额=Σ(developer_ledger)−Σ(pending 提现)；amount≥1、account≥3 |
-| `POST api/malladmin/codes` | 生成卡密 | count 1-100、points≥1；返回明文（仅此一次），库中只存 SHA-256 digest |
-| `POST api/malladmin/developer` | 审核开发者 | pending→approved（升 role）/rejected，记 review_note |
-| `POST api/malladmin/product` | 审核商品 | pending→approved/rejected |
-| `POST api/malladmin/version` | 审核版本 | pending→approved/rejected，记 review_note；**批准时无私钥/签名失败则拒绝**（见 §3.6） |
-| `POST api/malladmin/withdrawal` | 审核提现 | 批准后 developer_ledger 记 `withdrawal` 负 delta |
-| `POST api/malladmin/entitlement` | 停用授权 | entitlements.disabled 置位 |
+| `POST api/admin/codes` | 生成卡密 | count 1-100、points≥1；返回明文（仅此一次），库中只存 SHA-256 digest |
+| `POST api/admin/developer` | 审核开发者 | pending→approved（升 role）/rejected，记 review_note |
+| `POST api/admin/product` | 审核商品 | pending→approved/rejected |
+| `POST api/admin/version` | 审核版本 | pending→approved/rejected，记 review_note；**批准时无私钥/签名失败则拒绝**（见 §3.6） |
+| `POST api/admin/withdrawal` | 审核提现 | 批准后 developer_ledger 记 `withdrawal` 负 delta |
+| `POST api/admin/entitlement` | 停用授权 | entitlements.disabled 置位 |
 
 ### 3.3 商城交易（Mall）`[完成]`
 
