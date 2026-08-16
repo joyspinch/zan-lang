@@ -33,6 +33,11 @@ class Schema {
         IDbConnection db = await ctx.Acquire();
         if (db == null) { return false; }
         try {
+            // WAL, on SQLite only (a no-op elsewhere): one file is shared by
+            // every worker process, and in the default journal a writer blocks
+            // readers -- one save would stall every page being read. The wait
+            // for the single writer is the driver's busy timeout.
+            await DbSchema.UseWriteAheadLogAsync(db);
             // Every [Table] class in the build, in one call: the compiler
             // knows them all, so a new model needs no line here and no model
             // can be forgotten.
@@ -423,6 +428,39 @@ class Schema {
             + Convert.ToString(keys.Count) + " 条屏掩码");
     }
 
+    /// <summary>Re-keys grants stored under a screen key that no longer exists
+    /// to the one that means the same screen ("Comments" ->
+    /// "Admin.Content.Comments"), which is the keys written before the module
+    /// prefix became part of every action name. A key that matches no screen or
+    /// several is left alone and named: the grant dialog shows it as an unknown
+    /// screen, which an operator can decide about -- guessing here would be
+    /// hanging a role's rights on a name collision.</summary>
+    static async void MigrateGrantKeys(IDbConnection db) {
+        List<RoleGrant> rows = await db.Select<RoleGrant>()
+            .Where(a => a.mask != 0).ToListAsync();
+        int moved = 0;
+        List<string> stray = new List<string>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            RoleGrant g = rows[i];
+            if (Perm.MaskOf(g.action) != 0) { continue; }
+            string now = Perm.Qualify(g.action);
+            if (now.Length == 0) { stray.Add(g.action); continue; }
+            int gid = g.id;
+            int _n = await db.Update<RoleGrant>().Set(a => a.action, now)
+                .Where(a => a.id == gid).ExecuteAffrowsAsync();
+            moved = moved + 1;
+        }
+        if (moved > 0) {
+            Console.WriteLine("[rbac] " + Convert.ToString(moved)
+                + " 条授权已改用带模块前缀的屏键");
+        }
+        if (stray.Count > 0) {
+            Console.WriteLine("[rbac] " + Convert.ToString(stray.Count)
+                + " 条授权的屏幕已不存在，保留未动: "
+                + Perm.Join(stray, 8));
+        }
+    }
+
     /// <summary>Grants the built-in roles the protected route actions they do
     /// not hold yet. Safe on every boot; nothing is ever removed.</summary>
     static async void SyncRoleGrants(WebApp app) {
@@ -430,6 +468,7 @@ class Schema {
         if (db == null) { return; }
         try {
             await Schema.MigrateGrants(db);
+            await Schema.MigrateGrantKeys(db);
             Role admin = await db.Select<Role>()
                 .Where(a => a.code == "admin").FirstAsync();
             Role editor = await db.Select<Role>()
