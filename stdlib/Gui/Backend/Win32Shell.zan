@@ -247,6 +247,13 @@ class Win32Shell {
     static int evKeyCode;
     static int evMods;
     static bool hasEvent;
+    // 窗口过程投递的事件队列（kind,x,y,button,keycode,mods 六元组 +
+    // 平行的 hwnd 列表）。事件不能只存一个槽位：嵌套的消息泵——原生
+    // 子窗口（CEF/WebView 的 Chromium 视图）在一帧里被驱动时，
+    // cef_do_message_loop_work 会顺手把线程队列里的 WM_CHAR/WM_KEYDOWN
+    // 分发给我们的窗口过程——会在应用取走之前覆盖掉槽位，按键就凭空丢了。
+    static List<int> postQ;
+    static List<nint> postHwnd;
 
     static int windowWidth;
     static int windowHeight;
@@ -345,6 +352,8 @@ class Win32Shell {
         Win32Shell.dirty = new List<int>();
         Win32Shell.injectQ = new List<int>();
         Win32Shell.injectHwnd = new List<nint>();
+        Win32Shell.postQ = new List<int>();
+        Win32Shell.postHwnd = new List<nint>();
         Win32Shell.hitGuards = new List<int>();
         Win32Shell.hitGuardWins = new List<nint>();
         Win32Shell.lastSurface = 0 - 1;
@@ -421,14 +430,35 @@ class Win32Shell {
     /// 因此子窗口一旦存在，父级点击就被当作"不是我的"丢弃。
     static void Post(nint hwnd, int kind, int x, int y, int button, int keycode,
                      int mods) {
-        Win32Shell.evHwnd = hwnd;
-        Win32Shell.evKind = kind;
-        Win32Shell.evX = x;
-        Win32Shell.evY = y;
-        Win32Shell.evButton = button;
-        Win32Shell.evKeyCode = keycode;
-        Win32Shell.evMods = mods;
-        Win32Shell.hasEvent = true;
+        if (Win32Shell.postQ == null) {
+            Win32Shell.postQ = new List<int>();
+            Win32Shell.postHwnd = new List<nint>();
+        }
+        int n = Win32Shell.postHwnd.Count;
+        // 鼠标移动（kind 1）只有最新位置有意义：与队尾的移动合并，
+        // 免得一次嵌套泵攒出几十帧的陈旧轨迹。
+        if (kind == 1 && n > 0 && Win32Shell.postQ[(n - 1) * 6] == 1
+            && Win32Shell.postHwnd[n - 1] == hwnd) {
+            Win32Shell.postQ[(n - 1) * 6 + 1] = x;
+            Win32Shell.postQ[(n - 1) * 6 + 2] = y;
+            Win32Shell.postQ[(n - 1) * 6 + 3] = button;
+            Win32Shell.postQ[(n - 1) * 6 + 4] = keycode;
+            Win32Shell.postQ[(n - 1) * 6 + 5] = mods;
+            return;
+        }
+        // 应用长时间不取（例如卡在一次很慢的绘制里）时丢最老的，
+        // 队列有界优先于无限增长。
+        if (n >= 512) {
+            for (int i = 0; i < 6; i = i + 1) { Win32Shell.postQ.RemoveAt(0); }
+            Win32Shell.postHwnd.RemoveAt(0);
+        }
+        Win32Shell.postQ.Add(kind);
+        Win32Shell.postQ.Add(x);
+        Win32Shell.postQ.Add(y);
+        Win32Shell.postQ.Add(button);
+        Win32Shell.postQ.Add(keycode);
+        Win32Shell.postQ.Add(mods);
+        Win32Shell.postHwnd.Add(hwnd);
     }
 
     /// 收集文件拖放的路径，并在
@@ -1706,16 +1736,36 @@ class Win32Shell {
         return got;
     }
 
+    /// 取出窗口过程排队的一个事件（队列空则 false）。
+    static bool DrainPosted() {
+        if (Win32Shell.postHwnd == null || Win32Shell.postHwnd.Count == 0) {
+            return false;
+        }
+        Win32Shell.evKind = Win32Shell.postQ[0];
+        Win32Shell.evX = Win32Shell.postQ[1];
+        Win32Shell.evY = Win32Shell.postQ[2];
+        Win32Shell.evButton = Win32Shell.postQ[3];
+        Win32Shell.evKeyCode = Win32Shell.postQ[4];
+        Win32Shell.evMods = Win32Shell.postQ[5];
+        for (int i = 0; i < 6; i = i + 1) { Win32Shell.postQ.RemoveAt(0); }
+        Win32Shell.evHwnd = Win32Shell.postHwnd[0];
+        Win32Shell.postHwnd.RemoveAt(0);
+        Win32Shell.hasEvent = true;
+        return true;
+    }
+
     static int PollEvent() {
         Win32Shell.Init();
         Win32Shell.ClearEvent();
         if (Win32Shell.DrainInjected()) { return 0; }
+        // 先把上一帧（含嵌套消息泵）攒下的事件排空，再泵新消息。
+        if (Win32Shell.DrainPosted()) { return 0; }
         nint msg = Win32Shell.scratchMsg;
         while (Win32Shell.PeekMessageW(msg, 0, 0, 0, 1) != 0) {
             if (Win32Shell.S32(msg, 8) == 18) { return 0 - 1; }  // WM_QUIT
             Win32Shell.TranslateMessage(msg);
             Win32Shell.DispatchMessageW(msg);
-            if (Win32Shell.hasEvent) { return 0; }
+            if (Win32Shell.DrainPosted()) { return 0; }
         }
         return 1;
     }
@@ -1724,10 +1774,12 @@ class Win32Shell {
         Win32Shell.Init();
         Win32Shell.ClearEvent();
         if (Win32Shell.DrainInjected()) { return 0; }
+        if (Win32Shell.DrainPosted()) { return 0; }
         nint msg = Win32Shell.scratchMsg;
         if (Win32Shell.GetMessageW(msg, 0, 0, 0) <= 0) { return 0 - 1; }
         Win32Shell.TranslateMessage(msg);
         Win32Shell.DispatchMessageW(msg);
+        Win32Shell.DrainPosted();
         return 0;
     }
 
@@ -1735,6 +1787,7 @@ class Win32Shell {
         Win32Shell.Init();
         Win32Shell.ClearEvent();
         if (Win32Shell.DrainInjected()) { return 0; }
+        if (Win32Shell.DrainPosted()) { return 0; }
         if (ms < 0) { ms = 0; }
         int start = Win32Shell.GetTickCount();
         nint msg = Win32Shell.scratchMsg;
@@ -1743,7 +1796,7 @@ class Win32Shell {
                 if (Win32Shell.S32(msg, 8) == 18) { return 0 - 1; }
                 Win32Shell.TranslateMessage(msg);
                 Win32Shell.DispatchMessageW(msg);
-                if (Win32Shell.hasEvent) { return 0; }
+                if (Win32Shell.DrainPosted()) { return 0; }
             }
             int elapsed = Win32Shell.GetTickCount() - start;
             if (elapsed >= ms) { return 1; }

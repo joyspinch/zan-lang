@@ -107,7 +107,18 @@ static zc_cef_t zc;
 
 static void *zc_open(const char *path) {
 #ifdef _WIN32
-    return (void *)LoadLibraryA(path);
+    /* libcef.dll pulls in siblings (chrome_elf.dll, libEGL.dll, ...) from its
+     * own directory, which is not on the loader's search path: without
+     * LOAD_WITH_ALTERED_SEARCH_PATH the load fails with ERROR_MOD_NOT_FOUND
+     * even though the whole runtime is unpacked next to it. */
+    /* That flag also wants a real Win32 path, so '/' becomes '\\'. */
+    char win[1024];
+    size_t n = strlen(path);
+    if (n >= sizeof(win)) { return NULL; }
+    for (size_t i = 0; i <= n; i++) {
+        win[i] = path[i] == '/' ? '\\' : path[i];
+    }
+    return (void *)LoadLibraryExA(win, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
 #else
     return dlopen(path, RTLD_NOW | RTLD_GLOBAL);
 #endif

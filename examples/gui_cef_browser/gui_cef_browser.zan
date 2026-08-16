@@ -1,0 +1,262 @@
+using System;
+using System.Diagnostics;
+using Gui;
+using Gui.Widget;
+using Gui.Component.CefBrowser;
+
+/// 自带 Chromium 的多标签浏览器示例：每个标签一个 CefBrowserBox，它就是一个
+/// 普通的保留式控件，挂进 Tabs 的页容器里；工具栏、标签条、状态行都是控件树
+/// 上的兄弟节点，没有一行坐标计算——布局由停靠给出，绘制由各控件自己负责。
+///
+/// 与 examples/gui_browser（系统 WebView + 即时模式自绘）的分工：那边自己画
+/// 标签条、自己算工具栏坐标；这里用标准 Tabs 组件 + 保留式控件树，引擎换成
+/// 自带的 Chromium（完整媒体栈、CDP 通道）。首次运行会由 CefRuntime 从官方
+/// CDN 下载 CEF 运行时（几百 MB，之后走缓存）。
+///
+/// 跑起来：
+///     cmake -B build -DZAN_BUILD_CEF=ON && cmake --build build --target zan_cef
+///     build/zanc examples/gui_cef_browser/gui_cef_browser.zan -o build/cefbrowser
+///     build/cefbrowser [起始地址]
+class CefBrowserDemo {
+    static Form form;
+    /// 标签条兼页容器：第 i 页里装着第 i 个浏览器。
+    static Tabs tabs;
+    /// 与标签一一对应的浏览器（下标 = 标签索引）。
+    static List<CefBrowserBox> views;
+    static Input address;
+    static Label status;
+    static string home;
+    /// 已回填进地址栏的地址：只在导航落地后回填一次，避免
+    /// http→https 的重定向中间态让地址栏闪烁。
+    static string shownUrl;
+    /// 上一次同步时的活动标签：切标签要无条件回填一次它的地址，
+    /// 不能等“加载完成”——新标签还在加载时地址栏会一直停在旧页。
+    static int shownTab;
+    /// 用户正在改地址栏：期间不回填，免得异步来的 URL 把打的字冲掉。
+    /// 回车导航（或切标签）后复位。
+    static bool editing;
+    /// 启动计时：拆开看「CEF 初始化」和「建 browser + 首屏」两段，不然
+    /// 只能笼统地说“启动很慢”。
+    static Stopwatch boot;
+    static bool bootLogged;
+
+    static async int Main() {
+        CefBrowserDemo.boot = Stopwatch.StartNew();
+        CefBrowserDemo.bootLogged = false;
+        // Chromium 是多进程的，本程序同时充当 render/gpu/utility helper：
+        // helper 分支在这里跑完自己的消息循环并退出，绝不能走到下面。
+        CefBootstrap.RunHelper();
+
+        Stopwatch sw = Stopwatch.StartNew();
+        Console.WriteLine("正在准备 CEF 运行时（首次运行要下载官方包，几百 MB）...");
+        if (!await CefBootstrap.StartAsync()) {
+            Console.WriteLine("CEF 启动失败：" + CefHost.Error());
+            return 1;
+        }
+        sw.Stop();
+        Console.WriteLine("CEF " + CefHost.CefVersion() + " 就绪（" +
+                          Convert.ToString(sw.ElapsedMilliseconds()) + " ms）：" +
+                          CefHost.RuntimeDir());
+
+        CefBrowserDemo.home = "https://www.example.com";
+        if (Environment.ArgCount() > 0) {
+            CefBrowserDemo.home = Environment.ArgAt(0);
+        }
+        CefBrowserDemo.shownUrl = "";
+        CefBrowserDemo.shownTab = 0 - 1;
+        CefBrowserDemo.editing = false;
+
+        Form f = Form.CreateDark("Zan CEF Browser", 1200, 800);
+        CefBrowserDemo.form = f;
+        App app = f.GetApp();
+
+        // ---- 工具栏：一行三个圆形图标按钮 + 吃掉剩余宽度的地址栏 ----
+        // 行内子节点用 With() 追加（它才会按流式轴自动停靠；Add() 只挂节点，
+        // 子节点仍是手动定位，全部叠在行首互相遮挡）。
+        Button back = new Button { Icon = "arrow-left", Class = "circle" };
+        back.Click += CefBrowserDemo.OnBack;
+        Button fwd = new Button { Icon = "arrow-right", Class = "circle" };
+        fwd.Click += CefBrowserDemo.OnForward;
+        Button reload = new Button { Icon = "refresh", Class = "circle" };
+        reload.Click += CefBrowserDemo.OnReload;
+
+        CefBrowserDemo.address =
+            Input.Bind(new SignalString(""), "输入网址后回车");
+        CefBrowserDemo.address.Submit += CefBrowserDemo.OnSubmit;
+        CefBrowserDemo.address.Change += CefBrowserDemo.OnAddressEdited;
+        CefBrowserDemo.address.Grow();
+
+        Panel bar = Panel.Row();
+        bar.Dock(Dock.Top());
+        bar.Pad(app.Scale(8));
+        bar.Gap(app.Scale(6));
+        bar.With(back).With(fwd).With(reload).With(CefBrowserDemo.address);
+
+        CefBrowserDemo.status = new Label("就绪");
+        CefBrowserDemo.status.Dock(Dock.Bottom());
+        CefBrowserDemo.status.Pad(app.Scale(6));
+
+        // ---- 标签条：标签下面就是页面区，活动页铺满、其余页隐藏 ----
+        CefBrowserDemo.tabs = new Tabs(Tabs.Card());
+        CefBrowserDemo.tabs.SetShowAdd(true);
+        CefBrowserDemo.tabs.Dock(Dock.Fill());
+        CefBrowserDemo.tabs.TabAdded += CefBrowserDemo.OnTabAdded;
+        CefBrowserDemo.tabs.TabClosed += CefBrowserDemo.OnTabClosed;
+        CefBrowserDemo.tabs.TabChanged += CefBrowserDemo.OnTabChanged;
+
+        f.Add(bar);
+        f.Add(CefBrowserDemo.status);
+        f.Add(CefBrowserDemo.tabs);
+
+        CefBrowserDemo.views = new List<CefBrowserBox>();
+        CefBrowserDemo.NewTab(CefBrowserDemo.home);
+        // 首屏耗时按导航完成事件计（轮询 IsLoading 会在加载还没开始时
+        // 就判成“已就绪”，量出来的数字比真实首屏小一个数量级）。
+        CefBrowserDemo.views[0].View().NavComplete += CefBrowserDemo.OnFirstReady;
+
+        // 页面标题 / 地址 / 加载状态由原生浏览器异步更新，定时同步进
+        // 标签文本、地址栏和状态行（周期任务跑完自动请求重绘）。
+        f.Every(250, CefBrowserDemo.Sync);
+
+        f.Run();
+        CefHost.Shutdown();
+        return 0;
+    }
+
+    // ---- 标签模型 ----------------------------------------------------
+
+    /// 建一个新标签：标签条添一项，它的页里放一个浏览器。
+    static void NewTab(string url) {
+        CefBrowserDemo.tabs.Add("新标签", true);
+        CefBrowserDemo.AttachView(CefBrowserDemo.tabs.Count() - 1, url);
+        CefBrowserDemo.tabs.Select(CefBrowserDemo.tabs.Count() - 1);
+        CefBrowserDemo.shownUrl = "";
+    }
+
+    /// 把第 i 个标签的浏览器挂进它的页容器。
+    static void AttachView(int i, string url) {
+        CefBrowserBox box = new CefBrowserBox();
+        box.SetStartUrl(url);
+        box.Dock(Dock.Fill());
+        CefBrowserDemo.tabs.Page(i).Add(box);
+        CefBrowserDemo.views.Add(box);
+    }
+
+    static CefBrowserBox Active() {
+        int i = CefBrowserDemo.tabs.Active();
+        if (i < 0 || i >= CefBrowserDemo.views.Count) { return null; }
+        return CefBrowserDemo.views[i];
+    }
+
+    /// 标签条上的「+」：新标签用主页地址。
+    static void OnTabAdded() {
+        int i = CefBrowserDemo.tabs.TakeAdded();
+        if (i < 0) { return; }
+        // Tabs 自己已经添好了标签项，这里只补它的页和浏览器。
+        if (i == CefBrowserDemo.views.Count) {
+            CefBrowserDemo.AttachView(i, CefBrowserDemo.home);
+        }
+        CefBrowserDemo.tabs.SetLabel(i, "新标签");
+        CefBrowserDemo.shownUrl = "";
+    }
+
+    /// 关标签：Tabs 已经摘掉了那一页，这里关掉它的原生浏览器。
+    static void OnTabClosed() {
+        int i = CefBrowserDemo.tabs.TakeClosed();
+        if (i < 0 || i >= CefBrowserDemo.views.Count) { return; }
+        CefBrowserDemo.views[i].Destroy();
+        CefBrowserDemo.views.RemoveAt(i);
+        if (CefBrowserDemo.views.Count == 0) {
+            CefBrowserDemo.NewTab(CefBrowserDemo.home);
+            return;
+        }
+        CefBrowserDemo.OnTabChanged();
+    }
+
+    /// 切标签：非活动标签的原生窗口显式收起（隐藏的页不再绘制，
+    /// 原生层不会自己让位），地址栏改回填新活动页。
+    static void OnTabChanged() {
+        for (int i = 0; i < CefBrowserDemo.views.Count; i = i + 1) {
+            if (i != CefBrowserDemo.tabs.Active()) {
+                CefBrowserDemo.views[i].Hide();
+            }
+        }
+        CefBrowserDemo.shownUrl = "";
+        CefBrowserDemo.Sync();
+    }
+
+    // ---- 工具栏动作 --------------------------------------------------
+
+    static void OnSubmit() {
+        CefBrowserBox b = CefBrowserDemo.Active();
+        if (b == null) { return; }
+        string u = CefBrowserDemo.address.GetText();
+        if (u == "") { return; }
+        CefBrowserDemo.editing = false;
+        CefBrowserDemo.shownUrl = u;
+        b.Navigate(u);
+    }
+
+    static void OnAddressEdited() { CefBrowserDemo.editing = true; }
+
+    static void OnBack() {
+        CefBrowserBox b = CefBrowserDemo.Active();
+        if (b != null) { b.Back(); }
+    }
+
+    static void OnForward() {
+        CefBrowserBox b = CefBrowserDemo.Active();
+        if (b != null) { b.Forward(); }
+    }
+
+    static void OnReload() {
+        CefBrowserBox b = CefBrowserDemo.Active();
+        if (b != null) { b.Reload(); }
+    }
+
+    /// 第一个标签首次导航完成：报出「进程启动 → 首屏」总耗时。
+    static void OnFirstReady() {
+        if (CefBrowserDemo.bootLogged) { return; }
+        CefBrowserDemo.bootLogged = true;
+        Console.WriteLine("首屏完成（自进程启动 " +
+            Convert.ToString(CefBrowserDemo.boot.ElapsedMilliseconds()) +
+            " ms）");
+    }
+
+    // ---- 同步显示 ----------------------------------------------------
+
+    /// 每个标签的标题回填标签文本；活动页的地址、HTTP 状态和加载状态
+    /// 回填地址栏与状态行。
+    static void Sync() {
+        for (int i = 0; i < CefBrowserDemo.views.Count; i = i + 1) {
+            string t = CefBrowserDemo.views[i].CurrentTitle();
+            if (t != "") { CefBrowserDemo.tabs.SetLabel(i, t); }
+        }
+
+        CefBrowserBox b = CefBrowserDemo.Active();
+        if (b == null) { return; }
+
+        // 地址栏回填：切标签时无条件跟上活动页（哪怕还在加载），
+        // 其余时候只在导航落地后回填一次。地址栏正被编辑（有键盘
+        // 焦点）时一律不覆盖，否则用户打的字会被异步的 URL 冲掉。
+        int tab = CefBrowserDemo.tabs.Active();
+        bool switched = tab != CefBrowserDemo.shownTab;
+        CefBrowserDemo.shownTab = tab;
+        if (switched) { CefBrowserDemo.editing = false; }
+        if (!CefBrowserDemo.editing && (switched || !b.IsLoading())) {
+            string u = b.CurrentUrl();
+            if (u == "") { u = b.StartUrl(); }
+            if (u != "" && (switched || u != CefBrowserDemo.shownUrl)) {
+                CefBrowserDemo.address.SetText(u);
+                CefBrowserDemo.shownUrl = u;
+            }
+        }
+
+        string state = "就绪";
+        if (b.IsLoading()) { state = "加载中..."; }
+        string title = b.CurrentTitle();
+        if (title == "") { title = "(无标题)"; }
+        CefBrowserDemo.status.Text = state + "   ·   HTTP " +
+            Convert.ToString(b.LastStatus()) + "   ·   " + title;
+    }
+}

@@ -26,11 +26,23 @@ namespace Gui.Component.CefBrowser;
 /// CefBootstrap.RunHelper()、之后 await CefBootstrap.StartAsync()。没启动成功时
 /// IsSupported() 为 false，Render 画一个画布内占位符（说明原因），而不是崩掉。
 class CefBrowser {
+    #if WINDOWS
+    /// 原生浏览器是宿主窗口的子 HWND，被点中时 Win32 键盘焦点就落在它上面，
+    /// 此后所有按键都进 Chromium——宿主窗口再也收不到 WM_CHAR，界面上的
+    /// 输入框（浏览器的地址栏就是一个）便无法输入。焦点交回宿主窗口要走
+    /// Win32，CEF 自己的 set_focus 只管引擎内部。
+    [DllImport("user32", EntryPoint = "SetFocus")]
+    static extern nint Win32SetFocus(nint hwnd);
+    #endif
+
     int handle;         // 原生浏览器句柄（0 = 尚未创建/不可用）
     bool created;       // 已尝试原生创建
     bool supported;     // 原生侧给出了可用的浏览器
     int lastNavSeq;     // 最近观察到的导航计数器
     string pendingUrl;  // 原生创建前请求的导航
+    /// 上一帧界面上是否有控件持有键盘焦点（用于只在切换的那一刻搬焦点，
+    /// 而不是每帧从浏览器手里抢，否则页面里就没法打字了）。
+    bool guiHadFocus;
 
     string lastSeenTitle;
     bool lastSeenLoading;
@@ -54,6 +66,7 @@ class CefBrowser {
         this.supported = true;
         this.lastNavSeq = 0;
         this.pendingUrl = "";
+        this.guiHadFocus = false;
         this.lastSeenTitle = "";
         this.lastSeenLoading = false;
         this.url = new SignalString("");
@@ -156,6 +169,25 @@ class CefBrowser {
         if (handle != 0) { CefBackend.SetFocus(handle, focus); }
     }
 
+    /// 每帧跟随界面焦点：界面上有控件拿到键盘焦点（点了地址栏）的那一刻，
+    /// 把 Win32 焦点从浏览器子窗口搬回宿主窗口；焦点被清掉（Esc / 点空白）
+    /// 的那一刻交还给浏览器。只在切换沿动作，页面内的点击因此照旧把焦点
+    /// 拿回去，网页里能正常打字。
+    void SyncFocus(App app) {
+        if (handle == 0) { return; }
+        bool gui = app.focus.focusedId >= 0;
+        if (gui == guiHadFocus) { return; }
+        guiHadFocus = gui;
+        if (gui) {
+            CefBackend.SetFocus(handle, false);
+            #if WINDOWS
+            CefBrowser.Win32SetFocus(app.window.GetHandle());
+            #endif
+            return;
+        }
+        CefBackend.SetFocus(handle, true);
+    }
+
     // ---- CDP（Chrome DevTools Protocol）----------------------------------
 
     /// 发一条 CDP 命令，返回其消息 id（失败 0）。回复和事件从
@@ -238,6 +270,7 @@ class CefBrowser {
         // 本帧占位，由 PresentFrame 在所有自绘 UI 之后算出未被遮挡的
         // 区域再下发（完全被盖住时隐藏）。
         NativeLayer.Register(app, handle, x, y, w, h, CefBackend.ApplyClip);
+        SyncFocus(app);
 
         bool dirty = false;
         bool busy = CefBackend.IsLoading(handle);
@@ -266,6 +299,14 @@ class CefBrowser {
         // 浏览器画面变化不会经过 Zan 的重绘逻辑，但原生窗口是自己刷新的，
         // 这里只在有语义变化时请求重绘（省电）。
         if (dirty) { app.RequestRedraw(); }
+        // Chromium 的消息循环只在本方法里被推，而事件循环空闲时会阻塞在
+        // WaitEvent 上——没有这一句，鼠标一停页面就冻住（加载中的页面停在
+        // 半张，标题/导航事件也要等下一次输入才到）。所以只要浏览器还活着
+        // 就预约下一帧：加载中密一点，空闲时降到约 30 Hz，并把重绘范围声明
+        // 成浏览器这块矩形（原生窗口自己刷新，画布这块几乎没有开销）。
+        int next = 30;
+        if (busy) { next = 8; }
+        app.RequestAnimationFrameIn(next, x, y, w, h);
         return handle;
     }
 
