@@ -16,7 +16,9 @@ namespace ZanWeb;
 /// process attaches to the same rows.
 ///
 ///   roles:  key "3"  -> acts ",Users.Index,Users.Save,"   (membership test)
+///                      scope 2, depts ",3,7,"             (data scope)
 ///   users:  key "42" -> super 0|1, roles ",3,7,"          (expires, reloaded)
+///                      scope 2, depts ",3,7,"             (resolved, expanded)
 ///
 /// Roles are loaded whole on boot and rewritten when an operator changes a
 /// grant, because there are few of them and every request needs them. Accounts
@@ -48,6 +50,8 @@ class PermTable {
         SharedTable r = new SharedTable(PermTable.RoleTable, 256);
         r.KeySize(16);
         r.ColumnString("acts", 8192);
+        r.ColumnInt("scope");
+        r.ColumnString("depts", 255);
         if (!r.Create()) { r = SharedTable.Open(PermTable.RoleTable); }
         if (r == null || !r.IsOpen()) { return false; }
 
@@ -55,6 +59,8 @@ class PermTable {
         u.KeySize(24);
         u.ColumnInt("super");
         u.ColumnString("roles", 192);
+        u.ColumnInt("scope");
+        u.ColumnString("depts", 1024);
         if (!u.Create()) { u = SharedTable.Open(PermTable.UserTable); }
         if (u == null || !u.IsOpen()) { return false; }
 
@@ -86,9 +92,26 @@ class PermTable {
                 acts.Append(grants[j].action);
                 acts.Append(",");
             }
-            bool _ok = PermTable.roles.SetString(Convert.ToString(r.id), "acts",
-                acts.ToString());
+            string key = Convert.ToString(r.id);
+            bool _ok = PermTable.roles.SetString(key, "acts", acts.ToString());
+            bool _s = PermTable.roles.SetInt(key, "scope", r.dataScope);
+            string depts = r.scopeDepts;
+            if (depts == null) { depts = ""; }
+            bool _d = PermTable.roles.SetString(key, "depts", depts);
         }
+    }
+
+    /// <summary>One role's sys_role.dataScope, 0 when the role is not in shared
+    /// memory (disabled, or the table is unavailable).</summary>
+    static int RoleScope(string roleId) {
+        if (!PermTable.Ready()) { return 0; }
+        return PermTable.roles.GetInt(roleId, "scope");
+    }
+
+    /// <summary>The departments a dataScope = 5 role names, as ",3,7,".</summary>
+    static string RoleDepts(string roleId) {
+        if (!PermTable.Ready()) { return ""; }
+        return PermTable.roles.GetString(roleId, "depts");
     }
 
     /// <summary>Whether one of `roleIds` (",3,7,") grants `action`. Reads the
@@ -112,6 +135,30 @@ class PermTable {
         if (!PermTable.users.Exists(uid)) { return ""; }
         if (PermTable.users.GetInt(uid, "super") == 1) { return "*"; }
         return PermTable.users.GetString(uid, "roles");
+    }
+
+    /// <summary>This account's resolved data scope (DataScope.All / ByDept /
+    /// Self), or 0 when it has not been worked out yet -- the department set is
+    /// already expanded, so a request never walks the department tree.</summary>
+    static int UserScope(string uid) {
+        if (!PermTable.Ready()) { return 0; }
+        if (!PermTable.users.Exists(uid)) { return 0; }
+        return PermTable.users.GetInt(uid, "scope");
+    }
+
+    /// <summary>The departments that scope covers, as ",3,7,".</summary>
+    static string UserDepts(string uid) {
+        if (!PermTable.Ready()) { return ""; }
+        return PermTable.users.GetString(uid, "depts");
+    }
+
+    /// <summary>Publishes an account's resolved scope alongside its roles, under
+    /// the same lease -- so dropping the account (Forget) drops both.</summary>
+    static void SetUserScope(string uid, int mode, string depts) {
+        if (!PermTable.Ready()) { return; }
+        bool _m = PermTable.users.SetInt(uid, "scope", mode);
+        bool _d = PermTable.users.SetString(uid, "depts", depts);
+        bool _e = PermTable.users.Expire(uid, PermTable.UserLeaseMs);
     }
 
     /// <summary>Publishes an account's roles for every worker, with a lease so a

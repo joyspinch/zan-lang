@@ -48,6 +48,7 @@ class Roles : AdminController {
             int users = await this.UserRole.Where(a => a.roleId == r.id).CountAsync();
             row.Set("perms", Convert.ToString(perms));
             row.Set("users", Convert.ToString(users));
+            row.Set("scope", DataScope.Label(r.dataScope));
             row.Set("statusText", Roles.StatusText(r.status));
             row.Set("statusClass", Roles.StatusClass(r.status));
             items.Add(row);
@@ -65,6 +66,8 @@ class Roles : AdminController {
         d.Set("dialogTitle", "新增角色");
         d.Set("rank", "10");
         d.Set("status1", "selected");
+        int scope = DataScope.RoleAll;
+        string picked = "";
         if (id > 0) {
             Role r = await this.Find(id);
             d.Set("dialogTitle", "编辑角色");
@@ -75,6 +78,24 @@ class Roles : AdminController {
             d.Set("status1", "");
             if (r.status == 1) { d.Set("status1", "selected"); }
             else { d.Set("status0", "selected"); }
+            if (r.dataScope > 0) { scope = r.dataScope; }
+            picked = Fmt.Text(r.scopeDepts, "");
+        }
+        // The data scope, and the departments the 自定义 option means. The
+        // checkboxes are always rendered; the template only shows them while
+        // that option is selected.
+        d.Set("scope" + Convert.ToString(scope), "selected");
+        List<Department> depts = await this.Department
+            .OrderBy(a => a.sortOrder).ToListAsync();
+        List<StrMap> opts = d.AddList("depts");
+        for (int i = 0; i < depts.Count; i = i + 1) {
+            StrMap o = new StrMap();
+            o.Set("id", Convert.ToString(depts[i].id));
+            o.Set("name", depts[i].name);
+            if (AuthUser.Holds(picked, Convert.ToString(depts[i].id))) {
+                o.Set("checked", "checked");
+            }
+            opts.Add(o);
         }
         this.Dialog(d);
     }
@@ -89,6 +110,19 @@ class Roles : AdminController {
         int status = this.InInt("status", 1);
         string description = this.In("description");
         if (status != 1) { status = 0; }
+        int dataScope = this.InInt("dataScope", DataScope.RoleAll);
+        if (dataScope < DataScope.RoleAll || dataScope > DataScope.RoleCustom) {
+            dataScope = DataScope.RoleAll;
+        }
+        // Only the 自定义 option keeps a department list, so switching away from
+        // it cannot leave a stale set behind to be re-applied later.
+        string scopeDepts = "";
+        if (dataScope == DataScope.RoleCustom) {
+            scopeDepts = await this.ScopeDepts(this.In("scopeDepts"));
+            if (scopeDepts.Length == 0) {
+                this.Fail(400, Codes.BadInput, "自定义数据权限至少要选一个部门");
+            }
+        }
 
         Role clash = await this.Role.Where(a => a.code == code).FirstAsync();
         if (clash != null && clash.id != id) {
@@ -101,6 +135,8 @@ class Roles : AdminController {
                 .Set(a => a.rank, rank)
                 .Set(a => a.status, status)
                 .Set(a => a.description, description)
+                .Set(a => a.dataScope, dataScope)
+                .Set(a => a.scopeDepts, scopeDepts)
                 .Set(a => a.updatedAt, WebApp.NowSeconds())
                 .Where(a => a.id == id)
                 .ExecuteAffrowsAsync();
@@ -115,9 +151,12 @@ class Roles : AdminController {
         r.rank = rank;
         r.status = status;
         r.description = description;
+        r.dataScope = dataScope;
+        r.scopeDepts = scopeDepts;
         r.createdAt = WebApp.NowSeconds();
         r.updatedAt = r.createdAt;
         int newId = await this.Role.Insert(r).ExecuteIdentityAsync();
+        await AuthUser.RolesChanged(this.Held());
         await this.Note("新增角色", code, newId > 0, "");
         this.Saved("角色已创建");
     }
@@ -212,6 +251,27 @@ class Roles : AdminController {
         Role r = await this.Role.Read(id);
         if (r == null) { this.Fail(404, Codes.NotFound, "角色不存在"); }
         return r;
+    }
+
+    /// <summary>The submitted departments, kept as ",3,7," -- and only the ones
+    /// that exist, the same way GrantSave only keeps actions that exist, so a
+    /// forged field cannot put a department id nobody can see into a scope.
+    /// </summary>
+    async string ScopeDepts(string picked) {
+        List<Department> all = await this.Department
+            .OrderBy(a => a.sortOrder).ToListAsync();
+        StringBuilder outp = new StringBuilder();
+        outp.Append(",");
+        int kept = 0;
+        for (int i = 0; i < all.Count; i = i + 1) {
+            string id = Convert.ToString(all[i].id);
+            if (!AuthUser.Holds(picked, id)) { continue; }
+            outp.Append(id);
+            outp.Append(",");
+            kept = kept + 1;
+        }
+        if (kept == 0) { return ""; }
+        return outp.ToString();
     }
 
     /// <summary>The rights that exist: every protected action in the route

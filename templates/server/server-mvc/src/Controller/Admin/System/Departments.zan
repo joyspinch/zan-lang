@@ -28,9 +28,22 @@ class Departments : AdminController {
         ViewData d = await this.Layout("部门管理");
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
 
+        // The tree is cut to the departments this account's roles cover, and
+        // the roster next to it to the same set, so the counts on the left and
+        // the names on the right always agree.
+        DataScope sc = await this.Scope();
+        List<int> scoped = sc.Depts();
+        int myDept = (await this.Admin()).departmentId;
+        int mine = sc.UserId();
+
         List<Department> rows = await this.Department
+            .WhereIf(sc.ByDept(), a => scoped.Contains(a.id))
+            .WhereIf(sc.Mine(), a => a.id == myDept)
             .OrderBy(a => a.sortOrder).ToListAsync();
-        List<User> users = await this.User.ToListAsync();
+        List<User> users = await this.User
+            .WhereIf(sc.ByDept(), a => scoped.Contains(a.departmentId))
+            .WhereIf(sc.Mine(), a => a.id == mine)
+            .ToListAsync();
 
         // Nothing picked means the first department, so the roster is never an
         // empty panel next to a full tree.
@@ -54,7 +67,9 @@ class Departments : AdminController {
         if (rows.Count == 0) { d.Set("empty", "1"); }
 
         Department picked = await this.Department.Read(pick);
-        if (picked == null) { this.Page(d); return; }
+        if (picked == null || !Departments.Listed(rows, pick)) {
+            this.Page(d); return;
+        }
         d.Set("deptId", Convert.ToString(picked.id));
         d.Set("deptName", picked.name);
         d.Set("deptCode", Fmt.Dash(picked.code));
@@ -104,8 +119,7 @@ class Departments : AdminController {
         d.Set("sortOrder", "1");
         d.Set("status1", "selected");
         if (id > 0) {
-            Department dept = await this.Department.Read(id);
-            if (dept == null) { this.Fail(404, "0404", "部门不存在"); }
+            Department dept = await this.Reach(id);
             d.Set("dialogTitle", "编辑部门");
             d.Set("name", dept.name);
             d.Set("code", dept.code);
@@ -115,7 +129,14 @@ class Departments : AdminController {
             if (dept.status == 1) { d.Set("status1", "selected"); }
             else { d.Set("status0", "selected"); }
         }
+        // The parent choices are the tree this account can see, so a department
+        // cannot be filed under one it may not read.
+        DataScope sc = await this.Scope();
+        List<int> scoped = sc.Depts();
+        int myDept = (await this.Admin()).departmentId;
         List<Department> all = await this.Department
+            .WhereIf(sc.ByDept(), a => scoped.Contains(a.id))
+            .WhereIf(sc.Mine(), a => a.id == myDept)
             .OrderBy(a => a.sortOrder).ToListAsync();
         List<StrMap> opts = d.AddList("parents");
         for (int i = 0; i < all.Count; i = i + 1) {
@@ -142,7 +163,9 @@ class Departments : AdminController {
         if (parentId == id && id > 0) {
             this.Fail(400, "0004", "上级部门不能是自己");
         }
+        await this.Parented(parentId);
         if (id > 0) {
+            Department _t = await this.Reach(id);
             int n = await this.Department.Update()
                 .Set(a => a.name, name)
                 .Set(a => a.code, code)
@@ -173,8 +196,7 @@ class Departments : AdminController {
     [Description("部门角色")]
     async void Roles() {
         int id = this.InInt("id", 0);
-        Department dept = await this.Department.Read(id);
-        if (dept == null) { this.Fail(404, "0404", "部门不存在"); }
+        Department dept = await this.Reach(id);
         ViewData d = new ViewData();
         d.Set("id", Convert.ToString(id));
         d.Set("name", dept.name);
@@ -199,8 +221,7 @@ class Departments : AdminController {
     [Description("保存部门角色")]
     async void RolesSave() {
         int id = this.InInt("id", 0);
-        Department dept = await this.Department.Read(id);
-        if (dept == null) { this.Fail(404, "0404", "部门不存在"); }
+        Department dept = await this.Reach(id);
         string picked = this.In("roleIds");
         int _cleared = await this.DepartmentRole.Delete()
             .Where(a => a.departmentId == id).ExecuteAffrowsAsync();
@@ -226,8 +247,7 @@ class Departments : AdminController {
     [Description("删除部门")]
     async void Delete() {
         int id = this.InInt("id", 0);
-        Department dept = await this.Department.Read(id);
-        if (dept == null) { this.Fail(404, "0404", "部门不存在"); }
+        Department dept = await this.Reach(id);
         int kids = await this.Department.Where(a => a.parentId == id).CountAsync();
         if (kids > 0) {
             this.Fail(400, "0004", "请先删除下级部门");
@@ -244,6 +264,43 @@ class Departments : AdminController {
         AuthUser.ForgetAll();
         await this.Note("删除部门", dept.name, n > 0, "");
         this.Saved("部门已删除");
+    }
+
+    /// <summary>The department this request may act on: out of the caller's
+    /// data scope reads as "does not exist", the same as on the list.</summary>
+    async Department Reach(int id) {
+        Department dept = await this.Department.Read(id);
+        if (dept == null) { this.Fail(404, "0404", "部门不存在"); }
+        DataScope sc = await this.Scope();
+        if (sc.Any()) { return dept; }
+        // The rows here ARE departments, so a row's "own department" is its own
+        // id, and a 仅本人 scope reaches the caller's department only.
+        bool ok = sc.Covers(0, dept.id);
+        if (sc.Mine()) { ok = dept.id == (await this.Admin()).departmentId; }
+        if (!ok) { this.Fail(404, "0404", "部门不存在"); }
+        return dept;
+    }
+
+    /// <summary>The parent a department may be filed under: outside the caller's
+    /// scope -- a top-level department included -- it would create a row the
+    /// caller itself cannot read back.</summary>
+    async void Parented(int parentId) {
+        DataScope sc = await this.Scope();
+        if (sc.Any()) { return; }
+        if (parentId <= 0) {
+            this.Fail(403, "0403", "数据权限不允许新增顶级部门");
+        }
+        Department _p = await this.Reach(parentId);
+    }
+
+    /// <summary>Whether the scoped tree on the left contains that id, so the
+    /// roster on the right cannot be opened for a department the tree does not
+    /// offer.</summary>
+    static bool Listed(List<Department> rows, int id) {
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].id == id) { return true; }
+        }
+        return false;
     }
 
     /// <summary>Two spaces per level, so the flat table still reads as a

@@ -41,13 +41,23 @@ class Users : AdminController {
         if (status == 1) { d.Set("statusOn", "selected"); }
         if (status == 0) { d.Set("statusOff", "selected"); }
 
+        // The rows this account's roles let it see, on the same WhereIf chain
+        // as the keyword and the status filter.
+        DataScope sc = await this.Scope();
+        List<int> scoped = sc.Depts();
+        int mine = sc.UserId();
+
         int total = await this.User
             .WhereIf(kw.Length > 0, a => a.username.Contains(kw))
             .WhereIf(status >= 0, a => a.status == status)
+            .WhereIf(sc.ByDept(), a => scoped.Contains(a.departmentId))
+            .WhereIf(sc.Mine(), a => a.id == mine)
             .CountAsync();
         List<User> rows = await this.User
             .WhereIf(kw.Length > 0, a => a.username.Contains(kw))
             .WhereIf(status >= 0, a => a.status == status)
+            .WhereIf(sc.ByDept(), a => scoped.Contains(a.departmentId))
+            .WhereIf(sc.Mine(), a => a.id == mine)
             .OrderByDescending(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
 
@@ -91,8 +101,7 @@ class Users : AdminController {
         d.Set("new", "1");
         d.Set("status1", "selected");
         if (id > 0) {
-            User u = await this.User.Where(a => a.id == id).FirstAsync();
-            if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+            User u = await this.Reach(id);
             d.Set("dialogTitle", "编辑账号");
             d.Set("username", u.username);
             d.Set("nickname", u.nickname);
@@ -105,7 +114,14 @@ class Users : AdminController {
             else { d.Set("status0", "selected"); }
             deptId = u.departmentId;
         }
+        // Only the departments this account may write into are offered, so the
+        // dialog cannot propose a move that Save would then refuse. A 仅本人
+        // scope may write into none of them.
+        DataScope sc = await this.Scope();
+        List<int> scoped = sc.Depts();
         List<Department> depts = await this.Department
+            .WhereIf(sc.ByDept(), a => scoped.Contains(a.id))
+            .WhereIf(sc.Mine(), a => a.id < 0)
             .OrderBy(a => a.sortOrder).ToListAsync();
         List<StrMap> opts = d.AddList("depts");
         for (int i = 0; i < depts.Count; i = i + 1) {
@@ -135,6 +151,11 @@ class Users : AdminController {
         if (clash != null && clash.id != id) {
             this.Fail(400, "0004", "账号 " + username + " 已存在");
         }
+        // Both ends are checked: the account being edited must be in scope, and
+        // so must the department it is being put in -- otherwise an operator who
+        // only sees one department could move an account out of its reach.
+        if (id > 0) { User _t = await this.Reach(id); }
+        await this.Reachable(departmentId);
 
         if (id > 0) {
             int n = await this.User.Update()
@@ -184,8 +205,7 @@ class Users : AdminController {
     [Description("删除账号")]
     async void Delete() {
         int id = this.InInt("id", 0);
-        User u = await this.User.Where(a => a.id == id).FirstAsync();
-        if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+        User u = await this.Reach(id);
         if (u.isSuper == 1) {
             this.Fail(400, "0004", "超级管理员账号不能删除");
         }
@@ -209,8 +229,7 @@ class Users : AdminController {
         int id = this.InInt("id", 0);
         int status = this.InInt("status", 1);
         if (status != 1) { status = 0; }
-        User u = await this.User.Where(a => a.id == id).FirstAsync();
-        if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+        User u = await this.Reach(id);
         if (u.isSuper == 1 && status == 0) {
             this.Fail(400, "0004", "超级管理员账号不能禁用");
         }
@@ -232,8 +251,7 @@ class Users : AdminController {
     [Description("强制下线")]
     async void Kick() {
         int id = this.InInt("id", 0);
-        User u = await this.User.Where(a => a.id == id).FirstAsync();
-        if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+        User u = await this.Reach(id);
         await this.Revoke(id);
         await this.Note("强制下线",
             "#" + Convert.ToString(id) + " " + u.username, true, "");
@@ -246,8 +264,7 @@ class Users : AdminController {
     [Description("重置密码表单")]
     async void PasswordForm() {
         int id = this.InInt("id", 0);
-        User u = await this.User.Where(a => a.id == id).FirstAsync();
-        if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+        User u = await this.Reach(id);
         ViewData d = new ViewData();
         d.Set("id", Convert.ToString(id));
         d.Set("username", u.username);
@@ -262,8 +279,7 @@ class Users : AdminController {
         if (password.Length < 8) {
             this.Fail(400, "0004", "密码至少 8 位");
         }
-        User u = await this.User.Where(a => a.id == id).FirstAsync();
-        if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+        User u = await this.Reach(id);
         string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
         string hash = AuthUser.PasswordHash(password, salt);
         int n = await this.User.Update()
@@ -284,8 +300,7 @@ class Users : AdminController {
     [Description("分配角色")]
     async void Roles() {
         int id = this.InInt("id", 0);
-        User u = await this.User.Where(a => a.id == id).FirstAsync();
-        if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+        User u = await this.Reach(id);
         ViewData d = new ViewData();
         d.Set("id", Convert.ToString(id));
         d.Set("username", u.username);
@@ -312,8 +327,7 @@ class Users : AdminController {
     [Description("保存角色分配")]
     async void RolesSave() {
         int id = this.InInt("id", 0);
-        User u = await this.User.Where(a => a.id == id).FirstAsync();
-        if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+        User u = await this.Reach(id);
         string picked = this.In("roleIds");
         int _cleared = await this.UserRole.Delete().Where(a => a.userId == id)
             .ExecuteAffrowsAsync();
@@ -332,6 +346,29 @@ class Users : AdminController {
             "#" + Convert.ToString(id) + " " + u.username, true,
             Convert.ToString(granted) + " 个角色");
         this.Saved("角色已保存");
+    }
+
+    /// <summary>The account this request is allowed to act on. Out of the
+    /// caller's data scope answers the same 404 as a row that is not there: a
+    /// screen that cannot list an account must not be able to confirm it exists
+    /// by poking its id into a dialog or a POST.</summary>
+    async User Reach(int id) {
+        User u = await this.User.Where(a => a.id == id).FirstAsync();
+        if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+        DataScope sc = await this.Scope();
+        if (!sc.Covers(u.id, u.departmentId)) {
+            this.Fail(404, "0404", "账号不存在");
+        }
+        return u;
+    }
+
+    /// <summary>Refuses a department this request may not write into, so an
+    /// account cannot be created in -- or moved to -- a department its operator
+    /// cannot see.</summary>
+    async void Reachable(int departmentId) {
+        DataScope sc = await this.Scope();
+        if (sc.Covers(0, departmentId)) { return; }
+        this.Fail(403, "0403", "数据权限不允许操作该部门的账号");
     }
 
     /// <summary>Invalidates every token issued for this account so far.</summary>

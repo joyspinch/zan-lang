@@ -1,0 +1,235 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb;
+
+/// <summary>
+/// How much of a table a request may see. The action check answers "may this
+/// account open Users.Index"; this answers "which rows does it get once it is
+/// in", which is the other half of the same question and the one every list
+/// screen has to ask.
+///
+/// A role carries sys_role.dataScope (1 全部 / 2 本部门 / 3 本部门及下级 /
+/// 4 仅本人 / 5 自定义部门). An account holds several roles, so the scopes are
+/// unioned -- not ranked: every role that names departments contributes its
+/// departments, and only an account whose roles all say 仅本人 ends up with
+/// Self. That collapses to three shapes, and a screen only ever asks about
+/// those:
+///
+///     DataScope sc = await this.Scope();
+///     List&lt;int&gt; depts = sc.Depts();
+///     int mine = sc.UserId();
+///     List&lt;User&gt; rows = await this.User
+///         .WhereIf(sc.ByDept(), a =&gt; depts.Contains(a.departmentId))
+///         .WhereIf(sc.Mine(), a =&gt; a.id == mine)
+///         .ToListAsync();
+///
+/// Same WhereIf idiom the keyword and status filters already use: no
+/// interceptor, no per-table metadata, and the column each screen scopes on
+/// stays visible in the screen.
+///
+/// It resolves once per account into the same shared-memory row its roles live
+/// in, department tree already flattened, so the request path stays query-free
+/// and Forget()/the lease expire both halves together.
+///
+/// An account that cannot be resolved (unknown, disabled, no usable database or
+/// no shared memory) comes back as ByDept over department -1: a filter that
+/// matches nothing, so a screen that forgets nothing still leaks nothing.
+/// </summary>
+class DataScope {
+    /// sys_role.dataScope values, as stored.
+    static int RoleAll = 1;
+    static int RoleDept = 2;
+    static int RoleDeptTree = 3;
+    static int RoleSelf = 4;
+    static int RoleCustom = 5;
+
+    /// Resolved shapes. Every row / rows of some departments / only my own row.
+    static int All = 1;
+    static int ByDepts = 2;
+    static int Self = 4;
+
+    int mode;
+    int userId;
+    List<int> depts;
+
+    DataScope() {
+        this.mode = DataScope.ByDepts;
+        this.userId = 0;
+        this.depts = new List<int>();
+    }
+
+    /// <summary>True when no row filter is needed at all.</summary>
+    bool Any() { return this.mode == DataScope.All; }
+
+    /// <summary>True when rows are limited to Depts() -- test the row's
+    /// department column with `depts.Contains(a.departmentId)`.</summary>
+    bool ByDept() { return this.mode == DataScope.ByDepts; }
+
+    /// <summary>True when rows are limited to this account's own -- test the
+    /// row's owner column with `a.userId == mine`.</summary>
+    bool Mine() { return this.mode == DataScope.Self; }
+
+    /// <summary>The departments ByDept() means, already including sub
+    /// departments. Never empty: a scope that covers nothing is [-1].</summary>
+    List<int> Depts() { return this.depts; }
+
+    /// <summary>The account itself, for Mine() and for screens whose rows are
+    /// accounts.</summary>
+    int UserId() { return this.userId; }
+
+    /// <summary>Whether one row is in scope. For the write paths, which load the
+    /// row by id instead of filtering a list: the same three shapes, asked of a
+    /// row that is already in hand.</summary>
+    bool Covers(int rowUserId, int rowDepartmentId) {
+        if (this.Any()) { return true; }
+        if (this.Mine()) { return rowUserId > 0 && rowUserId == this.userId; }
+        return DataScope.Has(this.depts, rowDepartmentId);
+    }
+
+    /// <summary>The scope that matches nothing, which is what an unresolvable
+    /// account gets.</summary>
+    static DataScope None() {
+        DataScope sc = new DataScope();
+        sc.mode = DataScope.ByDepts;
+        sc.depts.Add(0 - 1);
+        return sc;
+    }
+
+    static DataScope Everything(int userId) {
+        DataScope sc = new DataScope();
+        sc.mode = DataScope.All;
+        sc.userId = userId;
+        return sc;
+    }
+
+    /// <summary>This account's scope. Read out of shared memory; worked out from
+    /// the database (roles, and the department tree when a role says 本部门及下级)
+    /// on the first request that misses.</summary>
+    static async DataScope Of(IDbConnection db, User me) {
+        if (me == null || me.status != AuthUser.Active) {
+            return DataScope.None();
+        }
+        if (me.isSuper == 1) { return DataScope.Everything(me.id); }
+
+        string uid = Convert.ToString(me.id);
+        int cached = PermTable.UserScope(uid);
+        if (cached > 0) {
+            return DataScope.Restore(me.id, cached, PermTable.UserDepts(uid));
+        }
+
+        string roleIds = await AuthUser.RolesOf(uid);
+        if (roleIds == "*") { return DataScope.Everything(me.id); }
+        if (roleIds.Length == 0) { return DataScope.None(); }
+        if (db == null) { return DataScope.None(); }
+
+        DataScope sc = await DataScope.Resolve(db, me, roleIds);
+        PermTable.SetUserScope(uid, sc.mode, DataScope.Join(sc.depts));
+        return sc;
+    }
+
+    /// <summary>Unions the scopes of the roles this account holds. A role that
+    /// says 全部 wins outright; otherwise every role contributes the departments
+    /// it names, and Self is what is left when none named any.</summary>
+    static async DataScope Resolve(IDbConnection db, User me, string roleIds) {
+        List<string> ids = PermTable.Split(roleIds);
+        List<int> depts = new List<int>();
+        bool tree = false;
+        bool own = false;
+
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            int scope = PermTable.RoleScope(ids[i]);
+            // A role from before this column existed is not silently narrowed.
+            if (scope <= 0) { scope = DataScope.RoleAll; }
+            if (scope == DataScope.RoleAll) {
+                return DataScope.Everything(me.id);
+            }
+            if (scope == DataScope.RoleDept) { own = true; }
+            else if (scope == DataScope.RoleDeptTree) { own = true; tree = true; }
+            else if (scope == DataScope.RoleCustom) {
+                List<string> named = PermTable.Split(PermTable.RoleDepts(ids[i]));
+                for (int j = 0; j < named.Count; j = j + 1) {
+                    DataScope.Add(depts, Filter.ToInt(named[j], 0));
+                }
+            }
+        }
+
+        if (own && me.departmentId > 0) {
+            DataScope.Add(depts, me.departmentId);
+        }
+        if (tree && me.departmentId > 0) {
+            List<Department> all = await db.Select<Department>().ToListAsync();
+            DataScope.Descend(all, me.departmentId, depts);
+        }
+
+        DataScope sc = new DataScope();
+        sc.userId = me.id;
+        if (depts.Count == 0) {
+            // Only 仅本人 roles, or 本部门 with no department to speak of.
+            sc.mode = DataScope.Self;
+            return sc;
+        }
+        sc.mode = DataScope.ByDepts;
+        sc.depts = depts;
+        return sc;
+    }
+
+    /// <summary>Adds every department under `parent`, depth first, skipping ids
+    /// already there so a cycle in parentId cannot loop.</summary>
+    static void Descend(List<Department> all, int parent, List<int> outp) {
+        for (int i = 0; i < all.Count; i = i + 1) {
+            Department d = all[i];
+            if (d.parentId != parent || d.id <= 0) { continue; }
+            if (DataScope.Has(outp, d.id)) { continue; }
+            outp.Add(d.id);
+            DataScope.Descend(all, d.id, outp);
+        }
+    }
+
+    static DataScope Restore(int userId, int mode, string depts) {
+        DataScope sc = new DataScope();
+        sc.userId = userId;
+        sc.mode = mode;
+        if (mode == DataScope.ByDepts) {
+            List<string> ids = PermTable.Split(depts);
+            for (int i = 0; i < ids.Count; i = i + 1) {
+                DataScope.Add(sc.depts, Filter.ToInt(ids[i], 0));
+            }
+            if (sc.depts.Count == 0) { return DataScope.None(); }
+        }
+        return sc;
+    }
+
+    static string Join(List<int> ids) {
+        StringBuilder outp = new StringBuilder();
+        outp.Append(",");
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            outp.Append(Convert.ToString(ids[i]));
+            outp.Append(",");
+        }
+        return outp.ToString();
+    }
+
+    static void Add(List<int> list, int id) {
+        if (id == 0 || DataScope.Has(list, id)) { return; }
+        list.Add(id);
+    }
+
+    static bool Has(List<int> list, int id) {
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i] == id) { return true; }
+        }
+        return false;
+    }
+
+    /// <summary>What the role form offers, and what the role list shows.</summary>
+    static string Label(int roleScope) {
+        if (roleScope == DataScope.RoleDept) { return "本部门"; }
+        if (roleScope == DataScope.RoleDeptTree) { return "本部门及下级"; }
+        if (roleScope == DataScope.RoleSelf) { return "仅本人"; }
+        if (roleScope == DataScope.RoleCustom) { return "自定义部门"; }
+        return "全部数据";
+    }
+}

@@ -27,10 +27,16 @@ class Logs : AdminController {
 
         ListQuery q = this.Paged("id", 30);
         string kw = q.Kw();
+        DataScope sc = await this.Scope();
+        bool byActor = !sc.Any();
+        List<int> actors = await this.Actors(sc);
+
         int total = await this.OperationLog
-            .WhereIf(kw.Length > 0, a => a.username.Contains(kw)).CountAsync();
+            .WhereIf(kw.Length > 0, a => a.username.Contains(kw))
+            .WhereIf(byActor, a => actors.Contains(a.userId)).CountAsync();
         List<OperationLog> rows = await this.OperationLog
             .WhereIf(kw.Length > 0, a => a.username.Contains(kw))
+            .WhereIf(byActor, a => actors.Contains(a.userId))
             .OrderByDescending(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         List<StrMap> items = d.AddList("rows");
@@ -65,10 +71,21 @@ class Logs : AdminController {
 
         ListQuery q = this.Paged("id", 30);
         string kw = q.Kw();
+        DataScope sc = await this.Scope();
+        List<string> actors = await this.Names(sc);
+        bool byActor = !sc.Any() && actors.Count > 0;
+        // A scope with no accounts in it can see no sign-ins; an empty IN () is
+        // not a filter, so that case is said outright.
+        bool nothing = !sc.Any() && actors.Count == 0;
+
         int total = await this.LoginLog
-            .WhereIf(kw.Length > 0, a => a.username.Contains(kw)).CountAsync();
+            .WhereIf(kw.Length > 0, a => a.username.Contains(kw))
+            .WhereIf(byActor, a => actors.Contains(a.username))
+            .WhereIf(nothing, a => a.id < 0).CountAsync();
         List<LoginLog> rows = await this.LoginLog
             .WhereIf(kw.Length > 0, a => a.username.Contains(kw))
+            .WhereIf(byActor, a => actors.Contains(a.username))
+            .WhereIf(nothing, a => a.id < 0)
             .OrderByDescending(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         List<StrMap> items = d.AddList("rows");
@@ -93,6 +110,13 @@ class Logs : AdminController {
     [Description("清空日志")]
     async void Clear() {
         string kind = this.In("kind");
+        // Clearing is all-or-nothing, so only a 全部数据 role may do it: a
+        // department-scoped operator wiping the whole trail would be deleting
+        // rows it is not even allowed to read.
+        DataScope sc = await this.Scope();
+        if (!sc.Any()) {
+            this.Fail(403, "0403", "数据权限不允许清空全部日志");
+        }
         if (kind == "login") {
             int n = await this.LoginLog.Delete().Where(a => a.id > 0)
                 .ExecuteAffrowsAsync();
@@ -106,6 +130,46 @@ class Logs : AdminController {
         await this.Note("清空操作日志", "", true,
             Convert.ToString(n) + " 条");
         this.Saved("操作日志已清空");
+    }
+
+    /// <summary>The accounts in scope. A log row names an account, not a
+    /// department, so a department scope is turned into its accounts once per
+    /// screen -- the one place the scope costs a query, because the alternative
+    /// is a join in every log listing.</summary>
+    async List<User> Members(DataScope sc) {
+        if (sc.Mine()) {
+            int mine = sc.UserId();
+            return await this.User.Where(a => a.id == mine).ToListAsync();
+        }
+        List<int> depts = sc.Depts();
+        return await this.User
+            .Where(a => depts.Contains(a.departmentId)).ToListAsync();
+    }
+
+    /// <summary>Whose operations this request may read. Empty comes back as
+    /// [-1] so the filter matches nothing, and a line left by a deleted account
+    /// (or by the system, userId 0) is only visible to a 全部数据 role.
+    /// </summary>
+    async List<int> Actors(DataScope sc) {
+        List<int> ids = new List<int>();
+        if (sc.Any()) { return ids; }
+        List<User> rows = await this.Members(sc);
+        for (int i = 0; i < rows.Count; i = i + 1) { ids.Add(rows[i].id); }
+        if (ids.Count == 0) { ids.Add(0 - 1); }
+        return ids;
+    }
+
+    /// <summary>Whose sign-ins this request may read -- by name, because a
+    /// sign-in is recorded before the account is known (a failed attempt may not
+    /// even name a real one), so sys_login_log has the name and not the id. An
+    /// attempt on a name that is not an account in scope is only visible to a
+    /// 全部数据 role.</summary>
+    async List<string> Names(DataScope sc) {
+        List<string> names = new List<string>();
+        if (sc.Any()) { return names; }
+        List<User> rows = await this.Members(sc);
+        for (int i = 0; i < rows.Count; i = i + 1) { names.Add(rows[i].username); }
+        return names;
     }
 
     static string OkText(int ok) {
