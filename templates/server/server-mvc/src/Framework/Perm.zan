@@ -1,0 +1,236 @@
+using System;
+using System.Web;
+
+namespace ZanWeb;
+
+/// <summary>
+/// Button-level rights: a screen is one row, its buttons are five bits.
+///
+/// Which button an action is comes from the action itself --
+/// [Custom(Perm = PermBit.Update)] -- so it is declared once, next to the code
+/// that does the writing, and never derived from a method name: renaming Save,
+/// adding a department screen or moving a controller into a module cannot
+/// quietly change what a role may do. The compiler carries the value onto the
+/// route (Route.MetaGet("Perm")), so this class is only the index over the
+/// route table:
+///
+///     "Users.Save" -> screen "Users", bit Update(4)
+///     screen "Users" -> 15 (the bits that screen actually has)
+///
+/// A grant row is then (roleId, screen, mask) and the check is one AND. An
+/// action that declared no bit is not grantable and is refused: an operator can
+/// see it in the grant dialog as 未标注 and the boot log names it, which is a
+/// missing declaration rather than an accidental right.
+/// </summary>
+class Perm {
+    /// Route action ("Users.Save") -> the bit it occupies.
+    static Dict<string, int> bits = null;
+
+    /// Screen key ("Users") -> the bits that exist on it, in route order.
+    static Dict<string, int> masks = null;
+    static List<string> screens = null;
+
+    /// Screen key -> what to call it in the grant dialog: the [Description] of
+    /// the screen's own Index, so the dialog reads 账号管理 rather than
+    /// Admin.System.Users.
+    static Dict<string, string> titles = null;
+
+    /// Protected actions that declared no bit; named once at boot.
+    static List<string> unmarked = null;
+
+    /// <summary>Every bit a screen can hold.</summary>
+    static int Full = 31;
+
+    /// <summary>Builds the index from the registered routes. Called from main
+    /// after __AttrRoutes.Register, before the first request.</summary>
+    static void Index(WebApp app) {
+        Perm.bits = new Dict<string, int>();
+        Perm.masks = new Dict<string, int>();
+        Perm.screens = new List<string>();
+        Perm.titles = new Dict<string, string>();
+        Perm.unmarked = new List<string>();
+
+        List<Route> all = app.router.All();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            Route r = all[i];
+            if (!r.needsAuth || r.action.Length == 0) { continue; }
+            if (Perm.bits.ContainsKey(r.action)) { continue; }
+            int bit = Perm.BitValue(r.MetaGet("Perm"));
+            Perm.bits.Add(r.action, bit);
+            if (bit == 0) { Perm.unmarked.Add(r.action); continue; }
+            string screen = Perm.ScreenOf(r.action);
+            int have = 0;
+            if (Perm.masks.TryGetValue(screen, out have)) {
+                Perm.masks.Remove(screen);
+            } else {
+                Perm.screens.Add(screen);
+            }
+            Perm.masks.Add(screen, have | bit);
+            Perm.Title(screen, r);
+        }
+        if (Perm.unmarked.Count > 0) {
+            Console.WriteLine("[rbac] " + Convert.ToString(Perm.unmarked.Count)
+                + " 个受控 action 未标注 Perm，已拒绝授权: "
+                + Perm.Join(Perm.unmarked, 8));
+        }
+    }
+
+    static bool Ready() { return Perm.bits != null; }
+
+    /// <summary>The bit an action occupies, 0 when it declared none (or the
+    /// index is not built, which is the same answer: nothing is granted).
+    /// </summary>
+    static int BitOf(string action) {
+        if (!Perm.Ready()) { return 0; }
+        int bit = 0;
+        if (Perm.bits.TryGetValue(action, out bit)) { return bit; }
+        return 0;
+    }
+
+    /// <summary>The screen an action belongs to: "Users.Save" -> "Users",
+    /// "Admin.System.Users.Save" -> "Admin.System.Users". The last segment is
+    /// the method, everything before it is the screen -- which is exactly how
+    /// the router names actions, so a module prefix stays part of the key
+    /// instead of collapsing two screens into one.</summary>
+    static string ScreenOf(string action) {
+        int dot = action.LastIndexOf(".");
+        if (dot <= 0) { return action; }
+        return action.Substring(0, dot);
+    }
+
+    /// <summary>The bits that exist on a screen (0 for an unknown one).</summary>
+    static int MaskOf(string screen) {
+        if (!Perm.Ready()) { return 0; }
+        int mask = 0;
+        if (Perm.masks.TryGetValue(screen, out mask)) { return mask; }
+        return 0;
+    }
+
+    /// <summary>Records/upgrades a screen's label. The screen's Index wins,
+    /// otherwise the first route seen names it.</summary>
+    static void Title(string screen, Route r) {
+        if (r.title.Length == 0) { return; }
+        bool have = Perm.titles.ContainsKey(screen);
+        if (have && !r.action.EndsWith(".Index")) { return; }
+        if (have) { Perm.titles.Remove(screen); }
+        Perm.titles.Add(screen, r.title);
+    }
+
+    /// <summary>What to call a screen; the key itself when nothing named it.
+    /// </summary>
+    static string TitleOf(string screen) {
+        if (!Perm.Ready()) { return screen; }
+        string t = "";
+        if (Perm.titles.TryGetValue(screen, out t) && t.Length > 0) { return t; }
+        return screen;
+    }
+
+    /// <summary>Every screen that has grantable bits, in route order.</summary>
+    static List<string> Screens() {
+        if (!Perm.Ready()) { return new List<string>(); }
+        return Perm.screens;
+    }
+
+    /// <summary>The actions with no declared bit -- the grant dialog shows them
+    /// so a missing declaration is visible rather than silent.</summary>
+    static List<string> Unmarked() {
+        if (!Perm.Ready()) { return new List<string>(); }
+        return Perm.unmarked;
+    }
+
+    /// <summary>PermBit member name(s) -> bits. The compiler writes the declared
+    /// member onto the route, and "Create|Update" when an action declared two of
+    /// them -- a Save that both inserts and edits is one action, and either bit
+    /// admits it. This is the only place a name becomes a number.</summary>
+    static int BitValue(string name) {
+        int bar = name.IndexOf("|");
+        if (bar > 0) {
+            return Perm.BitValue(name.Substring(0, bar))
+                 | Perm.BitValue(name.Substring(bar + 1));
+        }
+        if (name == "View") { return (int)PermBit.View; }
+        if (name == "Create") { return (int)PermBit.Create; }
+        if (name == "Update") { return (int)PermBit.Update; }
+        if (name == "Delete") { return (int)PermBit.Delete; }
+        if (name == "Export") { return (int)PermBit.Export; }
+        return 0;
+    }
+
+    /// <summary>The bits in mask order, for the grant dialog and the boot log.
+    /// </summary>
+    static List<int> Order() {
+        List<int> outp = new List<int>();
+        outp.Add((int)PermBit.View);
+        outp.Add((int)PermBit.Create);
+        outp.Add((int)PermBit.Update);
+        outp.Add((int)PermBit.Delete);
+        outp.Add((int)PermBit.Export);
+        return outp;
+    }
+
+    static string BitLabel(int bit) {
+        if (bit == (int)PermBit.View) { return "查看"; }
+        if (bit == (int)PermBit.Create) { return "新增"; }
+        if (bit == (int)PermBit.Update) { return "修改"; }
+        if (bit == (int)PermBit.Delete) { return "删除"; }
+        if (bit == (int)PermBit.Export) { return "导出"; }
+        return "";
+    }
+
+    static string BitName(int bit) {
+        if (bit == (int)PermBit.View) { return "View"; }
+        if (bit == (int)PermBit.Create) { return "Create"; }
+        if (bit == (int)PermBit.Update) { return "Update"; }
+        if (bit == (int)PermBit.Delete) { return "Delete"; }
+        if (bit == (int)PermBit.Export) { return "Export"; }
+        return "";
+    }
+
+    // ---- the stored form -----------------------------------------------------
+    // A role's masks travel through shared memory as one string,
+    // ",Users:15,Roles:5,", for the same reason its actions used to: the request
+    // path reads a role row and answers without a query, and a role is rewritten
+    // only when an operator changes it.
+
+    /// <summary>One screen's mask inside the stored form, 0 when absent.
+    /// </summary>
+    static int MaskIn(string stored, string screen) {
+        if (stored.Length == 0 || screen.Length == 0) { return 0; }
+        int at = stored.IndexOf("," + screen + ":");
+        if (at < 0) { return 0; }
+        int i = at + screen.Length + 2;
+        int val = 0;
+        bool any = false;
+        while (i < stored.Length) {
+            int c = stored[i] & 255;
+            if (c < 48 || c > 57) { break; }
+            val = val * 10 + (c - 48);
+            any = true;
+            i = i + 1;
+        }
+        if (!any) { return 0; }
+        return val;
+    }
+
+    /// <summary>Appends one screen's mask to the stored form being built.
+    /// </summary>
+    static void Append(StringBuilder sb, string screen, int mask) {
+        if (screen.Length == 0 || mask <= 0) { return; }
+        sb.Append(screen);
+        sb.Append(":");
+        sb.Append(Convert.ToString(mask));
+        sb.Append(",");
+    }
+
+    static string Join(List<string> items, int max) {
+        StringBuilder sb = new StringBuilder();
+        int n = items.Count;
+        if (n > max) { n = max; }
+        for (int i = 0; i < n; i = i + 1) {
+            if (i > 0) { sb.Append(" "); }
+            sb.Append(items[i]);
+        }
+        if (items.Count > n) { sb.Append(" ..."); }
+        return sb.ToString();
+    }
+}

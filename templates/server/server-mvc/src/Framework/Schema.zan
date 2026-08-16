@@ -102,10 +102,12 @@ class Schema {
         return await db.Insert<Role>(r).ExecuteIdentityAsync();
     }
 
-    static async void Grant(IDbConnection db, int roleId, string action, long now) {
+    static async void Grant(IDbConnection db, int roleId, string screen, int mask,
+                            long now) {
         RoleGrant g = new RoleGrant();
         g.roleId = roleId;
-        g.action = action;
+        g.action = screen;
+        g.mask = mask;
         g.createdAt = now;
         int _id = await db.Insert<RoleGrant>(g).ExecuteIdentityAsync();
     }
@@ -370,12 +372,64 @@ class Schema {
     // ever by insert: a right an operator revoked stays revoked, because the
     // grant it would re-add is already accounted for below.
 
+    /// <summary>Folds pre-mask grant rows (one action, mask 0) into one row per
+    /// screen with the bits those actions declare. Runs before the built-in roles
+    /// are looked at, and only over rows that still have mask 0, so it is a
+    /// no-op from the second boot on. An action nobody declared a bit for has no
+    /// bit to keep: it is dropped here and named by Perm.Index's boot line, which
+    /// is the missing declaration showing up rather than a silent right.
+    /// </summary>
+    static async void MigrateGrants(IDbConnection db) {
+        List<RoleGrant> old = await db.Select<RoleGrant>()
+            .Where(a => a.mask == 0).ToListAsync();
+        if (old.Count == 0) { return; }
+
+        // (roleId, screen) -> bits, kept as two parallel lists: a handful of
+        // roles times a handful of screens, once in the life of a database.
+        List<string> keys = new List<string>();
+        List<int> masks = new List<int>();
+        for (int i = 0; i < old.Count; i = i + 1) {
+            RoleGrant g = old[i];
+            int bit = Perm.BitOf(g.action);
+            if (bit == 0) { continue; }
+            string key = Convert.ToString(g.roleId) + "|"
+                + Perm.ScreenOf(g.action);
+            int at = keys.IndexOf(key);
+            if (at < 0) { keys.Add(key); masks.Add(bit); }
+            else { masks[at] = masks[at] | bit; }
+        }
+
+        int _gone = await db.Delete<RoleGrant>().Where(a => a.mask == 0)
+            .ExecuteAffrowsAsync();
+        long now = WebApp.NowSeconds();
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string key = keys[i];
+            int bar = key.IndexOf("|");
+            int roleId = Convert.ToInt32(key.Substring(0, bar));
+            string screen = key.Substring(bar + 1);
+            RoleGrant have = await db.Select<RoleGrant>()
+                .Where(a => a.roleId == roleId && a.action == screen)
+                .FirstAsync();
+            if (have != null) {
+                int merged = have.mask | masks[i];
+                int _n = await db.Update<RoleGrant>()
+                    .Set(a => a.mask, merged)
+                    .Where(a => a.id == have.id).ExecuteAffrowsAsync();
+                continue;
+            }
+            await Schema.Grant(db, roleId, screen, masks[i], now);
+        }
+        Console.WriteLine("[rbac] 旧授权已合并为 "
+            + Convert.ToString(keys.Count) + " 条屏掩码");
+    }
+
     /// <summary>Grants the built-in roles the protected route actions they do
     /// not hold yet. Safe on every boot; nothing is ever removed.</summary>
     static async void SyncRoleGrants(WebApp app) {
         IDbConnection db = await AuthUser.Lease();
         if (db == null) { return; }
         try {
+            await Schema.MigrateGrants(db);
             Role admin = await db.Select<Role>()
                 .Where(a => a.code == "admin").FirstAsync();
             Role editor = await db.Select<Role>()
@@ -404,16 +458,35 @@ class Schema {
             if (!fillAdmin && !fillEditor) { return; }
 
             long now = WebApp.NowSeconds();
+            // One row per screen: the bits that screen actually has, which is
+            // the whole of it for the admin role and the content screens for the
+            // editor one.
             List<Route> routes = app.router.All();
-            string done = ",";
+            List<string> screens = new List<string>();
+            List<int> masks = new List<int>();
+            List<bool> content = new List<bool>();
             for (int i = 0; i < routes.Count; i = i + 1) {
                 Route r = routes[i];
                 if (r.action.Length == 0 || !r.needsAuth) { continue; }
-                if (done.Contains("," + r.action + ",")) { continue; }
-                done = done + r.action + ",";
-                if (fillAdmin) { await Schema.Grant(db, admin.id, r.action, now); }
-                if (fillEditor && Schema.IsContent(r.pattern)) {
-                    await Schema.Grant(db, editor.id, r.action, now);
+                int bit = Perm.BitOf(r.action);
+                if (bit == 0) { continue; }
+                string screen = Perm.ScreenOf(r.action);
+                int at = screens.IndexOf(screen);
+                if (at < 0) {
+                    screens.Add(screen);
+                    masks.Add(bit);
+                    content.Add(Schema.IsContent(r.pattern));
+                } else {
+                    masks[at] = masks[at] | bit;
+                    if (Schema.IsContent(r.pattern)) { content[at] = true; }
+                }
+            }
+            for (int i = 0; i < screens.Count; i = i + 1) {
+                if (fillAdmin) {
+                    await Schema.Grant(db, admin.id, screens[i], masks[i], now);
+                }
+                if (fillEditor && content[i]) {
+                    await Schema.Grant(db, editor.id, screens[i], masks[i], now);
                 }
             }
         } finally {

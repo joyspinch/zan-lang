@@ -15,7 +15,7 @@ namespace ZanWeb;
 /// Users.Save?" costs no query and no per-worker duplication: every worker
 /// process attaches to the same rows.
 ///
-///   roles:  key "3"  -> acts ",Users.Index,Users.Save,"   (membership test)
+///   roles:  key "3"  -> acts ",Users:15,Roles:1,"         (screen -> mask)
 ///                      scope 2, depts ",3,7,"             (data scope)
 ///   users:  key "42" -> super 0|1, roles ",3,7,"          (expires, reloaded)
 ///                      scope 2, depts ",3,7,"             (resolved, expanded)
@@ -73,7 +73,7 @@ class PermTable {
         return PermTable.roles != null && PermTable.users != null;
     }
 
-    /// <summary>Rewrites every role's action set from the database. Run on boot
+    /// <summary>Rewrites every role's screen masks from the database. Run on boot
     /// and after an operator changes a role's grants: a role is edited rarely
     /// and read on every request, so it is pushed rather than expired.</summary>
     static async void LoadRoles(IDbConnection db) {
@@ -89,8 +89,7 @@ class PermTable {
             for (int j = 0; j < grants.Count; j = j + 1) {
                 if (grants[j].roleId != r.id) { continue; }
                 if (grants[j].action.Length == 0) { continue; }
-                acts.Append(grants[j].action);
-                acts.Append(",");
+                Perm.Append(acts, grants[j].action, grants[j].mask);
             }
             string key = Convert.ToString(r.id);
             bool _ok = PermTable.roles.SetString(key, "acts", acts.ToString());
@@ -114,17 +113,30 @@ class PermTable {
         return PermTable.roles.GetString(roleId, "depts");
     }
 
-    /// <summary>Whether one of `roleIds` (",3,7,") grants `action`. Reads the
-    /// role rows straight out of shared memory.</summary>
+    /// <summary>Whether one of `roleIds` (",3,7,") grants `action`: the bit the
+    /// action declared, looked up in that role's mask for the action's screen.
+    /// An action that declared no bit (Perm.BitOf == 0) is refused -- a right
+    /// nobody can grant is not a right anybody holds.</summary>
     static bool RolesAllow(string roleIds, string action) {
         if (!PermTable.Ready()) { return false; }
-        string needle = "," + action + ",";
+        int bit = Perm.BitOf(action);
+        if (bit == 0) { return false; }
+        return (PermTable.RolesMask(roleIds, Perm.ScreenOf(action)) & bit) != 0;
+    }
+
+    /// <summary>Every bit `roleIds` hold on one screen, OR-ed together: what the
+    /// dispatcher refuses on and what the screen's buttons are rendered from,
+    /// out of the one mask.</summary>
+    static int RolesMask(string roleIds, string screen) {
+        if (!PermTable.Ready() || screen.Length == 0) { return 0; }
+        int mask = 0;
         List<string> ids = PermTable.Split(roleIds);
         for (int i = 0; i < ids.Count; i = i + 1) {
             string acts = PermTable.roles.GetString(ids[i], "acts");
-            if (acts.Length > 0 && acts.Contains(needle)) { return true; }
+            if (acts.Length == 0) { continue; }
+            mask = mask | Perm.MaskIn(acts, screen);
         }
-        return false;
+        return mask;
     }
 
     /// <summary>This account's roles as ",3,7,", or "" when it is not in shared

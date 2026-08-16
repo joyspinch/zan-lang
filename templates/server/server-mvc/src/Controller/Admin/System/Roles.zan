@@ -22,7 +22,7 @@ namespace ZanWeb.Admin.System;
 class Roles : AdminController {
     [HttpGet]
     [Route("/admin/system/roles")]
-    [Custom(IsMenu = true, Icon = "mdi:shield-account")]
+    [Custom(IsMenu = true, Icon = "mdi:shield-account", Perm = PermBit.View)]
     [Description("角色管理")]
     async void Index() {
         ViewData d = await this.Layout("角色管理");
@@ -58,6 +58,7 @@ class Roles : AdminController {
     }
 
     [HttpGet]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("角色表单")]
     async void Form() {
         int id = this.InInt("id", 0);
@@ -101,6 +102,7 @@ class Roles : AdminController {
     }
 
     [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存角色")]
     async void Save() {
         int id = this.InInt("id", 0);
@@ -162,6 +164,7 @@ class Roles : AdminController {
     }
 
     [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
     [Description("删除角色")]
     async void Delete() {
         int id = this.InInt("id", 0);
@@ -179,10 +182,13 @@ class Roles : AdminController {
         this.Saved("角色已删除");
     }
 
-    /// <summary>The grant dialog: every protected action in the route table,
-    /// grouped by the screen it belongs to, with the ones this role holds
-    /// ticked.</summary>
+    /// <summary>The grant dialog: one row per screen, one checkbox per button
+    /// the screen actually has (查/增/改/删/导出), ticked where this role holds
+    /// the bit. Which bits a screen has comes from the actions' own
+    /// [Custom(Perm = ...)], so a new screen appears here the moment it
+    /// compiles.</summary>
     [HttpGet]
+    [Custom(Perm = PermBit.Update)]
     [Description("角色授权")]
     async void Grant() {
         int id = this.InInt("id", 0);
@@ -192,32 +198,39 @@ class Roles : AdminController {
         d.Set("name", r.name);
         List<RoleGrant> held = await this.RoleGrant
             .Where(a => a.roleId == id).ToListAsync();
-        string has = ",";
-        for (int i = 0; i < held.Count; i = i + 1) { has = has + held[i].action + ","; }
 
         List<StrMap> rows = d.AddList("perms");
-        List<Route> routes = Roles.Grantable();
-        string group = "";
-        for (int i = 0; i < routes.Count; i = i + 1) {
-            Route route = routes[i];
-            string owner = Roles.Owner(route.action);
-            if (owner != group) {
-                group = owner;
-                StrMap head = new StrMap();
-                head.Set("group", group);
-                rows.Add(head);
+        List<string> screens = Perm.Screens();
+        List<int> order = Perm.Order();
+        for (int i = 0; i < screens.Count; i = i + 1) {
+            string screen = screens[i];
+            int exists = Perm.MaskOf(screen);
+            int mine = 0;
+            for (int j = 0; j < held.Count; j = j + 1) {
+                if (held[j].action == screen) { mine = mine | held[j].mask; }
             }
             StrMap row = new StrMap();
-            row.Set("id", route.action);
-            row.Set("name", Fmt.Text(route.title, route.action));
-            row.Set("code", route.method + " " + route.pattern);
-            if (has.Contains("," + route.action + ",")) { row.Set("checked", "checked"); }
+            row.Set("screen", screen);
+            row.Set("name", Perm.TitleOf(screen));
+            for (int b = 0; b < order.Count; b = b + 1) {
+                int bit = order[b];
+                string nm = Perm.BitName(bit);
+                if ((exists & bit) == 0) { continue; }
+                row.Set("has" + nm, "1");
+                row.Set("val" + nm, screen + ":" + Convert.ToString(bit));
+                if ((mine & bit) != 0) { row.Set("on" + nm, "checked"); }
+            }
             rows.Add(row);
         }
+        // A protected action that declared no bit cannot be granted; showing it
+        // here is how an operator finds the missing declaration.
+        List<string> gaps = Perm.Unmarked();
+        if (gaps.Count > 0) { d.Set("unmarked", Perm.Join(gaps, 20)); }
         this.Dialog(d);
     }
 
     [HttpPost]
+    [Custom(Perm = PermBit.Update)]
     [Description("保存角色授权")]
     async void GrantSave() {
         int id = this.InInt("id", 0);
@@ -226,17 +239,31 @@ class Roles : AdminController {
         int _cleared = await this.RoleGrant.Delete()
             .Where(a => a.roleId == id).ExecuteAffrowsAsync();
 
-        // Only actions that exist can be granted: the form is a list of route
-        // actions, so anything else in the submission is a forged field.
+        // Only bits that exist can be granted: the form submits "screen:bit"
+        // pairs, and anything the route table does not have -- a screen nobody
+        // registered, a button that screen has no action for -- is a forged
+        // field and is dropped rather than stored.
         long now = WebApp.NowSeconds();
-        List<Route> routes = Roles.Grantable();
+        List<string> screens = Perm.Screens();
+        List<int> order = Perm.Order();
         int granted = 0;
-        for (int i = 0; i < routes.Count; i = i + 1) {
-            string action = routes[i].action;
-            if (!AuthUser.Holds(picked, action)) { continue; }
+        for (int i = 0; i < screens.Count; i = i + 1) {
+            string screen = screens[i];
+            int exists = Perm.MaskOf(screen);
+            int mask = 0;
+            for (int b = 0; b < order.Count; b = b + 1) {
+                int bit = order[b];
+                if ((exists & bit) == 0) { continue; }
+                if (!AuthUser.Holds(picked, screen + ":" + Convert.ToString(bit))) {
+                    continue;
+                }
+                mask = mask | bit;
+            }
+            if (mask == 0) { continue; }
             RoleGrant g = new RoleGrant();
             g.roleId = id;
-            g.action = action;
+            g.action = screen;
+            g.mask = mask;
             g.createdAt = now;
             int _n = await this.RoleGrant.Insert(g).ExecuteIdentityAsync();
             granted = granted + 1;
@@ -272,38 +299,6 @@ class Roles : AdminController {
         }
         if (kept == 0) { return ""; }
         return outp.ToString();
-    }
-
-    /// <summary>The rights that exist: every protected action in the route
-    /// table, each listed once (a route registered for two methods is one
-    /// right), ordered by the screen that owns it.</summary>
-    static List<Route> Grantable() {
-        List<Route> all = WebHost.Current().router.All();
-        List<Route> outp = new List<Route>();
-        string seen = ",";
-        for (int i = 0; i < all.Count; i = i + 1) {
-            Route r = all[i];
-            if (!r.needsAuth || r.action.Length == 0) { continue; }
-            if (seen.Contains("," + r.action + ",")) { continue; }
-            seen = seen + r.action + ",";
-            Roles.InsertSorted(outp, r);
-        }
-        return outp;
-    }
-
-    static void InsertSorted(List<Route> list, Route r) {
-        int i = list.Count;
-        while (i > 0 && String.CompareOrdinal(list[i - 1].action, r.action) > 0) {
-            i = i - 1;
-        }
-        list.Insert(i, r);
-    }
-
-    /// <summary>The screen an action belongs to: "Users.Save" -> "Users".</summary>
-    static string Owner(string action) {
-        int dot = action.IndexOf(".");
-        if (dot <= 0) { return action; }
-        return action.Substring(0, dot);
     }
 
     static string StatusText(int status) {
