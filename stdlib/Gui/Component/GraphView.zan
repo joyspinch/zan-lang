@@ -1,0 +1,653 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component;
+
+/// 依赖图里的一个节点。
+///
+/// `deps` 里放前置节点的 id，图的层次、连线和解锁都从它推出来：
+/// 前置全部 `done` 的节点才可以开工，未满足的节点由图自己标成锁住的
+/// ——调用方不需要再维护一份「谁可以开始」的并行状态。
+///
+/// 布局字段（`depth`/`lx`/`ly`/`lw`/`lh`）由 GraphView 每帧写回，读它们
+/// 可以把浮层、菜单锚到节点上。
+class GraphNode {
+    string id;
+    string title;
+    /// 负责人之类的短标签，画在标题下方。
+    string tag;
+    /// 上面那个标签的语义类（`primary`/`success`…），由皮肤取色。
+    string tagClass;
+    /// 状态短语（进行中 / 待办 / 阻塞…）。
+    string state;
+    string stateClass;
+    /// 0..100 的进度；负数表示这个节点不显示进度条。
+    int progress;
+    /// 该节点已完成：后继节点据此解锁。
+    bool done;
+    /// 前置节点的 id。
+    List<string> deps;
+    /// 调用方自己的 payload（索引、路径…），图不解释它。
+    string payload;
+
+    /// 布局结果：层号与节点卡片的屏幕矩形。
+    int depth;
+    int lx;
+    int ly;
+    int lw;
+    int lh;
+
+    static GraphNode Of(string id, string title) {
+        GraphNode n = new GraphNode();
+        n.id = id;
+        n.title = title;
+        n.tag = "";
+        n.tagClass = "";
+        n.state = "";
+        n.stateClass = "";
+        n.progress = 0 - 1;
+        n.done = false;
+        n.deps = new List<string>();
+        n.payload = "";
+        n.depth = 0;
+        n.lx = 0;
+        n.ly = 0;
+        n.lw = 0;
+        n.lh = 0;
+        return n;
+    }
+
+    /// 声明一个前置节点。
+    GraphNode After(string depId) {
+        if (depId != "") { this.deps.Add(depId); }
+        return this;
+    }
+
+    GraphNode WithTag(string text, string cls) {
+        this.tag = text;
+        this.tagClass = cls;
+        return this;
+    }
+
+    GraphNode WithState(string text, string cls) {
+        this.state = text;
+        this.stateClass = cls;
+        return this;
+    }
+
+    GraphNode WithProgress(int pct) {
+        this.progress = pct;
+        return this;
+    }
+
+    GraphNode WithPayload(string p) {
+        this.payload = p;
+        return this;
+    }
+
+    GraphNode Finished() {
+        this.done = true;
+        return this;
+    }
+}
+
+/// 为一个节点构建卡片控件，供节点长相由调用方决定的图使用。
+delegate Control GraphCardOf(GraphNode node);
+
+/// <summary>
+/// 节点连线画布：一份 `List&lt;GraphNode&gt;` 按依赖关系分层画成图，
+/// 节点是标准控件搭的卡片，画布本身只负责层次布局、连线和交互。
+///
+///     GraphView g = new GraphView();
+///     g.Bind(model.nodes);            // 调用方的列表，不复制
+///     g.OnSelect(ShowNodeContext);    // 读 SelectedIndex / Selected
+///     g.OnActivate(StartSelected);    // 双击开工
+///     g.OnBlocked(ExplainLock);       // 双击了前置未完成的节点
+///     panel.Add(g);
+///
+/// 层次是从依赖算出来的最长路径：没有前置的节点在第 0 层，其余节点
+/// 排在其所有前置的下一层，所以连线一律自上而下，不会出现回头的边。
+/// 一层放不下就在本层内折行，因此只需要纵向滚动。
+///
+/// 节点卡片默认由标准控件拼出（标题 + 负责人/状态标签 + 进度条 +
+/// 锁标记）；传入模板即可换成调用方自己的组件：
+///
+///     GraphView g = new GraphView(n => MyCard(n));
+///
+/// 前置未全部完成的节点是锁住的：仍可点开查看，但双击不会触发
+/// Activate，而是触发 Blocked，让宿主说明还差哪一步。
+/// </summary>
+class GraphView : Control {
+    /// 调用方的节点，每帧读取；卡片需要重建时调用 Refresh()。
+    List<GraphNode> data;
+    SignalInt sel;
+    SignalInt scroll;
+    GraphCardOf tpl;
+    /// 每个节点一张卡片，索引与 `data` 对齐。
+    List<Control> cards;
+    /// 默认卡片里的锁标记，索引与 `cards` 对齐（自定义卡片处为 null）。
+    List<Tag> locks;
+    bool cardsStale;
+    int builtFor;
+
+    /// 图没有节点时居中显示（"" 不画）。
+    string Empty;
+
+    /// 处理器运行期间设置：事件涉及的节点与指针位置。
+    int ctxRow;
+    int ctxX;
+    int ctxY;
+
+    /// 节点被选中时（读 SelectedIndex / Selected）。
+    UiEvent Select;
+    /// 节点被双击且已解锁时（开工）。
+    UiEvent Activate;
+    /// 双击了锁住的节点时（读 ContextRow，说明还差哪些前置）。
+    UiEvent Blocked;
+    /// 节点被右键点击时（读 ContextRow / ContextX / ContextY）。
+    UiEvent Context;
+
+    void InitGraph() {
+        this.InitControl("graph", 5);
+        data = new List<GraphNode>();
+        sel = new SignalInt(0 - 1);
+        scroll = new SignalInt(0);
+        tpl = null;
+        cards = new List<Control>();
+        locks = new List<Tag>();
+        cardsStale = true;
+        builtFor = 0 - 1;
+        Empty = "";
+        ctxRow = 0 - 1;
+        ctxX = 0;
+        ctxY = 0;
+        wiresOwnEvents = true;
+        Select = new UiEvent();
+        Activate = new UiEvent();
+        Blocked = new UiEvent();
+        Context = new UiEvent();
+    }
+
+    GraphView() { InitGraph(); }
+
+    /// 自定义节点卡片。
+    GraphView(GraphCardOf template) {
+        InitGraph();
+        tpl = template;
+    }
+
+    override string Kind() { return "GraphView"; }
+
+    override string StyleType() { return "graph"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec empty = PropSpec.Text("empty", "Empty text");
+        empty.str = Empty;
+        ps.Add(empty);
+        PropSpec cls = PropSpec.Text("class", "Classes");
+        cls.str = Class;
+        ps.Add(cls);
+        return ps;
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Select");
+        e.Add("Activate");
+        e.Add("Blocked");
+        e.Add("Context");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Select") { Select.Add(a); return; }
+        if (evt == "Activate") { Activate.Add(a); return; }
+        if (evt == "Blocked") { Blocked.Add(a); return; }
+        if (evt == "Context") { Context.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    // ---- 数据 ---------------------------------------------------------------
+
+    /// 绑定调用方的节点列表；不复制任何内容。
+    GraphView Bind(List<GraphNode> nodes) {
+        if (nodes == null) { data = new List<GraphNode>(); }
+        else { data = nodes; }
+        cardsStale = true;
+        if (sel.Get() >= data.Count) { sel.Set(0 - 1); }
+        return this;
+    }
+
+    /// 节点内容变了：下一帧重建卡片。
+    void Refresh() { cardsStale = true; }
+
+    /// 共享调用方的选择信号，供在列表重建后保持选择的宿主使用。
+    GraphView BindSel(SignalInt s) {
+        if (s != null) { sel = s; }
+        return this;
+    }
+
+    GraphView EmptyText(string text) { Empty = text; return this; }
+
+    GraphView OnSelect(Action a) { Select.Add(a); return this; }
+    GraphView OnActivate(Action a) { Activate.Add(a); return this; }
+    GraphView OnBlocked(Action a) { Blocked.Add(a); return this; }
+    GraphView OnContext(Action a) { Context.Add(a); return this; }
+
+    int Count() { return data.Count; }
+
+    bool Has(int row) { return row >= 0 && row < data.Count; }
+
+    GraphNode NodeAt(int row) { return data[row]; }
+
+    List<GraphNode> Nodes() { return data; }
+
+    int SelectedIndex() { return sel.Get(); }
+
+    bool HasSelection() { return this.Has(sel.Get()); }
+
+    /// 选中的节点；仅在 HasSelection() 时有效。
+    GraphNode Selected() { return data[sel.Get()]; }
+
+    /// 事件处理器涉及的节点行号与指针位置。
+    int ContextRow() { return ctxRow; }
+    int ContextX() { return ctxX; }
+    int ContextY() { return ctxY; }
+
+    int IndexOfId(string id) { return GraphView.IndexOf(data, id); }
+
+    /// 按 id 选中节点，并触发 Select（宿主恢复上次选择时用）。
+    void SelectId(string id) {
+        int i = this.IndexOfId(id);
+        if (i < 0 || sel.Get() == i) { return; }
+        sel.Set(i);
+        Select.Post();
+    }
+
+    static int IndexOf(List<GraphNode> ns, string id) {
+        if (id == "") { return 0 - 1; }
+        for (int i = 0; i < ns.Count; i = i + 1) {
+            if (ns[i].id == id) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    // ---- 依赖与解锁 ---------------------------------------------------------
+
+    /// `row` 的前置里还没做完的那些 id。空表示它可以开工了。
+    /// 指向不存在节点的前置被忽略：图只为自己画得出的关系负责，
+    /// 半截的引用留给宿主自己校验，而不是在这里把节点永久锁死。
+    List<string> PendingDeps(int row) {
+        List<string> miss = new List<string>();
+        if (!this.Has(row)) { return miss; }
+        GraphNode n = data[row];
+        for (int i = 0; i < n.deps.Count; i = i + 1) {
+            int d = GraphView.IndexOf(data, n.deps[i]);
+            if (d < 0 || data[d].done) { continue; }
+            miss.Add(n.deps[i]);
+        }
+        return miss;
+    }
+
+    /// 前置没做完 —— 节点锁住，双击只会触发 Blocked。
+    bool LockedAt(int row) { return this.PendingDeps(row).Count > 0; }
+
+    /// 层号 = 到某个无前置节点的最长路径。用逐轮松弛算，轮数以节点
+    /// 数为上限：依赖成环时不再变化就停下，图仍然画得出来（环上的边
+    /// 会同层相连），而不是无限递归下去。
+    void ComputeDepth() {
+        for (int i = 0; i < data.Count; i = i + 1) { data[i].depth = 0; }
+        int rounds = 0;
+        bool moved = true;
+        while (moved && rounds < data.Count) {
+            moved = false;
+            rounds = rounds + 1;
+            for (int i = 0; i < data.Count; i = i + 1) {
+                GraphNode n = data[i];
+                int want = 0;
+                for (int k = 0; k < n.deps.Count; k = k + 1) {
+                    int d = GraphView.IndexOf(data, n.deps[k]);
+                    if (d < 0) { continue; }
+                    if (data[d].depth + 1 > want) { want = data[d].depth + 1; }
+                }
+                if (want > n.depth) {
+                    n.depth = want;
+                    moved = true;
+                }
+            }
+        }
+    }
+
+    // ---- 卡片 ---------------------------------------------------------------
+
+    bool Templated() { return tpl != null; }
+
+    /// 每个节点一张卡片。卡片是本控件的子节点，因此由框架测量、
+    /// 绘制、换肤，画布自己只摆位置、画连线和标记选中/锁住。
+    void BuildCards(App app) {
+        if (!cardsStale && builtFor == data.Count) { return; }
+        this.RemoveAll();
+        cards = new List<Control>();
+        locks = new List<Tag>();
+        for (int i = 0; i < data.Count; i = i + 1) {
+            Control card = null;
+            Tag mark = null;
+            if (this.Templated()) {
+                card = tpl(data[i]);
+            } else {
+                mark = GraphView.LockMark();
+                card = GraphView.DefaultCard(data[i], mark);
+            }
+            if (card == null) { continue; }
+            this.Add(card);
+            card.dock = 0;
+            cards.Add(card);
+            locks.Add(mark);
+        }
+        cardsStale = false;
+        builtFor = data.Count;
+        for (int k = 0; k < cards.Count; k = k + 1) {
+            cards[k].MeasureTree(app);
+        }
+    }
+
+    /// 内置节点卡片：标题（右上角锁标记）+ 负责人/状态标签 + 进度条，
+    /// 全是标准控件，卡面本身是标准 Card，`card.graphnode` 及其状态类
+    /// 在皮肤里。
+    static Card DefaultCard(GraphNode n, Tag mark) {
+        Card box = new Card();
+        box.Class = "graphnode";
+        Panel head = Panel.Row();
+        head.Class = "graphnodehead";
+        head.dock = 1;
+        if (mark != null) {
+            mark.dock = 4;
+            head.Add(mark);
+        }
+        Label title = new Label(n.title);
+        title.Class = "strong";
+        title.dock = 5;
+        head.Add(title);
+        box.Add(head);
+        if (n.tag != "" || n.state != "") {
+            Panel row = Panel.Row();
+            row.Class = "graphnodetags";
+            row.dock = 1;
+            if (n.tag != "") {
+                Tag owner = new Tag(n.tag);
+                owner.Class = GraphView.TagClass(n.tagClass);
+                owner.dock = 3;
+                row.Add(owner);
+            }
+            if (n.state != "") {
+                Tag st = new Tag(n.state);
+                st.Class = GraphView.TagClass(n.stateClass);
+                st.dock = 3;
+                row.Add(st);
+            }
+            box.Add(row);
+        }
+        if (n.progress >= 0) {
+            Progress bar = new Progress(n.progress, 0);
+            bar.Class = "graphnodebar";
+            bar.dock = 1;
+            box.Add(bar);
+        }
+        return box;
+    }
+
+    /// 节点标签一律用小号，语义类由调用方给。
+    static string TagClass(string cls) {
+        if (cls == "") { return "small"; }
+        return cls + " small";
+    }
+
+    /// 锁标记：前置没做完时显示的标准标签（默认卡片专用）。
+    static Tag LockMark() {
+        Tag mark = new Tag("");
+        mark.Icon = "lock";
+        mark.Class = "graphnodelock tiny";
+        mark.dock = 4;
+        mark.visible = false;
+        return mark;
+    }
+
+    // ---- 布局 ---------------------------------------------------------------
+
+    int Gap(App app) {
+        StyleBox s = this.ResolveStyleAs(app, "graph", Class, Style.SNormal());
+        return s.GapOr(app.theme.gapLarge);
+    }
+
+    /// 所有卡片统一宽度：图要读的是层次，宽度参差不齐会让同层
+    /// 的卡片看着像不同的东西。取最宽的那张，再收进可用宽度。
+    int CardWidth(App app, int areaW) {
+        int w = app.Scale(140);
+        for (int i = 0; i < cards.Count; i = i + 1) {
+            if (cards[i].prefW > w) { w = cards[i].prefW; }
+        }
+        if (w > areaW && areaW > 0) { w = areaW; }
+        return w;
+    }
+
+    int CardHeight(App app) {
+        int h = app.Scale(48);
+        for (int i = 0; i < cards.Count; i = i + 1) {
+            if (cards[i].prefH > h) { h = cards[i].prefH; }
+        }
+        return h;
+    }
+
+    /// 按层排布，写回每个节点的矩形，返回内容总高度。`areaX/areaY`
+    /// 是内容区左上角（已含滚动偏移）。
+    int Layout(App app, int areaX, int areaY, int areaW) {
+        this.ComputeDepth();
+        int gap = this.Gap(app);
+        int cw = this.CardWidth(app, areaW);
+        int ch = this.CardHeight(app);
+        int perRow = (areaW + gap) / (cw + gap);
+        if (perRow < 1) { perRow = 1; }
+        int maxDepth = 0;
+        for (int i = 0; i < data.Count; i = i + 1) {
+            if (data[i].depth > maxDepth) { maxDepth = data[i].depth; }
+        }
+        int y = areaY;
+        for (int d = 0; d <= maxDepth; d = d + 1) {
+            // 本层的节点，按在列表里的次序 —— 宿主重排任务的次序
+            // 就是图上的次序，不再另发明一套排序。
+            List<int> layer = new List<int>();
+            for (int i = 0; i < data.Count; i = i + 1) {
+                if (data[i].depth == d) { layer.Add(i); }
+            }
+            if (layer.Count == 0) { continue; }
+            int placed = 0;
+            while (placed < layer.Count) {
+                int cnt = layer.Count - placed;
+                if (cnt > perRow) { cnt = perRow; }
+                int rowW = cnt * cw + (cnt - 1) * gap;
+                int x = areaX + (areaW - rowW) / 2;
+                for (int k = 0; k < cnt; k = k + 1) {
+                    GraphNode n = data[layer[placed + k]];
+                    n.lx = x + k * (cw + gap);
+                    n.ly = y;
+                    n.lw = cw;
+                    n.lh = ch;
+                }
+                placed = placed + cnt;
+                y = y + ch + gap;
+            }
+        }
+        int total = y - areaY;
+        if (total > 0) { total = total - gap; }
+        return total;
+    }
+
+    // ---- 绘制 ---------------------------------------------------------------
+
+    override void OnMeasure(App app) {
+        this.BuildCards(app);
+        int gap = this.Gap(app);
+        int areaW = bw - gap * 2;
+        if (areaW <= 0) { areaW = app.Scale(320); }
+        prefH = this.Layout(app, 0, 0, areaW) + gap * 2;
+    }
+
+    override void OnPaint(App app) {
+        this.BuildCards(app);
+        Canvas c = app.canvas;
+        StyleBox s = this.ResolveStyleAs(app, "graph", Class, Style.SNormal());
+        s.Paint(app, bx, by, bw, bh);
+        if (data.Count == 0) {
+            this.PaintEmpty(app);
+            return;
+        }
+        int gap = this.Gap(app);
+        int barW = app.Scale(6);
+        int areaW = bw - gap * 2;
+        if (areaW < app.Scale(40)) { areaW = app.Scale(40); }
+        int contentH = this.Layout(app, bx + gap, by + gap, areaW);
+        bool overflow = contentH + gap * 2 > bh;
+        if (overflow) {
+            areaW = areaW - barW;
+            contentH = this.Layout(app, bx + gap, by + gap, areaW);
+        }
+        int off = this.ScrollOffset(app, contentH + gap * 2);
+        if (off != 0) { this.Layout(app, bx + gap, by + gap - off, areaW); }
+
+        c.PushClip(bx, by, bw, bh);
+        this.PaintEdges(app);
+        this.PaintNodes(app);
+        c.PopClip();
+        if (overflow) {
+            Scrollbar.RenderVerticalScroll(app, bx + bw - barW, by, bh, bh,
+                contentH + gap * 2, scroll);
+        }
+    }
+
+    int ScrollOffset(App app, int contentH) {
+        Scrollbar.HandleWheel(app, bx, by, bw, bh, contentH, scroll);
+        int maxOff = contentH - bh;
+        if (maxOff < 0) { maxOff = 0; }
+        if (scroll.Get() > maxOff) { scroll.Set(maxOff); }
+        if (scroll.Get() < 0) { scroll.Set(0); }
+        return scroll.Get();
+    }
+
+    /// 依赖连线：前置卡片底边中点 -> 本节点顶边中点，走折线，末端
+    /// 带箭头。已完成的前置用强调色，未完成的用分隔线色 —— 一眼
+    /// 看出哪条边还卡着。
+    void PaintEdges(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int th = app.Scale(1);
+        for (int i = 0; i < data.Count; i = i + 1) {
+            GraphNode n = data[i];
+            for (int k = 0; k < n.deps.Count; k = k + 1) {
+                int d = GraphView.IndexOf(data, n.deps[k]);
+                if (d < 0) { continue; }
+                GraphNode p = data[d];
+                int col = t.divider;
+                if (p.done) { col = t.primary; }
+                int x0 = p.lx + p.lw / 2;
+                int y0 = p.ly + p.lh;
+                int x1 = n.lx + n.lw / 2;
+                int y1 = n.ly;
+                int ym = (y0 + y1) / 2;
+                if (y1 <= y0) { ym = y0 + app.Scale(8); }
+                c.DrawLine(x0, y0, x0, ym, col, th);
+                c.DrawLine(x0, ym, x1, ym, col, th);
+                c.DrawLine(x1, ym, x1, y1, col, th);
+                int a = app.Scale(4);
+                c.DrawLine(x1 - a, y1 - a, x1, y1, col, th);
+                c.DrawLine(x1 + a, y1 - a, x1, y1, col, th);
+            }
+        }
+    }
+
+    /// 节点：把卡片摆到算出来的矩形上，并按选中/悬停/锁住换类 ——
+    /// 选中态、悬停态和锁住态的长相因此都在皮肤里，画布不自绘卡面。
+    void PaintNodes(App app) {
+        int selRow = sel.Get();
+        for (int i = 0; i < data.Count; i = i + 1) {
+            GraphNode n = data[i];
+            bool onscreen = n.ly + n.lh > by && n.ly < by + bh;
+            Control card = null;
+            if (i < cards.Count) { card = cards[i]; }
+            if (card == null) { continue; }
+            card.visible = onscreen;
+            if (!onscreen) { continue; }
+            int id = this.NodeInteract(app, i, n);
+            bool locked = this.LockedAt(i);
+            if (!this.Templated()) {
+                card.Class = GraphView.NodeClass(i == selRow,
+                    app.focus.IsHovered(id), locked);
+                if (i < locks.Count && locks[i] != null) {
+                    locks[i].visible = locked;
+                }
+            }
+            card.MeasureTree(app);
+            card.Arrange(n.lx, n.ly, n.lw, n.lh);
+        }
+    }
+
+    /// 节点卡片的状态类。
+    static string NodeClass(bool selected, bool hovered, bool locked) {
+        string cls = "graphnode";
+        if (selected) { cls = cls + " graphnodesel"; }
+        else if (hovered) { cls = cls + " graphnodehover"; }
+        if (locked) { cls = cls + " graphnodelocked"; }
+        return cls;
+    }
+
+    /// 一个节点的选中 / 开工 / 右键。返回命中 id，供上面画悬停态。
+    int NodeInteract(App app, int index, GraphNode n) {
+        int id = app.focus.AllocId();
+        app.hitTester.RegisterRect(id, n.lx, n.ly, n.lw, n.lh, 0);
+        if (app.ClickTarget() != id && app.RightPressTarget() != id) {
+            return id;
+        }
+        if (app.ClickTarget() == id && app.ClickAvailable()) {
+            if (sel.Get() != index) {
+                sel.Set(index);
+                Select.Post();
+            }
+            ctxRow = index;
+            ctxX = app.mouseX;
+            ctxY = app.mouseY;
+            if (app.DoubleClickNow()) {
+                // 锁住的节点也让选中生效（要能点开看前置是谁），
+                // 但开工要走 Blocked，由宿主说明还差哪一步。
+                if (this.LockedAt(index)) { Blocked.Post(); }
+                else { Activate.Post(); }
+            }
+            this.NoteSelfDamage(app);
+        }
+        if (app.RightPressTarget() == id && app.EventKind() == 2) {
+            if (sel.Get() != index) {
+                sel.Set(index);
+                Select.Post();
+            }
+            ctxRow = index;
+            ctxX = app.mouseX;
+            ctxY = app.mouseY;
+            Context.Post();
+            this.NoteSelfDamage(app);
+        }
+        return id;
+    }
+
+    /// 选中与滚动只改画布自己那块像素，损伤限定在控件矩形内。
+    void NoteSelfDamage(App app) {
+        app.NoteDamage(bx, by, bw, bh);
+        app.window.Wake();
+    }
+
+    void PaintEmpty(App app) {
+        if (Empty == "") { return; }
+        Theme t = app.theme;
+        app.canvas.DrawTextCentered(bx, by, bw, bh, Empty, t.textTertiary,
+            t.fontSizeMedium);
+    }
+}
