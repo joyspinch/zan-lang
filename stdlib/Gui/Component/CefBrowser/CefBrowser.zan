@@ -3,6 +3,9 @@ using Gui;
 
 namespace Gui.Component.CefBrowser;
 
+/// 弹窗请求交给宿主时的回调（参数是要打开的 URL）。
+delegate void CefPopupFn(string url);
+
 /// 内嵌的 Chromium 浏览器（CEF）视图。
 ///
 /// 和 Gui.Component.WebView 的分工：WebView 用系统自带引擎（Windows
@@ -33,6 +36,8 @@ class CefBrowser {
     /// Win32，CEF 自己的 set_focus 只管引擎内部。
     [DllImport("user32", EntryPoint = "SetFocus")]
     static extern nint Win32SetFocus(nint hwnd);
+    [DllImport("user32", EntryPoint = "GetFocus")]
+    static extern nint Win32GetFocus();
     #endif
 
     int handle;         // 原生浏览器句柄（0 = 尚未创建/不可用）
@@ -46,6 +51,14 @@ class CefBrowser {
 
     string lastSeenTitle;
     bool lastSeenLoading;
+    /// CDP 路由/Cookie 门面，第一次被要到时才建（没人用就没有额外开销）。
+    CefCdp cdpRouter;
+    /// 弹窗策略与宿主回调（policy 2 时每帧从原生侧取待处理的目标 URL）。
+    int popupPolicy;
+    CefPopupFn popupSink;
+    CefCookies cookieApi;
+    CefPage pageApi;
+    CefFingerprint fpApi;
 
     SignalString url;
     SignalString title;
@@ -69,6 +82,12 @@ class CefBrowser {
         this.guiHadFocus = false;
         this.lastSeenTitle = "";
         this.lastSeenLoading = false;
+        this.cdpRouter = null;
+        this.popupPolicy = 0;
+        this.popupSink = null;
+        this.cookieApi = null;
+        this.pageApi = null;
+        this.fpApi = null;
         this.url = new SignalString("");
         this.title = new SignalString("");
         this.NavComplete = new UiEvent();
@@ -107,6 +126,9 @@ class CefBrowser {
         }
         supported = true;
         pendingUrl = "";
+        if (popupPolicy != 0) {
+            CefBackend.SetPopupPolicy(handle, popupPolicy);
+        }
     }
 
     /// 导航到 URL。无协议的裸主机名视为 https://。
@@ -173,19 +195,25 @@ class CefBrowser {
     /// 把 Win32 焦点从浏览器子窗口搬回宿主窗口；焦点被清掉（Esc / 点空白）
     /// 的那一刻交还给浏览器。只在切换沿动作，页面内的点击因此照旧把焦点
     /// 拿回去，网页里能正常打字。
+    /// 另外，界面持有焦点期间每帧确认 Win32 焦点确实还在宿主窗口上：
+    /// Chromium 会自己把焦点抢回去（导航提交、页面调 focus()、子进程重启），
+    /// 只在切换沿搬一次的话，地址栏看着还在编辑态、按键却全进了页面——这正是
+    /// “地址栏时好时坏”的成因。原生侧同时拒掉 CEF 主动要焦点的请求
+    /// （cef_focus_handler_t::on_set_focus），这里是兜底。
     void SyncFocus(App app) {
         if (handle == 0) { return; }
         bool gui = app.focus.focusedId >= 0;
-        if (gui == guiHadFocus) { return; }
-        guiHadFocus = gui;
-        if (gui) {
-            CefBackend.SetFocus(handle, false);
-            #if WINDOWS
-            CefBrowser.Win32SetFocus(app.window.GetHandle());
-            #endif
-            return;
+        if (gui != guiHadFocus) {
+            guiHadFocus = gui;
+            CefBackend.SetFocus(handle, !gui);
         }
-        CefBackend.SetFocus(handle, true);
+        if (!gui) { return; }
+        #if WINDOWS
+        nint host = app.window.GetHandle();
+        if (CefBrowser.Win32GetFocus() != host) {
+            CefBrowser.Win32SetFocus(host);
+        }
+        #endif
     }
 
     // ---- CDP（Chrome DevTools Protocol）----------------------------------
@@ -227,10 +255,91 @@ class CefBrowser {
         return CefBackend.CdpAttached(handle);
     }
 
+    /// 缩放级别：0 = 100%，每 +1 乘 1.2（Ctrl+滚轮的那一档），可为负。
+    void SetZoom(double level) {
+        if (handle != 0) { CefBackend.SetZoom(handle, level); }
+    }
+    double Zoom() {
+        if (handle == 0) { return 0.0; }
+        return CefBackend.GetZoom(handle);
+    }
+    void ZoomIn() { SetZoom(Zoom() + 1.0); }
+    void ZoomOut() { SetZoom(Zoom() - 1.0); }
+    void ResetZoom() { SetZoom(0.0); }
+
+    /// 页内查找并高亮。第一次调用 findNext 传 false（开一次新搜索），之后
+    /// 传 true 在同一批命中之间前后跳；<see cref="StopFind"/> 收尾。
+    void Find(string text, bool forward, bool matchCase, bool findNext) {
+        if (handle != 0) {
+            CefBackend.Find(handle, text, forward, matchCase, findNext);
+        }
+    }
+    void StopFind(bool clearSelection) {
+        if (handle != 0) { CefBackend.StopFind(handle, clearSelection); }
+    }
+
+    /// 打开系统打印对话框。要无对话框地导出 PDF 用
+    /// `Cdp().Send("Page.printToPDF", ...)`（回调里拿到 base64 的字节）。
+    void Print() { if (handle != 0) { CefBackend.Print(handle); } }
+
+    /// DevTools 开/关（CEF 自己的窗口）。
+    void ShowDevTools() {
+        if (handle != 0) { CefBackend.ShowDevTools(handle); }
+    }
+    void CloseDevTools() {
+        if (handle != 0) { CefBackend.CloseDevTools(handle); }
+    }
+
+    /// 弹窗（window.open / target=_blank / 中键点击）交给 CEF 自己开一个
+    /// 独立的浏览器窗口——默认行为。
+    void AllowPopupWindows() { SetPopupPolicy(0, null); }
+
+    /// 一律不开弹窗（页面里的 window.open 返回 null）。
+    void BlockPopups() { SetPopupPolicy(1, null); }
+
+    /// 弹窗不再自己开窗口，改为把目标 URL 交给宿主：标签式外壳在这里
+    /// 新建一个标签，单页外壳可以直接 <see cref="Navigate"/>。回调在
+    /// <see cref="Render"/> 里（UI 线程）被调用。
+    void OnPopup(CefPopupFn handler) { SetPopupPolicy(2, handler); }
+
+    void SetPopupPolicy(int policy, CefPopupFn handler) {
+        popupPolicy = policy;
+        popupSink = handler;
+        if (handle != 0) { CefBackend.SetPopupPolicy(handle, policy); }
+    }
+
     /// 取走一条 CDP 消息（命令回复或事件的原始 JSON），空队列为 ""。
     string TakeCdpMessage() {
         if (handle == 0) { return ""; }
         return CefBackend.CdpTake(handle);
+    }
+
+    /// 按事件名订阅 CDP 事件 / 给命令挂回调的路由（首次调用时建）。
+    /// 拿到它之后，<see cref="Render"/> 每帧把消息队列交给它分派，
+    /// 此时不要再直接用 <see cref="TakeCdpMessage"/>。
+    CefCdp Cdp() {
+        if (cdpRouter == null) { cdpRouter = new CefCdp(this); }
+        return cdpRouter;
+    }
+
+    /// Cookie 读写（走 CDP，第一次调用时建）。
+    CefCookies Cookies() {
+        if (cookieApi == null) { cookieApi = new CefCookies(Cdp()); }
+        return cookieApi;
+    }
+
+    /// 页面级钩子：下载、JS 对话框、console、网络（走 CDP）。
+    CefPage Page() {
+        if (pageApi == null) { pageApi = new CefPage(Cdp()); }
+        return pageApi;
+    }
+
+    /// 指纹套用：UA/Client Hints、语言、时区、屏幕、WebGL、canvas 噪声。
+    /// 填好字段后调 <see cref="CefFingerprint.Apply"/>；注入的补丁对下一个
+    /// 文档生效，所以对已经打开的页要再 <see cref="Reload"/> 一次。
+    CefFingerprint Fingerprint() {
+        if (fpApi == null) { fpApi = new CefFingerprint(Cdp()); }
+        return fpApi;
     }
 
     // ---- 生命周期 --------------------------------------------------------
@@ -271,6 +380,12 @@ class CefBrowser {
         // 区域再下发（完全被盖住时隐藏）。
         NativeLayer.Register(app, handle, x, y, w, h, CefBackend.ApplyClip);
         SyncFocus(app);
+
+        if (cdpRouter != null) { cdpRouter.Pump(); }
+        if (popupPolicy == 2 && popupSink != null) {
+            string popup = CefBackend.TakePopupUrl(handle);
+            if (popup != "") { popupSink(popup); }
+        }
 
         bool dirty = false;
         bool busy = CefBackend.IsLoading(handle);

@@ -1,0 +1,410 @@
+using System;
+
+namespace Gui.Component.CefBrowser;
+
+/// <summary>
+/// 浏览器指纹套用：UA 与 Client Hints 品牌、语言、时区、屏幕与 DPR、
+/// WebGL vendor/renderer、canvas 噪声，一次 <see cref="Apply"/> 全部生效。
+///
+/// 分两条路子实现，都建在 <see cref="CefCdp"/> 上：
+/// 浏览器自己认的那几项（UA/Client Hints/时区/地区/屏幕/CPU 核数）走
+/// `Emulation` 域的 override —— 页面里读到的 `navigator.userAgent`、
+/// `Intl.DateTimeFormat().resolvedOptions().timeZone`、`screen.width` 全都跟着变，
+/// 请求头也跟着变；浏览器不给覆盖的那几项（`navigator.languages`、
+/// `deviceMemory`、`webdriver`、WebGL 型号串、canvas 像素）靠
+/// `Page.addScriptToEvaluateOnNewDocument` 在页面脚本之前打补丁。
+///
+/// <code>
+/// CefFingerprint fp = web.Fingerprint();
+/// fp.userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ...";
+/// fp.brand = "Google Chrome";  fp.brandVersion = "151";
+/// fp.locale = "zh-CN";  fp.acceptLanguage = "zh-CN,zh;q=0.9";
+/// fp.timezone = "Asia/Shanghai";
+/// fp.screenWidth = 1920;  fp.screenHeight = 1080;  fp.scalePercent = 100;
+/// fp.webglVendor = "Google Inc. (NVIDIA)";
+/// fp.webglRenderer = "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0)";
+/// fp.canvasNoise = 2;
+/// fp.Apply();
+/// web.Reload();          // 注入脚本对「下一个」文档生效，当前页要刷一下
+/// </code>
+///
+/// 空字段 = 不动那一项，所以只想改 UA 就只填 <see cref="userAgent"/>。
+/// 改不了的：TLS/JA3（Chromium 内置栈）、真实 GPU 型号（要换
+/// `--use-angle=`）、系统字体列表（要么注入补丁，要么换 profile 字体目录）。
+/// </summary>
+class CefFingerprint {
+    CefCdp cdp;
+
+    /// <summary>完整 UA 串；空 = 不改。</summary>
+    string userAgent;
+    /// <summary>`Accept-Language` 请求头，如 `zh-CN,zh;q=0.9`；空 = 不改。</summary>
+    string acceptLanguage;
+    /// <summary>JS 侧地区（`navigator.language`、`Intl` 默认地区），如 `zh-CN`。
+    /// </summary>
+    string locale;
+    /// <summary>`navigator.languages` 列表；空表 = 用 <see cref="locale"/>。
+    /// </summary>
+    List<string> languages;
+    /// <summary>IANA 时区名，如 `Asia/Shanghai`；空 = 不改。</summary>
+    string timezone;
+
+    /// <summary>Client Hints 平台名，如 `Windows`；空 = 不发 Client Hints。
+    /// </summary>
+    string platform;
+    /// <summary>Client Hints 平台版本，如 `15.0.0`（Win11）。</summary>
+    string platformVersion;
+    /// <summary>Client Hints 品牌，如 `Google Chrome`。</summary>
+    string brand;
+    /// <summary>品牌主版本号，如 `151`。</summary>
+    string brandVersion;
+    /// <summary>品牌完整版本号，如 `151.0.7922.138`；空 = 用主版本号。</summary>
+    string brandFullVersion;
+    /// <summary>CPU 架构：`x86` / `arm`；空 = `x86`。</summary>
+    string architecture;
+    /// <summary>机型（移动端才有意义）。</summary>
+    string model;
+    /// <summary>移动标志（`navigator.userAgentData.mobile`、`Sec-CH-UA-Mobile`）。
+    /// </summary>
+    bool mobile;
+
+    /// <summary>屏幕宽（CSS 像素）；0 = 不改屏幕。</summary>
+    int screenWidth;
+    /// <summary>屏幕高（CSS 像素）。</summary>
+    int screenHeight;
+    /// <summary>设备像素比 × 100（100 = 1.0，150 = 1.5）；0 = 用 100。</summary>
+    int scalePercent;
+
+    /// <summary>`navigator.hardwareConcurrency`；0 = 不改。</summary>
+    int hardwareConcurrency;
+    /// <summary>`navigator.deviceMemory`（GB，2 的幂）；0 = 不改。</summary>
+    int deviceMemory;
+    /// <summary>把 `navigator.webdriver` 抹成 false。</summary>
+    bool hideWebdriver;
+
+    /// <summary>WebGL `UNMASKED_VENDOR_WEBGL` / `VENDOR`；空 = 不改。</summary>
+    string webglVendor;
+    /// <summary>WebGL `UNMASKED_RENDERER_WEBGL` / `RENDERER`；空 = 不改。
+    /// </summary>
+    string webglRenderer;
+
+    /// <summary>canvas 噪声幅度（每像素红色通道 ±n，1~8 足够打散哈希）；
+    /// 0 = 不加噪声。加了之后 `toDataURL`/`toBlob`/`getImageData` 拿到的像素每次
+    /// 都不同，代价是画布内容真的被改了一点。</summary>
+    int canvasNoise;
+    /// <summary>噪声随机种子；0 = 用固定种子（同一指纹每次运行一致）。
+    /// </summary>
+    int seed;
+
+    /// <summary>已注入脚本的标识（<see cref="Reset"/> 用来撤掉它）。</summary>
+    string scriptId;
+    /// <summary>覆盖之前浏览器自己的 UA：CDP 没有「清除 UA 覆盖」这个命令，
+    /// 只能把原值再设回去，所以第一次 <see cref="Apply"/> 时先问一句
+    /// `Browser.getVersion` 记下来。</summary>
+    string originalUa;
+
+    CefFingerprint(CefCdp channel) {
+        cdp = channel;
+        userAgent = "";
+        acceptLanguage = "";
+        locale = "";
+        languages = new List<string>();
+        timezone = "";
+        platform = "";
+        platformVersion = "";
+        brand = "";
+        brandVersion = "";
+        brandFullVersion = "";
+        architecture = "";
+        model = "";
+        mobile = false;
+        screenWidth = 0;
+        screenHeight = 0;
+        scalePercent = 0;
+        hardwareConcurrency = 0;
+        deviceMemory = 0;
+        hideWebdriver = false;
+        webglVendor = "";
+        webglRenderer = "";
+        canvasNoise = 0;
+        seed = 0;
+        scriptId = "";
+        originalUa = "";
+    }
+
+    /// <summary>一份桌面 Windows Chrome 的常见取值：调完再按需改字段。
+    /// <paramref name="version"/> 是 Chrome 完整版本号（如
+    /// `151.0.7922.138`），拿 <see cref="CefHost.ChromeVersion"/> 最省事。
+    /// </summary>
+    void UseWindowsChrome(string version) {
+        string major = CefFingerprint.Major(version);
+        userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/"
+            + major + ".0.0.0 Safari/537.36";
+        platform = "Windows";
+        platformVersion = "15.0.0";
+        brand = "Google Chrome";
+        brandVersion = major;
+        brandFullVersion = version;
+        architecture = "x86";
+        mobile = false;
+    }
+
+    /// <summary>把当前字段套到浏览器上。`Emulation` 那几项立即生效，注入脚本
+    /// 对下一个文档生效（当前页要 <see cref="CefBrowser.Reload"/>）。</summary>
+    void Apply() {
+        if (userAgent != "" && originalUa == "") {
+            cdp.Send("Browser.getVersion", "{}",
+                (result) => { originalUa = CefCdp.Field(result, "userAgent"); });
+        }
+        if (userAgent != "") { SendUserAgent(); }
+        if (timezone != "") {
+            cdp.Send("Emulation.setTimezoneOverride",
+                "{\"timezoneId\":" + CefBrowser.JsonString(timezone) + "}",
+                null);
+        }
+        if (locale != "") {
+            cdp.Send("Emulation.setLocaleOverride",
+                "{\"locale\":" + CefBrowser.JsonString(locale) + "}", null);
+        }
+        if (screenWidth > 0 && screenHeight > 0) {
+            int pct = scalePercent > 0 ? scalePercent : 100;
+            cdp.Send("Emulation.setDeviceMetricsOverride",
+                "{\"width\":" + Convert.ToString(screenWidth)
+                + ",\"height\":" + Convert.ToString(screenHeight)
+                + ",\"screenWidth\":" + Convert.ToString(screenWidth)
+                + ",\"screenHeight\":" + Convert.ToString(screenHeight)
+                + ",\"deviceScaleFactor\":" + CefFingerprint.Ratio(pct)
+                + ",\"mobile\":" + (mobile ? "true" : "false") + "}", null);
+        }
+        if (hardwareConcurrency > 0) {
+            cdp.Send("Emulation.setHardwareConcurrencyOverride",
+                "{\"hardwareConcurrency\":"
+                + Convert.ToString(hardwareConcurrency) + "}", null);
+        }
+        if (acceptLanguage != "") {
+            cdp.Enable("Network");
+            cdp.Send("Network.setExtraHTTPHeaders",
+                "{\"headers\":{\"Accept-Language\":"
+                + CefBrowser.JsonString(acceptLanguage) + "}}", null);
+        }
+        string js = Script();
+        if (js != "") {
+            cdp.Enable("Page");
+            cdp.Send("Page.addScriptToEvaluateOnNewDocument",
+                "{\"source\":" + CefBrowser.JsonString(js) + "}",
+                (result) => { scriptId = CefCdp.Field(result, "identifier"); });
+        }
+    }
+
+    /// <summary>撤掉 <see cref="Apply"/> 装上的东西（屏幕/UA/时区/地区 override
+    /// 与注入脚本）。已经加载的页面同样要刷一下才回原样。</summary>
+    void Reset() {
+        cdp.Send("Emulation.clearDeviceMetricsOverride", "{}", null);
+        // 时区给空串 = 撤掉覆盖；地区不带参数 = 回默认（这是 CDP 的约定，
+        // 没有单独的 clear 命令）。
+        cdp.Send("Emulation.setTimezoneOverride", "{\"timezoneId\":\"\"}",
+            null);
+        cdp.Send("Emulation.setLocaleOverride", "{}", null);
+        cdp.Send("Network.setExtraHTTPHeaders", "{\"headers\":{}}", null);
+        // UA 同理没有 clear：把开工前问到的原值设回去。问不到就只能留着
+        // （设空串会让页面真的读到空 UA，比留着更扎眼）。
+        if (originalUa != "") {
+            cdp.Send("Emulation.setUserAgentOverride",
+                "{\"userAgent\":" + CefBrowser.JsonString(originalUa) + "}",
+                null);
+        }
+        if (scriptId != "") {
+            cdp.Send("Page.removeScriptToEvaluateOnNewDocument",
+                "{\"identifier\":" + CefBrowser.JsonString(scriptId) + "}",
+                null);
+            scriptId = "";
+        }
+    }
+
+    // ---- UA / Client Hints ------------------------------------------------
+
+    void SendUserAgent() {
+        StringBuilder p = new StringBuilder();
+        p.Append("{\"userAgent\":");
+        p.Append(CefBrowser.JsonString(userAgent));
+        if (acceptLanguage != "") {
+            p.Append(",\"acceptLanguage\":");
+            p.Append(CefBrowser.JsonString(acceptLanguage));
+        }
+        if (platform != "") {
+            p.Append(",\"platform\":");
+            p.Append(CefBrowser.JsonString(platform));
+        }
+        if (brand != "" && brandVersion != "") {
+            p.Append(",\"userAgentMetadata\":");
+            p.Append(Metadata());
+        }
+        p.Append("}");
+        // Emulation 与 Network 两个域都能改 UA：Emulation 那份带 Client Hints，
+        // Network 那份是老接口，只在没有 Client Hints 时才需要。
+        if (brand != "" && brandVersion != "") {
+            cdp.Send("Emulation.setUserAgentOverride", p.ToString(), null);
+        } else {
+            cdp.Enable("Network");
+            cdp.Send("Network.setUserAgentOverride", p.ToString(), null);
+        }
+    }
+
+    /// <summary>Client Hints 元数据：品牌列表按 Chromium 的做法带上
+    /// `Chromium` 与 `Not.A/Brand` 两个同版本条目，只报一个品牌反而扎眼。
+    /// </summary>
+    string Metadata() {
+        string full = brandFullVersion != "" ? brandFullVersion : brandVersion;
+        StringBuilder b = new StringBuilder();
+        b.Append("{\"brands\":[");
+        b.Append("{\"brand\":\"Not.A/Brand\",\"version\":\"99\"},");
+        b.Append("{\"brand\":\"Chromium\",\"version\":");
+        b.Append(CefBrowser.JsonString(brandVersion));
+        b.Append("},{\"brand\":");
+        b.Append(CefBrowser.JsonString(brand));
+        b.Append(",\"version\":");
+        b.Append(CefBrowser.JsonString(brandVersion));
+        b.Append("}],\"fullVersionList\":[");
+        b.Append("{\"brand\":\"Not.A/Brand\",\"version\":\"99.0.0.0\"},");
+        b.Append("{\"brand\":\"Chromium\",\"version\":");
+        b.Append(CefBrowser.JsonString(full));
+        b.Append("},{\"brand\":");
+        b.Append(CefBrowser.JsonString(brand));
+        b.Append(",\"version\":");
+        b.Append(CefBrowser.JsonString(full));
+        b.Append("}],\"fullVersion\":");
+        b.Append(CefBrowser.JsonString(full));
+        b.Append(",\"platform\":");
+        b.Append(CefBrowser.JsonString(platform));
+        b.Append(",\"platformVersion\":");
+        b.Append(CefBrowser.JsonString(platformVersion));
+        b.Append(",\"architecture\":");
+        b.Append(CefBrowser.JsonString(
+            architecture != "" ? architecture : "x86"));
+        b.Append(",\"model\":");
+        b.Append(CefBrowser.JsonString(model));
+        b.Append(",\"mobile\":");
+        b.Append(mobile ? "true" : "false");
+        b.Append("}");
+        return b.ToString();
+    }
+
+    // ---- 注入脚本 ---------------------------------------------------------
+
+    /// <summary>要注入的补丁脚本（不需要补任何东西时是 ""）。补丁都在页面
+    /// 脚本之前跑，且每个新文档都跑一遍（iframe 也算）。</summary>
+    string Script() {
+        StringBuilder js = new StringBuilder();
+        if (languages.Count > 0 || locale != "") { js.Append(LanguagesJs()); }
+        if (deviceMemory > 0) {
+            js.Append("try{Object.defineProperty(Navigator.prototype,");
+            js.Append("'deviceMemory',{get:function(){return ");
+            js.Append(Convert.ToString(deviceMemory));
+            js.Append(";}});}catch(e){}");
+        }
+        if (hideWebdriver) {
+            js.Append("try{Object.defineProperty(Navigator.prototype,");
+            js.Append("'webdriver',{get:function(){return false;}});}catch(e){}");
+        }
+        if (webglVendor != "" || webglRenderer != "") { js.Append(WebglJs()); }
+        if (canvasNoise > 0) { js.Append(CanvasJs()); }
+        if (js.Length == 0) { return ""; }
+        return "(function(){" + js.ToString() + "})();";
+    }
+
+    string LanguagesJs() {
+        StringBuilder arr = new StringBuilder();
+        arr.Append("[");
+        if (languages.Count > 0) {
+            for (int i = 0; i < languages.Count; i = i + 1) {
+                if (i > 0) { arr.Append(","); }
+                arr.Append(CefBrowser.JsonString(languages[i]));
+            }
+        } else {
+            arr.Append(CefBrowser.JsonString(locale));
+        }
+        arr.Append("]");
+        return "try{var L=" + arr.ToString()
+            + ";Object.defineProperty(Navigator.prototype,'languages',"
+            + "{get:function(){return L.slice();}});}catch(e){}";
+    }
+
+    string WebglJs() {
+        string v = webglVendor != "" ? webglVendor : "";
+        string r = webglRenderer != "" ? webglRenderer : "";
+        StringBuilder js = new StringBuilder();
+        js.Append("try{var V=");
+        js.Append(CefBrowser.JsonString(v));
+        js.Append(",R=");
+        js.Append(CefBrowser.JsonString(r));
+        // 37445/37446 是 WEBGL_debug_renderer_info 的 UNMASKED_*，
+        // 7936/7937 是标准 VENDOR/RENDERER：两套都要接，指纹脚本两套都读。
+        js.Append(";var g=function(orig){return function(p){");
+        js.Append("if(V&&(p===37445||p===7936)){return V;}");
+        js.Append("if(R&&(p===37446||p===7937)){return R;}");
+        js.Append("return orig.apply(this,arguments);};};");
+        js.Append("if(window.WebGLRenderingContext){");
+        js.Append("var p1=WebGLRenderingContext.prototype;");
+        js.Append("p1.getParameter=g(p1.getParameter);}");
+        js.Append("if(window.WebGL2RenderingContext){");
+        js.Append("var p2=WebGL2RenderingContext.prototype;");
+        js.Append("p2.getParameter=g(p2.getParameter);}");
+        js.Append("}catch(e){}");
+        return js.ToString();
+    }
+
+    string CanvasJs() {
+        int s = seed > 0 ? seed : 20250816;
+        StringBuilder js = new StringBuilder();
+        js.Append("try{var N=");
+        js.Append(Convert.ToString(canvasNoise));
+        js.Append(",S=");
+        js.Append(Convert.ToString(s));
+        // 线性同余：不用 Math.random，好让同一指纹的噪声可复现。
+        js.Append(";var rnd=function(){S=(S*1103515245+12345)&2147483647;");
+        js.Append("return S%(2*N+1)-N;};");
+        js.Append("var jit=function(p){for(var i=0;i<p.length;i+=4){");
+        js.Append("var v=p[i]+rnd();p[i]=v<0?0:(v>255?255:v);}};");
+        js.Append("var gid=CanvasRenderingContext2D.prototype.getImageData;");
+        js.Append("var paint=function(cv){try{var c=cv.getContext('2d');");
+        js.Append("if(!c||!cv.width||!cv.height){return;}");
+        js.Append("var d=gid.call(c,0,0,cv.width,cv.height);");
+        js.Append("jit(d.data);c.putImageData(d,0,0);}catch(e){}};");
+        js.Append("var td=HTMLCanvasElement.prototype.toDataURL;");
+        js.Append("HTMLCanvasElement.prototype.toDataURL=function(){");
+        js.Append("paint(this);return td.apply(this,arguments);};");
+        js.Append("var tb=HTMLCanvasElement.prototype.toBlob;");
+        js.Append("if(tb){HTMLCanvasElement.prototype.toBlob=function(){");
+        js.Append("paint(this);return tb.apply(this,arguments);};}");
+        js.Append("CanvasRenderingContext2D.prototype.getImageData=");
+        js.Append("function(){var r=gid.apply(this,arguments);");
+        js.Append("try{jit(r.data);}catch(e){}return r;};");
+        js.Append("}catch(e){}");
+        return js.ToString();
+    }
+
+    // ---- 小工具 -----------------------------------------------------------
+
+    /// <summary>百分数转小数串：150 → `1.5`，100 → `1`，225 → `2.25`。
+    /// （拼 JSON 要的是字面量，浮点格式化的小数点在别的地区会变成逗号。）
+    /// </summary>
+    static string Ratio(int percent) {
+        int whole = percent / 100;
+        int frac = percent % 100;
+        if (frac == 0) { return Convert.ToString(whole); }
+        if (frac % 10 == 0) {
+            return Convert.ToString(whole) + "." + Convert.ToString(frac / 10);
+        }
+        string f = Convert.ToString(frac);
+        if (frac < 10) { f = "0" + f; }
+        return Convert.ToString(whole) + "." + f;
+    }
+
+    /// <summary>取版本号的主版本段：`151.0.7922.138` → `151`。</summary>
+    static string Major(string version) {
+        for (int i = 0; i < version.Length; i = i + 1) {
+            if ((version[i] & 255) == 46) { return version.Substring(0, i); }
+        }
+        return version;
+    }
+}

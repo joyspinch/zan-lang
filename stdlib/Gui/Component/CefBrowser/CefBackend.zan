@@ -38,6 +38,15 @@ class CefBackend {
     static nint addr_setVisible;
     static nint addr_setClip;
     static nint addr_setFocus;
+    static nint addr_setPopupPolicy;
+    static nint addr_takePopupUrl;
+    static nint addr_setZoom;
+    static nint addr_getZoom;
+    static nint addr_find;
+    static nint addr_stopFind;
+    static nint addr_print;
+    static nint addr_showDevTools;
+    static nint addr_closeDevTools;
     static nint addr_navigate;
     static nint addr_back;
     static nint addr_forward;
@@ -122,7 +131,7 @@ class CefBackend {
         string file = "lib" + baseName + ".so";
         #endif
         List<string> cands = new List<string>();
-        string forced = ProcessHost.Env("ZAN_CEF_DRIVER");
+        string forced = CefOptions.DriverPath();
         if (forced != "") {
             if (Directory.Exists(forced)) { cands.Add(forced + "/" + file); }
             else { cands.Add(forced); }
@@ -168,6 +177,18 @@ class CefBackend {
         CefBackend.addr_cdpDropped = CefBackend.Sym("zan_cef_cdp_dropped");
         CefBackend.addr_cdpAttached = CefBackend.Sym("zan_cef_cdp_attached");
         CefBackend.addr_cdpTake = CefBackend.Sym("zan_cef_cdp_take");
+        CefBackend.addr_setPopupPolicy =
+            CefBackend.Sym("zan_cef_set_popup_policy");
+        CefBackend.addr_takePopupUrl =
+            CefBackend.Sym("zan_cef_take_popup_url");
+        CefBackend.addr_setZoom = CefBackend.Sym("zan_cef_set_zoom");
+        CefBackend.addr_getZoom = CefBackend.Sym("zan_cef_get_zoom");
+        CefBackend.addr_find = CefBackend.Sym("zan_cef_find");
+        CefBackend.addr_stopFind = CefBackend.Sym("zan_cef_stop_find");
+        CefBackend.addr_print = CefBackend.Sym("zan_cef_print");
+        CefBackend.addr_showDevTools = CefBackend.Sym("zan_cef_show_devtools");
+        CefBackend.addr_closeDevTools =
+            CefBackend.Sym("zan_cef_close_devtools");
         return CefBackend.missing == "";
     }
 
@@ -187,10 +208,11 @@ class CefBackend {
 
     /// <summary>本进程是 Chromium helper（render/gpu/utility）时跑完并返回
     /// 其退出码；是浏览器进程时返回 -1，调用方继续往下走。</summary>
-    static int ExecuteProcess(string runtimeDir, string cefVersion) {
+    static int ExecuteProcess(string runtimeDir, string cefVersion,
+                              string switches) {
         if (!CefBackend.Resolve(cefVersion)) { return 0 - 1; }
-        CefIntStrFn f = (CefIntStrFn)CefBackend.addr_executeProcess;
-        return f(runtimeDir);
+        CefExecuteFn f = (CefExecuteFn)CefBackend.addr_executeProcess;
+        return f(runtimeDir, switches);
     }
 
     /// <summary>初始化 CEF 浏览器进程（driver 变体按 CEF 版本选）。
@@ -349,6 +371,61 @@ class CefBackend {
         return CefBackend.CallStr(CefBackend.addr_cdpTake, h);
     }
 
+    /// <summary>window.open / target=_blank 的处理方式：0 = CEF 自己开弹窗
+    /// 窗口（默认）、1 = 拦掉、2 = 拦掉并把目标 URL 交给宿主。</summary>
+    static void SetPopupPolicy(int h, int policy) {
+        if (!CefBackend.resolved || CefBackend.addr_setPopupPolicy == 0) {
+            return;
+        }
+        CefIntIntFn f = (CefIntIntFn)CefBackend.addr_setPopupPolicy;
+        f(h, policy);
+    }
+
+    /// <summary>policy=2 下待处理的弹窗目标 URL，没有则 ""。</summary>
+    static string TakePopupUrl(int h) {
+        return CefBackend.CallStr(CefBackend.addr_takePopupUrl, h);
+    }
+
+    // ---------------------------------------------------- 缩放 / 查找 / 打印
+
+    /// <summary>Chromium 的缩放级：0 = 100%，每 +1 乘 1.2。</summary>
+    static void SetZoom(int h, double level) {
+        if (!CefBackend.resolved || CefBackend.addr_setZoom == 0) { return; }
+        CefZoomFn f = (CefZoomFn)CefBackend.addr_setZoom;
+        f(h, level);
+    }
+
+    static double GetZoom(int h) {
+        if (!CefBackend.resolved || CefBackend.addr_getZoom == 0) {
+            return 0.0;
+        }
+        CefGetZoomFn f = (CefGetZoomFn)CefBackend.addr_getZoom;
+        return f(h);
+    }
+
+    static void Find(int h, string text, bool forward, bool matchCase,
+                     bool findNext) {
+        if (!CefBackend.resolved || CefBackend.addr_find == 0) { return; }
+        CefFindFn f = (CefFindFn)CefBackend.addr_find;
+        f(h, text, forward ? 1 : 0, matchCase ? 1 : 0, findNext ? 1 : 0);
+    }
+
+    static void StopFind(int h, bool clearSelection) {
+        if (!CefBackend.resolved || CefBackend.addr_stopFind == 0) { return; }
+        CefIntIntFn f = (CefIntIntFn)CefBackend.addr_stopFind;
+        f(h, clearSelection ? 1 : 0);
+    }
+
+    static void Print(int h) { CefBackend.CallVoid(CefBackend.addr_print, h); }
+
+    static void ShowDevTools(int h) {
+        CefBackend.CallVoid(CefBackend.addr_showDevTools, h);
+    }
+
+    static void CloseDevTools(int h) {
+        CefBackend.CallVoid(CefBackend.addr_closeDevTools, h);
+    }
+
     // ---------------------------------------------------------- 调用小工具
 
     static void CallVoid(nint addr, int h) {
@@ -376,6 +453,7 @@ delegate void CefVoidFn();
 delegate int CefIntFn();
 delegate string CefStrFn();
 delegate int CefIntStrFn(string s);
+delegate int CefExecuteFn(string runtimeDir, string switches);
 delegate int CefInitFn(string runtimeDir, string cachePath, string helperPath,
                        string locale, string switches, int windowless);
 delegate int CefCreateFn(nint parent, int x, int y, int w, int h, string url);
@@ -388,3 +466,7 @@ delegate void CefIntStrVoidFn(int h, string s);
 delegate void CefBoundsFn(int h, int x, int y, int w, int hh);
 delegate void CefJsFn(int h, string code, string scriptUrl, int startLine);
 delegate int CefCdpSendFn(int h, string method, string paramsJson);
+delegate void CefZoomFn(int h, double level);
+delegate double CefGetZoomFn(int h);
+delegate void CefFindFn(int h, string text, int forward, int matchCase,
+                        int findNext);

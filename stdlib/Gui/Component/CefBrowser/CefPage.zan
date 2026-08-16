@@ -1,0 +1,139 @@
+using System;
+
+namespace Gui.Component.CefBrowser;
+
+/// <summary>
+/// 页面级常用钩子：下载、JS 对话框、console 输出。都建在
+/// <see cref="CefCdp"/> 上（这些能力 CDP 全都有，不需要再加原生 handler），
+/// 所以任何 CDP 域/事件都能用 <see cref="CefCdp.On"/> 自己接，这里只是把最常
+/// 用的三件事收成一行调用。
+///
+/// <code>
+/// CefPage page = web.Page();
+/// page.AllowDownloads("D:/app/downloads", (json) => { ... });
+/// page.AutoDismissDialogs(true);   // alert/confirm 一律确定，避免页面卡住
+/// page.OnConsole((json) => { Console.WriteLine(json); });
+/// </code>
+/// </summary>
+class CefPage {
+    CefCdp cdp;
+    bool pageOn;
+    bool dialogAccept;
+    bool dialogAuto;
+
+    CefPage(CefCdp channel) {
+        cdp = channel;
+        pageOn = false;
+        dialogAccept = true;
+        dialogAuto = false;
+    }
+
+    /// <summary>Page 域的事件要先 enable。</summary>
+    void EnsurePage() {
+        if (pageOn) { return; }
+        cdp.Enable("Page");
+        pageOn = true;
+    }
+
+    // ---- 下载 -------------------------------------------------------------
+
+    /// <summary>允许下载并落到 <paramref name="dir"/>；
+    /// <paramref name="onEvent"/> 非空时同时订阅
+    /// `Browser.downloadWillBegin` / `Browser.downloadProgress`（带
+    /// guid/url/文件名/进度/状态）。默认 Chromium 在无 UI 的嵌入场景里是拒绝
+    /// 下载的，所以不调这个就不会有文件落盘。</summary>
+    void AllowDownloads(string dir, CdpEventFn onEvent) {
+        if (onEvent != null) {
+            cdp.On("Browser.downloadWillBegin", onEvent);
+            cdp.On("Browser.downloadProgress", onEvent);
+        }
+        cdp.Send("Browser.setDownloadBehavior",
+            "{\"behavior\":\"allow\",\"downloadPath\":"
+            + CefBrowser.JsonString(dir) + ",\"eventsEnabled\":true}", null);
+    }
+
+    /// <summary>拒绝一切下载。</summary>
+    void DenyDownloads() {
+        cdp.Send("Browser.setDownloadBehavior", "{\"behavior\":\"deny\"}",
+                 null);
+    }
+
+    /// <summary>取消一个正在进行的下载（guid 来自下载事件）。</summary>
+    void CancelDownload(string guid) {
+        cdp.Send("Browser.cancelDownload",
+                 "{\"guid\":" + CefBrowser.JsonString(guid) + "}", null);
+    }
+
+    // ---- JS 对话框 --------------------------------------------------------
+
+    /// <summary>自动应答 alert/confirm/prompt/beforeunload：
+    /// <paramref name="accept"/> 为 true 时点「确定」，否则「取消」。
+    /// 嵌入式浏览器里这些对话框默认没人应答，页面会一直停在那儿。</summary>
+    void AutoDismissDialogs(bool accept) {
+        dialogAccept = accept;
+        EnsurePage();
+        if (dialogAuto) { return; }
+        dialogAuto = true;
+        cdp.On("Page.javascriptDialogOpening", (json) => {
+            cdp.Send("Page.handleJavaScriptDialog",
+                     dialogAccept ? "{\"accept\":true}" : "{\"accept\":false}",
+                     null);
+        });
+    }
+
+    /// <summary>自己应答一个打开着的对话框（配合
+    /// <see cref="CefCdp.On"/> 订阅 `Page.javascriptDialogOpening` 时用）；
+    /// <paramref name="promptText"/> 只对 prompt 有意义。</summary>
+    void AnswerDialog(bool accept, string promptText) {
+        string p = accept ? "{\"accept\":true" : "{\"accept\":false";
+        if (promptText != "") {
+            p = p + ",\"promptText\":" + CefBrowser.JsonString(promptText);
+        }
+        cdp.Send("Page.handleJavaScriptDialog", p + "}", null);
+    }
+
+    // ---- console / 页面日志 ----------------------------------------------
+
+    /// <summary>订阅页面 console：`Runtime.consoleAPICalled`（console.log 一族）
+    /// 与 `Log.entryAdded`（浏览器自己的告警，如 CSP、404）。</summary>
+    void OnConsole(CdpEventFn onEvent) {
+        cdp.On("Runtime.consoleAPICalled", onEvent);
+        cdp.On("Log.entryAdded", onEvent);
+        cdp.Enable("Runtime");
+        cdp.Enable("Log");
+    }
+
+    /// <summary>订阅未捕获异常（`Runtime.exceptionThrown`）。</summary>
+    void OnException(CdpEventFn onEvent) {
+        cdp.On("Runtime.exceptionThrown", onEvent);
+        cdp.Enable("Runtime");
+    }
+
+    // ---- 网络 -------------------------------------------------------------
+
+    /// <summary>订阅请求/响应（`Network.requestWillBeSent`、
+    /// `Network.responseReceived`、`Network.loadingFailed`）。要改写或拦截请求
+    /// 得用 Fetch 域，自己 <see cref="CefCdp.On"/> + `Fetch.continueRequest`。
+    /// </summary>
+    void OnNetwork(CdpEventFn onEvent) {
+        cdp.On("Network.requestWillBeSent", onEvent);
+        cdp.On("Network.responseReceived", onEvent);
+        cdp.On("Network.loadingFailed", onEvent);
+        cdp.Enable("Network");
+    }
+
+    /// <summary>覆盖 User-Agent（空串还原）。</summary>
+    void SetUserAgent(string ua) {
+        cdp.Enable("Network");
+        cdp.Send("Network.setUserAgentOverride",
+                 "{\"userAgent\":" + CefBrowser.JsonString(ua) + "}", null);
+    }
+
+    /// <summary>附加 HTTP 头（JSON 对象，如
+    /// `{"X-Token":"abc"}`）；`{}` 清空。</summary>
+    void SetExtraHeaders(string headersJson) {
+        cdp.Enable("Network");
+        cdp.Send("Network.setExtraHTTPHeaders",
+                 "{\"headers\":" + headersJson + "}", null);
+    }
+}

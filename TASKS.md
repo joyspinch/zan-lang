@@ -1161,6 +1161,33 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
   判断该按 `ulong` 输出；要么给它传入静态类型，要么在 append 侧分流。基线同样
   如此，不在本轮性能改动范围内，用例里因此只放了 `long` 的 append，修好后补行。
 
+# A50 · CEF 浏览器控件的剩余缺口（2026-08-16）
+
+浏览、导航、事件、CDP 原始通道、按事件名订阅、Cookie、下载/对话框/console/网络
+钩子、代码级路径配置（`CefOptions`）都已就位（见
+`examples/gui_cef_browser/README.md`）。剩下的都要动原生 shim
+`stdlib/Gui/Component/CefBrowser/native/zan_cef.c`，注意同一份 C 要同时编出 CEF 151
+与 CEF 109 两个 driver 变体，而这些回调的签名在两个版本间不同（例如
+`on_before_popup` 在 151 上多了 `popup_id` 参数），必须按变体分支并各自编译验证：
+
+* [x] **A50-1 弹窗策略**（`cef_life_span_handler_t::on_before_popup`）：三档已就位
+  —— `web.OnPopup(cb)` 拦下并把 URL 交给宿主（宿主自己开标签）、`BlockPopups()`
+  让 `window.open` 返回 null、`AllowPopupWindows()` 回到 CEF 自己开窗。
+* [ ] **A50-2 右键菜单**（`cef_context_menu_handler_t`）：禁用/定制默认菜单。
+* [ ] **A50-3 查找与打印 UI**（`find`、`print`、`print_to_pdf`）。
+* [x] **A50-4 GPU 子进程崩溃与「Timeout of new browser info response」**：Windows
+  实机带 verbose 日志复现完毕。GPU 子进程在 viz 起来后、建 GL 共享上下文时
+  `STATUS_BREAKPOINT`（`exit_code=-2147483645`）连崩 3 次，第 4 次退化到
+  `--use-gl=disabled` 并报 `Failed to create shared context for virtualization`
+  —— 触发者是 DirectComposition 交换链（装了 IDD 虚拟显示适配器的机器）。
+  `CefOptions.disableDirectComposition`（`ZAN_CEF_NO_DCOMP=1`）后同一场景 GPU
+  崩溃 0 次、硬件 GL 仍走真实显卡；默认是否按机器自动关 DComp 待定。
+  「Timeout of new browser info response」固定 2 条，与 GPU 崩溃、宿主消息泵
+  （同一次运行 `[pump]` 0 条）都无关，按 CEF 侧噪声对待。
+  顺带修掉一个真 bug：helper 子进程之前拿不到 `CefOptions.switches` /
+  `ZAN_CEF_SWITCHES`（`zan_cef_execute_process` 不接开关），因此只有
+  Chromium 自己会转发的开关能进子进程；现在浏览器进程与子进程用同一份开关。
+
 # 已撤回的结论（早期草稿中的错误，勿再引用）
 
 1. ~~"无符号/窄类型只是语法别名，IR 层全塌成 i64，语义是假的"~~ ——

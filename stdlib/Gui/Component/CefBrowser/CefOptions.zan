@@ -1,0 +1,147 @@
+using System;
+using System.Diagnostics;
+
+namespace Gui.Component.CefBrowser;
+
+/// <summary>
+/// CEF 的路径与启动配置，代码级入口。
+///
+/// 每一项都有环境变量对应物（运维/调试时不改代码就能改），但走
+/// <see cref="CefBootstrap.StartAsync"/> / 控件树（CefBrowserBox）时进程内
+/// 传不进任何路径——只能靠环境变量，这个类就是补上那一半：
+///
+/// <code>
+/// CefOptions o = new CefOptions();
+/// o.runtimeDir = "D:/app/cef";      // 自备运行时，完全不联网
+/// o.profileDir = "D:/app/data/web"; // Cookie/缓存/localStorage
+/// o.switches = "disable-gpu";       // 追加 Chromium 开关
+/// CefOptions.Use(o);                 // 之后所有 CEF 调用都按它来
+/// await CefBootstrap.StartAsync();
+/// </code>
+///
+/// 优先级：显式设过的字段 &gt; 环境变量 &gt; 默认值。空字符串表示「没设」，
+/// 因此把某项留空不会把环境变量顶掉。CEF 一个进程只初始化一次，所以
+/// 要在 <see cref="CefBootstrap.RunHelper"/> 之前就 <see cref="Use"/>——
+/// helper 子进程也要按同一份配置找运行时。
+/// </summary>
+class CefOptions {
+    /// <summary>已装好的 CEF 运行时目录（对应 ZAN_CEF_RUNTIME）。
+    /// 设了就不下载、不联网。</summary>
+    string runtimeDir;
+    /// <summary>下载/解包缓存根目录（对应 ZAN_CEF_CACHE）。运行时按
+    /// `&lt;root&gt;/&lt;平台&gt;-&lt;版本&gt;` 装在它下面。</summary>
+    string cacheRoot;
+    /// <summary>浏览器 profile 目录：Cookie、HTTP 缓存、localStorage
+    /// （对应 ZAN_CEF_PROFILE）。默认在运行时目录旁边，多数应用想把它放到
+    /// 自己的数据目录里。</summary>
+    string profileDir;
+    /// <summary>zan_cef driver 的文件或所在目录（对应 ZAN_CEF_DRIVER）。
+    /// 默认在可执行文件旁边找。</summary>
+    string driverPath;
+    /// <summary>追加到每个 Chromium 进程命令行的开关，`a=b,c` 形式
+    /// （对应 ZAN_CEF_SWITCHES），如 `disable-gpu,disable-gpu-compositing`。
+    /// 开关值里本身带逗号时（`disable-features=A,B`）改用分号分隔项：
+    /// `disable-features=A,B;disable-gpu`。列表型开关（*-features）会合并到
+    /// CEF/Chromium 自己那份值里，不会把它们顶掉。
+    /// 与环境变量同时存在时两者都生效（先环境变量、后这里）。</summary>
+    string switches;
+    /// <summary>关掉 DirectComposition 呈现（对应 ZAN_CEF_NO_DCOMP=1，
+    /// 即 Chromium 的 `--disable-direct-composition`）。
+    ///
+    /// 默认跟 Chromium 一样开着。但在装了虚拟显示适配器（向日葵/
+    /// GameViewer 类 IDD 驱动、部分远程桌面）的机器上，DComp 交换链会让
+    /// GPU 子进程在创建命令缓冲区时 CHECK 失败（exit_code=-2147483645
+    /// 即 STATUS_BREAKPOINT），连崩 3 次后 Chromium 退到 `--use-gl=disabled`，
+    /// 这时整个进程内 WebGL 都建不起来。关掉 DComp 后 GPU 不再崩、
+    /// 硬件 GL 照旧走真实显卡（ANGLE/D3D11）。</summary>
+    bool disableDirectComposition;
+    /// <summary>界面语言（CEF settings.locale，如 `zh-CN`；对应
+    /// ZAN_CEF_LOCALE）。""=Chromium 按系统决定。</summary>
+    string locale;
+    /// <summary>Chromium 子进程用的可执行文件（对应 ZAN_CEF_HELPER）。
+    /// ""=复用本程序，此时 Main 首句必须是
+    /// <see cref="CefBootstrap.RunHelper"/>。</summary>
+    string helperPath;
+
+    static CefOptions current;
+
+    CefOptions() {
+        runtimeDir = "";
+        cacheRoot = "";
+        profileDir = "";
+        driverPath = "";
+        switches = "";
+        disableDirectComposition = false;
+        locale = "";
+        helperPath = "";
+    }
+
+    /// <summary>让后续所有 CEF 调用使用这份配置。</summary>
+    static void Use(CefOptions options) { CefOptions.current = options; }
+
+    /// <summary>当前生效的配置（没设过时是一份全空的，即纯环境变量/默认
+    /// 行为）；就地改它的字段也算生效。</summary>
+    static CefOptions Current() {
+        if (CefOptions.current == null) {
+            CefOptions.current = new CefOptions();
+        }
+        return CefOptions.current;
+    }
+
+    /// <summary>显式配置优先，其次环境变量，都没有则 ""。</summary>
+    static string Pick(string configured, string envName) {
+        if (configured != "") { return configured; }
+        return ProcessHost.Env(envName);
+    }
+
+    static string RuntimeDir() {
+        return CefOptions.Pick(CefOptions.Current().runtimeDir,
+                               "ZAN_CEF_RUNTIME");
+    }
+    static string CacheRoot() {
+        return CefOptions.Pick(CefOptions.Current().cacheRoot, "ZAN_CEF_CACHE");
+    }
+    static string ProfileDir() {
+        return CefOptions.Pick(CefOptions.Current().profileDir,
+                               "ZAN_CEF_PROFILE");
+    }
+    static string DriverPath() {
+        return CefOptions.Pick(CefOptions.Current().driverPath,
+                               "ZAN_CEF_DRIVER");
+    }
+    static string Locale() {
+        return CefOptions.Pick(CefOptions.Current().locale, "ZAN_CEF_LOCALE");
+    }
+    static string HelperPath() {
+        return CefOptions.Pick(CefOptions.Current().helperPath,
+                               "ZAN_CEF_HELPER");
+    }
+
+    /// <summary>两处开关拼在一起（环境变量在前，配置在后，后者覆盖同名
+    /// 开关——Chromium 取命令行里最后一个），并把
+    /// <see cref="disableDirectComposition"/> 展开成真正的开关。任一段里出现
+    /// 分号时整串改用分号分隔，否则带逗号的开关值会被拆开。</summary>
+    static string Switches() {
+        string all = ProcessHost.Env("ZAN_CEF_SWITCHES");
+        all = CefOptions.Join(all, CefOptions.Current().switches);
+        if (CefOptions.NoDcomp()) {
+            all = CefOptions.Join(all, "disable-direct-composition");
+        }
+        return all;
+    }
+
+    static bool NoDcomp() {
+        if (CefOptions.Current().disableDirectComposition) { return true; }
+        string env = ProcessHost.Env("ZAN_CEF_NO_DCOMP");
+        return env != "" && env != "0";
+    }
+
+    static string Join(string left, string right) {
+        if (left == "") { return right; }
+        if (right == "") { return left; }
+        if (left.IndexOf(";") >= 0 || right.IndexOf(";") >= 0) {
+            return left + ";" + right;
+        }
+        return left + "," + right;
+    }
+}

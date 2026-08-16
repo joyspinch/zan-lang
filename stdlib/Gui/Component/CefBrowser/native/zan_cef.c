@@ -31,6 +31,7 @@
 #include "include/capi/cef_client_capi.h"
 #include "include/capi/cef_command_line_capi.h"
 #include "include/capi/cef_devtools_message_observer_capi.h"
+#include "include/capi/cef_focus_handler_capi.h"
 #include "include/capi/cef_registration_capi.h"
 
 #ifdef _WIN32
@@ -49,6 +50,18 @@
 #define ZC_MAX_CDP_QUEUE 512
 
 static char zc_error[512];
+
+/* Diagnostics gated on ZAN_CEF_LOG=1 (env read once): CEF failures show up as
+ * a blank view or a stalled page, and the useful signal (what switches the
+ * child processes got, whether the host kept pumping) is only visible here. */
+static int zc_log_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("ZAN_CEF_LOG");
+        on = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return on;
+}
 
 static void zc_fail(const char *fmt, ...) {
     va_list ap;
@@ -287,6 +300,7 @@ typedef struct zc_browser_s {
     cef_life_span_handler_t life;
     cef_load_handler_t load;
     cef_display_handler_t display;
+    cef_focus_handler_t focus;
     cef_dev_tools_message_observer_t observer;
 
     int bx, by, bw, bh;         /* last requested bounds, host coordinates */
@@ -297,6 +311,18 @@ typedef struct zc_browser_s {
     int closing, gone;
     int cdp_id;                 /* last allocated CDP message id */
     int cdp_attached;
+    /* Set while the host UI owns the keyboard (an on-canvas text field is
+     * focused): Chromium otherwise grabs the Win32 focus back on its own --
+     * after a navigation commits, a page calls focus(), a plugin starts -- and
+     * the host's address bar silently stops receiving WM_CHAR. */
+    int host_focus;
+    /* window.open / target=_blank policy: 0 = let CEF open its own popup
+     * window, 1 = block, 2 = cancel and hand the URL to the host (a tabbed
+     * host opens its own tab). */
+    int popup_policy;
+    char popup_url[2048];       /* pending handed-to-host popup target */
+    int popup_dropped;          /* hosts that never drain must not queue up */
+    char *taken_popup;          /* last popup URL handed to Zan, owned here */
 
     char *queue[ZC_MAX_CDP_QUEUE];
     int q_head, q_count, q_dropped;
@@ -406,6 +432,44 @@ static void CEF_CALLBACK zc_on_after_created(cef_life_span_handler_t *self,
     }
 }
 
+/* window.open / target=_blank / ctrl-click. Returning 1 cancels the popup;
+ * policy 2 additionally records the target so the host can open a tab. */
+static int CEF_CALLBACK zc_on_before_popup(cef_life_span_handler_t *self,
+                                           cef_browser_t *browser,
+                                           cef_frame_t *frame,
+#ifndef ZAN_CEF_LEGACY
+                                           int popup_id,
+#endif
+                                           const cef_string_t *target_url,
+                                           const cef_string_t *target_frame_name,
+                                           cef_window_open_disposition_t disp,
+                                           int user_gesture,
+                                           const cef_popup_features_t *features,
+                                           cef_window_info_t *window_info,
+                                           cef_client_t **client,
+                                           cef_browser_settings_t *settings,
+                                           cef_dictionary_value_t **extra_info,
+                                           int *no_javascript_access) {
+    (void)browser; (void)frame; (void)target_frame_name; (void)disp;
+    (void)user_gesture; (void)features; (void)window_info; (void)client;
+    (void)settings; (void)extra_info; (void)no_javascript_access;
+#ifndef ZAN_CEF_LEGACY
+    (void)popup_id;
+#endif
+    zc_browser_t *b = ZC_OWNER(self, life);
+    if (b->popup_policy == 0) return 0;
+    if (b->popup_policy == 2) {
+        zc_enter();
+        if (b->popup_url[0]) {
+            b->popup_dropped++;
+        } else {
+            zc_str_get(target_url, b->popup_url, sizeof(b->popup_url));
+        }
+        zc_leave();
+    }
+    return 1;
+}
+
 static int CEF_CALLBACK zc_do_close(cef_life_span_handler_t *self,
                                     cef_browser_t *browser) {
     (void)browser;
@@ -497,6 +561,28 @@ static void CEF_CALLBACK zc_on_title_change(cef_display_handler_t *self,
     b->nav_seq++;
 }
 
+/* -------------------------------------------------------------------- focus */
+
+/* Chromium asking for the focus. Denied while the host owns the keyboard, so a
+ * page load (or the page itself) cannot steal it from an on-canvas text field.
+ * `source` is FOCUS_SOURCE_NAVIGATION or FOCUS_SOURCE_SYSTEM. */
+static int CEF_CALLBACK zc_on_set_focus(cef_focus_handler_t *self,
+                                        cef_browser_t *browser,
+                                        cef_focus_source_t source) {
+    (void)browser;
+    (void)source;
+    return ZC_OWNER(self, focus)->host_focus ? 1 : 0;
+}
+
+/* Chromium giving the focus up (tabbing out of the last element): the host gets
+ * it, matching what CefBrowser.SyncFocus does on the Zan side. */
+static void CEF_CALLBACK zc_on_take_focus(cef_focus_handler_t *self,
+                                          cef_browser_t *browser, int next) {
+    (void)browser;
+    (void)next;
+    ZC_OWNER(self, focus)->host_focus = 1;
+}
+
 /* ------------------------------------------------------------------- client */
 
 static cef_life_span_handler_t *CEF_CALLBACK zc_get_life_span_handler(
@@ -513,20 +599,28 @@ static cef_display_handler_t *CEF_CALLBACK zc_get_display_handler(
     return &ZC_OWNER(self, client)->display;
 }
 
+static cef_focus_handler_t *CEF_CALLBACK zc_get_focus_handler(
+        cef_client_t *self) {
+    return &ZC_OWNER(self, client)->focus;
+}
+
 static void zc_browser_init_handlers(zc_browser_t *b) {
     memset(&b->client, 0, sizeof(b->client));
     memset(&b->life, 0, sizeof(b->life));
     memset(&b->load, 0, sizeof(b->load));
     memset(&b->display, 0, sizeof(b->display));
+    memset(&b->focus, 0, sizeof(b->focus));
     memset(&b->observer, 0, sizeof(b->observer));
 
     zc_base_init(&b->client.base, sizeof(b->client));
     b->client.get_life_span_handler = zc_get_life_span_handler;
     b->client.get_load_handler = zc_get_load_handler;
     b->client.get_display_handler = zc_get_display_handler;
+    b->client.get_focus_handler = zc_get_focus_handler;
 
     zc_base_init(&b->life.base, sizeof(b->life));
     b->life.on_after_created = zc_on_after_created;
+    b->life.on_before_popup = zc_on_before_popup;
     b->life.do_close = zc_do_close;
     b->life.on_before_close = zc_on_before_close;
 
@@ -539,6 +633,10 @@ static void zc_browser_init_handlers(zc_browser_t *b) {
     zc_base_init(&b->display.base, sizeof(b->display));
     b->display.on_address_change = zc_on_address_change;
     b->display.on_title_change = zc_on_title_change;
+
+    zc_base_init(&b->focus.base, sizeof(b->focus));
+    b->focus.on_set_focus = zc_on_set_focus;
+    b->focus.on_take_focus = zc_on_take_focus;
 
     zc_base_init(&b->observer.base, sizeof(b->observer));
     b->observer.on_dev_tools_message = zc_on_dev_tools_message;
@@ -555,23 +653,59 @@ static void zc_browser_init_handlers(zc_browser_t *b) {
  * without a user gesture; the rest keeps a headless-ish embed usable. */
 static char zc_extra_switches[1024];
 
+/* Comma-separated switches: appending one of these with a plain value would
+ * drop the entries Chromium and CEF already put there (CEF 151 disables
+ * GlicActorUi/LensOverlay/... this way), so an app switch has to be merged
+ * into the existing value instead of replacing it. */
+static int zc_switch_is_list(const char *k) {
+    return strcmp(k, "disable-features") == 0 ||
+           strcmp(k, "enable-features") == 0 ||
+           strcmp(k, "disable-blink-features") == 0 ||
+           strcmp(k, "enable-blink-features") == 0;
+}
+
+static void zc_append_switch(cef_command_line_t *cl, const char *key,
+                             const char *value) {
+    cef_string_t k, v;
+    zc_str_set(&k, key);
+    if (!value) {
+        cl->append_switch(cl, &k);
+        zc_str_free(&k);
+        return;
+    }
+    char merged[1024];
+    const char *out = value;
+    if (zc_switch_is_list(key) && cl->has_switch(cl, &k)) {
+        char old[768];
+        zc_userfree_get(cl->get_switch_value(cl, &k), old, sizeof(old));
+        if (old[0]) {
+            snprintf(merged, sizeof(merged), "%s,%s", old, value);
+            out = merged;
+        }
+    }
+    zc_str_set(&v, out);
+    cl->append_switch_with_value(cl, &k, &v);
+    zc_str_free(&k);
+    zc_str_free(&v);
+}
+
 static void CEF_CALLBACK zc_on_before_command_line_processing(
         cef_app_t *self, const cef_string_t *process_type,
         cef_command_line_t *command_line) {
     (void)self; (void)process_type;
     if (!command_line) return;
-    cef_string_t k, v;
-    zc_str_set(&k, "autoplay-policy");
-    zc_str_set(&v, "no-user-gesture-required");
-    command_line->append_switch_with_value(command_line, &k, &v);
-    zc_str_free(&k);
-    zc_str_free(&v);
+    zc_append_switch(command_line, "autoplay-policy",
+                     "no-user-gesture-required");
 
-    /* "a=b,c" style list handed down from Zan (CefRuntime/CefBrowser). */
+    /* "a=b,c" style list handed down from Zan (CefRuntime/CefBrowser). A comma
+     * is also the separator inside switch values (disable-features=A,B), so a
+     * semicolon anywhere switches the whole list to semicolons and lets those
+     * values through intact. */
+    char sep = strchr(zc_extra_switches, ';') ? ';' : ',';
     const char *p = zc_extra_switches;
     while (*p) {
-        const char *comma = strchr(p, ',');
-        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        const char *end = strchr(p, sep);
+        size_t len = end ? (size_t)(end - p) : strlen(p);
         if (len > 0 && len < 512) {
             char item[512];
             memcpy(item, p, len);
@@ -579,19 +713,27 @@ static void CEF_CALLBACK zc_on_before_command_line_processing(
             char *eq = strchr(item, '=');
             if (eq) {
                 *eq = '\0';
-                zc_str_set(&k, item);
-                zc_str_set(&v, eq + 1);
-                command_line->append_switch_with_value(command_line, &k, &v);
-                zc_str_free(&k);
-                zc_str_free(&v);
+                zc_append_switch(command_line, item, eq + 1);
             } else {
-                zc_str_set(&k, item);
-                command_line->append_switch(command_line, &k);
-                zc_str_free(&k);
+                zc_append_switch(command_line, item, NULL);
             }
         }
-        if (!comma) break;
-        p = comma + 1;
+        if (!end) break;
+        p = end + 1;
+    }
+
+    /* With ZAN_CEF_LOG=1, report the command line every Chromium process is
+     * actually started with -- the only way to tell a switch that never
+     * arrived (typo in ZAN_CEF_SWITCHES) from one Chromium ignored. */
+    if (zc_log_on()) {
+        char utf8[4096];
+        zc_userfree_get(command_line->get_command_line_string(command_line),
+                        utf8, sizeof(utf8));
+        char ptype[128];
+        zc_str_get(process_type, ptype, sizeof(ptype));
+        fprintf(stderr, "[cmdline] type=%s extra=\"%s\" line=%s\n",
+                ptype[0] ? ptype : "browser", zc_extra_switches, utf8);
+        fflush(stderr);
     }
 }
 
@@ -671,9 +813,17 @@ ZC_EXPORT int zan_cef_ready(void) { return zc_ready && !zc_shut; }
 /* Run a Chromium helper process (render/gpu/utility) and return its exit code;
  * returns -1 in the browser process, where the caller must continue into
  * zan_cef_init. A Zan program that reuses its own executable as the helper
- * calls this as the very first thing in Main. */
-ZC_EXPORT int zan_cef_execute_process(const char *runtime_dir) {
+ * calls this as the very first thing in Main.
+ *
+ * `switches` is the same list the browser process passes to zan_cef_init:
+ * Chromium only forwards the switches it knows about to its children, so a
+ * host switch that must hold in every process (logging, GPU selection) has to
+ * be re-applied here as well. */
+ZC_EXPORT int zan_cef_execute_process(const char *runtime_dir,
+                                     const char *switches) {
     if (!zc_load(runtime_dir)) return -1;
+    snprintf(zc_extra_switches, sizeof(zc_extra_switches), "%s",
+             switches ? switches : "");
     zc_app_init();
     cef_main_args_t args;
     zc_main_args(&args);
@@ -753,7 +903,38 @@ ZC_EXPORT int zan_cef_init(const char *runtime_dir, const char *cache_path,
 
 /* One turn of CEF's message loop, driven from the host UI loop. */
 ZC_EXPORT void zan_cef_work(void) {
-    if (zc_ready && !zc_shut) zc.do_message_loop_work();
+    if (zc_ready && !zc_shut) {
+#ifdef _WIN32
+        {   /* CEF is driven from the host UI loop, so a host that stops
+             * calling here stalls Chromium -- which surfaces as unrelated-
+             * looking failures inside CEF ("Timeout of new browser info
+             * response"). ZAN_CEF_LOG=1 reports the gaps. */
+            static unsigned long long prev = 0, worst = 0;
+            static unsigned long calls = 0, slow = 0;
+            if (zc_log_on()) {
+                unsigned long long now = GetTickCount64();
+                if (prev) {
+                    unsigned long long gap = now - prev;
+                    calls++;
+                    if (gap > worst) worst = gap;
+                    if (gap > 300) {
+                        SYSTEMTIME st;
+                        GetLocalTime(&st);
+                        slow++;
+                        fprintf(stderr,
+                                "[pump] %02d:%02d:%02d.%03d gap=%llu ms worst=%llu"
+                                " slow=%lu calls=%lu\n",
+                                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                                gap, worst, slow, calls);
+                        fflush(stderr);
+                    }
+                }
+                prev = now;
+            }
+        }
+#endif
+        zc.do_message_loop_work();
+    }
 }
 
 ZC_EXPORT void zan_cef_shutdown(void) {
@@ -805,6 +986,9 @@ ZC_EXPORT int zan_cef_create(void *parent, int x, int y, int w, int h,
     }
     memset(b->url, 0, sizeof(b->url));
     memset(b->title, 0, sizeof(b->title));
+    memset(b->popup_url, 0, sizeof(b->popup_url));
+    b->popup_policy = 0;
+    b->popup_dropped = 0;
     b->used = 1;
     b->gone = 0;
     b->bx = x;
@@ -1020,10 +1204,94 @@ ZC_EXPORT void zan_cef_set_clip(int h, const char *spec) {
 
 ZC_EXPORT void zan_cef_set_focus(int h, int focus) {
     zc_browser_t *b = zc_get(h);
-    if (!b || !b->browser) return;
+    if (!b) return;
+    /* Latch first: focus=0 means "the host owns the keyboard now", which must
+     * hold even before the browser exists (or after it went away), otherwise
+     * the first navigation grabs the focus back. */
+    b->host_focus = focus ? 0 : 1;
+    if (!b->browser) return;
     cef_browser_host_t *host = b->browser->get_host(b->browser);
     if (!host) return;
     host->set_focus(host, focus);
+    host->base.release(&host->base);
+}
+
+/* --------------------------------------------------- zoom / find / print --- */
+
+/* Chromium's zoom is logarithmic: level 0 is 100%, +1 is a factor of 1.2. */
+ZC_EXPORT void zan_cef_set_zoom(int h, double level) {
+    zc_browser_t *b = zc_get(h);
+    if (!b || !b->browser) return;
+    cef_browser_host_t *host = b->browser->get_host(b->browser);
+    if (!host) return;
+    host->set_zoom_level(host, level);
+    host->base.release(&host->base);
+}
+
+ZC_EXPORT double zan_cef_get_zoom(int h) {
+    zc_browser_t *b = zc_get(h);
+    if (!b || !b->browser) return 0.0;
+    cef_browser_host_t *host = b->browser->get_host(b->browser);
+    if (!host) return 0.0;
+    double level = host->get_zoom_level(host);
+    host->base.release(&host->base);
+    return level;
+}
+
+/* In-page search. find_next=0 starts a new search, 1 steps through the
+ * matches of the current one. */
+ZC_EXPORT void zan_cef_find(int h, const char *text, int forward,
+                            int match_case, int find_next) {
+    zc_browser_t *b = zc_get(h);
+    if (!b || !b->browser || !text) return;
+    cef_browser_host_t *host = b->browser->get_host(b->browser);
+    if (!host) return;
+    cef_string_t s;
+    zc_str_set(&s, text);
+    /* Same shape on both branches: 109 had already dropped the
+     * caller-assigned search identifier. */
+    host->find(host, &s, forward, match_case, find_next);
+    zc_str_free(&s);
+    host->base.release(&host->base);
+}
+
+ZC_EXPORT void zan_cef_stop_find(int h, int clear_selection) {
+    zc_browser_t *b = zc_get(h);
+    if (!b || !b->browser) return;
+    cef_browser_host_t *host = b->browser->get_host(b->browser);
+    if (!host) return;
+    host->stop_finding(host, clear_selection);
+    host->base.release(&host->base);
+}
+
+/* Opens the platform print dialog (printing to PDF without a dialog is
+ * CDP's Page.printToPDF, which also returns the bytes). */
+ZC_EXPORT void zan_cef_print(int h) {
+    zc_browser_t *b = zc_get(h);
+    if (!b || !b->browser) return;
+    cef_browser_host_t *host = b->browser->get_host(b->browser);
+    if (!host) return;
+    host->print(host);
+    host->base.release(&host->base);
+}
+
+/* DevTools in its own CEF-owned window; the optional arguments are all NULL,
+ * which is how CEF is told to use its defaults. */
+ZC_EXPORT void zan_cef_show_devtools(int h) {
+    zc_browser_t *b = zc_get(h);
+    if (!b || !b->browser) return;
+    cef_browser_host_t *host = b->browser->get_host(b->browser);
+    if (!host) return;
+    host->show_dev_tools(host, NULL, NULL, NULL, NULL);
+    host->base.release(&host->base);
+}
+
+ZC_EXPORT void zan_cef_close_devtools(int h) {
+    zc_browser_t *b = zc_get(h);
+    if (!b || !b->browser) return;
+    cef_browser_host_t *host = b->browser->get_host(b->browser);
+    if (!host) return;
+    host->close_dev_tools(host);
     host->base.release(&host->base);
 }
 
@@ -1155,6 +1423,31 @@ ZC_EXPORT int zan_cef_cdp_send(int h, const char *method, const char *params_jso
     free(msg);
     host->base.release(&host->base);
     return ok ? id : 0;
+}
+
+/* window.open / target=_blank policy: 0 = CEF's own popup window (default),
+ * 1 = block, 2 = cancel and hand the URL to the host via
+ * zan_cef_take_popup_url. */
+ZC_EXPORT void zan_cef_set_popup_policy(int h, int policy) {
+    zc_browser_t *b = zc_get(h);
+    if (b) b->popup_policy = policy;
+}
+
+/* Pending popup target under policy 2, "" when there is none. The returned
+ * pointer stays valid until the next take on the same browser. */
+ZC_EXPORT const char *zan_cef_take_popup_url(int h) {
+    zc_browser_t *b = zc_get(h);
+    if (!b) return "";
+    zc_enter();
+    if (!b->popup_url[0]) {
+        zc_leave();
+        return "";
+    }
+    free(b->taken_popup);
+    b->taken_popup = zc_dup(b->popup_url, strlen(b->popup_url));
+    b->popup_url[0] = '\0';
+    zc_leave();
+    return b->taken_popup ? b->taken_popup : "";
 }
 
 ZC_EXPORT int zan_cef_cdp_pending(int h) {

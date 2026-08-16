@@ -1,0 +1,298 @@
+using System;
+
+namespace Gui.Component.CefBrowser;
+
+/// <summary>CDP 消息回调：收到的原始 JSON（事件的整条消息，或命令回复的
+/// `result` 部分）。</summary>
+delegate void CdpEventFn(string json);
+
+/// <summary>
+/// CDP（Chrome DevTools Protocol）消息路由：把
+/// <see cref="CefBrowser.TakeCdpMessage"/> 那条「什么都往里塞」的原始队列
+/// 分派成「按事件名订阅」和「命令回复回调」。
+///
+/// <code>
+/// CefCdp cdp = web.Cdp();
+/// cdp.Enable("Network");
+/// cdp.On("Network.responseReceived", (json) => { Console.WriteLine(json); });
+/// cdp.Send("Page.captureScreenshot", "{}", (result) => { ... });
+/// </code>
+///
+/// 队列由 <see cref="CefBrowser.Render"/> 每帧抽干（拿到过
+/// <see cref="CefBrowser.Cdp"/> 的浏览器才会），因此不用自己调
+/// <see cref="Pump"/>；不走 GUI 的宿主自己按节奏调它。
+///
+/// 注意：路由挂上之后消息就都归它了，别再直接用
+/// <see cref="CefBrowser.TakeCdpMessage"/> —— 两边会互相抢消息。
+/// </summary>
+class CefCdp {
+    CefBrowser web;
+    List<string> names;         // 订阅的事件名
+    List<CdpEventFn> handlers;  // 与 names 平行
+    List<int> ids;              // 等待回复的命令 id
+    List<CdpEventFn> replies;   // 与 ids 平行，一次性
+    CdpEventFn anyHandler;      // 所有事件（含未订阅的）
+    int dispatched;
+    int unrouted;
+
+    CefCdp(CefBrowser browser) {
+        web = browser;
+        names = new List<string>();
+        handlers = new List<CdpEventFn>();
+        ids = new List<int>();
+        replies = new List<CdpEventFn>();
+        anyHandler = null;
+        dispatched = 0;
+        unrouted = 0;
+    }
+
+    /// <summary>订阅一个 CDP 事件（如 `Network.responseReceived`）。可以对同
+    /// 一个事件名订阅多次。回调拿到的是整条消息 JSON（含 `params`）。</summary>
+    void On(string eventName, CdpEventFn handler) {
+        names.Add(eventName);
+        handlers.Add(handler);
+    }
+
+    /// <summary>取消某个事件名上的全部订阅。</summary>
+    void Off(string eventName) {
+        int i = 0;
+        while (i < names.Count) {
+            if (names[i] == eventName) {
+                names.RemoveAt(i);
+                handlers.RemoveAt(i);
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+
+    /// <summary>订阅所有事件（调试/日志用）。</summary>
+    void OnAny(CdpEventFn handler) { anyHandler = handler; }
+
+    /// <summary>发一条 CDP 命令；<paramref name="onResult"/> 在回复到达时被调
+    /// 一次，拿到的是回复里的 `result` JSON（不需要回复传 null）。返回消息 id
+    /// （0 = 浏览器还没就绪）。</summary>
+    int Send(string method, string paramsJson, CdpEventFn onResult) {
+        int id = web.SendCdp(method, paramsJson);
+        if (id != 0 && onResult != null) {
+            ids.Add(id);
+            replies.Add(onResult);
+        }
+        return id;
+    }
+
+    /// <summary>打开一个 CDP 域（`Network` / `Page` / `Runtime` / `Log` ...）。
+    /// 多数域的事件要先 enable 才会来。</summary>
+    int Enable(string domain) {
+        return web.SendCdp(domain + ".enable", "{}");
+    }
+
+    /// <summary>关闭一个 CDP 域。</summary>
+    int Disable(string domain) {
+        return web.SendCdp(domain + ".disable", "{}");
+    }
+
+    /// <summary>已分派的消息数 / 没有任何订阅者接手的消息数（订阅名写错时
+    /// 后者会一直涨）。</summary>
+    int Dispatched() { return dispatched; }
+    int Unrouted() { return unrouted; }
+
+    /// <summary>抽干队列并分派。幂等，未创建/空队列时是空操作。</summary>
+    void Pump() {
+        while (true) {
+            string msg = web.TakeCdpMessage();
+            if (msg == "") { return; }
+            Dispatch(msg);
+        }
+    }
+
+    void Dispatch(string msg) {
+        dispatched = dispatched + 1;
+        string method = CefCdp.Field(msg, "method");
+        if (method != "") {
+            bool routed = false;
+            for (int i = 0; i < names.Count; i = i + 1) {
+                if (names[i] == method) {
+                    handlers[i](msg);
+                    routed = true;
+                }
+            }
+            if (anyHandler != null) { anyHandler(msg); routed = true; }
+            if (!routed) { unrouted = unrouted + 1; }
+            return;
+        }
+        // 命令回复：{"id":7,"result":{...}}
+        int id = CefCdp.IntField(msg, "id");
+        if (id == 0) { unrouted = unrouted + 1; return; }
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            if (ids[i] == id) {
+                CdpEventFn h = replies[i];
+                ids.RemoveAt(i);
+                replies.RemoveAt(i);
+                string result = CefCdp.Raw(msg, "result");
+                if (result == "") { result = msg; }
+                h(result);
+                return;
+            }
+        }
+        unrouted = unrouted + 1;
+    }
+
+    // ---- 顶层 JSON 取值 ---------------------------------------------------
+    // CDP 消息里嵌套很深，而这里只需要最外层的 method/id/result：浅扫全文会
+    // 把 params 里同名的键当成外层的，所以按括号深度只认深度 1 的键。
+
+    /// <summary>顶层键的原始值（字符串带引号、对象/数组原样），没有为 ""。
+    /// </summary>
+    static string Raw(string json, string key) {
+        int n = json.Length;
+        int depth = 0;
+        bool inStr = false;
+        bool esc = false;
+        int i = 0;
+        while (i < n) {
+            int c = json[i] & 255;
+            if (inStr) {
+                if (esc) { esc = false; }
+                else if (c == 92) { esc = true; }
+                else if (c == 34) {
+                    inStr = false;
+                    // 字符串刚结束：它是深度 1 的键吗（后面紧跟 ':'）？
+                    if (depth == 1) {
+                        int j = CefCdp.SkipWs(json, i + 1);
+                        if (j < n && (json[j] & 255) == 58) {
+                            int ks = CefCdp.KeyStart(json, i);
+                            if (ks >= 0
+                                && json.Substring(ks, i - ks) == key) {
+                                return CefCdp.ValueAt(json,
+                                    CefCdp.SkipWs(json, j + 1));
+                            }
+                        }
+                    }
+                }
+                i = i + 1;
+                continue;
+            }
+            if (c == 34) { inStr = true; }
+            else if (c == 123 || c == 91) { depth = depth + 1; }
+            else if (c == 125 || c == 93) { depth = depth - 1; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// <summary>顶层字符串键的值（已去引号），没有为 ""。</summary>
+    static string Field(string json, string key) {
+        string raw = CefCdp.Raw(json, key);
+        if (raw.Length >= 2 && (raw[0] & 255) == 34) {
+            return CefCdp.Unescape(raw.Substring(1, raw.Length - 2));
+        }
+        return raw;
+    }
+
+    /// <summary>顶层整数键的值，没有/不是数字为 0。</summary>
+    static int IntField(string json, string key) {
+        string raw = CefCdp.Raw(json, key);
+        int v = 0;
+        bool any = false;
+        for (int i = 0; i < raw.Length; i = i + 1) {
+            int c = raw[i] & 255;
+            if (c < 48 || c > 57) { break; }
+            v = v * 10 + (c - 48);
+            any = true;
+        }
+        if (!any) { return 0; }
+        return v;
+    }
+
+    /// <summary>从引号结束位置回溯到键名的起点（引号之后的第一个字符），
+    /// 找不到成对的起始引号返回 -1。</summary>
+    static int KeyStart(string json, int endQuote) {
+        int i = endQuote - 1;
+        while (i >= 0) {
+            if ((json[i] & 255) == 34) {
+                // 数一下前面连续的反斜杠：偶数个才是真正的起始引号。
+                int bs = 0;
+                int k = i - 1;
+                while (k >= 0 && (json[k] & 255) == 92) { bs = bs + 1; k = k - 1; }
+                if (bs % 2 == 0) { return i + 1; }
+            }
+            i = i - 1;
+        }
+        return 0 - 1;
+    }
+
+    static int SkipWs(string json, int i) {
+        while (i < json.Length) {
+            int c = json[i] & 255;
+            if (c != 32 && c != 9 && c != 10 && c != 13) { return i; }
+            i = i + 1;
+        }
+        return i;
+    }
+
+    /// <summary>从 <paramref name="start"/> 起读一个 JSON 值的原文。</summary>
+    static string ValueAt(string json, int start) {
+        int n = json.Length;
+        if (start >= n) { return ""; }
+        int c = json[start] & 255;
+        if (c == 34) {
+            bool esc = false;
+            for (int i = start + 1; i < n; i = i + 1) {
+                int d = json[i] & 255;
+                if (esc) { esc = false; }
+                else if (d == 92) { esc = true; }
+                else if (d == 34) { return json.Substring(start, i - start + 1); }
+            }
+            return json.Substring(start, n - start);
+        }
+        if (c == 123 || c == 91) {
+            int depth = 0;
+            bool inStr = false;
+            bool esc2 = false;
+            for (int i = start; i < n; i = i + 1) {
+                int d = json[i] & 255;
+                if (inStr) {
+                    if (esc2) { esc2 = false; }
+                    else if (d == 92) { esc2 = true; }
+                    else if (d == 34) { inStr = false; }
+                    continue;
+                }
+                if (d == 34) { inStr = true; }
+                else if (d == 123 || d == 91) { depth = depth + 1; }
+                else if (d == 125 || d == 93) {
+                    depth = depth - 1;
+                    if (depth == 0) { return json.Substring(start, i - start + 1); }
+                }
+            }
+            return json.Substring(start, n - start);
+        }
+        int end = start;
+        while (end < n) {
+            int d = json[end] & 255;
+            if (d == 44 || d == 125 || d == 93) { break; }
+            end = end + 1;
+        }
+        return json.Substring(start, end - start).Trim();
+    }
+
+    static string Unescape(string s) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c == 92 && i + 1 < s.Length) {
+                int d = s[i + 1] & 255;
+                if (d == 110) { sb.Append("\n"); }
+                else if (d == 114) { sb.Append("\r"); }
+                else if (d == 116) { sb.Append("\t"); }
+                else { sb.Append(s.Substring(i + 1, 1)); }
+                i = i + 2;
+                continue;
+            }
+            sb.Append(s.Substring(i, 1));
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+}

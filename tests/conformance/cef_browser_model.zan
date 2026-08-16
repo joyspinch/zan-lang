@@ -133,6 +133,136 @@ class Program {
         return false;
     }
 
+    static void Options() {
+        // 代码级配置：显式设过的字段盖掉环境变量，空字符串 = 没设。
+        CefOptions o = new CefOptions();
+        o.runtimeDir = "D:/app/cef";
+        o.profileDir = "D:/app/data/web";
+        o.driverPath = "D:/app/bin";
+        o.cacheRoot = "D:/app/cache";
+        o.locale = "zh-CN";
+        o.helperPath = "D:/app/bin/helper.exe";
+        o.switches = "disable-gpu";
+        CefOptions.Use(o);
+        Eq(CefOptions.RuntimeDir(), "D:/app/cef", "options runtime dir");
+        Eq(CefOptions.ProfileDir(), "D:/app/data/web", "options profile dir");
+        Eq(CefOptions.CacheRoot(), "D:/app/cache", "options cache root");
+        Eq(CefOptions.Locale(), "zh-CN", "options locale");
+        Eq(CefOptions.HelperPath(), "D:/app/bin/helper.exe",
+            "options helper path");
+        Eq(CefHost.Switches(), "disable-gpu", "options switches reach the host");
+        // profile 目录不再跟着运行时目录跑，driver 按配置目录找。
+        Eq(CefHost.ProfileDir("/opt/cef/linux64-151"), "D:/app/data/web",
+            "configured profile wins over the runtime-adjacent default");
+        Check(Program.EndsWithAny(CefBackend.Candidates("151.3.18"),
+                                  "D:/app/bin"),
+            "configured driver directory is searched first");
+        // 开关值里带逗号时整串改用分号分隔，否则 disable-features=A,B 会被
+        // 拆成两个开关；disableDirectComposition 展开成真正的开关。
+        o.switches = "disable-features=A,B;use-angle=d3d11";
+        o.disableDirectComposition = true;
+        Eq(CefHost.Switches(),
+            "disable-features=A,B;use-angle=d3d11;disable-direct-composition",
+            "semicolon list keeps comma-separated switch values intact");
+        o.switches = "";
+        Eq(CefHost.Switches(), "disable-direct-composition",
+            "dcomp flag alone still reaches the command line");
+        o.disableDirectComposition = false;
+        o.switches = "disable-gpu";
+        // 换回一份空配置 = 纯环境变量/默认行为。
+        CefOptions.Use(new CefOptions());
+        Eq(CefOptions.RuntimeDir(), "", "empty options fall back");
+        Eq(CefHost.ProfileDir("/opt/cef/linux64-151"), "/opt/cef/profile",
+            "default profile sits next to the runtime");
+    }
+
+    static void CdpRouting() {
+        // CDP 消息分派只能认最外层的 method/id：params 里同名的键
+        // （事件体里就带着 "method"/"id"）不能把路由带跑。
+        string evt = "{\"method\":\"Network.responseReceived\",\"params\":"
+            + "{\"requestId\":\"7.1\",\"method\":\"Runtime.evaluate\","
+            + "\"id\":99,\"response\":{\"status\":200}}}";
+        Eq(CefCdp.Field(evt, "method"), "Network.responseReceived",
+            "top-level method");
+        Check(CefCdp.IntField(evt, "id") == 0, "nested id is not a reply id");
+        string reply = "{\"id\":42,\"result\":{\"cookies\":[{\"name\":\"a\"}]}}";
+        Check(CefCdp.IntField(reply, "id") == 42, "reply id");
+        Eq(CefCdp.Field(reply, "method"), "", "reply has no method");
+        Eq(CefCdp.Raw(reply, "result"),
+            "{\"cookies\":[{\"name\":\"a\"}]}", "reply result payload");
+        // 键名里带转义的引号不能把扫描弄丢。
+        string tricky = "{\"a\\\"b\":1,\"method\":\"Page.loadEventFired\"}";
+        Eq(CefCdp.Field(tricky, "method"), "Page.loadEventFired",
+            "escaped quote in a key");
+        // Cookie 参数拼装：domain/path 形式与 url 形式。
+        Eq(CefCookies.Param("t", "v", ".example.com", "/", true, "", 0 - 1),
+            "{\"name\":\"t\",\"value\":\"v\",\"domain\":\".example.com\","
+            + "\"path\":\"/\",\"secure\":true}", "cookie param domain form");
+        Eq(CefCookies.Param("t", "v", "", "", false,
+                            "https://example.com/", 1700000000),
+            "{\"name\":\"t\",\"value\":\"v\",\"url\":\"https://example.com/\","
+            + "\"expires\":1700000000}", "cookie param url form");
+    }
+
+    static void Fingerprint() {
+        // DPR 拼的是 JSON 字面量，不能跟着地区变成逗号。
+        Eq(CefFingerprint.Ratio(100), "1", "dpr 1.0");
+        Eq(CefFingerprint.Ratio(150), "1.5", "dpr 1.5");
+        Eq(CefFingerprint.Ratio(225), "2.25", "dpr 2.25");
+        Eq(CefFingerprint.Ratio(205), "2.05", "dpr keeps the leading zero");
+        Eq(CefFingerprint.Major("151.0.7922.138"), "151", "chrome major");
+        Eq(CefFingerprint.Major("151"), "151", "major without dots");
+
+        // 一份什么都没填的指纹不该注入任何脚本。
+        CefFingerprint fp = new CefFingerprint(null);
+        Eq(fp.Script(), "", "empty fingerprint injects nothing");
+
+        // 补丁脚本按字段按需拼：只填了 WebGL 就只有 WebGL 那段。
+        fp.webglVendor = "Google Inc. (NVIDIA)";
+        fp.webglRenderer = "ANGLE (NVIDIA)";
+        string js = fp.Script();
+        Check(js.StartsWith("(function(){") && js.EndsWith("})();"),
+            "injected script is self-contained");
+        Check(js.Contains("37445") && js.Contains("7936"),
+            "both unmasked and standard WebGL parameters are patched");
+        Check(!js.Contains("languages") && !js.Contains("toDataURL"),
+            "unset fields inject nothing");
+
+        fp.canvasNoise = 2;
+        fp.locale = "zh-CN";
+        fp.hideWebdriver = true;
+        js = fp.Script();
+        Check(js.Contains("toDataURL") && js.Contains("getImageData"),
+            "canvas noise patches both readback paths");
+        Check(js.Contains("'languages'") && js.Contains("[\"zh-CN\"]"),
+            "languages fall back to the locale");
+        Check(js.Contains("'webdriver'"), "webdriver is hidden");
+
+        // Client Hints 品牌列表要带 Chromium 与 Not.A/Brand，只报一个
+        // 品牌反而扎眼；fullVersion 缺省跟主版本号。
+        fp.brand = "Google Chrome";
+        fp.brandVersion = "151";
+        fp.platform = "Windows";
+        fp.platformVersion = "15.0.0";
+        string meta = fp.Metadata();
+        Check(meta.Contains("\"Not.A/Brand\"") && meta.Contains("\"Chromium\"")
+              && meta.Contains("\"Google Chrome\""), "brand list");
+        Check(meta.Contains("\"fullVersion\":\"151\""),
+            "fullVersion falls back to the major version");
+        Check(meta.Contains("\"architecture\":\"x86\""),
+            "architecture defaults to x86");
+        Check(meta.Contains("\"mobile\":false"), "desktop mobile flag");
+
+        // 预设拿的是 Chromium 的版本号，不是 CEF 的。
+        CefFingerprint win = new CefFingerprint(null);
+        win.UseWindowsChrome("151.0.7922.138");
+        Check(win.userAgent.Contains("Chrome/151.0.0.0")
+              && win.userAgent.Contains("Windows NT 10.0; Win64; x64"),
+            "windows chrome preset UA");
+        Eq(win.brandVersion, "151", "preset brand major");
+        Eq(win.brandFullVersion, "151.0.7922.138", "preset brand full version");
+    }
+
     static int Main() {
         bad = 0;
         Normalize();
@@ -141,6 +271,9 @@ class Program {
         Factory();
         HostPaths();
         DriverChoice();
+        Options();
+        CdpRouting();
+        Fingerprint();
         if (bad == 0) { Console.WriteLine("cef browser model ok"); }
         return bad == 0 ? 0 : 1;
     }
