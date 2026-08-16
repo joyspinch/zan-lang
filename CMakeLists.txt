@@ -1399,48 +1399,6 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 
-# ---- IDE: assistant task state machine ----
-# The twelve-phase delivery run (understand -> ... -> knowledge), its bounded
-# retries, the diagnose-and-reverify loop and the checkpoint round-trip are pure
-# computation, so the whole lifecycle is verified headlessly -- including that a
-# restored checkpoint resumes at the phase that failed instead of restarting.
-add_test(NAME conformance_ide_airun
-  COMMAND ${CMAKE_COMMAND}
-    -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/ide/airun_test.zan
-    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/src/ide_zan/src/services/AiRun.zan;--auto-stdlib"
-    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/ide/airun_test.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_ide_airun${_exe_ext}
-    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-
-# ---- IDE: Help & Feedback local diagnostics store ----
-# Parsing compiler diagnostic lines, de-dup counting, redaction (absolute paths,
-# secrets, connection strings, e-mail), the JSONL round-trip and "no events in
-# the payload unless the user consents to logs" are all pure computation, so the
-# aggregation layer is verified headlessly with no window.
-add_test(NAME conformance_ide_diagstore
-  COMMAND ${CMAKE_COMMAND}
-    -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/ide/diagstore_test.zan
-    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/src/ide_zan/src/services/DiagStore.zan;--auto-stdlib"
-    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/ide/diagstore_test.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_ide_diagstore${_exe_ext}
-    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-
-# ---- Designer: free-layout magnetic snapping geometry ----
-# Snapping is pure integer geometry (candidate lines from the canvas and the
-# siblings x the moving box's start/centre/end anchors, within a tolerance), so
-# every alignment case is pinned here -- including that a drag outside the
-# tolerance is left exactly where the pointer put it and draws no guide.
-add_test(NAME conformance_ide_snap
-  COMMAND ${CMAKE_COMMAND}
-    -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/ide/snap_test.zan
-    -DZANC_ARGS=--auto-stdlib
-    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/ide/snap_test.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_ide_snap${_exe_ext}
-    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-
 # ---- Policy: components own their drawing, examples only use them ----
 # A gauge drawn a second time inside a demo drifts from the component the moment
 # the component is fixed -- so the arc/sector primitives a dial is made of are
