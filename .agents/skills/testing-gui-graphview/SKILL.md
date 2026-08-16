@@ -89,6 +89,43 @@ wrapping and vertical scrolling paths.
   screenshot taken with the cursor still over the card. **Always move the mouse
   away and re-screenshot before judging selection.**
 
+## Verifying the same component inside ZanIDE (`_scratch/zanide`)
+
+The probe proves the widget; the IDE proves the wiring. Launch:
+
+```bash
+cd /home/ubuntu/work/zan-lang && (ZAN_LIB_PATH=$PWD/build LD_LIBRARY_PATH=$PWD/build \
+  LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libssl.so.3 /usr/lib/x86_64-linux-gnu/libcrypto.so.3" \
+  DISPLAY=:0 setsid nohup ./_scratch/zanide > _scratch/zanide.log 2>&1 < /dev/null &)
+# then, in a separate call:
+DISPLAY=:0 wmctrl -a ZanIDE && DISPLAY=:0 wmctrl -r ZanIDE -b add,maximized_vert,maximized_horz
+```
+`LD_PRELOAD` is required (the bundled `libcrypto.so.3` wants GLIBC 2.38, the box
+has 2.35). The exe comes from
+`build/zanc @_scratch/ide_files.txt --auto-stdlib --link-input _scratch/linux_drop_stub.o -o _scratch/zanide`.
+
+Useful facts when testing the assistant panel's team board / task graph:
+
+- **Team mode may not be reachable from the UI.** `AiPanel.Prepare` does
+  `this.Team.SetShown(teamOn)`, so with team mode off the whole strip — including
+  the only "solo / team" switch — is hidden. Workaround: team mode is persisted in
+  the per-project session archive at
+  `_scratch/cache/sessions/<projectkey>.db` (`ExeDir()/cache/sessions/`), table
+  `sessions(id, pack)`, JSON key `"tm"`. With the IDE **not** running:
+  `sqlite3 <db> "update sessions set pack=replace(pack,'\"tm\":0','\"tm\":1');"`,
+  then restart — the strip appears with the switch on.
+- The task graph itself lives in `<project>/.zan/tasks.json` (`cur` = selected
+  node) and per-node chat context in `<project>/.zan/tasks.db`
+  (`node_msg(node, role, kind, body, ...)`). Both are excellent machine-checkable
+  assertions after a UI click: select a node in the GUI, then re-read `cur`.
+- IDE log lines written with `log.Add(...)` land in the bottom **Output** panel;
+  widen it (drag the dock splitter) before asserting on text, it truncates.
+- Widen the assistant dock by dragging the splitter at its left edge; the graph
+  canvas is a fixed ~190dp tall, so use the mouse wheel over the canvas to reach
+  lower layers.
+- Tool/`kind=deps` chat messages render **collapsed** (header only); click the
+  row to reveal the body before asserting on its text.
+
 ## Devin Secrets Needed
 
 none

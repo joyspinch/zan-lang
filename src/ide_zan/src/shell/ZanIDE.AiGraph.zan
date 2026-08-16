@@ -1,0 +1,192 @@
+using System;
+using System.IO;
+using Gui;
+using Gui.Widget;
+
+/// 小助手的任务图：图存在打开的项目里（`.zan/tasks.json`），每个节点的多角色
+/// 多轮上下文存 `.zan/tasks.db`，面板上的画布只是它的视图。
+///
+/// 这里是宿主侧的生命周期：跟着项目走的加载、变化即保存、选节点即切上下文。
+/// 「选节点即切上下文」是字面意思——`aiMsgs` 被换成该节点自己的历史，所以
+/// 下一次请求带的就是这个节点的上下文，而不是把全局聊天记录截一段。
+partial class ZanIDE {
+    /// 每帧一次：项目换了就换图，图变了就落盘，聊天里新增的话追加到当前
+    /// 节点的上下文。放在渲染流程里而不是散在每个写入点，是因为任务是被
+    /// 十几处回复折叠出来的，逐处挂钩迟早漏一处。
+    void AiGraphTick() {
+        if (root != aiGraphRoot) {
+            aiGraphRoot = root;
+            this.AiGraphLoad();
+        }
+        string sig = ZanIDE.AiGraphSig(aiTasks, aiGraphSel);
+        if (sig != aiGraphSig) {
+            aiGraphSig = sig;
+            this.AiGraphSave();
+        }
+        this.AiCtxFlush();
+    }
+
+    /// 打开项目时读回它的图；聊天还是空的（刚开 IDE、刚建会话）就顺带把
+    /// 选中节点的上下文恢复出来，于是重开项目接着上次那一拍继续。
+    void AiGraphLoad() {
+        aiGraphSel = "";
+        aiCtxSaved = aiMsgs.Count;
+        if (!AiTaskGraph.Usable(root)) {
+            aiGraphSig = ZanIDE.AiGraphSig(aiTasks, aiGraphSel);
+            return;
+        }
+        string cur = AiTaskGraph.Load(root, aiTasks);
+        aiGraphSig = ZanIDE.AiGraphSig(aiTasks, cur);
+        if (cur == "" || AiTeam.TaskOf(aiTasks, cur) == null) { return; }
+        aiGraphSel = cur;
+        // 恢复出来的会话存档属于哪个节点，由它自己的 activeTask 说了算：只有
+        // 正好是同一个节点才留着（那段更全，可能还带着没写完的一拍），否则图
+        // 上选中 T-4、聊天区却接着 T-2 的话往下说。存档里的话本来就在会话库
+        // 和它自己节点的 tasks.db 里，换掉不丢东西。
+        if (aiMsgs.Count != 0 && aiTeamSt.activeTask == cur) { return; }
+        aiMsgs = new List<ChatMessage>();
+        AiTaskGraph.LoadCtx(root, cur, aiMsgs);
+        aiCtxSaved = aiMsgs.Count;
+        aiTeamSt.activeTask = cur;
+        AiTask t = AiTeam.TaskOf(aiTasks, cur);
+        if (t != null && t.owner != "") {
+            // 换的是节点，收件人也跟着换成这个节点的负责人：否则重启后徽标
+            // 还写着存档里那位，第一拍就发错人。
+            aiTeamSt.activeAgent = t.owner;
+            aiRunAgent = t.owner;
+            aiSendTo = t.owner;
+        }
+        aiStreamMsgIdx = 0 - 1;
+        aiStreamLen = 0;
+        this.AiChatInvalidate();
+    }
+
+    void AiGraphSave() {
+        if (!AiTaskGraph.Usable(root)) { return; }
+        bool ok = AiTaskGraph.Save(root, aiTasks, aiGraphSel);
+        if (!ok) {
+            log.Add(ZanIDE.T("> Could not write the task graph to ",
+                "> 任务图写入失败：") + AiTaskGraph.GraphPath(root));
+        }
+    }
+
+    /// 图的内容签名。只覆盖会显示、会被读回的字段，因为签名的用途是回答
+    /// 「这一帧要不要重写文件」，不是校验。
+    static string AiGraphSig(List<AiTask> tasks, string cur) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(cur);
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            AiTask t = tasks[i];
+            sb.Append("|" + t.id + "~" + t.title + "~" + t.owner
+                + "~" + Convert.ToString(t.state)
+                + "~" + Convert.ToString(t.progress)
+                + "~" + t.accept + "~" + t.outcome + "~"
+                + AiTeam.JoinIds(t.deps));
+            if (t.parts != null) {
+                for (int k = 0; k < t.parts.Count; k = k + 1) {
+                    AiTaskPart p = t.parts[k];
+                    sb.Append("^" + p.role + ":" + p.model + ":"
+                        + Convert.ToString(p.rounds));
+                }
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// 把聊天里还没入库的那几条追加到它们所属节点的上下文。消息自带任务号
+    /// 时按它归档（一次交接里模型说的话属于被指派的那个任务），否则归当前
+    /// 选中的节点。
+    void AiCtxFlush() {
+        if (!AiTaskGraph.Usable(root)) { aiCtxSaved = aiMsgs.Count; return; }
+        if (aiCtxSaved > aiMsgs.Count) { aiCtxSaved = aiMsgs.Count; }
+        while (aiCtxSaved < aiMsgs.Count) {
+            ChatMessage m = aiMsgs[aiCtxSaved];
+            aiCtxSaved = aiCtxSaved + 1;
+            string node = m.taskId;
+            if (node == "") { node = aiGraphSel; }
+            if (node == "") { node = aiTeamSt.activeTask; }
+            if (node == "") { continue; }
+            // 流式回答那一条会被就地改写到最终文本，所以只在它写完
+            // （不再是当前流式气泡）之后才入库。
+            if (aiCtxSaved - 1 == aiStreamMsgIdx) {
+                aiCtxSaved = aiCtxSaved - 1;
+                return;
+            }
+            bool _ok = AiTaskGraph.Append(root, node, m);
+        }
+    }
+
+    /// 选中一个任务节点：把聊天换成这个节点自己的多角色多轮上下文。
+    ///
+    /// 请求在飞的时候不换——半路换上下文会让回来的那一段落到别人的节点里。
+    void AiGraphOpen(string id) {
+        if (id == "" || id == aiGraphSel) { return; }
+        AiTask t = AiTeam.TaskOf(aiTasks, id);
+        if (t == null) { return; }
+        if (aiBusy.Get() != 0) {
+            log.Add(ZanIDE.T("> Busy: finish or stop the current turn before"
+                    + " switching task nodes.",
+                "> 正忙：先等这一拍跑完或停下来，再切任务节点。"));
+            return;
+        }
+        this.AiCtxFlush();
+        aiGraphSel = id;
+        aiMsgs = new List<ChatMessage>();
+        AiTaskGraph.LoadCtx(root, id, aiMsgs);
+        aiCtxSaved = aiMsgs.Count;
+        aiTeamSt.activeTask = id;
+        // 节点的负责人就是这个节点的默认收件人：切过去就能直接说话，
+        // 不用先在提示行里再选一次人。
+        if (t.owner != "") {
+            aiRunAgent = t.owner;
+            aiSendTo = t.owner;
+        }
+        aiStreamMsgIdx = 0 - 1;
+        aiStreamLen = 0;
+        aiHandoffs = 0;
+        this.AiNoteDeps(t);
+        this.AiChatInvalidate();
+        this.AiChatToEnd();
+        this.AiGraphSave();
+    }
+
+    /// 把前置节点的产出摘要放进这个节点的上下文——一次，且只放摘要。
+    /// 复制前置的完整历史会让每个下游节点都背上整条链的对话，而下游真正
+    /// 需要知道的只是「上游交出了什么」。
+    void AiNoteDeps(AiTask t) {
+        string brief = AiTeam.DepsBrief(aiTasks, t.id);
+        if (brief == "") { return; }
+        for (int i = 0; i < aiMsgs.Count; i = i + 1) {
+            if (aiMsgs[i].kind == AiTeam.KindDeps()) { return; }
+        }
+        ChatMessage m = ChatMessage.Create("tool", brief);
+        m.kind = AiTeam.KindDeps();
+        m.taskId = t.id;
+        aiMsgs.Add(m);
+    }
+
+    /// 双击一个没被锁住的节点＝开工：节点进入「进行中」，并把这一拍交给
+    /// 它的负责人。锁住的节点走 AiGraphBlocked，不会到这里。
+    void AiGraphStart(string id) {
+        this.AiGraphOpen(id);
+        if (aiGraphSel != id) { return; }
+        AiTask t = AiTeam.TaskOf(aiTasks, id);
+        if (t == null) { return; }
+        if (t.state == AiTeam.TaskTodo() || t.state == AiTeam.TaskAcked()
+            || t.state == AiTeam.TaskBlocked()) {
+            t.state = AiTeam.TaskDoing();
+        }
+        aiTeamSt.activeTask = id;
+        if (t.owner != "") { aiTeamSt.activeAgent = t.owner; }
+        log.Add(ZanIDE.T("> Task ", "> 任务 ") + AiTaskGraph.CardTitle(t)
+            + ZanIDE.T(" is open for work.", " 已开工。"));
+    }
+
+    /// 双击一个被锁住的节点：说清楚是哪个前置卡着它，而不是让双击没反应。
+    void AiGraphBlocked(string id) {
+        this.AiGraphOpen(id);
+        string why = AiTeam.BlockedWhy(aiTasks, id);
+        if (why == "") { return; }
+        log.Add("> " + id + ": " + why);
+    }
+}

@@ -30,6 +30,32 @@ class AiRole {
     }
 }
 
+/// 一个角色在某个任务节点上的参与记录。
+///
+/// 参与者不是一串角色 id：面板要显示「谁、用哪个模型、说了几轮、最后一次
+/// 什么时候」，用平行的 List<string> 靠下标对齐迟早对不上，所以每个参与者
+/// 就是一条带自己字段的记录，按 role 查。
+class AiTaskPart {
+    /// 角色 id（`AiTeam.Dev()` 等七个之一）。节点内唯一，就是这条记录的键。
+    string role;
+    /// 该角色在本节点实际用的模型名，记下来是因为角色到模型的映射用户随时
+    /// 会改：事后看历史时要知道当时是谁跑的。
+    string model;
+    /// 该角色在本节点发过的消息轮数。
+    int rounds;
+    /// 最后一次发言的 Unix 秒。0 表示只被计划提名、还没说过话。
+    long lastTs;
+
+    static AiTaskPart Create(string role) {
+        AiTaskPart p = new AiTaskPart();
+        p.role = role;
+        p.model = "";
+        p.rounds = 0;
+        p.lastTs = 0;
+        return p;
+    }
+}
+
 /// One card on the team task board.
 ///
 /// Replaces the flat `AiPlanStep` for team sessions: a task now has an owner
@@ -44,6 +70,16 @@ class AiTask {
     int state;
     int progress;
     string accept;
+    /// 前置任务的 id。全部完成前本任务是锁着的：这既是「不能提前开工」
+    /// 的开关，也是上下文传递的路径（前置的产出摘要注入本节点）。
+    List<string> deps;
+    /// 在本节点参与过的角色，按首次出现排序。一个节点通常不止一个角色
+    /// （开发者做、测试工程师验、审查员看），所以节点自己记住参与者，而不是
+    /// 从整条流水里反推；每条记录带模型与轮数，见 `AiTaskPart`。
+    List<AiTaskPart> parts;
+    /// 本节点的产出摘要：交付了什么、结论是什么。解锁后继节点时原样注入
+    /// 它们的上下文头部，所以后继不必重读前置的全部对话。
+    string outcome;
 
     static AiTask Create(string id, string title, string owner) {
         AiTask t = new AiTask();
@@ -53,6 +89,9 @@ class AiTask {
         t.state = 0;
         t.progress = 0;
         t.accept = "";
+        t.deps = new List<string>();
+        t.parts = new List<AiTaskPart>();
+        t.outcome = "";
         return t;
     }
 }
@@ -366,6 +405,10 @@ class AiTeam {
     static string KindQuestion() { return "question"; }
     static string KindReport() { return "report"; }
     static string KindBlock() { return "block"; }
+    /// 不是模型说的拍子，而是 IDE 自己放进节点上下文的一条：前置节点的产出
+    /// 摘要。单独一个 kind 是为了「这个节点已经收到过前置摘要了」可以被查到，
+    /// 于是切回来十次也只注入一次。
+    static string KindDeps() { return "deps"; }
 
     static bool IsKind(string k) {
         return k == AiTeam.KindAssign() || k == AiTeam.KindAck()
@@ -729,7 +772,21 @@ class AiTeam {
             + " the user asked you directly.\n"
             + "5. STAY IN YOUR LANE. Only the tools listed for you below are"
             + " available; the IDE refuses the rest. If you need one you do"
-            + " not have, hand off to the member who owns it.\n\n");
+            + " not have, hand off to the member who owns it.\n"
+            + "6. THE PLAN IS A TASK GRAPH. In team mode the `plan` tool's"
+            + " items are the task nodes the user sees and clicks, so give"
+            + " each one the fields that make it a node:\n"
+            + "  {\"id\":\"T-2\", \"t\":\"表单校验\", \"owner\":\"开发者\","
+            + " \"deps\":[\"T-1\"], \"parts\":[\"测试工程师\"],"
+            + " \"accept\":\"非法输入有明确提示\"}\n"
+            + " `deps` are the task ids that must be DONE first -- a node"
+            + " whose deps are unfinished is locked in the panel and nobody"
+            + " starts it. `owner` is the one member responsible, `parts` the"
+            + " others who will speak on that node, `accept` how we know it"
+            + " is done. Re-send the plan (same ids) to add or re-wire nodes;"
+            + " progress and state come from your [progress]/[handoff]"
+            + " headers, not from the plan, so re-sending never resets"
+            + " work that is already underway.\n\n");
         return sb.ToString();
     }
 
@@ -1034,6 +1091,9 @@ class AiTeam {
         if (kind == AiTeam.KindQuestion()) { return ZanIDE.T("question", "待确认"); }
         if (kind == AiTeam.KindReport()) { return ZanIDE.T("report", "汇报"); }
         if (kind == AiTeam.KindBlock()) { return ZanIDE.T("defect", "问题"); }
+        if (kind == AiTeam.KindDeps()) {
+            return ZanIDE.T("upstream", "前置产出");
+        }
         return "";
     }
 
@@ -1102,6 +1162,225 @@ class AiTeam {
         if (env.progress > cur.progress) { cur.progress = env.progress; }
         if (cur.state == AiTeam.TaskDone()) { cur.progress = 100; }
         if (cur.title == "") { cur.title = AiTeam.TaskTitleOf(env.body); }
+        AiTeam.TouchPart(cur, owner);
+        // 交接和汇报是这个节点「交付了什么」的唯一权威说法，所以它们的正文
+        // 就是节点产出；后继节点解锁时注入的正是这一段。
+        if (env.kind == AiTeam.KindHandoff() || env.kind == AiTeam.KindReport()) {
+            AiTeam.NoteOutcome(cur, env.body);
+        }
+    }
+
+    // --- task graph: deps, participants, outcomes -----------------------------
+
+    /// The task with `id`, or null. The board is small (a plan, not a database),
+    /// so a linear scan is the whole index.
+    static AiTask TaskOf(List<AiTask> tasks, string id) {
+        int at = AiTeam.IndexOfTask(tasks, id);
+        if (at < 0) { return null; }
+        return tasks[at];
+    }
+
+    /// 本任务还没完成的前置 id。图里查不到的前置被忽略——模型写错一个任务号
+    /// 不该把整条链永久锁死；查得到但未完成的一律阻塞。
+    static List<string> PendingDeps(List<AiTask> tasks, string id) {
+        List<string> miss = new List<string>();
+        AiTask t = AiTeam.TaskOf(tasks, id);
+        if (t == null || t.deps == null) { return miss; }
+        for (int i = 0; i < t.deps.Count; i = i + 1) {
+            AiTask p = AiTeam.TaskOf(tasks, t.deps[i]);
+            if (p == null) { continue; }
+            if (p.state == AiTeam.TaskDone()) { continue; }
+            AiTeam.AddOnce(miss, t.deps[i]);
+        }
+        return miss;
+    }
+
+    /// True while any dependency is unfinished: the node may be read and
+    /// discussed but not started.
+    static bool LockedTask(List<AiTask> tasks, string id) {
+        return AiTeam.PendingDeps(tasks, id).Count > 0;
+    }
+
+    /// 点到锁着的节点时给用户看的原因：卡在哪几个前置、它们叫什么、现在什么
+    /// 状态。只说事实，不猜什么时候能解锁。
+    static string BlockedWhy(List<AiTask> tasks, string id) {
+        List<string> miss = AiTeam.PendingDeps(tasks, id);
+        if (miss.Count == 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(ZanIDE.T("blocked by ", "前置未完成："));
+        for (int i = 0; i < miss.Count; i = i + 1) {
+            if (i > 0) { sb.Append("; "); }
+            sb.Append(miss[i]);
+            AiTask p = AiTeam.TaskOf(tasks, miss[i]);
+            if (p != null) {
+                if (p.title != "") { sb.Append(" " + p.title); }
+                sb.Append(" [" + AiTeam.TaskStateName(p.state) + "]");
+            }
+        }
+        return sb.ToString();
+    }
+
+    static void AddDep(AiTask t, string depId) {
+        if (t == null || depId == "" || depId == t.id) { return; }
+        if (t.deps == null) { t.deps = new List<string>(); }
+        AiTeam.AddOnce(t.deps, depId);
+    }
+
+    /// 本节点上某角色的参与记录，没有就建一条。按 role 查，所以谁先发言、
+    /// 记录怎么排序都不影响能不能找到。
+    static AiTaskPart PartOf(AiTask t, string roleId) {
+        if (t == null || roleId == "") { return null; }
+        if (t.parts == null) { t.parts = new List<AiTaskPart>(); }
+        for (int i = 0; i < t.parts.Count; i = i + 1) {
+            if (t.parts[i].role == roleId) { return t.parts[i]; }
+        }
+        AiTaskPart p = AiTaskPart.Create(roleId);
+        t.parts.Add(p);
+        return p;
+    }
+
+    /// 把一个角色记为本节点的参与者，不计轮（计划里提名、从文件读回都走这里）。
+    static void AddPart(AiTask t, string roleId) {
+        AiTaskPart p = AiTeam.PartOf(t, roleId);
+        if (p == null) { return; }
+        if (p.model == "") { p.model = AiTeam.ModelOf(roleId); }
+    }
+
+    /// 该角色在本节点又说了一轮：轮数 +1、时间戳刷新、模型按当时配置记下。
+    static void TouchPart(AiTask t, string roleId) {
+        AiTaskPart p = AiTeam.PartOf(t, roleId);
+        if (p == null) { return; }
+        p.rounds = p.rounds + 1;
+        p.lastTs = DateTime.UtcNow().ToUnixSeconds();
+        string m = AiTeam.ModelOf(roleId);
+        if (m != "") { p.model = m; }
+    }
+
+    /// 参与者的角色 id 表，给只关心「有谁」的调用方（卡片头像行、提示词）。
+    static List<string> PartRoles(AiTask t) {
+        List<string> ids = new List<string>();
+        if (t == null || t.parts == null) { return ids; }
+        for (int i = 0; i < t.parts.Count; i = i + 1) {
+            if (t.parts[i].role == "") { continue; }
+            AiTeam.AddOnce(ids, t.parts[i].role);
+        }
+        return ids;
+    }
+
+    /// Records what a node delivered. Later beats replace the earlier summary
+    /// on purpose: the last handoff/report is the current truth about the node.
+    static void NoteOutcome(AiTask t, string body) {
+        if (t == null) { return; }
+        string s = AiAgent.Trim(body);
+        if (s == "") { return; }
+        if (s.Length > 600) { s = s.Substring(0, 600); }
+        t.outcome = s;
+    }
+
+    /// 前置节点的产出，拼成注入后继节点上下文头部的一段。依赖不只是解锁开关，
+    /// 也是上下文的传递路径：后继读这一段就够，不用重读前置的全部对话。
+    static string DepsBrief(List<AiTask> tasks, string id) {
+        AiTask t = AiTeam.TaskOf(tasks, id);
+        if (t == null || t.deps == null || t.deps.Count == 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < t.deps.Count; i = i + 1) {
+            AiTask p = AiTeam.TaskOf(tasks, t.deps[i]);
+            if (p == null || p.outcome == "") { continue; }
+            sb.Append("- " + p.id);
+            if (p.title != "") { sb.Append(" " + p.title); }
+            if (p.owner != "") {
+                sb.Append("（" + AiTeam.DisplayName(p.owner) + "）");
+            }
+            sb.Append("：" + p.outcome + "\n");
+        }
+        if (sb.Length == 0) { return ""; }
+        return ZanIDE.T("[upstream results]\n", "[前置产出]\n") + sb.ToString();
+    }
+
+    /// 现在可以开工的节点：自己未完成、前置全齐。面板用它提示「接下来能做
+    /// 哪几个」，模型也用它决定下一步派单给谁。
+    static List<string> ReadyTasks(List<AiTask> tasks) {
+        List<string> ids = new List<string>();
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            if (tasks[i].state == AiTeam.TaskDone()) { continue; }
+            if (AiTeam.LockedTask(tasks, tasks[i].id)) { continue; }
+            ids.Add(tasks[i].id);
+        }
+        return ids;
+    }
+
+    /// 团队模式下 `plan` 工具的一次调用即一张任务图：`items` 里每项除了标题，
+    /// 还可以带 `id` / `owner` / `deps` / `accept` / `parts`。已存在的节点只更新
+    /// 图信息，状态和进度留给协议信封推进——重发一次计划不该把进行中的节点
+    /// 打回待办。返回图里的节点总数。
+    static int ParseGraph(string json, List<AiTask> tasks) {
+        JsonValue v = JsonValue.ParseLenient(json);
+        if (v == null) { return tasks.Count; }
+        JsonValue items = v.Get("items");
+        if (items == null || !items.IsArray()) { return tasks.Count; }
+        for (int i = 0; i < items.Count(); i = i + 1) {
+            JsonValue it = items.At(i);
+            if (!it.IsObject()) { continue; }
+            string id = AiAgent.Trim(it.Str("id", ""));
+            string title = AiAgent.Trim(it.Str("t", it.Str("text",
+                it.Str("title", ""))));
+            if (id == "" && title == "") { continue; }
+            if (id == "") { id = "T-" + Convert.ToString(i + 1); }
+            AiTask t = AiTeam.TaskOf(tasks, id);
+            if (t == null) {
+                t = AiTask.Create(id, title, "");
+                tasks.Add(t);
+            } else if (title != "") {
+                t.title = title;
+            }
+            string owner = AiTeam.RoleIdArg(it.Str("owner", it.Str("o", "")));
+            if (owner != "") { t.owner = owner; }
+            string accept = AiAgent.Trim(it.Str("accept", it.Str("ac", "")));
+            if (accept != "") { t.accept = accept; }
+            AiTeam.ReadIds(it.Get("deps"), t, true);
+            AiTeam.ReadIds(it.Get("parts"), t, false);
+        }
+        return tasks.Count;
+    }
+
+    /// Folds a JSON `deps`/`parts` value into the task. Both a real array and
+    /// the comma-separated string models keep emitting instead are accepted, so
+    /// a well-meant `"deps": "T-1, T-2"` is not silently dropped.
+    static void ReadIds(JsonValue v, AiTask t, bool asDeps) {
+        if (v == null) { return; }
+        List<string> ids = new List<string>();
+        if (v.IsArray()) {
+            for (int i = 0; i < v.Count(); i = i + 1) {
+                ids.Add(AiAgent.Trim(v.At(i).AsString("")));
+            }
+        } else {
+            string s = v.AsString("");
+            int start = 0;
+            for (int i = 0; i <= s.Length; i = i + 1) {
+                bool end = i == s.Length;
+                bool comma = false;
+                if (!end) { comma = (s[i] & 255) == 44; }
+                if (end || comma) {
+                    ids.Add(AiAgent.Trim(s.Substring(start, i - start)));
+                    start = i + 1;
+                }
+            }
+        }
+        for (int k = 0; k < ids.Count; k = k + 1) {
+            if (ids[k] == "") { continue; }
+            if (asDeps) { AiTeam.AddDep(t, ids[k]); }
+            else { AiTeam.AddPart(t, AiTeam.RoleIdArg(ids[k])); }
+        }
+    }
+
+    /// A role written by the model as an id ("dev"), an @name or a display name,
+    /// resolved to the role id; "" when it is none of the seven.
+    static string RoleIdArg(string s) {
+        string v = AiAgent.Trim(s);
+        if (v == "") { return ""; }
+        if ((v[0] & 255) == 64) { v = v.Substring(1, v.Length - 1); }
+        if (AiTeam.RoleOf(v) != null) { return v; }
+        return AiTeam.RoleIdOfName(v);
     }
 
     /// The board shows one line per task, so the title is the envelope body's

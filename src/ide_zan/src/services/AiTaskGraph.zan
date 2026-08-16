@@ -1,0 +1,356 @@
+using System;
+using System.Data;
+using System.Data.Sqlite;
+using Gui.Component;
+
+/// 一个参与者在 `.zan/tasks.json` 里的样子：角色 + 当时的模型 + 轮数 + 最后
+/// 发言时间。存成对象而不是一串角色 id，是为了这四项永远绑在一起。
+class TaskPartDoc {
+    string role;
+    string model;
+    int rounds;
+    long lastTs;
+}
+
+/// 一个任务节点在 `.zan/tasks.json` 里的样子。字段名写短的是因为这个文件
+/// 会进用户的版本库、要能被人读和手改，但也没必要长到占满一行。
+class TaskNodeDoc {
+    string id;
+    string title;
+    string owner;
+    /// 参与过本节点的角色，每条带模型与轮数。
+    List<TaskPartDoc> parts;
+    /// 前置节点 id。
+    List<string> deps;
+    int state;
+    int progress;
+    string accept;
+    string outcome;
+}
+
+/// `.zan/tasks.json` 的全文：版本号、当前选中的节点、节点表。
+///
+/// 只存图，不存对话——对话在 `.zan/tasks.db` 里。这样这个文件小到可以 diff、
+/// 可以 review、坏了能手改，而几万条上下文消息不会把它撑爆。
+class TaskGraphDoc {
+    int v;
+    string cur;
+    List<TaskNodeDoc> nodes;
+}
+
+/// 任务图的项目级持久化：图存 `<项目>/.zan/tasks.json`，每个节点的多角色多轮
+/// 上下文存 `<项目>/.zan/tasks.db`。
+///
+/// 跟着项目走，不跟着会话走：换会话、换窗口、重启 IDE，打开同一个项目看到的
+/// 还是同一张图和同一份节点上下文。上下文按节点分表存，所以切节点是查询，
+/// 不是「把全局聊天记录截一段」——这正是用户要的「每个节点有自己的多轮上下文」。
+class AiTaskGraph {
+    static int Version() { return 1; }
+
+    static string Dir(string root) { return root + "/.zan"; }
+    static string GraphPath(string root) {
+        return AiTaskGraph.Dir(root) + "/tasks.json";
+    }
+    static string DbPath(string root) {
+        return AiTaskGraph.Dir(root) + "/tasks.db";
+    }
+
+    /// True when `root` looks like an opened project we may write into. A blank
+    /// root means no project is open, and writing `.zan/` into the process's
+    /// current directory instead would scatter task graphs wherever the IDE was
+    /// started from.
+    static bool Usable(string root) {
+        if (root == null) { return false; }
+        if (AiAgent.Trim(root) == "") { return false; }
+        return Directory.Exists(root);
+    }
+
+    static bool EnsureDir(string root) {
+        if (!AiTaskGraph.Usable(root)) { return false; }
+        string d = AiTaskGraph.Dir(root);
+        if (Directory.Exists(d)) { return true; }
+        Directory.CreateDirectoryRecursive(d);
+        return Directory.Exists(d);
+    }
+
+    // --- graph: .zan/tasks.json ----------------------------------------------
+
+    /// Writes the graph. `cur` is the node the panel has selected, so reopening
+    /// the project lands on the task the user was working on.
+    static bool Save(string root, List<AiTask> tasks, string cur) {
+        if (!AiTaskGraph.EnsureDir(root)) { return false; }
+        TaskGraphDoc o = new TaskGraphDoc();
+        o.v = AiTaskGraph.Version();
+        o.cur = cur;
+        o.nodes = new List<TaskNodeDoc>();
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            AiTask t = tasks[i];
+            TaskNodeDoc n = new TaskNodeDoc();
+            n.id = t.id;
+            n.title = t.title;
+            n.owner = t.owner;
+            n.parts = AiTaskGraph.PartDocs(t.parts);
+            n.deps = AiTaskGraph.CopyIds(t.deps);
+            n.state = t.state;
+            n.progress = t.progress;
+            n.accept = t.accept;
+            n.outcome = t.outcome;
+            o.nodes.Add(n);
+        }
+        File.WriteAllText(AiTaskGraph.GraphPath(root),
+            Json.Serialize<TaskGraphDoc>(o));
+        return true;
+    }
+
+    /// Reads the graph into `tasks` (replacing whatever it held) and returns the
+    /// selected node id. A missing or unreadable file yields an empty graph and
+    /// "": a project that never used the assistant is not an error.
+    static string Load(string root, List<AiTask> tasks) {
+        tasks.Clear();
+        if (!AiTaskGraph.Usable(root)) { return ""; }
+        string path = AiTaskGraph.GraphPath(root);
+        if (!File.Exists(path)) { return ""; }
+        string body = File.ReadAllText(path);
+        if (AiAgent.Trim(body) == "") { return ""; }
+        TaskGraphDoc v = Json.Deserialize<TaskGraphDoc>(body);
+        if (v == null || v.nodes == null) { return ""; }
+        for (int i = 0; i < v.nodes.Count; i = i + 1) {
+            TaskNodeDoc n = v.nodes[i];
+            if (n == null || n.id == "") { continue; }
+            AiTask t = AiTask.Create(n.id, n.title, n.owner);
+            t.state = n.state;
+            t.progress = n.progress;
+            if (n.accept != null) { t.accept = n.accept; }
+            if (n.outcome != null) { t.outcome = n.outcome; }
+            t.deps = AiTaskGraph.CopyIds(n.deps);
+            t.parts = AiTaskGraph.PartsOf(n.parts);
+            tasks.Add(t);
+        }
+        if (v.cur == null) { return ""; }
+        return v.cur;
+    }
+
+    /// A copy of an id list, never null. The docs are deserialized, so an absent
+    /// array arrives as null and must not be shared with the live task either
+    /// way -- otherwise saving twice would alias the same list.
+    static List<string> CopyIds(List<string> xs) {
+        List<string> outIds = new List<string>();
+        if (xs == null) { return outIds; }
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            if (xs[i] == null || xs[i] == "") { continue; }
+            outIds.Add(xs[i]);
+        }
+        return outIds;
+    }
+
+    static List<TaskPartDoc> PartDocs(List<AiTaskPart> parts) {
+        List<TaskPartDoc> outDocs = new List<TaskPartDoc>();
+        if (parts == null) { return outDocs; }
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            AiTaskPart p = parts[i];
+            if (p == null || p.role == "") { continue; }
+            TaskPartDoc d = new TaskPartDoc();
+            d.role = p.role;
+            d.model = p.model;
+            d.rounds = p.rounds;
+            d.lastTs = p.lastTs;
+            outDocs.Add(d);
+        }
+        return outDocs;
+    }
+
+    /// 读回参与者记录。同一角色在文件里出现两次（手改过的图）只保留第一条，
+    /// 因为节点内 role 是键，重复会让「按角色查」变成看运气。
+    static List<AiTaskPart> PartsOf(List<TaskPartDoc> docs) {
+        List<AiTaskPart> outParts = new List<AiTaskPart>();
+        if (docs == null) { return outParts; }
+        for (int i = 0; i < docs.Count; i = i + 1) {
+            TaskPartDoc d = docs[i];
+            if (d == null || d.role == null || d.role == "") { continue; }
+            if (AiTaskGraph.HasRole(outParts, d.role)) { continue; }
+            AiTaskPart p = AiTaskPart.Create(d.role);
+            if (d.model != null) { p.model = d.model; }
+            p.rounds = d.rounds;
+            p.lastTs = d.lastTs;
+            outParts.Add(p);
+        }
+        return outParts;
+    }
+
+    static bool HasRole(List<AiTaskPart> parts, string role) {
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (parts[i].role == role) { return true; }
+        }
+        return false;
+    }
+
+    // --- node context: .zan/tasks.db -----------------------------------------
+
+    /// Opens (and on first use creates) the context database. Returns null when
+    /// there is no project to write into or the driver could not open the file,
+    /// so every caller must check -- the panel keeps working without a database,
+    /// it just loses the per-node history.
+    static SqliteConnection OpenDb(string root) {
+        if (!AiTaskGraph.EnsureDir(root)) { return null; }
+        SqliteConnection db = SqliteConnection.Open(AiTaskGraph.DbPath(root));
+        if (db == null || !db.IsConnected()) { return null; }
+        // WAL: the IDE writes while it also reads the node being displayed, and
+        // a rolled-back journal would stall the UI thread on its own reader.
+        int _w = db.Execute("PRAGMA journal_mode=WAL");
+        int _s = db.Execute("PRAGMA synchronous=NORMAL");
+        int rc = db.Execute("CREATE TABLE IF NOT EXISTS node_msg ("
+            + "seq INTEGER PRIMARY KEY AUTOINCREMENT,"
+            + "node TEXT NOT NULL,"
+            + "role TEXT NOT NULL,"
+            + "agent TEXT NOT NULL,"
+            + "dest TEXT NOT NULL,"
+            + "kind TEXT NOT NULL,"
+            + "progress INTEGER NOT NULL,"
+            + "body TEXT NOT NULL,"
+            + "reason TEXT NOT NULL,"
+            + "ts INTEGER NOT NULL)");
+        if (rc < 0) { db.Close(); return null; }
+        int _i = db.Execute("CREATE INDEX IF NOT EXISTS node_msg_node "
+            + "ON node_msg (node, seq)");
+        return db;
+    }
+
+    /// Appends one turn to a node's own transcript. The node id is the only key:
+    /// switching nodes, switching sessions or restarting the IDE all end up
+    /// reading the same rows back.
+    static bool Append(string root, string node, ChatMessage m) {
+        if (node == "" || m == null) { return false; }
+        SqliteConnection db = AiTaskGraph.OpenDb(root);
+        if (db == null) { return false; }
+        bool ok = AiTaskGraph.AppendOn(db, node, m);
+        db.Close();
+        return ok;
+    }
+
+    /// Appends `msgs` in one open/close, for the bulk path (importing a chat
+    /// into a node, or flushing a finished turn): one connection per message
+    /// would pay the WAL and schema check for every line.
+    static int AppendAll(string root, string node, List<ChatMessage> msgs) {
+        if (node == "" || msgs == null || msgs.Count == 0) { return 0; }
+        SqliteConnection db = AiTaskGraph.OpenDb(root);
+        if (db == null) { return 0; }
+        int n = 0;
+        int _b = db.Execute("BEGIN");
+        for (int i = 0; i < msgs.Count; i = i + 1) {
+            if (AiTaskGraph.AppendOn(db, node, msgs[i])) { n = n + 1; }
+        }
+        int _c = db.Execute("COMMIT");
+        db.Close();
+        return n;
+    }
+
+    static bool AppendOn(SqliteConnection db, string node, ChatMessage m) {
+        DbParams p = new DbParams();
+        p.Add(node);
+        p.Add(m.role);
+        p.Add(m.agent);
+        p.Add(m.to);
+        p.Add(m.kind);
+        p.AddInt(m.progress);
+        p.Add(m.text);
+        p.Add(m.reason);
+        p.AddLong(DateTime.UtcNow().ToUnixSeconds());
+        int rc = db.Execute("INSERT INTO node_msg "
+            + "(node, role, agent, dest, kind, progress, body, reason, ts) "
+            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", p);
+        return rc >= 0;
+    }
+
+    /// Reads a node's transcript back into `outMsgs`, oldest first, and returns
+    /// how many turns it had. The rows rebuild real `ChatMessage` entities, so
+    /// the panel renders a restored node with the same view as a live one.
+    static int LoadCtx(string root, string node, List<ChatMessage> outMsgs) {
+        outMsgs.Clear();
+        if (node == "" || !AiTaskGraph.Usable(root)) { return 0; }
+        if (!File.Exists(AiTaskGraph.DbPath(root))) { return 0; }
+        SqliteConnection db = AiTaskGraph.OpenDb(root);
+        if (db == null) { return 0; }
+        DbParams p = new DbParams();
+        p.Add(node);
+        DbResult r = db.Query("SELECT role, agent, dest, kind, progress, body,"
+            + " reason FROM node_msg WHERE node = ? ORDER BY seq", p);
+        for (int i = 0; i < r.RowCount(); i = i + 1) {
+            ChatMessage m = ChatMessage.CreateWithReason(r.GetString(i, 0),
+                r.GetString(i, 5), r.GetString(i, 6));
+            m.agent = r.GetString(i, 1);
+            m.to = r.GetString(i, 2);
+            m.kind = r.GetString(i, 3);
+            m.taskId = node;
+            m.progress = Convert.ToInt32(r.GetString(i, 4));
+            outMsgs.Add(m);
+        }
+        db.Close();
+        return outMsgs.Count;
+    }
+
+    /// How many turns a node has, without loading them: the board shows it on
+    /// the card so a node with history is visibly different from a fresh one.
+    static int CtxCount(string root, string node) {
+        if (node == "" || !AiTaskGraph.Usable(root)) { return 0; }
+        if (!File.Exists(AiTaskGraph.DbPath(root))) { return 0; }
+        SqliteConnection db = AiTaskGraph.OpenDb(root);
+        if (db == null) { return 0; }
+        DbParams p = new DbParams();
+        p.Add(node);
+        string n = db.ExecuteScalar(
+            "SELECT COUNT(*) FROM node_msg WHERE node = ?", p);
+        db.Close();
+        if (n == "") { return 0; }
+        return Convert.ToInt32(n);
+    }
+
+    /// Drops a node's context. Used when the graph drops the node itself --
+    /// leaving orphan rows behind would make a re-used task id inherit a
+    /// stranger's history.
+    static bool DropCtx(string root, string node) {
+        if (node == "" || !AiTaskGraph.Usable(root)) { return false; }
+        if (!File.Exists(AiTaskGraph.DbPath(root))) { return false; }
+        SqliteConnection db = AiTaskGraph.OpenDb(root);
+        if (db == null) { return false; }
+        DbParams p = new DbParams();
+        p.Add(node);
+        int rc = db.Execute("DELETE FROM node_msg WHERE node = ?", p);
+        db.Close();
+        return rc >= 0;
+    }
+
+    // --- graph <-> canvas ----------------------------------------------------
+
+    /// The task graph as canvas nodes. The lock state is not stored here: the
+    /// canvas derives it from `deps` + `done`, so a node cannot be shown
+    /// unlocked while its前置 is still open.
+    static List<GraphNode> ToNodes(List<AiTask> tasks) {
+        List<GraphNode> outNodes = new List<GraphNode>();
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            AiTask t = tasks[i];
+            GraphNode n = GraphNode.Of(t.id, AiTaskGraph.CardTitle(t));
+            if (t.owner != "") {
+                n = n.WithTag(AiTeam.DisplayName(t.owner),
+                    AiTeam.RoleTagClass(t.owner));
+            }
+            n = n.WithState(AiTeam.TaskStateName(t.state),
+                AiTeam.TaskStateClass(t.state));
+            n = n.WithProgress(t.progress);
+            if (t.state == AiTeam.TaskDone()) { n = n.Finished(); }
+            if (t.deps != null) {
+                for (int d = 0; d < t.deps.Count; d = d + 1) {
+                    n = n.After(t.deps[d]);
+                }
+            }
+            outNodes.Add(n);
+        }
+        return outNodes;
+    }
+
+    /// 卡片上显示的标题：任务号 + 标题，因为依赖是按任务号说的，卡片上不带号
+    /// 的话用户没法把「前置 T-2」对到某张卡上。
+    static string CardTitle(AiTask t) {
+        if (t.title == "") { return t.id; }
+        return t.id + " " + t.title;
+    }
+}

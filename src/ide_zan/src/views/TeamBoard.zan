@@ -3,13 +3,19 @@ using Gui;
 using Gui.Widget;
 
 /// 小赞面板的团队条：团队模式开关、当前谁在工作、（展开后）流水线
-/// 位置和任务板。
+/// 位置和任务图。
 ///
 /// 结构在 `views/TeamBoard.zform` 里声明（开关 / 标签 / 徽标行 / 展开
-/// 箭头 / 流水线 / 任务板），这里只把每帧的状态喂给这些控件：没有一处
-/// 坐标运算，行高、间距和圆点大小全部由控件与皮肤自己决定。
+/// 箭头 / 流水线 / 任务画布 / 阻塞说明），这里只把每帧的状态喂给这些
+/// 控件：没有一处坐标运算，卡片、连线、层次布局和锁标记全部由标准库
+/// 的 `Gui.Component.GraphView` 自己决定。
 ///
-/// 默认折叠：读者关心的是「谁 / 哪一拍 / 到哪了」，完整任务板一次点击
+/// 任务是一张图而不是一列表：节点之间的前置关系决定了谁能开工，所以
+/// 「选一个节点进去做」和「这个节点还差哪个前置」都在图上直接看得见。
+/// 选中 / 双击 / 双击锁住的节点这三件事由画布给出，外壳取走后决定做
+/// 什么（切上下文、开工、说明阻塞）。
+///
+/// 默认折叠：读者关心的是「谁 / 哪一拍 / 到哪了」，完整任务图一次点击
 /// 就能展开。
 partial class TeamBoard {
     /// 一个面板一条团队条；设计里的 onClick 是无参处理器，靠它找回实例。
@@ -23,6 +29,14 @@ partial class TeamBoard {
     /// 徽标行上一帧的内容签名：只有真的换人 / 换状态才重建那一行。
     static string chipSig;
     static SignalInt openSig;
+    /// 画布上一帧的图签名：任务的状态每帧都可能被回复折叠出新值，只有
+    /// 真的变了才重建节点，否则滚动位置和选择会被每帧重建冲掉。
+    string graphSig;
+    /// 本帧画布给出的三件事，外壳取走（"" = 没有）。选中即切上下文，
+    /// 双击即开工，双击锁住的节点即要一个解释。
+    string pickedId;
+    string startedId;
+    string blockedId;
 
     void OnInit() {
         TeamBoard.current = this;
@@ -35,7 +49,16 @@ partial class TeamBoard {
         this.Pipeline.AddStep(ZanIDE.T("Rev", "审查"));
         this.Pipeline.AddStep(ZanIDE.T("Sec", "安全"));
         this.Pipeline.ErrorIndex = 0 - 1;
-        this.Board.WithRow(TeamBoard.TaskRow);
+        graphSig = "~";
+        pickedId = "";
+        startedId = "";
+        blockedId = "";
+        this.Graph.EmptyText(ZanIDE.T("No tasks yet -- ask the team to plan"
+                + " the work and the graph appears here.",
+            "还没有任务：让团队先把活拆成任务图，这里就会出现节点。"));
+        this.Graph.OnSelect(TeamBoard.NodePicked);
+        this.Graph.OnActivate(TeamBoard.NodeStarted);
+        this.Graph.OnBlocked(TeamBoard.NodeBlocked);
         TeamBoard.ava = new Avatar();
         TeamBoard.ava.Size = 18;
         TeamBoard.nameTag = new Tag("");
@@ -45,18 +68,22 @@ partial class TeamBoard {
         TeamBoard.chipSig = "~";
         TeamBoard.openSig = null;
         this.Pipeline.visible = false;
-        this.Board.visible = false;
+        this.Graph.visible = false;
+        this.Why.visible = false;
     }
 
-    /// 自身高度 = 头行 +（展开时）流水线 + 任务板。子控件已在
+    /// 自身高度 = 头行 +（展开时）流水线 + 任务图 + 阻塞说明。子控件已在
     /// MeasureTree 里量过，所以这里只做加法，不碰任何像素常量。
     override void OnMeasure(App app) {
         int h = this.Head.prefH;
         if (this.Pipeline.visible) {
             h = h + gap + this.Pipeline.prefH;
         }
-        if (this.Board.visible) {
-            h = h + gap + this.Board.prefH;
+        if (this.Graph.visible) {
+            h = h + gap + this.Graph.prefH;
+        }
+        if (this.Why.visible) {
+            h = h + gap + this.Why.prefH;
         }
         prefH = h;
     }
@@ -78,9 +105,58 @@ partial class TeamBoard {
     /// 读这里，仍是那份状态的唯一持有者。
     bool TeamOn() { return this.ModeSw.IsOn(); }
 
-    /// 本帧的状态：谁在忙、任务到哪了、板子是否展开。渲染前调用一次。
+    /// 节点被选中：把任务号留给外壳，切上下文是外壳的事（聊天记录、
+    /// 收件人和落盘都归它）。
+    static void NodePicked() {
+        TeamBoard tb = TeamBoard.current;
+        if (tb == null) { return; }
+        tb.pickedId = tb.NodeIdAt(tb.Graph.SelectedIndex());
+    }
+
+    /// 双击一个解锁的节点＝开工。
+    static void NodeStarted() {
+        TeamBoard tb = TeamBoard.current;
+        if (tb == null) { return; }
+        tb.startedId = tb.NodeIdAt(tb.Graph.ContextRow());
+    }
+
+    /// 双击一个锁住的节点：画布不让它开工，外壳负责说清是谁卡着它。
+    static void NodeBlocked() {
+        TeamBoard tb = TeamBoard.current;
+        if (tb == null) { return; }
+        tb.blockedId = tb.NodeIdAt(tb.Graph.ContextRow());
+    }
+
+    string NodeIdAt(int row) {
+        if (!this.Graph.Has(row)) { return ""; }
+        return this.Graph.NodeAt(row).id;
+    }
+
+    /// 本帧用户在图上选中的节点（取走后清空）。
+    string TakePicked() {
+        string v = pickedId;
+        pickedId = "";
+        return v;
+    }
+
+    /// 本帧用户双击开工的节点（取走后清空）。
+    string TakeStarted() {
+        string v = startedId;
+        startedId = "";
+        return v;
+    }
+
+    /// 本帧用户双击了的锁住节点（取走后清空）。
+    string TakeBlocked() {
+        string v = blockedId;
+        blockedId = "";
+        return v;
+    }
+
+    /// 本帧的状态：谁在忙、任务到哪了、板子是否展开、图上选中哪个节点。
+    /// 渲染前调用一次。
     void Sync(bool teamOn, bool busy, AiTeamState st, List<AiTask> tasks,
-            SignalInt open) {
+            SignalInt open, string curNode) {
         TeamBoard.openSig = open;
         this.ModeSw.SetOn(teamOn);
         bool nowOn = teamOn;
@@ -93,7 +169,8 @@ partial class TeamBoard {
             // 关：面板就是单个助手，团队条如实说明，而不是假装有人待命。
             this.ShowSolo();
             this.Pipeline.visible = false;
-            this.Board.visible = false;
+            this.Graph.visible = false;
+            this.Why.visible = false;
             return;
         }
 
@@ -104,19 +181,42 @@ partial class TeamBoard {
             TeamBoard.StatusClass(st, busy), pct);
 
         this.Pipeline.visible = isOpen;
-        this.Board.visible = isOpen;
-        if (!isOpen) { return; }
+        this.Graph.visible = isOpen;
+        if (!isOpen) {
+            this.Why.visible = false;
+            return;
+        }
 
         this.Pipeline.SetProp("current",
             Convert.ToString(AiTeam.StageOf(st.activeAgent)));
-        // 任务板：最近四条，新的在上，由标准 ListView 按行模板渲染。
-        List<AiTask> recent = new List<AiTask>();
-        int ti = tasks.Count - 1;
-        while (ti >= 0 && recent.Count < 4) {
-            recent.Add(tasks[ti]);
-            ti = ti - 1;
+        // 任务图：节点 + 前置连线由画布自己布局，锁状态由它从 deps 推出，
+        // 所以这里只在图真的变了的时候重新交一份节点。
+        string sig = TeamBoard.GraphSigOf(tasks) + "|" + curNode;
+        if (graphSig != sig) {
+            graphSig = sig;
+            this.Graph.Bind(AiTaskGraph.ToNodes(tasks));
+            this.Graph.SelectId(curNode);
         }
-        this.Board.Bind(recent);
+        // 选中的节点被前置卡着时，把「差哪一个、它现在什么状态」写在图
+        // 下面：双击锁住的节点没有反应，才是真正让人困惑的那种界面。
+        string why = "";
+        if (curNode != "") { why = AiTeam.BlockedWhy(tasks, curNode); }
+        this.Why.visible = why != "";
+        if (why != "") { this.Why.SetProp("text", why); }
+    }
+
+    /// 图的内容签名：卡片上显示的每一项都在里面，因为签名的用途是回答
+    /// 「要不要重建卡片」。
+    static string GraphSigOf(List<AiTask> tasks) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            AiTask t = tasks[i];
+            sb.Append(t.id + "~" + t.title + "~" + t.owner + "~"
+                + Convert.ToString(t.state) + "~"
+                + Convert.ToString(t.progress) + "~"
+                + AiTeam.JoinIds(t.deps) + ";");
+        }
+        return sb.ToString();
     }
 
     /// 单人模式的说明文字，占住徽标行的位置。
@@ -168,28 +268,5 @@ partial class TeamBoard {
         if (st.awaitingUser) { return "warning"; }
         if (busy) { return "primary"; }
         return "";
-    }
-
-    /// 任务板的一行：负责人、状态、进度条和标题，全是标准控件。
-    static Control TaskRow(AiTask t) {
-        Panel row = Panel.Row();
-        row.gap = 6;
-        Tag owner = new Tag(AiTeam.DisplayName(t.owner));
-        owner.Class = AiTeam.RoleTagClass(t.owner);
-        owner.dock = 1;
-        row.Add(owner);
-        Tag state = new Tag(AiTeam.TaskStateName(t.state));
-        state.Class = AiTeam.TaskStateClass(t.state);
-        state.dock = 1;
-        row.Add(state);
-        Progress bar = new Progress(t.progress, 0);
-        bar.Class = "taskbar";
-        bar.dock = 2;
-        row.Add(bar);
-        Label title = new Label(t.title);
-        title.Class = "small";
-        title.dock = 5;
-        row.Add(title);
-        return row;
     }
 }
