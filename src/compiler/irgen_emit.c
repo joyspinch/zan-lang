@@ -2285,6 +2285,45 @@ int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len) {
     return stubbed;
 }
 
+int zan_irgen_prune_extern_libs(zan_irgen_t *g) {
+    int kept = 0, dropped = 0;
+    for (int li = 0; li < g->extern_lib_count; li++) {
+        const char *lib = g->extern_libs[li].str;
+        int lib_len = (int)g->extern_libs[li].len;
+        int live = 0;
+        for (int i = 0; i < g->extern_fn_count && !live; i++) {
+            if ((int)g->extern_fns[i].lib.len != lib_len ||
+                memcmp(g->extern_fns[i].lib.str, lib, (size_t)lib_len) != 0)
+                continue;
+            char nm[256];
+            snprintf(nm, sizeof(nm), "%.*s", (int)g->extern_fns[i].name.len,
+                     g->extern_fns[i].name.str);
+            /* The sweep erases declarations nothing references, so a surviving
+             * declaration (or a definition, e.g. an already-stubbed one) is
+             * what makes the library needed at link time. */
+            if (LLVMGetNamedFunction(g->mod, nm)) live = 1;
+        }
+        /* A library with no recorded imports at all is not ours to judge (the
+         * declarations may have been registered elsewhere): keep it. */
+        if (!live) {
+            int has_fns = 0;
+            for (int i = 0; i < g->extern_fn_count && !has_fns; i++) {
+                if ((int)g->extern_fns[i].lib.len == lib_len &&
+                    memcmp(g->extern_fns[i].lib.str, lib, (size_t)lib_len) == 0)
+                    has_fns = 1;
+            }
+            if (!has_fns) live = 1;
+        }
+        if (live) {
+            g->extern_libs[kept++] = g->extern_libs[li];
+        } else {
+            dropped++;
+        }
+    }
+    g->extern_lib_count = kept;
+    return dropped;
+}
+
 bool zan_irgen_defines_prefix(zan_irgen_t *g, const char *prefix) {
     size_t plen = strlen(prefix);
     if (!plen) return false;

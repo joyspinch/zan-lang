@@ -2185,6 +2185,7 @@ int main(int argc, char **argv) {
     if (effective_opt > ZAN_OPT_NONE) {
         zan_opt_report_t opt_report = zan_optimize(&irgen, &binder, effective_opt);
         zan_opt_report_print(&opt_report);
+        zan_irgen_prune_extern_libs(&irgen);
     } else {
         /* Unoptimized build: also skip machine-level optimization, which is
          * the single most expensive phase (edit-compile-run turnaround in the
@@ -2192,7 +2193,14 @@ int main(int argc, char **argv) {
          * are still dropped: emitting a whole globbed-in stdlib directory costs
          * far more time and size than the sweep itself. */
         irgen.fast_codegen = true;
-        if (!do_emit_ir) zan_opt_strip_unused(&irgen);
+        if (!do_emit_ir) {
+            zan_opt_strip_unused(&irgen);
+            /* The sweep just erased the imports nothing calls; drop their
+             * libraries too, or the link line keeps asking for native
+             * libraries (openssl for a globbed-in TlsStream, ...) that this
+             * program never calls. */
+            zan_irgen_prune_extern_libs(&irgen);
+        }
     }
 
     if (do_emit_ir) {

@@ -3232,6 +3232,22 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
                     strs[i] = buf;
                     lens[i] = needed64;
                     owns[i] = 1;
+                } else if (vtk == LLVMIntegerTypeKind &&
+                           LLVMGetIntTypeWidth(vt) == 1) {
+                    /* bool interpolates as true/false, like `b.ToString()`
+                     * and C#. Falling through to the integer path printed the
+                     * i1 as a number instead (1, or -1 back when it was
+                     * sign-extended). A format spec has no meaning here. */
+                    LLVMValueRef btrue = emit_string_literal_rc(g,
+                        (zan_istr_t){ "true", 4 });
+                    LLVMValueRef bfalse = emit_string_literal_rc(g,
+                        (zan_istr_t){ "false", 5 });
+                    strs[i] = LLVMBuildSelect(g->builder, val, btrue, bfalse,
+                        "bstr");
+                    lens[i] = LLVMBuildSelect(g->builder, val,
+                        LLVMConstInt(i64, 4, 0), LLVMConstInt(i64, 5, 0),
+                        "blen");
+                    owns[i] = 0;
                 } else if (expr_is_char(g, part, locals)) {
                     /* char interpolates as the character (C#), not its code. */
                     LLVMValueRef buf = emit_char_to_cstr(g, val);

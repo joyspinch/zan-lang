@@ -645,6 +645,12 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path);
  * whole publish failing. Returns the number of functions stubbed. */
 int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len);
 
+/* Drop from extern_libs every [DllImport] library whose imports were all
+ * deleted as unreachable, so a program links only the native libraries it
+ * actually calls. Must run after the dead-code sweep. Returns the number of
+ * libraries dropped. */
+int zan_irgen_prune_extern_libs(zan_irgen_t *g);
+
 /* True when the module defines a function whose (mangled `Class_Member`) name
  * starts with `prefix`. Lets a driver bundle a dependency only for programs
  * that actually use the feature owning it (see the `if` clause of a
