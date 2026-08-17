@@ -851,6 +851,9 @@ partial class ZanIDE {
         } else {
             payload = Json.Serialize<AiChatBodyDoc>(body);
         }
+        // 这一拍的请求体跟上一拍到底有多少字节是逐字相同的前缀：供应商报的
+        // cached_tokens 让人觉得不对的时候，只有这个数能分清是谁的问题。
+        ZanIDE.AiPrefixNote(model, payload);
         // The request is made with the Net standard library on a worker
         // thread that streams the decoded response into an in-memory sink;
         // the panel reads the sink each frame for incremental output.
@@ -876,9 +879,47 @@ partial class ZanIDE {
     static int aiStatCompletion;
     static int aiStatCached;
     static int aiStatTotal;
+    // 客户端这一侧的前缀稳定度：每个模型上一次发出去的请求体，以及本次
+    // 与它逐字节相同的前缀长度。prompt 缓存按前缀匹配，所以「缓存命中就那
+    // 么一点」只有两种可能：本地前缀本身每一拍在变（那是 IDE 的错），或者
+    // 前缀不变而服务端没给那么多（那是供应商的事）。两个数并列在用量面板
+    // 里，以后不用再猜。
+    static List<string> aiPrefixModels;
+    static List<string> aiPrefixLast;
+    /// 上一次请求的共同前缀字节数与整个请求体的字节数。
+    static int aiPrefixShared;
+    static int aiPrefixTotal;
+
     /// Replies that carried a usage object, so the panel can say "no data"
     /// instead of showing zeros for a provider that reports none.
     static int aiStatUsageReplies;
+
+    /// 记下这一拍的请求体，并与同一个模型上一拍的请求体比一下前缀。按模型
+    /// 分开存：团队模式下两个成员各跑自己的模型，他们的缓存也是各自一份。
+    static void AiPrefixNote(string model, string payload) {
+        if (ZanIDE.aiPrefixModels == null) {
+            ZanIDE.aiPrefixModels = new List<string>();
+            ZanIDE.aiPrefixLast = new List<string>();
+        }
+        int at = 0 - 1;
+        for (int i = 0; i < ZanIDE.aiPrefixModels.Count; i = i + 1) {
+            if (ZanIDE.aiPrefixModels[i] == model) { at = i; }
+        }
+        ZanIDE.aiPrefixTotal = payload.Length;
+        if (at < 0) {
+            ZanIDE.aiPrefixModels.Add(model);
+            ZanIDE.aiPrefixLast.Add(payload);
+            ZanIDE.aiPrefixShared = 0;
+            return;
+        }
+        string prev = ZanIDE.aiPrefixLast[at];
+        int n = prev.Length;
+        if (payload.Length < n) { n = payload.Length; }
+        int k = 0;
+        while (k < n && prev[k] == payload[k]) { k = k + 1; }
+        ZanIDE.aiPrefixShared = k;
+        ZanIDE.aiPrefixLast[at] = payload;
+    }
 
     /// Folds one finished reply's usage into the running totals.
     static void AiStatAdd(SseAnswer a) {

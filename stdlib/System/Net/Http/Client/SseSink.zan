@@ -21,10 +21,14 @@ class SseSink {
     string donePath;
     /// 文件模式下整个流的打开句柄（0 表示无）。
     nint fp;
-    /// 已写入但尚未取走的 chunk（内存模式）。用 StringBuilder 累积：
-    /// `buf = buf + piece` 每个 chunk 都要复制一遍全文，一次几千个 chunk 的
-    /// 长回答就是 O(n²) 的拷贝，模型输出越长工作线程越烫。
-    StringBuilder buf;
+    /// 已写入的 chunk（内存模式），按到达顺序原样保存。存一串 chunk 而不是
+    /// 一整块字符串：`buf = buf + piece` 每个 chunk 都要复制一遍全文，一次
+    /// 几千个 chunk 的长回答就是 O(n²) 的拷贝；而且逐帧刷新预览的读者只需要
+    /// 「上次之后新到的那几段」（<c>Since</c>），不必每一拍把已经收到的全文
+    /// 再复制一遍（<c>All</c> 就是那份复制，还占着写入线程的锁）。
+    List<string> parts;
+    /// parts 中已经被 <c>Since</c> 交给读者的段数。
+    int cut;
     /// 刚结束的那次尝试的结果（有尝试在运行时为 ""）。
     string attempt;
     /// 所有者确定不再重试后发布的结果（此前为 ""）。
@@ -54,7 +58,8 @@ class SseSink {
         s.path = outFile;
         s.donePath = doneFile;
         s.fp = 0;
-        s.buf = new StringBuilder();
+        s.parts = new List<string>();
+        s.cut = 0;
         s.attempt = "";
         s.done = "";
         s.total = 0;
@@ -69,7 +74,8 @@ class SseSink {
         s.path = "";
         s.donePath = "";
         s.fp = 0;
-        s.buf = new StringBuilder();
+        s.parts = new List<string>();
+        s.cut = 0;
         s.attempt = "";
         s.done = "";
         s.total = 0;
@@ -82,7 +88,8 @@ class SseSink {
     /// </summary>
     void Begin() {
         Mutex.Lock(this.lockHandle);
-        this.buf = new StringBuilder();
+        this.parts = new List<string>();
+        this.cut = 0;
         this.attempt = "";
         this.total = 0;
         Mutex.Unlock(this.lockHandle);
@@ -106,9 +113,18 @@ class SseSink {
             return;
         }
         Mutex.Lock(this.lockHandle);
-        this.buf.Append(piece);
+        this.parts.Add(piece);
         this.total = this.total + piece.Length;
         Mutex.Unlock(this.lockHandle);
+    }
+
+    /// parts[from..] 拼成一段。调用者必须已经持有锁。
+    string Join(int from) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = from; i < this.parts.Count; i = i + 1) {
+            sb.Append(this.parts[i]);
+        }
+        return sb.ToString();
     }
 
     /// <summary>以结果标记（"ok" 或 "err: ..."）结束一次尝试。
@@ -153,7 +169,20 @@ class SseSink {
     /// </summary>
     string All() {
         Mutex.Lock(this.lockHandle);
-        string s = this.buf.ToString();
+        string s = this.Join(0);
+        Mutex.Unlock(this.lockHandle);
+        return s;
+    }
+
+    /// <summary>自上次调用以来新到的那部分（内存模式），已收到的内容仍然
+    /// 留在 sink 里供 <c>All</c> 读取。边到边显示的读者用这个而不是
+    /// <c>All</c>：一个长回答的最后那几十秒里，每一拍 <c>All</c> 都要把已经
+    /// 收到的几百 KB 全文复制一遍——那份复制（以及它占住的写入锁）就是流式
+    /// 输出时烧掉的那一核。</summary>
+    string Since() {
+        Mutex.Lock(this.lockHandle);
+        string s = this.Join(this.cut);
+        this.cut = this.parts.Count;
         Mutex.Unlock(this.lockHandle);
         return s;
     }
@@ -162,8 +191,9 @@ class SseSink {
     /// </summary>
     string Take() {
         Mutex.Lock(this.lockHandle);
-        string s = this.buf.ToString();
-        this.buf = new StringBuilder();
+        string s = this.Join(0);
+        this.parts = new List<string>();
+        this.cut = 0;
         Mutex.Unlock(this.lockHandle);
         return s;
     }

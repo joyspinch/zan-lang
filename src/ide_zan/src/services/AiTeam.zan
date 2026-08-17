@@ -850,14 +850,17 @@ class AiTeam {
             + " @开发者 (Developer), @测试工程师 (Test Engineer), @代码审查员"
             + " (Code Reviewer), @安全审计员 (Security Auditor).\n"
             + "Every message you send starts with a routing header:\n"
-            + "  @<member> [<kind> <taskId> <NN%>] then your text\n"
-            + "Kinds: assign (hand a task over), progress (a percentage and"
-            + " ONE line), handoff (your stage passed, pass it on), question"
+            + "  @<member> [<kind> <taskId>] then your text\n"
+            + "Never put a percentage in the header or the text: the IDE"
+            + " computes a node's progress from its checklist and the beats"
+            + " that actually ran, and a number you invent is ignored.\n"
+            + "Kinds: assign (hand a task over), progress (ONE line on what"
+            + " just moved), handoff (your stage passed, pass it on), question"
             + " (you need the USER to decide), report (your conclusion),"
             + " block (you are stuck).\n"
             + "Examples:\n"
             + "  @架构师 [handoff T-1] 需求已确认：三条验收标准如下……\n"
-            + "  [progress T-3 60%] 校验规则写完，还剩边界用例。\n"
+            + "  [progress T-3] 校验规则写完，还剩边界用例。\n"
             + "  @开发者 [block T-3] ui_check 报 hitregion 缺失，见下。\n"
             + "RULES.\n"
             + "1. NO CHATTER, NO RESTATING. A task assigned to you needs no"
@@ -925,6 +928,10 @@ class AiTeam {
                 + " ever make is re-sending YOUR OWN node with a finished"
                 + " item marked \"[x] \" (everything you do not mention is"
                 + " kept), which is how the board moves while you work."
+                + " A node whose `deps` are not DONE is not startable: the IDE"
+                + " refuses write_file / edit_file / build on it, so if the"
+                + " node you were given waits on an unaccepted one, say"
+                + " [block] naming it instead of building ahead."
                 + " When the node is done you send [report] task=<id> and"
                 + " STOP: @产品经理 dispatches the next node. Never pick up"
                 + " another node yourself, and never assign one.\n";
@@ -954,7 +961,19 @@ class AiTeam {
             + " worked on, and the node's percentage is that checklist's"
             + " done-ratio, so a node with no `tasks` cannot show real"
             + " progress. Keep `tasks` at 3-8 concrete items; if a node needs"
-            + " far more, it was really two nodes. As you finish an item,"
+            + " far more, it was really two nodes.\n"
+            + " A NODE IS ALSO NOT A STAGE. 需求理解 / 数据模型设计 /"
+            + " 安全审计 / 测试 / 验收 are NOT nodes: every node already runs"
+            + " the whole pipeline inside itself (understand, survey the code,"
+            + " plan, implement, build, test, verify, accept) and its `accept`"
+            + " line is where acceptance lives. A board shaped 需求 -> 模型 ->"
+            + " 实现 -> 安全 -> 验收 delivers nothing runnable until the last"
+            + " node and tells the user nothing about what works;"
+            + " 前台商品展示 / 下单购买 / 积分兑换 / 后台商品管理 does both."
+            + " Cross-cutting concerns (security, performance, telemetry,"
+            + " data model) belong in the `tasks` and `accept` of the nodes"
+            + " they affect, not in a node of their own.\n"
+            + " As you finish an item,"
             + " re-send just that node with the item marked \"[x] \" (state,"
             + " ownership and everything you did not mention are kept), which"
             + " is how the board moves while you work.\n"
@@ -1443,9 +1462,26 @@ class AiTeam {
         }
         AiTask cur = tasks[at];
         cur.owner = owner;
-        cur.state = AiTeam.TaskStateOf(env.kind, cur.state);
-        if (env.progress > cur.progress) { cur.progress = env.progress; }
-        if (cur.state == AiTeam.TaskDone()) { cur.progress = 100; }
+        int next = AiTeam.TaskStateOf(env.kind, cur.state);
+        // 前置没验收的节点不会因为「有人开口说在做它」就变成进行中：图上画了
+        // 依赖、板上却显示下游已经在跑（上游还挂着「已交接」），说的就是这条。
+        // 真正开工的闸门在工具那一层，这里只管别把状态写成开工过。
+        bool locked = AiTeam.LockedTask(tasks, cur.id);
+        if (locked && (next == AiTeam.TaskDoing()
+                || next == AiTeam.TaskReview()
+                || next == AiTeam.TaskDone())) {
+            next = cur.state;
+        }
+        cur.state = next;
+        // 模型自报的那个百分比不进节点：它是一句话里的数字，跟这个节点真的
+        // 打了几个勾、跑到第几拍没有任何关系（同一次执行里一个节点写着 45%、
+        // 另一个 30%，而清单是 1/6 和 0/5，就是这么来的）。进度只有两个来源：
+        // 节点自己的清单（AiTaskPlan.Fold）和这一次交付的拍数
+        // （ZanIDE.AiRunPct），信封里的数字只留在那条消息的徽标上供参考。
+        if (cur.state == AiTeam.TaskDone()) {
+            cur.progress = 100;
+            AiTaskPlan.MarkAllDone(cur);
+        }
         // 100% 就是「验收过了」的同义词：还没完成的节点即使自报一百，也只
         // 显示到 95，最后那一档留给验收（和 AiGraphReopen 把 100 退回 90 同理）。
         if (cur.state != AiTeam.TaskDone() && cur.progress >= 100) {
@@ -1731,6 +1767,37 @@ class AiTeam {
         return null;
     }
 
+    /// 挂在「已交接（验收中）」却一直没有验收结论的那个节点。
+    ///
+    /// 送去验收的那一拍只要没回 [report]/[block]（说了两句就停、或者话头被别的
+    /// 节点带走），节点就一直停在验收中——而它又是下游的 `deps`，整张图都被它
+    /// 挡住（用户看到的「上游还挂着已交接，进度 96% 一直不动」）。所以派下一个
+    /// 节点之前先看有没有这种欠着结论的节点。
+    static AiTask AwaitingAccept(List<AiTask> tasks) {
+        if (tasks == null) { return null; }
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            if (tasks[i].state == AiTeam.TaskReview()) { return tasks[i]; }
+        }
+        return null;
+    }
+
+    /// 同一个节点最多催几次验收：催不动就是验收这一拍本身有问题（标准没法判、
+    /// 交付说明缺证据），再催只会把同一段话刷屏，那时挂起节点交给用户。
+    static int MaxReviewChases() { return 2; }
+
+    /// 催验收的指令：把原来的验收要求原样再给一遍，并说清「不回结论下游全都
+    /// 开不了工」——只有 [report]/[block] 两个出口，不引入新状态。
+    static string ChaseAcceptPrompt(AiTask t, int times) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] " + t.id + " 还挂在「验收中」，上一拍没有给出验收"
+            + "结论（第 " + Convert.ToString(times) + " 次催办）。这个节点是下游的"
+            + "前置，不验收下游一个都开不了工。\n");
+        sb.Append(AiTeam.AcceptPrompt(t));
+        sb.Append("\n这一拍必须以 [report] 或 [block] 收尾，别只描述你打算"
+            + "怎么核对；缺证据就自己读代码 / 编译 / 运行去取。");
+        return sb.ToString();
+    }
+
     /// 一个节点验收过了之后交回产品经理的指令：它这一拍只做调度——把下一个
     /// 能开工的节点派给负责人。派单以外的话（重述需求、再发一份计划）就是
     /// 用户看到的那种「反复列需求不开工」。
@@ -1791,9 +1858,21 @@ class AiTeam {
         if (AiAgent.Trim(t.accept) != "") {
             sb.Append("验收标准：\n" + AiAgent.Trim(t.accept) + "\n");
         }
+        sb.Append(AiTeam.TickHint(t));
         sb.Append("做完回 [report] task=" + t.id
             + " 说清交付了什么、怎么验证的；真有需要用户定的事才 [question]。");
         return sb.ToString();
+    }
+
+    /// 「干完一条怎么把它勾上」。节点百分比只从这份清单和真跑过的拍数算，而勾选
+    /// 只有重发 plan（把做完的那条写成 "[x] ..."）才会打上：不说这件事，模型
+    /// 就在正文里写个 100%，于是图上出现「进行到 95% 而清单 0/5」。
+    static string TickHint(AiTask t) {
+        int n = AiTaskPlan.CountOf(t);
+        if (n == 0) { return ""; }
+        return "每干完一条就用 plan 工具把这个节点连同整份 tasks 重发一次，做完的那条"
+            + "写成 \"[x] ...\"：节点进度就是这份清单的完成比，正文里写百分比不会让它"
+            + "动一格（也不要写）。\n";
     }
 
     /// 该派给谁：节点写了负责人就按它，没写（或写成产品经理——它不写代码）就
@@ -2094,6 +2173,7 @@ class AiTeam {
         if (t != null && t.title != "") { sb.Append("（" + t.title + "）"); }
         sb.Append("该由你负责的那一段：该查就查、该改就改，"
             + "别复述计划也别重复刚才已经查过的东西。\n");
+        sb.Append(AiTeam.TickHint(t));
         sb.Append("做完回 [report] 说清交付了什么、怎么验证的；"
             + "真有需要用户定的事才 [question]。");
         return sb.ToString();
@@ -2127,6 +2207,7 @@ class AiTeam {
         if (t != null && t.title != "") { sb.Append("（" + t.title + "）"); }
         sb.Append("：上一拍只说了下一步却没真做，现在直接发出那一步的工具调用，"
             + "别重述计划、别重复已经查过的东西、别从头开始。\n");
+        sb.Append(AiTeam.TickHint(t));
         if (!AiTeam.AllowsTool(who, "write_file")) {
             // 只读角色再催「发工具调用」只会换个文件继续读：它的交付不是代码，
             // 是一条能落地的指令。

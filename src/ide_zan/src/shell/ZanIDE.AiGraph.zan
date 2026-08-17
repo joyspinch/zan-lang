@@ -79,10 +79,15 @@ partial class ZanIDE {
         // ID）：别的节点跑到第几拍跟这个节点没关系，更不能因为它恰好被
         // 选中就把它写成「进行中」。
         if (aiRun == null || aiRun.taskId != t.id) { return; }
+        // 前置还没验收的节点不该被写成「进行中」：面板锁着它、派单跳过它，这里
+        // 也不能因为模型自己开口提了它就替它开工。
+        if (AiTeam.LockedTask(aiTasks, t.id)) { return; }
         if (t.state == AiTeam.TaskTodo() || t.state == AiTeam.TaskAcked()) {
             t.state = AiTeam.TaskDoing();
         }
-        int ev = ZanIDE.AiRunPct(aiRun);
+        // 拍数不能越过清单：这一次交付跑到第几拍只说明「手上这一条」干到哪儿
+        // 了，折进那一条的份额里，于是 0/5 的节点再怎么跑也到不了 95%。
+        int ev = AiTaskPlan.WithRun(t, ZanIDE.AiRunPct(aiRun));
         if (ev > t.progress) { t.progress = ev; }
     }
 
@@ -295,6 +300,8 @@ partial class ZanIDE {
         aiIdleKey = "";
         aiIdleTimes = 0;
         aiEscKey = "";
+        aiRevKey = "";
+        aiRevTimes = 0;
         if (t != null) { this.AiNoteDeps(t); }
         this.AiChatInvalidate();
         this.AiChatToEnd();
@@ -401,6 +408,7 @@ partial class ZanIDE {
         if (this.AiGraphBusy()) { return; }
         t.state = AiTeam.TaskDone();
         t.progress = 100;
+        AiTaskPlan.MarkAllDone(t);
         log.Add(ZanIDE.T("> Task ", "> 任务 ") + AiTaskGraph.CardTitle(t)
             + ZanIDE.T(" marked done.", " 已标记完成。"));
     }
@@ -431,9 +439,22 @@ partial class ZanIDE {
         if (id == "" || aiRun == null || aiRun.taskId != id) { return ""; }
         AiTask t = AiTeam.TaskOf(aiTasks, id);
         if (t == null || t.state == AiTeam.TaskDone()) { return ""; }
-        string s = AiPhase.Zh(aiRun.phase) + " "
-            + Convert.ToString(aiRun.DoneCount()) + "/"
-            + Convert.ToString(AiPhase.Count());
+        // 「事实检索 1/12」这样写会被读成「一共十二件事、做完了一件事实检索」，
+        // 而它的意思是「当前这一拍是事实检索，前面走完了 1 拍」。所以把两个数
+        // 分别说清：现在在哪一拍，走完了几拍。
+        string s = ZanIDE.T("beat ", "第 ")
+            + Convert.ToString(aiRun.phase + 1) + "/"
+            + Convert.ToString(AiPhase.Count())
+            + ZanIDE.T(" ", " 拍 ")
+            + ZanIDE.T(AiPhase.En(aiRun.phase), AiPhase.Zh(aiRun.phase))
+            + " · " + ZanIDE.T("done ", "已完成 ")
+            + Convert.ToString(aiRun.DoneCount());
+        // 这一拍真的调了几次工具。「它开始搜代码了，可是用工具了吗」只有这个数
+        // 能回答：模型在文字里说自己要搜什么都不算，工具真被执行才加一。
+        AiRunStep cs = aiRun.Current();
+        if (cs != null && cs.calls > 0 && cs.command != "") {
+            s = s + " · " + cs.command + "×" + Convert.ToString(cs.calls);
+        }
         if (aiRun.changedFiles.Count > 0) {
             s = s + " · " + Convert.ToString(aiRun.changedFiles.Count)
                 + ZanIDE.T(" file(s)", " 个文件")

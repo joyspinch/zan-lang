@@ -252,6 +252,30 @@ class App {
     int perfFxMs;
     int perfOverlayMs;
     int lastPresentMs;
+    // 空闲循环采样（同一个开关）：不画帧也在烧 CPU 的那份活只能
+    // 在这里看见——每 2 秒记一行「循环转了多少圈、走的哪条等待
+    // 路径、醒来是因为哪种事件」。帧数为 0 却有几百圈循环就是空转，
+    // 一圈都没转则说明 CPU 花在别的线程上。
+    int perfLoopAt;
+    int perfLoops;
+    int perfPollPath;
+    int perfAnimPath;
+    int perfWaitPath;
+    int perfEvNone;
+    int perfEvMove;
+    int perfEvOther;
+    int perfLoopMs;
+    int perfFxTicks;
+    int perfFxTickMs;
+    // 最后一次收到真实输入（鼠标/键盘/滚轮/缩放）的墙钟毫秒。
+    // 环境特效以此判断「人还在看」：久无输入就把动画降到心跳
+    // 节奏，窗口失去焦点则完全停摆（见 FxIntervalMs / FxPresent）。
+    int lastInputMs;
+    // 上一次被记作输入的指针位置：Windows 会在窗口重绘/焦点变化后
+    // 补发坐标未变的 WM_MOUSEMOVE，若把它们也算成输入，久无人操作
+    // 的窗口每隔十几秒就被「唤醒」一次，心跳降速永远不生效。
+    int lastInX;
+    int lastInY;
     // 墙钟截止时间（毫秒），*节流*动画希望在此刻进行下一次
     // 重绘，若无待处理则返回 -1。循环动画（例如加载
     // 转圈动画）通过 RequestAnimationFrame 在此注册，而不是
@@ -447,6 +471,20 @@ class App {
         this.perfPresentMs = 0;
         this.perfBeginMs = 0;
         this.lastPresentMs = 0;
+        this.perfLoopAt = 0;
+        this.perfLoops = 0;
+        this.perfPollPath = 0;
+        this.perfAnimPath = 0;
+        this.perfWaitPath = 0;
+        this.perfEvNone = 0;
+        this.perfEvMove = 0;
+        this.perfEvOther = 0;
+        this.perfLoopMs = 0;
+        this.perfFxTicks = 0;
+        this.perfFxTickMs = 0;
+        this.lastInputMs = this.nowMs;
+        this.lastInX = -1;
+        this.lastInY = -1;
         this.animNextMs = -1;
         this.animRectValid = false;
         this.animRectAll = false;
@@ -1366,6 +1404,14 @@ class App {
     /// 例如在尺寸变化之后。
     bool FxPresent() {
         if (!fxSnapValid || !this.FxActive()) { fxNextMs = -1; return false; }
+        // 没拿到输入焦点就别动：装饰性的环境动画只有人在这个窗口
+        // 上时才有意义，而它的代价是实打实的——一跳要恢复像素 +
+        // 重新合成 + 提交（实测约 6ms），一秒十跳就是一个核的 7%，
+        // 用户切去别的程序时这份 CPU 全是白烧的。任何事件（含重新
+        // 获得焦点）都会在 ProcessEvent / ApplyEvent 末尾重新武装。
+        if (!window.IsFocused()) { fxNextMs = -1; return true; }
+        int perfFxT0 = 0;
+        if (App.PerfOn()) { perfFxT0 = Window.GetTickMs(); }
         if (!window.IsVisible()) {
             // 窗口不可见（最小化或完全被遮挡）：停止
             // 计时。仅失去焦点的窗口仍在屏幕上，
@@ -1408,6 +1454,10 @@ class App {
         }
         window.Present(canvas);
         lastPresentMs = Window.GetTickMs();
+        if (App.PerfOn()) {
+            perfFxTicks = perfFxTicks + 1;
+            perfFxTickMs = perfFxTickMs + (lastPresentMs - perfFxT0);
+        }
         fxNextMs = lastPresentMs + this.FxIntervalMs();
         return true;
     }
@@ -1415,7 +1465,12 @@ class App {
     /// 距下次效果帧的时间：皮肤自身的帧间隔。
     /// 只有不可见的窗口才停止计时（见 FxPresent）。
     int FxIntervalMs() {
-        return BackdropFx.IntervalMs(this.EffectiveFx());
+        int ms = BackdropFx.IntervalMs(this.EffectiveFx());
+        // 人在窗口里但半分钟没碰过键鼠：多半是在读代码或离开了座位，
+        // 背景该走多快没人盯着。降到心跳节奏（约 1.3 跳/秒）把空闲
+        // 时的这份 CPU 砍掉八成，任何输入都会立刻回到原节奏。
+        if (Window.GetTickMs() - lastInputMs > 30000) { return ms * 8; }
+        return ms;
     }
 
     /// 将下次重绘标记为损伤裁剪帧，覆盖指针
@@ -2413,7 +2468,11 @@ class App {
         // 不要阻塞等待下一个 OS 事件——改为轮询，
         // 让新状态立即绘制。否则阻塞直到事件到达。
         int result;
+        int loopT0 = 0;
+        int loopPath = 2;
+        if (App.PerfOn()) { loopT0 = Window.GetTickMs(); }
         if (needsRedraw) {
+            loopPath = 0;
             // 重绘挂起中（状态变化或动画进行中）。
             // 将忙轮询限制在约 60fps，避免运行中的动画让
             // CPU 以数百帧每秒空转；睡眠帧预算的剩余部分
@@ -2422,6 +2481,7 @@ class App {
             if (lastPresentMs > 0 && since < 16) { Window.SleepMs(16 - since); }
             result = window.PollEvent();
         } else if (animNextMs >= 0 || fxNextMs >= 0) {
+            loopPath = 1;
             // 节流的动画（spinner 在 animNextMs）和/或皮肤
             // 特效层（fxNextMs）需要未来的帧。休眠（空闲）直到
             // 最早截止时间，而不是以 60fps 忙碌渲染；但
@@ -2466,6 +2526,7 @@ class App {
         } else {
             result = window.WaitEvent();
         }
+        if (App.PerfOn()) { this.PerfLoopTick(loopT0, loopPath); }
         if (result < 0) {
             this.StopLoop();
             return false;
@@ -2659,10 +2720,21 @@ class App {
             needsRedraw = true;
         }
 
-        // 窗口重新可见时恢复暂停的环境特效
-        // （FxPresent 在隐藏时将 fxNextMs 置为 -1；可见性变化
-        // 唤醒如同任何事件一样到达此处并重新武装它）。
-        if (fxSnapValid && fxNextMs < 0 && this.FxActive() && window.IsVisible()) {
+        // 真实输入（按下/抬起/滚轮/按键/字符，以及指针真的动了的
+        // 移动）记时：环境特效的心跳降速以此为准。
+        if (kind >= 2 && kind <= 6) {
+            lastInputMs = Window.GetTickMs();
+        } else if (kind == 1 && (mouseX != lastInX || mouseY != lastInY)) {
+            lastInputMs = Window.GetTickMs();
+            lastInX = mouseX;
+            lastInY = mouseY;
+        }
+
+        // 窗口重新可见 / 重新拿回焦点时恢复暂停的环境特效
+        // （FxPresent 在隐藏或失焦时将 fxNextMs 置为 -1；这类唤醒
+        // 如同任何事件一样到达此处并重新武装它）。
+        if (fxSnapValid && fxNextMs < 0 && this.FxActive() && window.IsVisible()
+            && window.IsFocused()) {
             fxNextMs = Window.GetTickMs();
         }
 
@@ -2834,10 +2906,21 @@ class App {
 
         if (kind == 6 || kind == 4 || kind == 5) { needsRedraw = true; }
 
-        // 窗口重新可见时恢复暂停的环境特效
-        // （FxPresent 在隐藏时将 fxNextMs 置为 -1；可见性变化
-        // 唤醒如同任何事件一样到达此处并重新武装它）。
-        if (fxSnapValid && fxNextMs < 0 && this.FxActive() && window.IsVisible()) {
+        // 真实输入（按下/抬起/滚轮/按键/字符，以及指针真的动了的
+        // 移动）记时：环境特效的心跳降速以此为准。
+        if (kind >= 2 && kind <= 6) {
+            lastInputMs = Window.GetTickMs();
+        } else if (kind == 1 && (mouseX != lastInX || mouseY != lastInY)) {
+            lastInputMs = Window.GetTickMs();
+            lastInX = mouseX;
+            lastInY = mouseY;
+        }
+
+        // 窗口重新可见 / 重新拿回焦点时恢复暂停的环境特效
+        // （FxPresent 在隐藏或失焦时将 fxNextMs 置为 -1；这类唤醒
+        // 如同任何事件一样到达此处并重新武装它）。
+        if (fxSnapValid && fxNextMs < 0 && this.FxActive() && window.IsVisible()
+            && window.IsFocused()) {
             fxNextMs = Window.GetTickMs();
         }
 
@@ -2944,6 +3027,54 @@ class App {
         // 使下一渲染帧能检测进入/离开和焦点/失焦转换
         // （Ui.Entered/Left/FocusGained/FocusLost）。
         focus.RollFrame();
+    }
+
+    /// 帧分析器的空闲侧：记一圈事件循环走了哪条等待路径、被什么
+    /// 唤醒、在循环体外花了多少毫秒，每 2 秒往同一个日志追一行。
+    /// path: 0 = 有挂起重绘（轮询），1 = 动画/特效截止时间，
+    /// 2 = 阻塞等事件。窗口安静不动时这行应该几乎不增长；它涨得
+    /// 快就说明有人在无事可做时反复唤醒 UI 线程。
+    void PerfLoopTick(int t0, int path) {
+        int now = Window.GetTickMs();
+        perfLoops = perfLoops + 1;
+        perfLoopMs = perfLoopMs + (now - t0);
+        if (path == 0) { perfPollPath = perfPollPath + 1; }
+        else if (path == 1) { perfAnimPath = perfAnimPath + 1; }
+        else { perfWaitPath = perfWaitPath + 1; }
+        int ek = window.EventKind();
+        if (ek == 0) { perfEvNone = perfEvNone + 1; }
+        else if (ek == 1) { perfEvMove = perfEvMove + 1; }
+        else { perfEvOther = perfEvOther + 1; }
+        if (perfLoopAt == 0) { perfLoopAt = now; }
+        int span = now - perfLoopAt;
+        if (span < 2000) { return; }
+        File.AppendAllText("zan_frame_perf.log",
+            "loops=" + Convert.ToString(perfLoops)
+            + " over_ms=" + Convert.ToString(span)
+            + " frames=" + Convert.ToString(perfFrames)
+            + " wait_ms=" + Convert.ToString(perfLoopMs)
+            + " path_poll=" + Convert.ToString(perfPollPath)
+            + " path_anim=" + Convert.ToString(perfAnimPath)
+            + " path_block=" + Convert.ToString(perfWaitPath)
+            + " ev_none=" + Convert.ToString(perfEvNone)
+            + " ev_move=" + Convert.ToString(perfEvMove)
+            + " ev_other=" + Convert.ToString(perfEvOther)
+            + " fx_ticks=" + Convert.ToString(perfFxTicks)
+            + " fx_tick_ms=" + Convert.ToString(perfFxTickMs)
+            + " fx_kind=" + Convert.ToString(this.EffectiveFx())
+            + " anim_armed=" + Convert.ToString(animNextMs)
+            + " fx_armed=" + Convert.ToString(fxNextMs) + "\n");
+        perfLoopAt = now;
+        perfLoops = 0;
+        perfLoopMs = 0;
+        perfPollPath = 0;
+        perfAnimPath = 0;
+        perfWaitPath = 0;
+        perfEvNone = 0;
+        perfEvMove = 0;
+        perfEvOther = 0;
+        perfFxTicks = 0;
+        perfFxTickMs = 0;
     }
 
     /// 启用可选帧分析器（ZAN_FRAME_PROF=1）时为真。

@@ -24,307 +24,6 @@ partial class ZanIDE {
         return m;
     }
 
-    /// Ends the member's turn. Outside team mode this is just "go idle".
-    ///
-    /// In team mode the reply's protocol beat decides what happens next: a
-    /// [question] parks the pipeline for the user (nobody guesses on the user's
-    /// behalf), a [handoff]/[block] wakes the next member with a directive
-    /// naming the task, and anything else means the same member still owns the
-    /// work. The chain is bounded by MaxHandoffs() so a pair of members cannot
-    /// volley a task back and forth forever without the user seeing it.
-    void AiTeamTurnEnd(string said) {
-        if (!aiTeamMode) { aiBusy.Set(0); return; }
-        AiEnvelope env = AiTeam.ParseEnvelope(said);
-        string from = aiRunAgent;
-        if (from == "") { from = AiTeam.Pm(); }
-        aiTeamSt = AiTeam.Advance(aiTeamSt, from, env);
-        if (aiTeamSt.awaitingUser) {
-            // Waiting on the user is a real stop: the panel shows who asked.
-            aiBusy.Set(0);
-            return;
-        }
-        // 只回了一句「收到」就停下，节点会永远停在「已认领 0%」等用户催。认领
-        // 不是工作，所以自动执行开着时立刻把同一个人叫回来干活。
-        // 但如果它在这句里 @ 了别人（「@开发者 [ack] ...」），交接已经发生，
-        // 该叫的是那个人，走下面的交接分支。
-        if (env.kind == AiTeam.KindAck() && aiAutoExec
-                && aiTeamSt.activeAgent == from) {
-            string aid = aiTeamSt.activeTask;
-            AiTask at = AiTeam.TaskOf(aiTasks, aid);
-            if (this.AiTeamDirect(from, AiTeam.StartPrompt(from, at, aid),
-                AiTeam.KindAssign(), aid)) {
-                return;
-            }
-        }
-        // 报完成不等于完事：先送验收，验收过了才落知识、接下一个任务。这条链
-        // 只在自动执行开着时自己走（关着时人本来就要一步一步看）。
-        if (env.kind == AiTeam.KindReport() && aiAutoExec
-            && this.AiTeamAccept(from, env)) {
-            return;
-        }
-        string nxt = aiTeamSt.activeAgent;
-        if (nxt == "" || nxt == from) {
-            // 图上有该别人干的节点就先派单：拆活儿的人自己不写代码，催它
-            // 「接着做」只会再得到一份计划，于是两边就在聊天里扯皮。
-            if (this.AiTeamAssign(from)) { return; }
-            if (this.AiTeamNudge(from, env, said)) { return; }
-            aiBusy.Set(0);
-            return;
-        }
-        // 接手的人除了直接的指令，还需要知道前置节点交出了什么——只给摘要，
-        // 不把前置的整段历史搬过来（那样每个下游都背上整条链的对话）。
-        string hbody = AiTeam.HandoffPrompt(from, nxt, env);
-        string hdeps = AiTeam.DepsBrief(aiTasks, aiTeamSt.activeTask);
-        if (hdeps != "") { hbody = hbody + "\n\n" + hdeps; }
-        bool _sent = this.AiTeamDirect(nxt, hbody, AiTeam.KindAssign(),
-            aiTeamSt.activeTask);
-    }
-
-    /// 计划拆好了却没人开工时的派单：图上第一个能开工的节点直接交给
-    /// 它的负责人，而不是把拆活儿的那个人又叫回来。
-    ///
-    /// 这就是「来回扯皮、任务没丢给对应的人」那个断点：产品经理发完任务图、
-    /// 自己却不写代码，而自动续跑只会把同一个人催回原地，于是它只能再发
-    /// 一份计划。派单只在自动执行开着、而且接手的确实不是当前这个人时发生
-    /// （开发者在做自己的节点不算，那种情况该走下面的“叫回原地”）。
-    ///
-    /// 返回 true = 这一拍已经派出去了，调用方不要再另作安排。
-    bool AiTeamAssign(string from) {
-        if (!aiAutoExec) { return false; }
-        if (aiTasks.Count == 0) { return false; }
-        AiTask t = AiTeam.TaskOf(aiTasks, aiTeamSt.activeTask);
-        if (t == null || t.state == AiTeam.TaskDone()
-            || AiTeam.LockedTask(aiTasks, t.id)) {
-            // 同一时刻只跑一个节点：手上还有进行中 / 验收中的活就把这一拍还给
-            // 它，别再开第二条战线。
-            t = AiTeam.InFlight(aiTasks);
-            if (t == null) { t = AiTeam.NextReady(aiTasks, ""); }
-        }
-        if (t == null) { return false; }
-        // 挂起的节点不再自动派：它是空转挂起的，派回去还是同一段空转。
-        if (t.state == AiTeam.TaskBlocked()) { return false; }
-        string who = AiTeam.OwnerOf(t);
-        if (who == "" || who == from) { return false; }
-        // 刚因为空转从 who 手上转走的节点，不能被接手的人原封不动派回去——
-        // 「原地空转，转给架构师 / 派单：T-1」那两行来回刷就是这么来的。
-        if (aiEscKey == t.id) { return false; }
-        if (t.state == AiTeam.TaskTodo()) {
-            t.state = AiTeam.TaskDoing();
-            // 新节点开工：上一个节点的「最后动作 / 卡住原因」跟它无关。
-            aiLastAct = "";
-            aiIdleWhy = "";
-            aiLookKey = "";
-            aiLookTimes = 0;
-        }
-        string body = AiTeam.AssignPrompt(t, who);
-        // 接手的人要的是前置交出了什么，不是前置聊过什么：只注入摘要。
-        string dep = AiTeam.DepsBrief(aiTasks, t.id);
-        if (dep != "") { body = body + "\n\n" + dep; }
-        log.Add(ZanIDE.T("> Assigned: ", "> 派单：")
-            + AiTaskGraph.CardTitle(t));
-        return this.AiTeamDirect(who, body, AiTeam.KindAssign(), t.id);
-    }
-
-    /// 同一个成员的一拍说完了、活儿还在图上没完：把它叫回原地接着干。
-    ///
-    /// 这就是「任务自己不往下走了」的那个断点：模型回一句「接下来看 Users.zan」
-    /// 却没发工具块（或者读文件读到本轮次数上限被截断），协议上没有交接、没有
-    /// 提问、也没有报完成，于是流程停在半路等用户手打「继续」。
-    ///
-    /// 只在自动执行开着、任务图里确实还有未完成节点、而且它没把问题抛回用户
-    /// （句尾问号）时才催。报完成这一拍不催——那条链由验收接手。返回 true =
-    /// 已经安排了下一拍。
-    bool AiTeamNudge(string who, AiEnvelope env, string said) {
-        if (!aiAutoExec) { return false; }
-        if (env.kind == AiTeam.KindReport()) { return false; }
-        if (AiAgent.AsksUser(said)) { return false; }
-        if (!AiTeam.HasUnfinished(aiTasks)) { return false; }
-        if (aiAutoCont >= aiContMax) { return false; }
-        string tid = aiTeamSt.activeTask;
-        AiTask t = AiTeam.TaskOf(aiTasks, tid);
-        // 同一个人在同一个节点上连着空转：再把它催回原地只会得到一模一样的一拍
-        // （用户看到的就是同一段话刷了三遍）。到了上限就换人：开发卡住交给
-        // 架构师理清，架构师也卡住就回到产品经理去统筴。
-        // 这一拍为什么不算进展：工具那边（重复调用被拦、没权限、重发计划）已经
-        // 写过原因，剩下的就是「只说话没动手」。挂起时把它原样交给用户。
-        if (aiIdleWhy == "") {
-            aiIdleWhy = ZanIDE.T("the beat was plain text with no tool call",
-                "这一拍只回了文字，没有发出任何工具调用");
-        }
-        string ikey = tid + "/" + who;
-        if (aiIdleKey == ikey) {
-            aiIdleTimes = aiIdleTimes + 1;
-        } else {
-            aiIdleKey = ikey;
-            aiIdleTimes = 1;
-        }
-        if (aiIdleTimes > AiTeam.MaxIdleNudges()) {
-            // 这个节点已经换过一次人了，现在又空转：问题在节点本身，再转一圈
-            // 只会变成「空转 → 换人 → 又把同一个节点派回来」那种刷屏。挂起
-            // 节点、停下来交给用户，不假装还在推进。
-            if (aiEscKey == tid) {
-                if (t != null) { t.state = AiTeam.TaskBlocked(); }
-                aiIdleKey = "";
-                aiIdleTimes = 0;
-                aiMsgs.Add(ChatMessage.Create("error", ZanIDE.T(
-                    "This node keeps stalling even after changing hands;"
-                        + " it is suspended for you to look at.",
-                    "这个节点换人之后还是推不动，已挂起等你介入：")
-                    + " " + tid + "\n"
-                    + this.AiStallWhy(who)));
-                aiBusy.Set(0);
-                return true;
-            }
-            string esc = AiTeam.EscalateTo(who);
-            if (esc == "" || esc == who) { return false; }
-            aiIdleKey = "";
-            aiIdleTimes = 0;
-            aiEscKey = tid;
-            log.Add(ZanIDE.T("> Stalled, escalating to ", "> 原地空转，转给 ")
-                + AiTeam.DisplayName(esc) + "（" + aiIdleWhy + "）");
-            return this.AiTeamDirect(esc,
-                AiTeam.EscalatePrompt(who, esc, t, tid),
-                AiTeam.KindAssign(), tid);
-        }
-        // AiTeamDirect 会把自动继续预算清零（那是给真交接用的：换人等于换一段
-        // 工作），催同一个人必须留住预算，否则这条路就没有刹车了。
-        int keep = aiAutoCont + 1;
-        bool sent = this.AiTeamDirect(who, AiTeam.NudgePrompt(who, t, tid),
-            AiTeam.KindAssign(), tid);
-        if (sent) { aiAutoCont = keep; }
-        return sent;
-    }
-
-    /// 挂起一个节点时给用户的原因：卡在谁手上、上一拍为什么不算进展、最后一个
-    /// 真正跑成功的动作是什么。这三样加起来才够判断是要补需求、换人，还是这个
-    /// 节点本身写得没法做。
-    string AiStallWhy(string who) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append(ZanIDE.T("stalled on: ", "卡在：") + AiTeam.DisplayName(who));
-        if (aiIdleWhy != "") {
-            sb.Append(ZanIDE.T("; reason: ", "；原因：") + aiIdleWhy);
-        }
-        if (aiLastAct != "") {
-            sb.Append(ZanIDE.T("; last action that did run: ",
-                "；最后一个真正跑成功的动作：") + aiLastAct);
-        } else {
-            sb.Append(ZanIDE.T("; no tool call ever ran on this node.",
-                "；这个节点上还没有任何工具调用跑成功过。"));
-        }
-        return sb.ToString();
-    }
-
-    /// 把这一拍交给 `toAgent`：指令进聊天（带上收件人、拍子和任务号，所以它
-    /// 会归到那个节点的上下文里），然后以那个成员的身份发请求。
-    ///
-    /// 返回 true = 这一拍已经有人接着跑（或者已经因为上限收尾了），调用方不要
-    /// 再另作安排。交接次数的上限在这里管，所以自动交接、自动验收、自动接下一
-    /// 个任务共用同一个刹车，两个成员不可能背着用户来回踢球。
-    bool AiTeamDirect(string toAgent, string body, string kind, string taskId) {
-        if (toAgent == "" || AiAgent.Trim(body) == "") { return false; }
-        if (aiHandoffs >= aiHandoffMax) {
-            aiMsgs.Add(ChatMessage.Create("error", ZanIDE.T(
-                "Handoff limit reached; the team stopped so you can look.",
-                "交接次数已达上限，团队已暂停，请你介入查看。")));
-            aiBusy.Set(0);
-            return true;
-        }
-        aiHandoffs = aiHandoffs + 1;
-        // 换人就把「查过什么」清空：上下文是按成员隔离的，接手的人并没有看到
-        // 前一个人读到的东西，用同一份签名拦它等于让它无从下手。同一个人被催
-        // 回原地时不清，那正是要拦的重复。
-        if (toAgent != aiRunAgent) { this.AiForgetTools(); }
-        aiRunAgent = toAgent;
-        aiTeamSt.activeAgent = toAgent;
-        if (taskId != "") {
-            aiTeamSt.activeTask = taskId;
-            // 换节点就换一份交付记录：进度、阶段圆点和改动清单都归这个节点。
-            this.AiRunForTask(taskId);
-        }
-        aiRetry = 0;
-        aiAutoCont = 0;
-        ChatMessage m = ChatMessage.Create("user", body);
-        // 模型接口只收 user/assistant，所以角色必须是 user；但这句话不是用户说的，
-        // 标上“流程”这个发语人，聊天区就不会把团队内部派单显示成「我」。
-        m.agent = AiTeam.Auto();
-        m.to = toAgent;
-        m.kind = kind;
-        m.taskId = taskId;
-        aiMsgs.Add(m);
-        string err = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
-            aiRunCtxName, aiRunCtxCode, root,
-            aiProfiles[aiProfActive].baseUrl,
-            aiProfiles[aiProfActive].key, aiRunModel);
-        if (err != "") {
-            aiMsgs.Add(ChatMessage.Create("error", err));
-            aiBusy.Set(0);
-        } else {
-            aiBusy.Set(1);
-        }
-        this.AiChatToEnd();
-        app.RequestRedraw();
-        return true;
-    }
-
-    /// 有人报完成之后那三件事：验收 → 落知识 → 接下一个任务。
-    ///
-    /// 验收换人做（写了验收标准就交给测试工程师对着标准判，不通过它回 [block]，
-    /// 协议本来就把 block 派回开发），所以「自己说自己通过」这条路不存在。验收
-    /// 过了才把节点收尾、把结论写进项目知识，然后按依赖挑出下一个能开工的节点
-    /// 派给它的负责人——这就是用户说的「验收结束自动接下一个任务」。
-    ///
-    /// 返回 true = 已经安排了下一拍；false = 这条链到头了，交回调用方收尾。
-    bool AiTeamAccept(string from, AiEnvelope env) {
-        string id = env.taskId;
-        if (id == "") { id = aiTeamSt.activeTask; }
-        AiTask t = AiTeam.TaskOf(aiTasks, id);
-        if (t == null) { return false; }
-        // 已经验收收尾的节点又来一份 report：再走一遍验收 → 落知识 → 交回调度
-        // 就是拿同一个状态转一圈，于是同一个节点被反复派出去。这一拍交给下面的
-        // 派单兜底，它只会挑没完成的节点，链子跑完就停。
-        if (t.state == AiTeam.TaskDone()) { return false; }
-        if (AiTeam.NeedsAccept(t, from)) {
-            // 报完成的节点先进「已交接」，验收结论才决定它是完成还是打回。
-            t.state = AiTeam.TaskReview();
-            log.Add(ZanIDE.T("> Acceptance check on ", "> 验收中：")
-                + AiTaskGraph.CardTitle(t));
-            return this.AiTeamDirect(AiTeam.Verifier(), AiTeam.AcceptPrompt(t),
-                AiTeam.KindAssign(), t.id);
-        }
-        t.state = AiTeam.TaskDone();
-        t.progress = 100;
-        aiEscKey = "";
-        aiIdleWhy = "";
-        this.AiTeamNote(t, env.body);
-        AiTask nx = AiTeam.NextReady(aiTasks, t.id);
-        // 下一个节点不由这里直接塞给负责人：派单权在产品经理手上，它对着图按
-        // 依赖决定下一单（于是也不会同时开两个节点）。它要是没派出去，下面
-        // AiTeamAssign 那道兜底还在，流程不会停。
-        string nid = "";
-        if (nx != null) { nid = nx.id; }
-        log.Add(ZanIDE.T("> Back to the dispatcher", "> 交回产品经理调度"));
-        return this.AiTeamDirect(AiTeam.Dispatcher(),
-            AiTeam.DispatchPrompt(t.id, nx), AiTeam.KindAssign(), nid);
-    }
-
-    /// 验收通过的结论写进项目知识（`.zan/knowledge.md`），下一拍的系统提示会
-    /// 原样带上它——「自动维护知识」落在这里，而不是指望模型记得住。没打开项目
-    /// 时无处可写，那就只留在任务图的节点产出里，不假装写成功了。
-    void AiTeamNote(AiTask t, string verdict) {
-        if (!AiTaskGraph.AppendNote(root, AiTeam.NoteSection(t, verdict))) {
-            return;
-        }
-        log.Add(ZanIDE.T("> Knowledge updated: ", "> 项目知识已更新：")
-            + AiTaskGraph.NotesPath(root));
-        if (aiRun == null) { return; }
-        int now = Window.GetTickMs();
-        aiRun.GotoPhase(AiPhase.Knowledge(), now,
-            ZanIDE.T("knowledge write-back", "知识沉淀"),
-            ZanIDE.T("not run for this change", "本次改动未执行此步"));
-        aiRun.Pass(now, ZanIDE.T("accepted: ", "已验收：") + t.id);
-        this.AiRunSave();
-    }
-
     /// Runs one assistant tool call inside the open project and continues the
     /// loop. File tools (`write_file` / `edit_file`, and the read tools) run
     /// here and their result is handed straight back to the model. `build` /
@@ -394,6 +93,37 @@ partial class ZanIDE {
         // 工具执行前先推进状态机：读=事实检索，写=实施，build=编译,
         // run/ui_check=运行验证。结果由构建完成的轮询回填。
         this.AiRunTool(tool, call);
+        // 前置没验收就不许动手。图上的 `deps` 以前只管两件事：面板上把卡片锁住、
+        // 派单时跳过它——可模型自己开口说「我现在做 T-商城兑换」时没人拦，于是
+        // 上游还挂在「已交接」，下游已经在写代码（用户看到的就是「前面的没完成
+        // 后面的就开始了」）。依赖是执行约束，所以闸门要落在真正改工程的那一步。
+        if (aiTeamMode && aiTeamSt.activeTask != ""
+            && (tool == "write_file" || tool == "edit_file" || tool == "build")
+            && AiTeam.LockedTask(aiTasks, aiTeamSt.activeTask)) {
+            string dwhy = AiTeam.BlockedWhy(aiTasks, aiTeamSt.activeTask);
+            aiMsgs.Add(this.AiToolMsg("tool", AiAgent.Describe(call) + "\n"
+                + ZanIDE.T("refused: node " + aiTeamSt.activeTask
+                    + " cannot be started yet -- " + dwhy
+                    + ". A dependency is DONE only after its report passes"
+                    + " acceptance. Finish (or get accepted) the node it"
+                    + " waits on first, or say [block] if the dependency is"
+                    + " wrong; do not build ahead of it.",
+                    "refused: 节点 " + aiTeamSt.activeTask + " 还不能开工——"
+                    + dwhy + "。前置只有汇报通过验收才算「已完成」：先把它做完"
+                    + "（或送去验收），依赖连错了就发 [block] 说清，别提前"
+                    + "开工。")));
+            aiIdleWhy = ZanIDE.T("blocked: the node's dependency is not done",
+                "这个节点的前置还没验收，不允许动手改工程");
+            string derr2 = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
+                aiRunCtxName, aiRunCtxCode, root,
+                aiProfiles[aiProfActive].baseUrl,
+                aiProfiles[aiProfActive].key, aiRunModel);
+            if (derr2 != "") {
+                aiMsgs.Add(this.AiToolMsg("error", derr2));
+                aiBusy.Set(0);
+            }
+            return;
+        }
         // The whitelist is enforced where the tool actually runs. Asking a
         // member in its prompt not to touch a tool is not a boundary; refusing
         // the call is, and naming the owner turns the refusal into a handoff
@@ -676,6 +406,8 @@ partial class ZanIDE {
         aiIdleKey = "";
         aiIdleTimes = 0;
         aiEscKey = "";
+        aiRevKey = "";
+        aiRevTimes = 0;
     }
 
     /// How a dropped file is written into the prompt: project-relative when it
