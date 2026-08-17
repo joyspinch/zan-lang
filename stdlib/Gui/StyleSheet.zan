@@ -42,6 +42,15 @@ class StyleSheet {
     List<string> selState;
     List<int> selSpec;
     int indexedCount;
+    /// 每条规则的声明块，索引与上面的选择器表对齐：匹配后直接取，
+    /// 不再按选择器文本回查 rules（一次首帧解析要按名字查上百次）。
+    List<JsonValue> selBlock;
+    /// 按类型名分桶的规则下标（升序，因此与 anyType 归并后仍是级联顺序）。
+    /// 一个控件只需看自己类型那一桶加上无类型的那些规则，
+    /// 而不是每次解析都扫全表——冷解析（首帧、换肤）的主要成本在此。
+    Dict<string, List<int>> byType;
+    /// 没有类型选择器的规则下标（`.primary`、`#save`、`::option`）。
+    List<int> anyType;
 
     StyleSheet() {
         this.rules = JsonValue.NewObject();
@@ -129,10 +138,34 @@ class StyleSheet {
                     int stateBits) {
         this.Index();
         List<string> want = Style.Classes(cls);
-        for (int i = 0; i < selText.Count; i = i + 1) {
-            if (this.Matches(i, type, want, id, part, stateBits)) {
-                this.ApplyBox(b, selText[i]);
+        List<int> typed = null;
+        if (type != "") { this.byType.TryGetValue(type, out typed); }
+        int a = 0;
+        int c = 0;
+        bool more = true;
+        while (more) {
+            int ia = 0 - 1;
+            int ic = 0 - 1;
+            if (typed != null && a < typed.Count) { ia = typed[a]; }
+            if (c < anyType.Count) { ic = anyType[c]; }
+            if (ia < 0 && ic < 0) {
+                more = false;
+            } else {
+                int i;
+                if (ic < 0 || (ia >= 0 && ia < ic)) { i = ia; a = a + 1; }
+                else { i = ic; c = c + 1; }
+                if (this.Matches(i, type, want, id, part, stateBits)) {
+                    this.ApplyDecls(b, selBlock[i]);
+                }
             }
+        }
+    }
+
+    /// 把已经取到的声明块叠加到样式盒上。
+    void ApplyDecls(StyleBox b, JsonValue block) {
+        if (block == null) { return; }
+        for (int i = 0; i < block.Count(); i = i + 1) {
+            StyleSheet.Decl(b, block.KeyAt(i), StyleSheet.ValStr(block.ValAt(i)));
         }
     }
 
@@ -192,6 +225,24 @@ class StyleSheet {
             selPart.Insert(at, p.part);
             selState.Insert(at, p.state);
             selSpec.Insert(at, spec);
+        }
+        // 分桶要等排序完成再做：上面的 Insert 会挪动下标。
+        this.selBlock = new List<JsonValue>();
+        this.byType = new Dict<string, List<int>>();
+        this.anyType = new List<int>();
+        for (int k = 0; k < selText.Count; k = k + 1) {
+            selBlock.Add(this.Block(selText[k]));
+            string ty = selType[k];
+            if (ty == "") {
+                anyType.Add(k);
+            } else {
+                List<int> bucket;
+                if (!byType.TryGetValue(ty, out bucket)) {
+                    bucket = new List<int>();
+                    byType.Add(ty, bucket);
+                }
+                bucket.Add(k);
+            }
         }
         indexedCount = rules.Count();
     }
