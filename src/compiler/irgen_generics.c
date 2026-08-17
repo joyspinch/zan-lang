@@ -872,7 +872,7 @@ static void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals
 static LLVMValueRef obj_rc_flag_slot(zan_irgen_t *g, local_var_t *v) {
     if (!v->obj_rc_flag) {
         LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
-        LLVMValueRef here = LLVMGetInsertBlock(g->builder);
+        LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
         v->obj_rc_flag = emit_entry_alloca(g, i1, "obj.owns");
         LLVMPositionBuilderAtEnd(g->builder, here);
         LLVMBuildStore(g->builder, LLVMConstInt(i1, 0, 0), v->obj_rc_flag);
@@ -1428,6 +1428,7 @@ static void emit_sb_append_bytes(zan_irgen_t *g, LLVMValueRef sbp,
     LLVMValueRef newdata = zan_call2(g->builder,
         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i64 }, 2, 0),
         g->fn_realloc, (LLVMValueRef[]){ olddata, nc }, 2, "sbnd");
+    zan_irgen_emit_oom_check(g, g->current_fn, newdata);
     LLVMBuildStore(g->builder, newdata, dptr);
     LLVMBuildStore(g->builder, nc, capptr);
     LLVMBuildBr(g->builder, st_bb);

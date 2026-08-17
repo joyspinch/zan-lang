@@ -672,10 +672,11 @@ static bool member_name_is(zan_symbol_t *m, zan_istr_t name) {
            memcmp(m->name.str, name.str, (size_t)name.len) == 0;
 }
 
-/* Guard a malloc result inside runtime allocator `fn`: if it is null, print
- * "out of memory" and exit(1) rather than returning a header-offset pointer
- * into a null allocation (which would later be dereferenced). */
-static void emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw) {
+/* Guard a malloc/realloc result inside `fn`: if it is null, print "out of
+ * memory" and exit(1) rather than carrying a null buffer into the store that
+ * follows. Without this an exhausted heap surfaces as a SIGSEGV at a tiny
+ * address (the element offset added to null) with no usable diagnosis. */
+void zan_irgen_emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, raw,
         LLVMConstPointerNull(i8ptr), "oom");
@@ -1348,12 +1349,16 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMPositionBuilderAtEnd(g->builder, alloc_bb);
             LLVMValueRef fresh = zan_call2(g->builder, malloc_type, g->fn_malloc,
                 (LLVMValueRef[]){ LLVMSizeOf(node_ty) }, 1, "node");
+            zan_irgen_emit_oom_check(g, g->rt_co_ready, fresh);
+            /* the check splits alloc_bb: the edge into have_bb now leaves its
+             * continuation block, which is what the phi must name. */
+            LLVMBasicBlockRef fresh_bb = LLVMGetInsertBlock(g->builder);
             LLVMBuildBr(g->builder, have_bb);
 
             LLVMPositionBuilderAtEnd(g->builder, have_bb);
             LLVMValueRef node = LLVMBuildPhi(g->builder, i8ptr, "node");
             LLVMAddIncoming(node, (LLVMValueRef[]){ spare, fresh },
-                (LLVMBasicBlockRef[]){ reuse_bb, alloc_bb }, 2);
+                (LLVMBasicBlockRef[]){ reuse_bb, fresh_bb }, 2);
             LLVMValueRef nnext = LLVMBuildStructGEP2(g->builder, node_ty, node, 0, "n.next");
             LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), nnext);
             LLVMValueRef nframe = LLVMBuildStructGEP2(g->builder, node_ty, node, 1, "n.frame");
@@ -1726,7 +1731,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef total = zan_add(g->builder, size, LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0), "total");
         LLVMTypeRef malloc_fn_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0);
         LLVMValueRef raw = zan_call2(g->builder, malloc_fn_type, g->fn_malloc, &total, 1, "raw");
-        emit_oom_check(g, g->rt_alloc, raw);
+        zan_irgen_emit_oom_check(g, g->rt_alloc, raw);
         /* refcount = 1 at raw[0..7] */
         LLVMValueRef rc_ptr = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "rcptr");
         LLVMBuildStore(g->builder, LLVMConstInt(i64, 1, 0), rc_ptr);
@@ -1767,7 +1772,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef total = zan_add(g->builder, size, LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0), "total");
         LLVMTypeRef malloc_fn_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0);
         LLVMValueRef raw = zan_call2(g->builder, malloc_fn_type, g->fn_malloc, &total, 1, "raw");
-        emit_oom_check(g, g->rt_str_alloc, raw);
+        zan_irgen_emit_oom_check(g, g->rt_str_alloc, raw);
         LLVMValueRef rc_ptr = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "rcptr");
         LLVMBuildStore(g->builder, LLVMConstInt(i64, 1, 0), rc_ptr);
         LLVMValueRef eight = LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);

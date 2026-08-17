@@ -363,6 +363,7 @@ static LLVMValueRef get_list_push_strn_fn(zan_irgen_t *g) {
     LLVMValueRef ndata8 = zan_call2(g->builder,
         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i64 }, 2, 0),
         g->fn_realloc, (LLVMValueRef[]){ odata8, nbytes }, 2, "ndata8");
+    zan_irgen_emit_oom_check(g, fn, ndata8);
     LLVMValueRef ndata = LLVMBuildBitCast(g->builder, ndata8, i64ptr, "ndata");
     LLVMBuildStore(g->builder, ndata, datap);
     LLVMBuildStore(g->builder, ncap, capp);
@@ -810,10 +811,12 @@ static LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
     LLVMValueRef ks8 = LLVMBuildBitCast(g->builder, ks, i8ptr, "ks8");
     LLVMValueRef nks8 = zan_call2(g->builder, realloc_ty, g->fn_realloc,
         (LLVMValueRef[]){ ks8, key_bytes }, 2, "nks8");
+    zan_irgen_emit_oom_check(g, fn, nks8);
     LLVMBuildStore(g->builder, LLVMBuildBitCast(g->builder, nks8, i8pp, "nks"), kp);
     LLVMValueRef vs8 = LLVMBuildBitCast(g->builder, vs, i8ptr, "vs8");
     LLVMValueRef nvs8 = zan_call2(g->builder, realloc_ty, g->fn_realloc,
         (LLVMValueRef[]){ vs8, value_bytes }, 2, "nvs8");
+    zan_irgen_emit_oom_check(g, fn, nvs8);
     LLVMBuildStore(g->builder, LLVMBuildBitCast(g->builder, nvs8, i64ptr, "nvs"), vp);
     LLVMBuildStore(g->builder, ncap, capp);
     LLVMBuildBr(g->builder, put_bb);

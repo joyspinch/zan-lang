@@ -3657,6 +3657,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                     LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
                     get_calloc_fn(g),
                     (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0), data_size }, 2, "ldata");
+                zan_irgen_emit_oom_check(g, g->current_fn, data);
                 LLVMValueRef data_typed = LLVMBuildBitCast(g->builder, data,
                     LLVMPointerType(i64, 0), "ldp");
                 zan_store_fit(g, data_typed,
@@ -4365,6 +4366,7 @@ static LLVMValueRef query_new_list(zan_irgen_t *g, zan_ast_node_t *at,
         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
         get_calloc_fn(g), (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0), dsz },
         2, "qdata");
+    zan_irgen_emit_oom_check(g, g->current_fn, dp);
     zan_store_fit(g, LLVMBuildBitCast(g->builder, dp,
         LLVMPointerType(i64, 0), "qdp"), data);
     return LLVMBuildBitCast(g->builder, lp, i8ptr, "qlv");
@@ -5387,6 +5389,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef data_ptr = zan_call2(g->builder,
                     LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
                     get_calloc_fn(g), (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0), data_size }, 2, "data");
+                zan_irgen_emit_oom_check(g, g->current_fn, data_ptr);
                 LLVMValueRef data_typed = LLVMBuildBitCast(g->builder, data_ptr,
                     LLVMPointerType(i64, 0), "dptr");
                 LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type, typed_ptr, 2, "df");
@@ -5467,6 +5470,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef keys_raw = zan_call2(g->builder,
                     LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
                     get_calloc_fn(g), (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0), keys_sz }, 2, "keys");
+                zan_irgen_emit_oom_check(g, g->current_fn, keys_raw);
                 LLVMValueRef keys_typed = LLVMBuildBitCast(g->builder, keys_raw,
                     LLVMPointerType(i8ptr, 0), "kptr");
                 LLVMValueRef kf = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, typed_ptr, 2, "kf");
@@ -5476,6 +5480,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef vals_raw = zan_call2(g->builder,
                     LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
                     get_calloc_fn(g), (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0), vals_sz }, 2, "vals");
+                zan_irgen_emit_oom_check(g, g->current_fn, vals_raw);
                 LLVMValueRef vals_typed = LLVMBuildBitCast(g->builder, vals_raw,
                     LLVMPointerType(i64, 0), "vptr");
                 LLVMValueRef vf = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, typed_ptr, 3, "vf");

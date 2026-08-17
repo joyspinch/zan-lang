@@ -524,6 +524,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         LLVMTypeRef malloc_ty = LLVMGlobalGetValueType(g->fn_malloc);
         LLVMValueRef fsize = LLVMSizeOf(frame_type);
         LLVMValueRef raw = zan_call2(g->builder, malloc_ty, g->fn_malloc, &fsize, 1, "frame.raw");
+        zan_irgen_emit_oom_check(g, ramp_fn, raw);
         /* Zero the frame so every owning (RC) local slot starts null. The
          * per-iteration capture of a loop-body local releases the reloaded
          * previous occupant of its slot; that requires the slot to be null

@@ -630,6 +630,13 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             bool arc_guard);
 void zan_irgen_destroy(zan_irgen_t *g);
 
+/* Abort with "out of memory" when the malloc/realloc result `raw` is null,
+ * instead of letting the store that follows write through a null buffer (which
+ * faults at a tiny address and reports no cause). Splits the current block:
+ * emission continues in the non-null continuation, so a phi fed by this edge
+ * must name LLVMGetInsertBlock() rather than the original block. */
+void zan_irgen_emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw);
+
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit);
 /* --publish only: emit the .ctors constructor that un-scrambles string
  * literals. No-op unless g->obfuscate_strings and at least one literal was

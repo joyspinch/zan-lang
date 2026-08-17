@@ -2834,6 +2834,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMValueRef new_data_raw = zan_call2(g->builder,
                         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i64 }, 2, 0),
                         g->fn_realloc, realloc_args, 2, "nd");
+                    zan_irgen_emit_oom_check(g, g->current_fn, new_data_raw);
                     LLVMValueRef new_data = LLVMBuildBitCast(g->builder, new_data_raw, LLVMPointerType(i64, 0), "ndt");
                     LLVMBuildStore(g->builder, new_data, data_field);
                     LLVMBuildBr(g->builder, add_bb);
@@ -2981,6 +2982,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMValueRef nd_raw = zan_call2(g->builder,
                         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i64 }, 2, 0),
                         g->fn_realloc, re_args, 2, "ar.nd");
+                    zan_irgen_emit_oom_check(g, g->current_fn, nd_raw);
                     LLVMValueRef nd = LLVMBuildBitCast(g->builder, nd_raw, i64ptr, "ar.ndt");
                     LLVMBuildStore(g->builder, nd, s_df);
                     LLVMBuildBr(g->builder, s_bb);
@@ -3299,6 +3301,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMValueRef new_data = zan_call2(g->builder,
                         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i64 }, 2, 0),
                         g->fn_realloc, (LLVMValueRef[]){ old_data, nbytes }, 2, "nd");
+                    zan_irgen_emit_oom_check(g, g->current_fn, new_data);
                     LLVMValueRef new_data_i = LLVMBuildBitCast(g->builder, new_data, LLVMPointerType(i64, 0), "ndi");
                     LLVMBuildStore(g->builder, new_data_i, data_field);
                     LLVMBuildBr(g->builder, shift_bb);
