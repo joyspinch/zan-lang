@@ -254,6 +254,45 @@ class App {
     int perfPartFrames;
     int perfPartRenderMs;
     int perfPartPresentMs;
+    // 本批里最慢的一帧（渲染 + 呈现）。平均值会把偶发的长帧摊掉，
+    // 而卡顿是被最慢的那一帧决定的。
+    int perfWorstMs;
+    // 上一帧结束时的样式解析计数，用来给单帧算差值。
+    int perfStyleAt;
+    int perfStyleMissAt;
+    // 同理，上一帧结束时的光栅像素计数（不透明填充 / 混合填充 /
+    // 模糊 / 字形 / 快照），只用于给超预算的单帧开单。
+    int perfPxFillAt;
+    int perfPxBlendAt;
+    int perfPxBlurAt;
+    int perfPxGlyphAt;
+    int perfPxSnapAt;
+    // 帧内分相位（微秒）：背景恢复 / 测量 / 排版 / 画树。整帧就几
+    // 毫秒，按毫秒取整时每个相位都被截成 0 或 1，所以这里用微秒；
+    // phaseAtUs 是上一个标记点。前四个是本帧的，后四个是本批的总和。
+    int phaseAtUs;
+    int phaseBgUs;
+    int phaseMeasUs;
+    int phaseArrUs;
+    int phaseTreeUs;
+    // 本帧最贵的那个即时模式 id 段（宿主拿它分隔各大区域）。
+    int scopeId;
+    int scopeAtUs;
+    int scopeEndUs;
+    int scopeEndId;
+    string phaseSecTop;
+    int phaseSecTopUs;
+    // 宿主自己埋的标记点之间的分段：本帧最贵的那一段。
+    int markAtUs;
+    string phaseMarkTop;
+    int phaseMarkTopUs;
+    // 本帧自身绘制最贵的那个节点（类型#名字）与它的微秒数。
+    string phaseTopNode;
+    int phaseTopUs;
+    int perfBgUs;
+    int perfMeasUs;
+    int perfArrUs;
+    int perfTreeUs;
     int perfBeginMs;
     int perfFxMs;
     int perfOverlayMs;
@@ -478,6 +517,34 @@ class App {
         this.perfPartFrames = 0;
         this.perfPartRenderMs = 0;
         this.perfPartPresentMs = 0;
+        this.perfWorstMs = 0;
+        this.perfStyleAt = 0;
+        this.perfStyleMissAt = 0;
+        this.perfPxFillAt = 0;
+        this.perfPxBlendAt = 0;
+        this.perfPxBlurAt = 0;
+        this.perfPxGlyphAt = 0;
+        this.perfPxSnapAt = 0;
+        this.phaseAtUs = 0;
+        this.phaseBgUs = 0;
+        this.phaseMeasUs = 0;
+        this.phaseArrUs = 0;
+        this.phaseTreeUs = 0;
+        this.phaseTopNode = "";
+        this.phaseTopUs = 0;
+        this.scopeId = 0;
+        this.scopeAtUs = 0;
+        this.scopeEndUs = 0;
+        this.scopeEndId = 0;
+        this.markAtUs = 0;
+        this.phaseMarkTop = "";
+        this.phaseMarkTopUs = 0;
+        this.phaseSecTop = "";
+        this.phaseSecTopUs = 0;
+        this.perfBgUs = 0;
+        this.perfMeasUs = 0;
+        this.perfArrUs = 0;
+        this.perfTreeUs = 0;
         this.perfBeginMs = 0;
         this.lastPresentMs = 0;
         this.perfLoopAt = 0;
@@ -1537,8 +1604,38 @@ class App {
     /// EndIdScope()。宿主用它隔开各个大区域（功能区、面板、标签条、
     /// 编辑区）：某个区域这一帧多画 / 少画了控件，也不会让别处的
     /// id 移位，从而把点击错投到另一个控件上。段之间要留足间隔。
-    void BeginIdScope(int first) { focus.PushIds(first); }
-    void EndIdScope() { focus.PopIds(); }
+    void BeginIdScope(int first) {
+        focus.PushIds(first);
+        // 分析器开着时把每个 id 段当作一个可计时的区域：它们正好是
+        // 宕机把界面分开的那几块（功能区、编辑区、各个面板），于是
+        // 不需要在宿主里另埋一套标记点。
+        if (!App.PerfOn()) { return; }
+        int now = Window.GetTickUs();
+        // 两个 id 段之间的活（宿主在面板之外直接画的东西）也要有人认：
+        // 否则尖尖那一帧只能看到“整棑很贵、每段都很便宜”。
+        if (scopeEndUs > 0) {
+            int gap = now - scopeEndUs;
+            if (gap > phaseSecTopUs) {
+                phaseSecTopUs = gap;
+                phaseSecTop = "after" + Convert.ToString(scopeEndId);
+            }
+        }
+        scopeId = first;
+        scopeAtUs = now;
+    }
+
+    void EndIdScope() {
+        focus.PopIds();
+        if (!App.PerfOn()) { return; }
+        int now = Window.GetTickUs();
+        int us = now - scopeAtUs;
+        scopeEndUs = now;
+        scopeEndId = scopeId;
+        if (us > phaseSecTopUs) {
+            phaseSecTopUs = us;
+            phaseSecTop = Convert.ToString(scopeId);
+        }
+    }
 
     /// 声明本次状态变化只改变 [x,y,w,h] 这块像素：下一帧被裁剪
     /// 到它（与本帧其他声明合并），而不是重绘整个窗口。切换
@@ -3020,6 +3117,68 @@ class App {
         window.Present(canvas);
         if (App.PerfOn()) {
             int endMs = Window.GetTickMs();
+            int wholeMs = endMs - perfBeginMs;
+            if (wholeMs > perfWorstMs) { perfWorstMs = wholeMs; }
+            int styleNow = Style.StatPeek(0);
+            int styleMissNow = styleNow - Style.StatPeek(1);
+            // 卡顿是单帧事件，平均值看不见：超过一个帧预算的帧单独记
+            // 一行，把它花在渲染、呈现、特效还是样式重算上当场分清。
+            int spikePart = 0;
+            if (partialFrame) { spikePart = 1; }
+            int pxFill = Canvas.RasterStat(0, 2);
+            int pxBlend = Canvas.RasterStat(1, 2);
+            int pxBlur = Canvas.RasterStat(5, 2);
+            int pxGlyph = Canvas.RasterStat(10, 2);
+            int pxSnap = Canvas.RasterStat(8, 2);
+            if (wholeMs >= 12) {
+                File.AppendAllText("zan_frame_perf.log",
+                    "  spike whole_ms=" + Convert.ToString(wholeMs)
+                    + " render_ms=" + Convert.ToString(perfPreMs - perfBeginMs)
+                    + " present_ms=" + Convert.ToString(endMs - perfPreMs)
+                    + " partial=" + Convert.ToString(spikePart)
+                    + " style=" + Convert.ToString(styleNow - perfStyleAt)
+                    + "/" + Convert.ToString(styleMissNow - perfStyleMissAt)
+                    + "miss fill=" + Convert.ToString(pxFill - perfPxFillAt)
+                    + "kpx blend=" + Convert.ToString(pxBlend - perfPxBlendAt)
+                    + "kpx blur=" + Convert.ToString(pxBlur - perfPxBlurAt)
+                    + "kpx glyph=" + Convert.ToString(pxGlyph - perfPxGlyphAt)
+                    + " snap=" + Convert.ToString(pxSnap - perfPxSnapAt)
+                    + "kpx bg=" + App.UsAvg(phaseBgUs, 1)
+                    + " measure=" + App.UsAvg(phaseMeasUs, 1)
+                    + " arrange=" + App.UsAvg(phaseArrUs, 1)
+                    + " tree=" + App.UsAvg(phaseTreeUs, 1)
+                    + " top=" + phaseTopNode
+                    + " top_ms=" + App.UsAvg(phaseTopUs, 1)
+                    + " scope=" + phaseSecTop
+                    + " scope_ms=" + App.UsAvg(phaseSecTopUs, 1)
+                    + " mark=" + phaseMarkTop
+                    + " mark_ms=" + App.UsAvg(phaseMarkTopUs, 1)
+                    + " frame=" + Convert.ToString(frameCount) + "\n");
+            }
+            phaseTopNode = "";
+            phaseTopUs = 0;
+            phaseSecTop = "";
+            phaseSecTopUs = 0;
+            // 段间分账只在一帧之内有意义：跨帧那一段是循环在等事件。
+            scopeEndUs = 0;
+            phaseMarkTop = "";
+            phaseMarkTopUs = 0;
+            markAtUs = 0;
+            perfBgUs = perfBgUs + phaseBgUs;
+            perfMeasUs = perfMeasUs + phaseMeasUs;
+            perfArrUs = perfArrUs + phaseArrUs;
+            perfTreeUs = perfTreeUs + phaseTreeUs;
+            phaseBgUs = 0;
+            phaseMeasUs = 0;
+            phaseArrUs = 0;
+            phaseTreeUs = 0;
+            perfPxFillAt = pxFill;
+            perfPxBlendAt = pxBlend;
+            perfPxBlurAt = pxBlur;
+            perfPxGlyphAt = pxGlyph;
+            perfPxSnapAt = pxSnap;
+            perfStyleAt = styleNow;
+            perfStyleMissAt = styleMissNow;
             if (partialFrame) {
                 perfPartFrames = perfPartFrames + 1;
                 perfPartRenderMs = perfPartRenderMs + (perfPreMs - perfBeginMs);
@@ -3037,13 +3196,18 @@ class App {
                 File.AppendAllText("zan_frame_perf.log",
                     "frames=" + Convert.ToString(perfFrames)
                     + " full=" + Convert.ToString(perfFrames - perfPartFrames)
-                    + " render_ms=" + Convert.ToString(perfRenderMs / fullN)
-                    + " present_ms=" + Convert.ToString(perfPresentMs / fullN)
+                    + " render_ms=" + App.MsAvg(perfRenderMs, fullN)
+                    + " present_ms=" + App.MsAvg(perfPresentMs, fullN)
                     + " partial=" + Convert.ToString(perfPartFrames)
-                    + " part_render_ms=" + Convert.ToString(perfPartRenderMs / partN)
-                    + " part_present_ms=" + Convert.ToString(perfPartPresentMs / partN)
-                    + " overlay_ms=" + Convert.ToString(perfOverlayMs / perfFrames)
-                    + " fx_ms=" + Convert.ToString(perfFxMs / perfFrames)
+                    + " part_render_ms=" + App.MsAvg(perfPartRenderMs, partN)
+                    + " part_present_ms=" + App.MsAvg(perfPartPresentMs, partN)
+                    + " overlay_ms=" + App.MsAvg(perfOverlayMs, perfFrames)
+                    + " fx_ms=" + App.MsAvg(perfFxMs, perfFrames)
+                    + " worst_ms=" + Convert.ToString(perfWorstMs)
+                    + " bg_ms=" + App.UsAvg(perfBgUs, perfFrames)
+                    + " measure_ms=" + App.UsAvg(perfMeasUs, perfFrames)
+                    + " arrange_ms=" + App.UsAvg(perfArrUs, perfFrames)
+                    + " tree_ms=" + App.UsAvg(perfTreeUs, perfFrames)
                     + " surface=" + Convert.ToString(canvas.Width())
                     + "x" + Convert.ToString(canvas.Height()) + "\n");
                 File.AppendAllText("zan_frame_perf.log",
@@ -3056,6 +3220,11 @@ class App {
                 perfPartPresentMs = 0;
                 perfOverlayMs = 0;
                 perfFxMs = 0;
+                perfWorstMs = 0;
+                perfBgUs = 0;
+                perfMeasUs = 0;
+                perfArrUs = 0;
+                perfTreeUs = 0;
             }
         }
         frameCount = frameCount + 1;
@@ -3114,6 +3283,59 @@ class App {
         perfFxTickMs = 0;
     }
 
+    /// 宿主在一大段绘制里埋的标记点：把自上一个标记以来的时间
+    /// 记到 `name` 头上（空名字只重置起点），分析器关着时不做事。
+    /// 尖尖那一帧只报最贵的一段，不每帧刷一大篇日志。
+    void PerfMark(string name) {
+        if (!App.PerfOn()) { return; }
+        int now = Window.GetTickUs();
+        int d = now - markAtUs;
+        bool first = markAtUs == 0;
+        markAtUs = now;
+        // 本帧的第一个标记只定起点：不然跨帧那一段（循环在等事件）
+        // 会被记到它头上。
+        if (name == "" || first) { return; }
+        if (d > phaseMarkTopUs) {
+            phaseMarkTopUs = d;
+            phaseMarkTop = name;
+        }
+    }
+
+    /// 一个节点自身绘制的耗时（不含子树）：只留本帧最贵的那个。
+    void PerfNode(string kind, string nm, int us) {
+        if (us <= phaseTopUs) { return; }
+        phaseTopUs = us;
+        phaseTopNode = kind + "#" + nm;
+    }
+
+    /// 开始一段帧内相位计时（分析器关着时是空操作）。
+    void PhaseBegin() {
+        if (!App.PerfOn()) { return; }
+        phaseAtUs = Window.GetTickUs();
+    }
+
+    /// 把上一个标记点到现在的时间计到第 `slot` 个相位上：
+    /// 0 = 背景，1 = 测量，2 = 排版，3 = 画整棵树。
+    void PhaseEnd(int slot) {
+        if (!App.PerfOn()) { return; }
+        int now = Window.GetTickUs();
+        int d = now - phaseAtUs;
+        phaseAtUs = now;
+        if (d < 0) { return; }
+        if (slot == 0) { phaseBgUs = phaseBgUs + d; }
+        else if (slot == 1) { phaseMeasUs = phaseMeasUs + d; }
+        else if (slot == 2) { phaseArrUs = phaseArrUs + d; }
+        else { phaseTreeUs = phaseTreeUs + d; }
+    }
+
+    /// `us` 微秒摆到 `n` 帧上，以毫秒保留一位小数。
+    static string UsAvg(int us, int n) {
+        if (n <= 0) { n = 1; }
+        int tenths = us / n / 100;
+        return Convert.ToString(tenths / 10) + "."
+            + Convert.ToString(tenths % 10);
+    }
+
     /// 启用可选帧分析器（ZAN_FRAME_PROF=1）时为真。
     static bool PerfOn() {
         if (App.perfMode == 0) {
@@ -3121,6 +3343,16 @@ class App {
             if (Interop.EnvVar("ZAN_FRAME_PROF") == "1") { App.perfMode = 1; }
         }
         return App.perfMode == 1;
+    }
+
+    /// `total` 毫秒摊到 `n` 帧上，保留一位小数。每帧的取样本身
+    /// 只有毫秒精度，但摊到几十帧上，这一位小数足以看出
+    /// 半毫秒量级的变化——整数平均会把它们全抹平。
+    static string MsAvg(int total, int n) {
+        if (n <= 0) { n = 1; }
+        int tenths = total * 10 / n;
+        return Convert.ToString(tenths / 10) + "."
+            + Convert.ToString(tenths % 10);
     }
 
     /// 帧分析器输出的一行每帧光栅化工作量：调用数与
@@ -3149,6 +3381,10 @@ class App {
                     + "/" + Convert.ToString(kpx / frames) + "kpx ";
             }
         }
+        int styleN = Style.StatRead(0);
+        int styleHit = Style.StatRead(1);
+        line = line + "style=" + Convert.ToString(styleN / frames) + "/"
+            + Convert.ToString((styleN - styleHit) / frames) + "miss ";
         for (int rank = 0; rank < 6; rank = rank + 1) {
             int kpx = Canvas.RasterTopBlend(rank, 0);
             int bx = Canvas.RasterTopBlend(rank, 1);
@@ -3162,6 +3398,19 @@ class App {
                     + "," + Convert.ToString(by) + "+" + Convert.ToString(bw)
                     + "x" + Convert.ToString(bh) + "a" + Convert.ToString(ba)
                     + " ";
+            }
+        }
+        for (int rank = 0; rank < 6; rank = rank + 1) {
+            int kpx = Canvas.RasterTopFill(rank, 0);
+            int fx = Canvas.RasterTopFill(rank, 1);
+            int fy = Canvas.RasterTopFill(rank, 2);
+            int fw = Canvas.RasterTopFill(rank, 3);
+            int fh = Canvas.RasterTopFill(rank, 4);
+            if (kpx > 0) {
+                line = line + "op" + Convert.ToString(rank) + "="
+                    + Convert.ToString(kpx) + "kpx@" + Convert.ToString(fx)
+                    + "," + Convert.ToString(fy) + "+" + Convert.ToString(fw)
+                    + "x" + Convert.ToString(fh) + " ";
             }
         }
         return line;

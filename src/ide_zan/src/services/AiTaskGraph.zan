@@ -281,6 +281,35 @@ class AiTaskGraph {
 
     // --- node context: .zan/tasks.db -----------------------------------------
 
+    /// 开着的这一份连接（只对当前项目）。每写一行就 open/close 一次，
+    /// 每次都要重新过 WAL 、建表、建索引，并在关闭时 fsync 一次：
+    /// 发一句话那一帧就是十几毫秒卡在绘制里（参见 ZanIDE.AiCtxFlush）。
+    static SqliteConnection gDb;
+    static string gDbRoot;
+
+    /// 这个项目的上下文库连接，没有就开一份留着。换项目（或连接
+    /// 断了）才重开，所以常态下一次追加就是一条 INSERT。
+    static SqliteConnection Db(string root) {
+        if (AiTaskGraph.gDb != null && AiTaskGraph.gDbRoot == root
+                && AiTaskGraph.gDb.IsConnected()) {
+            return AiTaskGraph.gDb;
+        }
+        AiTaskGraph.CloseDb();
+        SqliteConnection db = AiTaskGraph.OpenDb(root);
+        if (db == null) { return null; }
+        AiTaskGraph.gDb = db;
+        AiTaskGraph.gDbRoot = root;
+        return db;
+    }
+
+    /// 放手那份开着的连接（关项目 / 换项目）。
+    static void CloseDb() {
+        if (AiTaskGraph.gDb == null) { return; }
+        AiTaskGraph.gDb.Close();
+        AiTaskGraph.gDb = null;
+        AiTaskGraph.gDbRoot = "";
+    }
+
     /// Opens (and on first use creates) the context database. Returns null when
     /// there is no project to write into or the driver could not open the file,
     /// so every caller must check -- the panel keeps working without a database,
@@ -315,19 +344,17 @@ class AiTaskGraph {
     /// reading the same rows back.
     static bool Append(string root, string node, ChatMessage m) {
         if (node == "" || m == null) { return false; }
-        SqliteConnection db = AiTaskGraph.OpenDb(root);
+        SqliteConnection db = AiTaskGraph.Db(root);
         if (db == null) { return false; }
-        bool ok = AiTaskGraph.AppendOn(db, node, m);
-        db.Close();
-        return ok;
+        return AiTaskGraph.AppendOn(db, node, m);
     }
 
-    /// Appends `msgs` in one open/close, for the bulk path (importing a chat
-    /// into a node, or flushing a finished turn): one connection per message
-    /// would pay the WAL and schema check for every line.
+    /// Appends `msgs` in one transaction, for the bulk path (importing a chat
+    /// into a node, or flushing a finished turn): a commit per line would pay
+    /// the WAL write for every one of them.
     static int AppendAll(string root, string node, List<ChatMessage> msgs) {
         if (node == "" || msgs == null || msgs.Count == 0) { return 0; }
-        SqliteConnection db = AiTaskGraph.OpenDb(root);
+        SqliteConnection db = AiTaskGraph.Db(root);
         if (db == null) { return 0; }
         int n = 0;
         int _b = db.Execute("BEGIN");
@@ -335,7 +362,6 @@ class AiTaskGraph {
             if (AiTaskGraph.AppendOn(db, node, msgs[i])) { n = n + 1; }
         }
         int _c = db.Execute("COMMIT");
-        db.Close();
         return n;
     }
 
@@ -368,7 +394,7 @@ class AiTaskGraph {
         outMsgs.Clear();
         if (node == "" || !AiTaskGraph.Usable(root)) { return 0; }
         if (!File.Exists(AiTaskGraph.DbPath(root))) { return 0; }
-        SqliteConnection db = AiTaskGraph.OpenDb(root);
+        SqliteConnection db = AiTaskGraph.Db(root);
         if (db == null) { return 0; }
         DbParams p = new DbParams();
         p.Add(node);
@@ -387,7 +413,6 @@ class AiTaskGraph {
             m.at = r.GetLong(i, 7);
             outMsgs.Add(m);
         }
-        db.Close();
         return outMsgs.Count;
     }
 
@@ -396,13 +421,12 @@ class AiTaskGraph {
     static int CtxCount(string root, string node) {
         if (node == "" || !AiTaskGraph.Usable(root)) { return 0; }
         if (!File.Exists(AiTaskGraph.DbPath(root))) { return 0; }
-        SqliteConnection db = AiTaskGraph.OpenDb(root);
+        SqliteConnection db = AiTaskGraph.Db(root);
         if (db == null) { return 0; }
         DbParams p = new DbParams();
         p.Add(node);
         string n = db.ExecuteScalar(
             "SELECT COUNT(*) FROM node_msg WHERE node = ?", p);
-        db.Close();
         if (n == "") { return 0; }
         return Convert.ToInt32(n);
     }
@@ -413,12 +437,11 @@ class AiTaskGraph {
     static bool DropCtx(string root, string node) {
         if (node == "" || !AiTaskGraph.Usable(root)) { return false; }
         if (!File.Exists(AiTaskGraph.DbPath(root))) { return false; }
-        SqliteConnection db = AiTaskGraph.OpenDb(root);
+        SqliteConnection db = AiTaskGraph.Db(root);
         if (db == null) { return false; }
         DbParams p = new DbParams();
         p.Add(node);
         int rc = db.Execute("DELETE FROM node_msg WHERE node = ?", p);
-        db.Close();
         return rc >= 0;
     }
 

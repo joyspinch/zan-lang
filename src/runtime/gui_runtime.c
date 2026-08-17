@@ -175,6 +175,20 @@ static u32 blend_over(u32 dst, u32 src) {
  * its fast path" (see zan_gui_stat_read idx 11/12). */
 static long long g_blend_px_simd, g_blend_px_scalar;
 
+/* Opaque fill of a run of pixels.
+ *
+ * A full-window frame writes about twice the surface in opaque fills (window
+ * background, then each panel's own background over it), so these writes set
+ * the frame's bandwidth floor. Non-temporal (cache-bypassing) stores were
+ * measured here and came out slower -- 4.0 ms vs 3.7 ms per full frame on the
+ * IDE at 1942x1286 -- because every filled pixel is read back within the same
+ * frame by the layers blended on top and by the blit to the window, so keeping
+ * the fill in cache is worth more than saving its read-for-ownership. Plain
+ * stores it is; clang vectorises this loop. */
+static void fill_run_const(u32 *row, int n, u32 c) {
+    for (int i = 0; i < n; i++) row[i] = c;
+}
+
 static void blend_run_const(u32 *row, int n, u32 src) {
     u32 sa = (src >> 24) & 0xFF;
     if (sa == 0 || n <= 0) return;
@@ -387,7 +401,7 @@ EXPORT void zan_gui_clear(i32 surface_id, i32 color) {
     u32 c = (u32)color;
     g_bg_color = c;
     int count = s->width * s->height;
-    for (int i = 0; i < count; i++) s->pixels[i] = c;
+    fill_run_const(s->pixels, count, c);
 }
 
 /* Intersect the clip window with (x,y,w,h) and save the previous window so a
@@ -459,38 +473,53 @@ EXPORT void zan_gui_stat_glyphs(i32 n) { ZAN_STAT(g_st_glyph, n); }
 /* The widest translucent fills of the frame, so a profile can name the layers
  * that dominate blending instead of only totalling them. */
 #define ZAN_TOP_N 6
-static int g_top_a[ZAN_TOP_N], g_top_x[ZAN_TOP_N], g_top_y[ZAN_TOP_N],
-           g_top_w[ZAN_TOP_N], g_top_h[ZAN_TOP_N], g_top_c[ZAN_TOP_N];
+/* Table 0 tracks translucent fills, table 1 opaque ones: an opaque fill that
+ * covers pixels a later layer paints again is pure overdraw, and naming the
+ * widest ones is the only way to tell which layer to stop painting. */
+#define ZAN_TOP_T 2
+static int g_top_a[ZAN_TOP_T][ZAN_TOP_N], g_top_x[ZAN_TOP_T][ZAN_TOP_N],
+           g_top_y[ZAN_TOP_T][ZAN_TOP_N], g_top_w[ZAN_TOP_T][ZAN_TOP_N],
+           g_top_h[ZAN_TOP_T][ZAN_TOP_N], g_top_c[ZAN_TOP_T][ZAN_TOP_N];
 
-static void stat_top_blend(int area, int x, int y, int w, int h, u32 color) {
+static void stat_top_rect(int t, int area, int x, int y, int w, int h,
+                          u32 color) {
     int slot = -1;
     for (int i = 0; i < ZAN_TOP_N; i++) {
-        if (area > g_top_a[i]) { slot = i; break; }
+        if (area > g_top_a[t][i]) { slot = i; break; }
     }
     if (slot < 0) return;
     for (int i = ZAN_TOP_N - 1; i > slot; i--) {
-        g_top_a[i] = g_top_a[i - 1]; g_top_x[i] = g_top_x[i - 1];
-        g_top_y[i] = g_top_y[i - 1]; g_top_w[i] = g_top_w[i - 1];
-        g_top_h[i] = g_top_h[i - 1]; g_top_c[i] = g_top_c[i - 1];
+        g_top_a[t][i] = g_top_a[t][i - 1]; g_top_x[t][i] = g_top_x[t][i - 1];
+        g_top_y[t][i] = g_top_y[t][i - 1]; g_top_w[t][i] = g_top_w[t][i - 1];
+        g_top_h[t][i] = g_top_h[t][i - 1]; g_top_c[t][i] = g_top_c[t][i - 1];
     }
-    g_top_a[slot] = area; g_top_x[slot] = x; g_top_y[slot] = y;
-    g_top_w[slot] = w; g_top_h[slot] = h; g_top_c[slot] = (int)color;
+    g_top_a[t][slot] = area; g_top_x[t][slot] = x; g_top_y[t][slot] = y;
+    g_top_w[t][slot] = w; g_top_h[t][slot] = h; g_top_c[t][slot] = (int)color;
+}
+
+static i32 stat_top_field(int t, i32 rank, i32 field) {
+    if (rank < 0 || rank >= ZAN_TOP_N) return 0;
+    switch (field) {
+        case 0: return g_top_a[t][rank] / 1000;
+        case 1: return g_top_x[t][rank];
+        case 2: return g_top_y[t][rank];
+        case 3: return g_top_w[t][rank];
+        case 5: return (g_top_c[t][rank] >> 24) & 0xFF;
+        default: break;
+    }
+    i32 h = g_top_h[t][rank];
+    g_top_a[t][rank] = 0;
+    return h;
 }
 
 /* field: 0 area/1000, 1 x, 2 y, 3 w, 4 h; reading field 4 clears the entry. */
 EXPORT i32 zan_gui_stat_top(i32 rank, i32 field) {
-    if (rank < 0 || rank >= ZAN_TOP_N) return 0;
-    switch (field) {
-        case 0: return g_top_a[rank] / 1000;
-        case 1: return g_top_x[rank];
-        case 2: return g_top_y[rank];
-        case 3: return g_top_w[rank];
-        case 5: return (g_top_c[rank] >> 24) & 0xFF;
-        default: break;
-    }
-    i32 h = g_top_h[rank];
-    g_top_a[rank] = 0;
-    return h;
+    return stat_top_field(0, rank, field);
+}
+
+/* Same fields, for the frame's widest opaque fills. */
+EXPORT i32 zan_gui_stat_top_fill(i32 rank, i32 field) {
+    return stat_top_field(1, rank, field);
 }
 
 /* Reads one counter and clears it: idx selects the primitive (see the switch),
@@ -522,6 +551,10 @@ EXPORT i32 zan_gui_stat_read(i32 idx, i32 kind) {
         default: return 0;
     }
     if (kind == 0) { return (i32)t->calls; }
+    /* kind 2 peeks the pixel counter without clearing it: a single frame's cost
+     * is read as a difference between two peeks, which must not disturb the
+     * per-batch totals the profiler prints from kind 1. */
+    if (kind == 2) { return (i32)(t->px / 1000); }
     i32 kpx = (i32)(t->px / 1000);
     t->calls = 0;
     t->px = 0;
@@ -542,13 +575,13 @@ EXPORT void zan_gui_fill_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 co
     if (area < 0) area = 0;
     if (sa == 255) {
         ZAN_STAT(g_st_fill_op, area);
+        stat_top_rect(1, (int)area, x0, y0, x1 - x0, y1 - y0, c);
         for (int py = y0; py < y1; py++) {
-            u32 *row = s->pixels + py * s->stride;
-            for (int px = x0; px < x1; px++) row[px] = c;
+            fill_run_const(s->pixels + py * s->stride + x0, x1 - x0, c);
         }
     } else if (sa != 0) {
         ZAN_STAT(g_st_fill_blend, area);
-        stat_top_blend((int)area, x0, y0, x1 - x0, y1 - y0, c);
+        stat_top_rect(0, (int)area, x0, y0, x1 - x0, y1 - y0, c);
         /* Rect is already clamped to the clip window, so blend straight into
          * the row instead of re-clipping every pixel via set_pixel -- these
          * translucent fills (scrims, hover/selection tints) cover large areas. */

@@ -27,6 +27,45 @@ partial class ZanIDE {
         return ZanIDE.CacheDir() + "/sessions/" + ZanIDE.PathKey(root) + ".db";
     }
 
+    // 会话库的常驻连接。流式回答的时候记录每几秒就要写回一行，而
+    // 「开库 → 建表 → 写一行 → 关库」里真正的活只是最后那一步：
+    // 每次重新开库都要过一遍 WAL 恢复、schema 解析和两条 CREATE TABLE
+    // IF NOT EXISTS，这笔同步文件 I/O 就落在绘制那一帧里（实测一次
+    // 自动保存卡掉 27ms）。同一份库就把连接留着，换项目或连接断了
+    // 才重开。
+    static SqliteConnection gSessDb;
+    static string gSessDbPath;
+
+    /// 这份会话库的连接（首次打开时建表并开 WAL）；打不开返回 null。
+    static SqliteConnection SessDb(string dbp) {
+        if (ZanIDE.gSessDb != null && ZanIDE.gSessDbPath == dbp
+                && ZanIDE.gSessDb.IsConnected()) {
+            return ZanIDE.gSessDb;
+        }
+        ZanIDE.CloseSessDb();
+        ZanIDE.EnsureCacheDir();
+        Directory.CreateDirectoryRecursive(ZanIDE.DirOf(dbp));
+        SqliteConnection db = SqliteConnection.Open(dbp);
+        if (db == null || !db.IsConnected()) { return null; }
+        db.Execute("PRAGMA journal_mode=WAL");
+        db.Execute("PRAGMA synchronous=NORMAL");
+        db.Execute("CREATE TABLE IF NOT EXISTS sessions ("
+            + "id INTEGER PRIMARY KEY, pack TEXT NOT NULL)");
+        db.Execute("CREATE TABLE IF NOT EXISTS meta ("
+            + "key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+        ZanIDE.gSessDb = db;
+        ZanIDE.gSessDbPath = dbp;
+        return db;
+    }
+
+    /// 放掉常驻连接（换项目、或一次操作出错后让下一次重开）。
+    static void CloseSessDb() {
+        if (ZanIDE.gSessDb == null) { return; }
+        ZanIDE.gSessDb.Close();
+        ZanIDE.gSessDb = null;
+        ZanIDE.gSessDbPath = "";
+    }
+
     static string SharedSessionsDbPath() {
         return ZanIDE.CacheDir() + "/ai_sessions.db";
     }
@@ -132,26 +171,16 @@ partial class ZanIDE {
     /// 多就是一笔白花的开销。
     void SaveAiSession(int idx) {
         if (idx < 0 || idx >= aiSessions.Count) { return; }
-        SqliteConnection db = null;
         try {
-            ZanIDE.EnsureCacheDir();
-            string dbp = this.AiSessionsDbPath();
-            Directory.CreateDirectoryRecursive(ZanIDE.DirOf(dbp));
-            db = SqliteConnection.Open(dbp);
-            if (db == null || !db.IsConnected()) { return; }
-            db.Execute("CREATE TABLE IF NOT EXISTS sessions ("
-                + "id INTEGER PRIMARY KEY, pack TEXT NOT NULL)");
-            db.Execute("CREATE TABLE IF NOT EXISTS meta ("
-                + "key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+            SqliteConnection db = ZanIDE.SessDb(this.AiSessionsDbPath());
+            if (db == null) { return; }
             db.Execute("INSERT OR REPLACE INTO sessions (id, pack) VALUES (?, ?)",
                 new DbParams().AddInt(idx).Add(aiSessions[idx].pack));
             db.Execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('cur', ?)",
                 new DbParams().Add(Convert.ToString(aiSessCur)));
         } catch (Exception e) {
             // Never let a storage failure crash the IDE's main loop.
-            int skip = 0;
-        } finally {
-            if (db != null) { db.Close(); }
+            ZanIDE.CloseSessDb();
         }
     }
 
@@ -168,17 +197,9 @@ partial class ZanIDE {
             if (ai > 0) { archCsv = archCsv + ","; }
             archCsv = archCsv + Convert.ToString(aiSessions[ai].archived);
         }
-        SqliteConnection db = null;
         try {
-            ZanIDE.EnsureCacheDir();
-            string dbp = this.AiSessionsDbPath();
-            Directory.CreateDirectoryRecursive(ZanIDE.DirOf(dbp));
-            db = SqliteConnection.Open(dbp);
-            if (db == null || !db.IsConnected()) { return; }
-            db.Execute("CREATE TABLE IF NOT EXISTS sessions ("
-                + "id INTEGER PRIMARY KEY, pack TEXT NOT NULL)");
-            db.Execute("CREATE TABLE IF NOT EXISTS meta ("
-                + "key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+            SqliteConnection db = ZanIDE.SessDb(this.AiSessionsDbPath());
+            if (db == null) { return; }
             db.Execute("DELETE FROM sessions");
             for (int i = 0; i < aiSessions.Count; i = i + 1) {
                 db.Execute("INSERT INTO sessions (id, pack) VALUES (?, ?)",
@@ -199,9 +220,7 @@ partial class ZanIDE {
                 new DbParams().Add(Json.Serialize<AiTitlesDoc>(td)));
         } catch (Exception e) {
             // Never let a storage failure crash the IDE's main loop.
-            int skip = 0;
-        } finally {
-            if (db != null) { db.Close(); }
+            ZanIDE.CloseSessDb();
         }
     }
 
@@ -284,10 +303,9 @@ partial class ZanIDE {
             }
         }
         if (File.Exists(aiSessDbPath)) {
-            SqliteConnection db = null;
             try {
-                db = SqliteConnection.Open(aiSessDbPath);
-                if (db != null && db.IsConnected()) {
+                SqliteConnection db = ZanIDE.SessDb(aiSessDbPath);
+                if (db != null) {
                     DbResult rs = db.Query("SELECT id, pack FROM sessions ORDER BY id");
                     for (int r = 0; r < rs.RowCount(); r = r + 1) {
                         aiSessions.Add(AiSession.Create(rs.GetString(r, 1), 0));
@@ -317,11 +335,10 @@ partial class ZanIDE {
                     aiSessCur = c;
                 }
             } catch (Exception e) {
+                ZanIDE.CloseSessDb();
                 if (aiSessions.Count == 0) {
                     aiSessions.Add(AiSession.Create("", 0)); aiSessCur = 0;
                 }
-            } finally {
-                if (db != null) { db.Close(); }
             }
         } else {
             if (aiSessions.Count == 0) {

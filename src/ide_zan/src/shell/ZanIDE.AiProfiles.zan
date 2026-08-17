@@ -769,6 +769,12 @@ partial class ZanIDE {
         // stream_options.include_usage: OpenAI-compatible endpoints only put
         // the token counts in the final chunk of a stream when asked, and the
         // usage card is only honest when they arrive.
+        // 每一拍发请求都发生在 UI 线程的那一帧里（点发送、工具跑完续跑、
+        // 重试），所以这里花掉的毫秒就是那一帧的卡顿。开着 ZAN_FRAME_PROF
+        // 时按阶段记一行，好分清是项目参考的磁盘扫描、上下文拼装、JSON
+        // 序列化还是前缀比对在吃时间。
+        int aiT0 = 0;
+        if (App.PerfOn()) { aiT0 = Window.GetTickMs(); }
         AiChatBodyMaxDoc body = new AiChatBodyMaxDoc();
         body.model = model;
         body.stream = true;
@@ -798,6 +804,8 @@ partial class ZanIDE {
         // code point），而那些字节可能来自任何一份读进来的文件或命令输出。
         sys.content = AiAgent.SafeUtf8(sysMsg);
         body.messages.Add(sys);
+        int aiT1 = 0;
+        if (App.PerfOn()) { aiT1 = Window.GetTickMs(); }
         // Fold the oldest turns into a digest once the transcript passes the
         // budget, so a long agent session keeps working instead of growing
         // until it overflows the model's context window.
@@ -834,6 +842,8 @@ partial class ZanIDE {
         // 整段对话仍然逐字节等于上一拍的前缀，于是供应商的 prompt 缓存能命中
         // 到「上一拍为止的全部内容」。角色用 user：OpenAI 兼容端点（含本地
         // 模型）都收 user，而尾部的 system 有的实现会忽略。
+        int aiT2 = 0;
+        if (App.PerfOn()) { aiT2 = Window.GetTickMs(); }
         ChatMessageDoc ctxMsg = new ChatMessageDoc();
         ctxMsg.role = "user";
         string ctxBody = AiAgent.ContextBlock(ctxName, ctxCode, projRoot);
@@ -843,6 +853,8 @@ partial class ZanIDE {
         // Apply the enabled model's configured maximum output length. With no
         // cap configured the key must be ABSENT, so the base type is what gets
         // serialized -- sending "max_tokens": null is a type error server-side.
+        int aiT3 = 0;
+        if (App.PerfOn()) { aiT3 = Window.GetTickMs(); }
         int maxOut = AiAgent.MaxOutTokensOf(model);
         string payload = "";
         if (maxOut > 0) {
@@ -853,7 +865,11 @@ partial class ZanIDE {
         }
         // 这一拍的请求体跟上一拍到底有多少字节是逐字相同的前缀：供应商报的
         // cached_tokens 让人觉得不对的时候，只有这个数能分清是谁的问题。
+        int aiT4 = 0;
+        if (App.PerfOn()) { aiT4 = Window.GetTickMs(); }
         ZanIDE.AiPrefixNote(model, payload);
+        int aiT5 = 0;
+        if (App.PerfOn()) { aiT5 = Window.GetTickMs(); }
         // The request is made with the Net standard library on a worker
         // thread that streams the decoded response into an in-memory sink;
         // the panel reads the sink each frame for incremental output.
@@ -865,6 +881,18 @@ partial class ZanIDE {
         // retry, continue) actually goes out, so the usage panel can never
         // drift from what was really sent.
         if (serr == "") { ZanIDE.aiStatReqs = ZanIDE.aiStatReqs + 1; }
+        if (App.PerfOn()) {
+            int aiT6 = Window.GetTickMs();
+            File.AppendAllText("zan_frame_perf.log",
+                "  ailaunch total_ms=" + Convert.ToString(aiT6 - aiT0)
+                + " sys_ms=" + Convert.ToString(aiT1 - aiT0)
+                + " hist_ms=" + Convert.ToString(aiT2 - aiT1)
+                + " ctx_ms=" + Convert.ToString(aiT3 - aiT2)
+                + " json_ms=" + Convert.ToString(aiT4 - aiT3)
+                + " prefix_ms=" + Convert.ToString(aiT5 - aiT4)
+                + " start_ms=" + Convert.ToString(aiT6 - aiT5)
+                + " bytes=" + Convert.ToString(payload.Length) + "\n");
+        }
         return serr;
     }
 
