@@ -170,6 +170,11 @@ static u32 blend_over(u32 dst, u32 src) {
  *     the range of s*sa + d*(255-sa).
  * The output is bit-identical to blend_over. Destinations that are not opaque
  * (shaped/glass windows clear the surface to alpha 0) take the general path. */
+/* Pixels of translucent fills taken by the 4-wide path vs. the one-at-a-time
+ * path, so a profile can tell "blending is expensive" from "blending fell off
+ * its fast path" (see zan_gui_stat_read idx 11/12). */
+static long long g_blend_px_simd, g_blend_px_scalar;
+
 static void blend_run_const(u32 *row, int n, u32 src) {
     u32 sa = (src >> 24) & 0xFF;
     if (sa == 0 || n <= 0) return;
@@ -198,6 +203,7 @@ static void blend_run_const(u32 *row, int n, u32 src) {
             __m128i d = _mm_loadu_si128((const __m128i *)(row + i));
             __m128i da = _mm_and_si128(d, amask);
             if (_mm_movemask_epi8(_mm_cmpeq_epi8(da, amask)) != 0xFFFF) break;
+            g_blend_px_simd += 4;
             __m128i lo = _mm_add_epi16(_mm_mullo_epi16(_mm_unpacklo_epi8(d, zero), invv), sLo);
             __m128i hi = _mm_add_epi16(_mm_mullo_epi16(_mm_unpackhi_epi8(d, zero), invv), sHi);
             lo = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(lo, one), _mm_srli_epi16(lo, 8)), 8);
@@ -207,6 +213,7 @@ static void blend_run_const(u32 *row, int n, u32 src) {
         }
     }
 #endif
+    g_blend_px_scalar += n - i;
     for (; i < n; i++) {
         u32 d = row[i];
         if ((d >> 24) != 0xFFu) { row[i] = blend_over(d, src); continue; }
@@ -504,6 +511,14 @@ EXPORT i32 zan_gui_stat_read(i32 idx, i32 kind) {
         case 8: t = &g_st_snap; break;
         case 9: t = &g_st_restore; break;
         case 10: t = &g_st_glyph; break;
+        case 11:
+        case 12: {
+            long long *px = idx == 11 ? &g_blend_px_simd : &g_blend_px_scalar;
+            if (kind == 0) { return 0; }
+            i32 kpx = (i32)(*px / 1000);
+            *px = 0;
+            return kpx;
+        }
         default: return 0;
     }
     if (kind == 0) { return (i32)t->calls; }

@@ -512,6 +512,20 @@ partial class ZanIDE {
         }
     }
 
+    /// 后台活儿（构建、发布、程序输出、git、小助手请求）下一拍的重绘：
+    /// 只声明这一拍可能变化的那块像素——那块面板自己。
+    ///
+    /// 这些轮询过去都用整窗的 RequestAnimationFrame 排下一拍，于是模型
+    /// 在想、编译器在跑的那几十秒里，屏上只有一个转圈在动，IDE 却按
+    /// 4~12 帧/秒把整个窗口（磨砂主题还要重新模糊一遍背景）重画一遍：
+    /// 这就是「小助手一干活 CPU 就上去」的那份活。声明了范围之后，
+    /// 由这一拍唤醒的帧走损伤裁剪，只有那块面板被重画；真有内容变化
+    /// 的时候各处照旧调 RequestRedraw，整窗帧一帧都没少。面板被收起
+    /// （停到屏外）时范围为空，这一拍就只跑轮询逻辑、几乎不画东西。
+    void PollNextIn(App app, int ms, Rect r) {
+        app.RequestAnimationFrameIn(ms, r.x, r.y, r.width, r.height);
+    }
+
     /// Paints the whole shell into the current frame. Called by
     /// IdeSurface.OnPaint inside Form.Run()'s retained loop (which already
     /// began the frame and will present it), so the frame must not call
@@ -1257,7 +1271,7 @@ partial class ZanIDE {
                     coLog.Reset();
                     app.RequestRedraw();
                 }
-                app.RequestAnimationFrame(250);
+                this.PollNextIn(app, 250, orr);
             }
             // Mirror a launched console program's output into the Output tab.
             if (runStreaming) {
@@ -1280,7 +1294,7 @@ partial class ZanIDE {
                     }
                     runStreaming = false;
                 }
-                app.RequestAnimationFrame(250);
+                this.PollNextIn(app, 250, orr);
             }
             // Save-triggered hot reload (autoRun ON): rebuild + restart the
             // active target in a DETACHED shell so saving never freezes the
@@ -1327,7 +1341,7 @@ partial class ZanIDE {
                     gitJob = 0;
                     app.RequestRedraw();
                 } else {
-                    app.RequestAnimationFrame(120);
+                    this.PollNextIn(app, 120, dock.ContentParked("git"));
                 }
             }
             // Poll the on-disk symbol index: a background EmitSymbolsDetach
@@ -1515,7 +1529,7 @@ partial class ZanIDE {
                     coLog.Reset();
                     app.RequestRedraw();
                 }
-                app.RequestAnimationFrame(80);
+                this.PollNextIn(app, 80, orr);
             }
             // ui_check in flight: the target is being driven by the
             // UiDriver script. Wait (without blocking) for its done-marker
@@ -1555,7 +1569,7 @@ partial class ZanIDE {
                     this.AiChatToEnd();
                     app.RequestRedraw();
                 } else {
-                    app.RequestAnimationFrame(150);
+                    this.PollNextIn(app, 150, dock.ContentParked("ai"));
                 }
             }
             // Poll the in-flight detached publish: compiler output streams
@@ -1625,7 +1639,7 @@ partial class ZanIDE {
                     coLog.Reset();
                     app.RequestRedraw();
                 }
-                app.RequestAnimationFrame(250);
+                this.PollNextIn(app, 250, orr);
             }
             // Poll the in-flight AI request. The Net worker thread streams
             // the decoded response body into an in-memory sink as it
@@ -1641,11 +1655,11 @@ partial class ZanIDE {
                 if (aiJob != null) { this.AiWorkFinish(aiJob); }
                 bool aiToolRunning = buildBusy || aiUiRunning || runStreaming
                     || AiWork.Busy();
-                // 这一拍之后隔多久再重绘。这个数字直接乘在 CPU 上：每一拍都是
-                // 一帧整窗重绘（磨砂主题还要重新模糊一遍背景），而模型在想、
-                // 工具在跑的那几十秒里屏上只有一个转圈在动，10~12 帧/秒全窗
-                // 重绘全花在转圈上。有新文本在流的时候才跟到 100ms（看得出
-                // 字在一个个蹦），其余时候 250ms 一拍转圈照样转。
+                // 这一拍之后隔多久再取一次流。这个数字直接乘在 CPU 上，所以
+                // 有新文本在流的时候才跟到 100ms（看得出字在一个个蹦），其余
+                // 时候 250ms 一拍转圈照样转。这一拍本身只声明助手面板那块像素
+                // （PollNextIn），模型在想的那几十秒里唤醒的是局部帧，而不是
+                // 每秒 4~10 次整窗重绘 + 重新模糊背景。
                 int aiPollMs = 250;
                 if (aiToolRunning) {
                     aiWaitStart = 0;
@@ -1967,7 +1981,7 @@ partial class ZanIDE {
                 // （一个核心跑满，界面跟着发洩），而流式文本每 100ms 追一次
                 // 已经看不出差别。节奏见上面 aiPollMs：真有文本在流才 100ms，
                 // 模型在想 / 工具在跑就 250ms。构建 / 运行 / 发布的轮询同理。
-                app.RequestAnimationFrame(aiPollMs);
+                this.PollNextIn(app, aiPollMs, dock.ContentParked("ai"));
             }
 
             // Autosave the AI transcript (throttled to 1/s): every new user

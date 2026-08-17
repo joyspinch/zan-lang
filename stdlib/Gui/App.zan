@@ -248,6 +248,12 @@ class App {
     int perfFrames;
     int perfRenderMs;
     int perfPresentMs;
+    // 损伤裁剪帧单独记账：整窗帧和只重画一条损伤带的帧成本差一个
+    // 数量级，混在一个平均值里两个目标（整窗 ≤8ms、局部 ≤2ms）都看
+    // 不出来。partial=0 而循环一直在转，就说明有人在用整窗帧做轮询。
+    int perfPartFrames;
+    int perfPartRenderMs;
+    int perfPartPresentMs;
     int perfBeginMs;
     int perfFxMs;
     int perfOverlayMs;
@@ -469,6 +475,9 @@ class App {
         this.perfFrames = 0;
         this.perfRenderMs = 0;
         this.perfPresentMs = 0;
+        this.perfPartFrames = 0;
+        this.perfPartRenderMs = 0;
+        this.perfPartPresentMs = 0;
         this.perfBeginMs = 0;
         this.lastPresentMs = 0;
         this.perfLoopAt = 0;
@@ -2029,6 +2038,17 @@ class App {
         int y0 = y - pad;
         int x1 = x + w + pad;
         int y1 = y + h + pad;
+        // 声明的范围整块落在画布外（收起的面板停在屏外、滚出视口的
+        // 行）：它一个可见像素也改不了，所以这一拍不是「不知道范围」
+        // 而是「范围为空」——退回整窗重绘反而把最省的情形变成最贵的
+        // 那一种。收缩成 1 像素的损伤：循环照样按时醒来跑轮询逻辑，
+        // 却几乎不画东西。
+        if (x1 <= 0 || y1 <= 0 || x0 >= canvas.Width() || y0 >= canvas.Height()) {
+            x0 = 0;
+            y0 = 0;
+            x1 = 1;
+            y1 = 1;
+        }
         if (animRectValid) {
             if (animRX < x0) { x0 = animRX; }
             if (animRY < y0) { y0 = animRY; }
@@ -3000,14 +3020,28 @@ class App {
         window.Present(canvas);
         if (App.PerfOn()) {
             int endMs = Window.GetTickMs();
-            perfRenderMs = perfRenderMs + (perfPreMs - perfBeginMs);
-            perfPresentMs = perfPresentMs + (endMs - perfPreMs);
+            if (partialFrame) {
+                perfPartFrames = perfPartFrames + 1;
+                perfPartRenderMs = perfPartRenderMs + (perfPreMs - perfBeginMs);
+                perfPartPresentMs = perfPartPresentMs + (endMs - perfPreMs);
+            } else {
+                perfRenderMs = perfRenderMs + (perfPreMs - perfBeginMs);
+                perfPresentMs = perfPresentMs + (endMs - perfPreMs);
+            }
             perfFrames = perfFrames + 1;
             if (perfFrames >= 30) {
+                int fullN = perfFrames - perfPartFrames;
+                if (fullN <= 0) { fullN = 1; }
+                int partN = perfPartFrames;
+                if (partN <= 0) { partN = 1; }
                 File.AppendAllText("zan_frame_perf.log",
                     "frames=" + Convert.ToString(perfFrames)
-                    + " render_ms=" + Convert.ToString(perfRenderMs / perfFrames)
-                    + " present_ms=" + Convert.ToString(perfPresentMs / perfFrames)
+                    + " full=" + Convert.ToString(perfFrames - perfPartFrames)
+                    + " render_ms=" + Convert.ToString(perfRenderMs / fullN)
+                    + " present_ms=" + Convert.ToString(perfPresentMs / fullN)
+                    + " partial=" + Convert.ToString(perfPartFrames)
+                    + " part_render_ms=" + Convert.ToString(perfPartRenderMs / partN)
+                    + " part_present_ms=" + Convert.ToString(perfPartPresentMs / partN)
                     + " overlay_ms=" + Convert.ToString(perfOverlayMs / perfFrames)
                     + " fx_ms=" + Convert.ToString(perfFxMs / perfFrames)
                     + " surface=" + Convert.ToString(canvas.Width())
@@ -3017,6 +3051,9 @@ class App {
                 perfFrames = 0;
                 perfRenderMs = 0;
                 perfPresentMs = 0;
+                perfPartFrames = 0;
+                perfPartRenderMs = 0;
+                perfPartPresentMs = 0;
                 perfOverlayMs = 0;
                 perfFxMs = 0;
             }
@@ -3100,7 +3137,9 @@ class App {
             "img",
             "snap",
             "restore",
-            "glyph" };
+            "glyph",
+            "bsimd",
+            "bscalar" };
         string line = "";
         for (int i = 0; i < names.Count; i = i + 1) {
             int calls = Canvas.RasterStat(i, 0);
