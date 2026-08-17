@@ -549,6 +549,149 @@ class AiAgent {
         return outSteps.Count;
     }
 
+    /// The plan a `plan` call asks for, with the previous plan's ticks carried
+    /// over: steps are matched by their text, so a model that resends its
+    /// checklist without repeating every "[x] " does not un-finish work that is
+    /// already done. Returns a NEW list (the strip rebinds on identity change).
+    ///
+    /// Losing those ticks is what made a long task look aimless: the checklist
+    /// reset to all-unfinished, so "the next unfinished step" pointed back at
+    /// step 1 and the assistant redid or skipped around work it had finished.
+    static List<AiPlanStep> MergePlan(string json, List<AiPlanStep> prev) {
+        List<AiPlanStep> fresh = new List<AiPlanStep>();
+        AiAgent.ParsePlan(json, fresh);
+        for (int i = 0; i < fresh.Count; i = i + 1) {
+            if (fresh[i].done != 0) { continue; }
+            if (AiAgent.WasDone(prev, fresh[i].text)) { fresh[i].done = 1; }
+        }
+        return fresh;
+    }
+
+    /// Was this step (matched by text) already ticked in that plan?
+    static bool WasDone(List<AiPlanStep> plan, string text) {
+        if (plan == null) { return false; }
+        for (int i = 0; i < plan.Count; i = i + 1) {
+            if (plan[i].text == text) { return plan[i].done != 0; }
+        }
+        return false;
+    }
+
+    static int PlanDone(List<AiPlanStep> plan) {
+        int n = 0;
+        if (plan == null) { return 0; }
+        for (int i = 0; i < plan.Count; i = i + 1) {
+            if (plan[i].done != 0) { n = n + 1; }
+        }
+        return n;
+    }
+
+    /// The step being worked on -- the first unticked one -- as "3/7 <text>",
+    /// or "" when the plan is empty or fully ticked. This is the one place that
+    /// decides "where we are", so the strip, the context block and the continue
+    /// nudge all name the same step.
+    static string CurStepText(List<AiPlanStep> plan) {
+        if (plan == null) { return ""; }
+        for (int i = 0; i < plan.Count; i = i + 1) {
+            if (plan[i].done == 0) {
+                return Convert.ToString(i + 1) + "/"
+                    + Convert.ToString(plan.Count) + " " + plan[i].text;
+            }
+        }
+        return "";
+    }
+
+    /// What the `plan` tool answers with: the resulting counts, the step now
+    /// current, and -- when the model rewrote its checklist instead of ticking
+    /// it -- how many steps it dropped. Naming the churn is what stops it: the
+    /// model only sees its plan through this reply.
+    static string PlanNote(List<AiPlanStep> prev, List<AiPlanStep> next) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("\nplan updated: " + Convert.ToString(next.Count)
+            + " step(s), " + Convert.ToString(AiAgent.PlanDone(next))
+            + " done.");
+        string cur = AiAgent.CurStepText(next);
+        if (cur != "") {
+            sb.Append(" current step: " + cur + ".");
+        } else {
+            sb.Append(" every step is ticked: say in one line what you"
+                + " delivered and stop.");
+        }
+        int gone = 0;
+        if (prev != null) {
+            for (int i = 0; i < prev.Count; i = i + 1) {
+                bool kept = false;
+                for (int j = 0; j < next.Count && !kept; j = j + 1) {
+                    if (next[j].text == prev[i].text) { kept = true; }
+                }
+                if (!kept) { gone = gone + 1; }
+            }
+        }
+        if (gone > 0) {
+            sb.Append(" NOTE: " + Convert.ToString(gone) + " step(s) of the"
+                + " previous plan are gone. Rewording a step loses its [x] and"
+                + " reads as starting over -- keep the wording of a step"
+                + " identical for the whole task, and only add or remove a step"
+                + " when the plan really changed (then say why in one line).");
+        }
+        return sb.ToString();
+    }
+
+    /// 单人模式那份计划在提示词里的样子（团队模式的对应物是任务图那块板）：
+    /// 整张清单、当前那一步、以及「一步一步来」的规矩。由宿主在计划变化时写
+    /// 进来（`SetPlanBoard`），每一拍作为现场的一部分发出去。
+    ///
+    /// 不发这一段，模型就只能从对话历史里回忆自己的清单——而历史会被压缩，
+    /// 摘要里那份清单是几拍之前的：于是它一会儿跳到第 5 步、一会儿回头重做第
+    /// 2 步，看着毫无逻辑。
+    static string gPlanBoard;
+
+    static void SetPlanBoard(string s) { AiAgent.gPlanBoard = s; }
+
+    static string PlanBoard() {
+        if (AiAgent.gPlanBoard == null) { return ""; }
+        return AiAgent.gPlanBoard;
+    }
+
+    /// 把一份计划拼成上面那一段。空计划返回 ""。
+    static string PlanBlock(List<AiPlanStep> plan) {
+        if (plan == null || plan.Count == 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("YOUR PLAN (the checklist above the chat, "
+            + Convert.ToString(AiAgent.PlanDone(plan)) + "/"
+            + Convert.ToString(plan.Count) + " done; this is the live copy --"
+            + " trust it over any plan text earlier in the conversation):\n");
+        for (int i = 0; i < plan.Count; i = i + 1) {
+            string mark = "[ ]";
+            if (plan[i].done != 0) { mark = "[x]"; }
+            string lead = "  ";
+            if (plan[i].done == 0 && AiAgent.PlanFirstOpen(plan) == i) {
+                lead = "->";
+            }
+            sb.Append(lead + " " + Convert.ToString(i + 1) + ". " + mark + " "
+                + plan[i].text + "\n");
+        }
+        string cur = AiAgent.CurStepText(plan);
+        if (cur != "") {
+            sb.Append("Work the step marked -> (" + cur + ") to the end before"
+                + " you touch any later step; when it is really done, resend"
+                + " the plan with it marked [x]. Do not jump ahead and do not"
+                + " reword the steps.\n\n");
+        } else {
+            sb.Append("Every step is ticked: report what you delivered in one"
+                + " line and stop instead of finding new work.\n\n");
+        }
+        return sb.ToString();
+    }
+
+    /// 第一条没打勾的下标（全打勾了返回 -1）。
+    static int PlanFirstOpen(List<AiPlanStep> plan) {
+        if (plan == null) { return -1; }
+        for (int i = 0; i < plan.Count; i = i + 1) {
+            if (plan[i].done == 0) { return i; }
+        }
+        return -1;
+    }
+
     /// How many times one request is resent by the panel after a transport
     /// failure before the error reaches the user (the Net layer retries within
     /// a request too, so this is the outer, visible loop).
@@ -618,16 +761,28 @@ class AiAgent {
 
     /// The nudge that keeps a multi-step task moving without the user having
     /// to type "continue" after every pause.
-    static string ContinuePrompt(bool limitHit) {
+    /// `curStep` = the step the checklist says is current ("3/7 <text>", "" when
+    /// there is no plan): naming it is what keeps the work in one place. The old
+    /// wording ("continue with the next unfinished step") left the choice to the
+    /// model, which after a compaction no longer knew which step that was.
+    static string ContinuePrompt(bool limitHit, string curStep) {
+        StringBuilder sb = new StringBuilder();
         if (limitHit) {
-            return "[auto] The per-question tool budget ran out mid-task."
-                + " Keep going from where you stopped: re-send the plan with"
-                + " the finished steps marked [x], then continue with the next"
-                + " step. Do not start over.";
+            sb.Append("[auto] The per-question tool budget ran out mid-task."
+                + " Keep going from where you stopped; do not start over.");
+        } else {
+            sb.Append("[auto] Continue.");
         }
-        return "[auto] Continue with the next unfinished step of the plan."
-            + " Re-send the plan with the finished steps marked [x] as you go."
-            + " When every step is done, say so in one line and stop.";
+        if (curStep != "") {
+            sb.Append(" The current step is " + curStep + " -- finish exactly"
+                + " that one, then resend the plan with it marked [x]. Do not"
+                + " start a later step, do not reopen a step already marked"
+                + " [x], and do not reword the plan.");
+        } else {
+            sb.Append(" Every planned step is marked [x]: say in one line what"
+                + " you delivered and stop.");
+        }
+        return sb.ToString();
     }
 
     /// 回复里明明想调用工具、却没能解析成工具块时，给模型的纠错提示（""=没有
@@ -1169,8 +1324,10 @@ class AiAgent {
             + "- plan {items}: show/update the task-plan checklist above the"
             + " chat. `items` is an array of short step strings (prefix"
             + " \"[x] \" to mark a step done); it replaces the current plan."
-            + " For a multi-step task, lay out a brief plan first, then resend"
-            + " it with steps marked done as you finish them. Runs silently.\n"
+            + " Steps are matched by their text, so keep each step's wording"
+            + " IDENTICAL for the whole task: reword it and it loses its [x]."
+            + " Aim for 3-8 steps, each one a change you can finish and verify"
+            + " on its own, in the order you will do them. Runs silently.\n"
             + "Action tools (the IDE asks the user to approve each one first,"
             + " unless they turned on Auto-execute):\n"
             + "- edit_file {path, old, new}: replace the UNIQUE occurrence of"
@@ -1218,10 +1375,21 @@ class AiAgent {
             + " rejects an action, do not repeat it -- propose something else or"
             + " ask.\n\n");
         sb.Append("WORKFLOW. Work in this order for every coding task:\n"
-            + "1. PLAN first. For any task that needs more than one edit or"
-            + " tool call, post a short checklist with the plan tool BEFORE the"
-            + " first action, resend it with steps marked [x] as they finish,"
-            + " and revise it when the situation changes the plan.\n"
+            + "1. PLAN first, then follow it top-down. For any task that needs"
+            + " more than one edit or tool call, post a short checklist with the"
+            + " plan tool BEFORE the first action.\n"
+            + "1a. ONE STEP AT A TIME. Every turn, work the first step that is"
+            + " not [x] (the current context block marks it with ->) and nothing"
+            + " else: retrieve for it, change code for it, verify it, then"
+            + " resend the plan with that step marked [x]. Do not start a later"
+            + " step while the current one is unfinished, and do not reopen a"
+            + " step that is already [x] -- if it turns out to be wrong, say so"
+            + " in one line and add a new step for the fix.\n"
+            + "1b. Revise the plan only when the situation really changed (you"
+            + " found the cause somewhere else, a step turned out unnecessary):"
+            + " say in one line what changed, then resend the plan keeping the"
+            + " wording of the steps that survive. Re-listing the same work in"
+            + " new words is not progress and loses your ticks.\n"
             + "2. RETRIEVE before acting. Read the code a change depends on"
             + " first (grep / read_file / stdlib_grep / api_search); find the"
             + " real source of a value before editing it. Never invent a file,"
@@ -1364,6 +1532,9 @@ class AiAgent {
                     + now + "\n");
             }
         }
+        // 单人模式那份计划：当前那一步在这里被指出来，模型于是不必从被压缩过
+        // 的历史里猜自己走到哪了。
+        sb.Append(AiAgent.PlanBoard());
         // 自己拆出来的任务图（含当前打开的节点、能开工的节点，以及怎么改
         // 它）。不告诉它图长什么样，它就只能把图当作一次性的清单发完就忘。
         sb.Append(AiTeam.Board());

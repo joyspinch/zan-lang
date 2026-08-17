@@ -419,12 +419,27 @@ partial class ZanIDE {
             // 一模一样的计划再发一遍不是进展：图已经在板上了，只会让所有人又
             // 围着需求转一圈。打了勾的重发内容不同，不会被拦。
             if (this.AiSeenTool("plan|" + AiAgent.Trim(call))) {
-                aiMsgs.Add(this.AiToolMsg("tool", AiAgent.Describe(call) + "\n"
-                    + ZanIDE.T("error: this plan is already on the board"
+                // 单人模式下重发同一份计划意味着「这一拍什么也没干」：告诉它
+                // 现在该做的是哪一步，而不是让它再琢磨一遍需求。
+                string pdup = ZanIDE.T("error: this plan is already on the board"
                         + " unchanged; assign the next ready node or start"
                         + " working on yours instead of re-planning.",
                         "error: 这份计划跟板上的一模一样：别再重发，"
-                        + "直接派单给下一个能开工的节点，或者动手做你自己那个。")));
+                        + "直接派单给下一个能开工的节点，或者动手做你自己那个。");
+                if (!aiTeamMode) {
+                    string pcur = AiAgent.CurStepText(aiPlan);
+                    pdup = "error: this plan is already on the board unchanged,"
+                        + " so this turn did nothing.";
+                    if (pcur != "") {
+                        pdup = pdup + " Start working on step " + pcur
+                            + " with a real tool call.";
+                    } else {
+                        pdup = pdup + " Every step is [x]: say in one line what"
+                            + " you delivered and stop.";
+                    }
+                }
+                aiMsgs.Add(this.AiToolMsg("tool", AiAgent.Describe(call) + "\n"
+                    + pdup));
                 aiIdleWhy = ZanIDE.T("the same unchanged plan was refused",
                     "重发的计划跟板上的一模一样，被拦下了");
                 string perr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
@@ -456,10 +471,12 @@ partial class ZanIDE {
                     pnote = pnote + " this node's checklist: " + pbrief + ".";
                 }
             } else {
-                aiPlan = new List<AiPlanStep>();
-                int nsteps = AiAgent.ParsePlan(call, aiPlan);
-                pnote = "\nplan updated: " + Convert.ToString(nsteps)
-                    + " step(s).";
+                // 已经打过勾的活按文本认人带过来：模型重发清单时没把每条
+                // 「[x]」都拄上，不该把干完的活变回没做——否则「下一步」又回到
+                // 第一步，整个流程看着就是在原地跳。
+                List<AiPlanStep> prevPlan = aiPlan;
+                aiPlan = AiAgent.MergePlan(call, prevPlan);
+                pnote = AiAgent.PlanNote(prevPlan, aiPlan);
             }
             aiMsgs.Add(this.AiToolMsg("tool",
                 AiAgent.Describe(call) + pnote));
@@ -693,5 +710,16 @@ partial class ZanIDE {
             if (steps[i].done == 0) { return true; }
         }
         return false;
+    }
+
+    /// 这一拍该做的那一步（"3/7 <正文>"，没有计划时 ""）。跟上面同一份清单，
+    /// 只是把「还有活」换成「是哪件活」，好让自动继续那句点名它。
+    string AiCurStep() {
+        List<AiPlanStep> steps = aiPlan;
+        if (aiTeamMode) {
+            steps = AiTaskPlan.ItemsOf(
+                AiTeam.TaskOf(aiTasks, aiTeamSt.activeTask));
+        }
+        return AiAgent.CurStepText(steps);
     }
 }
