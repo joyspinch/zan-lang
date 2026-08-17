@@ -23,6 +23,13 @@ class ChatMsgDoc {
     string k;
     string ti;
     int pg;
+    /// 这一拍发出的工具调用（留档给模型看它自己的格式）。旧存档里没有 -> ""。
+    string c;
+    /// 这条消息的时刻（Unix 秒，UTC）。旧存档里没有 -> 0，重新打开
+    /// 时头行就不显示时刻（而不是把旧消息全标成打开存档的那一刻）。存成
+    /// int 而不是 long：这份存档里每一个数字字段都是 int，Unix 秒到
+    /// 2038 年前都在 int 范围内。
+    int at;
 }
 
 class ChatPlanStepDoc {
@@ -49,6 +56,11 @@ class ChatPackDoc {
     int tm;
     string ts;
     List<ChatTaskDoc> tk;
+    // 这个会话正在跑的那次交付（AiRun 的 JSON）。跟着会话存，是因为「跑到
+    // 第几拍」属于某一段对话：以前它只按项目存一份，于是新建会话、切到别的
+    // 会话，顶上那排阶段圆点还挂着上一段对话的进度。旧存档里没有这个键 ->
+    // ""，也就是「这个会话没有在跑的交付」，跟旧行为一致。
+    string rn;
 }
 
 /// Mutable holder for the team half of a session archive, so ChatUnpack can
@@ -58,12 +70,15 @@ class ChatTeamSave {
     int on;
     AiTeamState st;
     List<AiTask> tasks;
+    /// 这个会话那次交付的检查点（AiRun 的 JSON），"" = 没有在跑的交付。
+    string run;
 
     static ChatTeamSave Create() {
         ChatTeamSave s = new ChatTeamSave();
         s.on = 0;
         s.st = AiTeamState.Create();
         s.tasks = new List<AiTask>();
+        s.run = "";
         return s;
     }
 }
@@ -172,6 +187,7 @@ class ChatArea {
         ChatPackDoc o = new ChatPackDoc();
         o.tm = team.on;
         o.ts = AiTeam.PackState(team.st);
+        o.rn = team.run;
         o.tk = new List<ChatTaskDoc>();
         for (int q = 0; q < team.tasks.Count; q = q + 1) {
             ChatTaskDoc td = new ChatTaskDoc();
@@ -193,6 +209,8 @@ class ChatArea {
             m.k = msgs[i].kind;
             m.ti = msgs[i].taskId;
             m.pg = msgs[i].progress;
+            m.c = msgs[i].call;
+            m.at = (int)msgs[i].at;
             o.m.Add(m);
         }
         o.plan = new List<ChatPlanStepDoc>();
@@ -217,6 +235,7 @@ class ChatArea {
         if (v == null || v.m == null) { return; }
         team.on = v.tm;
         team.st = AiTeam.UnpackState(v.ts);
+        team.run = v.rn;
         team.tasks = new List<AiTask>();
         if (v.tk != null) {
             for (int q = 0; q < v.tk.Count; q = q + 1) {
@@ -234,6 +253,11 @@ class ChatArea {
             m.kind = v.m[i].k;
             m.taskId = v.m[i].ti;
             m.progress = v.m[i].pg;
+            m.call = v.m[i].c;
+            // 存档里的时刻要盖回去：Create 给的是「现在」，不盖就是把一整份
+            // 历史记录都标成打开它的那一刻。旧存档没这个字段 -> 0，头行
+            // 不显示时刻。
+            m.at = (long)v.m[i].at;
             msgs.Add(m);
         }
         if (v.plan != null) {
@@ -342,6 +366,31 @@ class ChatArea {
             textW, thinkOpen, toolOpen, cache);
     }
 
+    /// Closes a turn by flagging its last row; StyledText draws that as a
+    /// hairline under the block instead of costing a whole blank row.
+    static void MarkBlockEnd(List<TextRun> cache) {
+        if (cache.Count > 0) { cache[cache.Count - 1].last = true; }
+    }
+
+    /// Whether this body line is dropped: paragraph gaps collapse to one blank
+    /// row, and a blank right after a name / fold row is not kept at all.
+    static bool SkipBlank(List<TextRun> cache, string s) {
+        if (s != "") { return false; }
+        if (cache.Count == 0) { return true; }
+        TextRun prev = cache[cache.Count - 1];
+        if (prev.kind == 3 || prev.kind == 4 || prev.kind == 5) { return true; }
+        return prev.text == "";
+    }
+
+    /// Drops trailing blank body rows past `floorIdx`.
+    static void TrimTrailBlank(List<TextRun> cache, int floorIdx) {
+        while (cache.Count > floorIdx
+            && cache[cache.Count - 1].kind == 0
+            && cache[cache.Count - 1].text == "") {
+            cache.RemoveAt(cache.Count - 1);
+        }
+    }
+
     /// Speaker code of a transcript role, used to tint whole message blocks:
     /// 0 = you, 1 = Xiao Zan, 2 = tool, 3 = error.
     static int RoleCode(string role) {
@@ -378,6 +427,15 @@ class ChatArea {
                 head = ZanIDE.T("You", "我");
                 headCol = t.primary;
                 headCls = "primary";
+                // 流程自己发的派单/催一脚必须以 user 角色进模型请求，但它们不是
+                // 用户说的话：写成「我」，用户看到的就是一屏自己没发过的消息。
+                if (AiTeam.IsAuto(msgs[i])) {
+                    head = ZanIDE.T("Dispatch", "派单");
+                    string dest = AiTeam.DisplayName(msgs[i].to);
+                    if (dest != "") { head = head + " → " + dest; }
+                    headCol = t.textTertiary;
+                    headCls = "";
+                }
             } else if (msgs[i].role == "error") {
                 head = ZanIDE.T("Error", "错误");
                 headCol = t.error;
@@ -439,10 +497,9 @@ class ChatArea {
                             cache, bodyCol, 0);
                     }
                 }
+                ChatArea.TrimTrailBlank(cache, msgStart + 1);
                 ChatArea.OwnRows(cache, msgStart, 2);
-                TextRun tgap = TextRun.Create("", t.textTertiary, 6);
-                tgap.owner = 2;
-                cache.Add(tgap);
+                ChatArea.MarkBlockEnd(cache);
                 i = i + 1;
                 continue;
             }
@@ -533,21 +590,24 @@ class ChatArea {
                         kind = 2;
                         col = t.textPrimary;
                     }
-                    ChatArea.WrapRows(shown, textW, t.fontSizeSmall,
-                        cache, col, kind);
+                    if (!ChatArea.SkipBlank(cache, shown)) {
+                        ChatArea.WrapRows(shown, textW, t.fontSizeSmall,
+                            cache, col, kind);
+                    }
                 }
                 li = li + 1;
             }
             // owner[row] = which speaker this display row belongs to, so the
             // renderer can paint the whole message as one tinted block.
             int ownCode = ChatArea.RoleCode(msgs[i].role);
+            // 内部派单跟工具结果一样是流程噪音，不该染成「用户发言」那种块。
+            if (AiTeam.IsAuto(msgs[i])) { ownCode = 2; }
+            ChatArea.TrimTrailBlank(cache, msgStart + 1);
             ChatArea.OwnRows(cache, msgStart, ownCode);
-            // One unpainted spacer row closes a turn: with six members talking,
-            // tinted blocks that touch each other read as one wall of text. The
-            // spacer carries no tint and no rail, so the blocks separate.
-            TextRun gap = TextRun.Create("", t.textTertiary, 6);
-            gap.owner = ownCode;
-            cache.Add(gap);
+            // A hairline closes a turn: with six members talking, tinted blocks
+            // that touch each other read as one wall of text, while a whole
+            // blank row per turn left the transcript half empty.
+            ChatArea.MarkBlockEnd(cache);
             i = i + 1;
         }
         // meta[row] = the message index a kind-5 toggle row controls (else -1).

@@ -1,0 +1,112 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+/// 小赞面板左边那列会话：列表本身是 `SessionListNav`，这里只把标题算出来
+/// 并把它交回的动作（新建 / 切换 / 重命名 / 归档 / 删除）落到会话表上。
+///
+/// 从 `ZanIDE.AiPanel.zan` 里分出来，是因为这几件事跟画一帧面板没有关系：
+/// 它们改的是「有哪些会话、当前是哪个」，而那一帧的数据流在那边。
+partial class ZanIDE {
+
+    void AiRenderSessions(App app, Rect area) {
+        int rPad = app.Scale(6);
+        List<string> aiTitles = new List<string>();
+        List<int> aiArch = new List<int>();
+        for (int sti = 0; sti < aiSessions.Count; sti = sti + 1) {
+            string sTtl = aiSessions[sti].title;
+            if (sTtl == "") {
+                if (sti == aiSessCur) {
+                    sTtl = ChatArea.FirstUserOf(aiMsgs);
+                } else {
+                    // 从存档里取标题要解一遍整段 JSON，所以走带缓存的那条路：
+                    // 每帧为每个会话解一次上千轮的存档是画不起的。
+                    sTtl = ZanIDE.AiSessTitleOf(aiSessions[sti]);
+                }
+            }
+            if (sTtl == "") {
+                sTtl = ZanIDE.T("New chat ", "新会话 ")
+                    + Convert.ToString(sti + 1);
+            }
+            aiTitles.Add(sTtl);
+            aiArch.Add(aiSessions[sti].archived);
+        }
+        SessionListAction sAct = aiSessNav.RenderEx(app,
+            area.x + rPad, area.y + rPad, area.width - rPad * 2,
+            area.height - rPad * 2, aiTitles, aiSessCur, aiArch);
+        if (aiBusy.Get() == 0 && sAct.archived >= 0
+            && sAct.archived < aiSessions.Count) {
+            // 归档保留会话（连上下文一起），只把它从列表里折叠起来；
+            // 再点一次就恢复。
+            int sArc = sAct.archived;
+            if (aiSessions[sArc].archived == 0) { aiSessions[sArc].archived = 1; }
+            else { aiSessions[sArc].archived = 0; }
+            SaveAiSessions();
+            Layer.Msg(aiSessions[sArc].archived == 1
+                ? ZanIDE.T("Chat archived", "会话已归档")
+                : ZanIDE.T("Chat restored", "会话已恢复"), 3);
+            app.RequestRedraw();
+        } else if (aiBusy.Get() == 0 && sAct.deleted >= 0) {
+            // 删除会丢掉那个会话的全部上下文：记录、思考、任务计划和
+            // 归档标记。最后一个会话只清空不移除，面板永远有地方可写。
+            aiSessions[aiSessCur].pack = AiPackCur();
+            int sDel = sAct.deleted;
+            bool sDelActive = sDel == aiSessCur;
+            int sNewCur = aiSessCur;
+            if (aiSessions.Count > 1) {
+                aiSessions.RemoveAt(sDel);
+                if (sDel < aiSessCur) { sNewCur = aiSessCur - 1; }
+                else if (sDel == aiSessCur) {
+                    if (sNewCur >= aiSessions.Count) {
+                        sNewCur = aiSessions.Count - 1;
+                    }
+                }
+            } else {
+                aiSessions[0].pack = "";
+                aiSessions[0].archived = 0;
+                sNewCur = 0;
+            }
+            aiMsgs = new List<ChatMessage>();
+            aiPlan = new List<AiPlanStep>();
+            AiRestoreSession(aiSessions[sNewCur].pack);
+            aiSessCur = sNewCur;
+            if (sDelActive) { AiResetContextState(); }
+            this.AiChatReset();
+            // 列表下的行整体上移：留着的重命名会落到接替那个下标的会话上。
+            aiSessNav.CancelRename();
+            SaveAiSessions();
+            Layer.Msg(ZanIDE.T("Chat and its context deleted",
+                "会话及其上下文已删除"), 3);
+            app.RequestRedraw();
+        } else if (sAct.renamed >= 0 && sAct.renamed < aiSessions.Count) {
+            // 名字清空就把这一行交回给推导出来的标题。
+            aiSessions[sAct.renamed].title = CodeEditor.TrimStr(sAct.title);
+            SaveAiSessions();
+            app.RequestRedraw();
+        } else if (aiBusy.Get() == 0 && sAct.created) {
+            aiSessions[aiSessCur].pack = AiPackCur();
+            aiSessions.Add(AiSession.Create("", 0));
+            aiMsgs = new List<ChatMessage>();
+            aiPlan = new List<AiPlanStep>();
+            aiSessCur = aiSessions.Count - 1;
+            AiResetContextState();
+            // 新会话没有在跑的交付：不清掉，顶上那排阶段圆点会带着上一段对话
+            // 的进度，而这里的聊天区和任务图都是空的。
+            this.AiRunRestore("");
+            this.AiChatReset();
+            SaveAiSessions();
+            app.RequestRedraw();
+        } else if (aiBusy.Get() == 0 && sAct.selected >= 0
+            && sAct.selected != aiSessCur) {
+            aiSessions[aiSessCur].pack = AiPackCur();
+            aiMsgs = new List<ChatMessage>();
+            aiPlan = new List<AiPlanStep>();
+            AiRestoreSession(aiSessions[sAct.selected].pack);
+            aiSessCur = sAct.selected;
+            this.AiChatReset();
+            SaveAiSessions();
+            app.RequestRedraw();
+        }
+    }
+}

@@ -8,11 +8,27 @@ using Gui.Widget;
 /// 结构在 `views/RunStrip.zform` 里声明（圆点容器 + 状态文字 + 分隔线）。
 /// 圆点数量来自 `AiPhase.Count()`，因此在 OnInit 里按相位建一次 Badge 并
 /// 留着，不是每帧造临时控件；这里只把状态翻译成类名和一句话。
+///
+/// 一个圆点＝一拍。光有颜色的点没人看得懂它是什么，所以每个点都能自己
+/// 说话：悬停给出「第几拍 拍名 · 状态」，点一下钉出这一拍的证据（做了
+/// 什么、跑的什么命令、退出码、产物、失败原因或跳过理由）。
 partial class RunStrip {
     List<Badge> dots;
+    /// 圆点各自的命中区 id：连续一块，第 i 个点用 dotBase + i。
+    int dotBase;
+    /// 被钉住的那一拍（-1 = 没有）。点同一个点收起。
+    int shown;
+    /// 本帧的交付状态：证据浮层要读它，Sync 时存下。
+    AiRun cur;
+    /// 这一帧是否显示那排圆点：有任务图时收起（进度归任务节点说）。
+    bool dotsOn;
 
     void OnInit() {
         dots = new List<Badge>();
+        dotBase = WidgetId.Block(AiPhase.Count());
+        shown = 0 - 1;
+        cur = null;
+        dotsOn = true;
         for (int ph = 0; ph < AiPhase.Count(); ph = ph + 1) {
             Badge dot = new Badge();
             dot.Class = "dot phase idle";
@@ -31,12 +47,67 @@ partial class RunStrip {
         return "idle";
     }
 
-    /// 「任务号 当前拍 · 已完成/总数 [· 故障分类] [· 下一步]」。
+    /// 整个需求的进度：任务图里验收通过的节点 / 总节点。
+    ///
+    /// 这才是用户问「做到哪了」时想知道的事：商城拆成七个节点，完成两个就是
+    /// 2/7。十二拍是单个节点内部的生命周期，降为后半句的细节。
+    static string TaskText(List<AiTask> tasks, string curId) {
+        if (tasks == null || tasks.Count == 0) { return ""; }
+        int done = 0;
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            if (tasks[i].state == AiTeam.TaskDone()) { done = done + 1; }
+        }
+        string label = ZanIDE.T("tasks ", "节点 ") + Convert.ToString(done)
+            + "/" + Convert.ToString(tasks.Count)
+            + ZanIDE.T(" done", " 完成");
+        // 后半句说的是「谁身上的活正在被做」：`curId` 来自状态机（这一次交付 /
+        // 团队活动节点），不是用户点开看的那个；而且它必须真的还没收尾——已完成
+        // 的节点不能被说成在执行，否则状态条会指着一个谁都没在做的节点说「当前」。
+        AiTask t = AiTeam.TaskOf(tasks, curId);
+        if (t != null && !RunStrip.InFlight(t)) { t = null; }
+        if (t == null) { t = RunStrip.InFlightTask(tasks); }
+        if (t != null) {
+            // 节点自己的状态名就是它现在的处境（进行中 / 验收中 / 待修复），
+            // 后面跟它的百分比：这两样都是节点身上的事实，不是「有没有一次
+            // 交付在跑」推出来的。
+            label = label + " · " + AiTeam.TaskStateName(t.state) + " " + t.id;
+            if (t.title != "") { label = label + " " + t.title; }
+            if (t.progress > 0) {
+                label = label + " " + Convert.ToString(t.progress) + "%";
+            }
+        } else {
+            label = label + " · " + ZanIDE.T("no task running", "无进行中节点");
+        }
+        return label;
+    }
+
+    /// 这个节点身上的活还没交完：在做、交出去等验收、或者卡着等修——三者都
+    /// 属于「有任务在推进」，只有待办和已完成不是。
+    static bool InFlight(AiTask t) {
+        return t.state == AiTeam.TaskDoing()
+            || t.state == AiTeam.TaskReview()
+            || t.state == AiTeam.TaskBlocked();
+    }
+
+    /// 状态机没给出活动节点时的兜底：图上第一个还在推进的节点，没有就是 null。
+    static AiTask InFlightTask(List<AiTask> tasks) {
+        if (tasks == null) { return null; }
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            if (RunStrip.InFlight(tasks[i])) { return tasks[i]; }
+        }
+        return null;
+    }
+
+    /// 「任务号 第几拍/共几拍 · 当前拍名 [· 故障分类] [· 下一步]」。
+    ///
+    /// 写成「第 2/12 拍」而不是「已完成 1/12」：后者在刚开始跑的时候读起来像
+    /// 「还没动就有了进度」，而这条状态条要回答的问题本来是「现在跑到哪一拍」。
     static string StatusText(AiRun run) {
         string label = run.taskId + " "
+            + ZanIDE.T("step ", "第 ") + Convert.ToString(run.phase + 1)
+            + "/" + Convert.ToString(AiPhase.Count())
+            + ZanIDE.T("", " 拍") + " · "
             + ZanIDE.T(AiPhase.En(run.phase), AiPhase.Zh(run.phase));
-        label = label + " · " + Convert.ToString(run.DoneCount()) + "/"
-            + Convert.ToString(AiPhase.Count());
         if (run.fault != AiFault.None()) {
             label = label + " · " + AiFault.Zh(run.fault);
         }
@@ -53,22 +124,188 @@ partial class RunStrip {
         return label;
     }
 
-    /// 状态条的高度（没有任务时为 0）。
-    static int HeightOf(App app, AiRun run) {
-        if (run == null) { return 0; }
+    /// 当前节点内部跑到哪一拍，只说拍名和下一步——不带「x/12」，因为在
+    /// 任务图模式下那个 12 不是用户要的刻度。
+    static string PhaseText(AiRun run) {
+        string label = ZanIDE.T(AiPhase.En(run.phase), AiPhase.Zh(run.phase));
+        if (run.fault != AiFault.None()) {
+            label = label + " · " + AiFault.Zh(run.fault);
+        }
+        int act = run.NextAction();
+        if (act == AiNext.AskUser()) {
+            label = label + " · " + ZanIDE.T("waiting for you", "等你");
+        } else if (act == AiNext.Diagnose()) {
+            label = label + " · " + ZanIDE.T("root-causing", "定位根因");
+        } else if (act == AiNext.Retry()) {
+            label = label + " · " + ZanIDE.T("retrying", "重试");
+        } else if (act == AiNext.Finished()) {
+            label = label + " · " + ZanIDE.T("done", "完成");
+        }
+        return label;
+    }
+
+    /// 状态条的高度（既没任务图也没在跑的交付时为 0）。
+    ///
+    /// 有任务图就该有进度：进度本来就是「拆出来的节点做完了几个」，而不是
+    /// 「有没有一次交付在跑」。
+    static int HeightOf(App app, AiRun run, List<AiTask> tasks) {
+        if (run == null && (tasks == null || tasks.Count == 0)) { return 0; }
         return app.Scale(22);
     }
 
-    /// 把 `run` 铺进控件：圆点的语义色和那一行文字。绘制归控件树。
-    void Sync(AiRun run) {
-        if (run == null) { return; }
+    /// 一拍的状态，写成人话（圆点的颜色是同一件事的另一种说法）。
+    static string StateZh(int st) {
+        if (st == AiRunStatus.Done()) { return ZanIDE.T("done", "已完成"); }
+        if (st == AiRunStatus.Running()) { return ZanIDE.T("running", "进行中"); }
+        if (st == AiRunStatus.Failed()) { return ZanIDE.T("failed", "失败"); }
+        if (st == AiRunStatus.Blocked()) { return ZanIDE.T("blocked", "卡住"); }
+        if (st == AiRunStatus.Skipped()) { return ZanIDE.T("skipped", "已跳过"); }
+        return ZanIDE.T("pending", "未开始");
+    }
+
+    /// 悬停提示：「3/12 方案拆解 · 已完成」。点数是拍数，这句话让它不再
+    /// 是一排没有出处的小圆点。
+    string TipOf(int ph) {
+        string tip = Convert.ToString(ph + 1) + "/"
+            + Convert.ToString(AiPhase.Count()) + " "
+            + ZanIDE.T(AiPhase.En(ph), AiPhase.Zh(ph));
+        AiRunStep s = null;
+        if (cur != null) { s = cur.At(ph); }
+        if (s == null) { return tip; }
+        tip = tip + " · " + RunStrip.StateZh(s.status);
+        return tip + " · " + ZanIDE.T("click for evidence", "点开看证据");
+    }
+
+    /// 一拍的证据正文：干了什么、命令与退出码、产物、失败原因或跳过理由。
+    /// 全部来自状态机记下的字段，不是让模型再复述一遍。
+    string EvidenceOf(int ph) {
+        AiRunStep s = null;
+        if (cur != null) { s = cur.At(ph); }
+        if (s == null) { return ZanIDE.T("No record for this phase yet.",
+            "这一拍还没有记录。"); }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(RunStrip.StateZh(s.status));
+        if (s.title != "") { sb.Append(" · " + s.title); }
+        if (s.command != "") {
+            sb.Append("\n" + ZanIDE.T("command", "命令") + ": " + s.command
+                + " (exit " + Convert.ToString(s.exitCode) + ")");
+        }
+        if (s.retries > 0) {
+            sb.Append("\n" + ZanIDE.T("retries", "重试") + ": "
+                + Convert.ToString(s.retries));
+        }
+        if (s.fault != AiFault.None()) {
+            sb.Append("\n" + ZanIDE.T("fault", "故障分类") + ": "
+                + AiFault.Zh(s.fault));
+        }
+        if (s.error != "") {
+            string head = ZanIDE.T("error", "原因");
+            if (s.status == AiRunStatus.Skipped()) {
+                head = ZanIDE.T("skipped because", "跳过理由");
+            }
+            sb.Append("\n" + head + ": " + s.error);
+        }
+        for (int i = 0; i < s.diagnostics.Count; i = i + 1) {
+            sb.Append("\n" + s.diagnostics[i]);
+        }
+        for (int i = 0; i < s.artifacts.Count; i = i + 1) {
+            sb.Append("\n" + ZanIDE.T("artifact", "产物") + ": "
+                + s.artifacts[i]);
+        }
+        return sb.ToString();
+    }
+
+    /// 圆点的悬停与点击：命中区贴着每个点自己的矩形（布局已经算完，
+    /// 所以这里读得到），点一下钉住那一拍的证据、再点收起。
+    override void OnPaint(App app) {
+        if (cur == null || !dotsOn) { shown = 0 - 1; return; }
         for (int i = 0; i < dots.Count; i = i + 1) {
-            AiRunStep st = run.At(i);
-            if (st == null) { continue; }
+            Badge dot = dots[i];
+            if (dot.bw <= 0 || dot.bh <= 0) { continue; }
+            // 点本身只有 7px 高，指到它上面很费劲：命中区取整条带子的高度，
+            // 左右各让出一像素，够点也不至于盖住隔壁那一拍。
+            int hx = dot.bx - 1;
+            int hw = dot.bw + 2;
+            int hy = this.Dots.by;
+            int hh = this.Dots.bh;
+            if (hh <= 0) { hy = dot.by; hh = dot.bh; }
+            int id = dotBase + i;
+            app.hitTester.RegisterRect(id, hx, hy, hw, hh, 0);
+            if (Ui.Clicked(app, id)) {
+                if (shown == i) { shown = 0 - 1; } else { shown = i; }
+                app.ClaimClick();
+                app.RequestRedraw();
+            }
+            if (app.focus.IsHovered(id)) {
+                Tooltip.RequestBox(app, hx, hy, hw, hh, this.TipOf(i),
+                    Tooltip.Top(), app.Scale(300));
+            }
+        }
+        if (shown >= 0) { app.AddOverlay(OverlayPopup.Host(this)); }
+    }
+
+    /// 证据浮层：走标准覆盖层通道，所以它压在聊天内容之上；点外面或
+    /// Esc 收起。
+    override void OnPaintOverlay(App app) {
+        if (shown < 0 || shown >= dots.Count) { return; }
+        app.BlockHitsBelow();
+        Badge dot = dots[shown];
+        string title = ZanIDE.T(AiPhase.En(shown), AiPhase.Zh(shown)) + " · "
+            + Convert.ToString(shown + 1) + "/"
+            + Convert.ToString(AiPhase.Count());
+        int panelId = Popover.PaintPanel(app, dot.bx + dot.bw / 2,
+            dot.by + dot.bh, app.Scale(320), title, this.EvidenceOf(shown));
+        int kind = app.EventKind();
+        if (kind == 2 && app.PressTarget() != panelId
+                && app.PressTarget() != dotBase + shown) {
+            shown = 0 - 1;
+            app.RequestRedraw();
+        }
+        if (kind == 4 && app.window.EventKeyCode() == 27) {
+            shown = 0 - 1;
+            app.RequestRedraw();
+        }
+    }
+
+    /// 把 `run` 铺进控件：圆点的语义色和那一行文字。绘制归控件树。
+    void Sync(AiRun run, List<AiTask> tasks, string curTask) {
+        cur = run;
+        if (shown >= AiPhase.Count()) { shown = 0 - 1; }
+        for (int i = 0; i < dots.Count; i = i + 1) {
+            AiRunStep st = null;
+            if (run != null) { st = run.At(i); }
+            if (st == null) {
+                dots[i].Class = "dot phase idle";
+                continue;
+            }
             dots[i].Class = "dot phase " + RunStrip.Tone(st.status);
         }
-        this.StatusLbl.Text = RunStrip.StatusText(run);
-        if (run.fault != AiFault.None()) {
+        // 任务图在前、十二拍在后：前者回答「需求做到哪了」，后者回答「当前
+        // 节点内部跑到哪一拍」。只有其中一份时就只说那一份。
+        string tt = RunStrip.TaskText(tasks, curTask);
+        // 有任务图时收起那一排圆点：进度该由任务节点说，十二拍是节点内部的
+        // 事，两排刻度并排摆着只会让人问「那 12 个点是什么」。要看某一拍的
+        // 证据就在任务图上点那个节点。
+        dotsOn = run != null && tt == "";
+        this.Dots.SetShown(dotsOn);
+        if (!dotsOn) { shown = 0 - 1; }
+        string rt = "";
+        if (run != null) {
+            if (dotsOn) {
+                rt = RunStrip.StatusText(run);
+            } else {
+                rt = RunStrip.PhaseText(run);
+            }
+        }
+        if (tt != "" && rt != "") {
+            this.StatusLbl.Text = tt + " · " + rt;
+        } else if (tt != "") {
+            this.StatusLbl.Text = tt;
+        } else {
+            this.StatusLbl.Text = rt;
+        }
+        if (run == null) { shown = 0 - 1; }
+        if (run != null && run.fault != AiFault.None()) {
             this.StatusLbl.Class = "small error";
         } else {
             this.StatusLbl.Class = "small secondary";

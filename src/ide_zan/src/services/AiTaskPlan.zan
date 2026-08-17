@@ -1,0 +1,122 @@
+using System;
+
+/// 节点内的开发任务清单（图上一个节点＝一块功能，节点里的这份清单＝把这块
+/// 功能做出来要干的活）。
+///
+/// 图和「下面那份计划」以前是同一份东西：模型用 `plan` 工具报一串条目，条目
+/// 既当节点又当步骤，于是「商城」这种需求要么被拆成十几个碎节点、要么一个
+/// 节点笼统写着「做商城」——两头都没法精确执行。现在分成两层：`plan` 的
+/// items 是功能节点（前台商品展示、下单购买、积分兑换、后台商品管理……），
+/// 每个节点自己带一份 `tasks` 清单，聊天上方那条计划显示的就是当前节点的
+/// 这份清单。
+///
+/// 这一层只做解析、合并和统计；节点状态和百分比的规则仍归 `AiTeam`。
+class AiTaskPlan {
+    /// 把 JSON 里的一份清单折进节点。已有条目的勾选状态按文本保留：模型
+    /// 重发一次计划（同样的节点、同样的活）不该把已经打过勾的活变回没做。
+    /// 条目可以是 "[x] 建商品表" 这样的字符串，也可以是 {"t":...,"d":true}。
+    static void ReadItems(JsonValue v, AiTask t) {
+        if (v == null || !v.IsArray()) { return; }
+        List<AiPlanStep> outp = new List<AiPlanStep>();
+        for (int i = 0; i < v.Count(); i = i + 1) {
+            JsonValue it = v.At(i);
+            string txt = "";
+            bool done = false;
+            if (it.IsObject()) {
+                txt = it.Str("t", it.Str("text", ""));
+                done = it.Bool("d", it.Bool("done", false));
+            } else {
+                txt = it.AsString("");
+                if (txt.Length >= 4) {
+                    string pre = txt.Substring(0, 4);
+                    if (pre == "[x] " || pre == "[X] ") {
+                        done = true;
+                        txt = txt.Substring(4, txt.Length - 4);
+                    } else if (pre == "[ ] ") {
+                        txt = txt.Substring(4, txt.Length - 4);
+                    }
+                }
+            }
+            txt = AiAgent.Trim(txt);
+            if (txt == "") { continue; }
+            int d = 0;
+            if (done) { d = 1; }
+            if (d == 0 && AiTaskPlan.WasDone(t, txt)) { d = 1; }
+            outp.Add(AiPlanStep.Create(txt, d));
+        }
+        if (outp.Count == 0) { return; }
+        t.items = outp;
+    }
+
+    /// 这条活在节点原来的清单里已经打过勾了吗（按文本认人）。
+    static bool WasDone(AiTask t, string text) {
+        if (t == null || t.items == null) { return false; }
+        for (int i = 0; i < t.items.Count; i = i + 1) {
+            if (t.items[i].text == text) { return t.items[i].done != 0; }
+        }
+        return false;
+    }
+
+    /// 节点清单里打过勾的条数。
+    static int DoneOf(AiTask t) {
+        int n = 0;
+        if (t == null || t.items == null) { return 0; }
+        for (int i = 0; i < t.items.Count; i = i + 1) {
+            if (t.items[i].done != 0) { n = n + 1; }
+        }
+        return n;
+    }
+
+    static int CountOf(AiTask t) {
+        if (t == null || t.items == null) { return 0; }
+        return t.items.Count;
+    }
+
+    /// 「3/7」这样的一小段，没有清单时返回 ""。
+    static string Brief(AiTask t) {
+        int n = AiTaskPlan.CountOf(t);
+        if (n == 0) { return ""; }
+        return Convert.ToString(AiTaskPlan.DoneOf(t)) + "/"
+            + Convert.ToString(n);
+    }
+
+    /// 节点清单换成百分比，封顶 95：清单全打勾也只是「活干完了」，最后那一
+    /// 档留给验收（和 AiTeam.ApplyToTasks 里同一个规矩）。
+    static int PctOf(AiTask t) {
+        int n = AiTaskPlan.CountOf(t);
+        if (n == 0) { return 0; }
+        int pct = AiTaskPlan.DoneOf(t) * 95 / n;
+        return pct;
+    }
+
+    /// 把每个节点自己的清单进度折进它自己的百分比：多个节点各自有各自的
+    /// 完成度，正是这一步让它们互不影响。只往前推，且不替验收宣布完成。
+    static void Fold(List<AiTask> tasks) {
+        if (tasks == null) { return; }
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            AiTask t = tasks[i];
+            if (t.state == AiTeam.TaskDone()) { continue; }
+            int pct = AiTaskPlan.PctOf(t);
+            if (pct > t.progress) { t.progress = pct; }
+        }
+    }
+
+    /// 图签名里代表清单的那一段（条数 + 每条的勾选位）：清单变了要重画卡片、
+    /// 要落盘，所以它得进签名。
+    static string SigOf(AiTask t) {
+        StringBuilder sb = new StringBuilder();
+        int n = AiTaskPlan.CountOf(t);
+        sb.Append(Convert.ToString(n));
+        for (int i = 0; i < n; i = i + 1) {
+            sb.Append(Convert.ToString(t.items[i].done));
+        }
+        return sb.ToString();
+    }
+
+    /// 一份可以直接绑到界面上的清单副本（节点没有清单时是空表，绝不返回
+    /// null）。返回节点自己那份列表本身：面板上的勾选就是改这个节点的活。
+    static List<AiPlanStep> ItemsOf(AiTask t) {
+        if (t == null || t.items == null) { return new List<AiPlanStep>(); }
+        return t.items;
+    }
+}

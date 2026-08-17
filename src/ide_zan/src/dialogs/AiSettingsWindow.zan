@@ -27,8 +27,11 @@ class AiSettingsWindow : ChildWindow {
     int active;
     int sel;
     int modelSel;
-    /// 当前页签：0 = 模型配置，i>0 = 第 i 个助手。
+    /// 当前页签：0 = 模型配置，i>0 = 第 i 个助手，最后一页 = 行为。
     int tab;
+    /// 自动继续预算（-1 = 没配过，跟着内置默认；0 = 不限）。跟服务商无关，
+    /// 所以存在 ai_behavior.json 而不是某个配置里。
+    int autoCont;
     /// 当前助手页对应的成员 id（模型页时为 ""）。
     string curRoleId;
 
@@ -81,6 +84,16 @@ class AiSettingsWindow : ChildWindow {
         return sel;
     }
 
+    /// 把这一刻列表里的每个配置都在 `hold` 里留一份引用。`hold` 是为那个还没根治
+    /// 的 ARC 过度释放兜底的（见 ZanIDE.AiProfilesHold），而它只在打开窗口时建过
+    /// 一次：运行中新增出来的配置从来没被 hold 住，于是「新增」和「点新增出来的
+    /// 那条」都会读到已经被回收的对象——就是那个闪退。新增之后必须补上。
+    void Hold() {
+        for (int i = 0; i < profiles.Count; i = i + 1) {
+            hold.Add(profiles[i]);
+        }
+    }
+
     void BuildUi() {
         content = new AiSettingsDialog();
         this.SetRoot(content, model);
@@ -127,21 +140,31 @@ class AiSettingsWindow : ChildWindow {
         for (int r = 0; r < rs.Count; r = r + 1) {
             if (lang == 1) { labels.Add(rs[r].zh); } else { labels.Add(rs[r].en); }
         }
+        labels.Add(AiSettingsWindow.T(lang, "Behaviour", "行为"));
         return labels;
     }
+
+    /// 行为页的页签号（助手页之后的那一页）。
+    int ActTab() { return AiTeam.Roles().Count + 1; }
 
     /// 铺当前页：模型页只要下拉的选项，助手页换一次绑定路径与下拉选项，
     /// 一套控件服务所有助手（不按成员数量堆控件）。
     void RefreshTabs() {
         List<AiRole> rs = AiTeam.Roles();
-        if (tab < 0 || tab > rs.Count) { tab = 0; }
+        if (tab < 0 || tab > this.ActTab()) { tab = 0; }
+        bool act = tab == this.ActTab();
         content.SyncTabs(this.TabLabels(), tab);
-        content.ShowPage(tab);
+        content.ShowPage(tab, act);
 
         AiProfile profile = profiles[SelClamped()];
         content.FillModelOptions(this.DefaultModelOptions(profile),
             profile.model);
 
+        if (act) {
+            curRoleId = "";
+            content.FillAct();
+            return;
+        }
         if (tab == 0) { curRoleId = ""; return; }
         AiRole role = rs[tab - 1];
         curRoleId = role.id;
@@ -286,11 +309,20 @@ class AiSettingsWindow : ChildWindow {
             model.PathStr("model", profile.model));
         this.CommitModelLimits();
         this.CommitRoleModels();
+        this.CommitAct();
+    }
+
+    /// 行为页读回：留空 = 没配过（跟内置默认走），0 = 不限，其余就是拍数。
+    void CommitAct() {
+        string text = AiAgent.Trim(model.PathStr("autocont", ""));
+        if (text == "") { autoCont = 0 - 1; return; }
+        autoCont = ZanIDE.ParseInt(text);
     }
 
     void Persist() {
         ZanIDE.AiProfilesSave(active, profiles);
         ZanIDE.AiRolePromptsSave(rolePrompts);
+        ZanIDE.AiAutoContSave(autoCont);
         saved = true;
     }
 
@@ -324,6 +356,10 @@ class AiSettingsWindow : ChildWindow {
         w.model.Set("status", JsonValue.NewStr(""));
         w.model.Set("ctx", JsonValue.NewStr(""));
         w.model.Set("out", JsonValue.NewStr(""));
+        w.autoCont = ZanIDE.AiAutoContLoad();
+        string contText = "";
+        if (w.autoCont >= 0) { contText = Convert.ToString(w.autoCont); }
+        w.model.Set("autocont", JsonValue.NewStr(contText));
         w.tab = 0;
         w.curRoleId = "";
         w.LoadFields();
@@ -380,6 +416,7 @@ class AiSettingsWindow : ChildWindow {
             profiles.Add(AiProfile.Create(AiSettingsWindow.T(lang, "AI ", "配置 ")
                 + Convert.ToString(profiles.Count + 1),
                 "https://api.openai.com/v1", "", "", "", "{}"));
+            this.Hold();
             sel = profiles.Count - 1;
             model.Set("sel", JsonValue.NewNum(Convert.ToString(sel)));
             this.LoadFields();
@@ -393,6 +430,7 @@ class AiSettingsWindow : ChildWindow {
             AiPreset preset = presets[p];
             profiles.Add(AiProfile.Create(preset.name, preset.baseUrl, "", preset.model,
                 "", "{}"));
+            this.Hold();
             sel = profiles.Count - 1;
             model.Set("sel", JsonValue.NewNum(Convert.ToString(sel)));
             this.LoadFields();

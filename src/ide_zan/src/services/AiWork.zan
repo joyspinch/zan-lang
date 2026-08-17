@@ -1,0 +1,162 @@
+using System;
+using System.IO;
+using System.Threading;
+
+/// 助手工具的执行线程。
+///
+/// 工具本身是纯粹的文件活：读一个几百 KB 的源文件、全仓 grep、生成工程概览、
+/// 把一段内容写回文件。这些活在 GUI 线程上跑就是几百毫秒到几秒的停顿，
+/// 窗口在这段时间里不泵消息，用户看到的就是「ZanIDE（未响应）」——而一轮
+/// 助手工作会连着跑十几个这样的调用。
+///
+/// 所以工具跟 AI 请求走同一套：`Start` 把这一次调用交给一条自己的线程，
+/// 事件循环每帧问一次 `Ready()`，拿到结果再接着发下一拍。`build` / `run`
+/// 原本就走分离进程，不经过这里。
+class AiWork {
+    /// 面板正在等的那一次调用。取消（停止按钮、下一个问题顶掉这一轮）会把它
+    /// 置空：还在跑的线程仍然写它自己那份 AiJob，但没人再读了。
+    static AiJob sCur;
+
+    /// 每次 Start / Abandon 都加一，线程据此判断自己这份结果还有没有人要。
+    static int sGen;
+
+    /// 交给线程但还没被领走的调用，以及看守它的锁。线程入口不能捕获变量
+    /// （`Thread.Start` 只收非捕获的委托），所以调用本身走这个队列而不是共享
+    /// 字段：一次 Start 只推一个、只起一条线程，两次调用不可能领到同一份活。
+    static List<AiJob> sPend;
+    #if WINDOWS
+    static nint sLock;
+    #else
+    static string sLock;
+    #endif
+
+    static void EnsureQueue() {
+        if (AiWork.sPend == null) {
+            AiWork.sPend = new List<AiJob>();
+            AiWork.sLock = Mutex.Create();
+        }
+    }
+
+    static void Push(AiJob j) {
+        AiWork.EnsureQueue();
+        Mutex.Lock(AiWork.sLock);
+        AiWork.sPend.Add(j);
+        Mutex.Unlock(AiWork.sLock);
+    }
+
+    /// 领走一份还没人做的活；没有就返回 null。
+    static AiJob Take() {
+        AiWork.EnsureQueue();
+        Mutex.Lock(AiWork.sLock);
+        AiJob j = null;
+        if (AiWork.sPend.Count > 0) {
+            j = AiWork.sPend[0];
+            AiWork.sPend.RemoveAt(0);
+        }
+        Mutex.Unlock(AiWork.sLock);
+        return j;
+    }
+
+    /// 线程入口：领一份活，跑完把结果登记上。
+    static void Worker() {
+        AiJob j = AiWork.Take();
+        if (j == null) { return; }
+        // 写工具落地前先留一份全文：改动清单要显示 +增 -删，而行数只有拿写
+        // 之前和写之后的两份文本比一次才算得准。这两遍读也一起离开 GUI 线程。
+        string before = "";
+        if (j.measure) { before = ZanIDE.AiFileText(j.root, j.path); }
+        string r = "";
+        // 工具里任何一处抛出来都必须变成模型能读的一行 error：线程静静死掉的话
+        // 面板会一直等到超时，还报成「请求超时」。
+        try {
+            r = AiAgent.Run(j.root, j.call);
+        } catch (Exception ex) {
+            r = "error: " + ex.Message;
+        }
+        if (j.measure) {
+            AiLineDelta d = AiAgent.LineDelta(before,
+                ZanIDE.AiFileText(j.root, j.path));
+            j.adds = d.adds;
+            j.dels = d.dels;
+        }
+        AiWork.Publish(j, r);
+    }
+
+    static void Publish(AiJob j, string result) {
+        AiWork.EnsureQueue();
+        Mutex.Lock(AiWork.sLock);
+        j.result = result;
+        j.done = 1;
+        Mutex.Unlock(AiWork.sLock);
+    }
+
+    static int DoneOf(AiJob j) {
+        AiWork.EnsureQueue();
+        Mutex.Lock(AiWork.sLock);
+        int d = j.done;
+        Mutex.Unlock(AiWork.sLock);
+        return d;
+    }
+
+    /// 把这一次工具调用交给一条线程。返回 "" 表示已经在跑，否则是给用户看的
+    /// 错误（起不了线程）。`path` / `measure` 只在写工具上有意义。
+    static string Start(string root, string call, string path, bool measure) {
+        AiJob j = new AiJob();
+        j.root = root;
+        j.call = call;
+        j.path = path;
+        j.measure = measure;
+        j.result = "";
+        j.adds = 0;
+        j.dels = 0;
+        j.done = 0;
+        AiWork.sGen = AiWork.sGen + 1;
+        j.gen = AiWork.sGen;
+        AiWork.sCur = j;
+        AiWork.Push(j);
+        if (!Thread.Start(AiWork.Worker)) {
+            AiJob _drop = AiWork.Take();
+            AiWork.sCur = null;
+            return "error: could not start the tool thread.";
+        }
+        return "";
+    }
+
+    /// 还有一次工具调用在线程上跑没跑完。事件循环据此不把这段安静当成
+    /// 「模型没回话」而去走超时。
+    static bool Busy() {
+        if (AiWork.sCur == null) { return false; }
+        return AiWork.DoneOf(AiWork.sCur) == 0;
+    }
+
+    /// 跑完了就把这份结果交出来（并清空在跑的那一份），否则返回 null。
+    static AiJob Ready() {
+        if (AiWork.sCur == null) { return null; }
+        if (AiWork.DoneOf(AiWork.sCur) == 0) { return null; }
+        AiJob j = AiWork.sCur;
+        AiWork.sCur = null;
+        return j;
+    }
+
+    /// 不要这一次的结果了（停止、或者被下一个问题顶掉）。线程照旧跑完它自己
+    /// 那份 AiJob，只是没人读，返回后就被回收。
+    static void Abandon() {
+        AiWork.sCur = null;
+        AiWork.sGen = AiWork.sGen + 1;
+    }
+}
+
+/// 一次工具调用：线程要的输入，加上它跑出来的结果。交给线程之后输入不再被
+/// 改动，所以两次调用互不干扰。`done` 由锁看守，是 GUI 线程唯一需要轮询的
+/// 字段。
+class AiJob {
+    string root;
+    string call;
+    string path;
+    bool measure;
+    string result;
+    int adds;
+    int dels;
+    int gen;
+    int done;
+}

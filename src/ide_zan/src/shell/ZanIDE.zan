@@ -1468,7 +1468,7 @@ partial class ZanIDE {
                                     "> [AI] 正在驱动 UI 自检..."));
                                 app.RequestAnimationFrame(120);
                             } else {
-                                aiMsgs.Add(ChatMessage.Create("tool",
+                                aiMsgs.Add(this.AiToolMsg("tool",
                                     aiUiTool + "\n"
                                     + AiAgent.BuildResult(bout, false, false)));
                                 string ube = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
@@ -1476,7 +1476,7 @@ partial class ZanIDE {
                                     aiProfiles[aiProfActive].baseUrl,
                                     aiProfiles[aiProfActive].key, aiRunModel);
                                 if (ube != "") {
-                                    aiMsgs.Add(ChatMessage.Create("error", ube));
+                                    aiMsgs.Add(this.AiToolMsg("error", ube));
                                     aiBusy.Set(0);
                                 }
                                 this.AiChatToEnd();
@@ -1484,14 +1484,14 @@ partial class ZanIDE {
                         } else {
                             string tb = "build\n";
                             if (buildThenRun) { tb = "run\n"; }
-                            aiMsgs.Add(ChatMessage.Create("tool",
+                            aiMsgs.Add(this.AiToolMsg("tool",
                                 tb + AiAgent.BuildResult(bout, aiOk, buildThenRun)));
                             string aiBe = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
                                 aiRunCtxName, aiRunCtxCode, root,
                                 aiProfiles[aiProfActive].baseUrl,
                                 aiProfiles[aiProfActive].key, aiRunModel);
                             if (aiBe != "") {
-                                aiMsgs.Add(ChatMessage.Create("error", aiBe));
+                                aiMsgs.Add(this.AiToolMsg("error", aiBe));
                                 aiBusy.Set(0);
                             }
                             this.AiChatToEnd();
@@ -1540,7 +1540,7 @@ partial class ZanIDE {
                     if (File.Exists(uidP + "/theme.json")) {
                         tjson = File.ReadAllText(uidP + "/theme.json");
                     }
-                    aiMsgs.Add(ChatMessage.Create("tool",
+                    aiMsgs.Add(this.AiToolMsg("tool",
                         aiUiTool + "\n"
                         + AiAgent.UiResultOf(aiUiTool, rlog, rjson, tjson,
                             uiTo && !uiDone)));
@@ -1549,7 +1549,7 @@ partial class ZanIDE {
                         aiProfiles[aiProfActive].baseUrl,
                         aiProfiles[aiProfActive].key, aiRunModel);
                     if (uce != "") {
-                        aiMsgs.Add(ChatMessage.Create("error", uce));
+                        aiMsgs.Add(this.AiToolMsg("error", uce));
                         aiBusy.Set(0);
                     }
                     this.AiChatToEnd();
@@ -1634,7 +1634,19 @@ partial class ZanIDE {
             // live, and a wall-clock backstop times the wait out so the
             // panel never hangs on 'thinking' if the worker dies silently.
             if (aiBusy.Get() == 1) {
-                bool aiToolRunning = buildBusy || aiUiRunning || runStreaming;
+                // 文件工具在自己的线程上跑（读大文件、全仓 grep、写文件）：
+                // 跑完了就在这里收结果并接着发下一拍，跑着的时候这段安静不是
+                // 「模型没回话」，所以也算 aiToolRunning，不能走请求超时。
+                AiJob aiJob = AiWork.Ready();
+                if (aiJob != null) { this.AiWorkFinish(aiJob); }
+                bool aiToolRunning = buildBusy || aiUiRunning || runStreaming
+                    || AiWork.Busy();
+                // 这一拍之后隔多久再重绘。这个数字直接乘在 CPU 上：每一拍都是
+                // 一帧整窗重绘（磨砂主题还要重新模糊一遍背景），而模型在想、
+                // 工具在跑的那几十秒里屏上只有一个转圈在动，10~12 帧/秒全窗
+                // 重绘全花在转圈上。有新文本在流的时候才跟到 100ms（看得出
+                // 字在一个个蹦），其余时候 250ms 一拍转圈照样转。
+                int aiPollMs = 250;
                 if (aiToolRunning) {
                     aiWaitStart = 0;
                 }
@@ -1642,38 +1654,35 @@ partial class ZanIDE {
                 bool aiMarker = aiDoneTxt != "";
                 bool aiTimedOut = false;
                 if (!aiToolRunning && !aiMarker) {
-                    // Live read: re-parse only when the decoded body grew,
-                    // and drop a stale live bubble if a retry just reset
-                    // the sink.
-                    string sraw = AiNet.Text();
-                    if (sraw.Length < aiStreamLen) {
-                        if (aiStreamMsgIdx >= 0
-                            && aiStreamMsgIdx == aiMsgs.Count - 1) {
-                            aiMsgs.RemoveAt(aiStreamMsgIdx);
-                        }
-                        aiStreamMsgIdx = 0 - 1;
-                        aiStreamLen = 0;
+                    // Live read: the byte count comes from the sink without
+                    // copying the body, so a model that is still thinking
+                    // costs nothing per frame. When it did grow, only the
+                    // event lines that are new are folded (aiLive keeps a
+                    // cursor): re-parsing the whole stream every 100ms is
+                    // what burned a core on a long answer.
+                    int sgrown = AiNet.Length();
+                    if (sgrown < aiStreamLen) {
+                        // 流变短了 = 重试把这一轮从头开始：连那条写了一半的
+                        // 预览一起丢掉，否则记录里会剩下半句话。
+                        this.AiStreamDrop(true);
                     }
-                    if (sraw.Length != aiStreamLen) {
-                        aiStreamLen = sraw.Length;
-                        SseAnswer pa = AiAgent.ParseSse(sraw);
-                        string live = pa.content;
-                        if (live == "" && pa.reasoning != "") {
-                            live = ZanIDE.T("(thinking) ", "(思考中) ")
-                                + pa.reasoning;
-                        }
-                        if (live != "") {
-                            if (aiStreamMsgIdx < 0) {
-                                aiMsgs.Add(ChatMessage.Create("assistant", live));
-                                aiStreamMsgIdx = aiMsgs.Count - 1;
-                            } else if (aiStreamMsgIdx < aiMsgs.Count) {
-                                aiMsgs[aiStreamMsgIdx].text = live;
-                            }
-                            this.AiChatToEnd();
-                        }
+                    int aiTick = Window.GetTickMs();
+                    // 预览只是给人看的（最终那一轮从整段原文重新解析），所以
+                    // 一旦工具调用的摘要定型，就别再为一个越写越长的文件正文
+                    // 每一拍复制全文、重排整段聊天——写一个几十 KB 的文件时，
+                    // 这条链（复制 SSE 全文 → 折叠 → 折行 → 重绘）就是 GUI
+                    // 线程「未响应」的那份活。节流到 120ms 一拍同理。
+                    bool aiRefresh = sgrown != aiStreamShown
+                        && !aiStreamSettled
+                        && aiTick - aiStreamAt >= 120;
+                    if (sgrown != aiStreamShown && !aiStreamSettled) {
+                        aiPollMs = 100;
+                    }
+                    if (sgrown != aiStreamLen) {
+                        aiStreamLen = sgrown;
                         aiWaitStart = 0;
-                    } else {
-                        int aiNow = Window.GetTickMs();
+                    } else if (!aiRefresh) {
+                        int aiNow = aiTick;
                         if (aiWaitStart == 0) { aiWaitStart = aiNow; }
                         // Mirrors the transport's idle window (600s): a
                         // model that is still thinking emits nothing for
@@ -1685,31 +1694,60 @@ partial class ZanIDE {
                             aiTimedOut = true;
                         }
                     }
+                    if (aiRefresh) {
+                        aiStreamShown = sgrown;
+                        aiStreamAt = aiTick;
+                        if (aiLive == null) { aiLive = new SseLive(); }
+                        aiLive.Feed(AiNet.Gen(), AiNet.Text());
+                        string cont = aiLive.Content();
+                        // 工具块折成一行：整个文件的内容流进聊天区没有意义，
+                        // 而且会把它真正说的那几句话推出屏幕。
+                        string live = AiAgent.LiveText(cont);
+                        if (live == "" && aiLive.Reasoning() != "") {
+                            live = ZanIDE.T("(thinking) ", "(思考中) ")
+                                + aiLive.Reasoning();
+                        }
+                        if (AiAgent.CallSettled(cont)) {
+                            aiStreamSettled = true;
+                        }
+                        if (live != "") {
+                            // 只认「还挂在末尾、而且真是自己那条助手气泡」的
+                            // 下标。记录在这一轮中间被换掉过（切节点、切会话、
+                            // 停止后又发了一句）时，旧下标要么越界、要么正好
+                            // 落在别人的消息上——改写用户刚发的那句话，收尾时
+                            // 再把它删掉，就是那一下闪退。
+                            bool liveOk = aiStreamMsgIdx >= 0
+                                && aiStreamMsgIdx == aiMsgs.Count - 1
+                                && aiMsgs[aiStreamMsgIdx].role == "assistant";
+                            if (liveOk) {
+                                aiMsgs[aiStreamMsgIdx].text = live;
+                            } else {
+                                // 流式那条气泡也要署名：不署名头行就退回默认的
+                                // 「小赞」，于是团队会话里每一拍都先冒出一个
+                                // 没人 @ 过的小赞，写完才变回真正在说话的成员。
+                                ChatMessage lm = ChatMessage.Create(
+                                    "assistant", live);
+                                lm.agent = aiRunAgent;
+                                aiMsgs.Add(lm);
+                                aiStreamMsgIdx = aiMsgs.Count - 1;
+                            }
+                            this.AiChatToEnd();
+                        }
+                        aiWaitStart = 0;
+                    }
                 }
                 if (aiTimedOut) {
-                    aiWaitStart = 0;
-                    if (aiStreamMsgIdx >= 0
-                        && aiStreamMsgIdx == aiMsgs.Count - 1) {
-                        aiMsgs.RemoveAt(aiStreamMsgIdx);
-                    }
-                    aiStreamMsgIdx = 0 - 1;
-                    aiStreamLen = 0;
+                    this.AiStreamDrop(true);
                     aiMsgs.Add(ChatMessage.Create("error", ZanIDE.T(
                         "[error] AI request timed out - no response received.",
                         "[错误] AI 请求超时——未收到响应。")));
                     aiBusy.Set(0);
                     this.AiChatToEnd();
                 } else if (aiMarker) {
-                    aiWaitStart = 0;
                     string doneTxt = AiAgent.Trim(aiDoneTxt);
                     // Drop the live preview bubble; the final turns are added
                     // below from the fully decoded stream.
-                    if (aiStreamMsgIdx >= 0
-                        && aiStreamMsgIdx == aiMsgs.Count - 1) {
-                        aiMsgs.RemoveAt(aiStreamMsgIdx);
-                    }
-                    aiStreamMsgIdx = 0 - 1;
-                    aiStreamLen = 0;
+                    this.AiStreamDrop(true);
                     string sraw = AiNet.Text();
                     AiNet.Abandon();
                     SseAnswer fa = AiAgent.ParseSse(sraw);
@@ -1779,15 +1817,24 @@ partial class ZanIDE {
                         string call = AiAgent.ToolBlock(reply);
                         bool more = call != ""
                             && AiAgent.StepsSinceUser(aiMsgs) < AiAgent.MaxSteps();
-                        string said = reply;
-                        if (call != "") { said = AiAgent.StripToolBlock(reply); }
+                        // 聊天区显示的正文：工具调用一律折成一行摘要，包括
+                        // 模型忘了围栏、直接吐一个裸 {"tool": ...} 的那种——
+                        // 那次一整屏转义过的文件正文就是这么铺出来的。
+                        string said = AiAgent.VisibleText(reply);
                         string rz = AiAgent.Trim(fa.reasoning);
                         // A reply that is only a tool block still carries
                         // thinking worth keeping, so save the reasoning
                         // even when there is no visible text.
-                        if (said != "" || rz != "") {
+                        // 这一拍真正发出的调用留在消息的 call 上：聊天区照旧
+                        // 只显示正文（工具那一行由工具消息给出），发回模型的
+                        // 请求带上它——不然模型照着自己历史里的大白话学，下一
+                        // 拍就发不出可执行的调用。
+                        string ac = "";
+                        if (call != "") { ac = AiAgent.ArchiveCall(call); }
+                        if (said != "" || rz != "" || ac != "") {
                             ChatMessage amsg = ChatMessage.CreateWithReason(
                                 "assistant", said, rz);
+                            amsg.call = ac;
                             if (aiTeamMode) {
                                 // Record the beat on the message itself, so
                                 // the transcript (and the reload of it) can
@@ -1821,7 +1868,7 @@ partial class ZanIDE {
                             // task "not continuing by itself" -- push the
                             // loop on with a continue turn, which also
                             // refills the per-question tool budget. Bounded
-                            // by MaxContinues() and never taken when the
+                            // by aiContMax and never taken when the
                             // model just asked the user something.
                             // A read-only tool (read_file / grep /
                             // list_dir / repo_map) that ran out of budget
@@ -1829,16 +1876,54 @@ partial class ZanIDE {
                             // model was only looking, not doing. Only a
                             // mutating call cut mid-task refills the budget
                             // -- or an unfinished plan under Auto-execute.
+                            // 团队模式下这一拍归谁、要不要往下走由协议说话
+                            // （AiTeamTurnEnd 读拍子：提问停、交接换人、其余
+                            // 原地续），所以这条按计划催的通路只走单助手。
+                            // 否则一句「@开发者 [handoff]」会被当成「计划还
+                            // 没做完」原地催回架构师，交接永远发不出去。
                             bool limitHit = call != ""
                                 && AiAgent.IsMutating(AiAgent.ToolName(call));
-                            bool cont = aiAutoCont < AiAgent.MaxContinues()
-                                && (limitHit
-                                    || (aiAutoExec && AiPlanUnfinished()
+                            // 想调用工具但格式不对（裸文本、块没闭合）：这不是
+                            // 「只说不做」，是那个调用没被执行。把失败原因说给
+                            // 它听并让它重发，否则它只会一模一样再来一遍。
+                            // 但正式交付（[report]/[block]/[handoff]/
+                            // [question]…）本身就是这一拍的成品，它的正文里
+                            // 引用了「read_file "src/X.zan" 返回 no such
+                            // file」这种取证也很正常——那不是「想调用工具却
+                            // 写成了文字」。这种拍子不许纠格式，得让它按协议
+                            // 交出去，不然交接永远发不出来，屏幕上只剩一遍遍
+                            // 的格式提醒。
+                            string badTool = "";
+                            if (call == ""
+                                && AiTeam.ParseEnvelope(said).kind == "") {
+                                badTool = AiAgent.BadToolHint(reply);
+                            }
+                            if (badTool != "") {
+                                aiIdleWhy = ZanIDE.T("the tool block could not"
+                                    + " be parsed, so nothing ran",
+                                    "它发的工具块解析不出来（格式不对或被截断），"
+                                    + "所以那个调用根本没执行");
+                            }
+                            if (limitHit) {
+                                aiIdleWhy = ZanIDE.T("the per-turn tool budget"
+                                    + " ran out", "这一问的工具预算用完了");
+                            }
+                            bool cont = aiAutoCont < aiContMax
+                                && (limitHit || badTool != ""
+                                    || (!aiTeamMode && aiAutoExec
+                                        && AiPlanUnfinished()
                                         && !AiAgent.AsksUser(said)));
                             if (cont) {
                                 aiAutoCont = aiAutoCont + 1;
-                                aiMsgs.Add(ChatMessage.Create("user",
-                                    AiAgent.ContinuePrompt(limitHit)));
+                                // 「接着做」是流程自己发的，不是用户说的：标上
+                                // 流程发语人，聊天区才不会把它画成「我」。
+                                string cbody = AiAgent.ContinuePrompt(limitHit);
+                                if (badTool != "") { cbody = badTool; }
+                                ChatMessage cm = ChatMessage.Create("user",
+                                    cbody);
+                                cm.agent = AiTeam.Auto();
+                                cm.to = aiRunAgent;
+                                aiMsgs.Add(cm);
                                 string cle = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
                                     aiRunCtxName, aiRunCtxCode, root,
                                     aiProfiles[aiProfActive].baseUrl,
@@ -1855,12 +1940,32 @@ partial class ZanIDE {
                                 }
                                 this.AiRunTurnEnd(said);
                                 AiTeamTurnEnd(said);
+                                // 真停下来了而活儿还没干完：把原因说出来。
+                                // 预算用尽后静悄悄结束，看上去就是「任务自己
+                                // 断了」，用户只能猜要不要催。
+                                if (aiBusy.Get() == 0
+                                    && aiAutoCont >= aiContMax
+                                    && (AiPlanUnfinished()
+                                        || (aiTeamMode
+                                            && AiTeam.HasUnfinished(aiTasks)))) {
+                                    aiMsgs.Add(ChatMessage.Create("error",
+                                        ZanIDE.T("Auto-continue budget spent with"
+                                            + " work left; say \"continue\" to"
+                                            + " push on.",
+                                            "自动继续次数已用完，任务还没做完；"
+                                            + "回一句「继续」就接着跑。")));
+                                }
                             }
                         }
                     }
                     this.AiChatToEnd();
                 }
-                app.RequestRedraw();
+                // 请求在飞的时候按节奏取流，而不是每帧无条件整窗重绘：
+                // RequestRedraw 会让事件循环在等模型的那几十秒里满帧空转
+                // （一个核心跑满，界面跟着发洩），而流式文本每 100ms 追一次
+                // 已经看不出差别。节奏见上面 aiPollMs：真有文本在流才 100ms，
+                // 模型在想 / 工具在跑就 250ms。构建 / 运行 / 发布的轮询同理。
+                app.RequestAnimationFrame(aiPollMs);
             }
 
             // Autosave the AI transcript (throttled to 1/s): every new user
@@ -2029,6 +2134,32 @@ partial class ZanIDE {
                         cmLabels.Add("-");
                     }
                     cmLabels.Add(ZanIDE.T("Copy Name", "复制名称"));
+                } else if (ctxKind == 7) {
+                    // 任务图节点：被前置卡住的节点不列「开工」，列不出来的
+                    // 原因由「为什么被卡住」那一项讲清楚。
+                    if (AiTeam.BlockedWhy(aiTasks, ctxTaskId) == "") {
+                        cmLabels.Add(ZanIDE.T("Start work", "开工"));
+                    } else {
+                        cmLabels.Add(ZanIDE.T("Why is it blocked?",
+                            "为什么被卡住"));
+                    }
+                    // 收尾了的节点这一项换成「重新打开」：完成不是只读——在
+                    // 某个节点上聊出新需求、要改验收标准或换负责人，都得先
+                    // 能把它重新打开。
+                    AiTask cmT = AiTeam.TaskOf(aiTasks, ctxTaskId);
+                    if (cmT != null && cmT.state == AiTeam.TaskDone()) {
+                        cmLabels.Add(ZanIDE.T("Reopen for changes",
+                            "重新打开修改"));
+                    } else {
+                        cmLabels.Add(ZanIDE.T("Mark done", "标记完成"));
+                    }
+                    // 开工能撤：被推成「进行中」的节点必须退得回去，否则点错一下
+                    // 就永远挂着一个假的进行中。
+                    cmLabels.Add(ZanIDE.T("Withdraw, back to todo",
+                        "撤回到待办"));
+                    cmLabels.Add("-");
+                    cmLabels.Add(ZanIDE.T("Acceptance criteria", "验收标准"));
+                    cmLabels.Add(ZanIDE.T("Copy task ID", "复制节点 ID"));
                 }
                 // An open context menu owns the pointer. Without this, the
                 // click that dismisses it also reached whatever was under it
@@ -2222,6 +2353,8 @@ partial class ZanIDE {
                                 if (exrReal) { ZanIDE.RevealInFileManager(exrn.path); }
                             }
                         }
+                    } else if (ctxKind == 7) {
+                        this.AiGraphMenu(ctxTaskId, chosen);
                     }
                     ctxKind = 0;
                     app.RequestRedraw();

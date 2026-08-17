@@ -15,17 +15,91 @@ partial class PlanStrip {
     bool collapsed;
     /// 本帧用户点了「清空计划」，外壳取走。
     bool clearWanted;
+    /// 绑上去的那份「本轮改动文件」（同样只在换了另一份时重绑）。显示的是
+    /// 「路径 +增 -删」那一行，双击要打开的却是路径，所以路径单独留一份
+    /// （同下标）。
+    List<string> boundFiles;
+    List<string> filePaths;
+    /// 改动文件清单是否收起（默认收起：多数时候只想知道改了几个）。
+    bool filesCollapsed;
+    /// 本帧用户双击了某个改动文件，外壳取走去打开它。
+    string openWanted;
     static PlanStrip current;
 
     void OnInit() {
         bound = null;
         collapsed = false;
         clearWanted = false;
+        boundFiles = null;
+        filePaths = null;
+        filesCollapsed = true;
+        openWanted = "";
         PlanStrip.current = this;
         this.Rows.WithRow(PlanRow.Of);
+        this.Files.WithRow(PlanStrip.FileRowOf);
+        this.Files.OnActivate(PlanStrip.FileActivated);
         this.ClearBtn.Text = ZanIDE.T("Clear plan", "清空计划");
         this.ClearBtn.Click.Add(PlanStrip.ClearClicked);
         this.TitleBtn.Click.Add(PlanStrip.HeadClicked);
+        this.FilesBtn.Click.Add(PlanStrip.FilesHeadClicked);
+    }
+
+    /// 改动文件清单的一行：路径后面跟这一轮的 `+增 -删`（行数未知时只有
+    /// 路径），双击那一行由列表的 Activate 事件打开文件。
+    static Control FileRowOf(string label) {
+        Label lbl = new Label(label);
+        lbl.Class = "ai-file secondary";
+        return lbl;
+    }
+
+    static void FilesHeadClicked() {
+        if (PlanStrip.current != null) {
+            PlanStrip.current.filesCollapsed =
+                !PlanStrip.current.filesCollapsed;
+        }
+    }
+
+    static void FileActivated() {
+        PlanStrip p = PlanStrip.current;
+        if (p == null || !p.Files.HasSelection()) { return; }
+        // 显示的那一行带着 +增 -删，能打开的只有路径本身。
+        p.openWanted = p.PathAt(p.Files.SelectedIndex());
+    }
+
+    string PathAt(int i) {
+        if (filePaths == null) { return ""; }
+        if (i < 0 || i >= filePaths.Count) { return ""; }
+        return filePaths[i];
+    }
+
+    /// 本帧用户要打开的改动文件（取走后清空，"" = 没有）。
+    string TakeOpen() {
+        string p = openWanted;
+        openWanted = "";
+        return p;
+    }
+
+    /// 本轮改动过的文件（没有交付记录时是空列表，绝不返回 null）。
+    static List<string> FilesOf(AiRun run) {
+        if (run == null) { return new List<string>(); }
+        return run.changedLabels;
+    }
+
+    /// 同一份清单对应的路径（同下标）。
+    static List<string> PathsOf(AiRun run) {
+        if (run == null) { return new List<string>(); }
+        return run.changedFiles;
+    }
+
+    /// 改动文件那两块要占多高：一行表头，展开时再加清单（至多六行）。
+    int FilesHeight(App app, AiRun run) {
+        List<string> files = PlanStrip.FilesOf(run);
+        if (files.Count == 0) { return 0; }
+        int hdr = app.Scale(22);
+        if (filesCollapsed) { return hdr; }
+        int rows = files.Count;
+        if (rows > 6) { rows = 6; }
+        return hdr + rows * app.Scale(20) + app.Scale(4);
     }
 
     static void ClearClicked() {
@@ -48,22 +122,69 @@ partial class PlanStrip {
 
     /// 这条带子要占多高：只有状态条时就是状态条的高度，折叠时加一行
     /// 表头，展开时按步数（至多八行）加清单。
-    int HeightOf(App app, AiRun run, List<AiPlanStep> plan) {
-        int runH = RunStrip.HeightOf(app, run);
-        if (plan == null || plan.Count == 0) { return runH; }
+    int HeightOf(App app, AiRun run, List<AiTask> tasks,
+            List<AiPlanStep> plan) {
+        int runH = RunStrip.HeightOf(app, run, tasks);
+        int filesH = this.FilesHeight(app, run);
+        if (plan == null || plan.Count == 0) { return runH + filesH; }
         int hdr = app.Scale(24);
-        if (collapsed) { return runH + hdr; }
+        if (collapsed) { return runH + filesH + hdr; }
         int rows = plan.Count;
         if (rows > 8) { rows = 8; }
-        return runH + hdr + rows * app.Scale(20) + app.Scale(6);
+        return runH + filesH + hdr + rows * app.Scale(20) + app.Scale(6);
+    }
+
+    /// 计划里「现在正在做的那一步」：第一条还没打勾的。清单和表头都用它，
+    /// 于是折叠着也看得到当前在做什么。
+    static AiPlanStep CurrentStep(List<AiPlanStep> plan) {
+        if (plan == null) { return null; }
+        for (int i = 0; i < plan.Count; i = i + 1) {
+            if (plan[i].done == 0) { return plan[i]; }
+        }
+        return null;
     }
 
     /// 把这一帧的交付状态和计划铺进控件。
-    void Sync(App app, AiRun run, List<AiPlanStep> plan) {
-        int runH = RunStrip.HeightOf(app, run);
+    /// `tag` = 这份清单属于哪个节点（团队模式；"" = 单人模式那份全局计划）。
+    /// 写在表头上，否则上面图里选的是一个节点、下面一堆活却不知道是谁的。
+    void Sync(App app, AiRun run, List<AiTask> tasks, string curTask,
+            List<AiPlanStep> plan, bool busy, string tag) {
+        int runH = RunStrip.HeightOf(app, run, tasks);
         this.Run.Prefer(0, runH);
         this.Run.SetShown(runH > 0);
-        if (runH > 0) { this.Run.Sync(run); }
+        if (runH > 0) { this.Run.Sync(run, tasks, curTask); }
+
+        // 「这轮改了哪些文件」：改动是状态机在每次 write_file / edit_file
+        // 时记下的（AiRun.changedFiles），这里只把它显示出来。
+        List<string> files = PlanStrip.FilesOf(run);
+        bool hasFiles = files.Count > 0;
+        this.FilesHead.SetShown(hasFiles);
+        this.Files.SetShown(hasFiles && !filesCollapsed);
+        if (hasFiles) {
+            string fcaret = "v ";
+            if (filesCollapsed) { fcaret = "> "; }
+            string ftxt = fcaret
+                + ZanIDE.T("Files changed ", "本轮改动文件 ")
+                + Convert.ToString(files.Count);
+            int fadds = run.TotalAdds();
+            int fdels = run.TotalDels();
+            if (fadds > 0 || fdels > 0) {
+                ftxt = ftxt + " · +" + Convert.ToString(fadds)
+                    + " -" + Convert.ToString(fdels);
+            }
+            this.FilesBtn.Text = ftxt;
+            filePaths = PlanStrip.PathsOf(run);
+            if (boundFiles != files) {
+                this.Files.Bind(files);
+                boundFiles = files;
+            }
+            this.Files.Refresh();
+            int fh = 0;
+            if (!filesCollapsed) {
+                fh = this.FilesHeight(app, run) - app.Scale(22);
+            }
+            this.Files.Prefer(0, fh);
+        }
 
         bool has = plan != null && plan.Count > 0;
         this.Head.SetShown(has);
@@ -74,10 +195,29 @@ partial class PlanStrip {
         for (int i = 0; i < plan.Count; i = i + 1) {
             if (plan[i].done != 0) { done = done + 1; }
         }
+        // 「进行中」是派生状态：第一条没打勾的就是当前那一步。每帧重算，
+        // 于是助手打勾之后箭头自己往下走。
+        AiPlanStep cur = PlanStrip.CurrentStep(plan);
+        for (int i = 0; i < plan.Count; i = i + 1) {
+            if (plan[i] == cur) { plan[i].cur = 1; } else { plan[i].cur = 0; }
+        }
         string caret = "v ";
         if (collapsed) { caret = "> "; }
-        this.TitleBtn.Text = caret + ZanIDE.T("Plan", "任务计划") + " "
+        string title = caret + ZanIDE.T("Plan", "任务计划");
+        if (tag != "") {
+            title = caret + tag + ZanIDE.T("'s tasks", " 的开发任务");
+        }
+        title = title + " "
             + Convert.ToString(done) + "/" + Convert.ToString(plan.Count);
+        // 折叠起来也要能看到在做哪一步，所以表头带上当前那条（截断）。只有
+        // 助手真的在跑的时候它才是「进行中」；停下来等人的时候它是「下一
+        // 步」，否则一条没人在做的计划也在喊自己在执行。
+        if (cur != null) {
+            string now = ZanIDE.T("next: ", "下一步：");
+            if (busy) { now = ZanIDE.T("now: ", "进行中："); }
+            title = title + " · " + now + AiAgent.Clip(cur.text, 40);
+        }
+        this.TitleBtn.Text = title;
         if (bound != plan) {
             this.Rows.Bind(plan);
             bound = plan;

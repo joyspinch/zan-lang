@@ -18,12 +18,66 @@ partial class ZanIDE {
             aiGraphRoot = root;
             this.AiGraphLoad();
         }
-        string sig = ZanIDE.AiGraphSig(aiTasks, aiGraphSel);
-        if (sig != aiGraphSig) {
-            aiGraphSig = sig;
-            this.AiGraphSave();
+        // 没有任务、也没有待入库的话时这一帧无事可做：拼一遍全图签名、再去
+        // stat 一次项目目录，是白花的钱（每帧都花）。
+        if (aiTasks.Count != 0 || aiGraphSel != "") {
+            string sig = ZanIDE.AiGraphSig(aiTasks, aiGraphSel);
+            if (sig != aiGraphSig) {
+                aiGraphSig = sig;
+                this.AiGraphSave();
+                // 下一次请求带的那段图状态跟着图一起更新：签名就是「图变了」，
+                // 所以这里重拼一次，而不是每帧或每次发问都拼一遍。
+                AiTeam.SetBoard(AiTeam.BoardBrief(aiTasks, aiGraphSel));
+            }
         }
-        this.AiCtxFlush();
+        this.AiGraphTrackRun();
+        // 节点自己那份开发任务打了几个勾，就是这个节点到底走了多少：一共
+        // 七件活干完三件，它就不能只因为模型没发 [progress] 而还写着 0%。
+        AiTaskPlan.Fold(aiTasks);
+        if (aiCtxSaved != aiMsgs.Count) { this.AiCtxFlush(); }
+    }
+
+    /// 把「真的在跑」这件事落到它所属的节点上。
+    ///
+    /// 节点的状态和百分比原来只有一个来源：模型自己发的协议信封。模型不发
+    /// `[progress]`（大多数时候它就是不发，它在忙着调工具）的时候，节点会一直
+    /// 停在「待办 0%」，直到一句汇报把它跳到最后一档——用户看到的就是「要么没
+    /// 人在做，要么一下就一百」。这里补的是状态机手上本来就有的事实：正在被执
+    /// 行的是哪个节点（`aiTeamSt.activeTask`，不是用户点开看的那个），以及这一
+    /// 次交付跑完了几拍（`AiRun`）。只往前推，绝不替模型宣布完成。
+    void AiGraphTrackRun() {
+        if (aiTeamSt == null) { return; }
+        AiTask t = AiTeam.TaskOf(aiTasks, aiTeamSt.activeTask);
+        if (t == null) { return; }
+        if (t.state == AiTeam.TaskDone() || t.state == AiTeam.TaskReview()) {
+            return;
+        }
+        // 停在「等用户回答」上的节点不是在跑，是在等人：那种情况让协议自己
+        // 说（[question] 已经把状态机挂起来了），这里不替它宣布在干活。
+        if (aiTeamSt.awaitingUser) { return; }
+        // 「在跑」= 这一拍正在等模型回话，或者这一次交付还没收尾（被卡住也算
+        // 这个节点身上的活没干完，它确实是进行中的那一个）。
+        bool working = aiBusy.Get() != 0
+            || (aiRun != null && !aiRun.Finished());
+        if (!working) { return; }
+        // 只认属于这个节点的那份交付记录（团队模式下一个节点一份，编号就是节点
+        // ID）：别的节点跑到第几拍跟这个节点没关系，更不能因为它恰好被
+        // 选中就把它写成「进行中」。
+        if (aiRun == null || aiRun.taskId != t.id) { return; }
+        if (t.state == AiTeam.TaskTodo() || t.state == AiTeam.TaskAcked()) {
+            t.state = AiTeam.TaskDoing();
+        }
+        int ev = ZanIDE.AiRunPct(aiRun);
+        if (ev > t.progress) { t.progress = ev; }
+    }
+
+    /// 这一次交付跑完的拍数换成百分比，封顶 95：最后那一档只能由汇报被验收
+    /// （或人工收尾）给出，进度条不替它们宣布完成。
+    static int AiRunPct(AiRun run) {
+        if (run == null) { return 0; }
+        int pct = run.Progress();
+        if (pct > 95) { pct = 95; }
+        return pct;
     }
 
     /// 打开项目时读回它的图；聊天还是空的（刚开 IDE、刚建会话）就顺带把
@@ -37,6 +91,7 @@ partial class ZanIDE {
         }
         string cur = AiTaskGraph.Load(root, aiTasks);
         aiGraphSig = ZanIDE.AiGraphSig(aiTasks, cur);
+        AiTeam.SetBoard(AiTeam.BoardBrief(aiTasks, cur));
         if (cur == "" || AiTeam.TaskOf(aiTasks, cur) == null) { return; }
         aiGraphSel = cur;
         // 恢复出来的会话存档属于哪个节点，由它自己的 activeTask 说了算：只有
@@ -44,11 +99,19 @@ partial class ZanIDE {
         // 上选中 T-4、聊天区却接着 T-2 的话往下说。存档里的话本来就在会话库
         // 和它自己节点的 tasks.db 里，换掉不丢东西。
         if (aiMsgs.Count != 0 && aiTeamSt.activeTask == cur) { return; }
+        this.AiCtxStash(AiTaskGraph.ProjectNode(), aiMsgs);
         aiMsgs = new List<ChatMessage>();
         AiTaskGraph.LoadCtx(root, cur, aiMsgs);
+        // 换了一份记录：上一份折出来的前情摘要说的不是这段对话。
+        AiAgent.ResetCompaction();
         aiCtxSaved = aiMsgs.Count;
-        aiTeamSt.activeTask = cur;
         AiTask t = AiTeam.TaskOf(aiTasks, cur);
+        // 重开项目只恢复「看的是哪个节点」；只有它上次确实停在进行中，才把它
+        // 重新认成执行节点。否则关 IDE 前随便点开看过的那个节点，一开项目就
+        // 变成了在跑的那一个。
+        if (t != null && t.state == AiTeam.TaskDoing()) {
+            aiTeamSt.activeTask = cur;
+        }
         if (t != null && t.owner != "") {
             // 换的是节点，收件人也跟着换成这个节点的负责人：否则重启后徽标
             // 还写着存档里那位，第一拍就发错人。
@@ -56,8 +119,9 @@ partial class ZanIDE {
             aiRunAgent = t.owner;
             aiSendTo = t.owner;
         }
-        aiStreamMsgIdx = 0 - 1;
-        aiStreamLen = 0;
+        // 换了一整份记录：旧那条流式气泡的下标不能跟过来（气泡跟着旧
+        // 列表走了，这里不要删新列表的末尾）。
+        this.AiStreamDrop(false);
         this.AiChatInvalidate();
     }
 
@@ -81,6 +145,7 @@ partial class ZanIDE {
                 + "~" + Convert.ToString(t.state)
                 + "~" + Convert.ToString(t.progress)
                 + "~" + t.accept + "~" + t.outcome + "~"
+                + AiTaskPlan.SigOf(t) + "~"
                 + AiTeam.JoinIds(t.deps));
             if (t.parts != null) {
                 for (int k = 0; k < t.parts.Count; k = k + 1) {
@@ -97,6 +162,7 @@ partial class ZanIDE {
     /// 时按它归档（一次交接里模型说的话属于被指派的那个任务），否则归当前
     /// 选中的节点。
     void AiCtxFlush() {
+        if (aiCtxSaved == aiMsgs.Count) { return; }
         if (!AiTaskGraph.Usable(root)) { aiCtxSaved = aiMsgs.Count; return; }
         if (aiCtxSaved > aiMsgs.Count) { aiCtxSaved = aiMsgs.Count; }
         while (aiCtxSaved < aiMsgs.Count) {
@@ -104,8 +170,9 @@ partial class ZanIDE {
             aiCtxSaved = aiCtxSaved + 1;
             string node = m.taskId;
             if (node == "") { node = aiGraphSel; }
-            if (node == "") { node = aiTeamSt.activeTask; }
-            if (node == "") { continue; }
+            // 没选节点时聊的那一段也要存：丢掉它（以前是 continue）就是
+            // 「点了个任务节点，刚才聊的就没了」。
+            node = AiTaskGraph.NodeKey(node);
             // 流式回答那一条会被就地改写到最终文本，所以只在它写完
             // （不再是当前流式气泡）之后才入库。
             if (aiCtxSaved - 1 == aiStreamMsgIdx) {
@@ -116,35 +183,91 @@ partial class ZanIDE {
         }
     }
 
+    /// 这个桶的记录存在内存里的第几格（-1 = 还没存过）。
+    int AiCtxSlot(string key) {
+        if (aiCtxKeys == null) { return 0 - 1; }
+        for (int i = 0; i < aiCtxKeys.Count; i = i + 1) {
+            if (aiCtxKeys[i] == key) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    /// 记下这个桶当前在聊天区里的那份记录，换给别的节点之前调用。切走的那
+    /// 一份必须留住：项目对话在没打开项目时无处入库，而入了库的节点也不该
+    /// 为了「切回去看一眼」再读一遍数据库。
+    void AiCtxStash(string key, List<ChatMessage> msgs) {
+        if (aiCtxKeys == null) {
+            aiCtxKeys = new List<string>();
+            aiCtxMem = new List<List<ChatMessage>>();
+        }
+        if (key == "" || msgs == null) { return; }
+        int at = this.AiCtxSlot(key);
+        if (at >= 0) { aiCtxMem[at] = msgs; return; }
+        aiCtxKeys.Add(key);
+        aiCtxMem.Add(msgs);
+    }
+
+    /// 这个桶留档的那份记录（没留过返回 null）。
+    List<ChatMessage> AiCtxPeek(string key) {
+        int at = this.AiCtxSlot(key);
+        if (at < 0) { return null; }
+        return aiCtxMem[at];
+    }
+
+    /// 项目对话那一份：正停在某个任务节点上时，它在留档里而不在聊天区。
+    List<ChatMessage> AiCtxProject() {
+        if (aiGraphSel == "") { return aiMsgs; }
+        List<ChatMessage> kept = this.AiCtxPeek(AiTaskGraph.ProjectNode());
+        if (kept == null) { return aiMsgs; }
+        return kept;
+    }
+
     /// 选中一个任务节点：把聊天换成这个节点自己的多角色多轮上下文。
     ///
     /// 请求在飞的时候不换——半路换上下文会让回来的那一段落到别人的节点里。
+    /// `id` 为空就是回到项目级对话（团队条上的「< 项目对话」）。
     void AiGraphOpen(string id) {
-        if (id == "" || id == aiGraphSel) { return; }
-        AiTask t = AiTeam.TaskOf(aiTasks, id);
-        if (t == null) { return; }
-        if (aiBusy.Get() != 0) {
-            log.Add(ZanIDE.T("> Busy: finish or stop the current turn before"
-                    + " switching task nodes.",
-                "> 正忙：先等这一拍跑完或停下来，再切任务节点。"));
-            return;
+        if (id == aiGraphSel) { return; }
+        AiTask t = null;
+        if (id != "") {
+            t = AiTeam.TaskOf(aiTasks, id);
+            if (t == null) { return; }
         }
+        if (this.AiGraphBusy()) { return; }
         this.AiCtxFlush();
+        this.AiCtxStash(AiTaskGraph.NodeKey(aiGraphSel), aiMsgs);
         aiGraphSel = id;
+        string key = AiTaskGraph.NodeKey(id);
         aiMsgs = new List<ChatMessage>();
-        AiTaskGraph.LoadCtx(root, id, aiMsgs);
+        AiTaskGraph.LoadCtx(root, key, aiMsgs);
+        // 库里没有（没打开项目，或这一段只在本次会话里聊过）就用留档：已经
+        // 收尾的节点也照此打开，看完整对话、并且能在上面继续提新需求。
+        if (aiMsgs.Count == 0) {
+            List<ChatMessage> kept = this.AiCtxPeek(key);
+            if (kept != null) { aiMsgs = kept; }
+        }
+        // 同上：换节点就是换记录，摘要跟着换。
+        AiAgent.ResetCompaction();
         aiCtxSaved = aiMsgs.Count;
-        aiTeamSt.activeTask = id;
+        // 注意这里不动 `activeTask`：看不等于执行。执行节点只由两件事给
+        // 出——双击开工（`AiGraphStart`）或者用户真在这个节点上发话。以前
+        // 点一下就设 activeTask，于是「点了节点它就变进行中」，而且上一个真在
+        // 跑的节点还被抢走。
         // 节点的负责人就是这个节点的默认收件人：切过去就能直接说话，
         // 不用先在提示行里再选一次人。
-        if (t.owner != "") {
+        if (t != null && t.owner != "") {
             aiRunAgent = t.owner;
             aiSendTo = t.owner;
         }
-        aiStreamMsgIdx = 0 - 1;
-        aiStreamLen = 0;
+        // 同上：换节点就换了消息列表，流式气泡的下标归零。
+        this.AiStreamDrop(false);
         aiHandoffs = 0;
-        this.AiNoteDeps(t);
+        // 换节点等于换一段工作：该查什么、谁在空转都重新算。
+        this.AiForgetTools();
+        aiIdleKey = "";
+        aiIdleTimes = 0;
+        aiEscKey = "";
+        if (t != null) { this.AiNoteDeps(t); }
         this.AiChatInvalidate();
         this.AiChatToEnd();
         this.AiGraphSave();
@@ -165,13 +288,35 @@ partial class ZanIDE {
         aiMsgs.Add(m);
     }
 
+    /// 正在跑的时候节点是锁的：切节点、开工、标完成、重开全部不受理。
+    ///
+    /// 不锁的后果不是「界面不好看」：这一拍的请求已经带着某个节点的上下文
+    /// 在飞，半路换人换节点，回来的那一段就落到别人的节点里，两边的上下文
+    /// 和进度一起对不上。返回 true = 这个动作被拦下了（并已告知用户）。
+    bool AiGraphBusy() {
+        if (aiBusy.Get() == 0) { return false; }
+        log.Add(ZanIDE.T("> Busy: the current turn owns a task node; wait for"
+                + " it or stop it, then operate on the graph.",
+            "> 正忙：这一拍正占着一个任务节点，先等它跑完或停下来，再动图上的节点。"));
+        return true;
+    }
+
+    /// 这一拍正占着的那个节点（锁的就是它）。没人在跑就是空串。
+    string AiGraphRunning() {
+        if (aiBusy.Get() == 0) { return ""; }
+        return aiTeamSt.activeTask;
+    }
+
     /// 双击一个没被锁住的节点＝开工：节点进入「进行中」，并把这一拍交给
     /// 它的负责人。锁住的节点走 AiGraphBlocked，不会到这里。
     void AiGraphStart(string id) {
+        if (this.AiGraphBusy()) { return; }
         this.AiGraphOpen(id);
         if (aiGraphSel != id) { return; }
         AiTask t = AiTeam.TaskOf(aiTasks, id);
         if (t == null) { return; }
+        // 开工就给它自己那份十二拍记录，卡片上立刻有「在跑哪一拍」。
+        this.AiRunForTask(id);
         if (t.state == AiTeam.TaskTodo() || t.state == AiTeam.TaskAcked()
             || t.state == AiTeam.TaskBlocked()) {
             t.state = AiTeam.TaskDoing();
@@ -182,11 +327,149 @@ partial class ZanIDE {
             + ZanIDE.T(" is open for work.", " 已开工。"));
     }
 
+    /// 任务图节点的右键菜单动作。菜单本身是标准的 Gui.Widget.ContextMenu
+    /// （和文件树、标签页同一套），外壳在最上层画完把选了第几项交到这里；
+    /// 项的顺序与 ZanIDE.zan 里 ctxKind == 7 那一段列的一致：
+    /// 0 开工 / 为什么被卡住，1 标记完成 / 重新打开，2 撤回到待办，3 分隔线，
+    /// 4 验收标准，5 复制节点 ID。
+    void AiGraphMenu(string id, int chosen) {
+        AiTask t = AiTeam.TaskOf(aiTasks, id);
+        if (t == null) { return; }
+        if (chosen == 0) {
+            // 第一项按节点是否被卡住换过：能开工就开工，否则说明卡在哪。
+            if (AiTeam.BlockedWhy(aiTasks, id) == "") {
+                this.AiGraphStart(id);
+            } else {
+                this.AiGraphBlocked(id);
+            }
+        } else if (chosen == 1) {
+            // 菜单上这一项对收尾了的节点是「重新打开修改」（标签同处切换）。
+            if (t.state == AiTeam.TaskDone()) {
+                this.AiGraphReopen(id);
+            } else {
+                this.AiGraphDone(id);
+            }
+        } else if (chosen == 2) {
+            this.AiGraphStop(id);
+        } else if (chosen == 4) {
+            string acc = AiAgent.Trim(t.accept);
+            if (acc == "") {
+                acc = ZanIDE.T("(no acceptance criteria on this task)",
+                    "（这个任务没写验收标准）");
+            }
+            log.Add("> " + id + " " + ZanIDE.T("acceptance: ", "验收标准：")
+                + acc);
+        } else if (chosen == 5) {
+            Clipboard.SetText(id);
+            log.Add(ZanIDE.T("> Copied task ID: ", "> 已复制节点 ID：") + id);
+        }
+    }
+
+    /// 手工把节点标记为完成：图是模型维护的，但人有权收尾——下游节点跟着
+    /// 解锁，所以这件事必须在界面上做得到，而不是只能等模型报完成。
+    void AiGraphDone(string id) {
+        AiTask t = AiTeam.TaskOf(aiTasks, id);
+        if (t == null || t.state == AiTeam.TaskDone()) { return; }
+        if (this.AiGraphBusy()) { return; }
+        t.state = AiTeam.TaskDone();
+        t.progress = 100;
+        log.Add(ZanIDE.T("> Task ", "> 任务 ") + AiTaskGraph.CardTitle(t)
+            + ZanIDE.T(" marked done.", " 已标记完成。"));
+    }
+
+    /// 撤回开工：把节点放回「待办」，进度清零，它要是正被当成执行节点就一并
+    /// 卸下来。
+    ///
+    /// 「点了就进行中、还退不回去」在这里收口：状态既然人能推上去，就必须能被
+    /// 人退回来。进度跟着回到 0——留着一个 60% 的待办节点，比没有进度更误导。
+    /// 正在跑的那一拍不许撤（先停下），否则回来的那一段会落到一个已经被退回
+    /// 待办的节点上。
+    void AiGraphStop(string id) {
+        AiTask t = AiTeam.TaskOf(aiTasks, id);
+        if (t == null) { return; }
+        if (this.AiGraphBusy()) { return; }
+        t.state = AiTeam.TaskTodo();
+        t.progress = 0;
+        if (aiTeamSt.activeTask == id) { aiTeamSt.activeTask = ""; }
+        log.Add(ZanIDE.T("> Task ", "> 任务 ") + AiTaskGraph.CardTitle(t)
+            + ZanIDE.T(" is back to todo.", " 已撤回到待办。"));
+    }
+
+    /// 进行中的节点卡片上那一行：正在跑第几拍、这个节点自己改了多少东西。
+    ///
+    /// 节点原来只有「进行中 40%」，用户看不出它到底在干什么、改了什么——而这些
+    /// 事实状态机手上都有，只是没送到图上。空串＝这个节点没有在跑。
+    string AiGraphLive(string id) {
+        if (id == "" || aiRun == null || aiRun.taskId != id) { return ""; }
+        AiTask t = AiTeam.TaskOf(aiTasks, id);
+        if (t == null || t.state == AiTeam.TaskDone()) { return ""; }
+        string s = AiPhase.Zh(aiRun.phase) + " "
+            + Convert.ToString(aiRun.DoneCount()) + "/"
+            + Convert.ToString(AiPhase.Count());
+        if (aiRun.changedFiles.Count > 0) {
+            s = s + " · " + Convert.ToString(aiRun.changedFiles.Count)
+                + ZanIDE.T(" file(s)", " 个文件")
+                + " +" + Convert.ToString(aiRun.TotalAdds())
+                + " -" + Convert.ToString(aiRun.TotalDels());
+        }
+        return s;
+    }
+
+    /// 把收尾了的节点重新打开：完成不等于只读——在某个节点上聊出了新需求、
+    /// 验收标准要改、负责人要换，都从这里开始。上下文一并切过去，接着上次那
+    /// 段对话往下说；改成什么样由这一拍的 plan 决定，所以这里只负责让它重新
+    /// 可写，不去猜要改哪个字段。
+    void AiGraphReopen(string id) {
+        AiTask t = AiTeam.TaskOf(aiTasks, id);
+        if (t == null) { return; }
+        if (this.AiGraphBusy()) { return; }
+        this.AiGraphOpen(id);
+        if (t.state == AiTeam.TaskDone()) {
+            t.state = AiTeam.TaskDoing();
+            if (t.progress >= 100) { t.progress = 90; }
+        }
+        aiTeamSt.activeTask = id;
+        if (t.owner != "") { aiTeamSt.activeAgent = t.owner; }
+        log.Add(ZanIDE.T("> Task ", "> 任务 ") + AiTaskGraph.CardTitle(t)
+            + ZanIDE.T(" reopened: say what to change (title, owner,"
+                    + " acceptance, deps) or raise a follow-up here and it"
+                    + " becomes a new node depending on this one.",
+                " 已重新打开：直接说要改什么（标题、负责人、验收标准、依赖），"
+                    + "或者在这里提新需求——它会挂成依赖本节点的新节点。"));
+    }
+
     /// 双击一个被锁住的节点：说清楚是哪个前置卡着它，而不是让双击没反应。
     void AiGraphBlocked(string id) {
         this.AiGraphOpen(id);
         string why = AiTeam.BlockedWhy(aiTasks, id);
         if (why == "") { return; }
         log.Add("> " + id + ": " + why);
+    }
+
+    /// 丢掉「正在流式输出的那条气泡」这一组运行态：气泡下标、已排过的长度、
+    /// 节流水位、SSE 解析游标，以及那条还没等到第一个字节的等待起点。
+    /// `dropBubble` = 连那条预览气泡一起删掉（它的正文是半句话，最终那一轮
+    /// 由整段原文重新生成，不删就会留下一条重复的半句）。
+    ///
+    /// 停止、超时、请求收尾、切节点和下一次发送都走这里。以前这五处各清一
+    /// 半字段：停止只清了待发调用，气泡下标留着，于是下一句话进来，那个下标
+    /// 正好落在新消息上——预览把用户刚发的那句话改写掉，收尾时又把它删掉，
+    /// 越界的那一下就是「停止后再发一句就闪退」。
+    void AiStreamDrop(bool dropBubble) {
+        if (dropBubble && aiStreamMsgIdx >= 0
+                && aiStreamMsgIdx == aiMsgs.Count - 1) {
+            aiMsgs.RemoveAt(aiStreamMsgIdx);
+        }
+        aiStreamMsgIdx = 0 - 1;
+        aiStreamLen = 0;
+        aiStreamShown = 0;
+        aiStreamAt = 0;
+        aiStreamSettled = false;
+        // 上一轮的 SSE 解析状态（游标、已经折出来的正文）不能带进下一次请求。
+        aiLive = null;
+        aiWaitStart = 0;
+        // 归档水位不能落在消息列表外：停止时补的那条「已停止」和下一句用户
+        // 输入都还要能归档，水位越界会让这段对话再也存不进节点。
+        if (aiCtxSaved > aiMsgs.Count) { aiCtxSaved = aiMsgs.Count; }
     }
 }

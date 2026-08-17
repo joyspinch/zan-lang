@@ -1,7 +1,6 @@
 using System;
 using System.Data;
 using System.Data.Sqlite;
-using Gui.Component;
 
 /// 一个参与者在 `.zan/tasks.json` 里的样子：角色 + 当时的模型 + 轮数 + 最后
 /// 发言时间。存成对象而不是一串角色 id，是为了这四项永远绑在一起。
@@ -10,6 +9,12 @@ class TaskPartDoc {
     string model;
     int rounds;
     long lastTs;
+}
+
+/// 节点里一条开发任务在 `.zan/tasks.json` 里的样子：文本 + 做完了没有。
+class TaskItemDoc {
+    string t;
+    int d;
 }
 
 /// 一个任务节点在 `.zan/tasks.json` 里的样子。字段名写短的是因为这个文件
@@ -26,6 +31,8 @@ class TaskNodeDoc {
     int progress;
     string accept;
     string outcome;
+    /// 本节点自己的开发任务清单（节点＝一块功能，清单＝要干的活）。
+    List<TaskItemDoc> items;
 }
 
 /// `.zan/tasks.json` 的全文：版本号、当前选中的节点、节点表。
@@ -47,12 +54,29 @@ class TaskGraphDoc {
 class AiTaskGraph {
     static int Version() { return 1; }
 
+    /// 项目级对话（没有选中任何节点时聊的那一段）在 node_msg 里的桶名。
+    /// 任务号由 AiTeam 生成（T-1、T-2…），不会和它撞。给它一个桶，是因为
+    /// 「点了个节点，刚才聊的就没了」的根子在这段话本来无处存放。
+    static string ProjectNode() { return "@project"; }
+
+    /// 上下文桶名：空节点号 = 项目级对话。
+    static string NodeKey(string id) {
+        if (id == "") { return AiTaskGraph.ProjectNode(); }
+        return id;
+    }
+
     static string Dir(string root) { return root + "/.zan"; }
     static string GraphPath(string root) {
         return AiTaskGraph.Dir(root) + "/tasks.json";
     }
     static string DbPath(string root) {
         return AiTaskGraph.Dir(root) + "/tasks.db";
+    }
+    /// 项目知识：验收通过的节点在这里留下结论（做成了什么、按什么标准验的）。
+    /// 是 Markdown 而不是又一个库，因为它同时要给人读、能进版本库 diff，而且
+    /// 每一拍都会被原样塞进系统提示。
+    static string NotesPath(string root) {
+        return AiTaskGraph.Dir(root) + "/knowledge.md";
     }
 
     /// True when `root` looks like an opened project we may write into. A blank
@@ -95,11 +119,47 @@ class AiTaskGraph {
             n.progress = t.progress;
             n.accept = t.accept;
             n.outcome = t.outcome;
+            n.items = AiTaskGraph.ItemDocs(t.items);
             o.nodes.Add(n);
         }
         File.WriteAllText(AiTaskGraph.GraphPath(root),
             Json.Serialize<TaskGraphDoc>(o));
         return true;
+    }
+
+    // --- 项目知识: .zan/knowledge.md -----------------------------------------
+
+    /// 往项目知识里追加一节（同一个节点重复验收就再追一节，保留过程而不是
+    /// 覆盖掉上一次的结论）。项目没打开就无处可写，返回 false 而不是往 IDE
+    /// 的工作目录里撒文件。
+    static bool AppendNote(string root, string section) {
+        if (AiAgent.Trim(section) == "") { return false; }
+        if (!AiTaskGraph.EnsureDir(root)) { return false; }
+        string path = AiTaskGraph.NotesPath(root);
+        StringBuilder sb = new StringBuilder();
+        if (File.Exists(path)) {
+            sb.Append(File.ReadAllText(path));
+        } else {
+            sb.Append("# 项目知识\n\n"
+                + "小助手在任务验收通过后自动写在这里：每节一个任务节点，"
+                + "记结论而不是过程。手工编辑也没问题，下一次追加只在末尾加。\n");
+        }
+        sb.Append(section);
+        File.WriteAllText(path, sb.ToString());
+        return true;
+    }
+
+    /// 项目知识的正文（截到 `cap` 个字符，超出的从头截掉——最近的结论比最早的
+    /// 更可能是现在的事实）。没有就返回 ""。
+    static string LoadNotes(string root, int cap) {
+        if (!AiTaskGraph.Usable(root)) { return ""; }
+        string path = AiTaskGraph.NotesPath(root);
+        if (!File.Exists(path)) { return ""; }
+        string body = File.ReadAllText(path);
+        if (body.Length > cap) {
+            body = AiAgent.ClipTail(body, cap);
+        }
+        return body;
     }
 
     /// Reads the graph into `tasks` (replacing whatever it held) and returns the
@@ -124,6 +184,7 @@ class AiTaskGraph {
             if (n.outcome != null) { t.outcome = n.outcome; }
             t.deps = AiTaskGraph.CopyIds(n.deps);
             t.parts = AiTaskGraph.PartsOf(n.parts);
+            t.items = AiTaskGraph.ItemsOf(n.items);
             tasks.Add(t);
         }
         if (v.cur == null) { return ""; }
@@ -141,6 +202,31 @@ class AiTaskGraph {
             outIds.Add(xs[i]);
         }
         return outIds;
+    }
+
+    /// 节点清单存盘用的样子。
+    static List<TaskItemDoc> ItemDocs(List<AiPlanStep> items) {
+        List<TaskItemDoc> outDocs = new List<TaskItemDoc>();
+        if (items == null) { return outDocs; }
+        for (int i = 0; i < items.Count; i = i + 1) {
+            TaskItemDoc d = new TaskItemDoc();
+            d.t = items[i].text;
+            d.d = items[i].done;
+            outDocs.Add(d);
+        }
+        return outDocs;
+    }
+
+    /// 读回节点清单。老存档没有这一列（`items` 是 null）就是空清单，不是错误。
+    static List<AiPlanStep> ItemsOf(List<TaskItemDoc> docs) {
+        List<AiPlanStep> outp = new List<AiPlanStep>();
+        if (docs == null) { return outp; }
+        for (int i = 0; i < docs.Count; i = i + 1) {
+            TaskItemDoc d = docs[i];
+            if (d == null || d.t == null || d.t == "") { continue; }
+            outp.Add(AiPlanStep.Create(d.t, d.d));
+        }
+        return outp;
     }
 
     static List<TaskPartDoc> PartDocs(List<AiTaskPart> parts) {
@@ -254,7 +340,12 @@ class AiTaskGraph {
         p.AddInt(m.progress);
         p.Add(m.text);
         p.Add(m.reason);
-        p.AddLong(DateTime.UtcNow().ToUnixSeconds());
+        // 时刻跟着消息走，不是「写进库的那一刻」：一次批量归档（把一整段
+        // 对话导入节点）会把几十轮全写成同一秒。旧消息没记时间时才
+        // 取现在，好比入库留个 0。
+        long at = m.at;
+        if (at <= 0) { at = DateTime.UtcNow().ToUnixSeconds(); }
+        p.AddLong(at);
         int rc = db.Execute("INSERT INTO node_msg "
             + "(node, role, agent, dest, kind, progress, body, reason, ts) "
             + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", p);
@@ -273,7 +364,7 @@ class AiTaskGraph {
         DbParams p = new DbParams();
         p.Add(node);
         DbResult r = db.Query("SELECT role, agent, dest, kind, progress, body,"
-            + " reason FROM node_msg WHERE node = ? ORDER BY seq", p);
+            + " reason, ts FROM node_msg WHERE node = ? ORDER BY seq", p);
         for (int i = 0; i < r.RowCount(); i = i + 1) {
             ChatMessage m = ChatMessage.CreateWithReason(r.GetString(i, 0),
                 r.GetString(i, 5), r.GetString(i, 6));
@@ -282,6 +373,9 @@ class AiTaskGraph {
             m.kind = r.GetString(i, 3);
             m.taskId = node;
             m.progress = Convert.ToInt32(r.GetString(i, 4));
+            // 记录里留的时刻要盖回去（Create 给的是「现在」），否则切回一个
+            // 节点，它去年说过的话也显示成刚刚说的。
+            m.at = r.GetLong(i, 7);
             outMsgs.Add(m);
         }
         db.Close();
@@ -320,32 +414,9 @@ class AiTaskGraph {
     }
 
     // --- graph <-> canvas ----------------------------------------------------
-
-    /// The task graph as canvas nodes. The lock state is not stored here: the
-    /// canvas derives it from `deps` + `done`, so a node cannot be shown
-    /// unlocked while its前置 is still open.
-    static List<GraphNode> ToNodes(List<AiTask> tasks) {
-        List<GraphNode> outNodes = new List<GraphNode>();
-        for (int i = 0; i < tasks.Count; i = i + 1) {
-            AiTask t = tasks[i];
-            GraphNode n = GraphNode.Of(t.id, AiTaskGraph.CardTitle(t));
-            if (t.owner != "") {
-                n = n.WithTag(AiTeam.DisplayName(t.owner),
-                    AiTeam.RoleTagClass(t.owner));
-            }
-            n = n.WithState(AiTeam.TaskStateName(t.state),
-                AiTeam.TaskStateClass(t.state));
-            n = n.WithProgress(t.progress);
-            if (t.state == AiTeam.TaskDone()) { n = n.Finished(); }
-            if (t.deps != null) {
-                for (int d = 0; d < t.deps.Count; d = d + 1) {
-                    n = n.After(t.deps[d]);
-                }
-            }
-            outNodes.Add(n);
-        }
-        return outNodes;
-    }
+    //
+    // 图到画布节点（GraphNode）的映射在 views/TeamBoard.zan：服务层不依赖
+    // Gui（docs/projects/zanide/STRUCTURE.md），持久化和界面各归各处。
 
     /// 卡片上显示的标题：任务号 + 标题，因为依赖是按任务号说的，卡片上不带号
     /// 的话用户没法把「前置 T-2」对到某张卡上。

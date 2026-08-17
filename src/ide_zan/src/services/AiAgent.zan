@@ -73,12 +73,138 @@ class AiAgent {
         return rest.Substring(0, b);
     }
 
+    /// 流式过程中给聊天区看的那一段。
+    ///
+    /// 工具调用的正文（write_file 的整个文件、edit_file 的前后文本）是给 IDE
+    /// 看的，不是给人读的：它一进流里，聊天区就被一整屏 `{"tool": "write_file",
+    /// "content": "using System;\\nusing ..."` 埋掉，而这段 JSON 对用户没有任何
+    /// 意义。所以工具块一露头就折成一行「▷ write_file 路径」——真正的结果稍后
+    /// 由工具消息（本来就是一行可展开的摘要）给出，改了哪些文件、加减多少行由
+    /// 改动清单给出。答完之后落进存档的那条消息走的是同一个折叠
+    /// （`VisibleText`），流式过程与存档于是长一个样。
+    static string LiveText(string live) { return AiAgent.VisibleText(live); }
+
+    /// 一段回复里真正适合给人看的部分：正文照旧，工具调用折成一行
+    /// 「▷ 工具 路径」。带围栏的和模型忘了围栏、光吐一个裸 `{"tool": ...}` 的都算：
+    /// 一屏转义过的文件正文对人没有意义，而当时就是因为少了围栏没折，
+    /// 整屏密密麻麻的 JSON 铺了出来。
+    static string VisibleText(string reply) {
+        int cut = ZanIDE.IndexOfStr(reply, AiAgent.Fence());
+        int s = 0;
+        if (cut >= 0) {
+            s = cut + AiAgent.Fence().Length;
+        } else {
+            cut = AiAgent.BareCallAt(reply);
+            if (cut < 0) { return reply; }
+            s = cut;
+        }
+        string said = AiAgent.Trim(reply.Substring(0, cut));
+        // 从调用起点往后扫，不把尾巴切出来：那一段就是整个文件的正文，
+        // 流式期间每一拍复制一次几十万字节，界面就是在这里被拖住的。
+        string one = "▷ " + AiAgent.LiveCall(reply, s);
+        if (said == "") { return one; }
+        return said + "\n\n" + one;
+    }
+
+    /// 这段回复里的工具调用摘要是不是已经定型了（工具名和第一个参数都拿到了）。
+    /// 定型之后，后面再来多少字节都只是工具正文，摘要那一行不会再变——预览是
+    /// 装饰性的（最终那一轮从整段原文重新解析），于是轮询可以停下来，不必为一个
+    /// 越来越长的正文每一拍复制、折行、重排一次。
+    static bool CallSettled(string reply) {
+        int cut = ZanIDE.IndexOfStr(reply, AiAgent.Fence());
+        int s = 0;
+        if (cut >= 0) {
+            s = cut + AiAgent.Fence().Length;
+        } else {
+            cut = AiAgent.BareCallAt(reply);
+            if (cut < 0) { return false; }
+            s = cut;
+        }
+        if (AiAgent.LiveField(reply, "tool", s) == "") { return false; }
+        if (AiAgent.LiveField(reply, "path", s) != "") { return true; }
+        if (AiAgent.LiveField(reply, "pattern", s) != "") { return true; }
+        if (AiAgent.LiveField(reply, "query", s) != "") { return true; }
+        return false;
+    }
+
+    /// 没带围栏的那个工具 JSON 从哪儿开始（没有就是 -1）。只看开头那一句
+    /// `{"tool"`：说得再宽就会把普通说明里提到的字段名当成调用。
+    static int BareCallAt(string reply) {
+        int a = ZanIDE.IndexOfStr(reply, "{\"tool\"");
+        int b = ZanIDE.IndexOfStr(reply, "{ \"tool\"");
+        if (a < 0) { return b; }
+        if (b < 0) { return a; }
+        if (b < a) { return b; }
+        return a;
+    }
+
+    /// 还没收完的那段工具 JSON 里，已经能看出来的「工具名 + 路径」。JSON 是
+    /// 半截的，所以不解析、只按字段名往后扫第一个字符串值。
+    static string LiveCall(string partial, int from) {
+        string tool = AiAgent.LiveField(partial, "tool", from);
+        if (tool == "") { return ZanIDE.T("preparing a tool call", "正在准备工具调用"); }
+        string name = AiAgent.ToolLabel(tool);
+        string path = AiAgent.LiveField(partial, "path", from);
+        if (path != "") { return name + " " + path; }
+        string pattern = AiAgent.LiveField(partial, "pattern", from);
+        if (pattern != "") { return name + " \"" + pattern + "\""; }
+        string query = AiAgent.LiveField(partial, "query", from);
+        if (query != "") { return name + " \"" + query + "\""; }
+        return name;
+    }
+
+    /// `"key": "value"` 里的 value（找不到就是 ""）。转义序列不还原：这一行是
+    /// 给人扫一眼的路径，不是要拿去打开文件。
+    static string LiveField(string s, string key, int from) {
+        int at = ZanIDE.IndexOfFrom(s, "\"" + key + "\"", from);
+        if (at < 0) { return ""; }
+        int i = at + key.Length + 2;
+        int n = s.Length;
+        // 按字节看，不逐字符切子串：`Substring(i, 1)` 每个字符都要新分配一个
+        // 字符串，扫一段几十万字节的正文就是几十万次分配。
+        while (i < n && (s[i] & 255) != 34) {
+            int ch = s[i] & 255;
+            if (ch != 32 && ch != 58 && ch != 10 && ch != 13 && ch != 9) {
+                return "";
+            }
+            i = i + 1;
+        }
+        i = i + 1;
+        int b = i;
+        while (b < n && (s[b] & 255) != 34) { b = b + 1; }
+        if (b > n) { return ""; }
+        return s.Substring(i, b - i);
+    }
+
     /// The reply with its tool block removed -- what is worth showing in the
     /// transcript while the tool runs.
     static string StripToolBlock(string reply) {
         int a = ZanIDE.IndexOfStr(reply, AiAgent.Fence());
         if (a < 0) { return reply; }
         return AiAgent.Trim(reply.Substring(0, a));
+    }
+
+    /// 存进对话记录里的那一份工具调用（模型下一拍看到的就是这个）。
+    ///
+    /// 以前存的是剥掉工具块之后的正文，于是模型自己的历史里只剩「read_file
+    /// src/X.zan」这种大白话，它照着自己的历史学，下一拍就把调用写成文字，
+    /// IDE 收不到调用——「来回好几拍没进展」就是这么来的。所以历史里必须留下
+    /// 真正的块。write_file / edit_file 的正文不留（一整个文件重复一遍只是烧
+    /// 上下文，内容在上面的工具结果里），只留格式和路径。
+    static string ArchiveCall(string call) {
+        JsonValue v = JsonValue.ParseLenient(call);
+        if (v == null) { return ""; }
+        string tool = v.Str("tool", "");
+        if (tool == "") { return ""; }
+        if (!AiAgent.IsMutating(tool)) {
+            return AiAgent.Fence() + "\n" + AiAgent.Trim(call) + "\n```";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(AiAgent.Fence() + "\n{\"tool\": \"" + tool + "\"");
+        string path = v.Str("path", "");
+        if (path != "") { sb.Append(", \"path\": \"" + path + "\""); }
+        sb.Append(", \"...\": \"(正文见上面这次调用的结果，不重复)\"}\n```");
+        return sb.ToString();
     }
 
     static string Trim(string s) {
@@ -428,10 +554,26 @@ class AiAgent {
     /// a request too, so this is the outer, visible loop).
     static int MaxRetries() { return 2; }
 
-    /// How many times one question may be pushed on with a continue turn.
-    /// Each continue also refills the per-question tool budget, so this bounds
-    /// a runaway loop at MaxContinues() * MaxSteps() tool calls.
-    static int MaxContinues() { return 6; }
+    /// How many times one question may be pushed on with a continue turn when
+    /// the user has not set a budget in the AI settings. Each continue also
+    /// refills the per-question tool budget, so this bounds a runaway loop at
+    /// MaxContinues() * MaxSteps() tool calls. Generous on purpose: a task
+    /// graph of a dozen nodes spends a continue per hand-back, and stopping
+    /// mid-graph to ask for "continue" reads as the assistant giving up.
+    static int MaxContinues() { return 40; }
+
+    /// The ceiling behind "unlimited" (0 in the settings). A truly unbounded
+    /// loop has no way to stop a model that answers without ever finishing, so
+    /// "unlimited" means "far past any real task" rather than "no bound".
+    static int ContinuesCeiling() { return 100000; }
+
+    /// The continue budget in force: what the user configured, 0 meaning
+    /// unlimited, and a negative value meaning "never configured" -> default.
+    static int ContinuesBudget(int configured) {
+        if (configured < 0) { return AiAgent.MaxContinues(); }
+        if (configured == 0) { return AiAgent.ContinuesCeiling(); }
+        return configured;
+    }
 
     /// True when a failed request looks like a transport hiccup rather than a
     /// refusal from the provider: a dropped connection, an idle timeout, a
@@ -488,11 +630,74 @@ class AiAgent {
             + " When every step is done, say so in one line and stop.";
     }
 
+    /// 回复里明明想调用工具、却没能解析成工具块时，给模型的纠错提示（""=没有
+    /// 这种迹象）。
+    ///
+    /// 这就是「来回好几拍都没有进展」的真正原因：模型把调用写成了大白话
+    /// （`read_file src/Main.zan`），或者工具块太长被截断没闭合，IDE 于是当成
+    /// 「这一拍只说话没动手」，只回一句「上一拍没真做」——它永远不知道自己格式
+    /// 错了，于是原样再来一遍。这里把失败原因直接说给它听。
+    static string BadToolHint(string reply) {
+        if (AiAgent.ToolBlock(reply) != "") { return ""; }
+        if (ZanIDE.IndexOfStr(reply, AiAgent.Fence()) >= 0) {
+            return "[auto] 你上一拍的工具块没有闭合（结尾的 ``` 丢了，通常是内容"
+                + "太长被截断），所以那个调用根本没有执行。重发这一个调用：一次"
+                + "只发一个 " + AiAgent.Fence() + " 块并且收尾闭合；文件很大就拆"
+                + "成几次 write_file，或者用 edit_file 只改要改的那几行。";
+        }
+        if (!AiAgent.MentionsTool(reply)) { return ""; }
+        return "[auto] 你上一拍只把工具名写成了文字，IDE 没有收到任何调用（能被"
+            + "执行的只有工具块，别的写法一律无效）。照这个格式把你刚才想做的那"
+            + "一个调用重发一遍：\n" + AiAgent.Fence()
+            + "\n{\"tool\": \"read_file\", \"path\": \"src/Main.zan\"}\n```";
+    }
+
+    /// 回复里是不是提到了某个工具名：用来判断「它本来是想调用工具」。`run` /
+    /// `plan` 这种太常见的词不算，免得把普通说明当成格式错误。
+    static bool MentionsTool(string reply) {
+        return ZanIDE.IndexOfStr(reply, "read_file") >= 0
+            || ZanIDE.IndexOfStr(reply, "write_file") >= 0
+            || ZanIDE.IndexOfStr(reply, "edit_file") >= 0
+            || ZanIDE.IndexOfStr(reply, "list_dir") >= 0
+            || ZanIDE.IndexOfStr(reply, "repo_map") >= 0
+            || ZanIDE.IndexOfStr(reply, "stdlib_read") >= 0
+            || ZanIDE.IndexOfStr(reply, "stdlib_grep") >= 0
+            || ZanIDE.IndexOfStr(reply, "api_search") >= 0
+            || ZanIDE.IndexOfStr(reply, "ui_check") >= 0
+            || ZanIDE.IndexOfStr(reply, "grep") >= 0;
+    }
+
     /// True for a tool that changes the project or runs code, so the panel
     /// asks the user before it runs (unless Auto-execute is on).
     static bool IsMutating(string tool) {
         return tool == "write_file" || tool == "edit_file"
             || tool == "build" || tool == "run" || tool == "ui_check";
+    }
+
+    /// 纯查询工具：结果只取决于工程当前的内容，没有写入发生时同一个调用
+    /// 再跑一遍只会返回一模一样的东西。
+    static bool IsLookup(string tool) {
+        return tool == "read_file" || tool == "list_dir" || tool == "grep"
+            || tool == "repo_map" || tool == "stdlib_read"
+            || tool == "stdlib_grep" || tool == "api_search"
+            || tool == "example";
+    }
+
+    /// 一个查询调用的身份：工具名加上真正决定结果的那几个参数。签名相同就是
+    /// 同一次查询，调用方据此拦掉重复的第二次（见 ZanIDE.AiSeenTool）。
+    static string CallSig(string json) {
+        JsonValue v = JsonValue.ParseLenient(json);
+        if (v == null) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(v.Str("tool", ""));
+        sb.Append("|" + v.Str("path", ""));
+        sb.Append("|" + v.Str("pattern", ""));
+        sb.Append("|" + v.Str("ext", ""));
+        sb.Append("|" + v.Str("query", ""));
+        sb.Append("|" + v.Str("topic", ""));
+        sb.Append("|" + Convert.ToString(v.Int("offset", 1)));
+        sb.Append("|" + Convert.ToString(v.Int("limit", 0)));
+        return sb.ToString();
     }
 
     /// The tool name of a call, or "" for a malformed one.
@@ -502,30 +707,52 @@ class AiAgent {
         return v.Str("tool", "");
     }
 
+    /// 工具名在界面上的叫法：聊天区是给人看的，“read_file”“edit_file”是协议
+    /// 里的字眼，不是人话。发给模型的调用名照旧（只换显示，不动协议）；
+    /// 认不出来的就原样显示。
+    static string ToolLabel(string tool) {
+        if (tool == "read_file") { return ZanIDE.T("read_file", "读取文件"); }
+        if (tool == "write_file") { return ZanIDE.T("write_file", "写入文件"); }
+        if (tool == "edit_file") { return ZanIDE.T("edit_file", "修改文件"); }
+        if (tool == "list_dir") { return ZanIDE.T("list_dir", "列目录"); }
+        if (tool == "grep") { return ZanIDE.T("grep", "搜代码"); }
+        if (tool == "repo_map") { return ZanIDE.T("repo_map", "工程概览"); }
+        if (tool == "stdlib_read") { return ZanIDE.T("stdlib_read", "读标准库"); }
+        if (tool == "stdlib_grep") { return ZanIDE.T("stdlib_grep", "搜标准库"); }
+        if (tool == "api_search") { return ZanIDE.T("api_search", "查接口"); }
+        if (tool == "example") { return ZanIDE.T("example", "看示例"); }
+        if (tool == "plan") { return ZanIDE.T("plan", "列计划"); }
+        if (tool == "build") { return ZanIDE.T("build", "编译"); }
+        if (tool == "run") { return ZanIDE.T("run", "运行"); }
+        if (tool == "run_errors") { return ZanIDE.T("run_errors", "运行错误"); }
+        if (tool == "ui_check") { return ZanIDE.T("ui_check", "界面校验"); }
+        if (tool == "ui_tree") { return ZanIDE.T("ui_tree", "界面结构"); }
+        if (tool == "diff") { return ZanIDE.T("diff", "改动清单"); }
+        return tool;
+    }
+
     /// A one-line description of a call, shown folded in the transcript so the
     /// user can see what the assistant looked at.
     static string Describe(string json) {
         JsonValue v = JsonValue.ParseLenient(json);
-        if (v == null) { return "tool"; }
+        if (v == null) { return ZanIDE.T("tool", "工具"); }
         string tool = v.Str("tool", "?");
-        if (tool == "grep") {
-            return "grep \"" + v.Str("pattern", "") + "\"";
+        string name = AiAgent.ToolLabel(tool);
+        if (tool == "grep" || tool == "stdlib_grep") {
+            return name + " \"" + v.Str("pattern", "") + "\"";
         }
-        if (tool == "repo_map") { return "repo_map"; }
         if (tool == "api_search") {
-            return "api_search \"" + v.Str("query", "") + "\"";
+            return name + " \"" + v.Str("query", "") + "\"";
         }
         if (tool == "example") {
-            return "example " + v.Str("topic", "");
+            return name + " " + v.Str("topic", "");
         }
-        if (tool == "plan") { return "plan"; }
-        if (tool == "build") { return "build"; }
-        if (tool == "run") { return "run"; }
-        if (tool == "ui_check") { return "ui_check"; }
-        if (tool == "ui_tree") { return "ui_tree"; }
-        if (tool == "diff") { return "diff"; }
-        if (tool == "run_errors") { return "run_errors"; }
-        return tool + " " + v.Str("path", "");
+        if (tool == "repo_map" || tool == "plan" || tool == "build"
+            || tool == "run" || tool == "ui_check" || tool == "ui_tree"
+            || tool == "diff" || tool == "run_errors") {
+            return name;
+        }
+        return name + " " + v.Str("path", "");
     }
 
     /// Makes a model-supplied UiDriver script safe to run unattended: appends a
@@ -578,7 +805,7 @@ class AiAgent {
         if (resultsLog != "") {
             string rl = resultsLog;
             if (rl.Length > 4000) {
-                rl = rl.Substring(rl.Length - 4000, 4000);
+                rl = AiAgent.ClipTail(rl, 4000);
             }
             sb.Append("--- driver log ---\n" + rl);
             if (rl.Length > 0 && rl.Substring(rl.Length - 1, 1) != "\n") {
@@ -590,14 +817,14 @@ class AiAgent {
         if (regionsJson != "") {
             string rj = regionsJson;
             if (rj.Length > 6000) {
-                rj = rj.Substring(0, 6000) + " ...(truncated)";
+                rj = AiAgent.Clip(rj, 6000) + " ...(truncated)";
             }
             sb.Append("--- hit regions (x,y,w,h per widget) ---\n" + rj + "\n");
         }
         if (themeJson != "") {
             string tj = themeJson;
             if (tj.Length > 4000) {
-                tj = tj.Substring(0, 4000) + " ...(truncated)";
+                tj = AiAgent.Clip(tj, 4000) + " ...(truncated)";
             }
             sb.Append("--- skin style tokens (scale is x1000) ---\n"
                 + tj + "\n");
@@ -723,7 +950,7 @@ class AiAgent {
         for (int i = 0; i < lines.Count && hits.Count < 80; i = i + 1) {
             if (ZanIDE.IndexOfStr(lines[i], pattern) >= 0) {
                 string txt = lines[i];
-                if (txt.Length > 200) { txt = txt.Substring(0, 200) + "..."; }
+                if (txt.Length > 200) { txt = AiAgent.Clip(txt, 200) + "..."; }
                 hits.Add(rel + ":" + Convert.ToString(i + 1) + ": " + txt);
             }
         }
@@ -737,14 +964,14 @@ class AiAgent {
         string mapPath = root + "/.zanmap/repo.map.txt";
         if (File.Exists(mapPath)) {
             string rm = File.ReadAllText(mapPath);
-            if (rm.Length > 12000) { rm = rm.Substring(0, 12000) + "\n... truncated"; }
+            if (rm.Length > 12000) { rm = AiAgent.Clip(rm, 12000) + "\n... truncated"; }
             return rm;
         }
         StringBuilder sb = new StringBuilder();
         sb.Append("(no RepoMap outline yet; auto-generated project tree)\n");
         AiAgent.AutoMap(root, sb, 0);
         string tree = sb.ToString();
-        if (tree.Length > 12000) { tree = tree.Substring(0, 12000) + "\n... truncated"; }
+        if (tree.Length > 12000) { tree = AiAgent.Clip(tree, 12000) + "\n... truncated"; }
         return tree;
     }
 
@@ -787,6 +1014,28 @@ class AiAgent {
     }
 
     // --- write tools ---------------------------------------------------------
+
+    /// 一次改动的行数变化：掐掉首尾完全相同的行之后，新文本剩下的行算「增」、
+    /// 旧文本剩下的行算「删」。
+    ///
+    /// 这不是最小编辑距离（那要 O(n*m)，而这条路径上每写一个文件都要算一次），
+    /// 对一次连续的改动它就是准的；改了好几处时它报的是「从第一处到最后一处这
+    /// 一段」的行数，偏大而不会偏小，也绝不会把没动过的头尾算成改动。
+    static AiLineDelta LineDelta(string oldText, string newText) {
+        List<string> a = ZanIDE.Lines(oldText);
+        List<string> b = ZanIDE.Lines(newText);
+        if (oldText == newText) { return AiLineDelta.Of(0, 0); }
+        int head = 0;
+        while (head < a.Count && head < b.Count && a[head] == b[head]) {
+            head = head + 1;
+        }
+        int tail = 0;
+        while (tail < a.Count - head && tail < b.Count - head
+            && a[a.Count - 1 - tail] == b[b.Count - 1 - tail]) {
+            tail = tail + 1;
+        }
+        return AiLineDelta.Of(b.Count - head - tail, a.Count - head - tail);
+    }
 
     /// Writes `content` to `path`, creating parent directories as needed.
     /// Used for new files or full rewrites; prefer `edit_file` for a small
@@ -878,7 +1127,13 @@ class AiAgent {
     /// The assistant's standing instructions. The rules are what keep a model
     /// from guessing: look before answering, fix the general layer, and never
     /// claim something works without having checked it.
-    static string SystemPrompt(string ctxName, string ctxCode, string root) {
+    ///
+    /// 这一段每一拍都逐字节相同，因此它就是供应商 prompt 缓存命中的那段前缀
+    /// （缓存是按前缀匹配的：前面差一个字节，后面全部重新计费）。每一拍都在变的
+    /// 现场 —— 当前打开的文件、任务图 —— 一律放 `ContextBlock`，作为最后一条
+    /// 消息发出去，别写回这里；只在项目变了才变的项目结构/项目知识定型一份接
+    /// 在这一段后面（`ProjectRef`）。
+    static string BaseInstructions() {
         StringBuilder sb = new StringBuilder();
         sb.Append("You are Xiao Zan (小赞), the assistant built into Zan IDE,"
             + " the IDE of the"
@@ -894,8 +1149,9 @@ class AiAgent {
             + "- grep {pattern, path, ext}: substring search across the project;"
             + " returns path:line: text.\n"
             + "- repo_map {}: full outline of the codebase. A project tree is"
-            + " ALREADY included in this system message, so you rarely need it;"
-            + " call it only when you need a deeper tree than the one here.\n"
+            + " ALREADY included in this message (Project structure, below),"
+            + " so you rarely need it; call it only when you need a deeper"
+            + " tree than the one there.\n"
             + "- stdlib_read {path, offset, limit} / stdlib_grep {pattern, path,"
             + " ext}: read/search the Zan STANDARD LIBRARY source shipped with"
             + " the IDE (paths relative to the stdlib root, e.g."
@@ -923,7 +1179,10 @@ class AiAgent {
             + " refused, so include enough surrounding lines. Prefer this for"
             + " small changes.\n"
             + "- write_file {path, content}: create a new file or fully rewrite"
-            + " one. `content` is the whole file.\n"
+            + " one. `content` is the whole file. Keep one call under ~200"
+            + " lines: a longer reply gets cut off mid-block, the call is then"
+            + " unparsable and NOTHING runs. Split a big file into a first"
+            + " write_file plus edit_file additions.\n"
             + "- build {}: compile the current run target and send you the"
             + " compiler errors/warnings.\n"
             + "- run {}: build, then launch the program.\n"
@@ -1077,28 +1336,84 @@ class AiAgent {
             + " assets.\n"
             + "Start from examples/game/* (snake, breakout, gomoku, weiqi,"
             + " xiangqi, ddz, ra2).\n\n");
+        return sb.ToString();
+    }
+
+    /// 这一拍的现场：当前打开的文件和自己拆出来的任务图。每一拍都可能变（用户
+    /// 敲一个字、工具改一个文件、任务图动一下），所以它单独作为**最后一条**消息
+    /// 发出去：前面的系统指令、项目参考和整段对话于是逐字节不变，供应商的
+    /// prompt 缓存才有东西可命中。
+    static string ContextBlock(string ctxName, string ctxCode, string root) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("CURRENT CONTEXT (refreshed every turn; always trust this"
+            + " over anything older in the conversation).\n\n");
         if (ctxName != "") {
             string ctx = ctxCode;
-            if (ctx.Length > 6000) { ctx = ctx.Substring(0, 6000); }
+            if (ctx.Length > 6000) { ctx = AiAgent.Clip(ctx, 6000); }
             sb.Append("The user is currently editing " + ctxName
                 + ". Its current content:\n" + ctx + "\n\n");
         }
+        // 项目参考定型之后才变的那种情况（工具新建了文件、知识被写了一条）：
+        // 差异走这条消息补，前缀那份一个字都不动。重写前缀等于把整段对话的
+        // 缓存一起作废，为一次结构变动付那个价钱不值得。
         if (root != "") {
-            string mapPath = root + "/.zanmap/repo.map.txt";
-            string rm = "";
-            if (File.Exists(mapPath)) {
-                rm = File.ReadAllText(mapPath);
-            } else {
-                // No RepoMap outline: generate the project tree on the fly so
-                // the model still starts with the project's shape.
-                StringBuilder am = new StringBuilder();
-                am.Append("(auto-generated project tree; no RepoMap outline)\n");
-                AiAgent.AutoMap(root, am, 0);
-                rm = am.ToString();
+            string now = AiAgent.ProjectRefNow(root);
+            if (now != AiAgent.ProjectRef(root)) {
+                sb.Append("PROJECT REFERENCE UPDATED since the copy in the"
+                    + " system message -- this is the current one:\n"
+                    + now + "\n");
             }
-            if (rm.Length > 8000) { rm = rm.Substring(0, 8000); }
-            sb.Append("Project structure (RepoMap outline -- files, classes"
-                + " and method signatures):\n" + rm + "\n");
+        }
+        // 自己拆出来的任务图（含当前打开的节点、能开工的节点，以及怎么改
+        // 它）。不告诉它图长什么样，它就只能把图当作一次性的清单发完就忘。
+        sb.Append(AiTeam.Board());
+        return sb.ToString();
+    }
+
+    // 项目参考（RepoMap 结构 + 项目知识）：内容只在项目本身变了才变，但足有
+    // 一万多字节。以前它跟着现场每一拍重发一遍，那一万多字节于是每一拍都落在
+    // 缓存前缀之外——这就是命中率上不去的大头。现在在会话第一次请求时定型一
+    // 份，挂在系统消息后面进到前缀里，之后逐字节复用。
+    static string gProjRef;
+    static string gProjRoot;
+
+    /// 这个项目定型的那份项目参考（第一次问到就按当前项目生成并留下来）。
+    static string ProjectRef(string root) {
+        if (root == "") { return ""; }
+        if (AiAgent.gProjRef == null || AiAgent.gProjRoot != root) {
+            AiAgent.gProjRoot = root;
+            AiAgent.gProjRef = AiAgent.ProjectRefNow(root);
+        }
+        return AiAgent.gProjRef;
+    }
+
+    /// 现在这一刻的项目参考：项目结构（RepoMap 大纲，没有就现生成目录树）加
+    /// 项目知识（`.zan/knowledge.md` 里已经验收通过的结论——它是这个项目里
+    /// 「已经定成什么样」的现有事实，所以先读它再动手，别把上一个任务定下来的
+    /// 东西重新讨论一遍）。
+    static string ProjectRefNow(string root) {
+        if (root == "") { return ""; }
+        StringBuilder sb = new StringBuilder();
+        string mapPath = root + "/.zanmap/repo.map.txt";
+        string rm = "";
+        if (File.Exists(mapPath)) {
+            rm = File.ReadAllText(mapPath);
+        } else {
+            // No RepoMap outline: generate the project tree on the fly so
+            // the model still starts with the project's shape.
+            StringBuilder am = new StringBuilder();
+            am.Append("(auto-generated project tree; no RepoMap outline)\n");
+            AiAgent.AutoMap(root, am, 0);
+            rm = am.ToString();
+        }
+        if (rm.Length > 8000) { rm = AiAgent.Clip(rm, 8000); }
+        sb.Append("Project structure (RepoMap outline -- files, classes"
+            + " and method signatures):\n" + rm + "\n");
+        string kn = AiTaskGraph.LoadNotes(root, 4000);
+        if (AiAgent.Trim(kn) != "") {
+            sb.Append("Project knowledge (.zan/knowledge.md -- settled"
+                + " conclusions from accepted tasks; treat as current"
+                + " fact and keep it up to date):\n" + kn + "\n\n");
         }
         return sb.ToString();
     }
@@ -1218,54 +1533,166 @@ class AiAgent {
 
     // --- context compaction --------------------------------------------------
 
-    // Per-model request limits set by the IDE from the enabled profile before
-    // each request: `gCtxTokens` is the selected model's context length (tokens,
-    // 0 = use the built-in default) and `gMaxOut` its maximum output length
-    // (tokens, 0 = don't send max_tokens). Globals so the many AiLaunch call
-    // sites and the context-usage ring share one source without threading two
-    // extra parameters through every one of them.
-    static int gCtxTokens;
-    static int gMaxOut;
-    // How many requests so far went out with an older part of the chat folded
-    // into a digest, and how many raw turns the LAST such fold replaced. The
-    // usage card reads these so "why is the context never near 200k?" has a
-    // visible answer instead of looking like the limit is not being used.
-    static int gCompactions;
-    static int gLastDropped;
+    // 生效服务商的限额表（模型 -> {ctx, out}，就是设置里那张表）和聊天框选中
+    // 的默认模型，由面板每帧刷新。团队模式下每个成员各跑自己的模型，上下文
+    // 窗口和输出上限也就各不相同，所以这里存的是「按模型查」的那张表，而不是
+    // 一份被所有人共用的数字——共用那份就是「统计不对、压缩按别人的窗口算」的
+    // 来源。
+    static string gLimits;
+    static string gChatModel;
 
-    /// Requests sent with compacted context, and the turns the last one folded.
-    static int Compactions() { return AiAgent.gCompactions; }
-    static int LastDropped() { return AiAgent.gLastDropped; }
+    // 每个成员各自的压缩记录：谁的上下文被折叠过几次、最近那次折掉了几轮。
+    // 一个成员因为自己的窗口小而压缩，不该显示成全队都压缩了。下标一一对应，
+    // 空成员名（"" ）就是单人模式那一份。
+    static List<string> gCompRoles;
+    static List<int> gCompCount;
+    static List<int> gCompDrop;
+
+    static void EnsureCompRoles() {
+        if (AiAgent.gCompRoles == null) {
+            AiAgent.gCompRoles = new List<string>();
+            AiAgent.gCompCount = new List<int>();
+            AiAgent.gCompDrop = new List<int>();
+        }
+    }
+
+    /// 这个成员在压缩记录里的下标；`make` 为真时没有就建一条。
+    static int CompSlot(string agent, bool make) {
+        AiAgent.EnsureCompRoles();
+        string who = agent;
+        if (who == null) { who = ""; }
+        for (int i = 0; i < AiAgent.gCompRoles.Count; i = i + 1) {
+            if (AiAgent.gCompRoles[i] == who) { return i; }
+        }
+        if (!make) { return 0 - 1; }
+        AiAgent.gCompRoles.Add(who);
+        AiAgent.gCompCount.Add(0);
+        AiAgent.gCompDrop.Add(0);
+        return AiAgent.gCompRoles.Count - 1;
+    }
+
+    static void NoteCompaction(string agent, int dropped) {
+        int s = AiAgent.CompSlot(agent, true);
+        AiAgent.gCompCount[s] = AiAgent.gCompCount[s] + 1;
+        AiAgent.gCompDrop[s] = dropped;
+    }
+
+    /// 这个成员的上下文被折叠过几次请求，以及最近那次折掉了几轮。
+    static int CompactionsOf(string agent) {
+        int s = AiAgent.CompSlot(agent, false);
+        if (s < 0) { return 0; }
+        return AiAgent.gCompCount[s];
+    }
+
+    static int LastDroppedOf(string agent) {
+        int s = AiAgent.CompSlot(agent, false);
+        if (s < 0) { return 0; }
+        return AiAgent.gCompDrop[s];
+    }
+
+    /// 全队一共压缩过几次（本次会话的总数）。
+    static int Compactions() {
+        AiAgent.EnsureCompRoles();
+        int acc = 0;
+        for (int i = 0; i < AiAgent.gCompCount.Count; i = i + 1) {
+            acc = acc + AiAgent.gCompCount[i];
+        }
+        return acc;
+    }
+
     static void ResetCompaction() {
-        AiAgent.gCompactions = 0;
-        AiAgent.gLastDropped = 0;
+        AiAgent.gCompRoles = new List<string>();
+        AiAgent.gCompCount = new List<int>();
+        AiAgent.gCompDrop = new List<int>();
+        AiAgent.gCompFrom = new List<int>();
+        AiAgent.gCompText = new List<string>();
     }
 
-    /// Records the enabled model's configured limits for the next request.
-    static void SetLimits(int ctxTokens, int maxOut) {
-        AiAgent.gCtxTokens = ctxTokens;
-        AiAgent.gMaxOut = maxOut;
+    // 已经定型的那份摘要：折掉了前 `gCompFrom` 轮，正文是 `gCompText`。留着它
+    // 是为了让摘要**逐字节不变**：摘要在消息序列里排在最前面，改一个字就等于
+    // 换掉整份前缀，它后面的每一条历史在供应商那边都要重新计费（prompt 缓存按
+    // 前缀匹配），命中率于是永远归零。
+    static List<int> gCompFrom;
+    static List<string> gCompText;
+
+    static void EnsureSticky() {
+        AiAgent.EnsureCompRoles();
+        if (AiAgent.gCompFrom == null) {
+            AiAgent.gCompFrom = new List<int>();
+            AiAgent.gCompText = new List<string>();
+        }
+        while (AiAgent.gCompFrom.Count < AiAgent.gCompRoles.Count) {
+            AiAgent.gCompFrom.Add(0);
+            AiAgent.gCompText.Add("");
+        }
     }
 
-    /// The configured maximum output length (tokens); 0 means "unset".
-    static int MaxOutTokens() { return AiAgent.gMaxOut; }
+    /// 这个成员已经定型的摘要折掉了前几轮（0 = 还没折过）。
+    static int StickyFrom(string agent) {
+        AiAgent.EnsureSticky();
+        int s = AiAgent.CompSlot(agent, false);
+        if (s < 0 || s >= AiAgent.gCompFrom.Count) { return 0; }
+        return AiAgent.gCompFrom[s];
+    }
 
-    /// Default context length (tokens) for a model with no explicit setting.
-    static int DefaultCtxTokens() { return 200000; }
+    /// 这个成员已经定型的摘要正文（"" = 还没折过）。
+    static string StickyText(string agent) {
+        AiAgent.EnsureSticky();
+        int s = AiAgent.CompSlot(agent, false);
+        if (s < 0 || s >= AiAgent.gCompText.Count) { return ""; }
+        return AiAgent.gCompText[s];
+    }
+
+    static void SetSticky(string agent, int from, string text) {
+        int s = AiAgent.CompSlot(agent, true);
+        AiAgent.EnsureSticky();
+        AiAgent.gCompFrom[s] = from;
+        AiAgent.gCompText[s] = text;
+    }
+
+    /// Records the enabled provider's per-model limits table and the model the
+    /// chat box is on, so every launch can resolve the limits of the model that
+    /// launch actually runs on.
+    static void SetProvider(string limitsJson, string chatModel) {
+        AiAgent.gLimits = limitsJson;
+        AiAgent.gChatModel = chatModel;
+    }
+
+    /// 这个模型配置的上下文长度（token）；没配过就用默认。空模型名 = 聊天框
+    /// 选中的那个模型（单人模式，以及没给成员单独绑模型的时候）。
+    static int CtxTokensOf(string model) {
+        int tok = AiAgent.LimitOf(model, "ctx");
+        if (tok <= 0) { tok = AiAgent.DefaultCtxTokens(); }
+        return tok;
+    }
+
+    /// 这个模型配置的最大输出长度（token）；0 表示没配（请求里不带 max_tokens）。
+    static int MaxOutTokensOf(string model) {
+        return AiAgent.LimitOf(model, "out");
+    }
+
+    static int LimitOf(string model, string field) {
+        string m = model;
+        if (m == null || m == "") { m = AiAgent.gChatModel; }
+        if (m == null || m == "") { return 0; }
+        if (AiAgent.gLimits == null) { return 0; }
+        return ZanIDE.AiLimitInt(AiAgent.gLimits, m, field);
+    }
 
     /// Character budget for the running transcript (everything after the system
     /// prompt). Beyond this the oldest turns are folded into a compact digest so
     /// a long agent session keeps going instead of growing until it overflows
-    /// the model's context window. Derived from the selected model's configured
-    /// context length (tokens ~= 4 chars) when set, else a safe default.
-    static int MaxContextChars() {
-        int tok = AiAgent.gCtxTokens;
-        if (tok <= 0) { tok = AiAgent.DefaultCtxTokens(); }
-        return tok * 4;
+    /// the model's context window. Derived from THAT model's configured context
+    /// length (tokens ~= 4 chars) when set, else a safe default.
+    static int MaxContextCharsOf(string model) {
+        return AiAgent.CtxTokensOf(model) * 4;
     }
 
+    /// Default context length (tokens) for a model with no explicit setting.
+    static int DefaultCtxTokens() { return 200000; }
+
     /// Total characters of the running transcript -- the quantity BuildContext
-    /// measures against MaxContextChars() to decide when to compact, and what
+    /// measures against that model's budget to decide when to compact, and what
     /// the context-usage ring shows.
     static int ContextChars(List<ChatMessage> msgs) {
         int acc = 0;
@@ -1285,7 +1712,86 @@ class AiAgent {
 
     static string Cap(string s, int n) {
         if (s.Length <= n) { return s; }
-        return s.Substring(0, n) + " ...";
+        return AiAgent.Clip(s, n) + " ...";
+    }
+
+    /// 前 `cap` 个字节，但截断点退到字符边界上。
+    ///
+    /// 字符串按字节索引，一个汉字占三个字节，所以 `Substring(0, 6000)` 有
+    /// 三分之二的概率把某个汉字切成半个。半个字符不是合法 UTF-8，装进请求体
+    /// 之后服务端整包拒收（HTTP 400 invalid unicode code point），提示词里
+    /// 越靠后的内容越无辜地背锅。所以凡是按长度截提示词的地方都走这里。
+    static string Clip(string s, int cap) {
+        if (cap <= 0) { return ""; }
+        if (s.Length <= cap) { return s; }
+        int n = cap;
+        // 续字节是 10xxxxxx（128..191）：落在续字节上说明切进了字符中间，
+        // 往前退到这个字符的首字节为止。
+        while (n > 0) {
+            int b = s[n] & 255;
+            if (b < 128 || b > 191) { break; }
+            n = n - 1;
+        }
+        return s.Substring(0, n);
+    }
+
+    /// 末 `cap` 个字节，同样只在字符边界上开切（掐头留尾的场合用它）。
+    static string ClipTail(string s, int cap) {
+        if (cap <= 0) { return ""; }
+        if (s.Length <= cap) { return s; }
+        int st = s.Length - cap;
+        while (st < s.Length) {
+            int b = s[st] & 255;
+            if (b < 128 || b > 191) { break; }
+            st = st + 1;
+        }
+        return s.Substring(st, s.Length - st);
+    }
+
+    /// 把一段字节流洗成合法 UTF-8：非法字节换成 `?`。
+    ///
+    /// 请求体里只要有一个非法码点，服务端就整包 400，一整轮对话原地卡死；而
+    /// 非法字节的来源不止截断——read_file 读到 GBK 存的源文件、命令输出里的
+    /// 半截多字节字符，都会带进来。所以发送前统一过一遍，宁可显示成 `?` 也
+    /// 不能让整个请求发不出去。
+    static string SafeUtf8(string s) {
+        int bad = 0;
+        int i = 0;
+        while (i < s.Length) {
+            int need = AiAgent.SeqLen(s, i);
+            if (need <= 0) { bad = bad + 1; i = i + 1; } else { i = i + need; }
+        }
+        if (bad == 0) { return s; }
+        StringBuilder sb = new StringBuilder();
+        i = 0;
+        while (i < s.Length) {
+            int need = AiAgent.SeqLen(s, i);
+            if (need <= 0) {
+                sb.Append("?");
+                i = i + 1;
+                continue;
+            }
+            sb.Append(s.Substring(i, need));
+            i = i + need;
+        }
+        return sb.ToString();
+    }
+
+    /// 从 `i` 开始的这个 UTF-8 序列有几个字节；不是合法序列就返回 0。
+    static int SeqLen(string s, int i) {
+        int b = s[i] & 255;
+        if (b < 128) { return 1; }
+        int need = 0;
+        if (b >= 194 && b <= 223) { need = 2; }
+        if (b >= 224 && b <= 239) { need = 3; }
+        if (b >= 240 && b <= 244) { need = 4; }
+        if (need == 0) { return 0; }
+        if (i + need > s.Length) { return 0; }
+        for (int k = 1; k < need; k = k + 1) {
+            int c = s[i + k] & 255;
+            if (c < 128 || c > 191) { return 0; }
+        }
+        return need;
     }
 
     /// One line standing in for a turn that fell out of the verbatim window:
@@ -1300,6 +1806,7 @@ class AiAgent {
             string t = AiAgent.StripToolBlock(m.text);
             if (AiAgent.Trim(t) == "") {
                 string call = AiAgent.ToolBlock(m.text);
+                if (call == "") { call = AiAgent.ToolBlock(m.call); }
                 return "ASSISTANT: (called " + AiAgent.Describe(call) + ")";
             }
             return "ASSISTANT: " + AiAgent.Cap(t, 400);
@@ -1319,29 +1826,53 @@ class AiAgent {
     }
 
     /// Builds the message list actually sent to the model: recent turns kept
-    /// whole, and everything older than the budget replaced by a single digest
-    /// message. Returns the turns unchanged when the transcript is small.
-    static AiMessages BuildContext(List<ChatMessage> msgs) {
+    /// whole, and everything older than `budget` characters replaced by a single
+    /// digest message. Returns the turns unchanged when the transcript is small.
+    ///
+    /// `msgs` 是这个成员自己那份上下文（`AiTeam.ContextFor`），`budget` 是
+    /// 它自己那个模型的窗口，`agent` 只用来把压缩记到它名下：一个成员
+    /// 因为自己的窗口小而压缩，不会动到别人的上下文、也不会显示成全队都
+    /// 压缩了。
+    static AiMessages BuildContext(List<ChatMessage> msgs, int budget,
+            string agent) {
         AiMessages m = new AiMessages();
         m.msgs = new List<ChatMessage>();
         m.compacted = false;
         m.dropped = 0;
         int n = msgs.Count;
-        int budget = AiAgent.MaxContextChars();
-        int acc = 0;
-        int keepFrom = n;
-        for (int i = n - 1; i >= 0; i = i - 1) {
-            acc = acc + msgs[i].text.Length;
-            int kept = n - i;
-            if (acc > budget && kept > AiAgent.MinRecentTurns()) { break; }
-            keepFrom = i;
+        // 上一拍定型的那份摘要：只要它后面的尾部还放得下，就一个字都不动地
+        // 复用。重算一次摘要 = 换掉整份前缀，后面每一条历史都要重新计费。
+        int sticky = AiAgent.StickyFrom(agent);
+        string stickyText = AiAgent.StickyText(agent);
+        if (sticky > 0 && sticky <= n && stickyText != ""
+                && stickyText.Length + AiAgent.TailChars(msgs, sticky)
+                    <= budget) {
+            m.msgs.Add(ChatMessage.Create("user", stickyText));
+            for (int k = sticky; k < n; k = k + 1) { m.msgs.Add(msgs[k]); }
+            m.compacted = true;
+            m.dropped = sticky;
+            return m;
         }
-        if (keepFrom <= 0) {
+        if (sticky > n) {
+            // 换了一份记录（切换/删除会话）：旧摘要说的不是这段对话了。
+            AiAgent.SetSticky(agent, 0, "");
+            sticky = 0;
+        }
+        int keepFrom = AiAgent.FoldPoint(msgs, budget);
+        if (keepFrom <= 0 && sticky <= 0) {
             for (int k = 0; k < n; k = k + 1) {
                 m.msgs.Add(msgs[k]);
             }
             return m;
         }
+        // 重折的时候一次折到预算的一半，而不是刚好放得下：刚好放得下意味着
+        // 下一拍又要重折，摘要于是每一拍都在变，缓存一次也命不中。
+        int target = budget * AiAgent.CompactKeepPercent() / 100;
+        int folded = AiAgent.FoldPoint(msgs, target);
+        if (folded > keepFrom) { keepFrom = folded; }
+        if (keepFrom <= sticky) { keepFrom = sticky; }
+        if (keepFrom <= 0) { keepFrom = 1; }
+        if (keepFrom > n) { keepFrom = n; }
         StringBuilder d = new StringBuilder();
         d.Append("[Earlier turns were compacted to save context; digest of the"
             + " conversation so far -- decisions, files touched and findings:]\n");
@@ -1352,17 +1883,48 @@ class AiAgent {
                 break;
             }
         }
-        m.msgs.Add(ChatMessage.Create("user", d.ToString()));
+        string digest = d.ToString();
+        AiAgent.SetSticky(agent, keepFrom, digest);
+        m.msgs.Add(ChatMessage.Create("user", digest));
         int r = keepFrom;
         while (r < n) {
             m.msgs.Add(msgs[r]); r = r + 1;
         }
         m.compacted = true;
         m.dropped = keepFrom;
-        AiAgent.gCompactions = AiAgent.gCompactions + 1;
-        AiAgent.gLastDropped = keepFrom;
+        AiAgent.NoteCompaction(agent, keepFrom);
         return m;
     }
+
+    /// 从末尾往前累计，`limit` 个字符放得下的最早那一轮的下标（0 = 整份都
+    /// 放得下）。最近 `MinRecentTurns()` 轮无论多长都保留。
+    static int FoldPoint(List<ChatMessage> msgs, int limit) {
+        int n = msgs.Count;
+        int acc = 0;
+        int from = n;
+        for (int i = n - 1; i >= 0; i = i - 1) {
+            acc = acc + msgs[i].text.Length;
+            int kept = n - i;
+            if (acc > limit && kept > AiAgent.MinRecentTurns()) { break; }
+            from = i;
+        }
+        if (from > n) { from = n; }
+        if (from < 0) { from = 0; }
+        return from;
+    }
+
+    /// `from` 之后逐字发出的那部分有多少字符。
+    static int TailChars(List<ChatMessage> msgs, int from) {
+        int acc = 0;
+        for (int i = from; i < msgs.Count; i = i + 1) {
+            acc = acc + msgs[i].text.Length;
+        }
+        return acc;
+    }
+
+    /// 重折一次之后尾部占预算的比例：折到一半，之后好几十拍都能复用同一
+    /// 份摘要（摘要不变 = 前缀不变 = 缓存还能命中）。
+    static int CompactKeepPercent() { return 50; }
 }
 
 /// The message list handed to the endpoint after compaction: one entity per
@@ -1372,6 +1934,97 @@ class AiMessages {
     List<ChatMessage> msgs;
     bool compacted;
     int dropped;
+}
+
+/// Folds a stream INCREMENTALLY while it arrives: the live preview used to
+/// call `AiAgent.ParseSse` on the whole body every time it grew, which is a
+/// full JSON re-parse of everything received so far ten times a second -- the
+/// cost grows with the square of the answer's length, and it is what pinned a
+/// core (and made the window stutter) while a long reply streamed in.
+///
+/// This keeps a byte cursor into the body plus the two builders, so a frame
+/// only parses the event lines that are actually new. A stream that was
+/// replaced (a new question) or truncated (a retry) resets the fold: `gen` is
+/// the request generation the cursor belongs to.
+class SseLive {
+    int gen;
+    int cursor;
+    StringBuilder c;
+    StringBuilder r;
+    /// Carries the error / usage / done fields the fold collects, so
+    /// `AiAgent.FoldChunk` is reused verbatim instead of duplicated here.
+    SseAnswer a;
+    /// Whether `a.content` / `a.reasoning` still have to be materialised from
+    /// the builders (ToString is a copy; a frame that folded nothing skips it).
+    bool dirty;
+
+    SseLive() { this.Reset(0); }
+
+    void Reset(int g) {
+        gen = g;
+        cursor = 0;
+        c = new StringBuilder();
+        r = new StringBuilder();
+        a = new SseAnswer();
+        a.content = "";
+        a.reasoning = "";
+        a.error = "";
+        a.done = false;
+        a.promptTokens = 0;
+        a.completionTokens = 0;
+        a.totalTokens = 0;
+        a.cachedTokens = 0;
+        dirty = false;
+    }
+
+    /// Folds every COMPLETE event line past the cursor. A half-written tail
+    /// line stays unparsed until the rest of it arrives, so no chunk is folded
+    /// twice and none is dropped.
+    void Feed(int g, string raw) {
+        if (g != gen || raw.Length < cursor) { this.Reset(g); }
+        int n = raw.Length;
+        int i = cursor;
+        while (i < n) {
+            int nl = i;
+            while (nl < n && (raw[nl] & 255) != 10) { nl = nl + 1; }
+            if (nl >= n) { break; }
+            int lineEnd = nl;
+            if (lineEnd > i && (raw[lineEnd - 1] & 255) == 13) {
+                lineEnd = lineEnd - 1;
+            }
+            this.FoldLine(raw.Substring(i, lineEnd - i));
+            i = nl + 1;
+        }
+        cursor = i;
+    }
+
+    void FoldLine(string line) {
+        string payload = "";
+        bool isData = false;
+        if (line.Length >= 6 && line.Substring(0, 6) == "data: ") {
+            payload = line.Substring(6, line.Length - 6);
+            isData = true;
+        } else if (line.Length >= 5 && line.Substring(0, 5) == "data:") {
+            payload = AiAgent.Trim(line.Substring(5, line.Length - 5));
+            isData = true;
+        }
+        if (!isData) { return; }
+        if (payload == "[DONE]") { a.done = true; return; }
+        AiAgent.FoldChunk(a, c, r, JsonValue.ParseLenient(payload), payload);
+        dirty = true;
+    }
+
+    void Materialise() {
+        if (!dirty) { return; }
+        a.content = c.ToString();
+        a.reasoning = r.ToString();
+        dirty = false;
+    }
+
+    /// The answer so far.
+    string Content() { this.Materialise(); return a.content; }
+    /// The thinking so far.
+    string Reasoning() { this.Materialise(); return a.reasoning; }
 }
 
 /// A text/event-stream reply folded by `AiAgent.ParseSse`: `content` is the

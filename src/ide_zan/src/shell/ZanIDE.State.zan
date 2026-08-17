@@ -77,11 +77,15 @@ class AiProfile {
 class AiPlanStep {
     string text;
     int done;
+    /// 1 = 这一步就是「现在正在做的那一步」（第一条还没打勾的）。派生自
+    /// `done`，每帧由 `PlanStrip.Sync` 重算，不落盘。
+    int cur;
 
     static AiPlanStep Create(string text, int done) {
         AiPlanStep s = new AiPlanStep();
         s.text = text;
         s.done = done;
+        s.cur = 0;
         return s;
     }
 }
@@ -94,12 +98,19 @@ class AiSession {
     /// The name the user gave this chat. "" means the list shows its first
     /// message instead, which is only a guess at what the chat is about.
     string title;
+    /// 没有 `title` 时列表显示的那句话，从 `pack` 里取一次就存着：取它要把整
+    /// 段存档 JSON 解一遍，每帧为每个会话解一次是画不起的。
+    string derived;
+    /// `derived` 是从多长的 `pack` 上算出来的（-1 = 还没算过）。
+    int derivedLen;
 
     static AiSession Create(string pack, int archived) {
         AiSession s = new AiSession();
         s.pack = pack;
         s.archived = archived;
         s.title = "";
+        s.derived = "";
+        s.derivedLen = 0 - 1;
         return s;
     }
 }
@@ -255,6 +266,9 @@ partial class ZanIDE {
     int ctxX;
     int ctxY;
     int ctxTarget;
+    /// 右键落在任务图上时的节点号（ctxKind == 7）：图的行号会随重新分层
+    /// 变化，所以菜单记的是任务 id 而不是行。
+    string ctxTaskId;
     SignalInt tmplCatSel;
     Input tmplNameInput;
     List<WizardItem> saveItems;
@@ -381,6 +395,14 @@ partial class ZanIDE {
     /// at most once per second so streaming a long answer does not hammer the
     /// filesystem, but a crash never loses more than a second of chat.
     int aiLastSave;
+    /// 上一次自动保存时这段对话的廉价指纹（轮数、尾条长度、计划、任务图与交付
+    /// 状态）。自动保存先比它：不然每秒都要把整段对话序列化一遍才知道「没
+    /// 变」，而那次序列化在上千轮的对话里就是 CPU 的大头。
+    string aiSaveSig;
+    /// 「最后一段 AI 代码」的缓存与它的指纹（轮数 + 尾条长度）：切出那段代码
+    /// 要复制整条回答，长回答每帧复制一次纯属白烧 CPU。
+    string aiCodeSig;
+    string aiCodeVal;
     SessionList aiSessNav;
     // G: per-session task plan drawn as a checklist above the chat. The plan
     // is stored inside the session record (ChatPack/ChatUnpack) so switching
@@ -394,7 +416,8 @@ partial class ZanIDE {
     // AiPanel.Transcript()); the shell only owns the message list.
     // D: token usage of the last reply (from the stream's usage object), shown
     // in the context-usage ring's tooltip; the ring itself measures the live
-    // transcript against AiAgent.MaxContextChars().
+    // transcript against the budget of the model that member runs on
+    // (AiAgent.MaxContextCharsOf).
     int aiTokPrompt;
     int aiTokCompletion;
     int aiTokTotal;
@@ -407,6 +430,13 @@ partial class ZanIDE {
     // and bound the two automatic loops (AiAgent.MaxRetries/MaxContinues).
     int aiRetry;
     int aiAutoCont;
+    // 本次会话允许的自动继续拍数（AI 设置里的「自动继续上限」，0 = 不限，
+    // 没配过就是 AiAgent.MaxContinues()），已经过 AiAgent.ContinuesBudget
+    // 解析，所以用它的地方直接比大小。
+    int aiContMax;
+    // 本次会话允许的自动交接次数：同一个设置项（见 AiTeam.HandoffsBudget），
+    // 所以「自动继续设成不限」时团队也不会在交接上被拦住。
+    int aiHandoffMax;
     // The request the assistant loop is currently answering: kept so a tool
     // result can be sent back on the same profile / model / open file the
     // question started on, from the poll that has no panel scope.
@@ -450,6 +480,27 @@ partial class ZanIDE {
     // Automatic handoffs taken since the user last spoke, bounded so the team
     // cannot loop between two members without the user noticing.
     int aiHandoffs;
+    /// 本次提问里已经跑过的查询调用签名（AiAgent.CallSig）。同一个查询发第二
+    /// 次只会把一模一样的结果再堆一遍上下文，模型于是原地打转、同一段催促
+    /// 刷屏，所以第二次被拒。写入会清空这份记录（文件变了，再读是合理的）。
+    List<string> aiToolSigs;
+    /// 上一次原地空转是「哪个节点上的哪个人」，以及连着空转了几次：同一个人
+    /// 在同一个节点上连着空转到上限就换人，而不是把它第三次催回原地。
+    string aiIdleKey;
+    int aiIdleTimes;
+    /// 已经因为空转换过一次人的那个节点。换了人还是空转说明这个节点自己有问题
+    /// （前置没交代清楚、要的工具没有、或者要求本身做不了），再转一圈只会变成
+    /// 「空转→换人→又派回来」的死循环：那时挂起节点，交给用户。
+    string aiEscKey;
+    /// 上一拍为什么没算进展（人话，直接给用户看），以及最后一个真正跑成功的
+    /// 动作。挂起一个节点时光说「推不动」等于什么都没说：用户要的是「谁、最后
+    /// 做成了什么、然后卡在哪一步」。
+    string aiIdleWhy;
+    string aiLastAct;
+    /// 「哪个节点上的哪个人」连着查了几次没交东西：到上限就不给再查了（见
+    /// AiTeam.MaxLookups）。写入、构建、运行、交接、换节点都会清零。
+    string aiLookKey;
+    int aiLookTimes;
     /// The task board, folded together from the envelopes as they go past.
     List<AiTask> aiTasks;
     /// Whether the team strip is expanded. Collapsed by default: the summary is
@@ -480,6 +531,27 @@ partial class ZanIDE {
     // length seen, so a frame only re-parses when the decoded body grew.
     int aiStreamMsgIdx;
     int aiStreamLen;
+    // 预览刷新的节流与止损：`aiStreamShown` 是上一次真正折过、排过版的长度，
+    // `aiStreamAt` 是那一拍的时刻，`aiStreamSettled` 表示工具调用摘要已经定型
+    // （后面再来的字节都是工具正文，那一行不会再变）。写一个几十 KB 的文件时，
+    // 每一拍复制全文 + 重排整段聊天就是 GUI 线程「未响应」的那份活。
+    int aiStreamShown;
+    int aiStreamAt;
+    bool aiStreamSettled;
+    // The incremental fold of the stream in flight: it parses only the event
+    // lines that are new, instead of re-parsing the whole body every time it
+    // grows (created on first use; a new request resets it by generation).
+    SseLive aiLive;
+    // 每个上下文桶（任务号，或项目对话 "@project"）最近在聊天区里的那份
+    // 记录，按桶名存在内存里。切节点会把 aiMsgs 整份换掉，没有这份留档时
+    // 「点了任务面板，刚才聊的就没了」：没打开项目时 tasks.db 根本不可写,
+    // 打开了项目也省掉来回切的重复读库。
+    List<string> aiCtxKeys;
+    List<List<ChatMessage>> aiCtxMem;
+    // Signature of the numbers the context / usage cards last showed, so the
+    // panel rebuilds those lists only when a number actually changed rather
+    // than allocating a dozen cards and their strings every frame.
+    string aiRingSig;
     int termFp;
     int termLogLen;
     int runLogLen;

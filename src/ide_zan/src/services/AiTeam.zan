@@ -80,6 +80,10 @@ class AiTask {
     /// 本节点的产出摘要：交付了什么、结论是什么。解锁后继节点时原样注入
     /// 它们的上下文头部，所以后继不必重读前置的全部对话。
     string outcome;
+    /// 本节点自己的开发任务清单（一个节点是一块功能，比如「前台商品展示」，
+    /// 清单才是把它做出来要干的活）。节点的百分比也从这份清单折出来，所以
+    /// 多个节点各有各的进度，互不影响。见 `AiTaskPlan`。
+    List<AiPlanStep> items;
 
     static AiTask Create(string id, string title, string owner) {
         AiTask t = new AiTask();
@@ -92,6 +96,7 @@ class AiTask {
         t.deps = new List<string>();
         t.parts = new List<AiTaskPart>();
         t.outcome = "";
+        t.items = new List<AiPlanStep>();
         return t;
     }
 }
@@ -159,8 +164,68 @@ class AiTeam {
     static string Sec() { return "sec"; }
     static string Art() { return "art"; }
 
+    /// 流程自己发的那些指令（派单、催一脚、转交）的发语人。它们技术上必须
+    /// 以 user 角色进模型请求（接口只收 user/assistant），但它们不是用户说的
+    /// 话——标上这个发语人，聊天记录里就不会把团队内部派单显示成「我」，
+    /// 每个成员也不会把别人的派单当成用户需求读。
+    static string Auto() { return "auto"; }
+
+    /// 这条是流程自己发的内部指令，不是用户发言。
+    static bool IsAuto(ChatMessage m) {
+        return m.role == "user" && m.agent == AiTeam.Auto();
+    }
+
     /// The member a defect always goes back to.
     static string FixOwner() { return AiTeam.Dev(); }
+
+    /// 全程握着任务图和派单权的那个人：拆完的图由它按依赖一个一个往外派，
+    /// 每个节点验收过了再派下一个。干活的成员不自己找下一个活。
+    static string Dispatcher() { return AiTeam.Pm(); }
+
+    /// 同一个成员在同一个节点上，最多连着查几次就必须交东西出来。读代码是手段
+    /// 不是交付：只读角色（架构师 / 审查 / 安全）读够了要给出指令，能写的角色
+    /// 读够了要动手改。没有这道闸，「每拍都发了工具调用」会一直算成有进展，于
+    /// 是它可以一路读到预算见底，用户看到的就是满屏读文件。
+    /// 查到上限时顶回去的那句话：说清「不许再查」和「这一拍要交什么」，按角色
+    /// 分——只读角色交指令，能写的角色交改动。
+    static string LookupCapped(string roleId) {
+        return AiTeam.LookupHead() + AiTeam.LookupAsk(roleId);
+    }
+
+    /// 顶回去时先说清「这是 IDE 不让你查，不是文件不存在」：不说的话，模型会把
+    /// 这条当成缺陷证据写进验收报告（真实发生过：它据此判前台入口缺失，而那个
+    /// 文件其实好好地在那儿）。
+    static string LookupHead() {
+        return "refused: 这一拍不许再查（不是文件不存在、也不是代码有问题，"
+            + "是你已经连着查了好几次还没交东西）。别把这条当成缺陷证据。";
+    }
+
+    static string LookupAsk(string roleId) {
+        if (roleId == AiTeam.Qa()) {
+            return "按手上的证据下结论：达标就 [report]，不达标就 [block]"
+                + " 写清「哪条验收、怎么复现、实际是什么」，别再补取证。";
+        }
+        if (!AiTeam.AllowsTool(roleId, "write_file")) {
+            return "代码你看够了：把结论写成一条别人拿着就能敲的指令（改哪个"
+                + "文件、加什么、怎么算做完）然后 [handoff] @"
+                + AiTeam.DisplayName(AiTeam.Dev())
+                + "；确实缺前置或要用户拍板就 [block] / [question] 说清缺什么。";
+        }
+        return "直接 edit_file / write_file 把这一步改出来，改完 build；"
+            + "真做不了就 [block] 说清卡在哪。";
+    }
+
+    static int MaxLookups(string roleId) {
+        // 测试要按验收标准一条条取证，读的文件本来就多，给到和开发一样的额度。
+        if (roleId == AiTeam.Qa()) { return 8; }
+        if (!AiTeam.AllowsTool(roleId, "write_file")) { return 5; }
+        return 8;
+    }
+
+    /// 干活的成员（自己不管图、不派单）：产品经理和架构师以外都是。
+    static bool Executor(string roleId) {
+        return roleId != AiTeam.Pm() && roleId != AiTeam.Arch();
+    }
 
     // --- per-member models ---------------------------------------------------
 
@@ -510,10 +575,37 @@ class AiTeam {
             if (p.Length > 0 && (p[p.Length - 1] & 255) == 37) {
                 e.progress = AiTeam.NumOf(p.Substring(0, p.Length - 1));
             } else {
-                e.taskId = p;
+                e.taskId = AiTeam.TaskIdOf(p);
             }
         }
         return true;
+    }
+
+    /// 标记里那一段任务号，去掉模型顺手带上的 `task=` 之类的前缀。
+    ///
+    /// 提示词里写的是 `[report] task=T-1`，模型多半合成一个标记写成
+    /// `[report task=T-1]`，于是这一段字面量是 `task=T-1`。不剥掉前缀，它就是
+    /// 一个图上不存在的节点号：`Fold` 照它新建一个空节点，真正的 T-1 因此永远
+    /// 不会被收尾、永远留在「能开工」里，产品经理于是一拍一拍地把同一个节点
+    /// 重新派出去——用户看到的那个「验收通过了还在原地打转」的死循环。
+    static string TaskIdOf(string s) {
+        string p = s;
+        int eq = -1;
+        for (int i = 0; i < p.Length; i = i + 1) {
+            int ch = p[i] & 255;
+            if (ch == 61 || ch == 58) { eq = i; break; }
+        }
+        if (eq >= 0) {
+            string head = ZanIDE.ToLowerS(p.Substring(0, eq));
+            if (head == "task" || head == "id" || head == "taskid"
+                || head == "node") {
+                p = p.Substring(eq + 1, p.Length - eq - 1);
+            }
+        }
+        while (p.Length > 0 && (p[0] & 255) == 35) {
+            p = p.Substring(1, p.Length - 1);
+        }
+        return p;
     }
 
     /// Leading decimal digits of `s` as an int (0 when there are none), so a
@@ -683,6 +775,15 @@ class AiTeam {
         List<ChatMessage> outMsgs = new List<ChatMessage>();
         for (int i = 0; i < msgs.Count; i = i + 1) {
             ChatMessage m = msgs[i];
+            if (AiTeam.IsAuto(m)) {
+                // 内部派单只给收件人看：它不是需求，把它广播给所有人只会让每个
+                // 成员都以为自己被叫到了。没写收件人的（旧存档）算公共上下文。
+                if (m.to == ""
+                    || AiTeam.HasStr(AiTeam.ToListOf(m), roleId)) {
+                    outMsgs.Add(m);
+                }
+                continue;
+            }
             if (m.role == "user") {
                 // A user turn aimed at another member is still context the
                 // team shares (it is the requirement), but it is relabelled
@@ -691,7 +792,10 @@ class AiTeam {
                 continue;
             }
             if (m.role == "tool" || m.role == "error") {
-                if (m.agent == roleId) { outMsgs.Add(m); }
+                // 没署名的工具结果（旧存档，或单人模式留下的）算公共上下文：
+                // 宁可多看一条，也不能把成员自己刚读到的东西滤掉——滤掉的
+                // 后果是它每一拍都以为自己还没查过，于是一直重发同一个调用。
+                if (m.agent == "" || m.agent == roleId) { outMsgs.Add(m); }
                 continue;
             }
             if (m.agent == roleId) { outMsgs.Add(m); continue; }
@@ -734,9 +838,11 @@ class AiTeam {
     // --- prompts -------------------------------------------------------------
 
     /// The protocol every member shares: the header format, the beats, and the
-    /// two rules that keep the pipeline honest (acknowledge before working,
+    /// rules that keep the pipeline honest (no chatter, one owner at a time,
     /// park on a question instead of guessing).
-    static string ProtocolPrompt() {
+    /// 协议里与成员无关的那一段（头部 + 规则 1-5）。单独拆出来是给全队共用的
+    /// 系统提示用的：系统消息逐字节与成员无关，供应商的前缀缓存才跨成员命中。
+    static string ProtocolHead() {
         StringBuilder sb = new StringBuilder();
         sb.Append("TEAM PROTOCOL. You are one member of a seven-member team in"
             + " a group chat with the user. Members: @产品经理 (Product"
@@ -745,23 +851,31 @@ class AiTeam {
             + " (Code Reviewer), @安全审计员 (Security Auditor).\n"
             + "Every message you send starts with a routing header:\n"
             + "  @<member> [<kind> <taskId> <NN%>] then your text\n"
-            + "Kinds: assign (hand a task over), ack (you accept a task --"
-            + " ALWAYS reply with this first, before doing any work),"
-            + " progress (a percentage and one line), handoff (your stage"
-            + " passed, pass it on), question (you need the USER to decide),"
-            + " report (your conclusion), block (you are stuck).\n"
+            + "Kinds: assign (hand a task over), progress (a percentage and"
+            + " ONE line), handoff (your stage passed, pass it on), question"
+            + " (you need the USER to decide), report (your conclusion),"
+            + " block (you are stuck).\n"
             + "Examples:\n"
             + "  @架构师 [handoff T-1] 需求已确认：三条验收标准如下……\n"
-            + "  [ack T-3] 收到，开始实现表单校验。\n"
             + "  [progress T-3 60%] 校验规则写完，还剩边界用例。\n"
             + "  @开发者 [block T-3] ui_check 报 hitregion 缺失，见下。\n"
             + "RULES.\n"
-            + "1. ACKNOWLEDGE FIRST. When a task is assigned to you, your very"
-            + " next message is [ack] naming what you understood. Only then do"
-            + " you start.\n"
-            + "2. ONE OWNER AT A TIME. When your stage passes, send [handoff]"
-            + " to exactly one member and stop. Do not do the next member's"
-            + " job yourself.\n"
+            + "1. NO CHATTER, NO RESTATING. A task assigned to you needs no"
+            + " acknowledgement: your first message is the work itself (a tool"
+            + " call, or one [progress] line). Never repeat the task text, the"
+            + " acceptance criterion, the plan, the previous message, or a"
+            + " result already in the transcript above -- the user sees all of"
+            + " it. Say only what is NEW in this beat, in one to three short"
+            + " sentences, with no closing recap of what you just said."
+            + " EVERY beat of yours carries an action: a tool call, or a"
+            + " finished result. A beat that only announces what you are"
+            + " about to do, or re-derives the requirement, is a wasted beat"
+            + " -- make the call instead of describing it.\n"
+            + "2. ONE OWNER AT A TIME. While the work is unfinished it stays"
+            + " YOURS: do not @ anybody mid-way, and never @ yourself. Only"
+            + " when your stage is really done -- or you are genuinely"
+            + " blocked -- you address exactly one member with [handoff] /"
+            + " [block] and stop. Do not do the next member's job yourself.\n"
             + "3. DEFECTS GO BACK TO THE DEVELOPER. If you find a problem,"
             + " address @开发者 with [block], and always include how to"
             + " reproduce it, what actually happened and what you expected."
@@ -772,21 +886,95 @@ class AiTeam {
             + " the user asked you directly.\n"
             + "5. STAY IN YOUR LANE. Only the tools listed for you below are"
             + " available; the IDE refuses the rest. If you need one you do"
-            + " not have, hand off to the member who owns it.\n"
-            + "6. THE PLAN IS A TASK GRAPH. In team mode the `plan` tool's"
+            + " not have, hand off to the member who owns it.\n");
+        return sb.ToString();
+    }
+
+    /// 协议的收尾一条（验收流程，同样与成员无关）。
+    static string ProtocolTail() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("7. REPORT IS AN ACCEPTANCE REQUEST, NOT THE END. When you send"
+            + " [report] on a task that has an `accept` criterion, the IDE"
+            + " hands it to @测试工程师 to check it against that criterion,"
+            + " and only after it reports back does the node close, its"
+            + " conclusion get written into the project knowledge"
+            + " (.zan/knowledge.md) and the next unblocked node get assigned"
+            + " automatically. So: state in [report] exactly what you"
+            + " delivered and how you verified it -- that text is what gets"
+            + " checked and archived. KEEP IT SHORT: five lines at most"
+            + " (delivered / verified / what is left), never a blow-by-blow"
+            + " of the beats you already sent. If you are the one checking,"
+            + " judge only against the criterion, take your own evidence"
+            + " (build / run / read the code), and answer [report] (passed)"
+            + " or [block] (failed, with the evidence).\n\n");
+        return sb.ToString();
+    }
+
+    /// 谁有权改任务图，写进各自的提示词里。
+    ///
+    /// 这就是「大家都在反复列需求、没人开工」那个断点：拆图的规矩以前发给所有
+    /// 人，于是开发者接到任务的第一反应也是再拆一遍需求。图只由产品经理和架构
+    /// 师维护，其他人唯一能碰计划的时候是把自己节点里做完的那一条打勾。
+    static string GraphPrompt(string roleId) {
+        if (AiTeam.Executor(roleId)) {
+            return "6. THE BOARD IS ALREADY THERE, AND YOU BUILD, NOT PLAN."
+                + " @产品经理 and @架构师 own the task graph; you never emit a"
+                + " new plan and never re-list the requirement. Your node and"
+                + " its checklist are in the board above: implement the next"
+                + " unchecked item with your tools. The ONLY plan call you"
+                + " ever make is re-sending YOUR OWN node with a finished"
+                + " item marked \"[x] \" (everything you do not mention is"
+                + " kept), which is how the board moves while you work."
+                + " When the node is done you send [report] task=<id> and"
+                + " STOP: @产品经理 dispatches the next node. Never pick up"
+                + " another node yourself, and never assign one.\n";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("6. THE PLAN IS A TASK GRAPH, AND IT COMES FIRST. A requirement"
+            + " of any size is broken into nodes with the `plan` tool BEFORE"
+            + " implementation starts: the user's progress readout is"
+            + " 'nodes done / nodes total', so work that exists only in the"
+            + " chat looks like no progress at all. If you are asked to build"
+            + " something and there is no node for it in the board above,"
+            + " the first move is to emit the graph (or hand off to the one"
+            + " who should). In team mode the `plan` tool's"
             + " items are the task nodes the user sees and clicks, so give"
             + " each one the fields that make it a node:\n"
-            + "  {\"id\":\"T-2\", \"t\":\"表单校验\", \"owner\":\"开发者\","
+            + "  {\"id\":\"T-2\", \"t\":\"前台商品展示\", \"owner\":\"开发者\","
             + " \"deps\":[\"T-1\"], \"parts\":[\"测试工程师\"],"
-            + " \"accept\":\"非法输入有明确提示\"}\n"
+            + " \"accept\":\"列表、详情、搜索都能用真实数据打开\","
+            + " \"tasks\":[\"商品列表页\",\"商品详情页\",\"关键字搜索\"]}\n"
+            + " A NODE IS A FEATURE, NOT ONE EDIT. Cut the requirement the way"
+            + " a product is cut -- for a shop: 前台商品展示 / 下单购买 /"
+            + " 积分兑换 / 后台商品管理 / 后台订单管理 -- one node per"
+            + " deliverable capability, front-end and back-office as separate"
+            + " nodes. Then put the actual work INSIDE the node as `tasks`:"
+            + " the short checklist of what has to be built for that feature."
+            + " The user's plan strip shows the `tasks` of the node being"
+            + " worked on, and the node's percentage is that checklist's"
+            + " done-ratio, so a node with no `tasks` cannot show real"
+            + " progress. Keep `tasks` at 3-8 concrete items; if a node needs"
+            + " far more, it was really two nodes. As you finish an item,"
+            + " re-send just that node with the item marked \"[x] \" (state,"
+            + " ownership and everything you did not mention are kept), which"
+            + " is how the board moves while you work.\n"
             + " `deps` are the task ids that must be DONE first -- a node"
             + " whose deps are unfinished is locked in the panel and nobody"
-            + " starts it. `owner` is the one member responsible, `parts` the"
+            + " starts it. EVERY node carries `deps`, and that is what makes"
+            + " the board a graph instead of a flat list: only the nodes that"
+            + " can genuinely start on day one get `\"deps\":[]`, everything"
+            + " else names the node(s) it waits on (design before build,"
+            + " build before test, and a node that needs two upstream"
+            + " results lists both). If you send a plan where no node has"
+            + " any deps, the IDE assumes you meant a straight sequence and"
+            + " chains the items in the order you listed them -- so wire the"
+            + " real dependencies yourself when the work is not a single"
+            + " line. `owner` is the one member responsible, `parts` the"
             + " others who will speak on that node, `accept` how we know it"
             + " is done. Re-send the plan (same ids) to add or re-wire nodes;"
             + " progress and state come from your [progress]/[handoff]"
             + " headers, not from the plan, so re-sending never resets"
-            + " work that is already underway.\n\n");
+            + " work that is already underway.\n");
         return sb.ToString();
     }
 
@@ -832,7 +1020,7 @@ class AiTeam {
     /// the default text of a member's prompt box.
     static string DefaultDuty(string roleId) {
         if (roleId == AiTeam.Pm()) {
-            return "YOU ARE @产品经理 (Product Manager). You are the only member"
+            return "YOUR ROLE: 产品经理 (Product Manager). You are the only member"
                 + " who owns the conversation with the user.\n"
                 + "- First, make the requirement unambiguous. If the request is"
                 + " vague, ask the user ONE round of the few questions that"
@@ -840,6 +1028,21 @@ class AiTeam {
                 + "- Then write a requirement card: goal, scope, acceptance"
                 + " criteria, and explicitly what is NOT in scope.\n"
                 + "- Then [handoff] to @架构师.\n"
+                + "- You are also the DISPATCHER: once the graph exists you"
+                + " hand out ONE node at a time ([assign] task=<id> @owner),"
+                + " and only after that node is accepted do you dispatch the"
+                + " next one whose deps are done. Never two nodes at once,"
+                + " and never re-list the requirement when dispatching -- one"
+                + " line of what to deliver is enough.\n"
+                + "- The task graph belongs to @架构师: if you sketch one with"
+                + " the plan tool, hand it off in the same turn. Re-sending the"
+                + " plan instead of handing off is how a run stalls -- you do"
+                + " not implement any node yourself.\n"
+                + "- You are NOT the one who surveys the codebase: a couple of"
+                + " reads to sanity-check a term is fine, but if you find"
+                + " yourself grepping file after file you are doing the"
+                + " architect's job -- hand off instead. Never repeat a read"
+                + " you already did; its result is above in this chat.\n"
                 + "- Other members route their questions through you: fold them"
                 + " into one clear question for the user rather than relaying"
                 + " six separate interruptions.\n"
@@ -847,7 +1050,7 @@ class AiTeam {
                 + " is still open. Do not design, do not write code.\n\n";
         }
         if (roleId == AiTeam.Arch()) {
-            return "YOU ARE @架构师 (Architect). You turn a requirement card"
+            return "YOUR ROLE: 架构师 (Architect). You turn a requirement card"
                 + " into an ordered set of task cards.\n"
                 + "- Read the real code first (grep/read_file/repo_map): decide"
                 + " which existing layer should change, and prefer extending it"
@@ -856,26 +1059,36 @@ class AiTeam {
                 + " task with the files it touches and an ACCEPTANCE CRITERION"
                 + " the test engineer can check without asking you.\n"
                 + "- Order tasks by dependency; call out the risky one.\n"
-                + "- Then [assign] the first task to @开发者. Do not write the"
-                + " implementation yourself.\n\n";
+                + "- ONE graph, then get out of the way: if the board above"
+                + " already has the nodes, do not re-emit or re-describe it.\n"
+                + "- Then [handoff] to @产品经理 in the same beat: it dispatches"
+                + " the nodes one at a time. You do not hand nodes out"
+                + " yourself, and you never write the implementation.\n\n";
         }
         if (roleId == AiTeam.Dev()) {
-            return "YOU ARE @开发者 (Developer). You implement one task card at"
+            return "YOUR ROLE: 开发者 (Developer). You implement one task card at"
                 + " a time.\n"
-                + "- [ack] the task, then read the code you are about to change"
-                + " before changing it.\n"
+                + "- Your FIRST beat on a node is a tool call: read_file /"
+                + " grep the file you are about to change. No"
+                + " acknowledgement, no restating the task, no plan of"
+                + " your own.\n"
+                + "- Then edit_file / write_file the real change. Reading"
+                + " forever is not progress: after a couple of reads on a"
+                + " node, the next beat edits something.\n"
                 + "- Keep the edit minimal and in the surrounding style; fix the"
                 + " general layer, never hard-code a value to hide the bug.\n"
                 + "- build and read the errors. Do not hand off until it"
                 + " compiles.\n"
-                + "- Then [handoff] to @测试工程师 stating what you changed"
-                + " (path:line) and how to exercise it.\n"
+                + "- Then [report] task=<id> stating what you changed"
+                + " (path:line) and how to exercise it -- the IDE sends it to"
+                + " acceptance and @产品经理 hands you the next node. Do not"
+                + " route it yourself, and do not start another node.\n"
                 + "- When a defect comes back to you, reproduce the reported"
                 + " cause before editing; do not re-send a fix that already"
                 + " failed.\n\n";
         }
         if (roleId == AiTeam.Qa()) {
-            return "YOU ARE @测试工程师 (Test Engineer). You decide whether the"
+            return "YOUR ROLE: 测试工程师 (Test Engineer). You decide whether the"
                 + " change actually works, against the task's acceptance"
                 + " criterion.\n"
                 + "- Exercise the real program: run it, and for UI work drive"
@@ -888,7 +1101,7 @@ class AiTeam {
                 + "- Never report a pass for something you did not execute.\n\n";
         }
         if (roleId == AiTeam.Rev()) {
-            return "YOU ARE @代码审查员 (Code Reviewer). You read the diff.\n"
+            return "YOUR ROLE: 代码审查员 (Code Reviewer). You read the diff.\n"
                 + "- Look for: wrong edge cases, broken invariants, changes"
                 + " outside the task's scope, duplicated logic that belonged in"
                 + " a shared helper, and tests or checks weakened to make"
@@ -899,7 +1112,7 @@ class AiTeam {
                 + " Clean -> [handoff] to @安全审计员.\n\n";
         }
         if (roleId == AiTeam.Art()) {
-            return "YOU ARE @素材设计师 (Asset Designer). You produce the UI and"
+            return "YOUR ROLE: 素材设计师 (Asset Designer). You produce the UI and"
                 + " game assets a task needs, as files in the project.\n"
                 + "- Icons and UI marks: write vector glyph / SVG-style assets"
                 + " that read at 16px as well as at 64px, on one grid, in one"
@@ -918,7 +1131,7 @@ class AiTeam {
                 + " write program logic.\n\n";
         }
         if (roleId == AiTeam.Sec()) {
-            return "YOU ARE @安全审计员 (Security Auditor). You audit the change"
+            return "YOUR ROLE: 安全审计员 (Security Auditor). You audit the change"
                 + " for exposure.\n"
                 + "- Look for: secrets/keys/tokens in plain text, injection"
                 + " (SQL/command/path), path traversal escaping the project"
@@ -932,19 +1145,59 @@ class AiTeam {
         return "";
     }
 
-    /// The full system prompt for one member: the shared IDE/agent
-    /// instructions, then the team protocol, then this member's charter and
-    /// tool list. Built on top of the single-assistant prompt on purpose --
-    /// the tool syntax, the Zan language notes and the project outline are the
-    /// same for everyone, so they can never drift per role.
-    static string RolePrompt(string roleId, string ctxName, string ctxCode,
-            string root) {
+    /// 全队共用的那一份系统提示：IDE/助手基础说明、团队协议、规则 6 的两种
+    /// 形态，然后是七个成员各自的章程与工具清单。
+    ///
+    /// 它逐字节与「这一拍是谁在说话」无关，这是故意的。供应商的 prompt 缓存按
+    /// **前缀**匹配：以前系统消息是 `BaseInstructions + 这个成员的协议/章程/
+    /// 工具`，七个成员各自一份，而团队模式几乎每一拍都在换人，于是能命中的只有
+    /// 大家共有的那一段（基础说明结尾处，实测就停在 4.9K token），后面两万
+    /// token 每拍全额重算。把整份系统提示做成全队同一份之后，不管这一拍谁开口，
+    /// 前缀都是同一串字节。本拍的身份改由 `SelfPrompt` 放在最后那条动态消息里
+    /// （见 `ZanIDE.AiLaunchAs`）——它排在最后，换人只作废尾巴，不作废前缀。
+    static string TeamPrompt() {
         StringBuilder sb = new StringBuilder();
-        sb.Append(AiAgent.SystemPrompt(ctxName, ctxCode, root));
+        sb.Append(AiAgent.BaseInstructions());
         sb.Append("\n\n");
-        sb.Append(AiTeam.ProtocolPrompt());
-        sb.Append(AiTeam.DutyPrompt(roleId));
-        sb.Append(AiTeam.ToolsPrompt(roleId));
+        sb.Append(AiTeam.ProtocolHead());
+        sb.Append("6 COMES IN TWO FORMS -- use the one named in the YOUR ROLE"
+            + " line at the end of this conversation, and ignore the other.\n"
+            + "[FORM P -- planners: @产品经理 and @架构师 only]\n");
+        sb.Append(AiTeam.GraphPrompt(AiTeam.Pm()));
+        sb.Append("[FORM B -- builders: @素材设计师, @开发者, @测试工程师,"
+            + " @代码审查员, @安全审计员]\n");
+        sb.Append(AiTeam.GraphPrompt(AiTeam.Dev()));
+        sb.Append(AiTeam.ProtocolTail());
+        sb.Append("MEMBER CHARTERS. Below is every member's charter and tool"
+            + " list, one section each. Exactly ONE of them is yours -- the"
+            + " YOUR ROLE line at the end of this conversation names it. Read"
+            + " your own section as your orders; the others are here only so"
+            + " you know who to hand work to, and doing their job is a"
+            + " protocol violation.\n\n");
+        List<AiRole> rs = AiTeam.Roles();
+        for (int i = 0; i < rs.Count; i = i + 1) {
+            sb.Append("=== MEMBER @" + rs[i].zh + " (" + rs[i].en
+                + ") -- applies when you are @" + rs[i].zh + " ===\n");
+            sb.Append(AiTeam.DutyPrompt(rs[i].id));
+            sb.Append(AiTeam.ToolsPrompt(rs[i].id));
+        }
+        return sb.ToString();
+    }
+
+    /// 「这一拍你是谁」那一小段：跟着会变的现场一起放在最后一条消息里，所以换
+    /// 人不会动到前面那份共用前缀（见 `TeamPrompt` 的说明）。
+    static string SelfPrompt(string roleId) {
+        AiRole r = AiTeam.RoleOf(roleId);
+        if (r == null) { return ""; }
+        string form = "FORM B (builders)";
+        if (!AiTeam.Executor(roleId)) { form = "FORM P (planners)"; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("YOUR ROLE THIS BEAT: you are @" + r.zh + " (" + r.en
+            + "). Your orders are the section '=== MEMBER @" + r.zh
+            + "' in the system prompt above, and rule 6 applies to you in "
+            + form + ". Speak only as @" + r.zh
+            + ": every header you write is yours, and the other members'"
+            + " sections are not your instructions.\n\n");
         return sb.ToString();
     }
 
@@ -975,12 +1228,36 @@ class AiTeam {
             string target = "";
             if (env.to.Count > 0) { target = env.to[0]; }
             if (env.kind == AiTeam.KindBlock()) { target = AiTeam.FixOwner(); }
+            // 干活的人做完不自己找下一环：交回产品经理，由它按依赖决定是送
+            // 验收还是派下一个节点。否则每个成员都在自作主张地派单，任务图
+            // 上的顺序就没人管了。
+            if (env.kind == AiTeam.KindHandoff()
+                && AiTeam.Executor(fromAgent)) {
+                target = AiTeam.Dispatcher();
+            }
+            // 自己 @ 自己不是交接（模型常把自己的名字当抬头写）：当成「没指定
+            // 收件人」，按链条交给下一环，而不是把这一拍又送回自己。
+            if (target == fromAgent) { target = ""; }
             if (target == "") { target = AiTeam.NextOf(fromAgent); }
             st.activeAgent = target;
             return st;
         }
-        // ack / progress / report keep ownership where it is: the member has
-        // more to do on the same task.
+        // 一句 [ack] 里 @ 了别人，意思是「下一拍归你」，抬头选错了不该把流程
+        // 卡在自己这里。但 [progress] 不算：活没完就还是自己的，干活途中提一
+        // 句「回头要给测试看」不能就把这一拍交出去（交接只能是 [handoff] /
+        // [block]）。Report 也不动 -- 那由验收决定下一个说话的人。
+        if (env.kind != AiTeam.KindReport()
+            && env.kind != AiTeam.KindProgress() && env.to.Count > 0) {
+            for (int i = 0; i < env.to.Count; i = i + 1) {
+                string cand = env.to[i];
+                if (cand == fromAgent) { continue; }
+                if (AiTeam.RoleOf(cand) == null) { continue; }
+                st.activeAgent = cand;
+                return st;
+            }
+        }
+        // Otherwise ownership stays where it is: the member has more to do on
+        // the same task.
         return st;
     }
 
@@ -1001,7 +1278,7 @@ class AiTeam {
     static string ResumePrompt(AiTeamState st) {
         string who = AiTeam.DisplayName(AiTeam.ResumeTarget(st));
         StringBuilder sb = new StringBuilder();
-        sb.Append("[auto] 恢复中断的流程。你是 @" + who + "。");
+        sb.Append("[auto] 恢复中断的流程。本拍执行人：" + who + "。");
         if (st.activeTask != "") {
             sb.Append("当前任务 " + st.activeTask + "。");
         }
@@ -1112,8 +1389,16 @@ class AiTeam {
         if (kind == AiTeam.KindProgress()) { return AiTeam.TaskDoing(); }
         if (kind == AiTeam.KindBlock()) { return AiTeam.TaskBlocked(); }
         if (kind == AiTeam.KindHandoff()) { return AiTeam.TaskReview(); }
-        if (kind == AiTeam.KindReport()) { return AiTeam.TaskDone(); }
-        if (kind == AiTeam.KindAssign()) { return AiTeam.TaskTodo(); }
+        // 汇报是「我交活了」，不是「这活验收过了」：完成只能由验收给出
+        // （AiTeamAccept），否则一句 [report] 就把节点跳成 100%，而验收
+        // 其实还没跑，下游也会跟着提前解锁。
+        if (kind == AiTeam.KindReport()) { return AiTeam.TaskReview(); }
+        // 派活只对还没开始的节点有意义：已经在跑 / 已交接 / 已完成的节点
+        // 不能被一句 [assign] 摸回「待办」，否则状态条会说「无进行中节点」。
+        if (kind == AiTeam.KindAssign()) {
+            if (cur > AiTeam.TaskTodo()) { return cur; }
+            return AiTeam.TaskTodo();
+        }
         return cur;
     }
 
@@ -1161,6 +1446,11 @@ class AiTeam {
         cur.state = AiTeam.TaskStateOf(env.kind, cur.state);
         if (env.progress > cur.progress) { cur.progress = env.progress; }
         if (cur.state == AiTeam.TaskDone()) { cur.progress = 100; }
+        // 100% 就是「验收过了」的同义词：还没完成的节点即使自报一百，也只
+        // 显示到 95，最后那一档留给验收（和 AiGraphReopen 把 100 退回 90 同理）。
+        if (cur.state != AiTeam.TaskDone() && cur.progress >= 100) {
+            cur.progress = 95;
+        }
         if (cur.title == "") { cur.title = AiTeam.TaskTitleOf(env.body); }
         AiTeam.TouchPart(cur, owner);
         // 交接和汇报是这个节点「交付了什么」的唯一权威说法，所以它们的正文
@@ -1273,7 +1563,7 @@ class AiTeam {
         if (t == null) { return; }
         string s = AiAgent.Trim(body);
         if (s == "") { return; }
-        if (s.Length > 600) { s = s.Substring(0, 600); }
+        if (s.Length > 600) { s = AiAgent.Clip(s, 600); }
         t.outcome = s;
     }
 
@@ -1297,6 +1587,252 @@ class AiTeam {
         return ZanIDE.T("[upstream results]\n", "[前置产出]\n") + sb.ToString();
     }
 
+    /// 当前任务图那一段提示词，由宿主在图变化时写进来（每帧重拼一遍全图是
+    /// 白花的钱）。没有这一段时模型看不见自己拆出来的图，既不知道现在开着
+    /// 哪个节点、哪几个能开工，也就无从修改它。
+    static string gBoard;
+
+    static void SetBoard(string s) { AiTeam.gBoard = s; }
+
+    static string Board() {
+        if (AiTeam.gBoard == null) { return ""; }
+        return AiTeam.gBoard;
+    }
+
+    /// 任务图的现状 + 「怎么改它」：节点一行一条（负责人、状态、进度、依赖、
+    /// 验收标准），标出当前打开的节点和现在能开工的节点。改图的手段就是重发
+    /// `plan`——带上已有 id 的条目只更新那几个字段，新 id 就是新增节点，所以
+    /// 在任何节点上聊出来的新需求都能挂进图里，而不用另起一套接口。
+    static string BoardBrief(List<AiTask> tasks, string cur) {
+        if (tasks == null || tasks.Count == 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("TASK GRAPH (project .zan/tasks.json; each node has its own"
+            + " multi-round context in .zan/tasks.db):\n");
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            AiTask t = tasks[i];
+            sb.Append("- " + t.id);
+            if (t.title != "") { sb.Append(" " + t.title); }
+            sb.Append(" [" + AiTeam.TaskStateName(t.state) + " "
+                + Convert.ToString(t.progress) + "%]");
+            if (t.owner != "") { sb.Append(" owner=@" + t.owner); }
+            if (t.deps != null && t.deps.Count > 0) {
+                sb.Append(" deps=" + AiTeam.JoinIds(t.deps));
+            }
+            if (t.accept != "") { sb.Append(" accept=" + t.accept); }
+            if (t.outcome != "") { sb.Append(" outcome=" + t.outcome); }
+            string brief = AiTaskPlan.Brief(t);
+            if (brief != "") { sb.Append(" tasks=" + brief); }
+            sb.Append("\n");
+        }
+        if (cur != "") {
+            sb.Append("OPEN NODE: " + cur + " -- the turns below are THIS"
+                + " node's own context, not the whole project chat.\n");
+            // 开着的那个节点把自己的活逐条列出来：图上只看得见「功能」，
+            // 真要干的是这几条，而不列出来模型就又去重新编一份。
+            AiTask co = AiTeam.TaskOf(tasks, cur);
+            List<AiPlanStep> its = AiTaskPlan.ItemsOf(co);
+            if (its.Count > 0) {
+                sb.Append("THIS NODE'S CHECKLIST (re-send this node via plan"
+                    + " with \"[x] \" on an item as you finish it):\n");
+                for (int k = 0; k < its.Count; k = k + 1) {
+                    string mark = "[ ] ";
+                    if (its[k].done != 0) { mark = "[x] "; }
+                    sb.Append("  " + mark + its[k].text + "\n");
+                }
+            }
+        } else {
+            sb.Append("OPEN NODE: none (project-level conversation).\n");
+        }
+        List<string> ready = AiTeam.ReadyTasks(tasks);
+        if (ready.Count > 0) {
+            sb.Append("READY (deps satisfied): " + AiTeam.JoinIds(ready)
+                + "\n");
+        }
+        sb.Append("The graph is EDITABLE and you maintain it: re-send the"
+            + " plan tool with items carrying the SAME id to change a node's"
+            + " title/owner/deps/accept, and a NEW id to add one. A new"
+            + " requirement raised while working on a node becomes its own"
+            + " node depending on this one -- do not silently widen the node"
+            + " you are on. State and progress come from your"
+            + " [progress]/[handoff]/[done] envelopes, not from plan.\n\n");
+        return sb.ToString();
+    }
+
+    // --- 自动验收 / 自动接下一个任务 ------------------------------------------
+
+    /// 验收的人：测试工程师。验收必须换一个人做，报完成的人自己说「通过」不
+    /// 算验收——这一条就是「执行验收结束」里的验收。
+    static string Verifier() { return AiTeam.Qa(); }
+
+    /// 报完成的这一拍要不要先送去验收：写了验收标准、而且报的人不是验收人。
+    /// 没写验收标准就没有可对的东西，硬塞一拍只是空转。
+    static bool NeedsAccept(AiTask t, string from) {
+        if (t == null) { return false; }
+        if (AiAgent.Trim(t.accept) == "") { return false; }
+        return from != AiTeam.Verifier();
+    }
+
+    /// 交给验收人的指令：只对着验收标准判，通过就 [report]，不通过就 [block]
+    /// 回开发——两个出口都已经在协议里，所以这里不引入新状态。
+    static string AcceptPrompt(AiTask t) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] 请验收任务 " + t.id);
+        if (t.title != "") { sb.Append("（" + t.title + "）"); }
+        sb.Append("。验收标准：\n" + AiAgent.Trim(t.accept) + "\n");
+        if (AiAgent.Trim(t.outcome) != "") {
+            sb.Append("交付说明：\n" + AiAgent.Trim(t.outcome) + "\n");
+        }
+        sb.Append("按标准逐条核对，需要就自己编译 / 运行 / 读代码取证，不要只"
+            + "看它怎么说。通过就回 [report] task=" + t.id
+            + " 并写清核对结果；不通过回 [block] task=" + t.id
+            + " 说清哪条不达标、证据是什么。");
+        return sb.ToString();
+    }
+
+    /// 验收通过后自动接的下一个节点：前置全齐、还没完成，排在最前的那个。
+    /// 没有就返回 null（整条链跑完，或剩下的都被前置卡着）。
+    static AiTask NextReady(List<AiTask> tasks, string doneId) {
+        List<string> ready = AiTeam.ReadyTasks(tasks);
+        for (int i = 0; i < ready.Count; i = i + 1) {
+            if (ready[i] == doneId) { continue; }
+            AiTask t = AiTeam.TaskOf(tasks, ready[i]);
+            if (t == null) { continue; }
+            return t;
+        }
+        return null;
+    }
+
+    /// 正在跑的那个节点（进行中或验收中）：同一时刻只允许一个，所以派单前先
+    /// 看有没有人手上还有活，有就不要再开第二个。
+    static AiTask InFlight(List<AiTask> tasks) {
+        if (tasks == null) { return null; }
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            if (tasks[i].state == AiTeam.TaskDoing()
+                || tasks[i].state == AiTeam.TaskReview()) {
+                return tasks[i];
+            }
+        }
+        return null;
+    }
+
+    /// 一个节点验收过了之后交回产品经理的指令：它这一拍只做调度——把下一个
+    /// 能开工的节点派给负责人。派单以外的话（重述需求、再发一份计划）就是
+    /// 用户看到的那种「反复列需求不开工」。
+    static string DispatchPrompt(string doneId, AiTask nx) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] " + doneId + " 已验收通过，结论已写进项目知识。");
+        if (nx == null) {
+            sb.Append("图上暂时没有能开工的节点了：要么向用户交代这一轮的结果，"
+                + "要么说清还卡在哪个前置。");
+            return sb.ToString();
+        }
+        sb.Append("你这一拍只做一件事——派下一个节点：\n");
+        sb.Append("  " + nx.id);
+        if (nx.title != "") { sb.Append("（" + nx.title + "）"); }
+        string who = AiTeam.OwnerOf(nx);
+        sb.Append(" → @" + AiTeam.DisplayName(who) + "\n");
+        sb.Append("回一条 [assign] task=" + nx.id + " @"
+            + AiTeam.DisplayName(who)
+            + "，一句话说清这个节点要交付什么就够了。不要重述需求、不要重发"
+            + "计划、不要同时派两个节点；有真需要用户定的事才 [question]。");
+        return sb.ToString();
+    }
+
+    /// 自动派下一个任务的指令。前置产出摘要由调用方附在后面（同一条消息里），
+    /// 所以接手的人不必回头读前置的整段对话。
+    static string NextPrompt(AiTask t, string doneId) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] " + doneId + " 已验收通过，按计划接下一个任务 " + t.id);
+        if (t.title != "") { sb.Append("（" + t.title + "）"); }
+        sb.Append("。直接开工，不用回「收到」；");
+        if (AiAgent.Trim(t.accept) != "") {
+            sb.Append("这个任务的验收标准是：\n" + AiAgent.Trim(t.accept) + "\n");
+        }
+        sb.Append("做完回 [report] task=" + t.id
+            + "，说清交付了什么、怎么验证的。计划要改就重发 plan。");
+        return sb.ToString();
+    }
+
+    /// 派单给节点负责人的指令。跟 `NextPrompt` 的区别只在由头：那条是「前一个
+    /// 节点验收过了」，这条是「图已经拆好了、这个节点该你干」——图一落地就得有
+    /// 人接手，否则拆活儿的人只会被反复叫回来再拆一遍。
+    static string AssignPrompt(AiTask t, string who) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] 按任务图派单。本拍执行人："
+            + AiTeam.DisplayName(who) + "，这个节点归你——" + t.id);
+        if (t.title != "") { sb.Append("（" + t.title + "）"); }
+        sb.Append("。直接动手做这个节点自己的活（不用回「收到」，也别重述计划、"
+            + "别把别人节点的活揽过来）。\n");
+        List<AiPlanStep> its = AiTaskPlan.ItemsOf(t);
+        if (its.Count > 0) {
+            sb.Append("这个节点要干的活：\n");
+            for (int i = 0; i < its.Count; i = i + 1) {
+                string mark = "[ ] ";
+                if (its[i].done != 0) { mark = "[x] "; }
+                sb.Append("  " + mark + its[i].text + "\n");
+            }
+        }
+        if (AiAgent.Trim(t.accept) != "") {
+            sb.Append("验收标准：\n" + AiAgent.Trim(t.accept) + "\n");
+        }
+        sb.Append("做完回 [report] task=" + t.id
+            + " 说清交付了什么、怎么验证的；真有需要用户定的事才 [question]。");
+        return sb.ToString();
+    }
+
+    /// 该派给谁：节点写了负责人就按它，没写（或写成产品经理——它不写代码）就
+    /// 按固定链条交给产品经理的下一环。
+    static string OwnerOf(AiTask t) {
+        if (t == null) { return ""; }
+        string who = AiAgent.Trim(t.owner);
+        if (who == "" || who == AiTeam.Pm()) {
+            return AiTeam.NextOf(AiTeam.Pm());
+        }
+        return who;
+    }
+
+    /// 验收通过后落进项目知识的那一段（`.zan/knowledge.md` 的一节）。写的是
+    /// 结论而不是过程：下一次开工的人要的是「这里已经定成什么样」，不是当时
+    /// 聊了多少拍。
+    static string NoteSection(AiTask t, string verdict) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("\n## " + t.id);
+        if (t.title != "") { sb.Append(" " + t.title); }
+        sb.Append("\n");
+        if (t.owner != "") {
+            sb.Append("- 负责人：@" + AiTeam.DisplayName(t.owner) + "\n");
+        }
+        if (AiAgent.Trim(t.accept) != "") {
+            sb.Append("- 验收标准：" + AiTeam.OneLine(t.accept) + "\n");
+        }
+        if (AiAgent.Trim(t.outcome) != "") {
+            sb.Append("- 产出：" + AiTeam.OneLine(t.outcome) + "\n");
+        }
+        string v = AiAgent.Trim(verdict);
+        if (v != "") { sb.Append("- 验收结论：" + AiTeam.OneLine(v) + "\n"); }
+        return sb.ToString();
+    }
+
+    /// 折成一行：知识条目是给人扫的，多行正文塞进列表项里会把结构撑烂。
+    static string OneLine(string s) {
+        StringBuilder sb = new StringBuilder();
+        bool sp = false;
+        string t = AiAgent.Trim(s);
+        for (int i = 0; i < t.Length; i = i + 1) {
+            string ch = t.Substring(i, 1);
+            if (ch == "\n" || ch == "\r" || ch == "\t") {
+                sp = true;
+                continue;
+            }
+            if (sp && sb.Length > 0) { sb.Append(" "); }
+            sp = false;
+            sb.Append(ch);
+        }
+        string one = sb.ToString();
+        if (one.Length > 600) { one = AiAgent.Clip(one, 600) + "..."; }
+        return one;
+    }
+
     /// 现在可以开工的节点：自己未完成、前置全齐。面板用它提示「接下来能做
     /// 哪几个」，模型也用它决定下一步派单给谁。
     static List<string> ReadyTasks(List<AiTask> tasks) {
@@ -1318,6 +1854,10 @@ class AiTeam {
         if (v == null) { return tasks.Count; }
         JsonValue items = v.Get("items");
         if (items == null || !items.IsArray()) { return tasks.Count; }
+        // 本次计划里出现的节点次序，以及模型到底有没有说过前置：没说过和
+        // 说了「没有前置」是两件事，前者才需要 IDE 替它连线。
+        List<string> order = new List<string>();
+        bool told = false;
         for (int i = 0; i < items.Count(); i = i + 1) {
             JsonValue it = items.At(i);
             if (!it.IsObject()) { continue; }
@@ -1337,10 +1877,33 @@ class AiTeam {
             if (owner != "") { t.owner = owner; }
             string accept = AiAgent.Trim(it.Str("accept", it.Str("ac", "")));
             if (accept != "") { t.accept = accept; }
+            if (it.Get("deps") != null) { told = true; }
+            // 节点内的开发任务清单：功能节点下面那几件具体的活。
+            JsonValue sub = it.Get("tasks");
+            if (sub == null) { sub = it.Get("items"); }
+            if (sub == null) { sub = it.Get("steps"); }
+            AiTaskPlan.ReadItems(sub, t);
             AiTeam.ReadIds(it.Get("deps"), t, true);
             AiTeam.ReadIds(it.Get("parts"), t, false);
+            AiTeam.AddOnce(order, id);
         }
+        if (!told) { AiTeam.ChainOrder(tasks, order); }
         return tasks.Count;
+    }
+
+    /// 一个 `deps` 都没写的计划：把这次列出的节点按给出的次序串成一条链。
+    /// 没有连线的任务图退化成一排卡片——看不出先后，也就没有「谁在等谁」
+    /// 和「现在能开工的是哪个」，而列出来的次序正是模型心里的顺序。只补
+    /// 空缺：已经有前置的节点不动，所以下一次带 deps 的重发能把链改成真
+    /// 正的分叉。
+    static void ChainOrder(List<AiTask> tasks, List<string> ids) {
+        if (ids == null || ids.Count < 2) { return; }
+        for (int i = 1; i < ids.Count; i = i + 1) {
+            AiTask t = AiTeam.TaskOf(tasks, ids[i]);
+            if (t == null) { continue; }
+            if (t.deps != null && t.deps.Count > 0) { continue; }
+            AiTeam.AddDep(t, ids[i - 1]);
+        }
     }
 
     /// Folds a JSON `deps`/`parts` value into the task. Both a real array and
@@ -1389,7 +1952,7 @@ class AiTeam {
         string t = AiAgent.Trim(body);
         int nl = t.IndexOf("\n");
         if (nl >= 0) { t = t.Substring(0, nl); }
-        if (t.Length > 60) { t = t.Substring(0, 60); }
+        if (t.Length > 60) { t = AiAgent.Clip(t, 60); }
         return AiAgent.Trim(t);
     }
 
@@ -1409,6 +1972,66 @@ class AiTeam {
     /// six members long, so a full pass plus a round of fixes fits; past that
     /// the members are volleying and the user should see it.
     static int MaxHandoffs() { return 12; }
+
+    /// 同一个人在同一个节点上能被原地催几次。第一脚常常真能把它推动，
+    /// 第二脚往往已经是一模一样的一拍；再催就只是把同一段话刷给用户看，
+    /// 所以到这里换人而不是接着催。
+    static int MaxIdleNudges() { return 2; }
+
+    /// 原地卡住的人把活儿交给谁：具体干活的人卡住先找架构师理清（拆活儿
+    /// 、定方案本来就是它的职责），架构师自己卡住就回到产品经理去统筴。
+    /// 产品经理本身卡住不在这条路上（给它的一脚已经是“转派”），返回 ""
+    /// 让调用方停下来交回用户。
+    static string EscalateTo(string who) {
+        if (who == AiTeam.Pm()) { return ""; }
+        if (who == AiTeam.Arch()) { return AiTeam.Pm(); }
+        return AiTeam.Arch();
+    }
+
+    /// 换人时给接手人的指令：说清是谁在哪个节点上停住了，接手人要么自己
+    /// 把这一步做完、要么把它拆成能执行的下一步再交回去，不要原封不动地
+    /// 把同一句话再弹回给卡住的人，也不要把这事丢给用户。
+    static string EscalatePrompt(string stuck, string esc, AiTask t,
+        string taskId) {
+        string id = taskId;
+        if (t != null) { id = t.id; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] 团队内部转交：" + AiTeam.DisplayName(stuck)
+            + " 在");
+        if (id != "") { sb.Append("任务 " + id); }
+        if (t != null && t.title != "") { sb.Append("（" + t.title + "）"); }
+        sb.Append(" 上连着几拍没有推进（只说下一步、或重复同一个查询），"
+            + "现在转给你。\n");
+        if (t != null && AiAgent.Trim(t.accept) != "") {
+            sb.Append("验收标准：\n" + AiAgent.Trim(t.accept) + "\n");
+        }
+        // 转给一个没有写权限的角色（架构师、审查、安全）时，「你自己把那一步
+        // 做完」是它做不到的事：它只会一遍遍读代码，然后同一个节点又挂起。
+        // 这种角色这一拍只能产出一条可执行指令，或者说清真的缺什么。
+        if (!AiTeam.AllowsTool(esc, "write_file")) {
+            sb.Append("你没有改代码的权限，所以不要试着自己做完：这一拍只做一件"
+                + "事——把卡住的那一步变成一条别人拿着就能敲的指令（改哪个文件、"
+                + "加什么、怎么算做完），然后 [handoff] @"
+                + AiTeam.DisplayName(stuck) + " task=" + id
+                + "。已经读过的东西别再读一遍；要是缺的是前置条件或用户拍板，"
+                + "直接 [block] 说清缺什么。");
+            return sb.ToString();
+        }
+        sb.Append("这一拍要么你自己把卡住的那一步做完，要么把它拆成一条明确、可"
+            + "执行的指令后 [handoff] 给合适的人（带上 task=" + id
+            + "）；不要把同一句话原样退回去，也不要因为这个去问用户。");
+        return sb.ToString();
+    }
+
+    /// 交接上限：跟「自动继续上限」用同一个设置项，因为一次自动交接对用户
+    /// 就是「小助手又自己跑了一拍」，两个刹车分开配只会出现「继续设成不限、
+    /// 团队照样停」。`configured` 是设置里的值（<0 = 没配过，用内置默认；
+    /// 0 = 不限，仍受 AiAgent.ContinuesCeiling() 兜底）。
+    static int HandoffsBudget(int configured) {
+        if (configured < 0) { return AiTeam.MaxHandoffs(); }
+        if (configured == 0) { return AiAgent.ContinuesCeiling(); }
+        return configured;
+    }
 
     /// The comma-separated recipient list stored on a message.
     static string JoinIds(List<string> ids) {
@@ -1436,8 +2059,95 @@ class AiTeam {
         }
         string body = AiAgent.Trim(env.body);
         if (body != "") { sb.Append(body + "\n"); }
-        sb.Append("先回一条 [ack] 认领，再开始你自己的职责；"
-            + "完成后按协议 @ 下一环节。");
+        sb.Append("直接开始你自己那一段（不用回「收到」）；做完再按协议 @ 下一"
+            + "环节，中途不要 @ 人。");
+        return sb.ToString();
+    }
+
+    /// 认领之后那一脚：认领本身不是工作，所以自动执行时立刻把同一个成员
+    /// 叫回来干活，而不是停在「已认领 0%」等用户催。
+    static string StartPrompt(string who, AiTask t, string taskId) {
+        // 产品经理认领了也不是它自己干：它统筹，所以那一脚仍是转派。
+        if (who == AiTeam.Pm()) { return AiTeam.RoutePrompt(t); }
+        string id = taskId;
+        if (t != null) { id = t.id; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] 本拍执行人："
+            + AiTeam.DisplayName(who) + "，现在直接做");
+        if (id != "") { sb.Append("任务 " + id); }
+        if (t != null && t.title != "") { sb.Append("（" + t.title + "）"); }
+        sb.Append("该由你负责的那一段：该查就查、该改就改，"
+            + "别复述计划也别重复刚才已经查过的东西。\n");
+        sb.Append("做完回 [report] 说清交付了什么、怎么验证的；"
+            + "真有需要用户定的事才 [question]。");
+        return sb.ToString();
+    }
+
+    /// 团队还欠着活儿：任务图里还有节点没到「已完成」。图是空的不算欠活儿
+    /// （还没拆任务时不该替用户往下催）。
+    static bool HasUnfinished(List<AiTask> tasks) {
+        if (tasks == null) { return false; }
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            if (tasks[i].state != AiTeam.TaskDone()) { return true; }
+        }
+        return false;
+    }
+
+    /// 一拍说完了却什么也没做（只回了一句「接下来看 X」、或者读文件读到次数
+    /// 上限被截断）时给同一个成员的那一脚。它欠的活儿还在图上，停下来只会让
+    /// 用户手打「继续」，所以直接把它叫回原地接着干。
+    ///
+    /// 产品经理是例外：它的活儿是盯全程和转派，不是自己下手做。催它「接着做」
+    /// 只会换回一份重写的计划或又一份报告，所以给它的那一脚是「按图把这一段
+    /// 交给对应负责人」。
+    static string NudgePrompt(string who, AiTask t, string taskId) {
+        if (who == AiTeam.Pm()) { return AiTeam.RoutePrompt(t); }
+        string id = taskId;
+        if (t != null) { id = t.id; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] 本拍执行人：" + AiTeam.DisplayName(who)
+            + "。从你上次停下的地方继续");
+        if (id != "") { sb.Append("任务 " + id); }
+        if (t != null && t.title != "") { sb.Append("（" + t.title + "）"); }
+        sb.Append("：上一拍只说了下一步却没真做，现在直接发出那一步的工具调用，"
+            + "别重述计划、别重复已经查过的东西、别从头开始。\n");
+        if (!AiTeam.AllowsTool(who, "write_file")) {
+            // 只读角色再催「发工具调用」只会换个文件继续读：它的交付不是代码，
+            // 是一条能落地的指令。
+            sb.Append("你没有改代码的权限：代码已经读够了就别再读，直接把结论写"
+                + "成一条可执行的指令 [handoff] 给 @"
+                + AiTeam.DisplayName(AiTeam.Dev()) + " task=" + id
+                + "；确实缺前置就 [block] 说清缺什么。");
+            return sb.ToString();
+        }
+        sb.Append("做完回 [report] 说清交付了什么、怎么验证的；"
+            + "真有需要用户定的事才 [question]。");
+        return sb.ToString();
+    }
+
+    /// 给产品经理的那一脚：转派，不是自己做。图上已经有这个节点就点名它的
+    /// 负责人；图还没拆（或这个节点没写负责人）就交给架构师去拆——拆活儿本来
+    /// 就是架构师的职责，产品经理只负责需求和统筹。
+    static string RoutePrompt(AiTask t) {
+        string who = AiTeam.OwnerOf(t);
+        if (t == null) { who = AiTeam.Arch(); }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] 本拍执行人：" + AiTeam.DisplayName(AiTeam.Pm())
+            + "。你不写代码、不做设计、不自己跑测试：你的活儿是把需求讲清楚、"
+            + "盯着整条流程、需要用户拍板时才问用户。上一拍你既没交接也没提问，"
+            + "流程停住了。\n");
+        sb.Append("现在这一拍只做一件事：[handoff] @"
+            + AiTeam.DisplayName(who));
+        if (t != null) {
+            sb.Append(" task=" + t.id);
+            if (t.title != "") { sb.Append("（" + t.title + "）"); }
+        }
+        sb.Append("，一句话说清要它交付什么、验收看什么。");
+        if (t == null) {
+            sb.Append("任务图还没拆，让架构师按功能拆成节点（每个节点自己带"
+                + " 3-8 条活儿、负责人和验收标准）。");
+        }
+        sb.Append("别重发计划、别再写一遍报告、别复述已经说过的话。");
         return sb.ToString();
     }
 

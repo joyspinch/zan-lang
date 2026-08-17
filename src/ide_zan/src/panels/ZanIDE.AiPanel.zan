@@ -103,13 +103,11 @@ partial class ZanIDE {
         }
         if (selMi != null) { chatModel = selMi.model; }
         aiChatModel = chatModel;
-        // 把生效模型配置的上下文 / 输出上限交给 agent 层，于是上下文
-        // 压缩、用量环和请求的 max_tokens 都跟着这个模型；没配过的模型
-        // 用默认上下文长度。
-        int aiCtxTok = ZanIDE.AiLimitInt(aiLimMap, chatModel, "ctx");
-        if (aiCtxTok <= 0) { aiCtxTok = AiAgent.DefaultCtxTokens(); }
-        AiAgent.SetLimits(aiCtxTok,
-            ZanIDE.AiLimitInt(aiLimMap, chatModel, "out"));
+        // 把整张限额表（模型 -> 上下文 / 输出上限）和聊天框选中的模型交给
+        // agent 层：团队里每个成员各跑自己的模型，所以压缩预算、用量环和请求
+        // 的 max_tokens 都必须按「那一次发请求的模型」去查这张表，而不是全队
+        // 共用聊天框这一个模型的数字。没配过的模型用默认上下文长度。
+        AiAgent.SetProvider(aiLimMap, chatModel);
 
         // ---- 本帧的可变尺寸 ----
         // 会话栏：太窄的停靠位直接收起它，好让聊天保持可用宽度。
@@ -126,15 +124,43 @@ partial class ZanIDE {
         // 新增的话追加到它所属节点的上下文。
         this.AiGraphTick();
         aiPanel.TeamStrip().Sync(aiTeamMode, aiBusy.Get() == 1, aiTeamSt,
-            aiTasks, aiTeamOpen, aiGraphSel);
+            aiTasks, aiTeamOpen, aiGraphSel,
+            aiTeamSt.activeTask, this.AiGraphLive(aiTeamSt.activeTask),
+            this.AiGraphRunning());
         // 「跑到哪了」+ 任务计划：带子自己量高度（声明的控件树），
         // 宿主只把这次交付和计划交给它。
         PlanStrip aiBand = aiPanel.PlanBand();
-        int aiPlanH = aiBand.HeightOf(app, aiRun, aiPlan);
-        aiBand.Sync(app, aiRun, aiPlan);
+        // 进度以任务图为主：拆出来的节点做完了几个才是「需求做到哪了」，
+        // 十二拍只是当前节点内部的细节。
+        // 状态条上的「当前节点」说的是谁在被执行，所以它只能来自状态机。点开
+        // 一个节点只是切它自己的上下文（`aiGraphSel`），不代表它在跑；拿选中项
+        // 当执行节点，就是「没有进行的任务却写着执行中」的由来。
+        // 团队状态机的活动节点在前：单人模式下没有活动节点，才拿这次交付自己
+        // 的编号（T1、T2……由 aiRunSeq 发）当标题。
+        string aiCurTask = aiTeamSt.activeTask;
+        if (aiCurTask == "" && aiRun != null) { aiCurTask = aiRun.taskId; }
+        // 团队模式下这条计划是「当前这个节点自己的活」：图上一个节点是一块功能
+        // （前台商品展示、积分兑换……），要干的活在节点里边。看哪个节点就看它
+        // 那份活（没在执行时看的是选中的那个），所以图和计划说的是同一件事。
+        List<AiPlanStep> aiBandPlan = aiPlan;
+        string aiBandTag = "";
+        if (aiTeamMode) {
+            string aiPlanNode = aiCurTask;
+            if (aiPlanNode == "") { aiPlanNode = aiGraphSel; }
+            AiTask aiPlanTask = AiTeam.TaskOf(aiTasks, aiPlanNode);
+            if (aiPlanTask != null) {
+                aiBandPlan = AiTaskPlan.ItemsOf(aiPlanTask);
+                aiBandTag = aiPlanNode;
+            } else {
+                aiBandPlan = new List<AiPlanStep>();
+            }
+        }
+        int aiPlanH = aiBand.HeightOf(app, aiRun, aiTasks, aiBandPlan);
+        aiBand.Sync(app, aiRun, aiTasks, aiCurTask, aiBandPlan,
+            aiBusy.Get() == 1, aiBandTag);
         // 「插入代码」/「替换整文件」：把最后一段 AI 代码写到光标处或
         // 整个文件；没有可用代码（或当前不是可写文件）就不占那一行。
-        string aiCode = ZanIDE.AiLastCode(aiMsgs);
+        string aiCode = this.AiLastCodeCached();
         bool aiCanApply = aiCode != "" && act >= 0 && act < tabs.Count
             && !designerMode && tabs[act].path != ""
             && tabs[act].path.Substring(0, 1) != "@";
@@ -148,6 +174,13 @@ partial class ZanIDE {
                 : ZanIDE.T("A:off", "自:关");
         }
         if (aiCueH > 0) {
+            // 收件人先回读、再铺进控件：下拉的选中变化是在覆盖层里发生的（这一帧
+            // 更靠后），所以必须在 Sync 之前把它取走。反过来的话 Sync 会先按旧的
+            // aiSendTo 把选中项按回去，用户怎么点都换不了人。
+            if (aiTeamMode && aiPanel.CueRow().TakeChanged()) {
+                aiSendTo = aiPanel.CueRow().Recipient();
+                app.RequestRedraw();
+            }
             // 自动模式下徽标显示当前解析到的成员，所以路由在这里算一次。
             aiPanel.CueRow().Sync(aiSendTo,
                 AiTeam.RouteUserSt(aiPanel.PromptBox().GetText(), aiMsgs,
@@ -188,7 +221,21 @@ partial class ZanIDE {
         string aiPicked = aiStrip.TakePicked();
         string aiStarted = aiStrip.TakeStarted();
         string aiBlockedNode = aiStrip.TakeBlocked();
-        if (aiStarted != "") {
+        // 右键：菜单和文件树 / 标签页的右键菜单同一套，由外壳在这一帧的
+        // 最上层画（ctxKind == 7），这里只记下是哪个节点。
+        string aiCtxNode = aiStrip.TakeContext();
+        if (aiCtxNode != "") {
+            ctxKind = 7;
+            ctxTaskId = aiCtxNode;
+            ctxX = aiStrip.CtxX();
+            ctxY = aiStrip.CtxY();
+            app.RequestRedraw();
+        }
+        if (aiStrip.TakeBackProject()) {
+            // 回项目级对话：节点上下文和项目对话各存一份，来回切都不丢。
+            this.AiGraphOpen("");
+            app.RequestRedraw();
+        } else if (aiStarted != "") {
             this.AiGraphStart(aiStarted);
             app.RequestRedraw();
         } else if (aiBlockedNode != "") {
@@ -201,20 +248,36 @@ partial class ZanIDE {
 
         // ---- 任务计划：清空由带子上的按钮给出，计划归外壳所有 ----
         if (aiBand.TakeClear()) {
-            aiPlan = new List<AiPlanStep>();
+            // 团队模式下这条计划是某个节点自己的活，清空它就是清空那个节点的
+            // 清单（进度跟着回落）；全局那份只属于单人模式。
+            if (aiBandTag != "") {
+                AiTask aiClr = AiTeam.TaskOf(aiTasks, aiBandTag);
+                if (aiClr != null) { aiClr.items = new List<AiPlanStep>(); }
+            } else {
+                aiPlan = new List<AiPlanStep>();
+            }
             app.RequestRedraw();
+        }
+
+        // ---- 本轮改动文件：双击清单里的一行就在编辑器里打开它，
+        // 免得为了看小助手改了什么去文件树里翻。
+        string aiOpenChanged = aiBand.TakeOpen();
+        if (aiOpenChanged != "") {
+            string aiCp = aiOpenChanged;
+            if (!File.Exists(aiCp) && root != "") {
+                aiCp = root + "/" + aiOpenChanged;
+            }
+            if (File.Exists(aiCp)) {
+                ZanIDE.OpenPath(tabs, activeTab, aiCp,
+                    Path.GetFileName(aiCp));
+                lastActive = 0 - 1;
+                app.RequestRedraw();
+            }
         }
 
         // ---- 聊天记录：组件自己排版、滚动、折叠与复制 ----
         aiPanel.Transcript().Bind(aiMsgs);
         aiPanel.Transcript().SetBusy(aiBusy.Get() == 1);
-
-        // ---- 发给谁提示行（团队模式）：下拉自己处理打开和选择，
-        // 外壳只在用户换了收件人时收下这个状态 ----
-        if (aiTeamMode && aiCueH > 0 && aiPanel.CueRow().TakeChanged()) {
-            aiSendTo = aiPanel.CueRow().Recipient();
-            app.RequestRedraw();
-        }
 
         // 自动执行开关真正决定的是「谁有权跑操作类工具」，所以把它说
         // 清楚，而不是在输入框前面留一个没头没尾的 "Auto"。
@@ -267,99 +330,21 @@ partial class ZanIDE {
     }
 
     /// 会话列表（左栏）：标题取用户改过的名字，否则取第一条用户消息。
-    void AiRenderSessions(App app, Rect area) {
-        int rPad = app.Scale(6);
-        List<string> aiTitles = new List<string>();
-        List<int> aiArch = new List<int>();
-        for (int sti = 0; sti < aiSessions.Count; sti = sti + 1) {
-            string sTtl = aiSessions[sti].title;
-            if (sTtl == "") {
-                if (sti == aiSessCur) {
-                    sTtl = ChatArea.FirstUserOf(aiMsgs);
-                } else {
-                    sTtl = ChatArea.ChatTitle(aiSessions[sti].pack);
-                }
-            }
-            if (sTtl == "") {
-                sTtl = ZanIDE.T("New chat ", "新会话 ")
-                    + Convert.ToString(sti + 1);
-            }
-            aiTitles.Add(sTtl);
-            aiArch.Add(aiSessions[sti].archived);
+    /// 最后一段 AI 代码，按「轮数 + 尾条长度」缓存。取它要在最后那条回答上
+    /// 找围栏并切出中间那段，一条几十 KB 的长回答每帧复制一次就是白烧 CPU，
+    /// 而它只在那条回答变长时才会变。
+    string AiLastCodeCached() {
+        string sig = Convert.ToString(aiMsgs.Count);
+        if (aiMsgs.Count > 0) {
+            ChatMessage tail = aiMsgs[aiMsgs.Count - 1];
+            sig = sig + ":" + Convert.ToString(tail.text.Length)
+                + ":" + tail.role;
         }
-        SessionListAction sAct = aiSessNav.RenderEx(app,
-            area.x + rPad, area.y + rPad, area.width - rPad * 2,
-            area.height - rPad * 2, aiTitles, aiSessCur, aiArch);
-        if (aiBusy.Get() == 0 && sAct.archived >= 0
-            && sAct.archived < aiSessions.Count) {
-            // 归档保留会话（连上下文一起），只把它从列表里折叠起来；
-            // 再点一次就恢复。
-            int sArc = sAct.archived;
-            if (aiSessions[sArc].archived == 0) { aiSessions[sArc].archived = 1; }
-            else { aiSessions[sArc].archived = 0; }
-            SaveAiSessions();
-            Layer.Msg(aiSessions[sArc].archived == 1
-                ? ZanIDE.T("Chat archived", "会话已归档")
-                : ZanIDE.T("Chat restored", "会话已恢复"), 3);
-            app.RequestRedraw();
-        } else if (aiBusy.Get() == 0 && sAct.deleted >= 0) {
-            // 删除会丢掉那个会话的全部上下文：记录、思考、任务计划和
-            // 归档标记。最后一个会话只清空不移除，面板永远有地方可写。
-            aiSessions[aiSessCur].pack = AiPackCur();
-            int sDel = sAct.deleted;
-            bool sDelActive = sDel == aiSessCur;
-            int sNewCur = aiSessCur;
-            if (aiSessions.Count > 1) {
-                aiSessions.RemoveAt(sDel);
-                if (sDel < aiSessCur) { sNewCur = aiSessCur - 1; }
-                else if (sDel == aiSessCur) {
-                    if (sNewCur >= aiSessions.Count) {
-                        sNewCur = aiSessions.Count - 1;
-                    }
-                }
-            } else {
-                aiSessions[0].pack = "";
-                aiSessions[0].archived = 0;
-                sNewCur = 0;
-            }
-            aiMsgs = new List<ChatMessage>();
-            aiPlan = new List<AiPlanStep>();
-            AiRestoreSession(aiSessions[sNewCur].pack);
-            aiSessCur = sNewCur;
-            if (sDelActive) { AiResetContextState(); }
-            this.AiChatReset();
-            // 列表下的行整体上移：留着的重命名会落到接替那个下标的会话上。
-            aiSessNav.CancelRename();
-            SaveAiSessions();
-            Layer.Msg(ZanIDE.T("Chat and its context deleted",
-                "会话及其上下文已删除"), 3);
-            app.RequestRedraw();
-        } else if (sAct.renamed >= 0 && sAct.renamed < aiSessions.Count) {
-            // 名字清空就把这一行交回给推导出来的标题。
-            aiSessions[sAct.renamed].title = CodeEditor.TrimStr(sAct.title);
-            SaveAiSessions();
-            app.RequestRedraw();
-        } else if (aiBusy.Get() == 0 && sAct.created) {
-            aiSessions[aiSessCur].pack = AiPackCur();
-            aiSessions.Add(AiSession.Create("", 0));
-            aiMsgs = new List<ChatMessage>();
-            aiPlan = new List<AiPlanStep>();
-            aiSessCur = aiSessions.Count - 1;
-            AiResetContextState();
-            this.AiChatReset();
-            SaveAiSessions();
-            app.RequestRedraw();
-        } else if (aiBusy.Get() == 0 && sAct.selected >= 0
-            && sAct.selected != aiSessCur) {
-            aiSessions[aiSessCur].pack = AiPackCur();
-            aiMsgs = new List<ChatMessage>();
-            aiPlan = new List<AiPlanStep>();
-            AiRestoreSession(aiSessions[sAct.selected].pack);
-            aiSessCur = sAct.selected;
-            this.AiChatReset();
-            SaveAiSessions();
-            app.RequestRedraw();
+        if (sig != aiCodeSig) {
+            aiCodeSig = sig;
+            aiCodeVal = ZanIDE.AiLastCode(aiMsgs);
         }
+        return aiCodeVal;
     }
 
     /// 换行缓存失效（文案、字号、团队模式或主题变了）：下一帧整份重排。
@@ -370,6 +355,19 @@ partial class ZanIDE {
     /// 换掉整份记录（新建 / 切换 / 删除会话）：缓存、折叠、选区与滚动
     /// 一起归零，否则新会话会带着上一份的展开项和高亮。
     void AiChatReset() {
+        // 上一份会话的节点留档不能跟着新会话走：它们属于那份记录，留着就是
+        // 切到同名节点时看到别的会话说过的话。
+        aiCtxKeys = new List<string>();
+        aiCtxMem = new List<List<ChatMessage>>();
+        aiGraphSel = "";
+        aiCtxSaved = aiMsgs.Count;
+        // 换会话就换了一张图：留着上一份的图状态，下一次请求会带着别的会话
+        // 的节点去问。
+        aiGraphSig = "";
+        AiTeam.SetBoard(AiTeam.BoardBrief(aiTasks, ""));
+        // 上一份记录折出来的那份摘要说的是上一段对话：留着它，新会话第一次
+        // 压缩就会把别人的历史当成自己的前情摘要发出去。
+        AiAgent.ResetCompaction();
         if (aiPanel != null) { aiPanel.Transcript().Reset(); }
     }
 
@@ -382,12 +380,56 @@ partial class ZanIDE {
     /// IDE 会话的请求与 token 总量。只在这里组装数字 —— 环、卡片、卡片
     /// 里的行和那段会自动换行的说明都由控件自己画。
     void AiSyncCtxRing() {
-        int used = AiAgent.ContextChars(aiMsgs);
-        int budget = AiAgent.MaxContextChars();
+        // 上下文是按成员分开的：每个成员只带自己那一份对话
+        // （`AiTeam.ContextFor`），而且各按自己绑的那个模型的窗口压缩。所以
+        // 环上显示的必须是「这一轮在说话的那个成员」的用量与它自己的上限，
+        // 底下再逐个成员列一行——把整条聊天记录对着聊天框那个模型的窗口算，
+        // 显示的和真正发出去的根本不是一回事。
+        string who = aiRunAgent;
+        if (!aiTeamMode) { who = ""; }
+        List<ChatMessage> mine = aiMsgs;
+        if (who != "") { mine = AiTeam.ContextFor(who, aiMsgs); }
+        string myModel = "";
+        if (who != "") { myModel = AiTeam.ModelOf(who); }
+        int used = AiAgent.ContextChars(mine);
+        int budget = AiAgent.MaxContextCharsOf(myModel);
         int pct = 0;
         if (budget > 0) { pct = used * 100 / budget; }
-        int comp = AiAgent.Compactions();
+        int comp = AiAgent.CompactionsOf(who);
+        int allChars = AiAgent.ContextChars(aiMsgs);
+        // Nothing here changes between frames unless one of these numbers did,
+        // and the control keeps the lists it was handed. Rebuilding a dozen
+        // cards (and their strings) every frame while an answer streams is
+        // pure garbage the collector then has to walk.
+        string sig = Convert.ToString(used) + ":" + Convert.ToString(budget)
+            + ":" + Convert.ToString(comp)
+            + ":" + Convert.ToString(AiAgent.LastDroppedOf(who))
+            + ":" + who + ":" + myModel
+            // 逐个成员那几行要重算就得给每个人过一遍 ContextFor（O(成员 × 对话)）,
+            // 所以整条聊天记录的字数进签名：它不动，谁的那份也不会动。
+            + ":" + Convert.ToString(allChars)
+            + ":" + Convert.ToString(aiMsgs.Count)
+            + ":" + Convert.ToString(ZanIDE.aiStatReqs)
+            + ":" + Convert.ToString(ZanIDE.aiStatFails)
+            + ":" + Convert.ToString(ZanIDE.aiStatUsageReplies)
+            + ":" + Convert.ToString(ZanIDE.aiStatPrompt)
+            + ":" + Convert.ToString(ZanIDE.aiStatCompletion)
+            + ":" + Convert.ToString(ZanIDE.aiStatCached)
+            + ":" + Convert.ToString(ZanIDE.aiStatTotal)
+            + ":" + Convert.ToString(aiTokPrompt)
+            + ":" + Convert.ToString(aiTokCompletion)
+            + ":" + Convert.ToString(aiTokTotal)
+            + ":" + Convert.ToString(ZanIDE.uiLang);
+        if (sig == aiRingSig) { return; }
+        aiRingSig = sig;
         List<UsageStat> ctx = new List<UsageStat>();
+        // 这一份用量是谁的：团队模式下不写出来的话，同一个环会在成员之间跳来
+        // 跳去，看着像统计错了。
+        if (who != "") {
+            string whoTxt = AiTeam.DisplayName(who);
+            if (myModel != "") { whoTxt = whoTxt + " · " + myModel; }
+            ctx.Add(UsageStat.Of(ZanIDE.T("Member", "当前成员"), whoTxt));
+        }
         ctx.Add(UsageStat.Of(ZanIDE.T("Used", "已使用"),
             Convert.ToString(used) + " " + ZanIDE.T("chars", "字符")));
         // The budget is measured in CHARACTERS (the transcript is not
@@ -408,12 +450,35 @@ partial class ZanIDE {
                 : Convert.ToString(comp) + " "
                     + ZanIDE.T("requests", "次请求"),
             comp > 0));
+        // 团队模式：每个成员一行「占用% · 已用/上限」，各自按自己那个模型的
+        // 窗口算。谁快满了、谁已经在压缩，在这里一眼看得见。
+        if (aiTeamMode) {
+            List<AiRole> rrs = AiTeam.Roles();
+            for (int ri = 0; ri < rrs.Count; ri = ri + 1) {
+                string rid = rrs[ri].id;
+                int rused = AiAgent.ContextChars(
+                    AiTeam.ContextFor(rid, aiMsgs));
+                if (rused == 0) { continue; }
+                int rbud = AiAgent.MaxContextCharsOf(AiTeam.ModelOf(rid));
+                int rpct = 0;
+                if (rbud > 0) { rpct = rused * 100 / rbud; }
+                string rtxt = Convert.ToString(rpct) + "% · "
+                    + Convert.ToString(rused) + " / " + Convert.ToString(rbud);
+                int rcomp = AiAgent.CompactionsOf(rid);
+                if (rcomp > 0) {
+                    rtxt = rtxt + ZanIDE.T(" · compacted x", " · 压缩 ")
+                        + Convert.ToString(rcomp);
+                }
+                ctx.Add(UsageStat.Flag(ZanIDE.T(rrs[ri].en, rrs[ri].zh),
+                    rtxt, rid == who));
+            }
+        }
         string note = "";
         if (comp > 0) {
             note = ZanIDE.T("Older turns are sent as a digest",
                     "较早的对话以摘要形式发送")
                 + ZanIDE.T(" (last fold: ", "（上次折叠 ")
-                + Convert.ToString(AiAgent.LastDropped())
+                + Convert.ToString(AiAgent.LastDroppedOf(who))
                 + ZanIDE.T(" turns; the chat above keeps them all).",
                     " 条；上方对话仍完整保留）。");
         }
@@ -561,13 +626,33 @@ partial class ZanIDE {
         // 由问它的人回答，于是「继续」接着停下的那一拍，否则由最后
         // 说话的成员接手。
         string tgt = "";
+        bool wasAsked = false;
         if (ide.aiTeamMode) {
             if (ide.aiSendTo != "") { tgt = ide.aiSendTo; }
             else { tgt = AiTeam.RouteUserSt(q, ide.aiMsgs, ide.aiTeamSt); }
+            wasAsked = ide.aiTeamSt.awaitingUser;
             ide.aiTeamSt.awaitingUser = false;
             ide.aiTeamSt.askedBy = "";
         }
+        // 执行节点由「在这个节点上真的发了话」给出，不由「点开看了一眼」给出。
+        //
+        // 在项目对话里发话（没选节点）而且上一次交付已经收尾，就把执行节点卸
+        // 掉：让它挂在上一个节点上，接下来这段话会被算进那个节点的进度里。回答
+        // 被挂起的提问是例外——那句话本来就是那个节点在等的东西。
+        if (ide.aiTeamMode) {
+            if (ide.aiGraphSel != "") {
+                ide.aiTeamSt.activeTask = ide.aiGraphSel;
+                ide.AiRunForTask(ide.aiGraphSel);
+            } else if (!wasAsked
+                && (ide.aiRun == null || ide.aiRun.Finished())) {
+                ide.aiTeamSt.activeTask = "";
+            }
+        }
         ide.aiRunAgent = tgt;
+        // 新一轮开始前，上一轮流式显示剩下的东西一律作废（停止、报错、
+        // 切会话那几条路径都可能留下一半）。这里不删气泡：当时那条已经
+        // 是记录的一部分，只把下标和解析状态归零。
+        ide.AiStreamDrop(false);
         ChatMessage umsg = ChatMessage.Create("user", q);
         umsg.to = tgt;
         ide.aiMsgs.Add(umsg);
@@ -578,6 +663,11 @@ partial class ZanIDE {
         ide.aiRetry = 0;
         ide.aiAutoCont = 0;
         ide.aiHandoffs = 0;
+        // 用户又说了一句话：这一问该查什么、谁在原地空转都重新算。
+        ide.AiForgetTools();
+        ide.aiIdleKey = "";
+        ide.aiIdleTimes = 0;
+        ide.aiEscKey = "";
         // 把当前文件作为上下文附上，助手才能帮到屏幕上这段代码。
         string aiCtxName = "";
         string aiCtxCode = "";
@@ -612,9 +702,13 @@ partial class ZanIDE {
         ZanIDE.AiCancelRequest();
         ide.AiRunStopped();
         ide.aiBusy.Set(0);
-        ide.aiAutoCont = AiAgent.MaxContinues();
+        ide.aiAutoCont = ide.aiContMax;
         ide.aiRetry = AiAgent.MaxRetries();
         ide.aiPendingCall = "";
+        // 中断就把这一轮的运行态一次清完：写了一半的预览气泡、它的下标、
+        // SSE 解析游标和等待起点。只清一半（以前只清待发调用）的后果是
+        // 下一句话进来时，旧下标落在那句新消息上。
+        ide.AiStreamDrop(true);
         ide.aiMsgs.Add(ChatMessage.Create("error",
             ZanIDE.T("[stopped] Interrupted by you.",
                 "[已停止] 任务被你中断。")));
@@ -640,7 +734,7 @@ partial class ZanIDE {
         if (ide == null || ide.aiBusy.Get() != 2) { return; }
         string capR = ide.aiPendingCall;
         ide.aiPendingCall = "";
-        ide.aiMsgs.Add(ChatMessage.Create("tool",
+        ide.aiMsgs.Add(ide.AiToolMsg("tool",
             AiAgent.Describe(capR) + "\n"
             + "user declined this action; do not repeat it --"
             + " propose an alternative or ask what to do instead."));
@@ -649,7 +743,7 @@ partial class ZanIDE {
             ide.aiProfiles[ide.aiProfActive].baseUrl,
             ide.aiProfiles[ide.aiProfActive].key, ide.aiRunModel);
         if (rerr != "") {
-            ide.aiMsgs.Add(ChatMessage.Create("error", rerr));
+            ide.aiMsgs.Add(ide.AiToolMsg("error", rerr));
             ide.aiBusy.Set(0);
         } else { ide.aiBusy.Set(1); }
         ide.AiChatToEnd();

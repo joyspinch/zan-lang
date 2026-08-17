@@ -1,6 +1,7 @@
 using System;
 using Gui;
 using Gui.Widget;
+using Gui.Component;
 
 /// 小赞面板的团队条：团队模式开关、当前谁在工作、（展开后）流水线
 /// 位置和任务图。
@@ -37,6 +38,19 @@ partial class TeamBoard {
     string pickedId;
     string startedId;
     string blockedId;
+    /// 右键点到的节点和指针位置：菜单本身由外壳画（和文件树、标签页的
+    /// 右键菜单同一套 Gui.Widget.ContextMenu），团队条只报告「在哪个
+    /// 节点上按了右键」。
+    string ctxId;
+    int ctxX;
+    int ctxY;
+    /// 本帧用户要求回到项目级对话（图上没有节点被选中的那份聊天）。
+    bool backProj;
+    /// 用户拖出来的任务图高度（逻辑像素，0 = 跟着内容自适应）。存逻辑
+    /// 像素而不是设备像素，换屏 / 改 DPI 后拖过的高度跟着缩放。
+    int graphLogH;
+    /// 图下沿拖拽条的命中区 id。
+    int sizerId;
 
     void OnInit() {
         TeamBoard.current = this;
@@ -53,12 +67,19 @@ partial class TeamBoard {
         pickedId = "";
         startedId = "";
         blockedId = "";
+        ctxId = "";
+        ctxX = 0;
+        ctxY = 0;
+        backProj = false;
+        this.ProjBtn.SetProp("text", ZanIDE.T("< Project", "< 项目对话"));
+        this.ProjBtn.visible = false;
         this.Graph.EmptyText(ZanIDE.T("No tasks yet -- ask the team to plan"
                 + " the work and the graph appears here.",
             "还没有任务：让团队先把活拆成任务图，这里就会出现节点。"));
         this.Graph.OnSelect(TeamBoard.NodePicked);
         this.Graph.OnActivate(TeamBoard.NodeStarted);
         this.Graph.OnBlocked(TeamBoard.NodeBlocked);
+        this.Graph.OnContext(TeamBoard.NodeContext);
         TeamBoard.ava = new Avatar();
         TeamBoard.ava.Size = 18;
         TeamBoard.nameTag = new Tag("");
@@ -69,7 +90,33 @@ partial class TeamBoard {
         TeamBoard.openSig = null;
         this.Pipeline.visible = false;
         this.Graph.visible = false;
+        this.Sizer.visible = false;
         this.Why.visible = false;
+        graphLogH = 0;
+        sizerId = WidgetId.Next();
+    }
+
+    /// 没拖过时任务图能自己长到多高（逻辑像素）：再高就在图里滚，否则
+    /// 一张大图会把聊天挤没。
+    static int GraphAutoMax() { return 300; }
+
+    /// 拖动的上下限：往下不能压到看不见节点，往上留出足够看完整张图的
+    /// 余量（超出部分仍由画布自己滚）。
+    static int GraphMin() { return 90; }
+
+    static int GraphDragMax() { return 1400; }
+
+    /// 本帧任务图的高度（设备像素）：拖过就用拖出来的，没拖过就取内容
+    /// 高度并收进 GraphAutoMax()。画布自己有纵向滚动，所以收窄只是少看
+    /// 几层，不会丢节点。
+    int GraphHeight(App app) {
+        if (graphLogH > 0) { return app.Scale(graphLogH); }
+        int want = this.Graph.prefH;
+        int cap = app.Scale(TeamBoard.GraphAutoMax());
+        if (want > cap) { want = cap; }
+        int min = app.Scale(TeamBoard.GraphMin());
+        if (want < min) { want = min; }
+        return want;
     }
 
     /// 自身高度 = 头行 +（展开时）流水线 + 任务图 + 阻塞说明。子控件已在
@@ -80,12 +127,70 @@ partial class TeamBoard {
             h = h + gap + this.Pipeline.prefH;
         }
         if (this.Graph.visible) {
+            // 画布的 OnMeasure 报的是整张图的内容高度（子控件先量完，所以
+            // 这里读得到），本控件在这里决定实际给它多少。
+            this.Graph.prefH = this.GraphHeight(app);
             h = h + gap + this.Graph.prefH;
+        }
+        if (this.Sizer.visible) {
+            h = h + gap + this.Sizer.prefH;
         }
         if (this.Why.visible) {
             h = h + gap + this.Why.prefH;
         }
+        // 任务板最多吃掉 AI 面板的三分之二：停靠是按声明顺序分高度的，任务
+        // 板排在输入框前面，所以一张拖得过高的图会把输入框和聊天挤到 0 高。
+        // 超了就从图上收（图自己能滚），别让面板变成一张只有图的死界面。
+        if (this.Graph.visible && parent != null && parent.bh > 0) {
+            int room = parent.bh * 2 / 3;
+            int floor = app.Scale(48);
+            if (h > room) {
+                int shrunk = this.Graph.prefH - (h - room);
+                if (shrunk < floor) { shrunk = floor; }
+                h = h - (this.Graph.prefH - shrunk);
+                this.Graph.prefH = shrunk;
+            }
+        }
         prefH = h;
+    }
+
+    /// 任务图下沿的拖拽条：图的高度不再写死，拉一把就能把整张图铺开看，
+    /// 双击回到跟着内容自适应。
+    override void OnPaint(App app) {
+        if (!this.Sizer.visible || this.Sizer.bh <= 0) { return; }
+        bool hot = app.focus.IsHovered(sizerId)
+            || app.focus.IsPressed(sizerId);
+        int col = app.theme.divider;
+        if (hot) { col = app.theme.primary; }
+        int gripW = app.Scale(28);
+        if (gripW > this.Sizer.bw) { gripW = this.Sizer.bw; }
+        int thick = app.Scale(2);
+        app.canvas.FillRect(this.Sizer.bx + (this.Sizer.bw - gripW) / 2,
+            this.Sizer.by + (this.Sizer.bh - thick) / 2, gripW, thick, col);
+        app.hitTester.RegisterRect(sizerId, this.Sizer.bx, this.Sizer.by,
+            this.Sizer.bw, this.Sizer.bh, 5);
+        if (Ui.DoubleClicked(app, sizerId)) {
+            graphLogH = 0;
+            app.RequestRedraw();
+            return;
+        }
+        if (app.focus.IsPressed(sizerId)) {
+            int want = TeamBoard.Unscale(app, app.mouseY - this.Graph.by);
+            if (want < TeamBoard.GraphMin()) { want = TeamBoard.GraphMin(); }
+            if (want > TeamBoard.GraphDragMax()) {
+                want = TeamBoard.GraphDragMax();
+            }
+            if (want != graphLogH) {
+                graphLogH = want;
+                app.RequestRedraw();
+            }
+        }
+    }
+
+    /// 设备像素 -> 逻辑像素（App.Scale 的反向）。
+    static int Unscale(App app, int px) {
+        if (app.dpiScale <= 0) { return px; }
+        return px * 100 / app.dpiScale;
     }
 
     /// 展开 / 收起任务板。开合状态属于宿主（面板要跨帧记住它），
@@ -99,6 +204,22 @@ partial class TeamBoard {
     /// 把设计里的事件接到处理器上：宿主只需在拿到 Form 后调一次。
     static void WireHandlers(Form form) {
         form.On("teamToggleOpen", TeamBoard.ToggleOpen);
+        form.On("teamBackProject", TeamBoard.BackProject);
+    }
+
+    /// 回到项目级对话：选中一个节点后聊天区换成了那个节点自己的历史，
+    /// 没有这个入口，之前跟小助手在项目层面聊的那一段看起来就「不见了」。
+    static void BackProject() {
+        TeamBoard tb = TeamBoard.current;
+        if (tb == null) { return; }
+        tb.backProj = true;
+    }
+
+    /// 本帧用户点了「回到项目对话」（取走后清空）。
+    bool TakeBackProject() {
+        bool v = backProj;
+        backProj = false;
+        return v;
     }
 
     /// 团队模式开关的状态。绘制时开关自己处理点击，所以宿主在渲染之后
@@ -127,6 +248,15 @@ partial class TeamBoard {
         tb.blockedId = tb.NodeIdAt(tb.Graph.ContextRow());
     }
 
+    /// 右键一个节点：记下节点号和指针位置，外壳在这一帧的最上层弹菜单。
+    static void NodeContext() {
+        TeamBoard tb = TeamBoard.current;
+        if (tb == null) { return; }
+        tb.ctxId = tb.NodeIdAt(tb.Graph.ContextRow());
+        tb.ctxX = tb.Graph.ContextX();
+        tb.ctxY = tb.Graph.ContextY();
+    }
+
     string NodeIdAt(int row) {
         if (!this.Graph.Has(row)) { return ""; }
         return this.Graph.NodeAt(row).id;
@@ -153,10 +283,24 @@ partial class TeamBoard {
         return v;
     }
 
+    /// 本帧用户右键的节点（取走后清空）；位置用 CtxX / CtxY 读。
+    string TakeContext() {
+        string v = ctxId;
+        ctxId = "";
+        return v;
+    }
+
+    int CtxX() { return ctxX; }
+    int CtxY() { return ctxY; }
+
     /// 本帧的状态：谁在忙、任务到哪了、板子是否展开、图上选中哪个节点。
     /// 渲染前调用一次。
+    /// `liveNode`/`liveText`：正在被执行的那个节点，以及它跑到哪一拍、
+    /// 改了多少东西（空串＝没人在跑）。`lockedNode`：这一拍正占着的节点，
+    /// 此时图上的操作都会被拦，卡片上得看得出来。
     void Sync(bool teamOn, bool busy, AiTeamState st, List<AiTask> tasks,
-            SignalInt open, string curNode) {
+            SignalInt open, string curNode, string liveNode, string liveText,
+            string lockedNode) {
         TeamBoard.openSig = open;
         this.ModeSw.SetOn(teamOn);
         bool nowOn = teamOn;
@@ -164,12 +308,17 @@ partial class TeamBoard {
         if (isOpen) { this.OpenBtn.SetProp("text", "▼"); }
         else { this.OpenBtn.SetProp("text", "▶"); }
         this.OpenBtn.visible = nowOn;
+        // 只在正看着某个节点时才提供「回到项目对话」：没选节点时聊天区
+        // 已经是项目级的那一份。
+        this.ProjBtn.visible = nowOn && curNode != "";
 
         if (!nowOn) {
             // 关：面板就是单个助手，团队条如实说明，而不是假装有人待命。
             this.ShowSolo();
+            this.ProjBtn.visible = false;
             this.Pipeline.visible = false;
             this.Graph.visible = false;
+            this.Sizer.visible = false;
             this.Why.visible = false;
             return;
         }
@@ -182,6 +331,7 @@ partial class TeamBoard {
 
         this.Pipeline.visible = isOpen;
         this.Graph.visible = isOpen;
+        this.Sizer.visible = isOpen;
         if (!isOpen) {
             this.Why.visible = false;
             return;
@@ -191,18 +341,63 @@ partial class TeamBoard {
             Convert.ToString(AiTeam.StageOf(st.activeAgent)));
         // 任务图：节点 + 前置连线由画布自己布局，锁状态由它从 deps 推出，
         // 所以这里只在图真的变了的时候重新交一份节点。
-        string sig = TeamBoard.GraphSigOf(tasks) + "|" + curNode;
+        string sig = TeamBoard.GraphSigOf(tasks) + "|" + curNode
+            + "|" + liveNode + "|" + liveText + "|" + lockedNode;
         if (graphSig != sig) {
             graphSig = sig;
-            this.Graph.Bind(AiTaskGraph.ToNodes(tasks));
+            this.Graph.Bind(TeamBoard.NodesOf(tasks, liveNode, liveText,
+                lockedNode));
             this.Graph.SelectId(curNode);
         }
         // 选中的节点被前置卡着时，把「差哪一个、它现在什么状态」写在图
         // 下面：双击锁住的节点没有反应，才是真正让人困惑的那种界面。
         string why = "";
         if (curNode != "") { why = AiTeam.BlockedWhy(tasks, curNode); }
+        // 没被卡住时这一行拿去说「现在在干什么」：正在跑的节点、跑到哪一
+        // 拍、改了多少——以前这块地方在不卡住的时候就是空的。
+        if (why == "" && liveText != "") {
+            why = liveNode + " " + liveText;
+        }
         this.Why.visible = why != "";
         if (why != "") { this.Why.SetProp("text", why); }
+    }
+
+    /// 任务图交给画布的那份节点。锁状态不在这里：画布自己从 `deps` +
+    /// 完成状态推，所以前置还开着的节点不会被显示成可开工。
+    ///
+    /// 这段映射住在界面层而不是 AiTaskGraph：服务层不依赖 Gui
+    /// （docs/projects/zanide/STRUCTURE.md），而 GraphNode 是画布的类型。
+    static List<GraphNode> NodesOf(List<AiTask> tasks, string liveNode,
+            string liveText, string lockedNode) {
+        List<GraphNode> outNodes = new List<GraphNode>();
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            AiTask t = tasks[i];
+            GraphNode n = GraphNode.Of(t.id, AiTaskGraph.CardTitle(t));
+            if (t.owner != "") {
+                n = n.WithTag(AiTeam.DisplayName(t.owner),
+                    AiTeam.RoleTagClass(t.owner));
+            }
+            // 正在跑的那个节点，状态短语换成它真在干的事（拍子 + 改动）；
+            // 「进行中 40%」看不出在干什么，这行字看得出。锁住的那个节点
+            // 额外带个锁：此时切节点 / 开工 / 标完成都会被拦下。
+            string stx = AiTeam.TaskStateName(t.state);
+            // 节点自己那份开发任务干了几条：节点是一块功能，「进行中 40%」
+            // 看不出它到底还差什么，「3/7」看得出。
+            string sub = AiTaskPlan.Brief(t);
+            if (sub != "") { stx = stx + " · " + sub; }
+            if (t.id == liveNode && liveText != "") { stx = liveText; }
+            if (t.id == lockedNode) { stx = "⚿ " + stx; }
+            n = n.WithState(stx, AiTeam.TaskStateClass(t.state));
+            n = n.WithProgress(t.progress);
+            if (t.state == AiTeam.TaskDone()) { n = n.Finished(); }
+            if (t.deps != null) {
+                for (int d = 0; d < t.deps.Count; d = d + 1) {
+                    n = n.After(t.deps[d]);
+                }
+            }
+            outNodes.Add(n);
+        }
+        return outNodes;
     }
 
     /// 图的内容签名：卡片上显示的每一项都在里面，因为签名的用途是回答
@@ -214,6 +409,7 @@ partial class TeamBoard {
             sb.Append(t.id + "~" + t.title + "~" + t.owner + "~"
                 + Convert.ToString(t.state) + "~"
                 + Convert.ToString(t.progress) + "~"
+                + AiTaskPlan.SigOf(t) + "~"
                 + AiTeam.JoinIds(t.deps) + ";");
         }
         return sb.ToString();

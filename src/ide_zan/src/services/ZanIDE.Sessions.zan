@@ -53,12 +53,106 @@ partial class ZanIDE {
     /// 时钟由调用方给（服务层不引 Gui）。
     void AutosaveAiSessions(int nowMs) {
         if (aiSessCur < 0 || aiSessCur >= aiSessions.Count) { return; }
-        if (nowMs - aiLastSave <= 1000) { return; }
+        // 流式那条气泡每 120ms 长一点，指纹于是每秒都不一样：一段长对话
+        // （工具贴过几个文件）光是「把整份记录序列化成 JSON 再写盘」就是
+        // 每秒几百 KB 的活，而那条预览收尾时本来就要丢掉重建。所以模型
+        // 正在写的时候放慢到 5 秒一次，写完那一拍照旧立刻落盘。
+        int gap = 1000;
+        if (aiBusy.Get() == 1 && aiStreamMsgIdx >= 0
+            && aiStreamMsgIdx == aiMsgs.Count - 1) {
+            gap = 5000;
+        }
+        if (nowMs - aiLastSave <= gap) { return; }
         aiLastSave = nowMs;
+        // 先问廉价指纹：不然一段开着但没人说话的长对话，每秒都要把它整段
+        // 序列化成 JSON 再拿去比一次字符串，只为得出「没变」。
+        string sig = this.AiLiveSig();
+        if (sig == aiSaveSig) { return; }
+        aiSaveSig = sig;
         string curPack = AiPackCur();
         if (aiSessions[aiSessCur].pack == curPack) { return; }
         aiSessions[aiSessCur].pack = curPack;
-        SaveAiSessions();
+        // 只这一段对话变了，就只写它那一行（整表重写留给会话列表真的变了
+        // 那几个入口：新建 / 删除 / 归档 / 改名）。
+        this.SaveAiSession(aiSessCur);
+    }
+
+    /// 这段对话的廉价指纹：只看会变的那几个量（轮数、正在流式输出的尾
+    /// 条、计划勾选、任务图节点状态、交付状态与压缩次数），不遍历全部消息
+    /// 文本。它只用来回答「要不要序列化」，真正落盘前还会比一次存档本身。
+    string AiLiveSig() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(Convert.ToString(aiMsgs.Count));
+        if (aiMsgs.Count > 0) {
+            ChatMessage tail = aiMsgs[aiMsgs.Count - 1];
+            sb.Append(":" + Convert.ToString(tail.text.Length)
+                + "/" + Convert.ToString(tail.reason.Length)
+                + "/" + tail.role + "/" + tail.agent
+                + "/" + Convert.ToString(tail.kind)
+                + "/" + Convert.ToString(tail.progress));
+        }
+        sb.Append(":" + Convert.ToString(AiAgent.Compactions())
+            + "/" + Convert.ToString(AiAgent.LastDroppedOf(aiRunAgent)));
+        sb.Append(":" + Convert.ToString(aiPlan.Count));
+        for (int p = 0; p < aiPlan.Count; p = p + 1) {
+            sb.Append(Convert.ToString(aiPlan[p].done));
+        }
+        sb.Append(":" + Convert.ToString(aiTasks.Count));
+        for (int t = 0; t < aiTasks.Count; t = t + 1) {
+            sb.Append("/" + aiTasks[t].id
+                + "@" + Convert.ToString(aiTasks[t].state)
+                + ":" + Convert.ToString(aiTasks[t].progress));
+        }
+        if (aiTeamMode) { sb.Append(":team"); }
+        if (aiTeamSt != null) { sb.Append(":" + aiTeamSt.activeTask); }
+        if (aiRun != null) {
+            sb.Append(":" + aiRun.taskId
+                + "/" + Convert.ToString(aiRun.phase)
+                + "/" + Convert.ToString(aiRun.DoneCount())
+                + "/" + Convert.ToString(aiRun.changedFiles.Count)
+                + "/" + Convert.ToString(aiRun.TotalAdds())
+                + "/" + Convert.ToString(aiRun.TotalDels()));
+        }
+        return sb.ToString();
+    }
+
+    /// 会话列表里那一行的标题（用户没命名时取它的第一句话）。从存档里取标题
+    /// 要把整段 JSON 解一遍，所以按存档长度缓存：每帧为每个会话解一次上千
+    /// 轮的存档，光画这份列表就能吃掉一个核。
+    static string AiSessTitleOf(AiSession s) {
+        if (s.derivedLen != s.pack.Length) {
+            s.derived = ChatArea.ChatTitle(s.pack);
+            s.derivedLen = s.pack.Length;
+        }
+        return s.derived;
+    }
+
+    /// 把一段对话的存档写回它那一行。流式回答的时候这一行每秒会变，而
+    /// 整表重写（DELETE 后逐行 INSERT）连其它会话的存档也一并重写，会话一
+    /// 多就是一笔白花的开销。
+    void SaveAiSession(int idx) {
+        if (idx < 0 || idx >= aiSessions.Count) { return; }
+        SqliteConnection db = null;
+        try {
+            ZanIDE.EnsureCacheDir();
+            string dbp = this.AiSessionsDbPath();
+            Directory.CreateDirectoryRecursive(ZanIDE.DirOf(dbp));
+            db = SqliteConnection.Open(dbp);
+            if (db == null || !db.IsConnected()) { return; }
+            db.Execute("CREATE TABLE IF NOT EXISTS sessions ("
+                + "id INTEGER PRIMARY KEY, pack TEXT NOT NULL)");
+            db.Execute("CREATE TABLE IF NOT EXISTS meta ("
+                + "key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+            db.Execute("INSERT OR REPLACE INTO sessions (id, pack) VALUES (?, ?)",
+                new DbParams().AddInt(idx).Add(aiSessions[idx].pack));
+            db.Execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('cur', ?)",
+                new DbParams().Add(Convert.ToString(aiSessCur)));
+        } catch (Exception e) {
+            // Never let a storage failure crash the IDE's main loop.
+            int skip = 0;
+        } finally {
+            if (db != null) { db.Close(); }
+        }
     }
 
     void SaveAiSessions() {
@@ -138,6 +232,11 @@ partial class ZanIDE {
         // 同一时机读回这个项目的交付检查点，「继续」才能接上上次那一拍，而不是
         // 从需求理解重来。
         this.AiRunLoad();
+        // 升级前的构建只按项目存一份交付检查点，会话存档里没有它。留着它，等
+        // 恢复完当前会话再决定：那份检查点属于上次关掉 IDE 时开着的会话，也就
+        // 是马上要恢复的这一个，所以只在它确实有对话时才认领。
+        string legacyRun = "";
+        if (aiRun != null) { legacyRun = aiRun.ToJson(); }
         // A project opening for the first time since chats became per-project
         // inherits the install-wide list, then owns its copy: the shared file is
         // renamed so the next project starts clean instead of a second copy.
@@ -232,9 +331,15 @@ partial class ZanIDE {
         // Restore the active session's transcript into the live lists.
         aiMsgs = new List<ChatMessage>();
         aiPlan = new List<AiPlanStep>();
+        // 换了一份记录：上一份折出来的前情摘要说的不是这段对话。
+        AiAgent.ResetCompaction();
         if (aiSessCur >= 0 && aiSessCur < aiSessions.Count) {
             AiRestoreSession(aiSessions[aiSessCur].pack);
         }
+        if (aiRun == null && legacyRun != "" && aiMsgs.Count > 0) {
+            this.AiRunRestore(legacyRun);
+        }
+        aiSaveSig = "";
         aiCacheKey = "";
         aiCacheSig = "";
         aiToolOpen = new List<int>();
@@ -261,7 +366,13 @@ partial class ZanIDE {
         if (aiTeamMode) { sv.on = 1; }
         sv.st = aiTeamSt;
         sv.tasks = aiTasks;
-        return ChatArea.ChatPack(aiMsgs, aiPlan, sv);
+        // 交付进度属于这一段对话：不跟着会话存，换会话时顶上那排阶段圆点就还
+        // 挂着上一段的「11/12」，而聊天区和任务图已经是空的。
+        if (aiRun != null) { sv.run = aiRun.ToJson(); }
+        // 存的是项目级对话。停在某个任务节点上时聊天区里是那个节点的
+        // 上下文（它自己存在 tasks.db 里），把它当作会话存档写回去，会把
+        // 这个会话里真正的需求对话覆盖掉。
+        return ChatArea.ChatPack(this.AiCtxProject(), aiPlan, sv);
     }
 
     /// Loads a session archive into the live lists, including the team half. A
@@ -275,5 +386,11 @@ partial class ZanIDE {
         aiTasks = sv.tasks;
         aiRunAgent = "";
         aiHandoffs = 0;
+        // 防循环计数只对「当前这一问」有意义，换会话就从零开始。
+        this.AiForgetTools();
+        aiIdleKey = "";
+        aiIdleTimes = 0;
+        aiEscKey = "";
+        this.AiRunRestore(sv.run);
     }
 }

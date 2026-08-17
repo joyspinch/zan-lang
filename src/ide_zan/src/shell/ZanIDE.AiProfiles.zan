@@ -9,11 +9,12 @@ using Game.Scene;
 
 // ---- AI profile / chat-completion entities -------------------------------
 // The OpenAI-compatible /chat/completions request body is declared as classes
-// and serialized with Json.Serialize<T>. `limits` and `max_tokens` stay
-// JsonValue because they are optional: null serializes to JSON null, which
-// compatible endpoints treat as "unset" exactly like the old conditional
-// field. ai_profiles.json stays JsonValue too: its "base" key is a reserved
-// word in Zan (no DTO field can carry that name without changing the format).
+// and serialized with Json.Serialize<T>. An optional key like max_tokens is
+// modelled as a SUBCLASS carrying it, not as a nullable field: a field is
+// always written, and strict endpoints reject "max_tokens": null with
+// `max_tokens 类型错误` instead of reading it as "unset". `limits` stays
+// JsonValue, and ai_profiles.json too: its "base" key is a reserved word in
+// Zan (no DTO field can carry that name without changing the format).
 
 class ChatMessageDoc {
     string role;
@@ -29,7 +30,13 @@ class AiChatBodyDoc {
     bool stream;
     AiStreamOptionsDoc stream_options;
     List<ChatMessageDoc> messages;
-    JsonValue max_tokens;   // set only when the enabled model has a cap
+}
+
+/// The same request plus the output cap, serialized only when the enabled
+/// model has one configured; otherwise the base type goes out and the key is
+/// absent from the JSON altogether.
+class AiChatBodyMaxDoc : AiChatBodyDoc {
+    int max_tokens;
 }
 
 /// ZanIDE part: settings persistence, the parsed error list, the AI
@@ -303,6 +310,9 @@ partial class ZanIDE {
     /// error in the next answer.
     static void AiCancelRequest() {
         AiNet.Abandon();
+        // 工具线程同理：停下这一轮之后，一个还在写/还在扫的调用不能等它跑完
+        // 再把结果接到下一个问题的后面。
+        AiWork.Abandon();
     }
 
     static void DeleteIfExists(string path) {
@@ -558,6 +568,32 @@ partial class ZanIDE {
         File.WriteAllText(ZanIDE.AiRolePromptsPath(), v.ToJson());
     }
 
+    // ---- 助手行为（ai_behavior.json）----
+    // {"autoCont": 40}：一次提问最多自动接着跑几拍。0 = 不限，
+    // 缺这个字段 = 从没配过，用 AiAgent.MaxContinues() 的内置默认。
+    // 单独一个文件而不是塞进 ai_profiles.json：它跟服务商无关，换服务商、
+    // 删配置都不该把它带走（ai_role_prompts.json 同理）。
+    static string AiBehaviorPath() {
+        return ZanIDE.UserConfigDir() + "/ai_behavior.json";
+    }
+
+    /// 配置里的自动继续上限，-1 表示没配过。
+    static int AiAutoContLoad() {
+        if (!File.Exists(ZanIDE.AiBehaviorPath())) { return 0 - 1; }
+        JsonValue v = JsonValue.ParseLenient(
+            File.ReadAllText(ZanIDE.AiBehaviorPath()));
+        if (v == null || !v.IsObject()) { return 0 - 1; }
+        return v.Int("autoCont", 0 - 1);
+    }
+
+    static void AiAutoContSave(int configured) {
+        if (configured < 0) { configured = 0 - 1; }
+        JsonValue root = JsonValue.NewObject();
+        root.Put("autoCont", JsonValue.NewNum(Convert.ToString(configured)));
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.AiBehaviorPath(), root.ToJson());
+    }
+
     /// 一个服务商在模型选择器里应当出现的模型：默认模型在最前，其后是
     /// 抓取到的模型，去重，并去掉在 AI 设置里取消勾选的
     /// （`limits[model].off == 1`）。聊天框与 AI 设置共用这一条规则。
@@ -733,29 +769,45 @@ partial class ZanIDE {
         // stream_options.include_usage: OpenAI-compatible endpoints only put
         // the token counts in the final chunk of a stream when asked, and the
         // usage card is only honest when they arrive.
-        AiChatBodyDoc body = new AiChatBodyDoc();
+        AiChatBodyMaxDoc body = new AiChatBodyMaxDoc();
         body.model = model;
         body.stream = true;
         body.stream_options = new AiStreamOptionsDoc();
         body.stream_options.include_usage = true;
         body.messages = new List<ChatMessageDoc>();
-        // The standing instructions, the tool protocol, the open file and the
-        // RepoMap outline all come from the agent layer, so the loop that runs
-        // the tools and the prompt that describes them can never drift apart.
-        string sysMsg = AiAgent.SystemPrompt(ctxName, ctxCode, projRoot);
-        if (agent != "") {
-            sysMsg = AiTeam.RolePrompt(agent, ctxName, ctxCode, projRoot);
-        }
+        // The standing instructions and the tool protocol come from the agent
+        // layer, so the loop that runs the tools and the prompt that describes
+        // them can never drift apart. 这一段是定死的文本，逐字节不变 ——
+        // prompt 缓存按前缀匹配，把「当前打开的文件 / 项目结构 / 任务图」这些
+        // 每一拍都在变的现场写进系统消息，等于每一拍都换掉整份前缀，缓存命中
+        // 率就永远是 0。会变的现场作为最后一条消息发（见下面的 ctxMsg）。
+        // 团队模式下这一段还要与「这一拍是谁在说话」无关：七个成员各发一份自己的
+        // 系统提示、而团队几乎每一拍都在换人时，能命中的只有大家共有的那一小
+        // 段（实测停在 4.9K token，后面两万 token 每拍重算）。所以全队共用同一份
+        // 系统提示（含七份章程），本拍的身份跟着现场走最后一条消息。
+        string sysMsg = AiAgent.BaseInstructions();
+        if (agent != "") { sysMsg = AiTeam.TeamPrompt(); }
+        // 项目结构和项目知识也挂在这里：它们只在项目本身变了才变，却有一万多
+        // 字节。跟着每一拍的现场重发就等于每一拍白扔一万多字节的缓存，所以定
+        // 型一份进前缀（真变了由现场那条消息补差异，见 `ContextBlock`）。
+        string projRef = AiAgent.ProjectRef(projRoot);
+        if (projRef != "") { sysMsg = sysMsg + "\n\n" + projRef; }
         ChatMessageDoc sys = new ChatMessageDoc();
         sys.role = "system";
-        sys.content = sysMsg;
+        // 洗一遍：带非法字节的请求体会被服务端整包 400（invalid unicode
+        // code point），而那些字节可能来自任何一份读进来的文件或命令输出。
+        sys.content = AiAgent.SafeUtf8(sysMsg);
         body.messages.Add(sys);
         // Fold the oldest turns into a digest once the transcript passes the
         // budget, so a long agent session keeps working instead of growing
         // until it overflows the model's context window.
+        // 上下文和压缩都按「这一次发请求的成员 + 它自己那个模型」来算：一个
+        // 8k 窗口的成员该压缩的时候必须压缩，而它压缩不能拿别人 200k 的窗口
+        // 当预算（也不能反过来把大窗口的成员按小窗口砍掉一半上下文）。
         List<ChatMessage> src = msgs;
         if (agent != "") { src = AiTeam.ContextFor(agent, msgs); }
-        AiMessages msgs2 = AiAgent.BuildContext(src);
+        AiMessages msgs2 = AiAgent.BuildContext(src,
+            AiAgent.MaxContextCharsOf(model), agent);
         for (int i = 0; i < msgs2.msgs.Count; i = i + 1) {
             // Tool results go back as user turns: every OpenAI-compatible
             // endpoint accepts that, including local models with no notion of
@@ -765,14 +817,39 @@ partial class ZanIDE {
             if (role == "user" || role == "assistant") {
                 ChatMessageDoc m = new ChatMessageDoc();
                 m.role = role;
-                m.content = msgs2.msgs[i].text;
+                // 正文 + 这一拍真正发出的工具调用：历史里只留正文的话，模型
+                // 会照着「read_file src/X.zan」这种大白话学，下一拍就发不出
+                // 可执行的调用（那一拍就白跑了）。
+                string body2 = msgs2.msgs[i].text;
+                if (msgs2.msgs[i].call != "") {
+                    if (body2 == "") { body2 = msgs2.msgs[i].call; }
+                    else { body2 = body2 + "\n\n" + msgs2.msgs[i].call; }
+                }
+                m.content = AiAgent.SafeUtf8(body2);
                 body.messages.Add(m);
             }
         }
-        // Apply the enabled model's configured maximum output length.
-        int maxOut = AiAgent.MaxOutTokens();
+        // 这一拍的现场（打开的文件、项目结构、项目知识、任务图）作为最后一条
+        // 消息：它每一拍都在变，放在最后就只废掉自己这一段，前面的系统指令加
+        // 整段对话仍然逐字节等于上一拍的前缀，于是供应商的 prompt 缓存能命中
+        // 到「上一拍为止的全部内容」。角色用 user：OpenAI 兼容端点（含本地
+        // 模型）都收 user，而尾部的 system 有的实现会忽略。
+        ChatMessageDoc ctxMsg = new ChatMessageDoc();
+        ctxMsg.role = "user";
+        string ctxBody = AiAgent.ContextBlock(ctxName, ctxCode, projRoot);
+        if (agent != "") { ctxBody = AiTeam.SelfPrompt(agent) + ctxBody; }
+        ctxMsg.content = AiAgent.SafeUtf8(ctxBody);
+        body.messages.Add(ctxMsg);
+        // Apply the enabled model's configured maximum output length. With no
+        // cap configured the key must be ABSENT, so the base type is what gets
+        // serialized -- sending "max_tokens": null is a type error server-side.
+        int maxOut = AiAgent.MaxOutTokensOf(model);
+        string payload = "";
         if (maxOut > 0) {
-            body.max_tokens = JsonValue.NewNum(Convert.ToString(maxOut));
+            body.max_tokens = maxOut;
+            payload = Json.Serialize<AiChatBodyMaxDoc>(body);
+        } else {
+            payload = Json.Serialize<AiChatBodyDoc>(body);
         }
         // The request is made with the Net standard library on a worker
         // thread that streams the decoded response into an in-memory sink;
@@ -780,7 +857,7 @@ partial class ZanIDE {
         // Certificate verification stays on (the platform trust store is
         // bridged into OpenSSL by the Tls layer).
         string serr = AiNet.Start(baseUrl, "/chat/completions", key,
-            Json.Serialize<AiChatBodyDoc>(body), 600000, true);
+            payload, 600000, true);
         // Counted here, at the one place every request (question, tool result,
         // retry, continue) actually goes out, so the usage panel can never
         // drift from what was really sent.
@@ -836,7 +913,7 @@ partial class ZanIDE {
         }
         JsonValue err = v.Get("error");
         if (err != null) { return "[error] " + err.Str("message", raw); }
-        if (raw.Length > 400) { raw = raw.Substring(0, 400) + "..."; }
+        if (raw.Length > 400) { raw = AiAgent.Clip(raw, 400) + "..."; }
         return "[error] " + raw;
     }
 
@@ -1042,7 +1119,7 @@ partial class ZanIDE {
         }
         if (txt.Length > 8000) {
             txt = "...(earlier output omitted)\n"
-                + txt.Substring(txt.Length - 8000, 8000);
+                + AiAgent.ClipTail(txt, 8000);
         }
         return "--- last run output (stdout+stderr, tail) ---\n" + txt;
     }
