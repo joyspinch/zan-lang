@@ -951,6 +951,43 @@ class Worker {
         }
     }
 
+    // ---- anonymous shared tables handed down to the workers ----
+    // A table the master created before spawning: the child inherits the OS
+    // handle and maps the same memory, so the table needs no machine-global
+    // name to be found by -- and nothing outside this server's own processes
+    // can reach it. The Web framework's rate/lock/route tables travel here.
+    static List<string> shareNames = new List<string>();
+    static List<long> shareHandles = new List<long>();
+
+    // The handle travels in the environment, like ZAN_STATS_HANDLE does.
+    static string ShareEnv(string name) { return "ZAN_SHARE_" + name; }
+
+    /// <summary>Hands an anonymous shared table down to every worker this
+    /// master spawns, under <paramref name="name"/>. Must be called before the
+    /// first worker starts: a child only inherits handles that already existed.
+    /// A handle of 0 -- a table that is named rather than anonymous, or one that
+    /// could not be created -- shares nothing, which leaves the worker to open
+    /// the table by name as it otherwise would.</summary>
+    static void ShareHandle(string name, long osHandle) {
+        if (name == "" || osHandle == 0) { return; }
+        for (int i = 0; i < shareNames.Count; i = i + 1) {
+            if (shareNames[i] == name) {
+                shareHandles[i] = osHandle;
+                return;
+            }
+        }
+        shareNames.Add(name);
+        shareHandles.Add(osHandle);
+    }
+
+    /// <summary>Worker side: the handle the master shared under this name, or 0
+    /// in a process that was not spawned as a worker of such a master.</summary>
+    static long InheritedHandle(string name) {
+        string env = ProcessHost.Env(ShareEnv(name));
+        if (env == "") { return 0; }
+        return Convert.ToInt64(env);
+    }
+
     /// Publishes this process's counters into its row.
     static void StatsPublish() {
         SharedTable t = statTable;
@@ -1037,6 +1074,10 @@ class Worker {
         SetEnvironmentVariableA("ZAN_STATS_HANDLE", Convert.ToString(statOsHandle));
         // The runtime crash handler puts its record next to the worker output.
         SetEnvironmentVariableA("ZAN_LOG_DIR", logDir);
+        for (int s = 0; s < shareNames.Count; s = s + 1) {
+            SetEnvironmentVariableA(ShareEnv(shareNames[s]),
+                Convert.ToString(shareHandles[s]));
+        }
         // Started directly, NOT through `cmd.exe /c`: a shell hop would leave
         // one cmd.exe plus one conhost.exe alive alongside every worker for as
         // long as it runs, so N workers (and every respawn) pile up as a crowd
@@ -1045,6 +1086,9 @@ class Worker {
         SetEnvironmentVariableA("ZAN_WORKER_ID", "");
         SetEnvironmentVariableA("ZAN_CTL_PORT", "");
         SetEnvironmentVariableA("ZAN_STATS_HANDLE", "");
+        for (int c = 0; c < shareNames.Count; c = c + 1) {
+            SetEnvironmentVariableA(ShareEnv(shareNames[c]), "");
+        }
         if (rc != 0) {
             Log.Error("[Worker] worker " + Convert.ToString(wid)
                 + " failed to start: CreateProcess(" + exe + ") failed");
@@ -1052,11 +1096,17 @@ class Worker {
         #else
         // The descriptor is not close-on-exec, so it survives the shell hop and
         // arrives in the worker under the same number.
+        string shared = "";
+        for (int s = 0; s < shareNames.Count; s = s + 1) {
+            shared = shared + ShareEnv(shareNames[s]) + "="
+                + Convert.ToString(shareHandles[s]) + " ";
+        }
         string cmd = "ZAN_WORKER_ID=" + Convert.ToString(wid)
             + " ZAN_CTL_PORT=" + Convert.ToString(ctl)
             + " ZAN_STATS_HANDLE=" + Convert.ToString(statOsHandle)
-            + " ZAN_LOG_DIR=\"" + logDir + "\""
-            + " \"" + exe + "\"";
+            + " ZAN_LOG_DIR=\"" + logDir + "\" "
+            + shared
+            + "\"" + exe + "\"";
         if (logPath != "") {
             // Append only, and nothing after the command: the spawning shell
             // execs the worker instead of waiting for it, so a worker costs one

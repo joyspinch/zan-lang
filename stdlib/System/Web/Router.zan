@@ -135,10 +135,10 @@ class Router {
     // addressed by this hash, so recording a hit neither re-hashes the key
     // string nor copies it into shared memory.
     List<long> flatHashes;
-    // Cross-process shared stats table (SharedTable backed by named shared
-    // memory). Columns: "hits" (int), "total_us" (int). Keyed by route.key.
-    // Null until InitStats is called. All workers share the same table so
-    // /admin/stats reflects the aggregate across every worker process.
+    // Cross-process shared stats table. Columns: "hits" (int), "total_us"
+    // (int). Keyed by route.key. Null until one of the InitStats paths is
+    // called. All workers share the same table so /admin/stats reflects the
+    // aggregate across every worker process.
     SharedTable routeStats;
 
     Router() {
@@ -172,39 +172,91 @@ class Router {
         return r;
     }
 
-    /// <summary>Create (master/single-process) or open (worker) the shared
-    /// route stats table. Call after all routes are registered and before the
-    /// first request. name should be unique per server instance -- WebApp
-    /// builds it as "zan.web.&lt;scope&gt;.route". In multi-worker mode every
-    /// worker calls this too;
-    /// Create falls back to Open when the master has already made the
-    /// table.</summary>
-    void InitStats(string name) {
-        int cap = this.flat.Count;
-        if (cap == 0) { return; }
+    // Rows are addressed by the hash of the route key, so hash every key once
+    // here instead of on the request path.
+    void HashRouteKeys() {
         this.flatHashes = new List<long>();
         for (int h = 0; h < this.flatKeys.Count; h = h + 1) {
             this.flatHashes.Add(SharedTable.Hash(this.flatKeys[h]));
         }
-        SharedTable t = new SharedTable(name, cap + 4);
+    }
+
+    SharedTable NewStatsTable(string name) {
+        SharedTable t = new SharedTable(name, this.flat.Count + 4);
         t.KeySize(128);
         t.ColumnInt("hits");
         t.ColumnInt("total_us");
+        return t;
+    }
+
+    // The process that creates the table seeds every route row, so a worker can
+    // Increment on a pre-existing row without triggering a capacity-limited
+    // auto-create under concurrent first requests.
+    void SeedStats(SharedTable t) {
+        for (int i = 0; i < this.flatHashes.Count; i = i + 1) {
+            t.SetIntAt(this.flatHashes[i], "hits", 0);
+            t.SetIntAt(this.flatHashes[i], "total_us", 0);
+        }
+    }
+
+    /// <summary>Create (master/single-process) or open (worker) a NAMED shared
+    /// route stats table -- for a deployment that wants the table reachable by
+    /// name. Call after all routes are registered and before the first request;
+    /// name must be unique per server instance (WebApp builds one with
+    /// SharedName). Every process calls this, and Create falls back to Open when
+    /// the master has already made the table.</summary>
+    void InitStats(string name) {
+        if (this.flat.Count == 0) { return; }
+        this.HashRouteKeys();
+        SharedTable t = this.NewStatsTable(name);
         if (t.Create()) {
-            // Master (or single process): seed every route row so workers
-            // can Increment on a pre-existing row without triggering a
-            // capacity-limited auto-create under concurrent first requests.
-            for (int i = 0; i < this.flatHashes.Count; i = i + 1) {
-                t.SetIntAt(this.flatHashes[i], "hits", 0);
-                t.SetIntAt(this.flatHashes[i], "total_us", 0);
-            }
+            this.SeedStats(t);
+            t.Label("web route stats");
             this.routeStats = t;
         } else {
             // Worker (or shared-memory already exists): open the table the
             // master created; all workers map the same backing store.
             SharedTable existing = SharedTable.Open(name);
-            if (existing.IsOpen()) { this.routeStats = existing; }
+            if (existing.IsOpen()) {
+                existing.Label("web route stats");
+                this.routeStats = existing;
+            }
         }
+    }
+
+    /// <summary>The default: create the stats table as anonymous shared memory
+    /// owned by this server. It has no name for anything on the machine to
+    /// collide with or read, and the workers get it from the master through
+    /// <see cref="StatsOsHandle"/> / <see cref="AttachStats"/>, so it must be
+    /// created before the first worker is spawned.</summary>
+    void InitStatsShared() {
+        if (this.flat.Count == 0) { return; }
+        if (this.routeStats != null) { return; }
+        this.HashRouteKeys();
+        SharedTable t = this.NewStatsTable("");
+        if (!t.CreateAnonymous()) { return; }
+        t.Label("web route stats");
+        this.SeedStats(t);
+        this.routeStats = t;
+    }
+
+    /// <summary>The handle a worker needs to map the anonymous stats table, or 0
+    /// when there is no such table (none created, or a named one).</summary>
+    long StatsOsHandle() {
+        if (this.routeStats == null) { return 0; }
+        return this.routeStats.OsHandle();
+    }
+
+    /// <summary>Worker side: map the anonymous stats table the master created
+    /// and handed down. A handle of 0 leaves this process without route stats,
+    /// which costs it nothing but its share of the counters.</summary>
+    void AttachStats(long osHandle) {
+        if (this.flat.Count == 0 || osHandle == 0) { return; }
+        this.HashRouteKeys();
+        SharedTable t = SharedTable.Attach(osHandle);
+        if (!t.IsOpen()) { return; }
+        t.Label("web route stats");
+        this.routeStats = t;
     }
 
     /// <summary>Record one served request. Two atomic increments into the

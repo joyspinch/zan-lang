@@ -36,14 +36,65 @@ class LockManager {
     long ownerSequence;
     long leaseMs;
 
-    LockManager(string name) {
+    LockManager() {
         this.ownerSequence = 0;
         this.leaseMs = 30000;
-        SharedTable table = new SharedTable(name, 65536);
-        table.KeySize(192);
-        table.ColumnInt("owner");
-        if (!table.Create()) { table = SharedTable.Open(name); }
-        if (table.IsOpen()) { this.table = table; }
+    }
+
+    static SharedTable NewTable(string name) {
+        SharedTable t = new SharedTable(name, 65536);
+        t.KeySize(192);
+        t.ColumnInt("owner");
+        return t;
+    }
+
+    /// <summary>Locks in a NAMED shared table: created by whichever process gets
+    /// there first and opened by the rest, and reachable by name from outside
+    /// the server.</summary>
+    static LockManager Named(string name) {
+        LockManager m = new LockManager();
+        SharedTable t = LockManager.NewTable(name);
+        if (!t.Create()) { t = SharedTable.Open(name); }
+        if (t.IsOpen()) {
+            t.Label("web request lock");
+            m.table = t;
+        }
+        return m;
+    }
+
+    /// <summary>Locks in anonymous shared memory this process owns: no name for
+    /// another server on the machine to collide with, and workers reach the same
+    /// leases through <see cref="OsHandle"/> / <see cref="Attach"/>.</summary>
+    static LockManager Owned() {
+        LockManager m = new LockManager();
+        SharedTable t = LockManager.NewTable("");
+        if (t.CreateAnonymous()) {
+            t.Label("web request lock");
+            m.table = t;
+        }
+        return m;
+    }
+
+    /// <summary>Locks in the anonymous table another process created and handed
+    /// down. Handle 0 (nothing was handed down) leaves the manager closed, and a
+    /// closed manager grants no lease -- a locked route is refused rather than
+    /// let through unprotected.</summary>
+    static LockManager Attach(long osHandle) {
+        LockManager m = new LockManager();
+        if (osHandle == 0) { return m; }
+        SharedTable t = SharedTable.Attach(osHandle);
+        if (t.IsOpen()) {
+            t.Label("web request lock");
+            m.table = t;
+        }
+        return m;
+    }
+
+    /// <summary>The handle a worker needs to map this manager's table, or 0 when
+    /// the table is named (found by name instead) or was never created.</summary>
+    long OsHandle() {
+        if (this.table == null) { return 0; }
+        return this.table.OsHandle();
     }
 
     static string KeyFor(Route route, string principal) {

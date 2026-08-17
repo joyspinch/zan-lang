@@ -1,0 +1,86 @@
+// Conformance: which shared-memory tables a WebApp owns, and how a worker
+// reaches the ones the master made.
+//
+// The framework's own three tables (rate, lock, route) are anonymous: the
+// master creates them before spawning any worker and hands the handles down,
+// so they belong to one server instance without a machine-global name -- and
+// in particular without the listening port, which is configuration and used to
+// be baked into every table name ("zan.web.8099.rate"). Tables the application
+// names still go through SharedName, whose namespace is the executable unless
+// Scope() gives it a readable one.
+using System;
+using System.Net;
+using System.Threading;
+using System.Web;
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    static async bool Hello(HttpContext ctx) {
+        ctx.Text("hi");
+        return true;
+    }
+
+    static void Main() {
+        WebApp app = new WebApp("127.0.0.1", 8099);
+        Route _r = app.Get("/", Hello);
+
+        // ---- the port is not part of any name ----
+        string rate = app.SharedName("rate");
+        Check(rate.IndexOf("8099") < 0, "default name carries no port");
+        Check(rate == "zan.web." + Worker.AppId() + ".rate",
+            "default namespace is the executable");
+        WebApp moved = new WebApp("127.0.0.1", 9099);
+        Check(moved.SharedName("rate") == rate,
+            "same server on another port, same tables");
+
+        // ---- Scope() still names them, for a deployment that wants that ----
+        WebApp shop = new WebApp("127.0.0.1", 8099);
+        WebApp _s = shop.Scope("shop");
+        Check(shop.SharedName("rate") == "zan.web.shop.rate",
+            "Scope names the tables");
+        Check(shop.SharedName("perm.roles") == "zan.web.shop.perm.roles",
+            "an application's own tables share the namespace");
+
+        // ---- master: the tables exist before any worker, as anonymous
+        // memory whose handle is the only way in ----
+        app.InitShared();
+        long rateHandle = app.Limiter().OsHandle();
+        long lockHandle = app.Locks().OsHandle();
+        Check(rateHandle != 0, "rate table is anonymous and inheritable");
+        Check(lockHandle != 0, "lock table is anonymous and inheritable");
+        Check(Worker.InheritedHandle("WEB_RATE") == 0,
+            "a process that is not a worker inherits nothing");
+
+        // ---- worker: mapping that handle is mapping the master's counters ----
+        RateLimiter worker = RateLimiter.Attach(rateHandle, 1000);
+        Check(app.Limiter().Allow("k", 5), "the master counts a request");
+        Check(worker.CountOf("k") == 1, "the worker sees the master's count");
+        Check(worker.Allow("k", 5), "the worker counts one of its own");
+        Check(app.Limiter().CountOf("k") == 2, "the master sees that one too");
+        RateLimiter orphan = RateLimiter.Attach(0, 1000);
+        Check(!orphan.Allow("k", 5),
+            "no table means refuse, not run unlimited");
+
+        LockManager workerLocks = LockManager.Attach(lockHandle);
+        LockLease held = app.Locks().TryAcquire("g:GET_/");
+        Check(held != null, "the master takes the lease");
+        Check(workerLocks.TryAcquire("g:GET_/") == null,
+            "the worker is locked out of the same key");
+        app.Locks().Release(held);
+        LockLease second = workerLocks.TryAcquire("g:GET_/");
+        Check(second != null, "and gets it once the master lets go");
+        workerLocks.Release(second);
+
+        Console.WriteLine("failures " + Convert.ToString(failures));
+    }
+}

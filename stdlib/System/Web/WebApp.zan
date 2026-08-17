@@ -51,13 +51,18 @@ class WebApp {
     int port;
     bool running;
     TcpListener listener;
-    // Namespace of every shared-memory table this app owns. Those tables are
-    // machine-global (their name is hashed into one /tmp mapping or one
-    // Local\ mapping), so two servers on one machine must not pick the same
-    // one or they would share rate counters, request locks and route stats.
-    // The listening port is the only discriminator known without being told,
-    // so it is the default; Scope() replaces it with a name that survives a
-    // port change.
+    // Namespace of the shared-memory tables this app NAMES. The three tables
+    // the framework itself owns (rate, lock, route) are not named at all: the
+    // master creates them as anonymous shared memory before it spawns any
+    // worker and hands the handles down (Worker.ShareHandle), so they belong to
+    // one server instance without a machine-global name to collide over -- and
+    // in particular without the listening port, which is configuration.
+    // Whatever tables the application adds still need a name, and SharedName
+    // namespaces them under this scope: empty (the default) means "the
+    // executable running this server" (Worker.AppId), and Scope() replaces it
+    // with a readable one -- which also switches the framework's own three
+    // tables to named tables, for a deployment that wants them reachable by
+    // name.
     string scope;
 
     Router router;
@@ -113,7 +118,7 @@ class WebApp {
         this.totalRequests = new AtomicInt(0);
         this.activeConnections = new AtomicInt(0);
         this.reusePort = false;
-        this.scope = Convert.ToString(port);
+        this.scope = "";
         // Shared tables are created by InitShared (before workers fork), not
         // here: Scope() may still rename them.
         this.limiter = null;
@@ -144,23 +149,32 @@ class WebApp {
     /// the JSON body, which is what an API-only server wants.</summary>
     WebApp LoginPath(string path) { this.loginPath = path; return this; }
     WebApp ReusePort(bool on) { this.reusePort = on; return this; }
-    /// <summary>Names this app instance for shared memory. Every table the app
-    /// owns is then "zan.web.&lt;name&gt;.&lt;part&gt;" -- rate, lock, route and
-    /// whatever the application adds through <see cref="SharedName"/>. Defaults
-    /// to the listening port. Set it before starting the server (and to the
-    /// same value in every process of one server), and use a distinct name per
-    /// deployed server on the machine.</summary>
+    /// <summary>Names this app instance for shared memory: every table it names
+    /// is then "zan.web.&lt;name&gt;.&lt;part&gt;", and the framework's own rate,
+    /// lock and route tables become named tables too instead of the anonymous
+    /// ones the master hands down to its workers. Only a deployment that wants
+    /// those tables reachable by name needs this. Set it before starting the
+    /// server, and to the same value in every process of one server; use a
+    /// distinct name per deployed server on the machine.</summary>
     WebApp Scope(string name) {
         if (name.Length > 0) { this.scope = name; }
         return this;
     }
     string Scope() { return this.scope; }
     /// <summary>The shared-memory name of one part of this app:
-    /// "zan.web.8080.rate", "zan.web.shop.perm.roles". The single place these
-    /// names are built, so an application's own tables are namespaced with the
-    /// framework's instead of inventing a prefix.</summary>
+    /// "zan.web.shop.perm.roles". The single place these names are built, so an
+    /// application's own tables are namespaced with the framework's instead of
+    /// inventing a prefix. Without <see cref="Scope"/> the identity of the
+    /// executable stands in (Worker.AppId): two copies in two directories are
+    /// two servers and share nothing, the same copy started again is the same
+    /// server, and moving the service to another port changes none of it.</summary>
     string SharedName(string part) {
-        return "zan.web." + this.scope + "." + part;
+        return "zan.web." + this.ScopeName() + "." + part;
+    }
+    // The scope an explicit Scope() set, or the identity of this executable.
+    string ScopeName() {
+        if (this.scope.Length > 0) { return this.scope; }
+        return Worker.AppId();
     }
     /// <summary>Initialise cross-process route stats. Call after all routes are
     /// registered and before starting the server or running workers. Safe to
@@ -168,30 +182,73 @@ class WebApp {
     /// calls (workers) open it. name must be unique per server instance --
     /// <see cref="SharedName"/> is what produces one.</summary>
     void InitStats(string name) { this.router.InitStats(name); }
-    void InitStats() { this.router.InitStats(this.SharedName("route")); }
+    void InitStats() {
+        if (this.scope.Length > 0) {
+            this.router.InitStats(this.SharedName("route"));
+            return;
+        }
+        this.router.InitStatsShared();
+    }
+
+    // The names the rate, lock and route handles reach the workers under.
+    static const string ShareRate = "WEB_RATE";
+    static const string ShareLock = "WEB_LOCK";
+    static const string ShareRoute = "WEB_ROUTE";
 
     /// <summary>Creates every shared-memory table of this app (rate limiter,
-    /// request locks, route stats) under the current scope. Called by WebServer
-    /// in the master before workers fork, so a worker opens tables that already
-    /// exist instead of racing another worker to create them. Idempotent.</summary>
+    /// request locks, route stats). Called by WebServer in the master before it
+    /// spawns any worker, which is what lets the workers inherit them: a worker
+    /// runs this too and maps the master's tables instead of making a second
+    /// set. Idempotent.</summary>
     void InitShared() {
-        RateLimiter _l = this.Limiter();
-        LockManager _k = this.Locks();
+        if (this.AttachShared()) { return; }
+        RateLimiter l = this.Limiter();
+        LockManager k = this.Locks();
         this.InitStats();
+        // The tables are anonymous, so their handles are the only way in: hand
+        // them to every worker spawned after this point. Under Scope() they are
+        // named instead, OsHandle() is 0, and workers open them by name.
+        Worker.ShareHandle(WebApp.ShareRate, l.OsHandle());
+        Worker.ShareHandle(WebApp.ShareLock, k.OsHandle());
+        Worker.ShareHandle(WebApp.ShareRoute, this.router.StatsOsHandle());
+    }
+
+    // Worker side: map the tables the master created and handed down. False in
+    // the master, in a single-process server, and in a worker of a server that
+    // named its tables -- each of which creates or opens them itself.
+    bool AttachShared() {
+        long rate = Worker.InheritedHandle(WebApp.ShareRate);
+        long lockTable = Worker.InheritedHandle(WebApp.ShareLock);
+        long route = Worker.InheritedHandle(WebApp.ShareRoute);
+        if (rate == 0 && lockTable == 0 && route == 0) { return false; }
+        if (this.limiter == null) {
+            this.limiter = RateLimiter.Attach(rate, 1000);
+        }
+        if (this.locks == null) { this.locks = LockManager.Attach(lockTable); }
+        this.router.AttachStats(route);
+        return true;
     }
 
     // Created on demand so Scope() can still rename them after construction;
     // InitShared does it up front in the process that owns the tables.
     RateLimiter Limiter() {
         if (this.limiter == null) {
-            this.limiter = new RateLimiter(this.SharedName("rate"), 1000);
+            if (this.scope.Length > 0) {
+                this.limiter = RateLimiter.Named(this.SharedName("rate"), 1000);
+            } else {
+                this.limiter = RateLimiter.Owned(1000);
+            }
         }
         return this.limiter;
     }
 
     LockManager Locks() {
         if (this.locks == null) {
-            this.locks = new LockManager(this.SharedName("lock"));
+            if (this.scope.Length > 0) {
+                this.locks = LockManager.Named(this.SharedName("lock"));
+            } else {
+                this.locks = LockManager.Owned();
+            }
         }
         return this.locks;
     }
@@ -844,14 +901,66 @@ class RateLimiter {
     SharedTable table;
     int windowMs;
 
-    RateLimiter(string name, int windowMs) {
+    RateLimiter(int windowMs) {
         if (windowMs > 0) { this.windowMs = windowMs; }
-        SharedTable table = new SharedTable(name, 65536);
-        table.KeySize(192);
-        table.ColumnInt("count");
-        table.ColumnInt("window_start");
-        if (!table.Create()) { table = SharedTable.Open(name); }
-        if (table.IsOpen()) { this.table = table; }
+    }
+
+    // The counters, before they are given a home: 65536 keys of route/ip/token.
+    static SharedTable NewTable(string name) {
+        SharedTable t = new SharedTable(name, 65536);
+        t.KeySize(192);
+        t.ColumnInt("count");
+        t.ColumnInt("window_start");
+        return t;
+    }
+
+    /// <summary>A limiter on a NAMED shared table: created by whichever process
+    /// gets there first and opened by the rest, and reachable by name from
+    /// outside the server.</summary>
+    static RateLimiter Named(string name, int windowMs) {
+        RateLimiter r = new RateLimiter(windowMs);
+        SharedTable t = RateLimiter.NewTable(name);
+        if (!t.Create()) { t = SharedTable.Open(name); }
+        if (t.IsOpen()) {
+            t.Label("web rate limit");
+            r.table = t;
+        }
+        return r;
+    }
+
+    /// <summary>A limiter on anonymous shared memory this process owns: no name
+    /// for another server on the machine to collide with, and workers reach it
+    /// through <see cref="OsHandle"/> / <see cref="Attach"/>.</summary>
+    static RateLimiter Owned(int windowMs) {
+        RateLimiter r = new RateLimiter(windowMs);
+        SharedTable t = RateLimiter.NewTable("");
+        if (t.CreateAnonymous()) {
+            t.Label("web rate limit");
+            r.table = t;
+        }
+        return r;
+    }
+
+    /// <summary>A limiter on the anonymous table another process created and
+    /// handed down. Handle 0 (nothing was handed down) leaves the limiter
+    /// closed, which refuses the requests it is asked about rather than
+    /// silently letting a limited route run unlimited.</summary>
+    static RateLimiter Attach(long osHandle, int windowMs) {
+        RateLimiter r = new RateLimiter(windowMs);
+        if (osHandle == 0) { return r; }
+        SharedTable t = SharedTable.Attach(osHandle);
+        if (t.IsOpen()) {
+            t.Label("web rate limit");
+            r.table = t;
+        }
+        return r;
+    }
+
+    /// <summary>The handle a worker needs to map this limiter's table, or 0 when
+    /// the table is named (found by name instead) or was never created.</summary>
+    long OsHandle() {
+        if (this.table == null) { return 0; }
+        return this.table.OsHandle();
     }
 
     bool Allow(string key, int limit) {
