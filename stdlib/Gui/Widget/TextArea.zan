@@ -53,6 +53,15 @@ class TextArea : Control {
     /// 或 SetText）都恰好重建一次。
     string cacheTxt;
     List<string> cacheLines;
+    /// 软换行后的显示行：每一项是一段文本的字节区间（起点 + 长度）。一行
+    /// 写不下就拆成几行显示，而文本本身不动（只有 Enter 才真的插入
+    /// 换行）：否则一句长句子会一直往右跑到框外面，又没有横向滚动，
+    /// 后半句就看不见了。按它的宽度与字号缓存，因为量文本宽度不便宜。
+    List<int> rowStart;
+    List<int> rowLen;
+    string wrapTxt;
+    int wrapW;
+    int wrapFs;
     /// 只读展示：文字仍可点选、拖选、Ctrl+A / Ctrl+C，但任何按键都改不了
     /// 内容，也不画输入框的外框——用来显示一段可复制的正文。
     bool readOnly;
@@ -75,6 +84,11 @@ class TextArea : Control {
         skipKeys = false;
         cacheTxt = "";
         cacheLines = null;
+        rowStart = new List<int>();
+        rowLen = new List<int>();
+        wrapTxt = "";
+        wrapW = 0;
+        wrapFs = 0;
         readOnly = false;
         autoHeight = false;
         wiresOwnEvents = true;
@@ -118,9 +132,14 @@ class TextArea : Control {
         return Canvas.FontHeight(app.theme.fontSizeMedium) + app.Scale(4);
     }
 
-    /// 放下全部文本需要的高度（含内边距）。
+    /// 放下全部文本需要的高度（含内边距）。量的是显示行：一句被折成
+    /// 三行的长句子占三行的高度，否则自动高度的正文会把自己剪掉。还没
+    /// 画过（不知道宽度）时退回按逻辑行算。
     int ContentHeight(App app) {
         int n = this.Lines().Count;
+        if (wrapTxt == model.Get() && wrapW > 0 && rowStart.Count > 0) {
+            n = rowStart.Count;
+        }
         if (n < 1) { n = 1; }
         return n * TextArea.LineHeight(app) + app.theme.paddingSmall * 2;
     }
@@ -198,28 +217,110 @@ class TextArea : Control {
         return cacheLines;
     }
 
-    /// 字节光标所在的行，从缓存行中推算出，而不是
-    /// 在光标前重新拆分一份文本副本。
-    int CaretLine(List<string> lines) {
-        int pos = 0;
-        for (int i = 0; i < lines.Count; i = i + 1) {
-            int end = pos + lines[i].Length;
-            if (cursorPos <= end) { return i; }
-            pos = end + 1;
+    /// 重算软换行（文本 / 宽度 / 字号变了才算）。
+    void Wrap(int maxW, int fs) {
+        string txt = model.Get();
+        if (wrapTxt == txt && wrapW == maxW && wrapFs == fs
+            && rowStart.Count > 0) {
+            return;
         }
-        if (lines.Count == 0) { return 0; }
-        return lines.Count - 1;
+        wrapTxt = txt;
+        wrapW = maxW;
+        wrapFs = fs;
+        rowStart = new List<int>();
+        rowLen = new List<int>();
+        List<string> lines = this.Lines();
+        int abs = 0;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string ln = lines[i];
+            this.WrapLine(ln, abs, maxW, fs);
+            abs = abs + ln.Length + 1;
+        }
+        if (rowStart.Count == 0) {
+            rowStart.Add(0);
+            rowLen.Add(0);
+        }
     }
 
-    int LineStartAbs(List<string> lines, int line) {
-        int s = 0;
-        for (int i = 0; i < line; i = i + 1) {
-            s = s + lines[i].Length + 1;
+    /// 一段逻辑行拆成几行显示。宽度还没算出来（maxW <= 0，第一帧）就不拆。
+    void WrapLine(string ln, int abs, int maxW, int fs) {
+        if (ln.Length == 0 || maxW <= 0) {
+            rowStart.Add(abs);
+            rowLen.Add(ln.Length);
+            return;
         }
-        return s;
+        int p = 0;
+        while (p < ln.Length) {
+            string rest = ln.Substring(p, ln.Length - p);
+            if (Canvas.MeasureText(rest, fs) <= maxW) {
+                rowStart.Add(abs + p);
+                rowLen.Add(rest.Length);
+                return;
+            }
+            // 二分找能装下的最长前缀（量每一个前缀太贵）。
+            int lo = 1;
+            int hi = rest.Length;
+            while (lo < hi) {
+                int mid = (lo + hi + 1) / 2;
+                if (Canvas.MeasureText(rest.Substring(0, mid), fs) <= maxW) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            // 不在一个多字节字符中间断开，也至少往前走一个字（否则一个比
+            // 框还宽的字会让这个循环原地转）。
+            lo = Text.ClampCharStart(rest, lo);
+            if (lo <= 0) { lo = Text.NextCharEnd(rest, 0); }
+            int cut = lo;
+            // 能在空格处断就在空格处断，英文单词不被劈开；整段没空格
+            // （中文）就按字断。
+            int sp = 0 - 1;
+            for (int k = 0; k < lo; k = k + 1) {
+                if (rest.Substring(k, 1) == " ") { sp = k; }
+            }
+            if (sp > 0) { cut = sp + 1; }
+            rowStart.Add(abs + p);
+            rowLen.Add(cut);
+            p = p + cut;
+        }
+    }
+
+    /// 字节位置落在哪一显示行。刚好落在软换行的接缝上时算下一行的行首：
+    /// 光标跟着刚敲进去的字走，而那个字已经在下一行了。
+    int RowOfPos(int pos) {
+        for (int i = 0; i < rowStart.Count; i = i + 1) {
+            int e = rowStart[i] + rowLen[i];
+            if (pos < e) { return i; }
+            if (pos == e) {
+                if (i + 1 < rowStart.Count && rowStart[i + 1] == e) {
+                    return i + 1;
+                }
+                return i;
+            }
+        }
+        if (rowStart.Count == 0) { return 0; }
+        return rowStart.Count - 1;
+    }
+
+    /// 第 `i` 行显示出来的那段文本。
+    string RowText(int i) {
+        if (i < 0 || i >= rowStart.Count) { return ""; }
+        string txt = model.Get();
+        int s = rowStart[i];
+        int n = rowLen[i];
+        if (s > txt.Length) { return ""; }
+        if (s + n > txt.Length) { n = txt.Length - s; }
+        return txt.Substring(s, n);
+    }
+
+    /// 确保显示行算过一次（第一帧还没画过时宽度未知，那就不折行）。
+    void EnsureRows() {
+        this.Wrap(wrapW, wrapFs);
     }
 
     void HandleInput(App app) {
+        this.EnsureRows();
         this.ClampCursor();
         int kind = app.EventKind();
         string txt = model.Get();
@@ -311,25 +412,24 @@ class TextArea : Control {
                     if (cursorPos < txt.Length) { cursorPos = Text.NextCharEnd(txt, cursorPos); }
                     app.RequestRedraw();
                 } else if (kc == 38 || kc == 40) {
-                    List<string> lines = this.Lines();
-                    int caretLine = this.CaretLine(lines);
-                    int caretCol = cursorPos - this.LineStartAbs(lines, caretLine);
-                    int target = caretLine - 1;
-                    if (kc == 40) { target = caretLine + 1; }
-                    if (target >= 0 && target < lines.Count) {
+                    // 上/下走的是看得见的行（软换行后的显示行）：一句被折成
+                    // 三行的长句子里按下就该到第二行，而不是跳到下一段。
+                    int caretRow = this.RowOfPos(cursorPos);
+                    int caretCol = cursorPos - rowStart[caretRow];
+                    int target = caretRow - 1;
+                    if (kc == 40) { target = caretRow + 1; }
+                    if (target >= 0 && target < rowStart.Count) {
                         int col = caretCol;
-                        if (col > lines[target].Length) { col = lines[target].Length; }
-                        cursorPos = this.LineStartAbs(lines, target) + col;
+                        if (col > rowLen[target]) { col = rowLen[target]; }
+                        cursorPos = rowStart[target] + col;
                         app.RequestRedraw();
                     }
                 } else if (kc == 36) {
-                    List<string> lines = this.Lines();
-                    cursorPos = this.LineStartAbs(lines, this.CaretLine(lines));
+                    cursorPos = rowStart[this.RowOfPos(cursorPos)];
                     app.RequestRedraw();
                 } else if (kc == 35) {
-                    List<string> lines = this.Lines();
-                    int caretLine = this.CaretLine(lines);
-                    cursorPos = this.LineStartAbs(lines, caretLine) + lines[caretLine].Length;
+                    int caretRow = this.RowOfPos(cursorPos);
+                    cursorPos = rowStart[caretRow] + rowLen[caretRow];
                     app.RequestRedraw();
                 }
             } else if (kc == 46) {
@@ -347,15 +447,16 @@ class TextArea : Control {
         }
     }
 
-    /// 鸠标位置对应的字节偏移（行高/滚动位置均取当前帧）。
-    int PosFromMouse(App app, List<string> lines, int innerX, int innerY,
-                     int lineH, int fs) {
-        int line = (app.mouseY - innerY + scrollY) / lineH;
-        if (line < 0) { line = 0; }
-        if (line >= lines.Count) { line = lines.Count - 1; }
-        if (line < 0) { return 0; }
-        int col = CodeEditor.ColFromX(lines[line], app.mouseX - innerX, fs);
-        return this.LineStartAbs(lines, line) + col;
+    /// 鸠标位置对应的字节偏移（行高/滚动位置均取当前帧）。按显示行算：
+    /// 点在折下来那半句上，光标就落在那半句里。
+    int PosFromMouse(App app, int innerX, int innerY, int lineH, int fs) {
+        int row = (app.mouseY - innerY + scrollY) / lineH;
+        if (row < 0) { row = 0; }
+        if (row >= rowStart.Count) { row = rowStart.Count - 1; }
+        if (row < 0) { return 0; }
+        int col = CodeEditor.ColFromX(this.RowText(row), app.mouseX - innerX,
+                                     fs);
+        return rowStart[row] + col;
     }
 
     int Render(App app, int x, int y, int w, int h) {
@@ -389,19 +490,21 @@ class TextArea : Control {
         int innerH = h - pad * 2;
         int lineH = TextArea.LineHeight(app);
 
-        List<string> lines = this.Lines();
-        int contentH = lines.Count * lineH;
+        // 折行宽度给滚动条留出位置，否则溢出时每行的最后几个字会被滚
+        // 动条盖住（而且“溢出才变窄”会在两种折法之间来回跳）。
+        int wrapWidth = innerW - app.Scale(10);
+        if (wrapWidth < app.Scale(24)) { wrapWidth = innerW; }
+        this.Wrap(wrapWidth, t.fontSizeMedium);
+        int contentH = rowStart.Count * lineH;
 
-        int caretLine = this.CaretLine(lines);
-        int caretCol = cursorPos - this.LineStartAbs(lines, caretLine);
+        int caretRow = this.RowOfPos(cursorPos);
+        int caretCol = cursorPos - rowStart[caretRow];
         if (caretCol < 0) { caretCol = 0; }
-        if (caretCol > lines[caretLine].Length) {
-            caretCol = lines[caretLine].Length;
-        }
+        if (caretCol > rowLen[caretRow]) { caretCol = rowLen[caretRow]; }
 
         // 保持光标可见（仅在获得焦点 / 正在编辑时）。
         if (focused) {
-            int caretTop = caretLine * lineH;
+            int caretTop = caretRow * lineH;
             if (caretTop < scrollY) { scrollY = caretTop; }
             if (caretTop + lineH > scrollY + innerH) {
                 scrollY = caretTop + lineH - innerH;
@@ -434,34 +537,36 @@ class TextArea : Control {
                 int selE = SelEnd();
                 int selColor = App.LerpColor(t.bgPrimary, t.primary, 96);
                 int nlW = Canvas.MeasureText(" ", fs);
-                int lineStart = 0;
-                for (int i = 0; i < lines.Count; i = i + 1) {
-                    int lineEnd = lineStart + lines[i].Length;
+                for (int i = 0; i < rowStart.Count; i = i + 1) {
+                    int lineStart = rowStart[i];
+                    int lineEnd = lineStart + rowLen[i];
                     int s = selS;
                     int e = selE;
                     if (s < lineStart) { s = lineStart; }
                     if (e > lineEnd) { e = lineEnd; }
                     if (s <= e && selE > lineStart && selS <= lineEnd) {
+                        string rt = this.RowText(i);
                         int ly = innerY + i * lineH - scrollY;
-                        int x0 = Canvas.MeasureText(lines[i].Substring(0, s - lineStart), fs);
-                        int x1 = Canvas.MeasureText(lines[i].Substring(0, e - lineStart), fs);
+                        int x0 = Canvas.MeasureText(rt.Substring(0, s - lineStart), fs);
+                        int x1 = Canvas.MeasureText(rt.Substring(0, e - lineStart), fs);
                         int selW = x1 - x0;
                         if (selE > lineEnd) { selW = selW + nlW; }
                         c.FillRect(innerX + x0, ly, selW, Canvas.FontHeight(fs), selColor);
                     }
-                    lineStart = lineEnd + 1;
                 }
             }
-            for (int i = 0; i < lines.Count; i = i + 1) {
+            for (int i = 0; i < rowStart.Count; i = i + 1) {
                 int ly = innerY + i * lineH - scrollY;
                 if (ly + lineH > innerY && ly < innerY + innerH) {
-                    c.DrawText(innerX, ly, lines[i], t.textPrimary, t.fontSizeMedium);
+                    c.DrawText(innerX, ly, this.RowText(i), t.textPrimary,
+                        t.fontSizeMedium);
                 }
             }
             if (focused && !readOnly) {
                 int caretX = innerX + Canvas.MeasureText(
-                    lines[caretLine].Substring(0, caretCol), t.fontSizeMedium);
-                int caretY = innerY + caretLine * lineH - scrollY;
+                    this.RowText(caretRow).Substring(0, caretCol),
+                    t.fontSizeMedium);
+                int caretY = innerY + caretRow * lineH - scrollY;
                 int fh = Canvas.FontHeight(t.fontSizeMedium);
                 c.FillRect(caretX, caretY, 1, fh, t.primary);
                 // 让 IME 组合窗口跟随光标。
@@ -495,7 +600,7 @@ class TextArea : Control {
 
         // 鼠标选择：按下锚定选区并放置光标，按住拖动移动活动端。
         if (Ui.PressedDown(app, id)) {
-            cursorPos = this.PosFromMouse(app, lines, innerX, innerY, lineH,
+            cursorPos = this.PosFromMouse(app, innerX, innerY, lineH,
                                           t.fontSizeMedium);
             if (!Modifiers.HasShift(app.window.EventMods()) || selAnchor < 0) {
                 selAnchor = cursorPos;
@@ -503,7 +608,7 @@ class TextArea : Control {
             this.ClampCursor();
             app.RequestRedraw();
         } else if (focused && app.focus.IsPressed(id) && app.EventKind() == 1) {
-            int drag = this.PosFromMouse(app, lines, innerX, innerY, lineH,
+            int drag = this.PosFromMouse(app, innerX, innerY, lineH,
                                          t.fontSizeMedium);
             if (drag != cursorPos) {
                 cursorPos = drag;
@@ -514,7 +619,7 @@ class TextArea : Control {
         // 单消费者点击：当此区域是框架解析出的点击
         // 目标时放置光标。
         if (Ui.Clicked(app, id)) {
-            cursorPos = this.PosFromMouse(app, lines, innerX, innerY, lineH,
+            cursorPos = this.PosFromMouse(app, innerX, innerY, lineH,
                                           t.fontSizeMedium);
             if (selAnchor == cursorPos) { selAnchor = -1; }
             this.ClampCursor();
@@ -550,7 +655,9 @@ class TextArea : Control {
 
     override bool SetExtra(string key, string val) {
         if (key != "text" && key != "value") { return false; }
-        this.SetText(val);
+        // 值没变就别碰光标/选区：属性写入可能每帧都来，而 SetText 的语义是
+        // 「换了一段文本」——光标收到末尾。
+        if (val != model.Get()) { this.SetText(val); }
         return true;
     }
 

@@ -20,6 +20,14 @@ class ChatMessage {
     string kind;
     string taskId;
     int progress;
+    /// 这一拍实际发出的工具调用（宿主自己的格式，原样留档）。它不进聊天区
+    /// 的正文——那是给人看的；宿主把请求发回模型时带上它，模型才看得到自己
+    /// 上一拍真正的调用长什么样。
+    string call;
+    /// 这条消息产生的时刻（Unix 秒，UTC）。0 = 不知道（旧存档里没有这个
+    /// 字段），头行就不显示时刻。流式那条气泡在建出来时定下这个值，后面
+    /// 每一拍只改正文，因此显示的是「这一轮开始说话的时间」。
+    long at;
 
     static ChatMessage Create(string role, string text) {
         ChatMessage m = new ChatMessage();
@@ -31,6 +39,8 @@ class ChatMessage {
         m.kind = "";
         m.taskId = "";
         m.progress = 0;
+        m.call = "";
+        m.at = DateTime.UtcNow().ToUnixSeconds();
         return m;
     }
 
@@ -128,13 +138,19 @@ class ChatView : Control {
     ChatSpeakerOf speakerOf;
     ChatKindLabel kindLabelOf;
 
-    /// 预换行的展示行缓存，以及增量重排用的水位线：`cacheTurns` 之前的
+    /// 正在排的那份行表，以及增量重排用的水位线：`cacheTurns` 之前的
     /// 轮次已定型，`cachePrefix` 是它们占的行数。
     List<TextRun> cache;
     int cacheTurns;
     int cachePrefix;
     string cacheKey;
     string cacheSig;
+    /// 画出来的那份行表：整份重排要跨好几帧，把半成品直接画出去，看到的
+    /// 就是「底端锚定的最后一行」一帧一帧往下长——改一次窗口大小，记录就
+    /// 自己从头滚到底一遍。所以排好的那一份才换上来。
+    List<TextRun> show;
+    /// 这次重排是整份重排（行号会全部重映射，换上来时要丢掉选区）。
+    bool showStale;
 
     /// 展开的消息下标（工具结果与长代码块共用一份）。
     List<int> toolOpen;
@@ -159,6 +175,8 @@ class ChatView : Control {
         cachePrefix = 0;
         cacheKey = "";
         cacheSig = "";
+        show = new List<TextRun>();
+        showStale = false;
         toolOpen = new List<int>();
         thinkOpen = new SignalInt(0);
         scrollSig = new SignalInt(0);
@@ -201,6 +219,13 @@ class ChatView : Control {
         return this;
     }
 
+    /// 一条消息头行右侧的本机时区时刻（HH:MM）；没有记时间的旧消息返回 ""。
+    static string ClockText(long at) {
+        if (at <= 0) { return ""; }
+        DateTime d = DateTime.FromUnixSeconds(at).ToLocalTime();
+        return Text.Left(d.ToTimeString(), 5);
+    }
+
     /// 模型正在回答：记录末尾显示 busy 行。
     void SetBusy(bool on) { busy = on; }
 
@@ -217,6 +242,8 @@ class ChatView : Control {
         cachePrefix = 0;
         cacheKey = "";
         cacheSig = "";
+        show = new List<TextRun>();
+        showStale = false;
         toolOpen = new List<int>();
         sel.Reset();
         scrollSig.Set(0);
@@ -229,7 +256,7 @@ class ChatView : Control {
     }
 
     /// 当前选中的文本（未选中则 ""）。
-    string SelectedText() { return ChatView.SelectionText(cache, sel); }
+    string SelectedText() { return ChatView.SelectionText(show, sel); }
 
     // ---- retained 钩子 ----------------------------------------------
 
@@ -243,7 +270,7 @@ class ChatView : Control {
         }
         this.TakeWheel(app);
         this.Build(app);
-        grid.lines = cache;
+        grid.lines = show;
         grid.scroll = scrollSig.Get();
         grid.busy = busy;
         grid.sel = sel;
@@ -251,6 +278,9 @@ class ChatView : Control {
         grid.thinkOpen = thinkOpen;
         grid.toolOpen = toolOpen;
         grid.busyText = str.busy;
+        // 记录网格自己画纵向滚动条（它才知道行高与可见行数），这里只把同一个
+        // 滚动信号交给它，滚轮与拖动于是动的是同一个量。
+        grid.scrollBar = scrollSig;
         // StyledText 在绘制时算出最大滚动，绘制发生在子控件那一步，
         // 因此这里读到的是上一帧的界限——足够用来夹住滚动值。
         int max = grid.maxScroll;
@@ -287,12 +317,23 @@ class ChatView : Control {
     /// 换行缓存：只有记录、宽度、字号或折叠状态变了才重建，而且只有
     /// 正在流式输出的最后一轮会重排——1000 轮的会话和空会话一样便宜。
     void Build(App app) {
-        int textW = bw - app.Scale(28);
+        // 还没量到尺寸（第一帧之前，或者窗口被最小化压成 0×0）：这时候
+        // 排出来的每一行都作废，而且是按最小宽度排整份记录——把一份长
+        // 记录排成几十万行的代价，正好落在恢复窗口的那一下。留着缓存
+        // 原样等有尺寸的那一帧。
+        if (bw <= 0 || bh <= 0) { return; }
+        // 纵向滚动条的宽度始终预留：换行宽度跟着滚动条的有无变，就会在「刚
+        // 好多一行」附近每帧重排一次。
+        int textW = bw - app.Scale(28) - StyledText.BarW(app);
         if (textW < app.Scale(20)) { textW = app.Scale(20); }
-        int tailLen = 0;
+        // 尾轮签名：流式输出时变的不只是长度，成员、状态和进度都会改
+        // 名字行上的头像与状态芯片，只看长度会让那一行停在旧状态上。
+        string tailSig = "-";
         if (data.Count > 0) {
-            tailLen = data[data.Count - 1].text.Length
-                + data[data.Count - 1].reason.Length;
+            ChatMessage tail = data[data.Count - 1];
+            tailSig = Convert.ToString(tail.text.Length + tail.reason.Length)
+                + "/" + tail.role + "/" + tail.agent + "/" + tail.kind
+                + "/" + Convert.ToString(tail.progress);
         }
         int toolSig = toolOpen.Count;
         for (int i = 0; i < toolOpen.Count; i = i + 1) {
@@ -304,7 +345,7 @@ class ChatView : Control {
             + ":" + Convert.ToString(thinkOpen.Get())
             + ":" + Convert.ToString(toolSig);
         string keyNow = layoutSig + ":" + Convert.ToString(data.Count)
-            + ":" + Convert.ToString(tailLen);
+            + ":" + tailSig;
         if (keyNow == cacheKey) { return; }
         bool full = layoutSig != cacheSig
             || data.Count < cacheTurns + 1
@@ -316,26 +357,63 @@ class ChatView : Control {
             cacheTurns = 0;
             cachePrefix = 0;
             cacheSig = layoutSig;
-            // 重排会重映射每个行号，留着的选区会高亮错的文本。
-            sel.ClearSelection();
+            // 重排会重映射每个行号，留着的选区会高亮错的文本；旧的一份还在
+            // 画着，所以等排完换上来的那一下再丢选区。
+            showStale = true;
         } else {
             while (cache.Count > cachePrefix) {
                 cache.RemoveAt(cache.Count - 1);
             }
         }
         if (cacheTurns < stable) {
-            this.BuildRange(app, cacheTurns, stable, textW);
-            cacheTurns = stable;
-            cachePrefix = cache.Count;
+            // 整份重排按拍切开做：一份长记录（工具贴过整个文件、几十轮
+            // 回答）改一次宽度就要重排每一行，整帧做完是秒级的，GUI
+            // 线程停一秒就是窗口标题上的「未响应」。每帧只排到预算用完，
+            // 剩下的下一帧接着排（缓存的水位线本来就是为增量重排准备的）。
+            int budget = ChatView.BuildBudgetMs();
+            int began = Window.GetTickMs();
+            while (cacheTurns < stable) {
+                int upto = cacheTurns + ChatView.BuildChunk();
+                if (upto > stable) { upto = stable; }
+                this.BuildRange(app, cacheTurns, upto, textW);
+                cacheTurns = upto;
+                cachePrefix = cache.Count;
+                if (Window.GetTickMs() - began >= budget) { break; }
+            }
+            if (cacheTurns < stable) {
+                // 还没排完：这一帧先把已排好的部分画出来，下一帧接着排。
+                // cacheKey 留空 = 缓存未完成，cacheSig 已跟上本次布局，于是
+                // 下一帧从水位线继续而不是从头重来。
+                cacheKey = "";
+                // 第一次填充（切换会话、刚打开）没有旧的一份可画，这时画半
+                // 成品是「越排越多」而不是「跳着滚」，比空白好。
+                if (show.Count == 0) { show = cache; }
+                app.RequestRedraw();
+                return;
+            }
         }
         this.BuildRange(app, stable, data.Count, textW);
         cacheKey = keyNow;
+        // 排完了才换上来：整份重排跨了多少帧，画的都还是上一份完整布局。
+        show = cache;
+        if (showStale) {
+            sel.ClearSelection();
+            showStale = false;
+        }
     }
 
     // ---- 排版 -------------------------------------------------------
 
     /// 折叠长代码块前保留的行数。
     static int CodeFoldLines() { return 14; }
+
+    /// 整份重排时每帧的时间预算（毫秒）：排完这么久就把控制权交
+    /// 回循环，下一帧接着排。一帧 16ms 的预算里留出绘制的份。
+    static int BuildBudgetMs() { return 8; }
+
+    /// 一个切片重排多少轮：太小会把时间花在重新取时间上，太大则一个
+    /// 切片就可能超出预算。
+    static int BuildChunk() { return 4; }
 
     static bool HasInt(List<int> xs, int v) {
         for (int i = 0; i < xs.Count; i = i + 1) {
@@ -361,21 +439,38 @@ class ChatView : Control {
             string line = hard[li];
             if (line == "") { outLines.Add(""); }
             while (line != "") {
-                if (Canvas.MeasureText(line, fontSize) <= maxW) {
+                int n = line.Length;
+                // 先倍增探出一个放不下的上界，再只在这段里二分：每排一行
+                // 都先量整条剩余文本，是平方级的开销——一条几十 KB 的工具
+                // 输出于是要量掉几百次几十 KB 的文本，正是 GUI 线程一停
+                // 一两秒、窗口标题变「未响应」的那份活。排一行只需要量到
+                // 它自己那一段。
+                int lo = 0;
+                int probe = 64;
+                if (probe > n) { probe = n; }
+                while (probe < n
+                        && Canvas.MeasureText(line.Substring(0, probe),
+                            fontSize) <= maxW) {
+                    lo = probe;
+                    probe = probe * 2;
+                    if (probe > n) { probe = n; }
+                }
+                if (probe >= n
+                        && Canvas.MeasureText(line, fontSize) <= maxW) {
                     outLines.Add(line);
                     line = "";
                 } else {
-                    // 二分出能放下的最长前缀。
-                    int lo = 1;
-                    int hi = line.Length;
-                    while (lo < hi) {
-                        int mid = (lo + hi + 1) / 2;
+                    // prefix(lo) 放得下，prefix(hi) 放不下：二分出最长前缀。
+                    int hi = probe;
+                    while (lo + 1 < hi) {
+                        int mid = (lo + hi) / 2;
                         if (Canvas.MeasureText(line.Substring(0, mid), fontSize)
                                 <= maxW) { lo = mid; }
-                        else { hi = mid - 1; }
+                        else { hi = mid; }
                     }
                     // 绝不在多字节字符内部断行，且至少保留一个完整字符，
                     // 保证循环推进。
+                    if (lo < 1) { lo = 1; }
                     lo = Text.ClampCharStart(line, lo);
                     if (lo <= 0) { lo = Text.NextCharEnd(line, 0); }
                     outLines.Add(line.Substring(0, lo));
@@ -391,6 +486,32 @@ class ChatView : Control {
         ChatView.WrapInto(s, maxW, fontSize, wrapped);
         for (int i = 0; i < wrapped.Count; i = i + 1) {
             cache.Add(TextRun.Create(wrapped[i], color, kind));
+        }
+    }
+
+    /// 收束一个轮次：最后一行带上分隔标记。StyledText 把它画成块底部的
+    /// 一条细线，比追加一整行空行省掉整整一行行高——记录里那些空行
+    /// 就是这么来的。
+    void MarkBlockEnd() {
+        if (cache.Count > 0) { cache[cache.Count - 1].last = true; }
+    }
+
+    /// 这一行正文该不该丢掉：markdown 段落之间的空行只留一条，紧跟
+    /// 名字行 / 折叠行的空行直接不要，间距统一交给行高与分隔线。
+    bool SkipBlank(string s) {
+        if (s != "") { return false; }
+        if (cache.Count == 0) { return true; }
+        TextRun prev = cache[cache.Count - 1];
+        if (prev.kind == 3 || prev.kind == 4 || prev.kind == 5) { return true; }
+        return prev.text == "";
+    }
+
+    /// 去掉 `floorIdx` 之后结尾处的空正文行（模型爱在答案末尾留空行）。
+    void TrimTrailBlank(int floorIdx) {
+        while (cache.Count > floorIdx
+            && cache[cache.Count - 1].kind == 0
+            && cache[cache.Count - 1].text == "") {
+            cache.RemoveAt(cache.Count - 1);
         }
     }
 
@@ -454,6 +575,13 @@ class ChatView : Control {
         if (stop > data.Count) { stop = data.Count; }
         while (i < stop) {
             ChatMessage msg = data[i];
+            // 空气泡不画：一拍只发了工具调用（正文和思考都空）时，留下的就是
+            // 一个光有名字的空框，下面紧跟着的工具行才是内容。
+            if (msg.text == "" && msg.reason == ""
+                && i < data.Count - 1) {
+                i = i + 1;
+                continue;
+            }
             string head = str.assistant;
             int headCol = t.success;
             int bodyCol = t.textPrimary;
@@ -477,9 +605,11 @@ class ChatView : Control {
             // 就是谁在做、做到哪了，细节仍然折叠在下面。
             string headStatus = "";
             int headPct = 0 - 1;
+            bool named = false;
             if (msg.agent != "" && speakerOf != null) {
                 ChatSpeaker who = speakerOf(msg.agent);
                 if (who != null) {
+                    named = true;
                     head = who.name;
                     headCol = who.tint;
                     headCls = who.tagCls;
@@ -523,10 +653,9 @@ class ChatView : Control {
                         this.WrapRows(tl[k], textW, t.fontSizeSmall, bodyCol, 0);
                     }
                 }
+                this.TrimTrailBlank(msgStart + 1);
                 this.OwnRows(msgStart, 2);
-                TextRun tgap = TextRun.Create("", t.textTertiary, 6);
-                tgap.owner = 2;
-                cache.Add(tgap);
+                this.MarkBlockEnd();
                 i = i + 1;
                 continue;
             }
@@ -536,6 +665,8 @@ class ChatView : Control {
             hln.tagCls = headCls;
             hln.status = headStatus;
             hln.pct = headPct;
+            // 这一轮是何时说的：贴在头行右缘，不挤名字、节拍标签和百分比。
+            hln.time = ChatView.ClockText(msg.at);
             cache.Add(hln);
             // 思考过程是答案上方一段暗色的独立区块，默认折叠成一行可点
             // 提示，绝不埋掉答案。
@@ -608,17 +739,21 @@ class ChatView : Control {
                         kind = 2;
                         col = t.textPrimary;
                     }
-                    this.WrapRows(shown, textW, t.fontSizeSmall, col, kind);
+                    if (!this.SkipBlank(shown)) {
+                        this.WrapRows(shown, textW, t.fontSizeSmall, col, kind);
+                    }
                 }
                 li = li + 1;
             }
             int ownCode = ChatView.RoleCode(msg.role);
+            // 有说话人的 user 消息不是用户发言（多智能体会话里那是流程自己发的
+            // 指令）：染成「我」那种色块，读起来就是用户发了一屏自己没发过的话。
+            if (msg.role == "user" && named) { ownCode = 2; }
+            this.TrimTrailBlank(msgStart + 1);
             this.OwnRows(msgStart, ownCode);
-            // 一行不上色的间隔收束一轮：六个成员轮流说话时，紧贴的色块
-            // 会读成一整片。
-            TextRun gap = TextRun.Create("", t.textTertiary, 6);
-            gap.owner = ownCode;
-            cache.Add(gap);
+            // 一条细分隔线收束一轮：六个成员轮流说话时，紧贴的色块会读成
+            // 一整片，而整行空行又把记录撑得半屏空白。
+            this.MarkBlockEnd();
             i = i + 1;
         }
         // kind-5 折叠行控制的消息下标（其余为 -1）。

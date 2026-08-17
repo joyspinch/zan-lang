@@ -130,24 +130,36 @@ class GridSource<T> : DataSource {
         return this.data.Count;
     }
 
+    /// 行号在当前这份数据里有效。引擎按上一次重算出来的行号集合
+    /// （`st.order`）取单元格，绑定的列表在那之后缩短过的话行号就会越界；
+    /// 读单元格是每帧的事，越界一次就是整个程序退出，所以这里按列一样挡住。
+    bool Row(int row) {
+        if (this.data == null) { return false; }
+        return row >= 0 && row < this.data.Count;
+    }
+
     override string CellText(int row, int col) {
         if (col < 0 || col >= this.cols.Count) { return ""; }
+        if (!this.Row(row)) { return ""; }
         return this.cols[col].Raw(this.data[row]);
     }
 
     override int CellNum(int row, int col) {
+        if (col < 0 || col >= this.cols.Count || !this.Row(row)) { return 0; }
         GridColumn<T> gc = this.cols[col];
         if (gc.num != null) { return gc.num(this.data[row]); }
         return DataTable.ParseInt(this.CellText(row, col));
     }
 
     override double CellReal(int row, int col) {
+        if (col < 0 || col >= this.cols.Count || !this.Row(row)) { return 0.0; }
         GridColumn<T> gc = this.cols[col];
         if (gc.real != null) { return gc.real(this.data[row]); }
         return DataTable.ParseReal(this.CellText(row, col));
     }
 
     override bool CellBool(int row, int col) {
+        if (col < 0 || col >= this.cols.Count || !this.Row(row)) { return false; }
         GridColumn<T> gc = this.cols[col];
         if (gc.truth != null) { return gc.truth(this.data[row]); }
         return DataTable.ParseBool(this.CellText(row, col));
@@ -155,6 +167,7 @@ class GridSource<T> : DataSource {
 
     override void SetCell(int row, int col, string v) {
         if (col < 0 || col >= this.cols.Count) { return; }
+        if (!this.Row(row)) { return; }
         GridColumn<T> gc = this.cols[col];
         if (gc.setter != null) { gc.setter(this.data[row], v); }
     }
@@ -205,6 +218,8 @@ class DataGrid<T> : Control {
     /// 每帧交给引擎的 `List<DataColumn>`，与
     /// `gcols` 保持同步，使构造后新增的列也能显示。
     List<DataColumn> descs;
+    /// 上一次 Bind 时的行数（-1 = 还没绑过）：行数变了必须让引擎重算行号集合。
+    int boundN;
 
     void InitGrid() {
         this.InitControl("datatable", 5);
@@ -216,6 +231,7 @@ class DataGrid<T> : Control {
         this.source.data = null;
         this.source.factory = null;
         this.descs = new List<DataColumn>();
+        this.boundN = 0 - 1;
         // 引擎自行完成整个网格的命中测试 / 绘制，
         // 因此基类控件不能再注册命中区域或绘制表面。
         this.wiresOwnEvents = true;
@@ -232,8 +248,14 @@ class DataGrid<T> : Control {
     /// 绑定调用方的列表。不复制——网格每帧读取，
     /// 修改列表会在下一次绘制时生效。
     DataGrid<T> Bind(List<T> src) {
+        int n = 0;
+        if (src != null) { n = src.Count; }
+        // 换了列表、或者行数变了：引擎里的行号集合（st.order）还是上一份数据
+        // 的，不重算就会拿越界行号去取单元格。
+        if (this.data != src || n != this.boundN) { this.st.dirty = true; }
         this.data = src;
         this.source.data = src;
+        this.boundN = n;
         return this;
     }
 

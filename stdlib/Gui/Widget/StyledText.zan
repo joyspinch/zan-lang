@@ -24,6 +24,13 @@ class TextRun {
     string tagCls;
     string status;
     int pct;
+    // 头行右缘的时刻文本（如 "14:03"）；空 = 不显示。它只占右缘，
+    // 不参与名字、节拍标签和百分比那几个芯片的从左往右排列。
+    string time;
+    // 本行是否是一个轮次的最后一行。轮次之间靠一条细分隔线断开，
+    // 而不是插一整行空行：空行也占满一行行高，六个成员轮流说话时
+    // 记录一半是空白，正是「行距太高、很多空行」的来源。
+    bool last;
 
     static TextRun Create(string text, int color, int kind) {
         TextRun ln = new TextRun();
@@ -36,6 +43,8 @@ class TextRun {
         ln.tagCls = "";
         ln.status = "";
         ln.pct = 0 - 1;
+        ln.time = "";
+        ln.last = false;
         return ln;
     }
 }
@@ -59,9 +68,26 @@ class StyledText : Control {
     List<int> toolOpen;
     string busyText;
     int maxScroll;
+    /// 调用方的滚动偏移信号（底端锚定，单位是展示行，0 = 贴住最新一行）。
+    /// 给了它就在右侧画一条可拖动的纵向滚动条：只有滚轮的时候，长记录既
+    /// 看不出自己停在整段的哪一段，也没法一把拖回去。null = 不画。
+    SignalInt scrollBar;
 
     // busy 行复用的常驻 Label（替代每帧 DrawStyledText）。
     static Label thinkingLbl;
+
+    // 滚动条要的是「像素、从顶算」的信号，而记录的滚动是「行、从底算」。
+    // 常驻一个转换用的信号，免得每帧新分配一个。
+    static SignalInt barSig;
+
+    static SignalInt BarSig() {
+        if (StyledText.barSig == null) { StyledText.barSig = new SignalInt(0); }
+        return StyledText.barSig;
+    }
+
+    /// 纵向滚动条占掉的宽度。调用方按它收窄换行宽度，最长的一行才不会被
+    /// 压在滑块底下。
+    static int BarW(App app) { return app.Scale(12); }
 
     static void EnsureThinking(App app) {
         if (StyledText.thinkingLbl == null) {
@@ -83,6 +109,7 @@ class StyledText : Control {
         toolOpen = null;
         busyText = "";
         maxScroll = 0;
+        scrollBar = null;
     }
 
     /// 记录的字号，解析自各行绘制时用的同一套样式，使测量与绘制不会错位。
@@ -95,11 +122,14 @@ class StyledText : Control {
     /// 都解释了之前面板为何显得局促错位——固定 18px 在大 UI 缩放
     /// 下比字体的行盒更紧，也比它要装的 Tag 更矮。
     static int RowH(App app) {
-        int h = Canvas.FontHeight(StyledText.FontPx(app)) + app.Scale(5);
-        int chip = Tag.Height(app, "") + app.Scale(2);
+        int h = Canvas.FontHeight(StyledText.FontPx(app)) + app.Scale(3);
+        int chip = Tag.Height(app, "");
         if (h < chip) { h = chip; }
         return h;
     }
+
+    /// 轮次之间的分隔线高度：块与块之间只让出这么多，不再插空行。
+    static int SepH(App app) { return app.Scale(1); }
 
     /// `mouseY` 下的展示行索引（底端锚定的记录，第一可见行为 `start`）。
     static int RowAt(int startY, int pad, int rowH, int start,
@@ -137,6 +167,20 @@ class StyledText : Control {
     static void PaintHeadRow(App app, TextRun ln, int x, int y, int rowH,
             int rightEdge) {
         int cx = x;
+        // 时刻贴右缘，并把芯片可用的右边界收回来：成员名很长时宁可
+        // 不画后面的芯片，也不能让它们跑到时刻上面。
+        if (ln.time != "") {
+            Theme th = app.theme;
+            int tw = Canvas.MeasureText(ln.time, th.fontSizeSmall);
+            int tx = rightEdge - tw;
+            int tdy = (rowH - th.fontSizeSmall) / 2;
+            if (tdy < 0) { tdy = 0; }
+            if (tx > x) {
+                app.canvas.DrawText(tx, y + tdy, ln.time, th.textTertiary,
+                    th.fontSizeSmall);
+                rightEdge = tx - app.Scale(6);
+            }
+        }
         // 名字条上的一切都按控件真实高度在行内居中：芯片高度为
         // theme.heightTiny，按更短的猜测行高布局正是把名字压进下一行的原因。
         int chipH = Tag.Height(app, ln.tagCls);
@@ -201,6 +245,10 @@ class StyledText : Control {
         int start = total - maxRows - sc;
         if (start < 0) { start = 0; }
         this.maxScroll = maxSc;
+        // 有得滚才画滚动条，也才收窄正文：内容装得下时右边不该空出一条。
+        bool wantBar = scrollBar != null && maxSc > 0;
+        int inset = 0;
+        if (wantBar) { inset = StyledText.BarW(app); }
         // 在已换行展示行上拖拽选择，复用 LogView 的选择模型
         // （LogState + LogView.ColAt / SelectionText）。滚轮滚动仍由
         // 调用方持有，以保留它自己的滚动模型。
@@ -210,6 +258,11 @@ class StyledText : Control {
             int kind = app.EventKind();
             bool over = app.mouseX >= bx && app.mouseX < bx + bw
                 && app.mouseY >= by && app.mouseY < by + bh;
+            // 滑块上的按下归滚动条，不能同时开一段文本选区（选区只看坐标，
+            // 不过 hitTester），否则拖条子的同时整屏反白。
+            if (wantBar && app.mouseX >= bx + bw - inset - app.Scale(5)) {
+                over = false;
+            }
             if (kind == 2 && app.window.EventButton() == 0 && over
                 && !app.PointerCaptured()) {
                 int ri = StyledText.RowAt(by, pad, rowH, start,
@@ -272,7 +325,8 @@ class StyledText : Control {
         int barW = app.Scale(3);
         int blockX = bx + pad;
         int textX = blockX + barW + app.Scale(8);
-        int textW2 = bw - pad * 2 - barW - app.Scale(8);
+        int blockW = bw - pad * 2 - inset;
+        int textW2 = blockW - barW - app.Scale(8);
         for (int row = 0; idx < total && row < maxRows; row = row + 1) {
             int ry = by + pad + row * rowH;
             if (idx < cache.Count) {
@@ -292,7 +346,7 @@ class StyledText : Control {
                 }
                 bool spacer = cache[idx].kind == 6;
                 if (!spacer) {
-                    c.FillRect(blockX, ry, bw - pad * 2, rowH, tint);
+                    c.FillRect(blockX, ry, blockW, rowH, tint);
                     c.FillRect(blockX, ry, barW, rowH, rail);
                 }
                 if (!spacer && cache[idx].kind == 1) {
@@ -316,15 +370,22 @@ class StyledText : Control {
                     if (hx1 < hx0 + 2) { hx1 = hx0 + 2; }
                     c.FillRect(hx0, ry, hx1 - hx0, rowH, selCol);
                 }
+                if (!spacer && cache[idx].last) {
+                    // 轮次收束：一条细线断开相邻的两个色块，代价是 1px
+                    // 而不是一整行。
+                    int sh = StyledText.SepH(app);
+                    c.FillRect(blockX, ry + rowH - sh, blockW, sh,
+                        t.borderSecondary);
+                }
                 if (spacer) {
-                    // 无需绘制：该行是两个轮次之间的间隔。
+                    // 无需绘制：该行是两个轮次之间的间隔（旧缓存兼容）。
                 } else if (cache[idx].kind == 3) {
                     // 轮次的名字行，由共享控件而非这里手绘拼成：发言者的
                     // 圆形 Avatar、名字的 Tag 芯片，团队聊天下再加一个
                     // 节拍 Tag 和一个百分比 Tag。手搓这个胶囊正是让助手
                     // 的外观偏离 IDE 中所有其它列表行的原因。
                     StyledText.PaintHeadRow(app, cache[idx], textX, ry, rowH,
-                        bx + bw - pad);
+                        bx + bw - pad - inset);
                 } else if (cache[idx].kind == 1) {
                     c.DrawText(textX + app.Scale(4), ry + textDy,
                         cache[idx].text, cache[idx].color, fontPx);
@@ -341,6 +402,20 @@ class StyledText : Control {
             idx = idx + 1;
         }
         c.PopClip();
+        // 纵向滚动条：记录的滚动是「从底算的行数」，滚动条说的是「从顶算的
+        // 像素」，在这里换一下再把拖动结果写回调用方的信号。
+        if (wantBar) {
+            int trackH = bh - pad * 2;
+            SignalInt px = StyledText.BarSig();
+            px.Set((maxSc - sc) * rowH);
+            Scrollbar.RenderVerticalScroll(app, bx + bw - inset, by + pad,
+                trackH, maxRows * rowH, total * rowH, px);
+            int top = px.Get() / rowH;
+            int want = maxSc - top;
+            if (want < 0) { want = 0; }
+            if (want > maxSc) { want = maxSc; }
+            if (want != sc) { scrollBar.Set(want); app.RequestRedraw(); }
+        }
     }
 
     // ---- 设计器 / 序列化模型 ----
