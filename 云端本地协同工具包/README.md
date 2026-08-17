@@ -15,6 +15,27 @@ export ZAN_MIRROR="$HOME/repos/zan-lang"          # 云端镜像根，可省略
 地址与令牌会轮换：取「本机文件桥接」笔记里的最新值。连不上（DNS/连接失败）=地址已换；
 403 且 `error code: 1010` = 被按 UA 拦截，脚本已自带浏览器 UA。
 
+## 1.5 一个命令行覆盖全部动作：`br.py`（推荐）
+
+`bridge_pull.py` / `bridge_push.py` 只管搬运；日常要看目录、搜代码、拉子树、写回、
+在本机跑构建，用 `br.py` 一个入口就够：
+
+```bash
+python3 br.py files src/compiler 1          # 看目录（别逐层爬）
+python3 br.py search "emit_oom_check" 30 c  # 带行号的内容搜索（正则）
+python3 br.py pull stdlib/System/IO/ByteBuffer.zan
+python3 br.py pullglob src/ide_zan "src/**/*.zan"
+python3 br.py push "一句话说清改了什么、验证到什么程度" src/compiler/irgen.c
+python3 br.py exec "cd /d d:\project\zan-lang && cmake --build build --config Release --target zanc" 3000000
+```
+
+它与两个最小脚本的差别，都是踩过的坑：
+
+- **按字节传输**（`encoding=base64`，push/pull 双向）。用文本方式读写会毁掉二进制：
+  交叉编译出来的 Linux ELF 拉回云端直接跑不起来，而现象只是「莫名其妙的段错误」；
+- **大文件分块**（单次 `/api/file` 读取有上限，超了被静默截断，看着像文件本身坏了）；
+- `push` 一次性带上 `handoff.summary`，写回与交接说明不会脱节。
+
 ## 2. 拉到云端（1:1 镜像，保持原相对路径与文件名）
 
 ```bash
@@ -47,6 +68,11 @@ curl -s -X POST "$ZAN_BRIDGE_BASE/api/terminal/exec" \
   -H "Authorization: Bearer $ZAN_BRIDGE_TOKEN" -H "Content-Type: application/json" \
   -A "Mozilla/5.0" -d '{"command":"git status --short"}'
 ```
+
+或 `python3 br.py exec "git status --short"`。注意本机侧是 **cmd.exe**：`head` / `grep` /
+`pkill` / `Select-Object` 这类都不存在（管道给 `Select-Object` 会报「不是内部或外部命令」）。
+要跑 PowerShell 脚本就写全 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test.ps1 smoke`；
+要截取输出就把全文取回云端再用本地工具过滤。
 
 ## 省 token 的用法
 
