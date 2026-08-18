@@ -255,6 +255,7 @@ class App {
     List<AnimSlot> anims;
     int nowMs;
     int lastFrameMs;
+    bool freezeAnimClock;
     // 可选帧分析器（ZAN_FRAME_PROF=1）：累计每帧的渲染和
     // 提交成本，每 120 帧追加一行平均值
     // 到进程目录下的 zan_frame_perf.log。0 = 尚未读取环境变量，
@@ -355,6 +356,8 @@ class App {
     // RequestRedraw，这样事件循环在帧间休眠，并以低频
     // 重绘它们，而不是以 60fps 忙碌地渲染整个页面。
     int animNextMs;
+    int wakeNextMs;
+    int wakeFrameNextMs;
     // 本帧登记的动画所声明的像素范围（并集）。animRectAll 表示
     // 至少有一个动画没有声明范围，于是由动画唤醒的下一帧仍整窗重绘。
     bool animRectValid;
@@ -540,6 +543,7 @@ class App {
         this.anims = new List<AnimSlot>();
         this.nowMs = Window.GetTickMs();
         this.lastFrameMs = this.nowMs;
+        this.freezeAnimClock = false;
         this.perfFrames = 0;
         this.perfRenderMs = 0;
         this.perfPresentMs = 0;
@@ -597,6 +601,8 @@ class App {
         this.lastInX = -1;
         this.lastInY = -1;
         this.animNextMs = -1;
+        this.wakeNextMs = -1;
+        this.wakeFrameNextMs = -1;
         this.animRectValid = false;
         this.animRectAll = false;
         this.animRW = 0;
@@ -1706,6 +1712,9 @@ class App {
     /// 标签页、勾选复选框一类的控件用它取代 RequestRedraw；
     /// 同一帧里任何 RequestRedraw 都会让下一帧回到整窗重绘。
     void NoteDamage(int x, int y, int w, int h) {
+        if (Interop.EnvVar("ZAN_FORCE_FULL_DAMAGE") == "1") {
+            partialBlocked = true;
+        }
         needsRedraw = true;
         if (partialBlocked || this.HasOverlays()) {
             if (partialBlocked) { this.NoteRedrawWhy("dmg-blocked"); }
@@ -2228,7 +2237,7 @@ class App {
         // 下一帧整窗重绘（NoteDamage 是声明了范围的那一个）。
         if (App.PerfOn()) {
             string why = markNow;
-            if (why == "") { why = "ev"; }
+            if (why == "") { why = "ev@" + Convert.ToString(scopeId); }
             this.NoteRedrawWhy(why);
         }
         partialBlocked = true;
@@ -2252,6 +2261,22 @@ class App {
         if (animNextMs < 0 || due < animNextMs) { animNextMs = due; }
         // 没有声明范围：下一次动画帧只能整窗重绘。
         animRectAll = true;
+    }
+
+    void RequestWakeIn(int minIntervalMs) {
+        int due = Window.GetTickMs() + minIntervalMs;
+        if (wakeNextMs < 0 || due < wakeNextMs) { wakeNextMs = due; }
+    }
+
+    void RequestWakeAt(int dueMs) {
+        if (wakeNextMs < 0 || dueMs < wakeNextMs) { wakeNextMs = dueMs; }
+    }
+
+    void RequestWakeFrameIn(int minIntervalMs) {
+        int due = Window.GetTickMs() + minIntervalMs;
+        if (wakeFrameNextMs < 0 || due < wakeFrameNextMs) {
+            wakeFrameNextMs = due;
+        }
     }
 
     /// 与 RequestAnimationFrame 相同，但同时声明这个动画只会
@@ -2311,6 +2336,7 @@ class App {
     /// 另外 slot 本帧刚换手时必须重算：里面是上一位主人的像素。
     bool BackdropDirtyIn(int slot, int x, int y, int w, int h) {
         if (slot < 0) { return true; }
+        if (freezeAnimClock) { return true; }
         if (slot < blurSlotNew.Count && blurSlotNew[slot] == frameCount) {
             return true;
         }
@@ -2479,7 +2505,7 @@ class App {
     /// 不再用 Ease 包裹）。进度为 (now - start)/duration，因此运动
     /// 与帧率或定时器精度无关，保持平滑。中途重新设目标时
     /// tween 从当前值重新开始；首次出现时直接跳变。
-    int AnimTo(int key, int target, int durMs) {
+    int AnimToValue(int key, int target, int durMs) {
         int idx = AnimIndex(key);
         if (idx < 0) {
             AnimAdd(key, target, target, durMs);
@@ -2504,9 +2530,32 @@ class App {
         int e = App.Ease(p);
         int val = from + (tgt - from) * e / 1000;
         a.cur = val;
-        if (p < 1000) { this.NoteRedrawWhy("anim"); needsRedraw = true; }
-        else { a.cur = tgt; }
+        if (p >= 1000) { a.cur = tgt; }
         return a.cur;
+    }
+
+    bool AnimActive(int key) {
+        int idx = AnimIndex(key);
+        if (idx < 0) { return false; }
+        return anims[idx].cur != anims[idx].dst;
+    }
+
+    int AnimTo(int key, int target, int durMs) {
+        int value = this.AnimToValue(key, target, durMs);
+        if (this.AnimActive(key)) {
+            this.NoteRedrawWhy("anim");
+            needsRedraw = true;
+        }
+        return value;
+    }
+
+    int AnimToIn(int key, int target, int durMs,
+                 int x, int y, int w, int h) {
+        int value = this.AnimToValue(key, target, durMs);
+        if (this.AnimActive(key)) {
+            this.RequestAnimationFrameIn(0, x, y, w, h);
+        }
+        return value;
     }
 
     /// 一次性入场 tween：首次出现时在 `durMs` 内将每个 key 的值从 0 缓动到 1000，
@@ -2515,12 +2564,10 @@ class App {
     /// 因此图表、柱状图或卡片首次绘制时可以从基线向上生长。
     /// 持续请求重绘直至稳定。返回缓动后的
     /// 0..1000 进度。
-    int AnimIntro(int key, int durMs) {
+    int AnimIntroValue(int key, int durMs) {
         int idx = AnimIndex(key);
         if (idx < 0) {
             anims.Add(new AnimSlot(key, 0, 1000, 0, nowMs, durMs));
-            this.NoteRedrawWhy("AnimIntro");
-            needsRedraw = true;
             return 0;
         }
         AnimSlot a = anims[idx];
@@ -2536,22 +2583,39 @@ class App {
         int e = App.Ease(p);
         int val = from + (tgt - from) * e / 1000;
         a.cur = val;
-        if (p < 1000) { this.NoteRedrawWhy("anim-intro"); needsRedraw = true; }
-        else { a.cur = tgt; }
+        if (p >= 1000) { a.cur = tgt; }
         return a.cur;
+    }
+
+    int AnimIntro(int key, int durMs) {
+        int value = this.AnimIntroValue(key, durMs);
+        if (this.AnimActive(key)) {
+            this.NoteRedrawWhy("anim-intro");
+            needsRedraw = true;
+        }
+        return value;
+    }
+
+    int AnimIntroIn(int key, int durMs, int x, int y, int w, int h) {
+        int value = this.AnimIntroValue(key, durMs);
+        if (this.AnimActive(key)) {
+            this.RequestAnimationFrameIn(0, x, y, w, h);
+        }
+        return value;
     }
 
     /// 使用指数平滑将每个 key 的值在任意（像素）空间向 `target` 缓动，
     /// 因此适用于任意范围（不像 AnimTo 那样固定
     /// 0..1000）。`tauMs` 是平滑时间常数（越大越慢）。用于
     /// 例如标签页下划线在不同宽度的标签之间滑动。
-    int AnimPx(int key, int target, int tauMs) {
+    int AnimPxValue(int key, int target, int tauMs) {
         int idx = AnimIndex(key);
         if (idx < 0) {
             AnimAdd(key, target, target, tauMs);
             return target;
         }
         AnimSlot a = anims[idx];
+        a.dst = target;
         int cur = a.cur;
         if (cur == target) { return cur; }
         int dt = nowMs - lastFrameMs;
@@ -2567,8 +2631,25 @@ class App {
         if (delta > 0 && next > target) { next = target; }
         if (delta < 0 && next < target) { next = target; }
         a.cur = next;
-        if (next != target) { this.NoteRedrawWhy("anim-step"); needsRedraw = true; }
         return next;
+    }
+
+    int AnimPx(int key, int target, int tauMs) {
+        int value = this.AnimPxValue(key, target, tauMs);
+        if (this.AnimActive(key)) {
+            this.NoteRedrawWhy("anim-step");
+            needsRedraw = true;
+        }
+        return value;
+    }
+
+    int AnimPxIn(int key, int target, int tauMs,
+                 int x, int y, int w, int h) {
+        int value = this.AnimPxValue(key, target, tauMs);
+        if (this.AnimActive(key)) {
+            this.RequestAnimationFrameIn(0, x, y, w, h);
+        }
+        return value;
     }
 
     /// 用 Smoothstep（3t^2 - 2t^3）对千分值做加减速缓动。
@@ -2715,10 +2796,30 @@ class App {
         needsRedraw = true;
     }
 
+    void FreezeAnimClock(int fixedMs) {
+        Window.FreezeTick(fixedMs);
+        nowMs = Window.GetTickMs();
+        freezeAnimClock = true;
+        lastFrameMs = nowMs;
+        lastPresentMs = nowMs;
+        animNextMs = -1;
+        wakeNextMs = -1;
+        wakeFrameNextMs = -1;
+        fxNextMs = -1;
+    }
+
+    void UnfreezeAnimClock() {
+        Window.UnfreezeTick();
+        freezeAnimClock = false;
+        nowMs = Window.GetTickMs();
+        lastFrameMs = nowMs;
+    }
+
     bool ProcessEvent() {
         // 推进活动的自动化脚本（注入合成事件，
         // 由同一循环随后轮询并分发）。未启用驱动时为空操作。
         UiDriver.Tick();
+        this.PerfMark("sh.evdriver");
         // 如果重绘已挂起（例如点击处理程序在帧中修改了状态），
         // 不要阻塞等待下一个 OS 事件——改为轮询，
         // 让新状态立即绘制。否则阻塞直到事件到达。
@@ -2738,7 +2839,8 @@ class App {
             int since = Window.GetTickMs() - lastPresentMs;
             if (lastPresentMs > 0 && since < 16) { Window.SleepMs(16 - since); }
             result = window.PollEvent();
-        } else if (animNextMs >= 0 || fxNextMs >= 0) {
+        } else if (animNextMs >= 0 || wakeNextMs >= 0
+                   || wakeFrameNextMs >= 0 || fxNextMs >= 0) {
             loopPath = 1;
             // 节流的动画（spinner 在 animNextMs）和/或皮肤
             // 特效层（fxNextMs）需要未来的帧。休眠（空闲）直到
@@ -2751,6 +2853,13 @@ class App {
             while (waiting) {
                 int now = Window.GetTickMs();
                 int deadline = animNextMs;
+                if (deadline < 0 || (wakeNextMs >= 0 && wakeNextMs < deadline)) {
+                    deadline = wakeNextMs;
+                }
+                if (deadline < 0
+                    || (wakeFrameNextMs >= 0 && wakeFrameNextMs < deadline)) {
+                    deadline = wakeFrameNextMs;
+                }
                 if (deadline < 0 || (fxNextMs >= 0 && fxNextMs < deadline)) {
                     deadline = fxNextMs;
                 }
@@ -2759,6 +2868,20 @@ class App {
                     bool fxOnly = animNextMs < 0 || now < animNextMs;
                     if (fxOnly && this.FxPresent()) {
                         // 已就地呈现；继续等待下一个 tick。
+                    } else if ((animNextMs < 0 || now < animNextMs)
+                               && wakeFrameNextMs >= 0
+                               && now >= wakeFrameNextMs) {
+                        wakeFrameNextMs = -1;
+                        if (wakeNextMs >= 0 && now >= wakeNextMs) {
+                            wakeNextMs = -1;
+                        }
+                        this.NoteRedrawWhy("wake");
+                        needsRedraw = true;
+                        waiting = false;
+                    } else if ((animNextMs < 0 || now < animNextMs)
+                               && wakeNextMs >= 0 && now >= wakeNextMs) {
+                        wakeNextMs = -1;
+                        waiting = false;
                     } else {
                         this.NoteRedrawWhy("ProcessEvent");
                         needsRedraw = true;
@@ -2794,6 +2917,7 @@ class App {
         // 在 UI 线程上运行从后台线程调度来的工作。
         // Wake() 仅投递一个空事件（kind 0）来触发此逻辑。
         DrainPosts();
+        this.PerfMark("sh.posts");
 
         int kind = window.EventKind();
 
@@ -2836,6 +2960,7 @@ class App {
         // 这保证 Present() 1:1 拷贝（绝不拉伸/模糊），且布局
         // 和命中测试与鼠标使用相同的坐标系。
         this.SyncSurface();
+        this.PerfMark("sh.surface");
 
         if (kind == 1) {
             mouseX = window.EventX();
@@ -3008,6 +3133,7 @@ class App {
             fxNextMs = Window.GetTickMs();
         }
 
+        this.PerfMark("sh.eventend");
         return true;
     }
 
@@ -3286,6 +3412,7 @@ class App {
             window.PresentDirty(dmgX, dmgY, dmgW, dmgH);
         }
         window.Present(canvas);
+        UiDriver.NotifyPresented(this);
         if (App.PerfOn()) {
             int endMs = Window.GetTickMs();
             int wholeMs = endMs - perfBeginMs;
@@ -3667,8 +3794,12 @@ class App {
         this.SyncSkin();
         // 推进动画时钟。AnimTo() 以 (nowMs - lastFrameMs) 作为
         // 流逝步长，缓动按真实时钟速率运行，与帧率无关。
-        lastFrameMs = nowMs;
-        nowMs = Window.GetTickMs();
+        if (freezeAnimClock) {
+            lastFrameMs = nowMs;
+        } else {
+            lastFrameMs = nowMs;
+            nowMs = Window.GetTickMs();
+        }
         // 帧开始时清除重绘标志；本帧内调用的处理程序
         // 可再次设置它，请求立即的后续重绘。
         if (App.PerfOn()) {
@@ -3691,6 +3822,8 @@ class App {
         // 同样清除节流动画的截止时间；仍在运行的动画
         // （spinner 等）会在渲染期间通过 RequestAnimationFrame 重新武装。
         animNextMs = -1;
+        wakeNextMs = -1;
+        wakeFrameNextMs = -1;
         animRectValid = false;
         animRectAll = false;
         // 本帧正在重新渲染，槽位 7 的 fx 快照已过期。
@@ -4006,7 +4139,7 @@ class App {
             RequestRedraw();
             return true;
         }
-        RequestAnimationFrame(80);
+        RequestWakeFrameIn(80);
         return false;
     }
 }

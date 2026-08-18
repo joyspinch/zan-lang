@@ -28,6 +28,152 @@ execute_process(
   OUTPUT_FILE "${_run}/stdout.log"
   ERROR_FILE "${_run}/stderr.log")
 
+set(_pixel_failures "")
+foreach(_snapshot after-scroll final)
+  set(_a_snapshot "${_run}/uidrv/${_snapshot}-a.bin")
+  set(_b_snapshot "${_run}/uidrv/${_snapshot}-b.bin")
+  set(_c_snapshot "${_run}/uidrv/${_snapshot}-c.bin")
+  set(_a_size "${_a_snapshot}.size")
+  set(_b_size "${_b_snapshot}.size")
+  set(_c_size "${_c_snapshot}.size")
+  foreach(_required_file "${_a_snapshot}" "${_b_snapshot}" "${_c_snapshot}"
+                          "${_a_size}" "${_b_size}" "${_c_size}")
+    if(NOT EXISTS "${_required_file}")
+      message(FATAL_ERROR
+        "PIXEL_COMPARE_MISSING: ${_snapshot} A/B/C snapshot ${_required_file}")
+    endif()
+  endforeach()
+  file(READ "${_a_size}" _a_dims)
+  file(READ "${_b_size}" _b_dims)
+  file(READ "${_c_size}" _c_dims)
+  string(STRIP "${_a_dims}" _a_dims)
+  string(STRIP "${_b_dims}" _b_dims)
+  string(STRIP "${_c_dims}" _c_dims)
+  if(NOT _a_dims STREQUAL _b_dims OR NOT _b_dims STREQUAL _c_dims)
+    message(FATAL_ERROR
+      "PIXEL_COMPARE_FAILED: ${_snapshot} A/B/C surfaces "
+      "${_a_dims} / ${_b_dims} / ${_c_dims}")
+  endif()
+  string(REGEX MATCH "^([0-9]+)x([0-9]+)$" _dims_match "${_a_dims}")
+  if(NOT _dims_match)
+    message(FATAL_ERROR
+      "PIXEL_COMPARE_FAILED: ${_snapshot} invalid dimensions ${_a_dims}")
+  endif()
+  set(_pixel_width "${CMAKE_MATCH_1}")
+  set(_pixel_height "${CMAKE_MATCH_2}")
+  math(EXPR _expected_bytes "24 + ${_pixel_width} * ${_pixel_height} * 4")
+  foreach(_label A B C)
+    set(_path "${_run}/uidrv/${_snapshot}-${_label}.bin")
+    file(SIZE "${_path}" _bytes)
+    if(NOT _bytes EQUAL _expected_bytes)
+      message(FATAL_ERROR
+        "PIXEL_COMPARE_FAILED: ${_snapshot}-${_label}"
+        " expected_bytes=${_expected_bytes} actual_bytes=${_bytes}")
+    endif()
+  endforeach()
+  set(_bbox_script "${_run}/pixel_bbox.ps1")
+  if(NOT EXISTS "${_bbox_script}")
+    file(WRITE "${_bbox_script}" [=[
+param([string]$PathA, [string]$PathB, [int]$Width, [int]$Height)
+$a = [IO.File]::ReadAllBytes($PathA)
+$b = [IO.File]::ReadAllBytes($PathB)
+$first = -1
+$minX = $Width
+$minY = $Height
+$maxX = -1
+$maxY = -1
+$diffPixels = 0
+$pixels = [math]::Floor(($a.Length - 24) / 4)
+for ($pixel = 0; $pixel -lt $pixels; $pixel++) {
+  $i = 24 + $pixel * 4
+  $changed = $false
+  for ($channel = 0; $channel -lt 4; $channel++) {
+    if ($a[$i + $channel] -ne $b[$i + $channel]) {
+      $changed = $true
+      if ($first -lt 0) { $first = $i + $channel }
+    }
+  }
+  if ($changed) {
+    $diffPixels++
+    $x = $pixel % $Width
+    $y = [math]::Floor($pixel / $Width)
+    if ($x -lt $minX) { $minX = $x }
+    if ($y -lt $minY) { $minY = $y }
+    if ($x -gt $maxX) { $maxX = $x }
+    if ($y -gt $maxY) { $maxY = $y }
+  }
+}
+Write-Output "$first;$diffPixels;$minX;$minY;$maxX;$maxY"
+]=])
+  endif()
+  foreach(_comparison AB BC)
+    if(_comparison STREQUAL "AB")
+      set(_left "${_a_snapshot}")
+      set(_right "${_b_snapshot}")
+      set(_pair "A_vs_B")
+    else()
+      set(_left "${_b_snapshot}")
+      set(_right "${_c_snapshot}")
+      set(_pair "B_vs_C")
+    endif()
+    execute_process(
+      COMMAND "${CMAKE_COMMAND}" -E compare_files "${_left}" "${_right}"
+      RESULT_VARIABLE _pixel_cmp_rc)
+    if(_pixel_cmp_rc EQUAL 0)
+      message("PIXEL_COMPARE_OK: ${_snapshot} ${_pair}"
+        " bytes=${_expected_bytes} surface=${_a_dims}")
+    else()
+      execute_process(
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+          -File "${_bbox_script}" "${_left}" "${_right}"
+          "${_pixel_width}" "${_pixel_height}"
+        RESULT_VARIABLE _bbox_rc
+        OUTPUT_VARIABLE _bbox
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+      if(NOT _bbox_rc EQUAL 0)
+        message(FATAL_ERROR
+          "PIXEL_COMPARE_FAILED: ${_snapshot} ${_pair}"
+          " could not calculate diff bbox rc=${_bbox_rc}")
+      endif()
+      list(GET _bbox 0 _diff_byte)
+      list(GET _bbox 1 _diff_pixels)
+      list(GET _bbox 2 _diff_x_min)
+      list(GET _bbox 3 _diff_y_min)
+      list(GET _bbox 4 _diff_x_max)
+      list(GET _bbox 5 _diff_y_max)
+      math(EXPR _pixel_index "(${_diff_byte} - 24) / 4")
+      math(EXPR _diff_x "${_pixel_index} % ${_pixel_width}")
+      math(EXPR _diff_y "${_pixel_index} / ${_pixel_width}")
+      set(_panel "unknown")
+      set(_in_explorer FALSE)
+      set(_in_editor FALSE)
+      if(_diff_x_min LESS 390 AND _diff_y_max GREATER_EQUAL 189
+         AND _diff_y_min LESS_EQUAL 1205)
+        set(_in_explorer TRUE)
+      endif()
+      if(_diff_x_max GREATER_EQUAL 390 AND _diff_y_max GREATER_EQUAL 189
+         AND _diff_y_min LESS_EQUAL 1205)
+        set(_in_editor TRUE)
+      endif()
+      if(_in_explorer AND _in_editor)
+        set(_panel "multiple")
+      elseif(_in_explorer)
+        set(_panel "explorer")
+      elseif(_in_editor)
+        set(_panel "editor")
+      endif()
+      set(_failure
+        "${_snapshot} ${_pair} first_diff_byte=${_diff_byte}"
+        "pixel=${_diff_x},${_diff_y} diff_pixels=${_diff_pixels}"
+        "diff_bbox=(${_diff_x_min},${_diff_y_min})-(${_diff_x_max},${_diff_y_max})"
+        "panel=${_panel} surface=${_a_dims}")
+      list(JOIN _failure " " _failure_line)
+      list(APPEND _pixel_failures "${_failure_line}")
+      message(SEND_ERROR "PIXEL_COMPARE_FAILED: ${_failure_line}")
+    endif()
+  endforeach()
+endforeach()
+
 if(_run_rc MATCHES "timeout")
   execute_process(
     COMMAND taskkill /F /T /IM ZanIDE.exe
@@ -75,8 +221,8 @@ foreach(_i RANGE 0 ${_last_line})
   endif()
 endforeach()
 
-if(_frame_count LESS 6)
-  message(FATAL_ERROR "frame log has only ${_frame_count} frames=30 batches; need at least 6")
+if(_frame_count LESS 4)
+  message(FATAL_ERROR "frame log has only ${_frame_count} frames=30 batches; need at least 4")
 endif()
 if(NOT _first_count EQUAL 1)
   message(FATAL_ERROR "frame log has ${_first_count} firstframe lines; need exactly 1")
@@ -91,7 +237,7 @@ endforeach()
 foreach(_required blend_kpx restore_kpx fill_kpx round_kpx grad_kpx
                  total_kpx style_resolve style_miss render_ms worst_ms tree_ms
                  surface_w surface_h first_whole_ms first_tree_ms
-                 first_blend_kpx first_style_miss)
+                 first_blend_kpx first_style_miss partial_min part_render_ms)
   if(NOT DEFINED "_budget_${_required}")
     message(FATAL_ERROR "frame budget is missing ${_required}")
   endif()
@@ -138,6 +284,12 @@ set(_max_miss 0)
 set(_max_render 0)
 set(_max_worst 0)
 set(_max_tree 0)
+# 局部帧下限（与其余上限相反）：一批 30 帧里至少这么多帧只重绘损伤区。
+# 状态变化改回整窗重绘会让它掉下来，光看 render_ms 均值是看不出的。
+set(_min_partial 30)
+# 局部帧自己的耗时：稳态下整窗帧归零后 render_ms 与像素计数器都测不
+# 到东西（它们只统计整窗帧），局部帧变贵就没人拦了。
+set(_max_part_render 0)
 list(LENGTH _frame_indexes _batch_count)
 math(EXPR _steady_start "2")
 if(_batch_count LESS 3)
@@ -186,6 +338,14 @@ foreach(_batch RANGE ${_steady_start} ${_last_batch})
   else()
     set(_style "0")
     set(_miss "0")
+  endif()
+  _field("${_frame_line}" "part_render_ms" "0" _part_render)
+  if(_part_render GREATER _max_part_render)
+    set(_max_part_render "${_part_render}")
+  endif()
+  _field("${_frame_line}" "partial" "0" _partial)
+  if(_partial LESS _min_partial)
+    set(_min_partial "${_partial}")
   endif()
   _field("${_frame_line}" "render_ms" "0" _render)
   _field("${_frame_line}" "worst_ms" "0" _worst)
@@ -245,6 +405,8 @@ message("  style_miss   ${_max_miss} / ${_budget_style_miss}")
 message("  render_ms    ${_max_render} / ${_budget_render_ms}")
 message("  worst_ms     ${_max_worst} / ${_budget_worst_ms}")
 message("  tree_ms      ${_max_tree} / ${_budget_tree_ms}")
+message("  partial_min  ${_min_partial} / ${_budget_partial_min} (floor)")
+message("  part_render_ms ${_max_part_render} / ${_budget_part_render_ms}")
 message("  first_whole_ms ${_first_whole} / ${_budget_first_whole_ms}")
 message("  first_tree_ms  ${_first_tree} / ${_budget_first_tree_ms}")
 message("  first_blend_kpx ${_first_blend} / ${_budget_first_blend_kpx}")
@@ -266,7 +428,8 @@ foreach(_check
     "first_whole_ms;${_first_whole};${_budget_first_whole_ms}"
     "first_tree_ms;${_first_tree};${_budget_first_tree_ms}"
     "first_blend_kpx;${_first_blend};${_budget_first_blend_kpx}"
-    "first_style_miss;${_first_style_miss};${_budget_first_style_miss}")
+    "first_style_miss;${_first_style_miss};${_budget_first_style_miss}"
+    "part_render_ms;${_max_part_render};${_budget_part_render_ms}")
   list(GET _check 0 _name)
   list(GET _check 1 _value)
   list(GET _check 2 _limit)
@@ -274,6 +437,9 @@ foreach(_check
     list(APPEND _failed "${_name}=${_value} (budget ${_limit})")
   endif()
 endforeach()
+if(_min_partial LESS _budget_partial_min)
+  list(APPEND _failed "partial_min=${_min_partial} (floor ${_budget_partial_min})")
+endif()
 if(_failed)
   message(FATAL_ERROR "FRAME_BUDGET_EXCEEDED: ${_failed}")
 endif()

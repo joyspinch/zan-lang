@@ -362,6 +362,43 @@ EXPORT i32 zan_gui_surface_height(i32 id) {
     return g_surfaces[id]->height;
 }
 
+/* Write a self-describing raw ARGB snapshot without passing the pixel buffer
+ * through the managed string ABI. The 24-byte header is:
+ *   "ZPX1", x, y, width, height, bytes_per_pixel
+ * followed by tightly packed rows in native ARGB32 order. */
+EXPORT i32 zan_gui_write_pixels(i32 surface_id, const char *path,
+                                i32 x, i32 y, i32 width, i32 height) {
+    if (surface_id < 0 || surface_id >= g_surface_count
+        || !g_surfaces[surface_id] || !path || path[0] == '\0') return -1;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (x < 0 || y < 0 || width <= 0 || height <= 0
+        || x > s->width - width || y > s->height - height) return -1;
+    size_t pixel_bytes = (size_t)width * (size_t)height * sizeof(u32);
+    size_t expected = 4 + 5 * sizeof(uint32_t) + pixel_bytes;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return -2;
+    const char magic[4] = { 'Z', 'P', 'X', '1' };
+    uint32_t meta[5];
+    meta[0] = (uint32_t)x;
+    meta[1] = (uint32_t)y;
+    meta[2] = (uint32_t)width;
+    meta[3] = (uint32_t)height;
+    meta[4] = (uint32_t)sizeof(u32);
+    size_t written = 0;
+    written += fwrite(magic, 1, sizeof(magic), fp);
+    written += fwrite(meta, sizeof(uint32_t), 5, fp) * sizeof(uint32_t);
+    if (written != 4 + 5 * sizeof(uint32_t)) {
+        fclose(fp);
+        return -3;
+    }
+    for (int row = 0; row < height; row++) {
+        written += fwrite(s->pixels + (size_t)(y + row) * (size_t)s->stride + x,
+                          sizeof(u32), (size_t)width, fp) * sizeof(u32);
+    }
+    if (fclose(fp) != 0 || written != expected) return -4;
+    return (i32)written;
+}
+
 /* Internal (not part of the [DllImport] ABI): expose a surface's raw ARGB
  * buffer to a native platform backend compiled as a separate TU (e.g. the
  * macOS Cocoa .m file), which cannot see the static g_surfaces table. */

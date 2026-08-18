@@ -132,6 +132,9 @@ class ThemeDoc {
 ///   dump hitregions &lt;file&gt; — 将所有注册的命中区域写入为 JSON
 ///   dump theme &lt;file&gt; — 将当前皮肤的样式 token 写入为 JSON
 ///   dump tree &lt;file&gt; — 将保留模式控件树写入为 JSON
+///   dump pixels &lt;file&gt; [x y w h] — 将客户区或指定矩形的原始像素写入文件
+///   redraw full — 强制下一帧整窗重绘，并等待该帧呈现
+///   freeze clock / unfreeze clock — 冻结或恢复测试专用动画时钟
 ///   dump probe &lt;name&gt; &lt;file&gt; — 写入指定 probe 的当前值
 ///   assert probe &lt;name&gt; contains &lt;text&gt; — 对照 probe 值记录 PASS/FAIL
 ///   assert probe &lt;name&gt; equals &lt;text&gt;
@@ -151,7 +154,8 @@ class UiDriver {
     static Control root;
     static List<string> cmds;
     static int pc;
-    static int waitUntil;          // 绝对毫秒；0 = 无挂起等待
+    static int waitUntilUs;        // 绝对微秒；0 = 无挂起等待
+    static bool waitFullPresent;
     static string outDir;
     static string resultsPath;
     static int passCount;
@@ -181,7 +185,8 @@ class UiDriver {
         List<string> raw = body.Replace("\r", "").Split("\n");
         for (int i = 0; i < raw.Count; i = i + 1) { cmds.Add(raw[i]); }
         pc = 0;
-        waitUntil = 0;
+        waitUntilUs = 0;
+        waitFullPresent = false;
         passCount = 0;
         failCount = 0;
         probeNames = new List<string>();
@@ -197,6 +202,11 @@ class UiDriver {
     /// 宿主钩子：登记保留模式的根，供 `dump tree`（Form.Run 调用）。
     static void SetRoot(Control c) {
         root = c;
+    }
+
+    /// 宿主钩子：释放 `redraw full` 在下一次脚本命令前的呈现屏障。
+    static void NotifyPresented(App owner) {
+        if (app == owner && waitFullPresent) { waitFullPresent = false; }
     }
 
     static string Env(string name) {
@@ -228,6 +238,13 @@ class UiDriver {
     /// 让出，使每批完全消费并渲染后再进行下一批。
     static void Tick() {
         if (!active || finished) { return; }
+        // `redraw full` hands control back to the host. The host clears this
+        // gate from PresentFrame, so the next script command cannot observe
+        // the pre-redraw surface.
+        if (waitFullPresent) {
+            app.pollPending = true;
+            return;
+        }
         // 脚本运行期间保持宿主循环轮询（而非阻塞），使注入的事件
         // 被刷出、基于时间的等待得以推进。只要求循环别睡着，不要求
         // 重绘：把它写成 needsRedraw 会让被驱动的每一帧都变成整窗
@@ -235,10 +252,10 @@ class UiDriver {
         app.pollPending = true;
         // 先让之前注入的批次排空（并完成渲染）。
         if (Window.InjectPending() > 0) { return; }
-        int now = Window.GetTickMs();
-        if (waitUntil > 0) {
-            if (now < waitUntil) { return; }
-            waitUntil = 0;
+        int nowUs = Window.GetTickUs();
+        if (waitUntilUs > 0) {
+            if (nowUs - waitUntilUs < 0) { return; }
+            waitUntilUs = 0;
         }
         while (pc < cmds.Count) {
             string line = cmds[pc];
@@ -260,9 +277,39 @@ class UiDriver {
 
         if (cmd == "wait") {
             int ms = UiDriver.ArgI(t, 1, 0);
-            waitUntil = Window.GetTickMs() + ms;
+            waitUntilUs = Window.GetTickUs() + ms * 1000;
             UiDriver.Note("wait " + Convert.ToString(ms));
             return true;
+        }
+        if (cmd == "redraw") {
+            if (t.Count != 2 || t[1] != "full") {
+                UiDriver.Note("redraw: expected full");
+                return false;
+            }
+            app.RequestRedraw();
+            waitFullPresent = true;
+            UiDriver.Note("redraw full");
+            return true;
+        }
+        if (cmd == "freeze") {
+            if (t.Count < 2 || t.Count > 3 || t[1] != "clock") {
+                UiDriver.Note("freeze: expected clock [tickMs]");
+                return false;
+            }
+            int fixedMs = 600000;
+            if (t.Count == 3) { fixedMs = UiDriver.ArgI(t, 2, fixedMs); }
+            app.FreezeAnimClock(fixedMs);
+            UiDriver.Note("freeze clock " + Convert.ToString(fixedMs));
+            return false;
+        }
+        if (cmd == "unfreeze") {
+            if (t.Count != 2 || t[1] != "clock") {
+                UiDriver.Note("unfreeze: expected clock");
+                return false;
+            }
+            app.UnfreezeAnimClock();
+            UiDriver.Note("unfreeze clock");
+            return false;
         }
         if (cmd == "move") {
             UiDriver.Inject(1, UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0), 0, 0, 0);
@@ -399,6 +446,38 @@ class UiDriver {
             string file = t[2];
             File.WriteAllText(UiDriver.OutPath(file), UiDriver.ThemeJson());
             UiDriver.Note("dump theme -> " + file);
+            return;
+        }
+        if (what == "pixels") {
+            string file = t[2];
+            string path = UiDriver.OutPath(file);
+            int x = 0;
+            int y = app.titlebarH;
+            int w = app.canvas.Width();
+            int h = app.canvas.Height() - y;
+            if (t.Count == 7) {
+                x = UiDriver.ArgI(t, 3, 0);
+                y = UiDriver.ArgI(t, 4, 0);
+                w = UiDriver.ArgI(t, 5, 0);
+                h = UiDriver.ArgI(t, 6, 0);
+            } else if (t.Count != 3) {
+                UiDriver.Note("dump pixels: expected file or file x y w h");
+                return;
+            }
+            int bytes = app.canvas.WritePixels(path, x, y, w, h);
+            int expected = 24 + w * h * 4;
+            if (bytes < 0 || bytes != expected) {
+                UiDriver.Note("dump pixels FAILED -> " + file
+                    + " rc=" + Convert.ToString(bytes)
+                    + " expected=" + Convert.ToString(expected));
+                return;
+            }
+            File.WriteAllText(path + ".size",
+                Convert.ToString(w) + "x" + Convert.ToString(h));
+            UiDriver.Note("dump pixels -> " + file + " ("
+                + Convert.ToString(w) + "x" + Convert.ToString(h)
+                + " at " + Convert.ToString(x) + ","
+                + Convert.ToString(y) + ")");
             return;
         }
         if (what == "probe") {
