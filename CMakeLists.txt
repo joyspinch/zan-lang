@@ -1415,6 +1415,13 @@ add_test(NAME policy_theme_color_budget
   COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
     -P ${CMAKE_SOURCE_DIR}/tests/run_theme_color_budget.cmake)
 
+# ---- Policy: widget draw paths must not gain direct Theme font-size reads ----
+add_test(NAME gui_theme_font_budget
+  COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_theme_font_budget.cmake)
+set_tests_properties(gui_theme_font_budget PROPERTIES
+  LABELS "full;standard;smoke;gui;perf")
+
 # ---- Performance: retained-mode IDE frame budget ----
 # Requires the separately-built ZanIDE executable and a desktop session.
 if(WIN32 AND EXISTS "${CMAKE_BINARY_DIR}/ZanIDE.exe")

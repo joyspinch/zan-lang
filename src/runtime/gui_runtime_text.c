@@ -17,6 +17,74 @@
 static HDC g_text_dc = NULL;
 static HFONT g_fonts[16]; /* cached fonts by size index */
 static int g_font_count = 0;
+static int g_text_stats_enabled = 0;
+static uint64_t g_text_draw_calls = 0;
+static uint64_t g_text_measure_calls = 0;
+static uint64_t g_text_height_calls = 0;
+static uint64_t g_text_font_creates = 0;
+static uint64_t g_text_font_hits = 0;
+static uint64_t g_text_draw_cache_hits = 0;
+static uint64_t g_text_draw_cache_misses = 0;
+static uint64_t g_text_measure_cache_hits = 0;
+static uint64_t g_text_measure_cache_misses = 0;
+static uint64_t g_text_draw_us = 0;
+static uint64_t g_text_measure_us = 0;
+static uint64_t g_text_height_us = 0;
+static uint64_t g_text_size_calls[64];
+static LARGE_INTEGER g_text_qpc0;
+static LARGE_INTEGER g_text_qpc_freq;
+
+static uint64_t text_qpc_us(void) {
+    LARGE_INTEGER now;
+    if (!g_text_qpc_freq.QuadPart) {
+        QueryPerformanceFrequency(&g_text_qpc_freq);
+    }
+    QueryPerformanceCounter(&now);
+    if (!g_text_qpc0.QuadPart) { g_text_qpc0 = now; }
+    return (uint64_t)((now.QuadPart - g_text_qpc0.QuadPart) * 1000000
+                      / g_text_qpc_freq.QuadPart);
+}
+
+EXPORT void zan_gui_text_stat_enable(i32 enabled) {
+    if (enabled && !g_text_stats_enabled) {
+        g_text_draw_calls = 0;
+        g_text_measure_calls = 0;
+        g_text_height_calls = 0;
+        g_text_font_creates = 0;
+        g_text_font_hits = 0;
+        g_text_draw_cache_hits = 0;
+        g_text_draw_cache_misses = 0;
+        g_text_measure_cache_hits = 0;
+        g_text_measure_cache_misses = 0;
+        g_text_draw_us = 0;
+        g_text_measure_us = 0;
+        g_text_height_us = 0;
+        memset(g_text_size_calls, 0, sizeof(g_text_size_calls));
+    }
+    g_text_stats_enabled = enabled ? 1 : 0;
+}
+
+EXPORT i64 zan_gui_text_stat_read(i32 idx) {
+    switch (idx) {
+        case 0: return (i64)g_text_draw_calls;
+        case 1: return (i64)g_text_measure_calls;
+        case 2: return (i64)g_text_height_calls;
+        case 3: return (i64)g_text_font_creates;
+        case 4: return (i64)g_text_font_hits;
+        case 5: return (i64)g_text_draw_cache_hits;
+        case 6: return (i64)g_text_draw_cache_misses;
+        case 7: return (i64)g_text_measure_cache_hits;
+        case 8: return (i64)g_text_measure_cache_misses;
+        case 9: return (i64)g_text_draw_us;
+        case 10: return (i64)g_text_measure_us;
+        case 11: return (i64)g_text_height_us;
+        default:
+            if (idx >= 12 && idx < 76) {
+                return (i64)g_text_size_calls[idx - 12];
+            }
+            return 0;
+    }
+}
 
 static void ensure_text_dc(void) {
     if (!g_text_dc) {
@@ -30,7 +98,10 @@ static int g_font_sizes[16];
 static HFONT get_or_create_font(int size) {
     /* Cache by exact size match */
     for (int i = 0; i < 16; i++) {
-        if (g_font_sizes[i] == size && g_fonts[i]) return g_fonts[i];
+        if (g_font_sizes[i] == size && g_fonts[i]) {
+            if (g_text_stats_enabled) { g_text_font_hits++; }
+            return g_fonts[i];
+        }
     }
     /* Find empty slot */
     int slot = -1;
@@ -48,6 +119,7 @@ static HFONT get_or_create_font(int size) {
         DEFAULT_PITCH | FF_SWISS,
         L"Segoe UI"
     );
+    if (g_text_stats_enabled) { g_text_font_creates++; }
     g_font_sizes[slot] = size;
     return g_fonts[slot];
 }
@@ -93,6 +165,7 @@ static zan_text_cache_t *zan_text_cache_get(const char *text, int size) {
         zan_text_cache_t *e = &g_tcache[(base + i) % ZAN_TEXT_CACHE_CAP];
         if (e->text && e->size == size && strcmp(e->text, text) == 0) {
             e->used = ++g_tcache_clock;
+            if (g_text_stats_enabled) { g_text_draw_cache_hits++; }
             return e;
         }
         if (!e->text && !victim) victim = e;
@@ -106,6 +179,7 @@ static zan_text_cache_t *zan_text_cache_get(const char *text, int size) {
     }
 
     /* Miss: rasterise white text on black to capture the coverage mask. */
+    if (g_text_stats_enabled) { g_text_draw_cache_misses++; }
     int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
     wchar_t *wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
     if (!wtext) return NULL;
@@ -171,9 +245,20 @@ EXPORT void zan_gui_draw_text(
     if (size < 8) size = 8;
 
     ensure_text_dc();
+    uint64_t t0 = 0;
+    if (g_text_stats_enabled) {
+        g_text_draw_calls++;
+        if (size >= 0 && size < 64) { g_text_size_calls[size]++; }
+        t0 = text_qpc_us();
+    }
 
     zan_text_cache_t *e = zan_text_cache_get(text, size);
-    if (!e || !e->bits) return;
+    if (!e || !e->bits) {
+        if (g_text_stats_enabled) {
+            g_text_draw_us += text_qpc_us() - t0;
+        }
+        return;
+    }
     int tw = e->tw;
     int th = e->th;
     u32 *src = e->bits;
@@ -217,6 +302,9 @@ EXPORT void zan_gui_draw_text(
             s->pixels[idx] = (255u << 24) | (or_ << 16) | (og << 8) | ob;
         }
     }
+    if (g_text_stats_enabled) {
+        g_text_draw_us += text_qpc_us() - t0;
+    }
 }
 
 /* --- Measured-width cache -------------------------------------------------
@@ -258,6 +346,12 @@ EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
     if (size < 8) size = 8;
 
     ensure_text_dc();
+    uint64_t t0 = 0;
+    if (g_text_stats_enabled) {
+        g_text_measure_calls++;
+        if (size >= 0 && size < 64) { g_text_size_calls[size]++; }
+        t0 = text_qpc_us();
+    }
 
     uint64_t h = zan_text_hash(text, size);
     int base = (int)(h % ZAN_MEAS_CACHE_CAP);
@@ -267,6 +361,10 @@ EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
         zan_measure_cache_t *e = &g_mcache[(base + i) % ZAN_MEAS_CACHE_CAP];
         if (e->text && e->size == size && strcmp(e->text, text) == 0) {
             e->used = ++g_mcache_clock;
+            if (g_text_stats_enabled) {
+                g_text_measure_cache_hits++;
+                g_text_measure_us += text_qpc_us() - t0;
+            }
             return (i64)e->width;
         }
         if (!e->text) { if (!victim || best != 0) { victim = e; best = 0; } }
@@ -274,6 +372,9 @@ EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
     }
 
     int w = measure_text_gdi(text, size);
+    if (g_text_stats_enabled) {
+        g_text_measure_cache_misses++;
+    }
 
     if (victim) {
         if (victim->text) { free(victim->text); victim->text = NULL; }
@@ -286,6 +387,9 @@ EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
             victim->used = ++g_mcache_clock;
         }
     }
+    if (g_text_stats_enabled) {
+        g_text_measure_us += text_qpc_us() - t0;
+    }
     return (i64)w;
 }
 
@@ -297,9 +401,20 @@ static int g_fh_count = 0;
 EXPORT i32 zan_gui_font_height(i32 font_size) {
     int size = (int)font_size;
     if (size < 8) size = 8;
+    uint64_t t0 = 0;
+    if (g_text_stats_enabled) {
+        g_text_height_calls++;
+        if (size >= 0 && size < 64) { g_text_size_calls[size]++; }
+        t0 = text_qpc_us();
+    }
 
     for (int i = 0; i < g_fh_count; i++) {
-        if (g_fh_size[i] == size) return (i64)g_fh_val[i];
+        if (g_fh_size[i] == size) {
+            if (g_text_stats_enabled) {
+                g_text_height_us += text_qpc_us() - t0;
+            }
+            return (i64)g_fh_val[i];
+        }
     }
 
     ensure_text_dc();
@@ -314,6 +429,9 @@ EXPORT i32 zan_gui_font_height(i32 font_size) {
         g_fh_size[g_fh_count] = size;
         g_fh_val[g_fh_count] = val;
         g_fh_count = g_fh_count + 1;
+    }
+    if (g_text_stats_enabled) {
+        g_text_height_us += text_qpc_us() - t0;
     }
     return (i64)val;
 }
