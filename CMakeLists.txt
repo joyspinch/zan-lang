@@ -1407,6 +1407,14 @@ add_test(NAME policy_no_widget_drawing
   COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
     -P ${CMAKE_SOURCE_DIR}/tests/run_no_widget_drawing.cmake)
 
+# ---- Policy: widget draw paths must not gain direct semantic-color reads ----
+# Colors belong to the style layer (base.css + Style/StyleBox/Fx); each direct
+# `t.<color>` read in a draw path is frozen CSS debt with a per-file budget
+# that may only go down.
+add_test(NAME policy_theme_color_budget
+  COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_theme_color_budget.cmake)
+
 # ---- Runtime diagnostics: parser must not hang/OOM on malformed input ----
 add_test(NAME diag_no_runaway
   COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/bad_member.zan --dump-ast)

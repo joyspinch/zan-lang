@@ -465,7 +465,6 @@ class TextArea : Control {
         Theme t = app.theme;
 
         app.focus.RegisterFocusable(id);
-        bool hovered = app.focus.IsHovered(id);
         bool focused = app.focus.IsFocused(id);
 
         if (focused && !skipKeys) { this.HandleInput(app); }
@@ -475,15 +474,14 @@ class TextArea : Control {
         string txt = model.Get();
         this.ClampCursor();
 
-        int borderColor = t.borderPrimary;
-        if (focused) { borderColor = t.borderFocus; }
-        if (hovered && !focused) { borderColor = t.borderHover; }
-        if (!readOnly) {
-            c.SurfaceRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary,
-                               borderColor, 1);
-        }
+        // 外框（填充、边框、圆角、hover/focus 淡变）全部来自样式层，
+        // 皮肤的 `textarea:hover / textarea:focus` 规则即可重设。
+        StyleBox s = this.ResolveEasedStyleAs(app, id, "textarea", Class,
+                                              false, false);
+        if (!readOnly) { s.Paint(app, x, y, w, h); }
+        int fs = s.FontOr(t.fontSizeMedium);
 
-        int pad = t.paddingSmall;
+        int pad = s.PadLOr(t.paddingSmall);
         int innerX = x + pad;
         int innerY = y + pad;
         int innerW = w - pad * 2;
@@ -494,7 +492,7 @@ class TextArea : Control {
         // 动条盖住（而且“溢出才变窄”会在两种折法之间来回跳）。
         int wrapWidth = innerW - app.Scale(10);
         if (wrapWidth < app.Scale(24)) { wrapWidth = innerW; }
-        this.Wrap(wrapWidth, t.fontSizeMedium);
+        this.Wrap(wrapWidth, fs);
         int contentH = rowStart.Count * lineH;
 
         int caretRow = this.RowOfPos(cursorPos);
@@ -527,28 +525,32 @@ class TextArea : Control {
 
         c.PushClip(innerX, innerY, innerW, innerH);
         if (txt == "" && !focused) {
-            c.DrawText(innerX, innerY, hint, t.textTertiary, t.fontSizeMedium);
+            StyleBox placeholderStyle = this.ResolvePartAs(
+                app, "textarea", "placeholder", "", Class, Style.SNormal());
+            c.DrawText(innerX, innerY, hint, placeholderStyle.FgOr(s.fg),
+                       placeholderStyle.FontOr(fs));
         } else {
-            int fs = t.fontSizeMedium;
             if (focused && HasSel()) {
                 // 选区高亮画在文本下面，每行取它与选区的交集；
                 // 含换行的行尾多画一个空格宽，使跳行可见。
                 int selS = SelStart();
                 int selE = SelEnd();
-                int selColor = App.LerpColor(t.bgPrimary, t.primary, 96);
+                StyleBox selectionStyle = this.ResolvePartAs(
+                    app, "textarea", "selection", "", Class, Style.SNormal());
+                int selColor = selectionStyle.BgOr(s.accent);
                 int nlW = Canvas.MeasureText(" ", fs);
                 for (int i = 0; i < rowStart.Count; i = i + 1) {
                     int lineStart = rowStart[i];
                     int lineEnd = lineStart + rowLen[i];
-                    int s = selS;
-                    int e = selE;
-                    if (s < lineStart) { s = lineStart; }
-                    if (e > lineEnd) { e = lineEnd; }
-                    if (s <= e && selE > lineStart && selS <= lineEnd) {
+                    int rs = selS;
+                    int re = selE;
+                    if (rs < lineStart) { rs = lineStart; }
+                    if (re > lineEnd) { re = lineEnd; }
+                    if (rs <= re && selE > lineStart && selS <= lineEnd) {
                         string rt = this.RowText(i);
                         int ly = innerY + i * lineH - scrollY;
-                        int x0 = Canvas.MeasureText(rt.Substring(0, s - lineStart), fs);
-                        int x1 = Canvas.MeasureText(rt.Substring(0, e - lineStart), fs);
+                        int x0 = Canvas.MeasureText(rt.Substring(0, rs - lineStart), fs);
+                        int x1 = Canvas.MeasureText(rt.Substring(0, re - lineStart), fs);
                         int selW = x1 - x0;
                         if (selE > lineEnd) { selW = selW + nlW; }
                         c.FillRect(innerX + x0, ly, selW, Canvas.FontHeight(fs), selColor);
@@ -558,17 +560,18 @@ class TextArea : Control {
             for (int i = 0; i < rowStart.Count; i = i + 1) {
                 int ly = innerY + i * lineH - scrollY;
                 if (ly + lineH > innerY && ly < innerY + innerH) {
-                    c.DrawText(innerX, ly, this.RowText(i), t.textPrimary,
-                        t.fontSizeMedium);
+                    c.DrawText(innerX, ly, this.RowText(i), s.fg, fs);
                 }
             }
             if (focused && !readOnly) {
+                StyleBox caretStyle = this.ResolvePartAs(
+                    app, "textarea", "caret", "", Class, Style.SNormal());
                 int caretX = innerX + Canvas.MeasureText(
-                    this.RowText(caretRow).Substring(0, caretCol),
-                    t.fontSizeMedium);
+                    this.RowText(caretRow).Substring(0, caretCol), fs);
                 int caretY = innerY + caretRow * lineH - scrollY;
-                int fh = Canvas.FontHeight(t.fontSizeMedium);
-                c.FillRect(caretX, caretY, 1, fh, t.primary);
+                int fh = Canvas.FontHeight(fs);
+                c.FillRect(caretX, caretY, caretStyle.WidthOr(1), fh,
+                           caretStyle.BgOr(caretStyle.FgOr(s.accent)));
                 // 让 IME 组合窗口跟随光标。
                 app.SetImeCaret(caretX, caretY + fh);
             }
@@ -577,7 +580,12 @@ class TextArea : Control {
 
         // 内容溢出时的垂直滚动条（限制 + 裁剪）。
         if (contentH > innerH && innerH > 0) {
-            int barW = app.Scale(6);
+            StyleBox sbStyle = this.ResolvePartAs(
+                app, "textarea", "scrollbar", "", Class, Style.SNormal());
+            StyleBox sbTrack = this.ResolvePartAs(
+                app, "textarea", "scrollbar-track", "", Class,
+                Style.SNormal());
+            int barW = sbStyle.WidthOr(app.Scale(6));
             int barX = x + w - barW - app.Scale(2);
             int minThumb = app.Scale(24);
             if (minThumb > innerH) { minThumb = innerH; }
@@ -591,8 +599,12 @@ class TextArea : Control {
             if (thumbY < innerY) { thumbY = innerY; }
             if (thumbY + thumbH > innerY + innerH) { thumbY = innerY + innerH - thumbH; }
             c.PushClip(innerX, innerY, innerW, innerH);
-            c.FillRoundRect(barX, innerY, barW, innerH, barW / 2, t.bgTertiary);
-            c.FillRoundRect(barX, thumbY, barW, thumbH, barW / 2, t.scrollbar);
+            if (sbTrack.bg != 0) {
+                c.FillRoundRect(barX, innerY, barW, innerH, barW / 2,
+                                sbTrack.bg);
+            }
+            c.FillRoundRect(barX, thumbY, barW, thumbH, barW / 2,
+                            sbStyle.BgOr(s.fg));
             c.PopClip();
         }
 
@@ -600,16 +612,14 @@ class TextArea : Control {
 
         // 鼠标选择：按下锚定选区并放置光标，按住拖动移动活动端。
         if (Ui.PressedDown(app, id)) {
-            cursorPos = this.PosFromMouse(app, innerX, innerY, lineH,
-                                          t.fontSizeMedium);
+            cursorPos = this.PosFromMouse(app, innerX, innerY, lineH, fs);
             if (!Modifiers.HasShift(app.window.EventMods()) || selAnchor < 0) {
                 selAnchor = cursorPos;
             }
             this.ClampCursor();
             app.RequestRedraw();
         } else if (focused && app.focus.IsPressed(id) && app.EventKind() == 1) {
-            int drag = this.PosFromMouse(app, innerX, innerY, lineH,
-                                         t.fontSizeMedium);
+            int drag = this.PosFromMouse(app, innerX, innerY, lineH, fs);
             if (drag != cursorPos) {
                 cursorPos = drag;
                 this.ClampCursor();
@@ -619,8 +629,7 @@ class TextArea : Control {
         // 单消费者点击：当此区域是框架解析出的点击
         // 目标时放置光标。
         if (Ui.Clicked(app, id)) {
-            cursorPos = this.PosFromMouse(app, innerX, innerY, lineH,
-                                          t.fontSizeMedium);
+            cursorPos = this.PosFromMouse(app, innerX, innerY, lineH, fs);
             if (selAnchor == cursorPos) { selAnchor = -1; }
             this.ClampCursor();
             app.RequestRedraw();
