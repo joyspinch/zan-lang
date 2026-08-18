@@ -341,9 +341,12 @@ class App {
     int perfLoopMs;
     int perfFxTicks;
     int perfFxTickMs;
+    int perfFxTickUs;
+    int perfFxRestoreUs;
+    int perfFxRenderUs;
+    int perfFxPresentUs;
     // 最后一次收到真实输入（鼠标/键盘/滚轮/缩放）的墙钟毫秒。
-    // 环境特效以此判断「人还在看」：久无输入就把动画降到心跳
-    // 节奏，窗口失去焦点则完全停摆（见 FxIntervalMs / FxPresent）。
+    // 环境特效以此选择活动/空闲间隔；失焦但可见的窗口仍继续动画。
     int lastInputMs;
     // 上一次被记作输入的指针位置：Windows 会在窗口重绘/焦点变化后
     // 补发坐标未变的 WM_MOUSEMOVE，若把它们也算成输入，久无人操作
@@ -597,6 +600,10 @@ class App {
         this.perfLoopMs = 0;
         this.perfFxTicks = 0;
         this.perfFxTickMs = 0;
+        this.perfFxTickUs = 0;
+        this.perfFxRestoreUs = 0;
+        this.perfFxRenderUs = 0;
+        this.perfFxPresentUs = 0;
         this.lastInputMs = this.nowMs;
         this.lastInX = -1;
         this.lastInY = -1;
@@ -1548,14 +1555,14 @@ class App {
     /// 例如在尺寸变化之后。
     bool FxPresent() {
         if (!fxSnapValid || !this.FxActive()) { fxNextMs = -1; return false; }
-        // 没拿到输入焦点就别动：装饰性的环境动画只有人在这个窗口
-        // 上时才有意义，而它的代价是实打实的——一跳要恢复像素 +
-        // 重新合成 + 提交（实测约 6ms），一秒十跳就是一个核的 7%，
-        // 用户切去别的程序时这份 CPU 全是白烧的。任何事件（含重新
-        // 获得焦点）都会在 ProcessEvent / ApplyEvent 末尾重新武装。
-        if (!window.IsFocused()) { fxNextMs = -1; return true; }
         int perfFxT0 = 0;
-        if (App.PerfOn()) { perfFxT0 = Window.GetTickMs(); }
+        int perfFxRestoreT0 = 0;
+        int perfFxRenderT0 = 0;
+        int perfFxPresentT0 = 0;
+        if (App.PerfOn()) {
+            perfFxT0 = Window.GetTickUs();
+            perfFxRestoreT0 = perfFxT0;
+        }
         if (!window.IsVisible()) {
             // 窗口不可见（最小化或完全被遮挡）：停止
             // 计时。仅失去焦点的窗口仍在屏幕上，
@@ -1585,6 +1592,11 @@ class App {
             fxSnapValid = false;
             return false;
         }
+        if (App.PerfOn()) {
+            perfFxRestoreUs = perfFxRestoreUs
+                + (Window.GetTickUs() - perfFxRestoreT0);
+            perfFxRenderT0 = Window.GetTickUs();
+        }
         BackdropFx.Render(this, fc, this.EffectiveFx(), 0, 0, fc.Width(), fc.Height(),
                           Window.GetTickMs(), theme, dpiScale);
         fxDamage = BackdropFx.TakeDamage();
@@ -1596,12 +1608,20 @@ class App {
             this.MarkPresentDirty(repaired);
             this.MarkPresentDirty(fxDamage);
         }
+        if (App.PerfOn()) { perfFxPresentT0 = Window.GetTickUs(); }
         window.Present(canvas);
-        lastPresentMs = Window.GetTickMs();
         if (App.PerfOn()) {
+            int perfFxEndUs = Window.GetTickUs();
+            perfFxRenderUs = perfFxRenderUs
+                + (perfFxPresentT0 - perfFxRenderT0);
+            perfFxPresentUs = perfFxPresentUs
+                + (perfFxEndUs - perfFxPresentT0);
+            perfFxTickUs = perfFxTickUs + (perfFxEndUs - perfFxT0);
             perfFxTicks = perfFxTicks + 1;
-            perfFxTickMs = perfFxTickMs + (lastPresentMs - perfFxT0);
+            perfFxTickMs = perfFxTickMs
+                + (perfFxEndUs - perfFxT0) / 1000;
         }
+        lastPresentMs = Window.GetTickMs();
         fxNextMs = lastPresentMs + this.FxIntervalMs();
         return true;
     }
@@ -1610,10 +1630,16 @@ class App {
     /// 只有不可见的窗口才停止计时（见 FxPresent）。
     int FxIntervalMs() {
         int ms = BackdropFx.IntervalMs(this.EffectiveFx());
-        // 人在窗口里但半分钟没碰过键鼠：多半是在读代码或离开了座位，
-        // 背景该走多快没人盯着。降到心跳节奏（约 1.3 跳/秒）把空闲
-        // 时的这份 CPU 砍掉八成，任何输入都会立刻回到原节奏。
-        if (Window.GetTickMs() - lastInputMs > 30000) { return ms * 8; }
+        // 空闲时只允许放慢，不得比皮肤自身节奏更快，也不得
+        // 慢于可感知的心跳。失焦只影响输入，不暂停可见窗口。
+        if (Window.GetTickMs() - lastInputMs > 30000) {
+            int idleMs = ms * 2;
+            int maxIdleMs = ms;
+            if (maxIdleMs < 50) { maxIdleMs = 50; }
+            if (idleMs < ms) { idleMs = ms; }
+            if (idleMs > maxIdleMs) { idleMs = maxIdleMs; }
+            return idleMs;
+        }
         return ms;
     }
 
@@ -1746,12 +1772,26 @@ class App {
         dmgW = x1 - x0;
         dmgH = y1 - y0;
         partialPending = true;
+        if (App.PerfOn()) {
+            File.AppendAllText("zan_frame_perf.log",
+                "damage_decl=" + Convert.ToString(dmgX) + ","
+                + Convert.ToString(dmgY) + "+"
+                + Convert.ToString(dmgW) + "x"
+                + Convert.ToString(dmgH) + "\n");
+        }
     }
 
     /// 滚轮把某块可滚动区域的内容平移了一段：变的只有这块像素，
     /// 于是把它声明成损伤区，而不是整窗重绘。区域为空或声明不成立
     /// 时 NoteDamage 自己会退回整窗。
     void NoteScrollDamage(int x, int y, int w, int h) {
+        if (App.PerfOn()) {
+            File.AppendAllText("zan_frame_perf.log",
+                "scroll_damage=" + Convert.ToString(x) + ","
+                + Convert.ToString(y) + "+"
+                + Convert.ToString(w) + "x"
+                + Convert.ToString(h) + "\n");
+        }
         this.NoteDamage(x, y, w, h);
     }
 
@@ -3125,11 +3165,10 @@ class App {
             lastInY = mouseY;
         }
 
-        // 窗口重新可见 / 重新拿回焦点时恢复暂停的环境特效
-        // （FxPresent 在隐藏或失焦时将 fxNextMs 置为 -1；这类唤醒
-        // 如同任何事件一样到达此处并重新武装它）。
-        if (fxSnapValid && fxNextMs < 0 && this.FxActive() && window.IsVisible()
-            && window.IsFocused()) {
+        // 窗口重新可见时恢复暂停的环境特效。失焦但仍可见的窗口
+        // 不会被暂停。
+        if (fxSnapValid && fxNextMs < 0 && this.FxActive()
+            && window.IsVisible()) {
             fxNextMs = Window.GetTickMs();
         }
 
@@ -3330,11 +3369,10 @@ class App {
             lastInY = mouseY;
         }
 
-        // 窗口重新可见 / 重新拿回焦点时恢复暂停的环境特效
-        // （FxPresent 在隐藏或失焦时将 fxNextMs 置为 -1；这类唤醒
-        // 如同任何事件一样到达此处并重新武装它）。
-        if (fxSnapValid && fxNextMs < 0 && this.FxActive() && window.IsVisible()
-            && window.IsFocused()) {
+        // 窗口重新可见时恢复暂停的环境特效。失焦但仍可见的窗口
+        // 不会被暂停。
+        if (fxSnapValid && fxNextMs < 0 && this.FxActive()
+            && window.IsVisible()) {
             fxNextMs = Window.GetTickMs();
         }
 
@@ -3376,13 +3414,13 @@ class App {
                 BackdropFx.TakeDamage();
                 fxSnapValid = false;
                 fxDamage = null;
-                fxNextMs = fxNow + 150;
+                fxNextMs = fxNow + this.FxIntervalMs();
             } else {
             bool burst = lastPresentMs > 0 && fxNow - lastPresentMs < 120;
             if (burst) {
                 fxSnapValid = false;
                 fxDamage = null;
-                fxNextMs = fxNow + 150;
+                fxNextMs = fxNow + this.FxIntervalMs();
             } else {
                 fc.SnapshotRect(0, 0, fc.Width(), fc.Height(), 7);
                 fxSnapValid = true;
@@ -3642,6 +3680,10 @@ class App {
             + " ev_other=" + Convert.ToString(perfEvOther)
             + " fx_ticks=" + Convert.ToString(perfFxTicks)
             + " fx_tick_ms=" + Convert.ToString(perfFxTickMs)
+            + " fx_tick_us=" + Convert.ToString(perfFxTickUs)
+            + " fx_restore_us=" + Convert.ToString(perfFxRestoreUs)
+            + " fx_render_us=" + Convert.ToString(perfFxRenderUs)
+            + " fx_present_us=" + Convert.ToString(perfFxPresentUs)
             + " fx_kind=" + Convert.ToString(this.EffectiveFx())
             + " anim_armed=" + Convert.ToString(animNextMs)
             + " fx_armed=" + Convert.ToString(fxNextMs) + "\n");
@@ -3656,6 +3698,10 @@ class App {
         perfEvOther = 0;
         perfFxTicks = 0;
         perfFxTickMs = 0;
+        perfFxTickUs = 0;
+        perfFxRestoreUs = 0;
+        perfFxRenderUs = 0;
+        perfFxPresentUs = 0;
     }
 
     /// 宿主在一大段绘制里埋的标记点：把自上一个标记以来的时间
