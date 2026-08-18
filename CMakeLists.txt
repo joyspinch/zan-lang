@@ -1415,6 +1415,21 @@ add_test(NAME policy_theme_color_budget
   COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
     -P ${CMAKE_SOURCE_DIR}/tests/run_theme_color_budget.cmake)
 
+# ---- Performance: retained-mode IDE frame budget ----
+# Requires the separately-built ZanIDE executable and a desktop session.
+if(WIN32 AND EXISTS "${CMAKE_BINARY_DIR}/ZanIDE.exe")
+  add_test(NAME perf_frame_budget
+    COMMAND ${CMAKE_COMMAND}
+      -DROOT=${CMAKE_SOURCE_DIR}
+      -DBINARY_DIR=${CMAKE_BINARY_DIR}
+      -DZANIDE=${CMAKE_BINARY_DIR}/ZanIDE.exe
+      -P ${CMAKE_SOURCE_DIR}/tests/run_frame_budget.cmake)
+  set_tests_properties(perf_frame_budget PROPERTIES
+    LABELS perf
+    TIMEOUT 240
+    SKIP_REGULAR_EXPRESSION "FRAME_BUDGET_SKIPPED")
+endif()
+
 # ---- Runtime diagnostics: parser must not hang/OOM on malformed input ----
 add_test(NAME diag_no_runaway
   COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/bad_member.zan --dump-ast)
