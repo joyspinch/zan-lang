@@ -37,9 +37,17 @@ class StyleSheet {
     List<string> selText;
     List<string> selType;
     List<string> selClasses;   // 空格分隔，规则未命名任何类别时为“”。
+    /// 规则要求的第一个类名（无类要求时为“”）。把颜色与状态
+    /// 下沉进 CSS 后，`button` 那一桶里绝大多数规则都带类
+    /// （`button.ghost.primary:hover` 之类），先用这一个字符串比较筛掉，
+    /// 就不必为每条规则再切分一次类名串。
+    List<string> selClass0;
     List<string> selId;
     List<string> selPart;
     List<string> selState;
+    /// 选择器要求的状态位（多个伪类取与）；引擎不认识其中
+    /// 任何一个伪类时为 -1（该规则永不匹配）。
+    List<int> selStateMask;
     List<int> selSpec;
     int indexedCount;
     /// 每条规则的声明块，索引与上面的选择器表对齐：匹配后直接取，
@@ -175,18 +183,36 @@ class StyleSheet {
         if (selPart[i] != part) { return false; }
         if (selType[i] != "" && selType[i] != type) { return false; }
         if (selId[i] != "" && (id == "" || selId[i] != id)) { return false; }
-        string st = selState[i];
-        if (st != "") {
-            int bit = Style.StateBit(st);
-            if (bit == 0) { return false; }
-            if ((stateBits / bit) % 2 != 1) { return false; }
-        }
+        int mask = selStateMask[i];
+        if (mask < 0) { return false; }
+        if ((stateBits & mask) != mask) { return false; }
         if (selClasses[i] == "") { return true; }
+        if (!StyleSheet.Holds(classes, selClass0[i])) { return false; }
         List<string> need = Style.Classes(selClasses[i]);
         for (int k = 0; k < need.Count; k = k + 1) {
             if (!StyleSheet.Holds(classes, need[k])) { return false; }
         }
         return true;
+    }
+
+    /// 一组伪类名对应的状态位掩码（含未知伪类时为 -1）。
+    static int StateMask(string state) {
+        if (state == "") { return 0; }
+        List<string> names = Style.Classes(state);
+        int mask = 0;
+        for (int i = 0; i < names.Count; i = i + 1) {
+            int bit = Style.StateBit(names[i]);
+            if (bit == 0) { return 0 - 1; }
+            mask = mask | bit;
+        }
+        return mask;
+    }
+
+    /// 空格分隔类名串里的第一个名字（“”表示没有类要求）。
+    static string FirstClass(string classes) {
+        int sp = StyleSheet.IndexOf(classes, " ");
+        if (sp < 0) { return classes; }
+        return classes.Substring(0, sp);
     }
 
     static bool Holds(List<string> list, string name) {
@@ -207,6 +233,8 @@ class StyleSheet {
         selId = new List<string>();
         selPart = new List<string>();
         selState = new List<string>();
+        selStateMask = new List<int>();
+        selClass0 = new List<string>();
         selSpec = new List<int>();
         int i = 0;
         while (i < rules.Count()) {
@@ -224,6 +252,8 @@ class StyleSheet {
             selId.Insert(at, p.id);
             selPart.Insert(at, p.part);
             selState.Insert(at, p.state);
+            selStateMask.Insert(at, StyleSheet.StateMask(p.state));
+            selClass0.Insert(at, StyleSheet.FirstClass(p.classes));
             selSpec.Insert(at, spec);
         }
         // 分桶要等排序完成再做：上面的 Insert 会挪动下标。

@@ -267,9 +267,22 @@ class Style {
 
     /// 把 sheet 中选中该控件的每条规则叠加到 `b` 上，
     /// 按从弱到强的顺序（参见 StyleSheet.ApplyMatch）。
+    ///
+    /// 别名类型先应用：浮动按钮就是一颗圆按钮，它要吃到整套
+    /// `button` 规则（角色、变体、状态），但皮肤仍能用
+    /// `floatbutton` 只改它自己——因此是别名在前、本名在后，
+    /// 而不是把上百条按钮规则在 CSS 里复制一遍。
     static void ApplySheet(StyleSheet sheet, StyleBox b, string type, string cls,
                            string id, int state) {
+        string alias = Style.SheetAlias(type);
+        if (alias != "") { sheet.ApplyMatch(b, alias, cls, id, "", state); }
         sheet.ApplyMatch(b, type, cls, id, "", state);
+    }
+
+    /// 该控件族借用哪个类型的 CSS 规则（"" = 不借）。
+    static string SheetAlias(string type) {
+        if (type == "floatbutton") { return "button"; }
+        return "";
     }
 
     /// 控件某个 `type::part` 的同样处理（`menu::item`、`card::title`）。
@@ -402,8 +415,9 @@ class Style {
 
     // ---- theme defaults ----------------------------------------------------
 
-    /// 类列表对应的角色强调色（"primary"/"info"/"success"/"warning"/
-    /// "error"），控件为中性时返回 0。
+    /// 角色类（primary/info/success/warning/error）在某状态下的强调色，
+    /// 无角色类时为 0。按钮/tab 的上色已经全在 skins/base.css 里，这里
+    /// 留给自绘标记的控件（时间轴的圆点等）按角色取一个主题色。
     static int RoleColor(Theme t, string cls, int state) {
         bool hover = (state / Style.SHover()) % 2 == 1;
         bool active = (state / Style.SActive()) % 2 == 1;
@@ -429,14 +443,13 @@ class Style {
         }
         if (Style.Has(cls, "error")) {
             if (active) { return t.errorPressed; }
-            if (hover) { return t.errorPressed; }
+            if (hover) { return t.errorHover; }
             return t.error;
         }
         return 0;
     }
 
-    /// 角色的静态强调色（不受状态影响）——用于 ghost/text
-    /// 这类由 *label* 承载角色颜色的变体。
+    /// 角色的静态强调色（不受状态影响）。
     static int RoleBase(Theme t, string cls) {
         return Style.RoleColor(t, cls, 0);
     }
@@ -446,12 +459,8 @@ class Style {
     /// 主题应用外观与内置主题分毫不差。
     static void Defaults(App app, StyleBox b, string type, string cls, int state) {
         Theme t = app.theme;
-        bool hover = (state / Style.SHover()) % 2 == 1;
         bool active = (state / Style.SActive()) % 2 == 1;
-        bool focus = (state / Style.SFocus()) % 2 == 1;
         bool disabled = (state / Style.SDisabled()) % 2 == 1;
-        bool selected = (state / Style.SSelected()) % 2 == 1;
-        if ((state / Style.SChecked()) % 2 == 1) { selected = true; }
 
         // 控件从自身尺寸比例推导的度量（高度、字号、
         // 水平内边距）在此有意不设置：控件会
@@ -459,13 +468,15 @@ class Style {
         // 就用 CSS 的，未声明时尺寸比例依然生效。
         b.transitionMs = t.animFastMs;
         b.fg = t.textPrimary;
+        // 禁用态的弱化文字放在默认层，CSS 因此还能改写它
+        // （皮肤的 `x:disabled { color: ... }` 以前被 Style.Shell 抹掉）。
+        if (disabled) { b.fg = t.textDisabled; }
         b.accent = t.primary;
 
         if (type == "button" || type == "floatbutton") {
-            Style.ButtonDefaults(app, b, cls, hover, active, focus, disabled,
-                                 selected);
+            Style.ButtonDefaults(app, b, cls, active, disabled);
         } else if (type == "tab") {
-            Style.TabDefaults(app, b, cls, hover, selected, disabled);
+            Style.TabDefaults(app, b, cls);
         } else if (Style.CssType(type)) {
             // 其余控件族完全由 skins/base.css 定义样式，它作为基础底层 sheet
             // 叠加在最下面（参见 Style.BaseSheet）。除上面设置的
@@ -482,8 +493,8 @@ class Style {
     }
 
     /// 整体外观已迁入 skins/base.css（作为基础底层 sheet 加载）的控件族
-    /// 返回 true。按钮和单个
-    /// 标签页是例外：它们的颜色在运行时计算。
+    /// 返回 true。按钮和标签页不在此列，是因为它们还要在代码里
+    /// 定几何量（尺寸档、堆叠命令、圆角形状），颜色同样只在 CSS 里。
     static bool CssType(string type) {
         return type == "input" || type == "textarea" || type == "select"
             || type == "card" || type == "panel" || type == "popup"
@@ -507,13 +518,13 @@ class Style {
     }
 
     /// 静态 CSS 规则无法表达的运行时处理，在
-    /// sheet 之后应用：禁用控件的弱化文字、玻璃磨砂，以及
-    /// 新粗野主义的偏移阴影外壳（均受主题标志/状态控制）。
+    /// sheet 之后应用：玻璃磨砂，以及新粗野主义的偏移阴影外壳
+    /// （均受主题标志/状态控制）。禁用态的弱化文字不在这里——
+    /// 它是默认层（Style.Defaults）的事，否则皮肤写的
+    /// `button:disabled { color: ... }` 会被这里抹掉。
     static void Shell(App app, StyleBox b, string type, string cls, int state) {
         Theme t = app.theme;
         bool active = (state / Style.SActive()) % 2 == 1;
-        bool disabled = (state / Style.SDisabled()) % 2 == 1;
-        if (disabled) { b.fg = t.textDisabled; }
         // 磨砂玻璃不在这里：表面的背景、模糊、圆角、边框、投影
         // 和光泽均由 skins/base.css 根据主题导出的 `--surface-*`
         // token 声明（见 Style.RootFromTheme），皮肤在自己的 CSS 里
@@ -649,7 +660,50 @@ class Style {
         s = s + Style.TokN("surface-border-w", surfBorderW);
         s = s + Style.TokN("surface-shadow-dy", surfShadowDy);
         s = s + Style.TokN("surface-shadow-blur", surfShadowBlur);
+        // 按钮/tab 的角色色与其状态色：过去按钮的颜色在
+        // ButtonDefaults 里按类名和状态现算，皮肤想改一个按下色
+        // 也无从下手。现在主题只导出 token，“哪个 token 画哪个
+        // 状态”写在 base.css 里。
+        s = s + Style.Tok("primary-hover", t.primaryHover);
+        s = s + Style.Tok("primary-pressed", t.primaryPressed);
+        s = s + Style.Tok("info-hover", t.infoHover);
+        s = s + Style.Tok("info-pressed", t.infoPressed);
+        s = s + Style.Tok("success-hover", t.successHover);
+        s = s + Style.Tok("success-pressed", t.successPressed);
+        s = s + Style.Tok("warning-hover", t.warningHover);
+        s = s + Style.Tok("warning-pressed", t.warningPressed);
+        s = s + Style.Tok("error-hover", t.errorHover);
+        s = s + Style.Tok("error-pressed", t.errorPressed);
+        s = s + Style.VariantTokens("primary", t.primary, t.bgPrimary);
+        s = s + Style.VariantTokens("info", t.info, t.bgPrimary);
+        s = s + Style.VariantTokens("success", t.success, t.bgPrimary);
+        s = s + Style.VariantTokens("warning", t.warning, t.bgPrimary);
+        s = s + Style.VariantTokens("error", t.error, t.bgPrimary);
+        // 中性（无角色类）的 ghost/secondary 以主文字色为色调。
+        s = s + Style.VariantTokens("neutral", t.textPrimary, t.bgPrimary);
+        // 禁用形状：在任何主题下都保持可见的弱化盒子。文字色由
+        // Style.Shell 统一压成 --text-disabled，这里只给填充和描边。
+        s = s + Style.Tok("disabled-bg", t.borderPrimary);
+        s = s + Style.Tok("disabled-fg",
+                          App.LerpColor(t.borderPrimary, t.textPrimary, 110));
+        s = s + Style.Tok("disabled-border",
+                          App.LerpColor(t.borderPrimary, t.textPrimary, 45));
         s = s + "}\n";
+        return s;
+    }
+
+    /// 一个角色的 ghost / secondary 变体色。CSS 没有混色函数，而
+    /// 这些混色只随主题变化，所以在导出 token 时算一次：
+    /// ghost 用角色色的低透明度作悬停/按下底色，secondary 是
+    /// 角色色与页面底色的浅混。皮肤可以逐个 token 改写。
+    static string VariantTokens(string name, int tint, int surface) {
+        string s = Style.Tok(name + "-ghost-hover-bg", App.ScaleAlpha(tint, 120));
+        s = s + Style.Tok(name + "-ghost-active-bg", App.ScaleAlpha(tint, 215));
+        s = s + Style.Tok(name + "-soft-bg", App.LerpColor(surface, tint, 90));
+        s = s + Style.Tok(name + "-soft-hover-bg",
+                          App.LerpColor(surface, tint, 150));
+        s = s + Style.Tok(name + "-soft-active-bg",
+                          App.LerpColor(surface, tint, 200));
         return s;
     }
 
@@ -836,12 +890,12 @@ class Style {
         return t.textInverse;
     }
 
-    static void ButtonDefaults(App app, StyleBox b, string cls, bool hover,
-                               bool active, bool focus, bool disabled,
-                               bool selected) {
+    /// 按钮的几何量与非声明式装饰。颜色（角色、变体、各状态）
+    /// 全在 skins/base.css 里，这里一律不碰——否则皮肤写了
+    /// `button.primary:active` 也改不动一个按下色。
+    static void ButtonDefaults(App app, StyleBox b, string cls, bool active,
+                               bool disabled) {
         Theme t = app.theme;
-        int role = Style.RoleColor(t, cls, Style.MaskOf(hover, active));
-        int roleBase = Style.RoleBase(t, cls);
         b.SetRadius(t.borderRadiusMedium);
         b.gap = t.gapSmall;
         b.align = 1;
@@ -868,82 +922,6 @@ class Style {
             b.emboss = 1;
             if (active) { b.emboss = 2; }
         }
-
-        if (disabled) {
-            // 在任何主题下都保持清晰可见的弱化形状：用（不透明的）
-            // 边框灰填充，并从中推导出可读的文字色。
-            b.bg = t.borderPrimary;
-            b.fg = App.LerpColor(t.borderPrimary, t.textPrimary, 110);
-            b.borderColor = App.LerpColor(t.borderPrimary, t.textPrimary, 45);
-            b.borderW = 1;
-            return;
-        }
-
-        if (Style.Has(cls, "ghost")) {
-            b.bg = 0;
-            b.fg = roleBase;
-            if (roleBase == 0) { b.fg = t.textPrimary; }
-            b.borderColor = b.fg;
-            b.borderW = 1;
-            if (hover) { b.bg = App.ScaleAlpha(b.fg, 120); }
-            if (active) { b.bg = App.ScaleAlpha(b.fg, 215); }
-            return;
-        }
-        if (Style.Has(cls, "secondary")) {
-            int mix = 90;
-            if (hover) { mix = 150; }
-            if (active) { mix = 200; }
-            int tint = roleBase;
-            if (tint == 0) { tint = t.textPrimary; }
-            b.bg = App.LerpColor(t.bgPrimary, tint, mix);
-            b.fg = tint;
-            b.borderW = 0;
-            return;
-        }
-        if (Style.Has(cls, "text")) {
-            b.bg = 0;
-            b.borderW = 0;
-            b.fg = roleBase;
-            if (roleBase == 0) { b.fg = t.textPrimary; }
-            // 锁定的扁平命令（绑定 Checked）靠自身的明暗表达：
-            // 用强调色点亮、不填充色块，这样一排开关仍呈现
-            // 列表而非一大块颜色。
-            if (selected) {
-                b.fg = t.primary;
-                if (roleBase != 0) { b.fg = roleBase; }
-                if (hover) { b.fg = t.primaryHover; }
-            }
-            if (hover) { b.bg = t.bgHover; }
-            if (active) { b.bg = t.bgActive; }
-            return;
-        }
-        if (Style.Has(cls, "outline") || Style.Has(cls, "dashed")) {
-            b.bg = t.bgPrimary;
-            if (hover) { b.bg = t.bgHover; }
-            if (active) { b.bg = t.bgActive; }
-            b.fg = roleBase;
-            if (roleBase == 0) { b.fg = t.textPrimary; }
-            b.borderColor = b.fg;
-            b.borderW = 1;
-            return;
-        }
-
-        if (role != 0) {
-            b.bg = role;
-            b.fg = t.textInverse;
-            b.borderColor = role;
-            b.borderW = 0;
-            return;
-        }
-        // 中性（默认）按钮：页面表面加边框。
-        b.bg = t.bgPrimary;
-        if (hover) { b.bg = t.bgHover; }
-        if (active) { b.bg = t.bgActive; }
-        b.fg = t.textPrimary;
-        b.borderColor = t.borderPrimary;
-        if (hover || active) { b.borderColor = t.borderHover; }
-        if (focus) { b.borderColor = t.borderFocus; }
-        b.borderW = 1;
     }
 
     static void SurfaceDefaults(App app, StyleBox b, string cls) {
@@ -973,52 +951,18 @@ class Style {
         }
     }
 
-    static void TabDefaults(App app, StyleBox b, string cls, bool hover,
-                            bool selected, bool disabled) {
+    /// 单个标签页的几何量。颜色（基础/悬停/选中、下划线与卡片
+    /// 描边）在 skins/base.css 的 `tab`、`tab.card`、`tab.segment`、
+    /// `tab.document` 规则里。
+    static void TabDefaults(App app, StyleBox b, string cls) {
         Theme t = app.theme;
-        b.bg = 0;
-        b.fg = t.textSecondary;
         b.align = 1;
         b.SetRadius(0);
         if (Style.Has(cls, "card")) {
-            b.bg = t.bgSecondary;
             b.SetRadius(t.borderRadiusMedium);
         } else if (Style.Has(cls, "segment")) {
             b.SetRadius(t.borderRadiusSmall);
-        } else if (Style.Has(cls, "document")) {
-            // 编辑器文档标签页：不透明的条状标签，激活的标签抬升到
-            // 页面背景，使其看起来像最前端的页签。
-            b.bg = t.bgSecondary;
         }
-        if (hover && !selected) {
-            b.bg = t.bgHover;
-            b.fg = t.textPrimary;
-        }
-        if (selected) {
-            b.fg = t.primary;
-            if (Style.Has(cls, "card")) {
-                b.bg = t.bgPrimary;
-                b.borderColor = t.borderPrimary;
-                b.borderW = 1;
-            } else if (Style.Has(cls, "segment")) {
-                b.bg = t.bgPrimary;
-                b.fg = t.textPrimary;
-            } else if (Style.Has(cls, "document")) {
-                b.bg = t.bgPrimary;
-                b.fg = t.textPrimary;
-            } else {
-                b.borderBottomW = 2;
-                b.borderBottomColor = t.primary;
-            }
-        }
-        if (disabled) { b.fg = t.textDisabled; }
-    }
-
-    static int MaskOf(bool hover, bool active) {
-        int m = 0;
-        if (hover) { m = m + Style.SHover(); }
-        if (active) { m = m + Style.SActive(); }
-        return m;
     }
 
     // ---- inline (fluent / retained-mode) overrides --------------------------
