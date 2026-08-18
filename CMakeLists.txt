@@ -1700,7 +1700,8 @@ set(_new_diag_cases
   float_to_int_narrowing
   integer_narrowing
   interface_missing_method
-  interface_bad_signature)
+  interface_bad_signature
+  unrelated_argument_type)
 foreach(_case ${_new_diag_cases})
   if(_case STREQUAL cyclic_inheritance)
     set(_diag_regex "cyclic inheritance")
@@ -1712,6 +1713,8 @@ foreach(_case ${_new_diag_cases})
     set(_diag_regex "cannot convert 'int' to 'Handler'")
   elseif(_case STREQUAL local_assignment_type_mismatch)
     set(_diag_regex "cannot convert 'string' to 'int' in assignment")
+  elseif(_case STREQUAL unrelated_argument_type)
+    set(_diag_regex "in argument 1 of 'Paint'")
   elseif(_case STREQUAL interface_missing_method OR
          _case STREQUAL interface_bad_signature)
     set(_diag_regex "does not implement interface method")

@@ -1108,6 +1108,78 @@ static void check_call_arity(zan_checker_t *c, zan_ast_node_t *call,
                   (int)name.len, name.str, want_min, want_max, argc);
 }
 
+/* Whether an argument of type `value` cannot reach a parameter of type
+ * `target`. Only class/struct types are judged, and only when neither side is
+ * a generic instantiation: passing an unrelated class (Theme where App is
+ * declared) shares the pointer carrier but not the layout, so it survived
+ * every source-level phase and read foreign fields at runtime. Numerics,
+ * interfaces, delegates, arrays and generics are left to the existing
+ * assignment/irgen paths. */
+static bool checker_arg_type_mismatch(zan_checker_t *c, zan_type_t *target,
+                                      zan_type_t *value) {
+    if (!target || !value) return false;
+    if (target->kind != TYPE_CLASS && target->kind != TYPE_STRUCT) return false;
+    if (value->kind != TYPE_CLASS && value->kind != TYPE_STRUCT) return false;
+    if (!target->sym || !value->sym) return false;
+    if (target->type_arg_count || value->type_arg_count) return false;
+    if (checker_type_assignable(target, value)) return false;
+    return !checker_has_user_conversion(c, target, value);
+}
+
+/* The declaration whose parameters line up one-for-one with this call's
+ * arguments, or NULL when the checker cannot match them by position: an
+ * overloaded name (irgen picks the overload), a generic method, a `params`
+ * tail or an extension receiver (the declaration has a parameter the call has
+ * no argument for), and named or `ref`/`out` arguments (reordered or passed by
+ * reference). */
+static zan_symbol_t *call_arg_signature(zan_ast_node_t *call,
+                                        zan_type_t *recv) {
+    zan_ast_node_t *callee = call->call.callee;
+    if (!callee || callee->kind != AST_MEMBER_ACCESS) return NULL;
+    if (!recv || !recv->sym || recv->type_arg_count) return NULL;
+    zan_istr_t name = callee->member.name;
+    zan_symbol_t *only = NULL;
+    for (zan_symbol_t *s = recv->sym; s;
+         s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
+        for (int i = 0; i < s->member_count; i++) {
+            zan_symbol_t *m = s->members[i];
+            if (!m || m->kind != SYM_METHOD || m->name.len != name.len ||
+                memcmp(m->name.str, name.str, (size_t)name.len) != 0)
+                continue;
+            if (only && only != m) return NULL;
+            only = m;
+        }
+    }
+    if (!only || !only->decl || only->decl->kind != AST_METHOD_DECL) return NULL;
+    if (only->decl->method_decl.type_params.count) return NULL;
+    zan_ast_list_t *ps = &only->decl->method_decl.params;
+    if (call->call.args.count > ps->count) return NULL;
+    for (int i = 0; i < ps->count; i++) {
+        zan_ast_node_t *p = ps->items[i];
+        if (!p || p->kind != AST_PARAM || p->param.is_params || p->param.is_this)
+            return NULL;
+    }
+    for (int i = 0; i < call->call.args.count; i++) {
+        zan_ast_node_t *a = call->call.args.items[i];
+        if (!a || a->kind == AST_NAMED_ARG || a->kind == AST_REF_ARG) return NULL;
+    }
+    return only;
+}
+
+static void check_call_arg_type(zan_checker_t *c, zan_symbol_t *sig, int index,
+                                zan_ast_node_t *arg, zan_type_t *arg_type) {
+    zan_ast_list_t *ps = &sig->decl->method_decl.params;
+    if (index >= ps->count) return;
+    zan_type_t *pt = zan_binder_resolve_type(c->binder,
+                                             ps->items[index]->param.type);
+    if (!checker_arg_type_mismatch(c, pt, arg_type)) return;
+    zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                  "cannot convert '%s' to '%s' in argument %d of '%.*s': "
+                  "no implicit conversion",
+                  type_name(arg_type), type_name(pt), index + 1,
+                  (int)sig->name.len, sig->name.str);
+}
+
 /* Comparisons, which consume the *value* of both operands. `+`/`-` are left
  * out: they combine delegates and register event handlers, both of which take
  * a method group. */
@@ -1498,10 +1570,13 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         } else {
             callee_type = zan_checker_check_expr(c, expr->call.callee);
         }
+        zan_symbol_t *arg_sig = call_arg_signature(expr, recv);
         for (int i = 0; i < expr->call.args.count; i++) {
             zan_ast_node_t *arg = expr->call.args.items[i];
             if (arg && arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;
-            zan_checker_check_expr(c, arg);
+            zan_type_t *arg_type = zan_checker_check_expr(c, arg);
+            if (arg_sig && arg)
+                check_call_arg_type(c, arg_sig, i, arg, arg_type);
         }
         /* Published after the arguments are checked (they are calls too), so a
          * member access on this call reads *this* call's callee. */
