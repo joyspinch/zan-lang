@@ -733,8 +733,10 @@ partial class ZanIDE {
                     // can resolve cross-file types (a `Utils` class in
                     // another file) and count the uses of a member that
                     // live outside the file being edited.
-                    editor.SetProjectFiles(
-                        ZanIDE.ProjectSources(tabs, root, act));
+                    // 交给编辑器的是分帧读入的项目源码：切换标签的这一帧
+                    // 只登记一次请求，实际读盘在下面的轮询段按预算推进
+                    // （整个工程一次读完实测 266 ms，全落在第一帧上）。
+                    projSrcFeed = true;
                     // Back to where this tab was left, not to line 1. A
                     // pending navigation target is applied just below and
                     // still wins.
@@ -1360,6 +1362,19 @@ partial class ZanIDE {
                 }
             }
             app.PerfMark("sh.symidx");
+            // 把项目源码读进编辑器：跨文件类型解析和引用计数要读工程里
+            // 每个 .zan，一帧读完就是几百毫秒的卡顿（本工程 266 ms，更大的
+            // 工程更久）。所以按字节预算分帧读，进度留在帧之间，读完了才
+            // 一次交给编辑器 —— 与 CodeEditor.StepExternRefs 同一套办法。
+            if (projSrcFeed && haveProject) {
+                if (ZanIDE.ProjectSourcesStep(root, 256)) {
+                    editor.SetProjectFiles(
+                        ZanIDE.ProjectSources(tabs, root, lastActive));
+                    projSrcFeed = false;
+                }
+                app.RequestRedraw();
+            }
+            app.PerfMark("sh.projsrc");
             // Poll the in-flight detached build (Run/Build ribbon): stream
             // compiler output and, when the done-marker appears, apply
             // diagnostics and (for Run) launch the program -- no UI freeze.
