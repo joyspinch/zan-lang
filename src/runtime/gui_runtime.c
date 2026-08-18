@@ -483,6 +483,16 @@ static int g_top_a[ZAN_TOP_T][ZAN_TOP_N], g_top_x[ZAN_TOP_T][ZAN_TOP_N],
 
 static void stat_top_rect(int t, int area, int x, int y, int w, int h,
                           u32 color) {
+    /* The same layer repaints the same rect every frame, so without this an
+     * entry over several frames fills every slot with one rect and hides the
+     * other layers -- exactly what the table exists to show. */
+    for (int i = 0; i < ZAN_TOP_N; i++) {
+        if (g_top_a[t][i] == area && g_top_x[t][i] == x &&
+            g_top_y[t][i] == y && g_top_w[t][i] == w &&
+            g_top_h[t][i] == h && g_top_c[t][i] == (int)color) {
+            return;
+        }
+    }
     int slot = -1;
     for (int i = 0; i < ZAN_TOP_N; i++) {
         if (area > g_top_a[t][i]) { slot = i; break; }
