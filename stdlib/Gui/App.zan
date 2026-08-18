@@ -25,6 +25,17 @@ class AnimSlot {
     }
 }
 
+/// 一条「整窗重绘理由 → 帧数」计数（参见 App.NoteFullFrameWhy）。
+class WhyTally {
+    string why;
+    int n;
+
+    WhyTally(string why) {
+        this.why = why;
+        this.n = 1;
+    }
+}
+
 /// 一帧的绘制体（参见 App.RunLoop / App.SafeFrame）。
 delegate void FrameBody();
 
@@ -36,6 +47,10 @@ class App {
     HitTester hitTester;
     bool isRunning;
     bool needsRedraw;
+    // 「别阻塞等事件，这一圈就回来」——与 needsRedraw 不同，它不
+    // 声称有像素变了。自动化驱动、外部泵这类需要循环持续转的
+    // 场景用它，避免为了轮询而把每一帧都升级成整窗重绘。
+    bool pollPending;
     /// 被 SafeFrame/PumpSafe 捕下的帧异常计数与最后一条消息：
     /// 界面可以把它当状态显示（“本次运行有 N 个错误”）。
     int frameErrors;
@@ -286,6 +301,19 @@ class App {
     int markAtUs;
     string phaseMarkTop;
     int phaseMarkTopUs;
+    // 本帧走到哪个标记点了，以及本帧第一次整窗重绘请求是在哪一段
+    // 发出的（"ev" = 事件处理期间）：整窗重绘帧的开销是脏区帧的
+    // 十几倍，所以要能指名道姓地问「这一帧凭什么整窗重画」。
+    string markNow;
+    string redrawWhy;
+    int redrawCount;
+    // 上面两个是「攒给下一帧」的：请求多半发生在上一帧渲染期间
+    // （即时模式控件在画的时候要求跟一帧）。BeginFrame 把它们
+    // 交接成本帧的理由，本帧结束时才归账。
+    string frameWhy;
+    int frameWhyN;
+    // 本批里每个整窗重绘理由各出现了多少帧。
+    List<WhyTally> fullWhy;
     // 本帧自身绘制最贵的那个节点（类型#名字）与它的微秒数。
     string phaseTopNode;
     int phaseTopUs;
@@ -434,6 +462,7 @@ class App {
         this.hitTester = new HitTester();
         this.isRunning = true;
         this.needsRedraw = true;
+        this.pollPending = false;
         this.frameBody = null;
         this.frameErrors = 0;
         this.lastFrameError = "";
@@ -537,6 +566,12 @@ class App {
         this.scopeEndUs = 0;
         this.scopeEndId = 0;
         this.markAtUs = 0;
+        this.markNow = "";
+        this.redrawWhy = "";
+        this.redrawCount = 0;
+        this.frameWhy = "";
+        this.frameWhyN = 0;
+        this.fullWhy = new List<WhyTally>();
         this.phaseMarkTop = "";
         this.phaseMarkTopUs = 0;
         this.phaseSecTop = "";
@@ -620,6 +655,7 @@ class App {
         isDark = dark;
         if (dark) { theme = Theme.Dark(); } else { theme = Theme.Light(); }
         theme.ScaleByDpi(dpiScale);
+        this.NoteRedrawWhy("SetDark");
         needsRedraw = true;
     }
 
@@ -644,6 +680,7 @@ class App {
         fxSnapValid = false;
         fxDamage = null;
         backdropDirty = true;
+        this.NoteRedrawWhy("ApplyTheme");
         needsRedraw = true;
     }
 
@@ -677,6 +714,7 @@ class App {
         this.ApplyAppCss();
         bgThemeGen = bgThemeGen + 1;
         backdropDirty = true;
+        this.NoteRedrawWhy("UseAppCss");
         needsRedraw = true;
     }
 
@@ -710,6 +748,7 @@ class App {
         fxSnapValid = false;
         fxDamage = null;
         backdropDirty = true;
+        this.NoteRedrawWhy("UseCss");
         needsRedraw = true;
     }
 
@@ -739,6 +778,7 @@ class App {
         appliedSkin = index;
         showThemeButton = true;
         window.SetCaptionButtons(ChromeButtonCount());
+        this.NoteRedrawWhy("EnableSkins");
         needsRedraw = true;
     }
 
@@ -823,6 +863,7 @@ class App {
             this.SetChromeButtons(showThemeButton, showPinButton,
                 showMinimizeButton, false);
         }
+        this.NoteRedrawWhy("SetResizable");
         needsRedraw = true;
     }
 
@@ -875,6 +916,7 @@ class App {
             glassNative = false;
         }
         window.SetShape(spec);
+        this.NoteRedrawWhy("SetWindowShape");
         needsRedraw = true;
     }
 
@@ -919,6 +961,7 @@ class App {
                 window.SetShape(shapeSpec);
             }
         }
+        this.NoteRedrawWhy("SetWindowShadow");
         needsRedraw = true;
     }
 
@@ -971,6 +1014,7 @@ class App {
         int n = 0;
         if (on) { n = ChromeButtonCount(); }
         window.SetCaptionButtons(n);
+        this.NoteRedrawWhy("SetChromeVisible");
         needsRedraw = true;
     }
 
@@ -990,6 +1034,7 @@ class App {
             window.DisableGlass();
             glassNative = false;
         }
+        this.NoteRedrawWhy("SetNativeGlass");
         needsRedraw = true;
     }
 
@@ -1013,6 +1058,7 @@ class App {
         bgImageOpacity = op;
         bgThemeGen = bgThemeGen + 1;
         fxSnapValid = false;
+        this.NoteRedrawWhy("SetWallpaper");
         needsRedraw = true;
         theme.MakeSurfacesOpaque();
         this.ApplySurfaceTranslucency();
@@ -1147,6 +1193,7 @@ class App {
     /// 请求宿主选择壁纸文件（见 ConsumeWallpaperPick）。
     void RequestWallpaperPick() {
         bgImagePickWanted = true;
+        this.NoteRedrawWhy("RequestWallpaperPick");
         needsRedraw = true;
     }
 
@@ -1485,6 +1532,7 @@ class App {
         fxEnabled = on;
         fxSnapValid = false;
         if (!on) { fxNextMs = -1; }
+        this.NoteRedrawWhy("SetBackdropFx");
         needsRedraw = true;
     }
 
@@ -1569,12 +1617,14 @@ class App {
     /// 任何其他重绘原因都会通过 CancelPartialFrame() 取消它。
     void NoteHoverDamage(int oldId, int newId) {
         if (this.HasOverlays() || this.PointerCaptured()) {
+            this.NoteRedrawWhy("hover-blocked");
             partialPending = false;
             return;
         }
         List<int> ra = hitTester.RectOf(oldId);
         List<int> rb = hitTester.RectOf(newId);
         if (ra == null && rb == null) {
+            this.NoteRedrawWhy("hover-norect");
             partialPending = false;
             return;
         }
@@ -1658,9 +1708,12 @@ class App {
     void NoteDamage(int x, int y, int w, int h) {
         needsRedraw = true;
         if (partialBlocked || this.HasOverlays()) {
+            if (partialBlocked) { this.NoteRedrawWhy("dmg-blocked"); }
+            else { this.NoteRedrawWhy("dmg-overlay"); }
             partialPending = false;
             return;
         }
+        this.NoteRedrawWhy("dmg");
         int x0 = x;
         int y0 = y;
         int x1 = x + w;
@@ -1684,6 +1737,21 @@ class App {
         dmgW = x1 - x0;
         dmgH = y1 - y0;
         partialPending = true;
+    }
+
+    /// 滚轮把某块可滚动区域的内容平移了一段：变的只有这块像素，
+    /// 于是把它声明成损伤区，而不是整窗重绘。区域为空或声明不成立
+    /// 时 NoteDamage 自己会退回整窗。
+    void NoteScrollDamage(int x, int y, int w, int h) {
+        this.NoteDamage(x, y, w, h);
+    }
+
+    /// 页面滚动影响的区域：标题栏以下、侧边栏（若有）以右的全部内容。
+    void NotePageScrollDamage() {
+        int x0 = 0;
+        if (splitX > 0) { x0 = splitX; }
+        this.NoteScrollDamage(x0, titlebarH, canvas.Width() - x0,
+                              canvas.Height() - titlebarH);
     }
 
     /// 强制下一帧完整重绘（任何非单纯
@@ -1722,6 +1790,7 @@ class App {
         showMinimizeButton = minimizeButton;
         showMaximizeButton = maximizeButton;
         window.SetCaptionButtons(ChromeButtonCount());
+        this.NoteRedrawWhy("SetChromeButtons");
         needsRedraw = true;
     }
 
@@ -1737,6 +1806,7 @@ class App {
         themeMenuBaseId = WidgetId.Block(names.Count);
         showThemeButton = true;
         window.SetCaptionButtons(ChromeButtonCount());
+        this.NoteRedrawWhy("SetThemeMenu");
         needsRedraw = true;
         return themeMenuChange;
     }
@@ -1750,6 +1820,7 @@ class App {
     /// 同步菜单选中项而不触发变更事件（用于深度链接）。
     void SetThemeMenuIndex(int i) {
         themeMenuModel.Set(i);
+        this.NoteRedrawWhy("SetThemeMenuIndex");
         needsRedraw = true;
     }
 
@@ -1810,6 +1881,7 @@ class App {
         if (maxScroll < 0) { maxScroll = 0; }
         if (scrollY > maxScroll) { scrollY = maxScroll; }
         if (scrollY < 0) { scrollY = 0; }
+        this.NoteRedrawWhy("SyncSurface");
         needsRedraw = true;
     }
 
@@ -2124,10 +2196,12 @@ class App {
             if (showThemeButton && hit == themeId) {
                 if (!themeMenuOpen.Get()) { themeMenuScroll.Set(0); }
                 themeMenuOpen.Set(!themeMenuOpen.Get());
+                this.NoteRedrawWhy("RenderCaptionButtons");
                 needsRedraw = true;
             } else if (showPinButton && hit == pinId) {
                 isTopmost = !isTopmost;
                 window.SetTopmost(isTopmost);
+                this.NoteRedrawWhy("RenderCaptionButtons");
                 needsRedraw = true;
             } else if (showMinimizeButton && hit == minId) {
                 window.Minimize();
@@ -2140,9 +2214,23 @@ class App {
         return themeId;
     }
 
+    /// 记下「下一帧为什么只能整窗重绘」的第一个理由（仅分析器开着
+    /// 时；见 fullWhy）。声明了范围的重绘不经过这里。
+    void NoteRedrawWhy(string why) {
+        if (!App.PerfOn()) { return; }
+        redrawCount = redrawCount + 1;
+        if (redrawWhy != "") { return; }
+        redrawWhy = why;
+    }
+
     void RequestRedraw() {
         // 未声明范围的重绘：无法知道哪些像素变了，因此
         // 下一帧整窗重绘（NoteDamage 是声明了范围的那一个）。
+        if (App.PerfOn()) {
+            string why = markNow;
+            if (why == "") { why = "ev"; }
+            this.NoteRedrawWhy(why);
+        }
         partialBlocked = true;
         partialPending = false;
         needsRedraw = true;
@@ -2348,6 +2436,7 @@ class App {
         Action handler = Dispatcher.Take();
         while (handler != null) {
             handler();
+            this.NoteRedrawWhy("handler");
             needsRedraw = true;
             handler = Dispatcher.Take();
         }
@@ -2415,7 +2504,8 @@ class App {
         int e = App.Ease(p);
         int val = from + (tgt - from) * e / 1000;
         a.cur = val;
-        if (p < 1000) { needsRedraw = true; } else { a.cur = tgt; }
+        if (p < 1000) { this.NoteRedrawWhy("anim"); needsRedraw = true; }
+        else { a.cur = tgt; }
         return a.cur;
     }
 
@@ -2429,6 +2519,7 @@ class App {
         int idx = AnimIndex(key);
         if (idx < 0) {
             anims.Add(new AnimSlot(key, 0, 1000, 0, nowMs, durMs));
+            this.NoteRedrawWhy("AnimIntro");
             needsRedraw = true;
             return 0;
         }
@@ -2445,7 +2536,8 @@ class App {
         int e = App.Ease(p);
         int val = from + (tgt - from) * e / 1000;
         a.cur = val;
-        if (p < 1000) { needsRedraw = true; } else { a.cur = tgt; }
+        if (p < 1000) { this.NoteRedrawWhy("anim-intro"); needsRedraw = true; }
+        else { a.cur = tgt; }
         return a.cur;
     }
 
@@ -2475,7 +2567,7 @@ class App {
         if (delta > 0 && next > target) { next = target; }
         if (delta < 0 && next < target) { next = target; }
         a.cur = next;
-        if (next != target) { needsRedraw = true; }
+        if (next != target) { this.NoteRedrawWhy("anim-step"); needsRedraw = true; }
         return next;
     }
 
@@ -2619,6 +2711,7 @@ class App {
         // 应用 CSS 里的 var(--token) 是按主题展开的，换了主题就要
         // 按新调色板重新展开一遍（否则应用样式表还挂着旧颜色）。
         this.ApplyAppCss();
+        this.NoteRedrawWhy("SetTheme");
         needsRedraw = true;
     }
 
@@ -2633,7 +2726,10 @@ class App {
         int loopT0 = 0;
         int loopPath = 2;
         if (App.PerfOn()) { loopT0 = Window.GetTickMs(); }
-        if (needsRedraw) {
+        if (needsRedraw || pollPending) {
+            // 一次性：要求轮询的一方每圈重新提出，驱动结束后
+            // 循环立刻回到阻塞等待，不留下空转。
+            pollPending = false;
             loopPath = 0;
             // 重绘挂起中（状态变化或动画进行中）。
             // 将忙轮询限制在约 60fps，避免运行中的动画让
@@ -2664,6 +2760,7 @@ class App {
                     if (fxOnly && this.FxPresent()) {
                         // 已就地呈现；继续等待下一个 tick。
                     } else {
+                        this.NoteRedrawWhy("ProcessEvent");
                         needsRedraw = true;
                         // 纯动画唤醒：若上一帧所有动画都声明了范围，
                         // 把这一帧裁剪到它们的并集。
@@ -2748,11 +2845,13 @@ class App {
             focus.SetHovered(hitId);
             if (hitId != oldHover) {
                 if (!needsRedraw) { this.NoteHoverDamage(oldHover, hitId); }
+                else { this.NoteRedrawWhy("hover-late"); }
                 needsRedraw = true;
             }
             // 当控件被按住（如滑块/滚动条拖拽）时，
             // 随指针移动持续重绘，使数值实时跟随光标。
             if (focus.pressedId >= 0) {
+                this.NoteRedrawWhy("drag");
                 needsRedraw = true;
             }
             int cursorId = hitId;
@@ -2800,6 +2899,7 @@ class App {
                 pressTargetId = hitId;
                 NotePressStart(hitId, mouseX, mouseY);
             }
+            this.NoteRedrawWhy("NotePressStart");
             needsRedraw = true;
         }
 
@@ -2823,6 +2923,7 @@ class App {
                 NoteClickTarget(clickTargetId);
                 focus.ClearPress();
             }
+            this.NoteRedrawWhy("click");
             needsRedraw = true;
         }
 
@@ -2834,6 +2935,7 @@ class App {
                 if (Modifiers.HasShift(window.EventMods())) { dir = -1; }
                 focus.FocusStep(dir);
             }
+            this.NoteRedrawWhy("focus-tab");
             needsRedraw = true;
         }
 
@@ -2846,6 +2948,7 @@ class App {
                 // 弹层和模态遮罩拥有本输入帧。让它们的
                 // 渲染路径消费滚轮，而不是移动
                 // 浮动表面下方的内容。
+                this.NoteRedrawWhy("wheel-blocked");
                 needsRedraw = true;
             } else if (splitX > 0 && mouseX < splitX) {
                 // 指针位于其上时滚动侧边栏。
@@ -2855,13 +2958,17 @@ class App {
                 int maxS = sidebarContentHeight - viewH;
                 if (maxS < 0) { maxS = 0; }
                 if (sidebarScrollY > maxS) { sidebarScrollY = maxS; }
-                if (sidebarScrollY != oldS) { needsRedraw = true; }
+                if (sidebarScrollY != oldS) {
+                    this.NoteScrollDamage(0, titlebarH, splitX,
+                                          canvas.Height() - titlebarH);
+                }
             } else if (mouseX >= wheelCapX && mouseX < wheelCapX + wheelCapW
                        && mouseY >= wheelCapY && mouseY < wheelCapY + wheelCapH) {
                 // 指针位于内部滚动的控件上（如
                 // DataTable 主体）；让它在渲染期间处理滚轮，
-                // 而不是滚动整个页面。
-                needsRedraw = true;
+                // 而不是滚动整个页面。变的只有这块视口。
+                this.NoteScrollDamage(wheelCapX, wheelCapY, wheelCapW,
+                                      wheelCapH);
             } else {
                 int oldScroll = scrollY;
                 scrollY = scrollY - delta * scrollSpeed / 120;
@@ -2870,7 +2977,7 @@ class App {
                 if (maxScroll < 0) { maxScroll = 0; }
                 if (scrollY > maxScroll) { scrollY = maxScroll; }
                 if (scrollY != oldScroll) {
-                    needsRedraw = true;
+                    this.NotePageScrollDamage();
                 }
             }
         }
@@ -2879,6 +2986,7 @@ class App {
         // （如 DataTable 过滤搜索框）能在本帧消费按键。
         // 事件槽仍保留该字符供控件读取。
         if (kind == 6 || kind == 4 || kind == 5) {
+            this.NoteRedrawWhy("key");
             needsRedraw = true;
         }
 
@@ -2958,6 +3066,7 @@ class App {
                 if (maxScroll < 0) { maxScroll = 0; }
                 if (scrollY > maxScroll) { scrollY = maxScroll; }
                 if (scrollY < 0) { scrollY = 0; }
+                this.NoteRedrawWhy("ApplyEvent");
                 needsRedraw = true;
             }
         }
@@ -2974,13 +3083,20 @@ class App {
                 // 状态变化请求的重绘可能触及任意
                 // 像素，裁剪掉它会丢失该更新。
                 if (!needsRedraw) { this.NoteHoverDamage(oldHover, hitId); }
+                this.NoteRedrawWhy("ApplyEvent");
                 needsRedraw = true;
             }
-            if (focus.pressedId >= 0) { needsRedraw = true; }
+            if (focus.pressedId >= 0) {
+                this.NoteRedrawWhy("press-hold");
+                needsRedraw = true;
+            }
             // 按住按钮：即时模式拖拽逻辑（画布元素、选框、
             // 缩放手柄）位于渲染代码中，因此指针按下期间
             // 的每次移动都必须到达一帧，即使不在任何控件上。
-            if (pointerDown) { needsRedraw = true; }
+            if (pointerDown) {
+                this.NoteRedrawWhy("pointer-down");
+                needsRedraw = true;
+            }
             int cursorId = hitId;
             if (focus.pressedId >= 0) { cursorId = focus.pressedId; }
             int wtype = hitTester.GetWidgetType(cursorId);
@@ -3014,6 +3130,7 @@ class App {
                 pointerDown = true;
                 NotePressStart(hitId, mouseX, mouseY);
             }
+            this.NoteRedrawWhy("NotePressStart");
             needsRedraw = true;
         }
 
@@ -3033,6 +3150,7 @@ class App {
                 NoteClickTarget(clickTargetId);
                 focus.ClearPress();
             }
+            this.NoteRedrawWhy("click");
             needsRedraw = true;
         }
 
@@ -3042,6 +3160,7 @@ class App {
                 if (Modifiers.HasShift(window.EventMods())) { dir = -1; }
                 focus.FocusStep(dir);
             }
+            this.NoteRedrawWhy("focus-tab");
             needsRedraw = true;
         }
 
@@ -3051,10 +3170,12 @@ class App {
             int delta = window.EventKeyCode();
             int viewH = canvas.Height() - titlebarH;
             if (this.HasOverlays() || blocksInputBelow) {
+                this.NoteRedrawWhy("wheel-blocked");
                 needsRedraw = true;
             } else if (mouseX >= wheelCapX && mouseX < wheelCapX + wheelCapW
                 && mouseY >= wheelCapY && mouseY < wheelCapY + wheelCapH) {
-                needsRedraw = true;
+                this.NoteScrollDamage(wheelCapX, wheelCapY, wheelCapW,
+                                      wheelCapH);
             } else {
                 int oldScroll = scrollY;
                 scrollY = scrollY - delta * scrollSpeed / 120;
@@ -3062,11 +3183,16 @@ class App {
                 int maxScroll = contentHeight - viewH;
                 if (maxScroll < 0) { maxScroll = 0; }
                 if (scrollY > maxScroll) { scrollY = maxScroll; }
-                if (scrollY != oldScroll) { needsRedraw = true; }
+                if (scrollY != oldScroll) {
+                    this.NotePageScrollDamage();
+                }
             }
         }
 
-        if (kind == 6 || kind == 4 || kind == 5) { needsRedraw = true; }
+        if (kind == 6 || kind == 4 || kind == 5) {
+            this.NoteRedrawWhy("key");
+            needsRedraw = true;
+        }
 
         // 真实输入（按下/抬起/滚轮/按键/字符，以及指针真的动了的
         // 移动）记时：环境特效的心跳降速以此为准。
@@ -3223,6 +3349,8 @@ class App {
                     + " scope_ms=" + App.UsAvg(phaseSecTopUs, 1)
                     + " mark=" + phaseMarkTop
                     + " mark_ms=" + App.UsAvg(phaseMarkTopUs, 1)
+                    + " redraw=" + Convert.ToString(frameWhyN)
+                    + "/" + frameWhy
                     + " frame=" + Convert.ToString(frameCount) + "\n");
             }
             phaseTopNode = "";
@@ -3234,6 +3362,7 @@ class App {
             phaseMarkTop = "";
             phaseMarkTopUs = 0;
             markAtUs = 0;
+            markNow = "";
             perfBgUs = perfBgUs + phaseBgUs;
             perfMeasUs = perfMeasUs + phaseMeasUs;
             perfArrUs = perfArrUs + phaseArrUs;
@@ -3256,7 +3385,9 @@ class App {
             } else {
                 perfRenderMs = perfRenderMs + (perfPreMs - perfBeginMs);
                 perfPresentMs = perfPresentMs + (endMs - perfPreMs);
+                this.NoteFullFrameWhy();
             }
+            frameWhy = "";
             perfFrames = perfFrames + 1;
             if (perfFrames >= 30) {
                 int fullN = perfFrames - perfPartFrames;
@@ -3278,10 +3409,12 @@ class App {
                     + " measure_ms=" + App.UsAvg(perfMeasUs, perfFrames)
                     + " arrange_ms=" + App.UsAvg(perfArrUs, perfFrames)
                     + " tree_ms=" + App.UsAvg(perfTreeUs, perfFrames)
+                    + " why=" + this.FullWhyLine()
                     + " surface=" + Convert.ToString(canvas.Width())
                     + "x" + Convert.ToString(canvas.Height()) + "\n");
                 File.AppendAllText("zan_frame_perf.log",
                     "  raster/frame " + App.RasterLine(perfFrames) + "\n");
+                fullWhy = new List<WhyTally>();
                 perfFrames = 0;
                 perfRenderMs = 0;
                 perfPresentMs = 0;
@@ -3364,11 +3497,52 @@ class App {
         markAtUs = now;
         // 本帧的第一个标记只定起点：不然跨帧那一段（循环在等事件）
         // 会被记到它头上。
+        if (name != "") { markNow = name; }
         if (name == "" || first) { return; }
         if (d > phaseMarkTopUs) {
             phaseMarkTopUs = d;
             phaseMarkTop = name;
         }
+    }
+
+    /// 记下这一整窗重绘帧是凭什么整窗重画的：脏区帧只重画一条带，
+    /// 整窗帧得把整个页面重新混一遍，因此“谁在不停地要整窗重绘”
+    /// 是帧成本的首要问题，而不是帧里画了什么。
+    void NoteFullFrameWhy() {
+        string why = frameWhy;
+        if (why == "") { why = "none"; }
+        for (int i = 0; i < fullWhy.Count; i = i + 1) {
+            if (fullWhy[i].why == why) {
+                fullWhy[i].n = fullWhy[i].n + 1;
+                return;
+            }
+        }
+        fullWhy.Add(new WhyTally(why));
+    }
+
+    /// 本批里整窗重绘理由的前三名（name:帧数，逗号分隔）。
+    string FullWhyLine() {
+        List<int> left = new List<int>();
+        for (int i = 0; i < fullWhy.Count; i = i + 1) {
+            left.Add(fullWhy[i].n);
+        }
+        string outp = "";
+        int taken = 0;
+        while (taken < 3) {
+            int best = 0 - 1;
+            for (int i = 0; i < left.Count; i = i + 1) {
+                if (left[i] <= 0) { continue; }
+                if (best < 0 || left[i] > left[best]) { best = i; }
+            }
+            if (best < 0) { break; }
+            if (outp != "") { outp = outp + ","; }
+            outp = outp + fullWhy[best].why + ":"
+                + Convert.ToString(fullWhy[best].n);
+            left[best] = 0;
+            taken = taken + 1;
+        }
+        if (outp == "") { return "-"; }
+        return outp;
     }
 
     /// 一个节点自身绘制的耗时（不含子树）：只留本帧最贵的那个。
@@ -3497,6 +3671,22 @@ class App {
         nowMs = Window.GetTickMs();
         // 帧开始时清除重绘标志；本帧内调用的处理程序
         // 可再次设置它，请求立即的后续重绘。
+        if (App.PerfOn()) {
+            if (redrawWhy == "") {
+                if (needsRedraw) { redrawWhy = "silent"; }
+                else { redrawWhy = "unrequested"; }
+            }
+            if (frameWhy != "" && redrawWhy == "") {
+                // 这一帧之前已经有人交接过理由，却又走了一次
+                // BeginFrame：说明一次 Present 对应了两次开帧。
+                frameWhy = "rebegin:" + frameWhy;
+            } else {
+                frameWhy = redrawWhy;
+                frameWhyN = redrawCount;
+            }
+            redrawWhy = "";
+            redrawCount = 0;
+        }
         needsRedraw = false;
         // 同样清除节流动画的截止时间；仍在运行的动画
         // （spinner 等）会在渲染期间通过 RequestAnimationFrame 重新武装。
@@ -3596,7 +3786,10 @@ class App {
         overlays.Add(p);
         // 在损坏裁剪帧期间出现的弹层/工具提示会被
         // 裁剪掉：注册后立即请求一帧完整重绘。
-        if (partialFrame) { needsRedraw = true; }
+        if (partialFrame) {
+            this.NoteRedrawWhy("overlay-in-partial");
+            needsRedraw = true;
+        }
     }
 
     /// 按注册顺序绘制并分发本帧注册的所有遮罩。
