@@ -19,17 +19,8 @@ cmake_policy(SET CMP0007 NEW)
 
 set(_budget
   "stdlib/Gui/Backend/UiDriver.zan=12"
-  "stdlib/Gui/Component/ChatView.zan=15"
-  "stdlib/Gui/Component/CodeEditor/CodeEditor.Render.zan=10"
   "stdlib/Gui/Component/FilePicker.zan=33"
-  "stdlib/Gui/Component/PivotTable.zan=23"
-  "stdlib/Gui/Component/PropertyGrid.zan=7"
-  "stdlib/Gui/Effects.zan=9"
-  "stdlib/Gui/Widget/Progress.zan=9"
   "stdlib/Gui/Widget/Ribbon.zan=30"
-  "stdlib/Gui/Widget/Spin.zan=5"
-  "stdlib/Gui/Widget/States.zan=18"
-  "stdlib/Gui/Widget/StyledText.zan=11"
   "stdlib/Gui/Widget/Wizard.zan=66"
 )
 

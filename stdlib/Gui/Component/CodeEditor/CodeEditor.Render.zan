@@ -97,10 +97,10 @@ partial class CodeEditor {
 
     /// 活动语法调色板的廉价签名；变化时
     /// 整个高亮缓存被丢弃，使颜色跟随主题/覆盖切换。
-    int HlThemeSig(Gui.Theme t) {
-        int s = t.textPrimary;
+    int HlThemeSig(Gui.Theme t, int defaultText) {
+        int s = defaultText;
         s = s ^ synKw ^ synTy ^ synStr ^ synCom ^ synNum ^ synText;
-        if (CodeEditor.IsLightBg(t)) { s = s ^ 0x5A5A5A5A; }
+        if (t.IsLightBg()) { s = s ^ 0x5A5A5A5A; }
         return s;
     }
 
@@ -112,8 +112,8 @@ partial class CodeEditor {
     /// */。当前一行尚未缓存时（跳转后首次绘制），
     /// 从最近的已缓存行向前分词重新推导状态，
     /// 直至本行。
-    CeHlLine GetHl(int ln, string text, Theme t) {
-        int sig = HlThemeSig(t);
+    CeHlLine GetHl(int ln, string text, Theme t, int defaultText) {
+        int sig = HlThemeSig(t, defaultText);
         if (sig != hlThemeSig) {
             hlCache = new List<CeHlLine>();
             hlThemeSig = sig;
@@ -123,7 +123,7 @@ partial class CodeEditor {
         if (cur != null && cur.src == text) {
             if (cur.spans == null) {
                 cur.spans = new List<CodeSpan>();
-                cur.blockOpen = Highlight(text, t, cur.blockIn, cur.spans);
+                cur.blockOpen = Highlight(text, t, defaultText, cur.blockIn, cur.spans);
             }
             return cur;
         }
@@ -154,7 +154,7 @@ partial class CodeEditor {
                         ke.spans = null;
                         ke.blockIn = inBlock;
                         scratch = new List<CodeSpan>();
-                        ke.blockOpen = Highlight(kt, t, inBlock, scratch);
+                        ke.blockOpen = Highlight(kt, t, defaultText, inBlock, scratch);
                         inBlock = ke.blockOpen;
                         while (hlCache.Count <= k) { hlCache.Add(null); }
                         hlCache[k] = ke;
@@ -170,7 +170,7 @@ partial class CodeEditor {
         ne.src = text;
         ne.spans = new List<CodeSpan>();
         ne.blockIn = inBlock;
-        ne.blockOpen = Highlight(text, t, inBlock, ne.spans);
+        ne.blockOpen = Highlight(text, t, defaultText, inBlock, ne.spans);
         hlCache[ln] = ne;
         return ne;
     }
@@ -179,7 +179,8 @@ partial class CodeEditor {
     /// 的标识符）、字符串、注释和数字各用不同颜色；
     /// 其余用默认文本色。`inBlock` 继承自
     /// 上一行，返回值是该行结束时的状态。
-    bool Highlight(string line, Theme t, bool inBlock, List<CodeSpan> spans) {
+    bool Highlight(string line, Theme t, int defaultText, bool inBlock,
+                   List<CodeSpan> spans) {
         // 默认值跟随当前外观：浅色背景用
         // 适配浅色的调色板，深色背景保留经典深色调色板。
         EditorPalette pal = EditorPalette.For(t);
@@ -188,7 +189,7 @@ partial class CodeEditor {
         int strC = pal.str;
         int comC = pal.comment;
         int numC = pal.number;
-        int def = t.textPrimary;
+        int def = defaultText;
         if (synKw != 0) { kwC = synKw; }
         if (synTy != 0) { tyC = synTy; }
         if (synStr != 0) { strC = synStr; }
@@ -323,17 +324,6 @@ partial class CodeEditor {
         return false;
     }
 
-    /// 背景 RGB 通道整体偏亮时视为"浅色"；
-    /// 用于选择适配外观的默认语法 / 选区颜色。
-    static bool IsLightBg(Gui.Theme t) {
-        int rgb = t.bgPrimary % 16777216;
-        if (rgb < 0) { rgb = rgb + 16777216; }
-        int r = rgb / 65536;
-        int g = (rgb / 256) % 256;
-        int b = rgb % 256;
-        return r + g + b > 384;
-    }
-
     /// 选区高亮色调，选在当前外观下可读的颜色。
     static int SelColor(Gui.Theme t) {
         return EditorPalette.For(t).selection;
@@ -392,6 +382,14 @@ partial class CodeEditor {
         Canvas c = app.canvas;
         Gui.Theme t = app.theme;
         EditorPalette pal = EditorPalette.For(t);
+        StyleBox surfaceStyle = Style.Part(app, "codeeditor", "surface", "",
+                                           "", "", Style.SNormal());
+        StyleBox gutterStyle = Style.Part(app, "codeeditor", "gutter", "",
+                                          "", "", Style.SNormal());
+        StyleBox dividerStyle = Style.Part(app, "codeeditor", "divider", "",
+                                           "", "", Style.SNormal());
+        StyleBox textStyle = Style.Part(app, "codeeditor", "text", "",
+                                        "", "", Style.SNormal());
         int id = app.focus.AllocId();
         lastId = id;
         bool focused = app.focus.IsFocused(id);
@@ -409,9 +407,9 @@ partial class CodeEditor {
         if (lineH < 1) { lineH = 1; }
         int gutterW = app.Scale(48);
 
-        c.FillRect(area.x, area.y, area.width, area.height, t.bgPrimary);
-        c.FillRect(area.x, area.y, gutterW, area.height, t.bgSecondary);
-        c.FillRect(area.x + gutterW, area.y, 1, area.height, t.divider);
+        c.FillRect(area.x, area.y, area.width, area.height, surfaceStyle.BgOr(0));
+        c.FillRect(area.x, area.y, gutterW, area.height, gutterStyle.BgOr(0));
+        c.FillRect(area.x + gutterW, area.y, 1, area.height, dividerStyle.BgOr(0));
 
         bool ownsWheel = app.CaptureWheel(
             area.x, area.y, area.width, area.height);
@@ -471,7 +469,18 @@ partial class CodeEditor {
             Canvas.FontHeight(t.fontSizeSmall) + app.Scale(3));
         visLines = VisibleRowCount();
         pageRows = visLines;
-        RenderLines(app, area, lineH, fontSize, gutterW, textX, visLines, focused);
+        StyleBox hoverStyle = Style.Part(app, "codeeditor", "hover", "",
+                                         "", "", Style.SNormal());
+        StyleBox breakpointStyle = Style.Part(app, "codeeditor", "breakpoint", "",
+                                              "", "", Style.SNormal());
+        StyleBox lineNumberStyle = Style.Part(app, "codeeditor", "line-number", "",
+                                              "", "", Style.SNormal());
+        StyleBox caretStyle = Style.Part(app, "codeeditor", "caret", "",
+                                         "", "", Style.SNormal());
+        RenderLines(app, area, lineH, fontSize, gutterW, textX, visLines, focused,
+                    hoverStyle.BgOr(0), breakpointStyle.BgOr(0),
+                    lineNumberStyle.FgOr(0), caretStyle.BgOr(0),
+                    textStyle.FgOr(0));
         // 本帧预算不足未完成的计数：下一帧继续完成。
         if (LensPending()) { app.RequestRedraw(); }
 
@@ -915,7 +924,10 @@ partial class CodeEditor {
     /// 绘制可见行窗口：装订线、断点/执行标记、行号、
     /// 选区高亮、语法区间、光标、错误下划线、
     /// 行内错误提示和 CodeLens。裁剪到编辑器矩形内。
-    void RenderLines(App app, Rect area, int lineH, int fontSize, int gutterW, int textX, int visLines, bool focused) {
+    void RenderLines(App app, Rect area, int lineH, int fontSize, int gutterW,
+                     int textX, int visLines, bool focused, int hoverColor,
+                     int breakpointColor, int lineNumberColor, int caretColor,
+                     int defaultText) {
         Canvas c = app.canvas;
         Gui.Theme t = app.theme;
         EditorPalette pal = EditorPalette.For(t);
@@ -933,14 +945,15 @@ partial class CodeEditor {
                 if (ln == execLine) {
                     c.FillRect(area.x + gutterW + 1, rowY, area.width - gutterW - 1, lineH, pal.warnLineBg);
                 } else if (ln == curLine && focused) {
-                    c.FillRect(area.x + gutterW + 1, rowY, area.width - gutterW - 1, lineH, t.bgHover);
+                    c.FillRect(area.x + gutterW + 1, rowY, area.width - gutterW - 1,
+                               lineH, hoverColor);
                 }
 
                 if (HasBreakpoint(ln)) {
                     int dotSz = app.Scale(10);
                     int dotX = area.x + app.Scale(6);
                     int dotY = rowY + (lineH - dotSz) / 2;
-                    c.FillRoundRect(dotX, dotY, dotSz, dotSz, dotSz, t.error);
+                    c.FillRoundRect(dotX, dotY, dotSz, dotSz, dotSz, breakpointColor);
                 }
                 if (ln == execLine) {
                     int aw = app.Scale(10);
@@ -951,7 +964,8 @@ partial class CodeEditor {
 
                 string num = Convert.ToString(ln + 1);
                 int numW = Canvas.MeasureText(num, fontSize);
-                c.DrawText(area.x + gutterW - numW - app.Scale(8), textY, num, t.textTertiary, fontSize);
+                c.DrawText(area.x + gutterW - numW - app.Scale(8), textY, num,
+                           lineNumberColor, fontSize);
 
                 string text = lines[ln];
 
@@ -971,7 +985,7 @@ partial class CodeEditor {
                         Canvas.MeasureText(text, fontSize), app.Scale(2), pal.errorDim);
                 }
 
-                CeHlLine hl = GetHl(ln, text, t);
+                CeHlLine hl = GetHl(ln, text, t, defaultText);
                 List<CodeSpan> spans = hl.spans;
                 int sx = textX;
                 for (int si2 = 0; si2 < spans.Count; si2 = si2 + 1) {
@@ -983,7 +997,8 @@ partial class CodeEditor {
                 if (ln == curLine && focused) {
                     string upto = Text.Left(text, curCol);
                     int cxp = textX + Canvas.MeasureText(upto, fontSize);
-                    c.FillRect(cxp, rowY + app.Scale(2), 1, lineH - app.Scale(4), t.primary);
+                    c.FillRect(cxp, rowY + app.Scale(2), 1,
+                               lineH - app.Scale(4), caretColor);
                 }
 
                 // CodeLens：此处声明成员的引用计数，位于
