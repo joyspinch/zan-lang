@@ -17,11 +17,11 @@
 
 cmake_policy(SET CMP0007 NEW)
 
+# UiDriver.ThemeJson exports the theme palette to ThemeDoc JSON for driver
+# self-checks; these reads are not drawing paths. When adding exported fields,
+# keep ThemeDoc, ThemeJson, and this note in sync.
 set(_budget
   "stdlib/Gui/Backend/UiDriver.zan=12"
-  "stdlib/Gui/Component/FilePicker.zan=33"
-  "stdlib/Gui/Widget/Ribbon.zan=30"
-  "stdlib/Gui/Widget/Wizard.zan=66"
 )
 
 set(_members "primary|primaryHover|primaryPressed|info|infoHover|infoPressed|success|successHover|successPressed|warning|warningHover|warningPressed|error|errorHover|errorPressed|textPrimary|textSecondary|textTertiary|textDisabled|textInverse|bgPrimary|bgSecondary|bgTertiary|bgHover|bgActive|bgDisabled|borderPrimary|borderSecondary|borderHover|borderFocus|divider|shadowColor|scrollbar|scrollbarHover|tooltipBg|tooltipBorder|tooltipText|glassTint|glassChromeTint")
