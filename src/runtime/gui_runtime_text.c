@@ -23,8 +23,6 @@ static uint64_t g_text_measure_calls = 0;
 static uint64_t g_text_height_calls = 0;
 static uint64_t g_text_font_creates = 0;
 static uint64_t g_text_font_hits = 0;
-static uint64_t g_text_draw_cache_hits = 0;
-static uint64_t g_text_draw_cache_misses = 0;
 static uint64_t g_text_measure_cache_hits = 0;
 static uint64_t g_text_measure_cache_misses = 0;
 static uint64_t g_text_draw_us = 0;
@@ -52,8 +50,8 @@ EXPORT void zan_gui_text_stat_enable(i32 enabled) {
         g_text_height_calls = 0;
         g_text_font_creates = 0;
         g_text_font_hits = 0;
-        g_text_draw_cache_hits = 0;
-        g_text_draw_cache_misses = 0;
+        g_atlas_hits = 0;
+        g_atlas_misses = 0;
         g_text_measure_cache_hits = 0;
         g_text_measure_cache_misses = 0;
         g_text_draw_us = 0;
@@ -71,8 +69,8 @@ EXPORT i64 zan_gui_text_stat_read(i32 idx) {
         case 2: return (i64)g_text_height_calls;
         case 3: return (i64)g_text_font_creates;
         case 4: return (i64)g_text_font_hits;
-        case 5: return (i64)g_text_draw_cache_hits;
-        case 6: return (i64)g_text_draw_cache_misses;
+        case 5: return (i64)g_atlas_hits;
+        case 6: return (i64)g_atlas_misses;
         case 7: return (i64)g_text_measure_cache_hits;
         case 8: return (i64)g_text_measure_cache_misses;
         case 9: return (i64)g_text_draw_us;
@@ -124,27 +122,6 @@ static HFONT get_or_create_font(int size) {
     return g_fonts[slot];
 }
 
-/* --- Rasterised text-run cache -------------------------------------------
- * zan_gui_draw_text is called many times per frame (one call per token/word)
- * and, while scrolling, with the *same* strings every frame -- only the Y
- * position moves. GDI-rendering each call (DIB alloc + TextOutW + GdiFlush)
- * then dominates CPU. Cache the white-on-black coverage bitmap keyed by
- * (text, size); the draw colour is applied at composite time, so it is not
- * part of the key and the same glyph run is reused for any colour. Entries
- * persist across frames, so scrolling only re-blits cached masks. */
-typedef struct {
-    char *text;   /* UTF-8 key; NULL marks an empty slot */
-    int   size;
-    int   tw, th;
-    u32  *bits;   /* tw*th ARGB coverage straight from GDI */
-    uint64_t used;   /* LRU tick */
-} zan_text_cache_t;
-
-#define ZAN_TEXT_CACHE_CAP 1024
-#define ZAN_TEXT_CACHE_PROBE 8
-static zan_text_cache_t g_tcache[ZAN_TEXT_CACHE_CAP];
-static uint64_t g_tcache_clock = 0;
-
 static uint64_t zan_text_hash(const char *s, int size) {
     uint64_t h = 1469598103934665603ULL;
     for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
@@ -156,30 +133,23 @@ static uint64_t zan_text_hash(const char *s, int size) {
     return h;
 }
 
-/* Returns a cache entry whose bits hold the coverage mask, or NULL on error. */
-static zan_text_cache_t *zan_text_cache_get(const char *text, int size) {
-    uint64_t h = zan_text_hash(text, size);
-    int base = (int)(h % ZAN_TEXT_CACHE_CAP);
-    zan_text_cache_t *victim = NULL;
-    for (int i = 0; i < ZAN_TEXT_CACHE_PROBE; i++) {
-        zan_text_cache_t *e = &g_tcache[(base + i) % ZAN_TEXT_CACHE_CAP];
-        if (e->text && e->size == size && strcmp(e->text, text) == 0) {
-            e->used = ++g_tcache_clock;
-            if (g_text_stats_enabled) { g_text_draw_cache_hits++; }
-            return e;
-        }
-        if (!e->text && !victim) victim = e;
-    }
-    if (!victim) {
-        uint64_t best = ~0ULL;
-        for (int i = 0; i < ZAN_TEXT_CACHE_PROBE; i++) {
-            zan_text_cache_t *e = &g_tcache[(base + i) % ZAN_TEXT_CACHE_CAP];
-            if (e->used <= best) { best = e->used; victim = e; }
-        }
-    }
+/* The coverage tile of a whole text run, rasterised by GDI on the first use of
+ * that (text, size) and cached in the glyph atlas afterwards.
+ *
+ * The run -- not the glyph -- is the unit here: ClearType coverage is
+ * per-channel and produced for the string GDI laid out itself, so caching
+ * glyphs separately and placing them at integer advances would change how
+ * every label in the app looks.
+ *
+ * White on black is what makes the result a mask: the draw colour is applied
+ * when the run is composited, so it is not part of the key and one tile serves
+ * every colour the same string is drawn in. */
+static const zan_glyph_tile *win_run_tile(const char *text, int size) {
+    int key_len = (int)strlen(text);
+    const zan_glyph_tile *cached =
+        zan_atlas_find(ZAN_TILE_RUN, size, text, key_len);
+    if (cached) return cached;
 
-    /* Miss: rasterise white text on black to capture the coverage mask. */
-    if (g_text_stats_enabled) { g_text_draw_cache_misses++; }
     int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
     wchar_t *wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
     if (!wtext) return NULL;
@@ -212,27 +182,15 @@ static zan_text_cache_t *zan_text_cache_get(const char *text, int size) {
     TextOutW(g_text_dc, 0, 0, wtext, text_len);
     GdiFlush();
 
-    u32 *copy = (u32 *)malloc((size_t)(tw * th) * sizeof(u32));
-    if (copy) memcpy(copy, dbits, (size_t)(tw * th) * sizeof(u32));
+    const zan_glyph_tile *tile =
+        zan_atlas_store(ZAN_TILE_RUN, size, text, key_len,
+                        tw, th, 0, 0, (int)ts.cx, dbits, 4);
 
     SelectObject(g_text_dc, old_bmp);
     SelectObject(g_text_dc, old_font);
     DeleteObject(hbmp);
     free(wtext);
-    if (!copy) return NULL;
-
-    if (victim->text) { free(victim->text); victim->text = NULL; }
-    if (victim->bits) { free(victim->bits); victim->bits = NULL; }
-    size_t klen = strlen(text) + 1;
-    victim->text = (char *)malloc(klen);
-    if (!victim->text) { free(copy); return NULL; }
-    memcpy(victim->text, text, klen);
-    victim->size = size;
-    victim->tw = tw;
-    victim->th = th;
-    victim->bits = copy;
-    victim->used = ++g_tcache_clock;
-    return victim;
+    return tile;
 }
 
 EXPORT void zan_gui_draw_text(
@@ -240,6 +198,7 @@ EXPORT void zan_gui_draw_text(
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s || !text || !*text) return;
+    ZAN_BE(s, draw_text, s, (int)x, (int)y, text, (u32)color, (int)font_size);
 
     int size = (int)font_size;
     if (size < 8) size = 8;
@@ -252,55 +211,17 @@ EXPORT void zan_gui_draw_text(
         t0 = text_qpc_us();
     }
 
-    zan_text_cache_t *e = zan_text_cache_get(text, size);
-    if (!e || !e->bits) {
-        if (g_text_stats_enabled) {
-            g_text_draw_us += text_qpc_us() - t0;
-        }
-        return;
-    }
-    int tw = e->tw;
-    int th = e->th;
-    u32 *src = e->bits;
-
-    /* Extract color components */
-    u32 cr = ((u32)color >> 16) & 0xFF;
-    u32 cg = ((u32)color >> 8) & 0xFF;
-    u32 cb = (u32)color & 0xFF;
-    u32 ca = ((u32)color >> 24) & 0xFF;
-    if (ca == 0) ca = 255; /* treat 0 alpha as opaque for text */
-
-    /* Composite cached coverage using per-channel ClearType AA. Clip is
-     * resolved to pixel ranges once here instead of a per-pixel branch, since
-     * this loop runs over every glyph pixel on every repaint. */
-    int ox = (int)x, oy = (int)y;
-    int py0 = s->clip_y0 - oy; if (py0 < 0) py0 = 0;
-    int py1 = s->clip_y1 - oy; if (py1 > th) py1 = th;
-    int px0 = s->clip_x0 - ox; if (px0 < 0) px0 = 0;
-    int px1 = s->clip_x1 - ox; if (px1 > tw) px1 = tw;
-    for (int py = py0; py < py1; py++) {
-        const u32 *srow = src + (size_t)py * tw;
-        int dst_row = (oy + py) * s->stride + ox;
-        for (int px = px0; px < px1; px++) {
-            u32 sp = srow[px];
-            if ((sp & 0x00FFFFFFu) == 0) continue;
-            u32 sr = (sp >> 16) & 0xFF;
-            u32 sg = (sp >> 8) & 0xFF;
-            u32 sb = sp & 0xFF;
-            /* Per-channel blend for subpixel AA */
-            int idx = dst_row + px;
-            u32 dp = s->pixels[idx];
-            u32 dr = (dp >> 16) & 0xFF;
-            u32 dg = (dp >> 8) & 0xFF;
-            u32 db = dp & 0xFF;
-            u32 ar = sr * ca / 255;
-            u32 ag = sg * ca / 255;
-            u32 ab = sb * ca / 255;
-            u32 or_ = (cr * ar + dr * (255 - ar)) / 255;
-            u32 og = (cg * ag + dg * (255 - ag)) / 255;
-            u32 ob = (cb * ab + db * (255 - ab)) / 255;
-            s->pixels[idx] = (255u << 24) | (or_ << 16) | (og << 8) | ob;
-        }
+    const zan_glyph_tile *tile = win_run_tile(text, size);
+    if (tile) {
+        zan_glyph_item item;
+        item.tile = tile;
+        item.x = (int)x + tile->left;
+        item.y = (int)y + tile->top;
+        zan_glyph_run run;
+        run.color = (u32)color;
+        run.count = 1;
+        run.items = &item;
+        ZAN_IMPL(s, glyph_run)->glyph_run(s, &run);
     }
     if (g_text_stats_enabled) {
         g_text_draw_us += text_qpc_us() - t0;
@@ -436,5 +357,16 @@ EXPORT i32 zan_gui_font_height(i32 font_size) {
     return (i64)val;
 }
 
+
+#else /* !_WIN32 */
+
+/* The text profiler counts GDI calls and its caches, so only the Win32 text
+ * path has anything to report. Canvas.TextStat* is declared unconditionally
+ * in Zan (stdlib/Gui/Render.zan), so every program touching it -- including
+ * the GUI conformance cases -- needs the symbols to exist elsewhere too;
+ * here they report "profiler off / nothing measured". */
+EXPORT void zan_gui_text_stat_enable(i32 enabled) { (void)enabled; }
+
+EXPORT i64 zan_gui_text_stat_read(i32 idx) { (void)idx; return 0; }
 
 #endif /* _WIN32 */

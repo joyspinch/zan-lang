@@ -33,6 +33,7 @@ static int g_scale_linux = 100;
 static int g_titlebar_h_l = 32;
 static int g_btn_w_l = 46;
 static int g_caption_btn_count_l = 5;
+static int g_metrics_ready_linux = 0;
 
 /* Per-window state so one process can drive several top-level windows. The
  * globals above still track the primary window for process-wide operations
@@ -60,6 +61,15 @@ static zan_lwin_t *lwin_find(Window xid) {
 
 i32 zan_gui_get_dpi_scale(void);
 i32 zan_gui_is_maximized(iptr hwnd_val);
+
+static void x11_set_scale_metrics(int scale) {
+    if (scale <= 0) { scale = 100; }
+    if (g_metrics_ready_linux && g_scale_linux == scale) { return; }
+    g_scale_linux = scale;
+    g_titlebar_h_l = 32 * scale / 100;
+    g_btn_w_l = 46 * scale / 100;
+    g_metrics_ready_linux = 1;
+}
 
 /* Decoded-event queue: a single XEvent can yield several ABI events (a key
  * press -> keyDown + textInput; a wheel button -> scroll), so decoded events
@@ -382,17 +392,22 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
     if (!g_display) {
         g_display = XOpenDisplay(NULL);
         if (!g_display) return 0;
-        /* Input method for UTF-8 text input (also enables IME preedit); opened
-         * once per display and shared by every window's input context. */
+    }
+    /* Keep client-side decoration metrics in device pixels even for callers
+     * that create a window directly without querying DPI first. */
+    zan_gui_get_dpi_scale();
+    /* Input method for UTF-8 text input (also enables IME preedit); opened
+     * once per display and shared by every window's input context. */
+    if (!g_xim) {
         setlocale(LC_ALL, "");
         XSetLocaleModifiers("");
         g_xim = XOpenIM(g_display, NULL, NULL, NULL);
-        if (g_wake_pipe[0] < 0 && pipe(g_wake_pipe) == 0) {
-            fcntl(g_wake_pipe[0], F_SETFL, O_NONBLOCK);
-            fcntl(g_wake_pipe[1], F_SETFL, O_NONBLOCK);
-            fcntl(g_wake_pipe[0], F_SETFD, FD_CLOEXEC);
-            fcntl(g_wake_pipe[1], F_SETFD, FD_CLOEXEC);
-        }
+    }
+    if (g_wake_pipe[0] < 0 && pipe(g_wake_pipe) == 0) {
+        fcntl(g_wake_pipe[0], F_SETFL, O_NONBLOCK);
+        fcntl(g_wake_pipe[1], F_SETFL, O_NONBLOCK);
+        fcntl(g_wake_pipe[0], F_SETFD, FD_CLOEXEC);
+        fcntl(g_wake_pipe[1], F_SETFD, FD_CLOEXEC);
     }
     if (g_lwin_count >= ZAN_MAX_WINDOWS) return 0;
 
@@ -428,8 +443,8 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
     w->backbuf = 0;
     w->backbuf_w = 0;
     w->backbuf_h = 0;
-    w->w = (int)width;
-    w->h = (int)height;
+    w->w = width;
+    w->h = height;
 
     if (!g_primary_win) {
         /* First window drives process-wide operations (clipboard, cursor) and
@@ -437,28 +452,25 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
         g_primary_win = xid;
         g_x11_window = xid;
         g_xic = xic;
-        g_win_w = (int)width;
-        g_win_h = (int)height;
-        g_scale_linux = (int)zan_gui_get_dpi_scale();
-        g_titlebar_h_l = 32 * g_scale_linux / 100;
-        g_btn_w_l = 46 * g_scale_linux / 100;
+        g_win_w = width;
+        g_win_h = height;
     } else {
         XWindowAttributes parent_attr;
         Window child = 0;
         int parent_x = 0;
         int parent_y = 0;
         Window root = RootWindow(g_display, screen);
+        int screen_w = DisplayWidth(g_display, screen);
+        int screen_h = DisplayHeight(g_display, screen);
         if (XGetWindowAttributes(g_display, g_primary_win, &parent_attr) &&
             XTranslateCoordinates(g_display, g_primary_win, root, 0, 0,
                                   &parent_x, &parent_y, &child)) {
-            int x = parent_x + (parent_attr.width - (int)width) / 2;
-            int y = parent_y + (parent_attr.height - (int)height) / 2;
-            int screen_w = DisplayWidth(g_display, screen);
-            int screen_h = DisplayHeight(g_display, screen);
+            int x = parent_x + (parent_attr.width - width) / 2;
+            int y = parent_y + (parent_attr.height - height) / 2;
             if (x < 0) x = 0;
             if (y < 0) y = 0;
-            if (x + (int)width > screen_w) x = screen_w - (int)width;
-            if (y + (int)height > screen_h) y = screen_h - (int)height;
+            if (x + width > screen_w) x = screen_w - width;
+            if (y + height > screen_h) y = screen_h - height;
             if (x < 0) x = 0;
             if (y < 0) y = 0;
             XMoveWindow(g_display, xid, x, y);
@@ -664,6 +676,21 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     if (!w) return 1;
     if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) return 1;
     zan_surface_t *s = g_surfaces[surface_id];
+
+    /* GPU direct present: the frame is swapped onto the window and never passes
+     * through s->pixels. 0 means this backend cannot present to this window
+     * (always so on the CPU rasterizer), and the Pixmap path below runs. */
+    if (zan_gui_present_window(surface_id, (void *)(intptr_t)w->xid)) {
+        g_dirty_count = 0;
+        g_dirty_overflow = 0;
+        return 0;
+    }
+    /* Presenting the bitmap: a backend holding the frame elsewhere has to put
+     * it back here first. */
+    if (s->be) {
+        if (s->be->flush) s->be->flush(s);
+        if (s->be->read_pixels) s->be->read_pixels(s);
+    }
 
     int screen = DefaultScreen(g_display);
     unsigned depth = (unsigned)DefaultDepth(g_display, screen);

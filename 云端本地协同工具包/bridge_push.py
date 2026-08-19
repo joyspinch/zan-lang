@@ -10,8 +10,14 @@ Usage:
   push_local.py <mirror-root> <relative-path> [<relative-path> ...] [--summary TEXT]
 
 Paths are workspace-relative and keep their names 1:1 (mirror <-> local).
+
+Content always travels as base64 of the exact bytes: the bridge decodes a
+bundle entry as base64 (a plain UTF-8 string is decoded too, silently
+producing garbage and truncating the file), and base64 also keeps CRLF
+intact. Every write is read back and compared byte for byte before the
+script reports success.
 """
-import base64, json, os, sys, urllib.request
+import base64, json, os, sys, urllib.parse, urllib.request
 
 BASE = os.environ["ZAN_BRIDGE_BASE"].rstrip("/")
 TOKEN = os.environ["ZAN_BRIDGE_TOKEN"]
@@ -28,6 +34,15 @@ def post(path, payload):
         method="POST")
     with urllib.request.urlopen(req, timeout=300) as r:
         return json.load(r)
+
+
+def get_bytes(rel):
+    q = urllib.parse.urlencode({"path": rel, "encoding": "base64"})
+    req = urllib.request.Request(
+        BASE + "/api/file?" + q,
+        headers={"Authorization": "Bearer " + TOKEN, "User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=300) as r:
+        return base64.b64decode(json.load(r).get("content", ""))
 
 
 def main(argv):
@@ -47,7 +62,18 @@ def main(argv):
     if summary:
         payload["handoff"] = {"summary": summary}
     print(json.dumps(post("/api/bundle", payload), ensure_ascii=False)[:2000])
+    bad = []
+    for rel in rels:
+        with open(os.path.join(root, rel), "rb") as f:
+            want = f.read()
+        if get_bytes(rel.replace("\\", "/")) != want:
+            bad.append(rel)
+    if bad:
+        print("WRITE_BACK_MISMATCH " + " ".join(bad))
+        return 1
+    print("WRITE_BACK_VERIFIED " + str(len(rels)) + " file(s)")
+    return 0
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    sys.exit(main(sys.argv[1:]) or 0)

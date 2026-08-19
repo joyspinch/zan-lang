@@ -33,6 +33,11 @@ python3 br.py exec "cd /d d:\project\zan-lang && cmake --build build --config Re
 
 - **按字节传输**（`encoding=base64`，push/pull 双向）。用文本方式读写会毁掉二进制：
   交叉编译出来的 Linux ELF 拉回云端直接跑不起来，而现象只是「莫名其妙的段错误」；
+  文本源码同样不能省这一步：bundle 条目一律按 base64 解码，直接塞 UTF-8 字符串会被
+  当 base64 解开，源文件被截成几十字节的乱码（`stdlib/Gui/App.zan` 曾从 205KB 变成
+  86 字节），base64 还能原样保住 CRLF；
+- **写回后回读比对字节**（`bridge_push.py` 内置，结尾打印 `WRITE_BACK_VERIFIED`）。
+  bundle 返回 `ok: true` 只代表写进去了，不代表写对了；
 - **大文件分块**（单次 `/api/file` 读取有上限，超了被静默截断，看着像文件本身坏了）；
 - `push` 一次性带上 `handoff.summary`，写回与交接说明不会脱节。
 
@@ -73,6 +78,27 @@ curl -s -X POST "$ZAN_BRIDGE_BASE/api/terminal/exec" \
 `pkill` / `Select-Object` 这类都不存在（管道给 `Select-Object` 会报「不是内部或外部命令」）。
 要跑 PowerShell 脚本就写全 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test.ps1 smoke`；
 要截取输出就把全文取回云端再用本地工具过滤。
+
+## 5.1 云端跑 GUI 回归（Linux/X11，不占用你的桌面）
+
+镜像拉到云端后可以在无头 X 上真跑 IDE，比隔着桥接截本机屏幕快得多：
+
+```bash
+sudo apt-get install -y cmake ninja-build clang-15 llvm-15-dev llvm-15-tools \
+  libx11-dev libxext-dev libxrender-dev libxrandr-dev libxi-dev \
+  libfontconfig1-dev libfreetype6-dev xvfb imagemagick xdotool x11-utils
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)
+Xvfb :99 -screen 0 1600x1000x24 &
+DISPLAY=:99 ZAN_UI_SCRIPT=$PWD/_scratch/x.uidrv ZAN_UI_OUT=$PWD/_scratch/uidrv ./ZanIDE
+```
+
+- `ZAN_UI_SCRIPT` 必须是**绝对路径**（相对路径会被静默忽略，表现为驱动完全不启动）；
+- `dump pixels a.bin x y w h` 出的是 BGRA 原始帧，配套 `a.bin.size` 给尺寸，
+  转 PNG：`convert -size ${W}x${H} -depth 8 bgra:a.bin a.png`；比对残影直接 md5 两帧；
+- 局部重绘的坑：`dump pixels` 拿的就是当前帧缓冲，先 `redraw full` 再 dump 会掩盖残影，
+  查残影/脏区问题时别加 `redraw full`；
+- 子窗口是独立 X 窗口，`dump pixels` 只覆盖主窗口，抓子窗口用 `import -window root`，
+  悬停用 `xdotool mousemove`（连送两次相邻坐标才会产生移动事件）。
 
 ## 省 token 的用法
 

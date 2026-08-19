@@ -61,6 +61,11 @@ class App {
     // 最后一个注册了帧体的 App。窗口过程回调是普通函数
     // 指针，拿不到实例，因此在这里存一份。
     static App frameApp;
+    // 窗口过程画帧时置位。呈现会改窗口状态（分层窗口的
+    // UpdateLayeredWindow 就带尺寸），系统可能就地再投一条尺寸
+    // 消息进来：不拦住就会在上一帧还没呈现完时开始画下一帧，
+    // 两帧共用同一块表面。
+    static bool wndProcPainting;
     int frameCount;
     int mouseX;
     int mouseY;
@@ -79,6 +84,16 @@ class App {
     bool showPinButton;
     bool showMinimizeButton;
     bool showMaximizeButton;
+    // 上一帧画出来的那条标题提示（它的按钮 id 与提示区左边）；
+    // 0 = 上一帧没有提示。
+    int capTipId;
+    int capTipX;
+    string themeTipText;
+    string pinTipText;
+    string minimizeTipText;
+    string maximizeTipText;
+    string restoreTipText;
+    string closeTipText;
     // 标题栏主题选择器。当 themeNames 非空时，主题标题
     // 按钮会打开一个下拉菜单列出这些预设（一个"颜色"字形）
     // 而不是在深色/浅色间切换；themeMenuChange 在新选择时触发，
@@ -261,6 +276,12 @@ class App {
     // 到进程目录下的 zan_frame_perf.log。0 = 尚未读取环境变量，
     // 1 = 开启，2 = 关闭。
     static int perfMode;
+    // 局部帧（悬停条带、动画矩形、纯特效就地呈现）的总开关，默认
+    // 关闭：每一帧都整窗重绘并整窗上传。见 SetPartialFrames。
+    bool partialFrames;
+    // 本应用要求的光栅器：RenderBackend.Cpu/Gpu/Auto。默认 CPU，见
+    // SetRenderBackend。
+    int renderBackendMode;
     int perfFrames;
     int perfRenderMs;
     int perfPresentMs;
@@ -373,6 +394,17 @@ class App {
     int animRY;
     int animRW;
     int animRH;
+    // 上一次动画帧实际重绘的那块（裁剪用的并集）。声明范围的动画
+    // 报的是它*这一帧*占的像素，而移动的动画（转圈里的球、滑动的
+    // 标签下划线、缓动中的面板）下一帧就画到别处去了：只按新范围
+    // 裁剪，旧位置的那几个像素既不重画也不上传，于是沿路径留下一
+    // 串亮块，直到某次整窗重绘才擦掉。裁剪要取「上一帧画过的」和
+    // 「这一帧要画的」的并集。
+    bool animPrevValid;
+    int animPX;
+    int animPY;
+    int animPW;
+    int animPH;
 
     // 当前帧处理了真实操作系统事件（输入、缩放、
     // 等）时为 true。纯动画重绘（转圈、缓动步进）在没有
@@ -455,6 +487,13 @@ class App {
     // 本帧出现了未声明范围的重绘请求（RequestRedraw）：下一帧
     // 整窗重绘，声明过范围的损伤区不再生效。
     bool partialBlocked;
+    // 下一帧必须是整窗帧（不得裁剪）。上一帧结束时发现屏上的像素
+    // 不再可信时置位（玻璃面板跨出损伤条带，模糊只能拿旧缓存充数）。
+    // partialBlocked 拦不住它：那个标志在下一次 BeginFrame 开头就被清掉，
+    // 而局部帧是在 BeginFrame 之前的事件处理里武装的，于是一边移鼠标一
+    // 边就把「下一帧整窗重绘」吃掉了，不一致的像素就一直挂在屏上。
+    // 这个标志跨帧留存，只在真正画出一帧整窗帧时才消。
+    bool forceFullNext;
     int dmgX;
     int dmgY;
     int dmgW;
@@ -530,6 +569,14 @@ class App {
         this.showPinButton = true;
         this.showMinimizeButton = true;
         this.showMaximizeButton = true;
+        this.capTipId = 0;
+        this.capTipX = 0;
+        this.themeTipText = "Theme";
+        this.pinTipText = "Pin on top";
+        this.minimizeTipText = "Minimize";
+        this.maximizeTipText = "Maximize";
+        this.restoreTipText = "Restore";
+        this.closeTipText = "Close";
         this.themeNames = new List<string>();
         this.themeMenuModel = new SignalInt(0);
         this.themeMenuOpen = new SignalBool(false);
@@ -619,12 +666,18 @@ class App {
         this.animRectAll = false;
         this.animRW = 0;
         this.animRH = 0;
+        this.animPrevValid = false;
+        this.animPW = 0;
+        this.animPH = 0;
         this.fxEnabled = true;
         this.fxNextMs = -1;
         this.fxSnapValid = false;
         this.partialPending = false;
         this.partialFrame = false;
         this.partialBlocked = false;
+        this.forceFullNext = false;
+        this.partialFrames = false;
+        this.renderBackendMode = RenderBackend.Cpu();
         this.dmgW = 0;
         this.dmgH = 0;
         this.fxDamage = null;
@@ -1559,6 +1612,7 @@ class App {
     /// 无有效快照时返回 false（调用方回退为完整渲染），
     /// 例如在尺寸变化之后。
     bool FxPresent() {
+        if (this.ForceFullFrames()) { fxNextMs = -1; return false; }
         if (!fxSnapValid || !this.FxActive()) { fxNextMs = -1; return false; }
         int perfFxT0 = 0;
         int perfFxRestoreT0 = 0;
@@ -1581,7 +1635,8 @@ class App {
         List<int> repaired = fxDamage;
         bool ok;
         if (fxDamage == null) {
-            ok = fc.RestoreRect(0, 0, fc.Width(), fc.Height(), 7);
+            ok = fc.RestoreRect(0, 0, fc.Width(), fc.Height(),
+                                App.FxSnapSlot());
         } else {
             // 只修复上一效果帧触及的像素：少量
             // 几百次小拷贝，而非整帧恢复。
@@ -1589,7 +1644,8 @@ class App {
             int i = 0;
             while (ok && i + 3 < fxDamage.Count) {
                 ok = fc.RestoreSubRect(fxDamage[i], fxDamage[i + 1],
-                                       fxDamage[i + 2], fxDamage[i + 3], 7);
+                                       fxDamage[i + 2], fxDamage[i + 3],
+                                       App.FxSnapSlot());
                 i = i + 4;
             }
         }
@@ -1653,6 +1709,15 @@ class App {
     /// 位于命中区外侧时也包含在内）。同一事件处理中
     /// 任何其他重绘原因都会通过 CancelPartialFrame() 取消它。
     void NoteHoverDamage(int oldId, int newId) {
+        if (this.ForceFullFrames()) { partialPending = false; return; }
+        // 同一批事件里已经有人要求过整窗重绘（RequestRedraw，说不清
+        // 改了哪些像素）：悬停不得反过来把它降级成一条条带，否则
+        // 那次状态变化改的像素永远不重画，一直就留在屏上。
+        if (partialBlocked) {
+            this.NoteRedrawWhy("hover-blocked");
+            partialPending = false;
+            return;
+        }
         if (this.HasOverlays() || this.PointerCaptured()) {
             this.NoteRedrawWhy("hover-blocked");
             partialPending = false;
@@ -1686,6 +1751,15 @@ class App {
         y0 = y0 - pad;
         x1 = x1 + pad;
         y1 = y1 + pad;
+        // 本批事件里已声明的损伤（NoteDamage：勾选框、换标签、滚动……）
+        // 要一并算进来。悬停条带直接覆盖它们的话，那些区域既不重画
+        // 也不上传，屏上就挂着旧像素，直到下一次整窗重绘。
+        if (partialPending) {
+            if (dmgX < x0) { x0 = dmgX; }
+            if (dmgY < y0) { y0 = dmgY; }
+            if (dmgX + dmgW > x1) { x1 = dmgX + dmgW; }
+            if (dmgY + dmgH > y1) { y1 = dmgY + dmgH; }
+        }
         if (x0 < 0) { x0 = 0; }
         if (y0 < 0) { y0 = 0; }
         if (x1 > canvas.Width()) { x1 = canvas.Width(); }
@@ -1743,9 +1817,7 @@ class App {
     /// 标签页、勾选复选框一类的控件用它取代 RequestRedraw；
     /// 同一帧里任何 RequestRedraw 都会让下一帧回到整窗重绘。
     void NoteDamage(int x, int y, int w, int h) {
-        if (Interop.EnvVar("ZAN_FORCE_FULL_DAMAGE") == "1") {
-            partialBlocked = true;
-        }
+        if (this.ForceFullFrames()) { partialBlocked = true; }
         needsRedraw = true;
         if (partialBlocked || this.HasOverlays()) {
             if (partialBlocked) { this.NoteRedrawWhy("dmg-blocked"); }
@@ -1848,6 +1920,73 @@ class App {
         needsRedraw = true;
     }
 
+    /// 悬停在某个标题按钮上够久（提示该露出来了）。
+    ///
+    /// 声明给动画的重绘范围必须把按钮下方那条提示一起圈进去：提示是这次悬停
+    /// 动画画出来的东西，只声明按钮自己那一格的话，被动画唤醒的那一帧就裁到
+    /// 那 46x33 —— 提示画在标题栏下方，整条都在裁剪框外，于是它一个像素也落
+    /// 不到屏幕上（只有别的原因触发整窗重绘时才闪一下）。
+    bool CaptionTipShown(int id, int bx, int bw, int hbar) {
+        int rh = hbar + this.Scale(80);
+        return Ui.HoverLevelMsIn(this, id, 0, this.CaptionTipX(bx, bw), 0,
+            this.Scale(300), rh) >= 900;
+    }
+
+    /// 标题提示区的左边（提示居中挂在按钮下方）。
+    int CaptionTipX(int bx, int bw) {
+        return bx + bw / 2 - this.Scale(300) / 2;
+    }
+
+    /// 记下这一帧哪条标题提示露着（`id` 为 0 表示一条也没有），并为
+    /// “浮出/消失”那一刻额外要一帧。
+    ///
+    /// 提示是指针刚进按钮那一帧画出来的，而那一帧的重绘范围是悬停损伤
+    /// （只有离开与进入的那两格按钮），提示整条都在裁剪框外，于是一个
+    /// 像素也落不到屏幕上（只有别的原因触发整窗重绘时才闪一下）；指针移开
+    /// 时反过来：没人重画提示占过的那块，那条提示就挂在那里不走。
+    void NoteCaptionTip(int id, int bx, int bw, int hbar) {
+        if (id == capTipId) { return; }
+        int tipW = this.Scale(300);
+        int tipH = hbar + this.Scale(80);
+        if (capTipId != 0) {
+            this.RequestAnimationFrameIn(16, capTipX, 0, tipW, tipH);
+        }
+        if (id != 0) {
+            int nx = this.CaptionTipX(bx, bw);
+            this.RequestAnimationFrameIn(16, nx, 0, tipW, tipH);
+            capTipX = nx;
+        }
+        capTipId = id;
+    }
+
+    /// 标题按钮的悬停提示文案。默认是英文（框架不认识宿主的界面
+    /// 语言），宿主切界面语言时把这一套文案换掉即可 —— 标题栏是
+    /// 窗口自己画的，它上面的字不跟着界面语言走，整窗就只剩这五个
+    /// 提示还在说英文。
+    void SetCaptionTips(
+        string theme,
+        string pin,
+        string minimize,
+        string maximize,
+        string restore,
+        string close
+    ) {
+        themeTipText = theme;
+        pinTipText = pin;
+        minimizeTipText = minimize;
+        maximizeTipText = maximize;
+        restoreTipText = restore;
+        closeTipText = close;
+    }
+
+    /// 照抄 `src` 的标题提示文案：副窗口的标题栏归框架画，
+    /// 界面语言归主窗口的宿主管，所以它只能跟着主窗口。
+    void FollowCaptionTips(App src) {
+        this.SetCaptionTips(src.themeTipText, src.pinTipText,
+            src.minimizeTipText, src.maximizeTipText, src.restoreTipText,
+            src.closeTipText);
+    }
+
     /// 将标题栏主题按钮变为下拉菜单，列出
     /// `names`（如皮肤预设）而非简单的深/浅切换，并且
     /// 保留在原始标题按钮位置，使其不可拖动。
@@ -1893,14 +2032,20 @@ class App {
     /// 不清掉这些状态，换表面后的第一帧只画出损伤条带，其余部分
     /// 是内存垃圾——看起来就是黑屏加几块残影。</summary>
     void SwapCanvas(int w, int h) {
-        canvas.Destroy();
+        // 先建新表面再销毁旧的：表面 id 取自空槽位，若先销毁，新表面
+        // 会立刻复用同一个 id，而外壳按 hwnd 记着这个 id，WM_PAINT /
+        // WM_SIZE（拖边框时来自 OS 的模态循环）就会把这块还没画过的
+        // 表面贴上屏——里面是分配器交还的旧表面内容。
+        Canvas old = canvas;
         canvas = new Canvas(w, h);
+        old.Destroy();
         partialPending = false;
         partialFrame = false;
         dmgW = 0;
         dmgH = 0;
         animRectValid = false;
         animRectAll = false;
+        animPrevValid = false;
         fxSnapValid = false;
         fxDamage = null;
     }
@@ -1975,8 +2120,11 @@ class App {
         // 尺寸消息属于某一个窗口：正在缩放的不是它自己的窗口时
         // 什么都别画，否则会把别的窗口的一帧画进这个 App 的表面。
         if (!a.EventIsMine()) { return; }
+        if (App.wndProcPainting) { return; }
+        App.wndProcPainting = true;
         a.SyncSurface();
         a.SafeFrame(a.frameBody);
+        App.wndProcPainting = false;
     }
 
     /// <summary>受保护的标准事件循环：每一轮的事件分发与
@@ -2254,6 +2402,44 @@ class App {
             hitTester.RegisterRect(maxId, maxX, 0, bw, hbar, 3);
         }
         hitTester.RegisterRect(closeId, closeX, 0, bw, hbar, 3);
+
+        // 标题栏在宿主 Flush 之后才绘制，而独立 App.Run 根本不 Flush，
+        // 所以提示必须在这里当帧绘制，不能再走 pending 通道。
+        int tipId = 0;
+        int tipX = 0;
+        if (showThemeButton && this.CaptionTipShown(themeId, themeX, bw, hbar)) {
+            Tooltip.RenderAt(this, themeX + bw / 2, hbar, themeTipText,
+                Tooltip.Bottom(), this.Scale(260));
+            tipId = themeId;
+            tipX = themeX;
+        }
+        if (showPinButton && this.CaptionTipShown(pinId, pinX, bw, hbar)) {
+            Tooltip.RenderAt(this, pinX + bw / 2, hbar, pinTipText,
+                Tooltip.Bottom(), this.Scale(260));
+            tipId = pinId;
+            tipX = pinX;
+        }
+        if (showMinimizeButton && this.CaptionTipShown(minId, minX, bw, hbar)) {
+            Tooltip.RenderAt(this, minX + bw / 2, hbar, minimizeTipText,
+                Tooltip.Bottom(), this.Scale(260));
+            tipId = minId;
+            tipX = minX;
+        }
+        if (showMaximizeButton && this.CaptionTipShown(maxId, maxX, bw, hbar)) {
+            string maxTip = maximizeTipText;
+            if (window.IsMaximized()) { maxTip = restoreTipText; }
+            Tooltip.RenderAt(this, maxX + bw / 2, hbar, maxTip,
+                Tooltip.Bottom(), this.Scale(260));
+            tipId = maxId;
+            tipX = maxX;
+        }
+        if (this.CaptionTipShown(closeId, closeX, bw, hbar)) {
+            Tooltip.RenderAt(this, closeX + bw / 2, hbar, closeTipText,
+                Tooltip.Bottom(), this.Scale(260));
+            tipId = closeId;
+            tipX = closeX;
+        }
+        this.NoteCaptionTip(tipId, tipX, bw, hbar);
 
         // 标题按钮和其它控件走同一套点击语义：只认主键、只认
         // 本帧解析出的那个点击目标。以前这里直接对当前坐标做
@@ -2875,6 +3061,86 @@ class App {
         lastFrameMs = nowMs;
     }
 
+    /// 已到期的帧截止时间（动画 / 唤醒 / 皮肤特效）就地兑现：标记这一帧
+    /// 要画，并在纯动画唤醒时把它裁剪到动画自己声明的范围。返回 false
+    /// 表示这一拍已由特效层就地呈现、还该继续等下一拍。
+    bool TakeDueFrame(int now) {
+        bool fxOnly = animNextMs < 0 || now < animNextMs;
+        if (fxOnly && this.FxPresent()) {
+            // 已就地呈现；继续等待下一个 tick。
+            return false;
+        }
+        if (fxOnly && wakeFrameNextMs >= 0 && now >= wakeFrameNextMs) {
+            wakeFrameNextMs = -1;
+            if (wakeNextMs >= 0 && now >= wakeNextMs) {
+                wakeNextMs = -1;
+            }
+            this.NoteRedrawWhy("wake");
+            needsRedraw = true;
+            return true;
+        }
+        if (fxOnly && wakeNextMs >= 0 && now >= wakeNextMs) {
+            wakeNextMs = -1;
+            return true;
+        }
+        this.NoteRedrawWhy("ProcessEvent");
+        needsRedraw = true;
+        // 纯动画唤醒：若上一帧所有动画都声明了范围，
+        // 把这一帧裁剪到它们的并集。
+        if (!fxOnly && animRectValid && !animRectAll
+            && !this.ForceFullFrames()
+            && !this.HasOverlays()) {
+            int adX = animRX;
+            int adY = animRY;
+            int adR = animRX + animRW;
+            int adB = animRY + animRH;
+            // 上一帧的动画像素也要进这一帧的裁剪，
+            // 否则移动中的动画会沿路径留下残影。
+            if (animPrevValid) {
+                if (animPX < adX) { adX = animPX; }
+                if (animPY < adY) { adY = animPY; }
+                if (animPX + animPW > adR) {
+                    adR = animPX + animPW;
+                }
+                if (animPY + animPH > adB) {
+                    adB = animPY + animPH;
+                }
+            }
+            dmgX = adX;
+            dmgY = adY;
+            dmgW = adR - adX;
+            dmgH = adB - adY;
+            animPrevValid = true;
+            animPX = dmgX;
+            animPY = dmgY;
+            animPW = dmgW;
+            animPH = dmgH;
+            partialPending = true;
+        }
+        return true;
+    }
+
+    /// 帧截止时间到了就兑现（不等待）。轮询那一路（有人挂起了重绘、
+    /// 或自动化驱动每圈都要求轮询）以前完全绕过截止时间：动画帧只在
+    /// “阻塞等下一拍”那一路才产生，于是驱动一开，悬停缓动、提示浮出、
+    /// toast 收拢这些纯动画帧一帧也不来，界面就停在最后那帧上。
+    void PumpDueFrame() {
+        int now = Window.GetTickMs();
+        int deadline = animNextMs;
+        if (deadline < 0 || (wakeNextMs >= 0 && wakeNextMs < deadline)) {
+            deadline = wakeNextMs;
+        }
+        if (deadline < 0
+            || (wakeFrameNextMs >= 0 && wakeFrameNextMs < deadline)) {
+            deadline = wakeFrameNextMs;
+        }
+        if (deadline < 0 || (fxNextMs >= 0 && fxNextMs < deadline)) {
+            deadline = fxNextMs;
+        }
+        if (deadline < 0 || now < deadline) { return; }
+        this.TakeDueFrame(now);
+    }
+
     bool ProcessEvent() {
         // 推进活动的自动化脚本（注入合成事件，
         // 由同一循环随后轮询并分发）。未启用驱动时为空操作。
@@ -2892,6 +3158,7 @@ class App {
             // 循环立刻回到阻塞等待，不留下空转。
             pollPending = false;
             loopPath = 0;
+            if (!needsRedraw) { this.PumpDueFrame(); }
             // 重绘挂起中（状态变化或动画进行中）。
             // 将忙轮询限制在约 60fps，避免运行中的动画让
             // CPU 以数百帧每秒空转；睡眠帧预算的剩余部分
@@ -2909,6 +3176,7 @@ class App {
             // 仅特效的截止时间由 FxPresent 处理（单次恢复 +
             // 重新合成，不渲染页面）；其余情况标记重绘。
             result = 1;
+            bool waitedForEvent = false;
             bool waiting = true;
             while (waiting) {
                 int now = Window.GetTickMs();
@@ -2925,46 +3193,17 @@ class App {
                 }
                 if (deadline < 0) { waiting = false; }
                 else if (now >= deadline) {
-                    bool fxOnly = animNextMs < 0 || now < animNextMs;
-                    if (fxOnly && this.FxPresent()) {
-                        // 已就地呈现；继续等待下一个 tick。
-                    } else if ((animNextMs < 0 || now < animNextMs)
-                               && wakeFrameNextMs >= 0
-                               && now >= wakeFrameNextMs) {
-                        wakeFrameNextMs = -1;
-                        if (wakeNextMs >= 0 && now >= wakeNextMs) {
-                            wakeNextMs = -1;
-                        }
-                        this.NoteRedrawWhy("wake");
-                        needsRedraw = true;
-                        waiting = false;
-                    } else if ((animNextMs < 0 || now < animNextMs)
-                               && wakeNextMs >= 0 && now >= wakeNextMs) {
-                        wakeNextMs = -1;
-                        waiting = false;
-                    } else {
-                        this.NoteRedrawWhy("ProcessEvent");
-                        needsRedraw = true;
-                        // 纯动画唤醒：若上一帧所有动画都声明了范围，
-                        // 把这一帧裁剪到它们的并集。
-                        if (!fxOnly && animRectValid && !animRectAll
-                            && !this.HasOverlays()) {
-                            dmgX = animRX;
-                            dmgY = animRY;
-                            dmgW = animRW;
-                            dmgH = animRH;
-                            partialPending = true;
-                        }
-                        waiting = false;
-                    }
+                    if (this.TakeDueFrame(now)) { waiting = false; }
                 } else {
                     // 在内核中休眠直到输入或截止时间：一次
                     // 阻塞等待，而非轮询 + 睡眠切片，因此等待
                     // 下一个动画帧不消耗 CPU。
+                    waitedForEvent = true;
                     result = window.WaitEventTimeout(deadline - now);
                     if (result != 1) { waiting = false; }
                 }
             }
+            if (!waitedForEvent) { result = window.PollEvent(); }
         } else {
             result = window.WaitEvent();
         }
@@ -3441,7 +3680,8 @@ class App {
                 fxDamage = null;
                 fxNextMs = fxNow + this.FxIntervalMs();
             } else {
-                fc.SnapshotRect(0, 0, fc.Width(), fc.Height(), 7);
+                fc.SnapshotRect(0, 0, fc.Width(), fc.Height(),
+                                App.FxSnapSlot());
                 fxSnapValid = true;
             }
             BackdropFx.Render(this, fc, this.EffectiveFx(), 0, 0, fc.Width(), fc.Height(),
@@ -3474,6 +3714,7 @@ class App {
             // 下一帧升级成整窗重绘把它纠正回来。
             if (blurMiss > 0) {
                 partialBlocked = true;
+                forceFullNext = true;
                 this.NoteRedrawWhy("glass-partial-blur");
                 needsRedraw = true;
             }
@@ -3831,6 +4072,56 @@ class App {
             + Convert.ToString(tenths % 10);
     }
 
+    /// 为真时所有局部帧路径都退回整窗重绘 + 整窗上传（本应用的默认）。
+    bool ForceFullFrames() { return !partialFrames; }
+
+    /// 局部帧（悬停条带、动画矩形、纯特效就地呈现）当前是否开启。
+    bool PartialFrames() { return partialFrames; }
+
+    /// 开启/关闭局部帧。**默认关闭**：局部帧要求每一处状态变化都准确
+    /// 声明自己改了哪些像素，漏一处旧像素就留在屏上（重复的面板、动画
+    /// 的移动轨迹、鼠标划过按钮时的错乱），一个真实应用里漏报的地方是
+    /// 堵不完的，所以正确性优先。这是每个应用自己的选择（不是环境变量：
+    /// 那会让一台机器上所有 Zan 程序共用一份配置），应用可以把它接到
+    /// 自己的设置项上，逐屏验证过再打开。
+    void SetPartialFrames(bool on) {
+        this.partialFrames = on;
+        if (!on) {
+            partialPending = false;
+            needsRedraw = true;
+        }
+    }
+
+    /// 本应用要求的光栅器（`RenderBackend.Cpu/Gpu/Auto`）。要看实际生效的
+    /// 那个用 <see cref="RenderBackendName"/>：要了 GPU 而这台机器给不出 GL
+    /// 上下文时，画面照旧由 CPU 光栅出来。
+    int RenderBackendMode() { return renderBackendMode; }
+
+    /// 实际生效的光栅器名字（"cpu" / "gl"），供设置页与日志显示。
+    string RenderBackendName() { return Canvas.Backend(); }
+
+    /// 选择本应用用哪个光栅器画每一帧。**默认 CPU**：GPU 后端还有
+    /// 阴影/模糊/图片这几个图元在 CPU 上（分派时自动同步帧），并且要靠
+    /// 每台机器的 GL 驱动，先让应用自己逐屏验证过再开。切换会带着当前
+    /// 窗口内容一起搬过去，不会闪白；随后整窗重画一帧。
+    ///
+    /// 返回实际装上的后端：1 = GPU，0 = CPU（要了 GPU 拿到 0 就是这台机器
+    /// 没有可用的 GL 上下文——远程桌面、虚拟机、CI——不是错误）。
+    int SetRenderBackend(int mode) {
+        this.renderBackendMode = mode;
+        int got = Canvas.SetBackend(mode);
+        forceFullNext = true;
+        needsRedraw = true;
+        return got;
+    }
+
+    /// 效果层合成前那一帧的快照槽。快照槽是一张全进程共享的表，
+    /// 而 ChartView.RenderCached 的文档把 0-7 给了宿主自己的图表缓存：
+    /// 效果层也用 7 的时候，宿主一旦缓存一张图表就把这份全窗快照顶
+    /// 掉，下一次效果跳动就把图表的旧像素修复到窗口各处，而且一直
+    /// 留到下一次整窗重绘。取一个宿主用不到的高位槽（池按需长到 512）。
+    static int FxSnapSlot() { return 384; }
+
     /// 启用可选帧分析器（ZAN_FRAME_PROF=1）时为真。
     static bool PerfOn() {
         if (App.perfMode == 0) {
@@ -3980,6 +4271,16 @@ class App {
             partialFrame = true;
         }
         partialPending = false;
+        // 上一帧留下的“下一帧必须整窗”比任何局部声明优先：它记的是
+        // 表面上已经有不可信的像素，只重画一条条带永远纠不回来。
+        if (forceFullNext) {
+            partialFrame = false;
+            forceFullNext = false;
+            this.NoteRedrawWhy("force-full");
+        }
+        // 整窗帧重画了每一个像素，动画的旧位置已被覆盖：
+        // 下一次动画帧不必再把它算进裁剪。
+        if (!partialFrame) { animPrevValid = false; }
         if (partialFrame) {
             // 下方内容照常绘制；裁剪将其限制在
             // 损坏条带内，上一帧未触及的像素得以保留。

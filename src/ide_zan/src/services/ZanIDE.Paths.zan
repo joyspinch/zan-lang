@@ -102,9 +102,20 @@ partial class ZanIDE {
         return h;
     }
 
-    /// Per-user, writable directory for IDE config + custom templates. Kept out
-    /// of the (possibly read-only) install dir so nothing user-owned lives there.
-    static string UserConfigDir() {
+    /// Writable directory for IDE config + custom templates: it travels with
+    /// the running executable (like CacheDir), so the settings of a copy live
+    /// with that copy instead of in one machine-wide profile: a build under a
+    /// working tree and an installed release each keep their own, and editing
+    /// `config/config.cfg` beside the exe is what the running IDE reads. Its own
+    /// subdirectory, like `cache`, so a dozen settings files do not litter the
+    /// install root. The location is the running image's own directory
+    /// (ExeDir), never a baked-in path.
+    static string UserConfigDir() { return ZanIDE.ExeDir() + "/config"; }
+
+    /// Where the settings lived before they moved beside the executable. Read
+    /// once per install to carry existing settings over (MigrateLegacyConfig);
+    /// never written to.
+    static string LegacyUserConfigDir() {
         #if WINDOWS
         string a = getenv("APPDATA");
         if (a == null || a == "") { a = ZanIDE.HomeDir(); }
@@ -116,6 +127,39 @@ partial class ZanIDE {
         if (x != null && x != "") { return x + "/zan-ide"; }
         return ZanIDE.HomeDir() + "/.config/zan-ide";
         #endif
+    }
+
+    /// Carries the settings of an earlier install (profile directory) over to
+    /// the directory beside the executable, so the move does not read as "the
+    /// IDE forgot my skin, my recent projects and my AI profiles". Runs only
+    /// when this executable has no settings of its own yet; the profile copy is
+    /// left in place and simply stops being read.
+    static void MigrateLegacyConfig() {
+        if (ZanIDE.UserConfigDir() == ZanIDE.LegacyUserConfigDir()) { return; }
+        if (File.Exists(ZanIDE.CfgPath())) { return; }
+        string old = ZanIDE.LegacyUserConfigDir();
+        if (!File.Exists(old + "/config.cfg")) { return; }
+        ZanIDE.CopySettingsTree(old, ZanIDE.UserConfigDir());
+    }
+
+    /// Byte-for-byte recursive copy for the settings migration: the profile
+    /// directory holds JSON, saved templates and a chat database, so a
+    /// text-rewriting copy (CopyTree, which also drops template manifests) is
+    /// the wrong tool. A destination file that already exists is left alone, so
+    /// a half-finished earlier migration resumes instead of overwriting
+    /// settings this install has already saved.
+    static void CopySettingsTree(string srcDir, string dstDir) {
+        Directory.CreateDirectoryRecursive(dstDir);
+        List<string> files = Directory.GetFiles(srcDir);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string dst = dstDir + "/" + files[i];
+            if (File.Exists(dst)) { continue; }
+            File.Copy(srcDir + "/" + files[i], dst);
+        }
+        List<string> subs = Directory.GetDirectories(srcDir);
+        for (int j = 0; j < subs.Count; j = j + 1) {
+            ZanIDE.CopySettingsTree(srcDir + "/" + subs[j], dstDir + "/" + subs[j]);
+        }
     }
 
     /// Volatile, per-run files live here: mirrored program logs, terminal

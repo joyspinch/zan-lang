@@ -897,13 +897,53 @@ set(_rts_stdlib_srcs
   ${CMAKE_SOURCE_DIR}/examples/game/ra2/stdlib_rts/Formats/Tmp.zan)
 string(JOIN ";" _rts_stdlib_zanc_args ${_rts_stdlib_srcs})
 
+# A conformance case that uses the Gui namespace reaches the
+# [DllImport("zan_gui")] exports, so it must link the library this build just
+# produced: the driver bundle committed under stdlib/Gui/drivers/ lags behind
+# newly added exports (the tests/gui/* cases below pass --driver-dir for the
+# same reason). Which cases those are is read from the sources rather than
+# guessed from their names, because Gui.Component.Chart and friends link the
+# same exports without a gui_ prefix.
+#
+# Only where the build output is what the linker consumes: on Windows that is
+# the GNU import library (libzan_gui.dll.a), which scripts/build_gui_driver.ps1
+# generates into stdlib/Gui/drivers/win-x64 -- the build tree holds the MSVC
+# zan_gui.lib, which zanc's bundled GNU ld cannot read. So Windows keeps the
+# bundled lookup and the driver script stays the step that refreshes it.
+set(_gui_driver_args "")
+if(TARGET zan_gui AND NOT WIN32)
+  set(_gui_driver_args "--driver-dir;$<TARGET_FILE_DIR:zan_gui>")
+endif()
+# Same override, spelled as a tail to append to a ZANC_ARGS string (an empty
+# list element would reach zanc as an empty argument).
+set(_gui_driver_tail "")
+if(_gui_driver_args)
+  set(_gui_driver_tail ";--driver-dir;$<TARGET_FILE_DIR:zan_gui>")
+endif()
+
+# --driver-dir redirects the lookup of *every* driver the case links, so a case
+# that also needs another module's driver (Gui.Component.CefBrowser ships its
+# own) stays on the bundled directories.
+function(zan_uses_gui_driver _src _out)
+  file(READ ${_src} _text)
+  if(_text MATCHES "using Gui[.;]"
+     AND NOT _text MATCHES "using Gui\\.Component\\.CefBrowser")
+    set(${_out} TRUE PARENT_SCOPE)
+  else()
+    set(${_out} FALSE PARENT_SCOPE)
+  endif()
+endfunction()
+
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
+  zan_uses_gui_driver(${_src} _needs_gui_driver)
   if(_name MATCHES "^rts_")
     set(_extra_args "${_rts_stdlib_zanc_args}")
   elseif(_name MATCHES "^async_mt")
     # ZAN_CO_DRIVER tests: exercise the multi-worker coroutine driver.
     set(_extra_args "--async-workers")
+  elseif(_needs_gui_driver)
+    set(_extra_args "${_gui_driver_args}")
   else()
     set(_extra_args "")
   endif()
@@ -991,10 +1031,13 @@ set(_known_leaky
 )
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
+  zan_uses_gui_driver(${_src} _needs_gui_driver)
   if(_name MATCHES "^rts_")
     set(_extra_args "${_rts_stdlib_zanc_args}")
   elseif(_name MATCHES "^async_mt")
     set(_extra_args "--async-workers")
+  elseif(_needs_gui_driver)
+    set(_extra_args "${_gui_driver_args}")
   else()
     set(_extra_args "")
   endif()
@@ -1246,7 +1289,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       # only the non-auto-included Stack.zan is passed explicitly here.
       # --driver-dir: link the freshly built zan_gui, not the committed
       # driver bundle (which may lag behind newly added native exports).
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Stack.zan;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Stack.zan${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_stack.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_stack${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -1257,7 +1300,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/tabs_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Widget/Tabs.zan;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Widget/Tabs.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_tabs.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_tabs${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -1284,7 +1327,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/retarget_test.zan
-      "-DZANC_ARGS=--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_retarget.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_retarget${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -1293,7 +1336,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/icon_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Icon.zan;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Icon.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_icon.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_icon${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -1302,7 +1345,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/text_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Text.zan;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Text.zan${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_text.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_text${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -1311,7 +1354,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -1320,7 +1363,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -1334,7 +1377,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/zform_control_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/zform_control.zform;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/zform_control.zform;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_zform_control.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_zform_control${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -1343,7 +1386,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/prop_test.zan
-      "-DZANC_ARGS=--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_props.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_props${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -1355,7 +1398,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/tree_test.zan
-      "-DZANC_ARGS=--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_tree.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_tree${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -1366,7 +1409,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/css_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Css.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/StyleSheet.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/StyleBox.zan;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Css.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/StyleSheet.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/StyleBox.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_css.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_css${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -1378,7 +1421,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/tailwind_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Tailwind.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/Css.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/StyleSheet.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/StyleBox.zan;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Tailwind.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/Css.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/StyleSheet.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/StyleBox.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_tailwind.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_tailwind${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -1390,7 +1433,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/webview_interop_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/WebView/WebView2.zan;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/WebView/WebView2.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_webview_interop.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_webview_interop${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -1434,7 +1477,29 @@ if(WIN32 AND EXISTS "${CMAKE_BINARY_DIR}/ZanIDE.exe")
   set_tests_properties(perf_frame_budget PROPERTIES
     LABELS perf
     TIMEOUT 240
+    # Shares the frame_budget_run directory with the GL budget below.
+    RUN_SERIAL TRUE
     SKIP_REGULAR_EXPRESSION "FRAME_BUDGET_SKIPPED")
+
+  # Same run under the GL backend (renderBackend=1). It reads
+  # tests/perf/frame_budget_gl.txt, which only exists once someone has
+  # calibrated it on a machine with a real GPU (-DCALIBRATE=1 prints the
+  # numbers); until then the test skips instead of asserting invented limits,
+  # and on a machine where the GL context cannot be created the IDE stays on
+  # the CPU path, which the surface/backend line in the output makes visible.
+  add_test(NAME perf_frame_budget_gl
+    COMMAND ${CMAKE_COMMAND}
+      -DROOT=${CMAKE_SOURCE_DIR}
+      -DBINARY_DIR=${CMAKE_BINARY_DIR}
+      -DZANIDE=${CMAKE_BINARY_DIR}/ZanIDE.exe
+      -DRENDER_BACKEND=1
+      -P ${CMAKE_SOURCE_DIR}/tests/run_frame_budget.cmake)
+  set_tests_properties(perf_frame_budget_gl PROPERTIES
+    LABELS perf
+    TIMEOUT 240
+    # Both budgets drive the same run directory, so they cannot overlap.
+    RUN_SERIAL TRUE
+    SKIP_REGULAR_EXPRESSION "FRAME_BUDGET_SKIPPED|FRAME_BUDGET_UNCALIBRATED")
 endif()
 
 # ---- Runtime diagnostics: parser must not hang/OOM on malformed input ----

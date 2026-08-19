@@ -263,6 +263,63 @@ static FT_Face ft_face_for_cp(u32 cp, int font_size) {
     return g_ft_face;
 }
 
+/* One glyph's coverage tile, rasterised on its first use at this size and kept
+ * in the glyph atlas: FT_LOAD_RENDER is the most expensive thing in a frame of
+ * text, and a repaint draws the same characters over and over. Whatever pixel
+ * format FreeType produced is normalised to one coverage byte per pixel here,
+ * so nothing downstream (nor a GPU backend's R8 atlas) has to know about
+ * FT_PIXEL_MODE_*. */
+static const zan_glyph_tile *ft_glyph_tile(u32 cp, int font_size) {
+    char key[4];
+    key[0] = (char)(cp & 0xFF);
+    key[1] = (char)((cp >> 8) & 0xFF);
+    key[2] = (char)((cp >> 16) & 0xFF);
+    key[3] = (char)((cp >> 24) & 0xFF);
+    const zan_glyph_tile *cached =
+        zan_atlas_find(ZAN_TILE_GLYPH, font_size, key, 4);
+    if (cached) return cached;
+
+    FT_Face face = ft_face_for_cp(cp, font_size);
+    FT_UInt glyph = FT_Get_Char_Index(face, cp);
+    if (!glyph) glyph = FT_Get_Char_Index(face, '?');
+    if (!glyph || FT_Load_Glyph(face, glyph, FT_LOAD_RENDER) != 0) return NULL;
+    FT_GlyphSlot slot = face->glyph;
+    FT_Bitmap *bitmap = &slot->bitmap;
+    int w = (int)bitmap->width;
+    int h = (int)bitmap->rows;
+    int advance = (int)(slot->advance.x >> 6);
+    if (w <= 0 || h <= 0) {
+        return zan_atlas_store(ZAN_TILE_GLYPH, font_size, key, 4,
+                               0, 0, 0, 0, advance, NULL, 1);
+    }
+
+    unsigned char *cov = (unsigned char *)malloc((size_t)w * (size_t)h);
+    if (!cov) return NULL;
+    int pitch = bitmap->pitch;
+    for (int py = 0; py < h; py++) {
+        const unsigned char *row =
+            pitch >= 0 ? bitmap->buffer + py * pitch
+                       : bitmap->buffer + (h - 1 - py) * (-pitch);
+        unsigned char *dst = cov + (size_t)py * (size_t)w;
+        for (int px = 0; px < w; px++) {
+            int coverage = 0;
+            if (bitmap->pixel_mode == FT_PIXEL_MODE_GRAY)
+                coverage = row[px];
+            else if (bitmap->pixel_mode == FT_PIXEL_MODE_MONO)
+                coverage = (row[px >> 3] & (0x80 >> (px & 7))) ? 255 : 0;
+            else if (bitmap->pixel_mode == FT_PIXEL_MODE_BGRA)
+                coverage = row[px * 4 + 3];
+            dst[px] = (unsigned char)coverage;
+        }
+    }
+    const zan_glyph_tile *tile =
+        zan_atlas_store(ZAN_TILE_GLYPH, font_size, key, 4,
+                        w, h, slot->bitmap_left, slot->bitmap_top,
+                        advance, cov, 1);
+    free(cov);
+    return tile;
+}
+
 static void ft_draw_text(i64 surface_id, i64 x, i64 y,
                          const char *text, i64 color, int font_size) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
@@ -271,41 +328,19 @@ static void ft_draw_text(i64 surface_id, i64 x, i64 y,
     int pen_x = (int)x;
     int baseline = (int)y +
                    (int)(g_ft_face->size->metrics.ascender >> 6);
+    zan_glyph_batch batch;
+    batch.s = s;
+    batch.color = (u32)color;
+    batch.count = 0;
     while (*text) {
         u32 cp = utf8_next(&text);
-        FT_Face face = ft_face_for_cp(cp, font_size);
-        FT_UInt glyph = FT_Get_Char_Index(face, cp);
-        if (!glyph) glyph = FT_Get_Char_Index(face, '?');
-        if (glyph && FT_Load_Glyph(face, glyph, FT_LOAD_RENDER) == 0) {
-            FT_GlyphSlot slot = face->glyph;
-            FT_Bitmap *bitmap = &slot->bitmap;
-            int ox = pen_x + slot->bitmap_left;
-            int oy = baseline - slot->bitmap_top;
-            int pitch = bitmap->pitch;
-            for (int py = 0; py < (int)bitmap->rows; py++) {
-                const unsigned char *row =
-                    pitch >= 0
-                        ? bitmap->buffer + py * pitch
-                        : bitmap->buffer +
-                              ((int)bitmap->rows - 1 - py) * (-pitch);
-                for (int px = 0; px < (int)bitmap->width; px++) {
-                    int coverage = 0;
-                    if (bitmap->pixel_mode == FT_PIXEL_MODE_GRAY)
-                        coverage = row[px];
-                    else if (bitmap->pixel_mode == FT_PIXEL_MODE_MONO)
-                        coverage = (row[px >> 3] & (0x80 >> (px & 7)))
-                                       ? 255
-                                       : 0;
-                    else if (bitmap->pixel_mode == FT_PIXEL_MODE_BGRA)
-                        coverage = row[px * 4 + 3];
-                    if (coverage)
-                        set_pixel_aa(s, ox + px, oy + py,
-                                     (u32)color, coverage);
-                }
-            }
-            pen_x += (int)(slot->advance.x >> 6);
-        }
+        const zan_glyph_tile *tile = ft_glyph_tile(cp, font_size);
+        if (!tile) continue;   /* glyph the face could not render: as before */
+        zan_glyph_batch_add(&batch, tile, pen_x + tile->left,
+                            baseline - tile->top);
+        pen_x += tile->advance;
     }
+    zan_glyph_batch_flush(&batch);
 }
 
 static i64 ft_measure_text(const char *text, int font_size) {
@@ -324,6 +359,10 @@ static i64 ft_measure_text(const char *text, int font_size) {
 
 EXPORT void zan_gui_draw_text(
     i32 surface_id, i32 x, i32 y, const char *text, i32 color, i32 font_size) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s || !text || !*text) return;
+    ZAN_BE(s, draw_text, s, (int)x, (int)y, text, (u32)color, (int)font_size);
 #ifdef ZAN_GUI_FREETYPE
     if (ft_prepare((int)font_size)) {
         ft_draw_text(surface_id, x, y, text, color, (int)font_size);
@@ -435,11 +474,30 @@ EXPORT i32 zan_gui_set_caption_buttons(iptr hwnd_val, i32 count) {
     return 0;
 }
 
+/* Close is a *request*, mirroring WM_CLOSE on Win32 and WM_DELETE_WINDOW
+ * from the window manager: post a kind-8 event stamped with the target
+ * window and let the owner tear the window down (zan_gui_destroy_window)
+ * once its loop has seen the event. Destroying synchronously here races the
+ * caller's frame loop, which may still render chrome against the dead
+ * Window and die with a fatal BadWindow. */
 EXPORT i32 zan_gui_close_window(iptr hwnd_val) {
+    if (!g_display) return 0;
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
+    if (!xid) return 0;
+    Window prev = g_evwin_linux;
+    g_evwin_linux = xid;
+    evq_push_linux(8, 0, 0, 0, 0, 0);
+    g_evwin_linux = prev;
+    zan_gui_wake();
+    return 0;
+}
+
+EXPORT i32 zan_gui_destroy_window(iptr hwnd_val) {
     if (!g_display) return 0;
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
     zan_lwin_t *w = lwin_find(xid);
     if (w) {
+        zan_gui_release_window((void *)(intptr_t)w->xid);
         if (w->backbuf) XFreePixmap(g_display, w->backbuf);
         if (w->gc) XFreeGC(g_display, w->gc);
         if (w->xic) XDestroyIC(w->xic);
@@ -476,11 +534,6 @@ EXPORT i32 zan_gui_close_window(iptr hwnd_val) {
     XFlush(g_display);
     return 0;
 }
-
-/* On Linux close_window already destroys the X window synchronously, so the
- * owner-driven destroy is a no-op kept for FFI symbol parity across
- * backends. */
-EXPORT i32 zan_gui_destroy_window(iptr hwnd_val) { (void)hwnd_val; return 0; }
 
 /* Native glass on Linux: ask a compositing WM (KWin, or picom via rules) to
  * blur whatever is behind the window by setting the de-facto standard
@@ -534,14 +587,21 @@ EXPORT i32 zan_gui_set_opacity(iptr hwnd_val, i32 percent) {
 }
 
 EXPORT i32 zan_gui_get_dpi_scale(void) {
-    if (!g_display) return 100;
+    if (!g_display) {
+        g_display = XOpenDisplay(NULL);
+        if (!g_display) return 100;
+    }
     int screen = DefaultScreen(g_display);
     int wpx = DisplayWidth(g_display, screen);
     int wmm = DisplayWidthMM(g_display, screen);
-    if (wmm <= 0) return 100;
+    if (wmm <= 0) {
+        x11_set_scale_metrics(100);
+        return 100;
+    }
     double dpi = (double)wpx * 25.4 / (double)wmm;
     long scale = (long)(dpi * 100.0 / 96.0 + 0.5);
     if (scale < 100) scale = 100; /* never report sub-1x scaling */
+    x11_set_scale_metrics((int)scale);
     return (i64)scale;
 }
 

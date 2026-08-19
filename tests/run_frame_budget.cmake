@@ -9,6 +9,37 @@ if(NOT EXISTS "${ZANIDE}")
   return()
 endif()
 
+# Damage-clipped frames are opt-in (App.SetPartialFrames, driven by the IDE's own
+# profile key below): correctness first, since a single under-declared damage
+# rect leaves last frame's pixels on screen. This budget exists to measure that
+# optimization, so it turns it on; -DPARTIAL_FRAMES=0 measures the whole-frame
+# path instead (the shipped default, whose cost the caching layers must carry).
+if(NOT DEFINED PARTIAL_FRAMES)
+  set(PARTIAL_FRAMES 1)
+endif()
+
+# Which renderer the measured run uses (the IDE's own `renderBackend` profile
+# key): 0 CPU, 1 GL, 2 auto. The two backends do not share a budget -- the GPU
+# path never touches the CPU rasterizer, so its pixel counters read near zero
+# while its render_ms measures upload, batch and swap instead -- so each one
+# reads its own budget file and is calibrated on its own.
+if(NOT DEFINED RENDER_BACKEND)
+  set(RENDER_BACKEND 0)
+endif()
+if(NOT DEFINED BUDGET_FILE)
+  if(RENDER_BACKEND EQUAL 0)
+    set(BUDGET_FILE "${ROOT}/tests/perf/frame_budget.txt")
+  else()
+    set(BUDGET_FILE "${ROOT}/tests/perf/frame_budget_gl.txt")
+  endif()
+endif()
+# -DCALIBRATE=1 prints the measured numbers in budget-file syntax and asserts
+# nothing: that is how a budget file is produced on a machine whose GPU (or
+# CPU) has never been measured before.
+if(NOT DEFINED CALIBRATE)
+  set(CALIBRATE 0)
+endif()
+
 set(_run "${BINARY_DIR}/frame_budget_run")
 file(REMOVE_RECURSE "${_run}")
 file(MAKE_DIRECTORY "${_run}")
@@ -59,7 +90,7 @@ file(TO_CMAKE_PATH "${_project}" _project_cmake)
 foreach(_dir ZanIDE zan-ide)   # Windows/macOS name, then the XDG one
   file(MAKE_DIRECTORY "${_profile}/${_dir}")
   file(WRITE "${_profile}/${_dir}/config.cfg"
-    "treeW=240;bottomH=190;winW=1294;winH=857;autoRun=0;skin=emerald;rightW=600;opacity=100;wallOpacity=100;wallpaper=;")
+    "treeW=240;bottomH=190;winW=1294;winH=857;autoRun=0;skin=emerald;rightW=600;opacity=100;wallOpacity=100;partialFrames=${PARTIAL_FRAMES};renderBackend=${RENDER_BACKEND};wallpaper=;")
   # Without this the IDE scaffolds a throwaway sample project under the user's
   # home on first launch.
   file(WRITE "${_profile}/${_dir}/lastproject.txt" "${_project_cmake}")
@@ -280,21 +311,33 @@ if(NOT _first_count EQUAL 1)
   message(FATAL_ERROR "frame log has ${_first_count} firstframe lines; need exactly 1")
 endif()
 
-file(STRINGS "${ROOT}/tests/perf/frame_budget.txt" _budget_lines
-  REGEX "^[A-Za-z_][A-Za-z0-9_]*=[0-9]+$")
-foreach(_budget_line ${_budget_lines})
-  string(REGEX MATCH "^([^=]+)=([0-9]+)$" _budget_match "${_budget_line}")
-  set("_budget_${CMAKE_MATCH_1}" "${CMAKE_MATCH_2}")
-endforeach()
-foreach(_required blend_kpx restore_kpx fill_kpx round_kpx grad_kpx
-                 total_kpx style_resolve style_miss render_ms worst_ms tree_ms
-                 surface_w surface_h first_whole_ms first_tree_ms
-                 first_blend_kpx first_style_miss partial_min part_render_ms
-                 slow16_max)
-  if(NOT DEFINED "_budget_${_required}")
-    message(FATAL_ERROR "frame budget is missing ${_required}")
-  endif()
-endforeach()
+if(CALIBRATE)
+  # Nothing to compare against: the run below only reports what it measured.
+  set(_calibrating TRUE)
+elseif(NOT EXISTS "${BUDGET_FILE}")
+  # A backend nobody has measured on this kind of machine yet (the GL budget
+  # needs a real GPU): report the numbers instead of inventing a limit.
+  message("FRAME_BUDGET_UNCALIBRATED: no budget file ${BUDGET_FILE}"
+    " for renderBackend=${RENDER_BACKEND}; run with -DCALIBRATE=1 to produce one")
+  set(_calibrating TRUE)
+else()
+  set(_calibrating FALSE)
+  file(STRINGS "${BUDGET_FILE}" _budget_lines
+    REGEX "^[A-Za-z_][A-Za-z0-9_]*=[0-9]+$")
+  foreach(_budget_line ${_budget_lines})
+    string(REGEX MATCH "^([^=]+)=([0-9]+)$" _budget_match "${_budget_line}")
+    set("_budget_${CMAKE_MATCH_1}" "${CMAKE_MATCH_2}")
+  endforeach()
+  foreach(_required blend_kpx restore_kpx fill_kpx round_kpx grad_kpx
+                   total_kpx style_resolve style_miss render_ms worst_ms tree_ms
+                   surface_w surface_h first_whole_ms first_tree_ms
+                   first_blend_kpx first_style_miss partial_min part_render_ms
+                   slow16_max)
+    if(NOT DEFINED "_budget_${_required}")
+      message(FATAL_ERROR "frame budget ${BUDGET_FILE} is missing ${_required}")
+    endif()
+  endforeach()
+endif()
 
 function(_field LINE KEY DEFAULT OUT)
   string(REGEX MATCH "${KEY}=([0-9]+(\\.[0-9]+)?)" _field_match "${LINE}")
@@ -446,7 +489,46 @@ foreach(_batch RANGE ${_steady_start} ${_last_batch})
   endif()
 endforeach()
 
-message("FRAME_BUDGET measured vs budget")
+if(_calibrating)
+  # Budget-file syntax, so a calibration run's output can be saved as one.
+  message("FRAME_BUDGET_MEASURED renderBackend=${RENDER_BACKEND}"
+    " partialFrames=${PARTIAL_FRAMES} (paste into a budget file, headroom is"
+    " yours to add)")
+  foreach(_measured
+      "surface_w;${_surface_width}"
+      "surface_h;${_surface_height}"
+      "blend_kpx;${_max_blend}"
+      "restore_kpx;${_max_restore}"
+      "fill_kpx;${_max_fill}"
+      "round_kpx;${_max_round}"
+      "grad_kpx;${_max_grad}"
+      "total_kpx;${_max_total}"
+      "style_resolve;${_max_style}"
+      "style_miss;${_max_miss}"
+      "render_ms;${_max_render}"
+      "worst_ms;${_max_worst}"
+      "tree_ms;${_max_tree}"
+      "slow16_max;${_max_slow16}"
+      "partial_min;${_min_partial}"
+      "part_render_ms;${_max_part_render}"
+      "first_whole_ms;${_first_whole}"
+      "first_tree_ms;${_first_tree}"
+      "first_blend_kpx;${_first_blend}"
+      "first_style_miss;${_first_style_miss}")
+    list(GET _measured 0 _name)
+    list(GET _measured 1 _value)
+    message("${_name}=${_value}")
+  endforeach()
+  if(_surface_mismatch)
+    message("FRAME_BUDGET_SKIPPED: surface size changed mid-run, calibrate again")
+    return()
+  endif()
+  # ctest's SKIP_REGULAR_EXPRESSION: an uncalibrated backend is not a failure.
+  message("FRAME_BUDGET_SKIPPED: calibration run, nothing asserted")
+  return()
+endif()
+
+message("FRAME_BUDGET measured vs budget (renderBackend=${RENDER_BACKEND})")
 message("  surface      ${_surface_width}x${_surface_height} / ${_budget_surface_w}x${_budget_surface_h}")
 if(_surface_mismatch OR
    NOT _surface_width EQUAL _budget_surface_w OR

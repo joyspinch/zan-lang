@@ -185,10 +185,41 @@ class Layer {
     // ---- 临时队列（惰性创建） ----
     static List<ToastItem> toasts;
     static List<ToastItem> notifs;
+    // 上一帧这两条队列各自占过的像素 [x, y, w, h]（w/h 为 0 表示上一帧
+    // 什么也没画）。
+    static List<int> toastPrev;
+    static List<int> notifPrev;
 
     static void EnsureQueues() {
         if (Layer.toasts == null) { Layer.toasts = new List<ToastItem>(); }
         if (Layer.notifs == null) { Layer.notifs = new List<ToastItem>(); }
+        if (Layer.toastPrev == null) { Layer.toastPrev = Layer.NewRect(); }
+        if (Layer.notifPrev == null) { Layer.notifPrev = Layer.NewRect(); }
+    }
+
+    static List<int> NewRect() {
+        List<int> r = new List<int>();
+        r.Add(0); r.Add(0); r.Add(0); r.Add(0);
+        return r;
+    }
+
+    /// 声明这条队列这一帧的脏区，并把上一帧的脏区一起交上去。
+    ///
+    /// 队列里的东西一直在动（滑入、淡出、幸存者上移收拢），只声明「它现在
+    /// 在哪」的话，上一帧它占过、这一帧已经离开的那几行像素没人重画，留在
+    /// 屏幕上就是残影；最后一条消失的那一帧更是连一次重绘都不会请求，于是
+    /// 那条 toast 会一直挂在屏幕上直到下一次整窗重绘。
+    static void MarkQueueDirty(App app, List<int> prev, bool any,
+            int rx, int ry, int rw, int rh) {
+        if (any) { app.RequestAnimationFrameIn(16, rx, ry, rw, rh); }
+        if (prev[2] > 0 && prev[3] > 0) {
+            app.RequestAnimationFrameIn(16, prev[0], prev[1], prev[2], prev[3]);
+        }
+        if (any) {
+            prev[0] = rx; prev[1] = ry; prev[2] = rw; prev[3] = rh;
+        } else {
+            prev[0] = 0; prev[1] = 0; prev[2] = 0; prev[3] = 0;
+        }
     }
 
     /// 对话框操作按钮宽度：取标签自然宽度，不低于
@@ -229,6 +260,14 @@ class Layer {
     /// 3 成功，4 警告，5 错误。
     static void Msg(string text, int type) {
         Layer.EnsureQueues();
+        int now = Window.GetTickMs();
+        for (int i = 0; i < Layer.toasts.Count; i = i + 1) {
+            ToastItem it = Layer.toasts[i];
+            if (it.text == text && it.type == type && !it.closing) {
+                it.lifeMs = now - it.bornMs + 3000;
+                return;
+            }
+        }
         Layer.toasts.Add(new ToastItem(text, type, 3000));
     }
 
@@ -299,9 +338,7 @@ class Layer {
                 }
             }
         }
-        if (n > 0) {
-            app.RequestAnimationFrameIn(16, rx, ry, rw, rh);
-        }
+        Layer.MarkQueueDirty(app, Layer.toastPrev, n > 0, rx, ry, rw, rh);
     }
 
     static Rect DrawToast(App app, int y, int a, string text, int mtype) {
@@ -402,9 +439,7 @@ class Layer {
                 }
             }
         }
-        if (n > 0) {
-            app.RequestAnimationFrameIn(16, rx, ry, rw, rh);
-        }
+        Layer.MarkQueueDirty(app, Layer.notifPrev, n > 0, rx, ry, rw, rh);
     }
 
     /// 单条通知 / 内联横幅卡片的高度。

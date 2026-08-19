@@ -17,7 +17,7 @@ typedef int64_t i64;
 
 extern i64 zan_gui_create_window(const char *title, i64 width, i64 height);
 extern i64 zan_gui_show_window(i64 window);
-extern i64 zan_gui_set_caption_buttons(i64 count);
+extern i64 zan_gui_set_caption_buttons(i64 hwnd, i64 count);
 extern i64 zan_gui_titlebar_height(void);
 extern i64 zan_gui_caption_button_width(void);
 extern i64 zan_gui_poll_event(void);
@@ -49,7 +49,7 @@ int main(void) {
     i64 win = zan_gui_create_window("titlebar", 320, 240);
     if (!win) { printf("create failed\n"); return 1; }
     zan_gui_show_window(win);
-    zan_gui_set_caption_buttons(5);
+    zan_gui_set_caption_buttons(win, 5);
 
     i64 th = zan_gui_titlebar_height();
     i64 bw = zan_gui_caption_button_width();

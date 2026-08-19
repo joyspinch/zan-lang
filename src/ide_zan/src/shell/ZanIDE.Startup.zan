@@ -19,6 +19,9 @@ partial class ZanIDE {
     /// IDE, the frame hook drives the multi-window event routing and the
     /// per-frame polls, the exit hook saves the session.
     void InitShell(Form form) {
+        // Settings live beside the executable; an install that still has them
+        // in the user profile hands them over on this first launch.
+        ZanIDE.MigrateLegacyConfig();
         // Restore the last-used window / panel sizes (see SaveSettings).
         string cfg = "";
         if (File.Exists(ZanIDE.CfgPath())) { cfg = File.ReadAllText(ZanIDE.CfgPath()); }
@@ -62,10 +65,32 @@ partial class ZanIDE {
         // The window itself comes from src/App.zform; this method only
         // restores the persisted skin/opacity/wallpaper onto it.
         app = form.GetApp();
+        app.themeTipText = ZanIDE.T("Theme", "主题");
+        app.pinTipText = ZanIDE.T("Pin on top", "置顶");
+        app.minimizeTipText = ZanIDE.T("Minimize", "最小化");
+        app.maximizeTipText = ZanIDE.T("Maximize", "最大化");
+        app.restoreTipText = ZanIDE.T("Restore", "还原");
+        app.closeTipText = ZanIDE.T("Close", "关闭");
+        // Damage-clipped frames (hover strips, animation rects, effect-only
+        // presents) are off unless this IDE's own profile turns them on: they
+        // require every state change to declare exactly which pixels it touched,
+        // and one missed declaration leaves last frame's pixels on screen
+        // (duplicated panels, animation trails, garbled hovered buttons). This
+        // is a per-application setting, not an environment variable -- one
+        // machine-wide switch for every Zan program is not a setting.
+        app.SetPartialFrames(ZanIDE.CfgInt(cfg, "partialFrames", 0) == 1);
+        // Which rasterizer draws the frames: 0 = CPU (default), 1 = the
+        // runtime's own OpenGL backend, 2 = GPU when this machine can give a
+        // GL context. Same reasoning as partialFrames -- the IDE's profile
+        // decides for the IDE, not one switch for every Zan program on the
+        // machine. Asking for the GPU on a machine without a usable GL context
+        // (remote desktop, VM, CI) silently keeps the CPU rasterizer.
+        app.SetRenderBackend(ZanIDE.CfgClamp(
+            ZanIDE.CfgInt(cfg, "renderBackend", 0), 0, 2));
         // Restore the last-used title-bar skin. New configs persist the pack
         // NAME (indices shift when skins are added/removed); a legacy numeric
         // value maps to the index it named and is upgraded on the next save.
-        string skinName = ZanIDE.CfgStr(cfg, "skin", "");
+        string skinName = ZanIDE.CfgStr(cfg, "skin", "light");
         bool skinNumeric = skinName.Length > 0;
         for (int si = 0; si < skinName.Length; si = si + 1) {
             if (!ZanIDE.IsDigit(skinName.Substring(si, 1))) { skinNumeric = false; break; }
@@ -150,11 +175,22 @@ partial class ZanIDE {
         } else {
             log.Add("> " + IdeVersion.Product() + " ready. No project is open.");
         }
+        // A profile that asked for the GPU says so in the console, with the
+        // rasterizer that actually took the frames: asking for GL on a machine
+        // that cannot give a context keeps the CPU one, and without this line
+        // the fallback is invisible (the window looks identical).
+        if (app.RenderBackendMode() != RenderBackend.Cpu()) {
+            string want = "gpu";
+            if (app.RenderBackendMode() == RenderBackend.Auto()) { want = "auto"; }
+            log.Add("> renderer: renderBackend=" + want
+                + ", active " + app.RenderBackendName());
+        }
 
         ZanIDE.uiLang = ZanIDE.ReadUiLang();
         Wizard.lang = ZanIDE.uiLang;
         Designer.lang = ZanIDE.uiLang;
         SceneDesigner.lang = ZanIDE.uiLang;
+        ZanIDE.ApplyCaptionTips(app);
         ribbonTabs = ZanIDE.RibbonTabs();
         ribbonTab = new SignalInt(0);
     }

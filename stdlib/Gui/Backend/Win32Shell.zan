@@ -222,10 +222,24 @@ class Win32Shell {
     /// 光栅化器持有像素；外壳仅负责呈现。
     [DllImport("zan_gui")]
     static extern nint zan_gui_get_pixels(int surfaceId);
+    /// GPU 直通呈现：光栅化器把帧直接交换到该窗口上，返回 1 表示
+    /// 屏幕已经是这一帧、外壳不要再贴位图；返回 0 表示照旧走位图
+    /// （CPU 后端、拿不到 GL 的机器、以及分层玻璃窗都是 0）。
+    [DllImport("zan_gui")]
+    static extern int zan_gui_present_window(int surfaceId, nint nativeWindow);
+    /// 窗口即将销毁：让光栅化器释放挂在这个句柄上的东西。
+    [DllImport("zan_gui")]
+    static extern void zan_gui_release_window(nint nativeWindow);
     [DllImport("zan_gui")]
     static extern int zan_gui_surface_width(int surfaceId);
     [DllImport("zan_gui")]
     static extern int zan_gui_surface_height(int surfaceId);
+    /// 该表面上是否已经画过一帧（整表面清屏）。缩放时表面被销毁重建，
+    /// 而表面 id 会立即被回收复用：WM_PAINT/WM_SIZE 拿着 SurfaceOf(hwnd)
+    /// 记下的旧 id 去呈现，正好命中那块尚未绘制的新表面——里面是分配器
+    /// 交还的上一块表面内容，按旧 stride 排列，于是整窗都是斜切重影。
+    [DllImport("zan_gui")]
+    static extern int zan_gui_surface_painted(int surfaceId);
 
     static bool ready;
     static nint instance;
@@ -300,9 +314,16 @@ class Win32Shell {
     static List<int> surfId;
     static int lastSurface;
 
-    // 为下一次呈现声明的脏矩形（x, y, w, h 四元组）。
+    // 为下一次呈现声明的脏矩形（x, y, w, h 四元组）。列表是一份，
+    // 而窗口不止一个（主窗、设置对话框、原生下拉层……），所以它记着
+    // 自己属于哪个窗口：矩形按各自表面的坐标算，谁先呈现谁就把别人
+    // 的矩形消费掉的话，那个窗口改过的条带永远传不上去，屏上就一直
+    // 留着旧像素，直到某次整窗重绘。换主人时旧主人记进 dirtyLost，
+    // 它下一次呈现整窗上传，把欠的账一次补齐。
     static List<int> dirty;
     static bool dirtyOverflow;
+    static nint dirtyHwnd;
+    static List<nint> dirtyLost;
 
     // 自动化驱动排队的合成事件，由临界区
     // 保护：驱动线程可能在 UI 线程排空时入队。
@@ -350,6 +371,8 @@ class Win32Shell {
         Win32Shell.surfHwnd = new List<nint>();
         Win32Shell.surfId = new List<int>();
         Win32Shell.dirty = new List<int>();
+        Win32Shell.dirtyHwnd = 0;
+        Win32Shell.dirtyLost = new List<nint>();
         Win32Shell.injectQ = new List<int>();
         Win32Shell.injectHwnd = new List<nint>();
         Win32Shell.postQ = new List<int>();
@@ -842,18 +865,49 @@ class Win32Shell {
     static void Blit(nint hwnd, int surface) {
         nint pixels = Win32Shell.zan_gui_get_pixels(surface);
         if (pixels == 0) { return; }
+        if (Win32Shell.zan_gui_surface_painted(surface) == 0) {
+            // 还没有任何一帧画到这块表面上：呈现它就是把分配器里的旧
+            // 内容贴到窗口上。丢掉为旧几何声明的脏矩形，等应用画完。
+            if (Win32Shell.dirtyHwnd == hwnd) {
+                Win32Shell.dirty.Clear();
+                Win32Shell.dirtyOverflow = false;
+            }
+            return;
+        }
         int sw = Win32Shell.zan_gui_surface_width(surface);
         int sh = Win32Shell.zan_gui_surface_height(surface);
+        if (!Win32Shell.glassOn && Win32Shell.windowWidth <= sw
+            && Win32Shell.windowHeight <= sh) {
+            // GPU 直通：帧交换到屏幕上，一个像素都不经过 CPU 位图。
+            // 只在客户区不大于表面时走这条路——窗口刚放大、表面还没跟上
+            // 的那一帧要靠下面的 FillRect 补边。
+            if (Win32Shell.zan_gui_present_window(surface, hwnd) == 1) {
+                if (Win32Shell.dirtyHwnd == hwnd) {
+                    Win32Shell.dirty.Clear();
+                    Win32Shell.dirtyOverflow = false;
+                }
+                Win32Shell.TakeDirtyLost(hwnd);
+                return;
+            }
+        }
         if (Win32Shell.glassOn) {
-            Win32Shell.dirty.Clear();
-            Win32Shell.dirtyOverflow = false;
+            // 分层窗只能整张提交，所以自己声明的矩形直接作废；
+            // 别人的矩形不得顺手清掉。
+            if (Win32Shell.dirtyHwnd == hwnd) {
+                Win32Shell.dirty.Clear();
+                Win32Shell.dirtyOverflow = false;
+            }
+            Win32Shell.TakeDirtyLost(hwnd);
             Win32Shell.PresentLayered(hwnd, surface);
             return;
         }
         nint dc = Win32Shell.GetDC(hwnd);
         if (dc == 0) { return; }
         Win32Shell.FillBitmapInfo(sw, sh);
-        if (Win32Shell.dirty.Count > 0 && !Win32Shell.dirtyOverflow) {
+        bool owned = Win32Shell.dirtyHwnd == hwnd;
+        bool lost = Win32Shell.TakeDirtyLost(hwnd);
+        if (owned && !lost && Win32Shell.dirty.Count > 0
+            && !Win32Shell.dirtyOverflow) {
             int i = 0;
             while (i + 3 < Win32Shell.dirty.Count) {
                 int rx = Win32Shell.dirty[i];
@@ -876,8 +930,10 @@ class Win32Shell {
             Win32Shell.SetDIBitsToDevice(dc, 0, 0, sw, sh, 0, 0, 0, sh,
                 pixels, Win32Shell.bitmapInfo, 0);
         }
-        Win32Shell.dirty.Clear();
-        Win32Shell.dirtyOverflow = false;
+        if (owned) {
+            Win32Shell.dirty.Clear();
+            Win32Shell.dirtyOverflow = false;
+        }
         if (Win32Shell.windowWidth > sw || Win32Shell.windowHeight > sh) {
             int bgr = ((Win32Shell.bgColor & 255) << 16)
                 | (Win32Shell.bgColor & 65280)
@@ -909,10 +965,26 @@ class Win32Shell {
     static void PresentLayered(nint hwnd, int surface) {
         nint pixels = Win32Shell.zan_gui_get_pixels(surface);
         if (pixels == 0) { return; }
+        if (Win32Shell.zan_gui_surface_painted(surface) == 0) { return; }
         int sw = Win32Shell.zan_gui_surface_width(surface);
         int sh = Win32Shell.zan_gui_surface_height(surface);
-        if (Win32Shell.lwDc == 0 || Win32Shell.lwW != sw
-                || Win32Shell.lwH != sh) {
+        // 呈现尺寸由窗口客户区说了算，不是表面说了算。UpdateLayeredWindow
+        // 的 psize 同时*决定*分层窗口的尺寸：拿一块尺寸还没跟上的表面去呈现，
+        // 等于一边把窗口拉回旧尺寸、一边让系统按旧宽度解读像素——屏幕上就是
+        // 斜切、错位、上一帧的碎块（缩放时表面换手总会晚一帧到）。
+        // 表面比窗口大就只取左上角那块，小就把余下部分留给 DWM 的模糊背景。
+        nint crect = Win32Shell.scratchRect;
+        int pw = sw;
+        int ph = sh;
+        if (Win32Shell.GetClientRect(hwnd, crect) != 0) {
+            int cw = Win32Shell.S32(crect, 8) - Win32Shell.S32(crect, 0);
+            int ch = Win32Shell.S32(crect, 12) - Win32Shell.S32(crect, 4);
+            if (cw > 0 && ch > 0) { pw = cw; ph = ch; }
+        }
+        int copyW = sw < pw ? sw : pw;
+        int copyH = sh < ph ? sh : ph;
+        if (Win32Shell.lwDc == 0 || Win32Shell.lwW != pw
+                || Win32Shell.lwH != ph) {
             if (Win32Shell.lwDc != 0) {
                 Win32Shell.SelectObject(Win32Shell.lwDc, Win32Shell.lwOld);
                 Win32Shell.DeleteObject(Win32Shell.lwBitmap);
@@ -922,7 +994,7 @@ class Win32Shell {
             nint screen = Win32Shell.GetDC(0);
             Win32Shell.lwDc = Win32Shell.CreateCompatibleDC(screen);
             Win32Shell.ReleaseDC(0, screen);
-            Win32Shell.FillBitmapInfo(sw, sh);
+            Win32Shell.FillBitmapInfo(pw, ph);
             nint bits = 0;
             Win32Shell.lwBitmap = Win32Shell.CreateDIBSection(Win32Shell.lwDc,
                 Win32Shell.bitmapInfo, 0, ref bits, 0, 0);
@@ -934,48 +1006,63 @@ class Win32Shell {
             Win32Shell.lwOld = Win32Shell.SelectObject(Win32Shell.lwDc,
                 Win32Shell.lwBitmap);
             Win32Shell.lwBits = bits;
-            Win32Shell.lwW = sw;
-            Win32Shell.lwH = sh;
+            Win32Shell.lwW = pw;
+            Win32Shell.lwH = ph;
         }
-        int n = sw * sh;
         List<byte> mask = null;
         if (Win32Shell.shapeMode != 0) {
-            mask = Win32Shell.ShapeMask(sw, sh);
+            mask = Win32Shell.ShapeMask(pw, ph);
         }
-        int i = 0;
-        while (i < n) {
-            int p = Win32Shell.S32(pixels, i * 4);
-            int a = (p >> 24) & 255;
-            if (mask != null) {
-                int cov = mask[i];
-                if (cov <= 0) {
-                    a = 0;
-                    new Span<int>(Win32Shell.lwBits + i * 4, 1)[0] = 0;
-                    i = i + 1;
-                    continue;
-                }
-                if (cov < 255) {
-                    // 预乘：alpha 和颜色通道按相同比例缩放。
-                    a = a * cov / 255;
-                    int r = ((p >> 16) & 255) * cov / 255;
-                    int g = ((p >> 8) & 255) * cov / 255;
-                    int b = (p & 255) * cov / 255;
-                    new Span<int>(Win32Shell.lwBits + i * 4, 1)[0] =
-                        (a << 24) | (r << 16) | (g << 8) | b;
-                    i = i + 1;
-                    continue;
+        // 逐行拷：目标行跨距按窗口宽 pw，源行跨距按表面宽 sw；两者在缩放
+        // 的一瞬并不相等（把它们当成同一个就是那片斜切）。
+        int y = 0;
+        while (y < ph) {
+            nint dstRow = Win32Shell.lwBits + y * pw * 4;
+            int x = 0;
+            if (y < copyH) {
+                nint srcRow = pixels + y * sw * 4;
+                while (x < copyW) {
+                    int p = Win32Shell.S32(srcRow, x * 4);
+                    int a = (p >> 24) & 255;
+                    if (mask != null) {
+                        int cov = mask[y * pw + x];
+                        if (cov <= 0) {
+                            new Span<int>(dstRow + x * 4, 1)[0] = 0;
+                            x = x + 1;
+                            continue;
+                        }
+                        if (cov < 255) {
+                            // 预乘：alpha 和颜色通道按相同比例缩放。
+                            a = a * cov / 255;
+                            int r = ((p >> 16) & 255) * cov / 255;
+                            int g = ((p >> 8) & 255) * cov / 255;
+                            int b = (p & 255) * cov / 255;
+                            new Span<int>(dstRow + x * 4, 1)[0] =
+                                (a << 24) | (r << 16) | (g << 8) | b;
+                            x = x + 1;
+                            continue;
+                        }
+                    }
+                    int r2 = ((p >> 16) & 255) * a / 255;
+                    int g2 = ((p >> 8) & 255) * a / 255;
+                    int b2 = (p & 255) * a / 255;
+                    new Span<int>(dstRow + x * 4, 1)[0] =
+                        (a << 24) | (r2 << 16) | (g2 << 8) | b2;
+                    x = x + 1;
                 }
             }
-            int r2 = ((p >> 16) & 255) * a / 255;
-            int g2 = ((p >> 8) & 255) * a / 255;
-            int b2 = (p & 255) * a / 255;
-            new Span<int>(Win32Shell.lwBits + i * 4, 1)[0] = (a << 24) | (r2 << 16) | (g2 << 8) | b2;
-            i = i + 1;
+            // 表面还没长到窗口这么大的那一圈：给它全透明，由 DWM 填模糊
+            // 背景（下一帧应用就把它画满了），而不是搬旧像素。
+            while (x < pw) {
+                new Span<int>(dstRow + x * 4, 1)[0] = 0;
+                x = x + 1;
+            }
+            y = y + 1;
         }
         nint screenDc = Win32Shell.GetDC(0);
         nint size = NativeMemory.Alloc(8);
-        new Span<int>(size, 1)[0] = sw;
-        new Span<int>(size + 4, 1)[0] = sh;
+        new Span<int>(size, 1)[0] = pw;
+        new Span<int>(size + 4, 1)[0] = ph;
         nint src = NativeMemory.Alloc(8);
         new Span<int>(src, 1)[0] = 0;
         new Span<int>(src + 4, 1)[0] = 0;
@@ -1207,6 +1294,7 @@ class Win32Shell {
 
     static void Destroy(nint hwnd) {
         Win32Shell.ForgetCaptionButtons(hwnd);
+        Win32Shell.zan_gui_release_window(hwnd);
         Win32Shell.DestroyWindow(hwnd);
     }
 
@@ -1687,9 +1775,19 @@ class Win32Shell {
         }
     }
 
-    static void PresentDirty(int x, int y, int w, int h) {
+    static void PresentDirty(nint hwnd, int x, int y, int w, int h) {
         Win32Shell.Init();
         if (w <= 0 || h <= 0) { return; }
+        if (Win32Shell.dirtyHwnd != hwnd) {
+            // 另一个窗口接手了还没被呈现的矩形：旧主人这一次改过
+            // 的像素已无法逐矩形上传，记下欠账。
+            if (Win32Shell.dirty.Count > 0 && Win32Shell.dirtyHwnd != 0) {
+                Win32Shell.NoteDirtyLost(Win32Shell.dirtyHwnd);
+            }
+            Win32Shell.dirty.Clear();
+            Win32Shell.dirtyOverflow = false;
+            Win32Shell.dirtyHwnd = hwnd;
+        }
         if (Win32Shell.dirty.Count >= 2048) {
             Win32Shell.dirtyOverflow = true;
             return;
@@ -1698,6 +1796,26 @@ class Win32Shell {
         Win32Shell.dirty.Add(y);
         Win32Shell.dirty.Add(w);
         Win32Shell.dirty.Add(h);
+    }
+
+    /// 记下一个窗口有一批声明过却没上传成的脏矩形：它下一次呈现
+    /// 整窗上传，而不是只上传那一次声明的那几块。
+    static void NoteDirtyLost(nint hwnd) {
+        for (int i = 0; i < Win32Shell.dirtyLost.Count; i = i + 1) {
+            if (Win32Shell.dirtyLost[i] == hwnd) { return; }
+        }
+        Win32Shell.dirtyLost.Add(hwnd);
+    }
+
+    /// 这个窗口是否欠着一次整窗上传（并消费掉该记录）。
+    static bool TakeDirtyLost(nint hwnd) {
+        for (int i = 0; i < Win32Shell.dirtyLost.Count; i = i + 1) {
+            if (Win32Shell.dirtyLost[i] == hwnd) {
+                Win32Shell.dirtyLost.RemoveAt(i);
+                return true;
+            }
+        }
+        return false;
     }
 
     // ---- 事件循环 ---------------------------------------------------------
