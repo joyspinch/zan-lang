@@ -16,11 +16,63 @@ file(MAKE_DIRECTORY "${_run}/uidrv")
 
 file(TO_CMAKE_PATH "${ROOT}/tests/perf/ide_hover_scroll.uidrv" _script)
 file(TO_CMAKE_PATH "${_run}/uidrv" _uidrv_out)
+
+set(_profile "${_run}/profile")
+
+# The opened project is part of the calibration surface too: the driver script
+# hovers and scrolls the explorer, so how many rows it has decides how many
+# frames the run even produces (against a 6-entry tree the scrolls are no-ops
+# and the profiler never fills its four 30-frame batches), and so does the file
+# count, because project sources are read in per-frame slices. Generate a fixed
+# project instead of opening the repo or whatever the developer had open --
+# repo contents drift, and a developer's project is not reproducible at all.
+set(_project "${_run}/fixture_project")
+file(WRITE "${_project}/zan.proj"
+  "name = FrameBudget\ntype = console\nentry = src/main.zan\ntarget = exe\nplatform = windows-x64\n")
+set(_main "")
+foreach(_i RANGE 1 60)
+  string(APPEND _main
+    "/// Frame-budget fixture line block ${_i}.\n"
+    "int budgetHelper${_i}(int seed) {\n"
+    "    int acc = seed;\n"
+    "    for (int i = 0; i < ${_i}; i = i + 1) { acc = acc + i * ${_i}; }\n"
+    "    return acc;\n"
+    "}\n\n")
+endforeach()
+file(WRITE "${_project}/src/main.zan" "${_main}void main() {\n    Console.WriteLine(\"frame budget fixture\");\n}\n")
+file(WRITE "${_project}/README.md" "# Frame budget fixture\n")
+foreach(_m RANGE 1 20)
+  foreach(_f a b c d e f g h i j)
+    file(WRITE "${_project}/mod${_m}/${_f}.zan"
+      "class Mod${_m}${_f} {\n    static int Value() { return ${_m}; }\n}\n")
+  endforeach()
+endforeach()
+file(TO_CMAKE_PATH "${_project}" _project_cmake)
+
+# ZanIDE reads its skin and panel widths from the per-user profile
+# (ZanIDE.UserConfigDir(), i.e. %APPDATA%/ZanIDE), and every pixel budget below
+# depends on both: the same build measured round_kpx 244 under the default skin
+# and 1293 under emerald. So the run gets a profile of its own inside the
+# (wiped) run dir. The values here ARE the calibration surface -- change them
+# only together with a fresh measurement -- and the developer's own profile is
+# never read or written.
+foreach(_dir ZanIDE zan-ide)   # Windows/macOS name, then the XDG one
+  file(MAKE_DIRECTORY "${_profile}/${_dir}")
+  file(WRITE "${_profile}/${_dir}/config.cfg"
+    "treeW=240;bottomH=190;winW=1294;winH=857;autoRun=0;skin=emerald;rightW=600;opacity=100;wallOpacity=100;wallpaper=;")
+  # Without this the IDE scaffolds a throwaway sample project under the user's
+  # home on first launch.
+  file(WRITE "${_profile}/${_dir}/lastproject.txt" "${_project_cmake}")
+endforeach()
+file(TO_NATIVE_PATH "${_profile}" _profile_native)
+
 execute_process(
   COMMAND "${CMAKE_COMMAND}" -E env
     "ZAN_FRAME_PROF=1"
     "ZAN_UI_SCRIPT=${_script}"
     "ZAN_UI_OUT=${_uidrv_out}"
+    "APPDATA=${_profile_native}"
+    "XDG_CONFIG_HOME=${_profile_native}"
     "${ZANIDE}"
   WORKING_DIRECTORY "${_run}"
   TIMEOUT 180

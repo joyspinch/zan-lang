@@ -617,6 +617,32 @@ EXPORT i32 zan_gui_stat_read(i32 idx, i32 kind) {
     return kpx;
 }
 
+/* zan_gui_clear restricted to a rect: stores the color, alpha included, instead
+ * of blending it. A damage-clipped frame begins by re-establishing the window
+ * background inside its damage rect only, and it must land on exactly the
+ * pixels a whole-frame clear would have produced. Doing that with fill_rect
+ * instead blends the background over the previous frame still sitting in the
+ * surface, so a translucent (glass) or fully transparent (shaped-window)
+ * background either tints the strip once more per partial frame or leaves the
+ * stale pixels untouched. */
+EXPORT void zan_gui_clear_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 color) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    u32 c = (u32)color;
+    int x0 = clamp_i((int)x, s->clip_x0, s->clip_x1);
+    int y0 = clamp_i((int)y, s->clip_y0, s->clip_y1);
+    int x1 = clamp_i((int)(x + w), s->clip_x0, s->clip_x1);
+    int y1 = clamp_i((int)(y + h), s->clip_y0, s->clip_y1);
+    long long area = (long long)(x1 - x0) * (long long)(y1 - y0);
+    if (area <= 0) return;
+    ZAN_STAT(g_st_fill_op, area);
+    stat_top_rect(1, (int)area, x0, y0, x1 - x0, y1 - y0, c);
+    for (int py = y0; py < y1; py++) {
+        fill_run_const(s->pixels + py * s->stride + x0, x1 - x0, c);
+    }
+}
+
 EXPORT void zan_gui_fill_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 color) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
@@ -1085,6 +1111,13 @@ static u32 zan_src_sum(zan_surface_t *s, int x0, int y0, int rw, int rh) {
 }
 static zan_blur_cache_t g_blur_cache[ZAN_BLUR_CACHE_SLOTS];
 
+/* Damage-clipped frames whose glass had to be re-blurred from a source that is
+ * only partly fresh: outside the damage strip the surface still holds the last
+ * frame's *composited* pixels (panel tint, text), so the kernel mixes them into
+ * the strip and the result drifts from what a whole frame would produce. The
+ * caller polls this to promote the next frame to a whole one. */
+static long long g_blur_partial_miss;
+
 static void zan_blur_cached_core(
     i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 slot,
     i32 dirty, int cr, int cmask) {
@@ -1118,8 +1151,14 @@ static void zan_blur_cached_core(
     int geom_ok = c->valid && c->pixels && c->sid == (int)surface_id
         && c->x0 == x0 && c->y0 == y0 && c->rw == rw && c->rh == rh
         && c->r == r && c->cr == cr && c->cmask == cmask;
+    int covers = clip_covers(s, x0, y0, x1, y1);
     u32 sum = geom_ok ? zan_src_sum(s, x0, y0, rw, rh) : 0;
-    if (geom_ok && (!dirty || sum == c->src_sum)) {
+    /* Region straddles the damage strip: the backdrop outside it is last
+     * frame's composited output, so both the checksum and a re-blur would be
+     * computed from stale pixels. The cached blur was taken from a clean
+     * backdrop, so restoring it is the *more* faithful answer -- ignore the
+     * dirty hint here. */
+    if (geom_ok && (!dirty || !covers || sum == c->src_sum)) {
         ZAN_STAT(g_st_blur_hit, (long long)rw * (long long)rh);
         for (int j = 0; j < rh; j++) {
             u32 *src = c->pixels + (size_t)j * rw;
@@ -1143,12 +1182,21 @@ static void zan_blur_cached_core(
      * untouched backdrop outside it. Snapshotting that mixture would hand a
      * later frame a half-sharp "blur"; drop the slot and let the next full
      * frame refill it. */
-    if (!clip_covers(s, x0, y0, x1, y1) || c->cap < n) { c->valid = 0; return; }
+    if (!covers) { g_blur_partial_miss++; }
+    if (!covers || c->cap < n) { c->valid = 0; return; }
     c->x0 = x0; c->y0 = y0; c->rw = rw; c->rh = rh; c->r = r;
     c->cr = cr; c->cmask = cmask;
     c->src_sum = fresh;
     c->sid = (int)surface_id;
     c->valid = 1;
+}
+
+/* Number of glass regions blurred from a partly stale backdrop since the last
+ * call (and resets the counter). */
+EXPORT i32 zan_gui_blur_partial_miss_take(void) {
+    i32 v = (i32)g_blur_partial_miss;
+    g_blur_partial_miss = 0;
+    return v;
 }
 
 EXPORT void zan_gui_blur_rect_cached(
