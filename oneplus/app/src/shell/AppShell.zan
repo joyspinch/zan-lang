@@ -1,0 +1,232 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component.CefBrowser;
+using OnePlus.Model;
+using OnePlus.Menu;
+using OnePlus.Pages;
+
+namespace OnePlus.Shell;
+
+/// 主壳：顶部入口、业务/浏览器多标签和底部状态栏。
+class AppShell : Control {
+    static AppShell current;
+    static App app;
+    static Label status;
+    static Tabs tabs;
+    static bool cefReady;
+    static string cefMessage;
+    static List<string> keys;
+    static List<CefBrowserBox> browsers;
+    static List<ToolPage> tools;
+    static SignalBool menuOpen;
+    static SignalInt menuAction;
+    static SignalInt menuSub;
+    static int menuKind;
+    static int menuX;
+    static int menuY;
+
+    AppShell(App a, bool ready, string message) {
+        this.InitControl("oneplus-shell", 5);
+        AppShell.current = this;
+        AppShell.app = a;
+        AppShell.cefReady = ready;
+        AppShell.cefMessage = message;
+        AppShell.keys = new List<string>();
+        AppShell.browsers = new List<CefBrowserBox>();
+        AppShell.tools = new List<ToolPage>();
+        AppShell.menuOpen = new SignalBool(false);
+        AppShell.menuAction = new SignalInt(-1);
+        AppShell.menuSub = new SignalInt(-1);
+
+        Panel top = Panel.Row();
+        top.Layout();
+        top.Gap(8);
+        top.Pad(10);
+        top.Dock(Dock.Top());
+        top.With(new Label("账号：演示账号  ·  授权：骨架模式") {
+            Class = "secondary"
+        });
+        top.With(new Label("店铺：演示店铺 ▼") { Class = "secondary" });
+        Panel spacer = Panel.Row();
+        spacer.Dock(Dock.Fill());
+        top.With(spacer);
+        Button software = new Button("推广软件") { Class = "primary" };
+        Button quick = new Button("快捷访问") { Class = "secondary" };
+        Button sites = new Button("站点") { Class = "secondary" };
+        software.Click += AppShell.OnSoftware;
+        quick.Click += AppShell.OnQuick;
+        sites.Click += AppShell.OnSites;
+        top.With(software).With(quick).With(sites);
+
+        AppShell.tabs = new Tabs(Tabs.Card());
+        AppShell.tabs.Dock(Dock.Fill());
+        AppShell.tabs.TabClosed += AppShell.OnTabClosed;
+        AppShell.tabs.TabChanged += AppShell.OnTabChanged;
+        AppShell.status = new Label("就绪 · 假数据 · " + message) {
+            Class = "secondary"
+        };
+        AppShell.status.Dock(Dock.Bottom());
+        AppShell.status.Pad(8);
+
+        this.With(top).With(AppShell.status).With(AppShell.tabs);
+        ToolDef first = ToolRegistry.All()[0];
+        AppShell.OpenToolTab(first);
+    }
+
+    static App App() { return AppShell.app; }
+
+    static void SetStatus(string text) {
+        if (AppShell.status != null) { AppShell.status.Text = text; }
+    }
+
+    static void OnTabChanged() {
+        AppShell.SetStatus("当前标签：" + AppShell.tabs.ActiveLabel());
+    }
+
+    static void OnTabClosed() {
+        int at = AppShell.tabs.TakeClosed();
+        if (at < 0 || at >= AppShell.keys.Count) { return; }
+        CefBrowserBox b = AppShell.browsers[at];
+        if (b != null) { b.Destroy(); }
+        AppShell.keys.RemoveAt(at);
+        AppShell.browsers.RemoveAt(at);
+        AppShell.tools.RemoveAt(at);
+        AppShell.SetStatus("已关闭标签");
+    }
+
+    static void OnSoftware() { AppShell.ShowMenu(0); }
+    static void OnQuick() { AppShell.ShowMenu(1); }
+    static void OnSites() { AppShell.ShowMenu(2); }
+
+    static void ShowMenu(int kind) {
+        AppShell.menuKind = kind;
+        if (AppShell.app != null) {
+            AppShell.menuX = AppShell.app.mouseX;
+            AppShell.menuY = AppShell.app.mouseY + 6;
+        }
+        AppShell.menuAction.Set(-1);
+        AppShell.menuSub.Set(-1);
+        AppShell.menuOpen.Set(true);
+        if (AppShell.app != null) { AppShell.app.RequestRedraw(); }
+    }
+
+    static List<MenuItem> MenuItems() {
+        List<MenuItem> r = new List<MenuItem>();
+        if (AppShell.menuKind == 0) {
+            r.Add(MenuItem.Header("推广软件"));
+            List<ToolDef> defs = ToolRegistry.All();
+            for (int i = 0; i < defs.Count; i = i + 1) {
+                r.Add(MenuItem.Item(defs[i].title, "rocket", i));
+            }
+        } else if (AppShell.menuKind == 1) {
+            r.Add(MenuItem.Header("快捷访问"));
+            r.Add(MenuItem.Item("淘宝首页", "home", 0));
+            r.Add(MenuItem.Item("万相台无界", "globe", 1));
+            r.Add(MenuItem.Item("生意参谋", "chart", 2));
+            r.Add(MenuItem.Item("达摩盘", "disc", 3));
+            r.Add(MenuItem.Item("商品素材", "image", 4));
+        } else {
+            r.Add(MenuItem.Header("站点"));
+            r.Add(MenuItem.Item("千牛", "monitor", 0));
+            r.Add(MenuItem.Item("天猫超市", "shopping-cart", 1));
+            r.Add(MenuItem.Item("天猫国际", "globe", 2));
+            r.Add(MenuItem.Item("阿里健康", "heart", 3));
+            r.Add(MenuItem.Item("淘工厂", "factory", 4));
+        }
+        return r;
+    }
+
+    void HandleMenuResult() {
+        int picked = AppShell.menuAction.Get();
+        if (!AppShell.menuOpen.Get() || picked < 0) { return; }
+        AppShell.menuOpen.Set(false);
+        AppShell.menuAction.Set(-1);
+        if (AppShell.menuKind == 0) {
+            List<ToolDef> defs = ToolRegistry.All();
+            if (picked < defs.Count) { AppShell.OpenToolTab(defs[picked]); }
+        } else if (AppShell.menuKind == 1) {
+            List<string> names = new List<string>();
+            names.Add("淘宝首页"); names.Add("万相台无界");
+            names.Add("生意参谋"); names.Add("达摩盘"); names.Add("商品素材");
+            List<string> urls = new List<string>();
+            urls.Add("https://www.taobao.com");
+            urls.Add("https://www.wanxiangtai.com");
+            urls.Add("https://sycm.taobao.com");
+            urls.Add("https://dmp.taobao.com");
+            urls.Add("https://item.taobao.com");
+            if (picked < names.Count) {
+                AppShell.OpenBrowserTab(names[picked], urls[picked]);
+            }
+        } else {
+            List<string> names = new List<string>();
+            names.Add("千牛"); names.Add("天猫超市"); names.Add("天猫国际");
+            names.Add("阿里健康"); names.Add("淘工厂");
+            if (picked < names.Count) {
+                AppShell.SetStatus("站点已切换：" + names[picked] + "（骨架状态，不持久化）");
+            }
+        }
+    }
+
+    static void OpenToolTab(ToolDef def) {
+        string key = "tool:" + def.bizCode;
+        for (int i = 0; i < AppShell.keys.Count; i = i + 1) {
+            if (AppShell.keys[i] == key) {
+                AppShell.tabs.Select(i);
+                return;
+            }
+        }
+        int at = AppShell.tabs.Count();
+        AppShell.tabs.Add(def.title, true);
+        ToolPage page = new ToolPage(def);
+        page.Dock(Dock.Fill());
+        AppShell.tabs.Page(at).Add(page);
+        AppShell.keys.Add(key);
+        AppShell.browsers.Add(null);
+        AppShell.tools.Add(page);
+        AppShell.tabs.Select(at);
+        AppShell.SetStatus("已打开：" + def.title + " · 假数据");
+    }
+
+    static void OpenBrowserTab(string title, string url) {
+        string key = "browser:" + url;
+        for (int i = 0; i < AppShell.keys.Count; i = i + 1) {
+            if (AppShell.keys[i] == key) {
+                AppShell.tabs.Select(i);
+                return;
+            }
+        }
+        int at = AppShell.tabs.Count();
+        AppShell.tabs.Add(title, true);
+        CefBrowserBox box = null;
+        if (AppShell.cefReady) {
+            box = new CefBrowserBox();
+            box.SetStartUrl(url);
+            box.Dock(Dock.Fill());
+            AppShell.tabs.Page(at).Add(box);
+        } else {
+            TextArea unavailable = new TextArea("");
+            unavailable.ReadOnly(true).AutoHeight(true);
+            unavailable.SetText("浏览器不可用\n" + AppShell.cefMessage +
+                                "\n业务工具标签仍可正常使用。");
+            unavailable.Class = "title";
+            unavailable.Dock(Dock.Fill());
+            unavailable.Pad(30);
+            AppShell.tabs.Page(at).Add(unavailable);
+        }
+        AppShell.keys.Add(key);
+        AppShell.browsers.Add(box);
+        AppShell.tools.Add(null);
+        AppShell.tabs.Select(at);
+        AppShell.SetStatus(title + " · " + (AppShell.cefReady ? "浏览器已打开" : "浏览器不可用"));
+    }
+
+    override void OnPaint(App a) {
+        if (AppShell.menuOpen.Get()) {
+            a.AddOverlay(OverlayPopup.RichMenu(AppShell.menuX, AppShell.menuY,
+                AppShell.MenuItems(), 720000, AppShell.menuAction,
+                AppShell.menuOpen, AppShell.menuSub));
+            AppShell.current.HandleMenuResult();
+        }
+    }
+}
