@@ -229,7 +229,7 @@ if(NOT _first_count EQUAL 1)
 endif()
 
 file(STRINGS "${ROOT}/tests/perf/frame_budget.txt" _budget_lines
-  REGEX "^[A-Za-z_]+=[0-9]+$")
+  REGEX "^[A-Za-z_][A-Za-z0-9_]*=[0-9]+$")
 foreach(_budget_line ${_budget_lines})
   string(REGEX MATCH "^([^=]+)=([0-9]+)$" _budget_match "${_budget_line}")
   set("_budget_${CMAKE_MATCH_1}" "${CMAKE_MATCH_2}")
@@ -237,7 +237,8 @@ endforeach()
 foreach(_required blend_kpx restore_kpx fill_kpx round_kpx grad_kpx
                  total_kpx style_resolve style_miss render_ms worst_ms tree_ms
                  surface_w surface_h first_whole_ms first_tree_ms
-                 first_blend_kpx first_style_miss partial_min part_render_ms)
+                 first_blend_kpx first_style_miss partial_min part_render_ms
+                 slow16_max)
   if(NOT DEFINED "_budget_${_required}")
     message(FATAL_ERROR "frame budget is missing ${_required}")
   endif()
@@ -290,6 +291,9 @@ set(_min_partial 30)
 # 局部帧自己的耗时：稳态下整窗帧归零后 render_ms 与像素计数器都测不
 # 到东西（它们只统计整窗帧），局部帧变贵就没人拦了。
 set(_max_part_render 0)
+# 一批 30 帧里超过 16.7ms 的帧数：worst_ms 只看最慢那一帧，掉 1 帧和掉
+# 12 帧给出同一个数字，而手感上的一卡一卡是掉帧密度。
+set(_max_slow16 0)
 list(LENGTH _frame_indexes _batch_count)
 math(EXPR _steady_start "2")
 if(_batch_count LESS 3)
@@ -342,6 +346,10 @@ foreach(_batch RANGE ${_steady_start} ${_last_batch})
   _field("${_frame_line}" "part_render_ms" "0" _part_render)
   if(_part_render GREATER _max_part_render)
     set(_max_part_render "${_part_render}")
+  endif()
+  _field("${_frame_line}" "slow16" "0" _slow16)
+  if(_slow16 GREATER _max_slow16)
+    set(_max_slow16 "${_slow16}")
   endif()
   _field("${_frame_line}" "partial" "0" _partial)
   if(_partial LESS _min_partial)
@@ -405,6 +413,7 @@ message("  style_miss   ${_max_miss} / ${_budget_style_miss}")
 message("  render_ms    ${_max_render} / ${_budget_render_ms}")
 message("  worst_ms     ${_max_worst} / ${_budget_worst_ms}")
 message("  tree_ms      ${_max_tree} / ${_budget_tree_ms}")
+message("  slow16       ${_max_slow16} / ${_budget_slow16_max}")
 message("  partial_min  ${_min_partial} / ${_budget_partial_min} (floor)")
 message("  part_render_ms ${_max_part_render} / ${_budget_part_render_ms}")
 message("  first_whole_ms ${_first_whole} / ${_budget_first_whole_ms}")
@@ -429,7 +438,8 @@ foreach(_check
     "first_tree_ms;${_first_tree};${_budget_first_tree_ms}"
     "first_blend_kpx;${_first_blend};${_budget_first_blend_kpx}"
     "first_style_miss;${_first_style_miss};${_budget_first_style_miss}"
-    "part_render_ms;${_max_part_render};${_budget_part_render_ms}")
+    "part_render_ms;${_max_part_render};${_budget_part_render_ms}"
+    "slow16;${_max_slow16};${_budget_slow16_max}")
   list(GET _check 0 _name)
   list(GET _check 1 _value)
   list(GET _check 2 _limit)
