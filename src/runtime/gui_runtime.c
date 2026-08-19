@@ -109,6 +109,10 @@ static int g_surface_count = 0;
 static i64 g_last_surface = -1;
 static u32 g_bg_color = 0xFFFFFFFF;
 
+/* Defined with the caches further down; destroy_surface (above them) has to
+ * drop every slot the dying surface owns. */
+static void zan_cache_drop_surface(int sid);
+
 static int clamp_i(int v, int lo, int hi) {
     if (v < lo) return lo;
     if (v > hi) return hi;
@@ -346,6 +350,11 @@ EXPORT i32 zan_gui_destroy_surface(i32 id) {
     free(g_surfaces[id]->pixels);
     free(g_surfaces[id]);
     g_surfaces[id] = NULL;
+    /* Slot ids are recycled by create_surface, so a snapshot taken before a
+     * resize would otherwise still match `sid` on the new surface and get
+     * blitted back with the old geometry -- old panels reappearing at old
+     * offsets, sheared where the width changed. */
+    zan_cache_drop_surface(id);
     /* Don't leave the resize re-blit pointing at a freed surface (it would read
      * a NULL slot at best, a recycled one at worst). */
     if (id == g_last_surface) g_last_surface = -1;
@@ -1196,6 +1205,19 @@ static zan_blur_cache_t *zan_snap_slot(int slot) {
     zan_snap_ensure(slot);
     if (slot >= g_snap_cache_count) return NULL;
     return &g_snap_cache[slot];
+}
+
+static void zan_cache_drop_surface(int sid) {
+    for (int i = 0; i < ZAN_BLUR_CACHE_SLOTS; i++) {
+        if (g_blur_cache[i].valid && g_blur_cache[i].sid == sid) {
+            g_blur_cache[i].valid = 0;
+        }
+    }
+    for (int i = 0; i < g_snap_cache_count; i++) {
+        if (g_snap_cache[i].valid && g_snap_cache[i].sid == sid) {
+            g_snap_cache[i].valid = 0;
+        }
+    }
 }
 
 EXPORT void zan_gui_snapshot_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 slot) {
