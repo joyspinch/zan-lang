@@ -393,6 +393,12 @@ static void x11_translate_event(XEvent *ev) {
     case ClientMessage:
         evq_push_linux(8, 0, 0, 0, 0, 0);
         break;
+    case FocusOut:
+        /* Kind 9 mirrors WM_KILLFOCUS: floating popups (context menus,
+         * dropdowns) dismiss themselves when the window loses focus, so a
+         * stale menu never lingers over an inactive window. */
+        evq_push_linux(9, 0, 0, 0, 0, 0);
+        break;
     }
 }
 
@@ -428,7 +434,7 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
     XSelectInput(g_display, xid,
         ExposureMask | KeyPressMask | KeyReleaseMask |
         ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
-        StructureNotifyMask);
+        StructureNotifyMask | FocusChangeMask);
 
     Atom wm_delete = XInternAtom(g_display, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(g_display, xid, &wm_delete, 1);
