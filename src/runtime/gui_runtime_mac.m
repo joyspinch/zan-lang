@@ -263,6 +263,18 @@ static int g_caption_btn_count = 5;
 static int zan_titlebar_h(void) { return (int)(32 * zan_gui_get_dpi_scale() / 100); }
 static int zan_caption_btn_w(void) { return (int)(46 * zan_gui_get_dpi_scale() / 100); }
 
+/* AppKit geometry is in points; Zan geometry is in physical pixels. */
+static CGFloat zan_window_scale(NSWindow *window) {
+    CGFloat scale = window ? [window backingScaleFactor]
+                           : [[NSScreen mainScreen] backingScaleFactor];
+    if (scale <= 0) scale = 1.0;
+    return scale;
+}
+
+static int zan_points_to_pixels(CGFloat points, CGFloat scale) {
+    return (int)floor((double)points * (double)scale + 0.5);
+}
+
 /* Window delegate: surfaces resize (kind 7) and close (kind 8) events, which
  * do not flow through -nextEventMatchingMask:, so the app can relayout and
  * quit exactly as it does on the Win32/X11 backends. */
@@ -275,10 +287,11 @@ static int zan_caption_btn_w(void) { return (int)(46 * zan_gui_get_dpi_scale() /
     zan_mwin_t *mw = mwin_find_win(win);
     if (mw && mw->view) {
         NSSize s = [mw->view bounds].size;
-        mw->w = (int)s.width;
-        mw->h = (int)s.height;
+        CGFloat scale = zan_window_scale(win);
+        mw->w = zan_points_to_pixels(s.width, scale);
+        mw->h = zan_points_to_pixels(s.height, scale);
         g_evt_win = (long)(intptr_t)win;
-        evq_push(7, (long)s.width, (long)s.height, 0, 0, 0);
+        evq_push(7, (long)mw->w, (long)mw->h, 0, 0, 0);
     }
 }
 - (BOOL)windowShouldClose:(NSWindow *)sender {
@@ -314,7 +327,10 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         if (!g_delegate) g_delegate = [[ZanDelegate alloc] init];
 
-        NSRect rect = NSMakeRect(0, 0, (CGFloat)width, (CGFloat)height);
+        /* The ABI takes physical pixels; AppKit's window frame takes points. */
+        CGFloat scale = zan_window_scale(nil);
+        NSRect rect = NSMakeRect(0, 0, (CGFloat)width / scale,
+                                  (CGFloat)height / scale);
         /* Borderless: the app paints its own title bar/caption buttons, matching
          * the Win32 (WS_POPUP) and X11 (override caption) backends. Keep the
          * resizable/miniaturizable capabilities so edge-resize still works. */
@@ -528,7 +544,9 @@ static void decode_event(NSEvent *ev) {
     g_evt_win = (long)(intptr_t)win;
     NSPoint p = [ev locationInWindow];
     NSPoint local = view ? [view convertPoint:p fromView:nil] : p;
-    long lx = (long)local.x, ly = (long)local.y;
+    CGFloat scale = zan_window_scale(win);
+    long lx = (long)zan_points_to_pixels(local.x, scale);
+    long ly = (long)zan_points_to_pixels(local.y, scale);
 
     switch (type) {
     case NSEventTypeApplicationDefined:
@@ -927,11 +945,15 @@ EXPORT i32 zan_gui_font_height(i32 font_size) {
 
 EXPORT i32 zan_gui_window_width(void) {
     if (g_mwin_count == 0 || !g_mwins[0].view) return 0;
-    return (i64)[g_mwins[0].view bounds].size.width;
+    NSWindow *window = g_mwins[0].window;
+    return (i64)zan_points_to_pixels([g_mwins[0].view bounds].size.width,
+                                      zan_window_scale(window));
 }
 EXPORT i32 zan_gui_window_height(void) {
     if (g_mwin_count == 0 || !g_mwins[0].view) return 0;
-    return (i64)[g_mwins[0].view bounds].size.height;
+    NSWindow *window = g_mwins[0].window;
+    return (i64)zan_points_to_pixels([g_mwins[0].view bounds].size.height,
+                                      zan_window_scale(window));
 }
 /* A stale handle (window already closed) reports 0, never another window's
  * size: falling back to g_mwins[0] made a closing dialog resize its canvas to
@@ -939,12 +961,14 @@ EXPORT i32 zan_gui_window_height(void) {
 EXPORT i32 zan_gui_client_width(iptr hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw || !mw->view) return hwnd_val == 0 ? zan_gui_window_width() : 0;
-    return (i64)[mw->view bounds].size.width;
+    return (i64)zan_points_to_pixels([mw->view bounds].size.width,
+                                     zan_window_scale(mw->window));
 }
 EXPORT i32 zan_gui_client_height(iptr hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw || !mw->view) return hwnd_val == 0 ? zan_gui_window_height() : 0;
-    return (i64)[mw->view bounds].size.height;
+    return (i64)zan_points_to_pixels([mw->view bounds].size.height,
+                                     zan_window_scale(mw->window));
 }
 
 /* Hit guards (zan_gui_clear_hit_guards / zan_gui_add_hit_guard) come from
@@ -1013,7 +1037,9 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
         if (layer) {
             [CATransaction begin];
             [CATransaction setDisableActions:YES];
-            layer.contentsScale = [[view window] backingScaleFactor];
+            /* The layer receives a physical-pixel bitmap; contentsScale maps
+             * those pixels to AppKit points without an additional stretch. */
+            layer.contentsScale = zan_window_scale([view window]);
             layer.contents = (__bridge id)surf;
             [CATransaction commit];
         }
@@ -1379,7 +1405,9 @@ EXPORT void zan_gui_webview_destroy(i32 h) {
 EXPORT void zan_gui_webview_set_frame(i32 h, i32 x, i32 y, i32 w, i32 hh) {
     WKWebView *wv = wv_get(h);
     if (!wv) return;
-    NSRect want = NSMakeRect((CGFloat)x, (CGFloat)y, (CGFloat)w, (CGFloat)hh);
+    CGFloat scale = zan_window_scale([wv window]);
+    NSRect want = NSMakeRect((CGFloat)x / scale, (CGFloat)y / scale,
+                             (CGFloat)w / scale, (CGFloat)hh / scale);
     if (NSEqualRects([wv frame], want)) return;
     [wv setFrame:want];
     /* The mask was built for the old frame; force the next set_clip to
@@ -1423,6 +1451,7 @@ EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
         NSRect frame = [wv frame];
         CGFloat fw = frame.size.width;
         CGFloat fh = frame.size.height;
+        CGFloat scale = zan_window_scale([wv window]);
         /* The web view lives in a flipped superview, so incoming rects are
          * top-left based while the view's own layer is bottom-left based. */
         CGMutablePathRef path = CGPathCreateMutable();
@@ -1440,14 +1469,16 @@ EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
             while (*p && *p != ';') p++;
             if (*p == ';') p++;
             if (rw <= 0 || rh <= 0) continue;
-            CGFloat lx = (CGFloat)rx - frame.origin.x;
-            CGFloat ly = (CGFloat)ry - frame.origin.y;
-            CGFloat layerY = fh - ly - (CGFloat)rh;
+            CGFloat lx = (CGFloat)rx / scale - frame.origin.x;
+            CGFloat ly = (CGFloat)ry / scale - frame.origin.y;
+            CGFloat rwPoints = (CGFloat)rw / scale;
+            CGFloat rhPoints = (CGFloat)rh / scale;
+            CGFloat layerY = fh - ly - rhPoints;
             CGPathAddRect(path, NULL,
-                          CGRectMake(lx, layerY, (CGFloat)rw, (CGFloat)rh));
+                          CGRectMake(lx, layerY, rwPoints, rhPoints));
             rects++;
             if (lx <= 0 && layerY <= 0
-                && lx + (CGFloat)rw >= fw && layerY + (CGFloat)rh >= fh) {
+                && lx + rwPoints >= fw && layerY + rhPoints >= fh) {
                 whole = 1;
             }
         }

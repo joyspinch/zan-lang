@@ -1729,9 +1729,12 @@ partial class ZanIDE {
         } else if (pack) {
             log.Add(ZanIDE.T(
                 "> Single file: resources are embedded in the executable"
-                    + " (read from the exe itself, nothing is unpacked).",
+                    + "; native drivers are statically linked into the exe"
+                    + "; only runtime-loaded drivers (CEF, WebView2) travel"
+                    + " beside it.",
                 "> 单文件：资源内嵌进可执行文件（直接从 exe 自身读取，"
-                    + "不解包到任何目录）。"));
+                    + "不解包到任何目录）；我们自己的原生驱动静态链接进 exe，"
+                    + "只有运行时按需加载的驱动（CEF、WebView2）仍随包。"));
         } else {
             log.Add(ZanIDE.T("> Single-file packing is off for this project.",
                              "> 本项目未启用单文件打包。"));
@@ -1797,7 +1800,8 @@ partial class ZanIDE {
                         // there is nothing to unpack and nowhere else to run.
                         string stage = ZanIDE.ResetStage(bd + "/pub_win_x64");
                         ZanIDE.CopyPayloadPacked(root, stage, outDir, log);
-                        steps.Add(ZanIDE.CompileToExe(root, p, inputs, ll, exe, !dbg, dbg)
+                        steps.Add(ZanIDE.CompileToExeSingleFile(root, p, inputs, ll,
+                            exe, !dbg, dbg)
                             + emb + ZanIDE.StageEmbedArgs(stage));
                     } else {
                         ZanIDE.CopyPayload(root, outDir, log);
@@ -2115,10 +2119,10 @@ partial class ZanIDE {
 
     /// Copies the project's selected theme skins into <outDir>/skins so a
     /// published GUI app can switch skins at runtime -- the skin loader finds a
-    /// skins\ folder next to the exe (Skin.FindDir's disk fallback). A no-op
-    /// when skin packaging is off, so the produced exe stays small.
+    /// skins\ folder next to the exe (Skin.FindDir's disk fallback). The base
+    /// stylesheet and dark/light baseline always ship; the project switch adds
+    /// the optional packs from skinlist.
     static void CopyThemeSkins(string root, string outDir, List<string> log) {
-        if (!ZanIDE.ProjSkinsEnabled(root)) { return; }
         string src = ZanIDE.StdlibDir() + "/Gui/skins";
         if (!Directory.Exists(src)) {
             log.Add("> WARNING: skins requested but stdlib skins folder not found.");
@@ -2127,20 +2131,44 @@ partial class ZanIDE {
         string dst = outDir + "/skins";
         Directory.CreateDirectoryRecursive(dst);
         // base.css is the shared reset every skin builds on -- ship it too.
+        int baseCopied = 0;
         if (File.Exists(src + "/base.css")) {
             File.Copy(src + "/base.css", dst + "/base.css");
+            baseCopied = 1;
         }
-        List<string> want = ZanIDE.ProjSkinList(root);
-        int copied = 0;
-        for (int i = 0; i < want.Count; i = i + 1) {
-            string sd = src + "/" + want[i];
+        List<string> baseline = new List<string>();
+        baseline.Add("dark");
+        baseline.Add("light");
+        List<string> bundled = new List<string>();
+        int baselineCopied = 0;
+        for (int i = 0; i < baseline.Count; i = i + 1) {
+            string sd = src + "/" + baseline[i];
             if (Directory.Exists(sd)) {
-                AssetManager.copyTree(sd, dst + "/" + want[i]);
-                copied = copied + 1;
+                AssetManager.copyTree(sd, dst + "/" + baseline[i]);
+                bundled.Add(baseline[i]);
+                baselineCopied = baselineCopied + 1;
             } else {
-                log.Add("> WARNING: skin not found, skipped: " + want[i]);
+                log.Add("> WARNING: skin not found, skipped: " + baseline[i]);
             }
         }
-        log.Add("> Bundled " + Convert.ToString(copied) + " skin pack(s) into " + dst);
+        int extraCopied = 0;
+        if (ZanIDE.ProjSkinsEnabled(root)) {
+            List<string> want = ZanIDE.ProjSkinList(root);
+            for (int i = 0; i < want.Count; i = i + 1) {
+                if (bundled.Contains(want[i])) { continue; }
+                string sd = src + "/" + want[i];
+                if (Directory.Exists(sd)) {
+                    AssetManager.copyTree(sd, dst + "/" + want[i]);
+                    bundled.Add(want[i]);
+                    extraCopied = extraCopied + 1;
+                } else {
+                    log.Add("> WARNING: skin not found, skipped: " + want[i]);
+                }
+            }
+        }
+        log.Add("> Bundled " + Convert.ToString(baseCopied)
+            + " base.css file(s), " + Convert.ToString(baselineCopied)
+            + " baseline skin pack(s) and " + Convert.ToString(extraCopied)
+            + " extra skin pack(s) into " + dst);
     }
 }

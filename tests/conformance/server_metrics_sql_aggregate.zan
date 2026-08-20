@@ -1,0 +1,172 @@
+// The monitor's SQL summaries must agree across time buckets, routes, and
+// window totals without loading raw minute rows into application memory.
+using System;
+using System.Data;
+using System.Data.Sqlite;
+
+class Program {
+    static int bad;
+
+    static void Check(bool ok, string label) {
+        if (!ok) {
+            Console.WriteLine("FAIL " + label);
+            Program.bad = Program.bad + 1;
+        }
+    }
+
+    static void AddRow(SqliteConnection db, long minute, string method,
+                       string path, long calls, long errors, long totalUs,
+                       long maxUs, long frames, long bytes) {
+        db.Execute("INSERT INTO metrics_minute "
+            + "(minute, method, path, calls, errors, total_us, max_us, "
+            + "frames, bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            new DbParams().AddLong(minute).Add(method).Add(path)
+                .AddLong(calls).AddLong(errors).AddLong(totalUs)
+                .AddLong(maxUs).AddLong(frames).AddLong(bytes));
+    }
+
+    static void Main() {
+        SqliteConnection db = SqliteConnection.Open(":memory:");
+        db.Execute("CREATE TABLE metrics_minute ("
+            + "minute INTEGER, method TEXT, path TEXT, calls INTEGER, "
+            + "errors INTEGER, total_us INTEGER, max_us INTEGER, "
+            + "frames INTEGER, bytes INTEGER)");
+
+        Program.AddRow(db, 100, "GET", "/a", 2, 1, 100, 70, 3, 30);
+        Program.AddRow(db, 101, "GET", "/a", 3, 0, 200, 120, 4, 40);
+        Program.AddRow(db, 119, "POST", "/b", 5, 2, 500, 300, 1, 10);
+        Program.AddRow(db, 120, "GET", "/a", 7, 1, 700, 600, 2, 20);
+        Program.AddRow(db, 121, "GET", "/c", 11, 0, 1100, 900, 5, 50);
+        Program.AddRow(db, 180, "POST", "/b", 13, 3, 1300, 1000, 6, 60);
+
+        DbResult buckets = db.Query(
+            "SELECT minute - (minute % 60), SUM(calls), SUM(errors), "
+            + "SUM(total_us), MAX(max_us), SUM(frames), SUM(bytes) "
+            + "FROM metrics_minute WHERE minute >= ? AND minute <= ? "
+            + "GROUP BY minute - (minute % 60) ORDER BY 1 DESC LIMIT 10",
+            new DbParams().AddLong(100).AddLong(180));
+        Check(buckets.RowCount() == 3, "bucket-count");
+        Check(buckets.GetLong(0, 0) == 180
+            && buckets.GetLong(0, 1) == 13
+            && buckets.GetLong(0, 2) == 3
+            && buckets.GetLong(0, 3) == 1300
+            && buckets.GetLong(0, 4) == 1000
+            && buckets.GetLong(0, 5) == 6
+            && buckets.GetLong(0, 6) == 60, "bucket-newest");
+        Check(buckets.GetLong(1, 0) == 120
+            && buckets.GetLong(1, 1) == 18
+            && buckets.GetLong(1, 2) == 1
+            && buckets.GetLong(1, 3) == 1800
+            && buckets.GetLong(1, 4) == 900
+            && buckets.GetLong(1, 5) == 7
+            && buckets.GetLong(1, 6) == 70, "bucket-middle");
+        Check(buckets.GetLong(2, 0) == 60
+            && buckets.GetLong(2, 1) == 10
+            && buckets.GetLong(2, 2) == 3
+            && buckets.GetLong(2, 3) == 800
+            && buckets.GetLong(2, 4) == 300
+            && buckets.GetLong(2, 5) == 8
+            && buckets.GetLong(2, 6) == 80, "bucket-oldest");
+
+        DbResult routes = db.Query(
+            "SELECT method, path, SUM(calls), SUM(errors), SUM(total_us), "
+            + "MAX(max_us), SUM(frames), SUM(bytes) FROM metrics_minute "
+            + "WHERE minute >= ? AND minute <= ? GROUP BY method, path "
+            + "ORDER BY 3 DESC, 5 DESC LIMIT 10",
+            new DbParams().AddLong(100).AddLong(180));
+        Check(routes.RowCount() == 3, "route-count");
+        Check(routes.GetString(0, 0) == "POST"
+            && routes.GetString(0, 1) == "/b"
+            && routes.GetLong(0, 2) == 18
+            && routes.GetLong(0, 3) == 5
+            && routes.GetLong(0, 4) == 1800
+            && routes.GetLong(0, 5) == 1000
+            && routes.GetLong(0, 6) == 7
+            && routes.GetLong(0, 7) == 70, "route-calls-order");
+        Check(routes.GetString(1, 0) == "GET"
+            && routes.GetString(1, 1) == "/a"
+            && routes.GetLong(1, 2) == 12
+            && routes.GetLong(1, 3) == 2
+            && routes.GetLong(1, 4) == 1000
+            && routes.GetLong(1, 5) == 600
+            && routes.GetLong(1, 6) == 9
+            && routes.GetLong(1, 7) == 90, "route-second");
+        Check(routes.GetString(2, 1) == "/c"
+            && routes.GetLong(2, 2) == 11, "route-third");
+
+        DbResult byTime = db.Query(
+            "SELECT method, path, SUM(calls), SUM(errors), SUM(total_us), "
+            + "MAX(max_us), SUM(frames), SUM(bytes) FROM metrics_minute "
+            + "WHERE minute >= ? AND minute <= ? GROUP BY method, path "
+            + "ORDER BY 5 DESC, 3 DESC LIMIT 10",
+            new DbParams().AddLong(100).AddLong(180));
+        Check(byTime.GetString(0, 1) == "/b"
+            && byTime.GetString(1, 1) == "/c"
+            && byTime.GetString(2, 1) == "/a", "route-time-order");
+
+        DbResult totals = db.Query(
+            "SELECT SUM(calls), SUM(errors), SUM(total_us), MAX(max_us), "
+            + "SUM(frames), SUM(bytes) FROM metrics_minute "
+            + "WHERE minute >= ? AND minute <= ?",
+            new DbParams().AddLong(100).AddLong(180));
+        Check(totals.RowCount() == 1
+            && totals.GetLong(0, 0) == 41
+            && totals.GetLong(0, 1) == 7
+            && totals.GetLong(0, 2) == 3900
+            && totals.GetLong(0, 3) == 1000
+            && totals.GetLong(0, 4) == 21
+            && totals.GetLong(0, 5) == 210, "window-values");
+
+        long bucketCalls = 0;
+        long bucketErrors = 0;
+        long bucketTotal = 0;
+        long bucketFrames = 0;
+        long bucketBytes = 0;
+        for (int i = 0; i < buckets.RowCount(); i = i + 1) {
+            bucketCalls = bucketCalls + buckets.GetLong(i, 1);
+            bucketErrors = bucketErrors + buckets.GetLong(i, 2);
+            bucketTotal = bucketTotal + buckets.GetLong(i, 3);
+            bucketFrames = bucketFrames + buckets.GetLong(i, 5);
+            bucketBytes = bucketBytes + buckets.GetLong(i, 6);
+        }
+        long routeCalls = 0;
+        long routeErrors = 0;
+        long routeTotal = 0;
+        long routeFrames = 0;
+        long routeBytes = 0;
+        for (int i = 0; i < routes.RowCount(); i = i + 1) {
+            routeCalls = routeCalls + routes.GetLong(i, 2);
+            routeErrors = routeErrors + routes.GetLong(i, 3);
+            routeTotal = routeTotal + routes.GetLong(i, 4);
+            routeFrames = routeFrames + routes.GetLong(i, 6);
+            routeBytes = routeBytes + routes.GetLong(i, 7);
+        }
+        Check(bucketCalls == totals.GetLong(0, 0)
+            && routeCalls == totals.GetLong(0, 0)
+            && bucketErrors == totals.GetLong(0, 1)
+            && routeErrors == totals.GetLong(0, 1)
+            && bucketTotal == totals.GetLong(0, 2)
+            && routeTotal == totals.GetLong(0, 2)
+            && bucketFrames == totals.GetLong(0, 4)
+            && routeFrames == totals.GetLong(0, 4)
+            && bucketBytes == totals.GetLong(0, 5)
+            && routeBytes == totals.GetLong(0, 5), "cross-summary-consistency");
+
+        DbResult empty = db.Query(
+            "SELECT SUM(calls), SUM(errors), SUM(total_us), MAX(max_us), "
+            + "SUM(frames), SUM(bytes) FROM metrics_minute "
+            + "WHERE minute >= ? AND minute <= ?",
+            new DbParams().AddLong(999).AddLong(1000));
+        Check(empty.RowCount() == 1
+            && empty.GetLong(0, 0) == 0
+            && empty.GetLong(0, 1) == 0
+            && empty.GetLong(0, 2) == 0
+            && empty.GetLong(0, 3) == 0
+            && empty.GetLong(0, 4) == 0
+            && empty.GetLong(0, 5) == 0, "empty-window");
+
+        Console.WriteLine("metrics-sql-ok: " + Convert.ToString(
+            Program.bad == 0 ? 1 : 0));
+        db.Close();
+    }
+}

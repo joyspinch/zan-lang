@@ -1182,6 +1182,50 @@ static bool zan_is_safe_bundle_name(const char *name) {
     return true;
 }
 
+/* A static-driver library manifest lists additional linker library basenames,
+ * one per line (with an optional "-l" prefix). Reuse the bundle filename
+ * safety rule so a driver-controlled file cannot inject a path or option into
+ * the link command. */
+static int zan_read_static_libs(const char *path, char out[][128], int max) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    int count = 0;
+    char line[128];
+    while (count < max && fgets(line, sizeof(line), f)) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r' ||
+                         line[n - 1] == ' ' || line[n - 1] == '\t'))
+            line[--n] = '\0';
+        char *comment = strchr(line, '#');
+        if (comment) {
+            *comment = '\0';
+            n = strlen(line);
+            while (n > 0 && (line[n - 1] == ' ' || line[n - 1] == '\t'))
+                line[--n] = '\0';
+        }
+        char *first = line;
+        while (*first == ' ' || *first == '\t') first++;
+        if (first != line) {
+            memmove(line, first, strlen(first) + 1);
+            n = strlen(line);
+        }
+        if (n == 0) continue;
+        char *name = line;
+        if (n >= 3 && line[0] == '-' && line[1] == 'l') {
+            name = line + 2;
+        }
+        if (!zan_is_safe_bundle_name(name)) {
+            fprintf(stderr, "warning: ignoring unsafe entry '%s' in %s "
+                            "(expected a bare library basename)\n", line, path);
+            continue;
+        }
+        snprintf(out[count], sizeof(out[0]), "-l%s", name);
+        count++;
+    }
+    fclose(f);
+    return count;
+}
+
 /* Per-target driver-bundle subdirectory under <module>/drivers/. Matches the
  * cross-compile toolchain naming so publishing for a target reads the drivers
  * built for that target. */
@@ -2671,6 +2715,9 @@ int main(int argc, char **argv) {
         int used_driver_len[16];
         const char *used_driver_module[16];
         bool used_driver_runtime[16] = { false };  /* dlopen'd, not linked */
+        bool used_driver_static[16] = { false };
+        char static_driver_libs[64][128];
+        int static_driver_lib_count = 0;
         for (int li = 0; li < irgen.extern_lib_count && used_driver_count < 16; li++) {
             int nlen;
             const char *nm = zan_dllimport_lname(
@@ -2720,15 +2767,38 @@ int main(int argc, char **argv) {
                 }
                 if (!driver_dirs[d][0]) continue;
                 /* Add the driver dir to the link search path (link-time -l
-                 * resolution) for every link branch below. Static linking reads
-                 * the archives from the "static" subdir so shared import libs
-                 * and static archives can coexist without ld ambiguity. */
+                 * resolution) for every link branch below. In static mode,
+                 * choose per driver: a driver with a static archive uses the
+                 * static subdir, while one without it falls back to its shared
+                 * directory and remains bundleable. The macOS cross-dylib path
+                 * is always shared, even when --link-mode static is requested. */
                 char linkdir[1100];
                 bool added_shared = false;
-                if (link_static_drivers)
+                bool want_static = link_static_drivers &&
+                    !used_driver_runtime[d] && cross_dylib_count == 0;
+                char archive[1200];
+                archive[0] = '\0';
+                if (want_static) {
+                    snprintf(archive, sizeof(archive), "%s/static/lib%.*s.a",
+                             driver_dirs[d], used_driver_len[d],
+                             used_drivers[d]);
+                }
+                if (want_static && zan_file_exists(archive)) {
+                    used_driver_static[d] = true;
                     snprintf(linkdir, sizeof(linkdir), "%s/static", driver_dirs[d]);
-                else
+                    char libs_manifest[1200];
+                    snprintf(libs_manifest, sizeof(libs_manifest),
+                             "%s/static/%.*s.libs", driver_dirs[d],
+                             used_driver_len[d], used_drivers[d]);
+                    if (static_driver_lib_count < 64) {
+                        static_driver_lib_count += zan_read_static_libs(
+                            libs_manifest,
+                            &static_driver_libs[static_driver_lib_count],
+                            64 - static_driver_lib_count);
+                    }
+                } else {
                     snprintf(linkdir, sizeof(linkdir), "%s", driver_dirs[d]);
+                }
                 if (zan_lib_ndirs < 16 && strlen(linkdir) < sizeof(zan_lib_dirs[0])) {
                     /* Prepend, not append: a bundled driver must take link-search
                      * precedence over the auto-added Homebrew/system fallback dirs.
@@ -2986,6 +3056,8 @@ int main(int argc, char **argv) {
                                  "-l%.*s", nlen, nm);
                         argv[a++] = libbufs[nb++];
                     }
+                    for (int li = 0; li < static_driver_lib_count && a < 150; li++)
+                        argv[a++] = static_driver_libs[li];
                     argv[a++] = "--end-group";
                     argv[a] = NULL;
                     if (getenv("ZAN_VERBOSE_LINK")) {
@@ -3029,6 +3101,11 @@ int main(int argc, char **argv) {
                         size_t cur = strlen(cmd);
                         snprintf(cmd + cur, sizeof(cmd) - cur, " -l%.*s",
                                  nlen, nm);
+                    }
+                    for (int li = 0; li < static_driver_lib_count; li++) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " %s",
+                                 static_driver_libs[li]);
                     }
                     if (getenv("ZAN_VERBOSE_LINK"))
                         fprintf(stderr, "[link] %s\n", cmd);
@@ -3152,6 +3229,11 @@ int main(int argc, char **argv) {
                         size_t cur = strlen(cmd);
                         snprintf(cmd + cur, sizeof(cmd) - cur, " -l%.*s",
                                  nlen, nm);
+                    }
+                    for (int li = 0; li < static_driver_lib_count; li++) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " %s",
+                                 static_driver_libs[li]);
                     }
                     if (getenv("ZAN_VERBOSE_LINK"))
                         fprintf(stderr, "[link] %s\n", cmd);
@@ -3385,6 +3467,11 @@ int main(int argc, char **argv) {
                 if (!nm) continue;
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " -l%.*s", nlen, nm);
+            }
+            for (int li = 0; li < static_driver_lib_count; li++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " %s",
+                         static_driver_libs[li]);
             }
             { size_t cur = strlen(cmd);
               snprintf(cmd + cur, sizeof(cmd) - cur,
@@ -3674,6 +3761,8 @@ int main(int argc, char **argv) {
                 snprintf(libbufs[nb], sizeof(libbufs[nb]), "-l%.*s", nlen, nm);
                 argv[a++] = libbufs[nb++];
             }
+            for (int li = 0; li < static_driver_lib_count && a < 150; li++)
+                argv[a++] = static_driver_libs[li];
             argv[a++] = "--end-group";
             argv[a++] = crtend;
             argv[a] = NULL;
@@ -3746,6 +3835,11 @@ int main(int argc, char **argv) {
                 if (!nm) continue;
                 size_t cur = strlen(link_cmd);
                 snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%.*s", nlen, nm);
+            }
+            for (int li = 0; li < static_driver_lib_count; li++) {
+                size_t cur = strlen(link_cmd);
+                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " %s",
+                         static_driver_libs[li]);
             }
             link_ret = system(link_cmd);
         }
@@ -3842,6 +3936,11 @@ int main(int argc, char **argv) {
             size_t cur = strlen(link_cmd);
             snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%.*s", name_len, name);
         }
+        for (int li = 0; li < static_driver_lib_count; li++) {
+            size_t cur = strlen(link_cmd);
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " %s",
+                     static_driver_libs[li]);
+        }
         /* caller-supplied link inputs (--libpath / --link-input / --link-lib);
          * --subsystem is Windows-only and ignored here. */
         for (int di = 0; di < extra_lib_path_count; di++) {
@@ -3883,28 +3982,17 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* ---- bundle native driver runtime libraries (shared) ------------
-         * Copy each used driver's runtime shared libraries next to the produced
+        /* ---- bundle native driver runtime libraries ---------------------
+         * Copy each used shared driver's runtime libraries next to the produced
          * executable for published programs and for all Windows builds, where
          * a linked DLL must be available beside the executable at launch. The
          * set of files per driver is taken
          * from an optional manifest "<driver_dir>/<driver>.bundle" (one file
          * name per line - lets a driver ship its own dependencies, e.g. libpq
          * with the OpenSSL DLLs); absent a manifest, common default file names
-         * are tried. Static linking folds the driver into the exe, so nothing
-         * is copied there. */
-        /* --link-mode static folds a driver into the exe only where a static
-         * archive was actually linked; the macOS cross path always resolves
-         * its drivers as @rpath dylibs, so those still have to travel next to
-         * the executable. */
-        bool drivers_are_shared = !link_static_drivers || cross_dylib_count > 0;
-        /* A dlopen'd driver is never folded into the exe, so --link-mode static
-         * does not exempt it from travelling next to the executable. */
-        int runtime_driver_count = 0;
-        for (int d = 0; d < used_driver_count; d++)
-            if (used_driver_runtime[d]) runtime_driver_count++;
+         * are tried. A driver with a linked static archive is not copied;
+         * drivers without one, and dlopen'd drivers, are still copied. */
         if ((publish_mode || target.os == ZAN_OS_WINDOWS) &&
-            (drivers_are_shared || runtime_driver_count > 0) &&
             used_driver_count > 0) {
             char outdir[1024];
             snprintf(outdir, sizeof(outdir), "%s", obj_path);
@@ -3916,7 +4004,7 @@ int main(int argc, char **argv) {
             for (int d = 0; d < used_driver_count; d++) {
                 const char *driver_dir = driver_dirs[d];
                 if (!driver_dir[0]) continue;
-                if (!drivers_are_shared && !used_driver_runtime[d]) continue;
+                if (used_driver_static[d] && !used_driver_runtime[d]) continue;
                 char drv[64];
                 snprintf(drv, sizeof(drv), "%.*s",
                          used_driver_len[d], used_drivers[d]);

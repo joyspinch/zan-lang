@@ -14,8 +14,9 @@ namespace ZanWeb;
 /// memory between flushes.
 ///
 /// It is also the table: the column names, the composite key `(minute, method,
-/// path)` and every statement over it are derived from this declaration by the
-/// ORM, so nothing below writes or concatenates SQL.</summary>
+/// path)` and the write statements are derived from this declaration by the
+/// ORM. The monitor's read-side summaries use explicit database aggregation so
+/// raw history rows never enter the process.</summary>
 [Table(Name = "metrics_minute")]
 class MetricMinute {
     [Column(IsPrimary = true)]
@@ -127,10 +128,6 @@ class MetricsStore {
     /// folded into one `OtherSql` row instead of being dropped: the day's query
     /// count has to stay a count of the queries that ran.
     static int MaxSqlShapes = 512;
-    /// Ceiling on the rows one monitor read pulls out of the minute table. The
-    /// summaries are folded in memory, so this is what keeps a wide window from
-    /// loading a whole archive: at a hundred interfaces it is days of history.
-    static int MaxScanRows = 200000;
     static string OtherSql = "(其他语句)";
     static DbPool pool = null;
     static bool ready = false;
@@ -451,83 +448,93 @@ class MetricsStore {
     /// given in seconds like every other query here and snapped to whole days,
     /// because that is the resolution the archive keeps.
     ///
-    /// The database hands back the day rows in the window and nothing else:
-    /// folding them per shape and ranking them happens here, in Zan. The
-    /// caller's ranking name picks a comparison, never a fragment of a
-    /// statement.</summary>
+    /// The database groups and ranks the day rows, so no raw archive rows are
+    /// loaded into the worker.</summary>
     static async List<MetricSql> SqlTotals(long from, long to, int limit,
                                            string rank) {
-        List<MetricSql> rows = new List<MetricSql>();
-        if (!MetricsStore.ready) { return rows; }
+        List<MetricSql> outp = new List<MetricSql>();
+        if (!MetricsStore.ready) { return outp; }
         IDbConnection db = await MetricsStore.Lease();
-        if (db == null) { return rows; }
+        if (db == null) { return outp; }
         long a0 = MetricsStore.Day(from);
         long b0 = MetricsStore.Day(to);
+        int order = 2;
+        if (rank == "time") {
+            order = 4;
+        } else if (rank == "slow") {
+            order = 3;
+        }
+        string sql = "SELECT sql, SUM(calls), SUM(slow), SUM(total_us), "
+            + "MAX(max_us) FROM metrics_sql_day "
+            + "WHERE day >= ? AND day <= ? "
+            + "GROUP BY sql ORDER BY " + Convert.ToString(order)
+            + " DESC LIMIT " + Convert.ToString(limit);
+        DbParams prms = new DbParams().AddLong(a0).AddLong(b0);
         try {
-            rows = await db.Select<MetricSql>()
-                .Where(a => a.day >= a0 && a.day <= b0)
-                .OrderByDescending(a => a.day)
-                .Limit(MetricsStore.MaxScanRows)
-                .ToListAsync();
+            DbResult r = await db.QueryAsync(sql, prms);
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                MetricSql e = new MetricSql();
+                e.day = a0;
+                e.sql = r.GetString(i, 0);
+                e.calls = r.GetLong(i, 1);
+                e.slow = r.GetLong(i, 2);
+                e.totalUs = r.GetLong(i, 3);
+                e.maxUs = r.GetLong(i, 4);
+                outp.Add(e);
+            }
         } finally {
             MetricsStore.Give(db);
         }
-        // Sorted by shape, the rows of one shape land next to each other, so
-        // one pass folds the window's days into one row per shape.
-        List<MetricSql> byShape = rows.OrderByStr(a => a.sql);
-        List<MetricSql> totals = new List<MetricSql>();
-        MetricSql cur = null;
-        for (int i = 0; i < byShape.Count; i = i + 1) {
-            MetricSql r = byShape[i];
-            if (cur == null || cur.sql != r.sql) {
-                cur = new MetricSql();
-                cur.day = a0;
-                cur.sql = r.sql;
-                totals.Add(cur);
-            }
-            cur.calls = cur.calls + r.calls;
-            cur.slow = cur.slow + r.slow;
-            cur.totalUs = cur.totalUs + r.totalUs;
-            if (r.maxUs > cur.maxUs) { cur.maxUs = r.maxUs; }
-        }
-        List<MetricSql> ranked = totals;
-        if (rank == "time") {
-            ranked = totals.OrderByNumDescending(a => (double)a.totalUs);
-        } else if (rank == "slow") {
-            ranked = totals.OrderByNumDescending(a => (double)a.slow);
-        } else {
-            ranked = totals.OrderByNumDescending(a => (double)a.calls);
-        }
-        return ranked.Take(limit);
+        return outp;
     }
 
     /// <summary>Aggregated history: one row per `stepSec` time bucket (a
     /// minute, an hour, a day or any other span), summed across interfaces --
     /// or over one of them when `method`/`path` filter -- newest first.
     ///
-    /// The read is the plain one: the window's minute rows, newest first. They
-    /// arrive ordered by minute, so a bucket's rows are contiguous and one pass
-    /// adds them up; `limit` buckets in, the walk stops.</summary>
+    /// The database groups, sums and limits the buckets, returning the newest
+    /// bucket first.</summary>
     static async List<MetricMinute> HistoryBuckets(long from, long to,
                                                    string method, string path,
                                                    long stepSec, int limit) {
         List<MetricMinute> outp = new List<MetricMinute>();
         if (stepSec < 1) { stepSec = 60; }
-        List<MetricMinute> rows = await MetricsStore.Scan(from, to, method,
-            path);
-        MetricMinute cur = null;
-        for (int i = 0; i < rows.Count; i = i + 1) {
-            MetricMinute r = rows[i];
-            long key = r.minute / stepSec * stepSec;
-            if (cur == null || cur.minute != key) {
-                if (outp.Count >= limit) { break; }
-                cur = new MetricMinute();
-                cur.minute = key;
-                cur.method = method;
-                cur.path = path;
-                outp.Add(cur);
+        string sql = "SELECT minute - (minute % " + Convert.ToString(stepSec)
+            + "), SUM(calls), SUM(errors), SUM(total_us), MAX(max_us), "
+            + "SUM(frames), SUM(bytes) FROM metrics_minute "
+            + "WHERE minute >= ? AND minute <= ?";
+        DbParams prms = new DbParams().AddLong(from).AddLong(to);
+        if (method.Length > 0) {
+            sql = sql + " AND method = ?";
+            prms.Add(method);
+        }
+        if (path.Length > 0) {
+            sql = sql + " AND path = ?";
+            prms.Add(path);
+        }
+        sql = sql + " GROUP BY minute - (minute % "
+            + Convert.ToString(stepSec) + ") ORDER BY 1 DESC LIMIT "
+            + Convert.ToString(limit);
+        if (!MetricsStore.ready) { return outp; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return outp; }
+        try {
+            DbResult r = await db.QueryAsync(sql, prms);
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                MetricMinute b = new MetricMinute();
+                b.minute = r.GetLong(i, 0);
+                b.method = method;
+                b.path = path;
+                b.calls = r.GetLong(i, 1);
+                b.errors = r.GetLong(i, 2);
+                b.totalUs = r.GetLong(i, 3);
+                b.maxUs = r.GetLong(i, 4);
+                b.frames = r.GetLong(i, 5);
+                b.bytes = r.GetLong(i, 6);
+                outp.Add(b);
             }
-            MetricsStore.Fold(cur, r);
+        } finally {
+            MetricsStore.Give(db);
         }
         return outp;
     }
@@ -548,106 +555,93 @@ class MetricsStore {
     /// called twice a day can still be the one the server spends its
     /// afternoon in.
     ///
-    /// Same plain read as everything else here; the interfaces are folded and
-    /// ranked in memory.</summary>
+    /// The database groups, ranks and limits the interfaces.</summary>
     static async List<MetricMinute> RouteTotalsBy(long from, long to,
                                                   string method, string path,
                                                   int limit, string rank) {
-        List<MetricMinute> rows = await MetricsStore.Scan(from, to, method,
-            path);
-        // One interface is (method, path): sorted by the pair, its minutes are
-        // contiguous and one pass folds them into one row.
-        List<MetricMinute> byRoute = rows.OrderByStr(
-            a => a.method + "\t" + a.path);
-        List<MetricMinute> totals = new List<MetricMinute>();
-        MetricMinute cur = null;
-        for (int i = 0; i < byRoute.Count; i = i + 1) {
-            MetricMinute r = byRoute[i];
-            if (cur == null || cur.method != r.method || cur.path != r.path) {
-                cur = new MetricMinute();
-                cur.minute = 0;
-                cur.method = r.method;
-                cur.path = r.path;
-                totals.Add(cur);
-            }
-            MetricsStore.Fold(cur, r);
-        }
-        List<MetricMinute> ranked = totals;
-        if (rank == "time") {
-            ranked = totals.OrderByNumDescending(a => (double)a.totalUs);
-        } else {
-            ranked = totals.OrderByNumDescending(a => (double)a.calls);
-        }
-        return ranked.Take(limit);
-    }
-
-    /// <summary>History for the screen: one row per minute per interface in the
-    /// window, newest first. `limit` is clamped by the caller's own ceiling.
-    ///
-    /// This is the one read every other figure on the screens is folded out of:
-    /// a filtered range of rows, ordered, capped. Nothing more is asked of the
-    /// database.</summary>
-    static async List<MetricMinute> History(long from, long to, string method,
-                                            string path, int limit) {
         List<MetricMinute> outp = new List<MetricMinute>();
+        int firstOrder = 3;
+        int secondOrder = 5;
+        if (rank == "time") {
+            firstOrder = 5;
+            secondOrder = 3;
+        }
+        string sql = "SELECT method, path, SUM(calls), SUM(errors), "
+            + "SUM(total_us), MAX(max_us), SUM(frames), SUM(bytes) "
+            + "FROM metrics_minute WHERE minute >= ? AND minute <= ?";
+        DbParams prms = new DbParams().AddLong(from).AddLong(to);
+        if (method.Length > 0) {
+            sql = sql + " AND method = ?";
+            prms.Add(method);
+        }
+        if (path.Length > 0) {
+            sql = sql + " AND path = ?";
+            prms.Add(path);
+        }
+        sql = sql + " GROUP BY method, path ORDER BY "
+            + Convert.ToString(firstOrder) + " DESC, "
+            + Convert.ToString(secondOrder) + " DESC LIMIT "
+            + Convert.ToString(limit);
         if (!MetricsStore.ready) { return outp; }
         IDbConnection db = await MetricsStore.Lease();
         if (db == null) { return outp; }
-        bool byMethod = method.Length > 0;
-        bool byPath = path.Length > 0;
         try {
-            outp = await db.Select<MetricMinute>()
-                .Where(a => a.minute >= from && a.minute <= to)
-                .WhereIf(byMethod, a => a.method == method)
-                .WhereIf(byPath, a => a.path == path)
-                .OrderByDescending(a => a.minute)
-                .OrderByDescending(a => a.calls)
-                .Limit(limit)
-                .ToListAsync();
+            DbResult r = await db.QueryAsync(sql, prms);
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                MetricMinute e = new MetricMinute();
+                e.minute = 0;
+                e.method = r.GetString(i, 0);
+                e.path = r.GetString(i, 1);
+                e.calls = r.GetLong(i, 2);
+                e.errors = r.GetLong(i, 3);
+                e.totalUs = r.GetLong(i, 4);
+                e.maxUs = r.GetLong(i, 5);
+                e.frames = r.GetLong(i, 6);
+                e.bytes = r.GetLong(i, 7);
+                outp.Add(e);
+            }
         } finally {
             MetricsStore.Give(db);
         }
         return outp;
     }
 
-    /// <summary>The window's minute rows, newest first, up to `MaxScanRows`.
-    /// Every summary below is folded out of this list, so the ceiling is what
-    /// bounds a monitor read: past it the OLDEST minutes of the window are the
-    /// ones missing, which is the truncation a newest-first screen can show
-    /// without lying about the recent past.</summary>
-    static async List<MetricMinute> Scan(long from, long to, string method,
-                                         string path) {
-        return await MetricsStore.History(from, to, method, path,
-            MetricsStore.MaxScanRows);
-    }
-
-    /// <summary>Adds one minute row into an accumulator: counters add, the
-    /// maximum takes the larger. The one place the arithmetic behind every
-    /// summary is written.</summary>
-    static void Fold(MetricMinute t, MetricMinute r) {
-        t.calls = t.calls + r.calls;
-        t.errors = t.errors + r.errors;
-        t.totalUs = t.totalUs + r.totalUs;
-        if (r.maxUs > t.maxUs) { t.maxUs = r.maxUs; }
-        t.frames = t.frames + r.frames;
-        t.bytes = t.bytes + r.bytes;
-    }
-
-    /// <summary>One row: everything the window holds, added up. This is what a
-    /// cumulative figure ("today so far") is read from -- the persisted minute
-    /// rows, which survive a worker restart and keep counting across the whole
-    /// day, unlike a process counter that starts again from zero. `calls` is 0
-    /// when the window is empty; the row is never null.</summary>
+    /// <summary>The database returns one aggregate row for the window. SQL NULL
+    /// aggregate cells are exposed as zero by DbResult.GetLong; empty windows
+    /// therefore retain the non-null zero row contract.</summary>
     static async MetricMinute WindowTotals(long from, long to, string method,
                                            string path) {
         MetricMinute b = new MetricMinute();
         b.minute = from;
         b.method = method;
         b.path = path;
-        List<MetricMinute> rows = await MetricsStore.Scan(from, to, method,
-            path);
-        for (int i = 0; i < rows.Count; i = i + 1) {
-            MetricsStore.Fold(b, rows[i]);
+        if (!MetricsStore.ready) { return b; }
+        string sql = "SELECT SUM(calls), SUM(errors), SUM(total_us), "
+            + "MAX(max_us), SUM(frames), SUM(bytes) FROM metrics_minute "
+            + "WHERE minute >= ? AND minute <= ?";
+        DbParams prms = new DbParams().AddLong(from).AddLong(to);
+        if (method.Length > 0) {
+            sql = sql + " AND method = ?";
+            prms.Add(method);
+        }
+        if (path.Length > 0) {
+            sql = sql + " AND path = ?";
+            prms.Add(path);
+        }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return b; }
+        try {
+            DbResult r = await db.QueryAsync(sql, prms);
+            if (r.RowCount() > 0) {
+                b.calls = r.GetLong(0, 0);
+                b.errors = r.GetLong(0, 1);
+                b.totalUs = r.GetLong(0, 2);
+                b.maxUs = r.GetLong(0, 3);
+                b.frames = r.GetLong(0, 4);
+                b.bytes = r.GetLong(0, 5);
+            }
+        } finally {
+            MetricsStore.Give(db);
         }
         return b;
     }

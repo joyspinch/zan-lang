@@ -872,8 +872,9 @@ endif()
 
 file(GLOB _conf_srcs ${CMAKE_SOURCE_DIR}/tests/conformance/*.zan)
 
-# Every test program is a pure function of (its source, zanc, the stdlib), so
-# the suite reuses the binary it built last time unless one of those changed.
+# Every test program is a pure function of its source, zanc, the stdlib and any
+# explicit Zan source arguments, so the suite reuses the binary it built last
+# time unless one of those changed.
 # This stamp carries the stdlib's mtime into that comparison; the test scripts
 # do the rest. Without it a plain re-run recompiled and relinked all ~165
 # programs three times over -- minutes of work with nothing to show for it.
@@ -942,6 +943,9 @@ foreach(_src ${_conf_srcs})
   elseif(_name MATCHES "^async_mt")
     # ZAN_CO_DRIVER tests: exercise the multi-worker coroutine driver.
     set(_extra_args "--async-workers")
+  elseif(_name STREQUAL "server_mvc_timezone")
+    set(_extra_args
+      "${CMAKE_SOURCE_DIR}/templates/server/server-mvc/src/Framework/Fmt.zan")
   elseif(_needs_gui_driver)
     set(_extra_args "${_gui_driver_args}")
   else()
@@ -1147,6 +1151,16 @@ add_test(NAME emit_lib_macos_dylib
     -DSTDLIB_STAMP=${_stdlib_stamp}
     -P ${CMAKE_SOURCE_DIR}/tests/run_emit_lib.cmake)
 set_tests_properties(emit_lib_macos_dylib PROPERTIES TIMEOUT 120)
+
+if(UNIX AND NOT APPLE)
+  add_test(NAME driver_packaging_sqlite
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/examples/db/sqlite_crud.zan
+      -DWORK=${CMAKE_BINARY_DIR}/driver_packaging_sqlite
+      -P ${CMAKE_SOURCE_DIR}/tests/run_driver_packaging.cmake)
+  set_tests_properties(driver_packaging_sqlite PROPERTIES TIMEOUT 120)
+endif()
 
 # ---- Self-hosting: build gen1 with the C host, emit IR for a real program,
 #      clang-compile + run + diff stdout, and verify malformed input fails

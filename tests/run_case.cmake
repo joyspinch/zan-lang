@@ -21,9 +21,9 @@ endif()
 
 # ---- up-to-date check ------------------------------------------------------
 # Re-running the suite must not recompile programs whose inputs did not change:
-# the artifact is a pure function of (source, compiler, stdlib), so a target
-# newer than all three is reused. STDLIB_STAMP is touched by the build whenever
-# any stdlib source changes.
+# the artifact is a pure function of the source, compiler, stdlib and any
+# explicit Zan source arguments, so a target newer than all of them is reused.
+# STDLIB_STAMP is touched by the build whenever any stdlib source changes.
 function(zan_artifact_is_current out_var artifact)
   set(${out_var} FALSE PARENT_SCOPE)
   if(NOT EXISTS ${artifact})
@@ -38,6 +38,12 @@ function(zan_artifact_is_current out_var artifact)
   if(STDLIB_STAMP AND EXISTS ${STDLIB_STAMP} AND ${STDLIB_STAMP} IS_NEWER_THAN ${artifact})
     return()
   endif()
+  foreach(_arg IN LISTS ZANC_ARGS)
+    if(_arg MATCHES "\\.(zan|zform)$" AND EXISTS "${_arg}"
+       AND "${_arg}" IS_NEWER_THAN "${artifact}")
+      return()
+    endif()
+  endforeach()
   set(${out_var} TRUE PARENT_SCOPE)
 endfunction()
 
