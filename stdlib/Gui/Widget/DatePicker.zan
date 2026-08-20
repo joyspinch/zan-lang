@@ -1,0 +1,258 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// 日期编辑控件：可键盘编辑的 YYYY-MM-DD 输入框，右侧带日历按钮。
+/// 月历在覆盖层中绘制，日期选择通过 OnChange 报告。
+class DatePicker : Control {
+    static DatePicker current;
+    Input editor;
+    Button trigger;
+    UiEvent Change;
+    bool open;
+    int viewYear;
+    int viewMonth;
+    DateTime selected;
+    int wid;
+
+    DatePicker() {
+        this.InitControl("datePicker", 1);
+        editor = new Input("YYYY-MM-DD");
+        editor.Class = "date";
+        trigger = new Button("");
+        trigger.Icon = "calendar";
+        trigger.Class = "text small";
+        trigger.Tip = "选择日期";
+        Change = new UiEvent();
+        open = false;
+        selected = DateTime.Now();
+        viewYear = selected.Year();
+        viewMonth = selected.Month();
+        wid = WidgetId.Next();
+        DatePicker.current = this;
+        wiresOwnEvents = true;
+        this.Add(editor);
+        this.Add(trigger);
+        trigger.Click += DatePicker.TriggerClicked;
+        this.SetDate(selected);
+    }
+
+    override string Kind() { return "DatePicker"; }
+    override string StyleType() { return "input"; }
+
+    DatePicker OnChange(Action a) {
+        Change.Add(a);
+        return this;
+    }
+
+    string Text() { return editor.GetText(); }
+    DateTime GetDate() { return selected; }
+
+    void SetDate(DateTime value) {
+        selected = value;
+        viewYear = value.Year();
+        viewMonth = value.Month();
+        editor.SetText(value.ToDateString());
+    }
+
+    void SetText(string value) {
+        editor.SetText(value);
+        this.Edited();
+    }
+
+    static int Digit(string s) {
+        if (s == "0") { return 0; }
+        if (s == "1") { return 1; }
+        if (s == "2") { return 2; }
+        if (s == "3") { return 3; }
+        if (s == "4") { return 4; }
+        if (s == "5") { return 5; }
+        if (s == "6") { return 6; }
+        if (s == "7") { return 7; }
+        if (s == "8") { return 8; }
+        if (s == "9") { return 9; }
+        return -1;
+    }
+
+    static int Number(string s, int at, int count) {
+        int outp = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            int d = DatePicker.Digit(s.Substring(at + i, 1));
+            if (d < 0) { return -1; }
+            outp = outp * 10 + d;
+        }
+        return outp;
+    }
+
+    static DateTime ParseDate(string value) {
+        if (value.Length != 10) { return null; }
+        if (value.Substring(4, 1) != "-" || value.Substring(7, 1) != "-") {
+            return null;
+        }
+        int y = DatePicker.Number(value, 0, 4);
+        int m = DatePicker.Number(value, 5, 2);
+        int d = DatePicker.Number(value, 8, 2);
+        if (y < 1 || m < 1 || m > 12 || d < 1 ||
+            d > DateTime.DaysInMonth(y, m)) { return null; }
+        return DateTime.FromDate(y, m, d);
+    }
+
+    void Edited() {
+        DateTime value = DatePicker.ParseDate(editor.GetText());
+        if (value == null) { return; }
+        if (!value.Equals(selected)) {
+            selected = value;
+            viewYear = value.Year();
+            viewMonth = value.Month();
+            Change.Raise();
+        }
+    }
+
+    static void TriggerClicked() {
+        if (DatePicker.current != null) {
+            DatePicker.current.ToggleOpen();
+        }
+    }
+
+    static void Use(DatePicker value) {
+        if (DatePicker.current != null && DatePicker.current != value &&
+            DatePicker.current.open) {
+            DatePicker.current.open = false;
+        }
+        DatePicker.current = value;
+    }
+
+    void ToggleOpen() {
+        open = !open;
+        if (open) {
+            DateTime value = DatePicker.ParseDate(editor.GetText());
+            if (value != null) {
+                selected = value;
+                viewYear = value.Year();
+                viewMonth = value.Month();
+            }
+        }
+    }
+
+    void MoveMonth(int delta) {
+        viewMonth = viewMonth + delta;
+        if (viewMonth < 1) { viewMonth = 12; viewYear = viewYear - 1; }
+        if (viewMonth > 12) { viewMonth = 1; viewYear = viewYear + 1; }
+    }
+
+    void PickDay(int day) {
+        selected = DateTime.FromDate(viewYear, viewMonth, day);
+        editor.SetText(selected.ToDateString());
+        open = false;
+        Change.Raise();
+    }
+
+    override void OnPaint(App app) {
+        // Input.Change does not carry an owning DatePicker through the
+        // non-capturing delegate ABI. Polling the editor keeps keyboard
+        // edits instance-local and also makes invalid text harmless.
+        this.Edited();
+        int buttonW = app.Scale(34);
+        bool overTrigger = app.mouseX >= bx + bw - buttonW &&
+            app.mouseX < bx + bw && app.mouseY >= by &&
+            app.mouseY < by + bh;
+        if (overTrigger) {
+            DatePicker.Use(this);
+        } else if (open) {
+            DatePicker.Use(this);
+        }
+    }
+
+    override void OnMeasure(App app) {
+        prefW = app.Scale(150);
+        prefH = app.theme.heightMedium;
+    }
+
+    override void Arrange(int px, int py, int pw, int ph) {
+        bx = px; by = py; bw = pw; bh = ph;
+        int buttonW = appScale(34);
+        if (buttonW > pw) { buttonW = pw; }
+        editor.Arrange(px, py, pw - buttonW, ph);
+        trigger.Arrange(px + pw - buttonW, py, buttonW, ph);
+    }
+
+    int appScale(int n) { return n; }
+
+    override void OnPaintOverlay(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int scale = app.Scale(1);
+        int buttonW = app.Scale(34);
+        bool clicked = app.ClickAvailable();
+        if (!open || DatePicker.current != this) { return; }
+        int popW = app.Scale(270);
+        int popH = app.Scale(244);
+        int popX = OverlayPopup.FitX(app, bx, popW);
+        int popY = OverlayPopup.FitY(app, by + bh + app.Scale(4), bh, popH);
+        StyleBox pop = this.ResolvePartAs(app, "select", "popup", "popup",
+                                          Class, Style.SSelected());
+        pop.Paint(app, popX, popY, popW, popH);
+        app.BlockHitsBelow();
+        app.BlockHitsRect(popX, popY, popW, popH);
+
+        int fs = pop.FontOr(Style.FontFallback(app, "medium"));
+        int pad = app.Scale(10);
+        int headerH = app.Scale(34);
+        c.DrawText(popX + pad, popY + app.Scale(22),
+                   Convert.ToString(viewYear) + "-" +
+                   DateTime.Pad2(viewMonth), pop.fg, fs);
+        c.DrawGlyphIn("chevron-left", popX + popW - app.Scale(56),
+                      popY, app.Scale(24), headerH, app.Scale(16), pop.fg);
+        c.DrawGlyphIn("chevron-right", popX + popW - app.Scale(28),
+                      popY, app.Scale(24), headerH, app.Scale(16), pop.fg);
+
+        string[] names = new string[]{"日","一","二","三","四","五","六"};
+        int cellW = (popW - pad * 2) / 7;
+        int cellH = app.Scale(28);
+        int top = popY + headerH + app.Scale(2);
+        for (int i = 0; i < 7; i = i + 1) {
+            c.DrawText(popX + pad + i * cellW + app.Scale(8), top + app.Scale(18),
+                       names[i], pop.fg, fs);
+        }
+        int start = DateTime.FromDate(viewYear, viewMonth, 1).DayOfWeek();
+        int days = DateTime.DaysInMonth(viewYear, viewMonth);
+        if (clicked) {
+            if (app.mouseX >= popX + popW - app.Scale(64) &&
+                app.mouseX < popX + popW - app.Scale(32) &&
+                app.mouseY >= popY && app.mouseY < popY + headerH) {
+                this.MoveMonth(-1); app.ClaimClick(); app.RequestRedraw(); return;
+            }
+            if (app.mouseX >= popX + popW - app.Scale(32) &&
+                app.mouseX < popX + popW &&
+                app.mouseY >= popY && app.mouseY < popY + headerH) {
+                this.MoveMonth(1); app.ClaimClick(); app.RequestRedraw(); return;
+            }
+        }
+        for (int day = 1; day <= days; day = day + 1) {
+            int index = start + day - 1;
+            int row = index / 7;
+            int col = index % 7;
+            int dx = popX + pad + col * cellW;
+            int dy = top + cellH + row * cellH;
+            if (day == selected.Day() && viewMonth == selected.Month() &&
+                viewYear == selected.Year()) {
+                c.FillRoundRect(dx + app.Scale(3), dy + app.Scale(2),
+                                cellW - app.Scale(6), cellH - app.Scale(4),
+                                app.Scale(4), pop.accent);
+            }
+            c.DrawText(dx + app.Scale(9), dy + app.Scale(19),
+                       Convert.ToString(day), pop.fg, fs);
+            if (clicked && app.mouseX >= dx && app.mouseX < dx + cellW &&
+                app.mouseY >= dy && app.mouseY < dy + cellH) {
+                this.PickDay(day); app.ClaimClick(); app.RequestRedraw(); return;
+            }
+        }
+        if (clicked && (app.mouseX < popX || app.mouseX >= popX + popW ||
+                        app.mouseY < popY || app.mouseY >= popY + popH)) {
+            open = false;
+            app.ClaimClick();
+            app.RequestRedraw();
+        }
+    }
+}
