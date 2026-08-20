@@ -9,6 +9,31 @@ namespace Gui.Component.DataTable;
 /// 与虚拟化的主渲染路径（表头 / 主体 / 页脚 /
 /// 交互）。
 partial class DataTable {
+    // ---------- 拖动手柄 ----------
+
+    /// 在 bx,by,bw,bh 内居中画一个 2×3 点阵的拖动手柄（列头 /
+    /// 行号的专用拖动按钮）。用点阵而不是字体图标，
+    /// 是因为图标集里没有 gripper 码点，而点阵在小尺寸下
+    /// 也不会糊成一团。
+    static void DrawGrip(App app, int bx, int by, int bw, int bh, int color) {
+        Canvas c = app.canvas;
+        int d = app.Scale(2);
+        int gap = app.Scale(2);
+        int gw = d * 2 + gap;
+        int gh = d * 3 + gap * 2;
+        int gx = bx + (bw - gw) / 2;
+        int gy = by + (bh - gh) / 2;
+        int row = 0;
+        while (row < 3) {
+            int col = 0;
+            while (col < 2) {
+                c.FillRect(gx + col * (d + gap), gy + row * (d + gap), d, d, color);
+                col = col + 1;
+            }
+            row = row + 1;
+        }
+    }
+
     // ---------- 单元格渲染 ----------
 
     /// `fgOverride` 是 state 的 CellStyler 给出的打包颜色，0 表示
@@ -381,6 +406,12 @@ partial class DataTable {
         int titleRowH = t.heightMedium;
         int rowH = t.heightMedium;
         int fs = t.fontSizeMedium;
+        // 紧凑密度：st.rowH 以逻辑像素给出数据行/表头行高，
+        // 0 表示沿用主题的 heightMedium。
+        if (st.rowH > 0) {
+            rowH = app.Scale(st.rowH);
+            titleRowH = rowH;
+        }
         // band 行位于列标题上方且略矮——
         // 只带组名，没有排序箭头或筛选图标。`headerH` 保持
         // 完整表头高度，后续所有测量（主体顶部、菜单
@@ -418,7 +449,7 @@ partial class DataTable {
 
         int gridColor = Style.Part(app, "datatable", "grid", "", "", "",
                                    Style.SNormal()).BgOr(0);
-        int menuIconW = app.Scale(22);
+        int menuIconW = app.Scale(14);
 
         // 内容不得溢出的右边界（为
         // 垂直滚动条留位）。右缘超出此限的列被
@@ -756,6 +787,7 @@ partial class DataTable {
             int menuId = -1;
             if (col.filterable || col.sortable) { menuId = app.focus.AllocId(); }
             int rzId = app.focus.AllocId();
+            int gripId = app.focus.AllocId();
             // 把命中区域同时裁剪到 band 和视口：滚到
             // 冻结 band 下方的中间列不能仍可点击，
             // 否则用户会点到自己看不见的列。
@@ -778,14 +810,42 @@ partial class DataTable {
                 dropVisLocal = hoi;
                 dropX = visX;
             }
-            bool hHover = app.focus.IsHovered(titleId);
+            int pad = t.paddingSmall;
+            // 悬停判定用几何而非悬停 id：按下那一帧
+            // App 会把 hoveredId 清成 -1，若依赖 id，手柄会在
+            // 正好按下它的那一帧消失。
+            bool hHover = app.mouseX >= visX && app.mouseX < visR
+                          && app.mouseY >= titleTop && app.mouseY < titleTop + titleRowH;
             if (hHover) { c.FillRect(visX, titleTop, visW, titleRowH, sHeaderHover.BgOr(0)); }
 
-            int pad = t.paddingSmall;
-            int availTitle = cw - pad * 2 - menuIconW;
+            // 列拖动的专用手柄：只在指针进入该表头单元格
+            // （或该列正被拖动）时出现在标题左侧，标题文本
+            // 同时右移，避免手柄压住列名；不悬停时表头
+            // 一个像素都不让给手柄。手柄区含左侧内边距，
+            // 与标题命中区严格不重叠。
+            int gripW = 0;
+            bool showGrip = hHover || st.dragCol == i;
+            if (showGrip) { gripW = pad + app.Scale(7); }
+
+            int availTitle = cw - pad * 2 - menuIconW - gripW;
             string ht = DataTable.Truncate(col.title, fs, availTitle);
             int ty = Canvas.CenterTextY(titleTop, titleRowH, fs);
-            c.DrawText(hx + pad, ty, ht, sHeader.FgOr(0), fs);
+            int titleTextX = hx + pad;
+            if (showGrip) { titleTextX = hx + gripW; }
+            c.DrawText(titleTextX, ty, ht, sHeader.FgOr(0), fs);
+            if (showGrip) {
+                bool gripHot = app.mouseX >= hx && app.mouseX < hx + gripW
+                               && app.mouseY >= titleTop && app.mouseY < titleTop + titleRowH;
+                int gCol = sIcon.FgOr(0);
+                if (gripHot || st.dragCol == i) { gCol = sIconSel.FgOr(0); }
+                DataTable.DrawGrip(app, hx, titleTop, gripW, titleRowH, gCol);
+                app.hitTester.RegisterRect(gripId, hx, titleTop, gripW, titleRowH, 0);
+                if (gripHot && app.EventKind() == 2 && app.window.EventButton() == 0) {
+                    st.dragCol = i;
+                    st.dragColStartX = app.mouseX;
+                    st.dragColMoved = false;
+                }
+            }
 
             // 排序指示——每键一个箭头，多列排序时
             // 再加从 1 开始的优先级徽标。
@@ -794,7 +854,7 @@ partial class DataTable {
                 string arrow = "arrow-up";
                 if (st.sortKeys[spos].dir == 2) { arrow = "arrow-down"; }
                 int aw = app.Scale(12);
-                int ax = hx + pad + Canvas.MeasureText(ht, fs) + app.Scale(4);
+                int ax = titleTextX + Canvas.MeasureText(ht, fs) + app.Scale(4);
                 c.DrawGlyph(arrow, ax, titleTop + (titleRowH - aw) / 2, aw, sIconSel.FgOr(0));
                 if (st.sortKeys.Count > 1) {
                     c.DrawText(ax + aw + app.Scale(1), ty,
@@ -807,7 +867,7 @@ partial class DataTable {
             // 其菜单打开时显示。`menuId` 总是分配，
             // 控件 id 不随图标显隐而变。
             if (menuId >= 0) {
-                int mIx = hx + cw - menuIconW - app.Scale(2);
+                int mIx = hx + cw - menuIconW - app.Scale(1);
                 bool active = st.filters[i].Active();
                 bool cellHover = app.mouseX >= visX && app.mouseX < visR
                                  && app.mouseY >= titleTop && app.mouseY < titleTop + titleRowH;
@@ -816,7 +876,7 @@ partial class DataTable {
                     int mColor = sIcon.FgOr(0);
                     if (active) { mColor = sIconSel.FgOr(0); }
                     if (app.focus.IsHovered(menuId)) { mColor = sIconHover.FgOr(0); }
-                    c.DrawGlyphIn("filter", mIx, titleTop, menuIconW, titleRowH, app.Scale(13), mColor);
+                    c.DrawGlyphIn("filter", mIx, titleTop, menuIconW, titleRowH, app.Scale(10), mColor);
                     app.hitTester.RegisterRect(menuId, mIx, titleTop, menuIconW, titleRowH, 0);
                     if (!st.dragColMoved && app.EventKind() == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == menuId) {
                         if (st.openMenu == i) { st.openMenu = -1; } else {
@@ -837,20 +897,16 @@ partial class DataTable {
                 }
             }
 
-            // 表头标题：按下可能开始拖拽重排；点击（未
-            // 拖动）循环切换排序。拖动中的列变暗。
-            int titleW = visW - menuIconW;
+            // 表头标题：点击循环切换排序（重排改由左侧
+            // 手柄发起，避免想排序时误拖列）。拖动中的列变暗。
+            int titleX = visX + gripW;
+            int titleW = visW - menuIconW - gripW;
             if (titleW < 0) { titleW = 0; }
-            app.hitTester.RegisterRect(titleId, visX, titleTop, titleW, titleRowH, 0);
-            if (app.EventKind() == 2 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == titleId) {
-                st.dragCol = i;
-                st.dragColStartX = app.mouseX;
-                st.dragColMoved = false;
-            }
-            if (st.dragCol == i && app.focus.pressedId == titleId) {
+            app.hitTester.RegisterRect(titleId, titleX, titleTop, titleW, titleRowH, 0);
+            if (st.dragCol == i && app.focus.pressedId >= 0) {
                 int dd = app.mouseX - st.dragColStartX;
                 if (dd < 0) { dd = 0 - dd; }
-                if (!st.dragColMoved && dd > app.Scale(5)) {
+                if (!st.dragColMoved && dd > app.Scale(2)) {
                     st.dragColMoved = true;
                 }
                 if (st.dragColMoved) { app.RequestRedraw(); }
@@ -982,7 +1038,7 @@ partial class DataTable {
         if (st.paged) { pagerH = app.Scale(38); }
 
         int filterRowH = 0;
-        if (st.showFilterRow) { filterRowH = t.heightMedium; }
+        if (st.showFilterRow) { filterRowH = rowH; }
         int statusBarH = 0;
         if (st.showStatusBar) { statusBarH = app.Scale(28); }
         int bodyTop = y + headerH + filterRowH;
@@ -1224,7 +1280,37 @@ partial class DataTable {
                 // 而非原始数据索引，这样行号
                 // 列保持有序，不会在用户
                 // 排序或过滤时乱跳。
-                c.DrawTextCentered(cx2, ry, numW, rowH, Convert.ToString(DataTable.DispNo(st, oiRow)), sHint.FgOr(0), t.fontSizeSmall);
+                // 行号列本身是多选区域，行的重排走右侧那个
+                // 专用手柄（仅本行悬停/正被拖动时出现），
+                // 这样在行号上拖动是框选行，而不是意外重排。
+                int rowGripW = app.Scale(10);
+                int rowGripX = cx2 + numW - rowGripW;
+                // 手动重排只在未分组时有意义（分组视图里
+                // 顺序由分组键决定）。
+                // 悬停用几何判断：按下那一帧 hoveredId 会被清空，
+                // 若依赖 id，手柄会在正好按下它时消失。
+                bool rowHot = app.mouseY >= ry && app.mouseY < ry + rowH
+                              && app.mouseX >= x && app.mouseX < x + viewW;
+                bool showRowGrip = (rowHot || st.dragRow == oiRow) && st.groupCols.Count == 0;
+                int numTextW = numW;
+                if (showRowGrip) { numTextW = numW - rowGripW; }
+                c.DrawTextCentered(cx2, ry, numTextW, rowH, Convert.ToString(DataTable.DispNo(st, oiRow)), sHint.FgOr(0), t.fontSizeSmall);
+                // id 每帧无条件分配，手柄显隐才不会让
+                // 之后注册的控件 id 整体错位。
+                int rgId = app.focus.AllocId();
+                if (showRowGrip) {
+                    app.hitTester.RegisterRect(rgId, rowGripX, ry, rowGripW, rowH, 0);
+                    bool rgHot = rowHot && app.mouseX >= rowGripX && app.mouseX < rowGripX + rowGripW;
+                    int rgCol = sIcon.FgOr(0);
+                    if (rgHot || st.dragRow == oiRow) { rgCol = sIconSel.FgOr(0); }
+                    DataTable.DrawGrip(app, rowGripX, ry, rowGripW, rowH, rgCol);
+                    if (rgHot && app.EventKind() == 2 && app.window.EventButton() == 0) {
+                        st.dragRow = oiRow;
+                        st.dragStartY = app.mouseY;
+                        st.dragMoved = false;
+                        st.rowGripDrag = true;
+                    }
+                }
                 // 主从详情展开箭头，嵌在行号栏左侧，
                 // 让行号在旁边仍清晰可读。只有 provider
                 // 接受的行才显示，无子行的行显示空白边距
@@ -1385,6 +1471,16 @@ partial class DataTable {
             if (dy < bodyTop) { dy = bodyTop; }
             if (dy > bodyTop + bodyH) { dy = bodyTop + bodyH; }
             c.FillRect(x + 1, dy - 1, viewW - 2, app.Scale(2), sAccent.BgOr(0));
+            // 跟随指针的行芯片：拖动过程中一直能看到"正在搬
+            // 哪一行"，而不是只有一根落点线。
+            string rl = "行 " + Convert.ToString(DataTable.DispNo(st, st.dragRow));
+            int rchW = Canvas.MeasureText(rl, t.fontSizeSmall) + app.Scale(16);
+            int rchX = app.mouseX + app.Scale(8);
+            if (rchX + rchW > x + viewW) { rchX = x + viewW - rchW; }
+            int rchY = app.mouseY - rowH / 2;
+            if (rchY < bodyTop) { rchY = bodyTop; }
+            c.FillRoundRect(rchX, rchY, rchW, rowH, t.borderRadiusSmall, sAccent.BgOr(0));
+            c.DrawTextCentered(rchX, rchY, rchW, rowH, rl, sAccent.FgOr(0), t.fontSizeSmall);
         }
 
         // ---------------- 内联单元格编辑器浮层 ----------------
@@ -1633,11 +1729,12 @@ partial class DataTable {
                 int gi = DataTable.DispRowOf(st, ptrOi);
                 DataTable.ToggleCollapse(st, st.groups[gi].key);
                 app.RequestRedraw();
-            } else if (app.mouseX >= x && app.mouseX < x + numW) {
-                // 行号按下：可能是行点击或重排拖拽
-                st.dragRow = ptrOi;
-                st.dragStartY = app.mouseY;
-                st.dragMoved = false;
+            } else if (app.mouseX >= x && app.mouseX < x + numW && !st.rowGripDrag) {
+                // 行号按下：选中该行并开始多选拖选（重排只能
+                // 从行号右侧的专用手柄发起，已在上面处理）。
+                DataTable.PickRow(st, ptrOi, emods);
+                st.rowSelDrag = true;
+                app.RequestRedraw();
             } else if (app.mouseX >= firstDataX && ptrCol >= 0) {
                 // 点击已是唯一选中状态的单元格
                 // （慢速二次点击）会打开内联编辑器；否则开始
@@ -1672,6 +1769,14 @@ partial class DataTable {
 
         // 拖拽移动
         if (ek == 1) {
+            // 行号列上拖动：从锚点到当前行连续选中（多选）
+            if (st.rowSelDrag && ptrOi >= 0 && DataTable.DispKind(st, ptrOi) == 0) {
+                DataTable.SelectRowSpan(st, st.selAnchor, ptrOi);
+                st.hitOrder = ptrOi;
+                st.hitRow = DataTable.DispRowOf(st, ptrOi);
+                st.SelectionChanged.Raise();
+                app.RequestRedraw();
+            }
             if (st.rangeDrag && ptrOi >= 0) {
                 st.rangeR1 = ptrOi;
                 if (ptrCol >= 0) { st.rangeC1 = ptrCol; }
@@ -1687,6 +1792,7 @@ partial class DataTable {
         // 左键释放
         if (ek == 3 && eb == 0) {
             if (st.rangeDrag) { st.rangeDrag = false; app.RequestRedraw(); }
+            if (st.rowSelDrag) { st.rowSelDrag = false; app.RequestRedraw(); }
             if (st.dragRow >= 0) {
                 if (st.groupCols.Count == 0 && st.dragMoved && ptrOi >= 0 && ptrOi != st.dragRow
                     && DataTable.DispKind(st, ptrOi) == 0) {
@@ -1697,34 +1803,13 @@ partial class DataTable {
                     DataTable.SyncPrimary(st);
                     app.RequestRedraw();
                 } else if (!st.dragMoved && DataTable.DispKind(st, st.dragRow) == 0) {
-                    // treat as a row-选择 click (按行选择)
-                    int ri = DataTable.DispRowOf(st, st.dragRow);
-                    st.hitOrder = st.dragRow;
-                    st.hitRow = ri;
-                    st.hitCol = -1;
-                    st.RowClick.Raise();
-                    st.SelectionChanged.Raise();
-                    bool shift = (emods & 2) != 0;
-                    bool ctrl = (emods & 1) != 0;
-                    if (shift && st.selAnchor >= 0) {
-                        DataTable.SelectAllRows(st, false);
-                        int a = DataTable.MinI(st.selAnchor, st.dragRow);
-                        int b = DataTable.MaxI(st.selAnchor, st.dragRow);
-                        int kk = a;
-                        while (kk <= b) { if (kk >= 0 && kk < DataTable.DispCount(st) && DataTable.DispKind(st, kk) == 0) { st.selected[DataTable.DispRowOf(st, kk)] = true; } kk = kk + 1; }
-                    } else if (ctrl) {
-                        st.selected[ri] = !st.selected[ri];
-                        st.selAnchor = st.dragRow;
-                    } else {
-                        DataTable.SelectAllRows(st, false);
-                        st.selected[ri] = true;
-                        st.selAnchor = st.dragRow;
-                        DataTable.ClearRange(st);
-                    }
+                    // 手柄上没拖动就松手：当作按行选择的点击
+                    DataTable.PickRow(st, st.dragRow, emods);
                     app.RequestRedraw();
                 }
                 st.dragRow = -1;
                 st.dragMoved = false;
+                st.rowGripDrag = false;
             }
         }
 

@@ -281,6 +281,14 @@ static void x11_serve_selection(XSelectionRequestEvent *req) {
     XFlush(g_display);
 }
 
+/* X11 buttons: 1=left 2=middle 3=right. The event ABI follows the Win32/SDL
+ * backends: 0=left 1=right 2=middle. */
+static int x11_abi_button(unsigned int b) {
+    if (b == 3) return 1;
+    if (b == 2) return 2;
+    return (int)b - 1;
+}
+
 /* Decode a raw XEvent into zero or more queued ABI events. */
 static void x11_translate_event(XEvent *ev) {
     g_evwin_linux = ev->xany.window;
@@ -314,14 +322,14 @@ static void x11_translate_event(XEvent *ev) {
             }
         } else {
             evq_push_linux(2, ev->xbutton.x, ev->xbutton.y,
-                           (int)ev->xbutton.button - 1, 0,
+                           x11_abi_button(ev->xbutton.button), 0,
                            x11_mods(ev->xbutton.state));
         }
         break;
     case ButtonRelease:
         if (ev->xbutton.button >= 4 && ev->xbutton.button <= 7) break;
         evq_push_linux(3, ev->xbutton.x, ev->xbutton.y,
-                       (int)ev->xbutton.button - 1, 0,
+                       x11_abi_button(ev->xbutton.button), 0,
                        x11_mods(ev->xbutton.state));
         break;
     case KeyPress: {

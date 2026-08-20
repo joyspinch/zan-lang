@@ -129,6 +129,25 @@ function(zan_cef_headers version tag out_var)
     set(${out_var} "${dest}" PARENT_SCOPE)
 endfunction()
 
+# Driver directory name of the host, spelled exactly as zan_driver_subdir() in
+# src/compiler/main.c: zanc looks the bundle up under that name.
+function(zan_cef_driver_subdir out)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        set(_arch "arm64")
+    else()
+        set(_arch "x64")
+    endif()
+    if(WIN32)
+        set(${out} "win-${_arch}" PARENT_SCOPE)
+    elseif(APPLE)
+        set(${out} "macos-${_arch}" PARENT_SCOPE)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
+        set(${out} "linux-riscv64" PARENT_SCOPE)
+    else()
+        set(${out} "linux-${_arch}" PARENT_SCOPE)
+    endif()
+endfunction()
+
 # One driver variant: same source, different header set / output name.
 function(zan_cef_add_variant target version tag)
     zan_cef_headers("${version}" "${tag}" headers)
@@ -153,5 +172,19 @@ function(zan_cef_add_variant target version tag)
     elseif(NOT APPLE)
         target_link_libraries(${target} PRIVATE dl)
     endif()
+    # zanc bundles a run-time loaded driver from the directory of the stdlib
+    # module owning it (stdlib/Gui/Component/CefBrowser/drivers/<target>, see
+    # its driver.manifest), so the built library is staged there. Without that
+    # copy nothing lands beside the produced executable and CefBackend reports
+    # "找不到原生 zan_cef driver" on a machine with no system-wide install.
+    zan_cef_driver_subdir(_sub)
+    set(_drv
+        "${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/CefBrowser/drivers/${_sub}")
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_drv}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:${target}>"
+                "${_drv}/$<TARGET_FILE_NAME:${target}>"
+        COMMENT "staging ${target} into ${_drv}")
     set(ZAN_CEF_AVAILABLE TRUE PARENT_SCOPE)
 endfunction()
