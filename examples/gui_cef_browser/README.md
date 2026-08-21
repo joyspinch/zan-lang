@@ -140,3 +140,38 @@ web.Reload();                // 注入脚本对「下一个」文档生效
 目前由 Chromium 自己开原生窗口）、右键菜单定制、打印/查找 UI。这些要动
 `stdlib/Gui/Component/CefBrowser/native/zan_cef.c`，且 CEF 151 与 109 两个变体的
 回调签名不同，见 `TASKS.md`。
+
+## 镜像与完全离线安装
+
+默认情况下不再依赖约 10 MB 的官方全量 `index.json`：程序会先从内置的
+CEF stable + minimal 版本表选择归档。CEF 版本和原生 `zan_cef` driver 是绑定的，
+不能只替换其中一个；升级时必须同时更新内置版本表、`CurrentBranch()` /
+`LegacyBranch()` 前缀和 driver。
+
+如果需要把下载切到镜像，可设置 `ZAN_CEF_MIRROR`。镜像上按官方原文件名放置归档，
+并在同一个基址下提供 `/index.json`，这样新平台或未登记分支仍可走索引兜底：
+
+```bash
+export ZAN_CEF_MIRROR=https://mirror.example.com/cef
+# 或本机镜像：
+export ZAN_CEF_MIRROR=http://127.0.0.1:8099/cef
+build/cefbrowser
+```
+
+归档 URL 会使用 `cef_binary_<版本>_<平台>_minimal.tar.bz2` 的官方文件名，
+文件名中的 `+` 会按 URL 规则转成 `%2B`。镜像可以使用 `http` 明文，也可以使用
+`https`；基址末尾是否带 `/` 都可以。
+
+没有 VPN 或目标机器完全不能联网时，可以在另一台机器手工下载归档后拷贝过来，
+设置 `ZAN_CEF_ARCHIVE` 指向本机归档的绝对路径。此模式不查索引、不联网，也不会
+给下载任务添加条目：
+
+```bash
+export ZAN_CEF_ARCHIVE=/Users/me/Downloads/cef_binary_151.3.23+gd211df0+chromium-151.0.7922.170_macosarm64_minimal.tar.bz2
+build/cefbrowser
+```
+
+本机归档的文件名必须包含当前平台，版本前缀必须与原生 driver 绑定的 CEF 分支
+一致。内置表中有该完整版本时还会校验 SHA-1；归档必须平台、版本前缀和 SHA-1
+都正确，否则会拒绝安装。内置表没有的同分支补丁版本可以使用，但会跳过 SHA-1
+校验；版本前缀检查仍然会执行。

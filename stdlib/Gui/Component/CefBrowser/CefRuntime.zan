@@ -10,6 +10,21 @@ using System.Net.Http.Download;
 
 namespace Gui.Component.CefBrowser;
 
+/// <summary>镜像基址解析结果。</summary>
+class CefHttpEndpoint {
+    string host;
+    int port;
+    bool tls;
+    string prefix;
+
+    CefHttpEndpoint() {
+        this.host = "";
+        this.port = 0;
+        this.tls = false;
+        this.prefix = "";
+    }
+}
+
 /// <summary>CEF 官方构建索引里的一个归档条目。</summary>
 class CefArchive {
     /// <summary>完整 CEF 版本，如
@@ -35,19 +50,20 @@ class CefArchive {
         this.size = 0;
     }
 
-    /// <summary>该归档在官方 CDN 上的请求路径（"+" 已按 URL 规则转义）。</summary>
+    /// <summary>该归档的请求路径（"+" 已按 URL 规则转义）。</summary>
     string Path() {
         return "/" + CefRuntime.UrlEncode(this.fileName);
     }
 }
 
 /// <summary>本地 CEF 运行时的自举：探测平台与应当使用的 CEF 主版本、
-/// 从官方 CDN 拉取构建索引、下载（可断点续传）并按官方 SHA-1 校验归档、
+/// 优先按内置钉版本表选择归档，必要时从官方或镜像索引兜底、
+/// 下载（可断点续传）并按官方 SHA-1 校验归档、
 /// 解压到本地缓存并打上就绪标记，最后给出稳定的运行时目录，供原生
 /// zan_cef driver 加载 libcef。
 ///
 /// 版本策略：Windows 7/8/8.1 只能用 CEF 109（最后一个支持它们的分支），
-/// 其他系统用当前最新的 stable。运行时二进制不入库，只落在用户缓存目录。
+/// 其他系统用当前绑定的 stable。运行时二进制不入库，只落在用户缓存目录。
 ///
 /// 用法：
 /// <code>
@@ -146,6 +162,76 @@ class CefRuntime {
         return CefRuntime.CurrentBranch();
     }
 
+    // ---------------------------------------------------------------- 钉版本
+
+    /// <summary>内置 stable + minimal 归档表。它跟 CurrentBranch() /
+    /// LegacyBranch() 以及原生 driver 的 CEF 版本绑定在一起，升级 CEF
+    /// 必须同时修改这张表、分支前缀和 driver。数据来自官方 index.json
+    /// 的 stable + minimal 条目。</summary>
+    static CefArchive Pinned(string version, string chromium, string platform,
+            string sha1, long size) {
+        CefArchive a = new CefArchive();
+        a.cefVersion = version;
+        a.chromiumVersion = chromium;
+        a.platform = platform;
+        a.fileName = "cef_binary_" + version + "_" + platform + "_"
+            + CefRuntime.ArchiveType() + ".tar.bz2";
+        a.sha1 = sha1;
+        a.size = size;
+        return a;
+    }
+
+    /// <summary>按平台和版本前缀查找内置归档，未命中返回 null。</summary>
+    static CefArchive FindPinned(string platform, string versionPrefix) {
+        CefArchive[] all = new CefArchive[8];
+        all[0] = CefRuntime.Pinned(
+            "151.3.23+gd211df0+chromium-151.0.7922.170",
+            "151.0.7922.170", "windows64",
+            "d8ec9eb5021852e33cd9dfeb3915971a6709e783", 170771122);
+        all[1] = CefRuntime.Pinned(
+            "151.3.23+gd211df0+chromium-151.0.7922.170",
+            "151.0.7922.170", "windowsarm64",
+            "e96d8e64472adfe0a2efeb67c3b92a5661271631", 165945014);
+        all[2] = CefRuntime.Pinned(
+            "151.3.23+gd211df0+chromium-151.0.7922.170",
+            "151.0.7922.170", "linux64",
+            "8c221485ef83ff4263a4170a215c05b48214391c", 321810032);
+        all[3] = CefRuntime.Pinned(
+            "151.3.23+gd211df0+chromium-151.0.7922.170",
+            "151.0.7922.170", "linuxarm64",
+            "50d5f193e41955b5a2dd59b6dcddbd159b95991b", 412699442);
+        all[4] = CefRuntime.Pinned(
+            "151.3.23+gd211df0+chromium-151.0.7922.170",
+            "151.0.7922.170", "macosarm64",
+            "94b409659401b34bf8616f9592ba5daeb9ee82d4", 130993494);
+        all[5] = CefRuntime.Pinned(
+            "151.3.23+gd211df0+chromium-151.0.7922.170",
+            "151.0.7922.170", "macosx64",
+            "e493896c0633b7630696d5d72bc17ef948be94b6", 136761682);
+        all[6] = CefRuntime.Pinned(
+            "109.1.18+gf1c41e4+chromium-109.0.5414.120",
+            "109.0.5414.120", "windows64",
+            "338ea5ebea4045405c1fe144d6ac82629120b8aa", 168318857);
+        all[7] = CefRuntime.Pinned(
+            "109.1.18+gf1c41e4+chromium-109.0.5414.120",
+            "109.0.5414.120", "windowsarm64",
+            "083f2e7821620c36b82336f4724b7852151d3ad6", 153534158);
+        for (int i = 0; i < all.Length; i = i + 1) {
+            if (all[i].platform != platform) { continue; }
+            if (versionPrefix == "" || all[i].cefVersion.StartsWith(versionPrefix)) {
+                return all[i];
+            }
+        }
+        return null;
+    }
+
+    /// <summary>按平台和完整版本查找内置归档，未命中返回 null。</summary>
+    static CefArchive FindPinnedExact(string platform, string version) {
+        CefArchive a = CefRuntime.FindPinned(platform, version);
+        if (a == null || a.cefVersion != version) { return null; }
+        return a;
+    }
+
     // ---------------------------------------------------------------- 缓存
 
     /// <summary>本地缓存根目录（可用 <see cref="CefOptions.cacheRoot"/> /
@@ -229,6 +315,89 @@ class CefRuntime {
         return Directory.DeleteRecursive(CefRuntime.CacheRoot());
     }
 
+    // ---------------------------------------------------------------- 地址
+
+    /// <summary>当前 CEF 服务基址。镜像配置会去掉末尾斜杠。</summary>
+    static string BaseUrl() {
+        string custom = CefOptions.MirrorBase();
+        if (custom == "") { return "https://" + CefRuntime.IndexHost(); }
+        return CefRuntime.Slashes(custom);
+    }
+
+    /// <summary>把镜像路径前缀与请求路径拼成单个 HTTP 路径。</summary>
+    static string BasePath(string path) {
+        CefHttpEndpoint endpoint = CefRuntime.Endpoint();
+        if (endpoint == null) { return path; }
+        string prefix = endpoint.prefix;
+        if (prefix == "") { return path; }
+        if (path == "") { return prefix; }
+        if (prefix.EndsWith("/") && path.StartsWith("/")) {
+            return prefix.Substring(0, prefix.Length - 1) + path;
+        }
+        if (!prefix.EndsWith("/") && !path.StartsWith("/")) {
+            return prefix + "/" + path;
+        }
+        return prefix + path;
+    }
+
+    /// <summary>解析镜像的 scheme、主机、端口与路径前缀。</summary>
+    static CefHttpEndpoint Endpoint() {
+        string baseUrl = CefRuntime.BaseUrl();
+        int schemeAt = baseUrl.IndexOf("://");
+        if (schemeAt <= 0) {
+            CefRuntime.Fail("CEF 镜像地址必须是 http:// 或 https://：" + baseUrl);
+            return null;
+        }
+        string scheme = baseUrl.Substring(0, schemeAt);
+        bool tls = false;
+        int port = 0;
+        if (scheme == "https") {
+            tls = true;
+            port = 443;
+        } else if (scheme == "http") {
+            port = 80;
+        } else {
+            CefRuntime.Fail("CEF 镜像地址只支持 http:// 或 https://：" + baseUrl);
+            return null;
+        }
+        string rest = baseUrl.Substring(schemeAt + 3,
+            baseUrl.Length - schemeAt - 3);
+        int slash = rest.IndexOf("/");
+        string authority = rest;
+        string prefix = "";
+        if (slash >= 0) {
+            authority = rest.Substring(0, slash);
+            prefix = rest.Substring(slash, rest.Length - slash);
+        }
+        if (authority == "") {
+            CefRuntime.Fail("CEF 镜像地址缺少主机名：" + baseUrl);
+            return null;
+        }
+        int colon = authority.LastIndexOf(":");
+        string host = authority;
+        if (colon > 0) {
+            host = authority.Substring(0, colon);
+            int parsed = CefRuntime.ParseInt(
+                authority.Substring(colon + 1, authority.Length - colon - 1));
+            if (parsed <= 0 || parsed > 65535) {
+                CefRuntime.Fail("CEF 镜像地址端口无效：" + baseUrl);
+                return null;
+            }
+            port = parsed;
+        }
+        CefHttpEndpoint e = new CefHttpEndpoint();
+        e.host = host;
+        e.port = port;
+        e.tls = tls;
+        e.prefix = prefix;
+        return e;
+    }
+
+    /// <summary>归档完整 URL（文件名中的 "+" 继续按 URL 规则转义）。</summary>
+    static string ArchiveUrl(CefArchive a) {
+        return CefRuntime.BaseUrl() + a.Path();
+    }
+
     // ---------------------------------------------------------------- 索引
 
     /// <summary>把官方构建索引下载到 <paramref name="destPath"/>，
@@ -236,7 +405,11 @@ class CefRuntime {
     /// 过期的半截文件上）。</summary>
     static async bool FetchIndexAsync(string destPath) {
         Directory.CreateDirectoryRecursive(CefRuntime.ParentDir(destPath));
-        HttpClient client = HttpClient.CreateHttps(CefRuntime.IndexHost(), 443);
+        CefHttpEndpoint endpoint = CefRuntime.Endpoint();
+        if (endpoint == null) { return false; }
+        HttpClient client = endpoint.tls
+            ? HttpClient.CreateHttps(endpoint.host, endpoint.port)
+            : new HttpClient(endpoint.host, endpoint.port);
         client.SetTimeout(60000);
         long n = 0;
         // 索引是 10 MB 量级的单次传输，一次连接抖动就够让整个自举失败，
@@ -244,7 +417,8 @@ class CefRuntime {
         // 错误里（-1=连接/握手/响应不完整）。
         for (int attempt = 0; attempt < 2; attempt = attempt + 1) {
             if (File.Exists(destPath)) { File.Delete(destPath); }
-            n = await client.DownloadBinaryToFileAsync(CefRuntime.IndexPath(),
+            n = await client.DownloadBinaryToFileAsync(
+                CefRuntime.BasePath(CefRuntime.IndexPath()),
                 destPath, destPath + ".progress");
             if (n > 0) {
                 File.Delete(destPath + ".progress");
@@ -252,8 +426,8 @@ class CefRuntime {
             }
         }
         CefRuntime.Fail("下载 CEF 构建索引失败（传输返回 "
-            + Convert.ToString(n) + "，检查网络与代理）：https://"
-            + CefRuntime.IndexHost() + CefRuntime.IndexPath());
+            + Convert.ToString(n) + "，检查网络与代理）："
+            + CefRuntime.BaseUrl() + CefRuntime.IndexPath());
         return false;
     }
 
@@ -339,22 +513,81 @@ class CefRuntime {
         return "（要求前缀 " + versionPrefix + "）";
     }
 
-    /// <summary>联网确定当前系统该用哪个 CEF 归档。</summary>
+    /// <summary>读取本机归档并校验其平台、版本和已知摘要。</summary>
+    static CefArchive ReadLocalArchive(string path) {
+        if (!File.Exists(path)) {
+            CefRuntime.Fail("CEF 本机归档不存在：" + path);
+            return null;
+        }
+        string name = Path.GetFileName(path);
+        string head = "cef_binary_";
+        string marker = "_" + CefRuntime.Platform() + "_";
+        int start = head.Length;
+        int at = name.IndexOf(marker);
+        if (!name.StartsWith(head) || at <= start || !name.EndsWith(".tar.bz2")) {
+            CefRuntime.Fail("CEF 本机归档命名必须是 cef_binary_<版本>_"
+                + CefRuntime.Platform() + "_...tar.bz2，当前文件名：" + name);
+            return null;
+        }
+        string version = name.Substring(start, at - start);
+        string prefix = CefRuntime.VersionPrefix();
+        if (prefix != "" && !version.StartsWith(prefix)) {
+            CefRuntime.Fail("原生 driver 绑定 CEF " + prefix + "，这个归档是 "
+                + version + "，ABI 不兼容");
+            return null;
+        }
+        CefArchive pinned = CefRuntime.FindPinnedExact(
+            CefRuntime.Platform(), version);
+        if (pinned != null && !Sha1.VerifyFile(path, pinned.sha1)) {
+            CefRuntime.Fail("CEF 本机归档 SHA-1 校验失败，文件可能损坏或版本不对："
+                + path);
+            return null;
+        }
+        CefArchive a = new CefArchive();
+        a.cefVersion = version;
+        a.chromiumVersion = "";
+        a.platform = CefRuntime.Platform();
+        a.fileName = name;
+        if (pinned != null) {
+            a.chromiumVersion = pinned.chromiumVersion;
+            a.sha1 = pinned.sha1;
+            a.size = pinned.size;
+        }
+        return a;
+    }
+
+    /// <summary>联网确定当前系统该用哪个 CEF 归档。优先使用内置表，
+    /// 只有新平台或未登记分支才下载索引兜底。</summary>
     static async CefArchive ResolveAsync() {
         string plat = CefRuntime.Platform();
         if (plat == "") {
             CefRuntime.Fail("当前平台没有官方 CEF 构建");
             return null;
         }
+        string prefix = CefRuntime.VersionPrefix();
+        CefArchive pinned = CefRuntime.FindPinned(plat, prefix);
+        if (pinned != null) { return pinned; }
         string indexPath = CefRuntime.CacheRoot() + "/index.json";
         bool ok = await CefRuntime.FetchIndexAsync(indexPath);
-        if (!ok) { return null; }
-        string text = File.ReadAllText(indexPath);
-        if (text.Length == 0) {
-            CefRuntime.Fail("CEF 构建索引为空");
+        if (!ok) {
+            string detail = CefRuntime.Error();
+            CefRuntime.Fail("内置表里没有 " + plat + "/" + prefix
+                + "，且索引兜底也失败：" + detail);
             return null;
         }
-        return CefRuntime.SelectArchive(text, plat, CefRuntime.VersionPrefix());
+        string text = File.ReadAllText(indexPath);
+        if (text.Length == 0) {
+            CefRuntime.Fail("内置表里没有 " + plat + "/" + prefix
+                + "，且索引兜底也失败：CEF 构建索引为空");
+            return null;
+        }
+        CefArchive selected = CefRuntime.SelectArchive(text, plat, prefix);
+        if (selected == null) {
+            string detail2 = CefRuntime.Error();
+            CefRuntime.Fail("内置表里没有 " + plat + "/" + prefix
+                + "，且索引兜底也失败：" + detail2);
+        }
+        return selected;
     }
 
     // ---------------------------------------------------------------- 安装
@@ -366,6 +599,17 @@ class CefRuntime {
         string have = CefRuntime.Installed();
         if (have != "") { return have; }
 
+        string localPath = CefOptions.ArchivePath();
+        if (localPath != "") {
+            CefArchive local = CefRuntime.ReadLocalArchive(localPath);
+            if (local == null) { return ""; }
+            string localDir = CefRuntime.RuntimeDir(local.cefVersion);
+            if (CefRuntime.IsReady(localDir)) { return localDir; }
+            if (!CefRuntime.Install(localPath, localDir, local.cefVersion)) {
+                return "";
+            }
+            return localDir;
+        }
         CefArchive a = await CefRuntime.ResolveAsync();
         if (a == null) { return ""; }
         string dir = CefRuntime.RuntimeDir(a.cefVersion);
@@ -395,7 +639,7 @@ class CefRuntime {
     /// // 任务成功后：CefRuntime.EnsuredDir() 就是运行时目录
     /// </code>
     ///
-    /// 「下哪个归档」仍然由本类决定（联网拉索引、按系统选版本），
+    /// 「下哪个归档」仍然由本类决定（优先查内置表、必要时联网拉索引），
     /// 解压/剥顶层目录/打就绪标记也仍然走本类的 <c>Install</c>——任务层只管
     /// 传输、校验与进度。已经装好时任务不下载任何东西，直接以“已完成”收工。
     /// </summary>
@@ -405,13 +649,23 @@ class CefRuntime {
         return job;
     }
 
-    /// <summary>任务的准备回调（跑在工作线程上）：联网定归档并加条目。
-    /// </summary>
+    /// <summary>任务的准备回调（跑在工作线程上）：确定归档并加条目；
+    /// 本机归档模式直接安装，不产生下载条目。</summary>
     static bool PrepareJob(DownloadJob job) {
         CefRuntime.lastError = "";
         CefRuntime.pendingDir = "";
         CefRuntime.pendingVersion = "";
         if (CefRuntime.Installed() != "") { return true; }
+        string localPath = CefOptions.ArchivePath();
+        if (localPath != "") {
+            CefArchive local = CefRuntime.ReadLocalArchive(localPath);
+            if (local == null) { return false; }
+            CefRuntime.pendingDir = CefRuntime.RuntimeDir(local.cefVersion);
+            CefRuntime.pendingVersion = local.cefVersion;
+            if (CefRuntime.IsReady(CefRuntime.pendingDir)) { return true; }
+            return CefRuntime.Install(localPath, CefRuntime.pendingDir,
+                CefRuntime.pendingVersion);
+        }
         CefArchive a = await CefRuntime.ResolveAsync();
         if (a == null) { return false; }
         string dir = CefRuntime.RuntimeDir(a.cefVersion);
@@ -421,7 +675,7 @@ class CefRuntime {
         Directory.CreateDirectoryRecursive(CefRuntime.DownloadDir());
         string archive = CefRuntime.DownloadDir() + "/" + a.fileName;
         DownloadItem it = DownloadItem.FromUrl(
-            "https://" + CefRuntime.IndexHost() + a.Path(), archive);
+            CefRuntime.ArchiveUrl(a), archive);
         if (it == null) {
             CefRuntime.Fail("CEF 归档地址异常：" + a.fileName);
             return false;
@@ -456,16 +710,21 @@ class CefRuntime {
         if (File.Exists(archive) && Sha1.VerifyFile(archive, a.sha1)) {
             return true;
         }
-        HttpClient client = HttpClient.CreateHttps(CefRuntime.IndexHost(), 443);
+        CefHttpEndpoint endpoint = CefRuntime.Endpoint();
+        if (endpoint == null) { return false; }
+        HttpClient client = endpoint.tls
+            ? HttpClient.CreateHttps(endpoint.host, endpoint.port)
+            : new HttpClient(endpoint.host, endpoint.port);
         client.SetTimeout(120000);
         for (int attempt = 0; attempt < 2; attempt = attempt + 1) {
-            long n = await client.DownloadBinaryToFileAsync(a.Path(), archive,
-                archive + ".progress");
+            long n = await client.DownloadBinaryToFileAsync(
+                CefRuntime.BasePath(a.Path()), archive, archive + ".progress");
             if (n > 0 && Sha1.VerifyFile(archive, a.sha1)) { return true; }
             // 半截或损坏：清掉后整包重下。
             if (File.Exists(archive)) { File.Delete(archive); }
         }
-        CefRuntime.Fail("CEF 归档下载或 SHA-1 校验失败：" + a.fileName);
+        CefRuntime.Fail("CEF 归档下载或 SHA-1 校验失败："
+            + CefRuntime.ArchiveUrl(a));
         return false;
     }
 
@@ -479,7 +738,9 @@ class CefRuntime {
     /// <summary>解压 .tar.bz2 归档到运行时目录并打上就绪标记：归档里
     /// 只有一层 cef_binary_… 顶层目录，会被剥掉。</summary>
     static bool Install(string archive, string dir, string cefVersion) {
-        string tar = archive + ".tar";
+        Directory.CreateDirectoryRecursive(CefRuntime.DownloadDir());
+        string tar = CefRuntime.DownloadDir() + "/" + Path.GetFileName(archive)
+            + ".tar";
         string staging = dir + ".tmp";
         Directory.DeleteRecursive(staging);
         Directory.DeleteRecursive(dir);
