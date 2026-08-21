@@ -4,6 +4,8 @@ using Gui;
 using Gui.Widget;
 using Gui.Component;
 
+delegate bool ChildWindowStop();
+
 /// Base class for every secondary top-level window (dialogs, settings,
 /// pickers that need their own OS window).
 ///
@@ -12,9 +14,10 @@ using Gui.Component;
 /// by the main window's loop. Doing that per window meant wiring each new
 /// window into six places in the host loop, and every miss showed up as a
 /// window that stopped repainting. Here the plumbing lives once, and
-/// `ChildWindows` keeps the registry `Form.Run()` iterates, so opening a
-/// window -- including one opened from another child window -- is enough to
-/// make it work.
+/// `ChildWindows` keeps parent-owned windows in the registry `Form.Run()`
+/// iterates. A caller running before its main window exists can instead use
+/// `OpenStandalone` and `PumpStandaloneUntil`; that path owns its event
+/// loop and is deliberately not registered in `ChildWindows`.
 ///
 /// A subclass supplies the title/size/widget-id baseline, builds `root` (a
 /// retained Control tree), wires handlers, and may override `Pending()`
@@ -200,6 +203,33 @@ class ChildWindow {
                               parent.UserWallpaperOpacity());
         host.RequestRedraw();
         ChildWindows.Register(this);
+    }
+
+    /// Creates a standalone top-level host for callers that run before the
+    /// application's main window exists. It deliberately does not inherit
+    /// parent styling or enter the shared ChildWindows registry.
+    void OpenStandalone() {
+        open = true;
+        idBase = this.IdBase();
+        host = App.CreateDark(this.Title(), this.Width(), this.Height());
+        host.SetChromeButtons(false, false, this.ShowMinimize(),
+                              this.ShowMaximize());
+        host.Show();
+        host.RequestRedraw();
+    }
+
+    /// Drives this window without a parent application's loop. ProcessEvent
+    /// supplies the blocking event wait when there is no redraw or animation,
+    /// so a background job can be observed without a busy loop.
+    void PumpStandaloneUntil(ChildWindowStop stop) {
+        while (this.IsOpen() && (stop == null || !stop())) {
+            if (!host.PumpSafe()) {
+                this.Close();
+                break;
+            }
+            if (this.IsOpen()) { this.Render(); }
+        }
+        if (this.IsOpen()) { this.Close(); }
     }
 
     /// Renders one frame, with this window's widget ids pinned: the render

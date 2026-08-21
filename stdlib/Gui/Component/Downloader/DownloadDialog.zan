@@ -18,6 +18,9 @@ namespace Gui.Component.Downloader;
 ///   job.Start();
 ///   DownloadDialog dlg = DownloadDialog.Show(app, "系统检查更新", job);
 ///
+/// 没有主窗口的启动阶段可用 `OpenStandalone` + `RunStandalone`：它自己
+/// 驱动唯一的顶层窗口，用户关窗不取消后台任务，关窗后任务静默跑完。
+///
 /// 刷新走 <c>App.RequestAnimationFrame(200)</c>：任务在跑时每 200ms 出一帧，
 /// 跑完就不再武装截止时间，因此空闲时零 CPU（直接让 <c>Pending()</c> 恒真
 /// 会让主循环满速忙渲染）。字节进度由 <see cref="DownloadJob.Poll"/> 从
@@ -69,6 +72,33 @@ class DownloadDialog : ChildWindow {
         d.job = j;
         d.Open(parent);
         return d;
+    }
+
+    /// <summary>在还没有主窗口时显示独立的下载进度窗。调用方负责在
+    /// <c>RunStandalone</c> 前启动任务；窗口创建失败会把异常交给调用方，
+    /// 方便无显示器宿主回退到静默路径。</summary>
+    static DownloadDialog OpenStandalone(string title, DownloadJob j) {
+        DownloadDialog d = new DownloadDialog();
+        d.caption = title;
+        d.job = j;
+        DownloadDialog.current = d;
+        d.BuildUi();
+        d.OpenStandalone();
+        return d;
+    }
+
+    /// <summary>驱动独立窗口直到任务成功、失败、取消或用户关窗，并返回
+    /// 是否成功。用户关窗不会取消任务；关窗后不再绘制界面，剩余工作静默
+    /// 等到收工。</summary>
+    async bool RunStandalone() {
+        this.PumpStandaloneUntil(() => { return this.Finished(); });
+        while (this.job != null && this.job.Running()) {
+            await Task.Delay(200);
+        }
+        if (DownloadDialog.current == this) {
+            DownloadDialog.current = null;
+        }
+        return this.job != null && this.job.Succeeded();
     }
 
     /// <summary>标题下面那段说明文字（"" = 不显示）。<c>Show</c> 之前

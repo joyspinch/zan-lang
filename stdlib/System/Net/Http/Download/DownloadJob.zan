@@ -216,6 +216,10 @@ class DownloadJob {
     int index;
     string current;
     string error;
+    /// 最近一次传输失败的阶段诊断，由 FetchAsync 从 HttpClient 转存。
+    string downloadError;
+    /// SetFail 把 stage 改成 Failed 前保存的阶段，供调用方判断失败类型。
+    int failedStage;
     bool running;
     // ---- 只有读者动的字段（由 Poll 从进度文件刷新）----
     long got;
@@ -228,6 +232,8 @@ class DownloadJob {
         this.index = 0;
         this.current = "";
         this.error = "";
+        this.downloadError = "";
+        this.failedStage = DownloadStage.Idle;
         this.running = false;
         this.got = 0;
         this.total = 0;
@@ -279,6 +285,11 @@ class DownloadJob {
     /// 状态为失败，原因见 <see cref="Error"/>）。</summary>
     bool Start() {
         DownloadJob.EnsureShared();
+        DownloadJob.Lock();
+        this.stage = DownloadStage.Idle;
+        this.failedStage = DownloadStage.Idle;
+        this.downloadError = "";
+        DownloadJob.Unlock();
         if (this.items.Count == 0 && this.prepare == null) {
             this.SetFail("没有要下载的文件");
             return false;
@@ -376,6 +387,7 @@ class DownloadJob {
         for (int i = 0; i < job.items.Count; i = i + 1) {
             if (DownloadJob.CancelRequested()) {
                 job.SetStage(DownloadStage.Cancelled);
+                job.SetError("下载已取消");
                 job.Finish();
                 return;
             }
@@ -387,17 +399,23 @@ class DownloadJob {
             try {
                 n = await job.FetchAsync(it);
             } catch (Exception ex) {
-                job.SetFail("下载 " + it.name + " 失败：" + ex.Message);
+                string detail = job.downloadError;
+                if (detail == "") { detail = ex.Message; }
+                job.SetFail("下载 " + it.name + " 失败：" + detail);
                 job.Finish();
                 return;
             }
             if (n == 0 - 2) {
                 job.SetStage(DownloadStage.Cancelled);
+                job.SetError("下载已取消");
                 job.Finish();
                 return;
             }
             if (n <= 0) {
-                job.SetFail("下载 " + it.name + " 失败");
+                string detail2 = job.downloadError;
+                if (detail2 == "") { detail2 = "未知下载阶段"; }
+                job.SetFail("下载 " + it.name + " 失败（传输返回 "
+                    + Convert.ToString(n) + "，下载阶段：" + detail2 + "）");
                 job.Finish();
                 return;
             }
@@ -435,8 +453,17 @@ class DownloadJob {
         else { cli = new HttpClient(it.host, it.port); }
         cli.SetTimeout(120000);
         cli.SetCancelProbe(DownloadJob.CancelRequested);
-        return await cli.DownloadBinaryToFileAsync(it.path, it.localPath,
-            it.ProgressFile());
+        this.downloadError = "";
+        try {
+            long n = await cli.DownloadBinaryToFileAsync(it.path, it.localPath,
+                it.ProgressFile());
+            if (n <= 0) { this.downloadError = cli.LastDownloadError(); }
+            return n;
+        } catch (Exception ex) {
+            this.downloadError = cli.LastDownloadError();
+            if (this.downloadError == "") { this.downloadError = ex.Message; }
+            throw ex;
+        }
     }
 
     /// <summary>把下载好的文件安装到 <c>extractTo</c>：归档按扩展名解开，
@@ -484,7 +511,14 @@ class DownloadJob {
 
     void SetFail(string msg) {
         DownloadJob.Lock();
+        this.failedStage = this.stage;
         this.stage = DownloadStage.Failed;
+        this.error = msg;
+        DownloadJob.Unlock();
+    }
+
+    void SetError(string msg) {
+        DownloadJob.Lock();
         this.error = msg;
         DownloadJob.Unlock();
     }
@@ -509,6 +543,14 @@ class DownloadJob {
     int Stage() {
         DownloadJob.Lock();
         int v = this.stage;
+        DownloadJob.Unlock();
+        return v;
+    }
+
+    /// <summary>失败前所处的阶段；非 Failed 状态时通常为 Idle。</summary>
+    int FailedStage() {
+        DownloadJob.Lock();
+        int v = this.failedStage;
         DownloadJob.Unlock();
         return v;
     }
