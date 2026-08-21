@@ -399,12 +399,21 @@ class TlsStream {
     // 最大 16KB；每条流分配一次，而非每次操作）
     byte[] scratch;
     static int SCRATCH = 17408;
+    static string lastError = "";
 
     // C 的 `int` 返回值是零扩展的（C 的 -1 读到为 4294967295）；
     // 将其折回有符号 32 位，错误检查才能正常工作。
     static int Norm(int v) {
         if (v > 2147483647) { return v - 4294967296; }
         return v;
+    }
+
+    static string LastError() {
+        return TlsStream.lastError;
+    }
+
+    static void SetLastError(string error) {
+        TlsStream.lastError = error;
     }
 
     TlsStream() {
@@ -448,8 +457,12 @@ class TlsStream {
     /// <paramref name="host"/> 的 SNI 并执行 TLS 握手。握手失败时
     /// 返回 null。</summary>
     static async TlsStream ConnectAsync(TlsContext ctx, nint sock, string host) {
+        TlsStream.SetLastError("");
         TlsStream s = Setup(ctx, sock);
-        if (s == null) { return null; }
+        if (s == null) {
+            TlsStream.SetLastError("SSL 对象初始化失败");
+            return null;
+        }
         SSL_set_connect_state(s.ssl);
         if (host != null && host.Length > 0) {
             // 55 = SSL_CTRL_SET_TLSEXT_HOSTNAME, 0 = TLSEXT_NAMETYPE_host_name
@@ -476,6 +489,7 @@ class TlsStream {
                         _hv = X509_VERIFY_PARAM_set1_host(param, host, 0);
                     }
                     if (_hv != 1) {
+                        TlsStream.SetLastError("TLS 主机名校验参数初始化失败");
                         s.Close();
                         return null;
                     }
@@ -484,6 +498,7 @@ class TlsStream {
         }
         int ok = await s.HandshakeAsync();
         if (ok != 1) {
+            TlsStream.SetLastError("TLS 握手失败");
             s.Close();
             return null;
         }
@@ -492,6 +507,8 @@ class TlsStream {
         if (ctx.verify) {
             long vr = SSL_get_verify_result(s.ssl);
             if (vr != 0) {
+                TlsStream.SetLastError("TLS 证书链或主机名校验失败（verify_result="
+                    + Convert.ToString(vr) + "）");
                 s.Close();
                 return null;
             }
@@ -499,6 +516,7 @@ class TlsStream {
         if (ctx.PinningActive()) {
             string got = TlsStream.SpkiPinOf(s.ssl);
             if (got == "" || !ctx.PinMatches(got)) {
+                TlsStream.SetLastError("TLS 公钥 pin 校验失败");
                 s.Close();
                 return null;
             }

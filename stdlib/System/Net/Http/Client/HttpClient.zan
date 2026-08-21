@@ -45,6 +45,7 @@ class HttpClient {
     CookieJar jar;
     // 取消探针；null = 不可取消（见 SetCancelProbe）。
     HttpCancelFn cancelProbe;
+    string lastDownloadError;
 
     [DllImport("crt")]
     static extern nint fopen(string path, string mode);
@@ -80,6 +81,7 @@ class HttpClient {
         this.pinningEnabled = false;
         this.jar = null;
         this.cancelProbe = null;
+        this.lastDownloadError = "";
     }
 
     /// <summary>为指定的主机和端口创建 HTTPS 客户端。</summary>
@@ -125,6 +127,15 @@ class HttpClient {
     HttpClient SetCancelProbe(HttpCancelFn f) {
         this.cancelProbe = f;
         return this;
+    }
+
+    /// <summary>最近一次二进制下载失败的阶段诊断；成功或尚未下载时为空。</summary>
+    string LastDownloadError() {
+        return this.lastDownloadError;
+    }
+
+    void SetDownloadError(string error) {
+        this.lastDownloadError = error;
     }
 
     /// <summary>探针是否要求收工（没装探针时恒为 false）。</summary>
@@ -1151,6 +1162,7 @@ class HttpClient {
     /// （已收字节保留在 <paramref name="localPath"/>，可续传）。</summary>
     async long DownloadBinaryToFileAsync(string path, string localPath,
             string progressFile) {
+        this.SetDownloadError("");
         int have = 0;
         nint probe = fopen(localPath, "rb");
         if (probe != 0) {
@@ -1161,7 +1173,16 @@ class HttpClient {
 
         Socket.Initialize();
         TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port, this.timeout);
-        if (conn == null) { return 0 - 1; }
+        if (conn == null) {
+            if (TcpClient.LastConnectResolveFailed()) {
+                this.SetDownloadError("DNS 解析失败");
+            } else if (TcpClient.LastConnectTimedOut()) {
+                this.SetDownloadError("TCP connect 超时");
+            } else {
+                this.SetDownloadError("TCP connect 失败");
+            }
+            return 0 - 1;
+        }
         TlsStream stream = null;
         TlsContext ctx = null;
         if (this.useTls) {
@@ -1172,11 +1193,20 @@ class HttpClient {
             } else {
                 ctx = TlsContext.CreateClient();
             }
-            if (ctx == null) { conn.Close(); return 0 - 1; }
+            if (ctx == null) {
+                this.SetDownloadError("TLS 上下文初始化失败");
+                conn.Close();
+                return 0 - 1;
+            }
             if (!this.verifyTls) { ctx.DisableVerify(); }
             this.ApplyPinning(ctx);
             stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host);
-            if (stream == null) { conn.Close(); ctx.Free(); return 0 - 1; }
+            if (stream == null) {
+                this.SetDownloadError("TLS 阶段失败：" + TlsStream.LastError());
+                conn.Close();
+                ctx.Free();
+                return 0 - 1;
+            }
         }
 
         int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
@@ -1209,10 +1239,12 @@ class HttpClient {
         int hlen = 0;
         bool endOfHead = false;
         bool closed = false;
+        int lastHeadGot = 0;
         while (!endOfHead && !closed && hlen < 262144) {
             int got;
             if (this.useTls) { got = await stream.RecvIntoAsync(one, 1); }
             else { got = await Socket.RecvIntoAsync(conn.Sock(), one, 1); }
+            lastHeadGot = got;
             if (got <= 0) { closed = true; }
             else {
                 int c = one[0] & 255;
@@ -1226,6 +1258,13 @@ class HttpClient {
             }
         }
         if (!endOfHead) {
+            if (HttpDeadline.Expired(watch)) {
+                this.SetDownloadError("读取响应头超时");
+            } else if (lastHeadGot < 0) {
+                this.SetDownloadError("读取响应头失败");
+            } else {
+                this.SetDownloadError("响应头不完整");
+            }
             HttpDeadline.Disarm(watch);
             if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
             else { conn.Close(); }
@@ -1234,6 +1273,7 @@ class HttpClient {
         string headText = head.ToString();
         int status = HttpClient.HeadStatus(headText);
         if (HttpClient.HeadIsChunked(headText)) {
+            this.SetDownloadError("响应使用了不支持的 chunked 传输");
             HttpDeadline.Disarm(watch);
             if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
             else { conn.Close(); }
@@ -1250,6 +1290,8 @@ class HttpClient {
             return have;
         }
         if (status < 200 || status >= 300) {
+            this.SetDownloadError("HTTP 响应状态码 "
+                + Convert.ToString(status));
             HttpDeadline.Disarm(watch);
             if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
             else { conn.Close(); }
@@ -1276,6 +1318,7 @@ class HttpClient {
         if (resume) { mode = "ab"; }
         nint outfp = fopen(localPath, mode);
         if (outfp == 0) {
+            this.SetDownloadError("无法打开本地归档文件");
             HttpDeadline.Disarm(watch);
             if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
             else { conn.Close(); }
@@ -1285,12 +1328,14 @@ class HttpClient {
         string buf = HttpClient.NewBuffer(65537);
         bool finished = false;
         bool cancelled = false;
+        int lastBodyN = 0;
         long lastReport = 0 - 1;
         long lastReportMs = 0;
         while (!finished) {
             int n;
             if (this.useTls) { n = await stream.RecvIntoAsync(buf, 65536); }
             else { n = await Socket.RecvIntoAsync(conn.Sock(), buf, 65536); }
+            lastBodyN = n;
             if (n <= 0) { finished = true; }
             else {
                 long w = fwrite(buf, 1, n, outfp);
@@ -1328,8 +1373,18 @@ class HttpClient {
         File.WriteAllText(progressFile,
             Convert.ToString(written) + "/" + Convert.ToString(total));
         if (cancelled) { return 0 - 2; }
-        if (late) { return 0 - 1; }
-        if (total > 0 && written < total) { return 0 - 1; }
+        if (late) {
+            this.SetDownloadError("读取归档正文超时");
+            return 0 - 1;
+        }
+        if (total > 0 && written < total) {
+            if (lastBodyN < 0) {
+                this.SetDownloadError("读取归档正文失败");
+            } else {
+                this.SetDownloadError("归档正文不完整");
+            }
+            return 0 - 1;
+        }
         return written;
     }
 
