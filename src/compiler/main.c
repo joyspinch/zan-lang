@@ -1266,6 +1266,52 @@ static bool zan_file_exists(const char *path) {
 #endif
 }
 
+/* Read the first usable runtime filename from a driver bundle manifest. */
+static bool zan_read_first_bundle_name(const char *path,
+                                       char *out, size_t outsz) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r' ||
+                         line[n - 1] == ' ' || line[n - 1] == '\t'))
+            line[--n] = '\0';
+        char *first = line;
+        while (*first == ' ' || *first == '\t') first++;
+        if (first != line) {
+            memmove(line, first, strlen(first) + 1);
+            n = strlen(line);
+        }
+        if (n == 0 || !zan_is_safe_bundle_name(line)) continue;
+        if (n >= outsz) continue;
+        snprintf(out, outsz, "%s", line);
+        fclose(f);
+        return true;
+    }
+    fclose(f);
+    return false;
+}
+
+/* Resolve a macOS driver's link input. The normal name is preferred, but
+ * versioned dylibs such as libssl.3.dylib can be named by <lib>.bundle. */
+static bool zan_find_macos_driver_dylib(const char *dir,
+                                        const char *name, int len,
+                                        char *out, size_t outsz) {
+    char direct[1200];
+    snprintf(direct, sizeof(direct), "%s/lib%.*s.dylib", dir, len, name);
+    if (zan_file_exists(direct)) {
+        snprintf(out, outsz, "%s", direct);
+        return true;
+    }
+    char manifest[1200], bundled[128];
+    snprintf(manifest, sizeof(manifest), "%s/%.*s.bundle", dir, len, name);
+    if (!zan_read_first_bundle_name(manifest, bundled, sizeof(bundled)))
+        return false;
+    snprintf(out, outsz, "%s/%s", dir, bundled);
+    return zan_file_exists(out);
+}
+
 /* Bare filename of a path (after the last '/' or '\\'). */
 static const char *zan_path_basename(const char *p) {
     const char *b = p;
@@ -2324,8 +2370,9 @@ int main(int argc, char **argv) {
 
         /* Cross-linking to macOS is dynamic: a [DllImport] lib resolves from
          * the per-target driver dylib shipped inside the owning stdlib module
-         * (<module>/drivers/<target-sub>/lib<name>.dylib), which the link
-         * records as @rpath/... and --publish copies next to the executable.
+         * (<module>/drivers/<target-sub>/lib<name>.dylib), or from the first
+         * usable filename in its <name>.bundle manifest. The link records the
+         * dylib as @rpath/... and --publish copies it next to the executable.
          * The dylib's own framework dependencies (Cocoa, WebKit, ...) are bound
          * on the target Mac, which is what lets a Windows/Linux host cross-link
          * a GUI program without an Apple SDK. A lib with no bundled dylib has
@@ -2346,12 +2393,14 @@ int main(int argc, char **argv) {
                 dylib[0] = '\0';
                 int didx = zan_driver_find(&mac_reg, nm, nlen);
                 if (didx >= 0 && resolved_stdlib_root[0]) {
-                    snprintf(dylib, sizeof(dylib),
-                             "%s/%s/drivers/%s/lib%.*s.dylib",
-                             resolved_stdlib_root,
-                             mac_reg.entries[didx].module, dsub, nlen, nm);
+                    char driver_dir[1200];
+                    snprintf(driver_dir, sizeof(driver_dir),
+                             "%s/%s/drivers/%s", resolved_stdlib_root,
+                             mac_reg.entries[didx].module, dsub);
+                    zan_find_macos_driver_dylib(
+                        driver_dir, nm, nlen, dylib, sizeof(dylib));
                 }
-                if (dylib[0] && zan_file_exists(dylib)) {
+                if (dylib[0]) {
                     if (cross_dylib_count < 16) {
                         snprintf(cross_dylibs[cross_dylib_count],
                                  sizeof(cross_dylibs[0]), "%s", dylib);
@@ -3098,6 +3147,32 @@ int main(int argc, char **argv) {
                             irgen.extern_libs[li].str,
                             (int)irgen.extern_libs[li].len, &nlen);
                         if (!nm) continue;
+                        if (target.os == ZAN_OS_MACOS) {
+                            for (int d = 0; d < used_driver_count; d++) {
+                                if (used_driver_runtime[d] ||
+                                    used_driver_static[d] ||
+                                    used_driver_len[d] != nlen ||
+                                    memcmp(used_drivers[d], nm,
+                                           (size_t)nlen) != 0)
+                                    continue;
+                                char primary[1200], fallback[1200];
+                                snprintf(primary, sizeof(primary),
+                                         "%s/lib%.*s.dylib", driver_dirs[d],
+                                         nlen, nm);
+                                if (!zan_file_exists(primary) &&
+                                    zan_find_macos_driver_dylib(
+                                        driver_dirs[d], nm, nlen,
+                                        fallback, sizeof(fallback))) {
+                                    size_t cur = strlen(cmd);
+                                    snprintf(cmd + cur,
+                                             sizeof(cmd) - cur, " \"%s\"",
+                                             fallback);
+                                    nm = NULL;
+                                }
+                                break;
+                            }
+                            if (!nm) continue;
+                        }
                         size_t cur = strlen(cmd);
                         snprintf(cmd + cur, sizeof(cmd) - cur, " -l%.*s",
                                  nlen, nm);
@@ -3933,6 +4008,31 @@ int main(int argc, char **argv) {
             int name_len;
             const char *name = zan_dllimport_lname(lib, lib_len, &name_len);
             if (!name) continue;
+            if (target.os == ZAN_OS_MACOS) {
+                for (int d = 0; d < used_driver_count; d++) {
+                    if (used_driver_runtime[d] ||
+                        used_driver_static[d] ||
+                        used_driver_len[d] != name_len ||
+                        memcmp(used_drivers[d], name,
+                               (size_t)name_len) != 0)
+                        continue;
+                    char primary[1200], fallback[1200];
+                    snprintf(primary, sizeof(primary),
+                             "%s/lib%.*s.dylib", driver_dirs[d],
+                             name_len, name);
+                    if (!zan_file_exists(primary) &&
+                        zan_find_macos_driver_dylib(
+                            driver_dirs[d], name, name_len,
+                            fallback, sizeof(fallback))) {
+                        size_t cur = strlen(link_cmd);
+                        snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+                                 " \"%s\"", fallback);
+                        name = NULL;
+                    }
+                    break;
+                }
+                if (!name) continue;
+            }
             size_t cur = strlen(link_cmd);
             snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%.*s", name_len, name);
         }

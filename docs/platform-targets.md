@@ -105,7 +105,11 @@ A target is only "complete" when these back ends exist for it. Current coverage:
 | Filesystem / dirent  | ✅      | glibc layout | Darwin layout | `Directory.zan` branches on dirent offsets |
 | Monotonic clock      | ✅      | `CLOCK_MONOTONIC`=1 | =6 | `Stopwatch` |
 | GUI backend          | Win32   | X11   | Cocoa | Wayland and all other windowing systems are stubs; macOS cross links the committed `macos-<arch>/libzan_gui.dylib`, whose Cocoa/WebKit dependencies bind on the target Mac |
-| Native DB drivers    | `win-x64`/`win-arm64` | `linux-x64`/`linux-arm64` | `macos-x64`/`macos-arm64` | `<stdlib>/System/Data/<Module>/drivers/<target>/`; binaries gitignored |
+| Native DB/TLS drivers | `win-x64`/`win-arm64` | `linux-x64`/`linux-arm64` | `macos-x64`/`macos-arm64` | `<stdlib>/System/Data/<Module>/drivers/<target>/` and `<stdlib>/System/Net/Tls/drivers/<target>/`; binaries committed per target |
+
+On macOS, versioned native dylibs such as `libssl.3.dylib` and `libpq.5.dylib`
+are named by the owning driver's `<lib>.bundle` manifest. The compiler uses its
+first safe entry when the unversioned `lib<lib>.dylib` link name is absent.
 
 Anything not listed (Wayland, BSD, mobile, WASM GUI, bare-metal) has **no** back end
 yet.

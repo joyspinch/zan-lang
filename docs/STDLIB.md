@@ -607,6 +607,9 @@ subdirectory:
 
 1. `<module>/drivers/driver.manifest` lists one `-l` basename per line
    (e.g. `zan_gui`, `zan_sdl3`); blank lines and `#` comments are ignored.
+   On macOS, a versioned driver may provide `<lib>.bundle`; when
+   `lib<lib>.dylib` is absent, the compiler links the first safe filename in
+   that manifest.
 2. `zan_discover_drivers` (`src/compiler/main.c`) scans the stdlib root for
    every manifest and indexes the per-target driver directories
    (`win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `linux-riscv64`,
