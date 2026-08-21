@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.Management;
 using System.Net.Http.Client;
 using System.Security.Cryptography;
+using System.Net.Http.Download;
 
 namespace Gui.Component.CefBrowser;
 
@@ -367,6 +368,77 @@ class CefRuntime {
         if (!got) { return ""; }
         if (!CefRuntime.Install(archive, dir, a.cefVersion)) { return ""; }
         return dir;
+    }
+
+    // ------------------------------------------- 带进度界面的自举（DownloadJob）
+
+    /// 准备阶段选中的目标目录与版本：worker 线程上先写、随后同一个线程上的
+    /// 安装步骤再读（DownloadJob 是单任务语义，见其类注释）。
+    static string pendingDir;
+    static string pendingVersion;
+
+    /// <summary>把运行时自举做成一个通用下载任务，好让宿主用
+    /// <see cref="DownloadDialog"/> 显示进度：
+    ///
+    /// <code>
+    /// DownloadJob job = CefRuntime.NewEnsureJob();
+    /// job.Start();
+    /// DownloadDialog.Show(app, "正在准备浏览器运行时", job);
+    /// // 任务成功后：CefRuntime.EnsuredDir() 就是运行时目录
+    /// </code>
+    ///
+    /// 「下哪个归档」仍然由本类决定（联网拉索引、按系统选版本），
+    /// 解压/剥顶层目录/打就绪标记也仍然走本类的 <c>Install</c>——任务层只管
+    /// 传输、校验与进度。已经装好时任务不下载任何东西，直接以“已完成”收工。
+    /// </summary>
+    static DownloadJob NewEnsureJob() {
+        DownloadJob job = new DownloadJob();
+        job.SetPrepare(CefRuntime.PrepareJob);
+        return job;
+    }
+
+    /// <summary>任务的准备回调（跑在工作线程上）：联网定归档并加条目。
+    /// </summary>
+    static bool PrepareJob(DownloadJob job) {
+        CefRuntime.lastError = "";
+        CefRuntime.pendingDir = "";
+        CefRuntime.pendingVersion = "";
+        if (CefRuntime.Installed() != "") { return true; }
+        CefArchive a = await CefRuntime.ResolveAsync();
+        if (a == null) { return false; }
+        string dir = CefRuntime.RuntimeDir(a.cefVersion);
+        CefRuntime.pendingDir = dir;
+        CefRuntime.pendingVersion = a.cefVersion;
+        if (CefRuntime.IsReady(dir)) { return true; }
+        Directory.CreateDirectoryRecursive(CefRuntime.DownloadDir());
+        string archive = CefRuntime.DownloadDir() + "/" + a.fileName;
+        DownloadItem it = DownloadItem.FromUrl(
+            "https://" + CefRuntime.IndexHost() + a.Path(), archive);
+        if (it == null) {
+            CefRuntime.Fail("CEF 归档地址异常：" + a.fileName);
+            return false;
+        }
+        job.Add(it.WithSha1(a.sha1).WithSize(a.size).WithName(a.fileName)
+            .WithInstaller(CefRuntime.InstallItem));
+        return true;
+    }
+
+    /// <summary>任务的安装步骤（跑在工作线程上）：CEF 的归档要剥掉顶层
+    /// 目录、要打就绪标记，所以不能用任务层按扩展名的默认解压。</summary>
+    static bool InstallItem(DownloadItem it) {
+        return CefRuntime.Install(it.LocalPath(), CefRuntime.pendingDir,
+            CefRuntime.pendingVersion);
+    }
+
+    /// <summary><see cref="NewEnsureJob"/> 的任务成功收工后，运行时所在
+    /// 目录；没装好时 ""。</summary>
+    static string EnsuredDir() {
+        string have = CefRuntime.Installed();
+        if (have != "") { return have; }
+        if (CefRuntime.pendingDir == null) { return ""; }
+        if (CefRuntime.pendingDir == "") { return ""; }
+        if (!CefRuntime.IsReady(CefRuntime.pendingDir)) { return ""; }
+        return CefRuntime.pendingDir;
     }
 
     /// <summary>下载归档（断点续传）并按官方 SHA-1 校验；校验不过会

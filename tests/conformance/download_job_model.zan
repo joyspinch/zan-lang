@@ -1,0 +1,106 @@
+// 通用下载/安装组件的离线部分：URL 解析、显示名、进度伴生文件命名、
+// 字节数的人读写法、阶段文案，以及空任务的失败语义。
+// 真正的传输与解压要联网，不在冒烟范围内。
+using System;
+using System.Net.Http.Download;
+
+class Program {
+    static int bad;
+
+    static void Eq(string got, string want, string label) {
+        if (got != want) {
+            Console.WriteLine("FAIL " + label + ": got '" + got
+                + "' want '" + want + "'");
+            bad = bad + 1;
+        }
+    }
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); bad = bad + 1; }
+    }
+
+    static void Urls() {
+        DownloadItem a = DownloadItem.FromUrl("https://cdn.example.com/app/plus2.exe",
+            "/tmp/plus2.exe");
+        Check(a != null, "https url parses");
+        if (a != null) {
+            Eq(a.Name(), "plus2.exe", "display name from url");
+            Eq(a.LocalPath(), "/tmp/plus2.exe", "local path kept");
+            Eq(a.ProgressFile(), "/tmp/plus2.exe.progress", "progress companion");
+            Eq(a.ExtractTo(), "", "no extract target by default");
+            Eq(a.WithName("升级包").Name(), "升级包", "display name override");
+            Eq(a.WithExtractTo("/tmp/out").ExtractTo(), "/tmp/out",
+                "extract target set");
+        }
+        DownloadItem b = DownloadItem.FromUrl("http://127.0.0.1:8099/pack.zip",
+            "/tmp/pack.zip");
+        Check(b != null, "http url with port parses");
+        if (b != null) { Eq(b.Name(), "pack.zip", "name from port-ful url"); }
+        Check(DownloadItem.FromUrl("ftp://example.com/x", "/tmp/x") == null,
+            "unsupported scheme rejected");
+        Check(DownloadItem.FromUrl("https:///x", "/tmp/x") == null,
+            "empty host rejected");
+    }
+
+    static void Human() {
+        Eq(DownloadJob.Human(0), "0 B", "zero bytes");
+        Eq(DownloadJob.Human(1023), "1023 B", "sub-KB stays in bytes");
+        Eq(DownloadJob.Human(1536), "1.5 KB", "KB with one decimal");
+        Eq(DownloadJob.Human(170688184), "162.7 MB", "MB with one decimal");
+        Eq(DownloadJob.Human(2147483648), "2.0 GB", "GB with one decimal");
+    }
+
+    static void Stages() {
+        Eq(DownloadStage.Text(DownloadStage.Idle), "准备中", "idle text");
+        Eq(DownloadStage.Text(DownloadStage.Download), "正在下载", "download text");
+        Eq(DownloadStage.Text(DownloadStage.Verify), "正在校验", "verify text");
+        Eq(DownloadStage.Text(DownloadStage.Extract), "正在解压安装",
+            "extract text");
+        Eq(DownloadStage.Text(DownloadStage.Done), "已完成", "done text");
+        Eq(DownloadStage.Text(DownloadStage.Cancelled), "已取消", "cancelled text");
+    }
+
+    static void EmptyJob() {
+        DownloadJob j = new DownloadJob();
+        Eq(Convert.ToString(j.Count()), "0", "new job has no items");
+        Check(j.Stage() == DownloadStage.Idle, "new job is idle");
+        Check(!j.Running(), "new job is not running");
+        j.Add(null);
+        Eq(Convert.ToString(j.Count()), "0", "null item ignored");
+        // 没有条目、也没有准备回调：起不来，且带着可读的原因。
+        Check(!j.Start(), "empty job refuses to start");
+        Check(j.Stage() == DownloadStage.Failed, "empty job ends failed");
+        Check(j.Error() != "", "empty job reports why");
+        Eq(Convert.ToString(j.TotalPercent()), "0", "empty job has no progress");
+    }
+
+    static void Percents() {
+        DownloadJob j = new DownloadJob();
+        DownloadItem a = DownloadItem.FromUrl("https://h/a.bin", "/tmp/a.bin");
+        DownloadItem b = DownloadItem.FromUrl("https://h/b.bin", "/tmp/b.bin");
+        if (a == null || b == null) {
+            Check(false, "percent fixture items parse");
+            return;
+        }
+        j.Add(a);
+        j.Add(b);
+        Eq(Convert.ToString(j.Count()), "2", "two items queued");
+        Check(j.ItemAt(0) == a, "item 0 is the first added");
+        Check(j.ItemAt(2) == null, "out-of-range item is null");
+        // 还没开跑：当前条目 0%，总体 0%（进度只由 Poll 从伴生文件刷新）。
+        Eq(Convert.ToString(j.ItemPercent()), "0", "no bytes yet");
+        Eq(Convert.ToString(j.TotalPercent()), "0", "no files done yet");
+        Eq(Convert.ToString(j.DoneCount()), "0", "nothing finished yet");
+    }
+
+    static int Main() {
+        bad = 0;
+        Urls();
+        Human();
+        Stages();
+        EmptyJob();
+        Percents();
+        if (bad == 0) { Console.WriteLine("download job model ok"); }
+        return bad == 0 ? 0 : 1;
+    }
+}

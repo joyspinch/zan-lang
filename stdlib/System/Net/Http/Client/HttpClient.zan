@@ -3,8 +3,13 @@ using System.IO;
 using System.Net.Sockets;
 using System.Net.Http;
 using System.Net.Tls;
+using System.Threading;
 
 namespace System.Net.Http.Client;
+
+/// <summary>取消探针：返回 true 表示调用方已经不要这个传输了。
+/// 见 <see cref="HttpClient.SetCancelProbe"/>。</summary>
+delegate bool HttpCancelFn();
 
 /// <summary>
 /// HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
@@ -38,6 +43,8 @@ class HttpClient {
     bool pinningEnabled;
     // cookie 存储；null = 不参与 cookie（Set-Cookie 只留在响应头里）。
     CookieJar jar;
+    // 取消探针；null = 不可取消（见 SetCancelProbe）。
+    HttpCancelFn cancelProbe;
 
     [DllImport("crt")]
     static extern nint fopen(string path, string mode);
@@ -72,6 +79,7 @@ class HttpClient {
         this.tlsPins = null;
         this.pinningEnabled = false;
         this.jar = null;
+        this.cancelProbe = null;
     }
 
     /// <summary>为指定的主机和端口创建 HTTPS 客户端。</summary>
@@ -105,6 +113,24 @@ class HttpClient {
     /// <summary>本客户端的 cookie 存储，未启用时为 null。</summary>
     CookieJar Cookies() {
         return this.jar;
+    }
+
+    /// <summary>装上取消探针：长下载在每收到一块正文后问它一次，
+    /// 返回 true 就在块边界收工。传 null 取消装配。
+    ///
+    /// 探针在驱动请求的那个线程上被调用（下载跑在工作线程时就是工作
+    /// 线程），因此它只应读一个共享标志，不要在里面做别的事。已落盘的
+    /// 字节会保留，下一次调用同一个 <see cref="DownloadBinaryToFileAsync"/>
+    /// 会用 Range 从断点续下。</summary>
+    HttpClient SetCancelProbe(HttpCancelFn f) {
+        this.cancelProbe = f;
+        return this;
+    }
+
+    /// <summary>探针是否要求收工（没装探针时恒为 false）。</summary>
+    bool CancelRequested() {
+        if (this.cancelProbe == null) { return false; }
+        return this.cancelProbe();
     }
 
     /// <summary>固定一个受信任的服务器公钥：其 DER SubjectPublicKeyInfo 的
@@ -1120,7 +1146,9 @@ class HttpClient {
     /// 已完成；超时是空闲窗口。进度（"&lt;已收&gt;/&lt;总计&gt;"）写入
     /// <paramref name="progressFile"/>。返回磁盘上的字节数；连接/握手
     /// 失败、响应不完整、或对端用 chunked 传输（本方法只支持带
-    /// Content-Length/Range 的 identity 正文）时返回 -1。</summary>
+    /// Content-Length/Range 的 identity 正文）时返回 -1；装了
+    /// <see cref="SetCancelProbe"/> 的探针并在下载中路取消时返回 -2
+    /// （已收字节保留在 <paramref name="localPath"/>，可续传）。</summary>
     async long DownloadBinaryToFileAsync(string path, string localPath,
             string progressFile) {
         int have = 0;
@@ -1256,7 +1284,9 @@ class HttpClient {
 
         string buf = HttpClient.NewBuffer(65537);
         bool finished = false;
+        bool cancelled = false;
         long lastReport = 0 - 1;
+        long lastReportMs = 0;
         while (!finished) {
             int n;
             if (this.useTls) { n = await stream.RecvIntoAsync(buf, 65536); }
@@ -1266,14 +1296,26 @@ class HttpClient {
                 long w = fwrite(buf, 1, n, outfp);
                 if (w < n) { finished = true; }
                 written = written + w;
-                if (written - lastReport >= 1048576 || lastReport < 0) {
+                // 进度以时间为主、字节为辅：每 200ms（或每 1 MB）刷一次，
+                // 慢链路上界面也在动——只按字节报的话 100 KB/s 的链路
+                // 十秒才动一格，看着像卡死。
+                long nowMs = Stopwatch.GetMilliseconds();
+                if (lastReport < 0 || written - lastReport >= 1048576
+                        || nowMs - lastReportMs >= 200) {
                     File.WriteAllText(progressFile,
                         Convert.ToString(written) + "/" + Convert.ToString(total));
                     lastReport = written;
+                    lastReportMs = nowMs;
                 }
                 if (total > 0 && written >= total) { finished = true; }
                 if (!HttpDeadline.Expired(watch)) {
                     HttpDeadline.Touch(watch, this.timeout);
+                }
+                // 块边界上优雅退出：已写入的字节都是完整的，下一轮
+                // 同一个调用会从这里接着下。
+                if (!finished && this.CancelRequested()) {
+                    finished = true;
+                    cancelled = true;
                 }
             }
         }
@@ -1285,6 +1327,7 @@ class HttpClient {
         else { conn.Close(); }
         File.WriteAllText(progressFile,
             Convert.ToString(written) + "/" + Convert.ToString(total));
+        if (cancelled) { return 0 - 2; }
         if (late) { return 0 - 1; }
         if (total > 0 && written < total) { return 0 - 1; }
         return written;

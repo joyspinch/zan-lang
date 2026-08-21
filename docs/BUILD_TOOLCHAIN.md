@@ -45,11 +45,22 @@ Remove-Item build\CMakeFiles -Recurse -Force
 
 ## Linux / macOS
 
-系统 clang 或 gcc + 系统 LLVM 开发包即可，`find_package(LLVM)` 能自动找到：
+系统 clang 或 gcc + **LLVM 15 或更新**的开发包，`find_package(LLVM)` 能自动找到：
 
 ```bash
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
+```
+
+LLVM 15 是硬性下限：irgen 按不透明指针（opaque pointers）生成 IR，用 LLVM 14
+及更早的类型化指针会在几乎每处泛型/闭包/字段存取上被 verifier 拒绝
+（`Stored value type does not match pointer operand type`），不是个别用例的问题。
+Ubuntu 22.04 自带的 `llvm-14-dev` 因此不可用，装 `llvm-15-dev clang-15` 并显式指定：
+
+```bash
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_DIR=/usr/lib/llvm-15/cmake \
+  -DCMAKE_C_COMPILER=clang-15 -DCMAKE_CXX_COMPILER=clang++-15
 ```
 
 ## 测试分层

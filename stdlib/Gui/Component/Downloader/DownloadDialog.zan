@@ -1,0 +1,246 @@
+using System;
+using System.Net.Http.Download;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.Downloader;
+
+/// <summary>通用的“下载 + 安装（解压）”进度窗：一行总体进度（n/m 个
+/// 文件）、一行当前文件进度、一行阶段提示，外加取消。
+///
+/// 它只是 <see cref="DownloadJob"/> 的观察者：任务跑在自己的工作线程上，
+/// 关掉窗口不会打断它（标题下那句提示就是这个意思），因此同一个任务可以
+/// 有窗口、也可以没有。CEF 运行时下载是第一个调用方，程序自更新、包管理
+/// 器下载复用同一个类：
+///
+///   DownloadJob job = new DownloadJob();
+///   job.Add(DownloadItem.FromUrl(url, dest).WithSha1(sha).WithExtractTo(dir));
+///   job.Start();
+///   DownloadDialog dlg = DownloadDialog.Show(app, "系统检查更新", job);
+///
+/// 刷新走 <c>App.RequestAnimationFrame(200)</c>：任务在跑时每 200ms 出一帧，
+/// 跑完就不再武装截止时间，因此空闲时零 CPU（直接让 <c>Pending()</c> 恒真
+/// 会让主循环满速忙渲染）。字节进度由 <see cref="DownloadJob.Poll"/> 从
+/// 伴生进度文件读，所以外部下载器写同一个文件也能驱动这个窗口。</summary>
+class DownloadDialog : ChildWindow {
+    /// 当前窗口。设计里的事件处理器是非捕获的静态方法，取消按钮通过
+    /// 它找到自己的窗口（与 ZanIDE 各子窗口一致的做法）。
+    static DownloadDialog current;
+
+    DownloadJob job;
+    string caption;
+    string intro;
+    string hint;
+    /// 界面文案，默认中文；换语言的宿主用 SetTexts 覆盖。
+    string tFileProgress;
+    string tDownloadFile;
+    string tFilesUnit;
+    string tCancel;
+    string tClose;
+
+    Label introLbl;
+    Label hintLbl;
+    Label fileProgressLbl;
+    Label downloadFileLbl;
+    Label countLbl;
+    Label nameLbl;
+    Label stageLbl;
+    Progress overall;
+    Progress single;
+    Button cancelBtn;
+
+    DownloadDialog() {
+        this.job = null;
+        this.caption = "下载";
+        this.intro = "";
+        this.hint = "本窗消失不影响更新进度。";
+        this.tFileProgress = "文件进度";
+        this.tDownloadFile = "下载文件";
+        this.tFilesUnit = "个文件";
+        this.tCancel = "取消";
+        this.tClose = "关闭";
+    }
+
+    /// <summary>开一个跟着 <paramref name="j"/> 的进度窗。任务可以先
+    /// <c>Start()</c> 也可以后 <c>Start()</c>：窗口只读状态。</summary>
+    static DownloadDialog Show(App parent, string title, DownloadJob j) {
+        DownloadDialog d = new DownloadDialog();
+        d.caption = title;
+        d.job = j;
+        d.Open(parent);
+        return d;
+    }
+
+    /// <summary>标题下面那段说明文字（"" = 不显示）。<c>Show</c> 之前
+    /// 或之后都能调用。</summary>
+    void SetIntro(string text) {
+        this.intro = text;
+        if (this.introLbl != null) { this.introLbl.Text = text; }
+        this.RequestRedraw();
+    }
+
+    /// <summary>说明下面那行弱化提示（默认是“本窗消失不影响更新进度”）。
+    /// </summary>
+    void SetHint(string text) {
+        this.hint = text;
+        if (this.hintLbl != null) { this.hintLbl.Text = text; }
+        this.RequestRedraw();
+    }
+
+    /// <summary>覆盖界面文案（宿主自己管界面语言时用）。</summary>
+    void SetTexts(string fileProgress, string downloadFile, string filesUnit,
+            string cancel, string close) {
+        this.tFileProgress = fileProgress;
+        this.tDownloadFile = downloadFile;
+        this.tFilesUnit = filesUnit;
+        this.tCancel = cancel;
+        this.tClose = close;
+        if (this.fileProgressLbl != null) {
+            this.fileProgressLbl.Text = fileProgress;
+        }
+        if (this.downloadFileLbl != null) {
+            this.downloadFileLbl.Text = downloadFile;
+        }
+        if (this.countLbl != null) { this.countLbl.Text = this.CountText(); }
+        if (this.cancelBtn != null) {
+            if (this.job != null && this.job.Running()) {
+                this.cancelBtn.Text = cancel;
+            } else {
+                this.cancelBtn.Text = close;
+            }
+        }
+        this.RequestRedraw();
+    }
+
+    void Open(App parent) {
+        DownloadDialog.current = this;
+        this.BuildUi();
+        this.OpenHost(parent);
+    }
+
+    void BuildUi() {
+        Panel root = Panel.Column();
+        root.Pad(18);
+        root.Gap(10);
+
+        introLbl = new Label(this.intro);
+        introLbl.wrap = true;
+        root.With(introLbl);
+
+        hintLbl = new Label(this.hint);
+        hintLbl.wrap = true;
+        hintLbl.Class = "secondary small";
+        root.With(hintLbl);
+
+        countLbl = new Label(this.CountText());
+        countLbl.Class = "secondary small";
+        fileProgressLbl = new Label(this.tFileProgress);
+        root.With(DownloadDialog.HeaderRow(fileProgressLbl, countLbl));
+        overall = new Progress(0, 2);
+        root.With(overall);
+
+        nameLbl = new Label(this.NameText());
+        nameLbl.Class = "secondary small";
+        downloadFileLbl = new Label(this.tDownloadFile);
+        root.With(DownloadDialog.HeaderRow(downloadFileLbl, nameLbl));
+        single = new Progress(0, 2);
+        root.With(single);
+
+        stageLbl = new Label(this.StatusText());
+        stageLbl.Class = "secondary small";
+        cancelBtn = new Button(this.tCancel);
+        cancelBtn.Class = "secondary";
+        cancelBtn.Click += DownloadDialog.OnCancel;
+        Panel foot = Panel.Row();
+        foot.Gap(8);
+        foot.With(stageLbl);
+        foot.Add(cancelBtn).DockRight();
+        root.With(foot);
+
+        this.SetRoot(root, null);
+    }
+
+    /// <summary>一行“标题 …… 右对齐的值”。</summary>
+    static Panel HeaderRow(Label title, Label value) {
+        Panel row = Panel.Row();
+        row.Gap(8);
+        row.With(title);
+        row.Add(value).DockRight();
+        return row;
+    }
+
+    override string Title() { return this.caption; }
+    override int Width() { return 460; }
+    override int Height() { return 280; }
+    override bool ShowMaximize() { return false; }
+    override int IdBase() { return 880000; }
+
+    /// <summary>关窗不取消任务：worker 线程照旧把更新装完（标题下那句
+    /// 提示承诺的正是这一点）。要真的停下来请按取消。</summary>
+    override void OnCloseRequested() {
+        if (DownloadDialog.current == this) { DownloadDialog.current = null; }
+    }
+
+    /// <summary>取消按钮：请求任务在下一个块边界收工。已下载的部分留在
+    /// 磁盘上，下次进来从断点续传。</summary>
+    static void OnCancel() {
+        DownloadDialog d = DownloadDialog.current;
+        if (d == null) { return; }
+        if (d.job != null && d.job.Running()) {
+            d.job.Cancel();
+            return;
+        }
+        d.Close();
+    }
+
+    /// <summary>每帧把任务状态搬到控件上，并在任务还在跑时武装下一次
+    /// 限速重绘。</summary>
+    override void AfterFrame() {
+        if (this.job == null) { return; }
+        this.job.Poll();
+        this.overall.SetPercent(this.job.TotalPercent());
+        this.single.SetPercent(this.job.ItemPercent());
+        this.countLbl.Text = this.CountText();
+        this.nameLbl.Text = this.NameText();
+        this.stageLbl.Text = this.StatusText();
+        if (this.job.Running()) {
+            this.cancelBtn.Text = this.tCancel;
+            App h = this.Host();
+            if (h != null) { h.RequestAnimationFrame(200); }
+        } else {
+            this.cancelBtn.Text = this.tClose;
+        }
+    }
+
+    /// <summary>"1/2 个文件"。</summary>
+    string CountText() {
+        if (this.job == null) { return ""; }
+        return Convert.ToString(this.job.DoneCount()) + "/"
+            + Convert.ToString(this.job.Count()) + " " + this.tFilesUnit;
+    }
+
+    /// <summary>当前文件名 + 已收/总量。</summary>
+    string NameText() {
+        if (this.job == null) { return ""; }
+        string s = this.job.Current();
+        if (this.job.Total() > 0) {
+            s = s + "   " + DownloadJob.Human(this.job.Got()) + " / "
+                + DownloadJob.Human(this.job.Total());
+        }
+        return s;
+    }
+
+    /// <summary>阶段一行：失败时显示原因。</summary>
+    string StatusText() {
+        if (this.job == null) { return ""; }
+        int st = this.job.Stage();
+        if (st == DownloadStage.Failed) { return this.job.Error(); }
+        return DownloadStage.Text(st);
+    }
+
+    /// <summary>任务已经收工（成功、失败或取消）。</summary>
+    bool Finished() {
+        if (this.job == null) { return true; }
+        return !this.job.Running();
+    }
+}

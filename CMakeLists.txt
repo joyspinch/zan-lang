@@ -54,6 +54,15 @@ file(WRITE "${ZAN_DEFAULT_ICON_H}"
 # ---- Find LLVM ----
 find_package(LLVM REQUIRED CONFIG)
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+# irgen emits IR for opaque pointers; typed-pointer LLVM (<= 14) rejects nearly
+# every generic/closure/field store in the verifier, so fail loudly at configure
+# time instead of at the first compile.
+if(LLVM_PACKAGE_VERSION VERSION_LESS 15.0)
+    message(FATAL_ERROR
+        "LLVM ${LLVM_PACKAGE_VERSION} is too old: zanc requires LLVM >= 15 "
+        "(opaque pointers). Point -DLLVM_DIR at a newer LLVM, e.g. "
+        "-DLLVM_DIR=/usr/lib/llvm-15/cmake -- see docs/BUILD_TOOLCHAIN.md.")
+endif()
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
 # Cross-compile backends beyond x86/aarch64 are optional: not every LLVM
