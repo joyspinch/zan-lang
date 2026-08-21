@@ -236,17 +236,25 @@ class CefRuntime {
     /// 过期的半截文件上）。</summary>
     static async bool FetchIndexAsync(string destPath) {
         Directory.CreateDirectoryRecursive(CefRuntime.ParentDir(destPath));
-        if (File.Exists(destPath)) { File.Delete(destPath); }
         HttpClient client = HttpClient.CreateHttps(CefRuntime.IndexHost(), 443);
         client.SetTimeout(60000);
-        long n = await client.DownloadBinaryToFileAsync(CefRuntime.IndexPath(),
-            destPath, destPath + ".progress");
-        if (n <= 0) {
-            CefRuntime.Fail("下载 CEF 构建索引失败：" + CefRuntime.IndexHost()
-                + CefRuntime.IndexPath());
-            return false;
+        long n = 0;
+        // 索引是 10 MB 量级的单次传输，一次连接抖动就够让整个自举失败，
+        // 而用户看到的只是「下载索引失败」；重试一次，并把传输返回值带进
+        // 错误里（-1=连接/握手/响应不完整）。
+        for (int attempt = 0; attempt < 2; attempt = attempt + 1) {
+            if (File.Exists(destPath)) { File.Delete(destPath); }
+            n = await client.DownloadBinaryToFileAsync(CefRuntime.IndexPath(),
+                destPath, destPath + ".progress");
+            if (n > 0) {
+                File.Delete(destPath + ".progress");
+                return true;
+            }
         }
-        return true;
+        CefRuntime.Fail("下载 CEF 构建索引失败（传输返回 "
+            + Convert.ToString(n) + "，检查网络与代理）：https://"
+            + CefRuntime.IndexHost() + CefRuntime.IndexPath());
+        return false;
     }
 
     /// <summary>从索引文本里挑出该平台上符合前缀的最新 stable 归档。
