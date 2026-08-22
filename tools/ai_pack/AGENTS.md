@@ -14,6 +14,36 @@ is.
 
 Not connected? See `docs/AI_ONBOARDING.md` — connecting takes one config file.
 
+## 0a. Read once, precisely, then edit
+
+The expensive habit is not writing the wrong code, it is reading the same code
+four times. A tool result stays true until you change it, so treat every read as
+permanent knowledge:
+
+1. `search_text("Foo.Bar")` → `path:line`. Do not open files to look for it.
+2. `read_file(path, from_line, max_lines)` → one numbered window around that
+   line, wide enough to edit from (say ±40 lines). Not the whole file.
+3. `edit_file(path, old, new)` → the *entire* change in one call per site. Not
+   one line, re-read, next line.
+4. Compile. Only now read again, and only what a diagnostic points at.
+
+Do not re-read a range you already have, do not re-run a search you already ran,
+and never read a file just so you can `write_file` it back — `edit_file` needs
+only the snippet. If the file is open in the user's editor, its contents are
+already in the conversation; use them. `write_file` is for creating a file or
+replacing it wholesale, nothing else.
+
+`edit_file` refuses a fuzzy edit instead of guessing: `old` must occur exactly
+once (extend it with neighbouring lines until it does, or pass `all=true` on
+purpose). A refusal means your snippet does not match the file byte for byte —
+re-read that one window rather than switching to a whole-file rewrite.
+
+## 0b. Skills: list, then read the one that fits
+
+`skills_list()` returns names and one-line summaries only; `skill_read(name)`
+returns a body. Read the body of the skill you are about to use, not all of
+them — and not again later in the same session.
+
 ## 1. Never guess an API
 
 Zan is not C#, and looking similar is exactly the trap. Before you write a call

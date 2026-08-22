@@ -1,6 +1,6 @@
 ---
 name: zan-mcp
-description: How to drive the Zan SDK through its MCP server (stdio or HTTP) — the tool catalog, what each tool answers, the resources, the safety flags, and how to reach zan-lsp / zan-dap directly. Use it when connecting an AI client to Zan or when an MCP call misbehaves.
+description: How to drive the Zan SDK through its MCP server (stdio or hosted HTTP) — the tool catalog, reading and editing without re-reading, skills over MCP, the safety flags, deploying one shared server, and how to reach zan-lsp / zan-dap directly. Use it when connecting an AI client to Zan or when an MCP call misbehaves.
 ---
 
 # Using the Zan MCP server
@@ -31,6 +31,11 @@ reason: pass `--token-env` (the client then sends
 `Authorization: Bearer <token>`) and never write the token into a file you
 commit.
 
+Hosted, one server for every project and client: `scripts\serve-mcp.ps1` /
+`scripts\serve-mcp.sh` in the SDK wrap the flags that matter
+(`--frozen-tools`, `--token-env`, optionally `--read-only` / `--no-exec`) —
+see `docs\MCP_HOSTING.md`.
+
 ## Handshake
 
 ```json
@@ -54,9 +59,44 @@ Ask-the-toolchain tools (use these before file tools):
 | `zan_compile` | `{content, filename?}` → compiles that snippet in an isolated directory and returns `{ok, exitCode, diagnostics[], raw}` with file/line/column. The cheapest way to settle a language question. |
 | `zan_build_project` | `{entry?}` (defaults to `src/App.zan` / `src/main.zan`) → builds the workspace project, same structured diagnostics. |
 
-Workspace tools: `list_dir`, `read_file` (`encoding=base64` for binary),
-`write_file`, `mkdir`, `delete_path`, `move_path`, `copy_path`, `stat_path`,
-`find_files`, `search_text`, `run_command`, `health_check`.
+Workspace tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `mkdir`,
+`delete_path`, `move_path`, `copy_path`, `stat_path`, `find_files`,
+`search_text`, `run_command`, `health_check`, `skills_list`, `skill_read`.
+
+### Reading and editing without reading twice
+
+`read_file` has two modes, and for source code you want the first:
+
+| Call | Returns |
+|---|---|
+| `{path, from_line, max_lines}` | that line window, `412\| code` numbered, plus `lines`, `to_line`, `truncated`. Default `max_lines` 120, `numbered` off with `numbered:false`. |
+| `{path, offset, limit}` | raw bytes from an offset; `encoding=base64` for binaries. |
+| `{path}` | the whole file, up to the server's `maxReadBytes`. The expensive one. |
+
+So: `search_text` for the line, `read_file` for that window, `edit_file` for the
+change, compile. The numbers in the window are there so you can quote
+`path:line` later instead of reading it again.
+
+`edit_file` takes `{path, old, new, all?}` and replaces an exact snippet in
+place, so a three-line fix costs three lines of payload instead of the file
+twice. It refuses rather than guesses:
+
+* `old` missing from the file → your copy is not byte-exact (whitespace,
+  indentation). Re-read that window; do not fall back to `write_file`.
+* `old` found more than once → extend it with the surrounding lines until it is
+  unique, or pass `all=true` if replacing every occurrence is what you mean.
+* Success returns `{replacements, line, bytes}` — the line is where it landed,
+  no verification read needed.
+
+`write_file` stays the right tool for a new file or a wholesale replacement.
+
+### Skills over MCP
+
+`skills_list` returns each skill's `name`, `summary`, `bytes` and `scope`
+(`project` = `.agents/skills` in the workspace, `installed` = shipped with the
+SDK or given by `--skills`) — never the bodies. `skill_read({name, file?})`
+returns one body, `SKILL.md` by default, or another file inside that skill's
+directory. Read the one that matches the task at hand, once.
 
 Resources (whole-project context without walking directories): `repo://map`,
 `repo://symbols`, `repo://routes` — the `tools/repomap` output under `.zanmap/`.
@@ -67,11 +107,18 @@ Refresh them after you add or move files.
 * Paths are relative to the workspace root. Absolute paths, drive letters and
   `..` segments are rejected — this is not negotiable, so do not try to reach
   outside; ask for the file to be added to the workspace instead.
-* `--read-only` fails every mutating tool; `--no-exec` removes `run_command`.
-  If a call is refused for one of these, say so instead of working around it.
+* `--read-only` fails every mutating tool (`write_file`, `edit_file`, …);
+  `--no-exec` removes `run_command`. If a call is refused for one of these, say
+  so instead of working around it.
 * An optional `zan_*` tool is absent when its backing file is: `knowledge\symbols.json`
   (api search), `knowledge\gallery.json` (examples), `toolchain\zanc.exe`
   (compile/build). Check `available` from `zan_start_here` before blaming the call.
+* `--frozen-tools` (what a hosted server runs) advertises the full catalog
+  whatever this workspace happens to have, so `tools/list` — and with it the
+  cached prefix of your prompt — is identical for every project. A tool that is
+  advertised but unbacked still answers with a plain `error:` explaining what is
+  missing, so `available` from `zan_start_here` remains the thing to check
+  before calling an optional tool, not the catalog.
 
 ## Semantic navigation and debugging are separate services
 

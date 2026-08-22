@@ -93,9 +93,14 @@ the executable out of the SDK.
 3. **`zan_example {topic: "server-mvc"}`** — the files of a shipped, build-verified
    program (no topic = catalog: GUI designer windows, games, console, HTTP and
    MVC servers, IoT, DLL libraries).
-4. **`read_file` / `search_text` / `find_files`** — only the part of the project
-   that matters.
-5. **`write_file`** — the edit.
+4. **`search_text` / `find_files`** → `path:line`, then **`read_file {path,
+   from_line, max_lines}`** → that numbered window. One window, not the file,
+   and not the same window twice: a tool result stays true until it is changed.
+5. **`edit_file {path, old, new}`** — the edit, in place, whole change in one
+   call. `old` must match byte for byte and occur once, or the call refuses
+   instead of guessing. `write_file` is for a new file or a full replacement.
+   Task-specific procedure needed? **`skills_list`** → names and summaries,
+   **`skill_read {name}`** → the body of the one that fits.
 6. **`zan_build_project {entry?}`** (defaults to `src/App.zan` / `src/main.zan`),
    or **`zan_compile {content, filename?}`** for a snippet compiled in an
    isolated directory — both return `{ok, exitCode, diagnostics[], raw}` with
@@ -115,7 +120,14 @@ zan-mcp.exe --stdio . --read-only            # refuse every mutating tool
 zan-mcp.exe --stdio . --no-exec              # keep files, drop run_command
 zan-mcp.exe . --port 18848                   # HTTP transport instead of stdio
 zan-mcp.exe . --host 0.0.0.0 --token-env ZAN_MCP_TOKEN   # reachable, authenticated
+zan-mcp.exe . --frozen-tools                 # same tool catalog for every workspace
+zan-mcp.exe . --skills <dir>                 # skills served by skills_list/skill_read
 ```
+
+One shared HTTP deployment for every project and client — `scripts\serve-mcp.ps1`
+or `scripts/serve-mcp.sh`, details in `docs\MCP_HOSTING.md`. `--frozen-tools`
+belongs there: a catalog that does not shift per workspace is what keeps the
+client's cached prompt prefix valid.
 
 Give `--read-only` to a tool you do not want writing to disk, and always pair a
 non-loopback `--host` with a token (`--token-env` keeps it out of the process

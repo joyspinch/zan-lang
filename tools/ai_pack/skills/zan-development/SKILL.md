@@ -14,10 +14,14 @@ No MCP: read `AGENTS.md` and `docs/AI_ONBOARDING.md` at the SDK root.
 ## 1. Locate before you read
 
 * `search_text(query)` for a symbol or string; `find_files(pattern)` for a name.
-* `read_file(path, offset, limit)` — read the region you need, not the file.
+  Both answer with `path:line`, which is the address you edit at.
+* `read_file(path, from_line, max_lines)` — the numbered window around that
+  line, not the file. (`offset`/`limit` reads bytes, for binaries.)
 
 Reading a whole tree "to understand the project" is what `zan_start_here` and
-the symbol index exist to replace.
+the symbol index exist to replace — and reading the same window twice is worse
+still: a tool result stays true until you change it, so use the one you have
+instead of asking again.
 
 ## 2. Look up every API you are about to call
 
@@ -49,8 +53,15 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
 
 ## 4. Edit
 
-`write_file(path, content)` (MCP) or your editor. Match the surrounding style;
-prefer extending an existing class over adding a parallel one.
+`edit_file(path, old, new)` (MCP) replaces an exact snippet in place — the
+default, because it needs the snippet and not the file. `old` must occur once,
+so extend it with neighbouring lines until it is unique; the call refuses a
+fuzzy match rather than guessing. `write_file(path, content)` is for a new file
+or a wholesale replacement.
+
+Make the whole change in one call per site — edit, re-read, edit the next line
+is how a five-minute fix becomes twenty. Match the surrounding style; prefer
+extending an existing class over adding a parallel one.
 
 ## 5. Compile — every time, before any claim
 

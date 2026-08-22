@@ -26,9 +26,9 @@ using System.Threading;
 ///                     GET  /health              liveness/metadata
 ///
 /// Generic tools (always available):
-///   zan_start_here, health_check, list_dir, read_file, write_file, mkdir,
-///   delete_path, move_path, copy_path, stat_path, find_files, search_text,
-///   run_command
+///   zan_start_here, health_check, list_dir, read_file, write_file, edit_file,
+///   mkdir, delete_path, move_path, copy_path, stat_path, find_files,
+///   search_text, run_command, skills_list, skill_read
 ///
 /// zan_start_here is the zero-discovery entry point: one call reports the
 /// project layout, the build/test commands, the coding rules and the rest of
@@ -43,6 +43,16 @@ using System.Threading;
 ///   mcp_server [workspace-dir] [options]
 ///     --stdio            serve JSON-RPC on stdin/stdout instead of HTTP
 ///     --host <addr>      bind address (default 127.0.0.1; 0.0.0.0 to publish)
+///     --skills <dir>     directory of skills (<name>/SKILL.md) served by
+///                        skills_list / skill_read, on top of the workspace's
+///                        own .agents\skills
+///     --frozen-tools     always advertise the whole catalog, even the tools
+///                        this deployment cannot back. A hosted server shared
+///                        by many projects wants this: tools/list becomes
+///                        byte-identical everywhere, so the client's prompt
+///                        prefix stays cacheable instead of changing per
+///                        workspace. Calls to a missing tool answer with the
+///                        reason.
 ///     --port <n>         TCP port (default 18848)
 ///     --token <secret>   require "Authorization: Bearer <secret>"
 ///     --token-env <VAR>  read the token from an environment variable instead,
@@ -68,7 +78,8 @@ using System.Threading;
 ///     for this installation. Existing files are kept unless --force is given.
 ///     project-dir defaults to the current directory.
 ///
-/// Environment fallbacks: MCP_HOST, MCP_PORT, MCP_TOKEN, MCP_ROOT.
+/// Environment fallbacks: MCP_HOST, MCP_PORT, MCP_TOKEN, MCP_ROOT,
+/// MCP_SKILLS, MCP_FROZEN_TOOLS.
 ///
 /// SECURITY: every path is resolved against the workspace root and rejected if
 /// it escapes it (absolute paths, drive letters and `..` segments). A token is
@@ -99,6 +110,11 @@ class McpServer {
     static string stdlibPath;
     /// SDK installation root (holds stdlib\, toolchain\, knowledge\, ai\).
     static string sdkRoot;
+    /// Skills shipped with the installation (<dir>/<name>/SKILL.md). The
+    /// workspace's own .agents/skills is served alongside it.
+    static string skillsDir;
+    /// Advertise the full catalog regardless of what is installed here.
+    static bool frozenTools;
     static string workRoot;
     static int compileSeq;
 
@@ -172,6 +188,8 @@ class McpServer {
         McpServer.parseError = "";
         McpServer.stdio = false;
         McpServer.sdkRoot = "";
+        McpServer.skillsDir = McpServer.Env("MCP_SKILLS", "");
+        McpServer.frozenTools = McpServer.Env("MCP_FROZEN_TOOLS", "") != "";
         bool initAgent = false;
         string initTarget = "";
         bool force = false;
@@ -214,6 +232,12 @@ class McpServer {
             }
             if (a == "--stdlib" && hasNext) {
                 McpServer.stdlibPath = Environment.ArgAt(i + 1); i = i + 2; continue;
+            }
+            if (a == "--skills" && hasNext) {
+                McpServer.skillsDir = Environment.ArgAt(i + 1); i = i + 2; continue;
+            }
+            if (a == "--frozen-tools") {
+                McpServer.frozenTools = true; i = i + 1; continue;
             }
             if (a == "--sdk-root" && hasNext) {
                 McpServer.sdkRoot = Environment.ArgAt(i + 1); i = i + 2; continue;
@@ -295,6 +319,16 @@ class McpServer {
                 McpServer.stdlibPath = McpServer.root + "/stdlib";
             }
         }
+        if (McpServer.skillsDir == "") {
+            McpServer.skillsDir = sdk + "/ai/skills";
+            if (!Directory.Exists(McpServer.skillsDir)) {
+                McpServer.skillsDir = sdk + "/tools/ai_pack/skills";
+            }
+            if (!Directory.Exists(McpServer.skillsDir)) {
+                McpServer.skillsDir = exeDir + "/ai/skills";
+            }
+        }
+        McpServer.skillsDir = McpServer.TrimTrailingSep(McpServer.skillsDir);
         McpServer.indexPath = McpServer.knowledge + "/symbols.json";
         McpServer.galleryPath = McpServer.knowledge + "/gallery.json";
         McpServer.workRoot = McpServer.root + "/_scratch/mcp_compile";
@@ -735,17 +769,44 @@ class McpServer {
         if (req.method == "POST" && p == "/api/copy") {
             return McpServer.RestSimple(req, "copy");
         }
+        // Clients differ on the trailing slash, and a 404 there looks like a
+        // wrong URL to the user.
+        if (p == "/mcp/" || p == "/rpc/") {
+            p = p.Substring(0, p.Length - 1);
+        }
         if (req.method == "POST" && (p == "/" || p == "/mcp" || p == "/rpc")) {
             return await McpServer.Rpc(req.body);
         }
-        if (req.method == "GET" && (p == "/" || p == "/mcp")) {
-            // Discovery: a GET on the JSON-RPC endpoint describes the service
+        if (req.method == "DELETE" && (p == "/" || p == "/mcp" || p == "/rpc")) {
+            // Streamable HTTP session teardown. This server keeps no session
+            // state, so acknowledging is the whole implementation.
+            return McpServer.Cors(HttpResponse.WithStatus(204, "No Content", ""));
+        }
+        if (req.method == "GET" && (p == "/" || p == "/mcp" || p == "/rpc")) {
+            // A Streamable HTTP client opens GET <endpoint> with
+            // Accept: text/event-stream to receive server-initiated messages.
+            // We have none, and the spec's answer for that is 405 -- replying
+            // with a JSON body instead leaves the client waiting for an SSE
+            // stream that never comes.
+            if (McpServer.WantsSse(req)) {
+                HttpResponse r = HttpResponse.WithStatus(405,
+                    "Method Not Allowed", "");
+                r = r.SetHeader("Allow", "POST, DELETE, OPTIONS");
+                return McpServer.Cors(r);
+            }
+            // Discovery in a browser or with curl: describe the service
             // instead of returning an opaque error.
             return McpServer.Ok(McpServer.HealthDoc());
         }
         return McpServer.Fail(404, "Not Found", "no such endpoint",
             "POST / for JSON-RPC, GET /health, GET|POST /api/file,"
             + " GET /api/files, POST /api/mkdir|delete|move|copy");
+    }
+
+    static bool WantsSse(HttpRequest req) {
+        string a = req.GetHeader("Accept");
+        if (a == "") { a = req.GetHeader("accept"); }
+        return McpServer.Find(a.ToLower(), "text/event-stream") >= 0;
     }
 
     /// Constant-time-ish bearer check against the Authorization header only.
@@ -773,7 +834,8 @@ class McpServer {
         r = r.SetHeader("Access-Control-Allow-Origin", "*");
         r = r.SetHeader("Access-Control-Allow-Headers",
             "Authorization, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version");
-        r = r.SetHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        r = r.SetHeader("Access-Control-Allow-Methods",
+            "GET, POST, DELETE, OPTIONS");
         return r;
     }
 
@@ -804,6 +866,9 @@ class McpServer {
         o.Put("exec", JsonValue.NewBool(McpServer.CanExec()));
         o.Put("maxReadBytes", JsonValue.NewNum(Convert.ToString(McpServer.maxRead)));
         o.Put("zanTools", JsonValue.NewBool(McpServer.ZanToolsAvailable()));
+        o.Put("frozenTools", JsonValue.NewBool(McpServer.frozenTools));
+        o.Put("skillRoots", JsonValue.NewNum(
+            Convert.ToString(McpServer.SkillRoots().Count)));
         o.Put("platform", JsonValue.NewStr(McpServer.Platform()));
         return o;
     }
@@ -1176,6 +1241,10 @@ class McpServer {
         }
         if (name == "health_check") { return McpServer.HealthDoc().ToJson(); }
         if (name == "run_command") { return await McpServer.RunCommand(args); }
+        if (name == "skills_list") { return McpServer.SkillsList(); }
+        if (name == "skill_read" || name == "skill_get") {
+            return McpServer.SkillRead(args);
+        }
 
         // zan_* tools stay optional so the server is useful on any directory.
         if (name == "zan_api_search") {
@@ -1258,6 +1327,16 @@ class McpServer {
             o.Put("path", JsonValue.NewStr(rel));
             o.Put("bytes", JsonValue.NewNum(Convert.ToString(data.Length)));
             return o.ToJson();
+        }
+        if (name == "edit_file") {
+            if (!McpServer.Mutable()) { return McpServer.ReadOnlyMsg(); }
+            string full = McpServer.Resolve(rel);
+            if (full == "") { return McpServer.OutsideMsg(rel); }
+            if (!File.Exists(full)) {
+                return "error: file not found: " + rel
+                    + "; use write_file to create it";
+            }
+            return McpServer.EditFile(rel, full, args);
         }
         if (name == "mkdir") {
             if (!McpServer.Mutable()) { return McpServer.ReadOnlyMsg(); }
@@ -1375,6 +1454,12 @@ class McpServer {
     /// files are base64 so the JSON stays valid UTF-8 -- returning raw bytes
     /// is what made clients fail with "'utf-8' codec can't decode byte".
     static string ReadDoc(string rel, string full, JsonValue args) {
+        // A model looking at a grep hit wants "line 412 and its
+        // neighbourhood", not a byte offset it has to guess -- and guessing is
+        // what makes it read the whole file and then read it again.
+        if (args.Int("from_line", 0) > 0) {
+            return McpServer.ReadLinesDoc(rel, full, args);
+        }
         int offset = args.Int("offset", 0);
         int limit = args.Int("limit", 0);
         byte[] data = McpServer.ReadSlice(full, offset, limit);
@@ -1398,6 +1483,228 @@ class McpServer {
                 JsonValue.NewStr(Encoding.Base64EncodeBytes(data, n)));
         }
         return o.ToJson();
+    }
+
+    /// A line window: `from_line` (1-based) plus `max_lines` (default 120),
+    /// optionally numbered so the model can cite path:line and come back to
+    /// the same place without re-reading.
+    static string ReadLinesDoc(string rel, string full, JsonValue args) {
+        int from = args.Int("from_line", 1);
+        int want = args.Int("max_lines", 120);
+        if (from < 1) { from = 1; }
+        if (want <= 0) { want = 120; }
+        bool numbered = args.Bool("numbered", true);
+        List<string> lines = File.ReadAllLines(full);
+        int last = from + want - 1;
+        if (last > lines.Count) { last = lines.Count; }
+        StringBuilder sb = new StringBuilder();
+        int i = from;
+        while (i <= last) {
+            if (numbered) { sb.Append(Convert.ToString(i) + "| "); }
+            sb.Append(lines[i - 1] + "\n");
+            i = i + 1;
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("path", JsonValue.NewStr(rel));
+        o.Put("encoding", JsonValue.NewStr("text"));
+        o.Put("lines", JsonValue.NewNum(Convert.ToString(lines.Count)));
+        o.Put("from_line", JsonValue.NewNum(Convert.ToString(from)));
+        o.Put("to_line", JsonValue.NewNum(Convert.ToString(last)));
+        o.Put("numbered", JsonValue.NewBool(numbered));
+        o.Put("truncated", JsonValue.NewBool(last < lines.Count));
+        o.Put("content", JsonValue.NewStr(sb.ToString()));
+        return o.ToJson();
+    }
+
+    /// Replaces `old` with `new` in one file, in place. This is the cheap way
+    /// to change code: no whole-file rewrite to send, so the model does not
+    /// have to read the file in full first just to be able to write it back.
+    /// An ambiguous or absent match is refused rather than guessed.
+    static string EditFile(string rel, string full, JsonValue args) {
+        string oldText = args.Str("old", "");
+        string newText = args.Str("new", "");
+        if (oldText == "") {
+            return "error: 'old' is required and must not be empty;"
+                + " use write_file to create a file";
+        }
+        if (oldText == newText) {
+            return "error: 'old' and 'new' are identical; nothing to do";
+        }
+        string text = File.ReadAllText(full);
+        int hits = McpServer.CountOccurrences(text, oldText);
+        if (hits == 0) {
+            return "error: 'old' does not occur in " + rel
+                + "; read the exact text first (read_file with from_line)"
+                + " and copy it byte for byte, whitespace included";
+        }
+        bool all = args.Bool("all", false);
+        if (hits > 1 && !all) {
+            return "error: 'old' occurs " + Convert.ToString(hits) + " times in "
+                + rel + "; extend it with surrounding lines until it is unique,"
+                + " or pass all=true to replace every occurrence";
+        }
+        int at = McpServer.Find(text, oldText);
+        int line = McpServer.LineOf(text, at);
+        string outText = "";
+        if (all) { outText = McpServer.ReplaceAll(text, oldText, newText); }
+        else {
+            outText = text.Substring(0, at) + newText
+                + text.Substring(at + oldText.Length,
+                    text.Length - at - oldText.Length);
+        }
+        string why = McpServer.WriteFile(full, outText.ToBytes(), false);
+        if (why != "") { return "error: " + why; }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("ok", JsonValue.NewBool(true));
+        o.Put("path", JsonValue.NewStr(rel));
+        int done = 1;
+        if (all) { done = hits; }
+        o.Put("replacements", JsonValue.NewNum(Convert.ToString(done)));
+        o.Put("line", JsonValue.NewNum(Convert.ToString(line)));
+        o.Put("bytes", JsonValue.NewNum(Convert.ToString(outText.Length)));
+        return o.ToJson();
+    }
+
+    static int CountOccurrences(string hay, string needle) {
+        if (needle.Length == 0) { return 0; }
+        int n = 0;
+        int i = 0;
+        while (i + needle.Length <= hay.Length) {
+            int at = McpServer.Find(hay.Substring(i, hay.Length - i), needle);
+            if (at < 0) { break; }
+            n = n + 1;
+            i = i + at + needle.Length;
+        }
+        return n;
+    }
+
+    static string ReplaceAll(string hay, string needle, string with) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < hay.Length) {
+            int at = McpServer.Find(hay.Substring(i, hay.Length - i), needle);
+            if (at < 0) {
+                sb.Append(hay.Substring(i, hay.Length - i));
+                break;
+            }
+            sb.Append(hay.Substring(i, at));
+            sb.Append(with);
+            i = i + at + needle.Length;
+        }
+        return sb.ToString();
+    }
+
+    /// 1-based line number of byte offset `at`.
+    static int LineOf(string text, int at) {
+        int line = 1;
+        for (int i = 0; i < at && i < text.Length; i = i + 1) {
+            if ((text[i] & 255) == 10) { line = line + 1; }
+        }
+        return line;
+    }
+
+    // ---- skills -------------------------------------------------------------
+    // Progressive disclosure: skills_list is a cheap index (name + one line),
+    // skill_read pulls one body when the task actually calls for it. Sending
+    // every SKILL.md up front is what turns a 3k-token system prompt into a
+    // 30k one.
+
+    static List<string> SkillRoots() {
+        List<string> outs = new List<string>();
+        string ws = McpServer.root + "/.agents/skills";
+        if (Directory.Exists(ws)) { outs.Add(ws); }
+        if (McpServer.skillsDir != "" && Directory.Exists(McpServer.skillsDir)
+            && McpServer.skillsDir != ws) {
+            outs.Add(McpServer.skillsDir);
+        }
+        return outs;
+    }
+
+    static string SkillsList() {
+        JsonValue arr = JsonValue.NewArray();
+        List<string> roots = McpServer.SkillRoots();
+        for (int r = 0; r < roots.Count; r = r + 1) {
+            List<string> names = Directory.GetDirectories(roots[r]);
+            for (int i = 0; i < names.Count; i = i + 1) {
+                string md = roots[r] + "/" + names[i] + "/SKILL.md";
+                if (!File.Exists(md)) { continue; }
+                JsonValue o = JsonValue.NewObject();
+                o.Put("name", JsonValue.NewStr(names[i]));
+                o.Put("summary", JsonValue.NewStr(McpServer.SkillSummary(md)));
+                o.Put("bytes", JsonValue.NewNum(
+                    Convert.ToString(McpServer.SizeOf(md))));
+                string scope = "project";
+                if (r > 0 || roots[r] != McpServer.root + "/.agents/skills") {
+                    scope = "installed";
+                }
+                o.Put("scope", JsonValue.NewStr(scope));
+                arr.Append(o);
+            }
+        }
+        JsonValue res = JsonValue.NewObject();
+        res.Put("count", JsonValue.NewNum(Convert.ToString(arr.Count())));
+        res.Put("skills", arr);
+        res.Put("usage", JsonValue.NewStr(
+            "Read a skill only when its summary matches the task:"
+            + " skill_read(name). The bodies are deliberately not included"
+            + " here."));
+        if (arr.Count() == 0) {
+            res.Put("hint", JsonValue.NewStr(
+                "No skills found. They are <name>/SKILL.md directories under"
+                + " the workspace's .agents/skills, or under the server's"
+                + " --skills directory."));
+        }
+        return res.ToJson();
+    }
+
+    /// The skill's own one-line description: YAML front matter `description:`
+    /// when present, else the first line of prose.
+    static string SkillSummary(string md) {
+        List<string> lines = File.ReadAllLines(md);
+        int n = lines.Count;
+        if (n > 40) { n = 40; }
+        for (int i = 0; i < n; i = i + 1) {
+            string l = McpServer.Trim(lines[i]);
+            if (l.Length > 12 && l.Substring(0, 12) == "description:") {
+                return McpServer.Trim(l.Substring(12, l.Length - 12));
+            }
+        }
+        for (int i = 0; i < n; i = i + 1) {
+            string l = McpServer.Trim(lines[i]);
+            if (l == "" || l == "---") { continue; }
+            if ((l[0] & 255) == 35) { continue; }
+            if (l.Length > 200) { return l.Substring(0, 200); }
+            return l;
+        }
+        return "";
+    }
+
+    static string SkillRead(JsonValue args) {
+        string name = args.Str("name", "");
+        if (name == "") { return "error: 'name' is required; call skills_list"; }
+        if (McpServer.Find(name, "..") >= 0 || McpServer.Find(name, "/") >= 0
+            || McpServer.Find(name, "\\") >= 0) {
+            return "error: 'name' is a skill directory name, not a path";
+        }
+        string file = args.Str("file", "SKILL.md");
+        if (file == "") { file = "SKILL.md"; }
+        if (McpServer.Find(file, "..") >= 0 || McpServer.IsAbsolute(file)) {
+            return "error: 'file' must stay inside the skill directory";
+        }
+        List<string> roots = McpServer.SkillRoots();
+        for (int r = 0; r < roots.Count; r = r + 1) {
+            string full = roots[r] + "/" + name + "/" + file;
+            if (!File.Exists(full)) { continue; }
+            JsonValue o = JsonValue.NewObject();
+            o.Put("name", JsonValue.NewStr(name));
+            o.Put("file", JsonValue.NewStr(file));
+            o.Put("bytes", JsonValue.NewNum(
+                Convert.ToString(McpServer.SizeOf(full))));
+            o.Put("content", JsonValue.NewStr(File.ReadAllText(full)));
+            return o.ToJson();
+        }
+        return "error: skill not found: " + name + "/" + file
+            + "; call skills_list for the catalogue";
     }
 
     /// Reads at most `maxRead` bytes starting at `offset`, byte-exactly (NUL
@@ -1996,11 +2303,21 @@ class McpServer {
         arr.Append(t);
 
         t = McpServer.NewTool("read_file",
-            "Read a workspace file. Text is returned in 'content'; binary"
-            + " content (or encoding='base64') in 'content_base64', so the"
-            + " response is always valid UTF-8 JSON. Use offset/limit to page"
-            + " through large files.");
+            "Read a workspace file -- ideally ONE window of it. Pass"
+            + " from_line/max_lines (numbered output) to read just the"
+            + " neighbourhood of a search_text hit; that is the cheap read and"
+            + " it gives you the line numbers to cite and to edit by. Reading"
+            + " the whole file, or the same lines twice, buys nothing: what a"
+            + " tool result already told you in this conversation is still"
+            + " true unless you changed it. Text comes back in 'content',"
+            + " binary (or encoding='base64') in 'content_base64'.");
         McpServer.AddParam(t, "path", "string", "Workspace-relative file.", true);
+        McpServer.AddParam(t, "from_line", "integer",
+            "First line (1-based). Preferred over offset for source code.", false);
+        McpServer.AddParam(t, "max_lines", "integer",
+            "Lines to return (default 120).", false);
+        McpServer.AddParam(t, "numbered", "boolean",
+            "Prefix each line with its number (default true).", false);
         McpServer.AddParam(t, "offset", "integer", "First byte to read.", false);
         McpServer.AddParam(t, "limit", "integer", "Maximum bytes to read.", false);
         McpServer.AddParam(t, "encoding", "string",
@@ -2015,6 +2332,38 @@ class McpServer {
         McpServer.AddParam(t, "content", "string", "UTF-8 text to write.", false);
         McpServer.AddParam(t, "content_base64", "string", "Base64 bytes to write.", false);
         McpServer.AddParam(t, "append", "boolean", "Append instead of replacing.", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("edit_file",
+            "Change a file in place by replacing an exact snippet. This is the"
+            + " normal way to edit: you send only the lines that change, so"
+            + " there is no reason to read the whole file first. 'old' must"
+            + " match byte for byte (whitespace included) and must be unique"
+            + " unless all=true; an ambiguous match is refused, not guessed."
+            + " Make the whole change in one call rather than one line per"
+            + " call. Returns {ok,path,replacements,line}.");
+        McpServer.AddParam(t, "path", "string", "Workspace-relative file.", true);
+        McpServer.AddParam(t, "old", "string",
+            "Exact text to replace, with enough context to be unique.", true);
+        McpServer.AddParam(t, "new", "string",
+            "Replacement text ('' deletes).", true);
+        McpServer.AddParam(t, "all", "boolean",
+            "Replace every occurrence instead of requiring uniqueness.", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("skills_list",
+            "Catalogue of the skills available here: name, one-line summary,"
+            + " size. Bodies are NOT included -- call skill_read only for the"
+            + " one that matches the task (progressive disclosure keeps the"
+            + " prompt small and cacheable).");
+        arr.Append(t);
+
+        t = McpServer.NewTool("skill_read",
+            "Read one skill's instructions (SKILL.md by default, or another"
+            + " file inside that skill's directory).");
+        McpServer.AddParam(t, "name", "string", "Skill name from skills_list.", true);
+        McpServer.AddParam(t, "file", "string",
+            "File inside the skill directory (default SKILL.md).", false);
         arr.Append(t);
 
         t = McpServer.NewTool("mkdir", "Create a directory (recursively).");
@@ -2062,7 +2411,7 @@ class McpServer {
         McpServer.AddParam(t, "max_results", "integer", "Result cap (default 200).", false);
         arr.Append(t);
 
-        if (McpServer.CanExec()) {
+        if (McpServer.CanExec() || McpServer.frozenTools) {
             t = McpServer.NewTool("run_command",
                 "Run a shell command in the workspace and return"
                 + " {ok,exitCode,stdout} with stdout and stderr merged.");
@@ -2077,7 +2426,7 @@ class McpServer {
         // Zan-specific tools appear only when this server actually has the
         // toolchain/knowledge to back them, so a generic client is not offered
         // tools that would always fail.
-        if (File.Exists(McpServer.indexPath)) {
+        if (File.Exists(McpServer.indexPath) || McpServer.frozenTools) {
             t = McpServer.NewTool("zan_api_search",
                 "Search the Zan stdlib symbol index (name/kind/file/line/signature)."
                 + " Use it before writing Zan code instead of guessing signatures.");
@@ -2085,14 +2434,15 @@ class McpServer {
             McpServer.AddParam(t, "limit", "integer", "Result cap (default 40).", false);
             arr.Append(t);
         }
-        if (File.Exists(McpServer.galleryPath)) {
+        if (File.Exists(McpServer.galleryPath) || McpServer.frozenTools) {
             t = McpServer.NewTool("zan_example",
                 "Return a shipped, build-verified Zan template for a topic."
                 + " Call with no topic to list the catalog.");
             McpServer.AddParam(t, "topic", "string", "Catalog topic.", false);
             arr.Append(t);
         }
-        if (McpServer.ZanToolsAvailable() && McpServer.Mutable()) {
+        if ((McpServer.ZanToolsAvailable() && McpServer.Mutable())
+            || McpServer.frozenTools) {
             t = McpServer.NewTool("zan_compile",
                 "Compile one Zan snippet in an isolated directory; returns"
                 + " {ok,exitCode,diagnostics[],raw}.");
@@ -2191,6 +2541,13 @@ class McpServer {
             + " snippet, zan_build_project for the project. Read the"
             + " diagnostics array, which carries file, line, column and code."));
         rules.Append(JsonValue.NewStr(
+            "Read once, precisely, then edit. search_text for the line,"
+            + " read_file(path, from_line, max_lines) for that window,"
+            + " edit_file for the whole change in one call. Do not re-read a"
+            + " range you already have and do not read a file just to be able"
+            + " to write it back: a tool result stays true until you change"
+            + " it."));
+        rules.Append(JsonValue.NewStr(
             "Reuse what exists. Prefer an existing class, service or template"
             + " over a new interface with the same job."));
         rules.Append(JsonValue.NewStr(
@@ -2219,9 +2576,16 @@ class McpServer {
         how.Append(JsonValue.NewStr(
             "search_text / find_files - locate code in this workspace."));
         how.Append(JsonValue.NewStr(
-            "read_file(path, offset, limit) - read only the part you need."));
+            "read_file(path, from_line, max_lines) - one numbered window, not"
+            + " the whole file; offset/limit for bytes and binaries."));
         how.Append(JsonValue.NewStr(
-            "write_file(path, content) - create or overwrite a file."));
+            "edit_file(path, old, new) - replace an exact snippet in place;"
+            + " the default way to change code."));
+        how.Append(JsonValue.NewStr(
+            "write_file(path, content) - create a file or replace it whole."));
+        how.Append(JsonValue.NewStr(
+            "skills_list() then skill_read(name) - the project's own"
+            + " procedures; read a body only when its summary fits the task."));
         how.Append(JsonValue.NewStr(
             "zan_build_project(entry) / zan_compile(content) - compile and get"
             + " {ok, exitCode, diagnostics[], raw}."));
@@ -2264,7 +2628,7 @@ class McpServer {
         next.Append(JsonValue.NewStr(
             "2. look up every API you are about to use (zan_api_search,"
             + " zan_example)"));
-        next.Append(JsonValue.NewStr("3. edit (write_file)"));
+        next.Append(JsonValue.NewStr("3. edit (edit_file, one call per change)"));
         next.Append(JsonValue.NewStr(
             "4. compile (zan_build_project) and fix the diagnostics"));
         next.Append(JsonValue.NewStr(
