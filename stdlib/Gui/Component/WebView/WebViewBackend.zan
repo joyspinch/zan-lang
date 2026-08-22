@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 
 namespace Gui.Component.WebView;
 
@@ -114,11 +115,16 @@ class WebViewBackend {
         #elif MACOS
         // Cocoa 侧的分区裁剪（zan_gui_webview_set_clip）已写在
         // src/runtime/gui_runtime_mac.m 里，但交叉链接只能解析仓库里那份
-        // 已提交的 libzan_gui.dylib（由 Mac 上的 CI 构建）的导出表，
-        // 新符号要等下一次 drivers 工作流重建才存在；在那之前引用它
-        // 会让 --publish macos-* 直接链接失败。因此这里只用已导出的
-        // set_visible 做“全遮住就隐藏”的降级：弹层下的部分遮挡在
-        // mac 上暂时不裁（即本次改动前的行为）。
+        // 已提交的 libzan_gui.dylib（由 Mac 上的 CI 构建）的导出表，直接
+        // DllImport 会让还没重建 dylib 的 --publish macos-* 链接失败。所以
+        // 和下面那批桥接入口一样在运行时探测：有就真裁，没有就退回
+        // set_visible 的“全遮住才隐藏”。
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_setClip != 0) {
+            WvNameVoidFn f = (WvNameVoidFn)WebViewBackend.addr_setClip;
+            f(h, spec);
+            return;
+        }
         WebViewBackend.zan_gui_webview_set_visible(h, spec == "" ? 0 : 1);
         #endif
     }
@@ -318,4 +324,203 @@ class WebViewBackend {
         WebViewBackend.zan_gui_webview_clear_cookies(h);
         #endif
     }
+
+    // ------------------------------------------------ JS ↔ 原生（可选能力）
+    //
+    // 这些入口是后加的：交叉链接只能解析仓库里那份已提交的
+    // libzan_gui.dylib（由 Mac 上的 CI 构建）的导出表，直接 DllImport
+    // 新符号会让 --publish macos-* 链接失败。所以按 Interop.Symbol 的
+    // 既有用法在运行时探测——旧运行时上表现为「不支持」，而不是启动即崩。
+
+    #if MACOS
+    static nint guiMod = 0;
+    static bool guiTried = false;
+    static nint addr_addHandler = 0;
+    static nint addr_removeHandler = 0;
+    static nint addr_takeMessage = 0;
+    static nint addr_msgPending = 0;
+    static nint addr_msgDropped = 0;
+    static nint addr_addScript = 0;
+    static nint addr_addStyle = 0;
+    static nint addr_removeScripts = 0;
+    static nint addr_evalAsync = 0;
+    static nint addr_clearData = 0;
+    static nint addr_setClip = 0;
+
+    /// 解析 zan_gui 里可选的 WKWebView 桥接入口。zan_gui 已被主程序加载，
+    /// dlopen 只是拿到同一个镜像的句柄：先按可执行文件同目录找（发布包把
+    /// dylib 放在 exe 旁边），再交给加载器按名字找。
+    static void ResolveBridge() {
+        if (WebViewBackend.guiTried) { return; }
+        WebViewBackend.guiTried = true;
+        string dir = ProcessHost.AppDir();
+        if (dir != "") {
+            WebViewBackend.guiMod = Interop.Load(dir + "/libzan_gui.dylib");
+        }
+        if (WebViewBackend.guiMod == 0) {
+            WebViewBackend.guiMod = Interop.Load("libzan_gui.dylib");
+        }
+        nint m = WebViewBackend.guiMod;
+        if (m == 0) { return; }
+        WebViewBackend.addr_addHandler =
+            Interop.Symbol(m, "zan_gui_webview_add_handler");
+        WebViewBackend.addr_removeHandler =
+            Interop.Symbol(m, "zan_gui_webview_remove_handler");
+        WebViewBackend.addr_takeMessage =
+            Interop.Symbol(m, "zan_gui_webview_take_message");
+        WebViewBackend.addr_msgPending =
+            Interop.Symbol(m, "zan_gui_webview_msg_pending");
+        WebViewBackend.addr_msgDropped =
+            Interop.Symbol(m, "zan_gui_webview_msg_dropped");
+        WebViewBackend.addr_addScript =
+            Interop.Symbol(m, "zan_gui_webview_add_script");
+        WebViewBackend.addr_addStyle =
+            Interop.Symbol(m, "zan_gui_webview_add_style");
+        WebViewBackend.addr_removeScripts =
+            Interop.Symbol(m, "zan_gui_webview_remove_scripts");
+        WebViewBackend.addr_evalAsync =
+            Interop.Symbol(m, "zan_gui_webview_eval_async");
+        WebViewBackend.addr_clearData =
+            Interop.Symbol(m, "zan_gui_webview_clear_data");
+        WebViewBackend.addr_setClip =
+            Interop.Symbol(m, "zan_gui_webview_set_clip");
+    }
+    #endif
+
+    /// 当前平台/运行时是否支持 JS→原生 的消息桥。
+    static bool HasBridge() {
+        #if MACOS
+        WebViewBackend.ResolveBridge();
+        return WebViewBackend.addr_addHandler != 0
+            && WebViewBackend.addr_takeMessage != 0;
+        #else
+        return false;
+        #endif
+    }
+
+    /// 注册 window.webkit.messageHandlers.<name>；页面 postMessage 的内容
+    /// 随后用 TakeMessage 取。
+    static bool AddHandler(int h, string handlerName) {
+        #if MACOS
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_addHandler == 0) { return false; }
+        WvNameFn f = (WvNameFn)WebViewBackend.addr_addHandler;
+        return f(h, handlerName) != 0;
+        #else
+        return false;
+        #endif
+    }
+
+    static void RemoveHandler(int h, string handlerName) {
+        #if MACOS
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_removeHandler == 0) { return; }
+        WvNameVoidFn f = (WvNameVoidFn)WebViewBackend.addr_removeHandler;
+        f(h, handlerName);
+        #endif
+    }
+
+    /// 队列里最早的一条消息，格式 "<handler>\t<body>"；空队列为 ""。
+    static string TakeMessage(int h) {
+        #if MACOS
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_takeMessage == 0) { return ""; }
+        WvStrIntFn f = (WvStrIntFn)WebViewBackend.addr_takeMessage;
+        return f(h);
+        #else
+        return "";
+        #endif
+    }
+
+    static int PendingMessages(int h) {
+        #if MACOS
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_msgPending == 0) { return 0; }
+        WvIntIntFn f = (WvIntIntFn)WebViewBackend.addr_msgPending;
+        return f(h);
+        #else
+        return 0;
+        #endif
+    }
+
+    /// 因队列满而被丢掉的消息数（宿主没及时取走）。
+    static int DroppedMessages(int h) {
+        #if MACOS
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_msgDropped == 0) { return 0; }
+        WvIntIntFn f = (WvIntIntFn)WebViewBackend.addr_msgDropped;
+        return f(h);
+        #else
+        return 0;
+        #endif
+    }
+
+    /// 每次导航都注入的脚本：atEnd=true 在文档解析完后跑，否则最先跑。
+    static bool AddScript(int h, string js, bool atEnd) {
+        #if MACOS
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_addScript == 0) { return false; }
+        WvScriptFn f = (WvScriptFn)WebViewBackend.addr_addScript;
+        int at = 0;
+        if (atEnd) { at = 1; }
+        return f(h, js, at) != 0;
+        #else
+        return false;
+        #endif
+    }
+
+    static bool AddStyle(int h, string css) {
+        #if MACOS
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_addStyle == 0) { return false; }
+        WvNameFn f = (WvNameFn)WebViewBackend.addr_addStyle;
+        return f(h, css) != 0;
+        #else
+        return false;
+        #endif
+    }
+
+    static void RemoveScripts(int h) {
+        #if MACOS
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_removeScripts == 0) { return; }
+        WvVoidIntFn f = (WvVoidIntFn)WebViewBackend.addr_removeScripts;
+        f(h);
+        #endif
+    }
+
+    /// 不等结果的 Native→JS 调用（Eval 会自旋 runloop 等返回值）；
+    /// 运行时没有这个入口时退回同步 Eval。
+    static void EvalAsync(int h, string js) {
+        #if MACOS
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_evalAsync != 0) {
+            WvNameVoidFn f = (WvNameVoidFn)WebViewBackend.addr_evalAsync;
+            f(h, js);
+            return;
+        }
+        #endif
+        string ignored = WebViewBackend.Eval(h, js);
+    }
+
+    /// 清掉该视图数据仓的全部网站数据（Cookie、缓存、localStorage…）；
+    /// 运行时不支持时退化为只清 Cookie。
+    static void ClearData(int h) {
+        #if MACOS
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_clearData != 0) {
+            WvVoidIntFn f = (WvVoidIntFn)WebViewBackend.addr_clearData;
+            f(h);
+            return;
+        }
+        #endif
+        WebViewBackend.ClearCookies(h);
+    }
 }
+
+delegate int WvNameFn(int h, string name);
+delegate void WvNameVoidFn(int h, string name);
+delegate string WvStrIntFn(int h);
+delegate int WvIntIntFn(int h);
+delegate void WvVoidIntFn(int h);
+delegate int WvScriptFn(int h, string js, int atEnd);

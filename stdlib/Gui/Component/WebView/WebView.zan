@@ -40,6 +40,12 @@ class WebView {
     string lastSeenTitle;
     bool lastSeenLoading;
 
+    // 原生视图创建前登记的桥接内容，创建时补上（宿主通常在构造后、
+    // 第一帧之前就注册 handler / 注入脚本）。
+    List<string> pendingHandlers;
+    List<string> pendingScripts;   // 每项 "0"/"1" + js，前缀是注入时机
+    List<string> pendingStyles;
+
     SignalString url;
     SignalString title;
 
@@ -72,6 +78,9 @@ class WebView {
         this.lastSeenRequest = "";
         this.lastSeenTitle = "";
         this.lastSeenLoading = false;
+        this.pendingHandlers = new List<string>();
+        this.pendingScripts = new List<string>();
+        this.pendingStyles = new List<string>();
         this.url = new SignalString("");
         this.title = new SignalString("");
         this.NavComplete = new UiEvent();
@@ -99,6 +108,20 @@ class WebView {
             return;
         }
         supported = true;
+        for (int i = 0; i < pendingHandlers.Count; i = i + 1) {
+            WebViewBackend.AddHandler(handle, pendingHandlers[i]);
+        }
+        pendingHandlers = new List<string>();
+        for (int i = 0; i < pendingScripts.Count; i = i + 1) {
+            string spec = pendingScripts[i];
+            WebViewBackend.AddScript(handle, spec.Substring(1, spec.Length - 1),
+                                     spec[0] == '1');
+        }
+        pendingScripts = new List<string>();
+        for (int i = 0; i < pendingStyles.Count; i = i + 1) {
+            WebViewBackend.AddStyle(handle, pendingStyles[i]);
+        }
+        pendingStyles = new List<string>();
         if (pendingUrl != "") {
             WebViewBackend.Navigate(handle, pendingUrl);
             pendingUrl = "";
@@ -177,6 +200,87 @@ class WebView {
         return WebViewBackend.Eval(handle, js);
     }
 
+    // ---- JS ↔ 原生 -------------------------------------------------------
+
+    /// 这个运行时上能不能收页面发来的消息（macOS 的 WKScriptMessageHandler；
+    /// 其他后端目前只有 Native→JS 的 <see cref="Eval"/>）。
+    bool SupportsMessages() { return WebViewBackend.HasBridge(); }
+
+    /// 让页面可以用
+    ///   window.webkit.messageHandlers.&lt;name&gt;.postMessage(x)
+    /// 给宿主发消息；消息按 <see cref="TakeMessage"/> 逐条取（和 CEF 那边的
+    /// CDP 队列同一套用法）。可在原生视图创建前调用。
+    void AddMessageHandler(string handlerName) {
+        if (handlerName == "") { return; }
+        if (!created || !supported || handle == 0) {
+            pendingHandlers.Add(handlerName);
+            return;
+        }
+        WebViewBackend.AddHandler(handle, handlerName);
+    }
+
+    void RemoveMessageHandler(string handlerName) {
+        if (supported && handle != 0) {
+            WebViewBackend.RemoveHandler(handle, handlerName);
+        }
+    }
+
+    /// 取走一条页面消息，格式 "&lt;handler&gt;\t&lt;body&gt;"（body 是字符串原文，
+    /// 其他类型的 postMessage 参数是 JSON）；空队列为 ""。
+    string TakeMessage() {
+        if (!supported || handle == 0) { return ""; }
+        return WebViewBackend.TakeMessage(handle);
+    }
+
+    /// 队列里待取的消息数。
+    int MessagePending() {
+        if (!supported || handle == 0) { return 0; }
+        return WebViewBackend.PendingMessages(handle);
+    }
+
+    /// 因为迟迟没被取走而丢掉的消息数（队列有界，防止跑飞的页面把内存
+    /// 吃光）。
+    int MessageDropped() {
+        if (!supported || handle == 0) { return 0; }
+        return WebViewBackend.DroppedMessages(handle);
+    }
+
+    /// 每次导航都注入的脚本：atDocumentEnd=true 在文档解析完后跑（能用
+    /// document/window），false 则在页面自己的脚本之前跑（适合装桥）。
+    void InjectScript(string js, bool atDocumentEnd) {
+        if (js == "") { return; }
+        if (!created || !supported || handle == 0) {
+            string tag = "0";
+            if (atDocumentEnd) { tag = "1"; }
+            pendingScripts.Add(tag + js);
+            return;
+        }
+        WebViewBackend.AddScript(handle, js, atDocumentEnd);
+    }
+
+    /// 每次导航都注入的 CSS。
+    void InjectStyle(string css) {
+        if (css == "") { return; }
+        if (!created || !supported || handle == 0) {
+            pendingStyles.Add(css);
+            return;
+        }
+        WebViewBackend.AddStyle(handle, css);
+    }
+
+    /// 撤掉此前注入的所有脚本/样式（下一次导航起生效）。
+    void ClearInjected() {
+        pendingScripts = new List<string>();
+        pendingStyles = new List<string>();
+        if (supported && handle != 0) { WebViewBackend.RemoveScripts(handle); }
+    }
+
+    /// Native→JS，但不等结果：<see cref="Eval"/> 要等返回值，会自旋事件
+    /// 循环，从绘制/事件回调里调不合适。
+    void EvalAsync(string js) {
+        if (supported && handle != 0) { WebViewBackend.EvalAsync(handle, js); }
+    }
+
     /// `url` 的 Cookie，序列化为 "name=value; name2=value2"（无则为 ""）。
     /// 传 "" 获取存储中的所有 Cookie。
     string GetCookies(string forUrl) {
@@ -192,6 +296,13 @@ class WebView {
     /// 清除共享存储中的所有 Cookie。
     void ClearCookies() {
         if (supported && handle != 0) { WebViewBackend.ClearCookies(handle); }
+    }
+
+    /// 清掉这个配置文件的全部网站数据：Cookie、缓存、localStorage、
+    /// IndexedDB…（“退出登录并忘记我”）。运行时只支持 Cookie 时退化为
+    /// <see cref="ClearCookies"/>。
+    void ClearBrowsingData() {
+        if (supported && handle != 0) { WebViewBackend.ClearData(handle); }
     }
 
     /// 隐藏原生视图（对不在屏幕上的标签/面板调用）。
