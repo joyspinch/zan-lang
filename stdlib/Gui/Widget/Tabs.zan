@@ -25,7 +25,7 @@ namespace Gui.Widget;
 ///
 ///   int now   = tabs.Active();
 ///   int added = tabs.TakeAdded();    // 本帧追加的索引，或 -1
-///   int shut  = tabs.TakeClosed();   // 本帧移除的索引，或 -1
+///   int shut  = tabs.TakeClosed();   // 移除的索引（一帧一个），或 -1
 ///
 /// 样式：Line（下划线）、Card（凸起标签）、Segment（胶囊组）。
 /// 方向：Horizontal（顶部条）或 Vertical（侧边轨道）。
@@ -69,6 +69,12 @@ class Tabs : Control {
     int changedIndex;
     int closedIndex;
     int addedIndex;
+    /// 还没被宿主领走的关闭索引，从大到小排队。批量关闭（关闭全部 /
+    /// 关闭其他）一次移除多个标签，而宿主每帧只 TakeClosed() 一次并按
+    /// 索引删自己的并行数组（页、浏览器…）：只报一个索引，宿主就少删
+    /// 几项，剩下的条目全部错位到别人的页上。倒序入队使每个上报的
+    /// 索引在宿主删到它之前始终指向自己那一项。
+    List<int> closedQueue;
 
     SignalBool menuOpen;
     int menuTab;
@@ -82,10 +88,10 @@ class Tabs : Control {
     UiEvent TabClosed;
     UiEvent TabAdded;
 
-    /// 内置上下文菜单标签的 UI 语言（0 = 英语，1 =
-    /// 1 = 简体中文). The host sets this 之前 rendering so the menu follows
-    /// 应用语言）。
-    static int lang;
+    /// 内置上下文菜单标签的 UI 语言（0 = 英语，1 = 简体中文）。宿主可在
+    /// 渲染前改它，让菜单跟随应用语言；默认简体中文，因为不设语言的
+    /// 发布版界面本身就是中文的，此时菜单不该是唯一说英语的地方。
+    static int lang = 1;
 
     static string TT(string en, string zh) {
         if (Tabs.lang == 1) { return zh; }
@@ -128,6 +134,7 @@ class Tabs : Control {
         this.changedIndex = 0 - 1;
         this.closedIndex = 0 - 1;
         this.addedIndex = 0 - 1;
+        this.closedQueue = new List<int>();
         this.menuOpen = new SignalBool(false);
         this.menuTab = 0;
         this.menuX = 0;
@@ -182,16 +189,6 @@ class Tabs : Control {
         for (int k = 0; k < pages.Count; k = k + 1) {
             if (k == i) { this.Remove(pages[k]); }
             else { keep.Add(pages[k]); }
-        }
-        pages = keep;
-    }
-
-    /// 只保留第 i 页（「关闭其他」）。i < 0 则丢掉全部（「关闭全部」）。
-    void KeepOnlyPage(int i) {
-        List<Panel> keep = new List<Panel>();
-        for (int k = 0; k < pages.Count; k = k + 1) {
-            if (k == i) { keep.Add(pages[k]); }
-            else { this.Remove(pages[k]); }
         }
         pages = keep;
     }
@@ -325,17 +322,21 @@ class Tabs : Control {
 
     void Add(string label, bool canClose) {
         tabs.Add(new TabItem(label, canClose));
+        // 空标签条没有选中项（active == -1）；补进来的第一个标签接管它，
+        // 否则宿主问到的活动索引一直是 -1，谁也不会被显示。
+        if (active < 0) { active = tabs.Count - 1; }
     }
 
     /// 丢掉所有标签页（选中项回到第一页）。声明式界面在语言切换后
     /// 重建标签文本时用它，免得宿主自己再持有一份影子列表。
     void Clear() {
         tabs = new List<TabItem>();
-        active = 0;
+        active = 0 - 1;
         scroll = 0;
         changedIndex = 0 - 1;
         closedIndex = 0 - 1;
         addedIndex = 0 - 1;
+        closedQueue = new List<int>();
     }
 
     int Count() { return tabs.Count; }
@@ -377,9 +378,17 @@ class Tabs : Control {
         return r;
     }
 
+    /// 领走一个已关闭的标签索引（没有则 -1）。一帧里关掉多个标签时
+    /// 逐帧逐个领，顺序与移除顺序一致（从大到小）。
     int TakeClosed() {
-        int r = closedIndex;
-        closedIndex = 0 - 1;
+        if (closedQueue.Count == 0) {
+            closedIndex = 0 - 1;
+            return 0 - 1;
+        }
+        int r = closedQueue[0];
+        closedQueue.RemoveAt(0);
+        if (closedQueue.Count > 0) { closedIndex = closedQueue[0]; }
+        else { closedIndex = 0 - 1; }
         return r;
     }
 
@@ -404,24 +413,108 @@ class Tabs : Control {
         TabAdded.Raise();
     }
 
+    /// 上报一个被移除的标签：入队给按帧轮询 TakeClosed() 的宿主，
+    /// 同时抛事件给订阅 TabClosed 的宿主。
+    void EmitClosed(int i) {
+        closedQueue.Add(i);
+        closedIndex = i;
+        TabClosed.Raise();
+    }
+
+    /// 移除第 i 个标签之后把选中项挪回有效位置。
+    void ReindexActive(int i) {
+        if (active > i) { active = active - 1; }
+        if (active >= tabs.Count) { active = tabs.Count - 1; }
+        if (active < 0 && tabs.Count > 0) { active = 0; }
+        // 空标签条没有活动标签：留下 0 会让每个按索引取标签的调用
+        // 越界，因此这里是 -1。
+        if (tabs.Count == 0) { active = 0 - 1; }
+    }
+
+    /// 第 i 个标签是否允许被关闭。固定标签（closable == false）既不画关闭
+    /// 按钮，也不能被右键菜单或 CloseAt() 关掉：宿主把它当常驻页，
+    /// 关掉它宿主的并行数组就和标签错位了。
+    bool Closable(int i) {
+        if (i < 0 || i >= tabs.Count) { return false; }
+        return tabs[i].closable;
+    }
+
+    /// 除第 keep 个之外还有几个可关闭的标签（keep < 0 表示不留）。
+    int ClosableCount(int keep) {
+        int n = 0;
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            if (i == keep) { continue; }
+            if (tabs[i].closable) { n = n + 1; }
+        }
+        return n;
+    }
+
     void CloseAt(int i) {
         if (i < 0 || i >= tabs.Count) { return; }
-        closedIndex = i;
+        if (!tabs[i].closable) { return; }
         if (hostModel) {
             follow = true;
-            TabClosed.Raise();
+            this.EmitClosed(i);
             return;
         }
         tabs.RemoveAt(i);
         this.DropPage(i);
-        if (active > i) { active = active - 1; }
-        if (active >= tabs.Count) { active = tabs.Count - 1; }
-        // 空标签条没有活动标签：留下 0 会让每个按索引取标签的调用
-        // 越界，因此这里是 -1。
-        if (active < 0 && tabs.Count > 0) { active = 0; }
-        if (tabs.Count == 0) { active = 0 - 1; }
+        this.ReindexActive(i);
         follow = true;
-        TabClosed.Raise();
+        this.EmitClosed(i);
+    }
+
+    /// 关闭全部标签（「关闭全部」）。固定标签（closable == false）是宿主的
+    /// 常驻页，批量关闭不能连它一起端走。
+    void CloseAll() { this.CloseBulk(0 - 1); }
+
+    /// 关闭除第 keep 个之外的标签（「关闭其他」）；keep 保留并成为选中项。
+    void CloseOthers(int keep) {
+        if (keep < 0 || keep >= tabs.Count) { return; }
+        this.CloseBulk(keep);
+    }
+
+    /// 批量关闭：keep < 0 关掉全部可关闭的标签，否则额外保留第 keep 个。
+    /// 先把要关的索引从大到小定下来再逐个关，这样上报出去的每个索引
+    /// 在宿主处理到它之前都还指向自己那一项，宿主的并行数组不会错位。
+    void CloseBulk(int keep) {
+        List<int> doomed = new List<int>();
+        for (int i = tabs.Count - 1; i >= 0; i = i - 1) {
+            if (i == keep) { continue; }
+            if (!tabs[i].closable) { continue; }
+            doomed.Add(i);
+        }
+        if (doomed.Count == 0) { return; }
+        int before = active;
+        int removedBeforeKeep = 0;
+        for (int k = 0; k < doomed.Count; k = k + 1) {
+            int i = doomed[k];
+            if (keep >= 0 && i < keep) { removedBeforeKeep = removedBeforeKeep + 1; }
+            if (!hostModel) {
+                tabs.RemoveAt(i);
+                this.DropPage(i);
+                this.ReindexActive(i);
+            }
+            this.EmitClosed(i);
+        }
+        follow = true;
+        if (hostModel) { return; }
+        // 「关闭其他」右键的那个标签留下来并接管选中；它前面被关掉的
+        // 标签把它往前挪了几格。
+        if (keep >= 0) {
+            active = keep - removedBeforeKeep;
+            // 比的是关之前的标签，不是索引：保留的标签换了人，只订阅
+            // TabChanged 的宿主也得知道自己该显示哪一页了。
+            if (before != keep) {
+                changedIndex = active;
+                TabChanged.Raise();
+            }
+            return;
+        }
+        if (active >= 0 && active != before) {
+            changedIndex = active;
+            TabChanged.Raise();
+        }
     }
 
     /// 此变体标签页/标签条匹配的 CSS 类，皮肤可通过
@@ -472,7 +565,6 @@ class Tabs : Control {
         Theme t = app.theme;
 
         int tabH = t.heightMedium;
-        int count = tabs.Count;
         int addW = tabH;
 
         int ek = app.EventKind();
@@ -484,6 +576,12 @@ class Tabs : Control {
         bool rightUp = ek == 3 && eb == 1 && !cap;
 
         this.ApplyMenuAction();
+        this.PumpClosed(app);
+
+        // 标签数只能在菜单动作之后数：「关闭全部 / 关闭其他」就在
+        // ApplyMenuAction 里移除标签，先数好的话本帧余下的绘制与命中
+        // 判定都会按旧长度去索引已经不存在的标签。
+        int count = tabs.Count;
 
         // 「+」添加按钮是固定的尾部控件（位于滚动
         // 视口之外）；需要时溢出箭头紧挨其左侧。
@@ -553,11 +651,20 @@ class Tabs : Control {
         this.EmitMenu(app);
     }
 
+    /// 队列里还有没被领走的关闭索引：每帧只轮询一次的宿主靠后续帧把
+    /// 剩下的领完，而空闲时框框并不自己重绘，所以这里把帧要出来。
+    void PumpClosed(App app) {
+        if (closedQueue.Count > 0) { app.RequestRedraw(); }
+    }
+
     /// 滚动标签条（裁剪）：每个标签一个样式框 + 标签/关闭字形，支持逐标签点击/右键菜单。
     void RenderTabStrip(App app, int x, int y, int viewW, int tabH, int count, string tcls, bool leftUp, bool rightUp) {
         bool cap = app.PointerCaptured();
         Canvas c = app.canvas;
         Theme t = app.theme;
+        // 调用方数好的标签数只是上界：本帧里任何一次关闭都会让列表变短，
+        // 而下面每一步都按索引取标签，因此收到实际长度。
+        if (count > tabs.Count) { count = tabs.Count; }
         c.PushClip(x, y, viewW, tabH);
 
         int tabX = x - scroll;
@@ -700,7 +807,6 @@ class Tabs : Control {
         Theme t = app.theme;
 
         int rowH = t.heightMedium;
-        int count = tabs.Count;
 
         int ek = app.EventKind();
         int eb = app.window.EventButton();
@@ -709,6 +815,14 @@ class Tabs : Control {
         bool cap = app.PointerCaptured();
         bool leftUp = app.ClickAvailable() && eb == 0;
         bool rightUp = ek == 3 && eb == 1 && !cap;
+
+        // 侧边轨道也会右键开菜单，所以菜单的发起与消费同样要在这里
+        // 走一遭；否则轨道上选的「关闭全部」永远不会被执行。
+        this.ApplyMenuAction();
+        this.PumpClosed(app);
+
+        // 同上：菜单里的批量关闭已经改过列表长度了。
+        int count = tabs.Count;
 
         string tcls = this.TabClasses();
         if (style == 0) {
@@ -810,6 +924,7 @@ class Tabs : Control {
         }
 
         c.PopClip();
+        this.EmitMenu(app);
     }
 
     /// 应用前一帧从上下文菜单中选择的动作。
@@ -822,30 +937,9 @@ class Tabs : Control {
         if (picked == 0) {
             this.CloseAt(menuTab);
         } else if (picked == 1) {
-            string keep = "";
-            bool keepClose = false;
-            if (menuTab >= 0 && menuTab < tabs.Count) {
-                keep = tabs[menuTab].label;
-                keepClose = tabs[menuTab].closable;
-            }
-            tabs = new List<TabItem>();
-            if (keep != "") {
-                tabs.Add(new TabItem(keep, keepClose));
-                this.KeepOnlyPage(menuTab);
-            } else {
-                this.KeepOnlyPage(0 - 1);
-            }
-            active = 0;
-            closedIndex = menuTab;
-            TabClosed.Raise();
-            changedIndex = active;
-            TabChanged.Raise();
+            this.CloseOthers(menuTab);
         } else if (picked == 2) {
-            tabs = new List<TabItem>();
-            this.KeepOnlyPage(0 - 1);
-            active = 0;
-            closedIndex = 0;
-            TabClosed.Raise();
+            this.CloseAll();
         } else if (picked == 3) {
             this.AddNew();
         } else if (picked == 4) {
@@ -870,12 +964,23 @@ class Tabs : Control {
     /// 子菜单）。
     void EmitMenu(App app) {
         if (!menuOpen.Get()) { return; }
+        // 菜单项跟着 closable 走：固定标签的「关闭」置灰，没有别的可关闭
+        // 标签时「关闭其他/关闭全部」也置灰，免得点了没反应。
+        string closeText = Tabs.TT("Close", "关闭");
+        string othersText = Tabs.TT("Close others", "关闭其他");
+        string allText = Tabs.TT("Close all", "关闭全部");
+        MenuItem closeItem = this.Closable(menuTab)
+            ? MenuItem.Shortcut(closeText, "close", "Ctrl+W", 0)
+            : MenuItem.Disabled(closeText, "close", 0);
+        MenuItem othersItem = this.ClosableCount(menuTab) > 0
+            ? MenuItem.Item(othersText, "minus", 1)
+            : MenuItem.Disabled(othersText, "minus", 1);
+        MenuItem allItem = this.ClosableCount(0 - 1) > 0
+            ? MenuItem.Item(allText, "trash", 2)
+            : MenuItem.Disabled(allText, "trash", 2);
         List<MenuItem> items = new List<MenuItem>{
             MenuItem.Header(Tabs.TT("This tab", "当前标签")),
-            MenuItem.Shortcut(Tabs.TT("Close", "关闭"), "close",
-                "Ctrl+W", 0),
-            MenuItem.Item(Tabs.TT("Close others", "关闭其他"), "minus", 1),
-            MenuItem.Item(Tabs.TT("Close all", "关闭全部"), "trash", 2) };
+            closeItem, othersItem, allItem };
         items.Add(MenuItem.Separator());
         List<MenuItem> sub = new List<MenuItem>{
             MenuItem.Item(Tabs.TT("New tab", "新建标签"), "plus", 3),
