@@ -493,6 +493,26 @@ static void embed_emit_register(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMDisposeBuilder(b);
 }
 
+int zan_embed_driver_spec(const char *path, const char *file, char *out,
+                         size_t out_sz) {
+    long long len = 0;
+    unsigned char *data = embed_read_file(path, &len);
+    if (!data) return -1;
+    /* FNV-1a over the whole driver: the fingerprint goes into the resource
+     * name, so the extracted copy of one build can never be mistaken for
+     * another's (a rebuild against different CEF headers often keeps the
+     * very same file size). */
+    unsigned long long h = 1469598103934665603ULL;
+    for (long long i = 0; i < len; i++) {
+        h ^= (unsigned long long)data[i];
+        h *= 1099511628211ULL;
+    }
+    free(data);
+    int n = snprintf(out, out_sz, "%s=%s/%016llx/%s", path,
+                     ZAN_EMBED_DRIVER_PREFIX, h, file);
+    return (n < 0 || (size_t)n >= out_sz) ? -1 : 0;
+}
+
 int zan_embed_emit_specs(zan_irgen_t *g, const char *const *specs, int count) {
     zan_embed_list_t files;
     memset(&files, 0, sizeof(files));

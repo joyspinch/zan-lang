@@ -2439,6 +2439,125 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* ---- native stdlib drivers ------------------------------------
+         * Third-party drivers (libpq, sqlite3, SDL3 bridges, ...) are NOT
+         * present on an
+         * arbitrary target, so a published program must carry them. Each driver
+         * ships inside the stdlib module that owns it, at
+         * <stdlib_root>/<module>/drivers/<target-sub>/ (e.g. System/Data/Sqlite
+         * for sqlite3), overridable with --driver-dir. Which libs are drivers
+         * and which module owns each is discovered from the stdlib tree's
+         * `drivers/driver.manifest` files (see zan_discover_drivers), not
+         * hardcoded here. Its directory is added to the link search path so
+         * both dev builds and publishes resolve the driver. On Windows the
+         * runtime libraries are always copied next to the executable because
+         * there is no rpath equivalent; other targets copy them on
+         * `--publish`. */
+        zan_driver_registry_t driver_reg;
+        zan_discover_drivers(resolved_stdlib_root, &driver_reg);
+        char driver_dirs[16][1024];
+        const char *used_drivers[16]; int used_driver_count = 0;
+        int used_driver_len[16];
+        const char *used_driver_module[16];
+        bool used_driver_runtime[16] = { false };  /* dlopen'd, not linked */
+        bool used_driver_static[16] = { false };
+        bool used_driver_embedded[16] = { false };  /* inside the executable */
+        char embedded_driver_file[16][128];
+        char static_driver_libs[64][128];
+        int static_driver_lib_count = 0;
+        for (int li = 0; li < irgen.extern_lib_count && used_driver_count < 16; li++) {
+            int nlen;
+            const char *nm = zan_dllimport_lname(
+                irgen.extern_libs[li].str, (int)irgen.extern_libs[li].len, &nlen);
+            int didx = nm ? zan_driver_find(&driver_reg, nm, nlen) : -1;
+            if (didx >= 0) {
+                used_drivers[used_driver_count] = nm;
+                used_driver_len[used_driver_count] = nlen;
+                used_driver_module[used_driver_count] = driver_reg.entries[didx].module;
+                used_driver_runtime[used_driver_count] = false;
+                used_driver_count++;
+            }
+        }
+        /* Run-time loaded drivers (declared "<lib> if <prefix>") are never in
+         * extern_libs, since the module dlopens them; they are used when the
+         * image actually contains the module's code. */
+        for (int di = 0; di < driver_reg.count && used_driver_count < 16; di++) {
+            const char *sym = driver_reg.entries[di].sym;
+            if (!sym[0]) continue;
+            if (!zan_irgen_defines_prefix(&irgen, sym)) continue;
+            const char *lib = driver_reg.entries[di].lib;
+            bool dup = false;
+            for (int u = 0; u < used_driver_count; u++)
+                if ((int)strlen(lib) == used_driver_len[u] &&
+                    memcmp(lib, used_drivers[u], strlen(lib)) == 0) dup = true;
+            if (dup) continue;
+            used_drivers[used_driver_count] = lib;
+            used_driver_len[used_driver_count] = (int)strlen(lib);
+            used_driver_module[used_driver_count] = driver_reg.entries[di].module;
+            used_driver_runtime[used_driver_count] = true;
+            used_driver_count++;
+        }
+        {
+            const char *dsub = zan_driver_subdir(&target);
+            for (int d = 0; d < used_driver_count; d++) {
+                driver_dirs[d][0] = '\0';
+                if (driver_dir_override) {
+                    snprintf(driver_dirs[d], sizeof(driver_dirs[d]), "%s",
+                             driver_dir_override);
+                } else {
+                    const char *mod = used_driver_module[d];
+                    if (mod && mod[0] && resolved_stdlib_root[0]) {
+                        snprintf(driver_dirs[d], sizeof(driver_dirs[d]),
+                                 "%s/%s/drivers/%s", resolved_stdlib_root,
+                                 mod, dsub);
+                    }
+                }
+            }
+        }
+
+        /* ---- run-time drivers inside the executable -------------------
+         * Windows has no rpath, so a dlopen'd driver normally lands beside
+         * the executable - which defeats a single-file publish. Such a driver
+         * cannot be linked in instead: it is loaded at run time by design
+         * (the CEF wrappers come in two variants bound to different CEF C ABIs
+         * and only one of them may be resolved in a given process). So in
+         * static mode its DLL travels as an embedded resource and the owning
+         * module writes it out before LoadLibrary. Only the wrapper is
+         * embedded; what it in turn loads (the CEF runtime) stays external. */
+        char embed_driver_specs[8][1300];
+        int embed_driver_spec_count = 0;
+        if (target.os == ZAN_OS_WINDOWS && link_static_drivers) {
+            for (int d = 0; d < used_driver_count; d++) {
+                if (!used_driver_runtime[d] || !driver_dirs[d][0]) continue;
+                if (embed_driver_spec_count >= 8 || embed_spec_count >= 64) break;
+                char drv[64];
+                snprintf(drv, sizeof(drv), "%.*s", used_driver_len[d],
+                         used_drivers[d]);
+                char file[128], src[1300];
+                snprintf(file, sizeof(file), "%s.dll", drv);
+                snprintf(src, sizeof(src), "%s/%s", driver_dirs[d], file);
+                if (!zan_file_exists(src)) {
+                    snprintf(file, sizeof(file), "lib%s.dll", drv);
+                    snprintf(src, sizeof(src), "%s/%s", driver_dirs[d], file);
+                }
+                if (!zan_file_exists(src)) continue;
+                if (zan_embed_driver_spec(
+                        src, file, embed_driver_specs[embed_driver_spec_count],
+                        sizeof(embed_driver_specs[0])) != 0) {
+                    fprintf(stderr,
+                            "warning: cannot embed driver '%s' from '%s'; it "
+                            "will be published beside the executable\n",
+                            drv, src);
+                    continue;
+                }
+                embed_specs[embed_spec_count++] =
+                    embed_driver_specs[embed_driver_spec_count++];
+                used_driver_embedded[d] = true;
+                snprintf(embedded_driver_file[d],
+                         sizeof(embedded_driver_file[0]), "%s", file);
+            }
+        }
+
         /* --embed: the project files that ship inside the executable rather
          * than beside it. Baked into this module (not a separately compiled
          * object) so it works for every target with no external C compiler.
@@ -2743,149 +2862,83 @@ int main(int argc, char **argv) {
         }
 #endif
 
-        /* ---- native stdlib drivers ------------------------------------
-         * Third-party drivers (libpq, sqlite3, SDL3 bridges, ...) are NOT
-         * present on an
-         * arbitrary target, so a published program must carry them. Each driver
-         * ships inside the stdlib module that owns it, at
-         * <stdlib_root>/<module>/drivers/<target-sub>/ (e.g. System/Data/Sqlite
-         * for sqlite3), overridable with --driver-dir. Which libs are drivers
-         * and which module owns each is discovered from the stdlib tree's
-         * `drivers/driver.manifest` files (see zan_discover_drivers), not
-         * hardcoded here. Its directory is added to the link search path so
-         * both dev builds and publishes resolve the driver. On Windows the
-         * runtime libraries are always copied next to the executable because
-         * there is no rpath equivalent; other targets copy them on
-         * `--publish`. */
-        zan_driver_registry_t driver_reg;
-        zan_discover_drivers(resolved_stdlib_root, &driver_reg);
-        char driver_dirs[16][1024];
-        const char *used_drivers[16]; int used_driver_count = 0;
-        int used_driver_len[16];
-        const char *used_driver_module[16];
-        bool used_driver_runtime[16] = { false };  /* dlopen'd, not linked */
-        bool used_driver_static[16] = { false };
-        char static_driver_libs[64][128];
-        int static_driver_lib_count = 0;
-        for (int li = 0; li < irgen.extern_lib_count && used_driver_count < 16; li++) {
-            int nlen;
-            const char *nm = zan_dllimport_lname(
-                irgen.extern_libs[li].str, (int)irgen.extern_libs[li].len, &nlen);
-            int didx = nm ? zan_driver_find(&driver_reg, nm, nlen) : -1;
-            if (didx >= 0) {
-                used_drivers[used_driver_count] = nm;
-                used_driver_len[used_driver_count] = nlen;
-                used_driver_module[used_driver_count] = driver_reg.entries[didx].module;
-                used_driver_runtime[used_driver_count] = false;
-                used_driver_count++;
+        /* ---- driver link search paths ----------------------------------
+         * Which directory each driver lives in is resolved above (embedding
+         * needs it before the object is emitted); the link-search decisions
+         * belong here, where zan_lib_dirs exists. */
+        for (int d = 0; d < used_driver_count; d++) {
+            if (!driver_dirs[d][0]) continue;
+            /* Add the driver dir to the link search path (link-time -l
+             * resolution) for every link branch below. In static mode,
+             * choose per driver: a driver with a static archive uses the
+             * static subdir, while one without it falls back to its shared
+             * directory and remains bundleable. The macOS cross-dylib path
+             * is always shared, even when --link-mode static is requested. */
+            char linkdir[1100];
+            bool added_shared = false;
+            bool want_static = link_static_drivers &&
+                !used_driver_runtime[d] && cross_dylib_count == 0;
+            char archive[1200];
+            archive[0] = '\0';
+            if (want_static) {
+                snprintf(archive, sizeof(archive), "%s/static/lib%.*s.a",
+                         driver_dirs[d], used_driver_len[d],
+                         used_drivers[d]);
             }
-        }
-        /* Run-time loaded drivers (declared "<lib> if <prefix>") are never in
-         * extern_libs, since the module dlopens them; they are used when the
-         * image actually contains the module's code. */
-        for (int di = 0; di < driver_reg.count && used_driver_count < 16; di++) {
-            const char *sym = driver_reg.entries[di].sym;
-            if (!sym[0]) continue;
-            if (!zan_irgen_defines_prefix(&irgen, sym)) continue;
-            const char *lib = driver_reg.entries[di].lib;
-            bool dup = false;
-            for (int u = 0; u < used_driver_count; u++)
-                if ((int)strlen(lib) == used_driver_len[u] &&
-                    memcmp(lib, used_drivers[u], strlen(lib)) == 0) dup = true;
-            if (dup) continue;
-            used_drivers[used_driver_count] = lib;
-            used_driver_len[used_driver_count] = (int)strlen(lib);
-            used_driver_module[used_driver_count] = driver_reg.entries[di].module;
-            used_driver_runtime[used_driver_count] = true;
-            used_driver_count++;
-        }
-        {
-            const char *dsub = zan_driver_subdir(&target);
-            for (int d = 0; d < used_driver_count; d++) {
-                driver_dirs[d][0] = '\0';
-                if (driver_dir_override) {
-                    snprintf(driver_dirs[d], sizeof(driver_dirs[d]), "%s",
-                             driver_dir_override);
-                } else {
-                    const char *mod = used_driver_module[d];
-                    if (mod && mod[0] && resolved_stdlib_root[0]) {
-                        snprintf(driver_dirs[d], sizeof(driver_dirs[d]),
-                                 "%s/%s/drivers/%s", resolved_stdlib_root,
-                                 mod, dsub);
-                    }
+            if (want_static && zan_file_exists(archive)) {
+                used_driver_static[d] = true;
+                snprintf(linkdir, sizeof(linkdir), "%s/static", driver_dirs[d]);
+                char libs_manifest[1200];
+                snprintf(libs_manifest, sizeof(libs_manifest),
+                         "%s/static/%.*s.libs", driver_dirs[d],
+                         used_driver_len[d], used_drivers[d]);
+                if (static_driver_lib_count < 64) {
+                    static_driver_lib_count += zan_read_static_libs(
+                        libs_manifest,
+                        &static_driver_libs[static_driver_lib_count],
+                        64 - static_driver_lib_count);
                 }
-                if (!driver_dirs[d][0]) continue;
-                /* Add the driver dir to the link search path (link-time -l
-                 * resolution) for every link branch below. In static mode,
-                 * choose per driver: a driver with a static archive uses the
-                 * static subdir, while one without it falls back to its shared
-                 * directory and remains bundleable. The macOS cross-dylib path
-                 * is always shared, even when --link-mode static is requested. */
-                char linkdir[1100];
-                bool added_shared = false;
-                bool want_static = link_static_drivers &&
-                    !used_driver_runtime[d] && cross_dylib_count == 0;
-                char archive[1200];
-                archive[0] = '\0';
+            } else {
                 if (want_static) {
-                    snprintf(archive, sizeof(archive), "%s/static/lib%.*s.a",
-                             driver_dirs[d], used_driver_len[d],
-                             used_drivers[d]);
+                    fprintf(stderr,
+                            "note: no static archive for driver '%.*s' "
+                            "(expected '%s'); falling back to the shared "
+                            "driver, which will still be published beside "
+                            "the executable\n",
+                            used_driver_len[d], used_drivers[d], archive);
                 }
-                if (want_static && zan_file_exists(archive)) {
-                    used_driver_static[d] = true;
-                    snprintf(linkdir, sizeof(linkdir), "%s/static", driver_dirs[d]);
-                    char libs_manifest[1200];
-                    snprintf(libs_manifest, sizeof(libs_manifest),
-                             "%s/static/%.*s.libs", driver_dirs[d],
-                             used_driver_len[d], used_drivers[d]);
-                    if (static_driver_lib_count < 64) {
-                        static_driver_lib_count += zan_read_static_libs(
-                            libs_manifest,
-                            &static_driver_libs[static_driver_lib_count],
-                            64 - static_driver_lib_count);
-                    }
-                } else {
-                    if (want_static) {
-                        fprintf(stderr,
-                                "note: no static archive for driver '%.*s' "
-                                "(expected '%s'); falling back to the shared "
-                                "driver, which will still be published beside "
-                                "the executable\n",
-                                used_driver_len[d], used_drivers[d], archive);
-                    }
-                    snprintf(linkdir, sizeof(linkdir), "%s", driver_dirs[d]);
-                }
-                if (zan_lib_ndirs < 16 && strlen(linkdir) < sizeof(zan_lib_dirs[0])) {
-                    /* Prepend, not append: a bundled driver must take link-search
-                     * precedence over the auto-added Homebrew/system fallback dirs.
-                     * Otherwise a keg-only Homebrew libpq is linked in place of the
-                     * shipped driver, and its absolute install-name defeats the
-                     * @rpath bundling (the published exe would look for the driver
-                     * at the developer's Homebrew path instead of beside itself). */
-                    memmove(&zan_lib_dirs[1], &zan_lib_dirs[0],
-                            (size_t)zan_lib_ndirs * sizeof(zan_lib_dirs[0]));
-                    snprintf(zan_lib_dirs[0], sizeof(zan_lib_dirs[0]), "%s", linkdir);
+                snprintf(linkdir, sizeof(linkdir), "%s", driver_dirs[d]);
+            }
+            if (zan_lib_ndirs < 16 && strlen(linkdir) < sizeof(zan_lib_dirs[0])) {
+                /* Prepend, not append: a bundled driver must take link-search
+                 * precedence over the auto-added Homebrew/system fallback dirs.
+                 * Otherwise a keg-only Homebrew libpq is linked in place of the
+                 * shipped driver, and its absolute install-name defeats the
+                 * @rpath bundling (the published exe would look for the driver
+                 * at the developer's Homebrew path instead of beside itself). */
+                memmove(&zan_lib_dirs[1], &zan_lib_dirs[0],
+                        (size_t)zan_lib_ndirs * sizeof(zan_lib_dirs[0]));
+                snprintf(zan_lib_dirs[0], sizeof(zan_lib_dirs[0]), "%s", linkdir);
+                zan_lib_ndirs++;
+                added_shared = true;
+            }
+            /* Fallback: a target may ship only the static archive of a
+             * driver (no shared library). Keep its dir right after the
+             * shared one so ld resolves -l<driver> from the archive
+             * instead of failing, while a shared library still wins. */
+            if (added_shared && !link_static_drivers) {
+                char statdir[1100];
+                snprintf(statdir, sizeof(statdir), "%s/static", driver_dirs[d]);
+                if (zan_lib_ndirs < 16 && zan_file_exists(statdir) &&
+                    strlen(statdir) < sizeof(zan_lib_dirs[0])) {
+                    memmove(&zan_lib_dirs[2], &zan_lib_dirs[1],
+                            (size_t)(zan_lib_ndirs - 1) * sizeof(zan_lib_dirs[0]));
+                    snprintf(zan_lib_dirs[1], sizeof(zan_lib_dirs[1]), "%s", statdir);
                     zan_lib_ndirs++;
-                    added_shared = true;
-                }
-                /* Fallback: a target may ship only the static archive of a
-                 * driver (no shared library). Keep its dir right after the
-                 * shared one so ld resolves -l<driver> from the archive
-                 * instead of failing, while a shared library still wins. */
-                if (added_shared && !link_static_drivers) {
-                    char statdir[1100];
-                    snprintf(statdir, sizeof(statdir), "%s/static", driver_dirs[d]);
-                    if (zan_lib_ndirs < 16 && zan_file_exists(statdir) &&
-                        strlen(statdir) < sizeof(zan_lib_dirs[0])) {
-                        memmove(&zan_lib_dirs[2], &zan_lib_dirs[1],
-                                (size_t)(zan_lib_ndirs - 1) * sizeof(zan_lib_dirs[0]));
-                        snprintf(zan_lib_dirs[1], sizeof(zan_lib_dirs[1]), "%s", statdir);
-                        zan_lib_ndirs++;
-                    }
                 }
             }
         }
+
 
         if (emit_lib) {
             /* ---- library output ----------------------------------------
@@ -3480,17 +3533,19 @@ int main(int argc, char **argv) {
             char cmd[8192];
             snprintf(cmd, sizeof(cmd),
                      "ld.lld -m %s --stack 268435456%s%s -o \"%s\" "
-                     "\"%s/crt2.o\" \"%s/crtbegin.o\" -L\"%s\"",
+                     "\"%s/crt2.o\" \"%s/crtbegin.o\"",
                      (target.arch == ZAN_ARCH_AARCH64) ? "arm64pe" : "i386pep",
                      publish_mode ? " -s" : "",
                      (link_subsystem && strcmp(link_subsystem, "windows") == 0)
                          ? " --subsystem windows" : "",
-                     obj_path, syslib, syslib, syslib);
+                     obj_path, syslib, syslib);
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
                          zan_lib_dirs[di]);
             }
+            { size_t cur = strlen(cmd);
+              snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"", syslib); }
             for (int di = 0; di < extra_lib_path_count; di++) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
@@ -3793,12 +3848,15 @@ int main(int argc, char **argv) {
             argv[a++] = "-o";      argv[a++] = obj_path;
             argv[a++] = crt2;
             argv[a++] = crtbeg;
-            argv[a++] = lflag;
             char ldirbufs[16][520];
+            /* Search bundled driver directories before the bundled MinGW
+             * sysroot so a driver-provided import library cannot be shadowed
+             * by a same-named host/runtime library. */
             for (int di = 0; di < zan_lib_ndirs && a < 120; di++) {
                 snprintf(ldirbufs[di], sizeof(ldirbufs[di]), "-L%s", zan_lib_dirs[di]);
                 argv[a++] = ldirbufs[di];
             }
+            argv[a++] = lflag;
             /* caller-supplied library search dirs (-L / --libpath) */
             char elpbufs[16][520];
             for (int di = 0; di < extra_lib_path_count && a < 120; di++) {
@@ -4171,6 +4229,13 @@ int main(int argc, char **argv) {
                 int copied = 0;
                 for (int c = 0; c < ncand; c++) {
                     char src[1300], dst[1300];
+                    if (used_driver_embedded[d] &&
+                        strcmp(cands[c], embedded_driver_file[d]) == 0) {
+                        printf("  embedded driver '%s' ? %s (inside the "
+                               "executable)\n", drv, cands[c]);
+                        copied++;
+                        continue;
+                    }
                     snprintf(src, sizeof(src), "%s/%s", driver_dir, cands[c]);
                     snprintf(dst, sizeof(dst), "%s/%s", outdir, cands[c]);
                     if (zan_copy_file(src, dst) == 0) {
