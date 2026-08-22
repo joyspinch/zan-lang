@@ -37,6 +37,8 @@ class TlsContext {
     [DllImport("ssl")]
     static extern int SSL_CTX_set_default_verify_paths(string ctx);
     [DllImport("ssl")]
+    static extern int SSL_CTX_load_verify_locations(string ctx, string file, string path);
+    [DllImport("ssl")]
     static extern string SSL_CTX_get_cert_store(string ctx);
     [DllImport("crypto")]
     static extern long ERR_get_error();
@@ -68,6 +70,9 @@ class TlsContext {
     // DisableVerify() 关闭——关闭后握手只加密不校验，
     // 用于本地开发，绝不用于生产。
     bool verify;
+    // 客户端信任库来源：装上的系统 CA 包路径，为 "" 表示一个都没找到
+    // （非 Windows 才探测，Windows 走系统证书库）。
+    string trust;
     // 公钥（SPKI）固定（pinning）：服务器
     // SubjectPublicKeyInfo 的 base64 SHA-256。启用且非空时，若握手的对端公钥
     // 哈希不匹配任何 pin，客户端将拒绝握手——从而挫败
@@ -80,6 +85,7 @@ class TlsContext {
         this.server = false;
         this.error = "";
         this.verify = true;
+        this.trust = "";
         this.pins = null;
         this.pinRequired = false;
     }
@@ -125,13 +131,13 @@ class TlsContext {
         string method = TLS_server_method();
         if (method == null) {
             TlsStream.SetLastError("OpenSSL 未链接或不可用（ssl driver dylib 未参与链接；"
-                + "常见于使用旧版编译器 publish）。请重新编译 zanc 后重新 publish");
+            + "常见于使用旧版编译器 publish）。请重新编译 zanc 后重新 publish");
             return null;
         }
         c.ctx = SSL_CTX_new(method);
         if (c.ctx == null) {
             TlsStream.SetLastError("SSL_CTX_new 失败（OpenSSL 错误码："
-                + Convert.ToString(ERR_get_error()) + "）");
+            + Convert.ToString(ERR_get_error()) + "）");
             return null;
         }
         // 1 = SSL_FILETYPE_PEM
@@ -160,13 +166,13 @@ class TlsContext {
         string method = TLS_client_method();
         if (method == null) {
             TlsStream.SetLastError("OpenSSL 未链接或不可用（ssl driver dylib 未参与链接；"
-                + "常见于使用旧版编译器 publish）。请重新编译 zanc 后重新 publish");
+            + "常见于使用旧版编译器 publish）。请重新编译 zanc 后重新 publish");
             return null;
         }
         c.ctx = SSL_CTX_new(method);
         if (c.ctx == null) {
             TlsStream.SetLastError("SSL_CTX_new 失败（OpenSSL 错误码："
-                + Convert.ToString(ERR_get_error()) + "）");
+            + Convert.ToString(ERR_get_error()) + "）");
             return null;
         }
         int _v = SSL_CTX_set_default_verify_paths(c.ctx);
@@ -175,6 +181,8 @@ class TlsContext {
         // 因此模仿基于 schannel 的工具（curl）免费获得的能力：把
         // 计算机/用户 ROOT 证书库导入该上下文的 X509_STORE。
         TlsContext.LoadSystemRootsWindows(c.ctx);
+        #else
+        c.trust = TlsContext.LoadSystemRootsUnix(c.ctx);
         #endif
         // 1 = SSL_VERIFY_PEER
         SSL_CTX_set_verify(c.ctx, 1, null);
@@ -226,7 +234,7 @@ class TlsContext {
         byte[] x = new byte[4];
         PlatMemCopyIn(x, ptr + off, 4);
         return (x[0] & 255) + ((x[1] & 255) << 8)
-            + ((x[2] & 255) << 16) + ((x[3] & 255) << 24);
+        + ((x[2] & 255) << 16) + ((x[3] & 255) << 24);
     }
 
     #if WINDOWS
@@ -264,6 +272,56 @@ class TlsContext {
         CertCloseStore(store, 0);
     }
     #endif
+
+    #if !WINDOWS
+    // 随包分发的 OpenSSL 是 CI 上的构建产物，编译期 OPENSSLDIR 指向构建机的
+    // 目录（macOS 那份是 /opt/homebrew/etc/openssl@3，Linux 那份是
+    // /usr/lib/ssl）。这些目录在用户机器上通常不存在，于是
+    // SSL_CTX_set_default_verify_paths 一张根证书都装不进来，所有 https
+    // 请求都在链校验处失败。按 curl 的做法探测本机的系统 CA 包，
+    // 装上第一个存在的，返回其路径；都没有则返回 ""。
+    static string LoadSystemRootsUnix(string sslctx) {
+        List<string> cands = new List<string>();
+        #if MACOS
+        // Apple 随系统分发的 PEM 包；后两条覆盖装了 Homebrew OpenSSL 的机器。
+        cands.Add("/etc/ssl/cert.pem");
+        cands.Add("/private/etc/ssl/cert.pem");
+        cands.Add("/opt/homebrew/etc/openssl@3/cert.pem");
+        cands.Add("/usr/local/etc/openssl@3/cert.pem");
+        #else
+        cands.Add("/etc/ssl/certs/ca-certificates.crt");  // Debian/Ubuntu/Alpine
+        cands.Add("/etc/pki/tls/certs/ca-bundle.crt");    // RHEL/Fedora
+        cands.Add("/etc/ssl/ca-bundle.pem");              // openSUSE
+        cands.Add("/etc/ssl/cert.pem");                   // Arch/BSD
+        cands.Add("/usr/lib/ssl/cert.pem");
+        #endif
+        for (int i = 0; i < cands.Count; i = i + 1) {
+            if (!File.Exists(cands[i])) { continue; }
+            if (SSL_CTX_load_verify_locations(sslctx, cands[i], null) == 1) {
+                return cands[i];
+            }
+        }
+        #if LINUX
+        // 只铺了 hash 目录、没有单文件 CA 包的发行版。
+        if (SSL_CTX_load_verify_locations(sslctx, null, "/etc/ssl/certs") == 1) {
+            return "/etc/ssl/certs";
+        }
+        #endif
+        return "";
+    }
+    #endif
+
+    /// <summary>链校验失败时补充的定位提示：本机一个系统 CA
+    /// 信任库都没装上时点名该原因，否则为 ""。</summary>
+    string TrustHint() {
+        #if WINDOWS
+        return "";
+        #else
+        if (this.server || this.trust != "") { return ""; }
+        return "；本机未找到系统 CA 信任库（随包 OpenSSL 编译期的默认证书目录"
+        + "在本机不存在），可用环境变量 SSL_CERT_FILE 指向一个 CA 包";
+        #endif
+    }
 
     // 从 PEM 字符串中抽出 base64 正文（BEGIN/END 标记之间）并解码为 DER。
     static byte[] PemBodyToDer(string pem, int expectedLen) {
@@ -522,7 +580,17 @@ class TlsStream {
         }
         int ok = await s.HandshakeAsync();
         if (ok != 1) {
-            TlsStream.SetLastError("TLS 握手失败");
+            // SSL_VERIFY_PEER 下证书不受信任在握手中就失败，此时真正的原因
+            // 记在 verify_result 里，只报「握手失败」看不出是信任库问题。
+            long hvr = 0;
+            if (ctx.verify) { hvr = SSL_get_verify_result(s.ssl); }
+            if (hvr != 0) {
+                TlsStream.SetLastError("TLS 握手失败：证书链或主机名校验不通过"
+                + "（verify_result=" + Convert.ToString(hvr) + "）"
+                + ctx.TrustHint());
+            } else {
+                TlsStream.SetLastError("TLS 握手失败");
+            }
             s.Close();
             return null;
         }
@@ -532,7 +600,7 @@ class TlsStream {
             long vr = SSL_get_verify_result(s.ssl);
             if (vr != 0) {
                 TlsStream.SetLastError("TLS 证书链或主机名校验失败（verify_result="
-                    + Convert.ToString(vr) + "）");
+                + Convert.ToString(vr) + "）" + ctx.TrustHint());
                 s.Close();
                 return null;
             }
