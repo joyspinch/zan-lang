@@ -317,6 +317,7 @@ jobs:
             ${{ matrix.prefix }}-sdl3
             ${{ matrix.prefix }}-sqlite3
             ${{ matrix.prefix }}-postgresql
+            ${{ matrix.target == 'win-x64' && 'mingw-w64-x86_64-openssl' || '' }}
 
       # Cross-linking a Windows-on-ARM program needs aarch64 copies of the
       # runtime objects zanc otherwise builds for the host; nothing off an ARM
@@ -355,18 +356,36 @@ jobs:
           printf 'zan_gui.dll\nWebView2Loader.dll if WebView\n' \
             > "$DEST/zan_gui.bundle"
 
-      # Import libraries the cross bundles were assembled without: a native
-      # Windows link picks these up from the host mingw, so they only go
-      # missing when zanc cross-links (psapi backs Process/memory queries).
+      # Import libraries and CRT support the cross bundles were assembled
+      # without: a native Windows link picks these up from the host mingw, so
+      # they only go missing when zanc cross-links. OpenSSL's static archives
+      # reference crypt32 plus MinGW fortify/stack-check symbols. Keep the
+      # existing libmingwex archive and merge only those support objects rather
+      # than replacing the whole archive (it must remain compatible with the
+      # committed libgcc.a/crt2.o pair).
       - name: Top up the cross mingw import libs
         run: |
           set -eux
           P="$(cygpath -u "$MINGW_PREFIX")"
-          for lib in psapi version setupapi; do
+          for lib in psapi version setupapi crypt32; do
             [ -f "$P/lib/lib$lib.a" ] \
               && cp -n "$P/lib/lib$lib.a" "toolchain/${{ matrix.target }}/mingw/lib/" \
               || true
           done
+          if [ "${{ matrix.target }}" = win-x64 ]; then
+            MEX="toolchain/${{ matrix.target }}/mingw/lib/libmingwex.a"
+            TMP="$(mktemp -d)"
+            trap 'rm -rf "$TMP"' EXIT
+            for obj in \
+              lib64_libmingwex_a-chk_fail.o \
+              lib64_libmingwex_a-memcpy_chk.o \
+              lib64_libmingwex_a-memset_chk.o \
+              lib64_libmingwex_a-stack_chk_fail.o \
+              lib64_libmingwex_a-stack_chk_guard.o; do
+              (cd "$TMP" && ar x "$P/lib/libmingwex.a" "$obj")
+            done
+            ar rD "$MEX" "$TMP"/*.o
+          fi
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -390,7 +409,9 @@ jobs:
           $sub = 'toolchain/${{ matrix.target }}'
           git add -f "$sub/zanrt_io.o" "$sub/zanrt_io_mt.o" "$sub/zanrt_sync.o" `
                      "$sub/zanrt_file.o" "$sub/zanrt_timer.o"
-          git add "$sub/mingw/lib"
+          # The repository ignores *.a by default; force-add refreshed import
+          # libraries such as libcrypt32.a and the merged libmingwex.a.
+          git add -f "$sub/mingw/lib"
           if ('${{ matrix.target }}' -eq 'win-arm64' -and
               (Test-Path 'stdlib/Gui/drivers/win-arm64')) {
             git add 'stdlib/Gui/drivers/win-arm64'
@@ -445,6 +466,22 @@ jobs:
           { echo libpq.dll; ls "$GDEST" | grep -viE '^(libpq\.dll|pq\.bundle)$' | sort || true; } > "$GDEST/pq.bundle"
           ls -la "$SDEST" "$QDEST" "$GDEST"
 
+      - name: Stage TLS static archives
+        if: matrix.target == 'win-x64'
+        run: |
+          set -eux
+          P="$(cygpath -u "$MINGW_PREFIX")"
+          TDEST="stdlib/System/Net/Tls/drivers/${{ matrix.target }}/static"
+          mkdir -p "$TDEST"
+          cp "$P/lib/libssl.a" "$TDEST/libssl.a"
+          cp "$P/lib/libcrypto.a" "$TDEST/libcrypto.a"
+          printf '# OpenSSL 3.6.3 MinGW-w64 Libs.private dependencies.\nws2_32\ngdi32\ncrypt32\n' \
+            > "$TDEST/ssl.libs"
+          cp "$TDEST/ssl.libs" "$TDEST/crypto.libs"
+          sh scripts/verify_dep.sh "$TDEST/libssl.a"
+          sh scripts/verify_dep.sh "$TDEST/libcrypto.a"
+          ls -la "$TDEST"
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: drivers-${{ matrix.target }}
@@ -452,6 +489,7 @@ jobs:
             stdlib/SDL3/drivers/${{ matrix.target }}/
             stdlib/System/Data/Sqlite/drivers/${{ matrix.target }}/
             stdlib/System/Data/Postgres/drivers/${{ matrix.target }}/
+            stdlib/System/Net/Tls/drivers/${{ matrix.target }}/
 
   # -------------------------------------------------------------- Release ----
   release:

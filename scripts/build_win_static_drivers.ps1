@@ -1,6 +1,10 @@
 # Builds the native static driver archives used by Windows x64 single-file
 # publishes. The GUI recipe matches build_ide.ps1; SQLite is built from the
 # pinned amalgamation used by .github/workflows/drivers.yml.
+#
+# OpenSSL static archives are staged by the drivers workflow from the MSYS2
+# OpenSSL package. This developer-side script does not build OpenSSL from
+# source.
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root

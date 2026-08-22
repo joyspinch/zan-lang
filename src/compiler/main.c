@@ -2846,6 +2846,14 @@ int main(int argc, char **argv) {
                             64 - static_driver_lib_count);
                     }
                 } else {
+                    if (want_static) {
+                        fprintf(stderr,
+                                "note: no static archive for driver '%.*s' "
+                                "(expected '%s'); falling back to the shared "
+                                "driver, which will still be published beside "
+                                "the executable\n",
+                                used_driver_len[d], used_drivers[d], archive);
+                    }
                     snprintf(linkdir, sizeof(linkdir), "%s", driver_dirs[d]);
                 }
                 if (zan_lib_ndirs < 16 && strlen(linkdir) < sizeof(zan_lib_dirs[0])) {
