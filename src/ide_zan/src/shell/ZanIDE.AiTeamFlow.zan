@@ -65,6 +65,7 @@ partial class ZanIDE {
             // 「接着做」只会再得到一份计划，于是两边就在聊天里扯皮。
             if (this.AiTeamAssign(from)) { return; }
             if (this.AiTeamNudge(from, env, said)) { return; }
+            this.AiTeamWrapUp();
             aiBusy.Set(0);
             return;
         }
@@ -184,6 +185,11 @@ partial class ZanIDE {
         if (env.kind == AiTeam.KindReport()) { return false; }
         if (AiAgent.AsksUser(said)) { return false; }
         if (!AiTeam.HasUnfinished(aiTasks)) { return false; }
+        // 还欠着活儿不等于流程自己推得动：剩下的节点全卡在未完成的前置、或者
+        // 都已经挂起等人介入时，把谁叫回原地都只会再得到一份同样的汇报（产品
+        // 经理那一脚还会变成又一轮派单）。停下来交给用户，由 AiTeamWrapUp 说清
+        // 卡在哪里。
+        if (!AiTeam.Actionable(aiTasks)) { return false; }
         if (aiAutoCont >= aiContMax) { return false; }
         string tid = aiTeamSt.activeTask;
         AiTask t = AiTeam.TaskOf(aiTasks, tid);
@@ -238,6 +244,41 @@ partial class ZanIDE {
             AiTeam.KindAssign(), tid);
         if (sent) { aiAutoCont = keep; }
         return sent;
+    }
+
+    /// 一轮自动流程停下来时给用户的交代：图上没有流程自己能推的节点了，那就
+    /// 说清是「全部验收完成」还是「剩下的卡在前置 / 挂起」，而不是默默停住（更不
+    /// 能再派一单）。同一张图只说一次：图没变就不重复刷同一句。
+    void AiTeamWrapUp() {
+        if (aiTasks.Count == 0) { return; }
+        if (AiTeam.Actionable(aiTasks)) { return; }
+        int done = 0;
+        for (int i = 0; i < aiTasks.Count; i = i + 1) {
+            if (aiTasks[i].state == AiTeam.TaskDone()) { done = done + 1; }
+        }
+        string key = Convert.ToString(aiTasks.Count) + "/"
+            + Convert.ToString(done);
+        if (aiWrapKey == key) { return; }
+        aiWrapKey = key;
+        if (!AiTeam.HasUnfinished(aiTasks)) {
+            log.Add(ZanIDE.T("> All task nodes are accepted; the team stopped.",
+                "> 任务图上的节点已全部验收完成，自动流程已停。"));
+            return;
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(ZanIDE.T("No node can be worked on right now, so the team"
+                + " stopped instead of re-dispatching. What is left:",
+            "图上没有能开工的节点了，自动流程已停（不再重复派单）。剩下的是："));
+        for (int i = 0; i < aiTasks.Count; i = i + 1) {
+            AiTask t = aiTasks[i];
+            if (t.state == AiTeam.TaskDone()) { continue; }
+            sb.Append("\n  " + t.id);
+            if (t.title != "") { sb.Append(" " + t.title); }
+            sb.Append(" [" + AiTeam.TaskStateName(t.state) + "]");
+            string why = AiTeam.BlockedWhy(aiTasks, t.id);
+            if (why != "") { sb.Append(" " + why); }
+        }
+        aiMsgs.Add(ChatMessage.Create("error", sb.ToString()));
     }
 
     /// 挂起一个节点时给用户的原因：卡在谁手上、上一拍为什么不算进展、最后一个
