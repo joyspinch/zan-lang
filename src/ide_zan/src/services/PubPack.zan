@@ -1,0 +1,165 @@
+using System;
+using System.IO;
+using System.Threading;
+
+/// 一次发布的打包收尾活（拷资源、写 Chromium 子进程包、tar.gz 归档）。
+///
+/// 编译本身早就走分离进程了，但收尾这一段原来是在 GUI 线程上跑的：一个
+/// macOS 发布目录里有可执行文件加上 libcrypto/libssl/libzan_gui 这些动态库，
+/// 光 `GZip.Compress(Tar.Create(...))` 就要把几十 MB 读进内存压一遍，
+/// 这段时间窗口不泵消息，用户看到的就是「ZanIDE（未响应）」——也就是
+/// 「发布 mac 程序总是未响应」的由来。
+///
+/// 所以收尾跟助手工具走同一套（见 AiWork）：`Start` 把这一次打包交给一条
+/// 自己的线程，事件循环每帧问一次 `Ready()`，拿到结果再把它那份日志倒进
+/// 输出窗。线程只碰自己 job 里的 List，不动 GUI 侧的任何状态。
+class PubPack {
+    /// 事件循环正在等的那一次打包。
+    static PubJob sCur;
+
+    /// 交给线程但还没被领走的活，以及看守它的锁。线程入口不能捕获变量
+    /// （`Thread.Start` 只收非捕获的委托），所以活本身走这个队列。
+    static List<PubJob> sPend;
+    #if WINDOWS
+    static nint sLock;
+    #else
+    static string sLock;
+    #endif
+
+    static void EnsureQueue() {
+        if (PubPack.sPend == null) {
+            PubPack.sPend = new List<PubJob>();
+            PubPack.sLock = Mutex.Create();
+        }
+    }
+
+    static void Push(PubJob j) {
+        PubPack.EnsureQueue();
+        Mutex.Lock(PubPack.sLock);
+        PubPack.sPend.Add(j);
+        Mutex.Unlock(PubPack.sLock);
+    }
+
+    static PubJob Take() {
+        PubPack.EnsureQueue();
+        Mutex.Lock(PubPack.sLock);
+        PubJob j = null;
+        if (PubPack.sPend.Count > 0) {
+            j = PubPack.sPend[0];
+            PubPack.sPend.RemoveAt(0);
+        }
+        Mutex.Unlock(PubPack.sLock);
+        return j;
+    }
+
+    /// 线程入口：领一份活，按发布顺序做完收尾三步。
+    static void Worker() {
+        PubJob j = PubPack.Take();
+        if (j == null) { return; }
+        // 打包里任何一处抛出来都必须变成输出窗里的一行：线程静静死掉的话
+        // 事件循环会一直等着「发布中」不落地。
+        try {
+            PubPack.Pack(j);
+        } catch (Exception ex) {
+            j.log.Add(ZanIDE.T("> Packaging failed: ", "> 打包失败：") + ex.Message);
+        }
+        PubPack.Finish(j);
+    }
+
+    /// 收尾三步，顺序和原来在事件循环里的一样：资源、Chromium 子进程包、归档。
+    static void Pack(PubJob j) {
+        // 每个目标各有自己的输出目录，资源就放在各自可执行文件旁边；
+        // 单文件的 Windows exe 已经把资源内嵌了，不需要这份散拷。
+        for (int i = 0; i < j.exes.Count; i = i + 1) {
+            if (File.Exists(j.exes[i])
+                && !(j.packed && ZanIDE.EndsWith(j.exes[i], ".exe"))) {
+                ZanIDE.CopyResources(j.root, ZanIDE.PayloadDirFor(j.exes[i]),
+                                     j.log);
+            }
+        }
+        // Chromium 从一个 helper 包里起子进程，所以它在链接之后、归档之前写。
+        for (int i = 0; i < j.exes.Count; i = i + 1) {
+            if (File.Exists(j.exes[i]) && ZanIDE.IsMacAppExe(j.exes[i])) {
+                string _h = ZanIDE.MacHelperPrepare(j.root, j.exes[i], j.log);
+            }
+        }
+        // macOS / Linux 的发布在 Windows 上留成 tar 归档：只有它带得走 unix
+        // 权限位，解包出来的二进制（和 .app 的 Contents/MacOS）才是可执行的。
+        List<string> tarred = new List<string>();
+        for (int i = 0; i < j.exes.Count; i = i + 1) {
+            if (!File.Exists(j.exes[i])) { continue; }
+            string tp = ZanIDE.TarPublishFor(j.exes[i], tarred, j.log);
+            if (tp != "") { tarred.Add(tp); }
+        }
+    }
+
+    static void Finish(PubJob j) {
+        PubPack.EnsureQueue();
+        Mutex.Lock(PubPack.sLock);
+        j.done = 1;
+        Mutex.Unlock(PubPack.sLock);
+    }
+
+    static int DoneOf(PubJob j) {
+        PubPack.EnsureQueue();
+        Mutex.Lock(PubPack.sLock);
+        int d = j.done;
+        Mutex.Unlock(PubPack.sLock);
+        return d;
+    }
+
+    /// 把这一次发布的收尾交给一条线程。返回 true 表示已经在跑；起不了线程时
+    /// 返回 false，调用方就地同步做完（宁可卡一下也不能不打包）。
+    static bool Start(string root, List<string> exes, bool packed) {
+        PubJob j = new PubJob();
+        j.root = root;
+        j.exes = exes;
+        j.packed = packed;
+        j.log = new List<string>();
+        j.done = 0;
+        PubPack.sCur = j;
+        PubPack.Push(j);
+        if (!Thread.Start(PubPack.Worker)) {
+            PubJob _drop = PubPack.Take();
+            PubPack.sCur = null;
+            return false;
+        }
+        return true;
+    }
+
+    /// 同步收尾（线程起不来时的退路）：日志直接进给定的输出列表。
+    static void PackNow(string root, List<string> exes, bool packed,
+                        List<string> log) {
+        PubJob j = new PubJob();
+        j.root = root;
+        j.exes = exes;
+        j.packed = packed;
+        j.log = log;
+        j.done = 1;
+        PubPack.Pack(j);
+    }
+
+    static bool Busy() {
+        if (PubPack.sCur == null) { return false; }
+        return PubPack.DoneOf(PubPack.sCur) == 0;
+    }
+
+    /// 跑完了就把这份活交出来（并清空在跑的那一份），否则返回 null。
+    static PubJob Ready() {
+        if (PubPack.sCur == null) { return null; }
+        if (PubPack.DoneOf(PubPack.sCur) == 0) { return null; }
+        PubJob j = PubPack.sCur;
+        PubPack.sCur = null;
+        return j;
+    }
+}
+
+/// 一次发布收尾的入参与产出。`log` 由线程写、由事件循环在 `Ready()` 之后读，
+/// 两边不重叠。
+class PubJob {
+    string root;
+    List<string> exes;
+    bool packed;
+    List<string> log;
+    int done;
+}
