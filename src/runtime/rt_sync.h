@@ -170,6 +170,12 @@ long long zan_file_flush(long long handle);
 long long zan_file_close(long long handle);
 long long zan_file_eof(long long handle);
 
+/* whole-file locks (System.IO.File.TryLock): released by the OS when the
+ * owning process exits, so they survive a crash without leaving a stale
+ * marker */
+long long zan_file_try_lock(const char *path);
+long long zan_file_unlock(long long handle);
+
 /* memory-mapped files (System.IO.MemoryMappedFile) */
 long long zan_mmap_create(const char *name, long long size);
 long long zan_mmap_open(const char *name, long long size);

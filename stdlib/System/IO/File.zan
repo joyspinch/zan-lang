@@ -59,6 +59,16 @@ class File {
     [DllImport("crt")]
     static extern string zan_embed_read(string name);
 
+    // 资源的原始字节：zan_embed_read 以 NUL 结尾，带 NUL 的二进制资源
+    // （图片、dll）必须走这里。返回资源在镜像里的地址，字节数写进
+    // outLen 指向的 int。
+    [DllImport("crt")]
+    static extern nint zan_embed_bytes(string name, byte[] outLen);
+
+    // 以某个前缀开头的全部资源名，用 '\n' 连接（前缀为空则是全部）。
+    [DllImport("crt")]
+    static extern string zan_embed_list(string prefix);
+
     /// <summary>把路径规范成内嵌资源名：内嵌资源以项目相对路径命名，
     /// "./config/app.json" 与 "config\\app.json" 都指向
     /// "config/app.json"。</summary>
@@ -75,6 +85,22 @@ class File {
         }
         if (s == ".") { return ""; }
         return s;
+    }
+
+    /// <summary>列出以 <paramref name="prefix"/> 开头的内嵌资源名（"" 为
+    /// 全部）。返回的名字可直接交给 <see cref="ExtractEmbedded"/> 或
+    /// <see cref="ReadAllText"/>。</summary>
+    static List<string> EmbeddedNames(string prefix) {
+        List<string> names = new List<string>();
+        string joined = zan_embed_list(File.EmbedName(prefix));
+        int start = 0;
+        for (int i = 0; i <= joined.Length; i = i + 1) {
+            bool end = i == joined.Length;
+            if (!end && joined.Substring(i, 1) != "\n") { continue; }
+            if (i > start) { names.Add(joined.Substring(start, i - start)); }
+            start = i + 1;
+        }
+        return names;
     }
 
     /// <summary>该路径是否有内嵌副本。</summary>
@@ -172,6 +198,28 @@ class File {
         return ((a / 4) % 2) == 0;
     }
 
+    [DllImport("crt")]
+    static extern long zan_file_try_lock(string path);
+
+    [DllImport("crt")]
+    static extern long zan_file_unlock(long handle);
+
+    /// <summary>抢占 <paramref name="path"/> 的跨进程独占锁（文件不存在
+    /// 就创建），拿到返回非 0 句柄，已被别的进程占用返回 0，不等待。
+    ///
+    /// 锁就是那个打开的系统句柄：进程退出（含被杀、崩溃）时由内核释放，
+    /// 因此不像 pid 文件那样会留下需要清理的陈旧标记。用途是「同一个程序
+    /// 的第几份副本占用哪个数据目录」这类判断。</summary>
+    static long TryLock(string path) {
+        return zan_file_try_lock(path);
+    }
+
+    /// <summary>释放 <see cref="TryLock"/> 拿到的锁；本来就没锁住返回
+    /// false。进程退出时无需显式调用。</summary>
+    static bool Unlock(long handle) {
+        return zan_file_unlock(handle) != 0;
+    }
+
     #if !WINDOWS
     [DllImport("crt")]
     static extern int chmod(string path, int mode);
@@ -201,7 +249,7 @@ class File {
         string lower = path.ToLower();
         if (!File.Exists(path)) { return false; }
         return lower.EndsWith(".exe") || lower.EndsWith(".bat")
-            || lower.EndsWith(".cmd") || lower.EndsWith(".com");
+        || lower.EndsWith(".cmd") || lower.EndsWith(".com");
         #else
         if (!File.Exists(path)) { return false; }
         return access(path, 1 /*X_OK*/) == 0;
@@ -371,6 +419,44 @@ class File {
         if (written != (long)data.Length) {
             throw new IOException("Could not write complete file: " + path);
         }
+    }
+
+    /// <summary>把内嵌资源原样落盘（二进制安全），返回是否落盘成功。
+    /// 没有这份内嵌资源返回 false。目标已存在且大小一致时直接成功，
+    /// 不重复写——同一份资源每次进程启动都会走到这里。
+    ///
+    /// 用于必须以「真文件」形式存在才能用的资源：动态库要交给系统加载器
+    /// （LoadLibrary/dlopen 只认路径），子进程可执行文件要交给 exec。
+    /// </summary>
+    static bool ExtractEmbedded(string path, string dest) {
+        string name = File.EmbedName(path);
+        if (zan_embed_has(name) == 0) { return false; }
+        byte[] lenBuf = new byte[8];
+        nint src = zan_embed_bytes(name, lenBuf);
+        if (src == 0) { return false; }
+        // 小端在目标平台上都成立（x86/ARM），这里按字节拼回长度而不是
+        // 引入一个只为读 int 的指针 API。
+        int len = (int)lenBuf[0] + (int)lenBuf[1] * 256
+        + (int)lenBuf[2] * 65536 + (int)lenBuf[3] * 16777216;
+        if (len <= 0) { return false; }
+        if (File.Exists(dest) && File.GetSize(dest) == len) { return true; }
+        // 先写临时文件再改名：另一个进程可能正好在加载这份资源，半个
+        // 文件被 LoadLibrary/dlopen 看到就是一次莫名的加载失败。
+        string part = dest + ".part";
+        FileStream fs = FileStream.OpenWrite(part);
+        int wrote = fs.WriteFrom(src, len);
+        fs.Close();
+        if (wrote != len) {
+            File.Delete(part);
+            return false;
+        }
+        File.Move(part, dest);
+        if (File.Exists(dest) && File.GetSize(dest) == len) {
+            File.Delete(part);
+            return true;
+        }
+        File.Delete(part);
+        return false;
     }
 
     /// <summary>将原始字节追加到文件末尾（二进制安全）。

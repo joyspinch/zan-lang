@@ -22,6 +22,16 @@
 #define _DEFAULT_SOURCE 1
 #endif
 
+/* flock(2) is a BSD extension, and the cross builds compile this with
+ * -std=c11 (so __STRICT_ANSI__): the Darwin and musl headers hide it unless
+ * their BSD flavour is asked for, before any system header is pulled in. */
+#if !defined(_WIN32) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE 1
+#endif
+#if !defined(_WIN32) && !defined(_BSD_SOURCE)
+#define _BSD_SOURCE 1
+#endif
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +46,9 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifndef __wasm__
+#include <sys/file.h>      /* flock */
+#endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>   /* _NSGetExecutablePath */
 #endif
@@ -522,4 +535,84 @@ long long zan_file_eof(long long handle) {
     zan_fh_unlock();
     if (!f) return 1;
     return feof(f) ? 1 : 0;
+}
+
+/* ---- whole-file locks (System.IO.File.TryLock) ---------------------------
+ * A lock nobody has to clean up: it lives in an open OS handle, so the kernel
+ * releases it when the process exits -- including when it is killed. That is
+ * what makes it usable for "which copy of this program owns which data
+ * directory": a crashed instance leaves no stale marker behind, unlike a pid
+ * file. Non-blocking: taken or refused, never waits.
+ * Handles are slots in a small table so zan code never holds a raw HANDLE/fd,
+ * matching the file-stream table above. */
+
+#define ZAN_LK_CAP 32
+typedef struct {
+#ifdef _WIN32
+    HANDLE h;
+#else
+    int fd;
+#endif
+    int used;
+} zan_lk_slot;
+static zan_lk_slot g_lk_table[ZAN_LK_CAP];
+
+/* Takes an exclusive lock on `path` (created when missing). Returns a handle,
+ * or 0 when another process holds it or the path is unusable. */
+long long zan_file_try_lock(const char *path) {
+    if (!path || !path[0]) return 0;
+    zan_fh_lock();          /* the table lock is shared with the stream table */
+    long slot = -1;
+    for (long i = 0; i < ZAN_LK_CAP; i++) {
+        if (!g_lk_table[i].used) { slot = i; break; }
+    }
+    zan_fh_unlock();
+    if (slot < 0) return 0;
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, 0 /* no sharing */, NULL,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+#elif defined(__wasm__)
+    (void)slot;
+    return 0;               /* no processes to contend with */
+#else
+    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+    if (fd < 0) return 0;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) { close(fd); return 0; }
+#endif
+#ifndef __wasm__
+    zan_fh_lock();
+#ifdef _WIN32
+    g_lk_table[slot].h = h;
+#else
+    g_lk_table[slot].fd = fd;
+#endif
+    g_lk_table[slot].used = 1;
+    zan_fh_unlock();
+    return (long long)(slot + 1);
+#endif
+}
+
+/* Releases a lock from zan_file_try_lock. Returns 1 when a lock was held. */
+long long zan_file_unlock(long long handle) {
+    long slot = (long)(handle - 1);
+    if (slot < 0 || slot >= ZAN_LK_CAP) return 0;
+    zan_fh_lock();
+    int used = g_lk_table[slot].used;
+#ifdef _WIN32
+    HANDLE h = g_lk_table[slot].h;
+    g_lk_table[slot].h = NULL;
+#elif !defined(__wasm__)
+    int fd = g_lk_table[slot].fd;
+    g_lk_table[slot].fd = -1;
+#endif
+    g_lk_table[slot].used = 0;
+    zan_fh_unlock();
+    if (!used) return 0;
+#ifdef _WIN32
+    CloseHandle(h);
+#elif !defined(__wasm__)
+    close(fd);              /* drops the flock */
+#endif
+    return 1;
 }
