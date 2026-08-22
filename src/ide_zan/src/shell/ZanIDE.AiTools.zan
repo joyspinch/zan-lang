@@ -35,18 +35,37 @@ partial class ZanIDE {
         // 同一个查询发第二次：结果一字不差就在上面，再跑一遍只是把同样的东西
         // 堆进上下文，然后模型接着原地打转（用户看到的就是同一段催促刷三遍）。
         // 所以直接拒掉并指回上面那份结果，而不是默默地再查一次。
-        if (AiAgent.IsLookup(tool)
-            && this.AiSeenTool(AiAgent.CallSig(call))) {
+        //
+        // 「同一个查询」比签名相同宽一点：同一个文件的行区间已经被读过的那一段
+        // 覆盖住（读了 1-200 再读 40-120），以及用户正打开着、正文已经钉在对话
+        // 里的那个文件——这两种读法一个新字节都拿不到，一样拒。
+        string dupWhy = "";
+        if (AiAgent.IsLookup(tool)) {
+            if (this.AiSeenTool(AiAgent.CallSig(call))) {
+                dupWhy = ZanIDE.T("this exact call already ran in this turn",
+                    "这个调用刚才已经跑过了");
+            } else if (tool == "read_file" && this.AiPinnedRead(call)) {
+                dupWhy = ZanIDE.T("that file is the one the user has open and"
+                    + " its full current content is pinned in this"
+                    + " conversation", "这个文件就是用户正打开的那个，它的完整"
+                    + "现状已经钉在这段对话里");
+            } else if (tool == "read_file" && this.AiSeenRead(call)) {
+                dupWhy = ZanIDE.T("those lines are inside a range already read"
+                    + " in this turn", "这些行落在这一问里已经读过的区间里");
+            }
+        }
+        if (dupWhy != "") {
+            ZanIDE.aiStatDupTools = ZanIDE.aiStatDupTools + 1;
             aiMsgs.Add(this.AiToolMsg("tool", AiAgent.Describe(call) + "\n"
-                + ZanIDE.T("refused: this exact call already ran in this turn"
-                    + " (the file is fine -- this is not evidence of a bug);"
-                    + " its result is above -- use it, or take the next real"
-                    + " step instead of looking again.",
-                    "refused: 这个调用刚才已经跑过了（不是文件不存在，别把这条"
-                    + "当成缺陷证据）：结果就在上面，直接用它，或者做下一步"
-                    + "实际动作，别再查一遍。")));
-        aiIdleWhy = ZanIDE.T("the same lookup was refused as a repeat: ",
-            "重复的同一次查询被拦下，没有新信息进来：") + AiAgent.Describe(call);
+                + ZanIDE.T("refused: ", "refused: ") + dupWhy
+                + ZanIDE.T(" (the file is fine -- this is not evidence of a"
+                    + " bug); the content is above -- use it, or take the next"
+                    + " real step instead of looking again.",
+                    "（不是文件不存在，别把这条当成缺陷证据）：内容就在上面，"
+                    + "直接用它，或者做下一步实际动作，别再查一遍。")));
+            aiIdleWhy = ZanIDE.T("the same lookup was refused as a repeat: ",
+                "重复的同一次查询被拦下，没有新信息进来：")
+                + AiAgent.Describe(call);
             string rerr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs, aiRunCtxName,
                 aiRunCtxCode, root, aiProfiles[aiProfActive].baseUrl,
                 aiProfiles[aiProfActive].key, aiRunModel);
@@ -291,8 +310,9 @@ partial class ZanIDE {
             buildTargetPath = apB;
             buildLogLen = 0;
             aiBuildForAi = true;
-            // 编译/运行前面一定刚改过东西：查过的东西已经不作数了，重新读得允许。
-            this.AiForgetTools();
+            // 编译/运行本身不改源码（写入那一步早就把自己那个文件的查询清掉
+            // 了，见 AiWorkFinish），所以这里不再把整份「查过什么」全忘掉：
+            // 忘掉的后果是每编译一次，模型就把刚才读过的文件重新读一遍。
             dock.Focus("output");
             log.Add(ZanIDE.T("> [AI] Building ", "> [AI] 正在构建 ") + rpB + " ...");
             app.RequestAnimationFrame(80);
@@ -325,8 +345,10 @@ partial class ZanIDE {
     void AiWorkFinish(AiJob job) {
         string tool = AiAgent.ToolName(job.call);
         if (job.measure) { this.AiNoteDelta(job.path, job.adds, job.dels); }
-        // 写过之后文件已经不是刚才那份：同一个查询再跑一次是合理的，不再拦。
-        if (AiAgent.IsMutating(tool)) { this.AiForgetTools(); }
+        // 写过之后**那个文件**已经不是刚才那份：只有跟它有关的查询才重新
+        // 允许。以前是整份忘掉，于是改一个文件就把另外五个文件的正文重新
+        // 读一遍——那正是「反复读同一段代码」的另一半原因。
+        if (AiAgent.IsMutating(tool)) { this.AiForgetToolsFor(job.path); }
         aiMsgs.Add(this.AiToolMsg("tool",
             AiAgent.Describe(job.call) + "\n" + job.result));
         string terr = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs, aiRunCtxName,
@@ -352,8 +374,105 @@ partial class ZanIDE {
         return false;
     }
 
-    /// 忘掉跑过的查询：工程变了（写入、构建）或者用户又说了一句话。
-    void AiForgetTools() { aiToolSigs = new List<string>(); }
+    /// 这一段行区间读过没有。同一个文件读 1-200 行再读 40-120 行是两个不同的
+    /// 签名（`CallSig` 带 offset/limit），所以光比签名拦不住——而后一次一个新
+    /// 字节都拿不到。已经被某次读覆盖住的区间返回 true（该拒），否则记下这次
+    /// 的覆盖范围并返回 false（该读）。
+    bool AiSeenRead(string call) {
+        JsonValue v = JsonValue.ParseLenient(call);
+        if (v == null) { return false; }
+        string path = v.Str("path", "");
+        if (path == "") { return false; }
+        int from = v.Int("offset", 1);
+        if (from < 1) { from = 1; }
+        int limit = v.Int("limit", 0);
+        // limit 省了 / <=0 就是「整个文件」：用一个比任何文件都大的行号收尾。
+        int to = ZanIDE.AiWholeFileTo();
+        if (limit > 0) { to = from + limit - 1; }
+        if (aiReadPaths == null) {
+            aiReadPaths = new List<string>();
+            aiReadFrom = new List<int>();
+            aiReadTo = new List<int>();
+        }
+        for (int i = 0; i < aiReadPaths.Count; i = i + 1) {
+            if (aiReadPaths[i] != path) { continue; }
+            if (aiReadFrom[i] <= from && aiReadTo[i] >= to) { return true; }
+        }
+        aiReadPaths.Add(path);
+        aiReadFrom.Add(from);
+        aiReadTo.Add(to);
+        return false;
+    }
+
+    /// 这次 read_file 读的就是用户正打开的那个文件，而它的完整正文已经作为
+    /// 一条 note 钉在对话里（见 `AiAgent.PinNotes`）。正文被截断过就不算：那
+    /// 时文件比钉进去的那一段长，后面的行确实还没给过，读是应该的。
+    bool AiPinnedRead(string call) {
+        if (aiRunCtxName == "") { return false; }
+        if (aiRunCtxCode.Length > AiAgent.MaxPinChars()) { return false; }
+        JsonValue v = JsonValue.ParseLenient(call);
+        if (v == null) { return false; }
+        string p = v.Str("path", "").Replace("\\", "/");
+        return p != "" && p == aiRunCtxName.Replace("\\", "/");
+    }
+
+    /// 「读到文件末尾」的收尾行号：比任何一个源文件的行数都大。
+    static int AiWholeFileTo() { return 1000000000; }
+
+    /// 忘掉跑过的查询：用户又说了一句话（新的一问从头算）。
+    void AiForgetTools() {
+        aiToolSigs = new List<string>();
+        aiReadPaths = new List<string>();
+        aiReadFrom = new List<int>();
+        aiReadTo = new List<int>();
+    }
+
+    /// 忘掉跟这一个路径有关的查询：那个文件真的变了，再读一次是合理的。项目
+    /// 级的视图（grep / 列目录 / 工程概览）也一起忘掉——一次写入可能新建了
+    /// 文件，它们的结果跟着变。别的文件在磁盘上一个字都没动，那些查询继续
+    /// 拦着，不然改一处就要把读过的东西全部重读一遍。
+    /// 路径为空（拿不到写入目标）时退回「全忘」，宁可多读一遍也不能拿旧正文
+    /// 当现状。
+    void AiForgetToolsFor(string path) {
+        if (path == "") { this.AiForgetTools(); return; }
+        if (aiToolSigs == null) { aiToolSigs = new List<string>(); }
+        List<string> keep = new List<string>();
+        for (int i = 0; i < aiToolSigs.Count; i = i + 1) {
+            if (ZanIDE.AiSigStale(aiToolSigs[i], path)) { continue; }
+            keep.Add(aiToolSigs[i]);
+        }
+        aiToolSigs = keep;
+        if (aiReadPaths == null) { return; }
+        List<string> kp = new List<string>();
+        List<int> kf = new List<int>();
+        List<int> kt = new List<int>();
+        for (int i = 0; i < aiReadPaths.Count; i = i + 1) {
+            if (aiReadPaths[i] == path) { continue; }
+            kp.Add(aiReadPaths[i]);
+            kf.Add(aiReadFrom[i]);
+            kt.Add(aiReadTo[i]);
+        }
+        aiReadPaths = kp;
+        aiReadFrom = kf;
+        aiReadTo = kt;
+    }
+
+    /// 这个查询签名会不会因为 `path` 被改写而过期：签名里的路径就是它（读的
+    /// 是这个文件），或者它是一份项目级的视图（grep / 列目录 / 工程概览）。
+    /// 签名的格式见 `AiAgent.CallSig`：工具名 | 路径 | ...
+    static bool AiSigStale(string sig, string path) {
+        int a = ZanIDE.IndexOfStr(sig, "|");
+        if (a < 0) { return true; }
+        string tool = sig.Substring(0, a);
+        string rest = sig.Substring(a + 1, sig.Length - a - 1);
+        int b = ZanIDE.IndexOfStr(rest, "|");
+        string sigPath = rest;
+        if (b >= 0) { sigPath = rest.Substring(0, b); }
+        if (tool == "grep" || tool == "list_dir" || tool == "repo_map") {
+            return true;
+        }
+        return sigPath == path;
+    }
 
     /// 写工具的目标路径；不是写工具就是空串。
     static string AiWritePath(string tool, string call) {
@@ -403,6 +522,11 @@ partial class ZanIDE {
         aiAutoCont = 0;
         aiPendingCall = "";
         aiToolSigs = new List<string>();
+        aiReadPaths = new List<string>();
+        aiReadFrom = new List<int>();
+        aiReadTo = new List<int>();
+        // 新的聊天里一条 note 都没有：记着「已经钉过」会让模型手上一份正文都没。
+        AiAgent.ResetPins();
         aiIdleKey = "";
         aiIdleTimes = 0;
         aiEscKey = "";

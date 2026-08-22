@@ -1489,6 +1489,19 @@ class AiAgent {
             + " -- see the GUI & GAME section -- BEFORE writing code; do not"
             + " guess a control constructor, a Theme token or a Game module"
             + " entry.\n"
+            // 读代码要花的是用户的钱和用户的时间：同一段读两遍不会带来新信息，
+            // 只会把上下文顶大、把缓存前缀顶掉，然后模型接着确认它已经知道的
+            // 事。所以「怎么读」跟「读什么」一样写进协议里。
+            + "2a. READ ONCE, PRECISELY, THEN EDIT. grep for the symbol to get"
+            + " path:line, then read_file that one window (offset a few lines"
+            + " above the hit, limit 80-200) -- not the whole file, and not the"
+            + " same lines twice. Anything you already received in this"
+            + " conversation (a tool result above, the pinned content of the"
+            + " file the user has open) is current unless a write changed it:"
+            + " use it instead of reading it again; a repeated read is refused."
+            + " When you know what to change, make the WHOLE change in one"
+            + " edit_file (or one write_file) and then build -- do not edit one"
+            + " line, re-read, edit the next line.\n"
             + "3. CITE your evidence as path:line so the user can check every"
             + " claim against the code you actually read.\n"
             + "4. VERIFY before claiming. After an edit, build (or run /"
@@ -1605,22 +1618,16 @@ class AiAgent {
         StringBuilder sb = new StringBuilder();
         sb.Append("CURRENT CONTEXT (refreshed every turn; always trust this"
             + " over anything older in the conversation).\n\n");
+        // 打开文件的正文不在这里：它是这段现场里唯一的大块头（上千到六千
+        // 字节），跟着现场每一拍重发一遍就等于每一拍白扔那么多缓存，而且
+        // 压缩之后模型在历史里找不到它，于是再 read_file 读一遍同一段。
+        // 现在正文「变了才钉一条进对话」（`PinNotes`），这里只留一句指路。
         if (ctxName != "") {
-            string ctx = ctxCode;
-            if (ctx.Length > 6000) { ctx = AiAgent.Clip(ctx, 6000); }
             sb.Append("The user is currently editing " + ctxName
-                + ". Its current content:\n" + ctx + "\n\n");
-        }
-        // 项目参考定型之后才变的那种情况（工具新建了文件、知识被写了一条）：
-        // 差异走这条消息补，前缀那份一个字都不动。重写前缀等于把整段对话的
-        // 缓存一起作废，为一次结构变动付那个价钱不值得。
-        if (root != "") {
-            string now = AiAgent.ProjectRefNow(root);
-            if (now != AiAgent.ProjectRef(root)) {
-                sb.Append("PROJECT REFERENCE UPDATED since the copy in the"
-                    + " system message -- this is the current one:\n"
-                    + now + "\n");
-            }
+                + ". Its content is pinned in the conversation above as an"
+                + " \"open file\" note (the LAST such note for this path is"
+                + " the current one) -- use it instead of calling read_file"
+                + " on that path.\n\n");
         }
         // 单人模式那份计划：当前那一步在这里被指出来，模型于是不必从被压缩过
         // 的历史里猜自己走到哪了。
@@ -1629,6 +1636,58 @@ class AiAgent {
         // 它）。不告诉它图长什么样，它就只能把图当作一次性的清单发完就忘。
         sb.Append(AiTeam.Board());
         return sb.ToString();
+    }
+
+    // 钉进对话的现场：打开文件的正文，以及项目参考被工具改动之后的新版本。
+    // 这两块都是「大而不常变」——放在最后那条现场消息里每一拍重发，一次提问
+    // 跑二十拍就白扔十几万字节的缓存；作为一条工具消息钉进对话则只追加、
+    // 不重发，从下一拍起它就落在缓存前缀里，而且一直看得见（模型不必为了
+    // 看自己刚看过的正文再发一次 read_file）。
+    static string gPinName;
+    static string gPinCode;
+    static string gPinRef;
+
+    /// 打开文件的正文最多钉这么多字节（跟以前发在现场里的上限一样）。
+    static int MaxPinChars() { return 6000; }
+
+    /// 这一拍需要钉进对话的现场，每条一段正文；没有变化时是空列表（绝大多数
+    /// 拍都是空的，那正是缓存能命中的原因）。
+    static List<string> PinNotes(string ctxName, string ctxCode, string root) {
+        List<string> outs = new List<string>();
+        if (ctxName != "") {
+            string ctx = ctxCode;
+            if (ctx.Length > AiAgent.MaxPinChars()) {
+                ctx = AiAgent.Clip(ctx, AiAgent.MaxPinChars());
+            }
+            if (AiAgent.gPinName != ctxName || AiAgent.gPinCode != ctx) {
+                AiAgent.gPinName = ctxName;
+                AiAgent.gPinCode = ctx;
+                outs.Add("open file " + ctxName + " (current content as the"
+                    + " user has it in the editor; this is the newest copy of"
+                    + " the whole file -- do not call read_file on it)\n"
+                    + ctx);
+            }
+        }
+        // 项目参考定型之后才变的那种情况（工具新建了文件、知识被写了一条）：
+        // 新版本钉一条进对话，系统消息里那份一个字都不动。重写前缀等于把整段
+        // 对话的缓存一起作废，为一次结构变动付那个价钱不值得。
+        if (root != "") {
+            string now = AiAgent.ProjectRefNow(root);
+            if (now != AiAgent.ProjectRef(root) && now != AiAgent.gPinRef) {
+                AiAgent.gPinRef = now;
+                outs.Add("project reference updated (the copy in the system"
+                    + " message is older; this one is current)\n" + now);
+            }
+        }
+        return outs;
+    }
+
+    /// 换一个聊天就重新钉：新对话里那些 note 不存在了，记着「已经钉过」会让
+    /// 模型手上一份正文都没有。
+    static void ResetPins() {
+        AiAgent.gPinName = "";
+        AiAgent.gPinCode = "";
+        AiAgent.gPinRef = "";
     }
 
     // 项目参考（RepoMap 结构 + 项目知识）：内容只在项目本身变了才变，但足有
@@ -2146,6 +2205,10 @@ class AiAgent {
         }
         string digest = d.ToString();
         AiAgent.SetSticky(agent, keepFrom, digest);
+        // 这一折把前面那些轮换成了摘要，钉进去的正文（打开文件、项目参考）
+        // 很可能就在被折掉的那一段里：忘掉「已经钉过」，下一拍重新钉一份。
+        // 不然模型手上没有正文，而重复读又会被拒——那就真的什么都看不到了。
+        AiAgent.ResetPins();
         m.msgs.Add(ChatMessage.Create("user", digest));
         int r = keepFrom;
         while (r < n) {
