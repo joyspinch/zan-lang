@@ -59,11 +59,7 @@ partial class MainForm {
         MainForm.tabPages = new List<Control>();
         MainForm.tabBrowsers = new List<CefBrowserBox>();
         MainForm.syncedUrl = "";
-        MainForm.tabKeys.Add("module:home");
-        MainForm.tabPages.Add(SearchPage);
-        MainForm.tabBrowsers.Add(null);
         DocumentTabs.Clear();
-        DocumentTabs.Add("推广软件", false);
         DocumentTabs.SetShowAdd(false);
         SiteButton.Click += MainForm.SiteClicked;
         NavBackButton.Icon = "chevron-left";
@@ -82,8 +78,10 @@ partial class MainForm {
         NavRefreshButton.Click += MainForm.NavRefresh;
         NavCloseButton.Click += MainForm.NavStop;
         AddressBox.Submit += MainForm.NavGo;
-        MainForm.ShowTab(0);
-        MainForm.SetStatus("推广软件 · 业务工具 · 假数据");
+        // 首标签是固定的主页网页（不可关闭），业务工具页由命令菜单按需打开。
+        SiteDef home = SiteRegistry.Home();
+        MainForm.OpenBrowserTab("browser:" + home.key, home.name,
+                                home.url, false);
         // 登录/授权本应来自授权接口；本壳跟其他页一样先给假数据。
         SessionState.SetAuth("新云腾商城", "琼子", true, "2026-11-15");
         MainForm.RefreshTitleStatus();
@@ -241,10 +239,12 @@ partial class MainForm {
     }
 
     static void OpenSite(SiteDef site) {
-        MainForm.OpenBrowserTab("browser:" + site.key, site.name, site.url);
+        MainForm.OpenBrowserTab("browser:" + site.key, site.name,
+                                site.url, true);
     }
 
-    static void OpenBrowserTab(string key, string name, string url) {
+    static void OpenBrowserTab(string key, string name, string url,
+                               bool closable) {
         for (int i = 0; i < MainForm.tabKeys.Count; i = i + 1) {
             if (MainForm.tabKeys[i] == key) {
                 DocumentTabs.Select(i);
@@ -258,7 +258,7 @@ partial class MainForm {
             }
         }
         int at = DocumentTabs.Count();
-        DocumentTabs.Add(name, true);
+        DocumentTabs.Add(name, closable);
         Control page;
         CefBrowserBox box = null;
         if (MainForm.cefReady) {
@@ -266,6 +266,10 @@ partial class MainForm {
             box.Dock(Dock.Fill());
             page = box;
             box.SetStartUrl(url);
+            // window.open / target=_blank 默认由 CEF 自己开一个独立的 Chromium
+            // 窗口（看着就是凭空多出来一个「Chrome 浏览器」）；这里改成在本软件
+            // 里新开一个标签。
+            box.View().OnPopup(MainForm.OpenPopup);
         } else {
             TextArea unavailable = new TextArea("");
             unavailable.ReadOnly(true).AutoHeight(true);
@@ -282,6 +286,13 @@ partial class MainForm {
         MainForm.ShowTab(at);
         MainForm.SetStatus(name + " · " +
             (MainForm.cefReady ? "浏览器已打开" : "浏览器不可用"));
+    }
+
+    /// 页面里 window.open / target=_blank 的目标：在本软件里新开一个标签，
+    /// 而不是让 CEF 自己弹一个独立的 Chromium 窗口。
+    static void OpenPopup(string url) {
+        if (url == "") { return; }
+        MainForm.OpenBrowserTab("browser:popup:" + url, "新标签", url, true);
     }
 
     static CefBrowserBox ActiveBrowser() {
@@ -326,7 +337,7 @@ partial class MainForm {
         if (b != null) {
             b.Navigate(target);
         } else {
-            MainForm.OpenBrowserTab("browser:manual", "网页", target);
+            MainForm.OpenBrowserTab("browser:manual", "网页", target, true);
         }
     }
 
@@ -392,16 +403,23 @@ partial class MainForm {
         MainForm.current.HandleMenu();
         int changed = DocumentTabs.TakeChanged();
         if (changed >= 0) { MainForm.ShowTab(changed); }
+        // 「关闭全部 / 关闭其他」一次移除多个标签，关闭索引在标签条里排队：
+        // 一帧只领一个的话，剩下的标签页和浏览器会一直挂着（关完标签 Chromium
+        // 进程还在就是这个原因），因此这里一次把队列领干净。
+        bool shut = false;
         int closed = DocumentTabs.TakeClosed();
-        if (closed >= 0 && closed < MainForm.tabPages.Count) {
-            CefBrowserBox cb = MainForm.tabBrowsers[closed];
-            if (cb != null) { cb.Destroy(); }
-            MainForm.tabPages.RemoveAt(closed);
-            MainForm.tabKeys.RemoveAt(closed);
-            MainForm.tabBrowsers.RemoveAt(closed);
-            int active = DocumentTabs.Active();
-            MainForm.ShowTab(active);
+        while (closed >= 0) {
+            if (closed < MainForm.tabPages.Count) {
+                CefBrowserBox cb = MainForm.tabBrowsers[closed];
+                if (cb != null) { cb.Destroy(); }
+                MainForm.tabPages.RemoveAt(closed);
+                MainForm.tabKeys.RemoveAt(closed);
+                MainForm.tabBrowsers.RemoveAt(closed);
+                shut = true;
+            }
+            closed = DocumentTabs.TakeClosed();
         }
+        if (shut) { MainForm.ShowTab(DocumentTabs.Active()); }
         MainForm.SyncAddress();
         nint evh = Window.EventHwnd();
         if (evh != MainForm.app.WindowHandle()) {
