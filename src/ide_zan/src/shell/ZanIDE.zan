@@ -1611,7 +1611,23 @@ partial class ZanIDE {
             // Poll the in-flight detached publish: compiler output streams
             // into the Output tab and a done-marker file signals completion,
             // so even a slow cross-compile never blocks the UI.
-            if (pubBusy) {
+            if (pubBusy && pubPacking) {
+                // The packaging thread's own log lines arrive in one go when it
+                // finishes; the publish is only done once they are in.
+                PubJob pj = PubPack.Ready();
+                if (pj != null) {
+                    for (int pl = 0; pl < pj.log.Count; pl = pl + 1) {
+                        log.Add(pj.log[pl]);
+                    }
+                    pubPacking = false;
+                    pubBusy = false;
+                    pubExes = new List<string>();
+                    coLog.Reset();
+                    app.RequestRedraw();
+                } else {
+                    this.PollNextIn(app, 250, orr);
+                }
+            } else if (pubBusy) {
                 int pubConsumed = ZanIDE.PubPoll(pubLogLen, log);
                 if (pubConsumed != pubLogLen) {
                     pubLogLen = pubConsumed;
@@ -1635,38 +1651,27 @@ partial class ZanIDE {
                             log.Add(ZanIDE.T("> Publish failed for ", "> 发布失败：") + pubExes[pe]);
                         }
                     }
-                    // Each target has its own output directory, so the
-                    // resources go beside each executable that does not
-                    // already carry them: a single-file Windows exe has them
-                    // embedded, everything else needs the loose copy.
+                    // The packaging that follows a publish -- resources beside
+                    // each executable, the Chromium helper bundle, and the
+                    // tar.gz (a whole publish directory read and gzipped) --
+                    // takes seconds to tens of seconds. On the UI thread that
+                    // is a window that stops pumping messages, i.e. "ZanIDE
+                    // (not responding)" at the end of every macOS publish, so
+                    // it runs on its own thread and this loop polls it.
                     bool packed = ZanIDE.ProjSingleFile(root);
-                    for (int pe3 = 0; pe3 < pubExes.Count; pe3 = pe3 + 1) {
-                        if (File.Exists(pubExes[pe3])
-                            && !(packed && ZanIDE.EndsWith(pubExes[pe3], ".exe"))) {
-                            ZanIDE.CopyResources(root,
-                                ZanIDE.PayloadDirFor(pubExes[pe3]), log);
-                        }
+                    if (PubPack.Start(root, pubExes, packed)) {
+                        pubPacking = true;
+                        log.Add(ZanIDE.T("> Packaging the published output ...",
+                                         "> 正在打包发布产物 ..."));
+                    } else {
+                        PubPack.PackNow(root, pubExes, packed, log);
+                        pubBusy = false;
+                        pubExes = new List<string>();
                     }
-                    // macOS / Linux publishes leave Windows as a tar archive:
-                    // it is the only common format that carries the unix mode,
-                    // so the unpacked binary (and the .app's Contents/MacOS)
-                    // is executable instead of "permission denied".
-                    List<string> tarred = new List<string>();
-                    for (int pe4 = 0; pe4 < pubExes.Count; pe4 = pe4 + 1) {
-                        // A library target produces two files in one directory;
-                        // archive that directory once.
-                        if (File.Exists(pubExes[pe4])) {
-                            string tp = ZanIDE.TarPublishFor(pubExes[pe4],
-                                                             tarred, log);
-                            if (tp != "") { tarred.Add(tp); }
-                        }
-                    }
-                    pubBusy = false;
-                    pubExes = new List<string>();
                     coLog.Reset();
                     app.RequestRedraw();
                 }
-                if (pubBusy && pubStartMs != 0
+                if (pubBusy && !pubPacking && pubStartMs != 0
                     && Window.GetTickMs() - pubStartMs > 1800000) {
                     pubBusy = false;
                     pubExes = new List<string>();
@@ -2067,6 +2072,7 @@ partial class ZanIDE {
             if (editor.SyntaxLang() == 2) { modeInfo = "Python"; }
             if (designerMode) { modeInfo = ZanIDE.T("Designer", "设计器"); }
             if (pubBusy) { modeInfo = ZanIDE.T("Publishing...", "发布中..."); }
+            if (pubPacking) { modeInfo = ZanIDE.T("Packaging...", "打包中..."); }
             if (sbDebug) { modeInfo = ZanIDE.T("Debugging", "调试中"); }
             int sbTint = 0;
             if (sbDebug) { sbTint = t.statusDebugBg; }

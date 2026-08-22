@@ -108,6 +108,130 @@ partial class ZanIDE {
         bool _x = File.SetExecutable(p, true);
     }
 
+    /// The Chromium helper bundle of a macOS publish:
+    /// `Contents/Frameworks/<name> Helper.app`. Its executable is the driver's
+    /// standalone `zan_cef_helper` (~30 KB: it dlopens libzan_cef.dylib in
+    /// Contents/MacOS and calls cef_execute_process), which zanc bundles into
+    /// Contents/MacOS next to the driver; the bundle therefore holds no second
+    /// copy of the program and no duplicated dylibs. A driver directory
+    /// without that helper falls back to a copy of the program itself, which
+    /// is what CefBootstrap.RunHelper() supports on every platform.
+    ///
+    /// CEF needs a separate sub-process executable on macOS. Without one
+    /// Chromium re-launches the app's own bundle for every render/gpu/utility
+    /// process, and each child then carries the app's Info.plist -- one launch
+    /// shows up as four apps in the Dock. LSUIElement is what keeps a helper
+    /// out of the Dock and the app switcher.
+    ///
+    /// Chromium since M76 does not use `browser-subprocess-path` for every
+    /// child: renderers, the GPU, plugins and the alerts service each look for
+    /// a helper bundle of their own, named after the plain one with a suffix
+    /// (`<name> Helper (Renderer).app` and so on -- one bundle per set of
+    /// entitlements a notarized app needs). A missing bundle is not a fallback
+    /// to the plain helper: the launch fails with ENOENT and the process never
+    /// exists, which for the renderer means every page stays blank.
+    ///
+    /// Only a bundle that carries the CEF driver gets a helper: without
+    /// Chromium there are no child processes and no reason to duplicate the
+    /// binary. Returns the plain helper executable (the one CEF is pointed at
+    /// as `browser-subprocess-path`), or "" when none was written.
+    static string MacHelperPrepare(string root, string exe, List<string> log) {
+        string macos = ZanIDE.DirOf(exe);
+        if (!File.Exists(macos + "/libzan_cef.dylib")) { return ""; }
+        string baseName = Path.GetFileName(exe) + " Helper";
+        string frameworks = ZanIDE.DirOf(macos) + "/Frameworks";
+        string small = macos + "/zan_cef_helper";
+        bool tiny = File.Exists(small);
+        string src = tiny ? small : exe;
+        string ver = ZanIDE.ProjField(root, "version");
+        if (ver == "") { ver = "1.0.0"; }
+        string ident = ZanIDE.ProjField(root, "bundleId");
+        if (ident == "") {
+            ident = "com.zanlang." + ZanIDE.BundleIdSafe(Path.GetFileName(exe));
+        }
+        // Name and bundle-id suffixes of the helper set, as Chromium looks
+        // them up (CEF's own CEF_HELPER_APP_SUFFIXES uses the same list).
+        List<string> names = new List<string>();
+        List<string> idents = new List<string>();
+        names.Add("");            idents.Add("");
+        names.Add(" (Alerts)");   idents.Add(".alerts");
+        names.Add(" (GPU)");      idents.Add(".gpu");
+        names.Add(" (Plugin)");   idents.Add(".plugin");
+        names.Add(" (Renderer)"); idents.Add(".renderer");
+        string plain = "";
+        for (int i = 0; i < names.Count; i = i + 1) {
+            string helper = ZanIDE.MacHelperBundle(frameworks,
+                baseName + names[i], ident + ".helper" + idents[i], ver,
+                src, tiny, macos);
+            if (i == 0) { plain = helper; }
+        }
+        if (tiny) {
+            // The staged helper only exists to be copied into the bundles:
+            // leaving it in Contents/MacOS would ship it one more time.
+            File.Delete(small);
+        }
+        string how = tiny ? "zan_cef_helper" : Path.GetFileName(exe) + " copy";
+        log.Add(ZanIDE.T("> macOS Chromium helpers: " + baseName + ".app"
+                + " + (Alerts|GPU|Plugin|Renderer) (" + how
+                + ", LSUIElement, not in the Dock).",
+            "> macOS Chromium 子进程包：" + baseName + ".app"
+                + " 及 (Alerts|GPU|Plugin|Renderer)（" + how
+                + "，LSUIElement，不在 Dock 显示）。"));
+        return plain;
+    }
+
+    /// Writes one helper bundle `<frameworks>/<name>.app` whose executable is
+    /// a copy of |src| named after the bundle, and returns that executable.
+    /// Chromium derives the executable name from the bundle name, so the copy
+    /// cannot keep the name it had in the driver directory.
+    static string MacHelperBundle(string frameworks, string name, string ident,
+                                  string ver, string src, bool tiny,
+                                  string macos) {
+        string app = frameworks + "/" + name + ".app";
+        string dir = app + "/Contents/MacOS";
+        Directory.CreateDirectoryRecursive(dir);
+        string helper = dir + "/" + name;
+        File.Copy(src, helper);
+        if (!tiny) {
+            // A program acting as its own helper resolves the zan_cef driver
+            // next to its own executable (ProcessHost.AppDir), so the driver
+            // libraries have to travel with it.
+            List<string> files = Directory.GetFiles(macos);
+            for (int i = 0; i < files.Count; i = i + 1) {
+                if (!ZanIDE.EndsWith(files[i], ".dylib")) { continue; }
+                File.Copy(macos + "/" + files[i], dir + "/" + files[i]);
+            }
+        }
+        bool _x = File.SetExecutable(helper, true);
+        File.WriteAllText(app + "/Contents/Info.plist",
+            ZanIDE.HelperInfoPlist(name, ident, ver));
+        File.WriteAllText(app + "/Contents/PkgInfo", "APPL????");
+        return helper;
+    }
+
+    /// Info.plist of the Chromium helper bundle: no icon and no document
+    /// types -- it never shows a window -- plus LSUIElement, which is what
+    /// keeps the child processes out of the Dock and the app switcher.
+    static string HelperInfoPlist(string name, string ident, string ver) {
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            + "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\""
+            + " \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+            + "<plist version=\"1.0\">\n<dict>\n"
+            + "\t<key>CFBundleName</key>\n\t<string>" + name + "</string>\n"
+            + "\t<key>CFBundleDisplayName</key>\n\t<string>" + name + "</string>\n"
+            + "\t<key>CFBundleExecutable</key>\n\t<string>" + name + "</string>\n"
+            + "\t<key>CFBundleIdentifier</key>\n\t<string>" + ident + "</string>\n"
+            + "\t<key>CFBundleVersion</key>\n\t<string>" + ver + "</string>\n"
+            + "\t<key>CFBundleShortVersionString</key>\n\t<string>" + ver
+            + "</string>\n"
+            + "\t<key>CFBundlePackageType</key>\n\t<string>APPL</string>\n"
+            + "\t<key>CFBundleInfoDictionaryVersion</key>\n\t<string>6.0</string>\n"
+            + "\t<key>LSMinimumSystemVersion</key>\n\t<string>11.0</string>\n"
+            + "\t<key>LSUIElement</key>\n\t<true/>\n"
+            + "\t<key>NSHighResolutionCapable</key>\n\t<true/>\n"
+            + "</dict>\n</plist>\n";
+    }
+
     static string InfoPlist(string baseName, string ident, string ver,
                             bool icon, bool windowed) {
         string exe = baseName;
