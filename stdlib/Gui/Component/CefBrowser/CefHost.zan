@@ -24,6 +24,9 @@ class CefHost {
     static string runtimeDir = "";
     static string cefVersion = "";
     static string lastError = "";
+    // 本进程占到的 profile 目录，以及占用它的那把锁（进程退出时由 OS 释放）
+    static string profileDir = "";
+    static long profileLock = 0;
 
     /// <summary>CEF 已初始化且未 shutdown。</summary>
     static bool IsRunning() {
@@ -69,13 +72,57 @@ class CefHost {
         return File.ReadAllText(p).Trim();
     }
 
-    /// <summary>浏览器进程的 CEF profile 目录（Cookie/缓存/localStorage）。
-    /// 默认放运行时目录旁边，<see cref="CefOptions.profileDir"/> /
-    /// ZAN_CEF_PROFILE 可覆盖。</summary>
+    /// <summary>能同时开的实例数（profile 槽位上限）。</summary>
+    static int MaxProfiles() { return 16; }
+
+    /// <summary>profile 目录里的占用标记文件名：谁锁住它，谁就在用这个
+    /// profile。带 zan- 前缀而不叫光秃的 lockfile，Chromium 自己也往
+    /// user-data-dir 里写同名文件，抢同一个名字会把它的文件锁掉。
+    /// </summary>
+    static string ProfileLockName() { return ".zan-lockfile"; }
+
+    /// <summary>profile 槽位的公共父目录：运行时装在 `&lt;缓存&gt;/Zan/cef/`
+    /// 下，登录态跟着版本目录走没意义，所以放同级的
+    /// `&lt;缓存&gt;/Zan/Cache/`。</summary>
+    static string ProfileRoot(string dir) {
+        return CefHost.ParentDir(CefHost.ParentDir(dir)) + "/Cache/profile";
+    }
+
+    /// <summary>浏览器进程的 CEF profile 目录（Cookie/缓存/localStorage），
+    /// 形如 `&lt;缓存&gt;/Zan/Cache/profile1`。
+    /// <see cref="CefOptions.profileDir"/> / ZAN_CEF_PROFILE 指定了就照用。
+    ///
+    /// 一个 Chromium profile 同时只能属于一个活进程：第二份副本指向同一个
+    /// 目录，`cef_initialize` 直接失败。桌面工具被开两份是常态，所以按槽位
+    /// 分配——第一份 `profile1`，同时开的第二份 `profile2`，依此类推；编号
+    /// 而不是按 pid，重启后还能找回自己那份登录态。
+    ///
+    /// 占用判定是 profile 目录里 <c>lockfile</c> 的系统级独占锁
+    /// （<see cref="File.TryLock"/>）：锁随持有进程退出（含被杀、崩溃）由内核
+    /// 释放，所以 `profile2` 一空出来，下一次启动就接着用 `profile2`，既不会
+    /// 一直往上加号，也没有需要清理的陈旧标记。</summary>
     static string ProfileDir(string dir) {
+        if (CefHost.profileDir != "") { return CefHost.profileDir; }
         string forced = CefOptions.ProfileDir();
-        if (forced != "") { return forced; }
-        return CefHost.ParentDir(dir) + "/profile";
+        if (forced != "") {
+            CefHost.profileDir = forced;
+            return forced;
+        }
+        string root = CefHost.ProfileRoot(dir);
+        int max = CefHost.MaxProfiles();
+        for (int slot = 1; slot <= max; slot = slot + 1) {
+            string cand = root + Convert.ToString(slot);
+            Directory.CreateDirectoryRecursive(cand);
+            long held = File.TryLock(cand + "/" + CefHost.ProfileLockName());
+            if (held != 0) {
+                CefHost.profileLock = held;
+                CefHost.profileDir = cand;
+                return cand;
+            }
+        }
+        // 槽位都被占着：用第一个，让 CEF 自己报冲突。
+        CefHost.profileDir = root + "1";
+        return CefHost.profileDir;
     }
 
     /// <summary>追加到每个 Chromium 进程命令行的开关，取自
@@ -85,6 +132,41 @@ class CefHost {
     /// unexpectedly”），首屏要等它超时退化，用它关掉 GPU 即可。</summary>
     static string Switches() {
         return CefOptions.Switches();
+    }
+
+    /// <summary>没有显式指定时 Chromium 子进程用的可执行文件：应用包里的
+    /// helper 包优先，否则复用本程序（此时 Main 首句必须是
+    /// <see cref="CefBootstrap.RunHelper"/>）。
+    ///
+    /// macOS 上复用 .app 里的主程序会让每个 render/gpu/utility 子进程都按主
+    /// 包的 Info.plist 起来，于是一次启动在 Dock 上显示成好几个 app；发布出来的
+    /// 包带独立 helper 包（Contents/Frameworks/&lt;名&gt; Helper.app，标了
+    /// LSUIElement），有它就走它。</summary>
+    static string DefaultHelper() {
+        string self = ProcessHost.SelfExe();
+        string bundled = CefHost.MacHelperFor(self);
+        if (bundled != "") { return bundled; }
+        return self;
+    }
+
+    /// <summary>`&lt;X&gt;.app/Contents/MacOS/&lt;X&gt;` 对应的 helper 包可执行
+    /// 文件；不在应用包里或没打 helper（IDE 里直接运行的裸可执行文件）
+    /// 时为 ""。</summary>
+    static string MacHelperFor(string exe) {
+        string macos = CefHost.ParentDir(exe);
+        if (!macos.EndsWith("/Contents/MacOS")) { return ""; }
+        string name = exe.Substring(macos.Length + 1, exe.Length - macos.Length - 1)
+            + " Helper";
+        string helper = CefHost.ParentDir(macos) + "/Frameworks/" + name
+            + ".app/Contents/MacOS/" + name;
+        if (File.Exists(helper)) { return helper; }
+        // `zanc --publish` 只把 driver 目录里的 zan_cef_helper 放进
+        // Contents/MacOS（成 helper 包是 IDE 发布那一步做的）。裸可执行文件
+        // 不属于任何包，Chromium 起它当子进程也不会进 Dock，所以直接用它，
+        // 仍然比复用主程序好。
+        string small = macos + "/zan_cef_helper";
+        if (File.Exists(small)) { return small; }
+        return "";
     }
 
     static string ParentDir(string path) {
@@ -111,7 +193,7 @@ class CefHost {
         CefHost.cefVersion = CefHost.MarkerVersion(dir);
         string helper = helperPath;
         if (helper == "") { helper = CefOptions.HelperPath(); }
-        if (helper == "") { helper = ProcessHost.SelfExe(); }
+        if (helper == "") { helper = CefHost.DefaultHelper(); }
         string cache = CefHost.ProfileDir(dir);
         Directory.CreateDirectoryRecursive(cache);
         bool ok = CefBackend.Init(dir, CefHost.cefVersion, cache, helper,

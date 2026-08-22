@@ -12,6 +12,15 @@ build/cefbrowser [起始地址]
 同一个可执行文件同时充当 Chromium 的 helper 子进程（`CefBootstrap.RunHelper()`
 必须是 `Main` 的第一句），所以不要把它改名后单独分发 helper。
 
+macOS 例外：Chromium 要求子进程是一个独立的 `.app`，否则每个子进程都会按主包的
+`Info.plist` 起来（Dock 里出现多个图标）。CEF 驱动目录里随驱动一起分发了一个只做
+`cef_execute_process` 的小 helper（`zan_cef_helper`，几十 KB，`dlopen` 同目录的
+`libzan_cef.dylib`），IDE 发布 macOS 时会把它装进
+`app.app/Contents/Frameworks/<名> Helper.app/Contents/MacOS/<名> Helper`
+并写 `LSUIElement=true`。运行时目录、驱动路径和 `switches` 由主进程通过
+`ZAN_CEF_HELPER_RUNTIME`/`ZAN_CEF_HELPER_DRIVER`/`ZAN_CEF_HELPER_SWITCHES`
+传给 helper，所以 helper 不需要包含应用本体。
+
 ## 路径与开关都能自定义
 
 代码里配置（优先级最高），适合把运行时随应用一起分发、完全离线启动：
@@ -24,7 +33,7 @@ o.profileDir = "D:/app/data/web";         // Cookie、localStorage、HTTP 缓存
 o.driverPath = "D:/app/bin";              // zan_cef 驱动所在目录或文件
 o.switches   = "disable-gpu,disable-gpu-compositing";
 o.locale     = "zh-CN";
-o.helperPath = "";                        // 空 = 用当前可执行文件当 helper
+o.helperPath = "";                        // 空 = 包里的 helper，没有就用当前可执行文件
 if (!await CefBootstrap.StartAsyncWith(o)) { ... }
 ```
 

@@ -149,8 +149,9 @@ class CefRuntime {
     /// 这里必须钉死而不是「取最新 stable」：CEF 的 C API 结构体布局按版本
     /// 绑定，原生 driver 是针对某个分支的头文件编译的，运行时换成别的分支
     /// 就是内存布局错位（driver 因此还会校验 cef_api_hash 并拒绝加载）。
-    /// 升级流程是：改这里的前缀 + 重新用对应头文件编译 driver（见
-    /// cmake/ZanCef.cmake 里的 ZAN_CEF_VERSION），两者一起动。</summary>
+    /// 升级流程是：改这里的前缀与下面的钉版本表，然后重新编译 driver
+    /// ——cmake/ZanCef.cmake 直接从本文件读这两处来取头文件版本，
+    /// 不再另写一份版本号（写两份就会漂成 cef api hash mismatch）。</summary>
     static string CurrentBranch() { return "151."; }
 
     /// <summary>旧 Windows（7/8/8.1）能用的最后一个 CEF 分支。</summary>
@@ -270,12 +271,34 @@ class CefRuntime {
             + "-" + CefRuntime.SafeVersion(cefVersion);
     }
 
-    /// <summary>该目录是否已完整安装（存在就绪标记与 Resources）。</summary>
+    /// <summary>运行时目录里 CEF 框架所在的子路径：Windows/Linux 是
+    /// Release/ 里的 libcef，macOS 是 Release/ 里的 framework 目录（与
+    /// native 侧 CefSettings.framework_dir_path 用的是同一个路径）。
+    /// </summary>
+    static string FrameworkSubdir() {
+        return "Release/Chromium Embedded Framework.framework";
+    }
+
+    /// <summary>解包后的目录里资源（.pak/icudtl.dat）所在的位置。官方 mac
+    /// 包没有顶层 Resources/，资源在 framework 内部，所以两边的校验路径
+    /// 不同。</summary>
+    static string ResourcesDir(string dir) {
+        #if MACOS
+        return dir + "/" + CefRuntime.FrameworkSubdir() + "/Resources";
+        #else
+        return dir + "/Resources";
+        #endif
+    }
+
+    /// <summary>该目录是否已完整安装（存在就绪标记与资源）。</summary>
     static bool IsReady(string dir) {
         if (!File.Exists(dir + "/" + CefRuntime.ReadyMarker())) { return false; }
-        if (!Directory.Exists(dir + "/Resources")) { return false; }
+        if (!Directory.Exists(CefRuntime.ResourcesDir(dir))) { return false; }
         #if MACOS
+        if (!File.Exists(dir + "/" + CefRuntime.FrameworkSubdir()
+            + "/Chromium Embedded Framework")) { return false; }
         #else
+        // StageResources 把资源搓到了 libcef 旁边，没搓到就不能算就绪。
         if (!File.Exists(dir + "/Release/icudtl.dat")) { return false; }
         #endif
         return true;
@@ -436,7 +459,8 @@ class CefRuntime {
         }
         CefRuntime.Fail("下载 CEF 构建索引失败（传输返回 "
             + Convert.ToString(n) + "，检查网络与代理）："
-            + CefRuntime.BaseUrl() + CefRuntime.IndexPath());
+            + CefRuntime.BaseUrl() + CefRuntime.IndexPath()
+            + "；下载阶段：" + client.LastDownloadError());
         return false;
     }
 
@@ -810,8 +834,10 @@ class CefRuntime {
         }
         Directory.CreateDirectoryRecursive(CefRuntime.ParentDir(dir));
         File.Move(src, dir);
-        if (!Directory.Exists(dir + "/Resources")) {
-            CefRuntime.Fail("CEF 归档内容异常：缺少 Resources/（" + archive + "）");
+        string res = CefRuntime.ResourcesDir(dir);
+        if (!Directory.Exists(res)) {
+            CefRuntime.Fail("CEF 归档内容异常：缺少 " + res + "（" + archive
+                + "）");
             Directory.DeleteRecursive(staging);
             return false;
         }
@@ -829,7 +855,7 @@ class CefRuntime {
         #if MACOS
         #else
         string rel = dir + "/Release";
-        string res = dir + "/Resources";
+        string res = CefRuntime.ResourcesDir(dir);
         if (!Directory.Exists(rel) || !Directory.Exists(res)) { return; }
         CefRuntime.CopyTree(res, rel);
         #endif
@@ -853,14 +879,27 @@ class CefRuntime {
     static void MarkExecutables(string dir) {
         #if WINDOWS
         #else
-        string rel = dir + "/Release";
-        if (!Directory.Exists(rel)) { return; }
-        List<string> files = Directory.GetFiles(rel);
+        CefRuntime.MarkExecutablesIn(dir + "/Release");
+        // mac 上二进制不在 Release/ 里，而在 framework 内部；其他平台上
+        // 这两个目录不存在，helper 直接返回。
+        string fw = dir + "/" + CefRuntime.FrameworkSubdir();
+        CefRuntime.MarkExecutablesIn(fw);
+        CefRuntime.MarkExecutablesIn(fw + "/Libraries");
+        #endif
+    }
+
+    /// <summary>给一个目录里（不递归）看起来是可执行文件/动态库的项补上
+    /// 可执行位。</summary>
+    static void MarkExecutablesIn(string dir) {
+        #if WINDOWS
+        #else
+        if (!Directory.Exists(dir)) { return; }
+        List<string> files = Directory.GetFiles(dir);
         for (int i = 0; i < files.Count; i = i + 1) {
             string name = files[i];
             if (name.EndsWith(".so") || name.EndsWith(".dylib")
                 || name.IndexOf(".") < 0 || name.EndsWith("Helper")) {
-                File.SetExecutable(rel + "/" + name, true);
+                File.SetExecutable(dir + "/" + name, true);
             }
         }
         #endif

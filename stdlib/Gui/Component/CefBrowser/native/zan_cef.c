@@ -21,6 +21,7 @@
  */
 
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,6 +43,10 @@
 #include <pthread.h>
 #include <unistd.h>
 #define ZC_EXPORT __attribute__((visibility("default")))
+#endif
+
+#ifdef __APPLE__
+#include <crt_externs.h>
 #endif
 
 /* ---------------------------------------------------------------- utilities */
@@ -155,6 +160,233 @@ static const char *zc_open_error(void) {
     return e ? e : "dlopen failed";
 #endif
 }
+
+#ifdef __APPLE__
+
+/* ------------------------------------------------------------ macOS NSView */
+
+/* On macOS the browser is an NSView inside the host window, so moving and
+ * hiding it means talking to AppKit. That happens through dlsym'd objc_msgSend
+ * so this file stays a plain C dylib -- no ObjC compiler, no AppKit at link
+ * time -- the same way the Linux path reaches X11 without linking libX11. */
+typedef struct { double x, y, w, h; } zc_rect_t;
+
+static struct {
+    void *objc;
+    void *(*sel)(const char *);
+    void *(*get_class)(const char *);
+    void *msg;
+    void *msg_stret;
+} zc_ns;
+
+static int zc_ns_init(void) {
+    if (zc_ns.objc) return 1;
+    void *lib = zc_open("/usr/lib/libobjc.A.dylib");
+    if (!lib) return 0;
+    void *sel = zc_sym(lib, "sel_registerName");
+    void *msg = zc_sym(lib, "objc_msgSend");
+    if (!sel || !msg) return 0;
+    memcpy(&zc_ns.sel, &sel, sizeof(void *));
+    zc_ns.msg = msg;
+    /* NSRect returns: arm64 hands small aggregates back in registers, x86_64
+     * needs the _stret entry point (absent on arm64). */
+    zc_ns.msg_stret = zc_sym(lib, "objc_msgSend_stret");
+    zc_ns.objc = lib;
+    return 1;
+}
+
+static void *zc_ns_id(void *obj, const char *name) {
+    if (!obj || !zc_ns_init()) return NULL;
+    void *(*send)(void *, void *) = NULL;
+    memcpy(&send, &zc_ns.msg, sizeof(void *));
+    return send(obj, zc_ns.sel(name));
+}
+
+static int zc_ns_bool(void *obj, const char *name) {
+    if (!obj || !zc_ns_init()) return 0;
+    signed char (*send)(void *, void *) = NULL;
+    memcpy(&send, &zc_ns.msg, sizeof(void *));
+    return send(obj, zc_ns.sel(name)) ? 1 : 0;
+}
+
+static void zc_ns_set_bool(void *obj, const char *name, int value) {
+    if (!obj || !zc_ns_init()) return;
+    void (*send)(void *, void *, signed char) = NULL;
+    memcpy(&send, &zc_ns.msg, sizeof(void *));
+    send(obj, zc_ns.sel(name), (signed char)(value ? 1 : 0));
+}
+
+static zc_rect_t zc_ns_rect(void *obj, const char *name) {
+    zc_rect_t r = { 0, 0, 0, 0 };
+    if (!obj || !zc_ns_init()) return r;
+#if defined(__x86_64__)
+    if (!zc_ns.msg_stret) return r;
+    void (*send)(zc_rect_t *, void *, void *) = NULL;
+    memcpy(&send, &zc_ns.msg_stret, sizeof(void *));
+    send(&r, obj, zc_ns.sel(name));
+#else
+    zc_rect_t (*send)(void *, void *) = NULL;
+    memcpy(&send, &zc_ns.msg, sizeof(void *));
+    r = send(obj, zc_ns.sel(name));
+#endif
+    return r;
+}
+
+static void zc_ns_set_frame(void *obj, zc_rect_t r) {
+    if (!obj || !zc_ns_init()) return;
+    void (*send)(void *, void *, zc_rect_t) = NULL;
+    memcpy(&send, &zc_ns.msg, sizeof(void *));
+    send(obj, zc_ns.sel("setFrame:"), r);
+}
+
+static double zc_ns_double(void *obj, const char *name) {
+    if (!obj || !zc_ns_init()) return 0.0;
+    double (*send)(void *, void *) = NULL;
+    memcpy(&send, &zc_ns.msg, sizeof(void *));
+    return send(obj, zc_ns.sel(name));
+}
+
+static void *zc_ns_class(const char *name) {
+    if (!zc_ns_init()) return NULL;
+    if (!zc_ns.get_class) {
+        void *f = zc_sym(zc_ns.objc, "objc_getClass");
+        memcpy(&zc_ns.get_class, &f, sizeof(void *));
+        if (!zc_ns.get_class) return NULL;
+    }
+    return zc_ns.get_class(name);
+}
+
+static void zc_ns_set_id(void *obj, const char *name, void *value) {
+    if (!obj || !zc_ns_init()) return;
+    void (*send)(void *, void *, void *) = NULL;
+    memcpy(&send, &zc_ns.msg, sizeof(void *));
+    send(obj, zc_ns.sel(name), value);
+}
+
+/* Chromium's mac message pump talks to NSApp through CrAppProtocol: it calls
+ * -isHandlingSendEvent to tell "inside AppKit's event dispatch" from "inside a
+ * nested run loop of our own", and every CEF sample gets this by subclassing
+ * NSApplication with CefAppProtocol. The host here owns NSApplication (zan_gui
+ * created it long before any browser exists), so instead of demanding that
+ * every Zan app subclass it, add the two accessors -- and a sendEvent: wrapper
+ * that maintains the flag -- to NSApplication itself at startup. Without them
+ * Chromium's unrecognized-selector exception kills the process the first time
+ * it pumps a nested loop (closing a tab does exactly that). */
+static int zc_app_sending_event;
+
+static signed char zc_app_is_handling(void *self, void *sel) {
+    (void)self; (void)sel;
+    return (signed char)(zc_app_sending_event ? 1 : 0);
+}
+
+static void zc_app_set_handling(void *self, void *sel, signed char v) {
+    (void)self; (void)sel;
+    zc_app_sending_event = v ? 1 : 0;
+}
+
+static void (*zc_app_orig_send_event)(void *, void *, void *);
+
+static void zc_app_send_event(void *self, void *sel, void *event) {
+    /* Nested: AppKit re-enters sendEvent: while tracking, so save and restore
+     * rather than clearing on the way out. */
+    int prev = zc_app_sending_event;
+    zc_app_sending_event = 1;
+    if (zc_app_orig_send_event) zc_app_orig_send_event(self, sel, event);
+    zc_app_sending_event = prev;
+}
+
+static void zc_mac_patch_nsapp(void) {
+    static int done;
+    if (done || !zc_ns_init()) return;
+    done = 1;
+    /* zan_gui already brought AppKit in, but this driver must not depend on
+     * that: objc_getClass sees NSApplication only once the framework is in. */
+    zc_open("/System/Library/Frameworks/AppKit.framework/AppKit");
+    void *cls = zc_ns_class("NSApplication");
+    if (!cls) return;
+    signed char (*add)(void *, void *, void *, const char *) = NULL;
+    void *(*get_method)(void *, void *) = NULL;
+    void *(*method_imp)(void *) = NULL;
+    void *(*set_imp)(void *, void *) = NULL;
+    void *f;
+    f = zc_sym(zc_ns.objc, "class_addMethod");
+    memcpy(&add, &f, sizeof(void *));
+    f = zc_sym(zc_ns.objc, "class_getInstanceMethod");
+    memcpy(&get_method, &f, sizeof(void *));
+    f = zc_sym(zc_ns.objc, "method_getImplementation");
+    memcpy(&method_imp, &f, sizeof(void *));
+    f = zc_sym(zc_ns.objc, "method_setImplementation");
+    memcpy(&set_imp, &f, sizeof(void *));
+    if (!add || !get_method || !method_imp || !set_imp) return;
+    void *imp;
+    imp = (void *)zc_app_is_handling;
+    add(cls, zc_ns.sel("isHandlingSendEvent"), imp, "c@:");
+    imp = (void *)zc_app_set_handling;
+    add(cls, zc_ns.sel("setHandlingSendEvent:"), imp, "v@:c");
+    /* Chromium also asks whether NSApp conforms to the protocol before trusting
+     * the flag; the protocol object lives in the CEF framework, which is
+     * already loaded by the time this runs. */
+    void *(*get_proto)(const char *) = NULL;
+    signed char (*add_proto)(void *, void *) = NULL;
+    f = zc_sym(zc_ns.objc, "objc_getProtocol");
+    memcpy(&get_proto, &f, sizeof(void *));
+    f = zc_sym(zc_ns.objc, "class_addProtocol");
+    memcpy(&add_proto, &f, sizeof(void *));
+    if (get_proto && add_proto) {
+        void *p = get_proto("CrAppProtocol");
+        if (p) add_proto(cls, p);
+        p = get_proto("CrAppControlProtocol");
+        if (p) add_proto(cls, p);
+    }
+    void *m = get_method(cls, zc_ns.sel("sendEvent:"));
+    if (m) {
+        void *orig = method_imp(m);
+        memcpy(&zc_app_orig_send_event, &orig, sizeof(void *));
+        imp = (void *)zc_app_send_event;
+        set_imp(m, imp);
+    }
+}
+
+/* CoreGraphics path builders, dlsym'd for the same reason as AppKit above. */
+static struct {
+    void *lib;
+    void *(*path_create)(void);
+    void (*path_add_rect)(void *, const void *, zc_rect_t);
+    void (*path_release)(void *);
+} zc_cg;
+
+static int zc_cg_init(void) {
+    if (zc_cg.lib) return 1;
+    void *lib = zc_open("/System/Library/Frameworks/CoreGraphics.framework/"
+                        "CoreGraphics");
+    if (!lib) return 0;
+    void *c = zc_sym(lib, "CGPathCreateMutable");
+    void *a = zc_sym(lib, "CGPathAddRect");
+    void *r = zc_sym(lib, "CGPathRelease");
+    if (!c || !a || !r) return 0;
+    /* The mask is a CAShapeLayer, and objc_getClass only sees it once
+     * QuartzCore is in the process -- AppKit pulls it in, but this driver must
+     * not depend on who loaded what. */
+    if (!zc_open("/System/Library/Frameworks/QuartzCore.framework/QuartzCore"))
+        return 0;
+    memcpy(&zc_cg.path_create, &c, sizeof(void *));
+    memcpy(&zc_cg.path_add_rect, &a, sizeof(void *));
+    memcpy(&zc_cg.path_release, &r, sizeof(void *));
+    zc_cg.lib = lib;
+    return 1;
+}
+
+/* Rects cross this ABI in physical pixels (that is what the host's layout and
+ * its software surface use), while AppKit frames are in points, so every rect
+ * handed to a view has to be divided by the window's backing scale -- on a
+ * Retina display an unscaled rect is twice too large and buries the host UI. */
+static double zc_view_scale(void *view) {
+    double s = zc_ns_double(zc_ns_id(view, "window"), "backingScaleFactor");
+    if (s <= 0.0) return 1.0;
+    return s;
+}
+
+#endif /* __APPLE__ */
 
 /* Resolve every libcef entry point the driver needs. `runtime_dir` is a CEF
  * runtime as unpacked by CefRuntime.zan; the shared library sits in Release/
@@ -304,6 +536,9 @@ typedef struct zc_browser_s {
     cef_dev_tools_message_observer_t observer;
 
     int bx, by, bw, bh;         /* last requested bounds, host coordinates */
+#ifdef __APPLE__
+    char *clip_spec;            /* region the mask layer was built for */
+#endif
     char url[2048];
     char title[512];
     int loading, can_back, can_forward;
@@ -749,19 +984,43 @@ static void zc_app_init(void) {
 
 /* CEF wants the process command line. Windows reads it from the OS, elsewhere
  * it must be handed argc/argv, which a shared library recovers from the
- * kernel (/proc/self/cmdline on Linux). */
+ * kernel (/proc/self/cmdline on Linux, the crt externs on macOS).
+ *
+ * Getting the real argv is not cosmetic: Chromium tells a child process what it
+ * is from --type= on its own command line, so a helper handed a made-up argv
+ * behaves like a second browser process, exits, and the browser kills itself
+ * after enough dead GPU children ("GPU process isn't usable. Goodbye."). */
 #ifndef _WIN32
 static char *zc_argv_storage;
-static char *zc_argv[64];
+static char *zc_argv_own[64];
+static char **zc_argv;
 static int zc_argc;
+
+static void zc_argv_fallback(void) {
+    static char fallback[] = "zan";
+    zc_argv_own[0] = fallback;
+    zc_argv_own[1] = NULL;
+    zc_argv = zc_argv_own;
+    zc_argc = 1;
+}
 
 static void zc_read_cmdline(void) {
     if (zc_argc) return;
+#ifdef __APPLE__
+    /* No /proc on Darwin; the kernel's argv is reachable from a dylib through
+     * the crt externs (what Chromium's own mac helper uses). */
+    int *ac = _NSGetArgc();
+    char ***av = _NSGetArgv();
+    if (ac && av && *ac > 0 && *av) {
+        zc_argc = *ac;
+        zc_argv = *av;
+        return;
+    }
+    zc_argv_fallback();
+#else
     FILE *f = fopen("/proc/self/cmdline", "rb");
     if (!f) {
-        static char fallback[] = "zan";
-        zc_argv[0] = fallback;
-        zc_argc = 1;
+        zc_argv_fallback();
         return;
     }
     size_t cap = 65536, len = 0;
@@ -769,18 +1028,18 @@ static void zc_read_cmdline(void) {
     if (zc_argv_storage) len = fread(zc_argv_storage, 1, cap - 1, f);
     fclose(f);
     if (!zc_argv_storage || len == 0) {
-        static char fallback[] = "zan";
-        zc_argv[0] = fallback;
-        zc_argc = 1;
+        zc_argv_fallback();
         return;
     }
     zc_argv_storage[len] = '\0';
+    zc_argv = zc_argv_own;
     size_t i = 0;
     while (i < len && zc_argc < 63) {
-        zc_argv[zc_argc++] = zc_argv_storage + i;
+        zc_argv_own[zc_argc++] = zc_argv_storage + i;
         i += strlen(zc_argv_storage + i) + 1;
     }
-    zc_argv[zc_argc] = NULL;
+    zc_argv_own[zc_argc] = NULL;
+#endif
 }
 #endif
 
@@ -830,6 +1089,32 @@ ZC_EXPORT int zan_cef_execute_process(const char *runtime_dir,
     return zc.execute_process(&args, &zc_app, NULL);
 }
 
+/* Tell the subprocess executable where the CEF runtime and this driver are.
+ *
+ * The standalone helper (native/zan_cef_helper.c, what macOS bundles put in
+ * Contents/Frameworks/<x> Helper.app) carries no configuration of its own: it
+ * dlopens this driver and calls zan_cef_execute_process, and both paths come
+ * from here, because Chromium hands its own environment to the children it
+ * spawns. A host that stays its own helper never reads these.
+ *
+ * Not on Windows: there the helper is always the host executable, which
+ * resolves everything through CefOptions before Main gets to RunHelper. */
+static void zc_export_helper_env(const char *runtime_dir,
+                                 const char *switches) {
+#ifndef _WIN32
+    if (runtime_dir && runtime_dir[0])
+        setenv("ZAN_CEF_HELPER_RUNTIME", runtime_dir, 1);
+    setenv("ZAN_CEF_HELPER_SWITCHES", switches ? switches : "", 1);
+    Dl_info info;
+    memset(&info, 0, sizeof(info));
+    if (dladdr((void *)(uintptr_t)&zc_export_helper_env, &info)
+        && info.dli_fname && info.dli_fname[0])
+        setenv("ZAN_CEF_HELPER_DRIVER", info.dli_fname, 1);
+#else
+    (void)runtime_dir; (void)switches;
+#endif
+}
+
 /* Bring up the CEF browser process. `runtime_dir` is CefRuntime.EnsureAsync()'s
  * result, `cache_path` a writable profile directory (empty = incognito),
  * `helper_path` the subprocess executable (empty = re-exec this program, which
@@ -847,6 +1132,7 @@ ZC_EXPORT int zan_cef_init(const char *runtime_dir, const char *cache_path,
     snprintf(zc_extra_switches, sizeof(zc_extra_switches), "%s",
              switches ? switches : "");
     zc_app_init();
+    zc_export_helper_env(runtime_dir, switches);
 
     cef_settings_t settings;
     memset(&settings, 0, sizeof(settings));
@@ -857,12 +1143,34 @@ ZC_EXPORT int zan_cef_init(const char *runtime_dir, const char *cache_path,
     settings.windowless_rendering_enabled = windowless ? 1 : 0;
     settings.log_severity = LOGSEVERITY_WARNING;
 
+    /* The profile directory is the caller's decision (CefHost.ProfileDir picks
+     * and locks a per-instance slot); this only passes it on. */
+    char profile[1100];
+    snprintf(profile, sizeof(profile), "%s", cache_path ? cache_path : "");
+
     char buf[1200];
+    /* Chromium reports a failed CHECK by writing "[FATAL:...]" to its log and
+     * then breaking into the debugger (crash code 0x80000003 with a pure libcef
+     * backtrace), so the only way to see the reason is to route that log to a
+     * file. ZAN_CEF_LOG=1 turns it on; ZAN_CEF_LOG_FILE overrides the path. */
+    if (zc_log_on()) {
+        const char *lf = getenv("ZAN_CEF_LOG_FILE");
+        if (lf && lf[0]) {
+            snprintf(buf, sizeof(buf), "%s", lf);
+        } else if (profile[0]) {
+            snprintf(buf, sizeof(buf), "%s/cef_debug.log", profile);
+        } else {
+            snprintf(buf, sizeof(buf), "%s/cef_debug.log", runtime_dir);
+        }
+        zc_str_set(&settings.log_file, buf);
+        settings.log_severity = LOGSEVERITY_VERBOSE;
+        fprintf(stderr, "[zan_cef] cef log -> %s\n", buf);
+    }
     if (helper_path && helper_path[0])
         zc_str_set(&settings.browser_subprocess_path, helper_path);
-    if (cache_path && cache_path[0]) {
-        zc_str_set(&settings.root_cache_path, cache_path);
-        zc_str_set(&settings.cache_path, cache_path);
+    if (profile[0]) {
+        zc_str_set(&settings.root_cache_path, profile);
+        zc_str_set(&settings.cache_path, profile);
     }
     if (locale && locale[0]) zc_str_set(&settings.locale, locale);
 #ifndef __APPLE__
@@ -883,8 +1191,14 @@ ZC_EXPORT int zan_cef_init(const char *runtime_dir, const char *cache_path,
 
     cef_main_args_t args;
     zc_main_args(&args);
+#ifdef __APPLE__
+    /* After zc_load: the CrAppProtocol object comes from the framework, and
+     * before initialize: Chromium reaches for NSApp during startup. */
+    zc_mac_patch_nsapp();
+#endif
     int ok = zc.initialize(&args, &settings, &zc_app, NULL);
 
+    zc_str_free(&settings.log_file);
     zc_str_free(&settings.browser_subprocess_path);
     zc_str_free(&settings.root_cache_path);
     zc_str_free(&settings.cache_path);
@@ -894,7 +1208,8 @@ ZC_EXPORT int zan_cef_init(const char *runtime_dir, const char *cache_path,
     zc_str_free(&settings.framework_dir_path);
 
     if (!ok) {
-        zc_fail("cef_initialize failed");
+        zc_fail("cef_initialize failed (profile=%s)",
+                profile[0] ? profile : "(none)");
         return 0;
     }
     zc_ready = 1;
@@ -958,6 +1273,8 @@ ZC_EXPORT void zan_cef_shutdown(void) {
 
 /* ---------------------------------------------------------- public: browser */
 
+ZC_EXPORT void *zan_cef_window(int h);
+
 ZC_EXPORT int zan_cef_create(void *parent, int x, int y, int w, int h,
                              const char *url) {
     if (!zan_cef_ready()) {
@@ -974,6 +1291,9 @@ ZC_EXPORT int zan_cef_create(void *parent, int x, int y, int w, int h,
                 b->queue[q] = NULL;
             }
             free(b->taken);
+#ifdef __APPLE__
+            free(b->clip_spec);
+#endif
             int id = i + 1;
             memset(b, 0, sizeof(*b));
             b->id = id;
@@ -1018,6 +1338,33 @@ ZC_EXPORT int zan_cef_create(void *parent, int x, int y, int w, int h,
     } else {
         wi.style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE;
     }
+#elif defined(__APPLE__)
+    /* The mac window info names the field parent_view: it is an NSView, not a
+     * window handle -- and the host handle (zan_gui_create_window) is the
+     * NSWindow, so hand Chromium that window's content view. Passing the window
+     * itself leaves CEF without a usable parent and every browser comes up as
+     * its own top-level window, next to (not inside) the app's own chrome. */
+    {
+        void *pview = zc_ns_id((void *)parent, "contentView");
+        wi.parent_view = (cef_window_handle_t)pview;
+        if (zc_log_on()) {
+            zc_rect_t pb = zc_ns_rect(pview, "bounds");
+            fprintf(stderr, "[zan_cef] embed parent=%p contentView=%p "
+                            "bounds=%.0fx%.0f flipped=%d req=%d,%d %dx%d\n",
+                    parent, pview, pb.w, pb.h, zc_ns_bool(pview, "isFlipped"),
+                    x, y, w, h);
+        }
+        if (pview) {
+            /* AppKit bounds are points; the caller measured pixels. */
+            double sc = zc_view_scale(pview);
+            wi.bounds.x = (int)((double)wi.bounds.x / sc);
+            wi.bounds.y = (int)((double)wi.bounds.y / sc);
+            wi.bounds.width = (int)((double)wi.bounds.width / sc);
+            wi.bounds.height = (int)((double)wi.bounds.height / sc);
+            if (wi.bounds.width < 1) wi.bounds.width = 1;
+            if (wi.bounds.height < 1) wi.bounds.height = 1;
+        }
+    }
 #else
     wi.parent_window = (cef_window_handle_t)(uintptr_t)parent;
 #endif
@@ -1049,12 +1396,29 @@ ZC_EXPORT int zan_cef_create(void *parent, int x, int y, int w, int h,
         b->cdp_reg = host->add_dev_tools_message_observer(host, &b->observer);
         host->base.release(&host->base);
     }
+#ifdef __APPLE__
+    if (zc_log_on()) {
+        void *wnd = zan_cef_window(b->id);
+        zc_rect_t fr = zc_ns_rect(wnd, "frame");
+        fprintf(stderr, "[zan_cef] browser view=%p superview=%p "
+                        "frame=%.0f,%.0f %.0fx%.0f hidden=%d\n",
+                wnd, zc_ns_id(wnd, "superview"), fr.x, fr.y, fr.w, fr.h,
+                zc_ns_bool(wnd, "isHidden"));
+    }
+#endif
     return b->id;
 }
+
+ZC_EXPORT void zan_cef_set_visible(int h, int visible);
 
 ZC_EXPORT void zan_cef_close(int h) {
     zc_browser_t *b = zc_get(h);
     if (!b || !b->browser) return;
+    /* close_browser() is asynchronous: the child window lives until CEF gets
+     * enough message-loop turns to destroy it, and the view that used to pump
+     * the loop every frame is being torn down right now. Hide it up front so a
+     * closed tab cannot keep covering the host UI in the meantime. */
+    zan_cef_set_visible(h, 0);
     cef_browser_host_t *host = b->browser->get_host(b->browser);
     if (!host) return;
     host->close_browser(host, 1);
@@ -1081,10 +1445,50 @@ ZC_EXPORT void zan_cef_set_bounds(int h, int x, int y, int w, int hh) {
     if (hh < 1) hh = 1;
     {
         zc_browser_t *bb = zc_get(h);
-        if (bb) { bb->bx = x; bb->by = y; bb->bw = w; bb->bh = hh; }
+        if (bb) {
+            bb->bx = x; bb->by = y; bb->bw = w; bb->bh = hh;
+#ifdef __APPLE__
+            /* The mask was built for the old frame: force the next set_clip to
+             * rebuild it instead of matching its cached spec. */
+            free(bb->clip_spec);
+            bb->clip_spec = NULL;
+#endif
+        }
     }
 #ifdef _WIN32
     SetWindowPos((HWND)wnd, NULL, x, y, w, hh, SWP_NOZORDER | SWP_NOACTIVATE);
+#elif defined(__APPLE__)
+    /* Host coordinates are top-left based; an NSView's frame is expressed in
+     * its superview's coordinates, which are bottom-left based unless that
+     * view is flipped -- so ask the superview instead of assuming. */
+    {
+        void *sup = zc_ns_id(wnd, "superview");
+        double sc = zc_view_scale(sup ? sup : wnd);
+        double px = (double)x / sc, pw = (double)w / sc;
+        double py = (double)y / sc, ph = (double)hh / sc;
+        double top = py;
+        if (sup && !zc_ns_bool(sup, "isFlipped")) {
+            zc_rect_t pb = zc_ns_rect(sup, "bounds");
+            top = pb.h - (py + ph);
+        }
+        zc_rect_t r;
+        r.x = px;
+        r.y = top;
+        r.w = pw < 1.0 ? 1.0 : pw;
+        r.h = ph < 1.0 ? 1.0 : ph;
+        zc_ns_set_frame(wnd, r);
+        if (zc_log_on()) {
+            static int once;
+            if (once < 4) {
+                once++;
+                fprintf(stderr, "[zan_cef] bounds host=%d,%d %dx%d -> "
+                                "view=%.0f,%.0f %.0fx%.0f scale=%.1f "
+                                "sup=%p flipped=%d\n", x, y, w, hh,
+                        r.x, r.y, r.w, r.h, sc, sup,
+                        sup ? zc_ns_bool(sup, "isFlipped") : 0);
+            }
+        }
+    }
 #else
     /* X11 lives in libcef's process already; resize through the display it
      * owns rather than linking libX11 into this driver. */
@@ -1127,6 +1531,8 @@ ZC_EXPORT void zan_cef_set_visible(int h, int visible) {
     void *wnd = zan_cef_window(h);
 #ifdef _WIN32
     if (wnd) ShowWindow((HWND)wnd, visible ? SW_SHOWNA : SW_HIDE);
+#elif defined(__APPLE__)
+    zc_ns_set_bool(wnd, "setHidden:", visible ? 0 : 1);
 #else
     if (wnd) {
         typedef void *(*fn_xdisplay)(void);
@@ -1156,14 +1562,94 @@ ZC_EXPORT void zan_cef_set_visible(int h, int visible) {
     }
 }
 
+#ifdef __APPLE__
+/* Punch the host's visible region out of the browser view with a mask layer.
+ * Rects arrive in host pixels with a top-left origin; the view's own layer is
+ * bottom-left based unless the view is flipped, and its coordinates are points,
+ * hence the divide by the backing scale. A single rect covering the whole view
+ * drops the mask entirely (no mask = no compositing cost while nothing
+ * overlaps the page). */
+static void zc_mac_clip(zc_browser_t *b, const char *spec) {
+    void *wnd = zan_cef_window(b->id);
+    if (!wnd || !zc_cg_init()) return;
+    /* Called every frame; rebuilding the mask each time would thrash the
+     * compositor, so only act when the region actually changed. */
+    if (b->clip_spec && strcmp(b->clip_spec, spec) == 0) return;
+    zc_rect_t fr = zc_ns_rect(wnd, "frame");
+    if (fr.w <= 0.0 || fr.h <= 0.0) return;
+    double sc = zc_view_scale(wnd);
+    int flipped = zc_ns_bool(wnd, "isFlipped");
+    void *path = zc_cg.path_create();
+    if (!path) return;
+    int rects = 0, whole = 0;
+    const char *p = spec;
+    while (*p) {
+        char *end = NULL;
+        long v[4] = { 0, 0, 0, 0 };
+        int n = 0;
+        while (n < 4) {
+            v[n] = strtol(p, &end, 10);
+            if (end == p) break;
+            p = end;
+            n++;
+            if (*p == ',') p++;
+            else break;
+        }
+        while (*p && *p != ';') p++;
+        if (*p == ';') p++;
+        if (n != 4 || v[2] <= 0 || v[3] <= 0) continue;
+        zc_rect_t r;
+        r.x = ((double)v[0] - (double)b->bx) / sc;
+        r.w = (double)v[2] / sc;
+        r.h = (double)v[3] / sc;
+        double top = ((double)v[1] - (double)b->by) / sc;
+        r.y = flipped ? top : fr.h - top - r.h;
+        zc_cg.path_add_rect(path, NULL, r);
+        rects++;
+        if (r.x <= 0.0 && r.y <= 0.0 && r.x + r.w >= fr.w
+            && r.y + r.h >= fr.h) {
+            whole = 1;
+        }
+    }
+    if (rects == 0) {
+        zc_cg.path_release(path);
+        return;
+    }
+    zc_ns_set_bool(wnd, "setWantsLayer:", 1);
+    void *layer = zc_ns_id(wnd, "layer");
+    if (layer) {
+        if (rects == 1 && whole) {
+            zc_ns_set_id(layer, "setMask:", NULL);
+        } else {
+            void *shape = zc_ns_id(zc_ns_class("CAShapeLayer"), "layer");
+            if (shape) {
+                zc_ns_set_frame(shape, zc_ns_rect(layer, "bounds"));
+                zc_ns_set_id(shape, "setPath:", path);
+                zc_ns_set_id(layer, "setMask:", shape);
+            }
+        }
+    }
+    zc_cg.path_release(path);
+    free(b->clip_spec);
+    b->clip_spec = zc_dup(spec, strlen(spec));
+}
+#endif
+
 /* Apply the host's per-frame occlusion result: `spec` is a "x,y,w,h;..." union
- * of visible rectangles in host coordinates ("" = fully covered). Windows can
- * clip the child window to that region; elsewhere this degrades to show/hide,
- * matching what the WebView backend does on macOS. */
+ * of visible rectangles in host coordinates ("" = fully covered). Windows clip
+ * the child window to that region, macOS masks the browser view's layer. */
 ZC_EXPORT void zan_cef_set_clip(int h, const char *spec) {
     zc_browser_t *b = zc_get(h);
     if (!b) return;
     int visible = spec && spec[0];
+    if (zc_log_on()) {
+        static int once;
+        if (once < 4) {
+            once++;
+            fprintf(stderr, "[zan_cef] clip h=%d visible=%d spec=%s\n", h,
+                    visible, spec ? spec : "(null)");
+        }
+    }
 #ifdef _WIN32
     void *wnd = zan_cef_window(h);
     if (visible && wnd) {
@@ -1198,6 +1684,12 @@ ZC_EXPORT void zan_cef_set_clip(int h, const char *spec) {
         /* SetWindowRgn takes ownership of the region. */
         SetWindowRgn((HWND)wnd, total, TRUE);
     }
+#elif defined(__APPLE__)
+    /* The browser is an NSView sibling of the host's software canvas, so it
+     * always draws over it: menus, dropdowns and dialogs above the page can
+     * only be honoured by punching them out of the view itself. Same treatment
+     * as the WKWebView backend: the visible union becomes a mask layer. */
+    if (visible) zc_mac_clip(b, spec);
 #endif
     zan_cef_set_visible(h, visible);
 }

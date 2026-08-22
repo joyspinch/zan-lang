@@ -356,36 +356,44 @@ jobs:
           printf 'zan_gui.dll\nWebView2Loader.dll if WebView\n' \
             > "$DEST/zan_gui.bundle"
 
-      # Import libraries and CRT support the cross bundles were assembled
-      # without: a native Windows link picks these up from the host mingw, so
-      # they only go missing when zanc cross-links. OpenSSL's static archives
-      # reference crypt32 plus MinGW fortify/stack-check symbols. Keep the
-      # existing libmingwex archive and merge only those support objects rather
-      # than replacing the whole archive (it must remain compatible with the
-      # committed libgcc.a/crt2.o pair).
-      - name: Top up the cross mingw import libs
+      # OpenSSL's static archives reference MinGW fortify/stack-check symbols
+      # and crypt32. Keep these support archives beside the TLS archives so
+      # native links do not depend on the host MinGW's CRT or import libraries.
+      - name: Stage TLS static archives
+        if: matrix.target == 'win-x64'
         run: |
           set -eux
           P="$(cygpath -u "$MINGW_PREFIX")"
-          for lib in psapi version setupapi crypt32; do
-            [ -f "$P/lib/lib$lib.a" ] \
-              && cp -n "$P/lib/lib$lib.a" "toolchain/${{ matrix.target }}/mingw/lib/" \
-              || true
+          TDEST="stdlib/System/Net/Tls/drivers/${{ matrix.target }}/static"
+          mkdir -p "$TDEST"
+          cp "$P/lib/libssl.a" "$TDEST/libssl.a"
+          cp "$P/lib/libcrypto.a" "$TDEST/libcrypto.a"
+          cp "$P/lib/libcrypt32.a" "$TDEST/libcrypt32.a"
+          TMP="$(mktemp -d)"
+          trap 'rm -rf "$TMP"' EXIT
+          for obj in \
+            lib64_libmingwex_a-chk_fail.o \
+            lib64_libmingwex_a-memcpy_chk.o \
+            lib64_libmingwex_a-memset_chk.o \
+            lib64_libmingwex_a-stack_chk_fail.o \
+            lib64_libmingwex_a-stack_chk_guard.o; do
+            (cd "$TMP" && ar x "$P/lib/libmingwex.a" "$obj")
           done
-          if [ "${{ matrix.target }}" = win-x64 ]; then
-            MEX="toolchain/${{ matrix.target }}/mingw/lib/libmingwex.a"
-            TMP="$(mktemp -d)"
-            trap 'rm -rf "$TMP"' EXIT
-            for obj in \
-              lib64_libmingwex_a-chk_fail.o \
-              lib64_libmingwex_a-memcpy_chk.o \
-              lib64_libmingwex_a-memset_chk.o \
-              lib64_libmingwex_a-stack_chk_fail.o \
-              lib64_libmingwex_a-stack_chk_guard.o; do
-              (cd "$TMP" && ar x "$P/lib/libmingwex.a" "$obj")
-            done
-            ar rD "$MEX" "$TMP"/*.o
-          fi
+          rm -f "$TDEST/libzan_tls_mingw_support.a"
+          ar rD "$TDEST/libzan_tls_mingw_support.a" "$TMP"/*.o
+          cat > "$TDEST/ssl.libs" <<'EOF'
+          # OpenSSL 3.6.3 MinGW-w64 Libs.private dependencies.
+          # MinGW fortify/stack-check objects from MSYS2 mingw-w64-x86_64-crt-git.
+          # The local crypt32 import library comes from that package as well.
+          zan_tls_mingw_support
+          crypt32
+          ws2_32
+          gdi32
+          EOF
+          cp "$TDEST/ssl.libs" "$TDEST/crypto.libs"
+          sh scripts/verify_dep.sh "$TDEST/libssl.a"
+          sh scripts/verify_dep.sh "$TDEST/libcrypto.a"
+          ls -la "$TDEST"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -394,6 +402,7 @@ jobs:
             toolchain/${{ matrix.target }}/zanrt_*.o
             toolchain/${{ matrix.target }}/mingw/lib/lib*.a
             stdlib/Gui/drivers/${{ matrix.target }}/
+            stdlib/System/Net/Tls/drivers/${{ matrix.target }}/static/
 
       # PowerShell, not the job's msys2 shell: the MSYS2 environments here ship
       # no git, so the runner's own git has to do the commit.
@@ -409,9 +418,11 @@ jobs:
           $sub = 'toolchain/${{ matrix.target }}'
           git add -f "$sub/zanrt_io.o" "$sub/zanrt_io_mt.o" "$sub/zanrt_sync.o" `
                      "$sub/zanrt_file.o" "$sub/zanrt_timer.o"
-          # The repository ignores *.a by default; force-add refreshed import
-          # libraries such as libcrypt32.a and the merged libmingwex.a.
-          git add -f "$sub/mingw/lib"
+          if ('${{ matrix.target }}' -eq 'win-x64') {
+            # TLS archives are generated from MSYS2's OpenSSL and CRT packages;
+            # *.a is ignored by default, so force-add this self-contained set.
+            git add -f 'stdlib/System/Net/Tls/drivers/win-x64/static'
+          }
           if ('${{ matrix.target }}' -eq 'win-arm64' -and
               (Test-Path 'stdlib/Gui/drivers/win-arm64')) {
             git add 'stdlib/Gui/drivers/win-arm64'
@@ -465,22 +476,6 @@ jobs:
             done || true
           { echo libpq.dll; ls "$GDEST" | grep -viE '^(libpq\.dll|pq\.bundle)$' | sort || true; } > "$GDEST/pq.bundle"
           ls -la "$SDEST" "$QDEST" "$GDEST"
-
-      - name: Stage TLS static archives
-        if: matrix.target == 'win-x64'
-        run: |
-          set -eux
-          P="$(cygpath -u "$MINGW_PREFIX")"
-          TDEST="stdlib/System/Net/Tls/drivers/${{ matrix.target }}/static"
-          mkdir -p "$TDEST"
-          cp "$P/lib/libssl.a" "$TDEST/libssl.a"
-          cp "$P/lib/libcrypto.a" "$TDEST/libcrypto.a"
-          printf '# OpenSSL 3.6.3 MinGW-w64 Libs.private dependencies.\nws2_32\ngdi32\ncrypt32\n' \
-            > "$TDEST/ssl.libs"
-          cp "$TDEST/ssl.libs" "$TDEST/crypto.libs"
-          sh scripts/verify_dep.sh "$TDEST/libssl.a"
-          sh scripts/verify_dep.sh "$TDEST/libcrypto.a"
-          ls -la "$TDEST"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

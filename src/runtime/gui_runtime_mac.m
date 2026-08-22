@@ -247,6 +247,39 @@ static int g_ime_composing = 0;
 - (void)doCommandBySelector:(SEL)selector { (void)selector; }
 @end
 
+/* CEF (Chromium) refuses to run under a plain NSApplication: its mac message
+ * pump asserts that NSApp conforms to CrAppProtocol and tracks whether a
+ * -sendEvent: is on the stack (include/cef_application_mac.h: "All CEF client
+ * applications must subclass NSApplication and implement this protocol").
+ * The protocols are re-declared here rather than pulled from the CEF headers
+ * so zan_gui keeps building without a CEF checkout; ObjC protocol identity is
+ * the name, so conformsToProtocol: still matches CEF's copy. Harmless for
+ * programs that never touch CefBrowserBox. */
+@protocol CrAppProtocol
+- (BOOL)isHandlingSendEvent;
+@end
+@protocol CrAppControlProtocol <CrAppProtocol>
+- (void)setHandlingSendEvent:(BOOL)handlingSendEvent;
+@end
+@protocol CefAppProtocol <CrAppControlProtocol>
+@end
+
+@interface ZanApplication : NSApplication <CefAppProtocol> {
+    BOOL handlingSendEvent;
+}
+@end
+
+@implementation ZanApplication
+- (BOOL)isHandlingSendEvent { return handlingSendEvent; }
+- (void)setHandlingSendEvent:(BOOL)value { handlingSendEvent = value; }
+- (void)sendEvent:(NSEvent *)event {
+    BOOL outer = handlingSendEvent;
+    handlingSendEvent = YES;
+    [super sendEvent:event];
+    handlingSendEvent = outer;
+}
+@end
+
 /* Borderless windows are not key/main by default; allow both so the app still
  * receives keyboard focus and looks active without a native title bar. */
 @interface ZanWindow : NSWindow
@@ -323,7 +356,10 @@ static ZanDelegate *g_delegate = nil;
 EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
     if (g_mwin_count >= ZAN_MAX_WINDOWS) return 0;
     @autoreleasepool {
-        [NSApplication sharedApplication];
+        /* +sharedApplication instantiates the receiver class, so this is what
+         * makes NSApp the CefAppProtocol-conforming subclass; it has to happen
+         * before cef_initialize, i.e. before the first browser is created. */
+        [ZanApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         if (!g_delegate) g_delegate = [[ZanDelegate alloc] init];
 
@@ -1186,6 +1222,14 @@ EXPORT void zan_gui_set_ime_pos(i32 x, i32 y) {
 
 @class ZanWebViewDelegate;
 
+/* Messages a page posted through window.webkit.messageHandlers.<name>, kept
+ * until the app drains them. WebKit delivers on the main thread while the app
+ * reads from its own frame loop, so a bounded queue (drop the oldest, count the
+ * drops) keeps a chatty page from growing memory without bound. */
+#define ZAN_WV_MSG_MAX 128
+
+@class ZanWebMessageHandler;
+
 typedef struct {
     int used;
     WKWebView *wv;
@@ -1199,13 +1243,31 @@ typedef struct {
     char *evalBuf;
     char *cookieBuf;
     char *clipSpec;   /* last region handed to set_clip, NULL = none yet */
+    char *msgQ[ZAN_WV_MSG_MAX];
+    int msgCount;
+    long msgDrops;
+    char *msgBuf;     /* last message handed out by take_message */
+    ZanWebMessageHandler *msgHandler;
+    NSMutableArray<NSString *> *msgNames;
 } zan_webview_t;
 
 static zan_webview_t g_webviews[ZAN_MAX_WEBVIEWS];
 
-@interface ZanWebViewDelegate : NSObject <WKNavigationDelegate>
+@interface ZanWebViewDelegate : NSObject <WKNavigationDelegate, WKUIDelegate>
 @property (nonatomic) int slot;
 @end
+
+/* Run an alert as a sheet when the view is in a window, modally otherwise
+ * (beginSheetModalForWindow: needs a real window), and report which button
+ * ended it so JS's alert/confirm/prompt can resolve. */
+static void wv_run_alert(NSAlert *alert, NSWindow *host,
+                         void (^done)(NSModalResponse)) {
+    if (host) {
+        [alert beginSheetModalForWindow:host completionHandler:done];
+    } else {
+        done([alert runModal]);
+    }
+}
 
 @implementation ZanWebViewDelegate
 - (void)webView:(WKWebView *)wv
@@ -1265,6 +1327,116 @@ static zan_webview_t g_webviews[ZAN_MAX_WEBVIEWS];
     (void)wv; (void)navigation;
     if (self.slot >= 0 && self.slot < ZAN_MAX_WEBVIEWS) g_webviews[self.slot].navSeq++;
     zan_gui_wake();
+}
+
+/* --- WKUIDelegate ---------------------------------------------------------
+ * Without these, a page's window.open / target=_blank does nothing at all
+ * (WebKit asks the UI delegate for a view to load into and gives up when there
+ * is none) and alert/confirm/prompt silently resolve to "dismissed". */
+- (WKWebView *)webView:(WKWebView *)wv
+    createWebViewWithConfiguration:(WKWebViewConfiguration *)configuration
+               forNavigationAction:(WKNavigationAction *)action
+                    windowFeatures:(WKWindowFeatures *)windowFeatures {
+    (void)configuration; (void)windowFeatures;
+    /* No tab management down here: load the target in this view, which is what
+     * an embedded single-view browser can honour. Returning nil means "handled
+     * by the app", so WebKit will not open a window of its own. */
+    if (!action.targetFrame && action.request.URL) [wv loadRequest:action.request];
+    return nil;
+}
+- (void)webView:(WKWebView *)wv runJavaScriptAlertPanelWithMessage:(NSString *)message
+    initiatedByFrame:(WKFrameInfo *)frame completionHandler:(void (^)(void))completionHandler {
+    (void)frame;
+    @autoreleasepool {
+        NSAlert *a = [[[NSAlert alloc] init] autorelease];
+        a.messageText = message ? message : @"";
+        [a addButtonWithTitle:@"OK"];
+        wv_run_alert(a, [wv window], ^(NSModalResponse r) {
+            (void)r;
+            completionHandler();
+        });
+    }
+}
+- (void)webView:(WKWebView *)wv runJavaScriptConfirmPanelWithMessage:(NSString *)message
+    initiatedByFrame:(WKFrameInfo *)frame completionHandler:(void (^)(BOOL))completionHandler {
+    (void)frame;
+    @autoreleasepool {
+        NSAlert *a = [[[NSAlert alloc] init] autorelease];
+        a.messageText = message ? message : @"";
+        [a addButtonWithTitle:@"OK"];
+        [a addButtonWithTitle:@"Cancel"];
+        wv_run_alert(a, [wv window], ^(NSModalResponse r) {
+            completionHandler(r == NSAlertFirstButtonReturn);
+        });
+    }
+}
+- (void)webView:(WKWebView *)wv
+    runJavaScriptTextInputPanelWithPrompt:(NSString *)prompt
+                              defaultText:(NSString *)defaultText
+                         initiatedByFrame:(WKFrameInfo *)frame
+                        completionHandler:(void (^)(NSString *))completionHandler {
+    (void)frame;
+    @autoreleasepool {
+        NSAlert *a = [[[NSAlert alloc] init] autorelease];
+        a.messageText = prompt ? prompt : @"";
+        [a addButtonWithTitle:@"OK"];
+        [a addButtonWithTitle:@"Cancel"];
+        NSTextField *field =
+            [[[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 260, 24)] autorelease];
+        [field setStringValue:(defaultText ? defaultText : @"")];
+        a.accessoryView = field;
+        wv_run_alert(a, [wv window], ^(NSModalResponse r) {
+            completionHandler(r == NSAlertFirstButtonReturn ? [field stringValue] : nil);
+        });
+    }
+}
+@end
+
+/* JS -> native. The handler is retained by the user content controller, which
+ * the web view's configuration owns; it deliberately keeps only the slot index
+ * so nothing points back at the view (the classic addScriptMessageHandler
+ * retain cycle). */
+@interface ZanWebMessageHandler : NSObject <WKScriptMessageHandler>
+@property (nonatomic) int slot;
+@end
+
+static void wv_msg_push(int slot, const char *text) {
+    if (slot < 0 || slot >= ZAN_MAX_WEBVIEWS || !text) return;
+    zan_webview_t *w = &g_webviews[slot];
+    if (!w->used) return;
+    char *nb = strdup(text);
+    if (!nb) return;
+    if (w->msgCount == ZAN_WV_MSG_MAX) {
+        free(w->msgQ[0]);
+        memmove(w->msgQ, w->msgQ + 1, sizeof(char *) * (ZAN_WV_MSG_MAX - 1));
+        w->msgCount--;
+        w->msgDrops++;
+    }
+    w->msgQ[w->msgCount++] = nb;
+    zan_gui_wake();
+}
+
+@implementation ZanWebMessageHandler
+- (void)userContentController:(WKUserContentController *)controller
+      didReceiveScriptMessage:(WKScriptMessage *)message {
+    (void)controller;
+    @autoreleasepool {
+        /* Strings pass through; anything else (object, array, number) is handed
+         * over as JSON so one text ABI covers every postMessage payload. */
+        NSString *body = nil;
+        id raw = message.body;
+        if ([raw isKindOfClass:[NSString class]]) {
+            body = (NSString *)raw;
+        } else if (raw && [NSJSONSerialization isValidJSONObject:@[raw ? raw : [NSNull null]]]) {
+            NSData *d = [NSJSONSerialization dataWithJSONObject:raw options:0 error:NULL];
+            if (d) body = [[[NSString alloc] initWithData:d
+                                                encoding:NSUTF8StringEncoding] autorelease];
+        }
+        if (!body) body = raw ? [NSString stringWithFormat:@"%@", raw] : @"";
+        NSString *line = [NSString stringWithFormat:@"%@\t%@",
+                          message.name ? message.name : @"", body];
+        wv_msg_push(self.slot, [line UTF8String]);
+    }
 }
 @end
 
@@ -1361,6 +1533,7 @@ EXPORT i32 zan_gui_webview_create(iptr hwnd_val, const char *profile_id) {
         ZanWebViewDelegate *d = [[ZanWebViewDelegate alloc] init];
         d.slot = slot;
         wv.navigationDelegate = d;   /* weak; the +1 from alloc keeps it alive */
+        wv.UIDelegate = d;
         [wv setHidden:YES];
         [mw->view addSubview:wv];    /* view retains wv; keep our +1 too */
 
@@ -1377,6 +1550,11 @@ EXPORT i32 zan_gui_webview_create(iptr hwnd_val, const char *profile_id) {
         w->evalBuf = NULL;
         w->cookieBuf = NULL;
         w->clipSpec = NULL;
+        w->msgCount = 0;
+        w->msgDrops = 0;
+        w->msgBuf = NULL;
+        w->msgHandler = nil;
+        w->msgNames = nil;
     }
     return (i64)(slot + 1);
 }
@@ -1387,10 +1565,20 @@ EXPORT void zan_gui_webview_destroy(i32 h) {
     if (!w->used) return;
     @autoreleasepool {
         if (w->wv) {
+            /* The controller retains the message handler, so the handlers have
+             * to go before the view or they outlive the slot they point at. */
+            WKUserContentController *ucc = w->wv.configuration.userContentController;
+            for (NSString *n in w->msgNames) {
+                [ucc removeScriptMessageHandlerForName:n];
+            }
+            [ucc removeAllUserScripts];
             w->wv.navigationDelegate = nil;
+            w->wv.UIDelegate = nil;
             [w->wv removeFromSuperview]; /* drop the superview's retain */
             [w->wv release];             /* drop our create-time retain */
         }
+        if (w->msgNames) [w->msgNames release];
+        if (w->msgHandler) [w->msgHandler release];
         if (w->delegate) [w->delegate release];
     }
     free(w->urlBuf);
@@ -1399,6 +1587,8 @@ EXPORT void zan_gui_webview_destroy(i32 h) {
     free(w->evalBuf);
     free(w->cookieBuf);
     free(w->clipSpec);
+    free(w->msgBuf);
+    for (int i = 0; i < w->msgCount; i++) free(w->msgQ[i]);
     memset(w, 0, sizeof(*w));
 }
 
@@ -1700,6 +1890,149 @@ EXPORT void zan_gui_webview_clear_cookies(i32 h) {
                 modifiedSince:[NSDate dateWithTimeIntervalSince1970:0]
             completionHandler:^{ done = YES; }];
         wv_spin(&done, 3.0);
+    }
+}
+
+/* --------------------------------------------------------- JS <-> native --
+ * window.webkit.messageHandlers.<name>.postMessage(x) in the page turns into a
+ * queued "<name>\tbody" line here; the app drains it from its frame loop with
+ * take_message. Native -> JS stays evaluateJavaScript (webview_eval, or
+ * eval_async for fire-and-forget calls that must not spin the run loop). */
+EXPORT i32 zan_gui_webview_add_handler(i32 h, const char *name) {
+    if (h < 1 || h > ZAN_MAX_WEBVIEWS || !name || !*name) return 0;
+    zan_webview_t *w = &g_webviews[(int)h - 1];
+    if (!w->used || !w->wv) return 0;
+    @autoreleasepool {
+        NSString *n = [NSString stringWithUTF8String:name];
+        if (!n || n.length == 0) return 0;
+        if (!w->msgNames) w->msgNames = [[NSMutableArray alloc] init];
+        if ([w->msgNames containsObject:n]) return 1;
+        if (!w->msgHandler) {
+            ZanWebMessageHandler *mh = [[ZanWebMessageHandler alloc] init];
+            mh.slot = (int)h - 1;
+            w->msgHandler = mh;
+        }
+        WKUserContentController *ucc = w->wv.configuration.userContentController;
+        if (!ucc) return 0;
+        /* Adding the same name twice raises, and a stale registration from a
+         * reused slot would deliver into the wrong handler. */
+        [ucc removeScriptMessageHandlerForName:n];
+        [ucc addScriptMessageHandler:w->msgHandler name:n];
+        [w->msgNames addObject:n];
+    }
+    return 1;
+}
+
+EXPORT void zan_gui_webview_remove_handler(i32 h, const char *name) {
+    if (h < 1 || h > ZAN_MAX_WEBVIEWS || !name || !*name) return;
+    zan_webview_t *w = &g_webviews[(int)h - 1];
+    if (!w->used || !w->wv) return;
+    @autoreleasepool {
+        NSString *n = [NSString stringWithUTF8String:name];
+        if (!n) return;
+        [w->wv.configuration.userContentController removeScriptMessageHandlerForName:n];
+        [w->msgNames removeObject:n];
+    }
+}
+
+/* Oldest queued message as "<name>\tbody", or "" when the queue is empty. The
+ * returned pointer stays valid until the next call for this view. */
+EXPORT const char *zan_gui_webview_take_message(i32 h) {
+    if (h < 1 || h > ZAN_MAX_WEBVIEWS) return "";
+    zan_webview_t *w = &g_webviews[(int)h - 1];
+    if (!w->used || w->msgCount == 0) return "";
+    char *first = w->msgQ[0];
+    memmove(w->msgQ, w->msgQ + 1, sizeof(char *) * (size_t)(w->msgCount - 1));
+    w->msgCount--;
+    free(w->msgBuf);
+    w->msgBuf = first;
+    return w->msgBuf ? w->msgBuf : "";
+}
+
+EXPORT i32 zan_gui_webview_msg_pending(i32 h) {
+    if (h < 1 || h > ZAN_MAX_WEBVIEWS) return 0;
+    zan_webview_t *w = &g_webviews[(int)h - 1];
+    return w->used ? w->msgCount : 0;
+}
+
+/* Messages dropped because the queue was full (the app is not draining). */
+EXPORT i32 zan_gui_webview_msg_dropped(i32 h) {
+    if (h < 1 || h > ZAN_MAX_WEBVIEWS) return 0;
+    zan_webview_t *w = &g_webviews[(int)h - 1];
+    return w->used ? (i32)w->msgDrops : 0;
+}
+
+/* Script run on every page of this view: at_end = after the document parsed
+ * (window/document usable), otherwise before anything else runs. */
+EXPORT i32 zan_gui_webview_add_script(i32 h, const char *js, i32 at_end) {
+    WKWebView *wv = wv_get(h);
+    if (!wv || !js || !*js) return 0;
+    @autoreleasepool {
+        NSString *src = [NSString stringWithUTF8String:js];
+        if (!src) return 0;
+        WKUserScript *us = [[[WKUserScript alloc]
+            initWithSource:src
+             injectionTime:(at_end ? WKUserScriptInjectionTimeAtDocumentEnd
+                                   : WKUserScriptInjectionTimeAtDocumentStart)
+          forMainFrameOnly:YES] autorelease];
+        if (!us) return 0;
+        [wv.configuration.userContentController addUserScript:us];
+    }
+    return 1;
+}
+
+EXPORT i32 zan_gui_webview_add_style(i32 h, const char *css) {
+    if (!css || !*css) return 0;
+    @autoreleasepool {
+        NSString *text = [NSString stringWithUTF8String:css];
+        if (!text) return 0;
+        NSData *enc = [NSJSONSerialization dataWithJSONObject:@[text]
+                                                     options:0 error:NULL];
+        if (!enc) return 0;
+        NSString *json = [[[NSString alloc] initWithData:enc
+                                               encoding:NSUTF8StringEncoding] autorelease];
+        if (!json) return 0;
+        /* JSON array of one string: [ "css" ] -- indexing it keeps quoting and
+         * newlines correct without hand-rolled escaping. */
+        NSString *js = [NSString stringWithFormat:
+            @"(function(){var s=document.createElement('style');"
+             "s.textContent=%@[0];"
+             "(document.head||document.documentElement).appendChild(s);})();",
+            json];
+        return zan_gui_webview_add_script(h, [js UTF8String], 1);
+    }
+}
+
+EXPORT void zan_gui_webview_remove_scripts(i32 h) {
+    WKWebView *wv = wv_get(h);
+    if (!wv) return;
+    [wv.configuration.userContentController removeAllUserScripts];
+}
+
+/* Native -> JS without waiting for a result: no run-loop spin, so it is safe
+ * to call from paint/event handlers. */
+EXPORT void zan_gui_webview_eval_async(i32 h, const char *js) {
+    WKWebView *wv = wv_get(h);
+    if (!wv || !js || !*js) return;
+    @autoreleasepool {
+        NSString *script = [NSString stringWithUTF8String:js];
+        if (!script) return;
+        [wv evaluateJavaScript:script completionHandler:nil];
+    }
+}
+
+/* Every kind of website data (cookies, caches, localStorage, IndexedDB, ...)
+ * for this view's data store -- the "log out and forget me" button. */
+EXPORT void zan_gui_webview_clear_data(i32 h) {
+    WKWebView *wv = wv_get(h);
+    if (!wv) return;
+    @autoreleasepool {
+        WKWebsiteDataStore *ds = wv.configuration.websiteDataStore;
+        __block BOOL done = NO;
+        [ds removeDataOfTypes:[WKWebsiteDataStore allWebsiteDataTypes]
+                modifiedSince:[NSDate dateWithTimeIntervalSince1970:0]
+            completionHandler:^{ done = YES; }];
+        wv_spin(&done, 5.0);
     }
 }
 

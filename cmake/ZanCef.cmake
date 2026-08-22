@@ -13,14 +13,49 @@
 # runtime comes from (the "minimal" package, which carries include/) into the
 # build tree. Nothing enters the repository.
 #
-# The pinned versions must stay in step with CefRuntime.CurrentBranch() /
-# LegacyBranch() in stdlib/Gui/Component/CefBrowser/CefRuntime.zan.
-set(ZAN_CEF_VERSION "151.3.18+gbeff58d+chromium-151.0.7922.138"
-    CACHE STRING "CEF version whose headers zan_cef is built against")
-set(ZAN_CEF_VERSION_LEGACY "109.1.18+gf1c41e4+chromium-109.0.5414.120"
-    CACHE STRING "CEF version whose headers zan_cef109 is built against (Win7/8/8.1)")
+# Which CEF the driver is built against has exactly one source of truth: the
+# pinned table in stdlib/Gui/Component/CefBrowser/CefRuntime.zan, which is also
+# what a program downloads at run time. Spelling the version here as well let
+# the two drift (headers 151.3.18 vs runtime 151.3.23), and libcef then refuses
+# to load with "cef api hash mismatch", so it is read out of that file instead.
 set(ZAN_CEF_CDN "https://cef-builds.spotifycdn.com"
     CACHE STRING "Base URL of the official CEF build CDN")
+
+# The C API version the modern variant is compiled against. Pinning it is what
+# makes the driver survive a runtime upgrade: cef_api_hash() is computed per API
+# version, so a driver built at 15101 loads in every libcef whose supported
+# range covers 15101. Leaving it unset selects CEF_API_VERSION_EXPERIMENTAL
+# (999999), whose hash is tied to one exact CEF build - which is how the
+# mismatch above happened.
+set(ZAN_CEF_API_VERSION "15101"
+    CACHE STRING "CEF C API version zan_cef is compiled against")
+
+# Pull "<branch>..." out of CefRuntime.zan: <prefix_fn> is the branch accessor
+# (CurrentBranch / LegacyBranch), and the version is the first entry of the
+# pinned table on that branch.
+function(zan_cef_pinned_version prefix_fn out_var)
+    file(READ "${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/CefBrowser/CefRuntime.zan"
+         _src)
+    string(REGEX MATCH
+           "${prefix_fn}\\(\\)[ \t]*{[ \t]*return[ \t]*\"([0-9]+\\.)\""
+           _unused "${_src}")
+    set(_branch "${CMAKE_MATCH_1}")
+    if(_branch STREQUAL "")
+        set(${out_var} "" PARENT_SCOPE)
+        return()
+    endif()
+    string(REPLACE "." "\\." _branch_re "${_branch}")
+    string(REGEX MATCH "\"(${_branch_re}[0-9][^\"]*\\+chromium-[^\"]*)\""
+           _unused2 "${_src}")
+    set(${out_var} "${CMAKE_MATCH_1}" PARENT_SCOPE)
+endfunction()
+
+zan_cef_pinned_version("CurrentBranch" ZAN_CEF_VERSION)
+zan_cef_pinned_version("LegacyBranch" ZAN_CEF_VERSION_LEGACY)
+if(ZAN_CEF_VERSION STREQUAL "" OR ZAN_CEF_VERSION_LEGACY STREQUAL "")
+    message(FATAL_ERROR
+            "cannot read the pinned CEF versions out of CefRuntime.zan")
+endif()
 
 # Official platform tag of the host, i.e. which archive carries our headers.
 # The headers themselves are platform-independent in practice, but taking the
@@ -77,7 +112,9 @@ function(zan_cef_headers version tag out_var)
         endif()
     endforeach()
 
-    set(dest "${CMAKE_BINARY_DIR}/cef-headers/${tag}")
+    # Keyed by version, not just by tag: a bump must not silently reuse the
+    # previous branch's headers left in the build tree.
+    set(dest "${CMAKE_BINARY_DIR}/cef-headers/${tag}-${vdir}")
     if(EXISTS "${dest}/include/cef_version.h")
         set(${out_var} "${dest}" PARENT_SCOPE)
         return()
@@ -162,6 +199,9 @@ function(zan_cef_add_variant target version tag)
         # CEF 109 predates the versioned C API (no CEF_API_VERSION, unsized
         # structs, single-argument cef_api_hash).
         target_compile_definitions(${target} PRIVATE ZAN_CEF_LEGACY)
+    else()
+        target_compile_definitions(${target}
+                                   PRIVATE CEF_API_VERSION=${ZAN_CEF_API_VERSION})
     endif()
     # libcef itself is never linked: the driver resolves it out of the runtime
     # directory at run time, because which CEF is installed is a per-machine

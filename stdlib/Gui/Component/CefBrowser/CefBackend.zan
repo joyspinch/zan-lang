@@ -103,8 +103,24 @@ class CefBackend {
             }
         }
         if (CefBackend.mod == 0) {
+            // 单文件发布（Windows --link-mode static）下 exe 旁边没有
+            // driver，它就在 exe 里面：先落盘再交给系统加载器。
+            string extracted = CefBackend.Extract(
+                CefBackend.FileName(cefVersion));
+            if (extracted != "") {
+                CefBackend.mod = Interop.Load(extracted);
+                if (CefBackend.mod != 0) { CefBackend.libName = extracted; }
+            }
+        }
+        if (CefBackend.mod == 0) {
+            // Extract() 失败时留下的原因要一起报出来，否则「内嵌了但没落
+            // 盘成功」会被说成「找不到 driver」。
+            string why = "";
+            if (CefBackend.lastError != "") {
+                why = "（" + CefBackend.lastError + "）";
+            }
             CefBackend.lastError = "找不到原生 zan_cef driver（" + cands[0]
-                + "）：" + Interop.LastError();
+                + "）：" + Interop.LastError() + why;
             return false;
         }
         if (!CefBackend.ResolveSymbols()) {
@@ -121,15 +137,7 @@ class CefBackend {
     /// ZAN_CEF_DRIVER 指定的绝对路径，再是可执行文件同目录（--publish
     /// 会把 driver 拷到这里），最后交给系统加载器按名字找。</summary>
     static List<string> Candidates(string cefVersion) {
-        string baseName = "zan_cef";
-        if (cefVersion.StartsWith("109.")) { baseName = "zan_cef109"; }
-        #if WINDOWS
-        string file = baseName + ".dll";
-        #elif MACOS
-        string file = "lib" + baseName + ".dylib";
-        #else
-        string file = "lib" + baseName + ".so";
-        #endif
+        string file = CefBackend.FileName(cefVersion);
         List<string> cands = new List<string>();
         string forced = CefOptions.DriverPath();
         if (forced != "") {
@@ -140,6 +148,53 @@ class CefBackend {
         if (dir != "") { cands.Add(dir + "/" + file); }
         cands.Add(file);
         return cands;
+    }
+
+    /// <summary>当前平台上该 CEF 分支对应的 driver 文件名。</summary>
+    static string FileName(string cefVersion) {
+        string baseName = "zan_cef";
+        if (cefVersion.StartsWith("109.")) { baseName = "zan_cef109"; }
+        #if WINDOWS
+        return baseName + ".dll";
+        #elif MACOS
+        return "lib" + baseName + ".dylib";
+        #else
+        return "lib" + baseName + ".so";
+        #endif
+    }
+
+    /// <summary>把随 exe 内嵌的 driver 写到 CEF 缓存目录并返回其路径；
+    /// 没有内嵌副本或写入失败时返回 ""。
+    ///
+    /// 资源名自带构建指纹（"zan-drivers/&lt;fp&gt;/zan_cef.dll"，zanc 内嵌
+    /// 时按字节算出），落盘目录沿用同一指纹：换了一份 exe 就是另一
+    /// 个目录，因此无论缓存里还留着哪些旧 wrapper（旧的可能正被另一
+    /// 个进程占着、覆盖不掉），都不会被加载到。</summary>
+    static string Extract(string file) {
+        List<string> names = File.EmbeddedNames("zan-drivers");
+        string name = "";
+        for (int i = 0; i < names.Count; i = i + 1) {
+            if (names[i].EndsWith("/" + file)) { name = names[i]; break; }
+        }
+        if (name == "") { return ""; }
+        string dir = CefRuntime.CacheRoot() + "/drivers/"
+            + CefBackend.Fingerprint(name);
+        Directory.CreateDirectoryRecursive(dir);
+        string dest = dir + "/" + file;
+        if (!File.ExtractEmbedded(name, dest)) {
+            CefBackend.lastError = "内嵌的 " + file + " 无法写到 " + dest;
+            return "";
+        }
+        return dest;
+    }
+
+    // "zan-drivers/<fp>/<file>" 中的 <fp>。
+    static string Fingerprint(string name) {
+        int end = name.LastIndexOf("/");
+        if (end <= 0) { return "unknown"; }
+        string head = name.Substring(0, end);
+        int start = head.LastIndexOf("/");
+        return head.Substring(start + 1, head.Length - start - 1);
     }
 
     static bool ResolveSymbols() {
