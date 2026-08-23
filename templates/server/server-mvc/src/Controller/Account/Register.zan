@@ -1,5 +1,4 @@
 using System;
-using System.Data;
 using System.Data.Orm;
 using System.Security.Cryptography;
 using System.Web;
@@ -22,7 +21,7 @@ namespace ZanWeb.Account;
 [Route("[controller]/[action]")]
 [Custom(Authorization = CustomAuthorization.None)]
 [Description("注册与找回密码")]
-class Register : Controller {
+class Register : AppController {
     static string RegTpl = "Account.Register.Index";
     static string ResetTpl = "Account.Register.Forgot";
 
@@ -69,32 +68,29 @@ class Register : Controller {
             }
         }
 
-        IDbConnection db = await AuthUser.Lease();
-        if (db == null) { await this.Back("数据库不可用，请稍后再试", user, email); return; }
-        try {
-            int clash = await db.Select<User>().Where(a => a.username == user).CountAsync();
-            if (clash > 0) { await this.Back("账号已被使用", user, email); return; }
-            int mailClash = await db.Select<User>().Where(a => a.email == email).CountAsync();
-            if (mailClash > 0) { await this.Back("该邮箱已注册", user, email); return; }
-
-            string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
-            User u = new User();
-            u.username = user;
-            u.nickname = user;
-            u.email = email;
-            u.mobile = "";
-            u.departmentId = 0;
-            u.passwordSalt = salt;
-            u.passwordHash = AuthUser.PasswordHash(pass, salt);
-            u.status = 1;
-            u.isSuper = 0;
-            u.tokenVersion = 1;
-            u.createdAt = WebApp.NowSeconds();
-            u.updatedAt = u.createdAt;
-            int _id = await db.Insert<User>(u).ExecuteIdentityAsync();
-        } finally {
-            AuthUser.Give(db);
+        if (!this.DbReady()) {
+            await this.Back("数据库不可用，请稍后再试", user, email); return;
         }
+        int clash = await this.User.Where(a => a.username == user).CountAsync();
+        if (clash > 0) { await this.Back("账号已被使用", user, email); return; }
+        int mailClash = await this.User.Where(a => a.email == email).CountAsync();
+        if (mailClash > 0) { await this.Back("该邮箱已注册", user, email); return; }
+
+        string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+        User u = new User();
+        u.username = user;
+        u.nickname = user;
+        u.email = email;
+        u.mobile = "";
+        u.departmentId = 0;
+        u.passwordSalt = salt;
+        u.passwordHash = AuthUser.PasswordHash(pass, salt);
+        u.status = 1;
+        u.isSuper = 0;
+        u.tokenVersion = 1;
+        u.createdAt = WebApp.NowSeconds();
+        u.updatedAt = u.createdAt;
+        int _id = await this.User.Insert(u).ExecuteIdentityAsync();
 
         string token = await AuthUser.Login(user, pass);
         if (token.Length > 0) {
@@ -147,32 +143,27 @@ class Register : Controller {
             return;
         }
 
-        IDbConnection db = await AuthUser.Lease();
-        if (db == null) {
+        if (!this.DbReady()) {
             this.ViewOf(Register.ResetTpl,
                 await Register.Page("找回密码", "数据库不可用，请稍后再试", "", "", email));
             return;
         }
         bool done = false;
-        try {
-            User u = await db.Select<User>().Where(a => a.email == email).FirstAsync();
-            if (u != null) {
-                string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
-                int id = u.id;
-                int version = u.tokenVersion + 1;
-                // Replacing a password must also end the sessions opened with
-                // the old one, otherwise a recovered account stays shared.
-                int n = await db.Update<User>()
-                    .Set(a => a.passwordSalt, salt)
-                    .Set(a => a.passwordHash, AuthUser.PasswordHash(pass, salt))
-                    .Set(a => a.tokenVersion, version)
-                    .Set(a => a.updatedAt, WebApp.NowSeconds())
-                    .Where(a => a.id == id)
-                    .ExecuteAffrowsAsync();
-                done = n > 0;
-            }
-        } finally {
-            AuthUser.Give(db);
+        User u = await this.User.Where(a => a.email == email).FirstAsync();
+        if (u != null) {
+            string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+            int id = u.id;
+            int version = u.tokenVersion + 1;
+            // Replacing a password must also end the sessions opened with
+            // the old one, otherwise a recovered account stays shared.
+            int n = await this.User.Update()
+                .Set(a => a.passwordSalt, salt)
+                .Set(a => a.passwordHash, AuthUser.PasswordHash(pass, salt))
+                .Set(a => a.tokenVersion, version)
+                .Set(a => a.updatedAt, WebApp.NowSeconds())
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            done = n > 0;
         }
         if (!done) {
             this.ViewOf(Register.ResetTpl,
