@@ -770,7 +770,10 @@ int zan_gen_codegen(zan_ast_node_t *unit, zan_arena_t *arena,
                     zan_diag_t *diag, const char *stdlib_root) {
     if (!zan_gen_enabled || !unit) return 0;
 
-    char *meta = zan_genmeta_export(unit);
+    /* Export with the file table: the generators ignore it, but the index
+     * emitter (GenIndex, opt-in via ZAN_INDEX_DIR) turns the `file` ids on
+     * every declaration into paths with it. */
+    char *meta = zan_genmeta_export_files(unit, diag);
     if (!meta) return 0;
     /* One parse feeds all three trigger filters. A parse failure is a compiler
      * bug (or a document past json.c's nesting cap), never "nothing

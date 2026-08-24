@@ -2,9 +2,11 @@
  *
  * Output shape:
  *   { "version": 1,
- *     "classes": [ { "name","ns","kind","bases":[...],"attrs":[...],
- *                    "fields":[{ "name","type","attrs" }],
- *                    "methods":[{ "name","static","async",
+ *     "files":   [ "src/main.zan", ... ],   // only in _export_files
+ *     "classes": [ { "name","ns","kind","file","line","bases":[...],
+ *                    "attrs":[...],
+ *                    "fields":[{ "name","type","file","line","attrs" }],
+ *                    "methods":[{ "name","static","async","file","line",
  *                                 "params":[{ "name","type" }],"attrs" }],
  *                    "members":[ { "name","value" } ] } ],     // enums
  *     "calls":  [ { "id","file","line","col","name","recv",
@@ -22,6 +24,7 @@
 
 #include "ast.h"
 #include "zan.h"
+#include "diag.h"
 #include "lexer.h"
 #include "../common/json.h"
 
@@ -781,6 +784,8 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
         if (decl->orig_name.len)
             json_obj_set(o, "orig", json_new_str(
                 decl->orig_name.str ? (const char *)decl->orig_name.str : ""));
+        json_obj_set(o, "file", json_new_num((double)decl->loc.file_id));
+        json_obj_set(o, "line", json_new_num((double)decl->loc.line));
         json_value *bases = json_new_arr();
         for (int i = 0; i < decl->type_decl.bases.count; i++) {
             char b[256];
@@ -830,6 +835,8 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
                     (m->method_decl.modifiers & MOD_PRIVATE) != 0));
                 json_obj_set(mm, "protected", json_new_bool(
                     (m->method_decl.modifiers & MOD_PROTECTED) != 0));
+                json_obj_set(mm, "file", json_new_num((double)m->loc.file_id));
+                json_obj_set(mm, "line", json_new_num((double)m->loc.line));
                 json_value *ps = json_new_arr();
                 for (int j = 0; j < m->method_decl.params.count; j++) {
                     zan_ast_node_t *p = m->method_decl.params.items[j];
@@ -1185,10 +1192,19 @@ int zan_genmeta_index_calls(zan_ast_node_t *unit, zan_ast_node_t **nodes,
     return f.seen;
 }
 
-char *zan_genmeta_export(zan_ast_node_t *unit) {
+static char *gm_export(zan_ast_node_t *unit, zan_diag_t *diag) {
     if (!unit) return NULL;
     json_value *root = json_new_obj();
     json_obj_set(root, "version", json_new_num(1));
+
+    if (diag) {
+        json_value *files = json_new_arr();
+        for (int i = 0; i < diag->file_count; i++) {
+            const char *name = diag->file_names ? diag->file_names[i] : NULL;
+            json_arr_add(files, json_new_str(name ? name : ""));
+        }
+        json_obj_set(root, "files", files);
+    }
 
     json_value *classes = json_new_arr();
     for (int i = 0; i < unit->comp_unit.decls.count; i++)
@@ -1238,6 +1254,14 @@ char *zan_genmeta_export(zan_ast_node_t *unit) {
     fflush(stderr);
     json_free(root);
     return out;
+}
+
+char *zan_genmeta_export(zan_ast_node_t *unit) {
+    return gm_export(unit, NULL);
+}
+
+char *zan_genmeta_export_files(zan_ast_node_t *unit, zan_diag_t *diag) {
+    return gm_export(unit, diag);
 }
 
 /* ---- expression-tree deserializer (gm_expr_tree's inverse) ----

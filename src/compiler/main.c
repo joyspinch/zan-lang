@@ -2159,7 +2159,7 @@ int main(int argc, char **argv) {
          * the generators, whose rewrites would otherwise change the call
          * sites under export. Debugging aid for writing/testing generators. */
         if (gen_meta_path) {
-            char *meta = zan_genmeta_export(ast);
+            char *meta = zan_genmeta_export_files(ast, diag);
             if (!meta) {
                 fprintf(stderr, "error: cannot export metadata\n");
                 zan_arena_free(arena);

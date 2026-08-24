@@ -14,10 +14,18 @@
 
 struct zan_ast_node;
 struct json_value;
+struct zan_diag;
 
 /* Serialize the unit's metadata to a malloc'd JSON string (caller frees),
  * or NULL on allocation failure. */
 char *zan_genmeta_export(struct zan_ast_node *unit);
+
+/* Same, plus a "files" array naming every source file, so the `file` ids the
+ * export carries on locations resolve to paths. Tooling that indexes a project
+ * ("which file declares this entity") needs the table; the generators do not,
+ * and zan_genmeta_export keeps their input unchanged. */
+char *zan_genmeta_export_files(struct zan_ast_node *unit,
+                               struct zan_diag *diag);
 
 /* Locate the `id`-th member call site (ids start at 1, in the same traversal
  * order the export walks) -- the node the generators' rewrite directives
