@@ -981,7 +981,9 @@ static void emit_rc_store_field(zan_irgen_t *g, zan_type_t *type,
     }
     /* weak field: non-owning store, no retain of new / release of old, so a
      * parent<->child back-reference does not form an ARC-uncollectable cycle. */
-    if (is_weak) {
+    if (is_weak && is_arc_managed_type(type) &&
+        (type->kind == TYPE_INTERFACE ||
+         (type->kind == TYPE_CLASS && type->sym != NULL))) {
         if (LLVMGetTypeKind(vt) == LLVMPointerTypeKind)
             emit_weak_store(g, field_ptr, v);
         else

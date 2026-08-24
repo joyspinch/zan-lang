@@ -427,6 +427,51 @@ static const char *type_name(zan_type_t *t) {
     return t->name.str;
 }
 
+/* A weak slot must point at an ARC-managed object whose final release reaches
+ * zan_rt_weak_nil_all. Intrinsic collections share TYPE_CLASS with user
+ * classes but have no class symbol and use their own layouts/destructors.
+ * Unresolved type parameters are deferred: their eventual argument is not
+ * known while checking the generic declaration. */
+static bool checker_weak_target_is_arc_ref(zan_type_t *t) {
+    if (!t) return false;
+    if (t->kind == TYPE_TYPE_PARAM) return true;
+    if (t->kind == TYPE_INTERFACE) return true;
+    return t->kind == TYPE_CLASS && t->sym != NULL;
+}
+
+static void check_weak_member(zan_checker_t *c, zan_ast_node_t *owner,
+                              zan_ast_node_t *member) {
+    if (!c || !owner || !member ||
+        (member->kind != AST_FIELD_DECL && member->kind != AST_PROPERTY_DECL) ||
+        !(member->field_decl.modifiers & MOD_WEAK))
+        return;
+
+    if (owner->kind == AST_STRUCT_DECL) {
+        zan_diag_emit(c->diag, DIAG_ERROR, member->loc,
+                      "weak field '%.*s' inside value-type struct '%.*s' "
+                      "cannot be tracked safely; move it to a class or remove "
+                      "'weak'",
+                      (int)member->field_decl.name.len,
+                      member->field_decl.name.str,
+                      (int)owner->type_decl.name.len,
+                      owner->type_decl.name.str);
+        return;
+    }
+
+    zan_type_t *type = zan_binder_resolve_type(c->binder,
+                                                member->field_decl.type);
+    if (!type || type == c->binder->type_error) return;
+    if (checker_weak_target_is_arc_ref(type)) return;
+
+    zan_diag_emit(c->diag, DIAG_ERROR, member->loc,
+                  "weak field '%.*s' has type '%s'; weak requires an "
+                  "ARC-managed class or interface reference, so use a "
+                  "class/interface type or remove 'weak'",
+                  (int)member->field_decl.name.len,
+                  member->field_decl.name.str,
+                  type_name(type));
+}
+
 /* ---- constructor availability -------------------------------------------
  * A class that declares constructors has no implicit parameterless one, so
  * `new T()` on it has nothing to run: irgen zero-fills the object and calls no
@@ -2461,6 +2506,7 @@ void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
         c->current_type_sym = zan_binder_lookup(c->binder, decl->type_decl.name);
         for (int j = 0; j < decl->type_decl.members.count; j++) {
             zan_ast_node_t *member = decl->type_decl.members.items[j];
+            check_weak_member(c, decl, member);
             if (member->kind == AST_METHOD_DECL ||
                 member->kind == AST_CONSTRUCTOR_DECL ||
                 member->kind == AST_DESTRUCTOR_DECL) {

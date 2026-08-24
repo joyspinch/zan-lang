@@ -816,7 +816,9 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
         if (!ft || ft->kind == TYPE_TYPE_PARAM) continue;
         /* weak fields are non-owning back-references: unregister the slot
          * before the containing object is freed, but never release its value. */
-        if (m->modifiers & MOD_WEAK) {
+        if ((m->modifiers & MOD_WEAK) && is_arc_managed_type(ft) &&
+            (ft->kind == TYPE_INTERFACE ||
+             (ft->kind == TYPE_CLASS && ft->sym != NULL))) {
             if (LLVMGetTypeKind(map_type(g, ft)) == LLVMPointerTypeKind) {
                 LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self,
                     (unsigned)idx, "weak.fp");
