@@ -10,7 +10,12 @@ zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t l
     node->kind = kind;
     node->loc = loc;
     node->lit_suffix = 0;
-    node->binary.compound_base = TK_EOF;   /* union field: deterministic default */
+    if (kind == AST_ASSIGNMENT || kind == AST_BINARY) {
+        /* Only nodes that actually use the `binary` union member may be
+         * defaulted here: the arena is not zeroed uniformly and other members
+         * keep a pointer at this offset. */
+        node->binary.compound_base = TK_EOF;
+    }
     zan_ast_list_init(&node->attributes);
     node->ns_name.str = NULL; node->ns_name.len = 0;
     node->orig_name.str = NULL; node->orig_name.len = 0;
