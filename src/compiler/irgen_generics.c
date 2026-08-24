@@ -981,7 +981,14 @@ static void emit_rc_store_field(zan_irgen_t *g, zan_type_t *type,
     }
     /* weak field: non-owning store, no retain of new / release of old, so a
      * parent<->child back-reference does not form an ARC-uncollectable cycle. */
-    if (is_weak || LLVMGetTypeKind(vt) != LLVMPointerTypeKind) {
+    if (is_weak) {
+        if (LLVMGetTypeKind(vt) == LLVMPointerTypeKind)
+            emit_weak_store(g, field_ptr, v);
+        else
+            LLVMBuildStore(g->builder, v, field_ptr);
+        return;
+    }
+    if (LLVMGetTypeKind(vt) != LLVMPointerTypeKind) {
         LLVMBuildStore(g->builder, v, field_ptr);
         return;
     }
@@ -989,6 +996,67 @@ static void emit_rc_store_field(zan_irgen_t *g, zan_type_t *type,
     if (!expr_yields_owned_rc_value(g, rhs, locals)) emit_rc_retain_for_type(g, type, v);
     LLVMBuildStore(g->builder, v, field_ptr);
     emit_rc_release_for_type(g, type, old);
+}
+
+/* SEH code carrying a fatal runtime message, recognized by the crash filter in
+ * src/runtime/rt_crash.h (keep the two in sync). ExceptionInformation[0] is the
+ * message pointer, [1] the exit code the program would have used. */
+#define ZAN_RT_FAULT_MESSAGE 0xE0A2C010u
+
+/* Report a fatal runtime condition and end the current block: print `text`,
+ * and on Windows also hand it to the crash filter, which appends it to
+ * <exe_dir>\zan_crash.log together with a (symbolized) backtrace of the site.
+ *
+ * The log is what makes a GUI program diagnosable at all: linked with
+ * `--subsystem windows` there is no console behind stdout, so the print alone
+ * means a failed bounds check looks exactly like the process vanishing -- no
+ * message, no window, nothing to go on. Never returns. */
+static void emit_fatal_report(zan_irgen_t *g, LLVMValueRef text, int exit_code) {
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%s", "fatal_fmt");
+    LLVMValueRef pargs[] = { fmt, text };
+    zan_call2(g->builder, g->printf_type, g->fn_printf, pargs, 2, "");
+
+    if (g->target_is_windows) {
+        /* Insurance for an image whose filter never got installed: there the
+         * raise ends the process, and buffered stdout would be dropped along
+         * with the message we just printed. */
+        LLVMTypeRef fl_ty = LLVMFunctionType(i32t, &i8p, 1, 0);
+        LLVMValueRef fl = LLVMGetNamedFunction(g->mod, "fflush");
+        if (!fl) fl = LLVMAddFunction(g->mod, "fflush", fl_ty);
+        LLVMValueRef nullp = LLVMConstPointerNull(i8p);
+        zan_call2(g->builder, fl_ty, fl, &nullp, 1, "");
+
+        /* RaiseException(code, flags=0 i.e. continuable, 2, {text, exit}):
+         * the filter logs the record and resumes here, so the exit() below
+         * still runs -- same exit status, same atexit reports as before. */
+        LLVMTypeRef re_args[] = { i32t, i32t, i32t, LLVMPointerType(i64t, 0) };
+        LLVMTypeRef re_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                             re_args, 4, 0);
+        LLVMValueRef re = LLVMGetNamedFunction(g->mod, "RaiseException");
+        if (!re) re = LLVMAddFunction(g->mod, "RaiseException", re_ty);
+        LLVMValueRef slots = LLVMBuildArrayAlloca(g->builder, i64t,
+            LLVMConstInt(i32t, 2, 0), "fatalargs");
+        LLVMValueRef vals[2] = {
+            LLVMBuildPtrToInt(g->builder, text, i64t, "fatalmsg"),
+            LLVMConstInt(i64t, (unsigned long long)exit_code, 0)
+        };
+        for (int i = 0; i < 2; i++) {
+            LLVMValueRef idx = LLVMConstInt(i32t, (unsigned long long)i, 0);
+            LLVMValueRef slot = LLVMBuildGEP2(g->builder, i64t, slots, &idx, 1,
+                                              "fatalslot");
+            LLVMBuildStore(g->builder, vals[i], slot);
+        }
+        LLVMValueRef cargs[] = { LLVMConstInt(i32t, ZAN_RT_FAULT_MESSAGE, 0),
+                                 LLVMConstInt(i32t, 0, 0),
+                                 LLVMConstInt(i32t, 2, 0), slots };
+        zan_call2(g->builder, re_ty, re, cargs, 4, "");
+    }
+    LLVMValueRef code = LLVMConstInt(i32t, (unsigned long long)exit_code, 0);
+    zan_call2(g->builder, g->exit_type, g->fn_exit, &code, 1, "");
+    LLVMBuildUnreachable(g->builder);
 }
 
 /* Emit: when `cond` (an i1) is true at runtime, print `msg` and exit(1), then
@@ -1001,12 +1069,7 @@ static void emit_io_abort_if(zan_irgen_t *g, LLVMValueRef cond, const char *msg)
     LLVMBuildCondBr(g->builder, cond, fail_bb, cont_bb);
     LLVMPositionBuilderAtEnd(g->builder, fail_bb);
     LLVMValueRef text = LLVMBuildGlobalStringPtr(g->builder, msg, "ioerr");
-    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%s", "ioerr_fmt");
-    LLVMValueRef pargs[] = { fmt, text };
-    zan_call2(g->builder, g->printf_type, g->fn_printf, pargs, 2, "");
-    LLVMValueRef code = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 1, 0);
-    zan_call2(g->builder, g->exit_type, g->fn_exit, &code, 1, "");
-    LLVMBuildUnreachable(g->builder);
+    emit_fatal_report(g, text, 1);
     LLVMPositionBuilderAtEnd(g->builder, cont_bb);
 }
 
@@ -1036,12 +1099,7 @@ static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
     snprintf(buf, sizeof(buf), "%s:%u:%u: runtime error: %s\n",
              file, loc.line, loc.col, msg);
     LLVMValueRef text = LLVMBuildGlobalStringPtr(g->builder, buf, "rterr");
-    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%s", "rterr_fmt");
-    LLVMValueRef pargs[] = { fmt, text };
-    zan_call2(g->builder, g->printf_type, g->fn_printf, pargs, 2, "");
-    LLVMValueRef code = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 70, 0);
-    zan_call2(g->builder, g->exit_type, g->fn_exit, &code, 1, "");
-    LLVMBuildUnreachable(g->builder);
+    emit_fatal_report(g, text, 70);
 
     LLVMPositionBuilderAtEnd(g->builder, cont_bb);
 }
@@ -1718,14 +1776,24 @@ static LLVMValueRef emit_string_literal_rc(zan_irgen_t *g, zan_istr_t text) {
     if (text.len > 0) memcpy(blob + 16, text.str, (size_t)text.len);
     blob[16 + (size_t)text.len] = 0;
     /* --publish: XOR-scramble the text bytes in the image and record the
-     * global so the startup constructor can un-scramble it. Only when there is
-     * room to record (else the byte would never be restored) -- overflow just
-     * leaves that literal in plain text, never garbled at runtime. The header
-     * (RC sentinel + magic) and NUL stay intact. The global must be writable
-     * for the constructor to patch it, so it is not marked constant here. */
-    bool obf = g->obfuscate_strings && text.len > 0
-        && g->obf_literal_count <
-           (int)(sizeof(g->obf_literals) / sizeof(g->obf_literals[0]));
+     * global so the startup constructor can un-scramble it. The record table
+     * grows on demand -- a literal is only scrambled once it is recorded, so a
+     * failed grow leaves it in plain text rather than garbled at runtime. The
+     * header (RC sentinel + magic) and NUL stay intact. The global must be
+     * writable for the constructor to patch it, so it is not marked constant
+     * here. */
+    bool obf = g->obfuscate_strings && text.len > 0;
+    if (obf && !ZAN_TAB_ENSURE(g->obf_literals, g->obf_literal_count,
+                               g->obf_literal_cap, 256)) {
+        /* Leaving this literal in plain text would be a silent hole in
+         * exactly the protection --publish was asked for, so the build
+         * fails instead. */
+        zan_loc_t oloc = {0};
+        zan_diag_emit(g->diag, DIAG_ERROR, oloc,
+                      "out of memory recording obfuscated string literals "
+                      "(%d recorded)", g->obf_literal_count);
+        obf = false;
+    }
     if (obf) {
         for (size_t j = 0; j < (size_t)text.len; j++) {
             unsigned char ks = g->obf_key[j & 15]
@@ -1753,7 +1821,8 @@ static LLVMValueRef emit_string_literal_rc(zan_irgen_t *g, zan_istr_t text) {
     LLVMValueRef idxs[] = { LLVMConstInt(i64, 0, 0), LLVMConstInt(i64, 16, 0) };
     LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, lit_ty, global, idxs, 2, "str.lit.ptr");
 
-    if (g->string_literal_count < (int)(sizeof(g->string_literals) / sizeof(g->string_literals[0]))) {
+    if (ZAN_TAB_ENSURE(g->string_literals, g->string_literal_count,
+                       g->string_literal_cap, 512)) {
         g->string_literals[g->string_literal_count].text = text;
         g->string_literals[g->string_literal_count].value = global;
         g->string_literal_count++;

@@ -6,6 +6,8 @@
 #include "zan.h"
 #include "ast.h"
 #include "binder.h"
+#include <stdlib.h>
+#include <string.h>
 #include <llvm-c/Core.h>
 #include <llvm-c/DebugInfo.h>
 #include <llvm-c/Target.h>
@@ -20,14 +22,45 @@ typedef struct {
     int          frame_index;
 } zan_async_slot_t;
 
+/* Growth helpers for the generator's heap tables. A fixed-size table that
+ * silently stops recording (an un-scrambled literal, a dropped extern lib, a
+ * mis-attributed debug file) is far worse than one that reallocs, so every
+ * table that scales with program size uses these. Both return false only when
+ * the allocation itself fails. */
+static inline bool zan_tab_grow(void **items, int *cap, size_t elem,
+                                int initial) {
+    int ncap = *cap ? *cap * 2 : initial;
+    void *n = realloc(*items, (size_t)ncap * elem);
+    if (!n) return false;
+    *items = n;
+    *cap = ncap;
+    return true;
+}
+
+/* Ensure `index` is addressable, zero-filling the newly added slots (tables
+ * addressed by an id rather than appended to). */
+static inline bool zan_tab_reserve(void **items, int *cap, size_t elem,
+                                  int index, int initial) {
+    if (index < *cap) return true;
+    int ncap = *cap ? *cap : initial;
+    while (ncap <= index) ncap *= 2;
+    void *n = realloc(*items, (size_t)ncap * elem);
+    if (!n) return false;
+    memset((char *)n + (size_t)*cap * elem, 0,
+           (size_t)(ncap - *cap) * elem);
+    *items = n;
+    *cap = ncap;
+    return true;
+}
+
+#define ZAN_TAB_ENSURE(tab, cnt, cap, initial) \
+    ((cnt) < (cap) || zan_tab_grow((void **)&(tab), &(cap), sizeof(*(tab)), (initial)))
+
 /* Depth at which expression inference is treated as non-terminating. Inference
  * re-enters itself through member access and overload scoring, so a cycle or a
  * pathological nesting used to spin the compiler with no output at all; past
  * this it reports where it gave up instead. Real code nests far below it. */
 #define ZAN_MAX_INFER_DEPTH 256
-
-/* Nesting depth of catch bodies a single function body may be inside. */
-#define ZAN_MAX_CATCH_DEPTH 16
 
 /* Nesting depth of try/finally regions a single function body may be inside. */
 #define ZAN_MAX_FINALLY_DEPTH 16
@@ -160,8 +193,9 @@ struct zan_irgen {
         LLVMValueRef tid_slot;   /* i8* slot: its class type descriptor, used by
                                   * a bare `throw;` to rethrow with the original
                                   * dynamic type */
-    } catch_cleanups[ZAN_MAX_CATCH_DEPTH];
+    } *catch_cleanups;
     int catch_cleanup_count;
+    int catch_cleanup_cap;
     /* catch_cleanups entries entered inside the innermost loop: `break` and
      * `continue` leave only those */
     int loop_catch_base;
@@ -303,6 +337,12 @@ struct zan_irgen {
     LLVMValueRef rt_str_alloc;   /* zan_rt_str_alloc(int64_t size) -> void* */
     LLVMValueRef rt_arr_retain;  /* zan_rt_arr_retain(void*) */
     LLVMValueRef rt_arr_release; /* zan_rt_arr_release(void*) */
+    LLVMTypeRef weak_node_type;  /* { next, target, slot } */
+    LLVMValueRef weak_buckets;   /* zan_weak_buckets[8192] */
+    LLVMValueRef weak_lock;      /* zan_weak_lock */
+    LLVMValueRef weak_count;     /* zan_weak_count */
+    LLVMValueRef rt_weak_store;  /* zan_rt_weak_store(void**, void*) */
+    LLVMValueRef rt_weak_nil_all; /* zan_rt_weak_nil_all(void*) */
 
     /* runtime diagnostics & leak detection */
     LLVMValueRef fn_printf;       /* int printf(const char*, ...) */
@@ -363,16 +403,9 @@ struct zan_irgen {
         zan_symbol_t *field;
         LLVMValueRef get_fn;
         LLVMValueRef set_fn;
-    } bind_accs[512];
+    } *bind_accs;
     int bind_acc_count;
-
-    /* vtable registry (for virtual dispatch) */
-    struct {
-        zan_symbol_t *type_sym;
-        LLVMValueRef vtable_global;  /* global constant array */
-        int method_count;
-    } vtables[256];
-    int vtable_count;
+    int bind_acc_cap;
 
     /* built-in List<T> runtime support */
     LLVMValueRef fn_realloc;     /* realloc(void*, size_t) -> void* */
@@ -387,8 +420,9 @@ struct zan_irgen {
     struct {
         zan_istr_t text;
         LLVMValueRef value;
-    } string_literals[2048];
+    } *string_literals;
     int string_literal_count;
+    int string_literal_cap;
 
     /* reflection (irgen_reflect.c): per-type static records, emitted on first
      * use by typeof(T) / obj.GetType(). `metas` caches one record per
@@ -448,8 +482,12 @@ struct zan_irgen {
      * defeats trivial static extraction. */
     bool obfuscate_strings;
     unsigned char obf_key[16];
-    struct { LLVMValueRef global; uint32_t len; } obf_literals[2048];
+    /* Grown on demand: a fixed cap would silently leave every literal past it
+     * in plain text, which is worse than not scrambling at all -- the build
+     * looks protected while most of the image is readable. */
+    struct { LLVMValueRef global; uint32_t len; } *obf_literals;
     int obf_literal_count;
+    int obf_literal_cap;
 
     /* async/await CPS lowering (see docs/ASYNC_CPS_DESIGN.md) */
     LLVMTypeRef  co_step_type;    /* void(i8*) — a frame's resume/step fn */
@@ -504,8 +542,9 @@ struct zan_irgen {
         zan_istr_t        name;
         LLVMValueRef      fn;
         LLVMBasicBlockRef bb;
-    } goto_labels[256];
+    } *goto_labels;
     int goto_label_count;
+    int goto_label_cap;
     /* set while emitting an async function's $resume body: the current heap
      * frame pointer and its struct type, so `return` stores into the frame's
      * result slot + notifies the awaiter instead of a plain ret. NULL when not
@@ -557,8 +596,9 @@ struct zan_irgen {
     zan_type_t  *current_async_this_type;
 
     /* DllImport: tracked extern libraries for linker */
-    zan_istr_t extern_libs[64];
+    zan_istr_t *extern_libs;
     int extern_lib_count;
+    int extern_lib_cap;
     /* DllImport: every extern declaration with its owning lib, so a lib that
      * cannot be resolved when cross-linking a fully static Linux binary can
      * have its functions stubbed out (see zan_irgen_stub_extern_lib). */
@@ -566,8 +606,9 @@ struct zan_irgen {
         zan_istr_t lib;
         zan_istr_t name; /* symbol name; looked up at stub time because
                             optimization may delete unused declarations */
-    } extern_fns[512];
+    } *extern_fns;
     int extern_fn_count;
+    int extern_fn_cap;
 
     /* Per-thread exception-handling state (see irgen_builtins.c). The block
      * pointer and the field addresses derived from it are materialized once
@@ -598,7 +639,8 @@ struct zan_irgen {
     bool             emit_debug;
     LLVMDIBuilderRef di_builder;
     LLVMMetadataRef  di_cu;
-    LLVMMetadataRef  di_files[256]; /* DIFile per source file_id */
+    LLVMMetadataRef *di_files;      /* DIFile per source file_id */
+    int              di_file_cap;
     uint32_t         di_cur_line;   /* source line of the statement in progress */
     uint32_t         di_cur_file;   /* its file_id (for local-variable declares) */
 

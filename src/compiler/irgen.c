@@ -151,7 +151,12 @@ static void di_ensure(zan_irgen_t *g) {
 
 static LLVMMetadataRef di_file_for(zan_irgen_t *g, uint32_t file_id) {
     if (!g->emit_debug) return NULL;
-    if (file_id >= 256) file_id = 0;
+    /* Grows with the file table: capping it used to fold every file past the
+     * limit onto file 0, silently attributing their line numbers to the first
+     * source file (a stdlib-sized build has well over a few hundred). */
+    if (!zan_tab_reserve((void **)&g->di_files, &g->di_file_cap,
+                         sizeof(*g->di_files), (int)file_id, 64))
+        return NULL;
     if (g->di_files[file_id]) return g->di_files[file_id];
     if (!g->di_builder) g->di_builder = LLVMCreateDIBuilder(g->mod);
 
@@ -335,6 +340,7 @@ static zan_irgen_t *g_di_emit_ctx = NULL;
 static bool types_equal(zan_type_t *a, zan_type_t *b);
 static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
                               LLVMValueRef *args, unsigned n, const char *nm);
+static void emit_weak_runtime(zan_irgen_t *g);
 
 /* True when `word` -- a string/object second header word -- belongs to a
  * managed string. Only the high half is the tag: the low half caches the byte
@@ -707,6 +713,10 @@ static bool member_name_is(zan_symbol_t *m, zan_istr_t name) {
            memcmp(m->name.str, name.str, (size_t)name.len) == 0;
 }
 
+/* Defined in irgen_generics.c, included at the bottom of this translation
+ * unit. */
+static void emit_fatal_report(zan_irgen_t *g, LLVMValueRef text, int exit_code);
+
 /* Guard a malloc/realloc result inside `fn`: if it is null, print "out of
  * memory" and exit(1) rather than carrying a null buffer into the store that
  * follows. Without this an exhausted heap surfaces as a SIGSEGV at a tiny
@@ -720,12 +730,7 @@ void zan_irgen_emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw)
     LLVMBuildCondBr(g->builder, isnull, oom_bb, ok_bb);
     LLVMPositionBuilderAtEnd(g->builder, oom_bb);
     LLVMValueRef text = LLVMBuildGlobalStringPtr(g->builder, "out of memory\n", "oomtxt");
-    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%s", "oomfmt");
-    LLVMValueRef pargs[] = { fmt, text };
-    zan_call2(g->builder, g->printf_type, g->fn_printf, pargs, 2, "");
-    LLVMValueRef code = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 1, 0);
-    zan_call2(g->builder, g->exit_type, g->fn_exit, &code, 1, "");
-    LLVMBuildUnreachable(g->builder);
+    emit_fatal_report(g, text, 1);
     LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }
 
@@ -946,18 +951,48 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
      * emitted below, so the multi-worker mode can skip it. */
     g->mt_scheduler = mt_scheduler;
 
-    /* --publish string obfuscation is off unless the driver turns it on; the
-     * key is a fixed 16-byte pad (see emit_string_literal_rc / the .ctors
-     * constructor). */
+    /* --publish string obfuscation is off unless the driver turns it on. This
+     * scrambling pad is not encryption: the key ships in the image next to the
+     * tables the startup constructor walks, so it only raises the cost of
+     * `strings`-style extraction. It is derived per build from the module name
+     * and target rather than being one constant shared by every Zan program,
+     * so a script written against one binary's pad does not unscramble the
+     * next one -- and it stays a pure function of the build inputs, so a
+     * rebuild of the same sources still reproduces the same image. */
     {
-        static const unsigned char zan_obf_default_key[16] = {
+        static const unsigned char zan_obf_pad[16] = {
             0x5a, 0x67, 0xa3, 0x1c, 0xd9, 0x84, 0x2f, 0x70,
             0xbe, 0x11, 0x4d, 0xe6, 0x93, 0x28, 0xc5, 0x7a
         };
-        memcpy(g->obf_key, zan_obf_default_key, 16);
+        uint64_t h = 0xcbf29ce484222325ULL; /* FNV-1a over the build identity */
+        const char *seeds[2] = { module_name ? module_name : "",
+                                 g->target_triple };
+        for (int s = 0; s < 2; s++) {
+            for (const char *p = seeds[s]; p && *p; p++) {
+                h ^= (unsigned char)*p;
+                h *= 0x100000001b3ULL;
+            }
+            h ^= 0x9e3779b97f4a7c15ULL;
+            h *= 0x100000001b3ULL;
+        }
+        for (int i = 0; i < 16; i++) {
+            uint64_t mix = h + (uint64_t)i * 0x9e3779b97f4a7c15ULL;
+            mix ^= mix >> 29;
+            mix *= 0xbf58476d1ce4e5b9ULL;
+            mix ^= mix >> 32;
+            g->obf_key[i] = (unsigned char)(zan_obf_pad[i] ^ (unsigned char)mix);
+        }
     }
+    g->catch_cleanups = NULL;
+    g->catch_cleanup_count = 0;
+    g->catch_cleanup_cap = 0;
     g->obfuscate_strings = false;
+    g->obf_literals = NULL;
     g->obf_literal_count = 0;
+    g->obf_literal_cap = 0;
+    g->string_literals = NULL;
+    g->string_literal_count = 0;
+    g->string_literal_cap = 0;
 
     g->ctx = LLVMContextCreate();
     g->mod = LLVMModuleCreateWithNameInContext(module_name, g->ctx);
@@ -968,7 +1003,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->emit_debug = false;
     g->di_builder = NULL;
     g->di_cu = NULL;
-    memset(g->di_files, 0, sizeof(g->di_files));
+    g->di_files = NULL;
+    g->di_file_cap = 0;
     g->di_cur_line = 0;
     g->di_cur_file = 0;
 
@@ -1098,6 +1134,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef exit_args[] = { i32 };
     g->exit_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), exit_args, 1, 0);
     g->fn_exit = LLVMAddFunction(g->mod, "exit", g->exit_type);
+    emit_weak_runtime(g);
 
     if (g->check_leaks) {
         /* int atexit(void(*)(void)) → used to schedule the leak report */
@@ -1683,6 +1720,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef header_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "hdr");
         LLVMTypeRef free_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
             (LLVMTypeRef[]){ i8ptr }, 1, 0);
+        zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_weak_nil_all),
+                  g->rt_weak_nil_all, &obj, 1, "");
         if (g->arc_guard) emit_arc_quarantine(g, obj, rc_iptr);
         else zan_call2(g->builder, free_fn_type, g->fn_free, &header_ptr, 1, "");
         if (g->check_leaks) {
@@ -2029,6 +2068,30 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 }
 
 void zan_irgen_destroy(zan_irgen_t *g) {
+    free(g->catch_cleanups);
+    g->catch_cleanups = NULL;
+    g->catch_cleanup_count = g->catch_cleanup_cap = 0;
+    free(g->di_files);
+    g->di_files = NULL;
+    g->di_file_cap = 0;
+    free(g->goto_labels);
+    g->goto_labels = NULL;
+    g->goto_label_count = g->goto_label_cap = 0;
+    free(g->bind_accs);
+    g->bind_accs = NULL;
+    g->bind_acc_count = g->bind_acc_cap = 0;
+    free(g->extern_libs);
+    g->extern_libs = NULL;
+    g->extern_lib_count = g->extern_lib_cap = 0;
+    free(g->extern_fns);
+    g->extern_fns = NULL;
+    g->extern_fn_count = g->extern_fn_cap = 0;
+    free(g->obf_literals);
+    g->obf_literals = NULL;
+    g->obf_literal_count = g->obf_literal_cap = 0;
+    free(g->string_literals);
+    g->string_literals = NULL;
+    g->string_literal_count = g->string_literal_cap = 0;
     if (g->builder) LLVMDisposeBuilder(g->builder);
     if (g->mod) LLVMDisposeModule(g->mod);
     if (g->ctx) LLVMContextDispose(g->ctx);
@@ -3261,6 +3324,7 @@ static LLVMValueRef emit_itoa_into(zan_irgen_t *g, LLVMValueRef buf,
  * inside this single translation unit. Do not add them to CMake.
  */
 #include "irgen_expr_core.c"
+#include "irgen_weak.c"
 #include "irgen_arc.c"
 #include "irgen_generics.c"
 #include "irgen_reflect.c"

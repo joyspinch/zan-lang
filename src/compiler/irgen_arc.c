@@ -814,8 +814,18 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
         /* resolve `T` / `List<T>` fields against the instantiation being freed */
         if (inst) ft = subst_type_param_deep(g, ft, inst);
         if (!ft || ft->kind == TYPE_TYPE_PARAM) continue;
-        /* weak fields are non-owning back-references: never released here. */
-        if (m->modifiers & MOD_WEAK) continue;
+        /* weak fields are non-owning back-references: unregister the slot
+         * before the containing object is freed, but never release its value. */
+        if (m->modifiers & MOD_WEAK) {
+            if (LLVMGetTypeKind(map_type(g, ft)) == LLVMPointerTypeKind) {
+                LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self,
+                    (unsigned)idx, "weak.fp");
+                emit_weak_store(g, fp,
+                    LLVMConstPointerNull(LLVMPointerType(
+                        LLVMInt8TypeInContext(c), 0)));
+            }
+            continue;
+        }
         if (ft->kind == TYPE_STRING) {
             LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
             LLVMValueRef s = LLVMBuildLoad2(b, i8ptr, fp, "fs");
