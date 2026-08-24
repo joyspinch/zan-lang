@@ -1,0 +1,356 @@
+// GenIndex.zan -- 项目语义索引导出(供 AI/工具「不读代码就能定位」)。
+//
+// 索引直接从 genmeta 的单元元数据推导,并复用 GenRoute / GenDb 的判定
+// (IsController/BuildPath/ControllerActionName、IsTableEntity/TableOf/
+// FieldsOf),因此索引里的路由与列定义与编译器真正生成的绑定代码同源,
+// 不会各写一遍再漂移。
+//
+// 产物(写入 <dir>,约定 <项目根>/.zanmap):
+//   routes.json    [{method,path,action,controller,module,title,auth,perm,
+//                    menu,icon,params:[{name,type}],file,line}]
+//                  —— RepoMap 的 routes.json 是同形数组的正则近似版,本文件
+//                  多出 perm/params/file/line 且路径与运行期一致。
+//   entities.json  [{name,ns,table,file,line,pk,facades:{...},
+//                    columns:[{field,column,type,kind,pk,identity,notNull,
+//                    strLen,file,line}],navs:[{field,type,table}],
+//                    indexes:[{name,fields,unique}]}]
+//   index.json     清单:{version,generatedBy,routes,entities,files,artefacts}
+//
+// 两个入口共享本模块:
+//   * ZanGen(编译期):设了 ZAN_INDEX_DIR 时顺带写出,编译即索引;
+//   * tools/zanindex(按需):对 `zanc --gen-meta` 的输出跑同一段代码。
+using System;
+using System.IO;
+using System.Json;
+using System.Text;
+
+namespace System.Compiler;
+
+class GenIndex {
+    static JsonValue unit;
+    static List<string> files;
+    /// 可选的路径前缀裁剪。工具为了避开 cwd 歧义常把绝对路径喂给编译器,
+    /// 但索引消费者要的是工作区相对路径;调用方设置本字段即可(Seed 不会
+    /// 重置它)。空串表示按编译器原样输出。
+    static string Base;
+
+    /// 从单元元数据建立查表状态,并给 GenRoute / GenDb 播种,以便直接调用
+    /// 它们的判定函数(两者的 Run 会自己重播种,先后调用互不影响)。
+    static void Seed(JsonValue u) {
+        GenIndex.unit = u;
+        GenIndex.files = new List<string>();
+        JsonValue fs = u.Get("files");
+        if (fs != null && fs.IsArray()) {
+            for (int i = 0; i < fs.Count(); i = i + 1) {
+                GenIndex.files.Add(fs.At(i).AsString(""));
+            }
+        }
+        GenRoute.Unit = u;
+        GenRoute.ClassOf = new Dict<string, JsonValue>();
+        GenDb.Unit = u;
+        GenDb.ClassOf = new Dict<string, JsonValue>();
+        JsonValue classes = u.Get("classes");
+        if (classes == null || !classes.IsArray()) { return; }
+        for (int i = 0; i < classes.Count(); i = i + 1) {
+            JsonValue c = classes.At(i);
+            string nm = c.Str("name", "");
+            if (nm.Length == 0) { continue; }
+            if (!GenRoute.ClassOf.ContainsKey(nm)) { GenRoute.ClassOf.Add(nm, c); }
+            if (!GenDb.ClassOf.ContainsKey(nm)) { GenDb.ClassOf.Add(nm, c); }
+        }
+    }
+
+    /// file_id -> 源文件路径(受 Base 裁剪)。旧编译器不导出 files 表时
+    /// 回退为 ""。
+    static string FileOf(int id) {
+        if (GenIndex.files == null) { return ""; }
+        if (id < 0 || id >= GenIndex.files.Count) { return ""; }
+        return GenIndex.Relative(GenIndex.files[id]);
+    }
+
+    static string Slashes(string p) {
+        return p.Replace("\\", "/");
+    }
+
+    static string Relative(string path) {
+        if (GenIndex.Base == null || GenIndex.Base.Length == 0) { return path; }
+        string p = GenIndex.Slashes(path);
+        string b = GenIndex.Slashes(GenIndex.Base);
+        while (b.Length > 0 && b.EndsWith("/")) { b = b.Substring(0, b.Length - 1); }
+        if (b.Length == 0 || !p.StartsWith(b + "/")) { return path; }
+        return p.Substring(b.Length + 1, p.Length - b.Length - 1);
+    }
+
+    // ---- 属性读取 -------------------------------------------------------
+
+    /// 命名实参 `Name = <expr>` 的右值表达式树,没有则 null。
+    static JsonValue NamedArg(JsonValue attr, string key) {
+        if (attr == null) { return null; }
+        JsonValue args = attr.Get("args");
+        if (args == null || !args.IsArray()) { return null; }
+        for (int i = 0; i < args.Count(); i = i + 1) {
+            JsonValue a = args.At(i);
+            if (a == null || a.Str("k", "") != "assign") { continue; }
+            JsonValue l = a.Get("l");
+            if (l == null || l.Str("n", "") != key) { continue; }
+            return a.Get("r");
+        }
+        return null;
+    }
+
+    /// 属性名匹配的第一个属性(类或成员),没有则 null。
+    static JsonValue AttrOf(JsonValue owner, string name) {
+        if (owner == null) { return null; }
+        JsonValue attrs = owner.Get("attrs");
+        if (attrs == null || !attrs.IsArray()) { return null; }
+        for (int i = 0; i < attrs.Count(); i = i + 1) {
+            JsonValue a = attrs.At(i);
+            if (a != null && a.Str("name", "") == name) { return a; }
+        }
+        return null;
+    }
+
+    /// 表达式树 -> 可读文本("PermBit.Create|PermBit.Update"、"true"、"8")。
+    /// 索引给人和 AI 看,保留源码写法比求值成数字更有用。
+    static string ExprText(JsonValue e) {
+        if (e == null) { return ""; }
+        string k = e.Str("k", "");
+        if (k == "lit") {
+            JsonValue v = e.Get("v");
+            if (v == null) { return ""; }
+            return v.AsString("");
+        }
+        if (k == "id") { return e.Str("n", ""); }
+        if (k == "mem") {
+            string o = GenIndex.ExprText(e.Get("o"));
+            string n = e.Str("n", "");
+            if (o.Length == 0) { return n; }
+            return o + "." + n;
+        }
+        if (k == "bin") {
+            string op = e.Str("op", "");
+            return GenIndex.ExprText(e.Get("l")) + op + GenIndex.ExprText(e.Get("r"));
+        }
+        if (k == "cast") { return GenIndex.ExprText(e.Get("e")); }
+        return "";
+    }
+
+    /// `Custom(...)` 上一个命名实参的文本,方法优先于类。
+    static string CustomText(JsonValue cls, JsonValue m, string key) {
+        JsonValue v = GenIndex.NamedArg(GenIndex.AttrOf(m, "Custom"), key);
+        if (v == null) { v = GenIndex.NamedArg(GenIndex.AttrOf(cls, "Custom"), key); }
+        return GenIndex.ExprText(v);
+    }
+
+    /// 授权门:`Custom(Authorization = CustomAuthorization.X)` -> "X"。
+    static string AuthOf(JsonValue cls, JsonValue m) {
+        string t = GenIndex.CustomText(cls, m, "Authorization");
+        int dot = t.LastIndexOf(".");
+        if (dot >= 0) { return t.Substring(dot + 1); }
+        return t;
+    }
+
+    // ---- 路由 -----------------------------------------------------------
+
+    /// 路由表。筛选与路径拼装跟 GenRoute.GenController 同一套判定:
+    /// 只有被 [Route]/[Http*] 标注(或 ApiController 的公开方法)、参数形状
+    /// 可绑定的方法才是 action。
+    static JsonValue RoutesDoc() {
+        JsonValue outArr = JsonValue.NewArray();
+        JsonValue classes = GenIndex.unit.Get("classes");
+        if (classes == null || !classes.IsArray()) { return outArr; }
+        for (int ci = 0; ci < classes.Count(); ci = ci + 1) {
+            JsonValue cls = classes.At(ci);
+            if (cls == null || cls.Str("kind", "") != "class") { continue; }
+            if (!GenRoute.IsController(cls)) { continue; }
+            string ctrltok = GenRoute.ControllerToken(cls);
+            string cmod = GenRoute.ControllerModule(cls);
+            string cdisp = GenRoute.ControllerDisplay(cls);
+            string cact = GenRoute.ControllerActionName(cls, cdisp, cmod);
+            string clsTpl = GenRoute.AttrStringArg(cls, "Route");
+            string clsDesc = GenRoute.AttrStringArg(cls, "Description");
+            bool apiController = GenRoute.AttrNamed(cls, "ApiController");
+
+            JsonValue methods = cls.Get("methods");
+            if (methods == null || !methods.IsArray()) { continue; }
+            for (int mi = 0; mi < methods.Count(); mi = mi + 1) {
+                JsonValue m = methods.At(mi);
+                if (m == null || m.Bool("ctor", false)) { continue; }
+                if (GenRoute.AttrNamed(m, "NonAction")) { continue; }
+                bool tagged = GenRoute.AttrNamed(m, "Route") ||
+                              GenRoute.AttrHttpVerb(
+                                  GenRoute.FirstVerbAttr(m)).Length > 0;
+                if (!tagged && !apiController) { continue; }
+                if (m.Bool("private", false) || m.Bool("protected", false)) {
+                    continue;
+                }
+                JsonValue ps = m.Get("params");
+                int np = ps != null ? ps.Count() : 0;
+                bool ctxParam = np == 1 &&
+                                ps.At(0).Str("type", "") == "HttpContext";
+                bool bindable = np > 0 && !ctxParam &&
+                                !m.Bool("static", false) &&
+                                GenRoute.BindableParams(ps);
+                if (np != 0 && !ctxParam && !bindable) { continue; }
+
+                string mname = m.Str("name", "");
+                string verb = GenRoute.MethodVerb(m);
+                if (verb.Length == 0) { verb = "GET"; }
+                string path = GenRoute.BuildPath(clsTpl,
+                    GenRoute.AttrStringArg(m, "Route"), ctrltok,
+                    GenRoute.Lower(mname));
+                string mDesc = GenRoute.AttrStringArg(m, "Description");
+                string title = mDesc.Length > 0 ? mDesc : clsDesc;
+
+                JsonValue r = JsonValue.NewObject();
+                r.Put("method", JsonValue.NewStr(verb));
+                r.Put("path", JsonValue.NewStr(path));
+                r.Put("action", JsonValue.NewStr(cact + "." + mname));
+                r.Put("controller", JsonValue.NewStr(cls.Str("name", "")));
+                r.Put("module", JsonValue.NewStr(cmod));
+                r.Put("title", JsonValue.NewStr(title));
+                r.Put("auth", JsonValue.NewStr(GenIndex.AuthOf(cls, m)));
+                r.Put("perm", JsonValue.NewStr(
+                    GenIndex.CustomText(cls, m, "Perm")));
+                r.Put("menu", JsonValue.NewStr(
+                    GenIndex.CustomText(cls, m, "IsMenu")));
+                r.Put("icon", JsonValue.NewStr(
+                    GenIndex.CustomText(cls, m, "Icon")));
+                r.Put("async", JsonValue.NewBool(m.Bool("async", false)));
+                JsonValue pl = JsonValue.NewArray();
+                if (ps != null && !ctxParam) {
+                    for (int pi = 0; pi < np; pi = pi + 1) {
+                        JsonValue p = JsonValue.NewObject();
+                        p.Put("name", JsonValue.NewStr(
+                            ps.At(pi).Str("name", "")));
+                        p.Put("type", JsonValue.NewStr(
+                            ps.At(pi).Str("type", "")));
+                        pl.Append(p);
+                    }
+                }
+                r.Put("params", pl);
+                r.Put("file", JsonValue.NewStr(
+                    GenIndex.FileOf(m.Int("file", 0))));
+                r.Put("line", JsonValue.NewNum(
+                    Convert.ToString(m.Int("line", 0))));
+                outArr.Append(r);
+            }
+        }
+        return outArr;
+    }
+
+    // ---- ORM 实体 -------------------------------------------------------
+
+    /// 实体表:每个 `[Table]` 类的物理表、列、导航、索引与生成门面名。
+    static JsonValue EntitiesDoc() {
+        JsonValue outArr = JsonValue.NewArray();
+        JsonValue classes = GenIndex.unit.Get("classes");
+        if (classes == null || !classes.IsArray()) { return outArr; }
+        for (int ci = 0; ci < classes.Count(); ci = ci + 1) {
+            JsonValue cls = classes.At(ci);
+            if (cls == null || cls.Str("kind", "") != "class") { continue; }
+            string name = cls.Str("name", "");
+            if (name.Length == 0 || !GenDb.IsTableEntity(name)) { continue; }
+            List<DbField> fs = GenDb.FieldsOf(name, 0);
+
+            JsonValue e = JsonValue.NewObject();
+            e.Put("name", JsonValue.NewStr(name));
+            e.Put("ns", JsonValue.NewStr(cls.Str("ns", "")));
+            e.Put("table", JsonValue.NewStr(GenDb.TableOf(name)));
+            e.Put("file", JsonValue.NewStr(GenIndex.FileOf(cls.Int("file", 0))));
+            e.Put("line", JsonValue.NewNum(Convert.ToString(cls.Int("line", 0))));
+            e.Put("pk", JsonValue.NewStr(GenDb.PkOf(name)));
+
+            JsonValue fac = JsonValue.NewObject();
+            fac.Put("cols", JsonValue.NewStr(name + "Cols"));
+            fac.Put("query", JsonValue.NewStr("__DbQ_" + name));
+            fac.Put("insert", JsonValue.NewStr("__DbI_" + name));
+            fac.Put("update", JsonValue.NewStr("__DbU_" + name));
+            fac.Put("delete", JsonValue.NewStr("__DbD_" + name));
+            fac.Put("sync", JsonValue.NewStr("__DbCF_" + name));
+            fac.Put("map", JsonValue.NewStr("__DbM_" + name));
+            fac.Put("bind", JsonValue.NewStr("__DbB_" + name));
+            e.Put("facades", fac);
+
+            JsonValue cols = JsonValue.NewArray();
+            JsonValue navs = JsonValue.NewArray();
+            for (int i = 0; i < fs.Count; i = i + 1) {
+                DbField f = fs[i];
+                if (f.Kind == 5) {
+                    JsonValue nv = JsonValue.NewObject();
+                    nv.Put("field", JsonValue.NewStr(f.Name));
+                    nv.Put("type", JsonValue.NewStr(f.TypeName));
+                    nv.Put("table", JsonValue.NewStr(GenDb.TableOf(f.TypeName)));
+                    navs.Append(nv);
+                    continue;
+                }
+                JsonValue c = JsonValue.NewObject();
+                c.Put("field", JsonValue.NewStr(f.Name));
+                c.Put("column", JsonValue.NewStr(f.Col));
+                c.Put("type", JsonValue.NewStr(f.TypeName));
+                c.Put("pk", JsonValue.NewBool(f.IsPk));
+                c.Put("identity", JsonValue.NewBool(f.IsIdent));
+                c.Put("notNull", JsonValue.NewBool(f.NotNull));
+                if (f.StrLen > 0) {
+                    c.Put("strLen", JsonValue.NewNum(
+                        Convert.ToString(f.StrLen)));
+                }
+                cols.Append(c);
+            }
+            e.Put("columns", cols);
+            e.Put("navs", navs);
+
+            JsonValue idx = JsonValue.NewArray();
+            List<JsonValue> ias = GenDb.IndexAttrs(name);
+            for (int i = 0; i < ias.Count; i = i + 1) {
+                JsonValue ia = ias[i];
+                JsonValue io = JsonValue.NewObject();
+                io.Put("name", JsonValue.NewStr(GenDb.AttrStr(ia, "Name")));
+                io.Put("fields", JsonValue.NewStr(GenDb.AttrStr(ia, "Fields")));
+                io.Put("unique", JsonValue.NewBool(
+                    GenDb.AttrBool(ia, "IsUnique", false)));
+                idx.Append(io);
+            }
+            e.Put("indexes", idx);
+            outArr.Append(e);
+        }
+        return outArr;
+    }
+
+    // ---- 清单 -----------------------------------------------------------
+
+    static JsonValue ManifestDoc(int routes, int entities) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("version", JsonValue.NewNum("1"));
+        o.Put("generatedBy", JsonValue.NewStr("System.Compiler.GenIndex"));
+        o.Put("sourceFiles", JsonValue.NewNum(
+            Convert.ToString(GenIndex.files != null ? GenIndex.files.Count : 0)));
+        o.Put("routes", JsonValue.NewNum(Convert.ToString(routes)));
+        o.Put("entities", JsonValue.NewNum(Convert.ToString(entities)));
+        JsonValue art = JsonValue.NewArray();
+        art.Append(JsonValue.NewStr("routes.json"));
+        art.Append(JsonValue.NewStr("entities.json"));
+        o.Put("artefacts", art);
+        JsonValue fl = JsonValue.NewArray();
+        if (GenIndex.files != null) {
+            for (int i = 0; i < GenIndex.files.Count; i = i + 1) {
+                fl.Append(JsonValue.NewStr(GenIndex.FileOf(i)));
+            }
+        }
+        o.Put("files", fl);
+        return o;
+    }
+
+    /// 把三份产物写进 `dir`(目录不存在则创建)。返回写出的路由条数。
+    static int WriteTo(JsonValue u, string dir) {
+        GenIndex.Seed(u);
+        JsonValue routes = GenIndex.RoutesDoc();
+        JsonValue entities = GenIndex.EntitiesDoc();
+        Directory.CreateDirectoryRecursive(dir);
+        File.WriteAllText(dir + "/routes.json", routes.PrettyToJson());
+        File.WriteAllText(dir + "/entities.json", entities.PrettyToJson());
+        File.WriteAllText(dir + "/index.json",
+            GenIndex.ManifestDoc(routes.Count(), entities.Count()).PrettyToJson());
+        return routes.Count();
+    }
+}

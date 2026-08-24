@@ -2050,6 +2050,21 @@ add_custom_command(OUTPUT ${_zandoc_exe}
     COMMENT "Building zandoc from Zan source")
 add_custom_target(zandoc_tool ALL DEPENDS ${_zandoc_exe})
 
+# ---- GenIndex (project semantic index, written in Zan) ----
+# The .zanmap index is what AI clients query instead of reading source, so its
+# shape is a contract: this case pins route/entity/manifest fields against a
+# trimmed, committed `--gen-meta` document.
+add_test(NAME tool_genindex
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/index/genindex_case.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/index/genindex.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/tool_genindex${_exe_ext}
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    "-DRUN_ARGS=${CMAKE_SOURCE_DIR}/tests/index/keys.meta.json;${CMAKE_BINARY_DIR}/genindex_out"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(tool_genindex PROPERTIES TIMEOUT 120)
+
 add_test(NAME tool_zandoc
   COMMAND ${CMAKE_COMMAND}
     -DZANDOC=${_zandoc_exe}

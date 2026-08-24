@@ -1,0 +1,84 @@
+// GenIndex regression: the project index (.zanmap/routes.json,
+// entities.json, index.json) is what AI clients query instead of reading
+// source, so its shape is a contract. This case feeds a trimmed, committed
+// `zanc --gen-meta` document (one controller + one entity, absolute paths)
+// through System.Compiler.GenIndex and prints the fields consumers rely on:
+// route verb/path/action/perm/auth, entity table/pk/facades/columns, and the
+// Base trimming that turns absolute compiler inputs into project-relative
+// hits.
+//
+//   Run: genindex_case <keys.meta.json> <out-dir>
+using System;
+using System.IO;
+using System.Json;
+using System.Compiler;
+
+namespace GenIndexCase;
+
+class Program {
+    static int Main() {
+        if (Environment.ArgCount() < 2) {
+            Console.WriteLine("usage: genindex_case <meta.json> <out-dir>");
+            return 2;
+        }
+        string meta = Environment.ArgAt(0);
+        string outDir = Environment.ArgAt(1);
+        JsonValue unit = JsonValue.Parse(File.ReadAllText(meta));
+        if (unit == null) { Console.WriteLine("bad metadata: " + meta); return 1; }
+
+        GenIndex.Base = "/proj";
+        int routes = GenIndex.WriteTo(unit, outDir);
+        Console.WriteLine("routes=" + Convert.ToString(routes));
+
+        JsonValue rs = JsonValue.Parse(File.ReadAllText(outDir + "/routes.json"));
+        if (rs == null) { Console.WriteLine("bad routes.json"); return 1; }
+        for (int i = 0; i < rs.Count(); i = i + 1) {
+            JsonValue r = rs.At(i);
+            if (r == null) { continue; }
+            Console.WriteLine("route " + r.Str("method", "") + " " + r.Str("path", "")
+                + " action=" + r.Str("action", "")
+                + " auth=" + r.Str("auth", "")
+                + " perm=" + r.Str("perm", "")
+                + " at=" + r.Str("file", "") + ":"
+                + Convert.ToString(r.Int("line", 0)));
+        }
+
+        JsonValue es = JsonValue.Parse(File.ReadAllText(outDir + "/entities.json"));
+        if (es == null) { Console.WriteLine("bad entities.json"); return 1; }
+        for (int i = 0; i < es.Count(); i = i + 1) {
+            JsonValue e = es.At(i);
+            if (e == null) { continue; }
+            JsonValue fac = e.Get("facades");
+            string q = "";
+            if (fac != null) { q = fac.Str("query", ""); }
+            Console.WriteLine("entity " + e.Str("name", "") + " -> " + e.Str("table", "")
+                + " pk=" + e.Str("pk", "")
+                + " query=" + q
+                + " at=" + e.Str("file", ""));
+            JsonValue cols = e.Get("columns");
+            if (cols == null) { continue; }
+            for (int j = 0; j < cols.Count(); j = j + 1) {
+                JsonValue c = cols.At(j);
+                if (c == null) { continue; }
+                Console.WriteLine("  col " + c.Str("field", "") + " " + c.Str("column", "")
+                    + " " + c.Str("type", "")
+                    + " pk=" + Convert.ToString(c.Bool("pk", false)));
+            }
+        }
+
+        JsonValue man = JsonValue.Parse(File.ReadAllText(outDir + "/index.json"));
+        if (man == null) { Console.WriteLine("bad index.json"); return 1; }
+        Console.WriteLine("manifest by=" + man.Str("generatedBy", "")
+            + " files=" + Convert.ToString(man.Int("sourceFiles", 0))
+            + " routes=" + Convert.ToString(man.Int("routes", 0))
+            + " entities=" + Convert.ToString(man.Int("entities", 0)));
+        JsonValue fl = man.Get("files");
+        if (fl == null) { Console.WriteLine("bad file table"); return 1; }
+        for (int i = 0; i < fl.Count(); i = i + 1) {
+            JsonValue f = fl.At(i);
+            if (f == null) { continue; }
+            Console.WriteLine("file " + f.AsString(""));
+        }
+        return 0;
+    }
+}
