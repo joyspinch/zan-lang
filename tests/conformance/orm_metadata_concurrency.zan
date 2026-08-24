@@ -1,0 +1,77 @@
+using System;
+using System.Data;
+using System.Data.Sqlite;
+using System.Threading;
+
+class ConcurrentRow {
+    [Column(IsPrimary = true, IsIdentity = true)]
+    int id;
+    string name;
+    long value;
+    bool active;
+}
+
+class Program {
+    static AtomicInt ready = new AtomicInt(0);
+    static AtomicInt start = new AtomicInt(0);
+    static AtomicInt done = new AtomicInt(0);
+    static AtomicInt failed = new AtomicInt(0);
+
+    static ConcurrentRow Row(int i) {
+        ConcurrentRow row = new ConcurrentRow();
+        row.name = "row";
+        row.value = i;
+        row.active = true;
+        return row;
+    }
+
+    static void Work() {
+        ready.Increment();
+        while (start.Load() == 0) {
+            Thread.Sleep(0);
+        }
+
+        try {
+            SqliteConnection db = SqliteConnection.Open(":memory:");
+            db.SyncStructure<ConcurrentRow>();
+            for (int i = 0; i < 200; i = i + 1) {
+                if (i % 3 == 0) {
+                    db.Insert<ConcurrentRow>(Program.Row(i))
+                        .Only("name")
+                        .ExecuteAffrows();
+                } else if (i % 3 == 1) {
+                    db.Insert<ConcurrentRow>(Program.Row(i))
+                        .Only("name")
+                        .Only("value")
+                        .ExecuteAffrows();
+                } else {
+                    db.Insert<ConcurrentRow>(Program.Row(i))
+                        .ExecuteAffrows();
+                }
+            }
+            db.Close();
+        } catch (Exception e) {
+            failed.Increment();
+        }
+        done.Increment();
+    }
+
+    static void Main() {
+        int workers = 16;
+        int started = 0;
+        for (int i = 0; i < workers; i = i + 1) {
+            if (Thread.Start(Work)) {
+                started = started + 1;
+            }
+        }
+        while (ready.Load() < started) {
+            Thread.Sleep(1);
+        }
+        start.Store(1);
+        while (done.Load() < started) {
+            Thread.Sleep(1);
+        }
+        Console.WriteLine("workers=" + Convert.ToString(started));
+        Console.WriteLine("failed=" + Convert.ToString(failed.Load()));
+    }
+}
