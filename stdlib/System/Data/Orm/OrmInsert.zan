@@ -1,0 +1,248 @@
+using System;
+using System.Data;
+
+namespace System.Data.Orm;
+
+/// <summary>
+/// 类型化 INSERT 的运行期实现：实体行与动态列（DbValues）两条来源，
+/// Only/Skip 决定的列集合在运行期成形，upsert 子句按方言拼装。
+/// 列清单与冲突子句按「实体 + 列集合」缓存在元数据上。
+/// </summary>
+class OrmInsert {
+    IDbExecutor db;
+    OrmMeta meta;
+    string tbl;
+    IOrmRows rows;
+    List<DbValues> dicts;
+    List<string> only;
+    List<string> skip;
+    List<string> conf;
+    List<string> acc;
+    List<string> gmx;
+    List<string> gmn;
+    bool upsert;
+    bool nop;
+    string sql;
+    DbParams bound;
+
+    OrmInsert(IDbExecutor db, OrmMeta meta) {
+        this.db = db;
+        this.meta = meta;
+        this.tbl = meta.Table;
+        this.rows = null;
+        this.dicts = new List<DbValues>();
+        this.only = new List<string>();
+        this.skip = new List<string>();
+        this.conf = new List<string>();
+        this.acc = new List<string>();
+        this.gmx = new List<string>();
+        this.gmn = new List<string>();
+        this.upsert = false;
+        this.nop = false;
+        this.sql = "";
+        this.bound = new DbParams();
+    }
+
+    static OrmInsert Create(IDbExecutor db, OrmMeta meta) {
+        return new OrmInsert(db, meta);
+    }
+
+    void AsTable(string t) { this.tbl = t; }
+    /// <summary>实体行来源：由编译期为该实体发的取值口提供。</summary>
+    void SetRows(IOrmRows rows) { this.rows = rows; }
+
+    int RowCount() { return this.rows == null ? 0 : this.rows.RowCount(); }
+
+    void AddDict(DbValues v) {
+        int i = 0;
+        while (i < v.Count()) { this.meta.Require(v.NameAt(i)); i = i + 1; }
+        this.dicts.Add(v);
+    }
+
+    void Only(string c) { this.only.Add(c); }
+    void Skip(string c) { this.skip.Add(c); }
+    void OC(string c) { this.conf.Add(c); this.upsert = true; }
+    void ACC(string c) { this.acc.Add(c); this.upsert = true; }
+    void GMX(string c) { this.gmx.Add(c); this.upsert = true; }
+    void GMN(string c) { this.gmn.Add(c); this.upsert = true; }
+    void NOP() { this.nop = true; this.upsert = true; }
+    int DictCount() { return this.dicts.Count; }
+
+    /// <summary>这一列是否进语句：Only 优先，其次自增列不写，
+    /// 最后看 Skip。</summary>
+    bool Use(string c, bool identity) {
+        if (this.only.Count > 0) { return OrmDialect.Has(this.only, c); }
+        if (identity) { return false; }
+        return !OrmDialect.Has(this.skip, c);
+    }
+
+    /// <summary>列集合的缓存键：Only/Skip 决定的列集合一样时，
+    /// 列清单与冲突子句都不必重拼。</summary>
+    string key(string what) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(what);
+        sb.Append("|");
+        sb.Append(this.tbl);
+        for (int i = 0; i < this.only.Count; i = i + 1) {
+            sb.Append("|o:" + this.only[i]);
+        }
+        for (int i = 0; i < this.skip.Count; i = i + 1) {
+            sb.Append("|s:" + this.skip[i]);
+        }
+        return sb.ToString();
+    }
+
+    List<OrmCol> used() {
+        List<OrmCol> l = new List<OrmCol>();
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            OrmCol c = this.meta.Cols[i];
+            if (this.Use(c.Col, c.IsIdent)) { l.Add(c); }
+        }
+        return l;
+    }
+
+    string colList(List<OrmCol> cols) {
+        string k = this.key("ic");
+        string hit = this.meta.Cached(k);
+        if (hit != null) { return hit; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append(cols[i].Col);
+        }
+        string v = sb.ToString();
+        this.meta.Cache(k, v);
+        return v;
+    }
+
+    /// <summary>冲突子句。键列缺省取实体主键；方言差异
+    /// （excluded 对 VALUES()、GREATEST 对 max）在 OrmDialect 里解决。</summary>
+    string Conflict() {
+        if (!this.upsert) { return ""; }
+        int p = this.db.GetProvider();
+        List<string> keys = this.conf;
+        if (keys.Count == 0) { keys = this.meta.PkCols(); }
+        if (keys.Count == 0) {
+            throw new Exception(this.meta.Entity
+                + ": OnConflict needs key columns");
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(OrmDialect.ConflictHead(p, keys, this.nop));
+        if (this.nop) { return sb.ToString(); }
+        int n = 0;
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            OrmCol c = this.meta.Cols[i];
+            if (!this.Use(c.Col, c.IsIdent)) { continue; }
+            if (OrmDialect.Has(keys, c.Col)) { continue; }
+            if (n > 0) { sb.Append(", "); }
+            sb.Append(OrmDialect.Excl(p, c.Col,
+                OrmDialect.Mode(this.acc, this.gmx, this.gmn, c.Col)));
+            n = n + 1;
+        }
+        if (n == 0) { return OrmDialect.ConflictHead(p, keys, true); }
+        return sb.ToString();
+    }
+
+    /// <summary>动态列写入：所有行按第一行的列形状对齐，缺的列写
+    /// NULL，值按列声明类型绑定。</summary>
+    int BuildDicts() {
+        DbParams ps = new DbParams();
+        DbValues head = this.dicts[0];
+        StringBuilder sb = new StringBuilder();
+        sb.Append("INSERT INTO ");
+        sb.Append(this.tbl);
+        sb.Append(" (");
+        int c = 0;
+        while (c < head.Count()) {
+            if (c > 0) { sb.Append(", "); }
+            sb.Append(head.NameAt(c));
+            c = c + 1;
+        }
+        sb.Append(") VALUES ");
+        int i = 0;
+        while (i < this.dicts.Count) {
+            DbValues v = this.dicts[i];
+            if (i > 0) { sb.Append(", "); }
+            sb.Append("(");
+            int k = 0;
+            while (k < head.Count()) {
+                if (k > 0) { sb.Append(", "); }
+                sb.Append("?");
+                int at = v.IndexOf(head.NameAt(k));
+                if (at < 0) { ps.AddNull(); }
+                else { v.BindAs(ps, at, this.meta.KindOf(head.NameAt(k))); }
+                k = k + 1;
+            }
+            sb.Append(")");
+            i = i + 1;
+        }
+        sb.Append(this.Conflict());
+        this.sql = sb.ToString();
+        this.bound = ps;
+        return 1;
+    }
+
+    /// <summary>实体行写入：列集合成形一次，每行按同一集合绑定。</summary>
+    int BuildRows() {
+        int nrows = this.RowCount();
+        if (nrows == 0) { return 0; }
+        List<OrmCol> cols = this.used();
+        if (cols.Count == 0) { return 0; }
+        DbParams ps = new DbParams();
+        StringBuilder sb = new StringBuilder();
+        sb.Append("INSERT INTO ");
+        sb.Append(this.tbl);
+        sb.Append(" (");
+        sb.Append(this.colList(cols));
+        sb.Append(") VALUES ");
+        string marks = OrmDialect.Marks(cols.Count);
+        int i = 0;
+        while (i < nrows) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append("(");
+            sb.Append(marks);
+            sb.Append(")");
+            for (int k = 0; k < cols.Count; k = k + 1) {
+                this.rows.BindCol(i, cols[k], ps);
+            }
+            i = i + 1;
+        }
+        sb.Append(this.Conflict());
+        this.sql = sb.ToString();
+        this.bound = ps;
+        return 1;
+    }
+
+    int ExecuteDicts() {
+        if (this.BuildDicts() == 0) { return 0; }
+        return this.db.Execute(this.sql, this.bound);
+    }
+
+    async int ExecuteDictsAsync() {
+        if (this.BuildDicts() == 0) { return 0; }
+        return await this.db.ExecuteAsync(this.sql, this.bound);
+    }
+
+    int ExecuteAffrows() {
+        if (this.dicts.Count > 0) { return this.ExecuteDicts(); }
+        if (this.BuildRows() == 0) { return 0; }
+        return this.db.Execute(this.sql, this.bound);
+    }
+
+    async int ExecuteAffrowsAsync() {
+        if (this.dicts.Count > 0) { return await this.ExecuteDictsAsync(); }
+        if (this.BuildRows() == 0) { return 0; }
+        return await this.db.ExecuteAsync(this.sql, this.bound);
+    }
+
+    int ExecuteIdentity() {
+        if (this.ExecuteAffrows() == 0) { return 0; }
+        return OrmDialect.LastId(this.db);
+    }
+
+    async int ExecuteIdentityAsync() {
+        int n = await this.ExecuteAffrowsAsync();
+        if (n == 0) { return 0; }
+        return await OrmDialect.LastIdAsync(this.db);
+    }
+}

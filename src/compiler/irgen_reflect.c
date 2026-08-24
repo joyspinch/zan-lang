@@ -18,7 +18,7 @@
  *      -32   i64  field_count
  *      -24   i64  type kind     ZAN_REFL_TK_*
  *      -16   i64  refcount      ZAN_STRING_SENTINEL_RC  \  the string RC header
- *       -8   i64  magic         ZAN_STRING_MAGIC        /  (see zan_abi.h)
+ *       -8   i64  tag|length    ZAN_STR_HDR_WORD(len)   /  (see zan_abi.h)
  *        0   i8[] name          NUL-terminated display name ("Widget", "int")
  *
  * The two header words a Zan string carries are therefore present at exactly
@@ -158,7 +158,7 @@ static LLVMValueRef refl_const_string(zan_irgen_t *g, const char *s, int len) {
     chars[len] = LLVMConstInt(i8, 0, 0);
     LLVMValueRef init = LLVMConstNamedStruct(rec_ty, (LLVMValueRef[]){
         LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
-        LLVMConstInt(i64, ZAN_STRING_MAGIC, 0),
+        LLVMConstInt(i64, ZAN_STR_HDR_WORD(len), 0),
         LLVMConstArray(i8, chars, (unsigned)(len + 1)) }, 3);
     free(chars);
     char nm[64];
@@ -900,7 +900,7 @@ static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
         LLVMConstInt(i64, (unsigned long long)field_count, 0),
         LLVMConstInt(i64, (unsigned long long)refl_type_kind(t), 0),
         LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
-        LLVMConstInt(i64, ZAN_STRING_MAGIC, 0),
+        LLVMConstInt(i64, ZAN_STR_HDR_WORD(disp_len), 0),
         LLVMConstArray(i8, chars, (unsigned)(disp_len + 1)) }, 12));
     free(chars);
     return rec;
@@ -1274,7 +1274,9 @@ static LLVMValueRef refl_get_f64_fn(zan_irgen_t *g) {
 }
 
 /* i8 *__zan_refl_get_str(i8 *ti, i8 *obj, i8 *name): a string field, or "" for
- * anything else (never null, so the result is printable/concatenable). */
+ * anything else (never null, so the result is printable/concatenable).
+ * The result is returned owned (+1), like every other call: the field keeps its
+ * own reference, so the caller's release cannot free the object's string. */
 static LLVMValueRef refl_get_str_fn(zan_irgen_t *g) {
     if (g->fn_refl_get_str) return g->fn_refl_get_str;
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
@@ -1309,10 +1311,15 @@ static LLVMValueRef refl_get_str_fn(zan_irgen_t *g) {
                       LLVMConstInt(i64, ZAN_REFL_FK_STRING, 0), "refl.propstr"),
         prop, notprop);
 
+    LLVMTypeRef arc_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                          (LLVMTypeRef[]){ i8ptr }, 1, 0);
+
     LLVMPositionBuilderAtEnd(g->builder, prop);
     LLVMValueRef psv = LLVMBuildIntToPtr(g->builder, pv, i8ptr, "refl.psv");
-    LLVMBuildRet(g->builder, LLVMBuildSelect(g->builder,
-        LLVMBuildIsNull(g->builder, psv, "refl.psnull"), empty, psv, "refl.ps"));
+    LLVMValueRef psr = LLVMBuildSelect(g->builder,
+        LLVMBuildIsNull(g->builder, psv, "refl.psnull"), empty, psv, "refl.ps");
+    zan_call2(g->builder, arc_ty, g->rt_str_retain, &psr, 1, "");
+    LLVMBuildRet(g->builder, psr);
 
     LLVMPositionBuilderAtEnd(g->builder, notprop);
     LLVMBuildCondBr(g->builder,
@@ -1346,8 +1353,10 @@ static LLVMValueRef refl_get_str_fn(zan_irgen_t *g) {
         LLVMBuildBitCast(g->builder, p, LLVMPointerType(i8ptr, 0), "refl.sp"),
         "refl.sv");
     /* an unassigned string field is null; answer "" instead */
-    LLVMBuildRet(g->builder, LLVMBuildSelect(g->builder,
-        LLVMBuildIsNull(g->builder, sv, "refl.snull"), empty, sv, "refl.str"));
+    LLVMValueRef svr = LLVMBuildSelect(g->builder,
+        LLVMBuildIsNull(g->builder, sv, "refl.snull"), empty, sv, "refl.str");
+    zan_call2(g->builder, arc_ty, g->rt_str_retain, &svr, 1, "");
+    LLVMBuildRet(g->builder, svr);
 
     LLVMPositionBuilderAtEnd(g->builder, none);
     LLVMBuildRet(g->builder, empty);
@@ -2481,11 +2490,16 @@ static bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
     }
 }
 
-/* `obj.GetType()` / `obj.GetFieldInt("x")` / ... on a class or struct value. */
-static bool refl_emit_instance_call(zan_irgen_t *g, zan_type_t *rt,
-                                    LLVMValueRef recv, zan_istr_t name,
-                                    zan_ast_node_t **args, int argc,
-                                    local_scope_t *locals, LLVMValueRef *out) {
+/* `obj.GetType()` / `obj.GetFieldInt("x")` / ... on a class or struct value.
+ * `nm_tmp`/`val_tmp` report the emitted name and value arguments, so the
+ * caller can release the ones it owns: like every other call, an argument
+ * written in place is the call site's temporary. */
+static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
+                                      LLVMValueRef recv, zan_istr_t name,
+                                      zan_ast_node_t **args, int argc,
+                                      local_scope_t *locals, LLVMValueRef *out,
+                                      LLVMValueRef *nm_tmp,
+                                      LLVMValueRef *val_tmp) {
     int code = 0;
     if (!zan_refl_instance_method(name, &code)) return false;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -2502,6 +2516,7 @@ static bool refl_emit_instance_call(zan_irgen_t *g, zan_type_t *rt,
     LLVMValueRef ti = refl_emit_get_type(g, rt, recv);
     LLVMValueRef obj = refl_receiver_ptr(g, rt, recv);
     LLVMValueRef nm = arg0 ? emit_expr(g, arg0, locals) : refl_empty_string(g);
+    if (arg0) *nm_tmp = nm;
     nm = LLVMBuildBitCast(g->builder, nm, i8ptr, "refl.nm");
     LLVMTypeRef three[3] = { i8ptr, i8ptr, i8ptr };
     /* SetField<T>(name, value): the setter of a property, else the field slot */
@@ -2509,6 +2524,7 @@ static bool refl_emit_instance_call(zan_irgen_t *g, zan_type_t *rt,
         code == ZAN_REFL_M_SETBOOL || code == ZAN_REFL_M_SETDOUBLE ||
         code == ZAN_REFL_M_SETSTRING) {
         LLVMValueRef v = arg1 ? emit_expr(g, arg1, locals) : NULL;
+        if (arg1) *val_tmp = v;
         int vkind = code == ZAN_REFL_M_SETDOUBLE ? ZAN_REFL_VK_DOUBLE
                   : code == ZAN_REFL_M_SETSTRING ? ZAN_REFL_VK_PTR
                                                  : ZAN_REFL_VK_INT;
@@ -2599,6 +2615,21 @@ static bool refl_emit_instance_call(zan_irgen_t *g, zan_type_t *rt,
     LLVMValueRef v = zan_call2(g->builder, LLVMFunctionType(i64, three, 3, 0),
         refl_get_i64_fn(g), (LLVMValueRef[]){ ti, obj, nm }, 3, "refl.i64");
     *out = code == ZAN_REFL_M_OINT ? LLVMBuildTrunc(g->builder, v, i32, "refl.i32") : v;
+    return true;
+}
+
+static bool refl_emit_instance_call(zan_irgen_t *g, zan_type_t *rt,
+                                    LLVMValueRef recv, zan_istr_t name,
+                                    zan_ast_node_t **args, int argc,
+                                    local_scope_t *locals, LLVMValueRef *out) {
+    LLVMValueRef nm_tmp = NULL, val_tmp = NULL;
+    if (!refl_emit_instance_call_1(g, rt, recv, name, args, argc, locals, out,
+                                   &nm_tmp, &val_tmp))
+        return false;
+    if (nm_tmp)
+        emit_release_owned_call_temp(g, args[0], nm_tmp, locals);
+    if (val_tmp)
+        emit_release_owned_call_temp(g, args[1], val_tmp, locals);
     return true;
 }
 

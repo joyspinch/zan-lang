@@ -1,0 +1,305 @@
+using System;
+using System.Data;
+
+namespace System.Data.Orm;
+
+/// <summary>
+/// 方言与目录探测：列类型、upsert 写法、表/列/索引存在性、自增值。
+/// 以前这些文本由代码生成器抄进每个用户产物，现在只有这一份实现，
+/// 改 SQL 规则只改这里。
+/// </summary>
+class OrmDialect {
+    /// <summary>`?, ?, ?` —— n 个占位符（n 为 0 时是 NULL）。</summary>
+    static string Marks(int n) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < n) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append("?");
+            i = i + 1;
+        }
+        if (sb.Length == 0) { sb.Append("NULL"); }
+        return sb.ToString();
+    }
+
+    static bool Has(List<string> l, string v) {
+        int i = 0;
+        while (i < l.Count) {
+            if (l[i] == v) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// <summary>WHERE 片段里的 `t.` 别名在 UPDATE/DELETE 上不成立。</summary>
+    static string Unalias(string f) { return f.Replace("t.", ""); }
+
+    /// <summary>两段参数按顺序合成一段（SET 在前、WHERE 在后）。</summary>
+    static DbParams Cat(DbParams a, DbParams b) {
+        DbParams r = new DbParams();
+        OrmDialect.CopyInto(a, r);
+        OrmDialect.CopyInto(b, r);
+        return r;
+    }
+
+    static void CopyInto(DbParams src, DbParams dst) {
+        int i = 0;
+        while (i < src.Count()) {
+            int k = src.KindAt(i);
+            if (k == DbParams.KindInt) { dst.AddLong(src.IntAt(i)); }
+            else if (k == DbParams.KindDouble) { dst.AddDouble(src.DoubleAt(i)); }
+            else if (k == DbParams.KindText) { dst.Add(src.TextAt(i)); }
+            else { dst.AddNull(); }
+            i = i + 1;
+        }
+    }
+
+    /// <summary>upsert 的冲突头：各家写法不同（ON CONFLICT /
+    /// ON DUPLICATE KEY / MERGE 前的 ON ...）。</summary>
+    static string ConflictHead(int p, List<string> keys, bool nop) {
+        bool my = p == DbProvider.MySQL || p == DbProvider.MariaDB;
+        bool pg = p == DbProvider.PostgreSQL || p == DbProvider.OpenGauss
+                  || p == DbProvider.Kingbase;
+        if (!my && !pg && p != DbProvider.SQLite) {
+            throw new Exception(
+                "Upsert (OnConflict) is not supported on this provider");
+        }
+        if (my) {
+            if (nop) {
+                return " ON DUPLICATE KEY UPDATE " + keys[0] + " = "
+                    + keys[0];
+            }
+            return " ON DUPLICATE KEY UPDATE ";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(" ON CONFLICT (");
+        int i = 0;
+        while (i < keys.Count) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append(keys[i]);
+            i = i + 1;
+        }
+        sb.Append(")");
+        if (nop) { sb.Append(" DO NOTHING"); }
+        else { sb.Append(" DO UPDATE SET "); }
+        return sb.ToString();
+    }
+
+    /// <summary>冲突时一列的新值：直接覆盖（0）、累加（1）、
+    /// 取大（2）、取小（3）。</summary>
+    static string Excl(int p, string c, int md) {
+        bool my = p == DbProvider.MySQL || p == DbProvider.MariaDB;
+        string src = my ? "VALUES(" + c + ")" : "excluded." + c;
+        if (md == 1) { return c + " = " + c + " + " + src; }
+        if (md == 2 || md == 3) {
+            string fn = md == 2 ? "GREATEST" : "LEAST";
+            if (p == DbProvider.SQLite) { fn = md == 2 ? "max" : "min"; }
+            return c + " = " + fn + "(" + c + ", " + src + ")";
+        }
+        return c + " = " + src;
+    }
+
+    static int Mode(List<string> acc, List<string> mx, List<string> mn,
+                    string c) {
+        if (OrmDialect.Has(acc, c)) { return 1; }
+        if (OrmDialect.Has(mx, c)) { return 2; }
+        if (OrmDialect.Has(mn, c)) { return 3; }
+        return 0;
+    }
+
+    /// <summary>刚插入行的自增值。</summary>
+    static string LastIdSql(IDbExecutor db) {
+        int p = db.GetProvider();
+        string sql = "SELECT last_insert_rowid()";
+        if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
+            sql = "SELECT LAST_INSERT_ID()";
+        } else if (p == DbProvider.PostgreSQL || p == DbProvider.OpenGauss
+                || p == DbProvider.Kingbase) {
+            sql = "SELECT lastval()";
+        } else if (p == DbProvider.SqlServer || p == DbProvider.DM) {
+            sql = "SELECT SCOPE_IDENTITY()";
+        }
+        return sql;
+    }
+
+    static int LastId(IDbExecutor db) {
+        DbResult r = db.Query(OrmDialect.LastIdSql(db));
+        if (r.RowCount() == 0) { return 0; }
+        return r.GetInt(0, 0);
+    }
+
+    static async int LastIdAsync(IDbExecutor db) {
+        string sql = OrmDialect.LastIdSql(db);
+        DbResult r = await db.QueryAsync(sql);
+        if (r.RowCount() == 0) { return 0; }
+        return r.GetInt(0, 0);
+    }
+
+    /* information_schema 横跨 MySQL 服务器上每个数据库（PostgreSQL/
+     * SQL Server 上每个 schema），不加作用域会找到别人库里同名表，
+     * CodeFirst 于是"改"一张这里不存在的表。每个目录探测都限定在
+     * 连接自己的库/schema。 */
+    static string OwnScope(int p) {
+        if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
+            return " AND table_schema = DATABASE()";
+        }
+        if (p == DbProvider.PostgreSQL || p == DbProvider.OpenGauss
+                || p == DbProvider.Kingbase) {
+            return " AND table_schema = current_schema()";
+        }
+        if (p == DbProvider.SqlServer || p == DbProvider.DM) {
+            return " AND table_schema = SCHEMA_NAME()";
+        }
+        return "";
+    }
+
+    static string HasTableSql(IDbExecutor db) {
+        int p = db.GetProvider();
+        if (p == DbProvider.SQLite) {
+            return "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'"
+                + " AND name = ?";
+        }
+        return "SELECT COUNT(*) FROM information_schema.tables"
+            + " WHERE table_name = ?" + OrmDialect.OwnScope(p);
+    }
+
+    static bool HasTable(IDbExecutor db, string t) {
+        DbResult r = db.Query(OrmDialect.HasTableSql(db),
+                              new DbParams().Add(t));
+        if (r.RowCount() == 0) { return false; }
+        return r.GetInt(0, 0) > 0;
+    }
+
+    static async bool HasTableAsync(IDbExecutor db, string t) {
+        string sql = OrmDialect.HasTableSql(db);
+        DbResult r = await db.QueryAsync(sql, new DbParams().Add(t));
+        if (r.RowCount() == 0) { return false; }
+        return r.GetInt(0, 0) > 0;
+    }
+
+    static string ColsSql(int p) {
+        return "SELECT column_name FROM information_schema.columns"
+            + " WHERE table_name = ?" + OrmDialect.OwnScope(p);
+    }
+
+    static List<string> Cols(IDbExecutor db, string t) {
+        List<string> cols = new List<string>();
+        int p = db.GetProvider();
+        DbResult r;
+        int nameCol = 0;
+        if (p == DbProvider.SQLite) {
+            r = db.Query("PRAGMA table_info(" + t + ")");
+            nameCol = 1;
+        } else {
+            r = db.Query(OrmDialect.ColsSql(p), new DbParams().Add(t));
+        }
+        int i = 0;
+        while (i < r.RowCount()) {
+            cols.Add(r.GetString(i, nameCol));
+            i = i + 1;
+        }
+        return cols;
+    }
+
+    static async List<string> ColsAsync(IDbExecutor db, string t) {
+        List<string> cols = new List<string>();
+        int p = db.GetProvider();
+        DbResult r;
+        int nameCol = 0;
+        if (p == DbProvider.SQLite) {
+            string ps = "PRAGMA table_info(" + t + ")";
+            r = await db.QueryAsync(ps);
+            nameCol = 1;
+        } else {
+            string cs = OrmDialect.ColsSql(p);
+            r = await db.QueryAsync(cs, new DbParams().Add(t));
+        }
+        int i = 0;
+        while (i < r.RowCount()) {
+            cols.Add(r.GetString(i, nameCol));
+            i = i + 1;
+        }
+        return cols;
+    }
+
+    /* 二级索引：声明在实体上，缺了就补，已有就不动。
+     * `CREATE INDEX IF NOT EXISTS` 不是各家都有的写法（MySQL 没有），
+     * 所以存在性自己按方言查。 */
+    static string HasIndexSql(int p) {
+        if (p == DbProvider.SQLite) {
+            return "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'"
+                + " AND name = ?";
+        }
+        if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
+            return "SELECT COUNT(*) FROM information_schema.statistics"
+                + " WHERE index_name = ? AND table_schema = DATABASE()";
+        }
+        return "SELECT COUNT(*) FROM pg_indexes WHERE indexname = ?";
+    }
+
+    static string IndexDdl(int p, string nm, string t, string cols,
+                           bool uniq) {
+        return "CREATE " + (uniq ? "UNIQUE " : "") + "INDEX " + nm + " ON "
+            + t + " (" + cols + ")";
+    }
+
+    static void EnsureIndex(IDbExecutor db, string nm, string t, string cols,
+                            bool uniq) {
+        int p = db.GetProvider();
+        DbResult r = db.Query(OrmDialect.HasIndexSql(p),
+                              new DbParams().Add(nm));
+        if (r.RowCount() > 0 && r.GetInt(0, 0) > 0) { return; }
+        db.Execute(OrmDialect.IndexDdl(p, nm, t, cols, uniq));
+    }
+
+    static async void EnsureIndexAsync(IDbExecutor db, string nm, string t,
+                                       string cols, bool uniq) {
+        int p = db.GetProvider();
+        DbResult r = await db.QueryAsync(OrmDialect.HasIndexSql(p),
+                                         new DbParams().Add(nm));
+        if (r.RowCount() > 0 && r.GetInt(0, 0) > 0) { return; }
+        int _n = await db.ExecuteAsync(OrmDialect.IndexDdl(p, nm, t, cols,
+                                                           uniq));
+    }
+
+    /// <summary>列的 DDL 类型。kind：0 int/enum、1 double、2 bool、
+    /// 3 string、4 64 位整数。</summary>
+    static string Ty(int p, int kind, bool pk, bool ident, int len) {
+        bool my = p == DbProvider.MySQL || p == DbProvider.MariaDB;
+        bool pg = p == DbProvider.PostgreSQL || p == DbProvider.OpenGauss
+                  || p == DbProvider.Kingbase;
+        bool ms = p == DbProvider.SqlServer || p == DbProvider.DM;
+        if (len <= 0) { len = 255; }
+        if (ident) {
+            if (my) { return "INT NOT NULL AUTO_INCREMENT PRIMARY KEY"; }
+            if (pg) { return "SERIAL PRIMARY KEY"; }
+            if (ms) { return "INT IDENTITY(1,1) PRIMARY KEY"; }
+            return "INTEGER PRIMARY KEY AUTOINCREMENT";
+        }
+        string t = "INTEGER";
+        if (kind == 4) {
+            if (p == DbProvider.SQLite) { t = "INTEGER"; } else { t = "BIGINT"; }
+            if (pk) { t = t + " PRIMARY KEY"; }
+            return t;
+        }
+        if (kind == 1) {
+            t = "DOUBLE PRECISION";
+            if (my) { t = "DOUBLE"; }
+            if (ms) { t = "FLOAT"; }
+            if (p == DbProvider.SQLite) { t = "REAL"; }
+        } else if (kind == 2) {
+            t = "BOOLEAN";
+            if (my) { t = "TINYINT(1)"; }
+            if (ms) { t = "BIT"; }
+            if (p == DbProvider.SQLite) { t = "INTEGER"; }
+        } else if (kind == 3) {
+            t = "VARCHAR(" + Convert.ToString(len) + ")";
+            if (p == DbProvider.SQLite) { t = "TEXT"; }
+            if (ms) { t = "NVARCHAR(" + Convert.ToString(len) + ")"; }
+        } else {
+            if (my || ms) { t = "INT"; }
+        }
+        if (pk) { t = t + " PRIMARY KEY"; }
+        return t;
+    }
+}

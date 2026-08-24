@@ -1,0 +1,356 @@
+using System;
+using System.Data;
+using System.Linq;
+
+namespace System.Data.Orm;
+
+/// <summary>
+/// 类型化 SELECT 链的运行期实现：条件片段、绑定值、分组、排序、
+/// 分页、连接与终端 SQL 都在这里，一份实现服务所有实体。生成的
+/// `__DbQ_<E>` 只是它的类型化门面（转发 + 用实体类型收口结果）。
+/// </summary>
+class OrmSelect {
+    IDbExecutor db;
+    OrmMeta meta;
+    string tbl;
+    string w;
+    DbParams ps;
+    string ob;
+    string gb;
+    string h;
+    bool distinct;
+    int limN;
+    int offN;
+    bool on;
+    List<bool> navOn;
+
+    OrmSelect(IDbExecutor db, OrmMeta meta) {
+        this.db = db;
+        this.meta = meta;
+        this.tbl = meta.Table;
+        this.w = "";
+        this.ps = new DbParams();
+        this.ob = "";
+        this.gb = "";
+        this.h = "";
+        this.distinct = false;
+        this.limN = -1;
+        this.offN = -1;
+        this.on = true;
+        this.navOn = new List<bool>();
+        for (int i = 0; i < meta.Navs.Count; i = i + 1) { this.navOn.Add(false); }
+    }
+
+    static OrmSelect Create(IDbExecutor db, OrmMeta meta) {
+        return new OrmSelect(db, meta);
+    }
+
+    OrmMeta Meta() { return this.meta; }
+    DbParams Params() { return this.ps; }
+    string GroupKey() { return this.gb; }
+    bool NavOn(int i) { return this.navOn[i]; }
+
+    void W(string f) {
+        if (!this.on) { return; }
+        if (this.w.Length == 0) { this.w = f; }
+        else { this.w = this.w + " AND " + f; }
+    }
+
+    /// <summary>lambda 降级出的表达式树：SQL 片段与绑定值都由
+    /// <see cref="ExprSql"/> 产出。</summary>
+    void WExpr(ExprNode root) {
+        if (!this.on) { return; }
+        if (root == null) { return; }
+        StringBuilder sb = new StringBuilder();
+        ExprSql.Build(root, sb, this.ps);
+        this.W(sb.ToString());
+    }
+
+    /// <summary>动态列集合等值条件：列名按实体校验，值按列声明类型
+    /// 绑定。</summary>
+    void WhereDict(DbValues v) {
+        if (!this.on) { return; }
+        int i = 0;
+        while (i < v.Count()) {
+            string c = this.meta.Require(v.NameAt(i));
+            this.W("t." + c + " = ?");
+            v.BindAs(this.ps, i, this.meta.KindOf(c));
+            i = i + 1;
+        }
+    }
+
+    void CondBegin(bool c) { this.on = c; }
+    void CondEnd() { this.on = true; }
+    void AsTable(string t) { this.tbl = t; }
+    void P(string v) { if (this.on) { this.ps.Add(v); } }
+    void Pi(int v) { if (this.on) { this.ps.AddInt(v); } }
+    void Pl(long v) { if (this.on) { this.ps.AddLong(v); } }
+    void Pd(double v) { if (this.on) { this.ps.AddDouble(v); } }
+
+    void InI(List<int> vs) {
+        if (!this.on) { return; }
+        int i = 0;
+        while (i < vs.Count) { this.ps.AddInt(vs[i]); i = i + 1; }
+    }
+
+    void InL(List<long> vs) {
+        if (!this.on) { return; }
+        int i = 0;
+        while (i < vs.Count) { this.ps.AddLong(vs[i]); i = i + 1; }
+    }
+
+    void InS(List<string> vs) {
+        if (!this.on) { return; }
+        int i = 0;
+        while (i < vs.Count) { this.ps.Add(vs[i]); i = i + 1; }
+    }
+
+    void InD(List<double> vs) {
+        if (!this.on) { return; }
+        int i = 0;
+        while (i < vs.Count) { this.ps.AddDouble(vs[i]); i = i + 1; }
+    }
+
+    void OB(string col) {
+        if (this.ob.Length == 0) { this.ob = col; }
+        else { this.ob = this.ob + ", " + col; }
+    }
+
+    void OBD(string col) { this.OB(col + " DESC"); }
+    void GB(string col) { this.gb = col; }
+    void OBK() { this.OB(this.gb); }
+    void OBDK() { this.OBD(this.gb); }
+
+    void H(string f) {
+        if (this.h.Length == 0) { this.h = f; }
+        else { this.h = this.h + " AND " + f; }
+    }
+
+    void DISTINCT() { this.distinct = true; }
+    void Take(int n) { this.limN = n; }
+    void SkipN(int n) { this.offN = n; }
+
+    void Page(int index, int size) {
+        if (index < 1) { index = 1; }
+        this.limN = size;
+        this.offN = (index - 1) * size;
+    }
+
+    /// <summary>包含第 i 个导航字段（LEFT JOIN + 它的列）。</summary>
+    void Include(int i) { this.navOn[i] = true; }
+
+    /// <summary>被包含的导航字段在结果里的起始列号。</summary>
+    int NavAt(int i) {
+        int at = this.meta.Cols.Count;
+        for (int k = 0; k < i; k = k + 1) {
+            if (this.navOn[k]) { at = at + this.meta.Navs[k].Cols.Count; }
+        }
+        return at;
+    }
+
+    void tail(StringBuilder sb) {
+        if (this.w.Length > 0) { sb.Append(" WHERE "); sb.Append(this.w); }
+        if (this.gb.Length > 0) { sb.Append(" GROUP BY "); sb.Append(this.gb); }
+        if (this.h.Length > 0) { sb.Append(" HAVING "); sb.Append(this.h); }
+        if (this.ob.Length > 0) { sb.Append(" ORDER BY "); sb.Append(this.ob); }
+    }
+
+    /// <summary>实体行的 SELECT。分页写法按方言：SQL Server/Oracle 用
+    /// OFFSET ... FETCH（且必须有 ORDER BY）。</summary>
+    string BuildSelect() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("SELECT ");
+        if (this.distinct) { sb.Append("DISTINCT "); }
+        sb.Append(this.meta.SelectList());
+        for (int i = 0; i < this.meta.Navs.Count; i = i + 1) {
+            if (this.navOn[i]) { sb.Append(this.meta.Navs[i].SelectList()); }
+        }
+        sb.Append(" FROM ");
+        sb.Append(this.tbl);
+        sb.Append(" t");
+        for (int i = 0; i < this.meta.Navs.Count; i = i + 1) {
+            if (this.navOn[i]) { sb.Append(this.meta.Navs[i].Join()); }
+        }
+        this.tail(sb);
+        int pv = this.db.GetProvider();
+        if (pv == DbProvider.SqlServer || pv == DbProvider.Oracle) {
+            int off = this.offN;
+            if (off < 0) { off = 0; }
+            if (this.ob.Length == 0) {
+                if (pv == DbProvider.SqlServer) {
+                    sb.Append(" ORDER BY (SELECT 0)");
+                } else {
+                    sb.Append(" ORDER BY (SELECT 0 FROM DUAL)");
+                }
+            }
+            sb.Append(" OFFSET ");
+            sb.Append(Convert.ToString(off));
+            sb.Append(" ROWS");
+            if (this.limN >= 0) {
+                sb.Append(" FETCH NEXT ");
+                sb.Append(Convert.ToString(this.limN));
+                sb.Append(" ROWS ONLY");
+            }
+        } else {
+            if (this.limN >= 0) {
+                sb.Append(" LIMIT ");
+                sb.Append(Convert.ToString(this.limN));
+            }
+            if (this.offN >= 0) {
+                sb.Append(" OFFSET ");
+                sb.Append(Convert.ToString(this.offN));
+            }
+        }
+        return sb.ToString();
+    }
+
+    DbResult Rows() { return this.db.Query(this.BuildSelect(), this.ps); }
+
+    async DbResult RowsAsync() {
+        string sql = this.BuildSelect();
+        return await this.db.QueryAsync(sql, this.ps);
+    }
+
+    /// <summary>单列/投影的 SELECT（分页在 DTO 版里按 LIMIT/OFFSET）。</summary>
+    string BuildCol(string col) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("SELECT " + col + " FROM " + this.tbl + " t");
+        this.tail(sb);
+        return sb.ToString();
+    }
+
+    string BuildDto(string cols) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("SELECT " + cols + " FROM " + this.tbl + " t");
+        this.tail(sb);
+        if (this.limN >= 0) {
+            sb.Append(" LIMIT " + Convert.ToString(this.limN));
+        }
+        if (this.offN >= 0) {
+            sb.Append(" OFFSET " + Convert.ToString(this.offN));
+        }
+        return sb.ToString();
+    }
+
+    List<string> MapCol(DbResult r) {
+        List<string> outp = new List<string>();
+        int row = 0;
+        while (row < r.RowCount()) {
+            outp.Add(r.GetString(row, 0));
+            row = row + 1;
+        }
+        return outp;
+    }
+
+    List<string> ToListCol(string col) {
+        return this.MapCol(this.db.Query(this.BuildCol(col), this.ps));
+    }
+
+    async List<string> ToListColAsync(string col) {
+        string sql = this.BuildCol(col);
+        DbResult r = await this.db.QueryAsync(sql, this.ps);
+        return this.MapCol(r);
+    }
+
+    DbResult Dto(string cols) {
+        return this.db.Query(this.BuildDto(cols), this.ps);
+    }
+
+    async DbResult DtoAsync(string cols) {
+        string sql = this.BuildDto(cols);
+        return await this.db.QueryAsync(sql, this.ps);
+    }
+
+    void One() { this.limN = 1; }
+
+    /// <summary>分组后的行数：分组键上的 COUNT 要套一层子查询。</summary>
+    string BuildCount() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("SELECT COUNT(*) FROM (SELECT 1 FROM " + this.tbl + " t");
+        if (this.w.Length > 0) { sb.Append(" WHERE " + this.w); }
+        sb.Append(" GROUP BY " + this.gb);
+        if (this.h.Length > 0) { sb.Append(" HAVING " + this.h); }
+        sb.Append(")");
+        return sb.ToString();
+    }
+
+    string BuildAgg(string expr) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("SELECT " + expr + " FROM " + this.tbl + " t");
+        if (this.w.Length > 0) { sb.Append(" WHERE "); sb.Append(this.w); }
+        if (this.gb.Length > 0) { sb.Append(" GROUP BY "); sb.Append(this.gb); }
+        if (this.h.Length > 0) { sb.Append(" HAVING "); sb.Append(this.h); }
+        return sb.ToString();
+    }
+
+    DbResult AggR(string expr) {
+        return this.db.Query(this.BuildAgg(expr), this.ps);
+    }
+
+    async DbResult AggRAsync(string expr) {
+        string sql = this.BuildAgg(expr);
+        return await this.db.QueryAsync(sql, this.ps);
+    }
+
+    int AggI(string expr) {
+        DbResult r = this.AggR(expr);
+        if (r.RowCount() == 0) { return 0; }
+        return r.GetInt(0, 0);
+    }
+
+    long AggL(string expr) {
+        DbResult r = this.AggR(expr);
+        if (r.RowCount() == 0) { return 0; }
+        return r.GetLong(0, 0);
+    }
+
+    double AggD(string expr) {
+        DbResult r = this.AggR(expr);
+        if (r.RowCount() == 0) { return 0.0; }
+        return r.GetDouble(0, 0);
+    }
+
+    async int AggIAsync(string expr) {
+        DbResult r = await this.AggRAsync(expr);
+        if (r.RowCount() == 0) { return 0; }
+        return r.GetInt(0, 0);
+    }
+
+    async long AggLAsync(string expr) {
+        DbResult r = await this.AggRAsync(expr);
+        if (r.RowCount() == 0) { return 0; }
+        return r.GetLong(0, 0);
+    }
+
+    async double AggDAsync(string expr) {
+        DbResult r = await this.AggRAsync(expr);
+        if (r.RowCount() == 0) { return 0.0; }
+        return r.GetDouble(0, 0);
+    }
+
+    int Count() {
+        if (this.gb.Length > 0) {
+            DbResult r = this.db.Query(this.BuildCount(), this.ps);
+            if (r.RowCount() == 0) { return 0; }
+            return r.GetInt(0, 0);
+        }
+        return this.AggI("COUNT(*)");
+    }
+
+    async int CountAsync() {
+        if (this.gb.Length > 0) {
+            string sql = this.BuildCount();
+            DbResult r = await this.db.QueryAsync(sql, this.ps);
+            if (r.RowCount() == 0) { return 0; }
+            return r.GetInt(0, 0);
+        }
+        return await this.AggIAsync("COUNT(*)");
+    }
+
+    bool Any() { return this.Count() > 0; }
+
+    async bool AnyAsync() {
+        int n = await this.CountAsync();
+        return n > 0;
+    }
+}

@@ -12,9 +12,11 @@
  *
  * `recv` is a short receiver shape ("this", "id:<name>", "mem:a.b",
  * "call", "other"); `args` items are shape objects -- literals, ids, null,
- * lambda (with an expression tree), or other. Every expression-tree node is
- * { "k": kind, ... } with "k" in bin/uni/mem/id/lit/call/cond/cast/is/
- * idx/assign/new/lam/null/this/base/await/other. */
+ * lambda (with an expression tree), or other. The calls array contains only
+ * generator entry points and their fluent receiver chains; ids still refer
+ * to the complete compilation-unit traversal and can therefore be sparse.
+ * Every expression-tree node is { "k": kind, ... } with "k" in bin/uni/mem/
+ * id/lit/call/cond/cast/is/idx/assign/new/lam/null/this/base/await/other. */
 
 #include "genmeta.h"
 
@@ -412,6 +414,195 @@ static void gm_record_call(zan_ast_node_t *call, gm_ctx_t *c) {
         json_arr_add(args, gm_arg_json(call->call.args.items[i]));
     json_obj_set(o, "args", args);
     json_arr_add(c->calls, o);
+}
+
+static bool gm_name_in(const char *name, const char *const *names, int count) {
+    if (!name) return false;
+    for (int i = 0; i < count; i++)
+        if (strcmp(name, names[i]) == 0) return true;
+    return false;
+}
+
+/* Table entity names of the unit: `[Table] class Order` -- accessor members
+ * named after one of them (`ctx.Order.Where(...)`) start a fluent DB chain. */
+static const char **gm_table_entity_names(json_value *classes, int *out_count) {
+    const char **names = NULL;
+    int count = 0, cap = 0;
+    *out_count = 0;
+    if (!classes || classes->type != JSON_ARR) return NULL;
+    for (int ci = 0; ci < classes->as.arr.count; ci++) {
+        json_value *cls = classes->as.arr.items[ci];
+        json_value *attrs = json_obj_get(cls, "attrs");
+        if (!attrs || attrs->type != JSON_ARR) continue;
+        bool table = false;
+        for (int ai = 0; ai < attrs->as.arr.count; ai++) {
+            const char *an =
+                json_get_str(json_obj_get(attrs->as.arr.items[ai], "name"));
+            if (an && strcmp(an, "Table") == 0) {
+                table = true;
+                break;
+            }
+        }
+        if (!table) continue;
+        const char *name = json_get_str(json_obj_get(cls, "name"));
+        if (!name || !name[0] || gm_name_in(name, names, count)) continue;
+        if (count >= cap) {
+            int next = cap ? cap * 2 : 8;
+            const char **grown =
+                (const char **)realloc(names,
+                                       sizeof(const char *) * (size_t)next);
+            if (!grown) zan_host_oom();
+            names = grown;
+            cap = next;
+        }
+        names[count++] = name;
+    }
+    *out_count = count;
+    return names;
+}
+
+static bool gm_is_codegen_seed(json_value *call, const char *const *expr_names,
+                               int expr_count, const char *const *table_names,
+                               int table_count) {
+    static const char *const seeds[] = {
+        /* route request readers */
+        "In", "InText", "InRaw", "InInt", "InLong", "InDouble", "InBool",
+        "HasIn", "Need", "NeedText", "NeedInt", "NeedLong", "Param", "Paged",
+        /* database roots/accessors; fluent descendants are retained below */
+        "Query", "Select", "Insert", "Update", "Delete", "SyncStructure",
+        "SyncStructureAsync", "SyncStructureAll", "SyncStructureAllAsync",
+        "Read", "ReadAsync"
+    };
+    const char *name = json_get_str(json_obj_get(call, "name"));
+    const char *recv = json_get_str(json_obj_get(call, "recv"));
+    if (recv && strcmp(recv, "id:Json") == 0 &&
+        name && (strcmp(name, "Serialize") == 0 ||
+                 strcmp(name, "Deserialize") == 0))
+        return true;
+    if (gm_name_in(name, seeds, (int)(sizeof(seeds) / sizeof(seeds[0]))))
+        return true;
+    if (gm_name_in(name, expr_names, expr_count)) return true;
+    /* accessor chain head: the receiver is `<obj>.<Entity>`, so the call has
+     * no receiving call site the walk above could reach it through. */
+    {
+        json_value *recvx = json_obj_get(call, "recvx");
+        if (recvx && recvx->type == JSON_OBJ) {
+            const char *k = json_get_str(json_obj_get(recvx, "k"));
+            const char *n = json_get_str(json_obj_get(recvx, "n"));
+            if (k && strcmp(k, "mem") == 0 &&
+                gm_name_in(n, table_names, table_count))
+                return true;
+        }
+    }
+    return false;
+}
+
+static const char **gm_expr_method_names(json_value *classes, int *out_count) {
+    const char **names = NULL;
+    int count = 0, cap = 0;
+    if (!classes || classes->type != JSON_ARR) {
+        *out_count = 0;
+        return NULL;
+    }
+    for (int ci = 0; ci < classes->as.arr.count; ci++) {
+        json_value *methods =
+            json_obj_get(classes->as.arr.items[ci], "methods");
+        if (!methods || methods->type != JSON_ARR) continue;
+        for (int mi = 0; mi < methods->as.arr.count; mi++) {
+            json_value *method = methods->as.arr.items[mi];
+            json_value *params = json_obj_get(method, "params");
+            if (!params || params->type != JSON_ARR) continue;
+            bool has_expr = false;
+            for (int pi = 0; pi < params->as.arr.count; pi++) {
+                const char *type =
+                    json_get_str(json_obj_get(params->as.arr.items[pi],
+                                              "type"));
+                size_t n = type ? strlen(type) : 0;
+                if (n > 6 && strncmp(type, "Expr<", 5) == 0 &&
+                    type[n - 1] == '>') {
+                    has_expr = true;
+                    break;
+                }
+            }
+            if (!has_expr) continue;
+            const char *name = json_get_str(json_obj_get(method, "name"));
+            if (!name || gm_name_in(name, names, count)) continue;
+            if (count >= cap) {
+                int next = cap ? cap * 2 : 8;
+                const char **grown =
+                    (const char **)realloc(names,
+                                          sizeof(const char *) * (size_t)next);
+                if (!grown) zan_host_oom();
+                names = grown;
+                cap = next;
+            }
+            names[count++] = name;
+        }
+    }
+    *out_count = count;
+    return names;
+}
+
+static void gm_prune_calls(json_value *calls, json_value *classes) {
+    if (!calls || calls->type != JSON_ARR || calls->as.arr.count == 0) return;
+    int max_id = 0;
+    for (int i = 0; i < calls->as.arr.count; i++) {
+        int id = (int)json_get_num(json_obj_get(calls->as.arr.items[i], "id"),
+                                   0);
+        if (id > max_id) max_id = id;
+    }
+    bool *keep = (bool *)calloc((size_t)max_id + 1, sizeof(bool));
+    if (!keep) zan_host_oom();
+    int expr_count = 0;
+    const char **expr_names = gm_expr_method_names(classes, &expr_count);
+    int table_count = 0;
+    const char **table_names = gm_table_entity_names(classes, &table_count);
+    for (int i = 0; i < calls->as.arr.count; i++) {
+        json_value *call = calls->as.arr.items[i];
+        int id = (int)json_get_num(json_obj_get(call, "id"), 0);
+        if (id > 0 && gm_is_codegen_seed(call, expr_names, expr_count,
+                                         table_names, table_count))
+            keep[id] = true;
+    }
+
+    /* DB metadata follows fluent receivers in both directions: ancestors
+     * locate the root and descendants carry every supported chain method. */
+    bool changed;
+    do {
+        changed = false;
+        for (int i = 0; i < calls->as.arr.count; i++) {
+            json_value *call = calls->as.arr.items[i];
+            int id =
+                (int)json_get_num(json_obj_get(call, "id"), 0);
+            int recv_id =
+                (int)json_get_num(json_obj_get(call, "recv_id"), 0);
+            if (id <= 0 || id > max_id || recv_id <= 0 ||
+                recv_id > max_id)
+                continue;
+            if (keep[id] && !keep[recv_id]) {
+                keep[recv_id] = true;
+                changed = true;
+            }
+            if (keep[recv_id] && !keep[id]) {
+                keep[id] = true;
+                changed = true;
+            }
+        }
+    } while (changed);
+
+    int out = 0;
+    for (int i = 0; i < calls->as.arr.count; i++) {
+        json_value *call = calls->as.arr.items[i];
+        int id = (int)json_get_num(json_obj_get(call, "id"), 0);
+        if (id > 0 && id <= max_id && keep[id])
+            calls->as.arr.items[out++] = call;
+        else
+            json_free(call);
+    }
+    calls->as.arr.count = out;
+    free(expr_names);
+    free(table_names);
+    free(keep);
 }
 
 /* ---- expression walk (finds call sites) ---- */
@@ -1027,6 +1218,7 @@ char *zan_genmeta_export(zan_ast_node_t *unit) {
             }
         }
     }
+    gm_prune_calls(ctx.calls, classes);
     json_obj_set(root, "calls", ctx.calls);
 
     free(ctx.rec_nodes);

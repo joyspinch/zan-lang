@@ -1,15 +1,20 @@
-// GenDbEmit.zan -- 实体绑定类文本生成(迁移自 src/compiler/dbgen.c 的
-// dg_gen_entity / dg_gen_cols / dg_gen_insert / dg_gen_update /
-// dg_gen_delete / dg_gen_codefirst 与 __DbBind 组装)。
+// GenDbEmit.zan -- 实体绑定类文本生成。
 //
-// 输出与 dbgen.c 逐字节一致:每个实体生成
-//   <Entity>Cols    列名常量 + Has/Kind/Require
-//   __DbQ_<E>       类型化 SELECT 链(WHERE 片段/绑定/排序/分页/映射)
-//   __DbI_<E>       INSERT(行列表/DbValues/Only/Skip)
-//   __DbU_<E>       UPDATE(Set/SetIncr/Where 链)
-//   __DbD_<E>       DELETE(Where 链)
-//   __DbCF_<E>      CodeFirst(建表/加列,Sync + SyncAsync)
-// 以及汇总类 __DbBind(工厂方法/SyncAll/M/Has/Cat/LastId/Cols/Ty)。
+// 编译期只发射「实体列元数据 + 薄类型门面」：
+//   <Entity>Cols    列名常量 + Has/Kind/Require + OrmMeta（表名/列/导航/索引）
+//   __DbQ_<E>       类型化 SELECT 门面(转发 OrmSelect,用实体类型收口结果)
+//   __DbI_<E>       类型化 INSERT 门面(转发 OrmInsert)
+//   __DbU_<E>       类型化 UPDATE 门面(转发 OrmUpdate)
+//   __DbD_<E>       类型化 DELETE 门面(转发 OrmDelete)
+//   __DbCF_<E>      CodeFirst 门面(转发 OrmSync)
+//   __DbM_<E>       实体字段取值/赋值口(按列元数据循环,长度与字段数无关)
+//   __DbB_<E>       IOrmRows 实现:把实体行交给运行期按列取值
+// 以及汇总类 __DbBind(工厂方法 + SyncAll)。
+//
+// SQL 文本、动态列集合、参数绑定、行映射、方言差异、SQL 缓存都在
+// System.Data.Orm 的共享实现里(OrmMeta/IOrmRows/OrmDialect/OrmSelect/
+// OrmInsert/OrmUpdate/OrmDelete/OrmSync)：改 SQL 规则只改那一处，
+// 用户工程加实体/加字段只多几行元数据，不再复制成段的 SQL 代码。
 namespace System.Compiler;
 
 class GenDbEmit {
@@ -18,7 +23,9 @@ class GenDbEmit {
         return type == "long" || type == "ulong" || type == "nint";
     }
 
-    /// 行的 Getter 名(按字段类型)。
+    static string Bl(bool v) { return v ? "true" : "false"; }
+
+    /// 行的 Getter 名(按字段类型)——投影仍按目标类型直接取值。
     static string Getter(int kind) {
         if (kind == 0 || kind == 4) { return "GetInt"; }
         if (kind == 1) { return "GetDouble"; }
@@ -26,10 +33,14 @@ class GenDbEmit {
         return "GetString";
     }
 
-    /// 行的 Getter 名(64 位整数列走 GetLong,否则同 Getter(kind))。
-    static string GetterOf(DbField f) {
-        if (f.Kind == 0 && GenDbEmit.Is64(f.TypeName)) { return "GetLong"; }
-        return GenDbEmit.Getter(f.Kind);
+    /// `m.Col(...)` 的实参文本：列名、字段名、类型码、是否 64 位、
+    /// 主键、自增、非空、字符串长度。
+    static string ColArgs(DbField f) {
+        return "\"" + f.Col + "\", \"" + f.Name + "\", "
+            + Convert.ToString(f.Kind) + ", "
+            + GenDbEmit.Bl(GenDbEmit.Is64(f.TypeName)) + ", "
+            + GenDbEmit.Bl(f.IsPk) + ", " + GenDbEmit.Bl(f.IsIdent) + ", "
+            + GenDbEmit.Bl(f.NotNull) + ", " + Convert.ToString(f.StrLen);
     }
 
     /// 聚合/列投影终端:GenDb.Projs 里属于本实体的每个形状生成
@@ -44,7 +55,7 @@ class GenDbEmit {
             JsonValue items = p.Get("items");
             if (items == null) { continue; }
             /* 列清单是一段生成侧的 string 表达式:固定片段是字面量,
-             * 分组键(a.Key)是运行时的 this.gb */
+             * 分组键(a.Key)是运行时的分组键 SQL */
             StringBuilder cols = new StringBuilder();
             StringBuilder lit = new StringBuilder();
             bool open = false;
@@ -57,7 +68,7 @@ class GenDbEmit {
                         open = true;
                         lit = new StringBuilder();
                     }
-                    cols.Append((open ? " + " : "") + "this.gb");
+                    cols.Append((open ? " + " : "") + "this.q.GroupKey()");
                     open = true;
                 } else {
                     lit.Append(items.At(k).Str("col", ""));
@@ -90,24 +101,22 @@ class GenDbEmit {
                      "        return outp;\n" +
                      "    }\n");
             b.Append("    List<" + t + "> " + nm + "() {\n" +
-                     "        return " + nm + "Map(this.db.Query(BuildDto(" +
-                     cols.ToString() + "), this.ps));\n" +
+                     "        return " + nm + "Map(this.q.Dto(" +
+                     cols.ToString() + "));\n" +
                      "    }\n" +
                      "    async List<" + t + "> " + nm + "Async() {\n" +
-                     "        string sql = BuildDto(" + cols.ToString() +
-                     ");\n" +
-                     "        DbResult r = await this.db.QueryAsync(sql, " +
-                     "this.ps);\n" +
+                     "        DbResult r = await this.q.DtoAsync(" +
+                     cols.ToString() + ");\n" +
                      "        return " + nm + "Map(r);\n" +
                      "    }\n" +
                      "    " + t + " " + nm + "One() {\n" +
-                     "        this.limN = 1;\n" +
+                     "        this.q.One();\n" +
                      "        List<" + t + "> l = " + nm + "();\n" +
                      "        if (l.Count > 0) { return l[0]; }\n" +
                      "        return null;\n" +
                      "    }\n" +
                      "    async " + t + " " + nm + "OneAsync() {\n" +
-                     "        this.limN = 1;\n" +
+                     "        this.q.One();\n" +
                      "        List<" + t + "> l = await " + nm + "Async();\n" +
                      "        if (l.Count > 0) { return l[0]; }\n" +
                      "        return null;\n" +
@@ -115,1139 +124,86 @@ class GenDbEmit {
         }
     }
 
-    /// __DbBind.Ty 的列类型码:0 int/enum, 1 double, 2 bool, 3 string,
-    /// 4 64 位整数。
-    static int TyCode(int kind) {
-        if (kind == 1) { return 1; }
-        if (kind == 2) { return 2; }
-        if (kind == 3) { return 3; }
-        return 0;
+    /// 实体的取值/赋值口 `__DbM_<T>` 与行来源 `__DbB_<T>`:反射读写字段只在
+    /// 静态类型就是实体的地方成立,所以按列元数据循环的这几行必须落在这里;
+    /// 它们的长度与字段数无关(加字段只多一行元数据),SQL/绑定/映射的规则本身
+    /// 仍只有 System.Data.Orm 里的一份。
+    static bool Has(List<string> l, string v) {
+        for (int i = 0; i < l.Count; i = i + 1) {
+            if (l[i] == v) { return true; }
+        }
+        return false;
     }
 
-    /// 字段的列类型码(在 TyCode 之上区分 64 位整数)。
-    static int TyCodeOf(DbField f) {
-        if (f.Kind == 0 && GenDbEmit.Is64(f.TypeName)) { return 4; }
-        return GenDbEmit.TyCode(f.Kind);
-    }
-
-    /// 输出 `ps.AddXxx(o.<field>);` 绑定语句(ind 为缩进)。
-    static void BindField(StringBuilder b, string ind, DbField f,
-                          string obj) {
-        if (f.Kind == 0) {
-            string add = GenDbEmit.Is64(f.TypeName) ? "ps.AddLong("
-                                                    : "ps.AddInt(";
-            b.Append(ind + add + obj + "." + f.Name + ");\n");
-        } else if (f.Kind == 4) {
-            /* enum -> int 隐式;临时变量把它移出表达式 */
-            b.Append(ind + "int ev_" + f.Name + " = " + obj + "." + f.Name +
-                     ";\n");
-            b.Append(ind + "ps.AddInt(ev_" + f.Name + ");\n");
-        } else if (f.Kind == 1) {
-            b.Append(ind + "ps.AddDouble(" + obj + "." + f.Name + ");\n");
-        } else if (f.Kind == 2) {
-            b.Append(ind + "if (" + obj + "." + f.Name +
-                     ") { ps.AddInt(1); } else { ps.AddInt(0); }\n");
-        } else {
-            b.Append(ind + "ps.Add(" + obj + "." + f.Name + ");\n");
-        }
-    }
-
-    /// `<Entity>Cols`:表名 + 列名常量 + Has/Kind/Require。
-    static void GenCols(StringBuilder b, string cls, List<DbField> fs,
-                        string tbl) {
-        b.Append("class " + cls + "Cols {\n");
-        /* 表名常量:让内省/运维接口拿到物理表名,而不是业务侧再写一遍
-         * 字面量。实体自己有 Table 字段时让位给它。 */
-        if (GenDb.FieldFind(fs, "Table") == null) {
-            b.Append("    static string Table = \"" + tbl + "\";\n");
-        }
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            DbField f = fs[i];
-            if (f.Kind == 5) { continue; }
-            b.Append("    static string " + f.Name + " = \"" + f.Col +
-                     "\";\n");
-        }
-        b.Append("    static bool Has(string c) {\n        return false");
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            DbField f = fs[i];
-            if (f.Kind == 5) { continue; }
-            b.Append("\n            || c == \"" + f.Col + "\"");
-        }
-        b.Append(";\n    }\n");
-        /* 列的声明类型,动态值按它转换 */
-        b.Append("    static int Kind(string c) {\n");
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            DbField f = fs[i];
-            if (f.Kind == 5) { continue; }
-            string k = f.Kind == 1 ? "KindDouble"
-                       : f.Kind == 3 ? "KindText" : "KindInt";
-            b.Append("        if (c == \"" + f.Col +
-                     "\") { return DbParams." + k + "; }\n");
-        }
-        b.Append("        return DbParams.KindNull;\n    }\n");
-        b.Append("    static string Require(string c) {\n" +
-                 "        if (!" + cls + "Cols.Has(c)) {\n" +
-                 "            throw new Exception(\"" + cls +
-                 " has no column: \" + c);\n" +
-                 "        }\n" +
-                 "        return c;\n" +
-                 "    }\n" +
-                 "}\n");
-    }
-
-    /// 查询类 __DbQ_<E>。
-    static void GenEntity(StringBuilder b, string cls) {
-        List<DbField> fs = GenDb.FieldsOf(cls, 0);
-        int nbase = 0;
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            if (fs[i].Kind != 5) { nbase = nbase + 1; }
-        }
-        b.Append("class __DbQ_" + cls + " {\n");
-        b.Append("    IDbExecutor db;\n" +
-                 "    string tbl;\n" +
-                 "    string w;\n" +
-                 "    DbParams ps;\n" +
-                 "    string ob;\n" +
-                 "    string gb;\n" +
-                 "    string h;\n" +
-                 "    bool distinct;\n" +
-                 "    int limN;\n" +
-                 "    int offN;\n" +
-                 "    bool on;\n");
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            if (fs[i].Kind == 5) {
-                b.Append("    bool j_" + fs[i].Name + ";\n");
-            }
-        }
-        b.Append("    static __DbQ_" + cls + " Create(IDbExecutor db) {\n" +
-                 "        __DbQ_" + cls + " q = new __DbQ_" + cls + "();\n" +
-                 "        q.db = db;\n" +
-                 "        q.tbl = \"" + GenDb.TableOf(cls) + "\";\n" +
-                 "        q.on = true;\n" +
-                 "        q.w = \"\";\n" +
-                 "        q.ps = new DbParams();\n" +
-                 "        q.ob = \"\";\n" +
-                 "        q.gb = \"\";\n" +
-                 "        q.h = \"\";\n" +
-                 "        q.distinct = false;\n" +
-                 "        q.limN = -1;\n" +
-                 "        q.offN = -1;\n" +
-                 "        return q;\n" +
-                 "    }\n");
-        b.Append("    __DbQ_" + cls + " W(string f) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        if (this.w.Length == 0) { this.w = f; }\n" +
-                 "        else { this.w = this.w + \" AND \" + f; }\n" +
-                 "        return this;\n" +
-                 "    }\n");
-        b.Append("    __DbQ_" + cls + " Where(Expr<" + cls + "> e) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        if (e == null || e.Root == null) { return this; }\n" +
-                 "        StringBuilder sb = new StringBuilder();\n" +
-                 "        ExprSql.Build(e.Root, sb, this.ps);\n" +
-                 "        return this.W(sb.ToString());\n" +
-                 "    }\n");
-        b.Append("    __DbQ_" + cls + " WhereDict(DbValues v) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < v.Count()) {\n" +
-                 "            string c = " + cls + "Cols.Require(v.NameAt(i));\n" +
-                 "            W(\"t.\" + c + \" = ?\");\n" +
-                 "            v.BindAs(this.ps, i, " + cls +
-                 "Cols.Kind(c));\n" +
-                 "            i = i + 1;\n" +
-                 "        }\n" +
-                 "        return this;\n" +
-                 "    }\n");
-        b.Append("    __DbQ_" + cls + " CondBegin(bool c) { this.on = c; " +
-                 "return this; }\n");
-        b.Append("    __DbQ_" + cls + " CondEnd() { this.on = true; " +
-                 "return this; }\n");
-        b.Append("    __DbQ_" + cls + " AsTable(string t) { this.tbl = t; " +
-                 "return this; }\n");
-        b.Append("    __DbQ_" + cls + " P(string v) {\n" +
-                 "        if (this.on) { this.ps.Add(v); }\n" +
-                 "        return this;\n" +
-                 "    }\n");
-        b.Append("    __DbQ_" + cls + " Pi(int v) {\n" +
-                 "        if (this.on) { this.ps.AddInt(v); }\n" +
-                 "        return this;\n" +
-                 "    }\n");
-        b.Append("    __DbQ_" + cls + " Pl(long v) {\n" +
-                 "        if (this.on) { this.ps.AddLong(v); }\n" +
-                 "        return this;\n" +
-                 "    }\n");
-        b.Append("    __DbQ_" + cls + " Pd(double v) {\n" +
-                 "        if (this.on) { this.ps.AddDouble(v); }\n" +
-                 "        return this;\n" +
-                 "    }\n");
-        b.Append("    __DbQ_" + cls + " InI(List<int> vs) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < vs.Count) { this.ps.AddInt(vs[i]); " +
-                 "i = i + 1; }\n" +
-                 "        return this;\n" +
-                 "    }\n");
-        b.Append("    __DbQ_" + cls + " InL(List<long> vs) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < vs.Count) { this.ps.AddLong(vs[i]); " +
-                 "i = i + 1; }\n" +
-                 "        return this;\n" +
-                 "    }\n");
-        b.Append("    __DbQ_" + cls + " InS(List<string> vs) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < vs.Count) { this.ps.Add(vs[i]); " +
-                 "i = i + 1; }\n" +
-                 "        return this;\n" +
-                 "    }\n");
-        b.Append("    __DbQ_" + cls + " InD(List<double> vs) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < vs.Count) { this.ps.AddDouble(vs[i]); " +
-                 "i = i + 1; }\n" +
-                 "        return this;\n" +
-                 "    }\n");
-        b.Append("    __DbQ_" + cls + " OB(string col) {\n" +
-                 "        if (this.ob.Length == 0) { this.ob = col; }\n" +
-                 "        else { this.ob = this.ob + \", \" + col; }\n" +
-                 "        return this;\n" +
-                 "    }\n");
-        b.Append("    __DbQ_" + cls + " OBD(string col) { return OB(col + " +
-                 "\" DESC\"); }\n");
-        b.Append("    __DbQ_" + cls + " GB(string col) { this.gb = col; " +
-                 "return this; }\n");
-        /* 按分组键排序:键的 SQL 就是 GroupBy 存下的那一段 */
-        b.Append("    __DbQ_" + cls + " OBK() { return OB(this.gb); }\n");
-        b.Append("    __DbQ_" + cls + " OBDK() { return OBD(this.gb); }\n");
-        b.Append("    __DbQ_" + cls + " H(string f) {\n" +
-                 "        if (this.h.Length == 0) { this.h = f; }\n" +
-                 "        else { this.h = this.h + \" AND \" + f; }\n" +
-                 "        return this;\n" +
-                 "    }\n");
-        b.Append("    __DbQ_" + cls + " DISTINCT() { this.distinct = true; " +
-                 "return this; }\n");
-        b.Append("    __DbQ_" + cls + " Take(int n) { this.limN = n; " +
-                 "return this; }\n");
-        b.Append("    __DbQ_" + cls + " Skip(int n) { this.offN = n; " +
-                 "return this; }\n");
-        b.Append("    __DbQ_" + cls + " Limit(int n) { this.limN = n; " +
-                 "return this; }\n");
-        b.Append("    __DbQ_" + cls + " Offset(int n) { this.offN = n; " +
-                 "return this; }\n");
-        b.Append("    __DbQ_" + cls + " Page(int index, int size) {\n" +
-                 "        if (index < 1) { index = 1; }\n" +
-                 "        this.limN = size;\n" +
-                 "        this.offN = (index - 1) * size;\n" +
-                 "        return this;\n" +
-                 "    }\n");
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            if (fs[i].Kind == 5) {
-                b.Append("    __DbQ_" + cls + " Inc_" + fs[i].Name +
-                         "() { this.j_" + fs[i].Name + " = true; " +
-                         "return this; }\n");
-            }
-        }
-
-        /* SELECT 构建 */
-        b.Append("    string BuildSelect() {\n" +
-                 "        StringBuilder sb = new StringBuilder();\n" +
-                 "        sb.Append(\"SELECT \");\n" +
-                 "        if (this.distinct) { sb.Append(\"DISTINCT \"); }\n");
-        {
-            StringBuilder cols = new StringBuilder();
-            bool first = true;
-            for (int i = 0; i < fs.Count; i = i + 1) {
-                if (fs[i].Kind == 5) { continue; }
-                if (!first) { cols.Append(", "); }
-                cols.Append("t." + fs[i].Col);
-                first = false;
-            }
-            b.Append("        sb.Append(\"" + cols.ToString() + "\");\n");
-        }
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            if (fs[i].Kind != 5) { continue; }
-            DbField f = fs[i];
-            List<DbField> nfs = GenDb.FieldsOf(f.TypeName, 0);
-            StringBuilder cols = new StringBuilder();
-            for (int k = 0; k < nfs.Count; k = k + 1) {
-                if (nfs[k].Kind == 5) { continue; }
-                cols.Append(", j_" + f.Name + "." + nfs[k].Col);
-            }
-            b.Append("        if (this.j_" + f.Name + ") { sb.Append(\"" +
-                     cols.ToString() + "\"); }\n");
-        }
-        b.Append("        sb.Append(\" FROM \");\n" +
-                 "        sb.Append(this.tbl);\n" +
-                 "        sb.Append(\" t\");\n");
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            if (fs[i].Kind != 5) { continue; }
-            DbField f = fs[i];
-            b.Append("        if (this.j_" + f.Name + ") { sb.Append(" +
-                     "\" LEFT JOIN " + GenDb.TableOf(f.TypeName) + " j_" +
-                     f.Name + " ON t." + f.Name + "Id = j_" + f.Name +
-                     ".id\"); }\n");
-        }
-        b.Append("        if (this.w.Length > 0) { sb.Append(\" WHERE \"); " +
-                 "sb.Append(this.w); }\n" +
-                 "        if (this.gb.Length > 0) { sb.Append(\" GROUP BY \"); " +
-                 "sb.Append(this.gb); }\n" +
-                 "        if (this.h.Length > 0) { sb.Append(\" HAVING \"); " +
-                 "sb.Append(this.h); }\n" +
-                 "        if (this.ob.Length > 0) { sb.Append(\" ORDER BY \"); " +
-                 "sb.Append(this.ob); }\n" +
-                 "        int pv = this.db.GetProvider();\n" +
-                 "        if (pv == DbProvider.SqlServer || pv == " +
-                 "DbProvider.Oracle) {\n" +
-                 "            int off = this.offN;\n" +
-                 "            if (off < 0) { off = 0; }\n" +
-                 "            if (this.ob.Length == 0) {\n" +
-                 "                if (pv == DbProvider.SqlServer) { " +
-                 "sb.Append(\" ORDER BY (SELECT 0)\"); }\n" +
-                 "                else { sb.Append(\" ORDER BY (SELECT 0 " +
-                 "FROM DUAL)\"); }\n" +
+    static void GenAccess(StringBuilder b, string cls) {
+        b.Append("class __DbM_" + cls + " {\n" +
+                 "    static " + cls + " Read(List<OrmCol> cols, DbResult r, " +
+                 "int row, int at0) {\n" +
+                 "        " + cls + " o = new " + cls + "();\n" +
+                 "        for (int i = 0; i < cols.Count; i = i + 1) {\n" +
+                 "            OrmCol c = cols[i];\n" +
+                 "            int at = at0 + i;\n" +
+                 "            if (c.Kind == 3) {\n" +
+                 "                o.SetFieldString(c.Field, " +
+                 "r.GetString(row, at));\n" +
+                 "            } else if (c.Kind == 1) {\n" +
+                 "                o.SetFieldDouble(c.Field, " +
+                 "r.GetDouble(row, at));\n" +
+                 "            } else if (c.Kind == 2) {\n" +
+                 "                o.SetFieldBool(c.Field, " +
+                 "r.GetBool(row, at));\n" +
+                 "            } else if (c.I64) {\n" +
+                 "                o.SetFieldLong(c.Field, " +
+                 "r.GetLong(row, at));\n" +
+                 "            } else {\n" +
+                 "                o.SetFieldInt(c.Field, " +
+                 "r.GetInt(row, at));\n" +
                  "            }\n" +
-                 "            sb.Append(\" OFFSET \"); " +
-                 "sb.Append(Convert.ToString(off)); sb.Append(\" ROWS\");\n" +
-                 "            if (this.limN >= 0) { sb.Append(\" FETCH NEXT \"); " +
-                 "sb.Append(Convert.ToString(this.limN)); sb.Append(\" ROWS " +
-                 "ONLY\"); }\n" +
-                 "        } else {\n" +
-                 "            if (this.limN >= 0) { sb.Append(\" LIMIT \"); " +
-                 "sb.Append(Convert.ToString(this.limN)); }\n" +
-                 "            if (this.offN >= 0) { sb.Append(\" OFFSET \"); " +
-                 "sb.Append(Convert.ToString(this.offN)); }\n" +
                  "        }\n" +
-                 "        return sb.ToString();\n" +
+                 "        return o;\n" +
+                 "    }\n" +
+                 "    static void Bind(" + cls + " o, OrmCol c, " +
+                 "DbParams ps) {\n" +
+                 "        if (c.Kind == 3) { __DbM_" + cls +
+                 ".BindStr(o, c.Field, ps); return; }\n" +
+                 "        if (c.Kind == 1) { " +
+                 "ps.AddDouble(o.GetFieldDouble(c.Field)); return; }\n" +
+                 "        if (c.Kind == 2) {\n" +
+                 "            if (o.GetFieldBool(c.Field)) { ps.AddInt(1); } " +
+                 "else { ps.AddInt(0); }\n" +
+                 "            return;\n" +
+                 "        }\n" +
+                 "        if (c.I64) { ps.AddLong(o.GetFieldLong(c.Field)); " +
+                 "return; }\n" +
+                 "        ps.AddInt(o.GetFieldInt(c.Field));\n" +
                  "    }\n");
-
-        /* 行映射 + 终端 */
-        b.Append("    List<" + cls + "> MapRows(DbResult r) {\n" +
-                 "        List<" + cls + "> outp = new List<" + cls +
-                 ">();\n" +
-                 "        int row = 0;\n" +
-                 "        while (row < r.RowCount()) {\n" +
-                 "            " + cls + " o = new " + cls + "();\n");
-        {
-            int ci = 0;
-            for (int i = 0; i < fs.Count; i = i + 1) {
-                if (fs[i].Kind == 5) { continue; }
-                if (fs[i].Kind == 4) {
-                    /* enum 强转不可解析;int -> enum 隐式 */
-                    b.Append("            o." + fs[i].Name + " = r.GetInt(" +
-                             "row, " + Convert.ToString(ci) + ");\n");
-                } else {
-                    b.Append("            o." + fs[i].Name + " = r." +
-                             GenDbEmit.GetterOf(fs[i]) + "(row, " +
-                             Convert.ToString(ci) + ");\n");
-                }
-                ci = ci + 1;
-            }
+        /* 字符串列按声明字段直接取值:未赋值的字段是 null,必须以 SQL NULL
+         * 写库,而反射取值把 null 与 "" 收敛成同一个空串,分不出来。
+         * 每个字符串字段一行,SQL 规则本身仍只有共享实现那一份。 */
+        b.Append("    static void BindStr(" + cls +
+                 " o, string f, DbParams ps) {\n");
+        List<DbField> sfs = GenDb.FieldsOf(cls, 0);
+        for (int i = 0; i < sfs.Count; i = i + 1) {
+            if (sfs[i].Kind != 3) { continue; }
+            b.Append("        if (f == \"" + sfs[i].Name + "\") { ps.Add(o." +
+                     sfs[i].Name + "); return; }\n");
         }
-        b.Append("            int ci = " + Convert.ToString(nbase) + ";\n");
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            if (fs[i].Kind != 5) { continue; }
-            DbField f = fs[i];
-            List<DbField> nfs = GenDb.FieldsOf(f.TypeName, 0);
-            int nn = 0;
-            int pk = -1;
-            for (int k = 0; k < nfs.Count; k = k + 1) {
-                if (nfs[k].Kind == 5) { continue; }
-                if (nfs[k].Name == "id") { pk = nn; }
-                nn = nn + 1;
-            }
-            if (pk < 0) { pk = 0; }
-            b.Append("            if (this.j_" + f.Name + ") {\n" +
-                     "                if (!r.IsNull(row, ci + " +
-                     Convert.ToString(pk) + ")) {\n" +
-                     "                    " + f.TypeName + " nv = new " +
-                     f.TypeName + "();\n");
-            int nk = 0;
-            for (int k = 0; k < nfs.Count; k = k + 1) {
-                if (nfs[k].Kind == 5) { continue; }
-                if (nfs[k].Kind == 4) {
-                    b.Append("                    nv." + nfs[k].Name +
-                             " = r.GetInt(row, ci + " +
-                             Convert.ToString(nk) + ");\n");
-                } else {
-                    b.Append("                    nv." + nfs[k].Name +
-                             " = r." + GenDbEmit.GetterOf(nfs[k]) +
-                             "(row, ci + " + Convert.ToString(nk) + ");\n");
-                }
-                nk = nk + 1;
-            }
-            b.Append("                    o." + f.Name + " = nv;\n" +
-                     "                }\n" +
-                     "                ci = ci + " + Convert.ToString(nn) +
-                     ";\n" +
-                     "            }\n");
-        }
-        b.Append("            outp.Add(o);\n" +
-                 "            row = row + 1;\n" +
-                 "        }\n" +
-                 "        return outp;\n" +
-                 "    }\n");
-        /* 单行映射、两个终端:异步版给网络驱动,同步版给内嵌驱动 */
-        b.Append("    List<" + cls + "> ToList() {\n" +
-                 "        return MapRows(this.db.Query(BuildSelect(), " +
-                 "this.ps));\n" +
-                 "    }\n" +
-                 "    async List<" + cls + "> ToListAsync() {\n" +
-                 "        string sql = BuildSelect();\n" +
-                 "        DbResult r = await this.db.QueryAsync(sql, " +
-                 "this.ps);\n" +
-                 "        return MapRows(r);\n" +
-                 "    }\n");
-        b.Append("    string BuildCol(string col) {\n" +
-                 "        StringBuilder sb = new StringBuilder();\n" +
-                 "        sb.Append(\"SELECT \" + col + \" FROM \" + this.tbl " +
-                 "+ \" t\");\n" +
-                 "        if (this.w.Length > 0) { sb.Append(\" WHERE \" + " +
-                 "this.w); }\n" +
-                 "        if (this.gb.Length > 0) { sb.Append(\" GROUP BY \" + " +
-                 "this.gb); }\n" +
-                 "        if (this.h.Length > 0) { sb.Append(\" HAVING \" + " +
-                 "this.h); }\n" +
-                 "        if (this.ob.Length > 0) { sb.Append(\" ORDER BY \" + " +
-                 "this.ob); }\n" +
-                 "        return sb.ToString();\n" +
-                 "    }\n" +
-                 "    List<string> MapCol(DbResult r) {\n" +
-                 "        List<string> outp = new List<string>();\n" +
-                 "        int row = 0;\n" +
-                 "        while (row < r.RowCount()) { outp.Add(r.GetString(" +
-                 "row, 0)); row = row + 1; }\n" +
-                 "        return outp;\n" +
-                 "    }\n" +
-                 "    List<string> ToListCol(string col) {\n" +
-                 "        return MapCol(this.db.Query(BuildCol(col), " +
-                 "this.ps));\n" +
-                 "    }\n" +
-                 "    async List<string> ToListColAsync(string col) {\n" +
-                 "        string sql = BuildCol(col);\n" +
-                 "        DbResult r = await this.db.QueryAsync(sql, " +
-                 "this.ps);\n" +
-                 "        return MapCol(r);\n" +
-                 "    }\n");
-        b.Append("    string BuildDto(string cols) {\n" +
-                 "        StringBuilder sb = new StringBuilder();\n" +
-                 "        sb.Append(\"SELECT \" + cols + \" FROM \" + this.tbl " +
-                 "+ \" t\");\n" +
-                 "        if (this.w.Length > 0) { sb.Append(\" WHERE \" + " +
-                 "this.w); }\n" +
-                 "        if (this.gb.Length > 0) { sb.Append(\" GROUP BY \" + " +
-                 "this.gb); }\n" +
-                 "        if (this.h.Length > 0) { sb.Append(\" HAVING \" + " +
-                 "this.h); }\n" +
-                 "        if (this.ob.Length > 0) { sb.Append(\" ORDER BY \" + " +
-                 "this.ob); }\n" +
-                 "        if (this.limN >= 0) { sb.Append(\" LIMIT \" + " +
-                 "Convert.ToString(this.limN)); }\n" +
-                 "        if (this.offN >= 0) { sb.Append(\" OFFSET \" + " +
-                 "Convert.ToString(this.offN)); }\n" +
-                 "        return sb.ToString();\n" +
-                 "    }\n");
-        GenDbEmit.Projections(b, cls);
-        b.Append("    " + cls + " First() {\n" +
-                 "        this.limN = 1;\n" +
-                 "        List<" + cls + "> l = ToList();\n" +
-                 "        if (l.Count > 0) { return l[0]; }\n" +
-                 "        return null;\n" +
-                 "    }\n" +
-                 "    " + cls + " FirstOrDefault() { return First(); }\n" +
-                 "    " + cls + " ToOne() { return First(); }\n" +
-                 "    async " + cls + " FirstAsync() {\n" +
-                 "        this.limN = 1;\n" +
-                 "        List<" + cls + "> l = await ToListAsync();\n" +
-                 "        if (l.Count > 0) { return l[0]; }\n" +
-                 "        return null;\n" +
-                 "    }\n" +
-                 "    async " + cls + " FirstOrDefaultAsync() { return await " +
-                 "FirstAsync(); }\n" +
-                 "    async " + cls + " ToOneAsync() { return await " +
-                 "FirstAsync(); }\n" +
-                 "    string BuildCount() {\n" +
-                 "        StringBuilder sb = new StringBuilder();\n" +
-                 "        sb.Append(\"SELECT COUNT(*) FROM (SELECT 1 FROM \" + " +
-                 "this.tbl + \" t\");\n" +
-                 "        if (this.w.Length > 0) { sb.Append(\" WHERE \" + " +
-                 "this.w); }\n" +
-                 "        sb.Append(\" GROUP BY \" + this.gb);\n" +
-                 "        if (this.h.Length > 0) { sb.Append(\" HAVING \" + " +
-                 "this.h); }\n" +
-                 "        sb.Append(\")\");\n" +
-                 "        return sb.ToString();\n" +
-                 "    }\n" +
-                 "    async int CountAsync() {\n" +
-                 "        if (this.gb.Length > 0) {\n" +
-                 "            string sql = BuildCount();\n" +
-                 "            DbResult r = await this.db.QueryAsync(sql, " +
-                 "this.ps);\n" +
-                 "            if (r.RowCount() == 0) { return 0; }\n" +
-                 "            return r.GetInt(0, 0);\n" +
-                 "        }\n" +
-                 "        return await AggIAsync(\"COUNT(*)\");\n" +
-                 "    }\n" +
-                 "    async bool AnyAsync() {\n" +
-                 "        int n = await CountAsync();\n" +
-                 "        return n > 0;\n" +
-                 "    }\n");
-        b.Append("    async DbResult AggRAsync(string expr) {\n" +
-                 "        string sql = BuildAgg(expr);\n" +
-                 "        return await this.db.QueryAsync(sql, this.ps);\n" +
-                 "    }\n" +
-                 "    async int AggIAsync(string expr) {\n" +
-                 "        DbResult r = await AggRAsync(expr);\n" +
-                 "        if (r.RowCount() == 0) { return 0; }\n" +
-                 "        return r.GetInt(0, 0);\n" +
-                 "    }\n" +
-                 "    async long AggLAsync(string expr) {\n" +
-                 "        DbResult r = await AggRAsync(expr);\n" +
-                 "        if (r.RowCount() == 0) { return 0; }\n" +
-                 "        return r.GetLong(0, 0);\n" +
-                 "    }\n" +
-                 "    async double AggDAsync(string expr) {\n" +
-                 "        DbResult r = await AggRAsync(expr);\n" +
-                 "        if (r.RowCount() == 0) { return 0.0; }\n" +
-                 "        return r.GetDouble(0, 0);\n" +
-                 "    }\n" +
-                 "    int Count() {\n" +
-                 "        if (this.gb.Length > 0) {\n" +
-                 "            DbResult r = this.db.Query(BuildCount(), " +
-                 "this.ps);\n" +
-                 "            if (r.RowCount() == 0) { return 0; }\n" +
-                 "            return r.GetInt(0, 0);\n" +
-                 "        }\n" +
-                 "        return AggI(\"COUNT(*)\");\n" +
-                 "    }\n" +
-                 "    bool Any() { return Count() > 0; }\n" +
-                 "    string BuildAgg(string expr) {\n" +
-                 "        StringBuilder sb = new StringBuilder();\n" +
-                 "        sb.Append(\"SELECT \" + expr + \" FROM \" + this.tbl " +
-                 "+ \" t\");\n" +
-                 "        if (this.w.Length > 0) { sb.Append(\" WHERE \"); " +
-                 "sb.Append(this.w); }\n" +
-                 "        if (this.gb.Length > 0) { sb.Append(\" GROUP BY \"); " +
-                 "sb.Append(this.gb); }\n" +
-                 "        if (this.h.Length > 0) { sb.Append(\" HAVING \"); " +
-                 "sb.Append(this.h); }\n" +
-                 "        return sb.ToString();\n" +
-                 "    }\n" +
-                 "    DbResult AggR(string expr) {\n" +
-                 "        return this.db.Query(BuildAgg(expr), this.ps);\n" +
-                 "    }\n" +
-                 "    int AggI(string expr) {\n" +
-                 "        DbResult r = AggR(expr);\n" +
-                 "        if (r.RowCount() == 0) { return 0; }\n" +
-                 "        return r.GetInt(0, 0);\n" +
-                 "    }\n" +
-                 "    long AggL(string expr) {\n" +
-                 "        DbResult r = AggR(expr);\n" +
-                 "        if (r.RowCount() == 0) { return 0; }\n" +
-                 "        return r.GetLong(0, 0);\n" +
-                 "    }\n" +
-                 "    double AggD(string expr) {\n" +
-                 "        DbResult r = AggR(expr);\n" +
-                 "        if (r.RowCount() == 0) { return 0.0; }\n" +
-                 "        return r.GetDouble(0, 0);\n" +
+        b.Append("        ps.Add(o.GetFieldString(f));\n" +
                  "    }\n" +
                  "}\n");
-    }
-
-    /// __DbI_<E>:INSERT(行列表 / DbValues 字典 / Only/Skip)。
-    static void GenInsert(StringBuilder b, string cls, List<DbField> fs,
-                          string tbl) {
-        b.Append("class __DbI_" + cls + " {\n" +
-                 "    IDbExecutor db;\n" +
-                 "    string tbl;\n" +
-                 "    List<" + cls + "> rows;\n" +
-                 "    List<DbValues> dicts;\n" +
-                 "    List<string> only;\n" +
-                 "    List<string> skip;\n" +
-                 "    List<string> conf;\n" +
-                 "    List<string> acc;\n" +
-                 "    List<string> gmx;\n" +
-                 "    List<string> gmn;\n" +
-                 "    bool upsert;\n" +
-                 "    bool nop;\n" +
-                 "    string sql;\n" +
-                 "    DbParams bound;\n" +
-                 "    static __DbI_" + cls + " Create(IDbExecutor db) {\n" +
-                 "        __DbI_" + cls + " q = new __DbI_" + cls + "();\n" +
-                 "        q.db = db;\n" +
-                 "        q.tbl = \"" + tbl + "\";\n" +
-                 "        q.rows = new List<" + cls + ">();\n" +
-                 "        q.dicts = new List<DbValues>();\n" +
-                 "        q.only = new List<string>();\n" +
-                 "        q.skip = new List<string>();\n" +
-                 "        q.conf = new List<string>();\n" +
-                 "        q.acc = new List<string>();\n" +
-                 "        q.gmx = new List<string>();\n" +
-                 "        q.gmn = new List<string>();\n" +
-                 "        q.upsert = false;\n" +
-                 "        q.nop = false;\n" +
-                 "        q.sql = \"\";\n" +
-                 "        q.bound = new DbParams();\n" +
-                 "        return q;\n" +
+        b.Append("class __DbB_" + cls + " : IOrmRows {\n" +
+                 "    List<" + cls + "> items;\n" +
+                 "    static __DbB_" + cls + " New() {\n" +
+                 "        __DbB_" + cls + " b = new __DbB_" + cls + "();\n" +
+                 "        b.items = new List<" + cls + ">();\n" +
+                 "        return b;\n" +
                  "    }\n" +
-                 "    static __DbI_" + cls + " Create(IDbExecutor db, " + cls +
-                 " o) {\n" +
-                 "        return __DbI_" + cls + ".Create(db).AppendData(o);\n" +
-                 "    }\n" +
-                 "    static __DbI_" + cls + " Create(IDbExecutor db, List<" +
-                 cls + "> l) {\n" +
-                 "        return __DbI_" + cls + ".Create(db).AppendData(l);\n" +
-                 "    }\n" +
-                 "    __DbI_" + cls + " AppendData(" + cls + " o) { " +
-                 "this.rows.Add(o); return this; }\n" +
-                 "    __DbI_" + cls + " AppendData(List<" + cls + "> l) {\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < l.Count) { this.rows.Add(l[i]); " +
-                 "i = i + 1; }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbI_" + cls + " AsTable(string t) { this.tbl = t; " +
-                 "return this; }\n" +
-                 "    __DbI_" + cls + " AppendDict(DbValues v) {\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < v.Count()) { " + cls +
-                 "Cols.Require(v.NameAt(i)); i = i + 1; }\n" +
-                 "        this.dicts.Add(v);\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbI_" + cls + " AppendDict(List<DbValues> l) {\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < l.Count) { AppendDict(l[i]); " +
-                 "i = i + 1; }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbI_" + cls + " Only(string c) { this.only.Add(c); " +
-                 "return this; }\n" +
-                 "    __DbI_" + cls + " Skip(string c) { this.skip.Add(c); " +
-                 "return this; }\n" +
-                 /* Upsert:键列 OC,冲突时累加 ACC / 取大 GMX / 取小 GMN,
-                  * 没点名的列冲突时被新值覆盖 */
-                 "    __DbI_" + cls + " OC(string c) { this.conf.Add(c); " +
-                 "this.upsert = true; return this; }\n" +
-                 "    __DbI_" + cls + " ACC(string c) { this.acc.Add(c); " +
-                 "this.upsert = true; return this; }\n" +
-                 "    __DbI_" + cls + " GMX(string c) { this.gmx.Add(c); " +
-                 "this.upsert = true; return this; }\n" +
-                 "    __DbI_" + cls + " GMN(string c) { this.gmn.Add(c); " +
-                 "this.upsert = true; return this; }\n" +
-                 "    __DbI_" + cls + " NOP() { this.nop = true; " +
-                 "this.upsert = true; return this; }\n" +
-                 "    bool Use(string c, bool identity) {\n" +
-                 "        if (this.only.Count > 0) { return " +
-                 "__DbBind.Has(this.only, c); }\n" +
-                 "        if (identity) { return false; }\n" +
-                 "        return !__DbBind.Has(this.skip, c);\n" +
-                 "    }\n");
-        /* 冲突子句。键列缺省取实体主键;方言差异(excluded 对
-         * VALUES()、max 对 GREATEST)在 __DbBind 里解决 */
-        b.Append("    List<string> Keys() {\n" +
-                 "        List<string> k = new List<string>();\n");
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            DbField f = fs[i];
-            if (f.Kind == 5 || !f.IsPk) { continue; }
-            b.Append("        k.Add(\"" + f.Col + "\");\n");
-        }
-        b.Append("        return k;\n" +
-                 "    }\n" +
-                 "    string Conflict() {\n" +
-                 "        if (!this.upsert) { return \"\"; }\n" +
-                 "        int p = this.db.GetProvider();\n" +
-                 "        List<string> keys = this.conf;\n" +
-                 "        if (keys.Count == 0) { keys = Keys(); }\n" +
-                 "        if (keys.Count == 0) {\n" +
-                 "            throw new Exception(\"" + cls +
-                 ": OnConflict needs key columns\");\n" +
-                 "        }\n" +
-                 "        StringBuilder sb = new StringBuilder();\n" +
-                 "        sb.Append(__DbBind.ConflictHead(p, keys, " +
-                 "this.nop));\n" +
-                 "        if (this.nop) { return sb.ToString(); }\n" +
-                 "        int n = 0;\n");
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            DbField f = fs[i];
-            if (f.Kind == 5) { continue; }
-            b.Append("        if (this.Use(\"" + f.Col + "\", " +
-                     (f.IsIdent ? "true" : "false") +
-                     ") && !__DbBind.Has(keys, \"" + f.Col + "\")) {\n" +
-                     "            if (n > 0) { sb.Append(\", \"); }\n" +
-                     "            sb.Append(__DbBind.Excl(p, \"" + f.Col +
-                     "\", __DbBind.Mode(this.acc, this.gmx, this.gmn, \"" +
-                     f.Col + "\")));\n" +
-                     "            n = n + 1;\n" +
-                     "        }\n");
-        }
-        /* 冲突时无列可写(整表都是键)= 保留已有行 */
-        b.Append("        if (n == 0) { return __DbBind.ConflictHead(p, " +
-                 "keys, true); }\n" +
-                 "        return sb.ToString();\n" +
-                 "    }\n");
-        /* 语句构建到 this.sql / this.bound,由一对终端执行,同步与异步
-         * 形式共享每一行 SQL 拼装 */
-        b.Append("    int BuildDicts() {\n" +
-                 "        DbParams ps = new DbParams();\n" +
-                 "        DbValues head = this.dicts[0];\n" +
-                 "        StringBuilder sb = new StringBuilder();\n" +
-                 "        sb.Append(\"INSERT INTO \");\n" +
-                 "        sb.Append(this.tbl);\n" +
-                 "        sb.Append(\" (\");\n" +
-                 "        int c = 0;\n" +
-                 "        while (c < head.Count()) {\n" +
-                 "            if (c > 0) { sb.Append(\", \"); }\n" +
-                 "            sb.Append(head.NameAt(c));\n" +
-                 "            c = c + 1;\n" +
-                 "        }\n" +
-                 "        sb.Append(\") VALUES \");\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < this.dicts.Count) {\n" +
-                 "            DbValues v = this.dicts[i];\n" +
-                 "            if (i > 0) { sb.Append(\", \"); }\n" +
-                 "            sb.Append(\"(\");\n" +
-                 "            int k = 0;\n" +
-                 "            while (k < head.Count()) {\n" +
-                 "                if (k > 0) { sb.Append(\", \"); }\n" +
-                 "                sb.Append(\"?\");\n" +
-                 "                int at = v.IndexOf(head.NameAt(k));\n" +
-                 "                if (at < 0) { ps.AddNull(); } else {\n" +
-                 "                    v.BindAs(ps, at, " + cls +
-                 "Cols.Kind(head.NameAt(k)));\n" +
-                 "                }\n" +
-                 "                k = k + 1;\n" +
-                 "            }\n" +
-                 "            sb.Append(\")\");\n" +
-                 "            i = i + 1;\n" +
-                 "        }\n" +
-                 "        sb.Append(Conflict());\n" +
-                 "        this.sql = sb.ToString();\n" +
-                 "        this.bound = ps;\n" +
-                 "        return 1;\n" +
-                 "    }\n" +
-                 "    int ExecuteDicts() {\n" +
-                 "        if (BuildDicts() == 0) { return 0; }\n" +
-                 "        return this.db.Execute(this.sql, this.bound);\n" +
-                 "    }\n" +
-                 "    async int ExecuteDictsAsync() {\n" +
-                 "        if (BuildDicts() == 0) { return 0; }\n" +
-                 "        return await this.db.ExecuteAsync(this.sql, " +
-                 "this.bound);\n" +
-                 "    }\n" +
-                 "    int BuildRows() {\n" +
-                 "        if (this.rows.Count == 0) { return 0; }\n" +
-                 "        DbParams ps = new DbParams();\n" +
-                 "        string cols = \"\";\n");
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            DbField f = fs[i];
-            if (f.Kind == 5) { continue; }
-            b.Append("        if (this.Use(\"" + f.Col + "\", " +
-                     (f.IsIdent ? "true" : "false") + ")) {\n" +
-                     "            if (cols.Length > 0) { cols = cols + " +
-                     "\", \"; }\n" +
-                     "            cols = cols + \"" + f.Col + "\";\n" +
-                     "        }\n");
-        }
-        b.Append("        if (cols.Length == 0) { return 0; }\n" +
-                 "        StringBuilder sb = new StringBuilder();\n" +
-                 "        sb.Append(\"INSERT INTO \");\n" +
-                 "        sb.Append(this.tbl);\n" +
-                 "        sb.Append(\" (\");\n" +
-                 "        sb.Append(cols);\n" +
-                 "        sb.Append(\") VALUES \");\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < this.rows.Count) {\n" +
-                 "            " + cls + " o = this.rows[i];\n" +
-                 "            if (i > 0) { sb.Append(\", \"); }\n" +
-                 "            string marks = \"\";\n");
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            DbField f = fs[i];
-            if (f.Kind == 5) { continue; }
-            b.Append("            if (this.Use(\"" + f.Col + "\", " +
-                     (f.IsIdent ? "true" : "false") + ")) {\n" +
-                     "                if (marks.Length > 0) { marks = marks + " +
-                     "\", \"; }\n" +
-                     "                marks = marks + \"?\";\n");
-            GenDbEmit.BindField(b, "                ", f, "o");
-            b.Append("            }\n");
-        }
-        b.Append("            sb.Append(\"(\");\n" +
-                 "            sb.Append(marks);\n" +
-                 "            sb.Append(\")\");\n" +
-                 "            i = i + 1;\n" +
-                 "        }\n" +
-                 "        sb.Append(Conflict());\n" +
-                 "        this.sql = sb.ToString();\n" +
-                 "        this.bound = ps;\n" +
-                 "        return 1;\n" +
-                 "    }\n" +
-                 "    int ExecuteAffrows() {\n" +
-                 "        if (this.dicts.Count > 0) { return " +
-                 "ExecuteDicts(); }\n" +
-                 "        if (BuildRows() == 0) { return 0; }\n" +
-                 "        return this.db.Execute(this.sql, this.bound);\n" +
-                 "    }\n" +
-                 "    async int ExecuteAffrowsAsync() {\n" +
-                 "        if (this.dicts.Count > 0) { return await " +
-                 "ExecuteDictsAsync(); }\n" +
-                 "        if (BuildRows() == 0) { return 0; }\n" +
-                 "        return await this.db.ExecuteAsync(this.sql, " +
-                 "this.bound);\n" +
-                 "    }\n" +
-                 "    int ExecuteIdentity() {\n" +
-                 "        if (ExecuteAffrows() == 0) { return 0; }\n" +
-                 "        return __DbBind.LastId(this.db);\n" +
-                 "    }\n" +
-                 "    async int ExecuteIdentityAsync() {\n" +
-                 "        int n = await ExecuteAffrowsAsync();\n" +
-                 "        if (n == 0) { return 0; }\n" +
-                 "        return await __DbBind.LastIdAsync(this.db);\n" +
+                 "    void Add(" + cls + " o) { this.items.Add(o); }\n" +
+                 "    int RowCount() { return this.items.Count; }\n" +
+                 "    void BindCol(int row, OrmCol c, DbParams ps) {\n" +
+                 "        __DbM_" + cls + ".Bind(this.items[row], c, ps);\n" +
                  "    }\n" +
                  "}\n");
-    }
-
-    /// __DbU_<E>:UPDATE(Set/SetIncr/Where 链)。
-    static void GenUpdate(StringBuilder b, string cls, List<DbField> fs,
-                          string tbl) {
-        DbField pk = null;
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            if (fs[i].IsPk && fs[i].Kind != 5) { pk = fs[i]; }
-        }
-        b.Append("class __DbU_" + cls + " {\n" +
-                 "    IDbExecutor db;\n" +
-                 "    string tbl;\n" +
-                 "    " + cls + " src;\n" +
-                 "    List<string> only;\n" +
-                 "    List<string> skip;\n" +
-                 "    string sets;\n" +
-                 "    DbParams sp;\n" +
-                 "    string w;\n" +
-                 "    DbParams wp;\n" +
-                 "    bool on;\n" +
-                 "    static __DbU_" + cls + " Create(IDbExecutor db) {\n" +
-                 "        __DbU_" + cls + " q = new __DbU_" + cls + "();\n" +
-                 "        q.db = db;\n" +
-                 "        q.tbl = \"" + tbl + "\";\n" +
-                 "        q.only = new List<string>();\n" +
-                 "        q.skip = new List<string>();\n" +
-                 "        q.sets = \"\";\n" +
-                 "        q.sp = new DbParams();\n" +
-                 "        q.w = \"\";\n" +
-                 "        q.wp = new DbParams();\n" +
-                 "        q.on = true;\n" +
-                 "        return q;\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " AsTable(string t) { this.tbl = t; " +
-                 "return this; }\n" +
-                 "    __DbU_" + cls + " Only(string c) { this.only.Add(c); " +
-                 "return this; }\n" +
-                 "    __DbU_" + cls + " Skip(string c) { this.skip.Add(c); " +
-                 "return this; }\n" +
-                 "    bool Use(string c) {\n" +
-                 "        if (this.only.Count > 0) { return " +
-                 "__DbBind.Has(this.only, c); }\n" +
-                 "        return !__DbBind.Has(this.skip, c);\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " SetDict(DbValues v) {\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < v.Count()) {\n" +
-                 "            string c = " + cls + "Cols.Require(v.NameAt(i));\n" +
-                 "            if (Use(c)) {\n" +
-                 "                v.BindAs(this.sp, i, " + cls +
-                 "Cols.Kind(c));\n" +
-                 "                Frag(c + \" = ?\");\n" +
-                 "            }\n" +
-                 "            i = i + 1;\n" +
-                 "        }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " WhereDict(DbValues v) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < v.Count()) {\n" +
-                 "            string c = " + cls + "Cols.Require(v.NameAt(i));\n" +
-                 "            W(c + \" = ?\");\n" +
-                 "            v.BindAs(this.wp, i, " + cls +
-                 "Cols.Kind(c));\n" +
-                 "            i = i + 1;\n" +
-                 "        }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " CondBegin(bool c) { this.on = c; " +
-                 "return this; }\n" +
-                 "    __DbU_" + cls + " CondEnd() { this.on = true; " +
-                 "return this; }\n" +
-                 "    __DbU_" + cls + " W(string f) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        string u = __DbBind.Unalias(f);\n" +
-                 "        if (this.w.Length == 0) { this.w = u; }\n" +
-                 "        else { this.w = this.w + \" AND \" + u; }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " P(string v) {\n" +
-                 "        if (this.on) { this.wp.Add(v); }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " Pi(int v) {\n" +
-                 "        if (this.on) { this.wp.AddInt(v); }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " Pl(long v) {\n" +
-                 "        if (this.on) { this.wp.AddLong(v); }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " Pd(double v) {\n" +
-                 "        if (this.on) { this.wp.AddDouble(v); }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " InI(List<int> vs) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < vs.Count) { this.wp.AddInt(vs[i]); " +
-                 "i = i + 1; }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " InL(List<long> vs) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < vs.Count) { this.wp.AddLong(vs[i]); " +
-                 "i = i + 1; }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " InS(List<string> vs) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < vs.Count) { this.wp.Add(vs[i]); " +
-                 "i = i + 1; }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " InD(List<double> vs) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < vs.Count) { this.wp.AddDouble(vs[i]); " +
-                 "i = i + 1; }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " Frag(string f) {\n" +
-                 "        if (this.sets.Length > 0) { this.sets = this.sets + " +
-                 "\", \"; }\n" +
-                 "        this.sets = this.sets + f;\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " SetI(string c, int v) {\n" +
-                 "        this.sp.AddInt(v);\n" +
-                 "        return Frag(c + \" = ?\");\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " SetL(string c, long v) {\n" +
-                 "        this.sp.AddLong(v);\n" +
-                 "        return Frag(c + \" = ?\");\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " SetD(string c, double v) {\n" +
-                 "        this.sp.AddDouble(v);\n" +
-                 "        return Frag(c + \" = ?\");\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " SetS(string c, string v) {\n" +
-                 "        this.sp.Add(v);\n" +
-                 "        return Frag(c + \" = ?\");\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " SetB(string c, bool v) {\n" +
-                 "        if (v) { this.sp.AddInt(1); } else { " +
-                 "this.sp.AddInt(0); }\n" +
-                 "        return Frag(c + \" = ?\");\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " SetIncrI(string c, int v) {\n" +
-                 "        this.sp.AddInt(v);\n" +
-                 "        return Frag(c + \" = \" + c + \" + ?\");\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " SetIncrL(string c, long v) {\n" +
-                 "        this.sp.AddLong(v);\n" +
-                 "        return Frag(c + \" = \" + c + \" + ?\");\n" +
-                 "    }\n" +
-                 "    __DbU_" + cls + " SetIncrD(string c, double v) {\n" +
-                 "        this.sp.AddDouble(v);\n" +
-                 "        return Frag(c + \" = \" + c + \" + ?\");\n" +
-                 "    }\n");
-        /* SetSource 记录实体;列在执行时展开,UpdateColumns/IgnoreColumns
-         * 任意链顺序都成立 */
-        b.Append("    __DbU_" + cls + " SetSource(" + cls + " o) { " +
-                 "this.src = o; return this; }\n" +
-                 "    void ApplySource() {\n" +
-                 "        if (this.src == null) { return; }\n" +
-                 "        " + cls + " o = this.src;\n" +
-                 "        this.src = null;\n");
-        if (pk == null) {
-            /* 无主键:没有可定位行的键 */
-            b.Append("    }\n");
-        } else {
-            for (int i = 0; i < fs.Count; i = i + 1) {
-                DbField f = fs[i];
-                if (f.Kind == 5 || f.IsPk) { continue; }
-                b.Append("        if (Use(\"" + f.Col + "\")) {\n");
-                if (f.Kind == 0) {
-                    b.Append("            SetI(\"" + f.Col + "\", o." +
-                             f.Name + ");\n");
-                } else if (f.Kind == 4) {
-                    b.Append("            int ev_" + f.Name + " = o." +
-                             f.Name + ";\n" +
-                             "            SetI(\"" + f.Col + "\", ev_" +
-                             f.Name + ");\n");
-                } else if (f.Kind == 1) {
-                    b.Append("            SetD(\"" + f.Col + "\", o." +
-                             f.Name + ");\n");
-                } else if (f.Kind == 2) {
-                    b.Append("            SetB(\"" + f.Col + "\", o." +
-                             f.Name + ");\n");
-                } else {
-                    b.Append("            SetS(\"" + f.Col + "\", o." +
-                             f.Name + ");\n");
-                }
-                b.Append("        }\n");
-            }
-            string pm = pk.Kind == 3 ? "P" : pk.Kind == 1 ? "Pd" : "Pi";
-            b.Append("        W(\"" + pk.Col + " = ?\");\n" +
-                     "        " + pm + "(o." + pk.Name + ");\n" +
-                     "    }\n");
-        }
-        b.Append("    string BuildUpdate() {\n" +
-                 "        ApplySource();\n" +
-                 "        if (this.sets.Length == 0) { return \"\"; }\n" +
-                 "        if (this.w.Length == 0) { return \"\"; }\n" +
-                 "        return \"UPDATE \" + this.tbl + \" SET \" + " +
-                 "this.sets\n" +
-                 "            + \" WHERE \" + this.w;\n" +
-                 "    }\n" +
-                 "    int ExecuteAffrows() {\n" +
-                 "        string sql = BuildUpdate();\n" +
-                 "        if (sql.Length == 0) { return 0; }\n" +
-                 "        return this.db.Execute(sql, " +
-                 "__DbBind.Cat(this.sp, this.wp));\n" +
-                 "    }\n" +
-                 "    async int ExecuteAffrowsAsync() {\n" +
-                 "        string sql = BuildUpdate();\n" +
-                 "        if (sql.Length == 0) { return 0; }\n" +
-                 "        DbParams ps = __DbBind.Cat(this.sp, this.wp);\n" +
-                 "        return await this.db.ExecuteAsync(sql, ps);\n" +
-                 "    }\n" +
-                 "}\n");
-    }
-
-    /// __DbD_<E>:DELETE(Where 链)。
-    static void GenDelete(StringBuilder b, string cls, string tbl) {
-        b.Append("class __DbD_" + cls + " {\n" +
-                 "    IDbExecutor db;\n" +
-                 "    string tbl;\n" +
-                 "    string w;\n" +
-                 "    DbParams ps;\n" +
-                 "    bool on;\n" +
-                 "    static __DbD_" + cls + " Create(IDbExecutor db) {\n" +
-                 "        __DbD_" + cls + " q = new __DbD_" + cls + "();\n" +
-                 "        q.db = db;\n" +
-                 "        q.tbl = \"" + tbl + "\";\n" +
-                 "        q.w = \"\";\n" +
-                 "        q.ps = new DbParams();\n" +
-                 "        q.on = true;\n" +
-                 "        return q;\n" +
-                 "    }\n" +
-                 "    __DbD_" + cls + " AsTable(string t) { this.tbl = t; " +
-                 "return this; }\n" +
-                 "    __DbD_" + cls + " CondBegin(bool c) { this.on = c; " +
-                 "return this; }\n" +
-                 "    __DbD_" + cls + " CondEnd() { this.on = true; " +
-                 "return this; }\n" +
-                 "    __DbD_" + cls + " W(string f) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        string u = __DbBind.Unalias(f);\n" +
-                 "        if (this.w.Length == 0) { this.w = u; }\n" +
-                 "        else { this.w = this.w + \" AND \" + u; }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbD_" + cls + " WhereDict(DbValues v) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < v.Count()) {\n" +
-                 "            string c = " + cls + "Cols.Require(v.NameAt(i));\n" +
-                 "            W(c + \" = ?\");\n" +
-                 "            v.BindAs(this.ps, i, " + cls +
-                 "Cols.Kind(c));\n" +
-                 "            i = i + 1;\n" +
-                 "        }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbD_" + cls + " P(string v) {\n" +
-                 "        if (this.on) { this.ps.Add(v); }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbD_" + cls + " Pi(int v) {\n" +
-                 "        if (this.on) { this.ps.AddInt(v); }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbD_" + cls + " Pl(long v) {\n" +
-                 "        if (this.on) { this.ps.AddLong(v); }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbD_" + cls + " Pd(double v) {\n" +
-                 "        if (this.on) { this.ps.AddDouble(v); }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbD_" + cls + " InI(List<int> vs) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < vs.Count) { this.ps.AddInt(vs[i]); " +
-                 "i = i + 1; }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbD_" + cls + " InL(List<long> vs) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < vs.Count) { this.ps.AddLong(vs[i]); " +
-                 "i = i + 1; }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbD_" + cls + " InS(List<string> vs) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < vs.Count) { this.ps.Add(vs[i]); " +
-                 "i = i + 1; }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    __DbD_" + cls + " InD(List<double> vs) {\n" +
-                 "        if (!this.on) { return this; }\n" +
-                 "        int i = 0;\n" +
-                 "        while (i < vs.Count) { this.ps.AddDouble(vs[i]); " +
-                 "i = i + 1; }\n" +
-                 "        return this;\n" +
-                 "    }\n" +
-                 "    int ExecuteAffrows() {\n" +
-                 "        if (this.w.Length == 0) { return 0; }\n" +
-                 "        string sql = \"DELETE FROM \" + this.tbl + " +
-                 "\" WHERE \" + this.w;\n" +
-                 "        return this.db.Execute(sql, this.ps);\n" +
-                 "    }\n" +
-                 "    async int ExecuteAffrowsAsync() {\n" +
-                 "        if (this.w.Length == 0) { return 0; }\n" +
-                 "        string sql = \"DELETE FROM \" + this.tbl + " +
-                 "\" WHERE \" + this.w;\n" +
-                 "        return await this.db.ExecuteAsync(sql, this.ps);\n" +
-                 "    }\n" +
-                 "}\n");
-    }
-
-    /// 复合主键的列清单(两列及以上时才有:一列的主键仍写在列定义里)。
-    /// identity 列自带 PRIMARY KEY,不参与表级约束。
-    static string PkList(List<DbField> fs) {
-        StringBuilder sb = new StringBuilder();
-        int n = 0;
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            DbField f = fs[i];
-            if (f.Kind == 5 || !f.IsPk || f.IsIdent) { continue; }
-            if (n > 0) { sb.Append(", "); }
-            sb.Append(f.Col);
-            n = n + 1;
-        }
-        if (n < 2) { return ""; }
-        return sb.ToString();
     }
 
     /// 只有标识符字符的名字才写进 DDL:索引名来自实体上的字面量,
@@ -1264,9 +220,9 @@ class GenDbEmit {
     }
 
     /// 实体 `[Index(Name=, Fields=, IsUnique=)]` -> 每条索引一行
-    /// `__DbBind.EnsureIndex(db, name, tbl, cols, unique)` 的实参文本。
-    /// `Fields` 写的是实体字段名,进语句的是它们的物理列名;既有表也补建
-    /// 缺失的索引(存在性由 __DbBind 按方言判断)。
+    /// `m.Index(name, cols, unique)` 的实参文本。`Fields` 写的是实体
+    /// 字段名,进语句的是它们的物理列名;既有表也补建缺失的索引
+    /// (存在性由 OrmDialect 按方言判断)。
     static List<string> IndexArgs(string cls, List<DbField> fs, string tbl) {
         List<string> outl = new List<string>();
         List<JsonValue> attrs = GenDb.IndexAttrs(cls);
@@ -1299,119 +255,407 @@ class GenDbEmit {
                 GenDb.Diag(a, "Index Name must be an identifier: " + nm);
                 return new List<string>();
             }
-            outl.Add("db, \"" + nm + "\", t, \"" + cols.ToString() + "\", " +
-                     (GenDb.AttrBool(a, "IsUnique", false) ? "true"
-                                                           : "false"));
+            outl.Add("\"" + nm + "\", \"" + cols.ToString() + "\", "
+                     + GenDbEmit.Bl(GenDb.AttrBool(a, "IsUnique", false)));
         }
         return outl;
     }
 
-    /// __DbCF_<E>:CodeFirst(缺表建表,缺列加列;同步 + 异步)。
+    /// `<Entity>Cols`:表名 + 列名常量 + Has/Kind/Require + 运行期元数据。
+    /// 元数据只建一次(静态缓存),SQL 片段的缓存挂在它上面。
+    static void GenCols(StringBuilder b, string cls, List<DbField> fs,
+                        string tbl) {
+        b.Append("class " + cls + "Cols {\n");
+        /* 表名常量:让内省/运维接口拿到物理表名,而不是业务侧再写一遍
+         * 字面量。实体自己有 Table 字段时让位给它。 */
+        if (GenDb.FieldFind(fs, "Table") == null) {
+            b.Append("    static string Table = \"" + tbl + "\";\n");
+        }
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            DbField f = fs[i];
+            if (f.Kind == 5) { continue; }
+            b.Append("    static string " + f.Name + " = \"" + f.Col +
+                     "\";\n");
+        }
+        /* 运行期元数据:列、导航连接、索引 */
+        b.Append("    static OrmMeta __M;\n" +
+                 "    static OrmMeta __Meta() {\n" +
+                 "        if (" + cls + "Cols.__M != null) { return " + cls +
+                 "Cols.__M; }\n" +
+                 "        OrmMeta m = OrmMeta.Of(\"" + cls + "\", \"" + tbl +
+                 "\");\n");
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            DbField f = fs[i];
+            if (f.Kind == 5) { continue; }
+            b.Append("        m.Col(" + GenDbEmit.ColArgs(f) + ");\n");
+        }
+        int nv = 0;
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            DbField f = fs[i];
+            if (f.Kind != 5) { continue; }
+            string v = "n" + Convert.ToString(nv);
+            b.Append("        OrmNav " + v + " = m.Nav(\"" + f.Name +
+                     "\", \"" + GenDb.TableOf(f.TypeName) + "\");\n");
+            List<DbField> nfs = GenDb.FieldsOf(f.TypeName, 0);
+            for (int k = 0; k < nfs.Count; k = k + 1) {
+                DbField g = nfs[k];
+                if (g.Kind == 5) { continue; }
+                b.Append("        " + v + ".Col(\"" + g.Col + "\", \"" +
+                         g.Name + "\", " + Convert.ToString(g.Kind) + ", " +
+                         GenDbEmit.Bl(GenDbEmit.Is64(g.TypeName)) + ");\n");
+            }
+            nv = nv + 1;
+        }
+        List<string> ixs = GenDbEmit.IndexArgs(cls, fs, tbl);
+        for (int i = 0; i < ixs.Count; i = i + 1) {
+            b.Append("        m.Index(" + ixs[i] + ");\n");
+        }
+        b.Append("        " + cls + "Cols.__M = m;\n" +
+                 "        return m;\n" +
+                 "    }\n");
+        b.Append("    static bool Has(string c) { return " + cls +
+                 "Cols.__Meta().Has(c); }\n" +
+                 "    static int Kind(string c) { return " + cls +
+                 "Cols.__Meta().KindOf(c); }\n" +
+                 "    static string Require(string c) { return " + cls +
+                 "Cols.__Meta().Require(c); }\n" +
+                 "}\n");
+    }
+
+    /// 查询门面 __DbQ_<E>:链式方法转发给 OrmSelect,只有行映射与终端
+    /// 需要实体类型。
+    static void GenEntity(StringBuilder b, string cls) {
+        List<DbField> fs = GenDb.FieldsOf(cls, 0);
+        string q = "__DbQ_" + cls;
+        b.Append("class " + q + " {\n" +
+                 "    OrmSelect q;\n" +
+                 "    static " + q + " Create(IDbExecutor db) {\n" +
+                 "        " + q + " r = new " + q + "();\n" +
+                 "        r.q = OrmSelect.Create(db, " + cls +
+                 "Cols.__Meta());\n" +
+                 "        return r;\n" +
+                 "    }\n");
+        b.Append("    " + q + " W(string f) { this.q.W(f); return this; }\n" +
+                 "    " + q + " Where(Expr<" + cls + "> e) {\n" +
+                 "        if (e == null) { return this; }\n" +
+                 "        this.q.WExpr(e.Root);\n" +
+                 "        return this;\n" +
+                 "    }\n" +
+                 "    " + q + " WhereDict(DbValues v) { this.q.WhereDict(v); " +
+                 "return this; }\n" +
+                 "    " + q + " CondBegin(bool c) { this.q.CondBegin(c); " +
+                 "return this; }\n" +
+                 "    " + q + " CondEnd() { this.q.CondEnd(); return this; }\n" +
+                 "    " + q + " AsTable(string t) { this.q.AsTable(t); " +
+                 "return this; }\n" +
+                 "    " + q + " P(string v) { this.q.P(v); return this; }\n" +
+                 "    " + q + " Pi(int v) { this.q.Pi(v); return this; }\n" +
+                 "    " + q + " Pl(long v) { this.q.Pl(v); return this; }\n" +
+                 "    " + q + " Pd(double v) { this.q.Pd(v); return this; }\n" +
+                 "    " + q + " InI(List<int> vs) { this.q.InI(vs); " +
+                 "return this; }\n" +
+                 "    " + q + " InL(List<long> vs) { this.q.InL(vs); " +
+                 "return this; }\n" +
+                 "    " + q + " InS(List<string> vs) { this.q.InS(vs); " +
+                 "return this; }\n" +
+                 "    " + q + " InD(List<double> vs) { this.q.InD(vs); " +
+                 "return this; }\n" +
+                 "    " + q + " OB(string col) { this.q.OB(col); " +
+                 "return this; }\n" +
+                 "    " + q + " OBD(string col) { this.q.OBD(col); " +
+                 "return this; }\n" +
+                 "    " + q + " GB(string col) { this.q.GB(col); " +
+                 "return this; }\n" +
+                 "    " + q + " OBK() { this.q.OBK(); return this; }\n" +
+                 "    " + q + " OBDK() { this.q.OBDK(); return this; }\n" +
+                 "    " + q + " H(string f) { this.q.H(f); return this; }\n" +
+                 "    " + q + " DISTINCT() { this.q.DISTINCT(); " +
+                 "return this; }\n" +
+                 "    " + q + " Take(int n) { this.q.Take(n); return this; }\n" +
+                 "    " + q + " Skip(int n) { this.q.SkipN(n); " +
+                 "return this; }\n" +
+                 "    " + q + " Limit(int n) { this.q.Take(n); " +
+                 "return this; }\n" +
+                 "    " + q + " Offset(int n) { this.q.SkipN(n); " +
+                 "return this; }\n" +
+                 "    " + q + " Page(int index, int size) { " +
+                 "this.q.Page(index, size); return this; }\n");
+        /* 导航字段:包含哪个连接由运行期的开关记着 */
+        int nv = 0;
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            if (fs[i].Kind != 5) { continue; }
+            b.Append("    " + q + " Inc_" + fs[i].Name + "() { this.q.Include(" +
+                     Convert.ToString(nv) + "); return this; }\n");
+            nv = nv + 1;
+        }
+        /* 行映射:实体自身列由共享实现按元数据填,连接出来的实体只需要
+         * 一处 new(类型在编译期才有) */
+        b.Append("    List<" + cls + "> MapRows(DbResult r) {\n" +
+                 "        List<" + cls + "> outp = new List<" + cls +
+                 ">();\n" +
+                 "        OrmMeta m = " + cls + "Cols.__Meta();\n" +
+                 "        int row = 0;\n" +
+                 "        while (row < r.RowCount()) {\n" +
+                 "            " + cls + " o = __DbM_" + cls +
+                 ".Read(m.Cols, r, row, 0);\n");
+        nv = 0;
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            if (fs[i].Kind != 5) { continue; }
+            DbField f = fs[i];
+            string ix = Convert.ToString(nv);
+            b.Append("            if (this.q.NavOn(" + ix + ")) {\n" +
+                     "                OrmNav nav" + ix + " = m.Navs[" + ix +
+                     "];\n" +
+                     "                int at" + ix + " = this.q.NavAt(" + ix +
+                     ");\n" +
+                     "                if (!r.IsNull(row, at" + ix +
+                     " + nav" + ix + ".PkAt)) {\n" +
+                     "                    o." + f.Name + " = __DbM_" +
+                     f.TypeName + ".Read(nav" + ix + ".Cols, r, row, at" +
+                     ix + ");\n" +
+                     "                }\n" +
+                     "            }\n");
+            nv = nv + 1;
+        }
+        b.Append("            outp.Add(o);\n" +
+                 "            row = row + 1;\n" +
+                 "        }\n" +
+                 "        return outp;\n" +
+                 "    }\n");
+        /* 终端:两个孪生版本,异步版给网络驱动,同步版给内嵌驱动 */
+        b.Append("    List<" + cls + "> ToList() { return " +
+                 "MapRows(this.q.Rows()); }\n" +
+                 "    async List<" + cls + "> ToListAsync() {\n" +
+                 "        DbResult r = await this.q.RowsAsync();\n" +
+                 "        return MapRows(r);\n" +
+                 "    }\n" +
+                 "    List<string> ToListCol(string col) { return " +
+                 "this.q.ToListCol(col); }\n" +
+                 "    async List<string> ToListColAsync(string col) {\n" +
+                 "        return await this.q.ToListColAsync(col);\n" +
+                 "    }\n");
+        GenDbEmit.Projections(b, cls);
+        b.Append("    " + cls + " First() {\n" +
+                 "        this.q.One();\n" +
+                 "        List<" + cls + "> l = ToList();\n" +
+                 "        if (l.Count > 0) { return l[0]; }\n" +
+                 "        return null;\n" +
+                 "    }\n" +
+                 "    " + cls + " FirstOrDefault() { return First(); }\n" +
+                 "    " + cls + " ToOne() { return First(); }\n" +
+                 "    async " + cls + " FirstAsync() {\n" +
+                 "        this.q.One();\n" +
+                 "        List<" + cls + "> l = await ToListAsync();\n" +
+                 "        if (l.Count > 0) { return l[0]; }\n" +
+                 "        return null;\n" +
+                 "    }\n" +
+                 "    async " + cls + " FirstOrDefaultAsync() { return await " +
+                 "FirstAsync(); }\n" +
+                 "    async " + cls + " ToOneAsync() { return await " +
+                 "FirstAsync(); }\n");
+        b.Append("    int Count() { return this.q.Count(); }\n" +
+                 "    async int CountAsync() { return await " +
+                 "this.q.CountAsync(); }\n" +
+                 "    bool Any() { return this.q.Any(); }\n" +
+                 "    async bool AnyAsync() { return await " +
+                 "this.q.AnyAsync(); }\n" +
+                 "    DbResult AggR(string expr) { return " +
+                 "this.q.AggR(expr); }\n" +
+                 "    int AggI(string expr) { return this.q.AggI(expr); }\n" +
+                 "    long AggL(string expr) { return this.q.AggL(expr); }\n" +
+                 "    double AggD(string expr) { return " +
+                 "this.q.AggD(expr); }\n" +
+                 "    async DbResult AggRAsync(string expr) { return await " +
+                 "this.q.AggRAsync(expr); }\n" +
+                 "    async int AggIAsync(string expr) { return await " +
+                 "this.q.AggIAsync(expr); }\n" +
+                 "    async long AggLAsync(string expr) { return await " +
+                 "this.q.AggLAsync(expr); }\n" +
+                 "    async double AggDAsync(string expr) { return await " +
+                 "this.q.AggDAsync(expr); }\n" +
+                 "}\n");
+    }
+
+    /// 插入门面 __DbI_<E>:行列表/动态列/Only/Skip/Upsert 都转发给
+    /// OrmInsert,只有实体类型的重载需要在这里。
+    static void GenInsert(StringBuilder b, string cls, List<DbField> fs,
+                          string tbl) {
+        string q = "__DbI_" + cls;
+        b.Append("class " + q + " {\n" +
+                 "    OrmInsert q;\n" +
+                 "    __DbB_" + cls + " rows;\n" +
+                 "    static " + q + " Create(IDbExecutor db) {\n" +
+                 "        " + q + " r = new " + q + "();\n" +
+                 "        r.q = OrmInsert.Create(db, " + cls +
+                 "Cols.__Meta());\n" +
+                 "        r.rows = __DbB_" + cls + ".New();\n" +
+                 "        r.q.SetRows(r.rows);\n" +
+                 "        return r;\n" +
+                 "    }\n" +
+                 "    static " + q + " Create(IDbExecutor db, " + cls +
+                 " o) { return " + q + ".Create(db).AppendData(o); }\n" +
+                 "    static " + q + " Create(IDbExecutor db, List<" + cls +
+                 "> l) { return " + q + ".Create(db).AppendData(l); }\n" +
+                 "    " + q + " AppendData(" + cls + " o) { " +
+                 "this.rows.Add(o); return this; }\n" +
+                 "    " + q + " AppendData(List<" + cls + "> l) {\n" +
+                 "        int i = 0;\n" +
+                 "        while (i < l.Count) { this.rows.Add(l[i]); " +
+                 "i = i + 1; }\n" +
+                 "        return this;\n" +
+                 "    }\n" +
+                 "    " + q + " AppendDict(DbValues v) { this.q.AddDict(v); " +
+                 "return this; }\n" +
+                 "    " + q + " AppendDict(List<DbValues> l) {\n" +
+                 "        int i = 0;\n" +
+                 "        while (i < l.Count) { this.q.AddDict(l[i]); " +
+                 "i = i + 1; }\n" +
+                 "        return this;\n" +
+                 "    }\n" +
+                 "    " + q + " AsTable(string t) { this.q.AsTable(t); " +
+                 "return this; }\n" +
+                 "    " + q + " Only(string c) { this.q.Only(c); " +
+                 "return this; }\n" +
+                 "    " + q + " Skip(string c) { this.q.Skip(c); " +
+                 "return this; }\n" +
+                 "    " + q + " OC(string c) { this.q.OC(c); " +
+                 "return this; }\n" +
+                 "    " + q + " ACC(string c) { this.q.ACC(c); " +
+                 "return this; }\n" +
+                 "    " + q + " GMX(string c) { this.q.GMX(c); " +
+                 "return this; }\n" +
+                 "    " + q + " GMN(string c) { this.q.GMN(c); " +
+                 "return this; }\n" +
+                 "    " + q + " NOP() { this.q.NOP(); return this; }\n" +
+                 "    int ExecuteAffrows() { return " +
+                 "this.q.ExecuteAffrows(); }\n" +
+                 "    async int ExecuteAffrowsAsync() { return await " +
+                 "this.q.ExecuteAffrowsAsync(); }\n" +
+                 "    int ExecuteIdentity() { return " +
+                 "this.q.ExecuteIdentity(); }\n" +
+                 "    async int ExecuteIdentityAsync() { return await " +
+                 "this.q.ExecuteIdentityAsync(); }\n" +
+                 "}\n");
+    }
+
+    /// 更新门面 __DbU_<E>：Set/SetIncr/Where 链转发给 OrmUpdate；
+    /// 实体整体更新在运行期按元数据展开。
+    static void GenUpdate(StringBuilder b, string cls, List<DbField> fs,
+                          string tbl) {
+        string q = "__DbU_" + cls;
+        b.Append("class " + q + " {\n" +
+                 "    OrmUpdate q;\n" +
+                 "    static " + q + " Create(IDbExecutor db) {\n" +
+                 "        " + q + " r = new " + q + "();\n" +
+                 "        r.q = OrmUpdate.Create(db, " + cls +
+                 "Cols.__Meta());\n" +
+                 "        return r;\n" +
+                 "    }\n" +
+                 "    " + q + " AsTable(string t) { this.q.AsTable(t); " +
+                 "return this; }\n" +
+                 "    " + q + " Only(string c) { this.q.Only(c); " +
+                 "return this; }\n" +
+                 "    " + q + " Skip(string c) { this.q.Skip(c); " +
+                 "return this; }\n" +
+                 "    " + q + " SetDict(DbValues v) { this.q.SetDict(v); " +
+                 "return this; }\n" +
+                 "    " + q + " WhereDict(DbValues v) { this.q.WhereDict(v); " +
+                 "return this; }\n" +
+                 "    " + q + " CondBegin(bool c) { this.q.CondBegin(c); " +
+                 "return this; }\n" +
+                 "    " + q + " CondEnd() { this.q.CondEnd(); return this; }\n" +
+                 "    " + q + " W(string f) { this.q.W(f); return this; }\n" +
+                 "    " + q + " P(string v) { this.q.P(v); return this; }\n" +
+                 "    " + q + " Pi(int v) { this.q.Pi(v); return this; }\n" +
+                 "    " + q + " Pl(long v) { this.q.Pl(v); return this; }\n" +
+                 "    " + q + " Pd(double v) { this.q.Pd(v); return this; }\n" +
+                 "    " + q + " InI(List<int> vs) { this.q.InI(vs); " +
+                 "return this; }\n" +
+                 "    " + q + " InL(List<long> vs) { this.q.InL(vs); " +
+                 "return this; }\n" +
+                 "    " + q + " InS(List<string> vs) { this.q.InS(vs); " +
+                 "return this; }\n" +
+                 "    " + q + " InD(List<double> vs) { this.q.InD(vs); " +
+                 "return this; }\n" +
+                 "    " + q + " Frag(string f) { this.q.Frag(f); " +
+                 "return this; }\n" +
+                 "    " + q + " SetI(string c, int v) { this.q.SetI(c, v); " +
+                 "return this; }\n" +
+                 "    " + q + " SetL(string c, long v) { this.q.SetL(c, v); " +
+                 "return this; }\n" +
+                 "    " + q + " SetD(string c, double v) { " +
+                 "this.q.SetD(c, v); return this; }\n" +
+                 "    " + q + " SetS(string c, string v) { " +
+                 "this.q.SetS(c, v); return this; }\n" +
+                 "    " + q + " SetB(string c, bool v) { this.q.SetB(c, v); " +
+                 "return this; }\n" +
+                 "    " + q + " SetIncrI(string c, int v) { " +
+                 "this.q.SetIncrI(c, v); return this; }\n" +
+                 "    " + q + " SetIncrL(string c, long v) { " +
+                 "this.q.SetIncrL(c, v); return this; }\n" +
+                 "    " + q + " SetIncrD(string c, double v) { " +
+                 "this.q.SetIncrD(c, v); return this; }\n" +
+                 "    " + q + " SetSource(" + cls + " o) {\n" +
+                 "        __DbB_" + cls + " b = __DbB_" + cls + ".New();\n" +
+                 "        b.Add(o);\n" +
+                 "        this.q.SetSource(b);\n" +
+                 "        return this;\n" +
+                 "    }\n" +
+                 "    int ExecuteAffrows() { return " +
+                 "this.q.ExecuteAffrows(); }\n" +
+                 "    async int ExecuteAffrowsAsync() { return await " +
+                 "this.q.ExecuteAffrowsAsync(); }\n" +
+                 "}\n");
+    }
+
+    /// 删除门面 __DbD_<E>：Where 链转发给 OrmDelete。
+    static void GenDelete(StringBuilder b, string cls, List<DbField> fs,
+                          string tbl) {
+        string q = "__DbD_" + cls;
+        b.Append("class " + q + " {\n" +
+                 "    OrmDelete q;\n" +
+                 "    static " + q + " Create(IDbExecutor db) {\n" +
+                 "        " + q + " r = new " + q + "();\n" +
+                 "        r.q = OrmDelete.Create(db, " + cls +
+                 "Cols.__Meta());\n" +
+                 "        return r;\n" +
+                 "    }\n" +
+                 "    " + q + " AsTable(string t) { this.q.AsTable(t); " +
+                 "return this; }\n" +
+                 "    " + q + " CondBegin(bool c) { this.q.CondBegin(c); " +
+                 "return this; }\n" +
+                 "    " + q + " CondEnd() { this.q.CondEnd(); return this; }\n" +
+                 "    " + q + " W(string f) { this.q.W(f); return this; }\n" +
+                 "    " + q + " WhereDict(DbValues v) { this.q.WhereDict(v); " +
+                 "return this; }\n" +
+                 "    " + q + " P(string v) { this.q.P(v); return this; }\n" +
+                 "    " + q + " Pi(int v) { this.q.Pi(v); return this; }\n" +
+                 "    " + q + " Pl(long v) { this.q.Pl(v); return this; }\n" +
+                 "    " + q + " Pd(double v) { this.q.Pd(v); return this; }\n" +
+                 "    " + q + " InI(List<int> vs) { this.q.InI(vs); " +
+                 "return this; }\n" +
+                 "    " + q + " InL(List<long> vs) { this.q.InL(vs); " +
+                 "return this; }\n" +
+                 "    " + q + " InS(List<string> vs) { this.q.InS(vs); " +
+                 "return this; }\n" +
+                 "    " + q + " InD(List<double> vs) { this.q.InD(vs); " +
+                 "return this; }\n" +
+                 "    int ExecuteAffrows() { return " +
+                 "this.q.ExecuteAffrows(); }\n" +
+                 "    async int ExecuteAffrowsAsync() { return await " +
+                 "this.q.ExecuteAffrowsAsync(); }\n" +
+                 "}\n");
+    }
+
+    /// CodeFirst 门面 __DbCF_<E>：建表/加列/补索引都由 OrmSync 按元数据做。
     static void GenCodeFirst(StringBuilder b, string cls, List<DbField> fs,
                              string tbl) {
-        /* 复合主键:列定义里不能各自带 PRIMARY KEY,键写成表级约束 */
-        string pks = GenDbEmit.PkList(fs);
-        bool comp = pks.Length > 0;
-        List<string> ixs = GenDbEmit.IndexArgs(cls, fs, tbl);
         b.Append("class __DbCF_" + cls + " {\n" +
-                 "    static void Sync(IDbExecutor db) {\n" +
-                 "        int p = db.GetProvider();\n" +
-                 "        string t = \"" + tbl + "\";\n" +
-                 "        if (!__DbBind.HasTable(db, t)) {\n" +
-                 "            string ddl = \"CREATE TABLE \" + t + \" (\";\n");
-        bool first = true;
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            DbField f = fs[i];
-            if (f.Kind == 5) { continue; }
-            b.Append("            ddl = ddl + \"" +
-                     (first ? "" : ", ") + f.Col + " \" + __DbBind.Ty(p, " +
-                     Convert.ToString(GenDbEmit.TyCodeOf(f)) + ", " +
-                     (f.IsPk && !comp ? "true" : "false") + ", " +
-                     (f.IsIdent ? "true" : "false") + ", " +
-                     Convert.ToString(f.StrLen) + ");\n");
-            first = false;
-        }
-        if (comp) {
-            b.Append("            ddl = ddl + \", PRIMARY KEY (" + pks +
-                     ")\";\n");
-        }
-        b.Append("            ddl = ddl + \")\";\n" +
-                 "            db.Execute(ddl);\n");
-        for (int i = 0; i < ixs.Count; i = i + 1) {
-            b.Append("            __DbBind.EnsureIndex(" + ixs[i] +
-                     ");\n");
-        }
-        b.Append("            return;\n" +
-                 "        }\n" +
-                 "        List<string> have = __DbBind.Cols(db, t);\n");
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            DbField f = fs[i];
-            if (f.Kind == 5) { continue; }
-            b.Append("        if (!__DbBind.Has(have, \"" + f.Col +
-                     "\")) {\n" +
-                     "            db.Execute(\"ALTER TABLE \" + t + " +
-                     "\" ADD COLUMN " + f.Col + " \"\n" +
-                     "                + __DbBind.Ty(p, " +
-                     Convert.ToString(GenDbEmit.TyCodeOf(f)) +
-                     ", false, false, " + Convert.ToString(f.StrLen) +
-                     "));\n" +
-                     "        }\n");
-        }
-        for (int i = 0; i < ixs.Count; i = i + 1) {
-            b.Append("        __DbBind.EnsureIndex(" + ixs[i] + ");\n");
-        }
-        b.Append("    }\n");
-        /* 异步孪生:同样的 DDL,await,非阻塞驱动可用 */
-        b.Append("    static async void SyncAsync(IDbExecutor db) {\n" +
-                 "        int p = db.GetProvider();\n" +
-                 "        string t = \"" + tbl + "\";\n" +
-                 "        bool exists = await __DbBind.HasTableAsync(db, t);\n" +
-                 "        if (!exists) {\n" +
-                 "            string ddl = \"CREATE TABLE \" + t + \" (\";\n");
-        first = true;
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            DbField f = fs[i];
-            if (f.Kind == 5) { continue; }
-            b.Append("            ddl = ddl + \"" +
-                     (first ? "" : ", ") + f.Col + " \" + __DbBind.Ty(p, " +
-                     Convert.ToString(GenDbEmit.TyCodeOf(f)) + ", " +
-                     (f.IsPk && !comp ? "true" : "false") + ", " +
-                     (f.IsIdent ? "true" : "false") + ", " +
-                     Convert.ToString(f.StrLen) + ");\n");
-            first = false;
-        }
-        if (comp) {
-            b.Append("            ddl = ddl + \", PRIMARY KEY (" + pks +
-                     ")\";\n");
-        }
-        b.Append("            ddl = ddl + \")\";\n" +
-                 "            int _c = await db.ExecuteAsync(ddl);\n");
-        for (int i = 0; i < ixs.Count; i = i + 1) {
-            b.Append("            await __DbBind.EnsureIndexAsync(" +
-                     ixs[i] + ");\n");
-        }
-        b.Append("            return;\n" +
-                 "        }\n" +
-                 "        List<string> have = await " +
-                 "__DbBind.ColsAsync(db, t);\n");
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            DbField f = fs[i];
-            if (f.Kind == 5) { continue; }
-            b.Append("        if (!__DbBind.Has(have, \"" + f.Col +
-                     "\")) {\n" +
-                     "            string alter = \"ALTER TABLE \" + t + " +
-                     "\" ADD COLUMN " + f.Col + " \"\n" +
-                     "                + __DbBind.Ty(p, " +
-                     Convert.ToString(GenDbEmit.TyCodeOf(f)) +
-                     ", false, false, " + Convert.ToString(f.StrLen) + ");\n" +
-                     "            int _a = await db.ExecuteAsync(alter);\n" +
-                     "        }\n");
-        }
-        for (int i = 0; i < ixs.Count; i = i + 1) {
-            b.Append("        await __DbBind.EnsureIndexAsync(" + ixs[i] +
-                     ");\n");
-        }
-        b.Append("    }\n}\n");
+                 "    static void Sync(IDbExecutor db) { OrmSync.Sync(db, " +
+                 cls + "Cols.__Meta()); }\n" +
+                 "    static async void SyncAsync(IDbExecutor db) { await " +
+                 "OrmSync.SyncAsync(db, " + cls + "Cols.__Meta()); }\n" +
+                 "}\n");
     }
 
     /// 汇总 __DbBind + 各实体类,产出整段生成源码。
@@ -1421,7 +665,9 @@ class GenDbEmit {
         /* 生成的查询类拼写 lambda 槽类型 `Expr<T>`,它在 System.Linq;
          * 程序本身无需导入 */
         outb.Append("using System.Linq;\nusing System.Data.Orm;\n");
-        outb.Append("class __DbBind {\n");
+        outb.Append("class __DbBind {\n" +
+                    /* 重写后的 WHERE 片段用它拼 IN 列表的占位符 */
+                    "    static string M(int n) { return OrmDialect.Marks(n); }\n");
         for (int i = 0; i < need.Count; i = i + 1) {
             string cls = need[i];
             outb.Append("    static __DbQ_" + cls + " Q_" + cls +
@@ -1460,342 +706,32 @@ class GenDbEmit {
             }
             outb.Append("    }\n");
         }
-        outb.Append("    static string M(int n) {\n" +
-                    "        StringBuilder sb = new StringBuilder();\n" +
-                    "        int i = 0;\n" +
-                    "        while (i < n) {\n" +
-                    "            if (i > 0) { sb.Append(\", \"); }\n" +
-                    "            sb.Append(\"?\");\n" +
-                    "            i = i + 1;\n" +
-                    "        }\n" +
-                    "        if (sb.Length == 0) { sb.Append(\"NULL\"); }\n" +
-                    "        return sb.ToString();\n" +
-                    "    }\n" +
-                    "    static bool Has(List<string> l, string v) {\n" +
-                    "        int i = 0;\n" +
-                    "        while (i < l.Count) {\n" +
-                    "            if (l[i] == v) { return true; }\n" +
-                    "            i = i + 1;\n" +
-                    "        }\n" +
-                    "        return false;\n" +
-                    "    }\n");
-        /* Upsert 的方言差异集中在这三个helper里:PostgreSQL/SQLite 写
-         * `ON CONFLICT (keys) DO UPDATE SET c = excluded.c`,MySQL 写
-         * `ON DUPLICATE KEY UPDATE c = VALUES(c)`(它按已有的唯一键判冲
-         * 突,不接受键列表)。取大/取小在 SQLite 是 max/min,别的方言是
-         * GREATEST/LEAST。MERGE 方言(SQL Server/Oracle)没有等价单句写
-         * 法,与其发一条会在运行时报语法错的语句,不如当场说清楚。 */
-        outb.Append("    static string ConflictHead(int p, List<string> keys, " +
-                    "bool nop) {\n" +
-                    "        bool my = p == DbProvider.MySQL || p == " +
-                    "DbProvider.MariaDB;\n" +
-                    "        bool pg = p == DbProvider.PostgreSQL" +
-                    " || p == DbProvider.OpenGauss || p == DbProvider.Kingbase;\n" +
-                    "        if (!my && !pg && p != DbProvider.SQLite) {\n" +
-                    "            throw new Exception(\"Upsert (OnConflict) is " +
-                    "not supported on this provider\");\n" +
-                    "        }\n" +
-                    "        if (my) {\n" +
-                    "            if (nop) {\n" +
-                    "                return \" ON DUPLICATE KEY UPDATE \" + " +
-                    "keys[0] + \" = \" + keys[0];\n" +
-                    "            }\n" +
-                    "            return \" ON DUPLICATE KEY UPDATE \";\n" +
-                    "        }\n" +
-                    "        StringBuilder sb = new StringBuilder();\n" +
-                    "        sb.Append(\" ON CONFLICT (\");\n" +
-                    "        int i = 0;\n" +
-                    "        while (i < keys.Count) {\n" +
-                    "            if (i > 0) { sb.Append(\", \"); }\n" +
-                    "            sb.Append(keys[i]);\n" +
-                    "            i = i + 1;\n" +
-                    "        }\n" +
-                    "        sb.Append(\")\");\n" +
-                    "        if (nop) { sb.Append(\" DO NOTHING\"); }\n" +
-                    "        else { sb.Append(\" DO UPDATE SET \"); }\n" +
-                    "        return sb.ToString();\n" +
-                    "    }\n" +
-                    "    static string Excl(int p, string c, int md) {\n" +
-                    "        bool my = p == DbProvider.MySQL || p == " +
-                    "DbProvider.MariaDB;\n" +
-                    "        string src = my ? \"VALUES(\" + c + \")\" : " +
-                    "\"excluded.\" + c;\n" +
-                    "        if (md == 1) { return c + \" = \" + c + \" + \" + " +
-                    "src; }\n" +
-                    "        if (md == 2 || md == 3) {\n" +
-                    "            string fn = md == 2 ? \"GREATEST\" : " +
-                    "\"LEAST\";\n" +
-                    "            if (p == DbProvider.SQLite) { fn = md == 2 ? " +
-                    "\"max\" : \"min\"; }\n" +
-                    "            return c + \" = \" + fn + \"(\" + c + \", \" + " +
-                    "src + \")\";\n" +
-                    "        }\n" +
-                    "        return c + \" = \" + src;\n" +
-                    "    }\n" +
-                    "    static int Mode(List<string> acc, List<string> mx, " +
-                    "List<string> mn, string c) {\n" +
-                    "        if (__DbBind.Has(acc, c)) { return 1; }\n" +
-                    "        if (__DbBind.Has(mx, c)) { return 2; }\n" +
-                    "        if (__DbBind.Has(mn, c)) { return 3; }\n" +
-                    "        return 0;\n" +
-                    "    }\n");
-        /* UPDATE/DELETE 在 SQLite 等没有表别名,WHERE 构建器发的
-         * `t.` 前缀在这里去掉 */
-        outb.Append("    static string Unalias(string f) { return " +
-                    "f.Replace(\"t.\", \"\"); }\n" +
-                    "    static DbParams Cat(DbParams a, DbParams b) {\n" +
-                    "        DbParams r = new DbParams();\n" +
-                    "        __DbBind.CopyInto(a, r);\n" +
-                    "        __DbBind.CopyInto(b, r);\n" +
-                    "        return r;\n" +
-                    "    }\n" +
-                    "    static void CopyInto(DbParams src, DbParams dst) {\n" +
-                    "        int i = 0;\n" +
-                    "        while (i < src.Count()) {\n" +
-                    "            int k = src.KindAt(i);\n" +
-                    "            if (k == DbParams.KindInt) { " +
-                    "dst.AddLong(src.IntAt(i)); }\n" +
-                    "            else if (k == DbParams.KindDouble) { " +
-                    "dst.AddDouble(src.DoubleAt(i)); }\n" +
-                    "            else if (k == DbParams.KindText) { " +
-                    "dst.Add(src.TextAt(i)); }\n" +
-                    "            else { dst.AddNull(); }\n" +
-                    "            i = i + 1;\n" +
-                    "        }\n" +
-                    "    }\n" +
-                    "    static string LastIdSql(IDbExecutor db) {\n" +
-                    "        int p = db.GetProvider();\n" +
-                    "        string sql = \"SELECT last_insert_rowid()\";\n" +
-                    "        if (p == DbProvider.MySQL || p == " +
-                    "DbProvider.MariaDB) {\n" +
-                    "            sql = \"SELECT LAST_INSERT_ID()\";\n" +
-                    "        } else if (p == DbProvider.PostgreSQL " +
-                    "|| p == DbProvider.OpenGauss || p == " +
-                    "DbProvider.Kingbase) {\n" +
-                    "            sql = \"SELECT lastval()\";\n" +
-                    "        } else if (p == DbProvider.SqlServer || p == " +
-                    "DbProvider.DM) {\n" +
-                    "            sql = \"SELECT SCOPE_IDENTITY()\";\n" +
-                    "        }\n" +
-                    "        return sql;\n" +
-                    "    }\n" +
-                    "    static int LastId(IDbExecutor db) {\n" +
-                    "        DbResult r = db.Query(__DbBind.LastIdSql(db));\n" +
-                    "        if (r.RowCount() == 0) { return 0; }\n" +
-                    "        return r.GetInt(0, 0);\n" +
-                    "    }\n" +
-                    "    static async int LastIdAsync(IDbExecutor db) {\n" +
-                    "        string sql = __DbBind.LastIdSql(db);\n" +
-                    "        DbResult r = await db.QueryAsync(sql);\n" +
-                    "        if (r.RowCount() == 0) { return 0; }\n" +
-                    "        return r.GetInt(0, 0);\n" +
-                    "    }\n" +
-                    "    static async bool HasTableAsync(IDbExecutor db, " +
-                    "string t) {\n" +
-                    "        string sql = __DbBind.HasTableSql(db);\n" +
-                    "        DbResult r = await db.QueryAsync(sql, " +
-                    "new DbParams().Add(t));\n" +
-                    "        if (r.RowCount() == 0) { return false; }\n" +
-                    "        return r.GetInt(0, 0) > 0;\n" +
-                    "    }\n" +
-                    "    static async List<string> ColsAsync(IDbExecutor db, " +
-                    "string t) {\n" +
-                    "        List<string> cols = new List<string>();\n" +
-                    "        int p = db.GetProvider();\n" +
-                    "        DbResult r;\n" +
-                    "        int nameCol = 0;\n" +
-                    "        if (p == DbProvider.SQLite) {\n" +
-                    "            string ps = \"PRAGMA table_info(\" + t + " +
-                    "\")\";\n" +
-                    "            r = await db.QueryAsync(ps);\n" +
-                    "            nameCol = 1;\n" +
-                    "        } else {\n" +
-                    "            string cs = \"SELECT column_name FROM" +
-                    " information_schema.columns WHERE table_name = ?\"\n" +
-                    "                + __DbBind.OwnScope(p);\n" +
-                    "            r = await db.QueryAsync(cs, " +
-                    "new DbParams().Add(t));\n" +
-                    "        }\n" +
-                    "        int i = 0;\n" +
-                    "        while (i < r.RowCount()) {\n" +
-                    "            cols.Add(r.GetString(i, nameCol));\n" +
-                    "            i = i + 1;\n" +
-                    "        }\n" +
-                    "        return cols;\n" +
-                    "    }\n");
-        /* information_schema 横跨 MySQL 服务器上每个数据库(PostgreSQL/
-         * SQL Server 上每个 schema),不加作用域会找到别人库里同名表,
-         * CodeFirst 于是"改"一张这里不存在的表。每个目录探测都限定在
-         * 连接自己的库/schema */
-        outb.Append("    static string OwnScope(int p) {\n" +
-                    "        if (p == DbProvider.MySQL || p == " +
-                    "DbProvider.MariaDB) {\n" +
-                    "            return \" AND table_schema = DATABASE()\";\n" +
-                    "        }\n" +
-                    "        if (p == DbProvider.PostgreSQL || p == " +
-                    "DbProvider.OpenGauss\n" +
-                    "                || p == DbProvider.Kingbase) {\n" +
-                    "            return \" AND table_schema = " +
-                    "current_schema()\";\n" +
-                    "        }\n" +
-                    "        if (p == DbProvider.SqlServer || p == " +
-                    "DbProvider.DM) {\n" +
-                    "            return \" AND table_schema = SCHEMA_NAME()\";\n" +
-                    "        }\n" +
-                    "        return \"\";\n" +
-                    "    }\n" +
-                    /* 二级索引:声明在实体上,缺了就补,已有就不动。
-                     * `CREATE INDEX IF NOT EXISTS` 不是各家都有的写法
-                     * (MySQL 没有),所以存在性自己按方言查。 */
-                    "    static string HasIndexSql(int p) {\n" +
-                    "        if (p == DbProvider.SQLite) {\n" +
-                    "            return \"SELECT COUNT(*) FROM sqlite_master" +
-                    " WHERE type = 'index' AND name = ?\";\n" +
-                    "        }\n" +
-                    "        bool my = p == DbProvider.MySQL || p == " +
-                    "DbProvider.MariaDB;\n" +
-                    "        if (my) {\n" +
-                    "            return \"SELECT COUNT(*) FROM " +
-                    "information_schema.statistics WHERE index_name = ?" +
-                    " AND table_schema = DATABASE()\";\n" +
-                    "        }\n" +
-                    "        return \"SELECT COUNT(*) FROM pg_indexes WHERE" +
-                    " indexname = ?\";\n" +
-                    "    }\n" +
-                    "    static string IndexDdl(int p, string nm, string t, " +
-                    "string cols, bool uniq) {\n" +
-                    "        return \"CREATE \" + (uniq ? \"UNIQUE \" : \"\")" +
-                    " + \"INDEX \" + nm + \" ON \" + t + \" (\" + cols + " +
-                    "\")\";\n" +
-                    "    }\n" +
-                    "    static void EnsureIndex(IDbExecutor db, string nm, " +
-                    "string t, string cols, bool uniq) {\n" +
-                    "        int p = db.GetProvider();\n" +
-                    "        DbResult r = db.Query(__DbBind.HasIndexSql(p), " +
-                    "new DbParams().Add(nm));\n" +
-                    "        if (r.RowCount() > 0 && r.GetInt(0, 0) > 0) { " +
-                    "return; }\n" +
-                    "        db.Execute(__DbBind.IndexDdl(p, nm, t, cols, " +
-                    "uniq));\n" +
-                    "    }\n" +
-                    "    static async void EnsureIndexAsync(IDbExecutor db, " +
-                    "string nm, string t, string cols, bool uniq) {\n" +
-                    "        int p = db.GetProvider();\n" +
-                    "        DbResult r = await db.QueryAsync(" +
-                    "__DbBind.HasIndexSql(p), new DbParams().Add(nm));\n" +
-                    "        if (r.RowCount() > 0 && r.GetInt(0, 0) > 0) { " +
-                    "return; }\n" +
-                    "        int _n = await db.ExecuteAsync(" +
-                    "__DbBind.IndexDdl(p, nm, t, cols, uniq));\n" +
-                    "    }\n" +
-                    "    static string HasTableSql(IDbExecutor db) {\n" +
-                    "        int p = db.GetProvider();\n" +
-                    "        string sql = \"SELECT COUNT(*) FROM " +
-                    "information_schema.tables" +
-                    " WHERE table_name = ?\" + __DbBind.OwnScope(p);\n" +
-                    "        if (p == DbProvider.SQLite) {\n" +
-                    "            sql = \"SELECT COUNT(*) FROM sqlite_master " +
-                    "WHERE" +
-                    " type = 'table' AND name = ?\";\n" +
-                    "        }\n" +
-                    "        return sql;\n" +
-                    "    }\n" +
-                    "    static bool HasTable(IDbExecutor db, string t) {\n" +
-                    "        int p = db.GetProvider();\n" +
-                    "        string sql = \"SELECT COUNT(*) FROM " +
-                    "information_schema.tables" +
-                    " WHERE table_name = ?\" + __DbBind.OwnScope(p);\n" +
-                    "        if (p == DbProvider.SQLite) {\n" +
-                    "            sql = \"SELECT COUNT(*) FROM sqlite_master " +
-                    "WHERE" +
-                    " type = 'table' AND name = ?\";\n" +
-                    "        }\n" +
-                    "        DbResult r = db.Query(sql, " +
-                    "new DbParams().Add(t));\n" +
-                    "        if (r.RowCount() == 0) { return false; }\n" +
-                    "        return r.GetInt(0, 0) > 0;\n" +
-                    "    }\n" +
-                    "    static List<string> Cols(IDbExecutor db, " +
-                    "string t) {\n" +
-                    "        List<string> cols = new List<string>();\n" +
-                    "        int p = db.GetProvider();\n" +
-                    "        DbResult r;\n" +
-                    "        int nameCol = 0;\n" +
-                    "        if (p == DbProvider.SQLite) {\n" +
-                    "            r = db.Query(\"PRAGMA table_info(\" + t + " +
-                    "\")\");\n" +
-                    "            nameCol = 1;\n" +
-                    "        } else {\n" +
-                    "            r = db.Query(\"SELECT column_name FROM" +
-                    " information_schema.columns WHERE table_name = ?\"\n" +
-                    "                + __DbBind.OwnScope(p),\n" +
-                    "                new DbParams().Add(t));\n" +
-                    "        }\n" +
-                    "        int i = 0;\n" +
-                    "        while (i < r.RowCount()) {\n" +
-                    "            cols.Add(r.GetString(i, nameCol));\n" +
-                    "            i = i + 1;\n" +
-                    "        }\n" +
-                    "        return cols;\n" +
-                    "    }\n");
-        /* kind: 0 int/enum, 1 double, 2 bool, 3 string */
-        outb.Append("    static string Ty(int p, int kind, bool pk, " +
-                    "bool ident, int len) {\n" +
-                    "        bool my = p == DbProvider.MySQL || p == " +
-                    "DbProvider.MariaDB;\n" +
-                    "        bool pg = p == DbProvider.PostgreSQL" +
-                    " || p == DbProvider.OpenGauss || p == DbProvider.Kingbase;\n" +
-                    "        bool ms = p == DbProvider.SqlServer || p == " +
-                    "DbProvider.DM;\n" +
-                    "        if (len <= 0) { len = 255; }\n" +
-                    "        if (ident) {\n" +
-                    "            if (my) { return \"INT NOT NULL " +
-                    "AUTO_INCREMENT PRIMARY KEY\"; }\n" +
-                    "            if (pg) { return \"SERIAL PRIMARY KEY\"; }\n" +
-                    "            if (ms) { return \"INT IDENTITY(1,1) " +
-                    "PRIMARY KEY\"; }\n" +
-                    "            return \"INTEGER PRIMARY KEY AUTOINCREMENT\";\n" +
-                    "        }\n" +
-                    "        string t = \"INTEGER\";\n" +
-                    "        if (kind == 4) {\n" +
-                    "            if (p == DbProvider.SQLite) { t = " +
-                    "\"INTEGER\"; } else { t = \"BIGINT\"; }\n" +
-                    "            if (pk) { t = t + \" PRIMARY KEY\"; }\n" +
-                    "            return t;\n" +
-                    "        }\n" +
-                    "        if (kind == 1) {\n" +
-                    "            t = \"DOUBLE PRECISION\";\n" +
-                    "            if (my) { t = \"DOUBLE\"; }\n" +
-                    "            if (ms) { t = \"FLOAT\"; }\n" +
-                    "            if (p == DbProvider.SQLite) { t = \"REAL\"; }\n" +
-                    "        } else if (kind == 2) {\n" +
-                    "            t = \"BOOLEAN\";\n" +
-                    "            if (my) { t = \"TINYINT(1)\"; }\n" +
-                    "            if (ms) { t = \"BIT\"; }\n" +
-                    "            if (p == DbProvider.SQLite) { t = " +
-                    "\"INTEGER\"; }\n" +
-                    "        } else if (kind == 3) {\n" +
-                    "            t = \"VARCHAR(\" + Convert.ToString(len) + " +
-                    "\")\";\n" +
-                    "            if (p == DbProvider.SQLite) { t = \"TEXT\"; }\n" +
-                    "            if (ms) { t = \"NVARCHAR(\" + " +
-                    "Convert.ToString(len) + \")\"; }\n" +
-                    "        } else {\n" +
-                    "            if (my || ms) { t = \"INT\"; }\n" +
-                    "        }\n" +
-                    "        if (pk) { t = t + \" PRIMARY KEY\"; }\n" +
-                    "        return t;\n" +
-                    "    }\n" +
-                    "}\n");
+        outb.Append("}\n");
+        /* 取值/赋值口:实体本身以及被 Include 的导航实体都要有一份 */
+        List<string> acc = new List<string>();
+        for (int i = 0; i < need.Count; i = i + 1) {
+            if (!GenDbEmit.Has(acc, need[i])) { acc.Add(need[i]); }
+            List<DbField> nfs = GenDb.FieldsOf(need[i], 0);
+            for (int j = 0; j < nfs.Count; j = j + 1) {
+                if (nfs[j].Kind != 5) { continue; }
+                if (!GenDbEmit.Has(acc, nfs[j].TypeName)) {
+                    acc.Add(nfs[j].TypeName);
+                }
+            }
+        }
+        for (int i = 0; i < acc.Count; i = i + 1) {
+            GenDbEmit.GenAccess(outb, acc[i]);
+        }
         for (int i = 0; i < need.Count; i = i + 1) {
             string cls = need[i];
             List<DbField> fs = GenDb.FieldsOf(cls, 0);
-            GenDbEmit.GenCols(outb, cls, fs, GenDb.TableOf(cls));
+            string tbl = GenDb.TableOf(cls);
+            GenDbEmit.GenCols(outb, cls, fs, tbl);
             GenDbEmit.GenEntity(outb, cls);
-            GenDbEmit.GenInsert(outb, cls, fs, GenDb.TableOf(cls));
-            GenDbEmit.GenUpdate(outb, cls, fs, GenDb.TableOf(cls));
-            GenDbEmit.GenDelete(outb, cls, GenDb.TableOf(cls));
-            GenDbEmit.GenCodeFirst(outb, cls, fs, GenDb.TableOf(cls));
+            GenDbEmit.GenInsert(outb, cls, fs, tbl);
+            GenDbEmit.GenUpdate(outb, cls, fs, tbl);
+            GenDbEmit.GenDelete(outb, cls, fs, tbl);
+            GenDbEmit.GenCodeFirst(outb, cls, fs, tbl);
         }
         GenCommon.AddSource(GenDb.Reply, "dbgen", outb);
     }

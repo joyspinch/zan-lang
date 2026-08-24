@@ -1,0 +1,245 @@
+using System;
+using System.Data;
+
+namespace System.Data.Orm;
+
+/// <summary>
+/// 一个实体列的运行期描述。编译期只发射这些描述（表名、列名、
+/// 字段名、类型码、主键/自增/长度），SQL 文本、参数绑定与行映射
+/// 全部由本目录下的共享实现按描述完成 —— 实体和列增加时只多几行
+/// 元数据，不再多出一份 SQL 拼装代码。
+///
+/// Kind 与编译期 <c>DbField.Kind</c> 一致：0 int、1 double、
+/// 2 bool、3 string、4 enum；<c>I64</c> 区分 64 位整数列。
+/// </summary>
+class OrmCol {
+    string Col;      // 物理列名
+    string Field;    // 实体字段名（反射读写用）
+    int Kind;        // 0 int, 1 double, 2 bool, 3 string, 4 enum
+    bool I64;        // 声明类型是 64 位整数
+    bool IsPk;
+    bool IsIdent;
+    bool NotNull;
+    int StrLen;
+
+    OrmCol(string col, string field, int kind, bool i64, bool pk, bool ident,
+           bool notNull, int len) {
+        this.Col = col;
+        this.Field = field;
+        this.Kind = kind;
+        this.I64 = i64;
+        this.IsPk = pk;
+        this.IsIdent = ident;
+        this.NotNull = notNull;
+        this.StrLen = len;
+    }
+
+    /// <summary>DDL 类型码（<see cref="OrmDialect.Ty"/>）：
+    /// 0 int、1 double、2 bool、3 string、4 bigint。</summary>
+    int TyCode() {
+        if (this.Kind == 1) { return 1; }
+        if (this.Kind == 2) { return 2; }
+        if (this.Kind == 3) { return 3; }
+        if (this.Kind == 0 && this.I64) { return 4; }
+        return 0;
+    }
+
+    /// <summary>动态值按列声明类型转换时用的 DbParams 类型码。</summary>
+    int PKind() {
+        if (this.Kind == 1) { return DbParams.KindDouble; }
+        if (this.Kind == 3) { return DbParams.KindText; }
+        return DbParams.KindInt;
+    }
+}
+
+/// <summary>导航字段（`[Column]` 之外的实体引用）的连接描述：
+/// 连接 `LEFT JOIN <Table> j_<Field> ON t.<Field>Id = j_<Field>.id`，
+/// 被包含时它的列跟在实体自身列之后。</summary>
+class OrmNav {
+    string Field;
+    string Table;
+    List<OrmCol> Cols;
+    int PkAt;        // Cols 中 id 列的下标（没有 id 时为 0）
+
+    OrmNav(string field, string table) {
+        this.Field = field;
+        this.Table = table;
+        this.Cols = new List<OrmCol>();
+        this.PkAt = 0;
+    }
+
+    /// <summary>追加一列被连接实体的列。</summary>
+    OrmNav Col(string col, string field, int kind, bool i64) {
+        this.Cols.Add(new OrmCol(col, field, kind, i64, false, false, false,
+                                 0));
+        if (field == "id") { this.PkAt = this.Cols.Count - 1; }
+        return this;
+    }
+
+    /// <summary>`j_<Field>.a, j_<Field>.b` —— 连接列的 SELECT 片段。</summary>
+    string SelectList() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < this.Cols.Count; i = i + 1) {
+            sb.Append(", j_" + this.Field + "." + this.Cols[i].Col);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>连接子句。</summary>
+    string Join() {
+        return " LEFT JOIN " + this.Table + " j_" + this.Field + " ON t."
+            + this.Field + "Id = j_" + this.Field + ".id";
+    }
+}
+
+/// <summary>实体上声明的二级索引。</summary>
+class OrmIndex {
+    string Name;
+    string Cols;
+    bool Unique;
+
+    OrmIndex(string name, string cols, bool uniq) {
+        this.Name = name;
+        this.Cols = cols;
+        this.Unique = uniq;
+    }
+}
+
+/// <summary>
+/// 一个实体的全部运行期元数据。生成的代码为每个实体建一次并缓存，
+/// 之后所有 SELECT/INSERT/UPDATE/DELETE/CodeFirst 都读它。
+/// </summary>
+class OrmMeta {
+    string Entity;
+    string Table;
+    List<OrmCol> Cols;
+    List<OrmNav> Navs;
+    List<OrmIndex> Idx;
+    Dict<string, OrmCol> byCol;
+    string selList;
+    Dict<string, string> sqlCache;
+
+    OrmMeta(string entity, string table) {
+        this.Entity = entity;
+        this.Table = table;
+        this.Cols = new List<OrmCol>();
+        this.Navs = new List<OrmNav>();
+        this.Idx = new List<OrmIndex>();
+        this.byCol = new Dict<string, OrmCol>();
+        this.selList = "";
+        this.sqlCache = new Dict<string, string>();
+    }
+
+    /// <summary>新建一个实体的元数据。</summary>
+    static OrmMeta Of(string entity, string table) {
+        return new OrmMeta(entity, table);
+    }
+
+    /// <summary>追加一列（按实体字段声明顺序）。</summary>
+    OrmMeta Col(string col, string field, int kind, bool i64, bool pk,
+                bool ident, bool notNull, int len) {
+        OrmCol c = new OrmCol(col, field, kind, i64, pk, ident, notNull, len);
+        this.Cols.Add(c);
+        this.byCol.Add(col, c);
+        return this;
+    }
+
+    /// <summary>追加一个导航字段，返回它以便继续追加它的列。</summary>
+    OrmNav Nav(string field, string table) {
+        OrmNav n = new OrmNav(field, table);
+        this.Navs.Add(n);
+        return n;
+    }
+
+    /// <summary>追加一条索引声明。</summary>
+    OrmMeta Index(string name, string cols, bool uniq) {
+        this.Idx.Add(new OrmIndex(name, cols, uniq));
+        return this;
+    }
+
+    /// <summary>列描述，不存在时为 null。</summary>
+    OrmCol Find(string c) {
+        OrmCol v;
+        if (this.byCol.TryGetValue(c, out v)) { return v; }
+        return null;
+    }
+
+    /// <summary>列是否属于本实体。</summary>
+    bool Has(string c) { return this.Find(c) != null; }
+
+    /// <summary>列的声明类型（DbParams.Kind*），不存在时 KindNull。</summary>
+    int KindOf(string c) {
+        OrmCol f = this.Find(c);
+        if (f == null) { return DbParams.KindNull; }
+        return f.PKind();
+    }
+
+    /// <summary>校验列名属于本实体，动态列集合的唯一入口。</summary>
+    string Require(string c) {
+        if (!this.Has(c)) {
+            throw new Exception(this.Entity + " has no column: " + c);
+        }
+        return c;
+    }
+
+    /// <summary>`t.a, t.b` —— 实体自身列的 SELECT 片段（缓存）。</summary>
+    string SelectList() {
+        if (this.selList.Length > 0) { return this.selList; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < this.Cols.Count; i = i + 1) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append("t." + this.Cols[i].Col);
+        }
+        this.selList = sb.ToString();
+        return this.selList;
+    }
+
+    /// <summary>主键列名（声明顺序）。</summary>
+    List<string> PkCols() {
+        List<string> k = new List<string>();
+        for (int i = 0; i < this.Cols.Count; i = i + 1) {
+            if (this.Cols[i].IsPk) { k.Add(this.Cols[i].Col); }
+        }
+        return k;
+    }
+
+    /// <summary>UPDATE ... WHERE 用的定位列：最后一个主键列，
+    /// 没有主键时为 null（与实体链的既有语义一致）。</summary>
+    OrmCol PkCol() {
+        OrmCol pk = null;
+        for (int i = 0; i < this.Cols.Count; i = i + 1) {
+            if (this.Cols[i].IsPk) { pk = this.Cols[i]; }
+        }
+        return pk;
+    }
+
+    /// <summary>复合主键的表级约束列清单（两列及以上才有；
+    /// identity 列自带 PRIMARY KEY，不参与）。</summary>
+    string PkList() {
+        StringBuilder sb = new StringBuilder();
+        int n = 0;
+        for (int i = 0; i < this.Cols.Count; i = i + 1) {
+            OrmCol c = this.Cols[i];
+            if (!c.IsPk || c.IsIdent) { continue; }
+            if (n > 0) { sb.Append(", "); }
+            sb.Append(c.Col);
+            n = n + 1;
+        }
+        if (n < 2) { return ""; }
+        return sb.ToString();
+    }
+
+    /// <summary>SQL 片段缓存：同一实体上同一列集合的 INSERT 列清单、
+    /// 冲突子句等只拼一次。</summary>
+    string Cached(string key) {
+        string v;
+        if (this.sqlCache.TryGetValue(key, out v)) { return v; }
+        return null;
+    }
+
+    void Cache(string key, string sql) {
+        string v;
+        if (this.sqlCache.TryGetValue(key, out v)) { return; }
+        this.sqlCache.Add(key, sql);
+    }
+}

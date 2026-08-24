@@ -421,9 +421,7 @@ static bool zan_trigger_json(const char *name) {
 
 /* json trigger over the exported metadata: any Json.Deserialize/Json.Serialize
  * call site (the calls array carries the bare method name in "name"). */
-static bool zan_trigger_json_meta(const char *meta) {
-    json_value *m = json_parse(meta);
-    if (!m) return false;
+static bool zan_trigger_json_meta(json_value *m) {
     int hit = 0;
     json_value *calls = json_obj_get(m, "calls");
     if (calls && calls->type == JSON_ARR) {
@@ -433,16 +431,13 @@ static bool zan_trigger_json_meta(const char *meta) {
             if (name && zan_trigger_json(name)) hit = 1;
         }
     }
-    json_free(m);
     return hit;
 }
 
 /* routegen trigger: a controller-shaped class -- name suffix, base class, or
  * [Route]/[ApiController] attribute. (Framework knowledge stays in Zan; this
  * is only the compiler's spawn filter, like the reserved words.) */
-static bool zan_trigger_route(const char *meta) {
-    json_value *m = json_parse(meta);
-    if (!m) return false;
+static bool zan_trigger_route(json_value *m) {
     int hit = 0;
     json_value *classes = json_obj_get(m, "classes");
     if (classes && classes->type == JSON_ARR) {
@@ -475,7 +470,6 @@ static bool zan_trigger_route(const char *meta) {
             }
         }
     }
-    json_free(m);
     return hit;
 }
 
@@ -491,9 +485,7 @@ static bool zan_trigger_db_name(const char *name) {
            strcmp(name, "SyncStructureAllAsync") == 0;
 }
 
-static bool zan_trigger_db_meta(const char *meta) {
-    json_value *m = json_parse(meta);
-    if (!m) return false;
+static bool zan_trigger_db_meta(json_value *m) {
     int hit = 0;
     json_value *calls = json_obj_get(m, "calls");
     if (calls && calls->type == JSON_ARR) {
@@ -516,13 +508,12 @@ static bool zan_trigger_db_meta(const char *meta) {
             }
         }
     }
-    json_free(m);
     return hit;
 }
 
-static bool zan_gen_codegen_triggered(const char *meta) {
-    return zan_trigger_json_meta(meta) || zan_trigger_route(meta) ||
-           zan_trigger_db_meta(meta);
+static bool zan_gen_codegen_triggered(json_value *m) {
+    return zan_trigger_json_meta(m) || zan_trigger_route(m) ||
+           zan_trigger_db_meta(m);
 }
 
 /* ---- rewrite directives ----
@@ -781,7 +772,19 @@ int zan_gen_codegen(zan_ast_node_t *unit, zan_arena_t *arena,
 
     char *meta = zan_genmeta_export(unit);
     if (!meta) return 0;
-    int triggered = zan_gen_codegen_triggered(meta);
+    /* One parse feeds all three trigger filters. A parse failure is a compiler
+     * bug (or a document past json.c's nesting cap), never "nothing
+     * triggered": silently skipping codegen would surface much later as
+     * `unresolved call 'Json.Serialize'` on every call site. */
+    json_value *meta_json = json_parse(meta);
+    if (!meta_json) {
+        fprintf(stderr, "error: cannot parse compilation metadata for the "
+                        "code generators\n");
+        free(meta);
+        return -1;
+    }
+    int triggered = zan_gen_codegen_triggered(meta_json);
+    json_free(meta_json);
     if (!triggered) {
         free(meta);
         return 0;

@@ -1,0 +1,273 @@
+using System;
+using System.Data;
+
+namespace System.Data.Orm;
+
+/// <summary>
+/// 类型化 UPDATE 的运行期实现：SET 片段与 WHERE 片段各自带一段参数，
+/// 执行时按 SET→WHERE 的顺序合并。实体整体更新（SetSource）在执行
+/// 时按元数据展开：非主键列进 SET，主键列进 WHERE。
+/// </summary>
+class OrmUpdate {
+    IDbExecutor db;
+    OrmMeta meta;
+    string tbl;
+    IOrmRows src;
+    List<string> only;
+    List<string> skip;
+    string sets;
+    DbParams sp;
+    string w;
+    DbParams wp;
+    bool on;
+
+    OrmUpdate(IDbExecutor db, OrmMeta meta) {
+        this.db = db;
+        this.meta = meta;
+        this.tbl = meta.Table;
+        this.src = null;
+        this.only = new List<string>();
+        this.skip = new List<string>();
+        this.sets = "";
+        this.sp = new DbParams();
+        this.w = "";
+        this.wp = new DbParams();
+        this.on = true;
+    }
+
+    static OrmUpdate Create(IDbExecutor db, OrmMeta meta) {
+        return new OrmUpdate(db, meta);
+    }
+
+    void AsTable(string t) { this.tbl = t; }
+    void Only(string c) { this.only.Add(c); }
+    void Skip(string c) { this.skip.Add(c); }
+    /// <summary>实体整体更新的值来源（取第一行）。</summary>
+    void SetSource(IOrmRows rows) { this.src = rows; }
+    void CondBegin(bool c) { this.on = c; }
+    void CondEnd() { this.on = true; }
+
+    bool Use(string c) {
+        if (this.only.Count > 0) { return OrmDialect.Has(this.only, c); }
+        return !OrmDialect.Has(this.skip, c);
+    }
+
+    void Frag(string f) {
+        if (this.sets.Length > 0) { this.sets = this.sets + ", "; }
+        this.sets = this.sets + f;
+    }
+
+    void SetI(string c, int v) { this.sp.AddInt(v); this.Frag(c + " = ?"); }
+    void SetL(string c, long v) { this.sp.AddLong(v); this.Frag(c + " = ?"); }
+    void SetD(string c, double v) { this.sp.AddDouble(v); this.Frag(c + " = ?"); }
+    void SetS(string c, string v) { this.sp.Add(v); this.Frag(c + " = ?"); }
+
+    void SetB(string c, bool v) {
+        if (v) { this.sp.AddInt(1); } else { this.sp.AddInt(0); }
+        this.Frag(c + " = ?");
+    }
+
+    void SetIncrI(string c, int v) {
+        this.sp.AddInt(v);
+        this.Frag(c + " = " + c + " + ?");
+    }
+
+    void SetIncrL(string c, long v) {
+        this.sp.AddLong(v);
+        this.Frag(c + " = " + c + " + ?");
+    }
+
+    void SetIncrD(string c, double v) {
+        this.sp.AddDouble(v);
+        this.Frag(c + " = " + c + " + ?");
+    }
+
+    void SetDict(DbValues v) {
+        int i = 0;
+        while (i < v.Count()) {
+            string c = this.meta.Require(v.NameAt(i));
+            if (this.Use(c)) {
+                v.BindAs(this.sp, i, this.meta.KindOf(c));
+                this.Frag(c + " = ?");
+            }
+            i = i + 1;
+        }
+    }
+
+    void W(string f) {
+        if (!this.on) { return; }
+        string u = OrmDialect.Unalias(f);
+        if (this.w.Length == 0) { this.w = u; }
+        else { this.w = this.w + " AND " + u; }
+    }
+
+    void WhereDict(DbValues v) {
+        if (!this.on) { return; }
+        int i = 0;
+        while (i < v.Count()) {
+            string c = this.meta.Require(v.NameAt(i));
+            this.W(c + " = ?");
+            v.BindAs(this.wp, i, this.meta.KindOf(c));
+            i = i + 1;
+        }
+    }
+
+    void P(string v) { if (this.on) { this.wp.Add(v); } }
+    void Pi(int v) { if (this.on) { this.wp.AddInt(v); } }
+    void Pl(long v) { if (this.on) { this.wp.AddLong(v); } }
+    void Pd(double v) { if (this.on) { this.wp.AddDouble(v); } }
+
+    void InI(List<int> vs) {
+        if (!this.on) { return; }
+        int i = 0;
+        while (i < vs.Count) { this.wp.AddInt(vs[i]); i = i + 1; }
+    }
+
+    void InL(List<long> vs) {
+        if (!this.on) { return; }
+        int i = 0;
+        while (i < vs.Count) { this.wp.AddLong(vs[i]); i = i + 1; }
+    }
+
+    void InS(List<string> vs) {
+        if (!this.on) { return; }
+        int i = 0;
+        while (i < vs.Count) { this.wp.Add(vs[i]); i = i + 1; }
+    }
+
+    void InD(List<double> vs) {
+        if (!this.on) { return; }
+        int i = 0;
+        while (i < vs.Count) { this.wp.AddDouble(vs[i]); i = i + 1; }
+    }
+
+    /// <summary>实体整体更新：列在执行时展开，Only/Skip 的链顺序
+    /// 任意；定位列取实体主键（含复合主键），没有主键则无法定位、
+    /// 什么也不做。</summary>
+    void ApplySource() {
+        if (this.src == null) { return; }
+        IOrmRows o = this.src;
+        this.src = null;
+        if (o.RowCount() == 0) { return; }
+        if (this.meta.PkCol() == null) { return; }
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            OrmCol c = this.meta.Cols[i];
+            if (c.IsPk || !this.Use(c.Col)) { continue; }
+            o.BindCol(0, c, this.sp);
+            this.Frag(c.Col + " = ?");
+        }
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            OrmCol c = this.meta.Cols[i];
+            if (!c.IsPk) { continue; }
+            this.W(c.Col + " = ?");
+            o.BindCol(0, c, this.wp);
+        }
+    }
+
+    string BuildUpdate() {
+        this.ApplySource();
+        if (this.sets.Length == 0) { return ""; }
+        if (this.w.Length == 0) { return ""; }
+        return "UPDATE " + this.tbl + " SET " + this.sets + " WHERE " + this.w;
+    }
+
+    int ExecuteAffrows() {
+        string sql = this.BuildUpdate();
+        if (sql.Length == 0) { return 0; }
+        return this.db.Execute(sql, OrmDialect.Cat(this.sp, this.wp));
+    }
+
+    async int ExecuteAffrowsAsync() {
+        string sql = this.BuildUpdate();
+        if (sql.Length == 0) { return 0; }
+        return await this.db.ExecuteAsync(sql,
+                                          OrmDialect.Cat(this.sp, this.wp));
+    }
+}
+
+/// <summary>类型化 DELETE 的运行期实现：条件片段 + 绑定值。
+/// 没有条件时不执行（不生成全表删除）。</summary>
+class OrmDelete {
+    IDbExecutor db;
+    OrmMeta meta;
+    string tbl;
+    string w;
+    DbParams ps;
+    bool on;
+
+    OrmDelete(IDbExecutor db, OrmMeta meta) {
+        this.db = db;
+        this.meta = meta;
+        this.tbl = meta.Table;
+        this.w = "";
+        this.ps = new DbParams();
+        this.on = true;
+    }
+
+    static OrmDelete Create(IDbExecutor db, OrmMeta meta) {
+        return new OrmDelete(db, meta);
+    }
+
+    void AsTable(string t) { this.tbl = t; }
+    void CondBegin(bool c) { this.on = c; }
+    void CondEnd() { this.on = true; }
+
+    void W(string f) {
+        if (!this.on) { return; }
+        string u = OrmDialect.Unalias(f);
+        if (this.w.Length == 0) { this.w = u; }
+        else { this.w = this.w + " AND " + u; }
+    }
+
+    void WhereDict(DbValues v) {
+        if (!this.on) { return; }
+        int i = 0;
+        while (i < v.Count()) {
+            string c = this.meta.Require(v.NameAt(i));
+            this.W(c + " = ?");
+            v.BindAs(this.ps, i, this.meta.KindOf(c));
+            i = i + 1;
+        }
+    }
+
+    void P(string v) { if (this.on) { this.ps.Add(v); } }
+    void Pi(int v) { if (this.on) { this.ps.AddInt(v); } }
+    void Pl(long v) { if (this.on) { this.ps.AddLong(v); } }
+    void Pd(double v) { if (this.on) { this.ps.AddDouble(v); } }
+
+    void InI(List<int> vs) {
+        if (!this.on) { return; }
+        int i = 0;
+        while (i < vs.Count) { this.ps.AddInt(vs[i]); i = i + 1; }
+    }
+
+    void InL(List<long> vs) {
+        if (!this.on) { return; }
+        int i = 0;
+        while (i < vs.Count) { this.ps.AddLong(vs[i]); i = i + 1; }
+    }
+
+    void InS(List<string> vs) {
+        if (!this.on) { return; }
+        int i = 0;
+        while (i < vs.Count) { this.ps.Add(vs[i]); i = i + 1; }
+    }
+
+    void InD(List<double> vs) {
+        if (!this.on) { return; }
+        int i = 0;
+        while (i < vs.Count) { this.ps.AddDouble(vs[i]); i = i + 1; }
+    }
+
+    int ExecuteAffrows() {
+        if (this.w.Length == 0) { return 0; }
+        string sql = "DELETE FROM " + this.tbl + " WHERE " + this.w;
+        return this.db.Execute(sql, this.ps);
+    }
+
+    async int ExecuteAffrowsAsync() {
+        if (this.w.Length == 0) { return 0; }
+        string sql = "DELETE FROM " + this.tbl + " WHERE " + this.w;
+        return await this.db.ExecuteAsync(sql, this.ps);
+    }
+}
