@@ -31,7 +31,7 @@ It writes to `<root>/.zanmap/` (git-ignored — regenerate any time):
 | `repo.map.txt`  | Human/AI-readable outline: every file with its classes + method signatures and line numbers. Feed this as AI context. |
 | `symbols.json`  | Flat index `[{name,kind,file,line,sig}]` — jump straight to a definition. |
 | `gallery.json` / `zform.json` | Generated example catalog and .zform schema/control catalog; build `tools/genknowledge/GenKnowledge.zan` or call the server's `zan_refresh_knowledge` after changing templates, examples, or controls. |
-| `routes.json`   | HTTP route table extracted from controller attributes (only when `src/Controller` exists): `[{method,path,action,title,auth}]`, where `auth` is the `CustomAuthorization` value in force (`None`/`Auth`/`Login`/`Grant`/`ApiAuth`, method attribute overriding the class one). |
+| `routes.approx.json` | HTTP route table extracted from controller attributes by text scanning (only when `src/Controller` exists): `[{method,path,action,title,auth}]`, where `auth` is the `CustomAuthorization` value in force (`None`/`Auth`/`Login`/`Grant`/`ApiAuth`, method attribute overriding the class one). A fallback: `routes.json` with the same shape plus `module`/`perm`/`params` is written by `System.Compiler.GenIndex` from real unit metadata (`zanindex`, or the server's `zan_refresh_index`), and RepoMap never overwrites it. |
 
 `repo.map.txt` excerpt:
 
@@ -74,7 +74,9 @@ pull structure without a filesystem walk:
 |------------------|------------------------------|
 | `repo://map`     | `.zanmap/repo.map.txt`       |
 | `repo://symbols` | `.zanmap/symbols.json`       |
-| `repo://routes`  | `.zanmap/routes.json`        |
+| `repo://routes`  | `.zanmap/routes.json` (GenIndex) or `.zanmap/routes.approx.json` |
+| `repo://entities` | `.zanmap/entities.json`     |
+| `repo://index`   | `.zanmap/index.json`         |
 
 A typical AI edit loop:
 
