@@ -16,9 +16,20 @@ endif()
 
 file(REMOVE ${OUT_EXE})
 # Comment lines, quoted paths and several arguments per line all have to parse.
-set(_body "# inputs\n\"${SRC}\"\n")
+# Copy inputs below a non-ASCII directory: IDE response files are UTF-8, and on
+# Windows these paths must behave exactly like paths passed directly in argv.
+get_filename_component(_rsp_dir "${RSP}" DIRECTORY)
+set(_unicode_dir "${_rsp_dir}/响应文件中文路径")
+file(REMOVE_RECURSE "${_unicode_dir}")
+file(MAKE_DIRECTORY "${_unicode_dir}")
+get_filename_component(_src_name "${SRC}" NAME)
+file(COPY "${SRC}" DESTINATION "${_unicode_dir}")
+set(_unicode_src "${_unicode_dir}/${_src_name}")
+set(_body "# inputs\n\"${_unicode_src}\"\n")
 foreach(_extra ${EXTRA})
-  set(_body "${_body}\"${_extra}\"\n")
+  get_filename_component(_extra_name "${_extra}" NAME)
+  file(COPY "${_extra}" DESTINATION "${_unicode_dir}")
+  set(_body "${_body}\"${_unicode_dir}/${_extra_name}\"\n")
 endforeach()
 file(WRITE ${RSP} "${_body}-o \"${OUT_EXE}\"\n")
 

@@ -14,6 +14,13 @@
 #include "../common/host_oom.h"
 
 #include "winres.h"
+#include "win_utf8.h"
+
+#ifdef _WIN32
+#define fopen zan_utf8_fopen
+#undef RT_ICON
+#undef RT_GROUP_ICON
+#endif
 
 #define RES_LANG 1033           /* en-US: what every toolchain defaults to */
 #define RT_ICON 3

@@ -10,12 +10,14 @@
  */
 
 #include "embedres.h"
+#include "win_utf8.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #ifdef _WIN32
 #include <windows.h>
+#define fopen zan_utf8_fopen
 #else
 #include <dirent.h>
 #include <sys/stat.h>
@@ -100,15 +102,23 @@ static void embed_walk(zan_embed_list_t *l, const char *dir, const char *name) {
 #ifdef _WIN32
     char pattern[1024];
     snprintf(pattern, sizeof(pattern), "%s\\*", dir);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern, &fd);
+    wchar_t *wide_pattern = zan_utf8_to_wide_alloc(pattern);
+    if (!wide_pattern) return;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wide_pattern, &fd);
+    free(wide_pattern);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
-        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0)
+        char *file_name = zan_wide_to_utf8_alloc(fd.cFileName);
+        if (!file_name) continue;
+        if (strcmp(file_name, ".") == 0 || strcmp(file_name, "..") == 0) {
+            free(file_name);
             continue;
+        }
         char path[1024];
-        snprintf(path, sizeof(path), "%s\\%s", dir, fd.cFileName);
-        char *sub = embed_join(name, fd.cFileName);
+        snprintf(path, sizeof(path), "%s\\%s", dir, file_name);
+        char *sub = embed_join(name, file_name);
+        free(file_name);
         if (!sub) continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
@@ -117,7 +127,7 @@ static void embed_walk(zan_embed_list_t *l, const char *dir, const char *name) {
             embed_add_file(l, path, sub);
         }
         free(sub);
-    } while (FindNextFileA(h, &fd));
+    } while (FindNextFileW(h, &fd));
     FindClose(h);
 #else
     DIR *d = opendir(dir);
@@ -142,7 +152,7 @@ static void embed_walk(zan_embed_list_t *l, const char *dir, const char *name) {
 
 static int embed_is_dir(const char *path) {
 #ifdef _WIN32
-    DWORD a = GetFileAttributesA(path);
+    DWORD a = zan_utf8_get_file_attributes(path);
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 #else
     struct stat st;

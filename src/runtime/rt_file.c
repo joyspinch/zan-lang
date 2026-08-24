@@ -61,6 +61,63 @@
 #define O_CLOEXEC 0
 #endif
 
+/* Zan strings are UTF-8. Windows narrow CRT paths follow the active ANSI code
+ * page, so every public File path enters through this conversion boundary. */
+#ifdef _WIN32
+static wchar_t *zan_win_utf8_to_wide(const char *text) {
+    if (!text) return NULL;
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1,
+                                NULL, 0);
+    if (n <= 0) return NULL;
+    wchar_t *wide = (wchar_t *)malloc((size_t)n * sizeof(*wide));
+    if (!wide) return NULL;
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1,
+                            wide, n) != n) { free(wide); return NULL; }
+    return wide;
+}
+#endif
+
+void *zan_file_fopen(const char *path, const char *mode) {
+    if (!path || !mode) return NULL;
+#ifdef _WIN32
+    wchar_t *wide_path = zan_win_utf8_to_wide(path);
+    wchar_t *wide_mode = zan_win_utf8_to_wide(mode);
+    if (!wide_path || !wide_mode) { free(wide_path); free(wide_mode); return NULL; }
+    FILE *f = _wfopen(wide_path, wide_mode);
+    free(wide_path); free(wide_mode);
+    return f;
+#else
+    return fopen(path, mode);
+#endif
+}
+
+int zan_file_remove(const char *path) {
+    if (!path || !path[0]) return -1;
+#ifdef _WIN32
+    wchar_t *wide_path = zan_win_utf8_to_wide(path);
+    if (!wide_path) return -1;
+    int ok = DeleteFileW(wide_path) ? 0 : -1;
+    free(wide_path);
+    return ok;
+#else
+    return remove(path);
+#endif
+}
+
+int zan_file_rename(const char *source, const char *dest) {
+    if (!source || !source[0] || !dest || !dest[0]) return -1;
+#ifdef _WIN32
+    wchar_t *wide_source = zan_win_utf8_to_wide(source);
+    wchar_t *wide_dest = zan_win_utf8_to_wide(dest);
+    if (!wide_source || !wide_dest) { free(wide_source); free(wide_dest); return -1; }
+    int ok = MoveFileExW(wide_source, wide_dest, MOVEFILE_REPLACE_EXISTING) ? 0 : -1;
+    free(wide_source); free(wide_dest);
+    return ok;
+#else
+    return rename(source, dest);
+#endif
+}
+
 /* --- File metadata -------------------------------------------------------
  *
  * The standard library had whole-file text IO and nothing else, so nothing
@@ -73,8 +130,12 @@
 long long zan_file_time(const char *path, int which) {
     if (!path || !path[0]) return 0;
 #ifdef _WIN32
+    wchar_t *wide_path = zan_win_utf8_to_wide(path);
+    if (!wide_path) return 0;
     WIN32_FILE_ATTRIBUTE_DATA d;
-    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &d)) return 0;
+    int got = GetFileAttributesExW(wide_path, GetFileExInfoStandard, &d);
+    free(wide_path);
+    if (!got) return 0;
     FILETIME ft = d.ftLastWriteTime;
     if (which == 1) ft = d.ftCreationTime;
     else if (which == 2) ft = d.ftLastAccessTime;
@@ -96,8 +157,12 @@ long long zan_file_time(const char *path, int which) {
 long long zan_file_length(const char *path) {
     if (!path || !path[0]) return -1;
 #ifdef _WIN32
+    wchar_t *wide_path = zan_win_utf8_to_wide(path);
+    if (!wide_path) return -1;
     WIN32_FILE_ATTRIBUTE_DATA d;
-    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &d)) return -1;
+    int got = GetFileAttributesExW(wide_path, GetFileExInfoStandard, &d);
+    free(wide_path);
+    if (!got) return -1;
     return (long long)(((unsigned long long)d.nFileSizeHigh << 32)
                        | (unsigned long long)d.nFileSizeLow);
 #else
@@ -203,7 +268,7 @@ const char *zan_file_read_path(const char *path) {
  * The stdlib's read paths import this instead of fopen so a published or
  * packaged program finds its resources whatever directory it was started in. */
 void *zan_pkg_fopen(const char *path, const char *mode) {
-    FILE *f = fopen(path, mode);
+    FILE *f = (FILE *)zan_file_fopen(path, mode);
     if (f) return f;
     if (!mode || mode[0] != 'r') return NULL;
     if (strchr(mode, '+')) return NULL;
@@ -211,7 +276,7 @@ void *zan_pkg_fopen(const char *path, const char *mode) {
     for (int which = 0; which < ZAN_ALT_BASES; which++) {
         const char *p = zan_alt_path(path, which, alt, sizeof(alt));
         if (!p) continue;
-        f = fopen(p, mode);
+        f = (FILE *)zan_file_fopen(p, mode);
         if (f) return f;
     }
     return NULL;
@@ -234,7 +299,10 @@ long long zan_file_attributes(const char *path) {
 static long long zan_file_attributes_at(const char *path) {
     if (!path || !path[0]) return -1;
 #ifdef _WIN32
-    DWORD a = GetFileAttributesA(path);
+    wchar_t *wide_path = zan_win_utf8_to_wide(path);
+    if (!wide_path) return -1;
+    DWORD a = GetFileAttributesW(wide_path);
+    free(wide_path);
     if (a == INVALID_FILE_ATTRIBUTES) return -1;
     long long r = 0;
     if (a & FILE_ATTRIBUTE_READONLY)  r |= 1;
@@ -277,11 +345,15 @@ static int zan_posix_open_nofollow(const char *path) {
 long long zan_file_set_readonly(const char *path, int on) {
     if (!path || !path[0]) return 0;
 #ifdef _WIN32
-    DWORD a = GetFileAttributesA(path);
-    if (a == INVALID_FILE_ATTRIBUTES) return 0;
+    wchar_t *wide_path = zan_win_utf8_to_wide(path);
+    if (!wide_path) return 0;
+    DWORD a = GetFileAttributesW(wide_path);
+    if (a == INVALID_FILE_ATTRIBUTES) { free(wide_path); return 0; }
     if (on) a |= FILE_ATTRIBUTE_READONLY;
     else    a &= ~(DWORD)FILE_ATTRIBUTE_READONLY;
-    return SetFileAttributesA(path, a) ? 1 : 0;
+    int ok = SetFileAttributesW(wide_path, a) ? 1 : 0;
+    free(wide_path);
+    return ok;
 #else
     int fd = zan_posix_open_nofollow(path);
     if (fd < 0) return 0;   /* missing, ELOOP symlink, EACCES, ... */
@@ -304,9 +376,12 @@ long long zan_file_set_time(const char *path, int which, long long unix_sec) {
     if (!path || !path[0]) return 0;
     if (which != 0 && which != 1 && which != 2) return 0;
 #ifdef _WIN32
-    HANDLE h = CreateFileA(path, FILE_WRITE_ATTRIBUTES,
+    wchar_t *wide_path = zan_win_utf8_to_wide(path);
+    if (!wide_path) return 0;
+    HANDLE h = CreateFileW(wide_path, FILE_WRITE_ATTRIBUTES,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    free(wide_path);
     if (h == INVALID_HANDLE_VALUE) return 0;
     /* Unix seconds since 1970 -> 100ns ticks since 1601. */
     unsigned long long ticks = (unsigned long long)(unix_sec + 11644473600LL)
@@ -418,7 +493,7 @@ static long zan_fh_index(long long handle) {
 /* `mode` is a stdio mode string ("rb", "wb", "r+b", "ab", ...). */
 long long zan_file_open(const char *path, const char *mode) {
     if (!path || !path[0] || !mode || !mode[0]) return 0;
-    FILE *f = fopen(path, mode);
+    FILE *f = (FILE *)zan_file_fopen(path, mode);
     if (!f) return 0;
     zan_fh_lock();
     zan_fh_ensure();
@@ -569,8 +644,11 @@ long long zan_file_try_lock(const char *path) {
     zan_fh_unlock();
     if (slot < 0) return 0;
 #ifdef _WIN32
-    HANDLE h = CreateFileA(path, GENERIC_WRITE, 0 /* no sharing */, NULL,
+    wchar_t *wide_path = zan_win_utf8_to_wide(path);
+    if (!wide_path) return 0;
+    HANDLE h = CreateFileW(wide_path, GENERIC_WRITE, 0 /* no sharing */, NULL,
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(wide_path);
     if (h == INVALID_HANDLE_VALUE) return 0;
 #elif defined(__wasm__)
     (void)slot;

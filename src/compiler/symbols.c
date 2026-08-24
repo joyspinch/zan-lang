@@ -2,9 +2,14 @@
 
 #include "symbols.h"
 #include "builtin_api.h"
+#include "win_utf8.h"
 
 #include <stdio.h>
 #include <string.h>
+
+#ifdef _WIN32
+#define fopen zan_utf8_fopen
+#endif
 
 /* Renders a type reference ("List<string>", "byte[]", "int?") into buf. */
 static int type_name(const zan_ast_node_t *t, char *buf, int cap) {
