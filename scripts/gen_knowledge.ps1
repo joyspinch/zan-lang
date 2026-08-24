@@ -1,6 +1,7 @@
 # gen_knowledge.ps1 -- generate the built-in assistant's offline knowledge base:
 #   <OutDir>\symbols.json   RepoMap API index built from the given stdlib
-#   <OutDir>\gallery.json   golden-example catalog (copied verbatim)
+#   <OutDir>\gallery.json   golden-example catalog (merged from templates/examples)
+#   <OutDir>\zform.json     .zform schema plus statically scanned controls
 #
 # The IDE's assistant (src\ide_zan\AiAgent.zan) reads these next to the IDE
 # (<ExeDir>\knowledge, i.e. BaseDir()+"/knowledge") through its api_search /
@@ -16,6 +17,8 @@ param(
   [Parameter(Mandatory=$true)][string]$OutDir,
   [string]$RepomapSrc,
   [string]$GallerySrc,
+  [string]$ZformDoc,
+  [switch]$WriteControls,
   [string]$WorkDir
 )
 
@@ -24,6 +27,8 @@ $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $PSScriptRoot
 if (-not $RepomapSrc) { $RepomapSrc = Join-Path $root 'tools\repomap\RepoMap.zan' }
 if (-not $GallerySrc) { $GallerySrc = Join-Path $root 'tools\mcp_server\gallery.json' }
+if (-not $ZformDoc) { $ZformDoc = Join-Path $root 'tools\mcp_server\zform.doc.json' }
+$genKnowledgeSrc = Join-Path $root 'tools\genknowledge\GenKnowledge.zan'
 
 # Everything past a Push-Location must be an absolute path.
 $Zanc   = (Resolve-Path $Zanc).Path
@@ -61,10 +66,32 @@ if (Test-Path $RepomapSrc) {
   Write-Output "KNOWLEDGE_WARN: $RepomapSrc missing; no API index generated"
 }
 
-# ---- example catalog (gallery.json) ----------------------------------------
-if (Test-Path $GallerySrc) {
-  Copy-Item $GallerySrc (Join-Path $OutDir 'gallery.json') -Force
-  Write-Output "KNOWLEDGE_GALLERY_OK -> $OutDir\gallery.json"
+# ---- gallery and .zform schema through the cross-platform Zan tool --------
+$controls = Join-Path $root 'tools\mcp_server\zform.controls.txt'
+if ((Test-Path $genKnowledgeSrc) -and (Test-Path $GallerySrc) -and
+    (Test-Path $ZformDoc) -and (Test-Path $Stdlib)) {
+  $genKnowledgeExe = Join-Path $toolDir 'genknowledge.exe'
+  try {
+    & $Zanc $genKnowledgeSrc --stdlib-path $Stdlib -o $genKnowledgeExe
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $genKnowledgeExe)) {
+      throw "GenKnowledge compile failed (exit code $LASTEXITCODE)"
+    }
+    $args = @('--root', $root, '--stdlib', $Stdlib, '--out', $OutDir,
+      '--seed', $GallerySrc, '--doc', $ZformDoc, '--controls', $controls)
+    if ($WriteControls) { $args += '--write-controls' }
+    & $genKnowledgeExe @args
+    if ($LASTEXITCODE -ne 0) {
+      throw "GenKnowledge execution failed (exit code $LASTEXITCODE)"
+    }
+  } catch {
+    Write-Output "KNOWLEDGE_WARN: GenKnowledge failed: $_"
+  }
+  if (-not (Test-Path (Join-Path $OutDir 'gallery.json'))) {
+    Write-Output "KNOWLEDGE_WARN: gallery generation failed; assistant example tool will be empty"
+  }
+  if (-not (Test-Path (Join-Path $OutDir 'zform.json'))) {
+    Write-Output "KNOWLEDGE_WARN: zform generation failed; form schema tool will be empty"
+  }
 } else {
-  Write-Output "KNOWLEDGE_WARN: $GallerySrc missing; assistant example tool will be empty"
+  Write-Output "KNOWLEDGE_WARN: GenKnowledge inputs missing; gallery/form schema tools will be empty"
 }

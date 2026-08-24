@@ -30,6 +30,7 @@ It writes to `<root>/.zanmap/` (git-ignored — regenerate any time):
 |-----------------|-----------------------------------------------------------------|
 | `repo.map.txt`  | Human/AI-readable outline: every file with its classes + method signatures and line numbers. Feed this as AI context. |
 | `symbols.json`  | Flat index `[{name,kind,file,line,sig}]` — jump straight to a definition. |
+| `gallery.json` / `zform.json` | Generated example catalog and .zform schema/control catalog; build `tools/genknowledge/GenKnowledge.zan` or call the server's `zan_refresh_knowledge` after changing templates, examples, or controls. |
 | `routes.json`   | HTTP route table extracted from controller attributes (only when `src/Controller` exists): `[{method,path,action,title,auth}]`, where `auth` is the `CustomAuthorization` value in force (`None`/`Auth`/`Login`/`Grant`/`ApiAuth`, method attribute overriding the class one). |
 
 `repo.map.txt` excerpt:

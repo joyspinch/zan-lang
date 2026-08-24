@@ -13,14 +13,20 @@ namespace RepoMap;
 //   repo.map.txt     compact, token-efficient outline (aider-style): every file
 //                    with its classes and method signatures -- feed this as AI
 //                    context ("here is the shape of my repo").
-//   symbols.json     flat symbol index  [{name,kind,file,line,sig}] -- lets the
-//                    AI (or the MCP bridge) jump straight to a definition.
+//   symbols.json     flat symbol index
+//                    [{name,kind,owner,ns,file,line,sig,doc,ext}] -- lets the
+//                    AI (or the MCP bridge) jump straight to a definition and
+//                    read the signature plus its /// summary without opening
+//                    the file.
+//   refs.json        reverse index [{name,kinds,owners,defs,refCount,testRefs,
+//                    refs,subtypes}] -- answers "who calls / who inherits /
+//                    which test covers this", i.e. the impact of a change.
 //   routes.json      HTTP route table extracted from controller attributes
 //                    [{method,path,action,title,auth}] -- only when a
 //                    src/Controller folder exists.
 //
 //   Build:  zanc tools/repomap/RepoMap.zan --auto-stdlib -o repomap.exe
-//   Run  :  repomap.exe [root]          (root defaults to ".")
+//   Run  :  repomap.exe [root] [--no-refs]   (root defaults to ".")
 //
 // Implemented with Substring/Length/char scanning only (several string instance
 // methods are unreliable in the current toolchain). Brace depth is tracked with
@@ -33,6 +39,8 @@ class Sym {
     string kind;    // class | struct | interface | enum | method | delegate
     string name;    // "MqttBroker" or "MqttBroker.Start"
     string sig;     // full signature line (methods) or "" (types)
+    string doc;     // first line of the /// summary, "" when undocumented
+    string ext;     // base type list of a type declaration, "" otherwise
     int line;
 
     static Sym Create(string kind, string name, string sig, int line) {
@@ -40,6 +48,8 @@ class Sym {
         s.kind = kind;
         s.name = name;
         s.sig = sig;
+        s.doc = "";
+        s.ext = "";
         s.line = line;
         return s;
     }
@@ -47,14 +57,54 @@ class Sym {
 
 /// <summary>A scanned source file with its top-level symbols.</summary>
 class FileInfo {
-    string path;
+    string path;    // path relative to the scanned root
+    string abs;     // path the scanner can re-open for the reference pass
+    string ns;      // declared namespace, "" when the file has none
     List<Sym> syms;
 
     static FileInfo Create(string path) {
         FileInfo f = new FileInfo();
         f.path = path;
+        f.abs = path;
+        f.ns = "";
         f.syms = new List<Sym>();
         return f;
+    }
+}
+
+/// <summary>Everything known about one simple name: where it is declared and
+/// where it is used. `refs` is capped; `total` keeps the honest count.</summary>
+class RefBucket {
+    string name;
+    List<string> kinds;
+    List<string> owners;
+    List<string> defs;      // "file:line" of every declaration (capped on output)
+    List<string> refs;      // "file:line", capped at Program.REF_CAP
+    List<string> subtypes;  // types declaring this one as a base
+    int total;
+    int tests;
+
+    static RefBucket Create(string name) {
+        RefBucket b = new RefBucket();
+        b.name = name;
+        b.kinds = new List<string>();
+        b.owners = new List<string>();
+        b.defs = new List<string>();
+        b.refs = new List<string>();
+        b.subtypes = new List<string>();
+        b.total = 0;
+        b.tests = 0;
+        return b;
+    }
+
+    static void AddUnique(List<string> target, string value) {
+        if (value.Length == 0) { return; }
+        int i = 0;
+        while (i < target.Count) {
+            if (target[i] == value) { return; }
+            i = i + 1;
+        }
+        target.Add(value);
     }
 }
 
@@ -179,18 +229,41 @@ class Str {
 class Program {
     static string OUT_DIR = ".zanmap";
 
+    /// Per-symbol cap on stored reference sites; `total` still counts them all.
+    static int REF_CAP = 30;
+
+    /// The scanned workspace root, so a renderer can still reach a source file
+    /// (the compiler's builtin API table) after the scan.
+    static string scanRoot = ".";
+
     static int Main() {
         string root = ".";
-        if (Environment.ArgCount() > 0) { root = Environment.ArgAt(0); }
+        bool wantRefs = true;
+        int ai = 0;
+        while (ai < Environment.ArgCount()) {
+            string a = Environment.ArgAt(ai);
+            ai = ai + 1;
+            if (a == "--no-refs") { wantRefs = false; }
+            else if (!Str.StartsWith(a, "--")) { root = a; }
+        }
 
+        Program.scanRoot = root;
         List<FileInfo> files = new List<FileInfo>();
         Program.ScanDir(root, "", files);
 
-        if (!Directory.Exists(Program.OUT_DIR)) {
-            Directory.CreateDirectoryRecursive(Program.OUT_DIR);
-        }
+        // 输出目录只能按磁盘状态判断：Directory.Exists 会回退到随附资源
+        // 目录，工作目录下没有 .zanmap 时也会答“有”，写入随后就失败。
+        // CreateDirectoryRecursive 自己按 ExistsOnDisk 判重，直接调用即可。
+        Directory.CreateDirectoryRecursive(Program.OUT_DIR);
         File.WriteAllText(Program.OUT_DIR + "/repo.map.txt", Program.RenderText(root, files));
         File.WriteAllText(Program.OUT_DIR + "/symbols.json", Program.RenderSymbols(files));
+
+        int refCount = 0;
+        if (wantRefs) {
+            List<RefBucket> buckets = Program.BuildRefIndex(files);
+            File.WriteAllText(Program.OUT_DIR + "/refs.json", Program.RenderRefs(buckets));
+            refCount = buckets.Count;
+        }
 
         // Route table, when this looks like a ZanWeb server project.
         string controllerDir = root + "/src/Controller";
@@ -207,6 +280,7 @@ class Program {
         while (i < files.Count) { symCount = symCount + files[i].syms.Count; i = i + 1; }
         Console.WriteLine("[repomap] " + Convert.ToString(files.Count) + " files, "
             + Convert.ToString(symCount) + " symbols, "
+            + Convert.ToString(refCount) + " indexed names, "
             + Convert.ToString(routeCount) + " routes -> " + Program.OUT_DIR + "/");
         return 0;
     }
@@ -225,10 +299,14 @@ class Program {
         while (i < fs.Count) {
             string fn = fs[i];
             i = i + 1;
-            if (Str.EndsWith(fn, ".zan")) {
+            bool isZan = Str.EndsWith(fn, ".zan");
+            bool isC = Str.EndsWith(fn, ".c") || Str.EndsWith(fn, ".h");
+            if (isZan || isC) {
                 string relPath = rel + fn;
                 FileInfo fi = FileInfo.Create(relPath);
-                Program.ScanFile(dir + "/" + fn, fi);
+                fi.abs = dir + "/" + fn;
+                if (isZan) { Program.ScanFile(fi.abs, fi); }
+                else { Program.ScanCFile(fi.abs, fi); }
                 if (fi.syms.Count > 0) { outp.Add(fi); }
             }
         }
@@ -249,26 +327,263 @@ class Program {
         string text = File.ReadAllText(path);
         List<string> lines = Program.SplitLines(text);
         List<int> depth = Program.DepthPerLine(lines);
+        string doc = "";
         int i = 0;
         while (i < lines.Count) {
             string t = Str.Trim(lines[i]);
             int d = depth[i];
             if (t.Length > 0) {
-                if (d == 0) {
-                    Program.TryType(t, i + 1, fi);
-                } else if (d == 1) {
-                    Program.TryMethod(t, i + 1, fi);
+                if (Str.StartsWith(t, "///")) {
+                    string piece = Str.Trim(Program.StripTags(t.Substring(3, t.Length - 3)));
+                    if (piece.Length > 0 && doc.Length == 0) { doc = piece; }
+                } else if (Str.StartsWith(t, "//") || Str.StartsWith(t, "[")
+                           || Str.StartsWith(t, "*") || Str.StartsWith(t, "/*")) {
+                    // attributes and plain comments keep the pending summary
+                } else {
+                    if (d == 0) {
+                        if (Str.Word(t, "namespace") && fi.ns.Length == 0) {
+                            fi.ns = Program.DottedAfter(t, "namespace");
+                        }
+                        Program.TryType(t, i + 1, fi, doc);
+                    } else if (d == 1) {
+                        Program.TryMethod(t, i + 1, fi, doc);
+                    }
+                    doc = "";
                 }
             }
             i = i + 1;
         }
     }
 
-    static void TryType(string t, int line, FileInfo fi) {
-        if (Str.Word(t, "class")) { fi.syms.Add(Sym.Create("class", Program.IdentAfter(t, "class"), "", line)); }
-        else if (Str.Word(t, "struct")) { fi.syms.Add(Sym.Create("struct", Program.IdentAfter(t, "struct"), "", line)); }
-        else if (Str.Word(t, "interface")) { fi.syms.Add(Sym.Create("interface", Program.IdentAfter(t, "interface"), "", line)); }
-        else if (Str.Word(t, "enum")) { fi.syms.Add(Sym.Create("enum", Program.IdentAfter(t, "enum"), "", line)); }
+    /// <summary>Symbols of a C translation unit or header: the compiler and
+    /// runtime live in .c/.h, so without this the index stops at the stdlib and
+    /// an AI has to grep src/ by hand. Definitions are recognised where a
+    /// top-level block opens, which keeps multi-line signatures intact;
+    /// prototypes (`...);` at depth 0) and macros are indexed too so a header
+    /// alone answers "what is the API".</summary>
+    static void ScanCFile(string path, FileInfo fi) {
+        List<string> lines = Program.SplitLines(File.ReadAllText(path));
+        List<int> depth = Program.DepthPerLine(lines);
+        string doc = "";
+        string pend = "";        // signature text accumulated at depth 0
+        int pendLine = 0;
+        bool inBlock = false;    // inside a /* ... */ comment
+        int i = 0;
+        while (i < lines.Count) {
+            string t = Str.Trim(lines[i]);
+            int d = depth[i];
+            i = i + 1;
+            if (inBlock) {
+                // Prose inside a block comment must not join a signature:
+                // continuation lines need not start with '*'.
+                int close = Str.Find(t, "*/", 0);
+                if (close < 0) {
+                    if (doc.Length == 0) { doc = Program.CDocLine(t); }
+                    continue;
+                }
+                inBlock = false;
+                t = Str.Trim(t.Substring(close + 2, t.Length - close - 2));
+                if (t.Length == 0) { continue; }
+            }
+            if (d == 1 && Str.StartsWith(t, "}") && Str.EndsWith(t, ";")
+                && Str.Find(t, "(", 0) < 0) {                // not `} while (c);`
+                // `} zan_string_t;` closing an anonymous `typedef struct {`
+                string cn = Program.LastIdent(t);
+                if (cn.Length > 0) {
+                    Sym cs = Sym.Create("typedef", cn, "typedef struct { ... } "
+                        + cn, i);
+                    fi.syms.Add(cs);
+                }
+                continue;
+            }
+            if (d != 0) { continue; }
+            if (t.Length == 0) { pend = ""; doc = ""; continue; }
+            if (Str.StartsWith(t, "//") || Str.StartsWith(t, "*")
+                || Str.StartsWith(t, "/*")) {
+                if (doc.Length == 0) { doc = Program.CDocLine(t); }
+                if (Str.Find(t, "/*", 0) >= 0 && Str.Find(t, "*/", 0) < 0) {
+                    inBlock = true;
+                }
+                continue;
+            }
+            if (Str.StartsWith(t, "#")) {
+                Program.TryCMacro(t, i, fi, doc);
+                doc = "";
+                continue;
+            }
+            if (pend.Length == 0) { pendLine = i; }
+            pend = pend + (pend.Length > 0 ? " " : "") + t;
+            if (Str.EndsWith(t, "{")) {
+                Program.TryCBlock(pend, pendLine, fi, doc);
+                pend = "";
+                doc = "";
+            } else if (Str.EndsWith(t, ";")) {
+                Program.TryCProto(pend, pendLine, fi, doc);
+                pend = "";
+                doc = "";
+            }
+        }
+    }
+
+    /// <summary>First words of a C comment line, without the markers.</summary>
+    static string CDocLine(string t) {
+        string s = t;
+        if (Str.StartsWith(s, "/**")) { s = s.Substring(3, s.Length - 3); }
+        else if (Str.StartsWith(s, "/*")) { s = s.Substring(2, s.Length - 2); }
+        else if (Str.StartsWith(s, "//")) { s = s.Substring(2, s.Length - 2); }
+        else if (Str.StartsWith(s, "*")) { s = s.Substring(1, s.Length - 1); }
+        int end = Str.Find(s, "*/", 0);
+        if (end >= 0) { s = s.Substring(0, end); }
+        return Str.Trim(s);
+    }
+
+    /// <summary>`#define NAME` / `#define NAME(a,b)` as a macro symbol.</summary>
+    static void TryCMacro(string t, int line, FileInfo fi, string doc) {
+        if (!Str.StartsWith(t, "#define")) { return; }
+        string name = Program.IdentAfter(t, "#define");
+        if (name.Length == 0) { return; }
+        Sym s = Sym.Create("macro", name, Str.Trim(t), line);
+        s.doc = doc;
+        fi.syms.Add(s);
+    }
+
+    /// <summary>A top-level `... {` in C: a function definition, or a struct /
+    /// union / enum declaration.</summary>
+    static void TryCBlock(string head, int line, FileInfo fi, string doc) {
+        string sig = head;
+        int brace = Str.Find(sig, "{", 0);
+        if (brace >= 0) { sig = Str.Trim(sig.Substring(0, brace)); }
+        if (sig.Length == 0) { return; }
+        if (Program.IsControlWord(sig)) { return; }
+        string kind = "";
+        if (Str.Word(sig, "struct")) { kind = "struct"; }
+        else if (Str.Word(sig, "union")) { kind = "struct"; }
+        else if (Str.Word(sig, "enum")) { kind = "enum"; }
+        int p = Str.Find(sig, "(", 0);
+        if (p > 0 && kind == "") {
+            string name = Program.NameBefore(sig, p);
+            if (name.Length == 0) { return; }
+            Sym s = Sym.Create("function", name, sig, line);
+            s.doc = doc;
+            fi.syms.Add(s);
+            return;
+        }
+        if (kind == "") { return; }
+        string tag = Program.IdentAfter(sig, kind);
+        if (tag.Length == 0) { return; }   // anonymous: named by its typedef
+        Sym st = Sym.Create(kind, tag, sig, line);
+        st.doc = doc;
+        fi.syms.Add(st);
+    }
+
+    /// <summary>A top-level `...;` in C: a function prototype or a typedef. A
+    /// prototype is kept apart from the definition so a lookup can tell the
+    /// header from the implementation.</summary>
+    static void TryCProto(string head, int line, FileInfo fi, string doc) {
+        string sig = head;
+        int semi = Str.Find(sig, ";", 0);
+        if (semi >= 0) { sig = Str.Trim(sig.Substring(0, semi)); }
+        if (sig.Length == 0) { return; }
+        if (Str.Word(sig, "typedef")) {
+            // the declared name is the last identifier of the declarator
+            string tn = Program.LastIdent(sig);
+            if (tn.Length == 0) { return; }
+            Sym s = Sym.Create("typedef", tn, sig, line);
+            s.doc = doc;
+            fi.syms.Add(s);
+            return;
+        }
+        int p = Str.Find(sig, "(", 0);
+        if (p <= 0) { return; }
+        string name = Program.NameBefore(sig, p);
+        if (name.Length == 0) { return; }
+        if (Program.IsControlWord(sig)) { return; }
+        Sym sp = Sym.Create("prototype", name, sig, line);
+        sp.doc = doc;
+        fi.syms.Add(sp);
+    }
+
+    /// <summary>Last identifier of a declaration (`typedef struct X Y` -> Y).
+    /// Trailing `[]`, `*` and parentheses are skipped.</summary>
+    static string LastIdent(string s) {
+        int i = s.Length - 1;
+        while (i >= 0 && !Str.IsAlnum(s.Substring(i, 1))) { i = i - 1; }
+        int end = i + 1;
+        while (i >= 0 && Str.IsAlnum(s.Substring(i, 1))) { i = i - 1; }
+        if (end <= i + 1) { return ""; }
+        return s.Substring(i + 1, end - i - 1);
+    }
+
+    /// <summary>Drops XML doc tags so a summary line reads as plain prose.</summary>
+    static string StripTags(string s) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            string c = s.Substring(i, 1);
+            if (c == "<") {
+                int close = Str.Find(s, ">", i + 1);
+                if (close < 0) { break; }
+                i = close + 1;
+                continue;
+            }
+            sb.Append(c);
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Dotted identifier after `kw` ("namespace Gui.Component").</summary>
+    static string DottedAfter(string line, string kw) {
+        int p = Str.Find(line, kw, 0);
+        if (p < 0) { return ""; }
+        int i = p + kw.Length;
+        while (i < line.Length && Str.IsSpace(line.Substring(i, 1))) { i = i + 1; }
+        StringBuilder sb = new StringBuilder();
+        while (i < line.Length) {
+            string c = line.Substring(i, 1);
+            if (!Str.IsAlnum(c) && c != ".") { break; }
+            sb.Append(c);
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Base types of a type declaration: the names between ':' and the
+    /// opening brace, comma separated and stripped of generic arguments.</summary>
+    static string BasesOf(string t) {
+        int brace = Str.Find(t, "{", 0);
+        string head = t;
+        if (brace >= 0) { head = t.Substring(0, brace); }
+        int colon = Str.Find(head, ":", 0);
+        if (colon < 0) { return ""; }
+        string tail = head.Substring(colon + 1, head.Length - colon - 1);
+        StringBuilder sb = new StringBuilder();
+        int depth = 0;
+        int i = 0;
+        while (i < tail.Length) {
+            string c = tail.Substring(i, 1);
+            if (c == "<") { depth = depth + 1; }
+            else if (c == ">") { depth = depth - 1; }
+            else if (depth == 0) {
+                if (Str.IsAlnum(c) || c == ".") { sb.Append(c); }
+                else if (c == ",") { sb.Append(","); }
+            }
+            i = i + 1;
+        }
+        return Str.Trim(sb.ToString());
+    }
+
+    static void TryType(string t, int line, FileInfo fi, string doc) {
+        string kind = "";
+        if (Str.Word(t, "class")) { kind = "class"; }
+        else if (Str.Word(t, "struct")) { kind = "struct"; }
+        else if (Str.Word(t, "interface")) { kind = "interface"; }
+        else if (Str.Word(t, "enum")) { kind = "enum"; }
+        if (kind == "") { return; }
+        Sym s = Sym.Create(kind, Program.IdentAfter(t, kind), "", line);
+        s.doc = doc;
+        s.ext = Program.BasesOf(t);
+        fi.syms.Add(s);
     }
 
     static bool IsControlWord(string t) {
@@ -278,7 +593,7 @@ class Program {
             || Str.Word(t, "namespace") || Str.Word(t, "await") || Str.Word(t, "lock");
     }
 
-    static void TryMethod(string t, int line, FileInfo fi) {
+    static void TryMethod(string t, int line, FileInfo fi, string doc) {
         if (Str.StartsWith(t, "//") || Str.StartsWith(t, "*") || Str.StartsWith(t, "/*")) { return; }
         if (Str.StartsWith(t, "[")) { return; }          // attribute
         if (Program.IsControlWord(t)) { return; }
@@ -298,7 +613,9 @@ class Program {
         if (semi >= 0) { sig = Str.Trim(sig.Substring(0, semi)); }
         string kind = "method";
         if (Str.Word(t, "delegate")) { kind = "delegate"; }
-        fi.syms.Add(Sym.Create(kind, name, sig, line));
+        Sym sym = Sym.Create(kind, name, sig, line);
+        sym.doc = doc;
+        fi.syms.Add(sym);
     }
 
     /// <summary>Identifier ending just before position p (the '(').</summary>
@@ -440,18 +757,28 @@ class Program {
                 } else if (owner.Length > 0) {
                     full = owner + "." + s.name;
                 }
+                string ownerOf = "";
+                if (full != s.name) { ownerOf = owner; }
                 if (!first) { sb.Append(","); }
                 first = false;
                 sb.Append("\n{\"name\":\"");
                 sb.Append(Str.JsonEsc(full));
                 sb.Append("\",\"kind\":\"");
                 sb.Append(s.kind);
+                sb.Append("\",\"owner\":\"");
+                sb.Append(Str.JsonEsc(ownerOf));
+                sb.Append("\",\"ns\":\"");
+                sb.Append(Str.JsonEsc(f.ns));
                 sb.Append("\",\"file\":\"");
                 sb.Append(Str.JsonEsc(f.path));
                 sb.Append("\",\"line\":");
                 sb.Append(Convert.ToString(s.line));
                 sb.Append(",\"sig\":\"");
                 sb.Append(Str.JsonEsc(s.sig));
+                sb.Append("\",\"ext\":\"");
+                sb.Append(Str.JsonEsc(s.ext));
+                sb.Append("\",\"doc\":\"");
+                sb.Append(Str.JsonEsc(s.doc));
                 sb.Append("\"}");
             }
         }
@@ -472,9 +799,239 @@ class Program {
         return sb.ToString();
     }
 
+    // ---- reverse index: who uses this name ----
+
+    /// <summary>Builds the reverse index. This is TEXT-LEVEL evidence: an
+    /// identifier match, deduplicated per line, with definition sites excluded.
+    /// There is no overload resolution and no type inference, so a record
+    /// answers "which lines mention this name", not "which calls bind to this
+    /// exact overload". Inheritance edges (`subtypes`) come from the declared
+    /// base list and are exact.</summary>
+    static List<RefBucket> BuildRefIndex(List<FileInfo> files) {
+        List<RefBucket> buckets = new List<RefBucket>();
+        Dictionary<string, int> byName = new Dictionary<string, int>();
+
+        int i = 0;
+        while (i < files.Count) {
+            FileInfo f = files[i];
+            i = i + 1;
+            string owner = "";
+            int j = 0;
+            while (j < f.syms.Count) {
+                Sym s = f.syms[j];
+                j = j + 1;
+                bool isType = s.kind == "class" || s.kind == "struct"
+                    || s.kind == "interface" || s.kind == "enum";
+                if (isType) { owner = s.name; }
+                if (s.name.Length == 0) { continue; }
+                int bi = Program.BucketOf(buckets, byName, s.name);
+                RefBucket b = buckets[bi];
+                RefBucket.AddUnique(b.kinds, s.kind);
+                if (!isType && owner.Length > 0) { RefBucket.AddUnique(b.owners, owner); }
+                RefBucket.AddUnique(b.defs, f.path + ":" + Convert.ToString(s.line));
+                if (isType && s.ext.Length > 0) {
+                    List<string> bases = Program.SplitCommas(s.ext);
+                    int k = 0;
+                    while (k < bases.Count) {
+                        string bn = Program.LastSegment(bases[k]);
+                        k = k + 1;
+                        if (bn.Length == 0) { continue; }
+                        int bx = Program.BucketOf(buckets, byName, bn);
+                        RefBucket bb = buckets[bx];
+                        RefBucket.AddUnique(bb.subtypes, s.name);
+                    }
+                }
+            }
+        }
+
+        int fx = 0;
+        while (fx < files.Count) {
+            FileInfo f = files[fx];
+            fx = fx + 1;
+            bool isTest = Str.StartsWith(f.path, "tests/");
+            List<string> lines = Program.SplitLines(File.ReadAllText(f.abs));
+            int li = 0;
+            while (li < lines.Count) {
+                string raw = lines[li];
+                li = li + 1;
+                string t = Str.Trim(raw);
+                if (t.Length == 0) { continue; }
+                if (Str.StartsWith(t, "//") || Str.StartsWith(t, "*")
+                    || Str.StartsWith(t, "/*")) { continue; }
+                string site = f.path + ":" + Convert.ToString(li);
+                List<string> ids = Program.Identifiers(raw);
+                int k = 0;
+                while (k < ids.Count) {
+                    string id = ids[k];
+                    k = k + 1;
+                    if (!byName.ContainsKey(id)) { continue; }
+                    int bidx = byName[id];
+                    RefBucket b = buckets[bidx];
+                    if (Program.Has(b.defs, site)) { continue; }
+                    b.total = b.total + 1;
+                    if (isTest) { b.tests = b.tests + 1; }
+                    if (b.refs.Count < Program.REF_CAP) { b.refs.Add(site); }
+                }
+            }
+        }
+        return buckets;
+    }
+
+    static int BucketOf(List<RefBucket> buckets, Dictionary<string, int> byName,
+                        string name) {
+        if (byName.ContainsKey(name)) { return byName[name]; }
+        buckets.Add(RefBucket.Create(name));
+        int idx = buckets.Count - 1;
+        byName[name] = idx;
+        return idx;
+    }
+
+    static bool Has(List<string> items, string value) {
+        int i = 0;
+        while (i < items.Count) {
+            if (items[i] == value) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// <summary>Distinct identifiers of one source line, skipping string and
+    /// char literals so quoted text cannot fake a reference.</summary>
+    static List<string> Identifiers(string s) {
+        List<string> outp = new List<string>();
+        int i = 0;
+        int n = s.Length;
+        while (i < n) {
+            string c = s.Substring(i, 1);
+            if (c == "\"" || c == "'") {
+                string quote = c;
+                i = i + 1;
+                while (i < n) {
+                    string q = s.Substring(i, 1);
+                    if (q == "\\") { i = i + 2; continue; }
+                    i = i + 1;
+                    if (q == quote) { break; }
+                }
+                continue;
+            }
+            if (c == "/" && i + 1 < n && s.Substring(i + 1, 1) == "/") { break; }
+            if (!Str.IsAlnum(c)) { i = i + 1; continue; }
+            int start = i;
+            while (i < n && Str.IsAlnum(s.Substring(i, 1))) { i = i + 1; }
+            string id = s.Substring(start, i - start);
+            string first = id.Substring(0, 1);
+            if (Str.Find("0123456789", first, 0) >= 0) { continue; }
+            if (!Program.Has(outp, id)) { outp.Add(id); }
+        }
+        return outp;
+    }
+
+    static List<string> SplitCommas(string s) {
+        List<string> outp = new List<string>();
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            string c = s.Substring(i, 1);
+            if (c == ",") { outp.Add(Str.Trim(sb.ToString())); sb = new StringBuilder(); }
+            else { sb.Append(c); }
+            i = i + 1;
+        }
+        outp.Add(Str.Trim(sb.ToString()));
+        return outp;
+    }
+
+    /// <summary>"System.IO.Stream" -> "Stream".</summary>
+    static string LastSegment(string s) {
+        int cut = -1;
+        int i = 0;
+        while (i < s.Length) {
+            if (s.Substring(i, 1) == ".") { cut = i; }
+            i = i + 1;
+        }
+        if (cut < 0) { return s; }
+        return s.Substring(cut + 1, s.Length - cut - 1);
+    }
+
+    static string RenderRefs(List<RefBucket> buckets) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[");
+        bool first = true;
+        int i = 0;
+        while (i < buckets.Count) {
+            RefBucket b = buckets[i];
+            i = i + 1;
+            if (b.defs.Count == 0 && b.subtypes.Count == 0) { continue; }
+            if (!first) { sb.Append(","); }
+            first = false;
+            sb.Append("\n{\"name\":\"");
+            sb.Append(Str.JsonEsc(b.name));
+            sb.Append("\",\"kinds\":");
+            sb.Append(Program.RenderStrArray(b.kinds));
+            sb.Append(",\"owners\":");
+            sb.Append(Program.RenderStrArray(b.owners));
+            sb.Append(",\"defCount\":");
+            sb.Append(Convert.ToString(b.defs.Count));
+            sb.Append(",\"defs\":");
+            sb.Append(Program.RenderCapped(b.defs));
+            sb.Append(",\"refCount\":");
+            sb.Append(Convert.ToString(b.total));
+            sb.Append(",\"testRefs\":");
+            sb.Append(Convert.ToString(b.tests));
+            sb.Append(",\"refs\":");
+            sb.Append(Program.RenderStrArray(b.refs));
+            sb.Append(",\"subtypes\":");
+            sb.Append(Program.RenderStrArray(b.subtypes));
+            sb.Append("}");
+        }
+        sb.Append("\n]\n");
+        return sb.ToString();
+    }
+
+    /// <summary>Like RenderStrArray but keeps at most REF_CAP entries, so one
+    /// record stays small enough to hand to a model verbatim.</summary>
+    static string RenderCapped(List<string> items) {
+        List<string> head = new List<string>();
+        int i = 0;
+        while (i < items.Count && i < Program.REF_CAP) {
+            head.Add(items[i]);
+            i = i + 1;
+        }
+        return Program.RenderStrArray(head);
+    }
+
+    static string RenderStrArray(List<string> items) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[");
+        int i = 0;
+        while (i < items.Count) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append("\"");
+            sb.Append(Str.JsonEsc(items[i]));
+            sb.Append("\"");
+            i = i + 1;
+        }
+        sb.Append("]");
+        return sb.ToString();
+    }
+
     /// One JSON record per compiler builtin that lacks a stdlib source.
+    ///
+    /// `string`, `List<T>`, `StringBuilder`, `Console` and friends are provided
+    /// by the compiler, so a source scan can never see them and a lookup of
+    /// "StringBuilder" would answer with whatever test fixture happens to
+    /// declare that name. The compiler already keeps the authoritative table in
+    /// src/compiler/builtin_api.c, so read it rather than restating it here;
+    /// the literals below cover the lowerings that table does not describe.
     static List<string> BuiltinRecords() {
-        List<string> r = new List<string>();
+        List<string> r = Program.BuiltinApiRecords();
+        if (r.Count > 0) {
+            // The table answered for the builtin types; only the lowerings it
+            // does not list are left.
+            r.Add(Program.BuiltinRec("Json.Serialize", "string Serialize<T>(T obj)"));
+            r.Add(Program.BuiltinRec("Json.Deserialize",
+                "T Deserialize<T>(string json)"));
+            return r;
+        }
         r.Add(Program.BuiltinRec("Convert.ToDouble", "double ToDouble(string text)"));
         r.Add(Program.BuiltinRec("Convert.ToInt32", "int ToInt32(string text)"));
         r.Add(Program.BuiltinRec("Convert.ToInt64", "long ToInt64(string text)"));
@@ -491,6 +1048,118 @@ class Program {
         r.Add(Program.BuiltinRec("Json.Serialize", "string Serialize<T>(T obj)"));
         r.Add(Program.BuiltinRec("Json.Deserialize", "T Deserialize<T>(string json)"));
         return r;
+    }
+
+    /// Records for every type in the compiler's builtin API table
+    /// (src/compiler/builtin_api.c), empty when that source is not part of this
+    /// workspace. The table is C data, so it is read as data: `members_x[]`
+    /// arrays of `{ "Name", 'M', "signature" }` rows, then the `BT(...)` list
+    /// that binds each array to a public type name.
+    static List<string> BuiltinApiRecords() {
+        List<string> outp = new List<string>();
+        string rel = "src/compiler/builtin_api.c";
+        // The scan root may be the stdlib subtree (the IDE knowledge build
+        // indexes only that), so also look above it for the repository root.
+        string path = Program.scanRoot + "/" + rel;
+        if (!File.Exists(path)) { path = Program.scanRoot + "/../" + rel; }
+        if (!File.Exists(path)) { path = Program.scanRoot + "/../../" + rel; }
+        if (!File.Exists(path)) { return outp; }
+        List<string> lines = Program.SplitLines(File.ReadAllText(path));
+
+        // member arrays, flattened: memArr[i] owns memName[i] / memSig[i] / ...
+        List<string> memArr = new List<string>();
+        List<string> memName = new List<string>();
+        List<string> memSig = new List<string>();
+        List<string> memKind = new List<string>();
+        List<int> memLine = new List<int>();
+        string cur = "";
+        int i = 0;
+        while (i < lines.Count) {
+            string t = Str.Trim(lines[i]);
+            i = i + 1;
+            if (Str.Contains(t, "zan_builtin_member_t") && Str.EndsWith(t, "{")) {
+                cur = Program.IdentAfter(t, "members_");
+                if (cur.Length > 0) { cur = "members_" + cur; }
+                continue;
+            }
+            if (cur.Length > 0 && Str.StartsWith(t, "}")) { cur = ""; continue; }
+            if (cur.Length == 0 || !Str.StartsWith(t, "{")) { continue; }
+            List<string> f = Program.CRowFields(t);
+            if (f.Count < 3) { continue; }
+            memArr.Add(cur);
+            memName.Add(f[0]);
+            memKind.Add(f[1] == "P" ? "property" : "method");
+            memSig.Add(f[2]);
+            memLine.Add(i);
+        }
+
+        int j = 0;
+        while (j < lines.Count) {
+            string t = Str.Trim(lines[j]);
+            j = j + 1;
+            if (!Str.StartsWith(t, "BT(")) { continue; }
+            List<string> f = Program.CRowFields(t);
+            if (f.Count < 5) { continue; }
+            string pub = f[1];
+            string disp = f[2];
+            string arr = f[4];
+            if (pub.Length == 0 || arr.Length == 0) { continue; }
+            outp.Add(Program.BuiltinTypeRec(pub, disp, rel, j));
+            int k = 0;
+            while (k < memArr.Count) {
+                if (memArr[k] == arr) {
+                    outp.Add(Program.BuiltinMemberRec(pub + "." + memName[k],
+                        pub, memKind[k], memSig[k], rel, memLine[k]));
+                }
+                k = k + 1;
+            }
+        }
+        return outp;
+    }
+
+    /// Fields of one C initialiser row: quoted strings, char literals and bare
+    /// identifiers, in order, unquoted (`{ "Length", 'P', "int Length" },` ->
+    /// Length / P / int Length).
+    static List<string> CRowFields(string t) {
+        List<string> outp = new List<string>();
+        int depth = 0;
+        int i = 0;
+        while (i < t.Length) {
+            string c = t.Substring(i, 1);
+            if (c == "\"" || c == "'") {
+                int end = Str.Find(t, c, i + 1);
+                if (end < 0) { break; }
+                outp.Add(t.Substring(i + 1, end - i - 1));
+                i = end + 1;
+                continue;
+            }
+            if (Str.IsAlnum(c)) {
+                int s = i;
+                while (i < t.Length && Str.IsAlnum(t.Substring(i, 1))) { i = i + 1; }
+                string word = t.Substring(s, i - s);
+                if (word != "BT") { outp.Add(word); }
+                continue;
+            }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    static string BuiltinTypeRec(string name, string disp, string file, int line) {
+        return "{\"name\":\"" + Str.JsonEsc(name) + "\",\"kind\":\"class\""
+            + ",\"owner\":\"\",\"ns\":\"\",\"file\":\"" + Str.JsonEsc(file)
+            + "\",\"line\":" + Convert.ToString(line) + ",\"sig\":\""
+            + Str.JsonEsc(disp) + "\",\"ext\":\"\",\"doc\":\""
+            + "compiler builtin; no stdlib source\"}";
+    }
+
+    static string BuiltinMemberRec(string name, string owner, string kind,
+                                   string sig, string file, int line) {
+        return "{\"name\":\"" + Str.JsonEsc(name) + "\",\"kind\":\""
+            + Str.JsonEsc(kind) + "\",\"owner\":\"" + Str.JsonEsc(owner)
+            + "\",\"ns\":\"\",\"file\":\"" + Str.JsonEsc(file) + "\",\"line\":"
+            + Convert.ToString(line) + ",\"sig\":\"" + Str.JsonEsc(sig)
+            + "\",\"ext\":\"\",\"doc\":\"compiler builtin\"}";
     }
 
     static string BuiltinRec(string name, string sig) {

@@ -1213,3 +1213,62 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
 > `unsigned_types` 的全部数值语义；`Path.zan` 的 calloc-as-string 惯用法；
 > 泛型第 5 条（Dictionary 装泛型类值）与第 6 条（`foreach Dictionary.Keys`）；
 > async 的 try 体 / finally / switch / while / 嵌套 try / 跨协程异常传播。
+
+# A43 · enum.ToString() 返回成员名 —— ✅ 已完成（2026-08-23）
+
+- 根因：irgen 的标量 `ToString()` lowering 把 TYPE_ENUM 接收者与整数同等对待，
+  走 `emit_itoa_into` 数值路径，永远输出数字；标准库因此遍地手写 int→名映射链
+  （`Log.LevelName`、ChartModel 19 处、ChartView 12 处等）。
+- 修复：`src/compiler/irgen_call.c` 新增 `irgen_enum_members()`（C# 运行计数器
+  语义：显式 `= n` 重置、否则 +1，与 EnumType.Member 折叠和反射表三处一致）；
+  enum 接收者生成分支链 + phi join——不能用 select，回退臂的字符串缓冲在命中时
+  也被求值，会泄漏（leakcheck 孪生当场抓住过）。命中返回成员名字面量，未命中
+  回落数值格式；同值别名先声明者胜。
+- 证据：`tests/conformance/enum_tostring.zan`（含 determinism/leakcheck 孪生）、
+  `ctest -R enum` 13/13、smoke 128/128 全过。
+- [ ] 后续：`Color.Red.ToString()` 静态成员链调用目前连解析都不过
+  （报 unresolved call 'Color.Red.ToString'），修好解析后可一并补
+  `Enum.TryParse(string)`；届时批量清理 stdlib 手写映射链。
+
+# B9 · Web 框架现代化：[Tx] 事务作用域 + 签名参数绑定 —— [~]（2026-08-23）
+
+1. ✅ **[Tx] 事务作用域**：stdlib `Controller` 新增虚方法
+   `__TxBegin()/__TxCommit()/__TxRollback()`（默认 no-op，普通控制器零感知）；
+   GenRoute 对 `[Tx]` action 生成 Begin→action→Commit，失败路径先 Rollback 再走
+   原 ApiError 应答（Begin 失败抛 503 走同一通道）；server-mvc `AppController`
+   用请求租约的 Begin/Commit/Rollback 覆盖三钩子。`Tx` 列入结构性属性不进文档元数据。
+2. ✅ **签名参数绑定**：全基元签名（int/long/string/double/bool）的实例 action
+   由蹦床按签名生成 `NeedX` 绑定，缺失/非法统一 400/0003，action 体不再手写
+   In() 拉取；同名参数进路由文档表（Controller 补齐 NeedDouble/NeedBool）。
+   静态方法与含不可绑定类型的签名维持原跳过行为，零回归。
+   演示样板：`templates/server/server-mvc/src/Controller/Admin/Dev/TxProbe.zan`。
+   - 证据：`tests/conformance/web_typed_binding.zan`（conformance/determinism/
+     leakcheck 三孪生全过）；`conformance_web_*` 既有 7 项全过；server-mvc 模板
+     215 文件整编通过（AppController 覆盖 + 新控制器）。
+3. [ ] **GenDb 仓储生成**（FreeSql 式体验的最后一块）：从 genmeta 类模型生成
+   `XxxDao` CRUD 门面 + 控制器访问器接线，项目里不再手写 UserDao 样板；
+   手写 DAO 保留为复杂查询出口。纯编译期展开，无运行时反射；
+   注入点用本次已落地的 `__Bind`/`__BeforeAsync` 请求作用域机制。
+4. 备注：`leakcheck_web_framing` 在主干上即失败（Accept 协程驻留使请求对象
+   可达），与本节改动无关；新用例采用进程内直调蹦床规避了该形态。
+
+
+# A44 · 生成器元数据收敛（genmeta calls 裁剪）—— ✅ 已完成（2026-08-24）
+
+- 症状：ZanIDE 整编时编译期元数据（`_scratch/ide_meta.json` 快照）达 14.1MB，
+  47435 个调用点被全量序列化，生成器只用到其中极少数。
+- 修复：`src/compiler/genmeta.c` 新增 `gm_prune_calls()`，只保留生成器真正消费的
+  调用点（`Json.Serialize/Deserialize`、Route 的 `In*/Need*/Param/Paged`、DB 的
+  `Query/Select/Insert/Update/Delete/SyncStructure*/Read*`、以及任何带 `Expr<...>`
+  形参的方法），并按 `recv_id` 做双向闭包保留 fluent 链的祖先与后代，避免链式
+  调用被截断。
+- 顺带修根因：`src/common/json.c` 增加 `JSON_MAX_DEPTH 1024` 递归深度上限与
+  realloc 失败检查；`src/compiler/genrun.c` 元数据只解析一次，且解析失败改为显式
+  报错并终止 codegen（此前会静默当作"没有生成器被触发"）。
+- 证据：ZanIDE 整编通过（`IDE_BUILD_OK build\ZanIDE.exe`），本次整编的元数据输入
+  1.53MB（裁剪前同口径 14.1MB）。A/B 判定：同一份 zanc 用环境变量开/关裁剪，各跑
+  一遍那 33 个失败用例，失败集合逐项完全一致，裁剪与这批失败无因果关系。
+- 备注：standard 层 562 项中 33 项失败，属工作树内其它未提交改动（irgen/checker/
+  stdlib 等）的既有问题，本节未定位；`build\ZanIDE.exe` 当前 12.23MB
+  （`dist/win-x64/ZanIDE.exe` 8-15 号快照为 8.2MB），EXE 本体增长来自 GUI/stdlib
+  侧改动，尚未追查。

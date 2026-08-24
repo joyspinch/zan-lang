@@ -257,8 +257,23 @@ if (Test-Path $toolsDir) {
 # catalog) via its api_search / example tools, so it answers from a generated
 # index instead of grepping the raw stdlib. Same data the server-side MCP
 # serves. Non-fatal: the assistant falls back to stdlib_grep if this is absent.
+$knowledgeDir = Join-Path $dist 'knowledge'
+New-Item -ItemType Directory -Force -Path $knowledgeDir | Out-Null
+$gallerySeed = Join-Path $root 'tools\mcp_server\gallery.json'
+$zformDoc = Join-Path $root 'tools\mcp_server\zform.doc.json'
+if (Test-Path $gallerySeed) {
+    Copy-Item $gallerySeed (Join-Path $knowledgeDir 'gallery.seed.json') -Force
+} else {
+    Write-Output "PUBLISH_WARN: gallery seed missing; server-side refresh is unavailable"
+}
+if (Test-Path $zformDoc) {
+    Copy-Item $zformDoc (Join-Path $knowledgeDir 'zform.doc.json') -Force
+} else {
+    Write-Output "PUBLISH_WARN: zform doc missing; server-side refresh is unavailable"
+}
 & (Join-Path $root 'scripts\gen_knowledge.ps1') `
-    -Zanc $zancExe -Stdlib $stdlib -OutDir (Join-Path $dist 'knowledge')
+    -Zanc $zancExe -Stdlib $stdlib -OutDir $knowledgeDir `
+    -GallerySrc $gallerySeed -ZformDoc $zformDoc
 
 # ---- AI onboarding pack (AGENTS.md + skills + stdio MCP + client configs) --
 # Any external AI tool (Claude Code / Cursor / Copilot / Windsurf) can drive
