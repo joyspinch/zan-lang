@@ -290,13 +290,15 @@ partial class Designer {
         int bw = winW;
         int bh = winH;
         FormField pc = ParentContainerOf(sel);
-        if (pc != null) { bw = pc.fw; bh = pc.fh; }
+        if (pc != null) { bw = pc.LayoutW(); bh = pc.LayoutH(); }
+        int sw = sel.LayoutW();
+        int sh = sel.LayoutH();
         if (mode == 0) { sel.fx = 0; }
-        else if (mode == 1) { sel.fx = (bw - sel.fw) / 2; }
-        else if (mode == 2) { sel.fx = bw - sel.fw; }
+        else if (mode == 1) { sel.fx = (bw - sw) / 2; }
+        else if (mode == 2) { sel.fx = bw - sw; }
         else if (mode == 3) { sel.fy = 0; }
-        else if (mode == 4) { sel.fy = (bh - sel.fh) / 2; }
-        else if (mode == 5) { sel.fy = bh - sel.fh; }
+        else if (mode == 4) { sel.fy = (bh - sh) / 2; }
+        else if (mode == 5) { sel.fy = bh - sh; }
         if (sel.fx < 0) { sel.fx = 0; }
         if (sel.fy < 0) { sel.fy = 0; }
     }
@@ -310,9 +312,9 @@ partial class Designer {
 
     // ---- 流式（自动吸附）排版 ----
     //
-    // 24 列的 form-builder 排版，但结果写回和自由画布同一套
-    // 设计空间矩形（fx/fy/fw/fh），于是命中测试、框选、缩放、
-    // 平移这些画布交互两种布局共用一份实现。
+    // 24 列的 form-builder 排版，但结果写入和自由画布同一套
+    // 运行时设计空间矩形，于是命中测试、框选、缩放、平移这些
+    // 画布交互两种布局共用一份实现。
 
     /// 设计窗口内容区的上边（留出表单标题）。
     int FlowTop() { return 44; }
@@ -359,9 +361,7 @@ partial class Designer {
                 int fw2 = xb - xa;
                 if (rc < rowEnd - 1) { fw2 = fw2 - 12; }
                 if (fw2 < 24) { fw2 = 24; }
-                f.fx = xa;
-                f.fy = y;
-                f.fw = fw2;
+                f.SetLayoutRect(xa, y, fw2, f.FreeH());
                 rc = rc + 1;
             }
             int rowH = 0;
@@ -373,7 +373,9 @@ partial class Designer {
             }
             int rh = rowStart;
             while (rh < rowEnd) {
-                lst[vis[rh]].fh = rowH;
+                FormField rf = lst[vis[rh]];
+                rf.SetLayoutRect(rf.LayoutX(), rf.LayoutY(),
+                    rf.LayoutW(), rowH);
                 rh = rh + 1;
             }
             y = y + rowH + 6;
@@ -413,7 +415,7 @@ partial class Designer {
     int LayoutFlowKids(FormField f) {
         int tab = 0 - 1;
         if (f.kind == "Tabs") { tab = Designer.TabActivePage(f); }
-        int w0 = f.fw - 12;
+        int w0 = f.LayoutW() - 12;
         if (w0 < 40) { w0 = 40; }
         int endY = this.LayoutFlowList(f.kids, 0, 8, w0, tab);
         int body = endY - 8 - 6 + 16;
@@ -441,10 +443,10 @@ partial class Designer {
         }
         if (cont != null) {
             dropContainer = cont;
-            int hx = ox + cont.fx * psMilli / 1000;
-            int hy = oy + cont.fy * psMilli / 1000;
-            c.DrawRect(hx - 2, hy - 2, cont.fw * psMilli / 1000 + 4,
-                cont.fh * psMilli / 1000 + 4, Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0), 2);
+            int hx = ox + cont.LayoutX() * psMilli / 1000;
+            int hy = oy + cont.LayoutY() * psMilli / 1000;
+            c.DrawRect(hx - 2, hy - 2, cont.LayoutW() * psMilli / 1000 + 4,
+                cont.LayoutH() * psMilli / 1000 + 4, Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0), 2);
             return;
         }
         dropIndex = fields.Count;
@@ -452,16 +454,17 @@ partial class Designer {
         for (int i = 0; i < fields.Count; i = i + 1) {
             FormField f = fields[i];
             if (f.IsNonVisual()) { continue; }
-            bool before = mdy < f.fy + f.fh / 2;
-            if (!before && mdy < f.fy + f.fh && mdx < f.fx + f.fw / 2) {
+            bool before = mdy < f.LayoutY() + f.LayoutH() / 2;
+            if (!before && mdy < f.LayoutY() + f.LayoutH()
+                    && mdx < f.LayoutX() + f.LayoutW() / 2) {
                 before = true;
             }
             if (before) {
                 dropIndex = i;
-                lineY = f.fy - 4;
+                lineY = f.LayoutY() - 4;
                 break;
             }
-            lineY = f.fy + f.fh + 2;
+            lineY = f.LayoutY() + f.LayoutH() + 2;
         }
         c.FillRect(ox + 12 * psMilli / 1000, oy + lineY * psMilli / 1000,
             (dw - 24) * psMilli / 1000, 2, Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0));
@@ -561,9 +564,12 @@ partial class Designer {
     /// 停靠布局：设了停靠边的组件在所在层里自动吸边——按顺序
     /// 从剩余矩形上切走一条（厚度沿用组件自己的宽/高），Fill
     /// 铺满剩下的全部；停靠为「自由」(0) 的组件不参与，保持
-    /// 绝对定位。每帧算一遍并写回 fx/fy/fw/fh，所以画布、命中
-    /// 测试和保存的 JSON 看到的是同一份矩形。
+    /// 绝对定位。每帧算一遍并写入运行时矩形，画布和命中测试
+    /// 看到解算结果，而保存的 JSON 仍只看作者矩形。
     void ApplyDockLayout(List<FormField> lst, int ax, int ay, int aw, int ah) {
+        for (int i = 0; i < lst.Count; i = i + 1) {
+            lst[i].ResetLayout();
+        }
         this.ApplyDockLayer(lst, ax, ay, aw, ah, 0 - 1);
         this.ApplyDockNested(lst);
     }
@@ -576,8 +582,8 @@ partial class Designer {
         for (int i = 0; i < lst.Count; i = i + 1) {
             FormField f = lst[i];
             if (f.KidCount() == 0) { continue; }
-            int iw = f.fw - this.KidInsetX(f) * 2;
-            int ih = f.fh - this.KidInsetY(f) - this.KidInsetX(f);
+            int iw = f.LayoutW() - this.KidInsetX(f) * 2;
+            int ih = f.LayoutH() - this.KidInsetY(f) - this.KidInsetX(f);
             if (iw < 0) { iw = 0; }
             if (ih < 0) { ih = 0; }
             if (f.kind == "Tabs") {
@@ -608,31 +614,26 @@ partial class Designer {
             if (tabFilter >= 0 && f.childTab != tabFilter) { continue; }
             int d = f.dockSide;
             if (d == 1 || d == 2) {
-                int th = f.fh;
+                int th = f.FreeH();
                 if (th > rh) { th = rh; }
-                f.fx = rx;
-                f.fw = rw;
-                f.fh = th;
-                if (d == 1) { f.fy = ry; ry = ry + th; }
-                else { f.fy = ry + rh - th; }
+                int fy = ry;
+                if (d == 2) { fy = ry + rh - th; }
+                f.SetLayoutRect(rx, fy, rw, th);
+                if (d == 1) { ry = ry + th; }
                 rh = rh - th;
             } else if (d == 3 || d == 4) {
-                int tw = f.fw;
+                int tw = f.FreeW();
                 if (tw > rw) { tw = rw; }
-                f.fy = ry;
-                f.fw = tw;
-                f.fh = rh;
-                if (d == 3) { f.fx = rx; rx = rx + tw; }
-                else { f.fx = rx + rw - tw; }
+                int fx = rx;
+                if (d == 4) { fx = rx + rw - tw; }
+                f.SetLayoutRect(fx, ry, tw, rh);
+                if (d == 3) { rx = rx + tw; }
                 rw = rw - tw;
             } else if (d == 5) {
                 // Fill 铺满剩下的矩形但不吃掉它（跟运行时
                 // Control.Arrange 一致）：否则同一层里第二个 Fill
                 // 以及 Fill 后面的组件全部只能拿到 0×0。
-                f.fx = rx;
-                f.fy = ry;
-                f.fw = rw;
-                f.fh = rh;
+                f.SetLayoutRect(rx, ry, rw, rh);
             }
             if (rw < 0) { rw = 0; }
             if (rh < 0) { rh = 0; }
@@ -644,10 +645,10 @@ partial class Designer {
     void RenderFreeField(App app, Canvas c, Theme t, FormField f, int ox, int oy,
             int psMilli, int px, int py) {
         int fs = t.fontSizeSmall;
-        int ex = ox + (px + f.fx) * psMilli / 1000;
-        int ey = oy + (py + f.fy) * psMilli / 1000;
-        int ew = f.fw * psMilli / 1000;
-        int eh = f.fh * psMilli / 1000;
+        int ex = ox + (px + f.LayoutX()) * psMilli / 1000;
+        int ey = oy + (py + f.LayoutY()) * psMilli / 1000;
+        int ew = f.LayoutW() * psMilli / 1000;
+        int eh = f.LayoutH() * psMilli / 1000;
         if (ew < 2) { ew = 2; }
         if (eh < 2) { eh = 2; }
         bool selected = !preview && (f == sel);
@@ -658,8 +659,8 @@ partial class Designer {
             // 容器：装饰 + 标题，子节点放在内容框内。
             c.FillRoundRect(ex, ey, ew, eh, app.Scale(4), Style.Part(app, "designer", "track", "", "", "", Style.SNormal()).BgOr(0));
             c.DrawRoundRect(ex, ey, ew, eh, app.Scale(4), Style.Part(app, "designer", "field", "", "", "", Style.SNormal()).BorderOr(0), 1);
-            int kidPX = px + f.fx + this.KidInsetX(f);
-            int kidPY = py + f.fy + this.KidInsetY(f);
+            int kidPX = px + f.LayoutX() + this.KidInsetX(f);
+            int kidPY = py + f.LayoutY() + this.KidInsetY(f);
             int tab = 0 - 1;
             if (f.kind == "Tabs") {
                 // 标签页容器画成真正的标签条：每一页一个页签，点
@@ -846,9 +847,10 @@ partial class Designer {
             FormField f = lst[i];
             if (f.IsNonVisual()) { i = i - 1; continue; }
             if (tabFilter >= 0 && f.childTab != tabFilter) { i = i - 1; continue; }
-            int ex = px + f.fx;
-            int ey = py + f.fy;
-            if (mx >= ex && mx < ex + f.fw && my >= ey && my < ey + f.fh) {
+            int ex = px + f.LayoutX();
+            int ey = py + f.LayoutY();
+            if (mx >= ex && mx < ex + f.LayoutW()
+                    && my >= ey && my < ey + f.LayoutH()) {
                 if (f.IsContainer() && f.KidCount() > 0) {
                     int kidTab = 0 - 1;
                     if (f.kind == "Tabs") { kidTab = Designer.TabActivePage(f); }
@@ -898,13 +900,13 @@ partial class Designer {
             FormField f = sibs[i];
             if (f == self || f.IsNonVisual()) { continue; }
             if (horiz) {
-                lines.Add(f.fx);
-                lines.Add(f.fx + f.fw / 2);
-                lines.Add(f.fx + f.fw);
+                lines.Add(f.LayoutX());
+                lines.Add(f.LayoutX() + f.LayoutW() / 2);
+                lines.Add(f.LayoutX() + f.LayoutW());
             } else {
-                lines.Add(f.fy);
-                lines.Add(f.fy + f.fh / 2);
-                lines.Add(f.fy + f.fh);
+                lines.Add(f.LayoutY());
+                lines.Add(f.LayoutY() + f.LayoutH() / 2);
+                lines.Add(f.LayoutY() + f.LayoutH());
             }
         }
         return lines;
@@ -973,7 +975,10 @@ partial class Designer {
         int dh = winH;
         if (dw < 40) { dw = 40; }
         if (dh < 40) { dh = 40; }
-        // 流式布局：每帧把自动排版的结果写回设计空间矩形，
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            fields[i].ResetLayout();
+        }
+        // 流式布局：每帧把自动排版的结果写入运行时矩形，
         // 下面的命中测试 / 框选 / 渲染就和自由布局走同一条路。
         // 排下来比窗口高时把设计面往下延长，免得多出来的字段
         // 被裁掉后既看不见也选不中。
@@ -1190,10 +1195,10 @@ partial class Designer {
                 started = true;
             }
             if (!started && free && sel != null && !sel.locked) {
-                int sx = ox + (freeSelPX + sel.fx) * psMilli / 1000;
-                int sy = oy + (freeSelPY + sel.fy) * psMilli / 1000;
-                int sw2 = sel.fw * psMilli / 1000;
-                int sh2 = sel.fh * psMilli / 1000;
+                int sx = ox + (freeSelPX + sel.LayoutX()) * psMilli / 1000;
+                int sy = oy + (freeSelPY + sel.LayoutY()) * psMilli / 1000;
+                int sw2 = sel.LayoutW() * psMilli / 1000;
+                int sh2 = sel.LayoutH() * psMilli / 1000;
                 int hs = app.Scale(10);
                 for (int hn = 0; hn < 8 && !started; hn = hn + 1) {
                     int hx = FreeHandleX(hn, sx, sw2);
@@ -1232,8 +1237,8 @@ partial class Designer {
                         msg = Designer.T("locked", "已锁定");
                     } else if (free) {
                         freeDragging = true;
-                        freeDragDx = mDesX - (freeSelPX + hit.fx);
-                        freeDragDy = mDesY - (freeSelPY + hit.fy);
+                        freeDragDx = mDesX - (freeSelPX + hit.LayoutX());
+                        freeDragDy = mDesY - (freeSelPY + hit.LayoutY());
                     } else {
                         // 流式布局：拖动就是重排（拖到容器上则移入）。
                         int ti = IndexIn(fields, this.TopLevelOf(hit));
@@ -1285,11 +1290,11 @@ partial class Designer {
             this.freeGuideY = 0 - 1;
             bool topLevel = freeSelPX == 0 && freeSelPY == 0;
             if (topLevel && !Modifiers.HasAlt(app.window.EventMods())) {
-                newLeft = this.FreeSnapX(app, newLeft, sel.fw, dw, sel, psMilli);
-                newTop = this.FreeSnapY(app, newTop, sel.fh, dh, sel, psMilli);
+                newLeft = this.FreeSnapX(app, newLeft, sel.LayoutW(), dw, sel, psMilli);
+                newTop = this.FreeSnapY(app, newTop, sel.LayoutH(), dh, sel, psMilli);
             }
-            int mvdx = (newLeft - freeSelPX) - sel.fx;
-            int mvdy = (newTop - freeSelPY) - sel.fy;
+            int mvdx = (newLeft - freeSelPX) - sel.LayoutX();
+            int mvdy = (newTop - freeSelPY) - sel.LayoutY();
             sel.fx = newLeft - freeSelPX;
             sel.fy = newTop - freeSelPY;
             // 多选：其余成员按相同增量跟随。
@@ -1297,8 +1302,8 @@ partial class Designer {
                 for (int me = 0; me < freeExtra.Count; me = me + 1) {
                     FormField ef = freeExtra[me];
                     if (ef == null || ef.locked) { continue; }
-                    ef.fx = ef.fx + mvdx;
-                    ef.fy = ef.fy + mvdy;
+                    ef.fx = ef.LayoutX() + mvdx;
+                    ef.fy = ef.LayoutY() + mvdy;
                     if (ef.fx < 0) { ef.fx = 0; }
                     if (ef.fy < 0) { ef.fy = 0; }
                 }
@@ -1314,10 +1319,10 @@ partial class Designer {
                 mDesX = (mDesX + gridSize / 2) / gridSize * gridSize;
                 mDesY = (mDesY + gridSize / 2) / gridSize * gridSize;
             }
-            int oldL = freeSelPX + sel.fx;
-            int oldT = freeSelPY + sel.fy;
-            int oldR = oldL + sel.fw;
-            int oldB = oldT + sel.fh;
+            int oldL = freeSelPX + sel.LayoutX();
+            int oldT = freeSelPY + sel.LayoutY();
+            int oldR = oldL + sel.LayoutW();
+            int oldB = oldT + sel.LayoutH();
             int newL = oldL;
             int newT = oldT;
             int newR = oldR;
@@ -1361,8 +1366,10 @@ partial class Designer {
                 for (int mi = 0; mi < fields.Count; mi = mi + 1) {
                     FormField mf = fields[mi];
                     if (mf.IsNonVisual()) { continue; }
-                    bool touches = mf.fx < selR && mf.fx + mf.fw > selL
-                        && mf.fy < selB && mf.fy + mf.fh > selT;
+                    bool touches = mf.LayoutX() < selR
+                        && mf.LayoutX() + mf.LayoutW() > selL
+                        && mf.LayoutY() < selB
+                        && mf.LayoutY() + mf.LayoutH() > selT;
                     if (touches) {
                         if (sel == null) { sel = mf; } else { freeExtra.Add(mf); }
                     }
@@ -1447,8 +1454,8 @@ partial class Designer {
         int px = freeSelPX;
         int py = freeSelPY;
         if (pick.IsContainer()) {
-            freeDropPX = px + pick.fx + this.KidInsetX(pick);
-            freeDropPY = py + pick.fy + this.KidInsetY(pick);
+            freeDropPX = px + pick.LayoutX() + this.KidInsetX(pick);
+            freeDropPY = py + pick.LayoutY() + this.KidInsetY(pick);
             return pick;
         }
         FormField cont = this.ParentContainerOf(pick);

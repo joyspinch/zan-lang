@@ -149,6 +149,7 @@ class GenRoute {
     static bool AttrIsStructural(string n) {
         if (GenRoute.AttrHttpVerb(n).Length > 0) { return true; }
         if (n == "Route" || n == "ApiController" || n == "NonAction" ||
+            n == "Tx" ||
             n == "Description" || n == "AttributeUsage" ||
             n == "DllImport" || n == "StructLayout" || n == "Obsolete") {
             return true;
@@ -815,14 +816,18 @@ class GenRoute {
                 continue;
             }
 
-            /* 支持的形状:0 参数,或单个 HttpContext 参数 */
+            /* 支持的形状:0 参数、单个 HttpContext 参数,或实例 action 的
+             * 全基元签名(string/int/long/double/bool)——后者由蹦床按
+             * 签名从请求绑定,action 体里不再手写 In() 拉取。 */
             JsonValue ps = m.Get("params");
             int np = ps != null ? ps.Count() : 0;
             bool ctxParam = false;
             if (np == 1 && ps.At(0).Str("type", "") == "HttpContext") {
                 ctxParam = true;
             }
-            if (np != 0 && !ctxParam) { continue; }
+            bool bindable = np > 0 && !ctxParam &&
+                !m.Bool("static", false) && GenRoute.BindableParams(ps);
+            if (np != 0 && !ctxParam && !bindable) { continue; }
 
             string mname = m.Str("name", "");
             string actiontok = GenRoute.Lower(mname);
@@ -864,6 +869,26 @@ class GenRoute {
             string hname = "__h_" + cname + "_" + mname;
             string aw = isAsync ? "await " : "";
             string arg = ctxParam ? "ctx" : "";
+            bool tx = !isStatic && (GenRoute.AttrNamed(m, "Tx") ||
+                                    GenRoute.AttrNamed(cls, "Tx"));
+            /* 签名参数绑定:类型化 action 的实参在蹦床里生成,缺失或
+             * 非法都在进 action 前以统一的 ApiError(400) 应答。 */
+            List<string> bindLines = new List<string>();
+            List<string> bindNames = new List<string>();
+            List<string> bindTypes = new List<string>();
+            if (bindable) {
+                arg = "";
+                for (int pi = 0; pi < np; pi = pi + 1) {
+                    string pt = ps.At(pi).Str("type", "");
+                    string pn = ps.At(pi).Str("name", "");
+                    bindTypes.Add(pt);
+                    bindNames.Add(pn);
+                    bindLines.Add("                " +
+                                  GenRoute.BindLine(pt, pn) + "\n");
+                    if (pi > 0) { arg = arg + ", "; }
+                    arg = arg + pn;
+                }
+            }
 
             /* 蹦床:async 以满足 async HttpHandler 委托(WebApp.Dispatch
              * await 它),让 action 能 await I/O 而不阻塞连接协程。 */
@@ -885,14 +910,37 @@ class GenRoute {
                 handlers.Append("        __c.__SetView(\"" + cact + "." +
                                 mname + "\");\n");
                 /* 必填参数以抛 ApiError 中止;在这里捕获,`this.Need(...)`
-                 * 才能读作一个表达式而非每个 action 里的守卫子句。 */
+                 * 才能读作一个表达式而非每个 action 里的守卫子句。
+                 * [Tx] 动作再包一层事务作用域:Begin 失败以 503 应答,
+                 * 提交在 action 之后,任何失败路径先回滚再走原处理。 */
                 handlers.Append("        if (await __c.__BeforeAsync()) {\n");
+                if (tx) {
+                    handlers.Append("            bool __tx = false;\n");
+                }
                 handlers.Append("            try {\n");
+                if (tx) {
+                    handlers.Append("                __tx = await __c.__TxBegin();\n");
+                    handlers.Append("                if (!__tx) { throw new ApiError(503, \"0503\", \"服务不可用\"); }\n");
+                }
+                for (int bi = 0; bi < bindLines.Count; bi = bi + 1) {
+                    handlers.Append(bindLines[bi]);
+                }
                 handlers.Append("                " + aw + "__c." + mname +
                                 "(" + arg + ");\n");
+                if (tx) {
+                    handlers.Append("                await __c.__TxCommit();\n");
+                }
                 handlers.Append("            } catch (ApiError __e) {\n");
+                if (tx) {
+                    handlers.Append("                if (__tx) { await __c.__TxRollback(); }\n");
+                }
                 handlers.Append("                ctx.Status(__e.Status(), ApiError.Reason(__e.Status()));\n");
                 handlers.Append("                ctx.Api(__e.Code(), __e.Message, \"null\");\n");
+                if (tx) {
+                    handlers.Append("            } catch (Exception __x) {\n");
+                    handlers.Append("                if (__tx) { await __c.__TxRollback(); }\n");
+                    handlers.Append("                throw;\n");
+                }
                 handlers.Append("            }\n");
                 handlers.Append("            await __c.__AfterAsync();\n");
                 handlers.Append("        }\n");
@@ -914,6 +962,16 @@ class GenRoute {
             GenRoute.PDef = new List<string>();
             GenRoute.PDesc = new List<string>();
             GenRoute.PWhere = new List<string>();
+            /* 签名绑定的参数先进文档表(必填、query 来源);随后
+             * ScanCalls/ParamsFromPath 对同名项做"强声明合并"。 */
+            for (int si = 0; si < bindNames.Count; si = si + 1) {
+                GenRoute.PName.Add(bindNames[si]);
+                GenRoute.PType.Add(bindTypes[si]);
+                GenRoute.PRequired.Add(true);
+                GenRoute.PDef.Add("");
+                GenRoute.PDesc.Add("");
+                GenRoute.PWhere.Add("query");
+            }
             GenRoute.ScanCalls(cname, mname);
             GenRoute.ParamsFromPath(path);
             GenRoute.EmitParams(reg);
@@ -936,5 +994,46 @@ class GenRoute {
 
     static string MethodVerb(JsonValue m) {
         return GenRoute.AttrHttpVerb(GenRoute.FirstVerbAttr(m));
+    }
+
+    /// 参数类型能否由蹦床从请求绑定(string/int/long/double/bool)。
+    static bool BindableParams(JsonValue ps) {
+        for (int i = 0; i < ps.Count(); i = i + 1) {
+            if (!GenRoute.BindableType(ps.At(i).Str("type", ""))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// 单个参数类型是否可绑定。
+    static bool BindableType(string t) {
+        return t == "string" || t == "int" || t == "long" ||
+               t == "double" || t == "bool";
+    }
+
+    /// 一条绑定语句:`long id = __c.NeedLong("id", "id");`。必填语义:
+    /// 缺失与非法同罪,都抛 ApiError(400),由蹦床统一应答——签名即文档,
+    /// 文档表在注册段以同一份名字先行播种。
+    static string BindLine(string t, string n) {
+        string label = GenRoute.Esc(n);
+        if (t == "int") {
+            return "int " + n + " = __c.NeedInt(\"" + label + "\", \"" +
+                   label + "\");";
+        }
+        if (t == "long") {
+            return "long " + n + " = __c.NeedLong(\"" + label + "\", \"" +
+                   label + "\");";
+        }
+        if (t == "double") {
+            return "double " + n + " = __c.NeedDouble(\"" + label + "\", \"" +
+                   label + "\");";
+        }
+        if (t == "bool") {
+            return "bool " + n + " = __c.NeedBool(\"" + label + "\", \"" +
+                   label + "\");";
+        }
+        return "string " + n + " = __c.Need(\"" + label + "\", \"" +
+               label + "\");";
     }
 }

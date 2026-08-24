@@ -1,0 +1,47 @@
+using System;
+using System.Data;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.Dev;
+
+/// <summary>
+/// The modern action shapes, as a runnable sample: /admin/dev/txprobe.
+///
+/// Sum shows signature parameter binding: the parameters live on the method
+/// signature, the generated trampoline reads and converts them from
+/// query / form / route, and a missing or malformed value is answered with
+/// the uniform 400/0003 before the action runs. The same names feed
+/// /api/docs, so there is nothing to keep in sync by hand.
+///
+/// Disable shows the [Tx] transaction scope: the trampoline opens the
+/// request's transaction, commits after the action succeeds, and on any
+/// failure path (Fail()'s ApiError included) rolls back before answering.
+/// The guard here fires after the first write has landed, so a super-admin
+/// attempt leaves no half-applied status change behind -- and the action
+/// body carries no Begin/Commit/Rollback ladder at all.
+/// </summary>
+[Route("admin/dev/txprobe/[action]")]
+class TxProbe : AdminController {
+    [HttpGet]
+    [Description("类型化参数绑定示例：两数之和")]
+    void Sum(int a, int b) {
+        this.Ok("{\"sum\":" + Convert.ToString(a + b) + "}");
+    }
+
+    [Tx]
+    [HttpPost]
+    [Description("事务作用域示例：禁用账号，任一步失败整体回滚")]
+    async void Disable(int id) {
+        User u = await this.User.ById(id);
+        if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+        int _first = await this.User.SetStatus(id, 0);
+        // 第一笔已在事务内落库。此刻才查出的违规若直接中止，
+        // [Tx] 会连同上面的状态改写一起回滚。
+        User fresh = await this.User.ById(id);
+        if (fresh.isSuper == 1) { this.Fail(400, "0004", "超级管理员不能禁用"); }
+        int _second = await this.User.BumpTokenVersion(id);
+        this.Ok("null");
+    }
+}

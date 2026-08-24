@@ -395,8 +395,67 @@ class GenForm {
                     Convert.ToString(i) +
                     " has an invalid \"of\": type arguments must be Zan type names");
             }
+            if (kind == "DataGrid") {
+                GenForm.ValidateColumns(reply, o, f0, i);
+            }
             GenForm.ValidateFields(reply, o.Get("kids"), file_name);
         }
+    }
+
+    /// 校验 DataGrid 的声明式列:columns 必须是对象数组,每列的
+    /// "field" 是行实体上的字段路径(点分标识符),"type" 只认
+    /// text/num/real/bool/date。带列的网格还必须写 "of"——列访问器
+    /// 读的是 "of" 类型的字段,缺省的 string 上没有它们。
+    static void ValidateColumns(JsonValue reply, JsonValue o, string f0,
+                                int idx) {
+        JsonValue cols = o.Get("columns");
+        if (cols == null) { return; }
+        if (!cols.IsArray()) {
+            GenCommon.Fail(reply, f0 + ": .zform field " +
+                Convert.ToString(idx) +
+                ": DataGrid \"columns\" must be an array of column objects");
+            return;
+        }
+        if (cols.Count() > 0 && GenForm.ObjStr(o, "of").Length == 0) {
+            GenCommon.Fail(reply, f0 + ": .zform field " +
+                Convert.ToString(idx) +
+                ": a DataGrid with \"columns\" requires \"of\" naming the row" +
+                " entity type");
+        }
+        for (int j = 0; j < cols.Count(); j = j + 1) {
+            JsonValue c = cols.At(j);
+            if (c == null || !c.IsObject()) {
+                GenCommon.Fail(reply, f0 + ": .zform field " +
+                    Convert.ToString(idx) + " column " + Convert.ToString(j) +
+                    " must be an object");
+                continue;
+            }
+            string field = GenForm.ObjStr(c, "field");
+            if (!GenForm.ValidFieldPath(field)) {
+                GenCommon.Fail(reply, f0 + ": .zform field " +
+                    Convert.ToString(idx) + " column " + Convert.ToString(j) +
+                    " requires \"field\": a field name on the row entity");
+            }
+            string t = GenForm.ObjStr(c, "type");
+            if (t.Length > 0 && t != "text" && t != "num" && t != "real" &&
+                t != "bool" && t != "date") {
+                GenCommon.Fail(reply, f0 + ": .zform field " +
+                    Convert.ToString(idx) + " column " + Convert.ToString(j) +
+                    " has unknown \"type\" '" + t +
+                    "'; use text, num, real, bool or date");
+            }
+        }
+    }
+
+    /// 列的 "field" 是实体上的字段路径:点分的合法标识符
+    /// ("name"、"addr.city")。
+    static bool ValidFieldPath(string s) {
+        if (s.Length == 0) { return false; }
+        List<string> dots = s.Split(".");
+        for (int i = 0; i < dots.Count; i = i + 1) {
+            if (!GenCommon.IsIdent(dots[i])) { return false; }
+        }
+        return true;
     }
 
     static string KindOf(JsonValue o) {
@@ -514,6 +573,116 @@ class GenForm {
         if (GenForm.ObjBool(o, "defOn")) {
             b.Append("        " + vn + ".SetProp(\"defOn\", \"true\");\n");
         }
+    }
+
+    /// DataGrid 的声明式列:columns 数组按现有 DataGrid<T> 泛型列 API
+    /// 展开,访问器直接读取 "of" 实体的字段
+    /// ({"field":"name"} -> `__r => __r.name`),不经过任何字符串行
+    /// 中间层;字段名或列类型与实体不符时由编译器在生成代码上报错。
+    /// 数据本身由 code-behind 用 `grid.Bind(list)` 传入 List<of>。
+    static void EmitColumns(StringBuilder b, JsonValue o, string vn) {
+        JsonValue cols = o.Get("columns");
+        if (cols != null && cols.IsArray()) {
+            for (int i = 0; i < cols.Count(); i = i + 1) {
+                JsonValue c = cols.At(i);
+                if (c == null || !c.IsObject()) { continue; }
+                GenForm.EmitColumn(b, c, vn);
+            }
+        }
+        /* "rowFactory": true 启用行插入/删除:泛型前端无法自己
+         * `new T()`,生成的工厂用 "of" 的实体类型。 */
+        if (GenForm.ObjBool(o, "rowFactory")) {
+            string of = GenForm.ObjStr(o, "of");
+            if (of.Length > 0) {
+                b.Append("        " + vn + ".RowFactory(() => new " +
+                         of + "());\n");
+            }
+        }
+    }
+
+    static void EmitColumn(StringBuilder b, JsonValue c, string vn) {
+        string field = GenForm.ObjStr(c, "field");
+        if (field.Length == 0) { return; }
+        string title = GenForm.ObjStr(c, "title");
+        if (title.Length == 0) { title = field; }
+        int width = GenForm.ObjNum(c, "width", 100);
+        string ctype = GenForm.ObjStr(c, "type");
+        string acc = "__r => __r." + field;
+        b.Append("        " + vn + ".");
+        if (ctype == "num") {
+            b.Append("NumCol(\"" + GenCommon.Esc(title) + "\", " +
+                     Convert.ToString(width) + ", " + acc + ")");
+        } else if (ctype == "real") {
+            int dec = GenForm.ObjNum(c, "decimals", 2);
+            b.Append("RealCol(\"" + GenCommon.Esc(title) + "\", " +
+                     Convert.ToString(width) + ", " +
+                     Convert.ToString(dec) + ", " + acc + ")");
+        } else if (ctype == "bool") {
+            b.Append("BoolCol(\"" + GenCommon.Esc(title) + "\", " +
+                     Convert.ToString(width) + ", " + acc + ")");
+        } else if (ctype == "date") {
+            int order = GenForm.ObjNum(c, "dateOrder", 0);
+            b.Append("DateCol(\"" + GenCommon.Esc(title) + "\", " +
+                     Convert.ToString(width) + ", " +
+                     Convert.ToString(order) + ", " + acc + ")");
+        } else {
+            b.Append("Col(\"" + GenCommon.Esc(title) + "\", " +
+                     Convert.ToString(width) + ", " + acc + ")");
+        }
+        /* 引擎侧的字段名:运行期按名找列(DataTable.Col)靠它。 */
+        b.Append(".Field(\"" + GenCommon.Esc(field) + "\")");
+        string align = GenForm.ObjStr(c, "align");
+        if (align == "right") { b.Append(".Right()"); }
+        if (align == "center") { b.Append(".Center()"); }
+        string money = GenForm.ObjStr(c, "money");
+        if (money.Length > 0) {
+            b.Append(".Money(\"" + GenCommon.Esc(money) + "\")");
+        }
+        if (GenForm.ObjBool(c, "percent")) { b.Append(".Percent()"); }
+        string prefix = GenForm.ObjStr(c, "prefix");
+        string suffix = GenForm.ObjStr(c, "suffix");
+        if (prefix.Length > 0 || suffix.Length > 0) {
+            b.Append(".Affix(\"" + GenCommon.Esc(prefix) + "\", \"" +
+                     GenCommon.Esc(suffix) + "\")");
+        }
+        if (GenForm.ObjBool(c, "sum")) { b.Append(".Sum()"); }
+        if (GenForm.ObjBool(c, "avg")) { b.Append(".Avg()"); }
+        if (GenForm.ObjBool(c, "min")) { b.Append(".Min()"); }
+        if (GenForm.ObjBool(c, "max")) { b.Append(".Max()"); }
+        if (GenForm.ObjBool(c, "count")) { b.Append(".Count()"); }
+        string pin = GenForm.ObjStr(c, "pin");
+        if (pin == "left") { b.Append(".Pin()"); }
+        if (pin == "right") { b.Append(".PinRight()"); }
+        string band = GenForm.ObjStr(c, "band");
+        if (band.Length > 0) {
+            b.Append(".Band(\"" + GenCommon.Esc(band) + "\")");
+        }
+        JsonValue sortable = c.Get("sortable");
+        if (sortable != null && sortable.IsBool() && !sortable.AsBool(true)) {
+            b.Append(".NotSortable()");
+        }
+        JsonValue resizable = c.Get("resizable");
+        if (resizable != null && resizable.IsBool() && !resizable.AsBool(true)) {
+            b.Append(".NotResizable()");
+        }
+        if (GenForm.ObjBool(c, "grouped")) { b.Append(".Grouped()"); }
+        if (GenForm.ObjBool(c, "editable")) {
+            /* 编辑回写:按列类型把提交的文本解析回实体字段。 */
+            if (ctype == "num") {
+                b.Append(".Editable((__r, __v) => { __r." + field +
+                         " = DataTable.ParseInt(__v); })");
+            } else if (ctype == "real") {
+                b.Append(".Editable((__r, __v) => { __r." + field +
+                         " = DataTable.ParseReal(__v); })");
+            } else if (ctype == "bool") {
+                b.Append(".Editable((__r, __v) => { __r." + field +
+                         " = DataTable.ParseBool(__v); })");
+            } else {
+                b.Append(".Editable((__r, __v) => { __r." + field +
+                         " = __v; })");
+            }
+        }
+        b.Append(";\n");
     }
 
     /// 发射 on<Event> 处理器绑定(事件名 = 去掉前导 "on" 的键)。
@@ -644,6 +813,9 @@ class GenForm {
             }
         }
         GenForm.FieldSetup(body, o, vn);
+        if (GenForm.KindOf(o) == "DataGrid") {
+            GenForm.EmitColumns(body, o, vn);
+        }
         if (req) {
             body.Append("        " + vn + ".SetProp(\"required\", \"true\");\n");
         }

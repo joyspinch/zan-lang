@@ -1,0 +1,358 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Text;
+
+namespace System.Knowledge;
+
+/// Source driven gallery generation shared by the CLI and MCP server.
+class GalleryResult {
+    string json;
+    int entries;
+    int discovered;
+    int templates;
+    List<string> warnings;
+
+    GalleryResult() {
+        this.json = "";
+        this.entries = 0;
+        this.discovered = 0;
+        this.templates = 0;
+        this.warnings = new List<string>();
+    }
+}
+
+class GalleryIndex {
+    static GalleryResult Generate(string root, string seedPath) {
+        GalleryResult r = new GalleryResult();
+        JsonValue seed = JsonValue.Parse(File.ReadAllText(seedPath));
+        JsonValue entries = seed.Get("entries");
+        if (entries == null || !entries.IsArray()) {
+            throw new Exception("gallery seed has no entries array");
+        }
+        JsonValue outEntries = JsonValue.NewArray();
+        List<string> referenced = new List<string>();
+        for (int i = 0; i < entries.Count(); i = i + 1) {
+            JsonValue e = entries.At(i);
+            outEntries.Append(e);
+            GalleryIndex.AddRefs(e, referenced);
+        }
+
+        List<JsonValue> extra = new List<JsonValue>();
+        GalleryIndex.ScanTemplates(root + "/templates", root, referenced, extra, r);
+        GalleryIndex.ScanExamples(root + "/examples", root, referenced, extra, r);
+        GalleryIndex.SortEntries(extra);
+        for (int i = 0; i < extra.Count; i = i + 1) {
+            outEntries.Append(extra[i]);
+        }
+        GalleryIndex.CheckTopics(outEntries);
+
+        JsonValue output = JsonValue.NewObject();
+        output.Put("version", seed.Get("version"));
+        output.Put("note", JsonValue.NewStr(
+            "Generated from templates, examples and the handwritten gallery seed."));
+        output.Put("models", seed.Get("models"));
+        output.Put("entries", outEntries);
+        r.json = output.ToJson();
+        r.entries = outEntries.Count();
+        return r;
+    }
+
+    static void AddRefs(JsonValue e, List<string> refs) {
+        JsonValue fs = e.Get("files");
+        if (fs == null || !fs.IsArray()) { return; }
+        for (int i = 0; i < fs.Count(); i = i + 1) {
+            string p = fs.At(i).AsString("");
+            if (!GalleryIndex.Has(refs, p)) { refs.Add(p); }
+        }
+    }
+
+    static void ScanTemplates(string dir, string root, List<string> refs,
+                              List<JsonValue> outp, GalleryResult r) {
+        if (!Directory.Exists(dir)) { return; }
+        List<string> ds = Directory.GetDirectories(dir);
+        for (int i = 0; i < ds.Count; i = i + 1) {
+            string family = ds[i];
+            string fd = dir + "/" + family;
+            List<string> ts = Directory.GetDirectories(fd);
+            for (int j = 0; j < ts.Count; j = j + 1) {
+                string td = fd + "/" + ts[j];
+                string mf = td + "/template.manifest";
+                if (!File.Exists(mf)) { continue; }
+                r.templates = r.templates + 1;
+                string entry = GalleryIndex.Manifest(mf, "entry");
+                if (entry == "") {
+                    r.warnings.Add("manifest has no entry: " + mf);
+                    continue;
+                }
+                string full = td + "/" + entry;
+                string rel = GalleryIndex.Rel(root, full);
+                string templateRel = GalleryIndex.Rel(root, td);
+                if (GalleryIndex.HasPrefix(refs, templateRel)) { continue; }
+                JsonValue e = JsonValue.NewObject();
+                string zform = GalleryIndex.SameName(full, ".zform");
+                JsonValue fs = JsonValue.NewArray();
+                fs.Append(JsonValue.NewStr(rel));
+                if (zform != "") { fs.Append(JsonValue.NewStr(GalleryIndex.Rel(root, zform))); }
+                e.Put("topic", JsonValue.NewStr(ts[j]));
+                e.Put("kind", JsonValue.NewStr(GalleryIndex.TemplateKind(
+                    family, zform != "")));
+                e.Put("path", JsonValue.NewStr(
+                    GalleryIndex.Rel(root, GalleryIndex.DirOf(full))));
+                e.Put("summary", JsonValue.NewStr(GalleryIndex.TemplateSummary(mf)));
+                e.Put("files", fs);
+                outp.Add(e);
+                r.discovered = r.discovered + 1;
+            }
+        }
+    }
+
+    static void ScanExamples(string dir, string root, List<string> refs,
+                             List<JsonValue> outp, GalleryResult r) {
+        if (!Directory.Exists(dir)) { return; }
+        List<string> fs = Directory.GetFiles(dir);
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            string fn = fs[i];
+            if (!GalleryIndex.Ends(fn, ".zan")) { continue; }
+            string full = dir + "/" + fn;
+            string rel = GalleryIndex.Rel(root, full);
+            if (GalleryIndex.Has(refs, rel)) { continue; }
+            JsonValue e = JsonValue.NewObject();
+            string topic = rel;
+            if (GalleryIndex.Starts(topic, "examples/")) {
+                topic = topic.Substring(9, topic.Length - 9);
+            }
+            topic = GalleryIndex.Replace(topic, "_", "-");
+            topic = GalleryIndex.Replace(topic, "/", "-");
+            if (GalleryIndex.Ends(topic, ".zan")) {
+                topic = topic.Substring(0, topic.Length - 4);
+            }
+            bool immediate = GalleryIndex.Starts(rel, "examples/gui_")
+                || GalleryIndex.Find(rel, "/gui_", 0) >= 0;
+            string family = GalleryIndex.Rel(root, dir);
+            e.Put("topic", JsonValue.NewStr(topic));
+            e.Put("kind", JsonValue.NewStr(immediate ? "gui-immediate" : "sample"));
+            e.Put("path", JsonValue.NewStr(family));
+            e.Put("summary", JsonValue.NewStr(
+                GalleryIndex.Summary(full, dir, fn)));
+            JsonValue a = JsonValue.NewArray();
+            a.Append(JsonValue.NewStr(rel));
+            e.Put("files", a);
+            outp.Add(e);
+            r.discovered = r.discovered + 1;
+        }
+        List<string> ds = Directory.GetDirectories(dir);
+        for (int i = 0; i < ds.Count; i = i + 1) {
+            string child = dir + "/" + ds[i];
+            if (GalleryIndex.Rel(root, child) == "examples/game") { continue; }
+            GalleryIndex.ScanExamples(child, root, refs, outp, r);
+        }
+    }
+
+    static string Manifest(string path, string key) {
+        List<string> ls = GalleryIndex.Lines(File.ReadAllText(path));
+        for (int i = 0; i < ls.Count; i = i + 1) {
+            string t = GalleryIndex.Trim(ls[i]);
+            int eq = GalleryIndex.Find(t, "=", 0);
+            if (eq >= 0 && GalleryIndex.Trim(t.Substring(0, eq)) == key) {
+                return GalleryIndex.Trim(t.Substring(eq + 1, t.Length - eq - 1));
+            }
+        }
+        return "";
+    }
+
+    static string TemplateKind(string family, bool hasZform) {
+        string f = GalleryIndex.Lower(family);
+        if (f == "gui") { return hasZform ? "gui-designer" : "gui-immediate"; }
+        if (f == "server") { return "server"; }
+        if (f == "console") { return "console"; }
+        if (f == "library") { return "library"; }
+        return f;
+    }
+
+    static string TemplateSummary(string manifest) {
+        string a = GalleryIndex.Manifest(manifest, "desc");
+        string b = GalleryIndex.Manifest(manifest, "desc.zh");
+        if (a != "" && b != "") { return a + " " + b; }
+        if (a != "") { return a; }
+        if (b != "") { return b; }
+        return GalleryIndex.BaseName(manifest);
+    }
+
+    static string Summary(string path, string dir, string fn) {
+        List<string> ls = GalleryIndex.Lines(File.ReadAllText(path));
+        string triple = "";
+        string dbl = "";
+        for (int i = 0; i < ls.Count; i = i + 1) {
+            string raw = ls[i];
+            string t = GalleryIndex.Trim(raw);
+            bool isTriple = GalleryIndex.Starts(t, "///");
+            bool isDouble = GalleryIndex.Starts(t, "//");
+            if (isTriple || isDouble) {
+                string x = t.Substring(isTriple ? 3 : 2,
+                    t.Length - (isTriple ? 3 : 2));
+                if (x.Length > 0 && x.Substring(0, 1) == " ") {
+                    x = x.Substring(1, x.Length - 1);
+                }
+                x = GalleryIndex.Trim(x);
+                if (x == "" || GalleryIndex.Decoration(x)) { continue; }
+                if (isTriple && triple == "") { triple = x; }
+                if (isDouble && dbl == "") { dbl = x; }
+                continue;
+            }
+            if (t != "") { break; }
+        }
+        if (triple != "") { return triple; }
+        if (dbl != "") { return dbl; }
+        string readme = dir + "/README.md";
+        if (File.Exists(readme)) {
+            List<string> rs = GalleryIndex.Lines(File.ReadAllText(readme));
+            for (int i = 0; i < rs.Count; i = i + 1) {
+                string x = GalleryIndex.Trim(rs[i]);
+                if (x != "" && !GalleryIndex.Starts(x, "#")) { return x; }
+            }
+        }
+        return GalleryIndex.WithoutExt(fn);
+    }
+
+    static bool Decoration(string s) {
+        if (s == "") { return true; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string c = s.Substring(i, 1);
+            if (c != "=" && c != "-" && c != "*" && c != "_" &&
+                c != " " && c != "\t") { return false; }
+        }
+        return true;
+    }
+
+    static string SameName(string path, string ext) {
+        string basep = GalleryIndex.WithoutExt(path);
+        string z = basep + ext;
+        return File.Exists(z) ? z : "";
+    }
+
+    static string Rel(string root, string path) {
+        string p = GalleryIndex.Replace(path, "\\", "/");
+        string r = GalleryIndex.Replace(root, "\\", "/");
+        if (GalleryIndex.Starts(p, r + "/")) { return p.Substring(r.Length + 1, p.Length - r.Length - 1); }
+        return p;
+    }
+
+    static string ParentName(string path) {
+        string p = GalleryIndex.Replace(path, "\\", "/");
+        int end = p.Length;
+        while (end > 0 && p.Substring(end - 1, 1) == "/") { end = end - 1; }
+        int i = end - 1;
+        while (i >= 0 && p.Substring(i, 1) != "/") { i = i - 1; }
+        return p.Substring(i + 1, end - i - 1);
+    }
+    static string DirOf(string path) {
+        string p = GalleryIndex.Replace(path, "\\", "/");
+        int i = p.Length - 1;
+        while (i >= 0 && p.Substring(i, 1) != "/") { i = i - 1; }
+        return i < 0 ? "" : p.Substring(0, i);
+    }
+
+    static string BaseName(string path) { return GalleryIndex.ParentName(path); }
+    static string WithoutExt(string path) {
+        int i = path.Length - 1;
+        while (i >= 0 && path.Substring(i, 1) != "/") { i = i - 1; }
+        int d = path.Length - 1;
+        while (d > i && path.Substring(d, 1) != ".") { d = d - 1; }
+        if (d <= i) { return path; }
+        return path.Substring(0, d);
+    }
+
+    static void SortEntries(List<JsonValue> a) {
+        for (int i = 1; i < a.Count; i = i + 1) {
+            JsonValue x = a[i];
+            JsonValue topicValue = x.Get("topic");
+            string k = topicValue == null ? "" : topicValue.AsString("");
+            int j = i - 1;
+            JsonValue prevTopic = a[j].Get("topic");
+            string prev = prevTopic == null ? "" : prevTopic.AsString("");
+            while (j >= 0 && prev > k) {
+                a[j + 1] = a[j]; j = j - 1;
+                if (j >= 0) {
+                    prevTopic = a[j].Get("topic");
+                    prev = prevTopic == null ? "" : prevTopic.AsString("");
+                }
+            }
+            a[j + 1] = x;
+        }
+    }
+
+    static void CheckTopics(JsonValue a) {
+        List<string> seen = new List<string>();
+        List<string> dup = new List<string>();
+        for (int i = 0; i < a.Count(); i = i + 1) {
+            string t = a.At(i).Get("topic").AsString("");
+            if (GalleryIndex.Has(seen, t)) {
+                if (!GalleryIndex.Has(dup, t)) { dup.Add(t); }
+            } else { seen.Add(t); }
+        }
+        if (dup.Count > 0) {
+            string s = "";
+            for (int i = 0; i < dup.Count; i = i + 1) {
+                if (i > 0) { s = s + ", "; }
+                s = s + dup[i];
+            }
+            throw new Exception("duplicate gallery topics: " + s);
+        }
+    }
+
+    static List<string> Lines(string s) {
+        List<string> r = new List<string>();
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string c = s.Substring(i, 1);
+            if (c == "\n") { r.Add(b.ToString()); b = new StringBuilder(); }
+            else if (c != "\r") { b.Append(c); }
+        }
+        r.Add(b.ToString());
+        return r;
+    }
+    static bool Has(List<string> a, string s) {
+        for (int i = 0; i < a.Count; i = i + 1) { if (a[i] == s) { return true; } }
+        return false;
+    }
+    static bool HasPrefix(List<string> a, string prefix) {
+        string p = prefix + "/";
+        for (int i = 0; i < a.Count; i = i + 1) {
+            if (a[i] == prefix || GalleryIndex.Starts(a[i], p)) { return true; }
+        }
+        return false;
+    }
+    static string Trim(string s) {
+        int a = 0; int b = s.Length;
+        while (a < b && (s.Substring(a, 1) == " " || s.Substring(a, 1) == "\t")) { a = a + 1; }
+        while (b > a && (s.Substring(b - 1, 1) == " " || s.Substring(b - 1, 1) == "\t")) { b = b - 1; }
+        return s.Substring(a, b - a);
+    }
+    static string Lower(string s) {
+        return s.ToLower();
+    }
+    static bool Starts(string s, string p) {
+        return s.Length >= p.Length && s.Substring(0, p.Length) == p;
+    }
+    static bool Ends(string s, string p) {
+        return s.Length >= p.Length && s.Substring(s.Length - p.Length, p.Length) == p;
+    }
+    static int Find(string s, string p, int start) {
+        if (p == "") { return start; }
+        for (int i = start; i + p.Length <= s.Length; i = i + 1) {
+            if (s.Substring(i, p.Length) == p) { return i; }
+        }
+        return -1;
+    }
+    static string Replace(string s, string a, string b) {
+        StringBuilder r = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            if (i + a.Length <= s.Length && s.Substring(i, a.Length) == a) {
+                r.Append(b); i = i + a.Length;
+            } else { r.Append(s.Substring(i, 1)); i = i + 1; }
+        }
+        return r.ToString();
+    }
+}

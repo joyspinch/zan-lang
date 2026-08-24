@@ -1,0 +1,561 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Text;
+
+namespace System.Knowledge;
+
+class ZformResult {
+    string json;
+    string controlsText;
+    int controls;
+    List<string> warnings;
+    ZformResult() {
+        this.json = "";
+        this.controlsText = "";
+        this.controls = 0;
+        this.warnings = new List<string>();
+    }
+}
+
+class KnowledgeProp {
+    string variable;
+    string key;
+    string label;
+    string type;
+    string aliases;
+    string tip;
+    string options;
+    int step;
+    int lo;
+    int hi;
+    bool range;
+    KnowledgeProp() {
+        variable = ""; key = ""; label = ""; type = ""; aliases = "";
+        tip = ""; options = ""; step = 0; lo = 0; hi = 0; range = false;
+    }
+}
+
+class KnowledgeControl {
+    string name;
+    string file;
+    int line;
+    string styleKind;
+    bool designer;
+    bool creatable;
+    bool generic;
+    bool inheritsBase;
+    string defaultOf;
+    List<KnowledgeProp> props;
+    List<string> events;
+    KnowledgeControl() {
+        name = ""; file = ""; line = 0; styleKind = "";
+        designer = false; creatable = false; generic = false;
+        inheritsBase = false; defaultOf = "";
+        props = new List<KnowledgeProp>(); events = new List<string>();
+    }
+}
+
+/// Static source reader for the .zform schema and control catalogue.
+class ZformSchema {
+    static ZformResult Generate(string root, string stdlib, string docPath) {
+        ZformResult result = new ZformResult();
+        JsonValue doc = JsonValue.Parse(File.ReadAllText(docPath));
+        List<KnowledgeControl> cs = new List<KnowledgeControl>();
+        ZformSchema.ReadFactories(stdlib);
+        ZformSchema.ScanDir(stdlib, root, stdlib, cs, result);
+        JsonValue controls = JsonValue.NewArray();
+        List<string> names = new List<string>();
+        for (int i = 0; i < cs.Count; i = i + 1) {
+            controls.Append(ZformSchema.ControlJson(cs[i]));
+            names.Add(cs[i].name);
+        }
+        JsonValue output = JsonValue.NewObject();
+        output.Put("version", doc.Get("version"));
+        output.Put("note", doc.Get("note"));
+        output.Put("source", doc.Get("source"));
+        output.Put("pipeline", doc.Get("pipeline"));
+        output.Put("document", doc.Get("document"));
+        output.Put("fields", doc.Get("fields"));
+        output.Put("commonEvents", doc.Get("commonEvents"));
+        output.Put("propKinds", doc.Get("propKinds"));
+        output.Put("controls", controls);
+        result.json = output.ToJson();
+        result.controls = cs.Count;
+        result.controlsText = ZformSchema.Manifest(names);
+        return result;
+    }
+
+    static void ScanDir(string dir, string root, string stdlib,
+                        List<KnowledgeControl> outp, ZformResult result) {
+        if (!Directory.Exists(dir)) { return; }
+        List<string> fs = Directory.GetFiles(dir);
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            if (!ZformSchema.Ends(fs[i], ".zan")) { continue; }
+            string full = dir + "/" + fs[i];
+            ZformSchema.ScanFile(full, root, stdlib, outp, result);
+        }
+        List<string> ds = Directory.GetDirectories(dir);
+        for (int i = 0; i < ds.Count; i = i + 1) {
+            ZformSchema.ScanDir(dir + "/" + ds[i], root, stdlib, outp, result);
+        }
+    }
+
+    static void ScanFile(string path, string root, string stdlib,
+                          List<KnowledgeControl> outp, ZformResult result) {
+        string text = File.ReadAllText(path);
+        if (ZformSchema.Find(text, "Props()", 0) < 0) { return; }
+        string masked = ZformSchema.Mask(text);
+        List<string> lines = ZformSchema.Lines(text);
+        List<string> maskedLines = ZformSchema.Lines(masked);
+        string propsSignature = "override List<PropSpec> " + "Props()";
+        if (ZformSchema.Find(masked, propsSignature, 0) < 0) {
+            return;
+        }
+        List<int> depths = ZformSchema.DepthLines(masked);
+        int pos = 0;
+        int lineNo = 1;
+        while (lineNo <= lines.Count) {
+            string raw = lines[lineNo - 1];
+            string t = ZformSchema.Trim(maskedLines[lineNo - 1]);
+            if (depths[lineNo - 1] == 0 && ZformSchema.Word(t, "class")) {
+                string current = ZformSchema.AfterWord(t, "class");
+                int lt = ZformSchema.Find(t, "<", 0);
+                int classOpen = ZformSchema.Find(masked, "{", pos);
+                if (classOpen >= 0) {
+                    int close = ZformSchema.Match(masked, classOpen);
+                    string body = close > classOpen
+                        ? text.Substring(classOpen + 1, close - classOpen - 1) : "";
+                    string maskedBody = close > classOpen
+                        ? masked.Substring(classOpen + 1, close - classOpen - 1) : "";
+                    if (close <= classOpen) {
+                        result.warnings.Add("unbalanced class " + current
+                            + " in " + ZformSchema.Rel(root, stdlib, path));
+                    }
+                    if (ZformSchema.HasProps(maskedBody)) {
+                        KnowledgeControl c = ZformSchema.ReadControl(
+                            current, lineNo, path, root, stdlib, t, body,
+                            result);
+                        c.generic = lt >= 0;
+                        ZformSchema.ReadFactories(c);
+                        outp.Add(c);
+                    }
+                }
+            }
+            int eol = ZformSchema.Find(masked, "\n", pos);
+            pos = eol < 0 ? masked.Length : eol + 1;
+            lineNo = lineNo + 1;
+        }
+    }
+
+    static KnowledgeControl ReadControl(string name, int line, string path,
+                                        string root, string stdlib, string header,
+                                        string body, ZformResult result) {
+        KnowledgeControl c = new KnowledgeControl();
+        c.name = name; c.line = line; c.file = ZformSchema.Rel(root, stdlib, path);
+        c.styleKind = ZformSchema.ReturnString(body, "Kind");
+        c.defaultOf = ZformSchema.DefaultOf(name);
+        string props = ZformSchema.MethodBody(body, "Props");
+        if (props == "") { return c; }
+        c.inheritsBase = ZformSchema.Find(props, "base.Props(", 0) >= 0;
+        int propsLine = ZformSchema.MethodLineOffset(body, "Props");
+        List<KnowledgeProp> all = new List<KnowledgeProp>();
+        List<KnowledgeProp> ordered = new List<KnowledgeProp>();
+        string pending = "";
+        List<string> ls = ZformSchema.Lines(props);
+        for (int i = 0; i < ls.Count; i = i + 1) {
+            string lineText = ls[i];
+            bool declared = false;
+            KnowledgeProp declaredProp = null;
+            int p = ZformSchema.Find(lineText, "PropSpec.", 0);
+            if (p >= 0) {
+                KnowledgeProp q = ZformSchema.ReadProp(lineText, p);
+                if (q != null) {
+                    declaredProp = q;
+                    declared = true;
+                    int eq = ZformSchema.Find(lineText, "=", 0);
+                    if (eq >= 0) {
+                        ZformSchema.ReadChainText(
+                            lineText.Substring(eq + 1,
+                                lineText.Length - eq - 1), q);
+                    } else {
+                        ZformSchema.ReadChainText(
+                            lineText.Substring(p, lineText.Length - p), q);
+                    }
+                    if (ZformSchema.Find(lineText, "ps.Add(", 0) >= 0) {
+                        ZformSchema.AddOrdered(ordered, q);
+                    } else {
+                        all.Add(q);
+                    }
+                    pending = q.variable;
+                } else {
+                    ZformSchema.Warn(result, path, root, stdlib, line,
+                        propsLine + i, lineText,
+                        "unable to parse PropSpec declaration");
+                }
+            }
+            if (!declared && pending != "") {
+                KnowledgeProp pendingProp = ZformSchema.ByVar(
+                    all, ordered, pending);
+                if (pendingProp != null) {
+                    ZformSchema.ReadChainText(lineText, pendingProp);
+                }
+            }
+            int add = ZformSchema.Find(lineText, "ps.Add(", 0);
+            if (add >= 0) {
+                string arg = ZformSchema.Identifier(lineText, add + 7);
+                if (arg != "") {
+                    KnowledgeProp q = ZformSchema.ByVar(all, ordered, arg);
+                    if (q != null) { ZformSchema.AddOrdered(ordered, q); }
+                    else if (arg != "PropSpec") {
+                        ZformSchema.Warn(result, path, root, stdlib, line,
+                            propsLine + i, lineText,
+                            "unknown ps.Add variable " + arg);
+                    }
+                    pending = "";
+                }
+                int inline = ZformSchema.Find(lineText, "PropSpec.", add);
+                if (inline >= 0 && arg == "" && declaredProp == null) {
+                    KnowledgeProp q = ZformSchema.ReadProp(lineText, inline);
+                    if (q != null) {
+                        ZformSchema.ReadChainText(
+                            lineText.Substring(inline,
+                                lineText.Length - inline), q);
+                    } else {
+                        ZformSchema.Warn(result, path, root, stdlib, line,
+                            propsLine + i, lineText,
+                            "unable to parse inline PropSpec");
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < ordered.Count; i = i + 1) { c.props.Add(ordered[i]); }
+        string ev = ZformSchema.MethodBody(body, "Events");
+        List<string> evLines = ZformSchema.Lines(ev);
+        for (int i = 0; i < evLines.Count; i = i + 1) {
+            string x = ZformSchema.QuotedAfter(evLines[i], "e.Add(");
+            if (x != "" && !ZformSchema.Has(c.events, x)) { c.events.Add(x); }
+        }
+        return c;
+    }
+
+    static KnowledgeProp ReadProp(string line, int at) {
+        int kindAt = at + 9;
+        int open = ZformSchema.Find(line, "(", kindAt);
+        if (open < 0) { return null; }
+        string kind = ZformSchema.WordAt(line, kindAt);
+        string key = ZformSchema.QuotedArg(line, open, 0);
+        string label = ZformSchema.QuotedArg(line, open, 1);
+        if (key == "" || label == "") { return null; }
+        KnowledgeProp p = new KnowledgeProp();
+        p.key = key; p.label = label; p.type = ZformSchema.PropType(kind);
+        int eq = ZformSchema.Find(line, "=", 0);
+        if (eq > 0) {
+            string left = ZformSchema.Trim(line.Substring(0, eq));
+            int sp = left.Length - 1;
+            while (sp >= 0 && ZformSchema.IsIdentChar(left.Substring(sp, 1))) { sp = sp - 1; }
+            p.variable = ZformSchema.Trim(left.Substring(sp + 1, left.Length - sp - 1));
+        }
+        if (p.variable == "" && ZformSchema.Find(line, "ps.Add(", 0) < 0) { return null; }
+        return p;
+    }
+
+    static void ReadChainText(string line, KnowledgeProp p) {
+        int at = ZformSchema.Find(line, "Also(", 0);
+        while (at >= 0) {
+            string x = ZformSchema.QuotedAfter(
+                line.Substring(at, line.Length - at), "Also(");
+            if (x == "") { break; }
+            if (p.aliases != "") { p.aliases = p.aliases + "|"; }
+            p.aliases = p.aliases + x;
+            at = ZformSchema.Find(line, "Also(", at + 5);
+        }
+        string x = ZformSchema.QuotedAfter(line, "WithTip(");
+        if (x != "") { p.tip = x; }
+        at = ZformSchema.Find(line, "Option(", 0);
+        while (at >= 0) {
+            x = ZformSchema.QuotedAfter(
+                line.Substring(at, line.Length - at), "Option(");
+            if (x == "") { break; }
+            if (p.options != "") { p.options = p.options + "|"; }
+            p.options = p.options + x;
+            at = ZformSchema.Find(line, "Option(", at + 7);
+        }
+        int st = ZformSchema.Find(line, "Step(", 0);
+        if (st >= 0) {
+            int close = ZformSchema.Find(line, ")", st);
+            string args = close > st
+                ? line.Substring(st + 5, close - st - 5) : "";
+            List<string> aa = ZformSchema.SplitComma(args);
+            if (aa.Count >= 3) {
+                p.step = ZformSchema.Int(aa[0]);
+                p.lo = ZformSchema.Int(aa[1]);
+                p.hi = ZformSchema.Int(aa[2]);
+                p.range = true;
+            }
+        }
+        int sb = ZformSchema.Find(line, "StepBy(", 0);
+        if (sb >= 0) {
+            int close = ZformSchema.Find(line, ")", sb);
+            string a = close > sb
+                ? line.Substring(sb + 7, close - sb - 7) : "";
+            p.step = ZformSchema.Int(a);
+        }
+    }
+
+    static JsonValue ControlJson(KnowledgeControl c) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("name", JsonValue.NewStr(c.name));
+        o.Put("file", JsonValue.NewStr(c.file));
+        o.Put("line", JsonValue.NewNum(Convert.ToString(c.line)));
+        if (c.styleKind != "") {
+            o.Put("styleKind", JsonValue.NewStr(c.styleKind));
+            o.Put("kind", JsonValue.NewStr(c.styleKind));
+            if (c.styleKind != c.name) {
+                o.Put("kindAlias", JsonValue.NewBool(true));
+            }
+        }
+        o.Put("designer", JsonValue.NewBool(c.designer));
+        o.Put("creatable", JsonValue.NewBool(c.creatable));
+        o.Put("generic", JsonValue.NewBool(c.generic));
+        if (c.inheritsBase) {
+            o.Put("inheritsBase", JsonValue.NewBool(true));
+        }
+        if (c.defaultOf != "") { o.Put("defaultOf", JsonValue.NewStr(c.defaultOf)); }
+        JsonValue ev = JsonValue.NewArray();
+        for (int i = 0; i < c.events.Count; i = i + 1) {
+            JsonValue e = JsonValue.NewObject();
+            e.Put("name", JsonValue.NewStr(c.events[i]));
+            e.Put("common", JsonValue.NewBool(ZformSchema.Common(c.events[i])));
+            ev.Append(e);
+        }
+        o.Put("events", ev);
+        JsonValue ps = JsonValue.NewArray();
+        for (int i = 0; i < c.props.Count; i = i + 1) {
+            KnowledgeProp p = c.props[i];
+            JsonValue q = JsonValue.NewObject();
+            q.Put("key", JsonValue.NewStr(p.key));
+            q.Put("label", JsonValue.NewStr(p.label));
+            q.Put("type", JsonValue.NewStr(p.type));
+            if (p.aliases != "") {
+                JsonValue aliases = JsonValue.NewArray();
+                List<string> aa = ZformSchema.Split(p.aliases, "|");
+                for (int j = 0; j < aa.Count; j = j + 1) {
+                    aliases.Append(JsonValue.NewStr(aa[j]));
+                }
+                q.Put("aliases", aliases);
+            }
+            if (p.options != "") {
+                JsonValue a = JsonValue.NewArray();
+                List<string> oo = ZformSchema.Split(p.options, "|");
+                for (int j = 0; j < oo.Count; j = j + 1) { a.Append(JsonValue.NewStr(oo[j])); }
+                q.Put("options", a);
+            }
+            if (p.tip != "") { q.Put("tip", JsonValue.NewStr(p.tip)); }
+            if (p.range) {
+                JsonValue range = JsonValue.NewObject();
+                range.Put("step", JsonValue.NewNum(Convert.ToString(p.step)));
+                range.Put("min", JsonValue.NewNum(Convert.ToString(p.lo)));
+                range.Put("max", JsonValue.NewNum(Convert.ToString(p.hi)));
+                q.Put("range", range);
+            } else if (p.step != 0) {
+                q.Put("step", JsonValue.NewNum(Convert.ToString(p.step)));
+            }
+            ps.Append(q);
+        }
+        o.Put("props", ps);
+        return o;
+    }
+
+    static string factoryKinds = "";
+    static string factoryCreate = "";
+    static void ReadFactories(string stdlib) {
+        string f = stdlib + "/Gui/ControlFactory.zan";
+        if (!File.Exists(f)) { return; }
+        string s = File.ReadAllText(f);
+        factoryKinds = ZformSchema.MethodBody(s, "Kinds");
+        factoryCreate = ZformSchema.MethodBody(s, "Create");
+    }
+    static void ReadFactories(KnowledgeControl c) {
+        string kinds = ZformSchema.factoryKinds;
+        string create = ZformSchema.factoryCreate;
+        c.designer = ZformSchema.Find(kinds, "\"" + c.name + "\"", 0) >= 0;
+        c.creatable = ZformSchema.Find(create, "new " + c.name + "(", 0) >= 0;
+    }
+    static string DefaultOf(string n) {
+        if (n == "ListView" || n == "Dropdown" || n == "DataGrid") { return "string"; }
+        return "";
+    }
+    static string PropType(string k) {
+        if (k == "Text") { return "text"; }
+        if (k == "Int") { return "integer"; }
+        if (k == "Bool") { return "boolean"; }
+        if (k == "Color") { return "color"; }
+        if (k == "Enum") { return "enum"; }
+        if (k == "Section") { return "section"; }
+        return "";
+    }
+    static bool Common(string e) {
+        string[] a = new string[]{"Click","DoubleClick","RightClick","MouseDown","MouseUp",
+            "Enter","Leave","Move","Wheel","Focus","Blur","KeyDown","KeyUp","KeyPress",
+            "Tap","LongPress","Swipe","DragStart","Drag","Drop","Resize","Show","Hide"};
+        for (int i = 0; i < a.Length; i = i + 1) { if (a[i] == e) { return true; } }
+        return false;
+    }
+    static string Manifest(List<string> a) {
+        ZformSchema.SortStrings(a);
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < a.Count; i = i + 1) { b.Append(a[i]); b.Append("\n"); }
+        return b.ToString();
+    }
+    static void SortStrings(List<string> a) {
+        for (int i = 1; i < a.Count; i = i + 1) {
+            string x = a[i]; int j = i - 1;
+            while (j >= 0 && a[j] > x) { a[j + 1] = a[j]; j = j - 1; }
+            a[j + 1] = x;
+        }
+    }
+    static KnowledgeProp ByVar(List<KnowledgeProp> a, List<KnowledgeProp> b,
+                               string v) {
+        for (int i = 0; i < a.Count; i = i + 1) { if (a[i].variable == v) { return a[i]; } }
+        for (int i = 0; i < b.Count; i = i + 1) { if (b[i].variable == v) { return b[i]; } }
+        return null;
+    }
+    static void AddOrdered(List<KnowledgeProp> a, KnowledgeProp p) {
+        for (int i = 0; i < a.Count; i = i + 1) {
+            if (a[i].variable == p.variable) { return; }
+        }
+        a.Add(p);
+    }
+    static void Warn(ZformResult result, string path, string root, string stdlib,
+                     int classLine, int offset, string line, string reason) {
+        result.warnings.Add(reason + " at " + ZformSchema.Rel(root, stdlib, path)
+            + ":" + Convert.ToString(classLine + offset) + ": "
+            + ZformSchema.Trim(line));
+    }
+    static string ReturnString(string body, string method) {
+        int signature = ZformSchema.Find(body,
+            "override string " + method + "()", 0);
+        if (signature < 0) { return ""; }
+        int open = ZformSchema.Find(body, "{", signature);
+        if (open < 0) { return ""; }
+        string masked = ZformSchema.Mask(body);
+        int close = ZformSchema.Match(masked, open);
+        string methodBody = close > open
+            ? body.Substring(open + 1, close - open - 1) : "";
+        int p = ZformSchema.Find(methodBody, "return", 0);
+        while (p >= 0) {
+            int q = ZformSchema.Find(methodBody, "\"", p);
+            int e = ZformSchema.Find(methodBody, "\"", q + 1);
+            if (q >= 0 && e > q) { return methodBody.Substring(q + 1, e - q - 1); }
+            p = ZformSchema.Find(methodBody, "return", p + 6);
+        }
+        return "";
+    }
+    static string MethodBody(string body, string name) {
+        string signature = "";
+        if (name == "Props") {
+            signature = "override List<PropSpec> " + "Props()";
+        } else if (name == "Events") {
+            signature = "override List<string> Events()";
+        } else if (name == "Kinds") {
+            signature = "static List<string> Kinds()";
+        } else if (name == "Create") {
+            signature = "static Control Create(string kind)";
+        }
+        if (signature == "") { return ""; }
+        string maskedBody = ZformSchema.Mask(body);
+        int p = ZformSchema.Find(maskedBody, signature, 0);
+        if (p < 0) { return ""; }
+        int open = ZformSchema.Find(maskedBody, "{", p);
+        if (open < 0) { return ""; }
+        int close = ZformSchema.Match(maskedBody, open);
+        return close > open ? body.Substring(open + 1, close - open - 1) : "";
+    }
+    static int MethodLineOffset(string body, string name) {
+        string signature = "";
+        if (name == "Props") {
+            signature = "override List<PropSpec> " + "Props()";
+        } else if (name == "Events") {
+            signature = "override List<string> Events()";
+        } else if (name == "Kinds") {
+            signature = "static List<string> Kinds()";
+        } else if (name == "Create") {
+            signature = "static Control Create(string kind)";
+        }
+        if (signature == "") { return 0; }
+        string maskedBody = ZformSchema.Mask(body);
+        int p = ZformSchema.Find(maskedBody, signature, 0);
+        if (p < 0) { return 0; }
+        int open = ZformSchema.Find(maskedBody, "{", p);
+        if (open < 0) { return 0; }
+        int lines = 0;
+        for (int i = 0; i < open; i = i + 1) {
+            if (body.Substring(i, 1) == "\n") { lines = lines + 1; }
+        }
+        return lines;
+    }
+    static bool HasProps(string body) {
+        string signature = "override List<PropSpec> " + "Props()";
+        return ZformSchema.Find(body, signature, 0) >= 0;
+    }
+    static string Rel(string root, string stdlib, string path) {
+        string p = ZformSchema.Replace(path, "\\", "/");
+        string s = ZformSchema.Replace(stdlib, "\\", "/");
+        string r = ZformSchema.Replace(root, "\\", "/");
+        if (ZformSchema.Starts(p, s + "/")) { return "stdlib/" + p.Substring(s.Length + 1, p.Length - s.Length - 1); }
+        if (ZformSchema.Starts(p, r + "/")) { return p.Substring(r.Length + 1, p.Length - r.Length - 1); }
+        return p;
+    }
+    static List<int> DepthLines(string s) {
+        List<int> a = new List<int>(); int d = 0; int start = 0;
+        for (int i = 0; i <= s.Length; i = i + 1) {
+            if (i == s.Length || s.Substring(i, 1) == "\n") {
+                a.Add(d);
+                for (int j = start; j < i; j = j + 1) {
+                    string c = s.Substring(j, 1); if (c == "{") { d = d + 1; }
+                    if (c == "}") { d = d - 1; }
+                }
+                start = i + 1;
+            }
+        }
+        return a;
+    }
+    static string Mask(string s) {
+        StringBuilder b = new StringBuilder(); bool str = false; bool chr = false; bool block = false;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string c = s.Substring(i, 1); string n = i + 1 < s.Length ? s.Substring(i + 1, 1) : "";
+            if (block) { if (c == "*" && n == "/") { block = false; b.Append("  "); i = i + 1; } else { b.Append(c == "\n" ? "\n" : " "); } continue; }
+            if (!str && !chr && c == "/" && n == "*") { block = true; b.Append("  "); i = i + 1; continue; }
+            if (!str && !chr && c == "/" && n == "/") { while (i < s.Length && s.Substring(i, 1) != "\n") { b.Append(" "); i = i + 1; } i = i - 1; continue; }
+            if (str) { if (c == "\\") { b.Append("  "); i = i + 1; } else { b.Append(c == "\n" ? "\n" : " "); if (c == "\"") { str = false; } } continue; }
+            if (chr) { b.Append(c == "\n" ? "\n" : " "); if (c == "'") { chr = false; } continue; }
+            if (c == "\"") { str = true; b.Append(" "); } else if (c == "'") { chr = true; b.Append(" "); } else { b.Append(c); }
+        }
+        return b.ToString();
+    }
+    static int Match(string s, int open) {
+        int d = 0; for (int i = open; i < s.Length; i = i + 1) { string c = s.Substring(i, 1); if (c == "{") { d = d + 1; } else if (c == "}") { d = d - 1; if (d == 0) { return i; } } } return -1;
+    }
+    static List<string> Lines(string s) { List<string> r = new List<string>(); StringBuilder b = new StringBuilder(); for (int i = 0; i < s.Length; i = i + 1) { string c = s.Substring(i, 1); if (c == "\n") { r.Add(b.ToString()); b = new StringBuilder(); } else if (c != "\r") { b.Append(c); } } r.Add(b.ToString()); return r; }
+    static string Trim(string s) { int a = 0; int b = s.Length; while (a < b && (s.Substring(a,1)==" " || s.Substring(a,1)=="\t")) { a = a + 1; } while (b > a && (s.Substring(b-1,1)==" " || s.Substring(b-1,1)=="\t")) { b = b - 1; } return s.Substring(a,b-a); }
+    static bool Starts(string s, string p) { return s.Length >= p.Length && s.Substring(0,p.Length)==p; }
+    static bool Ends(string s, string p) { return s.Length >= p.Length && s.Substring(s.Length-p.Length,p.Length)==p; }
+    static int Find(string s, string p, int at) { for (int i = at; i + p.Length <= s.Length; i = i + 1) { if (s.Substring(i,p.Length)==p) { return i; } } return -1; }
+    static string Replace(string s, string a, string b) { StringBuilder q = new StringBuilder(); int i=0; while(i<s.Length){if(i+a.Length<=s.Length&&s.Substring(i,a.Length)==a){q.Append(b);i=i+a.Length;}else{q.Append(s.Substring(i,1));i=i+1;}}return q.ToString(); }
+    static string AfterWord(string s, string w) { int p=Find(s,w,0)+w.Length; while(p<s.Length&&(s.Substring(p,1)==" "||s.Substring(p,1)=="\t")){p=p+1;} int e=p; while(e<s.Length&&IsIdentChar(s.Substring(e,1))){e=e+1;} return s.Substring(p,e-p); }
+    static bool Word(string s,string w){int p=Find(s,w,0);return p>=0&&(p==0||!IsIdentChar(s.Substring(p-1,1)))&&(p+w.Length==s.Length||!IsIdentChar(s.Substring(p+w.Length,1))); }
+    static bool IsIdentChar(string c){return (c>="a"&&c<="z")||(c>="A"&&c<="Z")||(c>="0"&&c<="9")||c=="_"; }
+    static string WordAt(string s,int p){int e=p;while(e<s.Length&&IsIdentChar(s.Substring(e,1))){e=e+1;}return s.Substring(p,e-p);}
+    static string Identifier(string s,int p){while(p<s.Length&&(s.Substring(p,1)==" "||s.Substring(p,1)=="\t")){p=p+1;}int e=p;while(e<s.Length&&IsIdentChar(s.Substring(e,1))){e=e+1;}return s.Substring(p,e-p);}
+    static string IdentifierBack(string s,int p){int e=p-1;while(e>=0&&(s.Substring(e,1)==" "||s.Substring(e,1)=="\t")){e=e-1;}int b=e;while(b>=0&&IsIdentChar(s.Substring(b,1))){b=b-1;}return s.Substring(b+1,e-b);}
+    static string QuotedArg(string s,int open,int n){int cur=open+1;int idx=0;while(cur<s.Length){while(cur<s.Length&&(s.Substring(cur,1)==" "||s.Substring(cur,1)==",")){cur=cur+1;}if(cur>=s.Length||s.Substring(cur,1)!="\""){return "";}int e=Find(s,"\"",cur+1);if(e<0){return "";}if(idx==n){return s.Substring(cur+1,e-cur-1);}idx=idx+1;cur=e+1;while(cur<s.Length&&s.Substring(cur,1)!=","){if(s.Substring(cur,1)==")"){return "";}cur=cur+1;}}return "";}
+    static string QuotedAfter(string s,string key){int p=Find(s,key,0);if(p<0){return "";}int q=Find(s,"\"",p+key.Length);if(q<0){return "";}int e=Find(s,"\"",q+1);return e>q?s.Substring(q+1,e-q-1):"";}
+    static List<string> SplitComma(string s){return Split(s,",");}
+    static List<string> Split(string s,string sep){List<string> r=new List<string>();int b=0;for(int i=0;i<=s.Length;i=i+1){if(i==s.Length||s.Substring(i,1)==sep){r.Add(Trim(s.Substring(b,i-b)));b=i+1;}}return r;}
+    static int Int(string s){string t=Trim(s);int sign=1;int i=0;if(t.StartsWith("-")){sign=-1;i=1;}int n=0;while(i<t.Length){string c=t.Substring(i,1);if(c<"0"||c>"9"){break;}n=n*10+(c[0]-48);i=i+1;}return n*sign;}
+    static string Without(string s){return s;}
+    static bool Has(List<string>a,string x){for(int i=0;i<a.Count;i=i+1){if(a[i]==x){return true;}}return false;}
+    static int LineAt(string s,int p){int n=1;for(int i=0;i<p&&i<s.Length;i=i+1){if(s.Substring(i,1)=="\n"){n=n+1;}}return n;}
+    static int NextLine(string s,int p){int i=Find(s,"\n",p);return i<0?s.Length:i;}
+}
