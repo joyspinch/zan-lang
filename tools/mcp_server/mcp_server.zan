@@ -40,7 +40,8 @@ using System.Compiler;      // GenIndex: the .zanmap project index emitter
 /// are actually present next to the server, so the same binary serves a plain
 /// directory just as well as a Zan checkout:
 ///   zan_api_search, zan_lookup_symbol, zan_list_members, zan_find_refs,
-///   zan_route_lookup, zan_orm_lookup, zan_refresh_index,
+///   zan_project_overview, zan_route_lookup, zan_orm_lookup,
+///   zan_change_impact, zan_read_context, zan_refresh_index,
 ///   zan_example, zan_compile, zan_build_project, build, zan_form_schema
 ///
 /// Usage:
@@ -350,6 +351,13 @@ class McpServer {
         // Per-workspace, not per-installation: these describe the project
         // being served, and zan_refresh_index rewrites them in place.
         McpServer.routesIndexPath = McpServer.root + "/.zanmap/routes.json";
+        // RepoMap's text-scanned table is the fallback for a workspace that
+        // was never compiled here: same shape, but no module/perm/params.
+        if (!File.Exists(McpServer.routesIndexPath)
+            && File.Exists(McpServer.root + "/.zanmap/routes.approx.json")) {
+            McpServer.routesIndexPath =
+                McpServer.root + "/.zanmap/routes.approx.json";
+        }
         McpServer.entitiesIndexPath = McpServer.root + "/.zanmap/entities.json";
         McpServer.indexManifestPath = McpServer.root + "/.zanmap/index.json";
         McpServer.KnowledgeCheck(false);
@@ -1226,7 +1234,7 @@ class McpServer {
             "text/plain");
         McpServer.AddResource(arr, "repo://symbols", ".zanmap/symbols.json",
             "Symbol index (one JSON record per line)", "application/json");
-        McpServer.AddResource(arr, "repo://routes", ".zanmap/routes.json",
+        McpServer.AddResource(arr, "repo://routes", McpServer.RoutesRel(),
             "HTTP route index", "application/json");
         McpServer.AddResource(arr, "repo://entities", ".zanmap/entities.json",
             "ORM entities: table, columns, indexes and generated facades",
@@ -1248,12 +1256,25 @@ class McpServer {
         arr.Append(o);
     }
 
+    /// Workspace-relative name of the route table actually in use: GenIndex's
+    /// routes.json when the project was compiled here, RepoMap's text-scanned
+    /// routes.approx.json otherwise.
+    static string RoutesRel() {
+        string p = McpServer.routesIndexPath;
+        string approx = "routes.approx.json";
+        if (p.Length >= approx.Length
+            && p.Substring(p.Length - approx.Length, approx.Length) == approx) {
+            return ".zanmap/" + approx;
+        }
+        return ".zanmap/routes.json";
+    }
+
     static JsonValue ReadResource(JsonValue id, string uri) {
         string rel = "";
         string mime = "application/json";
         if (uri == "repo://map") { rel = ".zanmap/repo.map.txt"; mime = "text/plain"; }
         if (uri == "repo://symbols") { rel = ".zanmap/symbols.json"; }
-        if (uri == "repo://routes") { rel = ".zanmap/routes.json"; }
+        if (uri == "repo://routes") { rel = McpServer.RoutesRel(); }
         if (uri == "repo://entities") { rel = ".zanmap/entities.json"; }
         if (uri == "repo://index") { rel = ".zanmap/index.json"; }
         if (rel == "") {
@@ -1303,8 +1324,20 @@ class McpServer {
         if (name == "zan_find_refs" || name == "find_refs") {
             return McpServer.FindRefs(args.Str("name", ""), args.Int("limit", 30));
         }
+        if (name == "zan_project_overview" || name == "project_overview") {
+            return McpServer.ProjectOverview(args.Int("limit", 40));
+        }
         if (name == "zan_route_lookup" || name == "route_lookup") {
             return McpServer.RouteLookup(args);
+        }
+        if (name == "zan_change_impact" || name == "change_impact") {
+            return McpServer.ChangeImpact(args.Str("symbol", ""),
+                                         args.Int("limit", 30));
+        }
+        if (name == "zan_read_context" || name == "read_context") {
+            return McpServer.ReadContext(args.Str("symbol", ""),
+                                        args.Int("before", 4),
+                                        args.Int("lines", 80));
         }
         if (name == "zan_orm_lookup" || name == "orm_lookup") {
             return McpServer.OrmLookup(args);
@@ -2654,6 +2687,248 @@ class McpServer {
         return false;
     }
 
+    /// The whole project in one call: how big it is, what it exposes (routes
+    /// per module and per verb), what it persists (entity -> table) and where
+    /// the RBAC holes are. Reads only .zanmap, so it replaces a tree walk plus
+    /// a dozen opening reads at the start of a task.
+    static string ProjectOverview(int limit) {
+        if (!File.Exists(McpServer.indexManifestPath)) {
+            return McpServer.IndexMissingMsg(".zanmap/index.json");
+        }
+        JsonValue man = McpServer.ParseBody(
+            File.ReadAllText(McpServer.indexManifestPath));
+        JsonValue o = JsonValue.NewObject();
+        o.Put("root", JsonValue.NewStr(McpServer.root));
+        if (man != null) {
+            o.Put("generatedBy", man.Get("generatedBy"));
+            o.Put("sourceFiles", man.Get("sourceFiles"));
+        }
+        JsonValue routes = McpServer.IndexArray(McpServer.routesIndexPath);
+        JsonValue ents = McpServer.IndexArray(McpServer.entitiesIndexPath);
+        JsonValue mods = JsonValue.NewObject();
+        JsonValue verbs = JsonValue.NewObject();
+        JsonValue unmarked = JsonValue.NewArray();
+        int unmarkedTotal = 0;
+        for (int i = 0; i < routes.Count(); i = i + 1) {
+            JsonValue r = routes.At(i);
+            if (r == null) { continue; }
+            McpServer.Bump(mods, r.Str("module", ""));
+            McpServer.Bump(verbs, r.Str("method", ""));
+            // Only a Grant-gated action needs Perm bits; Login/None actions
+            // legitimately carry none, and reporting them as holes would make
+            // the number useless.
+            if (r.Str("perm", "") == "" && r.Str("auth", "") == "Grant") {
+                unmarkedTotal = unmarkedTotal + 1;
+                if (unmarked.Count() < limit) {
+                    unmarked.Append(JsonValue.NewStr(r.Str("action", "")));
+                }
+            }
+        }
+        JsonValue tables = JsonValue.NewArray();
+        for (int i = 0; i < ents.Count(); i = i + 1) {
+            JsonValue e = ents.At(i);
+            if (e == null) { continue; }
+            if (tables.Count() >= limit) { break; }
+            tables.Append(JsonValue.NewStr(e.Str("name", "") + " -> "
+                + e.Str("table", "")));
+        }
+        o.Put("routes", JsonValue.NewNum(Convert.ToString(routes.Count())));
+        o.Put("routesByModule", mods);
+        o.Put("routesByMethod", verbs);
+        o.Put("entities", JsonValue.NewNum(Convert.ToString(ents.Count())));
+        o.Put("tables", tables);
+        // An authorized action with no Perm is the failure mode the RBAC gate
+        // reports at startup, so it belongs in the overview rather than in a
+        // separate audit call.
+        o.Put("authorizedWithoutPerm",
+            JsonValue.NewNum(Convert.ToString(unmarkedTotal)));
+        o.Put("authorizedWithoutPermSample", unmarked);
+        o.Put("next", JsonValue.NewStr(
+            "zan_route_lookup for an URL or action, zan_orm_lookup for an"
+            + " entity's columns and facades, zan_change_impact before"
+            + " editing a shared symbol, zan_read_context to see one"
+            + " definition"));
+        return o.ToJson();
+    }
+
+    /// `.zanmap` artefact as an array, or an empty array when it is missing or
+    /// malformed: an overview must still answer what it does know.
+    static JsonValue IndexArray(string path) {
+        if (!File.Exists(path)) { return JsonValue.NewArray(); }
+        JsonValue all = McpServer.ParseBody(File.ReadAllText(path));
+        if (all == null || !all.IsArray()) { return JsonValue.NewArray(); }
+        return all;
+    }
+
+    /// Counts `key` in a JSON object used as a counter map. Empty keys are
+    /// bucketed as "(none)" so a missing module is visible instead of silent.
+    static void Bump(JsonValue map, string key) {
+        string k = key;
+        if (k == "") { k = "(none)"; }
+        int n = 0;
+        if (map.Has(k)) {
+            JsonValue cur = map.Get(k);
+            if (cur != null) { n = cur.AsInt(0); }
+        }
+        map.Set(k, JsonValue.NewNum(Convert.ToString(n + 1)));
+    }
+
+    /// "What breaks if I change this": the declaration sites of a name, the
+    /// files that mention it, and -- the part a grep cannot give you -- the
+    /// routes and entities those files own, so the answer is "these 3 URLs and
+    /// this table" rather than "47 hits".
+    ///
+    /// Reference sites come from RepoMap's text-level index (identifier
+    /// matches, not overload-resolved), so they are candidates to review; the
+    /// route/entity attribution is exact, being derived from unit metadata.
+    static string ChangeImpact(string name, int limit) {
+        if (name == "") { return "error: 'symbol' is required"; }
+        if (!File.Exists(McpServer.refsPath)) {
+            return "error: reference index not found at " + McpServer.refsPath
+                + "; generate it with: zanc tools/repomap/RepoMap.zan"
+                + " --auto-stdlib -o repomap.exe && repomap.exe .";
+        }
+        string simple = McpServer.AfterLastDot(name).ToLower();
+        List<string> lines = File.ReadAllLines(McpServer.refsPath);
+        JsonValue rec = null;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (McpServer.NameField(lines[i]) != simple) { continue; }
+            rec = McpServer.IndexRecord(lines[i]);
+            if (rec != null) { break; }
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("symbol", JsonValue.NewStr(name));
+        if (rec == null) {
+            o.Put("hint", JsonValue.NewStr(
+                "no indexed name matches; the index keys simple names"
+                + " (\"OpenRouterKey\", not \"Model.OpenRouterKey\")"));
+            return o.ToJson();
+        }
+        JsonValue files = JsonValue.NewObject();
+        McpServer.CountSites(files, rec.Get("defs"));
+        McpServer.CountSites(files, rec.Get("refs"));
+        o.Put("defs", rec.Get("defs"));
+        o.Put("refCount", JsonValue.NewNum(
+            Convert.ToString(rec.Int("refCount", 0))));
+        o.Put("testRefs", JsonValue.NewNum(
+            Convert.ToString(rec.Int("testRefs", 0))));
+        o.Put("files", files);
+        o.Put("subtypes", rec.Get("subtypes"));
+
+        JsonValue routes = McpServer.IndexArray(McpServer.routesIndexPath);
+        JsonValue hitRoutes = JsonValue.NewArray();
+        int routeTotal = 0;
+        for (int i = 0; i < routes.Count(); i = i + 1) {
+            JsonValue r = routes.At(i);
+            if (r == null || !files.Has(r.Str("file", ""))) { continue; }
+            routeTotal = routeTotal + 1;
+            if (hitRoutes.Count() >= limit) { continue; }
+            JsonValue row = JsonValue.NewObject();
+            row.Put("method", r.Get("method"));
+            row.Put("path", r.Get("path"));
+            row.Put("action", r.Get("action"));
+            row.Put("perm", r.Get("perm"));
+            hitRoutes.Append(row);
+        }
+        JsonValue ents = McpServer.IndexArray(McpServer.entitiesIndexPath);
+        JsonValue hitEnts = JsonValue.NewArray();
+        for (int i = 0; i < ents.Count(); i = i + 1) {
+            JsonValue e = ents.At(i);
+            if (e == null) { continue; }
+            bool byFile = files.Has(e.Str("file", ""));
+            bool byName = e.Str("name", "").ToLower() == simple;
+            if (!byFile && !byName) { continue; }
+            JsonValue row = JsonValue.NewObject();
+            row.Put("name", e.Get("name"));
+            row.Put("table", e.Get("table"));
+            row.Put("file", e.Get("file"));
+            hitEnts.Append(row);
+        }
+        o.Put("routes", hitRoutes);
+        o.Put("routesAffected", JsonValue.NewNum(
+            Convert.ToString(routeTotal)));
+        o.Put("entities", hitEnts);
+        o.Put("evidence", JsonValue.NewStr(
+            "'files' and 'refCount' are text-level identifier matches (review"
+            + " them); 'routes'/'entities' are exact, derived from the"
+            + " compiler's unit metadata for the files that mention the name"));
+        return o.ToJson();
+    }
+
+    /// Adds each "file:line" site of `arr` to a per-file counter map.
+    static void CountSites(JsonValue map, JsonValue arr) {
+        if (arr == null || !arr.IsArray()) { return; }
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            string site = arr.At(i).AsString("");
+            int cut = site.LastIndexOf(":");
+            if (cut > 0) { site = site.Substring(0, cut); }
+            if (site == "") { continue; }
+            McpServer.Bump(map, site);
+        }
+    }
+
+    /// The definition of a symbol as source text: resolve it in the symbol
+    /// index, then return that window of the file. One call instead of
+    /// lookup-then-read, and it never returns a whole file.
+    static string ReadContext(string name, int before, int lines) {
+        if (name == "") { return "error: 'symbol' is required"; }
+        if (!File.Exists(McpServer.indexPath)) { return McpServer.NoIndex(); }
+        string lower = name.ToLower();
+        string dotted = "." + lower;
+        List<string> idx = File.ReadAllLines(McpServer.indexPath);
+        List<JsonValue> cands = new List<JsonValue>();
+        for (int i = 0; i < idx.Count; i = i + 1) {
+            if (cands.Count >= McpServer.CandCap()) { break; }
+            string full = McpServer.NameField(idx[i]);
+            if (full == "") { continue; }
+            bool exact = full == lower;
+            bool member = full.Length > dotted.Length
+                && full.Substring(full.Length - dotted.Length,
+                                  dotted.Length) == dotted;
+            if (!exact && !member) { continue; }
+            JsonValue rec = McpServer.IndexRecord(idx[i]);
+            if (rec != null) { cands.Add(rec); }
+        }
+        JsonValue best = McpServer.RankedTake(cands, 1);
+        if (best.Count() == 0) {
+            JsonValue miss = JsonValue.NewObject();
+            miss.Put("symbol", JsonValue.NewStr(name));
+            miss.Put("hint", JsonValue.NewStr(
+                "no definition indexed for that name; try zan_api_search"));
+            return miss.ToJson();
+        }
+        JsonValue def = best.At(0);
+        string rel = def.Str("file", "");
+        int line = def.Int("line", 0);
+        string full2 = McpServer.Resolve(rel);
+        if (rel == "" || full2 == "" || !File.Exists(full2)) {
+            JsonValue miss = JsonValue.NewObject();
+            miss.Put("symbol", JsonValue.NewStr(name));
+            miss.Put("definition", def);
+            miss.Put("hint", JsonValue.NewStr(
+                "the definition lives outside this workspace ('" + rel
+                + "'); the index record above is all this server can show"));
+            return miss.ToJson();
+        }
+        int from = line - before;
+        if (from < 1) { from = 1; }
+        JsonValue args = JsonValue.NewObject();
+        args.Put("from_line", JsonValue.NewNum(Convert.ToString(from)));
+        args.Put("max_lines", JsonValue.NewNum(Convert.ToString(lines)));
+        JsonValue win = McpServer.ParseBody(
+            McpServer.ReadLinesDoc(rel, full2, args));
+        JsonValue o = JsonValue.NewObject();
+        o.Put("symbol", JsonValue.NewStr(name));
+        o.Put("definition", def);
+        if (win != null) {
+            o.Put("from_line", win.Get("from_line"));
+            o.Put("to_line", win.Get("to_line"));
+            o.Put("fileLines", win.Get("lines"));
+            o.Put("content", win.Get("content"));
+        }
+        return o.ToJson();
+    }
+
     /// Rebuild .zanmap/{routes,entities,index}.json: export the workspace's
     /// unit metadata with zanc --gen-meta, then run the same GenIndex the
     /// compiler runs, so the index cannot drift from the generated code.
@@ -3137,6 +3412,16 @@ class McpServer {
                 "Reference sites to return (default 30).", false);
             arr.Append(t);
         }
+        if (File.Exists(McpServer.indexManifestPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_project_overview",
+                "Read this before touching a project you do not know: size,"
+                + " routes grouped by module and by verb, entity -> table"
+                + " map, and the actions that are authorized but carry no"
+                + " Perm. One .zanmap read instead of walking the tree.");
+            McpServer.AddParam(t, "limit", "integer",
+                "Cap for the sample lists (default 40).", false);
+            arr.Append(t);
+        }
         if (File.Exists(McpServer.routesIndexPath) || McpServer.frozenTools) {
             t = McpServer.NewTool("zan_route_lookup",
                 "Answer \"which action serves this URL, and what may call"
@@ -3169,6 +3454,35 @@ class McpServer {
                 "Find the entities that carry this column/field.", false);
             McpServer.AddParam(t, "limit", "integer",
                 "Result cap (default 10).", false);
+            arr.Append(t);
+        }
+        if (File.Exists(McpServer.refsPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_change_impact",
+                "Before editing a shared symbol: where it is declared, which"
+                + " files mention it, how much of that is tests, and -- what"
+                + " a grep cannot tell you -- the routes and entities those"
+                + " files own, so you see the URLs and tables at risk."
+                + " Reference sites are text-level candidates; the route and"
+                + " entity attribution is exact.");
+            McpServer.AddParam(t, "symbol", "string",
+                "Simple name (\"OpenRouterKey\") or Type.Member.", true);
+            McpServer.AddParam(t, "limit", "integer",
+                "Route rows to return (default 30).", false);
+            arr.Append(t);
+        }
+        if (File.Exists(McpServer.indexPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_read_context",
+                "The source of ONE definition: resolves the symbol in the"
+                + " index and returns that window of the file, numbered."
+                + " Use it instead of read_file when you know the name but"
+                + " not the file, and instead of reading a whole file to see"
+                + " one method.");
+            McpServer.AddParam(t, "symbol", "string",
+                "Simple name or Type.Member.", true);
+            McpServer.AddParam(t, "before", "integer",
+                "Lines of context above the declaration (default 4).", false);
+            McpServer.AddParam(t, "lines", "integer",
+                "Lines to return (default 80).", false);
             arr.Append(t);
         }
         if ((McpServer.ZanToolsAvailable() && McpServer.Mutable())
