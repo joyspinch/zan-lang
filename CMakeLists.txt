@@ -1027,6 +1027,9 @@ foreach(_src ${_gen_srcs})
     "\"op\": \"db_acc_head\","
     "class __DbQ_Order"
     "class __DbU_Order")
+  set(_gen_forbid_regex
+    "GetField(Int|Long|Double|String|Bool)"
+    "SetField(Int|Long|Double|String|Bool)")
   add_test(NAME gen_${_name}
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -1035,9 +1038,21 @@ foreach(_src ${_gen_srcs})
       -DOUT_EXE=${CMAKE_BINARY_DIR}/gen_${_name}${_exe_ext}
       -DREPLY=${CMAKE_BINARY_DIR}/gen_${_name}_reply.json
       "-DREPLY_REGEX=${_gen_regex}"
+      "-DREPLY_FORBID_REGEX=${_gen_forbid_regex}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_gen_case.cmake)
   set_tests_properties(gen_${_name} PROPERTIES TIMEOUT 120)
 endforeach()
+
+add_test(NAME gen_cache_isolation
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSTDLIB=${CMAKE_SOURCE_DIR}/stdlib
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/json_entity_mapping.zan
+    -DWORK=${CMAKE_BINARY_DIR}/gen_cache_isolation
+    -P ${CMAKE_SOURCE_DIR}/tests/run_gen_cache_isolation.cmake)
+set_tests_properties(gen_cache_isolation PROPERTIES
+  TIMEOUT 240
+  LABELS "full;standard;smoke")
 
 # ---- Leak detection: run each program under --check-leaks, fail on leaks ----
 # The --check-leaks build tracks rc-managed allocations and reports any object

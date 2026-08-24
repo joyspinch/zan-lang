@@ -7,7 +7,7 @@
 //   __DbU_<E>       类型化 UPDATE 门面(转发 OrmUpdate)
 //   __DbD_<E>       类型化 DELETE 门面(转发 OrmDelete)
 //   __DbCF_<E>      CodeFirst 门面(转发 OrmSync)
-//   __DbM_<E>       实体字段取值/赋值口(按列元数据循环,长度与字段数无关)
+//   __DbM_<E>       实体字段取值/赋值口(按列元数据分发到直接字段访问)
 //   __DbB_<E>       IOrmRows 实现:把实体行交给运行期按列取值
 // 以及汇总类 __DbBind(工厂方法 + SyncAll)。
 //
@@ -124,10 +124,9 @@ class GenDbEmit {
         }
     }
 
-    /// 实体的取值/赋值口 `__DbM_<T>` 与行来源 `__DbB_<T>`:反射读写字段只在
-    /// 静态类型就是实体的地方成立,所以按列元数据循环的这几行必须落在这里;
-    /// 它们的长度与字段数无关(加字段只多一行元数据),SQL/绑定/映射的规则本身
-    /// 仍只有 System.Data.Orm 里的一份。
+    /// 实体的取值/赋值口 `__DbM_<T>` 与行来源 `__DbB_<T>`。列集合和 SQL
+    /// 仍由运行期决定；这里仅把列元数据分发到实体的直接字段访问，避免为每个
+    /// 实体拉入通用反射读写表。
     static bool Has(List<string> l, string v) {
         for (int i = 0; i < l.Count; i = i + 1) {
             if (l[i] == v) { return true; }
@@ -136,60 +135,51 @@ class GenDbEmit {
     }
 
     static void GenAccess(StringBuilder b, string cls) {
+        List<DbField> fs = GenDb.FieldsOf(cls, 0);
         b.Append("class __DbM_" + cls + " {\n" +
                  "    static " + cls + " Read(List<OrmCol> cols, DbResult r, " +
                  "int row, int at0) {\n" +
                  "        " + cls + " o = new " + cls + "();\n" +
                  "        for (int i = 0; i < cols.Count; i = i + 1) {\n" +
                  "            OrmCol c = cols[i];\n" +
-                 "            int at = at0 + i;\n" +
-                 "            if (c.Kind == 3) {\n" +
-                 "                o.SetFieldString(c.Field, " +
-                 "r.GetString(row, at));\n" +
-                 "            } else if (c.Kind == 1) {\n" +
-                 "                o.SetFieldDouble(c.Field, " +
-                 "r.GetDouble(row, at));\n" +
-                 "            } else if (c.Kind == 2) {\n" +
-                 "                o.SetFieldBool(c.Field, " +
-                 "r.GetBool(row, at));\n" +
-                 "            } else if (c.I64) {\n" +
-                 "                o.SetFieldLong(c.Field, " +
-                 "r.GetLong(row, at));\n" +
-                 "            } else {\n" +
-                 "                o.SetFieldInt(c.Field, " +
-                 "r.GetInt(row, at));\n" +
-                 "            }\n" +
+                 "            int at = at0 + i;\n");
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            DbField f = fs[i];
+            if (f.Kind == 5) { continue; }
+            string getter = f.Kind == 0 && GenDbEmit.Is64(f.TypeName)
+                ? "GetLong" : GenDbEmit.Getter(f.Kind);
+            b.Append("            if (c.Field == \"" + f.Name + "\") { " +
+                     "o." + f.Name + " = r." + getter +
+                     "(row, at); }\n");
+        }
+        b.Append(
                  "        }\n" +
                  "        return o;\n" +
                  "    }\n" +
                  "    static void Bind(" + cls + " o, OrmCol c, " +
-                 "DbParams ps) {\n" +
-                 "        if (c.Kind == 3) { __DbM_" + cls +
-                 ".BindStr(o, c.Field, ps); return; }\n" +
-                 "        if (c.Kind == 1) { " +
-                 "ps.AddDouble(o.GetFieldDouble(c.Field)); return; }\n" +
-                 "        if (c.Kind == 2) {\n" +
-                 "            if (o.GetFieldBool(c.Field)) { ps.AddInt(1); } " +
-                 "else { ps.AddInt(0); }\n" +
-                 "            return;\n" +
-                 "        }\n" +
-                 "        if (c.I64) { ps.AddLong(o.GetFieldLong(c.Field)); " +
-                 "return; }\n" +
-                 "        ps.AddInt(o.GetFieldInt(c.Field));\n" +
-                 "    }\n");
-        /* 字符串列按声明字段直接取值:未赋值的字段是 null,必须以 SQL NULL
-         * 写库,而反射取值把 null 与 "" 收敛成同一个空串,分不出来。
-         * 每个字符串字段一行,SQL 规则本身仍只有共享实现那一份。 */
-        b.Append("    static void BindStr(" + cls +
-                 " o, string f, DbParams ps) {\n");
-        List<DbField> sfs = GenDb.FieldsOf(cls, 0);
-        for (int i = 0; i < sfs.Count; i = i + 1) {
-            if (sfs[i].Kind != 3) { continue; }
-            b.Append("        if (f == \"" + sfs[i].Name + "\") { ps.Add(o." +
-                     sfs[i].Name + "); return; }\n");
+                 "DbParams ps) {\n");
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            DbField f = fs[i];
+            if (f.Kind == 5) { continue; }
+            b.Append("        if (c.Field == \"" + f.Name + "\") {\n");
+            if (f.Kind == 0) {
+                string add = GenDbEmit.Is64(f.TypeName) ? "AddLong" : "AddInt";
+                b.Append("            ps." + add + "(o." + f.Name + ");\n");
+            } else if (f.Kind == 4) {
+                b.Append("            int ev = o." + f.Name + ";\n" +
+                         "            ps.AddInt(ev);\n");
+            } else if (f.Kind == 1) {
+                b.Append("            ps.AddDouble(o." + f.Name + ");\n");
+            } else if (f.Kind == 2) {
+                b.Append("            if (o." + f.Name +
+                         ") { ps.AddInt(1); } else { ps.AddInt(0); }\n");
+            } else {
+                b.Append("            ps.Add(o." + f.Name + ");\n");
+            }
+            b.Append("            return;\n" +
+                     "        }\n");
         }
-        b.Append("        ps.Add(o.GetFieldString(f));\n" +
-                 "    }\n" +
+        b.Append("    }\n" +
                  "}\n");
         b.Append("class __DbB_" + cls + " : IOrmRows {\n" +
                  "    List<" + cls + "> items;\n" +

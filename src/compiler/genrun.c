@@ -10,6 +10,7 @@
 #include "../common/json.h"
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -101,23 +102,29 @@ int zan_gen_cache_dir(char *dir, size_t dir_size) {
 #endif
 }
 
-/* Last-write time of a file; -1 when missing. (Values are only compared
- * within one platform, so the Windows/POSIX units need not match.) */
-static long long zan_file_mtime(const char *path) {
-#ifdef _WIN32
-    HANDLE h = CreateFileA(path, 0,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return -1;
-    FILETIME ft;
-    GetFileTime(h, NULL, NULL, &ft);
-    CloseHandle(h);
-    return ((long long)ft.dwHighDateTime << 32) | (long long)ft.dwLowDateTime;
-#else
-    struct stat st;
-    if (stat(path, &st) != 0) return -1;
-    return (long long)st.st_mtime;
-#endif
+static void zan_gen_hash_bytes(uint64_t *hash, const void *data, size_t len) {
+    const unsigned char *p = (const unsigned char *)data;
+    for (size_t i = 0; i < len; i++) {
+        *hash ^= (uint64_t)p[i];
+        *hash *= UINT64_C(1099511628211);
+    }
+}
+
+static void zan_gen_hash_text(uint64_t *hash, const char *text) {
+    zan_gen_hash_bytes(hash, text, strlen(text));
+    zan_gen_hash_bytes(hash, "\0", 1);
+}
+
+static int zan_gen_hash_file(uint64_t *hash, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    unsigned char buf[32768];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        zan_gen_hash_bytes(hash, buf, n);
+    int ok = ferror(f) ? -1 : 0;
+    fclose(f);
+    return ok;
 }
 
 /* Spawn a child process and wait for it. argv[0] is the program. Returns the
@@ -151,39 +158,47 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
         fprintf(stderr, "error: no user cache dir for the code generators\n");
         return -1;
     }
-    snprintf(exe, exe_size, "%s%sZanGen%s", dir, GEN_DIR_SEP_STR, GEN_EXE_SUFFIX);
 
-    /* Cold cache, a generator source edited, or a relinked zanc: the metadata
-     * protocol and the generator executable must match (the compiler binary
-     * carries the exporter, the cached exe carries the consumers). */
-    long long exe_mt = zan_file_mtime(exe);
-    long long newest_input = -1;   /* newest generator input, for a re-check */
-    int stale = (exe_mt < 0);
-    {
-        char zexe[ZAN_GEN_MAX_PATH];
-        zan_self_exe(zexe, sizeof(zexe));
-        long long self_mt = zexe[0] ? zan_file_mtime(zexe) : -1;
-        if (self_mt > newest_input) newest_input = self_mt;
-        if (!stale && self_mt > exe_mt) stale = 1;
+    /* The cache must not be shared merely because timestamps happen to line
+     * up. Different worktrees can carry incompatible generator sources whose
+     * checkout times are newer than the cached executable. Key the image by
+     * compiler bytes, stdlib root and generator contents instead. */
+    char zexe[ZAN_GEN_MAX_PATH];
+    zan_self_exe(zexe, sizeof(zexe));
+    if (!zexe[0]) {
+        fprintf(stderr, "error: cannot locate zanc to compile the code generators\n");
+        return -1;
     }
+    uint64_t key = UINT64_C(1469598103934665603);
+    zan_gen_hash_text(&key, "zan-generator-cache-v2");
+    zan_gen_hash_text(&key, zexe);
+    if (zan_gen_hash_file(&key, zexe) != 0) {
+        fprintf(stderr, "error: cannot hash zanc for the code-generator cache\n");
+        return -1;
+    }
+    zan_gen_hash_text(&key, stdlib_root);
     for (int i = 0; i < GEN_SOURCE_COUNT; i++) {
         char src[ZAN_GEN_MAX_PATH];
         snprintf(src, sizeof(src), "%s%cSystem%cCompiler%c%s",
                  stdlib_root, GEN_DIR_SEP_STR[0], GEN_DIR_SEP_STR[0],
                  GEN_DIR_SEP_STR[0], kGenSources[i]);
-        long long mt = zan_file_mtime(src);
-        if (mt > newest_input) newest_input = mt;
-        if (!stale && (mt < 0 || mt > exe_mt)) stale = 1;
-    }
-
-    if (stale) {
-        char zexe[ZAN_GEN_MAX_PATH];
-        char src[ZAN_GEN_MAX_PATH];
-        zan_self_exe(zexe, sizeof(zexe));
-        if (!zexe[0]) {
-            fprintf(stderr, "error: cannot locate zanc to compile the code generators\n");
+        zan_gen_hash_text(&key, kGenSources[i]);
+        if (zan_gen_hash_file(&key, src) != 0) {
+            fprintf(stderr, "error: cannot hash code-generator source '%s'\n", src);
             return -1;
         }
+    }
+    snprintf(exe, exe_size, "%s%sZanGen_%016llx%s", dir, GEN_DIR_SEP_STR,
+             (unsigned long long)key, GEN_EXE_SUFFIX);
+
+    if (
+#ifdef _WIN32
+        GetFileAttributesA(exe) == INVALID_FILE_ATTRIBUTES
+#else
+        access(exe, F_OK) != 0
+#endif
+    ) {
+        char src[ZAN_GEN_MAX_PATH];
         snprintf(src, sizeof(src), "%s%cSystem%cCompiler%cZanGen.zan",
                  stdlib_root, GEN_DIR_SEP_STR[0], GEN_DIR_SEP_STR[0],
                  GEN_DIR_SEP_STR[0]);
@@ -197,8 +212,9 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
 #else
         int pid = (int)getpid();
 #endif
-        snprintf(tmp, sizeof(tmp), "%s%cZanGen_%d%s", dir,
-                 GEN_DIR_SEP_STR[0], pid, GEN_EXE_SUFFIX);
+        snprintf(tmp, sizeof(tmp), "%s%cZanGen_%016llx_%d%s", dir,
+                 GEN_DIR_SEP_STR[0], (unsigned long long)key, pid,
+                 GEN_EXE_SUFFIX);
         char *argv[] = {
             zexe, src, "--stdlib-path", (char *)stdlib_root, "--auto-stdlib",
             "--no-gen", "-DZAN_GEN_MAIN=1", "-o", tmp, NULL
@@ -216,11 +232,14 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
 #endif
             /* A parallel build compiling the same generator may hold the
              * published image open (Windows cannot replace a running exe).
-             * That is harmless as long as what it published is itself current,
-             * so drop our copy and reuse theirs; a missing or stale
-             * destination is a real failure. */
+             * The content-addressed destination proves their image has the
+             * same inputs, so drop our copy and reuse it. */
             remove(tmp);
-            if (zan_file_mtime(exe) >= newest_input) return 0;
+            FILE *published = fopen(exe, "rb");
+            if (published) {
+                fclose(published);
+                return 0;
+            }
             fprintf(stderr, "error: cannot publish the compiled code generator\n");
             return -1;
         }
@@ -908,4 +927,3 @@ done:
     remove(out_path);
     return rc;
 }
-

@@ -7,8 +7,9 @@
  * the generated source + rewrite directives from the reply JSON.
  *
  * The generator is compiled with zanc itself (it is ordinary Zan code) and
- * cached under the user cache dir, keyed by the generator sources' mtimes:
- * a cold cache costs one extra compile, a warm cache one spawn per build.
+ * cached under the user cache dir, keyed by the compiler, stdlib root and
+ * generator source contents: a cold cache costs one extra compile, a warm
+ * cache one spawn per build.
  *
  * --no-gen (zan_gen_enabled = 0) disables the whole machinery; it exists to
  * compile the generators themselves, whose sources must not run the codegen
@@ -26,11 +27,10 @@ struct zan_diag;
 /* Set by main() from --no-gen. Generators run only while this is non-zero. */
 extern int zan_gen_enabled;
 
-/* Ensure the cached generator executable is present and newer than every
- * generator source under <stdlib_root>/System/Compiler/. Compiles it with
- * zanc itself when cold. Fills `exe` (caller's buffer, at least
- * ZAN_GEN_MAX_PATH bytes) on success. Returns 0, or -1 with a message on
- * stderr. */
+/* Ensure the content-addressed generator executable exists for this compiler
+ * and <stdlib_root>. Compiles it with zanc itself when cold. Fills `exe`
+ * (caller's buffer, at least ZAN_GEN_MAX_PATH bytes) on success. Returns 0,
+ * or -1 with a message on stderr. */
 #define ZAN_GEN_MAX_PATH 1024
 int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size);
 

@@ -7,6 +7,7 @@
 #   cmake -DZANC=<zanc> -DSRC=<file.zan> -DEXPECTED=<file.out>
 #         -DOUT_EXE=<exe path> -DREPLY=<reply json path>
 #         "-DREPLY_REGEX=<re1>;<re2>;..." [-DZANC_ARGS=<extra;args>]
+#         "-DREPLY_FORBID_REGEX=<re1>;<re2>;..."
 #         -P run_gen_case.cmake
 #
 # Unlike run_case.cmake this always recompiles: the reply file IS the input
@@ -40,6 +41,13 @@ foreach(_re ${REPLY_REGEX})
   if(NOT _m)
     message(FATAL_ERROR
       "generator reply missing expected pattern:\n  ${_re}\n--- reply head ---\n${reply}")
+  endif()
+endforeach()
+foreach(_re ${REPLY_FORBID_REGEX})
+  string(REGEX MATCH "${_re}" _m "${reply}")
+  if(_m)
+    message(FATAL_ERROR
+      "generator reply contains forbidden pattern:\n  ${_re}\n--- reply head ---\n${reply}")
   endif()
 endforeach()
 
