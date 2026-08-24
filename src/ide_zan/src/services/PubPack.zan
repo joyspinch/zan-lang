@@ -56,18 +56,26 @@ class PubPack {
     static void Worker() {
         PubJob j = PubPack.Take();
         if (j == null) { return; }
-        // 打包里任何一处抛出来都必须变成输出窗里的一行：线程静静死掉的话
-        // 事件循环会一直等着「发布中」不落地。
         try {
             PubPack.Pack(j);
         } catch (Exception ex) {
+            j.ok = false;
             j.log.Add(ZanIDE.T("> Packaging failed: ", "> 打包失败：") + ex.Message);
+        } finally {
+            PubPack.Finish(j);
         }
-        PubPack.Finish(j);
+    }
+
+    static void SetStage(PubJob j, string stage) {
+        PubPack.EnsureQueue();
+        Mutex.Lock(PubPack.sLock);
+        j.stage = stage;
+        Mutex.Unlock(PubPack.sLock);
     }
 
     /// 收尾三步，顺序和原来在事件循环里的一样：资源、Chromium 子进程包、归档。
     static void Pack(PubJob j) {
+        PubPack.SetStage(j, ZanIDE.T("copying resources", "复制资源"));
         // 每个目标各有自己的输出目录，资源就放在各自可执行文件旁边；
         // 单文件的 Windows exe 已经把资源内嵌了，不需要这份散拷。
         for (int i = 0; i < j.exes.Count; i = i + 1) {
@@ -77,6 +85,8 @@ class PubPack {
                                      j.log);
             }
         }
+        PubPack.SetStage(j, ZanIDE.T("preparing the Chromium helper",
+                                     "准备 Chromium 子进程包"));
         // Chromium 从一个 helper 包里起子进程，所以它在链接之后、归档之前写。
         for (int i = 0; i < j.exes.Count; i = i + 1) {
             if (File.Exists(j.exes[i]) && ZanIDE.IsMacAppExe(j.exes[i])) {
@@ -88,9 +98,12 @@ class PubPack {
         List<string> tarred = new List<string>();
         for (int i = 0; i < j.exes.Count; i = i + 1) {
             if (!File.Exists(j.exes[i])) { continue; }
+            PubPack.SetStage(j, ZanIDE.T("archiving ", "归档 ")
+                + j.exes[i]);
             string tp = ZanIDE.TarPublishFor(j.exes[i], tarred, j.log);
             if (tp != "") { tarred.Add(tp); }
         }
+        PubPack.SetStage(j, ZanIDE.T("complete", "完成"));
     }
 
     static void Finish(PubJob j) {
@@ -108,23 +121,31 @@ class PubPack {
         return d;
     }
 
-    /// 把这一次发布的收尾交给一条线程。返回 true 表示已经在跑；起不了线程时
-    /// 返回 false，调用方就地同步做完（宁可卡一下也不能不打包）。
-    static bool Start(string root, List<string> exes, bool packed) {
+    /// 返回 1 表示已启动，0 表示线程起不来，-1 表示上一次超时的线程仍在跑。
+    static int Start(string root, List<string> exes, bool packed) {
+        if (PubPack.sCur != null) {
+            if (PubPack.DoneOf(PubPack.sCur) == 0) { return 0 - 1; }
+            PubPack.sCur = null;
+        }
         PubJob j = new PubJob();
         j.root = root;
-        j.exes = exes;
+        j.exes = new List<string>();
+        for (int i = 0; i < exes.Count; i = i + 1) {
+            j.exes.Add(exes[i]);
+        }
         j.packed = packed;
         j.log = new List<string>();
+        j.stage = ZanIDE.T("starting", "启动");
+        j.ok = true;
         j.done = 0;
         PubPack.sCur = j;
         PubPack.Push(j);
         if (!Thread.Start(PubPack.Worker)) {
             PubJob _drop = PubPack.Take();
             PubPack.sCur = null;
-            return false;
+            return 0;
         }
-        return true;
+        return 1;
     }
 
     /// 同步收尾（线程起不来时的退路）：日志直接进给定的输出列表。
@@ -135,8 +156,15 @@ class PubPack {
         j.exes = exes;
         j.packed = packed;
         j.log = log;
+        j.stage = ZanIDE.T("starting", "启动");
+        j.ok = true;
         j.done = 1;
-        PubPack.Pack(j);
+        try {
+            PubPack.Pack(j);
+        } catch (Exception ex) {
+            j.ok = false;
+            log.Add(ZanIDE.T("> Packaging failed: ", "> 打包失败：") + ex.Message);
+        }
     }
 
     static bool Busy() {
@@ -152,6 +180,16 @@ class PubPack {
         PubPack.sCur = null;
         return j;
     }
+
+    static string Stage() {
+        if (PubPack.sCur == null) { return ZanIDE.T("unknown", "未知"); }
+        PubPack.EnsureQueue();
+        Mutex.Lock(PubPack.sLock);
+        string stage = PubPack.sCur.stage;
+        Mutex.Unlock(PubPack.sLock);
+        return stage;
+    }
+
 }
 
 /// 一次发布收尾的入参与产出。`log` 由线程写、由事件循环在 `Ready()` 之后读，
@@ -161,5 +199,7 @@ class PubJob {
     List<string> exes;
     bool packed;
     List<string> log;
+    string stage;
+    bool ok;
     int done;
 }
