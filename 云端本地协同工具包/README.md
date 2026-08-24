@@ -141,3 +141,7 @@ powershell -ExecutionPolicy Bypass -NoProfile -File scripts\publish_ide.ps1 [-No
 `-NoBump` 复用当前版本，别把版本号白升一格。成功的收尾行是
 `PUBLISH_OK v<版本> -> ...\dist\win-x64\ZanIDE.exe`，产物为扁平布局（exe + 几个驱动 dll +
 `toolchain\ stdlib\ examples\ templates\ knowledge\ docs\`）。
+
+## mirror_delta.py（云端镜像快速重建）
+
+工作区是 git 仓库时，别再逐文件 pull：云端 `git clone` 拿基线，只搬「未推送提交 bundle + 未提交改动 tgz」两个增量包，镜像即本机工作树副本。用法与手工重放步骤见脚本头部 docstring。注意本机 autocrlf=true，提交仍在本机做。
