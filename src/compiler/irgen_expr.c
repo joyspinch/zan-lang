@@ -185,7 +185,7 @@ static bool emit_span_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef window = (expr->call.args.count >= 2)
                 ? coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), i64t)
                 : LLVMBuildSub(g->builder, len, start, "span.len");
-            emit_span_window_check(g, start, window, len, expr->loc);
+            emit_span_window_check(g, start, window, len, expr->loc, "span");
             LLVMValueRef off = LLVMBuildMul(g->builder, start,
                 LLVMSizeOf(elem_llvm), "span.boff");
             base = LLVMBuildGEP2(g->builder, i8, base, &off, 1, "span.base2");
@@ -211,7 +211,7 @@ static bool emit_span_call(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMValueRef nlen = (expr->call.args.count >= 2)
             ? coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), i64t)
             : LLVMBuildSub(g->builder, len, start, "sl.len2");
-        emit_span_window_check(g, start, nlen, len, expr->loc);
+        emit_span_window_check(g, start, nlen, len, expr->loc, "span");
         LLVMValueRef off = LLVMBuildMul(g->builder, start,
             LLVMSizeOf(elem_llvm), "sl.boff");
         LLVMValueRef nbase = LLVMBuildGEP2(g->builder, i8, base, &off, 1, "sl.base2");
@@ -2006,6 +2006,88 @@ static LLVMValueRef emit_mdarray_elem_ptr(zan_irgen_t *g, LLVMValueRef arr_ptr,
     return LLVMBuildGEP2(g->builder, elem_llvm, typed, &flat, 1, "md.ep");
 }
 
+/* ---- compound assignment: evaluate the store target exactly once ----
+ * The parser desugars `lhs op= rhs` into `lhs = (lhs op rhs)`, sharing one
+ * AST subtree for both occurrences of `lhs`. Emitting that naively runs every
+ * effectful node along the target spine twice -- once when folding the value,
+ * once when relocating the store address -- and the two evaluations can even
+ * land on different storage (`Slot[NextIndex()] += 1`). Before lowering, each
+ * effectful spine node is rewritten in place into a load from a hidden temp
+ * local evaluated exactly once here. Leaves that cannot diverge (identifiers,
+ * literals, this) stay put; an INDEX / MEMBER_ACCESS at the root is the
+ * storage location itself and only gets its children rewritten. */
+static int ca_synth_counter = 0;
+
+static void ca_hoist_spine(zan_irgen_t *g, zan_ast_node_t **slot,
+                           local_scope_t *locals, int is_root);
+
+/* Evaluate `*slot` once into a hidden temp local and replace it with an
+ * identifier bound to that temp. Owned (+1) results are consumed by the temp
+ * (released with the enclosing scope); borrowed values are stored raw. */
+static void ca_replace_with_temp(zan_irgen_t *g, zan_ast_node_t **slot,
+                                 local_scope_t *locals) {
+    zan_ast_node_t *node = *slot;
+    if (!node) return;
+    zan_type_t *type = infer_expr_type(g, node, locals);
+    /* without a type we cannot size the temp; re-emitting is then the lesser
+     * risk, and the checker will have flagged the expression anyway */
+    if (!type) return;
+    char nbuf[40];
+    int n = (int)__atomic_fetch_add(&ca_synth_counter, 1, __ATOMIC_SEQ_CST);
+    snprintf(nbuf, sizeof nbuf, "__zca%d", n);
+    uint32_t nlen = (uint32_t)strlen(nbuf);
+    zan_istr_t name = { zan_arena_strdup(g->arena, nbuf, nlen), nlen };
+    LLVMValueRef alloca = emit_entry_alloca(g, map_type(g, type), nbuf);
+    LLVMValueRef val = emit_expr(g, node, locals);
+    zan_store_fit(g, val, alloca);
+    local_add(locals, name, alloca, type);
+    locals->vars[locals->count - 1].arc_owned =
+        (is_rc_managed_type(type) && expr_yields_owned_rc_value(g, node, locals))
+            ? 1 : 0;
+    zan_ast_node_t *id = zan_ast_new(g->arena, AST_IDENTIFIER, node->loc);
+    id->ident.name = name;
+    *slot = id;
+}
+
+static void ca_hoist_spine(zan_irgen_t *g, zan_ast_node_t **slot,
+                           local_scope_t *locals, int is_root) {
+    zan_ast_node_t *node = *slot;
+    if (!node) return;
+    switch (node->kind) {
+    case AST_INDEX:
+        if (is_root) {
+            /* storage location: keep it live, rewrite what it is built from */
+            ca_hoist_spine(g, &node->index.object, locals, 0);
+            ca_hoist_spine(g, &node->index.index, locals, 0);
+        } else {
+            ca_replace_with_temp(g, slot, locals);
+        }
+        return;
+    case AST_MEMBER_ACCESS:
+        if (is_root) {
+            ca_hoist_spine(g, &node->member.object, locals, 0);
+        } else {
+            /* container position: a property getter or computed object must
+             * not run twice, so freeze the whole reference into a temp */
+            ca_replace_with_temp(g, slot, locals);
+        }
+        return;
+    case AST_IDENTIFIER:
+    case AST_THIS_EXPR:
+    case AST_INT_LITERAL:
+    case AST_FLOAT_LITERAL:
+    case AST_STRING_LITERAL:
+    case AST_CHAR_LITERAL:
+    case AST_BOOL_LITERAL:
+    case AST_NULL_LITERAL:
+        return;
+    default:
+        /* calls, casts, conditionals, ... can run user code */
+        ca_replace_with_temp(g, slot, locals);
+        return;
+    }
+}
+
     static LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
             local_scope_t *locals) {
             LLVMValueRef right;
@@ -2021,6 +2103,12 @@ static LLVMValueRef emit_mdarray_elem_ptr(zan_irgen_t *g, LLVMValueRef arr_ptr,
                 return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
             }
             check_readonly_store(g, expr->binary.left, locals);
+            /* `lhs op= rhs`: the parser shared one target subtree for the
+             * value read and the store address. Freeze every effectful spine
+             * node into a temp so both occurrences evaluate exactly once and
+             * agree on the location (see ca_hoist_spine). */
+            if (expr->binary.compound_base != TK_EOF)
+                ca_hoist_spine(g, &expr->binary.left, locals, 1);
         {
             zan_type_t *lt = assign_lhs_type(g, expr->binary.left, locals);
             check_implicit_narrowing(g, lt,
@@ -2340,6 +2428,7 @@ binding_lowered:
                         LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i8, arr_ptr, &idx, 1, "eidx");
                         LLVMValueRef val8 = LLVMBuildTrunc(g->builder, right, i8, "byte");
                         zan_store_fit(g, val8, elem_ptr);
+                        emit_string_len_invalidate(g, arr_ptr);
                     } else {
                         LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
                         if (local->type && local->type->element_type) {
@@ -2467,6 +2556,7 @@ binding_lowered:
                             LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i8, arr_ptr, &idx, 1, "eidx");
                             LLVMValueRef val8 = LLVMBuildTrunc(g->builder, right, i8, "byte");
                             zan_store_fit(g, val8, elem_ptr);
+                            emit_string_len_invalidate(g, arr_ptr);
                         } else {
                         LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
                         if (fsym->type && fsym->type->element_type) {
@@ -2544,6 +2634,10 @@ binding_lowered:
                             list_ptr, 2, "df");
                         LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64t, 0),
                             data_field, "data");
+                        LLVMValueRef count = LLVMBuildLoad2(g->builder, i64t,
+                            LLVMBuildStructGEP2(g->builder, g->list_struct_type,
+                                list_ptr, 0, "countf"), "count");
+                        emit_index_bounds_check(g, idx, count, expr->loc, "list");
                         if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
                             LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
                             idx = LLVMBuildSExt(g->builder, idx, i64t, "idxext");
@@ -2574,10 +2668,20 @@ binding_lowered:
                             expr->binary.left->index.index, expr->binary.right, locals);
                     } else if (at->kind == TYPE_STRING) {
                         LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+                        emit_index_bounds_check(g, idx,
+                            emit_string_buffer_len(g, arr_ptr), expr->loc,
+                            "string");
                         LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i8, arr_ptr, &idx, 1, "eidx");
                         LLVMValueRef val8 = LLVMBuildTrunc(g->builder, right, i8, "byte");
                         zan_store_fit(g, val8, elem_ptr);
+                        emit_string_len_invalidate(g, arr_ptr);
                         } else {
+                        if (at->kind == TYPE_ARRAY && at->array_rank == 1) {
+                            /* rank>1 goes through emit_mdarray_elem_ptr, which
+                             * checks each dimension itself */
+                            emit_index_bounds_check(g, idx,
+                                zan_array_len(g, arr_ptr), expr->loc, "array");
+                        }
                         LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
                         if (at->element_type) {
                             elem_llvm = map_type(g, at->element_type);
@@ -2645,6 +2749,8 @@ binding_lowered:
                             expr->binary.left, elem_llvm, locals);
                     } else {
                         LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
+                        emit_index_bounds_check(g, idx, zan_array_len(g, arr_ptr),
+                            expr->loc, "array");
                         LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                             LLVMPointerType(elem_llvm, 0), "arrp");
                         elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm,
@@ -2867,6 +2973,9 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
     zan_ast_node_t *operand = expr->unary.operand;
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef slot_ptr = NULL;
+    /* set when the slot is a byte of a string, whose cached length the store
+     * at the end of this function invalidates */
+    LLVMValueRef slot_str_base = NULL;
     LLVMTypeRef slot_ty = NULL;
     /* property operand (`obj.Prop++`): resolved via getter+setter calls */
     zan_symbol_t *prop_getter = NULL;
@@ -3020,6 +3129,7 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             slot_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
                 arr_ptr, &idx, 1, "eidx");
             slot_ty = LLVMInt8TypeInContext(g->ctx);
+            slot_str_base = arr_ptr;
         }
     }
 
@@ -3081,6 +3191,7 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             : zan_sub(g->builder, old_val, one, "dec");
     }
     zan_store_fit(g, new_val, slot_ptr);
+    if (slot_str_base) emit_string_len_invalidate(g, slot_str_base);
     return is_prefix ? new_val : old_val;
 }
 
@@ -3200,9 +3311,9 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
 
                 if (vtk == LLVMPointerTypeKind) {
                     /* already a string — a null one concatenates as "" (C#),
-                     * so coerce before strlen sees it */
+                     * so coerce before the length is taken */
                     strs[i] = emit_str_nonnull(g, val);
-                    lens[i] = zan_call2(g->builder, strlen_type, g->fn_strlen, &strs[i], 1, "len");
+                    lens[i] = emit_string_length(g, strs[i]);
                     owns[i] = expr_yields_owned_rc_value(g, part, locals) ? 1 : 0;
                 } else if (vtk == LLVMDoubleTypeKind || vtk == LLVMFloatTypeKind) {
                     /* snprintf(NULL, 0, fmt, val) to get length, then snprintf
@@ -3347,6 +3458,8 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
                 if (owns[i]) emit_string_release(g, strs[i]);
             }
         }
+        /* every part was concatenated whole, so the total is the exact length */
+        emit_string_len_set(g, result, total_len);
         free(strs);
         free(lens);
         free(owns);
@@ -3719,19 +3832,17 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             }
         }
 
-        /* String.Length property — call strlen on string pointer. Only for a
-         * receiver that really is a string: every rc-managed value is a
-         * pointer, so an unguarded fallback answered `list.Length` with the
-         * strlen of the List's own storage instead of rejecting the member. */
+        /* String.Length property — the cached header length, falling back to a
+         * strlen walk. Only for a receiver that really is a string: every
+         * rc-managed value is a pointer, so an unguarded fallback answered
+         * `list.Length` with the strlen of the List's own storage instead of
+         * rejecting the member. */
         if (expr->member.name.len == 6 && memcmp(expr->member.name.str, "Length", 6) == 0 &&
             recv_is_stringlike(g, expr->member.object, locals)) {
             LLVMValueRef obj_val = emit_expr(g, expr->member.object, locals);
             if (LLVMGetTypeKind(LLVMTypeOf(obj_val)) == LLVMPointerTypeKind) {
-                LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                LLVMTypeRef strlen_type = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0);
-                /* strlen returns i64; `int` is i64 so return it directly. */
-                LLVMValueRef len = zan_call2(g->builder, strlen_type, g->fn_strlen, &obj_val, 1, "len");
+                /* the length is an i64; `int` is i64 so return it directly. */
+                LLVMValueRef len = emit_string_length(g, obj_val);
                 emit_release_owned_call_temp(g, expr->member.object, obj_val, locals);
                 return len;
             }
@@ -6835,7 +6946,7 @@ static LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
 
     /* site index at obj-8 (second header word). A string stored in an
      * `object` slot is a bare buffer whose second header word carries
-     * ZAN_STRING_MAGIC instead of a site index, so probe for it first:
+     * the string tag instead of a site index, so probe for it first:
      * `x is string` must match, anything else must not. */
     LLVMPositionBuilderAtEnd(g->builder, head);
     LLVMValueRef tstr = LLVMBuildGlobalStringPtr(g->builder, tname, "is.tn");
@@ -6845,8 +6956,7 @@ static LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
     LLVMValueRef site = LLVMBuildLoad2(g->builder, i64,
         LLVMBuildBitCast(g->builder, sptr, LLVMPointerType(i64, 0), "is.sp"),
         "is.site");
-    LLVMValueRef isstr = zan_icmp(g->builder, LLVMIntEQ, site,
-        LLVMConstInt(i64, ZAN_STRING_MAGIC, 0), "is.str");
+    LLVMValueRef isstr = zan_hdr_is_string(g, site, "is.str");
     LLVMBuildCondBr(g->builder, isstr, str_bb, oob_bb);
 
     /* string object: `is T` holds iff T is `string` */

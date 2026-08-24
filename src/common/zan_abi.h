@@ -35,15 +35,36 @@
  * arrays (see zan_array_alloc/zan_array_len). */
 #define ZAN_OBJ_RC_OFF    (-16)
 
-/* Second header word: i64 leak-site index (or ZAN_STRING_MAGIC on strings).
- * Tolerant retain/release probe this slot to tell a managed string from a
- * bare buffer before touching the refcount. */
+/* Second header word: i64 leak-site index (or the tag/length pair below on
+ * strings). Tolerant retain/release probe this slot to tell a managed string
+ * from a bare buffer before touching the refcount. */
 #define ZAN_OBJ_SITE_OFF  (-8)
 
 /* String RC header magic and sentinel refcount. The second header word
  * doubles as a guard for tolerant retain/release. */
 #define ZAN_STRING_MAGIC       UINT64_C(0x5a414e5354524d47) /* "ZANSTRMG" */
 #define ZAN_STRING_SENTINEL_RC UINT64_C(0xffffffffffffffff)
+
+/* On strings the second header word is split: the high 32 bits keep the tag
+ * that identifies a managed string, the low 32 bits cache its byte length so
+ * `.Length` and every bounds check are O(1) instead of a strlen walk (an
+ * index-per-character loop over an n-byte string was O(n^2)).
+ *
+ *   str - 8: [ u32 ZAN_STRING_TAG | u32 byte length ]
+ *
+ * ZAN_STR_LEN_UNKNOWN is the length half of the historical ZAN_STRING_MAGIC,
+ * so a freshly allocated string still reads as "not measured yet" and the
+ * value written by every producer that only knows a capacity stays valid.
+ * Readers fall back to strlen for it and cache the result back into the word
+ * (only when the refcount is not the literal sentinel, i.e. the header is
+ * writable). A length that happens to equal ZAN_STR_LEN_UNKNOWN (~1.4 GB)
+ * simply keeps measuring by strlen; lengths above 4 GB-1 are not cacheable
+ * either and are left unknown. */
+#define ZAN_STRING_TAG         UINT64_C(0x5a414e53)         /* "ZANS" */
+#define ZAN_STR_LEN_UNKNOWN    UINT64_C(0x54524d47)         /* "TRMG" */
+#define ZAN_STR_LEN_MASK       UINT64_C(0xffffffff)
+#define ZAN_STR_HDR_WORD(len)  (((ZAN_STRING_TAG) << 32) | \
+                                ((uint64_t)(len) & ZAN_STR_LEN_MASK))
 
 /* Array header magic, in the same slot (arrays keep their element count in the
  * first word and take no leak-site index). It is what tells a byte[] apart

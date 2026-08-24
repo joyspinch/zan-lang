@@ -1547,6 +1547,23 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
          * so the two are not conflated. */
         int callee_is_method = 0;
         zan_symbol_t *called_sym = NULL;
+        /* EnumType.TryParse(text, out value): a compiler-lowered static over
+         * the enum's declaration-order name table. The enum carries no method
+         * symbol for the generic member path to find, so resolve it here and
+         * type the call bool; irgen emits the strcmp probe chain. */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
+            expr->call.callee->member.object->kind == AST_IDENTIFIER &&
+            expr->call.args.count == 2 &&
+            expr->call.callee->member.name.len == 8 &&
+            memcmp(expr->call.callee->member.name.str, "TryParse", 8) == 0) {
+            zan_symbol_t *es = zan_binder_lookup(c->binder,
+                expr->call.callee->member.object->ident.name);
+            if (es && es->kind == SYM_ENUM) {
+                for (int ai = 0; ai < 2; ai++)
+                    zan_checker_check_expr(c, expr->call.args.items[ai]);
+                return c->binder->type_bool;
+            }
+        }
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             recv = zan_checker_check_expr(c, expr->call.callee->member.object);
             if (recv && recv->sym) {
@@ -2314,13 +2331,22 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                     break;
             }
             if (ei == obj_type->sym->member_count) {
-                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
-                              "enum type '%.*s' has no member '%.*s'",
-                              (int)obj_type->sym->name.len,
-                              obj_type->sym->name.str,
-                              (int)expr->member.name.len,
-                              expr->member.name.str);
-                return c->binder->type_error;
+                /* Compiler-provided static pseudo-members on an enum type:
+                 * TryParse(string, out T) is lowered by irgen over the
+                 * declaration-order name table, so it is not a declared
+                 * member. */
+                zan_istr_t mn = expr->member.name;
+                bool pseudo = mn.len == 8 &&
+                    memcmp(mn.str, "TryParse", 8) == 0;
+                if (!pseudo) {
+                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                                  "enum type '%.*s' has no member '%.*s'",
+                                  (int)obj_type->sym->name.len,
+                                  obj_type->sym->name.str,
+                                  (int)expr->member.name.len,
+                                  expr->member.name.str);
+                    return c->binder->type_error;
+                }
             }
         }
     }

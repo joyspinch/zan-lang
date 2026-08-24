@@ -302,7 +302,13 @@ bool zan_pkg_fetch(zan_pkg_registry_t *reg, const zan_dependency_t *dep) {
     return false;
 }
 
-bool zan_pkg_resolve(zan_pkg_registry_t *reg, zan_package_t *root) {
+/* Resolve `root`'s dependency tree. `seen` carries the names already resolved
+ * during this run: the resolver has no other memory of what it visited, so a
+ * dependency cycle (A -> B -> A) would otherwise recurse until zanc's stack
+ * is exhausted. An already-seen name is simply not re-entered -- its own deps
+ * were resolved when it was first seen. */
+static bool zan_pkg_resolve_seen(zan_pkg_registry_t *reg, zan_package_t *root,
+                                 char (*seen)[128], int *seen_count) {
     bool all_ok = true;
     for (int i = 0; i < root->dep_count; i++) {
         zan_dependency_t *dep = &root->deps[i];
@@ -322,8 +328,25 @@ bool zan_pkg_resolve(zan_pkg_registry_t *reg, zan_package_t *root) {
             }
             /* Propagate transitive resolution failures instead of dropping
              * them: an unresolved sub-dependency must fail the whole resolve. */
-            if (fetched_pkg.dep_count > 0 && !zan_pkg_resolve(reg, &fetched_pkg))
-                all_ok = false;
+            if (fetched_pkg.dep_count > 0) {
+                bool seen_before = false;
+                for (int s = 0; s < *seen_count; s++) {
+                    if (strcmp(seen[s], fetched_pkg.name) == 0) { seen_before = true; break; }
+                }
+                if (seen_before) {
+                    fprintf(stderr, "note: '%s' is already resolved (shared dependency "
+                                    "or dependency cycle); skipping its subtree\n",
+                            fetched_pkg.name);
+                } else if (*seen_count < 256) {
+                    snprintf(seen[*seen_count], 128, "%s", fetched_pkg.name);
+                    (*seen_count)++;
+                    if (!zan_pkg_resolve_seen(reg, &fetched_pkg, seen, seen_count))
+                        all_ok = false;
+                } else {
+                    fprintf(stderr, "error: dependency chain deeper than 256 packages\n");
+                    all_ok = false;
+                }
+            }
             zan_pkg_destroy(&fetched_pkg);
         } else {
             fprintf(stderr, "error: failed to read manifest for package '%s'\n", dep->name);
@@ -331,6 +354,17 @@ bool zan_pkg_resolve(zan_pkg_registry_t *reg, zan_package_t *root) {
         }
     }
     return all_ok;
+}
+
+bool zan_pkg_resolve(zan_pkg_registry_t *reg, zan_package_t *root) {
+    char seen[256][128];
+    int seen_count = 0;
+    /* seed with the root itself: a transitive dep on the root package must
+     * terminate too */
+    if (root->name[0]) {
+        snprintf(seen[seen_count++], 128, "%s", root->name);
+    }
+    return zan_pkg_resolve_seen(reg, root, seen, &seen_count);
 }
 
 char **zan_pkg_get_sources(zan_pkg_registry_t *reg, int *out_count) {

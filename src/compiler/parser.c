@@ -1608,6 +1608,10 @@ static zan_ast_node_t *parse_expression(zan_parser_t *p) {
 
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_ASSIGNMENT, loc);
         n->binary.op = op;
+        /* `expr` is now referenced twice (value side and store target);
+         * compound_base tells irgen to rewrite the spine for single
+         * evaluation before lowering. */
+        n->binary.compound_base = base;
         n->binary.left = expr;
         n->binary.right = right;
         return n;

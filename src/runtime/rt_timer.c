@@ -22,6 +22,7 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <shellapi.h>
 typedef CRITICAL_SECTION zan_timer_mutex_t;
 static INIT_ONCE g_lock_once = INIT_ONCE_STATIC_INIT;
 static zan_timer_mutex_t g_lock;
@@ -53,6 +54,63 @@ static zan_timer_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static void timer_lock(void) { pthread_mutex_lock(&g_lock); }
 static void timer_unlock(void) { pthread_mutex_unlock(&g_lock); }
 #endif
+/* The Windows C runtime's argv is decoded with the process ANSI code page,
+ * whereas Zan strings and the Windows file APIs use UTF-8. Reparse the
+ * original Unicode command line and retain the converted vector for process
+ * lifetime, matching the CRT argv lifetime. This object is linked into every
+ * native executable, so the compiler can use the helper without a new optional
+ * runtime dependency. */
+int zan_utf8_argv(int *argc, char ***argv) {
+#if defined(_WIN32)
+    if (!argc || !argv) return 0;
+
+    int wide_argc = 0;
+    LPWSTR *wide_argv = CommandLineToArgvW(GetCommandLineW(), &wide_argc);
+    if (!wide_argv || wide_argc < 1) return 0;
+
+    char **utf8_argv = (char **)calloc((size_t)wide_argc + 1, sizeof(*utf8_argv));
+    if (!utf8_argv) {
+        LocalFree(wide_argv);
+        return 0;
+    }
+
+    for (int i = 0; i < wide_argc; i++) {
+        int bytes = WideCharToMultiByte(CP_UTF8, 0, wide_argv[i], -1,
+                                        NULL, 0, NULL, NULL);
+        if (bytes <= 0) {
+            for (int j = 0; j < i; j++) free(utf8_argv[j]);
+            free(utf8_argv);
+            LocalFree(wide_argv);
+            return 0;
+        }
+        utf8_argv[i] = (char *)malloc((size_t)bytes);
+        if (!utf8_argv[i]) {
+            for (int j = 0; j < i; j++) free(utf8_argv[j]);
+            free(utf8_argv);
+            LocalFree(wide_argv);
+            return 0;
+        }
+        if (WideCharToMultiByte(CP_UTF8, 0, wide_argv[i], -1,
+                                utf8_argv[i], bytes, NULL, NULL) != bytes) {
+            free(utf8_argv[i]);
+            for (int j = 0; j < i; j++) free(utf8_argv[j]);
+            free(utf8_argv);
+            LocalFree(wide_argv);
+            return 0;
+        }
+    }
+
+    LocalFree(wide_argv);
+    *argc = wide_argc;
+    *argv = utf8_argv;
+    return 1;
+#else
+    (void)argc;
+    (void)argv;
+    return 0;
+#endif
+}
+
 
 typedef enum zan_timer_kind {
     ZAN_TIMER_DELAY = 0,

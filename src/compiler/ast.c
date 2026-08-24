@@ -10,6 +10,7 @@ zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t l
     node->kind = kind;
     node->loc = loc;
     node->lit_suffix = 0;
+    node->binary.compound_base = TK_EOF;   /* union field: deterministic default */
     zan_ast_list_init(&node->attributes);
     node->ns_name.str = NULL; node->ns_name.len = 0;
     node->orig_name.str = NULL; node->orig_name.len = 0;

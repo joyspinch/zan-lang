@@ -169,6 +169,11 @@ struct zan_ast_node {
         /* binary / assignment */
         struct {
             zan_token_kind_t op;
+            /* AST_ASSIGNMENT only: base operator of a desugared `lhs op= rhs`
+             * (TK_EOF for a plain assignment). The parser reuses the target
+             * subtree as the value-side operand; irgen keys single-evaluation
+             * rewriting on this. */
+            zan_token_kind_t compound_base;
             zan_ast_node_t *left;
             zan_ast_node_t *right;
         } binary;

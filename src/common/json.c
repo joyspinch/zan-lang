@@ -190,7 +190,17 @@ typedef struct {
     const char *p;
     const char *end;
     bool ok;
+    int depth;
 } jparser;
+
+/* jp_value recurses once per nesting level and is fed directly by zan-lsp /
+ * zan-dap with untrusted peer messages: without a cap, a few hundred KB of
+ * `[[[[...` overflows the stack and kills the server. The cap has to clear
+ * genmeta's compilation metadata too, whose nesting follows the expression
+ * nesting of the compiled sources (ZanIDE's own unit reaches 144), so it is
+ * set well above any hand-written code rather than at Json.NET's 128; a
+ * thousand jp_value frames still cost well under a megabyte of stack. */
+#define JSON_MAX_DEPTH 1024
 
 static void jp_skip_ws(jparser *j) {
     while (j->p < j->end &&
@@ -263,7 +273,10 @@ static json_value *jp_string(jparser *j) {
                 for (int i = 0; i < n; i++) {
                     if (len + 1 >= cap) {
                         if (cap > SIZE_MAX / 2) { free(buf); j->ok = false; return NULL; }
-                        cap *= 2; buf = (char *)realloc(buf, cap);
+                        cap *= 2;
+                        char *g = (char *)realloc(buf, cap);
+                        if (!g) { free(buf); j->ok = false; return NULL; }
+                        buf = g;
                     }
                     buf[len++] = utf8[i];
                 }
@@ -355,8 +368,13 @@ static json_value *jp_value(jparser *j) {
     if (j->p >= j->end) { j->ok = false; return NULL; }
     char c = *j->p;
     if (c == '"') return jp_string(j);
-    if (c == '{') return jp_object(j);
-    if (c == '[') return jp_array(j);
+    if (c == '{' || c == '[') {
+        if (j->depth >= JSON_MAX_DEPTH) { j->ok = false; return NULL; }
+        j->depth++;
+        json_value *v = (c == '{') ? jp_object(j) : jp_array(j);
+        j->depth--;
+        return v;
+    }
     if (c == '-' || isdigit((unsigned char)c)) return jp_number(j);
     if ((size_t)(j->end - j->p) >= 4 && strncmp(j->p, "true", 4) == 0) {
         j->p += 4; return json_new_bool(true);
@@ -377,6 +395,7 @@ json_value *json_parse(const char *text) {
     j.p = text;
     j.end = text + strlen(text);
     j.ok = true;
+    j.depth = 0;
     json_value *v = jp_value(&j);
     if (!j.ok) { json_free(v); return NULL; }
     /* A well-formed document is exactly one value; reject anything trailing

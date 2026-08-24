@@ -40,6 +40,30 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
         zan_call2(g->builder, setcp_type, fn_set_in, &cp_utf8, 1, "");
     }
 
+    /* Windows supplies the process argv through the active ANSI code page.
+     * Rebuild it from GetCommandLineW as UTF-8 so Environment.ArgAt() agrees
+     * with Zan strings and the wide Windows file APIs. The helper leaves the
+     * initialized locals untouched when conversion cannot be completed. */
+    LLVMValueRef main_argc = LLVMGetParam(main_fn, 0);
+    LLVMValueRef main_argv = LLVMGetParam(main_fn, 1);
+    if (g->target_is_windows) {
+        LLVMTypeRef i32ptr = LLVMPointerType(i32ty, 0);
+        LLVMTypeRef i8ptrptrptr = LLVMPointerType(i8ptrptr, 0);
+        LLVMTypeRef utf8_argv_type = LLVMFunctionType(i32ty,
+            (LLVMTypeRef[]){ i32ptr, i8ptrptrptr }, 2, 0);
+        LLVMValueRef utf8_argv_fn = LLVMGetNamedFunction(g->mod, "zan_utf8_argv");
+        if (!utf8_argv_fn)
+            utf8_argv_fn = LLVMAddFunction(g->mod, "zan_utf8_argv", utf8_argv_type);
+        LLVMValueRef argc_slot = LLVMBuildAlloca(g->builder, i32ty, "utf8_argc");
+        LLVMValueRef argv_slot = LLVMBuildAlloca(g->builder, i8ptrptr, "utf8_argv");
+        LLVMBuildStore(g->builder, main_argc, argc_slot);
+        LLVMBuildStore(g->builder, main_argv, argv_slot);
+        LLVMValueRef utf8_argv_args[] = { argc_slot, argv_slot };
+        zan_call2(g->builder, utf8_argv_type, utf8_argv_fn, utf8_argv_args, 2, "");
+        main_argc = LLVMBuildLoad2(g->builder, i32ty, argc_slot, "utf8_argc.value");
+        main_argv = LLVMBuildLoad2(g->builder, i8ptrptr, argv_slot, "utf8_argv.value");
+    }
+
     /* stash argc/argv into module globals for Environment.* builtins */
     LLVMValueRef g_argc = LLVMGetNamedGlobal(g->mod, "__zan_argc");
     if (!g_argc) {
@@ -51,8 +75,8 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
         g_argv = LLVMAddGlobal(g->mod, i8ptrptr, "__zan_argv");
         LLVMSetInitializer(g_argv, LLVMConstNull(i8ptrptr));
     }
-    LLVMBuildStore(g->builder, LLVMGetParam(main_fn, 0), g_argc);
-    LLVMBuildStore(g->builder, LLVMGetParam(main_fn, 1), g_argv);
+    LLVMBuildStore(g->builder, main_argc, g_argc);
+    LLVMBuildStore(g->builder, main_argv, g_argv);
 
     /* Make stdout flush promptly so a long-running program's output (a
      * server's startup/request logs, progress prints, ...) is visible

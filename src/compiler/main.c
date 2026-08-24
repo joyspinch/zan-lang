@@ -1061,17 +1061,19 @@ static void zan_read_driver_manifest(const char *manifest_path,
     fclose(f);
 }
 
-/* Recursively walk the stdlib tree looking for module directories that own a
- * `drivers/driver.manifest`. `rel` is the current directory relative to the
- * stdlib root ('/'-separated, empty at the root). Depth is bounded so a stray
- * symlink cycle can't wedge the compiler; `drivers`/`native`/dot directories
- * are not descended into (driver payloads, not further modules). */
-static void zan_scan_drivers_dir(const char *dir_full, const char *rel,
-                                 int depth, zan_driver_registry_t *reg) {
+typedef void (*zan_stdlib_dir_callback)(const char *dir_full,
+                                        const char *rel, void *ctx);
+static bool zan_file_exists(const char *path);
+static bool zan_is_safe_bundle_name(const char *name);
+
+/* Walk module directories below the stdlib root. Keeping enumeration here
+ * lets driver discovery and static-library lookup share the same bounded,
+ * platform-specific traversal without opening arbitrary driver payload trees. */
+static void zan_walk_stdlib_dirs(const char *dir_full, const char *rel,
+                                 int depth, zan_stdlib_dir_callback visit,
+                                 void *ctx) {
     if (depth > 8) return;
-    char manifest[1200];
-    snprintf(manifest, sizeof(manifest), "%s/drivers/driver.manifest", dir_full);
-    if (rel[0]) zan_read_driver_manifest(manifest, rel, reg);
+    visit(dir_full, rel, ctx);
 #ifdef _WIN32
     char glob[1200];
     snprintf(glob, sizeof(glob), "%s\\*", dir_full);
@@ -1088,7 +1090,7 @@ static void zan_scan_drivers_dir(const char *dir_full, const char *rel,
             char subrel[512];
             if (rel[0]) snprintf(subrel, sizeof(subrel), "%s/%s", rel, nm);
             else snprintf(subrel, sizeof(subrel), "%s", nm);
-            zan_scan_drivers_dir(sub, subrel, depth + 1, reg);
+            zan_walk_stdlib_dirs(sub, subrel, depth + 1, visit, ctx);
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
@@ -1107,18 +1109,26 @@ static void zan_scan_drivers_dir(const char *dir_full, const char *rel,
             char subrel[512];
             if (rel[0]) snprintf(subrel, sizeof(subrel), "%s/%s", rel, nm);
             else snprintf(subrel, sizeof(subrel), "%s", nm);
-            zan_scan_drivers_dir(sub, subrel, depth + 1, reg);
+            zan_walk_stdlib_dirs(sub, subrel, depth + 1, visit, ctx);
         }
         closedir(d);
     }
 #endif
 }
 
+static void zan_scan_driver_module(const char *dir_full, const char *rel,
+                                   void *ctx) {
+    if (!rel[0]) return;
+    char manifest[1200];
+    snprintf(manifest, sizeof(manifest), "%s/drivers/driver.manifest", dir_full);
+    zan_read_driver_manifest(manifest, rel, (zan_driver_registry_t *)ctx);
+}
+
 static void zan_discover_drivers(const char *stdlib_root,
                                  zan_driver_registry_t *reg) {
     reg->count = 0;
     if (!stdlib_root || !stdlib_root[0]) return;
-    zan_scan_drivers_dir(stdlib_root, "", 0, reg);
+    zan_walk_stdlib_dirs(stdlib_root, "", 0, zan_scan_driver_module, reg);
 }
 
 /* Index of the discovered driver whose lib basename matches, or -1. */
@@ -1128,6 +1138,52 @@ static int zan_driver_find(const zan_driver_registry_t *reg,
         if ((int)strlen(reg->entries[i].lib) == len &&
             memcmp(reg->entries[i].lib, lname, (size_t)len) == 0) return i;
     return -1;
+}
+
+typedef struct {
+    const char *target_subdir;
+    const char *library_name;
+    char result[1200];
+} zan_static_library_search_t;
+
+/* Locate a static dependency on demand instead of maintaining a module map:
+ * a new driver or target only needs to ship its archive in the standard
+ * drivers/<target>/static shape, with no compiler change. The library name
+ * comes only from the already-validated .libs manifest. */
+static void zan_find_static_library_dir(const char *dir_full, const char *rel,
+                                        void *ctx) {
+    (void)rel;
+    zan_static_library_search_t *search = (zan_static_library_search_t *)ctx;
+    if (search->result[0]) return;
+    char archive[1400];
+    int n = snprintf(archive, sizeof(archive),
+                     "%s/drivers/%s/static/lib%s.a", dir_full,
+                     search->target_subdir, search->library_name);
+    if (n < 0 || (size_t)n >= sizeof(archive)) return;
+    if (!zan_file_exists(archive)) return;
+    n = snprintf(search->result, sizeof(search->result),
+                 "%s/drivers/%s/static", dir_full, search->target_subdir);
+    if (n < 0 || (size_t)n >= sizeof(search->result))
+        search->result[0] = '\0';
+}
+
+static bool zan_find_static_library(const char *stdlib_root,
+                                    const char *target_subdir,
+                                    const char *library_name,
+                                    char *out, size_t outsz) {
+    if (!stdlib_root || !target_subdir || !library_name ||
+        !zan_is_safe_bundle_name(library_name))
+        return false;
+    zan_static_library_search_t search = {
+        .target_subdir = target_subdir,
+        .library_name = library_name,
+        .result = {0}
+    };
+    zan_walk_stdlib_dirs(stdlib_root, "", 0,
+                         zan_find_static_library_dir, &search);
+    if (!search.result[0] || strlen(search.result) >= outsz) return false;
+    snprintf(out, outsz, "%s", search.result);
+    return true;
 }
 
 /* Copy a file byte-for-byte (portable; no shell). Returns 0 on success. */
@@ -1186,8 +1242,17 @@ static int zan_copy_file(const char *src, const char *dst) {
 static bool zan_is_safe_bundle_name(const char *name) {
     if (!name || !name[0]) return false;
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return false;
-    for (const char *p = name; *p; p++)
-        if (*p == '/' || *p == '\\' || *p == ':') return false;
+    /* Allowlist, not blocklist: these names end up in a shell link command
+     * (system()) on some platforms, and a blocklist that misses one metacharacter
+     * (` $ && ; ... ) is command injection. A library or asset basename is
+     * always alphanumerics plus . _ - + -- anything else is rejected. */
+    for (const char *p = name; *p; p++) {
+        char c = *p;
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+                  c == '-' || c == '+';
+        if (!ok) return false;
+    }
     return true;
 }
 
@@ -2247,7 +2312,6 @@ int main(int argc, char **argv) {
         free(source);
         return 1;
     }
-    irgen.runtime_checks = runtime_checks;
     irgen.emit_debug = debug_info;
     /* Publish builds scramble string literals in the image (un-scrambled by a
      * .ctors constructor at startup) so a `strings` pass over the exe reveals
@@ -2952,6 +3016,72 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* Static .libs may name archives owned by another driver (for example,
+         * libpq.a needs OpenSSL). Resolve those names on demand by looking for
+         * the target's standard drivers/<target>/static layout instead of
+         * maintaining a module dependency map. This keeps new drivers and
+         * targets data-driven: shipping the archive is enough. */
+        if (link_static_drivers && resolved_stdlib_root[0]) {
+            const char *dsub = zan_driver_subdir(&target);
+            for (int li = 0; li < static_driver_lib_count; li++) {
+                const char *entry = static_driver_libs[li];
+                if (entry[0] != '-' || entry[1] != 'l' ||
+                    !entry[2] || !zan_is_safe_bundle_name(entry + 2))
+                    continue;
+                bool resolved = false;
+                for (int di = 0; di < zan_lib_ndirs && !resolved; di++) {
+                    char candidate[1200];
+                    int n = snprintf(candidate, sizeof(candidate),
+                                     "%s/lib%s.a", zan_lib_dirs[di], entry + 2);
+                    if (n >= 0 && (size_t)n < sizeof(candidate) &&
+                        zan_file_exists(candidate)) {
+                        resolved = true;
+                        continue;
+                    }
+#ifdef _WIN32
+                    n = snprintf(candidate, sizeof(candidate),
+                                 "%s/%s.lib", zan_lib_dirs[di], entry + 2);
+                    if (n >= 0 && (size_t)n < sizeof(candidate) &&
+                        zan_file_exists(candidate))
+                        resolved = true;
+#endif
+                }
+                if (resolved) continue;
+                char dependency_dir[1200];
+                if (zan_find_static_library(resolved_stdlib_root, dsub,
+                                            entry + 2, dependency_dir,
+                                            sizeof(dependency_dir))) {
+                    bool duplicate = false;
+                    for (int di = 0; di < zan_lib_ndirs; di++)
+                        if (strcmp(zan_lib_dirs[di], dependency_dir) == 0) {
+                            duplicate = true;
+                            break;
+                        }
+                    if (duplicate) continue;
+                    if (zan_lib_ndirs >= 16) {
+                        fprintf(stderr,
+                                "warning: static-driver dependency search "
+                                "path limit reached; ignoring '%s' for '%s'\n",
+                                dependency_dir, entry);
+                        continue;
+                    }
+                    memmove(&zan_lib_dirs[1], &zan_lib_dirs[0],
+                            (size_t)zan_lib_ndirs * sizeof(zan_lib_dirs[0]));
+                    snprintf(zan_lib_dirs[0], sizeof(zan_lib_dirs[0]), "%s",
+                             dependency_dir);
+                    zan_lib_ndirs++;
+                    continue;
+                }
+#ifdef _WIN32
+                if (zan_win_system_lib(entry + 2, (int)strlen(entry + 2)))
+                    continue;
+#endif
+                fprintf(stderr,
+                        "warning: static-driver library '%s' could not be "
+                        "resolved for target '%s'\n", entry, dsub);
+            }
+        }
+
 
         if (emit_lib) {
             /* ---- library output ----------------------------------------
@@ -3422,6 +3552,16 @@ int main(int argc, char **argv) {
             snprintf(cmd, sizeof(cmd),
                      "ld.lld -static%s -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\" \"%s\"",
                      publish_mode ? " -s" : "", obj_path, sys, sys, obj_tmp);
+            for (int di = 0; di < zan_lib_ndirs; di++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                         zan_lib_dirs[di]);
+            }
+            for (int di = 0; di < extra_lib_path_count; di++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                         extra_lib_paths[di]);
+            }
             if (rt_timer_obj) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", rt_timer_obj);
@@ -3473,6 +3613,11 @@ int main(int argc, char **argv) {
             for (int d = 0; d < cross_archive_count; d++) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", cross_archives[d]);
+            }
+            for (int li = 0; li < static_driver_lib_count; li++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " %s",
+                         static_driver_libs[li]);
             }
             { size_t cur = strlen(cmd);
               snprintf(cmd + cur, sizeof(cmd) - cur,

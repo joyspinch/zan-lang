@@ -362,6 +362,57 @@ static void release_string_like_arg(zan_irgen_t *g, zan_ast_node_t *e,
     else emit_release_owned_call_temp(g, e, v, locals);
 }
 
+/* The declared members of an enum symbol with their effective constants.
+ * C# running counter: an explicit `= n` resets it, the next auto member
+ * continues at n+1 — the same rule as the EnumType.Member fold in
+ * irgen_expr.c and the reflection table in irgen_reflect.c. Returns the
+ * member count written, capped at `cap`. */
+static int irgen_enum_members(zan_symbol_t *sym, zan_symbol_t **out_syms,
+                              long long *out_vals, int cap) {
+    if (!sym) { return 0; }
+    long long val = 0;
+    int n = 0;
+    for (int i = 0; i < sym->member_count && n < cap; i++) {
+        zan_symbol_t *m = sym->members[i];
+        if (!m || m->kind != SYM_ENUM_MEMBER) { continue; }
+        if (m->decl && m->decl->kind == AST_ENUM_MEMBER &&
+            m->decl->enum_member.value &&
+            m->decl->enum_member.value->kind == AST_INT_LITERAL) {
+            val = (long long)m->decl->enum_member.value->int_val;
+        }
+        out_syms[n] = m;
+        out_vals[n] = val;
+        n++;
+        val++;
+    }
+    return n;
+}
+
+/* The collection intrinsics evaluate their receiver expression directly
+ * instead of going through the regular instance-call path, so an owned (+1)
+ * receiver (`Fetch().Items`) leaks its extra reference: nobody released it
+ * after the operation. Mirror what a regular call does with its self argument
+ * (the arg handling above): register the value for exception unwinding while
+ * the arguments run, then pop and release it once the intrinsic is done.
+ * Borrowed receivers (locals, statics, fields of locals) make both helpers
+ * no-ops. */
+static int emit_intrinsic_own_recv(zan_irgen_t *g, zan_ast_node_t *lobj,
+                                   LLVMValueRef recv, local_scope_t *locals) {
+    zan_type_t *lt = infer_expr_type(g, lobj, locals);
+    if (!lt || !is_rc_managed_type(lt) ||
+        expr_is_local_ident(lobj, locals) ||
+        !expr_yields_owned_rc_value(g, lobj, locals)) return 0;
+    emit_eh_tmp_push(g, recv);
+    return 1;
+}
+
+static void emit_intrinsic_drop_recv(zan_irgen_t *g, zan_ast_node_t *lobj,
+                                     LLVMValueRef recv, local_scope_t *locals,
+                                     int pushed) {
+    if (pushed) emit_eh_tmp_pop(g);
+    emit_release_owned_call_temp(g, lobj, recv, locals);
+}
+
 static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* Reflection (irgen_reflect.c): `ti.GetFieldName(i)` and friends on a
@@ -735,6 +786,25 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                          (LLVMTypeRef[]){ i8p }, 1, 0),
                         g->rt_println, &cs, 1, "");
                     emit_string_release(g, cs);
+                } else if (expr_is_bool(g, arg_ast, locals)) {
+                    /* bool prints as true/false (C#), not as 1/0. */
+                    LLVMValueRef t = emit_string_literal_rc(g,
+                        (zan_istr_t){ "true", 4 });
+                    LLVMValueRef f = emit_string_literal_rc(g,
+                        (zan_istr_t){ "false", 5 });
+                    LLVMValueRef cond = arg;
+                    if (LLVMGetTypeKind(LLVMTypeOf(arg)) ==
+                            LLVMIntegerTypeKind &&
+                        LLVMGetIntTypeWidth(LLVMTypeOf(arg)) != 1)
+                        cond = LLVMBuildICmp(g->builder, LLVMIntNE, arg,
+                            LLVMConstNull(LLVMTypeOf(arg)), "wl.bnz");
+                    LLVMValueRef bs = LLVMBuildSelect(g->builder, cond, t, f,
+                                                      "wl.b");
+                    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                    zan_call2(g->builder,
+                        LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                         (LLVMTypeRef[]){ i8p }, 1, 0),
+                        g->rt_println, &bs, 1, "");
                 } else {
                     /* ensure integer arg is i64 for print_int; an unsigned
                      * value (uint/ulong/ushort/byte) must zero-extend so
@@ -809,6 +879,24 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMValueRef cargs[] = { cfmt, cs };
                     zan_call2(g->builder, printf_type, printf_fn, cargs, 2, "");
                     emit_string_release(g, cs);
+                } else if (expr_is_bool(g, arg_ast, locals)) {
+                    /* bool prints as true/false (C#), not as 1/0. */
+                    LLVMValueRef t = emit_string_literal_rc(g,
+                        (zan_istr_t){ "true", 4 });
+                    LLVMValueRef f = emit_string_literal_rc(g,
+                        (zan_istr_t){ "false", 5 });
+                    LLVMValueRef cond = arg;
+                    if (LLVMGetTypeKind(LLVMTypeOf(arg)) ==
+                            LLVMIntegerTypeKind &&
+                        LLVMGetIntTypeWidth(LLVMTypeOf(arg)) != 1)
+                        cond = LLVMBuildICmp(g->builder, LLVMIntNE, arg,
+                            LLVMConstNull(LLVMTypeOf(arg)), "w.bnz");
+                    LLVMValueRef bs = LLVMBuildSelect(g->builder, cond, t, f,
+                                                      "w.b");
+                    LLVMValueRef bfmt = LLVMBuildGlobalStringPtr(g->builder,
+                        "%s", "wfmt_b");
+                    LLVMValueRef bargs[] = { bfmt, bs };
+                    zan_call2(g->builder, printf_type, printf_fn, bargs, 2, "");
                 } else {
                     LLVMValueRef fmt = expr_is_ulong(g, arg_ast, locals)
                         ? LLVMBuildGlobalStringPtr(g->builder, "%llu", "wfmt_u")
@@ -1527,14 +1615,29 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef s = emit_expr(g, sc->member.object, locals);
                 LLVMValueRef start = coerce_int_to(g,
                     emit_expr(g, expr->call.args.items[0], locals), i64);
+                /* bounds: `start` in [0, strlen]; the two-argument form also
+                 * needs `len >= 0` and `start+len <= strlen`. Without this the
+                 * GEP+memcpy below read arbitrary heap (and a one-argument
+                 * call with start > strlen computes a negative size). */
+                /* A receiver without a reliable NUL bound (a raw FFI buffer
+                 * typed as `string`, e.g. a `struct dirent*` sliced byte by
+                 * byte) would fail the window check against strlen even though
+                 * the read is in range -- the same policy the string index
+                 * guards use. */
+                bool bounded = expr_has_reliable_string_bounds(sc->member.object,
+                                                              locals) != 0;
+                LLVMValueRef total = (bounded || expr->call.args.count == 1)
+                    ? emit_string_length(g, s) : NULL;
                 LLVMValueRef slen;
                 if (expr->call.args.count == 2) {
                     slen = coerce_int_to(g,
                         emit_expr(g, expr->call.args.items[1], locals), i64);
+                    if (total)
+                        emit_span_window_check(g, start, slen, total, expr->loc,
+                                               "substring");
                 } else {
-                    LLVMValueRef total = zan_call2(g->builder,
-                        LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0),
-                        g->fn_strlen, &s, 1, "slen");
+                    emit_index_range_check(g, start, total, true, expr->loc,
+                                           "substring");
                     slen = zan_sub(g->builder, total, start, "subl");
                 }
                 LLVMValueRef bufsz = zan_add(g->builder, slen, LLVMConstInt(i64, 1, 0), "bsz");
@@ -1551,6 +1654,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     memcpy_fn, mcargs, 3, "");
                 LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, buf, &slen, 1, "endp");
                 LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0), endp);
+                /* the slice was cut inside a NUL-free range, so `slen` is the
+                 * result's own length */
+                emit_string_len_set(g, buf, slen);
                 emit_release_owned_call_temp(g, sc->member.object, s, locals);
                 return buf;
             }
@@ -1608,9 +1714,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     if (LLVMGetTypeKind(LLVMTypeOf(start)) == LLVMIntegerTypeKind &&
                         LLVMGetIntTypeWidth(LLVMTypeOf(start)) < 64)
                         start = LLVMBuildSExt(g->builder, start, i64, "idx.start");
-                    LLVMTypeRef strlen_type = LLVMFunctionType(i64, &i8ptr, 1, 0);
-                    LLVMValueRef slen = zan_call2(g->builder, strlen_type,
-                        g->fn_strlen, &s, 1, "idx.slen");
+                    LLVMValueRef slen = emit_string_length(g, s);
                     LLVMValueRef nonneg = zan_icmp(g->builder, LLVMIntSGE, start,
                         LLVMConstInt(i64, 0, 0), "idx.nonneg");
                     LLVMValueRef within = zan_icmp(g->builder, LLVMIntSLE, start,
@@ -1799,6 +1903,84 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
+        /* EnumType.TryParse(text, out EnumType value): C# semantics over the
+         * same declaration-order name table as ToString — a case-sensitive
+         * strcmp probe; a hit stores the member constant into the out slot,
+         * a miss stores default(Color) and yields false. */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
+            expr->call.callee->member.object->kind == AST_IDENTIFIER &&
+            expr->call.args.count == 2 &&
+            expr->call.callee->member.name.len == 8 &&
+            memcmp(expr->call.callee->member.name.str, "TryParse", 8) == 0) {
+            zan_symbol_t *es = zan_binder_lookup(g->binder,
+                expr->call.callee->member.object->ident.name);
+            if (es && es->kind == SYM_ENUM && es->member_count > 0) {
+                zan_symbol_t *mems[256];
+                long long vals[256];
+                int n = irgen_enum_members(es, mems, vals, 256);
+                LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+                LLVMTypeRef i8pt = LLVMPointerType(i8t, 0);
+                LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+                LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+                LLVMTypeRef strcmp_ty = LLVMFunctionType(i32t,
+                    (LLVMTypeRef[]){ i8pt, i8pt }, 2, 0);
+                LLVMValueRef s = emit_expr(g, expr->call.args.items[0],
+                                           locals);
+                zan_ast_node_t *out_arg = expr->call.args.items[1];
+                LLVMValueRef out_ptr = NULL;
+                if (out_arg->kind == AST_REF_ARG) {
+                    out_ptr = emit_expr(g, out_arg, locals);
+                } else if (out_arg->kind == AST_IDENTIFIER) {
+                    local_var_t *ol = local_find(locals,
+                        out_arg->ident.name);
+                    if (ol) { out_ptr = ol->alloca; }
+                }
+                LLVMValueRef res_a = emit_entry_alloca(g, i32t, "tp.res");
+                LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(
+                    g->ctx, g->current_fn, "tp.done");
+                LLVMBasicBlockRef miss_bb = LLVMAppendBasicBlockInContext(
+                    g->ctx, g->current_fn, "tp.miss");
+                for (int i = 0; i < n; i++) {
+                    LLVMBasicBlockRef next_bb =
+                        (i == n - 1)
+                            ? miss_bb
+                            : LLVMAppendBasicBlockInContext(g->ctx,
+                                g->current_fn, "tp.chk");
+                    LLVMValueRef lit = emit_string_literal_rc(g,
+                        mems[i]->name);
+                    LLVMValueRef cmpv = zan_call2(g->builder, strcmp_ty,
+                        g->fn_strcmp, (LLVMValueRef[]){ s, lit }, 2,
+                        "tp.cmp");
+                    LLVMValueRef eq = LLVMBuildICmp(g->builder, LLVMIntEQ,
+                        cmpv, LLVMConstInt(i32t, 0, 0), "tp.eq");
+                    LLVMBasicBlockRef hit_bb = LLVMAppendBasicBlockInContext(
+                        g->ctx, g->current_fn, "tp.hit");
+                    LLVMBuildCondBr(g->builder, eq, hit_bb, next_bb);
+                    LLVMPositionBuilderAtEnd(g->builder, hit_bb);
+                    if (out_ptr) {
+                        emit_typed_out_store(g, es->type, out_ptr,
+                            LLVMConstInt(i64t,
+                                (unsigned long long)vals[i], 0));
+                    }
+                    LLVMBuildStore(g->builder, LLVMConstInt(i32t, 1, 0),
+                                   res_a);
+                    LLVMBuildBr(g->builder, done_bb);
+                    LLVMPositionBuilderAtEnd(g->builder, next_bb);
+                }
+                /* no member carries this name: C# assigns the default */
+                if (out_ptr) {
+                    emit_typed_out_store(g, es->type, out_ptr,
+                        LLVMConstInt(i64t, 0, 0));
+                }
+                LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), res_a);
+                LLVMBuildBr(g->builder, done_bb);
+                LLVMPositionBuilderAtEnd(g->builder, done_bb);
+                emit_release_owned_call_temp(g, expr->call.args.items[0], s,
+                                             locals);
+                return LLVMBuildLoad2(g->builder, i32t, res_a, "tp.out");
+            }
+        }
+
         /* value.ToString() on a scalar (int/float/bool/char/enum) or string
          * receiver. Class/struct receivers fall through to normal method
          * dispatch. Previously these calls lowered to the constant-0 fallback,
@@ -1847,6 +2029,78 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         zan_call2(g->builder, memcpy_ty, memcpy_fn, mcargs, 3, "");
                         emit_release_owned_call_temp(g, sc->member.object, v, locals);
                         return buf;
+                    }
+                    /* enum receiver: C# semantics — the name of the member
+                     * whose constant equals the value; a value no member
+                     * carries formats as its number. A branch chain into a
+                     * phi join rather than a select: the numeric fallback
+                     * allocates its buffer, so a select would leak the
+                     * losing side. */
+                    if (rt_ty->kind == TYPE_ENUM && rt_ty->sym &&
+                        rt_ty->sym->member_count > 0) {
+                        zan_symbol_t *mems[256];
+                        long long vals[256];
+                        int n = irgen_enum_members(rt_ty->sym, mems, vals, 256);
+                        if (n > 0) {
+                            LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+                            LLVMValueRef v64 = emit_widen_i64_for_print(g, v);
+                            LLVMValueRef fn = LLVMGetBasicBlockParent(
+                                LLVMGetInsertBlock(g->builder));
+                            LLVMBasicBlockRef joinbb =
+                                LLVMAppendBasicBlockInContext(g->ctx, fn,
+                                                              "em.join");
+                            LLVMBasicBlockRef hitbbs[256];
+                            LLVMValueRef lits[256];
+                            LLVMBasicBlockRef cur =
+                                LLVMGetInsertBlock(g->builder);
+                            for (int i = 0; i < n; i++) {
+                                LLVMBasicBlockRef miss =
+                                    (i == n - 1)
+                                        ? LLVMAppendBasicBlockInContext(g->ctx,
+                                            fn, "em.num")
+                                        : LLVMAppendBasicBlockInContext(g->ctx,
+                                            fn, "em.chk");
+                                LLVMValueRef hit = LLVMBuildICmp(g->builder,
+                                    LLVMIntEQ, v64,
+                                    LLVMConstInt(i64t,
+                                        (unsigned long long)vals[i], 0),
+                                    "em.val");
+                                hitbbs[i] = LLVMAppendBasicBlockInContext(
+                                    g->ctx, fn, "em.hit");
+                                LLVMBuildCondBr(g->builder, hit, hitbbs[i],
+                                                miss);
+                                /* the literal is materialized inside its
+                                 * hit block so the phi incoming dominates */
+                                LLVMPositionBuilderAtEnd(g->builder, hitbbs[i]);
+                                lits[i] = emit_string_literal_rc(g,
+                                    mems[i]->name);
+                                LLVMBuildBr(g->builder, joinbb);
+                                LLVMPositionBuilderAtEnd(g->builder, miss);
+                                cur = miss;
+                            }
+                            /* Unmatched values only: format like an int. */
+                            LLVMValueRef ebuf = emit_string_alloc_rc(g,
+                                LLVMConstInt(i64t, 32, 0));
+                            emit_itoa_into(g, ebuf, v64, 0);
+                            LLVMBuildBr(g->builder, joinbb);
+                            LLVMPositionBuilderAtEnd(g->builder, joinbb);
+                            LLVMValueRef phi = LLVMBuildPhi(g->builder, i8ptr,
+                                                            "em.name");
+                            LLVMValueRef *vals_in = (LLVMValueRef *)calloc(
+                                (size_t)n + 1, sizeof(LLVMValueRef));
+                            LLVMBasicBlockRef *blks_in = (LLVMBasicBlockRef *)
+                                calloc((size_t)n + 1, sizeof(*blks_in));
+                            for (int i = 0; i < n; i++) {
+                                vals_in[i] = lits[i];
+                                blks_in[i] = hitbbs[i];
+                            }
+                            vals_in[n] = ebuf;
+                            blks_in[n] = cur;
+                            LLVMAddIncoming(phi, vals_in, blks_in, n + 1);
+                            free(vals_in);
+                            free(blks_in);
+                            return phi;
+                        }
                     }
                     /* numeric: format like Convert.ToString */
                     LLVMValueRef buf = emit_string_alloc_rc(g,
@@ -2806,6 +3060,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                     /* load list pointer (works for local vars and fields) */
                     LLVMValueRef raw_ptr = emit_expr(g, lobj, locals);
+                    int recv_own = emit_intrinsic_own_recv(g, lobj, raw_ptr, locals);
                     (void)i8ptr;
                     LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, raw_ptr,
                         LLVMPointerType(g->list_struct_type, 0), "lptr");
@@ -2852,6 +3107,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     /* count++ */
                     LLVMValueRef new_count = zan_add(g->builder, count2, LLVMConstInt(i64, 1, 0), "nc");
                     LLVMBuildStore(g->builder, new_count, count_ptr);
+                    emit_intrinsic_drop_recv(g, lobj, raw_ptr, locals, recv_own);
                     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
                 }
             }
@@ -3898,6 +4154,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     emit_invalidate_freed_string(g,
                                         expr->call.args.items[0], locals);
                                 }
+                                emit_extern_call_len_invalidate(g,
+                                    g->functions[fi].fn, call_args, argc,
+                                    expr, locals);
                                 for (int k = argc - 1; k >= 0; k--) {
                                     if (arg_eh_pushed[k]) emit_eh_tmp_pop(g);
                                 }
@@ -4168,6 +4427,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     emit_invalidate_freed_string(g,
                                         expr->call.args.items[0], locals);
                                 }
+                                emit_extern_call_len_invalidate(g,
+                                    g->functions[fi].fn, call_args, argc,
+                                    expr, locals);
                                 for (int k = 0; k < argc; k++) {
                                     if (!consumes_free_arg || k != 0) {
                                         emit_release_owned_call_temp(g, expr->call.args.items[k],
@@ -4302,6 +4564,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                 emit_invalidate_freed_string(g,
                                     expr->call.args.items[0], locals);
                             }
+                            emit_extern_call_len_invalidate(g,
+                                g->functions[fi].fn, call_args, argc + extra,
+                                expr, locals);
                             for (int k = 0; k < argc; k++) {
                                 if (!consumes_free_arg || k != 0) {
                                     emit_release_owned_call_temp(g, expr->call.args.items[k],
@@ -4338,6 +4603,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     emit_invalidate_freed_string(g,
                         expr->call.args.items[0], locals);
                 }
+                emit_extern_call_len_invalidate(g, global_fn, call_args, argc,
+                                               expr, locals);
                 for (int k = 0; k < argc; k++) {
                     if (!consumes_free_arg || k != 0) {
                         emit_release_owned_call_temp(g, expr->call.args.items[k],
@@ -4417,7 +4684,34 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 char path[256];
                 int plen = format_name_path(expr->call.callee, path,
                                             (int)sizeof(path));
-                if (!osym) {
+                /* `EnumType.Member.Method(...)`: the receiver folds to an
+                 * enum constant, so its rightmost segment has no symbol of
+                 * its own. When the member is declared and the method is one
+                 * irgen lowers over the name table (ToString / TryParse),
+                 * this is a resolved call, not an unresolved reference. */
+                bool enum_const_recv = false;
+                if (!osym && obj->kind == AST_MEMBER_ACCESS &&
+                    obj->member.object->kind == AST_IDENTIFIER) {
+                    zan_symbol_t *es = zan_binder_lookup(g->binder,
+                        obj->member.object->ident.name);
+                    if (es && es->kind == SYM_ENUM) {
+                        for (int ei = 0; ei < es->member_count; ei++) {
+                            zan_symbol_t *em = es->members[ei];
+                            if (em && em->kind == SYM_ENUM_MEMBER &&
+                                em->name.len == obj->member.name.len &&
+                                memcmp(em->name.str, obj->member.name.str,
+                                       (size_t)obj->member.name.len) == 0) {
+                                enum_const_recv =
+                                    (mn.len == 8 &&
+                                     memcmp(mn.str, "ToString", 8) == 0) ||
+                                    (mn.len == 8 &&
+                                     memcmp(mn.str, "TryParse", 8) == 0);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!osym && !enum_const_recv) {
                     zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
                         "unresolved call '%.*s': '%.*s' is not a known variable, "
                         "type, or namespace (is the class imported and registered "

@@ -503,6 +503,23 @@ static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *local
                 if (fsym) return fsym->type;
             }
         }
+        /* EnumType.Member: the constant's type is the enum itself, so a
+         * chained call (`Color.Red.ToString()`) infers an enum receiver and
+         * reaches the compiler-lowered scalar handling. */
+        if (!l && g && g->binder) {
+            zan_symbol_t *es = zan_binder_lookup(g->binder, obj->ident.name);
+            if (es && es->kind == SYM_ENUM) {
+                for (int ei = 0; ei < es->member_count; ei++) {
+                    zan_symbol_t *em = es->members[ei];
+                    if (em && em->kind == SYM_ENUM_MEMBER &&
+                        em->name.len == member->member.name.len &&
+                        memcmp(em->name.str, member->member.name.str,
+                               (size_t)member->member.name.len) == 0) {
+                        return es->type;
+                    }
+                }
+            }
+        }
         /* not a local: could be an implicit `this` field whose own type is a
          * class, e.g. `field.subfield` inside a method. */
         if (g && g->current_type_sym) {
@@ -1660,6 +1677,25 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 if (fs) return fs->type;
             }
         }
+        /* EnumType.Member (`Color.Green.ToString()`): the constant has the
+         * enum's own type, so a chained call infers an enum receiver and
+         * reaches the compiler-lowered scalar handling instead of the
+         * constant-0 fallback. */
+        if (e->member.object->kind == AST_IDENTIFIER &&
+            !local_find(locals, e->member.object->ident.name)) {
+            zan_symbol_t *es = zan_binder_lookup(g->binder,
+                                                 e->member.object->ident.name);
+            if (es && es->kind == SYM_ENUM) {
+                for (int ei = 0; ei < es->member_count; ei++) {
+                    zan_symbol_t *em = es->members[ei];
+                    if (em && em->kind == SYM_ENUM_MEMBER &&
+                        em->name.len == e->member.name.len &&
+                        memcmp(em->name.str, e->member.name.str,
+                               (size_t)e->member.name.len) == 0)
+                        return es->type;
+                }
+            }
+        }
         /* builtin scalar-type constants (`int.MaxValue`, `double.NaN`, ...):
          * the receiver is a primitive type name with no class symbol, so the
          * lookup above misses; without this the inferred type is NULL and the
@@ -1809,6 +1845,18 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
          * chained member access (e.g. Next().field) can find the struct. */
         zan_ast_node_t *callee = e->call.callee;
         if (!callee) return NULL;
+        /* EnumType.TryParse(text, out T): compiler-lowered static over the
+         * enum's name table — always yields bool. */
+        if (callee->kind == AST_MEMBER_ACCESS &&
+            callee->member.object->kind == AST_IDENTIFIER &&
+            callee->member.name.len == 8 &&
+            memcmp(callee->member.name.str, "TryParse", 8) == 0) {
+            zan_symbol_t *es = zan_binder_lookup(g->binder,
+                callee->member.object->ident.name);
+            if (es && es->kind == SYM_ENUM) {
+                return g->binder->type_bool;
+            }
+        }
         /* reflection calls (`obj.GetType()`, `ti.GetFieldName(i)`, ...): a
          * user-declared member of the same name is resolved below instead. */
         if (callee->kind == AST_MEMBER_ACCESS) {
@@ -2017,6 +2065,12 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
             return NULL;
         }
         return resolve_type_ctx(g, e->new_expr.type);
+    case AST_UNARY:
+        /* `!b` is bool; `-x`/`+x`/`~x` keep the operand's static type, so a
+         * negated value still prints and feeds `var` inference. */
+        if (e->unary.op == TK_BANG)
+            return g->binder ? g->binder->type_bool : NULL;
+        return infer_expr_type(g, e->unary.operand, locals);
     case AST_BINARY:
         /* string concatenation (`a + b`) yields a freshly heap-allocated,
          * owned string; other binary operators produce non-rc scalars. */
@@ -2091,6 +2145,13 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
 static bool expr_is_ulong(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
     zan_type_t *t = infer_expr_type(g, e, locals);
     return t && t->kind == TYPE_ULONG;
+}
+
+/* True when an expression's static type is bool, so Console.WriteLine/Write
+ * render it as true/false instead of falling into the integer path. */
+static bool expr_is_bool(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
+    zan_type_t *t = infer_expr_type(g, e, locals);
+    return t && t->kind == TYPE_BOOL;
 }
 
 /* True when the expression's static type is any unsigned integer (uint,

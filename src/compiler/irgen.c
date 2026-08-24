@@ -333,6 +333,41 @@ static zan_irgen_t *g_di_emit_ctx = NULL;
 #define ZAN_MAX_LEAK_SITES 4096
 
 static bool types_equal(zan_type_t *a, zan_type_t *b);
+static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
+                              LLVMValueRef *args, unsigned n, const char *nm);
+
+/* True when `word` -- a string/object second header word -- belongs to a
+ * managed string. Only the high half is the tag: the low half caches the byte
+ * length (see ZAN_STRING_TAG in zan_abi.h), so identity is a tag test rather
+ * than equality with the whole ZAN_STRING_MAGIC word. */
+static LLVMValueRef zan_hdr_is_string(zan_irgen_t *g, LLVMValueRef word,
+                                     const char *nm) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef tag = LLVMBuildLShr(g->builder, word,
+                                     LLVMConstInt(i64, 32, 0), "hdr.tag");
+    return zan_icmp(g->builder, LLVMIntEQ, tag,
+                    LLVMConstInt(i64, ZAN_STRING_TAG, 0), nm);
+}
+
+/* i1 telling whether the 8 header bytes at `ptr8` may be read, or NULL when
+ * the target needs no probe. Same contract as emit_header_read_guard, but as a
+ * value: callers that must produce a length instead of returning early branch
+ * on it themselves. Only Windows has IsBadReadPtr; elsewhere the ARC runtime
+ * reads a string header unprobed as well. */
+static LLVMValueRef zan_hdr_read_ok(zan_irgen_t *g, LLVMValueRef ptr8) {
+    if (!g->target_is_windows) return NULL;
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef args[] = { i8p, i64t };
+    LLVMTypeRef fnty = LLVMFunctionType(i32t, args, 2, 0);
+    LLVMValueRef isbad = LLVMGetNamedFunction(g->mod, "IsBadReadPtr");
+    if (!isbad) isbad = LLVMAddFunction(g->mod, "IsBadReadPtr", fnty);
+    LLVMValueRef cargs[] = { ptr8, LLVMConstInt(i64t, 8, 0) };
+    LLVMValueRef bad = zan_call2(g->builder, fnty, isbad, cargs, 2, "hdr.badread");
+    return zan_icmp(g->builder, LLVMIntEQ, bad, LLVMConstInt(i32t, 0, 0),
+                    "hdr.readok");
+}
 
 static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
                             zan_type_t *inst, int coll_kind,
@@ -939,7 +974,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 
     /* runtime-diagnostics defaults */
     g->src_file = module_name;
-    g->runtime_checks = true;
     g->check_leaks = check_leaks;
 
     /* leak-tracking globals are always created; instrumentation and reporting
@@ -1684,6 +1718,23 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "ret");
         LLVMBuildCondBr(g->builder, is_null, ret_bb, cont);
         LLVMPositionBuilderAtEnd(g->builder, cont);
+        /* Interned string literals carry ZAN_STRING_SENTINEL_RC and live in
+         * static (read-only) storage; their second header word is
+         * the string tag plus length, not a site index, so without this guard
+         * they fall through to the plain-object releaser and fault writing the
+         * refcount.
+         * A sentinel rc means immortal: nothing to release. */
+        LLVMValueRef sent16 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1);
+        LLVMValueRef sent_rc = LLVMBuildLoad2(g->builder, i64,
+            LLVMBuildBitCast(g->builder,
+                LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &sent16, 1, "sentp"),
+                LLVMPointerType(i64, 0), "sentip"), "sentrc");
+        LLVMBasicBlockRef literal = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "islit");
+        LLVMBuildCondBr(g->builder,
+            zan_icmp(g->builder, LLVMIntEQ, sent_rc,
+                LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0), "issent"),
+            ret_bb, literal);
+        LLVMPositionBuilderAtEnd(g->builder, literal);
         LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
         LLVMValueRef sptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "sptr");
         LLVMValueRef siptr = LLVMBuildBitCast(g->builder, sptr, LLVMPointerType(i64, 0), "siptr");
@@ -1758,9 +1809,11 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 
     /* ARC runtime for strings: zan_rt_str_alloc(int64_t size) -> void*
      * Allocates (16 + size) bytes laid out as
-     *   [i64 refcount][i64 STRING_MAGIC][... user data ...]
+     *   [i64 refcount][u32 STRING_TAG | u32 byte length][... user data ...]
      * sets refcount=1, bumps the global live count, and returns the pointer
-     * to the user data. Strings intentionally do not participate in the
+     * to the user data. `size` is a capacity, not the final byte length, so
+     * the length half starts out ZAN_STR_LEN_UNKNOWN and the first reader
+     * measures and caches it. Strings intentionally do not participate in the
      * per-site leak table. */
     {
         LLVMTypeRef str_alloc_args[] = { i64 };
@@ -1778,7 +1831,9 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef eight = LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
         LLVMValueRef magic_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &eight, 1, "magicp");
         LLVMValueRef magic_iptr = LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64, 0), "magicip");
-        LLVMBuildStore(g->builder, LLVMConstInt(i64, ZAN_STRING_MAGIC, 0), magic_iptr);
+        LLVMBuildStore(g->builder,
+                       LLVMConstInt(i64, ZAN_STR_HDR_WORD(ZAN_STR_LEN_UNKNOWN), 0),
+                       magic_iptr);
         LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
         LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &hdr_off, 1, "usr");
         if (g->check_leaks) {
@@ -1807,8 +1862,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         emit_header_read_guard(g, g->rt_str_retain, magic_ptr, ret_bb);
         LLVMValueRef magic_iptr = LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64t, 0), "magicip");
         LLVMValueRef magic = LLVMBuildLoad2(g->builder, i64t, magic_iptr, "magic");
-        LLVMValueRef has_magic = zan_icmp(g->builder, LLVMIntEQ, magic,
-            LLVMConstInt(i64t, ZAN_STRING_MAGIC, 0), "hasmagic");
+        LLVMValueRef has_magic = zan_hdr_is_string(g, magic, "hasmagic");
         LLVMBasicBlockRef retain_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_retain, "retain");
         LLVMBuildCondBr(g->builder, has_magic, retain_bb, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, retain_bb);
@@ -1853,8 +1907,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         emit_header_read_guard(g, g->rt_str_release, magic_ptr, ret_bb);
         LLVMValueRef magic_iptr = LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64t, 0), "magicip");
         LLVMValueRef magic = LLVMBuildLoad2(g->builder, i64t, magic_iptr, "magic");
-        LLVMValueRef has_magic = zan_icmp(g->builder, LLVMIntEQ, magic,
-            LLVMConstInt(i64t, ZAN_STRING_MAGIC, 0), "hasmagic");
+        LLVMValueRef has_magic = zan_hdr_is_string(g, magic, "hasmagic");
         LLVMBasicBlockRef rel_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "release");
         LLVMBuildCondBr(g->builder, has_magic, rel_bb, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, rel_bb);

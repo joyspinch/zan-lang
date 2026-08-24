@@ -1603,20 +1603,27 @@ partial class ZanIDE {
                                 string bd, string name) {
         StringBuilder sb = new StringBuilder();
         #if WINDOWS
-        sb.Append("@echo off\r\nset ZANFAIL=0\r\n");
+        // This file is placed in the ASCII IDE cache below. Switch cmd.exe to
+        // UTF-8 before it parses any project paths contained in later lines.
+        sb.Append("@echo off\r\nchcp 65001>nul\r\nset ZANFAIL=0\r\n");
         for (int i = 0; i < steps.Count; i = i + 1) {
             sb.Append("(" + steps[i] + ") >> \"" + logPath + "\" 2>&1\r\n");
             sb.Append("if errorlevel 1 set ZANFAIL=1\r\n");
         }
         sb.Append("if \"%ZANFAIL%\"==\"0\" (echo ok> \"" + donePath + "\") "
             + "else (echo fail> \"" + donePath + "\")\r\n");
-        string path = bd + "/" + name + ".cmd";
+        // Keep the batch file itself in the IDE's per-window cache. The cache
+        // normally lives beside ZanIDE.exe and, unlike the opened project, is
+        // not expected to contain user-selected Unicode directory names. cmd
+        // has to locate and parse the batch file before any command inside it
+        // can run, so putting it under a Chinese project path can fail before
+        // the compiler gets a chance to write either the log or done marker.
+        string path = ZanIDE.WindowCacheDir() + "/" + name + ".cmd";
         File.WriteAllText(path, sb.ToString());
-        // File.WriteAllText emits UTF-8. The code page has to be selected by
-        // the parent cmd.exe before it starts parsing the batch file; changing
-        // it from inside the file can corrupt cmd's buffered byte position.
-        int rc = Process.RunDetached("chcp 65001>nul & call \""
-            + ZanIDE.ToWinPath(path) + "\"");
+        // The launcher command now contains only the ASCII cache path. Once
+        // inside the script, chcp above takes effect before the UTF-8 project
+        // paths are parsed.
+        int rc = Process.RunDetached("call \"" + ZanIDE.ToWinPath(path) + "\"");
         // A shell that never started writes neither log nor marker, and the
         // caller would poll for a result that can never arrive: report the
         // failure through the same marker the poll already reads.
@@ -1803,12 +1810,12 @@ partial class ZanIDE {
                         // (File/Directory fall back to the embedded copy), so
                         // there is nothing to unpack and nowhere else to run.
                         string stage = ZanIDE.ResetStage(bd + "/pub_win_x64");
-                        ZanIDE.CopyPayloadPacked(root, stage, outDir, log);
+                        ZanIDE.CopyPayloadPacked(root, stage, outDir, p, log);
                         steps.Add(ZanIDE.CompileToExeSingleFile(root, p, inputs, ll,
                             exe, !dbg, dbg)
                             + emb + ZanIDE.StageEmbedArgs(stage));
                     } else {
-                        ZanIDE.CopyPayload(root, outDir, log);
+                        ZanIDE.CopyPayload(root, outDir, p, log);
                         steps.Add(ZanIDE.CompileToExe(root, p, inputs, ll, exe, !dbg, dbg) + emb);
                     }
                     exes.Add(exe);
@@ -1819,11 +1826,11 @@ partial class ZanIDE {
                     // (win-arm64 target) -- no external clang needed.
                     if (pack) {
                         string stage = ZanIDE.ResetStage(bd + "/pub_win_arm64");
-                        ZanIDE.CopyPayloadPacked(root, stage, outDir, log);
+                        ZanIDE.CopyPayloadPacked(root, stage, outDir, p, log);
                         steps.Add(ZanIDE.CompileToExeCross(root, p, inputs, exe, "win-arm64", dbg)
                             + emb + ZanIDE.StageEmbedArgs(stage));
                     } else {
-                        ZanIDE.CopyPayload(root, outDir, log);
+                        ZanIDE.CopyPayload(root, outDir, p, log);
                         steps.Add(ZanIDE.CompileToExeCross(root, p, inputs, exe, "win-arm64", dbg) + emb);
                     }
                     exes.Add(exe);
@@ -1839,7 +1846,7 @@ partial class ZanIDE {
                     // and a name for. Resources live in Contents/Resources.
                     string exe = ZanIDE.MacAppPrepare(root, outDir, baseName,
                         ZanIDE.IsWindowedTarget(root, p), log);
-                    ZanIDE.CopyPayload(root, ZanIDE.PayloadDirFor(exe), log);
+                    ZanIDE.CopyPayload(root, ZanIDE.PayloadDirFor(exe), p, log);
                     if (id == hostId) {
                         steps.Add(ZanIDE.CompileToExe(root, p, inputs, "", exe, !dbg, dbg) + emb);
                     } else {
@@ -1850,7 +1857,7 @@ partial class ZanIDE {
                 } else if (id == "linux-x64") {
                     // Self-contained musl static single file (cross from any host).
                     string exe = outDir + "/" + baseName;
-                    ZanIDE.CopyPayload(root, outDir, log);
+                    ZanIDE.CopyPayload(root, outDir, p, log);
                     steps.Add(zc + pubFlag + " " + inputs
                         + " --target linux-musl --link-mode static -o \"" + exe + "\"" + emb);
                     exes.Add(exe);
@@ -1858,7 +1865,7 @@ partial class ZanIDE {
                 } else if (id == "linux-arm64") {
                     // Same musl static path as linux-x64; only triple/sysroot differ.
                     string exe = outDir + "/" + baseName;
-                    ZanIDE.CopyPayload(root, outDir, log);
+                    ZanIDE.CopyPayload(root, outDir, p, log);
                     steps.Add(zc + pubFlag + " " + inputs
                         + " --target linux-arm64 --link-mode static -o \"" + exe + "\"" + emb);
                     exes.Add(exe);
@@ -2103,9 +2110,9 @@ partial class ZanIDE {
     /// resources, optional theme skins and the runtime content folders. The
     /// single-file path stages this before packing; every other target gets it
     /// in the publish directory itself.
-    static void CopyPayload(string root, string dir, List<string> log) {
+    static void CopyPayload(string root, string dir, string sourcePath, List<string> log) {
         ZanIDE.CopyResources(root, dir, log);
-        ZanIDE.CopyThemeSkins(root, dir, log);
+        ZanIDE.CopyThemeSkins(root, dir, sourcePath, log);
         ZanIDE.CopyContent(root, dir, log);
     }
 
@@ -2115,9 +2122,9 @@ partial class ZanIDE {
     /// edit after publishing -- baking it into the exe is the one thing that
     /// action rules out. It ships in the publish directory next to the exe.
     static void CopyPayloadPacked(string root, string stage, string outDir,
-                                  List<string> log) {
+                                  string sourcePath, List<string> log) {
         ZanIDE.CopyResources(root, stage, log);
-        ZanIDE.CopyThemeSkins(root, stage, log);
+        ZanIDE.CopyThemeSkins(root, stage, sourcePath, log);
         ZanIDE.CopyContent(root, outDir, log);
     }
 
@@ -2126,7 +2133,9 @@ partial class ZanIDE {
     /// skins\ folder next to the exe (Skin.FindDir's disk fallback). The base
     /// stylesheet and dark/light baseline always ship; the project switch adds
     /// the optional packs from skinlist.
-    static void CopyThemeSkins(string root, string outDir, List<string> log) {
+    static void CopyThemeSkins(string root, string outDir, string sourcePath,
+                              List<string> log) {
+        if (!ZanIDE.IsGuiTarget(root, sourcePath)) { return; }
         string src = ZanIDE.StdlibDir() + "/Gui/skins";
         if (!Directory.Exists(src)) {
             log.Add("> WARNING: skins requested but stdlib skins folder not found.");

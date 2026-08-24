@@ -12,6 +12,11 @@ typedef void (*zan_timer_callback_t)(void);
 typedef void (*zan_timer_step_t)(void *frame);
 
 void zan_timer_runtime_reset(void);
+/* Windows starts a console program through a narrow CRT argv whose encoding
+ * follows the active ANSI code page. This helper rebuilds it from the Unicode
+ * command line as UTF-8. It returns non-zero on success and otherwise leaves
+ * the caller-owned argc/argv values unchanged. */
+int zan_utf8_argv(int *argc, char ***argv);
 void zan_timer_set_ready_hook(void (*ready)(void *frame, zan_timer_step_t step));
 long long zan_timer_now_ms(void);
 void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step);

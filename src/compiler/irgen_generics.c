@@ -1081,43 +1081,282 @@ static void emit_index_bounds_check(zan_irgen_t *g, LLVMValueRef index,
     emit_index_range_check(g, index, length, false, loc, kind);
 }
 
-/* Length of a `string`-typed payload for bounds checking. Strings, byte[] and
- * bare C pointers all share the payload pointer ABI, and the second header
- * word says which one this is: ZAN_ARRAY_MAGIC marks a byte buffer, whose
- * carried element count is used so embedded NUL bytes do not truncate
- * indexing bounds. Everything else -- a managed string, or a pointer an extern
- * returned, which has no Zan header at all -- is NUL-terminated and measured
- * with strlen, the same definition `string.Length` uses. Never read the count
- * word for those: for a foreign pointer it is whatever the C allocator left in
- * front of the buffer, which used to reject every valid index. */
-static LLVMValueRef emit_string_buffer_len(zan_irgen_t *g, LLVMValueRef payload) {
+/* Length of a `string`-typed payload, for `.Length` and for bounds checking.
+ * Strings, byte[] and bare C pointers all share the payload pointer ABI, and
+ * the second header word says which one this is:
+ *
+ *   - a managed string carries ZAN_STRING_TAG in the word's high half and its
+ *     cached byte length in the low half, which is the O(1) answer. When the
+ *     cache still reads ZAN_STR_LEN_UNKNOWN (a producer that only knew a
+ *     capacity), strlen measures it once and the result is written back, so
+ *     scanning an n-byte string character by character is O(n), not O(n^2);
+ *   - ZAN_ARRAY_MAGIC marks a byte buffer, whose carried element count is used
+ *     so embedded NUL bytes do not truncate indexing bounds;
+ *   - anything else -- a pointer an extern returned, which has no Zan header
+ *     at all -- is NUL-terminated and measured with strlen. Never read the
+ *     count word or write the header for those: in front of a foreign buffer
+ *     sits whatever the C allocator left there.
+ *
+ * The write-back is why the cache may only be filled for a tagged string whose
+ * refcount is not the literal sentinel: sentinel-RC literals live in read-only
+ * storage, and they already have their length baked in at compile time.
+ *
+ * `array_count` selects whether a byte[] answers with its element count (what
+ * bounds checking wants) or with strlen (what `string.Length` has always
+ * reported for a buffer that reached code typed `string`). */
+static LLVMValueRef emit_string_len_ex(zan_irgen_t *g, LLVMValueRef payload,
+                                      int array_count) {
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8p = LLVMPointerType(i8, 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-    LLVMValueRef back = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1);
-    LLVMValueRef header = LLVMBuildGEP2(g->builder, i8, payload, &back, 1,
-                                        "strbuf.header");
-    LLVMValueRef count = LLVMBuildLoad2(g->builder, i64,
-        LLVMBuildBitCast(g->builder, header, LLVMPointerType(i64, 0),
-                         "strbuf.countp"), "strbuf.count");
-    LLVMValueRef magic_ptr = LLVMBuildGEP2(g->builder, i8, payload,
+    LLVMTypeRef i64p = LLVMPointerType(i64, 0);
+    LLVMTypeRef strlen_ty = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8p }, 1, 0);
+    if (LLVMGetTypeKind(LLVMTypeOf(payload)) != LLVMPointerTypeKind)
+        return zan_call2(g->builder, strlen_ty, g->fn_strlen, &payload, 1,
+                         "strbuf.strlen");
+
+    LLVMBasicBlockRef entry_bb = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(entry_bb);
+    LLVMBasicBlockRef probe_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.probe");
+    LLVMBasicBlockRef arr_bb = array_count
+        ? LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.arr") : NULL;
+    LLVMBasicBlockRef slow_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.slow");
+    LLVMBasicBlockRef stamp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.stamp");
+    LLVMBasicBlockRef stamp_do_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.stampdo");
+    LLVMBasicBlockRef slow_end_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.slowend");
+    LLVMBasicBlockRef raw_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.raw");
+    LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.done");
+
+    /* The header sits behind the payload, so a pointer that never came from the
+     * Zan allocator must not be dereferenced blindly. Windows can ask before
+     * reading; on POSIX this matches what the ARC runtime already does. */
+    LLVMValueRef hdr_ptr = LLVMBuildGEP2(g->builder, i8, payload,
         &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1) }, 1,
-        "strbuf.magicp");
-    LLVMValueRef magic = LLVMBuildLoad2(g->builder, i64,
-        LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64, 0),
-                         "strbuf.magicc"), "strbuf.magic");
-    LLVMValueRef is_array = zan_icmp(g->builder, LLVMIntEQ, magic,
-        LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "strbuf.isarr");
-    LLVMTypeRef strlen_ty = LLVMFunctionType(i64,
-        (LLVMTypeRef[]){ LLVMPointerType(i8, 0) }, 1, 0);
+        "strbuf.hdrp");
+    LLVMValueRef read_ok = zan_hdr_read_ok(g, hdr_ptr);
+    /* A null string keeps faulting inside strlen the way it always has, rather
+     * than in front of address 0 where the header would be. */
+    LLVMValueRef probe_ok = zan_icmp(g->builder, LLVMIntNE, payload,
+        LLVMConstNull(LLVMTypeOf(payload)), "strbuf.nonnull");
+    if (read_ok) probe_ok = zan_and(g->builder, probe_ok, read_ok, "strbuf.ok");
+    LLVMBuildCondBr(g->builder, probe_ok, probe_bb, raw_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, probe_bb);
+    LLVMValueRef hdr_iptr = LLVMBuildBitCast(g->builder, hdr_ptr, i64p,
+                                             "strbuf.hdrip");
+    LLVMValueRef word = LLVMBuildLoad2(g->builder, i64, hdr_iptr, "strbuf.hdr");
+    LLVMValueRef is_str = zan_hdr_is_string(g, word, "strbuf.isstr");
+    LLVMValueRef cached = LLVMBuildAnd(g->builder, word,
+        LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0), "strbuf.cached");
+    LLVMValueRef measured = zan_icmp(g->builder, LLVMIntNE, cached,
+        LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "strbuf.measured");
+    LLVMValueRef known = zan_and(g->builder, is_str, measured, "strbuf.known");
+    LLVMBuildCondBr(g->builder, known, done_bb,
+                    arr_bb ? arr_bb : slow_bb);
+
+    /* Only a header that says "array" makes the count word meaningful. */
+    LLVMValueRef count = NULL;
+    if (arr_bb) {
+        LLVMBasicBlockRef arr_test_bb = arr_bb;
+        arr_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.arrcount");
+        LLVMPositionBuilderAtEnd(g->builder, arr_test_bb);
+        LLVMValueRef is_array = zan_icmp(g->builder, LLVMIntEQ, word,
+            LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "strbuf.isarr");
+        LLVMBuildCondBr(g->builder, is_array, arr_bb, slow_bb);
+        LLVMPositionBuilderAtEnd(g->builder, arr_bb);
+        LLVMValueRef cnt_ptr = LLVMBuildGEP2(g->builder, i8, payload,
+            &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1) }, 1,
+            "strbuf.countp");
+        count = LLVMBuildLoad2(g->builder,
+            i64, LLVMBuildBitCast(g->builder, cnt_ptr, i64p, "strbuf.countip"),
+            "strbuf.count");
+        LLVMBuildBr(g->builder, done_bb);
+    }
+
+    LLVMPositionBuilderAtEnd(g->builder, slow_bb);
     LLVMValueRef string_len = zan_call2(g->builder, strlen_ty, g->fn_strlen,
                                         &payload, 1, "strbuf.strlen");
-    return LLVMBuildSelect(g->builder, is_array, count, string_len,
-                           "strbuf.len");
+    /* A length that collides with the "unknown" pattern, or one that does not
+     * fit the 32-bit field, stays unmeasured rather than being cached wrong. */
+    LLVMValueRef fits = zan_and(g->builder,
+        zan_icmp(g->builder, LLVMIntNE, string_len,
+                 LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "strbuf.notunk"),
+        zan_icmp(g->builder, LLVMIntULE, string_len,
+                 LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0), "strbuf.fits32"),
+        "strbuf.fits");
+    LLVMBuildCondBr(g->builder, zan_and(g->builder, is_str, fits,
+                                        "strbuf.stampable"),
+                    stamp_bb, slow_end_bb);
+
+    /* Sentinel-RC strings are compile-time literals in read-only storage. */
+    LLVMPositionBuilderAtEnd(g->builder, stamp_bb);
+    LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, i8, payload,
+        &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1) }, 1,
+        "strbuf.rcp");
+    LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64,
+        LLVMBuildBitCast(g->builder, rc_ptr, i64p, "strbuf.rcip"), "strbuf.rc");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntNE, rc,
+                 LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
+                 "strbuf.writable"),
+        stamp_do_bb, slow_end_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, stamp_do_bb);
+    LLVMBuildStore(g->builder, LLVMBuildOr(g->builder,
+            LLVMConstInt(i64, ZAN_STRING_TAG << 32, 0), string_len,
+            "strbuf.newhdr"),
+        hdr_iptr);
+    LLVMBuildBr(g->builder, slow_end_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, slow_end_bb);
+    LLVMBuildBr(g->builder, done_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, raw_bb);
+    LLVMValueRef raw_len = zan_call2(g->builder, strlen_ty, g->fn_strlen,
+                                     &payload, 1, "strbuf.rawlen");
+    LLVMBuildBr(g->builder, done_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, done_bb);
+    LLVMValueRef phi = LLVMBuildPhi(g->builder, i64, "strbuf.len");
+    LLVMAddIncoming(phi, (LLVMValueRef[]){ cached },
+                    (LLVMBasicBlockRef[]){ probe_bb }, 1);
+    if (arr_bb)
+        LLVMAddIncoming(phi, (LLVMValueRef[]){ count },
+                        (LLVMBasicBlockRef[]){ arr_bb }, 1);
+    LLVMAddIncoming(phi, (LLVMValueRef[]){ string_len },
+                    (LLVMBasicBlockRef[]){ slow_end_bb }, 1);
+    LLVMAddIncoming(phi, (LLVMValueRef[]){ raw_len },
+                    (LLVMBasicBlockRef[]){ raw_bb }, 1);
+    return phi;
+}
+
+/* Drop a cached length: the bytes behind `payload` are about to change (a
+ * `s[i] = c` store, or a buffer handed to an extern that fills it), so the
+ * next reader has to measure again. A no-op for anything that is not a
+ * heap-owned managed string. */
+static void emit_string_len_invalidate(zan_irgen_t *g, LLVMValueRef payload) {
+    if (LLVMGetTypeKind(LLVMTypeOf(payload)) != LLVMPointerTypeKind) return;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i64p = LLVMPointerType(i64, 0);
+    LLVMBasicBlockRef entry_bb = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(entry_bb);
+    LLVMBasicBlockRef probe_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.probe");
+    LLVMBasicBlockRef clear_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.clear");
+    LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.done");
+    LLVMValueRef hdr_ptr = LLVMBuildGEP2(g->builder, i8, payload,
+        &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1) }, 1,
+        "strinv.hdrp");
+    LLVMValueRef read_ok = zan_hdr_read_ok(g, hdr_ptr);
+    LLVMValueRef nonnull = zan_icmp(g->builder, LLVMIntNE, payload,
+        LLVMConstNull(LLVMTypeOf(payload)), "strinv.nonnull");
+    if (read_ok) nonnull = zan_and(g->builder, nonnull, read_ok, "strinv.ok");
+    LLVMBuildCondBr(g->builder, nonnull, probe_bb, done_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, probe_bb);
+    LLVMValueRef hdr_iptr = LLVMBuildBitCast(g->builder, hdr_ptr, i64p,
+                                             "strinv.hdrip");
+    LLVMValueRef word = LLVMBuildLoad2(g->builder, i64, hdr_iptr, "strinv.hdr");
+    LLVMValueRef stale = zan_and(g->builder,
+        zan_hdr_is_string(g, word, "strinv.isstr"),
+        zan_icmp(g->builder, LLVMIntNE,
+                 LLVMBuildAnd(g->builder, word,
+                     LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0), "strinv.cached"),
+                 LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "strinv.measured"),
+        "strinv.stale");
+    LLVMBuildCondBr(g->builder, stale, clear_bb, done_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, clear_bb);
+    LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, i8, payload,
+        &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1) }, 1,
+        "strinv.rcp");
+    LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64,
+        LLVMBuildBitCast(g->builder, rc_ptr, i64p, "strinv.rcip"), "strinv.rc");
+    LLVMBasicBlockRef store_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.store");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntNE, rc,
+                 LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
+                 "strinv.writable"),
+        store_bb, done_bb);
+    LLVMPositionBuilderAtEnd(g->builder, store_bb);
+    LLVMBuildStore(g->builder,
+                   LLVMConstInt(i64, ZAN_STR_HDR_WORD(ZAN_STR_LEN_UNKNOWN), 0),
+                   hdr_iptr);
+    LLVMBuildBr(g->builder, done_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, done_bb);
+}
+
+/* Publish a length a producer already knows into the header of a freshly
+ * allocated managed string, so the first `.Length`/bounds check costs nothing.
+ * `payload` must come from emit_string_alloc_rc (tagged, writable, non-null)
+ * and `len` must be the exact byte length. Lengths the 32-bit field cannot
+ * hold, or one colliding with the "not measured" pattern, are stored as
+ * unknown so a reader measures instead of trusting a truncated value. */
+static void emit_string_len_set(zan_irgen_t *g, LLVMValueRef payload,
+                                LLVMValueRef len) {
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i64p = LLVMPointerType(i64, 0);
+    LLVMValueRef fits = zan_and(g->builder,
+        zan_icmp(g->builder, LLVMIntULE, len,
+                 LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0), "strset.fits32"),
+        zan_icmp(g->builder, LLVMIntNE, len,
+                 LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "strset.notunk"),
+        "strset.ok");
+    LLVMValueRef half = LLVMBuildSelect(g->builder, fits, len,
+        LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "strset.half");
+    LLVMValueRef word = LLVMBuildOr(g->builder,
+        LLVMConstInt(i64, ZAN_STRING_TAG << 32, 0), half, "strset.hdr");
+    LLVMValueRef hdr_ptr = LLVMBuildGEP2(g->builder, i8, payload,
+        &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1) }, 1,
+        "strset.hdrp");
+    LLVMBuildStore(g->builder, word,
+        LLVMBuildBitCast(g->builder, hdr_ptr, i64p, "strset.hdrip"));
+}
+
+/* An extern/FFI callee may fill a string buffer in place (`recv(buf, n)`,
+ * `getcwd(buf, size)`, `fread(buf, ...)`), which moves the NUL terminator
+ * without going through a Zan store, so a string argument's cached length is
+ * stale once the call returns. Callees with a body are Zan code, which mutates
+ * string bytes only through the index store -- that path invalidates on its
+ * own.
+ * Only the string-typed arguments are touched: probing [p-8] of an arbitrary
+ * pointer (a struct, an int buffer, an nint) would widen the header probe to
+ * values ARC never inspects. The lowered argument list may carry a receiver
+ * ahead of the source arguments, so the two are aligned from the end. */
+static void emit_extern_call_len_invalidate(zan_irgen_t *g, LLVMValueRef fn,
+                                            LLVMValueRef *args, int argc,
+                                            zan_ast_node_t *call,
+                                            local_scope_t *locals) {
+    if (!fn || !args || argc <= 0 || !call) return;
+    if (!LLVMIsAFunction(fn) || LLVMCountBasicBlocks(fn) != 0) return;
+    int m = call->call.args.count;
+    if (m <= 0 || m > argc) return;
+    for (int i = 0; i < m; i++) {
+        LLVMValueRef v = args[argc - m + i];
+        if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind)
+            continue;
+        if (!is_string_expr(g, call->call.args.items[i], locals)) continue;
+        emit_string_len_invalidate(g, v);
+    }
+}
+
+/* Bounds-checking length: a byte[] answers with its element count so embedded
+ * NUL bytes do not truncate the valid index range. */
+static LLVMValueRef emit_string_buffer_len(zan_irgen_t *g, LLVMValueRef payload) {
+    return emit_string_len_ex(g, payload, 1);
+}
+
+/* `string.Length`: strlen semantics, with the header cache short-circuiting
+ * the walk for managed strings. */
+static LLVMValueRef emit_string_length(zan_irgen_t *g, LLVMValueRef payload) {
+    return emit_string_len_ex(g, payload, 0);
 }
 
 static void emit_span_window_check(zan_irgen_t *g, LLVMValueRef start,
                                    LLVMValueRef window, LLVMValueRef length,
-                                   zan_loc_t loc) {
+                                   zan_loc_t loc, const char *kind) {
     if (!g->runtime_checks || !g->current_fn) return;
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     start = emit_index_i64(g, start, "span.start");
@@ -1136,7 +1375,9 @@ static void emit_span_window_check(zan_irgen_t *g, LLVMValueRef start,
     LLVMValueRef bad = LLVMBuildOr(g->builder, bad_start, bad_window, "span.bad0");
     bad = LLVMBuildOr(g->builder, bad, after_end, "span.bad1");
     bad = LLVMBuildOr(g->builder, bad, too_long, "span.bad2");
-    emit_runtime_check(g, bad, loc, "span range out of bounds");
+    char msg[96];
+    snprintf(msg, sizeof(msg), "%s range out of bounds", kind ? kind : "span");
+    emit_runtime_check(g, bad, loc, msg);
 }
 
 /* Resolve the base pointer to a struct/class instance held by a local.
@@ -1471,7 +1712,9 @@ static LLVMValueRef emit_string_literal_rc(zan_irgen_t *g, zan_istr_t text) {
     unsigned char *blob = (unsigned char *)calloc(total, 1);
     if (!blob) return LLVMConstNull(LLVMPointerType(i8, 0));
     memcpy(blob + 0, &((uint64_t){ ZAN_STRING_SENTINEL_RC }), 8);
-    memcpy(blob + 8, &((uint64_t){ ZAN_STRING_MAGIC }), 8);
+    /* Literals know their length at compile time, so bake it into the header
+     * word: their storage is read-only, so a reader could never cache it. */
+    memcpy(blob + 8, &((uint64_t){ ZAN_STR_HDR_WORD(text.len) }), 8);
     if (text.len > 0) memcpy(blob + 16, text.str, (size_t)text.len);
     blob[16 + (size_t)text.len] = 0;
     /* --publish: XOR-scramble the text bytes in the image and record the
@@ -1755,6 +1998,7 @@ static LLVMValueRef emit_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
         LLVMGetNamedFunction(g->mod, "strcpy"),
         (LLVMValueRef[]){ buf, tmp }, 2, "");
+    emit_string_len_set(g, buf, needed);
     return buf;
 }
 
@@ -1822,6 +2066,8 @@ static LLVMValueRef emit_char_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
     zan_call2(bd, memcpy_type, memcpy_fn, (LLVMValueRef[]){ buf, tmp, len }, 3, "");
     LLVMValueRef endp = LLVMBuildGEP2(bd, i8t, buf, &len, 1, "ch.end");
     LLVMBuildStore(bd, LLVMConstInt(i8t, 0, 0), endp);
+    /* no length stamp: char 0 encodes as one NUL byte, whose string length is
+     * 0, not `len` */
     return buf;
 }
 
@@ -1871,9 +2117,8 @@ static LLVMValueRef emit_str_concat(zan_irgen_t *g, LLVMValueRef a, LLVMValueRef
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     a = emit_str_nonnull(g, a);
     b = emit_str_nonnull(g, b);
-    LLVMTypeRef strlen_type = LLVMFunctionType(i64t, (LLVMTypeRef[]){ i8ptr }, 1, 0);
-    LLVMValueRef la = zan_call2(g->builder, strlen_type, g->fn_strlen, &a, 1, "cla");
-    LLVMValueRef lb = zan_call2(g->builder, strlen_type, g->fn_strlen, &b, 1, "clb");
+    LLVMValueRef la = emit_string_length(g, a);
+    LLVMValueRef lb = emit_string_length(g, b);
     LLVMValueRef tot = zan_add(g->builder, la, lb, "ct");
     tot = zan_add(g->builder, tot, LLVMConstInt(i64t, 1, 0), "ct1");
     LLVMValueRef buf = emit_string_alloc_rc(g, tot);
@@ -1888,6 +2133,9 @@ static LLVMValueRef emit_str_concat(zan_irgen_t *g, LLVMValueRef a, LLVMValueRef
     LLVMValueRef end_off = zan_add(g->builder, la, lb, "slen");
     LLVMValueRef endp = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), buf, &end_off, 1, "end");
     LLVMBuildStore(g->builder, LLVMConstInt(LLVMInt8TypeInContext(g->ctx), 0, 0), endp);
+    /* the result's length is exactly what was just copied: `s = s + x` in a
+     * loop would otherwise re-measure the whole accumulator every round */
+    emit_string_len_set(g, buf, end_off);
     return buf;
 }
 
@@ -1956,6 +2204,7 @@ static LLVMValueRef emit_str_concat_n(zan_irgen_t *g, zan_ast_node_t *expr,
     }
     LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8t, buf, &off, 1, "end");
     LLVMBuildStore(g->builder, LLVMConstInt(i8t, 0, 0), endp);
+    emit_string_len_set(g, buf, off);
     for (int i = 0; i < n; i++) {
         if (owned[i]) emit_string_release(g, vals[i]);
     }

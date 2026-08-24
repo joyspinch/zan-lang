@@ -2115,8 +2115,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
         locals->count = catch_start;
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
-            /* drop the throw-site +1 on the caught exception (class-typed
-             * throws set __zan_eh_exc_owned; string throws leave it 0) */
+            /* drop the throw-site +1 on the caught exception (every
+             * RC-managed throw -- class, string, array, delegate -- sets
+             * __zan_eh_exc_owned; only non-managed values leave it 0) */
             LLVMValueRef owned_g = get_eh_exc_owned_global(g);
             LLVMValueRef ofl = LLVMBuildLoad2(g->builder, i32t, owned_g, "exc.owned");
             LLVMValueRef is_owned = zan_icmp(g->builder, LLVMIntNE, ofl,
@@ -2229,9 +2230,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             fe_len = zan_array_len(g, collection);
         } else if (fe_string) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-            LLVMTypeRef slt = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0);
             LLVMValueRef sp = LLVMBuildBitCast(g->builder, collection, i8ptr, "fe.sp");
-            fe_len = zan_call2(g->builder, slt, g->fn_strlen, &sp, 1, "fe.slen");
+            fe_len = emit_string_length(g, sp);
         }
 
         /* Iteration state (element, index, collection) of a `foreach` in an
@@ -2317,9 +2317,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 count = zan_array_len(g, col_cond);
             } else if (col_slot) {
                 LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                LLVMTypeRef slt2 = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8p }, 1, 0);
                 LLVMValueRef sp2 = LLVMBuildBitCast(g->builder, col_cond, i8p, "fe.sp2");
-                count = zan_call2(g->builder, slt2, g->fn_strlen, &sp2, 1, "fe.slen2");
+                count = emit_string_length(g, sp2);
             } else {
                 count = fe_len;
             }
@@ -2578,14 +2577,26 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMValueRef owned_g = get_eh_exc_owned_global(g);
                 LLVMValueRef tid_g = get_eh_exc_tid_global(g);
                 zan_type_t *tt = infer_expr_type(g, stmt->throw_stmt.value, locals);
-                if (tt && tt->kind == TYPE_CLASS &&
+                if (tt && is_rc_managed_type(tt) &&
                     LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind) {
+                    /* rc convention: __zan_eh_exc carries a +1 reference for
+                     * every RC-managed throw -- class, string, array or
+                     * delegate. Retain borrowed values here; the catch (and
+                     * the propagate path) release through rt_release_dyn,
+                     * which dispatches on the header tag. Leaving strings and
+                     * arrays unowned used to let the pre-longjmp unwind
+                     * release the local's last reference while __zan_eh_exc
+                     * still pointed at it: the handler read freed memory. */
                     if (!expr_yields_owned_rc_value(g, stmt->throw_stmt.value, locals))
-                        emit_arc_retain(g, vail);
+                        /* type-aware: a string retain must go through the
+                         * sentinel-tolerant helper -- interned literals sit in
+                         * read-only static storage, and the plain object
+                         * retain would fault incrementing their refcount */
+                        emit_rc_retain_for_type(g, tt, vail);
                     zan_store_fit(g, LLVMConstInt(i32t, 1, 0), owned_g);
                     /* record the thrown class's type descriptor so catch
                      * clauses can dispatch by type */
-                    if (tt->sym) {
+                    if (tt->kind == TYPE_CLASS && tt->sym) {
                         LLVMValueRef tid = get_class_tid_global(g, tt->sym);
                         zan_store_fit(g,
                             LLVMBuildBitCast(g->builder, tid, i8ptr, "tid.bc"),
