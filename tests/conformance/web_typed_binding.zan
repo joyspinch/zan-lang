@@ -1,0 +1,160 @@
+// Conformance: signature-bound actions and the [Tx] transaction scope.
+//
+//   1. a typed action parameter is read and converted by the generated
+//      trampoline -- the action sees an int, not a raw string;
+//   2. a missing or malformed parameter never reaches the action: the
+//      trampoline answers the uniform 400/0003 before the first statement;
+//   3. the same names feed the route's documented parameters;
+//   4. [Tx] wraps the action in __TxBegin/__TxCommit, and a Fail() inside
+//      the action rolls back before the ApiError answer goes out.
+//
+// The generated trampolines are invoked directly on a hand-parsed context:
+// no sockets, so the leak-check twins stay meaningful (a parked accept
+// coroutine would hold every request object reachable at exit).
+using System;
+using System.Net;
+using System.Net.Http;
+using System.Web;
+
+[Route("/api/calc")]
+class CalcController : Controller {
+    [HttpGet]
+    [Description("加法")]
+    void Sum(int a, int b) {
+        this.Ok("{\"sum\":" + Convert.ToString(a + b) + "}");
+    }
+}
+
+/// The [Tx] hook call order, captured statically so Main can assert it.
+/// Nulled before exit so nothing reachable holds the list at leak check.
+class TxLog {
+    static List<string> events;
+
+    static void Push(string e) {
+        if (TxLog.events == null) { TxLog.events = new List<string>(); }
+        TxLog.events.Add(e);
+    }
+
+    static string Joined() {
+        if (TxLog.events == null) { return ""; }
+        string out0 = "";
+        for (int i = 0; i < TxLog.events.Count; i = i + 1) {
+            if (i > 0) { out0 = out0 + ","; }
+            out0 = out0 + TxLog.events[i];
+        }
+        return out0;
+    }
+
+    static void Reset() { TxLog.events = new List<string>(); }
+
+    static void Drop() { TxLog.events = null; }
+}
+
+[Route("/api/tx")]
+class DocController : Controller {
+    [Tx]
+    [HttpPost]
+    [Description("保存")]
+    void Save(string name, int qty) {
+        TxLog.Push("action:" + name + ":" + Convert.ToString(qty));
+        if (qty < 0) { this.Fail(400, "0004", "数量不能为负"); }
+        this.Ok("null");
+    }
+
+    override async bool __TxBegin() { TxLog.Push("begin"); return true; }
+    override async void __TxCommit() { TxLog.Push("commit"); }
+    override async void __TxRollback() { TxLog.Push("rollback"); }
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Program.failures = Program.failures + 1; }
+        Console.WriteLine((ok ? "ok " : "FAIL ") + label);
+    }
+
+    static HttpContext Ctx(string method, string target) {
+        string raw = method + " " + target + " HTTP/1.1\r\nHost: t\r\n\r\n";
+        HttpRequest r = HttpRequest.Parse(raw);
+        return new HttpContext(r, "127.0.0.1");
+    }
+
+    /// Run one trampoline call to completion (handlers are async void;
+    /// the spawn handle joins through WhenAll).
+    static async List<long> Call(long h) {
+        List<long> hs = new List<long>();
+        hs.Add(h);
+        return hs;
+    }
+
+    static async int Run() {
+        // 1. Typed binding converts: the action receives real ints.
+        HttpContext c1 = Program.Ctx("GET", "/api/calc/sum?a=2&b=40");
+        await Task.WhenAll(await Program.Call(
+            Task.Spawn(__AttrRoutes.__h_CalcController_Sum(c1))));
+        string p1 = c1.BuildResponse(true);
+        Program.Check(p1.IndexOf("200 OK") >= 0, "sum answers 200");
+        Program.Check(p1.IndexOf("\"sum\":42") >= 0, "sum body computed");
+
+        // 2. Missing parameter -> uniform 400/0003, action never runs.
+        HttpContext c2 = Program.Ctx("GET", "/api/calc/sum?a=2");
+        await Task.WhenAll(await Program.Call(
+            Task.Spawn(__AttrRoutes.__h_CalcController_Sum(c2))));
+        string p2 = c2.BuildResponse(true);
+        Program.Check(p2.IndexOf("400 Bad") >= 0
+            && p2.IndexOf("\"0003\"") >= 0,
+            "missing param answered 0003");
+
+        // 3. Malformed integer -> same client-mistake answer.
+        HttpContext c3 = Program.Ctx("GET", "/api/calc/sum?a=2&b=xyz");
+        await Task.WhenAll(await Program.Call(
+            Task.Spawn(__AttrRoutes.__h_CalcController_Sum(c3))));
+        string p3 = c3.BuildResponse(true);
+        Program.Check(p3.IndexOf("400 Bad") >= 0
+            && p3.IndexOf("\"0003\"") >= 0,
+            "malformed int answered 0003");
+
+        // 4. Documented parameters carry the signature names/types.
+        WebApp app = new WebApp("127.0.0.1", 0);
+        __AttrRoutes.Register(app);
+        Route sum = null;
+        List<Route> routes = app.router.All();
+        for (int i = 0; i < routes.Count; i = i + 1) {
+            if (routes[i].pattern == "/api/calc/sum") { sum = routes[i]; }
+        }
+        Program.Check(sum != null && sum.docParams.Count == 2
+            && sum.docParams[0].Name() == "a"
+            && sum.docParams[0].Type() == "int"
+            && sum.docParams[0].Required(),
+            "signature params documented");
+
+        // 5. [Tx] happy path: begin -> action -> commit.
+        TxLog.Reset();
+        HttpContext c5 = Program.Ctx("POST", "/api/tx/save?name=box&qty=3");
+        await Task.WhenAll(await Program.Call(
+            Task.Spawn(__AttrRoutes.__h_DocController_Save(c5))));
+        string p5 = c5.BuildResponse(true);
+        Program.Check(p5.IndexOf("200 OK") >= 0, "tx save answers 200");
+        Program.Check(TxLog.Joined() == "begin,action:box:3,commit",
+            "tx commit order");
+
+        // 6. [Tx] failure path: rollback precedes the ApiError answer.
+        TxLog.Reset();
+        HttpContext c6 = Program.Ctx("POST", "/api/tx/save?name=box&qty=-1");
+        await Task.WhenAll(await Program.Call(
+            Task.Spawn(__AttrRoutes.__h_DocController_Save(c6))));
+        string p6 = c6.BuildResponse(true);
+        Program.Check(p6.IndexOf("400 Bad") >= 0, "tx failure answers 400");
+        Program.Check(TxLog.Joined() == "begin,action:box:-1,rollback",
+            "tx rollback order");
+
+        TxLog.Drop();
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

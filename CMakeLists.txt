@@ -960,6 +960,11 @@ foreach(_src ${_conf_srcs})
   else()
     set(_extra_args "")
   endif()
+  if(_name STREQUAL "environment_unicode_args")
+    set(_run_args "中文;参数")
+  else()
+    set(_run_args "")
+  endif()
   add_test(NAME conformance_${_name}
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -968,6 +973,7 @@ foreach(_src ${_conf_srcs})
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_${_name}${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       "-DZANC_ARGS=${_extra_args}"
+      "-DRUN_ARGS=${_run_args}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   # A program and its leakcheck twin are built from the same source, so any
   # hardcoded listen port (e.g. the async networking conformance tests) is
@@ -1405,6 +1411,18 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_zform_control${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # Declarative typed grid: a DataGrid field with "of" + "columns" projects
+  # typed accessor lambdas onto the generic column API, binds the caller's
+  # List<T> directly (no DataRow), and "props"/"rowFactory" reach the state.
+  add_test(NAME conformance_gui_zform_grid
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/zform_grid_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/zform_grid.zform;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_zform_grid.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_zform_grid${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   add_test(NAME conformance_gui_props
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -1472,6 +1490,18 @@ endif()
 add_test(NAME policy_no_widget_drawing
   COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
     -P ${CMAKE_SOURCE_DIR}/tests/run_no_widget_drawing.cmake)
+
+add_test(NAME policy_gallery_coverage
+  COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_gallery_coverage.cmake)
+
+add_test(NAME policy_zform_schema
+  COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_zform_schema.cmake)
+
+add_test(NAME policy_control_factory
+  COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_control_factory.cmake)
 
 # ---- Policy: widget draw paths must not gain direct semantic-color reads ----
 # Colors belong to the style layer (base.css + Style/StyleBox/Fx); each direct
@@ -1830,15 +1860,24 @@ foreach(_runtime_case IN ITEMS
     array_oob
     list_removeat_oob
     list_insert_oob
+    member_list_field_oob
+    substring_start_oob
+    substring_window_oob
     span_window_oob
-    span_negative_length)
+    span_negative_length
+    member_array_field_oob)
   if(_runtime_case STREQUAL list_removeat_oob OR
-     _runtime_case STREQUAL list_insert_oob)
+     _runtime_case STREQUAL list_insert_oob OR
+     _runtime_case STREQUAL member_list_field_oob)
     set(_runtime_regex "list index out of bounds")
   elseif(_runtime_case STREQUAL span_window_oob)
     set(_runtime_regex "span range out of bounds")
   elseif(_runtime_case STREQUAL span_negative_length)
     set(_runtime_regex "negative span length")
+  elseif(_runtime_case STREQUAL substring_start_oob)
+    set(_runtime_regex "substring index out of bounds")
+  elseif(_runtime_case STREQUAL substring_window_oob)
+    set(_runtime_regex "substring range out of bounds")
   else()
     set(_runtime_regex "array index out of bounds")
   endif()

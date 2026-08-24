@@ -2,7 +2,8 @@
 #
 # Invoked as:
 #   cmake -DZANC=<zanc> -DSRC=<file.zan> -DEXPECTED=<file.out> \
-#         -DOUT_EXE=<exe path> [-DZANC_ARGS=<extra;args>] [-DWORKDIR=<dir>] \
+#         -DOUT_EXE=<exe path> [-DZANC_ARGS=<extra;args>] [-DRUN_ARGS=<args>] \
+#         [-DWORKDIR=<dir>] \
 #         -P run_case.cmake
 #
 # Fails (non-zero) if compilation fails or the program's stdout does not
@@ -80,14 +81,14 @@ while(TRUE)
   math(EXPR _run_attempt "${_run_attempt} + 1")
   if(WORKDIR)
     execute_process(
-      COMMAND ${OUT_EXE}
+      COMMAND ${OUT_EXE} ${RUN_ARGS}
       WORKING_DIRECTORY ${WORKDIR}
       RESULT_VARIABLE run_rc
       OUTPUT_VARIABLE actual
       ENCODING UTF-8)
   else()
     execute_process(
-      COMMAND ${OUT_EXE}
+      COMMAND ${OUT_EXE} ${RUN_ARGS}
       RESULT_VARIABLE run_rc
       OUTPUT_VARIABLE actual
       ENCODING UTF-8)

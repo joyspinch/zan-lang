@@ -1,0 +1,116 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component.DataTable;
+
+/// Row entity named by the tested document's "of" (zform_grid.zform). The
+/// designed DataGrid binds the caller's List<GridRow> directly: accessors
+/// read these fields each frame, no DataRow / string-row copy exists.
+class GridRow {
+    string name;
+    int clicks;
+    double spend;
+    bool active;
+
+    GridRow() {
+        name = "";
+        clicks = 0;
+        spend = 0.0;
+        active = false;
+    }
+}
+
+/// Code-behind of the tested control document (zform_grid.zform).
+partial class ZfGrid {
+    void OnInit() {
+    }
+}
+
+/// Covers the declarative typed grid: "of" + "columns" project onto the
+/// generic column API (Col/NumCol/RealCol/BoolCol), the "props" table reaches
+/// the grid state, editing writes back into the entity by column type, and
+/// "rowFactory" enables row insertion with `new GridRow()`.
+class ZformGridTest {
+    static int fails;
+
+    static void Eq(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got '" + got + "' want '" +
+                          want + "'");
+    }
+
+    static void Main() {
+        fails = 0;
+        ZfGrid p = new ZfGrid();
+
+        // "of" makes the designed field a typed DataGrid<GridRow>: the
+        // assignment is checked by the compiler, not by a cast.
+        DataGrid<GridRow> g = p.Grid;
+
+        // "columns" landed on the typed column API in document order.
+        ZformGridTest.Eq("columns", g.GetProp("previewColumns"),
+                         "220,名称|80,点击|100,花费|70,在投");
+
+        // "props" pass-through reaches the grid state through SetExtra.
+        ZformGridTest.Eq("striped", g.GetProp("striped"), "true");
+        ZformGridTest.Eq("rowHeight", g.GetProp("rowHeight"), "22");
+        ZformGridTest.Eq("summary", g.GetProp("summary"), "true");
+        ZformGridTest.Eq("allowAddRow", g.GetProp("allowAddRow"), "true");
+
+        // Bind the caller's own list; accessors read the live entities.
+        List<GridRow> rows = new List<GridRow>();
+        GridRow a = new GridRow();
+        a.name = "计划A";
+        a.clicks = 3;
+        a.spend = 12.5;
+        a.active = true;
+        rows.Add(a);
+        GridRow b = new GridRow();
+        b.name = "计划B";
+        b.clicks = 4;
+        rows.Add(b);
+        g.Bind(rows);
+        ZformGridTest.Eq("count", Convert.ToString(g.Count()), "2");
+
+        GridSource<GridRow> src = g.source;
+        ZformGridTest.Eq("cell text", src.CellText(0, 0), "计划A");
+        ZformGridTest.Eq("cell num", src.CellText(1, 1), "4");
+        ZformGridTest.Eq("cell real", src.CellText(0, 2), "12.50");
+        ZformGridTest.Eq("cell bool", src.CellText(0, 3), "true");
+        ZformGridTest.Eq("cell bool off", src.CellText(1, 3), "false");
+
+        // "editable" writes back into the entity, parsed by column type.
+        src.SetCell(0, 0, "改名");
+        ZformGridTest.Eq("edit text", a.name, "改名");
+        src.SetCell(1, 1, "9");
+        ZformGridTest.Eq("edit num", Convert.ToString(b.clicks), "9");
+        // The spend column is not editable: the write is ignored.
+        src.SetCell(0, 2, "99.99");
+        ZformGridTest.Eq("readonly real", src.CellText(0, 2), "12.50");
+
+        // HideCol trims a shared column union by field name at assembly
+        // time; unknown fields are a no-op.
+        g.HideCol("clicks", true);
+        if (!g.State().colHidden[1]) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL HideCol did not hide the clicks column");
+        }
+        g.HideCol("clicks", false);
+        if (g.State().colHidden[1]) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL HideCol did not restore the clicks column");
+        }
+        g.HideCol("missing", true);
+
+        // "rowFactory" projects RowFactory(() => new GridRow()).
+        if (!src.CanInsert()) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL rowFactory did not reach the source");
+        }
+        src.InsertRow(2);
+        ZformGridTest.Eq("insert", Convert.ToString(rows.Count), "3");
+
+        if (fails == 0) { Console.WriteLine("ZFORM_GRID_OK"); }
+    }
+}
