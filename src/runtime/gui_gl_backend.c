@@ -502,21 +502,35 @@ static void zgl_upload(zan_surface_t *s, zgl_target *t) {
     t->cpu_ahead = 0;
 }
 
+/* Staging rows for GPU readback: GL hands the frame back bottom-up and the
+ * surface is top-down, so the flip runs through here. Reused across calls --
+ * present-path shells read back every frame, and a malloc/free of
+ * W*H*4 per present showed up as pure allocator churn. Grow-only, like the
+ * polyline coverage scratch on the CPU side. */
+static unsigned char *g_zgl_rb = NULL;
+static size_t g_zgl_rb_cap = 0;
+
 /* GPU -> s->pixels, for the shells' present path and for any primitive still
  * running on the CPU. */
 static void zgl_readback(zan_surface_t *s, zgl_target *t) {
     if (!t->gpu_ahead) return;
+    if (s->width <= 0 || s->height <= 0) return;
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
     /* GL hands back rows bottom-up; the surface is top-down. */
     size_t row = (size_t)s->width * 4;
-    unsigned char *tmp = (unsigned char *)malloc(row * (size_t)s->height);
-    if (!tmp) return;
-    gl.ReadPixels(0, 0, s->width, s->height, ZGL_BGRA, ZGL_UNSIGNED_BYTE, tmp);
+    size_t need = row * (size_t)s->height;
+    if (need > g_zgl_rb_cap) {
+        unsigned char *ng = (unsigned char *)realloc(g_zgl_rb, need);
+        if (!ng) return;   /* keep the old block; skip this readback */
+        g_zgl_rb = ng;
+        g_zgl_rb_cap = need;
+    }
+    gl.ReadPixels(0, 0, s->width, s->height, ZGL_BGRA, ZGL_UNSIGNED_BYTE,
+                  g_zgl_rb);
     for (int y = 0; y < s->height; y++) {
         memcpy(s->pixels + (size_t)y * (size_t)s->stride,
-               tmp + row * (size_t)(s->height - 1 - y), row);
+               g_zgl_rb + row * (size_t)(s->height - 1 - y), row);
     }
-    free(tmp);
     /* The surface and the GPU now agree, so this is also the newest shadow --
      * without it every tile would read as dirty on the next upload. */
     if (t->shadow) zgl_shadow_store(s, t, 0, 0, s->width, s->height);

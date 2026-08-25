@@ -343,17 +343,74 @@ static void ft_draw_text(i64 surface_id, i64 x, i64 y,
     zan_glyph_batch_flush(&batch);
 }
 
+/* Measured-width cache, ported from gui_runtime_text.c's Win32 one: layout,
+ * caret and syntax-highlight paths call measure hundreds of times per frame
+ * with unchanged strings, and every miss here costs one FT_Load_Glyph (plus
+ * a pixel-size reselect on fallback faces) per code point. The face set is
+ * fixed for the life of the process ("sans" plus discovered fallbacks), so
+ * (text, size) fully determines the width. */
+typedef struct {
+    char    *text;   /* UTF-8 key; NULL marks an empty slot */
+    int      size;
+    int      width;
+    uint64_t used;   /* LRU tick */
+} ft_measure_cache_t;
+
+#define FT_MEAS_CACHE_CAP 2048
+#define FT_MEAS_CACHE_PROBE 8
+static ft_measure_cache_t g_ft_mcache[FT_MEAS_CACHE_CAP];
+static uint64_t g_ft_mcache_clock = 0;
+
+static uint64_t ft_meas_hash(const char *s, int size) {
+    uint64_t h = 1469598103934665603ULL ^ (uint64_t)(unsigned)size;
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
 static i64 ft_measure_text(const char *text, int font_size) {
+    if (!text || !*text) return 0;
+
+    uint64_t h = ft_meas_hash(text, font_size);
+    int base = (int)(h % FT_MEAS_CACHE_CAP);
+    ft_measure_cache_t *victim = NULL;
+    uint64_t best = ~0ULL;
+    for (int i = 0; i < FT_MEAS_CACHE_PROBE; i++) {
+        ft_measure_cache_t *e = &g_ft_mcache[(base + i) % FT_MEAS_CACHE_CAP];
+        if (e->text && e->size == font_size && strcmp(e->text, text) == 0) {
+            e->used = ++g_ft_mcache_clock;
+            return (i64)e->width;
+        }
+        if (!e->text) { if (!victim || best != 0) { victim = e; best = 0; } }
+        else if (e->used < best) { best = e->used; victim = e; }
+    }
+
     int width = 0;
-    while (text && *text) {
-        u32 cp = utf8_next(&text);
+    const char *p = text;
+    while (*p) {
+        u32 cp = utf8_next(&p);
         FT_Face face = ft_face_for_cp(cp, font_size);
         FT_UInt glyph = FT_Get_Char_Index(face, cp);
         if (!glyph) glyph = FT_Get_Char_Index(face, '?');
         if (glyph && FT_Load_Glyph(face, glyph, FT_LOAD_DEFAULT) == 0)
             width += (int)(face->glyph->advance.x >> 6);
     }
-    return width;
+
+    if (victim) {
+        free(victim->text);
+        victim->text = NULL;
+        size_t klen = strlen(text) + 1;
+        victim->text = (char *)malloc(klen);
+        if (victim->text) {
+            memcpy(victim->text, text, klen);
+            victim->size = font_size;
+            victim->width = width;
+            victim->used = ++g_ft_mcache_clock;
+        }
+    }
+    return (i64)width;
 }
 #endif
 

@@ -1031,6 +1031,21 @@ int32_t zan_io_poll(int64_t timeout_ms) {
             nr += io_take(s, fd, 1, ready + nr, 8 - nr);
         if (events[i].filter == EVFILT_WRITE)
             nr += io_take(s, fd, 0, ready + nr, 8 - nr);
+        /* This delivery consumed the filter's EV_ONESHOT. When waiters are
+         * still queued in that direction -- a readiness burst larger than
+         * the batch of 8 -- nothing else would re-arm it: io_register only
+         * runs when a NEW waiter parks, and these are already parked. The
+         * epoll backend re-arms with EPOLL_CTL_MOD in exactly this spot;
+         * keep the two backends at parity or the overflow waiters hang.
+         * A failed kevent here means the fd died mid-burst; the sweep's
+         * liveness probes fail those waiters on the next capped timeout. */
+        if ((events[i].filter == EVFILT_READ && s->has_r) ||
+            (events[i].filter == EVFILT_WRITE && s->has_w)) {
+            struct kevent rk;
+            EV_SET(&rk, (uintptr_t)fd, events[i].filter,
+                   EV_ADD | EV_ONESHOT, 0, 0, NULL);
+            kevent(g_kq_fd, &rk, 1, NULL, 0, NULL);
+        }
         for (int k = 0; k < nr; k++) {
             io_deliver_waiter(fd, &ready[k]);
             g_io_count--;

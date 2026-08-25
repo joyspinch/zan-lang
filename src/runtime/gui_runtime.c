@@ -1093,9 +1093,23 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
     if (dw < 1) dw = 1;
     if (dh < 1) dh = 1;
     size_t dn = (size_t)dw * (size_t)dh;
-    u32 *a = (u32 *)malloc(dn * sizeof(u32));
-    u32 *b = (u32 *)malloc(dn * sizeof(u32));
-    if (!a || !b) { free(a); free(b); return; }
+    /* Downsample/upscale scratch, reused across calls: every glass panel on
+     * an animated page re-blurs per frame, and two malloc/free of the small
+     * copy each time was measurable allocator churn (frame-budget probes
+     * flagged it). Grow-only, like the polyline coverage scratch. */
+    static u32 *scratch_a = NULL, *scratch_b = NULL;
+    static size_t scratch_n = 0;
+    if (dn > scratch_n) {
+        u32 *na = (u32 *)realloc(scratch_a, dn * sizeof(u32));
+        if (!na) return;                    /* keep old block; skip this blur */
+        scratch_a = na;
+        u32 *nb = (u32 *)realloc(scratch_b, dn * sizeof(u32));
+        if (!nb) return;
+        scratch_b = nb;
+        scratch_n = dn;
+    }
+    u32 *a = scratch_a;
+    u32 *b = scratch_b;
 
     /* Downsample: average each ds x ds source block into one small pixel. */
     for (int dj = 0; dj < dh; dj++) {
@@ -1241,7 +1255,6 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
             }
         }
     }
-    free(a); free(b);
 }
 
 EXPORT void zan_gui_blur_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius) {
@@ -1342,10 +1355,21 @@ static void cpu_blur(zan_surface_t *s, int x, int y, int w, int h, int radius,
      * plain hover strip crossing a glass panel stays cheap. */
     if (geom_ok && (!dirty || (covers && sum == c->src_sum))) {
         ZAN_STAT(g_st_blur_hit, (long long)rw * (long long)rh);
-        for (int j = 0; j < rh; j++) {
-            u32 *src = c->pixels + (size_t)j * rw;
-            for (int i = 0; i < rw; i++)
-                blur_put(s, x0 + i, y0 + j, src[i], 255);
+        if (covers) {
+            /* Whole region inside the clip: plain row copies. Per-pixel
+             * blur_put (a clip test plus blend bookkeeping each) dominated
+             * the hit path on animation-only frames; with the clip covering
+             * everything at coverage 255 the copy is semantically identical. */
+            for (int j = 0; j < rh; j++)
+                memcpy(s->pixels + (size_t)(y0 + j) * s->stride + x0,
+                       c->pixels + (size_t)j * rw, (size_t)rw * sizeof(u32));
+        } else {
+            /* Region straddles the damage strip: keep the per-pixel clip. */
+            for (int j = 0; j < rh; j++) {
+                u32 *src = c->pixels + (size_t)j * rw;
+                for (int i = 0; i < rw; i++)
+                    blur_put(s, x0 + i, y0 + j, src[i], 255);
+            }
         }
         return;
     }
@@ -2251,12 +2275,18 @@ static void zan_polyline_core(zan_surface_t *s, const i32 *pts, i32 n,
         g_poly_cov = (u8*)malloc((size_t)W * (size_t)H);
         g_poly_cov_w = W;
         g_poly_cov_h = H;
+        /* One clear on (re)allocation only -- malloc leaves garbage that
+         * would break the first-touch marker below. Every pass afterwards
+         * restores all-zero itself: the blend pass resets each pixel it
+         * touched, so a fresh O(surface) sweep per draw call is not needed.
+         * Width changes do not matter either: slots are only ever written
+         * through the tracked path, which always zeroes them again. */
+        if (g_poly_cov) memset(g_poly_cov, 0, (size_t)W * (size_t)H);
     }
+    if (!g_poly_cov) { g_poly_cov_w = 0; g_poly_cov_h = 0; return; }
     g_poly_dirty_n = 0;
-    /* The first-touch marker below relies on a zero buffer (g_poly_cov[idx]==0
-     * means "not seen this pass"). malloc leaves garbage behind, so a dirty
-     * slot can be skipped and its pixel silently dropped -- clear every pass. */
-    memset(g_poly_cov, 0, (size_t)W * (size_t)H);
+    /* First-touch marker relies on the buffer being zero here; see the
+     * allocation-time clear above and the blend-pass reset below. */
 
     double half = t * 0.5;
     for (i32 i = 0; i + 1 < n; i++) {
@@ -2289,9 +2319,22 @@ static void zan_polyline_core(zan_surface_t *s, const i32 *pts, i32 n,
                 int idx = py * W + px;
                 if (g_poly_cov[idx] == 0) {       /* first touch this pass */
                     if (g_poly_dirty_n >= g_poly_dirty_cap) {
-                        g_poly_dirty_cap = g_poly_dirty_cap ? g_poly_dirty_cap * 2 : 1024;
-                        g_poly_dirty = (i32*)realloc(g_poly_dirty,
-                            (size_t)g_poly_dirty_cap * sizeof(i32));
+                        i32 cap2 = g_poly_dirty_cap ? g_poly_dirty_cap * 2 : 1024;
+                        i32 *nd = (i32*)realloc(g_poly_dirty,
+                            (size_t)cap2 * sizeof(i32));
+                        /* Growth failed (test-injected OOM only): blending
+                         * nothing and resetting coverage keeps the buffer's
+                         * all-zero invariant intact -- pixels written after
+                         * the aborted tracking would otherwise poison the
+                         * next pass's first-touch marker. This call simply
+                         * draws without anti-aliasing bookkeeping. */
+                        if (!nd) {
+                            memset(g_poly_cov, 0, (size_t)W * (size_t)H);
+                            g_poly_dirty_n = 0;
+                            return;
+                        }
+                        g_poly_dirty = nd;
+                        g_poly_dirty_cap = cap2;
                     }
                     g_poly_dirty[g_poly_dirty_n++] = (py << 16) | (px & 0xFFFF);
                 }
