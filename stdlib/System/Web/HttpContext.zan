@@ -126,6 +126,96 @@ class HttpContext {
     string Query(string name) { return this.query.Get(name); }
     string Form(string name) { return this.form.Get(name); }
     string Body() { return this.request.body; }
+
+    // ================= 类型化取参族 =================
+    //
+    // Input* 家族按 route → query → form 合并取值（Param 只看
+    // route 路径参数，语义保持不变）。空串一律视同缺失（空表单
+    // 字段直接落到默认值）。数值解析全部手写：Convert.ToInt 目前
+    // 降级为 C 的 atoi（负数零扩展缺陷，编译器票在案），而且
+    // atoi 的部分消费语义（"12abc" 得 12）对 HTTP 参数是错的——
+    // 这里要求整串消费干净，否则返回默认值。
+
+    /// <summary>按 route → query → form 顺序取原始字符串；
+    /// 三处都缺时返回空串。</summary>
+    string InputString(string name) {
+        string v = this.routeParams.Get(name);
+        if (v.Length > 0) { return v; }
+        v = this.query.Get(name);
+        if (v.Length > 0) { return v; }
+        return this.form.Get(name);
+    }
+
+    /// <summary>按合并顺序取整型；缺失、非整数或溢出时返回
+    /// `dflt`。"42"、"-7"、"+7" 合法；"12abc"、"2.5"、"" 不合法。</summary>
+    int InputInt(string name, int dflt) {
+        return HttpContext.ParseIntStrict(this.InputString(name), dflt);
+    }
+
+    /// <summary>按合并顺序取 64 位整型；规则同 InputInt。</summary>
+    long InputLong(string name, long dflt) {
+        return HttpContext.ParseLongStrict(this.InputString(name), dflt);
+    }
+
+    /// <summary>按合并顺序取布尔："1"/"true"/"on"/"yes"
+    /// （大小写不敏感）为真，"0"/"false"/"off"/"no" 为假，
+    /// 其余返回 `dflt`。</summary>
+    bool InputBool(string name, bool dflt) {
+        string v = this.InputString(name);
+        if (v.Length == 0) { return dflt; }
+        if (HttpContext.AsciiEq(v, "1")) { return true; }
+        if (HttpContext.AsciiEq(v, "true")) { return true; }
+        if (HttpContext.AsciiEq(v, "on")) { return true; }
+        if (HttpContext.AsciiEq(v, "yes")) { return true; }
+        if (HttpContext.AsciiEq(v, "0")) { return false; }
+        if (HttpContext.AsciiEq(v, "false")) { return false; }
+        if (HttpContext.AsciiEq(v, "off")) { return false; }
+        if (HttpContext.AsciiEq(v, "no")) { return false; }
+        return dflt;
+    }
+
+    /// <summary>严格十进制解析：可选 +/- 前缀、其余必须全为数字、
+    /// 整串消费、int 范围校验；任何一条不满足返回 `dflt`。</summary>
+    static int ParseIntStrict(string v, int dflt) {
+        if (v == null || v.Length == 0) { return dflt; }
+        long r = HttpContext.ParseLongStrict(v, dflt);
+        if (r > 2147483647 || r < 0 - 2147483648) { return dflt; }
+        return (int)r;
+    }
+
+    /// <summary>ASCII 大小写不敏感等值（布尔词表用）。</summary>
+    static bool AsciiEq(string a, string b) {
+        if (a.Length != b.Length) { return false; }
+        for (int i = 0; i < a.Length; i = i + 1) {
+            int x = a[i] & 255;
+            int y = b[i] & 255;
+            if (x >= 65 && x <= 90) { x = x + 32; }
+            if (y >= 65 && y <= 90) { y = y + 32; }
+            if (x != y) { return false; }
+        }
+        return true;
+    }
+
+    static long ParseLongStrict(string v, long dflt) {
+        if (v == null || v.Length == 0) { return dflt; }
+        int i = 0;
+        bool neg = false;
+        int c0 = v[0] & 255;
+        if (c0 == 45) { neg = true; i = 1; }
+        else if (c0 == 43) { i = 1; }
+        if (i >= v.Length) { return dflt; }
+        long acc = 0;
+        while (i < v.Length) {
+            int c = v[i] & 255;
+            if (c < 48 || c > 57) { return dflt; }
+            acc = acc * 10 + (c - 48);
+            if (acc > 9223372036854775807L) {
+                return dflt;
+            }
+            i = i + 1;
+        }
+        return neg ? 0 - acc : acc;
+    }
     string Header(string name) { return this.request.GetHeader(name); }
 
     /// <summary>Reads one cookie from the Cookie header, or "".</summary>

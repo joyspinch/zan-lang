@@ -1,0 +1,81 @@
+// HttpContext 类型化取参族（InputString/InputInt/InputLong/InputBool）的契约：
+// 合并顺序 route → query → form，空串视同缺失，数值解析必须整串
+// 消费（"12abc"、""、"2.5" 都落默认值），布尔词表大小写不敏感。
+using System;
+using System.Web;
+
+class Program {
+    static int failures = 0;
+
+    static void Eq(string what, string got, string want) {
+        if (got == want) {
+            Console.WriteLine("ok " + what);
+        } else {
+            Console.WriteLine("FAIL " + what + ": got '" + got
+                              + "' want '" + want + "'");
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static void Ok(string what, bool got, bool want) {
+        Program.Eq(what, got ? "true" : "false", want ? "true" : "false");
+    }
+
+    static void Main() {
+        // GET + 查询串。
+        string raw = "GET /user/42?page=3&flag=on&q=hello HTTP/1.1\r\n"
+                     + "Host: h\r\n\r\n";
+        HttpContext c = new HttpContext(HttpRequest.Parse(raw), "127.0.0.1");
+        c.routeParams.Set("id", "42");
+        Program.Eq("route param", c.InputString("id"), "42");
+        Program.Eq("query raw", c.InputString("q"), "hello");
+        Program.Ok("route int", c.InputInt("id", 0) == 42, true);
+        Program.Ok("query int", c.InputInt("page", 1) == 3, true);
+        Program.Ok("bool on", c.InputBool("flag", false) == true, true);
+        Program.Eq("missing raw", c.InputString("nope"), "");
+        Program.Ok("missing int dflt", c.InputInt("nope", 9) == 9, true);
+
+        // 整串消费：垃圾一律默认值。
+        Program.Ok("trailing junk", c.InputInt("bad1", 7) == 7, true);
+        c.query.Set("bad1", "12abc");
+        Program.Ok("12abc rejected", c.InputInt("bad1", 7) == 7, true);
+        c.query.Set("frac", "2.5");
+        Program.Ok("float rejected", c.InputInt("frac", 7) == 7, true);
+        c.query.Set("neg", "-5");
+        Program.Ok("negative ok", c.InputInt("neg", 7) == 0 - 5, true);
+        c.query.Set("plus", "+6");
+        Program.Ok("plus sign", c.InputInt("plus", 7) == 6, true);
+        c.query.Set("emptyv", "");
+        Program.Ok("empty falls to dflt", c.InputInt("emptyv", 3) == 3, true);
+        c.query.Set("big", "9223372036854775807");
+        Program.Ok("long max", c.InputLong("big", 0) == 9223372036854775807L,
+                   true);
+        c.query.Set("huge", "2147483648");
+        Program.Ok("int overflow to dflt", c.InputInt("huge", 5) == 5, true);
+
+        // POST 表单：query 与 form 同名时 query 优先；form 兜底。
+        string post = "POST /save?src=q HTTP/1.1\r\nHost: h\r\n"
+                      + "Content-Type: application/x-www-form-urlencoded\r\n"
+                      + "Content-Length: 15\r\n\r\nname=alice&src=f";
+        HttpContext p = new HttpContext(HttpRequest.Parse(post), "127.0.0.1");
+        Program.Eq("query beats form", p.InputString("src"), "q");
+        Program.Eq("form value", p.InputString("name"), "alice");
+        Program.Ok("form int", p.InputInt("name", 0) == 0, true);
+
+        // 布尔词表。
+        p.form.Set("t1", "TRUE");
+        p.form.Set("t2", "Yes");
+        p.form.Set("f1", "off");
+        p.form.Set("f2", "garbage");
+        Program.Ok("true word", p.InputBool("t1", false) == true, true);
+        Program.Ok("yes word", p.InputBool("t2", false) == true, true);
+        Program.Ok("off word", p.InputBool("f1", true) == false, true);
+        Program.Ok("garbage keeps dflt", p.InputBool("f2", true) == true, true);
+
+        if (Program.failures > 0) {
+            Console.WriteLine("fail: " + Convert.ToString(Program.failures));
+        } else {
+            Console.WriteLine("all pass");
+        }
+    }
+}
