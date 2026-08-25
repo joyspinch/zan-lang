@@ -251,8 +251,22 @@ static json_value *jp_string(jparser *j) {
                         if (h >= '0' && h <= '9') lo |= (unsigned)(h - '0');
                         else if (h >= 'a' && h <= 'f') lo |= (unsigned)(h - 'a' + 10);
                         else if (h >= 'A' && h <= 'F') lo |= (unsigned)(h - 'A' + 10);
+                        else { j->ok = false; free(buf); return NULL; }
                     }
-                    code = 0x10000 + ((code - 0xD800) << 10) + (lo - 0xDC00);
+                    /* A high surrogate must pair with a low surrogate. The old
+                     * code accepted ANY tail value: "\uD800\u0041" wrapped
+                     * around into a wrong-but-valid code point, and a bad hex
+                     * digit in the tail silently passed. */
+                    if (lo < 0xDC00 || lo > 0xDFFF) {
+                        code = 0xFFFD;      /* U+FFFD, keep parsing */
+                    } else {
+                        code = 0x10000 + ((code - 0xD800) << 10) + (lo - 0xDC00);
+                    }
+                } else if (code >= 0xD800 && code <= 0xDFFF) {
+                    /* Lone surrogate (bare low, or high with no \u tail):
+                     * encode it as U+FFFD instead of emitting CESU-8 bytes no
+                     * strict decoder accepts. */
+                    code = 0xFFFD;
                 }
                 char utf8[4];
                 int n = 0;
@@ -282,7 +296,12 @@ static json_value *jp_string(jparser *j) {
                 }
                 continue;
             }
-            default: c = e; break;
+            default:
+                /* RFC 8259 section 7: unknown escapes are a syntax error.
+                 * Laundering "\q" into "q" accepts invalid input AND makes a
+                 * round-trip through json_serialize change the bytes, which
+                 * masks desync between peers. */
+                free(buf); j->ok = false; return NULL;
             }
         }
         if (len + 1 >= cap) {
@@ -412,25 +431,37 @@ typedef struct {
     char  *buf;
     size_t len;
     size_t cap;
+    int    oom;     /* sticky: a realloc failed (test builds only -- the
+                     * production allocation policy aborts); writers stop
+                     * touching buf so a forced failure cannot corrupt it */
 } sbuf;
 
 static void sb_ensure(sbuf *s, size_t extra) {
     if (s->len + extra + 1 > s->cap) {
         size_t nc = s->cap ? s->cap * 2 : 256;
         while (nc < s->len + extra + 1) nc *= 2;
-        s->buf = (char *)realloc(s->buf, nc);
+        /* Keep the old block on failure: committing `nc` with buf == NULL (or
+         * a stale cap) turned every later write into a NULL deref or an
+         * overflow. */
+        char *g = (char *)realloc(s->buf, nc);
+        if (!g) { s->oom = 1; return; }
+        s->buf = g;
         s->cap = nc;
     }
 }
 
 static void sb_putc(sbuf *s, char c) {
+    if (s->oom) return;
     sb_ensure(s, 1);
+    if (s->oom) return;
     s->buf[s->len++] = c;
 }
 
 static void sb_puts(sbuf *s, const char *str) {
+    if (s->oom) return;
     size_t n = strlen(str);
     sb_ensure(s, n);
+    if (s->oom) return;
     memcpy(s->buf + s->len, str, n);
     s->len += n;
 }
@@ -467,6 +498,11 @@ static void sb_put_value(sbuf *s, const json_value *v) {
     case JSON_BOOL: sb_puts(s, v->as.b ? "true" : "false"); break;
     case JSON_NUM: {
         double n = v->as.num;
+        /* inf and nan serialize to invalid JSON ("inf"/"nan" via %g), which
+         * makes strict peers abort the whole response. The parser accepts
+         * overflowing literals like 1e999, so any arithmetic on them can
+         * reach this point. Emit null, JSON's canonical "no value". */
+        if (!isfinite(n)) { sb_puts(s, "null"); break; }
         char tmp[64];
         if (n == floor(n) && fabs(n) < 1e15) {
             snprintf(tmp, sizeof(tmp), "%lld", (long long)n);
@@ -501,7 +537,8 @@ static void sb_put_value(sbuf *s, const json_value *v) {
 char *json_serialize(const json_value *v) {
     sbuf s = {0};
     sb_put_value(&s, v);
-    if (!s.buf) { s.buf = (char *)malloc(1); s.cap = 1; }
-    s.buf[s.len] = '\0';
+    if (!s.buf) { s.buf = (char *)malloc(1); s.cap = 1; s.len = 0; }
+    if (!s.oom) s.buf[s.len] = '\0';
+    else if (s.cap > 0) s.buf[0] = '\0';   /* best-effort prefix, terminated */
     return s.buf;
 }
