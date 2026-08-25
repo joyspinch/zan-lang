@@ -44,6 +44,14 @@ class FwdChannel {
         if (this.tls != null) {
             return await this.tls.RecvAsync(max);
         }
+        // 空闲截止：对端迟迟不发数据时让出连接，而不是永久占用
+        // 协程 + 套接字（慢速客户端 / 卡死的上游正是这样拖死
+        // 转发器的——类文档一直声称有这个行为）。TLS 侧待运行时
+        // 提供带截止的解密接收后同样接入。
+        int idle = HttpForwarder.SharedIdleMs();
+        if (idle > 0) {
+            return await Socket.RecvAsync(this.sock, max, idle);
+        }
         return await Socket.RecvAsync(this.sock, max);
     }
 
@@ -400,10 +408,21 @@ class HttpForwarder {
 
     /// <summary>空闲超时（毫秒）：两个方向都这么久没有字节
     /// 才判定链路失效。流式响应之间的静默间隔可能很长，
-    /// 因此默认 5 分钟。</summary>
+    /// 因此默认 5 分钟。同时更新明文链路的接收截止——
+    /// 此前该值只作用于连接建立，注释承诺的空闲判定从未生效，
+    /// 慢速客户端/卡死上游会永久占用协程与套接字。</summary>
     HttpForwarder SetTimeout(int ms) {
         this.timeoutMs = ms;
+        HttpForwarder.idleMs = ms;
         return this;
+    }
+
+    /* FwdChannel 的明文接收截止（毫秒）；0 = 不设限。进程级配置：
+     * 一个转发器实例一份语义，通道构造时不再逐个传参。 */
+    static int idleMs = 300000;
+
+    static int SharedIdleMs() {
+        return HttpForwarder.idleMs;
     }
 
     /// <summary>单次搬运的块大小（字节）。</summary>

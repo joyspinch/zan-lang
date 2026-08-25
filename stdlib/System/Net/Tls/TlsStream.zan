@@ -411,6 +411,9 @@ class TlsContext {
 /// 刷回套接字。
 /// </summary>
 class TlsStream {
+    [DllImport("crt", EntryPoint = "zan_monotonic_us")]
+    static extern long MonotonicUs();
+
     [DllImport("ssl")]
     static extern string SSL_new(string ctx);
     [DllImport("ssl")]
@@ -700,13 +703,19 @@ class TlsStream {
         return -1;
     }
 
-    /// <summary>驱动 TLS 握手直至完成。成功返回 1。</summary>
+    /// <summary>驱动 TLS 握手直至完成。成功返回 1。
+    /// 整个握手有 30 秒硬截止：对端每 30 秒滴一字节的慢速攻击
+    /// 此前会无限循环 WANT_READ，钉死一个协程 + SSL + BIO + 17KB
+    /// 暂存缓冲——面向公网的服务器这样被逐个耗干。超时返回 -2，
+    /// 调用方照常关闭连接。</summary>
     async int HandshakeAsync() {
+        long deadlineUs = MonotonicUs() + 30000000;
         while (true) {
             int r = Norm(SSL_do_handshake(this.ssl));
             int flushed = await FlushOutAsync();
             if (flushed < 0) { return -1; }
             if (r == 1) { return 1; }
+            if (MonotonicUs() >= deadlineUs) { return -2; }
             int err = SSL_get_error(this.ssl, r);
             // 2 = SSL_ERROR_WANT_READ, 3 = SSL_ERROR_WANT_WRITE
             if (err == 2) {
