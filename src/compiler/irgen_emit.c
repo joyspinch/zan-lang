@@ -1078,7 +1078,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                     irgen_register_function(g, method_sym, efn, ft);
                 }
                 /* store lib name for linker */
-                if (member->method_decl.extern_lib.str && g->extern_lib_count < 64) {
+                if (member->method_decl.extern_lib.str) {
                     bool already = false;
                     for (int li = 0; li < g->extern_lib_count; li++) {
                         if (g->extern_libs[li].len == member->method_decl.extern_lib.len &&
@@ -1088,14 +1088,15 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                             break;
                         }
                     }
-                    if (!already) {
+                    if (!already &&
+                        ZAN_TAB_ENSURE(g->extern_libs, g->extern_lib_count,
+                                       g->extern_lib_cap, 16)) {
                         g->extern_libs[g->extern_lib_count++] = member->method_decl.extern_lib;
                     }
                 }
                 /* record (lib, fn) so an unresolvable lib can be stubbed when
                  * cross-linking a static Linux binary */
-                if (member->method_decl.extern_lib.str &&
-                    g->extern_fn_count < (int)(sizeof(g->extern_fns) / sizeof(g->extern_fns[0]))) {
+                if (member->method_decl.extern_lib.str) {
                     zan_istr_t sym = member->method_decl.entry_point.str
                         ? member->method_decl.entry_point
                         : member->method_decl.name;
@@ -1107,7 +1108,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                             break;
                         }
                     }
-                    if (!seen) {
+                    if (!seen &&
+                        ZAN_TAB_ENSURE(g->extern_fns, g->extern_fn_count,
+                                       g->extern_fn_cap, 128)) {
                         g->extern_fns[g->extern_fn_count].lib = member->method_decl.extern_lib;
                         g->extern_fns[g->extern_fn_count].name = sym;
                         g->extern_fn_count++;

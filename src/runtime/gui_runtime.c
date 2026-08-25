@@ -382,6 +382,79 @@ static inline int aa_coverage(double cov) {
     return (int)(cov * 255.0);
 }
 
+/* ---- Fault guard (see rt_crash.h) ---- */
+
+/* Run `fn(arg)` -- a Zan `static void f(nint)` handed over as a function
+ * pointer -- with a recovery point installed, and report whether it finished:
+ * 1 normally, 0 when a hard fault inside it was logged and abandoned. The GUI
+ * loop wraps one event dispatch and one frame in it, so a fault in event or
+ * paint code costs that event or frame instead of the whole program. */
+EXPORT i32 zan_gui_guard_call(iptr fn, iptr arg) {
+    void (*body)(void *) = (void (*)(void *))fn;
+    if (!body) return 1;
+#if defined(_WIN32)
+    return (i32)zan__guard_call(body, (void *)arg);
+#else
+    /* POSIX: a fatal signal is reported by rt_crash's handler and re-raised;
+     * there is no resume point to jump back to, so the call is plain. */
+    body((void *)arg);
+    return 1;
+#endif
+}
+
+#if defined(_WIN32)
+/* Guarded window procedure. The class is registered with this instead of the
+ * Zan procedure directly, and the fault taken by one message is recovered from
+ * *inside* the callback: DispatchMessageW then returns normally, having had a
+ * (default) reply to the message, and only that message is lost. Recovering
+ * one level further out -- around the message loop, as the loop's own guard
+ * does -- would instead jump over the middle of Win32's own dispatch, leaving
+ * the thread's message state half-finished; a window that stops responding is
+ * not a better outcome than one that loses a click. */
+typedef iptr (*zan_gui_wndproc_fn)(iptr hwnd, i32 msg, iptr wp, iptr lp);
+static zan_gui_wndproc_fn zan_gui_zan_wndproc;
+
+typedef struct {
+    HWND hwnd; UINT msg; WPARAM wp; LPARAM lp; iptr result;
+} zan_gui_wndproc_args;
+
+static void zan_gui_wndproc_body(void *p) {
+    zan_gui_wndproc_args *a = (zan_gui_wndproc_args *)p;
+    a->result = zan_gui_zan_wndproc((iptr)a->hwnd, (i32)a->msg,
+                                    (iptr)a->wp, (iptr)a->lp);
+}
+
+static LRESULT CALLBACK zan_gui_wndproc(HWND hwnd, UINT msg,
+                                        WPARAM wp, LPARAM lp) {
+    if (!zan_gui_zan_wndproc) return DefWindowProcW(hwnd, msg, wp, lp);
+    zan_gui_wndproc_args a;
+    a.hwnd = hwnd; a.msg = msg; a.wp = wp; a.lp = lp; a.result = 0;
+    if (!zan__guard_call(zan_gui_wndproc_body, &a))
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    return (LRESULT)a.result;
+}
+#endif
+
+/* Adopt `proc` (a Zan `static nint f(nint, int, nint, nint)`) as the window
+ * procedure and return the address to register in WNDCLASSEX instead. */
+EXPORT iptr zan_gui_guard_wndproc(iptr proc) {
+#if defined(_WIN32)
+    zan_gui_zan_wndproc = (zan_gui_wndproc_fn)proc;
+    return (iptr)(void *)&zan_gui_wndproc;
+#else
+    return proc;
+#endif
+}
+
+/* How many faults the guard has absorbed in this process. */
+EXPORT i32 zan_gui_guard_recovered(void) {
+#if defined(_WIN32)
+    return (i32)zan__guard_recovered_count();
+#else
+    return 0;
+#endif
+}
+
 /* ---- Exported rendering functions ---- */
 
 EXPORT i32 zan_gui_create_surface(i32 width, i32 height) {

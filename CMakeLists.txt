@@ -177,6 +177,7 @@ add_custom_command(
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c -o ${ZAN_RT_TIMER_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
     COMMENT "Building unified timer runtime object (zanrt_timer)"
     VERBATIM)
 add_custom_target(zanrt_timer ALL DEPENDS ${ZAN_RT_TIMER_OBJ})

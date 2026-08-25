@@ -53,6 +53,27 @@
 
 #include "../common/host_oom.h"
 
+/* Capacities of the link invocation the driver builds. Overflowing any of them
+ * used to drop the entry that did not fit -- a lost `-l`, a driver never
+ * linked, a `-L` the linker never sees -- and the build then failed with an
+ * unresolved symbol far from the cause. They are sized for real projects and
+ * every site reports instead of truncating (see link_cap_exceeded). */
+#define ZAN_LINK_MAX_ARGV        512
+#define ZAN_LINK_MAX_LIBS        128
+#define ZAN_LINK_MAX_DIRS         64
+#define ZAN_MAX_USED_DRIVERS      64
+#define ZAN_MAX_STATIC_DRV_LIBS  128
+/* Argv slots the tail of each link line still needs after the loops that fill
+ * it (terminator, --end-group, the final inputs). */
+#define ZAN_LINK_ARGV_TAIL        16
+
+static void link_cap_exceeded(const char *what, int cap) {
+    fprintf(stderr,
+            "zanc: too many %s for one link (limit %d) -- raise the matching"
+            " ZAN_LINK_MAX_* in src/compiler/main.c\n", what, cap);
+    exit(1);
+}
+
 /* ---- phase timing (--time) ---- */
 
 static bool g_time_phases = false;
@@ -393,6 +414,10 @@ static int auto_include_namespace(const char *stdlib_root, const char *subdir,
     char package_dirs[32][1024];
     int package_count = zan_pkg_find_namespace(package_project_root, subdir,
                                                    package_dirs, 32);
+    if (package_count >= 32)
+        fprintf(stderr, "warning: namespace '%s' is provided by 32 or more "
+                        "installed packages; only the first 32 are compiled\n",
+                subdir);
     for (int i = 0; i < package_count; i++) {
         int before = *count;
         glob_stdlib_dir(package_dirs[i], "", files, count, cap);
@@ -1697,8 +1722,8 @@ int main(int argc, char **argv) {
     bool lib_shared = false;        /* library is shared (.dll/.so/.dylib), not static */
     const char *extra_link_inputs[32]; int extra_link_input_count = 0;
     const char *embed_specs[64]; int embed_spec_count = 0;
-    const char *extra_link_libs[32];   int extra_link_lib_count = 0;
-    const char *extra_lib_paths[16];   int extra_lib_path_count = 0;
+    const char *extra_link_libs[ZAN_LINK_MAX_LIBS]; int extra_link_lib_count = 0;
+    const char *extra_lib_paths[ZAN_LINK_MAX_DIRS]; int extra_lib_path_count = 0;
     /* Resolved stdlib root, hoisted so the native-driver block (which lives
      * outside the stdlib-discovery scope) can root driver dirs at
      * <stdlib_root>/<module>/drivers/<target>/. Empty when no stdlib is used. */
@@ -1815,16 +1840,24 @@ int main(int argc, char **argv) {
             if (extra_link_input_count < 32) extra_link_inputs[extra_link_input_count++] = argv[++i];
             else { fprintf(stderr, "error: too many --link-input (max 32)\n"); return 1; }
         } else if (strcmp(argv[i], "--link-lib") == 0 && i + 1 < argc) {
-            if (extra_link_lib_count < 32) extra_link_libs[extra_link_lib_count++] = argv[++i];
-            else { fprintf(stderr, "error: too many --link-lib (max 32)\n"); return 1; }
+            if (extra_link_lib_count < ZAN_LINK_MAX_LIBS)
+                extra_link_libs[extra_link_lib_count++] = argv[++i];
+            else { fprintf(stderr, "error: too many --link-lib (max %d)\n",
+                           ZAN_LINK_MAX_LIBS); return 1; }
         } else if (strcmp(argv[i], "--libpath") == 0 && i + 1 < argc) {
-            if (extra_lib_path_count < 16) extra_lib_paths[extra_lib_path_count++] = argv[++i];
-            else { fprintf(stderr, "error: too many --libpath (max 16)\n"); return 1; }
+            if (extra_lib_path_count < ZAN_LINK_MAX_DIRS)
+                extra_lib_paths[extra_lib_path_count++] = argv[++i];
+            else { fprintf(stderr, "error: too many --libpath (max %d)\n",
+                           ZAN_LINK_MAX_DIRS); return 1; }
         } else if (strncmp(argv[i], "-L", 2) == 0 && argv[i][2] != '\0') {
-            if (extra_lib_path_count < 16) extra_lib_paths[extra_lib_path_count++] = argv[i] + 2;
-            else { fprintf(stderr, "error: too many -L dirs (max 16)\n"); return 1; }
+            if (extra_lib_path_count < ZAN_LINK_MAX_DIRS)
+                extra_lib_paths[extra_lib_path_count++] = argv[i] + 2;
+            else { fprintf(stderr, "error: too many -L dirs (max %d)\n",
+                           ZAN_LINK_MAX_DIRS); return 1; }
         } else if (strncmp(argv[i], "-D", 2) == 0 && argv[i][2] != '\0') {
             if (pp_define_count < 64) pp_defines[pp_define_count++] = argv[i] + 2;
+            else { fprintf(stderr, "error: too many -D defines (max 64)\n");
+                   return 1; }
         } else if (argv[i][0] != '-') {
             input_files_push(&input_files, &input_count, &input_cap, argv[i]);
         } else {
@@ -2400,7 +2433,7 @@ int main(int argc, char **argv) {
          * unixODBC's libodbc - a driver manager that cannot live inside a
          * static binary) has its extern functions stubbed out so the publish
          * still links, with the stubbed calls failing at runtime instead. */
-        char cross_archives[16][1200];
+        char cross_archives[ZAN_MAX_USED_DRIVERS][1200];
         int cross_archive_count = 0;
         if (cross_compiling && target.os == ZAN_OS_LINUX) {
             zan_driver_registry_t cross_reg;
@@ -2422,7 +2455,9 @@ int main(int argc, char **argv) {
                              cross_reg.entries[didx].module, dsub, nlen, nm);
                 }
                 if (archive[0] && zan_file_exists(archive)) {
-                    if (cross_archive_count < 16) {
+                    if (cross_archive_count >= ZAN_MAX_USED_DRIVERS)
+                        link_cap_exceeded("static driver archives", ZAN_MAX_USED_DRIVERS);
+                    {
                         snprintf(cross_archives[cross_archive_count],
                                  sizeof(cross_archives[0]), "%s", archive);
                         cross_archive_count++;
@@ -2454,7 +2489,7 @@ int main(int argc, char **argv) {
          * on the target Mac, which is what lets a Windows/Linux host cross-link
          * a GUI program without an Apple SDK. A lib with no bundled dylib has
          * its externs stubbed, exactly as on the Linux cross path. */
-        char cross_dylibs[16][1200];
+        char cross_dylibs[ZAN_MAX_USED_DRIVERS][1200];
         int cross_dylib_count = 0;
         if (cross_compiling && target.os == ZAN_OS_MACOS) {
             zan_driver_registry_t mac_reg;
@@ -2478,7 +2513,9 @@ int main(int argc, char **argv) {
                         driver_dir, nm, nlen, dylib, sizeof(dylib));
                 }
                 if (dylib[0]) {
-                    if (cross_dylib_count < 16) {
+                    if (cross_dylib_count >= ZAN_MAX_USED_DRIVERS)
+                        link_cap_exceeded("driver dylibs", ZAN_MAX_USED_DRIVERS);
+                    {
                         snprintf(cross_dylibs[cross_dylib_count],
                                  sizeof(cross_dylibs[0]), "%s", dylib);
                         cross_dylib_count++;
@@ -2532,17 +2569,19 @@ int main(int argc, char **argv) {
          * `--publish`. */
         zan_driver_registry_t driver_reg;
         zan_discover_drivers(resolved_stdlib_root, &driver_reg);
-        char driver_dirs[16][1024];
-        const char *used_drivers[16]; int used_driver_count = 0;
-        int used_driver_len[16];
-        const char *used_driver_module[16];
-        bool used_driver_runtime[16] = { false };  /* dlopen'd, not linked */
-        bool used_driver_static[16] = { false };
-        bool used_driver_embedded[16] = { false };  /* inside the executable */
-        char embedded_driver_file[16][128];
-        char static_driver_libs[64][128];
+        char driver_dirs[ZAN_MAX_USED_DRIVERS][1024];
+        const char *used_drivers[ZAN_MAX_USED_DRIVERS]; int used_driver_count = 0;
+        int used_driver_len[ZAN_MAX_USED_DRIVERS];
+        const char *used_driver_module[ZAN_MAX_USED_DRIVERS];
+        bool used_driver_runtime[ZAN_MAX_USED_DRIVERS] = { false };  /* dlopen'd, not linked */
+        bool used_driver_static[ZAN_MAX_USED_DRIVERS] = { false };
+        bool used_driver_embedded[ZAN_MAX_USED_DRIVERS] = { false };  /* inside the executable */
+        char embedded_driver_file[ZAN_MAX_USED_DRIVERS][128];
+        char static_driver_libs[ZAN_MAX_STATIC_DRV_LIBS][128];
         int static_driver_lib_count = 0;
-        for (int li = 0; li < irgen.extern_lib_count && used_driver_count < 16; li++) {
+        for (int li = 0; li < irgen.extern_lib_count; li++) {
+            if (used_driver_count >= ZAN_MAX_USED_DRIVERS)
+                link_cap_exceeded("native drivers", ZAN_MAX_USED_DRIVERS);
             int nlen;
             const char *nm = zan_dllimport_lname(
                 irgen.extern_libs[li].str, (int)irgen.extern_libs[li].len, &nlen);
@@ -2558,7 +2597,9 @@ int main(int argc, char **argv) {
         /* Run-time loaded drivers (declared "<lib> if <prefix>") are never in
          * extern_libs, since the module dlopens them; they are used when the
          * image actually contains the module's code. */
-        for (int di = 0; di < driver_reg.count && used_driver_count < 16; di++) {
+        for (int di = 0; di < driver_reg.count; di++) {
+            if (used_driver_count >= ZAN_MAX_USED_DRIVERS)
+                link_cap_exceeded("native drivers", ZAN_MAX_USED_DRIVERS);
             const char *sym = driver_reg.entries[di].sym;
             if (!sym[0]) continue;
             if (!zan_irgen_defines_prefix(&irgen, sym)) continue;
@@ -2606,7 +2647,10 @@ int main(int argc, char **argv) {
         if (target.os == ZAN_OS_WINDOWS && link_static_drivers) {
             for (int d = 0; d < used_driver_count; d++) {
                 if (!used_driver_runtime[d] || !driver_dirs[d][0]) continue;
-                if (embed_driver_spec_count >= 8 || embed_spec_count >= 64) break;
+                if (embed_driver_spec_count >= 8)
+                    link_cap_exceeded("embedded driver DLLs", 8);
+                if (embed_spec_count >= 64)
+                    link_cap_exceeded("--embed resources", 64);
                 char drv[64];
                 snprintf(drv, sizeof(drv), "%.*s", used_driver_len[d],
                          used_drivers[d]);
@@ -2692,6 +2736,8 @@ int main(int argc, char **argv) {
                 icon_obj[0] = '\0';
             } else if (extra_link_input_count < 32) {
                 extra_link_inputs[extra_link_input_count++] = icon_obj;
+            } else {
+                link_cap_exceeded("link inputs", 32);
             }
         }
 
@@ -2874,7 +2920,7 @@ int main(int argc, char **argv) {
          * $ZAN_LIB_PATH env var (platform PATH separator). This lets a Zan
          * program link against a library that is not on the default system
          * search path - e.g. a freshly built zan_gui in the CMake build dir. */
-        char zan_lib_dirs[16][512]; int zan_lib_ndirs = 0;
+        char zan_lib_dirs[ZAN_LINK_MAX_DIRS][512]; int zan_lib_ndirs = 0;
         {
             const char *lp = getenv("ZAN_LIB_PATH");
             if (lp && *lp) {
@@ -2884,7 +2930,7 @@ int main(int argc, char **argv) {
                 const char sep = ':';
 #endif
                 const char *p = lp;
-                while (*p && zan_lib_ndirs < 16) {
+                while (*p && zan_lib_ndirs < ZAN_LINK_MAX_DIRS) {
                     const char *e = strchr(p, sep);
                     size_t n = e ? (size_t)(e - p) : strlen(p);
                     if (n > 0 && n < sizeof(zan_lib_dirs[0])) {
@@ -2969,12 +3015,13 @@ int main(int argc, char **argv) {
                 snprintf(libs_manifest, sizeof(libs_manifest),
                          "%s/static/%.*s.libs", driver_dirs[d],
                          used_driver_len[d], used_drivers[d]);
-                if (static_driver_lib_count < 64) {
-                    static_driver_lib_count += zan_read_static_libs(
-                        libs_manifest,
-                        &static_driver_libs[static_driver_lib_count],
-                        64 - static_driver_lib_count);
-                }
+                if (static_driver_lib_count >= ZAN_MAX_STATIC_DRV_LIBS)
+                    link_cap_exceeded("static driver libraries",
+                                      ZAN_MAX_STATIC_DRV_LIBS);
+                static_driver_lib_count += zan_read_static_libs(
+                    libs_manifest,
+                    &static_driver_libs[static_driver_lib_count],
+                    ZAN_MAX_STATIC_DRV_LIBS - static_driver_lib_count);
             } else {
                 if (want_static) {
                     fprintf(stderr,
@@ -2986,7 +3033,7 @@ int main(int argc, char **argv) {
                 }
                 snprintf(linkdir, sizeof(linkdir), "%s", driver_dirs[d]);
             }
-            if (zan_lib_ndirs < 16 && strlen(linkdir) < sizeof(zan_lib_dirs[0])) {
+            if (zan_lib_ndirs < ZAN_LINK_MAX_DIRS && strlen(linkdir) < sizeof(zan_lib_dirs[0])) {
                 /* Prepend, not append: a bundled driver must take link-search
                  * precedence over the auto-added Homebrew/system fallback dirs.
                  * Otherwise a keg-only Homebrew libpq is linked in place of the
@@ -3006,7 +3053,7 @@ int main(int argc, char **argv) {
             if (added_shared && !link_static_drivers) {
                 char statdir[1100];
                 snprintf(statdir, sizeof(statdir), "%s/static", driver_dirs[d]);
-                if (zan_lib_ndirs < 16 && zan_file_exists(statdir) &&
+                if (zan_lib_ndirs < ZAN_LINK_MAX_DIRS && zan_file_exists(statdir) &&
                     strlen(statdir) < sizeof(zan_lib_dirs[0])) {
                     memmove(&zan_lib_dirs[2], &zan_lib_dirs[1],
                             (size_t)(zan_lib_ndirs - 1) * sizeof(zan_lib_dirs[0]));
@@ -3208,7 +3255,7 @@ int main(int argc, char **argv) {
                         /* no bundled ld: fall back to ld.lld from PATH */
                         dll_ld = "ld.lld";
                     }
-                    const char *argv[160];
+                    const char *argv[ZAN_LINK_MAX_ARGV];
                     int a = 0;
                     argv[a++] = dll_ld;
                     argv[a++] = "-m";
@@ -3234,23 +3281,23 @@ int main(int argc, char **argv) {
                     argv[a++] = "-o";
                     argv[a++] = obj_path;
                     argv[a++] = obj_tmp;
-                    if (zan_file_exists(dllcrt2) && a < 120)
+                    if (zan_file_exists(dllcrt2))
                         argv[a++] = dllcrt2;
                     /* runtime objects the library actually uses (IO reactor,
                      * sync runtime, embed API, unified timer); host objects ==
                      * target here, and they must precede the -l libs
                      * (single-pass ld) */
-                    if (rt_io_obj && a < 120) argv[a++] = rt_io_obj;
-                    if (rt_sync_obj && a < 120) argv[a++] = rt_sync_obj;
-                    if (rt_file_obj && a < 120) argv[a++] = rt_file_obj;
-                    if (rt_embed_obj && a < 120) argv[a++] = rt_embed_obj;
-                    if (rt_timer_obj && a < 120) argv[a++] = rt_timer_obj;
+                    if (rt_io_obj) argv[a++] = rt_io_obj;
+                    if (rt_sync_obj) argv[a++] = rt_sync_obj;
+                    if (rt_file_obj) argv[a++] = rt_file_obj;
+                    if (rt_embed_obj) argv[a++] = rt_embed_obj;
+                    if (rt_timer_obj) argv[a++] = rt_timer_obj;
                     /* Also emit an import library (see implib naming note
                      * above) so a consumer can link with just `-L <dir>` +
                      * [DllImport("foo.dll")]. */
                     argv[a++] = "-out-implib";
                     argv[a++] = implib;
-                    char ldirbufs[20][520]; int nld = 0;
+                    char ldirbufs[ZAN_LINK_MAX_DIRS * 2 + 4][520]; int nld = 0;
                     if (dll_exe_dir[0] &&
                         zan_file_exists(dll_exe_dir + 0) /* always true */) {
                         /* bundled mingw runtime: must be on the search path
@@ -3258,20 +3305,24 @@ int main(int argc, char **argv) {
                         char mlib[1300];
                         snprintf(mlib, sizeof(mlib), "%s\\mingw\\lib",
                                  dll_exe_dir);
-                        if (zan_file_exists(mlib) && nld < 20 && a < 120) {
+                        if (zan_file_exists(mlib)) {
                             snprintf(ldirbufs[nld], sizeof(ldirbufs[0]),
                                      "-L%s", mlib);
                             argv[a++] = ldirbufs[nld++];
                         }
                     }
-                    for (int di = 0; di < zan_lib_ndirs && nld < 20 && a < 120;
-                         di++) {
+                    for (int di = 0; di < zan_lib_ndirs; di++) {
+                        if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
+                            link_cap_exceeded("linker arguments",
+                                              ZAN_LINK_MAX_ARGV);
                         snprintf(ldirbufs[nld], sizeof(ldirbufs[0]),
                                  "-L%s", zan_lib_dirs[di]);
                         argv[a++] = ldirbufs[nld++];
                     }
-                    for (int di = 0; di < extra_lib_path_count && nld < 20 &&
-                         a < 120; di++) {
+                    for (int di = 0; di < extra_lib_path_count; di++) {
+                        if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
+                            link_cap_exceeded("linker arguments",
+                                              ZAN_LINK_MAX_ARGV);
                         snprintf(ldirbufs[nld], sizeof(ldirbufs[0]),
                                  "-L%s", extra_lib_paths[di]);
                         argv[a++] = ldirbufs[nld++];
@@ -3291,15 +3342,21 @@ int main(int argc, char **argv) {
                      * is not part of the toolchain. */
                     static const char *const dllcrt[] = {
                         "-lmingw32", "-lgcc", "-lmoldname", "-lmingwex",
-                        "-lmsvcrt", "-lkernel32", "-l:libwinpthread.a", NULL };
-                    for (int li = 0; dllcrt[li] && a < 150; li++)
+                        "-lmsvcrt", "-lkernel32", "-lshell32",
+                        "-l:libwinpthread.a", NULL };
+                    for (int li = 0; dllcrt[li]; li++) {
+                        if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
+                            link_cap_exceeded("linker arguments", ZAN_LINK_MAX_ARGV);
                         argv[a++] = dllcrt[li];
+                    }
                     /* the IO reactor uses Winsock */
-                    if (rt_io_obj && a < 150) argv[a++] = "-lws2_32";
+                    if (rt_io_obj) argv[a++] = "-lws2_32";
                     /* extern [DllImport] libraries */
-                    char libbufs[24][128]; int nb = 0;
-                    for (int li = 0; li < irgen.extern_lib_count && nb < 24
-                         && a < 150; li++) {
+                    char libbufs[ZAN_LINK_MAX_LIBS][128]; int nb = 0;
+                    for (int li = 0; li < irgen.extern_lib_count; li++) {
+                        if (nb >= ZAN_LINK_MAX_LIBS ||
+                            a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
+                            link_cap_exceeded("DllImport libraries", ZAN_LINK_MAX_LIBS);
                         int nlen;
                         const char *nm = zan_dllimport_lname(
                             irgen.extern_libs[li].str,
@@ -3309,8 +3366,11 @@ int main(int argc, char **argv) {
                                  "-l%.*s", nlen, nm);
                         argv[a++] = libbufs[nb++];
                     }
-                    for (int li = 0; li < static_driver_lib_count && a < 150; li++)
+                    for (int li = 0; li < static_driver_lib_count; li++) {
+                        if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
+                            link_cap_exceeded("linker arguments", ZAN_LINK_MAX_ARGV);
                         argv[a++] = static_driver_libs[li];
+                    }
                     argv[a++] = "--end-group";
                     argv[a] = NULL;
                     if (getenv("ZAN_VERBOSE_LINK")) {
@@ -3334,7 +3394,7 @@ int main(int argc, char **argv) {
                     { size_t cur = strlen(cmd);
                       snprintf(cmd + cur, sizeof(cmd) - cur,
                                " -lmingw32 -lmoldname -lmingwex -lmsvcrt"
-                               " -lkernel32"); }
+                               " -lkernel32 -lshell32"); }
                     for (int di = 0; di < zan_lib_ndirs; di++) {
                         size_t cur = strlen(cmd);
                         snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
@@ -3991,7 +4051,7 @@ int main(int argc, char **argv) {
             /* Invoke the bundled GNU ld (mingw binutils) directly. The system
              * import/static libs have circular references, so wrap them in
              * --start-group/--end-group for ld's single-pass resolver. */
-            const char *argv[160];
+            const char *argv[ZAN_LINK_MAX_ARGV];
             int a = 0;
             argv[a++] = ld_path;
             argv[a++] = "-m";      argv[a++] = "i386pep";
@@ -4006,18 +4066,22 @@ int main(int argc, char **argv) {
             argv[a++] = "-o";      argv[a++] = obj_path;
             argv[a++] = crt2;
             argv[a++] = crtbeg;
-            char ldirbufs[16][520];
+            char ldirbufs[ZAN_LINK_MAX_DIRS][520];
             /* Search bundled driver directories before the bundled MinGW
              * sysroot so a driver-provided import library cannot be shadowed
              * by a same-named host/runtime library. */
-            for (int di = 0; di < zan_lib_ndirs && a < 120; di++) {
+            for (int di = 0; di < zan_lib_ndirs; di++) {
+                if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
+                    link_cap_exceeded("linker arguments", ZAN_LINK_MAX_ARGV);
                 snprintf(ldirbufs[di], sizeof(ldirbufs[di]), "-L%s", zan_lib_dirs[di]);
                 argv[a++] = ldirbufs[di];
             }
             argv[a++] = lflag;
             /* caller-supplied library search dirs (-L / --libpath) */
-            char elpbufs[16][520];
-            for (int di = 0; di < extra_lib_path_count && a < 120; di++) {
+            char elpbufs[ZAN_LINK_MAX_DIRS][520];
+            for (int di = 0; di < extra_lib_path_count; di++) {
+                if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
+                    link_cap_exceeded("linker arguments", ZAN_LINK_MAX_ARGV);
                 snprintf(elpbufs[di], sizeof(elpbufs[di]), "-L%s", extra_lib_paths[di]);
                 argv[a++] = elpbufs[di];
             }
@@ -4027,19 +4091,24 @@ int main(int argc, char **argv) {
             if (rt_file_obj) argv[a++] = rt_file_obj;
             if (rt_embed_obj) argv[a++] = rt_embed_obj;
             if (rt_timer_obj) argv[a++] = rt_timer_obj;
-            if (rt_mem_obj && a < 118) {
+            if (rt_mem_obj) {
                 argv[a++] = rt_mem_obj;
                 argv[a++] = "--wrap=malloc";  argv[a++] = "--wrap=free";
                 argv[a++] = "--wrap=calloc"; argv[a++] = "--wrap=realloc";
             }
             /* caller-supplied objects/resources (--link-input) */
-            for (int ei = 0; ei < extra_link_input_count && a < 130; ei++)
+            for (int ei = 0; ei < extra_link_input_count; ei++) {
+                if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
+                    link_cap_exceeded("linker arguments", ZAN_LINK_MAX_ARGV);
                 argv[a++] = extra_link_inputs[ei];
+            }
             argv[a++] = "--start-group";
             /* caller-supplied libraries (--link-lib), inside the group so they
              * can resolve against and be resolved by the system libs. */
-            char elibbufs[32][160]; int neb = 0;
-            for (int ei = 0; ei < extra_link_lib_count && a < 140 && neb < 32; ei++) {
+            char elibbufs[ZAN_LINK_MAX_LIBS][160]; int neb = 0;
+            for (int ei = 0; ei < extra_link_lib_count; ei++) {
+                if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL || neb >= ZAN_LINK_MAX_LIBS)
+                    link_cap_exceeded("linker arguments", ZAN_LINK_MAX_ARGV);
                 snprintf(elibbufs[neb], sizeof(elibbufs[neb]), "-l%s", extra_link_libs[ei]);
                 argv[a++] = elibbufs[neb++];
             }
@@ -4050,8 +4119,11 @@ int main(int argc, char **argv) {
             argv[a++] = "-luser32";   argv[a++] = "-l:libwinpthread.a";
             if (rt_io_obj) argv[a++] = "-lws2_32";
             /* extern [DllImport] libraries (skip those already in the CRT) */
-            char libbufs[24][128]; int nb = 0;
-            for (int li = 0; li < irgen.extern_lib_count && a < 150 && nb < 24; li++) {
+            char libbufs[ZAN_LINK_MAX_LIBS][128]; int nb = 0;
+            for (int li = 0; li < irgen.extern_lib_count; li++) {
+                if (nb >= ZAN_LINK_MAX_LIBS ||
+                    a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
+                    link_cap_exceeded("DllImport libraries", ZAN_LINK_MAX_LIBS);
                 int nlen;
                 const char *nm = zan_dllimport_lname(
                     irgen.extern_libs[li].str,
@@ -4060,8 +4132,11 @@ int main(int argc, char **argv) {
                 snprintf(libbufs[nb], sizeof(libbufs[nb]), "-l%.*s", nlen, nm);
                 argv[a++] = libbufs[nb++];
             }
-            for (int li = 0; li < static_driver_lib_count && a < 150; li++)
+            for (int li = 0; li < static_driver_lib_count; li++) {
+                if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
+                    link_cap_exceeded("linker arguments", ZAN_LINK_MAX_ARGV);
                 argv[a++] = static_driver_libs[li];
+            }
             argv[a++] = "--end-group";
             argv[a++] = crtend;
             argv[a] = NULL;
@@ -4333,16 +4408,23 @@ int main(int argc, char **argv) {
                 snprintf(drv, sizeof(drv), "%.*s",
                          used_driver_len[d], used_drivers[d]);
 
-                /* candidate runtime file names for this driver. The cap must
-                 * cover a driver's whole dependency closure (e.g. libpq ships
-                 * libpq + its OpenSSL and Kerberos dylibs -> 8 files). */
+                /* candidate runtime file names for this driver: one entry per
+                 * file in its dependency closure (e.g. libpq ships libpq plus
+                 * its OpenSSL and Kerberos dylibs -> 8 files). Dropping the
+                 * tail used to ship an incomplete bundle that only failed
+                 * once the program loaded the driver. */
                 char cands[64][128]; int ncand = 0;
                 char manifest[1200];
                 snprintf(manifest, sizeof(manifest), "%s/%s.bundle", driver_dir, drv);
                 FILE *mf = fopen(manifest, "rb");
                 if (mf) {
                     char line[128];
-                    while (ncand < 64 && fgets(line, sizeof(line), mf)) {
+                    while (fgets(line, sizeof(line), mf)) {
+                        if (ncand >= 64) {
+                            fclose(mf);
+                            link_cap_exceeded("files in a driver bundle "
+                                              "manifest", 64);
+                        }
                         size_t l = strlen(line);
                         while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r'
                                          || line[l-1] == ' ' || line[l-1] == '\t'))

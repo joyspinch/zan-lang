@@ -26,6 +26,23 @@ class Window {
     [DllImport("kernel32")]
     static extern int GetTickCount();
 
+    /// 故障护栏：把一段工作（一次事件分发、一帧绘制）交给运行时执行，
+    /// 期间发生硬故障（空指针访问、越界读写、除零、生成代码的运行时
+    /// 检查失败）时记录一条崩溃记录并放弃这段工作，而不是让整个进程
+    /// 消失。参数是函数指针（Zan 的 `static void f(nint)`）与它的实参。
+    [DllImport("zan_gui")]
+    static extern int zan_gui_guard_call(nint fn, nint arg);
+
+    /// 把窗口过程交给护栏包一层：返回应当注册进 WNDCLASSEX 的地址，
+    /// 某条消息处理中发生硬故障时在回调内部恢复（丢掉这条消息、按默认
+    /// 处理返回），而不是跨过 DispatchMessageW 往外跳。
+    [DllImport("zan_gui")]
+    static extern nint zan_gui_guard_wndproc(nint proc);
+
+    /// 本次运行被护栏吞掉的硬故障次数。
+    [DllImport("zan_gui")]
+    static extern int zan_gui_guard_recovered();
+
     #if !WINDOWS
     [DllImport("zan_gui")]
     static extern nint zan_gui_create_window(string title, int width, int height);
@@ -449,6 +466,29 @@ class Window {
         #else
         zan_gui_set_cursor(cursorType);
         #endif
+    }
+
+    /// <summary>在故障护栏下执行 `fn(arg)`：正常跑完返回 true；
+    /// 期间的硬故障（越界、空指针、除零……）已记入
+    /// &lt;exe 目录&gt;\zan_crash.log 并放弃这段工作时返回 false，
+    /// 进程继续运行。`fn` 必须是 `static void f(nint)` 的函数指针。
+    /// </summary>
+    static bool GuardCall(nint fn, nint arg) {
+        return Window.zan_gui_guard_call(fn, arg) != 0;
+    }
+
+    /// <summary>
+    /// 用护栏包住窗口过程 `proc`（`static nint f(nint, int, nint, nint)`），
+    /// 返回改为注册的地址。一条消息内的硬故障在回调内部就地恢复，只丢这
+    /// 一条消息；窗口消息状态由 Win32 正常收尾，不会卡住消息循环。
+    /// </summary>
+    static nint GuardWndProc(nint proc) {
+        return Window.zan_gui_guard_wndproc(proc);
+    }
+
+    /// <summary>本次运行被护栏吞掉的硬故障次数。</summary>
+    static int GuardRecovered() {
+        return Window.zan_gui_guard_recovered();
     }
 
     static int RawTickMs() {

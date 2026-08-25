@@ -2172,16 +2172,68 @@ class App {
         Show();
         if (frameBody == null) { this.SetFrameBody(body); }
         while (isRunning) {
-            if (!this.PumpSafe()) { break; }
+            if (!this.PumpGuarded()) { break; }
             if (!needsRedraw) { continue; }
             // 最小化（或整窗被遮住）时不画：这时候客户区是 0×0，
             // 所有停靠都被压成零宽，而按宽度换行的内容（聊天记录、
             // 表格）会按最小宽度把整份内容重排一遍，而且没一个像素
             // 给人看。needsRedraw 留着，恢复时那一帧照旧尺寸重新画。
             if (!window.IsVisible()) { continue; }
-            this.SafeFrame(body);
+            this.FrameGuarded(body);
         }
     }
+
+    // 护栏调用的目标只能是静态函数指针（原生侧拿不到实例），因此
+    // 这一圈要处理的 App/帧体先放到这里，再由 GuardBody 取回。
+    static App guardApp;
+    static FrameBody guardBody;
+    // 0 = 事件分发（PumpSafe），1 = 画一帧（SafeFrame）。
+    static int guardWhat;
+    static bool guardPumpAlive;
+
+    static void GuardBody(nint arg) {
+        App a = App.guardApp;
+        if (a == null) { return; }
+        if (App.guardWhat == 0) { App.guardPumpAlive = a.PumpSafe(); }
+        else { a.SafeFrame(App.guardBody); }
+    }
+
+    /// <summary>PumpSafe 再加一层原生故障护栏：Zan 异常由 PumpSafe
+    /// 捕获，而硬故障（越界、空指针、除零，以及生成代码里失败的
+    /// 运行时检查）由护栏记录后丢掉这一次事件——两者都不再让
+    /// 进程消失。</summary>
+    bool PumpGuarded() {
+        App.guardApp = this;
+        App.guardWhat = 0;
+        App.guardPumpAlive = isRunning;
+        if (!Window.GuardCall((nint)App.GuardBody, 0)) {
+            // 这次事件在原生层崩了：记录（zan_crash.log 里已有带
+            // 回溯的记录）、重画一帧，然后继续泵下一个事件。
+            this.NoteFrameError("event", "native fault recovered");
+            this.RequestRedraw();
+            return isRunning;
+        }
+        return App.guardPumpAlive;
+    }
+
+    /// <summary>SafeFrame 再加一层原生故障护栏：这一帧里的硬故障
+    /// 只丢掉这一帧。</summary>
+    bool FrameGuarded(FrameBody body) {
+        App.guardApp = this;
+        App.guardWhat = 1;
+        App.guardBody = body;
+        if (!Window.GuardCall((nint)App.GuardBody, 0)) {
+            this.NoteFrameError("frame", "native fault recovered");
+            // 这一帧半途而废：脏区裁剪已经不可信，下一帧整窗重画。
+            this.CancelPartialFrame();
+            this.RequestRedraw();
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>本次运行被原生护栏吞掉的硬故障次数。</summary>
+    static int NativeFaultCount() { return Window.GuardRecovered(); }
 
     /// <summary>ProcessEvent 的受保护版本：事件处理（回调、
     /// 命令、绑定）里抛出的异常不再终止进程。

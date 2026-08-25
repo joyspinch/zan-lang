@@ -20,6 +20,18 @@
 #include <string.h>
 #include "../common/host_oom.h"
 
+/* Persistent crash logging. This object is linked into every program zanc
+ * builds (its coroutine driver calls zan_timer_*, see src/compiler/main.c), so
+ * including the logger here is what gives a plain console or GUI program the
+ * same crash record the async reactor and the GUI runtime already installed --
+ * before this, a program that used neither died without a trace. Every symbol
+ * in the header is static and installation is idempotent, so the runtimes that
+ * also include it stay correct. The wasm sysroot has no signals or process
+ * paths, so it keeps the previous behaviour. */
+#if !defined(__wasm__)
+#include "rt_crash.h"
+#endif
+
 #if defined(_WIN32)
 #include <windows.h>
 #include <shellapi.h>

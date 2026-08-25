@@ -5,6 +5,9 @@
 >
 > 所有文档同时提供 HTML（给人浏览）与 Markdown（给 AI，无标签噪音，推荐抓
 > 取 `.md` 版本）。
+>
+> 想把 AI 编码工具接到本机 SDK（`AGENTS.md` + skills + MCP 配置，一条命令、
+> 可离线）？看 **[`/ai-connect`](/ai-connect)**——那是 `tools\ai_pack\` 的网站镜像。
 
 ## 文档结构
 

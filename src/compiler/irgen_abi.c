@@ -36,8 +36,6 @@ typedef struct {
     unsigned stack_align;  /* AArch64 HFA arguments carry alignstack(8) */
 } abi_slot_t;
 
-#define ABI_MAX_PARAMS 32
-
 static abi_target_t abi_target_of(zan_irgen_t *g) {
     const char *t = g->target_triple;
     if (t && t[0]) {
@@ -379,14 +377,19 @@ static LLVMValueRef abi_byte_ptr(zan_irgen_t *g, LLVMValueRef base,
 static LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
                                      LLVMTypeRef zan_ft) {
     unsigned pc = LLVMCountParamTypes(zan_ft);
-    if (pc > ABI_MAX_PARAMS) return NULL;
-    LLVMTypeRef zan_params[ABI_MAX_PARAMS];
+    /* Sized by the actual parameter count: a fixed cap here used to bail out
+     * for wide signatures, and the caller then declared the extern with the
+     * Zan-level signature -- passing structs by the wrong ABI instead of
+     * reporting anything. */
+    LLVMTypeRef *zan_params =
+        (LLVMTypeRef *)calloc(pc ? pc : 1, sizeof(LLVMTypeRef));
+    if (!zan_params) return NULL;
     LLVMGetParamTypes(zan_ft, zan_params);
     LLVMTypeRef zan_ret = LLVMGetReturnType(zan_ft);
 
     bool any = abi_is_aggregate(zan_ret);
     for (unsigned i = 0; i < pc && !any; i++) any = abi_is_aggregate(zan_params[i]);
-    if (!any) return NULL;
+    if (!any) { free(zan_params); return NULL; }
 
     abi_target_t tgt = abi_target_of(g);
     if (tgt == ABI_TARGET_UNSUPPORTED) {
@@ -394,17 +397,26 @@ static LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
                       "extern '%s' passes a struct by value, which has no C ABI "
                       "classification for target '%s'", name,
                       g->target_triple[0] ? g->target_triple : "host");
+        free(zan_params);
         return NULL;
     }
 
     abi_slot_t ret_slot;
-    abi_slot_t arg_slots[ABI_MAX_PARAMS];
+    abi_slot_t *arg_slots =
+        (abi_slot_t *)calloc(pc ? pc : 1, sizeof(abi_slot_t));
+    LLVMTypeRef *c_params =
+        (LLVMTypeRef *)calloc((size_t)pc * 2 + 1, sizeof(LLVMTypeRef));
+    LLVMValueRef *c_args =
+        (LLVMValueRef *)calloc((size_t)pc * 2 + 1, sizeof(LLVMValueRef));
+    if (!arg_slots || !c_params || !c_args) {
+        free(arg_slots); free(c_params); free(c_args); free(zan_params);
+        return NULL;
+    }
     abi_classify(g, tgt, zan_ret, true, &ret_slot);
     for (unsigned i = 0; i < pc; i++)
         abi_classify(g, tgt, zan_params[i], false, &arg_slots[i]);
 
     /* --- the real C signature --- */
-    LLVMTypeRef c_params[ABI_MAX_PARAMS * 2 + 1];
     unsigned cn = 0;
     bool sret = (ret_slot.kind == ABI_SLOT_SRET);
     LLVMTypeRef ptr_ty = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -464,7 +476,10 @@ static LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
     char tname[320];
     snprintf(tname, sizeof(tname), "zan.abi.%s", name);
     LLVMValueRef thunk = LLVMGetNamedFunction(g->mod, tname);
-    if (thunk) return thunk;
+    if (thunk) {
+        free(arg_slots); free(c_params); free(c_args); free(zan_params);
+        return thunk;
+    }
     thunk = LLVMAddFunction(g->mod, tname, zan_ft);
     LLVMSetLinkage(thunk, LLVMInternalLinkage);
 
@@ -472,7 +487,6 @@ static LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, thunk, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
 
-    LLVMValueRef c_args[ABI_MAX_PARAMS * 2 + 1];
     unsigned an = 0;
     LLVMValueRef ret_tmp = NULL;
     if (sret) {
@@ -548,5 +562,6 @@ static LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
     }
 
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    free(arg_slots); free(c_params); free(c_args); free(zan_params);
     return thunk;
 }

@@ -1571,7 +1571,7 @@ static void get_binding_accessors(zan_irgen_t *g, zan_symbol_t *cls,
     g->current_fn = saved_fn;
     if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
 
-    if (g->bind_acc_count < 512) {
+    if (ZAN_TAB_ENSURE(g->bind_accs, g->bind_acc_count, g->bind_acc_cap, 128)) {
         g->bind_accs[g->bind_acc_count].cls = cls;
         g->bind_accs[g->bind_acc_count].field = fs;
         g->bind_accs[g->bind_acc_count].get_fn = get_fn;
@@ -2668,9 +2668,13 @@ binding_lowered:
                             expr->binary.left->index.index, expr->binary.right, locals);
                     } else if (at->kind == TYPE_STRING) {
                         LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
-                        emit_index_bounds_check(g, idx,
-                            emit_string_buffer_len(g, arr_ptr), expr->loc,
-                            "string");
+                        /* A string field may hold a raw FFI buffer, whose
+                         * first NUL says nothing about its capacity; only a
+                         * literal/local receiver carries a reliable bound. */
+                        if (expr_has_reliable_string_bounds(arr_expr, locals))
+                            emit_index_bounds_check(g, idx,
+                                emit_string_buffer_len(g, arr_ptr), expr->loc,
+                                "string");
                         LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i8, arr_ptr, &idx, 1, "eidx");
                         LLVMValueRef val8 = LLVMBuildTrunc(g->builder, right, i8, "byte");
                         zan_store_fit(g, val8, elem_ptr);
@@ -7308,8 +7312,6 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
  * them from that record. Capture is by value, so a later write to the
  * enclosing local is not observed by the lambda -- and, symmetrically, the
  * lambda cannot dangle once the enclosing frame is gone. */
-#define ZAN_MAX_CAPTURES 32
-
 typedef struct {
     zan_istr_t   name;   /* captured local's name; empty for the receiver */
     LLVMValueRef slot;   /* the enclosing alloca, NULL for the receiver;
@@ -7325,11 +7327,15 @@ typedef struct {
 typedef struct {
     zan_irgen_t     *g;
     local_scope_t   *outer;
-    lambda_capture_t caps[ZAN_MAX_CAPTURES];
+    /* Grown on demand: a fixed cap here rejected the whole lambda once a body
+     * mentioned more than a handful of enclosing locals. */
+    lambda_capture_t *caps;
     int              count;
+    int              cap;
     int              needs_this;
-    zan_istr_t       shadow[ZAN_MAX_CAPTURES * 4];
+    zan_istr_t      *shadow;
     int              shadow_count;
+    int              shadow_cap;
     int              overflow;
     /* write scan (A33-2b): instead of collecting captures, report whether a
      * lambda somewhere below assigns to `want_write`. */
@@ -7347,11 +7353,20 @@ static void cap_shadow(capture_scan_t *cs, zan_istr_t name) {
     if (!name.len) return;
     for (int i = 0; i < cs->shadow_count; i++)
         if (istr_eq_c(cs->shadow[i], name)) return;
-    if (cs->shadow_count >= (int)(sizeof(cs->shadow) / sizeof(cs->shadow[0]))) {
+    if (!ZAN_TAB_ENSURE(cs->shadow, cs->shadow_count, cs->shadow_cap, 64)) {
         cs->overflow = 1;
         return;
     }
     cs->shadow[cs->shadow_count++] = name;
+}
+
+static void cap_scan_free(capture_scan_t *cs) {
+    free(cs->caps);
+    cs->caps = NULL;
+    cs->count = cs->cap = 0;
+    free(cs->shadow);
+    cs->shadow = NULL;
+    cs->shadow_count = cs->shadow_cap = 0;
 }
 
 static int cap_is_shadowed(capture_scan_t *cs, zan_istr_t name) {
@@ -7387,7 +7402,10 @@ static void cap_use(capture_scan_t *cs, zan_istr_t name) {
         if (name_is_instance_member(cs->g, name)) cs->needs_this = 1;
         return;
     }
-    if (cs->count >= ZAN_MAX_CAPTURES) { cs->overflow = 1; return; }
+    if (!ZAN_TAB_ENSURE(cs->caps, cs->count, cs->cap, 16)) {
+        cs->overflow = 1;
+        return;
+    }
     lambda_capture_t *c = &cs->caps[cs->count++];
     c->name = name;
     c->type = lv->type;
@@ -7700,7 +7718,9 @@ static int local_is_lambda_written(zan_irgen_t *g, local_scope_t *locals,
     cs.outer = locals;
     cs.want_write = name;
     cap_scan(&cs, g->current_fn_body);
-    return cs.found_write;
+    int found = cs.found_write;
+    cap_scan_free(&cs);
+    return found;
 }
 
 /* Allocate the cell for a boxed local and return it; `init` (may be null) is
@@ -7862,7 +7882,7 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     if (cs.needs_this && !g->current_this) cs.needs_this = 0;
     if (cs.overflow) {
         zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
-            "lambda captures too many variables (limit %d)", ZAN_MAX_CAPTURES);
+            "out of memory collecting the variables this lambda captures");
         cs.count = 0;
         cs.needs_this = 0;
     }
@@ -7889,7 +7909,12 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
      * bound target, so that slot stays null (see the closure record layout). */
     LLVMTypeRef rec_ty = NULL;
     if (is_closure) {
-        LLVMTypeRef fields[ZAN_CLOSURE_HDR_FIELDS + ZAN_MAX_CAPTURES + 1];
+        LLVMTypeRef *fields = (LLVMTypeRef *)calloc(
+            (size_t)(ZAN_CLOSURE_HDR_FIELDS + capc + 1), sizeof(LLVMTypeRef));
+        if (!fields) {
+            cap_scan_free(&cs);
+            return LLVMConstNull(i8ptr);
+        }
         for (int i = 0; i < ZAN_CLOSURE_HDR_FIELDS; i++) fields[i] = i8ptr;
         for (int i = 0; i < capc; i++)
             fields[ZAN_CLOSURE_HDR_FIELDS + i] = cs.caps[i].llvm;
@@ -7899,6 +7924,7 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
         rec_ty = LLVMStructCreateNamed(g->ctx, rname);
         LLVMStructSetBody(rec_ty, fields,
                           (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc + has_this), 0);
+        free(fields);
     }
 
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
@@ -8069,8 +8095,11 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
         ? LLVMBuildLoad2(g->builder, LLVMGetAllocatedType(saved_this),
                          saved_this, "cap.self")
         : NULL;
-    return emit_closure_record(g, expr->loc, lname, rec_ty, lambda_fn, NULL,
-                               cs.caps, capc, has_this, self);
+    LLVMValueRef clo = emit_closure_record(g, expr->loc, lname, rec_ty,
+                                           lambda_fn, NULL, cs.caps, capc,
+                                           has_this, self);
+    cap_scan_free(&cs);
+    return clo;
 }
 
 static zan_type_t *method_param_type(zan_irgen_t *g, zan_symbol_t *msym, int idx) {

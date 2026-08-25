@@ -19,7 +19,8 @@ static LLVMBasicBlockRef irgen_goto_label(zan_irgen_t *g, zan_istr_t name) {
                    (size_t)name.len) == 0)
             return g->goto_labels[i].bb;
     }
-    if (g->goto_label_count >= 256) return NULL;
+    if (!ZAN_TAB_ENSURE(g->goto_labels, g->goto_label_count,
+                        g->goto_label_cap, 64)) return NULL;
     LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "label");
     g->goto_labels[g->goto_label_count].name = name;
     g->goto_labels[g->goto_label_count].fn = fn;
@@ -2070,13 +2071,20 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMBuildBr(g->builder, pcont_bb);
                     LLVMPositionBuilderAtEnd(g->builder, pcont_bb);
                 }
-                if (g->catch_cleanup_count < ZAN_MAX_CATCH_DEPTH) {
+                /* Grown on demand: skipping the entry left the handler's
+                 * exception released only by the try epilogue, so a `return`
+                 * or `throw` out of a deeply nested catch leaked it. */
+                if (ZAN_TAB_ENSURE(g->catch_cleanups, g->catch_cleanup_count,
+                                   g->catch_cleanup_cap, 16)) {
                     g->catch_cleanups[g->catch_cleanup_count].exc_slot = exc_slot;
                     g->catch_cleanups[g->catch_cleanup_count].owned_slot =
                         exc_owned_slot;
                     g->catch_cleanups[g->catch_cleanup_count].tid_slot =
                         exc_tid_slot;
                     g->catch_cleanup_count++;
+                } else {
+                    zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                        "out of memory tracking nested catch handlers");
                 }
                 int saved_cc = g->catch_cleanup_count;
                 emit_stmt(g, cc->catch_clause.body, locals);

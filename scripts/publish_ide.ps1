@@ -432,6 +432,12 @@ AI coding tools (Claude Code / Cursor / Copilot / Windsurf)
                  The full connection guide (also covers zan-lsp / zan-dap for
                  editors that speak LSP/DAP directly).
 
+  Website mirror    The same ai\ content (rules + skills + mcp configs) is
+                  mirrored on the project website at /ai-connect, generated
+                  from this pack so they never drift. This SDK copy is the
+                  authoritative one that --init-agent installs; the site copy
+                  is for reading.
+
 Requirement
   None for normal use: zanc links via the bundled toolchain\ folder, so no
   external LLVM/clang install is needed. (If the linker files under toolchain\

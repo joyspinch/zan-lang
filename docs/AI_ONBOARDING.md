@@ -5,6 +5,11 @@ command connects your project to the SDK's MCP server; from then on the model
 asks the toolchain instead of guessing — signatures, working examples, real
 compiler diagnostics.
 
+> The same `tools\ai_pack\` content (AGENTS.md, skills, mcp configs) is mirrored
+> on the project website at `/ai-connect` (generated from the pack, so the two
+> never drift). The SDK copy below is authoritative and what `--init-agent`
+> installs.
+
 Two directories, and the difference matters: the **SDK installation**
 (`dist\win-x64`, referred to as `<ZAN_SDK>`) is where the IDE and the toolchain
 live, and your **project** is wherever you write code. AI configuration belongs

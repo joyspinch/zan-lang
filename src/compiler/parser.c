@@ -16,6 +16,7 @@
 #include "diag.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
 
 /* ---- helpers ---- */
@@ -3992,6 +3993,12 @@ static zan_ast_node_t *find_delegate_decl(zan_ast_node_t *unit, zan_istr_t name)
  * `n += f(&n)` form) is unspecified evaluation order that double-counts on
  * some compilers (e.g. MinGW GCC), leaving gaps of uninitialized stack bytes
  * in the generated source. */
+/* Capacity of the synthetic-source buffers. Generated text scales with the
+ * declaration (a record's fields, a delegate's parameters), so this is sized
+ * far above any plausible declaration and an overflow is reported as an error
+ * instead of feeding truncated source to the lexer. */
+#define ZAN_GEN_SRC_CAP (256 * 1024)
+
 static void zsrc_append(char *buf, int cap, int *off, const char *fmt, ...) {
     if (*off >= cap) return;
     va_list ap;
@@ -4024,9 +4031,11 @@ static int tref_write(char *buf, int cap, zan_ast_node_t *t) {
 static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
                              const char *dname, const char *hname,
                              zan_arena_t *arena, zan_diag_t *diag) {
-    char src[8192];
+    char *src = (char *)malloc(ZAN_GEN_SRC_CAP);
+    if (!src) return;
+    const int cap = ZAN_GEN_SRC_CAP;
     int n = 0;
-    zsrc_append(src, (int)sizeof(src), &n,
+    zsrc_append(src, cap, &n,
         "class %s {\n"
         "    List<%s> hs;\n"
         "    static %s op_add(%s self, %s h) {\n"
@@ -4053,22 +4062,22 @@ static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
     int invoke_params_at = n;
     for (int i = 0; i < ddecl->method_decl.params.count; i++) {
         zan_ast_node_t *pp = ddecl->method_decl.params.items[i];
-        if (i > 0) zsrc_append(src, (int)sizeof(src), &n, ", ");
-        n += tref_write(src + n, (int)sizeof(src) - n, pp->param.type);
-        zsrc_append(src, (int)sizeof(src), &n, " a%d", i);
+        if (i > 0) zsrc_append(src, cap, &n, ", ");
+        n += tref_write(src + n, cap - n, pp->param.type);
+        zsrc_append(src, cap, &n, " a%d", i);
     }
     int invoke_params_end = n;
-    zsrc_append(src, (int)sizeof(src), &n,
+    zsrc_append(src, cap, &n,
         ") {\n"
         "        int i = 0;\n"
         "        while (i < hs.Count) {\n"
         "            %s d = hs[i];\n"
         "            d(", dname);
     for (int i = 0; i < ddecl->method_decl.params.count; i++) {
-        zsrc_append(src, (int)sizeof(src), &n, "%sa%d",
+        zsrc_append(src, cap, &n, "%sa%d",
                          i > 0 ? ", " : "", i);
     }
-    zsrc_append(src, (int)sizeof(src), &n,
+    zsrc_append(src, cap, &n,
         ");\n"
         "            i = i + 1;\n"
         "        }\n"
@@ -4077,22 +4086,34 @@ static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
     /* `E(args)` raises the event, as in C#. The holder is null until the first
      * subscription, and a call with no subscribers simply does nothing (the
      * `E?.Invoke(...)` shape C# code writes by hand). */
-    char params[2048];
-    snprintf(params, sizeof(params), "%.*s",
-             invoke_params_end - invoke_params_at, src + invoke_params_at);
-    zsrc_append(src, (int)sizeof(src), &n,
+    int params_len = invoke_params_end - invoke_params_at;
+    char *params = (char *)malloc((size_t)params_len + 1);
+    if (!params) { free(src); return; }
+    memcpy(params, src + invoke_params_at, (size_t)params_len);
+    params[params_len] = '\0';
+    zsrc_append(src, cap, &n,
         "    static void op_call(%s self%s%s) {\n"
         "        if (self == null) { return; }\n"
         "        self.Invoke(",
         hname, ddecl->method_decl.params.count ? ", " : "", params);
     for (int i = 0; i < ddecl->method_decl.params.count; i++)
-        zsrc_append(src, (int)sizeof(src), &n, "%sa%d", i > 0 ? ", " : "", i);
-    zsrc_append(src, (int)sizeof(src), &n,
+        zsrc_append(src, cap, &n, "%sa%d", i > 0 ? ", " : "", i);
+    zsrc_append(src, cap, &n,
         ");\n"
         "    }\n"
         "}\n");
+    free(params);
 
+    if (n >= cap) {
+        zan_loc_t loc = {0};
+        zan_diag_emit(diag, DIAG_ERROR, loc,
+                      "declaration too large to lower: generated source "
+                      "exceeds %d bytes", cap);
+        free(src);
+        return;
+    }
     char *gsrc = zan_arena_strdup(arena, src, (size_t)n);
+    free(src);
     zan_lexer_t lex;
     zan_lexer_init(&lex, gsrc, (size_t)n, 0, arena, diag);
     zan_parser_t gp;
@@ -4109,35 +4130,37 @@ static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
 static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
                              zan_ast_list_t *params, zan_arena_t *arena,
                              zan_diag_t *diag) {
-    char src[8192];
+    char *src = (char *)malloc(ZAN_GEN_SRC_CAP);
+    if (!src) return;
+    const int cap = ZAN_GEN_SRC_CAP;
     char nm[256];
     int n = 0;
     snprintf(nm, sizeof(nm), "%.*s", (int)rname.len, rname.str);
-    zsrc_append(src, (int)sizeof(src), &n, "class %s {\n", nm);
+    zsrc_append(src, cap, &n, "class %s {\n", nm);
     for (int i = 0; i < params->count; i++) {
         zan_ast_node_t *pp = params->items[i];
-        zsrc_append(src, (int)sizeof(src), &n, "    public ");
-        n += tref_write(src + n, (int)sizeof(src) - n, pp->param.type);
-        zsrc_append(src, (int)sizeof(src), &n, " %.*s;\n",
+        zsrc_append(src, cap, &n, "    public ");
+        n += tref_write(src + n, cap - n, pp->param.type);
+        zsrc_append(src, cap, &n, " %.*s;\n",
                          (int)pp->param.name.len, pp->param.name.str);
     }
-    zsrc_append(src, (int)sizeof(src), &n, "    public %s(", nm);
+    zsrc_append(src, cap, &n, "    public %s(", nm);
     for (int i = 0; i < params->count; i++) {
         zan_ast_node_t *pp = params->items[i];
-        if (i > 0) zsrc_append(src, (int)sizeof(src), &n, ", ");
-        n += tref_write(src + n, (int)sizeof(src) - n, pp->param.type);
-        zsrc_append(src, (int)sizeof(src), &n, " %.*s",
+        if (i > 0) zsrc_append(src, cap, &n, ", ");
+        n += tref_write(src + n, cap - n, pp->param.type);
+        zsrc_append(src, cap, &n, " %.*s",
                          (int)pp->param.name.len, pp->param.name.str);
     }
-    zsrc_append(src, (int)sizeof(src), &n, ") {\n");
+    zsrc_append(src, cap, &n, ") {\n");
     for (int i = 0; i < params->count; i++) {
         zan_ast_node_t *pp = params->items[i];
-        zsrc_append(src, (int)sizeof(src), &n,
+        zsrc_append(src, cap, &n,
                          "        this.%.*s = %.*s;\n",
                          (int)pp->param.name.len, pp->param.name.str,
                          (int)pp->param.name.len, pp->param.name.str);
     }
-    zsrc_append(src, (int)sizeof(src), &n,
+    zsrc_append(src, cap, &n,
         "    }\n"
         "    static bool op_eq(%s l, %s r) {\n"
         "        if (l == null) { return r == null; }\n"
@@ -4145,12 +4168,12 @@ static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
         "        return true", nm, nm);
     for (int i = 0; i < params->count; i++) {
         zan_ast_node_t *pp = params->items[i];
-        zsrc_append(src, (int)sizeof(src), &n,
+        zsrc_append(src, cap, &n,
                          " && l.%.*s == r.%.*s",
                          (int)pp->param.name.len, pp->param.name.str,
                          (int)pp->param.name.len, pp->param.name.str);
     }
-    zsrc_append(src, (int)sizeof(src), &n,
+    zsrc_append(src, cap, &n,
         ";\n"
         "    }\n"
         "    static bool op_neq(%s l, %s r) { return !(l == r); }\n"
@@ -4162,7 +4185,7 @@ static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
         int is_str = pt && pt->kind == AST_TYPE_REF && !pt->type_ref.is_array &&
                      pt->type_ref.name.len == 6 &&
                      memcmp(pt->type_ref.name.str, "string", 6) == 0;
-        zsrc_append(src, (int)sizeof(src), &n,
+        zsrc_append(src, cap, &n,
                          " + \"%s %.*s = \" + %s%.*s%s",
                          i > 0 ? "," : "",
                          (int)pp->param.name.len, pp->param.name.str,
@@ -4170,12 +4193,21 @@ static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
                          (int)pp->param.name.len, pp->param.name.str,
                          is_str ? "" : ")");
     }
-    zsrc_append(src, (int)sizeof(src), &n,
+    zsrc_append(src, cap, &n,
         " + \" }\";\n"
         "    }\n"
         "}\n");
 
+    if (n >= cap) {
+        zan_loc_t loc = {0};
+        zan_diag_emit(diag, DIAG_ERROR, loc,
+                      "declaration too large to lower: generated source "
+                      "exceeds %d bytes", cap);
+        free(src);
+        return;
+    }
     char *gsrc = zan_arena_strdup(arena, src, (size_t)n);
+    free(src);
     zan_lexer_t lex;
     zan_lexer_init(&lex, gsrc, (size_t)n, 0, arena, diag);
     zan_parser_t gp;
@@ -4275,8 +4307,12 @@ void zan_parser_flatten_nested_types(zan_ast_node_t *unit, zan_arena_t *arena,
 void zan_parser_desugar_events(zan_ast_node_t *unit, zan_arena_t *arena,
                                zan_diag_t *diag) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
-    const char *generated[64];
+    /* Holder classes generated so far, grown on demand: a fixed cap used to
+     * stop generating them silently, and every later `event` of a new
+     * delegate type then referenced a class that was never emitted. */
+    const char **generated = NULL;
     int generated_count = 0;
+    int generated_cap = 0;
     int decl_count = unit->comp_unit.decls.count;
     for (int di = 0; di < decl_count; di++) {
         zan_ast_node_t *d = unit->comp_unit.decls.items[di];
@@ -4305,7 +4341,18 @@ void zan_parser_desugar_events(zan_ast_node_t *unit, zan_arena_t *arena,
             int already = 0;
             for (int gi = 0; gi < generated_count; gi++)
                 if (strcmp(generated[gi], hname) == 0) { already = 1; break; }
-            if (!already && generated_count < 64) {
+            if (!already) {
+                if (generated_count == generated_cap) {
+                    int ncap = generated_cap ? generated_cap * 2 : 16;
+                    const char **ng = (const char **)realloc(
+                        (void *)generated, (size_t)ncap * sizeof(*generated));
+                    if (!ng) {
+                        free((void *)generated);
+                        return;
+                    }
+                    generated = ng;
+                    generated_cap = ncap;
+                }
                 gen_event_holder(unit, ddecl, dname, hname, arena, diag);
                 generated[generated_count++] =
                     zan_arena_strdup(arena, hname, strlen(hname));
@@ -4314,4 +4361,5 @@ void zan_parser_desugar_events(zan_ast_node_t *unit, zan_arena_t *arena,
             tr->type_ref.name = (zan_istr_t){hn, (uint32_t)strlen(hname)};
         }
     }
+    free((void *)generated);
 }

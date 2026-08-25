@@ -19,6 +19,15 @@
  * gui_runtime DLL) so both console/async and GUI (ZanIDE) processes leave a
  * trace. Every symbol is static so multiple includers never collide at link
  * time, and installation is idempotent (only the first caller wins).
+ *
+ * Beyond logging, the file provides the fault guard (zan__guard_call, exported
+ * as zan_gui_guard_call): work run through it survives a hard fault -- the
+ * record is written and the callback abandoned, instead of the process dying.
+ * The GUI loop wraps one event dispatch and one frame in it, so a bad pointer
+ * or a failed bounds check in UI code costs that event or frame. Recording is
+ * done by a vectored handler, which runs before any frame-based handler and
+ * therefore also survives another component replacing the filter (an embedded
+ * browser does), the case where a crash used to leave nothing at all behind.
  */
 #ifndef ZAN_RT_CRASH_H
 #define ZAN_RT_CRASH_H
@@ -27,6 +36,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 static void zan__crash_modline(FILE *f, void *addr, const char *tag) {
@@ -260,28 +270,265 @@ static void zan__crash_symbolize_one(const char *logpath, const char *exe,
     zan__crash_symbolize(logpath, exe, exe_dir, exe_base, addr, NULL, 0, 1);
 }
 
+/* <exe_dir>\zan_crash.log, plus the directory itself. Both fall back to the
+ * bare file name in the current directory when the exe path is unavailable. */
+static void zan__crash_logpath(char *logpath, size_t cap, char *exe_dir) {
+    exe_dir[0] = '\0';
+    DWORD n = GetModuleFileNameA(NULL, logpath, (DWORD)cap);
+    if (n == 0 || n >= cap) {
+        snprintf(logpath, cap, "zan_crash.log");
+        return;
+    }
+    char *slash = strrchr(logpath, '\\');
+    if (!slash) {
+        snprintf(logpath, cap, "zan_crash.log");
+        return;
+    }
+    size_t dl = (size_t)(slash + 1 - logpath);
+    memcpy(exe_dir, logpath, dl);
+    exe_dir[dl] = '\0';
+    slash[1] = '\0';
+    strncat(logpath, "zan_crash.log", cap - strlen(logpath) - 1);
+}
+
+/* One line into the crash log. Used for the markers that make "the program
+ * vanished and there is no log" a distinguishable state: no file at all means
+ * the image has no handler installed (or writes elsewhere), a file with only
+ * a `run` line means the process left without any exception -- an exit()/
+ * ExitProcess/TerminateProcess path rather than a crash. */
+static void zan__crash_note(const char *what, const char *detail) {
+    char logpath[MAX_PATH];
+    char exe_dir[MAX_PATH];
+    zan__crash_logpath(logpath, sizeof logpath, exe_dir);
+    FILE *f = fopen(logpath, "ab");
+    if (!f) f = fopen("zan_crash.log", "ab");
+    if (!f) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "---- %s %04d-%02d-%02d %02d:%02d:%02d.%03d pid=%lu tid=%lu %s\n",
+            what, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
+            st.wSecond, st.wMilliseconds,
+            (unsigned long)GetCurrentProcessId(),
+            (unsigned long)GetCurrentThreadId(), detail ? detail : "");
+    fclose(f);
+}
+
+static void zan__crash_write_record(EXCEPTION_POINTERS *ep, const char *reason,
+                                   void **bt, unsigned btn);
+
+#if defined(_MSC_VER)
+#define ZAN_CRASH_TLS __declspec(thread)
+#else
+#define ZAN_CRASH_TLS __thread
+#endif
+
+/* One instance of the handler state per binary, not per translation unit.
+ * This header is included by several runtime objects (the timer, the IO
+ * reactor, the GUI runtime), and a produced program links more than one of
+ * them: with `static` state each copy got its own guard stack, so the guard a
+ * GUI event was entered through was invisible to the vectored handler in
+ * another copy -- the fault was logged as unrecoverable and the process died
+ * with a perfectly good recovery point one frame below. selectany puts the
+ * definitions in COMDATs the linker folds into one. */
+#if defined(_WIN32) && (defined(__GNUC__) || defined(__clang__))
+#define ZAN_CRASH_SHARED __attribute__((selectany))
+#elif defined(_MSC_VER)
+#define ZAN_CRASH_SHARED __declspec(selectany)
+#else
+#define ZAN_CRASH_SHARED
+#endif
+
+/* Address range of the loaded main image, from its own PE headers. */
+static void zan__crash_image_range(uintptr_t base, uintptr_t *lo,
+                                  uintptr_t *hi) {
+    *lo = base;
+    *hi = base;
+    if (!base) return;
+    const IMAGE_DOS_HEADER *dh = (const IMAGE_DOS_HEADER *)base;
+    if (dh->e_magic != IMAGE_DOS_SIGNATURE) return;
+    const IMAGE_NT_HEADERS *nh =
+        (const IMAGE_NT_HEADERS *)(base + (uintptr_t)dh->e_lfanew);
+    if (nh->Signature != IMAGE_NT_SIGNATURE) return;
+    *hi = base + nh->OptionalHeader.SizeOfImage;
+}
+
+/* Return addresses left on the faulting stack, most frequent first.
+ *
+ * Used when no real backtrace could be taken -- a stack overflow leaves no
+ * room to walk the stack from the handler. The overflowing call chain is still
+ * written all over the stack, so scanning it upwards for values inside the
+ * program's own code and counting them names the recursion: the few addresses
+ * that repeat thousands of times are the cycle. */
+static void zan__crash_stack_scan(FILE *f, ULONG_PTR rsp, uintptr_t exe_base) {
+    uintptr_t lo, hi;
+    zan__crash_image_range(exe_base, &lo, &hi);
+    if (hi <= lo) return;
+
+    /* Start clear of the low end of the stack: by the time this runs the guard
+     * page has been re-armed somewhere below the current frame, and reading it
+     * would raise the overflow a second time. The recursion repeats all the
+     * way up, so skipping its innermost frames costs nothing. */
+    ULONG_PTR start = rsp + 128 * 1024;
+
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery((void *)start, &mbi, sizeof mbi)) return;
+    if (mbi.State != MEM_COMMIT) return;
+    if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return;
+    ULONG_PTR region_end = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
+
+    /* Enough to cover a deep recursion without walking the whole stack. */
+    ULONG_PTR end = start + 512 * 1024;
+    if (end > region_end) end = region_end;
+
+    enum { SLOTS = 24 };
+    uintptr_t addr[SLOTS];
+    unsigned long hits[SLOTS];
+    unsigned used = 0;
+    unsigned long total = 0;
+
+    for (ULONG_PTR p = (start + 7) & ~(ULONG_PTR)7; p + 8 <= end; p += 8) {
+        uintptr_t v = *(const uintptr_t *)p;
+        if (v < lo || v >= hi) continue;
+        total++;
+        unsigned i = 0;
+        for (; i < used; i++) {
+            if (addr[i] == v) { hits[i]++; break; }
+        }
+        if (i == used && used < SLOTS) {
+            addr[used] = v;
+            hits[used] = 1;
+            used++;
+        }
+    }
+    if (!used) return;
+
+    fprintf(f, "stack-scan (%lu in-image addresses, most frequent first --"
+               " a repeated address is the recursion):\n", total);
+    for (unsigned n = 0; n < used && n < 12; n++) {
+        unsigned best = n;
+        for (unsigned i = n + 1; i < used; i++)
+            if (hits[i] > hits[best]) best = i;
+        uintptr_t ta = addr[best]; unsigned long th = hits[best];
+        addr[best] = addr[n]; hits[best] = hits[n];
+        addr[n] = ta; hits[n] = th;
+        char tag[32];
+        snprintf(tag, sizeof tag, "  x%-6lu ", th);
+        zan__crash_modline(f, (void *)ta, tag);
+    }
+}
+
+/* Per-thread state for the handlers below, in a plain table keyed by thread id
+ * rather than in thread-local variables.
+ *
+ * A vectored handler runs on whatever thread faulted, and __thread there is a
+ * trap: the access compiles to TEB->ThreadLocalStoragePointer[_tls_index],
+ * which is null on threads whose static TLS block is not in place (a thread
+ * still starting up, one already torn down, threads a foreign component brings
+ * with it). Reading it then faults *inside the handler*, and that fault is
+ * what kills the process -- with no record written, since writing one is
+ * exactly what never got started. Two words of table lookup instead. */
+typedef struct zan__guard zan__guard_t;
+typedef struct zan__fault zan__fault_t;
+
+typedef struct zan__thread_slot {
+    volatile LONG tid;      /* owning thread id, 0 when free */
+    zan__guard_t *top;      /* innermost guard on that thread */
+    int ready;              /* one-time per-thread setup done */
+    int busy;               /* a handler is writing a record right now */
+} zan__thread_slot;
+
+#define ZAN_GUARD_SLOTS 64
+
+/* All the state the handlers share, in one COMDAT.
+ *
+ * It is deliberately one aggregate with a non-zero initialiser: a zeroed
+ * selectany definition goes to .bss$name with gcc and to .data$name with
+ * clang, and a program that links objects from both toolchains (the mingw-ABI
+ * GUI runtime next to the clang-built runtime objects) then has two sections
+ * the linker will not fold -- "multiple definition of zan__slots". `magic`
+ * keeps the aggregate in initialised data for either compiler. */
+typedef struct zan__shared {
+    LONG magic;
+    volatile LONG busy;         /* record being written on a thread with no slot */
+    volatile LONG recovered;    /* faults recovered from, all threads */
+    volatile LONG logged;       /* records written for them */
+    volatile LONG firstchance;  /* hard faults seen that nothing recovered */
+    volatile LONG installed;    /* handlers registered (once per binary) */
+    zan__thread_slot slots[ZAN_GUARD_SLOTS];
+} zan__shared_t;
+
+ZAN_CRASH_SHARED zan__shared_t zan__shared = { 0x5A414353, 0, 0, 0, 0, 0, { { 0, 0, 0, 0 } } };
+
+/* Spelled as the plain names the code below reads best with. */
+#define zan__slots             zan__shared.slots
+#define zan__crash_busy_shared zan__shared.busy
+#define zan__guard_recovered   zan__shared.recovered
+#define zan__guard_logged      zan__shared.logged
+#define zan__guard_firstchance zan__shared.firstchance
+#define zan__crash_installed   zan__shared.installed
+
+/* Find this thread's slot, claiming a free one when `create`. Returns NULL if
+ * the thread has none and none may be claimed -- the handlers treat that as
+ * "nothing of ours is running here" and keep their hands off. */
+static zan__thread_slot *zan__slot(int create) {
+    LONG tid = (LONG)GetCurrentThreadId();
+    unsigned start = ((unsigned)tid * 2654435761u) % ZAN_GUARD_SLOTS;
+    for (unsigned i = 0; i < ZAN_GUARD_SLOTS; i++) {
+        zan__thread_slot *s = &zan__slots[(start + i) % ZAN_GUARD_SLOTS];
+        if (s->tid == tid) return s;
+    }
+    if (!create) return NULL;
+    for (unsigned i = 0; i < ZAN_GUARD_SLOTS; i++) {
+        zan__thread_slot *s = &zan__slots[(start + i) % ZAN_GUARD_SLOTS];
+        if (InterlockedCompareExchange(&s->tid, tid, 0) == 0) return s;
+    }
+    return NULL;
+}
+
+/* Set while a handler is writing a record. A fault raised from inside the
+ * handling of another one must not be handled again: on a stack overflow the
+ * record writer itself (a few kilobytes of buffers) touches the guard page and
+ * faults, and without this the vectored handler is re-entered for that fault,
+ * faults again, and the process spins in KiUserExceptionDispatch until the
+ * stack is gone -- a hang with an empty log instead of a crash. Threads
+ * without a slot share one flag; they only ever reach the filter. */
+static int zan__crash_busy_get(zan__thread_slot *s) {
+    return s ? s->busy : (int)zan__crash_busy_shared;
+}
+static void zan__crash_busy_set(zan__thread_slot *s, int v) {
+    if (s) s->busy = v; else zan__crash_busy_shared = v;
+}
+
 static LONG WINAPI zan__crash_filter(EXCEPTION_POINTERS *ep) {
     if (!ep || !ep->ExceptionRecord) return EXCEPTION_EXECUTE_HANDLER;
+    zan__thread_slot *s = zan__slot(0);
+    if (zan__crash_busy_get(s)) return EXCEPTION_EXECUTE_HANDLER;
+    zan__crash_busy_set(s, 1);
+    zan__crash_write_record(ep, "unhandled", NULL, 0);
+    zan__crash_busy_set(s, 0);
+    if (ep->ExceptionRecord->ExceptionCode == 0xE0A2C010) {
+        /* Generated code raised this only to get the record written; it exits
+         * with its own status right after the raise, so resume there rather
+         * than killing the process with a foreign exit code. */
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_EXECUTE_HANDLER; /* log, then terminate (skip WER dialog) */
+}
+
+/* Append one diagnostic record for `ep`. `reason` says how the exception was
+ * seen: "unhandled" (the filter, process is about to die), "recovered" (the
+ * fault guard below is about to abandon the faulting work and continue), or
+ * "first-chance" (the vectored handler saw a hard fault that something else
+ * may still handle -- logged because a hijacked filter would otherwise leave
+ * no trace at all). */
+static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
+                                   const char *reason,
+                                   void **bt, unsigned btn) {
+    if (!ep || !ep->ExceptionRecord) return;
 
     char logpath[MAX_PATH];
     char exe_dir[MAX_PATH];
-    exe_dir[0] = '\0';
-    DWORD n = GetModuleFileNameA(NULL, logpath, (DWORD)sizeof logpath);
-    if (n == 0 || n >= sizeof logpath) {
-        snprintf(logpath, sizeof(logpath), "zan_crash.log");
-    } else {
-        char *slash = strrchr(logpath, '\\');
-        if (slash) {
-            size_t dl = (size_t)(slash + 1 - logpath);
-            memcpy(exe_dir, logpath, dl);
-            exe_dir[dl] = '\0';
-            slash[1] = '\0';
-            strncat(logpath, "zan_crash.log",
-                    sizeof(logpath) - strlen(logpath) - 1);
-        } else {
-            snprintf(logpath, sizeof(logpath), "zan_crash.log");
-        }
-    }
+    zan__crash_logpath(logpath, sizeof logpath, exe_dir);
 
     char exe[MAX_PATH];
     if (!GetModuleFileNameA(NULL, exe, (DWORD)sizeof exe)) exe[0] = '\0';
@@ -297,9 +544,9 @@ static LONG WINAPI zan__crash_filter(EXCEPTION_POINTERS *ep) {
         GetLocalTime(&st);
         EXCEPTION_RECORD *er = ep->ExceptionRecord;
 
-        fprintf(f, "==== ZAN CRASH %04d-%02d-%02d %02d:%02d:%02d.%03d ====\n",
+        fprintf(f, "==== ZAN CRASH %04d-%02d-%02d %02d:%02d:%02d.%03d (%s) ====\n",
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
-                st.wSecond, st.wMilliseconds);
+                st.wSecond, st.wMilliseconds, reason ? reason : "unhandled");
         fprintf(f, "exe=%s pid=%lu tid=%lu\n", exe,
                 (unsigned long)GetCurrentProcessId(),
                 (unsigned long)GetCurrentThreadId());
@@ -328,6 +575,18 @@ static LONG WINAPI zan__crash_filter(EXCEPTION_POINTERS *ep) {
                                    "reference (missing retain when stored)";
                              break;
             default: break;
+            }
+            /* A failed runtime check (bounds, division by zero, a failed I/O
+             * guard) raised by generated code. It prints the message too, but
+             * a `--subsystem windows` program has no console, so the text
+             * would otherwise be lost and the process would just vanish. The
+             * pointer is a string literal in this same process. */
+            if (er->ExceptionCode == 0xE0A2C010 &&
+                er->NumberParameters >= 1 && er->ExceptionInformation[0]) {
+                fprintf(f, "zan=%s", (const char *)er->ExceptionInformation[0]);
+                if (er->NumberParameters >= 2)
+                    fprintf(f, "exit=%lld\n",
+                            (long long)er->ExceptionInformation[1]);
             }
             if (arc) {
                 fprintf(f, "arc=%s\n", arc);
@@ -361,7 +620,16 @@ static LONG WINAPI zan__crash_filter(EXCEPTION_POINTERS *ep) {
         }
 #endif
 
-        fn = RtlCaptureStackBackTrace(0, 62, frames, NULL);
+        if (bt) {
+            /* Captured where the fault happened; this call site may already be
+             * the recovered frame, whose own stack says nothing. */
+            fn = (USHORT)(btn < 62 ? btn : 62);
+            for (USHORT i = 0; i < fn; i++) frames[i] = bt[i];
+        } else {
+            fn = RtlCaptureStackBackTrace(0, 62, frames, NULL);
+        }
+        if (fn == 0 && ep->ContextRecord)
+            zan__crash_stack_scan(f, ep->ContextRecord->Rsp, exe_base);
         fprintf(f, "backtrace (%u frames):\n", (unsigned)fn);
         for (USHORT i = 0; i < fn; i++) {
             char tag[16];
@@ -373,21 +641,280 @@ static LONG WINAPI zan__crash_filter(EXCEPTION_POINTERS *ep) {
 
         /* Resolve to source when the image carries DWARF (Debug builds). Done
          * after the raw record is flushed so a symbolizer failure never costs
-         * us the addresses. */
-        zan__crash_symbolize(logpath, exe, exe_dir[0] ? exe_dir : ".\\",
-                             exe_base, ep->ExceptionRecord->ExceptionAddress,
-                             frames, fn, 0);
+         * us the addresses -- and skipped entirely after an overflow, where
+         * this still runs on the stack that has just run out and spawning a
+         * symbolizer is more than it has left. */
+        if (er->ExceptionCode != EXCEPTION_STACK_OVERFLOW) {
+            zan__crash_symbolize(logpath, exe, exe_dir[0] ? exe_dir : ".\\",
+                                 exe_base, ep->ExceptionRecord->ExceptionAddress,
+                                 frames, fn, 0);
+        }
         if (arc_freed_by)
             zan__crash_symbolize_one(logpath, exe, exe_dir[0] ? exe_dir : ".\\",
                                      exe_base, arc_freed_by);
     }
-    return EXCEPTION_EXECUTE_HANDLER; /* log, then terminate (skip WER dialog) */
+}
+
+/* ------------------------------------------------------------------ *
+ * Fault guard
+ *
+ * A hard fault (or a failed runtime check) inside GUI work used to end the
+ * process: no window, no message, and -- if some other component had replaced
+ * the unhandled-exception filter meanwhile -- no log either. The guard makes
+ * that survivable. `zan_rt_guard_call` runs a callback with a recovery point
+ * recorded for the calling thread; the vectored handler below turns a fault
+ * raised inside it into a jump back to that point, so the work in progress
+ * (one frame, one event) is abandoned with a logged record and the loop keeps
+ * running instead of the program disappearing.
+ *
+ * Not everything may be resumed this way: heap corruption and fail-fast
+ * reports say the process state itself is no longer trustworthy, so those keep
+ * falling through to the filter and terminate as before.
+ *
+ * The handler itself does as little as possible on the faulting stack: it
+ * copies the exception out and jumps back, and the record is written from the
+ * recovered frame. Writing it in place is what a stack that has just run out
+ * cannot afford -- the writer's own buffers fault again, and the handler is
+ * re-entered for that fault, which is how an ordinary crash turns into a
+ * process that spins in the exception dispatcher and cannot even be killed.
+ * ------------------------------------------------------------------ */
+
+/* The exception, copied out of the faulting frame for the record the recovered
+ * frame writes. Lives in the guard frame, which the fault left intact. */
+struct zan__fault {
+    EXCEPTION_RECORD er;
+    CONTEXT ctx;
+    void *bt[62];
+    unsigned btn;
+    int have;
+};
+
+struct zan__guard {
+    void *jb[5];             /* __builtin_setjmp buffer (fp, sp, pc, ...) */
+    struct zan__guard *prev; /* enclosing guard on this thread */
+    ULONG_PTR sp;            /* stack pointer inside the guard frame */
+    volatile LONG armed;
+    zan__fault_t f;
+};
+
+/* Records written so far, and the ones after which the log thins out: a fault
+ * that repeats every frame must not turn a 100 MB log file into the next
+ * problem, while the beginning of the run -- where the first occurrence and
+ * its backtrace are -- is always kept in full. */
+#define ZAN_GUARD_LOG_FULL 20
+#define ZAN_GUARD_LOG_EVERY 100
+
+/* Codes it makes sense to abandon the current callback for. Deliberately
+ * excludes EXCEPTION_STACK_OVERFLOW (there is no stack left to run on),
+ * 0xC0000374 (heap corruption) and the fail-fast codes: continuing after those
+ * buys a corrupted process rather than a working one. */
+static int zan__guard_recoverable(DWORD code) {
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_IN_PAGE_ERROR:
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+    case EXCEPTION_DATATYPE_MISALIGNMENT:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_PRIV_INSTRUCTION:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_INT_OVERFLOW:
+    case EXCEPTION_FLT_DIVIDE_BY_ZERO:
+    case EXCEPTION_FLT_INVALID_OPERATION:
+    /* Raised by generated code: the ARC integrity checks, and 0xE0A2C010 for
+     * a failed runtime check (bounds, division by zero, an I/O guard), which
+     * would otherwise exit() right after the raise. Inside a guard that means
+     * losing one frame or one event instead of the program. */
+    case 0xE0A2C001: case 0xE0A2C002: case 0xE0A2C003: case 0xE0A2C004:
+    case 0xE0A2C005: case 0xE0A2C006: case 0xE0A2C007: case 0xE0A2C008:
+    case 0xE0A2C009: case 0xE0A2C010:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Hard faults worth a record even when something else might still handle them:
+ * the filter is the reliable place to log, but any component in the process
+ * (an embedded browser, a plugin) can replace it after us. */
+static int zan__guard_hard_fault(DWORD code) {
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_IN_PAGE_ERROR:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_PRIV_INSTRUCTION:
+    case EXCEPTION_STACK_OVERFLOW:
+    case 0xC0000374:
+    /* The ARC integrity reports from generated code. They are raised on
+     * purpose and the raising code prints the facts, but the record is what
+     * carries the backtrace -- and with a Debug build's line table, the source
+     * line holding the stale reference. Worth writing here because nothing
+     * else may: the raise is immediately followed by exit(), and a frame-based
+     * handler anywhere below (the CRT installs one) can swallow it before the
+     * unhandled-exception filter is ever consulted. */
+    case 0xE0A2C001: case 0xE0A2C002: case 0xE0A2C003: case 0xE0A2C004:
+    case 0xE0A2C005: case 0xE0A2C006: case 0xE0A2C007: case 0xE0A2C008:
+    case 0xE0A2C009:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Entered with a synthesized context (see the handler): a private stack and
+ * this address in Rip, so the jump back runs on a frame the fault cannot have
+ * damaged. __builtin_longjmp restores frame/stack/pc directly, without the
+ * table-driven unwind msvcrt's longjmp would attempt from that frame. */
+static void zan__guard_resume(void) {
+    zan__thread_slot *s = zan__slot(0);
+    zan__guard_t *g = s ? s->top : NULL;
+    if (!g) ExitProcess(0xE0A2C0FFu);
+    __builtin_longjmp(g->jb, 1);
+}
+
+static void zan__crash_install(void);
+
+/* Write the record for the fault this thread just recovered from. Runs on the
+ * restored stack, where a few kilobytes of buffers and a symbolizer are
+ * affordable again. */
+static void zan__guard_log_deferred(zan__thread_slot *s, zan__fault_t *flt) {
+    if (!flt->have) return;
+    flt->have = 0;
+    if (zan__crash_busy_get(s)) return;
+
+    LONG seen = InterlockedIncrement((LONG volatile *)&zan__guard_recovered);
+    /* Always recover -- there is no fault count at which killing the program
+     * is the better outcome -- but stop writing a full record for every one
+     * once the pattern is established. */
+    if (seen > ZAN_GUARD_LOG_FULL && seen % ZAN_GUARD_LOG_EVERY != 0) return;
+
+    EXCEPTION_POINTERS p;
+    p.ExceptionRecord = &flt->er;
+    p.ContextRecord = &flt->ctx;
+    zan__crash_busy_set(s, 1);
+    zan__crash_write_record(&p, "recovered", flt->bt, flt->btn);
+    zan__crash_busy_set(s, 0);
+    InterlockedIncrement((LONG volatile *)&zan__guard_logged);
+}
+
+/* Run fn(arg) with a recovery point for this thread. Returns 1 when it
+ * returned normally, 0 when a fault inside it was recovered from. */
+static int zan__guard_call(void (*fn)(void *), void *arg) {
+    if (!fn) return 1;
+    zan__thread_slot *s = zan__slot(1);
+    if (!s) { fn(arg); return 1; } /* out of slots: unguarded, as before */
+    /* Once per thread: this is on the path of every window message. */
+    if (!s->ready) {
+        s->ready = 1;
+        /* Re-assert ownership of the filter: a component loaded after us (CEF
+         * and friends install their own) would otherwise take every unhandled
+         * fault with it and leave no record behind. */
+        SetUnhandledExceptionFilter(zan__crash_filter);
+        zan__crash_install();
+        /* Headroom below the guard page, so the handler still has a stack to
+         * write its record on when the fault is the stack running out. */
+        ULONG guarantee = 64 * 1024;
+        SetThreadStackGuarantee(&guarantee);
+    }
+
+    zan__guard_t g;
+    volatile char frame_probe = 0;
+    g.prev = s->top;
+    g.sp = (ULONG_PTR)&frame_probe;
+    g.armed = 1;
+    g.f.have = 0;
+    int ok = 1;
+    if (__builtin_setjmp(g.jb) == 0) {
+        s->top = &g;
+        fn(arg);
+    } else {
+        ok = 0;
+        s->top = g.prev;
+        zan__guard_log_deferred(s, &g.f);
+    }
+    s->top = g.prev;
+    (void)frame_probe;
+    return ok;
+}
+
+static LONG CALLBACK zan__crash_veh(EXCEPTION_POINTERS *ep) {
+    if (!ep || !ep->ExceptionRecord || !ep->ContextRecord)
+        return EXCEPTION_CONTINUE_SEARCH;
+    /* No slot means no guard was ever entered on this thread: there is nothing
+     * to recover into, but a hard fault there is still worth a record (the
+     * faults before the first window message live here). */
+    zan__thread_slot *s = zan__slot(0);
+    /* A fault taken while handling one: handling it again is how the process
+     * ends up spinning in the dispatcher instead of crashing. */
+    if (zan__crash_busy_get(s)) return EXCEPTION_CONTINUE_SEARCH;
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    zan__guard_t *g = s ? s->top : NULL;
+
+#if defined(_M_X64) || defined(__x86_64__)
+    if (g && g->armed && zan__guard_recoverable(code)) {
+        g->armed = 0; /* one recovery per guard entry, no re-entry from here */
+        /* Everything expensive is deferred to the recovered frame; all that
+         * happens here is copying the exception out (the backtrace too, which
+         * only exists while the faulting frames are still on the stack) and
+         * redirecting execution. On a stack overflow even the walk is out of
+         * reach -- the record falls back to scanning the stack instead. */
+        g->f.er = *ep->ExceptionRecord;
+        g->f.ctx = *ep->ContextRecord;
+        g->f.btn = (unsigned)RtlCaptureStackBackTrace(0, 62, g->f.bt, NULL);
+        g->f.have = 1;
+        /* Resume just below the guard's own frame: that memory is committed
+         * (the abandoned callees were using it) and cannot overlap the frame
+         * being jumped back into. x64 wants (rsp % 16) == 8 at a function's
+         * first instruction. */
+        ULONG_PTR sp = ((g->sp - 256) & ~(ULONG_PTR)15) - 8;
+        ep->ContextRecord->Rsp = (DWORD64)sp;
+        ep->ContextRecord->Rip = (DWORD64)(ULONG_PTR)&zan__guard_resume;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+#endif
+
+    /* Nothing to recover into: leave the disposition alone and only leave a
+     * trace, since the filter may no longer be ours by the time this dies.
+     * Throttled like the recoveries -- a hard fault another component handles
+     * on purpose (some do, while probing) would otherwise repeat forever. */
+    if (zan__guard_hard_fault(code)) {
+        LONG seen = InterlockedIncrement((LONG volatile *)&zan__guard_firstchance);
+        if (seen <= ZAN_GUARD_LOG_FULL || seen % ZAN_GUARD_LOG_EVERY == 0) {
+            zan__crash_busy_set(s, 1);
+            zan__crash_write_record(ep, "first-chance", NULL, 0);
+            zan__crash_busy_set(s, 0);
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Number of faults the guard has absorbed so far (a UI can surface it). */
+static LONG zan__guard_recovered_count(void) {
+    return zan__guard_recovered;
+}
+
+static void zan__crash_atexit(void) {
+    /* Reached on every ordinary shutdown too; the value is in the contrast --
+     * a log whose last line is `run` and nothing else means the process was
+     * killed outright (TerminateProcess, a fail-fast, a hard exit in native
+     * code) rather than crashing where we could see it. */
+    char detail[96];
+    snprintf(detail, sizeof detail, "recovered=%ld logged=%ld first-chance=%ld",
+             (long)zan__guard_recovered, (long)zan__guard_logged,
+             (long)zan__guard_firstchance);
+    zan__crash_note("exit", detail);
 }
 
 static void zan__crash_install(void) {
-    static LONG once = 0;
-    if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
+    /* Shared across the copies of this header in one binary: three vectored
+     * handlers doing the same work only multiply the records. */
+    if (InterlockedCompareExchange((LONG volatile *)&zan__crash_installed,
+                                   1, 0) != 0) return;
     SetUnhandledExceptionFilter(zan__crash_filter);
+    /* First in line: a vectored handler runs before any frame-based one, so a
+     * fault is recorded (and recovered from) whatever else is installed. */
+    AddVectoredExceptionHandler(1, zan__crash_veh);
+    zan__crash_note("run", "");
+    atexit(zan__crash_atexit);
 }
 
 #if defined(__GNUC__) || defined(__clang__)

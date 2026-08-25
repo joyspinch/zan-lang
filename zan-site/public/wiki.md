@@ -102,6 +102,9 @@ platforms = win-x64   # 可发布目标（逗号分隔）
   `docs/MCP_HOSTING.md` 与 `docs/ai-assist.md`）；
 - 网站文档（本站）即是 AI 与人工的共同知识源：让 AI 抓 `/lang.md`、
   `/gui.md`、`/ref/<ns>.md` 即可获得准确上下文。
+- 想把外部 AI 编码工具（Claude Code / Cursor / Copilot / Windsurf 等）接到
+  本机 SDK？见 **[/ai-connect](/ai-connect)**——`tools\ai_pack\`（AGENTS.md +
+  skills + MCP 配置）的网站镜像，一条命令装进项目。
 
 ## 快捷键速查
 

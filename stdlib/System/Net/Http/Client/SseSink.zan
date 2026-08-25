@@ -36,6 +36,11 @@ class SseSink {
     /// 已写入的总字节数，使轮询者无需排空缓冲区就能区分
     /// "仍在流式传输" 与 "尚无数据"。
     int total;
+    /// 上游本次握手的响应状态、原始头部和失败正文。普通成功 SSE 只需状态
+    /// 与头部；非 2xx 的正文供调用方在还没有向下游输出前作出重试决策。
+    int responseStatus;
+    string responseHeaders;
+    string responseErrorBody;
     #if WINDOWS
     nint lockHandle;
     #else
@@ -63,6 +68,9 @@ class SseSink {
         s.attempt = "";
         s.done = "";
         s.total = 0;
+        s.responseStatus = 0;
+        s.responseHeaders = "";
+        s.responseErrorBody = "";
         s.lockHandle = Mutex.Create();
         return s;
     }
@@ -79,6 +87,9 @@ class SseSink {
         s.attempt = "";
         s.done = "";
         s.total = 0;
+        s.responseStatus = 0;
+        s.responseHeaders = "";
+        s.responseErrorBody = "";
         s.lockHandle = Mutex.Create();
         return s;
     }
@@ -92,6 +103,9 @@ class SseSink {
         this.cut = 0;
         this.attempt = "";
         this.total = 0;
+        this.responseStatus = 0;
+        this.responseHeaders = "";
+        this.responseErrorBody = "";
         Mutex.Unlock(this.lockHandle);
         if (this.path != "") {
             nint t = SseSink.fopen(this.path, "wb");
@@ -116,6 +130,38 @@ class SseSink {
         this.parts.Add(piece);
         this.total = this.total + piece.Length;
         Mutex.Unlock(this.lockHandle);
+    }
+
+    /// <summary>Publishes the upstream handshake metadata for the current
+    /// attempt. It is deliberately separate from stream chunks so a caller can
+    /// inspect a 429 before opening or writing its own SSE response.</summary>
+    void SetResponse(int status, string headers, string errorBody) {
+        Mutex.Lock(this.lockHandle);
+        this.responseStatus = status;
+        this.responseHeaders = headers;
+        this.responseErrorBody = errorBody;
+        Mutex.Unlock(this.lockHandle);
+    }
+
+    int ResponseStatus() {
+        Mutex.Lock(this.lockHandle);
+        int s = this.responseStatus;
+        Mutex.Unlock(this.lockHandle);
+        return s;
+    }
+
+    string ResponseHeaders() {
+        Mutex.Lock(this.lockHandle);
+        string s = this.responseHeaders;
+        Mutex.Unlock(this.lockHandle);
+        return s;
+    }
+
+    string ResponseErrorBody() {
+        Mutex.Lock(this.lockHandle);
+        string s = this.responseErrorBody;
+        Mutex.Unlock(this.lockHandle);
+        return s;
     }
 
     /// parts[from..] 拼成一段。调用者必须已经持有锁。

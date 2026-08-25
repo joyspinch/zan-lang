@@ -47,9 +47,10 @@ typedef struct {
     int rec_count;
     int rec_cap;
     /* receiver-is-a-call placeholders (defensive fallback only) */
-    zan_ast_node_t *pend_nodes[256];
-    int pend_ids[256];
+    zan_ast_node_t **pend_nodes;
+    int *pend_ids;
     int pend_count;
+    int pend_cap;
 } gm_ctx_t;
 
 static json_value *gm_arg_json(zan_ast_node_t *n);
@@ -331,7 +332,17 @@ static void gm_recv_str(zan_ast_node_t *obj, char *out, size_t outsz) {
 static int gm_recv_reserve(zan_ast_node_t *recv, gm_ctx_t *c) {
     for (int i = 0; i < c->pend_count; i++)
         if (c->pend_nodes[i] == recv) return c->pend_ids[i];
-    if (c->pend_count >= 256) return 0;
+    if (c->pend_count >= c->pend_cap) {
+        int ncap = c->pend_cap ? c->pend_cap * 2 : 64;
+        zan_ast_node_t **nn = (zan_ast_node_t **)realloc(
+            c->pend_nodes, (size_t)ncap * sizeof(*nn));
+        if (nn) c->pend_nodes = nn;
+        int *ni = nn ? (int *)realloc(c->pend_ids, (size_t)ncap * sizeof(*ni))
+                     : NULL;
+        if (!nn || !ni) return 0;
+        c->pend_ids = ni;
+        c->pend_cap = ncap;
+    }
     c->pend_nodes[c->pend_count] = recv;
     c->pend_ids[c->pend_count] = ++c->call_id;
     return c->pend_ids[c->pend_count++];
@@ -1215,7 +1226,10 @@ static char *gm_export(zan_ast_node_t *unit, zan_diag_t *diag) {
     memset(&ctx, 0, sizeof(ctx));
     ctx.calls = json_new_arr();
     ctx.call_id = 0;
+    ctx.pend_nodes = NULL;
+    ctx.pend_ids = NULL;
     ctx.pend_count = 0;
+    ctx.pend_cap = 0;
     /* walk every method body and field initializer for call sites */
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
@@ -1237,6 +1251,8 @@ static char *gm_export(zan_ast_node_t *unit, zan_diag_t *diag) {
     gm_prune_calls(ctx.calls, classes);
     json_obj_set(root, "calls", ctx.calls);
 
+    free(ctx.pend_nodes);
+    free(ctx.pend_ids);
     free(ctx.rec_nodes);
     free(ctx.rec_ids);
 
