@@ -879,6 +879,8 @@ void zan_io_init(void) {
     if (g_epoll_fd >= 0) { close(g_epoll_fd); g_epoll_fd = -1; }
     if (g_dns_wake_fd >= 0) { close(g_dns_wake_fd); g_dns_wake_fd = -1; }
     g_io_started = 0;
+}
+
 static int io_arm(int fd, zan_io_slot_t *s) {
     struct epoll_event ev;
     memset(&ev, 0, sizeof(ev));
@@ -908,9 +910,6 @@ static int io_arm(int fd, zan_io_slot_t *s) {
     return 0;
 }
 
-    g_io_count -= failed;
-    return failed;
-}
 static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
     if (g_io_broken) {   /* backend never started: fail, don't park forever */
         io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);

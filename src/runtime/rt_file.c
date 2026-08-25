@@ -362,7 +362,12 @@ long long zan_file_set_readonly(const char *path, int on) {
     mode_t m = st.st_mode;
     if (on) m &= ~(mode_t)(S_IWUSR | S_IWGRP | S_IWOTH);
     else    m |= S_IWUSR;
+#if defined(__wasi__)
+    /* WASI has no fchmod; report unsupported so callers degrade. */
+    int ok = 0;
+#else
     int ok = fchmod(fd, m) == 0 ? 1 : 0;
+#endif
     close(fd);
     return ok;
 #endif

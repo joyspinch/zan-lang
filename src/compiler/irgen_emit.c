@@ -1047,7 +1047,12 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                         fprintf(stderr, "[sync-flag] %s\n", ext_name);
                     g->uses_sync_runtime = true;
                 }
-                if (strncmp(ext_name, "zan_io_socket_", 14) == 0) {
+                /* Any zan_io_ export (sockets today, future io helpers
+                 * tomorrow) pulls in the reactor object. Matching the
+                 * family prefix rather than each name prevents the next
+                 * runtime addition from linking as an undefined symbol
+                 * only on user machines with stale-but-valid bundles. */
+                if (strncmp(ext_name, "zan_io_", 7) == 0) {
                     g->uses_socket_async = true;
                 }
                 if (strncmp(ext_name, "zan_gate_", 9) == 0) {

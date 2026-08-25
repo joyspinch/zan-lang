@@ -1046,10 +1046,18 @@ static const char *zan__crash_hex(unsigned long long v, char *buf) {
 /* Print one backtrace line for a code address: "path+base_offset (symbol)"
  * when dladdr can attribute it, the raw hex otherwise. Safe enough for
  * crash reporting: dladdr does not malloc for modules already loaded,
- * which every address in our own image is. */
+ * which every address in our own image is.
+ * dladdr/Dl_info are GNU extensions: both libcs declare them only when
+ * _GNU_SOURCE was set before the libc headers. Without it we still print
+ * the raw address -- the RIP itself is the critical triage datum. */
+#if defined(_GNU_SOURCE)
+#define ZAN_CRASH_HAVE_DLADDR 1
+#endif
+
 static void zan__crash_frame(int fd, void *pc) {
     char num[24];
     zan__crash_wr(fd, "  # ");
+#if defined(ZAN_CRASH_HAVE_DLADDR)
     Dl_info di;
     if (dladdr(pc, &di) && di.dli_fname) {
         zan__crash_wr(fd, di.dli_fname);
@@ -1065,6 +1073,10 @@ static void zan__crash_frame(int fd, void *pc) {
         zan__crash_wr(fd, "0x");
         zan__crash_wr(fd, zan__crash_hex((unsigned long long)(size_t)pc, num));
     }
+#else
+    zan__crash_wr(fd, "0x");
+    zan__crash_wr(fd, zan__crash_hex((unsigned long long)(size_t)pc, num));
+#endif
     zan__crash_wr(fd, "\n");
 }
 
@@ -1271,10 +1283,18 @@ static void zan__crash_record(int fd, int sig, void *addr, const char *stamp,
      * starts at this handler's own frame -- still enough to attribute the
      * crash module. */
 #  if defined(__linux__) && defined(__x86_64__)
+    /* Both libcs lay mcontext_t out as 32 words: 23 gregs, an fpregs
+     * pointer, 8 reserved. glibc names the first slice 'gregs'; musl
+     * only does so under _GNU_SOURCE and otherwise exposes opaque
+     * __space[32] -- same bytes either way. Index the raw word array,
+     * so one expression serves both (kernel sigcontext order:
+     * R8..R15=0..7 RDI=8 RSI=9 RBP=10 RBX=11 RDX=12 RAX=13 RCX=14
+     * RSP=15 RIP=16). */
     ucontext_t *uc = (ucontext_t *)uctx;
     if (uc) {
-        void *rip = (void *)uc->uc_mcontext.gregs[REG_RIP];
-        void **rbp = (void **)uc->uc_mcontext.gregs[REG_RBP];
+        unsigned long *mc = (unsigned long *)&uc->uc_mcontext;
+        void *rip = (void *)mc[16];   /* REG_RIP */
+        void **rbp = (void **)mc[10]; /* REG_RBP */
         zan__crash_wr(fd, "faulting ip:\n");
         zan__crash_frame(fd, rip);
         zan__crash_wr(fd, "backtrace (frame-pointer walk):\n");
