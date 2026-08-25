@@ -124,25 +124,93 @@ class PgConnection : IDbConnection {
         return "" + s;
     }
 
-    /// <summary>将 `?` 占位符（单引号字面量之外）改写为
-    /// libpq 的位置参数 $1..$n 形式，使所有驱动统一使用 `?` 语法。</summary>
+    /// <summary>将 `?` 占位符（SQL 结构位置）改写为 libpq 的
+    /// 位置参数 $1..$n 形式，使所有驱动统一使用 `?` 语法。
+    /// 上下文感知：字符串字面量、转义引号、双引号标识符、
+    /// 行/块注释以及美元引用（$$..$$ / $tag$..$tag$）内部的
+    /// `?` 一律原样保留——此前无脑改写，
+    /// SELECT * FROM t WHERE note = 'a?b' 会变成 $1 参数错位、
+    /// 注释里的示例 SQL 直接破坏语句。</summary>
     static string ToDollarParams(string sql) {
         StringBuilder sb = new StringBuilder();
         int n = sql.Length;
         int next = 1;
-        bool inQuote = false;
-        for (int i = 0; i < n; i = i + 1) {
+        int i = 0;
+        while (i < n) {
             int c = sql[i] & 255;
-            if (c == 39) {                    // '
-                inQuote = !inQuote;
-                sb.Append("'");
-            } else if (c == 63 && !inQuote) { // ?
+            if (c == 45 && i + 1 < n && (sql[i + 1] & 255) == 45) {
+                // 行注释：-- 直到换行。
+                while (i < n && (sql[i] & 255) != 10) {
+                    sb.Append(sql.Substring(i, 1));
+                    i = i + 1;
+                }
+                continue;
+            }
+            if (c == 47 && i + 1 < n && (sql[i + 1] & 255) == 42) {
+                // 块注释：/* .. */（未闭合则吞到末尾）。
+                while (i < n) {
+                    sb.Append(sql.Substring(i, 1));
+                    bool closed = (sql[i] & 255) == 42 && i + 1 < n
+                        && (sql[i + 1] & 255) == 47;
+                    i = i + 1;
+                    if (closed) { sb.Append("/"); i = i + 1; break; }
+                }
+                continue;
+            }
+            if (c == 39 || c == 34) {
+                // 引号区域（'..' 字符串含 '' 转义；".." 标识符）。
+                int q = c;
+                sb.Append(sql.Substring(i, 1));
+                i = i + 1;
+                while (i < n) {
+                    int d = sql[i] & 255;
+                    sb.Append(sql.Substring(i, 1));
+                    i = i + 1;
+                    if (d == q) {
+                        if (q == 39 && i < n && (sql[i] & 255) == 39) {
+                            sb.Append("'");       // '' 转义
+                            i = i + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            if (c == 36) {
+                // 美元引用：$ 后跟 [A-Za-z0-9_]* 再跟 $ 即开标签；
+                // 找不到闭合标签就按开标签吞到串尾。
+                int j = i + 1;
+                while (j < n) {
+                    int d = sql[j] & 255;
+                    bool tagch = (d >= 48 && d <= 57) || (d >= 65 && d <= 90)
+                        || (d >= 97 && d <= 122) || d == 95;
+                    if (!tagch) { break; }
+                    j = j + 1;
+                }
+                if (j < n && (sql[j] & 255) == 36) {
+                    string opener = sql.Substring(i, j - i + 1);
+                    int end = sql.IndexOf(opener, j + 1);
+                    int stop = end < 0 ? n : end + opener.Length;
+                    while (i < stop) {
+                        sb.Append(sql.Substring(i, 1));
+                        i = i + 1;
+                    }
+                    continue;
+                }
+                sb.Append(sql.Substring(i, 1));
+                i = i + 1;
+                continue;
+            }
+            if (c == 63) {                        // ?
                 sb.Append("$");
                 sb.Append(Convert.ToString(next));
                 next = next + 1;
-            } else {
-                sb.Append(sql.Substring(i, 1));
+                i = i + 1;
+                continue;
             }
+            sb.Append(sql.Substring(i, 1));
+            i = i + 1;
         }
         return sb.ToString();
     }

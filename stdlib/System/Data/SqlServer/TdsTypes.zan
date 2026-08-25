@@ -249,18 +249,26 @@ class TdsValue {
 
     /// <summary>PLP：八字节总长度（或 unknown/NULL 标记），
     /// 随后是分块，直到零长度块。分块先合并为一个
-    /// 带长度的块，因为一个值可能横跨多个分块。</summary>
+    /// 带长度的块，因为一个值可能横跨多个分块。
+    /// 防御：U8() 读穿缓冲尾会返回 0 而非报错，因此损坏/恶意
+    /// 的流此前可以无限追加零字节把客户端喂到 OOM。这里按
+    /// 包剩余字节校验每个分块声明（分块不会横跨包边界），
+    /// 并给单值设 64 MiB 硬上限；违规一律按 NULL 收场。</summary>
     static TdsCell ReadPlp(TdsReader r, int t) {
         int hi = r.U32LE();
         int lo = r.U32LE();
         if (hi == 0 - 1 && lo == 0 - 1) { return TdsCell.Null(); }
+        long cap = 67108864;
         TdsBuf acc = new TdsBuf();
         bool more = true;
         while (more) {
             int chunk = r.U32LE();
-            if (chunk <= 0) {
+            if (chunk < 0) { return TdsCell.Null(); }
+            if (chunk == 0) {
                 more = false;
             } else {
+                if ((long)chunk > r.Left()) { return TdsCell.Null(); }
+                if (acc.Count() + chunk > cap) { return TdsCell.Null(); }
                 for (int i = 0; i < chunk; i = i + 1) {
                     acc.U8(r.U8());
                 }
