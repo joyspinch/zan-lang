@@ -1,0 +1,97 @@
+using System;
+
+/// <summary>MySQL 线格式纯函数库：async 与 sync 连接双胞胎共享的
+/// 字节解析/编码工具。只做纯变换、无 IO 无状态——从两份逐字节
+/// 一致的副本合并而来（stdlib 去重 批D-1）。</summary>
+class MySqlWire {
+
+    static string bytesToStr(string buf, int off, int len) {
+        if (len <= 0) { return ""; }
+        byte[] t = new byte[len + 1];
+        for (int i = 0; i < len; i = i + 1) { t[i] = (byte)(buf[off+i] & 255); }
+        return t.ToStr(0, len);
+    }
+
+    static long readLenenc(string buf, List<int> cur) {
+        int p = cur[0];
+        int b0 = buf[p] & 255;
+        if (b0 < 251) { cur[0] = p + 1; return b0; }
+        if (b0 == 252) { cur[0] = p + 3; return (buf[p+1]&255)|((buf[p+2]&255)<<8); }
+        if (b0 == 253) { cur[0] = p + 4; return (buf[p+1]&255)|((buf[p+2]&255)<<8)|((buf[p+3]&255)<<16); }
+        if (b0 == 254) {
+            long v = 0; 
+            for (int i = 0; i < 8; i = i + 1) { v = v | ((long)(buf[p+1+i]&255) << (8*i)); }
+            cur[0] = p + 9; return v;
+        }
+        cur[0] = p + 1; return -1;
+    }
+
+    static string readLenencStr(string buf, List<int> cur) {
+        int b0 = buf[cur[0]] & 255;
+        if (b0 == 251) { cur[0] = cur[0] + 1; return ""; }
+        int len = (int)readLenenc(buf, cur);
+        int p = cur[0];
+        cur[0] = p + len;
+        return bytesToStr(buf, p, len);
+    }
+
+    static int findSub(string h, int hlen, string ndl, int nlen, int from) {
+        int i = from;
+        while (i + nlen <= hlen) {
+             bool ok = true;
+            for (int j = 0; j < nlen; j = j + 1) { if ((h[i + j] & 255) != (ndl[j] & 255)) { ok = false; break; } }
+            if (ok) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    static int readDerLen(string der, List<int> c) {
+        int b = der[c[0]] & 255; c[0] = c[0] + 1;
+        if (b < 128) { return b; }
+        int nb = b - 128;
+        int v = 0; 
+        for (int i = 0; i < nb; i = i + 1) { v = (v << 8) | (der[c[0]] & 255); c[0] = c[0] + 1; }
+        return v;
+    }
+
+    static int writeLenenc(string buf, int pos, int v) {
+        if (v < 251) { buf[pos] = v & 255; return pos + 1; }
+        if (v < 65536) {
+            buf[pos] = 252; buf[pos+1] = v & 255; buf[pos+2] = (v >> 8) & 255;
+            return pos + 3;
+        }
+        buf[pos] = 253; buf[pos+1] = v & 255; buf[pos+2] = (v >> 8) & 255;
+        buf[pos+3] = (v >> 16) & 255;
+        return pos + 4;
+    }
+
+    static double pow2(int e) {
+        double v = 1.0;
+        int i = 0;
+        if (e >= 0) {
+            while (i < e) { v = v * 2.0; i = i + 1; }
+        } else {
+            while (i > e) { v = v / 2.0; i = i - 1; }
+        }
+        return v;
+    }
+
+    static string pad2(int v) {
+        if (v < 10) { return "0" + Convert.ToString(v); }
+        return Convert.ToString(v);
+    }
+
+    static string ieeeToText(int sign, int exp, long mant, int expBias, int mantBits) {
+        if (exp == 0 && mant == 0) { return "0"; }
+        double m = 1.0;
+        int b = mantBits - 1;
+        while (b >= 0) {
+            if (((mant >> b) & 1) == 1) { m = m + pow2(b - mantBits); }
+            b = b - 1;
+        }
+        double v = m * pow2(exp - expBias);
+        if (sign == 1) { v = 0.0 - v; }
+        return Convert.ToString(v);
+    }
+}
