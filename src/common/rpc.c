@@ -9,12 +9,8 @@
 
 #include "host_oom.h"
 
-/* Default cap for the stdio path: a single LSP/DAP message may be large (a big
- * publishDiagnostics or a loaded-sources response) but never multi-GB. Capping
- * at 64MB stops a malicious/buggy peer from forcing a huge allocation with one
- * `Content-Length: 9999999999` header. The callback API still honours an
- * explicit max_len (<= 0 means no limit) for callers that want their own cap. */
-#define RPC_MAX_MESSAGE (64L * 1024 * 1024)
+/* The message cap lives in rpc.h (RPC_MAX_MESSAGE) so callers see the same
+ * number this file's default reader enforces -- keep it that way. */
 
 /* Parse the value of a "Content-Length:" header line (everything after the
  * colon). Returns the length on success, or -1 on any malformation: no digits,

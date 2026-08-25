@@ -37,7 +37,9 @@ typedef bool (*rpc_writer_fn)(void *ctx, const char *buf, int n);
 /* Read one Content-Length framed message via `reader`. `max_len` caps the
  * accepted Content-Length (<= 0 means no limit). Returns a freshly malloc'd
  * NUL-terminated JSON body (caller frees), or NULL on EOF / malformed header /
- * oversize payload / truncated body. */
+ * oversize payload / truncated body. A NULL here means the stream framing can
+ * no longer be trusted: an oversize payload is NOT drained, so the caller must
+ * treat NULL as end-of-session, never as "read the next message". */
 char *rpc_read_message_cb(rpc_reader_fn reader, void *ctx, long max_len);
 
 /* Default size cap applied by rpc_read_message (the FILE wrapper): 64 MB. A

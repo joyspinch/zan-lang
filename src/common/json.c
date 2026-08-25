@@ -117,12 +117,20 @@ static void json_obj_index_insert(json_value *obj, const char *key,
  * this is also correct after keys[] was realloc'd. A failed calloc leaves
  * the object without an index -- correctness never depends on it. */
 static void json_obj_index_rebuild(json_value *obj) {
-    int want = obj->as.obj.cap > 8 ? obj->as.obj.cap : 8;
-    int cap = 16;
-    while (cap < want * 2) {
-        if (cap > (INT_MAX >> 1)) { free(obj->as.obj.index); obj->as.obj.index = NULL; obj->as.obj.index_cap = 0; return; }
-        cap <<= 1;
+    /* All sizing math in 64-bit: at count ~2^30 the int expression
+     * `want * 2` would overflow before any guard could see it and wrap the
+     * ladder down to a uselessly small table. */
+    long long want = obj->as.obj.cap > 8 ? obj->as.obj.cap : 8;
+    if (want > (INT_MAX >> 2)) {
+        /* Beyond ~2^29 members an index is not worth the address space;
+         * stay on the linear path, which stays correct. */
+        free(obj->as.obj.index);
+        obj->as.obj.index = NULL;
+        obj->as.obj.index_cap = 0;
+        return;
     }
+    int cap = 16;
+    while ((long long)cap < want * 2) cap <<= 1;
     free(obj->as.obj.index);
     obj->as.obj.index = (int *)calloc((size_t)cap, sizeof(int));
     obj->as.obj.index_cap = obj->as.obj.index ? cap : 0;
@@ -184,7 +192,8 @@ void json_obj_set(json_value *obj, const char *key, json_value *val) {
      * build on first entry past 16 members, grow before load passes 0.5. */
     if (!obj->as.obj.index) {
         if (obj->as.obj.count >= 16) json_obj_index_rebuild(obj);
-    } else if ((obj->as.obj.count + 1) * 2 > obj->as.obj.index_cap &&
+    } else if ((long long)(obj->as.obj.count + 1) * 2 >
+                   (long long)obj->as.obj.index_cap &&
                obj->as.obj.index_cap <= (INT_MAX >> 1)) {
         json_obj_index_rebuild(obj);
     } else {
