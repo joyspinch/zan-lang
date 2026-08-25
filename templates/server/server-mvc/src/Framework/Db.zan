@@ -8,37 +8,15 @@ using System.Data.Sqlite;
 
 namespace ZanWeb;
 
-/// <summary>
-/// Database / Redis bootstrap driven by the [database] and [cache] sections of
-/// config/app.json. main.zan calls OpenPool() / OpenRedis() ONCE per worker
-/// process and injects the pools into DbContext / CacheContext — consumers never
-/// open connections themselves.
-///
-/// Both are POOLS, not single connections: workers are separate processes (each
-/// re-runs Main), and inside one worker every request is a coroutine, so a
-/// shared connection would serialize the whole worker and interleave two
-/// requests' transactions on one session. A pool opens its connections lazily on
-/// first use, hands one out per request, and parks a coroutine (never the
-/// thread) when every connection is checked out.
-///
-/// Nothing here fails startup: when the database or Redis is unreachable the
-/// server still serves, and handlers surface a friendly error.
-/// </summary>
+/* 数据库/Redis 启动引导，由 config/app.json 的 [database] 和 [cache] 段驱动。主进程调用 OpenPool/OpenRedis，注入 DbContext/CacheContext。消费者不自行打开连接。均为连接池而非单连接：worker 为独立进程，请求为协程，共享连接会串行化。数据库/Redis 不可达时仍启动，handler 返回友好错误。*/
 class Db {
-    /// <summary>The connection pool for the configured engine, sized by
-    /// [database].poolSize. Connections open on first acquire, so calling this
-    /// in the master process opens nothing.</summary>
+    /* 按 [database].poolSize 创建的连接池，首次 acquire 时才真正建连。*/
     static DbPool OpenPool() {
         string driver = Cfg.Db.driver;
         int size = Cfg.Db.poolSize;
         if (size < 1) { size = 1; }
         if (driver == "mysql" || driver == "mariadb") {
-            // The coroutine-ized driver: waiting for a free connection AND
-            // waiting for the server both suspend, so one worker can have
-            // `poolSize` queries in flight. The blocking driver
-            // (MySqlConnector) would cap database concurrency at one query per
-            // worker no matter how large the pool is; it is only for call sites
-            // that cannot be coroutines, which this template has none of.
+            /* 协程驱动：等待空闲连接和等待服务端均挂起协程，单 worker 可同时有 poolSize 个查询在途。阻塞驱动每 worker 最多并发 1 个查询。*/
             return MySqlAsyncConnector.Pool(Cfg.Db.host, Cfg.Db.port,
                 Cfg.Db.name, Cfg.Db.user, Cfg.Db.password, size);
         }
@@ -50,22 +28,15 @@ class Db {
         return SqliteConnector.Pool(Cfg.Db.sqlitePath, size);
     }
 
-    /// <summary>Creates the folder a SQLite file is configured to live in.
-    /// sqlite3_open does not create directories: a path like `data/app.db` in a
-    /// fresh checkout would fail to open, and the server would run with no
-    /// database at all -- schema unapplied, every sign-in "wrong
-    /// password".</summary>
+    /* SQLite 文件所在目录不存在则创建（sqlite3_open 不创建目录）。*/
     static void EnsureFileDir(string path) {
         string dir = Path.GetDirectoryName(path);
         if (dir == "") { return; }
-        // Recursive: it is a no-op per existing level, so this both creates a
-        // nested path and costs nothing on every later start.
+        /* 递归创建；已存在层级无副作用，每次启动零开销。*/
         Directory.CreateDirectoryRecursive(dir);
     }
 
-    /// <summary>Builds the Redis pool from config, or null when [cache].driver
-    /// is not "redis" (worker-local memory cache only). The pool is injected
-    /// into CacheContext.</summary>
+    /* [cache].driver=="redis" 时构造 Redis 池，否则返回 null。注入 CacheContext。*/
     static RedisPool OpenRedis() {
         if (Cfg.Cache.driver != "redis") { return null; }
         return new RedisPool(Cfg.Cache.redisHost,

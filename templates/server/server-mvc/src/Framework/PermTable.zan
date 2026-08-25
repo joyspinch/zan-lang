@@ -7,43 +7,16 @@ using ZanWeb.Model.Sys;
 
 namespace ZanWeb;
 
-/// <summary>
-/// The authorization tables in shared memory: "what may this role run" and
-/// "which roles does this account hold". Both are derived data -- the database
-/// still owns sys_role_grant / sys_user_role / sys_department_role -- but the
-/// request path reads them out of shared memory, so answering "may this uid run
-/// Users.Save?" costs no query and no per-worker duplication: every worker
-/// process attaches to the same rows.
-///
-///   roles:  key "3"  -> acts ",Users:15,Roles:1,"         (screen -> mask)
-///                      scope 2, depts ",3,7,"             (data scope)
-///   users:  key "42" -> super 0|1, roles ",3,7,"          (expires, reloaded)
-///                      scope 2, depts ",3,7,"             (resolved, expanded)
-///
-/// Roles are loaded whole on boot and rewritten when an operator changes a
-/// grant, because there are few of them and every request needs them. Accounts
-/// are filled in on first use with a short lease, because there can be millions
-/// and only the ones signing in matter.
-/// </summary>
+/* 共享内存授权表：角色可执行哪些 action、账号持有哪些角色。数据库仍持有 sys_role_grant / sys_user_role / sys_department_role，请求路径读共享内存，零查询。角色整表加载、授权变更时重写；账号按需加载，带短租约过期。*/
 class PermTable {
-    /// Shared-memory names, filled by Open from the app's scope
-    /// ("zan.web.<scope>.perm.roles" / ".perm.users"), so two servers on one
-    /// machine never read each other's authorization.
     static string RoleTable = "";
     static string UserTable = "";
-
-    /// How long an account's role set stays in shared memory before it is read
-    /// from the database again. A revocation is pushed immediately (Forget), so
-    /// this only bounds a change made by another process.
     static long UserLeaseMs = 300000;
 
     static SharedTable roles = null;
     static SharedTable users = null;
 
-    /// <summary>Creates (or attaches to) both tables, namespaced with the rest
-    /// of the app's shared memory. Called once from main before the server
-    /// starts; false means shared memory is unavailable and authorization falls
-    /// back to querying the database.</summary>
+    /* 创建或挂载两个共享表，命名空间与 app.SharedName 一致，确保同机多实例互不干扰。*/
     static bool Open(WebApp app) {
         PermTable.RoleTable = app.SharedName("perm.roles");
         PermTable.UserTable = app.SharedName("perm.users");
@@ -75,9 +48,7 @@ class PermTable {
         return PermTable.roles != null && PermTable.users != null;
     }
 
-    /// <summary>Rewrites every role's screen masks from the database. Run on boot
-    /// and after an operator changes a role's grants: a role is edited rarely
-    /// and read on every request, so it is pushed rather than expired.</summary>
+    /* 从数据库重写所有角色掩码。启动时和授权变更后运行。*/
     static async void LoadRoles(IDbConnection db) {
         if (!PermTable.Ready()) { return; }
         List<Role> rows = await db.Select<Role>().ToListAsync();
@@ -85,9 +56,7 @@ class PermTable {
         await PermTable.LoadRoles(rows, grants);
     }
 
-    /// <summary>Publishes already-loaded role rows. Controllers use this
-    /// overload with their generated Role and RoleGrant accessors, so a fixed
-    /// table write never needs to expose a request connection.</summary>
+    /* 发布已加载的角色行（Controller 端使用，避免暴露请求连接）。*/
     static async void LoadRoles(List<Role> rows, List<RoleGrant> grants) {
         if (!PermTable.Ready()) { return; }
         if (rows == null) { rows = new List<Role>(); }
@@ -112,23 +81,16 @@ class PermTable {
         }
     }
 
-    /// <summary>One role's sys_role.dataScope, 0 when the role is not in shared
-    /// memory (disabled, or the table is unavailable).</summary>
     static int RoleScope(string roleId) {
         if (!PermTable.Ready()) { return 0; }
         return PermTable.roles.GetInt(roleId, "scope");
     }
 
-    /// <summary>The departments a dataScope = 5 role names, as ",3,7,".</summary>
     static string RoleDepts(string roleId) {
         if (!PermTable.Ready()) { return ""; }
         return PermTable.roles.GetString(roleId, "depts");
     }
 
-    /// <summary>Whether one of `roleIds` (",3,7,") grants `action`: the bit the
-    /// action declared, looked up in that role's mask for the action's screen.
-    /// An action that declared no bit (Perm.BitOf == 0) is refused -- a right
-    /// nobody can grant is not a right anybody holds.</summary>
     static bool RolesAllow(string roleIds, string action) {
         if (!PermTable.Ready()) { return false; }
         int bit = Perm.BitOf(action);
@@ -136,9 +98,6 @@ class PermTable {
         return (PermTable.RolesMask(roleIds, Perm.ScreenOf(action)) & bit) != 0;
     }
 
-    /// <summary>Every bit `roleIds` hold on one screen, OR-ed together: what the
-    /// dispatcher refuses on and what the screen's buttons are rendered from,
-    /// out of the one mask.</summary>
     static int RolesMask(string roleIds, string screen) {
         if (!PermTable.Ready() || screen.Length == 0) { return 0; }
         int mask = 0;
@@ -151,9 +110,6 @@ class PermTable {
         return mask;
     }
 
-    /// <summary>This account's roles as ",3,7,", or "" when it is not in shared
-    /// memory yet (or its lease ran out) and must be read from the database.
-    /// "*" means the bootstrap account, which bypasses the role tables.</summary>
     static string UserRoles(string uid) {
         if (!PermTable.Ready()) { return ""; }
         if (!PermTable.users.Exists(uid)) { return ""; }
@@ -161,23 +117,17 @@ class PermTable {
         return PermTable.users.GetString(uid, "roles");
     }
 
-    /// <summary>This account's resolved data scope (DataScope.All / ByDept /
-    /// Self), or 0 when it has not been worked out yet -- the department set is
-    /// already expanded, so a request never walks the department tree.</summary>
     static int UserScope(string uid) {
         if (!PermTable.Ready()) { return 0; }
         if (!PermTable.users.Exists(uid)) { return 0; }
         return PermTable.users.GetInt(uid, "scope");
     }
 
-    /// <summary>The departments that scope covers, as ",3,7,".</summary>
     static string UserDepts(string uid) {
         if (!PermTable.Ready()) { return ""; }
         return PermTable.users.GetString(uid, "depts");
     }
 
-    /// <summary>Publishes an account's resolved scope alongside its roles, under
-    /// the same lease -- so dropping the account (Forget) drops both.</summary>
     static void SetUserScope(string uid, int mode, string depts) {
         if (!PermTable.Ready()) { return; }
         bool _m = PermTable.users.SetInt(uid, "scope", mode);
@@ -185,8 +135,6 @@ class PermTable {
         bool _e = PermTable.users.Expire(uid, PermTable.UserLeaseMs);
     }
 
-    /// <summary>Publishes an account's roles for every worker, with a lease so a
-    /// change nobody announced still lands eventually.</summary>
     static void SetUser(string uid, bool isSuper, string roleIds) {
         if (!PermTable.Ready()) { return; }
         bool _s = PermTable.users.SetInt(uid, "super", isSuper ? 1 : 0);
@@ -194,23 +142,16 @@ class PermTable {
         bool _e = PermTable.users.Expire(uid, PermTable.UserLeaseMs);
     }
 
-    /// <summary>Drops one account, so the next request rereads its roles. Used
-    /// after assigning roles, disabling an account or changing its
-    /// department.</summary>
     static void Forget(string uid) {
         if (!PermTable.Ready()) { return; }
         bool _d = PermTable.users.Delete(uid);
     }
 
-    /// <summary>Drops every account: for a change that can affect many at once
-    /// (a role's grants, a department's roles, a deleted role).</summary>
     static void ForgetAll() {
         if (!PermTable.Ready()) { return; }
         PermTable.users.Clear();
     }
 
-    /// <summary>The non-empty parts of ",3,7," -- the stored form of an id
-    /// set.</summary>
     static List<string> Split(string joined) {
         List<string> outp = new List<string>();
         StringBuilder cur = new StringBuilder();

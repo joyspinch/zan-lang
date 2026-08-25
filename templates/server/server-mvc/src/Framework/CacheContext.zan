@@ -3,54 +3,28 @@ using System.Data.Redis;
 
 namespace ZanWeb;
 
-/// <summary>
-/// Cache with an injected Redis pool. main.zan builds the pool from
-/// [cache] in config/app.json (or passes null) and injects it here.
-///
-/// WHERE THE DATA LIVES IS PART OF THE METHOD NAME — that distinction is the
-/// whole point of this class:
-///
-///   GetAsync / SetAsync / SetTtlAsync / DelAsync   the SHARED cache (Redis).
-///       Visible to every worker process and to every other machine talking to
-///       the same Redis. Use these for anything a second worker must see:
-///       sessions, permissions, rate counters, cached query results.
-///
-///   LocalGet / LocalSet / LocalSetTtl / LocalDel   this worker's own memory.
-///       A plain in-process map: fast, no IO, and invisible to every other
-///       worker. Only for values that may differ per worker (a short-lived
-///       memo of something immutable, a per-process counter).
-///
-/// When [cache].driver is not "redis" there is no shared cache, and the async
-/// methods fall back to this worker's memory — correct only with worker.count=1
-/// (the default), which is why the fallback is announced at startup instead of
-/// being silent. When Redis IS configured but unreachable, a read reports a
-/// MISS and a write is dropped: the caller then goes to the database, which is
-/// slower but right, instead of reading another worker's private memory.
-/// </summary>
+/* 带注入 Redis 池的缓存。main.zan 根据 [cache] 配置构建池并注入（或传 null）。命名即语义：GetAsync/SetAsync/SetTtlAsync/DelAsync = 共享缓存（Redis，所有 worker 可见）；LocalGet/LocalSet/LocalSetTtl/LocalDel = 本 worker 私有内存。driver != "redis" 时无共享缓存，async 方法回退到本地内存（仅 worker.count=1 时正确）。Redis 不可达时读 MISS 写丢弃，调用方回退到数据库。*/
 class CacheContext {
     StrMap store;
     StrMap expiry;
     RedisPool redis;
 
-    /// <summary>redis == null means worker-local memory only.</summary>
     CacheContext(RedisPool redis) {
         this.store = new StrMap();
         this.expiry = new StrMap();
         this.redis = redis;
     }
 
-    /// <summary>Wraps an injected Redis pool (null = worker-local only).</summary>
     static CacheContext Of(RedisPool redis) {
         return new CacheContext(redis);
     }
 
-    /// <summary>True when a shared (cross-worker) cache is configured.</summary>
+    /* 已配置共享（跨 worker）缓存时返回 true。*/
     bool Shared() {
         return this.redis != null;
     }
 
-    // ---- worker-local memory (never leaves this process) ----
-
+    /* ---- worker 本地内存（不出进程）---- */
     bool Alive(string key) {
         if (!this.store.Has(key)) { return false; }
         string expires = this.expiry.GetOr(key, "0");
@@ -92,10 +66,8 @@ class CacheContext {
         this.expiry.Set(key, "0");
     }
 
-    // ---- shared cache (Redis; every worker sees the same value) ----
-
-    /// <summary>Reads the shared cache. "" means MISS — also when Redis is
-    /// unreachable, so the caller falls through to its source of truth.</summary>
+    /* ---- 共享缓存（Redis，所有 worker 看到同一值）---- */
+    /* 读取共享缓存；"" 表示 MISS（Redis 不可达时同样返回，调用方回退到数据源）。*/
     async string GetAsync(string key) {
         if (this.redis == null) { return this.LocalGet(key); }
         RedisClient client = await this.redis.AcquireAsync();
@@ -141,8 +113,7 @@ class CacheContext {
         }
     }
 
-    /// <summary>Opens and parks one connection so the first request does not pay
-    /// the connect cost, and reports whether Redis actually answered.</summary>
+    /* 预热一条连接以免首次请求支付建连成本，返回 Redis 是否应答。*/
     async bool Warmup() {
         if (this.redis == null) { return false; }
         RedisClient client = await this.redis.AcquireAsync();

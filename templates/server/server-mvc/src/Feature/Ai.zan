@@ -8,19 +8,13 @@ using System.Web;
 
 namespace ZanWeb;
 
-/// <summary>
-/// One assistant persona. They differ only in the instruction they open a
-/// conversation with, which is what makes "帮我建表" and "帮我分析数据" two
-/// useful assistants rather than one vague one.
-/// </summary>
+/* AI 助手：每个助手只是一段系统提示词。 */
 class AiAgent {
     string code;
     string name;
     string hint;
     string icon;
-    // Whether this agent may hand back an action the operator can run against
-    // the database (a CREATE TABLE). It is never run without a second, explicit
-    // confirmation -- the flag only decides whether the button is offered.
+    /* 是否允许将结果提交到数据库（建表）。 */
     bool apply;
     string prompt;
 
@@ -35,8 +29,7 @@ class AiAgent {
     }
 }
 
-/// <summary>An official service the admin can be pointed at with one click:
-/// its API base, a model that exists there, and where to go for a key.</summary>
+/* 预设的 AI 服务商：接口地址、模型、申请链接。 */
 class AiVendor {
     string code;
     string name;
@@ -54,14 +47,12 @@ class AiVendor {
     }
 }
 
-/// <summary>One piece of a streamed answer, as the browser receives it. A doc
-/// rather than a hand-built string so the escaping is the JSON writer's.</summary>
+/* 流式返回的一段文本，用作 JSON 序列化对象。 */
 class AiDeltaDoc {
     string text;
 }
 
-/// <summary>The answer of one exchange: either text, or the reason there is
-/// none. Never an exception -- the caller is an HTTP handler.</summary>
+/* 一次对话的返回：成功返回文本，失败返回原因。 */
 class AiReply {
     bool ok;
     string text;
@@ -81,18 +72,9 @@ class AiReply {
     }
 }
 
-/// <summary>
-/// The assistant: provider presets, the agents the admin offers, and one call
-/// against an OpenAI-compatible /chat/completions endpoint.
-///
-/// One protocol covers every provider worth offering here (DeepSeek, OpenAI,
-/// 通义, 智谱, Moonshot, a local Ollama), so the configuration is three fields
-/// -- base URL, key, model -- and the presets fill two of them. The key lives
-/// in the settings table and is never sent to the browser, written to a log or
-/// echoed in an answer: the screen only ever learns whether one is set.
-/// </summary>
+/* AI 入口：服务商预设、内置助手、与 OpenAI 兼容接口的调用。Key 仅存于设置表，不发送到浏览器。 */
 class Ai {
-    /// <summary>The official services offered as presets, DeepSeek first.</summary>
+    /* 官方预设服务商，DeepSeek 排首位。 */
     static List<AiVendor> Vendors() {
         List<AiVendor> v = new List<AiVendor>();
         v.Add(new AiVendor("deepseek", "DeepSeek", "https://api.deepseek.com/v1",
@@ -113,10 +95,7 @@ class Ai {
         return v;
     }
 
-    /// <summary>The built-in agents. Each is one persona of the same model,
-    /// separated only by the instruction it opens with, so "建表" and "数据分析"
-    /// are two useful assistants rather than one vague one. The list is data,
-    /// not code branches: a new agent is one row here.</summary>
+    /* 内置助手列表，每个助手对应一个独立 persona。 */
     static List<AiAgent> Agents() {
         List<AiAgent> a = new List<AiAgent>();
         a.Add(new AiAgent("schema", "建表助手", "用一句话描述业务，让它设计表结构并可一键建表",
@@ -158,49 +137,39 @@ class Ai {
         return all[0];
     }
 
-    /// <summary>True when the assistant has everything it needs to answer.</summary>
+    /* AI 服务已配置可用（启用、URL、模型、Key 齐全，本地可免 Key）。 */
     static async bool Ready() {
         if (!await Settings.On(SettingKeys.AiEnabled, false)) { return false; }
         string url = await Settings.Get(SettingKeys.AiBaseUrl, "");
         string key = await Settings.Get(SettingKeys.AiApiKey, "");
         string model = await Settings.Get(SettingKeys.AiModel, "");
         if (url.Length == 0 || model.Length == 0) { return false; }
-        // A local runtime needs no key; a hosted one does.
+        /* 本地服务免 Key，线上服务必须有 Key。 */
         if (key.Length == 0 && !url.Contains("127.0.0.1") && !url.Contains("localhost")) {
             return false;
         }
         return true;
     }
 
-    /// <summary>One exchange with the configured provider, no prior turns.</summary>
+    /* 单轮对话。 */
     static async AiReply Ask(string agentCode, string question) {
         return await Ai.AskConv(agentCode, "[]", question);
     }
 
-    /// <summary>A multi-turn exchange: the agent's system prompt, the earlier
-    /// turns the browser kept for this conversation, then the new question.
-    /// `historyJson` is a JSON array of {"role","content"} and is trusted only
-    /// as text -- role is clamped and the tail is capped so a long thread can
-    /// never be pasted wholesale into one request.</summary>
+    /* 多轮对话，historyJson 仅当文本处理，角色取 user/assistant，最多保留 20 轮。 */
     static async AiReply AskConv(string agentCode, string historyJson, string question) {
         if (!await Ai.Ready()) { return AiReply.Bad("尚未配置 AI 服务"); }
         string baseUrl = await Settings.Get(SettingKeys.AiBaseUrl, "");
         string key = await Settings.Get(SettingKeys.AiApiKey, "");
         string model = await Settings.Get(SettingKeys.AiModel, "");
         string temp = await Settings.Get(SettingKeys.AiTemperature, "0.3");
-
         AiEndpoint ep = AiEndpoint.Parse(baseUrl);
         if (ep == null) { return AiReply.Bad("服务地址不合法"); }
-
         return await Ai.Complete(ep, key, model, temp,
             Ai.Messages(Ai.AgentOf(agentCode), historyJson, question));
     }
 
-    /// <summary>The messages array for one exchange: the agent's instruction,
-    /// the tail of the thread the browser kept, then the new question. The
-    /// thread is trusted only as text -- an unknown role becomes "user" and only
-    /// the last 20 turns are sent, so a long conversation cannot be replayed
-    /// wholesale into one request.</summary>
+    /* 构造 messages 数组：系统提示词 + 历史（最多 20 轮）+ 当前问题。 */
     static string Messages(AiAgent agent, string historyJson, string question) {
         StringBuilder msgs = new StringBuilder();
         msgs.Append("[{\"role\":\"system\",\"content\":");
@@ -231,9 +200,7 @@ class Ai {
         return msgs.ToString();
     }
 
-    /// <summary>The request/response half shared by every exchange: it takes a
-    /// finished messages array and returns the assistant's text or the reason
-    /// there is none.</summary>
+    /* 非流式调用：发送 messages，返回文本或失败原因。 */
     static async AiReply Complete(AiEndpoint ep, string key, string model,
                                   string temp, string messages) {
         StringBuilder body = new StringBuilder();
@@ -270,8 +237,7 @@ class Ai {
         if (root == null) { return AiReply.Bad("AI 服务返回的内容无法解析"); }
         JsonValue err = root.Get("error");
         if (err != null && err.IsObject()) {
-            // The provider's own wording is the useful part; a key never
-            // appears in it.
+            /* 服务商的错误文案直接回传，不会泄露 Key。 */
             return AiReply.Bad(err.Str("message", "AI 服务返回错误"));
         }
         JsonValue choices = root.Get("choices");
@@ -283,17 +249,7 @@ class Ai {
         return AiReply.Good(msg.Str("content", ""));
     }
 
-    /// <summary>
-    /// The same exchange, streamed: the provider's deltas are forwarded to the
-    /// browser as they arrive, so an answer starts appearing in a second instead
-    /// of after the whole completion.
-    ///
-    /// The connection to the provider is opened with stream=true and drained
-    /// into a memory sink by one coroutine while this one forwards whatever has
-    /// landed as `delta` events. Nothing is buffered to disk and no helper
-    /// process is involved. The whole answer is returned as well, so the caller
-    /// can log or store it without reassembling the stream.
-    /// </summary>
+    /* 流式调用：delta 逐块推到浏览器。 */
     static async AiReply StreamConv(HttpContext ctx, string agentCode,
                                     string historyJson, string question) {
         if (!await Ai.Ready()) { return AiReply.Bad("尚未配置 AI 服务"); }
@@ -315,8 +271,7 @@ class Ai {
 
         HttpClient http = new HttpClient(ep.Host(), ep.Port());
         if (ep.Tls()) { http = HttpClient.CreateHttps(ep.Host(), ep.Port()); }
-        // An IDLE timeout: every chunk re-arms it, so a slow answer survives
-        // while a silent provider is hung up on.
+        /* 空闲超时：每个分片重设，慢响应也能存活，静默超时会被挂断。 */
         http.SetTimeout(60000);
         http.SetHeader("Content-Type", "application/json");
         http.SetHeader("Accept", "text/event-stream");
@@ -332,8 +287,7 @@ class Ai {
         while (!finished) {
             string piece = sink.Take();
             if (piece.Length == 0) {
-                // The transport reports the outcome once; drain whatever landed
-                // with it before leaving the loop.
+                /* 传输层仅报告一次结果，退出前先把已到达的内容取光。 */
                 if (sink.Attempt().Length > 0) {
                     piece = sink.Take();
                     finished = true;
@@ -356,8 +310,7 @@ class Ai {
                     d.text = delta;
                     if (!await ctx.SseSend("delta",
                             Json.Serialize<AiDeltaDoc>(d))) {
-                        // The operator closed the panel: stop reading rather
-                        // than finish an answer nobody will see.
+                        /* 用户关闭面板，停止读取。 */
                         sink.Dispose();
                         return AiReply.Bad("客户端已断开");
                     }
@@ -377,9 +330,7 @@ class Ai {
         return AiReply.Good(text);
     }
 
-    /// <summary>One `data:` line of an OpenAI-style stream as the text it adds,
-    /// or "" for a keep-alive, the terminator, or anything unparsable. The wire
-    /// format is never assembled or split by hand beyond this.</summary>
+    /* 从 OpenAI 流式 `data:` 行提取增量文本，keep-alive/终止行返回空串。 */
     static string Delta(string line) {
         if (!line.StartsWith("data:")) { return ""; }
         string payload = line.Substring(5).Trim();
@@ -397,12 +348,7 @@ class Ai {
         return delta.Str("content", "");
     }
 
-    /// <summary>The models a provider actually offers, read from its OpenAI-style
-    /// /models endpoint, so the operator picks one instead of guessing the exact
-    /// string. Called with the base URL and key the operator just typed (the key
-    /// falls back to the stored one), and returns an empty list on any failure --
-    /// the screen keeps a text field for providers that expose no such endpoint.
-    /// </summary>
+    /* 读取服务商 /models 端点返回的模型列表。 */
     static async List<string> Models(string baseUrl, string key) {
         List<string> ids = new List<string>();
         AiEndpoint ep = AiEndpoint.Parse(baseUrl);
@@ -433,12 +379,7 @@ class Ai {
         return ids;
     }
 
-    /// <summary>Runs a table-creation the assistant proposed, after the operator
-    /// has confirmed it. Only a single CREATE TABLE statement is ever allowed: a
-    /// proposal is one statement with no way to reach DROP/DELETE, and rejecting
-    /// anything with a second statement or a comment closes the rest off. This is
-    /// the one place assistant output touches the database, and it is reached only
-    /// through a guarded, explicitly-confirmed endpoint.</summary>
+    /* 执行助手提议的建表语句：仅允许单条 CREATE TABLE，含注释或第二条语句均拒绝。 */
     static async AiReply ApplySchema(string sql) {
         string s = sql.Trim();
         while (s.EndsWith(";")) { s = s.Substring(0, s.Length - 1).Trim(); }
@@ -463,12 +404,12 @@ class Ai {
         return AiReply.Good("建表成功");
     }
 
-    /// <summary>A JSON string literal, quotes included.</summary>
+    /* JSON 字符串字面量，含引号。 */
     static string Q(string v) {
         return "\"" + Encoding.JsonEscape(v) + "\"";
     }
 
-    /// <summary>A temperature that is safe to paste into JSON.</summary>
+    /* 安全的温度值：仅数字和小数点。 */
     static string Number(string v) {
         if (v.Length == 0) { return "0.3"; }
         for (int i = 0; i < v.Length; i = i + 1) {
@@ -480,7 +421,7 @@ class Ai {
     }
 }
 
-/// <summary>A base URL split into what HttpClient needs.</summary>
+/* 将基础 URL 拆成 HttpClient 所需的 host/port/path/tls。 */
 class AiEndpoint {
     string host;
     int port;
@@ -492,8 +433,7 @@ class AiEndpoint {
     string Path() { return this.path; }
     bool Tls() { return this.tls; }
 
-    /// <summary>"https://api.deepseek.com/v1" -&gt; host/port/path. null when the
-    /// value is not a URL this client can use.</summary>
+    /* 解析 URL，返回 null 表示不是可用地址。 */
     static AiEndpoint Parse(string url) {
         AiEndpoint e = new AiEndpoint();
         string rest = url;

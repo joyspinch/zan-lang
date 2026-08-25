@@ -1,20 +1,4 @@
-/* charts.js -- the dashboard's time-series charts, drawn as SVG with no charting
-   library. A dependency for four line charts would be ~1MB of vendor code and a
-   CDN a private deployment cannot reach, while an SVG path is a string: one
-   polling loop, one <path> per series, and the browser does the rest.
-
-   Markup contract (see Admin/Dashboard.Index.html):
-
-     <div id="charts" data-src="/admin/metrics/series" data-window="120">
-       <figure class="chart" data-metric="req" data-title="QPS" data-unit="/s"></figure>
-       <figure class="chart" data-metric="p95_us,avg_us" data-title="延迟"
-               data-unit="ms" data-scale="1000" data-legend="p95,平均"></figure>
-     </div>
-
-   data-metric may name several point fields; the first is the filled series and
-   the rest are drawn as lines over it. data-scale divides the raw value (RSS in
-   bytes -> MB, latency in microseconds -> ms). A field that is -1 for the whole window (a probe the current OS
-   cannot answer) renders as "不支持" rather than a flat line at zero. */
+/* charts.js：仪表盘时间序列图，SVG 绘制，无第三方库。 */
 
 (function () {
   "use strict";
@@ -22,13 +6,10 @@
   var host = document.getElementById("charts");
   if (!host) { return; }
 
-  // Drawn in CSS pixels (the viewBox matches the measured box, nothing is
-  // stretched): a stretched viewBox would squash the axis labels and thin the
-  // strokes by whatever the card's width happened to be.
   var H = 132, PAD_L = 40, PAD_R = 8, PAD_T = 12, PAD_B = 16;
   var charts = [].slice.call(host.querySelectorAll(".chart"));
   var timer = null;
-  var last = null;   // last payload, so a resize can redraw without a request
+  var last = null;
 
   charts.forEach(function (fig) {
     fig.innerHTML =
@@ -44,8 +25,6 @@
     return s + (unit ? " " + unit : "");
   }
 
-  // A y-axis that lands on 1/2/5 x 10^n, so the gridline labels stay readable
-  // instead of "0 / 3.7333 / 7.4666".
   function niceMax(v) {
     if (v <= 0) { return 1; }
     var mag = Math.pow(10, Math.floor(Math.log(v) / Math.LN10));
@@ -86,8 +65,6 @@
       });
     });
 
-    // -1 across the board means "this platform does not report it": say so,
-    // rather than drawing a confident zero.
     var supported = points.some(function (p) {
       return points.length === 0 || p[fields[0].trim()] >= 0;
     });
@@ -147,8 +124,6 @@
       .catch(function () { host.classList.add("stale"); });
   }
 
-  // Polling stops while the tab is hidden: an unattended dashboard should not
-  // keep waking the server up once a second.
   function schedule() {
     if (timer) { clearInterval(timer); timer = null; }
     if (document.hidden) { return; }

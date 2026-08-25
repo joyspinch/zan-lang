@@ -1,17 +1,15 @@
-/* app.js -- the little glue htmx and Alpine do not cover.
-   Loaded after both; nothing here is required for a page to render. */
+/* app.js：htmx/Alpine 未覆盖的粘合层，页面渲染不依赖。 */
 
 (function () {
   "use strict";
 
-  // Send the CSRF token with every htmx request that changes state, so a form
-  // fragment never has to remember to include it.
+  // 每次 htmx 请求携带 CSRF 令牌。
   document.addEventListener("htmx:configRequest", function (e) {
     var meta = document.querySelector('meta[name="csrf-token"]');
     if (meta) { e.detail.headers["X-CSRF-Token"] = meta.content; }
   });
 
-  // A server error would otherwise swap nothing and look like a dead button.
+  // 服务端错误显示 toast，避免按钮看起来卡死。
   document.addEventListener("htmx:responseError", function (e) {
     flash(e.detail.xhr.status + " " + (e.detail.xhr.statusText || "request failed"), "bad");
   });
@@ -19,7 +17,7 @@
     flash("network error", "bad");
   });
 
-  // Server-driven toast: respond with the HX-Flash header from any handler.
+  // HX-Flash 头驱动的 toast。
   document.addEventListener("htmx:afterRequest", function (e) {
     var msg = e.detail.xhr.getResponseHeader("HX-Flash");
     if (msg) { flash(msg, e.detail.xhr.getResponseHeader("HX-Flash-Kind") || "ok"); }
@@ -35,15 +33,12 @@
     setTimeout(function () { el.remove(); }, 4000);
   }
 
-  // Live visitor count. One EventSource per page, opened once: the server
-  // pushes when the number changes shape, and the browser reconnects by itself
-  // when the stream is closed. No stream, no line -- the footer just stays put.
+  // 在线人数：每页一个 EventSource，流断开自动重连。
   (function live() {
     var host = document.querySelector("[data-live]");
     if (!host || typeof EventSource === "undefined") { return; }
     var visitors = host.querySelector("[data-live-visitors]");
     var pages = host.querySelector("[data-live-pages]");
-    // How long the server took on this page, from the browser's own timing.
     var ttfb = host.querySelector("[data-live-ttfb]");
     if (ttfb) {
       var nav = performance.getEntriesByType("navigation")[0];

@@ -10,19 +10,10 @@ using ZanWeb.Dao.Sys;
 namespace ZanWeb;
 
 class AuthUser {
-    /// <summary>sys_user.status of an account that may log in.</summary>
+    /* 可登录账号的状态值。*/
     static int Active = 1;
 
-    /// <summary>Borrows a connection for one authentication lookup. The
-    /// token / permission resolvers run on the request coroutine (their
-    /// delegates are async), so this parks like any other request instead of
-    /// blocking the worker, and it works on drivers that only offer awaited
-    /// calls. null means the database is unreachable and every caller then fails
-    /// closed (anonymous, nothing granted) rather than guessing.
-    ///
-    /// It is still one lookup per request: the RBAC phase reads the principal
-    /// from the shared permission tables instead, leaving zero queries on the
-    /// request path.</summary>
+    /* 为单次认证查询借出连接；token/权限解析在请求协程上运行（delegate 为 async），协程挂起而非阻塞 worker。null 表示数据库不可达，调用方一律降级为匿名。RBAC 阶段从共享权限表读，请求路径零查询。*/
     static async IDbConnection Lease() {
         AppServices s = AppServices.Current();
         if (s == null) { return null; }
@@ -67,8 +58,7 @@ class AuthUser {
         }
     }
 
-    /// <summary>Verifies the password and issues a cookie token. "" = rejected;
-    /// the caller must not tell the client which of the two reasons applied.</summary>
+    /* 校验密码并发放 Cookie token；"" = 拒绝，调用方不得区分失败原因。*/
     static async string Login(string username, string password) {
         User row = await AuthUser.ByUsername(username);
         if (row == null || row.status != AuthUser.Active) { return ""; }
@@ -78,10 +68,7 @@ class AuthUser {
             WebApp.NowSeconds());
     }
 
-    /// <summary>The account's current token version, or -1 when it cannot log in
-    /// (unknown, disabled, or the database is out of capacity). A token whose
-    /// version differs was issued before a password change / forced logout and is
-    /// no longer valid — so the token itself carries no password material.</summary>
+    /* 账号当前 token 版本号；无法登录时返回 -1。token 版本不同即作废，token 本身不含密码材料。*/
     static async int TokenVersion(string uid) {
         User row = await AuthUser.ById(uid);
         if (row == null || row.status != AuthUser.Active) { return -1; }
@@ -92,45 +79,23 @@ class AuthUser {
         return Filter.ToInt(s, 0);
     }
 
-    // ---- authorization ------------------------------------------------------
-    // A user holds roles (sys_user_role, plus the roles of their department),
-    // a role holds route actions (sys_role_grant), and a route action is what
-    // the dispatcher and the menu both ask about. That is the whole model: no
-    // permission directory, no code to keep in step with the routes, and one
-    // question -- "may this uid run this action?" -- answered in one place for
-    // both the gateway and the sidebar, so a visible link can never 403.
-    //
-    // Both halves live in shared memory (PermTable), so a page that asks once
-    // per menu entry costs no query and every worker process reads the same
-    // rows. The database is only consulted when an account is not in the table
-    // yet; a write drops it there and then.
-
-    /// <summary>Drops one account's roles, so its next request rereads
-    /// them.</summary>
+    /* ---- 授权 ---- */
+    /* 模型：用户持角色，角色持路由 action，action 是调度和菜单共问的唯一权限单位。权限数据在共享内存（PermTable），首次缺失时从数据库加载。授权变更主动写回共享内存。*/
     static void Forget(string uid) { PermTable.Forget(uid); }
 
-    /// <summary>Drops every account: used after a change that can affect many at
-    /// once (a department's roles, a reassignment).</summary>
     static void ForgetAll() { PermTable.ForgetAll(); }
 
-    /// <summary>Republishes what every role may run and drops every cached
-    /// account: for a change to a role, its grants or its status.</summary>
     static async void RolesChanged(IDbConnection db) {
         await PermTable.LoadRoles(db);
         PermTable.ForgetAll();
     }
 
-    /// <summary>Refreshes role permissions from rows already read through a
-    /// controller's generated table accessors.</summary>
     static async void RolesChanged(List<Role> roles, List<RoleGrant> grants) {
         await PermTable.LoadRoles(roles, grants);
         PermTable.ForgetAll();
     }
 
-    /// <summary>The PermissionResolver the dispatcher and the menu both go
-    /// through: whether this account may run that route action. The bootstrap
-    /// account bypasses the lookup, which is how the first role gets granted
-    /// at all.</summary>
+    /* 调度器和菜单共用的权限解析：账号是否可执行该 action。Bootstrap 账号绕过查找。*/
     static async bool Allow(string uid, string action) {
         if (action.Length == 0) { return false; }
         string roleIds = await AuthUser.RolesOf(uid);
@@ -139,10 +104,7 @@ class AuthUser {
         return PermTable.RolesAllow(roleIds, action);
     }
 
-    /// <summary>Which buttons of one screen this account holds (see PermBit) --
-    /// the same masks Allow() refuses on, so a rendered button and an accepted
-    /// request are one decision. The bootstrap account holds every bit the
-    /// screen actually has.</summary>
+    /* 该账号在某屏上的按钮掩码；与 Allow() 拒之依据为同一决策。Bootstrap 账号持该屏所有位。*/
     static async int MaskOf(string uid, string screen) {
         if (screen.Length == 0) { return 0; }
         string roleIds = await AuthUser.RolesOf(uid);
@@ -151,10 +113,7 @@ class AuthUser {
         return PermTable.RolesMask(roleIds, screen) & Perm.MaskOf(screen);
     }
 
-    /// <summary>This account's roles as ",3,7," ("*" for the bootstrap account,
-    /// "" when it is unknown, disabled or the database is unreachable -- an
-    /// unresolvable account holds no rights). Read from shared memory; filled in
-    /// from the database on the first request that misses.</summary>
+    /* 账号角色 ",3,7,"；"*" 为 bootstrap；"" 为未知/禁用/数据库不可达。共享内存读，首次缺失从数据库填充。*/
     static async string RolesOf(string uid) {
         int id = AuthUser.ToInt(uid);
         if (id <= 0) { return ""; }
@@ -179,9 +138,7 @@ class AuthUser {
         }
     }
 
-    /// <summary>The enabled roles this account holds -- its own and its
-    /// department's, so a new hire inherits the department's rights without a
-    /// second assignment -- as ",3,7,".</summary>
+    /* 账号已启用的角色（自身 + 所在部门），输出 ",3,7,"。*/
     static async string RoleIds(IDbConnection db, User me) {
         List<int> roleIds = new List<int>();
         List<UserRole> mine = await db.Select<UserRole>()
@@ -225,9 +182,6 @@ class AuthUser {
         return false;
     }
 
-    /// <summary>Whether a comma-joined list holds the whole item `needle`. The
-    /// commas are part of the comparison, so "Users.List" never matches
-    /// "Users.ListAll". Used to read checkbox sets off a form.</summary>
     static bool Holds(string haystack, string needle) {
         if (needle.Length == 0) { return false; }
         return ("," + haystack + ",").Contains("," + needle + ",");
@@ -235,11 +189,7 @@ class AuthUser {
 }
 
 class AuthToken {
-    /// <summary>The cookie key: [auth].secret in config/app.json, overridden by
-    /// the ZAN_AUTH_SECRET environment variable when that is set (so a
-    /// deployment can keep the secret out of the file).</summary>
     static string Secret() { return Cfg.Auth.secret; }
-
     static bool Ready() { return AuthToken.Secret().Length >= 32; }
 
     static bool Equal(string actual, string expected) {
@@ -285,10 +235,7 @@ class AuthToken {
         return Sha256.Hash(secret, secret.Length);
     }
 
-    /// <summary>Builds the cookie: version marker, uid, issue time and the
-    /// account's tokenVersion, encrypted and authenticated with AES-GCM. No
-    /// password material goes in, so the cookie cannot leak credentials and a
-    /// forced logout is one integer bump.</summary>
+    /* 用 AES-GCM 加密签发 Cookie：版本标记 + uid + 签发时间 + tokenVersion。不含密码材料，强制登出只需 bump 整数。*/
     static string Issue(string uid, int tokenVersion, int now) {
         if (!AuthToken.Ready()) { return ""; }
         string plain = "2\t" + uid + "\t" + Convert.ToString(now) + "\t"
@@ -345,8 +292,7 @@ class AuthToken {
         if (issued <= 0 || issued > now + 300 || issued + 864000 <= now) { return ""; }
         int carried = Filter.ToInt(plain.Substring(third + 1), -1);
         int current = await AuthUser.TokenVersion(uid);
-        // Never log the token or the uid: an access log is not a place to leak
-        // credential material.
+        /* 不记录 token 或 uid，避免凭证材料泄漏。*/
         if (carried < 0 || current < 0 || carried != current) { return ""; }
         return uid;
     }

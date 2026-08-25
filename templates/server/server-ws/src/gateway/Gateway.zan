@@ -6,20 +6,7 @@ using System.Net.WebSocket;
 
 namespace WsGateway;
 
-/// <summary>
-/// The Gateway owns the network: it performs the RFC 6455 handshake, keeps a
-/// registry of every connected client, and offers Broadcast / Push so business
-/// code can fan messages out to clients it never directly accepted. Business
-/// logic lives in a separate worker (see worker/ChatWorker.zan) -- the Gateway
-/// only moves bytes, which is what makes the two independently scalable.
-///
-/// SCALING: this is a single-process gateway; the coroutine event loop already
-/// handles thousands of concurrent sockets. To scale across processes/machines
-/// (the classic Gateway/Worker/Register topology) run several gateways behind a
-/// shared message bus -- publish each broadcast to Redis (System.Data.Redis)
-/// on the [scale].channel and have every gateway subscribe and fan out to its
-/// LOCAL clients. That "Register" bridge is the documented extension point.
-/// </summary>
+/* WebSocket 网关：负责 RFC 6455 握手、客户端注册与推送/广播。业务逻辑在 ChatWorker。 */
 class Gateway {
     string host;
     int port;
@@ -48,14 +35,7 @@ class Gateway {
         return 2;
     }
 
-    /// <summary>Writes an already-encoded frame to one socket with a bounded
-    /// full-send loop. Uses the non-blocking Socket.Send (a direct syscall)
-    /// rather than the awaitable SendBytesAsync ON PURPOSE: a broadcast runs in
-    /// one connection's coroutine but must write to *other* connections whose
-    /// own coroutines are parked awaiting readability on those sockets. Awaiting
-    /// writability on a socket already registered for read would double-register
-    /// the fd on the reactor; a direct send never touches the read registration.
-    /// </summary>
+    /* 使用非阻塞 Send（直接 syscall）向单个 socket 写帧，避免双注册 fd。 */
     static bool SendFrame(nint sock, string enc, int total) {
         int off = 0;
         int tries = 0;
@@ -72,8 +52,7 @@ class Gateway {
         return true;
     }
 
-    /// <summary>Sends one text frame to a single client. Returns 1 on success,
-    /// 0 if the client was dead/unwritable (then marked dead).</summary>
+    /* 向单个客户端推送文本帧，成功返回 1，客户端不可用返回 0。 */
     int Push(ClientConn c, string text) {
         if (!c.alive) { return 0; }
         WsFrame f = WsFrame.TextFrame(text);
@@ -84,9 +63,7 @@ class Gateway {
         return 0;
     }
 
-    /// <summary>Sends one text frame to every connected client. Returns the
-    /// number of clients the frame was delivered to. Encodes once, then reuses
-    /// the same bytes for every recipient.</summary>
+    /* 向所有客户端广播文本帧，返回成功数。编码一次后复用。 */
     int Broadcast(string text) {
         WsFrame f = WsFrame.TextFrame(text);
         string enc = f.Encode();
@@ -134,7 +111,7 @@ class Gateway {
         this.nextId = this.nextId + 1;
         ClientConn conn = ClientConn.Create(this.nextId, clientSock);
 
-        // ---- RFC 6455 handshake ----
+        /* ---- RFC 6455 握手 ---- */
         string rawReq = await conn.client.RecvAsync(65536);
         HttpRequest req = HttpRequest.Parse(rawReq);
         string upgrade = req.GetHeader("Upgrade");
@@ -155,13 +132,13 @@ class Gateway {
         sb.Append("\r\n\r\n");
         int hr = await conn.client.SendAsync(sb.ToString());
 
-        // ---- register + notify worker ----
+        /* ---- 注册并通知 worker ---- */
         this.conns.Add(conn);
         int pr = this.Push(conn, "* welcome, you are client #" + Convert.ToString(conn.id));
         string openMsg = await ChatWorker.OnOpen(conn, this.Count());
         int jr = this.Broadcast(openMsg);
 
-        // ---- read loop ----
+        /* ---- 读循环 ---- */
         WsReader reader = new WsReader(clientSock);
         bool connected = true;
         while (connected) {
@@ -189,7 +166,7 @@ class Gateway {
             }
         }
 
-        // ---- unregister + notify worker ----
+        /* ---- 注销并通知 worker ---- */
         conn.alive = false;
         this.Remove(conn);
         string closeMsg = await ChatWorker.OnClose(conn, this.Count());

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Json;
 using System.Text;
@@ -8,24 +8,12 @@ using ZanWeb;
 
 namespace ZanWeb.Admin.Monitor;
 
-/// <summary>
-/// Server monitoring at /admin/monitor: throughput, errors, latency, queries,
-/// CPU and memory as charts.
-///
-/// The page subscribes to /admin/monitor/stream ONCE and the server pushes a
-/// snapshot every couple of seconds (Server-Sent Events). Polling would mean a
-/// full request -- routing, auth resolution, a log line -- per tick per open
-/// tab, to answer "has anything changed"; a stream costs one connection and
-/// sends only when there is something to send. A comment line goes out between
-/// snapshots so an idle proxy does not decide the connection is dead.
-/// </summary>
+/* /admin/monitor 服务器监控：吞吐量、错误、延迟、查询、CPU/内存，以图表呈现；页面向 /admin/monitor/stream 订阅一次，服务器经 Server-Sent Events 每几秒推一份快照——轮询等价于每 tick 每标签页一次完整请求（路由、授权解析、记日志），流只占一条连接且仅在有数据时发送，空闲时发注释行让代理不误判断连。 */
 [Route("admin/monitor/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("运行监控")]
 class Monitor : AdminController {
-    /// <summary>How long a stream lives before the browser is asked to
-    /// reconnect. Bounded on purpose: a tab left open overnight should not hold
-    /// a coroutine forever, and EventSource reconnects on its own.</summary>
+    /* 流存活时长；有意的上限：标签整夜开着不应永远占协程，EventSource 会自连。 */
     static int StreamSeconds = 1800;
 
     [HttpGet]
@@ -45,10 +33,7 @@ class Monitor : AdminController {
         d.Set("pid", Convert.ToString(m.Long("pid", 0)));
         d.Set("slow", Fmt.Dur(req.Long("slow_threshold_us", 0)));
 
-        // The day's four figures are rendered with the page, so the first
-        // paint already shows the day's total instead of this worker's counter
-        // (which is 0 on a worker that has just been spawned). The page keeps
-        // them current from /admin/monitor/today.
+        /* 当日四个数字随页渲出，首次绘制即为当日汇总而非本 worker 计数器（新派 worker 从 0 起），页后续由 /admin/monitor/today 保持更新。 */
         long now = (long)WebApp.NowSeconds();
         long today = Monitor.Today(now);
         long from = Monitor.PickedDay(this.In("d"), today);
@@ -57,8 +42,6 @@ class Monitor : AdminController {
         MetricMinute day = await MetricsStore.WindowTotals(from, to, "", "");
         d.Set("day", Fmt.Day(from));
         d.Set("d", Fmt.Day(from));
-        // A past day's cumulative half is finished history; the live half of
-        // the page still describes right now, whichever day is being read.
         if (from < today) { d.Set("past", "1"); }
         d.Set("dayCalls", Convert.ToString(day.calls));
         d.Set("dayErrors", Convert.ToString(day.errors));
@@ -67,8 +50,7 @@ class Monitor : AdminController {
         this.Page(d);
     }
 
-    /// <summary>The live snapshot stream. Not a menu entry: the monitor page is
-    /// its user interface.</summary>
+    /* 实时快照流；非菜单项，监控页为其界面。 */
     [HttpGet]
     [Custom(Perm = PermBit.View)]
     [Description("运行指标事件流")]
@@ -76,9 +58,7 @@ class Monitor : AdminController {
         HttpContext ctx = this.Ctx();
         if (!await ctx.SseOpen()) { return; }
 
-        // The first frame carries the recent history so the charts are drawn
-        // full rather than filling up over the next two minutes. Every frame
-        // is the merge of every live worker, not this process's own numbers.
+        /* 首帧携带近期历史使图表一次绘满，而非两分钟内慢慢填满；每帧为所有 live worker 的合并，非本进程自身数字。 */
         if (!await ctx.SseSend("series", await MetricsCluster.SeriesJson(120))) {
             return;
         }
@@ -101,28 +81,12 @@ class Monitor : AdminController {
         }
     }
 
-    /// How the day is bucketed on the live page: five minutes, so a whole day
-    /// is 288 points -- enough to see a spike, few enough to draw.
+    /* 当日页面按五分钟分桶：一昼夜 288 个点，足以看见尖峰又易绘。 */
     static long DayStep = 300;
-    /// How many interfaces the day ranking shows per ordering it is taken by.
+    /* 当日排名每个排序下展示条数。 */
     static int DayRoutes = 20;
 
-    /// <summary>One day -- today so far, or a picked one in full -- read from
-    /// the persisted minute rows rather than from any process's counters.
-    ///
-    /// Why not the live snapshot: a worker's counters start at zero when it
-    /// starts, so a restarted (or newly spawned) worker makes the page's
-    /// totals, its ranking and its charts jump backwards -- the numbers "come
-    /// and go" without anything having happened to the traffic. The minute
-    /// table is written by every worker into one database, keyed by minute and
-    /// interface, so it accumulates across restarts and across the fleet: the
-    /// same request is counted once, whichever worker served it, and a chart
-    /// drawn from it grows through the day instead of being replaced by the
-    /// last two minutes of live samples.
-    ///
-    /// This worker's own unflushed buckets are flushed first, so the current
-    /// minute is included. Another worker's are not: its last flush is at most
-    /// [metrics].flushSeconds old, which is what `as_of` reports.</summary>
+    /* 当日（今天至此，或指定的一天完整）取自持久化的分钟行而非任一进程计数器。不用实时快照：worker 计数器于启动时归零，重启/新派会让页面总计、排名、图表反向跳变。分钟表由所有 worker 写入同一库、以分钟+接口为键，跨重启跨集群累积；本 worker 未刷出的桶先刷出，故当前分钟被纳入；as_of 报告其余 worker 最新刷出的时刻。 */
     static async string DayJson(long from, long to) {
         int _w = await MetricsStore.Flush();
         MetricMinute tot = await MetricsStore.WindowTotals(from, to, "", "");
@@ -130,7 +94,7 @@ class Monitor : AdminController {
             "", "", Monitor.DayStep, Monitor.MaxRows);
         rows = Monitor.FillGaps(rows, from, to, Monitor.DayStep);
 
-        // Oldest first: the chart's x axis runs forwards.
+        /* 最旧在前：图表 x 轴正向。 */
         JsonValue pts = JsonValue.NewArray();
         for (int i = rows.Count - 1; i >= 0; i = i - 1) {
             MetricMinute b = rows[i];
@@ -160,15 +124,7 @@ class Monitor : AdminController {
         return o.ToJson();
     }
 
-    /// <summary>Today's interfaces, one row each, for a table the operator
-    /// sorts by whichever column the question is about.
-    ///
-    /// Taken by both orderings the database can rank by and merged: the top
-    /// interfaces by call count and the top ones by time spent are different
-    /// sets -- the interface that ate the day is often not the busiest one --
-    /// so ranking by only one of them would hide the other's leaders no matter
-    /// which column the screen is then sorted by. An interface reached by both
-    /// queries is kept once.</summary>
+    /* 当日各接口一行，供操作员按所问列排序；按调用量与耗时两套排序合并取 top——吞吐最多者常非耗时最多者，单排序会隐藏另一端的领先者。 */
     static async JsonValue DayTop(long from, long to) {
         JsonValue arr = JsonValue.NewArray();
         Dictionary<string,int> seen = new Dictionary<string,int>();
@@ -177,9 +133,7 @@ class Monitor : AdminController {
         return arr;
     }
 
-    /// <summary>Appends today's interfaces ranked by `rank` -- "calls" (how
-    /// often) or "time" (how much of the server's day the interface consumed)
-    /// -- skipping the ones already in `arr`.</summary>
+    /* 追加当日按 rank（calls=频次 / time=占服务器当日时间比）排序的接口，跳过已在 arr 中的。 */
     static async void AppendDayTop(JsonValue arr, Dictionary<string,int> seen,
             long from, long to, string rank) {
         List<MetricMinute> tops = await MetricsStore.RouteTotalsBy(from, to,
@@ -200,9 +154,7 @@ class Monitor : AdminController {
         }
     }
 
-    /// <summary>A day's cumulative figures as one request, for tooling and for
-    /// the page's first paint. `d` (YYYY-MM-DD) picks the day; today by
-    /// default.</summary>
+    /* 当日累计指标单次请求，供工具与页面首绘；d (YYYY-MM-DD) 指定日，默认今天。 */
     [HttpGet]
     [Custom(Perm = PermBit.View)]
     [Description("当天累计指标")]
@@ -214,29 +166,23 @@ class Monitor : AdminController {
             Monitor.DayEnd(from, today, now)));
     }
 
-    /// <summary>The second today started.</summary>
+    /* 今日零点秒。 */
     static long Today(long now) { return Fmt.TodayStart(now); }
 
-    /// <summary>The day a screen asked for: the picked date when it parses and
-    /// is not in the future, otherwise today. A day that has not happened has
-    /// no rows, and answering with an empty screen would read as lost
-    /// history.</summary>
+    /* 屏幕所求日期：可解析且不在未来的取指定日，否则取今日；未来日无行，答空表会被读作历史丢失。 */
     static long PickedDay(string day, long today) {
         long start = Monitor.DaySeconds(day);
         if (start < 0 || start > today) { return today; }
         return start;
     }
 
-    /// <summary>Where the day being read ends: midnight for a finished day, and
-    /// now for today -- a window that ran to tonight's midnight would report
-    /// the hours that have not happened yet as a day with no traffic.</summary>
+    /* 被读当日终点：已结束日取午夜，今日取此刻——窗跑到今夜午夜的会把尚未发生的时刻算作无流量的一日。 */
     static long DayEnd(long from, long today, long now) {
         if (from >= today) { return now; }
         return from + 86399;
     }
 
-    /// <summary>The same snapshot as one request, for tooling that is not a
-    /// browser.</summary>
+    /* 与实时快照同一次请求，供非浏览器工具。 */
     [HttpGet]
     [Custom(Perm = PermBit.View)]
     [Description("运行指标快照")]
@@ -251,15 +197,7 @@ class Monitor : AdminController {
         this.Json(await MetricsCluster.SeriesJson(this.InInt("sec", 120)));
     }
 
-    /// <summary>The analysis the live stream cannot do: which hour (or day)
-    /// carried how much traffic at what throughput and latency, and which
-    /// interfaces carried it. Both tables are grouped by the database -- per
-    /// time bucket (minute/hour/day via `g`) and per interface over the window
-    /// -- not assembled from raw minute rows on the screen. An interface is a
-    /// method and a path ("GET" + "/api/index/index"), the two filters `m` and
-    /// `route` narrow to; a request no route or asset served has no path of its
-    /// own and was never filed, so nothing here comes from a scanner's URL.
-    /// </summary>
+    /* 流无法完成的分析：哪小时/日承载多少流量、吞吐与延迟、由哪些接口承载；两表由数据库按时间桶与接口分组，非屏幕端拼分钟行。接口即 method+path；无路径的请求从未被登记，故无扫描器 URL。 */
     [HttpGet]
     [Route("/admin/monitor/history")]
     [Custom(IsMenu = true, Icon = "mdi:chart-timeline-variant", Perm = PermBit.View)]
@@ -268,11 +206,7 @@ class Monitor : AdminController {
         ViewData d = await this.Layout("历史统计");
         string method = this.In("m");
         string route = this.In("route");
-        // Two ways to pick the window, because they answer different
-        // questions: `h` is "the last N hours" (what is happening now) and
-        // `d`/`d2` are calendar dates (what happened that day). A dated window
-        // is closed on both ends, so its buckets are the same rows every time
-        // it is opened -- a rolling window's are not.
+        /* 两种取窗方式：h 为"过去 N 小时"，d/d2 为日历日期；日历窗两端闭合，故每次打开桶相同，滚动窗则不然。 */
         MetricWindow w = Monitor.Window(this.In("d"), this.In("d2"),
             this.InInt("h", 24));
         string gran = Monitor.Gran(this.In("g"), w.hours);
@@ -280,28 +214,22 @@ class Monitor : AdminController {
         long from = w.from;
         long to = w.to;
 
-        // The window is flushed first, so "the last hour" includes the minute
-        // that is still being filled instead of stopping ten minutes short.
+        /* 先刷窗，使"过去一小时"含正在填充的分钟而非止于十分钟前。 */
         int _w = await MetricsStore.Flush();
         List<MetricMinute> rows = await MetricsStore.HistoryBuckets(from, to,
             method, route, step, Monitor.MaxRows);
-        // Two orders, because they answer different questions: which
-        // interface was called most, and which one the server spent the
-        // window inside. The parameter picks between them by name; it never
-        // reaches the statement.
+        /* 两种顺序：哪个接口被调最多、哪个接口占窗内服务器时间；参数以名称切换，不进入语句。 */
         string by = "calls";
         if (this.In("by") == "time") { by = "time"; }
         List<MetricMinute> tops = await MetricsStore.RouteTotalsBy(from, to,
             method, route, Monitor.MaxRoutes, by);
-        // A dated window shows every bucket it contains, including the ones
-        // with no traffic: "03:00 had nothing" is a fact about the day, and a
-        // table that silently skips those hours cannot be read as a timeline.
+        /* 日历窗展示其含的全部桶，含无流量者——"03:00 无数据"是事实，跳过这些小时会被误读为时间线。 */
         if (w.dated) { rows = Monitor.FillGaps(rows, from, to, step); }
 
         List<StrMap> items = d.AddList("rows");
         long calls = 0;
         long errors = 0;
-        long peakQps10 = 0;    // peak bucket throughput, in tenths of req/s
+        long peakQps10 = 0;
         for (int i = 0; i < rows.Count; i = i + 1) {
             MetricMinute b = rows[i];
             calls = calls + b.calls;
@@ -325,9 +253,7 @@ class Monitor : AdminController {
         for (int i = 0; i < tops.Count; i = i + 1) {
             MetricMinute b = tops[i];
             StrMap r = new StrMap();
-            // Two cells, because they are two things: the verb and the
-            // interface. The old single "route" cell is still filled with the
-            // pair so a view that has not been updated keeps rendering.
+            /* 两格：动作与接口；为兼容未更新的视图，仍把两值拼入老 route 格。 */
             r.Set("method", b.method);
             r.Set("path", b.path);
             r.Set("route", b.method + " " + b.path);
@@ -356,9 +282,7 @@ class Monitor : AdminController {
         d.Set("to", Fmt.Stamp(to));
         if (w.dated) { d.Set("dated", "1"); }
         if (w.invalid) { d.Set("badDate", "1"); }
-        // The window as one label, built here rather than in the template: the
-        // view engine has no {{else}}, and a KPI that reads "24 小时" for a
-        // dated query would describe the wrong window.
+        /* 窗标签在此构建，模板无 {{else}}，故不能让 KPI 对日历查询读作"24 小时"。 */
         string label = Convert.ToString(w.hours) + " 小时";
         if (w.dated) {
             label = w.day;
@@ -373,16 +297,12 @@ class Monitor : AdminController {
         d.Set("avgQps", Monitor.Tenths(windowQps10));
         d.Set("peakQps", Monitor.Tenths(peakQps10));
         d.Set("shown", Convert.ToString(rows.Count));
-        // A dated window always has its buckets (zero-filled), so "nothing
-        // here" is about the traffic, not about how many rows came back.
         if (calls == 0) { d.Set("empty", "1"); }
         if (rows.Count >= Monitor.MaxRows) { d.Set("capped", "1"); }
         this.Page(d);
     }
 
-    /// <summary>The same window as a file. Bounded by the same row cap as the
-    /// screen, so an export cannot be used to pull the whole database in one
-    /// request.</summary>
+    /* 与屏同窗的文件导出；受同条行数上限约束，一次请求无法拉出整库。 */
     [HttpGet]
     [Custom(Perm = PermBit.Export)]
     [Description("导出历史统计")]
@@ -410,8 +330,6 @@ class Monitor : AdminController {
                 MetricMinute b = rows[i];
                 MetricsRowDoc o = new MetricsRowDoc();
                 o.bucket = b.minute;
-                // What the rows were filtered to: a bucket row is a sum over
-                // interfaces, so it carries the filter, not a name of its own.
                 o.method = method;
                 o.path = route;
                 o.calls = b.calls;
@@ -454,9 +372,7 @@ class Monitor : AdminController {
             sb.ToString());
     }
 
-    /// <summary>Every error the server caught, as persisted by the sink the
-    /// dispatcher feeds. Details are redacted before they are stored, so this
-    /// screen shows no keys, tokens or passwords.</summary>
+    /* 服务器捕获的所有错误，按分发器喂给 sink 的持久化形式；存储前已脱敏，此屏不含密钥、令牌或密码。 */
     [HttpGet]
     [Route("/admin/monitor/errors")]
     [Custom(IsMenu = true, Icon = "mdi:alert-circle-outline", Perm = PermBit.View)]
@@ -485,12 +401,7 @@ class Monitor : AdminController {
         this.Page(d);
     }
 
-    /// <summary>The shared memory this process has mapped, read-only: one row
-    /// per table with what it holds and what it costs. A table's mapping is
-    /// reserved address space -- rows are addressable without being paid for --
-    /// so the size it was created with and the part of it that is actually
-    /// resident are two columns, never one. The numbers are per process: every
-    /// worker maps the same table at its own residency.</summary>
+    /* 本进程映射的共享内存（只读）：每表一行，含所存内容与所耗成本；映射是预留地址空间（行可寻址但未必已占用），故创建大小与实际驻留为两列。数字按进程计：各 worker 在同驻留映射各自表。 */
     [HttpGet]
     [Route("/admin/monitor/tables")]
     [Custom(IsMenu = true, Icon = "mdi:memory", Perm = PermBit.View)]
@@ -522,8 +433,7 @@ class Monitor : AdminController {
             r.Set("resident", Fmt.Bytes(live));
             items.Add(r);
             reserved = reserved + res;
-            // A platform that cannot report residency reports -1, and one
-            // unknown row makes the total an underestimate rather than a lie.
+            /* 平台不可报告驻留时答 -1；一条未知行使总数为低估而非谎言。 */
             if (live < 0) { partial = true; } else { resident = resident + live; }
         }
         d.Set("count", Convert.ToString(n));
@@ -534,13 +444,9 @@ class Monitor : AdminController {
         this.Page(d);
     }
 
-    /// <summary>The largest window and page an export or screen may ask for.
-    /// A query string is not allowed to decide how much of the database one
-    /// request reads.</summary>
+    /* 导出与屏幕可请求的最大窗与页；查询串不得决定一次请求读取多少数据。 */
     static int MaxRows = 5000;
     static int MaxHours = 720;
-    /// How many interfaces the per-interface table shows: enough for every real
-    /// API, bounded so a long route table cannot grow the page without limit.
     static int MaxRoutes = 100;
 
     static int Hours(int h) {
@@ -549,12 +455,7 @@ class Monitor : AdminController {
         return h;
     }
 
-    /// <summary>The window a screen asked for: a calendar day (or a range of
-    /// them) when `day` parses, otherwise the last `h` hours. A dated window
-    /// covers whole days -- 00:00:00 through 23:59:59 -- so the same date always
-    /// answers with the same buckets, and it is clamped to MaxHours like the
-    /// rolling one: a query string does not get to ask for a year at a
-    /// time.</summary>
+    /* 屏幕所求窗：day 可解析时取日历日（或多日），否则取过去 h 小时；日历窗覆盖整日 00:00:00–23:59:59，同一日期答同桶；滚动窗同样钳到 MaxHours，查询串一次不能要一整年。 */
     static MetricWindow Window(string day, string day2, int h) {
         MetricWindow w = new MetricWindow();
         w.day = "";
@@ -586,9 +487,7 @@ class Monitor : AdminController {
         return w;
     }
 
-    /// <summary>"YYYY-MM-DD" as the UTC second that day starts, or -1 when it
-    /// is not a date. Parsed by hand rather than trusted: this value picks the
-    /// rows a page reads.</summary>
+    /* "YYYY-MM-DD" 转该日 UTC 零点秒；不可解析为 -1；手解析不信任，因该值决定页面读哪些行。 */
     static long DaySeconds(string s) {
         if (s == null || s.Length != 10) { return 0 - 1; }
         if (s.Substring(4, 1) != "-" || s.Substring(7, 1) != "-") {
@@ -602,8 +501,7 @@ class Monitor : AdminController {
         return Fmt.LocalDayStart(y, m, dd);
     }
 
-    /// <summary>`n` digits of `s` at `at` as a number, or -1 if any of them is
-    /// not a digit.</summary>
+    /* 取 s 在 at 处 n 位数字；任一非数字返回 -1。 */
     static int Digits(string s, int at, int n) {
         int v = 0;
         for (int i = 0; i < n; i = i + 1) {
@@ -614,10 +512,7 @@ class Monitor : AdminController {
         return v;
     }
 
-    /// <summary>The same rows with every empty bucket of the window filled in
-    /// as a zero row, newest first -- what makes a day 24 hours long on screen
-    /// whether or not it had traffic. Bounded by MaxRows like the query
-    /// itself.</summary>
+    /* 空桶补零；使一天在屏上为 24 小时，无论有无流量；按 MaxRows 上限。 */
     static List<MetricMinute> FillGaps(List<MetricMinute> rows, long from,
                                        long to, long step) {
         List<MetricMinute> outp = new List<MetricMinute>();
@@ -640,9 +535,7 @@ class Monitor : AdminController {
         return outp;
     }
 
-    /// <summary>The granularity, validated; unset picks the one whose table
-    /// stays readable for the window (minutes up to 3h, hours up to 3 days,
-    /// days beyond).</summary>
+    /* 粒度校验；未设时按窗长挑选可读的粒度（≤3h 分钟，≤3d 小时，更长按日）。 */
     static string Gran(string g, int hours) {
         if (g == "min" || g == "hour" || g == "day") { return g; }
         if (hours <= 3) { return "min"; }
@@ -656,8 +549,7 @@ class Monitor : AdminController {
         return 3600;
     }
 
-    /// <summary>The bucket as the screen names it: a day by its date, an hour
-    /// as "date hh:00", a minute with its full clock.</summary>
+    /* 桶按屏称呼：日按日期、小时"日期 hh:00"、分钟完整时钟。 */
     static string BucketLabel(long sec, string gran) {
         if (gran == "day") { return Fmt.Day(sec); }
         string s = Fmt.Stamp(sec);
@@ -667,28 +559,24 @@ class Monitor : AdminController {
         return s;
     }
 
-    /// <summary>A count in tenths, as "12.3". Integer arithmetic: the number
-    /// is for a table cell, not for further math.</summary>
+    /* 十分位计数，作 "12.3"；整数运算，仅为表格单元格而非后续数学。 */
     static string Tenths(long v10) {
         return Convert.ToString(v10 / 10) + "." + Convert.ToString(v10 % 10);
     }
 
-    /// <summary>`part` of `whole` as a percentage with one decimal.</summary>
+    /* part/whole 作百分比，一位小数。 */
     static string Rate(long part, long whole) {
         if (whole <= 0) { return "0.0"; }
         return Monitor.Tenths(part * 1000 / whole);
     }
 
-    /// <summary>Mean duration in microseconds, 0 for a bucket with no calls (a
-    /// zero-filled hour has no average, and dividing by its 0 calls would be a
-    /// fault rather than an answer).</summary>
+    /* 微秒均值；无调用桶答 0（补零小时无均值，除 0 会出错而非答数）。 */
     static long Avg(long totalUs, long calls) {
         if (calls <= 0) { return 0; }
         return totalUs / calls;
     }
 
-    /// <summary>A CSV cell: quoted, with embedded quotes doubled, so a route
-    /// name can never break the column layout.</summary>
+    /* CSV 单元格：加引号、内部引号翻倍，路由名永不破坏列布局。 */
     static string Cell(string v) {
         StringBuilder sb = new StringBuilder();
         sb.Append("\"");
@@ -702,15 +590,13 @@ class Monitor : AdminController {
     }
 }
 
-/// <summary>What an export answers with: the window and its rows, serialized by
-/// the JSON writer rather than assembled as text.</summary>
+/* 导出答以窗口与其行；由 JSON 写出器序列化。 */
 class MetricsRowDoc {
     long bucket;
     string method;
     string path;
     long calls;
     long errors;
-    // Microseconds: the unit every duration the server records is kept in.
     long avg_us;
     long max_us;
     long frames;
@@ -724,9 +610,7 @@ class MetricsExportDoc {
     List<MetricsRowDoc> rows;
 }
 
-/// <summary>The time window a screen or an export is looking at, and how it was
-/// asked for: `dated` distinguishes "that day" from "the last N hours", which
-/// decides whether empty buckets are shown as zeros.</summary>
+/* 屏幕或导出所看的窗及取得方式；dated 区分"那一天"与"过去 N 小时"，决定空桶是否以零显示。 */
 class MetricWindow {
     long from;
     long to;

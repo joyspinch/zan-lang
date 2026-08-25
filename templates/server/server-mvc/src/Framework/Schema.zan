@@ -10,37 +10,16 @@ using ZanWeb.Dao.Blog;
 
 namespace ZanWeb;
 
-/// <summary>
-/// Schema and seed data, applied ONCE at startup by main.zan -- never from a
-/// request. CodeFirst (SyncStructure) reads the database catalog and issues
-/// DDL; doing that per request costs a round trip on every hit and lets two
-/// requests race on the same CREATE/ALTER.
-///
-/// The seeds are what makes a fresh checkout usable: an administrator, two
-/// roles, a department, the site settings and a few articles. Every seed is
-/// guarded by a count, so restarting an installed system changes nothing.
-///
-/// There is no permission seed. The rights that exist are the route table, so
-/// a new screen needs no edit here; the only permission data seeded is which
-/// route actions the two built-in roles hold (see SyncRoleGrants), and that is
-/// read back off the routes themselves.
-/// </summary>
+/* 表结构 + 种子数据，启动时由 main.zan 一次性应用。CodeFirst (SyncStructure) 读取数据库目录发 DDL，不做每次请求触发。种子带计数保护，重复启动不变。权限仅 seed 内置角色持有哪些 action，其余从路由表派生。*/
 class Schema {
-    /// <summary>Creates/updates every table and seeds a usable system. Returns
-    /// false when the database is unreachable: the server still starts, and
-    /// handlers report the outage instead of the process dying at boot.</summary>
+    /* 创建/更新全部表并填充种子数据。数据库不可达时返回 false，服务器仍启动。*/
     static async bool Ensure(DbContext ctx) {
         IDbConnection db = await ctx.Acquire();
         if (db == null) { return false; }
         try {
-            // WAL, on SQLite only (a no-op elsewhere): one file is shared by
-            // every worker process, and in the default journal a writer blocks
-            // readers -- one save would stall every page being read. The wait
-            // for the single writer is the driver's busy timeout.
+            /* SQLite 启用 WAL（其他引擎无操作）：多 worker 共享文件时避免写者阻塞读者。*/
             await DbSchema.UseWriteAheadLogAsync(db);
-            // Every [Table] class in the build, in one call: the compiler
-            // knows them all, so a new model needs no line here and no model
-            // can be forgotten.
+            /* 编译期已知所有 [Table] 类，一行调用覆盖全部，新模型无需补行。*/
             await db.SyncStructureAllAsync();
 
             await Schema.SeedAdmin(db);
@@ -55,9 +34,7 @@ class Schema {
         }
     }
 
-    /// <summary>Creates the bootstrap account on an empty database. The
-    /// password is a development convenience: change it before this template is
-    /// deployed anywhere reachable.</summary>
+    /* 空库创建 bootstrap 账号；密码为开发用，部署前必须修改。*/
     static async void SeedAdmin(IDbConnection db) {
         UserDao users = new UserDao(db);
         int have = await users.Count();
@@ -75,11 +52,7 @@ class Schema {
         int _id = await users.Insert(admin);
     }
 
-    /// <summary>Two roles that are useful the moment the system starts: one that
-    /// can run the whole admin, and one that can only work on content. They are
-    /// ordinary rows -- the bootstrap account bypasses them entirely, so the
-    /// system is never locked out by an editing accident here. What they may do
-    /// is filled in from the route table by SyncRoleGrants.</summary>
+    /* 两个内置角色：admin（全部管理）和 editor（仅内容管理）。bootstrap 账号绕过角色表，防止误操作锁死。具体权限由 SyncRoleGrants 从路由表填充。*/
     static async void SeedRoles(IDbConnection db) {
         int have = await db.Select<Role>().CountAsync();
         if (have > 0) { return; }
@@ -97,9 +70,7 @@ class Schema {
         r.rank = rank;
         r.status = 1;
         r.description = description;
-        // Which rows a role may read, next to what it may do. A role from before
-        // this column existed reads as 0, and DataScope takes that as 全部数据,
-        // so an upgrade cannot narrow rights nobody changed.
+        /* 旧行缺此列则读作 0，DataScope 视为 全部数据，升级不缩权。*/
         r.dataScope = dataScope;
         r.scopeDepts = "";
         r.createdAt = WebApp.NowSeconds();
@@ -160,7 +131,7 @@ class Schema {
     }
 
     static async void AddDictItem(IDbConnection db, string typeCode, string value,
-                               string label, int sortOrder) {
+                            string label, int sortOrder) {
         DictItem it = new DictItem();
         it.typeCode = typeCode;
         it.value = value;
@@ -172,9 +143,6 @@ class Schema {
         int _id = await db.Insert<DictItem>(it).ExecuteIdentityAsync();
     }
 
-    /// <summary>The fields the settings screen edits. The rows carry their own
-    /// label, kind and order, so adding a setting is one line here and it
-    /// appears in the admin -- there is no second list of form fields.</summary>
     static async void SeedSettings(IDbConnection db) {
         int have = await db.Select<SiteSetting>().CountAsync();
         if (have > 0) {
@@ -202,27 +170,21 @@ class Schema {
         await Schema.SeedFeatureSettings(db);
     }
 
-    /// <summary>Switches and mail credentials, added row by row so an existing
-    /// installation picks them up on the next start instead of needing the
-    /// settings table to be empty.</summary>
     static async void SeedFeatureSettings(IDbConnection db) {
         await Schema.EnsureSetting(db, "内容与评论", "blog.comment.enabled",
             "开放评论", "1", "switch", "关闭后前台不再显示评论框，已有评论仍可在后台查看", 40);
         await Schema.EnsureSetting(db, "内容与评论", "blog.comment.review",
             "评论需审核", "1", "switch", "开启时新评论要在后台通过后才公开显示", 41);
-
         await Schema.EnsureSetting(db, "基本", "site.timezone", "时区偏移",
             "480", "text",
             "与 UTC 的分钟偏移，例如 480 表示 UTC+8（北京时间）；服务器在境外时按此换算显示",
             5);
-
         await Schema.EnsureSetting(db, "注册登录", "auth.register.enabled",
             "开放注册", "0", "switch", "关闭后前台隐藏注册入口并拒绝注册请求", 50);
         await Schema.EnsureSetting(db, "注册登录", "auth.register.verify",
             "注册需邮箱验证码", "1", "switch", "需要先配置好邮件服务", 51);
         await Schema.EnsureSetting(db, "注册登录", "auth.reset.enabled",
             "允许找回密码", "1", "switch", "通过邮箱验证码重设密码", 52);
-
         await Schema.EnsureSetting(db, "邮件服务", "mail.host", "SMTP 主机", "",
             "text", "例如 smtp.qq.com", 60);
         await Schema.EnsureSetting(db, "邮件服务", "mail.port", "端口", "465",
@@ -237,7 +199,6 @@ class Schema {
             "text", "留空则使用账号", 65);
         await Schema.EnsureSetting(db, "邮件服务", "mail.fromName", "发件人名称", "",
             "text", "", 66);
-
         await Schema.EnsureSetting(db, "AI 助手", "ai.enabled", "启用助手", "0",
             "switch", "开启后右下角的助手可以对话", 70);
         await Schema.EnsureSetting(db, "AI 助手", "ai.provider", "服务商", "deepseek",
@@ -251,22 +212,21 @@ class Schema {
             "deepseek-chat", "text", "", 74);
         await Schema.EnsureSetting(db, "AI 助手", "ai.temperature", "温度", "0.3",
             "text", "0 更稳定，1 更发散", 75);
-
         await Schema.EnsureSetting(db, "开发", "gen.root", "源码目录", "..",
             "text", "生成的代码写到这里，相对服务进程的工作目录", 80);
     }
 
     static async void EnsureSetting(IDbConnection db, string groupName, string name,
-                                 string label, string value, string kind,
-                                 string tip, int sortOrder) {
+                                string label, string value, string kind,
+                                string tip, int sortOrder) {
         int have = await db.Select<SiteSetting>().Where(a => a.name == name).CountAsync();
         if (have > 0) { return; }
         await Schema.AddSetting(db, groupName, name, label, value, kind, tip, sortOrder);
     }
 
     static async void AddSetting(IDbConnection db, string groupName, string name,
-                              string label, string value, string kind,
-                              string tip, int sortOrder) {
+                             string label, string value, string kind,
+                             string tip, int sortOrder) {
         SiteSetting s = new SiteSetting();
         s.groupName = groupName;
         s.name = name;
@@ -292,49 +252,20 @@ class Schema {
         List<Post> seed = new List<Post> {
             Schema.PostOf("Zan 是什么：熟悉的语法，原生的产物", 1,
                 "zan,llvm,arc", 1,
-                "C# 的写法，AOT 的产物：一份源码经 LLVM 直接生成机器码，"
-                + "运行时不需要虚拟机，内存由编译期插入的引用计数管理。",
-                "Zan 想解决的问题很具体：写业务的人希望要类、接口、泛型、"
-                + "属性和 async/await 这些顺手的东西，交付的人希望拿到一个可以直接跑的"
-                + "可执行文件，而不是一套需要先装运行时的环境。\n\n"
-                + "语法层面，Zan 基本沿用 C# 的形状，学习成本主要花在少数几处差异上："
-                + "结构体在栈上，集合写时复制，没有垃圾回收，也没有生命周期标注。\n\n"
-                + "内存管理用的是自动引用计数（ARC）。计数的增减由编译器在编译期插入，"
-                + "对象的析构时机因此是确定的，不会出现“过一会儿才被回收”的抖动，"
-                + "这对长期驻留的服务端进程尤其重要。\n\n"
-                + "编译目标是 LLVM IR，再由 LLVM 生成目标平台的机器码。"
-                + "启动没有预热阶段，第一份请求和第一万份请求走的是同一份代码。"),
+                "C# 的写法，AOT 的产物：一份源码经 LLVM 直接生成机器码，运行时不需要虚拟机，内存由编译期插入的引用计数管理。",
+                "Zan 想解决的问题很具体：写业务的人希望要类、接口、泛型、属性和 async/await 这些顺手的东西，交付的人希望拿到一个可以直接跑的可执行文件，而不是一套需要先装运行时的环境。\n\n语法层面，Zan 基本沿用 C# 的形状，学习成本主要花在少数几处差异上：结构体在栈上，集合写时复制，没有垃圾回收，也没有生命周期标注。\n\n内存管理用的是自动引用计数（ARC）。计数的增减由编译器在编译期插入，对象的析构时机因此是确定的，不会出现"过一会儿才被回收"的抖动，这对长期驻留的服务端进程尤其重要。\n\n编译目标是 LLVM IR，再由 LLVM 生成目标平台的机器码。启动没有预热阶段，第一份请求和第一万份请求走的是同一份代码。"),
             Schema.PostOf("用 ZanIDE 开始第一个项目", 3,
                 "zanide,上手", 0,
                 "编译器、语言服务、调试器和标准库都在 IDE 里，新建项目到断点调试不需要额外配置。",
-                "打开 ZanIDE，新建项目，从控制台、图形界面、服务端、库四类模板里选一个，"
-                + "向导会生成一份可以直接运行的工程。\n\n"
-                + "点“运行”在输出面板看结果，按 F5 进入调试：断点、单步、变量查看、"
-                + "调用栈都由随 IDE 分发的调试器提供，不需要自己搭 LLDB。\n\n"
-                + "要交付时用“发布”，选目标平台打包，产物是可执行文件加上它依赖的动态库，"
-                + "拷到目标机器上即可运行。"),
+                "打开 ZanIDE，新建项目，从控制台、图形界面、服务端、库四类模板里选一个，向导会生成一份可以直接运行的工程。\n\n点"运行"在输出面板看结果，按 F5 进入调试：断点、单步、变量查看、调用栈都由随 IDE 分发的调试器提供，不需要自己搭 LLDB。\n\n要交付时用"发布"，选目标平台打包，产物是可执行文件加上它依赖的动态库，拷到目标机器上即可运行。"),
             Schema.PostOf("ZanWeb 的路由是编译期生成的", 2,
                 "zanweb,路由,attribute", 0,
                 "控制器上的 [Route] / [Http*] 由编译器扫描并生成注册代码，启动时没有反射，也没有手写路由表。",
-                "在 ZanWeb 里，一个接口就是一个带属性的方法：[Route] 决定路径，"
-                + "[HttpGet] / [HttpPost] 决定方法，[Description] 决定它在接口文档里的说明。\n\n"
-                + "编译器的属性路由阶段会扫描所有控制器与动作，把类级默认值和方法级覆盖合并，"
-                + "展开 [controller] / [action] 占位，然后生成一份注册代码。"
-                + "运行时要做的只是执行这份注册，因此启动过程里没有反射、没有扫描目录。\n\n"
-                + "同一份属性还喂给两处：管理后台的菜单按属性和权限过滤生成，"
-                + "接口文档按路径分组列出方法、说明、参数与返回值。"
-                + "换句话说，加一个动作，菜单和文档会同时跟上，不存在第二份需要同步的清单。"),
+                "在 ZanWeb 里，一个接口就是一个带属性的方法：[Route] 决定路径，[HttpGet] / [HttpPost] 决定方法，[Description] 决定它在接口文档里的说明。\n\n编译器的属性路由阶段会扫描所有控制器与动作，把类级默认值和方法级覆盖合并，展开 [controller] / [action] 占位，然后生成一份注册代码。运行时要做的只是执行这份注册，因此启动过程里没有反射、没有扫描目录。\n\n同一份属性还喂给两处：管理后台的菜单按属性和权限过滤生成，接口文档按路径分组列出方法、说明、参数与返回值。换句话说，加一个动作，菜单和文档会同时跟上，不存在第二份需要同步的清单。"),
             Schema.PostOf("服务端指标为什么用 SSE 而不是轮询", 2,
                 "sse,监控,性能", 0,
-                "一次连接换掉每秒一次的整轮请求：路由、鉴权、日志都不必为“有没有变化”重复付费。",
-                "管理后台的运行监控需要秒级刷新。用轮询实现的话，每个打开的标签页每秒都要走一遍"
-                + "完整请求：解析、路由匹配、会话校验、写一行访问日志，"
-                + "而绝大多数回答是“和上次一样”。\n\n"
-                + "改成 Server-Sent Events 之后，浏览器用 EventSource 订阅一次，"
-                + "服务端每两秒推一帧快照，另外定期补一段时序数据用于绘制曲线，"
-                + "空闲时发一行注释做保活，避免中间代理判定连接已死。\n\n"
-                + "这类长连接不参与延迟统计：它的存活时间取决于用户什么时候关掉页面，"
-                + "把它当成一次慢请求记录下来只会污染 P95。"
+                "一次连接换掉每秒一次的整轮请求：路由、鉴权、日志都不必为"有没有变化"重复付费。",
+                "管理后台的运行监控需要秒级刷新。用轮询实现的话，每个打开的标签页每秒都要走一遍完整请求：解析、路由匹配、会话校验、写一行访问日志，而绝大多数回答是"和上次一样"。\n\n改成 Server-Sent Events 之后，浏览器用 EventSource 订阅一次，服务端每两秒推一帧快照，另外定期补一段时序数据用于绘制曲线，空闲时发一行注释做保活，避免中间代理判定连接已死。\n\n这类长连接不参与延迟统计：它的存活时间取决于用户什么时候关掉页面，把它当成一次慢请求记录下来只会污染 P95。"
             )
         };
         for (int i = 0; i < seed.Count; i = i + 1) {
@@ -343,7 +274,7 @@ class Schema {
     }
 
     static async void AddCategory(IDbConnection db, string name, string slug,
-                               int sortOrder) {
+                            int sortOrder) {
         Category c = new Category();
         c.name = name;
         c.slug = slug;
@@ -372,30 +303,15 @@ class Schema {
         return p;
     }
 
-    // ---- route-derived grants ------------------------------------------------
-    // The rights that EXIST are the route table, so nothing has to be seeded
-    // for a new screen. What a deployment decides -- which role holds which of
-    // them -- is rows in sys_role_grant, and the one decision made for it is
-    // this: the built-in "admin" role keeps covering the whole admin as new
-    // screens ship, and the built-in "editor" role keeps covering the content
-    // ones. Both are filled in here, after the routes are registered, and only
-    // ever by insert: a right an operator revoked stays revoked, because the
-    // grant it would re-add is already accounted for below.
+    /* ---- 路由派生授权 ---- */
+    /* 存在的权限 = 路由表。部署决策写入 sys_role_grant 行。内置 admin 始终覆盖全部管理屏，内置 editor 始终覆盖内容屏。本方法只 INSERT，操作者撤销的权限不会被重新添加。*/
 
-    /// <summary>Folds pre-mask grant rows (one action, mask 0) into one row per
-    /// screen with the bits those actions declare. Runs before the built-in roles
-    /// are looked at, and only over rows that still have mask 0, so it is a
-    /// no-op from the second boot on. An action nobody declared a bit for has no
-    /// bit to keep: it is dropped here and named by Perm.Index's boot line, which
-    /// is the missing declaration showing up rather than a silent right.
-    /// </summary>
+    /* 将 mask=0 的旧授权行按 screen 合并为一条屏掩码行；仅 mask=0 的行参与，第二次启动起即 no-op。未声明位的 action 丢弃并在 Perm.Index boot 行提示。*/
     static async void MigrateGrants(IDbConnection db) {
         List<RoleGrant> old = await db.Select<RoleGrant>()
             .Where(a => a.mask == 0).ToListAsync();
         if (old.Count == 0) { return; }
 
-        // (roleId, screen) -> bits, kept as two parallel lists: a handful of
-        // roles times a handful of screens, once in the life of a database.
         List<string> keys = new List<string>();
         List<int> masks = new List<int>();
         for (int i = 0; i < old.Count; i = i + 1) {
@@ -433,13 +349,7 @@ class Schema {
             + Convert.ToString(keys.Count) + " 条屏掩码");
     }
 
-    /// <summary>Re-keys grants stored under a screen key that no longer exists
-    /// to the one that means the same screen ("Comments" ->
-    /// "Admin.Content.Comments"), which is the keys written before the module
-    /// prefix became part of every action name. A key that matches no screen or
-    /// several is left alone and named: the grant dialog shows it as an unknown
-    /// screen, which an operator can decide about -- guessing here would be
-    /// hanging a role's rights on a name collision.</summary>
+    /* 将不再存在的旧屏键迁移到带模块前缀的新键；无匹配或多匹配的不动并在日志中标出。*/
     static async void MigrateGrantKeys(IDbConnection db) {
         List<RoleGrant> rows = await db.Select<RoleGrant>()
             .Where(a => a.mask != 0).ToListAsync();
@@ -466,8 +376,7 @@ class Schema {
         }
     }
 
-    /// <summary>Grants the built-in roles the protected route actions they do
-    /// not hold yet. Safe on every boot; nothing is ever removed.</summary>
+    /* 给内置角色补发尚未持有的受控 action。每次启动安全，永不删除。*/
     static async void SyncRoleGrants(WebApp app) {
         IDbConnection db = await AuthUser.Lease();
         if (db == null) { return; }
@@ -480,31 +389,24 @@ class Schema {
                 .Where(a => a.code == "editor").FirstAsync();
             if (admin == null && editor == null) { return; }
 
-            // What each role already holds, joined into one string per role, so
-            // the loop below is a substring test rather than a query per route.
             List<RoleGrant> rows = await db.Select<RoleGrant>().ToListAsync();
             string adminHas = ",";
             string editorHas = ",";
             for (int i = 0; i < rows.Count; i = i + 1) {
                 RoleGrant g = rows[i];
                 if (admin != null && g.roleId == admin.id) {
-                    adminHas = adminHas + g.action + ",";
+                    adminHas = adminHas + g.action + ",",;
                 }
                 if (editor != null && g.roleId == editor.id) {
-                    editorHas = editorHas + g.action + ",";
+                    editorHas = editorHas + g.action + ",",;
                 }
             }
 
-            // A role that already holds something was set up on an earlier boot
-            // or by an operator; adding to it would undo their revocations.
             bool fillAdmin = admin != null && adminHas == ",";
             bool fillEditor = editor != null && editorHas == ",";
             if (!fillAdmin && !fillEditor) { return; }
 
             long now = WebApp.NowSeconds();
-            // One row per screen: the bits that screen actually has, which is
-            // the whole of it for the admin role and the content screens for the
-            // editor one.
             List<Route> routes = app.router.All();
             List<string> screens = new List<string>();
             List<int> masks = new List<int>();
@@ -538,8 +440,6 @@ class Schema {
         }
     }
 
-    /// <summary>Whether a route belongs to the content side of the admin, which
-    /// is what the built-in editor role is allowed to run.</summary>
     static bool IsContent(string pattern) {
         return pattern.StartsWith("/admin/content/") || pattern == "/admin";
     }

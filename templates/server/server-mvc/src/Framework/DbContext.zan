@@ -3,31 +3,7 @@ using System.Data;
 
 namespace ZanWeb;
 
-/// <summary>
-/// Database access for one worker process: a connection POOL plus the lease
-/// protocol every call site follows. main.zan builds the pool from
-/// config/app.json once and injects it here.
-///
-/// A request borrows a connection, runs its statements, and gives it back in a
-/// finally block — the connection belongs to that request (and to its
-/// transaction) for as long as it holds it, and to nobody else:
-///
-///   DbContext ctx = this.Db();
-///   IDbConnection db = await ctx.Acquire();
-///   if (db == null) { ...database unavailable... }
-///   try {
-///       List&lt;Post&gt; rows = await db.Select&lt;Post&gt;()
-///           .OrderByDescending(a =&gt; a.id).ToListAsync();
-///   } finally {
-///       ctx.Release(db);
-///   }
-///
-/// Statements go through the *Async terminals so the coroutine parks while the
-/// server answers; the non-blocking MySQL driver offers only those.
-///
-/// Forgetting Release() leaks the connection: the pool is capped, so a leak
-/// eventually parks every request forever. The finally block is not optional.
-/// </summary>
+/* worker 数据库访问：连接池 + 借用协议。main.zan 一次性构建池并注入。请求借出连接执行语句，finally 中归还。全部走 *Async 端点以挂起协程。忘记 Release() 会耗尽池，故 finally 不可省略。*/
 class DbContext {
     DbPool pool;
 
@@ -35,14 +11,12 @@ class DbContext {
         this.pool = pool;
     }
 
-    /// <summary>Wraps the pool built by the bootstrap (main.zan).</summary>
+    /* 包装启动引导创建的池。*/
     static DbContext Of(DbPool pool) {
         return new DbContext(pool);
     }
 
-    /// <summary>Borrows a connection for this request; parks the coroutine while
-    /// the pool is saturated. Returns null when the database is unreachable or
-    /// the pool is closed — always pair with Release() in a finally.</summary>
+    /* 借出连接供请求使用；池满时挂起协程。数据库不可达或池已关闭返回 null，务必与 Release() 配对。*/
     async IDbConnection Acquire() {
         if (this.pool == null) { return null; }
         IDbConnection db = await this.pool.AcquireAsync();
@@ -50,34 +24,23 @@ class DbContext {
             this.pool.Release(db);
             return null;
         }
-        // Every application statement is leased here, so this is where they are
-        // timed: one wrapper per lease instead of a stopwatch in every DAO, and
-        // the monitor's query numbers cover whatever the driver is. The wrapper
-        // is skipped entirely when nothing is listening (main.zan installs the
-        // sink), and metrics.db has a pool of its own -- writing the trace down
-        // is not itself traced.
+        /* 所有应用语句在此被借用，故在此计时：每个借用点一个包装器，避免每个 DAO 都放秒表。Metrics.db 使用独立池，不会自跟踪。*/
         return TracedDbConnection.Wrap(db);
     }
 
-    /// <summary>Returns a connection to the pool. Safe with null, so it can sit
-    /// in a finally block unconditionally.</summary>
+    /* 归还连接到池，兼容 null，可直接放入 finally。*/
     void Release(IDbConnection db) {
         if (this.pool == null || db == null) { return; }
-        // What goes back is the pooled connection, not the timing wrapper the
-        // request was handed.
+        /* 归还的是底层池连接，而非请求拿到的计时包装器。*/
         this.pool.Release(TracedDbConnection.Unwrap(db));
     }
 
-    /// <summary>Opens and parks <paramref name="count"/> connections at startup
-    /// (before the server accepts anything), so the first request does not pay
-    /// the connect cost. Returns the number now idle: 0 means the database is
-    /// unreachable.</summary>
+    /* 启动时提前建连（服务器接受请求之前），返回当前空闲数；0 表示数据库不可达。*/
     async int Warmup(int count) {
         if (this.pool == null) { return 0; }
         return await this.pool.WarmupAsync(count);
     }
 
-    /// <summary>Idle / live / waiting counters, for a health or metrics endpoint.</summary>
     int IdleCount() {
         if (this.pool == null) { return 0; }
         return this.pool.IdleCount();

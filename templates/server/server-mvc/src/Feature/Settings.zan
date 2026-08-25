@@ -6,27 +6,15 @@ using ZanWeb.Model.Sys;
 
 namespace ZanWeb;
 
-/// <summary>
-/// Site-wide settings (title, keywords, ICP filing, footer, ...) read from
-/// sys_setting.
-///
-/// They are read once per worker and kept in memory for a minute: every page
-/// renders the site title and the footer, and none of them is worth a query per
-/// request. A save clears the copy in the worker that handled it; the others
-/// pick the change up when their copy expires.
-/// </summary>
+/* 站点全局设置（标题、关键词、备案号等），每 worker 缓存一分钟，保存后本 worker 立即失效。 */
 class Settings {
     static int CacheSeconds = 60;
 
-    /// This worker's copy of sys_setting, and when it goes stale. A map, not
-    /// the "name\tvalue\n..." string it used to be: reading one setting was a
-    /// scan of the whole blob (a page render reads ten), and a value with a
-    /// newline in it -- the analytics snippet -- had to be escaped on the way
-    /// in and unescaped on the way out.
+    /* 本 worker 的设置缓存及过期时间，用 StrMap 避免扫描与换行符转义。 */
     static StrMap values;
     static long expires;
 
-    /// <summary>Every setting, loaded once per minute per worker.</summary>
+    /* 加载所有设置，每 worker 每分钟一次。 */
     static async StrMap All() {
         long now = WebApp.NowSeconds();
         if (Settings.values != null && now < Settings.expires) {
@@ -34,8 +22,7 @@ class Settings {
         }
         IDbConnection db = await AuthUser.Lease();
         if (db == null) {
-            // Unavailable database: keep serving the copy we have (stale beats
-            // a site that loses its title) and retry on the next read.
+            /* 数据库不可用时返回旧缓存，下次读取时重试。 */
             if (Settings.values != null) { return Settings.values; }
             return new StrMap();
         }
@@ -54,13 +41,13 @@ class Settings {
         return m;
     }
 
-    /// <summary>Drops this worker's copy after a save.</summary>
+    /* 保存后清除本 worker 的缓存。 */
     static void Forget() {
         Settings.values = null;
         Settings.expires = 0;
     }
 
-    /// <summary>One setting, or `def` when it is unset or empty.</summary>
+    /* 读取一个设置，未配置或为空时返回默认值。 */
     static async string Get(string name, string def) {
         StrMap m = await Settings.All();
         string v = m.Get(name);
@@ -68,15 +55,14 @@ class Settings {
         return v;
     }
 
-    /// <summary>A switch setting: true unless it is stored as "0".</summary>
+    /* 布尔设置：非 "0" 即为 true。 */
     static async bool On(string name, bool def) {
         string v = await Settings.Get(name, "");
         if (v.Length == 0) { return def; }
         return v != "0";
     }
 
-    /// <summary>Copies the public-facing settings into a view: every layout
-    /// shows the site name, and the footer shows the ICP filing.</summary>
+    /* 将公开设置注入视图数据（站点标题、备案号、分析代码等）。 */
     static async void Apply(ViewData d) {
         StrMap m = await Settings.All();
         d.Set("siteTitle", m.GetOr(SettingKeys.SiteTitle, "Zan"));

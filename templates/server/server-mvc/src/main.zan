@@ -4,61 +4,35 @@ using System.Diagnostics;
 using ZanWeb;
 using System.Web;
 
-// {{NAME}} -- ZanWeb enterprise web application (layered).
-//
-// main.zan only bootstraps the server and wires routes. Request handling lives
-// in controllers (src/controller), data access in models (src/model), and the
-// cross-cutting plumbing in the framework (src/framework). All runtime settings
-// are parsed ONCE from config/app.json into the typed Cfg entity (Cfg.Server.*,
-// Cfg.Db.*, Cfg.Worker.*, ...) and are NOT compiled into the binary -- edit the
-// file and restart to change host / port / limits / database / cache / workers.
+/* {{NAME}} -- ZanWeb 企业级 Web 应用。主入口负责启动服务器与注册路由，运行时配置从 config/app.json 读取。 */
 class Program {
-    // Slow-request threshold (ms), loaded from [log].slowMs at startup.
+    /* 慢请求阈值(ms)，启动时从 [log].slowMs 读取 */
     static int slowMs = 1000;
-    // Slow-statement threshold, in MICROSECONDS: [log].slowSqlMs converted once
-    // here, because every statement is compared against it.
+    /* 慢 SQL 阈值(微秒)，启动时从 [log].slowSqlMs 换算 */
     static long slowSqlUs = 200000;
 
     static void Main() {
-        // config/, views/, wwwroot/ and the databases are read by relative path,
-        // so the process has to stand in the release directory. It does when the
-        // server is started from there, and does not when it is double-clicked
-        // (macOS hands a bundle the root directory) or started from elsewhere.
+        /* 进程需位于发布目录，按相对路径读取 config/views/wwwroot/数据库 */
         bool _cd = ProcessHost.UseAppDir("config/app.json");
         Cfg.Load("config/app.json");
 
-        // Logging goes to a FILE before anything else can go wrong: a worker is
-        // a background process (and on Windows may have no console at all), so
-        // a line printed to stdout is a line nobody will ever read. One file a
-        // day for the whole pool -- logs/{yyyyMM}/{dd}.log by default, the same
-        // file the master writes its supervision records to -- so what the
-        // application logged and what happened to the process that logged it sit
-        // next to each other, in order.
+        /* 日志优先写入文件，worker 进程可能没有控制台 */
         if (Cfg.Log.dir.Length > 0) {
             int level = Log.INFO;
             if (Cfg.Log.debug) { level = Log.DEBUG; }
             Log.Configure(Cfg.Log.dir, Cfg.Log.pattern, level);
-            // The console echo would double every line in a worker, whose
-            // stdout is already redirected into that same file.
+            /* worker 的 stdout 已重定向到日志文件，不重复输出到控制台 */
             Log.EchoToConsole(Cfg.Log.debug);
         }
 
-        // ---- assemble + inject dependencies ----
-        // Every worker is its own process re-running Main, so each builds its
-        // OWN pools here; nothing is inherited or shared across workers. Pools,
-        // not single connections: inside one worker each request is a coroutine,
-        // and a shared connection would serialize the worker and interleave two
-        // requests' transactions on one session. Handlers get them through
-        // AppServices (this.Db() / this.Cache()) and never open anything.
+        /* 依赖注入：每个 worker 进程独立构建连接池和缓存 */
         DbPool pool = Db.OpenPool();
         DbContext db = DbContext.Of(pool);
         CacheContext cache = CacheContext.Of(Db.OpenRedis());
         AppServices services = new AppServices(db, cache);
         AppServices.Use(services);
 
-        // Open a couple of connections before the first request pays for them
-        // (and so the synchronous auth resolvers find one idle). idle == 0 means
-        // the database is down: the server still starts and says so.
+        /* 预开两个连接，避免首请求支付连接开销 */
         int idle = await db.Warmup(2);
         Console.WriteLine("[db] " + Cfg.Db.driver + " pool size="
             + Convert.ToString(Cfg.Db.poolSize) + " idle=" + Convert.ToString(idle));
@@ -77,9 +51,7 @@ class Program {
                 + " -- correct only while [worker].count is 1");
         }
 
-        // Schema + seed data run HERE, once, before the server accepts anything.
-        // CodeFirst DDL in a request path costs a catalog round trip per hit and
-        // lets two requests race on the same CREATE/ALTER.
+        /* 启动时执行一次 Schema 迁移和数据初始化 */
         bool ready = await Schema.Ensure(db);
         if (!ready) {
             Console.WriteLine("[db] schema not applied (database unreachable)"
@@ -92,93 +64,42 @@ class Program {
         WebHost.Use(app);
         app.AuthResolver(AuthToken.Resolve);
         app.PermissionResolver(AuthUser.Allow);
-        // The sidebar is the route table read through the URLs: an action marked
-        // [Custom(IsMenu = true)] appears, its text is its [Description] and its
-        // section is its URL. These four lines are the only place a URL segment
-        // gets a Chinese name, and their order is the order of the sections --
-        // no controller declares a group, a parent or a rank.
-        MenuBuilder.Section("monitor", "概览");
-        MenuBuilder.Section("system", "系统");
-        MenuBuilder.Section("content", "内容");
-        MenuBuilder.Section("dev", "开发");
-        // A navigation that needs a session it does not have lands on the
-        // sign-in form; a script gets 401 JSON. One setting, decided in the
-        // dispatcher, so no controller carries its own "are you logged in".
         app.LoginPath(Routes.Login);
-        // Views are read from disk once, here, and rendered from memory after.
-        // They keep the module layout of the controllers (views/Admin/... for
-        // src/Controller/Admin/...), so the view keys are unchanged — but they
-        // live outside src/, which is what makes a release a copy of four
-        // directories: the executable, config/, wwwroot/ and views/.
+        /* 视图从磁盘读取一次，之后从内存渲染 */
         app.Views("views");
 
-        // Assets (CSS/JS/fonts) come off disk, before auth and routing, cached in
-        // this worker after the first hit. Nothing here is a route, so nothing
-        // here can be secured or land in a menu.
-        //
-        // Only wwwroot/ is reachable, and only ever by that name: everything else
-        // in the project — src/, config/app.json, app.db — is outside the mount,
-        // so no traversal or naming trick can reach it even if a path check
-        // slipped. Put a file under wwwroot/ exactly when the public internet is
-        // meant to download it.
+        /* 静态文件挂载：仅 wwwroot/ 可被外部访问 */
         StaticFiles.Mount(app, "/static", "wwwroot");
 
-        // ---- lifecycle hooks (compile-time typed, run in order) ----
-        // Access logging is OFF by default: a synchronous console write on every
-        // request is a real throughput/CPU cost under load. Turn on [log].access
-        // in app.json when you need to watch requests live.
+        /* 生命周期钩子 */
         if (Cfg.Log.access) {
             app.Before(Program.AccessLog);
         }
         Program.slowMs = Cfg.Log.slowMs;
         Program.slowSqlUs = (long)Cfg.Log.slowSqlMs * 1000;
         app.After(Program.Metrics);
-        // Every statement the application runs is timed and reported here: the
-        // pool leases go out wrapped (DbContext.Acquire), so this covers the
-        // DAOs, the ORM and the code generator's output whatever the driver is,
-        // with no stopwatch at any call site.
         ServerMetrics.Global().SlowQueryMs(Cfg.Log.slowSqlMs);
         DbTrace.Sink(Program.SqlTrace);
-        // Errors always persist -- to the log file and, so the backend screen
-        // can query them, to metrics.db. The console echo is a debug
-        // convenience, off in production and toggleable at runtime.
         ServerMetrics.Global()
             .ErrorLog(Cfg.Log.errorLog, Cfg.Log.debug)
             .OnError(MetricsStore.Failed);
 
-        // Per-minute, per-route history in its own database, written by one
-        // background coroutine every [metrics].flushSeconds (or sooner once
-        // [metrics].flushRows have piled up) -- never per request.
+        /* 指标历史写入独立数据库，由后台协程定期刷新 */
         bool hist = await MetricsStore.Start();
         if (hist) {
             Console.WriteLine("[metrics] history " + Cfg.Metrics.path
                 + " flush=" + Convert.ToString(Cfg.Metrics.flushSeconds) + "s");
         }
 
-        // ---- routes ----
-        // Routes are generated at COMPILE TIME from the [Route]/[Http*]/[Custom]/
-        // [Description] attributes on the controller actions: the compiler's
-        // attr-route pass discovers every controller + action, merges class-level
-        // defaults with method-level overrides, expands [controller]/[action]
-        // tokens, and synthesizes __AttrRoutes.Register(app) below. Add a
-        // controller/action + attributes and rebuild -- no route table, no
-        // generated file to maintain, no external tool.
+        /* 路由：编译期从控制器属性生成，运行时只执行注册 */
         __AttrRoutes.Register(app);
 
-        // Which button each action is -- [Custom(Perm = PermBit.Update)] --
-        // indexed off the routes once, so authorization, the grant dialog and
-        // the buttons a screen renders all read the same masks.
+        /* 权限索引：从路由表建立 screen->bit 映射 */
         Perm.Index(app);
 
-        // Rights follow the routes: the route table IS the list of rights, so a
-        // new controller (or a module the code generator writes) is grantable
-        // the moment it compiles. All this does is fill the two built-in roles
-        // in on a fresh database, which needs the registered routes.
         if (ready) {
+            /* 内置角色同步路由授权，然后移入共享内存 */
             await Schema.SyncRoleGrants(app);
-            // Authorization then moves to shared memory: every worker process
-            // reads the same "role -> actions" rows, so the question the
-            // dispatcher and the sidebar ask on every request costs no query.
             if (!PermTable.Open(app)) {
                 Console.WriteLine("[rbac] shared memory unavailable");
             }
@@ -189,34 +110,16 @@ class Program {
             }
         }
 
-        // The API reference is generated from those same attributes plus the
-        // parameters each action reads (this.In / this.Need). The document is
-        // served at /api/docs.json; the reference people read is the admin
-        // screen at /admin/system/docs, so no second UI is mounted here.
+        /* API 文档：从属性生成，挂载到 /api/docs */
         ApiDocs.Title(Cfg.Server.name);
         ApiDocs.MountSpec(app, "/api/docs");
 
-        // Single process, or N workers per config, and the binary answers
-        // start / start -d / stop / restart / reload / status on the command
-        // line. WebServer.Run(app, count, daemon) is the plain variant that
-        // only ever starts in the foreground.
+        /* 启动服务器，支持 start/stop/restart/reload/status */
         int r = await WebServer.RunCommand(app, Cfg.Worker.count,
             Cfg.Worker.daemon);
     }
 
-    // ---- hooks ----
-
-    /// <summary>One finished statement: `us` is MICROSECONDS.
-    ///
-    /// Three destinations, one measurement: the live monitor's query counters,
-    /// the day's per-statement archive in metrics.db (accumulated in memory and
-    /// written by the flusher, never per query), and -- only when it was slow --
-    /// a line in the log file, which is where an operator looks after the fact.
-    ///
-    /// What is recorded is the NORMALIZED statement: literals collapse to `?`,
-    /// so every execution of one query lands on one row, and no value a caller
-    /// typed (an address, a token, the password being checked) is written to the
-    /// archive or the log.</summary>
+    /* 慢 SQL 追踪：记录归一化语句、归档到 metrics.db、超过阈值时写日志 */
     static void SqlTrace(string sql, long us) {
         ServerMetrics.Global().RecordQuery(sql, us);
         string norm = ServerMetrics.NormalizeSql(sql);
@@ -230,21 +133,11 @@ class Program {
 
     static bool AccessLog(HttpContext ctx) {
         Console.WriteLine("[req] " + ctx.method + " " + ctx.path);
-        return true;   // false would short-circuit the request
+        return true;
     }
 
-    // `elapsedUs` is MICROSECONDS: the pipeline is timed with the monotonic
-    // microsecond clock, because a request served in 200us is not a
-    // millisecond and reads as 0 in one.
+    /* 请求指标：按毫秒统计，流式连接只计推送量 */
     static void Metrics(HttpContext ctx, long elapsedUs) {
-        // Only what the server served has a name to file the minute under:
-        // ctx.routePattern is the route's registration pattern
-        // ("/api/index/index") or a mounted asset's path
-        // ("/static/js/admin.js"), filed next to the method as its own field.
-        // It is empty for a 404, a 405 or a scan, and those get no history row:
-        // a per-URL row for every path a scanner guesses is a table of the
-        // scanner's imagination, not of this server's interfaces. The totals on
-        // the live monitor still count them, so a probed server is not silent.
         if (ctx.routePattern.Length == 0) {
             if (elapsedUs > (long)Program.slowMs * 1000) {
                 Console.WriteLine("[slow] " + ctx.method + " " + ctx.path + " "
@@ -252,8 +145,6 @@ class Program {
             }
             return;
         }
-        // A stream is measured by what it pushed; timing it would file every
-        // open dashboard as a multi-minute request.
         if (ctx.MetricsExcluded()) {
             MetricsStore.Pushed(ctx.method, ctx.routePattern, ctx.Frames(),
                 ctx.FrameBytes());

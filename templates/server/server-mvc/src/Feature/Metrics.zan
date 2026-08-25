@@ -8,74 +8,51 @@ using System.Web;
 
 namespace ZanWeb;
 
-/// <summary>One minute of traffic for one interface: how often it was called, how
-/// long it took, how badly it went, and -- for a stream -- how much was pushed
-/// over it. This is the row the history screen reads and the shape kept in
-/// memory between flushes.
-///
-/// It is also the table: the column names, the composite key `(minute, method,
-/// path)` and the write statements are derived from this declaration by the
-/// ORM. The monitor's read-side summaries use explicit database aggregation so
-/// raw history rows never enter the process.</summary>
+/* 单接口单分钟流量指标（调用/错误/耗时/流式帧数/字节），同时作为 metrics_minute 表实体。 */
 [Table(Name = "metrics_minute")]
 class MetricMinute {
     [Column(IsPrimary = true)]
-    long minute;     // epoch seconds truncated to the minute
-    // The interface, as two fields rather than one joined string: the request
-    // method and what served it -- a route's registration pattern
-    // ("/api/index/index") or a mounted asset's path ("/static/js/admin.js").
-    // A request nothing served has no name of its own and is never filed here.
+    long minute;     // 截断到分钟的 epoch 秒
+    /* 接口由 method + path 两个字段组成，method 为请求方法，path 为路由或静态资源路径。 */
     [Column(IsPrimary = true, StringLength = 16)]
     string method;
     [Column(IsPrimary = true, StringLength = 400)]
     string path;
     long calls;
     long errors;
-    // MICROSECONDS, like every duration the server records: a request served
-    // in 200us rounds to "0 ms", so a millisecond history of a fast endpoint
-    // is a column of zeroes.
+    /* 微秒单位，避免毫秒级快接口被归零。 */
     [Column(Name = "total_us")]
     long totalUs;
     [Column(Name = "max_us")]
     long maxUs;
-    /// Frames/messages pushed over a long-lived connection (SSE/WebSocket) --
-    /// how a stream is measured, since its duration is not a latency.
+    /* 长连接推送的帧数与字节数（SSE/WebSocket），以帧/字节代替延迟度量流式接口。 */
     long frames;
     long bytes;
 }
 
-/// <summary>One day of one statement shape: how often it ran, how long it took
-/// and how much of that was slow. A shape is the normalized statement (literals
-/// replaced by placeholders), so `WHERE id = 7` and `WHERE id = 9` are one row
-/// -- and no value a caller typed is ever stored here.</summary>
+/* 单日单 SQL 模板的指标（调用/慢次数/耗时），SQL 已规范化，不存储用户输入。 */
 [Table(Name = "metrics_sql_day")]
 class MetricSql {
     [Column(IsPrimary = true)]
-    long day;        // epoch seconds truncated to midnight
+    long day;        // 截断到午夜的 epoch 秒
     [Column(IsPrimary = true, StringLength = 400)]
-    string sql;      // normalized statement shape
+    string sql;      // 规范化的语句模板
     long calls;
-    long slow;       // executions at or over [log].slowSqlMs
+    long slow;       // 达到 [log].slowSqlMs 阈值的执行
     [Column(Name = "total_us")]
-    long totalUs;    // MICROSECONDS, like every duration the server records
+    long totalUs;    // 微秒单位
     [Column(Name = "max_us")]
     long maxUs;
 }
 
-/// <summary>One worker's published live row: which worker, how many seconds
-/// ago it published, and the JSON it published. A read shape, not a table --
-/// `age` is "now minus updated", computed per read.</summary>
+/* 存活工作进程发布的实时行（仅读结构，age 由读取时计算）。 */
 class LiveRow {
     int worker;
     long age;
     string json;
 }
 
-/// <summary>One worker's row in the live table, overwritten in place on every
-/// publish: the monitor reads ALL of them and shows the whole server, not
-/// whichever worker happened to accept the page request. Keyed by worker id --
-/// NOT an autoincrement id -- so a restarted worker replaces its own row
-/// instead of adding a second one.</summary>
+/* 每个工作进程的实时快照行，按 worker id 主键覆盖更新。 */
 [Table(Name = "metrics_live")]
 class MetricLive {
     [Column(IsPrimary = true, IsIdentity = false)]
@@ -86,7 +63,7 @@ class MetricLive {
     string series;
 }
 
-/// <summary>One persisted server error, for the backend error screen.</summary>
+/* 持久化的服务端错误记录。 */
 [Table(Name = "metrics_error")]
 [Index(Name = "ix_metrics_error_ts", Fields = "ts")]
 class MetricError {
@@ -98,35 +75,16 @@ class MetricError {
     string detail;
 }
 
-/// <summary>
-/// The history behind the live monitor: per-minute, per-route counters and the
-/// errors, kept in memory and written to their own database.
-///
-/// Why a second database: this is write-heavy operational data with a retention
-/// policy of its own, and it must never contend with -- or be rolled back
-/// alongside -- an application transaction. It is SQLite in WAL mode whatever
-/// the application runs on, so the writer never blocks a reader.
-///
-/// Why buckets: a request costs an add to a minute bucket, never a write. The
-/// buckets are flushed by one background coroutine on an interval
-/// ([metrics].flushSeconds, one minute by default) or once enough of them have
-/// piled up ([metrics].flushRows), and the in-memory list is capped so a
-/// database that is down cannot grow the process without bound.
-/// </summary>
+/* 运行监控的历史数据存储：内存按分钟聚合后批量写入独立 SQLite 数据库。 */
 class MetricsStore {
     static List<MetricMinute> buckets = new List<MetricMinute>();
     static List<MetricError> errors = new List<MetricError>();
-    /// Statement shapes waiting to be written, accumulated per shape rather than
-    /// per execution: a query that runs ten thousand times an hour is ten
-    /// thousand additions to one entry, not ten thousand entries.
+    /* 待写入的 SQL 模板聚合（按模板聚合，每个慢查询只累加一次）。 */
     static List<MetricSql> sqlBuckets = new List<MetricSql>();
-    /// Hard ceiling on unflushed state: at one bucket per route per minute this
-    /// is hours of traffic, and dropping the oldest beats growing forever.
+    /* 未刷新桶数上限，超出则丢弃最旧记录。 */
     static int MaxBuckets = 8192;
     static int MaxErrors = 4096;
-    /// Distinct statement shapes carried in memory. A shape past the ceiling is
-    /// folded into one `OtherSql` row instead of being dropped: the day's query
-    /// count has to stay a count of the queries that ran.
+    /* 内存 SQL 模板数上限，超出时折叠为"其他语句"。 */
     static int MaxSqlShapes = 512;
     static string OtherSql = "(其他语句)";
     static DbPool pool = null;
@@ -134,9 +92,7 @@ class MetricsStore {
     static bool flushing = false;
     static long lastSweep = 0;
 
-    /// <summary>Opens metrics.db, creates the two tables, and starts the
-    /// flusher. Called once per worker from main; a failure here leaves the
-    /// server running without history rather than not running.</summary>
+    /* 初始化 metrics.db，创建表并启动后台刷新；失败时继续运行但不记历史。 */
     static async bool Start() {
         if (!Cfg.Metrics.enabled) { return false; }
         Db.EnsureFileDir(Cfg.Metrics.path);
@@ -144,27 +100,11 @@ class MetricsStore {
         IDbConnection db = await MetricsStore.Lease();
         if (db == null) { return false; }
         try {
-            // WAL: the flusher writes while the history screen reads.
+            /* WAL 模式：刷新写入时历史界面仍可读取。 */
             await DbSchema.UseWriteAheadLogAsync(db);
-            // A history written by an older build measured something else: it
-            // keyed a row by one `route` column holding an action name or a raw
-            // request line, and it stored durations in whole milliseconds.
-            // Those are different measurements, not renamed ones, so they are
-            // set aside under their own name instead of being guessed into the
-            // new columns -- and the new table starts clean.
+            /* 旧版使用不同键（route 列 + 毫秒单位），新表独立创建，旧数据归档为 _legacy。 */
             await MetricsStore.RetireLegacyMinutes(db);
-            // CodeFirst: the four tables are the four entities. Missing tables
-            // are created, missing columns added, declared indexes ensured --
-            // which is also the upgrade path for a database an older build
-            // left behind with fewer columns.
-            //
-            // SQL statistics are archived by DAY, not by minute: what an
-            // operator asks of a statement ("how often did it run today, how
-            // much of the day did it cost, how often was it slow") is a daily
-            // question, and a per-minute row per shape would be a table tens of
-            // times the size of the traffic history for an answer nothing reads.
-            // The minute is only how OFTEN memory is emptied out -- the flusher
-            // merges what it drained into today's row.
+            /* CodeFirst 建表/加列/建索引；SQL 统计按天聚合，分钟仅用于刷新时机。 */
             await db.SyncStructureAsync<MetricMinute>();
             await db.SyncStructureAsync<MetricError>();
             await db.SyncStructureAsync<MetricSql>();
@@ -191,27 +131,19 @@ class MetricsStore {
         MetricsStore.pool.Release(db);
     }
 
-    /// <summary>The minute a timestamp belongs to.</summary>
+    /* 截断到分钟的 epoch 秒。 */
     static long Minute(long sec) { return sec - (sec % 60); }
 
-    /// <summary>The day a timestamp belongs to.</summary>
+    /* 截断到午夜的 epoch 秒。 */
     static long Day(long sec) { return sec - (sec % 86400); }
 
-    /// <summary>Sets aside a metrics_minute written by an older build: one that
-    /// keyed a row by a single `route` column holding either an action name
-    /// ("Users.Save") or a raw request line ("GET /wp-login.php"), or one that
-    /// stored durations in whole milliseconds. Those rows are kept under
-    /// metrics_minute_legacy rather than migrated: an action name is not a
-    /// request path, and a millisecond that was already rounded to a 15ms tick
-    /// cannot be turned back into microseconds -- multiplying it by 1000 would
-    /// publish invented precision.</summary>
+    /* 检测并重命名旧版 metrics_minute 表（按 route 或 total_ms 列判断），归档为 _legacy。 */
     static async void RetireLegacyMinutes(IDbConnection db) {
         try {
             bool exists = await DbSchema.TableExistsAsync(db,
                 MetricMinuteCols.Table);
             if (!exists) { return; }
-            // The tell is a column the current entity does not have: `route`
-            // (the old key) or `total_ms` (the old unit).
+            /* 通过 route 或 total_ms 列判断是否为旧版表结构。 */
             List<string> gone = new List<string> { "route", "total_ms" };
             bool old = await DbSchema.HasAnyColumnAsync(db,
                 MetricMinuteCols.Table, gone);
@@ -221,16 +153,13 @@ class MetricsStore {
             Console.WriteLine("[metrics] history schema changed: previous "
                 + "rows kept in metrics_minute_legacy");
         } catch (Exception ex) {
-            // A history that cannot be inspected must not stop the server.
+            /* 检查失败不影响服务启动。 */
             Console.WriteLine("[metrics] legacy history check failed: "
                 + ex.Message);
         }
     }
 
-    /// <summary>Starts the flusher on the first thing worth flushing. It is
-    /// started here rather than at startup because a coroutine only runs once
-    /// the server is pumping its event loop: spawned from Start() it would sit
-    /// unscheduled (and hold up the boot) instead of ticking.</summary>
+    /* 首次有数据可刷新时启动后台刷新协程，避免启动阶段阻塞。 */
     static void Arm() {
         if (MetricsStore.flushing || !MetricsStore.ready) { return; }
         MetricsStore.flushing = true;
@@ -238,14 +167,12 @@ class MetricsStore {
         Task.Spawn(MetricsCluster.Loop());
     }
 
-    /// <summary>The bucket for this minute and interface, created if this is
-    /// the first thing that happened to it.</summary>
+    /* 获取当前分钟的桶，不存在则创建。 */
     static MetricMinute Bucket(string method, string path) {
         MetricsStore.Arm();
         long m = MetricsStore.Minute((long)WebApp.NowSeconds());
         int n = MetricsStore.buckets.Count;
-        // The current minute's buckets are at the end: a backwards scan finds
-        // one in a handful of steps and never walks the history.
+        /* 当前分钟桶位于列表末尾，倒序查找即可。 */
         for (int i = n - 1; i >= 0; i = i - 1) {
             MetricMinute b = MetricsStore.buckets[i];
             if (b.minute != m) { break; }
@@ -262,9 +189,7 @@ class MetricsStore {
         return b2;
     }
 
-    /// <summary>One finished request. `us` is the whole pipeline in
-    /// microseconds; a hijacked connection (SSE/WebSocket) does not come
-    /// through here -- see Pushed.</summary>
+    /* 记录一次请求完成（含状态码与耗时）。 */
     static void Record(string method, string path, int status, long us) {
         if (!Cfg.Metrics.enabled) { return; }
         MetricMinute b = MetricsStore.Bucket(method, path);
@@ -274,8 +199,7 @@ class MetricsStore {
         if (status >= 500) { b.errors = b.errors + 1; }
     }
 
-    /// <summary>What a long-lived connection is measured by: frames and bytes
-    /// pushed, never elapsed time.</summary>
+    /* 长连接以推送帧数/字节计量，不计耗时。 */
     static void Pushed(string method, string path, long frames, long bytes) {
         if (!Cfg.Metrics.enabled) { return; }
         MetricMinute b = MetricsStore.Bucket(method, path);
@@ -283,14 +207,7 @@ class MetricsStore {
         b.bytes = b.bytes + bytes;
     }
 
-    /// <summary>One finished statement, folded into its shape's entry for today.
-    /// `norm` is the NORMALIZED statement (ServerMetrics.NormalizeSql), so a
-    /// literal a caller typed -- an address, a token, a password being checked --
-    /// never reaches the database or the log. `us` is microseconds.
-    ///
-    /// Called from the DbTrace sink, on the coroutine that ran the statement:
-    /// this adds to a list in memory and never writes, so a query costs a query.
-    /// </summary>
+    /* 记录一条 SQL 执行结果，累加到当天模板聚合中。SQL 已规范化，耗时单位微秒。 */
     static void RecordSql(string norm, long us, bool slow) {
         if (!Cfg.Metrics.enabled) { return; }
         MetricsStore.Arm();
@@ -301,11 +218,7 @@ class MetricsStore {
         if (slow) { e.slow = e.slow + 1; }
     }
 
-    /// <summary>Today's entry for a shape, created if this is the first time it
-    /// ran. Once `MaxSqlShapes` shapes are held, everything new folds into the
-    /// `OtherSql` entry -- a server generating unbounded statement shapes must
-    /// not turn the monitor into a leak, and must not lose the count either.
-    /// </summary>
+    /* 获取今日 SQL 模板聚合项，上限超出则折叠为"其他语句"。 */
     static MetricSql SqlEntry(string norm) {
         long d = MetricsStore.Day((long)WebApp.NowSeconds());
         for (int i = MetricsStore.sqlBuckets.Count - 1; i >= 0; i = i - 1) {
@@ -326,8 +239,7 @@ class MetricsStore {
         return n;
     }
 
-    /// <summary>Queues one error for the error screen. The detail is already
-    /// redacted by the caller.</summary>
+    /* 向错误队列添加一条错误记录。 */
     static void Failed(long ts, string origin, string detail) {
         if (!Cfg.Metrics.enabled) { return; }
         MetricError e = new MetricError();
@@ -340,8 +252,7 @@ class MetricsStore {
         }
     }
 
-    /// <summary>The flusher. One coroutine per worker, awake once a second only
-    /// to look at a counter.</summary>
+    /* 后台刷新协程：每秒检查一次，到达间隔或数量阈值时刷新。 */
     static async void Loop() {
         int waited = 0;
         while (true) {
@@ -357,10 +268,7 @@ class MetricsStore {
         }
     }
 
-    /// <summary>Writes everything buffered in one transaction and clears it.
-    /// The current minute is written too -- a worker that dies should not lose
-    /// the minute it was in -- and re-flushing it later adds to the row that is
-    /// already there.</summary>
+    /* 事务性刷新所有缓冲数据，当前分钟也写入以防进程退出丢失。 */
     static async int Flush() {
         if (!MetricsStore.ready) { return 0; }
         if (MetricsStore.buckets.Count == 0 && MetricsStore.errors.Count == 0
@@ -379,11 +287,7 @@ class MetricsStore {
         int written = 0;
         try {
             await db.BeginTransactionAsync();
-            // Merged on write: the batch goes in as one statement and a row
-            // that is already there for this (minute, method, path) takes the
-            // counters ADDED to it and keeps the larger maximum. So a minute
-            // re-flushed by this worker, or flushed by four workers at once,
-            // ends as ONE row -- nothing raw is stored to be added up later.
+            /* 写入时按复合键合并：冲突时累加计数器、取最大 maxUs，最终每桶一行。 */
             if (mine.Count > 0) {
                 written = written + await db.Insert<MetricMinute>(mine)
                     .OnConflict(a => new { a.minute, a.method, a.path })
@@ -395,9 +299,7 @@ class MetricsStore {
                     .SetIncr(a => a.bytes)
                     .ExecuteAffrowsAsync();
             }
-            // The same merge by (day, sql): this worker flushes every minute,
-            // the other workers flush their own, and all of it accumulates
-            // into one row per shape per day.
+            /* 按 (day, sql) 合并，所有工作进程累积到同一行。 */
             if (sqls.Count > 0) {
                 written = written + await db.Insert<MetricSql>(sqls)
                     .OnConflict(a => new { a.day, a.sql })
@@ -407,8 +309,7 @@ class MetricsStore {
                     .SetMax(a => a.maxUs)
                     .ExecuteAffrowsAsync();
             }
-            // Errors are events, not counters: each one is its own row, and
-            // `id` is filled by the database.
+            /* 错误为事件记录，每条独立一行。 */
             if (errs.Count > 0) {
                 written = written + await db.Insert<MetricError>(errs)
                     .ExecuteAffrowsAsync();
@@ -417,8 +318,7 @@ class MetricsStore {
             await MetricsStore.Sweep(db);
         } catch (Exception ex) {
             await db.RollbackAsync();
-            // Losing history is not worth failing a request over, and the
-            // error sink itself must not recurse into the error sink.
+            /* 刷新失败不回滚请求，且错误记录器自身不递归。 */
             Console.WriteLine("[metrics] flush failed: " + ex.Message);
         } finally {
             MetricsStore.Give(db);
@@ -426,8 +326,7 @@ class MetricsStore {
         return written;
     }
 
-    /// <summary>Drops anything past the retention window, at most once an
-    /// hour.</summary>
+    /* 按保留天数清理过期数据，每小时最多执行一次。 */
     static async void Sweep(IDbConnection db) {
         long now = (long)WebApp.NowSeconds();
         if (now - MetricsStore.lastSweep < 3600) { return; }
@@ -442,14 +341,7 @@ class MetricsStore {
             .Where(a => a.day < dayCut).ExecuteAffrowsAsync();
     }
 
-    /// <summary>The statements the window was spent on, one row per shape,
-    /// ranked by "calls" (how often it ran), "time" (how much of the window it
-    /// cost) or "slow" (how often it was over the threshold). The window is
-    /// given in seconds like every other query here and snapped to whole days,
-    /// because that is the resolution the archive keeps.
-    ///
-    /// The database groups and ranks the day rows, so no raw archive rows are
-    /// loaded into the worker.</summary>
+    /* 查询窗口内 SQL 模板聚合，按调用/耗时/慢次数排序，数据库端聚合，无原始行入内存。 */
     static async List<MetricSql> SqlTotals(long from, long to, int limit,
                                            string rank) {
         List<MetricSql> outp = new List<MetricSql>();
@@ -488,15 +380,10 @@ class MetricsStore {
         return outp;
     }
 
-    /// <summary>Aggregated history: one row per `stepSec` time bucket (a
-    /// minute, an hour, a day or any other span), summed across interfaces --
-    /// or over one of them when `method`/`path` filter -- newest first.
-    ///
-    /// The database groups, sums and limits the buckets, returning the newest
-    /// bucket first.</summary>
+    /* 聚合历史：按 stepSec 分桶（分钟/小时/天），可按 method/path 过滤。 */
     static async List<MetricMinute> HistoryBuckets(long from, long to,
-                                                   string method, string path,
-                                                   long stepSec, int limit) {
+                                                    string method, string path,
+                                                    long stepSec, int limit) {
         List<MetricMinute> outp = new List<MetricMinute>();
         if (stepSec < 1) { stepSec = 60; }
         string sql = "SELECT minute - (minute % " + Convert.ToString(stepSec)
@@ -539,9 +426,7 @@ class MetricsStore {
         return outp;
     }
 
-    /// <summary>Per-interface totals over the window, busiest first: which
-    /// endpoints carried the traffic, which were slow and which erred.
-    /// `minute` is 0 -- these rows have no time axis.</summary>
+    /* 窗口内按接口聚合，按调用次数排序。 */
     static async List<MetricMinute> RouteTotals(long from, long to,
                                                 string method, string path,
                                                 int limit) {
@@ -549,13 +434,7 @@ class MetricsStore {
             "calls");
     }
 
-    /// <summary>The same per-interface totals ranked by something else:
-    /// "calls" (how often) or "time" (how much of the server's time the
-    /// interface consumed). The two answer different questions -- an endpoint
-    /// called twice a day can still be the one the server spends its
-    /// afternoon in.
-    ///
-    /// The database groups, ranks and limits the interfaces.</summary>
+    /* 按接口聚合，可按调用次数或耗时排序。 */
     static async List<MetricMinute> RouteTotalsBy(long from, long to,
                                                   string method, string path,
                                                   int limit, string rank) {
@@ -606,9 +485,7 @@ class MetricsStore {
         return outp;
     }
 
-    /// <summary>The database returns one aggregate row for the window. SQL NULL
-    /// aggregate cells are exposed as zero by DbResult.GetLong; empty windows
-    /// therefore retain the non-null zero row contract.</summary>
+    /* 窗口整体汇总（单次聚合行，无数据时各字段为 0）。 */
     static async MetricMinute WindowTotals(long from, long to, string method,
                                            string path) {
         MetricMinute b = new MetricMinute();
@@ -646,7 +523,7 @@ class MetricsStore {
         return b;
     }
 
-    /// <summary>Persisted errors, newest first.</summary>
+    /* 查询持久化的错误记录，按时间倒序。 */
     static async List<MetricError> Errors(long from, long to, int limit) {
         List<MetricError> outp = new List<MetricError>();
         if (!MetricsStore.ready) { return outp; }
@@ -665,31 +542,13 @@ class MetricsStore {
     }
 }
 
-/// <summary>
-/// The whole server's live numbers, not one worker's. Every counter behind
-/// the monitor lives in the worker process that served the request, so with
-/// [worker].count > 1 a page that read its own process would show a different
-/// worker on every refresh. Instead each worker publishes its snapshot into
-/// metrics_live (one row per worker, overwritten in place, every couple of
-/// seconds), and the reader merges every row that is still fresh: counters
-/// add, maxima take the max, averages are weighted by their counts, CPU and
-/// RSS add across processes. With a single worker the merge degenerates to
-/// that worker's own snapshot.
-/// </summary>
+/* 聚合所有工作进程的实时指标：各 worker 独立发布，读取端合并。 */
 class MetricsCluster {
-    /// How often each worker publishes, and how old a row may be before its
-    /// per-second series is too stale to plot. Totals are NOT subject to this
-    /// window: a cumulative counter that disappears makes the whole page jump
-    /// backwards (the symptom is numbers that come and go on refresh), so a
-    /// worker's last published totals keep counting until its row is replaced
-    /// -- the row is keyed by worker id, so a restarted worker overwrites its
-    /// own row rather than adding a second one.
+    /* 发布间隔 2 秒，秒级数据失效阈值 30 秒；累加总量不受失效阈值影响。 */
     static int PublishSeconds = 2;
     static int FreshSeconds = 30;
 
-    /// <summary>One background coroutine per worker (spawned from
-    /// MetricsStore.Arm), so the row is fresh even for workers the monitor's
-    /// own requests never land on.</summary>
+    /* 每个 worker 一个后台协程，定期发布快照。 */
     static async void Loop() {
         while (true) {
             await Task.Delay(MetricsCluster.PublishSeconds * 1000);
@@ -697,7 +556,7 @@ class MetricsCluster {
         }
     }
 
-    /// <summary>Writes this worker's snapshot + series over its own row.</summary>
+    /* 覆写本 worker 的实时行（快照 + 时序）。 */
     static async void Publish() {
         if (!MetricsStore.ready) { return; }
         WebApp app = WebHost.Current();
@@ -711,8 +570,7 @@ class MetricsCluster {
             row.updated = (long)WebApp.NowSeconds();
             row.snapshot = app.MetricsJson();
             row.series = app.MetricsSeriesJson(120);
-            // One row per worker, overwritten in place: on a conflicting
-            // `worker` the columns not named as counters take the new values.
+            /* 按 worker 主键冲突时覆写非计数列。 */
             int _n = await db.Insert<MetricLive>(row)
                 .OnConflict(a => a.worker)
                 .ExecuteAffrowsAsync();
@@ -723,12 +581,7 @@ class MetricsCluster {
         }
     }
 
-    /// <summary>Every worker's published `col` ("snapshot" or "series") with
-    /// how old it is, in worker order. `maxAgeSec` 0 means every row however
-    /// old: for cumulative totals an old row is a lagging total, and dropping
-    /// it would subtract that worker's whole history from the page. Only the
-    /// per-second series passes an age limit, because a stale point plotted at
-    /// "now" is a wrong point rather than a late one.</summary>
+    /* 读取所有 worker 发布的指定列（snapshot 或 series）及年龄，可选时效过滤。 */
     static async List<LiveRow> LiveRows(string col, int maxAgeSec) {
         List<LiveRow> outp = new List<LiveRow>();
         if (!MetricsStore.ready) { return outp; }
@@ -748,8 +601,7 @@ class MetricsCluster {
                 w.worker = m.worker;
                 w.age = now - m.updated;
                 if (w.age < 0) { w.age = 0; }
-                // Which of the two published documents the caller asked for --
-                // a field pick in Zan, not a column name in a statement.
+                /* 根据参数选择返回 snapshot 或 series 字段。 */
                 w.json = col == "series" ? m.series : m.snapshot;
                 outp.Add(w);
             }
@@ -759,15 +611,10 @@ class MetricsCluster {
         return outp;
     }
 
-    /// <summary>The merged snapshot: same shape MetricsJson produces, so the
-    /// page's painter does not know how many processes it is looking at. Adds
-    /// `workers` (how many are live), `worker_list`, and `processes` -- one row
-    /// per publishing process, which is the only part of the page that is NOT
-    /// merged: a summed CPU or request count says nothing about which worker is
-    /// carrying the traffic or has stopped answering.</summary>
+    /* 合并所有 worker 的快照，追加 workers/processes/worker_list 字段。 */
     static async string SnapshotJson() {
         WebApp app = WebHost.Current();
-        await MetricsCluster.Publish();   // this worker is always current
+        await MetricsCluster.Publish();   // 本 worker 始终保持最新
         List<LiveRow> rows = await MetricsCluster.LiveRows("snapshot", 0);
         List<JsonValue> ms = new List<JsonValue>();
         List<LiveRow> kept = new List<LiveRow>();
@@ -783,10 +630,7 @@ class MetricsCluster {
 
         string own = app.MetricsJson();
         if (ms.Count <= 1) {
-            // One process publishing (or no store at all): its own snapshot IS
-            // the server's, and the process table has the one row this request
-            // is being served by. Taken from this process rather than from its
-            // published row, which is up to a publish interval old.
+            /* 单进程场景：自身快照即服务器全貌。 */
             JsonValue o = JsonValue.ParseLenient(own);
             if (o == null || !o.IsObject()) { return own; }
             List<JsonValue> self = new List<JsonValue>();
@@ -798,9 +642,7 @@ class MetricsCluster {
             r.json = own;
             selfRow.Add(r);
             o.Put("processes", MetricsCluster.ProcessesJson(selfRow, self));
-            // The fleet fields the merge adds, which a single worker's own
-            // snapshot does not carry: without them the page reads "存活  个"
-            // and cannot tell one worker from an unknown number of them.
+            /* 单 worker 场景补全 fleet 字段，避免页面显示异常。 */
             o.Put("workers", MetricsCluster.Num(1));
             o.Put("workers_counted", MetricsCluster.Num(1));
             o.Put("worker_list", JsonValue.NewStr(
@@ -814,12 +656,7 @@ class MetricsCluster {
         return merged.ToJson();
     }
 
-    /// <summary>One row per process behind the server: who it is (worker id,
-    /// pid), how long it has been up, what it has served and what it costs.
-    /// `age` is how many seconds ago the row was published and `live` whether
-    /// that is still within FreshSeconds -- a worker that died keeps its row,
-    /// marked stale, because a row that simply disappeared would read as "the
-    /// server has fewer workers now" without saying that one stopped.</summary>
+    /* 每个进程一行，含 uptime/requests/queries/load 等，age 为发布到现在的秒数。 */
     static JsonValue ProcessesJson(List<LiveRow> rows, List<JsonValue> ms) {
         JsonValue arr = JsonValue.NewArray();
         for (int i = 0; i < ms.Count; i = i + 1) {
@@ -964,9 +801,7 @@ class MetricsCluster {
         o.Put("pid", MetricsCluster.Num(ProcessHost.Pid()));
         o.Put("worker_id", MetricsCluster.Num(ProcessHost.WorkerId()));
         o.Put("workers", MetricsCluster.Num(live));
-        // Every worker whose totals are in this merge, including ones that have
-        // stopped publishing: the difference is what tells a reader that a
-        // worker died rather than that traffic vanished.
+        /* 计入所有参与合并的 worker（含已停发），停发与流量消失的区别由此区分。 */
         o.Put("workers_counted", MetricsCluster.Num(ms.Count));
         o.Put("worker_list", JsonValue.NewStr(wl.ToString()));
         o.Put("cpu_percent", MetricsCluster.Num(cpuPct));
@@ -979,9 +814,7 @@ class MetricsCluster {
         return o.ToJson();
     }
 
-    /// <summary>Folds one worker's top list into the merged one: rows with the
-    /// same key add their counts and total_ms, keep the larger max, and the
-    /// average is recomputed from the merged totals.</summary>
+    /* 合并一个 worker 的 top 列表：同 key 累加 count/total_us，取较大 max_us，重算 avg。 */
     static void MergeTop(JsonValue merged, JsonValue add, string key) {
         if (add == null || !add.IsArray()) { return; }
         for (int i = 0; i < add.Count(); i = i + 1) {
@@ -1028,9 +861,7 @@ class MetricsCluster {
         row.Set("avg_us", MetricsCluster.Num(avg));
     }
 
-    /// <summary>Busiest first, by cumulative time, capped at 20 like the
-    /// per-worker lists. Selection sort: the list is at most a few dozen
-    /// rows.</summary>
+    /* 按累计耗时降序排列，最多取 20 条，选择排序。 */
     static JsonValue SortTop(JsonValue arr) {
         int n = arr.Count();
         List<JsonValue> rows = new List<JsonValue>();
@@ -1055,11 +886,7 @@ class MetricsCluster {
         return outp;
     }
 
-    /// <summary>The merged per-second series: requests and errors add, latency
-    /// averages weight by requests, p95/max take the worst worker, CPU and RSS
-    /// add across processes. Field names and units are the ones a single
-    /// worker's MetricsSeriesJson produces (durations in microseconds, `_us`),
-    /// because the page paints both shapes with the same code.</summary>
+    /* 合并秒级时序：请求/错误相加，延迟按请求数加权，p95/max 取最值，CPU/RSS 相加。 */
     static async string SeriesJson(int seconds) {
         WebApp app = WebHost.Current();
         List<LiveRow> rows = await MetricsCluster.LiveRows("series",
@@ -1083,11 +910,7 @@ class MetricsCluster {
             JsonValue pts = s.Get("points");
             if (pts == null || !pts.IsArray()) { continue; }
             merged = merged + 1;
-            // Each worker numbers its points from its OWN "now", so a row
-            // published two seconds ago describes two seconds ago: shifting it
-            // back by its age is what keeps one second of the chart made of the
-            // same second from every worker (unshifted, the last buckets mix
-            // full seconds with partial ones and the line flickers).
+            /* 各 worker 以自身时间零点编号，回移 age 使同一秒来自所有 worker 的数据对齐。 */
             int shift = (int)rows[i].age;
             for (int j = 0; j < pts.Count(); j = j + 1) {
                 JsonValue p = pts.At(j);

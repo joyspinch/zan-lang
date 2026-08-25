@@ -7,19 +7,12 @@ using ZanWeb.Model.Sys;
 
 namespace ZanWeb.Admin.System;
 
-/// <summary>
-/// Departments at /admin/system/departments. A department can carry roles of its own
-/// (sys_department_role), so an account inherits rights from where it works
-/// without anyone assigning them per person.
-/// </summary>
+/* /admin/system/departments 部门；部门可携带自身角色（sys_department_role），故账号继承工作所属的权利，无需逐人分派。 */
 [Route("admin/system/departments/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("部门管理")]
 class Departments : AdminController {
-    /// The screen is the organisation on the left and the people in the picked
-    /// department on the right: a department only means anything through who
-    /// works in it, so browsing the tree and reading the roster is one screen
-    /// rather than a list and a detour.
+    /* 屏左侧为组织树、右侧为所选部门的成员；部门只有通过谁在里面才有意义，故浏览树与读名册为同一屏。 */
     [HttpGet]
     [Route("/admin/system/departments")]
     [Custom(IsMenu = true, Icon = "mdi:sitemap", Perm = PermBit.View)]
@@ -28,9 +21,7 @@ class Departments : AdminController {
         ViewData d = await this.Layout("部门管理");
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
 
-        // The tree is cut to the departments this account's roles cover, and
-        // the roster next to it to the same set, so the counts on the left and
-        // the names on the right always agree.
+        /* 树按该账号角色可覆盖部门裁剪，旁侧名册同裁，使左右数字与姓名总一致。 */
         DataScope sc = await this.Scope();
         List<int> scoped = sc.Depts();
         int myDept = (await this.Admin()).departmentId;
@@ -45,8 +36,7 @@ class Departments : AdminController {
             .WhereIf(sc.Mine(), a => a.id == mine)
             .ToListAsync();
 
-        // Nothing picked means the first department, so the roster is never an
-        // empty panel next to a full tree.
+        /* 未选中取首部门，使名册旁不出现空面板。 */
         int pick = this.InInt("id", 0);
         if (pick == 0 && rows.Count > 0) { pick = rows[0].id; }
 
@@ -77,8 +67,7 @@ class Departments : AdminController {
         d.Set("deptStatusText", Departments.StatusText(picked.status));
         d.Set("deptStatusClass", Departments.StatusClass(picked.status));
 
-        // The roles this department lends everyone in it -- the reason an
-        // account can hold rights nobody assigned it personally.
+        /* 该部门借给其所有人的角色——账号能持无人为其分派的权利的原因。 */
         List<Role> roles = await this.Role.ToListAsync();
         List<DepartmentRole> lent = await this.DepartmentRole
             .Where(a => a.departmentId == pick).ToListAsync();
@@ -130,8 +119,7 @@ class Departments : AdminController {
             if (dept.status == 1) { d.Set("status1", "selected"); }
             else { d.Set("status0", "selected"); }
         }
-        // The parent choices are the tree this account can see, so a department
-        // cannot be filed under one it may not read.
+        /* 上级选择项为树可见部分，故部门不能被归档到不可读的位置。 */
         DataScope sc = await this.Scope();
         List<int> scoped = sc.Depts();
         int myDept = (await this.Admin()).departmentId;
@@ -192,8 +180,7 @@ class Departments : AdminController {
         this.Saved("部门已创建");
     }
 
-    /// A department's roles are what everyone in it inherits, so this is how a
-    /// whole team is granted at once instead of person by person.
+    /* 部门角色为所属所有人继承——一次为整队授权，而非逐人。 */
     [HttpGet]
     [Custom(Perm = PermBit.Update)]
     [Description("部门角色")]
@@ -239,8 +226,7 @@ class Departments : AdminController {
             int _n = await this.DepartmentRole.Insert(link).ExecuteIdentityAsync();
             granted = granted + 1;
         }
-        // Everyone in the department just changed rights, and the grant cache is
-        // keyed per account, so it goes as a whole.
+        /* 部门内所有人权利刚变更，授权缓存按账号键，故整体清除。 */
         AuthUser.ForgetAll();
         await this.Note("部门角色", dept.name, true,
             Convert.ToString(granted) + " 个角色");
@@ -271,24 +257,20 @@ class Departments : AdminController {
         this.Saved("部门已删除");
     }
 
-    /// <summary>The department this request may act on: out of the caller's
-    /// data scope reads as "does not exist", the same as on the list.</summary>
+    /* 请求可操作的部门：超范围的读作"不存在"，与列表上同。 */
     async Department Reach(int id) {
         Department dept = await this.Department.Read(id);
         if (dept == null) { this.Fail(404, "0404", "部门不存在"); }
         DataScope sc = await this.Scope();
         if (sc.Any()) { return dept; }
-        // The rows here ARE departments, so a row's "own department" is its own
-        // id, and a 仅本人 scope reaches the caller's department only.
+        /* 此处行即部门本身，故行"自己的部门"为其 id；仅本人 scope 只触及调用方所属部门。 */
         bool ok = sc.Covers(0, dept.id);
         if (sc.Mine()) { ok = dept.id == (await this.Admin()).departmentId; }
         if (!ok) { this.Fail(404, "0404", "部门不存在"); }
         return dept;
     }
 
-    /// <summary>The parent a department may be filed under: outside the caller's
-    /// scope -- a top-level department included -- it would create a row the
-    /// caller itself cannot read back.</summary>
+    /* 部门可归档到的上级；超范围（含顶级）会造出调用方自身无法读回的部门行。 */
     async void Parented(int parentId) {
         DataScope sc = await this.Scope();
         if (sc.Any()) { return; }
@@ -298,9 +280,7 @@ class Departments : AdminController {
         Department _p = await this.Reach(parentId);
     }
 
-    /// <summary>Whether the scoped tree on the left contains that id, so the
-    /// roster on the right cannot be opened for a department the tree does not
-    /// offer.</summary>
+    /* 左侧 scoped 树是否含该 id，使右侧名册无法为该树未提供的部门打开。 */
     static bool Listed(List<Department> rows, int id) {
         for (int i = 0; i < rows.Count; i = i + 1) {
             if (rows[i].id == id) { return true; }
@@ -308,8 +288,7 @@ class Departments : AdminController {
         return false;
     }
 
-    /// <summary>Two spaces per level, so the flat table still reads as a
-    /// tree.</summary>
+    /* 每层两个全角空格，使平表仍读作树。 */
     static string Indent(List<Department> all, Department dept) {
         string pad = "";
         int parent = dept.parentId;
@@ -343,7 +322,7 @@ class Departments : AdminController {
         return "—";
     }
 
-    /// <summary>The roles an account holds in its own right, as one label.</summary>
+    /* 账号本人持有的角色，作一个标签。 */
     static string RolesOf(List<Role> roles, List<UserRole> held, int userId) {
         string s = "";
         for (int i = 0; i < held.Count; i = i + 1) {

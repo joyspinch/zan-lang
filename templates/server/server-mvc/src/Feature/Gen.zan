@@ -7,25 +7,9 @@ using ZanWeb.Model.Sys;
 
 namespace ZanWeb;
 
-/// <summary>
-/// The table designer's engine: it turns a saved design (GenTable + GenColumn)
-/// into DDL for the connected engine, and into readable .zan sources.
-///
-/// Two products from one design, because they answer different needs. The DDL
-/// plus the generic screens in Admin.Data make a designed table manageable the
-/// moment it is saved -- no rebuild, which is the whole point of designing a
-/// table from a running admin. The generated sources are for the table that
-/// outgrows a generic screen: they are ordinary controllers and views, checked
-/// by the compiler like the hand-written ones, and free to be edited afterwards.
-///
-/// Identifiers never come from the request. Everything that reaches SQL as a
-/// name is checked by Safe() first and everything that reaches SQL as a value
-/// is bound as a parameter, so a designed screen cannot be talked into naming
-/// a column or a table of the caller's choosing.
-/// </summary>
+/* 表设计器引擎：将设计（GenTable+GenColumn）生成 DDL 与 .zan 源码。标识符经 Safe() 校验，值使用参数绑定。 */
 class Gen {
-    /// <summary>True for a name that may be written into SQL: lower-case
-    /// letters, digits and underscore, starting with a letter.</summary>
+    /* 判断标识符是否安全：字母开头，仅含小写字母、数字与下划线。 */
     static bool Safe(string name) {
         if (name == null) { return false; }
         int n = name.Length;
@@ -40,10 +24,7 @@ class Gen {
         return true;
     }
 
-    /// <summary>The design as logical column definitions. Every table gets an
-    /// identity `id`, which the screens and the generated code rely on for row
-    /// identity; the physical types are the ORM's business, not the
-    /// designer's.</summary>
+    /* 将设计列转为 DbColumnDef，自动加 identity id。 */
     static List<DbColumnDef> Columns(List<GenColumn> cols) {
         List<DbColumnDef> defs = new List<DbColumnDef>();
         defs.Add(DbColumnDef.Identity("id"));
@@ -58,16 +39,14 @@ class Gen {
         return defs;
     }
 
-    /// <summary>Creates the table, or adds the columns the design has and the
-    /// table does not. Columns are never dropped or retyped here: that destroys
-    /// data, and an operator who wants it should say so in SQL.</summary>
+    /* 建表或追加设计中有而表缺失的列，不删列不改类型。 */
     static async int Migrate(IDbConnection db, GenTable t, List<GenColumn> cols) {
         return await DbSchema.MigrateAsync(db, t.tableName, Gen.Columns(cols));
     }
 
-    // ---- source generation --------------------------------------------------
+    /* ---- 源码生成 ---- */
 
-    /// <summary>The Zan type a designed kind maps to.</summary>
+    /* 设计列类型到 Zan 类型的映射。 */
     static string ZanType(string kind) {
         if (kind == "int" || kind == "bool") { return "int"; }
         if (kind == "long" || kind == "datetime") { return "long"; }
@@ -75,7 +54,7 @@ class Gen {
         return "string";
     }
 
-    /// <summary>The entity source for a design.</summary>
+    /* 生成实体类源码。 */
     static string ModelSource(GenTable t, List<GenColumn> cols) {
         StringBuilder b = new StringBuilder();
         b.Append("using System.Data.Orm;\n\nnamespace ZanWeb.Model.Gen;\n\n");
@@ -105,20 +84,8 @@ class Gen {
         return 255;
     }
 
-    /// <summary>The admin controller source for a design: list, dialog form,
-    /// save and delete. Authorization is the class attribute and nothing else:
-    /// the generated actions become route actions like every other screen's, so
-    /// they are grantable the moment the module is compiled in.
-    ///
-    /// The class is named after the entity ("ShopItem") and lives in
-    /// Controller/Admin so the directory matches the /admin URL and the route,
-    /// file, class and view all read the same token. The entity type would then
-    /// shadow the class name, so every reference to it is written in full
-    /// (ZanWeb.Model.Gen.ShopItem); `this.ShopItem` stays the compiler-provided
-    /// table accessor, which is a member and does not clash.</summary>
-    /// <summary>The URL a generated module is served at, below /admin: its
-    /// section and its table ("content/shoporder"). The sidebar reads the same
-    /// URL, so there is no group to declare anywhere.</summary>
+    /* 生成管理控制器源码（列表/表单/保存/删除），命名与路由一致。 */
+    /* 生成模块的 URL 路径（section/表名），侧边栏共享此 URL。 */
     static string Route(GenTable t) {
         string sec = t.section;
         if (!Gen.Safe(sec)) { sec = "content"; }
@@ -183,7 +150,7 @@ class Gen {
             GenColumn c = cols[i];
             if (c.name == "id" || c.inEdit != 1) { continue; }
             if (Gen.ZanType(c.kind) == "string") {
-                b.Append("            d.Set(\"" + c.name + "\", e." + c.name + ");\n");
+                b.Append("            d.Set(\"" + c.name + "\", e." + c.name + "");\n");
             } else {
                 b.Append("            d.Set(\"" + c.name
                     + "\", Convert.ToString(e." + c.name + "));\n");
@@ -251,7 +218,7 @@ class Gen {
         return c.name;
     }
 
-    /// <summary>The list view for a generated controller.</summary>
+    /* 生成列表视图源码。 */
     static string ListViewSource(GenTable t, List<GenColumn> cols) {
         string route = Gen.Route(t);
         StringBuilder b = new StringBuilder();
@@ -281,7 +248,7 @@ class Gen {
         return b.ToString();
     }
 
-    /// <summary>The dialog form for a generated controller.</summary>
+    /* 生成表单视图源码。 */
     static string FormViewSource(GenTable t, List<GenColumn> cols) {
         string route = Gen.Route(t);
         StringBuilder b = new StringBuilder();
@@ -293,11 +260,7 @@ class Gen {
             if (c.name == "id" || (c.inCreate != 1 && c.inEdit != 1)) { continue; }
             b.Append("    <label>" + Gen.LabelOf(c) + "</label>\n");
             if (c.widget == "select") {
-                // A dropdown whose choices come from a dictionary type or from
-                // another table (relTable/relValue/relLabel), described here as
-                // data-* so the option source stays declarative. The current
-                // value is kept as one option so a save round-trips even before
-                // the choices are loaded.
+                /* 下拉框：选项来自字典类型或关联表，通过 data-* 声明，保留当前值以防先保存后加载。 */
                 string src = "";
                 if (c.dictType.Length > 0) {
                     src = " data-dict=\"" + c.dictType + "\"";
@@ -327,10 +290,7 @@ class Gen {
         return b.ToString();
     }
 
-    /// <summary>The data-access gateway for a design, mirroring the hand-written
-    /// DAOs (one connection-bound object, every read and write of the table in
-    /// one place). The class is {Entity}Dao, so the entity name is free to be
-    /// used unqualified here, unlike in the controller.</summary>
+    /* 生成数据访问网关（{Entity}Dao），与手写 DAO 结构一致。 */
     static string DaoSource(GenTable t, List<GenColumn> cols) {
         string ent = t.entityName;
         StringBuilder b = new StringBuilder();

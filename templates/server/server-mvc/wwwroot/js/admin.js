@@ -1,23 +1,10 @@
-/* Admin shell behaviour: tabs, dialogs, writes and the live metric stream.
- *
- * The rules are all in the markup, so a screen is a plain template:
- *   <a data-tab href="/admin/system/users">      opens (or focuses) a tab
- *   <a data-load href="?page=2">          reloads the current panel in place
- *   <a data-dialog href="/admin/system/users/form?id=3">   opens a fragment as a modal
- *   <button data-post="/admin/system/users/status" data-args="id=3&status=0">
- *   <form data-submit action="/admin/system/users/save">   posts, closes, reloads
- *
- * A panel is fetched with X-Fragment: 1, which makes the server render the
- * screen without the shell. */
+/* Admin 外壳行为：标签、弹窗、写操作与实时指标流。规则全部在标记中，屏幕即模板。 */
 (function () {
   var panel, tabs, toasts;
   var state = { tabs: [], active: '' };
   var KEY = 'zanweb.admin.tabs';
   var stream = null;
   var ctxMenu = null;
-  // Which sub-pane a screen last showed, keyed by its base path. A write
-  // reloads the panel in place; without this the active pane would snap back
-  // to the first one and drop the operator somewhere they did not choose.
   var paneMemo = {};
 
   function el(id) { return document.getElementById(id); }

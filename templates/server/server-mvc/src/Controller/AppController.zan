@@ -4,60 +4,26 @@ using System.Web;
 
 namespace ZanWeb;
 
-/// <summary>
-/// Controller base with injected database and cache access. Dependencies are
-/// assembled in main.zan and installed via AppServices.Use(...); actions reach
-/// them through this.Conn() / this.Cache() instead of static service lookup.
-///
-/// THE CONNECTION IS REQUEST-SCOPED. Conn() borrows one connection from the pool
-/// the first time an action asks for it, every later call in the same request
-/// gets that same connection, and OnAfter() gives it back when the action
-/// finishes — so no business code, and no DAO, contains Acquire/Release:
-///
-///     PostDao dao = new PostDao(await this.Conn());
-///     List&lt;Post&gt; rows = await dao.Recent(20, kw);
-///     Post one = await dao.ById(id);    // same connection, no second lease
-///
-/// One connection per request (not per query) is also what makes transactions
-/// possible at all: a transaction lives on a session, so every statement inside
-/// it must run on the same connection.
-///
-///     if (!await this.Begin()) { ...unavailable... }
-///     try {
-///         int id = await new PostDao(this.Held()).Insert(p);
-///         int _n = await new UserDao(this.Held()).BumpTokenVersion(uid);
-///         await this.Commit();
-///     } catch { await this.Rollback(); }   // Rollback is safe to call twice
-///
-/// BEGIN / COMMIT / ROLLBACK are statements like any other, so they are awaited
-/// too — on a non-blocking driver they are round trips, and the request's
-/// teardown (OnAfterAsync) therefore runs on the coroutine as well.
-///
-/// Override OnDone() (not OnAfterAsync()) for per-request cleanup of your own, so
-/// the connection is always released.
-/// </summary>
+/* 注入数据库与缓存访问的控制器基类。依赖在 main.zan 装配并经 AppServices.Use(...) 安装，动作通过 this.Conn()/this.Cache() 访问。连接按请求作用域：Conn() 首次调用时从连接池借出，同请求后续调用复用同一连接，OnAfter() 在动作返回时归还——故业务代码与 DAO 不含 Acquire/Release；按请求(非按查询)持一连接也使事务成为可能，事务内每条语句须在同一连接上执行。BEGIN/COMMIT/ROLLBACK 同其他语句一样需 await。子类清理覆盖 OnDone() 而非 OnAfterAsync()，以确保连接总是被释放。 */
 class AppController : Controller {
     IDbConnection lease;
     bool inTx;
 
-    /// <summary>The injected database context (null before AppServices.Use).</summary>
+    /* 注入的数据库上下文（AppServices.Use 前为 null）。 */
     protected DbContext Db() {
         AppServices s = AppServices.Current();
         if (s == null) { return null; }
         return s.Db();
     }
 
-    /// <summary>The injected cache context (null before AppServices.Use).</summary>
+    /* 注入的缓存上下文（AppServices.Use 前为 null）。 */
     protected CacheContext Cache() {
         AppServices s = AppServices.Current();
         if (s == null) { return null; }
         return s.Cache();
     }
 
-    /// <summary>This request's connection: borrowed on first call, reused
-    /// afterwards, released automatically when the action returns. null means the
-    /// database is unavailable — handlers should answer 503 rather than pretend
-    /// the result set was empty.</summary>
+    /* 本次请求的连接：首次调用借出、之后复用、动作返回自动释放。null 表示数据库不可用——处理器应答 503 而非假设结果集为空。 */
     protected async IDbConnection Conn() {
         if (this.lease != null) { return this.lease; }
         DbContext ctx = this.Db();
@@ -66,47 +32,28 @@ class AppController : Controller {
         return this.lease;
     }
 
-    /// <summary>The connection already borrowed by this request, without
-    /// awaiting. Only valid after Conn() or Begin() succeeded (handy inside a
-    /// transaction block, where the lease is guaranteed).</summary>
+    /* 本次请求已借出的连接，不 await；仅在 Conn() 或 Begin() 成功后有效。 */
     protected IDbConnection Held() {
         return this.lease;
     }
 
-    /// <summary>The connection the table accessors run on. `this.User`,
-    /// `this.Post`, ... compile into a typed query over THIS connection, which
-    /// is why the lease is taken in OnBeforeAsync(): an accessor is a plain
-    /// member and cannot await.
-    ///
-    ///     List&lt;Post&gt; rows = await this.Post
-    ///         .Where(a => a.published == 1)
-    ///         .OrderByDescending(a => a.id).Take(20).ToListAsync();
-    ///     User u = await this.User.Read(uid);
-    ///
-    /// No DAO to construct, no Acquire/Release, and the field names are still
-    /// checked at compile time.</summary>
+    /* 表访问器运行其上的连接：this.User、this.Post 编译为在此连接上的类型化查询，故租约需在 OnBeforeAsync() 取得（访问器是普通成员，无法 await）。不构造 DAO、不借还、字段名在编译期校验。 */
     IDbConnection __Conn() {
         return this.lease;
     }
 
-    /// <summary>Leases this request's connection before the action runs, so the
-    /// table accessors have one. Costs nothing when the database is
-    /// unconfigured (Conn() answers null and actions fall back to 503).</summary>
+    /* 动作运行前借出本次请求连接，供表访问器使用；数据库未配置时零开销（Conn() 答 null，动作回退到 503）。 */
     virtual async bool OnBeforeAsync() {
         IDbConnection _db = await this.Conn();
         return this.OnBefore();
     }
 
-    /// <summary>Whether this request has a usable database. False means the pool
-    /// could not hand out a connection (unconfigured or unreachable), which is a
-    /// 503 for the caller rather than an exception. Cheap: the lease was already
-    /// taken in OnBeforeAsync(), so this only looks at it.</summary>
+    /* 本次请求是否有可用数据库。false 表示连接池无法借出（未配置或不可达），对调用方答 503 而非抛异常；廉价：租约在 OnBeforeAsync() 已取得。 */
     protected bool DbReady() {
         return this.lease != null;
     }
 
-    /// <summary>Opens a transaction on this request's connection. false means the
-    /// database is unavailable and nothing was started.</summary>
+    /* 在本次请求连接上开启事务；false 表示数据库不可用且未开启任何事务。 */
     protected async bool Begin() {
         IDbConnection db = await this.Conn();
         if (db == null) { return false; }
@@ -116,40 +63,32 @@ class AppController : Controller {
         return true;
     }
 
-    /// <summary>Commits this request's transaction (no-op when none is open).</summary>
+    /* 提交本次请求事务；无事务时为 no-op。 */
     protected async void Commit() {
         if (!this.inTx) { return; }
         this.inTx = false;
         await this.lease.CommitAsync();
     }
 
-    /// <summary>Rolls back this request's transaction (no-op when none is open,
-    /// so it is safe in an error path that may run after Commit()).</summary>
+    /* 回滚本次请求事务；无事务时为 no-op，可在 Commit() 之后的错误路径重复调用。 */
     protected async void Rollback() {
         if (!this.inTx) { return; }
         this.inTx = false;
         await this.lease.RollbackAsync();
     }
 
-    // ---- [Tx] trampoline hooks ----------------------------------------------
-    // The generated trampoline calls these around a [Tx] action, so declaring
-    // the attribute is the whole transaction story: no Begin/try/Commit/
-    // catch/Rollback ladder repeats in the action body.
+    /* [Tx] 蹦床钩子：声明属性即完成事务，动作体内不再出现 Begin/Commit/Rollback 阶梯。 */
 
-    /// <summary>Opens this request's transaction (lease + BEGIN). false means
-    /// the database is unavailable and the trampoline answers 503.</summary>
+    /* 打开本次请求事务（租约+BEGIN）；false 表示数据库不可用，蹦床答 503。 */
     protected override async bool __TxBegin() { return await this.Begin(); }
 
-    /// <summary>Commits after the action succeeded (no-op when none open).</summary>
+    /* 动作成功后提交；无事务时 no-op。 */
     protected override async void __TxCommit() { await this.Commit(); }
 
-    /// <summary>Rolls back on any failure path (safe twice / after commit).</summary>
+    /* 任何失败路径回滚；可重复调用、可在提交后调用。 */
     protected override async void __TxRollback() { await this.Rollback(); }
 
-    /// <summary>Releases the request's connection, on the coroutine, so an
-    /// unfinished transaction can be rolled back first: returning a connection
-    /// mid-transaction would hand the next request a session holding someone
-    /// else's locks, and the rollback itself is a round trip.</summary>
+    /* 释放请求连接（在协程上），以便未完成的务事先回滚；事务中途归还会把持着别人锁的会话交还下一个请求，回滚本身也是往返。 */
     virtual async void OnAfterAsync() {
         if (this.lease != null) {
             await this.Rollback();
@@ -160,7 +99,6 @@ class AppController : Controller {
         this.OnDone();
     }
 
-    /// <summary>Per-request cleanup for subclasses. Override this instead of
-    /// OnAfterAsync(), which owns releasing the connection.</summary>
+    /* 供子类做每请求清理；覆盖此而非 OnAfterAsync()，后者负责释放连接。 */
     virtual void OnDone() { }
 }
