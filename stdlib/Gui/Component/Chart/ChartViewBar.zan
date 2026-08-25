@@ -148,8 +148,46 @@ partial class ChartView {
             int barW = (groupW - gap * (nsVis - 1)) / nsVis;
             if (barW < app.Scale(2)) { barW = app.Scale(2); }
             int groupX0 = (step - groupW) / 2;
+            // barWidth/barGap/showBackground 取首条可见柱系列
+            // 的声明（ECharts 允许逐系列，这里取主导系列统一）。
+            int bwOverride = 0;
+            int bgPct = 0 - 1;
+            bool showBg = false;
+            int bgCol = 0;
+            List<int> barRad = null;
+            for (int ps = 0; ps < ns; ps = ps + 1) {
+                ChartSeries pc = series[ps];
+                if (!pc.hidden && !ChartView.IsLineFamily(pc.type)
+                    && pc.type != ChartType.Scatter) {
+                    bwOverride = pc.barWidth;
+                    bgPct = pc.barGapPct;
+                    showBg = pc.showBackground;
+                    bgCol = pc.backgroundColor;
+                    if (pc.itemStyle.normal.borderRadius.Count > 0) {
+                        barRad = pc.itemStyle.normal.borderRadius;
+                    }
+                    break;
+                }
+            }
+            if (bwOverride > 0) {
+                barW = app.Scale(bwOverride);
+                if (barW > groupW / nsVis) { barW = groupW / nsVis; }
+                if (bgPct >= 0) { gap = barW * bgPct / 100; }
+            } else if (bgPct >= 0 && barW > 0 && nsVis > 1) {
+                gap = barW * bgPct / 100;
+            }
+            if (bwOverride > 0 || bgPct >= 0) {
+                int totGw = nsVis * barW + (nsVis - 1) * gap;
+                if (totGw < groupW) { groupX0 = groupX0 + (groupW - totGw) / 2; }
+            }
             int mxB = app.mouseX;
             int myB = app.mouseY;
+            // showBackground 底带缺省色 = 网格线色。
+            int bgInk = 0;
+            if (showBg && bgCol == 0) {
+                bgInk = Style.Part(app, "chart", "grid", "", "", "",
+                                   Style.SNormal()).BgOr(0);
+            }
 
             int barSlot = 0;
             for (int si = 0; si < ns; si = si + 1) {
@@ -191,6 +229,24 @@ partial class ChartView {
                             if (oi < s.data.Count && s.data[oi].color != 0) { col = s.data[oi].color; }
                             int by = f.YOf(v * g / 1000, ax);
                             int bx = f.plotX + i * step + groupX0 + barSlot * (barW + gap);
+                            if (showBg) {
+                                // 底带：零线到满刻度方向铺满（ECharts
+                                // showBackground），随柱条正负取方向。
+                                int bgY2;
+                                int bgH2;
+                                if (v < 0) {
+                                    bgY2 = zeroY;
+                                    bgH2 = f.plotY + f.plotH - zeroY;
+                                } else {
+                                    bgY2 = f.plotY;
+                                    bgH2 = zeroY - f.plotY;
+                                }
+                                if (bgH2 > 0) {
+                                    c.FillRoundRect(bx, bgY2, barW, bgH2,
+                                        rad < 1 ? 1 : (rad > 3 ? 3 : rad),
+                                        bgCol != 0 ? bgCol : bgInk);
+                                }
+                            }
                             if (v < 0) {
                                 // 负值柱条垂挂在零基线下方
                                 int bh = zeroY - by;
@@ -202,7 +258,8 @@ partial class ChartView {
                                 if (hovB && s.itemStyle.emphasis.color != 0) {
                                     fillC = s.itemStyle.emphasis.color;
                                 }
-                                ChartView.BarCell(c, bx, zeroY, barW, bh, rad, fillC, o.gradient);
+                                ChartView.BarCellR4(c, bx, zeroY, barW, bh,
+                                    barRad, rad, fillC, o.gradient);
                                 int bcol = hovB && s.itemStyle.emphasis.borderColor != 0
                                     ? s.itemStyle.emphasis.borderColor
                                     : s.itemStyle.normal.borderColor;
@@ -230,7 +287,8 @@ partial class ChartView {
                                 if (hovB && s.itemStyle.emphasis.color != 0) {
                                     fillC = s.itemStyle.emphasis.color;
                                 }
-                                ChartView.BarCell(c, bx, by, barW, bh, rad, fillC, o.gradient);
+                                ChartView.BarCellR4(c, bx, by, barW, bh,
+                                    barRad, rad, fillC, o.gradient);
                                 int bcol = hovB && s.itemStyle.emphasis.borderColor != 0
                                     ? s.itemStyle.emphasis.borderColor
                                     : s.itemStyle.normal.borderColor;
@@ -283,6 +341,38 @@ partial class ChartView {
         } else {
             c.FillRoundRect(x, y, w, h, rad, color);
         }
+    }
+
+    /// 带四角独立圆角的柱格（itemStyle.borderRadius）。渐变路径
+    /// 退化为统一半径；实色路径先整块圆角矩形再补平方角。
+    static void BarCellR4(Canvas c, int x, int y, int w, int h,
+                          List<int> r4, int radDef,
+                          int color, bool gradient) {
+        if (r4 == null || r4.Count < 1 || h <= 0 || w <= 0) {
+            ChartView.BarCell(c, x, y, w, h, radDef, color, gradient);
+            return;
+        }
+        int r0 = r4[0];
+        int r1 = r4.Count > 1 ? r4[1] : 0;
+        int r2 = r4.Count > 2 ? r4[2] : 0;
+        int r3 = r4.Count > 3 ? r4[3] : 0;
+        int rm = r0;
+        if (r1 > rm) { rm = r1; }
+        if (r2 > rm) { rm = r2; }
+        if (r3 > rm) { rm = r3; }
+        if (rm > w / 2) { rm = w / 2; }
+        if (rm > h / 2) { rm = h / 2; }
+        if (rm < 1) { rm = 1; }
+        if (gradient) {
+            ChartView.BarCell(c, x, y, w, h, rm, color, true);
+            return;
+        }
+        c.FillRoundRect(x, y, w, h, rm, color);
+        // 平角补方块（与主色一致，覆盖圆弧）。
+        if (r0 < 1) { c.FillRect(x, y, rm, rm, color); }
+        if (r1 < 1) { c.FillRect(x + w - rm, y, rm, rm, color); }
+        if (r2 < 1) { c.FillRect(x + w - rm, y + h - rm, rm, rm, color); }
+        if (r3 < 1) { c.FillRect(x, y + h - rm, rm, rm, color); }
     }
 
     /// 返回 `series` 的副本，每个值按 g/1000 缩放（用于
@@ -416,6 +506,42 @@ partial class ChartView {
             int barH = (groupH - gap * (ns - 1)) / ns;
             if (barH < app.Scale(2)) { barH = app.Scale(2); }
             int groupY0 = (rowH - groupH) / 2;
+            // 与垂直分组柱一致：取首条可见柱系列的
+            // barWidth/barGap/showBackground/borderRadius。
+            int bhOverride = 0;
+            int bgPct2 = 0 - 1;
+            bool showBg2 = false;
+            int bgCol2 = 0;
+            List<int> barRad2 = null;
+            for (int ps2 = 0; ps2 < ns; ps2 = ps2 + 1) {
+                ChartSeries pc2 = series[ps2];
+                if (!pc2.hidden) {
+                    bhOverride = pc2.barWidth;
+                    bgPct2 = pc2.barGapPct;
+                    showBg2 = pc2.showBackground;
+                    bgCol2 = pc2.backgroundColor;
+                    if (pc2.itemStyle.normal.borderRadius.Count > 0) {
+                        barRad2 = pc2.itemStyle.normal.borderRadius;
+                    }
+                    break;
+                }
+            }
+            if (bhOverride > 0) {
+                barH = app.Scale(bhOverride);
+                if (barH > groupH / ns) { barH = groupH / ns; }
+                if (bgPct2 >= 0) { gap = barH * bgPct2 / 100; }
+            } else if (bgPct2 >= 0 && barH > 0 && ns > 1) {
+                gap = barH * bgPct2 / 100;
+            }
+            if (bhOverride > 0 || bgPct2 >= 0) {
+                int totGh = ns * barH + (ns - 1) * gap;
+                if (totGh < groupH) { groupY0 = groupY0 + (groupH - totGh) / 2; }
+            }
+            int bgInk2 = 0;
+            if (showBg2 && bgCol2 == 0) {
+                bgInk2 = Style.Part(app, "chart", "grid", "", "", "",
+                                    Style.SNormal()).BgOr(0);
+            }
 
             for (int i = 0; i < n; i = i + 1) {
                 int rowY = plotY + i * rowH;
@@ -425,7 +551,13 @@ partial class ChartView {
                     if (i < series[si].Count()) { v = series[si].Value(i); }
                     int bw = v * plotW / maxV;
                     int by = rowY + groupY0 + si * (barH + gap);
-                    c.FillRoundRect(plotX + 1, by, bw, barH, rad, series[si].color);
+                    if (showBg2 && plotW > 2) {
+                        c.FillRoundRect(plotX + 1, by, plotW - 2, barH,
+                            rad < 1 ? 1 : (rad > 3 ? 3 : rad),
+                            bgCol2 != 0 ? bgCol2 : bgInk2);
+                    }
+                    ChartView.BarCellR4(c, plotX + 1, by, bw, barH,
+                        barRad2, rad, series[si].color, false);
                 }
             }
         }
