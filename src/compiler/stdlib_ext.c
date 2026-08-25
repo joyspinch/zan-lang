@@ -269,7 +269,8 @@ static void skip_json_ws(const char **p, const char *end) {
     while (*p < end && isspace((unsigned char)**p)) (*p)++;
 }
 
-static zan_json_value_t *parse_json_value(const char **p, const char *end);
+static zan_json_value_t *parse_json_value(const char **p, const char *end,
+                                          int depth);
 
 static char *parse_json_string(const char **p, const char *end, size_t *out_len) {
     if (**p != '"') return NULL;
@@ -301,9 +302,16 @@ static char *parse_json_string(const char **p, const char *end, size_t *out_len)
     return buf;
 }
 
-static zan_json_value_t *parse_json_value(const char **p, const char *end) {
+/* Nesting cap for the recursive-descent JSON reader: the input ultimately
+ * comes from the network, so an adversarial `[[[[[...` must fail cleanly
+ * instead of exhausting the C stack. */
+#define ZAN_JSON_MAX_DEPTH 128
+
+static zan_json_value_t *parse_json_value(const char **p, const char *end,
+                                          int depth) {
     skip_json_ws(p, end);
     if (*p >= end) return NULL;
+    if (depth > ZAN_JSON_MAX_DEPTH) return NULL;
 
     zan_json_value_t *val = (zan_json_value_t *)calloc(1, sizeof(zan_json_value_t));
 
@@ -311,6 +319,7 @@ static zan_json_value_t *parse_json_value(const char **p, const char *end) {
         val->type = ZAN_JSON_STRING;
         val->string_val.str = parse_json_string(p, end, &val->string_val.len);
     } else if (**p == '{') {
+        if (depth >= ZAN_JSON_MAX_DEPTH) { free(val); return NULL; }
         val->type = ZAN_JSON_OBJECT;
         val->object_val.cap = 8;
         val->object_val.keys = (char **)malloc(sizeof(char *) * 8);
@@ -322,7 +331,7 @@ static zan_json_value_t *parse_json_value(const char **p, const char *end) {
             char *key = parse_json_string(p, end, NULL);
             skip_json_ws(p, end);
             if (*p < end && **p == ':') (*p)++;
-            zan_json_value_t *v = parse_json_value(p, end);
+            zan_json_value_t *v = parse_json_value(p, end, depth + 1);
             if (val->object_val.count >= val->object_val.cap) {
                 val->object_val.cap *= 2;
                 val->object_val.keys = (char **)realloc(val->object_val.keys, sizeof(char *) * (size_t)val->object_val.cap);
@@ -336,13 +345,14 @@ static zan_json_value_t *parse_json_value(const char **p, const char *end) {
         }
         if (*p < end) (*p)++;
     } else if (**p == '[') {
+        if (depth >= ZAN_JSON_MAX_DEPTH) { free(val); return NULL; }
         val->type = ZAN_JSON_ARRAY;
         val->array_val.cap = 8;
         val->array_val.items = (zan_json_value_t **)malloc(sizeof(zan_json_value_t *) * 8);
         (*p)++;
         skip_json_ws(p, end);
         while (*p < end && **p != ']') {
-            zan_json_value_t *item = parse_json_value(p, end);
+            zan_json_value_t *item = parse_json_value(p, end, depth + 1);
             if (val->array_val.count >= val->array_val.cap) {
                 val->array_val.cap *= 2;
                 val->array_val.items = (zan_json_value_t **)realloc(val->array_val.items, sizeof(zan_json_value_t *) * (size_t)val->array_val.cap);
@@ -374,7 +384,7 @@ static zan_json_value_t *parse_json_value(const char **p, const char *end) {
 zan_json_value_t *zan_json_parse(const char *json, size_t len) {
     const char *p = json;
     const char *end = json + len;
-    return parse_json_value(&p, end);
+    return parse_json_value(&p, end, 0);
 }
 
 /* JSON serialization */

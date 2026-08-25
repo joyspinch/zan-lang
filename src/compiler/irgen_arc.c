@@ -683,14 +683,58 @@ static void emit_array_retain(zan_irgen_t *g, LLVMValueRef v) {
  * types that own something; a `byte[]`/`int[]` release is the plain helper. */
 static void mangle_type_token(char *buf, size_t n, size_t *off, zan_type_t *t);
 
+/* FNV-1a over a canonical byte encoding of a type structure (kind tag,
+ * length-prefixed name, then type arguments). Unlike the readable token this
+ * neither truncates nor leaves separators ambiguous, so two distinct element
+ * types share a cache key only on a 64-bit hash match. */
+static void arr_rel_hash_mix(uint64_t *h, const void *data, size_t len) {
+    const unsigned char *p = (const unsigned char *)data;
+    for (size_t i = 0; i < len; i++) {
+        *h ^= (uint64_t)p[i];
+        *h *= 0x100000001b3ULL;
+    }
+}
+
+static void arr_rel_hash_type(uint64_t *h, zan_type_t *t) {
+    if (!t) { unsigned char c = 'N'; arr_rel_hash_mix(h, &c, 1); return; }
+    unsigned char kind = (unsigned char)t->kind;
+    arr_rel_hash_mix(h, &kind, 1);
+    unsigned short nlen = (unsigned short)t->name.len;
+    arr_rel_hash_mix(h, &nlen, sizeof(nlen));
+    if (t->name.str && t->name.len)
+        arr_rel_hash_mix(h, t->name.str, t->name.len);
+    for (int i = 0; i < t->type_arg_count; i++)
+        arr_rel_hash_type(h, t->type_args[i]);
+    if (t->kind == TYPE_ARRAY || t->kind == TYPE_NULLABLE) {
+        unsigned char e = 'E';
+        arr_rel_hash_mix(h, &e, 1);
+        arr_rel_hash_type(h, t->element_type);
+    }
+    unsigned char end = ';';
+    arr_rel_hash_mix(h, &end, 1);
+}
+
+static uint64_t arr_rel_type_key(zan_type_t *t) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    arr_rel_hash_type(&h, t);
+    return h;
+}
+
 static LLVMValueRef get_array_release_decl(zan_irgen_t *g, zan_type_t *elem_type,
                                            int rect) {
     char tok[192];
     size_t off = 0;
     tok[0] = '\0';
     mangle_type_token(tok, sizeof(tok), &off, elem_type);
+    /* the readable token alone is not a safe cache key: it truncates at
+     * 192 bytes and is ambiguous (`string[]` mangles to "stringA", colliding
+     * with a class literally named stringA), so a same-named earlier body
+     * would be silently reused for the wrong element type. Mix in the
+     * structure hash. */
     char name[256];
-    snprintf(name, sizeof(name), "__zan_arr_release_%s%s", tok, rect ? "_md" : "");
+    snprintf(name, sizeof(name), "__zan_arr_release_%s_%016llx%s",
+             tok, (unsigned long long)arr_rel_type_key(elem_type),
+             rect ? "_md" : "");
     LLVMValueRef existing = LLVMGetNamedFunction(g->mod, name);
     if (existing) return existing;
 

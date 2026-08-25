@@ -707,6 +707,31 @@ add_test(NAME diag_ctor_initializer_partial
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_ctor_initializer_partial PROPERTIES TIMEOUT 60)
 
+# Regression (audit H4): a named argument bound past a defaulted parameter
+# used to write a NULL into the call's argument list and crash zanc with no
+# diagnostic. The rebinder must reject the shape up front.
+add_test(NAME diag_named_args_gap
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/named_args_gap.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_named_args_gap${_exe_ext}
+    "-DEXPECT_REGEX=named arguments must bind to the leading parameters"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_named_args_gap PROPERTIES TIMEOUT 60)
+
+# Regression (audit H8): an array initializer whose element count does not
+# match the dimension product used to overflow the allocation in the built
+# program; it must be a compile error.
+add_test(NAME diag_array_init_count_mismatch
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/array_init_count_mismatch.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_array_init_count_mismatch${_exe_ext}
+    "-DEXPECT_REGEX=array initializer has"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_array_init_count_mismatch PROPERTIES TIMEOUT 60)
+
+
 # A cast is the one expression whose operand and target the checker used to
 # skip entirely, so an impossible conversion reinterpreted the operand's bits
 # instead of failing: `(int)"abc"` handed back the string pointer.

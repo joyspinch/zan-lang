@@ -173,6 +173,14 @@ static LLVMValueRef embed_bytes_global(zan_irgen_t *g, const char *label,
                                        const unsigned char *data,
                                        long long len) {
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    /* LLVM array lengths are 32-bit; a resource of 4 GiB or more would
+     * truncate here and emit a bogus smaller constant. Refuse it instead. */
+    if (len < 0 || len > 0xFFFFFFFEULL) {
+        fprintf(stderr,
+                "error: embedded resource '%s' is too large (%lld bytes, "
+                "max 4 GiB - 2)\n", label ? label : "?", len);
+        return NULL;
+    }
     LLVMTypeRef arr_ty = LLVMArrayType(i8, (unsigned)len + 1);
     LLVMValueRef init = LLVMConstStringInContext(g->ctx, (const char *)data,
                                                  (unsigned)len, 0);
@@ -567,6 +575,7 @@ int zan_embed_emit_specs(zan_irgen_t *g, const char *const *specs, int count) {
         snprintf(label, sizeof(label), "zan.embed.d%d", i);
         LLVMValueRef data = embed_bytes_global(g, label, files.v[i].data,
                                                files.v[i].len);
+        if (!name || !data) { free(ents); return -1; }
         LLVMValueRef vals[] = { name, data,
             LLVMConstInt(i64, (unsigned long long)files.v[i].len, 0) };
         ents[i] = LLVMConstNamedStruct(ent_ty, vals, 3);

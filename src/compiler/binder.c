@@ -205,40 +205,78 @@ zan_type_t *zan_binder_make_grouping_type(zan_binder_t *b, zan_type_t *elem) {
 /* Render a type into `buf` for use in a tuple signature: the element's simple
  * name with its generic arguments inlined (`List<int>` -> "List<int>"), so
  * two tuples whose element types are structurally identical -- even ones
- * spelled at different sites -- map to one anonymous struct. */
-static void tuple_sig_type(zan_type_t *t, char *buf, size_t cap) {
-    if (!t || cap == 0) return;
+ * spelled at different sites -- map to one anonymous struct. Returns false
+ * when any part did NOT fit and was dropped (the caller must then
+ * disambiguate; see zan_binder_make_tuple_type). */
+static bool tuple_sig_type(zan_type_t *t, char *buf, size_t cap) {
+    if (!t || cap == 0) return true;
     size_t used = strlen(buf);
-    if (used + 1 >= cap) return;
+    if (used + 1 >= cap) return false;
     if (t->kind == TYPE_ARRAY && t->element_type) {
-        tuple_sig_type(t->element_type, buf, cap);
+        bool ok = tuple_sig_type(t->element_type, buf, cap);
         if (strlen(buf) + 4 < cap) {
             strcat(buf, "[");
             for (int r = 1; r < (t->array_rank > 1 ? t->array_rank : 1); r++)
                 if (strlen(buf) + 2 < cap) strcat(buf, ",");
             strcat(buf, "]");
+        } else {
+            ok = false;
         }
-        return;
+        return ok;
     }
     if (t->kind == TYPE_NULLABLE && t->element_type) {
-        tuple_sig_type(t->element_type, buf, cap);
+        bool ok = tuple_sig_type(t->element_type, buf, cap);
         if (strlen(buf) + 1 < cap) strcat(buf, "?");
-        return;
+        else ok = false;
+        return ok;
     }
     const char *nm = t->name.str ? t->name.str : "?";
     int nl = (int)t->name.len;
     if (nl <= 0) nl = (int)strlen(nm);
     if (nl <= 0) nl = 1;
-    if (used + (size_t)nl + 8 >= cap) return;
+    if (used + (size_t)nl + 8 >= cap) return false;
     strncat(buf, nm, (size_t)nl);
+    bool ok = true;
     if (t->type_arg_count > 0) {
         if (strlen(buf) + 2 < cap) strcat(buf, "<");
+        else ok = false;
         for (int i = 0; i < t->type_arg_count; i++) {
-            if (i > 0 && strlen(buf) + 2 < cap) strcat(buf, ",");
-            tuple_sig_type(t->type_args[i], buf, cap);
+            if (i > 0) {
+                if (strlen(buf) + 2 < cap) strcat(buf, ",");
+                else ok = false;
+            }
+            if (!tuple_sig_type(t->type_args[i], buf, cap)) ok = false;
         }
         if (strlen(buf) + 1 < cap) strcat(buf, ">");
+        else ok = false;
     }
+    return ok;
+}
+
+/* FNV-1a over a canonical encoding of a type structure. Never truncated, so
+ * it can disambiguate signatures that overflowed the fixed-size name buffer. */
+static uint64_t tuple_type_hash(zan_type_t *t) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    while (t) {
+        unsigned char kind = (unsigned char)t->kind;
+        h ^= kind; h *= 0x100000001b3ULL;
+        uint16_t nlen = (uint16_t)t->name.len;
+        const unsigned char *nb = (const unsigned char *)&nlen;
+        for (size_t i = 0; i < sizeof(nlen); i++) { h ^= nb[i]; h *= 0x100000001b3ULL; }
+        if (t->name.str)
+            for (uint32_t i = 0; i < t->name.len; i++) {
+                h ^= (unsigned char)t->name.str[i]; h *= 0x100000001b3ULL;
+            }
+        for (int i = 0; i < t->type_arg_count; i++) {
+            uint64_t ah = tuple_type_hash(t->type_args[i]);
+            const unsigned char *ab = (const unsigned char *)&ah;
+            for (size_t k = 0; k < sizeof(ah); k++) { h ^= ab[k]; h *= 0x100000001b3ULL; }
+        }
+        t = t->element_type;
+    }
+    unsigned char end = ';';
+    h ^= end; h *= 0x100000001b3ULL;
+    return h;
 }
 
 /* C# tuples `(T1, T2, ...)` lower to a canonical anonymous struct whose symbol
@@ -253,9 +291,34 @@ zan_type_t *zan_binder_make_tuple_type(zan_binder_t *b, zan_type_t **elems,
     /* canonical signature: "__tuple<N>:<sig1>,<sig2>,..." */
     char sig[512];
     snprintf(sig, sizeof sig, "__tuple%d:", count);
+    bool complete = true;
     for (int i = 0; i < count; i++) {
-        if (i > 0 && strlen(sig) < sizeof sig - 2) strcat(sig, ",");
-        tuple_sig_type(elems[i], sig, sizeof sig);
+        if (i > 0) {
+            if (strlen(sig) < sizeof sig - 2) strcat(sig, ",");
+            else complete = false;
+        }
+        if (!tuple_sig_type(elems[i], sig, sizeof sig)) complete = false;
+    }
+    if (!complete) {
+        /* The readable signature overflowed the fixed buffer: two distinct
+         * tuples could truncate to the same prefix and wrongly share one
+         * anonymous struct (type confusion downstream). Append a hash over
+         * the full element structures so every distinct element list keeps a
+         * unique cache key. */
+        uint64_t h = 0xcbf29ce484222325ULL;
+        for (int i = 0; i < count; i++) {
+            uint64_t eh = tuple_type_hash(elems[i]);
+            const unsigned char *eb = (const unsigned char *)&eh;
+            for (size_t k = 0; k < sizeof(eh); k++) { h ^= eb[k]; h *= 0x100000001b3ULL; }
+            unsigned char sep = ',';
+            h ^= sep; h *= 0x100000001b3ULL;
+        }
+        char tail[24];
+        snprintf(tail, sizeof tail, "#%016llx", (unsigned long long)h);
+        size_t l = strlen(sig);
+        size_t room = sizeof sig - strlen(tail) - 1;
+        if (l > room) { sig[room] = '\0'; l = room; }
+        memcpy(sig + l, tail, strlen(tail) + 1);
     }
     zan_istr_t sig_istr = { (char *)sig, (uint32_t)strlen(sig) };
 

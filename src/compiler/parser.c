@@ -1623,7 +1623,25 @@ static zan_ast_node_t *parse_expression(zan_parser_t *p) {
 
 /* ---- statements ---- */
 
+/* Cap on statement/block nesting. Thousands of nested `{` recurse
+ * parse_block -> parse_statement without bound and would exhaust the C stack
+ * before any diagnostic fires; mirror the expression depth cap. */
+#define ZAN_PARSER_MAX_STMT_DEPTH 128
+
 static zan_ast_node_t *parse_block(zan_parser_t *p) {
+    if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
+        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                      "statement nesting too deep (max %d)",
+                      ZAN_PARSER_MAX_STMT_DEPTH);
+        /* drain to the matching close brace so parsing resumes sanely */
+        while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF))
+            parser_advance(p);
+        zan_ast_node_t *empty = zan_ast_new(p->arena, AST_BLOCK,
+                                            p->current.loc);
+        zan_ast_list_init(&empty->block.stmts);
+        return empty;
+    }
+    p->stmt_depth++;
     zan_loc_t loc = p->current.loc;
     parser_expect(p, TK_LBRACE);
 
@@ -1644,6 +1662,7 @@ static zan_ast_node_t *parse_block(zan_parser_t *p) {
         }
     }
 
+    p->stmt_depth--;
     parser_expect(p, TK_RBRACE);
     return block;
 }
@@ -3489,9 +3508,9 @@ ordinary_member:
         ret->ret.value = expr;
         zan_ast_list_push(&body->block.stmts, ret, p->arena);
 
-        char *gname = zan_arena_strdup(p->arena, "get_", 4);
-        size_t gn = strlen(gname);
-        gname = zan_arena_strdup(p->arena, gname, gn + name.len);
+        size_t gn = 4;
+        char *gname = (char *)zan_arena_alloc(p->arena, gn + (size_t)name.len + 1);
+        memcpy(gname, "get_", gn);
         memcpy(gname + gn, name.str, name.len);
         gname[gn + name.len] = '\0';
         zan_istr_t gistr = { gname, (uint32_t)(gn + name.len) };
@@ -3631,9 +3650,10 @@ ordinary_member:
              * `a.Name` / write `a.Name = v`: synthesize `get_<name>` /
              * `set_<name>` and queue them right after this member. */
             if (getter_body) {
-                char *gname = zan_arena_strdup(p->arena, "get_", 4);
-                size_t gn = strlen(gname);
-                gname = zan_arena_strdup(p->arena, gname, gn + name.len);
+                size_t gn = 4;
+                char *gname = (char *)zan_arena_alloc(p->arena,
+                    gn + (size_t)name.len + 1);
+                memcpy(gname, "get_", gn);
                 memcpy(gname + gn, name.str, name.len);
                 gname[gn + name.len] = '\0';
                 zan_istr_t gistr = { gname, (uint32_t)(gn + name.len) };
@@ -3643,9 +3663,10 @@ ordinary_member:
                     p->arena);
             }
             if (setter_body) {
-                char *sname = zan_arena_strdup(p->arena, "set_", 4);
-                size_t sn = strlen(sname);
-                sname = zan_arena_strdup(p->arena, sname, sn + name.len);
+                size_t sn = 4;
+                char *sname = (char *)zan_arena_alloc(p->arena,
+                    sn + (size_t)name.len + 1);
+                memcpy(sname, "set_", sn);
                 memcpy(sname + sn, name.str, name.len);
                 sname[sn + name.len] = '\0';
                 zan_istr_t sistr = { sname, (uint32_t)(sn + name.len) };

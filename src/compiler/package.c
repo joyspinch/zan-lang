@@ -34,6 +34,9 @@ bool zan_version_parse(const char *str, zan_version_t *out) {
         if (n < 2) return false;
         out->patch = 0;
     }
+    /* versions are non-negative by definition; %d would otherwise accept
+     * signs that later comparisons treat inconsistently */
+    if (out->major < 0 || out->minor < 0 || out->patch < 0) return false;
     if (str[consumed] == '-') {
         const char *pre = str + consumed + 1;
         size_t plen = strlen(pre);
@@ -44,10 +47,19 @@ bool zan_version_parse(const char *str, zan_version_t *out) {
     return true;
 }
 
+/* Sign-normalized integer compare: subtracting two ints directly can
+ * overflow (INT_MAX vs INT_MIN) and flip the result. */
+static int version_cmp_int(int x, int y) {
+    return (x > y) - (x < y);
+}
+
 int zan_version_compare(const zan_version_t *a, const zan_version_t *b) {
-    if (a->major != b->major) return a->major - b->major;
-    if (a->minor != b->minor) return a->minor - b->minor;
-    if (a->patch != b->patch) return a->patch - b->patch;
+    int c = version_cmp_int(a->major, b->major);
+    if (c) return c;
+    c = version_cmp_int(a->minor, b->minor);
+    if (c) return c;
+    c = version_cmp_int(a->patch, b->patch);
+    if (c) return c;
     bool a_pre = (a->prerelease[0] != 0);
     bool b_pre = (b->prerelease[0] != 0);
     if (!a_pre && b_pre) return 1;

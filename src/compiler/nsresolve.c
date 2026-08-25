@@ -55,15 +55,21 @@ static bool ns_has_dot(zan_istr_t s) {
     return false;
 }
 
-/* build "<a>.<b>"; if a is empty, just b */
+/* build "<a>.<b>"; if a is empty, just b. Allocated at full length: a silent
+ * truncation here could merge two distinct namespace-qualified names into
+ * one symbol identity. */
 static zan_istr_t join_ns(zan_arena_t *ar, zan_istr_t a, zan_istr_t b) {
     if (a.len == 0) return b;
-    char buf[512];
-    size_t n = 0;
-    for (uint32_t i = 0; i < a.len && n < sizeof buf - 2; i++) buf[n++] = a.str[i];
-    if (n < sizeof buf - 1) buf[n++] = '.';
-    for (uint32_t i = 0; i < b.len && n < sizeof buf - 1; i++) buf[n++] = b.str[i];
-    return mk_istr(ar, buf, n);
+    size_t n = (size_t)a.len + 1 + (size_t)b.len;
+    char *buf = (char *)zan_arena_alloc(ar, n);
+    if (!buf) { zan_istr_t r = {0}; return r; }
+    memcpy(buf, a.str, a.len);
+    buf[a.len] = '.';
+    if (b.len) memcpy(buf + a.len + 1, b.str, b.len);
+    zan_istr_t r;
+    r.str = buf;
+    r.len = (uint32_t)n;
+    return r;
 }
 
 static zan_istr_t flatten_qname(zan_ast_node_t *q, zan_arena_t *ar) {
@@ -71,14 +77,26 @@ static zan_istr_t flatten_qname(zan_ast_node_t *q, zan_arena_t *ar) {
     if (!q) return empty;
     if (q->kind == AST_IDENTIFIER) return q->ident.name;
     if (q->kind == AST_QUALIFIED_NAME) {
-        char buf[512];
-        size_t n = 0;
+        size_t total = 0;
+        int parts = 0;
         for (int i = 0; i < q->qualified_name.parts.count; i++) {
             zan_ast_node_t *p = q->qualified_name.parts.items[i];
-            if (p->kind != AST_IDENTIFIER) continue;
-            if (i > 0 && n < sizeof buf - 1) buf[n++] = '.';
-            for (uint32_t j = 0; j < p->ident.name.len && n < sizeof buf - 1; j++)
-                buf[n++] = p->ident.name.str[j];
+            if (!p || p->kind != AST_IDENTIFIER) continue;
+            if (parts > 0) total++;
+            total += p->ident.name.len;
+            parts++;
+        }
+        char *buf = (char *)zan_arena_alloc(ar, total ? total : 1);
+        if (!buf) return empty;
+        size_t n = 0;
+        parts = 0;
+        for (int i = 0; i < q->qualified_name.parts.count; i++) {
+            zan_ast_node_t *p = q->qualified_name.parts.items[i];
+            if (!p || p->kind != AST_IDENTIFIER) continue;
+            if (parts > 0) buf[n++] = '.';
+            memcpy(buf + n, p->ident.name.str, p->ident.name.len);
+            n += p->ident.name.len;
+            parts++;
         }
         return mk_istr(ar, buf, n);
     }

@@ -477,7 +477,13 @@ static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
     LLVMTypeRef vd = LLVMVoidTypeInContext(g->ctx);
 
     unsigned total = LLVMCountParamTypes(fn_ty);
-    if (total > ZAN_REFL_ARG_SLOTS + 1) return NULL;
+    /* instance thunks read args[0..total-2] (slot 0 of the caller's array is
+     * the first real argument); a static method gets no self pointer, so its
+     * whole signature must fit the same fixed-size slot array -- allowing
+     * SLOTS+1 here made a 5-parameter static method read one slot past the
+     * end of every caller's [ZAN_REFL_ARG_SLOTS x i64] alloca */
+    unsigned max_params = is_static ? ZAN_REFL_ARG_SLOTS : ZAN_REFL_ARG_SLOTS + 1;
+    if (total > max_params) return NULL;
     LLVMTypeRef ptypes[ZAN_REFL_ARG_SLOTS + 1];
     LLVMGetParamTypes(fn_ty, ptypes);
     unsigned first = is_static ? 0 : 1;

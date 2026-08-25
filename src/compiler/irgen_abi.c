@@ -92,30 +92,47 @@ static unsigned long abi_align_of(LLVMTypeRef t) {
     }
 }
 
-static unsigned long abi_size_of(LLVMTypeRef t) {
+/* Size computation must not truncate: on LLP64/Windows `unsigned long` is
+ * 32 bits, so a large array length times its element size would wrap into a
+ * small value and the classifier would pass a MEMORY-class aggregate in
+ * registers. Compute in 64 bits with saturation. */
+#define ABI_SIZE_MAX (1ULL << 40)
+
+static uint64_t abi_size_of64(LLVMTypeRef t) {
     switch (LLVMGetTypeKind(t)) {
-    case LLVMIntegerTypeKind: return (LLVMGetIntTypeWidth(t) + 7) / 8;
+    case LLVMIntegerTypeKind:
+        return ((uint64_t)LLVMGetIntTypeWidth(t) + 7) / 8;
     case LLVMFloatTypeKind:   return 4;
     case LLVMDoubleTypeKind:  return 8;
     case LLVMPointerTypeKind: return 8;
-    case LLVMArrayTypeKind:
-        return (unsigned long)LLVMGetArrayLength(t) *
-               abi_size_of(LLVMGetElementType(t));
+    case LLVMArrayTypeKind: {
+        uint64_t es = abi_size_of64(LLVMGetElementType(t));
+        uint64_t n = (uint64_t)LLVMGetArrayLength(t);
+        if (es != 0 && n > ABI_SIZE_MAX / es) return ABI_SIZE_MAX;
+        return n * es;
+    }
     case LLVMStructTypeKind: {
         bool packed = LLVMIsPackedStruct(t);
         unsigned n = LLVMCountStructElementTypes(t);
-        unsigned long off = 0, maxa = 1;
+        uint64_t off = 0, maxa = 1;
         for (unsigned i = 0; i < n; i++) {
             LLVMTypeRef f = LLVMStructGetTypeAtIndex(t, i);
-            unsigned long a = packed ? 1 : abi_align_of(f);
+            uint64_t a = packed ? 1 : (uint64_t)abi_align_of(f);
             if (a > maxa) maxa = a;
             off = (off + a - 1) & ~(a - 1);
-            off += abi_size_of(f);
+            off += abi_size_of64(f);
+            if (off > ABI_SIZE_MAX) return ABI_SIZE_MAX;
         }
         return (off + maxa - 1) & ~(maxa - 1);
     }
     default: return 8;
     }
+}
+
+static unsigned long abi_size_of(LLVMTypeRef t) {
+    uint64_t s = abi_size_of64(t);
+    if (s > 0xFFFFFFFFULL) s = 0xFFFFFFFFULL;
+    return (unsigned long)s;
 }
 
 static bool abi_is_aggregate(LLVMTypeRef t) {

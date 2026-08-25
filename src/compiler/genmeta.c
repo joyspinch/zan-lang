@@ -28,6 +28,7 @@
 #include "lexer.h"
 #include "../common/json.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,26 +71,43 @@ static bool gm_istr_is(zan_istr_t s, const char *lit) {
 
 /* ---- type reference -> string ---- */
 
+/* Append `fmt` at `pos` into `out`/`cap`, keeping the cursor inside the
+ * buffer: snprintf returns the *would-be* length, so accumulating it raw
+ * let a truncated write send `out + n` past the caller's stack buffer
+ * (with `outsz - n` wrapping to a huge size_t). Saturates at cap-1. */
+static size_t gm_snpcat(char *out, size_t cap, size_t pos,
+                        const char *fmt, ...) {
+    if (cap == 0) return 0;
+    if (pos >= cap) pos = cap - 1;
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(out + pos, cap - pos, fmt, ap);
+    va_end(ap);
+    if (w < 0 || (size_t)w >= cap - pos) return cap - 1;
+    return pos + (size_t)w;
+}
+
 static void gm_type_str(zan_ast_node_t *t, char *out, size_t outsz) {
     if (!t) { out[0] = '\0'; return; }
     switch (t->kind) {
     case AST_TYPE_REF: {
-        int n = snprintf(out, outsz, "%.*s", (int)t->type_ref.name.len,
-                         t->type_ref.name.str);
+        size_t n = gm_snpcat(out, outsz, 0, "%.*s",
+                             (int)t->type_ref.name.len,
+                             t->type_ref.name.str ? t->type_ref.name.str : "");
         if (t->type_ref.type_args.count > 0) {
-            n += snprintf(out + n, outsz - (size_t)n, "<");
+            n = gm_snpcat(out, outsz, n, "<");
             for (int i = 0; i < t->type_ref.type_args.count; i++) {
-                if (i) n += snprintf(out + n, outsz - (size_t)n, ",");
+                if (i) n = gm_snpcat(out, outsz, n, ",");
                 char tmp[256];
                 gm_type_str(t->type_ref.type_args.items[i], tmp, sizeof(tmp));
-                n += snprintf(out + n, outsz - (size_t)n, "%s", tmp);
+                n = gm_snpcat(out, outsz, n, "%s", tmp);
             }
-            snprintf(out + n, outsz - (size_t)n, ">");
+            n = gm_snpcat(out, outsz, n, ">");
         }
         if (t->type_ref.is_array)
-            snprintf(out + strlen(out), outsz - strlen(out), "[]");
+            n = gm_snpcat(out, outsz, n, "[]");
         if (t->type_ref.is_nullable)
-            snprintf(out + strlen(out), outsz - strlen(out), "?");
+            gm_snpcat(out, outsz, n, "?");
         break;
     }
     case AST_ARRAY_TYPE:
@@ -101,10 +119,10 @@ static void gm_type_str(zan_ast_node_t *t, char *out, size_t outsz) {
         size_t n = 0;
         for (int i = 0; i < t->qualified_name.parts.count; i++) {
             zan_ast_node_t *p = t->qualified_name.parts.items[i];
-            if (p->kind != AST_IDENTIFIER) continue;
-            if (n) n += snprintf(out + n, outsz - n, ".");
-            n += snprintf(out + n, outsz - n, "%.*s", (int)p->ident.name.len,
-                          p->ident.name.str);
+            if (!p || p->kind != AST_IDENTIFIER) continue;
+            if (n) n = gm_snpcat(out, outsz, n, ".");
+            n = gm_snpcat(out, outsz, n, "%.*s", (int)p->ident.name.len,
+                          p->ident.name.str ? p->ident.name.str : "");
         }
         break;
     }

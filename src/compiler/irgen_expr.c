@@ -250,7 +250,10 @@ static bool emit_bytes_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
     if (to_bytes) {
         if (ot->kind != TYPE_STRING || expr->call.args.count != 0) return false;
-        LLVMValueRef s = emit_expr(g, callee->member.object, locals);
+        /* normalize a null receiver to the shared empty string before
+         * handing it to strlen */
+        LLVMValueRef s = emit_str_nonnull(g,
+            emit_expr(g, callee->member.object, locals));
         LLVMTypeRef strlen_ty = LLVMFunctionType(i64t, (LLVMTypeRef[]){ i8ptr }, 1, 0);
         LLVMValueRef len = zan_call2(g->builder, strlen_ty, g->fn_strlen, &s, 1, "tb.len");
         LLVMValueRef arr = zan_array_alloc(g, len, len);
@@ -269,6 +272,25 @@ static bool emit_bytes_call(zan_irgen_t *g, zan_ast_node_t *expr,
             emit_expr(g, expr->call.args.items[0], locals), i64t);
         len = coerce_int_to(g,
             emit_expr(g, expr->call.args.items[1], locals), i64t);
+        /* Clamp the requested window into the buffer: a negative or
+         * oversized offset/length would otherwise drive the memcpy below
+         * far past the allocation. An out-of-range request yields an
+         * empty string instead of memory corruption. */
+        LLVMValueRef zero64 = LLVMConstInt(i64t, 0, 0);
+        LLVMValueRef alen = zan_array_len(g, arr);
+        off = LLVMBuildSelect(g->builder,
+            zan_icmp(g->builder, LLVMIntSLT, off, zero64, "ts.oneg"),
+            zero64, off, "ts.off");
+        off = LLVMBuildSelect(g->builder,
+            zan_icmp(g->builder, LLVMIntSGT, off, alen, "ts.obig"),
+            alen, off, "ts.off2");
+        LLVMValueRef avail = zan_sub(g->builder, alen, off, "ts.avail");
+        len = LLVMBuildSelect(g->builder,
+            zan_icmp(g->builder, LLVMIntSLT, len, zero64, "ts.lneg"),
+            zero64, len, "ts.len");
+        len = LLVMBuildSelect(g->builder,
+            zan_icmp(g->builder, LLVMIntSGT, len, avail, "ts.lbig"),
+            avail, len, "ts.len2");
         src = LLVMBuildGEP2(g->builder, i8, arr, &off, 1, "ts.src");
     }
     LLVMTypeRef alloc_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64t }, 1, 0);
@@ -395,6 +417,11 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMValueRef p = nm_arg(g, expr, 0, locals);
         LLVMValueRef off = nm_arg(g, expr, 1, locals);
         LLVMValueRef len = nm_arg(g, expr, 2, locals);
+        /* a negative length would wrap the allocation size below; treat it
+         * as zero instead */
+        len = LLVMBuildSelect(g->builder,
+            zan_icmp(g->builder, LLVMIntSLT, len, zero64, "nm.gs.neg"),
+            zero64, len, "nm.gs.len");
         LLVMValueRef one = LLVMConstInt(i64t, 1, 0);
         LLVMValueRef total = zan_add(g->builder, len, one, "nm.gs.sz");
         LLVMValueRef s = emit_string_alloc_rc(g, total);
@@ -413,6 +440,10 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
         zan_ast_node_t *s_ast = expr->call.args.items[2];
         LLVMValueRef s = emit_expr(g, s_ast, locals);
         LLVMValueRef len = nm_arg(g, expr, 3, locals);
+        /* a negative length would wrap into a huge memcpy */
+        len = LLVMBuildSelect(g->builder,
+            zan_icmp(g->builder, LLVMIntSLT, len, zero64, "nm.ps.neg"),
+            zero64, len, "nm.ps.len");
         LLVMTypeRef ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64t }, 3, 0);
         LLVMValueRef fn = get_libc_fn(g, "memcpy", ty);
         zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
@@ -5083,8 +5114,11 @@ static void query_final_pass(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMBasicBlockRef pass_bb = LLVMAppendBasicBlockInContext(g->ctx,
                 LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder)),
                 "q.pass");
-            LLVMBuildCondBr(g->builder, c, pass_bb,
-                            skip_stack[*skip_depth - 1]);
+            {
+                int rd = *skip_depth - 1;
+                if (rd >= 16) rd = 15;   /* keep the read inside skip_stack */
+                LLVMBuildCondBr(g->builder, c, pass_bb, skip_stack[rd]);
+            }
             LLVMPositionBuilderAtEnd(g->builder, pass_bb);
         } else if (cl->kind == AST_QUERY_LET) {
             zan_type_t *lt = infer_expr_type(g, cl->query_clause.expr, locals);
@@ -5189,7 +5223,16 @@ static void query_final_pass(zan_irgen_t *g, zan_ast_node_t *expr,
             /* plain join: recurse inside the match so everything after the
              * join runs per match */
             *skip_depth = *skip_depth + 1;
-            skip_stack[*skip_depth - 1] = il.inc;
+            {
+                int sd = *skip_depth - 1;
+                if (sd >= 16) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, cl->loc,
+                                  "query expression has too many join "
+                                  "clauses (max 15)");
+                    sd = 15;
+                }
+                skip_stack[sd] = il.inc;
+            }
             query_final_pass(g, expr, clauses, join_in_rows, ci + 1,
                              result_name, select, skip_stack, skip_depth,
                              locals);

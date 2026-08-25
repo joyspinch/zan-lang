@@ -1114,6 +1114,16 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             is_call_to(expr, "Math", "Abs") && expr->call.args.count == 1) {
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef arg_type = LLVMTypeOf(arg);
+            /* only numeric kinds reach the lowering below; a pointer-shaped
+             * operand would hit GetIntTypeWidth on an opaque pointer */
+            if (LLVMGetTypeKind(arg_type) != LLVMIntegerTypeKind &&
+                LLVMGetTypeKind(arg_type) != LLVMDoubleTypeKind &&
+                LLVMGetTypeKind(arg_type) != LLVMFloatTypeKind) {
+                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                              "Math.Abs requires an int or floating-point "
+                              "argument");
+                return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+            }
             if (LLVMGetTypeKind(arg_type) == LLVMDoubleTypeKind ||
                 LLVMGetTypeKind(arg_type) == LLVMFloatTypeKind) {
                 LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
@@ -1150,6 +1160,15 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeKind kb = LLVMGetTypeKind(LLVMTypeOf(b));
             int fa = (ka == LLVMDoubleTypeKind || ka == LLVMFloatTypeKind);
             int fb = (kb == LLVMDoubleTypeKind || kb == LLVMFloatTypeKind);
+            if (!fa && !fb &&
+                ka != LLVMIntegerTypeKind && kb != LLVMIntegerTypeKind) {
+                /* pointer/class operands: GetIntTypeWidth on an opaque
+                 * pointer would abort; diagnose instead */
+                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                              "Math.%s requires numeric arguments",
+                              want_max ? "Max" : "Min");
+                return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+            }
             if (fa || fb) {
                 LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
                 a = fa ? (ka == LLVMFloatTypeKind
@@ -1423,11 +1442,21 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 int seg_start = 0;
                 for (int i = 0; i < f.len; i++) {
                     if (f.str[i] == '{' && i + 2 < f.len + 1) {
-                        int j = i + 1, idx = 0, has = 0;
+                        int j = i + 1, idx = 0, has = 0, oflow = 0;
                         while (j < f.len && f.str[j] >= '0' && f.str[j] <= '9') {
-                            idx = idx * 10 + (f.str[j] - '0'); j++; has = 1;
+                            /* A huge digit run must not wrap `idx` negative:
+                             * once it cannot name a valid argument, stop
+                             * accumulating (keep consuming so the '}' check
+                             * still sees the real token stream) and treat the
+                             * whole placeholder as literal text. */
+                            if (!oflow) {
+                                if (idx > 214748363 ||
+                                    idx >= expr->call.args.count) oflow = 1;
+                                else idx = idx * 10 + (f.str[j] - '0');
+                            }
+                            j++; has = 1;
                         }
-                        if (has && j < f.len && f.str[j] == '}' &&
+                        if (has && !oflow && j < f.len && f.str[j] == '}' &&
                             idx + 1 < expr->call.args.count) {
                             if (i > seg_start) {
                                 zan_istr_t seg = { f.str + seg_start, i - seg_start };
@@ -2645,17 +2674,33 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef sfp = zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 fopen_fn, sargs, 2, "sfp");
-            /* get size */
-            LLVMValueRef seek_end[] = { sfp, LLVMConstInt(i64, 0, 0), LLVMConstInt(i32, 2, 0) };
+            emit_fopen_check(g, sfp, "cannot read file\n");
+            /* get size (ftell failure yields -1: clamp to an empty copy
+             * instead of driving fread/fwrite with a huge size) */
+            LLVMValueRef zero64 = LLVMConstInt(i64, 0, 0);
+            LLVMValueRef seek_end[] = { sfp, zero64, LLVMConstInt(i32, 2, 0) };
             zan_call2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i64, i32 }, 3, 0),
                 fseek_fn, seek_end, 3, "");
             LLVMValueRef sz = zan_call2(g->builder,
                 LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0), ftell_fn, &sfp, 1, "sz");
-            LLVMValueRef seek_start[] = { sfp, LLVMConstInt(i64, 0, 0), LLVMConstInt(i32, 0, 0) };
+            sz = LLVMBuildSelect(g->builder,
+                zan_icmp(g->builder, LLVMIntSLT, sz, zero64, "sz.neg"),
+                zero64, sz, "sz.clamp");
+            LLVMValueRef seek_start[] = { sfp, zero64, LLVMConstInt(i32, 0, 0) };
             zan_call2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i64, i32 }, 3, 0),
                 fseek_fn, seek_start, 3, "");
-            /* allocate buffer */
-            LLVMValueRef buf = emit_string_alloc_rc(g, sz);
+            /* allocate a raw byte buffer: this must stay a plain malloc --
+             * emit_string_alloc_rc hands back a header-offset pointer that
+             * the free below must not receive */
+            LLVMValueRef buf = zan_call2(g->builder,
+                LLVMGlobalGetValueType(g->fn_malloc), g->fn_malloc,
+                &sz, 1, "cp.buf");
+            {
+                LLVMTypeRef i8ptr_t = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                emit_io_abort_if(g, zan_icmp(g->builder, LLVMIntEQ, buf,
+                    LLVMConstPointerNull(i8ptr_t), "cp.buf.null"),
+                    "out of memory\n");
+            }
             /* read */
             LLVMValueRef fread_args[] = { buf, LLVMConstInt(i64, 1, 0), sz, sfp };
             zan_call2(g->builder, LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i64, i64, i8ptr }, 4, 0),
@@ -2668,6 +2713,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef dfp = zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 fopen_fn, dargs, 2, "dfp");
+            emit_fopen_check(g, dfp, "cannot write file\n");
             /* write */
             LLVMValueRef fwrite_args[] = { buf, LLVMConstInt(i64, 1, 0), sz, dfp };
             zan_call2(g->builder, LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i64, i64, i8ptr }, 4, 0),

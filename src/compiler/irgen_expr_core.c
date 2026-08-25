@@ -256,6 +256,11 @@ static bool narrow_warn_enabled(void) {
  * a cast because the value is known at compile time and fits. Only a constant
  * integer expression qualifies, so this folds literals and the operators a
  * constant can be spelled with, and reports "not constant" for anything else. */
+/* Fold in unsigned arithmetic: signed overflow during constant folding is
+ * C-level UB in the compiler itself (a source literal like
+ * `long x = 9223372036854775807 * 2;` would be enough to trip it), while the
+ * wrap-around two's-complement result is exactly what the folded value
+ * means. */
 static bool const_int_expr(zan_ast_node_t *e, int64_t *out) {
     if (!e) return false;
     switch (e->kind) {
@@ -265,8 +270,9 @@ static bool const_int_expr(zan_ast_node_t *e, int64_t *out) {
     case AST_UNARY: {
         int64_t v;
         if (!const_int_expr(e->unary.operand, &v)) return false;
+        uint64_t uv = (uint64_t)v;
         switch (e->unary.op) {
-        case TK_MINUS: *out = -v; return true;
+        case TK_MINUS: *out = (int64_t)(0ULL - uv); return true;
         case TK_PLUS:  *out = v;  return true;
         case TK_TILDE: *out = ~v; return true;
         default: return false;
@@ -276,12 +282,17 @@ static bool const_int_expr(zan_ast_node_t *e, int64_t *out) {
         int64_t l, r;
         if (!const_int_expr(e->binary.left, &l)) return false;
         if (!const_int_expr(e->binary.right, &r)) return false;
+        uint64_t ul = (uint64_t)l, ur = (uint64_t)r;
         switch (e->binary.op) {
-        case TK_PLUS:  *out = l + r; return true;
-        case TK_MINUS: *out = l - r; return true;
-        case TK_STAR:  *out = l * r; return true;
-        case TK_SLASH: if (!r) return false; *out = l / r; return true;
-        case TK_LESS_LESS: *out = l << (r & 63); return true;
+        case TK_PLUS:  *out = (int64_t)(ul + ur); return true;
+        case TK_MINUS: *out = (int64_t)(ul - ur); return true;
+        case TK_STAR:  *out = (int64_t)(ul * ur); return true;
+        case TK_SLASH:
+            /* also guards the INT64_MIN / -1 overflow, which is UB */
+            if (!r || (l == INT64_MIN && r == -1)) return false;
+            *out = l / r; return true;
+            /* a negative left shift is UB too; shift the bit pattern */
+        case TK_LESS_LESS: *out = (int64_t)((uint64_t)l << (r & 63)); return true;
         case TK_AMP:   *out = l & r; return true;
         case TK_PIPE:  *out = l | r; return true;
         default: return false;

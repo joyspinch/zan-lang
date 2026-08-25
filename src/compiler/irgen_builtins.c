@@ -2068,8 +2068,10 @@ static LLVMValueRef get_str_join_fn(zan_irgen_t *g) {
         zan_icmp(g->builder, LLVMIntSLT, mi, n, "mlt"), m_body, c_pre);
     LLVMPositionBuilderAtEnd(g->builder, m_body);
     LLVMValueRef slot = LLVMBuildGEP2(g->builder, i64, data, &mi, 1, "slot");
-    LLVMValueRef sv = LLVMBuildIntToPtr(g->builder,
-        LLVMBuildLoad2(g->builder, i64, slot, "svi"), i8ptr, "sv");
+    /* a list may legitimately hold null entries (xs.Add(null)); join treats
+     * them as empty strings instead of handing NULL to strlen */
+    LLVMValueRef sv = emit_str_nonnull(g, LLVMBuildIntToPtr(g->builder,
+        LLVMBuildLoad2(g->builder, i64, slot, "svi"), i8ptr, "sv"));
     LLVMValueRef sl = zan_call2(g->builder, strlen_ty, g->fn_strlen, &sv, 1, "sl");
     LLVMBuildStore(g->builder,
         zan_add(g->builder, LLVMBuildLoad2(g->builder, i64, tot_a, "t0"), sl, "t1"), tot_a);
@@ -2089,8 +2091,8 @@ static LLVMValueRef get_str_join_fn(zan_irgen_t *g) {
         zan_icmp(g->builder, LLVMIntSLT, ci, n, "clt"), c_body, done);
     LLVMPositionBuilderAtEnd(g->builder, c_body);
     LLVMValueRef slot2 = LLVMBuildGEP2(g->builder, i64, data, &ci, 1, "slot2");
-    LLVMValueRef sv2 = LLVMBuildIntToPtr(g->builder,
-        LLVMBuildLoad2(g->builder, i64, slot2, "svi2"), i8ptr, "sv2");
+    LLVMValueRef sv2 = emit_str_nonnull(g, LLVMBuildIntToPtr(g->builder,
+        LLVMBuildLoad2(g->builder, i64, slot2, "svi2"), i8ptr, "sv2"));
     LLVMValueRef sl2 = zan_call2(g->builder, strlen_ty, g->fn_strlen, &sv2, 1, "sl2");
     LLVMValueRef pos = LLVMBuildLoad2(g->builder, i64, pos_a, "pos");
     LLVMValueRef dst = LLVMBuildGEP2(g->builder, i8, buf, &pos, 1, "dst");
@@ -2482,18 +2484,32 @@ static void reorder_named_args_impl(zan_irgen_t *g, zan_ast_list_t *args,
     }
 
     /* Rebuild: each named arg contributes its expression; positional args
-     * move to their slot. The result list keeps the original length. */
+     * move to their slot. The result list keeps the original length.
+     * The rewrite is only meaningful when the bound parameter slots are
+     * exactly 0..n-1 (the dense positional prefix downstream expects); any
+     * other shape -- an unknown or duplicate name diagnosed above, or a
+     * skipped defaulted parameter ahead of a bound one -- used to punch
+     * NULL holes into the AST here and crash later phases. Restore the
+     * original argument order instead and let the diagnostics stand. */
     zan_ast_node_t **reb = (zan_ast_node_t **)malloc(sizeof(zan_ast_node_t *) *
                                                      (size_t)n);
-    for (int i = 0; i < n; i++) {
-        int src = slot[i];
-        if (src < 0 || src >= n) { reb[i] = NULL; continue; }
-        zan_ast_node_t *arg = args->items[src];
+    if (!reb) { free(slot); free(used_name); return; }
+    int ok = 1;
+    for (int p = 0; p < n; p++) {
+        if (slot[p] < 0 || slot[p] >= n) {
+            ok = 0;
+            zan_diag_emit(g->diag, DIAG_ERROR, loc,
+                          "named arguments must bind to the leading "
+                          "parameters in order");
+            break;
+        }
+        zan_ast_node_t *arg = args->items[slot[p]];
         if (arg && arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;
-        reb[i] = arg;
+        reb[p] = arg;
     }
-    for (int i = 0; i < n; i++)
-        args->items[i] = reb[i];
+    if (ok)
+        for (int i = 0; i < n; i++)
+            args->items[i] = reb[i];
     free(reb);
     free(slot);
     free(used_name);

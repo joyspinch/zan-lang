@@ -111,6 +111,30 @@ void zan_incr_init(zan_incr_cache_t *cache, const char *project_dir) {
 #define CACHE_MAGIC 0x5A414E43
 #define CACHE_VERSION 1
 
+/* Read one length-prefixed string into buf; false on truncation or a
+ * corrupted length. */
+static bool incr_read_str(FILE *f, char *buf, size_t bufsz) {
+    uint16_t slen;
+    if (fread(&slen, 2, 1, f) != 1) return false;
+    if (slen >= bufsz) return false;
+    if (fread(buf, 1, slen, f) != slen) return false;
+    buf[slen] = 0;
+    return true;
+}
+
+/* Release a unit's strings without touching the cache array (the unit is
+ * about to be discarded, not stored). */
+static void incr_unit_discard(zan_compile_unit_t *unit) {
+    free(unit->source_path);
+    free(unit->object_path);
+    if (unit->deps) {
+        for (int d = 0; d < unit->dep_count && unit->deps[d]; d++)
+            free(unit->deps[d]);
+        free(unit->deps);
+    }
+    memset(unit, 0, sizeof(*unit));
+}
+
 bool zan_incr_load(zan_incr_cache_t *cache) {
     char manifest[1024];
     snprintf(manifest, sizeof(manifest), "%s" PATH_SEP "manifest.bin", cache->cache_dir);
@@ -126,44 +150,47 @@ bool zan_incr_load(zan_incr_cache_t *cache) {
     if (fread(&count, 4, 1, f) != 1 || count < 0 || count > 10000) { fclose(f); return false; }
 
     for (int i = 0; i < count; i++) {
-        uint16_t slen;
         char path_buf[1024];
-
-        if (fread(&slen, 2, 1, f) != 1) break;
-        if (slen >= sizeof(path_buf)) break;
-        if (fread(path_buf, 1, slen, f) != slen) break;
-        path_buf[slen] = 0;
-
         zan_compile_unit_t unit;
         memset(&unit, 0, sizeof(unit));
+
+        /* A truncated or corrupt record discards this unit and everything
+         * after it: storing a half-initialized unit would leave dangling
+         * dep pointers behind for later strcmp/free. Records already stored
+         * in this pass are complete and keep their entries. */
+        if (!incr_read_str(f, path_buf, sizeof(path_buf))) break;
         unit.source_path = zan_strdup(path_buf);
-
-        if (fread(&slen, 2, 1, f) != 1) break;
-        if (slen >= sizeof(path_buf)) break;
-        if (fread(path_buf, 1, slen, f) != slen) break;
-        path_buf[slen] = 0;
-        unit.object_path = zan_strdup(path_buf);
-
-        if (fread(&unit.stamp, sizeof(zan_file_stamp_t), 1, f) != 1) break;
+        if (!incr_read_str(f, path_buf, sizeof(path_buf)) ||
+            !(unit.object_path = zan_strdup(path_buf))) {
+            incr_unit_discard(&unit); break;
+        }
+        if (fread(&unit.stamp, sizeof(zan_file_stamp_t), 1, f) != 1) {
+            incr_unit_discard(&unit); break;
+        }
 
         int16_t dep_count;
-        if (fread(&dep_count, 2, 1, f) != 1) break;
+        if (fread(&dep_count, 2, 1, f) != 1 || dep_count < 0 || dep_count > 4096) {
+            incr_unit_discard(&unit); break;
+        }
         unit.dep_count = dep_count;
         if (dep_count > 0) {
-            unit.deps = (char **)malloc(sizeof(char *) * (size_t)dep_count);
-            for (int d = 0; d < dep_count; d++) {
-                if (fread(&slen, 2, 1, f) != 1) break;
-                if (slen >= sizeof(path_buf)) break;
-                if (fread(path_buf, 1, slen, f) != slen) break;
-                path_buf[slen] = 0;
-                unit.deps[d] = zan_strdup(path_buf);
+            unit.deps = (char **)calloc((size_t)dep_count, sizeof(char *));
+            if (!unit.deps) { incr_unit_discard(&unit); break; }
+            bool deps_ok = true;
+            for (int d = 0; d < dep_count && deps_ok; d++) {
+                deps_ok = incr_read_str(f, path_buf, sizeof(path_buf)) &&
+                          (unit.deps[d] = zan_strdup(path_buf)) != NULL;
             }
+            if (!deps_ok) { incr_unit_discard(&unit); break; }
         }
 
         if (cache->unit_count >= cache->unit_cap) {
-            cache->unit_cap *= 2;
-            cache->units = (zan_compile_unit_t *)realloc(cache->units,
-                sizeof(zan_compile_unit_t) * (size_t)cache->unit_cap);
+            int ncap = cache->unit_cap * 2;
+            zan_compile_unit_t *grown = (zan_compile_unit_t *)realloc(cache->units,
+                sizeof(zan_compile_unit_t) * (size_t)ncap);
+            if (!grown) { incr_unit_discard(&unit); break; }
+            cache->units = grown;
+            cache->unit_cap = ncap;
         }
         cache->units[cache->unit_count++] = unit;
     }
@@ -175,9 +202,14 @@ bool zan_incr_load(zan_incr_cache_t *cache) {
 
 bool zan_incr_save(zan_incr_cache_t *cache) {
     char manifest[1024];
+    char manifest_tmp[1024];
     snprintf(manifest, sizeof(manifest), "%s" PATH_SEP "manifest.bin", cache->cache_dir);
+    snprintf(manifest_tmp, sizeof(manifest_tmp), "%s.tmp", manifest);
 
-    FILE *f = fopen(manifest, "wb");
+    /* Write to a temporary file and move it into place: a crash or full disk
+     * mid-save must never leave a truncated manifest.bin that a later load
+     * would have to treat as corrupt input. */
+    FILE *f = fopen(manifest_tmp, "wb");
     if (!f) return false;
 
     uint32_t magic = CACHE_MAGIC, version = CACHE_VERSION;
@@ -210,11 +242,22 @@ bool zan_incr_save(zan_incr_cache_t *cache) {
         }
     }
 
-    /* A short write (e.g. a full disk) leaves a truncated manifest that would
-     * be silently treated as valid on the next run; surface it as failure so
-     * the cache is regenerated instead of trusting a partial file. */
+    /* A short write (e.g. a full disk) leaves a truncated temporary that is
+     * simply abandoned; only a fully written file replaces the manifest. */
     bool ok = (ferror(f) == 0);
     if (fclose(f) != 0) ok = false;
+    if (!ok) { remove(manifest_tmp); return false; }
+#ifdef _WIN32
+    if (!MoveFileExA(manifest_tmp, manifest, MOVEFILE_REPLACE_EXISTING)) {
+        remove(manifest_tmp);
+        return false;
+    }
+#else
+    if (rename(manifest_tmp, manifest) != 0) {
+        remove(manifest_tmp);
+        return false;
+    }
+#endif
     return ok;
 }
 

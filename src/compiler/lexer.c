@@ -220,6 +220,10 @@ static inline char lexer_peek_ch2(zan_lexer_t *lex) {
 }
 
 static inline char lexer_advance(zan_lexer_t *lex) {
+    /* guard the read: callers generally check at_end first, but a stray
+     * advance at EOF must not step past the buffer (the NUL sentinel one
+     * past the text is not guaranteed on every source path) */
+    if (lexer_at_end(lex)) return '\0';
     char ch = lex->source[lex->pos++];
     if (ch == '\n') {
         lex->line++;
@@ -313,20 +317,26 @@ static void pp_read_ident(zan_lexer_t *lex, char *buf, int maxlen) {
 }
 
 /* Evaluate a simple preprocessor expression: supports identifiers (treated as
-   defined?1:0), integer literals, !, &&, ||, ==, !=, (, ) */
-static int pp_eval_expr(zan_lexer_t *lex);
+   defined?1:0), integer literals, !, &&, ||, ==, !=, (, ).
+   `depth` bounds the `!`/`(` recursion: an unbounded chain like
+   `#if !!!!!!!!!...` is attacker-controlled source text and would otherwise
+   exhaust the C stack before any diagnostic fires. */
+static int pp_eval_expr(zan_lexer_t *lex, int depth);
+#define ZAN_PP_EVAL_MAX_DEPTH 200
 
-static int pp_eval_atom(zan_lexer_t *lex) {
+static int pp_eval_atom(zan_lexer_t *lex, int depth) {
     pp_skip_hspaces(lex);
     char ch = lexer_peek_ch(lex);
 
     if (ch == '!') {
         lexer_advance(lex);
-        return !pp_eval_atom(lex);
+        if (depth >= ZAN_PP_EVAL_MAX_DEPTH) return 0;
+        return !pp_eval_atom(lex, depth + 1);
     }
     if (ch == '(') {
         lexer_advance(lex);
-        int v = pp_eval_expr(lex);
+        if (depth >= ZAN_PP_EVAL_MAX_DEPTH) return 0;
+        int v = pp_eval_expr(lex, depth + 1);
         pp_skip_hspaces(lex);
         if (lexer_peek_ch(lex) == ')') lexer_advance(lex);
         return v;
@@ -361,26 +371,26 @@ static int pp_eval_atom(zan_lexer_t *lex) {
     return 0;
 }
 
-static int pp_eval_expr(zan_lexer_t *lex) {
-    int left = pp_eval_atom(lex);
+static int pp_eval_expr(zan_lexer_t *lex, int depth) {
+    int left = pp_eval_atom(lex, depth);
     for (;;) {
         pp_skip_hspaces(lex);
         char c1 = lexer_peek_ch(lex);
         if (c1 == '&' && !lexer_at_end(lex) && lex->pos+1 < lex->source_len && lex->source[lex->pos+1] == '&') {
             lexer_advance(lex); lexer_advance(lex);
-            int right = pp_eval_atom(lex);
+            int right = pp_eval_atom(lex, depth);
             left = left && right;
         } else if (c1 == '|' && !lexer_at_end(lex) && lex->pos+1 < lex->source_len && lex->source[lex->pos+1] == '|') {
             lexer_advance(lex); lexer_advance(lex);
-            int right = pp_eval_atom(lex);
+            int right = pp_eval_atom(lex, depth);
             left = left || right;
         } else if (c1 == '=' && !lexer_at_end(lex) && lex->pos+1 < lex->source_len && lex->source[lex->pos+1] == '=') {
             lexer_advance(lex); lexer_advance(lex);
-            int right = pp_eval_atom(lex);
+            int right = pp_eval_atom(lex, depth);
             left = (left == right);
         } else if (c1 == '!' && !lexer_at_end(lex) && lex->pos+1 < lex->source_len && lex->source[lex->pos+1] == '=') {
             lexer_advance(lex); lexer_advance(lex);
-            int right = pp_eval_atom(lex);
+            int right = pp_eval_atom(lex, depth);
             left = (left != right);
         } else {
             break;
@@ -427,7 +437,7 @@ static void pp_handle_directive(zan_lexer_t *lex) {
         if (lex->cond_depth < ZAN_PP_MAX_COND_DEPTH) {
             int parent_active = pp_active(lex);
             int val = 0;
-            if (parent_active) val = pp_eval_expr(lex);
+            if (parent_active) val = pp_eval_expr(lex, 0);
             lex->cond_stack[lex->cond_depth] = parent_active && val;
             lex->cond_seen_true[lex->cond_depth] = parent_active && val;
             lex->cond_depth++;
@@ -441,7 +451,7 @@ static void pp_handle_directive(zan_lexer_t *lex) {
                 int parent = 1;
                 for (int i = 0; i < idx; i++) { if (!lex->cond_stack[i]) { parent=0; break; } }
                 int val = 0;
-                if (parent) val = pp_eval_expr(lex);
+                if (parent) val = pp_eval_expr(lex, 0);
                 lex->cond_stack[idx] = parent && val;
                 if (parent && val) lex->cond_seen_true[idx] = 1;
             }

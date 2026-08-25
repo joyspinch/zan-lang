@@ -371,10 +371,13 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
     int ok = 0;
     FILE *mf = fopen(meta_path, "wb");
     if (!mf || !meta ||
-        fwrite(meta, 1, strlen(meta), mf) != strlen(meta) ||
-        fclose(mf) != 0) {
+        fwrite(meta, 1, strlen(meta), mf) != strlen(meta)) {
         fprintf(stderr, "error: cannot write generator request\n");
         if (mf) fclose(mf);
+        ok = -1;
+    } else if (fclose(mf) != 0) {
+        /* the FILE* is already closed here; closing it again is UB */
+        fprintf(stderr, "error: cannot write generator request\n");
         ok = -1;
     }
     free(meta);
@@ -855,10 +858,16 @@ int zan_gen_codegen(zan_ast_node_t *unit, zan_arena_t *arena,
     snprintf(req_text, req_len, "{\"mode\":\"codegen\",\"unit\":%s}", meta);
     free(meta);
     FILE *mf = fopen(meta_path, "wb");
-    if (!mf || fwrite(req_text, 1, strlen(req_text), mf) != strlen(req_text) ||
-        fclose(mf) != 0) {
+    if (!mf || fwrite(req_text, 1, strlen(req_text), mf) != strlen(req_text)) {
         fprintf(stderr, "error: cannot write generator request\n");
         if (mf) fclose(mf);
+        free(req_text);
+        remove(meta_path);
+        return -1;
+    }
+    if (fclose(mf) != 0) {
+        /* the FILE* is already closed here; closing it again is UB */
+        fprintf(stderr, "error: cannot write generator request\n");
         free(req_text);
         remove(meta_path);
         return -1;

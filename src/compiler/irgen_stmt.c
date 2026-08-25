@@ -9,6 +9,31 @@
 
 /* Find or create the basic block for a goto label in the current function. */
 static void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit);
+/* Structural type compatibility for async frame-slot reuse: two same-named
+ * declarations may share one frame slot only when their types genuinely
+ * agree, because the slot's LLVM type and width are baked into the frame
+ * struct at plan time. */
+static bool async_slot_type_compatible(zan_type_t *a, zan_type_t *b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    int depth = 0;
+    while (a && b && depth < 32) {
+        if (a == b) return true;
+        if (a->kind != b->kind) return false;
+        if (a->name.len != b->name.len ||
+            (a->name.len && memcmp(a->name.str, b->name.str,
+                                   (size_t)a->name.len) != 0))
+            return false;
+        if (a->type_arg_count != b->type_arg_count) return false;
+        for (int i = 0; i < a->type_arg_count; i++)
+            if (!async_slot_type_compatible(a->type_args[i], b->type_args[i]))
+                return false;
+        a = a->element_type;
+        b = b->element_type;
+        depth++;
+    }
+    return a == b;
+}
 
 static LLVMBasicBlockRef irgen_goto_label(zan_irgen_t *g, zan_istr_t name) {
     LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
@@ -446,10 +471,26 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (g->current_async_frame && g->current_async_slot_count > 0) {
             local_var_t *pre = local_find(locals, stmt->var_decl.name);
             if (pre) {
+                /* Resolve this declaration's own type -- explicitly written or
+                 * inferred from its initializer -- before deciding whether it
+                 * may reuse the frame slot a previous same-named declaration
+                 * scanned into the frame struct. */
                 zan_type_t *type = stmt->var_decl.type
                     ? resolve_type_ctx(g, stmt->var_decl.type)
-                    : pre->type;
+                    : NULL;
+                if (!type && stmt->var_decl.initializer)
+                    type = infer_expr_type(g, stmt->var_decl.initializer, locals);
+                if (!type) type = pre->type;
                 for (int i = 0; i < g->current_async_slot_count; i++) {
+                    /* A shadowing declaration with a different type must NOT
+                     * reuse the slot: the slot's LLVM type is baked into the
+                     * frame struct, so storing through it would type-confuse
+                     * both variables (the frame save/reload would also move
+                     * the wrong width). Skip the reuse and let the ordinary
+                     * scoped declaration below shadow it instead. */
+                    if (g->current_async_slots[i].slot_alloca == pre->alloca &&
+                        !async_slot_type_compatible(type, pre->type))
+                        continue;
                     if (g->current_async_slots[i].slot_alloca == pre->alloca) {
                         /* Own every rc-managed local, including those declared
                          * inside loop/if/block bodies (arc_stmt_depth != 0):
@@ -1392,12 +1433,16 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMValueRef switch_val = emit_expr(g, stmt->switch_stmt.expr, locals);
         LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.end");
 
-        /* count non-default cases */
+        /* count non-default cases. A pure type-pattern case (`case Dog d:`)
+         * carries no `pattern` node -- it must not be mistaken for the
+         * default arm, or its body would run unconditionally as the
+         * fallthrough target. */
         int num_cases = 0;
         zan_ast_node_t *default_case = NULL;
         for (int i = 0; i < stmt->switch_stmt.cases.count; i++) {
             zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
-            if (sc->switch_case.pattern) {
+            if (sc->switch_case.pattern || sc->switch_case.type_pattern ||
+                sc->switch_case.when_cond || sc->switch_case.var_name.len > 0) {
                 num_cases++;
             } else {
                 default_case = sc;
@@ -1687,7 +1732,22 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             if (!sc->switch_case.pattern) continue; /* default handled separately */
 
             LLVMBasicBlockRef case_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.case");
+            LLVMBasicBlockRef entry_bb = LLVMGetInsertBlock(g->builder);
             LLVMValueRef case_val = emit_expr(g, sc->switch_case.pattern, locals);
+            /* LLVMBuildSwitch / LLVMConstIntGetSExtValue require a ConstantInt;
+             * an arbitrary expression here would type-confuse inside LLVM's
+             * C++ unwrap (UB / garbage constants). Diagnose and route this
+             * case straight to the switch end instead. */
+            if (!case_val || !LLVMIsAConstantInt(case_val)) {
+                zan_diag_emit(g->diag, DIAG_ERROR, sc->loc,
+                              "case label must be a compile-time constant "
+                              "in an integer switch");
+                LLVMPositionBuilderAtEnd(g->builder, case_bb);
+                emit_release_owned_locals_from(g, locals, switch_start);
+                LLVMBuildBr(g->builder, end_bb);
+                LLVMPositionBuilderAtEnd(g->builder, entry_bb);
+                continue;
+            }
             /* A case label is an integer constant; fit it to the switch
              * operand's width with a *constant* cast. Widening the operand
              * instead (coerce_int_pair) would build a sext into this block,

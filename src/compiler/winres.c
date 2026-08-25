@@ -118,7 +118,7 @@ static int icon_object(const unsigned char *ico, size_t ico_len,
         ents[i].bits = (unsigned short)rd16(e + 6);
         ents[i].bytes = rd32(e + 8);
         ents[i].offset = rd32(e + 12);
-        if ((size_t)ents[i].offset + ents[i].bytes > ico_len) {
+        if ((unsigned long long)ents[i].offset + ents[i].bytes > ico_len) {
             free(ents); return 2;
         }
     }

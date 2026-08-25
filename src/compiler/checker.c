@@ -342,6 +342,7 @@ static zan_type_t *checker_index_set_target(zan_checker_t *c,
     zan_istr_t op_name = {(char *)"op_index_set", 12};
     for (int i = 0; i < obj->sym->member_count; i++) {
         zan_symbol_t *m = obj->sym->members[i];
+        if (!m) continue;
         if (m->kind != SYM_METHOD || m->name.len != op_name.len ||
             memcmp(m->name.str, op_name.str, op_name.len) != 0) continue;
         if (!m->decl || m->decl->kind != AST_METHOD_DECL ||
@@ -926,7 +927,10 @@ static bool const_integral_value(zan_ast_node_t *expr, int64_t *value) {
     }
     if (expr->kind == AST_UNARY && expr->unary.op == TK_MINUS &&
         expr->unary.operand && expr->unary.operand->kind == AST_INT_LITERAL) {
-        *value = -expr->unary.operand->int_val;
+        /* negate through unsigned: -INT64_MIN (from the literal
+         * `-9223372036854775808`, whose bits the lexer keeps verbatim) is
+         * signed-overflow UB if done in int64_t */
+        *value = (int64_t)(0ULL - (uint64_t)expr->unary.operand->int_val);
         return true;
     }
     return false;
@@ -1270,6 +1274,7 @@ static zan_symbol_t *expr_method_group(zan_checker_t *c, zan_ast_node_t *e) {
     if (!ot || !ot->sym) return NULL;
     for (int i = ot->sym->member_count - 1; i >= 0; i--) {
         zan_symbol_t *m = ot->sym->members[i];
+        if (!m) continue;
         if (m->name.len == e->member.name.len &&
             memcmp(m->name.str, e->member.name.str, (size_t)m->name.len) == 0)
             return m->kind == SYM_METHOD ? m : NULL;
@@ -1799,6 +1804,39 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             type = zan_binder_make_array_type(c->binder, type);
         check_generic_constraints(c, type, expr->loc);
         check_ctor_available(c, type, expr);
+        /* A sized allocation with a trailing element initializer
+         * (`new int[2] { 1, 2 }`) writes the elements sequentially with no
+         * runtime bound, so the element count must match the dimension
+         * product exactly and every dimension must be a compile-time
+         * constant; otherwise the extra elements overflow the allocation. */
+        if (expr->new_expr.is_array && !expr->new_expr.array_init &&
+            expr->new_expr.args.count > 0) {
+            int rank = expr->new_expr.array_rank > 0
+                ? expr->new_expr.array_rank : 1;
+            int nd = rank > 16 ? 16 : rank;
+            int ninit = expr->new_expr.args.count - nd;
+            if (ninit > 0) {
+                int64_t prod = 1;
+                bool const_dims = true;
+                for (int d = 0; d < nd && const_dims; d++) {
+                    int64_t dv = 0;
+                    if (!const_integral_value(expr->new_expr.args.items[d], &dv))
+                        const_dims = false;
+                    else
+                        prod *= dv;
+                }
+                if (!const_dims)
+                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                                  "an array creation with an initializer "
+                                  "requires constant dimensions");
+                else if (prod != ninit)
+                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                                  "array initializer has %d element%s but the "
+                                  "dimensions describe %lld",
+                                  ninit, ninit == 1 ? "" : "s",
+                                  (long long)prod);
+            }
+        }
         for (int i = 0; i < expr->new_expr.args.count; i++) {
             zan_ast_node_t *arg = expr->new_expr.args.items[i];
             /* Object-initializer assignments are field writes on the newly
@@ -2439,6 +2477,7 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
     if (obj_type && obj_type->sym) {
         for (int i = obj_type->sym->member_count - 1; i >= 0; i--) {
             zan_symbol_t *m = obj_type->sym->members[i];
+            if (!m) continue;
             if (m->name.len == expr->member.name.len &&
                 memcmp(m->name.str, expr->member.name.str, m->name.len) == 0) {
                 /* A method in value position is a method group: only a
