@@ -5,6 +5,43 @@
 > 缺失项 grep 反证。标注口径：**已实现**=有代码路径且可从 option/API 表达；
 > **部分实现**=有入口但语义缩水；**未实现**=全目录 grep 无任何消费点。
 
+## ⚠ 口径修订：以 2.2.4 为准的重新定性
+
+以下经官方 example 目录（130 个 demo 全量解析）与 GitHub tag 源码核对后修正：
+
+**我们已超越 2.2.4 的能力（不是缺口，勿"补齐"）：**
+- `markArea`——2.2.4 没有 markLine 之外的三区标注；我们已实现。
+- 阶梯线 `step`——2.2.4 折线无 step 字段（3.x 能力）；我们的 step:start 已超出，
+  三态分化属于超纲增强而非对齐缺口。
+- 热力图 Heatmap——`src/chart/` 在 2.2.4 不存在（3.x 核心）；我们是净增类型。
+- sankey / box / error / waterfall / sunburst / radialBars 六个扩展渲染器同理。
+- gauge 的 `precision` 定点格式：2.2.1 已从官方删除，我们保留是超集。
+
+**2.x 命名对照（对齐时用 2.x 字段名）：**
+- 3.x 的 `visualMap` 在 2.2.4 叫 **`dataRange`**（含 `splitList` 不等距分割、
+  `calculable` 值域漫游、`hoverLink` 与地图反向联动）。地图 ramp 两端硬编码、
+  散点无值域映射的对齐目标是 dataRange 语义。
+- K线涨跌色在 2.x 是 `itemStyle.normal{color(阳线填充), color0(阴线填充),
+  lineStyle{color(阳线框), color0(阴线框)}}`——不是 3.x 的顶层 color/color0。
+- 漏斗水平对齐字段是 **`funnelAlign:'left'|'right'|'center'`**（2.1.8+），
+  我们缺的是这个而不是泛泛的"label 位置"。
+- 树图连线 2.2.4 支持 `'curve'|'broken'` 两种；径向 = `orient:'radial'`。
+
+**混搭的真实边界（官方 mix 分类 11 个 demo 证实）：**
+跨族共存靠各自定位项（`pie.center`、`map.mapLocation`、`gauge.center`、
+`funnel.x/y`）+ 轴绑定（line/bar/scatter/k/eventRiver 的 xAxisIndex/yAxisIndex）。
+官方代表组合：折柱双数值轴(mix1)、散饼值轴(mix7)、折K(mix10)、地图选器+饼(mix3)、
+仪表+嵌套漏斗 BI(mix11)、多图联动 connect()(mix8/9)。我们的直角系内混搭已覆盖
+mix1/mix6/mix10 的核心；缺的是整图族定位共存层与多图联动。
+另注：`toolbox.magicType`（line↔bar↔stack↔tiled 切换）是 2.2.4 混搭体验的一部分，
+我们没有对应物。
+
+**其余确认对齐项：** dataZoom 百分比 start/end 语义一致（无 startValue/endValue
+是 2.2.4 本来的限制）；饼图 label 默认外部+labelLine、startAngle、selectedMode/
+selectedOffset、roseType 两态为 2.2.4 标配（我们的缺口判定不变）；treemap 下钻+
+面包屑(2.2.3)+root(2.2.4)、tree 径向、wordCloud textRotation 角度候选列表均为
+2.2.4 内能力，缺口判定不变。
+
 ## 0. 总体架构事实（矩阵的公共前提）
 
 - **分发**：`ChartView.DispatchKind` 按**第一个可见系列**的类型选整图渲染键
@@ -193,19 +230,27 @@ CustomOf :41-45 → DispatchKind ChartView.zan:308-361 → DispatchRender :438-5
 → FingerprintCore 折叠 :163-282（否则 RenderCached 陈旧快照）→
 锚点测试 tests/conformance/chart_kinds_complete.zan:14-56 更新 goldens。
 
-## 变体补齐 Top 10（性价比 × 视觉影响）
+## 变体补齐 Top 10（性价比 × 视觉影响；经 2.2.4 口径修订后）
 
-1. **step 三态分化**（一处循环改三种拐角顺序）
-2. **emphasis 消费闭环**（Effective* 接进 pie 扇区/map 区域/bar 单柱悬停；
-   顺带让 normal.borderColor/borderWidth 生效）
+1. **emphasis 消费闭环**——Effective* 接进 pie 扇区/map 区域/bar 单柱悬停；
+   顺带让 normal.borderColor/borderWidth 生效。2.2.4 的 hoverable/selectedMode
+   体验地基。
+2. **pie labelLine + startAngle + selectedOffset**——2.2.4 标配三件套，
+   都在 DrawPie/PieLayout 角度装配层，labelLine 两点折线即可。
 3. **roseType radius/area 区分**（radius=角∝占比+半径∝√值；area=等角+半径∝面积比）
-4. **bar 的 barWidth/barGap/showBackground/itemStyle borderRadius**
-5. **K线涨跌色配置 + 十字光标**（复用 CartesianTooltip 竖线）
-6. **pie labelLine + startAngle + selectedOffset**
-7. **connectNulls/null 数据模型**（断点折线的地基，唯一涉数据模型的项）
-8. **scatter symbolSize 映射推广 + 逐点颜色**
-9. **radar areaStyle 填充 + shape:circle + splitArea**
-10. **treemap squarify + upperLabel**
+4. **bar 的 barWidth/barGap/showBackground/itemStyle barBorderRadius**
+   （2.x 字段名 barBorderColor/barBorderRadius/barBorderWidth，radius 支持 4 角数组）
+5. **K线涨跌色配置**（2.x 写法 normal.color/color0 + lineStyle.color/color0）
+   + 十字光标（复用 CartesianTooltip 竖线）
+6. **treemap squarify + 下钻 leafDepth + breadcrumb + root**——2.2.3/2.2.4 已有
+   的官方能力，我们是零
+7. **tree orient:'radial' + initialTreeDepth + 节点折叠**
+8. **dataRange（=visualMap 前身）组件**：min/max/splitList/calculable/hoverLink，
+   先接 map ramp 与 scatter 值映射两个消费方
+9. **null 数据模型 + 断点折线**（表达力地基，超纲但值得）
+10. **scatter symbolSize 数值映射推广 + 逐点颜色**（气泡 ISqrt 映射泛化）
 
-次优先：chord 贝塞尔弧带与标签旋转、tree radial/折叠、force 参数字段暴露、
-eventRiver 图例点击、HBarCore/DrawScatterCore 收编共享坐标系（配合注记 A）。
+次优先：funnelAlign 三态、chord 贝塞尔弧带(ribbonType:false 语义)与 sort/sortSub、
+force 参数字段(scaling/gravity/linkSymbol/draggable)、eventRiver 图例点击、
+wordCloud textRotation（依赖 Canvas 旋转文本原语）、HBarCore/DrawScatterCore
+收编共享坐标系、toolbox.magicType 图表切换。
