@@ -117,12 +117,6 @@ static int zan__crash_find_symbolizer(const char *exe_dir, char *out, size_t out
     if (GetFileAttributesA(cand) != INVALID_FILE_ATTRIBUTES) {
         snprintf(out, outsz, "%s", cand); return 2;
     }
-    if (SearchPathA(NULL, "addr2line", ".exe", 0, NULL, NULL)) {
-        snprintf(out, outsz, "addr2line"); return 1;
-    }
-    if (SearchPathA(NULL, "llvm-symbolizer", ".exe", 0, NULL, NULL)) {
-        snprintf(out, outsz, "llvm-symbolizer"); return 2;
-    }
     return 0;
 }
 
@@ -733,6 +727,30 @@ static int zan__guard_recoverable(DWORD code) {
     }
 }
 
+/* Recovery abandons the faulting frame chain without any unwind, so every
+ * lock and invariant it held stays held. That trade is worth it for generated
+ * Zan frames (they own no OS state across a message callback), but never for
+ * foreign code: a fault inside another module's allocator or loader leaves,
+ * say, its heap critical section owned, and the resumed event loop then
+ * blocks forever on the next allocation -- a frozen-but-alive process with a
+ * "recovered" line in the log. Restrict recovery to the main image, where
+ * generated code and its runtime live; DLL faults die through the normal
+ * unhandled path with a full record instead.
+ *
+ * Known limit: a statically linked CRT puts its heap INSIDE the main image,
+ * so this check cannot see it. Guard recovery remains what it always was for
+ * that case -- a deliberate bet that the abandoned frames held no OS lock. */
+static int zan__guard_rip_recoverable(EXCEPTION_POINTERS *ep) {
+    ULONG_PTR rip = ep->ContextRecord ? ep->ContextRecord->Rip : 0;
+    HMODULE m = NULL;
+    if (!rip ||
+        !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)(ULONG_PTR)rip, &m))
+        return 0;
+    return (uintptr_t)m == (uintptr_t)GetModuleHandleA(NULL);
+}
+
 /* Hard faults worth a record even when something else might still handle them:
  * the filter is the reliable place to log, but any component in the process
  * (an embedded browser, a plugin) can replace it after us. */
@@ -850,7 +868,8 @@ static LONG CALLBACK zan__crash_veh(EXCEPTION_POINTERS *ep) {
     zan__guard_t *g = s ? s->top : NULL;
 
 #if defined(_M_X64) || defined(__x86_64__)
-    if (g && g->armed && zan__guard_recoverable(code)) {
+    if (g && g->armed && zan__guard_recoverable(code) &&
+        zan__guard_rip_recoverable(ep)) {
         g->armed = 0; /* one recovery per guard entry, no re-entry from here */
         /* Everything expensive is deferred to the recovered frame; all that
          * happens here is copying the exception out (the backtrace too, which
@@ -958,6 +977,9 @@ static void zan__crash_wr(int fd, const char *s) {
     size_t n = strlen(s);
     while (n) {
         ssize_t w = write(fd, s, n);
+        /* w < 0 with EAGAIN (non-blocking dup of stderr whose pipe is full)
+         * drops the remainder on purpose: blocking here inside a signal
+         * handler turns one wedged reader into a hung worker pool. */
         if (w <= 0) return;
         s += (size_t)w;
         n -= (size_t)w;
@@ -1003,6 +1025,69 @@ static char zan__crash_exe[4096];
 static char zan__crash_logdir[4096];
 /* $ZAN_WORKER_ID, so a record tells which worker of the pool died. */
 static char zan__crash_wid[32];
+
+/* State cached at install time because the signal handler must not touch
+ * libc machinery that takes locks:
+ *  - the timezone offset: localtime_r/strftime grab the tz lock and may read
+ *    /etc/localtime; a crash on a thread holding that lock (the master's
+ *    timestamp path runs continuously) would self-deadlock the handler.
+ *  - a non-blocking dup of stderr: writing a full pipe from the handler
+ *    blocks in-kernel forever if the reader stalled, hanging this worker
+ *    instead of letting the supervisor respawn it. Partial records are
+ *    dropped instead.
+ *  - one warm-up call of backtrace(): glibc can dlopen libgcc_s on first
+ *    use, which means malloc and the loader lock inside the handler. */
+static long zan__crash_tz_off;
+static int zan__crash_err_fd = -1;
+
+static void zan__crash_cache_handler_state(void) {
+    time_t now = time(NULL);
+    struct tm g, l;
+    if (gmtime_r(&now, &g) && localtime_r(&now, &l)) {
+        zan__crash_tz_off =
+            ((long)(l.tm_yday) - (long)(g.tm_yday)) * 86400L +
+            ((long)(l.tm_hour) - (long)(g.tm_hour)) * 3600L +
+            ((long)(l.tm_min) - (long)(g.tm_min)) * 60L +
+            ((long)(l.tm_sec) - (long)(g.tm_sec));
+    }
+#if defined(F_DUPFD_CLOEXEC)
+    int fd = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 100);
+#else
+    int fd = fcntl(STDERR_FILENO, F_DUPFD, 100);
+#endif
+    if (fd >= 0) {
+        int fl = fcntl(fd, F_GETFL);
+        if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK); /* best-effort */
+        zan__crash_err_fd = fd;
+    }
+#if defined(ZAN_CRASH_HAVE_BACKTRACE)
+    {
+        void *warm[2];
+        backtrace(warm, 2);
+    }
+#endif
+}
+
+/* days-since-epoch -> civil date, proleptic Gregorian. Integer-only
+ * (Hinnant's civil_from_days), safe to run inside a signal handler. */
+static void zan__crash_civil(long long z, int *y, unsigned *m, unsigned *d) {
+    z += 719468;
+    long long era = (z >= 0 ? z : z - 146096) / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    long long yy = (long long)yoe + era * 400;
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    unsigned mp = (5 * doy + 2) / 153;
+    unsigned dd = doy - (153 * mp + 2) / 5 + 1;
+    *m = (unsigned)(mp < 10 ? mp + 3 : mp - 9);
+    *y = (int)(yy + (*m <= 2));
+}
+
+static char *zan__crash_put2(char *p, unsigned v) {
+    p[0] = (char)('0' + (v / 10) % 10);
+    p[1] = (char)('0' + v % 10);
+    return p + 2;
+}
 
 static void zan__crash_resolve_paths(void) {
     ssize_t n = -1;
@@ -1102,16 +1187,46 @@ static void zan__crash_record(int fd, int sig, void *addr, const char *stamp) {
 static void zan__crash_handler(int sig, siginfo_t *info, void *ctx) {
     (void)ctx;
     void *addr = info ? info->si_addr : NULL;
-    time_t now = time(NULL);
-    struct tm tmv;
-    struct tm *lt = localtime_r(&now, &tmv);
+    /* Local time from the install-time timezone offset: localtime_r and
+     * strftime take the tz lock (and read /etc/localtime) and are not
+     * async-signal-safe. */
+    time_t now = time(NULL) + (time_t)zan__crash_tz_off;
     char stamp[32];
-    stamp[0] = '\0';
-    if (lt) strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M:%S", lt);
+    {
+        long long days = (long long)(now / 86400);
+        long long secs = (long long)(now % 86400);
+        if (secs < 0) { secs += 86400; days -= 1; }
+        int y = 1970;
+        unsigned mo = 1, da = 1;
+        zan__crash_civil(days, &y, &mo, &da);
+        unsigned hh = (unsigned)(secs / 3600);
+        unsigned mi = (unsigned)((secs / 60) % 60);
+        unsigned ss = (unsigned)(secs % 60);
+        char *p = stamp;
+        if (y < 0 || y > 9999) y = 1970;
+        p[0] = (char)('0' + (y / 1000) % 10);
+        p[1] = (char)('0' + (y / 100) % 10);
+        p = zan__crash_put2(p + 2, (unsigned)(y % 100));
+        *p++ = '-';
+        p = zan__crash_put2(p, mo);
+        *p++ = '-';
+        p = zan__crash_put2(p, da);
+        *p++ = ' ';
+        p = zan__crash_put2(p, hh);
+        *p++ = ':';
+        p = zan__crash_put2(p, mi);
+        *p++ = ':';
+        p = zan__crash_put2(p, ss);
+        *p = '\0';
+    }
 
     /* stderr first: a supervised worker has it redirected to its dated output
-     * file, which is where the operator looks anyway. */
-    zan__crash_record(STDERR_FILENO, sig, addr, stamp);
+     * file, which is where the operator looks anyway. The write goes to the
+     * non-blocking dup when there is one, so a full pipe cannot hang the
+     * handler (the record still reaches the crash log below). */
+    zan__crash_record(zan__crash_err_fd >= 0 ? zan__crash_err_fd
+                                             : STDERR_FILENO,
+                      sig, addr, stamp);
 
     char path[4096];
     if (zan__crash_logpath_for(lt, path, sizeof path)) {
@@ -1136,6 +1251,7 @@ static void zan__crash_install(void) {
     if (once) return;
     once = 1;
     zan__crash_resolve_paths();
+    zan__crash_cache_handler_state();
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = zan__crash_handler;
