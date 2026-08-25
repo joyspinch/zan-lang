@@ -74,7 +74,8 @@ class SseConnection {
     bool IsOpen() { return this.open; }
 
     /// 发送具名事件。data 中的每个 '\n' 都会变成独立的
-    /// `data:` 行，保证多行负载在线上格式中不被破坏。</summary>
+    /// `data:` 行，保证多行负载在线上格式中不被破坏。
+    /// 返回值 <= 0 表示订阅者已断开。</summary>
     async int SendAsync(string eventName, string data) {
         StringBuilder sb = new StringBuilder();
         if (eventName.Length > 0) {
@@ -92,9 +93,18 @@ class SseConnection {
             }
         }
         sb.Append("\n");
-        int n = await this.client.SendAsync(sb.ToString());
-        if (n <= 0) { this.open = false; }
-        return n;
+        string frame = sb.ToString();
+        // 循环直到整段写出：单次 send 在 TCP 背压下短写会把事件截成
+        // 半帧，下一个事件从中间开始，流就此错位。
+        int total = frame.Length;
+        int sent = 0;
+        while (sent < total) {
+            string rest = frame.Substring(sent, total - sent);
+            int n = await this.client.SendAsync(rest);
+            if (n <= 0) { this.open = false; return n; }
+            sent = sent + n;
+        }
+        return total;
     }
 
     /// <summary>发送匿名（"message"）事件。</summary>

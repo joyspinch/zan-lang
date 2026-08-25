@@ -393,6 +393,24 @@ class HttpContext {
         return true;
     }
 
+    /// <summary>循环直到整段写出。TcpClient.SendAsync 是单次非阻塞
+    /// send：TCP 背压下（慢订阅者 + 快上游——繁忙转发的常态）它经常
+    /// 短写，此前按 frame.Length 记账等于把没发出去的事件当已送达，
+    /// 下一事件从半帧中间开始——浏览器收到的补全是坏 JSON。
+    /// false = 对端已断开。</summary>
+    async bool SendAllTcp(string data) {
+        int total = data.Length;
+        if (total == 0) { return true; }
+        int sent = 0;
+        while (sent < total) {
+            string rest = data.Substring(sent, total - sent);
+            int n = await this.conn.SendAsync(rest);
+            if (n <= 0) { return false; }
+            sent = sent + n;
+        }
+        return true;
+    }
+
     /// <summary>Pushes one event. `name` "" sends the default "message" event.
     /// Each newline in `data` becomes its own data: line, as the wire format
     /// requires. false = the subscriber is gone; stop the loop.</summary>
@@ -411,8 +429,8 @@ class HttpContext {
         }
         sb.Append("\n");
         string frame = sb.ToString();
-        int n = await this.conn.SendAsync(frame);
-        if (n <= 0) { this.hijacked = false; return false; }
+        bool ok = await this.SendAllTcp(frame);
+        if (!ok) { this.hijacked = false; return false; }
         this.frames = this.frames + 1;
         this.framesBytes = this.framesBytes + frame.Length;
         return true;
@@ -422,8 +440,8 @@ class HttpContext {
     /// the stream.</summary>
     async bool SsePing() {
         if (!this.hijacked || this.conn == null) { return false; }
-        int n = await this.conn.SendAsync(": ping\n\n");
-        if (n <= 0) { this.hijacked = false; return false; }
+        bool ok = await this.SendAllTcp(": ping\n\n");
+        if (!ok) { this.hijacked = false; return false; }
         this.frames = this.frames + 1;
         this.framesBytes = this.framesBytes + 8;
         return true;

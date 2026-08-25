@@ -94,6 +94,7 @@ class WssClient {
         while (this.connected) {
             int total = this.FrameLength();
             while (total < 0) {
+                if (total == -2) { this.CloseNow(); return ""; }
                 string chunk = await this.stream.RecvAsync(65536);
                 if (chunk.Length == 0) { this.CloseNow(); return ""; }
                 this.pending = this.pending + chunk;
@@ -176,6 +177,13 @@ class WssClient {
             pos = 4;
         } else if (payloadLen == 127) {
             if (this.pending.Length < 10) { return -1; }
+            // 64 位长度的高 32 位必须为零（RFC 要求连接失败）：
+            // 不检查时置位的高位会把 payloadLen 变成负数，total 随之
+            // 为负、长度比较永远通过，解码端按负帧长越界。
+            if ((this.pending[2] & 255) != 0 || (this.pending[3] & 255) != 0
+                || (this.pending[4] & 255) != 0 || (this.pending[5] & 255) != 0) {
+                return -2;
+            }
             payloadLen = ((this.pending[6] & 255) << 24)
                 | ((this.pending[7] & 255) << 16)
                 | ((this.pending[8] & 255) << 8)
@@ -184,6 +192,7 @@ class WssClient {
         }
         if ((b1 & 128) != 0) { pos = pos + 4; }
         int total = pos + payloadLen;
+        if (total < 0) { return -2; }
         if (this.pending.Length < total) { return -1; }
         return total;
     }

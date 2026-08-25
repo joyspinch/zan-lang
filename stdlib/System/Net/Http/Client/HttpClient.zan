@@ -562,20 +562,44 @@ class HttpClient {
     }
 
     // 当响应头声明分块传输编码（chunked transfer-encoding）时返回 true。
-    // 调用者必须只传头部（"\r\n\r\n" 之前的字节），不能传
-    // 整个缓冲区：正文文本若含有该词会造成误判。
+    // 调用者必须只传头部（"\r\n\r\n" 之前的字节）。
+    // 按行解析：字段名必须是行首（大小写不敏感）"transfer-encoding"，
+    // 且只有逗号列表的最后一项等于 "chunked" 才算。此前在整个头块里
+    // 包含匹配 "chunked"，恶意上游一个 ETag: "chunked" 就能把真实的
+    // SSE 流按假尺寸行解析到乱码/截断。
     static bool HeadIsChunked(string head) {
-        int n = head.Length;
-        // 扫描 transfer-encoding 头后的 "chunked"；这里用普通的
-        // 大小写不敏感包含判断就足够了，因为响应头
-        // 不会在其他地方出现该词。
-        for (int i = 0; i + 7 <= n; i = i + 1) {
-            int a = head[i] & 255;
-            if (a == 99 || a == 67) {
-                if (HttpClient.AsciiNameEquals(head.Substring(i, 7), "chunked", 7)) {
-                    return true;
-                }
+        int lineStart = 0;
+        while (lineStart < head.Length) {
+            int lineEnd = head.Length;
+            int e = HttpClient.IndexOf(head, "\n", lineStart);
+            if (e >= 0) { lineEnd = e; }
+            int colon = -1;
+            for (int i = lineStart; i < lineEnd; i = i + 1) {
+                if ((head[i] & 255) == 58) { colon = i; break; }
             }
+            if (colon == lineStart + 17
+                && HttpClient.AsciiNameEquals(
+                    head.Substring(lineStart, 17), "transfer-encoding", 17)) {
+                // 取值部分最后一个逗号之后的项，去尾部空白后比较。
+                int p = colon + 1;
+                int lastComma = p - 1;
+                for (int i = p; i < lineEnd; i = i + 1) {
+                    if ((head[i] & 255) == 44) { lastComma = i; }
+                }
+                int itemStart = lastComma + 1;
+                int itemEnd = lineEnd;
+                while (itemEnd > itemStart) {
+                    int b = head[itemEnd - 1] & 255;
+                    if (b == 32 || b == 9 || b == 13) { itemEnd = itemEnd - 1; }
+                    else { break; }
+                }
+                return itemEnd - itemStart == 7
+                    && HttpClient.AsciiNameEquals(
+                        head.Substring(itemStart, itemEnd - itemStart),
+                        "chunked", 7);
+            }
+            if (e < 0) { break; }
+            lineStart = e + 1;
         }
         return false;
     }
@@ -705,7 +729,11 @@ class HttpClient {
         // 该正文就是完整诊断，因此在此保留并写入
         // 结果标记中，而不是被当作普通答案
         // 流入 sink。
-        bool failed = status >= 400;
+        // 非 2xx 一律按失败收场（此前只有 >=400 才算）：3xx 重定向的
+        // HTML、1xx 的杂音会被逐 token 写进 sink，订阅者收到的是垃圾
+        // 补全且调用方还会重试。本客户端有意不自动跟随重定向——
+        // 跨源跳转携带 Authorization 是更大的错误。
+        bool failed = status < 200 || status >= 300;
         string errBody = "";
         int got = 0;
         bool finished = false;
@@ -817,7 +845,7 @@ class HttpClient {
         // 把它报告成传输问题（"connection closed"）既掩盖了
         // 服务商的信息，又让调用者重试一个注定
         // 再次失败的请求。
-        if (status >= 400) {
+        if (status < 200 || status >= 300) {
             sink.SetResponse(status, sink.ResponseHeaders(), errBody);
             string detail = HttpClient.OneLine(errBody);
             string marker = "err: HTTP " + Convert.ToString(status);

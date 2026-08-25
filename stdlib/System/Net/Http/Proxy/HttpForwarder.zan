@@ -990,10 +990,17 @@ class HttpForwarder {
         return HttpForwarder.ParseInt(head.Substring(start, end - start));
     }
 
-    /// <summary>头部行的字段名（小写）；不是头部行时返回空串。</summary>
+    /// <summary>头部行的字段名（小写）；不是头部行时返回空串。
+    /// 冒号前含空格/制表符的行（如 "Transfer-Encoding :"）返回空串——
+    /// 这种混淆名此前会绕过所有 TE/逐跳判定后被原样转发，是教科书级
+    /// 走私向量；RFC 7230 要求拒收。</summary>
     static string LowerName(string line) {
         int colon = HttpForwarder.IndexOf(line, ":", 0);
         if (colon <= 0) { return ""; }
+        for (int i = 0; i < colon; i = i + 1) {
+            int b = line[i] & 255;
+            if (b == 32 || b == 9) { return ""; }
+        }
         return HttpForwarder.Lower(line.Substring(0, colon));
     }
 
@@ -1055,12 +1062,44 @@ class HttpForwarder {
 
     /// <summary>检查请求/响应头块的正文定界是否合法。
     /// 非法定界（TE+CL 冲突、非 chunked 的 TE、chunked 不在最后、
-    /// 非法 Content-Length）返回 false，调用方应返回 400。</summary>
+    /// 非法/重复的 Content-Length、冒号前含空白的混淆字段名）
+    /// 返回 false，调用方应返回 400。</summary>
     static bool IsBodyFramingValid(string head, bool isRequest) {
+        List<string> lines = HttpForwarder.HeadLines(head);
+        int clCount = 0;
+        string clValue = "";
+        for (int i = 1; i < lines.Count; i = i + 1) {
+            string line = lines[i];
+            int colon = HttpForwarder.IndexOf(line, ":", 0);
+            if (colon <= 0) { continue; }
+            // 混淆字段名："Transfer-Encoding :" 这类冒号前带空白的行
+            // 不匹配任何已知名，此前会绕过全部判定后被原样转发，
+            // 由容忍该空格的上游按 TE 解析——走私。RFC 要求拒收。
+            bool badName = false;
+            for (int k = 0; k < colon; k = k + 1) {
+                int b = line[k] & 255;
+                if (b == 32 || b == 9) { badName = true; break; }
+            }
+            if (badName) { return false; }
+            string name = HttpForwarder.Lower(line.Substring(0, colon));
+            if (name == "content-length") {
+                clCount = clCount + 1;
+                clValue = HttpForwarder.Trim(
+                    line.Substring(colon + 1, line.Length - colon - 1));
+            } else if (name == "transfer-encoding") {
+                // 空白分隔的值变体（值内 tab）同样不参与下面的
+                // 严格解析——统一 trim 后再判。
+            }
+        }
+        // 多个 Content-Length 行：即使值相同也拒绝（RFC 允许合并，
+        // 但转发器选择 fail-closed——上游与我们对合并语义的理解
+        // 一旦分歧就是请求走私）。
+        if (clCount > 1) { return false; }
+
         string teValue = HttpForwarder.Lower(
             HttpForwarder.HeaderValue(head, "transfer-encoding"));
         bool hasTe = teValue.Length > 0;
-        bool hasCl = HttpForwarder.HeaderValue(head, "content-length").Length > 0;
+        bool hasCl = clCount == 1;
         if (hasTe && hasCl) { return false; }
         if (hasTe) {
             List<string> parts = HttpForwarder.SplitCsv(teValue);
