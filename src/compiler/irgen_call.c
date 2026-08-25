@@ -427,13 +427,17 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             zan_type_t *rt = infer_expr_type(g, recv, locals);
             LLVMValueRef rv = NULL;
             if (zan_refl_is_typeinfo(rt)) {
-                if (refl_emit_typeinfo_member(g, emit_expr(g, recv, locals),
+                if (refl_emit_typeinfo_member(g,
+                                              emit_guarded_member_object(
+                                                  g, expr->call.callee, locals),
                                               mname, cargs, cargc, locals, &rv))
                     return rv;
             } else if (zan_refl_is_reflectable(rt) &&
                        (!rt->sym || !get_method_sym(rt->sym, mname)) &&
                        zan_refl_instance_method(mname, NULL)) {
-                if (refl_emit_instance_call(g, rt, emit_expr(g, recv, locals),
+                if (refl_emit_instance_call(g, rt,
+                                            emit_guarded_member_object(
+                                                g, expr->call.callee, locals),
                                             mname, cargs, cargc, locals, &rv))
                     return rv;
             }
@@ -4196,7 +4200,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         if (g->functions[fi].sym == method_sym) {
                             int argc = expr->call.args.count + 1;
                             LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
-                            LLVMValueRef recv_val = emit_expr(g, callee->member.object, locals);
+                            LLVMValueRef recv_val = emit_guarded_member_object(
+                                g, callee, locals);
                             /* receiver: the object pointer produced by the
                              * expression (field load, index, call, ...). */
                             call_args[0] = recv_val;
@@ -4285,7 +4290,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
                     int uargc = expr->call.args.count;
                     /* emit receiver + argument values once, before branching */
-                    LLVMValueRef recv = emit_expr(g, callee->member.object, locals);
+                    LLVMValueRef recv = emit_guarded_member_object(g, callee, locals);
                     LLVMValueRef *avals = (LLVMValueRef *)calloc((size_t)(uargc > 0 ? uargc : 1),
                                                                 sizeof(LLVMValueRef));
                     for (int k = 0; k < uargc; k++)

@@ -2893,13 +2893,15 @@ binding_lowered:
                         zan_symbol_t *setter = property_setter_sym(g, psym);
                         if (setter) {
                             zan_type_t *rct = infer_expr_type(g, obj_expr, locals);
-                            LLVMValueRef rval = emit_expr(g, obj_expr, locals);
+                            LLVMValueRef rval = emit_guarded_member_object(
+                                g, expr->binary.left, locals);
                             emit_property_setter_call(g, setter, rct, rval,
                                 right, obj_expr, expr->binary.right, locals);
                             stored = true;
                         } else {
                             LLVMTypeRef st = get_struct_llvm_type(g, cls);
-                            LLVMValueRef obj_val = emit_expr(g, obj_expr, locals);
+                            LLVMValueRef obj_val = emit_guarded_member_object(
+                                g, expr->binary.left, locals);
                             if (st && LLVMGetTypeKind(LLVMTypeOf(obj_val)) == LLVMPointerTypeKind) {
                                 LLVMValueRef fptr = emit_field_ptr(g, cls, st, obj_val, fi, "gfld");
                                 zan_symbol_t *gfsym = get_field_sym(cls, expr->binary.left->member.name);
@@ -3493,7 +3495,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             if (zan_refl_is_typeinfo(tit)) {
                 LLVMValueRef rv = NULL;
                 if (refl_emit_typeinfo_member(g,
-                        emit_expr(g, expr->member.object, locals),
+                        emit_guarded_member_object(g, expr, locals),
                         expr->member.name, NULL, 0, locals, &rv))
                     return rv;
             }
@@ -3508,7 +3510,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             bool is_val = expr->member.name.len == 5 &&
                 memcmp(expr->member.name.str, "Value", 5) == 0;
             if (nt && nt->kind == TYPE_NULLABLE && (is_has || is_val)) {
-                LLVMValueRef nv = emit_expr(g, expr->member.object, locals);
+                LLVMValueRef nv = emit_guarded_member_object(g, expr, locals);
                 if (llvm_is_nullable(LLVMTypeOf(nv))) {
                     if (is_has) return nullable_has_value(g, nv);
                     emit_runtime_check(g,
@@ -3536,7 +3538,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                         return LLVMConstInt(ti64, 0, 0);
                     }
                     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                    LLVMValueRef h = emit_expr(g, expr->member.object, locals);
+                    LLVMValueRef h = emit_guarded_member_object(g, expr, locals);
                     if (LLVMGetTypeKind(LLVMTypeOf(h)) == LLVMPointerTypeKind)
                         h = LLVMBuildPtrToInt(g->builder, h, ti64, "task.h");
                     else if (LLVMGetIntTypeWidth(LLVMTypeOf(h)) < 64)
@@ -3687,7 +3689,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             memcmp(expr->member.name.str, "Length", 6) == 0) {
             zan_type_t *st = infer_expr_type(g, expr->member.object, locals);
             if (is_span_type(st)) {
-                LLVMValueRef span_val = emit_expr(g, expr->member.object, locals);
+                LLVMValueRef span_val = emit_guarded_member_object(g, expr, locals);
                 LLVMValueRef len = LLVMBuildExtractValue(g->builder, span_val, 1, "sp.len");
                 return LLVMBuildTrunc(g->builder, len,
                     LLVMInt32TypeInContext(g->ctx), "sp.len32");
@@ -3700,7 +3702,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             zan_type_t *lt = infer_expr_type(g, expr->member.object, locals);
             if (lt && type_named(lt, "List", 4)) {
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-                LLVMValueRef raw_ptr = emit_expr(g, expr->member.object, locals);
+                LLVMValueRef raw_ptr = emit_guarded_member_object(g, expr, locals);
                 LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, raw_ptr,
                     LLVMPointerType(g->list_struct_type, 0), "lptr");
                 LLVMValueRef count_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 0, "cntp");
@@ -3723,7 +3725,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             if (dt && type_named(dt, "Dict", 4)) {
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                LLVMValueRef raw = emit_expr(g, expr->member.object, locals);
+                LLVMValueRef raw = emit_guarded_member_object(g, expr, locals);
                 LLVMValueRef dp = LLVMBuildBitCast(g->builder, raw,
                     LLVMPointerType(g->dict_struct_type, 0), "dp");
                 LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 0, "cntp");
@@ -3744,7 +3746,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                 zan_type_t *elem = want_keys ? dict_key_type(g, dt) : dict_value_type(dt);
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                LLVMValueRef raw = emit_expr(g, expr->member.object, locals);
+                LLVMValueRef raw = emit_guarded_member_object(g, expr, locals);
                 LLVMValueRef dp = LLVMBuildBitCast(g->builder, raw,
                     LLVMPointerType(g->dict_struct_type, 0), "dp");
                 LLVMValueRef dict_value_words = load_dict_value_words(g, raw);
@@ -3816,7 +3818,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
         if (expr->member.name.len == 6 && memcmp(expr->member.name.str, "Length", 6) == 0) {
             zan_type_t *at = infer_expr_type(g, expr->member.object, locals);
             if (at && at->kind == TYPE_ARRAY) {
-                LLVMValueRef arr = emit_expr(g, expr->member.object, locals);
+                LLVMValueRef arr = emit_guarded_member_object(g, expr, locals);
                 return zan_array_len(g, arr);
             }
         }
@@ -3826,7 +3828,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             zan_type_t *sbt = infer_expr_type(g, expr->member.object, locals);
             if (sbt && type_named(sbt, "StringBuilder", 13)) {
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-                LLVMValueRef raw = emit_expr(g, expr->member.object, locals);
+                LLVMValueRef raw = emit_guarded_member_object(g, expr, locals);
                 LLVMValueRef sbp = LLVMBuildBitCast(g->builder, raw,
                     LLVMPointerType(g->sb_struct_type, 0), "sbp");
                 LLVMValueRef cptr = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sbp, 0, "sbcp");
@@ -3843,7 +3845,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
          * rejecting the member. */
         if (expr->member.name.len == 6 && memcmp(expr->member.name.str, "Length", 6) == 0 &&
             recv_is_stringlike(g, expr->member.object, locals)) {
-            LLVMValueRef obj_val = emit_expr(g, expr->member.object, locals);
+            LLVMValueRef obj_val = emit_guarded_member_object(g, expr, locals);
             if (LLVMGetTypeKind(LLVMTypeOf(obj_val)) == LLVMPointerTypeKind) {
                 /* the length is an i64; `int` is i64 so return it directly. */
                 LLVMValueRef len = emit_string_length(g, obj_val);
@@ -4003,13 +4005,13 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                     zan_symbol_t *getter = property_getter_sym(g, psym);
                     if (getter) {
                         zan_type_t *rct = infer_expr_type(g, expr->member.object, locals);
-                        LLVMValueRef rval = emit_expr(g, expr->member.object, locals);
+                        LLVMValueRef rval = emit_guarded_member_object(g, expr, locals);
                         return emit_property_getter_call(g, getter, rct, rval,
                                                          expr->member.object,
                                                          locals);
                     }
                     LLVMTypeRef st = get_struct_llvm_type(g, cls);
-                    LLVMValueRef obj_val = emit_expr(g, expr->member.object, locals);
+                    LLVMValueRef obj_val = emit_guarded_member_object(g, expr, locals);
                     /* a value struct rvalue (list[i] of a struct element,
                      * a call result) is in a register, not behind a pointer */
                     if (LLVMGetTypeKind(LLVMTypeOf(obj_val)) == LLVMStructTypeKind) {
@@ -4050,7 +4052,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                 zan_symbol_t *ms = get_method_sym(cls, expr->member.name);
                 if (ms && ms->decl && ms->decl->kind == AST_METHOD_DECL &&
                     (ms->decl->method_decl.modifiers & MOD_STATIC) == 0) {
-                    LLVMValueRef recv = emit_expr(g, expr->member.object, locals);
+                    LLVMValueRef recv = emit_guarded_member_object(g, expr, locals);
                     LLVMValueRef clo = recv
                         ? emit_method_group_closure(g, ms, recv, expr->loc)
                         : NULL;

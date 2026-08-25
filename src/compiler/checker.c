@@ -14,6 +14,8 @@
 #include "arena.h"
 #include <string.h>
 
+static const char *type_name(zan_type_t *t);
+
 /* Depth cap for every walk that follows base_type / interface chains. The
  * binder rejects cyclic inheritance outright (binder.c resolve_bases), but a
  * stray ring must never turn a checker pass into an infinite loop. */
@@ -38,6 +40,23 @@ static void no_runtime_reject(zan_checker_t *c, zan_loc_t loc, const char *what)
     if (!c->in_no_runtime) return;
     zan_diag_emit(c->diag, DIAG_ERROR, loc,
                   "%s is not allowed in a [NoRuntime] method", what);
+}
+
+static bool no_runtime_arc_return_type(zan_type_t *type) {
+    return type && (type->kind == TYPE_STRING ||
+                    type->kind == TYPE_INTERFACE ||
+                    type->kind == TYPE_CLASS);
+}
+
+static void no_runtime_warn_arc_return(zan_checker_t *c,
+                                       zan_ast_node_t *call,
+                                       zan_type_t *type) {
+    if (!c->in_no_runtime || !no_runtime_arc_return_type(type)) return;
+    zan_diag_emit(c->diag, DIAG_WARNING, call->loc,
+                  "call in a [NoRuntime] method returns an ARC-managed value "
+                  "with an owned +1 reference, but [NoRuntime] emits no ARC; "
+                  "the +1 will not be released and will leak. Move the call "
+                  "out of the [NoRuntime] method or use a non-owning return");
 }
 
 /* The payload type of a nullable value operand: `int?` -> `int`, anything
@@ -1645,14 +1664,21 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         if (!called_sym && expr->call.callee &&
             expr->call.callee->kind == AST_IDENTIFIER)
             called_sym = zan_binder_lookup(c->binder, expr->call.callee->ident.name);
+        if (!called_sym && expr->call.callee &&
+            expr->call.callee->kind == AST_IDENTIFIER &&
+            c->current_type_sym)
+            called_sym = checker_find_method(c->current_type_sym,
+                                             expr->call.callee->ident.name);
         c->last_call_node = expr;
         c->last_call_method = called_sym;
         check_call_arity(c, expr, recv);
         if (!callee_is_method && callee_type &&
             callee_type->kind == TYPE_DELEGATE) {
-            return callee_type->delegate_ret_type
+            zan_type_t *ret = callee_type->delegate_ret_type
                 ? callee_type->delegate_ret_type
                 : c->binder->type_void;
+            no_runtime_warn_arc_return(c, expr, ret);
+            return ret;
         }
         /* op_call operator: `<class instance>(args)` has the op_call method's
          * declared return type. */
@@ -1662,10 +1688,15 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             zan_symbol_t *op = checker_find_method(callee_type->sym, op_name);
             if (op && op->decl && op->decl->kind == AST_METHOD_DECL &&
                 op->decl->method_decl.return_type) {
-                return zan_binder_resolve_type(c->binder,
+                zan_type_t *ret = zan_binder_resolve_type(c->binder,
                     op->decl->method_decl.return_type);
+                no_runtime_warn_arc_return(c, expr, ret);
+                return ret;
             }
-            if (op && op->type) return op->type;
+            if (op && op->type) {
+                no_runtime_warn_arc_return(c, expr, op->type);
+                return op->type;
+            }
         }
         /* Resolve the callee's return type when the function/method symbol
          * is in scope. Fall back to type_error (NOT void) for unresolved
@@ -1673,15 +1704,21 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
          * recursive `Fib(n-1) + Fib(n-2)` — does not raise a spurious
          * "cannot apply operator to 'void'..." error. */
         if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER) {
-            zan_symbol_t *fsym = zan_binder_lookup(c->binder, expr->call.callee->ident.name);
+            zan_symbol_t *fsym = called_sym
+                ? called_sym
+                : zan_binder_lookup(c->binder, expr->call.callee->ident.name);
             if (fsym && (fsym->kind == SYM_METHOD) && fsym->decl) {
                 zan_ast_node_t *m = fsym->decl;
                 if (m->method_decl.return_type) {
-                    return zan_binder_resolve_type(c->binder, m->method_decl.return_type);
+                    zan_type_t *ret = zan_binder_resolve_type(
+                        c->binder, m->method_decl.return_type);
+                    no_runtime_warn_arc_return(c, expr, ret);
+                    return ret;
                 }
                 return c->binder->type_void; /* explicit void return */
             }
         }
+        no_runtime_warn_arc_return(c, expr, callee_is_method ? callee_type : NULL);
         return c->binder->type_error;
     }
 

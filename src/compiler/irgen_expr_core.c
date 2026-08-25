@@ -18,6 +18,8 @@ static LLVMValueRef get_libc_fn(zan_irgen_t *g, const char *name, LLVMTypeRef ty
 
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
+static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
+                               zan_loc_t loc, const char *msg);
 /* Emit a lambda literal, typing its parameters/return from `expected` (the
  * target delegate type) when the lambda omits annotations. Without this the
  * params default to `int`, so a class-typed parameter cannot resolve fields.
@@ -2186,6 +2188,65 @@ static zan_symbol_t *expr_class_sym(zan_irgen_t *g, zan_ast_node_t *e,
     if (t && t->kind == TYPE_TYPE_PARAM) t = concretize(g, t);
     if (t && (t->kind == TYPE_CLASS || t->kind == TYPE_STRUCT)) return t->sym;
     return NULL;
+}
+
+/* Return the field symbol when `e` is a read of a weak instance field.  Keep
+ * the two AST shapes here in step with the field-store paths: an explicit
+ * member access resolves through the receiver's class symbol, while a bare
+ * identifier resolves against the current class (and must not capture a local
+ * shadowing the field). */
+static zan_symbol_t *weak_field_read_sym(zan_irgen_t *g, zan_ast_node_t *e,
+                                         local_scope_t *locals) {
+    zan_symbol_t *field = NULL;
+    if (!e) return NULL;
+    if (e->kind == AST_IDENTIFIER) {
+        if (local_find(locals, e->ident.name) || !g->current_type_sym)
+            return NULL;
+        if (get_field_index(g->current_type_sym, e->ident.name) >= 0)
+            field = get_field_sym(g->current_type_sym, e->ident.name);
+        if (field && field_member_is_static(field)) return NULL;
+    } else if (e->kind == AST_MEMBER_ACCESS && !e->member.null_cond) {
+        zan_symbol_t *owner = expr_class_sym(g, e->member.object, locals);
+        if (!owner) return NULL;
+        if (get_field_index(owner, e->member.name) >= 0)
+            field = get_field_sym(owner, e->member.name);
+        if (field && field_member_is_static(field)) return NULL;
+    }
+    return field && (field->modifiers & MOD_WEAK) ? field : NULL;
+}
+
+/* Guard one already-emitted weak-field value.  The caller emits the value
+ * first so a receiver expression with side effects is evaluated exactly once.
+ * `loc` is the weak read site, which gives the runtime report the useful
+ * source position rather than a later lowered load. */
+static void emit_weak_read_guard(zan_irgen_t *g, zan_ast_node_t *read_expr,
+                                 LLVMValueRef value, zan_loc_t loc,
+                                 local_scope_t *locals) {
+    zan_symbol_t *field = weak_field_read_sym(g, read_expr, locals);
+    if (!field || !value ||
+        LLVMGetTypeKind(LLVMTypeOf(value)) != LLVMPointerTypeKind)
+        return;
+    LLVMTypeRef ptr_type = LLVMTypeOf(value);
+    LLVMValueRef is_null = zan_icmp(g->builder, LLVMIntEQ, value,
+                                    LLVMConstNull(ptr_type), "weak.null");
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "null reference: weak field '%.*s' was cleared",
+             (int)field->name.len, field->name.str);
+    emit_runtime_check(g, is_null, loc, msg);
+}
+
+/* Emit a member receiver once and guard it when the receiver expression is a
+ * weak field read.  Null-conditional access owns its own null test and must
+ * not receive a second fatal guard. */
+static LLVMValueRef emit_guarded_member_object(zan_irgen_t *g,
+                                               zan_ast_node_t *member,
+                                               local_scope_t *locals) {
+    LLVMValueRef value = emit_expr(g, member->member.object, locals);
+    if (member && !member->member.null_cond)
+        emit_weak_read_guard(g, member->member.object, value,
+                             member->member.object->loc, locals);
+    return value;
 }
 
 /* True when class `cls` (or one of its base classes) declares `iface` — or an
