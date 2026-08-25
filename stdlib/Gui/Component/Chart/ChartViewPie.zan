@@ -16,6 +16,7 @@ class PieSlice {
     int a0;
     int a1;
     int ring;
+    bool selected;  // data.selected：静态选中，绘制时外偏 selectedOffset
 
     static PieSlice Of(int value, int color, string name,
                        int seriesIndex, int dataIndex, int a0, int a1, int ring) {
@@ -28,6 +29,7 @@ class PieSlice {
         s.a0 = a0;
         s.a1 = a1;
         s.ring = ring;
+        s.selected = false;
         return s;
     }
 }
@@ -46,6 +48,7 @@ class PieLayout {
     int ringCount;      // 环数（非环模式 = 1）
     List<int> ringTotal; // 每环各自可见值之和（环模式角度分母）
     List<int> ringInner; // 每环有效内径百分比（innerPct>0 ? innerPct : donutPct）
+    int rot;            // 起始边顺时针偏移（度）：90 - series.startAngle
 
     static PieLayout Of(Theme t, ChartOption o) {
         PieLayout l = new PieLayout();
@@ -54,14 +57,23 @@ class PieLayout {
         l.ringInner = new List<int>();
         l.total = 0;
         l.ringCount = 0;
+        l.rot = 0;
 
-        // 可见 Pie 系列（隐藏系列不参与）。
+        // 可见 Pie 系列（隐藏系列不参与）。origIdx 记录其在
+        // o.series 里的原始下标——扇区命中要回查该系列的 itemStyle。
         List<ChartSeries> pies = new List<ChartSeries>();
+        List<int> origIdx = new List<int>();
         for (int i = 0; i < o.series.Count; i = i + 1) {
             ChartSeries s = o.series[i];
-            if (!s.hidden && s.type == ChartType.Pie) { pies.Add(s); }
+            if (!s.hidden && s.type == ChartType.Pie) {
+                pies.Add(s);
+                origIdx.Add(i);
+            }
         }
         if (pies.Count < 1) { return l; }
+        // ECharts startAngle 是数学角（0=3 点钟，逆时针），默认 90
+        // 视觉上=12 点钟；本库扇区角 0=12 点钟顺时针，换算 90-值。
+        l.rot = ((90 - pies[0].startAngle) % 360 + 360) % 360;
 
         if (o.pieRings) {
             // 每条可见系列 = 一环，各自 total。
@@ -88,7 +100,8 @@ class PieLayout {
                     int a0 = acc * 360 / rt;
                     int a1 = (acc + v) * 360 / rt;
                     l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, di2, l.slices.Count),
-                        PieLayout.SliceName(s, di2), r, di2, a0, a1, r));
+                        PieLayout.SliceName(s, di2), origIdx[r], di2, a0, a1, r));
+                    l.slices[l.slices.Count - 1].selected = d.selected;
                     acc = acc + v;
                 }
             }
@@ -123,7 +136,8 @@ class PieLayout {
                 int a0 = acc2 * 360 / total;
                 int a1 = (acc2 + v) * 360 / total;
                 l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, di2, l.slices.Count),
-                    PieLayout.SliceName(s, di2), p2, di2, a0, a1, 0));
+                    PieLayout.SliceName(s, di2), origIdx[p2], di2, a0, a1, 0));
+                l.slices[l.slices.Count - 1].selected = d.selected;
                 acc2 = acc2 + v;
             }
         }
@@ -187,6 +201,8 @@ partial class ChartView {
         int cx = x + pad + areaW / 2;
         int cy = top + areaH / 2;
         int sweepMax = 360 * g / 1000;
+        // 起始边顺时针偏移（ECharts startAngle 换算），布局层给出。
+        int rot = layout.rot;
 
         // 环带几何：pieRings 时每条可见系列一条等宽环带，
         // 最外环用系列 innerPct（缺省 donutPct）开孔；
@@ -216,17 +232,38 @@ partial class ChartView {
             if (ri < 0) { ri = 0; }
             int a0 = sl.a0;
             int a1 = sl.a1;
+            // 入场扫掠沿旋转后的起始边顺时针推进；扇区可见弧段
+            // = [rot+a0, rot+min(a1, sweepMax)]（FillSector 自带
+            // 角度回绕，>360 安全）。
             int aEnd = a1;
             if (aEnd > sweepMax) { aEnd = sweepMax; }
-            if (aEnd > a0) {
-                c.FillSector(cx, cy, ri, ro, a0, aEnd, sl.color);
+            // 静态选中：沿中角方向向外偏 selectedOffset 像素。
+            int sx = 0;
+            int sy = 0;
+            if (sl.selected && sl.seriesIndex >= 0
+                && sl.seriesIndex < o.series.Count) {
+                int offPx = app.Scale(o.series[sl.seriesIndex].selectedOffset);
+                if (offPx > 0) {
+                    int midSel = rot + (a0 + a1) / 2;
+                    // 屏幕位置约定 pos=(CosDeg m, SinDeg m)，而 m 是
+                    // 数学域角；扇区角是原生态域：m = 扇区角+270。
+                    sx = ChartView.SinDeg(midSel) * offPx / 1000;
+                    sy = ChartView.SinDeg(midSel + 270) * offPx / 1000;
+                }
+            }
+            int scx = cx + sx;
+            int scy = cy + sy;
+            int pa0 = a0 + rot;
+            int paEnd = aEnd + rot;
+            if (paEnd > pa0) {
+                c.FillSector(scx, scy, ri, ro, pa0, paEnd, sl.color);
                 // itemStyle.normal 边框：borderWidth>0 且 borderColor
                 // 非零时描扇区轮廓（ECharts 2.x 语义，缺省不画）。
                 if (sl.seriesIndex >= 0 && sl.seriesIndex < o.series.Count) {
                     ChartSeries bs = o.series[sl.seriesIndex];
                     if (bs.itemStyle.normal.borderWidth > 0
                         && bs.itemStyle.normal.borderColor != 0) {
-                        StrokeSector(c, cx, cy, ri, ro, a0, aEnd,
+                        StrokeSector(c, scx, scy, ri, ro, pa0, paEnd,
                             bs.itemStyle.normal.borderColor,
                             app.Scale(bs.itemStyle.normal.borderWidth));
                     }
@@ -256,7 +293,7 @@ partial class ChartView {
                         rLbl = (ri0 + rOuter) / 2;
                         if (ri0 < app.Scale(4)) { rLbl = rOuter * 62 / 100; }
                     }
-                    int mid = (sl.a0 + sl.a1) / 2;
+                    int mid = rot + (sl.a0 + sl.a1) / 2;
                     int lxp = cx + ChartView.CosDeg(mid) * rLbl / 1000;
                     int lyp = cy + ChartView.SinDeg(mid) * rLbl / 1000;
                     string pl = Convert.ToString(pct) + "%";
@@ -306,6 +343,8 @@ partial class ChartView {
             int ddy = my - cy;
             int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
             int ang = ChartView.AngleOf(ddx, ddy);
+            // 与绘制循环同一旋转平移（同域相减，约定无关）。
+            int angR = ((ang - rot) % 360 + 360) % 360;
             for (int k3 = slices.Count - 1; k3 >= 0; k3 = k3 - 1) {
                 PieSlice sl = slices[k3];
                 int ring = sl.ring;
@@ -322,13 +361,14 @@ partial class ChartView {
                     ro = rOuter;
                 }
                 if (ri < 0) { ri = 0; }
-                if (dist >= ri && dist <= ro && ang >= sl.a0 && ang < sl.a1) {
+                if (dist >= ri && dist <= ro && angR >= sl.a0 && angR < sl.a1) {
                     int ringTot = total;
                     if (ring < layout.ringTotal.Count && layout.ringTotal[ring] > 0) {
                         ringTot = layout.ringTotal[ring];
                     }
                     // emphasis 高亮：命中扇区按强调色重画（覆盖普通
                     // 绘制，不改写源系列），再按配置描强调边框。
+                    // 角度与绘制循环同域：rot 平移 + 原生角。
                     if (sl.seriesIndex >= 0 && sl.seriesIndex < o.series.Count) {
                         ChartSeries hs2 = o.series[sl.seriesIndex];
                         int hiFill = sl.color;
@@ -338,12 +378,14 @@ partial class ChartView {
                         int aEnd2 = sl.a1;
                         if (aEnd2 > sweepMax) { aEnd2 = sweepMax; }
                         if (aEnd2 > sl.a0) {
-                            c.FillSector(cx, cy, ri, ro, sl.a0, aEnd2, hiFill);
+                            c.FillSector(cx, cy, ri, ro,
+                                rot + sl.a0, rot + aEnd2, hiFill);
                             int bc = hs2.itemStyle.emphasis.borderColor;
                             int bw2 = hs2.itemStyle.emphasis.borderWidth;
                             if (bc == 0) { bc = hs2.itemStyle.normal.borderColor; }
                             if (bw2 <= 0) { bw2 = hs2.itemStyle.normal.borderWidth; }
-                            StrokeSector(c, cx, cy, ri, ro, sl.a0, aEnd2, bc,
+                            StrokeSector(c, cx, cy, ri, ro,
+                                rot + sl.a0, rot + aEnd2, bc,
                                 app.Scale(bw2));
                         }
                     }
@@ -936,6 +978,8 @@ partial class ChartView {
         int cx = x + pad + areaW / 2;
         int cy = top + areaH / 2;
         int sweepMax = 360 * g / 1000;
+        // 起始边顺时针偏移（ECharts startAngle 换算），布局层给出。
+        int rot = layout.rot;
 
         for (int i = 0; i < n; i = i + 1) {
             int a0 = i * 360 / n;
