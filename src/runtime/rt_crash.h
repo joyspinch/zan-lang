@@ -1008,6 +1008,9 @@ __attribute__((constructor)) static void zan__crash_ctor(void) {
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
+/* dladdr: symbolize return addresses when execinfo is absent (musl/BSD).
+ * Needs _GNU_SOURCE on both glibc and musl; the runtime builds define it. */
+#include <dlfcn.h>
 
 static void zan__crash_wr(int fd, const char *s) {
     size_t n = strlen(s);
@@ -1038,6 +1041,52 @@ static const char *zan__crash_hex(unsigned long long v, char *buf) {
     *--p = 'x';
     *--p = '0';
     return p;
+}
+
+/* Print one backtrace line for a code address: "path+base_offset (symbol)"
+ * when dladdr can attribute it, the raw hex otherwise. Safe enough for
+ * crash reporting: dladdr does not malloc for modules already loaded,
+ * which every address in our own image is. */
+static void zan__crash_frame(int fd, void *pc) {
+    char num[24];
+    zan__crash_wr(fd, "  # ");
+    Dl_info di;
+    if (dladdr(pc, &di) && di.dli_fname) {
+        zan__crash_wr(fd, di.dli_fname);
+        zan__crash_wr(fd, "+0x");
+        zan__crash_wr(fd, zan__crash_hex(
+            (unsigned long long)((char *)pc - (char *)di.dli_fbase), num));
+        if (di.dli_sname) {
+            zan__crash_wr(fd, " (");
+            zan__crash_wr(fd, di.dli_sname);
+            zan__crash_wr(fd, ")");
+        }
+    } else {
+        zan__crash_wr(fd, "0x");
+        zan__crash_wr(fd, zan__crash_hex((unsigned long long)(size_t)pc, num));
+    }
+    zan__crash_wr(fd, "\n");
+}
+
+/* Frame-pointer chain walk for libcs without execinfo. Starts at `fp`
+ * (the faulting frame's rbp from the signal context when available),
+ * validating each link: aligned, strictly increasing, within 1 MiB of
+ * the previous frame -- a corrupted or omitted-FP chain ends the walk
+ * instead of producing garbage lines. */
+static int zan__crash_fp_walk(int fd, void **fp) {
+    int n = 0;
+    while (fp && n < 48) {
+        void **next = (void **)fp[0];
+        void *ret = fp[1];
+        if (!ret) break;
+        zan__crash_frame(fd, ret);
+        n++;
+        if ((size_t)next & (sizeof(void *) - 1)) break;
+        if ((size_t)next <= (size_t)fp) break;
+        if ((size_t)next - (size_t)fp > (1u << 20)) break;
+        fp = next;
+    }
+    return n;
 }
 
 static const char *zan__crash_signame(int sig) {
@@ -1185,7 +1234,8 @@ static int zan__crash_logpath_for(const struct tm *tmv, char *out, size_t cap) {
     return (size_t)snprintf(out, cap, "%s/%s.log", dir, day) < cap;
 }
 
-static void zan__crash_record(int fd, int sig, void *addr, const char *stamp) {
+static void zan__crash_record(int fd, int sig, void *addr, const char *stamp,
+                              void *uctx) {
     char num[24];
     zan__crash_wr(fd, "==== ZAN CRASH ");
     zan__crash_wr(fd, stamp);
@@ -1215,13 +1265,33 @@ static void zan__crash_record(int fd, int sig, void *addr, const char *stamp) {
         backtrace_symbols_fd(frames, n, fd);
     }
 #else
-    zan__crash_wr(fd, "backtrace unavailable (no execinfo)\n");
+    /* No execinfo (musl/BSD). The faulting instruction pointer and frame
+     * pointer come from the signal context; the FP walk then covers the
+     * caller chain. Linux x86-64 reads gregs directly; every other target
+     * starts at this handler's own frame -- still enough to attribute the
+     * crash module. */
+#  if defined(__linux__) && defined(__x86_64__)
+    ucontext_t *uc = (ucontext_t *)uctx;
+    if (uc) {
+        void *rip = (void *)uc->uc_mcontext.gregs[REG_RIP];
+        void **rbp = (void **)uc->uc_mcontext.gregs[REG_RBP];
+        zan__crash_wr(fd, "faulting ip:\n");
+        zan__crash_frame(fd, rip);
+        zan__crash_wr(fd, "backtrace (frame-pointer walk):\n");
+        if (!((size_t)rbp & (sizeof(void *) - 1)))
+            zan__crash_fp_walk(fd, rbp);
+        else
+            zan__crash_wr(fd, "  # <frame pointer not preserved>\n");
+    }
+#  else
+    zan__crash_wr(fd, "backtrace (frame-pointer walk from handler):\n");
+    zan__crash_fp_walk(fd, (void **)__builtin_frame_address(0));
+#  endif
 #endif
     zan__crash_wr(fd, "\n");
 }
 
 static void zan__crash_handler(int sig, siginfo_t *info, void *ctx) {
-    (void)ctx;
     void *addr = info ? info->si_addr : NULL;
     /* Local time from the install-time timezone offset: localtime_r and
      * strftime take the tz lock (and read /etc/localtime) and are not
@@ -1272,7 +1342,7 @@ static void zan__crash_handler(int sig, siginfo_t *info, void *ctx) {
      * handler (the record still reaches the crash log below). */
     zan__crash_record(zan__crash_err_fd >= 0 ? zan__crash_err_fd
                                              : STDERR_FILENO,
-                      sig, addr, stamp);
+                      sig, addr, stamp, ctx);
 
     char path[4096];
     if (zan__crash_logpath_for(&lt, path, sizeof path)) {
@@ -1283,7 +1353,7 @@ static void zan__crash_handler(int sig, siginfo_t *info, void *ctx) {
             struct stat a, b;
             int same = fstat(STDERR_FILENO, &a) == 0 && fstat(fd, &b) == 0
                        && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
-            if (!same) zan__crash_record(fd, sig, addr, stamp);
+            if (!same) zan__crash_record(fd, sig, addr, stamp, ctx);
             close(fd);
         }
     }
