@@ -113,11 +113,11 @@ selectedOffset、roseType 两态为 2.2.4 标配（我们的缺口判定不变�
 |---|---|---|
 | 基础 / 环形 donut | 已实现 | innerPct/donutPct/radius:[i,o]；环心总值（:260-267） |
 | 多环嵌套 pieRings | 已实现 | 每可见 Pie 系列一环（PieLayout :66-96） |
-| roseType radius\|area | 部分实现 | DrawRose 不读 roseType（:886-916），两种取值同形 ≈ 'area' 语义且线性半径 |
-| labelLine 引导线 | 未实现 | 标签只有中角百分比与右侧列表（:228-289） |
-| startAngle | 未实现(pie) | 恒从 12 点起（PieLayout :88/:123） |
-| selectedMode 偏移 | 未实现 | 无 |
-| sector 圆角/边框 | 未实现 | FillSector 平边；itemStyle 边框无消费 |
+| roseType radius\|area | 已实现 | radius=角∝占比+半径线性；area=等角+半径∝√值；startAngle 生效，命中按预计算边界+每扇区半径（DrawRose） |
+| labelLine 引导线 | 已实现 | series.label.show 切外置：两段引导线（中角出弧+水平收尾）+名称百分比，色随扇区/label.color |
+| startAngle | 已实现(pie) | 数学角缺省 90=12 点起，PieLayout.rot 同域平移绘制/扫掠/命中/标签 |
+| selectedMode 偏移 | 部分 | data[].selected 静态外偏 selectedOffset；点击切换未做 |
+| sector 圆角/边框 | 部分 | FillSector 平边；itemStyle normal/emphasis 边框已消费，圆角无 |
 
 ## 6. 雷达 radar（ChartViewPolar.zan:27-127）
 

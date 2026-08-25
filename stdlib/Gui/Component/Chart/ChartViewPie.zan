@@ -1013,16 +1013,59 @@ partial class ChartView {
         int cx = x + pad + areaW / 2;
         int cy = top + areaH / 2;
         int sweepMax = 360 * g / 1000;
-        // 起始边顺时针偏移（ECharts startAngle 换算），布局层给出。
-        int rot = layout.rot;
+        // 模式与起始角取自首条可见玫瑰系列：
+        //  radius —— 圆心角 ∝ 数值占比，半径线性于数值；
+        //  area   —— 圆心角均分，半径 ∝ √数值（面积正比于数值）。
+        string mode = "radius";
+        int rot = 0;
+        foreach (ChartSeries rs in o.series) {
+            if (!rs.hidden && rs.type == ChartType.Pie
+                && rs.roseType.Length > 0) {
+                mode = rs.roseType;
+                rot = ((90 - rs.startAngle) % 360 + 360) % 360;
+                break;
+            }
+        }
+
+        // 预计算每扇区 [a0,a1) 与外半径；hover 与绘制共用。
+        List<int> secA0 = new List<int>();
+        List<int> secR = new List<int>();
+        int totalV = 0;
+        foreach (ChartStage st in stages) { totalV = totalV + st.val; }
+        if (totalV < 1) { totalV = 1; }
+        int acc = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int v = stages[i].val;
+            int a0;
+            if (mode == "area") {
+                a0 = i * 360 / n;
+            } else {
+                a0 = acc * 360 / totalV;
+                acc = acc + v;
+            }
+            secA0.Add(a0);
+            int r;
+            if (mode == "area") {
+                r = rMax * ChartView.ISqrt(v * 10000 / maxV) / 100;
+            } else {
+                r = rMax * v / maxV;
+            }
+            if (r < app.Scale(6)) { r = app.Scale(6); }
+            secR.Add(r);
+        }
 
         for (int i = 0; i < n; i = i + 1) {
-            int a0 = i * 360 / n;
-            int a1 = (i + 1) * 360 / n;
-            if (a1 > sweepMax) { a1 = sweepMax; }
-            int r = rMax * stages[i].val / maxV;
-            if (r < app.Scale(6)) { r = app.Scale(6); }
-            if (a1 > a0) { c.FillSector(cx, cy, 0, r, a0, a1, stages[i].color); }
+            int a0 = rot + secA0[i];
+            int a1;
+            if (mode == "area") { a1 = rot + (i + 1) * 360 / n; }
+            else if (i + 1 < n) { a1 = rot + secA0[i + 1]; }
+            else { a1 = rot + 360; }
+            int aEnd = a1;
+            if (aEnd > sweepMax + rot) { aEnd = sweepMax + rot; }
+            int r = secR[i];
+            if (aEnd > a0) {
+                c.FillSector(cx, cy, 0, r, a0, aEnd, stages[i].color);
+            }
         }
 
         int lx = x + w - pad - legendW;
@@ -1047,10 +1090,13 @@ partial class ChartView {
             int ddx = mx - cx;
             int ddy = my - cy;
             int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
-            if (dist <= rMax) {
-                int ang = ChartView.AngleOf(ddx, ddy);
-                int idx = ang * n / 360;
-                if (idx > n - 1) { idx = n - 1; }
+            // 命中：与绘制同域旋转后，按预计算边界与每扇区半径匹配。
+            int angR = ((ChartView.AngleOf(ddx, ddy) - rot) % 360 + 360) % 360;
+            int idx = 0 - 1;
+            for (int q = n - 1; q >= 0; q = q - 1) {
+                if (angR >= secA0[q] && dist <= secR[q]) { idx = q; break; }
+            }
+            if (idx >= 0) {
                 ChartStage st = stages[idx];
                 string nm = st.name;
                 if (nm.Length == 0) { nm = "Item " + Convert.ToString(idx + 1); }
