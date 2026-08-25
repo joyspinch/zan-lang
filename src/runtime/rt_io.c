@@ -367,25 +367,34 @@ int64_t zan_io_socket_send(intptr_t fd, const void *buf, int64_t len,
     if (len <= 0) return len == 0 ? 0 : -2;
     if (len > 0x7FFFFFFF) len = 0x7FFFFFFF;
 #if defined(_WIN32)
-    int _sr = send((SOCKET)fd, (const char *)buf, (int)len, (int)flags);
-    if (_sr == SOCKET_ERROR) {
+    for (;;) {
+        int _sr = send((SOCKET)fd, (const char *)buf, (int)len, (int)flags);
+        if (_sr != SOCKET_ERROR) {
+            IOTRACE("send fd=%lld len=%lld -> %d", (long long)fd, (long long)len, _sr);
+            return (int64_t)_sr;
+        }
         int e = WSAGetLastError();
         IOTRACE("send fd=%lld len=%lld -> ERR err=%d", (long long)fd, (long long)len, e);
         if (e == WSAEWOULDBLOCK) return -1;
+        /* EINTR means nothing was transferred -- retrying cannot duplicate
+         * bytes, and reporting it as fatal (-2) tore down healthy
+         * connections whenever a signal arrived mid-send. */
+        if (e == WSAEINTR) continue;
         return -2;
     }
-    IOTRACE("send fd=%lld len=%lld -> %d", (long long)fd, (long long)len, _sr);
-    return (int64_t)_sr;
 #else
 #if defined(MSG_NOSIGNAL)
     flags |= MSG_NOSIGNAL;   /* a dead peer is a return value, not a signal */
 #endif
-    ssize_t r = send((int)fd, buf, (size_t)len, (int)flags);
-    if (r < 0) {
+    for (;;) {
+        ssize_t r = send((int)fd, buf, (size_t)len, (int)flags);
+        if (r >= 0) return (int64_t)r;
         if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
+        /* Same nothing-transferred guarantee: retry instead of fabricating
+         * a fatal error on signal arrival. */
+        if (errno == EINTR) continue;
         return -2;
     }
-    return (int64_t)r;
 #endif
 }
 
@@ -402,11 +411,6 @@ int64_t zan_io_socket_recv(intptr_t fd, void *buf, int64_t len,
 }
 
 const char *zan_io_socket_peer_ip(intptr_t fd) {
-    /* Thread-local: the --async-workers driver runs connection steps on
-     * several threads, and a process-wide static was formatted concurrently
-     * by unrelated requests (torn / mixed strings). Each thread formats into
-     * its own buffer; callers copy out immediately as before. */
-    static _Thread_local char address[INET6_ADDRSTRLEN];
     struct sockaddr_storage peer;
 #if defined(_WIN32)
     int length = (int)sizeof(peer);
@@ -436,6 +440,41 @@ const char *zan_io_sockaddr_ip_str(const void *sa) {
         return address;
     }
     return "";
+}
+
+/* ---- copy-out variants of the two IP-text helpers above -------------------
+ * The plain const char* returns are ADOPTED by the FFI without a copy
+ * (docs/ABI.md), but their backing storage is per-thread shared state: a
+ * value stored into a managed string before an await silently changed
+ * content after the next call on this worker -- or, under --async-workers,
+ * after fiber migration (UDP reply paths read the peer IP post-await). The
+ * stdlib wrappers now copy into caller-owned storage through these; they
+ * return the text length excluding NUL, or -1 on failure / bad args /
+ * too-small buffer. */
+static int32_t zan_io_ip_copy_out(const char *text, char *buf, int32_t cap) {
+    if (!buf || cap <= 0) return -1;
+    size_t n = strlen(text);
+    if ((size_t)cap <= n) return -1;
+    memcpy(buf, text, n + 1);
+    return (int32_t)n;
+}
+
+int32_t zan_io_socket_peer_ip_into(intptr_t fd, char *buf, int32_t cap) {
+    struct sockaddr_storage peer;
+#if defined(_WIN32)
+    int length = (int)sizeof(peer);
+    if (getpeername((SOCKET)fd, (struct sockaddr *)&peer, &length) != 0)
+        return -1;
+#else
+    socklen_t length = (socklen_t)sizeof(peer);
+    if (getpeername((int)fd, (struct sockaddr *)&peer, &length) != 0)
+        return -1;
+#endif
+    return zan_io_ip_copy_out(zan_io_sockaddr_ip_str(&peer), buf, cap);
+}
+
+int32_t zan_io_sockaddr_ip_str_into(const void *sa, char *buf, int32_t cap) {
+    return zan_io_ip_copy_out(zan_io_sockaddr_ip_str(sa), buf, cap);
 }
 
 /* Resolve `name` (hostname or literal IP) to a complete sockaddr. The port is
@@ -722,6 +761,36 @@ static void io_unlink_waiter(zan_io_slot_t *s, int read_dir,
     free(w);
 }
 
+/* Fail every waiter still parked on this slot (both directions). Used when
+ * the backend refuses to (re-)arm the fd: such waiters are invisible to the
+ * backend AND to the sweep, which only rescues dead fds. recv gets the
+ * end-of-stream shape (0) and accept -1 -- the same contract io_flush_dead
+ * applies when the reactor itself is unusable. Returns how many waiters were
+ * failed (each represented one g_io_count). Shared by the epoll and kqueue
+ * backends (same slot/waiter layout, same dead-delivery contract). */
+static int io_fail_slot_waiters(zan_io_slot_t *s) {
+    int failed = 0;
+    for (int dir = 0; dir < 2; dir++) {
+        unsigned char *has = dir ? &s->has_r : &s->has_w;
+        zan_io_waiter_t *inl = dir ? &s->r : &s->w;
+        if (!*has) continue;
+        io_mark_dead(inl->co, inl->step, inl->out_n, inl->out_accept);
+        failed++;
+        zan_io_waiter_t *x = inl->next;
+        while (x) {
+            zan_io_waiter_t *nx = x->next;
+            io_mark_dead(x->co, x->step, x->out_n, x->out_accept);
+            free(x);
+            failed++;
+            x = nx;
+        }
+        inl->next = NULL;
+        *has = 0;
+    }
+    g_io_count -= failed;
+    return failed;
+}
+
 /* Fail every waiter parked on an fd that has since been closed. Closing an fd
  * removes it from the epoll set without any event, so such waiters are
  * invisible to epoll_wait and would otherwise never be resumed. */
@@ -767,6 +836,9 @@ static int g_epoll_fd = -1;
 void zan_io_init(void) {
     if (g_io_started) return;
     zan_io_ignore_sigpipe();
+    /* A fresh reactor lifetime clears any poison from a failed previous one:
+     * shutdown+re-init is real (schedulers and embedded hosts do it). */
+    g_io_broken = 0;
     g_io_entries = NULL;
     g_io_count = 0;
     g_epoll_fd = epoll_create1(0);
@@ -807,27 +879,39 @@ void zan_io_init(void) {
     if (g_epoll_fd >= 0) { close(g_epoll_fd); g_epoll_fd = -1; }
     if (g_dns_wake_fd >= 0) { close(g_dns_wake_fd); g_dns_wake_fd = -1; }
     g_io_started = 0;
-}static void io_arm(int fd, zan_io_slot_t *s) {
+static int io_arm(int fd, zan_io_slot_t *s) {
     struct epoll_event ev;
     memset(&ev, 0, sizeof(ev));
     ev.data.fd = fd;
     ev.events = EPOLLONESHOT;
     if (s->has_r) ev.events |= EPOLLIN;
     if (s->has_w) ev.events |= EPOLLOUT;
-    if (!s->in_epoll) {
-        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev) == 0) {
-            s->in_epoll = 1;
-        } else if (errno == EEXIST) {
-            epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, fd, &ev);
-            s->in_epoll = 1;
+    /* Returns 1 when armed, 0 when the backend ultimately refused the fd
+     * (EPERM/ENOMEM/... even after EINTR retries). Callers MUST fail the
+     * slot's waiters on 0: a live fd the backend will not report can never
+     * wake them, and the sweep skips live fds -- parking here means forever. */
+    for (int attempt = 0; attempt < 8; attempt++) {
+        if (!s->in_epoll) {
+            if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev) == 0) {
+                s->in_epoll = 1;
+                return 1;
+            }
+            if (errno == EINTR) continue;
+            if (errno == EEXIST) { s->in_epoll = 1; continue; } /* fall to MOD */
+            return 0;
         }
-        return;
+        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, fd, &ev) == 0) return 1;
+        if (errno == EINTR) continue;
+        if (errno == ENOENT) { s->in_epoll = 0; continue; } /* re-add */
+        return 0;
     }
-    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, fd, &ev) != 0 && errno == ENOENT) {
-        /* fd was closed and its number reused: re-add it. */
-        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev) != 0) s->in_epoll = 0;
-    }
-}static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
+    return 0;
+}
+
+    g_io_count -= failed;
+    return failed;
+}
+static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
     if (g_io_broken) {   /* backend never started: fail, don't park forever */
         io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);
         g_pending_rbuf = NULL;
@@ -877,7 +961,15 @@ void zan_io_init(void) {
     g_pending_accept_out = NULL;
     g_io_count++;
 
-    io_arm(fd, s);
+    if (!io_arm(fd, s)) {
+        /* The backend refused this fd even after retries: without an arm,
+         * nothing will ever report it ready and the sweep skips live fds.
+         * Unlink the just-queued waiter and fail it through its own sinks
+         * (recv -> 0, accept -> -1) instead of parking it forever. */
+        io_unlink_waiter(s, interest == ZAN_IO_READ ? 1 : 0, w);
+        g_io_count--;
+        io_mark_dead(co, step, w->out_n, w->out_accept);
+    }
 }
 
 /* One waiter per direction is stored inline in the slot (the common case:
@@ -900,6 +992,12 @@ int32_t zan_io_poll(int64_t timeout_ms) {
         int capped = (wait < 0 || wait > ZAN_IO_SWEEP_MS);
         if (capped) wait = ZAN_IO_SWEEP_MS;
         n = epoll_wait(g_epoll_fd, events, 256, (int)wait);
+        /* n < 0 (EINTR from a stray signal, or a transient backend error) is
+         * NOT quiescence: falling through with 0 would make
+         * zan_co_sched_run_until declare the program finished and drop every
+         * parked coroutine. Fold it into the timeout path, whose housekeeping
+         * passes and loop-exit checks are exactly what a spurious wake needs. */
+        if (n < 0) n = 0;
         if (n != 0) break;
         int w2 = dns_timeout_scan();
         if (w2) return w2;
@@ -932,8 +1030,13 @@ int32_t zan_io_poll(int64_t timeout_ms) {
         if ((ev & EPOLLOUT) || err) nr += io_take(s, fd, 0, ready + nr, 8 - nr);
 
         /* Re-arm before waking: a woken coroutine may register again and the
-         * EPOLLONESHOT arm state must already reflect the remaining waiters. */
-        if (s->has_r || s->has_w) io_arm(fd, s);
+         * EPOLLONESHOT arm state must already reflect the remaining waiters.
+         * If the backend refuses the re-arm, those remaining waiters would
+         * never be reported again -- fail them now (they carry their own
+         * result sinks). */
+        if (s->has_r || s->has_w) {
+            if (!io_arm(fd, s)) io_fail_slot_waiters(s);
+        }
 
         for (int k = 0; k < nr; k++) {
             io_deliver_waiter(fd, &ready[k]);
@@ -953,6 +1056,8 @@ static int g_kq_fd = -1;
 void zan_io_init(void) {
     if (g_io_started) return;
     zan_io_ignore_sigpipe();
+    /* Fresh reactor lifetime: clear any poison from a failed previous one. */
+    g_io_broken = 0;
     g_io_entries = NULL;
     g_io_count = 0;
     g_kq_fd = kqueue();
@@ -1042,29 +1147,35 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
     w->rlen = g_pending_rlen;
     w->out_n = g_pending_out_n;
     w->out_accept = g_pending_accept_out;
-    g_pending_rbuf = NULL;
-    g_pending_out_n = NULL;
-    g_pending_accept_out = NULL;
-    g_io_count++;
-
-    /* EV_ONESHOT arms the fd for one event; the next io_register issues a
-     * fresh EV_ADD, so there is no per-event re-arm bookkeeping. */
-    struct kevent kev;
-    short filter = (interest == ZAN_IO_READ) ? EVFILT_READ : EVFILT_WRITE;
-    EV_SET(&kev, fd, filter, EV_ADD | EV_ONESHOT, 0, 0, NULL);
-    if (kevent(g_kq_fd, &kev, 1, NULL, 0, NULL) != 0) {
-        /* fd was closed or otherwise invalid: fail the waiter so it does not
-         * park forever. Unlink it from the slot FIRST -- io_mark_dead queues
-         * its own delivery, and a waiter still reachable here would let the
-         * sweep wake this same frame a second time (an 8-byte UAF through
-         * *out_n/*out_accept) and leak one g_io_count. */
-        io_unlink_waiter(s, interest == ZAN_IO_READ ? 1 : 0, w);
-        g_io_count--;
-        io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);
+    /* Snapshot the result sinks BEFORE clearing the pending globals: if the
+     * kevent below fails, the waiter must still be failed THROUGH its sinks.
+     * Passing the already-NULL globals made io_flush_dead wake the frame
+     * without writing anything, so the resumed coroutine read its previous
+     * RESULT back as a recv byte count or accepted fd. */
+    {
+        int64_t *fail_out_n = g_pending_out_n;
+        intptr_t *fail_accept = g_pending_accept_out;
         g_pending_rbuf = NULL;
         g_pending_out_n = NULL;
         g_pending_accept_out = NULL;
-        return;
+        g_io_count++;
+
+        /* EV_ONESHOT arms the fd for one event; the next io_register issues a
+         * fresh EV_ADD, so there is no per-event re-arm bookkeeping. */
+        struct kevent kev;
+        short filter = (interest == ZAN_IO_READ) ? EVFILT_READ : EVFILT_WRITE;
+        EV_SET(&kev, fd, filter, EV_ADD | EV_ONESHOT, 0, 0, NULL);
+        if (kevent(g_kq_fd, &kev, 1, NULL, 0, NULL) != 0) {
+            /* fd was closed or otherwise invalid: fail the waiter so it does
+             * not park forever. Unlink it from the slot FIRST -- io_mark_dead
+             * queues its own delivery, and a waiter still reachable here would
+             * let the sweep wake this same frame a second time (an 8-byte UAF
+             * through *out_n/*out_accept) and leak one g_io_count. */
+            io_unlink_waiter(s, interest == ZAN_IO_READ ? 1 : 0, w);
+            g_io_count--;
+            io_mark_dead(co, step, fail_out_n, fail_accept);
+            return;
+        }
     }
 }
 
@@ -1084,6 +1195,12 @@ int32_t zan_io_poll(int64_t timeout_ms) {
         if (capped) wait = ZAN_IO_SWEEP_MS;
         struct timespec ts = { wait / 1000, (wait % 1000) * 1000000L };
         n = kevent(g_kq_fd, NULL, 0, events, 64, &ts);
+        /* n < 0 (EINTR from a stray signal) is NOT quiescence: returning 0
+         * here would make zan_co_sched_run_until declare the program
+         * finished and drop every parked coroutine. Fold it into the timeout
+         * path -- its housekeeping passes and loop-exit checks are exactly
+         * what a spurious wake needs. */
+        if (n < 0) n = 0;
         if (n != 0) break;
         int w2 = dns_timeout_scan();
         if (w2) return w2;
@@ -1124,9 +1241,22 @@ int32_t zan_io_poll(int64_t timeout_ms) {
         if ((events[i].filter == EVFILT_READ && s->has_r) ||
             (events[i].filter == EVFILT_WRITE && s->has_w)) {
             struct kevent rk;
+            int retries;
             EV_SET(&rk, (uintptr_t)fd, events[i].filter,
                    EV_ADD | EV_ONESHOT, 0, 0, NULL);
-            kevent(g_kq_fd, &rk, 1, NULL, 0, NULL);
+            int rearmed = 0;
+            for (retries = 0; retries < 8 && !rearmed; retries++) {
+                if (kevent(g_kq_fd, &rk, 1, NULL, 0, NULL) == 0) rearmed = 1;
+                else if (errno != EINTR) break;
+            }
+            /* A persistent failure with a LIVE fd means those remaining
+             * waiters will never be reported again; fail them through their
+             * own sinks instead of parking them past the end of time. */
+            if (!rearmed &&
+                ((events[i].filter == EVFILT_READ && s->has_r) ||
+                 (events[i].filter == EVFILT_WRITE && s->has_w))) {
+                io_fail_slot_waiters(s);
+            }
         }
         for (int k = 0; k < nr; k++) {
             io_deliver_waiter(fd, &ready[k]);
@@ -1369,9 +1499,15 @@ void zan_io_init(void) {
     if (g_io_started) return;
     zan__crash_install();
     g_io_count = 0;
+    /* Fresh reactor lifetime; and if the port itself cannot be created
+     * (handle exhaustion -- the Windows analogue of EMFILE), mark the
+     * backend broken so every await fails loudly through the dead queue
+     * instead of parking forever with its completion packet going nowhere. */
+    g_io_broken = 0;
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    if (g_iocp == NULL) g_io_broken = 1;
 #if defined(ZAN_CO_DRIVER)
     InitializeSListHead(&g_op_slist);   /* lock-free op pool for the workers */
 #endif
@@ -1436,6 +1572,13 @@ static int io_is_listening(SOCKET s) {
 
 /* Post a zero-byte overlapped op to learn when `fd` is read/write ready. */
 static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
+    if (g_io_broken) {
+        /* Port creation failed: an issued op's completion packet would go
+         * nowhere and park this waiter forever. Readiness waits carry no
+         * result sink, so resuming is the whole failure report. */
+        if (step) zan_co_ready(co, step);
+        return;
+    }
     SOCKET s = (SOCKET)fd;
 
 #if defined(ZAN_CO_DRIVER)
@@ -1532,9 +1675,24 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
 void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
                     zan_co_step_t step, int64_t *out_n) {
     zan_io_init();
+    /* Broken backend (port creation failed): fail with peer-close semantics
+     * instead of issuing an op whose completion packet has nowhere to go. */
+    if (g_io_broken) {
+        if (out_n) *out_n = 0;
+        if (step) zan_co_ready(frame, step);
+        return;
+    }
     SOCKET s = (SOCKET)fd;
     int skip = ensure_assoc(s);
     (void)skip;
+
+    /* A negative or >INT_MAX length would wrap in the WSABUF cast and come
+     * back as WSAEINVAL -- reported as EOF. Reject it explicitly instead. */
+    if (len <= 0 || len > 0x7FFFFFF0) {
+        if (out_n) *out_n = 0;
+        if (step) zan_co_ready(frame, step);
+        return;
+    }
 
     zan_io_op_t *op = op_alloc();
     if (!op) {
@@ -1595,6 +1753,12 @@ void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
 void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
                       intptr_t *out_fd) {
     zan_io_init();
+    /* Broken backend: report a failed accept rather than parking forever. */
+    if (g_io_broken) {
+        if (out_fd) *out_fd = -1;
+        if (step) zan_co_ready(frame, step);
+        return;
+    }
     SOCKET listener = (SOCKET)fd;
     IOTRACE("accept_co ENTER listener=%lld", (long long)fd);
     int skip = ensure_assoc(listener);
@@ -1646,6 +1810,15 @@ void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
     op->out_n = (int64_t *)out_fd;
     op->accepted = accepted;
     op->accept_buf = calloc(1, addr_len * 2);
+    if (!op->accept_buf) {
+        /* AcceptEx would fail cleanly on NULL, but failing the waiter here
+         * with its proper sink keeps the contract explicit. */
+        closesocket(accepted);
+        op_free(op);
+        if (out_fd) *out_fd = -1;
+        if (step) zan_co_ready(frame, step);
+        return;
+    }
     IO_CNT_INC();
 
     got = 0;
@@ -1848,8 +2021,11 @@ int32_t zan_io_poll(int64_t timeout_ms) {
     FD_ZERO(&write_fds);
     int max_fd = 0;
 
-    /* The async-DNS wake pipe read end joins the read set (persistent). */
-    if (g_dns_wake_fd >= 0) {
+    /* The async-DNS wake pipe read end joins the read set (persistent).
+     * FD_SET of an fd >= FD_SETSIZE is UB -- it clobbers adjacent fd_set
+     * storage and select waits on a random bit. Skip the wake fd in that
+     * case: async-DNS completions still arrive via the deadline scan. */
+    if (g_dns_wake_fd >= 0 && g_dns_wake_fd < FD_SETSIZE) {
         FD_SET(g_dns_wake_fd, &read_fds);
         max_fd = g_dns_wake_fd;
     }

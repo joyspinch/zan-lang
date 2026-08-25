@@ -207,8 +207,33 @@ class Socket {
     static extern int NativeResolveSockAddr(string name, int port, byte[] buf, int cap);
 
     // 把 sockaddr 的地址部分格式化为文本（IPv4 点分 / IPv6 冒号十六进制）。
+    // 注意：这两个 *_str 原生返回值按 ABI 是“采纳而非拷贝”，背后是
+    // 线程共享缓冲——存进托管字符串后，同 worker 的下一次调用或
+    // await 迁移都会让内容悄悄变化。跨 await 持有 IP 文本的代码
+    // （WebApp、UDP 回信）必须走下面的 SockAddrIpText/RemoteIp 拷贝封装。
     [DllImport("crt", EntryPoint = "zan_io_sockaddr_ip_str")]
     static extern string NativeSockAddrIp(byte[] sa);
+
+    [DllImport("crt", EntryPoint = "zan_io_sockaddr_ip_str_into")]
+    static extern int NativeSockAddrIpInto(byte[] sa, nint buf, int cap);
+
+    [DllImport("crt", EntryPoint = "zan_io_socket_peer_ip_into")]
+    static extern int NativePeerIpInto(nint sock, nint buf, int cap);
+
+    // 从临时原生缓冲取出拷贝好的地址文本并释放缓冲。
+    static string IpTextFromNative(nint buf, int n) {
+        if (n <= 0) { NativeMemory.Free(buf); return ""; }
+        string s = NativeMemory.GetString(buf, 0, n);
+        NativeMemory.Free(buf);
+        return s;
+    }
+
+    /// <summary>sockaddr → 地址文本（拷贝语义，可安全跨 await 持有）。</summary>
+    static string SockAddrIpText(byte[] sa) {
+        nint buf = NativeMemory.Alloc(64);   // INET6_ADDRSTRLEN 上限
+        if (buf == 0) { return ""; }
+        return IpTextFromNative(buf, NativeSockAddrIpInto(sa, buf, 64));
+    }
 
     [DllImport("crt")]
     static extern long strlen(string str);
@@ -828,7 +853,7 @@ class Socket {
             // 端口在 sockaddr_in / sockaddr_in6 的同一偏移（2），
             // 均为网络字节序；地址文本由 C 端按族格式化。
             lastPeerPort = ((fromAddr[2] & 255) << 8) + (fromAddr[3] & 255);
-            lastPeerIp = Socket.NativeSockAddrIp(fromAddr);
+            lastPeerIp = Socket.SockAddrIpText(fromAddr);
         } else {
             lastPeerPort = 0;
             lastPeerIp = "";
@@ -870,8 +895,14 @@ class Socket {
         return hostname;
     }
 
+    /// <summary>远端 IP 地址文本。拷贝语义：返回的托管字符串拥有自己的
+    /// 字节，不受线程共享格式化缓冲或 await 后协程迁移的影响
+    /// （此前直接采纳原生指针，WebApp 存下 ctx.RemoteIp 后会被
+    /// 下一个连接的调用悄悄改写——限流键因此被污染）。</summary>
     static string RemoteIp(nint sock) {
-        return NativePeerIp(sock);
+        nint buf = NativeMemory.Alloc(64);   // INET6_ADDRSTRLEN 上限
+        if (buf == 0) { return ""; }
+        return IpTextFromNative(buf, NativePeerIpInto(sock, buf, 64));
     }
 
     /// <summary>最近一次失败的套接字系统调用的平台错误码：
