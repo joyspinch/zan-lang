@@ -4,59 +4,28 @@
 # Theme tokens). Widget draw and measure paths must consume the resolved
 # StyleBox fontPx instead of reading Theme fontSize* fields directly.
 #
-# The per-file budget below freezes the current residual outside Widget and
-# requires zero residual reads in stdlib/Gui/Widget. A file with reads that is
-# not listed has an implicit budget of zero.
+# PAID OFF (298 -> 36): every widget/component draw path now consumes
+# Style.FontFallback(app, size) (or a resolved StyleBox), so skins can
+# override type scale from base.css. The only residual reads are the style
+# layer itself (Style.zan implements the fallback funnel, Theme.zan defines
+# the tokens), UiDriver.ThemeJson's palette export for driver self-checks
+# (not a draw path), and two Theme-parameter-injected APIs whose callers pass
+# the theme explicitly (ChartResolved.ResolvedSeries.Of, CodeEditor.FontSize).
+# Widget requires zero; any file with reads that is not listed is implicit zero.
 #
 # Inputs: ROOT (repository root).
 
 cmake_policy(SET CMP0007 NEW)
 
 set(_budget
-  "stdlib/Gui/App.zan=2"
   "stdlib/Gui/Style.zan=14"
   "stdlib/Gui/Theme.zan=15"
   "stdlib/Gui/Backend/UiDriver.zan=5"
-  "stdlib/Gui/Component/ChatView.zan=6"
-  "stdlib/Gui/Component/Dock.zan=2"
-  "stdlib/Gui/Component/FilePicker.zan=13"
-  "stdlib/Gui/Component/LogView.zan=6"
-  "stdlib/Gui/Component/PivotTable.zan=2"
-  "stdlib/Gui/Component/PropertyGrid.zan=2"
-  "stdlib/Gui/Component/SessionList.zan=11"
-  "stdlib/Gui/Component/CefBrowser/CefBrowser.zan=1"
-  "stdlib/Gui/Component/Chart/Chart.zan=9"
-  "stdlib/Gui/Component/Chart/ChartBig.zan=5"
   "stdlib/Gui/Component/Chart/ChartResolved.zan=1"
-  "stdlib/Gui/Component/Chart/ChartView.zan=4"
-  "stdlib/Gui/Component/Chart/ChartViewBar.zan=7"
-  "stdlib/Gui/Component/Chart/ChartViewEventRiver.zan=4"
-  "stdlib/Gui/Component/Chart/ChartViewFinance.zan=3"
-  "stdlib/Gui/Component/Chart/ChartViewHeatmap.zan=4"
-  "stdlib/Gui/Component/Chart/ChartViewHier.zan=8"
-  "stdlib/Gui/Component/Chart/ChartViewMap.zan=1"
-  "stdlib/Gui/Component/Chart/ChartViewPie.zan=22"
-  "stdlib/Gui/Component/Chart/ChartViewPolar.zan=3"
-  "stdlib/Gui/Component/Chart/ChartViewRelation.zan=5"
-  "stdlib/Gui/Component/Chart/ChartViewScatter.zan=3"
-  "stdlib/Gui/Component/Chart/ChartViewShared.zan=5"
-  "stdlib/Gui/Component/Chart/ChartViewVenn.zan=1"
-  "stdlib/Gui/Component/CodeEditor/CodeEditor.Render.zan=24"
-  "stdlib/Gui/Component/CodeEditor/CodeEditor.zan=2"
-  "stdlib/Gui/Component/DataTable/DataTable.Overlays.zan=12"
-  "stdlib/Gui/Component/DataTable/DataTable.FilterUI.zan=15"
-  "stdlib/Gui/Component/WebView/WebView.zan=1"
-  "stdlib/Gui/Designer/Designer.Form.zan=17"
-  "stdlib/Gui/Designer/Designer.Inspector.zan=4"
-  "stdlib/Gui/Designer/Designer.zan=5"
-  "stdlib/Gui/Hmi/Alarm.zan=3"
-  "stdlib/Gui/Hmi/Gauge.zan=3"
-  "stdlib/Gui/Hmi/Indicator.zan=4"
-  "stdlib/Gui/Hmi/NumPad.zan=5"
-  "stdlib/Gui/Hmi/Trend.zan=1"
+  "stdlib/Gui/Component/CodeEditor/CodeEditor.zan=1"
 )
 set(_members "fontSizeTiny|fontSizeSmall|fontSizeMedium|fontSizeLarge|fontSizeHuge")
-set(_total_budget 234)
+set(_total_budget 36)
 file(GLOB_RECURSE _sources "${ROOT}/stdlib/Gui/*.zan")
 
 set(_fail "")
