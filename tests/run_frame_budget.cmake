@@ -80,21 +80,20 @@ foreach(_m RANGE 1 20)
 endforeach()
 file(TO_CMAKE_PATH "${_project}" _project_cmake)
 
-# ZanIDE reads its skin and panel widths from the per-user profile
-# (ZanIDE.UserConfigDir(), i.e. %APPDATA%/ZanIDE), and every pixel budget below
-# depends on both: the same build measured round_kpx 244 under the default skin
-# and 1293 under emerald. So the run gets a profile of its own inside the
-# (wiped) run dir. The values here ARE the calibration surface -- change them
-# only together with a fresh measurement -- and the developer's own profile is
-# never read or written.
-foreach(_dir ZanIDE zan-ide)   # Windows/macOS name, then the XDG one
-  file(MAKE_DIRECTORY "${_profile}/${_dir}")
-  file(WRITE "${_profile}/${_dir}/config.cfg"
-    "treeW=240;bottomH=190;winW=1294;winH=857;autoRun=0;skin=emerald;rightW=600;opacity=100;wallOpacity=100;partialFrames=${PARTIAL_FRAMES};renderBackend=${RENDER_BACKEND};wallpaper=;")
-  # Without this the IDE scaffolds a throwaway sample project under the user's
-  # home on first launch.
-  file(WRITE "${_profile}/${_dir}/lastproject.txt" "${_project_cmake}")
-endforeach()
+# ZanIDE reads its skin and panel widths from its config directory. Since the
+# config moved beside the executable (UserConfigDir = ExeDir/config) the old
+# %APPDATA% location is only a migration SOURCE, never read while the exe-side
+# config exists -- so a fixture written there is silently ignored and the gate
+# ends up measuring whatever settings the developer's own build carries (this
+# exact mismatch once measured whole-window frames at the wrong skin and
+# failed every pixel budget). ZAN_IDE_CONFIG_DIR pins the instance to the run
+# dir: the values here ARE the calibration surface, the developer's own
+# settings are never read or written.
+file(WRITE "${_profile}/config.cfg"
+  "treeW=240;bottomH=190;winW=1294;winH=857;autoRun=0;skin=emerald;rightW=600;opacity=100;wallOpacity=100;partialFrames=${PARTIAL_FRAMES};renderBackend=${RENDER_BACKEND};wallpaper=;")
+# Without this the IDE scaffolds a throwaway sample project under the user's
+# home on first launch.
+file(WRITE "${_profile}/lastproject.txt" "${_project_cmake}")
 file(TO_NATIVE_PATH "${_profile}" _profile_native)
 
 execute_process(
@@ -102,6 +101,7 @@ execute_process(
     "ZAN_FRAME_PROF=1"
     "ZAN_UI_SCRIPT=${_script}"
     "ZAN_UI_OUT=${_uidrv_out}"
+    "ZAN_IDE_CONFIG_DIR=${_profile_native}"
     "APPDATA=${_profile_native}"
     "XDG_CONFIG_HOME=${_profile_native}"
     "${ZANIDE}"
@@ -391,11 +391,17 @@ set(_max_part_render 0)
 set(_max_slow16 0)
 list(LENGTH _frame_indexes _batch_count)
 math(EXPR _steady_start "2")
-if(_batch_count LESS 3)
+# The LAST batch is not steady state either: the driver script ends with
+# freeze + `redraw full` + three pixel dumps, so its tail is whole-window by
+# construction (those forced frames are what the A/B/C pixel comparison
+# snapshots). Counting them here would pin blend/grad/restore to whatever a
+# deliberate full repaint costs and hide every real regression behind it.
+math(EXPR _steady_last "${_batch_count} - 2")
+if(_batch_count LESS 4)
   message(FATAL_ERROR "no steady-state frame batches remain after dropping two")
 endif()
 math(EXPR _last_batch "${_batch_count} - 1")
-foreach(_batch RANGE ${_steady_start} ${_last_batch})
+foreach(_batch RANGE ${_steady_start} ${_steady_last})
   list(GET _frame_indexes ${_batch} _frame_index)
   math(EXPR _raster_index "${_frame_index} + 1")
   if(_raster_index GREATER_EQUAL _line_count)
