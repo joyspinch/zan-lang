@@ -104,7 +104,7 @@ selectedOffset、roseType 两态为 2.2.4 标配（我们的缺口判定不变�
 | 蜡烛 | 已实现 | 影线+实体+大数据分桶（:65-102） |
 | MA 均线叠加 | 已实现 | 折线族覆盖共享价格轴（:38-51,114-133） |
 | 成交量副图 | 未实现 | 单窗格模型，无第二 grid |
-| 涨跌色配置 | 未实现 | upC/dnC 硬编码（:69-70） |
+| 涨跌色配置 | 已实现 | itemStyle.normal color/color0（阳/阴填充）+ lineStyle.color/color0（阳/阴影线），缺省回落内置绿红；十字光标 axisPointer cross（竖线吸附桶中心）随 showTooltip |
 | 十字光标 | 未实现 | 只有悬停 OHLC 卡片（:135-169） |
 
 ## 5. 饼 pie（ChartViewPie.zan）
