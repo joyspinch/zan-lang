@@ -37,6 +37,7 @@
 #include <glob.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -55,7 +56,10 @@
 #endif
 
 #define ZAN_TABLE_MAGIC UINT64_C(0x5a414e54424c3031)
-#define ZAN_TABLE_VERSION 2
+/* Version 3: lock words gained the held-bit + holder-pid encoding below.
+ * Version 2 tables store bare 0/1 words that a version-3 reader would decode
+ * as "held by pid 1" and never reclaim, so old mappings are rejected. */
+#define ZAN_TABLE_VERSION 3
 #define ZAN_TABLE_MAX_COLUMNS 16
 #define ZAN_TABLE_COLUMN_NAME 32
 /* Schema ceilings. The checker rejects a constant width past these where it
@@ -305,32 +309,102 @@ static void zan_make_names(
  * operations per second each. Only slot allocation, delete and clear take it
  * now; reads and writes of an existing row are guarded by that row's own
  * spinlock, so unrelated keys never contend. */
-static void zan_struct_lock(zan_shared_header *header) {
-    for (;;) {
+/* ---- cross-process lock words -------------------------------------------
+ * A lock word is 0 when free; while held, bit 31 is set and bits 30:0 carry
+ * the holding process's id. A plain 0/1 word cannot survive a crashed
+ * holder -- every other process would spin on it forever. With the id in
+ * the word, a waiter that has exhausted its backoff ladder tests whether
+ * the holder still exists (OpenProcess / kill(pid,0)) and reclaims the word
+ * with a CAS when it does not, so a killed writer cannot wedge the table
+ * for every other process attached to it.
+ *
+ * PID truncation can alias a live process; the probe then reports alive and
+ * the waiter keeps spinning. Reclamation is a heuristic safety net, never
+ * the primary mutual-exclusion mechanism: a live holder's word is only ever
+ * cleared by the holder's own release-store of 0. */
+#define ZAN_LOCK_HELD_BIT 0x80000000u
+#define ZAN_LOCK_PID_MASK 0x7FFFFFFFu
+
+static int zan_pid_alive(uint32_t pid) {
+    if (!pid) return 0;
 #ifdef _WIN32
-        if (InterlockedCompareExchange(
-                (volatile LONG *)&header->struct_lock, 1, 0) == 0) {
-            return;
-        }
-        SwitchToThread();
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                           (DWORD)pid);
+    if (!h) return GetLastError() == ERROR_ACCESS_DENIED;
+    int alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+    CloseHandle(h);
+    return alive;
 #else
+    return kill((pid_t)pid, 0) == 0 || errno == EPERM;
+#endif
+}
+
+static void zan_lock_word_acquire(volatile uint32_t *word) {
+#ifdef _WIN32
+    LONG mine = (LONG)(ZAN_LOCK_HELD_BIT |
+                       ((uint32_t)GetCurrentProcessId() & ZAN_LOCK_PID_MASK));
+    for (unsigned spin = 0;; spin++) {
+        if (InterlockedCompareExchange((volatile LONG *)word, mine, 0) == 0)
+            return;
+        if (spin < 64) {
+#if defined(__i386__) || defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+        } else if (spin < 4096 || (spin & 1023u) != 0) {
+            SwitchToThread();
+        } else {
+            LONG held = InterlockedCompareExchange((volatile LONG *)word,
+                                                   0, 0);
+            if ((held & (LONG)ZAN_LOCK_HELD_BIT) &&
+                !zan_pid_alive((uint32_t)held & ZAN_LOCK_PID_MASK)) {
+                InterlockedCompareExchange((volatile LONG *)word, 0, held);
+            }
+            SwitchToThread();
+        }
+    }
+#else
+    uint32_t mine = ZAN_LOCK_HELD_BIT |
+                    ((uint32_t)getpid() & ZAN_LOCK_PID_MASK);
+    for (unsigned spin = 0;; spin++) {
         uint32_t expected = 0;
-        if (__atomic_compare_exchange_n(
-                &header->struct_lock, &expected, 1, 0,
-                __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        if (__atomic_compare_exchange_n(word, &expected, mine, 0,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
             return;
         }
-        sched_yield();
+        if (spin < 64) {
+#if defined(__i386__) || defined(__x86_64__)
+            __builtin_ia32_pause();
 #endif
+        } else if (spin < 4096 || (spin & 1023u) != 0) {
+            sched_yield();
+        } else {
+            uint32_t held = __atomic_load_n(word, __ATOMIC_RELAXED);
+            if ((held & ZAN_LOCK_HELD_BIT) &&
+                !zan_pid_alive(held & ZAN_LOCK_PID_MASK)) {
+                __atomic_compare_exchange_n(word, &held, 0, 0,
+                                            __ATOMIC_RELEASE,
+                                            __ATOMIC_RELAXED);
+            }
+            sched_yield();
+        }
     }
+#endif
+}
+
+static void zan_lock_word_release(volatile uint32_t *word) {
+#ifdef _WIN32
+    InterlockedExchange((volatile LONG *)word, 0);
+#else
+    __atomic_store_n(word, 0, __ATOMIC_RELEASE);
+#endif
+}
+
+static void zan_struct_lock(zan_shared_header *header) {
+    zan_lock_word_acquire(&header->struct_lock);
 }
 
 static void zan_struct_unlock(zan_shared_header *header) {
-#ifdef _WIN32
-    InterlockedExchange((volatile LONG *)&header->struct_lock, 0);
-#else
-    __atomic_store_n(&header->struct_lock, 0, __ATOMIC_RELEASE);
-#endif
+    zan_lock_word_release(&header->struct_lock);
 }
 
 /* Resolves a key to its row, claiming a slot when `create` is set. The lookup
@@ -411,33 +485,30 @@ static char *zan_row_key(unsigned char *row) {
     return (char *)(row + ZAN_SLOT_PREFIX);
 }
 
+/* Re-validate a resolved row after acquiring its lock. Between the lock-free
+ * lookup and the row lock another process can tombstone the slot (delete or
+ * expiry) and a third can claim it for a DIFFERENT key -- without this check
+ * a suspended writer commits its value into the new owner's row. Key-based
+ * callers pass the key and compare bytes exactly as zan_find_row does;
+ * hash-keyed (_at) callers pass key=NULL and rely on the 64-bit hash. A 0
+ * return means "the row I resolved no longer exists": callers fail the
+ * operation (0 / empty / -1), which is what racing a concurrent delete means. */
+static int zan_row_revalidate(
+    unsigned char *row, uint64_t hash, const char *key, uint32_t key_size) {
+    if (zan_load_state(row) != ZAN_SLOT_USED) return 0;
+    if (*zan_row_hash(row) != hash) return 0;
+    if (key &&
+        strncmp((const char *)zan_row_key(row), key, key_size) != 0)
+        return 0;
+    return 1;
+}
+
 static void zan_row_lock(unsigned char *row) {
-    uint32_t *lock = zan_row_lock_word(row);
-    for (;;) {
-#ifdef _WIN32
-        if (InterlockedCompareExchange(
-                (volatile LONG *)lock, 1, 0) == 0) {
-            return;
-        }
-        SwitchToThread();
-#else
-        uint32_t expected = 0;
-        if (__atomic_compare_exchange_n(
-                lock, &expected, 1, 0,
-                __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-            return;
-        }
-        sched_yield();
-#endif
-    }
+    zan_lock_word_acquire(zan_row_lock_word(row));
 }
 
 static void zan_row_unlock(unsigned char *row) {
-#ifdef _WIN32
-    InterlockedExchange((volatile LONG *)zan_row_lock_word(row), 0);
-#else
-    __atomic_store_n(zan_row_lock_word(row), 0, __ATOMIC_RELEASE);
-#endif
+    zan_lock_word_release(zan_row_lock_word(row));
 }
 
 static void zan_expiry_swap(zan_shared_header *header, uint64_t a, uint64_t b) {
@@ -543,7 +614,11 @@ static void zan_purge_expired_locked(zan_shared_header *header, int64_t now_ms) 
         if (*zan_row_expires_at(row) > now_ms) break;
         zan_row_lock(row);
         zan_expiry_remove(header, row);
-        memset(row, 0, header->row_stride);
+        /* Wipe the payload but keep word 4 -- it IS this thread's lock:
+         * zeroing it lets another process acquire the row mid-purge and
+         * write into memory being erased. State is republished last so a
+         * lock-free lookup never sees content whose state disagrees. */
+        memset(row + 8, 0, header->row_stride - 8);
         zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
         header->count--;
         zan_row_unlock(row);
@@ -1096,6 +1171,41 @@ static int zan_table_layout_of(
     return 1;
 }
 
+/* Re-derive the geometry a header claims from its own fields. open/attach
+ * validate magic/version/ready but used to trust capacity, row_stride,
+ * key_size and column_count blindly afterwards -- and every operation
+ * derives addresses from them. One stray write to a shared header (buggy
+ * writer, torn multi-word update, hostile co-process mapping the same name)
+ * then sent zan_row_at or zan_find_column far outside the mapping. */
+static int zan_header_geometry_ok(const zan_shared_header *header) {
+    if (header->capacity == 0 ||
+        header->capacity > ZAN_TABLE_MAX_CAPACITY ||
+        (header->capacity & (header->capacity - 1)) != 0)
+        return 0;   /* power of two, probed with & mask everywhere */
+    if (header->key_size == 0 || header->key_size > ZAN_TABLE_MAX_KEY)
+        return 0;
+    if (header->column_count > ZAN_TABLE_MAX_COLUMNS)
+        return 0;
+    size_t rows_offset = zan_align8(sizeof(zan_shared_header));
+    size_t min_stride = zan_align8(ZAN_SLOT_PREFIX + (size_t)header->key_size);
+    if (header->row_stride < min_stride)
+        return 0;
+    for (uint32_t i = 0; i < header->column_count; i++) {
+        const zan_shared_column *c = &header->columns[i];
+        if (c->type != ZAN_TABLE_INT && c->type != ZAN_TABLE_STRING &&
+            c->type != ZAN_TABLE_FLOAT)
+            return 0;
+        if (c->size == 0 ||
+            (uint64_t)c->offset + c->size > header->row_stride)
+            return 0;
+    }
+    uint64_t expected =
+        (uint64_t)rows_offset +
+        header->capacity * (uint64_t)header->row_stride +
+        header->capacity * sizeof(uint64_t);
+    return expected == header->total_size;
+}
+
 /* Stamps the header of a freshly mapped table and publishes it. */
 static void zan_table_init_header(
     zan_shared_table *table, const zan_table_layout *layout) {
@@ -1285,7 +1395,8 @@ int64_t zan_shared_table_attach(int64_t os_handle) {
         table->header->magic != ZAN_TABLE_MAGIC ||
         table->header->version != ZAN_TABLE_VERSION ||
         table->header->total_size < sizeof(zan_shared_header) ||
-        table->header->total_size > table->mapped_size) {
+        table->header->total_size > table->mapped_size ||
+        !zan_header_geometry_ok(table->header)) {
         zan_shared_table_free(table);
         return 0;
     }
@@ -1430,7 +1541,8 @@ int64_t zan_shared_table_open(const char *name) {
     if (table->header->ready != 1 ||
         table->header->magic != ZAN_TABLE_MAGIC ||
         table->header->version != ZAN_TABLE_VERSION ||
-        table->header->total_size < sizeof(zan_shared_header)) {
+        table->header->total_size < sizeof(zan_shared_header) ||
+        !zan_header_geometry_ok(table->header)) {
         zan_shared_table_free(table);
         return 0;
     }
@@ -1592,6 +1704,11 @@ int32_t zan_shared_table_set_int(
     unsigned char *row = column ? zan_row_for(table->header, key, 1) : NULL;
     if (!row) return 0;
     zan_row_lock(row);
+    if (!zan_row_revalidate(row, zan_hash_bytes(key), key,
+                            table->header->key_size)) {
+        zan_row_unlock(row);
+        return 0;
+    }
     memcpy(row + column->offset, &value, sizeof(value));
     zan_row_unlock(row);
     return 1;
@@ -1607,6 +1724,11 @@ int64_t zan_shared_table_get_int(
     unsigned char *row = column ? zan_row_for(table->header, key, 0) : NULL;
     if (!row) return 0;
     zan_row_lock(row);
+    if (!zan_row_revalidate(row, zan_hash_bytes(key), key,
+                            table->header->key_size)) {
+        zan_row_unlock(row);
+        return 0;
+    }
     memcpy(&value, row + column->offset, sizeof(value));
     zan_row_unlock(row);
     return value;
@@ -1621,6 +1743,11 @@ int32_t zan_shared_table_set_float(
     unsigned char *row = column ? zan_row_for(table->header, key, 1) : NULL;
     if (!row) return 0;
     zan_row_lock(row);
+    if (!zan_row_revalidate(row, zan_hash_bytes(key), key,
+                            table->header->key_size)) {
+        zan_row_unlock(row);
+        return 0;
+    }
     memcpy(row + column->offset, &value, sizeof(value));
     zan_row_unlock(row);
     return 1;
@@ -1636,6 +1763,11 @@ double zan_shared_table_get_float(
     unsigned char *row = column ? zan_row_for(table->header, key, 0) : NULL;
     if (!row) return 0.0;
     zan_row_lock(row);
+    if (!zan_row_revalidate(row, zan_hash_bytes(key), key,
+                            table->header->key_size)) {
+        zan_row_unlock(row);
+        return 0.0;
+    }
     memcpy(&value, row + column->offset, sizeof(value));
     zan_row_unlock(row);
     return value;
@@ -1654,6 +1786,11 @@ int32_t zan_shared_table_set_string(
             : NULL;
     if (!row) return 0;
     zan_row_lock(row);
+    if (!zan_row_revalidate(row, zan_hash_bytes(key), key,
+                            table->header->key_size)) {
+        zan_row_unlock(row);
+        return 0;
+    }
     char *destination = (char *)(row + column->offset);
     memset(destination, 0, column->size);
     memcpy(destination, value, value_len);
@@ -1672,10 +1809,14 @@ const char *zan_shared_table_get_string(
     unsigned char *row = column ? zan_row_for(table->header, key, 0) : NULL;
     if (!row) return result;
     zan_row_lock(row);
-    size_t max_len = column->size - 1u;
-    size_t len = zan_strnlen((const char *)(row + column->offset), max_len);
-    memcpy(result, row + column->offset, len);
-    result[len] = '\0';
+    size_t max_len = 0;
+    if (zan_row_revalidate(row, zan_hash_bytes(key), key,
+                           table->header->key_size)) {
+        max_len = column->size - 1u;
+        size_t len = zan_strnlen((const char *)(row + column->offset), max_len);
+        memcpy(result, row + column->offset, len);
+        result[len] = '\0';
+    }
     zan_row_unlock(row);
     return result;
 }
@@ -1690,6 +1831,11 @@ int64_t zan_shared_table_increment(
     unsigned char *row = column ? zan_row_for(table->header, key, 1) : NULL;
     if (!row) return 0;
     zan_row_lock(row);
+    if (!zan_row_revalidate(row, zan_hash_bytes(key), key,
+                            table->header->key_size)) {
+        zan_row_unlock(row);
+        return 0;
+    }
     memcpy(&value, row + column->offset, sizeof(value));
     value += delta;
     memcpy(row + column->offset, &value, sizeof(value));
@@ -1748,6 +1894,10 @@ int32_t zan_shared_table_set_int_at(
         column ? zan_row_for_hash(table->header, (uint64_t)key_hash, 1) : NULL;
     if (!row) return 0;
     zan_row_lock(row);
+    if (!zan_row_revalidate(row, (uint64_t)key_hash, NULL, 0)) {
+        zan_row_unlock(row);
+        return 0;
+    }
     memcpy(row + column->offset, &value, sizeof(value));
     zan_row_unlock(row);
     return 1;
@@ -1764,6 +1914,10 @@ int64_t zan_shared_table_get_int_at(
         column ? zan_row_for_hash(table->header, (uint64_t)key_hash, 0) : NULL;
     if (!row) return 0;
     zan_row_lock(row);
+    if (!zan_row_revalidate(row, (uint64_t)key_hash, NULL, 0)) {
+        zan_row_unlock(row);
+        return 0;
+    }
     memcpy(&value, row + column->offset, sizeof(value));
     zan_row_unlock(row);
     return value;
@@ -1780,6 +1934,10 @@ int64_t zan_shared_table_increment_at(
         column ? zan_row_for_hash(table->header, (uint64_t)key_hash, 1) : NULL;
     if (!row) return 0;
     zan_row_lock(row);
+    if (!zan_row_revalidate(row, (uint64_t)key_hash, NULL, 0)) {
+        zan_row_unlock(row);
+        return 0;
+    }
     memcpy(&value, row + column->offset, sizeof(value));
     value += delta;
     memcpy(row + column->offset, &value, sizeof(value));
@@ -1803,6 +1961,10 @@ int64_t zan_shared_table_extreme_at(
         column ? zan_row_for_hash(table->header, (uint64_t)key_hash, 1) : NULL;
     if (!row) return 0;
     zan_row_lock(row);
+    if (!zan_row_revalidate(row, (uint64_t)key_hash, NULL, 0)) {
+        zan_row_unlock(row);
+        return 0;
+    }
     memcpy(&stored, row + column->offset, sizeof(stored));
     int replace = keep_larger ? (value > stored) : (stored == 0 || value < stored);
     if (replace) {
@@ -1827,6 +1989,10 @@ int32_t zan_shared_table_set_string_at(
             : NULL;
     if (!row) return 0;
     zan_row_lock(row);
+    if (!zan_row_revalidate(row, (uint64_t)key_hash, NULL, 0)) {
+        zan_row_unlock(row);
+        return 0;
+    }
     char *destination = (char *)(row + column->offset);
     memset(destination, 0, column->size);
     memcpy(destination, value, value_len);
@@ -1846,10 +2012,13 @@ const char *zan_shared_table_get_string_at(
         column ? zan_row_for_hash(table->header, (uint64_t)key_hash, 0) : NULL;
     if (!row) return result;
     zan_row_lock(row);
-    size_t max_len = column->size - 1u;
-    size_t len = zan_strnlen((const char *)(row + column->offset), max_len);
-    memcpy(result, row + column->offset, len);
-    result[len] = '\0';
+    size_t max_len = 0;
+    if (zan_row_revalidate(row, (uint64_t)key_hash, NULL, 0)) {
+        max_len = column->size - 1u;
+        size_t len = zan_strnlen((const char *)(row + column->offset), max_len);
+        memcpy(result, row + column->offset, len);
+        result[len] = '\0';
+    }
     zan_row_unlock(row);
     return result;
 }
@@ -1869,8 +2038,10 @@ int32_t zan_shared_table_match_at(
         column ? zan_find_row_hash(table->header, (uint64_t)key_hash, 0) : NULL;
     if (!row) return 0;
     zan_row_lock(row);
-    int equal = strncmp(
-        (const char *)(row + column->offset), text, column->size) == 0;
+    int equal = 0;
+    if (zan_row_revalidate(row, (uint64_t)key_hash, NULL, 0))
+        equal = strncmp(
+            (const char *)(row + column->offset), text, column->size) == 0;
     zan_row_unlock(row);
     return equal ? 1 : 0;
 }
@@ -1892,7 +2063,8 @@ int32_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash) {
     if (row) {
         zan_row_lock(row);
         zan_expiry_remove(table->header, row);
-        memset(row, 0, table->header->row_stride);
+        /* Keep the lock word we hold (offset 4): see zan_purge_expired_locked */
+        memset(row + 8, 0, table->header->row_stride - 8);
         zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
         table->header->count--;
         zan_row_unlock(row);
@@ -1933,7 +2105,10 @@ int64_t zan_shared_table_expires_at(int64_t handle, const char *key) {
     unsigned char *row = zan_find_row(table->header, key, 0);
     if (!row) return -1;
     zan_row_lock(row);
-    int64_t expires_at = *zan_row_expires_at(row);
+    int64_t expires_at = -1;
+    if (zan_row_revalidate(row, zan_hash_bytes(key), key,
+                           table->header->key_size))
+        expires_at = *zan_row_expires_at(row);
     zan_row_unlock(row);
     return expires_at;
 }
@@ -2042,7 +2217,9 @@ int32_t zan_shared_table_lock_release(
         memcpy(&current_owner, row + owner_column->offset, sizeof(current_owner));
         if (current_owner == owner) {
             zan_expiry_remove(table->header, row);
-            memset(row, 0, table->header->row_stride);
+            /* Keep the lock word we hold (offset 4): see
+             * zan_purge_expired_locked. */
+            memset(row + 8, 0, table->header->row_stride - 8);
             zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
             table->header->count--;
             released = 1;
@@ -2062,7 +2239,8 @@ int32_t zan_shared_table_delete(int64_t handle, const char *key) {
     if (row) {
         zan_row_lock(row);
         zan_expiry_remove(table->header, row);
-        memset(row, 0, table->header->row_stride);
+        /* Keep the lock word we hold (offset 4): see zan_purge_expired_locked */
+        memset(row + 8, 0, table->header->row_stride - 8);
         zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
         table->header->count--;
         zan_row_unlock(row);
@@ -2088,16 +2266,36 @@ int64_t zan_shared_table_count(int64_t handle) {
 void zan_shared_table_clear(int64_t handle) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return;
+    /* Clear row by row under each row's own lock. The previous version took
+     * and immediately released every row lock and then wiped the whole row
+     * area under only the structural lock -- but value writers never take
+     * the structural lock, so a set that acquired its row lock after the
+     * walk returned success and then had its value erased by the memset:
+     * an acknowledged write silently lost. Holding each row's lock across
+     * its own wipe makes clear serialize against writers per row. The
+     * structural lock is still taken so slot claims and expiry mutations
+     * cannot interleave with the sweep. */
     zan_struct_lock(table->header);
-    size_t rows_offset = zan_align8(sizeof(*table->header));
     for (uint64_t i = 0; i < table->header->capacity; i++) {
         unsigned char *row = zan_row_at(table->header, i);
+        uint32_t state = zan_load_state(row);
+        if (state == ZAN_SLOT_EMPTY) continue;   /* untouched page: skip */
         zan_row_lock(row);
+        if (zan_load_state(row) != ZAN_SLOT_EMPTY) {
+            /* Keep the lock word we hold (offset 4); see
+             * zan_purge_expired_locked for why word 4 must survive. A
+             * tombstone row is already all-zero by invariant, so only USED
+             * rows need the payload wipe. */
+            if (zan_load_state(row) == ZAN_SLOT_USED)
+                memset(row + 8, 0, table->header->row_stride - 8);
+            zan_publish_state(row, ZAN_SLOT_EMPTY);
+        }
         zan_row_unlock(row);
     }
-    memset(
-        (unsigned char *)table->header + rows_offset, 0,
-        table->mapped_size - rows_offset);
+    /* The expiry heap sits behind the row area; every mutation of it holds
+     * the structural lock, which we hold, so a wholesale reset is safe. */
+    memset(zan_expiry_heap(table->header), 0,
+           (size_t)table->header->capacity * sizeof(uint64_t));
     table->header->count = 0;
     table->header->expiry_count = 0;
     zan_struct_unlock(table->header);
