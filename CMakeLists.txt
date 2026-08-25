@@ -1559,6 +1559,16 @@ add_test(NAME gui_theme_font_budget
 set_tests_properties(gui_theme_font_budget PROPERTIES
   LABELS "full;standard;smoke;gui;perf")
 
+# ---- Policy: widget draw paths must not gain raw 0xAARRGGBB literals ----
+# The semantic-color budget above cannot see a color spelled as a hex literal;
+# this one can. Native-interop flag files are skipped outright, and every
+# frozen budget line documents why its literal is not a skin color.
+add_test(NAME policy_raw_color_budget
+  COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_raw_color_budget.cmake)
+set_tests_properties(policy_raw_color_budget PROPERTIES
+  LABELS "full;standard;smoke;gui;perf")
+
 # ---- Performance: retained-mode IDE frame budget ----
 # Requires the separately-built ZanIDE executable and a desktop session.
 if(WIN32 AND EXISTS "${CMAKE_BINARY_DIR}/ZanIDE.exe")
