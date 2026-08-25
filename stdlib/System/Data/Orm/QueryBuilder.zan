@@ -32,19 +32,14 @@ class SetClause {
 /// 仿 FreeSQL 的流式 SQL 查询构建器。
 /// 支持通过方法链执行 SELECT、INSERT、UPDATE、DELETE。
 ///
-/// 用法：
-///   QueryBuilder qb = QueryBuilder.From("users");
-///   string sql = qb.Where("age > 18").OrderBy("name").Limit(10).BuildSelect("*");
-///
-///   string insertSql = QueryBuilder.InsertInto("users")
-///       .Set("name", "Alice").Set("age", "30").BuildInsert();
-///
-///   string updateSql = QueryBuilder.Update("users")
-///       .Set("name", "Bob").Where("id = 1").BuildUpdate();
-///
-/// 参数化模式（推荐——值永远不会进入 SQL 文本）：
-///   QueryBuilder qb = QueryBuilder.From("users").WhereEq("name", name);
+/// 用法（全部走 `?` 占位符 + DbParams——值永远不会进入 SQL 文本，
+/// 由 DbConnection 以驱动级参数绑定上线）：
+///   QueryBuilder qb = QueryBuilder.From("users").WhereEq("age", 18);
 ///   DbResult r = db.Query(qb.BuildSelectParams("*"), qb.SelectParams());
+///
+///   string sql = QueryBuilder.InsertInto("users")
+///       .Set("name", "Alice").BuildInsertParams();
+///   db.Execute(sql, qb.InsertParams());
 ///
 /// 标识符（表、列、ORDER BY / GROUP BY 目标）会按
 /// [A-Za-z_][A-Za-z0-9_.]* 校验；非法标识符抛出 Exception。
@@ -407,9 +402,64 @@ class QueryBuilder {
     // 访问器，将两者一起传给支持参数化的驱动重载，例如
     //   db.Query(qb.BuildSelectParams("*"), qb.SelectParams())
 
+    /// <summary>把 JOIN/WHERE/GROUP BY/HAVING/ORDER BY/LIMIT/OFFSET
+    /// 子句追加到 sb（占位符原样保留，参数由调用方随 SQL 一起传）。</summary>
+    void AppendClauses(StringBuilder sb) {
+        if (this.joinClause.Length > 0) {
+            sb.Append(this.joinClause);
+        }
+        if (this.whereClause.Length > 0) {
+            sb.Append(" WHERE ");
+            sb.Append(this.whereClause);
+        }
+        if (this.groupByClause.Length > 0) {
+            sb.Append(" GROUP BY ");
+            sb.Append(this.groupByClause);
+        }
+        if (this.havingClause.Length > 0) {
+            sb.Append(" HAVING ");
+            sb.Append(this.havingClause);
+        }
+        if (this.orderByClause.Length > 0) {
+            sb.Append(" ORDER BY ");
+            sb.Append(this.orderByClause);
+        }
+        if (this.dialect == SqlDialect.Standard) {
+            if (this.limitVal >= 0) {
+                sb.Append(" LIMIT ");
+                sb.Append(Convert.ToString(this.limitVal));
+            }
+            if (this.offsetVal >= 0) {
+                sb.Append(" OFFSET ");
+                sb.Append(Convert.ToString(this.offsetVal));
+            }
+        } else {
+            // SQL Server / Oracle：OFFSET m ROWS FETCH NEXT n ROWS ONLY。
+            if (this.offsetVal >= 0 || this.limitVal >= 0) {
+                int off = this.offsetVal;
+                if (off < 0) { off = 0; }
+                sb.Append(" OFFSET ");
+                sb.Append(Convert.ToString(off));
+                sb.Append(" ROWS");
+                if (this.limitVal >= 0) {
+                    sb.Append(" FETCH NEXT ");
+                    sb.Append(Convert.ToString(this.limitVal));
+                    sb.Append(" ROWS ONLY");
+                }
+            }
+        }
+    }
+
     /// <summary>构建带 `?` 占位符的 SELECT（参见 SelectParams()）。</summary>
     string BuildSelectParams(string columns) {
-        return BuildSelect(columns, true);
+        StringBuilder sb = new StringBuilder();
+        sb.Append("SELECT ");
+        if (this.distinct) { sb.Append("DISTINCT "); }
+        sb.Append(columns);
+        sb.Append(" FROM ");
+        sb.Append(this.tableName);
+        AppendClauses(sb);
+        return sb.ToString();
     }
 
     /// <summary>BuildSelectParams / BuildDeleteParams 的参数。</summary>
@@ -494,167 +544,11 @@ class QueryBuilder {
         return sb.ToString();
     }
 
-    // ===== 旧版字符串构建器 =====
-    // 保留给尚不能绑定参数的调用方；WhereEq/WhereIn/... 产生的
-    // WHERE 占位符会经过加引号 + 转义后内联回 SQL。
-
-    /// <summary>构建 SELECT 查询（旧版：参数内联）。</summary>
-    string BuildSelect(string columns) {
-        return BuildSelect(columns, false);
-    }
-
-    string BuildSelect(string columns, bool keepPlaceholders) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("SELECT ");
-        if (this.distinct) { sb.Append("DISTINCT "); }
-        sb.Append(columns);
-        sb.Append(" FROM ");
-        sb.Append(this.tableName);
-        AppendClauses(sb);
-        if (keepPlaceholders) { return sb.ToString(); }
-        return InlineParams(sb.ToString(), this.whereParams);
-    }
-
-    /// <summary>构建 SELECT COUNT 查询。</summary>
-    string BuildCount() {
-        return BuildSelect("COUNT(*)");
-    }
-
-    /// <summary>构建 INSERT 查询。</summary>
-    string BuildInsert() {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("INSERT INTO ");
-        sb.Append(this.tableName);
-        sb.Append(" (");
-
-        bool first = true;
-        foreach (SetClause s in this.sets) {
-            if (!first) { sb.Append(", "); }
-            sb.Append(s.column);
-            first = false;
-        }
-        sb.Append(") VALUES (");
-
-        first = true;
-        foreach (SetClause s in this.sets) {
-            if (!first) { sb.Append(", "); }
-            sb.Append("'");
-            sb.Append(EscapeString(s.val));
-            sb.Append("'");
-            first = false;
-        }
-        sb.Append(")");
-        return sb.ToString();
-    }
-
-    /// <summary>构建 UPDATE 查询。</summary>
-    string BuildUpdate() {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("UPDATE ");
-        sb.Append(this.tableName);
-        sb.Append(" SET ");
-
-        bool first = true;
-        foreach (SetClause s in this.sets) {
-            if (!first) { sb.Append(", "); }
-            sb.Append(s.column);
-            sb.Append(" = '");
-            sb.Append(EscapeString(s.val));
-            sb.Append("'");
-            first = false;
-        }
-
-        if (this.whereClause.Length > 0) {
-            sb.Append(" WHERE ");
-            sb.Append(this.whereClause);
-        }
-        return InlineParams(sb.ToString(), this.whereParams);
-    }
-
-    /// <summary>构建 DELETE 查询（旧版：参数内联）。</summary>
-    string BuildDelete() {
-        return InlineParams(BuildDeleteParams(), this.whereParams);
-    }
-
-    // --- 内部辅助函数 ---
-
-    /// <summary>将 `?` 占位符（引号字面量之外）替换为
-    /// 带引号、已转义的参数值，供旧版纯字符串执行使用。</summary>
-    static string InlineParams(string sql, DbParams prms) {
-        if (prms.Count() == 0) { return sql; }
-        StringBuilder sb = new StringBuilder();
-        int n = sql.Length;
-        int next = 0;
-        bool inQuote = false;
-        for (int i = 0; i < n; i = i + 1) {
-            int c = sql[i] & 255;
-            if (c == 39) {                       // '
-                inQuote = !inQuote;
-                sb.Append("'");
-            } else if (c == 63 && !inQuote && next < prms.Count()) {   // ?
-                if (prms.IsNull(next)) {
-                    sb.Append("NULL");
-                } else {
-                    sb.Append("'");
-                    sb.Append(EscapeString(prms.AsText(next)));
-                    sb.Append("'");
-                }
-                next = next + 1;
-            } else {
-                sb.Append(sql.Substring(i, 1));
-            }
-        }
-        return sb.ToString();
-    }
-
-    void AppendClauses(StringBuilder sb) {
-        if (this.joinClause.Length > 0) {
-            sb.Append(this.joinClause);
-        }
-        if (this.whereClause.Length > 0) {
-            sb.Append(" WHERE ");
-            sb.Append(this.whereClause);
-        }
-        if (this.groupByClause.Length > 0) {
-            sb.Append(" GROUP BY ");
-            sb.Append(this.groupByClause);
-        }
-        if (this.havingClause.Length > 0) {
-            sb.Append(" HAVING ");
-            sb.Append(this.havingClause);
-        }
-        if (this.orderByClause.Length > 0) {
-            sb.Append(" ORDER BY ");
-            sb.Append(this.orderByClause);
-        }
-        if (this.dialect == SqlDialect.Standard) {
-            if (this.limitVal >= 0) {
-                sb.Append(" LIMIT ");
-                sb.Append(Convert.ToString(this.limitVal));
-            }
-            if (this.offsetVal >= 0) {
-                sb.Append(" OFFSET ");
-                sb.Append(Convert.ToString(this.offsetVal));
-            }
-        } else {
-            // SQL Server / Oracle：OFFSET m ROWS FETCH NEXT n ROWS ONLY。
-            if (this.offsetVal >= 0 || this.limitVal >= 0) {
-                int off = this.offsetVal;
-                if (off < 0) { off = 0; }
-                sb.Append(" OFFSET ");
-                sb.Append(Convert.ToString(off));
-                sb.Append(" ROWS");
-                if (this.limitVal >= 0) {
-                    sb.Append(" FETCH NEXT ");
-                    sb.Append(Convert.ToString(this.limitVal));
-                    sb.Append(" ROWS ONLY");
-                }
-            }
-        }
-    }
-
-    /// <summary>转义字符串中的单引号以确保 SQL 安全。</summary>
-    static string EscapeString(string val) {
+    /// <summary>DDL 字面量转义（单引号加倍）。只允许用于
+    /// CREATE TABLE 的 DEFAULT 子句这类无法参数化的位置——
+    /// 所有 DML 一律走 `?` + DbParams 驱动级绑定，
+    /// 不要用本方法拼接查询值。</summary>
+    static string EscapeDdlLiteral(string val) {
         StringBuilder sb = new StringBuilder();
         int len = val.Length;
         for (int i = 0; i < len; i = i + 1) {
@@ -667,4 +561,5 @@ class QueryBuilder {
         }
         return sb.ToString();
     }
+
 }

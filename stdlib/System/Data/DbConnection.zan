@@ -87,6 +87,14 @@ class DbConnection : IDbConnection {
     [DllImport("odbc32")]
     static extern int SQLPrepare(nint stmt, string sql, int textLength);
 
+    /// <summary>真参数绑定：值经驱动以数据形式上线，永不拼回
+    /// SQL 文本——注入与转义方言问题在此一并消失。
+    /// 常量：1=SQL_PARAM_INPUT，1=SQL_C_CHAR，12=SQL_VARCHAR。</summary>
+    [DllImport("odbc32")]
+    static extern int SQLBindParameter(nint stmt, int ipar, int ptype, int ctype,
+        int sqltype, long colDef, int scale, string valuePtr, long valueMax,
+        byte[] indPtr);
+
     [DllImport("odbc32")]
     static extern int SQLExecute(nint stmt);
 
@@ -131,6 +139,12 @@ class DbConnection : IDbConnection {
 
     [DllImport("odbc")]
     static extern int SQLPrepare(nint stmt, string sql, int textLength);
+
+    /// <summary>同上：POSIX 侧 odbc 驱动管理器的真参数绑定。</summary>
+    [DllImport("odbc")]
+    static extern int SQLBindParameter(nint stmt, int ipar, int ptype, int ctype,
+        int sqltype, long colDef, int scale, string valuePtr, long valueMax,
+        byte[] indPtr);
 
     [DllImport("odbc")]
     static extern int SQLExecute(nint stmt);
@@ -424,9 +438,53 @@ class DbConnection : IDbConnection {
         return affected;
     }
 
+    /// <summary>把 prms 绑定为 ODBC 输入参数。全部按 SQL_C_CHAR /
+    /// SQL_VARCHAR 以数据形式传输（类型由列侧隐式转换），NULL 用
+    /// 指示符 SQL_NULL_DATA(-1) 表达。值与指示符缓冲必须活到
+    /// SQLExecute 完成之后——ARC 不移动对象，地址稳定，但引用
+    /// 断了内存就没了；调用方持有 keepAlive 列表跨过 await。
+    /// 返回绑定的参数个数，失败返回 -1。</summary>
+    int BindParams(nint stmt, DbParams prms, List<string> keepValues,
+                   List<byte[]> keepInds) {
+        int n = prms.Count();
+        for (int i = 0; i < n; i = i + 1) {
+            string v = prms.IsNull(i) ? "" : prms.AsText(i);
+            byte[] ind = new byte[8];
+            if (prms.IsNull(i)) {
+                for (int b = 0; b < 8; b = b + 1) { ind[b] = 255; }
+            }
+            keepValues.Add(v);
+            keepInds.Add(ind);
+            int rc = SQLBindParameter(stmt, i + 1,
+                1,          // SQL_PARAM_INPUT
+                1,          // SQL_C_CHAR
+                12,         // SQL_VARCHAR
+                v.Length > 0 ? v.Length : 1,
+                0,          // ibScale
+                v,
+                v.Length,
+                ind);
+            if (!OdbcSuccess(rc)) {
+                this.lastError = "SQLBindParameter failed";
+                return -1;
+            }
+        }
+        return n;
+    }
+
     /// <summary>执行非查询语句。SQLPrepare carries the managed SQL string
-    /// synchronously; handle-only SQLExecute crosses the blocking boundary.</summary>
+    /// synchronously; handle-only SQLExecute crosses the blocking boundary.
+    /// 带 prms 时走真参数绑定：占位符就是 ODBC 原生的 `?`，
+    /// 不再做任何文本内联。</summary>
     async int ExecuteAsync(string sql) {
+        return await this.ExecuteCoreAsync(sql, null);
+    }
+
+    async int ExecuteAsync(string sql, DbParams prms) {
+        return await this.ExecuteCoreAsync(sql, prms);
+    }
+
+    async int ExecuteCoreAsync(string sql, DbParams prms) {
         if (!this.connected) { return -1; }
         nint stmt = AllocStmt();
         if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; return -1; }
@@ -435,6 +493,15 @@ class DbConnection : IDbConnection {
             this.lastError = "SQLPrepare failed";
             SQLFreeHandle(3, stmt);
             return -1;
+        }
+        // 缓冲活到 await 之后：驱动在 SQLExecute 期间读取。
+        List<string> keepValues = new List<string>();
+        List<byte[]> keepInds = new List<byte[]>();
+        if (prms != null && prms.Count() > 0) {
+            if (this.BindParams(stmt, prms, keepValues, keepInds) < 0) {
+                SQLFreeHandle(3, stmt);
+                return -1;
+            }
         }
         int erc = await SQLExecute(stmt);
         if (!OdbcSuccess(erc)) {
@@ -451,11 +518,94 @@ class DbConnection : IDbConnection {
         return affected;
     }
 
-    async int ExecuteAsync(string sql, DbParams prms) {
-        return await this.ExecuteAsync(InlineParams(sql, prms));
+    /// <summary>执行查询并返回结果集。带 prms 时走真参数绑定
+    /// （见 ExecuteCoreAsync）。</summary>
+    async DbResult QueryAsync(string sql) {
+        return await this.QueryCoreAsync(sql, null);
     }
 
-    /// <summary>执行查询并返回结果集。</summary>
+    async DbResult QueryAsync(string sql, DbParams prms) {
+        return await this.QueryCoreAsync(sql, prms);
+    }
+
+    async DbResult QueryCoreAsync(string sql, DbParams prms) {
+        if (!this.connected) { return DbResult.Empty(); }
+        DbResult result = new DbResult();
+        nint stmt = AllocStmt();
+        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; return result; }
+        int rc = SQLPrepare(stmt, sql, -3);   // SQL_NTS
+        if (!OdbcSuccess(rc)) {
+            this.lastError = "SQLPrepare failed";
+            SQLFreeHandle(3, stmt);
+            return result;
+        }
+        List<string> keepValues = new List<string>();
+        List<byte[]> keepInds = new List<byte[]>();
+        if (prms != null && prms.Count() > 0) {
+            if (this.BindParams(stmt, prms, keepValues, keepInds) < 0) {
+                SQLFreeHandle(3, stmt);
+                return result;
+            }
+        }
+        int erc = await SQLExecute(stmt);
+        if (!OdbcSuccess(erc)) {
+            this.lastError = "SQLExecute failed";
+            SQLFreeStmt(stmt, 0);
+            SQLFreeHandle(3, stmt);
+            return result;
+        }
+        byte[] pcc = new byte[4];
+        SQLNumResultCols(stmt, pcc);
+        int colCount = Int16FromBuf(pcc);
+        result.SetColumnCount(colCount);
+
+        int c = 0;
+        for (; c < colCount; c = c + 1) {
+            byte[] nameBuf = new byte[256];
+            byte[] pNameLen = new byte[4];
+            byte[] pType = new byte[4];
+            byte[] pSize = new byte[8];
+            byte[] pDec = new byte[4];
+            byte[] pNull = new byte[4];
+            SQLDescribeCol(stmt, c + 1, nameBuf, 256, pNameLen, pType, pSize, pDec, pNull);
+            result.AddColumnName(BufToString(nameBuf, 256));
+        }
+
+        // SQL_SUCCESS = 0, SQL_SUCCESS_WITH_INFO = 1, SQL_NO_DATA = 100.
+        int fr = await SQLFetch(stmt);
+        while (fr == 0 || fr == 1) {
+            List<string> row = new List<string>();
+            List<bool> nulls = new List<bool>();
+            c = 0;
+            while (c < colCount) {
+                byte[] buf = new byte[4096];
+                byte[] pInd = new byte[8];
+                int g = SQLGetData(stmt, c + 1, 1, buf, 4096, pInd);
+                // SQL_NULL_DATA = -1：指示缓冲由驱动填写，此前从未读过，
+                // NULL 被不可逆地压成 ""，IsNull() 永远不触发。
+                bool isNull = g == 100
+                    || ((pInd[0] & 255) == 255 && (pInd[1] & 255) == 255
+                        && (pInd[2] & 255) == 255 && (pInd[3] & 255) == 255);
+                if (isNull) {
+                    nulls.Add(true);
+                    row.Add("");
+                } else {
+                    nulls.Add(false);
+                    row.Add(BufToString(buf, 4096));
+                }
+                c = c + 1;
+            }
+            result.AddRowNulls(row, nulls);
+            fr = await SQLFetch(stmt);
+        }
+
+        SQLFreeStmt(stmt, 0);        // SQL_CLOSE
+        SQLFreeHandle(3, stmt);
+        return result;
+    }
+
+    /// <summary>同步查询（阻塞调用线程——服务端代码请改用
+    /// QueryAsync）。SQLExecDirect 直发，无参数版本。</summary>
     DbResult Query(string sql) {
         if (!this.connected) { return DbResult.Empty(); }
         DbResult result = new DbResult();
@@ -486,7 +636,6 @@ class DbConnection : IDbConnection {
             result.AddColumnName(BufToString(nameBuf, 256));
         }
 
-        // SQL_SUCCESS = 0, SQL_SUCCESS_WITH_INFO = 1, SQL_NO_DATA = 100.
         int fr = SQLFetch(stmt);
         while (fr == 0 || fr == 1) {
             List<string> row = new List<string>();
@@ -496,8 +645,6 @@ class DbConnection : IDbConnection {
                 byte[] buf = new byte[4096];
                 byte[] pInd = new byte[8];
                 int g = SQLGetData(stmt, c + 1, 1, buf, 4096, pInd);
-                // SQL_NULL_DATA = -1：指示缓冲由驱动填写，此前从未读过，
-                // NULL 被不可逆地压成 ""，IsNull() 永远不触发。
                 bool isNull = g == 100
                     || ((pInd[0] & 255) == 255 && (pInd[1] & 255) == 255
                         && (pInd[2] & 255) == 255 && (pInd[3] & 255) == 255);
@@ -517,74 +664,6 @@ class DbConnection : IDbConnection {
         SQLFreeStmt(stmt, 0);        // SQL_CLOSE
         SQLFreeHandle(3, stmt);
         return result;
-    }
-
-    /// <summary>执行查询。SQLPrepare carries the managed SQL string
-    /// synchronously; handle-only SQLExecute and SQLFetch are offloaded.</summary>
-    async DbResult QueryAsync(string sql) {
-        if (!this.connected) { return DbResult.Empty(); }
-        DbResult result = new DbResult();
-        nint stmt = AllocStmt();
-        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; return result; }
-        int rc = SQLPrepare(stmt, sql, -3);   // SQL_NTS
-        if (!OdbcSuccess(rc)) {
-            this.lastError = "SQLPrepare failed";
-            SQLFreeHandle(3, stmt);
-            return result;
-        }
-        int erc = await SQLExecute(stmt);
-        if (!OdbcSuccess(erc)) {
-            this.lastError = "SQLExecute failed";
-            SQLFreeStmt(stmt, 0);
-            SQLFreeHandle(3, stmt);
-            return result;
-        }
-        byte[] pcc = new byte[4];
-        SQLNumResultCols(stmt, pcc);
-        int colCount = Int16FromBuf(pcc);
-        result.SetColumnCount(colCount);
-        int c = 0;
-        for (; c < colCount; c = c + 1) {
-            byte[] nameBuf = new byte[256];
-            byte[] pNameLen = new byte[4];
-            byte[] pType = new byte[4];
-            byte[] pSize = new byte[8];
-            byte[] pDec = new byte[4];
-            byte[] pNull = new byte[4];
-            SQLDescribeCol(stmt, c + 1, nameBuf, 256, pNameLen, pType, pSize, pDec, pNull);
-            result.AddColumnName(BufToString(nameBuf, 256));
-        }
-        int fr = await SQLFetch(stmt);
-        while (fr == 0 || fr == 1) {
-            List<string> row = new List<string>();
-            List<bool> nulls = new List<bool>();
-            c = 0;
-            while (c < colCount) {
-                byte[] buf = new byte[4096];
-                byte[] pInd = new byte[8];
-                int g = SQLGetData(stmt, c + 1, 1, buf, 4096, pInd);
-                bool isNull = g == 100
-                    || ((pInd[0] & 255) == 255 && (pInd[1] & 255) == 255
-                        && (pInd[2] & 255) == 255 && (pInd[3] & 255) == 255);
-                if (isNull) {
-                    nulls.Add(true);
-                    row.Add("");
-                } else {
-                    nulls.Add(false);
-                    row.Add(BufToString(buf, 4096));
-                }
-                c = c + 1;
-            }
-            result.AddRowNulls(row, nulls);
-            fr = await SQLFetch(stmt);
-        }
-        SQLFreeStmt(stmt, 0);
-        SQLFreeHandle(3, stmt);
-        return result;
-    }
-
-    async DbResult QueryAsync(string sql, DbParams prms) {
-        return await QueryAsync(InlineParams(sql, prms));
     }
 
     /// <summary>执行标量查询（以字符串形式返回第一行第一列）。</summary>
@@ -677,60 +756,116 @@ class DbConnection : IDbConnection {
         return this.provider;
     }
 
-    /// <summary>执行带参数的非查询语句。ODBC 路径没有
-    /// 统一的参数绑定接口，因此 `?` 占位符在执行前经加引号和转义
-    /// 后内联进 SQL。</summary>
+    /// <summary>执行带参数的非查询语句（同步）。真参数绑定，
+    /// 与异步路径一致——`?` 是 ODBC 原生占位符，值以数据形式
+    /// 上线，不再有任何文本内联。</summary>
     int Execute(string sql, DbParams prms) {
-        return Execute(InlineParams(sql, prms));
+        if (!this.connected) { return -1; }
+        nint stmt = AllocStmt();
+        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; return -1; }
+        int rc = SQLPrepare(stmt, sql, -3);
+        if (!OdbcSuccess(rc)) {
+            this.lastError = "SQLPrepare failed";
+            SQLFreeHandle(3, stmt);
+            return -1;
+        }
+        List<string> keepValues = new List<string>();
+        List<byte[]> keepInds = new List<byte[]>();
+        if (prms != null && prms.Count() > 0) {
+            if (this.BindParams(stmt, prms, keepValues, keepInds) < 0) {
+                SQLFreeHandle(3, stmt);
+                return -1;
+            }
+        }
+        int erc = SQLExecute(stmt);
+        if (!OdbcSuccess(erc)) {
+            this.lastError = "SQLExecute failed";
+            SQLFreeStmt(stmt, 0);
+            SQLFreeHandle(3, stmt);
+            return -1;
+        }
+        byte[] pRows = new byte[8];
+        SQLRowCount(stmt, pRows);
+        int affected = (int)HandleFromBuf(pRows);
+        SQLFreeStmt(stmt, 0);
+        SQLFreeHandle(3, stmt);
+        return affected;
     }
 
-    /// <summary>执行带参数的查询（ODBC 路径上参数的绑定方式
-    /// 参见 Execute 重载）。</summary>
+    /// <summary>执行带参数的查询（同步）。真参数绑定，取数逻辑与
+    /// 无参 Query 共用同一形状。</summary>
     DbResult Query(string sql, DbParams prms) {
-        return Query(InlineParams(sql, prms));
-    }
+        if (!this.connected) { return DbResult.Empty(); }
+        DbResult result = new DbResult();
+        nint stmt = AllocStmt();
+        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; return result; }
 
-    /// <summary>将 `?` 占位符（引号字面量之外的）替换为
-    /// 加引号并转义后的参数值。</summary>
-    static string InlineParams(string sql, DbParams prms) {
-        if (prms.Count() == 0) { return sql; }
-        StringBuilder sb = new StringBuilder();
-        int n = sql.Length;
-        int next = 0;
-        bool inQuote = false;
-        for (int i = 0; i < n; i = i + 1) {
-            int c = sql[i] & 255;
-            if (c == 39) {                       // '
-                inQuote = !inQuote;
-                sb.Append("'");
-            } else if (c == 63 && !inQuote && next < prms.Count()) {   // ?
-                if (prms.IsNull(next)) {
-                    sb.Append("NULL");
+        int rc = SQLPrepare(stmt, sql, -3);
+        if (!OdbcSuccess(rc)) {
+            this.lastError = "SQLPrepare failed";
+            SQLFreeHandle(3, stmt);
+            return result;
+        }
+        List<string> keepValues = new List<string>();
+        List<byte[]> keepInds = new List<byte[]>();
+        if (prms != null && prms.Count() > 0) {
+            if (this.BindParams(stmt, prms, keepValues, keepInds) < 0) {
+                SQLFreeHandle(3, stmt);
+                return result;
+            }
+        }
+        int erc = SQLExecute(stmt);
+        if (!OdbcSuccess(erc)) {
+            this.lastError = "SQLExecute failed";
+            SQLFreeStmt(stmt, 0);
+            SQLFreeHandle(3, stmt);
+            return result;
+        }
+
+        byte[] pcc = new byte[4];
+        SQLNumResultCols(stmt, pcc);
+        int colCount = Int16FromBuf(pcc);
+        result.SetColumnCount(colCount);
+
+        int c = 0;
+        for (; c < colCount; c = c + 1) {
+            byte[] nameBuf = new byte[256];
+            byte[] pNameLen = new byte[4];
+            byte[] pType = new byte[4];
+            byte[] pSize = new byte[8];
+            byte[] pDec = new byte[4];
+            byte[] pNull = new byte[4];
+            SQLDescribeCol(stmt, c + 1, nameBuf, 256, pNameLen, pType, pSize, pDec, pNull);
+            result.AddColumnName(BufToString(nameBuf, 256));
+        }
+
+        int fr = SQLFetch(stmt);
+        while (fr == 0 || fr == 1) {
+            List<string> row = new List<string>();
+            List<bool> nulls = new List<bool>();
+            c = 0;
+            while (c < colCount) {
+                byte[] buf = new byte[4096];
+                byte[] pInd = new byte[8];
+                int g = SQLGetData(stmt, c + 1, 1, buf, 4096, pInd);
+                bool isNull = g == 100
+                    || ((pInd[0] & 255) == 255 && (pInd[1] & 255) == 255
+                        && (pInd[2] & 255) == 255 && (pInd[3] & 255) == 255);
+                if (isNull) {
+                    nulls.Add(true);
+                    row.Add("");
                 } else {
-                    sb.Append("'");
-                    sb.Append(EscapeSqlString(prms.AsText(next)));
-                    sb.Append("'");
+                    nulls.Add(false);
+                    row.Add(BufToString(buf, 4096));
                 }
-                next = next + 1;
-            } else {
-                sb.Append(sql.Substring(i, 1));
+                c = c + 1;
             }
+            result.AddRowNulls(row, nulls);
+            fr = SQLFetch(stmt);
         }
-        return sb.ToString();
-    }
 
-    /// <summary>转义字符串中的单引号以保证 SQL 安全。</summary>
-    static string EscapeSqlString(string val) {
-        StringBuilder sb = new StringBuilder();
-        int len = val.Length;
-        for (int i = 0; i < len; i = i + 1) {
-            string ch = val.Substring(i, 1);
-            if (ch == "'") {
-                sb.Append("''");
-            } else {
-                sb.Append(ch);
-            }
-        }
-        return sb.ToString();
+        SQLFreeStmt(stmt, 0);        // SQL_CLOSE
+        SQLFreeHandle(3, stmt);
+        return result;
     }
 }
