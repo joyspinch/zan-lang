@@ -1830,6 +1830,16 @@ typedef struct zan_blocking_job {
 typedef struct zan_dns_work {
     zan_blocking_job_t job;
     char hostname[256];     /* NUL-terminated copy for the worker thread */
+    /* Resolved sockaddr staged here by the worker thread. resolve_sa jobs
+     * must NOT write job.sabuf directly: past the deadline the reactor flags
+     * the job, wakes the destination frame with a failure, and that frame can
+     * complete and be freed while this thread is still blocked inside
+     * getaddrinfo -- a late direct copy would be a cross-thread UAF write.
+     * Instead the reactor copies staging -> sabuf in dns_drain, under
+     * dns_lock, while the destination frame is still parked. Timed-out jobs
+     * never reach dns_drain (the worker discards them), so the sink is only
+     * ever written for a lookup that is being delivered. */
+    unsigned char sa_staging[sizeof(struct sockaddr_in6)];
 } zan_dns_work_t;
 
 static zan_blocking_job_t *g_blocking_pending; /* in flight, owned by workers */
@@ -1993,11 +2003,19 @@ static void blocking_submit(zan_blocking_job_t *job) {
 
 static void dns_job_run(zan_blocking_job_t *job) {
     zan_dns_work_t *w = (zan_dns_work_t *)job;
-    if (w->job.sabuf)
+    if (w->job.sabuf) {
+        /* Resolve into the job-local staging buffer, never into sabuf (see
+         * the comment on sa_staging): the frame this sink points into may be
+         * woken and freed the moment the deadline passes, while this thread
+         * is still inside getaddrinfo. */
+        int32_t cap = w->job.sacap;
+        if (cap < 0 || cap > (int32_t)sizeof w->sa_staging)
+            cap = (int32_t)sizeof w->sa_staging;
         w->job.result = zan_io_resolve_sa(w->hostname, w->job.port,
-                                          w->job.sabuf, w->job.sacap);
-    else
+                                          w->sa_staging, cap);
+    } else {
         w->job.result = zan_io_resolve_ipv4(w->hostname);
+    }
 }
 
 /* Milliseconds until the earliest in-flight lookup times out, or caller_ms if
@@ -2111,6 +2129,19 @@ static int dns_drain(void) {
         zan_blocking_job_t *n = j->next;
         if (j->out) *j->out = (int32_t)j->result;
         if (j->out64) *j->out64 = j->result;
+        /* resolve_sa jobs staged their sockaddr in the work item; copy it
+         * into the caller's sink here, on the reactor thread, before the
+         * frame is woken. result > 0 implies len <= sacap: dns_job_run
+         * resolved against the sink capacity. Timed-out jobs are discarded
+         * by their worker and never appear on this list, so the sink --
+         * an interior pointer into the destination frame -- is guaranteed
+         * still valid here. The staging write happened-before this read via
+         * the worker's dns_lock handoff in blocking_finish_worker. */
+        if (j->sabuf && j->result > 0) {
+            size_t len = (size_t)j->result;
+            if (len <= (size_t)j->sacap)
+                memcpy(j->sabuf, ((zan_dns_work_t *)j)->sa_staging, len);
+        }
         io_wake(j->frame, j->step);
         free(j);
         woke++;
@@ -3084,11 +3115,21 @@ static void co_run(zan_co_worker_t *w, zan_co_task *t) {
 }
 
 /* Dispatch due Delay and public timers; return ms until the next deadline.
- * Serialized to one worker and throttled pool-wide to ~1ms (see
- * g_timer_owner); a caller that skips the pump gets the cached deadline,
- * floored at 1ms so "a timer is due right now" cannot turn into a spin while
- * another worker is dispatching it. */
+ * zan_timer_dispatch_due is serialized to one worker pool-wide via the
+ * g_timer_owner gate taken here -- the gate MUST cover every caller: the
+ * timer's g_dispatching slot holds exactly one in-flight callback, so a
+ * second concurrent dispatcher makes clear-from-callback miss the running
+ * entry and a cancelled tick timer fires again. A caller that cannot become
+ * the owner still needs a deadline to park on, so it reports the live heap
+ * head without dispatching; the owner refreshes g_timer_next_ms when it
+ * finishes. */
 static long long co_pump_timers_now(void) {
+    if (InterlockedCompareExchange(&g_timer_owner, 1, 0) != 0) {
+        long long live = zan_timer_next_timeout();
+        if (live > 0) return live;
+        long long cached = g_timer_next_ms;
+        return (cached <= 0) ? 1 : cached;
+    }
     /* Count the pump as running work. Dispatching a Delay pops its entry from
      * the timer heap before the ready hook queues the coroutine, and in that
      * window the pool has no timer pending, no queued frame and no running
@@ -3100,19 +3141,18 @@ static long long co_pump_timers_now(void) {
     g_timer_next_ms = next;
     g_timer_pumped_ms = co_now_ms();
     InterlockedDecrement(&g_co_running);
+    InterlockedExchange(&g_timer_owner, 0);
     return next;
 }
 
 static long long co_pump_timers(void) {
     long long now = co_now_ms();
-    if (now - g_timer_pumped_ms < 1 ||
-        InterlockedCompareExchange(&g_timer_owner, 1, 0) != 0) {
-        long long cached = g_timer_next_ms;
-        return (cached == 0) ? 1 : cached;
-    }
-    long long next = co_pump_timers_now();
-    InterlockedExchange(&g_timer_owner, 0);
-    return next;
+    /* Throttled pool-wide to ~1ms: while the pump ran recently every caller
+     * reuses the cached deadline so the timer lock stays cold on busy loops. */
+    if (now - g_timer_pumped_ms >= 1)
+        return co_pump_timers_now();
+    long long cached = g_timer_next_ms;
+    return (cached == 0) ? 1 : cached;
 }
 
 /* Block on the completion port, re-readying coroutines whose IO completed.
