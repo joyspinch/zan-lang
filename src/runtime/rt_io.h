@@ -120,6 +120,13 @@ void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
 void zan_io_resolve_co(const char *hostname, void *frame, zan_co_step_t step,
                        int32_t *out);
 
+/* Run one scalar-only native call away from the reactor.  The worker invokes
+ * fn(a0..a[argc-1]) exactly once, stores its int64 result in *out, and
+ * re-readies frame through step.  A NULL out denotes a void native call. */
+void zan_rt_blocking_co(void *fn, int32_t argc,
+                        int64_t a0, int64_t a1, int64_t a2, int64_t a3,
+                        void *frame, zan_co_step_t step, int64_t *out);
+
 /* Idle bridge for the stackless scheduler: if IO watchers are pending, block
  * until at least one fires (readying its frame via zan_co_ready) and return the
  * number woken; otherwise return 0. Wire into the co driver with

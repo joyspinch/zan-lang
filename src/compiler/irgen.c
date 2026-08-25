@@ -1250,6 +1250,15 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->rt_io_resolve_sa_co_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), sa_args, 7, 0);
         g->rt_io_resolve_sa_co = LLVMAddFunction(g->mod, "zan_io_resolve_sa_co",
             g->rt_io_resolve_sa_co_type);
+        LLVMTypeRef fnptr = i8ptr;
+        LLVMTypeRef argc_t = i32d;
+        LLVMTypeRef blocking_args[] = { fnptr, argc_t, i64d, i64d, i64d,
+                                        i64d, i8ptr, g->co_step_ptr,
+                                        LLVMPointerType(i64d, 0) };
+        g->rt_blocking_co_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                                   blocking_args, 9, 0);
+        g->rt_blocking_co = LLVMAddFunction(g->mod, "zan_rt_blocking_co",
+                                            g->rt_blocking_co_type);
         LLVMTypeRef pump_args[] = { i64d };
         g->rt_io_pump_timeout_type = LLVMFunctionType(i32d, pump_args, 1, 0);
         g->rt_io_pump_timeout = LLVMAddFunction(g->mod, "zan_io_pump_timeout",

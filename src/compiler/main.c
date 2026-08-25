@@ -2760,10 +2760,9 @@ int main(int argc, char **argv) {
         char rt_timer_buf[1200];
         char rt_mem_buf[1200];
 
-        /* Socket-async programs (await Socket.ReadReady/WriteReady) link the
-         * readiness reactor object shipped with zanc; it provides zan_io_wait_co
-         * and the strong zan_io_pump_timeout that overrides the program's weak
-         * timer-only fallback. */
+        /* IO-await programs link the rt_io object shipped with zanc. It
+         * provides socket readiness, generic blocking jobs, and the strong
+         * zan_io_pump_timeout that overrides the timer-only fallback. */
         const char *rt_io_obj = NULL;
 #ifdef ZAN_RT_IO_OBJ
         if (irgen.uses_socket_async) {

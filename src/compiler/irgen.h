@@ -527,11 +527,15 @@ struct zan_irgen {
     LLVMValueRef rt_io_resolve_co; /* void zan_io_resolve_co(i8* host,i8* frame,step,i32* out) */
     LLVMTypeRef  rt_io_resolve_co_type;
     LLVMValueRef rt_io_resolve_sa_co; /* void zan_io_resolve_sa_co(i8* name,i32 port,
-                                         i8* buf,i32 cap,i8* frame,step,i32* out) */
+                                          i8* buf,i32 cap,i8* frame,step,i32* out) */
     LLVMTypeRef  rt_io_resolve_sa_co_type;
+    LLVMValueRef rt_blocking_co;       /* void zan_rt_blocking_co(fn,argc,a0..a3,
+                                           frame,step,out) */
+    LLVMTypeRef  rt_blocking_co_type;
     LLVMValueRef rt_io_pump_timeout;      /* i32 zan_io_pump_timeout(i64 timeout_ms) */
     LLVMTypeRef  rt_io_pump_timeout_type;
-    bool         uses_socket_async; /* set when a socket await is lowered */
+    /* rt_io.o provides socket readiness and generic blocking-await jobs. */
+    bool         uses_socket_async; /* set when either IO await is lowered */
     bool         uses_timer_runtime; /* set by Timer API externs */
     bool         uses_sync_runtime; /* set by AtomicInt/SharedTable externs */
     bool         uses_file_runtime; /* set by zan_file_* (file IO) externs */

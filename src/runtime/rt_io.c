@@ -129,17 +129,17 @@ static int g_io_started;
 
 /* ---- async hostname resolution (shared by all backends) ----
  * zan_io_resolve_co runs the lookup on a worker thread so the reactor never
- * blocks on the resolver. The worker parks the result in g_dns_done and pokes
+ * blocks on the resolver. The worker parks the result in g_blocking_done and pokes
  * the backend's wake fd (eventfd/pipe on POSIX, a NULL-overlapped IOCP packet
  * on Windows); the next zan_io_poll drains the list, stores each result into
- * its frame's RESULT slot and re-readies the frame. g_dns_inflight counts
- * lookups whose completion has not yet been delivered, so the scheduler keeps
- * polling while one is outstanding (zan_io_has_pending). A lookup still in
+ * its frame's RESULT slot and re-readies the frame. g_blocking_inflight counts
+ * jobs whose completion has not yet been delivered, so the scheduler keeps
+ * polling while one is outstanding (zan_io_has_pending). A DNS lookup still in
  * flight past ZAN_DNS_TIMEOUT_MS is delivered as a failure by the reactor
  * (dns_timeout_scan); the worker then discards its result. The machinery
  * itself lives in the coroutine-facing ABI section at the bottom; these are
  * the pieces the platform backends must see. */
-static int32_t g_dns_inflight;
+static int32_t g_blocking_inflight;
 static int32_t g_dns_wake_fd = -1;    /* reactor-visible wake fd (POSIX) */
 #if !defined(__linux__) && !defined(_WIN32)
 static int32_t g_dns_wake_wfd = -1;   /* pipe write end (kqueue/select) */
@@ -819,7 +819,7 @@ void zan_io_init(void) {
 
 int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_dead) return io_flush_dead();
-    if (g_io_count == 0 && g_dns_inflight == 0) return 0;
+    if (g_io_count == 0 && g_blocking_inflight == 0) return 0;
     /* A waiter whose fd was closed under it is invisible to the backend, so it
      * is the sweep below -- reached when the (now bounded) wait times out --
      * that keeps it from becoming a hang. Sweeping before every wait instead
@@ -841,7 +841,7 @@ int32_t zan_io_poll(int64_t timeout_ms) {
         if (w4) return w4;
         /* A wait shortened only to schedule the sweep has not expired for the
          * caller: keep waiting rather than report "nothing to wait for". */
-        if (!capped || (g_io_count == 0 && g_dns_inflight == 0)) return 0;
+        if (!capped || (g_io_count == 0 && g_blocking_inflight == 0)) return 0;
         if (timeout_ms >= 0) return 0;
     }
     int woke = 0;
@@ -988,7 +988,7 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
 
 int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_dead) return io_flush_dead();
-    if (g_io_count == 0 && g_dns_inflight == 0) return 0;
+    if (g_io_count == 0 && g_blocking_inflight == 0) return 0;
     /* A waiter whose fd was closed under it is invisible to the backend, so it
      * is the sweep below -- reached when the (now bounded) wait times out --
      * that keeps it from becoming a hang. Sweeping before every wait instead
@@ -1011,7 +1011,7 @@ int32_t zan_io_poll(int64_t timeout_ms) {
         if (w4) return w4;
         /* A wait shortened only to schedule the sweep has not expired for the
          * caller: keep waiting rather than report "nothing to wait for". */
-        if (!capped || (g_io_count == 0 && g_dns_inflight == 0)) return 0;
+        if (!capped || (g_io_count == 0 && g_blocking_inflight == 0)) return 0;
         if (timeout_ms >= 0) return 0;
     }
     int woke = 0;
@@ -1624,7 +1624,7 @@ static BOOL io_poll_any(OVERLAPPED_ENTRY *entries, ULONG cap, ULONG *removed,
 #endif
 
 int32_t zan_io_poll(int64_t timeout_ms) {
-    if (g_io_count == 0 && g_dns_inflight == 0) return 0;
+    if (g_io_count == 0 && g_blocking_inflight == 0) return 0;
     OVERLAPPED_ENTRY entries[64];
     ULONG removed = 0;
     int64_t wait = dns_wait_ms(timeout_ms);
@@ -1725,7 +1725,7 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
 
 int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_dead) return io_flush_dead();
-    if (g_io_count == 0 && g_dns_inflight == 0) return 0;
+    if (g_io_count == 0 && g_blocking_inflight == 0) return 0;
 
     /* Every fd goes into an fd_set below, so a watcher whose socket has been
      * closed under it must leave the list first: FD_SET of a negative or
@@ -1735,7 +1735,7 @@ int32_t zan_io_poll(int64_t timeout_ms) {
     {
         int woke = io_sweep_entries(FD_SETSIZE);
         if (woke) return woke;
-        if (g_io_count == 0 && g_dns_inflight == 0) return 0;
+        if (g_io_count == 0 && g_blocking_inflight == 0) return 0;
     }
 
     fd_set read_fds, write_fds;
@@ -1809,11 +1809,13 @@ int32_t zan_io_poll(int64_t timeout_ms) {
  * result is discarded. */
 #define ZAN_DNS_TIMEOUT_MS 10000
 
-typedef struct zan_dns_job {
-    struct zan_dns_job *next;
+typedef struct zan_blocking_job {
+    struct zan_blocking_job *next;
+    struct zan_blocking_job *queue_next;
     int64_t  deadline_ms;   /* reactor-clock deadline; timed out when passed */
     int      timed_out;     /* reactor delivered a timeout failure for this */
-    int32_t  result;        /* resolved IPv4 (network byte order) or sockaddr
+    int      started;       /* a detached worker owns this job */
+    int64_t  result;        /* resolved IPv4 (network byte order) or sockaddr
                                length, 0 on failure */
     void    *sabuf;         /* sockaddr sink (resolve_sa jobs), else NULL */
     int32_t  sacap;         /* sink capacity */
@@ -1821,15 +1823,21 @@ typedef struct zan_dns_job {
     void    *frame;         /* stackless frame, or stackful fiber handle */
     zan_co_step_t step;     /* resume fn (NULL => stackful fiber) */
     int32_t *out;           /* result sink (&frame->result) */
-} zan_dns_job_t;
+    int64_t *out64;         /* scalar blocking-call result sink */
+    void (*run)(struct zan_blocking_job *job);
+} zan_blocking_job_t;
 
 typedef struct zan_dns_work {
-    zan_dns_job_t job;
+    zan_blocking_job_t job;
     char hostname[256];     /* NUL-terminated copy for the worker thread */
 } zan_dns_work_t;
 
-static zan_dns_job_t *g_dns_pending;   /* in flight, owned by their workers */
-static zan_dns_job_t *g_dns_done;      /* completed, waiting for the reactor */
+static zan_blocking_job_t *g_blocking_pending; /* in flight, owned by workers */
+static zan_blocking_job_t *g_blocking_done;    /* completed, reactor delivery */
+static zan_blocking_job_t *g_blocking_queued;  /* accepted, awaiting worker */
+static int32_t g_blocking_active;
+
+#define ZAN_BLOCKING_MAX_ACTIVE 64
 
 static int64_t dns_now_ms(void) {
 #if defined(_WIN32)
@@ -1851,58 +1859,58 @@ static void dns_lock(void) { pthread_mutex_lock(&g_dns_mx); }
 static void dns_unlock(void) { pthread_mutex_unlock(&g_dns_mx); }
 #endif
 
-/* Worker thread: resolve the hostname (never on the reactor), park the result,
- * then wake the reactor through its backend wake fd. If the reactor already
- * delivered a timeout failure, nothing was parked: free the work item here,
- * since the reactor never frees an in-flight job (the worker may still be
- * writing into it). */
-#if defined(_WIN32)
-static DWORD WINAPI dns_worker(void *arg) {
-#else
-static void *dns_worker(void *arg) {
-#endif
-    zan_dns_work_t *w = (zan_dns_work_t *)arg;
-    if (w->job.sabuf)
-        w->job.result = zan_io_resolve_sa(w->hostname, w->job.port,
-                                          w->job.sabuf, w->job.sacap);
-    else
-        w->job.result = zan_io_resolve_ipv4(w->hostname);
+/* Start one queued job if a worker slot is available.  Queue overflow is
+ * deliberately kept asynchronous: a failed thread creation completes the
+ * operation with a failure rather than running it on the reactor. */
+static void blocking_start_next(void);
+
+static void blocking_spawn(zan_blocking_job_t *job);
+
+static void blocking_finish_worker(zan_blocking_job_t *job) {
+    zan_blocking_job_t *next = NULL;
+    int discard = 0;
     dns_lock();
-    if (w->job.timed_out) {
-        dns_unlock();
-        free(w);
-#if defined(_WIN32)
-        return 0;
-#else
-        return NULL;
-#endif
-    }
-    /* Still ours: take it off the pending list and move it to the done list.
-     * If the reactor already timed us out / shut down, the job is no longer in
-     * g_dns_pending; free the work item and let the reactor own the frame. */
-    int found = 0;
-    zan_dns_job_t **pp = &g_dns_pending;
-    while (*pp) {
-        if (*pp == &w->job) {
-            *pp = w->job.next;
-            found = 1;
-            break;
+    if (job->timed_out) {
+        job->started = 0;
+        if (g_blocking_active > 0) g_blocking_active--;
+        discard = 1;
+    } else {
+        zan_blocking_job_t **pp = &g_blocking_pending;
+        while (*pp && *pp != job) pp = &(*pp)->next;
+        if (!*pp) {
+            discard = 1;
+        } else {
+            *pp = job->next;
+            job->next = g_blocking_done;
+            g_blocking_done = job;
+            job->started = 0;
+            if (g_blocking_active > 0) g_blocking_active--;
         }
-        pp = &(*pp)->next;
     }
-    if (!found || w->job.timed_out) {
-        dns_unlock();
-        free(w);
-#if defined(_WIN32)
-        return 0;
-#else
-        return NULL;
-#endif
+    if (g_blocking_active < ZAN_BLOCKING_MAX_ACTIVE && g_blocking_queued) {
+        next = g_blocking_queued;
+        g_blocking_queued = next->queue_next;
+        next->queue_next = NULL;
+        next->started = 1;
+        g_blocking_active++;
     }
-    w->job.next = g_dns_done;
-    g_dns_done = &w->job;
     dns_unlock();
-    dns_wake_notify();
+    if (discard) free(job);
+    if (!discard) dns_wake_notify();
+    if (next) blocking_spawn(next);
+}
+
+/* Worker thread trampoline: `run` is a C native operation only.  It never
+ * enters Zan, touches ARC, allocates through the Zan allocator, or mutates
+ * coroutine state.  Completion ownership stays with the reactor. */
+#if defined(_WIN32)
+static DWORD WINAPI blocking_worker(void *arg) {
+#else
+static void *blocking_worker(void *arg) {
+#endif
+    zan_blocking_job_t *job = (zan_blocking_job_t *)arg;
+    job->run(job);
+    blocking_finish_worker(job);
 #if defined(_WIN32)
     return 0;
 #else
@@ -1910,16 +1918,100 @@ static void *dns_worker(void *arg) {
 #endif
 }
 
+static void blocking_start_failed(zan_blocking_job_t *job) {
+    int deliver = 0;
+    dns_lock();
+    zan_blocking_job_t **pp = &g_blocking_pending;
+    while (*pp && *pp != job) pp = &(*pp)->next;
+    if (*pp == job) {
+        *pp = job->next;
+        deliver = 1;
+    }
+    if (job->started && g_blocking_active > 0) g_blocking_active--;
+    job->started = 0;
+    job->result = 0;
+    if (deliver) {
+        job->next = g_blocking_done;
+        g_blocking_done = job;
+    }
+    dns_unlock();
+    if (deliver) dns_wake_notify();
+    else free(job);
+    blocking_start_next();
+}
+
+static void blocking_spawn(zan_blocking_job_t *job) {
+#if defined(_WIN32)
+    HANDLE h = CreateThread(NULL, 0, blocking_worker, job, 0, NULL);
+    if (!h) {
+        blocking_start_failed(job);
+        return;
+    }
+    CloseHandle(h);
+#else
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, blocking_worker, job) != 0) {
+        blocking_start_failed(job);
+        return;
+    }
+    pthread_detach(tid);
+#endif
+}
+
+static void blocking_start_next(void) {
+    zan_blocking_job_t *next = NULL;
+    dns_lock();
+    if (g_blocking_active < ZAN_BLOCKING_MAX_ACTIVE && g_blocking_queued) {
+        next = g_blocking_queued;
+        g_blocking_queued = next->queue_next;
+        next->queue_next = NULL;
+        next->started = 1;
+        g_blocking_active++;
+    }
+    dns_unlock();
+    if (next) blocking_spawn(next);
+}
+
+static void blocking_submit(zan_blocking_job_t *job) {
+    int start = 0;
+    dns_lock();
+    job->next = g_blocking_pending;
+    g_blocking_pending = job;
+    g_blocking_inflight++;
+    if (g_blocking_active < ZAN_BLOCKING_MAX_ACTIVE) {
+        job->started = 1;
+        g_blocking_active++;
+        start = 1;
+    } else {
+        zan_blocking_job_t **tail = &g_blocking_queued;
+        while (*tail) tail = &(*tail)->queue_next;
+        *tail = job;
+    }
+    dns_unlock();
+    if (start) blocking_spawn(job);
+}
+
+static void dns_job_run(zan_blocking_job_t *job) {
+    zan_dns_work_t *w = (zan_dns_work_t *)job;
+    if (w->job.sabuf)
+        w->job.result = zan_io_resolve_sa(w->hostname, w->job.port,
+                                          w->job.sabuf, w->job.sacap);
+    else
+        w->job.result = zan_io_resolve_ipv4(w->hostname);
+}
+
 /* Milliseconds until the earliest in-flight lookup times out, or caller_ms if
  * none would fire sooner (-1 meaning unbounded). Caps every backend wait so a
  * black-hole resolver cannot hang the reactor forever. */
 static int64_t dns_wait_ms(int64_t caller_ms) {
-    if (g_dns_inflight <= 0) return caller_ms;
+    if (g_blocking_inflight <= 0) return caller_ms;
     int64_t now = dns_now_ms();
     int64_t nearest = -1;
     dns_lock();
-    for (zan_dns_job_t *j = g_dns_pending; j; j = j->next)
-        if (nearest < 0 || j->deadline_ms < nearest) nearest = j->deadline_ms;
+    for (zan_blocking_job_t *j = g_blocking_pending; j; j = j->next)
+        if (j->deadline_ms > 0 &&
+            (nearest < 0 || j->deadline_ms < nearest))
+            nearest = j->deadline_ms;
     dns_unlock();
     if (nearest < 0) return caller_ms;
     int64_t wait = nearest - now;
@@ -1934,24 +2026,38 @@ static int64_t dns_wait_ms(int64_t caller_ms) {
 static int dns_timeout_scan(void) {
     int woke = 0;
     int64_t now = dns_now_ms();
-    zan_dns_job_t *timed_out = NULL;
+    zan_blocking_job_t *timed_out = NULL;
     dns_lock();
-    zan_dns_job_t **pp = &g_dns_pending;
+    zan_blocking_job_t **pp = &g_blocking_pending;
     while (*pp) {
-        zan_dns_job_t *j = *pp;
-        if (j->deadline_ms > now) { pp = &j->next; continue; }
+        zan_blocking_job_t *j = *pp;
+        if (j->deadline_ms <= 0 || j->deadline_ms > now) {
+            pp = &j->next;
+            continue;
+        }
         *pp = j->next;
         j->timed_out = 1;
-        g_dns_inflight--;
-        j->next = timed_out;
-        timed_out = j;
+        g_blocking_inflight--;
+        if (!j->started) {
+            zan_blocking_job_t **qp = &g_blocking_queued;
+            while (*qp && *qp != j) qp = &(*qp)->queue_next;
+            if (*qp == j) *qp = j->queue_next;
+            j->queue_next = NULL;
+            j->next = timed_out;
+            timed_out = j;
+        } else {
+            j->next = timed_out;
+            timed_out = j;
+        }
     }
     dns_unlock();
     while (timed_out) {
-        zan_dns_job_t *j = timed_out;
+        zan_blocking_job_t *j = timed_out;
         timed_out = j->next;
         if (j->out) *j->out = 0;
+        if (j->out64) *j->out64 = 0;
         io_wake(j->frame, j->step);
+        if (!j->started) free(j);
         woke++;
     }
     return woke;
@@ -1994,16 +2100,17 @@ static void dns_wake_read(void) {
 /* Deliver every completed lookup to its waiting frame (reactor thread). */
 static int dns_drain(void) {
     int cnt = 0, woke = 0;
-    zan_dns_job_t *j;
+    zan_blocking_job_t *j;
     dns_lock();
-    j = g_dns_done;
-    g_dns_done = NULL;
-    for (zan_dns_job_t *x = j; x; x = x->next) cnt++;
-    g_dns_inflight -= cnt;
+    j = g_blocking_done;
+    g_blocking_done = NULL;
+    for (zan_blocking_job_t *x = j; x; x = x->next) cnt++;
+    g_blocking_inflight -= cnt;
     dns_unlock();
     while (j) {
-        zan_dns_job_t *n = j->next;
-        if (j->out) *j->out = j->result;
+        zan_blocking_job_t *n = j->next;
+        if (j->out) *j->out = (int32_t)j->result;
+        if (j->out64) *j->out64 = j->result;
         io_wake(j->frame, j->step);
         free(j);
         woke++;
@@ -2017,18 +2124,27 @@ static int dns_drain(void) {
  * so we must not free jobs out from under them. */
 static void dns_shutdown_cleanup(void) {
     dns_lock();
-    zan_dns_job_t *j = g_dns_done;
-    g_dns_done = NULL;
+    zan_blocking_job_t *j = g_blocking_done;
+    g_blocking_done = NULL;
     while (j) {
-        zan_dns_job_t *n = j->next;
+        zan_blocking_job_t *n = j->next;
         free(j);
         j = n;
     }
-    for (zan_dns_job_t *p = g_dns_pending; p; p = p->next) {
-        p->timed_out = 1;
+    zan_blocking_job_t *queued = g_blocking_queued;
+    g_blocking_queued = NULL;
+    while (queued) {
+        zan_blocking_job_t *n = queued->queue_next;
+        zan_blocking_job_t **pp = &g_blocking_pending;
+        while (*pp && *pp != queued) pp = &(*pp)->next;
+        if (*pp == queued) *pp = queued->next;
+        free(queued);
+        queued = n;
     }
-    g_dns_pending = NULL;
-    g_dns_inflight = 0;
+    for (zan_blocking_job_t *p = g_blocking_pending; p; p = p->next)
+        p->timed_out = 1;
+    g_blocking_pending = NULL;
+    g_blocking_inflight = 0;
     dns_unlock();
 }
 
@@ -2058,42 +2174,8 @@ void zan_io_resolve_sa_co(const char *name, int32_t port, void *buf,
     w->job.sacap = cap;
     w->job.port = port;
     w->job.deadline_ms = dns_now_ms() + ZAN_DNS_TIMEOUT_MS;
-    dns_lock();
-    w->job.next = g_dns_pending;
-    g_dns_pending = &w->job;
-    g_dns_inflight++;
-    dns_unlock();
-#if defined(_WIN32)
-    HANDLE h = CreateThread(NULL, 0, dns_worker, w, 0, NULL);
-    if (!h) {
-        dns_lock();
-        g_dns_inflight--;
-        zan_dns_job_t **pp = &g_dns_pending;
-        while (*pp != &w->job) pp = &(*pp)->next;
-        *pp = w->job.next;
-        dns_unlock();
-        if (out) *out = 0;
-        io_wake(frame, step);
-        free(w);
-        return;
-    }
-    CloseHandle(h);     /* the thread keeps running detached */
-#else
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, dns_worker, w) != 0) {
-        dns_lock();
-        g_dns_inflight--;
-        zan_dns_job_t **pp = &g_dns_pending;
-        while (*pp != &w->job) pp = &(*pp)->next;
-        *pp = w->job.next;
-        dns_unlock();
-        if (out) *out = 0;
-        io_wake(frame, step);
-        free(w);
-        return;
-    }
-    pthread_detach(tid);
-#endif
+    w->job.run = dns_job_run;
+    blocking_submit(&w->job);
 }
 
 void zan_io_resolve_co(const char *hostname, void *frame, zan_co_step_t step,
@@ -2118,42 +2200,82 @@ void zan_io_resolve_co(const char *hostname, void *frame, zan_co_step_t step,
     w->job.step = step;
     w->job.out = out;
     w->job.deadline_ms = dns_now_ms() + ZAN_DNS_TIMEOUT_MS;
-    dns_lock();
-    w->job.next = g_dns_pending;
-    g_dns_pending = &w->job;
-    g_dns_inflight++;
-    dns_unlock();
-#if defined(_WIN32)
-    HANDLE h = CreateThread(NULL, 0, dns_worker, w, 0, NULL);
-    if (!h) {
-        dns_lock();
-        g_dns_inflight--;
-        zan_dns_job_t **pp = &g_dns_pending;
-        while (*pp != &w->job) pp = &(*pp)->next;
-        *pp = w->job.next;
-        dns_unlock();
-        if (out) *out = 0;
-        io_wake(frame, step);
-        free(w);
+    w->job.run = dns_job_run;
+    blocking_submit(&w->job);
+}
+
+typedef struct zan_blocking_work {
+    zan_blocking_job_t job;
+    void *fn;
+    int32_t argc;
+    int64_t args[4];
+} zan_blocking_work_t;
+
+typedef int64_t (*zan_blocking_fn0)(void);
+typedef int64_t (*zan_blocking_fn1)(int64_t);
+typedef int64_t (*zan_blocking_fn2)(int64_t, int64_t);
+typedef int64_t (*zan_blocking_fn3)(int64_t, int64_t, int64_t);
+typedef int64_t (*zan_blocking_fn4)(int64_t, int64_t, int64_t, int64_t);
+typedef void (*zan_blocking_void0)(void);
+typedef void (*zan_blocking_void1)(int64_t);
+typedef void (*zan_blocking_void2)(int64_t, int64_t);
+typedef void (*zan_blocking_void3)(int64_t, int64_t, int64_t);
+typedef void (*zan_blocking_void4)(int64_t, int64_t, int64_t, int64_t);
+
+/* The compiler passes only scalar ABI values.  A NULL result sink identifies
+ * a void declaration, avoiding a return-value mismatch for void FFI calls. */
+static void blocking_native_run(zan_blocking_job_t *base) {
+    zan_blocking_work_t *w = (zan_blocking_work_t *)base;
+    if (!w->fn || w->argc < 0 || w->argc > 4) {
+        w->job.result = 0;
         return;
     }
-    CloseHandle(h);     /* the thread keeps running detached */
-#else
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, dns_worker, w) != 0) {
-        dns_lock();
-        g_dns_inflight--;
-        zan_dns_job_t **pp = &g_dns_pending;
-        while (*pp != &w->job) pp = &(*pp)->next;
-        *pp = w->job.next;
-        dns_unlock();
-        if (out) *out = 0;
-        io_wake(frame, step);
-        free(w);
+    if (!w->job.out64) {
+        switch (w->argc) {
+        case 0: ((zan_blocking_void0)w->fn)(); break;
+        case 1: ((zan_blocking_void1)w->fn)(w->args[0]); break;
+        case 2: ((zan_blocking_void2)w->fn)(w->args[0], w->args[1]); break;
+        case 3: ((zan_blocking_void3)w->fn)(w->args[0], w->args[1], w->args[2]); break;
+        case 4: ((zan_blocking_void4)w->fn)(w->args[0], w->args[1], w->args[2], w->args[3]); break;
+        }
+        w->job.result = 0;
         return;
     }
-    pthread_detach(tid);
-#endif
+    switch (w->argc) {
+    case 0: w->job.result = ((zan_blocking_fn0)w->fn)(); break;
+    case 1: w->job.result = ((zan_blocking_fn1)w->fn)(w->args[0]); break;
+    case 2: w->job.result = ((zan_blocking_fn2)w->fn)(w->args[0], w->args[1]); break;
+    case 3: w->job.result = ((zan_blocking_fn3)w->fn)(w->args[0], w->args[1], w->args[2]); break;
+    case 4: w->job.result = ((zan_blocking_fn4)w->fn)(w->args[0], w->args[1], w->args[2], w->args[3]); break;
+    }
+}
+
+void zan_rt_blocking_co(void *fn, int32_t argc,
+                        int64_t a0, int64_t a1, int64_t a2, int64_t a3,
+                        void *frame, zan_co_step_t step, int64_t *out) {
+    if (!fn || argc < 0 || argc > 4) {
+        if (out) *out = 0;
+        io_wake(frame, step);
+        return;
+    }
+    zan_io_init();
+    zan_blocking_work_t *w = (zan_blocking_work_t *)calloc(1, sizeof(*w));
+    if (!w) {
+        if (out) *out = 0;
+        io_wake(frame, step);
+        return;
+    }
+    w->fn = fn;
+    w->argc = argc;
+    w->args[0] = a0;
+    w->args[1] = a1;
+    w->args[2] = a2;
+    w->args[3] = a3;
+    w->job.frame = frame;
+    w->job.step = step;
+    w->job.out64 = out;
+    w->job.run = blocking_native_run;
+    blocking_submit(&w->job);
 }
 
 /* ================= coroutine-facing ABI ================= */
@@ -2236,7 +2358,7 @@ int32_t zan_io_has_pending(void) {
 #endif
     /* An outstanding DNS lookup (or one parked waiting for the reactor) also
      * owes a wake, so the scheduler must keep polling instead of sleeping. */
-    return (g_io_count > 0) || (g_dns_inflight > 0);
+    return (g_io_count > 0) || (g_blocking_inflight > 0);
 }
 
 #ifndef ZAN_IO_STACKLESS_ONLY
@@ -3049,13 +3171,13 @@ static int co_all_idle(void) {
     /* Cheap unlocked reject first: this runs on the empty-queue path of every
      * worker, and a live server almost always has IO in flight or a timer
      * pending. */
-    if (g_co_running != 0 || g_io_count != 0 || g_dns_inflight != 0 ||
+    if (g_co_running != 0 || g_io_count != 0 || g_blocking_inflight != 0 ||
         zan_timer_pending() != 0)
         return 0;
     int idle;
     EnterCriticalSection(&g_co_lock);
     idle = !(zan_timer_pending() != 0 || g_co_running != 0 ||
-             g_io_count != 0 || g_dns_inflight != 0 || co_has_runnable());
+             g_io_count != 0 || g_blocking_inflight != 0 || co_has_runnable());
     LeaveCriticalSection(&g_co_lock);
     return idle;
 }
@@ -3124,7 +3246,7 @@ static void co_worker(int worker) {
         if (tnext >= 0)               to = tnext;
         else if (g_io_count > 0)      to = 1000;
         else                          to = 50;
-        if (g_dns_inflight > 0) {
+        if (g_blocking_inflight > 0) {
             long long dw = dns_wait_ms(-1);
             if (dw >= 0 && dw < to) to = dw;
         }

@@ -6166,6 +6166,186 @@ static LLVMValueRef coerce_await_result(zan_irgen_t *g, zan_ast_node_t *expr,
     return coerce_from_frame_result(g, res, rt);
 }
 
+static zan_symbol_t *direct_extern_method(zan_irgen_t *g, zan_ast_node_t *expr) {
+    if (!expr || expr->kind != AST_CALL || !expr->call.callee) return NULL;
+    zan_symbol_t *sym = NULL;
+    if (expr->call.callee->kind == AST_IDENTIFIER) {
+        if (g->current_type_sym)
+            sym = get_method_sym(g->current_type_sym,
+                                 expr->call.callee->ident.name);
+        if (!sym)
+            sym = zan_binder_lookup(g->binder, expr->call.callee->ident.name);
+    } else if (expr->call.callee->kind == AST_MEMBER_ACCESS &&
+               expr->call.callee->member.object->kind == AST_IDENTIFIER) {
+        zan_symbol_t *cls = zan_binder_lookup(g->binder,
+            expr->call.callee->member.object->ident.name);
+        if (cls) sym = get_method_sym(cls, expr->call.callee->member.name);
+    }
+    if (!sym || !sym->decl || sym->decl->kind != AST_METHOD_DECL) return NULL;
+    if (!sym->decl->method_decl.extern_lib.str &&
+        !(sym->decl->method_decl.modifiers & MOD_EXTERN))
+        return NULL;
+    return sym;
+}
+
+static bool blocking_integer_type(zan_type_t *t) {
+    if (!t) return false;
+    switch (t->kind) {
+    case TYPE_BOOL:
+    case TYPE_BYTE:
+    case TYPE_SHORT:
+    case TYPE_INT:
+    case TYPE_LONG:
+    case TYPE_SBYTE:
+    case TYPE_USHORT:
+    case TYPE_UINT:
+    case TYPE_ULONG:
+    case TYPE_CHAR:
+    case TYPE_NINT:
+    case TYPE_ENUM:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static LLVMValueRef blocking_arg_i64(zan_irgen_t *g, LLVMValueRef v,
+                                     zan_type_t *type) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    if (LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMIntegerTypeKind)
+        return LLVMBuildPtrToInt(g->builder, v, i64, "blocking.arg");
+    if (LLVMGetIntTypeWidth(LLVMTypeOf(v)) == 64) return v;
+    if (type && (type->kind == TYPE_BOOL || type->kind == TYPE_BYTE ||
+                 type->kind == TYPE_USHORT || type->kind == TYPE_UINT ||
+                 type->kind == TYPE_ULONG || type->kind == TYPE_CHAR))
+        return LLVMBuildZExt(g->builder, v, i64, "blocking.arg");
+    return LLVMBuildSExt(g->builder, v, i64, "blocking.arg");
+}
+
+/* `await native(...)` is the one suspension primitive whose callee is not a
+ * Zan coroutine.  Keep the validation here, next to the lowering, so an
+ * invalid direct extern await cannot fall through to the synchronous call
+ * emitter and accidentally block the reactor. */
+static LLVMValueRef emit_await_blocking_extern(zan_irgen_t *g,
+        zan_ast_node_t *expr, local_scope_t *locals, zan_symbol_t *sym) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    zan_ast_node_t *call = expr->await_expr.expr;
+    zan_ast_node_t *decl = sym->decl;
+    int argc = call->call.args.count;
+    zan_type_t *ret = decl->method_decl.return_type
+        ? resolve_type_ctx(g, decl->method_decl.return_type)
+        : g->binder->type_void;
+
+    if (strstr(g->target_triple, "wasm") != NULL) {
+        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+            "await native extern calls are not supported on wasm32: "
+            "the blocking runtime requires native worker threads");
+        return LLVMConstInt(i64, 0, 0);
+    }
+
+    if (!g->current_async_frame || !g->current_async_switch) {
+        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+            "await native extern calls are only supported inside an async "
+            "method");
+        return LLVMConstInt(i64, 0, 0);
+    }
+    if (argc > 4) {
+        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+            "await native extern call has %d arguments; at most four scalar "
+            "arguments are supported (prepare data before suspension and "
+            "await a handle-only operation)", argc);
+        return LLVMConstInt(i64, 0, 0);
+    }
+    if (ret->kind != TYPE_VOID && ret->kind != TYPE_INT &&
+        ret->kind != TYPE_LONG && ret->kind != TYPE_NINT) {
+        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+            "await native extern call returns '%s', but only int, long, nint, "
+            "or void can cross a suspension safely; return a scalar handle "
+            "instead", ret->name.str ? ret->name.str : "unsupported");
+        return LLVMConstInt(i64, 0, 0);
+    }
+
+    for (int k = 0; k < argc; k++) {
+        zan_ast_node_t *p = decl->method_decl.params.items[k];
+        zan_type_t *pt = (p && p->kind == AST_PARAM)
+            ? resolve_type_ctx(g, p->param.type) : NULL;
+        if (!blocking_integer_type(pt)) {
+            zan_diag_emit(g->diag, DIAG_ERROR, call->call.args.items[k]->loc,
+                "await native extern argument %d has type '%s'; only integer, "
+                "nint, bool, and enum scalars are safe across suspension "
+                "(prepare/bind managed data first, then await a handle-only "
+                "operation)", k + 1, pt && pt->name.str ? pt->name.str : "unsupported");
+            return LLVMConstInt(i64, 0, 0);
+        }
+    }
+
+    int fi = irgen_find_function(g, sym);
+    LLVMValueRef native = fi >= 0 ? g->functions[fi].fn : NULL;
+    if (!native) {
+        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+            "cannot lower await native extern call: external function is not "
+            "available in the generated module");
+        return LLVMConstInt(i64, 0, 0);
+    }
+
+    LLVMValueRef args[4] = {
+        LLVMConstInt(i64, 0, 0), LLVMConstInt(i64, 0, 0),
+        LLVMConstInt(i64, 0, 0), LLVMConstInt(i64, 0, 0)
+    };
+    for (int k = 0; k < argc; k++) {
+        zan_ast_node_t *p = decl->method_decl.params.items[k];
+        zan_type_t *pt = resolve_type_ctx(g, p->param.type);
+        args[k] = blocking_arg_i64(g,
+            emit_arg_typed(g, call->call.args.items[k], pt, locals), pt);
+    }
+
+    /* The socket-async flag selects rt_io.o, which also owns the generic
+     * blocking queue and reactor wake-up path used by this await. */
+    g->uses_socket_async = true;
+    int state = g->current_async_next_state++;
+    LLVMValueRef frame = g->current_async_frame;
+    LLVMTypeRef frame_type = g->current_async_frame_type;
+    LLVMValueRef frame_i8 = LLVMBuildBitCast(g->builder, frame, i8ptr,
+                                             "blocking.frame");
+    LLVMValueRef out = NULL;
+    if (ret->kind != TYPE_VOID) {
+        out = LLVMBuildStructGEP2(g->builder, frame_type, frame,
+                                  ASYNC_FRAME_RESULT, "blocking.out");
+    } else {
+        out = LLVMConstNull(LLVMPointerType(i64, 0));
+    }
+    LLVMValueRef fnptr = LLVMBuildBitCast(g->builder, native, i8ptr,
+                                          "blocking.fn");
+    emit_async_save_slots(g);
+    zan_store_fit(g, LLVMConstInt(i32, (unsigned)state, 0),
+        LLVMBuildStructGEP2(g->builder, frame_type, frame,
+                            ASYNC_FRAME_STATE, "blocking.state"));
+    LLVMValueRef rt_args[] = {
+        fnptr, LLVMConstInt(i32, (unsigned)argc, 0),
+        args[0], args[1], args[2], args[3],
+        frame_i8, g->current_async_resume_fn, out
+    };
+    zan_call2(g->builder, g->rt_blocking_co_type, g->rt_blocking_co,
+              rt_args, 9, "");
+    emit_async_eh_unarm(g);
+    LLVMBuildRetVoid(g->builder);
+
+    LLVMBasicBlockRef resume = LLVMAppendBasicBlockInContext(g->ctx,
+        g->current_async_resume_fn, "co.blocking.resume");
+    LLVMAddCase(g->current_async_switch,
+        LLVMConstInt(i32, (unsigned)state, 0), resume);
+    LLVMPositionBuilderAtEnd(g->builder, resume);
+    emit_async_reload_slots(g);
+    if (ret->kind == TYPE_VOID) return LLVMConstInt(i64, 0, 0);
+    LLVMValueRef raw = LLVMBuildLoad2(g->builder, i64,
+        LLVMBuildStructGEP2(g->builder, frame_type, frame,
+                            ASYNC_FRAME_RESULT, "blocking.result"),
+        "blocking.raw");
+    return coerce_await_result(g, expr, raw, locals);
+}
+
 static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* await Task.Delay(ms) — time-based suspension (no sub-frame). Inside an
@@ -6545,6 +6725,12 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMPointerType(di32, 0), "self.saout2");
                 return LLVMBuildLoad2(g->builder, di32, res_slot, "salen");
             }
+        }
+
+        {
+            zan_symbol_t *native = direct_extern_method(g, expr->await_expr.expr);
+            if (native)
+                return emit_await_blocking_extern(g, expr, locals, native);
         }
 
         /* await <call> — the awaited expression is a call to an async method's

@@ -271,21 +271,122 @@ class SqliteConnection : IDbConnection {
         return CopyText(sqlite3_errmsg(this.handle));
     }
 
-    /// <summary>开始一个事务。</summary>
     // ===== 协程孪生方法 =====
-    // 本驱动的 IO 是同步的，因此这里只是转发。它们的用途是让调用方
-    // （以及生成的 ORM 终端方法）能对所有驱动使用同一条异步链，
-    // 并在驱动支持的地方获得真正的非阻塞 IO。
-    async DbResult QueryAsync(string sql) { return this.Query(sql); }
-    async DbResult QueryAsync(string sql, DbParams prms) { return this.Query(sql, prms); }
-    async int ExecuteAsync(string sql) { return this.Execute(sql); }
-    async int ExecuteAsync(string sql, DbParams prms) { return this.Execute(sql, prms); }
-    async string ExecuteScalarAsync(string sql) { return this.ExecuteScalar(sql); }
-    async string ExecuteScalarAsync(string sql, DbParams prms) { return this.ExecuteScalar(sql, prms); }
-    async bool BeginTransactionAsync() { this.BeginTransaction(); return true; }
-    async bool CommitAsync() { this.Commit(); return true; }
-    async bool RollbackAsync() { this.Rollback(); return true; }
+    // Prepare/bind and result processing stay on the reactor. Only the
+    // non-cancellable sqlite3_step crosses the blocking-offload boundary.
+    async DbResult QueryAsync(string sql) {
+        return await this.QueryAsync(sql, new DbParams());
+    }
 
+    async DbResult QueryAsync(string sql, DbParams prms) {
+        if (!this.connected) { return DbResult.Empty(); }
+        DbResult result = new DbResult();
+        byte[] ppStmt = new byte[8];
+        byte[] pzTail = new byte[8];
+        int rc = sqlite3_prepare_v2(this.handle, sql, sql.Length, ppStmt, pzTail);
+        nint stmt = HandleFromBuf(ppStmt);
+        if (rc != 0) { return result; }
+        if (!BindAll(stmt, prms)) {
+            sqlite3_finalize(stmt);
+            return result;
+        }
+        int colCount = sqlite3_column_count(stmt);
+        result.SetColumnCount(colCount);
+        int c = 0;
+        for (; c < colCount; c = c + 1) {
+            result.AddColumnName(CopyText(sqlite3_column_name(stmt, c)));
+        }
+
+        int step = await sqlite3_step(stmt);
+        while (step == 100) {
+            List<string> row = new List<string>();
+            List<bool> nullFlags = new List<bool>();
+            c = 0;
+            while (c < colCount) {
+                if (sqlite3_column_type(stmt, c) == 5) {
+                    row.Add("");
+                    nullFlags.Add(true);
+                } else {
+                    row.Add(CopyText(sqlite3_column_text(stmt, c)));
+                    nullFlags.Add(false);
+                }
+                c = c + 1;
+            }
+            result.AddRowNulls(row, nullFlags);
+            step = await sqlite3_step(stmt);
+        }
+        sqlite3_finalize(stmt);
+        return result;
+    }
+
+    async int ExecuteAsync(string sql) {
+        return await this.ExecuteAsync(sql, new DbParams());
+    }
+
+    async int ExecuteAsync(string sql, DbParams prms) {
+        if (!this.connected) { return -1; }
+        string remaining = sql;
+        int affected = 0;
+        bool firstStatement = true;
+        while (remaining.Length > 0) {
+            byte[] ppStmt = new byte[8];
+            byte[] pzTail = new byte[8];
+            int rc = sqlite3_prepare_v2(this.handle, remaining, remaining.Length,
+                ppStmt, pzTail);
+            nint stmt = HandleFromBuf(ppStmt);
+            if (rc != 0) { return -1; }
+            if (stmt == 0) { break; }   // whitespace/comments after the last statement
+
+            // As with the synchronous prepare+bind path, parameters belong to
+            // the first prepared statement only. Callers combining parameters
+            // with multiple statements must put placeholders in that statement;
+            // later statements have SQLite's normal unbound-parameter behavior.
+            if (firstStatement && !BindAll(stmt, prms)) {
+                sqlite3_finalize(stmt);
+                return -1;
+            }
+            int step = await sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+            if (step != 101) { return -1; }   // SQLITE_DONE = 101
+            affected = sqlite3_changes(this.handle);
+            firstStatement = false;
+
+            nint tail = HandleFromBuf(pzTail);
+            int offset = (int)(tail - (nint)remaining);
+            if (offset <= 0 || offset >= remaining.Length) { break; }
+            remaining = remaining.Substring(offset, remaining.Length - offset);
+        }
+        return affected;
+    }
+
+    async string ExecuteScalarAsync(string sql) {
+        return await this.ExecuteScalarAsync(sql, new DbParams());
+    }
+
+    async string ExecuteScalarAsync(string sql, DbParams prms) {
+        DbResult result = await this.QueryAsync(sql, prms);
+        if (result.RowCount() > 0) {
+            return result.GetString(0, 0);
+        }
+        return "";
+    }
+
+    async bool BeginTransactionAsync() {
+        await this.ExecuteAsync("BEGIN TRANSACTION");
+        return true;
+    }
+
+    async bool CommitAsync() {
+        await this.ExecuteAsync("COMMIT");
+        return true;
+    }
+
+    async bool RollbackAsync() {
+        await this.ExecuteAsync("ROLLBACK");
+        return true;
+    }
+
+    /// <summary>开始一个事务。</summary>
     void BeginTransaction() { Execute("BEGIN TRANSACTION"); }
 
     /// <summary>提交当前事务。</summary>
