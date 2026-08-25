@@ -629,8 +629,23 @@ typedef struct {
     int fd;
 #endif
     int used;
+    uint32_t gen;   /* stale-handle defence, same scheme as the stream table */
 } zan_lk_slot;
 static zan_lk_slot g_lk_table[ZAN_LK_CAP];
+
+/* Handles encode (gen << 32) | slot. Without the generation, the sequence
+ * "take lock -> release -> anyone retakes -> a delayed duplicate unlock of
+ * the FIRST handle" closed the SECOND holder's active OS lock; the generation
+ * makes the stale copy simply fail. */
+static long zan_lk_index(long long handle) {
+    if (handle <= 0) return -1;
+    unsigned long long h = (unsigned long long)handle;
+    uint32_t gen = (uint32_t)(h >> 32);
+    unsigned long long slot = h & 0xFFFFFFFFULL;
+    if (slot >= (unsigned long long)ZAN_LK_CAP) return -1;
+    if (!g_lk_table[slot].used || g_lk_table[slot].gen != gen) return -1;
+    return (long)slot;
+}
 
 /* Takes an exclusive lock on `path` (created when missing). Returns a handle,
  * or 0 when another process holds it or the path is unusable. */
@@ -665,31 +680,42 @@ long long zan_file_try_lock(const char *path) {
 #else
     g_lk_table[slot].fd = fd;
 #endif
+    /* New generation: every outstanding copy of this slot's previous handle
+     * stops matching, so a late unlock cannot release somebody else's lock. */
+    g_lk_table[slot].gen = g_lk_table[slot].gen + 1;
+    if (g_lk_table[slot].gen == 0) { g_lk_table[slot].gen = 1; }
     g_lk_table[slot].used = 1;
+    unsigned long long lk_handle =
+        ((unsigned long long)g_lk_table[slot].gen << 32)
+        | (unsigned long long)slot;
     zan_fh_unlock();
-    return (long long)(slot + 1);
+    return (long long)lk_handle;
 #endif
 }
 
 /* Releases a lock from zan_file_try_lock. Returns 1 when a lock was held. */
 long long zan_file_unlock(long long handle) {
-    long slot = (long)(handle - 1);
-    if (slot < 0 || slot >= ZAN_LK_CAP) return 0;
     zan_fh_lock();
-    int used = g_lk_table[slot].used;
+    long slot = zan_lk_index(handle);
+    if (slot < 0) {
+        zan_fh_unlock();
+        return 0;
+    }
+    zan_lk_slot *s = &g_lk_table[slot];
 #ifdef _WIN32
-    HANDLE h = g_lk_table[slot].h;
-    g_lk_table[slot].h = NULL;
-#elif !defined(__wasm__)
-    int fd = g_lk_table[slot].fd;
-    g_lk_table[slot].fd = -1;
+    HANDLE h = s->h;
+    s->h = NULL;
+#else
+    int fd = s->fd;
+    s->fd = -1;
 #endif
-    g_lk_table[slot].used = 0;
+    s->used = 0;
+    s->gen = s->gen + 1;   /* a second unlock of the same value now fails */
+    if (s->gen == 0) { s->gen = 1; }
     zan_fh_unlock();
-    if (!used) return 0;
 #ifdef _WIN32
     CloseHandle(h);
-#elif !defined(__wasm__)
+#else
     close(fd);              /* drops the flock */
 #endif
     return 1;
