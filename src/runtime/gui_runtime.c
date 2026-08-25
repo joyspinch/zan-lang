@@ -1894,38 +1894,47 @@ EXPORT void zan_gui_shadow_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w, i32
 static void cpu_fill_circle(zan_surface_t *s, int cx, int cy, int radius,
                             u32 c) {
     int r = radius;
-    int icx = cx, icy = cy;
-    double rin = (double)r - 0.5, rout = (double)r + 0.5;
+    double rr = (double)r;
+    double rin = rr - 0.5, rout = rr + 0.5;
     double rin2 = rin * rin, rout2 = rout * rout;
 
-    for (int dy = -r - 1; dy <= r + 1; dy++) {
-        int py = icy + dy;
-        if (py < s->clip_y0 || py >= s->clip_y1) continue;
-        double dy2 = (double)(dy * dy);
-        if (dy2 > rout2) continue;
-        /* Widest dx still inside each radius; nudged so floating-point slack
-         * in sqrt can never move a pixel across the boundary. */
-        int dxOut = (int)sqrt(rout2 - dy2);
-        while (dxOut >= 0 && (double)(dxOut * dxOut) + dy2 > rout2) dxOut--;
-        while ((double)((dxOut + 1) * (dxOut + 1)) + dy2 <= rout2) dxOut++;
-        if (dxOut < 0) continue;
-        int dxIn = -1;
-        if (rin >= 0.0 && rin2 >= dy2) {
-            dxIn = (int)sqrt(rin2 - dy2);
-            while (dxIn >= 0 && (double)(dxIn * dxIn) + dy2 > rin2) dxIn--;
-            while ((double)((dxIn + 1) * (dxIn + 1)) + dy2 <= rin2) dxIn++;
-        }
-        u32 *row = s->pixels + py * s->stride;
-        if (dxIn >= 0) {
-            int x0 = clamp_i(icx - dxIn, s->clip_x0, s->clip_x1);
-            int x1 = clamp_i(icx + dxIn + 1, s->clip_x0, s->clip_x1);
-            if (x1 > x0) blend_run_const(row + x0, x1 - x0, c);
-        }
-        for (int dx = dxIn + 1; dx <= dxOut; dx++) {
-            double dist = sqrt((double)(dx * dx) + dy2);
-            int cov = (int)((rout - dist) * 255.0);
-            set_pixel_aa(s, icx + dx, py, c, cov);
-            if (dx > 0) set_pixel_aa(s, icx - dx, py, c, cov);
+    /* Every sample is taken at the PIXEL CENTRE (px+0.5, py+0.5) relative to
+     * the true circle centre. The old code measured distances on the integer
+     * lattice (dx,dy around the centre), i.e. half a pixel off everywhere,
+     * which threw the 1px coverage ramp out of phase with the actual pixel
+     * footprint: arcs came out stepped, some rows nearly binary. Same
+     * convention as cpu_fill_round's corner arcs, which always looked right.
+     * Interior stays a solid span run; only the 1px outer band pays a sqrt. */
+    ZAN_STAT(g_st_round, (long long)(2 * r + 3) * (long long)(2 * r + 3));
+    int ext = r + 2;
+    int ylo = cy - ext, yhi = cy + ext;
+    if (ylo < s->clip_y0) ylo = s->clip_y0;
+    if (yhi >= s->clip_y1) yhi = s->clip_y1 - 1;
+    for (int py = ylo; py <= yhi; py++) {
+        double wy = (double)py + 0.5 - (double)cy;
+        double wy2 = wy * wy;
+        if (wy2 > rout2) continue;
+        u32 *row = s->pixels + (size_t)py * (size_t)s->stride;
+        /* Solid span: pixel centres strictly within rin. Pixel px has centre
+         * cx + k + 0.5 with k = px - cx, so the span is k ∈ [-hs-0.5, hs-0.5]. */
+        double hs = (rin2 > wy2) ? sqrt(rin2 - wy2) : -1.0;
+        int L = cx + (int)ceil(-hs - 0.5);
+        int Rr = cx + (int)floor(hs - 0.5);
+        if (L < cx - ext) L = cx - ext;
+        if (Rr > cx + ext) Rr = cx + ext;
+        int xlo = cx - ext, xhi = cx + ext;
+        if (xlo < s->clip_x0) xlo = s->clip_x0;
+        if (xhi >= s->clip_x1) xhi = s->clip_x1 - 1;
+        for (int px = xlo; px <= xhi; px++) {
+            if (px >= L && px <= Rr) {
+                row[px] = blend_over(row[px], c);
+                continue;
+            }
+            double wx = (double)px + 0.5 - (double)cx;
+            double dist = sqrt(wx * wx + wy2);
+            double cov = rout - dist;
+            if (cov <= 0.0) continue;
+            set_pixel_aa(s, px, py, c, (int)(cov * 255.0));
         }
     }
 }
@@ -1946,16 +1955,21 @@ static void cpu_draw_circle(zan_surface_t *s, int cx, int cy, int radius,
     if (r <= 0) return;
     double half = (double)(thickness > 0 ? thickness : 1) / 2.0;
     int ext = r + (int)half + 2;
-    int icx = cx, icy = cy;
 
-    for (int dy = -ext; dy <= ext; dy++) {
-        for (int dx = -ext; dx <= ext; dx++) {
-            double d = fabs(sqrt((double)(dx*dx + dy*dy)) - (double)r);
+    /* Pixel-centre sampling: see cpu_fill_circle. The lattice version drew
+     * rings whose stroke width visibly wobbled around the compass. */
+    for (int py = cy - ext; py <= cy + ext; py++) {
+        if (py < s->clip_y0 || py >= s->clip_y1) continue;
+        double wy = (double)py + 0.5 - (double)cy;
+        for (int px = cx - ext; px <= cx + ext; px++) {
+            if (px < s->clip_x0 || px >= s->clip_x1) continue;
+            double wx = (double)px + 0.5 - (double)cx;
+            double d = fabs(sqrt(wx * wx + wy * wy) - (double)r);
             if (d <= half - 0.5) {
-                set_pixel(s, icx + dx, icy + dy, c);
+                set_pixel(s, px, py, c);
             } else if (d <= half + 0.5) {
                 int cov = (int)((half + 0.5 - d) * 255.0);
-                set_pixel_aa(s, icx + dx, icy + dy, c, cov);
+                set_pixel_aa(s, px, py, c, cov);
             }
         }
     }
@@ -2041,9 +2055,16 @@ static void cpu_fill_sector(zan_surface_t *s, int cx, int cy, int r_inner,
     int R = r_outer;
     const double PI = 3.14159265358979323846;
 
-    for (int dy = -R - 1; dy <= R + 1; dy++) {
-        for (int dx = -R - 1; dx <= R + 1; dx++) {
-            double dist = sqrt((double)(dx*dx + dy*dy));
+    /* Pixel-centre sampling throughout: the old integer-lattice distances
+     * put the radial AA band half a pixel off the true rim, so pie rims and
+     * gauge arcs read as stepped rings. */
+    for (int py = icy - R - 1; py <= icy + R + 1; py++) {
+        if (py < s->clip_y0 || py >= s->clip_y1) continue;
+        double wy = (double)py + 0.5 - (double)icy;
+        for (int px = icx - R - 1; px <= icx + R + 1; px++) {
+            if (px < s->clip_x0 || px >= s->clip_x1) continue;
+            double wx = (double)px + 0.5 - (double)icx;
+            double dist = sqrt(wx * wx + wy * wy);
             /* radial coverage (AA on inner & outer edge) */
             double radCov = 1.0;
             if (dist > ro + 0.5) continue;
@@ -2053,7 +2074,7 @@ static void cpu_fill_sector(zan_surface_t *s, int cx, int cy, int r_inner,
             if (radCov <= 0.0) continue;
             if (radCov > 1.0) radCov = 1.0;
             /* angle of this pixel: 0 at top, clockwise, in [0,360) */
-            double ang = atan2((double)dx, (double)(-dy)) * 180.0 / PI;
+            double ang = atan2(wx, -wy) * 180.0 / PI;
             if (ang < 0.0) ang += 360.0;
             /* Angular coverage: anti-alias the two radial (start/end) edges of
              * the sweep so slice sides are smooth, not stair-stepped. One pixel
@@ -2078,8 +2099,8 @@ static void cpu_fill_sector(zan_surface_t *s, int cx, int cy, int r_inner,
                 if (angCov <= 0.0) continue;
             }
             int cov = (int)(radCov * angCov * 255.0);
-            if (cov >= 255) set_pixel(s, icx + dx, icy + dy, c);
-            else set_pixel_aa(s, icx + dx, icy + dy, c, cov);
+            if (cov >= 255) set_pixel(s, px, py, c);
+            else set_pixel_aa(s, px, py, c, cov);
         }
     }
 }
@@ -2199,15 +2220,16 @@ static void cpu_draw_line(zan_surface_t *s, int x0, int y0, int x1, int y1,
             if (rowLo < minx) rowLo = minx;
             if (rowHi > maxx) rowHi = maxx;
             for (int px = rowLo; px <= rowHi; px++) {
+                double pxc = (double)px + 0.5, pyc = (double)py + 0.5;
                 double proj = 0.0;
                 if (len2 > 0.0001) {
-                    proj = ((px - (double)x0) * dx + (py - (double)y0) * dy) / len2;
+                    proj = ((pxc - (double)x0) * dx + (pyc - (double)y0) * dy) / len2;
                     if (proj < 0.0) proj = 0.0;
                     if (proj > 1.0) proj = 1.0;
                 }
                 double cxp = (double)x0 + proj * dx;
                 double cyp = (double)y0 + proj * dy;
-                double ddx = px - cxp, ddy = py - cyp;
+                double ddx = pxc - cxp, ddy = pyc - cyp;
                 double dist = sqrt(ddx*ddx + ddy*ddy);
                 double cov = half + 0.5 - dist;   /* 1px band, like circle */
                 if (cov <= 0.0) continue;
@@ -2305,13 +2327,19 @@ static void zan_polyline_core(zan_surface_t *s, const i32 *pts, i32 n,
         if (maxx >= W) maxx = W - 1;
         if (maxy >= H) maxy = H - 1;
         for (int py = miny; py <= maxy; py++) {
+            /* Pixel-centre sampling (px+0.5, py+0.5): measuring from the bare
+             * lattice point put every coverage ramp half a pixel out of phase
+             * with the pixel footprint, which is exactly the "curves look
+             * stepped" artifact. Chart smooth lines all come through here. */
+            double pyc = (double)py + 0.5;
             for (int px = minx; px <= maxx; px++) {
-                double proj = ((px - x0) * dx + (py - y0) * dy) / len2;
+                double pxc = (double)px + 0.5;
+                double proj = ((pxc - x0) * dx + (pyc - y0) * dy) / len2;
                 if (proj < 0.0) proj = 0.0;
                 if (proj > 1.0) proj = 1.0;
                 double cxp = x0 + proj * dx;
                 double cyp = y0 + proj * dy;
-                double ddx = px - cxp, ddy = py - cyp;
+                double ddx = pxc - cxp, ddy = pyc - cyp;
                 double dist = sqrt(ddx * ddx + ddy * ddy);
                 double cov = half + 0.5 - dist;   /* 1px band, like circle */
                 if (cov <= 0.0) continue;

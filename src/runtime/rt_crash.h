@@ -11,9 +11,10 @@
  * a Debug publish), the handler additionally resolves every in-module frame to
  * `function  <file>.zan:line` right there in the log, so a crash points at the
  * exact source location with no manual addr2line step. Resolution shells out
- * to a symbolizer found next to the exe (addr2line.exe / llvm-symbolizer.exe)
- * or on PATH; if none is present the raw module+offset lines still stand and
- * can be resolved offline (scripts\symbolize_crash.ps1).
+ * to a symbolizer found next to the exe only (addr2line.exe /
+ * llvm-symbolizer.exe) -- deliberately not PATH/CWD, which are
+ * attacker-influenceable; if none is present the raw module+offset lines still
+ * stand and can be resolved offline (scripts\symbolize_crash.ps1).
  *
  * Included by the always-linked runtime objects (rt_io.c reactor and the
  * gui_runtime DLL) so both console/async and GUI (ZanIDE) processes leave a
@@ -34,6 +35,12 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+/* GetTickCount64 (used below): some MinGW header sets (TDM-GCC with the
+ * plain -DZAN_GUI_STATIC build) hide its declaration behind a WINVER guard,
+ * and windows.h may already be included before this header, so bumping
+ * _WIN32_WINNT here would be too late. The prototype is a stable Win32 ABI;
+ * a matching redeclaration is harmless where the header did declare it. */
+WINBASEAPI ULONGLONG WINAPI GetTickCount64(VOID);
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -215,13 +222,19 @@ static void zan__crash_symbolize(const char *logpath, const char *exe,
             ^ ((unsigned long long)(uintptr_t)&attempt << 17)
             ^ ((unsigned long long)GetCurrentProcessId() << 33)
             ^ ((unsigned long long)attempt * 0x9E3779B97F4A7C15ull);
+        /* QPC beats the ~15 ms tick granularity for same-process crashes
+         * that land within one tick of each other. */
+        LARGE_INTEGER qpc;
+        if (QueryPerformanceCounter(&qpc))
+            salt ^= (unsigned long long)qpc.QuadPart << 19;
         snprintf(tmppath, sizeof tmppath, "%szan_crash.sym.%lu.%016llx.tmp",
                  exe_dir, (unsigned long)GetCurrentProcessId(), salt);
         SECURITY_ATTRIBUTES sa;
         memset(&sa, 0, sizeof sa);
         sa.nLength = sizeof sa;
         sa.bInheritHandle = TRUE;
-        h = CreateFileA(tmppath, GENERIC_WRITE, FILE_SHARE_READ, &sa,
+        h = CreateFileA(tmppath, GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_DELETE, &sa,
                         CREATE_NEW,
                         FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_TEMPORARY,
                         NULL);
@@ -1215,6 +1228,10 @@ static void zan__crash_handler(int sig, siginfo_t *info, void *ctx) {
      * async-signal-safe. */
     time_t now = time(NULL) + (time_t)zan__crash_tz_off;
     char stamp[32];
+    /* Same broken-down time, kept for zan__crash_logpath_for()'s strftime
+     * below -- rebuilt by hand because localtime_r is not async-signal-safe. */
+    struct tm lt;
+    memset(&lt, 0, sizeof lt);
     {
         long long days = (long long)(now / 86400);
         long long secs = (long long)(now % 86400);
@@ -1225,6 +1242,12 @@ static void zan__crash_handler(int sig, siginfo_t *info, void *ctx) {
         unsigned hh = (unsigned)(secs / 3600);
         unsigned mi = (unsigned)((secs / 60) % 60);
         unsigned ss = (unsigned)(secs % 60);
+        lt.tm_year = y - 1900;
+        lt.tm_mon = (int)mo - 1;
+        lt.tm_mday = (int)da;
+        lt.tm_hour = (int)hh;
+        lt.tm_min = (int)mi;
+        lt.tm_sec = (int)ss;
         char *p = stamp;
         if (y < 0 || y > 9999) y = 1970;
         p[0] = (char)('0' + (y / 1000) % 10);
@@ -1252,7 +1275,7 @@ static void zan__crash_handler(int sig, siginfo_t *info, void *ctx) {
                       sig, addr, stamp);
 
     char path[4096];
-    if (zan__crash_logpath_for(lt, path, sizeof path)) {
+    if (zan__crash_logpath_for(&lt, path, sizeof path)) {
         int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
             /* A supervised worker already has stderr pointing at this same
