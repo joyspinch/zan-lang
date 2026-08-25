@@ -4665,6 +4665,43 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 free(call_args);
                 return result;
             }
+
+            /* Robustness (A43-A15): an unqualified call that resolves to
+             * neither a class method nor a global function used to fall
+             * through every path and silently lower to an empty/zero
+             * result -- the QueryBuilder BuildSelect incident. The
+             * qualified form below already errors when the receiver type
+             * lacks the member entirely; give the implicit-this form the
+             * same contract. Name-only scan (arity ignored) so a genuine
+             * overload/arity mismatch keeps reaching its own diagnostics,
+             * and a local delegate/alias invocation stays exempt. */
+            if (g->current_type_sym &&
+                (g->current_type_sym->kind == SYM_CLASS ||
+                 g->current_type_sym->kind == SYM_STRUCT)) {
+                zan_symbol_t *cur = g->current_type_sym;
+                int member_found = 0;
+                while (cur && !member_found) {
+                    for (int mi = 0; mi < cur->member_count; mi++) {
+                        zan_symbol_t *m = cur->members[mi];
+                        if (m && m->name.len == fn_name.len &&
+                            memcmp(m->name.str, fn_name.str,
+                                   (size_t)fn_name.len) == 0) {
+                            member_found = 1;
+                            break;
+                        }
+                    }
+                    zan_symbol_t *base = (cur->type && cur->type->base_type)
+                        ? cur->type->base_type->sym : NULL;
+                    cur = (base && base != cur) ? base : NULL;
+                }
+                if (!member_found && !local_find(locals, expr->call.callee->ident.name)) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "'%.*s' has no member '%.*s'",
+                        (int)g->current_type_sym->name.len,
+                        g->current_type_sym->name.str,
+                        (int)fn_name.len, fn_name.str);
+                }
+            }
         }
 
         /* Robustness: a call `obj.Method(...)` on a known class/struct type

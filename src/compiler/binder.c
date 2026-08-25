@@ -132,6 +132,39 @@ void zan_binder_init(zan_binder_t *b, zan_arena_t *arena, zan_diag_t *diag) {
  * silently loads the field instead (a data pointer called as a function).
  * Partial classes make this easy to hit - one part declares the field, the
  * other the method - so both parts are checked against the merged type. */
+/* Structural type identity for overload-duplicate detection: kind + name +
+ * recursively compared type arguments. Two declarations of `List<string>`
+ * match even though binder makes fresh type nodes per site. */
+static bool binder_type_equiv(const zan_type_t *a, const zan_type_t *b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    if (a->kind != b->kind) return false;
+    if (a->name.len != b->name.len ||
+        memcmp(a->name.str, b->name.str, (size_t)a->name.len) != 0)
+        return false;
+    if (a->type_arg_count != b->type_arg_count) return false;
+    for (int i = 0; i < a->type_arg_count; i++) {
+        if (!binder_type_equiv(a->type_args[i], b->type_args[i])) return false;
+    }
+    return true;
+}
+
+/* Full parameter-list identity: count plus each parameter's declared type.
+ * Methods differing only in parameter types are legal overloads; methods
+ * with identical lists are the A43-A16 duplicate that used to compile with
+ * first-wins semantics. */
+static bool binder_params_equiv(zan_symbol_t *a, zan_symbol_t *b) {
+    if (a->member_count != b->member_count) return false;
+    for (int i = 0; i < a->member_count; i++) {
+        zan_symbol_t *pa = a->members[i];
+        zan_symbol_t *pb = b->members[i];
+        if (!pa || !pb || pa->kind != SYM_PARAM || pb->kind != SYM_PARAM)
+            return false;
+        if (!binder_type_equiv(pa->type, pb->type)) return false;
+    }
+    return true;
+}
+
 static void check_member_name_clash(zan_binder_t *b, zan_symbol_t *type_sym,
                                     zan_symbol_t *added) {
     for (int i = 0; i < type_sym->member_count; i++) {
@@ -151,6 +184,45 @@ static void check_member_name_clash(zan_binder_t *b, zan_symbol_t *type_sym,
                           "'%.*s'; give one of them a different name",
                           added->name.len, added->name.str,
                           data->kind == SYM_PROPERTY ? "property" : "field",
+                          type_sym->name.len, type_sym->name.str);
+            return;
+        }
+        /* A43-A16: two members of the same kind with the same name used to
+         * be accepted silently and every lookup picked whichever came
+         * first -- a semantics swap with zero diagnostics. Fields collide
+         * on name alone (C# CS0102); methods and constructors collide only
+         * when the full parameter list matches too (C# CS0111, overloads
+         * stay legal); enum members collide on name alone. */
+        if (m_is_data && a_is_data) {
+            zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
+                          "duplicate '%.*s' in '%.*s': a %s with this name "
+                          "is already declared",
+                          added->name.len, added->name.str,
+                          type_sym->name.len, type_sym->name.str,
+                          added->kind == SYM_PROPERTY ? "property" : "field");
+            return;
+        }
+        if (m->kind == SYM_ENUM_MEMBER && added->kind == SYM_ENUM_MEMBER) {
+            zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
+                          "duplicate enum member '%.*s' in '%.*s'",
+                          added->name.len, added->name.str,
+                          type_sym->name.len, type_sym->name.str);
+            return;
+        }
+        if ((m_is_code && a_is_code) &&
+            binder_params_equiv(m, added)) {
+            zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
+                          "duplicate method '%.*s' in '%.*s': a method with "
+                          "the same parameter types is already declared",
+                          added->name.len, added->name.str,
+                          type_sym->name.len, type_sym->name.str);
+            return;
+        }
+        if (m->kind == SYM_CONSTRUCTOR && added->kind == SYM_CONSTRUCTOR &&
+            binder_params_equiv(m, added)) {
+            zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
+                          "duplicate constructor in '%.*s': a constructor "
+                          "with the same parameter types is already declared",
                           type_sym->name.len, type_sym->name.str);
             return;
         }
@@ -1177,11 +1249,9 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
             zan_symbol_t *method_sym = make_symbol(b->arena, SYM_METHOD,
                 member->method_decl.name, ret_type, member,
                 member->method_decl.modifiers);
-            scope_add(b->arena, b->current_scope, method_sym);
-            symbol_add_member(b->arena, type_sym, method_sym);
-            check_member_name_clash(b, type_sym, method_sym);
 
-            /* bind parameters */
+            /* bind parameters BEFORE the duplicate check: comparing two
+             * methods requires both parameter lists to be populated. */
             for (int j = 0; j < member->method_decl.params.count; j++) {
                 zan_ast_node_t *param = member->method_decl.params.items[j];
                 zan_type_t *param_type = zan_binder_resolve_type(b, param->param.type);
@@ -1189,14 +1259,15 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
                     param->param.name, param_type, param, 0);
                 symbol_add_member(b->arena, method_sym, param_sym);
             }
+            scope_add(b->arena, b->current_scope, method_sym);
+            symbol_add_member(b->arena, type_sym, method_sym);
+            check_member_name_clash(b, type_sym, method_sym);
             break;
         }
         case AST_CONSTRUCTOR_DECL: {
             zan_symbol_t *ctor_sym = make_symbol(b->arena, SYM_CONSTRUCTOR,
                 member->method_decl.name, type_sym->type, member,
                 member->method_decl.modifiers);
-            scope_add(b->arena, b->current_scope, ctor_sym);
-            symbol_add_member(b->arena, type_sym, ctor_sym);
 
             for (int j = 0; j < member->method_decl.params.count; j++) {
                 zan_ast_node_t *param = member->method_decl.params.items[j];
@@ -1205,6 +1276,9 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
                     param->param.name, param_type, param, 0);
                 symbol_add_member(b->arena, ctor_sym, param_sym);
             }
+            scope_add(b->arena, b->current_scope, ctor_sym);
+            symbol_add_member(b->arena, type_sym, ctor_sym);
+            check_member_name_clash(b, type_sym, ctor_sym);
             break;
         }
         case AST_ENUM_MEMBER: {
@@ -1212,6 +1286,7 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
                 member->enum_member.name, type_sym->type, member, MOD_PUBLIC);
             scope_add(b->arena, b->current_scope, em_sym);
             symbol_add_member(b->arena, type_sym, em_sym);
+            check_member_name_clash(b, type_sym, em_sym);
             break;
         }
         default:

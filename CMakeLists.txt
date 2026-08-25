@@ -707,6 +707,30 @@ add_test(NAME diag_ctor_initializer_partial
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_ctor_initializer_partial PROPERTIES TIMEOUT 60)
 
+# A43-A16: a duplicate method (same name, same parameter types) used to
+# compile with first-wins semantics -- zero diagnostics for a silent
+# semantics swap. Same-signature duplicates must be a hard error while
+# legal overloads stay untouched.
+add_test(NAME diag_duplicate_member
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/duplicate_member.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_duplicate_member${_exe_ext}
+    "-DEXPECT_REGEX=duplicate method .Val. in .Dup."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_duplicate_member PROPERTIES TIMEOUT 60)
+
+# A43-A15: an unqualified call to a member that exists nowhere in the class
+# chain used to lower silently to an empty/zero result instead of erroring.
+add_test(NAME diag_implicit_ghost_call
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/implicit_ghost_call.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_implicit_ghost_call${_exe_ext}
+    "-DEXPECT_REGEX=.Ghost. has no member .MissingHelper."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_implicit_ghost_call PROPERTIES TIMEOUT 60)
+
 # Regression (audit H4): a named argument bound past a defaulted parameter
 # used to write a NULL into the call's argument list and crash zanc with no
 # diagnostic. The rebinder must reject the shape up front.
@@ -1373,6 +1397,18 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Widget/Tabs.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_tabs.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_tabs${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  # VirtualList template rows: rows are built lazily (never at SetRows, only
+  # when a frame needs them in the viewport) and the string-mode bookkeeping
+  # stays intact across the mode switch.
+  add_test(NAME conformance_gui_virtuallist
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/virtuallist_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Widget/VirtualList.zan;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_virtuallist.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_virtuallist${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # The New Project wizard rescales a template's .zform designs to the chosen
