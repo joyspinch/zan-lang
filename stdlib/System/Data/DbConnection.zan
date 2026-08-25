@@ -85,6 +85,12 @@ class DbConnection : IDbConnection {
     static extern int SQLExecDirect(nint stmt, string sql, int textLength);
 
     [DllImport("odbc32")]
+    static extern int SQLPrepare(nint stmt, string sql, int textLength);
+
+    [DllImport("odbc32")]
+    static extern int SQLExecute(nint stmt);
+
+    [DllImport("odbc32")]
     static extern int SQLNumResultCols(nint stmt, string colCountPtr);
 
     [DllImport("odbc32")]
@@ -122,6 +128,12 @@ class DbConnection : IDbConnection {
 
     [DllImport("odbc")]
     static extern int SQLExecDirect(nint stmt, string sql, int textLength);
+
+    [DllImport("odbc")]
+    static extern int SQLPrepare(nint stmt, string sql, int textLength);
+
+    [DllImport("odbc")]
+    static extern int SQLExecute(nint stmt);
 
     [DllImport("odbc")]
     static extern int SQLNumResultCols(nint stmt, string colCountPtr);
@@ -412,13 +424,35 @@ class DbConnection : IDbConnection {
         return affected;
     }
 
-    /// <summary>执行非查询语句（包装方法：ODBC 为同步操作）。</summary>
+    /// <summary>执行非查询语句。SQLPrepare carries the managed SQL string
+    /// synchronously; handle-only SQLExecute crosses the blocking boundary.</summary>
     async int ExecuteAsync(string sql) {
-        return Execute(sql);
+        if (!this.connected) { return -1; }
+        nint stmt = AllocStmt();
+        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; return -1; }
+        int rc = SQLPrepare(stmt, sql, -3);   // SQL_NTS
+        if (!OdbcSuccess(rc)) {
+            this.lastError = "SQLPrepare failed";
+            SQLFreeHandle(3, stmt);
+            return -1;
+        }
+        int erc = await SQLExecute(stmt);
+        if (!OdbcSuccess(erc)) {
+            this.lastError = "SQLExecute failed";
+            SQLFreeStmt(stmt, 0);
+            SQLFreeHandle(3, stmt);
+            return -1;
+        }
+        byte[] pRows = new byte[8];
+        SQLRowCount(stmt, pRows);
+        int affected = (int)HandleFromBuf(pRows);
+        SQLFreeStmt(stmt, 0);
+        SQLFreeHandle(3, stmt);
+        return affected;
     }
 
     async int ExecuteAsync(string sql, DbParams prms) {
-        return Execute(sql, prms);
+        return await this.ExecuteAsync(InlineParams(sql, prms));
     }
 
     /// <summary>执行查询并返回结果集。</summary>
@@ -477,13 +511,66 @@ class DbConnection : IDbConnection {
         return result;
     }
 
-    /// <summary>执行查询（包装方法：ODBC 为同步操作）。</summary>
+    /// <summary>执行查询。SQLPrepare carries the managed SQL string
+    /// synchronously; handle-only SQLExecute and SQLFetch are offloaded.</summary>
     async DbResult QueryAsync(string sql) {
-        return Query(sql);
+        if (!this.connected) { return DbResult.Empty(); }
+        DbResult result = new DbResult();
+        nint stmt = AllocStmt();
+        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; return result; }
+        int rc = SQLPrepare(stmt, sql, -3);   // SQL_NTS
+        if (!OdbcSuccess(rc)) {
+            this.lastError = "SQLPrepare failed";
+            SQLFreeHandle(3, stmt);
+            return result;
+        }
+        int erc = await SQLExecute(stmt);
+        if (!OdbcSuccess(erc)) {
+            this.lastError = "SQLExecute failed";
+            SQLFreeStmt(stmt, 0);
+            SQLFreeHandle(3, stmt);
+            return result;
+        }
+        byte[] pcc = new byte[4];
+        SQLNumResultCols(stmt, pcc);
+        int colCount = Int16FromBuf(pcc);
+        result.SetColumnCount(colCount);
+        int c = 0;
+        for (; c < colCount; c = c + 1) {
+            byte[] nameBuf = new byte[256];
+            byte[] pNameLen = new byte[4];
+            byte[] pType = new byte[4];
+            byte[] pSize = new byte[8];
+            byte[] pDec = new byte[4];
+            byte[] pNull = new byte[4];
+            SQLDescribeCol(stmt, c + 1, nameBuf, 256, pNameLen, pType, pSize, pDec, pNull);
+            result.AddColumnName(BufToString(nameBuf, 256));
+        }
+        int fr = await SQLFetch(stmt);
+        while (fr == 0 || fr == 1) {
+            List<string> row = new List<string>();
+            c = 0;
+            while (c < colCount) {
+                byte[] buf = new byte[4096];
+                byte[] pInd = new byte[8];
+                int g = SQLGetData(stmt, c + 1, 1, buf, 4096, pInd);
+                if (g == 100) {
+                    row.Add("");
+                } else {
+                    row.Add(BufToString(buf, 4096));
+                }
+                c = c + 1;
+            }
+            result.AddRow(row);
+            fr = await SQLFetch(stmt);
+        }
+        SQLFreeStmt(stmt, 0);
+        SQLFreeHandle(3, stmt);
+        return result;
     }
 
     async DbResult QueryAsync(string sql, DbParams prms) {
-        return Query(sql, prms);
+        return await QueryAsync(InlineParams(sql, prms));
     }
 
     /// <summary>执行标量查询（以字符串形式返回第一行第一列）。</summary>
@@ -503,18 +590,36 @@ class DbConnection : IDbConnection {
         return "";
     }
 
-    /// <summary>执行标量查询（包装方法：ODBC 为同步操作）。</summary>
+    /// <summary>执行标量查询; see QueryAsync for the SQLPrepare/SQLExecute
+    /// split used by this provider.</summary>
     async string ExecuteScalarAsync(string sql) {
-        return ExecuteScalar(sql);
+        DbResult result = await QueryAsync(sql);
+        if (result.RowCount() > 0) {
+            return result.GetString(0, 0);
+        }
+        return "";
     }
 
     async string ExecuteScalarAsync(string sql, DbParams prms) {
-        return ExecuteScalar(sql, prms);
+        DbResult result = await QueryAsync(sql, prms);
+        if (result.RowCount() > 0) {
+            return result.GetString(0, 0);
+        }
+        return "";
     }
 
-    async bool BeginTransactionAsync() { this.BeginTransaction(); return true; }
-    async bool CommitAsync() { this.Commit(); return true; }
-    async bool RollbackAsync() { this.Rollback(); return true; }
+    async bool BeginTransactionAsync() {
+        await this.ExecuteAsync("BEGIN");
+        return true;
+    }
+    async bool CommitAsync() {
+        await this.ExecuteAsync("COMMIT");
+        return true;
+    }
+    async bool RollbackAsync() {
+        await this.ExecuteAsync("ROLLBACK");
+        return true;
+    }
 
     /// <summary>获取此连接记录的最后一条错误信息。</summary>
     string GetError() {
