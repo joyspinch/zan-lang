@@ -4,14 +4,17 @@
 # Theme tokens). Widget draw and measure paths must consume the resolved
 # StyleBox fontPx instead of reading Theme fontSize* fields directly.
 #
-# PAID OFF (298 -> 36): every widget/component draw path now consumes
+# PAID OFF (298 -> 37): every widget/component draw path now consumes
 # Style.FontFallback(app, size) (or a resolved StyleBox), so skins can
 # override type scale from base.css. The only residual reads are the style
 # layer itself (Style.zan implements the fallback funnel, Theme.zan defines
-# the tokens), UiDriver.ThemeJson's palette export for driver self-checks
-# (not a draw path), and two Theme-parameter-injected APIs whose callers pass
-# the theme explicitly (ChartResolved.ResolvedSeries.Of, CodeEditor.FontSize).
+# the tokens, StyleBox.zan defaults fontPx from a token once), UiDriver.
+# ThemeJson's palette export for driver self-checks (not a draw path), and
+# two Theme-parameter-injected APIs whose callers pass the theme explicitly
+# (ChartResolved.ResolvedSeries.Of, CodeEditor.FontSize).
 # Widget requires zero; any file with reads that is not listed is implicit zero.
+# The matcher accepts a leading '.', so member chains like
+# app.theme.fontSizeSmall can no longer dodge the budget (2026-02 hole).
 #
 # Inputs: ROOT (repository root).
 
@@ -20,12 +23,13 @@ cmake_policy(SET CMP0007 NEW)
 set(_budget
   "stdlib/Gui/Style.zan=14"
   "stdlib/Gui/Theme.zan=15"
+  "stdlib/Gui/StyleBox.zan=1"
   "stdlib/Gui/Backend/UiDriver.zan=5"
   "stdlib/Gui/Component/Chart/ChartResolved.zan=1"
   "stdlib/Gui/Component/CodeEditor/CodeEditor.zan=1"
 )
 set(_members "fontSizeTiny|fontSizeSmall|fontSizeMedium|fontSizeLarge|fontSizeHuge")
-set(_total_budget 36)
+set(_total_budget 37)
 file(GLOB_RECURSE _sources "${ROOT}/stdlib/Gui/*.zan")
 
 set(_fail "")
@@ -42,7 +46,7 @@ foreach(_f ${_sources})
       continue()
     endif()
     string(REGEX MATCHALL
-      "[^A-Za-z0-9_.](t|theme)\\.(${_members})[^A-Za-z0-9_]"
+      "[^A-Za-z0-9_](t|theme)\\.(${_members})[^A-Za-z0-9_]"
       _hits " ${_line} ")
     list(FILTER _hits EXCLUDE REGEX "^$")
     list(LENGTH _hits _c)
@@ -87,7 +91,7 @@ foreach(_dir ${_dir_names})
         continue()
       endif()
       string(REGEX MATCHALL
-        "[^A-Za-z0-9_.](t|theme)\\.(${_members})[^A-Za-z0-9_]"
+        "[^A-Za-z0-9_](t|theme)\\.(${_members})[^A-Za-z0-9_]"
         _hits " ${_line} ")
       list(FILTER _hits EXCLUDE REGEX "^$")
       list(LENGTH _hits _c)
