@@ -305,27 +305,28 @@ class MySqlSyncConnection : IDbConnection {
         p = p + 8;
         p = p + 1;                                    // 填充
         int capLow = (hs[p]&255)|((hs[p+1]&255)<<8);
-        p = p + 2;
-        int charset = hs[p] & 255; p = p + 1;
+        p = p + 2;                                    // 能力标志（低位）
+        p = p + 1;                                    // 字符集
+        // 状态标志（2 字节）必须跳过——此前漏读它导致 capHigh 读到的是
+        // 状态字、authLen 落进保留零区（=0），nonce 第二段从未拷入，
+        // scramble 只覆盖 8 个真实字节：任何非空密码的认证必然失败。
+        p = p + 2;                                    // 状态标志
         int capHigh = (hs[p]&255)|((hs[p+1]&255)<<8);
-        p = p + 2;
         int caps = capLow | (capHigh << 16);
         int capPluginAuth = (caps & 524288) != 0 ? 1 : 0;
-        p = p + 1;                                    // 填充（1 字节）
-        p = p + 10;                                   // 填充（10 字节）
-        int authLen = 0;
-        if (capPluginAuth != 0) {
-            authLen = hs[p] & 255;
-            p = p + 1;
-        } else {
-            p = p + 1;
-        }
+        p = p + 2;                                    // 能力标志（高位）
+        int authLen = hs[p] & 255;
+        p = p + 1;                                    // 认证插件数据长度
+        p = p + 10;                                   // 保留字段
+        // 规范：part2 长度 = max(13, authlen - 8)；缓冲只有 12+8=20，
+        // 实际最多拷 12 字节（与异步版一致）。
         int part2 = authLen - 8;
-        if (part2 > 12) { part2 = 12; }
+        if (part2 < 13) { part2 = 13; }
+        int copy2 = part2;
+        if (copy2 > 12) { copy2 = 12; }
         i = 0;
-        while (i < part2) { nonce[8 + i] = (byte)(hs[p+i] & 255); i = i + 1; }
+        while (i < copy2) { nonce[8 + i] = (byte)(hs[p+i] & 255); i = i + 1; }
         p = p + part2;
-        if ((caps & 512) != 0) { p = p + 1; }         // SECURE_CONNECTION：跳过填充
         string plugin = "mysql_native_password";
         if (capPluginAuth != 0) {
             int pluginEnd = p;

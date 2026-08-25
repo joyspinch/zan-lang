@@ -528,7 +528,11 @@ class HttpClient {
     }
 
     // 解析十六进制 chunk 大小前缀，在第一个非十六进制字节处停止
-    // （例如 ';' 分块扩展或 CR）。
+    // （例如 ';' 分块扩展或 CR）。累计上限 0x00FFFFFF（16 MiB-1）：恶意
+    // 服务器发超长十六进制串会让 v*16 回绕成负数，下游
+    // need = crlf+2+size+2 随之为负、Substring 触发数组越界陷阱直接杀死
+    // 进程——服务器端解析器（HttpFramer.ReadChunked）早有同样的上限纪律，
+    // 客户端此前从未对齐。超限返回 -1，调用方按坏帧处理。
     static int ParseHex(string s) {
         int v = 0;
         for (int i = 0; i < s.Length; i = i + 1) {
@@ -539,6 +543,7 @@ class HttpClient {
             else if (c >= 65 && c <= 70) { d = c - 65 + 10; }
             else { i = s.Length; }
             if (d >= 0) { v = v * 16 + d; }
+            if (v > 16777215) { return 0 - 1; }
         }
         return v;
     }
@@ -722,7 +727,11 @@ class HttpClient {
                     else {
                         string sizeLine = pending.Substring(0, crlf);
                         int size = HttpClient.ParseHex(sizeLine);
-                        if (size == 0) {
+                        if (size < 0) {
+                            // 坏的块大小行：按截断响应收尾，不再扫描。
+                            finished = true;
+                            progressed = false;
+                        } else if (size == 0) {
                             finished = true;
                             cleanEnd = true;
                             progressed = false;
@@ -1118,6 +1127,11 @@ class HttpClient {
                     int crlf = HttpClient.IndexOf(pending, "\r\n", 0);
                     if (crlf >= 0) {
                         int size = HttpClient.ParseHex(pending.Substring(0, crlf));
+                        if (size < 0) {
+                            // 坏的块大小行（超限/非法）：停止分块消费，
+                            // 剩余缓冲按原样落盘后结束。
+                            break;
+                        }
                         if (size == 0) {
                             finished = true;
                         } else {

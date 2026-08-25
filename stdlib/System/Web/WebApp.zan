@@ -989,11 +989,28 @@ class Sessions {
     /// request in the process and those run on several worker threads: a Set
     /// that rehashes while another thread is reading corrupts the table, and
     /// the count that makes the token unique must be read under the same lock
-    /// as the insert.</summary>
+    /// as the insert.
+    ///
+    /// Tokens are 32 CSPRNG bytes (RtlGenRandom / /dev/urandom) hex-encoded:
+    /// 256 bits of entropy an attacker cannot guess or forge. The previous
+    /// scheme ("t" + wall-clock seconds + uid + map count) had zero entropy --
+    /// anyone who knew a user's uid and could guess the second their session
+    /// started owned that session. On CSPRNG failure we refuse to issue
+    /// rather than mint something predictable; when the map grows past its
+    /// flood cap it is cleared instead of growing without bound.</summary>
     string Issue(string uid, int nowSeconds) {
         lock (this) {
-            string token = "t" + Convert.ToString(nowSeconds) + "x" + uid
-                + Convert.ToString(this.tokens.Count());
+            byte[] rnd = RandomNumberGenerator.GetBytes(32);
+            if (rnd == null) { return ""; }
+            if (this.tokens.Count() >= 65536) { this.tokens.Clear(); }
+            string h = "0123456789abcdef";
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 32; i = i + 1) {
+                int v = rnd[i] & 255;
+                sb.Append(h.Substring(v >> 4, 1));
+                sb.Append(h.Substring(v & 15, 1));
+            }
+            string token = sb.ToString();
             this.tokens.Set(token, uid);
             return token;
         }
