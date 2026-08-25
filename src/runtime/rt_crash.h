@@ -104,9 +104,11 @@ static int zan__crash_in_main(void *addr, uintptr_t exe_base) {
     return 0;
 }
 
-/* Locate a symbolizer: prefer one shipped beside the exe (so a Debug publish
- * is self-contained), else fall back to PATH. Returns 1/2 for
- * addr2line/llvm-symbolizer and writes the program name/path into out. */
+/* Locate a symbolizer beside the exe, so a Debug publish is self-contained
+ * and the crash path never executes a binary whose location depends on CWD
+ * or PATH (either is attacker-influenceable; the search was removed rather
+ * than hardened). Returns 1/2 for addr2line/llvm-symbolizer and writes the
+ * program path into out. */
 static int zan__crash_find_symbolizer(const char *exe_dir, char *out, size_t outsz) {
     char cand[MAX_PATH];
     snprintf(cand, sizeof cand, "%saddr2line.exe", exe_dir);
@@ -200,16 +202,30 @@ static void zan__crash_symbolize(const char *logpath, const char *exe,
                  sym, exe, addrs);
 
     char tmppath[MAX_PATH];
-    snprintf(tmppath, sizeof tmppath, "%szan_crash.sym.%lu.tmp", exe_dir,
-             (unsigned long)GetCurrentProcessId());
-
-    SECURITY_ATTRIBUTES sa;
-    memset(&sa, 0, sizeof sa);
-    sa.nLength = sizeof sa;
-    sa.bInheritHandle = TRUE;
-    HANDLE h = CreateFileA(tmppath, GENERIC_WRITE,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
-                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    /* Unpredictable name, created exclusively: a pid-only temp beside the exe
+     * is trivially pre-created by another local process, and CREATE_ALWAYS
+     * would then truncate whatever that handle holds -- poisoning the block
+     * this function later appends into the crash log. Tick count plus an ASLR-
+     * derived stack address give bits an outside process cannot guess; the
+     * CREATE_NEW loop closes the residual collision window. */
+    HANDLE h = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 8 && h == INVALID_HANDLE_VALUE; attempt++) {
+        unsigned long long salt =
+            (unsigned long long)GetTickCount64()
+            ^ ((unsigned long long)(uintptr_t)&attempt << 17)
+            ^ ((unsigned long long)GetCurrentProcessId() << 33)
+            ^ ((unsigned long long)attempt * 0x9E3779B97F4A7C15ull);
+        snprintf(tmppath, sizeof tmppath, "%szan_crash.sym.%lu.%016llx.tmp",
+                 exe_dir, (unsigned long)GetCurrentProcessId(), salt);
+        SECURITY_ATTRIBUTES sa;
+        memset(&sa, 0, sizeof sa);
+        sa.nLength = sizeof sa;
+        sa.bInheritHandle = TRUE;
+        h = CreateFileA(tmppath, GENERIC_WRITE, FILE_SHARE_READ, &sa,
+                        CREATE_NEW,
+                        FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_TEMPORARY,
+                        NULL);
+    }
     if (h == INVALID_HANDLE_VALUE) return;
     STARTUPINFOA si;
     memset(&si, 0, sizeof si);
@@ -637,8 +653,15 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
          * after the raw record is flushed so a symbolizer failure never costs
          * us the addresses -- and skipped entirely after an overflow, where
          * this still runs on the stack that has just run out and spawning a
-         * symbolizer is more than it has left. */
-        if (er->ExceptionCode != EXCEPTION_STACK_OVERFLOW) {
+         * symbolizer is more than it has left. Also skipped when the heap or
+         * fail-fast machinery reported itself broken: fopen/fprintf/spawn run
+         * on CRT state those codes declare untrustworthy, and hanging there
+         * costs more than the resolution is worth -- the module+offset lines
+         * above still resolve offline via scripts\symbolize_crash.ps1. */
+        DWORD crash_code = er->ExceptionCode;
+        if (crash_code != EXCEPTION_STACK_OVERFLOW &&
+            crash_code != 0xC0000374 /* heap corruption */ &&
+            crash_code != 0xC0000409 /* fail-fast */) {
             zan__crash_symbolize(logpath, exe, exe_dir[0] ? exe_dir : ".\\",
                                  exe_base, ep->ExceptionRecord->ExceptionAddress,
                                  frames, fn, 0);

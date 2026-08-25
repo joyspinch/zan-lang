@@ -31,7 +31,11 @@ struct json_value {
         double num;
         char  *str;                 /* owned, NUL-terminated */
         struct { json_value **items; int count; int cap; } arr;
-        struct { char **keys; json_value **vals; int count; int cap; } obj;
+        struct { char **keys; json_value **vals; int count; int cap;
+                 /* Open-addressing key -> ordinal+1 index over keys[] (NULL
+                  * until the object grows past a few members); keeps
+                  * construction and lookup O(1) per member. */
+                 int *index; int index_cap; } obj;
     } as;
 };
 

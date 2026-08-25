@@ -126,6 +126,11 @@ static int g_io_count;
 /* Whether the backend has been initialized. Generated async programs never
  * call zan_io_init explicitly, so zan_io_wait_co lazy-inits on first use. */
 static int g_io_started;
+/* Set when the backend could not start (epoll_create1/kqueue failed, usually
+ * EMFILE): every later registration fails its waiter through the dead queue
+ * instead of parking a coroutine that nothing will ever wake -- the old
+ * behaviour was every await in the process hanging silently forever. */
+static int g_io_broken;
 
 /* ---- async hostname resolution (shared by all backends) ----
  * zan_io_resolve_co runs the lookup on a worker thread so the reactor never
@@ -298,7 +303,13 @@ static void io_deliver_recv(zan_io_entry_t *e) {
         return;
     }
     if (!e->out_n) return;
-    ssize_t rn = recv(e->fd, e->rbuf, (size_t)e->rlen, 0);
+    ssize_t rn;
+    do {
+        rn = recv(e->fd, e->rbuf, (size_t)e->rlen, 0);
+    } while (rn < 0 && errno == EINTR);
+    /* Retry transient EINTR: readiness was real, and reporting a signal
+     * interruption as 0 bytes would fabricate a peer close and tear down a
+     * healthy keep-alive connection. */
     *e->out_n = (rn < 0) ? 0 : (int64_t)rn;
 }
 
@@ -349,6 +360,12 @@ void zan_io_socket_cleanup(void) {}
  * connection mid-send (e.g. a server that answers 413 and closes). */
 int64_t zan_io_socket_send(intptr_t fd, const void *buf, int64_t len,
                            int32_t flags) {
+    /* The runtime is the last validation before the kernel: a Zan-side
+     * underflow or -1 sentinel used to reach send() as a negative int
+     * (Windows truncation) or ~2^64 size_t (POSIX wrap). Callers loop for
+     * anything larger than one OS call anyway. */
+    if (len <= 0) return len == 0 ? 0 : -2;
+    if (len > 0x7FFFFFFF) len = 0x7FFFFFFF;
 #if defined(_WIN32)
     int _sr = send((SOCKET)fd, (const char *)buf, (int)len, (int)flags);
     if (_sr == SOCKET_ERROR) {
@@ -374,6 +391,9 @@ int64_t zan_io_socket_send(intptr_t fd, const void *buf, int64_t len,
 
 int64_t zan_io_socket_recv(intptr_t fd, void *buf, int64_t len,
                            int32_t flags) {
+    /* Same clamp discipline as send: reject negatives, cap at INT_MAX. */
+    if (len < 0) return -2;
+    if (len > 0x7FFFFFFF) len = 0x7FFFFFFF;
 #if defined(_WIN32)
     return (int64_t)recv((SOCKET)fd, (char *)buf, (int)len, (int)flags);
 #else
@@ -382,7 +402,11 @@ int64_t zan_io_socket_recv(intptr_t fd, void *buf, int64_t len,
 }
 
 const char *zan_io_socket_peer_ip(intptr_t fd) {
-    static char address[INET6_ADDRSTRLEN];
+    /* Thread-local: the --async-workers driver runs connection steps on
+     * several threads, and a process-wide static was formatted concurrently
+     * by unrelated requests (torn / mixed strings). Each thread formats into
+     * its own buffer; callers copy out immediately as before. */
+    static _Thread_local char address[INET6_ADDRSTRLEN];
     struct sockaddr_storage peer;
 #if defined(_WIN32)
     int length = (int)sizeof(peer);
@@ -396,7 +420,8 @@ const char *zan_io_socket_peer_ip(intptr_t fd) {
 
 /* Format the address part of a sockaddr (IPv4 or IPv6) as text. */
 const char *zan_io_sockaddr_ip_str(const void *sa) {
-    static char address[INET6_ADDRSTRLEN];
+    /* Thread-local, for the same multi-worker reason as peer_ip above. */
+    static _Thread_local char address[INET6_ADDRSTRLEN];
     const struct sockaddr *a = (const struct sockaddr *)sa;
     if (a->sa_family == AF_INET) {
         const struct sockaddr_in *in = (const struct sockaddr_in *)a;
@@ -632,7 +657,12 @@ static void io_deliver_waiter(int fd, zan_io_waiter_t *w) {
         return;
     }
     if (!w->out_n) return;
-    ssize_t rn = recv(fd, w->rbuf, (size_t)w->rlen, 0);
+    ssize_t rn;
+    do {
+        rn = recv(fd, w->rbuf, (size_t)w->rlen, 0);
+    } while (rn < 0 && errno == EINTR);
+    /* Retry transient EINTR rather than fabricate an EOF: see the twin in
+     * io_deliver_recv. */
     *w->out_n = (rn < 0) ? 0 : (int64_t)rn;
 }
 
@@ -663,6 +693,33 @@ static int io_take(zan_io_slot_t *s, int fd, int read_dir,
     }
     (void)fd;
     return n;
+}
+
+/* Remove a waiter that was just inserted, for the registration-failure paths:
+ * io_mark_dead queues its own delivery, so a waiter still reachable from the
+ * slot would let the sweep wake the same frame a second time (an 8-byte UAF
+ * through *out_n/*out_accept, whose storage typically belongs to an already
+ * finished frame) and leaks one g_io_count. Mirrors io_take's unlink order. */
+static void io_unlink_waiter(zan_io_slot_t *s, int read_dir,
+                             zan_io_waiter_t *w) {
+    unsigned char *has = read_dir ? &s->has_r : &s->has_w;
+    zan_io_waiter_t *inl = read_dir ? &s->r : &s->w;
+    if (w == inl) {
+        zan_io_waiter_t *rest = inl->next;
+        if (rest) {
+            *inl = *rest;   /* promote the first chained node into the slot */
+            free(rest);
+        } else {
+            inl->next = NULL;
+            *has = 0;
+        }
+        return;
+    }
+    zan_io_waiter_t *p = inl;
+    while (p && p->next != w) p = p->next;
+    if (!p) return;   /* not reachable: nothing to undo */
+    p->next = w->next;
+    free(w);
 }
 
 /* Fail every waiter parked on an fd that has since been closed. Closing an fd
@@ -713,6 +770,10 @@ void zan_io_init(void) {
     g_io_entries = NULL;
     g_io_count = 0;
     g_epoll_fd = epoll_create1(0);
+    /* e.g. EMFILE: mark the backend broken so every later await fails
+     * through the dead queue instead of parking forever with zero
+     * diagnostics -- epoll_wait on -1 never reports anything. */
+    if (g_epoll_fd < 0) g_io_broken = 1;
     /* Wake fd for async-DNS completions: a persistent (non-ONESHOT) EPOLLIN
      * member of the set, so a worker thread's eventfd write wakes zan_io_poll
      * even when no socket watcher is ready. */
@@ -767,6 +828,13 @@ void zan_io_init(void) {
         if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev) != 0) s->in_epoll = 0;
     }
 }static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
+    if (g_io_broken) {   /* backend never started: fail, don't park forever */
+        io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);
+        g_pending_rbuf = NULL;
+        g_pending_out_n = NULL;
+        g_pending_accept_out = NULL;
+        return;
+    }
     if (io_reject_dead_fd(fd, co, step)) return;
     zan_io_slot_t *s = io_slot((int)fd);
     if (!s) {   /* slot table could not grow: fail rather than drop the waiter */
@@ -888,6 +956,8 @@ void zan_io_init(void) {
     g_io_entries = NULL;
     g_io_count = 0;
     g_kq_fd = kqueue();
+    /* Same broken-marking as the epoll backend: fail awaits loudly. */
+    if (g_kq_fd < 0) g_io_broken = 1;
     /* Async-DNS wake pipe: the read end joins the kqueue with a persistent
      * (non-ONESHOT) EVFILT_READ, so a worker thread's write wakes zan_io_poll
      * even when no socket watcher is ready. */
@@ -928,6 +998,13 @@ void zan_io_shutdown(void) {
 }
 
 static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t step) {
+    if (g_io_broken) {   /* backend never started: fail, don't park forever */
+        io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);
+        g_pending_rbuf = NULL;
+        g_pending_out_n = NULL;
+        g_pending_accept_out = NULL;
+        return;
+    }
     if (io_reject_dead_fd(fd, co, step)) return;
     zan_io_slot_t *s = io_slot((int)fd);
     if (!s) {   /* slot table could not grow: fail rather than drop the waiter */
@@ -977,7 +1054,12 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
     EV_SET(&kev, fd, filter, EV_ADD | EV_ONESHOT, 0, 0, NULL);
     if (kevent(g_kq_fd, &kev, 1, NULL, 0, NULL) != 0) {
         /* fd was closed or otherwise invalid: fail the waiter so it does not
-         * park forever. */
+         * park forever. Unlink it from the slot FIRST -- io_mark_dead queues
+         * its own delivery, and a waiter still reachable here would let the
+         * sweep wake this same frame a second time (an 8-byte UAF through
+         * *out_n/*out_accept) and leak one g_io_count. */
+        io_unlink_waiter(s, interest == ZAN_IO_READ ? 1 : 0, w);
+        g_io_count--;
         io_mark_dead(co, step, g_pending_out_n, g_pending_accept_out);
         g_pending_rbuf = NULL;
         g_pending_out_n = NULL;
@@ -1496,10 +1578,18 @@ void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
     /* Hard error: report 0 bytes (peer-close semantics) via a queued packet. */
     if (out_n) *out_n = 0;
 #if defined(ZAN_CO_DRIVER)
-    PostQueuedCompletionStatus(io_shard_of(s), 0, (ULONG_PTR)s, &op->ov);
+    if (!PostQueuedCompletionStatus(io_shard_of(s), 0, (ULONG_PTR)s, &op->ov)) {
 #else
-    PostQueuedCompletionStatus(g_iocp, 0, (ULONG_PTR)s, &op->ov);
+    if (!PostQueuedCompletionStatus(g_iocp, 0, (ULONG_PTR)s, &op->ov)) {
 #endif
+        /* The port is gone or the post failed for another reason: nothing
+         * will dequeue this completion, so deliver inline like io_register's
+         * failure path does -- otherwise the frame parks forever, the op
+         * leaks and g_io_count stays elevated past quiescence. */
+        if (step) zan_co_ready(frame, step);
+        op_free(op);
+        IO_CNT_DEC();
+    }
 }
 
 void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
@@ -2501,6 +2591,7 @@ int64_t zan_io_connect(intptr_t fd, const char *ip, int32_t port) {
     if (!co) return -1;
 
     zan_io_op_t *op = op_alloc();
+    if (!op) return -1;   /* like every other op site: fail the connect */
     op->sock = s;
     op->interest = ZAN_IO_WRITE;
     op->co = co;
@@ -2546,7 +2637,10 @@ int64_t zan_io_connect(intptr_t fd, const char *ip, int32_t port) {
 
     int err = 0;
     socklen_t len = sizeof(err);
-    getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len);
+    /* A failed getsockopt means the fd died under the wait (closed via
+     * Socket.Stop -- the stranded-watcher case): report connect failure, not
+     * success with a stale err==0. */
+    if (getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len) != 0) return -1;
     return err == 0 ? 0 : -1;
 }
 #endif
@@ -3424,6 +3518,14 @@ void zan_co_sched_init(void) {
 void zan_co_ready(void *frame, zan_co_step_t step) {
     if (!step) return;
     zan_co_node *n = (zan_co_node *)malloc(sizeof(*n));
+    if (!n) {
+        /* Out of memory: stepping inline keeps the frame's release contract
+         * intact. This driver is single-threaded, so the only new hazard is
+         * re-entrancy through the step -- strictly better than dropping the
+         * wake and parking the coroutine forever. */
+        step(frame);
+        return;
+    }
     n->next = NULL; n->frame = frame; n->step = step;
     if (g_rq_tail) g_rq_tail->next = n; else g_rq_head = n;
     g_rq_tail = n;

@@ -67,16 +67,89 @@ void json_arr_add(json_value *arr, json_value *val) {
     arr->as.arr.items[arr->as.arr.count++] = val;
 }
 
+/* ---- object key index ----------------------------------------------------
+ * json_obj_set runs once per member while parsing and used to linear-scan
+ * every existing key for the replace case, making object construction
+ * O(n^2) strcmps -- a 20k-key message cost ~2e8 comparisons, a CPU
+ * amplifier any peer gets for free. A small open-addressing index (key hash
+ * -> ordinal+1, 0 = empty slot) sits next to the ordered arrays;
+ * serialization still walks the arrays, so insertion order is preserved.
+ * There is no per-key removal API, so the index never needs tombstones.
+ * The index is optional at runtime: if its allocation fails, callers fall
+ * back to the linear scan. */
+static uint64_t json_key_hash(const char *s) {
+    uint64_t h = 1469598103934665603ULL;
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/* index_cap is always a power of two and at least twice the member count,
+ * so the load factor stays <= 0.5 and probes terminate. */
+static int json_obj_index_find(const json_value *obj, const char *key,
+                               uint64_t h) {
+    int cap = obj->as.obj.index_cap;
+    if (!obj->as.obj.index || cap == 0) return -1;
+    uint32_t mask = (uint32_t)(cap - 1);
+    uint32_t i = (uint32_t)h & mask;
+    while (obj->as.obj.index[i]) {
+        int ordinal = obj->as.obj.index[i] - 1;
+        if (ordinal >= 0 && ordinal < obj->as.obj.count &&
+            strcmp(obj->as.obj.keys[ordinal], key) == 0)
+            return ordinal;
+        i = (i + 1) & mask;
+    }
+    return -1;
+}
+
+static void json_obj_index_insert(json_value *obj, const char *key,
+                                  int ordinal) {
+    uint64_t h = json_key_hash(key);
+    uint32_t mask = (uint32_t)(obj->as.obj.index_cap - 1);
+    uint32_t i = (uint32_t)h & mask;
+    while (obj->as.obj.index[i]) i = (i + 1) & mask;
+    obj->as.obj.index[i] = ordinal + 1;
+}
+
+/* (Re)build from the ordered arrays; ordinals are stable across growth, so
+ * this is also correct after keys[] was realloc'd. A failed calloc leaves
+ * the object without an index -- correctness never depends on it. */
+static void json_obj_index_rebuild(json_value *obj) {
+    int want = obj->as.obj.cap > 8 ? obj->as.obj.cap : 8;
+    int cap = 16;
+    while (cap < want * 2) {
+        if (cap > (INT_MAX >> 1)) { free(obj->as.obj.index); obj->as.obj.index = NULL; obj->as.obj.index_cap = 0; return; }
+        cap <<= 1;
+    }
+    free(obj->as.obj.index);
+    obj->as.obj.index = (int *)calloc((size_t)cap, sizeof(int));
+    obj->as.obj.index_cap = obj->as.obj.index ? cap : 0;
+    if (!obj->as.obj.index) return;
+    for (int k = 0; k < obj->as.obj.count; k++)
+        json_obj_index_insert(obj, obj->as.obj.keys[k], k);
+}
+
 void json_obj_set(json_value *obj, const char *key, json_value *val) {
     if (!obj || obj->type != JSON_OBJ || !key || !val) return;
-    /* replace existing */
-    for (int i = 0; i < obj->as.obj.count; i++) {
-        if (strcmp(obj->as.obj.keys[i], key) == 0) {
-            json_free(obj->as.obj.vals[i]);
-            obj->as.obj.vals[i] = val;
-            return;
+
+    /* replace existing: indexed when live, linear otherwise (tiny objects
+     * never pay for an index; a failed index allocation keeps working). */
+    int found = -1;
+    if (obj->as.obj.index) {
+        found = json_obj_index_find(obj, key, json_key_hash(key));
+    } else {
+        for (int i = 0; i < obj->as.obj.count; i++) {
+            if (strcmp(obj->as.obj.keys[i], key) == 0) { found = i; break; }
         }
     }
+    if (found >= 0) {
+        json_free(obj->as.obj.vals[found]);
+        obj->as.obj.vals[found] = val;
+        return;
+    }
+
     if (obj->as.obj.count >= obj->as.obj.cap) {
         /* Grow keys and vals independently. If one realloc fails we must not
          * touch the still-valid original of the other: realloc returns NULL
@@ -101,9 +174,22 @@ void json_obj_set(json_value *obj, const char *key, json_value *val) {
         }
         obj->as.obj.cap = nc;
     }
-    obj->as.obj.keys[obj->as.obj.count] = strdup_key(key);
+    char *copy = strdup_key(key);
+    if (!copy) { json_free(val); return; }
+    obj->as.obj.keys[obj->as.obj.count] = copy;
     obj->as.obj.vals[obj->as.obj.count] = val;
     obj->as.obj.count++;
+
+    /* Keep the index live once the object is big enough for O(n^2) to hurt:
+     * build on first entry past 16 members, grow before load passes 0.5. */
+    if (!obj->as.obj.index) {
+        if (obj->as.obj.count >= 16) json_obj_index_rebuild(obj);
+    } else if ((obj->as.obj.count + 1) * 2 > obj->as.obj.index_cap &&
+               obj->as.obj.index_cap <= (INT_MAX >> 1)) {
+        json_obj_index_rebuild(obj);
+    } else {
+        json_obj_index_insert(obj, copy, obj->as.obj.count - 1);
+    }
 }
 
 /* ============================== free ================================= */
@@ -125,6 +211,7 @@ void json_free(json_value *v) {
         }
         free(v->as.obj.keys);
         free(v->as.obj.vals);
+        free(v->as.obj.index);
         break;
     default:
         break;
@@ -140,6 +227,10 @@ bool json_is(const json_value *v, json_type_t type) {
 
 json_value *json_obj_get(const json_value *obj, const char *key) {
     if (!obj || obj->type != JSON_OBJ || !key) return NULL;
+    if (obj->as.obj.index) {
+        int ordinal = json_obj_index_find(obj, key, json_key_hash(key));
+        return ordinal >= 0 ? obj->as.obj.vals[ordinal] : NULL;
+    }
     for (int i = 0; i < obj->as.obj.count; i++) {
         if (strcmp(obj->as.obj.keys[i], key) == 0) return obj->as.obj.vals[i];
     }

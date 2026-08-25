@@ -109,6 +109,10 @@ char *rpc_read_message_cb(rpc_reader_fn reader, void *ctx, long max_len) {
 bool rpc_write_message_cb(rpc_writer_fn writer, void *ctx, const char *payload) {
     char header[64];
     size_t len = strlen(payload);
+    /* The writer ABI takes an int length; a >INT_MAX payload would truncate
+     * to a negative count and become a huge fwrite. Fail instead of
+     * corrupting the stream (the read side caps at RPC_MAX_MESSAGE anyway). */
+    if (len > (size_t)0x7FFFFFFF) return false;
     int hn = snprintf(header, sizeof(header), "Content-Length: %zu\r\n\r\n", len);
     if (hn < 0) return false;
     if (!writer(ctx, header, hn)) return false;
