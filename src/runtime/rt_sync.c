@@ -313,17 +313,33 @@ static void zan_make_names(const char *name, char map_name[96]) {
  * PID truncation can alias a live process; the probe then reports alive and
  * the waiter keeps spinning. Reclamation is a heuristic safety net, never
  * the primary mutual-exclusion mechanism: a live holder's word is only ever
- * cleared by the holder's own release-store of 0. */
+ * cleared by the holder's own release-store of 0.
+ *
+ * KNOWN LIMITATION (documented, not yet fixed): the word carries only
+ * bit31|pid, so a RECYCLED pid of a dead holder reads as alive and reclaim
+ * never fires -- a waiter can spin on an orphaned lock until the holder
+ * slot is otherwise released. Sharpest case: the waiter's own pid was
+ * recycled from the dead holder. Mutual exclusion itself is never violated
+ * (reclaim is gated on the liveness probe); fixing this properly means
+ * mixing a per-process creation-time nonce into bits 30:0 across both
+ * platforms and every probe site. */
 #define ZAN_LOCK_HELD_BIT 0x80000000u
 #define ZAN_LOCK_PID_MASK 0x7FFFFFFFu
 
 static int zan_pid_alive(uint32_t pid) {
     if (!pid) return 0;
 #ifdef _WIN32
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
-                           (DWORD)pid);
+    /* SYNCHRONIZE is required for WaitForSingleObject to work at all: a
+     * QUERY_LIMITED_INFORMATION-only handle fails every wait with
+     * WAIT_FAILED (verified empirically), which would report every live
+     * holder as dead and let a waiter steal a held lock. Any wait result
+     * other than WAIT_TIMEOUT keeps the holder conservatively alive --
+     * reclaim only ever fires when OpenProcess itself says the pid is
+     * gone. */
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                           FALSE, (DWORD)pid);
     if (!h) return GetLastError() == ERROR_ACCESS_DENIED;
-    int alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+    int alive = WaitForSingleObject(h, 0) != WAIT_OBJECT_0;
     CloseHandle(h);
     return alive;
 #else
@@ -630,7 +646,13 @@ static void zan_purge_expired_locked(
 }
 
 static void zan_purge_expired(zan_shared_header *header) {
-    if (header->expiry_count == 0) return;
+    /* Relaxed loads: this peek races writers that hold the struct lock. On
+     * LP64 the aligned 64-bit loads are single-copy atomic and every
+     * consequence is re-validated under the struct lock below, so a torn or
+     * stale peek can only cause a wasted attempt -- but read them as atomics
+     * anyway and range-check the index before it becomes a row pointer. */
+    if (__atomic_load_n(&header->expiry_count, __ATOMIC_RELAXED) == 0)
+        return;
     /* Process-wide throttle: once any TTL exists, every op would otherwise
      * pay a wall-clock syscall plus a heap-top compare. A plain static with
      * relaxed atomics is enough -- worst case two threads both run the peek,
@@ -641,7 +663,9 @@ static void zan_purge_expired(zan_shared_header *header) {
     if (last > now_ms - ZAN_PURGE_MIN_INTERVAL_MS && last <= now_ms) return;
     __atomic_store_n(&last_attempt_ms, now_ms, __ATOMIC_RELAXED);
     uint64_t *heap = zan_expiry_heap(header);
-    unsigned char *row = zan_row_at(header, heap[0]);
+    uint64_t top = __atomic_load_n(&heap[0], __ATOMIC_RELAXED);
+    if (top >= header->capacity) return; /* torn peek: let the real pass run */
+    unsigned char *row = zan_row_at(header, top);
     if (*zan_row_expires_at(row) > now_ms) return;
     zan_struct_lock(header);
     zan_purge_expired_locked(header, now_ms, ZAN_PURGE_MAX_BATCH);
@@ -1424,6 +1448,11 @@ int64_t zan_shared_table_attach(int64_t os_handle) {
         return 0;
     }
     table->mapped_size = (size_t)stat_buf.st_size;
+    /* Unlike open() -- which demands exact equality -- attach tolerates a
+     * file LARGER than the header claims: named table files can be extended
+     * by anyone with write access, and geometry identity plus the later
+     * total_size <= mapped_size check already bound every access, so the
+     * extra bytes are simply never touched. */
     table->header = (zan_shared_header *)mmap(
         NULL, table->mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED,
         table->fd, 0);
@@ -2185,7 +2214,12 @@ int32_t zan_shared_table_rate_allow(
     int allowed = 0;
     zan_struct_lock(table->header);
     zan_purge_expired_locked(table->header, now_ms, UINT64_MAX);
-    unsigned char *row = zan_find_row(table->header, key, 1);
+    /* Existence-first, like zan_lock_row_for: the 7/8 load-factor refusal in
+     * zan_find_row(create=1) fires before the probe loop, so a direct create
+     * call would deny requests for LONG-EXISTING keys once the table nears
+     * capacity -- an invisible fail-closed outage for a rate limiter. */
+    unsigned char *row = zan_find_row(table->header, key, 0);
+    if (!row) row = zan_find_row(table->header, key, 1);
     if (row) {
         zan_row_lock(row);
         int64_t count = 0;

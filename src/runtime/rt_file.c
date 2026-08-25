@@ -593,8 +593,13 @@ long long zan_file_close(long long handle) {
         s->open = 0;
         f = s->fp;
         s->fp = NULL;
-        s->gen = s->gen + 1;   /* invalidate every outstanding copy of the handle */
-        if (s->gen == 0) { s->gen = 1; }
+        /* Invalidate every outstanding copy of the handle -- except at
+         * generation wrap: resetting to 1 there would revalidate surviving
+         * handles from the previous cycle, because zan_file_open reuses
+         * closed slots without bumping. Leave gen at its max and open at 0:
+         * the slot retires (once per 2^32 closes of one slot). */
+        uint32_t next_gen = (uint32_t)(s->gen + 1);
+        if (next_gen != 0) s->gen = next_gen;
     }
     zan_fh_unlock();
     if (!f) return 0;   /* unknown or already-closed handle */
@@ -643,7 +648,7 @@ static long zan_lk_index(long long handle) {
     uint32_t gen = (uint32_t)(h >> 32);
     unsigned long long slot = h & 0xFFFFFFFFULL;
     if (slot >= (unsigned long long)ZAN_LK_CAP) return -1;
-    if (!g_lk_table[slot].used || g_lk_table[slot].gen != gen) return -1;
+    if (g_lk_table[slot].used != 1 || g_lk_table[slot].gen != gen) return -1;
     return (long)slot;
 }
 
@@ -651,29 +656,39 @@ static long zan_lk_index(long long handle) {
  * or 0 when another process holds it or the path is unusable. */
 long long zan_file_try_lock(const char *path) {
     if (!path || !path[0]) return 0;
+#if defined(__wasm__)
+    (void)path;
+    return 0;               /* no processes to contend with */
+#else
     zan_fh_lock();          /* the table lock is shared with the stream table */
     long slot = -1;
     for (long i = 0; i < ZAN_LK_CAP; i++) {
-        if (!g_lk_table[i].used) { slot = i; break; }
+        if (!g_lk_table[i].used) {
+            slot = i;
+            /* Reserve the slot INSIDE this critical section. Picking it
+             * unlocked and registering later let two threads of this process
+             * choose the same free slot; the second registration then
+             * overwrites the first's OS handle -- leaked as an exclusive
+             * sharing-0 lock until process exit -- and bumps the generation
+             * out from under the first caller's just-minted handle. */
+            g_lk_table[slot].used = 1;
+            break;
+        }
     }
     zan_fh_unlock();
     if (slot < 0) return 0;
 #ifdef _WIN32
     wchar_t *wide_path = zan_win_utf8_to_wide(path);
-    if (!wide_path) return 0;
+    if (!wide_path) goto fail_reserve;
     HANDLE h = CreateFileW(wide_path, GENERIC_WRITE, 0 /* no sharing */, NULL,
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     free(wide_path);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-#elif defined(__wasm__)
-    (void)slot;
-    return 0;               /* no processes to contend with */
+    if (h == INVALID_HANDLE_VALUE) goto fail_reserve;
 #else
     int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
-    if (fd < 0) return 0;
-    if (flock(fd, LOCK_EX | LOCK_NB) != 0) { close(fd); return 0; }
+    if (fd < 0) goto fail_reserve;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) { close(fd); goto fail_reserve; }
 #endif
-#ifndef __wasm__
     zan_fh_lock();
 #ifdef _WIN32
     g_lk_table[slot].h = h;
@@ -681,16 +696,40 @@ long long zan_file_try_lock(const char *path) {
     g_lk_table[slot].fd = fd;
 #endif
     /* New generation: every outstanding copy of this slot's previous handle
-     * stops matching, so a late unlock cannot release somebody else's lock. */
-    g_lk_table[slot].gen = g_lk_table[slot].gen + 1;
-    if (g_lk_table[slot].gen == 0) { g_lk_table[slot].gen = 1; }
-    g_lk_table[slot].used = 1;
+     * stops matching, so a late unlock cannot release somebody else's lock.
+     * At wrap, retire instead of resetting to 1: a reset would validate a
+     * surviving handle minted 2^32 locks ago against this cycle. Refusing
+     * one attempt per slot per four billion locks is the cheap side of that
+     * trade. */
+    uint32_t next_gen = (uint32_t)(g_lk_table[slot].gen + 1);
+    if (next_gen == 0) {
+#ifdef _WIN32
+        g_lk_table[slot].h = NULL;
+#else
+        g_lk_table[slot].fd = -1;
+#endif
+        g_lk_table[slot].used = 2;          /* retired: index rejects it */
+        zan_fh_unlock();
+#ifdef _WIN32
+        CloseHandle(h);
+#else
+        close(fd);              /* drops nothing; flock was not taken yet */
+#endif
+        return 0;
+    }
+    g_lk_table[slot].gen = next_gen;
     unsigned long long lk_handle =
         ((unsigned long long)g_lk_table[slot].gen << 32)
         | (unsigned long long)slot;
     zan_fh_unlock();
     return (long long)lk_handle;
-#endif
+
+fail_reserve:
+    zan_fh_lock();
+    g_lk_table[slot].used = 0;   /* give the reserved slot back */
+    zan_fh_unlock();
+    return 0;
+#endif /* !__wasm__ */
 }
 
 /* Releases a lock from zan_file_try_lock. Returns 1 when a lock was held. */
