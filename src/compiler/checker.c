@@ -113,6 +113,123 @@ static zan_symbol_t *checker_find_field(zan_symbol_t *type_sym, zan_istr_t name)
     return NULL;
 }
 
+/* ---- access control ------------------------------------------------------
+ * `private`/`protected`/`internal` were parsed onto symbols but never
+ * checked, so every "hidden" member was effectively public. Members without
+ * a modifier stay fully public: the whole stdlib predates enforcement and
+ * relies on the open default.
+ *
+ * The `internal` module boundary is the namespace prefix up to and including
+ * its second dot ("System.Data.SqlServer" -> module "System.Data"; a
+ * single-dot namespace like "Acc.Inner" is its own whole key). That mirrors
+ * the physical rule that one directory under stdlib/ is one encapsulation
+ * unit. */
+
+static bool checker_type_derives_from(zan_type_t *sub, zan_type_t *sup);
+
+/* Length of the module key of dotted namespace `ns`. */
+static uint32_t access_module_len(zan_istr_t ns) {
+    int dots = 0;
+    for (uint32_t i = 0; i < ns.len; i++) {
+        if (ns.str[i] == '.') {
+            dots++;
+            if (dots == 2) return i;
+        }
+    }
+    return ns.len;
+}
+
+static bool access_same_module(zan_istr_t a, zan_istr_t b) {
+    uint32_t la = access_module_len(a), lb = access_module_len(b);
+    return la == lb && memcmp(a.str, b.str, (size_t)la) == 0;
+}
+
+/* Namespace of the top-level type declaration that owns symbol `s` (walk up
+ * member nesting); empty when unknown, which compares as no-module. */
+static zan_istr_t access_symbol_ns(zan_symbol_t *s) {
+    while (s) {
+        if (s->decl && s->decl->ns_name.len)
+            return s->decl->ns_name;
+        s = s->parent;
+    }
+    return (zan_istr_t){NULL, 0};
+}
+
+static zan_ast_node_t *access_current_decl(zan_checker_t *c) {
+    return c->current_type_sym ? c->current_type_sym->decl : NULL;
+}
+
+static void report_inaccessible(zan_checker_t *c, zan_symbol_t *m,
+                                zan_loc_t loc) {
+    zan_istr_t owner_name = m->parent ? m->parent->name : m->name;
+    if (!c->current_type_sym) return;
+    if (m->modifiers & MOD_PRIVATE)
+        zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                      "'%.*s.%.*s' is private and cannot be accessed "
+                      "from '%.*s'",
+                      (int)owner_name.len, owner_name.str,
+                      (int)m->name.len, m->name.str,
+                      (int)c->current_type_sym->name.len,
+                      c->current_type_sym->name.str);
+    else if (m->modifiers & MOD_PROTECTED)
+        zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                      "'%.*s.%.*s' is protected and cannot be accessed "
+                      "from '%.*s'",
+                      (int)owner_name.len, owner_name.str,
+                      (int)m->name.len, m->name.str,
+                      (int)c->current_type_sym->name.len,
+                      c->current_type_sym->name.str);
+    else if (m->modifiers & MOD_INTERNAL) {
+        zan_istr_t mod_ns = access_symbol_ns(m);
+        zan_ast_node_t *cur = access_current_decl(c);
+        zan_istr_t cur_name = cur ? cur->ns_name : c->current_type_sym->name;
+        zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                      "'%.*s.%.*s' is internal to '%.*s' and cannot be "
+                      "accessed from '%.*s'",
+                      (int)owner_name.len, owner_name.str,
+                      (int)m->name.len, m->name.str,
+                      (int)mod_ns.len, mod_ns.str,
+                      (int)cur_name.len, cur_name.str);
+    }
+}
+
+/* Can code in the current type body access member `m`? Modifiers are read
+ * off the declaring symbol; contexts without a current type (top-level
+ * functions) only see unmodified members. */
+static bool access_member_allowed(zan_checker_t *c, zan_symbol_t *m) {
+    if (!(m->modifiers & (MOD_PRIVATE | MOD_PROTECTED | MOD_INTERNAL)))
+        return true;
+    if (!c->current_type_sym || !m->parent ||
+        !m->parent->type || !c->current_type_sym->type)
+        return false;
+    /* private: the declaring type's own bodies */
+    if (c->current_type_sym == m->parent) return true;
+    /* protected: plus bodies of derived types */
+    if ((m->modifiers & MOD_PROTECTED) &&
+        checker_type_derives_from(c->current_type_sym->type,
+                                  m->parent->type))
+        return true;
+    /* internal: any type whose namespace shares the module prefix */
+    if ((m->modifiers & MOD_INTERNAL) &&
+        access_same_module(access_symbol_ns(c->current_type_sym),
+                           access_symbol_ns(m)))
+        return true;
+    return false;
+}
+
+/* Field lookup for assignment targets etc.: found-but-inaccessible reports
+ * and degrades to NULL so the caller emits its normal shape diagnostics. */
+static zan_symbol_t *checker_field_visible(zan_checker_t *c,
+                                           zan_symbol_t *ts, zan_loc_t loc,
+                                           zan_istr_t name) {
+    zan_symbol_t *f = checker_find_field(ts, name);
+    if (f && !access_member_allowed(c, f)) {
+        report_inaccessible(c, f, loc);
+        return NULL;
+    }
+    return f;
+}
+
 /* ---- local variable tracking ---------------------------------------------
  * The checker walks a method body without its own scope stack; irgen, in
  * contrast, resolves a bare name in an expression local-first (its
@@ -207,7 +324,8 @@ static zan_symbol_t *assign_target_field(zan_checker_t *c, zan_ast_node_t *lhs,
     if (lhs->kind == AST_IDENTIFIER) {
         if (!c->current_type_sym) return NULL;
         if (owner) *owner = c->current_type_sym;
-        return checker_find_field(c->current_type_sym, lhs->ident.name);
+        return checker_field_visible(c, c->current_type_sym, lhs->loc,
+                                     lhs->ident.name);
     }
     if (lhs->kind == AST_MEMBER_ACCESS) {
         zan_symbol_t *ts = NULL;
@@ -219,7 +337,7 @@ static zan_symbol_t *assign_target_field(zan_checker_t *c, zan_ast_node_t *lhs,
         }
         if (!ts) return NULL;
         if (owner) *owner = ts;
-        return checker_find_field(ts, lhs->member.name);
+        return checker_field_visible(c, ts, lhs->loc, lhs->member.name);
     }
     return NULL;
 }
@@ -270,12 +388,12 @@ static void check_readonly_assignment(zan_checker_t *c, zan_ast_node_t *expr) {
 static void check_readonly_incdec(zan_checker_t *c, zan_ast_node_t *expr) {
     if (!expr || !expr->unary.operand) return;
     zan_ast_node_t *operand = expr->unary.operand;
-    zan_symbol_t *owner = NULL;
     zan_symbol_t *field = NULL;
     if (operand->kind == AST_IDENTIFIER) {
         if (checker_find_local(c, operand->ident.name)) return;
         if (!c->current_type_sym) return;
-        field = checker_find_field(c->current_type_sym, operand->ident.name);
+        field = checker_field_visible(c, c->current_type_sym, expr->loc,
+                                      operand->ident.name);
     } else if (operand->kind == AST_MEMBER_ACCESS) {
         zan_symbol_t *ts = NULL;
         if (operand->member.object &&
@@ -286,7 +404,7 @@ static void check_readonly_incdec(zan_checker_t *c, zan_ast_node_t *expr) {
             ts = ot ? ot->sym : NULL;
         }
         if (!ts) return;
-        field = checker_find_field(ts, operand->member.name);
+        field = checker_field_visible(c, ts, expr->loc, operand->member.name);
     }
     if (!property_is_readonly(field)) return;
     zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
@@ -307,9 +425,9 @@ static zan_type_t *checker_assignment_target_type(zan_checker_t *c,
     }
     if (lhs->kind == AST_MEMBER_ACCESS) {
         zan_type_t *obj = zan_checker_check_expr(c, lhs->member.object);
-        zan_symbol_t *sym = obj && obj->sym ? checker_find_field(obj->sym,
-                                                                  lhs->member.name)
-                                            : NULL;
+        zan_symbol_t *sym = obj && obj->sym
+            ? checker_field_visible(c, obj->sym, lhs->loc, lhs->member.name)
+            : NULL;
         return sym ? sym->type : NULL;
     }
     if (lhs->kind == AST_INDEX) {
@@ -589,7 +707,11 @@ static void check_ctor_available(zan_checker_t *c, zan_type_t *type,
         int lo = 0;
         int hi = 0;
         ctor_arity(m->decl, &lo, &hi);
-        if (argc >= lo && (hi < 0 || argc <= hi)) return;
+        if (argc >= lo && (hi < 0 || argc <= hi)) {
+            if (!access_member_allowed(c, m))
+                report_inaccessible(c, m, expr->loc);
+            return;
+        }
     }
     if (declared == 0) return;
     zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
@@ -1642,6 +1764,10 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                     /* the unresolved path below reports through
                      * check_member_access, so report here only for the
                      * resolved-method fast path */
+                    if (!access_member_allowed(c, m)) {
+                        report_inaccessible(c, m, expr->call.callee->loc);
+                        return c->binder->type_error;
+                    }
                     checker_reject_null_receiver(c, expr->call.callee);
                     called_sym = m;
                     callee_type = m->type ? m->type : c->binder->type_error;
@@ -2501,6 +2627,10 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
             if (!m) continue;
             if (m->name.len == expr->member.name.len &&
                 memcmp(m->name.str, expr->member.name.str, m->name.len) == 0) {
+                if (!access_member_allowed(c, m)) {
+                    report_inaccessible(c, m, expr->loc);
+                    return c->binder->type_error;
+                }
                 /* A method in value position is a method group: only a
                  * delegate-typed slot (or a call, typed in the AST_CALL case)
                  * consumes it. Returning the method's *return* type here would

@@ -20,22 +20,26 @@ class FwdChannel {
     TlsStream tls;
     TlsContext ctx;
     bool closed;
+    // 明文接收的空闲截止（毫秒；0 = 不设限）。转发器实例级配置，
+    // 通道创建时注入，避免读进程级全局导致的实例间串扰。
+    int idleMs;
 
-    FwdChannel(nint sock, TlsStream tls, TlsContext ctx) {
+    FwdChannel(nint sock, TlsStream tls, TlsContext ctx, int idleMs) {
         this.sock = sock;
         this.tls = tls;
         this.ctx = ctx;
         this.closed = false;
+        this.idleMs = idleMs;
     }
 
     /// <summary>明文 TCP 链路。</summary>
-    static FwdChannel OfSocket(nint sock) {
-        return new FwdChannel(sock, null, null);
+    static FwdChannel OfSocket(nint sock, int idleMs) {
+        return new FwdChannel(sock, null, null, idleMs);
     }
 
     /// <summary>TLS 链路；`ctx` 由本链路持有，关闭时释放。</summary>
-    static FwdChannel OfTls(nint sock, TlsStream tls, TlsContext ctx) {
-        return new FwdChannel(sock, tls, ctx);
+    static FwdChannel OfTls(nint sock, TlsStream tls, TlsContext ctx, int idleMs) {
+        return new FwdChannel(sock, tls, ctx, idleMs);
     }
 
     /// <summary>本次到达的字节，最多 `max`；对端关闭或出错时为空串。</summary>
@@ -48,7 +52,7 @@ class FwdChannel {
         // 协程 + 套接字（慢速客户端 / 卡死的上游正是这样拖死
         // 转发器的——类文档一直声称有这个行为）。TLS 侧待运行时
         // 提供带截止的解密接收后同样接入。
-        int idle = HttpForwarder.SharedIdleMs();
+        int idle = this.idleMs;
         if (idle > 0) {
             return await Socket.RecvAsync(this.sock, max, idle);
         }
@@ -350,6 +354,9 @@ class HttpForwarder {
     int active;
     bool running;
     TcpListener listener;
+    // 明文链路接收的空闲截止（毫秒；0 = 不设限），实例级配置，
+    // 由 Start 之后建立的每条 FwdChannel 在创建时取走。
+    int recvIdleMs;
     // 上游 keep-alive：pool 为 null 即每请求一连。
     FwdPool pool;
     int maxIdleUp;
@@ -375,6 +382,7 @@ class HttpForwarder {
         this.active = 0;
         this.running = false;
         this.listener = null;
+        this.recvIdleMs = 300000;
         this.maxIdleUp = 64;
         this.idleUpMs = 55000;
         this.pool = new FwdPool(this.maxIdleUp, this.idleUpMs);
@@ -413,16 +421,8 @@ class HttpForwarder {
     /// 慢速客户端/卡死上游会永久占用协程与套接字。</summary>
     HttpForwarder SetTimeout(int ms) {
         this.timeoutMs = ms;
-        HttpForwarder.idleMs = ms;
+        this.recvIdleMs = ms;
         return this;
-    }
-
-    /* FwdChannel 的明文接收截止（毫秒）；0 = 不设限。进程级配置：
-     * 一个转发器实例一份语义，通道构造时不再逐个传参。 */
-    static int idleMs = 300000;
-
-    static int SharedIdleMs() {
-        return HttpForwarder.idleMs;
     }
 
     /// <summary>单次搬运的块大小（字节）。</summary>
@@ -519,7 +519,7 @@ class HttpForwarder {
     }
 
     static async void RejectBusy(nint clientSock) {
-        FwdChannel ch = FwdChannel.OfSocket(clientSock);
+        FwdChannel ch = FwdChannel.OfSocket(clientSock, 0);
         int _n = await ch.SendAllAsync(
             "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 11\r\n"
             + "Connection: close\r\n\r\nforwarder busy");
@@ -534,7 +534,7 @@ class HttpForwarder {
     /// <summary>转发一个下游连接：读请求头 → 连上游 → 边收边转
     /// 请求体 → 上游响应头即刻回传 → 边收边转响应体。</summary>
     async void ServeOnce(nint clientSock) {
-        FwdChannel client = FwdChannel.OfSocket(clientSock);
+        FwdChannel client = FwdChannel.OfSocket(clientSock, this.recvIdleMs);
         FwdReader creader = new FwdReader(client, this.chunkBytes);
         string head = await creader.ReadHeadAsync(this.maxHeadBytes);
         if (head.Length == 0) {
@@ -701,7 +701,7 @@ class HttpForwarder {
             return;
         }
         Socket.SetNoDelay(sock);
-        FwdChannel up = FwdChannel.OfSocket(sock);
+        FwdChannel up = FwdChannel.OfSocket(sock, this.recvIdleMs);
         int _o = await client.SendAllAsync(
             "HTTP/1.1 200 Connection Established\r\n\r\n");
         FwdReader ureader = new FwdReader(up, this.chunkBytes);
@@ -721,7 +721,7 @@ class HttpForwarder {
         }
         Socket.SetNoDelay(sock);
         if (!this.upTls) {
-            return FwdChannel.OfSocket(sock);
+            return FwdChannel.OfSocket(sock, this.recvIdleMs);
         }
         TlsContext ctx = TlsContext.CreateClient();
         if (ctx == null) {
@@ -735,7 +735,7 @@ class HttpForwarder {
             ctx.Free();
             return null;
         }
-        return FwdChannel.OfTls(sock, stream, ctx);
+        return FwdChannel.OfTls(sock, stream, ctx, this.recvIdleMs);
     }
 
     /// <summary>改写请求头：Host 指向上游、剥离逐跳头部、

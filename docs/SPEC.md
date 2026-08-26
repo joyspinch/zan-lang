@@ -361,6 +361,46 @@ public delegate TResult Func<T, TResult>(T arg);
 
 支持捕获的 lambda（闭包）与无捕获 lambda。
 
+### 4.8 Access Control
+
+Class/struct members（字段、属性、方法、构造器）可以标记四种访问修饰符；
+检查器在编译期强制执行。**未加修饰符的成员完全公开**——这是默认，整个
+标准库都依赖它：
+
+| 修饰符       | 可访问范围                                                     |
+|--------------|----------------------------------------------------------------|
+| （无）       | 任何代码                                                       |
+| `private`    | 仅声明该成员的类型自身的方法体                                  |
+| `protected`  | 声明类型自身 + 派生类型的方法体                                 |
+| `internal`   | 同一"模块"内的所有类型的代码                                    |
+
+模块以命名空间前缀界定：取命名空间第二个 `.` 之前的前缀
+（`System.Data.SqlServer` 与 `System.Data.MySql` 同属模块
+`System.Data`；单点命名空间如 `Acc.Inner` 自成一个模块）。这与物理布局
+一致——`stdlib/` 下一个目录就是一个封装边界。
+
+```csharp
+public class Base {
+    private int seed = 1;         // 只有 Base 的方法体能碰
+    protected int guard = 2;      // Base 及其派生类可碰
+    internal int tag = 3;         // 同模块内的类型可碰
+}
+
+public class Child : Base {
+    public int Read() { return guard; }      // OK：派生类
+    public int Fail(Sibling s) {
+        // return s.otherPrivate;             // error: '...' is private
+        return tag;                            // OK：internal 同模块
+    }
+}
+```
+
+访问被拒绝时编译器报告：
+`'Owner.member' is private and cannot be accessed from 'Ctx'`
+（protected/internal 类似，internal 会指出所属模块）。构造器同样受控，
+`private` 构造器阻止在类型之外 `new`（工厂模式）。顶级类型本身的修饰符
+目前解析后不参与限制。
+
 ---
 
 ## 5. Statements

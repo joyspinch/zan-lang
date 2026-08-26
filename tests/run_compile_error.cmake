@@ -3,8 +3,17 @@ if(NOT DEFINED ZANC OR NOT DEFINED SRC OR NOT DEFINED OUT_EXE OR
   message(FATAL_ERROR "ZANC, SRC, OUT_EXE, and EXPECT_REGEX are required")
 endif()
 
+# Optional extra zanc inputs (semicolon-list), e.g. a second source file so an
+# access-control case can compile the declaring module alongside the abuser.
+set(_zanc_cmd "${ZANC}" "${SRC}")
+if(DEFINED ZANC_ARGS)
+  foreach(_arg ${ZANC_ARGS})
+    list(APPEND _zanc_cmd "${_arg}")
+  endforeach()
+endif()
+
 execute_process(
-  COMMAND "${ZANC}" "${SRC}" -o "${OUT_EXE}"
+  COMMAND ${_zanc_cmd} -o "${OUT_EXE}"
   RESULT_VARIABLE compile_result
   OUTPUT_VARIABLE compile_stdout
   ERROR_VARIABLE compile_stderr)

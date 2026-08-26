@@ -755,6 +755,50 @@ add_test(NAME diag_array_init_count_mismatch
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_array_init_count_mismatch PROPERTIES TIMEOUT 60)
 
+# ---- Declared access control ----
+# public/private/internal/protected were parsed into metadata but the checker
+# never enforced them. Unmarked members stay public; an explicit modifier now
+# rejects out-of-scope uses.
+
+add_test(NAME diag_access_private_field
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/access_private_field.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_access_private_field${_exe_ext}
+    "-DEXPECT_REGEX=.Vault.secret. is private"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_access_private_field PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_access_protected_unrelated
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/access_protected_unrelated.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_access_protected_unrelated${_exe_ext}
+    "-DEXPECT_REGEX=.Base.shield. is protected"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_access_protected_unrelated PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_access_private_ctor
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/access_private_ctor.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_access_private_ctor${_exe_ext}
+    "-DEXPECT_REGEX=.Safe.Safe. is private"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_access_private_ctor PROPERTIES TIMEOUT 60)
+
+# internal is module-scoped (first two namespace segments); the case needs
+# the declaring file on the command line next to the abuser.
+add_test(NAME diag_access_internal_module
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/access_internal_module.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/diag/access_internal_module_helper.zan"
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_access_internal_module${_exe_ext}
+    "-DEXPECT_REGEX=.Core.Tag. is internal to .Acc.Inner."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_access_internal_module PROPERTIES TIMEOUT 60)
+
 
 # A cast is the one expression whose operand and target the checker used to
 # skip entirely, so an impossible conversion reinterpreted the operand's bits
