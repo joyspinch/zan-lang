@@ -2222,6 +2222,19 @@ EXPORT i32 zan_gui_atomic_present(void *hwnd, i32 surface_id) {
             oy = ty;
         }
     }
+    {
+        static int alog = -1;
+        if (alog < 0) alog = getenv("ZAN_ATOMIC_LOG") != NULL;
+        if (alog) {
+            FILE *af = fopen("atomic_trace.log", "a");
+            if (af) {
+                fprintf(af, "atomic hwnd=%p cli=%dx%d win=%dx%d -> psize=%dx%d off=%d,%d surf=%dx%d\n",
+                        hwnd, pw, ph, wr.right - wr.left, wr.bottom - wr.top,
+                        ww, wh, ox, oy, s->width, s->height);
+                fclose(af);
+            }
+        }
+    }
     zan_atomic_layer_t *l = atomic_layer(hwnd, ww, wh);
     if (!l || !l->bits) return 0;
     int w = s->width, h = s->height;
