@@ -20,7 +20,9 @@
 #include <windows.h>
 #include <process.h>
 #else
+#include <dirent.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -151,6 +153,210 @@ static int zan_spawn_wait(char *const argv[]) {
 #endif
 }
 
+/* ---- cache cleanup ----
+ *
+ * The generator cache (%LOCALAPPDATA%\Zan\gen on Windows,
+ * $XDG_CACHE_HOME/zan/gen on Linux) is shared across every zanc invocation
+ * and may accumulate files we never want to keep around:
+ *
+ *   ZanGen_<hash>_<pid>.exe   per-process compile temp; zanc killed before
+ *                              MoveFileExA leaves it behind
+ *   gen_codegen_<pid>_in.json  per-process metadata I/O; same orphan problem
+ *   gen_codegen_<pid>_out.json
+ *   gen_design_<pid>_in.json
+ *   gen_design_<pid>_out.json
+ *
+ * The published ZanGen_<hash>.exe is *not* touched here: it is the warm
+ * cache that future invocations read, and the gen_cache_isolation test
+ * (tests/run_gen_cache_isolation.cmake) asserts the count of those entries
+ * after building two stdlib worktrees. Sweep is best-effort and runs once
+ * per zanc process. */
+
+static int zan_pid_alive(uint32_t pid) {
+    if (pid == 0) return 0;
+#ifdef _WIN32
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                           FALSE, (DWORD)pid);
+    if (!h) return 0;
+    DWORD wait = WaitForSingleObject(h, 0);
+    CloseHandle(h);
+    return wait != WAIT_OBJECT_0;
+#else
+    if (kill((pid_t)pid, 0) == 0) return 1;
+    return errno == EPERM;
+#endif
+}
+
+/* Walk `dir` and call `cb(name, ud)` for every entry (basename only, no path
+ * prefix). Skips "." and "..". Best-effort: missing dir is not an error. */
+static void zan_gen_scan_dir(const char *dir,
+                             void (*cb)(const char *name, void *ud),
+                             void *ud) {
+#ifdef _WIN32
+    char pattern[ZAN_GEN_MAX_PATH];
+    snprintf(pattern, sizeof(pattern), "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.cFileName[0] == '.') {
+            if (fd.cFileName[1] == '\0' ||
+                (fd.cFileName[1] == '.' && fd.cFileName[2] == '\0'))
+                continue;
+        }
+        cb(fd.cFileName, ud);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') {
+            if (e->d_name[1] == '\0' ||
+                (e->d_name[1] == '.' && e->d_name[2] == '\0'))
+                continue;
+        }
+        cb(e->d_name, ud);
+    }
+    closedir(d);
+#endif
+}
+
+/* Try to match `s` against `prefix` exactly; if it matches, point `rest` at
+ * the first byte after the prefix and return 1. Else return 0. */
+static int zan_gen_strip(const char *s, const char *prefix, const char **rest) {
+    size_t n = strlen(prefix);
+    if (strncmp(s, prefix, n) != 0) return 0;
+    *rest = s + n;
+    return 1;
+}
+
+/* Parse the ZanGen_<hash>[_<pid>] form. `s` points just past "ZanGen_".
+ * The hash must be exactly 16 lowercase hex digits. If followed by "_<pid>"
+ * (decimal, <= 10 digits, no .exe), the pid is written to *out and the
+ * function returns 2. If only the hash is present (optionally followed by
+ * ".exe" on Windows), returns 1. Returns 0 if `s` is not a ZanGen name. */
+static int zan_gen_parse_zangen(const char *s, uint32_t *out) {
+    if (!s) return 0;
+    static const char hex[] = "0123456789abcdef";
+    if (strlen(s) < 16) return 0;
+    for (int i = 0; i < 16; i++) {
+        const char *p = strchr(hex, s[i]);
+        if (!p) return 0;
+    }
+    const char *p = s + 16;
+    if (*p == '\0') return 1;
+    if (*p == '_') {
+        const char *q = p + 1;
+        const char *end = q;
+        while (*end >= '0' && *end <= '9') end++;
+        if (end == q || end - q > 10) return 0;
+        /* On Windows an optional ".exe" suffix is allowed. */
+        if (end[0] == '.') {
+            if (end[1] != 'e' || end[2] != 'x' || end[3] != 'e' || end[4])
+                return 0;
+        } else if (end[0] != '\0') {
+            return 0;
+        }
+        uint64_t v = 0;
+        for (const char *r = q; r < end; r++) {
+            v = v * 10 + (uint64_t)(*r - '0');
+            if (v > 0xFFFFFFFFu) return 0;
+        }
+        *out = (uint32_t)v;
+        return 2;
+    }
+#ifdef _WIN32
+    if (strcmp(p, ".exe") == 0) return 1;
+#endif
+    return 0;
+}
+
+/* Parse a decimal PID from the segment of `s` immediately following the
+ * literal prefix it was stripped against. The segment runs from `s` to
+ * either the end of the string, an optional ".exe" suffix, or an optional
+ * "_in.json"/"_out.json" suffix. Returns 1 on success and writes to *out,
+ * else 0. Capped at 10 digits (max uint32). */
+static int zan_gen_parse_pid(const char *s, uint32_t *out) {
+    if (!s) return 0;
+    const char *p = s;
+    const char *end = p + strlen(p);
+    /* "ZanGen_<hash>_<pid>.exe" or "ZanGen_<hash>_<pid>" */
+    if (end - p >= 4 && memcmp(end - 4, ".exe", 4) == 0) end -= 4;
+    /* "gen_codegen_<pid>_in.json" / "_out.json" */
+    else if (end - p > 8 && memcmp(end - 8, "_in.json", 8) == 0) end -= 8;
+    else if (end - p > 9 && memcmp(end - 9, "_out.json", 9) == 0) end -= 9;
+    if (end == p) return 0;
+    uint64_t v = 0;
+    for (const char *q = p; q < end; q++) {
+        if (*q < '0' || *q > '9') return 0;
+        v = v * 10 + (uint64_t)(*q - '0');
+        if (v > 0xFFFFFFFFu) return 0;
+    }
+    *out = (uint32_t)v;
+    return 1;
+}
+
+static void zan_gen_sweep_one(const char *name, void *ud) {
+    const char *dir = (const char *)ud;
+    const char *rest = NULL;
+    char path[ZAN_GEN_MAX_PATH];
+    uint32_t pid = 0;
+#ifdef _WIN32
+    const char sep = '\\';
+#else
+    const char sep = '/';
+#endif
+
+    /* ZanGen_<16hex>[.exe] -- published cache, do not touch.
+     * ZanGen_<16hex>_<pid>[.exe] -- per-process compile temp; reap if the
+     *   holding zanc is gone. */
+    if (zan_gen_strip(name, "ZanGen_", &rest)) {
+        int kind = zan_gen_parse_zangen(rest, &pid);
+        if (kind == 2 && !zan_pid_alive(pid)) {
+            snprintf(path, sizeof(path), "%s%c%s", dir, sep, name);
+#ifdef _WIN32
+            DeleteFileA(path);
+#else
+            remove(path);
+#endif
+        }
+        return;
+    }
+    /* gen_codegen_<pid>_in.json / _out.json -- per-process metadata I/O. */
+    if (zan_gen_strip(name, "gen_codegen_", &rest)) {
+        if (zan_gen_parse_pid(rest, &pid) && !zan_pid_alive(pid)) {
+            snprintf(path, sizeof(path), "%s%c%s", dir, sep, name);
+#ifdef _WIN32
+            DeleteFileA(path);
+#else
+            remove(path);
+#endif
+        }
+        return;
+    }
+    if (zan_gen_strip(name, "gen_design_", &rest)) {
+        if (zan_gen_parse_pid(rest, &pid) && !zan_pid_alive(pid)) {
+            snprintf(path, sizeof(path), "%s%c%s", dir, sep, name);
+#ifdef _WIN32
+            DeleteFileA(path);
+#else
+            remove(path);
+#endif
+        }
+        return;
+    }
+    /* Anything else: leave alone. */
+}
+
+static void zan_gen_sweep(const char *dir) {
+    static int swept = 0;
+    if (swept) return;
+    swept = 1;
+    zan_gen_scan_dir(dir, zan_gen_sweep_one, (void *)dir);
+}
+
 int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
     if (!zan_gen_enabled) return -1;
     char dir[ZAN_GEN_MAX_PATH];
@@ -158,6 +364,9 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
         fprintf(stderr, "error: no user cache dir for the code generators\n");
         return -1;
     }
+    /* Reap orphans from a prior crashed/killed zanc, before we decide to
+     * (re)compile or reuse the published image. */
+    zan_gen_sweep(dir);
 
     /* The cache must not be shared merely because timestamps happen to line
      * up. Different worktrees can carry incompatible generator sources whose
