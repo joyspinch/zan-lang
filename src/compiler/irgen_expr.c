@@ -5532,6 +5532,108 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 /* cast to List* */
                 LLVMValueRef typed_ptr = LLVMBuildBitCast(g->builder, list_ptr,
                     LLVMPointerType(g->list_struct_type, 0), "lptr");
+                /* `new List<T>(src)` — copy constructor (checker flagged
+                 * list_copy): a fresh list carrying src's count and a cloned
+                 * data buffer. Each slot goes through
+                 * emit_collection_slot_store so RC occupants are retained
+                 * exactly like Add would retain them; the old slot is empty
+                 * (calloc), so overwrite_old stays 0. */
+                if (expr->new_expr.list_copy && expr->new_expr.args.count == 1) {
+                    LLVMValueRef src_raw =
+                        emit_expr(g, expr->new_expr.args.items[0], locals);
+                    if (LLVMGetTypeKind(LLVMTypeOf(src_raw)) != LLVMPointerTypeKind) {
+                        src_raw = LLVMBuildIntToPtr(g->builder, src_raw, i8ptr,
+                                                    "cpy.src.ip");
+                    }
+                    LLVMValueRef src_ptr = LLVMBuildBitCast(g->builder, src_raw,
+                        LLVMPointerType(g->list_struct_type, 0), "cpy.src");
+                    LLVMValueRef src_cnt = LLVMBuildLoad2(g->builder, i64,
+                        LLVMBuildStructGEP2(g->builder, g->list_struct_type,
+                            src_ptr, 0, "src.cnt"), "src.n");
+                    LLVMValueRef src_data = LLVMBuildLoad2(g->builder,
+                        LLVMPointerType(i64, 0),
+                        LLVMBuildStructGEP2(g->builder, g->list_struct_type,
+                            src_ptr, 2, "src.df"), "src.d");
+
+                    LLVMValueRef eight = LLVMConstInt(i64, 8, 0);
+                    LLVMValueRef cap = LLVMBuildSelect(g->builder,
+                        zan_icmp(g->builder, LLVMIntSGT, src_cnt, eight, "cpy.gt8"),
+                        src_cnt, eight, "cpy.cap");
+                    zan_store_fit(g, src_cnt, LLVMBuildStructGEP2(g->builder,
+                        g->list_struct_type, typed_ptr, 0, "cnt"));
+                    zan_store_fit(g, cap, LLVMBuildStructGEP2(g->builder,
+                        g->list_struct_type, typed_ptr, 1, "cap"));
+                    unsigned lwords = elem_slot_words(g, lelem);
+                    LLVMValueRef bytes = LLVMBuildMul(g->builder, cap,
+                        LLVMConstInt(i64, (unsigned long long)(8 * lwords), 0),
+                        "cpy.bytes");
+                    LLVMValueRef data_ptr = zan_call2(g->builder,
+                        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
+                        get_calloc_fn(g),
+                        (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0), bytes }, 2,
+                        "cpy.data");
+                    zan_irgen_emit_oom_check(g, g->current_fn, data_ptr);
+                    LLVMValueRef dst_data = LLVMBuildBitCast(g->builder, data_ptr,
+                        LLVMPointerType(i64, 0), "cpy.dp");
+                    zan_store_fit(g, dst_data, LLVMBuildStructGEP2(g->builder,
+                        g->list_struct_type, typed_ptr, 2, "df"));
+
+                    if (lwords != 1) {
+                        /* Wide value-struct slots have no populated form to
+                         * copy (Add rejects them too); say so instead of
+                         * word-copying possible RC fields by hand. */
+                        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                            "List copy constructor is not supported yet for a "
+                            "list whose element is a value struct wider than "
+                            "8 bytes");
+                    } else {
+                        LLVMValueRef cfn = LLVMGetBasicBlockParent(
+                            LLVMGetInsertBlock(g->builder));
+                        LLVMBasicBlockRef saved_bb =
+                            LLVMGetInsertBlock(g->builder);
+                        LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(
+                            g->ctx, cfn, "cpy.cond");
+                        LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(
+                            g->ctx, cfn, "cpy.body");
+                        LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(
+                            g->ctx, cfn, "cpy.end");
+                        LLVMValueRef ip = LLVMBuildAlloca(g->builder, i64, "cpy.i");
+                        LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), ip);
+                        LLVMBuildBr(g->builder, cond_bb);
+                        LLVMPositionBuilderAtEnd(g->builder, cond_bb);
+                        LLVMValueRef iv = LLVMBuildLoad2(g->builder, i64, ip, "cpy.iv");
+                        LLVMBuildCondBr(g->builder,
+                            zan_icmp(g->builder, LLVMIntSLT, iv, src_cnt, "cpy.more"),
+                            body_bb, end_bb);                        LLVMPositionBuilderAtEnd(g->builder, body_bb);
+                        iv = LLVMBuildLoad2(g->builder, i64, ip, "cpy.iv2");
+                        LLVMValueRef off = LLVMBuildMul(g->builder, iv,
+                            LLVMConstInt(i64, lwords, 0), "cpy.off");
+                        LLVMValueRef s_slot = LLVMBuildGEP2(g->builder, i64,
+                            src_data, &off, 1, "cpy.ss");
+                        LLVMValueRef d_slot = LLVMBuildGEP2(g->builder, i64,
+                            dst_data, &off, 1, "cpy.ds");
+                        LLVMTypeRef elem_llvm = lelem ? map_type(g, lelem) : i64;
+                        LLVMValueRef v = LLVMBuildLoad2(g->builder, i64, s_slot,
+                                                        "cpy.sv");
+                        if (LLVMGetTypeKind(elem_llvm) == LLVMStructTypeKind) {
+                            v = load_struct_from_slot(g, s_slot, elem_llvm);
+                        } else if (LLVMGetTypeKind(elem_llvm) == LLVMPointerTypeKind) {
+                            v = LLVMBuildIntToPtr(g->builder, v, elem_llvm, "cpy.pv");
+                        } else if (LLVMGetTypeKind(elem_llvm) == LLVMDoubleTypeKind) {
+                            v = LLVMBuildBitCast(g->builder, v, elem_llvm, "cpy.dv");
+                        }
+                        /* rhs NULL: the loaded element is borrowed from src,
+                         * so the store must retain it (owned-check yields 0). */
+                        emit_collection_slot_store(g, lelem, i64, d_slot, v,
+                                                   NULL, locals, 0);
+                        LLVMValueRef nxt = LLVMBuildAdd(g->builder, iv,
+                            LLVMConstInt(i64, 1, 0), "cpy.nx");
+                        LLVMBuildStore(g->builder, nxt, ip);
+                        LLVMBuildBr(g->builder, cond_bb);
+                        LLVMPositionBuilderAtEnd(g->builder, end_bb);
+                    }
+                    return LLVMBuildBitCast(g->builder, typed_ptr, i8ptr, "listv");
+                }
                 /* collection initializer items: new List<T>{ a, b, c }. The
                  * parser stores them in new_expr.args (List has no ctor args). */
                 int ninit = expr->new_expr.args.count;

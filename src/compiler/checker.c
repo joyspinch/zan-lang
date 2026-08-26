@@ -1804,6 +1804,21 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             type = zan_binder_make_array_type(c->binder, type);
         check_generic_constraints(c, type, expr->loc);
         check_ctor_available(c, type, expr);
+        /* `new List<T>(src)` with a single List-typed argument is the copy
+         * constructor. Historically every argument was silently read as a
+         * collection-initializer item, so `new List<T>(other)` compiled to a
+         * one-element list whose element WAS the other list -- element reads
+         * then handed the raw List pointer to whatever expected a T (a
+         * dangling-pointer crash, not a diagnostic). Flag the copy form for
+         * irgen below; any other argument shape keeps the historical
+         * initializer reading. */
+        bool list_copy_candidate = !expr->new_expr.is_array && type &&
+            type->kind == TYPE_CLASS && type->type_arg_count == 1 &&
+            type->name.len == 4 && memcmp(type->name.str, "List", 4) == 0 &&
+            expr->new_expr.args.count == 1 &&
+            expr->new_expr.args.items[0] &&
+            expr->new_expr.args.items[0]->kind != AST_ASSIGNMENT;
+        expr->new_expr.list_copy = false;
         /* A sized allocation with a trailing element initializer
          * (`new int[2] { 1, 2 }`) writes the elements sequentially with no
          * runtime bound, so the element count must match the dimension
@@ -1868,7 +1883,13 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                     continue;
                 }
             }
-            zan_checker_check_expr(c, arg);
+            zan_type_t *arg_type = zan_checker_check_expr(c, arg);
+            if (list_copy_candidate &&
+                arg_type && arg_type->kind == TYPE_CLASS &&
+                arg_type->type_arg_count == 1 && arg_type->name.len == 4 &&
+                memcmp(arg_type->name.str, "List", 4) == 0) {
+                expr->new_expr.list_copy = true;
+            }
         }
         return type;
     }

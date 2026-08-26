@@ -221,6 +221,9 @@ struct zan_ast_node {
             bool array_init;     /* new Type[] { a, b } -- args are elements */
             int array_rank;      /* number of dimension sizes at args start
                                   * (0 = no dims: plain object or unsized init) */
+            bool list_copy;      /* new List<T>(src): copy-construct from
+                                  * another List (checker-flagged; without it
+                                  * args were silently initializer items) */
         } new_expr;
 
         /* cast: (Type)expr */
