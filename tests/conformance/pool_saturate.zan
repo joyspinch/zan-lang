@@ -1,0 +1,188 @@
+// Conformance: saturated-pool bounded waiting (System.Data.PoolCore).
+// The high-concurrency wedge this suite guards against: every pool slot
+// is held by a request that then waits for a SECOND connection (nested
+// lease). Release-driven recovery must still work, and pathological
+// holders that never release must fast-fail the waiters with null in
+// bounded time instead of parking them on the gate forever.
+using System;
+using System.Data;
+using System.Diagnostics;
+using System.Threading;
+
+class FakeConnection : IDbConnection {
+    int id;
+    bool alive;
+
+    FakeConnection(int id) {
+        this.id = id;
+        this.alive = true;
+    }
+
+    DbResult Query(string sql) {
+        DbResult r = new DbResult();
+        r.SetColumnCount(1);
+        r.AddColumnName("id");
+        List<string> row = new List<string>();
+        row.Add(Convert.ToString(this.id));
+        r.AddRow(row);
+        return r;
+    }
+
+    DbResult Query(string sql, DbParams prms) { return this.Query(sql); }
+    int Execute(string sql) { return 1; }
+    int Execute(string sql, DbParams prms) { return this.Execute(sql); }
+    string ExecuteScalar(string sql) { return Convert.ToString(this.id); }
+    string ExecuteScalar(string sql, DbParams prms) { return this.ExecuteScalar(sql); }
+    async DbResult QueryAsync(string sql) { return this.Query(sql); }
+    async DbResult QueryAsync(string sql, DbParams prms) { return this.Query(sql, prms); }
+    async int ExecuteAsync(string sql) { return this.Execute(sql); }
+    async int ExecuteAsync(string sql, DbParams prms) { return this.Execute(sql, prms); }
+    async string ExecuteScalarAsync(string sql) { return this.ExecuteScalar(sql); }
+    async string ExecuteScalarAsync(string sql, DbParams prms) { return this.ExecuteScalar(sql, prms); }
+    void BeginTransaction() { }
+    void Commit() { }
+    void Rollback() { }
+    async bool BeginTransactionAsync() { return true; }
+    async bool CommitAsync() { return true; }
+    async bool RollbackAsync() { return true; }
+    bool IsConnected() { return this.alive; }
+    void Close() { this.alive = false; }
+    int GetProvider() { return DbProvider.SQLite; }
+}
+
+class FakeConnector : IDbConnector {
+    int opened;
+
+    FakeConnector() {
+        this.opened = 0;
+    }
+
+    int Opened() { return this.opened; }
+
+    async IDbConnection ConnectAsync() {
+        await Task.Delay(1);
+        this.opened = this.opened + 1;
+        return new FakeConnection(this.opened);
+    }
+
+    int GetProvider() { return DbProvider.SQLite; }
+}
+
+class Check {
+    static int passed = 0;
+    static int failed = 0;
+
+    static void Eq(int got, int want, string what) {
+        if (got == want) {
+            Check.passed = Check.passed + 1;
+        } else {
+            Check.failed = Check.failed + 1;
+            Console.WriteLine("FAIL " + what + ": got " + Convert.ToString(got)
+                + ", want " + Convert.ToString(want));
+        }
+    }
+
+    static void EqStr(string got, string want, string what) {
+        if (got == want) {
+            Check.passed = Check.passed + 1;
+        } else {
+            Check.failed = Check.failed + 1;
+            Console.WriteLine("FAIL " + what + ": got " + got + ", want " + want);
+        }
+    }
+
+    static void True(bool cond, string what) {
+        if (cond) {
+            Check.passed = Check.passed + 1;
+        } else {
+            Check.failed = Check.failed + 1;
+            Console.WriteLine("FAIL " + what);
+        }
+    }
+}
+
+class Program {
+    static async void Borrow(DbPool pool, List<string> log) {
+        IDbConnection c = await pool.AcquireAsync();
+        if (c == null) {
+            log.Add("null");
+            return;
+        }
+        log.Add(c.ExecuteScalar("SELECT 1"));
+        pool.Release(c);
+    }
+
+    // Healthy saturation: the released slot hands the parked waiter its
+    // connection, and the gate drains to zero.
+    static async void Recovery() {
+        FakeConnector f = new FakeConnector();
+        DbPool pool = new DbPool(f, 1);
+        IDbConnection held = await pool.AcquireAsync();
+        Check.Eq(f.Opened(), 1, "one connection opened");
+
+        List<string> log = new List<string>();
+        Task.Spawn(Program.Borrow(pool, log));
+        await Task.Delay(20);
+        Check.Eq(log.Count, 0, "waiter parked while saturated");
+        Check.Eq(pool.WaitingCount(), 1, "one waiter on the gate");
+
+        pool.Release(held);
+        await Task.Delay(20);
+        Check.Eq(log.Count, 1, "release woke the waiter");
+        Check.Eq(pool.WaitingCount(), 0, "gate drained cleanly");
+    }
+
+    // Nested-lease exhaustion: the single slot is held forever while two
+    // borrowers each need it. With tightened policy constants they must
+    // give up with null in bounded time -- not park forever.
+    static async void ExhaustionFastFails() {
+        int saveWaits = PoolWait.MaxGateWaits;
+        int saveFuse = PoolWait.GateWaitMs;
+        int saveStep = PoolWait.PollStepMs;
+        int saveBudget = PoolWait.PollBudgetMs;
+        PoolWait.MaxGateWaits = 2;
+        PoolWait.GateWaitMs = 20;
+        PoolWait.PollStepMs = 5;
+        PoolWait.PollBudgetMs = 25;
+
+        FakeConnector f = new FakeConnector();
+        DbPool pool = new DbPool(f, 1);
+        IDbConnection held = await pool.AcquireAsync();
+
+        List<string> log = new List<string>();
+        Task.Spawn(Program.Borrow(pool, log));
+        Task.Spawn(Program.Borrow(pool, log));
+        long t0 = ServerMetrics.MonoMillis();
+        await Task.Delay(500);
+        long dt = ServerMetrics.MonoMillis() - t0;
+
+        // Restore the production policy before any assertion can skip it.
+        PoolWait.MaxGateWaits = saveWaits;
+        PoolWait.GateWaitMs = saveFuse;
+        PoolWait.PollStepMs = saveStep;
+        PoolWait.PollBudgetMs = saveBudget;
+
+        Check.Eq(log.Count, 2, "both borrowers gave up in bounded time");
+        Check.EqStr(log[0], "null", "first borrower fast-failed");
+        Check.EqStr(log[1], "null", "second borrower fast-failed");
+        Check.Eq(pool.WaitingCount(), 0, "no waiter left behind on the gate");
+        Check.True(dt < 30000, "exhaustion resolved quickly");
+
+        // Policy restored: the pool behaves normally again.
+        pool.Release(held);
+        IDbConnection again = await pool.AcquireAsync();
+        Check.True(again != null, "healthy acquire after policy restored");
+        if (again != null) { pool.Release(again); }
+    }
+
+    static async void RunAll() {
+        await Program.Recovery();
+        await Program.ExhaustionFastFails();
+    }
+
+    static void Main() {
+        await Program.RunAll();
+        Console.WriteLine("pass: " + Convert.ToString(Check.passed));
+        Console.WriteLine("fail: " + Convert.ToString(Check.failed));
+    }
+}

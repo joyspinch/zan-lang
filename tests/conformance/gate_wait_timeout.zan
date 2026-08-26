@@ -1,0 +1,72 @@
+// Conformance: Gate bounded wait (System.Threading.Gate). A gate whose
+// signal never comes must still release its waiter once the timeout
+// elapses (the watchdog), a banked Signal must be consumed without
+// parking, and a real cross-coroutine Signal must end the wait well
+// before the fuse. Bounded waiting is what keeps saturated connection
+// pools from wedging coroutines permanently.
+using System;
+using System.Diagnostics;
+using System.Threading;
+
+class Check {
+    static int passed = 0;
+    static int failed = 0;
+
+    static void True(bool cond, string what) {
+        if (cond) {
+            Check.passed = Check.passed + 1;
+        } else {
+            Check.failed = Check.failed + 1;
+            Console.WriteLine("FAIL " + what);
+        }
+    }
+}
+
+class Program {
+    static async void Waker(Gate g, int afterMs) {
+        await Task.Delay(afterMs);
+        g.Signal();
+    }
+
+    static async void Work() {
+        // Silent gate: nobody ever signals -- the watchdog ends the wait.
+        Gate silent = new Gate();
+        long t0 = ServerMetrics.MonoMillis();
+        bool r = await silent.Wait(60);
+        long dt = ServerMetrics.MonoMillis() - t0;
+        Check.True(r, "timeout wait resumes");
+        Check.True(dt >= 40, "timeout wait actually waited");
+        Check.True(dt < 5000, "timeout wait ended on its own");
+
+        // Banked surplus: signal-before-wait consumes instantly instead of
+        // sitting out the whole fuse.
+        Gate banked = new Gate();
+        banked.Signal();
+        long t1 = ServerMetrics.MonoMillis();
+        bool r2 = await banked.Wait(60000);
+        long dt2 = ServerMetrics.MonoMillis() - t1;
+        Check.True(r2, "banked wait resumes");
+        Check.True(dt2 < 2000, "banked signal consumed immediately");
+
+        // A real cross-coroutine signal ends the wait far before the fuse.
+        Gate woken = new Gate();
+        Task.Spawn(Program.Waker(woken, 20));
+        long t3 = ServerMetrics.MonoMillis();
+        await woken.Wait(60000);
+        long dt3 = ServerMetrics.MonoMillis() - t3;
+        Check.True(dt3 < 3000, "signal wakes the waiter early");
+
+        // Non-positive timeout degrades to the unbounded wait; paired with
+        // a waker so the program still terminates.
+        Gate plain = new Gate();
+        Task.Spawn(Program.Waker(plain, 15));
+        bool r4 = await plain.Wait();
+        Check.True(r4, "unbounded wait still works");
+    }
+
+    static void Main() {
+        await Program.Work();
+        Console.WriteLine("pass: " + Convert.ToString(Check.passed));
+        Console.WriteLine("fail: " + Convert.ToString(Check.failed));
+    }
+}
