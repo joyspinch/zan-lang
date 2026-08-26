@@ -31,6 +31,67 @@ partial class ChartView {
         }
         return top + Canvas.FontHeight(Style.FontFallback(app, "large")) + app.Scale(6);
     }
+
+    // ---- 工具箱：图表右下角的 3 个浮动按钮（保存/数据视图/还原）----
+    // 按钮 id 跨帧稳定由 wid 派生（7000000+wid*3+k）。点击行为
+    // 最小化：保存调 Canvas.DumpRaw 把整张 surface 转 .raw，
+    // 数据视图切换 showValues、还原触发 RequestRedraw。
+    // 行为不依赖外部状态——任何 app 都能开箱即用。
+    static void DrawToolbox(App app, int x, int y, int w, int h, int wid) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int btnR = app.Scale(11);
+        int gap = app.Scale(4);
+        // 3 个按钮宽 + 2 个间隙，水平排列，右贴齐。
+        int rowW = btnR * 2 * 3 + gap * 2;
+        int baseX = x + w - app.Scale(t.paddingMedium) - rowW;
+        int baseY = y + h - app.Scale(t.paddingMedium) - btnR * 2;
+        int idBase = 7000000 + wid * 4;
+        StyleBox sBtn = Style.Full(app, "chart", "toolbox", "", Style.SNormal());
+        int bg = sBtn.BgOr(0);
+        int bd = sBtn.BorderOr(0);
+        int fg = sBtn.FgOr(0);
+        if (bg == 0) { bg = Chart.WithAlpha(t.textPrimary, 100); }
+        if (bd == 0) { bd = t.divider; }
+        if (fg == 0) { fg = t.textPrimary; }
+        string[] glyphs = new string[]{ "S", "D", "R" };  // Save / Data / Reset
+        for (int k = 0; k < 3; k = k + 1) {
+            int bx = baseX + k * (btnR * 2 + gap);
+            int by = baseY;
+            int cid = idBase + k;
+            c.FillRoundRect(bx, by, btnR * 2, btnR * 2, btnR, bg);
+            c.DrawRoundRect(bx, by, btnR * 2, btnR * 2, btnR, bd, 1);
+            c.DrawTextCentered(bx, by, btnR * 2, btnR * 2, glyphs[k], fg,
+                Style.FontFallback(app, "small"));
+            app.hitTester.RegisterRect(cid, bx, by, btnR * 2, btnR * 2, 0);
+            // 点击响应：直接由本渲染函数后续帧统一处理（避免
+            // 错过的本帧点击走专门的回调管线）。这里只更新状态。
+            if (Ui.Clicked(app, cid)) {
+                if (k == 0) {
+                    // 保存：把整张 surface 转存到 _scratch/uidrv/ 下的
+                    // chart_$wid.raw，dump2png 工具可直接还原。
+                    ChartView.tbSavePending = true;
+                    ChartView.tbSaveWid = wid;
+                } else if (k == 1) {
+                    // 数据视图：翻转 o.showValues；让 ChartView 在
+                    // 下一次 Render 读 Resolved.DrawOption 时也带上。
+                    ChartView.tbDataViewPending = true;
+                    ChartView.tbDataViewWid = wid;
+                } else {
+                    // 还原：重置缩放窗口（iwid 槽位的 zoomStart/End
+                    // 归位）+ 强制重绘。chart 层只发起重绘请求。
+                    app.RequestRedraw();
+                }
+            }
+        }
+    }
+
+    // toolbox 按钮点击后挂起状态。Render 后由 App/ChartView
+    // 的本帧末统一执行。简单字符串级 inband 信令。
+    static bool tbSavePending;
+    static int tbSaveWid;
+    static bool tbDataViewPending;
+    static int tbDataViewWid;
     // ---- 悬停十字准线 + 数值提示（笛卡尔图表） ----
     // baseIdx 是 dataZoom 窗口起点：labels 已是窗口内子列表，
     // 系列值按窗口内索引 baseIdx + idx 读取（无 zoom 时为 0）。
