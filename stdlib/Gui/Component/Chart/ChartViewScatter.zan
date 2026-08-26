@@ -23,7 +23,10 @@ partial class ChartView {
         int pad = t.paddingMedium;
         int axisFs = Style.FontFallback(app, "small");
 
-        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+        // 面板头走 DrawPanelI：与柱状/极坐标同一条路——标题 +
+        // 图例色块（可点击切换系列显隐，放不下自动换行避让标题）。
+        int top = Chart.DrawPanelI(app, x, y, w, h, o.title, o.series,
+                                   o.iwid, o.showLegend);
 
         // dataZoom：窗口索引 [i0,i1]（含端点）；范围与点绘制
         // 都只在窗口内。点下标是各系列 points 列表的全局下标。
@@ -55,6 +58,27 @@ partial class ChartView {
         }
         int maxXN = Chart.NiceMax(maxX);
         int maxYN = Chart.NiceMax(maxY);
+        // 显式数值轴范围（ECharts xAxis/yAxis.min/max）：设了就固定
+        // 定义域，数据不再参与推导——身高体重这类有自然域的散点
+        // 靠它贴合原例的坐标格。
+        int xLo = 0;
+        int yLo = 0;
+        if (o.xAxes.Count > 0 && o.xAxes[0].min != ChartOption.Auto()) {
+            xLo = o.xAxes[0].min;
+        }
+        if (o.yAxes.Count > 0 && o.yAxes[0].min != ChartOption.Auto()) {
+            yLo = o.yAxes[0].min;
+        }
+        if (o.xAxes.Count > 0 && o.xAxes[0].max != ChartOption.Auto()) {
+            maxXN = o.xAxes[0].max;
+        }
+        if (o.yAxes.Count > 0 && o.yAxes[0].max != ChartOption.Auto()) {
+            maxYN = o.yAxes[0].max;
+        }
+        int xSpan = maxXN - xLo;
+        int ySpan = maxYN - yLo;
+        if (xSpan < 1) { xSpan = 1; }
+        if (ySpan < 1) { ySpan = 1; }
         int leftGut = Canvas.MeasureText(Convert.ToString(maxYN), axisFs) + app.Scale(12);
         int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
         int plotX = x + pad + leftGut;
@@ -72,11 +96,11 @@ partial class ChartView {
         for (int k = 0; k <= ticks; k = k + 1) {
             int gy = plotY + plotH - (k * plotH / ticks);
             c.FillRect(plotX, gy, plotW, 1, sGrid.BgOr(0));
-            string vs = Convert.ToString(maxYN * k / ticks);
+            string vs = Convert.ToString(yLo + ySpan * k / ticks);
             int vw = Canvas.MeasureText(vs, axisFs);
             c.DrawText(plotX - app.Scale(6) - vw, Canvas.CenterTextYAt(gy, axisFs), vs, sAxis.FgOr(0), axisFs);
             int gx = plotX + k * plotW / ticks;
-            c.DrawTextCentered(gx - app.Scale(20), plotY + plotH + app.Scale(4), app.Scale(40), botGut, Convert.ToString(maxXN * k / ticks), sAxis.FgOr(0), axisFs);
+            c.DrawTextCentered(gx - app.Scale(20), plotY + plotH + app.Scale(4), app.Scale(40), botGut, Convert.ToString(xLo + xSpan * k / ticks), sAxis.FgOr(0), axisFs);
         }
         c.FillRect(plotX, plotY, 1, plotH, sAxis.BgOr(0));
         c.FillRect(plotX, plotY + plotH, plotW, 1, sAxis.BgOr(0));
@@ -97,16 +121,16 @@ partial class ChartView {
                     List<int> ly = new List<int>();
                     int j0 = i0;
                     while (j0 <= i1 && j0 < s.points.Count) {
-                        lx.Add(plotX + s.points[j0].x * plotW / maxXN);
-                        ly.Add(plotY + plotH - (s.points[j0].y * plotH / maxYN));
+                        lx.Add(plotX + (s.points[j0].x - xLo) * plotW / xSpan);
+                        ly.Add(plotY + plotH - ((s.points[j0].y - yLo) * plotH / ySpan));
                         j0 = j0 + 1;
                     }
                     c.DrawPolyline(lx, ly, s.color, app.Scale(2));
                 } else {
                     int j = i0;
                     while (j <= i1 && j < s.points.Count) {
-                        int px = plotX + s.points[j].x * plotW / maxXN;
-                        int py = plotY + plotH - (s.points[j].y * plotH / maxYN);
+                        int px = plotX + (s.points[j].x - xLo) * plotW / xSpan;
+                        int py = plotY + plotH - ((s.points[j].y - yLo) * plotH / ySpan);
                         c.FillCircle(px, py, rad, s.color);
                         j = j + 1;
                     }
@@ -125,9 +149,10 @@ partial class ChartView {
         int pad = t.paddingMedium;
         int axisFs = Style.FontFallback(app, "small");
 
-        // 仅做布局：这里绝不调用 PanelHead（它会重绘整个面板
-        // 背景盖住点）。主体已由 Core 绘制。
-        int top = y + pad + Canvas.FontHeight(Style.FontFallback(app, "large")) + app.Scale(6);
+        // 仅做布局：这里绝不调用 DrawPanelI / PanelHead（它们会重绘
+        // 整个面板背景盖住点）。主体已由 Core 绘制；top 用
+        // PanelTopI 与 DrawPanelI 的返回值逐像素对齐（含图例换行）。
+        int top = Chart.PanelTopI(app, x, y, w, o.title, o.series, o.showLegend);
 
         int zoomH = 0;
         int fullN = 0;
@@ -157,6 +182,26 @@ partial class ChartView {
         }
         int maxXN = Chart.NiceMax(maxX);
         int maxYN = Chart.NiceMax(maxY);
+        // 与 DrawScatterCore 相同的显式轴范围与映射，命中检测
+        // 才能落在真实的点上。
+        int xLo = 0;
+        int yLo = 0;
+        if (o.xAxes.Count > 0 && o.xAxes[0].min != ChartOption.Auto()) {
+            xLo = o.xAxes[0].min;
+        }
+        if (o.yAxes.Count > 0 && o.yAxes[0].min != ChartOption.Auto()) {
+            yLo = o.yAxes[0].min;
+        }
+        if (o.xAxes.Count > 0 && o.xAxes[0].max != ChartOption.Auto()) {
+            maxXN = o.xAxes[0].max;
+        }
+        if (o.yAxes.Count > 0 && o.yAxes[0].max != ChartOption.Auto()) {
+            maxYN = o.yAxes[0].max;
+        }
+        int xSpan = maxXN - xLo;
+        int ySpan = maxYN - yLo;
+        if (xSpan < 1) { xSpan = 1; }
+        if (ySpan < 1) { ySpan = 1; }
         int leftGut = Canvas.MeasureText(Convert.ToString(maxYN), axisFs) + app.Scale(12);
         int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
         int plotX = x + pad + leftGut;
@@ -179,8 +224,8 @@ partial class ChartView {
                     if (!s2.hidden && s2.type != ChartType.Line) {
                         int j2 = i0;
                         while (j2 <= i1 && j2 < s2.points.Count) {
-                            int px2 = plotX + s2.points[j2].x * plotW / maxXN;
-                            int py2 = plotY + plotH - (s2.points[j2].y * plotH / maxYN);
+                            int px2 = plotX + (s2.points[j2].x - xLo) * plotW / xSpan;
+                            int py2 = plotY + plotH - ((s2.points[j2].y - yLo) * plotH / ySpan);
                             int ddx = mx - px2;
                             int ddy = my - py2;
                             int d2 = ddx * ddx + ddy * ddy;
