@@ -63,6 +63,15 @@ class SelectBox : Control {
     int size;
     int status;
     int maxVisible;
+    /// 弹出层位置：0 自动（触发控件下方，超出则反向），1 仅下方，2 仅上方。
+    /// Naive UI `placement` prop。
+    int placement;
+    /// 可搜索：弹出层顶部加搜索框，键入时过滤选项（Naive UI `filterable` prop）。
+    bool filterable;
+    /// 当前搜索关键词。
+    string filterText;
+    /// 过滤后的选项索引列表（null = 不启用过滤）。每帧根据 filterText 重建。
+    List<int> filteredIdx;
     // 每帧暂存锚点几何，使延迟弹出层（OnPaintOverlay、
     // 在覆盖阶段运行）能在触发控件下方自行布局。
     int trigX;
@@ -110,6 +119,10 @@ class SelectBox : Control {
         this.status = 0;
         this.maxVisible = 6;
         this.cols = 0;
+        this.placement = 0;
+        this.filterable = false;
+        this.filterText = "";
+        this.filteredIdx = null;
         this.wid = WidgetId.Next();
         this.lastH = 0;
         this.hoverRow = 0 - 1;
@@ -269,6 +282,30 @@ class SelectBox : Control {
         return this;
     }
 
+    /// 弹出位置：0=自动（默认），1=下方（Naive UI placement="bottom"），2=上方。
+    SelectBox Placement(int v) {
+        if (v >= 0 && v <= 2) { placement = v; }
+        return this;
+    }
+
+    /// 启用搜索过滤（Naive UI filterable）。
+    SelectBox Filterable(bool v) {
+        filterable = v;
+        if (v) { filterText = ""; }
+        return this;
+    }
+
+    /// 根据 filterText 重建过滤索引列表（空文本/未启用 → 全量）。
+    void RebuildFilter() {
+        if (!filterable || filterText == "") { filteredIdx = null; return; }
+        List<int> r = new List<int>();
+        string q = filterText.ToLower();
+        for (int i = 0; i < opts.Count; i = i + 1) {
+            if (opts[i].label.ToLower().Contains(q)) { r.Add(i); }
+        }
+        filteredIdx = r;
+    }
+
     int Selected() {
         return selected;
     }
@@ -361,6 +398,13 @@ class SelectBox : Control {
         PropSpec clr = PropSpec.Bool("clearable", "Clearable");
         clr.flag = clearable;
         ps.Add(clr);
+        PropSpec pl = PropSpec.Enum("placement", "Placement",
+            new List<string>{ "auto", "bottom", "top" });
+        pl.num = placement;
+        ps.Add(pl);
+        PropSpec flt = PropSpec.Bool("filterable", "Filterable");
+        flt.flag = filterable;
+        ps.Add(flt);
         return ps;
     }
 
@@ -536,6 +580,20 @@ class SelectBox : Control {
         return w;
     }
 
+    /// 搜索框高度（filterable=true 时占用的顶部空间）。
+    int FilterBarH() {
+        if (!filterable) { return 0; }
+        return 32;
+    }
+
+    /// 过滤后参与渲染的选项索引（filterable + 关键词非空才过滤）。
+    List<int> VisibleOpts() {
+        if (!filterable || filterText == "") { return null; }
+        if (filteredIdx == null) { this.RebuildFilter(); }
+        if (filteredIdx == null) { return null; }
+        return filteredIdx;
+    }
+
     /// 延迟弹层：在 App.RunOverlays 中、所有内容绘制完成后绘制并派发事件。
     override void OnPaintOverlay(App app) {
         if (!open) { return; }
@@ -557,9 +615,12 @@ class SelectBox : Control {
 
         int nCols = this.ColumnCount();
         int nRows = this.RowCount();
+        // filterable 时每列只排一行（变成真正的下拉列表）。
+        if (filterable && filterText != "") { nCols = 1; nRows = 0; }
         int visRows = nRows;
         if (visRows > maxVisible) { visRows = maxVisible; }
-        int viewH = OverlayPopup.FitH(app, visRows * optH);
+        int fbH = this.FilterBarH();
+        int viewH = OverlayPopup.FitH(app, visRows * optH + fbH);
         int contentH = nRows * optH;
         // 由框架放置，保证列表不超出窗口：
         // 靠近底部边缘时向上翻转，而不是
@@ -568,6 +629,57 @@ class SelectBox : Control {
         int popX = OverlayPopup.FitX(app, x, w);
         int popY = OverlayPopup.FitY(app, y + h + app.Scale(4), h, viewH);
 
+        // ---- filterable 搜索框处理 ----
+        bool overSearch = false;
+        bool overClearBtn = false;
+        int searchBarX = popX;
+        int searchBarY = popY;
+        int searchBarW = w;
+        int searchBarH = fbH;
+        if (filterable && searchBarH > 0) {
+            overSearch = app.mouseX >= searchBarX
+                && app.mouseX < searchBarX + searchBarW
+                && app.mouseY >= searchBarY
+                && app.mouseY < searchBarY + searchBarH;
+            int clearBtnW = app.Scale(28);
+            overClearBtn = overSearch
+                && app.mouseX >= searchBarX + searchBarW - clearBtnW;
+            // 搜索框内接受键盘输入。
+            if (overSearch && ek == 4) {
+                int kc = app.window.EventKeyCode();
+                if (kc == 8) {
+                    // Backspace：删掉最后一个字符。
+                    if (filterText.Length > 0) {
+                        filterText = Text.Left(filterText, filterText.Length - 1);
+                        this.RebuildFilter();
+                        app.RequestRedraw();
+                    }
+                } else if (kc == 27) {
+                    // Escape：清空并关闭。
+                    filterText = "";
+                    this.SetOpen(false);
+                    app.RequestRedraw();
+                } else {
+                    string ch = Text.CharStr(kc);
+                    if (ch.Length > 0) {
+                        filterText = filterText + ch;
+                        this.RebuildFilter();
+                        app.RequestRedraw();
+                    }
+                }
+            }
+            // 清空按钮点击。
+            if (overClearBtn && app.ClickAvailable()) {
+                filterText = "";
+                app.ClaimClick();
+                app.RequestRedraw();
+            }
+        }
+
+        // 弹层内容区（选项列表）Y 起始：搜索框下方。
+        int listY = popY + searchBarH;
+        int listH = viewH - searchBarH;
+        if (listH < 0) { listH = 0; }
         bool overPopup = app.mouseX >= popX && app.mouseX < popX + w
             && app.mouseY >= popY && app.mouseY < popY + viewH;
 
@@ -575,25 +687,32 @@ class SelectBox : Control {
         // 在弹层内移动不会改变悬停 id，也不会调度新帧；只有悬停行
         // 真的变了才重绘（每一个鼠标移动事件都重绘一整帧，只要
         // 弹层开着就是持续满载）。
-        int colW = w / nCols;
+        int colW = w;
+        if (nCols > 1) { colW = w / nCols; }
         if (colW < 1) { colW = 1; }
         int over = 0 - 1;
-        if (overPopup) {
-            int row = (app.mouseY - popY + scrollY) / optH;
+        if (overPopup && !overSearch) {
+            int row = (app.mouseY - listY + scrollY) / optH;
             int col = (app.mouseX - popX) / colW;
             if (col >= nCols) { col = nCols - 1; }
+            if (col < 0) { col = 0; }
             int idx = col * nRows + row;
-            if (row >= 0 && row < nRows && idx < opts.Count) { over = idx; }
+            // 过滤模式下直接用 filteredIdx。
+            if (filterable && filterText != "" && filteredIdx != null) {
+                if (row >= 0 && row < filteredIdx.Count) { over = filteredIdx[row]; }
+            } else if (row >= 0 && row < nRows && idx < opts.Count) {
+                over = idx;
+            }
         }
         if (over != hoverRow) {
             hoverRow = over;
             app.RequestRedraw();
         }
 
-        int maxScroll = contentH - viewH;
+        int maxScroll = contentH - listH;
         if (maxScroll < 0) { maxScroll = 0; }
-        if (overPopup) {
-            bool ownsWheel = app.CaptureWheel(popX, popY, w, viewH);
+        if (overPopup && !overSearch) {
+            bool ownsWheel = app.CaptureWheel(popX, listY, w, listH);
             if (ownsWheel && ek == 13) {
                 int d = app.window.EventKeyCode();
                 scrollY = scrollY - d * app.scrollSpeed / 120;
@@ -604,27 +723,71 @@ class SelectBox : Control {
         if (scrollY < 0) { scrollY = 0; }
 
         app.BlockHitsBelow();
-        // 弹层底由 `select::popup` 提供不透明背景（base.css 保证可读），
-        // 不再额外垫一层不透明底——同区域双重绘制是过绘的典型来源。
         StyleBox pop = this.ResolvePartAs(app, "select", "popup", "popup",
                                           Class, Style.SSelected());
         pop.Paint(app, popX, popY, w, viewH);
         app.BlockHitsRect(popX, popY, w, viewH);
 
-        c.PushClip(popX, popY, w, viewH);
+        // ---- 搜索框渲染（filterable）----
+        if (filterable && searchBarH > 0) {
+            StyleBox sbStyle = this.ResolvePartAs(app, "select", "searchbar", "",
+                                                  Class, Style.SNormal());
+            sbStyle.Paint(app, searchBarX, searchBarY, searchBarW, searchBarH);
+            int sbPad = sbStyle.PadLOr(t.paddingSmall);
+            int sbFs = sbStyle.FontOr(fs);
+            // 放大镜图标：颜色由 sbStyle.fg 派生（FgOr fallback
+            // 来自皮肤的 `select::searchbar` 规则与默认主题色）。
+            int iconSz = app.Scale(14);
+            int textColor = sbStyle.FgOr(0);
+            c.DrawGlyphIn("search", searchBarX + sbPad, searchBarY,
+                iconSz, searchBarH, iconSz, textColor);
+            // 搜索文字。
+            int textX = searchBarX + sbPad + iconSz + app.Scale(4);
+            int clearBtnW = app.Scale(28);
+            int textW = searchBarW - (textX - searchBarX) - clearBtnW - sbPad;
+            if (textW > 0) {
+                if (filterText != "") {
+                    c.DrawText(textX, Canvas.CenterTextY(searchBarY, searchBarH, sbFs),
+                                filterText, textColor, sbFs);
+                } else {
+                    c.DrawText(textX, Canvas.CenterTextY(searchBarY, searchBarH, sbFs),
+                                "搜索...", textColor, sbFs);
+                }
+            }
+            // 清空按钮。
+            if (filterText != "") {
+                int cbX = searchBarX + searchBarW - clearBtnW;
+                StyleBox clrStyle = this.ResolvePartAs(app, "select", "icon", "",
+                                                       Class, Style.SNormal());
+                c.DrawGlyphIn("x", cbX, searchBarY, clearBtnW, searchBarH,
+                               iconSz, clrStyle.FgOr(0));
+            }
+        }
+
+        // ---- 选项列表渲染 ----
+        c.PushClip(popX, listY, w, listH);
+        // 过滤模式下重建行列数。
+        if (filterable && filterText != "" && filteredIdx != null) {
+            nRows = filteredIdx.Count;
+            visRows = nRows;
+            if (visRows > maxVisible) { visRows = maxVisible; }
+        }
         for (int i = 0; i < opts.Count; i = i + 1) {
+            int realIdx = i;
+            if (filterable && filterText != "" && filteredIdx != null) {
+                if (i >= filteredIdx.Count) { break; }
+                realIdx = filteredIdx[i];
+            }
             int oCol = i / nRows;
             int oRow = i % nRows;
             int ox = popX + oCol * colW;
-            int oy = popY + oRow * optH - scrollY;
-            if (oy + optH > popY && oy < popY + viewH) {
-                bool overRow = i == hoverRow;
+            int oy = listY + oRow * optH - scrollY;
+            if (oy + optH > listY && oy < listY + listH) {
+                bool overRow = realIdx == hoverRow;
                 bool isSel = false;
-                if (multi) { isSel = opts[i].chosen; }
-                else { isSel = i == selected; }
+                if (multi) { isSel = opts[realIdx].chosen; }
+                else { isSel = realIdx == selected; }
 
-                // 行以 `option`（`option:hover`、`option:selected`）解析，
-                // 皮肤无需在此分支即可重设列表样式。
                 int st = Style.SNormal();
                 if (overRow) { st = st + Style.SHover(); }
                 if (isSel) { st = st + Style.SSelected(); }
@@ -636,7 +799,7 @@ class SelectBox : Control {
                 int oMaxW = colW - rowPad - arrowSlot - t.paddingSmall;
                 c.DrawText(ox + rowPad,
                     Canvas.CenterTextY(oy, optH, rowFs),
-                    Ellipsis.Fit(opts[i].label, oMaxW, rowFs),
+                    Ellipsis.Fit(opts[realIdx].label, oMaxW, rowFs),
                     row.fg, rowFs);
                 if (isSel) {
                     StyleBox checkStyle = this.ResolvePartAs(app, "select", "checkmark", "",
@@ -650,23 +813,23 @@ class SelectBox : Control {
         }
         c.PopClip();
 
-        // 弹层滚动条（裁剪到弹层内，限制在轨道范围内）。
-        if (contentH > viewH && viewH > 0) {
+        // 弹层滚动条。
+        if (contentH > listH && listH > 0) {
             StyleBox scrollbarStyle = this.ResolvePartAs(app, "select", "scrollbar", "",
                                                           Class, Style.SSelected());
             int barW = scrollbarStyle.WidthOr(app.Scale(6));
             int bx = popX + w - barW - app.Scale(2);
             int minThumb = app.Scale(24);
-            if (minThumb > viewH) { minThumb = viewH; }
-            int thumbH = viewH * viewH / contentH;
+            if (minThumb > listH) { minThumb = listH; }
+            int thumbH = listH * listH / contentH;
             if (thumbH < minThumb) { thumbH = minThumb; }
-            if (thumbH > viewH) { thumbH = viewH; }
-            int travel = viewH - thumbH;
+            if (thumbH > listH) { thumbH = listH; }
+            int travel = listH - thumbH;
             if (travel < 0) { travel = 0; }
-            int thumbY = popY;
-            if (maxScroll > 0) { thumbY = popY + scrollY * travel / maxScroll; }
-            if (thumbY < popY) { thumbY = popY; }
-            if (thumbY + thumbH > popY + viewH) { thumbY = popY + viewH - thumbH; }
+            int thumbY = listY;
+            if (maxScroll > 0) { thumbY = listY + scrollY * travel / maxScroll; }
+            if (thumbY < listY) { thumbY = listY; }
+            if (thumbY + thumbH > listY + listH) { thumbY = listY + listH - thumbH; }
             c.PushClip(popX, popY, w, viewH);
             c.FillRoundRect(bx, thumbY, barW, thumbH,
                             scrollbarStyle.RadiusOr(barW / 2),
@@ -674,18 +837,23 @@ class SelectBox : Control {
             c.PopClip();
         }
 
-        // ---- 集中式弹层输入（overlay 阶段，位于内容之上） ----
-        // 弹层打开的当前帧 ClickAvailable() 为 false（打开时的
-        // 点击已被占用），因此弹层不会在打开时立即自关闭。
+        // ---- 弹层输入处理 ----
         if (app.ClickAvailable()) {
-            if (overPopup) {
-                int rel = app.mouseY - popY + scrollY;
+            if (overSearch) {
+                // 搜索框区域点击不关闭弹层（输入已在上面处理）。
+            } else if (overPopup) {
+                int rel = app.mouseY - listY + scrollY;
                 int col = (app.mouseX - popX) / colW;
                 if (col >= nCols) { col = nCols - 1; }
                 if (col < 0) { col = 0; }
                 int idx = col * nRows + rel / optH;
-                if (idx >= 0 && idx < opts.Count) {
-                    this.Choose(idx);
+                int realIdx = idx;
+                if (filterable && filterText != "" && filteredIdx != null) {
+                    if (idx >= 0 && idx < filteredIdx.Count) { realIdx = filteredIdx[idx]; }
+                    else { realIdx = -1; }
+                }
+                if (realIdx >= 0 && realIdx < opts.Count) {
+                    this.Choose(realIdx);
                     if (!multi) { this.SetOpen(false); }
                     app.ClaimClick();
                     app.RequestRedraw();

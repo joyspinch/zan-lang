@@ -54,6 +54,25 @@ class Button : Control {
     /// 常用事件集（Enter/Leave/MouseDown/...）由 Control.On 继承。
     UiEvent Click;
 
+    /// 背景色，Binding 支持可响应式更新。为 0 表示跟随 Class 中的
+    /// 角色类型（primary/info/success/warning/error）。非 0 时
+    /// 运行时向样式表注入 `[class*="custom-"]` 规则，自动派生
+    /// hover（+10% Lighten）和 pressed（+10% Darken）色。
+    /// 这是 Naive UI Button 的 `color` prop 语义。
+    Binding<int> Color;
+
+    /// 文字色，0 表示由 Class 决定。Color != 0 时生效。
+    Binding<int> TextColor;
+
+    /// tertiary（次要平坦）和 quaternary（卡片内按钮）变体，
+    /// 渲染时等价于 Class 里写 tertiary / quaternary。
+    /// 对应 Naive UI 的 tertiary / quaternary 按钮。
+    bool Tertiary;
+    bool Quaternary;
+
+    /// 粗体字（font-weight: 700）。Naive UI Button 的 strong 属性。
+    bool Strong;
+
     void InitButton(string label) {
         this.InitControl(label, 1);
         Text = label;
@@ -65,6 +84,11 @@ class Button : Control {
         wid = WidgetId.Next();
         wiresOwnEvents = true;
         Click = new UiEvent();
+        Color = 0;
+        TextColor = 0;
+        Tertiary = false;
+        Quaternary = false;
+        Strong = false;
     }
 
     /// `new Button { Text = "Save", Class = "primary" }`
@@ -151,6 +175,22 @@ class Button : Control {
         bool busy = Style.Has(Class, "loading");
         bool off = this.IsDisabled();
         clicked = false;
+        // 颜色绑定在每帧解析前注入对应 CSS 规则（Color 变化时
+        // 触发 bgThemeGen 失效缓存）。只注入一次：
+        // 同一色值后续帧直接命中 StyleSheet 规则。
+        this.EnsureColorInjected(app);
+        // 自定义 Color 编码为 Class 中的 `custom-{hex}` 片段，
+        // base.css 中的 `[class*="custom-"]` 子串匹配规则负责
+        // 派生出 hover/pressed 色。
+        string origClass = Class;
+        int c = 0;
+        if (Color != null) { c = Color.Get(); }
+        if (c != 0) { Class = this.AppendCustomClass(origClass, c); }
+        // Tertiary/Quaternary/Strong 是 Naive UI 风格的便利布尔 prop，
+        // 渲染时等价于在 Class 里写 tertiary/quaternary/strong。
+        if (Tertiary) { this.AddClass("tertiary"); }
+        if (Quaternary) { this.AddClass("quaternary"); }
+        if (Strong) { this.AddClass("strong"); }
         if (w <= 0) { w = this.AutoWidth(app); }
         if (h <= 0) { h = this.AutoHeight(app); }
         // 一次性解析整个外观：按钮各 class 的主题默认值，
@@ -159,6 +199,8 @@ class Button : Control {
         StyleBox s = this.ResolveEasedStyleAsIn(
             app, wid, "button", Class, off, this.IsChecked(),
             x, y, w, h);
+        // Strong prop 覆盖皮肤字重（Naive UI 风格）。
+        if (Strong) { s.fontWeight = 700; }
         s.SetRadius(s.RadiusOr(app.theme.borderRadiusMedium));
         if (styleRadius != 0) { s.SetRadius(styleRadius); }
         if (corners != Corner.All()) { s.SetCorners(corners); }
@@ -166,6 +208,8 @@ class Button : Control {
         h = s.ClampH(h);
         BoxContent.Paint(app, wid, "button", Class, name, s, x, y, w, h,
                          Icon, this.Label(), "", busy, off);
+        // 恢复 Class，避免设计器/序列化器读到污染的字段。
+        Class = origClass;
         if (off || busy) { return wid; }
         if (Ui.Activate(app, wid, x, y, w, h)) {
             clicked = true;
@@ -185,13 +229,59 @@ class Button : Control {
         return wid;
     }
 
+    // ---- 自定义 Color 注入 ------------------------------------------------
+
+    /// 上一帧注入的色值（0=无），与当前 Color 字段对比以检测变化。
+    int lastInjectedColor;
+    int lastColorGen;
+
+    /// 解析样式前确保 Color 的 CSS 规则已注入 sheet。
+    /// 颜色变化时（1）重新注入派生 CSS（2）触发样式缓存失效。
+    void EnsureColorInjected(App app) {
+        int c = 0;
+        if (Color != null) { c = Color.Get(); }
+        int curGen = app.bgThemeGen;
+        if (c == lastInjectedColor && curGen == lastColorGen) { return; }
+        lastInjectedColor = c;
+        lastColorGen = curGen;
+        if (app.sheet == null || c == 0) { return; }
+        string css = this.BuildColorCss(c);
+        StyleSheet tmp = StyleSheet.FromCss(css);
+        app.sheet.MergeSheet(tmp);
+        app.bgThemeGen = app.bgThemeGen + 1;
+    }
+
+    /// 编码 Color 值为 `custom-{hex}` class 片段，附加到 Class 末尾。
+    string AppendCustomClass(string orig, int c) {
+        string hex = Style.Hex8(c);
+        if (hex.Length == 8) { hex = hex.Substring(2, 6); }
+        string frag = "custom-" + hex;
+        if (Style.Has(orig, frag)) { return orig; }
+        if (orig == "") { return frag; }
+        return orig + " " + frag;
+    }
+
+    /// 从 Color 值生成 hover/pressed 派生色 CSS 规则。
+    /// 选择器 `[class*="custom-"]` 子串匹配任意 custom-{hex}。
+    string BuildColorCss(int c) {
+        string sel = "[class*=\"custom-\"]";
+        string selH = "[class*=\"custom-\"]:hover";
+        string selA = "[class*=\"custom-\"]:active";
+        int hov = App.Lighten(c, 100);
+        int prs = App.Darken(c, 100);
+        string css = sel + " { background: #" + Style.Hex8(c)
+            + "; border: 0 #" + Style.Hex8(c) + "; }\n";
+        css = css + selH + " { background: #" + Style.Hex8(hov)
+            + "; border-color: #" + Style.Hex8(hov) + "; }\n";
+        css = css + selA + " { background: #" + Style.Hex8(prs)
+            + "; border-color: #" + Style.Hex8(prs) + "; }\n";
+        return css;
+    }
+
     // ---- 设计器 / 序列化模型 -------------------------------------
 
     override string Kind() { return "Button"; }
 
-    /// 每个属性都指向其编辑的字段，读写操作
-    /// 由基类完成（Control.GetProp/SetProp），此列表就是该控件
-    /// 的全部属性代码。
     override List<PropSpec> Props() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec text = PropSpec.Text("text", "Text");
@@ -209,8 +299,15 @@ class Button : Control {
         PropSpec on = PropSpec.Bool("checked", "Checked");
         on.flag = Checked;
         ps.Add(on);
-        // 所有视觉样式都是 class：`primary small round ghost loading`，
-        // 或皮肤 CSS 定义的任何类。
+        PropSpec tri = PropSpec.Bool("tertiary", "Tertiary");
+        tri.flag = Tertiary;
+        ps.Add(tri);
+        PropSpec qua = PropSpec.Bool("quaternary", "Quaternary");
+        qua.flag = Quaternary;
+        ps.Add(qua);
+        PropSpec strg = PropSpec.Bool("strong", "Strong");
+        strg.flag = Strong;
+        ps.Add(strg);
         PropSpec cls = PropSpec.Text("class", "Classes");
         cls.str = Class;
         ps.Add(cls);

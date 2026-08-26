@@ -47,6 +47,16 @@ class Input : Control {
     /// 校验错误信息；"" 表示有效。SetError 会绘制红色边框，并
     /// 在字段下方显示消息；任何编辑都会清除它。
     string errMsg;
+    /// 尺寸变体：对应 Class = "small" / "large"（Naive UI size prop）。
+    string Size;
+    /// 可清空：文本非空且（获焦或悬停）时在尾端显示 X 按钮，
+    /// 点击清空内容并触发 Change（Naive UI clearable prop）。
+    bool Clearable;
+    /// 聚焦时自动全选内容（Naive UI autoselect prop）。适合
+    /// 地址栏、"搜索并跳转" 等点进来就整段替换的字段。
+    bool Autoselect;
+    /// 跟踪 autoselect 已执行过（防止每次获焦都全选）。
+    bool autoselected;
 
     /// 立即模式工厂与保留模式构造函数共用的初始化函数：
     /// 设置 Control 基类（停靠顶部，使追加的输入框
@@ -63,6 +73,9 @@ class Input : Control {
         iconLead = "";
         errMsg = "";
         iconTrail = "";
+        Size = "medium";
+        Clearable = false;
+        Autoselect = false;
         wiresOwnEvents = true;
         Change = new UiEvent();
         Submit = new UiEvent();
@@ -282,7 +295,23 @@ class Input : Control {
         app.focus.RegisterFocusable(id);
         bool focused = app.focus.IsFocused(id);
 
-        if (focused) { HandleInput(app); }
+        // Size 字段映射为 Class 片段（small/medium/large），
+        // base.css 的 input.small/large 规则负责重设高度/字号。
+        string origClass = Class;
+        if (Size == "tiny") { this.AddClass("small"); }
+        else if (Size == "small") { this.AddClass("small"); }
+        else if (Size == "large") { this.AddClass("large"); }
+        // medium 是默认，不附加。
+
+        if (focused) {
+            // Autoselect: 首次获焦时全选。
+            if (Autoselect && !autoselected) {
+                SelectAll();
+                autoselected = true;
+            }
+            HandleInput(app);
+        }
+        if (!focused) { autoselected = false; }
 
         SyncBinding();
         string txt = model.Get();
@@ -303,7 +332,7 @@ class Input : Control {
             errorStyle = this.ResolvePartAs(app, "input", "error", "",
                                             Class, Style.SNormal());
             c.DrawRect(x, y, w, h, errorStyle.BorderOr(errorStyle.fg),
-                       errorStyle.BorderWOr(app.Scale(2)));
+                       errorStyle.BorderWOr(2));
         }
 
         int pad = s.PadLOr(t.paddingSmall);
@@ -312,6 +341,9 @@ class Input : Control {
         int glyphSz = fs;
         string trailIcon = iconTrail;
         if (password) { trailIcon = "eye"; }
+        // Clearable：文本非空且获焦时在尾端附加 X 清除按钮。
+        bool showClear = Clearable && txt != "" && focused;
+        if (showClear) { trailIcon = "x"; }
         int leadSlot = 0;
         if (iconLead != "") { leadSlot = glyphSz + pad; }
         int trailSlot = 0;
@@ -409,11 +441,18 @@ class Input : Control {
 
         app.hitTester.RegisterRect(id, x, y, w, h, 1);
 
-        // 密码明文：在尾端眼睛图标上松开左键，切换
-        // 明文并消费该点击，光标不会移动。
-        if (password && onTrail && app.EventKind() == 3
+        // 密码明文 / 清空按钮点击：都在尾端图标上释放左键。
+        if (onTrail && app.EventKind() == 3
                 && app.window.EventButton() == 0 && app.ClickAvailable()) {
-            reveal = !reveal;
+            if (password) {
+                reveal = !reveal;
+            } else if (showClear) {
+                // Clearable: 清空内容，触发 Change，置光标到行首。
+                model.Set("");
+                cursorPos = 0;
+                selAnchor = -1;
+                Edited();
+            }
             app.ClaimClick();
             app.RequestRedraw();
         }
@@ -449,6 +488,9 @@ class Input : Control {
         }
         if (!focused && selAnchor >= 0) { selAnchor = -1; }
 
+        // 恢复 Class，避免设计器/序列化器读到污染的字段。
+        Class = origClass;
+
         On.Fire(app, id);
         return id;
     }
@@ -464,6 +506,16 @@ class Input : Control {
         ph.Also("placeholder");
         ps.Add(ph);
         ps.Add(PropSpec.Text("text", "Text"));
+        PropSpec sz = PropSpec.Enum("size", "Size",
+            new List<string>{ "tiny", "small", "medium", "large" });
+        sz.num = 2;  // medium
+        ps.Add(sz);
+        PropSpec clr = PropSpec.Bool("clearable", "Clearable");
+        clr.flag = Clearable;
+        ps.Add(clr);
+        PropSpec asel = PropSpec.Bool("autoselect", "Autoselect");
+        asel.flag = Autoselect;
+        ps.Add(asel);
         return ps;
     }
 

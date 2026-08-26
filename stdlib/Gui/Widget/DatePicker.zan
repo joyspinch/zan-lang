@@ -5,6 +5,10 @@ namespace Gui.Widget;
 
 /// 日期编辑控件：可键盘编辑的 YYYY-MM-DD 输入框，右侧带日历按钮。
 /// 月历在覆盖层中绘制，日期选择通过 OnChange 报告。
+/// Type 字段控制变体（Naive UI type prop）：
+///   "date"      — 默认，单个日期
+///   "datetime"  — 含时分（HH:MM），时分通过弹层底部两个数字框输入
+///   "daterange" — 起止日期对，第一次点击=起始，第二次=结束
 class DatePicker : Control {
     static DatePicker current;
     Input editor;
@@ -14,7 +18,14 @@ class DatePicker : Control {
     int viewYear;
     int viewMonth;
     DateTime selected;
+    /// range 模式下第一个点击（pending）；第二次点击后才关闭弹层。
+    DateTime pendingStart;
+    bool hasPending;
+    int hour;
+    int minute;
     int wid;
+    /// Naive UI type prop：date | datetime | daterange。
+    string Type;
 
     DatePicker() {
         this.InitControl("datePicker", 1);
@@ -26,9 +37,14 @@ class DatePicker : Control {
         trigger.Tip = "选择日期";
         Change = new UiEvent();
         open = false;
+        Type = "date";
         selected = DateTime.Now();
         viewYear = selected.Year();
         viewMonth = selected.Month();
+        pendingStart = null;
+        hasPending = false;
+        hour = 0;
+        minute = 0;
         wid = WidgetId.Next();
         DatePicker.current = this;
         wiresOwnEvents = true;
@@ -46,19 +62,32 @@ class DatePicker : Control {
         // DateTime is exposed through the existing Text()/SetText() pair;
         // the editor's SignalString remains owned by the child Input.
         PropSpec text = PropSpec.Text("text", "Date");
-        text.WithTip("Date value in YYYY-MM-DD format.");
+        text.WithTip("Date value in YYYY-MM-DD format. For datetime use "
+                     + "'YYYY-MM-DD HH:MM'; for daterange use 'A ~ B'.");
         ps.Add(text);
+        PropSpec type = PropSpec.Enum("type", "Type",
+            new List<string>{ "date", "datetime", "daterange" });
+        type.num = 0;
+        ps.Add(type);
         return ps;
     }
 
     override string GetExtra(string key) {
         if (key == "text" || key == "value") { return this.Text(); }
+        if (key == "type") { return Type; }
         return "";
     }
 
     override bool SetExtra(string key, string val) {
         if (key == "text" || key == "value") {
             this.SetText(val);
+            return true;
+        }
+        if (key == "type") {
+            if (val == "datetime" || val == "daterange" || val == "date") {
+                Type = val;
+                editor.SetText(this.FormatText());
+            }
             return true;
         }
         return false;
@@ -82,17 +111,43 @@ class DatePicker : Control {
 
     string Text() { return editor.GetText(); }
     DateTime GetDate() { return selected; }
+    /// 范围模式下的起始日；非 range 模式时 == GetDate()。
+    DateTime GetStart() {
+        if (Type == "daterange" && hasPending) { return pendingStart; }
+        return selected;
+    }
+    /// 范围模式下的结束日；非 range 模式时 == GetDate()。
+    DateTime GetEnd() { return selected; }
+    bool IsRange() { return Type == "daterange"; }
+    bool IsDateTime() { return Type == "datetime"; }
 
     void SetDate(DateTime value) {
         selected = value;
         viewYear = value.Year();
         viewMonth = value.Month();
-        editor.SetText(value.ToDateString());
+        if (Type == "datetime") {
+            DateTime t = value;
+            hour = t.Hour();
+            minute = t.Minute();
+        }
+        editor.SetText(this.FormatText());
     }
 
     void SetText(string value) {
         editor.SetText(value);
         this.Edited();
+    }
+
+    /// 格式化当前值为编辑框文本，遵循 Type 变体。
+    string FormatText() {
+        if (Type == "datetime") {
+            return selected.ToDateString() + " " + DateTime.Pad2(hour)
+                + ":" + DateTime.Pad2(minute);
+        }
+        if (Type == "daterange" && hasPending) {
+            return pendingStart.ToDateString() + " ~ " + selected.ToDateString();
+        }
+        return selected.ToDateString();
     }
 
     static int Digit(string s) {
@@ -133,7 +188,61 @@ class DatePicker : Control {
     }
 
     void Edited() {
-        DateTime value = DatePicker.ParseDate(editor.GetText());
+        string raw = editor.GetText();
+        if (Type == "daterange") {
+            // "YYYY-MM-DD ~ YYYY-MM-DD" / "YYYY-MM-DD~YYYY-MM-DD" / 单日期
+            int sep = raw.IndexOf("~");
+            DateTime startV = null;
+            DateTime endV = null;
+            if (sep >= 0) {
+                startV = DatePicker.ParseDate(
+                    raw.Substring(0, sep).Trim());
+                endV = DatePicker.ParseDate(
+                    raw.Substring(sep + 1, raw.Length - sep - 1).Trim());
+            } else {
+                startV = DatePicker.ParseDate(raw);
+                endV = startV;
+            }
+            if (startV == null || endV == null) { return; }
+            pendingStart = startV;
+            hasPending = true;
+            if (!selected.Equals(endV)) {
+                selected = endV;
+                viewYear = endV.Year();
+                viewMonth = endV.Month();
+                Change.Raise();
+            }
+            return;
+        }
+        if (Type == "datetime") {
+            // "YYYY-MM-DD HH:MM"
+            int sp = raw.IndexOf(" ");
+            DateTime dv = null;
+            if (sp >= 0) { dv = DatePicker.ParseDate(raw.Substring(0, sp)); }
+            else { dv = DatePicker.ParseDate(raw); }
+            if (dv == null) { return; }
+            int h = hour; int mi = minute;
+            if (sp >= 0) {
+                string tail = raw.Substring(sp + 1, raw.Length - sp - 1);
+                int colon = tail.IndexOf(":");
+                if (colon >= 0) {
+                    int hh = DatePicker.Number(tail, 0, colon);
+                    int mm = DatePicker.Number(tail, colon + 1, 2);
+                    if (hh >= 0) { h = hh; }
+                    if (mm >= 0) { mi = mm; }
+                }
+            }
+            if (h > 23) { h = 23; }
+            if (mi > 59) { mi = 59; }
+            selected = dv;
+            hour = h;
+            minute = mi;
+            viewYear = dv.Year();
+            viewMonth = dv.Month();
+            Change.Raise();
+            return;
+        }
+        DateTime value = DatePicker.ParseDate(raw);
         if (value == null) { return; }
         if (!value.Equals(selected)) {
             selected = value;
@@ -176,8 +285,33 @@ class DatePicker : Control {
     }
 
     void PickDay(int day) {
-        selected = DateTime.FromDate(viewYear, viewMonth, day);
-        editor.SetText(selected.ToDateString());
+        DateTime picked = DateTime.FromDate(viewYear, viewMonth, day);
+        if (Type == "daterange") {
+            // 第一次点击 = 起始；第二次点击 = 结束。结束 < 起始时
+            // 自动交换，让用户总能先点开始再点结束。
+            if (!hasPending) {
+                pendingStart = picked;
+                hasPending = true;
+                selected = picked;
+                editor.SetText(this.FormatText());
+                return;
+            }
+            DateTime startV = pendingStart;
+            DateTime endV = picked;
+            if (endV.IsBefore(startV)) {
+                endV = startV;
+                startV = picked;
+            }
+            pendingStart = startV;
+            selected = endV;
+            hasPending = true;
+            editor.SetText(this.FormatText());
+            open = false;
+            Change.Raise();
+            return;
+        }
+        selected = picked;
+        editor.SetText(this.FormatText());
         open = false;
         Change.Raise();
     }
@@ -226,6 +360,7 @@ class DatePicker : Control {
         if (!open || DatePicker.current != this) { return; }
         int popW = app.Scale(224);
         int popH = app.Scale(200);
+        if (Type == "datetime") { popH = popH + app.Scale(40); }
         int popX = OverlayPopup.FitX(app, bx, popW);
         int popY = OverlayPopup.FitY(app, by + bh + app.Scale(4), bh, popH);
         StyleBox pop = this.ResolvePartAs(app, "select", "popup", "popup",
@@ -233,8 +368,6 @@ class DatePicker : Control {
         pop.Paint(app, popX, popY, popW, popH);
         app.BlockHitsBelow();
         app.BlockHitsRect(popX, popY, popW, popH);
-        // 与 SelectBox 相同：点击可用性必须在 BlockHitsBelow 之后询问，
-        // 否则弹层已开（inputBlockPrevious）而本帧遮罩未登记时恒为 false。
         bool clicked = app.ClickAvailable();
 
         int fs = Style.FontFallback(app, "small");
@@ -280,15 +413,34 @@ class DatePicker : Control {
             int dy = top + cellH + row * cellH;
             string label = Convert.ToString(day);
             int color = pop.fg;
-            if (day == selected.Day() && viewMonth == selected.Month() &&
-                viewYear == selected.Year()) {
+            // 范围模式：高亮整段范围（Naive UI daterange）。
+            bool inRange = false;
+            bool isStart = false;
+            bool isEnd = false;
+            if (Type == "daterange" && hasPending) {
+                DateTime cur = DateTime.FromDate(viewYear, viewMonth, day);
+                if (cur.IsBefore(pendingStart) == false &&
+                    cur.IsBefore(selected) == false) {
+                    inRange = true;
+                }
+                if (cur.Equals(pendingStart)) { isStart = true; }
+                if (cur.Equals(selected)) { isEnd = true; }
+            }
+            if (inRange) {
+                StyleBox range = Style.Part(app, "datepicker", "range", "", "",
+                                             "", Style.SHover());
+                c.FillRect(dx, dy + app.Scale(1),
+                           cellW, cellH - app.Scale(2),
+                           range.BgOr(pop.accent));
+            }
+            if (isStart || isEnd ||
+                (day == selected.Day() && viewMonth == selected.Month() &&
+                 viewYear == selected.Year())) {
                 StyleBox sel = Style.Part(app, "datepicker", "day", "", "",
                                           "", Style.SSelected());
                 c.FillRoundRect(dx + app.Scale(1), dy + app.Scale(1),
                                 cellW - app.Scale(2), cellH - app.Scale(2),
                                 app.Scale(3), sel.BgOr(pop.accent));
-                // 选中格的数字必须自带前景色，否则它和强调底色同调，
-                // 当天在日历上看起来是个空的色块。
                 color = sel.FgOr(pop.bg);
             }
             c.DrawText(dx + (cellW - Canvas.MeasureText(label, fs)) / 2,
@@ -296,6 +448,39 @@ class DatePicker : Control {
             if (clicked && app.mouseX >= dx && app.mouseX < dx + cellW &&
                 app.mouseY >= dy && app.mouseY < dy + cellH) {
                 this.PickDay(day); app.ClaimClick(); app.RequestRedraw(); return;
+            }
+        }
+        // ---- datetime 模式的时间输入行 ----
+        if (Type == "datetime") {
+            int timeY = top + (7 + 1) * cellH;  // 7 行日期后
+            int tw = app.Scale(36);
+            int gap = app.Scale(4);
+            int totalTimeW = tw * 2 + gap;
+            int startX = popX + (popW - totalTimeW) / 2;
+            int hourX = startX;
+            int colonX = startX + tw;
+            int minX = colonX + gap;
+            c.DrawText(hourX, Canvas.CenterTextY(timeY, cellH, fs),
+                       DateTime.Pad2(hour), pop.fg, fs);
+            c.DrawText(colonX + app.Scale(8),
+                       Canvas.CenterTextY(timeY, cellH, fs),
+                       ":", pop.fg, fs);
+            c.DrawText(minX, Canvas.CenterTextY(timeY, cellH, fs),
+                       DateTime.Pad2(minute), pop.fg, fs);
+            // 增/减按钮（点击小时区：循环 0-23，点击分钟区：循环 0-59）。
+            if (clicked) {
+                if (app.mouseY >= timeY && app.mouseY < timeY + cellH) {
+                    if (app.mouseX >= hourX && app.mouseX < hourX + tw) {
+                        hour = (hour + 1) % 24;
+                        editor.SetText(this.FormatText());
+                        app.ClaimClick(); app.RequestRedraw(); return;
+                    }
+                    if (app.mouseX >= minX && app.mouseX < minX + tw) {
+                        minute = (minute + 1) % 60;
+                        editor.SetText(this.FormatText());
+                        app.ClaimClick(); app.RequestRedraw(); return;
+                    }
+                }
             }
         }
         if (clicked && (app.mouseX < popX || app.mouseX >= popX + popW ||
