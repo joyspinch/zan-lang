@@ -1762,8 +1762,16 @@ static int gdi_upload_chunks(HDC dc, int h, u32 *pix, BITMAPINFO *bmi,
     while (y < end) {
         int ch = end - y;
         if (ch > ZAN_CHUNK_H) ch = ZAN_CHUNK_H;
-        SetDIBitsToDevice(dc, rx, y, rw, ch, rx, y, 0, h, pix, bmi,
-                          DIB_RGB_COLORS);
+        /* A failed chunk must not reach the shadow: the shadow claims to
+         * describe the screen, and a rect recorded but never shown would
+         * never be retried -- the old pixels would stick on screen forever
+         * while every later diff calls them fresh. Report the failure so the
+         * caller leaves that rect out of the shadow and the next frame
+         * diffs it again. */
+        if (!SetDIBitsToDevice(dc, rx, y, rw, ch, rx, y, 0, h, pix, bmi,
+                               DIB_RGB_COLORS)) {
+            return -1;
+        }
         calls++;
         y += ch;
     }
@@ -1826,17 +1834,22 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
     int calls = 0;
 
     zan_present_shadow_t *sh = present_shadow(hwnd, w, h, 1);
-    /* rect_count < 0 (the shell's "forced full": WM_PAINT, app-declared whole
-     * frames, pad frames) does NOT bypass the diff: the shadow tracks what was
-     * last uploaded to the screen, not what the app rendered, so it stays
-     * valid across occlusions and full re-renders -- a WM_PAINT restore only
-     * needs the rows that actually differ. Apps that re-render everything
-     * every frame (the gallery loop, games) would otherwise stream their full
-     * window every frame, which is exactly the tearing this path exists to
-     * prevent. */
-    int force_full = !sh;
+    /* rect_count < 0: the caller knows the shadow no longer describes the
+     * screen -- WM_PAINT after the OS invalidated parts of the redirection
+     * surface behind our back, or a pad frame behind a resized window.
+     * Bypass the diff and upload everything. rect_count == 0 is an
+     * app-declared whole-frame repaint: nothing changed the screen since the
+     * last forced upload except our own (shadow-tracked) uploads, so the
+     * shadow still describes it and diffing against it is both safe and
+     * cheap -- apps that redraw every pixel every frame pay only the changed
+     * tiles instead of streaming the window sixty times a second. The two
+     * cases must not be merged: letting a WM_PAINT diff would keep whatever
+     * the OS discarded on screen forever (the shadow says fresh, the screen
+     * shows stale bands), while letting every whole frame bypass the diff
+     * would stream the full window each animation frame. */
+    int force_full = !sh || rect_count < 0;
 
-    if (!force_full && rect_count <= 0) {
+    if (!force_full && rect_count == 0) {
         /* Tile diff against the last presented frame. */
         int tw = (w + ZAN_DIFF_TILE - 1) / ZAN_DIFF_TILE;
         int th = (h + ZAN_DIFF_TILE - 1) / ZAN_DIFF_TILE;
@@ -1963,8 +1976,11 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
                 if (rx + rw > w) rw = w - rx;
                 if (ry + rh > h) rh = h - ry;
                 if (rw <= 0 || rh <= 0) continue;
-                calls += gdi_upload_chunks(dc, h, pix, &bmi, rx, ry, rw, rh);
-                present_shadow_fill_rect(sh, pix, stride, rx, ry, rw, rh);
+                int c = gdi_upload_chunks(dc, h, pix, &bmi, rx, ry, rw, rh);
+                if (c >= 0) {
+                    calls += c;
+                    present_shadow_fill_rect(sh, pix, stride, rx, ry, rw, rh);
+                }
             }
         }
         free(changed);
@@ -1973,14 +1989,19 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
     } else if (force_full) {
         /* WM_PAINT / fresh shadow: the OS invalidated the redirection
          * surface, so everything changes -- swap atomically when the window
-         * allows it, chunks only as fallback. */
+         * allows it, chunks only as fallback. On a failed chunk upload the
+         * shadow is left stale: the next frame's diff (or the next
+         * WM_PAINT) retries exactly what did not land. */
         if (zan_gui_atomic_present(hwnd, surface_id)) {
             memcpy(sh->pixels, pix, (size_t)w * (size_t)h * 4);
             ReleaseDC((HWND)hwnd, dc);
             return ZAN_ATOMIC_RET;
         }
-        calls = gdi_upload_chunks(dc, h, pix, &bmi, 0, 0, w, h);
-        memcpy(sh->pixels, pix, (size_t)w * (size_t)h * 4);
+        int c = gdi_upload_chunks(dc, h, pix, &bmi, 0, 0, w, h);
+        if (c >= 0) {
+            calls = c;
+            memcpy(sh->pixels, pix, (size_t)w * (size_t)h * 4);
+        }
     } else if (rect_count > 0) {
         long long area = 0;
         for (int i = 0; i < rect_count; i++) {
@@ -2011,8 +2032,11 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
             if (rx + rw > w) rw = w - rx;
             if (ry + rh > h) rh = h - ry;
             if (rw <= 0 || rh <= 0) continue;
-            calls += gdi_upload_chunks(dc, h, pix, &bmi, rx, ry, rw, rh);
-            present_shadow_fill_rect(sh, pix, stride, rx, ry, rw, rh);
+            int c = gdi_upload_chunks(dc, h, pix, &bmi, rx, ry, rw, rh);
+            if (c >= 0) {
+                calls += c;
+                present_shadow_fill_rect(sh, pix, stride, rx, ry, rw, rh);
+            }
         }
     }
     ReleaseDC((HWND)hwnd, dc);

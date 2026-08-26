@@ -354,14 +354,6 @@ class Win32Shell {
     // 这次 Blit 必须整窗上传（zan_gui_gdi_present 的 rectCount=-1 语义）。
     static bool wmPaintBlit;
 
-    // 应用声明“这一帧重画了每一个像素”：下一次该窗口的 Blit 整窗上传。
-    // 整窗帧不经过 PresentDirty，此前落进瓦片差分（阴影比对）——阴影
-    // 与重定向表面一旦失步（上传过却没上屏的块），差异比对会永远认为
-    // 那块没变，旧帧内容就永久留在屏上。整窗帧的上传范围由应用自己
-    // 说清楚，不依赖任何影子。
-    static bool forceFullUpload;
-    static nint forceFullHwnd;
-
     // 自动化驱动排队的合成事件，由临界区
     // 保护：驱动线程可能在 UI 线程排空时入队。
     static List<int> injectQ;
@@ -936,7 +928,6 @@ class Win32Shell {
                 if (Win32Shell.dirtyHwnd == hwnd) {
                     Win32Shell.dirty.Clear();
                     Win32Shell.dirtyOverflow = false;
-                    Win32Shell.forceFullUpload = false;
                 }
                 Win32Shell.TakeDirtyLost(hwnd);
                 return;
@@ -948,7 +939,6 @@ class Win32Shell {
             if (Win32Shell.dirtyHwnd == hwnd) {
                 Win32Shell.dirty.Clear();
                 Win32Shell.dirtyOverflow = false;
-                Win32Shell.forceFullUpload = false;
             }
             Win32Shell.TakeDirtyLost(hwnd);
             Win32Shell.PresentLayered(hwnd, surface);
@@ -956,16 +946,13 @@ class Win32Shell {
         }
         bool owned = Win32Shell.dirtyHwnd == hwnd;
         bool lost = Win32Shell.TakeDirtyLost(hwnd);
-        bool fullAsked = Win32Shell.forceFullUpload
-                         && Win32Shell.forceFullHwnd == hwnd;
-        if (owned) {
-            Win32Shell.forceFullUpload = false;
-        }
         // GDI 呈现统一走 zan_gui_gdi_present：声明过的脏矩形按矩形上传；
         // 没有声明时对上一呈现帧的阴影做瓦片差分，只上传真正变化的块。
         // SetDIBitsToDevice 是逐行流入重定向表面的，整窗上传会在屏幕上
         // 撕裂几毫秒（滚动时肉眼可见的文字重影）；差分把上传缩到变化区，
-        // 且正确性不依赖任何损伤声明——漏报最多多传几块瓦片，绝不花屏。
+        // 且对应用自画的帧是安全的——屏上除了我们上传过的内容（影子
+        // 都记了账）什么都不会变。唯一让影子失信的是 OS 失效，那走
+        // 下面的 rectCount=-1 强制整窗。
         int rects = 0;
         int ret = 0;
         if (owned && !lost && Win32Shell.dirty.Count > 0
@@ -979,11 +966,13 @@ class Win32Shell {
             ret = Win32Shell.zan_gui_gdi_present(hwnd, surface,
                 Win32Shell.scratchRects, n);
             rects = ret > 0 ? ret : 0;
-        } else if (fullAsked || Win32Shell.wmPaintBlit
+        } else if (Win32Shell.wmPaintBlit
                    || Win32Shell.windowWidth > sw
                    || Win32Shell.windowHeight > sh) {
-            // 应用声明的整窗帧、WM_PAINT（OS 判定表面失效）或窗口比
-            // 表面大（补边帧）：阴影不再可信，强制整窗上传。
+            // WM_PAINT（OS 判定表面失效）或窗口比表面大（补边帧）：
+            // 影子不再可信，rectCount=-1 让运行时跳过差分、整窗重传。
+            // 欠账（lost）不需要强制：差分以“上一呈现帧”为基线，
+            // 没上传成的块下一帧照样被判为变化、照常重传。
             ret = Win32Shell.zan_gui_gdi_present(hwnd, surface, 0, 0 - 1);
             rects = ret > 0 ? ret : 0;
         } else {
@@ -1876,8 +1865,12 @@ class Win32Shell {
         Win32Shell.dirty.Add(h);
     }
 
-    /// 整窗帧的呈现声明：这一帧重画了窗口的每个像素，下一次 Blit
-    /// 对它整窗上传（rectCount=-1），不做任何差分。见 forceFullUpload。
+    /// 整窗帧的呈现声明：本帧重画了窗口的每个像素。差分的基线是
+    /// “上一呈现帧”——屏上除了我们上传过的内容（影子逐块记了账）
+    /// 什么都不会变，所以画满整窗的帧照常走差分即可，漏不掉任何
+    /// 变化；强制整窗（rectCount=-1）只保留给 OS 失效（WM_PAINT/
+    /// 补边帧），见 Blit。这里只做脏矩形归属交接，让本帧进入统一
+    /// 的呈现路径。
     static void PresentFull(nint hwnd) {
         Win32Shell.Init();
         if (Win32Shell.dirtyHwnd != hwnd) {
@@ -1888,8 +1881,6 @@ class Win32Shell {
             Win32Shell.dirtyOverflow = false;
             Win32Shell.dirtyHwnd = hwnd;
         }
-        Win32Shell.forceFullUpload = true;
-        Win32Shell.forceFullHwnd = hwnd;
     }
 
     /// 记下一个窗口有一批声明过却没上传成的脏矩形：它下一次呈现
