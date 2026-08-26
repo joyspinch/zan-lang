@@ -2121,11 +2121,17 @@ static void zan_atomic_layer_drop(void *hwnd) {
 }
 
 /* Swaps the surface onto the screen atomically. The window becomes layered on
- * first use (the glass path already runs this way). The DIB is sized to the
- * client rect: UpdateLayeredWindow's psize *sets* the window size, so sizing
- * it to a stale surface would resize the window mid-frame. Rows beyond the
- * surface (a resize frame where the surface lags) go up transparent, exactly
- * like the glass present. Returns 1 when the frame is on screen. */
+ * first use (the glass path already runs this way). Layered content covers the
+ * whole window -- a layered window has no non-client area -- and
+ * UpdateLayeredWindow's psize *sets* the window size, so the DIB must be sized
+ * to the window rect with the client pixels placed at the client offset:
+ * sizing it to the client rect would shrink a maximized window by the frame
+ * inset on every present (the WM_NCCALCSIZE maximized compensation is the one
+ * state where client < window), and the shell's relayout would loop the
+ * shrink. On a normal window the offset is zero and this is the client-sized
+ * geometry. Rows beyond the surface (a resize frame where the surface lags)
+ * and the maximized frame ring go up transparent, exactly like the glass
+ * present. Returns 1 when the frame is on screen. */
 EXPORT i32 zan_gui_atomic_present(void *hwnd, i32 surface_id) {
 #ifdef _WIN32
     if (!hwnd || surface_id < 0 || surface_id >= g_surface_count) return 0;
@@ -2140,31 +2146,56 @@ EXPORT i32 zan_gui_atomic_present(void *hwnd, i32 surface_id) {
     int pw = rc.right - rc.left;
     int ph = rc.bottom - rc.top;
     if (pw <= 0 || ph <= 0) return 0;
+    RECT wr;
+    POINT co;
+    co.x = 0;
+    co.y = 0;
+    int ww = pw;
+    int wh = ph;
+    int ox = 0;
+    int oy = 0;
+    if (GetWindowRect((HWND)hwnd, &wr) && ClientToScreen((HWND)hwnd, &co)) {
+        int tw = wr.right - wr.left;
+        int th = wr.bottom - wr.top;
+        int tx = co.x - wr.left;
+        int ty = co.y - wr.top;
+        if (tw > 0 && th > 0 && tx >= 0 && ty >= 0 && tx + pw <= tw
+                && ty + ph <= th) {
+            ww = tw;
+            wh = th;
+            ox = tx;
+            oy = ty;
+        }
+    }
     LONG_PTR ex = GetWindowLongPtrW((HWND)hwnd, GWL_EXSTYLE);
     if (!(ex & WS_EX_LAYERED)) {
         SetWindowLongPtrW((HWND)hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
     }
-    zan_atomic_layer_t *l = atomic_layer(hwnd, pw, ph);
+    zan_atomic_layer_t *l = atomic_layer(hwnd, ww, wh);
     if (!l || !l->bits) return 0;
     int w = s->width, h = s->height;
     int stride = s->stride;
     u32 *pix = s->pixels;
-    int copyW = w < pw ? w : pw;
-    int copyH = h < ph ? h : ph;
+    int copyW = w < ww ? w : ww;
+    int copyH = h < wh ? h : wh;
     u32 *dst = (u32 *)l->bits;
-    for (int y = 0; y < ph; y++) {
-        u32 *drow = dst + (size_t)y * (size_t)pw;
-        if (y < copyH) {
-            const u32 *srow = pix + (size_t)y * (size_t)stride;
-            for (int x = 0; x < copyW; x++) {
-                drow[x] = srow[x] | 0xFF000000u;
-            }
+    for (int y = 0; y < wh; y++) {
+        u32 *drow = dst + (size_t)y * (size_t)ww;
+        int sy = y - oy;
+        if (sy < 0 || sy >= copyH) {
+            memset(drow, 0, (size_t)ww * 4);
         } else {
-            memset(drow, 0, (size_t)pw * 4);
+            const u32 *srow = pix + (size_t)sy * (size_t)stride;
+            int x = 0;
+            for (; x < ox; x++) { drow[x] = 0; }
+            for (; x < ox + copyW; x++) {
+                drow[x] = srow[x - ox] | 0xFF000000u;
+            }
+            for (; x < ww; x++) { drow[x] = 0; }
         }
     }
     POINT src = { 0, 0 };
-    SIZE size = { pw, ph };
+    SIZE size = { ww, wh };
     BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
     HDC sdc = GetDC(0);
     BOOL ok = UpdateLayeredWindow((HWND)hwnd, sdc, NULL, &size, l->dc, &src,
