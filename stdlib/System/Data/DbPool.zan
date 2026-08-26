@@ -32,6 +32,16 @@ class DbPool {
     IDbConnector connector;
     PoolCore<IDbConnection> core;
 
+    /// <summary>池饱和时获取等待的硬上限：先走事件门（零轮询），
+    /// 门等次数用尽后转为短轮询直至预算耗尽，返回 null 让调用方
+    /// 快速失败。这是进程级自愈兜底——任何「持着一条连接再等第二条」
+    /// 的嵌套租借缺陷只会退化成个别请求 503，而不是把整个 worker
+    /// 拖成永久假死（实测教训：协程死锁时 CPU 空转、端口照收、
+    /// 全站无响应）。</summary>
+    static int SaturateGateWaits = 64;
+    static int SaturatePollStepMs = 20;
+    static int SaturatePollBudgetMs = 10000;
+
     DbPool(IDbConnector connector, int maxSize) {
         this.connector = connector;
         this.core = new PoolCore<IDbConnection>(maxSize);
@@ -42,9 +52,13 @@ class DbPool {
     }
 
     /// <summary>借出一个连接：复用空闲连接，未达上限时新建，
-    /// 否则挂起协程直到有连接被释放。
-    /// 连接池关闭后返回 null。</summary>
+    /// 否则挂起协程直到有连接被释放。饱和等待有硬上限
+    /// （见 SaturateGateWaits）：超时返回 null，调用方按
+    /// 「数据库暂不可用」应答，绝不定死。
+    /// 连接池关闭后同样返回 null。</summary>
     async IDbConnection AcquireAsync() {
+        int gated = 0;
+        int budget = DbPool.SaturatePollBudgetMs;
         while (true) {
             if (this.core.IsClosed()) {
                 return null;
@@ -76,10 +90,20 @@ class DbPool {
                 this.core.Borrow(opened);
                 return opened;
             }
-            // 连接池已满：挂起等待，直到有连接释放。
-            this.core.EnterWait();
-            await this.core.Waiter().Wait();
-            this.core.LeaveWait();
+            // 连接池已满：先走事件门等待（零轮询，归还即醒）；
+            // 门等次数用尽仍拿不到，说明持有者迟迟不还（健康系统
+            // 里一次归还在毫秒级）——转为短轮询直至预算耗尽，
+            // 以 null 快速失败，把「等不到连接」局限在单个请求。
+            if (gated < DbPool.SaturateGateWaits) {
+                this.core.EnterWait();
+                await this.core.Waiter().Wait();
+                this.core.LeaveWait();
+                gated = gated + 1;
+                continue;
+            }
+            await Task.Delay(DbPool.SaturatePollStepMs);
+            budget = budget - DbPool.SaturatePollStepMs;
+            if (budget <= 0) { return null; }
         }
         return null;
     }
