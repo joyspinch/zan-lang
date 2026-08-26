@@ -37,6 +37,31 @@ class Gate {
         return true;
     }
 
+    /// <summary>带超时的等待：至多 <paramref name="timeoutMs"/> 毫秒后
+    /// 必然恢复。返回 true 只表示「已恢复」，不区分是 Signal 还是超时
+    /// ——调用方一律复查自己的谓词（计数语义本就要求复查循环）。
+    ///
+    /// 超时由看门狗协程实现：到点向本门发一次信号。落在 FIFO 头部的
+    /// 等待者被唤醒——可能是调用者自己，也可能是同一门上的别人；对
+    /// 「任何等待都有出口」这个目的而言足够：没有谁会永久停在门上，
+    /// 丢失的 Signal 最迟 timeoutMs 后也有进展。看门狗不取消：提前
+    /// 醒来时它稍后的那次 Signal 存为盈余，由下一个等待者立即消费，
+    /// 无副作用。timeoutMs &lt;= 0 时退化为无限等待。</summary>
+    async bool Wait(int timeoutMs) {
+        if (this.handle == 0) { return false; }
+        if (timeoutMs > 0) {
+            Task.Spawn(Gate.Watchdog(this.handle, timeoutMs));
+        }
+        await Gate.Park(this.handle);
+        return true;
+    }
+
+    /* 看门狗协程体：延迟后向句柄发一次信号，然后自然结束。 */
+    static async void Watchdog(long handle, int timeoutMs) {
+        await Task.Delay(timeoutMs);
+        zan_gate_signal(handle);
+    }
+
     void Signal() {
         if (this.handle == 0) { return; }
         Gate.zan_gate_signal(this.handle);
