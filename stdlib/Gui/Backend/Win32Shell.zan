@@ -107,6 +107,8 @@ class Win32Shell {
     static extern short GetKeyState(int vk);
     [DllImport("user32", EntryPoint = "ScreenToClient")]
     static extern int ScreenToClient(nint hwnd, nint point);
+    [DllImport("user32", EntryPoint = "ClientToScreen")]
+    static extern int ClientToScreen(nint hwnd, nint point);
     [DllImport("user32", EntryPoint = "GetDC")]
     static extern nint GetDC(nint hwnd);
     [DllImport("user32", EntryPoint = "ReleaseDC")]
@@ -1060,8 +1062,36 @@ class Win32Shell {
         }
         int copyW = sw < pw ? sw : pw;
         int copyH = sh < ph ? sh : ph;
-        if (Win32Shell.lwDc == 0 || Win32Shell.lwW != pw
-                || Win32Shell.lwH != ph) {
+        // 分层窗口没有非客户区：内容铺满整个窗口，而 UpdateLayeredWindow
+        // 的 psize 会*设置*窗口尺寸。拿客户区尺寸当 psize，最大化状态下
+        // （NCCALCSIZE 补偿是唯一客户区小于窗口的状态）每帧都会把窗口
+        // 缩小一个边框宽度，外壳重排再触发下一帧——窗口持续自动缩小。
+        // 所以 DIB 按窗口矩形建、客户区像素放到客户区偏移处、psize 恒等
+        // 于当前窗口尺寸；普通窗口偏移为零，几何与旧逻辑完全一致。
+        int ww = pw;
+        int wh = ph;
+        int ox = 0;
+        int oy = 0;
+        nint wrect = NativeMemory.Alloc(16);
+        nint cpt = NativeMemory.Alloc(8);
+        if (Win32Shell.GetWindowRect(hwnd, wrect) != 0
+                && Win32Shell.ClientToScreen(hwnd, cpt) != 0) {
+            int tw = Win32Shell.S32(wrect, 8) - Win32Shell.S32(wrect, 0);
+            int th = Win32Shell.S32(wrect, 12) - Win32Shell.S32(wrect, 4);
+            int tx = Win32Shell.S32(cpt, 0) - Win32Shell.S32(wrect, 0);
+            int ty = Win32Shell.S32(cpt, 4) - Win32Shell.S32(wrect, 4);
+            if (tw > 0 && th > 0 && tx >= 0 && ty >= 0 && tx + pw <= tw
+                    && ty + ph <= th) {
+                ww = tw;
+                wh = th;
+                ox = tx;
+                oy = ty;
+            }
+        }
+        NativeMemory.Free(wrect);
+        NativeMemory.Free(cpt);
+        if (Win32Shell.lwDc == 0 || Win32Shell.lwW != ww
+                || Win32Shell.lwH != wh) {
             if (Win32Shell.lwDc != 0) {
                 Win32Shell.SelectObject(Win32Shell.lwDc, Win32Shell.lwOld);
                 Win32Shell.DeleteObject(Win32Shell.lwBitmap);
@@ -1071,7 +1101,7 @@ class Win32Shell {
             nint screen = Win32Shell.GetDC(0);
             Win32Shell.lwDc = Win32Shell.CreateCompatibleDC(screen);
             Win32Shell.ReleaseDC(0, screen);
-            Win32Shell.FillBitmapInfo(pw, ph);
+            Win32Shell.FillBitmapInfo(ww, wh);
             nint bits = 0;
             Win32Shell.lwBitmap = Win32Shell.CreateDIBSection(Win32Shell.lwDc,
                 Win32Shell.bitmapInfo, 0, ref bits, 0, 0);
@@ -1083,26 +1113,40 @@ class Win32Shell {
             Win32Shell.lwOld = Win32Shell.SelectObject(Win32Shell.lwDc,
                 Win32Shell.lwBitmap);
             Win32Shell.lwBits = bits;
-            Win32Shell.lwW = pw;
-            Win32Shell.lwH = ph;
+            Win32Shell.lwW = ww;
+            Win32Shell.lwH = wh;
         }
         List<byte> mask = null;
         if (Win32Shell.shapeMode != 0) {
             mask = Win32Shell.ShapeMask(pw, ph);
         }
-        // 逐行拷：目标行跨距按窗口宽 pw，源行跨距按表面宽 sw；两者在缩放
-        // 的一瞬并不相等（把它们当成同一个就是那片斜切）。
+        // 逐行拷：目标行跨距按窗口宽 ww，源行跨距按表面宽 sw；两者在缩放
+        // 的一瞬并不相等（把它们当成同一个就是那片斜切）。窗口坐标 y 对应
+        // 客户区行 sy = y - oy，列同样偏移 ox；客户区之外（最大化时的边框
+        // 环）保持全透明。
         int y = 0;
-        while (y < ph) {
-            nint dstRow = Win32Shell.lwBits + y * pw * 4;
+        while (y < wh) {
+            nint dstRow = Win32Shell.lwBits + y * ww * 4;
+            int sy = y - oy;
             int x = 0;
-            if (y < copyH) {
-                nint srcRow = pixels + y * sw * 4;
-                while (x < copyW) {
-                    int p = Win32Shell.S32(srcRow, x * 4);
+            if (sy < 0 || sy >= copyH) {
+                // 表面还没长到窗口这么大的那一圈：给它全透明，由 DWM 填
+                // 模糊背景（下一帧应用就把它画满了），而不是搬旧像素。
+                while (x < ww) {
+                    new Span<int>(dstRow + x * 4, 1)[0] = 0;
+                    x = x + 1;
+                }
+            } else {
+                nint srcRow = pixels + sy * sw * 4;
+                while (x < ox) {
+                    new Span<int>(dstRow + x * 4, 1)[0] = 0;
+                    x = x + 1;
+                }
+                while (x < ox + copyW) {
+                    int p = Win32Shell.S32(srcRow, (x - ox) * 4);
                     int a = (p >> 24) & 255;
                     if (mask != null) {
-                        int cov = mask[y * pw + x];
+                        int cov = mask[sy * pw + (x - ox)];
                         if (cov <= 0) {
                             new Span<int>(dstRow + x * 4, 1)[0] = 0;
                             x = x + 1;
@@ -1127,19 +1171,17 @@ class Win32Shell {
                         (a << 24) | (r2 << 16) | (g2 << 8) | b2;
                     x = x + 1;
                 }
-            }
-            // 表面还没长到窗口这么大的那一圈：给它全透明，由 DWM 填模糊
-            // 背景（下一帧应用就把它画满了），而不是搬旧像素。
-            while (x < pw) {
-                new Span<int>(dstRow + x * 4, 1)[0] = 0;
-                x = x + 1;
+                while (x < ww) {
+                    new Span<int>(dstRow + x * 4, 1)[0] = 0;
+                    x = x + 1;
+                }
             }
             y = y + 1;
         }
         nint screenDc = Win32Shell.GetDC(0);
         nint size = NativeMemory.Alloc(8);
-        new Span<int>(size, 1)[0] = pw;
-        new Span<int>(size + 4, 1)[0] = ph;
+        new Span<int>(size, 1)[0] = ww;
+        new Span<int>(size + 4, 1)[0] = wh;
         nint src = NativeMemory.Alloc(8);
         new Span<int>(src, 1)[0] = 0;
         new Span<int>(src + 4, 1)[0] = 0;
