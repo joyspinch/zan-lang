@@ -20,6 +20,15 @@ class Rate : Control {
     int baseId;
     /// 评分变化时触发（C# 风格：`r.Change += h;`）。
     UiEvent Change;
+    /// 允许半星（Naive UI allow-half）。true 时点击星星左半
+    /// = i+0.5，右半 = i+1，模型用 *2 存储。
+    bool allowHalf;
+    /// 只读：禁止点击编辑，但仍绘制（Naive UI readonly）。
+    bool readOnly;
+    /// 可清空：再次点击同一星清除评分（Naive UI clearable）。
+    bool clearable;
+    /// 尺寸变体：small/medium/large（Naive UI size）。
+    string Size;
 
     void InitRate(SignalInt m, int stars) {
         this.InitControl("rate", 1);
@@ -28,6 +37,10 @@ class Rate : Control {
         baseId = WidgetId.Block(stars);
         wiresOwnEvents = true;
         Change = new UiEvent();
+        allowHalf = false;
+        readOnly = false;
+        clearable = false;
+        Size = "medium";
     }
 
     /// Default design-time constructor.
@@ -56,8 +69,21 @@ class Rate : Control {
         PropSpec val = PropSpec.Int("value", "Rating");
         val.snum = model;
         val.Step(1, 0, 10);
-        val.WithTip("Current selected rating.");
+        val.WithTip("Current selected rating (Naive UI value, *2 if allow-half).");
         ps.Add(val);
+        PropSpec half = PropSpec.Bool("allowHalf", "Allow half");
+        half.flag = allowHalf;
+        ps.Add(half);
+        PropSpec ro = PropSpec.Bool("readonly", "Readonly");
+        ro.flag = readOnly;
+        ps.Add(ro);
+        PropSpec clr = PropSpec.Bool("clearable", "Clearable");
+        clr.flag = clearable;
+        ps.Add(clr);
+        PropSpec sz = PropSpec.Enum("size", "Size",
+            new List<string>{ "small", "medium", "large" });
+        sz.num = 1;
+        ps.Add(sz);
         return ps;
     }
 
@@ -67,24 +93,52 @@ class Rate : Control {
     }
 
     int Value() { return model.Get(); }
+    /// 半星模式下 *2 编码：模型字段 3 = 1.5 星。
+    int RawValue() {
+        if (allowHalf) { return model.Get() / 2; }
+        return model.Get();
+    }
 
     /// 将绑定的模型值拉入本地信号（model -> UI）。
     void SyncBinding() {
         if (data == null) { return; }
         int cur = data.Get();
+        if (allowHalf) { cur = cur * 2; }
         if (cur != model.Get()) { model.Set(cur); }
     }
 
     int Render(App app, int x, int y) {
         SyncBinding();
         this.PaintStars(app, x, y);
-        if (app.EventKind() == 3) {
+        if (!readOnly && app.EventKind() == 3) {
             int hit = app.ClickTarget();
             if (hit >= baseId && hit < baseId + maxStars) {
-                model.Set(hit - baseId + 1);
-                if (data != null) { data.Set(model.Get()); }
-                Change.Raise();
-                app.RequestRedraw();
+                int idx = hit - baseId;
+                if (allowHalf) {
+                    // 利用鼠标 x 位置判断左右半：图标左半 = 半星。
+                    int cellW = app.Scale(22);
+                    if (Size == "small") { cellW = app.Scale(16); }
+                    if (Size == "large") { cellW = app.Scale(30); }
+                    int rel = app.mouseX - x;
+                    int half = (rel % cellW) < (cellW / 2);
+                    int newVal = idx * 2 + (half ? 1 : 2);
+                    if (clearable && model.Get() == newVal) { newVal = 0; }
+                    if (newVal != model.Get()) {
+                        model.Set(newVal);
+                        if (data != null) { data.Set(newVal / 2); }
+                        Change.Raise();
+                        app.RequestRedraw();
+                    }
+                } else {
+                    int newVal = idx + 1;
+                    if (clearable && model.Get() == newVal) { newVal = 0; }
+                    if (newVal != model.Get()) {
+                        model.Set(newVal);
+                        if (data != null) { data.Set(newVal); }
+                        Change.Raise();
+                        app.RequestRedraw();
+                    }
+                }
             }
         }
         On.Fire(app, baseId);
@@ -106,15 +160,25 @@ class Rate : Control {
     }
 
     /// 按 `rate` CSS 规则绘制星星，悬停的星星预览
-    /// 将要设置的评分。
+    /// 将要设置的评分。半星模式（allowHalf）下，
+    /// 整星 = 实心，半星 = 50% alpha 实心（`rate::star-half`）。
     void PaintStars(App app, int x, int y) {
         Canvas c = app.canvas;
         Theme t = app.theme;
+        // Size 字段映射为 Class 片段。
+        string origClass = Class;
+        if (Size == "small") { this.AddClass("small"); }
+        else if (Size == "large") { this.AddClass("large"); }
         StyleBox s = this.ResolveStyleAs(app, "rate", Class, Style.SNormal());
         StyleBox on = this.ResolvePartAs(app, "rate", "star", "", Class,
                                          Style.SNormal());
         StyleBox off = this.ResolvePartAs(app, "rate", "empty", "", Class,
                                           Style.SNormal());
+        StyleBox half = null;
+        if (allowHalf) {
+            half = this.ResolvePartAs(app, "rate", "star-half", "", Class,
+                                       Style.SNormal());
+        }
         int fs = s.FontOr(Style.FontFallback(app, "huge"));
         int step = fs + app.Scale(6);
         int rowH = Canvas.FontHeight(fs);
@@ -124,25 +188,40 @@ class Rate : Control {
         for (; i < maxStars; i = i + 1) {
             if (app.focus.IsHovered(baseId + i)) { preview = i; }
         }
-        int fillTo = model.Get();
-        if (preview >= 0) { fillTo = preview + 1; }
+        // 评分以 *2 编码；显示时除以 2。
+        int fillTwos = model.Get();
+        int fillTo = fillTwos;
+        if (preview >= 0) {
+            // 悬停预览也按 *2
+            fillTo = preview * 2 + 2;
+        }
 
         int offColor = off.FgOr(0);
         int onColor = on.FgOr(0);
+        int halfColor = half != null ? half.FgOr(onColor) : onColor;
         i = 0;
         while (i < maxStars) {
             int sx = x + i * step;
             int color = offColor;
             string name = "star-empty";
-            if (i < fillTo) {
-                color = onColor;
-                name = "star";
+            if (allowHalf) {
+                int twosHere = fillTo - i * 2;
+                if (twosHere >= 2) {
+                    color = onColor; name = "star";
+                } else if (twosHere == 1) {
+                    color = halfColor; name = "star";
+                }
+            } else {
+                if (i < fillTo) {
+                    color = onColor; name = "star";
+                }
             }
             c.DrawGlyphIn(name, sx, y, step, rowH, fs, color);
             app.hitTester.RegisterRect(baseId + i, sx, y, step,
                                                     rowH, 0);
             i = i + 1;
         }
+        Class = origClass;
     }
 
     override void OnMeasure(App app) {
