@@ -1678,6 +1678,9 @@ typedef struct zan_present_shadow_s {
     int w;
     int h;
     u32 *pixels;
+    int layered;  /* ever presented through UpdateLayeredWindow: GDI uploads
+                     to this hwnd no longer reach the screen, so every later
+                     present must go out layered too (see present_layered) */
     struct zan_present_shadow_s *next;
 } zan_present_shadow_t;
 
@@ -1803,6 +1806,90 @@ EXPORT i32 zan_gui_atomic_present(void *hwnd, i32 surface_id);
  * atomic swap instead of rect uploads; the shell only tests ret > 0, so any
  * distinctive positive works -- the value just makes present logs decodable. */
 #define ZAN_ATOMIC_RET 1000000
+
+static i32 atomic_present_rows(void *hwnd, i32 surface_id,
+                               const unsigned char *rows);
+
+/* The incremental present for a window whose content DWM already holds (an
+ * UpdateLayeredWindow swap happened before): GDI uploads to such a window
+ * silently no-op -- SetDIBitsToDevice "succeeds" while the screen never
+ * changes -- so mixing the two paths after the first atomic swap is what made
+ * clicks and hovers look dead until some big repaint resynced the screen.
+ * Every present for a latched window goes out through ULW instead, but only
+ * the rows the diff (or the declared rects) mark as changed are premultiplied
+ * into the persistent layered DIB, and a frame with no changed rows skips the
+ * swap entirely. Shadow bookkeeping matches the GDI path: a failed swap
+ * zeroes the shadow so the next frame re-uploads everything. */
+static i32 present_layered(void *hwnd, i32 surface_id, zan_present_shadow_t *sh,
+                           const u32 *pix, int stride, int w, int h,
+                           i32 *rects, i32 rect_count) {
+    unsigned char *rows = (unsigned char *)calloc((size_t)h, 1);
+    if (!rows) return -1;
+    int any = 0;
+    if (rect_count < 0) {
+        /* OS invalidation / pad frame: everything changes. A layered window
+         * keeps its content across occlusion, so this is rare -- resize lag,
+         * mostly. */
+        memset(rows, 1, (size_t)h);
+        any = 1;
+    } else if (rect_count == 0) {
+        int tw = (w + ZAN_DIFF_TILE - 1) / ZAN_DIFF_TILE;
+        int th = (h + ZAN_DIFF_TILE - 1) / ZAN_DIFF_TILE;
+        for (int ty = 0; ty < th; ty++) {
+            int y0 = ty * ZAN_DIFF_TILE;
+            int nrows = (y0 + ZAN_DIFF_TILE <= h) ? ZAN_DIFF_TILE : (h - y0);
+            for (int tx = 0; tx < tw; tx++) {
+                int x0 = tx * ZAN_DIFF_TILE;
+                int cols = (x0 + ZAN_DIFF_TILE <= w) ? ZAN_DIFF_TILE : (w - x0);
+                int dirty = 0;
+                for (int j = 0; j < nrows && !dirty; j++) {
+                    const u32 *a = pix + (size_t)(y0 + j) * (size_t)stride + x0;
+                    const u32 *b = sh->pixels
+                                   + (size_t)(y0 + j) * (size_t)w + x0;
+                    if (memcmp(a, b, (size_t)cols * 4) != 0) dirty = 1;
+                }
+                if (dirty) {
+                    memset(rows + y0, 1, (size_t)nrows);
+                    present_shadow_fill_rect(sh, pix, stride, x0, y0, cols,
+                                             nrows);
+                    any = 1;
+                }
+            }
+        }
+    } else {
+        for (int i = 0; i < rect_count; i++) {
+            int rx = rects[i * 4 + 0];
+            int ry = rects[i * 4 + 1];
+            int rw = rects[i * 4 + 2];
+            int rh = rects[i * 4 + 3];
+            if (rx < 0) { rw += rx; rx = 0; }
+            if (ry < 0) { rh += ry; ry = 0; }
+            if (rx + rw > w) rw = w - rx;
+            if (ry + rh > h) rh = h - ry;
+            if (rw <= 0 || rh <= 0) continue;
+            memset(rows + ry, 1, (size_t)rh);
+            present_shadow_fill_rect(sh, pix, stride, rx, ry, rw, rh);
+            any = 1;
+        }
+    }
+    if (!any) {
+        free(rows);
+        return 0;
+    }
+    if (!atomic_present_rows(hwnd, surface_id, rows)) {
+        /* Nothing shown: invalidate the shadow so the next frame re-uploads
+         * everything instead of trusting rows DWM never got. */
+        memset(sh->pixels, 0, (size_t)w * (size_t)h * 4);
+        free(rows);
+        return -1;
+    }
+    if (rect_count < 0) {
+        memcpy(sh->pixels, pix, (size_t)w * (size_t)h * 4);
+    }
+    free(rows);
+    return ZAN_ATOMIC_RET;
+}
+
 EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
                                i32 rect_count) {
 #ifdef _WIN32
@@ -1820,6 +1907,14 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
     u32 *pix = s->pixels;
     int stride = s->stride;
 
+    zan_present_shadow_t *sh = present_shadow(hwnd, w, h, 1);
+    if (sh && sh->layered) {
+        /* DWM holds this window's content (an atomic swap ran before); GDI
+         * uploads would land nowhere, so every present stays layered. */
+        return present_layered(hwnd, surface_id, sh, pix, stride, w, h,
+                               rects, rect_count);
+    }
+
     BITMAPINFO bmi;
     memset(&bmi, 0, sizeof(bmi));
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -1833,7 +1928,6 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
     if (!dc) return -1;
     int calls = 0;
 
-    zan_present_shadow_t *sh = present_shadow(hwnd, w, h, 1);
     /* rect_count < 0: the caller knows the shadow no longer describes the
      * screen -- WM_PAINT after the OS invalidated parts of the redirection
      * surface behind our back, or a pad frame behind a resized window.
@@ -1899,6 +1993,7 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
                              * ZAN_DIFF_TILE;
             if (area * 100 > (long long)w * h * ZAN_ATOMIC_AT
                     && zan_gui_atomic_present(hwnd, surface_id)) {
+                sh->layered = 1;
                 memcpy(sh->pixels, pix, (size_t)w * (size_t)h * 4);
                 free(changed);
                 free(out);
@@ -1993,6 +2088,7 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
          * shadow is left stale: the next frame's diff (or the next
          * WM_PAINT) retries exactly what did not land. */
         if (zan_gui_atomic_present(hwnd, surface_id)) {
+            sh->layered = 1;
             memcpy(sh->pixels, pix, (size_t)w * (size_t)h * 4);
             ReleaseDC((HWND)hwnd, dc);
             return ZAN_ATOMIC_RET;
@@ -2018,6 +2114,7 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
         }
         if (area * 100 > (long long)w * h * ZAN_ATOMIC_AT
                 && zan_gui_atomic_present(hwnd, surface_id)) {
+            sh->layered = 1;
             memcpy(sh->pixels, pix, (size_t)w * (size_t)h * 4);
             ReleaseDC((HWND)hwnd, dc);
             return ZAN_ATOMIC_RET;
@@ -2075,10 +2172,11 @@ typedef struct zan_atomic_layer_s {
 
 static zan_atomic_layer_t *g_atomic_layers = NULL;
 
-static zan_atomic_layer_t *atomic_layer(void *hwnd, int w, int h) {
+static zan_atomic_layer_t *atomic_layer(void *hwnd, int w, int h, int *fresh) {
     zan_atomic_layer_t *prev = NULL;
     zan_atomic_layer_t *it = g_atomic_layers;
     int n = 0;
+    if (fresh) { *fresh = 0; }
     while (it) {
         if (it->hwnd == hwnd) {
             if (it->w != w || it->h != h) {
@@ -2106,6 +2204,9 @@ static zan_atomic_layer_t *atomic_layer(void *hwnd, int w, int h) {
                 SelectObject(it->dc, it->bm);
                 it->w = w;
                 it->h = h;
+                /* A recreated DIB holds garbage outside anything the caller
+                 * premultiplies this call, so the caller must fill it all. */
+                if (fresh) { *fresh = 1; }
             }
             if (prev) {
                 prev->next = it->next;
@@ -2147,6 +2248,7 @@ static zan_atomic_layer_t *atomic_layer(void *hwnd, int w, int h) {
         free(tail->next);
         tail->next = NULL;
     }
+    if (fresh) { *fresh = 1; }
     return nl;
 }
 
@@ -2166,12 +2268,21 @@ static void zan_atomic_layer_drop(void *hwnd) {
 }
 
 /* Swaps the surface onto the screen atomically. The window becomes layered on
- * first use (the glass path already runs this way). The DIB is sized to the
- * client rect: UpdateLayeredWindow's psize *sets* the window size, so sizing
- * it to a stale surface would resize the window mid-frame. Rows beyond the
- * surface (a resize frame where the surface lags) go up transparent, exactly
- * like the glass present. Returns 1 when the frame is on screen. */
-EXPORT i32 zan_gui_atomic_present(void *hwnd, i32 surface_id) {
+ * first use (the glass path already runs this way) -- and stays layered: a
+ * window whose content was last set through UpdateLayeredWindow no longer
+ * shows GDI output at all, so once this path has run for a hwnd every later
+ * present must run through it too (the shadow's `layered` bit routes them
+ * here). The DIB is sized to the client rect: UpdateLayeredWindow's psize
+ * *sets* the window size, so sizing it to a stale surface would resize the
+ * window mid-frame. `rows` (when not NULL) picks the surface rows to
+ * premultiply; unlisted rows keep what the layered DIB already shows, which
+ * is what makes per-frame incremental atomic presents cheaper than a full
+ * copy. A freshly (re)created DIB ignores `rows` and fills everything. Rows
+ * beyond the surface (a resize frame where the surface lags) go up
+ * transparent, exactly like the glass present. Returns 1 when the frame is on
+ * screen. */
+static i32 atomic_present_rows(void *hwnd, i32 surface_id,
+                               const unsigned char *rows) {
 #ifdef _WIN32
     if (!hwnd || surface_id < 0 || surface_id >= g_surface_count) return 0;
     zan_surface_t *s = g_surfaces[surface_id];
@@ -2185,41 +2296,96 @@ EXPORT i32 zan_gui_atomic_present(void *hwnd, i32 surface_id) {
     int pw = rc.right - rc.left;
     int ph = rc.bottom - rc.top;
     if (pw <= 0 || ph <= 0) return 0;
+    /* Layered content covers the whole window -- a layered window has no
+     * non-client area -- and UpdateLayeredWindow's psize *sets* the window
+     * size. Sizing it to the client rect would shrink a maximized window by
+     * the frame inset on every present (the WM_NCCALCSIZE maximized
+     * compensation is the one state where client < window), and the shell's
+     * relayout would loop the shrink. Size the DIB to the window rect and
+     * place the client pixels at the client offset instead; on a normal
+     * window the offset is zero and this is the client-sized geometry. */
+    RECT wr;
+    POINT co;
+    co.x = 0;
+    co.y = 0;
+    int ww = pw;
+    int wh = ph;
+    int ox = 0;
+    int oy = 0;
+    if (GetWindowRect((HWND)hwnd, &wr) && ClientToScreen((HWND)hwnd, &co)) {
+        int tw = wr.right - wr.left;
+        int th = wr.bottom - wr.top;
+        int tx = co.x - wr.left;
+        int ty = co.y - wr.top;
+        if (tw > 0 && th > 0 && tx >= 0 && ty >= 0 && tx + pw <= tw
+                && ty + ph <= th) {
+            ww = tw;
+            wh = th;
+            ox = tx;
+            oy = ty;
+        }
+    }
+    int made_layered = 0;
     LONG_PTR ex = GetWindowLongPtrW((HWND)hwnd, GWL_EXSTYLE);
     if (!(ex & WS_EX_LAYERED)) {
         SetWindowLongPtrW((HWND)hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+        made_layered = 1;
     }
-    zan_atomic_layer_t *l = atomic_layer(hwnd, pw, ph);
-    if (!l || !l->bits) return 0;
+    int fresh = 0;
+    zan_atomic_layer_t *l = atomic_layer(hwnd, ww, wh, &fresh);
+    if (!l || !l->bits) {
+        if (made_layered) {
+            /* Back out: a layered window without ULW content shows nothing
+             * at all, and the caller is about to fall back to GDI uploads. */
+            SetWindowLongPtrW((HWND)hwnd, GWL_EXSTYLE, ex);
+        }
+        return 0;
+    }
     int w = s->width, h = s->height;
     int stride = s->stride;
     u32 *pix = s->pixels;
     int copyW = w < pw ? w : pw;
     int copyH = h < ph ? h : ph;
     u32 *dst = (u32 *)l->bits;
-    for (int y = 0; y < ph; y++) {
-        u32 *drow = dst + (size_t)y * (size_t)pw;
-        if (y < copyH) {
-            const u32 *srow = pix + (size_t)y * (size_t)stride;
-            for (int x = 0; x < copyW; x++) {
-                drow[x] = srow[x] | 0xFF000000u;
-            }
+    for (int y = 0; y < wh; y++) {
+        u32 *drow = dst + (size_t)y * (size_t)ww;
+        int sy = y - oy;
+        if (sy < 0 || sy >= copyH) {
+            /* Rows outside the surface (a resize frame where the surface
+             * lags) and the maximized frame ring go up transparent, exactly
+             * like the glass present. */
+            memset(drow, 0, (size_t)ww * 4);
+        } else if (!fresh && rows && !rows[sy]) {
+            continue;
         } else {
-            memset(drow, 0, (size_t)pw * 4);
+            const u32 *srow = pix + (size_t)sy * (size_t)stride;
+            int x = 0;
+            for (; x < ox; x++) { drow[x] = 0; }
+            for (; x < ox + copyW; x++) {
+                drow[x] = srow[x - ox] | 0xFF000000u;
+            }
+            for (; x < ww; x++) { drow[x] = 0; }
         }
     }
     POINT src = { 0, 0 };
-    SIZE size = { pw, ph };
+    SIZE size = { ww, wh };
     BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
     HDC sdc = GetDC(0);
     BOOL ok = UpdateLayeredWindow((HWND)hwnd, sdc, NULL, &size, l->dc, &src,
                                   0, &bf, 2);
     ReleaseDC(0, sdc);
+    if (!ok && made_layered) {
+        SetWindowLongPtrW((HWND)hwnd, GWL_EXSTYLE, ex);
+    }
     return ok ? 1 : 0;
 #else
-    (void)hwnd; (void)surface_id;
+    (void)hwnd; (void)surface_id; (void)rows;
     return 0;
 #endif
+}
+
+EXPORT i32 zan_gui_atomic_present(void *hwnd, i32 surface_id) {
+    return atomic_present_rows(hwnd, surface_id, NULL);
 }
 
 /* A window is gone: drop its presented-frame shadow so the allocation does not
@@ -2233,10 +2399,12 @@ EXPORT void zan_gui_gdi_present_drop(void *hwnd) {
             *p = dead->next;
             free(dead->pixels);
             free(dead);
-            return;
+            break;
         }
         p = &(*p)->next;
     }
+    /* The layered DIB must go either way: a window without a presented-frame
+     * shadow (glass path) can still have gone through an atomic present. */
     zan_atomic_layer_drop(hwnd);
 #else
     (void)hwnd;
