@@ -3,6 +3,10 @@ using Gui;
 
 namespace Gui.Widget;
 
+/// 为虚拟列表构建第 `index` 行的控件子树；数据由调用方的
+/// 闭包持有，行只在进入视口时才会被构建。
+delegate Control RowAt(int index);
+
 /// <summary>
 /// 高层级虚拟化列表。
 ///
@@ -19,6 +23,18 @@ namespace Gui.Widget;
 ///   int sel = list.Selected();                   // -1 表示无
 ///   int hit = list.TakeActivated();              // 本帧点击的行，-1
 ///
+/// 行也可以是自定义组件（模板模式，与 ListView 的行模板同构，
+/// 但只在行进入视口时才构建）：
+///
+///   list.SetRows(model.quotes.Count, i => QuoteRow(model.quotes[i]));
+///   ...                                         // 数据变更后
+///   list.Refresh();                             // 下一帧重建可见行
+///
+/// 行内子控件（按钮、开关）照常收自己的点击：每行按行号独占
+/// 一段 WidgetId，滚动或重建都不改号，上一帧登记的命中区因此
+/// 始终对得上。行等高（虚拟化的前提）；行内控件的易失状态
+/// （如开关的本地翻转）放在调用方的数据里，重建后由数据恢复。
+///
 /// 与 ListView（每行全高布局、无视口）不同，
 /// 本组件成本恒定且自行滚动。
 /// </summary>
@@ -28,6 +44,15 @@ class VirtualList : Control {
     int selected;
     int rowH;
     int activated;
+    /// 模板模式的行构建器；null = 字符串行模式。
+    RowAt rowAt;
+    int rowCount;
+    /// 模板行待重建标记；可见区间变化时也会重建。
+    bool rowsStale;
+    int builtFirst;
+    int builtLast;
+    /// 模板行独占的 WidgetId 段起点（-1 = 还没建过行）。
+    int rowSeqBase;
 
     VirtualList() {
         this.InitControl("virtualList", 5);
@@ -36,6 +61,12 @@ class VirtualList : Control {
         this.selected = 0 - 1;
         this.rowH = 0;
         this.activated = 0 - 1;
+        this.rowAt = null;
+        this.rowCount = 0;
+        this.rowsStale = true;
+        this.builtFirst = 0 - 1;
+        this.builtLast = 0 - 1;
+        this.rowSeqBase = 0 - 1;
     }
 
     override string Kind() { return "VirtualList"; }
@@ -59,8 +90,15 @@ class VirtualList : Control {
         this.Render(app, bx, by, bw, bh);
     }
 
+    /// 每行独占的 WidgetId 数：够放一行十来个控件还有余。
+    /// 超出会把段基后移、下一帧整体重建——宁可丢一次点击，
+    /// 也不能让两行共用同一段 id。
+    static int RowIdStride() { return 64; }
+
     void SetItems(List<string> rows) {
         items = rows;
+        rowAt = null;
+        rowCount = 0;
         if (selected >= rows.Count) { selected = rows.Count - 1; }
     }
 
@@ -68,11 +106,36 @@ class VirtualList : Control {
         items.Add(row);
     }
 
+    /// 模板模式：共 `count` 行，第 `i` 行由 `build(i)` 构建控件
+    /// 子树，数据由调用方闭包持有。构建器像 ListView 的行模板
+    /// 一样创建一次即可；行 id 只取决于行号，因此即使每帧传入
+    /// 新的 lambda（内容相同），行内控件也照常收得到点击。
+    /// 行数变化或内容变更（Refresh()）后，可见行在下一帧重建。
+    void SetRows(int count, RowAt build) {
+        if (build != rowAt) {
+            rowAt = build;
+            rowsStale = true;
+        }
+        if (count != rowCount) {
+            rowCount = count;
+            rowsStale = true;
+            // 段长随行数变化：已领出的段外 id 可能已归属别的控件，
+            // 换一段（行 id 移动一次，代价与 ListView 重建同量级）。
+            rowSeqBase = 0 - 1;
+            if (selected >= rowCount) { selected = rowCount - 1; }
+        }
+    }
+
+    /// 标记模板行数据已变更，可见行将在下一帧重建。
+    /// 任意线程调用都安全。
+    void Refresh() { rowsStale = true; }
+
     void SetRowHeight(int h) {
         rowH = h;
     }
 
     int Count() {
+        if (rowAt != null) { return rowCount; }
         return items.Count;
     }
 
@@ -81,6 +144,7 @@ class VirtualList : Control {
     }
 
     string SelectedText() {
+        if (rowAt != null) { return ""; }
         if (selected < 0 || selected >= items.Count) { return ""; }
         return items[selected];
     }
@@ -97,6 +161,44 @@ class VirtualList : Control {
         return app.theme.heightLarge;
     }
 
+    /// 为可见区间 [first, last) 重建模板行。行控件的 WidgetId
+    /// 按「段基 + 行号 × 步长」发号：滚动改变可见集时行内控件
+    /// 的 id 不变，上一帧登记的命中区依旧对得上号；区间与数据
+    /// 都没变时不动 children，行内控件跨帧保留。
+    void BuildVisible(App app, int first, int last) {
+        if (!rowsStale && first == builtFirst && last == builtLast) { return; }
+        int saved = WidgetId.SeqValue();
+        if (rowSeqBase < 0) { rowSeqBase = saved; }
+        // 全局发号器跳过整段行 id，后续控件不会和行内控件撞号。
+        int resume = rowSeqBase + this.Count() * VirtualList.RowIdStride();
+        children = new List<Control>();
+        int i = first;
+        while (i < last) {
+            WidgetId.SetSeq(rowSeqBase + i * VirtualList.RowIdStride());
+            Control row = rowAt(i);
+            if (row == null) { row = Panel.Root("vrow"); }
+            row.parent = this;
+            row.dock = 1;
+            children.Add(row);
+            int end = WidgetId.SeqValue();
+            if (end > rowSeqBase + (i + 1) * VirtualList.RowIdStride()) {
+                // 该行的控件数超出预留段：段基挪到已用之处，
+                // 下一帧整体重建（见 RowIdStride）。
+                rowSeqBase = end;
+                resume = end;
+            }
+            i = i + 1;
+        }
+        builtFirst = first;
+        builtLast = last;
+        rowsStale = false;
+        int used = WidgetId.SeqValue();
+        if (used < resume) { WidgetId.SetSeq(resume); }
+        for (int k = 0; k < children.Count; k = k + 1) {
+            children[k].MeasureTree(app);
+        }
+    }
+
     void Render(App app, int x, int y, int w, int h) {
         Canvas c = app.canvas;
         Theme t = app.theme;
@@ -109,18 +211,26 @@ class VirtualList : Control {
                            root.BgOr(0), root.BorderOr(0), root.BorderWOr(1));
 
         int rh = this.ResolveRowH(app);
-        int contentH = items.Count * rh;
+        int n = this.Count();
+        int contentH = n * rh;
 
         Rect area = new Rect(x + 1, y + 1, w - 2, h - 2);
         int dy = scroll.Begin(app, area, contentH);
         int accent = app.Scale(3);
+        bool templated = rowAt != null;
 
         // 只遍历与视口相交的行。
         int first = dy / rh;
         if (first < 0) { first = 0; }
         int visible = area.height / rh + 2;
         int last = first + visible;
-        if (last > items.Count) { last = items.Count; }
+        if (last > n) { last = n; }
+        if (templated) { this.BuildVisible(app, first, last); }
+
+        // 滚动条沟槽：模板行不排进去。
+        int rowW = area.width;
+        if (scroll.Overflowing()) { rowW = rowW - app.Scale(12); }
+        if (rowW < 0) { rowW = 0; }
 
         // 将行裁剪到视口，使边缘处多画/画一半的行
         // 不会渗出带边框的区域。
@@ -128,40 +238,63 @@ class VirtualList : Control {
         int i = first;
         while (i < last) {
             int ry = area.y + i * rh - dy;
-            bool over = app.mouseX >= area.x && app.mouseX < area.x + area.width
+            bool over = app.mouseX >= area.x && app.mouseX < area.x + rowW
                 && app.mouseY >= ry && app.mouseY < ry + rh
                 && app.mouseY >= area.y && app.mouseY < area.y + area.height;
             bool isSel = i == selected;
 
+            if (templated) {
+                Control row = children[i - first];
+                row.Arrange(area.x, ry, rowW, rh);
+                row.visible = true;
+                // 行矩形登记进命中区：行内子控件在本行之后才绘制、
+                // 矩形叠在其上，点击解析（按上一帧完整命中区）会把
+                // 子控件上的点击判给子控件，行只收到空白处的点击。
+                int rid = app.focus.AllocId();
+                app.hitTester.RegisterRect(rid, area.x, ry, rowW, rh, 0);
+                if (app.focus.IsHovered(rid)) { over = true; }
+                if (app.ClickTarget() == rid && app.ClickAvailable()) {
+                    selected = i;
+                    activated = i;
+                    app.NoteDamage(x, y, w, h);
+                    app.window.Wake();
+                }
+            }
+
             if (States.HasBg(over, false, isSel, false)) {
-                c.FillRect(area.x, ry, area.width, rh,
+                c.FillRect(area.x, ry, rowW, rh,
                     States.Bg(app, over, false, isSel, false));
             }
             if (isSel) { c.FillRect(area.x, ry, accent, rh, States.Accent(app)); }
-            if (i > 0) { c.FillRect(area.x, ry, area.width, 1, divider.BgOr(0)); }
+            if (i > 0) { c.FillRect(area.x, ry, rowW, 1, divider.BgOr(0)); }
 
-            int tc = States.Text(app, isSel, false);
-            int ty = Canvas.CenterTextY(ry, rh, rowFont);
-            c.DrawText(area.x + t.paddingLarge, ty,
-                Ellipsis.Fit(items[i], area.width - t.paddingLarge * 2, rowFont),
-                tc, rowFont);
+            if (!templated) {
+                int tc = States.Text(app, isSel, false);
+                int ty = Canvas.CenterTextY(ry, rh, rowFont);
+                c.DrawText(area.x + t.paddingLarge, ty,
+                    Ellipsis.Fit(items[i], rowW - t.paddingLarge * 2, rowFont),
+                    tc, rowFont);
+            }
             i = i + 1;
         }
         c.PopClip();
 
         scroll.End(app, area);
 
-        // 行选择（在视口内点击）。
+        // 行选择（在视口内点击）；模板行已在上面经命中区处理，
+        // 这里只剩字符串行的按坐标选择。
         bool leftUp = app.EventKind() == 3 && app.window.EventButton() == 0;
         bool inArea = app.mouseX >= area.x && app.mouseX < area.x + area.width
             && app.mouseY >= area.y && app.mouseY < area.y + area.height;
-        if (leftUp && inArea && !scroll.Overflowing()) {
-            this.HitSelect(app, area, rh, dy);
-        } else if (leftUp && inArea) {
-            // 忽略落在滚动条沟槽上的点击。
-            int gutter = area.x + area.width - app.Scale(12);
-            if (app.mouseX < gutter) {
+        if (leftUp && inArea && !templated) {
+            if (!scroll.Overflowing()) {
                 this.HitSelect(app, area, rh, dy);
+            } else {
+                // 忽略落在滚动条沟槽上的点击。
+                int gutter = area.x + area.width - app.Scale(12);
+                if (app.mouseX < gutter) {
+                    this.HitSelect(app, area, rh, dy);
+                }
             }
         }
     }

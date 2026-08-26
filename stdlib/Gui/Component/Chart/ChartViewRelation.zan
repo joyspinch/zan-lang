@@ -7,6 +7,37 @@ namespace Gui.Component.Chart;
 partial class ChartView {
     // ---- 弦图（ECharts type 'chord'；外环节点弧 + 连接 ribbon） ----
 
+    // 力导向布局的逐帧记忆化：布局是数据与几何的纯函数（局部
+    // 坐标，与卡片在屏幕上的位置无关），即时模式调用方每帧重建
+    // option，按内容指纹复用同一次弹簧模拟，滚动/悬停帧不再
+    // 重算 O(n²) 迭代。小容量即可——同屏一般只有一两个力导向图。
+    static List<ForceLayoutCache> forceCache;
+
+    static int ForceFingerprint(List<ChartLink> links, int r, int w, int h) {
+        int fp = (r * 17 + w * 19 + h * 23) % 2000000000;
+        for (int i = 0; i < links.Count; i = i + 1) {
+            ChartLink lk = links[i];
+            fp = ChartView.FoldStr(fp, lk.from, 21);
+            fp = ChartView.FoldStr(fp, lk.to, 22);
+            fp = (fp * 31 + lk.val) % 2000000000;
+        }
+        return fp;
+    }
+
+    static ForceLayout CachedForceLayout(List<ChartLink> links,
+                                         int r, int w, int h) {
+        if (links.Count < 1) { return ForceLayout.Of(links, r, w, h); }
+        int fp = ChartView.ForceFingerprint(links, r, w, h);
+        if (ChartView.forceCache == null) {
+            ChartView.forceCache = new List<ForceLayoutCache>();
+        }
+        ForceLayout hit = ForceLayoutCache.Lookup(ChartView.forceCache, fp);
+        if (hit != null) { return hit; }
+        ForceLayout layout = ForceLayout.Of(links, r, w, h);
+        ForceLayoutCache.Store(ChartView.forceCache, fp, layout, 4);
+        return layout;
+    }
+
     static void DrawChord(App app, int x, int y, int w, int h,
                           ChartOption o, int g) {
         Canvas c = app.canvas;
@@ -36,6 +67,8 @@ partial class ChartView {
         }
         int ribbonR = r * 88 / 100;
         // 先画 ribbon（弧会盖住其端部）：源/目标节点色的半透明带。
+        // 形状是 ECharts 式过圆心的二次贝塞尔曲线，按段折线近似
+        // （定点 t∈[0,100]，分母 10000 防溢出）。
         for (int i = 0; i < nr; i = i + 1) {
             ChordRibbon rb = layout.ribbons[i];
             int col = Chart.Palette(t, rb.from);
@@ -44,7 +77,18 @@ partial class ChartView {
             int x2 = cx + ChartView.CosDeg(rb.dstAngle) * ribbonR / 1000;
             int y2 = cy + ChartView.SinDeg(rb.dstAngle) * ribbonR / 1000;
             int th = app.Scale(2) + app.Scale(6) * rb.val / maxVal;
-            c.DrawLine(x1, y1, x2, y2, Chart.WithAlpha(col, 150), th);
+            int segs = 18;
+            int px = x1;
+            int py = y1;
+            for (int si = 1; si <= segs; si = si + 1) {
+                int tq = si * 100 / segs;
+                int it = 100 - tq;
+                int bx = (it * it * x1 + 2 * it * tq * cx + tq * tq * x2) / 10000;
+                int by = (it * it * y1 + 2 * it * tq * cy + tq * tq * y2) / 10000;
+                c.DrawLine(px, py, bx, by, Chart.WithAlpha(col, 150), th);
+                px = bx;
+                py = by;
+            }
         }
 
         // 节点弧：外环上按权重分的扇区，随 g 扫入。
@@ -101,7 +145,24 @@ partial class ChartView {
                 int y2 = cy + ChartView.SinDeg(rb.dstAngle) * ribbonR / 1000;
                 int th = app.Scale(2) + app.Scale(6) * rb.val / maxVal;
                 int hitR = app.Scale(4) + th / 2;
-                if (ChartView.DistToSeg(mx, my, x1, y1, x2, y2) <= hitR) {
+                // 命中沿同一条贝塞尔折线逐段测距。
+                int segs = 18;
+                int px = x1;
+                int py = y1;
+                bool hit = false;
+                for (int si = 1; si <= segs; si = si + 1) {
+                    int tq = si * 100 / segs;
+                    int it = 100 - tq;
+                    int bx = (it * it * x1 + 2 * it * tq * cx + tq * tq * x2) / 10000;
+                    int by = (it * it * y1 + 2 * it * tq * cy + tq * tq * y2) / 10000;
+                    if (ChartView.DistToSeg(mx, my, px, py, bx, by) <= hitR) {
+                        hit = true;
+                        break;
+                    }
+                    px = bx;
+                    py = by;
+                }
+                if (hit) {
                     string fn = layout.nodes[rb.from].name;
                     string tn = layout.nodes[rb.to].name;
                     List<TooltipRow> rows = new List<TooltipRow>{
@@ -137,10 +198,13 @@ partial class ChartView {
         int r = areaW * 2 / 5;
         if (areaH * 2 / 5 < r) { r = areaH * 2 / 5; }
         if (r < app.Scale(10)) { r = app.Scale(10); }
-        int cx = x + pad + areaW / 2;
-        int cy = top + areaH / 2;
+        // 布局在局部坐标里模拟（原点 = 绘图区左上角）；绘制与
+        // 命中时统一平移回屏幕，形状不随卡片滚动位置变化。
+        int ox = x + pad;
+        int oy = top;
 
-        ForceLayout layout = ForceLayout.Of(lead.links, cx, cy, r, areaW, areaH);
+        ForceLayout layout = ChartView.CachedForceLayout(lead.links,
+            r, areaW, areaH);
         int nn = layout.nodes.Count;
         if (nn < 1) { return; }
 
@@ -156,8 +220,8 @@ partial class ChartView {
             int best = 0 - 1;
             int bestD = 0;
             for (int i = 0; i < nn; i = i + 1) {
-                int ddx = mx - layout.nodes[i].x;
-                int ddy = my - layout.nodes[i].y;
+                int ddx = mx - (ox + layout.nodes[i].x);
+                int ddy = my - (oy + layout.nodes[i].y);
                 int d2 = ddx * ddx + ddy * ddy;
                 int rad = app.Scale(6);
                 if (d2 <= rad * rad) {
@@ -173,8 +237,8 @@ partial class ChartView {
             ForceEdge e = layout.edges[i];
             int col = Chart.Palette(t, e.a);
             int w2 = 1 + app.Scale(2) * e.val / maxVal;
-            c.DrawLine(layout.nodes[e.a].x, layout.nodes[e.a].y,
-                layout.nodes[e.b].x, layout.nodes[e.b].y,
+            c.DrawLine(ox + layout.nodes[e.a].x, oy + layout.nodes[e.a].y,
+                ox + layout.nodes[e.b].x, oy + layout.nodes[e.b].y,
                 Chart.WithAlpha(col, alpha), w2);
         }
         if (hoverNode >= 0) {
@@ -182,8 +246,8 @@ partial class ChartView {
                 ForceEdge e = layout.edges[i];
                 if (e.a != hoverNode && e.b != hoverNode) { continue; }
                 int col = Chart.Palette(t, e.a);
-                c.DrawLine(layout.nodes[e.a].x, layout.nodes[e.a].y,
-                    layout.nodes[e.b].x, layout.nodes[e.b].y,
+                c.DrawLine(ox + layout.nodes[e.a].x, oy + layout.nodes[e.a].y,
+                    ox + layout.nodes[e.b].x, oy + layout.nodes[e.b].y,
                     col, app.Scale(3));
             }
         }
@@ -193,11 +257,11 @@ partial class ChartView {
         for (int i = 0; i < nn; i = i + 1) {
             ForceNode nd = layout.nodes[i];
             int col = Chart.Palette(t, i);
-            c.FillCircle(nd.x, nd.y, nodeR, col);
-            ChartView.RingOutline(c, nd.x, nd.y, nodeR, 4294967295);
+            c.FillCircle(ox + nd.x, oy + nd.y, nodeR, col);
+            ChartView.RingOutline(c, ox + nd.x, oy + nd.y, nodeR, 4294967295);
             string nm = nd.name;
             int tw = Canvas.MeasureText(nm, Style.FontFallback(app, "small"));
-            c.DrawText(nd.x - tw / 2, nd.y + nodeR + app.Scale(3),
+            c.DrawText(ox + nd.x - tw / 2, oy + nd.y + nodeR + app.Scale(3),
                 nm,
                 Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0),
                 Style.FontFallback(app, "small"));

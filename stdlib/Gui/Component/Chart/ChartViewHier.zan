@@ -24,6 +24,32 @@ class WordCloudItem {
     }
 }
 
+/// 词云放置结果的逐帧记忆化条目：螺旋放置只依赖词条内容与
+/// 盒子几何，即时模式调用方每帧重建 option 对象，按内容指纹
+/// 复用同一次放置搜索（见 ChartView.DrawWordCloud）。
+class WordCloudCacheEntry {
+    int fp;
+    List<WordCloudItem> items;
+    static WordCloudCacheEntry Lookup(List<WordCloudCacheEntry> cache, int fp) {
+        for (int i = 0; i < cache.Count; i = i + 1) {
+            if (cache[i].fp == fp) { return cache[i]; }
+        }
+        return null;
+    }
+    /// 存入放置结果（同指纹去重；超出容量时挤掉最旧的一条）。
+    static void Store(List<WordCloudCacheEntry> cache, int fp,
+                      List<WordCloudItem> items, int capacity) {
+        for (int i = 0; i < cache.Count; i = i + 1) {
+            if (cache[i].fp == fp) { return; }
+        }
+        WordCloudCacheEntry e = new WordCloudCacheEntry();
+        e.fp = fp;
+        e.items = items;
+        if (cache.Count >= capacity) { cache.RemoveAt(0); }
+        cache.Add(e);
+    }
+}
+
 class TreeLayoutNode {
     ChartNode node;
     int depth;
@@ -563,16 +589,6 @@ partial class ChartView {
         return s;
     }
 
-    /// 节点下方最深路径的深度（边数）。
-    static int TreeDepth(ChartNode n) {
-        int md = 0;
-        for (int i = 0; i < n.children.Count; i = i + 1) {
-            int d = ChartView.TreeDepth(n.children[i]) + 1;
-            if (d > md) { md = d; }
-        }
-        return md;
-    }
-
     /// 为每个节点分配 span 坐标：节点跨越叶子 [lo, hi)，
     /// 其中心位于该叶子范围中点。span 在垂直树中
     /// 从左到右，在水平树中从上到下。
@@ -637,39 +653,80 @@ partial class ChartView {
             if (lead.data[i].val > maxV) { maxV = lead.data[i].val; }
         }
 
-        List<WordCloudItem> placed = new List<WordCloudItem>();
+        List<WordCloudItem> placed = null;
         int minFs = app.Scale(11);
         int maxFs = app.Scale(34);
+        // 静态帧（g=1000）走缓存：动画帧字号随 g 缩放，仍按
+        // 原路径逐帧重排，动画结束后的一帧把结果存入缓存。
+        bool cacheable = g >= 1000;
+        int wfp = 0;
+        if (cacheable) {
+            wfp = ChartView.WordCloudFingerprint(lead.data, aw, ah, minFs, maxFs);
+            if (ChartView.wcCache == null) {
+                ChartView.wcCache = new List<WordCloudCacheEntry>();
+            }
+            WordCloudCacheEntry hit = WordCloudCacheEntry.Lookup(
+                ChartView.wcCache, wfp);
+            if (hit != null) { placed = hit.items; }
+        }
         c.PushClip(ax, ay, aw, ah);
-        for (int wi = 0; wi < lead.data.Count; wi = wi + 1) {
-            ChartData word = lead.data[wi];
-            int fs = minFs + (maxFs - minFs) * word.val / maxV;
-            fs = minFs + (fs - minFs) * g / 1000;
-            string text = word.name;
-            int tw = Canvas.MeasureText(text, fs) + app.Scale(4);
-            int th = Canvas.FontHeight(fs) + app.Scale(2);
-            int attempt = 0;
-            while (attempt < 180) {
-                int angle = (attempt * 137 + wi * 47) % 360;
-                int radius = app.Scale(2 + attempt * 2);
-                int cx = ax + aw / 2 + ChartView.CosDeg(angle) * radius / 1000;
-                int cy = ay + ah / 2 + ChartView.SinDeg(angle) * radius / 1000;
-                int tx = cx - tw / 2;
-                int ty = cy - th / 2;
-                if (tx >= ax && ty >= ay && tx + tw <= ax + aw && ty + th <= ay + ah
-                    && ChartView.WordCloudFits(placed, tx, ty, tw, th)) {
-                    int color = word.color;
-                    if (color == 0) { color = Chart.Palette(t, wi); }
-                    c.DrawText(tx + app.Scale(2), ty, text, color, fs);
-                    placed.Add(WordCloudItem.Of(word, tx, ty, tw, th, fs));
-                    attempt = 180;
-                } else {
-                    attempt = attempt + 1;
+        if (placed == null) {
+            placed = new List<WordCloudItem>();
+            for (int wi = 0; wi < lead.data.Count; wi = wi + 1) {
+                ChartData word = lead.data[wi];
+                int fs = minFs + (maxFs - minFs) * word.val / maxV;
+                fs = minFs + (fs - minFs) * g / 1000;
+                string text = word.name;
+                int tw = Canvas.MeasureText(text, fs) + app.Scale(4);
+                int th = Canvas.FontHeight(fs) + app.Scale(2);
+                int attempt = 0;
+                while (attempt < 180) {
+                    int angle = (attempt * 137 + wi * 47) % 360;
+                    int radius = app.Scale(2 + attempt * 2);
+                    int cx = ax + aw / 2 + ChartView.CosDeg(angle) * radius / 1000;
+                    int cy = ay + ah / 2 + ChartView.SinDeg(angle) * radius / 1000;
+                    int tx = cx - tw / 2;
+                    int ty = cy - th / 2;
+                    if (tx >= ax && ty >= ay && tx + tw <= ax + aw && ty + th <= ay + ah
+                        && ChartView.WordCloudFits(placed, tx, ty, tw, th)) {
+                        int color = word.color;
+                        if (color == 0) { color = Chart.Palette(t, wi); }
+                        c.DrawText(tx + app.Scale(2), ty, text, color, fs);
+                        placed.Add(WordCloudItem.Of(word, tx, ty, tw, th, fs));
+                        attempt = 180;
+                    } else {
+                        attempt = attempt + 1;
+                    }
                 }
+            }
+            if (cacheable) {
+                WordCloudCacheEntry.Store(ChartView.wcCache, wfp, placed, 4);
+            }
+        } else {
+            // 缓存命中：条目里已带放置矩形与字号，直接重绘文本。
+            for (int wi = 0; wi < placed.Count; wi = wi + 1) {
+                WordCloudItem it = placed[wi];
+                int color = it.data.color;
+                if (color == 0) { color = Chart.Palette(t, wi); }
+                c.DrawText(it.x + app.Scale(2), it.y, it.data.name,
+                    color, it.fontSize);
             }
         }
         c.PopClip();
     }
+
+    static int WordCloudFingerprint(List<ChartData> data, int aw, int ah,
+                                    int minFs, int maxFs) {
+        int fp = (aw * 7 + ah * 13 + minFs * 17 + maxFs * 19) % 2000000000;
+        for (int i = 0; i < data.Count; i = i + 1) {
+            fp = ChartView.FoldStr(fp, data[i].name, 23);
+            fp = (fp * 31 + data[i].val) % 2000000000;
+        }
+        return fp;
+    }
+
+    // 词云布局缓存：指纹 → 放置结果（小容量，见 WordCloudCacheEntry）。
+    static List<WordCloudCacheEntry> wcCache;
 
     static void DrawTree(App app, int x, int y, int w, int h,
                          ChartOption o, int g) {

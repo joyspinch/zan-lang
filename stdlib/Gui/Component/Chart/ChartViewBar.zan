@@ -15,14 +15,16 @@ partial class ChartView {
         List<string> labels = o.XCategories();
 
         if (horizontal) {
-            // 水平布局委托给 HBar 渲染器，
-            // 增长因子通过预缩放临时序列集施加。任何
-            // 带 stackName 的序列都会使布局成为水平堆叠组。
+            // 水平布局委托给 HBar 渲染器。轴范围按*未缩放*的最终值
+            // 定标（full），动画缩放只作用于柱长——否则入场动画期间
+            // 轴刻度会从 0..5 逐帧跳到真实范围（首帧闪跳）。
+            // 传 o.iwid 使图例色块可点击切换系列显隐。
             bool hstack = false;
             for (int hsi = 0; hsi < series.Count; hsi = hsi + 1) {
                 if (series[hsi].stackName.Length > 0) { hstack = true; }
             }
-            ChartView.HBarCore(app, x, y, w, h, o.title, labels, ChartView.Scaled(series, g), hstack, o.showLegend);
+            ChartView.HBarCore(app, x, y, w, h, o.title, labels,
+                ChartView.Scaled(series, g), hstack, o.showLegend, series, o.iwid);
             return;
         }
 
@@ -399,9 +401,11 @@ partial class ChartView {
     /// 水平柱状图：类别在左纵排，数值横伸。stacked 为 true 时，
     /// 共享 stackName 的序列每组堆成一条水平色带，
     /// （对应 ECharts stacked bar4），各行上下排列各组。
+    /// `full` 是未缩放的原系列（轴范围按最终值定标）；
+    /// `wid` 非零时图例可点击切换系列显隐。
     static void HBarCore(App app, int x, int y, int w, int h, string title,
                          List<string> labels, List<ChartSeries> series, bool stacked,
-                         bool showLegend) {
+                         bool showLegend, List<ChartSeries> full, int wid) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         c.PushClip(x, y, w, h);
@@ -409,9 +413,24 @@ partial class ChartView {
         int axisFs = Style.FontFallback(app, "small");
         int n = labels.Count;
         int ns = series.Count;
-        int maxV = Chart.NiceMax(Chart.MaxOf(series));
-        if (stacked) { maxV = Chart.NiceMax(Chart.MaxStackAll(series, n)); }
-        int plotTop = Chart.DrawPanel(app, x, y, w, h, title, series, showLegend);
+        int maxV = Chart.NiceMax(Chart.MaxOf(full));
+        if (stacked) { maxV = Chart.NiceMax(Chart.MaxStackAll(full, n)); }
+        List<ChartSeries> legendSrc = full;
+        int plotTop = Chart.DrawPanelI(app, x, y, w, h, title, legendSrc, wid, showLegend);
+        // 图例切换写回 full 的 hidden 标志；绘制列表继承同一状态
+        // （Scaled 复制了 hidden，但图例解析发生在本帧绘制之前，
+        // 因此把解析结果同步到绘制列表），再剔除隐藏序列，
+        // 使槽位布局只按可见序列分配。
+        for (int hi = 0; hi < series.Count && hi < full.Count; hi = hi + 1) {
+            series[hi].hidden = full[hi].hidden;
+        }
+        List<ChartSeries> visSeries = new List<ChartSeries>();
+        for (int hi2 = 0; hi2 < series.Count; hi2 = hi2 + 1) {
+            if (!series[hi2].hidden) { visSeries.Add(series[hi2]); }
+        }
+        if (visSeries.Count > 0) { series = visSeries; }
+        ns = series.Count;
+        if (ns < 1) { ns = 1; }
 
         if (n < 1 || ns < 1) { c.PopClip(); return; }
 

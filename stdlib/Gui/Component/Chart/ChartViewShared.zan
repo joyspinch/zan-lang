@@ -98,33 +98,60 @@ partial class ChartView {
         c.FillRect(x + w - t2, y, t2, h, color);
     }
 
-    // 带彩色色块行的悬停提示卡片。px/py 是锚点（
+    // ---- 延迟工具提示 ----
+    // 提示卡片必须绘制在一切之上，但图表在帧内绘制较早：同页
+    // 之后渲染的控件会盖住它，图表自身的 PushClip 也会把越出
+    // 图表矩形的卡片裁掉。因此悬停时只*记录*请求（与 Widget.Tooltip
+    // 的 Request/Flush 契约一致；本帧最后一次请求胜出——指针只在
+    // 一个图表上），由 App.PresentFrame 在所有内容与弹层之后调用
+    // FlushTooltips 统一绘制。
+    static List<TooltipRow> tipRows;
+    static int tipPx;
+    static int tipPy;
+    static int tipRight;
+
+    // 带彩色色块行的悬停提示卡片请求。px/py 是锚点（
     // 十字准线 / 指针）；当卡片会越过图表右缘（maxRight）时
     // 翻转到左侧。
     static void TooltipCard(App app, int px, int py, int maxRight,
                             List<TooltipRow> rows) {
+        if (rows.Count < 1) { return; }
+        // 调用方的列表可能是跨帧复用的缓冲，拷贝一份快照
+        // （new List<T>(src) 拷贝构造，元素随 src 保留）。
+        ChartView.tipRows = new List<TooltipRow>(rows);
+        ChartView.tipPx = px;
+        ChartView.tipPy = py;
+        ChartView.tipRight = maxRight;
+        app.RequestRedraw();
+    }
+
+    /// 绘制本帧请求的图表提示卡片（若有）并清空队列。
+    /// 由 App.PresentFrame 在所有内容与弹层之后调用。
+    static void FlushTooltips(App app) {
+        if (ChartView.tipRows == null || ChartView.tipRows.Count < 1) { return; }
+        List<TooltipRow> rows = ChartView.tipRows;
+        ChartView.tipRows = null;
         Canvas c = app.canvas;
         Theme t = app.theme;
         int fs = Style.FontFallback(app, "small");
         int lh = Canvas.FontHeight(fs) + app.Scale(4);
         int rowCount = rows.Count;
-        if (rowCount < 1) { return; }
         int boxW = app.Scale(28);
         for (int i = 0; i < rowCount; i = i + 1) {
             int w2 = Canvas.MeasureText(rows[i].text, fs);
             if (w2 + app.Scale(30) > boxW) { boxW = w2 + app.Scale(30); }
         }
         int boxH = rowCount * lh + app.Scale(10);
-        int bx = px + app.Scale(10);
-        if (bx + boxW > maxRight) { bx = px - app.Scale(10) - boxW; }
+        int bx = ChartView.tipPx + app.Scale(10);
+        if (bx + boxW > ChartView.tipRight) { bx = ChartView.tipPx - app.Scale(10) - boxW; }
         if (bx < app.Scale(2)) { bx = app.Scale(2); }
         // 默认在指针下方；会超出画布底部时翻转到上方，
-        // 确保卡片永不被图表边缘裁剪。
-        int by = py + app.Scale(8);
+        // 确保卡片永不被窗口边缘裁剪。
+        int by = ChartView.tipPy + app.Scale(8);
         int margin = app.Scale(4);
         int cH = c.Height();
         if (by + boxH > cH - margin) {
-            by = py - app.Scale(8) - boxH;
+            by = ChartView.tipPy - app.Scale(8) - boxH;
         }
         if (by < margin) { by = margin; }
 
@@ -143,7 +170,6 @@ partial class ChartView {
                 sTip.FgOr(0), fs);
             ty = ty + lh;
         }
-        app.RequestRedraw();
     }
 
     // 系列在窗口 [i0,i1]（含端点）内最大/最小值的下标；
@@ -290,6 +316,46 @@ partial class ChartView {
                     if (rem < take) { take = rem; }
                 }
                 traveled = traveled + take;
+            }
+        }
+    }
+
+    // 多边形扫描线填充（半透明，用于雷达 areaStyle）。逐行求
+    // 边交点、排序后成对填段；顶点数少（雷达 ≤ 十几轴），
+    // O(高×边) 足够。
+    static void FillPolyAlpha(Canvas c, List<int> px, List<int> py,
+                              int color, int alpha) {
+        int n = px.Count;
+        if (n < 3 || py.Count < n) { return; }
+        int y0 = py[0];
+        int y1 = py[0];
+        for (int i = 1; i < n; i = i + 1) {
+            if (py[i] < y0) { y0 = py[i]; }
+            if (py[i] > y1) { y1 = py[i]; }
+        }
+        List<int> xs = new List<int>();
+        for (int y = y0; y <= y1; y = y + 1) {
+            xs.Clear();
+            for (int i2 = 0; i2 < n; i2 = i2 + 1) {
+                int j = i2 + 1;
+                if (j == n) { j = 0; }
+                int ya = py[i2];
+                int yb = py[j];
+                if (ya == yb) { continue; }
+                if ((y >= ya && y < yb) || (y >= yb && y < ya)) {
+                    xs.Add(px[i2] + (y - ya) * (px[j] - px[i2]) / (yb - ya));
+                }
+            }
+            // 插入排序（xs 通常 2~4 个元素）。
+            for (int a = 1; a < xs.Count; a = a + 1) {
+                int v = xs[a];
+                int b = a - 1;
+                while (b >= 0 && xs[b] > v) { xs[b + 1] = xs[b]; b = b - 1; }
+                xs[b + 1] = v;
+            }
+            for (int k = 0; k + 1 < xs.Count; k = k + 2) {
+                int w = xs[k + 1] - xs[k];
+                if (w > 0) { c.FillRect(xs[k], y, w, 1, Chart.WithAlpha(color, alpha)); }
             }
         }
     }
