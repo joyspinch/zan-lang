@@ -170,11 +170,13 @@ static void zq_push(int kind, int x, int y, int button, int code, int mods,
 }
 
 /* Pop the front zan event into the reported slots. Caller checks !zq_empty. */
+static long long g_ev_seq_sdl = 0;
 static void zq_pop(void) {
     zan_zev_t *z = &g_zq[g_zq_head];
     for (int i = 0; i < 8; i++) g_pending_event[i] = z->e[i];
     g_event_win = z->win;
     g_zq_head = (g_zq_head + 1) % ZAN_ZQ_CAP;
+    g_ev_seq_sdl++;
 }
 
 /* Map an SDL keycode to the Win32 virtual-key code Gui/Keys expects. Letters
@@ -878,6 +880,7 @@ EXPORT i32 zan_gui_inject_pending(void) {
 }
 
 EXPORT i32 zan_gui_event_kind(void)    { return g_pending_event[0]; }
+EXPORT i64 zan_gui_event_seq(void)     { return g_ev_seq_sdl; }
 EXPORT i32 zan_gui_event_x(void)       { return g_pending_event[1]; }
 EXPORT i32 zan_gui_event_y(void)       { return g_pending_event[2]; }
 EXPORT i32 zan_gui_event_button(void)  { return g_pending_event[3]; }

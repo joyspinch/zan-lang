@@ -1617,6 +1617,587 @@ EXPORT i32 zan_gui_restore_sub_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, 
                                          (int)slot, 1);
 }
 
+/* Debug helper: writes the surface's pixels as a 24bpp bottom-up BMP so a
+ * headless agent can compare the canvas contents against what the window
+ * actually shows. Returns 1 on success. */
+EXPORT i32 zan_gui_surface_dump(i32 surface_id, const char *path) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return 0;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s || !s->pixels || !path) return 0;
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    int w = s->width, h = s->height;
+    int stride_out = (w * 3 + 3) & ~3;
+    u32 data_size = (u32)stride_out * (u32)h;
+    u32 file_size = 54 + data_size;
+    unsigned char hdr[54];
+    memset(hdr, 0, sizeof(hdr));
+    hdr[0] = 'B'; hdr[1] = 'M';
+    memcpy(hdr + 2, &file_size, 4);
+    u32 off = 54; memcpy(hdr + 10, &off, 4);
+    u32 ihs = 40; memcpy(hdr + 14, &ihs, 4);
+    memcpy(hdr + 18, &w, 4);
+    memcpy(hdr + 22, &h, 4);
+    unsigned short planes = 1; memcpy(hdr + 26, &planes, 2);
+    unsigned short bpp = 24; memcpy(hdr + 28, &bpp, 2);
+    memcpy(hdr + 34, &data_size, 4);
+    fwrite(hdr, 1, 54, f);
+    unsigned char *row = (unsigned char *)malloc((size_t)stride_out);
+    if (!row) { fclose(f); return 0; }
+    memset(row, 0, (size_t)stride_out);
+    for (int j = h - 1; j >= 0; j--) {
+        u32 *src = s->pixels + (size_t)j * (size_t)s->stride;
+        for (int i = 0; i < w; i++) {
+            u32 p = src[i];
+            row[i * 3 + 0] = (unsigned char)((p >> 16) & 0xFF);
+            row[i * 3 + 1] = (unsigned char)((p >> 8) & 0xFF);
+            row[i * 3 + 2] = (unsigned char)(p & 0xFF);
+        }
+        fwrite(row, 1, (size_t)stride_out, f);
+    }
+    free(row);
+    fclose(f);
+    return 1;
+}
+
+/* ========================================================================
+ * Incremental GDI present (tear-free full-frame blits)
+ * ======================================================================== */
+/* SetDIBitsToDevice streams rows into the window's redirection surface, so a
+ * full-window upload leaves the screen mid-tear for milliseconds -- visible as
+ * doubled/ghosted text while a list scrolls (the frame is correct on the
+ * canvas; the *screen* shows two frames blended at the tear line). Uploading
+ * only the tiles that actually changed shrinks that window to near zero for
+ * partial updates, and -- unlike damage-rect reporting -- the diff against the
+ * previously presented bits is ground truth: a missed damage declaration can
+ * never ghost the screen, it only costs one extra uploaded tile. */
+#ifdef _WIN32
+
+typedef struct zan_present_shadow_s {
+    void *hwnd;
+    int w;
+    int h;
+    u32 *pixels;
+    struct zan_present_shadow_s *next;
+} zan_present_shadow_t;
+
+static zan_present_shadow_t *g_present_shadows = NULL;
+
+#define ZAN_DIFF_TILE 64
+
+/* Shadow for this window at this size, or NULL. `alloc` creates/resizes it
+ * (zeroed: a fresh shadow diffs as fully changed, so the first present is a
+ * correct full upload). The list is capped; the oldest entry is evicted. */
+static zan_present_shadow_t *present_shadow(void *hwnd, int w, int h, int alloc) {
+    zan_present_shadow_t *prev = NULL;
+    zan_present_shadow_t *it = g_present_shadows;
+    int n = 0;
+    while (it) {
+        if (it->hwnd == hwnd) {
+            if (it->w != w || it->h != h) {
+                if (!alloc) return NULL;
+                u32 *np = (u32 *)realloc(it->pixels,
+                                         (size_t)w * (size_t)h * 4);
+                if (!np) return NULL;
+                memset(np, 0, (size_t)w * (size_t)h * 4);
+                it->pixels = np;
+                it->w = w;
+                it->h = h;
+            }
+            if (prev) {  /* move to front (LRU) */
+                prev->next = it->next;
+                it->next = g_present_shadows;
+                g_present_shadows = it;
+            }
+            return it;
+        }
+        prev = it;
+        it = it->next;
+        n++;
+    }
+    if (!alloc) return NULL;
+    zan_present_shadow_t *ns = (zan_present_shadow_t *)calloc(1, sizeof(*ns));
+    if (!ns) return NULL;
+    ns->pixels = (u32 *)calloc((size_t)w * (size_t)h, 4);
+    if (!ns->pixels) { free(ns); return NULL; }
+    ns->hwnd = hwnd;
+    ns->w = w;
+    ns->h = h;
+    ns->next = g_present_shadows;
+    g_present_shadows = ns;
+    if (n >= 8) {  /* drop the now-tail entry */
+        zan_present_shadow_t *tail = g_present_shadows;
+        while (tail->next && tail->next->next) tail = tail->next;
+        free(tail->next->pixels);
+        free(tail->next);
+        tail->next = NULL;
+    }
+    return ns;
+}
+
+static void present_shadow_fill_rect(zan_present_shadow_t *sh, const u32 *pix,
+                                     int stride, int rx, int ry, int rw, int rh) {
+    for (int j = 0; j < rh; j++) {
+        memcpy(sh->pixels + (size_t)(ry + j) * (size_t)sh->w + rx,
+               pix + (size_t)(ry + j) * (size_t)stride + rx,
+               (size_t)rw * 4);
+    }
+}
+
+/* One SetDIBitsToDevice streams its rows into the window's redirection
+ * surface without any atomic-swap guarantee: DWM can composite mid-stream and
+ * put a torn frame on screen (the classic 花屏). Splitting every upload into
+ * short horizontal chunks bounds each exposure window to a sub-millisecond
+ * and any visible tear to one chunk height; between chunks the surface is in
+ * a consistent old/new mix, which for animation reads as motion, not garbage.
+ * Returns the number of calls made. */
+#define ZAN_CHUNK_H 128
+
+static int gdi_upload_chunks(HDC dc, int h, u32 *pix, BITMAPINFO *bmi,
+                             int rx, int ry, int rw, int rh) {
+    int calls = 0;
+    int y = ry;
+    int end = ry + rh;
+    while (y < end) {
+        int ch = end - y;
+        if (ch > ZAN_CHUNK_H) ch = ZAN_CHUNK_H;
+        SetDIBitsToDevice(dc, rx, y, rw, ch, rx, y, 0, h, pix, bmi,
+                          DIB_RGB_COLORS);
+        calls++;
+        y += ch;
+    }
+    return calls;
+}
+
+#endif /* _WIN32 */
+
+/* GDI blit with a per-window shadow of the last presented frame.
+ * rect_count > 0: upload exactly those [x,y,w,h] rects (declared damage).
+ * rect_count < 0: forced full upload (WM_PAINT: the OS invalidated the
+ *   redirection surface, the shadow can no longer be trusted).
+ * rect_count == 0: diff against the shadow and upload only changed tiles.
+ * Every upload -- diffed, declared or forced -- is split into horizontal
+ * chunks at most ZAN_CHUNK_H tall so no single call streams a whole window
+ * past DWM. Presents whose changed area exceeds ZAN_ATOMIC_AT percent of the
+ * window go out through zan_gui_atomic_present instead: streaming that much
+ * would put mixed old/new frames on screen for most of a frame period.
+ * Returns the number of SetDIBitsToDevice calls made, or -1 on failure (the
+ * caller falls back to its own full blit). Non-Windows builds return -1 and
+ * the shells keep their own present path. */
+EXPORT i32 zan_gui_atomic_present(void *hwnd, i32 surface_id);
+
+/* Changed area above this fraction of the window swaps atomically instead of
+ * streaming: the copy cost is the same order as the upload, and the screen
+ * never shows a mixed frame. */
+#define ZAN_ATOMIC_AT 35
+/* Return value of zan_gui_gdi_present when the frame went out through the
+ * atomic swap instead of rect uploads; the shell only tests ret > 0, so any
+ * distinctive positive works -- the value just makes present logs decodable. */
+#define ZAN_ATOMIC_RET 1000000
+EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
+                               i32 rect_count) {
+#ifdef _WIN32
+    if (!hwnd || surface_id < 0 || surface_id >= g_surface_count) return -1;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s || !s->pixels) return -1;
+    if (s->be) {
+        if (s->be->flush) s->be->flush(s);
+        if (s->be->read_pixels) s->be->read_pixels(s);
+    }
+    int w = s->width, h = s->height;
+    u32 *pix = s->pixels;
+    int stride = s->stride;
+
+    BITMAPINFO bmi;
+    memset(&bmi, 0, sizeof(bmi));
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;  /* top-down: rows share the surface origin */
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    HDC dc = GetDC((HWND)hwnd);
+    if (!dc) return -1;
+    int calls = 0;
+
+    zan_present_shadow_t *sh = present_shadow(hwnd, w, h, 1);
+    int force_full = (rect_count < 0) || !sh;
+
+    if (!force_full && rect_count == 0) {
+        /* Tile diff against the last presented frame. */
+        int tw = (w + ZAN_DIFF_TILE - 1) / ZAN_DIFF_TILE;
+        int th = (h + ZAN_DIFF_TILE - 1) / ZAN_DIFF_TILE;
+        unsigned char *changed = (unsigned char *)calloc((size_t)tw * th, 1);
+        unsigned char *rowany = (unsigned char *)calloc((size_t)th, 1);
+        int *out = (int *)malloc(sizeof(int) * 4 * (size_t)(tw * th + th));
+        if (!changed || !out || !rowany) {
+            free(changed);
+            free(out);
+            free(rowany);
+            ReleaseDC((HWND)hwnd, dc);
+            return -1;
+        }
+        int changed_tiles = 0;
+        for (int ty = 0; ty < th; ty++) {
+            int y0 = ty * ZAN_DIFF_TILE;
+            int rows = (y0 + ZAN_DIFF_TILE <= h) ? ZAN_DIFF_TILE : (h - y0);
+            for (int tx = 0; tx < tw; tx++) {
+                int x0 = tx * ZAN_DIFF_TILE;
+                int cols = (x0 + ZAN_DIFF_TILE <= w) ? ZAN_DIFF_TILE : (w - x0);
+                int dirty = 0;
+                for (int j = 0; j < rows && !dirty; j++) {
+                    u32 *a = pix + (size_t)(y0 + j) * (size_t)stride + x0;
+                    u32 *b = sh->pixels + (size_t)(y0 + j) * (size_t)w + x0;
+                    if (memcmp(a, b, (size_t)cols * 4) != 0) dirty = 1;
+                }
+                if (dirty) {
+                    changed[(size_t)ty * tw + tx] = 1;
+                    changed_tiles++;
+                }
+            }
+        }
+        if (changed_tiles > 0) {
+            /* A page switch, a scroll past the diff's sweet spot: streaming
+             * this much would keep the surface in a mixed state for most of
+             * the frame period, so swap atomically instead. */
+            long long area = (long long)changed_tiles * ZAN_DIFF_TILE
+                             * ZAN_DIFF_TILE;
+            if (area * 100 > (long long)w * h * ZAN_ATOMIC_AT
+                    && zan_gui_atomic_present(hwnd, surface_id)) {
+                memcpy(sh->pixels, pix, (size_t)w * (size_t)h * 4);
+                free(changed);
+                free(out);
+                free(rowany);
+                ReleaseDC((HWND)hwnd, dc);
+                return ZAN_ATOMIC_RET;
+            }
+            for (int ty = 0; ty < th; ty++) {
+                for (int tx = 0; tx < tw; tx++) {
+                    if (changed[(size_t)ty * tw + tx]) { rowany[ty] = 1; break; }
+                }
+            }
+            /* Merge changed tiles into maximal rects: horizontal runs, then
+             * extend each run downward while the same span stays changed. A
+             * scroll touches one contiguous block, which collapses to a rect
+             * or two -- the screen then updates as a single sweep of just the
+             * changed area. Scattered small changes (particles, carets) stay
+             * as small rects. */
+            int n = 0;
+            for (int ty = 0; ty < th; ty++) {
+                int tx = 0;
+                while (tx < tw) {
+                    if (!changed[(size_t)ty * tw + tx]) { tx++; continue; }
+                    int tx0 = tx;
+                    while (tx < tw && changed[(size_t)ty * tw + tx]) tx++;
+                    int ty1 = ty + 1;
+                    while (ty1 < th) {
+                        int ok = 1;
+                        for (int k = tx0; k < tx; k++) {
+                            if (!changed[(size_t)ty1 * tw + k]) { ok = 0; break; }
+                        }
+                        if (!ok) break;
+                        ty1++;
+                    }
+                    out[n * 4 + 0] = tx0 * ZAN_DIFF_TILE;
+                    out[n * 4 + 1] = ty * ZAN_DIFF_TILE;
+                    out[n * 4 + 2] = (tx - tx0) * ZAN_DIFF_TILE;
+                    out[n * 4 + 3] = (ty1 - ty) * ZAN_DIFF_TILE;
+                    n++;
+                    for (int yy = ty; yy < ty1; yy++) {
+                        for (int k = tx0; k < tx; k++) {
+                            changed[(size_t)yy * tw + k] = 0;
+                        }
+                    }
+                }
+            }
+            /* Heavily fragmented frame (particles, noise): dozens of disjoint
+             * rects cost more fixed GDI overhead than a few full-width bands,
+             * so re-merge into one band per run of changed tile-rows and let
+             * the chunk splitter below keep each call short. rowany was
+             * snapshotted before collection cleared `changed`. */
+            if (n > 48) {
+                int ty = 0;
+                n = 0;
+                while (ty < th) {
+                    if (!rowany[ty]) { ty++; continue; }
+                    int ty0 = ty;
+                    while (ty < th && rowany[ty]) ty++;
+                    out[n * 4 + 0] = 0;
+                    out[n * 4 + 1] = ty0 * ZAN_DIFF_TILE;
+                    out[n * 4 + 2] = w;
+                    int bh = (ty - ty0) * ZAN_DIFF_TILE;
+                    if (out[n * 4 + 1] + bh > h) bh = h - out[n * 4 + 1];
+                    out[n * 4 + 3] = bh;
+                    n++;
+                }
+            }
+            for (int i = 0; i < n; i++) {
+                int rx = out[i * 4 + 0];
+                int ry = out[i * 4 + 1];
+                int rw = out[i * 4 + 2];
+                int rh = out[i * 4 + 3];
+                if (rx < 0) { rw += rx; rx = 0; }
+                if (ry < 0) { rh += ry; ry = 0; }
+                if (rx + rw > w) rw = w - rx;
+                if (ry + rh > h) rh = h - ry;
+                if (rw <= 0 || rh <= 0) continue;
+                calls += gdi_upload_chunks(dc, h, pix, &bmi, rx, ry, rw, rh);
+                present_shadow_fill_rect(sh, pix, stride, rx, ry, rw, rh);
+            }
+        }
+        free(changed);
+        free(out);
+        free(rowany);
+    } else if (force_full) {
+        /* WM_PAINT / fresh shadow: the OS invalidated the redirection
+         * surface, so everything changes -- swap atomically when the window
+         * allows it, chunks only as fallback. */
+        if (zan_gui_atomic_present(hwnd, surface_id)) {
+            memcpy(sh->pixels, pix, (size_t)w * (size_t)h * 4);
+            ReleaseDC((HWND)hwnd, dc);
+            return ZAN_ATOMIC_RET;
+        }
+        calls = gdi_upload_chunks(dc, h, pix, &bmi, 0, 0, w, h);
+        memcpy(sh->pixels, pix, (size_t)w * (size_t)h * 4);
+    } else if (rect_count > 0) {
+        long long area = 0;
+        for (int i = 0; i < rect_count; i++) {
+            int rx = rects[i * 4 + 0];
+            int ry = rects[i * 4 + 1];
+            int rw = rects[i * 4 + 2];
+            int rh = rects[i * 4 + 3];
+            if (rx < 0) { rw += rx; rx = 0; }
+            if (ry < 0) { rh += ry; ry = 0; }
+            if (rx + rw > w) rw = w - rx;
+            if (ry + rh > h) rh = h - ry;
+            if (rw <= 0 || rh <= 0) continue;
+            area += (long long)rw * rh;
+        }
+        if (area * 100 > (long long)w * h * ZAN_ATOMIC_AT
+                && zan_gui_atomic_present(hwnd, surface_id)) {
+            memcpy(sh->pixels, pix, (size_t)w * (size_t)h * 4);
+            ReleaseDC((HWND)hwnd, dc);
+            return ZAN_ATOMIC_RET;
+        }
+        for (int i = 0; i < rect_count; i++) {
+            int rx = rects[i * 4 + 0];
+            int ry = rects[i * 4 + 1];
+            int rw = rects[i * 4 + 2];
+            int rh = rects[i * 4 + 3];
+            if (rx < 0) { rw += rx; rx = 0; }
+            if (ry < 0) { rh += ry; ry = 0; }
+            if (rx + rw > w) rw = w - rx;
+            if (ry + rh > h) rh = h - ry;
+            if (rw <= 0 || rh <= 0) continue;
+            calls += gdi_upload_chunks(dc, h, pix, &bmi, rx, ry, rw, rh);
+            present_shadow_fill_rect(sh, pix, stride, rx, ry, rw, rh);
+        }
+    }
+    ReleaseDC((HWND)hwnd, dc);
+    return calls;
+#else
+    (void)hwnd; (void)surface_id; (void)rects; (void)rect_count;
+    return -1;
+#endif
+}
+
+/* ========================================================================
+ * Atomic full-frame present (UpdateLayeredWindow)
+ * ======================================================================== */
+/* GDI SetDIBitsToDevice streams rows into the window's redirection surface:
+ * however the upload is split, DWM can composite a half-updated frame and the
+ * user sees bands of old and new content (花屏). The other backends never have
+ * this problem because their present is an atomic swap (SDL_Renderer flip on
+ * Linux/macOS, the GL backend's SwapBuffers here). Windows has an atomic swap
+ * too: a layered window hands DWM a whole new surface via UpdateLayeredWindow,
+ * which either shows entirely or not at all. This path costs a full-frame
+ * premultiplied copy, so it is reserved for presents whose changed area is
+ * large (page switches, scrolls, WM_PAINT restores); small diffs stay on the
+ * cheap rect uploads above, where the exposure window is far below one frame.
+ * For an opaque window "premultiplied ARGB" is just the canvas pixel with the
+ * alpha byte forced to 0xFF -- the same pixels GDI would have shown, since
+ * SetDIBitsToDevice ignores alpha anyway. */
+
+typedef struct zan_atomic_layer_s {
+    void *hwnd;
+    int w, h;
+    HBITMAP bm;
+    HDC dc;
+    void *bits;
+    struct zan_atomic_layer_s *next;
+} zan_atomic_layer_t;
+
+static zan_atomic_layer_t *g_atomic_layers = NULL;
+
+static zan_atomic_layer_t *atomic_layer(void *hwnd, int w, int h) {
+    zan_atomic_layer_t *prev = NULL;
+    zan_atomic_layer_t *it = g_atomic_layers;
+    int n = 0;
+    while (it) {
+        if (it->hwnd == hwnd) {
+            if (it->w != w || it->h != h) {
+                /* deleting the DC deselects the DIB, so the bitmap can go */
+                DeleteDC(it->dc);
+                DeleteObject(it->bm);
+                BITMAPINFO bmi;
+                memset(&bmi, 0, sizeof(bmi));
+                bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bmi.bmiHeader.biWidth = w;
+                bmi.bmiHeader.biHeight = -h;
+                bmi.bmiHeader.biPlanes = 1;
+                bmi.bmiHeader.biBitCount = 32;
+                HDC sdc = GetDC(0);
+                it->dc = CreateCompatibleDC(sdc);
+                ReleaseDC(0, sdc);
+                it->bm = CreateDIBSection(it->dc, &bmi, DIB_RGB_COLORS,
+                                          &it->bits, NULL, 0);
+                if (!it->bm) {
+                    DeleteDC(it->dc);
+                    it->dc = 0;
+                    it->bits = NULL;
+                    return NULL;
+                }
+                SelectObject(it->dc, it->bm);
+                it->w = w;
+                it->h = h;
+            }
+            if (prev) {
+                prev->next = it->next;
+                it->next = g_atomic_layers;
+                g_atomic_layers = it;
+            }
+            return it;
+        }
+        prev = it;
+        it = it->next;
+        n++;
+    }
+    zan_atomic_layer_t *nl = (zan_atomic_layer_t *)calloc(1, sizeof(*nl));
+    if (!nl) return NULL;
+    BITMAPINFO bmi;
+    memset(&bmi, 0, sizeof(bmi));
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    HDC sdc = GetDC(0);
+    nl->dc = CreateCompatibleDC(sdc);
+    ReleaseDC(0, sdc);
+    if (!nl->dc) { free(nl); return NULL; }
+    nl->bm = CreateDIBSection(nl->dc, &bmi, DIB_RGB_COLORS, &nl->bits, NULL, 0);
+    if (!nl->bm) { DeleteDC(nl->dc); nl->dc = 0; free(nl); return NULL; }
+    SelectObject(nl->dc, nl->bm);
+    nl->hwnd = hwnd;
+    nl->w = w;
+    nl->h = h;
+    nl->next = g_atomic_layers;
+    g_atomic_layers = nl;
+    if (n >= 8) {
+        zan_atomic_layer_t *tail = g_atomic_layers;
+        while (tail->next && tail->next->next) tail = tail->next;
+        DeleteDC(tail->next->dc);
+        DeleteObject(tail->next->bm);
+        free(tail->next);
+        tail->next = NULL;
+    }
+    return nl;
+}
+
+static void zan_atomic_layer_drop(void *hwnd) {
+    zan_atomic_layer_t **p = &g_atomic_layers;
+    while (*p) {
+        if ((*p)->hwnd == hwnd) {
+            zan_atomic_layer_t *dead = *p;
+            *p = dead->next;
+            DeleteDC(dead->dc);
+            DeleteObject(dead->bm);
+            free(dead);
+            return;
+        }
+        p = &(*p)->next;
+    }
+}
+
+/* Swaps the surface onto the screen atomically. The window becomes layered on
+ * first use (the glass path already runs this way). The DIB is sized to the
+ * client rect: UpdateLayeredWindow's psize *sets* the window size, so sizing
+ * it to a stale surface would resize the window mid-frame. Rows beyond the
+ * surface (a resize frame where the surface lags) go up transparent, exactly
+ * like the glass present. Returns 1 when the frame is on screen. */
+EXPORT i32 zan_gui_atomic_present(void *hwnd, i32 surface_id) {
+#ifdef _WIN32
+    if (!hwnd || surface_id < 0 || surface_id >= g_surface_count) return 0;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s || !s->pixels) return 0;
+    if (s->be) {
+        if (s->be->flush) s->be->flush(s);
+        if (s->be->read_pixels) s->be->read_pixels(s);
+    }
+    RECT rc;
+    if (!GetClientRect((HWND)hwnd, &rc)) return 0;
+    int pw = rc.right - rc.left;
+    int ph = rc.bottom - rc.top;
+    if (pw <= 0 || ph <= 0) return 0;
+    LONG_PTR ex = GetWindowLongPtrW((HWND)hwnd, GWL_EXSTYLE);
+    if (!(ex & WS_EX_LAYERED)) {
+        SetWindowLongPtrW((HWND)hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+    }
+    zan_atomic_layer_t *l = atomic_layer(hwnd, pw, ph);
+    if (!l || !l->bits) return 0;
+    int w = s->width, h = s->height;
+    int stride = s->stride;
+    u32 *pix = s->pixels;
+    int copyW = w < pw ? w : pw;
+    int copyH = h < ph ? h : ph;
+    u32 *dst = (u32 *)l->bits;
+    for (int y = 0; y < ph; y++) {
+        u32 *drow = dst + (size_t)y * (size_t)pw;
+        if (y < copyH) {
+            const u32 *srow = pix + (size_t)y * (size_t)stride;
+            for (int x = 0; x < copyW; x++) {
+                drow[x] = srow[x] | 0xFF000000u;
+            }
+        } else {
+            memset(drow, 0, (size_t)pw * 4);
+        }
+    }
+    POINT src = { 0, 0 };
+    SIZE size = { pw, ph };
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    HDC sdc = GetDC(0);
+    BOOL ok = UpdateLayeredWindow((HWND)hwnd, sdc, NULL, &size, l->dc, &src,
+                                  0, &bf, 2);
+    ReleaseDC(0, sdc);
+    return ok ? 1 : 0;
+#else
+    (void)hwnd; (void)surface_id;
+    return 0;
+#endif
+}
+
+/* A window is gone: drop its presented-frame shadow so the allocation does not
+ * linger for the session. No-op when the handle has none. */
+EXPORT void zan_gui_gdi_present_drop(void *hwnd) {
+#ifdef _WIN32
+    zan_present_shadow_t **p = &g_present_shadows;
+    while (*p) {
+        if ((*p)->hwnd == hwnd) {
+            zan_present_shadow_t *dead = *p;
+            *p = dead->next;
+            free(dead->pixels);
+            free(dead);
+            return;
+        }
+        p = &(*p)->next;
+    }
+    zan_atomic_layer_drop(hwnd);
+#else
+    (void)hwnd;
+#endif
+}
+
 /* Frees the pixel buffer owned by a snapshot slot and marks it invalid, so the
  * memory a cached region holds (e.g. a chart embedded in a grid cell that just
  * scrolled out of view) is returned to the allocator instead of being retained

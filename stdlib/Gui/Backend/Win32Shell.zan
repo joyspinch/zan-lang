@@ -154,6 +154,18 @@ class Win32Shell {
                                         int usage);
     [DllImport("gdi32", EntryPoint = "CreateSolidBrush")]
     static extern nint CreateSolidBrush(int color);
+
+    /// GDI 呈现（含对上一呈现帧的差分增量上传），见 gui_runtime.c。
+    /// rects 为 [x,y,w,h]* 扁平数组的原生缓冲，rectCount 是矩形个数；
+    /// rectCount < 0 强制整窗上传（WM_PAINT：重定向表面可能已失效）；
+    /// rectCount == 0 走瓦片差分。返回实际上传的矩形数，-1 失败。
+    [DllImport("zan_gui")]
+    static extern int zan_gui_gdi_present(nint hwnd, int surfaceId, nint rects,
+                                          int rectCount);
+
+    /// 窗口销毁时释放它的呈现阴影（见 zan_gui_gdi_present）。
+    [DllImport("zan_gui")]
+    static extern void zan_gui_gdi_present_drop(nint hwnd);
     [DllImport("gdi32", EntryPoint = "DeleteObject")]
     static extern int DeleteObject(nint obj);
     [DllImport("gdi32", EntryPoint = "CreateCompatibleDC")]
@@ -264,6 +276,11 @@ class Win32Shell {
     static int evKeyCode;
     static int evMods;
     static bool hasEvent;
+    // 每投递一个真实事件递增一次。EventKind() 在没有新事件的
+    // 迭代里返回上一次的旧值（自定义循环的动画分支不泵就退出），
+    // 应用据此区分"新事件"与"陈旧回读"——点击的帧绑定只能
+    // 由新事件解除，否则一次释放会被每一帧当成新点击。
+    static long evSeq;
     // 窗口过程投递的事件队列（kind,x,y,button,keycode,mods 六元组 +
     // 平行的 hwnd 列表）。事件不能只存一个槽位：嵌套的消息泵——原生
     // 子窗口（CEF/WebView 的 Chromium 视图）在一帧里被驱动时，
@@ -328,6 +345,23 @@ class Win32Shell {
     static nint dirtyHwnd;
     static List<nint> dirtyLost;
 
+    // 诊断：ZAN_PRESENT_LOG 非空时把每次 Blit 的脏矩形状态追加到
+    // present_log.txt（见 Blit 开头）。
+    static bool presentLog;
+    static extern string getenv(string name);
+
+    // WM_PAINT 分支正在呈现：OS 判定重定向表面失效，差分阴影不再可信，
+    // 这次 Blit 必须整窗上传（zan_gui_gdi_present 的 rectCount=-1 语义）。
+    static bool wmPaintBlit;
+
+    // 应用声明“这一帧重画了每一个像素”：下一次该窗口的 Blit 整窗上传。
+    // 整窗帧不经过 PresentDirty，此前落进瓦片差分（阴影比对）——阴影
+    // 与重定向表面一旦失步（上传过却没上屏的块），差异比对会永远认为
+    // 那块没变，旧帧内容就永久留在屏上。整窗帧的上传范围由应用自己
+    // 说清楚，不依赖任何影子。
+    static bool forceFullUpload;
+    static nint forceFullHwnd;
+
     // 自动化驱动排队的合成事件，由临界区
     // 保护：驱动线程可能在 UI 线程排空时入队。
     static List<int> injectQ;
@@ -351,6 +385,7 @@ class Win32Shell {
     static List<nint> hitGuardWins;
 
     static nint scratchRect;
+    static nint scratchRects;
     static nint scratchMsg;
     static nint bitmapInfo;
     static int bgColor;
@@ -376,6 +411,7 @@ class Win32Shell {
         Win32Shell.dirty = new List<int>();
         Win32Shell.dirtyHwnd = 0;
         Win32Shell.dirtyLost = new List<nint>();
+        Win32Shell.presentLog = Win32Shell.getenv("ZAN_PRESENT_LOG") != "";
         Win32Shell.injectQ = new List<int>();
         Win32Shell.injectHwnd = new List<nint>();
         Win32Shell.postQ = new List<int>();
@@ -388,6 +424,7 @@ class Win32Shell {
         Win32Shell.injectCs = NativeMemory.Alloc(64);
         Win32Shell.InitializeCriticalSection(Win32Shell.injectCs);
         Win32Shell.scratchRect = NativeMemory.Alloc(16);
+        Win32Shell.scratchRects = NativeMemory.Alloc(2048 * 4);
         Win32Shell.scratchMsg = NativeMemory.Alloc(64);
         Win32Shell.bitmapInfo = NativeMemory.Alloc(48);
 
@@ -693,7 +730,11 @@ class Win32Shell {
             nint ps = NativeMemory.Alloc(72);
             Win32Shell.BeginPaint(hwnd, ps);
             int own = Win32Shell.SurfaceOf(hwnd);
-            if (!Win32Shell.glassOn && own >= 0) { Win32Shell.Blit(hwnd, own); }
+            if (!Win32Shell.glassOn && own >= 0) {
+                Win32Shell.wmPaintBlit = true;
+                Win32Shell.Blit(hwnd, own);
+                Win32Shell.wmPaintBlit = false;
+            }
             Win32Shell.EndPaint(hwnd, ps);
             NativeMemory.Free(ps);
             return 0;
@@ -895,6 +936,7 @@ class Win32Shell {
                 if (Win32Shell.dirtyHwnd == hwnd) {
                     Win32Shell.dirty.Clear();
                     Win32Shell.dirtyOverflow = false;
+                    Win32Shell.forceFullUpload = false;
                 }
                 Win32Shell.TakeDirtyLost(hwnd);
                 return;
@@ -906,67 +948,92 @@ class Win32Shell {
             if (Win32Shell.dirtyHwnd == hwnd) {
                 Win32Shell.dirty.Clear();
                 Win32Shell.dirtyOverflow = false;
+                Win32Shell.forceFullUpload = false;
             }
             Win32Shell.TakeDirtyLost(hwnd);
             Win32Shell.PresentLayered(hwnd, surface);
             return;
         }
-        nint dc = Win32Shell.GetDC(hwnd);
-        if (dc == 0) { return; }
-        Win32Shell.FillBitmapInfo(sw, sh);
         bool owned = Win32Shell.dirtyHwnd == hwnd;
         bool lost = Win32Shell.TakeDirtyLost(hwnd);
+        bool fullAsked = Win32Shell.forceFullUpload
+                         && Win32Shell.forceFullHwnd == hwnd;
+        if (owned) {
+            Win32Shell.forceFullUpload = false;
+        }
+        // GDI 呈现统一走 zan_gui_gdi_present：声明过的脏矩形按矩形上传；
+        // 没有声明时对上一呈现帧的阴影做瓦片差分，只上传真正变化的块。
+        // SetDIBitsToDevice 是逐行流入重定向表面的，整窗上传会在屏幕上
+        // 撕裂几毫秒（滚动时肉眼可见的文字重影）；差分把上传缩到变化区，
+        // 且正确性不依赖任何损伤声明——漏报最多多传几块瓦片，绝不花屏。
+        int rects = 0;
+        int ret = 0;
         if (owned && !lost && Win32Shell.dirty.Count > 0
             && !Win32Shell.dirtyOverflow) {
-            int i = 0;
-            while (i + 3 < Win32Shell.dirty.Count) {
-                int rx = Win32Shell.dirty[i];
-                int ry = Win32Shell.dirty[i + 1];
-                int rw = Win32Shell.dirty[i + 2];
-                int rh = Win32Shell.dirty[i + 3];
-                i = i + 4;
-                if (rx < 0) { rw = rw + rx; rx = 0; }
-                if (ry < 0) { rh = rh + ry; ry = 0; }
-                if (rx + rw > sw) { rw = sw - rx; }
-                if (ry + rh > sh) { rh = sh - ry; }
-                if (rw <= 0 || rh <= 0) { continue; }
-                // bitmapInfo 使用负高度，因此这是 top-down DIB；
-                // 源行与目标行使用同一原点。若在这里套用
-                // bottom-up 换算，会把脏区域在表面内垂直镜像。
-                Win32Shell.SetDIBitsToDevice(dc, rx, ry, rw, rh, rx,
-                    ry, 0, sh, pixels, Win32Shell.bitmapInfo, 0);
+            int n = Win32Shell.dirty.Count / 4;
+            Span<int> buf = new Span<int>(Win32Shell.scratchRects,
+                Win32Shell.dirty.Count);
+            for (int i = 0; i < Win32Shell.dirty.Count; i = i + 1) {
+                buf[i] = Win32Shell.dirty[i];
             }
+            ret = Win32Shell.zan_gui_gdi_present(hwnd, surface,
+                Win32Shell.scratchRects, n);
+            rects = ret > 0 ? ret : 0;
+        } else if (fullAsked || Win32Shell.wmPaintBlit
+                   || Win32Shell.windowWidth > sw
+                   || Win32Shell.windowHeight > sh) {
+            // 应用声明的整窗帧、WM_PAINT（OS 判定表面失效）或窗口比
+            // 表面大（补边帧）：阴影不再可信，强制整窗上传。
+            ret = Win32Shell.zan_gui_gdi_present(hwnd, surface, 0, 0 - 1);
+            rects = ret > 0 ? ret : 0;
         } else {
-            Win32Shell.SetDIBitsToDevice(dc, 0, 0, sw, sh, 0, 0, 0, sh,
-                pixels, Win32Shell.bitmapInfo, 0);
+            ret = Win32Shell.zan_gui_gdi_present(hwnd, surface, 0, 0);
+            rects = ret > 0 ? ret : 0;
+        }
+        if (Win32Shell.presentLog) {
+            int n = owned ? Win32Shell.dirty.Count : 0 - 1;
+            File.AppendAllText("present_log.txt",
+                "blit t=" + Convert.ToString(Window.GetTickMs())
+                + " hwnd=" + Convert.ToString(hwnd)
+                + " rects=" + Convert.ToString(rects)
+                + " n=" + Convert.ToString(n)
+                + " lost=" + Convert.ToString(lost ? 1 : 0)
+                + " ret=" + Convert.ToString(ret)
+                + " win=" + Convert.ToString(Win32Shell.windowWidth)
+                + "x" + Convert.ToString(Win32Shell.windowHeight)
+                + " surf=" + Convert.ToString(sw) + "x"
+                + Convert.ToString(sh) + "\n");
         }
         if (owned) {
             Win32Shell.dirty.Clear();
             Win32Shell.dirtyOverflow = false;
         }
         if (Win32Shell.windowWidth > sw || Win32Shell.windowHeight > sh) {
-            int bgr = ((Win32Shell.bgColor & 255) << 16)
-                | (Win32Shell.bgColor & 65280)
-                | ((Win32Shell.bgColor >> 16) & 255);
-            nint brush = Win32Shell.CreateSolidBrush(bgr);
-            nint rc = Win32Shell.scratchRect;
-            if (Win32Shell.windowWidth > sw) {
-                new Span<int>(rc, 1)[0] = sw;
-                new Span<int>(rc + 4, 1)[0] = 0;
-                new Span<int>(rc + 8, 1)[0] = Win32Shell.windowWidth;
-                new Span<int>(rc + 12, 1)[0] = Win32Shell.windowHeight;
-                Win32Shell.FillRect(dc, rc, brush);
+            nint edc = Win32Shell.GetDC(hwnd);
+            if (edc != 0) {
+                int bgr = ((Win32Shell.bgColor & 255) << 16)
+                    | (Win32Shell.bgColor & 65280)
+                    | ((Win32Shell.bgColor >> 16) & 255);
+                nint brush = Win32Shell.CreateSolidBrush(bgr);
+                nint rc = Win32Shell.scratchRect;
+                if (Win32Shell.windowWidth > sw) {
+                    new Span<int>(rc, 1)[0] = sw;
+                    new Span<int>(rc + 4, 1)[0] = 0;
+                    new Span<int>(rc + 8, 1)[0] = Win32Shell.windowWidth;
+                    new Span<int>(rc + 12, 1)[0] = Win32Shell.windowHeight;
+                    Win32Shell.FillRect(edc, rc, brush);
+                }
+                if (Win32Shell.windowHeight > sh) {
+                    new Span<int>(rc, 1)[0] = 0;
+                    new Span<int>(rc + 4, 1)[0] = sh;
+                    new Span<int>(rc + 8, 1)[0] = sw;
+                    new Span<int>(rc + 12, 1)[0] = Win32Shell.windowHeight;
+                    Win32Shell.FillRect(edc, rc, brush);
+                }
+                Win32Shell.DeleteObject(brush);
+                Win32Shell.ReleaseDC(hwnd, edc);
             }
-            if (Win32Shell.windowHeight > sh) {
-                new Span<int>(rc, 1)[0] = 0;
-                new Span<int>(rc + 4, 1)[0] = sh;
-                new Span<int>(rc + 8, 1)[0] = sw;
-                new Span<int>(rc + 12, 1)[0] = Win32Shell.windowHeight;
-                Win32Shell.FillRect(dc, rc, brush);
-            }
-            Win32Shell.DeleteObject(brush);
         }
-        Win32Shell.ReleaseDC(hwnd, dc);
     }
 
     /// 玻璃呈现：将直通 alpha 表面预乘进缓存的 DIB
@@ -1305,6 +1372,7 @@ class Win32Shell {
     static void Destroy(nint hwnd) {
         Win32Shell.ForgetCaptionButtons(hwnd);
         Win32Shell.zan_gui_release_window(hwnd);
+        Win32Shell.zan_gui_gdi_present_drop(hwnd);
         Win32Shell.DestroyWindow(hwnd);
     }
 
@@ -1808,6 +1876,22 @@ class Win32Shell {
         Win32Shell.dirty.Add(h);
     }
 
+    /// 整窗帧的呈现声明：这一帧重画了窗口的每个像素，下一次 Blit
+    /// 对它整窗上传（rectCount=-1），不做任何差分。见 forceFullUpload。
+    static void PresentFull(nint hwnd) {
+        Win32Shell.Init();
+        if (Win32Shell.dirtyHwnd != hwnd) {
+            if (Win32Shell.dirty.Count > 0 && Win32Shell.dirtyHwnd != 0) {
+                Win32Shell.NoteDirtyLost(Win32Shell.dirtyHwnd);
+            }
+            Win32Shell.dirty.Clear();
+            Win32Shell.dirtyOverflow = false;
+            Win32Shell.dirtyHwnd = hwnd;
+        }
+        Win32Shell.forceFullUpload = true;
+        Win32Shell.forceFullHwnd = hwnd;
+    }
+
     /// 记下一个窗口有一批声明过却没上传成的脏矩形：它下一次呈现
     /// 整窗上传，而不是只上传那一次声明的那几块。
     static void NoteDirtyLost(nint hwnd) {
@@ -1860,6 +1944,7 @@ class Win32Shell {
             if (target == 0) { target = Win32Shell.mainHwnd; }
             Win32Shell.evHwnd = target;
             Win32Shell.hasEvent = true;
+            Win32Shell.evSeq = Win32Shell.evSeq + 1;
             got = true;
         }
         Win32Shell.LeaveCriticalSection(Win32Shell.injectCs);
@@ -1881,6 +1966,7 @@ class Win32Shell {
         Win32Shell.evHwnd = Win32Shell.postHwnd[0];
         Win32Shell.postHwnd.RemoveAt(0);
         Win32Shell.hasEvent = true;
+        Win32Shell.evSeq = Win32Shell.evSeq + 1;
         return true;
     }
 
@@ -1969,6 +2055,7 @@ class Win32Shell {
     }
 
     static int EventKindValue() { return Win32Shell.evKind; }
+    static long EventSeqValue() { return Win32Shell.evSeq; }
     static int EventXValue() { return Win32Shell.evX; }
     static int EventYValue() { return Win32Shell.evY; }
     static int EventButtonValue() { return Win32Shell.evButton; }

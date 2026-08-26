@@ -77,7 +77,14 @@ static void x11_set_scale_metrics(int scale) {
  * queue. Slots: [kind, x, y, button, keycode, mods, 0, 0]. */
 #define ZAN_EVQ_CAP 64
 static int g_evq_linux[ZAN_EVQ_CAP][8];
-static int g_evq_head_linux = 0, g_evq_tail_linux = 0;
+static int evq_head_linux = 0, g_evq_tail_linux = 0;
+
+/* Monotonic counter bumped every time an event is delivered into
+ * g_pending_event_linux. Event getters return the LAST event even when no
+ * new one arrived (animation frames exit without pumping), so the shell
+ * needs a way to tell a fresh event from a stale re-read -- the click
+ * frame-binding must only be released by a genuinely new release event. */
+static long long g_ev_seq_linux = 0;
 
 static void evq_push_linux(int kind, int x, int y, int button, int keycode, int mods) {
     int next = (g_evq_tail_linux + 1) % ZAN_EVQ_CAP;
@@ -93,6 +100,7 @@ static int evq_pop_linux(void) {
     memcpy(g_pending_event_linux, g_evq_linux[g_evq_head_linux],
            sizeof(g_pending_event_linux));
     g_evq_head_linux = (g_evq_head_linux + 1) % ZAN_EVQ_CAP;
+    g_ev_seq_linux++;
     return 1;
 }
 
@@ -645,6 +653,7 @@ EXPORT i32 zan_gui_inject_pending(void) {
 }
 
 EXPORT i32 zan_gui_event_kind(void)    { return g_pending_event_linux[0]; }
+EXPORT i64 zan_gui_event_seq(void)     { return g_ev_seq_linux; }
 EXPORT i32 zan_gui_event_x(void)       { return g_pending_event_linux[1]; }
 EXPORT i32 zan_gui_event_y(void)       { return g_pending_event_linux[2]; }
 EXPORT i32 zan_gui_event_button(void)  { return g_pending_event_linux[3]; }

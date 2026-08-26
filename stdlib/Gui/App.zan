@@ -1,4 +1,5 @@
 using System;
+using Gui.Component.Chart;
 using Gui.Backend;
 
 namespace Gui;
@@ -205,6 +206,18 @@ class App {
     // 事件，这样点击永远不会穿透到它自己刚刚打开的模态框
     // 中。每帧在 BeginFrame 中重置。
     bool clickClaimed;
+    // 一次释放只投递给一帧：持续动画（星空、spinner）会在下个
+    // 事件到来前反复出帧，而 EventKind 停留在 3；没有此锁定时
+    // 按钮等会在每个动画帧重新触发（通知连发、点击计数暴涨）。
+    // frameSeq 由 BeginFrame 递增；clickSeenSeq 记录当前释放
+    // 首次被读到的帧（-1 = 新释放尚未绑定）。
+    // 解除绑定只认"没见过的新释放事件"：自定义循环的动画分支
+    // 可以不泵事件就出帧，此时 EventKind 回读上一次的旧值，
+    // 单看 kind==3 会把同一次释放每帧都当成新的（点击每帧
+    // 重触发）。clickEvSeq 记录已解除绑定的事件序号。
+    int frameSeq;
+    int clickSeenSeq;
+    long clickEvSeq;
 
     // --- 事件分发 ---
     // 当前鼠标事件的目标，在 ProcessEvent 中每事件解析一次，
@@ -370,6 +383,7 @@ class App {
     int perfEvOther;
     int perfLoopMs;
     int perfFxTicks;
+    int perfFxOnlyTicks;
     int perfFxTickMs;
     int perfFxTickUs;
     int perfFxRestoreUs;
@@ -512,6 +526,14 @@ class App {
     int dmgY;
     int dmgW;
     int dmgH;
+    // 本帧 PushClip 时锁定的上传矩形。dmg 在渲染期间还可能增长
+    // （渲染中的 NoteDamage、PresentFrame 的 WidenDamageToGlass），
+    // 但那些区域本帧没渲染过，画布上是上一帧的旧像素——上传它们
+    // 就是拖影。PresentDirty 只许用这里锁定的值。
+    int presentX;
+    int presentY;
+    int presentW;
+    int presentH;
     // 本帧画过的玻璃面板矩形（x,y,w,h 四元组，NoteGlassRect 记录，
     // BeginFrame 清空）。损伤条带跨出某块玻璃时（模糊只能拿条带外
     // 的旧合成像素充数），下一帧把裁剪扩到相交面板的并集：模糊从
@@ -526,11 +548,25 @@ class App {
     bool glassRefreshOwe;
     int glassRefreshArmedAt;
     List<int> glassDeferredRects;
+    // 损伤裁剪帧玻璃模糊连续 miss 的帧数。扩裁剪（widen）重算过
+    // 的帧若仍报 miss，说明模糊核的采样边缘超出了任何条带，widen
+    // 救不回来——按 g_blur_partial_miss 的契约升级整窗帧，否则
+    // 滚动串里每一帧都在欠账，整帧永远排不上。
+    int blurMissStreak;
     // 效果层在最后一次合成帧中触及的像素矩形（x,y,w,h 四边形）
     // 下一次效果跳动只从
     // 槽位 7 的快照修复这些区域，而不是恢复整个帧。null = 未知
     // （修复会回退为一次全帧恢复）。
     List<int> fxDamage;
+
+    // 自快照以来效果层触及过的全部矩形的累计（并集清单）。效果
+    // 跳动只修复"上一拍"的矩形是不够的：光斑在移动，更早各拍
+    // 画下的像素若不被修复，就会作为幽灵残留在画布和屏幕上
+    // （大光斑皮肤下是一团越积越亮的色块）。每次纯效果跳动把
+    // 新损伤并入这份清单，修复与上传都以它为准；累计面积超过
+    // 半窗或矩形过多时退回全帧恢复（fxTouchedFull）。
+    List<int> fxTouched;
+    bool fxTouchedFull;
 
     App(string title, int width, int height) {
         this.window = new Window(title, width, height);
@@ -570,6 +606,9 @@ class App {
         this.clickTargetId = -1;
         this.pressTargetId = -1;
         this.pointerDown = false;
+        this.frameSeq = 0;
+        this.clickSeenSeq = 0 - 1;
+        this.clickEvSeq = 0 - 1;
         this.rightClickTargetId = -1;
         this.rightPressTargetId = -1;
         this.lastClickId = -1;
@@ -684,6 +723,7 @@ class App {
         this.perfEvOther = 0;
         this.perfLoopMs = 0;
         this.perfFxTicks = 0;
+        this.perfFxOnlyTicks = 0;
         this.perfFxTickMs = 0;
         this.perfFxTickUs = 0;
         this.perfFxRestoreUs = 0;
@@ -714,6 +754,8 @@ class App {
         this.dmgW = 0;
         this.dmgH = 0;
         this.fxDamage = null;
+        this.fxTouched = null;
+        this.fxTouchedFull = false;
         this.backdropDirty = true;
         this.blurSlotSeq = 0;
         this.blurSlotKey = new List<int>();
@@ -784,6 +826,8 @@ class App {
         // 几次切换后会把旧皮肤混入新皮肤。
         fxSnapValid = false;
         fxDamage = null;
+        fxTouched = null;
+        fxTouchedFull = false;
         backdropDirty = true;
         this.NoteRedrawWhy("ApplyTheme");
         needsRedraw = true;
@@ -852,6 +896,8 @@ class App {
         bgThemeGen = bgThemeGen + 1;
         fxSnapValid = false;
         fxDamage = null;
+        fxTouched = null;
+        fxTouchedFull = false;
         backdropDirty = true;
         this.NoteRedrawWhy("UseCss");
         needsRedraw = true;
@@ -1656,6 +1702,8 @@ class App {
     void SetBackdropFx(bool on) {
         fxEnabled = on;
         fxSnapValid = false;
+        fxTouched = null;
+        fxTouchedFull = false;
         if (!on) { fxNextMs = -1; }
         this.NoteRedrawWhy("SetBackdropFx");
         needsRedraw = true;
@@ -1686,19 +1734,27 @@ class App {
             return true;
         }
         Canvas fc = canvas;
-        List<int> repaired = fxDamage;
+        int cw = fc.Width();
+        int chh = fc.Height();
+        // 修复自快照以来特效触及过的全部区域（fxTouched），而不是
+        // 只有上一拍的矩形：光斑在移动，只修上一拍会让更早各拍的
+        // 像素以幽灵色块的形式留在画布与屏幕上。
+        bool fullRepair = fxTouchedFull || fxTouched == null;
         bool ok;
-        if (fxDamage == null) {
-            ok = fc.RestoreRect(0, 0, fc.Width(), fc.Height(),
-                                App.FxSnapSlot());
+        if (App.PerfOn()) {
+            File.AppendAllText("zan_frame_perf.log",
+                "fxp full=" + (fullRepair ? 1 : 0)
+                + " n=" + (fxTouched == null ? 0 : fxTouched.Count / 4)
+                + "\n");
+        }
+        if (fullRepair) {
+            ok = fc.RestoreRect(0, 0, cw, chh, App.FxSnapSlot());
         } else {
-            // 只修复上一效果帧触及的像素：少量
-            // 几百次小拷贝，而非整帧恢复。
             ok = true;
             int i = 0;
-            while (ok && i + 3 < fxDamage.Count) {
-                ok = fc.RestoreSubRect(fxDamage[i], fxDamage[i + 1],
-                                       fxDamage[i + 2], fxDamage[i + 3],
+            while (ok && i + 3 < fxTouched.Count) {
+                ok = fc.RestoreSubRect(fxTouched[i], fxTouched[i + 1],
+                                       fxTouched[i + 2], fxTouched[i + 3],
                                        App.FxSnapSlot());
                 i = i + 4;
             }
@@ -1712,19 +1768,51 @@ class App {
                 + (Window.GetTickUs() - perfFxRestoreT0);
             perfFxRenderT0 = Window.GetTickUs();
         }
-        BackdropFx.Render(this, fc, this.EffectiveFx(), 0, 0, fc.Width(), fc.Height(),
-                          Window.GetTickMs(), theme, dpiScale);
-        fxDamage = BackdropFx.TakeDamage();
-        // 除已修复像素和本效果帧
-        // 绘制的像素外没有变化，因此呈现只上传这些——把
-        // 整个表面推上去正是空闲效果帧过去耗时的原因
-        // 。完整恢复（无先前损伤）仍会呈现全部内容。
-        if (repaired != null) {
-            this.MarkPresentDirty(repaired);
-            this.MarkPresentDirty(fxDamage);
+        int fxPhaseMs = Window.GetTickMs();
+        BackdropFx.Render(this, fc, this.EffectiveFx(), 0, 0, cw, chh,
+                          fxPhaseMs, theme, dpiScale);
+        // 本拍把屏幕上的特效相位推进到了 fxPhaseMs：记入 fxFrameMs，
+        // 否则随后的损伤裁剪帧（悬停条带）仍按上一整帧的旧相位在
+        // 条带内重合成特效，与条带外已在屏幕上的新相位错开——
+        // 条带边界处就会出现一块矩形鬼影。
+        fxFrameMs = fxPhaseMs;
+        List<int> fresh = BackdropFx.TakeDamage();
+        fxDamage = fresh;
+        // 并入本拍损伤，得到下一拍的修复清单；累计过大时改走
+        // 全帧恢复（本拍已经全恢复了就直接以本拍损伤重新起算）。
+        if (fullRepair) {
+            fxTouched = fresh;
+            fxTouchedFull = false;
+            if (fresh != null && fresh.Count / 4 > 1024) { fxTouchedFull = true; }
+        } else {
+            int i = 0;
+            while (i + 3 < fresh.Count) {
+                fxTouched.Add(fresh[i]);
+                fxTouched.Add(fresh[i + 1]);
+                fxTouched.Add(fresh[i + 2]);
+                fxTouched.Add(fresh[i + 3]);
+                i = i + 4;
+            }
+            long area = 0;
+            i = 0;
+            while (i + 3 < fxTouched.Count) {
+                area = area + (long)fxTouched[i + 2] * fxTouched[i + 3];
+                i = i + 4;
+            }
+            if (fxTouched.Count / 4 > 1024
+                || area * 2 > (long)cw * chh) {
+                fxTouchedFull = true;
+            }
         }
+        // 呈现：全帧修复后画布处处等于"快照+本拍特效"，整窗上传；
+        // 部分修复时上传旧损伤区（已回到快照）+ 本拍损伤区即可。
         if (App.PerfOn()) { perfFxPresentT0 = Window.GetTickUs(); }
-        window.Present(canvas);
+        if (fullRepair) {
+            window.Present(canvas);
+        } else {
+            this.MarkPresentDirty(fxTouched);
+            window.Present(canvas);
+        }
         if (App.PerfOn()) {
             int perfFxEndUs = Window.GetTickUs();
             perfFxRenderUs = perfFxRenderUs
@@ -1733,8 +1821,10 @@ class App {
                 + (perfFxEndUs - perfFxPresentT0);
             perfFxTickUs = perfFxTickUs + (perfFxEndUs - perfFxT0);
             perfFxTicks = perfFxTicks + 1;
+            perfFxOnlyTicks = perfFxOnlyTicks + 1;
             perfFxTickMs = perfFxTickMs
                 + (perfFxEndUs - perfFxT0) / 1000;
+            this.PerfMaybeFlushLoop(Window.GetTickMs());
         }
         lastPresentMs = Window.GetTickMs();
         fxNextMs = lastPresentMs + this.FxIntervalMs();
@@ -1745,17 +1835,18 @@ class App {
     /// 只有不可见的窗口才停止计时（见 FxPresent）。
     int FxIntervalMs() {
         int ms = BackdropFx.IntervalMs(this.EffectiveFx());
-        // 空闲时只允许放慢，不得比皮肤自身节奏更快，也不得
-        // 慢于可感知的心跳。失焦只影响输入，不暂停可见窗口。
-        if (Window.GetTickMs() - lastInputMs > 30000) {
-            int idleMs = ms * 2;
-            int maxIdleMs = ms;
-            if (maxIdleMs < 50) { maxIdleMs = 50; }
-            if (idleMs < ms) { idleMs = ms; }
-            if (idleMs > maxIdleMs) { idleMs = maxIdleMs; }
-            return idleMs;
-        }
-        return ms;
+        // 空闲时逐级放慢环境特效的心跳：最后一次真实输入越久，
+        // tick 越稀；任何输入都会把 lastInputMs 拉回当下，下一拍
+        // 就恢复皮肤自身节奏。可见窗口不暂停（失焦只影响输入），
+        // 但没人看动画时不必每 150ms 重合成一整层。
+        int idleMs = Window.GetTickMs() - lastInputMs;
+        if (idleMs <= 5000) { return ms; }
+        if (idleMs <= 30000) { return ms * 2; }
+        if (idleMs <= 120000) { return ms * 4; }
+        int slow = ms * 8;
+        if (slow > 1000) { slow = 1000; }
+        if (slow < ms) { slow = ms; }
+        return slow;
     }
 
     /// 将下次重绘标记为损伤裁剪帧，覆盖指针
@@ -2224,6 +2315,8 @@ class App {
         animPrevValid = false;
         fxSnapValid = false;
         fxDamage = null;
+        fxTouched = null;
+        fxTouchedFull = false;
     }
 
     void Show() {
@@ -3462,7 +3555,26 @@ class App {
             // 还能让运动更平滑、更贴合真实时钟节奏。
             int since = Window.GetTickMs() - lastPresentMs;
             if (lastPresentMs > 0 && since < 16) { Window.SleepMs(16 - since); }
-            result = window.PollEvent();
+            if (needsRedraw) {
+                result = window.PollEvent();
+            } else {
+                // 只有"要求轮询"没有"挂起重绘"（自动化驱动在等时间
+                // 或等注入批次排空）：在内核里小睡到下一个事件或最多
+                // 8ms——注入的事件会立刻唤醒等待，而循环不再以
+                // 数十万圈每秒空转烧掉半个核。
+                int now = Window.GetTickMs();
+                int slice = 8;
+                int dl = animNextMs;
+                if (dl < 0 || (wakeNextMs >= 0 && wakeNextMs < dl)) { dl = wakeNextMs; }
+                if (dl < 0 || (wakeFrameNextMs >= 0 && wakeFrameNextMs < dl)) { dl = wakeFrameNextMs; }
+                if (dl < 0 || (fxNextMs >= 0 && fxNextMs < dl)) { dl = fxNextMs; }
+                if (dl >= 0) {
+                    int d = dl - now;
+                    if (d < 1) { d = 1; }
+                    if (d < slice) { slice = d; }
+                }
+                result = window.WaitEventTimeout(slice);
+            }
         } else if (animNextMs >= 0 || wakeNextMs >= 0
                    || wakeFrameNextMs >= 0 || fxNextMs >= 0) {
             loopPath = 1;
@@ -3516,6 +3628,15 @@ class App {
         this.PerfMark("sh.posts");
 
         int kind = window.EventKind();
+        // 新的释放事件：解除上一释放的帧绑定，让本次点击
+        // 重新锁定到处理它的那一帧（见 ClickFrameCurrent）。
+        // 只认没见过的新事件：动画到期路径可能不泵就出帧，
+        // EventKind 回读旧值，单看 kind==3 会把同一次释放
+        // 每帧都当成新的。
+        if (kind == 3 && window.EventSeq() != clickEvSeq) {
+            clickSeenSeq = 0 - 1;
+            clickEvSeq = window.EventSeq();
+        }
 
         // 纯动画重绘在无 OS 事件（kind 0）时唤醒：玻璃背后的内容
         // 未变化，因此其模糊 + 静态壁纸可以直接从缓存恢复。
@@ -3763,6 +3884,14 @@ class App {
     bool ApplyEvent(nint evHwnd) {
         bool mine = evHwnd == window.GetHandle();
         int kind = window.EventKind();
+        // 新的释放事件：解除上一释放的帧绑定（见 ClickFrameCurrent）。
+        // 与 ProcessEvent 相同，只认没见过的新事件——自定义循环
+        // （gallery 等）的动画分支不泵就出帧，EventKind 会回读
+        // 上一次释放的旧值，不设防就把一次点击每帧重放一遍。
+        if (kind == 3 && window.EventSeq() != clickEvSeq) {
+            clickSeenSeq = 0 - 1;
+            clickEvSeq = window.EventSeq();
+        }
         // 与 ProcessEvent 相同的帧内快速路径：由
         // 多窗口泵驱动的窗口不能为每次鼠标移动和按键
         // 都付出完整的重新模糊代价——在 IDE 尺寸的表面上，
@@ -3966,6 +4095,11 @@ class App {
         // 最后绘制并分发弹层，使其位于所有内容之上并拥有
         // 最顶层命中区域（框架拥有的遮罩/层叠层）。
         RunOverlays();
+        // 延迟悬停提示最后绘制：拥有它们的控件帧内渲染较早，
+        // 会被同页后续内容甚至弹层盖住。宿主若已自行 Flush 过，
+        // 这里就是空操作（队列已清空）。
+        Widget.Tooltip.Flush(this);
+        Component.Chart.ChartView.FlushTooltips(this);
         // 弹层落定之后再结算原生浮层：此刻本帧所有拦截区都已注册，
         // 能算出网页视图真正该露出的区域（菜单/对话框压住的部分被
         // 裁掉），否则原生层会盖住它上面的一切。
@@ -3995,22 +4129,34 @@ class App {
                 BackdropFx.TakeDamage();
                 fxSnapValid = false;
                 fxDamage = null;
+                fxTouched = null;
+                fxTouchedFull = false;
                 fxNextMs = fxNow + this.FxIntervalMs();
             } else {
             bool burst = lastPresentMs > 0 && fxNow - lastPresentMs < 120;
             if (burst) {
                 fxSnapValid = false;
                 fxDamage = null;
+                fxTouched = null;
+                fxTouchedFull = false;
                 fxNextMs = fxNow + this.FxIntervalMs();
             } else {
                 fc.SnapshotRect(0, 0, fc.Width(), fc.Height(),
                                 App.FxSnapSlot());
                 fxSnapValid = true;
+                if (App.PerfOn()) {
+                    File.AppendAllText("zan_frame_perf.log", "fframe snap=1\n");
+                }
             }
             BackdropFx.Render(this, fc, this.EffectiveFx(), 0, 0, fc.Width(), fc.Height(),
                               fxNow, theme, dpiScale);
             if (!burst) {
                 fxDamage = BackdropFx.TakeDamage();
+                // 新快照 = 干净基线：累计损伤从此刻的特效矩形重新
+                // 起算（与 fxDamage 先共享同一份清单，FxPresent 里
+                // 并入新损伤之前 fxDamage 已换到新列表，不会互扰）。
+                fxTouched = fxDamage;
+                fxTouchedFull = fxDamage.Count / 4 > 1024;
                 fxNextMs = Window.GetTickMs() + this.FxIntervalMs();
             } else {
                 BackdropFx.TakeDamage();
@@ -4031,22 +4177,50 @@ class App {
         int blurMiss = Canvas.TakeBlurPartialMiss();
         if (partialFrame) {
             canvas.PopClip();
+            // 上传矩形用 PushClip 时锁定的 presentX..，而不是现读
+            // dmg：渲染期间 dmg 还会增长（渲染中的 NoteDamage、下面
+            // 的 WidenDamageToGlass），那些区域本帧没渲染过，画布上
+            // 是上一帧的旧像素——上传它们就是拖影与阶梯状残块。扩大的
+            // 裁剪经 partialPending 留给下一帧真正渲染后再上屏。
             // 有玻璃面板跨出了损伤条带、且没有可复用的缓存模糊：条带里
             // 的磨砂是拿上一帧的合成结果当背景糊出来的，与整帧渲染不
             // 等价（背景内容变化大时就是可见的拖影）。下一帧把裁剪
             // 扩到相交面板并集重新算；没有可用的并集（或大到接近
             // 整窗）时才升级成整窗重绘。
             if (blurMiss > 0) {
-                if (!this.WidenDamageToGlass()) {
+                blurMissStreak = blurMissStreak + 1;
+                // 扩裁剪重算过的帧若仍报 miss，模糊核的取样边缘越出了
+                // 一切条带，widen 已无力——按 g_blur_partial_miss 的
+                // 契约把下一帧升级成整窗，别让滚动串帧帧欠账。
+                if (!this.WidenDamageToGlass() || blurMissStreak >= 2) {
                     partialBlocked = true;
                     forceFullNext = true;
+                    blurMissStreak = 0;
                     this.NoteRedrawWhy("glass-partial-blur");
                 } else {
                     this.NoteRedrawWhy("glass-strip-widen");
                 }
                 needsRedraw = true;
+            } else {
+                blurMissStreak = 0;
             }
-            window.PresentDirty(dmgX, dmgY, dmgW, dmgH);
+            if (App.PerfOn()) {
+                File.AppendAllText("zan_frame_perf.log",
+                    "pframe present=" + Convert.ToString(presentX) + ","
+                    + Convert.ToString(presentY) + "+"
+                    + Convert.ToString(presentW) + "x"
+                    + Convert.ToString(presentH)
+                    + " miss=" + Convert.ToString(blurMiss)
+                    + "\n");
+            }
+            window.PresentDirty(presentX, presentY, presentW, presentH);
+        } else {
+            // 整窗帧重画了每一个像素，就声明整窗上传：呈现范围由
+            // 自己的声明决定，而不是运行时的差分影子。影子只依据
+            // “上传过什么”，不依据“屏幕上是什么”——一次没上屏的
+            // 上传之后，影子与屏幕永久失步，差异比对会把旧帧内容
+            // 当作已呈现，滚动停下的残带就是这样留下的。
+            window.PresentFull();
         }
         this.SettleGlassRefresh();
         window.Present(canvas);
@@ -4267,6 +4441,14 @@ class App {
         if (ek == 0) { perfEvNone = perfEvNone + 1; }
         else if (ek == 1) { perfEvMove = perfEvMove + 1; }
         else { perfEvOther = perfEvOther + 1; }
+        this.PerfMaybeFlushLoop(now);
+    }
+
+    /// 把累计的循环/特效计数按 2 秒窗口落盘。除了事件循环本身，
+    /// 纯特效 tick（FxPresent 在等待循环内就地呈现，不经过
+    /// PerfLoopTick）也调用这里，否则安静的效果层会让日志整段
+    /// 缺行，看起来像循环根本没在跑。
+    void PerfMaybeFlushLoop(int now) {
         if (perfLoopAt == 0) { perfLoopAt = now; }
         int span = now - perfLoopAt;
         if (span < 2000) { return; }
@@ -4282,6 +4464,7 @@ class App {
             + " ev_move=" + Convert.ToString(perfEvMove)
             + " ev_other=" + Convert.ToString(perfEvOther)
             + " fx_ticks=" + Convert.ToString(perfFxTicks)
+            + " fx_only=" + Convert.ToString(perfFxOnlyTicks)
             + " fx_tick_ms=" + Convert.ToString(perfFxTickMs)
             + " fx_tick_us=" + Convert.ToString(perfFxTickUs)
             + " fx_restore_us=" + Convert.ToString(perfFxRestoreUs)
@@ -4300,6 +4483,7 @@ class App {
         perfEvMove = 0;
         perfEvOther = 0;
         perfFxTicks = 0;
+        perfFxOnlyTicks = 0;
         perfFxTickMs = 0;
         perfFxTickUs = 0;
         perfFxRestoreUs = 0;
@@ -4586,6 +4770,7 @@ class App {
         blocksInputBelow = false;
         menuBlockPrevious = menuBlock;
         menuBlock = false;
+        frameSeq = frameSeq + 1;
         clickClaimed = false;
         hitTester.Clear();
         glassRects.Clear();
@@ -4616,6 +4801,10 @@ class App {
             // 下方内容照常绘制；裁剪将其限制在
             // 损坏条带内，上一帧未触及的像素得以保留。
             canvas.PushClip(dmgX, dmgY, dmgW, dmgH);
+            presentX = dmgX;
+            presentY = dmgY;
+            presentW = dmgW;
+            presentH = dmgH;
         }
         if (shapeMode != 0) {
             // 实时缩放露出的边距由外壳按此色填充（见
@@ -4796,8 +4985,21 @@ class App {
     /// 本帧尚未运行，意味着询问的代码渲染在其下方。
     /// 模态自身的内部在其遮罩之后渲染，那里此函数为 true，
     /// 因此点击永远不会穿过模态落到下面的页面。
+    /// 一次释放只属于它首次被读到的那一帧。持续动画（星空、
+    /// spinner）会在下个事件到来前反复出帧，而 EventKind 停留
+    /// 在 3；不锁定的话按钮会在每个动画帧重新触发。同一帧内
+    /// 多个表面照常都能读到（绑定只记帧序，不做独占）。
+    bool ClickFrameCurrent() {
+        if (this.clickSeenSeq < 0) { this.clickSeenSeq = this.frameSeq; }
+        return this.clickSeenSeq == this.frameSeq;
+    }
+
+    /// 当前帧序号（BeginFrame 递增）。诊断用。
+    int FrameSeq() { return frameSeq; }
+
     bool ClickAvailable() {
         if (this.EventKind() != 3 || clickClaimed) { return false; }
+        if (!this.ClickFrameCurrent()) { return false; }
         // 只有主按钮算点击。右键的释放绝不能
         // 被当作点击，否则刚在其上打开上下文菜单的控件
         // 也会被选中/切换，菜单在同一次手势中被关闭。
@@ -4814,6 +5016,9 @@ class App {
 
     /// 将当前点击标记为本帧余下时间内已被消费。
     void ClaimClick() { clickClaimed = true; }
+
+    /// 当前释放是否已被某表面认领（见 ClaimClick）。
+    bool ClickClaimed() { return clickClaimed; }
 
     /// 当前点击（mouse-up）落到的控件 id，无则 -1。
     int ClickTarget() { return hitTester.AnchorIdOf(1); }
