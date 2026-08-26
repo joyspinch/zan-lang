@@ -1682,6 +1682,7 @@ typedef struct zan_present_shadow_s {
 } zan_present_shadow_t;
 
 static zan_present_shadow_t *g_present_shadows = NULL;
+static int g_present_log = -1;   /* lazy: ZAN_PRESENT_LOG */
 
 #define ZAN_DIFF_TILE 64
 
@@ -1797,6 +1798,9 @@ EXPORT i32 zan_gui_atomic_present(void *hwnd, i32 surface_id);
 EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
                                i32 rect_count) {
 #ifdef _WIN32
+    if (g_present_log < 0) {
+        g_present_log = getenv("ZAN_PRESENT_LOG") ? 1 : 0;
+    }
     if (!hwnd || surface_id < 0 || surface_id >= g_surface_count) return -1;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s || !s->pixels) return -1;
@@ -1822,9 +1826,17 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
     int calls = 0;
 
     zan_present_shadow_t *sh = present_shadow(hwnd, w, h, 1);
-    int force_full = (rect_count < 0) || !sh;
+    /* rect_count < 0 (the shell's "forced full": WM_PAINT, app-declared whole
+     * frames, pad frames) does NOT bypass the diff: the shadow tracks what was
+     * last uploaded to the screen, not what the app rendered, so it stays
+     * valid across occlusions and full re-renders -- a WM_PAINT restore only
+     * needs the rows that actually differ. Apps that re-render everything
+     * every frame (the gallery loop, games) would otherwise stream their full
+     * window every frame, which is exactly the tearing this path exists to
+     * prevent. */
+    int force_full = !sh;
 
-    if (!force_full && rect_count == 0) {
+    if (!force_full && rect_count <= 0) {
         /* Tile diff against the last presented frame. */
         int tw = (w + ZAN_DIFF_TILE - 1) / ZAN_DIFF_TILE;
         int th = (h + ZAN_DIFF_TILE - 1) / ZAN_DIFF_TILE;
@@ -1855,6 +1867,15 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
                     changed[(size_t)ty * tw + tx] = 1;
                     changed_tiles++;
                 }
+            }
+        }
+        if (g_present_log) {
+            FILE *lf = fopen("present_log.txt", "a");
+            if (lf) {
+                fprintf(lf, "gdi t=%lu tiles=%d of %d hwnd=%p\n",
+                        (unsigned long)GetTickCount(), changed_tiles,
+                        tw * th, hwnd);
+                fclose(lf);
             }
         }
         if (changed_tiles > 0) {
