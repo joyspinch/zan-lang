@@ -43,9 +43,11 @@ class SqlitePool {
     }
 
     /// <summary>借出一个连接：复用空闲连接，未达上限则新建，
-    /// 否则挂起协程，直到有连接被归还。
+    /// 否则挂起协程，直到有连接被归还。饱和等待有硬上限
+    /// （见 <see cref="PoolWait"/>）：超时返回 null，绝不定死。
     /// 池已关闭后返回 null。</summary>
     async SqliteConnection AcquireAsync() {
+        PoolWait wait = new PoolWait();
         while (true) {
             if (this.core.IsClosed()) {
                 return null;
@@ -77,10 +79,11 @@ class SqlitePool {
                 this.core.Borrow(opened);
                 return opened;
             }
-            // 连接池已满：挂起等待连接被归还。
-            this.core.EnterWait();
-            await this.core.Waiter().Wait();
-            this.core.LeaveWait();
+            // 连接池已满：交给共享的有界等待（见 PoolWait），
+            // 预算耗尽以 null 快速失败。
+            if (!await this.core.WaitForRelease(wait)) {
+                return null;
+            }
         }
         return null;
     }

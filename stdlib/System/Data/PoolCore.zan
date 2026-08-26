@@ -26,8 +26,16 @@ namespace System.Data;
 /// 临界区里绝不 await：所有方法都是同步的，锁只覆盖几条
 /// 列表/计数操作，因此持锁期间协程不会被挂起，也不会
 /// 把锁带过调度点。停泊逻辑留在驱动连接池中——<c>EnterWait</c>、
-/// <c>await core.Waiter().Wait()</c>、<c>LeaveWait</c>——因此挂起的协程
+/// <c>await core.WaitForRelease(...)</c>、<c>LeaveWait</c>——因此挂起的协程
 /// 正是调用方所等待的那个协程，等待的 await 也发生在锁之外。
+///
+/// 「等不到连接」对单个获取者必须有界：饱和等待由
+/// <see cref="PoolWait"/> / <see cref="WaitForRelease"/> 统一兜底——先停泊在
+/// 事件门上（归还即醒），门等次数用尽后转短轮询直至预算耗尽，
+/// 返回 false 让调用方快速失败。任何嵌套租借（持一条再等第二条）
+/// 或漏归还因此只退化成个别请求拿不到连接，而不是把协程永久停在
+/// 门上把整个池拖死（实测教训：协程死锁时 CPU 空转、端口照收、
+/// 全站无响应）。
 /// </summary>
 class PoolCore<T> {
     int maxSize;
@@ -280,4 +288,62 @@ class PoolCore<T> {
             this.gate.Signal();
         }
     }
+
+    /// <summary>池饱和时的一轮有界等待，所有驱动连接池共用。
+    ///
+    /// 先停泊在事件门上（零轮询，归还即醒；每轮门等自带
+    /// <see cref="PoolWait.GateWaitMs"/> 看门狗，Signal 丢失也必然复查）；
+    /// 门等次数用尽仍拿不到——说明持有者迟迟不还：健康系统里一次
+    /// 归还在毫秒级——转为短轮询直至预算耗尽，返回 false 让调用方
+    /// 快速失败（应答「数据库暂不可用」），绝不定死。等待次数与预算
+    /// 记在调用方自备的 <see cref="PoolWait"/> 里，跨整个获取循环累计。
+    /// </summary>
+    async bool WaitForRelease(PoolWait w) {
+        if (w.gated < PoolWait.MaxGateWaits) {
+            this.EnterWait();
+            await this.Waiter().Wait(PoolWait.GateWaitMs);
+            this.LeaveWait();
+            w.gated = w.gated + 1;
+            return true;
+        }
+        await Task.Delay(PoolWait.PollStepMs);
+        w.budget = w.budget - PoolWait.PollStepMs;
+        return w.budget > 0;
+    }
+}
+
+/// <summary>一个获取者在饱和等待期的进度：已发生的门等次数与剩余的
+/// 轮询预算。获取循环外创建一次，传给每一轮
+/// <see cref="PoolCore{T}.WaitForRelease"/>；策略常数也集中在这里，
+/// 是全仓库连接池唯一的饱和政策出处。</summary>
+class PoolWait {
+    /// <summary>已消耗的事件门等次数。计数语义的门加上调用方的复查
+    /// 循环保证不丢失唤醒；超过上限说明持有者整体停滞（嵌套租借、
+    /// 漏归还），转轮询兜底。</summary>
+    int gated;
+
+    /// <summary>剩余的短轮询预算（毫秒），耗尽即放弃本次获取。</summary>
+    int budget;
+
+    PoolWait() {
+        this.gated = 0;
+        this.budget = PoolWait.PollBudgetMs;
+    }
+
+    /// <summary>单次门等的看门狗上限（毫秒）。Signal 正常到达时等待者
+    /// 立即醒来，不受此值影响；它只是唤醒丢失时的保险丝——最坏情况
+    /// 下每轮门等多拖这么久就复查一次，谁也不会永久停在门上。</summary>
+    static int GateWaitMs = 250;
+
+    /// <summary>门等次数上限：健康系统里归还远快于此，用满意味着池
+    /// 已被病态持有拖住。</summary>
+    static int MaxGateWaits = 64;
+
+    /// <summary>轮询步长（毫秒）：预算耗尽前最后的挣扎，也让等待者
+    /// 周期性重查 IsClosed/空闲列表。</summary>
+    static int PollStepMs = 20;
+
+    /// <summary>轮询总预算（毫秒）：这是进程级自愈兜底的一部分——
+    /// 病态持有的最坏情形下，单个请求最多挂这么久就以 null 放弃。</summary>
+    static int PollBudgetMs = 10000;
 }
