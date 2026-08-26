@@ -108,9 +108,11 @@ partial class Designer {
     // 风格），1 = 自由（绝对定位的设计画布，场景设计器风格）。
     int layoutMode;
     // 自由画布缩放，以设计尺寸的千分比表示（1000 = 100%，0 = 适配
-    // 到编辑器视口）。默认 0（适应）：高 DPI 屏上一张 1000 逻辑像素
-    // 宽的设计按 1:1 根本放不进编辑面板，只会露出中间一块空白；
-    // 「适应」每帧按当前视口重算，且从不放大超过 100%。
+    // 到编辑器视口）。默认 1000：100% 的语义是"目标设备 1:1"——
+    // 渲染比例 = 视图缩放 × dpiScale，任何显示比例的机器打开同一张
+    // 设计，看到的逻辑布局都一致；「适应」把显示器 DPI 烘进缩放
+    // 结果（同一张设计在不同 DPI 屏上适应出的比例不同），只作为
+    // 缩放下拉里的一档，不作为默认视图。
     int winZoom;
     // 最近一帧「适应」算出的实际缩放（千分比，1000 = 100%），供功能区
     // 显示与从 Fit 缩放的起步值使用。
@@ -144,6 +146,15 @@ partial class Designer {
     /// 自由画布上的附加选中项（Ctrl+点击 / 框选），
     /// `sel` 是其中的主选中项（手柄和检查器跟着它）。
     List<FormField> freeExtra;
+    // --- 撤销 / 重做与剪贴板 -------------------------------------
+    /// 整份设计 JSON 快照（最多 60 份）：任何修改前压栈，
+    /// 撤销时把当前快照压回重做栈再载入栈顶。和场景设计器
+    /// 同一套模型——SaveJson/LoadJson 就是文档的完整往返。
+    List<string> undoStack;
+    List<string> redoStack;
+    /// 剪贴板：复制选中项的 FieldJson 片段，粘贴时重建
+    /// （容器连子级一起）。
+    List<string> clipFields;
     bool freeHand;       // 抓手模式：左键拖动即平移画布
     bool freeMarquee;    // 正在空白处拉框选
     int freeMqSX;        // 框选起点（屏幕坐标）
@@ -322,8 +333,9 @@ partial class Designer {
         this.activeContainer = null;
         this.palFolded = new List<string>();
         this.layoutMode = 0;
-        // 0 = 适应视口：打开设计先看到整张设计，再手动缩放。
-        this.winZoom = 0;
+        // 1000 = 100%：打开设计按真实尺寸编辑，超出视口的部分平移查看；
+        // 「适应」仍是缩放下拉里的一档，要看全貌时手动切。
+        this.winZoom = 1000;
         this.lastFitPct = 1000;
         this.zoomMenuOpen = false;
         this.zoomMenuX = 0;
@@ -349,6 +361,9 @@ partial class Designer {
         this.freePanY = 0;
         this.freePanning = false;
         this.freeExtra = new List<FormField>();
+        this.undoStack = new List<string>();
+        this.redoStack = new List<string>();
+        this.clipFields = new List<string>();
         this.freeHand = false;
         this.freeMarquee = false;
         this.freeMqSX = 0;
@@ -504,6 +519,7 @@ partial class Designer {
     /// 标签页）；否则追加到顶层表单。添加容器后会把它设为活动
     /// 容器，可以立刻往里面放置组件。
     void AddField(int ftype) {
+        this.PushUndo();
         this.DropDeadRefs();
         FormField f = FormField.New(ftype, seq);
         seq = seq + 1;
@@ -682,6 +698,7 @@ partial class Designer {
 
     void MoveSel(int delta) {
         if (sel == null) { return; }
+        this.PushUndo();
         FormField pc = ParentContainerOf(sel);
         if (pc == null) {
             int idx = IndexIn(fields, sel);
@@ -737,7 +754,8 @@ partial class Designer {
     /// 把多选里其余成员的宽/高设成主选中项的（0=等宽，1=等高），
     /// 和场景设计器的「尺寸」组同义。
     void SizeSelGroup(int mode) {
-        if (sel == null) { return; }
+        if (sel == null || freeExtra.Count == 0) { return; }
+        this.PushUndo();
         for (int i = 0; i < freeExtra.Count; i = i + 1) {
             FormField f = freeExtra[i];
             if (mode == 0) { f.fw = sel.LayoutW(); }
@@ -757,6 +775,7 @@ partial class Designer {
         int to = 0;
         if (top == 0) { to = list.Count - 1; }
         if (to == idx) { return; }
+        this.PushUndo();
         list = ListMove(list, idx, to);
         if (pc == null) { fields = list; } else { pc.kids = list; }
     }
@@ -764,6 +783,7 @@ partial class Designer {
     /// 复制选中项，副本偏移一点并成为新的选中项。
     void DuplicateSel() {
         if (sel == null) { return; }
+        this.PushUndo();
         FormField nf = sel.Clone();
         nf.fx = sel.LayoutX() + 16;
         nf.fy = sel.LayoutY() + 16;
@@ -779,10 +799,140 @@ partial class Designer {
         msg = Designer.T("duplicated", "已复制");
     }
 
+    // --- 撤销 / 重做（整份设计 JSON 快照，同场景设计器） ----------
+
+    /// 记录当前设计；在任何修改前调用。当前状态和栈顶相同
+    /// （上一次压栈后设计没真正变过）时不重复压栈。
+    void PushUndo() {
+        string j = this.SaveJson();
+        if (undoStack.Count > 0 && undoStack[undoStack.Count - 1] == j) {
+            return;
+        }
+        undoStack.Add(j);
+        if (undoStack.Count > 60) { undoStack.RemoveAt(0); }
+        redoStack = new List<string>();
+    }
+
+    /// 拖拽/缩放结束（或任何「压了栈但没改成」的操作收尾）时调用：
+    /// 设计和栈顶一致说明这次操作没有实际改动，把栈顶退掉，
+    /// 免得 Ctrl+Z 第一脚踩空。
+    void PopUndoIfUnchanged() {
+        if (undoStack.Count > 0 && undoStack[undoStack.Count - 1] == this.SaveJson()) {
+            undoStack.RemoveAt(undoStack.Count - 1);
+        }
+    }
+
+    void Undo() {
+        if (undoStack.Count == 0) {
+            msg = Designer.T("nothing to undo", "没有可撤销的操作");
+            return;
+        }
+        redoStack.Add(this.SaveJson());
+        string j = undoStack[undoStack.Count - 1];
+        undoStack.RemoveAt(undoStack.Count - 1);
+        this.LoadJson(j);
+        msg = Designer.T("undone", "已撤销");
+    }
+
+    void Redo() {
+        if (redoStack.Count == 0) {
+            msg = Designer.T("nothing to redo", "没有可重做的操作");
+            return;
+        }
+        undoStack.Add(this.SaveJson());
+        string j = redoStack[redoStack.Count - 1];
+        redoStack.RemoveAt(redoStack.Count - 1);
+        this.LoadJson(j);
+        msg = Designer.T("redone", "已重做");
+    }
+
+    // --- 剪贴板：复制 / 粘贴选中项（容器连子级一起） --------------
+
+    void CopySel() {
+        if (sel == null) {
+            msg = Designer.T("nothing to copy", "没有可复制的内容");
+            return;
+        }
+        List<FormField> all = new List<FormField>();
+        all.Add(sel);
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            if (freeExtra[i] != sel) { all.Add(freeExtra[i]); }
+        }
+        clipFields = new List<string>();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            clipFields.Add(this.FieldJson(all[i]).PrettyToJson());
+        }
+        msg = Designer.T("copied ", "已复制 ")
+            + Convert.ToString(clipFields.Count)
+            + Designer.T(" component(s)", " 个组件");
+    }
+
+    /// 粘贴的组件整组换新名字（含容器子级），避免和原组件、
+    /// 以及代码后置里的字段撞名。
+    void RenameFresh(FormField f) {
+        f.fname = FormField.TypeKey(f.ftype) + Convert.ToString(seq);
+        f.name = f.fname;
+        seq = seq + 1;
+        for (int i = 0; i < f.kids.Count; i = i + 1) {
+            this.RenameFresh(f.kids[i]);
+        }
+    }
+
+    /// 粘贴到原父容器（没有选中就贴到顶层），整组偏移 16px，
+    /// 贴完的组成为新的选中组。
+    void PasteClip() {
+        if (clipFields == null || clipFields.Count == 0) {
+            msg = Designer.T("clipboard is empty", "剪贴板是空的");
+            return;
+        }
+        this.PushUndo();
+        FormField pc = null;
+        if (sel != null) { pc = ParentContainerOf(sel); }
+        List<FormField> list = fields;
+        if (pc != null) { list = pc.kids; }
+        this.ClearExtraSel();
+        sel = null;
+        for (int i = 0; i < clipFields.Count; i = i + 1) {
+            JsonValue o = JsonValue.ParseLenient(clipFields[i]);
+            if (o == null || !o.IsObject()) { continue; }
+            FormField nf = this.FieldFromJson(o);
+            nf.fx = nf.fx + 16;
+            nf.fy = nf.fy + 16;
+            this.RenameFresh(nf);
+            list.Add(nf);
+            if (sel == null) { sel = nf; } else { freeExtra.Add(nf); }
+        }
+        if (pc != null) { activeContainer = pc; }
+        inspTab = 0;
+        msg = Designer.T("pasted ", "已粘贴 ")
+            + Convert.ToString(clipFields.Count)
+            + Designer.T(" component(s)", " 个组件");
+    }
+
+    /// 方向键微调整个多选组（自由布局；Shift=1px）。
+    void NudgeSel(int dx, int dy) {
+        if (sel == null) { return; }
+        this.PushUndo();
+        this.NudgeOne(sel, dx, dy);
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            FormField ef = freeExtra[i];
+            if (ef == null || ef.locked) { continue; }
+            this.NudgeOne(ef, dx, dy);
+        }
+    }
+
+    void NudgeOne(FormField f, int dx, int dy) {
+        f.fx = f.LayoutX() + dx;
+        f.fy = f.LayoutY() + dy;
+        if (f.fx < 0) { f.fx = 0; }
+        if (f.fy < 0) { f.fy = 0; }
+    }
+
     /// 锁定/解锁整个多选：以主选中项的状态取反，其余成员跟随，
     /// 这样一组组件的锁定状态始终一致。
     void ToggleLockSel() {
         if (sel == null) { return; }
+        this.PushUndo();
         bool on = !sel.locked;
         sel.locked = on;
         for (int i = 0; i < freeExtra.Count; i = i + 1) {
@@ -796,6 +946,7 @@ partial class Designer {
     /// 无论从功能区按钮还是 Delete 键触发，都走这里，
     /// 保证多选里的每一个都被删掉（而不是只删主选中项）。
     void DeleteSelGroup() {
+        if (sel != null || freeExtra.Count > 0) { this.PushUndo(); }
         dropContainer = null;
         activeContainer = null;
         dragging = false;
@@ -929,12 +1080,41 @@ partial class Designer {
         }
 
         hoverFt = -1;
-        // Delete 删除选中组件；当文本框持有键盘焦点时
-        // 忽略该操作，避免影响输入。
-        if (!preview && ek == 4 && app.window.EventKeyCode() == 46
-            && sel != null && app.focus.focusedId < 0) {
-            DeleteSelGroup();
-            app.RequestRedraw();
+        // 键盘编辑：Delete 删除选中组，Ctrl+Z/Y 撤销重做，
+        // Ctrl+C/V 复制粘贴，Ctrl+D 复制副本，方向键按网格步长
+        // 微调整组（Shift = 1px，仅自由布局）。文本框持有键盘
+        // 焦点时全部忽略，避免影响输入。Ctrl+字母以控制码到达
+        //（^Z=26 ^Y=25 ^C=3 ^V=22 ^D=4），和场景设计器一致。
+        if (!preview && app.focus.focusedId < 0 && !app.PointerCaptured()) {
+            if (ek == 6) {
+                int cc = app.window.EventKeyCode();
+                if (cc == 26) { this.Undo(); app.RequestRedraw(); }
+                else if (cc == 25) { this.Redo(); app.RequestRedraw(); }
+                else if (cc == 3) { this.CopySel(); app.RequestRedraw(); }
+                else if (cc == 22) { this.PasteClip(); app.RequestRedraw(); }
+                else if (cc == 4 && sel != null) { this.DuplicateSel(); app.RequestRedraw(); }
+            } else if (ek == 4) {
+                int kc = app.window.EventKeyCode();
+                if (kc == 46 && sel != null) {
+                    DeleteSelGroup();
+                    app.RequestRedraw();
+                } else if (layoutMode == 1 && sel != null
+                        && kc >= 37 && kc <= 40) {
+                    int step = 1;
+                    if (snapGrid && gridSize > 0
+                        && !Modifiers.HasShift(app.window.EventMods())) {
+                        step = gridSize;
+                    }
+                    int ndx = 0;
+                    int ndy = 0;
+                    if (kc == 37) { ndx = 0 - step; }
+                    if (kc == 39) { ndx = step; }
+                    if (kc == 38) { ndy = 0 - step; }
+                    if (kc == 40) { ndy = step; }
+                    this.NudgeSel(ndx, ndy);
+                    app.RequestRedraw();
+                }
+            }
         }
         if (jsonOpen) {
             RenderJsonPanel(app, c, t, canX, bodyY, canW, bodyH);

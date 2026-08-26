@@ -70,8 +70,31 @@ partial class Designer {
         }
         groups.Add(ga);
 
-        // --- 编辑 ---
+        // --- 编辑：撤销重做、剪贴板、复制副本、删除、锁定 ---
         RibbonGroup ged = new RibbonGroup(Designer.T("Edit", "编辑"));
+        RibbonItem und = RibbonItem.Small("undo", Designer.T("Undo", "撤销"));
+        und.SetTip(Designer.T("Undo the last change (Ctrl+Z)",
+            "撤销上一次修改（Ctrl+Z）"));
+        und.SetEnabled(undoStack.Count > 0);
+        ged.Add(und);
+        acts.Add("undo");
+        RibbonItem red = RibbonItem.Small("redo", Designer.T("Redo", "重做"));
+        red.SetTip(Designer.T("Redo (Ctrl+Y)", "重做（Ctrl+Y）"));
+        red.SetEnabled(redoStack.Count > 0);
+        ged.Add(red);
+        acts.Add("redo");
+        RibbonItem cp = RibbonItem.Small("copy", Designer.T("Copy", "复制"));
+        cp.SetTip(Designer.T("Copy the selection (Ctrl+C)",
+            "复制选中项（Ctrl+C）"));
+        cp.SetEnabled(hasSel);
+        ged.Add(cp);
+        acts.Add("copy");
+        RibbonItem pa = RibbonItem.Small("paste", Designer.T("Paste", "粘贴"));
+        pa.SetTip(Designer.T("Paste (Ctrl+V)", "粘贴（Ctrl+V）"));
+        bool hasClip = clipFields != null && clipFields.Count > 0;
+        pa.SetEnabled(hasClip);
+        ged.Add(pa);
+        acts.Add("paste");
         RibbonItem dup = RibbonItem.Small("copy", Designer.T("Duplicate", "复制"));
         dup.SetEnabled(hasSel);
         ged.Add(dup);
@@ -177,6 +200,14 @@ partial class Designer {
     void RunRibbon(App app, string act) {
         if (act == "preview") {
             preview = !preview;
+        } else if (act == "undo") {
+            this.Undo();
+        } else if (act == "redo") {
+            this.Redo();
+        } else if (act == "copy") {
+            this.CopySel();
+        } else if (act == "paste") {
+            this.PasteClip();
         } else if (act == "delete") {
             DeleteSelGroup();
         } else if (act == "fwd") {
@@ -274,6 +305,7 @@ partial class Designer {
     /// （主选中项所在框的边）。
     void AlignSelGroup(int mode) {
         if (sel == null) { return; }
+        this.PushUndo();
         FormField keep = sel;
         List<FormField> extra = freeExtra;
         this.AlignSel(mode);
@@ -867,6 +899,50 @@ partial class Designer {
         return null;
     }
 
+    /// 框选收集：递归收集与设计空间矩形相交的可见组件（含容器
+    /// 内的子组件）。px/py 为父链累计原点；Tabs 只看当前显示的
+    /// 标签页——看不见的页里的组件也框不中，与点选一致。
+    void MarqueeCollect(List<FormField> lst, int px, int py,
+                        int selL, int selT, int selR, int selB,
+                        List<FormField> got) {
+        for (int i = 0; i < lst.Count; i = i + 1) {
+            FormField f = lst[i];
+            if (f.IsNonVisual()) { continue; }
+            int ex = px + f.LayoutX();
+            int ey = py + f.LayoutY();
+            bool touches = ex < selR && ex + f.LayoutW() > selL
+                && ey < selB && ey + f.LayoutH() > selT;
+            if (touches) { got.Add(f); }
+            if (f.IsContainer() && f.KidCount() > 0) {
+                int kidTab = 0 - 1;
+                if (f.kind == "Tabs") { kidTab = Designer.TabActivePage(f); }
+                List<FormField> kids = f.kids;
+                if (kidTab >= 0) {
+                    kids = new List<FormField>();
+                    for (int k = 0; k < f.kids.Count; k = k + 1) {
+                        if (f.kids[k].childTab == kidTab) { kids.Add(f.kids[k]); }
+                    }
+                }
+                this.MarqueeCollect(kids, ex + this.KidInsetX(f),
+                    ey + this.KidInsetY(f), selL, selT, selR, selB, got);
+            }
+        }
+    }
+
+    /// `f` 的某个祖先是否也在 `got` 里——框选时容器和它的子级
+    /// 同时相交只留容器：拖动父级本来就带着子级，两组一起选
+    /// 会把子级移两次。
+    bool HasAncestorIn(FormField f, List<FormField> got) {
+        FormField pc = ParentContainerOf(f);
+        while (pc != null) {
+            for (int i = 0; i < got.Count; i = i + 1) {
+                if (got[i] == pc) { return true; }
+            }
+            pc = ParentContainerOf(pc);
+        }
+        return false;
+    }
+
     static int FreeHandleX(int hn, int ex, int ew) {
         if (hn == 2 || hn == 3 || hn == 4) { return ex + ew; }
         if (hn == 0 || hn == 6 || hn == 7) { return ex; }
@@ -1205,6 +1281,7 @@ partial class Designer {
                     int hy = FreeHandleY(hn, sy, sh2);
                     if (InRect(app.mouseX, app.mouseY,
                             hx - hs, hy - hs, hs * 2, hs * 2)) {
+                        this.PushUndo();
                         freeResizing = true;
                         freeResizeH = hn;
                         started = true;
@@ -1236,6 +1313,7 @@ partial class Designer {
                         // 锁定：选得中、改得了属性，就是拖不动。
                         msg = Designer.T("locked", "已锁定");
                     } else if (free) {
+                        this.PushUndo();
                         freeDragging = true;
                         freeDragDx = mDesX - (freeSelPX + hit.LayoutX());
                         freeDragDy = mDesY - (freeSelPY + hit.LayoutY());
@@ -1243,6 +1321,7 @@ partial class Designer {
                         // 流式布局：拖动就是重排（拖到容器上则移入）。
                         int ti = IndexIn(fields, this.TopLevelOf(hit));
                         if (ti >= 0) {
+                            this.PushUndo();
                             dragging = true;
                             dragFromPalette = false;
                             dragMoved = false;
@@ -1288,10 +1367,34 @@ partial class Designer {
             }
             this.freeGuideX = 0 - 1;
             this.freeGuideY = 0 - 1;
-            bool topLevel = freeSelPX == 0 && freeSelPY == 0;
-            if (topLevel && !Modifiers.HasAlt(app.window.EventMods())) {
-                newLeft = this.FreeSnapX(app, newLeft, sel.LayoutW(), dw, sel, psMilli);
-                newTop = this.FreeSnapY(app, newTop, sel.LayoutH(), dh, sel, psMilli);
+            if (!Modifiers.HasAlt(app.window.EventMods())) {
+                // 磁吸对嵌套组件同样生效：兄弟取自父容器，参考系是
+                // 父内容框（子坐标本来就是父相对的），画布边线换成
+                // 父框的边/中线——「贴父容器边」和「贴兄弟边」都成立。
+                FormField pc = ParentContainerOf(sel);
+                List<FormField> sibs = fields;
+                int baseX = 0;
+                int baseY = 0;
+                int spanW = dw;
+                int spanH = dh;
+                if (pc != null) {
+                    sibs = pc.kids;
+                    baseX = freeSelPX;
+                    baseY = freeSelPY;
+                    spanW = pc.LayoutW();
+                    spanH = pc.LayoutH();
+                }
+                int tol = this.FreeSnapTol(app, psMilli);
+                List<int> lx = Designer.FreeSnapLines(true, sibs, sel, spanW);
+                List<int> rx = Designer.SnapAxis(newLeft - baseX,
+                    sel.LayoutW(), lx, tol);
+                newLeft = rx[0] + baseX;
+                if (rx[1] >= 0) { this.freeGuideX = rx[1] + baseX; }
+                List<int> ly = Designer.FreeSnapLines(false, sibs, sel, spanH);
+                List<int> ry = Designer.SnapAxis(newTop - baseY,
+                    sel.LayoutH(), ly, tol);
+                newTop = ry[0] + baseY;
+                if (ry[1] >= 0) { this.freeGuideY = ry[1] + baseY; }
             }
             int mvdx = (newLeft - freeSelPX) - sel.LayoutX();
             int mvdy = (newTop - freeSelPY) - sel.LayoutY();
@@ -1339,6 +1442,52 @@ partial class Designer {
             if (newB - newT < 8) {
                 if (hn == 0 || hn == 1 || hn == 2) { newT = newB - 8; } else { newB = newT + 8; }
             }
+            // 移动中的边做磁吸：和兄弟的边/中线、父框边对齐时吸上去
+            // （拖拽时的同一套参考线几何）。Alt 临时关闭。
+            if (!Modifiers.HasAlt(app.window.EventMods())) {
+                FormField pc = ParentContainerOf(sel);
+                List<FormField> sibs = fields;
+                int baseX = 0;
+                int baseY = 0;
+                int spanW = dw;
+                int spanH = dh;
+                if (pc != null) {
+                    sibs = pc.kids;
+                    baseX = freeSelPX;
+                    baseY = freeSelPY;
+                    spanW = pc.LayoutW();
+                    spanH = pc.LayoutH();
+                }
+                int tol = this.FreeSnapTol(app, psMilli);
+                this.freeGuideX = 0 - 1;
+                this.freeGuideY = 0 - 1;
+                if (hn == 0 || hn == 6 || hn == 7) {
+                    List<int> lx = Designer.FreeSnapLines(true, sibs, sel, spanW);
+                    List<int> r = Designer.SnapAxis(newL - baseX, 0, lx, tol);
+                    newL = r[0] + baseX;
+                    if (r[1] >= 0) { this.freeGuideX = r[1] + baseX; }
+                    if (newR - newL < 8) { newL = newR - 8; }
+                } else if (hn == 2 || hn == 3 || hn == 4) {
+                    List<int> lx = Designer.FreeSnapLines(true, sibs, sel, spanW);
+                    List<int> r = Designer.SnapAxis(newR - baseX, 0, lx, tol);
+                    newR = r[0] + baseX;
+                    if (r[1] >= 0) { this.freeGuideX = r[1] + baseX; }
+                    if (newR - newL < 8) { newR = newL + 8; }
+                }
+                if (hn == 0 || hn == 1 || hn == 2) {
+                    List<int> ly = Designer.FreeSnapLines(false, sibs, sel, spanH);
+                    List<int> r = Designer.SnapAxis(newT - baseY, 0, ly, tol);
+                    newT = r[0] + baseY;
+                    if (r[1] >= 0) { this.freeGuideY = r[1] + baseY; }
+                    if (newB - newT < 8) { newT = newB - 8; }
+                } else if (hn == 4 || hn == 5 || hn == 6) {
+                    List<int> ly = Designer.FreeSnapLines(false, sibs, sel, spanH);
+                    List<int> r = Designer.SnapAxis(newB - baseY, 0, ly, tol);
+                    newB = r[0] + baseY;
+                    if (r[1] >= 0) { this.freeGuideY = r[1] + baseY; }
+                    if (newB - newT < 8) { newB = newT + 8; }
+                }
+            }
             sel.fx = newL - freeSelPX;
             sel.fy = newT - freeSelPY;
             sel.fw = newR - newL;
@@ -1363,16 +1512,13 @@ partial class Designer {
                 int selB = (mqy + mqh - oy) * 1000 / psMilli;
                 this.ClearExtraSel();
                 sel = null;
-                for (int mi = 0; mi < fields.Count; mi = mi + 1) {
-                    FormField mf = fields[mi];
-                    if (mf.IsNonVisual()) { continue; }
-                    bool touches = mf.LayoutX() < selR
-                        && mf.LayoutX() + mf.LayoutW() > selL
-                        && mf.LayoutY() < selB
-                        && mf.LayoutY() + mf.LayoutH() > selT;
-                    if (touches) {
-                        if (sel == null) { sel = mf; } else { freeExtra.Add(mf); }
-                    }
+                // 递归收集：容器里的子组件同样框得中（Tabs 只看
+                // 当前页），和场景设计器、点选的行为一致。
+                List<FormField> got = new List<FormField>();
+                this.MarqueeCollect(fields, 0, 0, selL, selT, selR, selB, got);
+                for (int gi = 0; gi < got.Count; gi = gi + 1) {
+                    if (this.HasAncestorIn(got[gi], got)) { continue; }
+                    if (sel == null) { sel = got[gi]; } else { freeExtra.Add(got[gi]); }
                 }
                 freeMarquee = false;
                 if (sel != null) {
@@ -1385,7 +1531,9 @@ partial class Designer {
         }
 
         // 任意位置松开指针即结束拖拽/调整大小/平移，并撤掉参考线。
+        // 指针没动过（一次点击）的话设计没变，把按下时压的栈退掉。
         if (ek == 3) {
+            if (!dragging) { this.PopUndoIfUnchanged(); }
             freeDragging = false;
             freeResizing = false;
             freePanning = false;
@@ -1494,6 +1642,7 @@ partial class Designer {
     /// 在设计空间 (dx, dy) 处把面板字段添加到自由画布，
     /// 新元素以光标为中心；光标下有容器则成为它的子级。
     void DropFreePalette(int dx, int dy) {
+        this.PushUndo();
         int ftype = dragKind;
         FormField cont = this.FreeDropContainer(dx, dy);
         int cx = 0;
