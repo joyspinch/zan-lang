@@ -68,10 +68,73 @@ class AuthUser {
             WebApp.NowSeconds());
     }
 
-    /* 账号当前 token 版本号；无法登录时返回 -1。token 版本不同即作废，token 本身不含密码材料。*/
+    /* 账号当前 token 版本号；无法登录时返回 -1。token 版本不同即作废，token 本身不含密码材料。
+       版本号走短 TTL 缓存：每个带 cookie 的请求都要校验一次，直查数据库会让
+       每个认证请求消耗两次池借用，白白加倍池压力。代价是 bump tokenVersion
+       后旧 token 最迟再有效 VerTtlSec 秒——对管理动作足够快，且 Forget 时主动失效。*/
+    static int VerTtlSec = 30;
+
+    static List<string> verUids = new List<string>();
+    static List<int> verVals = new List<int>();
+    static List<int> verGoodUntil = new List<int>();
+
+    /* 命中返回缓存的版本号，过期/缺失返回 -1。 */
+    static int CachedVersion(string uid, int now) {
+        lock (AuthUser.verUids) {
+            for (int i = 0; i < AuthUser.verUids.Count; i = i + 1) {
+                if (AuthUser.verUids[i] == uid && AuthUser.verGoodUntil[i] > now) {
+                    return AuthUser.verVals[i];
+                }
+            }
+        }
+        return -1;
+    }
+
+    static void StoreVersion(string uid, int version, int now) {
+        lock (AuthUser.verUids) {
+            /* 顺带清扫过期项：列表长度受活跃账号约束，线性扫描足够。 */
+            int i = 0;
+            while (i < AuthUser.verUids.Count) {
+                if (AuthUser.verGoodUntil[i] <= now) {
+                    AuthUser.verUids.RemoveAt(i);
+                    AuthUser.verVals.RemoveAt(i);
+                    AuthUser.verGoodUntil.RemoveAt(i);
+                    continue;
+                }
+                if (AuthUser.verUids[i] == uid) {
+                    AuthUser.verVals[i] = version;
+                    AuthUser.verGoodUntil[i] = now + AuthUser.VerTtlSec;
+                    return;
+                }
+                i = i + 1;
+            }
+            AuthUser.verUids.Add(uid);
+            AuthUser.verVals.Add(version);
+            AuthUser.verGoodUntil.Add(now + AuthUser.VerTtlSec);
+        }
+    }
+
+    static void DropCachedVersion(string uid) {
+        lock (AuthUser.verUids) {
+            for (int i = 0; i < AuthUser.verUids.Count; i = i + 1) {
+                if (AuthUser.verUids[i] == uid) {
+                    AuthUser.verUids.RemoveAt(i);
+                    AuthUser.verVals.RemoveAt(i);
+                    AuthUser.verGoodUntil.RemoveAt(i);
+                    return;
+                }
+            }
+        }
+    }
+
     static async int TokenVersion(string uid) {
+        int now = WebApp.NowSeconds();
+        int cached = AuthUser.CachedVersion(uid, now);
+        if (cached >= 0) { return cached; }
         User row = await AuthUser.ById(uid);
+        /* 负结果不缓存：禁用/删除必须尽快生效，且这类查询不在热路径上。 */
         if (row == null || row.status != AuthUser.Active) { return -1; }
+        AuthUser.StoreVersion(uid, row.tokenVersion, now);
         return row.tokenVersion;
     }
 
@@ -81,9 +144,20 @@ class AuthUser {
 
     /* ---- 授权 ---- */
     /* 模型：用户持角色，角色持路由 action，action 是调度和菜单共问的唯一权限单位。权限数据在共享内存（PermTable），首次缺失时从数据库加载。授权变更主动写回共享内存。*/
-    static void Forget(string uid) { PermTable.Forget(uid); }
+    /* 授权变更时同步失效版本缓存。 */
+    static void Forget(string uid) {
+        AuthUser.DropCachedVersion(uid);
+        PermTable.Forget(uid);
+    }
 
-    static void ForgetAll() { PermTable.ForgetAll(); }
+    static void ForgetAll() {
+        lock (AuthUser.verUids) {
+            AuthUser.verUids.Clear();
+            AuthUser.verVals.Clear();
+            AuthUser.verGoodUntil.Clear();
+        }
+        PermTable.ForgetAll();
+    }
 
     static async void RolesChanged(IDbConnection db) {
         await PermTable.LoadRoles(db);
@@ -95,19 +169,34 @@ class AuthUser {
         PermTable.ForgetAll();
     }
 
-    /* 调度器和菜单共用的权限解析：账号是否可执行该 action。Bootstrap 账号绕过查找。*/
+    /* 调度器和菜单共用的权限解析：账号是否可执行该 action。Bootstrap 账号绕过查找。
+       持有请求租约的调用方（控制器动作内）必须走 <see cref="Allow"/> 的
+       带连接重载——嵌套租借（持一条再等第二条）在高并发下会把池拖成
+       循环等待，见 RolesOf 的说明。 */
     static async bool Allow(string uid, string action) {
+        return await AuthUser.Allow(null, uid, action);
+    }
+
+    /* 带租约的权限解析：db 传调用方已持有的请求租约（Held()），角色
+       未命中时的回填查询直接跑在它上面，不再二次借连接；传 null 则
+       自行借还一次（调用方未持有任何连接时）。 */
+    static async bool Allow(IDbConnection db, string uid, string action) {
         if (action.Length == 0) { return false; }
-        string roleIds = await AuthUser.RolesOf(uid);
+        string roleIds = await AuthUser.RolesOf(db, uid);
         if (roleIds == "*") { return true; }
         if (roleIds.Length == 0) { return false; }
         return PermTable.RolesAllow(roleIds, action);
     }
 
-    /* 该账号在某屏上的按钮掩码；与 Allow() 拒之依据为同一决策。Bootstrap 账号持该屏所有位。*/
+    /* 该账号在某屏上的按钮掩码；与 Allow() 拒之依据为同一决策。Bootstrap 账号持该屏所有位。 */
     static async int MaskOf(string uid, string screen) {
+        return await AuthUser.MaskOf(null, uid, screen);
+    }
+
+    /* 带租约的按钮掩码：语义同 <see cref="Allow"/> 的带连接重载。 */
+    static async int MaskOf(IDbConnection db, string uid, string screen) {
         if (screen.Length == 0) { return 0; }
-        string roleIds = await AuthUser.RolesOf(uid);
+        string roleIds = await AuthUser.RolesOf(db, uid);
         if (roleIds == "*") { return Perm.MaskOf(screen); }
         if (roleIds.Length == 0) { return 0; }
         return PermTable.RolesMask(roleIds, screen) & Perm.MaskOf(screen);
@@ -115,14 +204,27 @@ class AuthUser {
 
     /* 账号角色 ",3,7,"；"*" 为 bootstrap；"" 为未知/禁用/数据库不可达。共享内存读，首次缺失从数据库填充。*/
     static async string RolesOf(string uid) {
+        return await AuthUser.RolesOf(null, uid);
+    }
+
+    /* 共享内存未命中时的数据库回填。db 为调用方已持有的租约时查询
+       直接跑在它上——绝不在持有租约的状态下再借第二条连接：
+       并发数一旦达到池上限，「每人都持一条、每人都等第二条」就是
+       循环等待，谁也不释放（实测过的全站假死形态）。db 为 null 才
+       自行借还一次，此时本协程未持有任何连接，顺序借用是安全的。*/
+    static async string RolesOf(IDbConnection db, string uid) {
         int id = AuthUser.ToInt(uid);
         if (id <= 0) { return ""; }
 
         string hit = PermTable.UserRoles(uid);
         if (hit.Length > 0) { return hit; }
 
-        IDbConnection db = await AuthUser.Lease();
-        if (db == null) { return ""; }
+        IDbConnection owned = null;
+        if (db == null) {
+            owned = await AuthUser.Lease();
+            if (owned == null) { return ""; }
+            db = owned;
+        }
         try {
             User me = await db.Select<User>().Where(a => a.id == id).FirstAsync();
             if (me == null || me.status != AuthUser.Active) { return ""; }
@@ -134,7 +236,7 @@ class AuthUser {
             PermTable.SetUser(uid, false, joined);
             return joined;
         } finally {
-            AuthUser.Give(db);
+            if (owned != null) { AuthUser.Give(owned); }
         }
     }
 

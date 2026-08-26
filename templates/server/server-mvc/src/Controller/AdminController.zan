@@ -34,6 +34,18 @@ class AdminController : AppController {
         return me;
     }
 
+    /* 进入任何管理屏之前先把该账号的角色解析进共享权限表：此刻请求
+       尚未持有租约，借还只是顺序复用；此后本页渲染期的 Allow/Mask
+       全部是共享内存读，绝不在持有租约时再向池借第二条连接——
+       并发数达到上限后，那种嵌套租借会变成「人人持一条、人人等
+       第二条」的循环等待（实测过的全站假死形态）。 */
+    override async bool OnBeforeAsync() {
+        if (this.uid.Length > 0) {
+            await AuthUser.RolesOf(this.uid);
+        }
+        return await base.OnBeforeAsync();
+    }
+
     /* 本次请求可见的数据行（见 DataScope）。列表屏幕取之传给 WhereIf；账号在屏幕运行前已加载，范围来自共享内存，无额外开销。 */
     protected async DataScope Scope() {
         if (this.scope != null) { return this.scope; }
@@ -85,9 +97,10 @@ class AdminController : AppController {
         }
     }
 
-    /* 当前屏幕对该登录账号的授权掩码。 */
+    /* 当前屏幕对该登录账号的授权掩码。传请求租约：掩码回填即使需要
+       查库也跑在这条连接上，不二次借用（见 AuthUser.RolesOf）。 */
     protected async int Mask() {
-        return await AuthUser.MaskOf(this.uid,
+        return await AuthUser.MaskOf(this.Held(), this.uid,
             Perm.ScreenOf(this.Ctx().routeAction));
     }
 
@@ -98,7 +111,7 @@ class AdminController : AppController {
 
     /* 为每张设计表追加一条侧边栏项；这是行而非路由，唯一一张通用数据屏 /admin/monitor/data 承载它们，故路由表无法供给。 */
     protected async void AddDesigned(List<MenuNode> nodes) {
-        if (!await AuthUser.Allow(this.uid, Routes.DataIndex)) { return; }
+        if (!await AuthUser.Allow(this.Held(), this.uid, Routes.DataIndex)) { return; }
         if (!this.DbReady()) { return; }
         List<GenTable> tables = await this.GenTable
             .Where(a => a.migrated == 1).ToListAsync();
