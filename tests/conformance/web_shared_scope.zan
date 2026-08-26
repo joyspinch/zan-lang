@@ -1,13 +1,12 @@
 // Conformance: which shared-memory tables a WebApp owns, and how a worker
 // reaches the ones the master made.
 //
-// The framework's own three tables (rate, lock, route) are anonymous: the
-// master creates them before spawning any worker and hands the handles down,
-// so they belong to one server instance without a machine-global name -- and
-// in particular without the listening port, which is configuration and used to
-// be baked into every table name ("zan.web.8099.rate"). Tables the application
-// names still go through SharedName, whose namespace is the executable unless
-// Scope() gives it a readable one.
+// Every table a web server uses -- the framework's rate, lock and route
+// counters included -- is anonymous shared memory the master creates before it
+// spawns any worker and hands down by handle (Worker.ShareHandle). Nothing has
+// a machine-global name: nothing outside this server's own process tree can
+// find or touch the memory, another copy of the same server cannot collide
+// with it, and the listening port is configuration that names none of it.
 using System;
 using System.Net;
 using System.Threading;
@@ -34,30 +33,24 @@ class Program {
         WebApp app = new WebApp("127.0.0.1", 8099);
         Route _r = app.Get("/", Hello);
 
-        // ---- the port is not part of any name ----
-        string rate = app.SharedName("rate");
-        Check(rate.IndexOf("8099") < 0, "default name carries no port");
-        Check(rate == "zan.web." + Worker.AppId() + ".rate",
-            "default namespace is the executable");
-        WebApp moved = new WebApp("127.0.0.1", 9099);
-        Check(moved.SharedName("rate") == rate,
-            "same server on another port, same tables");
-
-        // ---- Scope() still names them, for a deployment that wants that ----
-        WebApp shop = new WebApp("127.0.0.1", 8099);
-        WebApp _s = shop.Scope("shop");
-        Check(shop.SharedName("rate") == "zan.web.shop.rate",
-            "Scope names the tables");
-        Check(shop.SharedName("perm.roles") == "zan.web.shop.perm.roles",
-            "an application's own tables share the namespace");
-
         // ---- master: the tables exist before any worker, as anonymous
         // memory whose handle is the only way in ----
         app.InitShared();
         long rateHandle = app.Limiter().OsHandle();
         long lockHandle = app.Locks().OsHandle();
-        Check(rateHandle != 0, "rate table is anonymous and inheritable");
-        Check(lockHandle != 0, "lock table is anonymous and inheritable");
+        Check(rateHandle != 0, "master creates the rate table before any worker");
+        Check(lockHandle != 0, "master creates the lock table before any worker");
+
+        // ---- another instance of the same executable shares nothing with it:
+        // no name to meet on, so each master owns its own memory ----
+        WebApp moved = new WebApp("127.0.0.1", 9099);
+        moved.InitShared();
+        Check(moved.Limiter().OsHandle() != rateHandle,
+            "another instance owns different memory");
+        moved.Limiter().Allow("k", 5);
+        Check(app.Limiter().CountOf("k") == 0,
+            "the instance's counters stay separate");
+
         Check(Worker.InheritedHandle("WEB_RATE") == 0,
             "a process that is not a worker inherits nothing");
 

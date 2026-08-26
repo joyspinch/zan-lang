@@ -1,6 +1,7 @@
 using System;
 using System.Data;
 using System.Data.Orm;
+using System.Net;
 using System.Threading;
 using System.Web;
 using ZanWeb.Model.Sys;
@@ -9,38 +10,56 @@ namespace ZanWeb;
 
 /* 共享内存授权表：角色可执行哪些 action、账号持有哪些角色。数据库仍持有 sys_role_grant / sys_user_role / sys_department_role，请求路径读共享内存，零查询。角色整表加载、授权变更时重写；账号按需加载，带短租约过期。*/
 class PermTable {
-    static string RoleTable = "";
-    static string UserTable = "";
+    /* 句柄在 master 与 worker 之间传递所用的名字（ZAN_SHARE_<name>）。*/
+    static const string ShareRoles = "WEB_PERM_ROLES";
+    static const string ShareUsers = "WEB_PERM_USERS";
+
     static long UserLeaseMs = 300000;
 
     static SharedTable roles = null;
     static SharedTable users = null;
 
-    /* 创建或挂载两个共享表，命名空间与 app.SharedName 一致，确保同机多实例互不干扰。*/
-    static bool Open(WebApp app) {
-        PermTable.RoleTable = app.SharedName("perm.roles");
-        PermTable.UserTable = app.SharedName("perm.users");
-        SharedTable r = new SharedTable(PermTable.RoleTable, 256);
-        r.KeySize(16);
-        r.ColumnString("acts", 8192);
-        r.ColumnInt("scope");
-        r.ColumnString("depts", 255);
-        if (!r.Create()) { r = SharedTable.Open(PermTable.RoleTable); }
-        if (r == null || !r.IsOpen()) { return false; }
-        r.Label("web perm roles");
+    /* 两张表只属于本服务实例：master 在派生 worker 之前建匿名共享内存，
+     * 句柄经 Worker.ShareHandle 下发，worker 用继承的句柄映射同一块内存。
+     * 全程没有名字，同机其他进程（包括别的 zan 服务）无法触及。*/
+    static bool Open() {
+        long roleHandle = Worker.InheritedHandle(PermTable.ShareRoles);
+        long userHandle = Worker.InheritedHandle(PermTable.ShareUsers);
+        if (roleHandle != 0 || userHandle != 0) {
+            /* worker：映射 master 下发的两张表；缺一即视为不可用，
+             * 权限判断一律失败（fail closed）。*/
+            SharedTable r = SharedTable.Attach(roleHandle);
+            SharedTable u = SharedTable.Attach(userHandle);
+            if (!r.IsOpen() || !u.IsOpen()) { return false; }
+            r.Label("web perm roles");
+            u.Label("web perm users");
+            PermTable.roles = r;
+            PermTable.users = u;
+            return true;
+        }
 
-        SharedTable u = new SharedTable(PermTable.UserTable, 8192);
-        u.KeySize(24);
-        u.ColumnInt("super");
-        u.ColumnString("roles", 192);
-        u.ColumnInt("scope");
-        u.ColumnString("depts", 1024);
-        if (!u.Create()) { u = SharedTable.Open(PermTable.UserTable); }
-        if (u == null || !u.IsOpen()) { return false; }
-        u.Label("web perm users");
+        /* master / 单进程：创建匿名表并登记句柄，供之后派生的 worker 继承。*/
+        SharedTable nr = new SharedTable("", 256);
+        nr.KeySize(16);
+        nr.ColumnString("acts", 8192);
+        nr.ColumnInt("scope");
+        nr.ColumnString("depts", 255);
+        if (!nr.CreateAnonymous()) { return false; }
+        nr.Label("web perm roles");
 
-        PermTable.roles = r;
-        PermTable.users = u;
+        SharedTable nu = new SharedTable("", 8192);
+        nu.KeySize(24);
+        nu.ColumnInt("super");
+        nu.ColumnString("roles", 192);
+        nu.ColumnInt("scope");
+        nu.ColumnString("depts", 1024);
+        if (!nu.CreateAnonymous()) { return false; }
+        nu.Label("web perm users");
+
+        Worker.ShareHandle(PermTable.ShareRoles, nr.OsHandle());
+        Worker.ShareHandle(PermTable.ShareUsers, nu.OsHandle());
+        PermTable.roles = nr;
+        PermTable.users = nu;
         return true;
     }
 

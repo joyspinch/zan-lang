@@ -136,9 +136,9 @@ class Router {
     // string nor copies it into shared memory.
     List<long> flatHashes;
     // Cross-process shared stats table. Columns: "hits" (int), "total_us"
-    // (int). Keyed by route.key. Null until one of the InitStats paths is
-    // called. All workers share the same table so /admin/stats reflects the
-    // aggregate across every worker process.
+    // (int). Keyed by route.key. Null until InitStatsShared is called. All
+    // workers share the same table so /admin/stats reflects the aggregate
+    // across every worker process.
     SharedTable routeStats;
 
     Router() {
@@ -181,8 +181,8 @@ class Router {
         }
     }
 
-    SharedTable NewStatsTable(string name) {
-        SharedTable t = new SharedTable(name, this.flat.Count + 4);
+    SharedTable NewStatsTable() {
+        SharedTable t = new SharedTable("", this.flat.Count + 4);
         t.KeySize(128);
         t.ColumnInt("hits");
         t.ColumnInt("total_us");
@@ -199,32 +199,7 @@ class Router {
         }
     }
 
-    /// <summary>Create (master/single-process) or open (worker) a NAMED shared
-    /// route stats table -- for a deployment that wants the table reachable by
-    /// name. Call after all routes are registered and before the first request;
-    /// name must be unique per server instance (WebApp builds one with
-    /// SharedName). Every process calls this, and Create falls back to Open when
-    /// the master has already made the table.</summary>
-    void InitStats(string name) {
-        if (this.flat.Count == 0) { return; }
-        this.HashRouteKeys();
-        SharedTable t = this.NewStatsTable(name);
-        if (t.Create()) {
-            this.SeedStats(t);
-            t.Label("web route stats");
-            this.routeStats = t;
-        } else {
-            // Worker (or shared-memory already exists): open the table the
-            // master created; all workers map the same backing store.
-            SharedTable existing = SharedTable.Open(name);
-            if (existing.IsOpen()) {
-                existing.Label("web route stats");
-                this.routeStats = existing;
-            }
-        }
-    }
-
-    /// <summary>The default: create the stats table as anonymous shared memory
+    /// <summary>Create the stats table as anonymous shared memory
     /// owned by this server. It has no name for anything on the machine to
     /// collide with or read, and the workers get it from the master through
     /// <see cref="StatsOsHandle"/> / <see cref="AttachStats"/>, so it must be
@@ -233,7 +208,7 @@ class Router {
         if (this.flat.Count == 0) { return; }
         if (this.routeStats != null) { return; }
         this.HashRouteKeys();
-        SharedTable t = this.NewStatsTable("");
+        SharedTable t = this.NewStatsTable();
         if (!t.CreateAnonymous()) { return; }
         t.Label("web route stats");
         this.SeedStats(t);
@@ -241,7 +216,7 @@ class Router {
     }
 
     /// <summary>The handle a worker needs to map the anonymous stats table, or 0
-    /// when there is no such table (none created, or a named one).</summary>
+    /// when there is no such table (none was created).</summary>
     long StatsOsHandle() {
         if (this.routeStats == null) { return 0; }
         return this.routeStats.OsHandle();
