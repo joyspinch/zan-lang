@@ -1753,16 +1753,46 @@ static void present_shadow_fill_rect(zan_present_shadow_t *sh, const u32 *pix,
  * Returns the number of calls made. */
 #define ZAN_CHUNK_H 128
 
-static int gdi_upload_chunks(HDC dc, int h, u32 *pix, BITMAPINFO *bmi,
+static int gdi_upload_chunks(HDC dc, u32 *pix, BITMAPINFO *bmi,
                              int rx, int ry, int rw, int rh) {
     int calls = 0;
     int y = ry;
     int end = ry + rh;
+    int w = bmi->bmiHeader.biWidth;
+    /* Rows are reversed into a staging buffer and uploaded as a genuine
+     * bottom-up DIB (positive biHeight). Passing the top-down surface
+     * directly with source offsets is what produced the 错乱: YSrc=y over
+     * the full surface with StartScan=0/cScanLines=h rendered every
+     * 128-row chunk bottom-up in place (title bar at the window bottom,
+     * half-cut sidebar rows) on real Win10 19044, and a zero-based
+     * bits-offset variant shifted whole chunks the other way. Reversal
+     * was verified pixel-exact on that box: screen row y+i displays the
+     * stage's row (ch-1-i), so stage row j carries surface row
+     * y+ch-1-j. The staged form also keeps every SetDIBitsToDevice call
+     * short, preserving the bounded tear exposure that chunking exists
+     * for. */
+    static u32 *stage;
+    static int stage_cap;
+    int need = (ZAN_CHUNK_H > rh ? ZAN_CHUNK_H : rh) * rw;
+    if (need > stage_cap) {
+        u32 *ns = (u32 *)realloc(stage, (size_t)need * 4);
+        if (!ns) return calls;
+        stage = ns;
+        stage_cap = need;
+    }
+    BITMAPINFOHEADER cbh = bmi->bmiHeader;
+    cbh.biWidth = rw;
     while (y < end) {
         int ch = end - y;
         if (ch > ZAN_CHUNK_H) ch = ZAN_CHUNK_H;
-        SetDIBitsToDevice(dc, rx, y, rw, ch, rx, y, 0, h, pix, bmi,
-                          DIB_RGB_COLORS);
+        for (int j = 0; j < ch; j++) {
+            memcpy(stage + (size_t)j * rw,
+                   pix + (size_t)(y + ch - 1 - j) * (size_t)w + rx,
+                   (size_t)rw * 4);
+        }
+        cbh.biHeight = ch;  /* bottom-up: scan 0 is stage's last row */
+        SetDIBitsToDevice(dc, rx, y, rw, ch, 0, 0, 0, ch, stage,
+                          (BITMAPINFO *)&cbh, DIB_RGB_COLORS);
         calls++;
         y += ch;
     }
@@ -1779,8 +1809,9 @@ static int gdi_upload_chunks(HDC dc, int h, u32 *pix, BITMAPINFO *bmi,
  * Every upload -- diffed, declared or forced -- is split into horizontal
  * chunks at most ZAN_CHUNK_H tall so no single call streams a whole window
  * past DWM. Presents whose changed area exceeds ZAN_ATOMIC_AT percent of the
- * window go out through zan_gui_atomic_present instead: streaming that much
- * would put mixed old/new frames on screen for most of a frame period.
+ * window go out through zan_gui_atomic_present instead -- but only when the
+ * window is already layered (glass/shape); a plain window streams, because
+ * going layered would cost it its DWM drop shadow.
  * Returns the number of SetDIBitsToDevice calls made, or -1 on failure (the
  * caller falls back to its own full blit). Non-Windows builds return -1 and
  * the shells keep their own present path. */
@@ -1823,6 +1854,22 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
 
     zan_present_shadow_t *sh = present_shadow(hwnd, w, h, 1);
     int force_full = (rect_count < 0) || !sh;
+    {
+        /* The tile diff compares the surface against a shadow of what was
+         * *uploaded*, not what the screen *shows*. On real Win10 boxes that
+         * agreement silently breaks (content lost without a WM_PAINT to
+         * invalidate the ledger -- repro: gui_gallery at 1702x1136, chrome
+         * rows land at the bottom, permanent mixed-frame scramble) and the
+         * diff then patches the wrong tiles forever. Full-window upload is
+         * byte-exact no matter what the screen lost, so it is the default;
+         * ZAN_TILE_DIFF=1 opts back into the diff for debugging it. */
+        static int tilediff = -1;
+        if (tilediff < 0) {
+            const char *ev = getenv("ZAN_TILE_DIFF");
+            tilediff = ev && *ev;
+        }
+        if (!tilediff && rect_count == 0) force_full = 1;
+    }
 
     if (!force_full && rect_count == 0) {
         /* Tile diff against the last presented frame. */
@@ -1942,7 +1989,7 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
                 if (rx + rw > w) rw = w - rx;
                 if (ry + rh > h) rh = h - ry;
                 if (rw <= 0 || rh <= 0) continue;
-                calls += gdi_upload_chunks(dc, h, pix, &bmi, rx, ry, rw, rh);
+                calls += gdi_upload_chunks(dc, pix, &bmi, rx, ry, rw, rh);
                 present_shadow_fill_rect(sh, pix, stride, rx, ry, rw, rh);
             }
         }
@@ -1958,7 +2005,7 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
             ReleaseDC((HWND)hwnd, dc);
             return ZAN_ATOMIC_RET;
         }
-        calls = gdi_upload_chunks(dc, h, pix, &bmi, 0, 0, w, h);
+        calls = gdi_upload_chunks(dc, pix, &bmi, 0, 0, w, h);
         memcpy(sh->pixels, pix, (size_t)w * (size_t)h * 4);
     } else if (rect_count > 0) {
         long long area = 0;
@@ -1990,7 +2037,7 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
             if (rx + rw > w) rw = w - rx;
             if (ry + rh > h) rh = h - ry;
             if (rw <= 0 || rh <= 0) continue;
-            calls += gdi_upload_chunks(dc, h, pix, &bmi, rx, ry, rw, rh);
+            calls += gdi_upload_chunks(dc, pix, &bmi, rx, ry, rw, rh);
             present_shadow_fill_rect(sh, pix, stride, rx, ry, rw, rh);
         }
     }
@@ -2120,9 +2167,10 @@ static void zan_atomic_layer_drop(void *hwnd) {
     }
 }
 
-/* Swaps the surface onto the screen atomically. The window becomes layered on
- * first use (the glass path already runs this way). Layered content covers the
- * whole window -- a layered window has no non-client area -- and
+/* Swaps the surface onto the screen atomically. Only for windows that are
+ * already layered (native glass, outline shape): a plain opaque window would
+ * lose its non-client area and with it the DWM drop shadow. Layered content
+ * covers the whole window -- a layered window has no non-client area -- and
  * UpdateLayeredWindow's psize *sets* the window size, so the DIB must be sized
  * to the window rect with the client pixels placed at the client offset:
  * sizing it to the client rect would shrink a maximized window by the frame
@@ -2135,6 +2183,13 @@ static void zan_atomic_layer_drop(void *hwnd) {
 EXPORT i32 zan_gui_atomic_present(void *hwnd, i32 surface_id) {
 #ifdef _WIN32
     if (!hwnd || surface_id < 0 || surface_id >= g_surface_count) return 0;
+    /* Only a window that already opted into layering -- native glass or an
+     * outline shape, which set WS_EX_LAYERED before their first present --
+     * may swap atomically. Flipping a plain opaque window layered here would
+     * strip its non-client area (DWM NC rendering off): the drop shadow
+     * vanishes, later GDI uploads land in a discarded redirection surface and
+     * mouse tracking degrades -- the very breakage that reverted fa7ed72c. */
+    if (!(GetWindowLongPtrW((HWND)hwnd, GWL_EXSTYLE) & WS_EX_LAYERED)) return 0;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s || !s->pixels) return 0;
     if (s->be) {
@@ -2166,10 +2221,6 @@ EXPORT i32 zan_gui_atomic_present(void *hwnd, i32 surface_id) {
             ox = tx;
             oy = ty;
         }
-    }
-    LONG_PTR ex = GetWindowLongPtrW((HWND)hwnd, GWL_EXSTYLE);
-    if (!(ex & WS_EX_LAYERED)) {
-        SetWindowLongPtrW((HWND)hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
     }
     zan_atomic_layer_t *l = atomic_layer(hwnd, ww, wh);
     if (!l || !l->bits) return 0;
