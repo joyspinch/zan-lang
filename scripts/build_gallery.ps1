@@ -34,6 +34,7 @@ try {
     $files += (Get-ChildItem $galleryComponents\*.zan).FullName
     $files += $registryPath
     $files += (Join-Path (Get-Location) "examples\gui_gallery\gui_gallery.zan")
+    $files += (Join-Path (Get-Location) "examples\gui_gallery\MapChinaData.zan")
 
     $zanArgs = @()
     $zanArgs += $files
