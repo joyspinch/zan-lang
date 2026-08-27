@@ -1158,10 +1158,13 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
   `-56`：`irgen_expr.c` 的插值整数分支对窄整数一律 `SExt`，而 `byte`/`bool` 在本
   降级里是无符号。改成走 `zan_iwiden`（≤8 位零扩展），`{b:F2}` 的 `SIToFP` 也
   一并拿到正确的宽化值。用例 `tests/conformance/int_format_boundaries.zan`。
-* [ ] **A49-2 `StringBuilder.Append(ulong)` 丢无符号语义**：`sb.Append(umax)`
-  打印 `-1`。`emit_value_as_cstr` 只看 LLVM 值宽度、拿不到 Zan 静态类型，无从
-  判断该按 `ulong` 输出；要么给它传入静态类型，要么在 append 侧分流。基线同样
-  如此，不在本轮性能改动范围内，用例里因此只放了 `long` 的 append，修好后补行。
+* [x] **A49-2 `StringBuilder.Append(ulong)` 丢无符号语义** —— ✅ 已修。
+  `sb.Append(umax)` 打印 `-1`：append 的整数路径走 `emit_itoa_into(..., 0)`，
+  `emit_value_as_cstr` 只看 LLVM 值宽度、拿不到 Zan 静态类型。改成与
+  `Console.WriteLine` 同一套分流：`expr_is_unsigned_int` 为真时零扩展到 i64
+  并传 unsigned itoa 旗标（`uint`/`ushort` 的 MaxValue 同样会在符号扩展后打成
+  `-1`，一并覆盖）。用例 `tests/conformance/int_format_boundaries.zan` 补了
+  `umax`/`uint`/`ushort` 的 Append 行。
 
 # A50 · CEF 浏览器控件的剩余缺口（2026-08-16）
 

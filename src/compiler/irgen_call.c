@@ -703,9 +703,27 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             LLVMGetIntTypeWidth(LLVMTypeOf(v)) > 1;
                         LLVMValueRef s, slen;
                         if (int_arg) {
+                            /* emit_value_as_cstr only sees LLVM width, so a
+                             * ulong (and uint/ushort after sign-extend) would
+                             * print as a negative. Widen unsigned values with
+                             * ZExt and pass the unsigned itoa flag. */
+                            bool sb_unsigned =
+                                expr_is_unsigned_int(g, arg0, locals);
+                            LLVMValueRef v64;
+                            if (sb_unsigned) {
+                                LLVMTypeRef vt = LLVMTypeOf(v);
+                                if (LLVMGetTypeKind(vt) == LLVMIntegerTypeKind &&
+                                    LLVMGetIntTypeWidth(vt) < 64)
+                                    v64 = LLVMBuildZExt(g->builder, v, i64,
+                                                        "sb.zext");
+                                else
+                                    v64 = emit_widen_i64_for_print(g, v);
+                            } else {
+                                v64 = emit_widen_i64_for_print(g, v);
+                            }
                             s = emit_entry_scratch(g, 40, "sb.i2s");
-                            slen = emit_itoa_into(g, s,
-                                emit_widen_i64_for_print(g, v), 0);
+                            slen = emit_itoa_into(g, s, v64,
+                                                  sb_unsigned ? 1 : 0);
                         } else {
                             s = char_arg ? emit_char_to_cstr(g, v)
                                          : emit_value_as_cstr(g, v);
