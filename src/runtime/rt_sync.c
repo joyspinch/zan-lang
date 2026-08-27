@@ -987,11 +987,21 @@ void zan_monitor_exit(void *obj) {
  * drain's release dropped a count the queue never held, so a handler an event
  * still owned -- `btn.Click += () => { ... }` -- was freed the first time it
  * was posted, and the next use or rebuild of that handler list read freed
- * memory. Posting still allocates nothing, so a background thread only touches
- * the record's refcount, never the Zan allocator. */
+ * memory. Posting into free space allocates nothing -- a background thread only
+ * touches the record's refcount, never the Zan allocator; growing the ring is
+ * the one exception, and it happens only once per doubling. */
 
-#define ZAN_DISPATCH_CAP 1024
-static void *g_dispatch_ring[ZAN_DISPATCH_CAP];
+/* The ring starts in static storage -- the common case never allocates -- and
+ * doubles onto the heap when a burst fills it. It used to be a fixed 1024
+ * entries whose overflow returned 0, and both Zan callers (`App.Post`,
+ * `UiEvent.Post`) drop that answer: a full queue silently meant "this click
+ * handler never ran". Growth is bounded so a runaway producer cannot eat the
+ * address space; at the ceiling the post is still refused, but loudly. */
+#define ZAN_DISPATCH_CAP0 1024
+#define ZAN_DISPATCH_CAP_MAX (1u << 20)
+static void *g_dispatch_static[ZAN_DISPATCH_CAP0];
+static void **g_dispatch_ring = g_dispatch_static;
+static int g_dispatch_cap = ZAN_DISPATCH_CAP0;
 static int g_dispatch_head = 0;
 static int g_dispatch_tail = 0;
 
@@ -1064,13 +1074,36 @@ static void zan_delegate_release(void *d) {
     if (dtor) ((void (*)(void *))dtor)(rec);
 }
 
+/* Double the ring, keeping FIFO order. Called with the lock held and only when
+ * the ring is full, so the entries are exactly cap-1 in queue order starting at
+ * head. Returns 0 when the ceiling is reached or the allocation failed, leaving
+ * the queue untouched. */
+static int zan_dispatch_grow(void) {
+    if ((unsigned)g_dispatch_cap >= ZAN_DISPATCH_CAP_MAX) return 0;
+    int ncap = g_dispatch_cap * 2;
+    void **nring = (void **)malloc((size_t)ncap * sizeof *nring);
+    if (!nring) return 0;
+    int count = 0;
+    for (int i = g_dispatch_head; i != g_dispatch_tail;
+         i = (i + 1) % g_dispatch_cap)
+        nring[count++] = g_dispatch_ring[i];
+    if (g_dispatch_ring != g_dispatch_static) free(g_dispatch_ring);
+    g_dispatch_ring = nring;
+    g_dispatch_cap = ncap;
+    g_dispatch_head = 0;
+    g_dispatch_tail = count;
+    return 1;
+}
+
 /* Enqueue a delegate to run on the UI thread. Thread-safe. Returns 1 on
- * success, 0 if the delegate was null or the queue was full. */
+ * success, 0 if the delegate was null or the queue is at its ceiling. */
 int32_t zan_dispatch_post(void *fn) {
     if (!fn) return 0;
     int32_t ok = 0;
     zan_dispatch_lock();
-    int next = (g_dispatch_tail + 1) % ZAN_DISPATCH_CAP;
+    int next = (g_dispatch_tail + 1) % g_dispatch_cap;
+    if (next == g_dispatch_head && zan_dispatch_grow())
+        next = (g_dispatch_tail + 1) % g_dispatch_cap;
     if (next != g_dispatch_head) {
         zan_delegate_retain(fn);
         g_dispatch_ring[g_dispatch_tail] = fn;
@@ -1078,6 +1111,17 @@ int32_t zan_dispatch_post(void *fn) {
         ok = 1;
     }
     zan_dispatch_unlock();
+    if (!ok) {
+        /* Report once: the queue is full at a million pending handlers, which
+         * means the UI thread has stopped draining, and the caller discards
+         * this answer. Silence here is how posted work disappears. */
+        static int reported;
+        if (!reported) {
+            reported = 1;
+            fprintf(stderr, "zan: UI dispatch queue full (%d pending); "
+                            "posted handler dropped\n", g_dispatch_cap - 1);
+        }
+    }
     return ok;
 }
 
@@ -1089,7 +1133,7 @@ void *zan_dispatch_take(void) {
     zan_dispatch_lock();
     if (g_dispatch_head != g_dispatch_tail) {
         fn = g_dispatch_ring[g_dispatch_head];
-        g_dispatch_head = (g_dispatch_head + 1) % ZAN_DISPATCH_CAP;
+        g_dispatch_head = (g_dispatch_head + 1) % g_dispatch_cap;
     }
     zan_dispatch_unlock();
     return fn;
@@ -1099,19 +1143,27 @@ void *zan_dispatch_take(void) {
  * work a background worker posted for the dead window must not run on the
  * next window, whose frame loop reuses the same global queue. */
 void zan_dispatch_clear(void) {
-    void *drop[ZAN_DISPATCH_CAP];
-    int n = 0;
-    zan_dispatch_lock();
-    while (g_dispatch_head != g_dispatch_tail) {
-        drop[n++] = g_dispatch_ring[g_dispatch_head];
-        g_dispatch_head = (g_dispatch_head + 1) % ZAN_DISPATCH_CAP;
+    /* Drained in fixed batches rather than one stack array of the whole ring:
+     * the ring grows to a million entries, and each batch is released outside
+     * the lock because a record's destructor runs Zan code, which must not
+     * re-enter the queue while it is held. */
+    for (;;) {
+        void *drop[64];
+        int n = 0;
+        zan_dispatch_lock();
+        while (n < (int)(sizeof drop / sizeof *drop) &&
+               g_dispatch_head != g_dispatch_tail) {
+            drop[n++] = g_dispatch_ring[g_dispatch_head];
+            g_dispatch_head = (g_dispatch_head + 1) % g_dispatch_cap;
+        }
+        if (g_dispatch_head == g_dispatch_tail) {
+            g_dispatch_head = 0;
+            g_dispatch_tail = 0;
+        }
+        zan_dispatch_unlock();
+        for (int i = 0; i < n; i++) zan_delegate_release(drop[i]);
+        if (n < (int)(sizeof drop / sizeof *drop)) return;
     }
-    g_dispatch_head = 0;
-    g_dispatch_tail = 0;
-    zan_dispatch_unlock();
-    /* Released outside the lock: a record's destructor runs Zan code, which
-     * must not re-enter the queue while it is held. */
-    for (int i = 0; i < n; i++) zan_delegate_release(drop[i]);
 }
 
 int64_t zan_atomic_int_create(int64_t initial_value) {
