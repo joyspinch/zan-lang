@@ -1190,6 +1190,19 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
   `ZAN_CEF_SWITCHES`（`zan_cef_execute_process` 不接开关），因此只有
   Chromium 自己会转发的开关能进子进程；现在浏览器进程与子进程用同一份开关。
 
+* [x] **A50-5 helper 子进程的 CefOptions 文档化（2026-08-28）**：
+  `CefBootstrap.RunHelper` 调的是 exec 出来的新进程，进程内
+  `CefOptions.current` 静态字段不会被继承；helper 只能走环境变量
+  （`ZAN_CEF_RUNTIME` / `ZAN_CEF_PROFILE` / `ZAN_CEF_CACHE` /
+  `ZAN_CEF_DRIVER` / `ZAN_CEF_SWITCHES` / `ZAN_CEF_LOCALE` /
+  `ZAN_CEF_HELPER` / `ZAN_CEF_DOWNLOAD_UI` / `ZAN_CEF_NO_DCOMP` /
+  `ZAN_CEF_MIRROR` / `ZAN_CEF_ARCHIVE`），加上浏览器进程
+  `zc_export_helper_env` 在 fork 之前 setenv 的
+  `ZAN_CEF_HELPER_RUNTIME/SWITCHES/DRIVER`（macOS/Linux；Windows helper
+  是自己）。已在 `CefBootstrap.zan:RunHelper` 与 `CefOptions.zan` 文档里
+  写明。先观察、暂不实现 `Use` 透传——profile 槽位有 `File.TryLock`
+  串行化、helper 走 env 兜底够用，没有发现"撞 slot"的实际 bug。
+
 # 已撤回的结论（早期草稿中的错误，勿再引用）
 
 1. ~~"无符号/窄类型只是语法别名，IR 层全塌成 i64，语义是假的"~~ ——

@@ -96,3 +96,22 @@ cmake --build build            # zanc, zan-lsp, zan-dap, tools
 
 Compile a single program: `build/zanc <file.zan> --auto-stdlib -o out.exe`
 Release build of a program: `build/zanc <file.zan> --auto-stdlib --publish -o out.exe`
+
+### CEF browser driver (optional)
+
+`Gui.Component.CefBrowser` ships as an opt-in native driver (`zan_cef` / on
+Windows also `zan_cef109` for Win7/8/8.1). It is **off by default** because the
+configure step fetches CEF headers from the official Spotify CDN (a few hundred
+MB). Enable with:
+
+```bash
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DZAN_BUILD_CEF=ON
+# Windows: also build the 109 legacy driver for Win7/8/8.1
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DZAN_BUILD_CEF=ON -DZAN_BUILD_CEF_LEGACY=ON
+cmake --build build --target zan_cef
+```
+
+Built drivers are staged next to the source (`stdlib/Gui/Component/CefBrowser/drivers/<plat>/`)
+so `zanc --publish` carries them with the program. The CEF *runtime* (libcef)
+is still downloaded per-machine at first run; see
+`examples/gui_cef_browser/README.md` for `ZAN_CEF_*` env vars.
