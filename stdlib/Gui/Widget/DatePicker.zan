@@ -8,7 +8,9 @@ namespace Gui.Widget;
 /// Type 字段控制变体（Naive UI type prop）：
 ///   "date"      — 默认，单个日期
 ///   "datetime"  — 含时分（HH:MM），时分通过弹层底部两个数字框输入
-///   "daterange" — 起止日期对，第一次点击=起始，第二次=结束
+///   "daterange" — 起止日期对，弹层为左右双月历（左=选中月，
+///                 右=下个月），第一次点击=起始，第二次=结束；
+///                 已点起始后悬停实时预览区间
 class DatePicker : Control {
     static DatePicker current;
     Input editor;
@@ -21,6 +23,12 @@ class DatePicker : Control {
     /// range 模式下第一个点击（pending）；第二次点击后才关闭弹层。
     DateTime pendingStart;
     bool hasPending;
+    /// 已点起始、等待第二个点击。重新打开弹层后复位，
+    /// 让"再点一次"总是开启一条新区间而不是续接旧区间。
+    bool pickingEnd;
+    /// 本帧悬停到的日期（仅弹层绘制期间有效），用于区间预览。
+    bool hasHover;
+    DateTime hoverDate;
     int hour;
     int minute;
     int wid;
@@ -47,6 +55,9 @@ class DatePicker : Control {
         viewMonth = selected.Month();
         pendingStart = null;
         hasPending = false;
+        pickingEnd = false;
+        hasHover = false;
+        hoverDate = null;
         hour = 0;
         minute = 0;
         wid = WidgetId.Next();
@@ -286,6 +297,16 @@ class DatePicker : Control {
     void ToggleOpen() {
         open = !open;
         if (open) {
+            pickingEnd = false;
+            if (Type == "daterange") {
+                // 编辑框文本是 "A ~ B"，ParseDate 解析不了；左面板
+                // 直接对到已有区间的起始月（Naive UI 的行为）。
+                if (hasPending) {
+                    viewYear = pendingStart.Year();
+                    viewMonth = pendingStart.Month();
+                }
+                return;
+            }
             DateTime value = DatePicker.ParseDate(editor.GetText());
             if (value != null) {
                 selected = value;
@@ -302,13 +323,18 @@ class DatePicker : Control {
     }
 
     void PickDay(int day) {
-        DateTime picked = DateTime.FromDate(viewYear, viewMonth, day);
+        this.PickDate(DateTime.FromDate(viewYear, viewMonth, day));
+    }
+
+    void PickDate(DateTime picked) {
         if (Type == "daterange") {
             // 第一次点击 = 起始；第二次点击 = 结束。结束 < 起始时
-            // 自动交换，让用户总能先点开始再点结束。
-            if (!hasPending) {
+            // 自动交换，让用户总能先点开始再点结束。重新打开弹层后
+            // pickingEnd 已复位，第一次点击开启的是新区间。
+            if (!pickingEnd) {
                 pendingStart = picked;
                 hasPending = true;
+                pickingEnd = true;
                 selected = picked;
                 editor.SetText(this.FormatText());
                 return;
@@ -322,6 +348,7 @@ class DatePicker : Control {
             pendingStart = startV;
             selected = endV;
             hasPending = true;
+            pickingEnd = false;
             editor.SetText(this.FormatText());
             open = false;
             Change.Raise();
@@ -381,9 +408,13 @@ class DatePicker : Control {
         int scale = app.Scale(1);
         int buttonW = app.Scale(34);
         if (!open || DatePicker.current != this) { return; }
-        int popW = app.Scale(224);
+        bool rangeMode = Type == "daterange";
+        int panelW = app.Scale(224);
         int popH = app.Scale(200);
         if (Type == "datetime") { popH = popH + app.Scale(40); }
+        // range 弹层横向并排两个月历面板（Naive UI daterange）。
+        int popW = panelW;
+        if (rangeMode) { popW = panelW + panelW; }
         int popX = OverlayPopup.FitX(app, bx, popW);
         int popY = OverlayPopup.FitY(app, by + bh + app.Scale(4), bh, popH);
         StyleBox pop = this.ResolvePartAs(app, "select", "popup", "popup",
@@ -396,81 +427,93 @@ class DatePicker : Control {
         int fs = Style.FontFallback(app, "small");
         int pad = app.Scale(6);
         int headerH = app.Scale(28);
-        c.DrawText(popX + pad, Canvas.CenterTextY(popY, headerH, fs),
-                   Convert.ToString(viewYear) + "-" +
-                   DateTime.Pad2(viewMonth), pop.fg, fs);
-        c.DrawGlyphIn("chevron-left", popX + popW - app.Scale(48),
-                      popY, app.Scale(22), headerH, app.Scale(13), pop.fg);
-        c.DrawGlyphIn("chevron-right", popX + popW - app.Scale(24),
-                      popY, app.Scale(22), headerH, app.Scale(13), pop.fg);
-
-        string[] names = new string[]{"日","一","二","三","四","五","六"};
-        int cellW = (popW - pad * 2) / 7;
+        int cellW = (panelW - pad * 2) / 7;
         int cellH = app.Scale(24);
         int top = popY + headerH;
-        for (int i = 0; i < 7; i = i + 1) {
-            int nx = popX + pad + i * cellW
-                     + (cellW - Canvas.MeasureText(names[i], fs)) / 2;
-            c.DrawText(nx, Canvas.CenterTextY(top, cellH, fs),
-                       names[i], pop.fg, fs);
-        }
-        int start = DateTime.FromDate(viewYear, viewMonth, 1).DayOfWeek();
-        int days = DateTime.DaysInMonth(viewYear, viewMonth);
-        if (clicked) {
-            if (app.mouseX >= popX + popW - app.Scale(50) &&
-                app.mouseX < popX + popW - app.Scale(26) &&
-                app.mouseY >= popY && app.mouseY < popY + headerH) {
-                this.MoveMonth(-1); app.ClaimClick(); app.RequestRedraw(); return;
-            }
-            if (app.mouseX >= popX + popW - app.Scale(26) &&
-                app.mouseX < popX + popW &&
-                app.mouseY >= popY && app.mouseY < popY + headerH) {
-                this.MoveMonth(1); app.ClaimClick(); app.RequestRedraw(); return;
-            }
-        }
-        for (int day = 1; day <= days; day = day + 1) {
-            int index = start + day - 1;
-            int row = index / 7;
-            int col = index % 7;
-            int dx = popX + pad + col * cellW;
-            int dy = top + cellH + row * cellH;
-            string label = Convert.ToString(day);
-            int color = pop.fg;
-            // 范围模式：高亮整段范围（Naive UI daterange）。
-            bool inRange = false;
-            bool isStart = false;
-            bool isEnd = false;
-            if (Type == "daterange" && hasPending) {
-                DateTime cur = DateTime.FromDate(viewYear, viewMonth, day);
-                if (cur.IsBefore(pendingStart) == false &&
-                    cur.IsBefore(selected) == false) {
-                    inRange = true;
+
+        // 右面板始终是左面板的下一个月。
+        int rightMonth = viewMonth + 1;
+        int rightYear = viewYear;
+        if (rightMonth > 12) { rightMonth = 1; rightYear = rightYear + 1; }
+
+        if (rangeMode) {
+            // 双月历头部：上月/下月箭头分居弹层两端，"YYYY-MM"
+            // 标题在各自面板内居中。
+            int arrowW = app.Scale(22);
+            int titleW = panelW - pad * 2 - arrowW * 2;
+            string leftTitle = Convert.ToString(viewYear) + "-" +
+                DateTime.Pad2(viewMonth);
+            string rightTitle = Convert.ToString(rightYear) + "-" +
+                DateTime.Pad2(rightMonth);
+            c.DrawText(popX + pad + arrowW +
+                       (titleW - Canvas.MeasureText(leftTitle, fs)) / 2,
+                       Canvas.CenterTextY(popY, headerH, fs),
+                       leftTitle, pop.fg, fs);
+            c.DrawText(popX + panelW + pad + arrowW +
+                       (titleW - Canvas.MeasureText(rightTitle, fs)) / 2,
+                       Canvas.CenterTextY(popY, headerH, fs),
+                       rightTitle, pop.fg, fs);
+            c.DrawGlyphIn("chevron-left", popX + pad, popY, arrowW,
+                          headerH, app.Scale(13), pop.fg);
+            c.DrawGlyphIn("chevron-right", popX + popW - pad - arrowW,
+                          popY, arrowW, headerH, app.Scale(13), pop.fg);
+            if (clicked) {
+                if (app.mouseX >= popX &&
+                    app.mouseX < popX + pad + arrowW &&
+                    app.mouseY >= popY && app.mouseY < popY + headerH) {
+                    this.MoveMonth(-1); app.ClaimClick(); app.RequestRedraw(); return;
                 }
-                if (cur.Equals(pendingStart)) { isStart = true; }
-                if (cur.Equals(selected)) { isEnd = true; }
+                if (app.mouseX >= popX + popW - pad - arrowW &&
+                    app.mouseX < popX + popW &&
+                    app.mouseY >= popY && app.mouseY < popY + headerH) {
+                    this.MoveMonth(1); app.ClaimClick(); app.RequestRedraw(); return;
+                }
             }
-            if (inRange) {
-                StyleBox range = Style.Part(app, "datepicker", "range", "", "",
-                                             "", Style.SHover());
-                c.FillRect(dx, dy + app.Scale(1),
-                           cellW, cellH - app.Scale(2),
-                           range.BgOr(pop.accent));
+        } else {
+            c.DrawText(popX + pad, Canvas.CenterTextY(popY, headerH, fs),
+                       Convert.ToString(viewYear) + "-" +
+                       DateTime.Pad2(viewMonth), pop.fg, fs);
+            c.DrawGlyphIn("chevron-left", popX + popW - app.Scale(48),
+                          popY, app.Scale(22), headerH, app.Scale(13), pop.fg);
+            c.DrawGlyphIn("chevron-right", popX + popW - app.Scale(24),
+                          popY, app.Scale(22), headerH, app.Scale(13), pop.fg);
+            if (clicked) {
+                if (app.mouseX >= popX + popW - app.Scale(50) &&
+                    app.mouseX < popX + popW - app.Scale(26) &&
+                    app.mouseY >= popY && app.mouseY < popY + headerH) {
+                    this.MoveMonth(-1); app.ClaimClick(); app.RequestRedraw(); return;
+                }
+                if (app.mouseX >= popX + popW - app.Scale(26) &&
+                    app.mouseX < popX + popW &&
+                    app.mouseY >= popY && app.mouseY < popY + headerH) {
+                    this.MoveMonth(1); app.ClaimClick(); app.RequestRedraw(); return;
+                }
             }
-            if (isStart || isEnd ||
-                (day == selected.Day() && viewMonth == selected.Month() &&
-                 viewYear == selected.Year())) {
-                StyleBox sel = Style.Part(app, "datepicker", "day", "", "",
-                                          "", Style.SSelected());
-                c.FillRoundRect(dx + app.Scale(1), dy + app.Scale(1),
-                                cellW - app.Scale(2), cellH - app.Scale(2),
-                                app.Scale(3), sel.BgOr(pop.accent));
-                color = sel.FgOr(pop.bg);
+        }
+
+        // 区间预览：先把悬停日整帧扫出来再绘制，两个面板
+        // 才能看到同一个 hover 值。
+        hasHover = false;
+        hoverDate = null;
+        if (rangeMode) {
+            hoverDate = this.HoverDay(app, popX, top, pad, cellW, cellH,
+                                      viewYear, viewMonth);
+            if (hoverDate == null) {
+                hoverDate = this.HoverDay(app, popX + panelW, top, pad,
+                                          cellW, cellH, rightYear, rightMonth);
             }
-            c.DrawText(dx + (cellW - Canvas.MeasureText(label, fs)) / 2,
-                       Canvas.CenterTextY(dy, cellH, fs), label, color, fs);
-            if (clicked && app.mouseX >= dx && app.mouseX < dx + cellW &&
-                app.mouseY >= dy && app.mouseY < dy + cellH) {
-                this.PickDay(day); app.ClaimClick(); app.RequestRedraw(); return;
+            hasHover = hoverDate != null;
+        }
+
+        if (this.PaintMonth(app, c, pop, popX, top, pad, cellW, cellH,
+                            fs, pop.fg, viewYear, viewMonth, clicked)) {
+            return;
+        }
+        if (rangeMode) {
+            if (this.PaintMonth(app, c, pop, popX + panelW, top, pad, cellW,
+                                cellH, fs, pop.fg, rightYear, rightMonth,
+                                clicked)) {
+                return;
             }
         }
         // ---- datetime 模式的时间输入行 ----
@@ -512,5 +555,97 @@ class DatePicker : Control {
             app.ClaimClick();
             app.RequestRedraw();
         }
+    }
+
+    /// 扫描一个月的日期网格，返回鼠标悬停到的日期（无则 null）。
+    /// 仅供区间预览在绘制前整帧调用一次。
+    DateTime HoverDay(App app, int panelX, int top, int pad, int cellW,
+                      int cellH, int year, int month) {
+        int start = DateTime.FromDate(year, month, 1).DayOfWeek();
+        int days = DateTime.DaysInMonth(year, month);
+        for (int day = 1; day <= days; day = day + 1) {
+            int index = start + day - 1;
+            int dx = panelX + pad + (index % 7) * cellW;
+            int dy = top + cellH + (index / 7) * cellH;
+            if (app.mouseX >= dx && app.mouseX < dx + cellW &&
+                app.mouseY >= dy && app.mouseY < dy + cellH) {
+                return DateTime.FromDate(year, month, day);
+            }
+        }
+        return null;
+    }
+
+    /// 绘制一个月的星期条与日期网格并处理日期点击。
+    /// 返回 true 表示本次点击命中了日期格，调用方应立即结束本次
+    /// 覆盖绘制，不再做弹层外部关闭判定。
+    bool PaintMonth(App app, Canvas c, StyleBox pop, int panelX, int top,
+                    int pad, int cellW, int cellH, int fs, int fg,
+                    int year, int month, bool clicked) {
+        string[] names = new string[]{"日","一","二","三","四","五","六"};
+        for (int i = 0; i < 7; i = i + 1) {
+            int nx = panelX + pad + i * cellW
+                     + (cellW - Canvas.MeasureText(names[i], fs)) / 2;
+            c.DrawText(nx, Canvas.CenterTextY(top, cellH, fs),
+                       names[i], fg, fs);
+        }
+        int start = DateTime.FromDate(year, month, 1).DayOfWeek();
+        int days = DateTime.DaysInMonth(year, month);
+        for (int day = 1; day <= days; day = day + 1) {
+            int index = start + day - 1;
+            int row = index / 7;
+            int col = index % 7;
+            int dx = panelX + pad + col * cellW;
+            int dy = top + cellH + row * cellH;
+            string label = Convert.ToString(day);
+            int color = fg;
+            // 范围模式：高亮整段范围（Naive UI daterange）。已点
+            // 起始、未点结束时用悬停日做预览终点。
+            bool inRange = false;
+            bool isEndpoint = false;
+            if (Type == "daterange" && hasPending) {
+                DateTime endRef = selected;
+                if (pickingEnd && hasHover) { endRef = hoverDate; }
+                DateTime cur = DateTime.FromDate(year, month, day);
+                // pendingStart <= cur <= endRef。终点一侧必须用
+                // endRef.IsBefore(cur)（cur <= endRef）；旧代码写成
+                // cur.IsBefore(selected) == false（cur >= selected），
+                // 结果终点之后整月都被填进区间。
+                if (cur.IsBefore(pendingStart) == false &&
+                    endRef.IsBefore(cur) == false) {
+                    inRange = true;
+                }
+                if (cur.Equals(pendingStart) || cur.Equals(endRef)) {
+                    isEndpoint = true;
+                }
+            } else if (day == selected.Day() && month == selected.Month() &&
+                       year == selected.Year()) {
+                isEndpoint = true;
+            }
+            if (inRange) {
+                StyleBox range = Style.Part(app, "datepicker", "range", "", "",
+                                             "", Style.SHover());
+                c.FillRect(dx, dy + app.Scale(1),
+                           cellW, cellH - app.Scale(2),
+                           range.BgOr(pop.accent));
+            }
+            if (isEndpoint) {
+                StyleBox sel = Style.Part(app, "datepicker", "day", "", "",
+                                          "", Style.SSelected());
+                c.FillRoundRect(dx + app.Scale(1), dy + app.Scale(1),
+                                cellW - app.Scale(2), cellH - app.Scale(2),
+                                app.Scale(3), sel.BgOr(pop.accent));
+                color = sel.FgOr(pop.bg);
+            }
+            c.DrawText(dx + (cellW - Canvas.MeasureText(label, fs)) / 2,
+                       Canvas.CenterTextY(dy, cellH, fs), label, color, fs);
+            if (clicked && app.mouseX >= dx && app.mouseX < dx + cellW &&
+                app.mouseY >= dy && app.mouseY < dy + cellH) {
+                this.PickDate(DateTime.FromDate(year, month, day));
+                app.ClaimClick();
+                app.RequestRedraw();
+                return true;
+            }
+        }
+        return false;
     }
 }
