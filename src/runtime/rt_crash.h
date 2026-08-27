@@ -1391,7 +1391,14 @@ static void zan__crash_install(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = zan__crash_handler;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+#ifdef SA_ONSTACK
+    /* glibc only exposes SA_ONSTACK under __USE_MISC / XOPEN_EXTENDED, not
+     * under _POSIX_C_SOURCE 200809L (which rt_timer.c sets for clock_gettime
+     * in a -std=c11 build). Skip it rather than fail the compile: the
+     * handler still runs on the interrupted stack. */
+    sa.sa_flags |= SA_ONSTACK;
+#endif
     sigemptyset(&sa.sa_mask);
     static const int sigs[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT };
     for (unsigned i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
