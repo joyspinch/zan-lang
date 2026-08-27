@@ -1,0 +1,130 @@
+using System;
+
+// An argument arrives borrowed, so a parameter slot that the body assigns to
+// has to own what it holds. Without that, a three-way swap left the *owned*
+// local holding the caller's object and released it at scope exit: the caller's
+// object was freed while still in use (heap corruption), and the stdlib's
+// generic merge sort -- which swaps its key parameter exactly like this --
+// returned a half-merged list before crashing. Both the plain and the
+// specialized (generic) emission paths bind parameters, so both are covered.
+
+class Box {
+    public int v;
+    Box(int x) { this.v = x; }
+    public static Box Of(int x) { return new Box(x); }
+}
+
+class Swaps {
+    // class reference: after the swap the parameter holds the new object and
+    // the local holds the caller's
+    static Box BoxSwap(Box p) {
+        Box q = Box.Of(100);
+        Box t = p; p = q; q = t;
+        return p;
+    }
+
+    // collection reference, same shape
+    static List<int> ListSwap(List<int> p) {
+        List<int> q = new List<int>();
+        q.Add(100);
+        List<int> t = p; p = q; q = t;
+        return p;
+    }
+
+    // string reference, same shape
+    static string StrSwap(string p) {
+        string q = "replacement";
+        string t = p; p = q; q = t;
+        return p;
+    }
+
+    // plain reassignment (no swap): the parameter drops the caller's object
+    static int Rebind(List<int> p) {
+        p = new List<int>();
+        p.Add(7);
+        p.Add(8);
+        return p.Count;
+    }
+
+    // generic method: the same binding through the specialization path
+    static List<T> GenericSwap<T>(List<T> p, List<T> other) {
+        List<T> t = p; p = other; other = t;
+        return p;
+    }
+
+    // a generic bottom-up merge sort that swaps both its buffers, one of which
+    // is a parameter -- the shape that broke `orderby`
+    static List<int> SortByKeys<T>(List<T> src, List<int> ka) {
+        List<int> a = new List<int>();
+        for (int i = 0; i < ka.Count; i = i + 1) { a.Add(ka[i]); }
+        int n = a.Count;
+        if (n < 2) { return a; }
+        List<int> b = new List<int>();
+        for (int i = 0; i < n; i = i + 1) { b.Add(0); }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width + width;
+                if (hi > n) { hi = n; }
+                int l = lo; int r = mid; int o = lo;
+                while (l < mid && r < hi) {
+                    if (a[l] <= a[r]) { b[o] = a[l]; l = l + 1; }
+                    else { b[o] = a[r]; r = r + 1; }
+                    o = o + 1;
+                }
+                while (l < mid) { b[o] = a[l]; l = l + 1; o = o + 1; }
+                while (r < hi) { b[o] = a[r]; r = r + 1; o = o + 1; }
+                lo = hi;
+            }
+            List<int> tl = a; a = b; b = tl;
+            width = width + width;
+        }
+        return a;
+    }
+}
+
+class Program {
+    static string Show(List<int> xs) {
+        string s = "";
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            if (i > 0) { s = s + ","; }
+            s = s + xs[i];
+        }
+        return s;
+    }
+
+    static void Main() {
+        Box outer = Box.Of(5);
+        Box r1 = Swaps.BoxSwap(outer);
+        Console.WriteLine("box: " + Convert.ToString(r1.v) + "/" +
+                          Convert.ToString(outer.v));
+
+        List<int> lst = new List<int>();
+        lst.Add(5);
+        List<int> r2 = Swaps.ListSwap(lst);
+        Console.WriteLine("list: " + Program.Show(r2) + "/" + Program.Show(lst));
+
+        string s = "caller-owned";
+        Console.WriteLine("str: " + Swaps.StrSwap(s) + "/" + s);
+
+        Console.WriteLine("rebind: " + Convert.ToString(Swaps.Rebind(lst)) +
+                          "/" + Program.Show(lst));
+
+        List<int> left = new List<int>();
+        left.Add(1);
+        List<int> right = new List<int>();
+        right.Add(2);
+        Console.WriteLine("generic: " +
+            Program.Show(Swaps.GenericSwap<int>(left, right)) + "/" +
+            Program.Show(left) + "/" + Program.Show(right));
+
+        List<int> keys = new List<int>();
+        keys.Add(5); keys.Add(3); keys.Add(9); keys.Add(1); keys.Add(7);
+        Console.WriteLine("sorted: " +
+            Program.Show(Swaps.SortByKeys<int>(keys, keys)) + " from " +
+            Program.Show(keys));
+    }
+}

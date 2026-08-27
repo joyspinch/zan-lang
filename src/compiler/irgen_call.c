@@ -69,6 +69,39 @@ static bool ident_names_own_field(zan_irgen_t *g, zan_ast_node_t *e) {
     return fs && fs->kind == SYM_FIELD && (fs->modifiers & MOD_STATIC) != 0;
 }
 
+/* True when a type still mentions an unbound type parameter (`T`, `List<T>`,
+ * `T[]`), or is the error type. Such a type has no resolvable members, so a
+ * call through it cannot be lowered until monomorphization binds it. */
+static bool type_mentions_type_param(zan_type_t *t, int depth) {
+    if (!t || depth > 8) return false;
+    if (t->kind == TYPE_TYPE_PARAM || t->kind == TYPE_ERROR) return true;
+    if (t->element_type && type_mentions_type_param(t->element_type, depth + 1))
+        return true;
+    for (int i = 0; i < t->type_arg_count; i++)
+        if (type_mentions_type_param(t->type_args[i], depth + 1)) return true;
+    return false;
+}
+
+/* Whether an unclaimed call sits in the erased body of a generic, reaching
+ * through a receiver whose type is still open. Distinguishes "the code
+ * generator failed to resolve a real call" from "this copy of the body is the
+ * erased template and the real code lives in the specializations". */
+static bool call_receiver_is_open_generic(zan_irgen_t *g, zan_ast_node_t *call,
+                                         local_scope_t *locals) {
+    zan_ast_node_t *callee = call->call.callee;
+    if (!callee) return false;
+    if (callee->kind == AST_MEMBER_ACCESS)
+        return type_mentions_type_param(
+            infer_expr_type(g, callee->member.object, locals), 0);
+    /* A bare-name call inside a generic: an argument typed by a type parameter
+     * is what keeps overload resolution from picking a target. */
+    for (int i = 0; i < call->call.args.count; i++)
+        if (type_mentions_type_param(
+                infer_expr_type(g, call->call.args.items[i], locals), 0))
+            return true;
+    return false;
+}
+
 /* Walks the receiver chain of an unclaimed call and reports the first
  * `Type.Method(...)` link naming a class that has no such method. A chained
  * call hides the broken link from the per-call checks: the outer call resolves
@@ -704,8 +737,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMValueRef s, slen;
                         if (int_arg) {
                             s = emit_entry_scratch(g, 40, "sb.i2s");
+                            /* a `ulong` appends unsigned, or everything past
+                             * 2^63 lands in the buffer as a negative number */
                             slen = emit_itoa_into(g, s,
-                                emit_widen_i64_for_print(g, v), 0);
+                                emit_widen_i64_for_print(g, v),
+                                expr_is_ulong(g, arg0, locals) ? 1 : 0);
                         } else {
                             s = char_arg ? emit_char_to_cstr(g, v)
                                          : emit_value_as_cstr(g, v);
@@ -4865,7 +4901,25 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS)
             diagnose_unresolved_static_chain(g, expr->call.callee->member.object);
 
-        /* generic function call — fallback */
+        /* Reaching here means no lowering claimed the call: nothing was
+         * emitted, so the call simply does not happen and the expression
+         * becomes the zero below. Every specific shape checked above was added
+         * after a bug where exactly that produced a silently wrong program, so
+         * the general case has to report too -- a call the code generator
+         * cannot resolve is a compile error, not a zero.
+         *
+         * Two contexts legitimately reach here and must stay quiet:
+         *   - the ERASED body of a generic, where a receiver still typed as a
+         *     type parameter has no methods to find. Calls are routed to the
+         *     monomorphized copies (cur_inst / cur_mtps), so the erased body's
+         *     zero is never executed.
+         *   - anything downstream of an earlier error, where the cascade adds
+         *     noise rather than information. */
+        if (!zan_diag_has_errors(g->diag) &&
+            !call_receiver_is_open_generic(g, expr, locals))
+            zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                          "this call could not be resolved to any callable "
+                          "(no method, delegate, operator or builtin matches)");
         return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 }

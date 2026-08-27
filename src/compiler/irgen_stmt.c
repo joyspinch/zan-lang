@@ -1529,8 +1529,19 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     if (pt && (pt->kind == TYPE_CLASS || pt->kind == TYPE_STRING ||
                                pt->kind == TYPE_OBJECT || pt->kind == TYPE_INTERFACE))
                         cond = emit_runtime_is_check_name(g, switch_val, pt);
-                    else
-                        cond = LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
+                    else {
+                        /* A value type has no runtime type variation, so the
+                         * match is decided statically -- the same rule
+                         * AST_IS_EXPR uses: true iff the discriminant's static
+                         * type is the pattern type. It was hardcoded false, so
+                         * `case int n when n > 3:` (and the switch-expression
+                         * arm that lowers to it) never matched and the switch
+                         * silently fell through to default. */
+                        zan_type_t *dt = infer_expr_type(g, stmt->switch_stmt.expr,
+                                                         locals);
+                        cond = LLVMConstInt(LLVMInt1TypeInContext(g->ctx),
+                            (pt && dt && types_equal(dt, pt)) ? 1 : 0, 0);
+                    }
                 } else if (sc->switch_case.pattern->kind == AST_NULL_LITERAL) {
                     cond = zan_icmp(g->builder, LLVMIntEQ, switch_val,
                         LLVMConstNull(LLVMTypeOf(switch_val)), "sw.null");

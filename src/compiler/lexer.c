@@ -203,6 +203,12 @@ void zan_lexer_init(zan_lexer_t *lex, const char *source, size_t len,
     lex->arena = arena;
     lex->diag = diag;
     lex->at_line_start = 1;
+    /* No arena means no #define table; every lookup below is bounded by
+     * define_count, which stays 0, so a NULL table is simply an empty one. */
+    lex->defines = arena
+        ? (zan_pp_define_t *)zan_arena_alloc(
+              arena, sizeof(zan_pp_define_t) * ZAN_PP_MAX_DEFINES)
+        : NULL;
 }
 
 static inline bool lexer_at_end(zan_lexer_t *lex) {
@@ -258,7 +264,7 @@ static inline bool lexer_match(zan_lexer_t *lex, char expected) {
 /* ---- Preprocessor ---- */
 
 void zan_lexer_define(zan_lexer_t *lex, const char *name, const char *value) {
-    if (lex->define_count >= ZAN_PP_MAX_DEFINES) return;
+    if (!lex->defines || lex->define_count >= ZAN_PP_MAX_DEFINES) return;
     zan_pp_define_t *d = &lex->defines[lex->define_count++];
     strncpy(d->name, name, 63); d->name[63] = '\0';
     if (value) { strncpy(d->value, value, 255); d->value[255] = '\0'; }

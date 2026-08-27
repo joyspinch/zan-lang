@@ -852,7 +852,6 @@ static bool implicit_ctor_for_arg(zan_irgen_t *g, zan_type_t *target,
 static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                                         zan_ast_list_t *args, local_scope_t *locals,
                                         zan_ast_node_t *exclude) {
-    struct zan_ctor_entry *first = NULL;
     struct zan_ctor_entry *best = NULL;
     int best_score = -1;
     int argc = args ? args->count : 0;
@@ -861,7 +860,6 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
         if (entry->type_sym != type_sym || entry->param_count != argc ||
             entry->decl == exclude)
             continue;
-        if (!first) first = entry;
         int score = 0;
         bool compatible = true;
         if (entry->decl && locals) {
@@ -978,7 +976,11 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
             best_score = score;
         }
     }
-    return locals ? best : first;
+    /* Without a local scope no argument can be typed, so nothing above ran and
+     * `best` stays unset. Returning the first constructor of matching arity
+     * would pick by declaration order and quietly run the wrong initializer;
+     * callers all treat NULL as "unresolved" and report, so hand them that. */
+    return best;
 }
 
 /* A primitive value may be materialized as a class only when the destination
@@ -1095,6 +1097,38 @@ static int expr_family(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals)
     }
 }
 
+/* Rank one argument against a concrete parameter type: -1 disqualifies the
+ * candidate, otherwise the score this argument contributes. Shared by the
+ * fixed parameters and by the params tail, which applies it per element. */
+static int concrete_arg_score(zan_irgen_t *g, zan_type_t *pt,
+                              zan_ast_node_t *a, local_scope_t *locals) {
+    zan_type_t *at = infer_expr_type(g, a, locals);
+    if (at && !type_mentions_tp(at)) {
+        if (types_concrete_equal(pt, at)) return 4;
+        int pf = type_family(pt), af = type_family(at);
+        if (pf == FAM_UNKNOWN || af == FAM_UNKNOWN) return 0;
+        if (pf == af) return 2;
+        if (implicit_ctor_for_arg(g, pt, at, a, locals)) return 1;
+        /* integer arguments widen to floating parameters */
+        if (pf == FAM_FLOAT && af == FAM_INT) return 0;
+        /* A string and a byte buffer share one pointer carrier at runtime,
+         * and the stdlib leans on it: random bytes flow into Fill's
+         * `string buf` extern as a byte[], wire data crosses both shapes.
+         * Score it neutrally instead of disqualifying -- for a candidate
+         * that is the ONLY arity match, disqualification left the caller
+         * to the historical first-declaration fallback or, after the
+         * all-disqualified reject, broke perfectly working code. */
+        if (str_and_byte_buffer(pt, at) || str_and_byte_buffer(at, pt)) return 0;
+        return -1;
+    }
+    int af = expr_family(g, a, locals);
+    int pf = type_family(pt);
+    if (af == FAM_UNKNOWN || pf == FAM_UNKNOWN) return 0;
+    if (af == pf) return 2;
+    if (pf == FAM_FLOAT && af == FAM_INT) return 0;
+    return -1;
+}
+
 /* Rank the arguments of one candidate against the call: -1 = incompatible,
  * otherwise a score raised by each argument whose type agrees with the
  * candidate's declared parameter type. `p0` is the parameter index that call
@@ -1111,6 +1145,33 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
     for (int j = p0; j < ps->count; j++) {
         int ai = j - p0;
         if (ai >= call->call.args.count) break;
+        /* The params tail takes every remaining argument as an element, so it
+         * must be ranked against the element type: comparing an element with
+         * the array type would disqualify the only candidate that can take the
+         * call (`Calc.Sum(1, 2, 3)`), while ranking on the element type is what
+         * tells `op_call(params double[])` from `op_call(params string[])`. */
+        if (ps->items[j]->kind == AST_PARAM && ps->items[j]->param.is_params) {
+            zan_type_t *bundle =
+                zan_binder_resolve_type(g->binder, ps->items[j]->param.type);
+            if (!bundle || bundle->kind != TYPE_ARRAY ||
+                !bundle->element_type || type_mentions_tp(bundle))
+                break;
+            for (; ai < call->call.args.count; ai++) {
+                zan_ast_node_t *ta = call->call.args.items[ai];
+                if (!ta || ta->kind == AST_NAMED_ARG || ta->kind == AST_LAMBDA)
+                    continue;
+                /* the bundle handed over whole, as C# allows */
+                zan_type_t *ta_ty = infer_expr_type(g, ta, locals);
+                if (ta_ty && types_concrete_equal(bundle, ta_ty)) {
+                    score += 4;
+                    continue;
+                }
+                int es = concrete_arg_score(g, bundle->element_type, ta, locals);
+                if (es < 0) return -1;
+                score += es;
+            }
+            break;
+        }
         zan_ast_node_t *a = call->call.args.items[ai];
         if (!a) continue;
         if (a->kind == AST_NAMED_ARG) {
@@ -1172,26 +1233,9 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
          * cannot see the implements list, so it stays neutral here
          * instead of disqualifying the candidate. */
         if (pt->kind == TYPE_INTERFACE) continue;
-        zan_type_t *at = infer_expr_type(g, a, locals);
-        if (at && !type_mentions_tp(at)) {
-            if (types_concrete_equal(pt, at)) { score += 4; continue; }
-            int pf = type_family(pt), af = type_family(at);
-            if (pf == FAM_UNKNOWN || af == FAM_UNKNOWN) continue;
-            if (pf == af) { score += 2; continue; }
-            if (implicit_ctor_for_arg(g, pt, at, a, locals)) {
-                score += 1;
-                continue;
-            }
-            /* integer arguments widen to floating parameters */
-            if (pf == FAM_FLOAT && af == FAM_INT) continue;
-            return -1;
-        }
-        int af = expr_family(g, a, locals);
-        int pf = type_family(pt);
-        if (af != FAM_UNKNOWN && pf != FAM_UNKNOWN) {
-            if (af == pf) score += 2;
-            else if (!(pf == FAM_FLOAT && af == FAM_INT)) return -1;
-        }
+        int s = concrete_arg_score(g, pt, a, locals);
+        if (s < 0) return -1;
+        score += s;
     }
     return score;
 }
@@ -1220,8 +1264,10 @@ static int ext_method_score(zan_irgen_t *g, zan_symbol_t *m,
  * matches. Candidates match on method name, arity, and the receiver's static
  * type; among several, the best-scoring one wins (a concretely typed receiver
  * beats a generic one, and a lambda argument's body must agree with the
- * delegate's declared return type). Falls back to the first name/arity match
- * when every candidate is disqualified, preserving the historical lookup. */
+ * delegate's declared return type). When every candidate is disqualified on
+ * argument types the answer is "no extension method": binding the first
+ * name/arity match lowered the call against a foreign signature, which is the
+ * same silent-miscompile shape that `resolve_overload_typed` used to have. */
 static zan_symbol_t *find_extension_method(zan_irgen_t *g, zan_type_t *recv_ty,
                                            zan_istr_t name, int argc,
                                            zan_ast_node_t *call,
@@ -1230,7 +1276,6 @@ static zan_symbol_t *find_extension_method(zan_irgen_t *g, zan_type_t *recv_ty,
     if (!recv_ty) return NULL;
     zan_symbol_t *best = NULL;
     int best_score = -1;
-    zan_symbol_t *first = NULL;
     for (int fi = 0; fi < g->function_count; fi++) {
         zan_symbol_t *m = g->functions[fi].sym;
         if (!m || m->kind != SYM_METHOD || !m->decl ||
@@ -1249,15 +1294,13 @@ static zan_symbol_t *find_extension_method(zan_irgen_t *g, zan_type_t *recv_ty,
              pt->kind == TYPE_INTERFACE || pt->kind == TYPE_ENUM) &&
             pt->sym != recv_ty->sym)
             continue;
-        if (!first) first = m;
         int score = ext_method_score(g, m, recv_ty, call, recv_expr, locals);
         if (score > best_score) {
             best_score = score;
             best = m;
         }
     }
-    if (best && best_score >= 0) return best;
-    return first;
+    return (best && best_score >= 0) ? best : NULL;
 }
 
 /* ---- SharedTable column widths ------------------------------------------
@@ -1341,7 +1384,23 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
             ? cls->type->base_type->sym : NULL;
         cls = (base && base != cls) ? base : NULL;
     }
-    if (arity_matches > 1 && best && best_score >= 0) return best;
+    if (best && best_score >= 0) return best;
+    if (arity_matches > 0) {
+        /* Every same-arity candidate was disqualified on concrete argument
+         * types. The historical fallback picked the first declaration by
+         * arity and lowered the call against a foreign signature: pointer
+         * carriers aligned, layouts did not, and CheckboxGroup.Add("Cheese")
+         * (no Add(string) declared at all) faulted inside Control.Adopt's
+         * stale-parent walk at gallery startup. This is the one phase that
+         * knows both sides' types for every overload, so reject here instead
+         * of emitting an executable that crashes far from the mistake. */
+        zan_diag_emit(g->diag, DIAG_ERROR,
+                      call ? call->loc : (zan_loc_t){0},
+                      "no overload of '%.*s.%.*s' matches argument type(s)",
+                      (int)type_sym->name.len, type_sym->name.str,
+                      (int)name.len, name.str);
+        return NULL;
+    }
     return resolve_overload(type_sym, name, argc);
 }
 

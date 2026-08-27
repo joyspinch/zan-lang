@@ -1,0 +1,133 @@
+// Conformance: the LINQ query clauses beyond from/where/select -- orderby
+// (ascending, descending, multi-key), let, join (plain, join+orderby, join into)
+// and group by (terminal and `into`). Parser and irgen carried these for a long
+// while with no golden covering them, and writing this file immediately turned
+// up four real defects (TASKS A54): a plain join emitted a block with two
+// terminators, `join ... into` left a block with none (and grouped only the
+// outer elements that had a match, instead of every one), `orderby descending`
+// and `let` produced empty results, and the sort was corrupted by the parameter
+// ownership bug (A53).
+using System;
+using System.Linq;
+
+class Person {
+    public string name;
+    public int age;
+    public int dept;
+
+    Person(string n, int a, int d) {
+        this.name = n;
+        this.age = a;
+        this.dept = d;
+    }
+
+    public static Person Of(string n, int a, int d) {
+        return new Person(n, a, d);
+    }
+}
+
+class Dept {
+    public int id;
+    public string title;
+
+    Dept(int i, string t) {
+        this.id = i;
+        this.title = t;
+    }
+
+    public static Dept Of(int i, string t) { return new Dept(i, t); }
+}
+
+class Program {
+    static string JoinInts(List<int> xs) {
+        string s = "";
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            if (i > 0) { s = s + ","; }
+            s = s + xs[i];
+        }
+        return s;
+    }
+
+    static string JoinStrings(List<string> xs) {
+        string s = "";
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            if (i > 0) { s = s + ","; }
+            s = s + xs[i];
+        }
+        return s;
+    }
+
+    static void Main() {
+        List<int> nums = new List<int> { 5, 3, 9, 1, 7 };
+
+        Console.WriteLine("asc: " + Program.JoinInts(from n in nums orderby n select n));
+        Console.WriteLine("asc-kw: " +
+            Program.JoinInts(from n in nums orderby n ascending select n));
+        Console.WriteLine("desc: " +
+            Program.JoinInts(from n in nums orderby n descending select n));
+
+        // let binds a value the clauses after it can see
+        Console.WriteLine("let: " +
+            Program.JoinInts(from n in nums let d = n * 2 where d > 6 select d));
+
+        List<Person> people = new List<Person> {
+            Person.Of("ann", 34, 2),
+            Person.Of("bob", 28, 1),
+            Person.Of("cid", 41, 2),
+            Person.Of("dee", 28, 2)
+        };
+
+        // two keys: dept ascending, then age descending inside a dept
+        Console.WriteLine("multikey: " + Program.JoinStrings(
+            from p in people orderby p.dept, p.age descending select p.name));
+
+        List<Dept> depts = new List<Dept> {
+            Dept.Of(1, "sales"),
+            Dept.Of(2, "eng")
+        };
+
+        Console.WriteLine("join: " + Program.JoinStrings(
+            from p in people
+            join d in depts on p.dept equals d.id
+            select p.name + "/" + d.title));
+
+        // A join followed by an orderby takes the row-materialization path,
+        // where the row used to hold the row builder's stack address instead of
+        // the range variable (TASKS A54-5)
+        Console.WriteLine("join-sorted: " + Program.JoinStrings(
+            from p in people
+            join d in depts on p.dept equals d.id
+            orderby p.name descending
+            select p.name + "/" + d.title));
+
+        // a join followed by a group takes the same path
+        List<Grouping<string>> joinGrouped =
+            from p in people
+            join d in depts on p.dept equals d.id
+            group p.name by p.dept;
+        for (int i = 0; i < joinGrouped.Count; i = i + 1) {
+            Console.WriteLine("join-group " + joinGrouped[i].Key + ": " +
+                              Program.JoinStrings(joinGrouped[i].Items));
+        }
+
+        // `join ... into` gives every left row a group, empty ones included
+        Console.WriteLine("join-into: " + Program.JoinStrings(
+            from d in depts
+            join p in people on d.id equals p.dept into members
+            select d.title + "=" + Convert.ToString(members.Count)));
+
+        // terminal group: the grouping list itself is the result
+        List<Grouping<string>> byDept =
+            from p in people group p.name by p.dept;
+        for (int i = 0; i < byDept.Count; i = i + 1) {
+            Console.WriteLine("group " + byDept[i].Key + ": " +
+                              Program.JoinStrings(byDept[i].Items));
+        }
+
+        // `group ... into g select p`: only g is in scope for the projection
+        Console.WriteLine("group-into: " + Program.JoinStrings(
+            from p in people
+            group p.name by p.dept into g
+            select g.Key + "#" + Convert.ToString(g.Items.Count)));
+    }
+}

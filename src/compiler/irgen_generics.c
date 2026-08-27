@@ -2000,8 +2000,12 @@ void zan_irgen_emit_string_deobf(zan_irgen_t *g) {
 
 /* Coerce a value to an i8* C string. Pointers pass through unchanged; integer
  * and floating operands are formatted into a fresh heap buffer via snprintf.
- * Lets `+` concatenate strings with numbers (e.g. "%t" + counter). */
-static LLVMValueRef emit_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
+ * Lets `+` concatenate strings with numbers (e.g. "%t" + counter).
+ * `is_unsigned` carries the one thing the LLVM value cannot say: an i64 holding
+ * a `ulong` formats unsigned, or every value past 2^63 prints as a negative
+ * number ("" + ulong.MaxValue used to read -1). */
+static LLVMValueRef emit_to_cstr_u(zan_irgen_t *g, LLVMValueRef val,
+                                   bool is_unsigned) {
     LLVMTypeRef vt = LLVMTypeOf(val);
     LLVMTypeKind vtk = LLVMGetTypeKind(vt);
     if (vtk == LLVMPointerTypeKind) return val;
@@ -2020,7 +2024,7 @@ static LLVMValueRef emit_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
         LLVMBuildCondBr(g->builder, has, some_bb, none_bb);
 
         LLVMPositionBuilderAtEnd(g->builder, some_bb);
-        LLVMValueRef sv = emit_to_cstr(g, payload);
+        LLVMValueRef sv = emit_to_cstr_u(g, payload, is_unsigned);
         LLVMBasicBlockRef some_end = LLVMGetInsertBlock(g->builder);
         LLVMBuildBr(g->builder, end_bb);
 
@@ -2053,7 +2057,8 @@ static LLVMValueRef emit_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
         /* integers format straight into the result string: the digits are at
          * most 20 plus a sign, so the length is known without a probe run */
         LLVMValueRef ibuf = emit_string_alloc_rc(g, LLVMConstInt(i64, 24, 0));
-        emit_itoa_into(g, ibuf, emit_widen_i64_for_print(g, val), 0);
+        emit_itoa_into(g, ibuf, emit_widen_i64_for_print(g, val),
+                       is_unsigned ? 1 : 0);
         return ibuf;
     }
     LLVMValueRef tmp_sz = LLVMConstInt(i64, 1024, 0);
@@ -2071,6 +2076,11 @@ static LLVMValueRef emit_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
         (LLVMValueRef[]){ buf, tmp }, 2, "");
     emit_string_len_set(g, buf, needed);
     return buf;
+}
+
+/* Signed formatting: for callers that have no Zan type to consult. */
+static LLVMValueRef emit_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
+    return emit_to_cstr_u(g, val, false);
 }
 
 /* Format a `char` as text the way C# does: the character itself, UTF-8 encoded,
@@ -2163,7 +2173,8 @@ static LLVMValueRef emit_to_cstr_of(zan_irgen_t *g, LLVMValueRef val,
         expr_is_char(g, ast, locals)) {
         return emit_char_to_cstr(g, val);
     }
-    return emit_to_cstr(g, val);
+    zan_type_t *st = ast ? infer_expr_type(g, ast, locals) : NULL;
+    return emit_to_cstr_u(g, val, st && st->kind == TYPE_ULONG);
 }
 
 /* Byte length of the C string `s` produced by `ast`. A string literal's length

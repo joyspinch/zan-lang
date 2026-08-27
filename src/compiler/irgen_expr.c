@@ -4459,6 +4459,14 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
 typedef struct {
     zan_istr_t seq_name;    /* hidden local holding the current sequence */
     LLVMValueRef seq_value; /* its value (kept in sync with the alloca) */
+    /* Whether seq_value is a list this lowering allocated. It starts false --
+     * the sequence *is* the source collection, borrowed from whatever
+     * expression produced it -- and turns true the first time a sort or a join
+     * row-materialization replaces it. Every replacement releases the previous
+     * sequence, and releasing a borrowed source there dropped a reference the
+     * caller still held: the first `orderby` over a local list freed that list
+     * and the next allocation corrupted the heap. */
+    bool seq_owned;
     zan_type_t *elem_type;  /* element type of the current sequence */
     bool row_mode;          /* sequence elements are row tuples */
     zan_type_t *row_type;   /* the row tuple type (row_mode only) */
@@ -4522,10 +4530,30 @@ static LLVMValueRef query_new_list(zan_irgen_t *g, zan_ast_node_t *at,
 
 /* register a hidden local holding `value`, typed `value_type`; returns the
  * registered name (the alloca is the source of truth for the value) */
+/* A struct value is represented by a pointer to its storage (that is what
+ * emit_expr yields for a tuple/struct), so for a struct-typed hold that pointer
+ * already *is* the slot. Wrapping it in a second slot left the local's declared
+ * type (the struct) disagreeing with what its storage held (the address), and
+ * consumers then read the struct out of the slot containing the address: a join
+ * row came out holding the stack address of the row builder instead of the range
+ * variable, so the join key never matched and `join` + `orderby`/`group`
+ * produced nothing. */
+static bool query_struct_slot(zan_irgen_t *g, LLVMValueRef value,
+                              zan_type_t *value_type) {
+    if (!value_type) return false;
+    LLVMTypeRef want = map_type(g, value_type);
+    return want && LLVMGetTypeKind(want) == LLVMStructTypeKind &&
+           LLVMGetTypeKind(LLVMTypeOf(value)) == LLVMPointerTypeKind;
+}
+
 static zan_istr_t query_hold(zan_irgen_t *g, local_scope_t *locals,
                              const char *prefix, LLVMValueRef value,
                              zan_type_t *value_type) {
     zan_istr_t name = query_fresh_name(g, prefix);
+    if (query_struct_slot(g, value, value_type)) {
+        local_add(locals, name, value, value_type);
+        return name;
+    }
     LLVMValueRef alloc = emit_entry_alloca(g, LLVMTypeOf(value), "qh");
     zan_store_fit(g, value, alloc);
     local_add(locals, name, alloc, value_type);
@@ -4537,6 +4565,11 @@ static zan_istr_t query_hold(zan_irgen_t *g, local_scope_t *locals,
 static void query_declare(zan_irgen_t *g, local_scope_t *locals,
                           zan_istr_t name, LLVMValueRef value,
                           zan_type_t *value_type) {
+    /* same struct-slot rule as query_hold */
+    if (query_struct_slot(g, value, value_type)) {
+        local_add(locals, name, value, value_type);
+        return;
+    }
     LLVMValueRef alloc = emit_entry_alloca(g, LLVMTypeOf(value), "qdecl");
     zan_store_fit(g, value, alloc);
     local_add(locals, name, alloc, value_type);
@@ -4639,7 +4672,13 @@ static LLVMValueRef query_loop_load(zan_irgen_t *g, query_loop_t *l,
 /* close a loop; the current block must be the body end */
 static void query_loop_close(zan_irgen_t *g, query_loop_t *l) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-    LLVMBuildBr(g->builder, l->inc);
+    /* Branch the body's tail block to the increment -- unless the caller
+     * already terminated it. A join wires its no-match block straight to
+     * `inc` (`br inc` in qj.skip / qm.skip), and appending a second terminator
+     * there is invalid IR: that was the "Terminator found in the middle of a
+     * basic block" failure, repeated at all four join emission sites. */
+    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+        LLVMBuildBr(g->builder, l->inc);
     LLVMPositionBuilderAtEnd(g->builder, l->inc);
     LLVMValueRef next = zan_add(g->builder,
         LLVMBuildLoad2(g->builder, i64, l->idx, "qli2"),
@@ -4784,9 +4823,11 @@ static void query_sort_by_key(zan_irgen_t *g, zan_ast_node_t *expr,
         (int)strlen(query_sort_fn(kind, desc)), args, 2, expr->loc, locals);
     LLVMValueRef salloc = local_find(locals, q->seq_name)->alloca;
     zan_store_fit(g, sorted, salloc);
-    emit_release_owned_call_temp(g, expr, q->seq_value, locals);
+    if (q->seq_owned)
+        emit_release_owned_call_temp(g, expr, q->seq_value, locals);
     emit_release_owned_call_temp(g, expr, keys, locals);
     q->seq_value = sorted;
+    q->seq_owned = true;
 }
 
 /* build a row tuple value from field values */
@@ -4841,10 +4882,19 @@ static void query_materialize_join(zan_irgen_t *g, zan_ast_node_t *expr,
                        locals);
         locals->count = olmark;
         query_loop_close(g, &ol);
-        LLVMValueRef salloc = local_find(locals, q->seq_name)->alloca;
-        zan_store_fit(g, rows1, salloc);
-        emit_release_owned_call_temp(g, expr, q->seq_value, locals);
+        local_var_t *slv = local_find(locals, q->seq_name);
+        zan_store_fit(g, rows1, slv->alloca);
+        /* The hidden sequence local changes *type* here too: it now holds rows,
+         * not source elements. That recorded type is what a later generic call
+         * infers its type argument from, so leaving it at List<P> monomorphized
+         * `Enumerable.OrderByKeysStr<P>` and walked 2-word rows with a 1-word
+         * stride -- every `join` followed by an `orderby`/`group` came out empty,
+         * and faulted outright once rows really were produced. */
+        slv->type = zan_binder_make_list_type(g->binder, row1);
+        if (q->seq_owned)
+            emit_release_owned_call_temp(g, expr, q->seq_value, locals);
         q->seq_value = rows1;
+        q->seq_owned = true;
         q->row_mode = true;
         q->row_type = row1;
         q->row_fields = 1;
@@ -4877,13 +4927,6 @@ static void query_materialize_join(zan_irgen_t *g, zan_ast_node_t *expr,
     zan_istr_t rows2_name = query_hold(g, locals, "r", rows2,
         zan_binder_make_list_type(g->binder, new_row));
 
-    /* left key once per outer element */
-    int lmark = locals->count;
-    LLVMValueRef lkv = emit_expr(g, jc->query_clause.left_key, locals);
-    zan_type_t *lkt = infer_expr_type(g, jc->query_clause.left_key, locals);
-    if (!lkt) lkt = g->binder->type_int;
-    zan_istr_t lk_name = query_hold(g, locals, "lk", lkv, lkt);
-
     query_loop_t ol;
     int olmark = locals->count;
     query_loop_open(g, &ol, q->seq_value);
@@ -4899,6 +4942,19 @@ static void query_materialize_join(zan_irgen_t *g, zan_ast_node_t *expr,
                           emit_expr(g, cl->query_clause.expr, locals), lt);
         }
     }
+
+    /* Left key, once per outer row -- and it has to be emitted *here*: the
+     * row's fields (and any `let`) only come into scope inside this loop, via
+     * query_register_iter above. It used to be emitted before the loop, where
+     * the range variable was out of scope, so `on p.dept equals d.id` read the
+     * undeclared `p` and fell back to constant 0: the key never matched, the
+     * row list came out empty, and every `join` followed by an `orderby` or a
+     * `group` silently produced zero results. (query_do_group has the right
+     * shape: open the loop, register the variables, then emit the key.) */
+    LLVMValueRef lkv = emit_expr(g, jc->query_clause.left_key, locals);
+    zan_type_t *lkt = infer_expr_type(g, jc->query_clause.left_key, locals);
+    if (!lkt) lkt = g->binder->type_int;
+    zan_istr_t lk_name = query_hold(g, locals, "lk", lkv, lkt);
 
     LLVMValueRef ml_val = NULL;
     zan_istr_t ml_name = { NULL, 0 };
@@ -5014,8 +5070,14 @@ static void query_materialize_join(zan_irgen_t *g, zan_ast_node_t *expr,
 
     LLVMValueRef salloc = local_find(locals, q->seq_name)->alloca;
     zan_store_fit(g, rows2, salloc);
-    emit_release_owned_call_temp(g, expr, q->seq_value, locals);
+    /* same as the row1 step: the sequence local's recorded type follows the
+     * rows, or the generic sort/group instantiates on the wrong element type */
+    local_find(locals, q->seq_name)->type =
+        zan_binder_make_list_type(g->binder, new_row);
+    if (q->seq_owned)
+        emit_release_owned_call_temp(g, expr, q->seq_value, locals);
     q->seq_value = rows2;
+    q->seq_owned = true;
     q->row_type = new_row;
     q->row_fields = nf;
     q->field_names = fn;
@@ -5142,32 +5204,11 @@ static void query_final_pass(zan_irgen_t *g, zan_ast_node_t *expr,
                                               locals);
             if (!lkt) lkt = g->binder->type_int;
             zan_istr_t lk_name = query_hold(g, locals, "lk", lkv, lkt);
-            query_loop_t il;
-            int lmark = locals->count;
-            query_loop_open(g, &il, s_val);
-            LLVMValueRef iiv = LLVMBuildLoad2(g->builder, i64, il.idx, "qjiv");
-            LLVMValueRef yslot = query_loop_load(g, &il, y_ty, iiv);
-            local_add(locals, cl->query_clause.name, yslot, y_ty);
-            LLVMValueRef rkv = emit_expr(g, cl->query_clause.right_key,
-                                         locals);
-            zan_type_t *rkt = infer_expr_type(g, cl->query_clause.right_key,
-                                              locals);
-            if (!rkt) rkt = y_ty;
-            if (query_key_kind(g, lkt, false) != query_key_kind(g, rkt, false))
-                zan_diag_emit(g->diag, DIAG_ERROR, cl->loc,
-                              "join key types must match (int, long, double "
-                              "or string)");
-            zan_istr_t rk_name = query_hold(g, locals, "rk", rkv, rkt);
-            LLVMValueRef eq = query_emit_eq(g, lk_name, rk_name, cl->loc,
-                                            locals);
-            LLVMBasicBlockRef keep_bb = LLVMAppendBasicBlockInContext(g->ctx,
-                LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder)),
-                "qj.keep");
-            LLVMBasicBlockRef skip_bb = LLVMAppendBasicBlockInContext(g->ctx,
-                LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder)),
-                "qj.skip");
-            LLVMBuildCondBr(g->builder, eq, keep_bb, skip_bb);
-            LLVMPositionBuilderAtEnd(g->builder, keep_bb);
+            /* `into` does not test the key out here: it gives *every* outer
+             * element a group (an empty one when nothing matches, as in C#),
+             * so it owns its own loop and match test below. Testing first also
+             * left the `qj.skip` block of that test with no terminator at all,
+             * which is what "Basic Block does not have terminator" was. */
             if (cl->query_clause.into.len > 0) {
                 /* join ... into g: collect the matches, then continue in the
                  * outer scope with g bound to the match list */
@@ -5220,8 +5261,34 @@ static void query_final_pass(zan_irgen_t *g, zan_ast_node_t *expr,
                 emit_release_owned_call_temp(g, expr, ml, locals);
                 return;
             }
-            /* plain join: recurse inside the match so everything after the
-             * join runs per match */
+            /* plain join: one nested loop over the join source, and the rest
+             * of the clauses run inside each match. */
+            query_loop_t il;
+            int lmark = locals->count;
+            query_loop_open(g, &il, s_val);
+            LLVMValueRef iiv = LLVMBuildLoad2(g->builder, i64, il.idx, "qjiv");
+            LLVMValueRef yslot = query_loop_load(g, &il, y_ty, iiv);
+            local_add(locals, cl->query_clause.name, yslot, y_ty);
+            LLVMValueRef rkv = emit_expr(g, cl->query_clause.right_key,
+                                         locals);
+            zan_type_t *rkt = infer_expr_type(g, cl->query_clause.right_key,
+                                              locals);
+            if (!rkt) rkt = y_ty;
+            if (query_key_kind(g, lkt, false) != query_key_kind(g, rkt, false))
+                zan_diag_emit(g->diag, DIAG_ERROR, cl->loc,
+                              "join key types must match (int, long, double "
+                              "or string)");
+            zan_istr_t rk_name = query_hold(g, locals, "rk", rkv, rkt);
+            LLVMValueRef eq = query_emit_eq(g, lk_name, rk_name, cl->loc,
+                                            locals);
+            LLVMBasicBlockRef keep_bb = LLVMAppendBasicBlockInContext(g->ctx,
+                LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder)),
+                "qj.keep");
+            LLVMBasicBlockRef skip_bb = LLVMAppendBasicBlockInContext(g->ctx,
+                LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder)),
+                "qj.skip");
+            LLVMBuildCondBr(g->builder, eq, keep_bb, skip_bb);
+            LLVMPositionBuilderAtEnd(g->builder, keep_bb);
             *skip_depth = *skip_depth + 1;
             {
                 int sd = *skip_depth - 1;
@@ -7671,10 +7738,13 @@ typedef struct {
     int              shadow_cap;
     int              overflow;
     /* write scan (A33-2b): instead of collecting captures, report whether a
-     * lambda somewhere below assigns to `want_write`. */
+     * lambda somewhere below assigns to `want_write`. With `write_any` the
+     * scan reports writes at any depth, lambda or not (used to decide whether
+     * a parameter's slot has to own its reference). */
     zan_istr_t       want_write;
     int              lam_depth;
     int              found_write;
+    int              write_any;
 } capture_scan_t;
 
 static int istr_eq_c(zan_istr_t a, zan_istr_t b) {
@@ -7774,7 +7844,8 @@ static void cap_scan(capture_scan_t *cs, zan_ast_node_t *n) {
     if (!n) return;
     if (cs->want_write.len) {
         if (cs->found_write) return;
-        if (cs->lam_depth > 0 && node_writes_ident(n, cs->want_write)) {
+        if ((cs->lam_depth > 0 || cs->write_any) &&
+            node_writes_ident(n, cs->want_write)) {
             cs->found_write = 1;
             return;
         }
@@ -8039,6 +8110,23 @@ static LLVMTypeRef box_cell_type(zan_irgen_t *g, LLVMTypeRef payload) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef fields[ZAN_BOX_VALUE_FIELD + 1] = { i8ptr, i8ptr, i8ptr, payload };
     return LLVMStructTypeInContext(g->ctx, fields, ZAN_BOX_VALUE_FIELD + 1, 0);
+}
+
+/* Does `body` assign to `name` anywhere -- inside a lambda or not? A parameter
+ * that is assigned needs a slot that owns its reference (see the parameter
+ * binding in irgen_emit.c); one that is only read stays a zero-cost borrow. */
+static int body_writes_ident(zan_irgen_t *g, zan_ast_node_t *body,
+                             zan_istr_t name) {
+    if (!body || !name.len) return 0;
+    capture_scan_t cs;
+    memset(&cs, 0, sizeof(cs));
+    cs.g = g;
+    cs.want_write = name;
+    cs.write_any = 1;
+    cap_scan(&cs, body);
+    int found = cs.found_write;
+    cap_scan_free(&cs);
+    return found;
 }
 
 /* Does a lambda in the body being compiled assign to `name`? */

@@ -2849,8 +2849,11 @@ static zan_ast_node_t *parse_parameter(zan_parser_t *p) {
         is_this = 1;
     }
 
-    /* contextual `params` modifier: `params T[] rest`. The variadic bundle is
-     * lowered as List<T> so the callee has Count and normal indexing. */
+    /* contextual `params` modifier: `params T[] rest`. The declared type stays
+     * `T[]` as written, like C#: the bundle is an array, the callee reads
+     * `rest.Length` and can hand it on to any `T[]` parameter. (It used to be
+     * rewritten to List<T> because array parameters carried no length; that
+     * gap is gone, and the rewrite left every params callee reading `.Count`.) */
     int is_params = 0;
     if (parser_check(p, TK_IDENT) && p->current.str_val.len == 6 &&
         memcmp(p->current.str_val.str, "params", 6) == 0) {
@@ -2864,17 +2867,6 @@ static zan_ast_node_t *parse_parameter(zan_parser_t *p) {
     else if (parser_check(p, TK_OUT)) { parser_advance(p); by_ref = 2; }
 
     zan_ast_node_t *type = parse_type_ref(p);
-    if (is_params && type && type->kind == AST_TYPE_REF && type->type_ref.is_array) {
-        zan_ast_node_t *elem = zan_ast_new(p->arena, AST_TYPE_REF, loc);
-        elem->type_ref.name = type->type_ref.name;
-        zan_ast_list_init(&elem->type_ref.type_args);
-        zan_ast_node_t *lst = zan_ast_new(p->arena, AST_TYPE_REF, loc);
-        lst->type_ref.name.str = "List";
-        lst->type_ref.name.len = 4;
-        zan_ast_list_init(&lst->type_ref.type_args);
-        zan_ast_list_push(&lst->type_ref.type_args, elem, p->arena);
-        type = lst;
-    }
 
     zan_istr_t name = {0};
     if (parser_check(p, TK_IDENT)) {

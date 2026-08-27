@@ -1298,38 +1298,65 @@ static void check_call_arity(zan_checker_t *c, zan_ast_node_t *call,
                   (int)name.len, name.str, want_min, want_max, argc);
 }
 
+/* Everything that lowers to a numeric register, and so has no object header
+ * behind it. `type_is_scalar_primitive` cannot serve here: it counts `string`,
+ * which is a reference. */
+static bool type_is_scalar_register(zan_type_t *t) {
+    return t && (type_is_numeric(t) || t->kind == TYPE_BOOL ||
+                 t->kind == TYPE_CHAR || t->kind == TYPE_ENUM ||
+                 t->kind == TYPE_NINT);
+}
+
 /* Whether an argument of type `value` cannot reach a parameter of type
- * `target`. Only class/struct types are judged, and only when neither side is
- * a generic instantiation: passing an unrelated class (Theme where App is
- * declared) shares the pointer carrier but not the layout, so it survived
- * every source-level phase and read foreign fields at runtime. Numerics,
- * interfaces, delegates, arrays and generics are left to the existing
- * assignment/irgen paths. */
+ * `target`. Two rules, both about a carrier that lines up while the thing
+ * behind it does not:
+ *
+ *   1. a reference of an unrelated class/struct -- Theme where App is
+ *      declared, a plain string where Control is. It shares the object
+ *      pointer but not the layout, so it survived every source-level phase
+ *      and read foreign fields at runtime.
+ *   2. a scalar handed to an `object`, interface, delegate or array parameter.
+ *      There is no boxing, so irgen `inttoptr`s the number into the slot
+ *      (`emit_boundary_coerce`) and the next `is`, pattern match or member
+ *      access reads `ptr - 8` and faults. `object o = 42;` is already an error
+ *      at assignment; this is the same rule on the argument path, which was the
+ *      one gap left. Class targets are deliberately absent: a scalar reaches
+ *      one through a single-argument constructor (`InitCheckbox(lbl, false)`
+ *      building a SignalBool), and `emit_arg_typed` already reports the case
+ *      where no constructor matches.
+ *
+ * Generic instantiations stay with irgen's invariance check; null literals and
+ * numeric conversions are left to the existing paths. */
 static bool checker_arg_type_mismatch(zan_checker_t *c, zan_type_t *target,
                                       zan_type_t *value) {
     if (!target || !value) return false;
-    if (target->kind != TYPE_CLASS && target->kind != TYPE_STRUCT) return false;
-    if (value->kind != TYPE_CLASS && value->kind != TYPE_STRUCT) return false;
-    if (!target->sym || !value->sym) return false;
     if (target->type_arg_count || value->type_arg_count) return false;
+    if (type_is_scalar_register(value)) {
+        bool ref_target = target->kind == TYPE_OBJECT ||
+                          target->kind == TYPE_INTERFACE ||
+                          target->kind == TYPE_DELEGATE ||
+                          target->kind == TYPE_ARRAY;
+        if (!ref_target) return false;
+        if (checker_type_assignable(target, value)) return false;
+        return !checker_has_user_conversion(c, target, value);
+    }
+    if (target->kind != TYPE_CLASS && target->kind != TYPE_STRUCT) return false;
+    if (!target->sym) return false;
+    bool ref_value = value->kind == TYPE_CLASS || value->kind == TYPE_STRUCT ||
+                     value->kind == TYPE_STRING || value->kind == TYPE_ARRAY ||
+                     value->kind == TYPE_DELEGATE ||
+                     value->kind == TYPE_INTERFACE;
+    if (!ref_value) return false;
     if (checker_type_assignable(target, value)) return false;
     return !checker_has_user_conversion(c, target, value);
 }
 
-/* The declaration whose parameters line up one-for-one with this call's
- * arguments, or NULL when the checker cannot match them by position: an
- * overloaded name (irgen picks the overload), a generic method, a `params`
- * tail or an extension receiver (the declaration has a parameter the call has
- * no argument for), and named or `ref`/`out` arguments (reordered or passed by
- * reference). */
-static zan_symbol_t *call_arg_signature(zan_ast_node_t *call,
-                                        zan_type_t *recv) {
-    zan_ast_node_t *callee = call->call.callee;
-    if (!callee || callee->kind != AST_MEMBER_ACCESS) return NULL;
-    if (!recv || !recv->sym || recv->type_arg_count) return NULL;
-    zan_istr_t name = callee->member.name;
+/* The sole method of this name on `type_sym` or its bases; NULL when the name
+ * is overloaded (irgen picks the overload) or absent. */
+static zan_symbol_t *unique_named_method(zan_symbol_t *type_sym,
+                                         zan_istr_t name) {
     zan_symbol_t *only = NULL;
-    for (zan_symbol_t *s = recv->sym; s;
+    for (zan_symbol_t *s = type_sym; s;
          s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
         for (int i = 0; i < s->member_count; i++) {
             zan_symbol_t *m = s->members[i];
@@ -1339,6 +1366,37 @@ static zan_symbol_t *call_arg_signature(zan_ast_node_t *call,
             if (only && only != m) return NULL;
             only = m;
         }
+    }
+    return only;
+}
+
+/* The declaration whose parameters line up one-for-one with this call's
+ * arguments, or NULL when the checker cannot match them by position: an
+ * overloaded name (irgen picks the overload), a generic method, a `params`
+ * tail or an extension receiver (the declaration has a parameter the call has
+ * no argument for), and named or `ref`/`out` arguments (reordered or passed by
+ * reference). Both call shapes are judged: `recv.M(a)` and a bare `M(a)` on
+ * the enclosing type, which is where the implicit-this path used to slip past
+ * every argument check. */
+static zan_symbol_t *call_arg_signature(zan_checker_t *c, zan_ast_node_t *call,
+                                        zan_type_t *recv) {
+    zan_ast_node_t *callee = call->call.callee;
+    if (!callee) return NULL;
+    zan_symbol_t *only = NULL;
+    if (callee->kind == AST_MEMBER_ACCESS) {
+        if (!recv || !recv->sym || recv->type_arg_count) return NULL;
+        only = unique_named_method(recv->sym, callee->member.name);
+    } else if (callee->kind == AST_IDENTIFIER) {
+        if (!c->current_type_sym) return NULL;
+        if (c->current_type_sym->type &&
+            c->current_type_sym->type->type_arg_count) return NULL;
+        /* a local, parameter or field of that name is a delegate being
+         * invoked, not the method it shadows */
+        zan_symbol_t *shadow = zan_binder_lookup(c->binder, callee->ident.name);
+        if (shadow && shadow->kind != SYM_METHOD) return NULL;
+        only = unique_named_method(c->current_type_sym, callee->ident.name);
+    } else {
+        return NULL;
     }
     if (!only || !only->decl || only->decl->kind != AST_METHOD_DECL) return NULL;
     if (only->decl->method_decl.type_params.count) return NULL;
@@ -1782,7 +1840,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         } else {
             callee_type = zan_checker_check_expr(c, expr->call.callee);
         }
-        zan_symbol_t *arg_sig = call_arg_signature(expr, recv);
+        zan_symbol_t *arg_sig = call_arg_signature(c, expr, recv);
         for (int i = 0; i < expr->call.args.count; i++) {
             zan_ast_node_t *arg = expr->call.args.items[i];
             if (arg && arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;

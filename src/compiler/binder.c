@@ -271,6 +271,16 @@ zan_type_t *zan_binder_make_grouping_type(zan_binder_t *b, zan_type_t *elem) {
         (zan_type_t **)zan_arena_alloc(b->arena, sizeof(zan_type_t *));
     t->type_args[0] = elem;
     t->type_arg_count = 1;
+    /* Attach the real stdlib class symbol. `List` gets away without one
+     * because irgen special-cases the builtin containers everywhere, but
+     * `Grouping` is an ordinary class in System.Linq: with no symbol the type
+     * has no members, so in `group e by k into g select g.Key` the projection
+     * neither type-inferred (it fell back to the group's element type, and a
+     * `select g.Items.Count` then failed to convert List<string> to List<int>)
+     * nor emitted (member lookup missed and the read came out as constant 0). */
+    zan_istr_t nm = { "Grouping", 8 };
+    zan_symbol_t *sym = zan_binder_lookup(b, nm);
+    if (sym && sym->kind == SYM_CLASS) t->sym = sym;
     return t;
 }
 

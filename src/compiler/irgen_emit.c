@@ -912,6 +912,28 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
     (void)type_sym; (void)fn;
 }
 
+/* A parameter the body assigns to must own what its slot holds. An argument
+ * arrives borrowed, so with a plain slot `t = p; p = q; q = t;` left the
+ * *owned* local holding the caller's object -- and scope exit released it,
+ * freeing an object the caller was still using. The stdlib's generic merge
+ * sort swaps its key parameter exactly like this: `orderby` returned a
+ * half-merged list and then corrupted the heap. Retaining on entry makes the
+ * slot symmetric with a local: assignments release the previous occupant, and
+ * scope exit or unwinding releases the last one. Parameters that are only read
+ * keep the zero-cost borrow. `object` is excluded because its ownership is
+ * tracked by a per-slot runtime flag (obj_rc_flag) rather than statically, and
+ * `ref`/`out` parameters have their own byref_slot protocol. */
+static void own_written_param(zan_irgen_t *g, local_scope_t *locals,
+                              zan_ast_node_t *param, zan_type_t *pt,
+                              LLVMTypeRef pty, LLVMValueRef pv,
+                              zan_ast_node_t *body) {
+    if (!pt || pt->kind == TYPE_OBJECT || !is_rc_managed_type(pt)) return;
+    if (LLVMGetTypeKind(pty) != LLVMPointerTypeKind) return;
+    if (!body_writes_ident(g, body, param->param.name)) return;
+    emit_rc_retain_for_type(g, pt, pv);
+    arc_own_local(g, locals);
+}
+
 static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
     /* Discover every concrete instantiation of a user generic class up front so
      * Pass A can emit one specialized variant per instantiation (in addition to
@@ -1037,11 +1059,23 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                      * shared-table runtime (rt_file.o vs rt_sync.o). */
                     g->uses_file_runtime = true;
                 }
+                /* Every symbol family rt_sync.c exports, so a program that
+                 * declares one links the object. The list must stay in sync
+                 * with rt_sync.c's exports: a missing family links only by
+                 * luck -- `zan_mmap_*` (System.IO.MemoryMappedFile) used to be
+                 * absent here and resolved solely because `using System` also
+                 * dragged in System.Threading, so the day that pull was removed
+                 * every memory-mapped-file program failed at link time with
+                 * "undefined reference to zan_mmap_create". */
                 if (strncmp(ext_name, "zan_atomic_int_", 15) == 0 ||
-                    strncmp(ext_name, "zan_shared_table_", 17) == 0 ||
+                    strncmp(ext_name, "zan_shared_", 11) == 0 ||
                     strncmp(ext_name, "zan_thread_", 11) == 0 ||
                     strncmp(ext_name, "zan_dispatch_", 13) == 0 ||
                     strncmp(ext_name, "zan_monotonic_", 14) == 0 ||
+                    strncmp(ext_name, "zan_monitor_", 12) == 0 ||
+                    strncmp(ext_name, "zan_mmap_", 9) == 0 ||
+                    strncmp(ext_name, "zan_exe_dir_", 12) == 0 ||
+                    strncmp(ext_name, "zan_dir_list_", 13) == 0 ||
                     strncmp(ext_name, "zan_plat_", 9) == 0) {
                     if (getenv("ZAN_TRACE_SYNC"))
                         fprintf(stderr, "[sync-flag] %s\n", ext_name);
@@ -1389,11 +1423,15 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                         locals->vars[locals->count - 1].arc_owned = 1;
                 continue;
             }
+            LLVMValueRef pv = LLVMGetParam(fn, (unsigned)(k + param_offset));
             LLVMValueRef param_alloca = LLVMBuildAlloca(g->builder, param_types[k + param_offset], "p");
-            LLVMBuildStore(g->builder, LLVMGetParam(fn, (unsigned)(k + param_offset)), param_alloca);
+            LLVMBuildStore(g->builder, pv, param_alloca);
             local_add(locals, param->param.name, param_alloca, pt);
             if (pt && pt->kind == TYPE_STRING)
                 locals->vars[locals->count - 1].opaque_string = 1;
+            own_written_param(g, locals, param, pt,
+                              param_types[k + param_offset], pv,
+                              member->method_decl.body);
         }
 
         LLVMValueRef saved_fn = g->current_fn;
@@ -2024,9 +2062,12 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
                     locals->vars[locals->count - 1].arc_owned = 1;
             continue;
         }
+        LLVMValueRef pv = LLVMGetParam(sp.fn, pi);
         LLVMValueRef param_alloca = LLVMBuildAlloca(g->builder, param_types[pi], "p");
-        LLVMBuildStore(g->builder, LLVMGetParam(sp.fn, pi), param_alloca);
+        LLVMBuildStore(g->builder, pv, param_alloca);
         local_add(locals, param->param.name, param_alloca, pt);
+        own_written_param(g, locals, param, pt, param_types[pi], pv,
+                          member->method_decl.body);
     }
     free(param_types);
 
@@ -2170,6 +2211,13 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     /* Pass 2: emit user-defined methods */
     emit_user_methods(g, unit);
 
+    /* An error here already dooms the build (see the check before finalize), so
+     * stopping now cannot change the outcome -- it only avoids carrying a
+     * half-emitted body into the synthetic passes below. Those walk the module
+     * assuming every function, vtable slot and reflection record it references
+     * exists, so a failed body turns a reported error into a compiler crash. */
+    if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
+
     /* Pass 3: find and emit static Main method */
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
@@ -2193,6 +2241,7 @@ done:
     ;
     /* Main may have created method specializations too. */
     emit_pending_method_specs(g);
+    if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
     /* Synthesise per-class release functions now that every class type has
      * been registered (Pass 1) and referenced (Passes 2/3). */
     di_clear(g); /* the following are synthetic fns; no user source scope */

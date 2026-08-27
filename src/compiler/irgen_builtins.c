@@ -2558,20 +2558,24 @@ static void pack_params_args(zan_irgen_t *g, zan_ast_node_t *call,
     int argc = call->call.args.count;
     if (argc < fixed) return;
     if (argc == visible) {
+        /* A single trailing argument that is already the bundle passes through
+         * untouched, as in C#: `Sum(arr)` hands `arr` over instead of wrapping
+         * it in a one-element array. */
         zan_ast_node_t *la = call->call.args.items[argc - 1];
-        if (la->kind == AST_NEW_EXPR) return; /* already packed / explicit list */
+        if (la->kind == AST_NEW_EXPR) return; /* already packed / explicit array */
         zan_type_t *lt = infer_expr_type(g, la, locals);
-        if (lt && type_named(lt, "List", 4)) return;
+        if (lt && lt->kind == TYPE_ARRAY) return;
     }
     zan_ast_node_t *last_p = ps->items[ps->count - 1];
-    zan_ast_node_t *lst = zan_ast_new(g->arena, AST_NEW_EXPR, call->loc);
-    lst->new_expr.type = last_p->param.type; /* List<T> */
-    lst->new_expr.is_array = false;
-    zan_ast_list_init(&lst->new_expr.args);
+    zan_ast_node_t *arr = zan_ast_new(g->arena, AST_NEW_EXPR, call->loc);
+    arr->new_expr.type = last_p->param.type; /* T[] */
+    arr->new_expr.is_array = true;
+    arr->new_expr.array_init = true; /* args are the elements */
+    zan_ast_list_init(&arr->new_expr.args);
     for (int i = fixed; i < argc; i++)
-        zan_ast_list_push(&lst->new_expr.args, call->call.args.items[i], g->arena);
+        zan_ast_list_push(&arr->new_expr.args, call->call.args.items[i], g->arena);
     call->call.args.count = fixed;
-    zan_ast_list_push(&call->call.args, lst, g->arena);
+    zan_ast_list_push(&call->call.args, arr, g->arena);
 }
 
 static LLVMValueRef emit_ref_arg(zan_irgen_t *g, zan_ast_node_t *arg,

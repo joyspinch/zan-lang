@@ -55,7 +55,18 @@ struct zan_lexer {
     zan_interp_level_t interp_stack[ZAN_MAX_INTERP_DEPTH];
 
     /* ---- Preprocessor state ---- */
-    zan_pp_define_t defines[ZAN_PP_MAX_DEFINES];
+    /* Arena-allocated rather than inline: the table is 40 KB, and the parser
+     * backtracks speculative lookahead by snapshotting a whole lexer into a
+     * stack local (`zan_lexer_t saved = *p->lex;`, six sites in parser.c). With
+     * the table inline every one of those frames was 41 KB, and one of them
+     * sits in the expression recursion cycle (parse_postfix) -- so nesting
+     * overflowed the 1 MB stack at ~25 levels, long before the parser's own
+     * 256-deep guard could turn it into a diagnostic.
+     * Behind a pointer a snapshot copies ~520 bytes and shares the table.
+     * Semantics are unchanged: the snapshot carries `define_count`, so
+     * restoring it truncates any #define a speculative pass appended (live
+     * entries are always [0, define_count)). */
+    zan_pp_define_t *defines;
     int define_count;
     /* Conditional compilation stack: 1=active, 0=skipping */
     int cond_stack[ZAN_PP_MAX_COND_DEPTH];
