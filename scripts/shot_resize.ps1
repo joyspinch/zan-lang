@@ -13,6 +13,9 @@ public class WR{
  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h,IntPtr a,int x,int y,int cx,int cy,uint f);
  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h,out RECT r);
  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+ // See shot_gallery.ps1: PrintWindow reads the window's own pixels, so a lost
+ // focus race cannot substitute another app's picture for the shot.
+ [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h,IntPtr hdc,uint f);
  public delegate bool EnumProc(IntPtr h,IntPtr l);
  public static IntPtr Found=IntPtr.Zero;
  [StructLayout(LayoutKind.Sequential)] public struct RECT{public int L;public int T;public int R;public int B;}
@@ -32,6 +35,10 @@ $r=New-Object WR+RECT
 $bw=$r.R-$r.L; $bh=$r.B-$r.T
 $bmp=New-Object System.Drawing.Bitmap($bw,$bh)
 $g=[System.Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($r.L,$r.T,0,0,(New-Object System.Drawing.Size($bw,$bh)))
+$hdc=$g.GetHdc()
+$ok=[WR]::PrintWindow($h,$hdc,2)
+$g.ReleaseHdc($hdc)
+$g.Dispose()
+if(-not $ok){Write-Output "printwindow-failed";exit 1}
 $bmp.Save($Out,[System.Drawing.Imaging.ImageFormat]::Png)
 Write-Output ("shot ok " + $bw + "x" + $bh + " -> " + $Out)

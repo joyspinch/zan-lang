@@ -1,4 +1,6 @@
-param([string]$A = "", [int]$CX = 0, [int]$CY = 0, [string]$Out = "d:\project\zan-lang\build\shot_click.png")
+# CapH, not H: PowerShell variable names are case-insensitive, so a -H
+# parameter would be the same variable as the $h window handle below.
+param([string]$A = "", [int]$CX = 0, [int]$CY = 0, [int]$CapH = 460, [string]$Out = "d:\project\zan-lang\build\shot_click.png")
 $exe = "d:\project\zan-lang\build\gallery_test.exe"
 Get-Process gallery_test -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 300
@@ -6,6 +8,20 @@ $argList = @()
 if ($A -ne "") { $argList = $A.Split(" ") }
 if ($argList.Count -gt 0) { Start-Process $exe -ArgumentList $argList } else { Start-Process $exe }
 Start-Sleep -Milliseconds 1500
+
+# PowerShell is DPI-unaware by default: on a scaled display GetWindowRect and
+# SetCursorPos then work in virtualised coordinates while the capture is in
+# physical pixels, so click coordinates read off a screenshot land in the wrong
+# place (2/3 of the way at 150%). Opt in before measuring or clicking anything.
+Add-Type @"
+using System;using System.Runtime.InteropServices;
+public class DPIC{
+ [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr c);
+ [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+ public static void On(){ try{ if(SetProcessDpiAwarenessContext((IntPtr)(-4))) return; }catch{} try{ SetProcessDPIAware(); }catch{} }
+}
+"@
+[DPIC]::On()
 
 Add-Type @"
 using System;using System.Text;using System.Runtime.InteropServices;
@@ -19,6 +35,9 @@ public class WGC{
  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x,int y);
  [DllImport("user32.dll")] public static extern void mouse_event(uint f,uint dx,uint dy,uint d,IntPtr e);
+ // See shot_gallery.ps1: read the window's own pixels so the shot cannot end
+ // up showing whatever else happened to cover the screen.
+ [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h,IntPtr hdc,uint f);
  public delegate bool EnumProc(IntPtr h,IntPtr l);
  public static IntPtr Found = IntPtr.Zero;
  [StructLayout(LayoutKind.Sequential)] public struct RECT{ public int L; public int T; public int R; public int B; }
@@ -45,10 +64,14 @@ $r = New-Object WGC+RECT
 [WGC]::GetWindowRect($h,[ref]$r) | Out-Null
 if ($CX -ne 0) { [WGC]::Click($r.L + $CX, $r.T + $CY); Start-Sleep -Milliseconds 500 }
 [WGC]::GetWindowRect($h,[ref]$r) | Out-Null
-$w = $r.R - $r.L; $ht = 460
+$w = $r.R - $r.L; $ht = $CapH
 Add-Type -AssemblyName System.Drawing
 $bmp = New-Object Drawing.Bitmap($w,$ht)
 $g = [Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($r.L,$r.T,0,0,$bmp.Size)
+$hdc = $g.GetHdc()
+$ok = [WGC]::PrintWindow($h, $hdc, 2)
+$g.ReleaseHdc($hdc)
+$g.Dispose()
+if (-not $ok) { Write-Output "printwindow-failed"; exit 1 }
 $bmp.Save($Out)
 Write-Output ("ok click=" + $CX + "," + $CY + " -> " + $Out)

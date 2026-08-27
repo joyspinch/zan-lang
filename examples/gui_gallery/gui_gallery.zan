@@ -217,6 +217,16 @@ class Comp {
         return this;
     }
 
+    /// 把 desc/code/json 那张「Basic usage」卡显式排到最前面。
+    ///
+    /// EffectiveDemos 只在演示列表为空时才合成这张卡，所以给一个老组件
+    /// 补第一个 AddDemo，会顺手把它原有的基础示例顶掉 —— 页面上看起来
+    /// 就是「基础用法这一节没了」。两者都要留的组件调用这个。
+    Comp WithBasic(int previewH) {
+        demos.Insert(0, new Demo("Basic usage", "", name, previewH, code, json));
+        return this;
+    }
+
     Comp AddProp(string name, string type, string deflt, string desc) {
         props.Add(new ApiRow(name, type, deflt, desc));
         return this;
@@ -449,6 +459,11 @@ class Gallery {
     static Input demoIcons;
     static Input demoOff;
     static Input demoErr;
+    // 三种模式的日期选择器。同样必须保留态：弹出的月历是控件自己的
+    // 覆盖层，每帧重建就等于每帧把它关掉。
+    static DatePicker demoDay;
+    static DatePicker demoWhen;
+    static DatePicker demoSpan;
     // 全选父项演示的保留态复选框组（含半选父框的可视状态）。
     static CheckboxGroup demoCbg;
     // JSON design document -> real control tree (FormBuilder.Build).
@@ -466,6 +481,12 @@ class Gallery {
     static SelectBox demoLong;
     static SelectBox demoLarge;
     static SelectBox demoSelectLow;
+    // 下拉框的四项能力各自一个演示：键入筛选、表格式选项、
+    // 两万条的虚表、悬停事件。
+    static SelectBox demoFilter;
+    static SelectBox demoTablePick;
+    static SelectBox demoHugePick;
+    static SelectBox demoHoverPick;
     static Dropdown<string> demoDropdown;
     static Popover demoPopover;
     static FilePicker filePicker;
@@ -518,6 +539,45 @@ class Gallery {
     // 画布环缓冲转储开关（ZAN_CANVAS_RING），见主循环里的转储点。
     static bool ringDump;
     static int ringIdx;
+    // 演示自检开关（ZAN_GALLERY_AUDIT），见 Gallery.Audit。
+    static bool audit;
+    // 本进程已记过的演示 -> 上次记下的「框高/内容/宽度」，用来只在数字
+    // 变化时补记一行，而不是每帧重复同一行。
+    static Dictionary<string, string> auditSeen;
+    // ---- 演示高度：实测优先，注册处的数字只作种子 ---------------------
+    // 每个演示原本在 AddDemo(..., previewH, ...) 里带一个手调的像素高度，
+    // 于是「窗口变窄 -> 内容换行 -> 高度不够 -> 被裁掉」是必然的，而且
+    // 每次改演示内容都得回去改那个数字。改用 LayoutAuto 的演示把自己
+    // 量出来的内容高度记在这里，PreviewBoxH 优先用它。
+    //
+    // 卡片高度在演示绘制之前就要算出来，所以读到的是上一帧的实测值：
+    // 和引擎里 Flex/Grid 的换行收敛是同一套办法——第一帧用种子高度，
+    // 量到真值后 RequestRedraw，第二帧起高度就是内容说了算。
+    static Dictionary<string, int> autoH;
+    // 每个实测值是在多宽的预览卡里量出来的。宽度变了（窗口缩放导致
+    // 换行行数变化）就必须重新量，否则会拿旧行数的高度去排新宽度。
+    static Dictionary<string, int> autoW;
+    // 当前预览框的顶边与卡片宽度（RenderPreview 每帧在进入演示分支前
+    // 设置）。LayoutAuto 用前者把内容底边换算成框高，RecordAuto 用后者
+    // 作为失效键 —— 两边必须是同一个数，否则实测值永远读不回来。
+    static int previewBoxTop;
+    static int previewCardW;
+    // 每个演示最近一次触发的事件文字，画在该卡片 "LIVE STATES" 那一行的
+    // 右端。一个只能看不能按出反应的演示，读者无法判断事件到底通没通，
+    // 也照抄不到接线的写法 —— 所以演示的处理器统一往这里写一句话。
+    static Dictionary<string, string> lastEvent;
+    // 同一个演示里事件触发了几次：连按同一个按钮时文字不变，没有计数
+    // 就看不出第二次到底通没通。
+    static Dictionary<string, int> eventN;
+    // 本帧这个演示里建出来的按钮。一排按钮各写一个处理器毫无信息量，
+    // 于是统一登记，排完版之后用 WasClicked（Click 事件的轮询版）问一遍。
+    static List<Button> demoBtns;
+    // 演示树里每个控件每个属性上一帧的值，键为 "演示/控件序号/属性名"。
+    // ReportTree 靠它判断「刚刚变了什么」，从而不必给每个演示手写处理器。
+    static Dictionary<string, string> watch;
+    // WatchTree 递归时的控件计数器，给树里的控件编出稳定的键。
+    static int watchSeq;
+
     static ScrollView navView;
     static Tabs tbLine;
     static Tabs tbCard;
@@ -699,7 +759,14 @@ class Gallery {
 
     static void Main() {
         App app = App.CreateDark("Zan GUI Components", 1120, 720);
+        // 损伤区重绘（默认关，见 App.SetPartialFrames）。开着它，动画帧
+        // 只重画自己声明的那一块，而不是每 60ms 把 1702x1136 的整窗在
+        // CPU 上重新光栅一遍 —— 后者是 HMI 各页 CPU 高的全部原因。
+        // 用 ZAN_GALLERY_FULLFRAMES=1 可以关掉，用来对比排查残影。
+        app.SetPartialFrames(UiDriver.Env("ZAN_GALLERY_FULLFRAMES") != "1");
         Gallery.ringDump = UiDriver.Env("ZAN_CANVAS_RING") != "";
+        Gallery.audit = UiDriver.Env("ZAN_GALLERY_AUDIT") == "1";
+        Gallery.auditSeen = new Dictionary<string, string>();
         // App-level CSS: brand classes the demos use, layered over the skin.
         app.UseAppCss("button.pink { background: #e91e63; color: #fff; border-color: #e91e63 }"
                       + " button.teal { background: #13c2c2; color: #fff; border-color: #13c2c2 }");
@@ -735,16 +802,24 @@ class Gallery {
         Gallery.demoOff.Disabled = true;
         Gallery.demoErr = new Input("taken@example.com");
         Gallery.demoErr.SetError("That address is already taken.");
+        Gallery.demoDay = new DatePicker();
+        Gallery.demoDay.SetText("2026-08-27");
+        Gallery.demoWhen = new DatePicker();
+        Gallery.demoWhen.SetExtra("type", "datetime");
+        Gallery.demoWhen.SetText("2026-08-27 14:30");
+        Gallery.demoSpan = new DatePicker();
+        Gallery.demoSpan.SetExtra("type", "daterange");
+        Gallery.demoSpan.SetText("2026-08-01 ~ 2026-08-15");
         // 全选父项 + 半选（indeterminate）演示组。
         Gallery.demoCbg = new CheckboxGroup();
-        Gallery.demoCbg.Add("Cheese");
-        Gallery.demoCbg.Add("Tomato");
-        Gallery.demoCbg.Add("Basil");
+        Gallery.demoCbg.AddOption("Cheese");
+        Gallery.demoCbg.AddOption("Tomato");
+        Gallery.demoCbg.AddOption("Basil");
         // One .zform-style document instantiated into a real control
         // tree: the designer saves exactly this JSON, and the preview
         // and runtime share the same Build path.
         Gallery.demoForm = FormBuilder.Build(JsonValue.Parse(
-            "{ \"layoutMode: 0, \"fields: [\n    { \"kind: \"Input, \"label: \"Email, \"name: \"email, \"placeholder: \"you@example.com },\n    { \"kind: \"SelectBox, \"label: \"Role, \"name: \"role, \"options: [\"Admin, \"Editor, \"Viewer] },\n    { \"kind: \"Switch, \"label: \"Weekly digest, \"name: \"digest, \"defOn: true },\n    { \"kind: \"TextArea, \"label: \"Bio, \"name: \"bio, \"placeholder: \"A few words about you, \"span: 24 }\n ] }"));
+            "{ \"layoutMode\": 0, \"fields\": [\n    { \"kind\": \"Input\", \"label\": \"Email\", \"name\": \"email\", \"placeholder\": \"you@example.com\" },\n    { \"kind\": \"SelectBox\", \"label\": \"Role\", \"name\": \"role\", \"options\": [\"Admin\", \"Editor\", \"Viewer\"] },\n    { \"kind\": \"Switch\", \"label\": \"Weekly digest\", \"name\": \"digest\", \"defOn\": true },\n    { \"kind\": \"TextArea\", \"label\": \"Bio\", \"name\": \"bio\", \"placeholder\": \"A few words about you\", \"span\": 24 }\n ] }"));
         Panel formActions = Panel.Row().Gap(app.Scale(10));
         formActions.With(new Button { Text = "Cancel" });
         formActions.With(new Button { Text = "Create account", Class = "primary" });
@@ -908,6 +983,12 @@ class Gallery {
         Gallery.dlgPrompt = LayerState.Prompt("Rename item", "new name");
         Gallery.tipsOn = new SignalBool(false);
         Gallery.tipClickOn = new SignalBool(false);
+        Gallery.popTipOn = new SignalBool(false);
+        Gallery.lastEvent = new Dictionary<string, string>();
+        Gallery.eventN = new Dictionary<string, int>();
+        Gallery.demoBtns = new List<Button>();
+        Gallery.watch = new Dictionary<string, string>();
+        Gallery.watchSeq = 0;
         Gallery.scrollOff = new SignalInt(0);
         Gallery.tipScroll = new SignalInt(0);
         Gallery.photosOpen = new SignalBool(false);
@@ -932,6 +1013,8 @@ class Gallery {
 
         // Bilingual + persistent demo models.
         Gallery.lang = new SignalInt(0);
+        // 之后建的演示数据要用 Gallery.T，所以必须排在 lang 之后。
+        Gallery.BuildSelectDemos();
         Gallery.splitVFirst = new SignalInt(app.Scale(150));
         Gallery.splitHFirst = new SignalInt(app.Scale(70));
         Gallery.treeSel = new SignalInt(2);
@@ -1033,6 +1116,14 @@ class Gallery {
                     }
                 } else if (want == "Dropdown") {
                     Gallery.demoDropdown.Open();
+                } else if (want == "SelectBox") {
+                    // 下拉框的弹层是它的一半，截图不打开就什么也验证不到。
+                    string st = "filter";
+                    if (Environment.ArgCount() > 2) { st = Environment.ArgAt(2); }
+                    if (st == "table") { Gallery.demoTablePick.SetOpen(true); }
+                    else if (st == "virtual") { Gallery.demoHugePick.SetOpen(true); }
+                    else if (st == "hover") { Gallery.demoHoverPick.SetOpen(true); }
+                    else { Gallery.demoFilter.SetOpen(true); }
                 }
             }
         }
@@ -1098,6 +1189,17 @@ class Gallery {
                     Window.SleepMs(16 - since);
                 }
                 r = app.window.PollEvent();
+                // 关键：PollEvent 在 zq 空时**不阻塞、立即返回 1**——
+                // 与注释里 "Poll (to keep animating)" 的预期相反。原
+                // 循环拿 r==1 走 app.ApplyEvent(evh=0)→!mine return
+                // true→doFrame=false→BeginFrame 不跑→needsRedraw 永远
+                // true 永远不清→主循环 100% CPU 空转。点完
+                // Button.quaternary / Button.color 这一类无 Click handler
+                // 的按钮、鼠标停在按钮上不动时一抓一个准。
+                // 仿照 App.ProcessEvent：空事件直接退回到内核等待。
+                if (r == 1) {
+                    r = app.window.WaitEventTimeout(16);
+                }
             } else if (!Gallery.filePicker.IsOpen()
                        && (app.animNextMs >= 0 || app.fxNextMs >= 0)) {
                 // A throttled animation (spinner/skeleton) and/or the skin
@@ -1116,11 +1218,13 @@ class Gallery {
                     }
                     if (deadline < 0) { waiting = false; }
                     else if (now >= deadline) {
-                        bool fxOnly = app.animNextMs < 0 || now < app.animNextMs;
-                        if (!(fxOnly && app.FxPresent())) {
-                            app.RequestRedraw();
-                            waiting = false;
-                        }
+                        // 用框架的 TakeDueFrame 兑现到期的那一帧：它既标记
+                        // 该出帧，又把这一帧裁剪到各动画自己声明的范围。
+                        // 这里原来直接调 RequestRedraw()，那是「不知道改了
+                        // 哪些像素」的整窗重绘，会把动画刚声明好的矩形全部
+                        // 作废 —— 于是每个动画帧都在 CPU 上重新光栅整个
+                        // 窗口，这正是 HMI 各页 CPU 高的根因。
+                        if (app.TakeDueFrame(now)) { waiting = false; }
                     } else {
                         // Single kernel wait until input or the deadline (no
                         // poll + sleep slices; idle waiting costs no CPU).
@@ -1388,7 +1492,16 @@ class Gallery {
     /// real Modbus/OPC poll thread, minus the field bus. Throttled to one pass
     /// per period, so the number of HMI cards on screen does not change the
     /// simulated scan rate.
-    static void HmiTick(App app) {
+    /// HMI 演示的模拟采集节拍。`x,y,w,h` 是本演示的预览框：动画帧
+    /// 必须声明它，否则走不带范围的 RequestAnimationFrame，整页（代码
+    /// 面板、属性表、同页其他卡片）会跟着每 60ms 重新混合一遍 ——
+    /// 实测这让 HMI 各页比静态页高出一个数量级的 CPU。声明范围后
+    /// 那一帧只裁剪到这些框的并集。
+    ///
+    /// 声明放在下面的节流判断之前：帧调度和数据采样是两件事，跳过
+    /// 一次采样不该顺带把下一帧也取消掉。
+    static void HmiTick(App app, int x, int y, int w, int h) {
+        app.RequestAnimationFrameIn(60, x, y, w, h);
         int now = Window.GetTickMs();
         if (now - Gallery.hmiScanMs < 60) { return; }
         Gallery.hmiScanMs = now;
@@ -1422,7 +1535,6 @@ class Gallery {
             Gallery.hmiSampleMs = now;
             Gallery.hmiTrend.Sample();
         }
-        app.RequestAnimationFrame(60);
     }
 
     /// One cell of the EN / 中 language toggle.
@@ -1718,8 +1830,15 @@ class Gallery {
         }
         yy = yy + app.Scale(14);
 
-        int overlayPX = 0; int overlayPY = 0; int overlayPW = 0;
-        bool haveOverlay = false;
+        // 本页所有需要延迟到覆盖通道绘制的演示。原来这里只有一组
+        // overlayPX/PY/PW 标量，后一个演示会把前一个的位置覆盖掉，
+        // 而且传给 RenderOverlay 的是组件名而不是演示的 previewId ——
+        // 于是一页只能有一个弹层演示，且必须与组件同名，多出来的
+        // 那些就只剩一个空框。
+        List<string> ovName = new List<string>();
+        List<int> ovX = new List<int>();
+        List<int> ovY = new List<int>();
+        List<int> ovW = new List<int>();
         for (int dj = 0; dj < demos.Count; dj = dj + 1) {
             Demo d = demos[dj];
             d.EnsureCache(app, t, cw, d.tab);
@@ -1747,8 +1866,8 @@ class Gallery {
                 Gallery.RenderPreview(app, c, t, d.previewId, cx, pvY, cw,
                     d.previewH);
                 if (Gallery.IsOverlayComp(d.previewId)) {
-                    overlayPX = cx; overlayPY = pvY; overlayPW = cw;
-                    haveOverlay = true;
+                    ovName.Add(d.previewId);
+                    ovX.Add(cx); ovY.Add(pvY); ovW.Add(cw);
                 }
                 yy = yy + Gallery.PreviewBoxH(app, d.previewId, d.previewH, cw)
                     + app.Scale(12);
@@ -1787,9 +1906,11 @@ class Gallery {
             app.RequestRedraw();
         }
 
-        if (haveOverlay) {
-            Gallery.RenderOverlay(app, c, t, e.name, overlayPX, overlayPY,
-                overlayPW);
+        for (int oi = 0; oi < ovName.Count; oi = oi + 1) {
+            Gallery.previewBoxTop = ovY[oi];
+            Gallery.previewCardW = ovW[oi];
+            Gallery.RenderOverlay(app, c, t, ovName[oi], ovX[oi], ovY[oi],
+                ovW[oi]);
         }
     }
 
@@ -2261,7 +2382,9 @@ class Gallery {
         if (name == "Button") { return 470; }
         if (name == "Icon") { return 360; }
         if (name == "States") { return 110; }
-        if (name == "Tabs") { return 385; }
+        // 垂直 rail 四项 = 4×34 + 顶部三行标题/页签；385 会把第四项
+        // （Run）裁在卡片底边上。
+        if (name == "Tabs") { return 430; }
         if (name == "TextArea") { return 245; }
         if (name == "SelectBox") { return 240; }
         if (name == "VirtualList") { return 235; }
@@ -2270,7 +2393,8 @@ class Gallery {
         if (name == "DataTable") { return 320; }
         if (name == "PivotTable") { return 270; }
         if (name == "Chart") { return 320; }
-        if (name == "Alert") { return 160; }
+        if (name == "Alert.types") { return 195; }
+        if (name == "Alert.queue") { return 155; }
         if (name == "Ellipsis") { return 165; }
         if (name == "Timeline") { return 165; }
         if (name == "TreeView") { return 305; }
@@ -2304,7 +2428,17 @@ class Gallery {
     /// as the window narrows, otherwise its lower rows spill past the fixed box
     /// and get clipped. Callers use this for both layout and the drawn frame so
     /// the box, the card height and the grid always agree.
+    /// 预览框内容区的上下内缩：上边留出 "LIVE STATES" 标题带，
+    /// 下边是收口留白。LayoutAuto 量到的是内容高度，加上这两段
+    /// 才是框高，所以两边必须读同一对值。
+    static int PreviewPadTop(App app) { return app.Scale(34); }
+    static int PreviewPadBottom(App app) { return app.Scale(14); }
+
     static int PreviewBoxH(App app, string name, int previewHUnscaled, int w) {
+        // 已经改用 LayoutAuto 的演示：框高由上一帧量到的内容底边决定，
+        // 注册处的 previewHUnscaled 只在第一帧（还没量过）起作用。
+        int auto = Gallery.AutoContentH(name, w);
+        if (auto > 0) { return auto + Gallery.PreviewPadBottom(app); }
         if (name == "Icon") {
             int cell = app.Scale(62);
             int gcols = (w - app.Scale(24)) / cell;
@@ -2330,8 +2464,325 @@ class Gallery {
         root.RenderTree(app);
     }
 
+    /// LayoutIn 的自测量版本：高度由子树自己量出来，而不是调用方传一个
+    /// 手调的数字。演示改用它之后，AddDemo 里的高度只是第一帧的种子，
+    /// 窗口变窄让 Flex 换行时卡片会跟着长高，而不是把内容裁掉。
+    ///
+    /// 参数与 LayoutIn 完全一致，只多了开头的 `name`（该演示的
+    /// previewId，PreviewBoxH 用同一个键回读）；末尾的 `fallbackH`
+    /// 就是原来那个手调高度，仅在子树量不出高度时兜底。
+    static void LayoutAuto(App app, Control root, string name,
+                           int x, int y, int w, int fallbackH) {
+        // 宽度已知，先告诉容器：换行的一排按钮才能在第一次测量就
+        // 算出正确行数（演示每帧重建控件树，没有上一帧的状态可用）。
+        root.HintWrapWidth(w);
+        root.MeasureTree(app);
+        int h = root.prefH;
+        if (h < 1) {
+            // 这棵树量不出高度——根多半是个跨帧复用的容器，它的
+            // 测量早已定型。保持改造前的行为：用调用方给的框高，
+            // 也不要写进缓存，否则卡片会塌成一条线。
+            root.Arrange(x, y, w, fallbackH);
+            root.RenderTree(app);
+            Gallery.ReportTree(app, name, root);
+            return;
+        }
+        root.Arrange(x, y, w, h);
+        root.RenderTree(app);
+        Gallery.ReportTree(app, name, root);
+        // 记的是「内容底边相对框顶的距离」而不是纯内容高度：各演示
+        // 的内容起点偏移并不统一（有的 y+34，有的 py-16），只有算到
+        // 框顶为止，PreviewBoxH 才能不管偏移直接得出框高。
+        Gallery.RecordAuto(app, name, y - Gallery.previewBoxTop + h);
+    }
+
+    /// 下拉框四项能力的演示数据。放在一处，因为它们只是同一个 SelectBox
+    /// 的不同配置，而不是四个不同的控件。
+    static void BuildSelectDemos() {
+        // 键入筛选：候选项多到不值得逐条翻的时候，搜索框才是入口。
+        Gallery.demoFilter = new SelectBox("Type to filter countries")
+            .Filterable(true)
+            .FilterHint(Gallery.T("Search countries", "搜索国家/地区"));
+        List<string> cs = new List<string>{
+            "Argentina", "Australia", "Austria", "Belgium", "Brazil", "Canada",
+            "Chile", "China", "Denmark", "Egypt", "Finland", "France",
+            "Germany", "Greece", "India", "Indonesia", "Ireland", "Italy",
+            "Japan", "Kenya", "Korea", "Malaysia", "Mexico", "Netherlands",
+            "New Zealand", "Norway", "Peru", "Poland", "Portugal", "Singapore",
+            "South Africa", "Spain", "Sweden", "Switzerland", "Thailand",
+            "Turkey", "Ukraine", "United Kingdom", "United States", "Vietnam" };
+        for (int i = 0; i < cs.Count; i = i + 1) {
+            Gallery.demoFilter.AddOption(cs[i]);
+        }
+
+        // 表格式选项：一行三列，筛选对所有列生效（按代码搜和按名称搜
+        // 同样自然）。
+        Gallery.demoTablePick = new SelectBox("Pick a stock")
+            .Filterable(true)
+            .FilterHint(Gallery.T("Code or name", "代码或名称"));
+        Gallery.demoTablePick.Table(
+            new List<string>{ Gallery.T("Code", "代码"),
+                              Gallery.T("Name", "名称"),
+                              Gallery.T("Last", "最新价") },
+            new List<int>{ 80, 150, 90 });
+        Gallery.demoTablePick.AddRow(new List<string>{ "600519", "Kweichow Moutai", "1712.00" });
+        Gallery.demoTablePick.AddRow(new List<string>{ "000858", "Wuliangye", "128.44" });
+        Gallery.demoTablePick.AddRow(new List<string>{ "601318", "Ping An", "56.31" });
+        Gallery.demoTablePick.AddRow(new List<string>{ "600036", "Merchants Bank", "39.02" });
+        Gallery.demoTablePick.AddRow(new List<string>{ "000333", "Midea Group", "72.18" });
+        Gallery.demoTablePick.AddRow(new List<string>{ "300750", "CATL", "241.60" });
+        Gallery.demoTablePick.AddRow(new List<string>{ "002594", "BYD", "265.77" });
+        Gallery.demoTablePick.AddRow(new List<string>{ "601899", "Zijin Mining", "18.05" });
+        Gallery.demoTablePick.AddRow(new List<string>{ "600900", "Yangtze Power", "28.94" });
+        Gallery.demoTablePick.AddRow(new List<string>{ "688981", "SMIC", "88.30" });
+
+        // 虚表：两万条。弹层只遍历视口里的十几行，宽度只量一次 ——
+        // 否则每帧两万次文本测量，一开就卡住。
+        Gallery.demoHugePick = new SelectBox("20000 options")
+            .Filterable(true)
+            .FilterHint(Gallery.T("Filter 20000 rows", "在两万条里筛"));
+        for (int i = 0; i < 20000; i = i + 1) {
+            Gallery.demoHugePick.AddOption(
+                "Item " + Convert.ToString(i + 1) + " · virtualized row");
+        }
+
+        // 悬停事件：指到哪条，卡片头部就报哪条。
+        Gallery.demoHoverPick = new SelectBox("Hover the options");
+        Gallery.demoHoverPick.AddOption("Alpha");
+        Gallery.demoHoverPick.AddOption("Bravo");
+        Gallery.demoHoverPick.AddOption("Charlie");
+        Gallery.demoHoverPick.AddOption("Delta");
+        Gallery.demoHoverPick.AddOption("Echo");
+    }
+
+    /// 立即模式的演示（直接把内容 Draw/Render 到算好的坐标上，没有控件树
+    /// 可量）报告自己内容的底边，框高就跟着内容走，与 LayoutAuto 共用同一
+    /// 个缓存 —— 只是高度由演示自己算，而不是由控件树量出来。
+    ///
+    /// 注册处那个手调的 previewH 之所以总有一边不对，是因为同一个数字要
+    /// 同时伺候宽窗口和窄窗口两种排布结果：窄了内容换行就被裁掉，宽了就
+    /// 空出一大片。
+    static void RecordBottom(App app, string name, int bottomY) {
+        Gallery.RecordAuto(app, name, bottomY - Gallery.previewBoxTop);
+    }
+
+    /// 说明小字。用 `label.caption` 而不是 DrawText + textTertiary：
+    /// 这样它是控件树的一员，能被测量、能跟着 CSS 换肤。
+    static Control Caption(string text) {
+        return new Label { Text = text, Class = "caption" };
+    }
+
+    /// 把一棵子树和它下面的说明小字装进一列。说明文字参与测量，
+    /// 框高才能把它算进去 —— 原先那些 `py + 84` 之类的手算偏移就
+    /// 不需要了。返回的还是这一列，需要第二行说明时接着
+    /// `.With(Gallery.Caption(...))`。
+    static Panel Captioned(App app, Control body, string caption) {
+        Panel col = Panel.Column().Gap(app.Scale(8));
+        col.With(body);
+        col.With(Gallery.Caption(caption));
+        return col;
+    }
+
+    /// 一个字段行加一行说明小字，整棵树都能被测量。
+    static Control FieldWithCaption(App app, string label, Control field,
+                                    string caption) {
+        Flex row = Flex.Wrapped().Gap(app.Scale(10));
+        row.With(new Label { Text = label });
+        row.With(field);
+        return Gallery.Captioned(app, row, caption);
+    }
+
+    /// 上一帧为 `name` 量到的内容底边偏移（设备像素，自框顶算起），
+    /// 没有或卡片宽度已变则返回 0（调用方回退到种子高度）。
+    /// `cardW` 是预览卡的宽度，也就是 PreviewBoxH 拿到的那个 w。
+    static int AutoContentH(string name, int cardW) {
+        if (Gallery.autoH == null) { return 0; }
+        if (!Gallery.autoH.ContainsKey(name)) { return 0; }
+        if (Gallery.autoW[name] != cardW) { return 0; }
+        return Gallery.autoH[name];
+    }
+
+    /// 记下这一帧量到的内容高度。与上一帧不同就请求重绘：卡片高度
+    /// 已经按旧值排过了，得再来一帧才能对上。
+    ///
+    /// 失效键用的是「当前预览卡的宽度」（RenderPreview 存下的
+    /// previewCardW），而不是调用方传给 LayoutAuto 的那个内容宽度。
+    /// 后者各演示写法不一（`w - Scale(36)`、`Scale(360)`、`Scale(400)`…），
+    /// 一旦不等于 PreviewBoxH 回读时用的值，实测高度就永远读不到，
+    /// 于是那个演示不声不响退回注册处的手调高度 —— Input.disabled /
+    /// Input.error 正是这样明明写了 LayoutAuto 却仍在用固定高度。
+    static void RecordAuto(App app, string name, int h) {
+        if (Gallery.autoH == null) {
+            Gallery.autoH = new Dictionary<string, int>();
+            Gallery.autoW = new Dictionary<string, int>();
+        }
+        int cardW = Gallery.previewCardW;
+        bool have = Gallery.autoH.ContainsKey(name);
+        if (have && Gallery.autoH[name] == h && Gallery.autoW[name] == cardW) {
+            return;
+        }
+        if (have) {
+            Gallery.autoH.Remove(name);
+            Gallery.autoW.Remove(name);
+        }
+        Gallery.autoH.Add(name, h);
+        Gallery.autoW.Add(name, cardW);
+        app.RequestRedraw();
+    }
+
+    /// 遍历演示的整棵控件树，把「刚才谁被按了 / 哪个值变了」报到卡片
+    /// 头部。这样每个走 LayoutAuto 的演示都自动带上事件反馈，不必逐个
+    /// 接线：
+    ///   * 主动作用 Control.FiredIn()（Click 的轮询版）；
+    ///   * 状态变化比对 Props() —— 设计器和序列化器读的是同一份声明，
+    ///     所以任何声明了属性的控件都自动被覆盖。
+    ///
+    /// 只在真实输入帧（按下/松开/按键/滚轮，不含纯移动与动画帧）上报：
+    /// HMI 各页的位号每 60ms 就变一次，那不是用户事件，逐帧报出来只会
+    /// 把真正的交互刷掉。基线仍然每帧更新，否则动画期间攒下的变化会在
+    /// 下一次点击时一股脑冒出来。
+    static void ReportTree(App app, string demo, Control root) {
+        int k = app.EventKind();
+        bool live = k != 0 && k != 1;
+        Control hit = root.FiredIn();
+        if (hit != null) {
+            string label = hit.GetProp("label");
+            if (label == "") { label = hit.GetProp("icon"); }
+            if (label == "") { label = hit.Kind(); }
+            Gallery.FiredN(app, demo, label + " clicked");
+        }
+        Gallery.watchSeq = 0;
+        Gallery.WatchTree(app, demo, root, live);
+    }
+
+    static void WatchTree(App app, string demo, Control c, bool live) {
+        Gallery.watchSeq = Gallery.watchSeq + 1;
+        string id = Convert.ToString(Gallery.watchSeq);
+        List<PropSpec> ps = c.Props();
+        for (int i = 0; i < ps.Count; i = i + 1) {
+            PropSpec p = ps[i];
+            if (p.kind == 5 || !p.IsBound()) { continue; }
+            string key = demo + "/" + id + "/" + p.key;
+            string val = p.Read();
+            if (!Gallery.watch.ContainsKey(key)) {
+                Gallery.watch.Add(key, val);
+                continue;
+            }
+            if (Gallery.watch[key] == val) { continue; }
+            Gallery.watch.Remove(key);
+            Gallery.watch.Add(key, val);
+            if (live) {
+                Gallery.Fired(app, demo,
+                    c.Kind() + "." + p.key + " = " + Gallery.Short(val));
+            }
+        }
+        for (int j = 0; j < c.children.Count; j = j + 1) {
+            Gallery.WatchTree(app, demo, c.children[j], live);
+        }
+    }
+
+    /// 事件文字里的值截断：多行文本域或长文本一整段贴上去会把
+    /// 卡片头部撑爆。
+    static string Short(string v) {
+        if (v.Length <= 24) { return v; }
+        return v.Substring(0, 24) + "...";
+    }
+
+    /// 演示的事件处理器报告「刚刚发生了什么」：文字画在该卡片
+    /// "LIVE STATES" 行的右端，读者按一下就能确认事件真的通了。
+    static void Fired(App app, string demo, string text) {
+        if (Gallery.lastEvent.ContainsKey(demo)) {
+            if (Gallery.lastEvent[demo] == text) { return; }
+            Gallery.lastEvent.Remove(demo);
+        }
+        Gallery.lastEvent.Add(demo, text);
+        app.RequestRedraw();
+    }
+
+    /// 同上，但把该演示的触发次数一起报出来（"Primary clicked x3"）：
+    /// 连按同一个按钮时文字不变，没有计数就看不出后面几次通没通。
+    static void FiredN(App app, string demo, string label) {
+        int n = 1;
+        if (Gallery.eventN.ContainsKey(demo)) {
+            n = Gallery.eventN[demo] + 1;
+            Gallery.eventN.Remove(demo);
+        }
+        Gallery.eventN.Add(demo, n);
+        Gallery.Fired(app, demo, label + " x" + Convert.ToString(n));
+    }
+
+    /// 弹层类演示的一条说明小字，画在触发器下面并报告框高。
+    ///
+    /// 这些演示走立即模式（不进控件树 —— 弹层的锚点是触发器的屏幕位置，
+    /// 交给容器排版会让它每帧漂移），所以说明文字只能画，高度也得自己报。
+    /// 放在触发器右边看着省地方，但窄窗口下它就直接被卡片裁掉了。
+    static void SelCaption(App app, string demo, int x, int y, string text) {
+        int fs = app.theme.fontSizeSmall;
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary", Style.SNormal()),
+            x, y, text, app.theme.textSecondary, fs);
+        Gallery.RecordBottom(app, demo, y + Canvas.FontHeight(fs));
+    }
+
+    /// 把下拉框当前的选择报到卡片头部：一个只能点开、点完什么都不说的
+    /// 下拉框，读者判断不出事件到底通没通。
+    static void SelReport(App app, string demo, SelectBox sel) {
+        string txt = sel.Text();
+        if (txt == "") {
+            Gallery.Fired(app, demo,
+                Gallery.T("(nothing selected)", "（未选择）"));
+            return;
+        }
+        Gallery.Fired(app, demo, "Selected: " + txt);
+    }
+
+    /// 演示用按钮：建出来就登记，接线交给 ReportClicks 统一做。
+    static Button Btn(string text, string cls) {
+        Button b = new Button { Text = text, Class = cls };
+        Gallery.demoBtns.Add(b);
+        return b;
+    }
+
+    /// 图标按钮（无文字），事件里报图标名。
+    static Button IconBtn(string icon, string cls) {
+        Button b = new Button { Icon = icon, Class = cls };
+        Gallery.demoBtns.Add(b);
+        return b;
+    }
+
+    /// 登记过的按钮里谁被按了就报到卡片头部。WasClicked 是 Button.Click
+    /// 的轮询版本，因此每帧重建的演示也不必保留处理器。
+    static void ReportClicks(App app, string demo) {
+        for (int i = 0; i < Gallery.demoBtns.Count; i = i + 1) {
+            Button b = Gallery.demoBtns[i];
+            if (!b.WasClicked()) { continue; }
+            string label = b.Text.Get();
+            if (label == "") { label = b.Icon; }
+            Gallery.FiredN(app, demo, label + " clicked");
+        }
+    }
+
+    static void DrawLastEvent(App app, Canvas c, Theme t, string demo,
+            int x, int y, int w) {
+        if (!Gallery.lastEvent.ContainsKey(demo)) { return; }
+        string msg = Gallery.lastEvent[demo];
+        if (msg == "") { return; }
+        int fs = t.fontSizeSmall;
+        int avail = w - app.Scale(120);
+        if (avail < app.Scale(60)) { return; }
+        msg = Ellipsis.Fit(msg, avail, fs);
+        int tw = Canvas.MeasureText(msg, fs);
+        c.DrawText(x + w - app.Scale(12) - tw, y + app.Scale(9), msg,
+                   t.primary, fs);
+    }
+
     static int RenderPreview(App app, Canvas c, Theme t, string name,
             int x, int y, int w, int previewHUnscaled) {
+        // 把这一段的耗时和「凭什么整窗重绘」都记到演示名下（ZAN_FRAME_PROF
+        // 关着时是空操作）。整窗帧比损伤帧贵十几倍，出问题时得能指名道姓
+        // 地问是哪个演示要的。
+        app.PerfMark(name);
+        Gallery.demoBtns.Clear();
         int h = Gallery.PreviewBoxH(app, name, previewHUnscaled, w);
         if (t.glass != 0) {
             // Real frosted glass: blur the wallpaper behind the box (clamped to
@@ -2361,9 +2812,19 @@ class Gallery {
         }
         c.DrawText(x + app.Scale(12), y + app.Scale(9), "LIVE STATES",
             t.textTertiary, t.fontSizeSmall);
+        Gallery.DrawLastEvent(app, c, t, name, x, y, w);
+        // 实测高度的两个基准（框顶、卡片宽度）在这里就位，好让延迟到
+        // 覆盖通道去画的演示也能报自己的高度。
+        Gallery.previewBoxTop = y;
+        Gallery.previewCardW = w;
         // Floating/interactive components are drawn later in the deferred
         // overlay pass (above the code panel); the base pass only frames them.
-        if (Gallery.IsOverlayComp(name)) { return h; }
+        if (Gallery.IsOverlayComp(name)) {
+            // 自检也要覆盖它们：这一路提前返回，否则弹层类演示在
+            // gallery_audit.log 里整批缺席，看起来像「没这几个演示」。
+            Gallery.Audit(app, name, x, y, w, h, true);
+            return h;
+        }
         // Clip every base demo to the preview box so nothing bleeds into the
         // title, description or the code panel below (fixes the overflow and
         // scroll "see-through" artifacts).
@@ -2372,41 +2833,51 @@ class Gallery {
         int py = y + app.Scale(48);
         bool rendered = true;
         if (name == "Button.types") {
-            Panel row = Panel.Row().Gap(app.Scale(10));
-            row.With(new Button { Text = "Default" });
-            row.With(new Button { Text = "Primary", Class = "primary" });
-            row.With(new Button { Text = "Info", Class = "info" });
-            row.With(new Button { Text = "Success", Class = "success" });
-            row.With(new Button { Text = "Warning", Class = "warning" });
-            row.With(new Button { Text = "Error", Class = "error" });
-            Gallery.LayoutIn(app, row, px, y + app.Scale(34), w - app.Scale(36), app.Scale(34));
+            // Flex.Wrapped(): 六个按钮在窄窗口里折行而不是被裁掉，卡片
+            // 高度由 LayoutAuto 量出来跟着长——这是所有按钮行的样板。
+            Flex row = Flex.Wrapped().Gap(app.Scale(10));
+            row.With(Gallery.Btn("Default", ""));
+            row.With(Gallery.Btn("Primary", "primary"));
+            row.With(Gallery.Btn("Info", "info"));
+            row.With(Gallery.Btn("Success", "success"));
+            row.With(Gallery.Btn("Warning", "warning"));
+            row.With(Gallery.Btn("Error", "error"));
+            Gallery.LayoutAuto(app, row, name, px, y + Gallery.PreviewPadTop(app),
+                               w - app.Scale(36), app.Scale(34));
+            Gallery.ReportClicks(app, name);
         } else if (name == "Button.styles") {
-            Panel row = Panel.Row().Gap(app.Scale(10));
-            row.With(new Button { Text = "Solid", Class = "primary" });
-            row.With(new Button { Text = "Outline", Class = "primary outline" });
-            row.With(new Button { Text = "Text", Class = "primary text" });
-            row.With(new Button { Text = "Dashed", Class = "primary dashed" });
-            row.With(new Button { Text = "Secondary", Class = "primary secondary" });
-            row.With(new Button { Text = "Ghost", Class = "primary ghost" });
-            Gallery.LayoutIn(app, row, px, y + app.Scale(34), w - app.Scale(36), app.Scale(34));
+            Flex row = Flex.Wrapped().Gap(app.Scale(10));
+            row.With(Gallery.Btn("Solid", "primary"));
+            row.With(Gallery.Btn("Outline", "primary outline"));
+            row.With(Gallery.Btn("Text", "primary text"));
+            row.With(Gallery.Btn("Dashed", "primary dashed"));
+            row.With(Gallery.Btn("Secondary", "primary secondary"));
+            row.With(Gallery.Btn("Ghost", "primary ghost"));
+            Gallery.LayoutAuto(app, row, name, px, y + Gallery.PreviewPadTop(app),
+                               w - app.Scale(36), app.Scale(34));
+            Gallery.ReportClicks(app, name);
         } else if (name == "Button.specular") {
-            Panel row = Panel.Row().Gap(app.Scale(10));
-            row.With(new Button { Text = "Hover me", Class = "primary specular" });
-            row.With(new Button { Text = "Success", Class = "success specular" });
-            row.With(new Button { Text = "Error", Class = "error specular" });
-            row.With(new Button { Text = "Default", Class = "specular" });
-            Gallery.LayoutIn(app, row, px, y + app.Scale(34), w - app.Scale(36), app.Scale(34));
+            Flex row = Flex.Wrapped().Gap(app.Scale(10));
+            row.With(Gallery.Btn("Hover me", "primary specular"));
+            row.With(Gallery.Btn("Success", "success specular"));
+            row.With(Gallery.Btn("Error", "error specular"));
+            row.With(Gallery.Btn("Default", "specular"));
+            Gallery.LayoutAuto(app, row, name, px, y + Gallery.PreviewPadTop(app),
+                               w - app.Scale(36), app.Scale(34));
+            Gallery.ReportClicks(app, name);
         } else if (name == "Button.secondary") {
-            Panel row = Panel.Row().Gap(app.Scale(10));
-            row.With(new Button { Text = "Default", Class = "secondary" });
-            row.With(new Button { Text = "Primary", Class = "primary secondary" });
-            row.With(new Button { Text = "Info", Class = "info secondary" });
-            row.With(new Button { Text = "Success", Class = "success secondary" });
-            row.With(new Button { Text = "Warning", Class = "warning secondary" });
-            row.With(new Button { Text = "Error", Class = "error secondary" });
-            Gallery.LayoutIn(app, row, px, y + app.Scale(34), w - app.Scale(36), app.Scale(34));
+            Flex row = Flex.Wrapped().Gap(app.Scale(10));
+            row.With(Gallery.Btn("Default", "secondary"));
+            row.With(Gallery.Btn("Primary", "primary secondary"));
+            row.With(Gallery.Btn("Info", "info secondary"));
+            row.With(Gallery.Btn("Success", "success secondary"));
+            row.With(Gallery.Btn("Warning", "warning secondary"));
+            row.With(Gallery.Btn("Error", "error secondary"));
+            Gallery.LayoutAuto(app, row, name, px, y + Gallery.PreviewPadTop(app),
+                               w - app.Scale(36), app.Scale(34));
+            Gallery.ReportClicks(app, name);
         } else if (name == "Button.states") {
-            Panel row = Panel.Row().Gap(app.Scale(10));
+            Flex row = Flex.Wrapped().Gap(app.Scale(10));
             row.With(new Button { Text = "Loading", Class = "primary loading" });
             Button bldg = new Button { Class = "success loading" };
             bldg.Class = bldg.Class + " circle";
@@ -2414,23 +2885,31 @@ class Gallery {
             Button bdis = new Button { Text = "Disabled" };
             bdis.Disabled = true;
             row.With(bdis);
-            row.With(new Button { Text = "Pink", Class = "pink" });
-            row.With(new Button { Text = "Teal", Class = "teal" });
-            Gallery.LayoutIn(app, row, px, y + app.Scale(34), w - app.Scale(36), app.Scale(34));
+            row.With(Gallery.Btn("Pink", "pink"));
+            row.With(Gallery.Btn("Teal", "teal"));
+            Gallery.LayoutAuto(app, row, name, px, y + app.Scale(34), w - app.Scale(36), app.Scale(34));
+            // loading / disabled 的按钮不派发 Click（Button.RenderIn 在
+            // Ui.Activate 之前就返回了），所以这一排只有后两个会报事件
+            // —— 这正是本演示要说明的行为。
+            Gallery.ReportClicks(app, name);
         } else if (name == "Button.shapes") {
-            Panel row = Panel.Row().Gap(app.Scale(10));
-            row.With(new Button { Text = "Round", Class = "primary round" });
-            row.With(new Button { Text = "Save", Icon = "save", Class = "success" });
-            row.With(new Button { Icon = "plus", Class = "primary circle" });
-            row.With(new Button { Icon = "settings", Class = "circle" });
-            Gallery.LayoutIn(app, row, px, y + app.Scale(34), w - app.Scale(36), app.Scale(34));
+            Flex row = Flex.Wrapped().Gap(app.Scale(10));
+            row.With(Gallery.Btn("Round", "primary round"));
+            Button bsave = Gallery.Btn("Save", "success");
+            bsave.Icon = "save";
+            row.With(bsave);
+            row.With(Gallery.IconBtn("plus", "primary circle"));
+            row.With(Gallery.IconBtn("settings", "circle"));
+            Gallery.LayoutAuto(app, row, name, px, y + app.Scale(34), w - app.Scale(36), app.Scale(34));
+            Gallery.ReportClicks(app, name);
         } else if (name == "Button.sizes") {
-            Panel row = Panel.Row().Gap(app.Scale(10));
-            row.With(new Button { Text = "Tiny", Class = "tiny" });
-            row.With(new Button { Text = "Small", Class = "small" });
-            row.With(new Button { Text = "Medium", Class = "medium" });
-            row.With(new Button { Text = "Large", Class = "large" });
-            Gallery.LayoutIn(app, row, px, y + app.Scale(34), w - app.Scale(36), app.Scale(40));
+            Flex row = Flex.Wrapped().Gap(app.Scale(10));
+            row.With(Gallery.Btn("Tiny", "tiny"));
+            row.With(Gallery.Btn("Small", "small"));
+            row.With(Gallery.Btn("Medium", "medium"));
+            row.With(Gallery.Btn("Large", "large"));
+            Gallery.LayoutAuto(app, row, name, px, y + app.Scale(34), w - app.Scale(36), app.Scale(40));
+            Gallery.ReportClicks(app, name);
         } else if (name == "Button.group") {
             int cur = y + app.Scale(34);
             ButtonGroup g1 = new ButtonGroup(1);
@@ -2483,7 +2962,7 @@ class Gallery {
             col.With(new Label { Text = "Default label" });
             col.With(new Label { Text = "Secondary", Class = "secondary" });
             col.With(new Label { Text = "Hint / muted caption text", Class = "hint" });
-            Gallery.LayoutIn(app, col, px, py - app.Scale(16),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(16),
                              w - app.Scale(36), app.Scale(140));
         } else if (name == "Typography") {
             // A full heading scale + a paragraph: showing h1..h4 and body copy
@@ -2495,20 +2974,20 @@ class Gallery {
             col.With(Typography.H("h4 · Group / card title", 4));
             col.With(Typography.P("Body paragraph — readable text for application content. Long lines wrap naturally and the size paces long-form reading."));
             col.With(new Label { Text = "Hint / muted caption text", Class = "hint" });
-            Gallery.LayoutIn(app, col, px, py - app.Scale(24),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(24),
                              w - app.Scale(36), app.Scale(260));
         } else if (name == "Input") {
             // A labelled input: the row lays the hint beside the field.
-            Panel row = Panel.Row().Gap(app.Scale(10));
+            Flex row = Flex.Wrapped().Gap(app.Scale(10));
             row.With(new Label { Text = "Your name" });
             row.With(Gallery.demoInput);
-            Gallery.LayoutIn(app, row, px, py - app.Scale(8),
+            Gallery.LayoutAuto(app, row, name, px, py - app.Scale(8),
                              w - app.Scale(36), t.heightMedium);
         } else if (name == "TextArea") {
             Panel col = Panel.Column().Gap(app.Scale(6));
             col.With(new Label { Text = "Description", Class = "secondary" });
             col.With(Gallery.demoArea);
-            Gallery.LayoutIn(app, col, px, py - app.Scale(20),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(20),
                              w - app.Scale(36), app.Scale(180));
         } else if (name == "Checkbox") {
             // Sizes + semantic accents, laid out by Panel flow (no coordinates).
@@ -2534,7 +3013,7 @@ class Gallery {
             Panel col = Panel.Column().Gap(app.Scale(12));
             col.With(Panel.Row().Gap(app.Scale(24)).With(cbS).With(cbM).With(cbL));
             col.With(Panel.Row().Gap(app.Scale(24)).With(ck).With(ck2).With(ck3));
-            Gallery.LayoutIn(app, col, px, py - app.Scale(12),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(12),
                              w - app.Scale(36), app.Scale(120));
         } else if (name == "Radio") {
             // A radio GROUP = every option shares one two-way data binding;
@@ -2554,25 +3033,25 @@ class Gallery {
             Panel col = Panel.Column().Gap(app.Scale(14));
             col.With(Panel.Row().Gap(app.Scale(24)).With(ra).With(rb));
             col.With(Panel.Row().Gap(app.Scale(24)).With(gl).With(gs));
-            Gallery.LayoutIn(app, col, px, py - app.Scale(12),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(12),
                              w - app.Scale(36), app.Scale(120));
         } else if (name == "Switch") {
-            Panel row = Panel.Row().Gap(app.Scale(12));
+            Flex row = Flex.Wrapped().Gap(app.Scale(12));
             row.With(Gallery.demoSwitch);
             row.With(new Label { Text = "Interactive state" });
-            Gallery.LayoutIn(app, row, px, py - app.Scale(8),
+            Gallery.LayoutAuto(app, row, name, px, py - app.Scale(8),
                              w - app.Scale(36), app.Scale(40));
         } else if (name == "Slider") {
             Panel col = Panel.Column().Gap(app.Scale(6));
             col.With(new Label { Text = "Level: " + Convert.ToString(Gallery.model.level), Class = "secondary" });
             col.With(Gallery.demoSlider);
-            Gallery.LayoutIn(app, col, px, py - app.Scale(12),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(12),
                              w - app.Scale(36), app.Scale(70));
         } else if (name == "Rate") {
             Panel col = Panel.Column().Gap(app.Scale(8));
             col.With(new Label { Text = "Rate · " + Convert.ToString(Gallery.model.level), Class = "secondary" });
             col.With(Gallery.demoRate);
-            Gallery.LayoutIn(app, col, px, py - app.Scale(8),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(8),
                              w - app.Scale(36), app.Scale(70));
         } else if (name == "Tabs") {
             // Retained Tabs component: header strip + a
@@ -2638,7 +3117,7 @@ class Gallery {
             bc.AddItem("Home"); bc.AddItem("Components"); bc.AddItem("Breadcrumb");
             Panel col = Panel.Column();
             col.With(bc);
-            Gallery.LayoutIn(app, col, px, py,
+            Gallery.LayoutAuto(app, col, name, px, py,
                              w - app.Scale(36), app.Scale(36));
         } else if (name == "Menu") {
             List<string> menuItems = new List<string>();
@@ -2649,7 +3128,7 @@ class Gallery {
             PageHeader ph = new PageHeader("Component page", "Title, subtitle and back action");
             Panel col = Panel.Column();
             col.With(ph);
-            Gallery.LayoutIn(app, col, px, py - app.Scale(16),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(16),
                              w - app.Scale(36), app.Scale(64));
         } else if (name == "Pagination") {
             // Multiple styles, each bound to its own current-page signal,
@@ -2674,7 +3153,7 @@ class Gallery {
             col.With(small);
             col.With(new Label { Text = "Simple · prev / total / next", Class = "secondary" });
             col.With(simple);
-            Gallery.LayoutIn(app, col, px, py - app.Scale(20),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(20),
                              w - app.Scale(36), app.Scale(310));
         } else if (name == "Card") {
             int cy0 = py - app.Scale(12);
@@ -2795,31 +3274,31 @@ class Gallery {
                 app.RequestRedraw();
             }
         } else if (name == "Avatar.text") {
-            Panel row = Panel.Row().Gap(app.Scale(20));
+            Flex row = Flex.Wrapped().Gap(app.Scale(20));
             row.With(new Avatar("A", 32, ""));
             row.With(new Avatar("Z", 42, ""));
             row.With(new Avatar("GK", 52, ""));
-            Gallery.LayoutIn(app, row, px, py,
+            Gallery.LayoutAuto(app, row, name, px, py,
                              w - app.Scale(36), app.Scale(60));
         } else if (name == "Avatar.icon") {
-            Panel row = Panel.Row().Gap(app.Scale(20));
+            Flex row = Flex.Wrapped().Gap(app.Scale(20));
             row.With(new Avatar("", 42, "user"));
             row.With(new Avatar("", 42, "settings"));
-            Gallery.LayoutIn(app, row, px, py,
+            Gallery.LayoutAuto(app, row, name, px, py,
                              w - app.Scale(36), app.Scale(52));
         } else if (name == "Badge.dot") {
-            Panel row = Panel.Row().Gap(app.Scale(14));
+            Flex row = Flex.Wrapped().Gap(app.Scale(14));
             row.With(new Badge(0));
             row.With(new Label { Text = "unread / active", Class = "secondary" });
-            Gallery.LayoutIn(app, row, px, py - app.Scale(2),
+            Gallery.LayoutAuto(app, row, name, px, py - app.Scale(2),
                              w - app.Scale(36), app.Scale(30));
         } else if (name == "Badge.count") {
-            Panel row = Panel.Row().Gap(app.Scale(14));
+            Flex row = Flex.Wrapped().Gap(app.Scale(14));
             row.With(new Badge(5));
             row.With(new Badge(12));
             row.With(new Badge(99));
             row.With(new Badge(120));
-            Gallery.LayoutIn(app, row, px, py,
+            Gallery.LayoutAuto(app, row, name, px, py,
                              w - app.Scale(36), app.Scale(30));
         } else if (name == "Statistic") {
             Statistic st1 = new Statistic("Active users", "12,480");
@@ -2827,9 +3306,9 @@ class Gallery {
             st2.Class = "success";
             Statistic st3 = new Statistic("Errors", "3");
             st3.Class = "error";
-            Panel row = Panel.Row().Gap(app.Scale(24));
+            Flex row = Flex.Wrapped().Gap(app.Scale(24));
             row.With(st1); row.With(st2); row.With(st3);
-            Gallery.LayoutIn(app, row, px, py - app.Scale(8),
+            Gallery.LayoutAuto(app, row, name, px, py - app.Scale(8),
                              w - app.Scale(36), app.Scale(70));
         } else if (name == "Timeline") {
             List<TimelineItem> items = new List<TimelineItem>();
@@ -2838,13 +3317,13 @@ class Gallery {
             Timeline tl = Timeline.Of(items);
             Panel col = Panel.Column();
             col.With(tl);
-            Gallery.LayoutIn(app, col, px, py - app.Scale(24),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(24),
                              w - app.Scale(36), app.Scale(120));
         } else if (name == "VirtualList") {
             // 两个模式并排一行、说明文字走布局容器——演示区里
             // 不手摆绝对坐标。
             Gallery.demoSelLabel.Text = Gallery.demoVList.SelectedText();
-            Panel vrow = Panel.Row();
+            Flex vrow = Flex.Wrapped();
             vrow.Gap(40);
             Panel c1 = Panel.Column();
             c1.With(Gallery.demoVList);
@@ -2858,7 +3337,7 @@ class Gallery {
             c3.With(new Label("SetRows: each row is a custom component"));
             c3.With(Gallery.demoSelLabel);
             vrow.With(c3);
-            Gallery.LayoutIn(app, vrow, px, py - app.Scale(16),
+            Gallery.LayoutAuto(app, vrow, name, px, py - app.Scale(16),
                 w - app.Scale(36), app.Scale(170));
         } else if (name == "ListView") {
             List<string> items = new List<string>();
@@ -2992,7 +3471,7 @@ class Gallery {
             c.Active = Gallery.model.pick;   // two-way open index
             Panel col = Panel.Column();
             col.With(c);
-            Gallery.LayoutIn(app, col, px, py - app.Scale(20),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(20),
                              w - app.Scale(36), app.Scale(140));
         } else if (name == "Carousel.basic") {
             Carousel car = new Carousel();
@@ -3000,7 +3479,7 @@ class Gallery {
             car.Index = Gallery.model.slide;   // two-way
             Panel col = Panel.Column().Gap(app.Scale(8));
             col.With(car);
-            Gallery.LayoutIn(app, col, px, py - app.Scale(10),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(10),
                              w - app.Scale(36), app.Scale(140));
         } else if (name == "Carousel.anim") {
             Carousel car = new Carousel();
@@ -3009,7 +3488,7 @@ class Gallery {
             car.Animate(Gallery.demoCarousel);
             Panel col = Panel.Column().Gap(app.Scale(8));
             col.With(car);
-            Gallery.LayoutIn(app, col, px, py - app.Scale(10),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(10),
                              w - app.Scale(36), app.Scale(140));
         } else if (name == "Carousel.many") {
             Carousel car = new Carousel();
@@ -3019,7 +3498,7 @@ class Gallery {
             car.Animate(Gallery.carAnim2);
             Panel col = Panel.Column().Gap(app.Scale(8));
             col.With(car);
-            Gallery.LayoutIn(app, col, px, py - app.Scale(10),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(10),
                              w - app.Scale(36), app.Scale(140));
         } else if (name == "Chart.line") {
             // ECharts line1 dataset in its plain form: five traffic sources
@@ -5177,7 +5656,7 @@ class Gallery {
             row.With(vert);
             row.With(new Label { Text = "Right" });
             col.With(row);
-            Gallery.LayoutIn(app, col, px, py - app.Scale(12),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(12),
                              w - app.Scale(36), app.Scale(150));
         } else if (name == "Progress.line") {
             Panel col = Panel.Column().Gap(app.Scale(10));
@@ -5185,10 +5664,10 @@ class Gallery {
             col.With(new Progress(45, 2));
             col.With(new Progress(90, 3));
             col.With(new Progress(30, 4));
-            Gallery.LayoutIn(app, col, px, py - app.Scale(12),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(12),
                              w - app.Scale(36), app.Scale(150));
         } else if (name == "Progress.circle") {
-            Panel row = Panel.Row().Gap(app.Scale(28));
+            Flex row = Flex.Wrapped().Gap(app.Scale(28));
             Progress p1 = new Progress(72, 0);
             p1.Ring();
             Progress p2 = new Progress(90, 3);
@@ -5196,17 +5675,80 @@ class Gallery {
             Progress p3 = new Progress(45, 4);
             p3.Ring();
             row.With(p1); row.With(p2); row.With(p3);
-            Gallery.LayoutIn(app, row, px, py - app.Scale(6),
+            Gallery.LayoutAuto(app, row, name, px, py - app.Scale(6),
                              w - app.Scale(36), app.Scale(90));
-        } else if (name == "Alert") {
+        } else if (name == "Alert.types") {
+            // Inline banners: one per role, the full type set side by side.
             int aw = w - app.Scale(36);
             int aay = py - app.Scale(20);
-            // Uniform banner height + equal outer gaps for every type variant.
             int step = Layer.NotifyH(app) + app.Scale(12);
-            Layer.DrawNotify(app, px, aay, aw, "Heads up — additional context.", 2);
-            Layer.DrawNotify(app, px, aay + step, aw, "Build succeeded — the executable is ready.", 3);
-            Layer.DrawNotify(app, px, aay + step * 2, aw, "Low disk space — free up room.", 4);
-            Layer.DrawNotify(app, px, aay + step * 3, aw, "Deployment failed — check the logs.", 5);
+            Layer.DrawNotify(app, px, aay, aw,
+                Gallery.T("Default — plain banner without a role tint.",
+                          "默认 — 无角色着色的普通横幅。"), 0);
+            Layer.DrawNotify(app, px, aay + step, aw,
+                Gallery.T("Info — additional context that does not demand action.",
+                          "信息 — 需要了解但无需操作的上下文。"), 2);
+            Layer.DrawNotify(app, px, aay + step * 2, aw,
+                Gallery.T("Success — the build finished.", "成功 — 构建完成。"), 3);
+            Layer.DrawNotify(app, px, aay + step * 3, aw,
+                Gallery.T("Warning — low disk space.", "警告 — 磁盘空间不足。"), 4);
+            Layer.DrawNotify(app, px, aay + step * 4, aw,
+                Gallery.T("Error — deployment failed.", "错误 — 部署失败。"), 5);
+            Gallery.RecordBottom(app, name,
+                aay + step * 4 + Layer.NotifyH(app));
+        } else if (name == "Alert.queue") {
+            // Transient queues: every button fires the real API; the toasts
+            // and corner cards render from the app's overlay pass (gallery
+            // main loop calls Layer.RenderToasts/RenderNotifs every frame).
+            int bw = app.Scale(96);
+            int bh = t.heightMedium;
+            int gapq = app.Scale(8);
+            int bx = px;
+            int by = py - app.Scale(16);
+            app.canvas.DrawStyledText(
+                Style.Of(app, "label", "secondary", Style.SNormal()),
+                bx, by - app.Scale(24),
+                Gallery.T("Layer.Msg · top-centred toast",
+                          "Layer.Msg · 顶部居中消息"),
+                t.textPrimary, t.fontSizeMedium);
+            int qm0 = new Button { Text = Gallery.T("Default", "默认") }
+                .Render(app, bx, by, bw);
+            if (Ui.Clicked(app, qm0)) { Layer.Msg("Message saved.", 0); }
+            int qm2 = new Button { Text = "Info" }
+                .Render(app, bx + (bw + gapq), by, bw);
+            if (Ui.Clicked(app, qm2)) { Layer.Msg("Context loaded.", 2); }
+            int qm3 = new Button { Text = "Success" }
+                .Render(app, bx + (bw + gapq) * 2, by, bw);
+            if (Ui.Clicked(app, qm3)) { Layer.Msg("Saved successfully", 3); }
+            int qm4 = new Button { Text = "Warning" }
+                .Render(app, bx + (bw + gapq) * 3, by, bw);
+            if (Ui.Clicked(app, qm4)) { Layer.Msg("Unsaved changes", 4); }
+            int qm5 = new Button { Text = "Error" }
+                .Render(app, bx + (bw + gapq) * 4, by, bw);
+            if (Ui.Clicked(app, qm5)) { Layer.Msg("Network error", 5); }
+            by = by + bh + app.Scale(34);
+            app.canvas.DrawStyledText(
+                Style.Of(app, "label", "secondary", Style.SNormal()),
+                bx, by - app.Scale(24),
+                Gallery.T("Layer.Notify · top-right corner card",
+                          "Layer.Notify · 右上角通知卡"),
+                t.textPrimary, t.fontSizeMedium);
+            int qn0 = new Button { Text = Gallery.T("Default", "默认") }
+                .Render(app, bx, by, bw);
+            if (Ui.Clicked(app, qn0)) { Layer.Notify("Deploy started", 0); }
+            int qn2 = new Button { Text = "Info" }
+                .Render(app, bx + (bw + gapq), by, bw);
+            if (Ui.Clicked(app, qn2)) { Layer.Notify("New version available", 2); }
+            int qn3 = new Button { Text = "Success" }
+                .Render(app, bx + (bw + gapq) * 2, by, bw);
+            if (Ui.Clicked(app, qn3)) { Layer.Notify("Build completed", 3); }
+            int qn4 = new Button { Text = "Warning" }
+                .Render(app, bx + (bw + gapq) * 3, by, bw);
+            if (Ui.Clicked(app, qn4)) { Layer.Notify("Disk almost full", 4); }
+            int qn5 = new Button { Text = "Error" }
+                .Render(app, bx + (bw + gapq) * 4, by, bw);
+            if (Ui.Clicked(app, qn5)) { Layer.Notify("Tests failed", 5); }
+            Gallery.RecordBottom(app, name, by + bh);
         } else if (name == "Result") {
             // Every status side by side: success / warning / error, arranged by
             // a row that lets each card keep its natural width.
@@ -5216,9 +5758,9 @@ class Gallery {
             r2.Class = Result.StatusClass(2);
             Result r3 = new Result("Error", "The build failed.");
             r3.Class = Result.StatusClass(3);
-            Panel row = Panel.Row().Gap(app.Scale(18));
+            Flex row = Flex.Wrapped().Gap(app.Scale(18));
             row.With(r1); row.With(r2); row.With(r3);
-            Gallery.LayoutIn(app, row, px, py - app.Scale(20),
+            Gallery.LayoutAuto(app, row, name, px, py - app.Scale(20),
                              w - app.Scale(36), app.Scale(220));
         } else if (name == "Tooltip") {
             // Triggers: hover shows the tip while the pointer is over the target;
@@ -5289,11 +5831,11 @@ class Gallery {
         } else if (name == "Spin.plain") {
             Spin big = new Spin(56);
             big.Class = "info";
-            Panel row = Panel.Row().Gap(app.Scale(26));
+            Flex row = Flex.Wrapped().Gap(app.Scale(26));
             row.With(new Spin(28));
             row.With(new Spin(40));
             row.With(big);
-            Gallery.LayoutIn(app, row, px, py - app.Scale(4),
+            Gallery.LayoutAuto(app, row, name, px, py - app.Scale(4),
                              w - app.Scale(36), app.Scale(70));
         } else if (name == "Spin.tip") {
             Spin load = new Spin(36);
@@ -5311,7 +5853,7 @@ class Gallery {
             col.With(row);
             col.With(new Skeleton(180, 14));
             col.With(new Skeleton(180, 14));
-            Gallery.LayoutIn(app, col, px, py - app.Scale(4),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(4),
                              w - app.Scale(36), app.Scale(120));
         } else if (name == "FloatButton") {
             // A fixed utility rail (like a page's bottom-right dock): a stack of
@@ -5603,7 +6145,7 @@ class Gallery {
             col.With(Gallery.evtButton);
             col.With(new Label { Text = "Click fired on the UI thread · count: " + Convert.ToString(Gallery.evtClicks) });
             col.With(new Label { Text = "registered once with  button.Click += handler", Class = "secondary" });
-            Gallery.LayoutIn(app, col, px, py - app.Scale(8),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(8),
                              w - app.Scale(36), app.Scale(120));
         } else if (name == "Events") {
             Panel col = Panel.Column().Gap(app.Scale(10));
@@ -5615,13 +6157,13 @@ class Gallery {
                 col.With(new Label { Text = "Ticks posted from worker thread: " + Convert.ToString(Gallery.evtValue.Get()) });
                 col.With(new Label { Text = "idle - click to spawn a Thread that reports back safely", Class = "secondary" });
             }
-            Gallery.LayoutIn(app, col, px, py - app.Scale(8),
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(8),
                              w - app.Scale(36), app.Scale(120));
         } else if (name == "Hmi.tags") {
             // The tag table itself: one simulated scan drives every column,
             // and the engineering text / percent / alarm state are all derived
             // from the same fixed-point raw counts.
-            Gallery.HmiTick(app);
+            Gallery.HmiTick(app, x, y, w, h);
             int fs = t.fontSizeSmall;
             int c0 = px;
             int c1 = px + app.Scale(150);
@@ -5663,105 +6205,113 @@ class Gallery {
                     + Convert.ToString(Gallery.hmiIo.Period()) + " ms",
                 t.textTertiary, fs);
         } else if (name == "Hmi.digital") {
-            Gallery.HmiTick(app);
-            Panel row = Panel.Row().Gap(app.Scale(12));
+            Gallery.HmiTick(app, x, y, w, h);
+            Flex row = Flex.Wrapped().Gap(app.Scale(12));
             row.With(Gallery.hmiDigPv);
             row.With(Gallery.hmiDigSp);
             row.With(Gallery.hmiDigFlow);
             row.With(Gallery.hmiDigLevel);
-            Gallery.LayoutIn(app, row, px, py - app.Scale(10),
-                w - app.Scale(36), app.Scale(76));
-            c.DrawText(px, py + app.Scale(84),
-                Gallery.T("Colour is the tag's alarm state; a bad tag reads \"----\".",
-                    "颜色即位号的报警状态；坏值位号显示 \"----\"。"),
-                t.textTertiary, t.fontSizeSmall);
+            Gallery.LayoutAuto(app,
+                Gallery.Captioned(app, row,
+                    Gallery.T("Colour is the tag's alarm state; a bad tag reads \"----\".",
+                        "颜色即位号的报警状态；坏值位号显示 \"----\"。")),
+                name, px, y + app.Scale(34), w - app.Scale(36),
+                app.Scale(120));
         } else if (name == "Hmi.led") {
-            Gallery.HmiTick(app);
-            Panel row = Panel.Row().Gap(app.Scale(24));
+            Gallery.HmiTick(app, x, y, w, h);
+            Flex row = Flex.Wrapped().Gap(app.Scale(24));
             row.With(Gallery.hmiLedOff);
             row.With(Gallery.hmiLedRun);
             row.With(Gallery.hmiLedWarn);
             row.With(Gallery.hmiLedFault);
             row.With(Gallery.hmiLedComm);
-            Gallery.LayoutIn(app, row, px, py - app.Scale(4),
-                w - app.Scale(36), app.Scale(28));
-            c.DrawText(px, py + app.Scale(40),
+            Panel ledCol = Gallery.Captioned(app, row,
                 Gallery.T("States 0 off / 1 green / 2 yellow / 3 red / 4 blue; WARN and FAULT blink.",
-                    "状态 0 灭 / 1 绿 / 2 黄 / 3 红 / 4 蓝；WARN 与 FAULT 闪烁。"),
-                t.textTertiary, t.fontSizeSmall);
-            c.DrawText(px, py + app.Scale(62),
+                    "状态 0 灭 / 1 绿 / 2 黄 / 3 红 / 4 蓝；WARN 与 FAULT 闪烁。"));
+            ledCol.With(Gallery.Caption(
                 Gallery.T("COMM turns red while the simulated scan drops out.",
-                    "模拟采集中断时 COMM 转红。"),
-                t.textTertiary, t.fontSizeSmall);
+                    "模拟采集中断时 COMM 转红。")));
+            Gallery.LayoutAuto(app, ledCol, name, px, y + app.Scale(34),
+                w - app.Scale(36), app.Scale(110));
         } else if (name == "Hmi.gauge") {
-            Gallery.HmiTick(app);
-            Panel row = Panel.Row().Gap(app.Scale(18));
+            Gallery.HmiTick(app, x, y, w, h);
+            Flex row = Flex.Wrapped().Gap(app.Scale(18));
             row.With(Gallery.hmiGaugePv);
             row.With(Gallery.hmiGaugeFlow);
             row.With(Gallery.hmiGaugeFree);
-            Gallery.LayoutIn(app, row, px, py - app.Scale(14),
-                w - app.Scale(36), app.Scale(205));
-            c.DrawText(px, py + app.Scale(200),
-                Gallery.T("The arc is coloured by the tag's alarm limits; the needle follows the tag's alarm state and quality.",
-                    "弧段按位号报警限着色；指针颜色跟随位号的报警状态与质量。"),
-                t.textTertiary, t.fontSizeSmall);
+            Gallery.LayoutAuto(app,
+                Gallery.Captioned(app, row,
+                    Gallery.T("The arc is coloured by the tag's alarm limits; the needle follows the tag's alarm state and quality.",
+                        "弧段按位号报警限着色；指针颜色跟随位号的报警状态与质量。")),
+                name, px, y + app.Scale(34), w - app.Scale(36),
+                app.Scale(250));
         } else if (name == "Hmi.bargraph") {
-            Gallery.HmiTick(app);
-            Panel row = Panel.Row().Gap(app.Scale(28));
-            row.With(Gallery.hmiBarPv);
-            row.With(Gallery.hmiBarFlow);
-            Gallery.LayoutIn(app, row, px, py - app.Scale(14),
-                app.Scale(260), app.Scale(200));
-            Gallery.LayoutIn(app, Gallery.hmiBarLevel,
-                px + app.Scale(300), py - app.Scale(14),
-                w - app.Scale(340), app.Scale(70));
-            c.DrawText(px + app.Scale(300), py + app.Scale(74),
+            Gallery.HmiTick(app, x, y, w, h);
+            // 两根竖条一栏、横条一栏。棒图自己知道该多大（竖 64x180、
+            // 横 220x40），所以两栏都不用给尺寸；横条那栏用原子类
+            // `grow` 吃掉剩余宽度，宽度不再由这里算。
+            Flex barRow = Flex.Wrapped().Gap(app.Scale(28));
+            Panel barVert = Panel.Row().Gap(app.Scale(28));
+            barVert.With(Gallery.hmiBarPv);
+            barVert.With(Gallery.hmiBarFlow);
+            Panel barLevel = Gallery.Captioned(app, Gallery.hmiBarLevel,
                 Gallery.T("Bargraph.Horizontal() swaps the axis; the thin lines are the LO / HI limits.",
-                    "Bargraph.Horizontal() 切换方向；细线是低报 / 高报限。"),
-                t.textTertiary, t.fontSizeSmall);
+                    "Bargraph.Horizontal() 切换方向；细线是低报 / 高报限。"));
+            barLevel.Class = "grow";
+            barRow.With(barVert);
+            barRow.With(barLevel);
+            Gallery.LayoutAuto(app, barRow, name, px, y + app.Scale(34),
+                w - app.Scale(36), app.Scale(220));
         } else if (name == "Hmi.trend") {
             // Live rolling trend: HmiTick samples all three pens on a 250 ms
             // beat into their ring buffers, so the window scrolls without the
             // preview holding any history of its own.
-            Gallery.HmiTick(app);
-            Gallery.LayoutIn(app, Gallery.hmiTrend, px, py - app.Scale(20),
-                w - app.Scale(36), app.Scale(230));
-            c.DrawText(px, py + app.Scale(218),
-                Gallery.T("Pens keep a fixed-capacity ring buffer, so a shift running for days costs no extra memory.",
-                    "曲线使用定容环形缓冲，因此连续运行数天也不增长内存。"),
-                t.textTertiary, t.fontSizeSmall);
+            Gallery.HmiTick(app, x, y, w, h);
+            // 趋势图的高度是作者定的（它没有固有高度）：钉在控件上，
+            // 外层那一列才能把它和说明文字一起量出来。
+            Gallery.hmiTrend.Prefer(0, app.Scale(230));
+            Gallery.LayoutAuto(app,
+                Gallery.Captioned(app, Gallery.hmiTrend,
+                    Gallery.T("Pens keep a fixed-capacity ring buffer, so a shift running for days costs no extra memory.",
+                        "曲线使用定容环形缓冲，因此连续运行数天也不增长内存。")),
+                name, px, y + app.Scale(34), w - app.Scale(36),
+                app.Scale(280));
         } else if (name == "Hmi.alarmBanner") {
-            Gallery.HmiTick(app);
-            Gallery.LayoutIn(app, Gallery.hmiBanner, px, py - app.Scale(16),
-                w - app.Scale(36), t.heightMedium);
-            int abY = py + app.Scale(28);
-            int rw = app.Scale(150);
-            int wid = new Button { Text = Gallery.T("Raise WARN", "产生警告") }
-                .Render(app, px, abY, rw);
-            if (Ui.Clicked(app, wid)) {
+            Gallery.HmiTick(app, x, y, w, h);
+            // 横幅、两个按钮、两行说明全部进控件树：按钮改成保留模式
+            // 的 Click 事件（不再 Ui.Clicked 配手写坐标），说明文字用
+            // caption 类的 Label，于是整块高度由测量得出。
+            Panel abCol = Panel.Column().Gap(app.Scale(16));
+            abCol.With(Gallery.hmiBanner);
+            Flex abBtns = Flex.Wrapped().Gap(app.Scale(10));
+            Button abWarn = new Button { Text = Gallery.T("Raise WARN", "产生警告") };
+            abWarn.Prefer(app.Scale(150), 0);
+            abWarn.Click += () => {
                 Gallery.hmiAlarms.Raise("PT104",
                     Gallery.T("filter differential high", "过滤器压差高"), 1);
-            }
-            int fid = new Button { Text = Gallery.T("Raise FAULT", "产生故障"),
-                Class = "error" }.Render(app, px + rw + app.Scale(10), abY, rw);
-            if (Ui.Clicked(app, fid)) {
+            };
+            Button abFault = new Button { Text = Gallery.T("Raise FAULT", "产生故障"),
+                Class = "error" };
+            abFault.Prefer(app.Scale(150), 0);
+            abFault.Click += () => {
                 Gallery.hmiAlarms.Raise("M105",
                     Gallery.T("motor overload tripped", "电机过载跳闸"), 2);
-            }
-            c.DrawText(px, abY + t.heightMedium + app.Scale(16),
+            };
+            abBtns.With(abWarn);
+            abBtns.With(abFault);
+            abCol.With(abBtns);
+            abCol.With(Gallery.Caption(
                 Gallery.T("Unacknowledged: ", "未确认：")
                     + Convert.ToString(Gallery.hmiAlarms.UnackedCount())
                     + Gallery.T("   ·   buffered: ", "   ·   缓冲：")
-                    + Convert.ToString(Gallery.hmiAlarms.Count()),
-                t.textTertiary, t.fontSizeSmall);
-            c.DrawText(px, abY + t.heightMedium + app.Scale(38),
+                    + Convert.ToString(Gallery.hmiAlarms.Count())));
+            abCol.With(Gallery.Caption(
                 Gallery.T("The banner blinks until acknowledged; its Ack button clears the whole buffer.",
-                    "横幅在确认前持续闪烁；确认按钮一次清掉整个缓冲。"),
-                t.textTertiary, t.fontSizeSmall);
+                    "横幅在确认前持续闪烁；确认按钮一次清掉整个缓冲。")));
+            Gallery.LayoutAuto(app, abCol, name, px, y + app.Scale(34),
+                w - app.Scale(36), app.Scale(190));
         } else if (name == "Hmi.alarmList") {
-            Gallery.HmiTick(app);
-            Gallery.LayoutIn(app, Gallery.hmiAlarmList, px, py - app.Scale(20),
-                w - app.Scale(36), app.Scale(200));
+            Gallery.HmiTick(app, x, y, w, h);
             AlarmItem sel = Gallery.hmiAlarmList.SelectedItem();
             string selTxt = Gallery.T("No row selected -- click one.",
                 "尚未选中行 —— 点击任意一行。");
@@ -5769,92 +6319,103 @@ class Gallery {
                 selTxt = Gallery.T("Selected: ", "已选：") + sel.Point()
                     + "  " + sel.Message();
             }
-            c.DrawText(px, py + app.Scale(190), selTxt, t.textTertiary,
-                t.fontSizeSmall);
-            c.DrawText(px, py + app.Scale(212),
+            Gallery.hmiAlarmList.Prefer(0, app.Scale(200));
+            Panel alCol = Gallery.Captioned(app, Gallery.hmiAlarmList, selTxt);
+            alCol.With(Gallery.Caption(
                 Gallery.T("Same AlarmBuffer as the banner demo, so an ack there shows up here.",
-                    "与横幅示例共用同一个 AlarmBuffer，因此在那里确认这里同步生效。"),
-                t.textTertiary, t.fontSizeSmall);
+                    "与横幅示例共用同一个 AlarmBuffer，因此在那里确认这里同步生效。")));
+            Gallery.LayoutAuto(app, alCol, name, px, y + app.Scale(34),
+                w - app.Scale(36), app.Scale(270));
         } else if (name == "Hmi.numpad") {
-            Gallery.HmiTick(app);
-            Gallery.LayoutIn(app, Gallery.hmiPad, px, py - app.Scale(20),
-                app.Scale(200), app.Scale(270));
-            int nx = px + app.Scale(224);
-            Gallery.LayoutIn(app, Gallery.hmiDigSp, nx, py - app.Scale(20),
-                app.Scale(160), app.Scale(72));
-            c.DrawText(nx, py + app.Scale(64),
+            Gallery.HmiTick(app, x, y, w, h);
+            // 键盘一栏、数显加三行说明一栏。两个控件都有固有尺寸
+            // （键盘 200x260、数显 150x72），说明文字进树参与测量，
+            // 右栏 grow 占满剩余宽度。
+            Flex padRow = Flex.Wrapped().Gap(app.Scale(24));
+            padRow.With(Gallery.hmiPad);
+            Panel padSide = Panel.Column().Gap(app.Scale(10));
+            padSide.Class = "grow";
+            padSide.With(Gallery.hmiDigSp);
+            padSide.With(Gallery.Caption(
                 Gallery.T("Type a value, then ENT -- the keypad converts it to raw counts (scale 10) and writes TIC101.SV.",
-                    "输入数值后按 ENT —— 键盘按刻度（10）换算成原始计数并写入 TIC101.SV。"),
-                t.textTertiary, t.fontSizeSmall);
-            c.DrawText(nx, py + app.Scale(90),
-                Gallery.T("Entry buffer: ", "输入缓冲：") + "\"" + Gallery.hmiPad.Text()
-                    + "\"", t.textSecondary, t.fontSizeSmall);
-            c.DrawText(nx, py + app.Scale(112),
+                    "输入数值后按 ENT —— 键盘按刻度（10）换算成原始计数并写入 TIC101.SV。")));
+            padSide.With(new Label {
+                Text = Gallery.T("Entry buffer: ", "输入缓冲：") + "\""
+                    + Gallery.hmiPad.Text() + "\"",
+                Class = "hint" });
+            padSide.With(Gallery.Caption(
                 Gallery.T("The trend's SV pen follows every commit.",
-                    "趋势图的 SV 曲线随每次写入变化。"),
-                t.textTertiary, t.fontSizeSmall);
-        } else if (name == "Hmi.equip") {
-            Gallery.HmiTick(app);
-            Gallery.LayoutIn(app, Gallery.hmiWall, px, py - app.Scale(20),
+                    "趋势图的 SV 曲线随每次写入变化。")));
+            padRow.With(padSide);
+            Gallery.LayoutAuto(app, padRow, name, px, y + app.Scale(34),
                 w - app.Scale(36), app.Scale(290));
-            c.DrawText(px, py + app.Scale(276),
-                Gallery.T("The panel is the container: it reflows its cards into as many columns as the width allows.",
-                    "面板本身就是容器：按可用宽度把卡片重排成相应的列数。"),
-                t.textTertiary, t.fontSizeSmall);
+        } else if (name == "Hmi.equip") {
+            Gallery.HmiTick(app, x, y, w, h);
+            Gallery.LayoutAuto(app,
+                Gallery.Captioned(app, Gallery.hmiWall,
+                    Gallery.T("The panel is the container: it reflows its cards into as many columns as the width allows.",
+                        "面板本身就是容器：按可用宽度把卡片重排成相应的列数。")),
+                name, px, y + app.Scale(34), w - app.Scale(36),
+                app.Scale(340));
         } else if (name == "Hmi.deviceCard") {
-            Gallery.HmiTick(app);
-            Gallery.LayoutIn(app, Gallery.hmiCard, px, py - app.Scale(16),
-                app.Scale(250), app.Scale(132));
-            c.DrawText(px + app.Scale(268), py - app.Scale(10),
+            Gallery.HmiTick(app, x, y, w, h);
+            Gallery.hmiCard.Prefer(app.Scale(250), app.Scale(132));
+            Panel notes = Panel.Column().Gap(app.Scale(8));
+            notes.With(Gallery.Caption(
                 Gallery.T("The status chip and the left colour bar cycle through the five states.",
-                    "状态标签与左侧色条在五种状态间循环。"),
-                t.textTertiary, t.fontSizeSmall);
-            c.DrawText(px + app.Scale(268), py + app.Scale(12),
+                    "状态标签与左侧色条在五种状态间循环。")));
+            notes.With(Gallery.Caption(
                 Gallery.T("Value rows read their tags directly, so no per-card copy exists.",
-                    "数值行直接读位号，因此卡片内没有值的副本。"),
-                t.textTertiary, t.fontSizeSmall);
+                    "数值行直接读位号，因此卡片内没有值的副本。")));
+            // 卡片在左、说明在右；窄窗口下说明整块折到卡片下面，
+            // 而不是被右边缘切掉。
+            Flex cardRow = Flex.Wrapped().Gap(app.Scale(18));
+            cardRow.With(Gallery.hmiCard);
+            cardRow.With(notes);
+            Gallery.LayoutAuto(app, cardRow, name, px, y + app.Scale(34),
+                w - app.Scale(36), app.Scale(150));
         } else if (name == "Button.tertiary") {
-            Panel row = Panel.Row().Gap(app.Scale(10));
+            Flex row = Flex.Wrapped().Gap(app.Scale(10));
             row.With(new Button { Text = "Default", Tertiary = true });
             row.With(new Button { Text = "Primary", Tertiary = true, Class = "primary" });
             row.With(new Button { Text = "Info",    Tertiary = true, Class = "info" });
             row.With(new Button { Text = "Success", Tertiary = true, Class = "success" });
             row.With(new Button { Text = "Warning", Tertiary = true, Class = "warning" });
             row.With(new Button { Text = "Error",   Tertiary = true, Class = "error" });
-            Gallery.LayoutIn(app, row, px, y + app.Scale(34), w - app.Scale(36),
+            Gallery.LayoutAuto(app, row, name, px, y + app.Scale(34), w - app.Scale(36),
                 app.Scale(34));
         } else if (name == "Button.quaternary") {
-            Panel row = Panel.Row().Gap(app.Scale(10));
+            Flex row = Flex.Wrapped().Gap(app.Scale(10));
             row.With(new Button { Text = "Default", Quaternary = true });
             row.With(new Button { Text = "Primary", Quaternary = true, Class = "primary" });
             row.With(new Button { Text = "Info",    Quaternary = true, Class = "info" });
             row.With(new Button { Text = "Success", Quaternary = true, Class = "success" });
             row.With(new Button { Text = "Warning", Quaternary = true, Class = "warning" });
             row.With(new Button { Text = "Error",   Quaternary = true, Class = "error" });
-            Gallery.LayoutIn(app, row, px, y + app.Scale(34), w - app.Scale(36),
+            Gallery.LayoutAuto(app, row, name, px, y + app.Scale(34), w - app.Scale(36),
                 app.Scale(34));
         } else if (name == "Button.color") {
             int brand = 0xFF1890FF;
             int warm = 0xFFFF7A45;
             int mint = 0xFF18A058;
-            Panel row = Panel.Row().Gap(app.Scale(10));
+            Flex row = Flex.Wrapped().Gap(app.Scale(10));
             row.With(new Button { Text = "Primary", Color = brand });
             row.With(new Button { Text = "Warm", Color = warm });
             row.With(new Button { Text = "Mint", Color = mint });
             row.With(new Button { Text = "Strong", Color = brand, Strong = true });
-            Gallery.LayoutIn(app, row, px, y + app.Scale(34), w - app.Scale(36),
+            Gallery.LayoutAuto(app, row, name, px, y + app.Scale(34), w - app.Scale(36),
                 app.Scale(34));
         } else if (name == "Button.iconButton") {
-            Panel row = Panel.Row().Gap(app.Scale(10));
+            Flex row = Flex.Wrapped().Gap(app.Scale(10));
             row.With(new Button { Icon = "search", Class = "primary circle" });
             row.With(new Button { Icon = "edit", Class = "info circle" });
             row.With(new Button { Icon = "trash", Class = "error circle outline" });
             row.With(new Button { Icon = "download", Class = "success round" });
             row.With(new Button { Icon = "plus", Class = "circle", Tip = "Add" });
-            Gallery.LayoutIn(app, row, px, y + app.Scale(34), w - app.Scale(36),
+            Gallery.LayoutAuto(app, row, name, px, y + app.Scale(34), w - app.Scale(36),
                 app.Scale(34));
         } else if (name == "Button.strong") {
-            Panel row = Panel.Row().Gap(app.Scale(10));
+            Flex row = Flex.Wrapped().Gap(app.Scale(10));
             row.With(new Button { Text = "Default" });
             row.With(new Button { Text = "Strong", Strong = true });
             row.With(new Button { Text = "Primary", Class = "primary" });
@@ -5862,7 +6423,7 @@ class Gallery {
                 Strong = true });
             row.With(new Button { Text = "Tertiary + Strong", Tertiary = true,
                 Strong = true });
-            Gallery.LayoutIn(app, row, px, y + app.Scale(34), w - app.Scale(36),
+            Gallery.LayoutAuto(app, row, name, px, y + app.Scale(34), w - app.Scale(36),
                 app.Scale(34));
         } else if (name == "Button.events") {
             Button b = new Button { Text = "Click me", Class = "primary" };
@@ -5875,7 +6436,7 @@ class Gallery {
                 Text = "clicked " + Convert.ToString(Gallery.evtClicks)
                     + " time(s) -- Click is a UiEvent; On adds Enter/Leave/...",
                 Class = "secondary" });
-            Gallery.LayoutIn(app, col, px, y + app.Scale(34), w - app.Scale(36),
+            Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34), w - app.Scale(36),
                 app.Scale(84));
         } else if (name == "Button.popover") {
             // Hover tip rides the built-in Tip; the second button toggles an
@@ -5894,15 +6455,12 @@ class Gallery {
                     t.heightMedium, "Toggled by click", 1, 0);
             }
         } else if (name == "Input.password") {
-            Panel row = Panel.Row().Gap(app.Scale(10));
-            row.With(new Label { Text = "Password" });
-            row.With(Gallery.demoPw);
-            Gallery.LayoutIn(app, row, px, py - app.Scale(8), app.Scale(360),
-                t.heightMedium);
-            c.DrawText(px, py + app.Scale(34),
-                Gallery.T("Masked with *; the trailing eye reveals it while keeping the caret.",
-                    "以 * 掩码显示；尾端眼睛图标在保持光标的同时切回明文。"),
-                t.textTertiary, t.fontSizeSmall);
+            Gallery.LayoutAuto(app,
+                Gallery.FieldWithCaption(app, "Password", Gallery.demoPw,
+                    Gallery.T("Masked with *; the trailing eye reveals it while keeping the caret.",
+                        "以 * 掩码显示；尾端眼睛图标在保持光标的同时切回明文。")),
+                name, px, y + app.Scale(34), w - app.Scale(36),
+                app.Scale(70));
         } else if (name == "Input.size") {
             Panel col = Panel.Column().Gap(app.Scale(10));
             Panel r1 = Panel.Row().Gap(app.Scale(10));
@@ -5917,94 +6475,94 @@ class Gallery {
             col.With(r1);
             col.With(r2);
             col.With(r3);
-            Gallery.LayoutIn(app, col, px, y + app.Scale(34), app.Scale(420),
+            Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34), app.Scale(420),
                 app.Scale(150));
         } else if (name == "Input.clearable") {
-            Panel row = Panel.Row().Gap(app.Scale(10));
-            row.With(new Label { Text = "Clearable" });
-            row.With(Gallery.demoClr);
-            Gallery.LayoutIn(app, row, px, py - app.Scale(8), app.Scale(360),
-                t.heightMedium);
-            c.DrawText(px, py + app.Scale(34),
-                Gallery.T("Type something and stay focused: an X appears in the trailing slot.",
-                    "输入内容并保持聚焦：尾端出现 X，点击清空。"),
-                t.textTertiary, t.fontSizeSmall);
+            Gallery.LayoutAuto(app,
+                Gallery.FieldWithCaption(app, "Clearable", Gallery.demoClr,
+                    Gallery.T("Type something and stay focused: an X appears in the trailing slot.",
+                        "输入内容并保持聚焦：尾端出现 X，点击清空。")),
+                name, px, y + app.Scale(34), w - app.Scale(36),
+                app.Scale(70));
         } else if (name == "Input.autoselect") {
-            Panel row = Panel.Row().Gap(app.Scale(10));
-            row.With(new Label { Text = "Autoselect" });
-            row.With(Gallery.demoAuto);
-            Gallery.LayoutIn(app, row, px, py - app.Scale(8), app.Scale(360),
-                t.heightMedium);
-            c.DrawText(px, py + app.Scale(34),
-                Gallery.T("Click away, then back in: everything is selected so typing replaces it all.",
-                    "先点别处再点回来：内容全选，直接输入即整段替换。"),
-                t.textTertiary, t.fontSizeSmall);
+            Gallery.LayoutAuto(app,
+                Gallery.FieldWithCaption(app, "Autoselect", Gallery.demoAuto,
+                    Gallery.T("Click away, then back in: everything is selected so typing replaces it all.",
+                        "先点别处再点回来：内容全选，直接输入即整段替换。")),
+                name, px, y + app.Scale(34), w - app.Scale(36),
+                app.Scale(70));
         } else if (name == "Input.icons") {
-            Panel row = Panel.Row().Gap(app.Scale(10));
-            row.With(new Label { Text = "Icons" });
-            row.With(Gallery.demoIcons);
-            Gallery.LayoutIn(app, row, px, py - app.Scale(8), app.Scale(380),
-                t.heightMedium);
-            c.DrawText(px, py + app.Scale(34),
-                Gallery.T("iconLead / iconTrail reserve glyph slots so text never runs under them.",
-                    "iconLead / iconTrail 预留图标槽位，文本不会滑到图标下面。"),
-                t.textTertiary, t.fontSizeSmall);
+            Gallery.LayoutAuto(app,
+                Gallery.FieldWithCaption(app, "Icons", Gallery.demoIcons,
+                    Gallery.T("iconLead / iconTrail reserve glyph slots so text never runs under them.",
+                        "iconLead / iconTrail 预留图标槽位，文本不会滑到图标下面。")),
+                name, px, y + app.Scale(34), w - app.Scale(36),
+                app.Scale(70));
         } else if (name == "Input.disabled") {
-            Panel row = Panel.Row().Gap(app.Scale(10));
+            Flex row = Flex.Wrapped().Gap(app.Scale(10));
             row.With(new Label { Text = "Disabled" });
             row.With(Gallery.demoOff);
-            Gallery.LayoutIn(app, row, px, py - app.Scale(8), app.Scale(360),
+            Gallery.LayoutAuto(app, row, name, px, py - app.Scale(8), app.Scale(360),
                 t.heightMedium);
         } else if (name == "Input.error") {
-            Panel row = Panel.Row().Gap(app.Scale(10));
+            Flex row = Flex.Wrapped().Gap(app.Scale(10));
             row.With(new Label { Text = "Email" });
             row.With(Gallery.demoErr);
-            Gallery.LayoutIn(app, row, px, py - app.Scale(8), app.Scale(360),
+            Gallery.LayoutAuto(app, row, name, px, py - app.Scale(8), app.Scale(360),
                 t.heightMedium);
+        } else if (name == "DatePicker") {
+            // 三种模式并排。月历弹层由 DatePicker 自己在框架的覆盖层里画
+            // （OnPaintOverlay），所以这里和普通字段没有区别：排进去就行。
+            Flex row = Flex.Wrapped().Gap(app.Scale(18));
+            row.With(Gallery.Captioned(app, Gallery.demoDay,
+                Gallery.T("date — the default", "date — 默认")));
+            row.With(Gallery.Captioned(app, Gallery.demoWhen,
+                Gallery.T("datetime — extra hour/minute row",
+                          "datetime — 弹层多一行时分")));
+            row.With(Gallery.Captioned(app, Gallery.demoSpan,
+                Gallery.T("daterange — click twice for start + end",
+                          "daterange — 点两次锁定起止")));
+            Gallery.LayoutAuto(app, row, name, px, y + app.Scale(34),
+                w - app.Scale(36), app.Scale(70));
         } else if (name == "Avatar.shape") {
             Avatar aC = new Avatar("A", 44, "");
             Avatar aR = new Avatar("R", 44, "");
             aR.Shape = "rounded";
             Avatar aS = new Avatar("S", 44, "");
             aS.Shape = "square";
-            Panel row = Panel.Row().Gap(app.Scale(24));
+            Flex row = Flex.Wrapped().Gap(app.Scale(24));
             row.With(aC);
             row.With(aR);
             row.With(aS);
-            Gallery.LayoutIn(app, row, px, y + app.Scale(34), app.Scale(240),
-                app.Scale(48));
-            c.DrawText(px, y + app.Scale(92),
-                "circle (default)      rounded      square",
-                t.textTertiary, t.fontSizeSmall);
+            Gallery.LayoutAuto(app,
+                Gallery.Captioned(app, row,
+                    "circle (default)      rounded      square"),
+                name, px, y + app.Scale(34), w - app.Scale(36),
+                app.Scale(80));
         } else if (name == "Form") {
-            Gallery.LayoutIn(app, Gallery.demoForm,
+            Gallery.LayoutAuto(app, Gallery.demoForm, name,
                 px, y + app.Scale(34), w - app.Scale(36),
                 app.Scale(280));
         } else if (name == "CheckboxGroup") {
-            // Children are retained on Gallery.demoCbg so toggles stick across
-            // frames; the parent box is just the aggregate visual:
-            // all=check, partial=dash, none=hollow.
+            // 子项留在 Gallery.demoCbg 上，勾选状态跨帧保持。“全选”
+            // 父项就是一个真的 Checkbox：三态由 Indeterminate 表达
+            // （全选=勾，部分=横线，全不选=空框），和下面代码示例里
+            // 写的 API 完全一致，不再手绘方框和横线。
             int n = Gallery.demoCbg.CheckedCount();
-            int boxY = y + app.Scale(36);
-            int boxSz = app.Scale(18);
-            if (n == 3) {
-                c.FillRoundRect(px, boxY, boxSz, boxSz, 3, t.primary);
-                c.DrawGlyph("check", px + app.Scale(3), boxY + app.Scale(3),
-                    app.Scale(12), app.theme.textInverse);
-            } else if (n > 0) {
-                c.FillRoundRect(px, boxY, boxSz, boxSz, 3, t.primary);
-                c.FillRoundRect(px + app.Scale(4), boxY + boxSz / 2 - 1,
-                    boxSz - app.Scale(8), app.Scale(2), 1,
-                    app.theme.textInverse);
-            } else {
-                c.DrawRoundRect(px, boxY, boxSz, boxSz, 3, t.borderPrimary, 1);
-            }
-            c.DrawText(px + boxSz + app.Scale(8), boxY + app.Scale(2),
+            int total = Gallery.demoCbg.Count();
+            Checkbox all = new Checkbox(
                 Gallery.T("Select all - mirrors the children (partial shows a dash)",
-                    "全选 - 随子项聚合（部分选中显示横线）"),
-                t.textSecondary, t.fontSizeSmall);
-            Gallery.LayoutIn(app, Gallery.demoCbg, px, y + app.Scale(70),
-                w - app.Scale(36), app.Scale(110));
+                    "全选 - 随子项聚合（部分选中显示横线）"));
+            all.SetChecked(total > 0 && n == total);
+            all.Indeterminate = n > 0 && n < total;
+            all.Change += () => {
+                Gallery.demoCbg.SetAllChecked(all.IsChecked());
+            };
+            Panel cbgCol = Panel.Column().Gap(app.Scale(10));
+            cbgCol.With(all);
+            cbgCol.With(Gallery.demoCbg);
+            Gallery.LayoutAuto(app, cbgCol, name, px, y + app.Scale(34),
+                w - app.Scale(36), app.Scale(150));
         } else if (name == "Empty") {
             Empty e1 = new Empty("No results");
             e1.Icon = "search";
@@ -6022,18 +6580,58 @@ class Gallery {
             c.DrawText(px + app.Scale(46), py + app.Scale(28), "Copy the API example below to use it.", t.textSecondary, t.fontSizeSmall);
         }
         c.PopClip();
+        Gallery.Audit(app, name, x, y, w, h, rendered);
         return h;
+    }
+
+    /// ZAN_GALLERY_AUDIT=1 时，每渲染一个演示就记一行到 gallery_audit.log：
+    /// 框高、实测内容底边、是否走了 LayoutAuto、是否有渲染分支。逐页肉眼
+    /// 看 135 个演示既慢又漏，让程序自己报「谁没画、谁被裁、谁还在用手调
+    /// 高度」要可靠得多。
+    static void Audit(App app, string name, int x, int y, int w, int h,
+                      bool rendered) {
+        if (!Gallery.audit) { return; }
+        int content = Gallery.AutoContentH(name, w);
+        // 卡片高度读的是上一帧的实测值（见 PreviewBoxH），所以第一帧的
+        // box 还是种子高度。逐帧比对、只在数字变化时补记一行，日志里
+        // 每个演示的最后一行就是收敛后的真值。
+        string sig = Convert.ToString(h) + "/" + Convert.ToString(content)
+            + "/" + Convert.ToString(w);
+        if (Gallery.auditSeen.ContainsKey(name)) {
+            if (Gallery.auditSeen[name] == sig) { return; }
+            Gallery.auditSeen.Remove(name);
+        }
+        Gallery.auditSeen.Add(name, sig);
+        File.AppendAllText("gallery_audit.log",
+            "demo=" + name
+            + " box=" + Convert.ToString(h)
+            + " content=" + Convert.ToString(content)
+            + " auto=" + (content > 0 ? "1" : "0")
+            + " rendered=" + (rendered ? "1" : "0")
+            + " w=" + Convert.ToString(w)
+            + "\n");
     }
 
     /// Components whose live demo floats outside the preview box (dropdowns,
     /// menus, popovers, a table with a filter panel). They are drawn in the
     /// deferred overlay pass so their popups sit above the code panel.
+    /// 这份名单必须与 RenderOverlay 的分支一一对应：名单漏了谁，那个
+    /// 演示的基础通道就走到最后的 else 去画「Overlay / interactive
+    /// component」占位卡，而 RenderOverlay 里写好的演示永远不会被调到 ——
+    /// Compose 与 DataTable 就是这样各自丢了一整个示例，且不报任何错。
+    /// tests/run_gallery_overlay_pairing.cmake 会核对两处是否一致。
     static bool IsOverlayComp(string name) {
         if (name == "Select") { return true; }
         if (name == "SelectBox") { return true; }
         if (name == "Dropdown") { return true; }
         if (name == "Popover") { return true; }
+        if (name == "SelectBox.filter") { return true; }
+        if (name == "SelectBox.table") { return true; }
+        if (name == "SelectBox.virtual") { return true; }
+        if (name == "SelectBox.hover") { return true; }
+        if (name == "DataTable") { return true; }
         if (name == "DataTable 1M") { return true; }
+        if (name == "Compose") { return true; }
         if (name == "Layer") { return true; }
         if (name == "Designer") { return true; }
         return false;
@@ -6065,6 +6663,44 @@ class Gallery {
                 app.theme.textPrimary, app.theme.fontSizeMedium);
             Gallery.demoLarge.Render(app, px, py + t.heightMedium + app.Scale(32),
                                      app.Scale(180));
+        } else if (name == "SelectBox.filter") {
+            // Filterable(true)：弹层顶部一个搜索框，键入即时过滤。
+            // 四十个候选项已经不值得逐条翻了。
+            Gallery.demoFilter.Render(app, px, py, app.Scale(260));
+            Gallery.SelCaption(app, name, px, py + t.heightMedium + app.Scale(12),
+                Gallery.T("Filterable(true) · type to narrow, X clears",
+                          "Filterable(true) · 键入即筛，X 清空"));
+            Gallery.SelReport(app, name, Gallery.demoFilter);
+        } else if (name == "SelectBox.table") {
+            // Table(headers, widths) + AddRow(cells)：弹层是一张对齐的表，
+            // 而不是把三段文字拼成一条长字符串。筛选对所有列生效。
+            Gallery.demoTablePick.Render(app, px, py, app.Scale(320));
+            Gallery.SelCaption(app, name, px, py + t.heightMedium + app.Scale(12),
+                Gallery.T("Table(headers, widths) + AddRow(cells) · the filter hits every column",
+                          "Table(headers, widths) + AddRow(cells) · 筛选命中所有列"));
+            Gallery.SelReport(app, name, Gallery.demoTablePick);
+        } else if (name == "SelectBox.virtual") {
+            // 两万条选项。弹层每帧只遍历视口里的那十几行，宽度只量一次；
+            // 滚动到底也一样流畅。
+            Gallery.demoHugePick.Render(app, px, py, app.Scale(280));
+            Gallery.SelCaption(app, name, px, py + t.heightMedium + app.Scale(12),
+                Gallery.T("20000 options · only the visible rows are walked each frame",
+                          "两万条选项 · 每帧只遍历可见的那几行"));
+            Gallery.SelReport(app, name, Gallery.demoHugePick);
+        } else if (name == "SelectBox.hover") {
+            // Hover 事件 + Hovered()：指到哪条就报哪条，联动预览/详情面板
+            // 靠的就是这一对。
+            Gallery.demoHoverPick.Render(app, px, py, app.Scale(220));
+            Gallery.SelCaption(app, name, px, py + t.heightMedium + app.Scale(12),
+                Gallery.T("Hover an option · the index is reported at the top of this card",
+                          "把鼠标移到选项上 · 序号报在卡片头部"));
+            int hv = Gallery.demoHoverPick.Hovered();
+            string hvText = Gallery.T("(nothing hovered)", "（未悬停）");
+            if (hv >= 0) {
+                hvText = "Hovered #" + Convert.ToString(hv)
+                    + " · " + Gallery.demoHoverPick.OptionLabel(hv);
+            }
+            Gallery.Fired(app, name, hvText);
         } else if (name == "Select") {
             // Retained instance: owns its open state and defers the option list
             // to the framework overlay layer (draws above the code panel, one
@@ -6663,16 +7299,16 @@ class Gallery {
         Comp bt = new Comp("Basic", "Button",
             "Button is a retained Control declared with an object initializer -- new Button { Text = \"Save\", Class = \"primary small\" } -- added to a container (Panel.Row/Column or a Form), so layout is automatic: no x/y/width. Wire a handler with `b.Click += ...`. Every look is a CSS class (type, fill, secondary, ghost, loading, shape, size), so a skin restyles all of it and demos only compose.", "");
         bt.AddDemo("Types", "Six semantic types, one class each: primary/info/success/warning/error (no class = default).", "Button.types", 92,
-            "// Retained: a Row lays the buttons out -- no x/y/width.\nPanel row = Panel.Row().Gap(10);\nrow.With(new Button { Text = \"Default\" })\n   .With(new Button { Text = \"Primary\", Class = \"primary\" })\n   .With(new Button { Text = \"Info\", Class = \"info\" })\n   .With(new Button { Text = \"Success\", Class = \"success\" })\n   .With(new Button { Text = \"Warning\", Class = \"warning\" })\n   .With(new Button { Text = \"Error\", Class = \"error\" });\nform.Add(row);",
+            "// Retained: a wrapping Flex row lays the buttons out -- no x/y/width.\n// Wrapped() = flex-wrap: wrap, so a narrow window folds the row\n// instead of clipping it, and the container measures its own height.\nFlex row = Flex.Wrapped().Gap(10);\nrow.With(new Button { Text = \"Default\" })\n   .With(new Button { Text = \"Primary\", Class = \"primary\" })\n   .With(new Button { Text = \"Info\", Class = \"info\" })\n   .With(new Button { Text = \"Success\", Class = \"success\" })\n   .With(new Button { Text = \"Warning\", Class = \"warning\" })\n   .With(new Button { Text = \"Error\", Class = \"error\" });\nform.Add(row);",
             "[\n  { \"kind\": \"Button\", \"text\": \"Default\", \"type\": \"default\" },\n  { \"kind\": \"Button\", \"text\": \"Primary\", \"type\": \"primary\" },\n  { \"kind\": \"Button\", \"text\": \"Info\",    \"type\": \"info\" },\n  { \"kind\": \"Button\", \"text\": \"Success\", \"type\": \"success\" },\n  { \"kind\": \"Button\", \"text\": \"Warning\", \"type\": \"warning\" },\n  { \"kind\": \"Button\", \"text\": \"Error\",   \"type\": \"error\" }\n]");
         bt.AddDemo("Styles", "The fill treatment is a class too: outline / text / dashed (no class = solid), as are secondary and ghost.", "Button.styles", 92,
-            "Panel row = Panel.Row().Gap(10);\nrow.With(new Button { Text = \"Solid\", Class = \"primary\" })\n   .With(new Button { Text = \"Outline\", Class = \"primary outline\" })\n   .With(new Button { Text = \"Text\", Class = \"primary text\" })\n   .With(new Button { Text = \"Dashed\", Class = \"primary dashed\" })\n   .With(new Button { Text = \"Secondary\", Class = \"primary secondary\" })\n   .With(new Button { Text = \"Ghost\", Class = \"primary ghost\" });\nform.Add(row);",
+            "Flex row = Flex.Wrapped().Gap(10);\nrow.With(new Button { Text = \"Solid\", Class = \"primary\" })\n   .With(new Button { Text = \"Outline\", Class = \"primary outline\" })\n   .With(new Button { Text = \"Text\", Class = \"primary text\" })\n   .With(new Button { Text = \"Dashed\", Class = \"primary dashed\" })\n   .With(new Button { Text = \"Secondary\", Class = \"primary secondary\" })\n   .With(new Button { Text = \"Ghost\", Class = \"primary ghost\" });\nform.Add(row);",
             "[\n  { \"kind\": \"Button\", \"text\": \"Solid\",     \"type\": \"primary\", \"style\": \"solid\" },\n  { \"kind\": \"Button\", \"text\": \"Outline\",   \"type\": \"primary\", \"style\": \"outline\" },\n  { \"kind\": \"Button\", \"text\": \"Text\",      \"type\": \"primary\", \"style\": \"text\" },\n  { \"kind\": \"Button\", \"text\": \"Dashed\",    \"type\": \"primary\", \"style\": \"dashed\" },\n  { \"kind\": \"Button\", \"text\": \"Secondary\", \"type\": \"primary\", \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Ghost\",     \"type\": \"primary\", \"ghost\": true }\n]");
         bt.AddDemo("流光效果 (cursor-driven)", "Opt-in border light -- the `specular` class. A small symmetric pair of glints rides the button's border, brightest at the edge nearest the cursor and mirrored on the opposite side; it moves only when the pointer moves (no auto-spin, zero repaints when still), stays on the border so it never covers the label, and is clipped to the button so nothing spills onto neighbours.", "Button.specular", 92,
-            "Panel row = Panel.Row().Gap(10);\nrow.With(new Button { Text = \"Hover me\", Class = \"primary specular\" })\n   .With(new Button { Text = \"Success\", Class = \"success specular\" })\n   .With(new Button { Text = \"Error\", Class = \"error specular\" })\n   .With(new Button { Text = \"Default\", Class = \"specular\" });\nform.Add(row);",
+            "Flex row = Flex.Wrapped().Gap(10);\nrow.With(new Button { Text = \"Hover me\", Class = \"primary specular\" })\n   .With(new Button { Text = \"Success\", Class = \"success specular\" })\n   .With(new Button { Text = \"Error\", Class = \"error specular\" })\n   .With(new Button { Text = \"Default\", Class = \"specular\" });\nform.Add(row);",
             "[\n  { \"kind\": \"Button\", \"text\": \"Hover me\", \"type\": \"primary\", \"specular\": true },\n  { \"kind\": \"Button\", \"text\": \"Success\",  \"type\": \"success\", \"specular\": true },\n  { \"kind\": \"Button\", \"text\": \"Error\",    \"type\": \"error\",   \"specular\": true }\n]");
         bt.AddDemo("Secondary buttons", "A subtly tinted fill with type-colored text -- the `secondary` class -- for lower-emphasis actions.", "Button.secondary", 92,
-            "Panel row = Panel.Row().Gap(10);\nrow.With(new Button { Text = \"Default\", Class = \"secondary\" })\n   .With(new Button { Text = \"Primary\", Class = \"primary secondary\" })\n   .With(new Button { Text = \"Info\", Class = \"info secondary\" })\n   .With(new Button { Text = \"Success\", Class = \"success secondary\" })\n   .With(new Button { Text = \"Warning\", Class = \"warning secondary\" })\n   .With(new Button { Text = \"Error\", Class = \"error secondary\" });\nform.Add(row);",
+            "Flex row = Flex.Wrapped().Gap(10);\nrow.With(new Button { Text = \"Default\", Class = \"secondary\" })\n   .With(new Button { Text = \"Primary\", Class = \"primary secondary\" })\n   .With(new Button { Text = \"Info\", Class = \"info secondary\" })\n   .With(new Button { Text = \"Success\", Class = \"success secondary\" })\n   .With(new Button { Text = \"Warning\", Class = \"warning secondary\" })\n   .With(new Button { Text = \"Error\", Class = \"error secondary\" });\nform.Add(row);",
             "[\n  { \"kind\": \"Button\", \"text\": \"Default\", \"type\": \"default\", \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Primary\", \"type\": \"primary\", \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Info\",    \"type\": \"info\",    \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Success\", \"type\": \"success\", \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Warning\", \"type\": \"warning\", \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Error\",   \"type\": \"error\",   \"secondary\": true }\n]");
         bt.AddDemo("Loading, disabled & custom color", "The `loading` class shows a built-in spinner and ignores clicks; Disabled = true greys it out; a brand colour is a class of your own (`button.pink { background: #e91e63 }` in the app CSS).", "Button.states", 92,
             "Panel row = Panel.Row().Gap(10);\nrow.With(new Button { Text = \"Loading\", Class = \"primary loading\" })\n   .With(new Button { Text = \"\", Class = \"success loading circle\" })\n   .With(new Button { Text = \"Disabled\", Disabled = true })\n   .With(new Button { Text = \"Pink\", Class = \"pink\" })\n   .With(new Button { Text = \"Teal\", Class = \"teal\" });\nform.Add(row);",
@@ -6826,20 +7462,22 @@ class Gallery {
         Gallery.Add(list, "Data Entry", "CheckboxGroup",
             Gallery.T("A group of real Checkboxes laid out by the group (options wrap into rows when the width runs out). IsChecked/CheckedCount aggregate the state; Change fires once per user toggle -- wire it up as the 'select all + indeterminate parent' pattern shown in the snippet.",
                 "一组真实的 Checkbox，由组负责排布（宽度不够时自动换行）。IsChecked/CheckedCount 聚合组状态；任一项被用户切换时 Change 触发一次——可配合父级「全选」复选框的 indeterminate 半选态使用（见示例）。"),
-            "CheckboxGroup tops = new CheckboxGroup();\ntops.Add(\"Cheese\"); tops.Add(\"Tomato\"); tops.Add(\"Basil\");\ntops.Change += () => {\n    int n = tops.CheckedCount();\n    // parent 'select all' checkbox drives every child:\n    //   allBox.data = (n == tops.Count());\n    //   allBox.Indeterminate = n > 0 && n < tops.Count();\n};\nform.Add(tops);")
+            "CheckboxGroup tops = new CheckboxGroup();\ntops.AddOption(\"Cheese\"); tops.AddOption(\"Tomato\"); tops.AddOption(\"Basil\");\n\n// 'select all' parent: a plain Checkbox in the three states\nCheckbox all = new Checkbox(\"Select all\");\nint n = tops.CheckedCount();\nall.SetChecked(n == tops.Count());\nall.Indeterminate = n > 0 && n < tops.Count();\nall.Change += () => { tops.SetAllChecked(all.IsChecked()); };\n\nform.Add(all); form.Add(tops);")
             .Json("{\n  \"type\": \"CheckboxGroup\",\n  \"name\": \"tops\",\n  \"options\": [\"Cheese\", \"Tomato\", \"Basil\"]\n}")
-            .AddProp("options", "List<string>", "-", "Added via Add(label).")
+            .AddProp("options", "List<string>", "-", "Added via AddOption(label).")
             .AddProp("IsChecked(i)", "bool", "-", "Aggregate query: option i checked?")
             .AddProp("CheckedCount()", "int", "-", "How many options are currently checked.")
+            .AddProp("Count()", "int", "-", "How many options the group holds.")
+            .AddProp("SetAllChecked(v)", "void", "-", "Check / uncheck every option (drives the 'select all' parent).")
             .AddEvent("Change", "() => void", "Fires whenever any checkbox in the group toggles.");
         Gallery.Add(list, "Data Entry", "Form",
             Gallery.T("A whole form from one design document. The JSON you feed FormBuilder.Build is exactly what the visual designer (.zform) saves -- kind/label/name/placeholder/options/span per field -- so hand-written UI and designer-made UI are the same artifact. Build returns a real retained Control tree (24-col flow layout); add your action row and read model fields through each control's .data binding as usual.",
                 "一份设计文档生成整个表单。喂给 FormBuilder.Build 的 JSON 与可视化设计器（.zform）保存的完全一致 —— 每个字段带 kind/label/name/placeholder/options/span —— 手写界面与设计器产出是同一种产物。Build 返回一棵真正的保留态控件树（24 栅格流式布局），追加操作行、照常通过各控件的 .data 绑定读取模型字段即可。"),
             "// doc is exactly what the visual designer (.zform) saves:\n//   { layoutMode:0, fields:[ { kind:\"Input\", label:\"Email\", ... } ] }\nControl form = FormBuilder.Build(JsonValue.Parse(designDoc));\nPanel actions = Panel.Row().Gap(10);\nactions.With(new Button { Text = \"Cancel\" });\nactions.With(new Button { Text = \"Create account\", Class = \"primary\" });\nform.Add(actions);\nroot.Add(form);   // laid out like any container child")
-            .Json("{\n  \"layoutMode: 0,\n  \"fields: [\n    { \"kind: \"Input, \"label: \"Email, \"name: \"email, \"placeholder: \"you@example.com },\n    { \"kind: \"SelectBox, \"label: \"Role, \"name: \"role, \"options: [\"Admin, \"Editor, \"Viewer] },\n    { \"kind: \"Switch, \"label: \"Weekly digest, \"name: \"digest, \"defOn: true },\n    { \"kind: \"TextArea, \"label: \"Bio, \"name: \"bio, \"span: 24 }\n  ]\n}")
+            .Json("{\n  \"layoutMode\": 0,\n  \"fields\": [\n    { \"kind\": \"Input\", \"label\": \"Email\", \"name\": \"email\", \"placeholder\": \"you@example.com\" },\n    { \"kind\": \"SelectBox\", \"label\": \"Role\", \"name\": \"role\", \"options\": [\"Admin\", \"Editor\", \"Viewer\"] },\n    { \"kind\": \"Switch\", \"label\": \"Weekly digest\", \"name\": \"digest\", \"defOn\": true },\n    { \"kind\": \"TextArea\", \"label\": \"Bio\", \"name\": \"bio\", \"span\": 24 }\n  ]\n}")
             .AddProp("layoutMode", "int", "0", "0 = 24-column flow, 1 = free canvas with absolute rects.")
             .AddProp("fields[].kind", "string", "-", "Any ControlFactory kind: Input / TextArea / SelectBox / Switch / Checkbox / Radio / Rate / Slider / Panel ...")
-            .AddProp("fields[].label", "string", "\"\"", "Caption above Input / TextArea / SelectBox fields.")
+            .AddProp("fields[].label", "string", "\"\"", "Field caption. Controls that carry their own label (Checkbox, Radio) get it; the rest get a caption line above them.")
             .AddProp("fields[].span", "int", "24", "Column span out of 24 (12 = half row).")
             .AddEvent("Read values", "control.data", "Keep references to built controls or bind paths; values land in your model like any retained widget.");
         Gallery.Add(list, "Data Entry", "Radio",
@@ -6886,6 +7524,31 @@ class Gallery {
                 "高级选择框。自持展开/收起、弹窗（对长列表自带裁剪与滚动）、单选或多选、可选清除按钮，以及尺寸和状态变体。一次 Render() 调用即可完成全部功能。Naive UI 风格 props：filterable (弹层顶部加搜索框，键入即时过滤选项，含 X 清空按钮)、placement (auto/bottom/top 控制弹层弹出方向)、clearable (触发器内的 X 按钮清除选项)。"),
             "SelectBox city = new SelectBox(\"Pick a city\").Clearable(true);\ncity.AddOption(\"London\"); city.AddOption(\"Paris\");\ncity.Render(app, 40, 80, 200);\nint i = city.Selected();      // -1 if none\n// multi-select: SelectBox.Multi(hint) + city.IsChosen(i)\n\n// Naive UI filterable + placement variants\nSelectBox filter = new SelectBox(\"Type to filter...\");\nfilter.Filterable(true);\nfilter.AddOption(\"Apple\");   filter.AddOption(\"Banana\");\nfilter.AddOption(\"Cherry\");  filter.AddOption(\"Date\");\nfilter.Render(app, 260, 80, 220);\n\nSelectBox top = new SelectBox(\"Opens upward\");\ntop.Placement(2);  // 2 = top, 1 = bottom, 0 = auto\ntop.AddOption(\"First\");  top.AddOption(\"Second\");\ntop.Render(app, 500, 80, 220);")
             .Json("{\n  \"type\": \"Column\",\n  \"name\": \"selects\",\n  \"gap\": 12,\n  \"children\": [\n    { \"type\": \"SelectBox\", \"name\": \"city\",   \"hint\": \"Pick a city\", \"clearable\": true,\n      \"options\": [\"London\", \"Paris\"] },\n    { \"type\": \"SelectBox\", \"name\": \"filter\", \"hint\": \"Type to filter...\",\n      \"filterable\": true,\n      \"options\": [\"Apple\", \"Banana\", \"Cherry\", \"Date\"] },\n    { \"type\": \"SelectBox\", \"name\": \"top\",    \"hint\": \"Opens upward\",\n      \"placement\": \"top\",\n      \"options\": [\"First\", \"Second\"] }\n  ]\n}")
+            .WithBasic(240)
+            .AddDemo(Gallery.T("Filterable", "键入筛选"),
+                Gallery.T("Filterable(true) puts a search box at the top of the popup and narrows the list as you type; the X clears it. FilterHint sets the placeholder, FilterText()/SetFilterText drive it from code (remote search).",
+                    "Filterable(true) 在弹层顶部加一个搜索框，键入即时收窄列表，X 清空。FilterHint 设置提示文字，FilterText()/SetFilterText 供代码驱动（远程搜索）。"),
+                "SelectBox.filter", 120,
+                "SelectBox pick = new SelectBox(\"Type to filter countries\")\n    .Filterable(true)\n    .FilterHint(\"Search countries\");\npick.AddOption(\"Argentina\");  pick.AddOption(\"Australia\");\n// ... 40 options\npick.Render(app, x, y, 260);\n\n// drive it from code (e.g. a remote search):\npick.SetFilterText(\"united\");\nstring q = pick.FilterText();",
+                "")
+            .AddDemo(Gallery.T("Custom list (table)", "自定义列表（表格）"),
+                Gallery.T("Table(headers, widths) turns the popup into an aligned table and AddRow(cells) adds one row per option -- each cell gets its own ellipsis, so the columns line up instead of one long concatenated string. The filter matches every cell, so searching by code or by name both work.",
+                    "Table(headers, widths) 把弹层变成一张对齐的表，AddRow(cells) 每个选项一行 —— 每格各自收省略号，列因此是对齐的，而不是把几段文字拼成一条长字符串。筛选命中所有单元格，按代码搜和按名称搜都行。"),
+                "SelectBox.table", 120,
+                "SelectBox pick = new SelectBox(\"Pick a stock\").Filterable(true);\npick.Table(new List<string>{ \"Code\", \"Name\", \"Last\" },\n           new List<int>{ 80, 150, 90 });\npick.AddRow(new List<string>{ \"600519\", \"Kweichow Moutai\", \"1712.00\" });\npick.AddRow(new List<string>{ \"000858\", \"Wuliangye\",       \"128.44\" });\npick.Render(app, x, y, 320);\n\n// first cell is the label, so Text()/Selected() are unchanged\nstring code = pick.Text();",
+                "")
+            .AddDemo(Gallery.T("Virtualized (20000 options)", "虚表（两万条选项）"),
+                Gallery.T("The popup walks only the rows inside the viewport and measures the widest label once, so the option count no longer costs anything per frame. Without both, 20000 options means 20000 iterations and 20000 text measurements every frame -- the measuring alone is more expensive than drawing the dozen rows you can actually see.",
+                    "弹层每帧只遍历视口里的行，最宽标签只量一次，选项数量因此不再有逐帧代价。两者缺一，两万条选项就是每帧两万次迭代加两万次文本测量 —— 光测量就比画出那十几行本身贵得多。"),
+                "SelectBox.virtual", 120,
+                "SelectBox pick = new SelectBox(\"20000 options\").Filterable(true);\nfor (int i = 0; i < 20000; i = i + 1) {\n    pick.AddOption(\"Item \" + Convert.ToString(i + 1));\n}\npick.Render(app, x, y, 280);   // scroll or filter -- both stay smooth",
+                "")
+            .AddDemo(Gallery.T("Hover event", "悬停事件"),
+                Gallery.T("Hover fires whenever the option under the pointer changes, and Hovered() says which one it is. The popup is placed by the framework (it flips when it would run off-screen), so a caller cannot work this out from the trigger geometry -- it has to come from the control.",
+                    "指针下的选项一变，Hover 就触发，Hovered() 给出是哪一条。弹层的位置由框架决定（越界时会翻转），调用方靠触发器几何算不出来，只能由控件报出。"),
+                "SelectBox.hover", 110,
+                "SelectBox pick = new SelectBox(\"Hover the options\");\npick.AddOption(\"Alpha\");  pick.AddOption(\"Bravo\");\npick.Hover += () => {\n    int i = pick.Hovered();       // -1 when nothing is hovered\n    preview.Show(i);\n};\npick.Render(app, x, y, 220);",
+                "")
             .AddProp("hint", "string", "\"\"", "Placeholder text.")
             .AddProp("clearable", "bool", "false", "Show a clear button (Clearable).")
             .AddProp("filterable", "bool", "false", "Top-of-popup search box with live filtering (Naive UI filterable).")
@@ -6894,8 +7557,13 @@ class Gallery {
             .AddProp("size", "enum", "medium", "small/medium/large (Naive UI size).")
             .AddProp("status", "enum", "normal", "normal/success/warning/error (Naive UI status).")
             .AddProp("options", "List<string>", "-", "Added via AddOption.")
+            .AddProp("Table(headers, widths)", "builder", "-", "Table-style popup: one row per option, cells from AddRow.")
+            .AddProp("FilterHint(text)", "builder", "\"Search\"", "Placeholder inside the popup search box.")
             .AddEvent("Selected()", "int", "Current selection index, or -1 if none.")
+            .AddEvent("Hovered()", "int", "Option index under the pointer, or -1.")
+            .AddEvent("FilterText()", "string", "Current search keyword (filterable).")
             .AddEvent("Change", "() => void", "Fires when the selection changes.")
+            .AddEvent("Hover", "() => void", "Fires when the hovered option changes.")
             .AddEvent("Open", "() => void", "Fires when the popup opens.")
             .AddEvent("Close", "() => void", "Fires when the popup closes.");
         Gallery.Add(list, "Data Entry", "Rate",
@@ -7392,13 +8060,31 @@ class Gallery {
     }
 
     static void BuildFeedback(List<Comp> list) {
-        Gallery.Add(list, "Feedback", "Alert",
-            Gallery.T("Alerts live in Layer, the single overlay component: Layer.DrawNotify paints an inline banner (accent bar + icon + text) wherever you want one, Layer.Msg / Layer.Notify push transient toasts, and LayerState.Alert opens a modal dialog. Type: 2 info, 3 success, 4 warning, 5 error; Layer.NotifyH(app) is the card height.",
-                "提示类统一归入 Layer 这一个覆盖层组件：Layer.DrawNotify 在任意位置画内联横幅（色条 + 图标 + 文字），Layer.Msg / Layer.Notify 推送临时提示，LayerState.Alert 打开模态对话框。类型：2 info，3 success，4 warning，5 error；Layer.NotifyH(app) 为卡片高度。"),
-            "// inline banner:\nLayer.DrawNotify(app, x, y, w, \"Your changes were saved.\", 3);\n// transient toast / corner notification:\nLayer.Msg(\"Saved\", 3);\nLayer.Notify(\"Build finished\", 3);\n// modal dialog:\nLayerState dlg = LayerState.Alert(\"Notice\", \"Saved.\", 1);")
-            .AddProp("w", "int", "-", "Banner width in px.")
-            .AddProp("message", "string", "-", "Banner text.")
-            .AddProp("ntype", "int", "0", "2 info, 3 success, 4 warning, 5 error.");
+        // Alert 的两个演示（内联横幅、临时队列）早就实现在 RenderPreview 里，
+        // 却从来没有注册过：整页只剩一张「Overlay / interactive component」
+        // 占位卡。这里把它们接上，Alert 页才真的在演示 Alert。
+        Comp al = new Comp("Feedback", "Alert",
+            Gallery.T("Alerts live in Layer, the single overlay component: Layer.DrawNotify paints an inline banner (accent bar + icon + text) wherever you want one, and Layer.Msg / Layer.Notify push transient toasts. Type: 2 info, 3 success, 4 warning, 5 error; Layer.NotifyH(app) is the card height. Modal dialogs are the same component -- see Layer.",
+                "提示类统一归入 Layer 这一个覆盖层组件：Layer.DrawNotify 在任意位置画内联横幅（色条 + 图标 + 文字），Layer.Msg / Layer.Notify 推送临时提示。类型：2 info，3 success，4 warning，5 error；Layer.NotifyH(app) 为卡片高度。模态对话框是同一个组件，见 Layer 条目。"), "");
+        al.AddDemo(Gallery.T("Inline banners", "内联横幅"),
+            Gallery.T("One banner per role, drawn in place with Layer.DrawNotify -- no overlay, no state: it is a paint call, so it goes wherever the layout puts it.",
+                "每个角色一条横幅，用 Layer.DrawNotify 就地绘制 —— 不进覆盖层、不带状态：它就是一次绘制调用，放在版面的哪里都行。"),
+            "Alert.types", 195,
+            "int step = Layer.NotifyH(app) + 12;\nLayer.DrawNotify(app, x, y, w, \"Plain banner\", 0);\nLayer.DrawNotify(app, x, y + step, w, \"Additional context\", 2);\nLayer.DrawNotify(app, x, y + step * 2, w, \"The build finished.\", 3);\nLayer.DrawNotify(app, x, y + step * 3, w, \"Low disk space.\", 4);\nLayer.DrawNotify(app, x, y + step * 4, w, \"Deployment failed.\", 5);",
+            "");
+        al.AddDemo(Gallery.T("Transient queues", "临时队列"),
+            Gallery.T("Every button below calls the real API. Layer.Msg pushes a top-centred toast, Layer.Notify a top-right card; both queue, auto-dismiss and animate out. The host only has to call Layer.RenderToasts / RenderNotifs once per frame.",
+                "下面每个按钮都在调真实 API。Layer.Msg 推顶部居中消息，Layer.Notify 推右上角通知卡；两者都会排队、自动消失并带收拢动画。宿主只需每帧调一次 Layer.RenderToasts / RenderNotifs。"),
+            "Alert.queue", 155,
+            "// anywhere in your code:\nLayer.Msg(\"Message saved.\", 0);\nLayer.Notify(\"Build completed\", 3);\n\n// once per frame, in the overlay pass:\nLayer.RenderToasts(app);\nLayer.RenderNotifs(app);",
+            "");
+        al.AddProp("w", "int", "-", Gallery.T("Banner width in px.", "横幅宽度（像素）。"));
+        al.AddProp("message", "string", "-", Gallery.T("Banner text.", "横幅文字。"));
+        al.AddProp("ntype", "int", "0", "2 info, 3 success, 4 warning, 5 error.");
+        al.AddEvent("Layer.NotifyH(app)", "int", Gallery.T("Height of one banner / card, for stacking them.", "单条横幅 / 通知卡的高度，用于堆叠排布。"));
+        al.AddEvent("Layer.Msg(text, type)", "void", Gallery.T("Push a top-centred toast.", "推送一条顶部居中消息。"));
+        al.AddEvent("Layer.Notify(text, type)", "void", Gallery.T("Push a top-right notification card.", "推送一张右上角通知卡。"));
+        list.Add(al);
         Comp pr = new Comp("Feedback", "Progress",
             "Progress indicators. A line bar shows a labelled percentage; a ring gauge shows the same value as a circle. type selects the colour (0 default, 2 info, 3 success, 4 warning).", "");
         pr.AddDemo("Line", "A Progress draws a labelled horizontal bar; the label is the progress::label part.", "Progress.line", 210,

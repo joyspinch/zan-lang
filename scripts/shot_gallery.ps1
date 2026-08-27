@@ -34,6 +34,12 @@ public class WG{
  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+ // PrintWindow asks the window for its own pixels, so it does not depend on
+ // the window being foreground and can never capture another app's picture
+ // (CopyFromScreen grabs whatever covers the screen when raising the window
+ // loses the race). Flag 0x2 is PW_RENDERFULLCONTENT, required for windows
+ // that render through DirectComposition.
+ [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
  public delegate bool EnumProc(IntPtr h,IntPtr l);
  public static IntPtr Found = IntPtr.Zero;
  [StructLayout(LayoutKind.Sequential)] public struct RECT{ public int L; public int T; public int R; public int B; }
@@ -61,6 +67,10 @@ $w = $r.R - $r.L; $ht = $r.B - $r.T
 Add-Type -AssemblyName System.Drawing
 $bmp = New-Object Drawing.Bitmap($w,$ht)
 $g = [Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($r.L,$r.T,0,0,$bmp.Size)
+$hdc = $g.GetHdc()
+$ok = [WG]::PrintWindow($h, $hdc, 2)
+$g.ReleaseHdc($hdc)
+$g.Dispose()
+if (-not $ok) { Write-Output "printwindow-failed"; exit 1 }
 $bmp.Save($Out)
 Write-Output ("ok size=" + $w + "x" + $ht + " -> " + $Out)

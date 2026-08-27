@@ -24,7 +24,8 @@ $files = @()
 $files += (Get-ChildItem stdlib\Gui\*.zan).FullName
 $files += (Get-ChildItem stdlib\Gui\Widget\*.zan).FullName
 $files += (Get-ChildItem stdlib\Gui\Component\Chart\*.zan).FullName
-$files += (Join-Path (Get-Location) "examples\gui_charts\gui_charts.zan")
+$files += (Get-ChildItem examples\gui_charts\*.zan).FullName
+$files += (Join-Path (Get-Location) "examples\gui_gallery\MapChinaData.zan")
 
 $zanArgs = @()
 $zanArgs += $files
