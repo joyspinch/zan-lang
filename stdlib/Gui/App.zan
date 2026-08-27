@@ -2380,16 +2380,21 @@ class App {
         Window.SetSizePaint(() => { App.PaintFromWndProc(); });
     }
 
-    /// <summary>从窗口过程就地画一帧（先让表面跟上新的窗口
-    /// 尺寸）。没有注册帧体时为空操作。</summary>
+    /// <summary>从窗口过程就地画一帧(先让表面跟上新的窗口
+    /// 尺寸)。没有注册帧体时为空操作。支持主 App 和 ChildWindow:
+    /// 按当前 eventHwnd 路由到对应的窗口。</summary>
     static void PaintFromWndProc() {
+        if (App.wndProcPainting) { return; }
+        // 窗口过程正在处理的消息所属的窗口。不能用 EventHwnd():
+        // 那一个只在应用泵出事件时更新,而模态尺寸调整循环期间
+        // 应用拿不到事件,它会停留在拖动开始前的旧值上。
+        nint hwnd = Window.SizePaintWindow();
+        // 先尝试路由给 ChildWindow(IDE 的子窗口)。
+        if (ChildWindows.PaintForResize(hwnd)) { return; }
+        // 不是子窗口,回退到主 App。
         App a = App.frameApp;
         if (a == null || a.frameBody == null) { return; }
-        // 帧体的持有者是进程级的（窗口过程回调拿不到实例），而
-        // 尺寸消息属于某一个窗口：正在缩放的不是它自己的窗口时
-        // 什么都别画，否则会把别的窗口的一帧画进这个 App 的表面。
-        if (!a.EventIsMine()) { return; }
-        if (App.wndProcPainting) { return; }
+        if (hwnd != a.WindowHandle()) { return; }
         App.wndProcPainting = true;
         a.SyncSurface();
         a.SafeFrame(a.frameBody);
@@ -3176,6 +3181,22 @@ class App {
         return anims[idx].cur != anims[idx].dst;
     }
 
+    /// 把一次性入场动画重置到 0，用于 toolbox 还原。
+    void AnimRestart(int key, int durMs) {
+        int idx = AnimIndex(key);
+        if (durMs < 1) { durMs = 1; }
+        if (idx < 0) {
+            this.anims.Add(new AnimSlot(key, 0, 1000, 0, this.nowMs, durMs));
+            return;
+        }
+        AnimSlot a = this.anims[idx];
+        a.src = 0;
+        a.cur = 0;
+        a.dst = 1000;
+        a.startMs = this.nowMs;
+        a.dur = durMs;
+    }
+
     int AnimTo(int key, int target, int durMs) {
         int value = this.AnimToValue(key, target, durMs);
         if (this.AnimActive(key)) {
@@ -3500,11 +3521,15 @@ class App {
             dmgY = adY;
             dmgW = adR - adX;
             dmgH = adB - adY;
+            // 记下的是这一帧*声明*的范围，不是刚算出的并集。存并集会
+            // 让「上一帧画过的」逐帧吞进更早各帧的范围而永不收缩：几十
+            // 帧之后裁剪矩形就是全窗，于是每个动画帧都整窗光栅一遍 ——
+            // 名义上是局部帧，代价却是整窗帧。
             animPrevValid = true;
-            animPX = dmgX;
-            animPY = dmgY;
-            animPW = dmgW;
-            animPH = dmgH;
+            animPX = animRX;
+            animPY = animRY;
+            animPW = animRW;
+            animPH = animRH;
             partialPending = true;
         }
         return true;

@@ -82,6 +82,7 @@ partial class ChartView {
         if (ksrc.itemStyle.normal.lineStyle.color != 0) { wickUp = ksrc.itemStyle.normal.lineStyle.color; }
         if (ksrc.itemStyle.normal.lineStyle.color0 != 0) { wickDn = ksrc.itemStyle.normal.lineStyle.color0; }
 
+        ChartView.PushPlotClip(app, f.plotX, f.plotY, f.plotW, f.plotH);
         for (int bc = 0; bc < cols; bc = bc + 1) {
             int c0 = bc * n / cols;
             int c1 = (bc + 1) * n / cols;
@@ -116,13 +117,6 @@ partial class ChartView {
             c.FillRoundRect(cx - bw / 2, bodyTop, bw, bh, app.Scale(1), col);
         }
 
-        string cap = Convert.ToString(n) + " bars";
-        int cwid = Canvas.MeasureText(cap, Style.FontFallback(app, "small"));
-        c.DrawText(x + w - t.paddingMedium - cwid, y + h - t.paddingMedium - Canvas.FontHeight(Style.FontFallback(app, "small")),
-            cap,
-            Style.Part(app, "chart", "hint", "", "", "", Style.SNormal()).FgOr(0),
-            Style.FontFallback(app, "small"));
-
         // 折线覆盖层（MA 线）绘制在同一价格轴，
         // 与蜡烛柱对齐分桶，使均线与柱条对齐。
         int ov = 1;
@@ -145,6 +139,14 @@ partial class ChartView {
             }
             ov = ov + 1;
         }
+        c.PopClip();
+
+        string cap = Convert.ToString(n) + " bars";
+        int cwid = Canvas.MeasureText(cap, Style.FontFallback(app, "small"));
+        c.DrawText(x + w - t.paddingMedium - cwid, y + h - t.paddingMedium - Canvas.FontHeight(Style.FontFallback(app, "small")),
+            cap,
+            Style.Part(app, "chart", "hint", "", "", "", Style.SNormal()).FgOr(0),
+            Style.FontFallback(app, "small"));
 
         if (o.showTooltip) {
             int mx = app.mouseX;
@@ -199,13 +201,19 @@ partial class ChartView {
                             ChartOption o, int g) {
         Canvas c = app.canvas;
         Theme t = app.theme;
-        List<Bubble> bs = o.series[0].bubbles;
-        int fullN = bs.Count;
-        int plotTop = ChartView.PanelHead(app, x, y, w, h, o.title);
+        int pad = t.paddingMedium;
+        int axisFs = Style.FontFallback(app, "small");
+        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.title, o.series,
+                                      o.iwid, o.showLegend);
+
+        int fullN = 0;
+        for (int si0 = 0; si0 < o.series.Count; si0 = si0 + 1) {
+            if (o.series[si0].bubbles.Count > fullN) {
+                fullN = o.series[si0].bubbles.Count;
+            }
+        }
         if (fullN < 1) { return; }
 
-        // dataZoom：窗口索引 [i0,i1]（含端点）；范围、跨步
-        // 采样和命中搜索都只在窗口内。
         int zoomH = 0;
         int i0 = 0;
         int i1 = fullN - 1;
@@ -214,69 +222,137 @@ partial class ChartView {
             i1 = Chart.ZoomI1(app, o, o.iwid, fullN);
             zoomH = app.Scale(24);
         }
-        int n = i1 - i0 + 1;
-        if (n < 1) { n = 1; }
 
-        int maxX = 1;
-        int maxY = 1;
+        int maxX = 0;
+        int maxY = 0;
         int maxW = 1;
-        for (int i = i0; i <= i1; i = i + 1) {
-            if (bs[i].x > maxX) { maxX = bs[i].x; }
-            if (bs[i].y > maxY) { maxY = bs[i].y; }
-            if (bs[i].weight > maxW) { maxW = bs[i].weight; }
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries s = o.series[si];
+            if (!s.hidden) {
+                int j = i0;
+                while (j <= i1 && j < s.bubbles.Count) {
+                    if (s.bubbles[j].x > maxX) { maxX = s.bubbles[j].x; }
+                    if (s.bubbles[j].y > maxY) { maxY = s.bubbles[j].y; }
+                    if (s.bubbles[j].weight > maxW) { maxW = s.bubbles[j].weight; }
+                    j = j + 1;
+                }
+            }
         }
-        int niceY = Chart.NiceMax(maxY);
-        int niceX = Chart.NiceMax(maxX);
-        List<string> noLab = new List<string>();
-        ChartFrame f = Chart.DrawFrame(app, x, y, w, h - zoomH, plotTop, noLab, niceY);
+        int maxXN = Chart.NiceMax(maxX);
+        int maxYN = Chart.NiceMax(maxY);
+        int xLo = 0;
+        int yLo = 0;
+        if (o.xAxes.Count > 0 && o.xAxes[0].min != ChartOption.Auto()) {
+            xLo = o.xAxes[0].min;
+        }
+        if (o.yAxes.Count > 0 && o.yAxes[0].min != ChartOption.Auto()) {
+            yLo = o.yAxes[0].min;
+        }
+        if (o.xAxes.Count > 0 && o.xAxes[0].max != ChartOption.Auto()) {
+            maxXN = o.xAxes[0].max;
+        }
+        if (o.yAxes.Count > 0 && o.yAxes[0].max != ChartOption.Auto()) {
+            maxYN = o.yAxes[0].max;
+        }
+        int leftGut = Canvas.MeasureText(Convert.ToString(maxYN), axisFs) + app.Scale(12);
+        int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
+        int plotX = x + pad + leftGut;
+        int plotY = plotTop;
+        int plotW = (x + w - pad) - plotX;
+        int plotH = (y + h - zoomH - pad - botGut) - plotY;
+        if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
+        if (plotH < app.Scale(20)) { plotH = app.Scale(20); }
+
+        StyleBox sGrid = Style.Part(app, "chart", "grid", "", "", "",
+                                    Style.SNormal());
+        StyleBox sAxis = Style.Part(app, "chart", "axis", "", "", "",
+                                    Style.SNormal());
+        int ticks = 5;
+        int xSpan = maxXN - xLo;
+        int ySpan = maxYN - yLo;
+        if (xSpan < 1) { xSpan = 1; }
+        if (ySpan < 1) { ySpan = 1; }
+        for (int k = 0; k <= ticks; k = k + 1) {
+            int gy = Chart.ValueY(plotY, plotH, yLo, maxYN, yLo + ySpan * k / ticks);
+            c.FillRect(plotX, gy, plotW, 1, sGrid.BgOr(0));
+            string vs = Convert.ToString(yLo + ySpan * k / ticks);
+            int vw = Canvas.MeasureText(vs, axisFs);
+            c.DrawText(plotX - app.Scale(6) - vw, Canvas.CenterTextYAt(gy, axisFs),
+                vs, sAxis.FgOr(0), axisFs);
+            int gx = Chart.ValueX(plotX, plotW, xLo, maxXN, xLo + xSpan * k / ticks);
+            c.DrawTextCentered(gx - app.Scale(20), plotY + plotH + app.Scale(4),
+                app.Scale(40), botGut,
+                Convert.ToString(xLo + xSpan * k / ticks), sAxis.FgOr(0), axisFs);
+        }
+        c.FillRect(plotX, plotY, 1, plotH, sAxis.BgOr(0));
+        c.FillRect(plotX, plotY + plotH, plotW, 1, sAxis.BgOr(0));
         if (zoomH > 0) {
-            Chart.DrawZoomBar(app, f.plotX, f.plotW, y + h - app.Scale(18),
+            Chart.DrawZoomBar(app, plotX, plotW, y + h - app.Scale(18),
                 app.Scale(12), o.iwid, fullN);
         }
-        int color = Style.Part(app, "chart", "accent", "", "", "",
-                               Style.SNormal()).BgOr(0);
-        if (o.series[0].color != 0) { color = o.series[0].color; }
+
         int maxR = app.Scale(20);
         int rootMaxW = ChartView.ISqrt(maxW);
         if (rootMaxW < 1) { rootMaxW = 1; }
-        int stride = 1;
-        if (n > f.plotW) { stride = n / f.plotW; if (stride < 1) { stride = 1; } }
 
-        int j = i0;
-        while (j <= i1) {
-            int px = f.plotX + bs[j].x * f.plotW / niceX;
-            int py = f.plotY + f.plotH - (bs[j].y * f.plotH / niceY);
-            int rr = ChartView.ISqrt(bs[j].weight) * maxR / rootMaxW;
-            if (rr < app.Scale(2)) { rr = app.Scale(2); }
-            rr = rr * g / 1000;
-            c.FillCircle(px, py, rr, Chart.WithAlpha(color, 80));
-            j = j + stride;
+        ChartView.PushPlotClip(app, plotX, plotY, plotW, plotH);
+        for (int r = 0; r < o.series.Count; r = r + 1) {
+            ChartSeries s = o.series[r];
+            if (!s.hidden) {
+                int j = i0;
+                while (j <= i1 && j < s.bubbles.Count) {
+                    int px = Chart.ValueX(plotX, plotW, xLo, maxXN, s.bubbles[j].x);
+                    int py = Chart.ValueY(plotY, plotH, yLo, maxYN, s.bubbles[j].y);
+                    int rr = ChartView.ISqrt(s.bubbles[j].weight) * maxR / rootMaxW;
+                    if (rr < app.Scale(2)) { rr = app.Scale(2); }
+                    rr = rr * g / 1000;
+                    int col = s.color;
+                    if (col == 0) { col = Chart.Palette(t, r); }
+                    c.FillCircle(px, py, rr, Chart.WithAlpha(col, 80));
+                    j = j + 1;
+                }
+            }
         }
+        c.PopClip();
 
         if (o.showTooltip) {
             int mx = app.mouseX;
             int my = app.mouseY;
-            if (mx >= f.plotX && mx < f.plotX + f.plotW
-                && my >= f.plotY && my < f.plotY + f.plotH) {
-                int best = 0 - 1;
+            if (mx >= plotX && mx < plotX + plotW
+                && my >= plotY && my < plotY + plotH) {
+                int bestS = 0 - 1;
+                int bestJ = 0;
                 int bestD = 0;
-                int j2 = i0;
-                while (j2 <= i1) {
-                    int px2 = f.plotX + bs[j2].x * f.plotW / niceX;
-                    int py2 = f.plotY + f.plotH - (bs[j2].y * f.plotH / niceY);
-                    int ddx = mx - px2;
-                    int ddy = my - py2;
-                    int d2 = ddx * ddx + ddy * ddy;
-                    if (best < 0 || d2 < bestD) { best = j2; bestD = d2; }
-                    j2 = j2 + stride;
+                for (int r2 = 0; r2 < o.series.Count; r2 = r2 + 1) {
+                    ChartSeries s2 = o.series[r2];
+                    if (!s2.hidden) {
+                        int j2 = i0;
+                        while (j2 <= i1 && j2 < s2.bubbles.Count) {
+                            int px2 = Chart.ValueX(plotX, plotW, xLo, maxXN, s2.bubbles[j2].x);
+                            int py2 = Chart.ValueY(plotY, plotH, yLo, maxYN, s2.bubbles[j2].y);
+                            int ddx = mx - px2;
+                            int ddy = my - py2;
+                            int d2 = ddx * ddx + ddy * ddy;
+                            if (bestS < 0 || d2 < bestD) {
+                                bestS = r2;
+                                bestJ = j2;
+                                bestD = d2;
+                            }
+                            j2 = j2 + 1;
+                        }
+                    }
                 }
                 int hitR = app.Scale(10);
-                if (best >= 0 && bestD <= hitR * hitR) {
+                if (bestS >= 0 && bestD <= hitR * hitR) {
+                    ChartSeries bs = o.series[bestS];
+                    int col = bs.color;
+                    if (col == 0) { col = Chart.Palette(t, bestS); }
                     List<TooltipRow> rows = new List<TooltipRow>{
-                        TooltipRow.Of(color, "x  " + Convert.ToString(bs[best].x)),
-                        TooltipRow.Of(color, "y  " + Convert.ToString(bs[best].y)),
-                        TooltipRow.Of(color, "w  " + Convert.ToString(bs[best].weight)) };
-                    ChartView.TooltipCard(app, mx, my, f.plotX + f.plotW, rows);
+                        TooltipRow.Of(col, bs.name),
+                        TooltipRow.Of(col, "x  " + Convert.ToString(bs.bubbles[bestJ].x)),
+                        TooltipRow.Of(col, "y  " + Convert.ToString(bs.bubbles[bestJ].y)),
+                        TooltipRow.Of(col, "w  " + Convert.ToString(bs.bubbles[bestJ].weight)) };
+                    ChartView.TooltipCard(app, mx, my, plotX + plotW, rows);
                 }
             }
         }
@@ -322,6 +398,7 @@ partial class ChartView {
         int bw = step * 5 / 10;
         if (bw < app.Scale(6)) { bw = app.Scale(6); }
 
+        ChartView.PushPlotClip(app, f.plotX, f.plotY, f.plotW, f.plotH);
         for (int k = 0; k < n; k = k + 1) {
             int cx = f.plotX + k * step + step / 2;
             int col = Chart.Palette(t, k);
@@ -340,6 +417,7 @@ partial class ChartView {
             c.SurfaceRoundRect(cx - bw / 2, yQ3, bw, boxH, app.Scale(2), Chart.WithAlpha(col, 70), col, 1);
             c.DrawLine(cx - bw / 2, yMed, cx + bw / 2, yMed, col, app.Scale(2));
         }
+        c.PopClip();
 
         if (o.showTooltip) {
             int mx = app.mouseX;
@@ -388,6 +466,7 @@ partial class ChartView {
         int color = Style.Part(app, "chart", "accent", "", "", "",
                                Style.SNormal()).BgOr(0);
         if (o.series[0].color != 0) { color = o.series[0].color; }
+        ChartView.PushPlotClip(app, f.plotX, f.plotY, f.plotW, f.plotH);
         List<int> lx = new List<int>();
         List<int> ly = new List<int>();
         for (int k = 0; k < n; k = k + 1) {
@@ -403,6 +482,7 @@ partial class ChartView {
             c.FillCircle(cx, vy, app.Scale(3), color);
         }
         if (lx.Count > 1) { c.DrawPolyline(lx, ly, color, app.Scale(2)); }
+        c.PopClip();
 
         if (o.showTooltip) {
             int mx = app.mouseX;

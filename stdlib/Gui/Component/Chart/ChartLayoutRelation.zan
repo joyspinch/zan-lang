@@ -26,21 +26,35 @@ class ChordNodeArc {
     }
 }
 
-/// 弦图的一条 ribbon（布局输出）：源/目标节点子弧的中心角。
+/// 弦图的一条 ribbon（布局输出）：源/目标节点子弧的中心角与端点。
 class ChordRibbon {
     int from;       // 节点下标
     int to;
     int val;
     int srcAngle;   // 源节点上该 link 的子弧中心角
     int dstAngle;   // 目标节点上该 link 的子弧中心角
+    int srcA0;
+    int srcA1;
+    int dstA0;
+    int dstA1;
 
     static ChordRibbon Of(int from, int to, int val, int srcAngle, int dstAngle) {
+        return ChordRibbon.OfSpan(from, to, val, srcAngle, dstAngle,
+            srcAngle, srcAngle, dstAngle, dstAngle);
+    }
+
+    static ChordRibbon OfSpan(int from, int to, int val, int srcAngle, int dstAngle,
+                              int srcA0, int srcA1, int dstA0, int dstA1) {
         ChordRibbon r = new ChordRibbon();
         r.from = from;
         r.to = to;
         r.val = val;
         r.srcAngle = srcAngle;
         r.dstAngle = dstAngle;
+        r.srcA0 = srcA0;
+        r.srcA1 = srcA1;
+        r.dstA0 = dstA0;
+        r.dstA1 = dstA1;
         return r;
     }
 }
@@ -78,7 +92,9 @@ class ChordLayout {
             int fi = ChordLayout.NodeIndex(l.nodes, lk.from);
             int ti = ChordLayout.NodeIndex(l.nodes, lk.to);
             l.nodes[fi].weight = l.nodes[fi].weight + lk.val;
-            l.nodes[ti].weight = l.nodes[ti].weight + lk.val;
+            if (ti != fi) {
+                l.nodes[ti].weight = l.nodes[ti].weight + lk.val;
+            }
         }
 
         // 稳定间隙 + 总弧长。
@@ -116,12 +132,19 @@ class ChordLayout {
             int fi = ChordLayout.NodeIndex(l.nodes, lk.from);
             int ti = ChordLayout.NodeIndex(l.nodes, lk.to);
             inc[fi].Add(li);
-            inc[ti].Add(li);
+            if (ti != fi) { inc[ti].Add(li); }
+        }
+        for (int i = 0; i < nn; i = i + 1) {
+            ChordLayout.SortInc(inc[i], links, l.nodes, i);
         }
         // subC[i][pos] = 节点 i 第 pos 个 incident link 的子弧中心角。
         List<List<int>> subC = new List<List<int>>();
+        List<List<int>> subA0 = new List<List<int>>();
+        List<List<int>> subA1 = new List<List<int>>();
         for (int i = 0; i < nn; i = i + 1) {
             List<int> ctrs = new List<int>();
+            List<int> a0s = new List<int>();
+            List<int> a1s = new List<int>();
             int subArc = l.nodes[i].a1 - l.nodes[i].a0;
             int wsum = l.nodes[i].weight;
             if (wsum < 1) { wsum = 1; }
@@ -140,9 +163,13 @@ class ChordLayout {
             int cum = l.nodes[i].a0;
             for (int p = 0; p < inc[i].Count; p = p + 1) {
                 ctrs.Add(cum + sizes[p] / 2);
+                a0s.Add(cum);
+                a1s.Add(cum + sizes[p]);
                 cum = cum + sizes[p];
             }
             subC.Add(ctrs);
+            subA0.Add(a0s);
+            subA1.Add(a1s);
         }
 
         for (int li = 0; li < n; li = li + 1) {
@@ -152,12 +179,49 @@ class ChordLayout {
             int sPos = ChordLayout.Pos(inc[fi], li);
             int dPos = ChordLayout.Pos(inc[ti], li);
             int sA = 0;
-            if (sPos >= 0 && sPos < subC[fi].Count) { sA = subC[fi][sPos]; }
             int dA = 0;
-            if (dPos >= 0 && dPos < subC[ti].Count) { dA = subC[ti][dPos]; }
-            l.ribbons.Add(ChordRibbon.Of(fi, ti, lk.val, sA, dA));
+            int sa0 = 0;
+            int sa1 = 0;
+            int da0 = 0;
+            int da1 = 0;
+            if (sPos >= 0 && sPos < subC[fi].Count) {
+                sA = subC[fi][sPos];
+                sa0 = subA0[fi][sPos];
+                sa1 = subA1[fi][sPos];
+            }
+            if (dPos >= 0 && dPos < subC[ti].Count) {
+                dA = subC[ti][dPos];
+                da0 = subA0[ti][dPos];
+                da1 = subA1[ti][dPos];
+            }
+            l.ribbons.Add(ChordRibbon.OfSpan(fi, ti, lk.val, sA, dA, sa0, sa1, da0, da1));
         }
         return l;
+    }
+
+    static int OtherIndex(List<ChordNodeArc> nodes, ChartLink lk, int self) {
+        int fi = ChordLayout.NodeIndex(nodes, lk.from);
+        int ti = ChordLayout.NodeIndex(nodes, lk.to);
+        if (fi == self) { return ti; }
+        return fi;
+    }
+
+    static void SortInc(List<int> inc, List<ChartLink> links,
+                        List<ChordNodeArc> nodes, int self) {
+        for (int a = 1; a < inc.Count; a = a + 1) {
+            int v = inc[a];
+            int ov = ChordLayout.OtherIndex(nodes, links[v], self);
+            int b = a - 1;
+            while (b >= 0) {
+                int ou = ChordLayout.OtherIndex(nodes, links[inc[b]], self);
+                bool keep = ou < ov;
+                if (!keep && ou == ov && inc[b] <= v) { keep = true; }
+                if (keep) { break; }
+                inc[b + 1] = inc[b];
+                b = b - 1;
+            }
+            inc[b + 1] = v;
+        }
     }
 
     static int NodeIndex(List<ChordNodeArc> nodes, string name) {

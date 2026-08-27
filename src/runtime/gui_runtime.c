@@ -2721,62 +2721,168 @@ EXPORT void zan_gui_fill_radial(i32 surface_id, i32 cx, i32 cy, i32 radius, i32 
 }
 
 /* Anti-aliased filled ring sector (pie / donut slice). Angles in degrees with
- * 0 at 12 o'clock, increasing clockwise. r_inner=0 gives a solid pie slice. */
+ * 0 at 12 o'clock, increasing clockwise. r_inner=0 gives a solid pie slice.
+ *
+ * Pixel-centre sampling throughout: integer-lattice distances would put the
+ * radial AA band half a pixel off the true rim, and pie rims / gauge arcs then
+ * read as stepped rings.
+ *
+ * The scan is derived from the shape, not from a bounding square. Walking the
+ * whole (2R+3)^2 square of the outer radius and paying a sqrt -- plus, for
+ * everything inside the annulus, an atan2 -- on every pixel of it is nearly all
+ * waste for the two shapes this actually draws: a 270-degree gauge ring of
+ * radius 170 covers ~35k pixels inside a 118k square, and a 90-degree pie slice
+ * discards three quarters of what it touched. Three dial gauges cost ~6ms of
+ * pure libm per frame that way, which is what dominated the HMI pages once
+ * their damage clipping was fixed. So:
+ *   - each row's x span comes from the circle, and the inner disc is skipped as
+ *     a hole rather than tested pixel by pixel;
+ *   - the sweep's own bounding box clamps the scan for partial sectors;
+ *   - the radial test runs on squared distances, so sqrt only runs for the two
+ *     half-pixel AA bands;
+ *   - the angular test is a pair of half-plane distances against the edge
+ *     directions instead of an atan2 per pixel. Since the edge vectors are unit
+ *     length, the cross product *is* the perpendicular distance in pixels, so
+ *     the half-pixel coverage ramp is the same band the arc-length form
+ *     computed -- only without the transcendental.
+ */
 static void cpu_fill_sector(zan_surface_t *s, int cx, int cy, int r_inner,
                             int r_outer, int a0_deg, int a1_deg, u32 c) {
-    int icx = cx, icy = cy;
-    double ri = (double)r_inner, ro = (double)r_outer;
+    if (r_outer <= 0) return;
     double a0 = (double)a0_deg, a1 = (double)a1_deg;
     if (a1 < a0) { double tmp = a0; a0 = a1; a1 = tmp; }
-    int R = r_outer;
-    const double PI = 3.14159265358979323846;
+    double sweep = a1 - a0;
+    if (sweep <= 0.0) return;
+    if (sweep > 360.0) sweep = 360.0;
+    /* One representation of the start angle for both the bbox scan below and
+     * the edge vectors: fold it into [0,360). */
+    a0 = a0 - floor(a0 / 360.0) * 360.0;
+    a1 = a0 + sweep;
 
-    /* Pixel-centre sampling throughout: the old integer-lattice distances
-     * put the radial AA band half a pixel off the true rim, so pie rims and
-     * gauge arcs read as stepped rings. */
-    for (int py = icy - R - 1; py <= icy + R + 1; py++) {
-        if (py < s->clip_y0 || py >= s->clip_y1) continue;
-        double wy = (double)py + 0.5 - (double)icy;
-        for (int px = icx - R - 1; px <= icx + R + 1; px++) {
-            if (px < s->clip_x0 || px >= s->clip_x1) continue;
-            double wx = (double)px + 0.5 - (double)icx;
-            double dist = sqrt(wx * wx + wy * wy);
-            /* radial coverage (AA on inner & outer edge) */
-            double radCov = 1.0;
-            if (dist > ro + 0.5) continue;
-            if (ri > 0.0 && dist < ri - 0.5) continue;
-            if (dist > ro - 0.5) radCov = ro + 0.5 - dist;
-            else if (ri > 0.0 && dist < ri + 0.5) radCov = dist - (ri - 0.5);
-            if (radCov <= 0.0) continue;
-            if (radCov > 1.0) radCov = 1.0;
-            /* angle of this pixel: 0 at top, clockwise, in [0,360) */
-            double ang = atan2(wx, -wy) * 180.0 / PI;
-            if (ang < 0.0) ang += 360.0;
-            /* Angular coverage: anti-alias the two radial (start/end) edges of
-             * the sweep so slice sides are smooth, not stair-stepped. One pixel
-             * of arc length subtends ~ (0.5/dist) radians; convert to degrees
-             * and ramp coverage across that half-pixel band on each edge. Skip
-             * for full turns so the closing seam does not double-darken. */
-            double angCov = 1.0;
-            double sweep = a1 - a0;
-            if (sweep < 360.0) {
-                double aa = ang;
-                double dpix = 45.0;
-                if (dist > 0.5) dpix = (0.5 / dist) * 180.0 / PI;
-                if (aa < a0 - dpix) aa += 360.0;
-                double dLo = aa - a0;   /* >0 inside from the start edge */
-                double dHi = a1 - aa;   /* >0 inside from the end edge   */
-                if (dLo <= -dpix || dHi <= -dpix) continue; /* fully outside */
-                double covLo = (dLo + dpix) / (2.0 * dpix);
-                double covHi = (dHi + dpix) / (2.0 * dpix);
-                if (covLo > 1.0) covLo = 1.0; if (covLo < 0.0) covLo = 0.0;
-                if (covHi > 1.0) covHi = 1.0; if (covHi < 0.0) covHi = 0.0;
-                angCov = covLo * covHi;
-                if (angCov <= 0.0) continue;
+    const double PI = 3.14159265358979323846;
+    double ri = (double)r_inner;
+    if (ri < 0.0) ri = 0.0;
+    double ro = (double)r_outer;
+    int hasHole = ri > 0.0;
+    double roOut = ro + 0.5, roIn = ro - 0.5;
+    double riOut = ri - 0.5, riIn = ri + 0.5;
+    if (riOut < 0.0) riOut = 0.0;
+    double roOut2 = roOut * roOut, roIn2 = roIn * roIn;
+    double riOut2 = riOut * riOut, riIn2 = riIn * riIn;
+    if (roIn2 < 0.0) roIn2 = 0.0;
+    int full = sweep >= 360.0;
+
+    /* Edge directions (unit): angle a points at (sin a, -cos a) on screen. */
+    double e0x = sin(a0 * PI / 180.0), e0y = -cos(a0 * PI / 180.0);
+    double e1x = sin(a1 * PI / 180.0), e1y = -cos(a1 * PI / 180.0);
+    /* cross(v,w) = v.x*w.y - v.y*w.x is > 0 when w is clockwise of v. */
+    int wide = sweep > 180.0;   /* not an intersection of two half-planes */
+
+    int bx0 = cx - r_outer - 1, bx1 = cx + r_outer + 1;
+    int by0 = cy - r_outer - 1, by1 = cy + r_outer + 1;
+    if (!full) {
+        /* Extremes of the sweep: both edges at both radii, the apex when the
+         * sector is solid, and the outer rim at every axis crossing inside. */
+        double xmn = e0x * ri, xmx = xmn, ymn = e0y * ri, ymx = ymn;
+        double cand[10][2];
+        int n = 0;
+        cand[n][0] = e0x * ro; cand[n][1] = e0y * ro; n++;
+        cand[n][0] = e1x * ri; cand[n][1] = e1y * ri; n++;
+        cand[n][0] = e1x * ro; cand[n][1] = e1y * ro; n++;
+        if (!hasHole) { cand[n][0] = 0.0; cand[n][1] = 0.0; n++; }
+        for (int k = 0; k <= 8; k++) {
+            double ca = (double)(k * 90);
+            if (ca < a0 || ca > a1) continue;
+            cand[n][0] = sin(ca * PI / 180.0) * ro;
+            cand[n][1] = -cos(ca * PI / 180.0) * ro;
+            n++;
+        }
+        for (int i = 0; i < n; i++) {
+            if (cand[i][0] < xmn) xmn = cand[i][0];
+            if (cand[i][0] > xmx) xmx = cand[i][0];
+            if (cand[i][1] < ymn) ymn = cand[i][1];
+            if (cand[i][1] > ymx) ymx = cand[i][1];
+        }
+        int nx0 = cx + (int)floor(xmn) - 1, nx1 = cx + (int)ceil(xmx) + 1;
+        int ny0 = cy + (int)floor(ymn) - 1, ny1 = cy + (int)ceil(ymx) + 1;
+        if (nx0 > bx0) bx0 = nx0;
+        if (nx1 < bx1) bx1 = nx1;
+        if (ny0 > by0) by0 = ny0;
+        if (ny1 < by1) by1 = ny1;
+    }
+    if (bx0 < s->clip_x0) bx0 = s->clip_x0;
+    if (by0 < s->clip_y0) by0 = s->clip_y0;
+    if (bx1 > s->clip_x1 - 1) bx1 = s->clip_x1 - 1;
+    if (by1 > s->clip_y1 - 1) by1 = s->clip_y1 - 1;
+
+    for (int py = by0; py <= by1; py++) {
+        double wy = (double)py + 0.5 - (double)cy;
+        double wy2 = wy * wy;
+        if (wy2 > roOut2) continue;
+        double half = sqrt(roOut2 - wy2);
+        int rx0 = (int)ceil((double)cx - half - 0.5);
+        int rx1 = (int)floor((double)cx + half - 0.5);
+        if (rx0 < bx0) rx0 = bx0;
+        if (rx1 > bx1) rx1 = bx1;
+        /* Two spans when this row crosses the hole; one otherwise. The span
+         * bounds are rounded outwards by a pixel, so the per-pixel radial test
+         * still owns the exact edge. */
+        int spans[2][2];
+        int nspan = 0;
+        if (hasHole && wy2 < riOut2) {
+            double hi = sqrt(riOut2 - wy2);
+            int hx0 = (int)floor((double)cx - hi - 0.5);
+            int hx1 = (int)ceil((double)cx + hi - 0.5);
+            spans[nspan][0] = rx0; spans[nspan][1] = hx0 < rx1 ? hx0 : rx1;
+            nspan++;
+            spans[nspan][0] = hx1 > rx0 ? hx1 : rx0; spans[nspan][1] = rx1;
+            nspan++;
+        } else {
+            spans[nspan][0] = rx0; spans[nspan][1] = rx1;
+            nspan++;
+        }
+        for (int sp = 0; sp < nspan; sp++) {
+            int x0 = spans[sp][0], x1 = spans[sp][1];
+            if (x0 < bx0) x0 = bx0;
+            if (x1 > bx1) x1 = bx1;
+            for (int px = x0; px <= x1; px++) {
+                double wx = (double)px + 0.5 - (double)cx;
+                double d2 = wx * wx + wy2;
+                if (d2 > roOut2) continue;
+                if (hasHole && d2 < riOut2) continue;
+                double radCov = 1.0;
+                if (d2 > roIn2) radCov = roOut - sqrt(d2);
+                else if (hasHole && d2 < riIn2) radCov = sqrt(d2) - riOut;
+                if (radCov <= 0.0) continue;
+                if (radCov > 1.0) radCov = 1.0;
+                double angCov = 1.0;
+                if (!full) {
+                    /* Perpendicular distance to each edge, positive inside. */
+                    if (wide) {
+                        /* Sweeps past a half turn are not an intersection of
+                         * half-planes; measure the gap instead and invert. */
+                        double gLo = e1x * wy - e1y * wx;
+                        double gHi = wx * e0y - wy * e0x;
+                        double covLo = gLo + 0.5, covHi = gHi + 0.5;
+                        if (covLo > 1.0) covLo = 1.0;
+                        if (covLo < 0.0) covLo = 0.0;
+                        if (covHi > 1.0) covHi = 1.0;
+                        if (covHi < 0.0) covHi = 0.0;
+                        angCov = 1.0 - covLo * covHi;
+                    } else {
+                        double covLo = (e0x * wy - e0y * wx) + 0.5;
+                        double covHi = (wx * e1y - wy * e1x) + 0.5;
+                        if (covLo <= 0.0 || covHi <= 0.0) continue;
+                        if (covLo > 1.0) covLo = 1.0;
+                        if (covHi > 1.0) covHi = 1.0;
+                        angCov = covLo * covHi;
+                    }
+                    if (angCov <= 0.0) continue;
+                }
+                int cov = (int)(radCov * angCov * 255.0);
+                if (cov >= 255) set_pixel(s, px, py, c);
+                else set_pixel_aa(s, px, py, c, cov);
             }
-            int cov = (int)(radCov * angCov * 255.0);
-            if (cov >= 255) set_pixel(s, px, py, c);
-            else set_pixel_aa(s, px, py, c, cov);
         }
     }
 }

@@ -23,8 +23,8 @@ partial class ChartView {
             for (int hsi = 0; hsi < series.Count; hsi = hsi + 1) {
                 if (series[hsi].stackName.Length > 0) { hstack = true; }
             }
-            ChartView.HBarCore(app, x, y, w, h, o.title, labels,
-                ChartView.Scaled(series, g), hstack, o.showLegend, series, o.iwid);
+            ChartView.HBarCore(app, x, y, w, h, o, labels,
+                ChartView.Scaled(series, g), hstack, series);
             return;
         }
 
@@ -60,6 +60,8 @@ partial class ChartView {
         int step = f.plotW / n;
         int rad = app.Scale(3);
         if (!o.rounded) { rad = app.Scale(1); }
+
+        ChartView.PushPlotClip(app, f.plotX, f.plotY, f.plotW, f.plotH);
 
         // 可见柱状族序列数量（折线族覆盖层不占槽位）
         int nsVis = 0;
@@ -110,7 +112,10 @@ partial class ChartView {
                         if (gi < 0) { gi = 0; }
                         int v = 0;
                         if (oi < sc.Count()) { v = sc.Value(oi); }
-                        int bx = f.plotX + i * step + groupX0 + gi * barW;
+                        int cellL = f.CatLeft(i, n);
+                        int cellW = f.CatWidth(i, n);
+                        int g0 = (cellW - groupW) / 2;
+                        int bx = cellL + g0 + gi * barW;
                         int yTop = f.YOf((accs[gi] + v) * g / 1000, 0);
                         int yBot = f.YOf(accs[gi] * g / 1000, 0);
                         int segH = yBot - yTop;
@@ -134,7 +139,7 @@ partial class ChartView {
                     for (int oi2 = 0; oi2 < n; oi2 = oi2 + 1) {
                         int oi3 = i0 + oi2;
                         if (oi3 >= s.Count()) { continue; }
-                        lpx.Add(f.plotX + oi2 * step + step / 2);
+                        lpx.Add(f.CatMid(oi2, n));
                         lpy.Add(f.YOf(s.Value(oi3) * g / 1000, s.axisIndex));
                     }
                     bool smooth = o.smooth;
@@ -203,7 +208,7 @@ partial class ChartView {
                         for (int li = 0; li < n; li = li + 1) {
                             int oiL = i0 + li;
                             if (oiL >= s.Count()) { continue; }
-                            lpx.Add(f.plotX + li * step + step / 2);
+                            lpx.Add(f.CatMid(li, n));
                             lpy.Add(f.YOf(s.Value(oiL) * g / 1000, ax));
                         }
                         bool smooth = o.smooth;
@@ -215,7 +220,7 @@ partial class ChartView {
                             int oiS = i0 + sp;
                             if (oiS >= s.Count()) { continue; }
                             int v = s.Value(oiS) * g / 1000;
-                            int px2 = f.plotX + sp * step + step / 2;
+                            int px2 = f.CatMid(sp, n);
                             int py2 = f.YOf(v, ax);
                             c.FillCircle(px2, py2, app.Scale(3), s.color);
                         }
@@ -230,7 +235,10 @@ partial class ChartView {
                             int col = s.color;
                             if (oi < s.data.Count && s.data[oi].color != 0) { col = s.data[oi].color; }
                             int by = f.YOf(v * g / 1000, ax);
-                            int bx = f.plotX + i * step + groupX0 + barSlot * (barW + gap);
+                            int cellL = f.CatLeft(i, n);
+                            int cellW = f.CatWidth(i, n);
+                            int g0 = (cellW - groupW) / 2;
+                            int bx = cellL + g0 + barSlot * (barW + gap);
                             if (showBg) {
                                 // 底带：零线到满刻度方向铺满（ECharts
                                 // showBackground），随柱条正负取方向。
@@ -315,6 +323,7 @@ partial class ChartView {
                 }
             }
         }
+        c.PopClip();
 
         Chart.DrawMarkLine(app, f, o);
         // markPoint：自动 max/min + 显式 marks（仅柱状族）。
@@ -332,7 +341,7 @@ partial class ChartView {
     /// 单个柱格，可选垂直渐变（color -> 更浅色）。
     static void BarCell(Canvas c, int x, int y, int w, int h, int rad,
                         int color, bool gradient) {
-        if (h <= 0) { return; }
+        if (h <= 0 || w <= 0) { return; }
         if (gradient) {
             int top = App.LerpColor(color, 4294967295, 150);
             c.FillRoundRect(x, y, w, h, rad, color);
@@ -399,13 +408,13 @@ partial class ChartView {
     }
 
     /// 水平柱状图：类别在左纵排，数值横伸。stacked 为 true 时，
-    /// 共享 stackName 的序列每组堆成一条水平色带，
+    /// 共享 stackName 的序列每组堆成一条水平色带
     /// （对应 ECharts stacked bar4），各行上下排列各组。
-    /// `full` 是未缩放的原系列（轴范围按最终值定标）；
-    /// `wid` 非零时图例可点击切换系列显隐。
-    static void HBarCore(App app, int x, int y, int w, int h, string title,
+    /// `full` 是未缩放的原系列（轴范围按最终值定标）。
+    /// 含负值时从零轴左右展开（旋风 / 人口金字塔）。
+    static void HBarCore(App app, int x, int y, int w, int h, ChartOption o,
                          List<string> labels, List<ChartSeries> series, bool stacked,
-                         bool showLegend, List<ChartSeries> full, int wid) {
+                         List<ChartSeries> full) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         c.PushClip(x, y, w, h);
@@ -413,10 +422,9 @@ partial class ChartView {
         int axisFs = Style.FontFallback(app, "small");
         int n = labels.Count;
         int ns = series.Count;
-        int maxV = Chart.NiceMax(Chart.MaxOf(full));
-        if (stacked) { maxV = Chart.NiceMax(Chart.MaxStackAll(full, n)); }
         List<ChartSeries> legendSrc = full;
-        int plotTop = Chart.DrawPanelI(app, x, y, w, h, title, legendSrc, wid, showLegend);
+        int wid = o.iwid;
+        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.title, legendSrc, wid, o.showLegend);
         // 图例切换写回 full 的 hidden 标志；绘制列表继承同一状态
         // （Scaled 复制了 hidden，但图例解析发生在本帧绘制之前，
         // 因此把解析结果同步到绘制列表），再剔除隐藏序列，
@@ -434,6 +442,23 @@ partial class ChartView {
 
         if (n < 1 || ns < 1) { c.PopClip(); return; }
 
+        int dataMin = 0;
+        int dataMax = 0;
+        for (int fi = 0; fi < full.Count; fi = fi + 1) {
+            if (!full[fi].hidden) {
+                for (int fj = 0; fj < full[fi].Count(); fj = fj + 1) {
+                    int fv = full[fi].Value(fj);
+                    if (fv > dataMax) { dataMax = fv; }
+                    if (fv < dataMin) { dataMin = fv; }
+                }
+            }
+        }
+        int lo = Chart.NiceMin(dataMin);
+        int hi = Chart.NiceMax(dataMax);
+        if (stacked) { hi = Chart.NiceMax(Chart.MaxStackAll(full, n)); }
+        if (hi <= lo) { hi = lo + 1; }
+        int span = hi - lo;
+
         // 最宽的类别标签决定左侧留白
         int leftGut = app.Scale(20);
         for (int li = 0; li < n; li = li + 1) {
@@ -446,8 +471,9 @@ partial class ChartView {
         int plotW = (x + w - pad) - plotX;
         int plotH = (y + h - pad - botGut) - plotY;
         if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
+        if (plotH < app.Scale(8)) { c.PopClip(); return; }
 
-        // 垂直数值网格线 + 标签
+        // 垂直数值网格线 + 标签（覆盖负值）
         StyleBox sGrid = Style.Part(app, "chart", "grid", "", "", "",
                                     Style.SNormal());
         StyleBox sAxis = Style.Part(app, "chart", "axis", "", "", "",
@@ -455,19 +481,37 @@ partial class ChartView {
         StyleBox sLabel = Style.Part(app, "chart", "label", "", "", "",
                                      Style.SNormal());
         int ticks = 5;
+        bool grid = o.showGrid;
         for (int k = 0; k <= ticks; k = k + 1) {
-            int gx = plotX + k * plotW / ticks;
-            c.FillRect(gx, plotY, 1, plotH, sGrid.BgOr(0));
-            string vs = Convert.ToString(maxV * k / ticks);
-            c.DrawTextCentered(gx - app.Scale(20), plotY + plotH + app.Scale(4), app.Scale(40), botGut, vs, sAxis.FgOr(0), axisFs);
+            int tv = lo + span * k / ticks;
+            int gx = Chart.ValueX(plotX, plotW, lo, hi, tv);
+            if (grid) { c.FillRect(gx, plotY, 1, plotH, sGrid.BgOr(0)); }
+            string vs = Convert.ToString(tv);
+            int tw = Canvas.MeasureText(vs, axisFs);
+            int lxT = gx - tw / 2;
+            if (lxT < x + pad) { lxT = x + pad; }
+            if (lxT + tw > x + w - pad) { lxT = x + w - pad - tw; }
+            c.DrawText(lxT, plotY + plotH + app.Scale(4), vs, sAxis.FgOr(0), axisFs);
         }
-        c.FillRect(plotX, plotY, 1, plotH, sAxis.BgOr(0));
+        int zeroX = Chart.ValueX(plotX, plotW, lo, hi, 0);
+        c.FillRect(zeroX, plotY, 1, plotH, sAxis.BgOr(0));
+        if (lo >= 0) { c.FillRect(plotX, plotY, 1, plotH, sAxis.BgOr(0)); }
 
         int rowH = plotH / n;
+        if (rowH < 1) { rowH = 1; }
         int rad = app.Scale(2);
+        bool bipolar = (lo < 0) && !stacked;
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        for (int li = 0; li < n; li = li + 1) {
+            int rowY = plotY + li * rowH;
+            c.DrawTextCentered(x + pad, rowY, leftGut - app.Scale(6), rowH,
+                labels[li], sLabel.FgOr(0), axisFs);
+        }
+        ChartView.PushPlotClip(app, plotX, plotY, plotW, plotH);
 
         if (stacked) {
-            // 堆叠组（ECharts stackName）：同名序列从左侧起
+            // 堆叠组（ECharts stackName）：同名序列从零轴起
             // 在同一色带内累计；不同组平分该行。
             List<string> grp = new List<string>();
             for (int gsi = 0; gsi < ns; gsi = gsi + 1) {
@@ -482,8 +526,6 @@ partial class ChartView {
             int groupY0 = (rowH - groupH) / 2;
             List<int> accs = new List<int>();
             for (int ai = 0; ai < ng; ai = ai + 1) { accs.Add(0); }
-            // 每组最顶层的序列带圆角右端帽；其下色带
-            // 以直角边相接并留 1px 缝隙。
             List<int> topSi = new List<int>();
             for (int ti = 0; ti < ng; ti = ti + 1) { topSi.Add(0 - 1); }
             for (int ts = 0; ts < ns; ts = ts + 1) {
@@ -496,7 +538,6 @@ partial class ChartView {
             }
             for (int i = 0; i < n; i = i + 1) {
                 int rowY = plotY + i * rowH;
-                c.DrawTextCentered(x + pad, rowY, leftGut - app.Scale(6), rowH, labels[i], sLabel.FgOr(0), axisFs);
                 for (int a2 = 0; a2 < ng; a2 = a2 + 1) { accs[a2] = 0; }
                 for (int si = 0; si < ns; si = si + 1) {
                     ChartSeries sc = series[si];
@@ -505,16 +546,21 @@ partial class ChartView {
                         if (gi < 0) { gi = 0; }
                         int v = 0;
                         if (i < sc.Count()) { v = sc.Value(i); }
-                        int accW = (accs[gi] + v) * plotW / maxV;
+                        int x0 = Chart.ValueX(plotX, plotW, lo, hi, accs[gi]);
+                        int x1 = Chart.ValueX(plotX, plotW, lo, hi, accs[gi] + v);
+                        int drawX = x0;
+                        int segW = x1 - x0;
+                        if (segW < 0) { drawX = x1; segW = 0 - segW; }
                         int by = rowY + groupY0 + gi * barH;
-                        int segW = accW - accs[gi] * plotW / maxV;
-                        int drawX = plotX + 1 + accs[gi] * plotW / maxV;
-                        // 色带边缘相接（无 1px 缝隙），
-                        // 与垂直堆叠柱一致：颜色变化
-                        // 即可区分各层，无需缺口。
                         int segRad = rad;
                         if (si != topSi[gi]) { segRad = 0; }
-                        c.FillRoundRect(drawX, by, segW, barH, segRad, sc.color);
+                        bool hov = o.showTooltip && mx >= drawX && mx < drawX + segW
+                            && my >= by && my < by + barH;
+                        int fill = sc.color;
+                        if (hov) { fill = App.Lighten(fill, 80); }
+                        if (segW > 0) {
+                            c.FillRoundRect(drawX, by, segW, barH, segRad, fill);
+                        }
                         accs[gi] = accs[gi] + v;
                     }
                 }
@@ -523,10 +569,13 @@ partial class ChartView {
             int groupH = rowH * 7 / 10;
             int gap = app.Scale(2);
             int barH = (groupH - gap * (ns - 1)) / ns;
+            if (bipolar) {
+                groupH = rowH * 6 / 10;
+                barH = groupH;
+                gap = 0;
+            }
             if (barH < app.Scale(2)) { barH = app.Scale(2); }
             int groupY0 = (rowH - groupH) / 2;
-            // 与垂直分组柱一致：取首条可见柱系列的
-            // barWidth/barGap/showBackground/borderRadius。
             int bhOverride = 0;
             int bgPct2 = 0 - 1;
             bool showBg2 = false;
@@ -545,14 +594,14 @@ partial class ChartView {
                     break;
                 }
             }
-            if (bhOverride > 0) {
+            if (!bipolar && bhOverride > 0) {
                 barH = app.Scale(bhOverride);
                 if (barH > groupH / ns) { barH = groupH / ns; }
                 if (bgPct2 >= 0) { gap = barH * bgPct2 / 100; }
-            } else if (bgPct2 >= 0 && barH > 0 && ns > 1) {
+            } else if (!bipolar && bgPct2 >= 0 && barH > 0 && ns > 1) {
                 gap = barH * bgPct2 / 100;
             }
-            if (bhOverride > 0 || bgPct2 >= 0) {
+            if (!bipolar && (bhOverride > 0 || bgPct2 >= 0)) {
                 int totGh = ns * barH + (ns - 1) * gap;
                 if (totGh < groupH) { groupY0 = groupY0 + (groupH - totGh) / 2; }
             }
@@ -562,22 +611,81 @@ partial class ChartView {
                                     Style.SNormal()).BgOr(0);
             }
 
+            int x0 = Chart.ValueX(plotX, plotW, lo, hi, 0);
             for (int i = 0; i < n; i = i + 1) {
                 int rowY = plotY + i * rowH;
-                c.DrawTextCentered(x + pad, rowY, leftGut - app.Scale(6), rowH, labels[i], sLabel.FgOr(0), axisFs);
                 for (int si = 0; si < ns; si = si + 1) {
                     int v = 0;
                     if (i < series[si].Count()) { v = series[si].Value(i); }
-                    int bw = v * plotW / maxV;
+                    int x1 = Chart.ValueX(plotX, plotW, lo, hi, v);
+                    int bx = x0;
+                    int bw = x1 - x0;
+                    bool toRight = true;
+                    if (bw < 0) { bx = x1; bw = 0 - bw; toRight = false; }
                     int by = rowY + groupY0 + si * (barH + gap);
-                    if (showBg2 && plotW > 2) {
+                    if (bipolar) { by = rowY + groupY0; }
+                    if (showBg2 && plotW > 2 && !bipolar) {
                         c.FillRoundRect(plotX + 1, by, plotW - 2, barH,
                             rad < 1 ? 1 : (rad > 3 ? 3 : rad),
                             bgCol2 != 0 ? bgCol2 : bgInk2);
                     }
-                    ChartView.BarCellR4(c, plotX + 1, by, bw, barH,
-                        barRad2, rad, series[si].color, false);
+                    bool hov = o.showTooltip && mx >= bx && mx < bx + bw
+                        && my >= by && my < by + barH;
+                    int fill = series[si].color;
+                    if (hov) { fill = App.Lighten(fill, 80); }
+                    int corners = toRight ? Corner.Right() : Corner.Left();
+                    if (bw > 0) {
+                        if (barRad2 == null) {
+                            c.FillRoundRectIn(bx, by, bw, barH, rad, corners, fill);
+                        } else {
+                            ChartView.BarCellR4(c, bx, by, bw, barH,
+                                barRad2, rad, fill, false);
+                        }
+                    }
+                    if ((o.showValues || series[si].labelShow) && bw > 0) {
+                        string lbl = Convert.ToString(v);
+                        int lw = Canvas.MeasureText(lbl, axisFs);
+                        int tx = bx + bw + app.Scale(4);
+                        if (!toRight) { tx = bx - lw - app.Scale(4); }
+                        if (tx < plotX) { tx = plotX + app.Scale(2); }
+                        if (tx + lw > plotX + plotW) { tx = plotX + plotW - lw - app.Scale(2); }
+                        c.DrawText(tx, by + (barH - Canvas.FontHeight(axisFs)) / 2,
+                            lbl, sLabel.FgOr(0), axisFs);
+                    }
                 }
+            }
+        }
+        c.PopClip();
+
+        if (o.showTooltip && n > 0 && rowH > 0) {
+            if (mx >= plotX && mx < plotX + plotW
+                && my >= plotY && my < plotY + plotH) {
+                int idx = (my - plotY) / rowH;
+                if (idx < 0) { idx = 0; }
+                if (idx > n - 1) { idx = n - 1; }
+                int rowY = plotY + idx * rowH;
+                int crossCol = Style.Part(app, "chart", "crosshair", "", "", "",
+                    Style.SNormal()).BgOr(0);
+                if (crossCol != 0) {
+                    c.FillRect(plotX, rowY, plotW, rowH,
+                        Chart.WithAlpha(crossCol, 40));
+                    c.FillRect(plotX, rowY, plotW, 1,
+                        Chart.WithAlpha(crossCol, 180));
+                    c.FillRect(plotX, rowY + rowH - 1, plotW, 1,
+                        Chart.WithAlpha(crossCol, 180));
+                }
+                List<TooltipRow> rows = new List<TooltipRow>();
+                rows.Add(TooltipRow.Of(0, labels[idx]));
+                for (int ti = 0; ti < series.Count; ti = ti + 1) {
+                    ChartSeries ts = series[ti];
+                    if (!ts.hidden) {
+                        int tv = 0;
+                        if (idx < ts.Count()) { tv = ts.Value(idx); }
+                        rows.Add(TooltipRow.Of(ts.color,
+                            ts.name + "  " + Convert.ToString(tv)));
+                    }
+                }
+                ChartView.TooltipCard(app, mx, my, plotX + plotW, rows);
             }
         }
         c.PopClip();
@@ -670,12 +778,12 @@ partial class ChartView {
             if (col == 0) { col = Chart.Palette(t, 0); }
             if (isTotal) { col = sAccent.BgOr(0); }
             else if (v < 0) { col = sMark.BgOr(0); }
-            ChartView.BarCell(c, f.plotX + ci * step + bx0, yTop, barW, yBot - yTop, rad, col, o.gradient);
+            ChartView.BarCell(c, f.CatLeft(ci, n) + bx0, yTop, barW, yBot - yTop, rad, col, o.gradient);
 
             // 从前一柱顶到当前柱底的连接线
             if (ci > 0) {
-                int px0 = f.plotX + (ci - 1) * step + bx0 + barW;
-                int px1 = f.plotX + ci * step + bx0;
+                int px0 = f.CatLeft(ci - 1, n) + bx0 + barW;
+                int px1 = f.CatLeft(ci, n) + bx0;
                 int pyc = f.YOf(prev, 0);
                 c.DrawLine(px0, pyc, px1, pyc, sGrid.BgOr(0), app.Scale(1));
             }
@@ -684,7 +792,7 @@ partial class ChartView {
             if (o.showValues || s.labelShow) {
                 string lbl = Convert.ToString(v);
                 int lw = Canvas.MeasureText(lbl, Style.FontFallback(app, "small"));
-                int lx2 = f.plotX + ci * step + bx0 + (barW - lw) / 2;
+                int lx2 = f.CatLeft(ci, n) + bx0 + (barW - lw) / 2;
                 int ly2 = yTop - app.Scale(14);
                 if (ly2 < f.plotY) { ly2 = yTop + app.Scale(2); }
                 c.DrawText(lx2, ly2, lbl,

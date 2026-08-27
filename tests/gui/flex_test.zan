@@ -1,0 +1,285 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// 无窗口回归：CSS flex 换行（Control.ArrangeFlex）与等宽栅格
+/// （Grid.Arrange）的排布数学。
+///
+/// 这两条路径以前是缺的：`flex-wrap` 虽然被 CSS 解析器认得，
+/// StyleBox.wrap 却没人读，一排放不下的子项只会挤成一行溢出框外；
+/// 通用栅格则根本不存在，于是调用方只能自己按 Scale(n) 手算坐标。
+/// 排布是纯计算，所以这里直接喂 computedStyle、调 Arrange、打印
+/// 解析出的矩形，对着 golden 比——不需要窗口，也不需要 App。
+class Program {
+    static void Line(string s) { Console.WriteLine(s); }
+
+    /// 只有测量尺寸的叶子：Arrange 对 computedStyle 为 null 的子节点
+    /// 回退到 prefW/prefH，因此叶子不必解析样式。
+    static Control Leaf(int w, int h) {
+        Label l = new Label("x");
+        l.Prefer(w, h);
+        return l;
+    }
+
+    /// 直接构造一个 flex 容器的已解析样式（正常情况下由
+    /// Style.Full 从 base.css 解析出来）。
+    static StyleBox FlexBox(int dir, int wrap, int gap) {
+        StyleBox b = new StyleBox();
+        b.display = 1;
+        b.flexDir = dir;
+        b.wrap = wrap;
+        b.gap = gap;
+        return b;
+    }
+
+    /// 子项样式：`flex-shrink: 0`（行溢出时不让位）。
+    static StyleBox Fixed() {
+        StyleBox b = new StyleBox();
+        b.shrink = 0;
+        return b;
+    }
+
+    /// 子项样式：`flex: 1 1 0`——basis 归零、按 grow 平分剩余空间。
+    static StyleBox GrowBasis0() {
+        StyleBox b = new StyleBox();
+        b.grow = 1;
+        b.basis = 0;
+        return b;
+    }
+
+    /// 子项样式：`align-self: <code>`（2 center，3 end）。
+    static StyleBox SelfAlign(int code) {
+        StyleBox b = new StyleBox();
+        b.alignSelf = code;
+        return b;
+    }
+
+    /// 子项样式：`flex: 1 1 0; aspect-ratio: 16 / 9`。
+    static StyleBox Thumb() {
+        StyleBox b = new StyleBox();
+        b.grow = 1;
+        b.basis = 0;
+        b.aspect = 16 * 1000 / 9;
+        return b;
+    }
+
+    static void Dump(string label, Control c) {
+        for (int i = 0; i < c.children.Count; i = i + 1) {
+            Control k = c.children[i];
+            Line($"{label}[{i}] {k.bx},{k.by} {k.bw}x{k.bh}");
+        }
+    }
+
+    /// 排布一个 flex 容器：`box` 是它的样式，`items` 是各子项的
+    /// 测量尺寸（宽,高 成对给出）。
+    static Control Lay(StyleBox box, List<int> items, int w, int h) {
+        Flex f = new Flex();
+        f.computedStyle = box;
+        for (int i = 0; i + 1 < items.Count; i = i + 2) {
+            f.Add(Program.Leaf(items[i], items[i + 1]));
+        }
+        f.Arrange(0, 0, w, h);
+        return f;
+    }
+
+    static void Main() {
+        // ---- 单行：老行为不能变 ----------------------------------------
+        // 三个 80 宽的子项、间距 10，交叉轴默认 stretch：各自拿满行高。
+        Line("=== row nowrap ===");
+        Control a = Program.Lay(Program.FlexBox(0, 0, 10),
+                                new List<int>{ 80, 30, 80, 30, 80, 30 },
+                                400, 100);
+        Program.Dump("row", a);
+
+        // ---- 换行 --------------------------------------------------------
+        // 400 宽里放五个 120 宽：120 + 10+120 + 10+120 = 380 放得下第三个，
+        // 第四个要 510 > 400，于是折行。行距回退到 gap = 10。
+        Line("=== row wrap ===");
+        Control b = Program.Lay(Program.FlexBox(0, 1, 10),
+                                new List<int>{ 120, 30, 120, 30, 120, 30,
+                                               120, 30, 120, 30 },
+                                400, 300);
+        Program.Dump("wrap", b);
+
+        // 比整框还宽的子项独占一行，不会把断行卡死。
+        Line("=== row wrap oversize ===");
+        Control c = Program.Lay(Program.FlexBox(0, 1, 10),
+                                new List<int>{ 500, 20, 60, 20 },
+                                400, 200);
+        Program.Dump("over", c);
+
+        // 纵向换行：主轴是高度，行沿横向铺开，列距同样回退到 gap。
+        Line("=== column wrap ===");
+        Control d = Program.Lay(Program.FlexBox(1, 1, 10),
+                                new List<int>{ 60, 40, 60, 40, 60, 40 },
+                                400, 100);
+        Program.Dump("colwrap", d);
+
+        // ---- 轴向独立间距：行距与列距不同 --------------------------------
+        Line("=== wrap row-gap/column-gap ===");
+        StyleBox axes = Program.FlexBox(0, 1, 0);
+        axes.colGap = 8;
+        axes.rowGap = 24;
+        Control e = Program.Lay(axes,
+                                new List<int>{ 150, 30, 150, 30, 150, 30 },
+                                320, 200);
+        Program.Dump("axes", e);
+
+        // ---- justify-content 作用在每一行上 -----------------------------
+        Line("=== wrap justify-between ===");
+        StyleBox jb = Program.FlexBox(0, 1, 10);
+        jb.justify = 3;
+        Control f = Program.Lay(jb,
+                                new List<int>{ 100, 30, 100, 30, 100, 30 },
+                                400, 200);
+        Program.Dump("between", f);
+
+        // ---- align-content 分配多余的交叉轴空间 --------------------------
+        // 两行共 30+10+30 = 70 高，框高 200，余 130：居中则整块下移 65。
+        Line("=== wrap align-content center ===");
+        StyleBox ac = Program.FlexBox(0, 1, 10);
+        ac.alignContent = 1;
+        ac.alignItems = 1;
+        Control g = Program.Lay(ac,
+                                new List<int>{ 250, 30, 250, 30 },
+                                400, 200);
+        Program.Dump("accenter", g);
+
+        // stretch：余量平分给两行，行高从 30 变成 30 + 65。
+        Line("=== wrap align-content stretch ===");
+        StyleBox st = Program.FlexBox(0, 1, 10);
+        st.alignContent = 5;
+        Control h = Program.Lay(st,
+                                new List<int>{ 250, 30, 250, 30 },
+                                400, 200);
+        Program.Dump("acstretch", h);
+
+        // ---- 等宽栅格 ----------------------------------------------------
+        // 三列、间距 10：列边界按 (cw + gap) * i / n 取整，取整误差不累加，
+        // 最后一列右边缘正好贴住内容框。
+        Line("=== grid 3 cols ===");
+        Grid g3 = Grid.Of(3);
+        g3.Gap(10);
+        g3.Add(Program.Leaf(0, 40));
+        g3.Add(Program.Leaf(0, 60));
+        g3.Add(Program.Leaf(0, 40));
+        g3.Add(Program.Leaf(0, 30));
+        g3.Arrange(0, 0, 400, 300);
+        Program.Dump("grid", g3);
+
+        // 跨列：GridItem(2) 吃掉两列，放不下就整格折到下一行。
+        Line("=== grid span ===");
+        Grid gs = Grid.Of(3);
+        gs.Gap(10);
+        gs.Add(Program.Leaf(0, 40));
+        GridItem wide = new GridItem(2);
+        wide.Add(Program.Leaf(0, 50));
+        gs.Add(wide);
+        gs.Add(Program.Leaf(0, 40));
+        gs.Arrange(0, 0, 400, 300);
+        Program.Dump("span", gs);
+
+        // 前置留空：offset 把格子推到本行更靠后的列上。
+        Line("=== grid offset ===");
+        Grid go = Grid.Of(4);
+        go.Gap(12);
+        go.Add(new GridItem(1, 1));
+        go.Add(Program.Leaf(0, 20));
+        go.Arrange(0, 0, 400, 100);
+        Program.Dump("offset", go);
+
+        // 响应式降列：每列至少 220 宽时，400 宽只放得下一列。
+        Line("=== grid responsive ===");
+        Grid gr = Grid.Of(4);
+        gr.Gap(10);
+        gr.MinColumn(220);
+        gr.Add(Program.Leaf(0, 30));
+        gr.Add(Program.Leaf(0, 30));
+        gr.Arrange(0, 0, 400, 200);
+        Program.Dump("resp", gr);
+
+        // ---- flex-shrink：溢出时谁让位 ------------------------------------
+        // 三个 200 宽挤在 400 里：中间那个 flex-shrink: 0，另外两个把
+        // 空间让出来（400 - 200 = 200，两者按原尺寸比例平分）。
+        Line("=== flex-shrink 0 ===");
+        Flex fs = new Flex();
+        fs.computedStyle = Program.FlexBox(0, 0, 0);
+        fs.Add(Program.Leaf(200, 30));
+        Control keep = fs.Add(Program.Leaf(200, 30));
+        keep.computedStyle = Program.Fixed();
+        fs.Add(Program.Leaf(200, 30));
+        fs.Arrange(0, 0, 400, 60);
+        Program.Dump("shrink", fs);
+
+        // ---- flex-basis + grow：真正等宽的列 -----------------------------
+        // 自然宽度差得很远（40/300/100），但 basis 归零后剩余空间按
+        // grow 平分，三列等宽。
+        Line("=== flex-basis 0 + grow ===");
+        Flex fb = new Flex();
+        fb.computedStyle = Program.FlexBox(0, 0, 10);
+        for (int i = 0; i < 3; i = i + 1) {
+            Control k = fb.Add(Program.Leaf(40 + i * 130, 30));
+            k.computedStyle = Program.GrowBasis0();
+        }
+        fb.Arrange(0, 0, 400, 60);
+        Program.Dump("basis", fb);
+
+        // ---- align-self：单个子项跳出容器的对齐 --------------------------
+        // 容器 align-items: start，中间那个自己居中、最后那个贴底。
+        Line("=== align-self ===");
+        Flex asf = new Flex();
+        StyleBox asBox = Program.FlexBox(0, 0, 10);
+        asBox.alignItems = 1;
+        asf.computedStyle = asBox;
+        asf.Add(Program.Leaf(60, 20));
+        Control mid = asf.Add(Program.Leaf(60, 20));
+        mid.computedStyle = Program.SelfAlign(2);
+        Control bot = asf.Add(Program.Leaf(60, 20));
+        bot.computedStyle = Program.SelfAlign(3);
+        asf.Arrange(0, 0, 400, 100);
+        Program.Dump("self", asf);
+
+        // ---- aspect-ratio：交叉轴由主轴推出 ------------------------------
+        // 16/9 的两格：宽度由 grow 分出来，高度自己跟上。
+        Line("=== aspect-ratio 16/9 ===");
+        Flex ar = new Flex();
+        StyleBox arBox = Program.FlexBox(0, 0, 10);
+        arBox.alignItems = 1;
+        ar.computedStyle = arBox;
+        for (int i = 0; i < 2; i = i + 1) {
+            Control k = ar.Add(Program.Leaf(0, 0));
+            k.computedStyle = Program.Thumb();
+        }
+        ar.Arrange(0, 0, 410, 300);
+        Program.Dump("aspect", ar);
+
+        // ---- 断行宽度沿树下传 --------------------------------------------
+        // 宿主只能把宽度告诉最外层容器。纵向排布的子节点各自铺满内宽，
+        // 所以那个宽度对它们同样成立，必须往下传：否则嵌在一列里的
+        // 换行行只会按单行测量，第二行被裁掉（HMI 数显那一排四个只
+        // 显示两个就是这个原因）。
+        Line("=== wrap hint into a column ===");
+        Panel col = Panel.Column().Gap(10);
+        Flex inner = new Flex();
+        inner.computedStyle = Program.FlexBox(0, 1, 10);
+        for (int i = 0; i < 4; i = i + 1) {
+            inner.Add(Program.Leaf(120, 30));
+        }
+        col.With(inner);
+        col.HintWrapWidth(400);
+        col.PropagateWrapHint();
+        Line($"colchild {inner.hintWrapW}");
+
+        // 横向排布的子节点要分摊宽度，父级这时还不知道各自分到多少，
+        // 传下去就会把行数算少，所以不传。
+        Line("=== wrap hint stops at a row ===");
+        Flex bar = new Flex();
+        bar.computedStyle = Program.FlexBox(0, 0, 0);
+        Flex nested = new Flex();
+        nested.computedStyle = Program.FlexBox(0, 1, 10);
+        bar.Add(nested);
+        bar.HintWrapWidth(400);
+        bar.PropagateWrapHint();
+        Line($"rowchild {nested.hintWrapW}");
+    }
+}

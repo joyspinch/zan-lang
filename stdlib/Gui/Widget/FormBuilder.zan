@@ -78,9 +78,32 @@ class FormBuilder {
         return kids != null && kids.IsArray();
     }
 
-    static bool NeedsCaption(JsonValue o) {
-        string k = FormBuilder.Kind(o);
-        return k == "Input" || k == "TextArea" || k == "SelectBox";
+    /// 控件是否自带 `label` 属性（Checkbox / Radio 那样把标题画在框
+    /// 旁边）。自带的交给控件，不自带的由表单在它上面补一行标题。
+    static bool OwnsLabel(Control ctl) {
+        if (ctl == null) { return false; }
+        List<PropSpec> ps = ctl.Props();
+        if (ps == null) { return false; }
+        for (int i = 0; i < ps.Count; i = i + 1) {
+            if (ps[i].key == "label") { return true; }
+        }
+        return false;
+    }
+
+    /// 字段需不需要表单替它画标题。以前这里是一张写死的白名单
+    /// （Input / TextArea / SelectBox），于是 Switch、Slider、Rate 这些
+    /// 字段的 label 既没进控件、也没画成标题，直接丢了；Checkbox 和
+    /// Radio 明明自带 label 属性也拿不到值。改成问控件自己有没有
+    /// label：没有就由表单补标题，两边都不会再漏。
+    static bool NeedsCaption(JsonValue o, Control ctl) {
+        // 只有设计文档真的写了 `label` 才由表单补标题行。`Caption` 在没有
+        // label 时会回退到 `name`，那是给自带 label 的控件兜底用的——若这里
+        // 也认那个回退，任何只写了 `name` 的字段都会被套一层
+        // `FbStack{Label, 控件}`，控件树凭空深一层：`.zform` 里
+        // `host.children[0].children[0]` 拿到的就不再是字段控件本身
+        // （CheckboxGroup 的聚合 API 因此全部落到 FbStack 上）。
+        if (o.Str("label", "") == "") { return false; }
+        return !FormBuilder.OwnsLabel(ctl);
     }
 
     static int PrefH(JsonValue o) {
@@ -159,6 +182,12 @@ class FormBuilder {
         Control ctl = ControlFactory.Create(kind);
         if (ctl == null) { return null; }
         ctl.name = o.Str("name", "");
+        // 自带 label 的控件（Checkbox / Radio）自己画标题，把值交给它；
+        // 其余控件的标题由 BuildCell 在上方补一行。
+        string cap = FormBuilder.Caption(o);
+        if (cap != "" && FormBuilder.OwnsLabel(ctl)) {
+            ctl.SetProp("label", cap);
+        }
         // 样式类（皮肤规则 / `grid-cols-3 gap-y-2` 这类原子类）。
         string cls = o.Str("class", "");
         if (cls != "") { ctl.Class = cls; }
@@ -227,17 +256,20 @@ class FormBuilder {
         Control ctl = FormBuilder.MakeControl(o, false);
         if (ctl == null) { return null; }
         if (FormBuilder.IsContainer(o)) {
-            ctl.Pad(10);
+            ctl.logPad = 10;
             return ctl;
         }
-        if (FormBuilder.NeedsCaption(o)) {
+        if (FormBuilder.NeedsCaption(o, ctl)) {
             FbStack cell = new FbStack();
             Label capL = new Label(FormBuilder.Caption(o));
             capL.Dock(Dock.Top());
-            capL.Prefer(0, 18);
+            // logH 而不是 Prefer：设计文档里的高度是 100% 下的逻辑
+            // 像素，按物理像素用的话，150% 缩放下文字长大了、格子却
+            // 没有，标题就压到控件上、行也压到下一行。
+            capL.logH = 18;
             cell.Add(capL);
             ctl.Dock(Dock.Fill());
-            ctl.Prefer(0, FormBuilder.PrefH(o));
+            ctl.logH = FormBuilder.PrefH(o);
             cell.Add(ctl);
             return cell;
         }
@@ -247,7 +279,7 @@ class FormBuilder {
             ((ChoiceGroup)ctl).SetRowHeight(FormBuilder.PrefH(o));
             return ctl;
         }
-        ctl.Prefer(0, FormBuilder.PrefH(o));
+        ctl.logH = FormBuilder.PrefH(o);
         return ctl;
     }
 
@@ -321,9 +353,16 @@ class FormBuilder {
 /// 行高取该行子节点 prefH 的最大值。无表面。
 class FbFlow : Panel {
     List<int> spans;
+    /// 逻辑像素（100% 下的样子）。
     int colGap;
     int rowGap;
     int minCell;
+    /// OnMeasure 按当前缩放解析出的实际间距，供拿不到 App 的
+    /// Arrange 复用 —— 直接用逻辑值排布，150% 下列间距会偏窄、
+    /// 行距不足，字段互相贴住。
+    int mColGap;
+    int mRowGap;
+    int mMinCell;
 
     FbFlow() {
         this.InitPanel("fbflow", 3);
@@ -331,6 +370,9 @@ class FbFlow : Panel {
         this.colGap = 12;
         this.rowGap = 6;
         this.minCell = 24;
+        this.mColGap = 12;
+        this.mRowGap = 6;
+        this.mMinCell = 24;
     }
 
     /// 追加一个单元及其列宽（span，1..24）。
@@ -377,6 +419,9 @@ class FbFlow : Panel {
     }
 
     override void OnMeasure(App app) {
+        this.mColGap = app.Scale(this.colGap);
+        this.mRowGap = app.Scale(this.rowGap);
+        this.mMinCell = app.Scale(this.minCell);
         int n = this.children.Count;
         int i = 0;
         int total = 0;
@@ -387,7 +432,7 @@ class FbFlow : Panel {
             rows = rows + 1;
             i = end;
         }
-        if (rows > 1) { total = total + this.rowGap * (rows - 1); }
+        if (rows > 1) { total = total + this.mRowGap * (rows - 1); }
         this.prefH = total;
         this.prefW = 0;
     }
@@ -415,11 +460,11 @@ class FbFlow : Panel {
                 acc = acc + this.SpanAt(k);
                 int xb = cx + cw * acc / 24;
                 int wCell = xb - xa;
-                if (k < end - 1) { wCell = wCell - this.colGap; }
-                if (wCell < this.minCell) { wCell = this.minCell; }
+                if (k < end - 1) { wCell = wCell - this.mColGap; }
+                if (wCell < this.mMinCell) { wCell = this.mMinCell; }
                 this.children[k].Arrange(xa, rowY, wCell, rowH);
             }
-            rowY = rowY + rowH + this.rowGap;
+            rowY = rowY + rowH + this.mRowGap;
             i = end;
         }
     }
@@ -484,6 +529,13 @@ class ChoiceGroup : Panel {
     int columns;
     /// 行高（0 = 按最高的选项）。样式表的 `line-height` 优先。
     int rowHeight;
+    /// gapX / gapY / rowHeight 都是逻辑像素（100% 下的样子），这里存
+    /// 它们在当前缩放下的值：直接拿逻辑值当物理像素用，150% 下行距
+    /// 和行高都会偏小，相邻选项行互相贴住。OnMeasure 每帧刷新，
+    /// 拿不到 App 的 Arrange 复用。
+    int sGapX;
+    int sGapY;
+    int sRowH;
     /// 与 children 对齐的选项标签，供 OptionsText 往返（子控件
     /// 的 label 字段不统一，不能靠 GetProp 读回）。
     List<string> labels;
@@ -503,6 +555,9 @@ class ChoiceGroup : Panel {
         this.gapY = 4;
         this.columns = 0;
         this.rowHeight = 0;
+        this.sGapX = 16;
+        this.sGapY = 4;
+        this.sRowH = 0;
         this.labels = new List<string>();
         this.mCols = 0;
         this.mColGap = 16;
@@ -526,6 +581,10 @@ class ChoiceGroup : Panel {
     void SetRowHeight(int h) {
         if (h < 0) { h = 0; }
         this.rowHeight = h;
+        // 缩放镜像只在 OnMeasure(app) 里刷新，而排布（ResolveMetrics）读的是
+        // 镜像值：不经测量直接 Arrange 时它还是 0，行高与行内居中就都丢了。
+        // 这里先按 100% 基准写入，OnMeasure 再按真实缩放覆盖。
+        this.sRowH = h;
     }
 
     int RowHeight() { return this.rowHeight; }
@@ -553,6 +612,22 @@ class ChoiceGroup : Panel {
         return outp;
     }
 
+    /// 追加一个选项，返回新建的选择控件（越界/构造失败时为 null）。
+    /// 代码里逐项建组用这个：`g.AddOption("Cheese")`——`Add` 是基类
+    /// 挂子控件用的，选项组要的是「按标签造一个选项」，两回事。
+    /// 选项个数。聚合查询（"全选" 父项要拿它和 CheckedCount 比）
+    /// 靠它，调用方不必去数 children。
+    int Count() { return this.children.Count; }
+
+    Control AddOption(string text) {
+        if (text == "") { return null; }
+        Control item = this.MakeItem(this.children.Count, text);
+        if (item == null) { return null; }
+        this.labels.Add(text);
+        this.Add(item);
+        return item;
+    }
+
     /// 按 "A|B|C" 追加选项（与 SelectBox.SetOptionsText 同一约定）。
     void SetOptionsText(string text) {
         string current = "";
@@ -560,13 +635,7 @@ class ChoiceGroup : Panel {
             string ch = "";
             if (i < text.Length) { ch = text.Substring(i, 1); }
             if (ch == "|" || i == text.Length) {
-                if (current != "") {
-                    Control item = this.MakeItem(this.children.Count, current);
-                    if (item != null) {
-                        this.labels.Add(current);
-                        this.Add(item);
-                    }
-                }
+                this.AddOption(current);
                 current = "";
             } else {
                 current = current + ch;
@@ -647,8 +716,8 @@ class ChoiceGroup : Panel {
     /// 依赖先跑过 OnMeasure）。
     void ResolveMetrics() {
         int n = this.children.Count;
-        this.mColGap = this.StyleColGap(this.gapX);
-        this.mRowGap = this.StyleRowGap(this.gapY);
+        this.mColGap = this.StyleColGap(this.sGapX);
+        this.mRowGap = this.StyleRowGap(this.sGapY);
         // 控件上显式配置的列数优先；没配就听样式表的
         // （皮肤的 `columns` / 原子类 `grid-cols-N`）。
         this.mCols = this.columns;
@@ -666,13 +735,16 @@ class ChoiceGroup : Panel {
             if (hh > itemH) { itemH = hh; }
         }
         int lineH = this.StyleLineHeight();
-        if (lineH < 1) { lineH = this.rowHeight; }
+        if (lineH < 1) { lineH = this.sRowH; }
         if (lineH > itemH) { itemH = lineH; }
         this.mRowH = itemH;
     }
 
     override void OnMeasure(App app) {
         int n = this.children.Count;
+        this.sGapX = app.Scale(this.gapX);
+        this.sGapY = app.Scale(this.gapY);
+        this.sRowH = app.Scale(this.rowHeight);
         this.ResolveMetrics();
         if (this.mRowH < 1) { this.mRowH = app.Scale(26); }
         int itemW = 0;

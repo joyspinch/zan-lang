@@ -47,49 +47,128 @@ partial class ChartView {
         ChartSeries lead = ChartView.LeadSeries(o);
         if (lead == null || lead.links.Count < 1) { return; }
 
-        int legendW = 0;
-        if (o.showLegend) { legendW = app.Scale(120); }
-        int areaW = w - pad * 2 - legendW;
-        int areaH = (y + h - pad) - top;
-        int r = areaW / 2;
-        if (areaH / 2 < r) { r = areaH / 2; }
-        if (r < app.Scale(20)) { r = app.Scale(20); }
-        int cx = x + pad + areaW / 2;
-        int cy = top + areaH / 2;
-
         ChordLayout layout = ChordLayout.Of(lead.links);
         int nn = layout.nodes.Count;
         if (nn < 1) { return; }
         int nr = layout.ribbons.Count;
+        List<bool> nodeHid = new List<bool>();
+        for (int ni = 0; ni < nn; ni = ni + 1) {
+            bool h = false;
+            if (o.iwid != 0) {
+                h = app.StateGet(Chart.LegendSliceKey(o.iwid, 0, ni), 0) == 1;
+            }
+            nodeHid.Add(h);
+        }
 
-        // ribbon 最粗值（按最大 link 值）。
+        int hoverNode = 0 - 1;
+        int bodyY = top;
+        if (o.showLegend) {
+            int x0 = x + pad;
+            int xCur = x0;
+            int yCur = top;
+            int maxX = x + w - pad;
+            int rowH = Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(6);
+            for (int i = 0; i < nn; i = i + 1) {
+                ChordNodeArc naL = layout.nodes[i];
+                int cw = Chart.LegendChipW(app, naL.name);
+                if (xCur > x0 && xCur + cw > maxX) {
+                    xCur = x0;
+                    yCur = yCur + rowH;
+                }
+                if (app.mouseX >= xCur && app.mouseX < xCur + cw
+                    && app.mouseY >= yCur && app.mouseY < yCur + rowH) {
+                    hoverNode = i;
+                }
+                int key = 0;
+                if (o.iwid != 0) { key = Chart.LegendSliceKey(o.iwid, 0, i); }
+                bool hid = false;
+                if (i < nodeHid.Count) { hid = nodeHid[i]; }
+                Chart.DrawLegendChip(app, xCur, yCur, cw, rowH,
+                    Chart.Palette(t, i), naL.name, hid, key);
+                xCur = xCur + cw + app.Scale(8);
+                bodyY = yCur + rowH + app.Scale(4);
+            }
+        }
+
+        int areaW = w - pad * 2;
+        int areaH = (y + h - pad) - bodyY;
+        int r = ChartView.RadialRadius(areaW, areaH, 56);
+        if (r < app.Scale(20)) { r = app.Scale(20); }
+        int cx = x + pad + areaW / 2;
+        int cy = bodyY + areaH / 2;
+        int boxX = x + pad;
+        int boxY = bodyY;
+        int boxW = areaW;
+        int boxH = areaH;
+
         int maxVal = 1;
         for (int i = 0; i < nr; i = i + 1) {
             if (layout.ribbons[i].val > maxVal) { maxVal = layout.ribbons[i].val; }
         }
         int ribbonR = r * 88 / 100;
-        // 先画 ribbon（弧会盖住其端部）：源/目标节点色的半透明带。
-        // 形状是 ECharts 式过圆心的二次贝塞尔曲线，按段折线近似
-        // （定点 t∈[0,100]，分母 10000 防溢出）。
+        bool thin = lead.innerPct > 0;
+        int hoverRibbon = 0 - 1;
+        int mxH = app.mouseX;
+        int myH = app.mouseY;
+        int distH = ChartView.ISqrt((mxH - cx) * (mxH - cx) + (myH - cy) * (myH - cy));
+        int rInner0 = r * 78 / 100;
+        if (myH >= bodyY && distH >= rInner0 && distH <= r + app.Scale(4)) {
+            int angH = ChartView.AngleOf(mxH - cx, myH - cy);
+            for (int hi = 0; hi < nn; hi = hi + 1) {
+                if (hi < nodeHid.Count && nodeHid[hi]) { continue; }
+                if (ChartView.InSweep(angH, layout.nodes[hi].a0, layout.nodes[hi].a1)) {
+                    hoverNode = hi;
+                }
+            }
+        }
+        if (hoverNode < 0 && myH >= bodyY) {
+            for (int ri = 0; ri < nr; ri = ri + 1) {
+                ChordRibbon rbh = layout.ribbons[ri];
+                if (rbh.from < nodeHid.Count && nodeHid[rbh.from]) { continue; }
+                if (rbh.to < nodeHid.Count && nodeHid[rbh.to]) { continue; }
+                int x1h = ChartView.FillX(cx, ribbonR, rbh.srcAngle);
+                int y1h = ChartView.FillY(cy, ribbonR, rbh.srcAngle);
+                int x2h = ChartView.FillX(cx, ribbonR, rbh.dstAngle);
+                int y2h = ChartView.FillY(cy, ribbonR, rbh.dstAngle);
+                int segsH = 12;
+                int pxh = x1h;
+                int pyh = y1h;
+                for (int sih = 1; sih <= segsH; sih = sih + 1) {
+                    int tq = sih * 100 / segsH;
+                    int it = 100 - tq;
+                    int bx = (it * it * x1h + 2 * it * tq * cx + tq * tq * x2h) / 10000;
+                    int by = (it * it * y1h + 2 * it * tq * cy + tq * tq * y2h) / 10000;
+                    if (ChartView.DistToSeg(mxH, myH, pxh, pyh, bx, by) <= app.Scale(8)) {
+                        hoverRibbon = ri;
+                    }
+                    pxh = bx;
+                    pyh = by;
+                }
+            }
+        }
+
+        // 先画 ribbon：端点落在对应节点子弧上（FillSector 角）。
         for (int i = 0; i < nr; i = i + 1) {
             ChordRibbon rb = layout.ribbons[i];
+            if (rb.from < nodeHid.Count && nodeHid[rb.from]) { continue; }
+            if (rb.to < nodeHid.Count && nodeHid[rb.to]) { continue; }
             int col = Chart.Palette(t, rb.from);
-            int x1 = cx + ChartView.CosDeg(rb.srcAngle) * ribbonR / 1000;
-            int y1 = cy + ChartView.SinDeg(rb.srcAngle) * ribbonR / 1000;
-            int x2 = cx + ChartView.CosDeg(rb.dstAngle) * ribbonR / 1000;
-            int y2 = cy + ChartView.SinDeg(rb.dstAngle) * ribbonR / 1000;
-            int th = app.Scale(2) + app.Scale(6) * rb.val / maxVal;
-            int segs = 18;
-            int px = x1;
-            int py = y1;
-            for (int si = 1; si <= segs; si = si + 1) {
-                int tq = si * 100 / segs;
-                int it = 100 - tq;
-                int bx = (it * it * x1 + 2 * it * tq * cx + tq * tq * x2) / 10000;
-                int by = (it * it * y1 + 2 * it * tq * cy + tq * tq * y2) / 10000;
-                c.DrawLine(px, py, bx, by, Chart.WithAlpha(col, 150), th);
-                px = bx;
-                py = by;
+            bool related = i == hoverRibbon
+                || rb.from == hoverNode || rb.to == hoverNode;
+            int alpha = 90;
+            if (related) { alpha = 160; }
+            if (thin) {
+                int x1 = ChartView.FillX(cx, ribbonR, rb.srcAngle);
+                int y1 = ChartView.FillY(cy, ribbonR, rb.srcAngle);
+                int x2 = ChartView.FillX(cx, ribbonR, rb.dstAngle);
+                int y2 = ChartView.FillY(cy, ribbonR, rb.dstAngle);
+                int th = app.Scale(2);
+                if (related) { th = app.Scale(3); }
+                ChartView.StrokeQuad(c, x1, y1, cx, cy, x2, y2,
+                    Chart.WithAlpha(col, alpha + 40), th);
+            } else {
+                ChartView.FillChordRibbon(c, cx, cy, ribbonR,
+                    rb.srcA0, rb.srcA1, rb.dstA0, rb.dstA1, col, alpha);
             }
         }
 
@@ -97,46 +176,38 @@ partial class ChartView {
         int rInner = r * 78 / 100;
         int sweepMax = 360 * g / 1000;
         for (int i = 0; i < nn; i = i + 1) {
+            if (i < nodeHid.Count && nodeHid[i]) { continue; }
             ChordNodeArc na = layout.nodes[i];
             int a0 = na.a0;
             int a1 = na.a1;
             if (a1 > a0 + sweepMax) { a1 = a0 + sweepMax; }
             if (a1 > a0) {
-                c.FillSector(cx, cy, rInner, r, a0, a1, Chart.Palette(t, i));
+                int ncol = Chart.Palette(t, i);
+                c.FillSector(cx, cy, rInner, r, a0, a1, ncol);
+                if (i == hoverNode || (hoverRibbon >= 0
+                    && (layout.ribbons[hoverRibbon].from == i
+                        || layout.ribbons[hoverRibbon].to == i))) {
+                    c.FillSector(cx, cy, rInner, r, a0, a1,
+                        Chart.WithAlpha(ncol, 220));
+                }
             }
-            // 节点名：弧中点外侧。
             string nm = na.name;
             int mid = (na.a0 + na.a1) / 2;
-            int lr = r + app.Scale(12);
-            int lx = cx + ChartView.CosDeg(mid) * lr / 1000;
-            int ly = cy + ChartView.SinDeg(mid) * lr / 1000;
-            int tw = Canvas.MeasureText(nm, Style.FontFallback(app, "small"));
-            c.DrawText(lx - tw / 2, Canvas.CenterTextYAt(ly, Style.FontFallback(app, "small")),
-                nm,
+            int gapL = app.Scale(6);
+            int fsN = Style.FontFallback(app, "small");
+            int twN = Canvas.MeasureText(nm, fsN);
+            int lxN = ChartView.FillX(cx, r + gapL, mid);
+            int lyN = Canvas.CenterTextYAt(ChartView.FillY(cy, r + gapL, mid), fsN);
+            if (ChartView.FillDx(mid) < 0) { lxN = lxN - twN; }
+            ChartView.DrawTextClamped(c, lxN, lyN, nm,
                 Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0),
-                Style.FontFallback(app, "small"));
-        }
-
-        // 图例：节点名 + 对应颜色（每节点一行）。
-        if (o.showLegend) {
-            int lx2 = x + w - pad - legendW;
-            int ly2 = top;
-            int sw2 = app.Scale(12);
-            int lh2 = Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(6);
-            for (int i = 0; i < nn; i = i + 1) {
-                ChordNodeArc na = layout.nodes[i];
-                c.FillRoundRect(lx2, ly2 + app.Scale(2), sw2, sw2, t.borderRadiusSmall,
-                    Chart.Palette(t, i));
-                c.DrawText(lx2 + sw2 + app.Scale(6), ly2 + app.Scale(1), na.name,
-                    Style.Part(app, "chart", "legend", "", "", "", Style.SNormal()).FgOr(0),
-                    Style.FontFallback(app, "small"));
-                ly2 = ly2 + lh2;
-            }
+                fsN, boxX, boxY, boxW, boxH);
         }
 
         if (o.showTooltip) {
             int mx = app.mouseX;
             int my = app.mouseY;
+            if (my < bodyY) { return; }
             int ddx = mx - cx;
             int ddy = my - cy;
             int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
@@ -146,6 +217,7 @@ partial class ChartView {
                 for (int i = 0; i < nn; i = i + 1) {
                     ChordNodeArc na = layout.nodes[i];
                     if (ChartView.InSweep(ang, na.a0, na.a1)) {
+                        if (i < nodeHid.Count && nodeHid[i]) { continue; }
                         List<TooltipRow> rows = new List<TooltipRow>{
                             TooltipRow.Of(0, o.title),
                             TooltipRow.Of(Chart.Palette(t, i),
@@ -158,10 +230,12 @@ partial class ChartView {
             // ribbon 命中：到线段的距离小于半带宽。
             for (int i = 0; i < nr; i = i + 1) {
                 ChordRibbon rb = layout.ribbons[i];
-                int x1 = cx + ChartView.CosDeg(rb.srcAngle) * ribbonR / 1000;
-                int y1 = cy + ChartView.SinDeg(rb.srcAngle) * ribbonR / 1000;
-                int x2 = cx + ChartView.CosDeg(rb.dstAngle) * ribbonR / 1000;
-                int y2 = cy + ChartView.SinDeg(rb.dstAngle) * ribbonR / 1000;
+                if (rb.from < nodeHid.Count && nodeHid[rb.from]) { continue; }
+                if (rb.to < nodeHid.Count && nodeHid[rb.to]) { continue; }
+                int x1 = ChartView.FillX(cx, ribbonR, rb.srcAngle);
+                int y1 = ChartView.FillY(cy, ribbonR, rb.srcAngle);
+                int x2 = ChartView.FillX(cx, ribbonR, rb.dstAngle);
+                int y2 = ChartView.FillY(cy, ribbonR, rb.dstAngle);
                 int th = app.Scale(2) + app.Scale(6) * rb.val / maxVal;
                 int hitR = app.Scale(4) + th / 2;
                 // 命中沿同一条贝塞尔折线逐段测距。
@@ -193,6 +267,72 @@ partial class ChartView {
                 }
             }
         }
+    }
+
+    static void AppendArcPts(List<int> px, List<int> py,
+                             int cx, int cy, int r, int a0, int a1) {
+        int span = a1 - a0;
+        if (span < 1) { span = 1; }
+        int steps = span / 2;
+        if (steps < 4) { steps = 4; }
+        if (steps > 48) { steps = 48; }
+        for (int i = 0; i <= steps; i = i + 1) {
+            int a = a0 + span * i / steps;
+            px.Add(ChartView.FillX(cx, r, a));
+            py.Add(ChartView.FillY(cy, r, a));
+        }
+    }
+
+    static void AppendQuadPts(List<int> px, List<int> py,
+                              int x1, int y1, int cx, int cy, int x2, int y2) {
+        int segs = 16;
+        for (int si = 1; si <= segs; si = si + 1) {
+            int tq = si * 100 / segs;
+            int it = 100 - tq;
+            px.Add((it * it * x1 + 2 * it * tq * cx + tq * tq * x2) / 10000);
+            py.Add((it * it * y1 + 2 * it * tq * cy + tq * tq * y2) / 10000);
+        }
+    }
+
+    static void StrokeQuad(Canvas c, int x1, int y1, int cx, int cy,
+                           int x2, int y2, int color, int th) {
+        List<int> fx = new List<int>();
+        List<int> fy = new List<int>();
+        fx.Add(x1 * 256);
+        fy.Add(y1 * 256);
+        int segs = 24;
+        for (int si = 1; si <= segs; si = si + 1) {
+            int tq = si * 100 / segs;
+            int it = 100 - tq;
+            int bx = (it * it * x1 + 2 * it * tq * cx + tq * tq * x2) / 10000;
+            int by = (it * it * y1 + 2 * it * tq * cy + tq * tq * y2) / 10000;
+            fx.Add(bx * 256);
+            fy.Add(by * 256);
+        }
+        c.DrawPolylineFx(fx, fy, color, th);
+    }
+
+    static void FillChordRibbon(Canvas c, int cx, int cy, int r,
+                                int sa0, int sa1, int da0, int da1,
+                                int color, int alpha) {
+        if (sa1 <= sa0) { sa1 = sa0 + 1; }
+        if (da1 <= da0) { da1 = da0 + 1; }
+        List<int> px = new List<int>();
+        List<int> py = new List<int>();
+        ChartView.AppendArcPts(px, py, cx, cy, r, sa0, sa1);
+        int xS1 = ChartView.FillX(cx, r, sa1);
+        int yS1 = ChartView.FillY(cy, r, sa1);
+        int xD0 = ChartView.FillX(cx, r, da0);
+        int yD0 = ChartView.FillY(cy, r, da0);
+        ChartView.AppendQuadPts(px, py, xS1, yS1, cx, cy, xD0, yD0);
+        ChartView.AppendArcPts(px, py, cx, cy, r, da0, da1);
+        int xD1 = ChartView.FillX(cx, r, da1);
+        int yD1 = ChartView.FillY(cy, r, da1);
+        int xS0 = ChartView.FillX(cx, r, sa0);
+        int yS0 = ChartView.FillY(cy, r, sa0);
+        ChartView.AppendQuadPts(px, py, xD1, yD1, cx, cy, xS0, yS0);
+        ChartView.FillPolyWinding(c, px, py, color, alpha);
+        ChartView.StrokePolyFx(c, px, py, Chart.WithAlpha(color, alpha + 50), 1);
     }
 
     // 角度（FillSector 约定，0 = 12 点）是否落在 [a0,a1)（含跨 0 回绕）。
@@ -228,6 +368,14 @@ partial class ChartView {
             r, areaW, areaH);
         int nn = layout.nodes.Count;
         if (nn < 1) { return; }
+        List<bool> nodeHid = new List<bool>();
+        for (int ni = 0; ni < nn; ni = ni + 1) {
+            bool h = false;
+            if (o.iwid != 0) {
+                h = app.StateGet(Chart.LegendSliceKey(o.iwid, 0, ni), 0) == 1;
+            }
+            nodeHid.Add(h);
+        }
 
         int maxVal = 1;
         for (int i = 0; i < layout.edges.Count; i = i + 1) {
@@ -241,6 +389,7 @@ partial class ChartView {
             int best = 0 - 1;
             int bestD = 0;
             for (int i = 0; i < nn; i = i + 1) {
+                if (i < nodeHid.Count && nodeHid[i]) { continue; }
                 int ddx = mx - (ox + layout.nodes[i].x);
                 int ddy = my - (oy + layout.nodes[i].y);
                 int d2 = ddx * ddx + ddy * ddy;
@@ -256,6 +405,8 @@ partial class ChartView {
         int alpha = 120 * g / 1000;
         for (int i = 0; i < layout.edges.Count; i = i + 1) {
             ForceEdge e = layout.edges[i];
+            if (e.a < nodeHid.Count && nodeHid[e.a]) { continue; }
+            if (e.b < nodeHid.Count && nodeHid[e.b]) { continue; }
             int col = Chart.Palette(t, e.a);
             int w2 = 1 + app.Scale(2) * e.val / maxVal;
             c.DrawLine(ox + layout.nodes[e.a].x, oy + layout.nodes[e.a].y,
@@ -276,31 +427,33 @@ partial class ChartView {
         // 节点 + 标签。
         int nodeR = app.Scale(5);
         for (int i = 0; i < nn; i = i + 1) {
+            if (i < nodeHid.Count && nodeHid[i]) { continue; }
             ForceNode nd = layout.nodes[i];
             int col = Chart.Palette(t, i);
             c.FillCircle(ox + nd.x, oy + nd.y, nodeR, col);
             ChartView.RingOutline(c, ox + nd.x, oy + nd.y, nodeR, 4294967295);
             string nm = nd.name;
             int tw = Canvas.MeasureText(nm, Style.FontFallback(app, "small"));
-            c.DrawText(ox + nd.x - tw / 2, oy + nd.y + nodeR + app.Scale(3),
+            int fs = Style.FontFallback(app, "small");
+            ChartView.DrawTextClamped(c, ox + nd.x - tw / 2, oy + nd.y + nodeR + app.Scale(3),
                 nm,
                 Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0),
-                Style.FontFallback(app, "small"));
+                fs, ox, oy, areaW, areaH);
         }
 
         // 图例：节点名 + 对应颜色（每节点一行）。
         if (o.showLegend) {
             int lx2 = x + w - pad - legendW;
-            int ly2 = top;
-            int sw2 = app.Scale(12);
+            int ly2 = Chart.LegendStartY(app, y, top);
             int lh2 = Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(6);
             for (int i = 0; i < nn; i = i + 1) {
                 ForceNode nd = layout.nodes[i];
-                c.FillRoundRect(lx2, ly2 + app.Scale(2), sw2, sw2, t.borderRadiusSmall,
-                    Chart.Palette(t, i));
-                c.DrawText(lx2 + sw2 + app.Scale(6), ly2 + app.Scale(1), nd.name,
-                    Style.Part(app, "chart", "legend", "", "", "", Style.SNormal()).FgOr(0),
-                    Style.FontFallback(app, "small"));
+                int key = 0;
+                if (o.iwid != 0) { key = Chart.LegendSliceKey(o.iwid, 0, i); }
+                bool hid = false;
+                if (i < nodeHid.Count) { hid = nodeHid[i]; }
+                Chart.DrawLegendChip(app, lx2, ly2, legendW, lh2,
+                    Chart.Palette(t, i), nd.name, hid, key);
                 ly2 = ly2 + lh2;
             }
         }

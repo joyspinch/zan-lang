@@ -23,6 +23,27 @@ partial class ChartView {
     // 避免增长入场动画每帧被重置为 0。
     int wid;
 
+    /// 把图例开关写回 data.hidden（多数据项）或 series.hidden（单值系列）。
+    /// 画廊每帧重建 option，必须从 App 状态恢复，否则点了等于没点。
+    static void ApplyDataLegend(App app, ChartOption o) {
+        if (o.iwid == 0) { return; }
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries s = o.series[si];
+            if (s.data.Count > 1) {
+                for (int di = 0; di < s.data.Count; di = di + 1) {
+                    s.data[di].hidden = app.StateGet(
+                        Chart.LegendSliceKey(o.iwid, si, di), 0) == 1;
+                    int sel0 = 0;
+                    if (s.data[di].selected) { sel0 = 1; }
+                    s.data[di].selected = app.StateGet(
+                        Chart.PieSelKey(o.iwid, si, di), sel0) == 1;
+                }
+            } else {
+                s.hidden = app.StateGet(Chart.LegendKey(o.iwid, si), 0) == 1;
+            }
+        }
+    }
+
     // 层级图表（treemap/sunburst）最近一次的悬停命中。
     // 由命中追踪辅助函数设置，调用方立即读取以绘制工具提示，
     // 因此不会跨帧存留。
@@ -303,11 +324,13 @@ partial class ChartView {
 
     /// 主导图表族：第一个可见序列的类型（
     /// 整图系列族 —— pie、gauge、heatmap 等 —— 从中选择布局，
-    /// 笛卡尔系列族则逐序列混用）。
+    /// 笛卡尔系列族则逐序列混用）。全部隐藏时仍用首条系列类型，
+    /// 保留坐标轴/图例，而不是整图变成空状态。
     static ChartType LeadType(ChartOption o) {
         for (int i = 0; i < o.series.Count; i = i + 1) {
             if (!o.series[i].hidden) { return o.series[i].type; }
         }
+        if (o.series.Count > 0) { return o.series[0].type; }
         return ChartType.Line;
     }
 
@@ -316,13 +339,9 @@ partial class ChartView {
     /// 未知/空 kind 返回 "empty"（渲染明确的空状态）。
     /// 这是 chart_kinds_complete 测试的确定性锚点。
     static string DispatchKind(ChartOption o) {
-        // 无系列或全部隐藏：没有可绘制的数据，画明确的空状态
-        // （而不是回退为折线图）。
-        bool anyVisible = false;
-        for (int i = 0; i < o.series.Count; i = i + 1) {
-            if (!o.series[i].hidden) { anyVisible = true; }
-        }
-        if (!anyVisible) { return "empty"; }
+        // 无系列才画空状态。图例关掉最后一条系列时仍按原类型
+        // 分发，只是渲染器跳过隐藏序列（坐标轴/图例还在）。
+        if (o.series.Count < 1) { return "empty"; }
         ChartType t = ChartView.LeadType(o);
         ChartSeries leadS = ChartView.LeadSeries(o);
         if (t == ChartType.Pie) {
@@ -432,6 +451,11 @@ partial class ChartView {
         this.resolved = ResolvedChart.Resolve(this.sourceOption, t, app, wid);
         bool animate = this.resolved.animate;
         if (this.staticFrame) { animate = false; }
+        string kind0 = ChartView.DispatchKind(this.sourceOption);
+        if (kind0 == "map" || kind0 == "heatmap" || kind0 == "wordCloud"
+            || kind0 == "force" || kind0 == "treemap") {
+            animate = false;
+        }
         if (this.sourceOption.backgroundColor != 0) {
             app.canvas.FillRect(x, y, w, h, this.sourceOption.backgroundColor);
         }
@@ -442,9 +466,14 @@ partial class ChartView {
                                 x, y, w, h);
         }
 
-        // Renderers receive a frame-local option containing normalized series.
         ChartOption drawOption = this.resolved.DrawOption(wid, animate);
+        if (app.StateGet(Chart.TbZoomKey(wid), 0) != 0) { drawOption.zoom = true; }
+        ChartView.ApplyMagic(drawOption, app.StateGet(Chart.TbMagicKey(wid), 0));
         option = drawOption;
+        Chart.toolReserve = 0;
+        if (drawOption.toolboxShow) {
+            Chart.toolReserve = ChartToolbox.Width(app, drawOption);
+        }
 
         // 把每种图表裁剪到自己的矩形，防止绘图线、柱条、
         // 轴标签和图例溢出到相邻控件。
@@ -452,11 +481,23 @@ partial class ChartView {
         this.DispatchRender(app, x, y, w, h, g);
         app.canvas.PopClip();
 
-        // ECharts 工具箱：图表右下角浮 3 个圆按钮（保存图片 /
-        // 数据视图 / 还原）。o.toolboxShow 关闭时不画也不注册命中。
-        // 按钮 id 跨帧稳定由本 ChartView.wid 派生。
+        // ECharts 工具箱：右上角。o.toolboxShow 关闭时不画。
         if (drawOption.toolboxShow) {
-            ChartView.DrawToolbox(app, x, y, w, h, this.wid);
+            ChartView.DrawToolbox(app, x, y, w, h, this.wid, drawOption);
+            ChartView.FlushToolboxSave(app, this.wid);
+        }
+    }
+
+    static void ApplyMagic(ChartOption o, int magic) {
+        if (magic != 1 && magic != 2) { return; }
+        ChartType t = ChartType.Line;
+        if (magic == 2) { t = ChartType.Bar; }
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            ChartSeries s = o.series[i];
+            if (s.type == ChartType.Line || s.type == ChartType.Bar) {
+                s.type = t;
+                if (t == ChartType.Bar) { s.areaStyle = false; }
+            }
         }
     }
 

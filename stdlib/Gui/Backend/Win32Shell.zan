@@ -944,9 +944,10 @@ class Win32Shell {
                 return;
             }
         }
-        if (Win32Shell.glassOn) {
+        if (Win32Shell.glassOn && !Win32Shell.IsLayerHost(hwnd)) {
             // 分层窗只能整张提交，所以自己声明的矩形直接作废；
-            // 别人的矩形不得顺手清掉。
+            // 别人的矩形不得顺手清掉。宿主了原生子窗口的窗口即便开着
+            // 玻璃也留在 GDI 路径上——ULW 呈现会让子窗口消失。
             if (Win32Shell.dirtyHwnd == hwnd) {
                 Win32Shell.dirty.Clear();
                 Win32Shell.dirtyOverflow = false;
@@ -1042,6 +1043,7 @@ class Win32Shell {
     /// 节并交给 DWM，由它在 alpha 低于 255 处
     /// 合成模糊背景。
     static void PresentLayered(nint hwnd, int surface) {
+        if (Win32Shell.IsLayerHost(hwnd)) { return; }
         nint pixels = Win32Shell.zan_gui_get_pixels(surface);
         if (pixels == 0) { return; }
         if (Win32Shell.zan_gui_surface_painted(surface) == 0) { return; }
@@ -1532,9 +1534,72 @@ class Win32Shell {
         Win32Shell.SetCursor(Win32Shell.LoadCursorW(0, id));
     }
 
+    // ---- 原生子窗口宿主与分层窗口互斥 ---------------------------------
+
+    /// 宿主了原生子窗口（CEF / WebView2 的子 HWND）的窗口句柄。分层
+    /// 窗口以 UpdateLayeredWindow 呈现时 OS 永远不合成其子窗口——子
+    /// HWND 的表面全零透明，网页内容一帧都上不了屏。这类窗口必须
+    /// 一直走 GDI/GL 直通呈现，并拒绝任何把 WS_EX_LAYERED 加回来的
+    /// 尝试（呈现路径、玻璃或系统工具都可能写这个位）。
+    static List<long> noLayerHosts;
+
+    /// `hwnd` 是否登记为原生子窗口宿主。
+    static bool IsLayerHost(nint hwnd) {
+        if (hwnd == 0 || Win32Shell.noLayerHosts == null) { return false; }
+        long key = (long)hwnd;
+        for (int i = 0; i < Win32Shell.noLayerHosts.Count; i = i + 1) {
+            if (Win32Shell.noLayerHosts[i] == key) { return true; }
+        }
+        return false;
+    }
+
+    /// 声明 `hwnd` 宿主了原生子窗口：立刻清掉分层位并登记，之后
+    /// 每帧经 SweepLayered 继续拒绝。
+    static void ForbidLayered(nint hwnd) {
+        Win32Shell.Init();
+        if (hwnd == 0 || Win32Shell.IsLayerHost(hwnd)) { return; }
+        if (Win32Shell.noLayerHosts == null) {
+            Win32Shell.noLayerHosts = new List<long>();
+        }
+        Win32Shell.noLayerHosts.Add((long)hwnd);
+        Win32Shell.StripLayered(hwnd);
+    }
+
+    /// 清掉 `hwnd` 的分层位。返回是否真的清了（外面有人加回来过），
+    /// 调用方据此请求一次全帧重绘——被 ULW 呈现过的那一帧子窗口
+    /// 没有上屏，不能留着。
+    static bool StripLayered(nint hwnd) {
+        nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+        if ((ex & 0x00080000) == 0) { return false; }
+        Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00080000);
+        return true;
+    }
+
+    /// 每帧清扫一次：宿主原生子窗口的窗口若又被加上分层位则清掉。
+    /// 返回是否清过（供调用方请求重绘）。
+    static bool SweepLayered() {
+        if (Win32Shell.noLayerHosts == null) { return false; }
+        bool cleaned = false;
+        for (int i = 0; i < Win32Shell.noLayerHosts.Count; i = i + 1) {
+            if (Win32Shell.StripLayered((nint)Win32Shell.noLayerHosts[i])) {
+                cleaned = true;
+            }
+        }
+        return cleaned;
+    }
+
     static void EnableGlass(nint hwnd, int tintArgb) {
         Win32Shell.Init();
         if (hwnd == 0) { return; }
+        if (Win32Shell.IsLayerHost(hwnd)) {
+            // 宿主了原生子窗口的窗口绝不能变成分层窗口（ULW 呈现时 OS
+            // 不合成子窗口）。亚克力 accent 走 SetWindowCompositionAttribute，
+            // 不需要 WS_EX_LAYERED；呈现由 Present 的 GDI 分支接管。
+            Win32Shell.glassTint = tintArgb;
+            Win32Shell.AcrylicApply(hwnd, 4, tintArgb);
+            Win32Shell.glassOn = true;
+            return;
+        }
         nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
         if ((ex & 0x00080000) == 0) {              // WS_EX_LAYERED
             Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex | 0x00080000);
@@ -1558,6 +1623,9 @@ class Win32Shell {
     static void SetOpacity(nint hwnd, int percent) {
         Win32Shell.Init();
         if (hwnd == 0) { return; }
+        // 半透明靠 SetLayeredWindowAttributes，必须分层；分层会连
+        // 原生子窗口一起藏掉，宿主窗口只能整窗不透明。
+        if (Win32Shell.IsLayerHost(hwnd)) { return; }
         if (percent < 10) { percent = 10; }
         if (percent > 100) { percent = 100; }
         nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
@@ -1621,8 +1689,10 @@ class Win32Shell {
         // 不能被主框架 800x600 的 WM_GETMINMAXINFO 最小值夹紧。
         Win32Shell.shapeMode = 1;
         Win32Shell.FitShapeWindow(hwnd, regs);
-        if (Win32Shell.DwmComposited()) {
+        if (Win32Shell.DwmComposited() && !Win32Shell.IsLayerHost(hwnd)) {
             // 分层逐像素 alpha 路径：无亚克力模糊，仅形状。
+            // 宿主了原生子窗口的窗口走下面的经典区域路径——分层窗口
+            // 的 OS 不合成其子 HWND。
             nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
             if ((ex & 0x00080000) == 0) {              // WS_EX_LAYERED
                 Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex | 0x00080000);
@@ -2104,6 +2174,12 @@ class Win32Shell {
     static int EventKeyCodeValue() { return Win32Shell.evKeyCode; }
     static int EventModsValue() { return Win32Shell.evMods; }
     static nint EventWindow() { return Win32Shell.evHwnd; }
+
+    /// 窗口过程当前正在处理的消息所属的窗口。与 EventWindow()
+    /// 不同：那一个只在应用泵出事件时更新，而模态尺寸调整循环
+    /// 期间应用拿不到事件，sizePaint 回调（窗口过程里触发）必须
+    /// 用这一个才能知道"正在缩放的是哪个窗口"。
+    static nint WndProcWindow() { return Win32Shell.eventHwnd; }
 
     /// 来自性能计数器的单调毫秒：GetTickCount 仅每约 15 ms
     /// 变化一次，这会使每帧动画步长抖动。

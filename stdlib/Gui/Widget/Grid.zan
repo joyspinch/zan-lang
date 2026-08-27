@@ -1,0 +1,267 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// 等宽栅格容器（Naive UI n-grid）：把子控件铺进 N 等宽列，
+/// 列宽自适应容器宽度，行高按每行最高的格子决定。
+///
+/// 用来排卡片墙、指标面板、表单的多列分区——凡是"三个一排、
+/// 宽度均分、窗口变窄要能自己降列"的场合：
+///
+///     Grid g = Grid.Of(3).Gap(app.theme.gapLarge);
+///     g.With(cardA);
+///     g.With(cardB);
+///     g.With(new GridItem(2).With(wideCard));  // 占两列
+///     g.RenderInside(app, area);
+///
+/// 响应式：给一个每列最小宽度，窗口变窄时自动减列（本框架的
+/// CSS 没有 @media，断点由容器自己按实际宽度算）：
+///
+///     Grid g = Grid.Of(4).MinColumn(app.Scale(220));
+///
+/// 容器按内容测量高度（行高之和），因此可以直接停靠进一列里，
+/// 不必给死高度。外观为透明（base.css 的 `grid` 规则），要边框
+/// 背景就放进 Card/Panel 或给它挂类。
+///
+/// 列数与间距都可以由 CSS 给：`grid { columns: 3; column-gap: 16px;
+/// row-gap: 24px }`——代码里的 Of(n)/Gap(px) 只是覆盖它。
+class Grid : Control {
+    /// 列数（<1 表示听样式表的 `columns`，仍缺省则 1 列）。
+    int cols;
+    /// 每列的最小宽度（0 = 不做响应式降列）。
+    int minColW;
+    /// 上一帧实际排布用的内容宽度，以及上一次测量用过的值：
+    /// 行数（因此高度）取决于宽度，而测量发生在拿到宽度之前，
+    /// 两者不一致说明高度还没收敛，需要再排一帧。
+    int lastW;
+    int measW;
+
+    void InitGrid(int n) {
+        this.InitControl("grid", 5);
+        cols = n;
+        minColW = 0;
+        lastW = 0;
+        measW = 0;
+    }
+
+    /// Default design-time constructor：单列（等同一列堆叠）。
+    Grid() { InitGrid(1); }
+
+    /// `Grid.Of(3)` —— 三等宽列。
+    static Grid Of(int n) { return new Grid().SetCols(n); }
+
+    override string Kind() { return "Grid"; }
+    override string StyleType() { return "grid"; }
+
+    Grid SetCols(int n) {
+        cols = n;
+        return this;
+    }
+
+    /// 每列不窄于 `px`：容器宽度不够时自动减少列数（响应式）。
+    Grid MinColumn(int px) {
+        minColW = px;
+        return this;
+    }
+
+    /// 本次排布的实际列数：代码给的列数优先，其次是样式表的
+    /// `columns`；配了每列最小宽度时按可用宽度往下调，最少 1 列。
+    int ResolvedCols(int cw) {
+        int n = cols;
+        if (n < 1) { n = this.StyleColumns(0); }
+        if (n < 1) { n = 1; }
+        if (minColW > 0 && cw > 0) {
+            int fit = (cw + this.ColGapPx()) / (minColW + this.ColGapPx());
+            if (fit < 1) { fit = 1; }
+            if (fit < n) { n = fit; }
+        }
+        return n;
+    }
+
+    int ColGapPx() { return this.StyleColGap(this.StyleGap()); }
+    int RowGapPx() { return this.StyleRowGap(this.StyleGap()); }
+
+    static int SpanOf(Control c) {
+        if (c is GridItem) {
+            GridItem gi = (GridItem)c;
+            return gi.Span();
+        }
+        return 1;
+    }
+
+    static int OffsetOf(Control c) {
+        if (c is GridItem) {
+            GridItem gi = (GridItem)c;
+            return gi.Offset();
+        }
+        return 0;
+    }
+
+    /// 列 `i` 相对内容框左边缘的偏移。按 `(cw + gap) * i / n` 取整而不
+    /// 是先算单列宽再乘——后者会把每列的取整误差累加，最后一列
+    /// 差出好几个像素、右边缘对不齐。
+    static int ColEdge(int cw, int gap, int n, int i) {
+        return (cw + gap) * i / n;
+    }
+
+    /// 从第 `at` 列起、跨 `span` 列的宽度。
+    static int SpanWidth(int cw, int gap, int n, int at, int span) {
+        int w = Grid.ColEdge(cw, gap, n, at + span) - gap
+            - Grid.ColEdge(cw, gap, n, at);
+        if (w < 0) { w = 0; }
+        return w;
+    }
+
+    /// 把可见子项分配到各行：返回每个子项所在的行号写入 `rowOf`、
+    /// 起始列写入 `colOf`、实际跨列写入 `spanOf`，并返回行数。
+    /// 一行放不下当前格时换行；跨列超过总列数的格子按总列数截断，
+    /// 因此不会出现放不进任何一行的死格。
+    int Place(int n, List<Control> items, List<int> rowOf, List<int> colOf,
+              List<int> spanOf) {
+        int row = 0;
+        int cursor = 0;
+        for (int i = 0; i < items.Count; i = i + 1) {
+            Control c = items[i];
+            int span = Grid.SpanOf(c);
+            if (span > n) { span = n; }
+            int off = Grid.OffsetOf(c);
+            if (off > n - span) { off = n - span; }
+            if (off < 0) { off = 0; }
+            if (cursor > 0 && cursor + off + span > n) {
+                row = row + 1;
+                cursor = 0;
+                off = Grid.OffsetOf(c);
+                if (off > n - span) { off = n - span; }
+                if (off < 0) { off = 0; }
+            }
+            rowOf.Add(row);
+            colOf.Add(cursor + off);
+            spanOf.Add(span);
+            cursor = cursor + off + span;
+            if (cursor >= n) {
+                row = row + 1;
+                cursor = 0;
+            }
+        }
+        if (cursor > 0) { row = row + 1; }
+        return row;
+    }
+
+    List<Control> VisibleItems() {
+        List<Control> items = new List<Control>();
+        for (int i = 0; i < children.Count; i = i + 1) {
+            if (children[i].StyleVisible()) { items.Add(children[i]); }
+        }
+        return items;
+    }
+
+    /// 每行的高度：该行最高格子的测量高度，样式表声明了
+    /// `line-height` 时统一取它（等高卡片墙）。
+    List<int> RowHeights(int rows, List<Control> items, List<int> rowOf) {
+        List<int> hs = new List<int>();
+        for (int r = 0; r < rows; r = r + 1) { hs.Add(0); }
+        for (int i = 0; i < items.Count; i = i + 1) {
+            int r = rowOf[i];
+            int h = items[i].prefH;
+            if (h > hs[r]) { hs[r] = h; }
+        }
+        int declared = this.StyleLineHeight();
+        if (declared > 0) {
+            for (int r = 0; r < rows; r = r + 1) { hs[r] = declared; }
+        }
+        return hs;
+    }
+
+    override void OnMeasure(App app) {
+        List<Control> items = this.VisibleItems();
+        if (items.Count == 0) { return; }
+        // 列宽取决于容器宽度，而测量拿不到它：用上一帧排布过的
+        // 宽度，作者给过固定宽度时优先用它。
+        int cw = lastW;
+        if (prefSet && prefW > 0) {
+            cw = prefW - this.StylePadL() - this.StylePadR();
+        }
+        int n = this.ResolvedCols(cw);
+        List<int> rowOf = new List<int>();
+        List<int> colOf = new List<int>();
+        List<int> spanOf = new List<int>();
+        int rows = this.Place(n, items, rowOf, colOf, spanOf);
+        List<int> hs = this.RowHeights(rows, items, rowOf);
+        int total = 0;
+        for (int r = 0; r < rows; r = r + 1) { total = total + hs[r]; }
+        if (rows > 1) { total = total + this.RowGapPx() * (rows - 1); }
+        if (prefH <= 0 && total > 0) {
+            prefH = total + this.StylePadT() + this.StylePadB();
+        }
+        // 首帧还不知道自己有多宽，算出的行数/高度是过时的；Arrange
+        // 拿到真实宽度后会更新 lastW，这里主动再要一帧收敛。
+        if (measW != lastW) {
+            measW = lastW;
+            app.RequestRedraw();
+        }
+    }
+
+    override void Arrange(int px, int py, int pw, int ph) {
+        if (pw < 0) { pw = 0; }
+        if (ph < 0) { ph = 0; }
+        bx = px;
+        by = py;
+        bw = pw;
+        bh = ph;
+        int cx = px + this.StylePadL();
+        int cy = py + this.StylePadT();
+        int cw = pw - this.StylePadL() - this.StylePadR();
+        int ch = ph - this.StylePadT() - this.StylePadB();
+        if (cw < 0) { cw = 0; }
+        if (ch < 0) { ch = 0; }
+        lastW = cw;
+
+        List<Control> items = this.VisibleItems();
+        if (items.Count == 0) { return; }
+        int n = this.ResolvedCols(cw);
+        int xg = this.ColGapPx();
+        int yg = this.RowGapPx();
+
+        List<int> rowOf = new List<int>();
+        List<int> colOf = new List<int>();
+        List<int> spanOf = new List<int>();
+        int rows = this.Place(n, items, rowOf, colOf, spanOf);
+        List<int> hs = this.RowHeights(rows, items, rowOf);
+
+        // 行的纵向起点：逐行累加，行间插 row-gap。
+        List<int> tops = new List<int>();
+        int y = 0;
+        for (int r = 0; r < rows; r = r + 1) {
+            tops.Add(y);
+            y = y + hs[r] + yg;
+        }
+
+        for (int i = 0; i < items.Count; i = i + 1) {
+            Control c = items[i];
+            int left = Grid.ColEdge(cw, xg, n, colOf[i]);
+            int w = Grid.SpanWidth(cw, xg, n, colOf[i], spanOf[i]);
+            c.Arrange(cx + left, cy + tops[rowOf[i]], w, hs[rowOf[i]]);
+        }
+    }
+
+    override bool SetExtra(string key, string val) {
+        if (key == "cols" || key == "columns") {
+            cols = Convert.ToInt32(val);
+            return true;
+        }
+        if (key == "min-column" || key == "minColumn") {
+            minColW = Convert.ToInt32(val);
+            return true;
+        }
+        return false;
+    }
+
+    override string GetExtra(string key) {
+        if (key == "cols" || key == "columns") { return Convert.ToString(cols); }
+        if (key == "min-column" || key == "minColumn") {
+            return Convert.ToString(minColW);
+        }
+        return "";
+    }
+}

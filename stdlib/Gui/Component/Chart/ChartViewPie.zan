@@ -99,7 +99,7 @@ class PieLayout {
                     int v = s.Value(di2);
                     int a0 = acc * 360 / rt;
                     int a1 = (acc + v) * 360 / rt;
-                    l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, di2, l.slices.Count),
+                    l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, di2, origIdx[r] * 16 + di2),
                         PieLayout.SliceName(s, di2), origIdx[r], di2, a0, a1, r));
                     l.slices[l.slices.Count - 1].selected = d.selected;
                     acc = acc + v;
@@ -135,7 +135,7 @@ class PieLayout {
                 int v = s.Value(di2);
                 int a0 = acc2 * 360 / total;
                 int a1 = (acc2 + v) * 360 / total;
-                l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, di2, l.slices.Count),
+                l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, di2, origIdx[p2] * 16 + di2),
                     PieLayout.SliceName(s, di2), origIdx[p2], di2, a0, a1, 0));
                 l.slices[l.slices.Count - 1].selected = d.selected;
                 acc2 = acc2 + v;
@@ -144,9 +144,8 @@ class PieLayout {
         return l;
     }
 
-    /// 扇区颜色：数据项色 > 单数据项系列的系列色 > 按扇区序调色板。
-    /// 多数据项系列用逐扇区调色板（ECharts 饼图按数据项着色），
-    /// 单数据项系列沿用系列色（保持旧版单系列单扇区的外观）。
+    /// 扇区颜色：数据项色 > 单数据项系列的系列色 > 按数据项下标调色板。
+    /// 用 di（而不是可见扇区序）着色，图例开关后颜色不会错位。
     static int SliceColor(Theme t, ChartSeries s, int di, int sliceIndex) {
         if (di >= 0 && di < s.data.Count && s.data[di].color != 0) {
             return s.data[di].color;
@@ -171,45 +170,132 @@ partial class ChartView {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int pad = t.paddingMedium;
-
-        StyleBox sPanel = Style.Full(app, "chart", "", "", Style.SNormal());
-        c.SurfaceRoundRect(x, y, w, h, t.borderRadiusMedium, sPanel.BgOr(0), sPanel.BorderOr(0), 1);
-        int top = y + pad;
-        if (o.title.Length > 0) {
-            c.DrawText(x + pad, top, o.title, sPanel.FgOr(0), Style.FontFallback(app, "large"));
-        }
-        top = top + Canvas.FontHeight(Style.FontFallback(app, "large")) + app.Scale(6);
-
-        // 合计来自完整数据（未按 g 缩放），使饼图几何稳定；
-        // 渐入动画是扫到 sweepMax 度的径向扫掠。这避免了
-        // 整数除法把早期帧的小值截断为 0（此前
-        // 会导致整张图空白）。
+        ChartView.ApplyDataLegend(app, o);
+        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
         PieLayout layout = PieLayout.Of(t, o);
         List<PieSlice> slices = layout.slices;
         int total = layout.total;
-        if (slices.Count < 1 || total <= 0) { return; }
         int ringCount = layout.ringCount;
         if (ringCount < 1) { ringCount = 1; }
 
-        int legendW = 0;
-        if (o.showLegend) { legendW = app.Scale(120); }
-        int areaW = w - pad * 2 - legendW;
-        int areaH = (y + h - pad) - top;
-        int rOuter = areaW / 2;
-        if (areaH / 2 < rOuter) { rOuter = areaH / 2; }
-        if (rOuter < app.Scale(10)) { rOuter = app.Scale(10); }
+        int hotSi = 0 - 1;
+        int hotDi = 0 - 1;
+        int bodyY = top;
+        if (o.showLegend) {
+            int x0 = x + pad;
+            int maxX = x + w - pad;
+            int rowH = Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(6);
+            int gap = app.Scale(8);
+            int rowW = 0;
+            int nChip = 0;
+            for (int sm = 0; sm < o.series.Count; sm = sm + 1) {
+                ChartSeries pm = o.series[sm];
+                if (pm.type != ChartType.Pie) { continue; }
+                int visM = 0;
+                for (int dvm = 0; dvm < pm.data.Count; dvm = dvm + 1) {
+                    if (!pm.data[dvm].hidden) { visM = visM + pm.Value(dvm); }
+                }
+                for (int dim = 0; dim < pm.data.Count; dim = dim + 1) {
+                    string nmm = PieLayout.SliceName(pm, dim);
+                    int pctM = 0;
+                    if (!pm.data[dim].hidden && visM > 0) {
+                        pctM = pm.Value(dim) * 100 / visM;
+                    }
+                    string lbm = nmm + "  " + Convert.ToString(pctM) + "%";
+                    rowW = rowW + Chart.LegendChipW(app, lbm) + gap;
+                    nChip = nChip + 1;
+                }
+            }
+            if (nChip > 0) { rowW = rowW - gap; }
+            int xCur = x0;
+            if (nChip > 0 && rowW > 0 && rowW <= maxX - x0) {
+                xCur = x0 + (maxX - x0 - rowW) / 2;
+            }
+            int yCur = top;
+            for (int si = 0; si < o.series.Count; si = si + 1) {
+                ChartSeries ps = o.series[si];
+                if (ps.type != ChartType.Pie) { continue; }
+                int visTot = 0;
+                for (int dv = 0; dv < ps.data.Count; dv = dv + 1) {
+                    if (!ps.data[dv].hidden) { visTot = visTot + ps.Value(dv); }
+                }
+                for (int di = 0; di < ps.data.Count; di = di + 1) {
+                    int col = PieLayout.SliceColor(t, ps, di, si * 16 + di);
+                    string nm = PieLayout.SliceName(ps, di);
+                    bool hid = ps.data[di].hidden;
+                    int pctL = 0;
+                    if (!hid && visTot > 0) { pctL = ps.Value(di) * 100 / visTot; }
+                    string lbl = nm + "  " + Convert.ToString(pctL) + "%";
+                    int cw = Chart.LegendChipW(app, lbl);
+                    if (xCur > x0 && xCur + cw > maxX) {
+                        xCur = x0;
+                        yCur = yCur + rowH;
+                    }
+                    if (app.mouseX >= xCur && app.mouseX < xCur + cw
+                        && app.mouseY >= yCur && app.mouseY < yCur + rowH) {
+                        hotSi = si;
+                        hotDi = di;
+                    }
+                    int key = 0;
+                    if (o.iwid != 0) { key = Chart.LegendSliceKey(o.iwid, si, di); }
+                    Chart.DrawLegendChip(app, xCur, yCur, cw, rowH, col, lbl, hid, key);
+                    xCur = xCur + cw + app.Scale(8);
+                    bodyY = yCur + rowH + app.Scale(4);
+                }
+            }
+        }
+
+        int areaW = w - pad * 2;
+        int areaH = (y + h - pad) - bodyY;
+        int pct = 72;
+        if (sliceLabels) { pct = 52; }
+        if (ringCount > 1) { pct = 64; }
+        int rOuter = ChartView.RadialRadius(areaW, areaH, pct);
         int cx = x + pad + areaW / 2;
-        int cy = top + areaH / 2;
+        int cy = bodyY + areaH / 2;
         int sweepMax = 360 * g / 1000;
-        // 起始边顺时针偏移（ECharts startAngle 换算），布局层给出。
         int rot = layout.rot;
 
-        // 环带几何：pieRings 时每条可见系列一条等宽环带，
-        // 最外环用系列 innerPct（缺省 donutPct）开孔；
-        // 单环时内半径由布局给出。环带从外向内等分半径。
         int band = 0;
         if (ringCount > 1) { band = rOuter / ringCount; }
         if (band < app.Scale(2)) { band = app.Scale(2); }
+
+        int hoverK = 0 - 1;
+        int mx0 = app.mouseX;
+        int my0 = app.mouseY;
+        int dist0 = ChartView.ISqrt((mx0 - cx) * (mx0 - cx) + (my0 - cy) * (my0 - cy));
+        int angR0 = ((ChartView.AngleOf(mx0 - cx, my0 - cy) - rot) % 360 + 360) % 360;
+        if (my0 >= bodyY) {
+            for (int kh = slices.Count - 1; kh >= 0; kh = kh - 1) {
+                PieSlice sh = slices[kh];
+                int ringH = sh.ring;
+                if (ringH >= ringCount) { ringH = ringCount - 1; }
+                if (ringH < 0) { ringH = 0; }
+                int riH = rOuter - (ringH + 1) * band;
+                int roH = rOuter - ringH * band;
+                if (ringCount == 1 && layout.ringInner.Count > 0) {
+                    riH = rOuter * layout.ringInner[0] / 100;
+                    roH = rOuter;
+                }
+                if (riH < 0) { riH = 0; }
+                if (dist0 >= riH && dist0 <= roH && angR0 >= sh.a0 && angR0 < sh.a1) {
+                    hoverK = kh;
+                    break;
+                }
+            }
+        }
+        if (hoverK >= 0 && o.iwid != 0
+            && app.EventKind() == 3 && app.ClickFrameCurrent()
+            && !app.ClickClaimed()) {
+            PieSlice clk = slices[hoverK];
+            if (clk.seriesIndex >= 0 && clk.seriesIndex < o.series.Count) {
+                int key = Chart.PieSelKey(o.iwid, clk.seriesIndex, clk.dataIndex);
+                int nv = 1;
+                if (clk.selected) { nv = 0; }
+                app.StateSet(key, nv);
+                app.RequestRedraw();
+            }
+        }
 
         for (int k = 0; k < slices.Count; k = k + 1) {
             PieSlice sl = slices[k];
@@ -246,30 +332,33 @@ partial class ChartView {
             // 静态选中：沿中角方向向外偏 selectedOffset 像素。
             int sx = 0;
             int sy = 0;
-            if (sl.selected && sl.seriesIndex >= 0
+            bool pop = sl.selected || k == hoverK
+                || (sl.seriesIndex == hotSi && sl.dataIndex == hotDi);
+            if (pop && sl.seriesIndex >= 0
                 && sl.seriesIndex < o.series.Count) {
                 int offPx = app.Scale(o.series[sl.seriesIndex].selectedOffset);
-                if (offPx > 0) {
-                    int midSel = rot + (a0 + a1) / 2;
-                    // 屏幕位置约定 pos=(CosDeg m, SinDeg m)，而 m 是
-                    // 数学域角；扇区角是原生态域：m = 扇区角+270。
-                    sx = ChartView.SinDeg(midSel) * offPx / 1000;
-                    sy = ChartView.SinDeg(midSel + 270) * offPx / 1000;
-                }
+                if (offPx < 1) { offPx = app.Scale(8); }
+                int midSel = rot + (a0 + a1) / 2;
+                sx = ChartView.FillDx(midSel) * offPx / 1000;
+                sy = ChartView.FillDy(midSel) * offPx / 1000;
             }
             int scx = cx + sx;
             int scy = cy + sy;
             int pa0 = a0 + rot;
             int paEnd = aEnd + rot;
             if (paEnd > pa0) {
-                c.FillSector(scx, scy, ri, ro, pa0, paEnd, sl.color);
-                // itemStyle.normal 边框：borderWidth>0 且 borderColor
-                // 非零时描扇区轮廓（ECharts 2.x 语义，缺省不画）。
+                int aHi = paEnd;
+                if (aHi > pa0 + 2) { aHi = paEnd - 1; }
+                c.FillSector(scx, scy, ri, ro, pa0, aHi, sl.color);
+                if (pop) {
+                    StrokeSector(c, scx, scy, ri, ro, pa0, aHi,
+                        Chart.ContrastFg(sl.color), app.Scale(2));
+                }
                 if (sl.seriesIndex >= 0 && sl.seriesIndex < o.series.Count) {
                     ChartSeries bs = o.series[sl.seriesIndex];
                     if (bs.itemStyle.normal.borderWidth > 0
                         && bs.itemStyle.normal.borderColor != 0) {
-                        StrokeSector(c, scx, scy, ri, ro, pa0, paEnd,
+                        StrokeSector(c, scx, scy, ri, ro, pa0, aHi,
                             bs.itemStyle.normal.borderColor,
                             app.Scale(bs.itemStyle.normal.borderWidth));
                     }
@@ -293,14 +382,28 @@ partial class ChartView {
                 // 系列级外置标签：series.label.show + labelLine（ECharts
                 // 2.x 语义）。引导线两段：沿中角出弧 L1，再水平收尾；
                 // 文本按左右半球锚定在水平段外侧。
-                bool outerLabel = false;
+                bool outerLabel = sliceLabels && ringCount == 1;
                 ChartTextStyle lblStyle = null;
                 if (sl.seriesIndex >= 0 && sl.seriesIndex < o.series.Count) {
                     lblStyle = o.series[sl.seriesIndex].label;
-                    outerLabel = o.series[sl.seriesIndex].labelShow;
+                    if (o.series[sl.seriesIndex].labelShow) { outerLabel = true; }
                 }
-                int lblColor = 4294967295;
+                int lblColor = Chart.ContrastFg(sl.color);
                 if (lblStyle != null && lblStyle.color != 0) { lblColor = lblStyle.color; }
+                int outerFg = Style.Part(app, "chart", "label", "", "", "",
+                    Style.SNormal()).FgOr(0);
+                int lcx = cx;
+                int lcy = cy;
+                bool popL = sl.selected || p == hoverK
+                    || (sl.seriesIndex == hotSi && sl.dataIndex == hotDi);
+                if (popL && sl.seriesIndex >= 0
+                    && sl.seriesIndex < o.series.Count) {
+                    int offPx = app.Scale(o.series[sl.seriesIndex].selectedOffset);
+                    if (offPx < 1) { offPx = app.Scale(8); }
+                    int midPop = rot + (sl.a0 + sl.a1) / 2;
+                    lcx = cx + ChartView.FillDx(midPop) * offPx / 1000;
+                    lcy = cy + ChartView.FillDy(midPop) * offPx / 1000;
+                }
                 if (sl.a1 <= sweepMax && pct >= 4 && !outerLabel) {
                     int rLbl = 0;
                     if (ringCount > 1) {
@@ -311,8 +414,8 @@ partial class ChartView {
                         if (ri0 < app.Scale(4)) { rLbl = rOuter * 62 / 100; }
                     }
                     int mid = rot + (sl.a0 + sl.a1) / 2;
-                    int lxp = cx + ChartView.CosDeg(mid) * rLbl / 1000;
-                    int lyp = cy + ChartView.SinDeg(mid) * rLbl / 1000;
+                    int lxp = ChartView.FillX(lcx, rLbl, mid);
+                    int lyp = ChartView.FillY(lcy, rLbl, mid);
                     string pl = Convert.ToString(pct) + "%";
                     int pw = Canvas.MeasureText(pl, Style.FontFallback(app, "small"));
                     c.DrawText(lxp - pw / 2, Canvas.CenterTextYAt(lyp, Style.FontFallback(app, "small")),
@@ -320,16 +423,14 @@ partial class ChartView {
                 } else if (sl.a1 <= sweepMax && pct >= 2 && outerLabel) {
                     int roLbl = rOuter - ring * band;
                     int midO = rot + (sl.a0 + sl.a1) / 2;
-                    // 屏幕位置约定 pos=(CosDeg m, SinDeg m)，m 为屏幕角；
-                    // 与绘制循环同域平移后方向分量取 (SinDeg m, SinDeg m+270)。
-                    int dirX = ChartView.SinDeg(midO);
-                    int dirY = ChartView.SinDeg(midO + 270);
+                    int dirX = ChartView.FillDx(midO);
+                    int dirY = ChartView.FillDy(midO);
                     int l1 = app.Scale(12);
                     int tail = app.Scale(8);
-                    int x1 = cx + dirX * (roLbl + app.Scale(2)) / 1000;
-                    int y1 = cy + dirY * (roLbl + app.Scale(2)) / 1000;
-                    int x2 = cx + dirX * (roLbl + app.Scale(2) + l1) / 1000;
-                    int y2 = cy + dirY * (roLbl + app.Scale(2) + l1) / 1000;
+                    int x1 = lcx + dirX * (roLbl + app.Scale(2)) / 1000;
+                    int y1 = lcy + dirY * (roLbl + app.Scale(2)) / 1000;
+                    int x2 = lcx + dirX * (roLbl + app.Scale(2) + l1) / 1000;
+                    int y2 = lcy + dirY * (roLbl + app.Scale(2) + l1) / 1000;
                     bool rightSide = dirX >= 0;
                     int x3 = rightSide ? x2 + tail : x2 - tail;
                     c.DrawLine(x1, y1, x2, y2, sl.color, 1);
@@ -339,8 +440,14 @@ partial class ChartView {
                     txt = txt + Convert.ToString(pct) + "%";
                     int tw2 = Canvas.MeasureText(txt, Style.FontFallback(app, "small"));
                     int txp = rightSide ? x3 + app.Scale(3) : x3 - app.Scale(3) - tw2;
-                    c.DrawText(txp, Canvas.CenterTextYAt(y2, Style.FontFallback(app, "small")),
-                        txt, lblColor, Style.FontFallback(app, "small"));
+                    if (txp < x + pad) { txp = x + pad; }
+                    if (txp + tw2 > x + w - pad) { txp = x + w - pad - tw2; }
+                    int fsO = Style.FontFallback(app, "small");
+                    int tyo = Canvas.CenterTextYAt(y2, fsO);
+                    if (tyo < bodyY) { tyo = bodyY; }
+                    int tyMax = y + h - pad - Canvas.FontHeight(fsO);
+                    if (tyo > tyMax) { tyo = tyMax; }
+                    c.DrawText(txp, tyo, txt, outerFg, fsO);
                 }
             }
         }
@@ -362,60 +469,29 @@ partial class ChartView {
             ChartView.DrawPieMark(app, c, cx, cy, rOuter, rot, slices, worstI, "min", t);
         }
 
-        // 环形图中心标注：当前累计值，让中心空洞有意义。
-        int centerInner = rOuter * layout.ringInner[0] / 100;
-        if (ringCount == 1 && centerInner > app.Scale(18)) {
-            string tot = Convert.ToString(total);
-            int tw = Canvas.MeasureText(tot, Style.FontFallback(app, "large"));
-            c.DrawText(cx - tw / 2, Canvas.CenterTextYAt(cy, Style.FontFallback(app, "large")),
-                tot, Style.Part(app, "chart", "value", "", "", "", Style.SNormal()).FgOr(0),
-                Style.FontFallback(app, "large"));
-        }
-
-        // 图例：色块 + 名称 + 百分比（每可见扇区一行；始终绘制）。
-        if (o.showLegend) {
-            int lx = x + w - pad - legendW;
-            int ly = top;
-            int sw = app.Scale(12);
-            int lh = Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(6);
-            for (int j = 0; j < slices.Count; j = j + 1) {
-                PieSlice sl = slices[j];
-                int ringTot = total;
-                if (sl.ring < layout.ringTotal.Count && layout.ringTotal[sl.ring] > 0) {
-                    ringTot = layout.ringTotal[sl.ring];
+        // 环形图中心标注：选中扇区名优先，否则累计值。
+        if (ringCount == 1 && layout.ringInner.Count > 0) {
+            int centerInner = rOuter * layout.ringInner[0] / 100;
+            if (centerInner > app.Scale(18) && total > 0) {
+                string tot = Convert.ToString(total);
+                for (int ks = 0; ks < slices.Count; ks = ks + 1) {
+                    if (slices[ks].selected && slices[ks].name.Length > 0) {
+                        tot = slices[ks].name;
+                    }
                 }
-                // legend chip 命中：按 seriesIndex 注册 hit，悬停
-                // 时切 series[i].hidden 与 chart 现有的
-                // LegendKey(app, wid, si) 跨帧状态保持一致。
-                int hid = Chart.LegendKey(o.iwid, sl.seriesIndex);
-                app.hitTester.RegisterRect(hid, lx, ly, legendW, lh, 0);
-                bool seriesHidden = (sl.seriesIndex >= 0
-                    && sl.seriesIndex < o.series.Count
-                    && o.series[sl.seriesIndex].hidden);
-                int rowCol = seriesHidden ? Chart.WithAlpha(sl.color, 90) : sl.color;
-                c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, rowCol);
-                int pct = sl.value * 100 / ringTot;
-                string lbl = sl.name + "  " + Convert.ToString(pct) + "%";
-                int lblColor = Style.Part(app, "chart", "label", "", "", "",
-                                          Style.SNormal()).FgOr(0);
-                if (seriesHidden) {
-                    lblColor = Chart.WithAlpha(lblColor, 110);
-                }
-                c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1), lbl,
-                    lblColor, Style.FontFallback(app, "small"));
-                if (Ui.Clicked(app, hid) && sl.seriesIndex >= 0
-                    && sl.seriesIndex < o.series.Count) {
-                    ChartSeries ts = o.series[sl.seriesIndex];
-                    ts.hidden = !ts.hidden;
-                    app.RequestRedraw();
-                }
-                ly = ly + lh;
+                int tw = Canvas.MeasureText(tot, Style.FontFallback(app, "large"));
+                c.DrawText(cx - tw / 2, Canvas.CenterTextYAt(cy, Style.FontFallback(app, "large")),
+                    tot, Style.Part(app, "chart", "value", "", "", "", Style.SNormal()).FgOr(0),
+                    Style.FontFallback(app, "large"));
             }
         }
+
+        // 图例已在饼上方横向绘制。
 
         if (o.showTooltip) {
             int mx = app.mouseX;
             int my = app.mouseY;
+            if (my < bodyY) { return; }
             int ddx = mx - cx;
             int ddy = my - cy;
             int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
@@ -454,14 +530,19 @@ partial class ChartView {
                         }
                         int aEnd2 = sl.a1;
                         if (aEnd2 > sweepMax) { aEnd2 = sweepMax; }
-                        if (aEnd2 > sl.a0) {
-                            c.FillSector(cx, cy, ri, ro,
+                        if (aEnd2 > sl.a0 && hs2.itemStyle.emphasis.color != 0) {
+                            int offH = app.Scale(hs2.selectedOffset);
+                            if (offH < 1) { offH = app.Scale(8); }
+                            int midH = rot + (sl.a0 + sl.a1) / 2;
+                            int hcx = cx + ChartView.FillDx(midH) * offH / 1000;
+                            int hcy = cy + ChartView.FillDy(midH) * offH / 1000;
+                            c.FillSector(hcx, hcy, ri, ro,
                                 rot + sl.a0, rot + aEnd2, hiFill);
                             int bc = hs2.itemStyle.emphasis.borderColor;
                             int bw2 = hs2.itemStyle.emphasis.borderWidth;
                             if (bc == 0) { bc = hs2.itemStyle.normal.borderColor; }
                             if (bw2 <= 0) { bw2 = hs2.itemStyle.normal.borderWidth; }
-                            StrokeSector(c, cx, cy, ri, ro,
+                            StrokeSector(c, hcx, hcy, ri, ro,
                                 rot + sl.a0, rot + aEnd2, bc,
                                 app.Scale(bw2));
                         }
@@ -862,7 +943,7 @@ partial class ChartView {
 
         // 图例：色块 + 名称 + 值。
         int lx = x + w - pad - legendW;
-        int ly = top;
+        int ly = Chart.LegendStartY(app, y, top);
         int sw = app.Scale(12);
         int lh = Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(6);
         for (int j = 0; j < n; j = j + 1) {
@@ -922,7 +1003,13 @@ partial class ChartView {
         } else if (series.Count == 1) {
             int n = series[0].Count();
             for (int i = 0; i < n; i = i + 1) {
-                stages.Add(new ChartStage(series[0].Value(i), Chart.Palette(t, i), "", 0));
+                if (series[0].data[i].hidden) { continue; }
+                int col = Chart.Palette(t, i);
+                if (series[0].data[i].color != 0) { col = series[0].data[i].color; }
+                string nm = series[0].data[i].name;
+                ChartStage st = new ChartStage(series[0].Value(i), col, nm, 0);
+                st.dataIndex = i;
+                stages.Add(st);
             }
         }
         return stages;
@@ -937,14 +1024,21 @@ partial class ChartView {
         int pad = t.paddingMedium;
         int top = ChartView.PanelHead(app, x, y, w, h, o.title);
 
+        ChartView.ApplyDataLegend(app, o);
         List<ChartStage> stages = ChartView.GatherStages(app, o.series);
         int n = stages.Count;
-        if (n < 1) { return; }
+        int legendW = 0;
+        if (o.showLegend) { legendW = app.Scale(120); }
+        if (n < 1) {
+            if (o.showLegend) {
+                ChartView.DrawStageLegend(app, o, x + w - pad - legendW,
+                    Chart.LegendStartY(app, y, top), legendW);
+            }
+            return;
+        }
         int maxV = 1;
         foreach (ChartStage st in stages) { if (st.val > maxV) { maxV = st.val; } }
 
-        int legendW = 0;
-        if (o.showLegend) { legendW = app.Scale(120); }
         int areaW = w - pad * 2 - legendW;
         int areaH = (y + h - pad) - top;
         int cx = x + pad + areaW / 2;
@@ -1000,35 +1094,9 @@ partial class ChartView {
         }
 
         if (o.showLegend) {
-        int lx = x + w - pad - legendW;
-        int ly = top;
-        int sw = app.Scale(12);
-        int lh = Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(6);
-        for (int j = 0; j < n; j = j + 1) {
-            ChartStage st = stages[j];
-            // 图例命中 + 显隐切换（与 pie legend 统一路径）。
-            int hid = Chart.LegendKey(o.iwid, st.seriesIndex);
-            app.hitTester.RegisterRect(hid, lx, ly, legendW, lh, 0);
-            bool seriesHidden = (st.seriesIndex >= 0
-                && st.seriesIndex < o.series.Count
-                && o.series[st.seriesIndex].hidden);
-            int rowCol = seriesHidden ? Chart.WithAlpha(st.color, 90) : st.color;
-            c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, rowCol);
-            string nm = st.name;
-            if (nm.Length == 0) { nm = ChartView.StageName(j); }
-            string lbl = nm + "  " + Convert.ToString(st.val);
-            int lblColor = Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0);
-            if (seriesHidden) { lblColor = Chart.WithAlpha(lblColor, 110); }
-            c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1),
-                lbl, lblColor, Style.FontFallback(app, "small"));
-            if (Ui.Clicked(app, hid) && st.seriesIndex >= 0
-                && st.seriesIndex < o.series.Count) {
-                ChartSeries ts = o.series[st.seriesIndex];
-                ts.hidden = !ts.hidden;
-                app.RequestRedraw();
-            }
-            ly = ly + lh;
-        }
+            int lx = x + w - pad - legendW;
+            int ly = Chart.LegendStartY(app, y, top);
+            ChartView.DrawStageLegend(app, o, lx, ly, legendW);
         }
 
         if (o.showTooltip) {
@@ -1070,6 +1138,95 @@ c.DrawText(labelX, labelY, lblF, Style.Part(app, "chart",
 
     static string StageName(int i) { return "Stage " + Convert.ToString(i + 1); }
 
+    static int DrawStageLegendWrap(App app, ChartOption o, int x, int y, int w, int top) {
+        int pad = app.theme.paddingMedium;
+        int x0 = x + pad;
+        int xCur = x0;
+        int yCur = top;
+        int maxX = x + w - pad;
+        int rowH = Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(6);
+        int bodyY = top;
+        Theme t = app.theme;
+        if (o.series.Count > 1) {
+            for (int si = 0; si < o.series.Count; si = si + 1) {
+                ChartSeries s = o.series[si];
+                int col = s.color;
+                if (col == 0) { col = Chart.Palette(t, si); }
+                string nm = s.name;
+                if (nm.Length == 0) { nm = ChartView.StageName(si); }
+                int v = 0;
+                if (s.Count() > 0) { v = s.Value(0); }
+                string lbl = nm + "  " + Convert.ToString(v);
+                int cw = Chart.LegendChipW(app, lbl);
+                if (xCur > x0 && xCur + cw > maxX) {
+                    xCur = x0;
+                    yCur = yCur + rowH;
+                }
+                int key = 0;
+                if (o.iwid != 0) { key = Chart.LegendKey(o.iwid, si); }
+                Chart.DrawLegendChip(app, xCur, yCur, cw, rowH, col, lbl, s.hidden, key);
+                xCur = xCur + cw;
+                bodyY = yCur + rowH + app.Scale(4);
+            }
+        } else if (o.series.Count == 1) {
+            ChartSeries s = o.series[0];
+            for (int di = 0; di < s.data.Count; di = di + 1) {
+                int col = Chart.Palette(t, di);
+                if (s.data[di].color != 0) { col = s.data[di].color; }
+                string nm = s.data[di].name;
+                if (nm.Length == 0) { nm = ChartView.StageName(di); }
+                string lbl = nm + "  " + Convert.ToString(s.Value(di));
+                int cw = Chart.LegendChipW(app, lbl);
+                if (xCur > x0 && xCur + cw > maxX) {
+                    xCur = x0;
+                    yCur = yCur + rowH;
+                }
+                int key = 0;
+                if (o.iwid != 0) { key = Chart.LegendSliceKey(o.iwid, 0, di); }
+                Chart.DrawLegendChip(app, xCur, yCur, cw, rowH, col, lbl,
+                    s.data[di].hidden, key);
+                xCur = xCur + cw;
+                bodyY = yCur + rowH + app.Scale(4);
+            }
+        }
+        return bodyY;
+    }
+
+    static void DrawStageLegend(App app, ChartOption o, int lx, int ly, int legendW) {
+        Theme t = app.theme;
+        int lh = Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(6);
+        if (o.series.Count > 1) {
+            for (int si = 0; si < o.series.Count; si = si + 1) {
+                ChartSeries s = o.series[si];
+                int col = s.color;
+                if (col == 0) { col = Chart.Palette(t, si); }
+                string nm = s.name;
+                if (nm.Length == 0) { nm = ChartView.StageName(si); }
+                int v = 0;
+                if (s.Count() > 0) { v = s.Value(0); }
+                int key = 0;
+                if (o.iwid != 0) { key = Chart.LegendKey(o.iwid, si); }
+                Chart.DrawLegendChip(app, lx, ly, legendW, lh, col,
+                    nm + "  " + Convert.ToString(v), s.hidden, key);
+                ly = ly + lh;
+            }
+        } else if (o.series.Count == 1) {
+            ChartSeries s = o.series[0];
+            for (int di = 0; di < s.data.Count; di = di + 1) {
+                int col = Chart.Palette(t, di);
+                if (s.data[di].color != 0) { col = s.data[di].color; }
+                string nm = s.data[di].name;
+                if (nm.Length == 0) { nm = ChartView.StageName(di); }
+                int key = 0;
+                if (o.iwid != 0) { key = Chart.LegendSliceKey(o.iwid, 0, di); }
+                Chart.DrawLegendChip(app, lx, ly, legendW, lh, col,
+                    nm + "  " + Convert.ToString(s.Value(di)),
+                    s.data[di].hidden, key);
+                ly = ly + lh;
+            }
+        }
+    }
+
     // ---- 玫瑰图 / 南丁格尔图（等角，半径按值） ----
 
     static void DrawRose(App app, int x, int y, int w, int h,
@@ -1079,21 +1236,22 @@ c.DrawText(labelX, labelY, lblF, Style.Part(app, "chart",
         int pad = t.paddingMedium;
         int top = ChartView.PanelHead(app, x, y, w, h, o.title);
 
+        ChartView.ApplyDataLegend(app, o);
         List<ChartStage> stages = ChartView.GatherStages(app, o.series);
         int n = stages.Count;
+        int bodyY = top;
+        if (o.showLegend) {
+            bodyY = ChartView.DrawStageLegendWrap(app, o, x, y, w, top);
+        }
         if (n < 1) { return; }
         int maxV = 1;
         foreach (ChartStage st in stages) { if (st.val > maxV) { maxV = st.val; } }
 
-        int legendW = 0;
-        if (o.showLegend) { legendW = app.Scale(120); }
-        int areaW = w - pad * 2 - legendW;
-        int areaH = (y + h - pad) - top;
-        int rMax = areaW / 2;
-        if (areaH / 2 < rMax) { rMax = areaH / 2; }
-        if (rMax < app.Scale(10)) { rMax = app.Scale(10); }
+        int areaW = w - pad * 2;
+        int areaH = (y + h - pad) - bodyY;
+        int rMax = ChartView.RadialRadius(areaW, areaH, 58);
         int cx = x + pad + areaW / 2;
-        int cy = top + areaH / 2;
+        int cy = bodyY + areaH / 2;
         int sweepMax = 360 * g / 1000;
         // 模式与起始角取自首条可见玫瑰系列：
         //  radius —— 圆心角 ∝ 数值占比，半径线性于数值；
@@ -1150,41 +1308,10 @@ c.DrawText(labelX, labelY, lblF, Style.Part(app, "chart",
             }
         }
 
-        if (o.showLegend) {
-        int lx = x + w - pad - legendW;
-        int ly = top;
-        int sw = app.Scale(12);
-        int lh = Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(6);
-        for (int j = 0; j < n; j = j + 1) {
-            ChartStage st = stages[j];
-            int hid = Chart.LegendKey(o.iwid, st.seriesIndex);
-            app.hitTester.RegisterRect(hid, lx, ly, legendW, lh, 0);
-            bool seriesHidden = (st.seriesIndex >= 0
-                && st.seriesIndex < o.series.Count
-                && o.series[st.seriesIndex].hidden);
-            int rowCol = seriesHidden ? Chart.WithAlpha(st.color, 90) : st.color;
-            c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, rowCol);
-            string nm = st.name;
-            if (nm.Length == 0) { nm = "Item " + Convert.ToString(j + 1); }
-            int lblColor = Style.Part(app, "chart", "label", "", "", "",
-                                      Style.SNormal()).FgOr(0);
-            if (seriesHidden) { lblColor = Chart.WithAlpha(lblColor, 110); }
-            c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1),
-                nm + "  " + Convert.ToString(st.val), lblColor,
-                Style.FontFallback(app, "small"));
-            if (Ui.Clicked(app, hid) && st.seriesIndex >= 0
-                && st.seriesIndex < o.series.Count) {
-                ChartSeries ts = o.series[st.seriesIndex];
-                ts.hidden = !ts.hidden;
-                app.RequestRedraw();
-            }
-            ly = ly + lh;
-        }
-        }
-
         if (o.showTooltip) {
             int mx = app.mouseX;
             int my = app.mouseY;
+            if (my < bodyY) { return; }
             int ddx = mx - cx;
             int ddy = my - cy;
             int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);

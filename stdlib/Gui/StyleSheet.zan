@@ -42,6 +42,8 @@ class StyleSheet {
     /// （`button.ghost.primary:hover` 之类），先用这一个字符串比较筛掉，
     /// 就不必为每条规则再切分一次类名串。
     List<string> selClass0;
+    /// `[class*="frag"]` 要求的 class 属性子串（无该要求时为“”）。
+    List<string> selContains;
     List<string> selId;
     List<string> selPart;
     List<string> selState;
@@ -164,7 +166,7 @@ class StyleSheet {
                 int i;
                 if (ic < 0 || (ia >= 0 && ia < ic)) { i = ia; a = a + 1; }
                 else { i = ic; c = c + 1; }
-                if (this.Matches(i, type, want, id, part, stateBits)) {
+                if (this.Matches(i, type, want, id, part, stateBits, cls)) {
                     this.ApplyDecls(b, selBlock[i]);
                 }
             }
@@ -182,15 +184,21 @@ class StyleSheet {
         }
     }
 
-    /// 规则 `i` 是否选中给定的控件/部件/状态。
+    /// 规则 `i` 是否选中给定的控件/部件/状态。`cls` 是 class
+    /// 属性原文，供 `[class*="frag"]` 做子串匹配。
     bool Matches(int i, string type, List<string> classes, string id,
-                 string part, int stateBits) {
+                 string part, int stateBits, string cls) {
         if (selPart[i] != part) { return false; }
         if (selType[i] != "" && selType[i] != type) { return false; }
         if (selId[i] != "" && (id == "" || selId[i] != id)) { return false; }
         int mask = selStateMask[i];
         if (mask < 0) { return false; }
         if ((stateBits & mask) != mask) { return false; }
+        string contains = selContains[i];
+        if (contains != ""
+            && (cls == "" || StyleSheet.IndexOf(cls, contains) < 0)) {
+            return false;
+        }
         if (selClasses[i] == "") { return true; }
         if (!StyleSheet.Holds(classes, selClass0[i])) { return false; }
         List<string> need = Style.Classes(selClasses[i]);
@@ -240,6 +248,7 @@ class StyleSheet {
         selState = new List<string>();
         selStateMask = new List<int>();
         selClass0 = new List<string>();
+        selContains = new List<string>();
         selSpec = new List<int>();
         int i = 0;
         while (i < rules.Count()) {
@@ -259,6 +268,7 @@ class StyleSheet {
             selState.Insert(at, p.state);
             selStateMask.Insert(at, StyleSheet.StateMask(p.state));
             selClass0.Insert(at, StyleSheet.FirstClass(p.classes));
+            selContains.Insert(at, p.clsContains);
             selSpec.Insert(at, spec);
         }
         // 分桶要等排序完成再做：上面的 Insert 会挪动下标。
@@ -326,7 +336,8 @@ class StyleSheet {
         if (k == "font-size" || k == "font") {
             return StyleBox.SourceFont();
         }
-        if (k == "width" || k == "min-width" || k == "max-width") {
+        if (k == "width" || k == "min-width" || k == "max-width"
+                || k == "flex-basis") {
             return StyleBox.SourceWidth();
         }
         if (k == "height" || k == "min-height" || k == "max-height") {
@@ -335,7 +346,11 @@ class StyleSheet {
         if (k == "gap" || k == "row-gap" || k == "column-gap") {
             return StyleBox.SourceGap();
         }
-        if (k == "radius" || k == "border-radius") {
+        if (k == "radius" || k == "border-radius"
+                || k == "border-top-left-radius"
+                || k == "border-top-right-radius"
+                || k == "border-bottom-right-radius"
+                || k == "border-bottom-left-radius") {
             return StyleBox.SourceRadius();
         }
         if (k == "padding" || k == "pad" || k == "padding-left"
@@ -426,6 +441,22 @@ class StyleSheet {
             StyleSheet.DeclRadius(b, v);
             return true;
         }
+        if (k == "border-top-left-radius") {
+            StyleSheet.CornerRadius(b, 0, StyleSheet.Num(v));
+            return true;
+        }
+        if (k == "border-top-right-radius") {
+            StyleSheet.CornerRadius(b, 1, StyleSheet.Num(v));
+            return true;
+        }
+        if (k == "border-bottom-right-radius") {
+            StyleSheet.CornerRadius(b, 2, StyleSheet.Num(v));
+            return true;
+        }
+        if (k == "border-bottom-left-radius") {
+            StyleSheet.CornerRadius(b, 3, StyleSheet.Num(v));
+            return true;
+        }
         if (k == "box-shadow" || k == "shadow") { StyleSheet.DeclShadow(b, v); return true; }
         if (k == "border-style") {
             b.borderStyle = 0;
@@ -470,7 +501,19 @@ class StyleSheet {
         if (k == "min-height") { StyleSheet.DeclMetric(b, 3, v); return true; }
         if (k == "max-width") { StyleSheet.DeclMetric(b, 4, v); return true; }
         if (k == "max-height") { StyleSheet.DeclMetric(b, 5, v); return true; }
-        if (k == "gap") { b.gap = StyleSheet.Num(v); return true; }
+        // `gap: <both>` 或 `gap: <row> <column>`（CSS 简写：第一个值是
+        // 行距）。两个值时同时置上两根轴，`row-gap`/`column-gap`
+        // 仍可在其后单独覆盖。
+        if (k == "gap") {
+            List<string> g = StyleSheet.Tokens(v);
+            if (g.Count == 0) { return true; }
+            b.gap = StyleSheet.Num(g[0]);
+            if (g.Count >= 2) {
+                b.rowGap = StyleSheet.Num(g[0]);
+                b.colGap = StyleSheet.Num(g[1]);
+            }
+            return true;
+        }
         if (k == "row-gap") { b.rowGap = StyleSheet.Num(v); return true; }
         if (k == "column-gap") { b.colGap = StyleSheet.Num(v); return true; }
         if (k == "columns") { b.columns = StyleSheet.Num(v); return true; }
@@ -505,11 +548,7 @@ class StyleSheet {
             return true;
         }
         if (k == "justify-content") {
-            b.justify = 0;
-            if (v == "center") { b.justify = 1; }
-            if (v == "flex-end" || v == "end" || v == "right") { b.justify = 2; }
-            if (v == "space-between") { b.justify = 3; }
-            if (v == "space-around" || v == "space-evenly") { b.justify = 4; }
+            b.justify = StyleSheet.JustifyCode(v);
             return true;
         }
         if (k == "align-items") {
@@ -519,12 +558,53 @@ class StyleSheet {
             if (v == "flex-end" || v == "end" || v == "bottom") { b.alignItems = 3; }
             return true;
         }
+        // `flex-flow: <direction> || <wrap>`——两个值顺序任意，各自
+        // 可省。
+        if (k == "flex-flow") {
+            List<string> ff = StyleSheet.Tokens(v);
+            for (int i = 0; i < ff.Count; i = i + 1) {
+                string t = StyleSheet.Lower(ff[i]);
+                if (t == "row" || t == "row-reverse") { b.flexDir = 0; }
+                else if (t == "column" || t == "col" || t == "column-reverse") {
+                    b.flexDir = 1;
+                } else if (t == "wrap" || t == "wrap-reverse") { b.wrap = 1; }
+                else if (t == "nowrap") { b.wrap = 0; }
+            }
+            return true;
+        }
         if (k == "flex-wrap") {
             b.wrap = 0;
             if (v == "wrap" || v == "wrap-reverse") { b.wrap = 1; }
             return true;
         }
-        if (k == "flex" || k == "flex-grow") { b.grow = StyleSheet.Num(v); return true; }
+        if (k == "align-content") {
+            b.alignContent = StyleSheet.AlignContentCode(v);
+            return true;
+        }
+        if (k == "align-self") {
+            b.alignSelf = 0;
+            if (v == "auto") { b.alignSelf = 0 - 1; }
+            if (v == "flex-start" || v == "start" || v == "top") { b.alignSelf = 1; }
+            if (v == "center") { b.alignSelf = 2; }
+            if (v == "flex-end" || v == "end" || v == "bottom") { b.alignSelf = 3; }
+            return true;
+        }
+        // `place-content: <align-content> [<justify-content>]`——一个值时
+        // 两根轴取同一个（`place-content: center` 就是整块居中）。
+        if (k == "place-content") {
+            List<string> pc = StyleSheet.Tokens(v);
+            if (pc.Count == 0) { return true; }
+            b.alignContent = StyleSheet.AlignContentCode(StyleSheet.Lower(pc[0]));
+            string j = pc[0];
+            if (pc.Count >= 2) { j = pc[1]; }
+            b.justify = StyleSheet.JustifyCode(StyleSheet.Lower(j));
+            return true;
+        }
+        if (k == "flex") { StyleSheet.DeclFlex(b, v); return true; }
+        if (k == "flex-grow") { b.grow = StyleSheet.Num(v); return true; }
+        if (k == "flex-shrink") { b.shrink = StyleSheet.Num(v); return true; }
+        if (k == "flex-basis") { StyleSheet.DeclBasis(b, v); return true; }
+        if (k == "aspect-ratio") { StyleSheet.DeclAspect(b, v); return true; }
         if (k == "order") { b.order = StyleSheet.Num(v); return true; }
         if (k == "position") {
             b.position = 0;
@@ -536,6 +616,30 @@ class StyleSheet {
         if (k == "right") { b.posR = StyleSheet.Num(v); return true; }
         if (k == "bottom") { b.posB = StyleSheet.Num(v); return true; }
         if (k == "left") { b.posL = StyleSheet.Num(v); return true; }
+        // `inset: <all> | <v> <h> | <t> <h> <b> | <t> <r> <b> <l>`
+        // （四边偏移的简写，和 padding 同一套取值规则）。
+        if (k == "inset") {
+            List<string> ins = StyleSheet.Tokens(v);
+            if (ins.Count == 0) { return true; }
+            int t = StyleSheet.Num(ins[0]);
+            int r = t;
+            int bo = t;
+            int l = t;
+            if (ins.Count == 2) {
+                r = StyleSheet.Num(ins[1]);
+                l = r;
+            } else if (ins.Count == 3) {
+                r = StyleSheet.Num(ins[1]);
+                l = r;
+                bo = StyleSheet.Num(ins[2]);
+            } else if (ins.Count >= 4) {
+                r = StyleSheet.Num(ins[1]);
+                bo = StyleSheet.Num(ins[2]);
+                l = StyleSheet.Num(ins[3]);
+            }
+            b.posT = t; b.posR = r; b.posB = bo; b.posL = l;
+            return true;
+        }
         if (k == "overflow" || k == "overflow-y" || k == "overflow-x") {
             b.overflow = 0;
             if (v == "hidden" || v == "clip" || v == "auto" || v == "scroll") {
@@ -550,7 +654,81 @@ class StyleSheet {
             return true;
         }
         if (k == "cursor") { b.cursor = StyleSheet.CursorCode(v); return true; }
+        // 本引擎的盒子一律是 border-box（内边距与边框都在声明尺寸
+        // 之内），所以这条属性照收但不改任何东西——认下来是为了
+        // 让作者照常写它，而不是让它掉到 Control.SetProp 里去。
+        if (k == "box-sizing") { return true; }
         return false;
+    }
+
+    /// `justify-content` 的取值码：0 start，1 center，2 end，
+    /// 3 space-between，4 space-around/evenly。
+    static int JustifyCode(string v) {
+        if (v == "center") { return 1; }
+        if (v == "flex-end" || v == "end" || v == "right") { return 2; }
+        if (v == "space-between") { return 3; }
+        if (v == "space-around" || v == "space-evenly") { return 4; }
+        return 0;
+    }
+
+    /// `align-content` 的取值码：0 start，1 center，2 end，
+    /// 3 space-between，4 space-around/evenly，5 stretch。
+    static int AlignContentCode(string v) {
+        if (v == "center") { return 1; }
+        if (v == "flex-end" || v == "end" || v == "bottom") { return 2; }
+        if (v == "space-between") { return 3; }
+        if (v == "space-around" || v == "space-evenly") { return 4; }
+        if (v == "stretch") { return 5; }
+        return 0;
+    }
+
+    /// `flex: none | auto | initial | <grow> [<shrink> [<basis>]]`。
+    static void DeclFlex(StyleBox b, string val) {
+        string lo = StyleSheet.Lower(val);
+        if (lo == "none") { b.grow = 0; b.shrink = 0; return; }
+        if (lo == "auto") { b.grow = 1; b.shrink = 1; return; }
+        if (lo == "initial") { b.grow = 0; b.shrink = 1; return; }
+        List<string> toks = StyleSheet.Tokens(val);
+        if (toks.Count == 0) { return; }
+        b.grow = StyleSheet.Num(toks[0]);
+        if (toks.Count >= 2) { b.shrink = StyleSheet.Num(toks[1]); }
+        if (toks.Count >= 3) { StyleSheet.DeclBasis(b, toks[2]); }
+    }
+
+    /// `flex-basis: auto | content | <px> | <pct>`：主轴基准尺寸。
+    /// `auto` 撤销声明，回退到 width/height 或控件的测量偏好。
+    static void DeclBasis(StyleBox b, string val) {
+        string lo = StyleSheet.Lower(val);
+        if (lo == "auto" || lo == "content") {
+            b.basis = 0 - 1;
+            b.basisPm = 0 - 1;
+            return;
+        }
+        int n = StyleSheet.Num(val);
+        if (StyleSheet.IndexOf(val, "%") >= 0) {
+            b.basisPm = n * 10;
+            b.basis = 0 - 1;
+        } else {
+            b.basis = n;
+            b.basisPm = 0 - 1;
+        }
+    }
+
+    /// `aspect-ratio: auto | <w> / <h> | <ratio>`，存为千分比
+    /// （`16 / 9` -> 1778）。
+    static void DeclAspect(StyleBox b, string val) {
+        string lo = StyleSheet.Lower(val);
+        if (lo == "auto" || lo == "none") { b.aspect = 0; return; }
+        int slash = StyleSheet.IndexOf(val, "/");
+        if (slash >= 0) {
+            int w = StyleSheet.Num(StyleSheet.Trim(val.Substring(0, slash)));
+            int h = StyleSheet.Num(StyleSheet.Trim(
+                val.Substring(slash + 1, val.Length - slash - 1)));
+            if (h == 0) { b.aspect = 0; return; }
+            b.aspect = w * 1000 / h;
+            return;
+        }
+        b.aspect = StyleSheet.Perm(val);
     }
 
     /// motion：transition / transform / animation。
@@ -564,6 +742,16 @@ class StyleSheet {
             return true;
         }
         if (k == "transform") { StyleSheet.DeclTransform(b, v); return true; }
+        // 现代 CSS 里 translate/rotate/scale 也可以脱离 transform 单独
+        // 声明，写起来短得多（`rotate: 90` 而不是 `transform: rotate(90)`）。
+        if (k == "rotate") { b.rotate = StyleSheet.Num(v); return true; }
+        if (k == "scale") { b.scale = StyleSheet.Perm(v); return true; }
+        if (k == "translate") {
+            List<string> t = StyleSheet.Tokens(v);
+            if (t.Count >= 1) { b.tx = StyleSheet.Num(t[0]); }
+            if (t.Count >= 2) { b.ty = StyleSheet.Num(t[1]); }
+            return true;
+        }
         if (k == "animation" || k == "animation-name") {
             StyleSheet.DeclAnimation(b, v);
             return true;
@@ -736,6 +924,31 @@ class StyleSheet {
         if (tr > max) { max = tr; }
         if (br > max) { max = br; }
         if (bl > max) { max = bl; }
+        b.radius = max;
+    }
+
+    /// 单个角的圆角（`border-top-left-radius` 等，`which`：0 TL、
+    /// 1 TR、2 BR、3 BL）。
+    ///
+    /// 未被声明过的角先继承当前的 `radius`：StyleBox 用"四个角都
+    /// 未声明"表示全圆角，只写一个角的话另外三个必须落成具体值，
+    /// 否则 Corners() 会把它们当成直角，一条
+    /// `border-top-left-radius: 0` 就会把整个盒子削成方的。
+    static void CornerRadius(StyleBox b, int which, int v) {
+        int fb = b.radius;
+        if (fb < 0) { fb = 0; }
+        if (b.radiusTL < 0) { b.radiusTL = fb; }
+        if (b.radiusTR < 0) { b.radiusTR = fb; }
+        if (b.radiusBR < 0) { b.radiusBR = fb; }
+        if (b.radiusBL < 0) { b.radiusBL = fb; }
+        if (which == 0) { b.radiusTL = v; }
+        else if (which == 1) { b.radiusTR = v; }
+        else if (which == 2) { b.radiusBR = v; }
+        else { b.radiusBL = v; }
+        int max = b.radiusTL;
+        if (b.radiusTR > max) { max = b.radiusTR; }
+        if (b.radiusBR > max) { max = b.radiusBR; }
+        if (b.radiusBL > max) { max = b.radiusBL; }
         b.radius = max;
     }
 

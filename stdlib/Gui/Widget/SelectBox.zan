@@ -8,10 +8,23 @@ namespace Gui.Widget;
 class SelectOption {
     string label;
     bool chosen;
+    /// 表格式下拉（SelectBox.Table）里这一行除首列以外的单元格。
+    /// null 表示这条只有 label —— 普通列表模式下始终如此。
+    List<string> cells;
 
     SelectOption(string label, bool chosen) {
         this.label = label;
         this.chosen = chosen;
+        this.cells = null;
+    }
+
+    /// 第 `i` 列的文本（0 为 label 列），越界返回空串。
+    string Cell(int i) {
+        if (i <= 0) { return label; }
+        if (cells == null) { return ""; }
+        int j = i - 1;
+        if (j >= cells.Count) { return ""; }
+        return cells[j];
     }
 }
 
@@ -90,9 +103,24 @@ class SelectBox : Control {
     /// 且未按行注册命中区域，因此没有其他机制
     /// 会请求重绘光标下那行的帧。
     int hoverRow;
+    /// 悬停的选项变化时触发（`sel.Hover += h;`，用 Hovered() 读是哪一条）。
+    /// 没有它，调用方就只能靠自己在弹层几何上重算一遍鼠标位置 —— 而弹层
+    /// 的位置是框架翻转后决定的，外面根本算不准。
+    UiEvent Hover;
     /// 弹层列数：0 = 自动（多选框选项多于一屏时分成等宽多列，
     /// 而不是拉成一条长条），否则固定列数。
     int cols;
+    /// 表格式下拉的列标题；null = 普通单列列表。首列对应选项的
+    /// label，其余对应 SelectOption.cells。
+    List<string> headers;
+    /// 各列宽度（设备像素）。与 headers 一一对应。
+    List<int> colWidths;
+    /// 搜索框里的提示文字（filterable）。空则用 "Search"。
+    string filterHint;
+    /// 弹层宽度缓存。量一次即可：逐帧测量每条标签在上万条选项时
+    /// 就是每帧上万次文本测量，比真正的绘制还贵。
+    int popupW;
+    bool popupWDirty;
 
     static int Small() { return 0; }
     static int Medium() { return 1; }
@@ -132,9 +160,15 @@ class SelectBox : Control {
         this.wiresOwnEvents = true;
         this.lastModel = 0 - 1;
         this.lastData = 0 - 1;
+        this.headers = null;
+        this.colWidths = null;
+        this.filterHint = "";
+        this.popupW = 0;
+        this.popupWDirty = true;
         this.Change = new UiEvent();
         this.Open = new UiEvent();
         this.Close = new UiEvent();
+        this.Hover = new UiEvent();
     }
 
     /// 从普通标签列表构建选择框（JSON / 设计器 / 单行场景使用）。
@@ -167,6 +201,7 @@ class SelectBox : Control {
     }
 
     void SetOptionsText(string text) {
+        popupWDirty = true;
         opts = new List<SelectOption>();
         string current = "";
         for (int i = 0; i <= text.Length; i = i + 1) {
@@ -188,17 +223,88 @@ class SelectBox : Control {
         if (n < 0) { n = 0; }
         cols = n;
         scrollY = 0;
+        popupWDirty = true;
         return this;
+    }
+
+    /// 表格式下拉：弹层变成一张带列标题的表，每个选项占一行、
+    /// 每行按 `widths` 分列。首列是选项的 label（Text() 仍然返回它），
+    /// 其余列由 AddRow 提供。
+    ///
+    ///   SelectBox pick = new SelectBox("Pick a stock");
+    ///   pick.Table(new List<string>{ "Code", "Name", "Last" },
+    ///              new List<int>{ 90, 160, 90 });
+    ///   pick.AddRow(new List<string>{ "600519", "Kweichow", "1712.00" });
+    ///
+    /// 传 null 恢复普通列表。
+    SelectBox Table(List<string> titles, List<int> widths) {
+        headers = titles;
+        colWidths = widths;
+        scrollY = 0;
+        popupWDirty = true;
+        return this;
+    }
+
+    bool IsTable() {
+        return headers != null && colWidths != null && colWidths.Count > 0;
+    }
+
+    /// 表格式下拉的一行。`cells[0]` 是 label（首列），其余为后续列。
+    void AddRow(List<string> cells) {
+        if (cells == null || cells.Count == 0) { return; }
+        SelectOption o = new SelectOption(cells[0], false);
+        List<string> rest = new List<string>();
+        for (int i = 1; i < cells.Count; i = i + 1) { rest.Add(cells[i]); }
+        o.cells = rest;
+        opts.Add(o);
+        popupWDirty = true;
+    }
+
+    /// 表头高度（表格模式下弹层顶部占用的空间）。
+    int HeaderH(App app) {
+        if (!this.IsTable()) { return 0; }
+        return app.Scale(26);
+    }
+
+    /// 过滤后参与显示的行数。
+    int DisplayCount() {
+        List<int> vis = this.VisibleOpts();
+        if (vis == null) { return opts.Count; }
+        return vis.Count;
+    }
+
+    /// 显示行 -> 真实选项下标。过滤开着时经过滤表转换，否则同一个数。
+    /// 渲染、命中和悬停三处原本各自内联这段映射，任何一处写歪都表现为
+    /// 「点中的不是看到的那条」。
+    int RowToOpt(int row) {
+        List<int> vis = this.VisibleOpts();
+        if (vis == null) {
+            if (row < 0 || row >= opts.Count) { return 0 - 1; }
+            return row;
+        }
+        if (row < 0 || row >= vis.Count) { return 0 - 1; }
+        return vis[row];
+    }
+
+    /// 悬停中的选项下标，没有则 -1（配合 `Hover` 事件读取）。
+    int Hovered() { return hoverRow; }
+
+    /// 第 `i` 个选项的标签（越界返回空串）。悬停/选择事件给出的是下标，
+    /// 调用方要显示的是文字。
+    string OptionLabel(int i) {
+        if (i < 0 || i >= opts.Count) { return ""; }
+        return opts[i].label;
     }
 
     /// 本次开层实际的列数。自动时：单选保持单列（下拉就该是
     /// 一条列表）；多选超过一屏时按 maxVisible 分列，最多 4 列，
-    /// 这样一屏就能成行成列地看完。
+    /// 这样一屏就能成行成列地看完。表格模式恒为一列（列在行内部）。
     int ColumnCount() {
+        if (this.IsTable()) { return 1; }
         if (cols > 0) { return cols; }
         if (!multi) { return 1; }
         if (maxVisible <= 0) { return 1; }
-        int n = (opts.Count + maxVisible - 1) / maxVisible;
+        int n = (this.DisplayCount() + maxVisible - 1) / maxVisible;
         if (n < 1) { n = 1; }
         if (n > 4) { n = 4; }
         return n;
@@ -207,7 +313,7 @@ class SelectBox : Control {
     /// 当前列数下每列的行数。
     int RowCount() {
         int n = this.ColumnCount();
-        int rows = (opts.Count + n - 1) / n;
+        int rows = (this.DisplayCount() + n - 1) / n;
         if (rows < 1) { rows = 1; }
         return rows;
     }
@@ -221,6 +327,7 @@ class SelectBox : Control {
     void SetOpen(bool v) {
         if (open == v) { return; }
         open = v;
+        Console.WriteLine("SB SetOpen " + Convert.ToString(v)); // PROBE
         if (v) { scrollY = 0; Open.Raise(); }
         else { Close.Raise(); }
     }
@@ -268,6 +375,7 @@ class SelectBox : Control {
 
     void AddOption(string label) {
         opts.Add(new SelectOption(label, false));
+        popupWDirty = true;
     }
 
     SelectBox Clearable(bool v) {
@@ -298,13 +406,39 @@ class SelectBox : Control {
         return this;
     }
 
+    /// 搜索框的提示文字。不设则用 "Search"。
+    SelectBox FilterHint(string s) {
+        filterHint = s;
+        return this;
+    }
+
+    /// 当前搜索关键词（供调用方回显 / 远程搜索用）。
+    string FilterText() { return filterText; }
+
+    /// 以编程方式设置关键词并重建过滤结果。
+    void SetFilterText(string s) {
+        filterText = s;
+        scrollY = 0;
+        this.RebuildFilter();
+    }
+
     /// 根据 filterText 重建过滤索引列表（空文本/未启用 → 全量）。
+    /// 表格模式下匹配整行的所有单元格，否则只匹配 label：一张表里
+    /// 按代码搜和按名称搜同样自然，只认首列会让另一半列形同虚设。
     void RebuildFilter() {
+        popupWDirty = true;
         if (!filterable || filterText == "") { filteredIdx = null; return; }
         List<int> r = new List<int>();
         string q = filterText.ToLower();
+        bool tbl = this.IsTable();
         for (int i = 0; i < opts.Count; i = i + 1) {
-            if (opts[i].label.ToLower().Contains(q)) { r.Add(i); }
+            bool hit = opts[i].label.ToLower().Contains(q);
+            if (!hit && tbl) {
+                for (int j = 1; j < colWidths.Count; j = j + 1) {
+                    if (opts[i].Cell(j).ToLower().Contains(q)) { hit = true; break; }
+                }
+            }
+            if (hit) { r.Add(i); }
         }
         filteredIdx = r;
     }
@@ -344,6 +478,18 @@ class SelectBox : Control {
             opts[i].chosen = false;
         }
     }
+
+    /// 清空选项集（连同过滤结果与宽度缓存）。远程搜索每次换一批
+    /// 候选项时需要它。
+    void ClearOptions() {
+        opts = new List<SelectOption>();
+        selected = 0 - 1;
+        scrollY = 0;
+        filteredIdx = null;
+        popupWDirty = true;
+    }
+
+    int Count() { return opts.Count; }
 
     string Text() {
         if (multi) {
@@ -447,6 +593,7 @@ class SelectBox : Control {
         e.Add("SelectionChanged");
         e.Add("Open");
         e.Add("Close");
+        e.Add("Hover");
         return e;
     }
 
@@ -454,6 +601,7 @@ class SelectBox : Control {
         if (evt == "Change" || evt == "SelectionChanged") { Change.Add(a); return; }
         if (evt == "Open") { Open.Add(a); return; }
         if (evt == "Close") { Close.Add(a); return; }
+        if (evt == "Hover") { Hover.Add(a); return; }
         On.AddByName(evt, a);
     }
 
@@ -586,7 +734,27 @@ class SelectBox : Control {
     /// 弹层宽度：不窄于触发器，但至少能放下最长的一条；
     /// 多列时按列数等宽扩开。按触发器宽度开弹层会把每一条
     /// 都截成同一个前缀，选项之间看不出区别。
+    ///
+    /// 结果缓存在 popupW 里，只有选项集或过滤词变了才重新量：这段
+    /// 要遍历全部标签，而它每帧都被调用一次。一万条选项时那是每帧
+    /// 一万次 MeasureText —— 比画出来的十几行本身贵上三个数量级，
+    /// 也是长列表下拉「一开就卡」的真正来源（虚表只省了绘制）。
     int PopupWidth(App app, Theme t, int trigWidth, int fs, int arrowSlot) {
+        if (this.IsTable()) {
+            int sum = t.paddingSmall * 2;
+            for (int i = 0; i < colWidths.Count; i = i + 1) {
+                sum = sum + colWidths[i];
+            }
+            if (sum < trigWidth) { sum = trigWidth; }
+            int roomT = app.canvas.Width() - app.Scale(8);
+            if (sum > roomT) { sum = roomT; }
+            return sum;
+        }
+        if (!popupWDirty && popupW > 0) {
+            int w0 = popupW;
+            if (w0 < trigWidth) { w0 = trigWidth; }
+            return w0;
+        }
         int n = this.ColumnCount();
         int colW = trigWidth / n;
         int chrome = t.paddingSmall * 2 + arrowSlot;
@@ -598,13 +766,15 @@ class SelectBox : Control {
         if (w < trigWidth) { w = trigWidth; }
         int room = app.canvas.Width() - app.Scale(8);
         if (w > room) { w = room; }
+        popupW = w;
+        popupWDirty = false;
         return w;
     }
 
     /// 搜索框高度（filterable=true 时占用的顶部空间）。
-    int FilterBarH() {
+    int FilterBarH(App app) {
         if (!filterable) { return 0; }
-        return 32;
+        return app.Scale(32);
     }
 
     /// 过滤后参与渲染的选项索引（filterable + 关键词非空才过滤）。
@@ -634,14 +804,16 @@ class SelectBox : Control {
 
         int ek = app.EventKind();
 
+        // 过滤开着时 ColumnCount/RowCount 已按过滤后的条数算，
+        // 不需要再单独把行列数清零重排一遍。
         int nCols = this.ColumnCount();
         int nRows = this.RowCount();
-        // filterable 时每列只排一行（变成真正的下拉列表）。
-        if (filterable && filterText != "") { nCols = 1; nRows = 0; }
+        if (filterable && filterText != "") { nCols = 1; nRows = this.DisplayCount(); }
         int visRows = nRows;
         if (visRows > maxVisible) { visRows = maxVisible; }
-        int fbH = this.FilterBarH();
-        int viewH = OverlayPopup.FitH(app, visRows * optH + fbH);
+        int fbH = this.FilterBarH(app);
+        int hdH = this.HeaderH(app);
+        int viewH = OverlayPopup.FitH(app, visRows * optH + fbH + hdH);
         int contentH = nRows * optH;
         // 由框架放置，保证列表不超出窗口：
         // 靠近底部边缘时向上翻转，而不是
@@ -666,8 +838,10 @@ class SelectBox : Control {
             overClearBtn = overSearch
                 && app.mouseX >= searchBarX + searchBarW - clearBtnW;
             // 搜索框内接受键盘输入。
-            if (overSearch && ek == 4) {
+            if (ek == 4) {
                 int kc = app.window.EventKeyCode();
+                Console.WriteLine("SB key kc=" + Convert.ToString(kc) // PROBE
+                    + " overSearch=" + Convert.ToString(overSearch));
                 if (kc == 8) {
                     // Backspace：删掉最后一个字符。
                     if (filterText.Length > 0) {
@@ -697,9 +871,10 @@ class SelectBox : Control {
             }
         }
 
-        // 弹层内容区（选项列表）Y 起始：搜索框下方。
-        int listY = popY + searchBarH;
-        int listH = viewH - searchBarH;
+        // 弹层内容区（选项列表）Y 起始：搜索框与表头下方。
+        int headerY = popY + searchBarH;
+        int listY = headerY + hdH;
+        int listH = viewH - searchBarH - hdH;
         if (listH < 0) { listH = 0; }
         bool overPopup = app.mouseX >= popX && app.mouseX < popX + w
             && app.mouseY >= popY && app.mouseY < popY + viewH;
@@ -712,21 +887,20 @@ class SelectBox : Control {
         if (nCols > 1) { colW = w / nCols; }
         if (colW < 1) { colW = 1; }
         int over = 0 - 1;
-        if (overPopup && !overSearch) {
+        if (overPopup && !overSearch && app.mouseY >= listY) {
             int row = (app.mouseY - listY + scrollY) / optH;
             int col = (app.mouseX - popX) / colW;
             if (col >= nCols) { col = nCols - 1; }
             if (col < 0) { col = 0; }
-            int idx = col * nRows + row;
-            // 过滤模式下直接用 filteredIdx。
-            if (filterable && filterText != "" && filteredIdx != null) {
-                if (row >= 0 && row < filteredIdx.Count) { over = filteredIdx[row]; }
-            } else if (row >= 0 && row < nRows && idx < opts.Count) {
-                over = idx;
+            if (row >= 0 && row < nRows) {
+                over = this.RowToOpt(col * nRows + row);
             }
         }
         if (over != hoverRow) {
             hoverRow = over;
+            // 悬停变化对外是一个事件，而不是只让本控件换个底色：
+            // 详情面板 / 联动预览这类需求要的正是「现在指着哪一条」。
+            Hover.Raise();
             app.RequestRedraw();
         }
 
@@ -767,13 +941,13 @@ class SelectBox : Control {
             int clearBtnW = app.Scale(28);
             int textW = searchBarW - (textX - searchBarX) - clearBtnW - sbPad;
             if (textW > 0) {
-                if (filterText != "") {
-                    c.DrawText(textX, Canvas.CenterTextY(searchBarY, searchBarH, sbFs),
-                                filterText, textColor, sbFs);
-                } else {
-                    c.DrawText(textX, Canvas.CenterTextY(searchBarY, searchBarH, sbFs),
-                                "搜索...", textColor, sbFs);
+                string sbText = filterText;
+                if (sbText == "") {
+                    sbText = filterHint;
+                    if (sbText == "") { sbText = "Search"; }
                 }
+                c.DrawText(textX, Canvas.CenterTextY(searchBarY, searchBarH, sbFs),
+                            Ellipsis.Fit(sbText, textW, sbFs), textColor, sbFs);
             }
             // 清空按钮。
             if (filterText != "") {
@@ -785,25 +959,39 @@ class SelectBox : Control {
             }
         }
 
-        // ---- 选项列表渲染 ----
-        c.PushClip(popX, listY, w, listH);
-        // 过滤模式下重建行列数。
-        if (filterable && filterText != "" && filteredIdx != null) {
-            nRows = filteredIdx.Count;
-            visRows = nRows;
-            if (visRows > maxVisible) { visRows = maxVisible; }
-        }
-        for (int i = 0; i < opts.Count; i = i + 1) {
-            int realIdx = i;
-            if (filterable && filterText != "" && filteredIdx != null) {
-                if (i >= filteredIdx.Count) { break; }
-                realIdx = filteredIdx[i];
+        // ---- 表头（表格模式）----
+        if (hdH > 0) {
+            StyleBox hdStyle = this.ResolvePartAs(app, "select", "header", "",
+                                                  Class, Style.SNormal());
+            hdStyle.Paint(app, popX, headerY, w, hdH);
+            int hdFs = hdStyle.FontOr(fs);
+            int hdPad = hdStyle.PadLOr(t.paddingSmall);
+            int cx = popX + hdPad;
+            for (int ci = 0; ci < colWidths.Count; ci = ci + 1) {
+                string title = "";
+                if (ci < headers.Count) { title = headers[ci]; }
+                c.DrawText(cx, Canvas.CenterTextY(headerY, hdH, hdFs),
+                    Ellipsis.Fit(title, colWidths[ci] - app.Scale(6), hdFs),
+                    hdStyle.FgOr(pop.fg), hdFs);
+                cx = cx + colWidths[ci];
             }
-            int oCol = i / nRows;
-            int oRow = i % nRows;
-            int ox = popX + oCol * colW;
-            int oy = listY + oRow * optH - scrollY;
-            if (oy + optH > listY && oy < listY + listH) {
+        }
+
+        // ---- 选项列表渲染 ----
+        // 虚表：只走视口里的那几行。原来的循环每帧遍历全部选项，一万条
+        // 就是一万次迭代 + 一万次 Ellipsis.Fit（每次都要测文本），而屏幕上
+        // 只放得下十几行 —— 行数一多，弹层开着就等于持续满载。
+        c.PushClip(popX, listY, w, listH);
+        int firstRow = scrollY / optH;
+        if (firstRow < 0) { firstRow = 0; }
+        int lastRow = (scrollY + listH) / optH + 1;
+        if (lastRow > nRows) { lastRow = nRows; }
+        for (int oCol = 0; oCol < nCols; oCol = oCol + 1) {
+            for (int oRow = firstRow; oRow < lastRow; oRow = oRow + 1) {
+                int realIdx = this.RowToOpt(oCol * nRows + oRow);
+                if (realIdx < 0) { continue; }
+                int ox = popX + oCol * colW;
+                int oy = listY + oRow * optH - scrollY;
                 bool overRow = realIdx == hoverRow;
                 bool isSel = false;
                 if (multi) { isSel = opts[realIdx].chosen; }
@@ -817,11 +1005,24 @@ class SelectBox : Control {
                 row.Paint(app, ox + 1, oy, colW - 2, optH);
                 int rowFs = row.FontOr(fs);
                 int rowPad = row.PadLOr(t.paddingSmall);
-                int oMaxW = colW - rowPad - arrowSlot - t.paddingSmall;
-                c.DrawText(ox + rowPad,
-                    Canvas.CenterTextY(oy, optH, rowFs),
-                    Ellipsis.Fit(opts[realIdx].label, oMaxW, rowFs),
-                    row.fg, rowFs);
+                if (this.IsTable()) {
+                    // 一行按列宽切开，每格自己收省略号 —— 列因此是对齐的，
+                    // 而不是把整行拼成一个长字符串再统一截断。
+                    int cellX = ox + rowPad;
+                    for (int ci = 0; ci < colWidths.Count; ci = ci + 1) {
+                        c.DrawText(cellX, Canvas.CenterTextY(oy, optH, rowFs),
+                            Ellipsis.Fit(opts[realIdx].Cell(ci),
+                                         colWidths[ci] - app.Scale(6), rowFs),
+                            row.fg, rowFs);
+                        cellX = cellX + colWidths[ci];
+                    }
+                } else {
+                    int oMaxW = colW - rowPad - arrowSlot - t.paddingSmall;
+                    c.DrawText(ox + rowPad,
+                        Canvas.CenterTextY(oy, optH, rowFs),
+                        Ellipsis.Fit(opts[realIdx].label, oMaxW, rowFs),
+                        row.fg, rowFs);
+                }
                 if (isSel) {
                     StyleBox checkStyle = this.ResolvePartAs(app, "select", "checkmark", "",
                                                               Class, st);
@@ -860,20 +1061,25 @@ class SelectBox : Control {
 
         // ---- 弹层输入处理 ----
         if (app.ClickAvailable()) {
+            Console.WriteLine("SB click kind=" + Convert.ToString(ek) // PROBE
+                + " overSearch=" + Convert.ToString(overSearch)
+                + " overPopup=" + Convert.ToString(overPopup)
+                + " mx=" + Convert.ToString(app.mouseX)
+                + " my=" + Convert.ToString(app.mouseY));
             if (overSearch) {
                 // 搜索框区域点击不关闭弹层（输入已在上面处理）。
-            } else if (overPopup) {
+            } else if (overPopup && app.mouseY >= listY) {
                 int rel = app.mouseY - listY + scrollY;
                 int col = (app.mouseX - popX) / colW;
                 if (col >= nCols) { col = nCols - 1; }
                 if (col < 0) { col = 0; }
-                int idx = col * nRows + rel / optH;
-                int realIdx = idx;
-                if (filterable && filterText != "" && filteredIdx != null) {
-                    if (idx >= 0 && idx < filteredIdx.Count) { realIdx = filteredIdx[idx]; }
-                    else { realIdx = -1; }
+                int rowHit = rel / optH;
+                int realIdx = 0 - 1;
+                if (rowHit >= 0 && rowHit < nRows) {
+                    realIdx = this.RowToOpt(col * nRows + rowHit);
                 }
                 if (realIdx >= 0 && realIdx < opts.Count) {
+                    Console.WriteLine("SB pick idx=" + Convert.ToString(realIdx)); // PROBE
                     this.Choose(realIdx);
                     if (!multi) { this.SetOpen(false); }
                     app.ClaimClick();
@@ -881,6 +1087,7 @@ class SelectBox : Control {
                 }
             } else {
                 // 点击弹层外部任意位置（含触发器）即关闭。
+                Console.WriteLine("SB outside-close"); // PROBE
                 this.SetOpen(false);
                 app.RequestRedraw();
             }

@@ -27,71 +27,224 @@ partial class ChartView {
         c.SurfaceRoundRect(x, y, w, h, t.borderRadiusMedium, sPanel.BgOr(0), sPanel.BorderOr(0), 1);
         int top = y + pad;
         if (title.Length > 0) {
-            c.DrawText(x + pad, top, title, sPanel.FgOr(0), Style.FontFallback(app, "large"));
-        }
-        return top + Canvas.FontHeight(Style.FontFallback(app, "large")) + app.Scale(6);
-    }
-
-    // ---- 工具箱：图表右下角的 3 个浮动按钮（保存/数据视图/还原）----
-    // 按钮 id 跨帧稳定由 wid 派生（7000000+wid*3+k）。点击行为
-    // 最小化：保存调 Canvas.DumpRaw 把整张 surface 转 .raw，
-    // 数据视图切换 showValues、还原触发 RequestRedraw。
-    // 行为不依赖外部状态——任何 app 都能开箱即用。
-    static void DrawToolbox(App app, int x, int y, int w, int h, int wid) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int btnR = app.Scale(11);
-        int gap = app.Scale(4);
-        // 3 个按钮宽 + 2 个间隙，水平排列，右贴齐。
-        int rowW = btnR * 2 * 3 + gap * 2;
-        int baseX = x + w - app.Scale(t.paddingMedium) - rowW;
-        int baseY = y + h - app.Scale(t.paddingMedium) - btnR * 2;
-        int idBase = 7000000 + wid * 4;
-        // 外观全部来自 `chart::toolbox` 的 CSS 规则（base.css 提供默认，
-        // 皮肤可覆写）；代码只消费解析值，不兜底主题色。
-        StyleBox sBtn = Style.Full(app, "chart", "toolbox", "", Style.SNormal());
-        int bg = sBtn.BgOr(0);
-        int bd = sBtn.BorderOr(0);
-        int fg = sBtn.FgOr(0);
-        if (fg == 0) { fg = bg; }
-        string[] glyphs = new string[]{ "S", "D", "R" };  // Save / Data / Reset
-        for (int k = 0; k < 3; k = k + 1) {
-            int bx = baseX + k * (btnR * 2 + gap);
-            int by = baseY;
-            int cid = idBase + k;
-            c.FillRoundRect(bx, by, btnR * 2, btnR * 2, btnR, bg);
-            c.DrawRoundRect(bx, by, btnR * 2, btnR * 2, btnR, bd, 1);
-            c.DrawTextCentered(bx, by, btnR * 2, btnR * 2, glyphs[k], fg,
-                Style.FontFallback(app, "small"));
-            app.hitTester.RegisterRect(cid, bx, by, btnR * 2, btnR * 2, 0);
-            // 点击响应：直接由本渲染函数后续帧统一处理（避免
-            // 错过的本帧点击走专门的回调管线）。这里只更新状态。
-            if (Ui.Clicked(app, cid)) {
-                if (k == 0) {
-                    // 保存：把整张 surface 转存到 _scratch/uidrv/ 下的
-                    // chart_$wid.raw，dump2png 工具可直接还原。
-                    ChartView.tbSavePending = true;
-                    ChartView.tbSaveWid = wid;
-                } else if (k == 1) {
-                    // 数据视图：翻转 o.showValues；让 ChartView 在
-                    // 下一次 Render 读 Resolved.DrawOption 时也带上。
-                    ChartView.tbDataViewPending = true;
-                    ChartView.tbDataViewWid = wid;
-                } else {
-                    // 还原：重置缩放窗口（iwid 槽位的 zoomStart/End
-                    // 归位）+ 强制重绘。chart 层只发起重绘请求。
-                    app.RequestRedraw();
-                }
+            int titleFs = Style.FontFallback(app, "large");
+            int titleH = Canvas.FontHeight(titleFs);
+            int titleMax = x + w - pad - Chart.toolReserve - (x + pad) - app.Scale(8);
+            if (titleMax > 0) {
+                c.PushClip(x + pad, top, titleMax, titleH);
+                c.DrawText(x + pad, top, title, sPanel.FgOr(0), titleFs);
+                c.PopClip();
             }
         }
+        return Chart.HeadBandBottom(app, y, title);
     }
 
-    // toolbox 按钮点击后挂起状态。Render 后由 App/ChartView
-    // 的本帧末统一执行。简单字符串级 inband 信令。
+    // ---- 工具箱：图表右上角图标按钮组 + tip（见 ChartToolbox）----
+    static void DrawToolbox(App app, int x, int y, int w, int h,
+                            int wid, ChartOption o) {
+        ChartToolbox.Draw(app, x, y, w, h, wid, o);
+    }
+
+    static void ToolboxRestore(App app, int wid, ChartOption o) {
+        app.StateSet(Chart.TbMagicKey(wid), 0);
+        app.StateSet(Chart.TbZoomKey(wid), 0);
+        app.StateSet(Chart.TbViewKey(wid), 0);
+        app.StateSet(Chart.ZoomLoKey(wid), o.zoomStart * 10);
+        app.StateSet(Chart.ZoomHiKey(wid), o.zoomEnd * 10);
+        app.StateSet(Chart.MapZoomKey(wid), 100);
+        app.StateSet(Chart.MapPanXKey(wid), 0);
+        app.StateSet(Chart.MapPanYKey(wid), 0);
+        app.StateSet(Chart.MapSelKey(wid), 0 - 1);
+        app.StateSet(Chart.TreeZoomKey(wid), 0);
+        app.StateSet(Chart.TreePanXKey(wid), 0);
+        app.StateSet(Chart.TreePanYKey(wid), 0);
+        int n = 1;
+        if (o.series.Count > n) { n = o.series.Count; }
+        for (int si = 0; si < n; si = si + 1) {
+            app.StateSet(Chart.LegendKey(wid, si), 0);
+            int dn = 32;
+            if (si < o.series.Count && o.series[si].data.Count > dn) {
+                dn = o.series[si].data.Count;
+            }
+            for (int di = 0; di < dn; di = di + 1) {
+                app.StateSet(Chart.LegendSliceKey(wid, si, di), 0);
+                app.StateSet(Chart.PieSelKey(wid, si, di), 0);
+            }
+        }
+        app.AnimRestart(5000000 + wid, o.animMs);
+        app.RequestRedraw();
+    }
+
+    static void DrawDataView(App app, int x, int y, int w, int h,
+                             int wid, ChartOption o) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        c.FillRect(x, y, w, h, Chart.WithAlpha(Style.Part(app, "chart",
+            "dataview-scrim", "", "", "", Style.SNormal()).BgOr(0), 220));
+        int pad = app.Scale(16);
+        int cardX = x + pad;
+        int cardY = y + pad;
+        int cardW = w - pad * 2;
+        int cardH = h - pad * 2;
+        StyleBox sPanel = Style.Full(app, "chart", "", "", Style.SNormal());
+        c.FillRoundRect(cardX, cardY, cardW, cardH, t.borderRadiusMedium,
+            sPanel.BgOr(0));
+        c.DrawRoundRect(cardX, cardY, cardW, cardH, t.borderRadiusMedium,
+            sPanel.BorderOr(0), 1);
+        int fs = Style.FontFallback(app, "small");
+        int lh = Canvas.FontHeight(fs) + app.Scale(4);
+        c.DrawText(cardX + pad, cardY + app.Scale(10), "数据视图",
+            sPanel.FgOr(0), Style.FontFallback(app, "large"));
+        string body = ChartView.OptionTsv(o);
+        int ty = cardY + app.Scale(40);
+        int maxY = cardY + cardH - app.Scale(48);
+        int start = 0;
+        while (start <= body.Length && ty + lh < maxY) {
+            int nl = start;
+            while (nl < body.Length && body[nl] != 10) { nl = nl + 1; }
+            string line = body.Substring(start, nl - start);
+            c.DrawText(cardX + pad, ty, line, sPanel.FgOr(0), fs);
+            ty = ty + lh;
+            if (nl >= body.Length) { start = body.Length + 1; }
+            else { start = nl + 1; }
+        }
+        int bw = app.Scale(72);
+        int bh = app.Scale(26);
+        int by = cardY + cardH - pad - bh;
+        int copyX = cardX + pad;
+        int closeX = copyX + bw + app.Scale(8);
+        int copyId = Chart.TbHitKey(wid, 6);
+        int closeId = Chart.TbHitKey(wid, 7);
+        StyleBox sCopy = Style.Part(app, "chart", "dataview-btn", "",
+            "primary", "", Style.SNormal());
+        c.FillRoundRect(copyX, by, bw, bh, app.Scale(4), sCopy.BgOr(0));
+        c.DrawTextCentered(copyX, by, bw, bh, "复制", sCopy.FgOr(0), fs);
+        StyleBox sClose = Style.Part(app, "chart", "dataview-btn", "", "", "",
+            Style.SNormal());
+        c.FillRoundRect(closeX, by, bw, bh, app.Scale(4), sClose.BgOr(0));
+        c.DrawTextCentered(closeX, by, bw, bh, "关闭", sPanel.FgOr(0), fs);
+        app.hitTester.RegisterRect(copyId, copyX, by, bw, bh, 0);
+        app.hitTester.RegisterRect(closeId, closeX, by, bw, bh, 0);
+        if (Ui.Clicked(app, copyId)) { Clipboard.SetText(body); }
+        if (Ui.Clicked(app, closeId)) {
+            app.StateSet(Chart.TbViewKey(wid), 0);
+            app.RequestRedraw();
+        }
+    }
+
+    static string OptionTsv(ChartOption o) {
+        string s = o.title;
+        if (s.Length < 1) { s = "chart"; }
+        s = s + "\n";
+        List<string> cats = o.XCategories();
+        if (cats.Count > 0) {
+            s = s + "category";
+            for (int i = 0; i < o.series.Count; i = i + 1) {
+                s = s + "\t" + o.series[i].name;
+            }
+            s = s + "\n";
+            int n = cats.Count;
+            for (int r = 0; r < n; r = r + 1) {
+                s = s + cats[r];
+                for (int i = 0; i < o.series.Count; i = i + 1) {
+                    ChartSeries cs = o.series[i];
+                    int v = 0;
+                    if (r < cs.Count()) { v = cs.Value(r); }
+                    s = s + "\t" + Convert.ToString(v);
+                }
+                s = s + "\n";
+            }
+            return s;
+        }
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            ChartSeries cs = o.series[i];
+            s = s + cs.name + "\n";
+            for (int d = 0; d < cs.data.Count; d = d + 1) {
+                ChartData cd = cs.data[d];
+                string nm = cd.name;
+                if (nm.Length < 1) { nm = Convert.ToString(d); }
+                s = s + nm + "\t" + Convert.ToString(cd.val) + "\n";
+            }
+            for (int r = 0; r < cs.regions.Count; r = r + 1) {
+                ChartMapRegion mr = cs.regions[r];
+                s = s + mr.name + "\t" + Convert.ToString(mr.value) + "\n";
+            }
+            for (int k = 0; k < cs.links.Count; k = k + 1) {
+                ChartLink lk = cs.links[k];
+                s = s + lk.from + "\t" + lk.to + "\t" + Convert.ToString(lk.val) + "\n";
+            }
+        }
+        return s;
+    }
+
+    static void FlushToolboxSave(App app, int wid) {
+        if (!ChartView.tbSavePending) { return; }
+        if (ChartView.tbSaveWid != wid) { return; }
+        ChartView.tbSavePending = false;
+        string path = "chart_" + Convert.ToString(wid) + ".png";
+        app.canvas.WritePixels(path, ChartView.tbSaveX, ChartView.tbSaveY,
+            ChartView.tbSaveW, ChartView.tbSaveH);
+    }
+
     static bool tbSavePending;
     static int tbSaveWid;
-    static bool tbDataViewPending;
-    static int tbDataViewWid;
+    static int tbSaveX;
+    static int tbSaveY;
+    static int tbSaveW;
+    static int tbSaveH;
+
+    static void QueueToolboxSave(int wid, int x, int y, int w, int h) {
+        ChartView.tbSavePending = true;
+        ChartView.tbSaveWid = wid;
+        ChartView.tbSaveX = x;
+        ChartView.tbSaveY = y;
+        ChartView.tbSaveW = w;
+        ChartView.tbSaveH = h;
+    }
+
+    /// Win32/SDL 滚轮键码是 ±120/格，不是 ±1。按格数用会把
+    /// 缩放乘爆（1.15^120）再把 pan 甩出 int 范围，图就「滚没了」。
+    static int WheelTicks(App app) {
+        int d = Ui.WheelDelta(app);
+        if (d == 0) { return 0; }
+        int t = d / 120;
+        if (t == 0) {
+            if (d > 0) { t = 1; } else { t = 0 - 1; }
+        }
+        if (t > 8) { t = 8; }
+        if (t < 0 - 8) { t = 0 - 8; }
+        return t;
+    }
+
+    static int ZoomByTicks(int zoom, int ticks, int lo, int hi) {
+        int next = zoom;
+        int s = ticks;
+        while (s > 0) {
+            int n = next * 115 / 100;
+            if (n <= next) { n = next + 1; }
+            next = n;
+            if (next >= hi) { next = hi; s = 0; } else { s = s - 1; }
+        }
+        while (s < 0) {
+            int n = next * 100 / 115;
+            if (n >= next) { n = next - 1; }
+            next = n;
+            if (next <= lo) { next = lo; s = 0; } else { s = s + 1; }
+        }
+        if (next < lo) { next = lo; }
+        if (next > hi) { next = hi; }
+        return next;
+    }
+
+    static int ClampPan(int pan, int content, int view) {
+        int slack = content + view;
+        if (slack < view) { slack = view; }
+        int lo = 0 - slack;
+        int hi = content + slack;
+        if (pan < lo) { return lo; }
+        if (pan > hi) { return hi; }
+        return pan;
+    }
     // ---- 悬停十字准线 + 数值提示（笛卡尔图表） ----
     // baseIdx 是 dataZoom 窗口起点：labels 已是窗口内子列表，
     // 系列值按窗口内索引 baseIdx + idx 读取（无 zoom 时为 0）。
@@ -100,67 +253,59 @@ partial class ChartView {
                                  List<ChartSeries> series, int maxV,
                                  int step, int half, int baseIdx) {
         Canvas c = app.canvas;
-        Theme t = app.theme;
         int mx = app.mouseX;
         int my = app.mouseY;
         bool inside = mx >= f.plotX && mx < f.plotX + f.plotW
             && my >= f.plotY && my < f.plotY + f.plotH;
         if (!inside) { return; }
         int n = labels.Count;
-        if (n < 1 || step < 1) { return; }
-        int idx = (mx - f.plotX) / step;
+        if (n < 1) { return; }
+        int idx = (mx - f.plotX) * n / f.plotW;
         if (idx < 0) { idx = 0; }
         if (idx > n - 1) { idx = n - 1; }
 
-        int gx = f.plotX + idx * step + half;
-        // axisPointer 竖线（ECharts cross）：1px 半透明线，居中
-        // 落在数据点上；不再使用 2px 实心（2px 在折线族看起来像柱，
-        // 与数据点混淆）。alpha 80 让线"穿过"图形而不抢眼。
+        int gx = f.CatMid(idx, n);
         int crossCol = Style.Part(app, "chart", "crosshair", "", "", "",
                                   Style.SNormal()).BgOr(0);
-        if (crossCol == 0) { return; }
-        crossCol = Chart.WithAlpha(crossCol, 200);
-        c.FillRect(gx, f.plotY, 1, f.plotH, crossCol);
-        // axisPointer 横线：在鼠标 y 处贯通整个绘图区，作为
-        // 高度参考；ECharts axisPointer.type='line' 行为一致。
-        if (my > f.plotY && my < f.plotY + f.plotH) {
-            c.FillRect(f.plotX, my, f.plotW, 1, crossCol);
+        if (crossCol != 0) {
+            int lineCol = Chart.WithAlpha(crossCol, 200);
+            c.FillRect(gx, f.plotY, 1, f.plotH, lineCol);
+            if (my > f.plotY && my < f.plotY + f.plotH) {
+                c.FillRect(f.plotX, my, f.plotW, 1, lineCol);
+            }
+            int fs = Style.FontFallback(app, "small");
+            int chipH = Canvas.FontHeight(fs);
+            int labelFg = Style.Part(app, "chart", "crosshair-label", "", "",
+                "", Style.SNormal()).FgOr(0);
+            string lblX = labels[idx];
+            int xw = Canvas.MeasureText(lblX, fs);
+            int lxX = gx - xw / 2;
+            if (lxX < f.plotX) { lxX = f.plotX; }
+            if (lxX + xw > f.plotX + f.plotW) { lxX = f.plotX + f.plotW - xw; }
+            int lyX = f.plotY + f.plotH - chipH - app.Scale(2);
+            c.FillRoundRect(lxX - app.Scale(2), lyX, xw + app.Scale(4),
+                chipH, app.Scale(2), crossCol);
+            c.DrawText(lxX, lyX, lblX, labelFg, fs);
+
+            int ticks = 4;
+            if (ticks < 1) { ticks = 1; }
+            int yIdx = ticks - (my - f.plotY) * ticks / f.plotH;
+            if (yIdx < 0) { yIdx = 0; }
+            if (yIdx > ticks) { yIdx = ticks; }
+            int vAt = yIdx * maxV / ticks;
+            string lblY = Convert.ToString(vAt);
+            int yw = Canvas.MeasureText(lblY, fs);
+            int lxY = f.plotX + app.Scale(2);
+            int lyY = Canvas.CenterTextYAt(my, fs);
+            if (lyY < f.plotY) { lyY = f.plotY; }
+            if (lyY + chipH > f.plotY + f.plotH) {
+                lyY = f.plotY + f.plotH - chipH;
+            }
+            c.FillRoundRect(lxY, lyY, yw + app.Scale(4), chipH,
+                app.Scale(2), crossCol);
+            c.DrawText(lxY + app.Scale(2), lyY, lblY, labelFg, fs);
         }
 
-        // axisPointer axis label：ECharts axisPointer 实际上包含
-        // 沿轴的小标签（底轴显示类别，左轴显示数值）。这里也画——
-        // X 类别在底轴正下方，Y 数值（用 maxV 的最近刻度）在左轴
-        // 正左方。颜色与竖线一致，让"准线"和"标签"作为一个整体。
-        int fs = Style.FontFallback(app, "small");
-        string lblX = labels[idx];
-        int xw = Canvas.MeasureText(lblX, fs);
-        int lxX = gx - xw / 2;
-        if (lxX < f.plotX) { lxX = f.plotX; }
-        if (lxX + xw > f.plotX + f.plotW) { lxX = f.plotX + f.plotW - xw; }
-        int lyX = f.plotY + f.plotH + app.Scale(2);
-        c.FillRoundRect(lxX - app.Scale(2), lyX, xw + app.Scale(4),
-            Canvas.FontHeight(fs), app.Scale(2), crossCol);
-        int labelFg = Style.Part(app, "chart", "crosshair-label", "", "",
-            "", Style.SNormal()).FgOr(crossCol);
-        c.DrawText(lxX, lyX, lblX, labelFg, fs);
-
-        // Y 轴 label（最近刻度数值）— 沿左轴外侧。
-        int ticks = 4;
-        if (ticks < 1) { ticks = 1; }
-        int yIdx = ticks - (my - f.plotY) * ticks / f.plotH;
-        if (yIdx < 0) { yIdx = 0; }
-        if (yIdx > ticks) { yIdx = ticks; }
-        int vAt = yIdx * maxV / ticks;
-        string lblY = Convert.ToString(vAt);
-        int yw = Canvas.MeasureText(lblY, fs);
-        int lxY = f.plotX - yw - app.Scale(6);
-        if (lxY < 0) { lxY = 0; }
-        int lyY = my - Canvas.FontHeight(fs) / 2;
-        c.FillRoundRect(lxY - app.Scale(2), lyY, yw + app.Scale(4),
-            Canvas.FontHeight(fs), app.Scale(2), crossCol);
-        c.DrawText(lxY, lyY, lblY, labelFg, fs);
-
-        // 提示卡片：类别标签 + 每个*可见*序列的值 + 色块。
         List<TooltipRow> rows = new List<TooltipRow>();
         rows.Add(TooltipRow.Of(0, labels[idx]));
         int oi = baseIdx + idx;
@@ -227,7 +372,6 @@ partial class ChartView {
         ChartView.tipPx = px;
         ChartView.tipPy = py;
         ChartView.tipRight = maxRight;
-        app.RequestRedraw();
     }
 
     /// 绘制本帧请求的图表提示卡片（若有）并清空队列。
@@ -247,13 +391,13 @@ partial class ChartView {
             if (w2 + app.Scale(30) > boxW) { boxW = w2 + app.Scale(30); }
         }
         int boxH = rowCount * lh + app.Scale(10);
-        int bx = ChartView.tipPx + app.Scale(10);
-        if (bx + boxW > ChartView.tipRight) { bx = ChartView.tipPx - app.Scale(10) - boxW; }
-        if (bx < app.Scale(2)) { bx = app.Scale(2); }
-        // 默认在指针下方；会超出画布底部时翻转到上方，
-        // 确保卡片永不被窗口边缘裁剪。
-        int by = ChartView.tipPy + app.Scale(8);
         int margin = app.Scale(4);
+        int bx = ChartView.tipPx + app.Scale(10);
+        int cW = c.Width();
+        if (bx + boxW > ChartView.tipRight) { bx = ChartView.tipPx - app.Scale(10) - boxW; }
+        if (bx + boxW > cW - margin) { bx = cW - margin - boxW; }
+        if (bx < margin) { bx = margin; }
+        int by = ChartView.tipPy + app.Scale(8);
         int cH = c.Height();
         if (by + boxH > cH - margin) {
             by = ChartView.tipPy - app.Scale(8) - boxH;
@@ -262,7 +406,10 @@ partial class ChartView {
 
         StyleBox sTip = Style.Part(app, "chart", "tooltip", "", "", "",
                                    Style.SNormal());
-        c.SurfaceRoundRect(bx, by, boxW, boxH, t.borderRadiusMedium, sTip.BgOr(0), sTip.BorderOr(0), 1);
+        int tipBg = sTip.BgOr(0);
+        int tipBd = sTip.BorderOr(0);
+        int tipFg = sTip.FgOr(0);
+        c.SurfaceRoundRect(bx, by, boxW, boxH, t.borderRadiusMedium, tipBg, tipBd, 1);
         int ty = by + app.Scale(5);
         for (int ri = 0; ri < rowCount; ri = ri + 1) {
             int sw = app.Scale(9);
@@ -272,7 +419,7 @@ partial class ChartView {
                     t.borderRadiusSmall, row.color);
             }
             c.DrawText(bx + app.Scale(8) + sw + app.Scale(6), ty, row.text,
-                sTip.FgOr(0), fs);
+                tipFg, fs);
             ty = ty + lh;
         }
     }
@@ -307,9 +454,11 @@ partial class ChartView {
         if (!o.markPoint && s.marks.Count < 1) { return; }
         int maxI = ChartView.SeriesMaxIndex(s, i0, i1);
         int minI = ChartView.SeriesMinIndex(s, i0, i1);
+        int nWin = i1 - i0 + 1;
+        if (nWin < 1) { nWin = 1; }
         if (o.markPoint) {
-            if (maxI >= 0) { ChartView.MarkAt(app, f, s, maxI, maxI - i0, step, half, "max"); }
-            if (minI >= 0 && minI != maxI) { ChartView.MarkAt(app, f, s, minI, minI - i0, step, half, "min"); }
+            if (maxI >= 0) { ChartView.MarkAt(app, f, s, maxI, maxI - i0, nWin, "max"); }
+            if (minI >= 0 && minI != maxI) { ChartView.MarkAt(app, f, s, minI, minI - i0, nWin, "min"); }
         }
         for (int mi = 0; mi < s.marks.Count; mi = mi + 1) {
             ChartMarkPoint m = s.marks[mi];
@@ -326,18 +475,18 @@ partial class ChartView {
                 else if (m.kind == "min") { lbl = "min"; }
                 else { lbl = Convert.ToString(s.Value(idx)); }
             }
-            ChartView.MarkAt(app, f, s, idx, idx - i0, step, half, lbl);
+            ChartView.MarkAt(app, f, s, idx, idx - i0, nWin, lbl);
         }
     }
 
     // 在数据点（类别下标 idx，槽位 slot = idx - i0）上绘制单个
     // 标记：系列色实心圆 + 白描边 + 上方小标签。
     static void MarkAt(App app, ChartFrame f, ChartSeries s, int idx,
-                       int slot, int step, int half, string lbl) {
+                       int slot, int nWin, string lbl) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int rad = app.Scale(4);
-        int lx = f.plotX + slot * step + half;
+        int lx = f.CatMid(slot, nWin);
         int ly = f.YOf(s.Value(idx), s.axisIndex);
         c.FillCircle(lx, ly, rad, s.color);
         ChartView.RingOutline(c, lx, ly, rad, 4294967295);
@@ -465,6 +614,60 @@ partial class ChartView {
         }
     }
 
+    // 非零环绕填充：弦图缎带过圆心自交，偶奇规则会挖空。
+    static void FillPolyWinding(Canvas c, List<int> px, List<int> py,
+                                int color, int alpha) {
+        int n = px.Count;
+        if (n < 3 || py.Count < n) { return; }
+        int y0 = py[0];
+        int y1 = py[0];
+        for (int i = 1; i < n; i = i + 1) {
+            if (py[i] < y0) { y0 = py[i]; }
+            if (py[i] > y1) { y1 = py[i]; }
+        }
+        List<int> xs = new List<int>();
+        List<int> ds = new List<int>();
+        for (int y = y0; y <= y1; y = y + 1) {
+            xs.Clear();
+            ds.Clear();
+            for (int i2 = 0; i2 < n; i2 = i2 + 1) {
+                int j = i2 + 1;
+                if (j == n) { j = 0; }
+                int ya = py[i2];
+                int yb = py[j];
+                if (ya == yb) { continue; }
+                if ((y >= ya && y < yb) || (y >= yb && y < ya)) {
+                    xs.Add(px[i2] + (y - ya) * (px[j] - px[i2]) / (yb - ya));
+                    int dir = 1;
+                    if (yb < ya) { dir = 0 - 1; }
+                    ds.Add(dir);
+                }
+            }
+            for (int a = 1; a < xs.Count; a = a + 1) {
+                int v = xs[a];
+                int d = ds[a];
+                int b = a - 1;
+                while (b >= 0 && xs[b] > v) {
+                    xs[b + 1] = xs[b];
+                    ds[b + 1] = ds[b];
+                    b = b - 1;
+                }
+                xs[b + 1] = v;
+                ds[b + 1] = d;
+            }
+            int wind = 0;
+            for (int k = 0; k + 1 < xs.Count; k = k + 1) {
+                wind = wind + ds[k];
+                if (wind != 0) {
+                    int ww = xs[k + 1] - xs[k];
+                    if (ww > 0) {
+                        c.FillRect(xs[k], y, ww, 1, Chart.WithAlpha(color, alpha));
+                    }
+                }
+            }
+        }
+    }
+
     // ==== 整数 / 三角函数辅助（定点数，*1000） ====
 
     static int ISqrt(int v) {
@@ -488,15 +691,86 @@ partial class ChartView {
 
     static int CosDeg(int deg) { return ChartView.SinDeg(deg + 90); }
 
-    static void RingOutline(Canvas c, int cx, int cy, int r, int color) {
-        int seg = 36;
-        List<int> lx = new List<int>();
-        List<int> ly = new List<int>();
-        for (int i = 0; i <= seg; i = i + 1) {
-            int ang = i * 360 / seg;
-            lx.Add(cx + ChartView.CosDeg(ang) * r / 1000);
-            ly.Add(cy + ChartView.SinDeg(ang) * r / 1000);
+    /// ECharts `radius:'pct%'`：半径 = pct% × min(w,h)/2。
+    /// 饼/环/玫瑰/和弦共用，避免撑满绘图区把标签和圆弧裁掉。
+    static int RadialRadius(int areaW, int areaH, int pct) {
+        int m = areaW;
+        if (areaH < m) { m = areaH; }
+        if (pct < 20) { pct = 20; }
+        if (pct > 90) { pct = 90; }
+        int r = m * pct / 200;
+        if (r < 8) { r = 8; }
+        return r;
+    }
+
+    static void StrokePolyFx(Canvas c, List<int> px, List<int> py,
+                             int color, int th) {
+        int n = px.Count;
+        if (n < 2 || py.Count < n) { return; }
+        List<int> fx = new List<int>();
+        List<int> fy = new List<int>();
+        for (int i = 0; i < n; i = i + 1) {
+            fx.Add(px[i] * 256);
+            fy.Add(py[i] * 256);
         }
-        c.DrawPolyline(lx, ly, color, 1);
+        fx.Add(px[0] * 256);
+        fy.Add(py[0] * 256);
+        c.DrawPolylineFx(fx, fy, color, th);
+    }
+
+    /// FillSector 角 `a`（0=12 点顺时针）对应的屏幕方向分量（×1000）。
+    /// CosDeg/SinDeg 的 0 在 3 点钟，不能直接当扇区方向用。
+    static int FillDx(int a) { return ChartView.SinDeg(a); }
+    static int FillDy(int a) { return ChartView.SinDeg(a + 270); }
+    static int FillX(int cx, int r, int a) {
+        return cx + ChartView.FillDx(a) * r / 1000;
+    }
+    static int FillY(int cy, int r, int a) {
+        return cy + ChartView.FillDy(a) * r / 1000;
+    }
+
+    /// 把系列图形裁进坐标网格，避免圆点/折线/柱帽画出轴线。
+    static void PushPlotClip(App app, int plotX, int plotY, int plotW, int plotH) {
+        app.canvas.PushClip(plotX, plotY, plotW, plotH);
+    }
+
+    /// 把文本画进 clip 矩形：先平移进框，再用裁剪挡住残余溢出。
+    static void DrawTextClamped(Canvas c, int x, int y, string text,
+                                int color, int fs,
+                                int clipX, int clipY, int clipW, int clipH) {
+        if (clipW < 1 || clipH < 1 || text.Length < 1) { return; }
+        int tw = Canvas.MeasureText(text, fs);
+        int th = Canvas.FontHeight(fs);
+        if (x + tw > clipX + clipW) { x = clipX + clipW - tw; }
+        if (y + th > clipY + clipH) { y = clipY + clipH - th; }
+        if (x < clipX) { x = clipX; }
+        if (y < clipY) { y = clipY; }
+        c.PushClip(clipX, clipY, clipW, clipH);
+        c.DrawText(x, y, text, color, fs);
+        c.PopClip();
+    }
+
+    /// 极坐标标签：按象限锚定（左半右对齐、右半左对齐），并钳进绘图区。
+    static void DrawPolarLabel(App app, Canvas c, int cx, int cy, int r, int ang,
+                               string lbl, int color, int fs,
+                               int boxX, int boxY, int boxW, int boxH) {
+        if (lbl.Length < 1) { return; }
+        int gap = app.Scale(8);
+        int lx = cx + ChartView.CosDeg(ang) * (r + gap) / 1000;
+        int ly = cy + ChartView.SinDeg(ang) * (r + gap) / 1000;
+        int tw = Canvas.MeasureText(lbl, fs);
+        int th = Canvas.FontHeight(fs);
+        int cosv = ChartView.CosDeg(ang);
+        int sinv = ChartView.SinDeg(ang);
+        if (cosv < 0 - 200) { lx = lx - tw; }
+        else if (cosv < 200) { lx = lx - tw / 2; }
+        if (sinv < 0 - 200) { ly = ly - th; }
+        else if (sinv < 200) { ly = ly - th / 2; }
+        else { ly = ly - th / 4; }
+        ChartView.DrawTextClamped(c, lx, ly, lbl, color, fs, boxX, boxY, boxW, boxH);
+    }
+
+    static void RingOutline(Canvas c, int cx, int cy, int r, int color) {
+        c.DrawCircle(cx, cy, r, color, 1);
     }
 }

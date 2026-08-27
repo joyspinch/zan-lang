@@ -45,6 +45,11 @@ class MapLayout {
     int offX; int offY;   // 变换原点（居中后）
 
     static MapLayout Of(List<ChartMapRegion> regions, int x, int y, int w, int h, int pad) {
+        return MapLayout.OfRoam(regions, x, y, w, h, pad, 100, 0, 0);
+    }
+
+    static MapLayout OfRoam(List<ChartMapRegion> regions, int x, int y, int w, int h,
+                            int pad, int zoom, int panX, int panY) {
         MapLayout l = new MapLayout();
         l.polys = new List<MapPolygon>();
         l.regionCount = regions.Count;
@@ -52,6 +57,8 @@ class MapLayout {
         int ph = h - pad * 2;
         if (pw < 1) { pw = 1; }
         if (ph < 1) { ph = 1; }
+        if (zoom < 40) { zoom = 40; }
+        if (zoom > 280) { zoom = 280; }
 
         // 全局数据边界（所有环的所有点；<3 点的退化环忽略）。
         bool any = false;
@@ -84,13 +91,15 @@ class MapLayout {
         int scH = ph * 1000 / bh;
         if (scH < sc) { sc = scH; }
         if (sc < 1) { sc = 1; }
+        sc = sc * zoom / 100;
+        if (sc < 1) { sc = 1; }
         l.scale = sc;
 
-        // 变换后实际像素宽高，居中偏移。
+        // 变换后实际像素宽高，居中偏移，再减漫游平移。
         int ow = bw * sc / 1000;
         int oh = bh * sc / 1000;
-        int ox = x + pad + (pw - ow) / 2;
-        int oy = y + pad + (ph - oh) / 2;
+        int ox = x + pad + (pw - ow) / 2 - panX;
+        int oy = y + pad + (ph - oh) / 2 - panY;
         l.offX = ox; l.offY = oy;
 
         for (int r = 0; r < regions.Count; r = r + 1) {
@@ -136,17 +145,19 @@ class MapLayout {
 
 partial class ChartView {
 
-    // 连续色域：浅蓝 → 深蓝，value 归一化到 [vMin, vMax]。
-    static int MapRamp(int value, int vMin, int vMax) {
-        int lo = Chart.Rgb(188, 212, 235);
-        int hi = Chart.Rgb(42, 66, 140);
-        if (vMax <= vMin) { return hi; }
-        int f = (value - vMin) * 1000 / (vMax - vMin);
-        if (f < 0) { f = 0; }
-        if (f > 1000) { f = 1000; }
-        int r = 188 + (42 - 188) * f / 1000;
-        int g = 212 + (66 - 212) * f / 1000;
-        int b = 235 + (140 - 235) * f / 1000;
+    // 连续色域：优先 option.rampColors（visualMap）；否则浅蓝 → 深蓝。
+    static int MapRamp(ChartOption o, int value, int vMin, int vMax) {
+        int span = vMax - vMin;
+        if (span < 1) { span = 1; }
+        int t = (value - vMin) * 1000 / span;
+        if (t < 0) { t = 0; }
+        if (t > 1000) { t = 1000; }
+        if (o != null && o.rampColors != null && o.rampColors.Count >= 2) {
+            return Chart.RampAt(o.rampColors, t);
+        }
+        int r = 188 + (42 - 188) * t / 1000;
+        int g = 212 + (66 - 212) * t / 1000;
+        int b = 235 + (140 - 235) * t / 1000;
         return Chart.Rgb(r, g, b);
     }
 
@@ -221,90 +232,203 @@ partial class ChartView {
         ChartSeries lead = ChartView.LeadSeries(o);
         if (lead == null || lead.regions.Count < 1) { return; }
 
-        MapLayout layout = MapLayout.Of(lead.regions, x, top, w, y + h - top, pad);
+        int plotX = x;
+        int plotY = top;
+        int plotW = w;
+        int plotH = y + h - top;
+        int barW = 0;
+        if (o.rampColors != null && o.rampColors.Count >= 2) {
+            barW = app.Scale(18);
+            plotX = x + barW + app.Scale(8);
+            plotW = w - barW - app.Scale(8);
+        }
+
+        int zoom = 100;
+        int panX = 0;
+        int panY = 0;
+        if (o.roam && o.iwid != 0) {
+            zoom = app.StateGet(Chart.MapZoomKey(o.iwid), 100);
+            if (zoom < 40) { zoom = 100; app.StateSet(Chart.MapZoomKey(o.iwid), 100); }
+            panX = app.StateGet(Chart.MapPanXKey(o.iwid), 0);
+            panY = app.StateGet(Chart.MapPanYKey(o.iwid), 0);
+            int panId = 7100000 + o.iwid;
+            app.hitTester.RegisterRect(panId, plotX, plotY, plotW, plotH, 3);
+            if (Ui.Wheeled(app, panId)) {
+                int ticks = ChartView.WheelTicks(app);
+                int next = ChartView.ZoomByTicks(zoom, ticks, 40, 280);
+                if (next != zoom) {
+                    zoom = next;
+                    app.StateSet(Chart.MapZoomKey(o.iwid), zoom);
+                    app.RequestRedraw();
+                }
+            }
+            if (Ui.PressedDown(app, panId) && app.window.EventButton() == 0) {
+                app.StateSet(Chart.MapDragXKey(o.iwid), app.mouseX);
+                app.StateSet(Chart.MapDragYKey(o.iwid), app.mouseY);
+                app.StateSet(Chart.MapDragPanXKey(o.iwid), panX);
+                app.StateSet(Chart.MapDragPanYKey(o.iwid), panY);
+                app.StateSet(Chart.MapDragKey(o.iwid), 1);
+            }
+            if (app.EventKind() == 3) { app.StateSet(Chart.MapDragKey(o.iwid), 0); }
+            if (app.StateGet(Chart.MapDragKey(o.iwid), 0) == 1
+                && Ui.Pressed(app, panId) && app.EventKind() == 1) {
+                panX = app.StateGet(Chart.MapDragPanXKey(o.iwid), panX)
+                    - (app.mouseX - app.StateGet(Chart.MapDragXKey(o.iwid), app.mouseX));
+                panY = app.StateGet(Chart.MapDragPanYKey(o.iwid), panY)
+                    - (app.mouseY - app.StateGet(Chart.MapDragYKey(o.iwid), app.mouseY));
+                app.StateSet(Chart.MapPanXKey(o.iwid), panX);
+                app.StateSet(Chart.MapPanYKey(o.iwid), panY);
+                app.RequestRedraw();
+            }
+        }
+
+        MapLayout layout = MapLayout.OfRoam(lead.regions, plotX, plotY, plotW, plotH,
+            pad, zoom, panX, panY);
         int n = layout.polys.Count;
         if (n < 1) { return; }
 
-        // 值域 → 连续色域；显式区域色优先。
         int vMin = 0;
         int vMax = 0;
-        for (int r = 0; r < lead.regions.Count; r = r + 1) {
-            int v = lead.regions[r].value;
-            if (r == 0) { vMin = v; vMax = v; }
-            else {
-                if (v < vMin) { vMin = v; }
-                if (v > vMax) { vMax = v; }
+        if (o.rampLo != ChartOption.Auto()) { vMin = o.rampLo; }
+        if (o.rampHi != ChartOption.Auto()) { vMax = o.rampHi; }
+        bool spanSet = o.rampLo != ChartOption.Auto() && o.rampHi != ChartOption.Auto();
+        if (!spanSet) {
+            for (int r = 0; r < lead.regions.Count; r = r + 1) {
+                int v = lead.regions[r].value;
+                if (r == 0) { vMin = v; vMax = v; }
+                else {
+                    if (v < vMin) { vMin = v; }
+                    if (v > vMax) { vMax = v; }
+                }
             }
         }
+        if (vMax <= vMin) { vMax = vMin + 1; }
 
-        // 动画：透明度淡入。
-        int alpha = 60 + 195 * g / 1000;
+        int alpha = 255;
+        if (g < 1000) { alpha = 60 + 195 * g / 1000; }
         if (alpha > 255) { alpha = 255; }
 
-        // 第一遍：所有外环。
-        for (int i = 0; i < n; i = i + 1) {
-            MapPolygon p = layout.polys[i];
-            if (p.hole) { continue; }
-            int col = lead.regions[p.region].color;
-            if (col == 0) { col = ChartView.MapRamp(lead.regions[p.region].value, vMin, vMax); }
-            ChartView.FillPolygon(c, p.points, Chart.WithAlpha(col, alpha));
+        int slot = 220 + ((o.iwid % 20) + 20) % 20;
+        int fp = (layout.scale * 13 + layout.offX * 17 + layout.offY * 19
+            + zoom * 23 + panX * 29 + panY * 31 + vMin * 37 + vMax * 41
+            + plotW * 43 + plotH * 47) % 2000000000;
+        for (int r = 0; r < lead.regions.Count; r = r + 1) {
+            fp = (fp * 31 + lead.regions[r].value) % 2000000000;
         }
-        // 第二遍：洞环回填背景（挖空）。
+        bool cached = g >= 1000 && app.StateGet(Chart.CacheKey(slot), 0) == fp
+            && c.RestoreRect(plotX, plotY, plotW, plotH, slot);
         int bg = Style.Full(app, "chart", "", "", Style.SNormal()).BgOr(0);
-        for (int i = 0; i < n; i = i + 1) {
-            MapPolygon p = layout.polys[i];
-            if (!p.hole) { continue; }
-            ChartView.FillPolygon(c, p.points, bg);
-        }
-        // 描边 + 中心标签（标签只放在外环质心）。
-        for (int i = 0; i < n; i = i + 1) {
-            MapPolygon p = layout.polys[i];
-            int col = lead.regions[p.region].color;
-            if (col == 0) { col = ChartView.MapRamp(lead.regions[p.region].value, vMin, vMax); }
-            ChartView.PolyOutline(c, p.points, col);
-            if (!p.hole) {
-                string nm = lead.regions[p.region].name;
-                if (nm.Length > 0) {
-                    int fs = Style.FontFallback(app, "small");
-                    int tw = Canvas.MeasureText(nm, fs);
-                    c.DrawText(p.cx - tw / 2, p.cy - Canvas.FontHeight(fs) / 2,
-                        nm,
-                        Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0),
-                        fs);
+        if (g < 1000 && !cached) {
+            c.FillRect(plotX, plotY, plotW, plotH, bg);
+        } else if (!cached) {
+            c.FillRect(plotX, plotY, plotW, plotH, bg);
+            for (int i = 0; i < n; i = i + 1) {
+                MapPolygon p = layout.polys[i];
+                if (p.hole) { continue; }
+                int col = lead.regions[p.region].color;
+                if (col == 0) { col = ChartView.MapRamp(o, lead.regions[p.region].value, vMin, vMax); }
+                ChartView.FillPolygon(c, p.points, Chart.WithAlpha(col, alpha));
+            }
+            for (int i = 0; i < n; i = i + 1) {
+                MapPolygon p = layout.polys[i];
+                if (!p.hole) { continue; }
+                ChartView.FillPolygon(c, p.points, bg);
+            }
+            for (int i = 0; i < n; i = i + 1) {
+                MapPolygon p = layout.polys[i];
+                int col = lead.regions[p.region].color;
+                if (col == 0) { col = ChartView.MapRamp(o, lead.regions[p.region].value, vMin, vMax); }
+                ChartView.PolyOutline(c, p.points, col);
+                if (!p.hole) {
+                    string nm = lead.regions[p.region].name;
+                    if (nm.Length > 0) {
+                        int fs = Style.FontFallback(app, "small");
+                        int tw = Canvas.MeasureText(nm, fs);
+                        int th = Canvas.FontHeight(fs);
+                        if (tw + app.Scale(4) <= p.maxX - p.minX
+                            && th + app.Scale(2) <= p.maxY - p.minY) {
+                            ChartView.DrawTextClamped(c, p.cx - tw / 2,
+                                p.cy - th / 2, nm, Chart.ContrastFg(col),
+                                fs, plotX, plotY, plotW, plotH);
+                        }
+                    }
                 }
+            }
+            if (g >= 1000) {
+                c.SnapshotRect(plotX, plotY, plotW, plotH, slot);
+                app.StateSet(Chart.CacheKey(slot), fp);
             }
         }
 
-        if (o.showTooltip) {
-            int mx = app.mouseX;
-            int my = app.mouseY;
-            int r = MapLayout.RegionAt(layout, mx, my);
-            if (r >= 0) {
-                ChartMapRegion mr = lead.regions[r];
-                int col = mr.color;
-                if (col == 0) { col = ChartView.MapRamp(mr.value, vMin, vMax); }
-                // emphasis 高亮：命中区域按强调色重画（挖空环保持
-                // 背景），描边改用强调边框色或区域色加亮。
-                int eFill = lead.itemStyle.emphasis.color != 0
-                    ? lead.itemStyle.emphasis.color : col;
-                int eLine = lead.itemStyle.emphasis.borderColor != 0
-                    ? lead.itemStyle.emphasis.borderColor : eFill;
-                for (int pi = 0; pi < layout.polys.Count; pi = pi + 1) {
-                    MapPolygon pp = layout.polys[pi];
-                    if (pp.region != r) { continue; }
-                    if (pp.hole) {
-                        ChartView.FillPolygon(c, pp.points, bg);
-                    } else {
-                        ChartView.FillPolygon(c, pp.points,
-                            Chart.WithAlpha(eFill, alpha));
-                    }
-                    ChartView.PolyOutline(c, pp.points, eLine);
-                }
-                List<TooltipRow> rows = new List<TooltipRow>{
-                    TooltipRow.Of(0, o.title),
-                    TooltipRow.Of(col, mr.name + "  " + Convert.ToString(mr.value)) };
-                ChartView.TooltipCard(app, mx, my, x + w, rows);
+        int sel = 0 - 1;
+        if (o.mapSelect && o.iwid != 0) {
+            sel = app.StateGet(Chart.MapSelKey(o.iwid), 0 - 1);
+        }
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        int hit = MapLayout.RegionAt(layout, mx, my);
+        if (o.mapSelect && o.iwid != 0 && app.window.EventKind() == 3
+            && mx >= plotX && mx < plotX + plotW
+            && my >= plotY && my < plotY + plotH) {
+            if (hit >= 0) {
+                if (sel == hit) { sel = 0 - 1; } else { sel = hit; }
+                app.StateSet(Chart.MapSelKey(o.iwid), sel);
+                app.RequestRedraw();
             }
+        }
+
+        int hi = hit;
+        if (sel >= 0) { hi = sel; }
+        if (hi >= 0) {
+            int col = lead.regions[hi].color;
+            if (col == 0) { col = ChartView.MapRamp(o, lead.regions[hi].value, vMin, vMax); }
+            int eFill = lead.itemStyle.emphasis.color != 0
+                ? lead.itemStyle.emphasis.color : col;
+            int eLine = lead.itemStyle.emphasis.borderColor != 0
+                ? lead.itemStyle.emphasis.borderColor : Chart.Rgb(255, 255, 255);
+            int bg2 = Style.Full(app, "chart", "", "", Style.SNormal()).BgOr(0);
+            for (int pi = 0; pi < layout.polys.Count; pi = pi + 1) {
+                MapPolygon pp = layout.polys[pi];
+                if (pp.region != hi) { continue; }
+                if (pp.hole) {
+                    ChartView.FillPolygon(c, pp.points, bg2);
+                } else {
+                    ChartView.FillPolygon(c, pp.points, Chart.WithAlpha(eFill, alpha));
+                }
+                ChartView.PolyOutline(c, pp.points, eLine);
+            }
+        }
+
+        if (barW > 0) {
+            int bx = x + app.Scale(6);
+            int by = plotY + app.Scale(8);
+            int bh = plotH - app.Scale(24);
+            if (bh < app.Scale(40)) { bh = app.Scale(40); }
+            for (int yi = 0; yi < bh; yi = yi + 1) {
+                int t2 = 1000 - yi * 1000 / bh;
+                c.FillRect(bx, by + yi, app.Scale(10), 1, Chart.RampAt(o.rampColors, t2));
+            }
+            int fs2 = Style.FontFallback(app, "small");
+            int lfg = Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0);
+            c.DrawText(bx, by - Canvas.FontHeight(fs2), "高", lfg, fs2);
+            c.DrawText(bx, by + bh, "低", lfg, fs2);
+        }
+
+        if (o.roam) {
+            int fs3 = Style.FontFallback(app, "small");
+            c.DrawText(plotX + app.Scale(8), plotY + plotH - Canvas.FontHeight(fs3) - app.Scale(4),
+                "滚轮缩放  ·  拖拽平移",
+                Style.Part(app, "chart", "hint", "", "", "", Style.SNormal()).FgOr(0), fs3);
+        }
+
+        if (o.showTooltip && hit >= 0) {
+            ChartMapRegion mr = lead.regions[hit];
+            int col = mr.color;
+            if (col == 0) { col = ChartView.MapRamp(o, mr.value, vMin, vMax); }
+            List<TooltipRow> rows = new List<TooltipRow>{
+                TooltipRow.Of(0, o.title),
+                TooltipRow.Of(col, mr.name + "  " + Convert.ToString(mr.value)) };
+            ChartView.TooltipCard(app, mx, my, x + w, rows);
         }
     }
 }

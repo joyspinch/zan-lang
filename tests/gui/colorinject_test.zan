@@ -1,0 +1,92 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// Headless regression for Button.EnsureColorInjected: the custom-Color CSS
+/// rule is injected once per color per sheet, keyed by the rule's presence in
+/// the sheet -- never by per-widget fields or bgThemeGen. Immediate-mode UIs
+/// (the gallery demo pages, the designer canvas) rebuild their widgets every
+/// frame, so instance fields reset each frame; and the injection itself bumps
+/// bgThemeGen, so a generation-based guard re-fires forever. Either way
+/// bgThemeGen grew every frame while a Color button rendered, the whole style
+/// cache and baseSheets were dropped and base.css re-parsed several times per
+/// frame, and the app froze. Also pins that the selector engine now matches
+/// `[class*="frag"]` rules, which the injected CSS (and the base skin's
+/// custom-color default) depend on.
+class Program {
+    static int fails;
+
+    static void True(string what, bool got) {
+        if (got) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    /// A fresh button with a const Color binding, as an immediate-mode
+    /// frame would build it.
+    static Button Colored(int c) {
+        Button b = new Button("X");
+        b.Color = c;
+        return b;
+    }
+
+    static void Main() {
+        fails = 0;
+        App app = new App("colorinject", 80, 40);
+        app.sheet = StyleSheet.FromCss("button { padding: 4; }\n");
+
+        int gen0 = app.bgThemeGen;
+        Colored(0xFF1890FF).EnsureColorInjected(app);
+        True("first frame injects once", app.bgThemeGen == gen0 + 1);
+        True("rule landed",
+             app.sheet.Block(Button.CustomSelector(0xFF1890FF)) != null);
+        True("hover variant landed",
+             app.sheet.Block(Button.CustomSelector(0xFF1890FF) + ":hover")
+                 != null);
+
+        // Next frames: fresh button objects, same color, same sheet.
+        Colored(0xFF1890FF).EnsureColorInjected(app);
+        Colored(0xFF1890FF).EnsureColorInjected(app);
+        True("fresh buttons do not re-inject", app.bgThemeGen == gen0 + 1);
+
+        // A second color injects exactly once and keeps the first's rules.
+        Colored(0xFFFF7A45).EnsureColorInjected(app);
+        True("second color injects once", app.bgThemeGen == gen0 + 2);
+        Colored(0xFFFF7A45).EnsureColorInjected(app);
+        True("second color steady", app.bgThemeGen == gen0 + 2);
+        True("first color rule kept",
+             app.sheet.Block(Button.CustomSelector(0xFF1890FF)) != null);
+
+        // Unrelated generation bumps (skin refresh, wallpaper, theme) must
+        // not re-inject: the sheet still carries the rule.
+        app.bgThemeGen = app.bgThemeGen + 7;
+        Colored(0xFF1890FF).EnsureColorInjected(app);
+        True("unrelated gen bump is not re-injected", app.bgThemeGen == gen0 + 9);
+
+        // A fresh sheet (skin switch) re-injects once.
+        app.sheet = StyleSheet.FromCss("button { padding: 6; }\n");
+        Colored(0xFF1890FF).EnsureColorInjected(app);
+        True("fresh sheet re-injects once", app.bgThemeGen == gen0 + 10);
+
+        // The selector engine matches class-substring rules: the generic
+        // skin default applies to any custom- fragment, the injected
+        // per-color rule only to its own hex, and the more specific
+        // later rule wins when both fit.
+        StyleSheet skins = StyleSheet.FromCss(
+            "button[class*=\"custom-\"] { background: #101010; }\n"
+            + "button[class*=\"custom-1890ff\"] { background: #1890ff; }\n");
+        // 赋给 int 先回绕：Zan 里超出 int 的十六进制字面量按无符号
+        // 参与 ==，直接和字段比较恒为 false。
+        int genericBg = 0xFF101010;
+        int brandBg = 0xFF1890FF;
+        StyleBox other = new StyleBox();
+        skins.ApplyMatch(other, "button", "custom-ff7a45", "", "", 0);
+        True("other hex gets the generic rule", other.bg == genericBg);
+        StyleBox fit = new StyleBox();
+        skins.ApplyMatch(fit, "button", "custom-1890ff", "", "", 0);
+        True("own hex gets the specific rule", fit.bg == brandBg);
+
+        if (fails == 0) { Console.WriteLine("colorinject: OK"); return; }
+        Console.WriteLine("colorinject: FAIL " + Convert.ToString(fails));
+    }
+}

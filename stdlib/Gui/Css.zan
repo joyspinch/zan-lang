@@ -296,9 +296,12 @@ class Selector {
     /// 无状态时为 ""。多个伪类是与关系，因此“选中且悬停”
     /// 这类组合外观能写在 CSS 里，而不必回到代码里分支。
     string state;
+    /// `[class*="frag"]` 里的 frag：class 属性原文的子串匹配，
+    /// 用于 `custom-{hex}` 这类复合 class 片段（无该条件时为 ""）。
+    string clsContains;
 
     /// 解析一个选择器；遇到本引擎不建模的形式（后代/子组合器、
-    /// 属性选择器、`:root`）时返回 null，
+    /// `class*` 之外的属性选择器、`:root`）时返回 null，
     /// 这类选择器永远不会匹配。
     static Selector Parse(string sel) {
         string s = Css.Trim(sel);
@@ -309,6 +312,7 @@ class Selector {
         p.id = "";
         p.part = "";
         p.state = "";
+        p.clsContains = "";
         int i = 0;
         int n = s.Length;
         for (; i < n && Selector.NameChar(s.Substring(i, 1)); i = i + 1) {
@@ -321,6 +325,17 @@ class Selector {
             if (ch == ":" && i + 1 < n && s.Substring(i + 1, 1) == ":") {
                 start = i + 2;
                 isPart = true;
+            } else if (ch == "[") {
+                // 属性选择器只建模 class 子串匹配：`[class*="frag"]`。
+                // 其余形式（等值、存在性、其他属性）仍不建模。
+                int close = Css.IndexFrom(s, "]", i);
+                if (close < 0) { return null; }
+                string frag = Selector.ClassContains(
+                    Css.Trim(s.Substring(i + 1, close - i - 1)));
+                if (frag == null || p.clsContains != "") { return null; }
+                p.clsContains = frag;
+                i = close + 1;
+                continue;
             } else if (ch != "." && ch != "#" && ch != ":") {
                 return null;
             }
@@ -355,9 +370,30 @@ class Selector {
         int spec = 0;
         if (type != "") { spec = spec + 1; }
         spec = spec + Style.Classes(classes).Count * 100;
+        if (clsContains != "") { spec = spec + 100; }
         if (id != "") { spec = spec + 10000; }
         spec = spec + Style.Classes(state).Count * 1000000;
         return spec;
+    }
+
+    /// `class*="frag"`（允许内部空白，双引号或单引号）→ frag；
+    /// 其余属性写法不是子串匹配，返回 null（选择器不建模）。
+    static string ClassContains(string attr) {
+        string t = "";
+        for (int i = 0; i < attr.Length; i = i + 1) {
+            string c = attr.Substring(i, 1);
+            if (c != " " && c != "\t") { t = t + c; }
+        }
+        string frag = null;
+        if (t.Length > 10 && t.Substring(0, 8) == "class*=\""
+            && t.Substring(t.Length - 1, 1) == "\"") {
+            frag = t.Substring(8, t.Length - 9);
+        } else if (t.Length > 10 && t.Substring(0, 8) == "class*='"
+            && t.Substring(t.Length - 1, 1) == "'") {
+            frag = t.Substring(8, t.Length - 9);
+        }
+        if (frag == null || frag == "") { return null; }
+        return frag;
     }
 
     /// 可作为类型/类/id/部件名称字符时为 true。

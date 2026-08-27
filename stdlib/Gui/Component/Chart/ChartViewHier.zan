@@ -11,8 +11,10 @@ class WordCloudItem {
     int w;
     int h;
     int fontSize;
+    int color;
 
-    static WordCloudItem Of(ChartData data, int x, int y, int w, int h, int fontSize) {
+    static WordCloudItem Of(ChartData data, int x, int y, int w, int h,
+                            int fontSize, int color) {
         WordCloudItem item = new WordCloudItem();
         item.data = data;
         item.x = x;
@@ -20,6 +22,7 @@ class WordCloudItem {
         item.w = w;
         item.h = h;
         item.fontSize = fontSize;
+        item.color = color;
         return item;
     }
 }
@@ -186,20 +189,21 @@ partial class ChartView {
         }
     }
 
-    // 矩形树图单元格内的名称（+ 值）标签，仅放得下时绘制。
+    // 矩形树图单元格内的名称（+ 值）标签，仅放得下时绘制，
+    // 并用单元格矩形裁剪，避免长名称画出格子。
     static void TreemapCell(App app, int x, int y, int w, int h, string name, string val) {
         Canvas c = app.canvas;
-        Theme t = app.theme;
         int fs = Style.FontFallback(app, "small");
         int fh = Canvas.FontHeight(fs);
         if (w < app.Scale(20) || h < fh + app.Scale(4)) { return; }
-        int nw = Canvas.MeasureText(name, fs);
-        if (nw > w - app.Scale(6)) { nw = w - app.Scale(6); }
-        c.DrawText(x + app.Scale(3), y + app.Scale(2), name, 4294967295, fs);
+        c.PushClip(x, y, w, h);
+        ChartView.DrawTextClamped(c, x + app.Scale(3), y + app.Scale(2),
+            name, 4294967295, fs, x, y, w, h);
         if (h > fh * 2 + app.Scale(4) && val.Length > 0) {
-            c.DrawText(x + app.Scale(3), y + app.Scale(2) + fh, val,
-                Chart.WithAlpha(4294967295, 200), fs);
+            ChartView.DrawTextClamped(c, x + app.Scale(3), y + app.Scale(2) + fh, val,
+                Chart.WithAlpha(4294967295, 200), fs, x, y, w, h);
         }
+        c.PopClip();
     }
 
     // ---- 旭日图（同心环；最内环 = 根的子节点） ----
@@ -611,11 +615,7 @@ partial class ChartView {
     }
 
     static int TreeLabelWidth(ChartNode n, int fs) {
-        string label = n.name;
-        if (n.children.Count == 0 && n.val > 0) {
-            label = n.name + " " + Convert.ToString(n.val);
-        }
-        int widest = Canvas.MeasureText(label, fs);
+        int widest = Canvas.MeasureText(n.name, fs);
         for (int i = 0; i < n.children.Count; i = i + 1) {
             int childW = ChartView.TreeLabelWidth(n.children[i], fs);
             if (childW > widest) { widest = childW; }
@@ -637,86 +637,127 @@ partial class ChartView {
         Canvas c = app.canvas;
         Theme t = app.theme;
         ChartSeries lead = ChartView.LeadSeries(o);
-        List<ChartSeries> header = new List<ChartSeries>();
-        int top = Chart.DrawPanelI(app, x, y, w, h, o.title, header, 0, o.showLegend);
+        int top = Chart.DrawPanelI(app, x, y, w, h, o.title, o.series,
+            o.iwid, o.showLegend);
         if (lead == null || lead.data.Count == 0) { return; }
 
-        int pad = app.Scale(12);
+        int pad = app.Scale(10);
         int ax = x + pad;
         int ay = top + app.Scale(2);
         int aw = w - pad * 2;
-        int ah = y + h - pad - ay;
-        if (aw < 1 || ah < 1) { return; }
+        int ah = (y + h - pad) - ay;
+        if (aw < app.Scale(24) || ah < app.Scale(24)) { return; }
 
         int maxV = 1;
         for (int i = 0; i < lead.data.Count; i = i + 1) {
             if (lead.data[i].val > maxV) { maxV = lead.data[i].val; }
         }
 
-        List<WordCloudItem> placed = null;
         int minFs = app.Scale(11);
-        int maxFs = app.Scale(34);
-        // 螺旋半径随可用区域走满：上限取短边的一半（留出内边距），
-        // 词云在整个画布铺开，而不是聚在中心一小团。
-        int maxR = (aw < ah ? aw : ah) / 2 - app.Scale(10);
-        if (maxR < app.Scale(40)) { maxR = app.Scale(40); }
-        // 静态帧（g=1000）走缓存：动画帧字号随 g 缩放，仍按
-        // 原路径逐帧重排，动画结束后的一帧把结果存入缓存。
-        bool cacheable = g >= 1000;
-        int wfp = 0;
-        if (cacheable) {
-            wfp = ChartView.WordCloudFingerprint(lead.data, aw, ah, minFs, maxFs);
-            if (ChartView.wcCache == null) {
-                ChartView.wcCache = new List<WordCloudCacheEntry>();
-            }
-            WordCloudCacheEntry hit = WordCloudCacheEntry.Lookup(
-                ChartView.wcCache, wfp);
-            if (hit != null) { placed = hit.items; }
+        int maxFs = app.Scale(36);
+        if (maxFs > ah / 3) { maxFs = ah / 3; }
+        if (maxFs > aw / 6) { maxFs = aw / 6; }
+        if (maxFs < minFs) { maxFs = minFs; }
+
+        int wfp = ChartView.WordCloudFingerprint(lead.data, aw, ah, minFs, maxFs);
+        if (ChartView.wcCache == null) {
+            ChartView.wcCache = new List<WordCloudCacheEntry>();
         }
-        c.PushClip(ax, ay, aw, ah);
+        List<WordCloudItem> placed = null;
+        WordCloudCacheEntry hit = WordCloudCacheEntry.Lookup(ChartView.wcCache, wfp);
+        if (hit != null) { placed = hit.items; }
+
         if (placed == null) {
-            placed = new List<WordCloudItem>();
-            for (int wi = 0; wi < lead.data.Count; wi = wi + 1) {
-                ChartData word = lead.data[wi];
-                int fs = minFs + (maxFs - minFs) * word.val / maxV;
-                fs = minFs + (fs - minFs) * g / 1000;
-                string text = word.name;
-                int tw = Canvas.MeasureText(text, fs) + app.Scale(4);
+            placed = ChartView.PlaceWordCloud(app, t, lead.data, aw, ah,
+                minFs, maxFs, maxV);
+            WordCloudCacheEntry.Store(ChartView.wcCache, wfp, placed, 4);
+        }
+
+        int alpha = 255 * g / 1000;
+        if (alpha < 0) { alpha = 0; }
+        if (alpha > 255) { alpha = 255; }
+        c.PushClip(ax, ay, aw, ah);
+        for (int wi = 0; wi < placed.Count; wi = wi + 1) {
+            WordCloudItem it = placed[wi];
+            int col = Chart.WithAlpha(it.color, alpha);
+            c.DrawText(ax + it.x, ay + it.y, it.data.name, col, it.fontSize);
+        }
+        c.PopClip();
+    }
+
+    /// 阿基米德螺旋放置：字号按权重，放不下就缩小，坐标相对绘图区。
+    static List<WordCloudItem> PlaceWordCloud(App app, Theme t, List<ChartData> src,
+                                              int aw, int ah, int minFs, int maxFs,
+                                              int maxV) {
+        List<ChartData> words = new List<ChartData>();
+        for (int i = 0; i < src.Count; i = i + 1) { words.Add(src[i]); }
+        for (int a = 0; a < words.Count; a = a + 1) {
+            int best = a;
+            for (int b = a + 1; b < words.Count; b = b + 1) {
+                if (words[b].val > words[best].val) { best = b; }
+            }
+            if (best != a) {
+                ChartData tmp = words[a];
+                words[a] = words[best];
+                words[best] = tmp;
+            }
+        }
+
+        List<WordCloudItem> placed = new List<WordCloudItem>();
+        int maxR = (aw < ah ? aw : ah) / 2;
+        if (maxR < app.Scale(24)) { maxR = app.Scale(24); }
+        int attempts = 480;
+        for (int wi = 0; wi < words.Count; wi = wi + 1) {
+            ChartData word = words[wi];
+            if (word.name.Length < 1) { continue; }
+            int fs = minFs + (maxFs - minFs) * word.val / maxV;
+            int color = word.color;
+            if (color == 0) { color = Chart.Palette(t, wi); }
+            bool done = false;
+            int shrink = 0;
+            while (!done && shrink < 10) {
+                int tw = Canvas.MeasureText(word.name, fs) + app.Scale(6);
                 int th = Canvas.FontHeight(fs) + app.Scale(2);
+                if (tw > aw - 2) {
+                    if (fs <= minFs) { done = true; }
+                    else { fs = fs - 2; if (fs < minFs) { fs = minFs; } }
+                    shrink = shrink + 1;
+                    continue;
+                }
+                if (th > ah - 2) {
+                    if (fs <= minFs) { done = true; }
+                    else { fs = fs - 2; if (fs < minFs) { fs = minFs; } }
+                    shrink = shrink + 1;
+                    continue;
+                }
                 int attempt = 0;
-                while (attempt < 220) {
-                    int angle = (attempt * 137 + wi * 47) % 360;
-                    int radius = app.Scale(2) + maxR * attempt / 220;
-                    int cx = ax + aw / 2 + ChartView.CosDeg(angle) * radius / 1000;
-                    int cy = ay + ah / 2 + ChartView.SinDeg(angle) * radius / 1000;
+                while (attempt < attempts && !done) {
+                    int angle = (attempt * 137 + wi * 53) % 360;
+                    int radius = maxR * attempt / attempts;
+                    int cx = aw / 2 + ChartView.CosDeg(angle) * radius / 1000;
+                    int cy = ah / 2 + ChartView.SinDeg(angle) * radius / 1000;
                     int tx = cx - tw / 2;
                     int ty = cy - th / 2;
-                    if (tx >= ax && ty >= ay && tx + tw <= ax + aw && ty + th <= ay + ah
+                    if (tx < 0) { tx = 0; }
+                    if (ty < 0) { ty = 0; }
+                    if (tx + tw > aw) { tx = aw - tw; }
+                    if (ty + th > ah) { ty = ah - th; }
+                    if (tx >= 0 && ty >= 0 && tx + tw <= aw && ty + th <= ah
                         && ChartView.WordCloudFits(placed, tx, ty, tw, th)) {
-                        int color = word.color;
-                        if (color == 0) { color = Chart.Palette(t, wi); }
-                        c.DrawText(tx + app.Scale(2), ty, text, color, fs);
-                        placed.Add(WordCloudItem.Of(word, tx, ty, tw, th, fs));
-                        attempt = 220;
+                        placed.Add(WordCloudItem.Of(word, tx, ty, tw, th, fs, color));
+                        done = true;
                     } else {
                         attempt = attempt + 1;
                     }
                 }
-            }
-            if (cacheable) {
-                WordCloudCacheEntry.Store(ChartView.wcCache, wfp, placed, 4);
-            }
-        } else {
-            // 缓存命中：条目里已带放置矩形与字号，直接重绘文本。
-            for (int wi = 0; wi < placed.Count; wi = wi + 1) {
-                WordCloudItem it = placed[wi];
-                int color = it.data.color;
-                if (color == 0) { color = Chart.Palette(t, wi); }
-                c.DrawText(it.x + app.Scale(2), it.y, it.data.name,
-                    color, it.fontSize);
+                if (!done) {
+                    if (fs <= minFs) { done = true; }
+                    else { fs = fs - 2; if (fs < minFs) { fs = minFs; } }
+                    shrink = shrink + 1;
+                }
             }
         }
-        c.PopClip();
+        return placed;
     }
 
     static int WordCloudFingerprint(List<ChartData> data, int aw, int ah,
@@ -732,6 +773,53 @@ partial class ChartView {
     // 词云布局缓存：指纹 → 放置结果（小容量，见 WordCloudCacheEntry）。
     static List<WordCloudCacheEntry> wcCache;
 
+    /// 无限画布网格：世界原点落在视口 (ax - panX, ay - panY)，
+    /// 间距随缩放变稀/变密，密到看不清时跳级。
+    static int TreeGridFirst(int origin, int view0, int gs) {
+        if (gs < 1) { return view0; }
+        int x = origin;
+        if (x < view0) {
+            int d = view0 - x;
+            x = x + (d / gs) * gs;
+            if (x < view0) { x = x + gs; }
+        } else if (x > view0) {
+            int d = x - view0;
+            x = x - (d / gs) * gs;
+        }
+        return x;
+    }
+
+    static void DrawTreeCanvasGrid(App app, Canvas c, int ax, int ay, int aw, int ah,
+                                   int panX, int panY, int zoom) {
+        int worldStep = app.Scale(28);
+        int gs = worldStep * zoom / 100;
+        while (gs < app.Scale(18) && worldStep < 512) {
+            worldStep = worldStep * 2;
+            gs = worldStep * zoom / 100;
+        }
+        if (gs < 8) { return; }
+        int col = Chart.WithAlpha(Style.Part(app, "chart", "grid", "", "", "",
+            Style.SNormal()).BgOr(0), 55);
+        int originX = ax - panX;
+        int originY = ay - panY;
+        int gx = ChartView.TreeGridFirst(originX, ax, gs);
+        int n = 0;
+        while (gx < ax + aw && n < 256) {
+            if (gx >= ax) { c.FillRect(gx, ay, 1, ah, col); }
+            int nx = gx + gs;
+            if (nx <= gx) { n = 256; } else { gx = nx; }
+            n = n + 1;
+        }
+        int gy = ChartView.TreeGridFirst(originY, ay, gs);
+        n = 0;
+        while (gy < ay + ah && n < 256) {
+            if (gy >= ay) { c.FillRect(ax, gy, aw, 1, col); }
+            int ny = gy + gs;
+            if (ny <= gy) { n = 256; } else { gy = ny; }
+            n = n + 1;
+        }
+    }
+
     static void DrawTree(App app, int x, int y, int w, int h,
                          ChartOption o, int g) {
         Canvas c = app.canvas;
@@ -744,6 +832,9 @@ partial class ChartView {
         int ay = plotTop;
         int aw = w - pad * 2;
         int ah = (y + h - pad) - plotTop;
+        int hintFs = Style.FontFallback(app, "small");
+        int hintH = Canvas.FontHeight(hintFs) + app.Scale(6);
+        if (ah > hintH + app.Scale(24)) { ah = ah - hintH; }
         if (aw < app.Scale(10) || ah < app.Scale(10)) { return; }
 
         ChartSeries lead = ChartView.LeadSeries(o);
@@ -755,86 +846,76 @@ partial class ChartView {
         if (leaves < 1) { leaves = 1; }
         if (depth < 1) { depth = 1; }
 
-        int panId = app.focus.AllocId();
-        app.hitTester.RegisterRect(panId, ax, ay, aw, ah, 2);
+        // 稳定命中 id（AllocId 每帧换号会让滚轮/拖拽丢目标）。
+        // widgetType=0 → 抓手光标，按无限画布拖动画布。
+        int panId = Chart.TreeHitKey(o.iwid);
+        app.hitTester.RegisterRect(panId, ax, ay, aw, ah, 0);
 
-        int labelWidth = ChartView.TreeLabelWidth(root, Style.FontFallback(app, "small"));
-        int labelHeight = Canvas.FontHeight(Style.FontFallback(app, "small"));
-        int leafGap = labelHeight + app.Scale(16);
-        int levelGap = labelWidth + app.Scale(36);
-        if (!horiz) {
-            leafGap = labelWidth * 2 + app.Scale(36);
-            levelGap = labelHeight + app.Scale(24);
+        // 字号保持可读：缩放改节点间距，标签跟节点走、越出视口裁掉。
+        int fs = Style.FontFallback(app, "small");
+        int fh = Canvas.FontHeight(fs);
+        int labelW = ChartView.TreeLabelWidth(root, fs);
+        int rad = app.Scale(4);
+        int gapSpan = 0;
+        int gapDep = 0;
+        if (horiz) {
+            gapSpan = fh + app.Scale(14);
+            if (gapSpan < app.Scale(22)) { gapSpan = app.Scale(22); }
+            gapDep = labelW + rad * 2 + app.Scale(28);
+            if (gapDep < app.Scale(40)) { gapDep = app.Scale(40); }
+        } else {
+            gapSpan = labelW + app.Scale(16);
+            if (gapSpan < app.Scale(36)) { gapSpan = app.Scale(36); }
+            gapDep = rad * 2 + fh + app.Scale(22);
+            if (gapDep < app.Scale(32)) { gapDep = app.Scale(32); }
         }
-        if (leafGap < app.Scale(40)) { leafGap = app.Scale(40); }
-        if (levelGap < app.Scale(48)) { levelGap = app.Scale(48); }
 
-        int spanLen = horiz ? ah : aw;
-        int depLen = horiz ? aw : ah;
+        int natSpan = leaves * gapSpan;
+        int natDep = depth * gapDep + app.Scale(8);
+        int natW = horiz ? (natDep + labelW + rad) : natSpan;
+        int natH = horiz ? natSpan : (natDep + fh + rad);
 
-        // 缩放：滚轮调整节点间距（标签大小随之缩放），
-        // 使放不下的树可收拢，而不是只能
-        // 四处拖动。未设置缩放时适配整棵树，这是树
-        // 打开时的预期形态 —— 平移只是可选，而非
-        // 查看其余部分的唯一方式。
         int zoom = app.StateGet(Chart.TreeZoomKey(o.iwid), 0);
-        if (zoom == 0) {
-            zoom = 100;
-            int natSpan = leaves * leafGap;
-            int natDepth = (depth + 1) * levelGap + app.Scale(8);
-            if (natSpan > spanLen) { zoom = spanLen * 100 / natSpan; }
-            int depZoom = 100;
-            if (natDepth > depLen) { depZoom = depLen * 100 / natDepth; }
-            if (depZoom < zoom) { zoom = depZoom; }
-            if (zoom < 25) { zoom = 25; }
-            app.StateSet(Chart.TreeZoomKey(o.iwid), zoom);
-        }
-        if (Ui.Wheeled(app, panId)) {
-            int notches = Ui.WheelDelta(app);
-            int next = zoom;
-            int steps = notches;
-            while (steps > 0) { next = next * 115 / 100; steps = steps - 1; }
-            while (steps < 0) { next = next * 100 / 115; steps = steps + 1; }
-            if (next < 20) { next = 20; }
-            if (next > 400) { next = 400; }
-            if (next != zoom) {
-                // 保持光标下的内容不动，使缩放表现为
-                // 树的缩放而非跳到树的另一部分。
-                int oldPanX = app.StateGet(Chart.TreePanXKey(o.iwid), 0);
-                int oldPanY = app.StateGet(Chart.TreePanYKey(o.iwid), 0);
-                int anchorX = app.mouseX - ax + oldPanX;
-                int anchorY = app.mouseY - ay + oldPanY;
-                app.StateSet(Chart.TreePanXKey(o.iwid),
-                    anchorX * next / zoom - (app.mouseX - ax));
-                app.StateSet(Chart.TreePanYKey(o.iwid),
-                    anchorY * next / zoom - (app.mouseY - ay));
-                zoom = next;
-                app.StateSet(Chart.TreeZoomKey(o.iwid), zoom);
-            }
-            app.RequestRedraw();
-        }
-        leafGap = leafGap * zoom / 100;
-        levelGap = levelGap * zoom / 100;
-        if (leafGap < app.Scale(6)) { leafGap = app.Scale(6); }
-        if (levelGap < app.Scale(8)) { levelGap = app.Scale(8); }
-
-        int contentSpan = leaves * leafGap;
-        int contentDepth = (depth + 1) * levelGap + app.Scale(8);
-        if (contentSpan < spanLen) { contentSpan = spanLen; }
-        if (contentDepth < depLen) { contentDepth = depLen; }
-
-        int contentW = horiz ? contentDepth : contentSpan;
-        int contentH = horiz ? contentSpan : contentDepth;
-        int maxPanX = contentW - aw;
-        int maxPanY = contentH - ah;
         int panX = app.StateGet(Chart.TreePanXKey(o.iwid), 0);
         int panY = app.StateGet(Chart.TreePanYKey(o.iwid), 0);
-        if (panX < 0) { panX = 0; }
-        if (panY < 0) { panY = 0; }
-        if (panX > maxPanX) { panX = maxPanX; }
-        if (panY > maxPanY) { panY = maxPanY; }
-        app.StateSet(Chart.TreePanXKey(o.iwid), panX);
-        app.StateSet(Chart.TreePanYKey(o.iwid), panY);
+        if (zoom == 0) {
+            zoom = 100;
+            if (natW > aw && natW > 0) { zoom = aw * 90 / natW; }
+            int zH = 100;
+            if (natH > ah && natH > 0) { zH = ah * 90 / natH; }
+            if (zH < zoom) { zoom = zH; }
+            if (zoom < 20) { zoom = 20; }
+            if (zoom > 100) { zoom = 100; }
+            panX = natW * zoom / 200 - aw / 2;
+            panY = natH * zoom / 200 - ah / 2;
+            app.StateSet(Chart.TreeZoomKey(o.iwid), zoom);
+            app.StateSet(Chart.TreePanXKey(o.iwid), panX);
+            app.StateSet(Chart.TreePanYKey(o.iwid), panY);
+        }
+        if (Ui.Wheeled(app, panId)) {
+            int ticks = ChartView.WheelTicks(app);
+            int next = ChartView.ZoomByTicks(zoom, ticks, 20, 400);
+            if (next != zoom && zoom > 0) {
+                panX = (app.mouseX - ax + panX) * next / zoom - (app.mouseX - ax);
+                panY = (app.mouseY - ay + panY) * next / zoom - (app.mouseY - ay);
+                zoom = next;
+                app.StateSet(Chart.TreeZoomKey(o.iwid), zoom);
+                app.StateSet(Chart.TreePanXKey(o.iwid), panX);
+                app.StateSet(Chart.TreePanYKey(o.iwid), panY);
+                app.RequestRedraw();
+            }
+        }
+        gapSpan = gapSpan * zoom / 100;
+        gapDep = gapDep * zoom / 100;
+        if (gapSpan < 2) { gapSpan = 2; }
+        if (gapDep < 2) { gapDep = 2; }
+
+        int contentSpan = leaves * gapSpan;
+        int contentDep = depth * gapDep + app.Scale(8);
+        if (contentSpan < 2) { contentSpan = 2; }
+        if (contentDep < 2) { contentDep = 2; }
+        int contentW = horiz ? (contentDep + labelW + rad) : contentSpan;
+        int contentH = horiz ? contentSpan : (contentDep + fh + rad);
 
         if (Ui.PressedDown(app, panId) && app.window.EventButton() == 0) {
             app.StateSet(Chart.TreeDragXKey(o.iwid), app.mouseX);
@@ -852,64 +933,58 @@ partial class ChartView {
                 - (app.mouseX - app.StateGet(Chart.TreeDragXKey(o.iwid), app.mouseX));
             panY = app.StateGet(Chart.TreeDragPanYKey(o.iwid), panY)
                 - (app.mouseY - app.StateGet(Chart.TreeDragYKey(o.iwid), app.mouseY));
-            if (panX < 0) { panX = 0; }
-            if (panY < 0) { panY = 0; }
-            if (panX > maxPanX) { panX = maxPanX; }
-            if (panY > maxPanY) { panY = maxPanY; }
-            app.StateSet(Chart.TreePanXKey(o.iwid), panX);
-            app.StateSet(Chart.TreePanYKey(o.iwid), panY);
             app.RequestRedraw();
         }
+        panX = ChartView.ClampPan(panX, contentW, aw);
+        panY = ChartView.ClampPan(panY, contentH, ah);
+        app.StateSet(Chart.TreePanXKey(o.iwid), panX);
+        app.StateSet(Chart.TreePanYKey(o.iwid), panY);
 
-        int span0 = horiz ? ay - panY : ax - panX;
-        int dep0 = (horiz ? ax - panX : ay - panY) + app.Scale(8);
+        int span0 = (horiz ? ay - panY : ax - panX);
+        int dep0 = (horiz ? ax - panX : ay - panY) + app.Scale(8) * zoom / 100;
+        int spanG = contentSpan;
+        int depG = contentDep;
 
-        // 渐入动画：整棵树沿两轴绕中心缩放。
-        int spanG = contentSpan * g / 1000;
-        int depG = contentDepth * g / 1000;
-        int spanG0 = span0 + (contentSpan - spanG) / 2;
-        int depG0 = dep0 + (contentDepth - depG) / 2;
-        if (spanG < app.Scale(4)) { spanG = app.Scale(4); }
-        if (depG < app.Scale(4)) { depG = app.Scale(4); }
+        int alpha = 255 * g / 1000;
+        if (alpha < 40) { alpha = 40; }
+        if (alpha > 255) { alpha = 255; }
 
         c.PushClip(ax, ay, aw, ah);
+        ChartView.DrawTreeCanvasGrid(app, c, ax, ay, aw, ah, panX, panY, zoom);
         List<TreeLayoutNode> layout = new List<TreeLayoutNode>();
         ChartView.TreeAssign(root, 0, 0, layout);
 
-        int rad = app.Scale(4) * zoom / 100;
-        if (rad > app.Scale(4)) { rad = app.Scale(4); }
-        if (rad < 2) { rad = 2; }
-        int lvlH = depG / (depth + 1);
         int col = 0;
         if (lead != null) { col = lead.color; }
         if (col == 0) { col = Chart.Palette(t, 0); }
+        int nodeCol = Chart.WithAlpha(col, alpha);
+        int linkCol = Chart.WithAlpha(Style.Part(app, "chart", "grid", "", "", "",
+            Style.SNormal()).BgOr(0), alpha);
+        int lblCol = Chart.WithAlpha(Style.Part(app, "chart", "label", "", "", "",
+            Style.SNormal()).FgOr(0), alpha);
 
-        // 先画连线（折线式正交连接器，ECharts lineStyle
-        // type:'broken'），再在顶层画节点，使圆点盖住线端。
         int i = 0;
         while (i < layout.Count) {
             TreeLayoutNode parent = layout[i];
             ChartNode n = parent.node;
             if (n.children.Count == 0) { i = i + 1; continue; }
             int pSpan = ChartView.TreeSpan(parent, spanG, leaves);
-            int pDep = parent.depth * lvlH;
+            int pDep = parent.depth * gapDep;
             for (int c0 = 0; c0 < n.children.Count; c0 = c0 + 1) {
                 ChartNode ch = n.children[c0];
                 int ci = 0;
                 for (; ci < layout.Count; ci = ci + 1) {
                     if (layout[ci].node == ch) { break; }
                 }
+                if (ci >= layout.Count) { continue; }
                 TreeLayoutNode child = layout[ci];
                 int cSpan = ChartView.TreeSpan(child, spanG, leaves);
-                int cDep = child.depth * lvlH;
-                int p0 = spanG0 + pSpan;
-                int p1 = depG0 + pDep;
-                int q0 = spanG0 + cSpan;
-                int q1 = depG0 + cDep;
-                int linkCol = Style.Part(app, "chart", "grid", "", "", "",
-                                         Style.SNormal()).BgOr(0);
+                int cDep = child.depth * gapDep;
+                int p0 = span0 + pSpan;
+                int p1 = dep0 + pDep;
+                int q0 = span0 + cSpan;
+                int q1 = dep0 + cDep;
                 if (horiz) {
-                    // span = y，depth = x：父节点在 (p1, p0)，子节点在 (q1, q0)
                     int mid = (p1 + q1) / 2;
                     c.DrawLine(p1, p0, mid, p0, linkCol, app.Scale(1));
                     c.DrawLine(mid, p0, mid, q0, linkCol, app.Scale(1));
@@ -924,48 +999,62 @@ partial class ChartView {
             i = i + 1;
         }
 
-        // 节点 + 标签。
         for (int j = 0; j < layout.Count; j = j + 1) {
             TreeLayoutNode item = layout[j];
             ChartNode n = item.node;
             int span = ChartView.TreeSpan(item, spanG, leaves);
-            int d = item.depth * lvlH;
-            int nx = horiz ? depG0 + d : spanG0 + span;
-            int ny = horiz ? spanG0 + span : depG0 + d;
-            c.FillCircle(nx, ny, rad, col);
-            int fs = Style.FontFallback(app, "small") * zoom / 100;
-            if (fs > Style.FontFallback(app, "small")) { fs = Style.FontFallback(app, "small"); }
-            if (fs < app.Scale(7)) { fs = app.Scale(7); }
-            string lbl = n.name;
-            if (n.children.Count == 0 && n.val > 0) {
-                lbl = n.name + " " + Convert.ToString(n.val);
+            int d = item.depth * gapDep;
+            int nx = horiz ? dep0 + d : span0 + span;
+            int ny = horiz ? span0 + span : dep0 + d;
+            if (nx + rad < ax || nx - rad > ax + aw
+                || ny + rad + fh + app.Scale(6) < ay || ny - rad > ay + ah) {
+                continue;
             }
+            c.FillCircle(nx, ny, rad, nodeCol);
+            string lbl = n.name;
             int lw = Canvas.MeasureText(lbl, fs);
-            c.DrawText(nx + rad + app.Scale(5), Canvas.CenterTextYAt(ny, fs),
-                lbl, Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
+            int lx = 0;
+            int ly = 0;
+            if (horiz) {
+                lx = nx + rad + app.Scale(6);
+                ly = Canvas.CenterTextYAt(ny, fs);
+            } else {
+                lx = nx - lw / 2;
+                ly = ny + rad + app.Scale(4);
+            }
+            c.DrawText(lx, ly, lbl, lblCol, fs);
         }
         c.PopClip();
 
+        c.DrawText(ax + app.Scale(4), ay + ah + app.Scale(2),
+            "滚轮缩放  ·  拖拽平移  ·  还原适配",
+            Style.Part(app, "chart", "hint", "", "", "", Style.SNormal()).FgOr(0),
+            hintFs);
+
         if (o.showTooltip && app.mouseX >= ax && app.mouseX < ax + aw
-            && app.mouseY >= ay && app.mouseY < ay + ah) {
+            && app.mouseY >= ay && app.mouseY < ay + ah
+            && app.StateGet(Chart.TreeDraggingKey(o.iwid), 0) == 0) {
             int mx = app.mouseX;
             int my = app.mouseY;
             int best = 0 - 1;
-            int hitRad = rad + app.Scale(6);
+            int hitRad = rad + app.Scale(8);
             for (int k = 0; k < layout.Count; k = k + 1) {
                 TreeLayoutNode item = layout[k];
                 int span = ChartView.TreeSpan(item, spanG, leaves);
-                int d = item.depth * lvlH;
-                int nx = horiz ? depG0 + d : spanG0 + span;
-                int ny = horiz ? spanG0 + span : depG0 + d;
+                int d = item.depth * gapDep;
+                int nx = horiz ? dep0 + d : span0 + span;
+                int ny = horiz ? span0 + span : dep0 + d;
+                string lbl = item.node.name;
+                int lw = Canvas.MeasureText(lbl, fs);
+                int lx = horiz ? nx + rad + app.Scale(6) : nx - lw / 2;
+                int ly = horiz ? Canvas.CenterTextYAt(ny, fs) : ny + rad + app.Scale(4);
                 int dx = mx - nx;
                 int dy = my - ny;
-                if (dx >= 0 - hitRad && dx <= hitRad
+                bool onDot = dx >= 0 - hitRad && dx <= hitRad
                     && dy >= 0 - hitRad && dy <= hitRad
-                    && dx * dx + dy * dy <= hitRad * hitRad) {
-                    best = k;
-                    break;
-                }
+                    && dx * dx + dy * dy <= hitRad * hitRad;
+                bool onLbl = mx >= lx && mx < lx + lw && my >= ly && my < ly + fh;
+                if (onDot || onLbl) { best = k; break; }
             }
             if (best >= 0) {
                 ChartNode hn = layout[best].node;

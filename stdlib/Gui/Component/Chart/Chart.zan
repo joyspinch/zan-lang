@@ -48,6 +48,19 @@ class ChartFrame {
     int timeMin;
     int timeMax;
 
+    // 第 i 类目左缘。用 i*W/n 而不是固定 step，余数摊到末格，
+    // 最后一根柱/最后一个标签贴上绘图区右缘。
+    int CatLeft(int i, int n) {
+        if (n < 1) { return this.plotX; }
+        return this.plotX + i * this.plotW / n;
+    }
+    int CatWidth(int i, int n) {
+        return this.CatLeft(i + 1, n) - this.CatLeft(i, n);
+    }
+    int CatMid(int i, int n) {
+        return this.CatLeft(i, n) + this.CatWidth(i, n) / 2;
+    }
+
     // 左轴（axisIndex 0）或右轴（1）上数值对应的像素 Y，
     // 遵循各轴预设的翻转标志。
     int YOf(int v, int axisIndex) {
@@ -145,6 +158,20 @@ class Chart {
         return (packed - (int)4278190080) + a * 16777216;
     }
 
+    /// 在 `bg` 上对比足够的前景：浅底深字、深底白字。
+    /// 饼图扇区 / 地图填色上的标签用它，避免白字画在黄块上。
+    static int ContrastFg(int bg) {
+        int r = bg >> 16 & 255;
+        int g = bg >> 8 & 255;
+        int b = bg & 255;
+        int lum = (r * 299 + g * 587 + b * 114) / 1000;
+        if (lum > 155) { return Chart.Rgb(32, 36, 42); }
+        return Chart.Rgb(255, 255, 255);
+    }
+
+    // 本帧工具箱占用的右上角宽度；DrawPanelI / PanelHead 让开它。
+    static int toolReserve;
+
     // 多段线性色带插值（visualMap inRange）：t ∈ [0,1000] 均匀映射
     // 到 colors 首尾之间，段内线性混合。colors 少于 2 个时取首色。
     static int RampAt(List<int> colors, int t) {
@@ -207,6 +234,35 @@ class Chart {
             for (int j = 0; j < s.Count(); j = j + 1) { if (s.Value(j) > mx) { mx = s.Value(j); } }
         }
         return mx;
+    }
+
+    // 系列中的最小值（无负数时为 0）。水平条 / 旋风图用它
+    // 把轴下界扩到 0 以下，而不是把负值裁成空柱。
+    static int MinOf(List<ChartSeries> series) {
+        int mn = 0;
+        for (int i = 0; i < series.Count; i = i + 1) {
+            ChartSeries s = series[i];
+            if (!s.hidden) {
+                for (int j = 0; j < s.Count(); j = j + 1) {
+                    if (s.Value(j) < mn) { mn = s.Value(j); }
+                }
+            }
+        }
+        return mn;
+    }
+
+    // 数值 → 水平像素：plotX 对应 lo，plotX+plotW 对应 hi。
+    static int ValueX(int plotX, int plotW, int lo, int hi, int v) {
+        int span = hi - lo;
+        if (span < 1) { span = 1; }
+        return plotX + (v - lo) * plotW / span;
+    }
+
+    // 数值 → 垂直像素：plotY+plotH 对应 lo，plotY 对应 hi（向上增大）。
+    static int ValueY(int plotY, int plotH, int lo, int hi, int v) {
+        int span = hi - lo;
+        if (span < 1) { span = 1; }
+        return plotY + plotH - (v - lo) * plotH / span;
     }
 
     // 仅索引窗口 [i0,i1]（含端点）内的最大值，供 dataZoom
@@ -452,6 +508,79 @@ class Chart {
     // 交互 id `wid` 下系列 `si` 的图例隐藏状态键。
     static int LegendKey(int wid, int si) { return 6000000 + wid * 64 + si; }
 
+    // 饼/漏斗/玫瑰扇区、和弦/力导节点：按 (系列, 数据项) 持久化隐藏。
+    // 与 LegendKey 分段错开，避免单系列多扇区共用一个键把整图关掉。
+    static int LegendSliceKey(int wid, int si, int di) {
+        return 6200000 + wid * 1024 + si * 64 + di;
+    }
+    static int PieSelKey(int wid, int si, int di) {
+        return 6400000 + wid * 1024 + si * 64 + di;
+    }
+
+    static int LegendChipW(App app, string label) {
+        int lgFs = Style.FontFallback(app, "small");
+        return app.Scale(12) + app.Scale(6)
+            + Canvas.MeasureText(label, lgFs) + app.Scale(10);
+    }
+
+    // 标题行与工具箱行的底边：空标题不占大号行高，有工具箱时
+    // 内容从工具箱下方开始，避免标题/色块和工具图标叠在一起。
+    static int HeadBandBottom(App app, int y, string title) {
+        int pad = app.theme.paddingMedium;
+        int top = y + pad;
+        int h = 0;
+        if (title.Length > 0) {
+            h = Canvas.FontHeight(Style.FontFallback(app, "large"));
+        }
+        if (Chart.toolReserve > 0) {
+            int th = ChartToolbox.Height(app);
+            if (th > h) { h = th; }
+        }
+        if (h < 1) { return top; }
+        return top + h + app.Scale(4);
+    }
+
+    /// 右侧色块图例一行：独立 AllocId 命中，stateKey 跨帧持久化。
+    /// 点一下切换隐藏（变暗 + 删除线），再点恢复。返回是否刚点中。
+    static bool DrawLegendChip(App app, int lx, int ly, int legendW, int lh,
+                               int color, string label, bool hidden, int stateKey) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int sw = app.Scale(12);
+        int hitId = app.focus.AllocId();
+        app.hitTester.RegisterRect(hitId, lx, ly, legendW, lh, 3);
+        bool hot = app.mouseX >= lx && app.mouseX < lx + legendW
+            && app.mouseY >= ly && app.mouseY < ly + lh;
+        int rowCol = color;
+        int lblColor = Style.Part(app, "chart", "label", "", "", "",
+            Style.SNormal()).FgOr(0);
+        if (hidden) {
+            rowCol = Chart.WithAlpha(color, 90);
+            lblColor = Chart.WithAlpha(lblColor, 110);
+        }
+        c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, rowCol);
+        if (hot && !hidden) {
+            c.DrawRoundRect(lx - app.Scale(1), ly + app.Scale(1),
+                sw + app.Scale(2), sw + app.Scale(2), t.borderRadiusSmall,
+                t.primary, 1);
+        }
+        int lgFs = Style.FontFallback(app, "small");
+        c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1), label, lblColor, lgFs);
+        if (hidden) {
+            int my = ly + app.Scale(2) + Canvas.FontHeight(lgFs) / 2;
+            int tw = Canvas.MeasureText(label, lgFs);
+            c.FillRect(lx + sw + app.Scale(6), my, tw, 1, lblColor);
+        }
+        if (stateKey != 0 && Ui.Clicked(app, hitId)) {
+            int nv = 1;
+            if (hidden) { nv = 0; }
+            app.StateSet(stateKey, nv);
+            app.RequestRedraw();
+            return true;
+        }
+        return false;
+    }
+
     // dataZoom 窗口状态键（分类范围的千分值 0..1000）。
     static int ZoomLoKey(int wid) { return 7000000 + wid * 2; }
     static int ZoomHiKey(int wid) { return 7000000 + wid * 2 + 1; }
@@ -462,13 +591,31 @@ class Chart {
     static int TreeDragPanXKey(int wid) { return 8000000 + wid * 16 + 4; }
     static int TreeDragPanYKey(int wid) { return 8000000 + wid * 16 + 5; }
     static int TreeDraggingKey(int wid) { return 8000000 + wid * 16 + 6; }
-    // 树缩放，为自然节点间距的百分比。0 表示"未设置
-    // "：首帧将整棵树适配进绘图区，
-    // 而不是在超大布局的角落打开。
-    static int TreeZoomKey(int wid) { return 8000000 + wid * 8 + 7; }
+    // 树缩放，为自然节点间距的百分比。0 表示尚未适配：
+    // 首帧（或工具箱「还原」）把整棵树放进视口中心，之后镜头
+    // 就是无限画布——平移不夹紧、缩放不因窗口尺寸变化而重置。
+    static int TreeZoomKey(int wid) { return 8000000 + wid * 16 + 7; }
+    static int TreeSizeWKey(int wid) { return 8000000 + wid * 16 + 8; }
+    static int TreeSizeHKey(int wid) { return 8000000 + wid * 16 + 9; }
+    static int TreeHitKey(int wid) { return 8000000 + wid * 16 + 10; }
 
     // 快照槽位的 RenderCache 指纹键（见 ChartView.RenderCached）。
     static int CacheKey(int slot) { return 9000000 + slot; }
+
+    // toolbox / 地图漫游 / 选中（与 Tree* 8000000 段错开）。
+    static int TbViewKey(int wid) { return 8200000 + wid * 8; }
+    static int TbMagicKey(int wid) { return 8200000 + wid * 8 + 1; }
+    static int TbZoomKey(int wid) { return 8200000 + wid * 8 + 2; }
+    static int MapZoomKey(int wid) { return 8200000 + wid * 8 + 3; }
+    static int MapPanXKey(int wid) { return 8200000 + wid * 8 + 4; }
+    static int MapPanYKey(int wid) { return 8200000 + wid * 8 + 5; }
+    static int MapSelKey(int wid) { return 8200000 + wid * 8 + 6; }
+    static int MapDragKey(int wid) { return 8200000 + wid * 8 + 7; }
+    static int MapDragXKey(int wid) { return 8300000 + wid * 4; }
+    static int MapDragYKey(int wid) { return 8300000 + wid * 4 + 1; }
+    static int MapDragPanXKey(int wid) { return 8300000 + wid * 4 + 2; }
+    static int MapDragPanYKey(int wid) { return 8300000 + wid * 4 + 3; }
+    static int TbHitKey(int wid, int k) { return 8500000 + wid * 8 + k; }
 
     // 将缩放窗口解析为包含端点的分类索引范围 [i0,i1]。
     static int ZoomI0(App app, ChartOption o, int wid, int n) {
@@ -573,6 +720,85 @@ class Chart {
         }
     }
 
+    // 右侧竖排图例的起始 y：工具箱占着标题行时下移，避免挡住色块。
+    static int LegendStartY(App app, int y, int proposed) {
+        if (Chart.toolReserve < 1) { return proposed; }
+        int bandBot = y + app.theme.paddingMedium
+            + ChartToolbox.Height(app) + app.Scale(4);
+        if (proposed < bandBot) { return bandBot; }
+        return proposed;
+    }
+
+    // 图例占用的行数：有工具箱时整排下移到标题行之下（至少 1 行）；
+    // 否则与标题同行，仅统计放不下而换出的行。
+    static int LegendRowCount(App app, int x, int w, string title,
+                              List<ChartSeries> series) {
+        if (series == null || series.Count < 1) { return 0; }
+        int pad = app.theme.paddingMedium;
+        int lgFs = Style.FontFallback(app, "small");
+        int sw = app.Scale(12);
+        bool below = Chart.toolReserve > 0;
+        int extra = 0;
+        if (below) {
+            extra = 1;
+            int xCur = x + pad;
+            int maxX = x + w - pad;
+            for (int si = 0; si < series.Count; si = si + 1) {
+                int chipW = sw + app.Scale(6)
+                    + Canvas.MeasureText(series[si].name, lgFs);
+                if (xCur > x + pad && xCur + chipW > maxX) {
+                    extra = extra + 1;
+                    xCur = x + pad;
+                }
+                xCur = xCur + chipW + app.Scale(14);
+            }
+            return extra;
+        }
+        int lx = x + w - pad;
+        int leftLimit = x + pad;
+        if (title.Length > 0) {
+            leftLimit = x + pad
+                + Canvas.MeasureText(title, Style.FontFallback(app, "large"))
+                + app.Scale(14);
+        }
+        int si = series.Count - 1;
+        while (si >= 0) {
+            int tw = Canvas.MeasureText(series[si].name, lgFs);
+            int rowLeft = lx - tw - app.Scale(6) - sw;
+            if (rowLeft < leftLimit) {
+                extra = extra + 1;
+                lx = x + w - pad;
+                leftLimit = x + pad;
+                rowLeft = lx - tw - app.Scale(6) - sw;
+                if (rowLeft < leftLimit) { rowLeft = leftLimit; }
+            }
+            lx = rowLeft - app.Scale(14);
+            si = si - 1;
+        }
+        return extra;
+    }
+
+    // 面板内容区顶部 y：标题/工具箱行 + 图例行 + 间隙。
+    // DrawPanelI 与 PanelTopI 共用，悬停层才能与主体对齐。
+    static int PanelContentTop(App app, int x, int y, int w, string title,
+                               List<ChartSeries> series, bool showLegend) {
+        int pad = app.theme.paddingMedium;
+        int titleH = Canvas.FontHeight(Style.FontFallback(app, "large"));
+        int headH = titleH;
+        if (Chart.toolReserve > 0) {
+            int th = ChartToolbox.Height(app);
+            if (th > headH) { headH = th; }
+        }
+        int belowGap = 0;
+        int extra = 0;
+        if (showLegend) {
+            extra = Chart.LegendRowCount(app, x, w, title, series);
+            if (Chart.toolReserve > 0) { belowGap = app.Scale(4); }
+        }
+        int rowH = Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(6);
+        return y + pad + headH + belowGap + extra * rowH + app.Scale(6);
+    }
+
     // 面板 + 交互式图例。wid != 0 时每个色块是一个命中区域：
     // 点击切换该系列的可见性（以 wid 为键持久化在
     // App 状态映射中），解析后的隐藏标志写入帧内系列
@@ -590,14 +816,18 @@ class Chart {
         c.SurfaceRoundRect(x, y, w, h, t.borderRadiusMedium, sPanel.BgOr(0), sPanel.BorderOr(0), 1);
 
         int top = y + pad;
-        if (title.Length > 0) {
-            c.DrawText(x + pad, top, title, sPanel.FgOr(0), Style.FontFallback(app, "large"));
+        int titleFs = Style.FontFallback(app, "large");
+        int titleH = Canvas.FontHeight(titleFs);
+        int titleMax = x + w - pad - Chart.toolReserve - (x + pad) - app.Scale(8);
+        if (title.Length > 0 && titleMax > 0) {
+            c.PushClip(x + pad, top, titleMax, titleH);
+            c.DrawText(x + pad, top, title, sPanel.FgOr(0), titleFs);
+            c.PopClip();
         }
 
         if (showLegend) {
-        // 图例（右上角），每系列一个色块 + 名称，从右到左；
-        // 放不下时换行，且第一行避开左侧标题文字——
-        // 多系列 / 长名称的图例不得压住标题或溢出面板。
+        // 有工具箱：图例整排下移到标题/工具箱行之下，永不互挡。
+        // 无工具箱：仍与标题同行，从右往左排，放不下再换行。
         StyleBox sLegend = Style.Part(app, "chart", "legend", "", "", "",
                                       Style.SNormal());
         StyleBox sLegendOff = Style.Part(app, "chart", "legend", "", "off", "",
@@ -605,20 +835,71 @@ class Chart {
         int sw = app.Scale(12);
         int lgFs = Style.FontFallback(app, "small");
         int rowH = Canvas.FontHeight(lgFs) + app.Scale(6);
+        bool below = Chart.toolReserve > 0;
+        int headH = titleH;
+        if (below) {
+            int toolH = ChartToolbox.Height(app);
+            if (toolH > headH) { headH = toolH; }
+        }
         int lgY = y + pad;
+        if (below) {
+            lgY = y + pad + headH + app.Scale(4);
+            int xCur = x + pad;
+            int maxX = x + w - pad;
+            int totW = 0;
+            for (int sm = 0; sm < series.Count; sm = sm + 1) {
+                totW = totW + sw + app.Scale(6)
+                    + Canvas.MeasureText(series[sm].name, lgFs) + app.Scale(14);
+            }
+            if (series.Count > 0) { totW = totW - app.Scale(14); }
+            if (totW > 0 && totW <= maxX - xCur) {
+                xCur = xCur + (maxX - xCur - totW) / 2;
+            }
+            for (int si = 0; si < series.Count; si = si + 1) {
+                bool hid = series[si].hidden;
+                if (wid != 0) {
+                    hid = app.StateGet(Chart.LegendKey(wid, si), hid ? 1 : 0) == 1;
+                }
+                string nm = series[si].name;
+                int tw = Canvas.MeasureText(nm, lgFs);
+                int chipW = sw + app.Scale(6) + tw;
+                if (xCur > x + pad && xCur + chipW > maxX) {
+                    xCur = x + pad;
+                    lgY = lgY + rowH;
+                }
+                int txtCol = sLegend.FgOr(0);
+                int swCol = series[si].color;
+                if (hid) { txtCol = sLegendOff.FgOr(0); swCol = sLegendOff.BgOr(0); }
+                c.FillRoundRect(xCur, lgY + app.Scale(3), sw, sw, t.borderRadiusSmall, swCol);
+                c.DrawText(xCur + sw + app.Scale(6), lgY + app.Scale(2), nm, txtCol, lgFs);
+                if (hid) {
+                    int my = lgY + app.Scale(2) + Canvas.FontHeight(lgFs) / 2;
+                    c.FillRect(xCur + sw + app.Scale(6), my, tw, 1, sLegendOff.FgOr(0));
+                }
+                if (wid != 0) {
+                    int hitId = app.focus.AllocId();
+                    app.hitTester.RegisterRect(hitId, xCur, lgY, chipW, rowH, 3);
+                    if (Ui.Clicked(app, hitId)) {
+                        int nv = 1;
+                        if (hid) { nv = 0; }
+                        app.StateSet(Chart.LegendKey(wid, si), nv);
+                        hid = (nv == 1);
+                        app.RequestRedraw();
+                    }
+                }
+                series[si].hidden = hid;
+                xCur = xCur + chipW + app.Scale(14);
+            }
+        } else {
         int lx = x + w - pad;
-        // 第一行的左界让开标题；换行后的行占满整宽。
         int leftLimit = x + pad;
         if (title.Length > 0) {
             leftLimit = x + pad
-                + Canvas.MeasureText(title, Style.FontFallback(app, "large"))
+                + Canvas.MeasureText(title, titleFs)
                 + app.Scale(14);
         }
-        int extraRows = 0;
         int si = series.Count - 1;
         while (si >= 0) {
-            // 先解析持久化的可见性，使图例和
-            // 绘图在本帧达成一致。
             bool hid = series[si].hidden;
             if (wid != 0) {
                 hid = app.StateGet(Chart.LegendKey(wid, si), hid ? 1 : 0) == 1;
@@ -628,9 +909,7 @@ class Chart {
             int tw = Canvas.MeasureText(nm, lgFs);
             int rowLeft = lx - tw - app.Scale(6) - sw;
             if (rowLeft < leftLimit) {
-                // 当前行放不下：换到下一行，从右缘重排。
                 lgY = lgY + rowH;
-                extraRows = extraRows + 1;
                 lx = x + w - pad;
                 leftLimit = x + pad;
                 rowLeft = lx - tw - app.Scale(6) - sw;
@@ -666,13 +945,10 @@ class Chart {
             lx = rowLeft - app.Scale(14);
             si = si - 1;
         }
-        // 换行占用的额外高度计入返回值，使绘图区下移，
-        // 图例永不与坐标轴/图形重叠。
-        return top + Canvas.FontHeight(Style.FontFallback(app, "large"))
-            + app.Scale(6) + extraRows * rowH;
+        }
         }
 
-        return top + Canvas.FontHeight(Style.FontFallback(app, "large")) + app.Scale(6);
+        return Chart.PanelContentTop(app, x, y, w, title, series, showLegend);
     }
 
     /// 只算不画：与 DrawPanelI 完全一致的面板内容顶部
@@ -681,36 +957,7 @@ class Chart {
     /// DrawPanelI / PanelHead，它们会重绘面板背景盖住图形。
     static int PanelTopI(App app, int x, int y, int w, string title,
                          List<ChartSeries> series, bool showLegend) {
-        int pad = app.theme.paddingMedium;
-        int rowH = Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(6);
-        int extraRows = 0;
-        if (showLegend) {
-            int lgFs = Style.FontFallback(app, "small");
-            int sw = app.Scale(12);
-            int lx = x + w - pad;
-            int leftLimit = x + pad;
-            if (title.Length > 0) {
-                leftLimit = x + pad
-                    + Canvas.MeasureText(title, Style.FontFallback(app, "large"))
-                    + app.Scale(14);
-            }
-            int si = series.Count - 1;
-            while (si >= 0) {
-                int tw = Canvas.MeasureText(series[si].name, lgFs);
-                int rowLeft = lx - tw - app.Scale(6) - sw;
-                if (rowLeft < leftLimit) {
-                    extraRows = extraRows + 1;
-                    lx = x + w - pad;
-                    leftLimit = x + pad;
-                    rowLeft = lx - tw - app.Scale(6) - sw;
-                    if (rowLeft < leftLimit) { rowLeft = leftLimit; }
-                }
-                lx = rowLeft - app.Scale(14);
-                si = si - 1;
-            }
-        }
-        return y + pad + Canvas.FontHeight(Style.FontFallback(app, "large"))
-            + app.Scale(6) + extraRows * rowH;
+        return Chart.PanelContentTop(app, x, y, w, title, series, showLegend);
     }
 
     // 左轴上的阴影 markArea 带 [markLo, markHi]（绘制在
@@ -789,10 +1036,11 @@ class Chart {
 
         int n = labels.Count;
         if (n > 0) {
-            int step = plotW / n;
             for (int ci = 0; ci < n; ci = ci + 1) {
-                int cxs = plotX + ci * step;
-                c.DrawTextCentered(cxs, plotY + plotH + app.Scale(4), step, botGut, labels[ci], sAxis.FgOr(0), axisFs);
+                int cxs = plotX + ci * plotW / n;
+                int cellW = plotX + (ci + 1) * plotW / n - cxs;
+                c.DrawTextCentered(cxs, plotY + plotH + app.Scale(4), cellW, botGut,
+                    labels[ci], sAxis.FgOr(0), axisFs);
             }
         }
 
@@ -847,10 +1095,11 @@ class Chart {
 
         int n = labels.Count;
         if (n > 0) {
-            int step = plotW / n;
             for (int ci = 0; ci < n; ci = ci + 1) {
-                int cxs = plotX + ci * step;
-                c.DrawTextCentered(cxs, plotY + plotH + app.Scale(4), step, botGut, labels[ci], sAxis.FgOr(0), axisFs);
+                int cxs = plotX + ci * plotW / n;
+                int cellW = plotX + (ci + 1) * plotW / n - cxs;
+                c.DrawTextCentered(cxs, plotY + plotH + app.Scale(4), cellW, botGut,
+                    labels[ci], sAxis.FgOr(0), axisFs);
             }
         }
 
@@ -999,7 +1248,7 @@ class Chart {
         int leftGut = Chart.TickLabelW(leftLo, leftHi, ticks, fs) + app.Scale(12);
         int rightGut = pad;
         if (hasRight) { rightGut = Chart.TickLabelW(rightLo, rightHi, ticks, fs) + app.Scale(12); }
-        int botGut = fh + app.Scale(8);
+        int botGut = fh + app.Scale(12);
         if (x0.title.Length > 0) { botGut = botGut + fh + app.Scale(2); }
         int topGut = 0;
         if (y0.title.Length > 0 || y1.title.Length > 0) { topGut = fh + app.Scale(2); }
@@ -1051,7 +1300,8 @@ class Chart {
                 if (grid) { c.FillRect(plotX, gy, plotW, 1, sGrid.BgOr(0)); }
                 string ls = Convert.ToString(lv);
                 int lw = Canvas.MeasureText(ls, fs);
-                c.DrawText(plotX - app.Scale(6) - lw, gy - fh / 2, ls, sAxis.FgOr(0), fs);
+                c.DrawText(plotX - app.Scale(6) - lw, Canvas.CenterTextYAt(gy, fs),
+                    ls, sAxis.FgOr(0), fs);
             }
         } else {
             int leftSpan = leftHi - leftLo;
@@ -1061,7 +1311,8 @@ class Chart {
                 if (grid) { c.FillRect(plotX, gy, plotW, 1, sGrid.BgOr(0)); }
                 string ls = Convert.ToString(lv);
                 int lw = Canvas.MeasureText(ls, fs);
-                c.DrawText(plotX - app.Scale(6) - lw, gy - fh / 2, ls, sAxis.FgOr(0), fs);
+                c.DrawText(plotX - app.Scale(6) - lw, Canvas.CenterTextYAt(gy, fs),
+                    ls, sAxis.FgOr(0), fs);
             }
         }
         if (hasRight) {
@@ -1070,7 +1321,7 @@ class Chart {
                 for (int ri = 0; ri < rts.Count; ri = ri + 1) {
                     int rv = rts[ri];
                     int gy = f.YOfLog(rv, 1);
-                    c.DrawText(plotRight + app.Scale(6), gy - fh / 2,
+                    c.DrawText(plotRight + app.Scale(6), Canvas.CenterTextYAt(gy, fs),
                         Convert.ToString(rv), sAxis.FgOr(0), fs);
                 }
             } else {
@@ -1078,7 +1329,7 @@ class Chart {
                 for (int k = 0; k <= ticks; k = k + 1) {
                     int rv = rightLo + rightSpan * k / ticks;
                     int gy = f.YOf(rv, 1);
-                    c.DrawText(plotRight + app.Scale(6), gy - fh / 2,
+                    c.DrawText(plotRight + app.Scale(6), Canvas.CenterTextYAt(gy, fs),
                         Convert.ToString(rv), sAxis.FgOr(0), fs);
                 }
             }
@@ -1103,16 +1354,18 @@ class Chart {
                     }
                 }
             } else {
-                int step = plotW / n;
                 int labelGap = app.Scale(6);
                 int labelRight = plotX - labelGap;
                 for (int ci = 0; ci < n; ci = ci + 1) {
-                    int cxs = plotX + ci * step;
+                    int cxs = f.CatLeft(ci, n);
+                    int cellW = f.CatWidth(ci, n);
                     int labelW = Canvas.MeasureText(labels[ci], fs);
-                    int labelLeft = cxs + (step - labelW) / 2;
+                    int labelLeft = cxs + (cellW - labelW) / 2;
                     if (labelLeft < cxs) { labelLeft = cxs; }
-                    if (labelLeft >= labelRight + labelGap && labelLeft + labelW <= plotX + plotW) {
-                        c.DrawTextCentered(cxs, plotBot + app.Scale(4), step, fh + app.Scale(4), labels[ci], sAxis.FgOr(0), fs);
+                    bool last = ci == n - 1;
+                    if (last || labelLeft >= labelRight + labelGap) {
+                        c.DrawTextCentered(cxs, plotBot + app.Scale(4), cellW,
+                            fh + app.Scale(4), labels[ci], sAxis.FgOr(0), fs);
                         labelRight = labelLeft + labelW;
                     }
                 }

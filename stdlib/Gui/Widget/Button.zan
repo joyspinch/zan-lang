@@ -21,6 +21,10 @@ namespace Gui.Widget;
 ///     .stacked                                    图标在标签上方
 ///     .align-left                                 内容靠起始边缘
 ///
+/// 满宽按钮不需要专门的 prop：停靠成一列时按钮本来就占满容器宽度，
+/// 放在 Flex 里给它挂 `.grow`（flex-grow: 1）即可——这就是
+/// Naive UI `block` 的效果。
+///
 /// `Style` 把主题默认 -> 皮肤规则 -> 悬停/按下状态解析为一个
 /// StyleBox，`BoxContent` 在该盒子里绘制图标和标签，
 /// `Ui.Activate` 使其可点击——所以本类只负责测量自身并
@@ -73,6 +77,13 @@ class Button : Control {
     /// 粗体字（font-weight: 700）。Naive UI Button 的 strong 属性。
     bool Strong;
 
+    /// 图标在标签的哪一侧：`""`/`"left"` 前置（默认），`"right"` 后置。
+    /// 对应 Naive UI 的 icon-placement。后置图标走 BoxContent 的
+    /// trailing 槽位，所以宽度、间距和居中逻辑与前置完全一致
+    /// （"下一步 →"、"更多 ▾" 这类按钮）。
+    /// 图标在标签**上方**是另一回事，用 `Class = "stacked"`。
+    string IconPlacement;
+
     void InitButton(string label) {
         this.InitControl(label, 1);
         Text = label;
@@ -89,6 +100,7 @@ class Button : Control {
         Tertiary = false;
         Quaternary = false;
         Strong = false;
+        IconPlacement = "";
     }
 
     /// `new Button { Text = "Save", Class = "primary" }`
@@ -113,6 +125,10 @@ class Button : Control {
     /// 按钮被激活的帧为 true——与 Click 对应的
     /// 轮询版本。
     bool WasClicked() { return clicked; }
+
+    /// 按钮的主动作就是点击，因此遍历整棵子树问「谁被按了」的宿主
+    /// （Control.FiredIn）不必知道 Button 这个类型。
+    override bool Fired() { return clicked; }
 
     /// 悬停气泡显示的内容：标签，其下方是命令的
     /// 作用（仅标签看不出新意）。
@@ -206,8 +222,13 @@ class Button : Control {
         if (corners != Corner.All()) { s.SetCorners(corners); }
         w = s.ClampW(w);
         h = s.ClampH(h);
+        // IconPlacement 决定图标走前置槽位还是 BoxContent 的 trailing
+        // 槽位；两者宽度相同，所以测量不必分支。
+        string lead = Icon;
+        string tail = "";
+        if (IconPlacement == "right") { lead = ""; tail = Icon; }
         BoxContent.Paint(app, wid, "button", Class, name, s, x, y, w, h,
-                         Icon, this.Label(), "", busy, off);
+                         lead, this.Label(), tail, busy, off);
         // 恢复 Class，避免设计器/序列化器读到污染的字段。
         Class = origClass;
         if (off || busy) { return wid; }
@@ -231,24 +252,40 @@ class Button : Control {
 
     // ---- 自定义 Color 注入 ------------------------------------------------
 
-    /// 上一帧注入的色值（0=无），与当前 Color 字段对比以检测变化。
-    int lastInjectedColor;
-    int lastColorGen;
-
     /// 解析样式前确保 Color 的 CSS 规则已注入 sheet。
     /// 颜色变化时（1）重新注入派生 CSS（2）触发样式缓存失效。
+    ///
+    /// 判重只能查 sheet 里是否已有该色值的规则——不能用按钮
+    /// 自身的实例字段，也不能用 bgThemeGen：立即模式的界面
+    /// （演示页、设计器画布）每帧重建控件，实例字段到下一帧
+    /// 就归零；而注入本身会递增代次，拿代次当守卫时下一帧必然
+    /// 判作"已变化"。两者的结局相同：每个 Color 按钮每帧重新
+    /// 注入并再次递增 bgThemeGen，整张样式缓存与 baseSheets
+    /// 每帧作废重建，一帧里把 base.css 重解析数次，帧耗时以秒
+    /// 计，事件循环被饿死，窗口进入"未响应"。按色值选择器的
+    /// 存在性判重后，每个色值在每张 sheet 上只注入一次；换肤
+    /// 换掉整张 sheet，规则随之消失，这里自然重新注入。
     void EnsureColorInjected(App app) {
         int c = 0;
         if (Color != null) { c = Color.Get(); }
-        int curGen = app.bgThemeGen;
-        if (c == lastInjectedColor && curGen == lastColorGen) { return; }
-        lastInjectedColor = c;
-        lastColorGen = curGen;
-        if (app.sheet == null || c == 0) { return; }
+        if (c == 0 || app.sheet == null) { return; }
+        if (app.sheet.Block(Button.CustomSelector(c)) != null) { return; }
         string css = this.BuildColorCss(c);
         StyleSheet tmp = StyleSheet.FromCss(css);
         app.sheet.MergeSheet(tmp);
         app.bgThemeGen = app.bgThemeGen + 1;
+    }
+
+    /// Color 派生规则的选择器：`button[class*="custom-<hex>"]`。
+    /// 片段按色值取键，同页多个 Color 按钮互不覆盖；带 `button`
+    /// 类型前缀使特异性与 base.css 的默认外观规则
+    /// `button[class*="custom-"]` 持平，而应用 sheet 在基础层
+    /// 之后应用、同权重时后规则胜出，派生色因此覆盖默认外观。
+    /// BuildColorCss 与判重共用同一份文本。
+    static string CustomSelector(int c) {
+        string hex = Style.Hex8(c);
+        if (hex.Length == 8) { hex = hex.Substring(2, 6); }
+        return "button[class*=\"custom-" + hex + "\"]";
     }
 
     /// 编码 Color 值为 `custom-{hex}` class 片段，附加到 Class 末尾。
@@ -262,11 +299,11 @@ class Button : Control {
     }
 
     /// 从 Color 值生成 hover/pressed 派生色 CSS 规则。
-    /// 选择器 `[class*="custom-"]` 子串匹配任意 custom-{hex}。
+    /// 选择器按色值取片段匹配，见 CustomSelector。
     string BuildColorCss(int c) {
-        string sel = "[class*=\"custom-\"]";
-        string selH = "[class*=\"custom-\"]:hover";
-        string selA = "[class*=\"custom-\"]:active";
+        string sel = Button.CustomSelector(c);
+        string selH = sel + ":hover";
+        string selA = sel + ":active";
         int hov = App.Lighten(c, 100);
         int prs = App.Darken(c, 100);
         string css = sel + " { background: #" + Style.Hex8(c)
@@ -308,6 +345,9 @@ class Button : Control {
         PropSpec strg = PropSpec.Bool("strong", "Strong");
         strg.flag = Strong;
         ps.Add(strg);
+        PropSpec ip = PropSpec.Text("iconPlacement", "Icon placement");
+        ip.str = IconPlacement;
+        ps.Add(ip);
         PropSpec cls = PropSpec.Text("class", "Classes");
         cls.str = Class;
         ps.Add(cls);
