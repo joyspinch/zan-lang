@@ -43,6 +43,11 @@ A32（遗留收尾路线）、A33-A47（专项记录）、文末"已撤回的结
 > 以下数字是审计起点快照，已随 B2（calloc 清零）/ B1-4（新增五模块）/ A0-A2（定宽）
 > 等大幅变化，仅作基线参考，当前以实测为准。
 
+> **2026-08-27 实测**：`stdlib/**/*.zan` 现为 **1186 文件 / 11.8MB**（下表的
+> 767 文件 / 4.6MB 是 2026-07-27 历史快照，仅作趋势参考；各目录当前的行数与
+> 文档覆盖率见 **C9**）。另：本节下方"超过 150 行的方法 23 个（现 22 个）"与
+> **B3-2** 正文里的"现 36 个"矛盾，以 B3-2 的 36 个为准。
+
 **代码量**（`stdlib/**/*.zan`，767 文件 4.6MB）：
 
 | 顶层目录 | 总行 | 代码行 | 文档注释 | 文档覆盖率 | 层级定位 |
@@ -349,22 +354,27 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
     宽度是 i32、角度必然丢成 0（当前无人调用）；要修得加独立 `angle` 参数导出，
     届时六平台驱动都要重编。
 * **B5-2 🟡 大部分完成**（`067ec4e` 删掉 C Win32 shell 与 link-only shims）。
-  `gui_runtime_shims.c` 只剩 macOS 非-Cocoa 构建的 **22 个 WebView no-op 桩**。
+  `gui_runtime_shims.c` 只剩 macOS 非-Cocoa 构建的 WebView no-op 桩
+  （2026-08-27 实测 **23 个**，`gui_runtime_shims.c:29-69`；清单原写 22）。
   **剩余**：macOS 那条分支要么接真 WKWebView、要么让 Zan 侧 `#if` 兜底后整文件删掉。
 * **B5-3 ✅ 已完成**（`406c451` gui: draw icons in Zan as vector primitives）。
   `draw_icon` 在 `src/runtime/*.c` 里零匹配。
 * **B5-4 ✅ 已完成**（`067ec4e`）删 `gui_runtime_text.c` 的 Win32 窗口壳：
   只剩 3 个文字导出（draw_text / measure_text / font_height）。
 * **B5-5** [ ] 〔A2 后〕`X11Shell.zan`：X11 窗口管理导出已从 `gui_runtime_font.c`
-  离开，但落在新的 `src/runtime/gui_runtime_x11.c`（30KB / **25 个导出**），**仍是 C**。
+  离开，但落在新的 `src/runtime/gui_runtime_x11.c`（2026-08-27 实测
+  **32.4KB / 28 个导出**；清单原写 30KB / 25），**仍是 C**。
   注意宏用函数版代替（`XDefaultScreen` 等），不构成阻塞。
 * **B5-6** [ ] 〔A2+A3 后〕SDL 后端（window registry / event queue / dirty rect /
   texture 上传）改由 Zan 组织，C facade 退回纯绑定；Cocoa 后端
   （`objc_allocateClassPair` + `class_addMethod` 造类）。
 * **B5-7** [ ] 终态：删除 `zan_gui` 和 `zan_sdl3` 两个自建垫片。
-  〔2026-08-08 复核〕`zan_gui` **109**、`zan_sdl3` **80** 个唯一 extern——未减少（依赖 B5-1/5/6）。
-  `user32`(186) / `kernel32`(116，多为 `EntryPoint` 直绑) / `gdi32`(49) / `crt`(257) /
-  `odbc` / `ws2_32` / `imm32` / `dwmapi` / `psapi` 直接绑 OS 的**是正确形态，不动**。
+  〔2026-08-27 复核，口径：`[DllImport("lib")]` 唯一符号〕`zan_gui` **134**、
+  `zan_sdl3` **124**——依赖 B5-1/5/6，仍在增长（2026-08-08 为 109 / 80）。
+  `user32`(150) / `kernel32`(93，多为 `EntryPoint` 直绑) / `gdi32`(41) / `crt`(225) /
+  `odbc` / `ws2_32` / `imm32` / `dwmapi` / `psapi` 直接绑 OS 的**是正确形态，不动**
+  （这几项相对 2026-08-08 是下降，因为计数口径与 EntryPoint 变体的处理不同，
+  趋势判断以 `zan_gui`/`zan_sdl3` 两项为准）。
 
 ## B6 工具链 Zan 化 〔依赖 A3 + A6〕
 
@@ -395,6 +405,13 @@ header-only 库 / C 回调 / 结构体字段偏移，全部对应 A2 / A3 / A4�
   并核实 Stopwatch.Start 的成员解析。自举代码量小（1 签名 2 调用点），
   但这是跨阶段特性，单列任务；在修好前 full 档 `ctest -R selfhost` 允许红
   （smoke/standard 档不含 fixed_point）。
+  **2026-08-27 追加分叉**：C host 已把 `params T[]` 恢复成真数组（见 **A51**），
+  自举编译器仍改写成 `List<T>`（`src/selfhost/parser.zan` 的 `ParseParams` 重写 +
+  `irgen_expr.zan` 打包成 `ival = 2` 的集合初始化器，直通判定用 `IsListType`），
+  因此编不出改用 `args.Length` 的 stdlib（Lua/Python 的 params callee）。
+  修 SH1 时一并做：删掉 ParseParams 的重写、打包换成数组初始化器（先确认自举
+  irgen 支持 `new T[]{...}`）、直通判定改数组。未盲改是因为固定点已红、
+  这段改动目前没有任何测试信号。
 
 ## B7 runtime 边界复核
 
@@ -407,10 +424,16 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
   `lock` 离开 body 不还锁（return/break/抛异常出口，现展开成 finally 区）；
   所有 `lock(obj)` 共用一把全局互斥量（改按对象地址 64 条 stripe 的递归锁）。
   用例 `lock_release_paths.zan` / `monitor_striped.zan`，733/733。
-* **B7-2 🚧 `rt_io.c` 复核（进行中）** 已修（epoll 路径，本机 Windows 无法实测，
+* **B7-2 [~] `rt_io.c` 复核（收尾）** 已修（epoll 路径，本机 Windows 无法实测，
   仅静态修正）：第二个 waiter 的 `calloc` 失败时直接 `return` 污染全局 pending →
   与"槽表扩容失败"同一处理（`io_mark_dead` + 清空 pending）；`io_take` 一次最多取
   8 个 waiter、超出的直接 `free` 掉使协程永不唤醒 → 溢出留在原地。
+  **2026-08-27 复核**：两处修复在当前代码里都在（`rt_io.c:939-946` epoll 与
+  `:1130-1137` kqueue 同构路径调 `io_mark_dead` 并清空 pending；`:712-734` 溢出链头
+  提升进 inline 槽，注释写明 "overflow head moves into inline slot"），`rt_io.c` 内
+  无 TODO/FIXME。**剩余只有 Linux epoll 实机验证**；此后 **B7-6 / B7-7** 已对
+  `rt_io` 做过二、三轮复核（timer 自取消、异步 DNS 超时、多 worker、IPv6），
+  本条目的静态清单已无剩项。
 * **B7-3 签入的跨平台二进制会悄悄陈旧（`scripts/check_toolchain_stale.py`）**
   **✅ 已解决（2026-07-29）：12 个 runtime 目标文件不再需要"对应平台"。**
   `zig cc` 自带 musl 与 Darwin 头，一台机器出全部五个目标（`build_linux_rt.sh` +
@@ -522,7 +545,10 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
 * **C8 ✅ 已完成（2026-07-29）：厘清 4 份路线文档边界**——归档 `ROADMAP.md`，
   给 `EXECUTION_PLAN` / `PRODUCTION_PLAN` / `SELF_CONTAINED_TOOLCHAIN` 加关系头，
   不做「四合一大文件」。
-* **C9** [ ] 文档覆盖率差距悬殊：`System` 16.5%、`Gui` 9.8%、`Game` **0.7%**。
+* **C9** [ ] 文档覆盖率差距悬殊。**2026-08-27 实测**（`///` 行占总行数）：
+  `Game` 47 文件 / 14751 行 / **1.0%**、`Gui` 177 文件 / 91707 行 / **9.5%**、
+  `System` 249 文件 / 81897 行 / **11.8%**。绝对文档量在增加，但代码涨得更快，
+  `System` 相对 2026-07-27 的 16.5% 反而下降。Game 仍是全库最低。
   既然 Game 不搬走，就得把文档补上（随 B1-2）。
 * **C10 ✅ 作为原则贯彻（2026-07-29）**：以实现+C# 为准改写，写入
   `docs/DOCS_MAINTENANCE.md` §3。
@@ -978,12 +1004,12 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 | A43-B1 | `Func<...>` / `Action<...>` | 26,39 | ✅ 已修（2026-08-08，`cs_b01_func_action.zan`）。内置泛型 delegate 类型 + 匿名 delegate 语法；`op_call` 的 `params` 尾部重载在零参数调用时修复了 fixed 参数计数下溢（`args[-1]` 越界读崩溃）：`resolve_op_overload` 的 `fixed = ps->count - 1 - p0`（原 `-2-p0` 静态/实例各差 1），`pack_params_args` 的 `injected` 按 `MOD_STATIC` 判定，emit 侧参数类型索引按 static/instance 取 `self_off`。回归测试 `cs_b_opcall_params.zan`（静态/实例、零参/多参） |
 | A43-B2 | `using (res) { }` 确定性释放 | 03 | ✅ 已修（2026-08-08，`cs_b02_using.zan`）。语句级 `using (res) { }` 降级 try/finally + `Dispose()`；stdlib 定义 `IDisposable`。另修复字符串拼接对 NULL 操作数直传 `strlen` 的崩溃（`emit_str_concat`/`emit_str_concat_n` 补 `emit_str_nonnull`） |
 | A43-B3 | 元组 `(int, string)` 与解构 | 01 | ✅ 已修（2026-08-08，`cs_b03_tuple.zan`）。`(a,b)` 字面量降级为匿名 struct（`Item1..N` 字段，签名缓存）；`var (a,b)=rhs` / `(int a,string b)=rhs` 解构→字段赋值；支持方法返回元组、显式 `(T1,T2)` 类型、`.ItemN` 访问。**限制**：嵌套解构 `var (a,(b,c))=...` 与 `(a,b)=rhs` 赋值未实现（后者已报错）；struct 字段持动态字符串沿用 KeyValuePair 的既有泄漏（ARC 不管理 struct 内 rc 字段） |
-| A43-B4 | 命名实参 `F(b: 2)` | 17 | `expected ')' , got ':'` |
+| A43-B4 | 命名实参 `F(b: 2)` | 17 | ✅ 已修（`cs_b04_named_args.zan`）。parser（`parser.c:1066`）→ `AST_NAMED_ARG` → irgen `reorder_named_args_impl`（`irgen_builtins.c:2423`）全链路；非法形态（跳过默认参数留空档）由 `diag/named_args_gap.zan` 覆盖。**2026-08-27 复核纠正**：清单原写 parser 报错，已过时 |
 | A43-B5 | 模式变量 `is T x` / `case T x:` / `when` 子句 / `is not null` | 23,34,35,45 | ✅ 已修（2026-08-08，`cs_b05_pattern_var.zan`）。`is T x` / `is not T` / `is null` / `is not null`、`case T x:`（类/string/object 运行时 is 检查，string 走 obj-8 magic 探测）、`when` 守卫（独立块短路，失败时不求值守卫）、`case null:`、case 体模式变量重绑定（先前 case 的 scope 释放会截断 locals）、switch `break` 经 `loop_locals_base` 释放不再误释放判别式（`case T x:` 后 `x is T` 此前读悬垂指针）。`emit_runtime_is_check` 的越界上界改用常量 `ZAN_MAX_LEAK_SITES`（原用发射时的 `leak_site_count`，helper 函数先于 `new` 站点注册时恒 false）。standard 回归发现的 `conformance_python_embed_smoke` 编译崩溃（`Python.Eval("lambda: 42")()` 空参 op_call 的 params 重载）已定位为 op_call 重载解析的 fixed 计数下溢（见 B1 行）并修复 |
 | A43-B6 | switch 表达式 `x switch { ... }` | 16 | ✅ 已修（2026-08-08，`cs_b06_switch_expr.zan`）。`expr switch { <pattern> when <guard> => <result>, ... }`：常量/类型模式（`is T x` 型 pattern + 变量绑定，`case T x:` 同款运行时检查）、`null`、`_` discard、`default`、`when` 守卫、pattern 变量在 result 中可用、无匹配 arm → 零值（int 0 / 引用 null）、嵌套 switch、可作为调用实参/赋值 RHS。降级：合成 AST_SWITCH_STMT，arms 的 result 存入隐藏局部 `\x01swx`（每个 case 体 `{__swx = result; break;}`），无 discard 时补空 default，emit 后 load 隐藏槽；隐藏局部移出 scope（`locals->count` 回滚）使 +1 归属表达式结果。**ARC**：`expr_yields_owned_rc_value` 加 AST_SWITCH_EXPR 分支返回 1（槽内存储后恒为 +1：owned arm move、borrowed arm retain，而本地作用域不释放），否则接收方二次 retain 导致 `leakcheck_cs_b06_switch_expr` 泄漏 |
 | A43-B7 | 扩展方法 `this int v` 形参 | 15 | ✅ 已实现（`this int v` + `find_extension_method` 全链路；`tests/conformance/cs_b07_ext_method.zan`）。数字字面量接收者需写 `(5).Twice()`（`5.` 会被词法当作 float，与 C# 一致） |
 | A43-B8 | 交错数组 `int[][]`、多维数组 `int[,]` | 24,25 | ✅ 已修（2026-08-08，`cs_b08_arrays.zan`）。`int[][]`（数组的数组）、`int[,]`/`int[,,]`（rank-N 矩形数组）、混合 `int[][,]`（rank-2 数组的 1D 数组）与 `int[,][]`，按 C# 最左 rank 规格最外层折叠；`.Length` 返回元素总数、`.GetLength(d)` 返回第 d 维长度；多下标 `m[i,j]` 按行优先扁平化越界检查；`new int[2,2]{{1,2},{3,4}}` 带维度初始化。**实现**：`type_ref` 加 `array_rank`+`array_element`（parse_type_ref 从右到左折叠最多 16 个 rank 规格）、`new_expr` 加 `array_rank`（sized 层作为最外层包装）、`AST_INDEX.extra` 多下标列表（首下标留在原字段，1D 路径不变）；binder 构造嵌套 TYPE_ARRAY（`binder_type_equal`/`checker_type_equal`/`types_concrete_equal`/`types_equal`/`tuple_sig_type`/`render_type_full` 全部比较 rank）；`zan_mdarray_alloc` 新布局 raw+0=count、raw+8=rank、raw+16=dims[0..rank-1]、data 紧跟其后，`zan_array_len`/`.Length` 可直接复用；`emit_mdarray_elem_ptr` 行优先扁平化，rank>1 的 new/store/incdec/read 路径全部分支到它。leakcheck `-- leak-clean` |
-| A43-B9 | 索引器 `public int this[int i]` | 37 | `expected member name` |
+| A43-B9 | 索引器 `public int this[int i]` | 37 | ✅ 已修（`cs_b09_indexer.zan`）。`parser.c:3351` 专解析 `this[...] { get/set }` 与 `=> expr`，降级为 `op_index`/`op_index_set` 协议。**2026-08-27 复核纠正**：清单原写 parser 报错，已过时 |
 | A43-B10 | 插值格式串 `{v:D4}` | 50 | ✅ 已修（2026-08-08，`cs_b10_interp_format.zan`） |
 | A43-B11 | 局部函数 | 05 | ✅ 已修（2026-08-08，`cs_b11_local_func.zan`，含泛型局部函数） |
 | A43-B12 | `implicit` / `explicit operator` | 06 | ✅ 已修（2026-08-08，`cs_b12_conv_operator.zan`） |
@@ -991,7 +1017,7 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 | A43-B14 | `checked` / `unchecked` | 02 | ✅ 已修（2026-08-08，`cs_b14_checked.zan`，no-op 纯表达式） |
 | A43-B15 | `Task` / `Task<T>` 类型名与 API | 12,31,32 | ✅ 已修（2026-08-08，`cs_b15_task.zan`）。`Task`/`Task<T>` 成为可用作值的类型（新 `TYPE_TASK` kind，opaque i64 协程句柄；`Task<int>` 携带结果类型），同时保留 builtin 静态 `Task.Spawn/Run/IsDone/Cancel/IsCancellationRequested` 调用面。`Task.Run(delegate(){...})`/`Task.Run(()=>...)`/`Task.Run(Action 变量)`：内联执行 delegate（体内 await 经 root-await 路径泵驱动），返回已完成任务（句柄 0，`__zan_co_isdone(0)` 恒 1）；`t.Wait()`：泵 `zan_co_sched_run` 直到该 frame done（协作式调度下同步上下文等协程的唯一正确方式）；`t.Result`：读 frame 结果槽（`ASYNC_FRAME_RESULT`）解码为 T 后 reap（untrack+free）；`t.IsCompleted`：非泵探针。**Task\<T\> 生命周期**：`Task.Run(<非 void async 调用>)` 不装 reaper、保留 track，frame 活到 `Result`/`Wait` 读取（恰好一个终结任务）；`Task.Spawn` 恒装 reaper（fire-and-forget 不泄漏）；`Task<T>` → `Task` 协变可赋值。**顺带修复 B5 预存缺陷**：`stdlib/System/Threading/Threading.zan` 的 `MacSemWaitUntil(string, long when)`/`MacDispatchTime(long base,...)` 参数名撞 `when`/`base` 保留字，macOS 目标 ABI 测试（stale 构建图掩盖）编译失败——改名 `deadline`/`baseTime`。**回归门禁**：standard 477/480（`cs_b15` 3 项 + 既有 474 项全过）；3 个 `emit_lib_*` 失败均为环境/并行因素，非 B15 回归：(1) `windows_dll` 链接时 `libgcc.a(emutls.o)` 缺 pthread 符号（mingw 交叉工具链无 winpthread stub，B8 时代产物时间戳佐证与本次无关）；(2) `linux_so`/`macos_dylib` 的 cross-shared guard 因 **IDE 改版并行加入的 `stdlib/System/MessageBox.zan`（untracked，17:29 创建）`using System.IO` 把 IO→DirectoryWatcher→Threading 全链拉进 `using System` 闭包**而触发（`zan_thread_*`/`zan_gate_*` extern 置位 `uses_sync_runtime`/`uses_socket_async`；移走该文件 cross-shared 立即通过，B8 时代 16:23 产物无此文件即通过）。IDE 改版合入后应将 MessageBox 移出 `System` 根命名空间（`using System` 会全量拉入 `stdlib/System/*.zan`） |
 | A43-B16 | `KeyValuePair<K,V>` | 27 | ✅ 已修（2026-08-08，`cs_b16_keyvaluepair.zan`） |
-| A43-B17 | LINQ `orderby` / `join` / `let` / `group into` | 14 | 查询语法只支持单 `from...where...select` |
+| A43-B17 | LINQ `orderby` / `join` / `let` / `group into` | 14 | [~] **2026-08-27 复核纠正**：parser（`parser.c:521-663`：where/let/orderby 多键与 asc/desc/join…on…equals[…into]/group…by[…into]）与 irgen（`irgen_expr.c:4438+` 的排序、join 行物化、分组三条降级）**都已实现**，"只支持单 from…where…select"已过时。真正的缺口是**没有任何 conformance 覆盖**，补用例时当场撞出三个真缺陷 → 见 **A54**。`orderby` 升序在 **A53** 的 ARC 修复后已正确 |
 | A43-B18 | `init` 访问器、`readonly struct` / `ref struct` | 09 | ✅ 已修（2026-08-08，`cs_b18_init.zan`） |
 | A43-B19 | 可空元素数组 `int?[]` | a11b | ✅ 已修（2026-08-08，`cs_b19_nullable_arr.zan`） |
 
@@ -1099,6 +1125,11 @@ exactly"；经 `emit_arg_typed` 覆盖全部方法调用实参发射点。2026-0
 | `libcrypto-3-x64.dll` (win-x64) | ✓ | ✓ | 5.5 MB |
 | `libssl-3-x64.dll` (win-x64) | ✓ | ✓ | 1.0 MB |
 
+**2026-08-27 实测更新**：重复面已扩大到 **约 28.8 MB**——上表六项仍成立，且
+**macOS 不再是"只有一份"**：Tls 现在也带 macos-x64 / macos-arm64 的
+`libcrypto.3.dylib`（4.99 / 4.63 MB）与 `libssl.3.dylib`（0.86 / 0.84 MB），
+与 Postgres 侧逐字节相同。下面这句"macOS 不重复"已过时。
+
 合计约 18 MB 纯重复（macOS 只有 Postgres 一份，不重复；
 `System/Scripting/drivers/win-x64` 的 `libcrypto-3.dll` 是 CPython 嵌入包
 自带的**另一个** build，名字和内容都不同，不能与上表合并）。
@@ -1109,8 +1140,21 @@ exactly"；经 `emit_arg_typed` 覆盖全部方法调用实参发射点。2026-0
   一种受限的共享引用（如 `@shared/openssl-3/<file>`，解析相对 stdlib 根、
   仍然拒绝 `..`、`:`、绝对路径），文件只留一份在
   `stdlib/_shared/openssl-3/<target>/`，发布时按 basename 复制到 exe 旁边。
-  链接期不受影响：导入库（`libcrypto.dll.a` / `libssl.dll.a`）只有 Tls 用，
-  留在原处。
+  ~~链接期不受影响：导入库（`libcrypto.dll.a` / `libssl.dll.a`）只有 Tls 用，
+  留在原处。~~
+  **2026-08-27 复核：上面这句不成立，本项比记录的更复杂，因此本轮未动手。**
+  三条新约束：
+  1. **链接期确实受影响**：driver 目录会被加进链接搜索路径（`zan_lib_dirs`），
+     Linux/macOS 侧 `-lcrypto` / `-lssl` 就是从 `drivers/<target>/` 解析的，
+     把 `.so`/`.dylib` 移走会让链接失败——共享目录必须同时进链接搜索路径。
+  2. **没有任何测试覆盖 driver bundle 的发布**：现有 publish 测试只有
+     `publish_obf_ctor_*`（字符串反混淆）与 `conformance_python_embed_smoke`
+     （Scripting 的 bundle），Postgres / Tls 的 bundle 复制无人验证。
+  3. **5 个目标里本机只能验 win-x64**，其余 4 个（linux-x64/arm64、macos-x64/arm64）
+     改坏了不会当场暴露。
+  做法建议：先补一个"发布一个用 Tls 的程序、断言 exe 旁边出现
+  `libssl`+`libcrypto` 且能启动"的用例，再改清单格式与链接路径，最后移文件。
+  另：实测重复面已达 **约 28.8MB**（macOS 侧现在也重复，见上表旁注）。
 * [~] **A47-2 `build/toolchain` 自嵌套**：曾实测嵌套到 32 层
   （`build/toolchain/toolchain/toolchain/...`，每层都带一份 stdlib 和
   openssl），`build/toolchain` 单独占 1.29 GB / 3205 文件。`build/` 是
@@ -1119,10 +1163,11 @@ exactly"；经 `emit_arg_typed` 覆盖全部方法调用实参发射点。2026-0
   **2026-08-08 复核：自嵌套已消失**——当前 `build/toolchain` 无嵌套（189MB / 1026
   文件，实测深度 0），大概率随 build 目录重建而清掉；「定位到具体步骤并加自嵌套
   防护」未验证，重跑发布流程时仍需检查。
-  要定位到具体步骤并加自嵌套防护，然后清掉。
-* [ ] **A47-3 `templates/server/server-mvc/.build/` 里躺着 libcrypto/libssl
-  两份拷贝**（被 `.gitignore` 的 `.build/` 挡住没进版本库），属于跑过一次
-  模板构建留下的残留，清掉。
+  **2026-08-27 复核**：仍无自嵌套（192 MB / 1048 文件，深度 0）；防护仍未加。
+* [x] **A47-3 `templates/server/server-mvc/.build/` 残留** —— ✅ 本机已无
+  （2026-08-27 实测该目录不存在）。它是跑过一次模板构建留下的产物、被
+  `.gitignore` 的 `.build/` 挡着，会随构建重新出现；若要彻底了结，应在模板构建
+  脚本里收尾删除，而不是靠人工清。
 * [x] **A47-4 `System/Scripting/drivers/win-x64` 瘦身**（2026-08-06）：CPython
   嵌入包里只有解释器 DLL 是被 `Python.zan` 用 `Interop.Load` 加载的，随包
   下发的启动器 `python.exe` / `pythonw.exe`、安装包签名目录 `python.cat`、
@@ -1140,10 +1185,18 @@ yet`（`src/compiler/main.c` 的 `need_rt && cross_compiling` 分支）。
 `tests/emit_lib/lib.zan` 现在会带上 embed/sync 运行时，于是撞上这道护栏——
 本机 `.dll` 与 `.a` 都正常。
 
-* [ ] **A48-1 交叉链接共享库时把运行时对象一起编出来**：Windows 本机 DLL 路径
-  把 `rt_io/rt_sync/rt_embed/rt_timer` 的 `.o` 放在链接行上，交叉路径没有对应
-  目标平台的产物，只能报错。补上按目标三元组编译运行时对象再链接，两个用例
-  即可解封。
+* [x] **A48-1 交叉链接共享库时把运行时对象一起编出来** —— ✅ 已完成
+  （2026-08-27 复核）。清单引用的错误串
+  `cross-compiled shared libraries that use the Zan runtime are not supported yet`
+  与 `need_rt && cross_compiling` 分支在全库已 **0 匹配**：现在交叉共享库链接会把
+  `rt_io/rt_sync/rt_file/rt_embed` 重定向到 `toolchain/<target>/` 下目标 ABI 的
+  `.o`（`main.c:3162-3217`），产物缺失时报 `bundled ... runtime object not found`。
+  `tests/emit_lib` 四个用例都在 standard 档、无 WILL_FAIL 标记，2026-08-27 实测
+  `ctest -L standard -E "gui|policy"` 全绿（含 `emit_lib_linux_so` /
+  `emit_lib_macos_dylib`）。**本节其余描述已过时**：`tests/emit_lib/lib.zan` 现在
+  只有纯静态方法，不再拉 embed/sync 运行时。
+  仍存在的无关拒绝分支：非 Linux/Windows/macOS 目标的 `shared libraries are not
+  supported for this target yet`（`main.c:3533`）。
 
 〔顺带已修〕本机 `.dll` 的链接行缺 `-lwinpthread`，而 `-lgcc` 的 unwinder 走
 POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败。已在
@@ -1158,10 +1211,16 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
   `-56`：`irgen_expr.c` 的插值整数分支对窄整数一律 `SExt`，而 `byte`/`bool` 在本
   降级里是无符号。改成走 `zan_iwiden`（≤8 位零扩展），`{b:F2}` 的 `SIToFP` 也
   一并拿到正确的宽化值。用例 `tests/conformance/int_format_boundaries.zan`。
-* [ ] **A49-2 `StringBuilder.Append(ulong)` 丢无符号语义**：`sb.Append(umax)`
-  打印 `-1`。`emit_value_as_cstr` 只看 LLVM 值宽度、拿不到 Zan 静态类型，无从
-  判断该按 `ulong` 输出；要么给它传入静态类型，要么在 append 侧分流。基线同样
-  如此，不在本轮性能改动范围内，用例里因此只放了 `long` 的 append，修好后补行。
+* [x] **A49-2 `StringBuilder.Append(ulong)` 丢无符号语义** —— ✅ 已修（2026-08-27）。
+  实测除 `sb.Append(umax)` 打印 `-1` 外，**字符串拼接 `"" + umax` 同样打成 `-1`**
+  （`Console.WriteLine` / 插值 / `Convert.ToString` / `.ToString()` 四条路径本来就对）。
+  根因是两个格式化点拿不到 Zan 静态类型：`irgen_call.c` 的 StringBuilder 整数分支
+  把 `emit_itoa_into` 的无符号标志硬编码为 0；`irgen_generics.c` 的 `emit_to_cstr`
+  同样硬编码。修法：`emit_to_cstr` 增加 `is_unsigned` 参数（保留同名签名的有符号
+  包装给拿不到类型的调用方），`emit_to_cstr_of` 本就持有 AST 节点，按
+  `infer_expr_type` 的 `TYPE_ULONG` 传入；StringBuilder 侧改用 `expr_is_ulong`。
+  用例：`int_format_boundaries.zan` 补上 `sb.Append(umax)` 与 `"" + umax` 两行
+  （即该条目当初留的空），`ctest -R "int_format|unsigned|concat|interp"` full 档 27/27。
 
 # A50 · CEF 浏览器控件的剩余缺口（2026-08-16）
 
@@ -1241,9 +1300,11 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
   回落数值格式；同值别名先声明者胜。
 - 证据：`tests/conformance/enum_tostring.zan`（含 determinism/leakcheck 孪生）、
   `ctest -R enum` 13/13、smoke 128/128 全过。
-- [ ] 后续：`Color.Red.ToString()` 静态成员链调用目前连解析都不过
-  （报 unresolved call 'Color.Red.ToString'），修好解析后可一并补
-  `Enum.TryParse(string)`；届时批量清理 stdlib 手写映射链。
+- [x] 后续 —— ✅ 已完成（2026-08-27 复核）：`Color.Red.ToString()` 静态成员链与
+  `Color.TryParse(string, out T)` 都已可用，用例 `tests/conformance/enum_static.zan`
+  （输出 `Green`/`Red`/`true`/`Blue`/`false`）。清单原写"连解析都不过"已过时。
+  **仍待做**：批量清理 stdlib 里手写的 int→名映射链（`Log.LevelName`、ChartModel
+  19 处、ChartView 12 处等），属收尾工作不是能力缺口。
 
 # B9 · Web 框架现代化：[Tx] 事务作用域 + 签名参数绑定 —— [~]（2026-08-23）
 
@@ -1287,3 +1348,519 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
   stdlib 等）的既有问题，本节未定位；`build\ZanIDE.exe` 当前 12.23MB
   （`dist/win-x64/ZanIDE.exe` 8-15 号快照为 8.2MB），EXE 本体增长来自 GUI/stdlib
   侧改动，尚未追查。
+  **2026-08-27 复核**：那 33 项已不复存在，当前 standard 582 项只剩 3 项失败
+  （2 项 policy 清单待 `scripts/gen_knowledge.ps1` 收录新控件、1 项 GUI 用例是
+  并发保存 stdlib 造成的瞬时失败，单跑即绿）。
+
+# A51 · `params T[]` 回归 C# 数组语义 —— ✅ 已完成（2026-08-27）
+
+- 根因：`parser.c` 的 `parse_param` 把 `params T[] rest` 的声明类型改写成
+  `List<T>`（当年为补"数组形参没有长度"的缺口，该缺口已随 **A15-8** 修掉），
+  于是三处与 C# 不符：callee 只能写 `rest.Count`；params 束不能传给任何 `T[]`
+  形参；调用方传一个真数组时会被再包一层。同时打分函数拿 `List<T>`/数组类型去比
+  标量实参必然判 -1，与新增的"同 arity 候选全被否决即硬报错"叠加后，**毙掉了
+  全部变参调用**（standard 里 `params_variadic`、`lua_embed_smoke`、
+  `python_embed_smoke` 三项，报 `no overload of 'Calc.Sum' matches argument type(s)`）。
+- 修复：parser 保留声明类型 `T[]`；`pack_params_args`（`irgen_builtins.c`）打包成
+  `new T[]{...}`（`is_array` + `array_init`），单个尾实参已是数组时按 C# 直通；
+  `method_args_score`（`irgen_expr_core.c`）抽出 `concrete_arg_score` 供固定形参与
+  params 尾参共用，尾参**按元素类型**逐个打分——这正是 `op_call(params double[])`
+  与 `op_call(params string[])` 之间选对重载的依据，整束传入记 +4。
+- 标准库同步：`System/Scripting/Lua.zan`（11 处）与 `Python.zan`（8 处）的
+  `args.Count` → `args.Length`，7 处"先建 List 再转交 params"改为直接建
+  `LuaValue[]`/`PyObject[]`。
+- 证据：`tests/conformance/params_variadic.zan` 新增 `Forward(params int[])` 把束
+  转交 `Sum(int[])` 的用例（原先不可能）与数组实参直通用例；
+  `ctest -R "params|opcall|operator_call|lua_embed|python_embed|extension_methods|overload"`
+  full 档 **42/42**（含 determinism/leakcheck 孪生）；standard 582 项余 3 项失败均与本项无关。
+- 遗留：自举编译器仍按 `List<T>` 降级，见 **B6-SH1** 的 2026-08-27 追加分叉。
+
+# A52 · 静默错误代码生成的封口（第一批）—— ✅ 已完成（2026-08-27）
+
+以"编译通过但产错码"这一类为优先，逐条修根因；每项都有探针与用例。
+
+1. **标量进引用形参**（A43-B 已知缺陷，登记已久）：`F(object o)` 收标量时 irgen 直接
+   `IntToPtr`（`irgen_arc.c` 的 `emit_boundary_coerce`），之后对该槽做 `is`/模式匹配
+   按指针解引用读 `ptr-8` 即崩。修在 `checker.c::checker_arg_type_mismatch`：标量
+   （numeric/bool/char/enum/nint）遇 `object`/interface/delegate/array 目标一律
+   DIAG_ERROR，与 `object o = 42;` 在赋值处的既有规则一致。
+   **class 目标故意不判**——本语言允许单参构造器做隐式转换
+   （`InitCheckbox(lbl, false)` 造 `SignalBool`），且 `emit_arg_typed` 已在无匹配
+   构造器时报错；第一版把 class 一起判了，standard 里 GUI 全线误报，已收窄。
+   用例 `tests/diag/scalar_argument_to_reference.zan`（smoke 档）。
+2. **校验窗口扩到裸名调用**：`call_arg_signature` 原来只认 `recv.M(a)` 形态，
+   隐式 this / 同类静态的 `M(a)` 完全不过实参校验（正是 A43-A15 那条静默路径的
+   同一盲区）。现按封闭类型的唯一同名方法解析，同名局部/参数/字段存在时让位给
+   委托调用。实测 `Draw(t)`、`Paint(t)`、`Paint(7)` 三种形态都在源码位置报错。
+3. **扩展方法不再"打分全否决仍取第一个"**：`find_extension_method` 删掉 `first`
+   兜底，全否决即返回 NULL（调用方按"没有该成员"报错），与 **A51** 里
+   `resolve_overload_typed` 的处理一致。
+4. **runtime：UI dispatch 队列不再静默丢工作**（`rt_sync.c`）：原固定 1024 环，满则
+   `zan_dispatch_post` 返回 0，而两个 Zan 调用方（`App.Post`、`UiEvent.Post`）都丢弃
+   该返回值——一次超过一帧排空能力的突发就等于"这个点击处理器根本没跑"。现从静态
+   1024 起按需翻倍到 1M（静态段起步，常态零分配），到顶才拒绝并在 stderr 留一行；
+   `zan_dispatch_clear` 改 64 条一批地排空（否则一百万条要一个 8MB 栈数组），
+   仍保持"释放在锁外"。用例 `tests/conformance/dispatch_queue_growth.zan`
+   （5000 条不排空全部入队、clear 清空、清空后仍可用），三档孪生全过。
+- 证据：`ctest -L standard -E "gui|policy"` **556/556**；dispatch/delegate/sync 相关
+  full 档 50/50（含新用例的 determinism/leakcheck 孪生）。GUI 与 policy 用例按
+  用户要求跳过（stdlib/Gui 正在并行改动）。
+- 下一批待做（都需要先定性能/语义取舍，未擅自动手）：
+  - [ ] **A52-5 `--publish` 的安全网**：`main.c:2335-2338` 让 `check_leaks` 与
+    `arc_guard` 都只在 `debug_info && !publish_mode` 下开启，发布版本恰好没有
+    over-release/UAF 检测；要定一个"低成本子集在发布版也保留"的方案。
+  - [ ] **A52-6 null 解引用守卫**：只有 weak 字段、nullable `.Value`、`?.` 有守卫，
+    普通 `obj.f` 直接 fault；opaque string（形参/extern 返回/字段）的下标也不检查
+    （`irgen_expr.c:55-64`）。
+  - [ ] **A52-7 EH 线程表 1024 硬顶**：`zan_abi.h:123` + `irgen_builtins.c` 耗尽即
+    `exit(1)`，且 GUI/外部回调线程从不调 `zan_thread_detach()`（A4-2 遗留）。
+  - [ ] **A52-8 库内单方面终止进程**：OOM（`host_oom.h`）、契约违反
+    （`rt_sched.c:242`）、slab 一致性（`rt_mem.c:446,453`）共十余处 `abort()`，
+    作为被嵌入的库没有错误码出口。
+
+# A53 · 被重新赋值的引用参数不拥有其槽位（堆损坏）—— ✅ 已修（2026-08-27）
+
+- **症状**：`orderby` 的结果是一个"半归并"的错误序列，随后进程以
+  `0xC0000374`（堆损坏）退出。同一套归并排序手写成非泛型版本结果正确，
+  放进标准库的 `Enumerable.MergeSortKeysInt<T>` 就错——一度误判为泛型缺陷。
+- **根因**（探针 `_scratch/q3..q9.zan`，用 `--emit-ir` 逐指令核对）：实参是**借入**
+  的（调用方持有那一份计数），所以参数槽此前是裸 alloca：写进去既不 retain 新值、
+  也不 release 旧值。于是 `t = p; p = q; q = t;` 之后，**拥有型局部** `q` 里装的是
+  调用方的对象，作用域退出时把它释放掉——调用方的对象在其仍在使用时被 free；
+  同时 `return p` 交出的是刚被 `q = t` 释放掉的新对象（use-after-free）。
+  标准库的自底向上归并排序正是这个形状（`List<int> tk = ka; ka = kb; kb = tk;`，
+  `ka` 是参数），所以 `orderby` 必然踩中。
+- **修复**：`irgen_emit.c` 新增 `own_written_param()`——参数若是 rc 管理的引用类型
+  且**函数体里存在对它的赋值**（新增 `body_writes_ident()`，复用 A33-2b 的
+  capture-scan，把"只看 lambda 内"放宽为任意深度），则入口 retain 一次并走
+  `arc_own_local()`：此后赋值释放前一占用者，作用域退出与异常展开释放最后一个。
+  只读参数保持零开销借入。两条参数绑定路径都接上了——普通方法
+  （`irgen_emit.c:1392`）与**泛型特化**（`:2049`，第一版只改了前者，泛型探针仍崩）。
+  `object` 参数不在范围内（它的所有权由每槽运行时标志 `obj_rc_flag` 动态跟踪），
+  `ref`/`out` 走既有的 `byref_slot` 协议。async 方法本来就把 rc 参数标成
+  `arc_owned`（帧持有），不受影响。
+- **证据**：`tests/conformance/param_reassign_ownership.zan`（类/集合/字符串三种
+  引用的三方交换、纯重新绑定、泛型方法、以及那个会踩雷的泛型归并排序；
+  conformance + determinism + leakcheck 三档孪生全过——leakcheck 通过说明入口
+  retain 与出口 release 配平）；ARC/泛型/闭包相关 full 档 97/97；
+  `ctest -L standard -E "gui|policy"` 556/557（唯一失败 `win_tray_screen_smoke`
+  是已登记的 GUI 环境偶发；`http_forwarder_stream` 并发下偶发、单跑即过）。
+
+# A54 · LINQ 查询子句：八处缺陷全部修复 —— ✅ 已完成（2026-08-27）
+
+补 **A43-B17** 缺失的 conformance 覆盖时，`tests/conformance/linq_query_clauses.zan`
+一路撞出七个真缺陷。**A54-1（descending 空）与 A54-2（let 空）不是独立缺陷**——
+它们是下面 ①③ 的表征，随之消失；**A54-4（扩展调用结果随机）也不是编译器缺陷**，
+根因是 ⑦。
+
+已修：
+
+1. **四处"基本块两个终结符"**：`query_loop_close` 的第一句就是 `br l->inc`，
+   它假定当前块尚未终结；而 join 的四个发射点（`query_final_pass` 的 plain 与
+   `into`、`query_materialize_join` 的 plain 与 `into`）都先手动给 no-match 块补了
+   `br inc`，于是 loop_close 又插一条 → `Terminator found in the middle of a basic
+   block! label %qj.skip / %qm.skip`。修在契约上：`query_loop_close` 当前块已终结
+   时不再补分支，四处一起解决且不会复发。
+2. **`join ... into` 的语义与悬空块**：`query_final_pass` 先开外层循环、发 `eq`
+   判定，再进 `into` 分支——那个 `eq` 的 `qj.skip` **从未被终结**（这才是最初看到的
+   "does not have terminator"），而且语义上错：C# 的 `join into` 对**每个**外层元素
+   产出一个分组（无匹配即空表），不该被 `eq` 门住。现在 `into` 自带循环与匹配判定，
+   不再经过外层 eq。
+3. **查询序列的所有权**（堆损坏）：排序与 join 行物化替换当前序列时**无条件释放
+   旧序列**，而第一次替换时旧序列正是**借入的源集合**——把调用方仍持有的
+   `List` 释放掉，下一次分配即堆损坏（`0xC0000374`）。`query_seq_t` 新增
+   `seq_owned`：只释放本次降级自己分配的列表。
+4. **`Grouping<T>` 没有类符号**：`zan_binder_make_grouping_type` 造的是
+   `sym == NULL` 的裸类型，从不查标准库里真正的 `Grouping` 类。于是
+   `group ... into g select g.Key` 既推断不出类型（回退成组元素类型，
+   `select g.Items.Count` 因此报 "cannot convert List<string> to List<int>"），
+   也发射不出成员读取（落到常量 0 兜底，`g.Key` 打印成 0）。现在附上真实符号。
+5. **左键在循环外发射**：`query_materialize_join` 的注释写"每个外层元素一次"，
+   实现却把 `on p.dept equals ...` 的左键放在外层循环**之前**——那里行变量还没
+   注册，`p` 落到常量 0 兜底。已搬进循环（与 `query_do_group` 的正确形状一致）；
+   顺带删掉那个从未使用、编译器一直在警告的 `lmark`。
+6. **`Enumerable.MergeSortKeys{Int,Long,Num,Str}` 改写调用方的键列表**：两个缓冲区
+   每轮互换，**第二轮之后 `kb` 指向的就是传进来的那个 list**，于是排序把调用方的
+   键列表原地改成排序后的样子。同一个键列表连排两次，第二次拿到的已是被改过的
+   数据——`OrderByKeysStrDescending` 因此给出既非原序也非排序的结果。四个变体
+   都改为先按值拷贝键列表。
+7. 以上 ⑥ 也是 **A54-4** 的真因：那个探针在一个程序里先调静态形态、再调扩展形态，
+   第二次用的键列表已被第一次改写，看起来像"结果随机"。
+
+**证据**：`tests/conformance/linq_query_clauses.zan`（orderby 升/降/多键、let、
+plain join、join into、终端 group、group into 八种形态）三档孪生全过；
+`ctest -R "linq|orm|query|enumerable|group"` full 档 **519/520**（唯一失败
+`leakcheck_checkbox_group` 是 **A57** 记的既有引用环）。**A43-B17 由此关闭**。
+
+8. **A54-5 `join` 后接 `orderby` / `group`（行物化路径）结果为空** —— ✅ 已修。
+   两处叠加：
+   - **序列局部变量的类型没跟着换**：替换为行列表时只 `zan_store_fit` 了槽里的值，
+     没更新该隐藏局部记录的类型，而泛型实参正是从它推断的——IR 里的调用符号是
+     `Enumerable_OrderByKeysStr$$P`（T = 源元素类型 P），于是排序按 1 字长步长
+     去走 2 字长的行。现在两处替换点都同步更新为 `List<row_type>`
+     （修复后符号变为 `...$$__tuple2:P,D`）。
+   - **`query_hold` / `query_declare` 把 struct 值又套了一层槽**：struct 值在本
+     代码库里就是"指向其存储的指针"（`emit_expr` 对元组返回 alloca），而这两个函数
+     用 `LLVMTypeOf(value)`（= ptr）建槽、却按 struct 类型注册局部变量。于是
+     `list.add` 里 `load %struct, ptr %qh` 把**槽里的地址**当结构体内容读——行的
+     字段 0 变成了行构造器那个复用 alloca 的**栈地址**而不是 range 变量，join 键
+     自然永不匹配（常量键时则读到栈地址当指针用，直接访问违例）。现在 struct 类型
+     的 hold 直接把该指针注册为槽。
+   证据：`linq_query_clauses.zan` 补回 `join-sorted`（降序 dee,cid,bob,ann）与
+   `join-group` 两组断言，全部逐行正确。
+
+# A55 · 值类型的类型模式永不匹配 —— ✅ 已修（2026-08-27）
+
+- **症状**：`v switch { int m when m > 3 => "big", _ => "other" }`（v = 5）得到
+  `"other"`；`v switch { int m => ... }` 同样落到 discard 臂；switch **语句**形态的
+  `case int n when n > 3:` 也一样不匹配。类/字符串的类型模式正常，所以此前
+  **A43-B5/B6** 的用例全都没覆盖到这条。
+- **根因**：`irgen_stmt.c` 的 case 匹配条件对类型模式只处理
+  class/string/object/interface，其余（值类型）直接 `cond = false` 硬编码——
+  该臂永远不可达，switch 无声落到 default。
+- **修复**：值类型没有运行期类型变化，匹配是静态决定，按 `AST_IS_EXPR` 已有的同一
+  规则（`types_equal(判别式静态类型, 模式类型)`）发常量条件。switch 表达式降级成
+  switch 语句，所以一处修复覆盖两种形态。
+- **证据**：`tests/conformance/pattern_value_types.zan`（表达式/语句两形态、
+  `when` 守卫、绑定变量、不同值类型不得匹配、以及 string/class/double/bool 判别式）。
+
+# A58 · 全量收口执行计划（2026-08-27 定序）
+
+排序依据三条：① 先修"编译通过但结果错/编译器崩"的，因为它们会污染后面每一次
+验证；② 验证基建提前到第二批，之后所有修复都有它兜底（本轮的 A53 堆损坏若有
+ASan 档会当场被抓，而不是从 `orderby` 错序回溯半天）；③ 需要定性能/语义取舍的、
+以及会与 GUI 并行编辑冲突的，排到取舍确定之后。
+
+**跨批规则**：每项完成即在本文件补实测证据（命令 + 数字 + 用例名）；每批结束跑
+`smoke` → `standard`；触及 `stdlib/Gui` 的项必须先与 GUI 编辑窗口协调（当前工作树
+有未提交的 Gui/Chart 改动）；不把多阶段揉进一次提交。
+
+## 第 1 批 · 封死"静默产错码"（编译器，低风险高价值）
+
+| # | 内容 | 验收 |
+|---|---|---|
+| 1.1 | **A54-3 `join` 生成不合法 IR**（`Basic Block ... does not have terminator!`，`query_materialize_join` 少一条终结边） | 三种 join 形态（裸 / join+orderby / join…into）编译通过且结果正确 |
+| 1.2 | **A54-1 / A54-2** `orderby ... descending` 与 `let` 返回空结果 | 升/降序、多键、let 的结果逐项正确 |
+| 1.3 | **A54-4** 显式泛型实参的扩展调用（`nums.OrderByKeysInt<int>(keys)`）结果随机（读未初始化内存） | 与静态调用形态结果一致，多次运行稳定 |
+| 1.4 | 补 `tests/conformance/linq_query_clauses.zan` golden（本轮已写好、因 1.1-1.3 失败暂未入库），**关闭 A43-B17** | conformance/determinism/leakcheck 三档 |
+| 1.5 | [x] **有诊断即停止 codegen** + 清掉真正会静默产错码的兜底 | 见下；standard 589 项全绿（唯一失败 `policy_theme_color_budget` 是未提交的 Gui/Chart 改动，与编译器无关） |
+
+1.5 放在 1.1-1.3 之后：它会把此前被兜底掩盖的错误一次性暴露出来，先修掉已知的
+才能分清噪声。
+
+**1.5 实测结论（修正原条目的"~33 处"口径）**：`return LLVMConst*` 在 irgen 六个
+文件里共 121 处，其中 85 处附近没有诊断——但绝大多数是**合法零值**（void 表达式的
+占位、布尔常量、不可达分支默认值），逐个改掉是错的。真正"解析不出来就当 0"的只有
+**分派链末端**一处，已按下述三点收口：
+
+- `irgen_call.c` 调用发射器末端：此前为几种已知形态各自补过特判诊断（内建成员不
+  存在、属性误写括号、静态调用链未解析），每条都是踩过一次坑后补的；现在把通用
+  情形也改为报错——走到末端说明没有任何 lowering 认领这个调用，即调用根本不会发生、
+  表达式恒为 0，这是编译错误而非零值。两个必须保持静默的上下文：泛型的**擦除体**
+  （接收者类型仍是未绑定类型参数，真实代码在单态化副本里，擦除体的 0 不会被执行，
+  由新增 `call_receiver_is_open_generic` 判定）和已有错误后的级联。
+  新增 `tests/diag/call_not_callable.zan`：`int count = 1; count(5);`
+  ——调用一个非可调用局部变量，此前静默编译并打印 0。
+- `irgen_expr_core.c` `find_ctor` 的 `locals==NULL → return first`：实测六个调用点
+  全部传入非空 `locals`，该兜底是**死代码**；删除后 standard 全绿，同时删掉随之无用
+  的 `first` 追踪。留 NULL 给调用方按"未解析"处理，避免按声明顺序挑构造函数。
+- `irgen_emit.c`：codegen 内部在 pass 2（用户方法）与方法特化队列排空后各加一处提前
+  返回。阶段级把关本来就没有缺口（解析错→不进 binder/checker；检查错→不进 codegen；
+  codegen 错→finalize 前返回失败），所以提前返回**不改变成败**，只是不再把半成品函数
+  体带进后面的合成 pass（类释放函数、vtable、反射表都假设引用到的函数/槽位存在），
+  避免一个已报告的错误表现成编译器崩溃。
+
+## 第 2 批 · 验证基建（一次性建设，后续所有批次的兜底）
+
+| # | 内容 | 验收 |
+|---|---|---|
+| 2.1 | [x] **生成程序跑带守卫的 conformance 全量**（不是 ASan——见下）：新增 `arcguard_*` 档，435 项 | ✅ 全量 435/435 绿；回退 A53 验收通过（下） |
+| 2.2 | [~] sanitizer 覆盖从 `rt_sched`/`rt_io`/`rt_co` 扩到 `rt_sync`+`rt_file`/`rt_timer`/`rt_mem` | 已写进 `runtime-tests.yml`，**本地无法验证**（下） |
+| 2.3 | [x] 前端 fuzz 从 parser 扩到 nsresolve+binder+checker | ✅ 44.6 万次执行零崩溃；首轮即抓到一个真 bug（下） |
+
+### 2.1 修正：ASan 是错的工具，`--arc-guard` 才是（三条实测理由）
+
+原条目写"生成程序在 ASan 下跑，回退 A53 必须当场报错"。实测这个前提在三个层面都不成立：
+
+1. **默认路径 ASan 看得见，但看不见要紧的那半。** ARC 对象默认走 libc
+   malloc/free（`rt_mem.c` 的 slab **只在 `--fast-alloc` 时链接**），所以 ASan 能拦
+   double-free；但 A53 是"提前释放后又被**读**"，而 zanc 发射的目标代码没有插桩、
+   不查 shadow，UAF **读**结构上就抓不到。要抓得给 codegen 挂 LLVM AddressSanitizer
+   pass，那是另一个量级的工程。
+2. **开了 `--fast-alloc` 反而更看不见。** slab 释放只是压回 free list、slab 永不
+   解映射，ASan 的 malloc 拦截被完全绕过。（slab 自己有常开的 double-free 与坏头
+   检测，见 `zan_mem_hdr_check`；这条对 UAF 读同样无效。）
+3. **本机无法验证。** Windows 上 clang 的 ASan 拦截是坏的
+   （`interception_win: unhandled instruction`，对赤裸 double-free 静默退出 0），
+   UBSan 运行时链接失败（缺 `__imp_getenv`、`ContinueOnError`）。
+
+**真正的检测器早已存在且更贴合**：`--arc-guard`（`irgen.c` 的
+`emit_arc_underflow_check` / `emit_arc_freed_use_check`）把释放后的对象打上
+`ZAN_ARC_FREED_MARK` 隔离，任何经陈旧引用的 retain/release 在**第一次后续使用**
+就被捕获，并用 `freed_by` 指出结束其生命的那次释放。这正是引用计数自身看不见的
+那一类：**缺一次 retain**，计数是平的但引用活过了对象。缺口只是**它从未接入任何
+测试档**（此前仅出现在开发脚本，`-g` 默认打开）——这就是 A53 能溜过整套测试的原因。
+
+新增 `tests/run_arcguard.cmake` + 每个 conformance 源一个 `arcguard_*` 孪生
+（435 项，`full` 档，与 `leakcheck_*` 一同构成 ARC 所有权的两面：漏一次 release
+与漏一次 retain）。**验收（按原条目要求实做）**：临时回退 A53 的
+`own_written_param`，同一个程序——
+
+- 不带守卫：退出 `0xC0000374`（STATUS_HEAP_CORRUPTION），**零输出**，无从定位；
+- 带守卫：`ARC integrity failure: retain through a stale reference (object was
+  freed: missing retain when stored)`，附对象地址与释放点。
+
+### 2.2 已写但**未本地验证**（需 Linux 首轮 CI 判定）
+
+`runtime-tests.yml` 的 sanitizer job 原先只编 `rt_test.c` + sched/io/co 三个源。
+扩了三步，每步单独成 step 以便失败时直接指名：`rt_sync`+`rt_file`、`rt_timer`
+（经 `rt_sigpipe_test`）、`rt_mem`。
+
+两个判断：① 不往 `rt_test.c` 的链接行里塞源文件——**那个 harness 对这三个模块
+一个用例都没有**，塞进去只是编译而从不执行；改为直接构建 CMake 已为它们注册的
+测试程序。② `rt_mem` 只上 UBSan、不上 ASan：它以 `--wrap=malloc` 链接并调用
+`__real_malloc`，与 ASan 的分配器拦截争同一批符号，且 ASan 本来就看不见 slab 块；
+而 UBSan 无需拦截，对这个满是原子操作、指针算术与对齐掩码的文件才是真正的收益。
+
+**未验证的原因**：本机 Windows 上 ASan/UBSan 运行时均不可用（见 2.1 第 3 条）。
+可本地验证的部分已验证：`ctest -R "^runtime_"` 12/12 绿，源文件清单逐字抄自
+`CMakeLists.txt`（596-638、932-967 行）。`rt_sigpipe_test` 与 `rt_mem_*` 是
+POSIX-only，Windows 上根本不注册，因此首轮 CI 是它们的第一次真实执行。
+
+### 2.3 前端 fuzz 扩容 —— 首轮就抓到一个真 bug
+
+`tests/fuzz/fuzz_parser.c` → `fuzz_frontend.c`：按驱动（`main.c` 2178-2291）的
+真实相位顺序补上 flatten/merge/desugar → `nsresolve` → `binder` → `checker`。
+**相位闸门照抄驱动**不是优化而是结论可信度的前提：驱动只在解析干净时才做解析后
+各步、只在那些步干净时才 bind，喂给 binder 一个半解析 AST 会在编译器永远到不了
+的状态里崩，每个这样的崩溃都是要花一轮排查的假报告。链接集仍无 LLVM（9 个源
+文件），job 因此仍是秒级；fuzz irgen 需要 LLVM 与 target machine，那是另一个
+harness，不是本条的延伸。删掉被完全取代的 `fuzz_parser.c`（CI 已不构建它，留着
+只会腐烂）。
+
+**首轮 1 秒内即崩**，且经两个 harness 对照定位到 **parser**（既有 bug，非本次扩容
+引入）。真因不是深度而是**栈帧**：parser 有六处 `zan_lexer_t saved = *p->lex;`
+做试探性回溯的栈上快照，而 `zan_lexer_t` 有 **41480 字节**，其中内联的
+`defines[128]` 预处理表独占 40960。于是 `parse_postfix`（41960 字节栈帧，且**就在
+表达式递归环里**）、`paren_is_named_cast`、`looks_like_local_func` 各自 41KB，
+1MB 栈在 **约 25 层**就耗尽——`parse_unary` 那条 256 层守卫**根本到不了，是死代码**。
+实测 **50 层配平括号**即 `0xC00000FD`（STATUS_STACK_OVERFLOW），无任何诊断；
+而括号**不配平**时诊断是正常的（`expected ')'`），所以这条一直藏在畸形输入之外。
+
+修法：`defines[]` 改为 arena 分配的指针（`lexer.h`/`lexer.c`）。六个快照点**一行
+未改**，语义完全不变——快照带着标量 `define_count`，恢复即截断试探期新增的宏
+（活跃项恒为 `[0, define_count)`）。效果：`parse_postfix` 41960 → <1024 字节，
+顶层两个 42KB → 约 1.4KB；`zan_lexer_init` 的 41KB memset 与每次试探 80KB 的
+memcpy 一并消失（这同时是条性能修复：`parse_postfix` 的前瞻是热路径）。
+现在 ≤255 层正常编译、≥300 层给出预期诊断，那条守卫首次真正生效。
+
+入库：`tests/diag/expression_nesting_depth.zan`（400 层配平括号）+
+`tests/fuzz/corpus/deep-nesting-stack-overflow.zan`（原崩溃样本，CI 语料现先播
+`tests/fuzz/corpus/*`，回归在第一次执行就被抓到而非靠运气）。
+修复后 240 秒 / **44.6 万次执行 / 3546 条边覆盖 / 零崩溃**。
+
+## 第 3 批 · 运行时的"企业嵌入"门槛（含两处待定取舍）
+
+| # | 内容 | 验收 |
+|---|---|---|
+| 3.1 | **A52-7** EH 线程表 1024 硬顶动态化；GUI/SDL/外部回调线程接上 `zan_thread_detach()`（A4-2 剩余） | `thread_eh_slots` 扩到 >1024 并发仍跑完；峰值内存不回退 |
+| 3.2 | **A52-8** 库内十余处 `abort()` 改为可注册回调 + 错误码出口（OOM、契约违反、slab 一致性） | 新增"宿主接管 OOM 后自行退出"用例；无回调时行为与今天一致 |
+| 3.3 | **A52-5** `--publish` 保留低成本安全网（~~需先定性能预算~~ **已实测，见下**） | publish 版本能报 over-release；约定阈值内不退化 |
+| 3.4 | **A52-6** null 解引用通用守卫 + opaque string 越界检查（~~需先定性能预算~~ **不是预算问题，见下**） | 新增诊断用例；裸循环/字段访问的基准不退化超阈值 |
+
+### 3.3 实测（2026-08-27）：整体守卫不可出厂，但可拆出一个 4.3% 的子集
+
+我原写"需先定性能预算"问错了问题。`--arc-guard` 的三个部件里，
+`emit_arc_quarantine`（`irgen.c:869-870`）**故意泄漏每个被释放的对象**
+——注释原文是 "leaked so its address is never recycled"，这正是陈旧引用可被检测的
+前提。所以它不能进出厂二进制的原因不是 CPU 而是内存无界增长。
+
+实测（`_scratch/arcbench.zan`，300 万轮 retain/release 饱和负载，取 3 次最好值）：
+
+| 变体 | 用时 | 相对基线 | 峰值内存 | exe |
+|---|---|---|---|---|
+| 基线（无守卫） | 417 ms | — | 6.2 MB | 399.7 KB |
+| **仅下溢检查**（无隔离区） | 435 ms | **+4.3%** | **6.2 MB（不变）** | 401.7 KB |
+| `--arc-guard`（完整） | 473 ms | +13.4% | **282.5 MB（45×）** | 403.2 KB |
+
+45 倍随分配量线性增长，长跑服务必然 OOM ⇒ 完整守卫只能是测试档（第 2 批的
+`arcguard_*` 正是它的正确用法）。
+
+**可出厂的子集是 `emit_arc_underflow_check` 单独启用**：它只在 release 路径上对
+已经载入的 `rc_old` 多一次比较+分支，不需要隔离区，因此内存零增长、体积 +2 KB、
+CPU +4.3%——而这是刻意饱和的微基准，真实程序更低，且仍在
+`docs/PERFORMANCE.md` 写明的 "ARC overhead < 5%" 目标之内。
+
+**剩下的是一个行为取舍，不是预算**：`irgen.c:823-827` 的注释说明了它今天为何 opt-in
+——over-release 目前"只泄漏（计数永不归零，于是什么都不释放），带着它的程序照样
+运行"，默认开陷阱会把泄漏变成崩溃。所以检测到之后要做什么有三种选择：
+abort（当前守卫行为）／只向 stderr 报告一次并继续／不报（现状）。这条需要拍板。
+
+### 3.4 实测：不是预算问题，是"能不能确定指针是托管字符串"
+
+`expr_has_reliable_string_bounds`（`irgen_expr.c:55-64`，6 处调用）只对字面量与
+非 opaque 局部返回真。查下来它**不是成本开关而是能力缺口**：
+
+托管字符串本来就在 `str-8` 的低 32 位缓存了字节长度（`zan_abi.h:48-67`，注释明说
+就是为了让 `.Length` 和每次边界检查 O(1)），所以只要确知是托管字符串，边界检查
+几乎免费。问题在于 opaque 字符串**可能根本不是托管字符串**——extern 返回的裸
+`char*` 前面没有头（`zan_abi.h:70-73` 明确写了这个区分），而去读 `str-8` 探测标记
+本身就可能越界：字符串位于页首时那是未映射页。**探测动作自己就是它要防的那个 bug。**
+
+所以 3.4 的真实选项是 ABI/表示层取舍，与性能阈值无关：
+① 规定跨入 Zan 的 `string` 必须是托管字符串（在边界包装 extern 返回值，代价是每次
+extern 返回一次拷贝）；② 维持现状，opaque 字符串无边界检查；③ 标记探测，接受
+未映射页风险（不可取）。**这条需要拍板，且选 ① 会改变 extern 字符串的 ABI 契约。**
+
+null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每次字段访问一次
+比较+分支（全语言最热路径）。这半确实是预算问题，但它需要先在 irgen 里做原型
+才能量——不像 3.3 有现成开关可切，无法只靠测量得出。
+
+## 第 4 批 · 标准库结构债（GUI 相关需协调窗口）
+
+| # | 内容 | 验收 |
+|---|---|---|
+| 4.1 | **A57 遗留** ARC 引用环：`Control.OnChildChanged` 虚钩子取代"子控件事件上挂捕获 this 的闭包"，并全库扫同模式 | `leakcheck_checkbox_group` 转绿；扫描结果登记 |
+| 4.2 | 闭包瘦身第二批：`Automation`(61) / `Management`(68) / `Windows`(71) 去 Threading+Diagnostics 税 | 三者文件数各降一档；standard 全绿 |
+| 4.3 | 选择性属性化：只改尺寸/索引/容量这类"写错就崩"的 public 裸字段（全库 13735 个不无脑重写） | 被改的字段有不变量校验用例 |
+| 4.4 | `App.zan` 5123 行单类拆分（per-panel / per-ribbon partial），连带 36 个 >150 行方法 | `IDE_BUILD_OK` + GUI golden 全绿 |
+| 4.5 | **A47-1** openssl 28.8MB 去重：先补"发布用 Tls 的程序并断言两个库在 exe 旁"的用例，再改清单格式与链接搜索路径 | 新用例绿；win-x64 实测发布可运行；仓库减约 14MB |
+
+## 第 5 批 · 模板与文档
+
+| # | 内容 | 验收 |
+|---|---|---|
+| 5.1 | `templates/server/server-mvc`（70 文件 / 10802 行 / `///` **0 行**）补公开接口与 Framework 层文档；拆 `Feature/Metrics.zan`(978) 与 `Admin/Monitor`(622) | 文档覆盖率 >10%；无 >400 行文件 |
+| 5.2 | 模板验收从"只编译"升级为"能跑"：起进程 + HTTP 断言（复用 `.agents/skills/testing-server-mvc-admin` 的流程） | 新 smoke 用例绿 |
+| 5.3 | **C9 / B1-2** `stdlib/Game` 文档（当前 1.0%） | 覆盖率 >10% |
+| 5.4 | **A2-4** 降级为文档说明（x64 四目标上 `stdcall`/`CallConv` 无行为差异）；SPEC/STDLIB 同步 | 条目关闭，文档有说明 |
+
+## 第 6 批 · 终局里程碑（最高风险，各自独立）
+
+| # | 内容 | 依赖 |
+|---|---|---|
+| 6.1 | **A32-4** await 同步完成 fast path 与无竞争握手 | 现有 async emitter |
+| 6.2 | **A32-5** LLVM 原生 EH 并删除 setjmp/longjmp 补偿层（空 try 2.6x 的终局解） | 6.1 之后 IR/frame 冻结 |
+| 6.3 | **A2-3** FFI 变参 → **A3** bindgen → **A6** 编译器对外 API → **B6** 工具链 Zan 化（LSP/DAP 约 256KB C） | 逐级依赖 |
+| 6.4 | **B6-SH1** 自举编译器补 `ref`/`out` 形参与 params 数组降级 | 与 6.3 并行 |
+| 6.5 | **A32-6** macOS 实机 + 签名公证（外部阻塞：无 Mac/凭据） | 外部 |
+
+# A57 · FormBuilder 逻辑像素重构的两处回归 —— ✅ 已修（2026-08-27）
+
+`conformance_checkbox_group` 在 `FormBuilder.zan` 的"逻辑像素 / 缩放感知"重构
+（工作树未提交改动）下变红，两处根因：
+
+1. **只写了 `name` 的字段被凭空套一层标题行**。重构把写死的白名单
+   （Input/TextArea/SelectBox）换成"控件自己有没有 `label` 属性"来决定是否补标题
+   ——方向对（Switch/Slider/Rate 的 label 此前直接丢了），但判据用了
+   `FormBuilder.Caption(o) != ""`，而 `Caption` 在没有 `label` 时**回退到
+   `name`**。于是任何只有 `name` 的字段都被包进 `FbStack{Label, 控件}`，控件树
+   凭空深一层：`.zform` 里 `host.children[0].children[0]` 拿到的是 FbStack，
+   CheckboxGroup 的聚合 API（`children.Count`、`SetChecked`/`IsChecked`）全落到
+   壳子上——golden 期望 3 个子项、实得 2（Label + 组）。
+   修法：表单补标题只认设计文档里**真的写了** `label`；`name` 回退留给自带
+   label 的控件（`ctl.SetProp("label", cap)`），两边意图都保住。
+2. **`SetRowHeight` 被忽略**。`ResolveMetrics` 改读缩放镜像 `sRowH`，而它只在
+   `OnMeasure(app)` 里刷新；不经测量直接 `Arrange`（本用例、以及任何无头布局）
+   时它还是 0，行高与行内居中一起丢失（期望 y=10/54，实得 y=0/24）。
+   修法：`SetRowHeight` 同时按 100% 基准写入镜像，`OnMeasure` 再按真实缩放覆盖。
+
+证据：`checkbox_group` 输出与 golden 逐行一致；`ctest -L standard`（含 GUI）
+**585/586**，唯一失败 `policy_theme_color_budget` 属 Chart 侧未提交改动
+（`ChartToolbox.zan` 7 处、`ChartViewShared.zan` 11 处、`ChartViewPie.zan` 2 处
+直接读语义色，budget 为 0）。
+
+**顺带定位一个既有泄漏（未修，需设计决定）**：`leakcheck_checkbox_group` 报
+`FormBuilder.zan` 的 `MakeItem` 每个选项泄漏一个闭包（用例造 3+3+5+4 = 15 个
+选项，正好 15 个），根因是**引用环**——组持有子 Checkbox，子的 `Change` 事件表
+持有捕获了组的闭包（`cb.Change.Add(() => { this.Change.Raise(); })`），ARC 不回收
+环。同源还有 `Gui/Event.zan:142` 的 490 个 `List<Action>`。可选修法：给 `Control`
+加一条 `OnChildChanged` 虚钩子，由子控件经 `parent` 反向通知（`parent` 是既有的
+非拥有指针），从而彻底不建闭包；这会动 `Control.zan`，与当前 GUI 改动重叠，
+留待协调后再做。
+
+# A56 · `using` 闭包瘦身：命名空间即目录，一个文件能拖一片 —— ✅ 第一批完成（2026-08-27）
+
+**根因（机制）**：`--auto-stdlib` 把 `using X.Y` 直接映射成目录 `stdlib/X/Y`，
+并把**该目录下所有 `.zan` 全部编进来**，再对新拉入的文件求不动点
+（`main.c:1976-2028` 的注释写明这是有意设计：加模块只需放文件）。后果是
+**目录里任何一个文件的 `using` 都会变成整个命名空间使用者的成本**——一个叶子
+工具引一次 `System.Threading`，所有用该命名空间的程序都跟着链上线程运行时。
+
+**实测（hello world，`using System;` + 一句 `Console.WriteLine`）**：
+
+| 阶段 | 文件数 | exe |
+|---|---|---|
+| 起点 | 80 | 563.7 KB |
+| 移出 `MessageBox`（根目录 → `System.Windows`） | 45 | 400.6 KB |
+| 切断 `Guid` → `System.Security.Cryptography` | **16** | **392.6 KB** |
+
+| 命名空间 | 改前 | 改后 |
+|---|---|---|
+| `using System` | 80 文件 / 564 KB | **16 / 393 KB** |
+| `using System.IO` | 79 / 564 | **34 / 411** |
+| `using System.Threading` | 59 / 558 | **24 / 532** |
+| `using System.Diagnostics` | 79 / 564 | **52 / 524** |
+
+**四处改动**：
+
+1. `stdlib/System/MessageBox.zan` → `stdlib/System/Windows/MessageBox.zan`
+   （`namespace System.Windows;`）。它是根目录唯一带 `System.Diagnostics` +
+   `System.IO` 的文件，于是 IO → DirectoryWatcher → Threading 整条链进了**每个**
+   程序；这也正是 **A43-B15** 记的"让 `emit_lib_linux_so`/`macos_dylib` 交叉共享库
+   用例失败"的那个文件。消费者只有 `ZanIDE.zan` 与 `platform_input_maps.zan`，
+   各加一行 `using System.Windows;`。
+2. `stdlib/System/IO/DirectoryWatcher.zan` → `stdlib/System/IO/Watch/`
+   （`namespace System.IO.Watch;`）。它是 `System.IO` 里唯一 `using System.Threading`
+   的文件——读个文件不该链线程运行时。消费者只有 `dir_watcher.zan`。
+3. `RandomNumberGenerator`（54 行、只依赖 `System`）从
+   `System.Security.Cryptography` 移到根命名空间；`Guid` 随之去掉那条 using，
+   并把 `Hex.nibble` 的十六进制位校验就地写成
+   `(c>=48&&c<=57)||(c>=97&&c<=102)`（原写法 `c == 0 && ch != "0"` 借返回值反推
+   合法性，既绕又是那条 using 的唯一理由）。这条最值：Cryptography 目录连带
+   Json/Text/Threading 共 **29 个文件**。
+4. **两个同名 `Stopwatch` 合并**：`System.Diagnostics.Stopwatch`（QPC /
+   clock_gettime 高分辨率）与 `Threading.zan` 里的第二个 `Stopwatch`
+   （`GetMicroseconds`/`GetMilliseconds`，还在用 B2 本该清零的 `calloc`-as-string
+   手工拼 timespec 字节）按 using 顺序各被一半调用方看见。静态时钟接口并入根
+   `Stopwatch`（新增 `MonoScaled`，先除后乘——QPC 频率下 `ticks*1e6` 在开机约
+   11 天后会溢出 i64），删掉 Threading 里那份 45 行；`Timer.Now()` 从
+   `ServerMetrics.MonoMillis()` 改为 `Stopwatch.GetMilliseconds()`，Diagnostics 从
+   Threading 闭包里彻底移除。`Stopwatch` 自身移到根命名空间。
+
+**证据**：`ctest -L standard -E "gui|policy"` **558/558 全绿**；套件耗时从
+**2262 → 438 sec\*proc**（挂钟 78s → 21s），因为每个用例现在编 16~45 个文件而不是
+45~80 个。
+
+**又暴露并修掉三类隐藏耦合（重新 `cmake -B build` 刷新 stdlib.stamp、缓存全部失效
+后才浮现）**：
+
+* **`zan_mmap_*` 不在 sync-runtime 前缀表里**（`irgen_emit.c`）：
+  `System.IO.MemoryMappedFile` 声明的 `zan_mmap_*` 住在 `rt_sync.c`，但编译器判断
+  "是否链接 rt_sync" 的前缀表只列了 atomic/shared/thread/dispatch/monotonic/plat
+  ——以前每个程序都因 `using System` 顺带拉进 Threading 而碰巧链上，闭包一瘦，
+  所有用内存映射文件的程序直接 `undefined reference to zan_mmap_create`。已按
+  `rt_sync.c` 的实际导出族补齐（`zan_mmap_` / `zan_monitor_` / `zan_exe_dir_` /
+  `zan_dir_list_`，并把 `zan_shared_table_` 放宽为 `zan_shared_`）。
+* **两个测试文件缺 `using System.Diagnostics`**（`dir_watcher.zan`、
+  `shortcut_roundtrip.zan` 用 `ProcessList.SelfPid()`）。
+* **两个测试文件依赖一个恰好存在的目录**：`fileinfoex_mmap.zan` /
+  `openwrite_truncate.zan` 往相对路径 `_scratch/` 写文件，而 ctest 的工作目录是
+  `build/`——它们一直靠 `build/_scratch` 这个历史遗留目录才通过，**在干净克隆上
+  本来就会失败**。已让用例自己 `Directory.CreateDirectory("_scratch")`。
+
+**顺带修掉两处隐藏耦合**：闭包一瘦，两个此前"白拿别人依赖"的文件当场暴露——
+`System/ServiceProcess/ServiceProcess.zan` 用 `Thread.Sleep` 却没写
+`using System.Threading;`；`System/Text/RegularExpressions/RegexProgram.zan` 用
+`Encoding.CharFromCode` 却没写 `using System.Text;`。两处补上声明后，**全部
+`System.*` 命名空间（逐目录扫过一遍）都能被单独 `using` 而编译通过**——
+"每个模块自己声明依赖"这条性质此前并不成立。
+
+**文档同步**：`docs/STDLIB.md` 的目录树（根命名空间新增 `Stopwatch` /
+`RandomNumberGenerator`、`IO/Watch/`、Threading 与 Diagnostics 去掉 Stopwatch）、
+`docs/aardio-capability-migration.md` 的两处路径。
+
+**未做（下一批）**：`System.Automation`(61) / `System.Management`(68) /
+`System.Windows`(71) 仍各带 Threading + Diagnostics，其中 `Automation/Window.zan`
+与 `Management/Cpu.zan` 疑似只为 `Thread.Sleep` 付全价，待核；`System.Net`(97) /
+`System.Web`(108) / `System.Data`(115) 的体量是真实并发/驱动面，不属于误拉。

@@ -86,10 +86,10 @@
 | 13 | `System.Automation.UiElement` | `stdlib/System/Automation/UiElement.zan` | `win_uielement_smoke` |
 | 23 | `System.IO.Compression` | `stdlib/System/IO/Compression/{Deflate,Crc32,GZip,Zip,Tar}.zan` | `win_compression_smoke` |
 | 33 | `System.Guid` | `stdlib/System/Guid.zan` | `guid_*` |
-| 36 | `Stopwatch` | `stdlib/System/Diagnostics/Stopwatch.zan` | `stopwatch_*` |
+| 36 | `Stopwatch` | `stdlib/System/Stopwatch.zan`（2026-08-27 从 `Diagnostics/` 移到根命名空间，见 TASKS A56） | `stopwatch_*` |
 | 37 | `System.Globalization.Lunar` | `stdlib/System/Globalization/Lunar.zan` | `lunar_*` |
 | 17 | `System.Windows.Clipboard` | `stdlib/System/Windows/Clipboard/Clipboard.zan` | `clipboard_roundtrip` |
-| 22 | `System.IO.DirectoryWatcher` | `stdlib/System/IO/DirectoryWatcher.zan` | `dir_watcher` |
+| 22 | `System.IO.Watch.DirectoryWatcher` | `stdlib/System/IO/Watch/DirectoryWatcher.zan`（2026-08-27 独立命名空间，见 TASKS A56） | `dir_watcher` |
 | 24~29 | `System.IO` 实用工具 | `stdlib/System/IO/{IniFile,Shortcut,KnownFolders,PathEx,FileInfoEx,MemoryMappedFile}.zan` | `ini_csv_roundtrip` / `shortcut_roundtrip` / `known_folders` / `path_ex` / `fileinfoex_mmap` |
 | 30~32 | `Csv` / `Template` / `TextTable` | `stdlib/System/Text/{Csv,Template,TextTable}.zan` | `ini_csv_roundtrip` / `text_template` |
 | 34+35 | `Pinyin` / `FuzzyMatching` / `Bm25Index` | `stdlib/System/Text/{Pinyin,FuzzyMatching,Bm25Index}.zan` | `tryget_pinyin` / `fuzzy_bm25` |

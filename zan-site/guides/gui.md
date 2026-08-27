@@ -225,9 +225,21 @@ c.StylePad... c.SetShown(v).Grow();
 ### CSS flex 布局
 
 给容器加 `display: flex`（样式表/`Style`），支持
-`flex-direction`（row/col）、`flex-grow`、`flex-shrink`、`justify-content`
+`flex-direction`（row/column）、`flex-wrap`、`justify-content`
 （start/center/end/between/around）、`align-items`（stretch/start/center/end）、
-margin、gap、min/max/百分比宽高。
+`align-content`（换行后各行在交叉轴的分布，含 stretch）、`gap`/`row-gap`/
+`column-gap`、margin、min/max/百分比宽高。
+
+子项上可以写 `flex`（`1 1 0` / `none` / `auto`）、`flex-grow`、`flex-shrink`
+（`0` = 溢出时不让位）、`flex-basis`、`align-self`（覆盖容器的 `align-items`）、
+`aspect-ratio`（只给一根轴，另一根按比例推出）、`order`。
+
+`flex-basis: 0` 配 `flex-grow: 1` 是等宽列的标准写法——剩余空间按 grow 平分，
+整除余数给最后一项，所以右边缘精确对齐容器。
+
+不必手写这些的场合用现成容器：`Gui.Widget.Flex`（对标 n-flex/n-space）和
+`Gui.Widget.Grid` + `GridItem`（对标 n-grid/n-gi，等宽列、span/offset、
+按最小列宽自动降列）。两者只往 `Class` 写类名，几何全部由 `base.css` 给出。
 
 ### 特殊容器
 
@@ -249,13 +261,25 @@ margin、gap、min/max/百分比宽高。
 ### CSS 文本（`StyleSheet.Parse`/`guicss`）
 
 `font-size`/`font`、`width`/`min-width`/`max-width`、`height`/`min/max`、
-`gap`/`row-gap`/`column-gap`、`radius`/`border-radius`、`padding`/`pad`（+每边）、
-`margin`（+每边）、`background`/`background-color`/`bg`、`opacity`、`color`、
-`accent-color`、`font-weight`、`line-height`、`text-align`、`vertical-align`、
-`text-transform`、`border-width`/`border-color`（+每边）、`box-shadow`/`shadow`、
-`display`（flex/inline-flex/none）、`flex-direction`、`justify-content`、
-`align-items`、`flex-grow`、`overflow`、`z-index`、`cursor`、`transition`、
-`transform`。颜色：命名色 + `#hex` + `0xAARRGGBB`。
+`aspect-ratio`、`gap`（`<both>` 或 `<row> <column>`）/`row-gap`/`column-gap`、
+`radius`/`border-radius`（1~4 值）+ `border-<corner>-radius` 四个单角、
+`padding`/`pad`（+每边）、`margin`（+每边）、`background`/`background-color`/`bg`、
+`opacity`、`color`、`accent-color`、`font-weight`、`line-height`、
+`letter-spacing`、`text-align`、`vertical-align`、`text-transform`、
+`text-overflow`、`white-space`、`border`（+每边简写）、`border-width`/
+`border-color`（+每边）、`border-style`、`box-shadow`/`shadow`、
+`display`（flex/inline-flex/none）、`flex-direction`、`flex-wrap`、
+`justify-content`、`align-items`、`align-content`、`place-content`、
+`flex`/`flex-grow`/`flex-shrink`/`flex-basis`、`align-self`、`order`、
+`position`、`top`/`right`/`bottom`/`left`/`inset`、`overflow`、`z-index`、
+`visibility`、`cursor`、`box-sizing`（盒子一律 border-box，照收不改）、
+`transition`（+`-duration`/`-timing-function`）、`transform`、
+`rotate`/`scale`/`translate`（脱离 transform 的单独写法）、
+`animation`（+`-name`/`-duration`）、`backdrop-filter`/`filter`（blur）。
+颜色：命名色 + `#hex` + `0xAARRGGBB`。
+
+长度按 100% 编写，DPI 缩放由引擎统一施加（含 `row-gap`/`column-gap`、
+单角圆角与 `flex-basis`）。百分比不缩放。
 
 支持选择器：类型 `button { }`、类 `.primary { }`、状态 `button:hover`/
 `:active`/`:focus`/`:checked`、`a,b{}`、子件 `select::option`、
@@ -291,6 +315,12 @@ sunset`。
 checked:/selected:/focus-visible:`；任意值 `w-[240px]`、`bg-[#0f172a]`；
 透明度 `bg-black/40`；工具类最后应用覆盖皮肤规则。
 ❌ 没有 `md:/sm:/dark:/group-hover:` 断点变体。
+
+布局类：`flex flex-col flex-wrap items-center justify-between gap-4 gap-x-2`、
+`grid grid-cols-3`；子项 `flex-1`（`1 1 0`，一排即等宽）/`flex-auto`/
+`flex-initial`/`flex-none`、`grow grow-0 shrink shrink-0`、
+`basis-0 basis-1/3 basis-full basis-24`、`self-center self-end self-stretch`、
+`content-between content-stretch`、`aspect-video aspect-square`。
 
 ## 事件机制
 

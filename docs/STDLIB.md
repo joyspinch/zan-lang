@@ -77,7 +77,13 @@ stdlib/
 │   ├── ConsoleColor.zan             # ConsoleColor enum
 │   ├── DateTime.zan                 # Date and time
 │   ├── Guid.zan                     # UUID generation
-│   ├── Random.zan                   # Random numbers
+│   ├── Random.zan                   # Random numbers (non-cryptographic)
+│   ├── RandomNumberGenerator.zan    # OS CSPRNG bytes — a root primitive:
+│   │                                # keeping it under Security/Cryptography
+│   │                                # made `using System;` pull 29 files
+│   ├── Stopwatch.zan                # monotonic clock + elapsed timing
+│   │                                # (QPC / clock_gettime); also the static
+│   │                                # GetMilliseconds/GetMicroseconds readings
 │   ├── TimeSpan.zan                 # Time span
 │   ├── Interop.zan                  # FFI helpers ([DllImport] wrappers)
 │   ├── NativeMemory.zan             # Low-level memory operations
@@ -101,7 +107,11 @@ stdlib/
 │   │   ├── FileInfo.zan / FileInfoEx.zan
 │   │   ├── PathEx.zan               # extended path helpers
 │   │   ├── DirectoryTree.zan        # directory tree enumeration
-│   │   ├── DirectoryWatcher.zan     # directory change watching
+│   │   ├── Watch/                   # System.IO.Watch — DirectoryWatcher
+│   │   │                            # (separate namespace: it needs a
+│   │   │                            #  background thread, and pulling
+│   │   │                            #  System.Threading into every reader
+│   │   │                            #  of a file cost +34 files / +150KB)
 │   │   ├── IniFile.zan              # INI parsing
 │   │   ├── Shortcut.zan             # .lnk / .desktop shortcuts
 │   │   ├── KnownFolders.zan         # OS known-folder lookup
@@ -149,14 +159,14 @@ stdlib/
 │   │   └── Rpc/                     # RpcClient/RpcServer, codecs, transports
 │   │
 │   ├── Threading/                   # System.Threading
-│   │   ├── Threading.zan            # Thread, Mutex, Semaphore, Stopwatch,
+│   │   ├── Threading.zan            # Thread, Mutex, Semaphore,
 │   │   │                            # AtomicInt, SharedTable, Channel
 │   │   ├── AsyncGate.zan / AsyncRwLock.zan / BlockingQueue.zan
 │   │   ├── Gate.zan / SemaphoreSlim.zan / Timer.zan
 │   │
 │   ├── Diagnostics/                 # Process, ProcessList, ProcessHost,
 │   │   │                            # ProcessControl, Privileges,
-│   │   │                            # ServerMetrics, Stopwatch
+│   │   │                            # ServerMetrics
 │   ├── Json/                        # Json.zan, JsonValue.zan
 │   ├── Linq/                        # Enumerable.zan, Expression.zan
 │   │

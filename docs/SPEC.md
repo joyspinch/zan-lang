@@ -125,7 +125,9 @@ Escape sequences: `\n \r \t \\ \" \' \0`（不支持 `\x` / `\u` / `\U` 十六�
 | 15 | `=` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` | Right | Assignment |
 | 16 | `=>` | Right | Lambda |
 
-Note: `?.`（null-conditional）**未实现**——`x?.y` 会被当作普通访问解析，行为与 C# 不一致，勿用。
+Note: `?.`（null-conditional）**已实现**（2026-08-27 实测更正，此前本节写"未实现"）：
+`x?.y` 在 `x` 为 null 时求值为无值的可空类型，非 null 时取成员，与 C# 一致
+（`tests/conformance/nullable_reference_types.zan`）。
 
 ---
 
@@ -197,7 +199,8 @@ if (x.HasValue) {
 int y = x ?? 0;
 ```
 
-注意：`?.` 未实现（见 §2.6），判空请用 `HasValue` 或 `!= null` 后再访问。
+注意：`?.` 已可用（见 §2.6 的更正）；`int? len = s?.Length;` 会得到一个可空值，
+用 `HasValue` / `.Value` 读取。
 
 ### 3.4 Generics
 
@@ -465,7 +468,12 @@ switch (value) {
 }
 ```
 
-switch 目前是**语句**形态（常量 case + default）；`value switch { ... }` 表达式形态未实现，case 守卫 `when` 未实现。
+switch 有语句与表达式两种形态（2026-08-27 复核更正，此前本节写"表达式形态与
+`when` 守卫未实现"）：语句形态支持常量 case、`case null:`、类型模式 `case T x:`
+与 `when` 守卫；表达式形态 `value switch { <模式> when <守卫> => <结果>, ... }`
+支持常量/类型模式、`_` discard、`default`，无匹配时取零值
+（`cs_b06_switch_expr.zan`、`cs_b05_pattern_var.zan`、`pattern_value_types.zan`）。
+值类型的类型模式按静态类型判定（`case int n:` 对 int 判别式成立）。
 
 ### 5.3 Exception Handling
 
@@ -742,17 +750,28 @@ qualified_name  = IDENT { "." IDENT } ;
 
 以下特性已实现（有 conformance 用例）：`yield return` / `yield break`（急切降级为隐藏 `List<T>` 累加器，非惰性迭代器）、`fixed`、`lock`、`goto`、`record`、属性 `get`/`set`、运算符重载、可空值类型（`int?` 的 `.HasValue`/`.Value`）、命名空间限定调用、`--check-leaks`。
 
+> 2026-08-27 复核：下面这份清单有六项已经过时（`using` / `init` / 元组与解构 /
+> `?.` / LINQ 查询语法 / switch 表达式与 `when` 守卫都已实现并有 conformance
+> 用例），已移入"已实现"一节。清单只保留实测仍不可用的项。
+
 以下 C# 特性**尚未实现**，不要在 Zan 代码中使用：
 
 - `checked` / `unchecked` — 关键字存在但均为 **no-op**：溢出检查始终关闭（环绕语义），`checked(x + 1)` 与 `x + 1` 行为相同（`tests/conformance/cs_b14_checked.zan`）
-- `using` statement — deterministic disposal (like C# IDisposable)
-- `init` — init-only property setter
 - lazy iterators (`IEnumerable<T>` protocol) — `yield` currently materializes a list
-- LINQ query syntax (`from x in xs where ... select`) — method chains only
-- 元组 `(int, string)` / 解构
+- LINQ 查询语法的 `orderby ... descending` 与 `let` 返回空结果、`join` 生成不合法 IR（`from/where/select` 与 `orderby` 升序可用）——见 `TASKS.md` **A54**
 - tagged union 枚举（代数数据类型）
-- `?.` null-conditional（会被当作普通访问解析，行为不标准）
+- 命名实参之外的实参特性：`params` 之后的可选实参组合未系统验证
 - `\x` / `\u` / `\U` 字符转义
 - `$@"..."` 组合字符串、`"""` 原始字符串
 - COW（copy-on-write）集合——`List` 赋值是引用共享，修改即共享
 - `[CImport]`、`project.zan` 项目文件、`zan` CLI（实际为 `zanc`）
+
+以下曾列为未实现、**2026-08-27 实测已可用**（各带 conformance 用例）：
+
+- `using (res) { }` 确定性释放（`cs_b02_using.zan`）
+- `init` 只写访问器（`cs_b18_init.zan`）
+- 元组 `(int, string)` 与 `var (a, b) = ...` 解构（`cs_b03_tuple.zan`；嵌套解构仍未实现）
+- `?.` null-conditional（`nullable_reference_types.zan`；见 §2.6 的更正）
+- LINQ 查询语法 `from x in xs where ... select`（`linq_query.zan`）
+- 命名实参 `F(b: 2)`（`cs_b04_named_args.zan`）、索引器 `this[int i]`（`cs_b09_indexer.zan`）
+- switch 表达式 `x switch { ... }` 与 `when` 守卫、值类型的类型模式（`cs_b06_switch_expr.zan`、`pattern_value_types.zan`）
