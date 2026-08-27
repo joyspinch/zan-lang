@@ -46,7 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Build & run with ASan + UBSan
+      - name: Build & run with ASan + UBSan (rt_sched, rt_io, rt_co)
         run: |
           cc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
             -Wall -Wextra -I. \
@@ -54,3 +54,45 @@ jobs:
             src/runtime/rt_co.c \
             -o rt_test_san -lpthread
           ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 ./rt_test_san
+
+      # The three modules below were outside sanitizer coverage. Each is built
+      # from the test program CMake already registers for it, rather than by
+      # adding sources to rt_test.c -- that harness has no cases for them, so
+      # linking it against them would have compiled the code without ever
+      # running it.
+      - name: Build & run with ASan + UBSan (rt_sync, rt_file)
+        run: |
+          cc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -Wall -Wextra -I. \
+            tests/runtime/rt_sync_test.c src/runtime/rt_sync.c \
+            src/runtime/rt_file.c \
+            -o rt_sync_san -lpthread -lrt
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 ./rt_sync_san
+
+      - name: Build & run with ASan + UBSan (rt_timer)
+        run: |
+          cc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -Wall -Wextra -I. -DZAN_IO_STACKLESS_ONLY \
+            tests/runtime/rt_sigpipe_test.c src/runtime/rt_io.c \
+            src/runtime/rt_co.c src/runtime/rt_timer.c \
+            -o rt_timer_san -lpthread
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 ./rt_timer_san
+
+      # rt_mem gets UBSan but NOT ASan, deliberately. It is linked with
+      # `ld --wrap=malloc,free,calloc,realloc` and calls `__real_malloc`, so
+      # under ASan the wrap and ASan's own allocator interceptors would both
+      # claim the same symbols -- and ASan cannot see slab blocks anyway, since
+      # a freed block stays mapped on a free list. UBSan needs no interception
+      # and is what pays off here: the allocator is a mass of atomics, pointer
+      # arithmetic and alignment masking.
+      - name: Build & run with UBSan (rt_mem)
+        run: |
+          for t in dblfree remote; do
+            cc -O1 -g -fsanitize=undefined -fno-sanitize-recover=all \
+              -Wall -Wextra -I. \
+              tests/runtime/rt_mem_${t}_test.c src/runtime/rt_mem.c \
+              -o rt_mem_${t}_san -lpthread \
+              -Wl,--wrap=malloc -Wl,--wrap=free \
+              -Wl,--wrap=calloc -Wl,--wrap=realloc
+            UBSAN_OPTIONS=print_stacktrace=1 ./rt_mem_${t}_san
+          done

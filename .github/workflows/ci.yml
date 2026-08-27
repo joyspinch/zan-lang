@@ -121,12 +121,14 @@ jobs:
       run: |
         find src/ -name '*.c' -o -name '*.h' | xargs clang-format --dry-run --Werror || true
 
-  # Fuzz the lexer + parser front-end with libFuzzer under ASan + UBSan. Runs a
-  # short bounded budget on every push so malformed-input crashes / OOB reads /
-  # UB regress loudly. The front-end (arena+diag+lexer+parser+ast) is a closed
-  # link set — no LLVM needed, so this stays fast.
+  # Fuzz the whole front-end with libFuzzer under ASan + UBSan: lexer, parser,
+  # the post-parse resolve steps, the binder and the type checker. Runs a short
+  # bounded budget on every push so malformed-input crashes / OOB reads / UB
+  # regress loudly. Everything linked here is LLVM-free, which is what keeps the
+  # job seconds rather than minutes; fuzzing irgen needs LLVM and a target
+  # machine, so that would be a separate harness.
   fuzz:
-    name: fuzz (lexer+parser)
+    name: fuzz (front-end)
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -135,8 +137,12 @@ jobs:
         clang -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
           -Isrc/compiler \
           src/compiler/arena.c src/compiler/diag.c src/compiler/lexer.c \
-          src/compiler/parser.c src/compiler/ast.c \
-          tests/fuzz/fuzz_parser.c -o fuzz_parser
+          src/compiler/parser.c src/compiler/ast.c src/compiler/nsresolve.c \
+          src/compiler/binder.c src/compiler/checker.c src/compiler/definite.c \
+          tests/fuzz/fuzz_frontend.c -o fuzz_frontend
         mkdir -p corpus
-        cp tests/golden/cases/*.zan tests/diag/*.zan examples/*.zan corpus/ 2>/dev/null || true
-        ASAN_OPTIONS=detect_leaks=0 ./fuzz_parser -max_total_time=45 -print_final_stats=1 corpus
+        # tests/fuzz/corpus holds inputs that once crashed the front-end, so a
+        # regression is caught on the first execution rather than by luck.
+        cp tests/fuzz/corpus/*.zan tests/golden/cases/*.zan tests/diag/*.zan \
+           examples/*.zan corpus/ 2>/dev/null || true
+        ASAN_OPTIONS=detect_leaks=0 ./fuzz_frontend -max_total_time=45 -print_final_stats=1 corpus

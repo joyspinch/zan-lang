@@ -1184,6 +1184,48 @@ foreach(_src ${_conf_srcs})
   endif()
 endforeach()
 
+# ---- ARC guard: every conformance program, with freed objects quarantined ----
+# --arc-guard stamps a freed object's refcount slot with a marker instead of
+# letting the block be recycled, and traps any later retain/release that reaches
+# it. That is the one bug class refcounting cannot notice on its own: a
+# *missing* retain, where the counts balance but a reference outlives its
+# object. The leakcheck twin above is the mirror image (a retain with no
+# release), so the two together bracket ARC ownership from both sides.
+#
+# This tier is why it earns its runtime: the A53 heap corruption (an
+# RC-managed parameter reassigned in the callee released the caller's object)
+# ran the plain conformance suite to a bare STATUS_HEAP_CORRUPTION exit with no
+# output, and in the field showed up only as misordered `orderby` results.
+# Under the guard the same program names the fault: "retain through a stale
+# reference (object was freed: missing retain when stored)", with the object
+# address and the releasing site.
+foreach(_src ${_conf_srcs})
+  get_filename_component(_name ${_src} NAME_WE)
+  zan_uses_gui_driver(${_src} _needs_gui_driver)
+  if(_name MATCHES "^rts_")
+    set(_extra_args "${_rts_stdlib_zanc_args}")
+  elseif(_name MATCHES "^async_mt")
+    set(_extra_args "--async-workers")
+  elseif(_name STREQUAL "server_mvc_timezone")
+    set(_extra_args
+      "${CMAKE_SOURCE_DIR}/templates/server/server-mvc/src/Framework/Fmt.zan")
+  elseif(_needs_gui_driver)
+    set(_extra_args "${_gui_driver_args}")
+  else()
+    set(_extra_args "")
+  endif()
+  add_test(NAME arcguard_${_name}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${_src}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/arc_${_name}${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      "-DZANC_ARGS=${_extra_args}"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_arcguard.cmake)
+  set_tests_properties(arcguard_${_name} PROPERTIES
+    RESOURCE_LOCK src_${_name} TIMEOUT 120)
+endforeach()
+
 # ---- Multi-file compilation: compile several .zan files into one program ----
 # Sources live in a subdirectory so the single-file glob above ignores them.
 add_test(NAME conformance_multifile
@@ -1565,6 +1607,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_tree${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # CSS flex wrapping and the equal-column Grid are pure geometry: the case
+  # feeds computed style boxes straight in and diffs the resolved rectangles,
+  # so line breaking, align-content, flex-shrink/basis, align-self,
+  # aspect-ratio and the grid's non-accumulating column edges are all pinned
+  # without a window.
+  add_test(NAME conformance_gui_flex
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/flex_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_flex.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_flex${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # The CSS skin pipeline (Css parser -> StyleSheet -> StyleBox) is pure
   # computation, so it is verified headlessly against a golden dump.
   add_test(NAME conformance_gui_css
@@ -1600,7 +1656,24 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_webview_interop${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable conformance_gui_css conformance_gui_tailwind conformance_gui_props conformance_gui_tree conformance_gui_webview_interop PROPERTIES
+  # Button.Color's CSS injection must be idempotent per color per sheet,
+  # keyed on the rule's presence in the sheet. The old guard keyed on
+  # bgThemeGen (which the injection itself bumps) and per-widget fields
+  # (which immediate-mode UIs reset every frame by rebuilding their
+  # widgets), so any frame that rendered a Color button bumped the
+  # generation again: the whole style cache and baseSheets were dropped
+  # and base.css re-parsed several times per frame until the app froze.
+  # Also pins that the selector engine matches [class*="frag"] rules.
+  add_test(NAME conformance_gui_colorinject
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/colorinject_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_colorinject.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_colorinject${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_flex conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable conformance_gui_css conformance_gui_tailwind conformance_gui_props conformance_gui_tree conformance_gui_webview_interop conformance_gui_colorinject PROPERTIES
     ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 
@@ -1631,6 +1704,28 @@ add_test(NAME policy_control_factory
 add_test(NAME policy_theme_color_budget
   COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
     -P ${CMAKE_SOURCE_DIR}/tests/run_theme_color_budget.cmake)
+
+# ---- Policy: a CSS comment body must not contain `*/` ----
+# Comments do not nest, so a `*/` inside one ends it early and the remaining
+# prose glues itself onto the next rule's first selector -- which is how the
+# `input` base rule silently vanished (no border, no field background) while
+# `textarea`/`select` in the same selector list kept theirs.
+add_test(NAME policy_css_comment_hygiene
+  COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_css_comment_hygiene.cmake)
+set_tests_properties(policy_css_comment_hygiene PROPERTIES
+  LABELS "full;standard;smoke;gui")
+
+# ---- Policy: every gallery demo that is written must be reachable ----
+# A demo is lost silently in two ways: an overlay demo missing from the
+# IsOverlayComp routing list (the base pass then paints a placeholder over it --
+# Compose and DataTable), or a render branch whose preview id no Comp registers
+# (dead code -- Alert.types / Alert.queue). Both look like an empty preview box.
+add_test(NAME policy_gallery_demo_wiring
+  COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_gallery_demo_wiring.cmake)
+set_tests_properties(policy_gallery_demo_wiring PROPERTIES
+  LABELS "full;standard;smoke;gui")
 
 # ---- Policy: widget draw paths must not gain direct Theme font-size reads ----
 add_test(NAME gui_theme_font_budget
@@ -1957,7 +2052,10 @@ set(_new_diag_cases
   integer_narrowing
   interface_missing_method
   interface_bad_signature
-  unrelated_argument_type)
+  unrelated_argument_type
+  scalar_argument_to_reference
+  call_not_callable
+  expression_nesting_depth)
 foreach(_case ${_new_diag_cases})
   if(_case STREQUAL cyclic_inheritance)
     set(_diag_regex "cyclic inheritance")
@@ -1971,6 +2069,12 @@ foreach(_case ${_new_diag_cases})
     set(_diag_regex "cannot convert 'string' to 'int' in assignment")
   elseif(_case STREQUAL unrelated_argument_type)
     set(_diag_regex "in argument 1 of 'Paint'")
+  elseif(_case STREQUAL scalar_argument_to_reference)
+    set(_diag_regex "cannot convert 'int' to 'object'")
+  elseif(_case STREQUAL call_not_callable)
+    set(_diag_regex "could not be resolved to any callable")
+  elseif(_case STREQUAL expression_nesting_depth)
+    set(_diag_regex "expression nesting too deep")
   elseif(_case STREQUAL interface_missing_method OR
          _case STREQUAL interface_bad_signature)
     set(_diag_regex "does not implement interface method")
