@@ -1,0 +1,353 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// 数字输入框（Naive UI n-input-number）：左右内嵌 −/+ 步进按钮，
+/// 中间是可编辑的数字区。绑定 SignalInt / `.data` 双向同步；
+/// min/max 钳制，step 定步长；聚焦后 ↑/↓ 键同样加减，回车提交。
+///
+///     InputNumber age = new InputNumber(0, 120);
+///     age.data = form.age;          // two-way
+///     age.Change += () => { ... };
+///     age.Render(app, 40, 40, 160, 34);
+///
+/// 外观走 `input` 类型规则（尺寸档 input.small/.large 直接生效），
+/// 步进按钮颜色取 `input::icon` part——代码只留几何与交互，
+/// 不直读主题语义色。
+class InputNumber : Control {
+    /// 值信号：立即模式与保留模式共用一条真值来源。
+    SignalInt model;
+    /// 双向绑定状态：`num.data = model.field;` 使模型字段与
+    /// 输入框双向同步（编译器降级的 Binding）。
+    Binding<int> data;
+    /// 空值占位提示（值为 0 且不在编辑时显示 hint 而非 "0" 的场景
+    /// 由 hint != "" 决定；默认 "" 直接显示数值）。
+    string hint;
+    int minV;
+    int maxV;
+    /// 步进量：按钮/↑↓ 每次 ±step。0 视为 1。
+    int stepV;
+    /// 聚焦编辑中的文本缓冲；失焦、回车或点击步进时提交。
+    string editBuf;
+    bool hadFocus;
+    int wid;
+    int minusId;
+    int plusId;
+    /// 值被用户改变时触发（C# 风格：`n.Change += h;`）。
+    UiEvent Change;
+    /// 尺寸变体：对应 Class = "small" / "large"（Naive UI size prop）。
+    Binding<string> Size;
+
+    void InitNumber(SignalInt m, int lo, int hi) {
+        this.InitControl("inputNumber", 1);
+        model = m;
+        minV = lo;
+        maxV = hi;
+        stepV = 1;
+        hint = "";
+        editBuf = "";
+        hadFocus = false;
+        wid = WidgetId.Next();
+        minusId = WidgetId.Next();
+        plusId = WidgetId.Next();
+        wiresOwnEvents = true;
+        Change = new UiEvent();
+        Size = "medium";
+    }
+
+    /// Default design-time constructor（范围 0..100）。
+    InputNumber() {
+        InitNumber(new SignalInt(0), 0, 100);
+    }
+
+    /// `new InputNumber(0, 120)` —— 带取值范围。
+    InputNumber(int lo, int hi) {
+        InitNumber(new SignalInt(lo), lo, hi);
+    }
+
+    static InputNumber Bind(SignalInt model, int lo, int hi) {
+        InputNumber n = new InputNumber(lo, hi);
+        n.model = model;
+        return n;
+    }
+
+    override string Kind() { return "InputNumber"; }
+    override string StyleType() { return "input"; }
+    override Binding<string> SizeOf() { return Size; }
+
+    void Hint(string text) { hint = text; }
+
+    InputNumber OnChange(Action a) {
+        Change.Add(a);
+        return this;
+    }
+
+    int Step() {
+        if (stepV < 1) { return 1; }
+        return stepV;
+    }
+
+    /// 当前值（经绑定解析）。
+    int Value() { return model.Get(); }
+
+    void SetRaw(int v) {
+        if (v < minV) { v = minV; }
+        if (v > maxV) { v = maxV; }
+        if (model.Get() == v) { return; }
+        model.Set(v);
+        if (data != null) { data.Set(v); }
+        Change.Raise();
+    }
+
+    /// 把绑定的模型值拉入本地信号并钳制（model -> UI）。
+    void SyncBinding() {
+        if (data == null) { return; }
+        int cur = data.Get();
+        if (cur < minV) { cur = minV; }
+        if (cur > maxV) { cur = maxV; }
+        if (cur != model.Get()) {
+            model.Set(cur);
+            data.Set(cur);
+        }
+    }
+
+    static int ParseInt(string s, int def) {
+        int i = 0;
+        bool neg = false;
+        if (s.StartsWith("-")) {
+            neg = true;
+            i = 1;
+            if (i >= s.Length) { return def; }
+        }
+        long acc = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch < "0" || ch > "9") { return def; }
+            acc = acc * 10 + Convert.ToInt32(ch);
+            if (acc > 2147483647) { acc = 2147483647; }
+            i = i + 1;
+        }
+        if (neg) { acc = -acc; }
+        return Convert.ToInt32(acc);
+    }
+
+    /// 解析编辑缓冲为数值并提交（空缓冲非法串还原当前值）。
+    void CommitBuffer() {
+        if (editBuf == "") { return; }
+        int v = ParseInt(editBuf, model.Get());
+        editBuf = "";
+        this.SetRaw(v);
+    }
+
+    // ---- rendering ------------------------------------------------------
+
+    int Render(App app, int x, int y, int w, int h) {
+        int id = wid;
+        SyncBinding();
+
+        bool focused = Ui.Focused(app, id) && !this.IsDisabled();
+        // 进入聚焦：把当前值灌进编辑缓冲；离开聚焦：提交缓冲。
+        if (focused && !hadFocus && editBuf == "") {
+            editBuf = Convert.ToString(model.Get());
+        }
+        if (!focused && hadFocus) { this.CommitBuffer(); }
+        hadFocus = focused;
+
+        this.PaintBox(app, x, y, w, h);
+        app.focus.RegisterFocusable(id);
+
+        if (!this.IsDisabled()) {
+            if (Ui.Clicked(app, minusId)) {
+                this.CommitBuffer();
+                this.SetRaw(model.Get() - this.Step());
+                app.RequestRedraw();
+            }
+            if (Ui.Clicked(app, plusId)) {
+                this.CommitBuffer();
+                this.SetRaw(model.Get() + this.Step());
+                app.RequestRedraw();
+            }
+            this.HandleKeys(app, focused);
+        }
+        On.Fire(app, id);
+        return id;
+    }
+
+    /// 绘制字段盒、两侧步进钮与中间数值。颜色来自解析样式盒
+    /// （input 类规则）与 `input::icon` / placeholder / caret parts。
+    void PaintBox(App app, int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        // Size 字段映射为档位 class（input.small/.large 重设高度/字号）。
+        string origClass = Class;
+        this.AddClass(this.SizeCls());
+        bool off = this.IsDisabled();
+        StyleBox s = this.ResolveEasedStyleAsIn(
+            app, wid, "input", Class, off, false, x, y, w, h);
+        s.Paint(app, x, y, w, h);
+        int fs = s.FontOr(Style.FontFallback(app, "medium"));
+        int btnW = app.Scale(26);
+
+        StyleBox iconStyle = Style.Part(app, "input", "icon", "", Class,
+                                        "", Style.SNormal());
+        int glyphColor = iconStyle.FgOr(s.fg);
+        int glyphSz = fs;
+        c.DrawGlyphIn("minus", x + (btnW - glyphSz) / 2, y,
+                      glyphSz, h, glyphSz, glyphColor);
+        c.DrawGlyphIn("plus",
+                      x + w - btnW + (btnW - glyphSz) / 2, y,
+                      glyphSz, h, glyphSz, glyphColor);
+        app.hitTester.RegisterRect(minusId, x, y, btnW, h, 2);
+        app.hitTester.RegisterRect(plusId, x + w - btnW, y, btnW, h, 2);
+
+        int innerX = x + btnW + app.Scale(6);
+        int innerW = w - (btnW + app.Scale(6)) * 2;
+        if (innerW < 0) { innerW = 0; }
+        c.PushClip(innerX, y, innerW, h);
+        string txt = "";
+        if (editBuf != "") { txt = editBuf; }
+        else if (!(hint != "" && !hadFocus && model.Get() == 0)) {
+            txt = Convert.ToString(model.Get());
+        } else { txt = ""; }
+        if (txt == "") {
+            StyleBox phStyle = Style.Part(app, "input", "placeholder", "",
+                                         Class, "", Style.SNormal());
+            c.DrawText(innerX, Canvas.CenterTextY(y, h, fs), hint,
+                       phStyle.FgOr(s.fg), fs);
+        } else {
+            string disp = txt;
+            if (Canvas.MeasureText(disp, fs) > innerW) {
+                disp = Ellipsis.Fit(disp, innerW, fs);
+            }
+            int tw = Canvas.MeasureText(disp, fs);
+            int tx = innerX + (innerW - tw) / 2;
+            c.DrawText(tx, Canvas.CenterTextY(y, h, fs), disp, s.fg, fs);
+        }
+        // 编辑光标线：贴在文本末尾。
+        if (editBuf != "") {
+            StyleBox caretStyle = Style.Part(app, "input", "caret", "",
+                                            Class, "", Style.SNormal());
+            int caretH = Canvas.FontHeight(fs);
+            int cx0 = innerX + (innerW - Canvas.MeasureText(txt, fs)) / 2
+                + Canvas.MeasureText(txt, fs);
+            c.FillRect(cx0, y + (h - caretH) / 2, caretStyle.WidthOr(1),
+                       caretH, caretStyle.BgOr(s.accent));
+        }
+        c.PopClip();
+        Class = origClass;
+    }
+
+    /// 键处理：↑/↓ 步进；数字键写入缓冲；回车提交；Esc 还原。
+    void HandleKeys(App app, bool focused) {
+        int kind = app.EventKind();
+        if (kind == 4) {
+            int kc = app.window.EventKeyCode();
+            if (kc == 38) {
+                this.CommitBuffer();
+                this.SetRaw(model.Get() + this.Step());
+                app.RequestRedraw();
+            } else if (kc == 40) {
+                this.CommitBuffer();
+                this.SetRaw(model.Get() - this.Step());
+                app.RequestRedraw();
+            } else if (kc == 13 && focused) {
+                this.CommitBuffer();
+                app.RequestRedraw();
+            } else if (kc == 27 && focused) {
+                editBuf = "";
+                app.RequestRedraw();
+            } else if (kc == 8 && focused && editBuf != "") {
+                editBuf = Text.Left(editBuf, editBuf.Length - 1);
+                app.RequestRedraw();
+            }
+            return;
+        }
+        if (kind == 6 && focused) {
+            int code = app.window.EventKeyCode();
+            string ch = Text.CharStr(code);
+            if (ch.Length == 0 || ch < " ") { return; }
+            if (ch >= "0" && ch <= "9" && editBuf.Length < 10) {
+                editBuf = editBuf + ch;
+                app.RequestRedraw();
+            } else if (ch == "-" && editBuf == "" && minV < 0) {
+                editBuf = "-";
+                app.RequestRedraw();
+            }
+        }
+    }
+
+    // ---- 设计器 / 序列化模型 -------------------------------------------
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        // 只有真正活绑定的字段才挂 PropSpec（snum 直写 model、
+        // str 直写 Size）；min/max/step/hint 是设计期常量，
+        // 经 GetExtra/SetExtra 应答文档键，避免快照 Binding 写不回。
+        PropSpec val = PropSpec.Int("value", "Value");
+        val.snum = model;
+        val.Also("text");
+        ps.Add(val);
+        PropSpec sz = PropSpec.Enum("size", "Size",
+            new List<string>{ "tiny", "small", "medium", "large" });
+        sz.str = Size;
+        ps.Add(sz);
+        return ps;
+    }
+
+    override string GetExtra(string key) {
+        if (key == "value") { return Convert.ToString(model.Get()); }
+        return "";
+    }
+
+    override bool SetExtra(string key, string val) {
+        if (key == "value") {
+            this.SetRaw(ParseInt(val, model.Get()));
+            return true;
+        }
+        if (key == "min") {
+            minV = Convert.ToInt32(val);
+            return true;
+        }
+        if (key == "max") {
+            maxV = Convert.ToInt32(val);
+            return true;
+        }
+        if (key == "step") {
+            stepV = Convert.ToInt32(val);
+            return true;
+        }
+        if (key == "hint" || key == "placeholder") {
+            hint = val;
+            return true;
+        }
+        return false;
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change") { Change.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    // ---- 保留模式钩子 ---------------------------------------------------
+
+    override void OnMeasure(App app) {
+        Theme t = app.theme;
+        string origClass = Class;
+        this.AddClass(this.SizeCls());
+        StyleBox s = this.ResolveStyleAs(app, "input", Class, Style.SNormal());
+        prefH = s.HeightOr(t.heightMedium);
+        prefW = s.WidthOr(app.Scale(140));
+        Class = origClass;
+    }
+
+    override void OnPaint(App app) {
+        this.Render(app, bx, by, bw, bh);
+    }
+}
