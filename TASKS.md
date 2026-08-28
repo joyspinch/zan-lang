@@ -1658,6 +1658,45 @@ plain join、join into、终端 group、group into 八种形态）三档孪生�
   B,G,R。无 golden 消费 BMP 字节（断言走进程内 GetPixel），零测试影响。
 - **已知限制**：macOS 文字水印不旋转（回落 DrawText）；ClearType 在旋转
   路径下不可用（GDI 限制，灰度 AA）；`Src` 平铺按自然尺寸不做缩放。
+
+# A63 · Gui.Widget.Countdown 倒计时组件（Naive UI n-countdown）—— ✅ 已完成（2026-08-28）
+
+目标：纯 Zan 倒计时控件，`Duration` 毫秒倒数、归零触发 `Finish`、`Active` 暂停/恢复、
+`Format` 令牌控制显示位面。零 runtime 改动。
+
+- **组件**（`stdlib/Gui/Widget/Countdown.zan`）：`Duration`（Binding<int>，变化即
+重摆）、`Active`（Binding<bool>，暂停冻结剩余值、恢复不跳变）、`Format`（空串按
+`"HH:mm:ss"`；令牌 `D` 总天数、`HH`/`mm`/`ss` 一律双写、`S` 十分之一秒，其余字符
+原样输出——`"T-minus"` 字面量不被吃掉，`"sss"` 渲染 `"05s"`）；`Restart()` 重摆；
+`Finish` 每轮一次（重摆后再归零会再触发）。计时由 tick 差值推得：`Tick(nowMs)`
+以 `Window.GetTickMs()` 推进（测试可注入确定时刻），掉帧/失焦不走慢。走动期间
+`App.RequestAnimationFrameIn` 限速重绘：秒级格式睡到下一秒边界（`remainingMs %
+1000 + 1`），含 `S` 才 100ms 节奏，并声明损伤矩形只重绘自己。格式化纯函数
+`Countdown.FormatText(fmt, ms)` 供测试与宿主复用。
+
+- **皮肤**：base.css `countdown::value`（字号默认 large 档；`.small`/`.large` 变体；
+`.success`/`.warning`/`.error` 状态色）。
+
+- **注册**：ControlFactory（Kinds + Create）、`tools/mcp_server/zform.controls.txt`
+补 Countdown 行（policy_zform_schema 守门）。
+
+- **测试**：`tests/gui/countdown_test.zan` + golden（无窗口，时刻由测试注入）：
+格式令牌九例（默认/双写/十分位/天/零/负钳制/字面量/尾随 s）、tick 推进/掉帧追平/
+归零 Finish 单次触发、暂停冻结与恢复无跳变、Restart 重摆与重摆后基准重定、
+SetProp 改 Duration 自动重摆、Kind/Props/Events/ControlFactory 往返。注册
+`conformance_gui_countdown`。
+
+- **gallery**：Data Display 增 Countdown 条目（代码/JSON 样例、Props/Events、
+Controls 子演示）+ 两演示——三格式三档字号并排（`mm:ss` 默认、`HH:mm:ss` large、
+`ss.S` small，归零由 Finish 翻 `.error` 色）；Controls（10s `ss.S` + 暂停/继续 + 
+重摆按钮 + Finish 状态行，实例跨帧存活）。
+
+- **实测**：`zanc tests/gui/countdown_test.zan --auto-stdlib` → `countdown_test OK`
+（truthy_cond 编译器修复落地后的 zanc 复验）；gallery 全量编译通过（`gui_gallery.zan
++ MapChinaData.zan`，306 文件）；policy_gallery_demo_wiring / policy_gallery_coverage /
+policy_no_widget_drawing / policy_css_comment_hygiene 全绿。
+
+
 # A58 · 全量收口执行计划（2026-08-27 定序）
 
 排序依据三条：① 先修"编译通过但结果错/编译器崩"的，因为它们会污染后面每一次

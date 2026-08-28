@@ -504,8 +504,24 @@ class Gallery {
     static List<string> demoQuotePrices;
     static List<string> demoQuoteChanges;
     static ListView<string> demoList;
+    // 倒计时演示：实例必须跨帧存活（剩余值长在控件上，每帧 new
+    // 等于每帧重摆），Finish 状态行单独持有。
+    static Countdown demoCountdownA;
+    static Countdown demoCountdownB;
+    static Countdown demoCountdownC;
+    static Label demoCountdownStatus;
+    static Countdown demoCountdownCtl;
+    static Button demoCountdownPause;
+    static Button demoCountdownRestart;
+    static bool demoCountdownPaused;
     static CarouselAnim demoCarousel;
     static CarouselAnim carAnim2;
+    static CarouselAnim photoCarAnim;
+    // 跑马灯的滚动相位：每帧重建的演示控件把它交给宿主持有，
+    // 滚动才不会每帧从头再来（三个演示各自一条，互不干扰）。
+    static MarqueeAnim demoMarquee;
+    static MarqueeAnim demoMarqueeFill;
+    static MarqueeAnim demoMarqueeNotice;
 
     // Delegate/event demo state. Retained buttons register their handlers once
     // with the C#-style `Click += handler`; a background Thread reports progress
@@ -876,8 +892,40 @@ class Gallery {
         Gallery.demoCarousel = new CarouselAnim();
         Gallery.model.slide = 0;
         Gallery.carAnim2 = new CarouselAnim();
+        Gallery.photoCarAnim = new CarouselAnim();
         Gallery.demoVList = new VirtualList();
         Gallery.demoSelLabel = new Label("");
+        Gallery.demoCountdownA = new Countdown(90 * 1000, "mm:ss");
+        Gallery.demoCountdownB = new Countdown(3661 * 1000, "HH:mm:ss");
+        Gallery.demoCountdownB.Class = "large";
+        Gallery.demoCountdownC = new Countdown(15 * 1000 + 500, "ss.S");
+        Gallery.demoCountdownC.Class = "small";
+        Gallery.demoCountdownStatus = new Label("");
+        Gallery.demoCountdownStatus.Class = "secondary";
+        Gallery.demoCountdownC.Finish.Add(() => {
+            Gallery.demoCountdownC.Class = "small error";
+        });
+        Gallery.demoCountdownCtl = new Countdown(10 * 1000, "ss.S");
+        Gallery.demoCountdownCtl.Finish.Add(() => {
+            Gallery.demoCountdownStatus.Text = Gallery.T(
+                "Finished - press Restart to run again.", "已归零 — 点重摆再来一轮。");
+            Gallery.demoCountdownStatus.Class = "secondary";
+        });
+        Gallery.demoCountdownRestart = new Button { Text = Gallery.T("Restart", "重摆") };
+        Gallery.demoCountdownRestart.OnClick(() => {
+            Gallery.demoCountdownCtl.Restart();
+            Gallery.demoCountdownStatus.Text = "";
+        });
+        Gallery.demoCountdownPause = new Button { Text = Gallery.T("Pause", "暂停") };
+        Gallery.demoCountdownPause.OnClick(() => {
+            Gallery.demoCountdownPaused = !Gallery.demoCountdownPaused;
+            Gallery.demoCountdownCtl.Active = !Gallery.demoCountdownPaused;
+            if (Gallery.demoCountdownPaused) {
+                Gallery.demoCountdownPause.Text = Gallery.T("Resume", "继续");
+            } else {
+                Gallery.demoCountdownPause.Text = Gallery.T("Pause", "暂停");
+            }
+        });
         for (int vli = 0; vli < 2000; vli = vli + 1) {
             Gallery.demoVList.Add("Row " + Convert.ToString(vli + 1) + " · virtualized");
         }
@@ -2375,8 +2423,10 @@ class Gallery {
         if (name == "Label") { return 195; }
         if (name == "Events") { return 175; }
         if (name == "Checkbox") { return 175; }
-        if (name == "Radio") { return 175; }
+        if (name == "Radio") { return 235; }
         if (name == "Statistic") { return 130; }
+        if (name == "Countdown") { return 110; }
+        if (name == "Countdown.controls") { return 130; }
         if (name == "Divider") { return 205; }
         if (name == "Breadcrumb") { return 105; }
         if (name == "PageHeader") { return 115; }
@@ -3484,6 +3534,24 @@ class Gallery {
             row.With(st1); row.With(st2); row.With(st3);
             Gallery.LayoutAuto(app, row, name, px, py - app.Scale(8),
                              w - app.Scale(36), app.Scale(70));
+        } else if (name == "Countdown") {
+            // 三种格式与三档字号；第三只归零后由 Finish 翻成 error 色。
+            Flex crow = Flex.Wrapped().Gap(app.Scale(28));
+            crow.With(Gallery.demoCountdownA);
+            crow.With(Gallery.demoCountdownB);
+            crow.With(Gallery.demoCountdownC);
+            Gallery.LayoutAuto(app, crow, name, px, py,
+                             w - app.Scale(36), app.Scale(44));
+        } else if (name == "Countdown.controls") {
+            Panel ccol = Panel.Column().Gap(app.Scale(10));
+            ccol.With(Gallery.demoCountdownCtl);
+            Panel cbtns = Panel.Row().Gap(app.Scale(10));
+            cbtns.With(Gallery.demoCountdownPause);
+            cbtns.With(Gallery.demoCountdownRestart);
+            ccol.With(cbtns);
+            ccol.With(Gallery.demoCountdownStatus);
+            Gallery.LayoutAuto(app, ccol, name, px, py,
+                             w - app.Scale(36), app.Scale(108));
         } else if (name == "Timeline") {
             List<TimelineItem> items = new List<TimelineItem>();
             items.Add(new TimelineItem("09:00", "Created", "Project initialized", "success"));
@@ -7884,6 +7952,22 @@ class Gallery {
             .Json("{\n  \"type\": \"Statistic\",\n  \"name\": \"stat\",\n  \"label\": \"Revenue\",\n  \"value\": \"128,000\",\n  \"trend\": \"up\"\n}")
             .AddProp("label", "string", "-", "Descriptive caption.")
             .AddProp("value", "string", "-", "Highlighted value.");
+        Gallery.Add(list, "Data Display", "Countdown",
+            Gallery.T("Count down from a duration to zero and fire Finish. Active pauses/resumes with the remainder preserved; Format picks the displayed units with tokens D, HH, mm, ss and S (tenths); anything else is literal text.",
+                "从一个时长倒数到零并触发 Finish。Active 暂停/恢复且剩余值不丢；Format 用令牌 D、HH、mm、ss、S（十分之一秒）选择显示位面，其余字符原样输出。"),
+            "Countdown cd = new Countdown(5 * 60000, \"mm:ss\");\ncd.Finish += () => { status.Text = \"Done\"; };\ncd.RenderInside(app, new Rect(40, 60, 140, 34));\n\n// drive it from code\ncd.Active = false;   // paused, remainder frozen\ncd.Active = true;    // resumes\ncd.Restart();        // re-arm to Duration")
+            .Json("{\n  \"type\": \"Countdown\",\n  \"name\": \"sale\",\n  \"duration\": 90000,\n  \"active\": true,\n  \"format\": \"mm:ss\"\n}")
+            .AddProp("duration", "int", "60000", "Total length in ms; changing it re-arms the countdown.")
+            .AddProp("active", "bool", "true", "false pauses; true resumes.")
+            .AddProp("format", "string", "HH:mm:ss", "Tokens: D, HH, mm, ss, S; other chars are literal.")
+            .AddEvent("Finish", "() => void", "The countdown reached zero (once per run).")
+            .AddDemo(Gallery.T("Controls", "代码控制"),
+                Gallery.T("Restart() re-arms the timer; toggling Active pauses and resumes without losing the remainder. The status line is fed by Finish.",
+                    "Restart() 重新摆表；切换 Active 暂停/恢复，剩余值不丢。状态行由 Finish 驱动。"),
+                "Countdown.controls", 120,
+                "Countdown cd = new Countdown(10 * 1000, \"ss.S\");\npauseBtn.Click += () => { cd.Active = !cd.Active; };\nrestartBtn.Click += () => cd.Restart();\ncd.Finish += () => status.Text = \"Finished\";",
+                "");
+
         Gallery.Add(list, "Data Display", "Timeline",
             Gallery.T("Display ordered events with titles and descriptions.",
                 "按顺序展示带标题和描述的事件时间线。"),

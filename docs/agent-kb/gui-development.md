@@ -130,6 +130,26 @@ tags.Render(app, 40, 80);
 命中测试取最后注册者。触发器走 `tag.add` 皮肤规则（虚线框）。设计器序列化经
 `GetExtra/SetExtra("options")`（`|` 连接，Tabs.SetItemsText 同款）。
 
+### 倒计时 Gui.Widget.Countdown（Naive UI n-countdown）
+
+从 `Duration` 毫秒倒数到零触发 `Finish`（每轮一次）。`Active` 暂停/恢复（剩余值冻结、
+恢复不跳变），`Format` 用令牌选位面：`D` 总天数、`HH`/`mm`/`ss`（一律双写）、`S` 十分
+之一秒；其余字符原样输出，`"T-minus"` 这类字面量不会被吃掉，`"sss"` 渲染成 `"05s"`。
+`Restart()` 重摆到当前 `Duration`；外部改 `Duration`（含双向绑定）自动重摆。
+
+```zan
+Countdown cd = new Countdown(5 * 60000, "mm:ss");
+cd.Finish += () => { status.Text = "Done"; };
+cd.RenderInside(app, new Rect(40, 60, 140, 34));
+```
+
+实现要点：剩余时刻由 tick 差值推得（`Tick(nowMs)` 以 `Window.GetTickMs()` 推进，测试
+可注入确定时刻），掉帧/失焦不走慢；走动期间经 `App.RequestAnimationFrameIn` 限速重绘
+——秒级格式睡到下一个秒边界（`remainingMs % 1000 + 1`），含 `S` 才以 100ms 节奏刷新，
+且声明损伤矩形只重绘自己。格式化是纯函数 `Countdown.FormatText(fmt, ms)`，无窗口
+回归在 `tests/gui/countdown_test.zan`。皮肤走 `countdown::value`（字号三档小/中/大
+对应 `.small`/默认/`.large`，状态色 `.success`/`.warning`/`.error`）。
+
 ## 控件与组件在哪
 
 | 想要 | 去哪 |

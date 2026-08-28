@@ -1,0 +1,124 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// Gui.Countdown 的无窗口回归：格式令牌（纯函数）、tick 推进 /
+/// 暂停 / 重摆 / Finish 单次触发，以及组件模型（Kind/Props/
+/// Events/ControlFactory）。时刻由测试注入，不依赖真实时钟。
+class CountdownTest {
+    static int fails;
+    static int finCount;
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got {got} want {want}");
+    }
+
+    static void EqStr(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got '{got}' want '{want}'");
+    }
+
+    static void OnFin() { finCount = finCount + 1; }
+
+    static void Main() {
+        fails = 0;
+
+        // ---- 格式令牌（Countdown.FormatText 纯函数）----------------
+        EqStr("default fmt", Countdown.FormatText("", 60000), "00:01:00");
+        EqStr("hhmmss", Countdown.FormatText("HH:mm:ss", 3661000), "01:01:01");
+        EqStr("mmss", Countdown.FormatText("mm:ss", 65000), "01:05");
+        EqStr("tenths", Countdown.FormatText("ss.S", 65500), "05.5");
+        EqStr("days", Countdown.FormatText("D d HH:mm:ss", 90061000),
+              "1 d 01:01:01");
+        EqStr("zero", Countdown.FormatText("HH:mm:ss", 0), "00:00:00");
+        EqStr("negative clamped", Countdown.FormatText("ss", 0 - 5), "00");
+        // 时间单位双写才成令牌：单个 h/m/s 是字面量，"T-minus"
+        // 不会被吃掉；"sss" 渲染成秒 + 字面量 s。
+        EqStr("literal only", Countdown.FormatText("T-minus", 65000),
+              "T-minus");
+        EqStr("literal unit", Countdown.FormatText("H:m", 65000), "H:m");
+        EqStr("trailing s", Countdown.FormatText("sss", 65000), "05s");
+
+        // ---- tick 推进：走动、暂停、恢复、重摆 ----------------------
+        Countdown cd = new Countdown(10000);
+        Eq("initial remaining", cd.Remaining(), 10000);
+        finCount = 0;
+        cd.Finish.Add(CountdownTest.OnFin);
+        cd.Tick(1000);
+        cd.Tick(5000);
+        Eq("advanced", cd.Remaining(), 6000);
+        // 掉帧安全：隔了很久才下一拍，剩余值正确落地并触发 Finish。
+        cd.Tick(17000);
+        Eq("finished", cd.Remaining(), 0);
+        Eq("finish fired once", finCount, 1);
+        // 归零后再来的拍不会重复触发。
+        cd.Tick(18000);
+        Eq("finish stays once", finCount, 1);
+
+        // 暂停：剩余值冻结，且恢复时不跳变（暂停期间基准持续刷新）。
+        Countdown cd2 = new Countdown(10000);
+        cd2.SetProp("active", "false");
+        cd2.SyncProps();
+        cd2.Tick(1000);
+        cd2.Tick(6000);
+        Eq("paused frozen", cd2.Remaining(), 10000);
+        cd2.SetProp("active", "true");
+        cd2.SyncProps();
+        cd2.Tick(7000);
+        Eq("resumed", cd2.Remaining(), 9000);
+
+        // Restart 重摆到当前 Duration；重摆后的第一拍重新定基准
+        //（不回溯重摆前的时间），随后正常走动。
+        cd.Restart();
+        Eq("restart re-arms", cd.Remaining(), 10000);
+        cd.Tick(20000);
+        Eq("rebased", cd.Remaining(), 10000);
+        cd.Tick(21000);
+        Eq("second run walking", cd.Remaining(), 9000);
+        cd.Tick(31000);
+        Eq("second run done", cd.Remaining(), 0);
+        Eq("finish fired twice", finCount, 2);
+
+        // 改 Duration（设计器 SetProp 走的就是这条路）自动重摆。
+        cd.SetProp("duration", "2500");
+        cd.SyncProps();
+        Eq("duration re-arms", cd.Remaining(), 2500);
+        cd.Tick(2600);
+        Eq("short run rebased", cd.Remaining(), 2500);
+        cd.Tick(5100);
+        Eq("short run done", cd.Remaining(), 0);
+        Eq("finish fired thrice", finCount, 3);
+
+        // ---- 组件模型（对齐 prop_test / image_test 的往返方式）。
+        Countdown cd3 = new Countdown(30000, "mm:ss");
+        EqStr("kind", cd3.Kind(), "Countdown");
+        Eq("props count", cd3.Props().Count, 4);
+        EqStr("format prop", cd3.GetProp("format"), "mm:ss");
+        EqStr("active prop", cd3.GetProp("active"), "true");
+        bool hasFinish = false;
+        List<string> evs = cd3.Events();
+        for (int i = 0; i < evs.Count; i = i + 1) {
+            if (evs[i] == "Finish") { hasFinish = true; }
+        }
+        if (!hasFinish) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL events: no Finish");
+        }
+        Control made = ControlFactory.Create("Countdown");
+        if (made == null) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL factory: null");
+        } else {
+            EqStr("factory kind", made.Kind(), "Countdown");
+        }
+
+        if (fails == 0) {
+            Console.WriteLine("countdown_test OK");
+        } else {
+            Console.WriteLine($"countdown_test FAILURES {fails}");
+        }
+    }
+}
