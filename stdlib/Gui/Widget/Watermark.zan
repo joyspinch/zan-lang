@@ -1,0 +1,216 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// 水印层：在自身矩形内平铺半透明文字（或图像），盖在页面内容上标注
+/// 状态——机密、草稿、环境名、账号/租户名。参照页面把它作为最后一个
+/// 子节点停靠填满（子节点按顺序绘制，最后添加者画在最上面）：
+///
+///     panel.Add(new Watermark { Content = "内部资料" }.DockFill());
+///
+/// 文本 `Content` 支持 `\n` 分行，整块作为一组绕每块自己的盒子中心
+/// 刚性倾斜（`Rotate` 度，正 = 顺时针，CSS 约定；默认 -22）。相邻块
+/// 的间距由 `GapX`/`GapY` 控制（逻辑 px），`OffsetX`/`OffsetY` 平移
+/// 整层——把 offset 取在半个间距内可以让拼缝错开内容的关键部位。
+///
+/// `Color` 为 0xAARRGGBB，alpha 参与混合（0 视为不透明，文本渲染的
+/// 约定）；0 表示交给 CSS `color`，再退内置的淡黑。`FontPx` 为 0 时
+/// 取 CSS `font-size`，再退 14。
+///
+/// `Src` 指向图像（文件路径或 mem: 内存 key）时改为平铺图像：像素
+/// 自带的 alpha 参与混合，倾斜应预先烘进图里——位图旋转不在图像
+/// 管线上，`Rotate` 只作用于文字。
+///
+/// 控件不接线任何事件，因此不注册命中区域，指针事件穿透到下层内容；
+/// 设计器仍可通过 HitTest 选中它。裸控件测量为 0×0，用
+/// DockFill()/Grow() 或 CSS width/height 给出覆盖范围。
+class Watermark : Control {
+    /// 水印文本（`\n` 分行）。
+    Binding<string> Content;
+    /// 图像水印源（文件路径 / mem: key）；非空时替代文本。
+    string Src;
+    /// 文字颜色 0xAARRGGBB；0 = CSS `color`，再退内置默认。
+    int Color;
+    /// 字号（逻辑 px）；0 = CSS `font-size`，再退 14。
+    int FontPx;
+    /// 倾斜角（度，正 = 顺时针）；仅作用于文字。
+    int Rotate;
+    /// 块间距（逻辑 px）。
+    int GapX;
+    int GapY;
+    /// 整层平移（逻辑 px）。
+    int OffsetX;
+    int OffsetY;
+
+    void InitWatermark() {
+        this.InitControl("watermark", 0);
+        Content = "";
+        Src = "";
+        Color = 0;
+        FontPx = 0;
+        Rotate = 0 - 22;
+        GapX = 100;
+        GapY = 100;
+        OffsetX = 0;
+        OffsetY = 0;
+    }
+    Watermark() { this.InitWatermark(); }
+    Watermark(string content) {
+        this.InitWatermark();
+        Content = content;
+    }
+
+    int RotClamped() {
+        int r = Rotate;
+        if (r < 0 - 90) { r = 0 - 90; }
+        if (r > 90) { r = 90; }
+        return r;
+    }
+
+    /// 生效字号：显式 `FontPx` 优先于 CSS `font-size`，再退 14（逻辑 px
+    /// 经 DPI 缩放）。
+    int EffectiveFont(App app, StyleBox s) {
+        if (FontPx > 0) { return app.Scale(FontPx); }
+        return s.FontOr(app.Scale(14));
+    }
+
+    /// 生效文字颜色：显式 `Color` 优先于 CSS `color`，再退
+    /// rgba(0,0,0,0.145)——与 antd 水印同档的"看得见但不打扰"。
+    int EffectiveColor(StyleBox s) {
+        if (Color != 0) { return Color; }
+        return s.FgOr(0x25000000);
+    }
+
+    override void OnPaint(App app) {
+        if (bw <= 0 || bh <= 0) { return; }
+        StyleBox s = this.ResolveStyleCached(app, this.StyleType(), Class,
+                                             Style.SNormal());
+        string src = Src;
+        if (src == null) { src = ""; }
+        Canvas c = app.canvas;
+        c.PushClip(bx, by, bw, bh);
+        if (src != "") {
+            this.PaintImageTiles(app, c, src);
+        } else {
+            this.PaintTextTiles(app, c, s);
+        }
+        c.PopClip();
+    }
+
+    void PaintTextTiles(App app, Canvas c, StyleBox s) {
+        string text = Content.Get();
+        if (text == null) { text = ""; }
+        if (text == "") { return; }
+        List<string> lines = text.Split("\n");
+        int fs = this.EffectiveFont(app, s);
+        int color = this.EffectiveColor(s);
+        int lineH = Canvas.FontHeight(fs);
+        int tileW = 0;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            int w = Canvas.MeasureText(lines[i], fs);
+            if (w > tileW) { tileW = w; }
+        }
+        int tileH = lineH * lines.Count;
+        int pitchX = tileW + app.Scale(GapX);
+        int pitchY = tileH + app.Scale(GapY);
+        if (pitchX <= 0 || pitchY <= 0) { return; }
+        int offX = app.Scale(OffsetX);
+        int offY = app.Scale(OffsetY);
+        int rot = this.RotClamped();
+        // 从盒子左上角外一个间距起铺：倾斜块的包围盒越出未旋转的盒子，
+        // 四周多铺一圈保证边缘不缺角。
+        for (int ty = by - pitchY + offY; ty < by + bh + pitchY + offY;
+             ty = ty + pitchY) {
+            for (int tx = bx - pitchX + offX; tx < bx + bw + pitchX + offX;
+                 tx = tx + pitchX) {
+                this.PaintTextTile(c, lines, tx, ty, tileW, lineH, fs, color,
+                                   rot);
+            }
+        }
+    }
+
+    /// 画一块文字水印。倾斜时每行的锚点先绕块中心旋转，运行时再把
+    /// 整行绕锚点转过去——两步合成 = 整块绕中心的刚性旋转（每行绕
+    /// 自己左上角转同一角度并非刚性，多行会扇形张开）。
+    void PaintTextTile(Canvas c, List<string> lines, int tx, int ty,
+                       int tileW, int lineH, int fs, int color, int rot) {
+        if (rot == 0) {
+            int ly = ty;
+            for (int i = 0; i < lines.Count; i = i + 1) {
+                c.DrawText(tx, ly, lines[i], color, fs);
+                ly = ly + lineH;
+            }
+            return;
+        }
+        double rad = (double)rot * 3.14159265358979323846 / 180.0;
+        double cs = Math.Cos(rad);
+        double sn = Math.Sin(rad);
+        int cx = tx + tileW / 2;
+        int cy = ty + lineH * lines.Count / 2;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            int dx = tx - cx;
+            int dy = ty + i * lineH - cy;
+            int ax = cx + (int)(cs * (double)dx - sn * (double)dy);
+            int ay = cy + (int)(sn * (double)dx + cs * (double)dy);
+            c.DrawTextRot(ax, ay, lines[i], color, fs, rot);
+        }
+    }
+
+    void PaintImageTiles(App app, Canvas c, string src) {
+        int iw = Canvas.ImageWidth(src);
+        int ih = Canvas.ImageHeight(src);
+        if (iw <= 0 || ih <= 0) { return; }
+        int w = app.Scale(iw);
+        int h = app.Scale(ih);
+        int pitchX = w + app.Scale(GapX);
+        int pitchY = h + app.Scale(GapY);
+        if (pitchX <= 0 || pitchY <= 0) { return; }
+        int offX = app.Scale(OffsetX);
+        int offY = app.Scale(OffsetY);
+        for (int ty = by - pitchY + offY; ty < by + bh + pitchY + offY;
+             ty = ty + pitchY) {
+            for (int tx = bx - pitchX + offX; tx < bx + bw + pitchX + offX;
+                 tx = tx + pitchX) {
+                c.BlitImage(src, tx, ty, w, h, 0, 0, 0, 0);
+            }
+        }
+    }
+
+    // ---- 设计器 / 序列化模型 ---------------------------------------
+
+    override string Kind() { return "Watermark"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec content = PropSpec.Text("content", "Content");
+        content.str = Content;
+        ps.Add(content);
+        PropSpec src = PropSpec.Text("src", "Image Src");
+        src.str = Src;
+        ps.Add(src);
+        PropSpec color = PropSpec.Color("color", "Color");
+        color.num = Color;
+        ps.Add(color);
+        PropSpec font = PropSpec.Int("fontpx", "Font Size");
+        font.num = FontPx;
+        ps.Add(font);
+        PropSpec rot = PropSpec.Int("rotate", "Rotate");
+        rot.num = Rotate;
+        ps.Add(rot);
+        PropSpec gx = PropSpec.Int("gapx", "Gap X");
+        gx.num = GapX;
+        ps.Add(gx);
+        PropSpec gy = PropSpec.Int("gapy", "Gap Y");
+        gy.num = GapY;
+        ps.Add(gy);
+        PropSpec ox = PropSpec.Int("offsetx", "Offset X");
+        ox.num = OffsetX;
+        ps.Add(ox);
+        PropSpec oy = PropSpec.Int("offsety", "Offset Y");
+        oy.num = OffsetY;
+        ps.Add(oy);
+        ps.Add(PropSpec.Text("class", "Classes"));
+        return ps;
+    }
+}

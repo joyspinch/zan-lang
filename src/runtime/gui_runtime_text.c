@@ -228,6 +228,163 @@ EXPORT void zan_gui_draw_text(
     }
 }
 
+/* Rotated text, same run-tile machinery as above: the whole run is
+ * rasterised once through a world transform on the text DC (the atlas key is
+ * the run text, so a second angle on the same string is a second tile), and
+ * compositing is unchanged -- cpu_glyph_run / gl_glyph_run place whatever
+ * coverage tile they are handed.
+ *
+ * The anchor is the unrotated run box's top-left, like zan_gui_draw_text, and
+ * the run rotates rigidly about it; positive angles turn clockwise. GDI
+ * disables ClearType while a world transform is live, so rotated tiles come
+ * back grey-antialiased in the 4bpp layout (R=G=B coverage), which both tile
+ * consumers render without knowing the difference. The atlas key is 0xFF-
+ * prefixed -- a byte that cannot appear in the text itself -- so a rotated
+ * tile can never collide with the unrotated tile of a string that merely ends
+ * in digits. */
+EXPORT void zan_gui_draw_text_rot(
+    i32 surface_id, i32 x, i32 y, const char *text, i32 color, i32 font_size,
+    i32 angle_deg) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s || !text || !*text) return;
+    int angle = (int)angle_deg;
+    if (angle < -90) angle = -90;
+    if (angle > 90) angle = 90;
+    if (angle == 0) {
+        zan_gui_draw_text(surface_id, x, y, text, color, font_size);
+        return;
+    }
+
+    int size = (int)font_size;
+    if (size < 8) size = 8;
+
+    int klen = (int)strlen(text) + 3;
+    char *key = (char *)malloc((size_t)klen);
+    if (!key) return;
+    key[0] = (char)0xFF;
+    key[1] = (char)(angle & 0xFF);
+    key[2] = (char)((angle >> 8) & 0xFF);
+    memcpy(key + 3, text, (size_t)klen - 3);
+
+    ensure_text_dc();
+    uint64_t t0 = 0;
+    if (g_text_stats_enabled) {
+        g_text_draw_calls++;
+        if (size >= 0 && size < 64) { g_text_size_calls[size]++; }
+        t0 = text_qpc_us();
+    }
+
+    const zan_glyph_tile *tile = zan_atlas_find(ZAN_TILE_RUN, size, key, klen);
+    if (!tile) {
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
+        wchar_t *wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+        if (!wtext) { free(key); return; }
+        MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, wlen);
+        int text_len = wlen - 1;
+
+        HFONT font = get_or_create_font(size);
+        HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
+        SIZE ts;
+        GetTextExtentPoint32W(g_text_dc, wtext, text_len, &ts);
+        int w = ts.cx + 2;
+        int h = ts.cy + 2;
+
+        double rad = (double)angle * 3.14159265358979323846 / 180.0;
+        double cs = cos(rad), sn = sin(rad);
+        /* Rotated bbox of the padded box [0..w)x[0..h) around the anchor:
+         * x' = cs*x - sn*y, y' = sn*x + cs*y. */
+        double cx0 = 0.0, cx1 = cs * w, cx2 = -sn * h, cx3 = cs * w - sn * h;
+        double cy0 = 0.0, cy1 = sn * w, cy2 = cs * h, cy3 = sn * w + cs * h;
+        double mnx = cx0;
+        if (cx1 < mnx) mnx = cx1;
+        if (cx2 < mnx) mnx = cx2;
+        if (cx3 < mnx) mnx = cx3;
+        double mxx = cx0;
+        if (cx1 > mxx) mxx = cx1;
+        if (cx2 > mxx) mxx = cx2;
+        if (cx3 > mxx) mxx = cx3;
+        double mny = cy0;
+        if (cy1 < mny) mny = cy1;
+        if (cy2 < mny) mny = cy2;
+        if (cy3 < mny) mny = cy3;
+        double mxy = cy0;
+        if (cy1 > mxy) mxy = cy1;
+        if (cy2 > mxy) mxy = cy2;
+        if (cy3 > mxy) mxy = cy3;
+        int left = (int)floor(mnx) - 1;
+        int top = (int)floor(mny) - 1;
+        int bw = (int)ceil(mxx) - (int)floor(mnx) + 2;
+        int bh = (int)ceil(mxy) - (int)floor(mny) + 2;
+
+        if (bw <= 0 || bh <= 0 || bw > 16384 || bh > 16384) {
+            free(wtext);
+            SelectObject(g_text_dc, old_font);
+            free(key);
+            return;
+        }
+
+        BITMAPINFO bmi = {0};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = bw;
+        bmi.bmiHeader.biHeight = -bh;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        void *dbits = NULL;
+        HBITMAP hbmp = CreateDIBSection(g_text_dc, &bmi, DIB_RGB_COLORS,
+                                        &dbits, NULL, 0);
+        if (!hbmp) {
+            free(wtext);
+            SelectObject(g_text_dc, old_font);
+            free(key);
+            return;
+        }
+        HBITMAP old_bmp = (HBITMAP)SelectObject(g_text_dc, hbmp);
+        memset(dbits, 0, (size_t)bw * (size_t)bh * 4);
+
+        /* Rotate about the anchor, then shift so the rotated bbox's min
+         * corner sits at (1,1) in the DIB (the +1 slack the left/top offset
+         * carries back out). Text drawn at (0,0) lands rotated. */
+        XFORM xf;
+        xf.eM11 = (FLOAT)cs;   xf.eM12 = (FLOAT)sn;
+        xf.eM21 = (FLOAT)-sn;  xf.eM22 = (FLOAT)cs;
+        xf.eDx = (FLOAT)(-mnx + 1.0);
+        xf.eDy = (FLOAT)(-mny + 1.0);
+        SetGraphicsMode(g_text_dc, GM_ADVANCED);
+        SetWorldTransform(g_text_dc, &xf);
+        SetTextColor(g_text_dc, RGB(255, 255, 255));
+        SetBkMode(g_text_dc, TRANSPARENT);
+        TextOutW(g_text_dc, 0, 0, wtext, text_len);
+        GdiFlush();
+        ModifyWorldTransform(g_text_dc, NULL, MWT_IDENTITY);
+        SetGraphicsMode(g_text_dc, GM_COMPATIBLE);
+
+        tile = zan_atlas_store(ZAN_TILE_RUN, size, key, klen,
+                               bw, bh, left, top, (int)ts.cx, dbits, 4);
+        SelectObject(g_text_dc, old_bmp);
+        DeleteObject(hbmp);
+        SelectObject(g_text_dc, old_font);
+        free(wtext);
+    }
+    free(key);
+    if (tile) {
+        zan_glyph_item item;
+        item.tile = tile;
+        item.x = (int)x + tile->left;
+        item.y = (int)y + tile->top;
+        zan_glyph_run run;
+        run.color = (u32)color;
+        run.count = 1;
+        run.items = &item;
+        ZAN_IMPL(s, glyph_run)->glyph_run(s, &run);
+    }
+    if (g_text_stats_enabled) {
+        g_text_draw_us += text_qpc_us() - t0;
+    }
+}
+
+
 /* --- Measured-width cache -------------------------------------------------
  * zan_gui_measure_text runs a GDI GetTextExtentPoint32W round-trip plus two
  * MultiByteToWideChar and a malloc/free on every call, and layout / caret /

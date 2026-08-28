@@ -1614,6 +1614,50 @@ plain join、join into、终端 group、group into 八种形态）三档孪生�
   `|` 会破坏 options 序列化（Tabs items 同款限制）；Esc 放弃是 Naive 没有
   的桌面补充（Naive 仅回车/失焦）。
 
+# A62 · Gui.Widget.Watermark 水印组件 + 运行时旋转文字 —— ✅ 已完成（2026-08-28）
+
+目标：对应 Naive UI n-watermark——盖在页面内容上的透明平铺层，重复文字或
+图像做"内部资料"式水印；旋转是定义性特征（默认 -22°），运行时此前没有
+旋转文字原语，按规则 10 补运行时而非绕过。
+
+- **运行时**（驱动导出 66→68）：`zan_gui_draw_text_rot(surface, x, y, text,
+  color, size, angle)`，角度限 [-90,90]、0 直接走 `zan_gui_draw_text`。
+  旋转平铺进 glyph atlas：run 瓦片 key = 0xFF 前缀 + 角度 LE 2 字节 + 文本
+  （0xFF 非法 UTF-8，绝不与普通文本 key 碰撞）；glyph 瓦片 key 6 字节
+  （cp + 2 字节角度）。Windows GDI 路径 `GM_ADVANCED` +
+  `SetWorldTransform`（eM11=c/eM12=s/eM21=−s/eM22=c），变换下 GDI 关
+  ClearType → 4bpp 布局灰度 AA（仍正确）；FreeType 路径 `FT_Set_Transform`
+  （矩阵 xx=c·65536, xy=s, yx=−s, yy=c，由 y-up 字形空间 × y-down 设备
+  翻转推导），推进取 `metrics.horiAdvance`（transform 会旋转 slot->advance），
+  基线走点 = anchor + R·(s_acc, asc)。合成器（CPU/GL `glyph_run`）不变——
+  瓦片内已烘焙旋转，只需按 left/top 摆放。macOS 暂回落不旋转（CoreText
+  旋转蒙版未实现，gui-development.md 已记）。
+- **Zan 侧**：`Canvas.DrawTextRot(x, y, text, color, size, angleDeg)`
+  （Render.zan，DllImport + 包装）；新控件 `Widget/Watermark.zan`：
+  `Content`（支持 `\n` 多行）、`Src`（非空改平铺图像，`BlitImage` 按自然
+  尺寸）、`Color`（0=吃 CSS，默认 rgba(0,0,0,0.145)）、`FontPx`（0=CSS→14）、
+  `Rotate`（默认 -22）、`GapX/GapY`（100）、`OffsetX/OffsetY`。绘制：锚点
+  = 未旋转行盒左上，绕其刚体旋转，正角顺时针（CSS 惯例）；组件把"瓦片中
+  心平移 + 运行时锚点旋转"复合成整瓦刚体旋转，瓦片从盒外一格 pitch 起
+  铺满可视区。纯绘制层：不注册命中 id、不 wire 事件（天然点击穿透）。
+- **注册**：ControlFactory（Kinds + Create）、
+  `tools/mcp_server/zform.controls.txt`（10 条 PropSpec：content/src/color/
+  fontpx/rotate/gapx/gapy/offsetx/offsety + class）、base.css `watermark {}`
+  （transparent 底 + 默认色/字号）。
+- **测试**：`tests/gui/watermark_test.zan` + golden（无窗口）：45° 旋转外接
+  盒高 >2× 宽缩、angle=0 与 `DrawText` 逐像素同界、alpha 0x80 全通道
+  [100,254]、组件级四象限都有着色、多行 `\n`、图像瓦片（合成 PNM）、空
+  内容/越界角度 500 钳制不崩、Props 往返（rotate 负数十进制、color 十进制）、
+  ControlFactory/Kinds。注册 `conformance_gui_watermark`。
+- **gallery**：Data Display 增 Watermark 组件条目 + 两演示——text（wm-doc
+  文档面板上 -22° 默认水印）、style（品牌蓝 0°/18px/密距）。
+- **顺手修掉的运行时缺陷**（规则 10，视觉核对时发现）：`zan_gui_surface_dump`
+  把 24 位 BMP 的行字节按 R,G,B 写出，而 BMP 是 B,G,R 序——Dump 出来的图
+  红蓝互换，与它"无头环境比对画布内容与屏幕实际显示"的文档约定相悖（GDI
+  present 路径按小端 B,G,R 直传是对的，Dump 是唯一写错的地方）；已改为
+  B,G,R。无 golden 消费 BMP 字节（断言走进程内 GetPixel），零测试影响。
+- **已知限制**：macOS 文字水印不旋转（回落 DrawText）；ClearType 在旋转
+  路径下不可用（GDI 限制，灰度 AA）；`Src` 平铺按自然尺寸不做缩放。
 # A58 · 全量收口执行计划（2026-08-27 定序）
 
 排序依据三条：① 先修"编译通过但结果错/编译器崩"的，因为它们会污染后面每一次

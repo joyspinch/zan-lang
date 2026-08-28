@@ -1652,6 +1652,11 @@ EXPORT i32 zan_gui_surface_dump(i32 surface_id, const char *path) {
             row[i * 3 + 0] = (unsigned char)((p >> 16) & 0xFF);
             row[i * 3 + 1] = (unsigned char)((p >> 8) & 0xFF);
             row[i * 3 + 2] = (unsigned char)(p & 0xFF);
+            /* BMP 24bpp is B,G,R byte order (the surface is 0xAARRGGBB);
+             * writing it the other way swaps red and blue on readback. */
+            row[i * 3 + 0] = (unsigned char)(p & 0xFF);
+            row[i * 3 + 1] = (unsigned char)((p >> 8) & 0xFF);
+            row[i * 3 + 2] = (unsigned char)((p >> 16) & 0xFF);
         }
         fwrite(row, 1, (size_t)stride_out, f);
     }
@@ -3210,6 +3215,20 @@ EXPORT void *zan_gui_get_pixels(i32 surface_id) {
     }
     return (void *)s->pixels;
 }
+/* One frame pixel as 0xAARRGGBB, or -1 outside the surface. Windowless
+ * assertions (tests) read sampled blits back through this. */
+EXPORT i32 zan_gui_read_pixel(i32 surface_id, i32 x, i32 y) {
+    if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id])
+        return -1;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (x < 0 || y < 0 || x >= s->width || y >= s->height) return -1;
+    if (s->be) {
+        if (s->be->flush) s->be->flush(s);
+        if (s->be->read_pixels) s->be->read_pixels(s);
+    }
+    return (i32)(s->pixels[(size_t)y * (size_t)s->stride + (size_t)x]);
+}
+
 
 /* The other present seam: hand the frame to the screen without a CPU copy.
  * `native_window` is the shell's window handle (HWND on Win32, X11 Window as an

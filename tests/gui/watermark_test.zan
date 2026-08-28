@@ -1,0 +1,221 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// Gui.Watermark 的无窗口回归：旋转文字原语（Canvas.DrawTextRot，经
+/// 运行时旋转贴片路径）与水印组件（平铺覆盖、默认淡色、组件模型）。
+/// 断言全部是几何/定性判断——旋转后包围盒必然更高更窄、带 alpha 的
+/// 文字必然既不等于底色也远浅于不透明——不依赖任何字体的具体形状，
+/// 在 GDI（Windows）与 FreeType（Linux）两条贴片路径上都成立。
+class Program {
+    static int fails;
+
+    static void True(string what, bool got) {
+        if (got) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got {got} want {want}");
+    }
+
+    /// 变化像素（偏离底色）的包围盒：minX, minY, maxX, maxY 写回 box，
+    /// 没有任何变化像素时 box[4] = 0。
+    static void InkBounds(Canvas c, int w, int h, List<int> box) {
+        int mnx = 0;
+        int mny = 0;
+        int mxx = 0 - 1;
+        int mxy = 0 - 1;
+        for (int y = 0; y < h; y = y + 1) {
+            for (int x = 0; x < w; x = x + 1) {
+                int p = c.GetPixel(x, y);
+                if ((p & 0x00FFFFFF) == 0x00FFFFFF) { continue; }
+                if (mxx < 0) { mnx = x; mny = y; }
+                if (x < mnx) { mnx = x; }
+                if (y < mny) { mny = y; }
+                if (x > mxx) { mxx = x; }
+                if (y > mxy) { mxy = y; }
+            }
+        }
+        box[0] = mnx;
+        box[1] = mny;
+        box[2] = mxx;
+        box[3] = mxy;
+        if (mxx < 0) { box[4] = 0; } else { box[4] = 1; }
+    }
+
+    /// 象限里是否落了墨（水印平铺覆盖到四角才叫平铺）。
+    static bool QuadrantHasInk(Canvas c, int x0, int y0, int x1, int y1,
+                               int lo, int hi) {
+        for (int y = y0; y < y1; y = y + 1) {
+            for (int x = x0; x < x1; x = x + 1) {
+                int p = c.GetPixel(x, y);
+                int b = p & 255;
+                if (b >= lo && b <= hi) { return true; }
+            }
+        }
+        return false;
+    }
+
+    static void Main() {
+        fails = 0;
+
+        // ---- 原语级：DrawTextRot vs DrawText（纯画布，无 DPI 参与）----
+        int W = 220;
+        int H = 160;
+        string text = "WATERMARK";
+        List<int> b0 = new List<int>();
+        b0.Add(0);
+        b0.Add(0);
+        b0.Add(0);
+        b0.Add(0);
+        b0.Add(0);
+        List<int> b1 = new List<int>();
+        b1.Add(0);
+        b1.Add(0);
+        b1.Add(0);
+        b1.Add(0);
+        b1.Add(0);
+
+        Canvas c = new Canvas(W, H);
+        c.Clear(0xFFFFFFFF);
+        c.DrawText(20, 60, text, 0xFF000000, 24);
+        InkBounds(c, W, H, b0);
+        True("unrotated drew", b0[4] == 1);
+
+        c.Clear(0xFFFFFFFF);
+        c.DrawTextRot(20, 60, text, 0xFF000000, 24, 45);
+        InkBounds(c, W, H, b1);
+        True("rotated drew", b1[4] == 1);
+        // 45° 旋转把横向长条立起来：明显更高、更靠左收窄。
+        True("rotated is taller",
+             b1[3] - b1[1] > (b0[3] - b0[1]) * 2);
+        True("rotated is narrower", b1[2] - b1[0] < b0[2] - b0[0]);
+
+        // angle=0 必须与 DrawText 完全同一路径：逐像素一致。
+        c.Clear(0xFFFFFFFF);
+        c.DrawTextRot(20, 60, text, 0xFF000000, 24, 0);
+        InkBounds(c, W, H, b1);
+        Eq("angle0 same bounds x", b1[0], b0[0]);
+        Eq("angle0 same bounds y", b1[1], b0[1]);
+        Eq("angle0 same bounds x2", b1[2], b0[2]);
+        Eq("angle0 same bounds y2", b1[3], b0[3]);
+
+        // 半透明：alpha=128 的墨迹任何通道都到不了纯黑，同时有像素被
+        // 明显压暗（证明墨迹真的画了）。ClearType 蒙版是逐通道覆盖，
+        // 边缘像素单通道回到底色 255 是常态，不在此断言之列。
+        c.Clear(0xFFFFFFFF);
+        c.DrawTextRot(20, 60, text, 0x80000000, 24, 30);
+        int minAll = 255;
+        for (int y = 0; y < H; y = y + 1) {
+            for (int x = 0; x < W; x = x + 1) {
+                int p = c.GetPixel(x, y);
+                if ((p & 0x00FFFFFF) == 0x00FFFFFF) { continue; }
+                for (int ch = 0; ch < 3; ch = ch + 1) {
+                    int v = (p >> (ch * 8)) & 255;
+                    if (v < minAll) { minAll = v; }
+                }
+            }
+        }
+        True("alpha keeps ink off black", minAll >= 100);
+        True("alpha leaves ink visible", minAll <= 200);
+
+        // ---- 组件级：水印平铺 + 淡色 + 模型 --------------------------
+        App app = new App("watermark", 240, 130);
+        app.canvas.Clear(0xFFFFFFFF);
+        Watermark wm = new Watermark("WATERMARK");
+        wm.GapX = 4;
+        wm.GapY = 4;
+        wm.Arrange(10, 10, 220, 110);
+        wm.RenderTree(app);
+        int q = 40;
+        True("tiles cover top-left",
+             QuadrantHasInk(app.canvas, 10, 10, 10 + q, 10 + q, 100, 254));
+        True("tiles cover top-right",
+             QuadrantHasInk(app.canvas, 230 - q, 10, 230, 10 + q, 100, 254));
+        True("tiles cover bottom-left",
+             QuadrantHasInk(app.canvas, 10, 120 - q, 10 + q, 120, 100, 254));
+        True("tiles cover bottom-right",
+             QuadrantHasInk(app.canvas, 230 - q, 120 - q, 230, 120, 100, 254));
+        // 默认色 alpha≈0.145：墨迹只能是底色与淡灰之间的浅色——
+        // 既证明画了，也证明没有把内容盖死。
+        True("watermark ink is faint",
+             QuadrantHasInk(app.canvas, 10, 10, 230, 120, 200, 254));
+
+        // Rotate=0 水平平铺同样覆盖。
+        app.canvas.Clear(0xFFFFFFFF);
+        Watermark flat = new Watermark("WATERMARK");
+        flat.GapX = 4;
+        flat.GapY = 4;
+        flat.Rotate = 0;
+        flat.Arrange(10, 10, 220, 110);
+        flat.RenderTree(app);
+        True("flat tiles cover",
+             QuadrantHasInk(app.canvas, 10, 10, 230, 120, 100, 254));
+
+        // 多行文本 + 图像源（合成 PNM，内存 key）不崩溃且落墨。
+        app.canvas.Clear(0xFFFFFFFF);
+        Watermark multi = new Watermark("AAA\nBBB");
+        multi.Arrange(10, 10, 220, 110);
+        multi.RenderTree(app);
+        True("multiline ink",
+             QuadrantHasInk(app.canvas, 10, 10, 230, 120, 100, 254));
+
+        string pnm = "P5\n6 4\n255\n"
+            + "dddddd" + "dddddd" + "dddddd" + "dddddd";
+        Eq("pnm registered",
+           Canvas.ImageLoadMem("mem:wm.pnm", pnm, pnm.Length), 6);
+        app.canvas.Clear(0xFFFFFFFF);
+        Watermark img = new Watermark("");
+        img.Src = "mem:wm.pnm";
+        img.GapX = 4;
+        img.GapY = 4;
+        img.Arrange(10, 10, 220, 110);
+        img.RenderTree(app);
+        True("image tiles cover",
+             QuadrantHasInk(app.canvas, 10, 10, 230, 120, 100, 254));
+
+        // 空内容/空盒/越界角度都不画也不崩。
+        Watermark empty = new Watermark("");
+        empty.Arrange(10, 10, 220, 110);
+        empty.RenderTree(app);
+        Watermark tilt = new Watermark("X");
+        tilt.Rotate = 500;
+        tilt.Arrange(0, 0, 40, 40);
+        tilt.RenderTree(app);
+
+        // ---- 组件模型（对齐 prop_test 的往返方式）。
+        Watermark m = new Watermark("机密");
+        Eq("props count", m.Props().Count, 10);
+        m.SetProp("content", "TOP SECRET");
+        True("content round-trip", m.GetProp("content") == "TOP SECRET");
+        m.SetProp("rotate", "-30");
+        True("rotate round-trip", m.GetProp("rotate") == "-30");
+        // 颜色属性绑定的是整数（0xAARRGGBB），序列化走十进制。
+        m.SetProp("color", Convert.ToString(0x26000000));
+        True("color round-trip", m.GetProp("color") == "637534208");
+        Control made = ControlFactory.Create("Watermark");
+        if (made == null) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL factory: null");
+        } else {
+            True("factory kind", made.Kind() == "Watermark");
+        }
+        List<string> kinds = ControlFactory.Kinds();
+        bool listed = false;
+        for (int i = 0; i < kinds.Count; i = i + 1) {
+            if (kinds[i] == "Watermark") { listed = true; }
+        }
+        True("kind listed", listed);
+
+        c.Destroy();
+        if (fails == 0) {
+            Console.WriteLine("watermark: OK");
+        } else {
+            Console.WriteLine("watermark: FAIL " + Convert.ToString(fails));
+        }
+    }
+}

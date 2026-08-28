@@ -269,27 +269,52 @@ static FT_Face ft_face_for_cp(u32 cp, int font_size) {
  * format FreeType produced is normalised to one coverage byte per pixel here,
  * so nothing downstream (nor a GPU backend's R8 atlas) has to know about
  * FT_PIXEL_MODE_*. */
-static const zan_glyph_tile *ft_glyph_tile(u32 cp, int font_size) {
-    char key[4];
+static const zan_glyph_tile *ft_glyph_tile(u32 cp, int font_size, int angle) {
+    char key[8];
     key[0] = (char)(cp & 0xFF);
     key[1] = (char)((cp >> 8) & 0xFF);
     key[2] = (char)((cp >> 16) & 0xFF);
     key[3] = (char)((cp >> 24) & 0xFF);
+    key[4] = (char)(angle & 0xFF);
+    key[5] = (char)((angle >> 8) & 0xFF);
     const zan_glyph_tile *cached =
-        zan_atlas_find(ZAN_TILE_GLYPH, font_size, key, 4);
+        zan_atlas_find(ZAN_TILE_GLYPH, font_size, key, 6);
     if (cached) return cached;
 
     FT_Face face = ft_face_for_cp(cp, font_size);
     FT_UInt glyph = FT_Get_Char_Index(face, cp);
     if (!glyph) glyph = FT_Get_Char_Index(face, '?');
-    if (!glyph || FT_Load_Glyph(face, glyph, FT_LOAD_RENDER) != 0) return NULL;
+    /* Rotation is baked into the coverage tile via the face transform, so
+     * nothing downstream knows tiles come in orientations: the atlas keeps
+     * one tile per (glyph, angle) and the pen loop walks the rotated
+     * baseline. The transform rotates slot->advance too, so the unrotated
+     * pen advance comes from metrics (26.6, never transformed). FT's font
+     * space is y-up and the device is y-down; mapping the device-space
+     * clockwise rotation through that flip gives this matrix. */
+    int rotated = angle != 0;
+    if (rotated) {
+        double rad = (double)angle * 3.14159265358979323846 / 180.0;
+        FT_Matrix mat;
+        mat.xx = (FT_Fixed)(cos(rad) * 65536.0);
+        mat.xy = (FT_Fixed)(sin(rad) * 65536.0);
+        mat.yx = (FT_Fixed)(-sin(rad) * 65536.0);
+        mat.yy = (FT_Fixed)(cos(rad) * 65536.0);
+        FT_Set_Transform(face, &mat, NULL);
+    }
+    int loaded = glyph && FT_Load_Glyph(face, glyph, FT_LOAD_RENDER) == 0;
+    int advance = 0;
+    if (loaded) {
+        advance = (int)((rotated ? face->glyph->metrics.horiAdvance
+                                 : face->glyph->advance.x) >> 6);
+    }
+    if (rotated) { FT_Set_Transform(face, NULL, NULL); }
+    if (!loaded) return NULL;
     FT_GlyphSlot slot = face->glyph;
     FT_Bitmap *bitmap = &slot->bitmap;
     int w = (int)bitmap->width;
     int h = (int)bitmap->rows;
-    int advance = (int)(slot->advance.x >> 6);
     if (w <= 0 || h <= 0) {
-        return zan_atlas_store(ZAN_TILE_GLYPH, font_size, key, 4,
+        return zan_atlas_store(ZAN_TILE_GLYPH, font_size, key, 6,
                                0, 0, 0, 0, advance, NULL, 1);
     }
 
@@ -313,7 +338,7 @@ static const zan_glyph_tile *ft_glyph_tile(u32 cp, int font_size) {
         }
     }
     const zan_glyph_tile *tile =
-        zan_atlas_store(ZAN_TILE_GLYPH, font_size, key, 4,
+        zan_atlas_store(ZAN_TILE_GLYPH, font_size, key, 6,
                         w, h, slot->bitmap_left, slot->bitmap_top,
                         advance, cov, 1);
     free(cov);
@@ -321,7 +346,8 @@ static const zan_glyph_tile *ft_glyph_tile(u32 cp, int font_size) {
 }
 
 static void ft_draw_text(i64 surface_id, i64 x, i64 y,
-                         const char *text, i64 color, int font_size) {
+                         const char *text, i64 color, int font_size,
+                         int angle) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s || !text) return;
@@ -332,13 +358,37 @@ static void ft_draw_text(i64 surface_id, i64 x, i64 y,
     batch.s = s;
     batch.color = (u32)color;
     batch.count = 0;
+    if (angle == 0) {
+        while (*text) {
+            u32 cp = utf8_next(&text);
+            const zan_glyph_tile *tile = ft_glyph_tile(cp, font_size, 0);
+            if (!tile) continue;   /* glyph the face could not render: as before */
+            zan_glyph_batch_add(&batch, tile, pen_x + tile->left,
+                                baseline - tile->top);
+            pen_x += tile->advance;
+        }
+        zan_glyph_batch_flush(&batch);
+        return;
+    }
+    /* Rotated: each glyph's tile already carries the rotation (see
+     * ft_glyph_tile), so the run reassembles rigidly by walking the rotated
+     * baseline. Unrotated pen points sit at (s, asc) from the anchor with s
+     * the accumulated advance; placing rotated glyphs at R(s, asc) through
+     * the device-space rotation reproduces exactly that rigid rotation. */
+    double rad = (double)angle * 3.14159265358979323846 / 180.0;
+    double cs = cos(rad), sn = sin(rad);
+    double asc = (double)(g_ft_face->size->metrics.ascender >> 6);
+    double s_acc = 0.0;
     while (*text) {
         u32 cp = utf8_next(&text);
-        const zan_glyph_tile *tile = ft_glyph_tile(cp, font_size);
-        if (!tile) continue;   /* glyph the face could not render: as before */
-        zan_glyph_batch_add(&batch, tile, pen_x + tile->left,
-                            baseline - tile->top);
-        pen_x += tile->advance;
+        const zan_glyph_tile *tile = ft_glyph_tile(cp, font_size, angle);
+        if (!tile) continue;
+        double px = cs * s_acc - sn * asc;
+        double py = sn * s_acc + cs * asc;
+        zan_glyph_batch_add(&batch, tile,
+                            (int)((double)x + px + tile->left),
+                            (int)((double)y + py - tile->top));
+        s_acc += tile->advance;   /* unrotated distance along the baseline */
     }
     zan_glyph_batch_flush(&batch);
 }
@@ -422,7 +472,34 @@ EXPORT void zan_gui_draw_text(
     ZAN_BE(s, draw_text, s, (int)x, (int)y, text, (u32)color, (int)font_size);
 #ifdef ZAN_GUI_FREETYPE
     if (ft_prepare((int)font_size)) {
-        ft_draw_text(surface_id, x, y, text, color, (int)font_size);
+        ft_draw_text(surface_id, x, y, text, color, (int)font_size, 0);
+        return;
+    }
+#endif
+    bitmap_draw_text(surface_id, x, y, text, color, font_size);
+}
+
+/* Rotated text: anchor and angle convention match the Win32 driver --
+ * (x, y) is the unrotated line box's top-left and the run rotates rigidly
+ * about it, positive = clockwise. FreeType bakes the rotation into the
+ * cached glyph tiles; the 6x10 bitmap fallback has no rotated rasters and
+ * draws unrotated rather than not at all. */
+EXPORT void zan_gui_draw_text_rot(
+    i32 surface_id, i32 x, i32 y, const char *text, i32 color, i32 font_size,
+    i32 angle_deg) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s || !text || !*text) return;
+    int angle = (int)angle_deg;
+    if (angle < -90) angle = -90;
+    if (angle > 90) angle = 90;
+    if (angle == 0) {
+        zan_gui_draw_text(surface_id, x, y, text, color, font_size);
+        return;
+    }
+#ifdef ZAN_GUI_FREETYPE
+    if (ft_prepare((int)font_size)) {
+        ft_draw_text(surface_id, x, y, text, color, (int)font_size, angle);
         return;
     }
 #endif

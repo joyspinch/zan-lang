@@ -951,6 +951,17 @@ EXPORT void zan_gui_draw_text(
     }
 }
 
+EXPORT void zan_gui_draw_text_rot(
+    i32 surface_id, i32 x, i32 y, const char *utf8, i32 color, i32 font_size,
+    i32 angle_deg) {
+    /* The cached CoreText mask is an axis-aligned raster; rotating it is a
+     * per-pixel inverse-mapped blit this driver has not learned yet, so a
+     * rotated run draws unrotated rather than not at all (the Win32 and
+     * FreeType drivers bake the rotation into the cached tiles). */
+    (void)angle_deg;
+    zan_gui_draw_text(surface_id, x, y, utf8, color, font_size);
+}
+
 EXPORT i32 zan_gui_measure_text(const char *utf8, i32 font_size) {
     if (!utf8 || !*utf8) return 0;
     @autoreleasepool {

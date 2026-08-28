@@ -79,6 +79,36 @@ Canvas.EvictImage("mem:logo");                              // 丢弃（路径�
 `Reload()` 重新解析。加载中与失败画 `image` CSS 规则的底色 + `Alt` 文本占位。
 注意：位图内容按矩形裁剪，CSS 圆角只作用于背景与边框（光栅器暂无圆角剪裁路径）。
 
+### 水印组件 Gui.Widget.Watermark（平铺旋转文字/图像，天然点击穿透）
+
+盖在页面内容上的透明平铺层（Naive UI n-watermark 同位）：`Content` 文字
+（`\n` 多行）或 `Src` 图像地址（同 Image 的本地路径/data URI，按自然尺寸
+平铺）反复重复铺满控件矩形。`Rotate` 角度默认 -22（度，正=顺时针，CSS
+惯例，限 [-90,90]）；`Color` 默认 rgba(0,0,0,0.145)（0=吃 `watermark {}`
+皮肤规则的 color）；`FontPx` 默认 14；`GapX/GapY` 瓦片间距（默认 100）、
+`OffsetX/OffsetY` 整体偏移。纯绘制层：不注册命中 id，事件照常落到下层
+控件。
+
+```zan
+Panel doc = Panel.Column().Gap(8);
+doc.With(new Label { Text = "合同正文..." });
+doc.With(new Watermark("INTERNAL USE ONLY").Grow());   // 默认 -22°
+// 品牌样式：
+Watermark wm = new Watermark("ACME");
+wm.Color = 0x2E1890FF; wm.FontPx = 18; wm.Rotate = 0; wm.GapX = 44;
+```
+
+实现要点：组件按瓦片网格从可视区外一格 pitch 起循环，每瓦把"行盒中心
+平移 + 运行时锚点旋转"复合成整瓦刚体旋转；文字经
+`Canvas.DrawTextRot(x, y, text, color, size, angleDeg)` 绘制——锚点 (x,y)
+是**未旋转行盒左上角**，旋转绕它进行。运行时新增导出
+`zan_gui_draw_text_rot`（驱动导出 66→68，Windows 改了运行时记得先跑
+`scripts/build_gui_driver.ps1` 重新 staging 再链 GUI 程序）：GDI 走
+`GM_ADVANCED` + `SetWorldTransform`（变换下 GDI 强制灰度 AA，ClearType
+不可用），FreeType 走 `FT_Set_Transform`，旋转结果按角度进 glyph atlas
+（run 瓦片 key 带 0xFF 前缀 + 角度，不与普通文本 key 碰撞）；CPU/GL
+合成器不变（瓦片内已烘焙旋转）。macOS 暂回落不旋转（CoreText 旋转蒙版
+待补）。
 ### 动态标签 Gui.Widget.DynamicTags（Naive UI n-dynamic-tags）
 
 一排可增删的 Tag + 尾部虚线「+ 新建标签」触发器；点击触发器原位变成输入框，
