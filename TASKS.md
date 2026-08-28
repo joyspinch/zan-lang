@@ -2233,3 +2233,47 @@ db_error_throw 的 leakcheck 在编译器重链接后出现 5 对象漂移
 
 **验证**：域内回归 `ctest -L standard -R "db_|orm_|zandb|sqlite|http_|ws_|webdav|mqtt|tls|https|csrf|web_|server_"`
 67/67 绿；泄漏双胎全量 446 项仅剩上述 8 项待查（详见上）。
+
+# A65 · Image 渲染边界修复 + Carousel 控件页 + 二进制取图通道 —— ✅ 已完成（2026-08-28）
+
+A59 的后续：用真实照片（naive-ui carousel 样例四图）压出渲染边界问题并
+修完；gallery 的 Image 演示全部改为标准组件树内嵌（Flex/Panel/Label，
+无自绘）。
+
+- **运行时采样边界**（随 42e5a603 入库）：缩小改盒式滤波——每个目标
+  像素平均全部覆盖到的源像素，细线/文字缩到缩略图不再整列丢失与走样；
+  放大改中心最近邻（不再向一角偏移半像素）。cover 源矩形只裁一个轴且
+  居中（原实现两轴各按比例裁，极端比例下裁错区域）；`ScaleTo` 目标
+  尺寸按源宽高比显式四舍五入。
+- **HttpClient 二进制安全 GET**（随 582a5a1a 入库）：新增
+  `SendBytesAsync`/`SendBytesTlsAsync`——一次性连接 + `HttpFramer` +
+  `ByteBuffer` 按字节累积，`HttpResponse.bodyBytes/bodyBytesLen` 保留
+  NUL（Zan string 是 NUL 结尾，二进制正文经 StringBuilder 组装会被
+  strlen 截短，ImageHttp 取 JPEG 因此只拿到前几个字节）。204/304/HEAD
+  无体；Content-Length/分块/EOF 定界三路齐备。EOF 路径探出 Windows
+  语义：closesocket 时入站请求数据未读会回 RST 并丢弃已排队响应——
+  原始 socket 服务端须先排干请求再关连接。
+  `tests/conformance/http_client_binary.zan`：CL 体逐字节位断言
+  （2500 个 NUL、0..255 图案）、204 无体、文本体、404、原始 HTTP/1.0
+  无 CL 的 EOF 定界体。
+- **编译器：extern 调用实参按形参铸造**（随 07dc1855 入库）：按名字
+  调全局函数的 gcall 路径裸 emit 实参，int 字面量一律铸 i64，形参若是
+  更窄整型/异型指针则 LLVM verification 失败（网络栈压测撞出
+  `X509_NAME_oneline` 的 i64 600 vs i32 形参）。按形参声明类型逐参
+  ZExt/SExt/Trunc/BitCast。
+- **Carousel 控件页**（随 a2f13f80 入库）：`AddSlideView(Control)` 让
+  真实控件（Image）成为页——布局/裁剪/过渡归轮播，每页保留 Image 的
+  四类地址语义（路径/URL/data URI/SVG）。箭头/指示点移入
+  `CarouselChrome` 末位子控件覆盖层：RenderTree 先画父 OnPaint 再画
+  子树，父级画的 chrome 会被控件页盖住；chrome 改首次 Arrange 时惰性
+  挂载，保证排在全部页之后。active 圆点状态改 `Style.SSelected()`
+  （原 `SChecked` 匹配不上皮肤 `:selected` 规则，当前页高亮不亮）。
+- **gallery Image 演示重做**（随 a2f13f80 入库）：Fit modes / URL /
+  Photo fit / Scale quality 四区放大到 560×300 等大幅面并配说明
+  Label；新增 Photo carousel（AddSlideView 四页实拍图、autoplay 3.5s、
+  cover 裁 640×360）与 Photo grid（Flex.Wrapped 200×140 均一瓦片）；
+  资源 `assets/carousel{1..4}.jpeg`。
+- **证据**：smoke 158/158、standard 609/609 绿；
+  `ctest -R conformance_http_client_binary` 绿；gallery 截图核验——
+  轮播箭头/圆点绘制在照片页之上、active 圆点白色加长胶囊、网格四瓦片
+  cover 一致。
