@@ -1,5 +1,6 @@
 /// Zan GUI component gallery.
 using System;
+using System.IO;
 using System.Threading;
 using System.Net.Http;
 using System.Net.Sockets;
@@ -451,9 +452,35 @@ class GalleryModel {
     bool cbWarning;
     int level;
     int radioGroup2;
+    // Radio 演示的三个独立分组：基础组 / 尺寸组 / 禁用组。各组绑定
+    // 自己的字段，互不串扰（绑定同一个字段才是同一组）。
+    int radioChoice;
+    int radioSize;
+    int radioLock;
     string notes;
     int pick;
     int slide;
+    // ---- 复杂表单演示的模型字段（.data 双向绑定直接写这里）----
+    // Form.validate：注册表单。
+    string suName;
+    string suMail;
+    string suPwd;
+    string suPwd2;
+    bool suAgree;
+    // Form.dependencies：配送单。radio 选配送方式、switch 开发票/礼品包装。
+    int orderShip;          // 0 快递配送 / 1 到店自提
+    string orderAddr;
+    bool orderGift;
+    string orderGiftNote;
+    bool orderInvoice;
+    string orderInvoiceTitle;
+    // Switch.master：总开关 + 两个子功能。
+    bool masterOn;
+    bool featA;
+    bool featB;
+    // Radio.dependent：渠道单选，「其他」的备注。
+    int howhear;            // 0 广告 / 1 朋友推荐 / 2 其他
+    string otherNote;
 }
 
 class Gallery {
@@ -461,6 +488,9 @@ class Gallery {
     // frame, so a single set of signals is enough to drive every interactive
     // example.
     static GalleryModel model;
+    // Radio 演示的上一帧基础组取值：翻转的那一帧才把 Change 报到
+    // LIVE STATES 行（轮询写法，免去 lambda 捕获）。
+    static int radioPrevChoice;
     static SignalBool demoBool;
     static SignalInt demoInt;
     static Input demoInput;
@@ -484,6 +514,22 @@ class Gallery {
     static CheckboxGroup demoCbg;
     // JSON design document -> real control tree (FormBuilder.Build).
     static Control demoForm;
+    // ---- 复杂表单演示（保留态：整棵 FormGroup 连同其中的输入控件
+    // 必须跨帧存活，每帧 new 会让 WidgetId 漂移，点击/焦点就再也落不
+    // 回同一控件；显隐/禁用等联动由预览分支每帧按模型值同步）----
+    // Form.validate：带校验的注册表单，校验结果行在表单底部。
+    static FormGroup demoSignup;
+    static Label demoSignupStatus;
+    // Form.dependencies：配送单。radio/switch 联动字段的整行显隐。
+    static FormGroup demoOrder;
+    static Label demoOrderStatus;
+    // Switch.master：总开关禁用一组子开关（Disabled 沿树继承）。
+    static Switch demoMaster;
+    static Panel demoMasterGroup;
+    static Switch demoMasterA;
+    static Switch demoMasterB;
+    // Radio.dependent：「其他」单选启用备注输入框（禁用联动）。
+    static Input demoHowhearNote;
     static SignalBool popTipOn;
     static Checkbox demoCheck;
     static Switch demoSwitch;
@@ -503,6 +549,12 @@ class Gallery {
     static SelectBox demoTablePick;
     static SelectBox demoHugePick;
     static SelectBox demoHoverPick;
+    // 级联（逐列展开）与树形（弹层内嵌 TreeView）两个弹层形态。
+    static SelectBox demoCascade;
+    static SelectBox demoTreePick;
+    static List<TreeNode> treeSelNodes;
+    // 分组标题 + 禁用项。
+    static SelectBox demoGroupPick;
     static Dropdown<string> demoDropdown;
     static Popover demoPopover;
     static FilePicker filePicker;
@@ -535,6 +587,9 @@ class Gallery {
     static MarqueeAnim demoMarquee;
     static MarqueeAnim demoMarqueeFill;
     static MarqueeAnim demoMarqueeNotice;
+    // 日历演示的选中值：RenderPreview 每帧重建 Calendar 实例，
+    // 点选结果存到这里、下一帧 SetDate 回灌，选择才不会一闪即逝。
+    static DateTime demoCalSel;
 
     // Delegate/event demo state. Retained buttons register their handlers once
     // with the C#-style `Click += handler`; a background Thread reports progress
@@ -628,6 +683,31 @@ class Gallery {
     // Retained state for the deferred-overlay / interactive demos.
     static string copiedIcon;
     static DataTableState demoTableState;
+    static PivotState demoPivotState;   // pivot scroll/selection survive frames
+
+    // PivotTable 演示数据：6 个区域 × 4 个季度，行列都足以溢出
+    // 预览框，展示行/列滚动与固定合计。
+    static List<DataRow> PivotDemoRows() {
+        List<string> regions = new List<string>{
+            "North", "South", "East", "West", "Central", "Overseas" };
+        List<string> quarters = new List<string>{ "Q1", "Q2", "Q3", "Q4" };
+        List<DataRow> rows = new List<DataRow>();
+        int seed = 7;
+        for (int r = 0; r < regions.Count; r = r + 1) {
+            for (int q = 0; q < quarters.Count; q = q + 1) {
+                seed = (seed * 31 + 17) % 997;
+                int units = seed % 90 + 10;
+                DataRow d = new DataRow();
+                d.Push(regions[r]);
+                d.Push(quarters[q]);
+                d.Push(Convert.ToString(units));
+                d.Push(Convert.ToString(units * 137 + seed % 53));
+                rows.Add(d);
+            }
+        }
+        return rows;
+    }
+
     static ScoreStyler demoStyler;      // kept typed so its columns can be rebound
     // The demo rows are built once and kept, not rebuilt per frame: rows the
     // user adds, edits or deletes have to survive the next repaint.
@@ -815,6 +895,9 @@ class Gallery {
         Gallery.model.cbPrimary = true;
         Gallery.model.cbSuccess = true;
         Gallery.model.level = 1;
+        Gallery.model.radioChoice = 0;
+        Gallery.model.radioSize = 1;
+        Gallery.model.radioLock = 1;
         Gallery.demoInput = new Input("type here");
         Gallery.demoInput.data = Gallery.model.inputText;
         // 变体输入框：只初始化一次，帧间保持同一 WidgetId。
@@ -853,12 +936,161 @@ class Gallery {
         // One .zform-style document instantiated into a real control
         // tree: the designer saves exactly this JSON, and the preview
         // and runtime share the same Build path.
+        // 双语助手 T() 读语言信号，复杂表单演示（下面）和
+        // BuildSelectDemos 都要在 lang 就绪之后才能建。
+        Gallery.lang = new SignalInt(0);
         Gallery.demoForm = FormBuilder.Build(JsonValue.Parse(
             "{ \"layoutMode\": 0, \"fields\": [\n    { \"kind\": \"Input\", \"label\": \"Email\", \"name\": \"email\", \"placeholder\": \"you@example.com\" },\n    { \"kind\": \"SelectBox\", \"label\": \"Role\", \"name\": \"role\", \"options\": [\"Admin\", \"Editor\", \"Viewer\"] },\n    { \"kind\": \"Switch\", \"label\": \"Weekly digest\", \"name\": \"digest\", \"defOn\": true },\n    { \"kind\": \"TextArea\", \"label\": \"Bio\", \"name\": \"bio\", \"placeholder\": \"A few words about you\", \"span\": 24 }\n ] }"));
         Panel formActions = Panel.Row().Gap(app.Scale(10));
         formActions.With(new Button { Text = "Cancel" });
         formActions.With(new Button { Text = "Create account", Class = "primary" });
         Gallery.demoForm.Add(formActions);
+        // ---- Form.validate：带校验的注册表单 ------------------------
+        // FormGroup 把每个字段包成「标题 + 控件 + 错误行」，Validate()
+        // 就地显示第一条错误：Input 用自带的红框错误态，其余控件用行内
+        // label.error。被联动隐藏/禁用的行自动跳过，因此依赖表单里
+        // 「选了配送才出现的地址」在自提时不会阻塞提交。
+        Input suName = new Input("2-16 个字符");
+        suName.name = "name";
+        suName.data = Gallery.model.suName;
+        Input suMail = new Input("you@example.com");
+        suMail.name = "mail";
+        suMail.data = Gallery.model.suMail;
+        Input suPwd = new Input("至少 6 位");
+        suPwd.name = "pwd";
+        suPwd.password = true;
+        suPwd.data = Gallery.model.suPwd;
+        Input suPwd2 = new Input("再输入一次");
+        suPwd2.name = "pwd2";
+        suPwd2.password = true;
+        suPwd2.data = Gallery.model.suPwd2;
+        Checkbox suAgree = new Checkbox(Gallery.T("I agree to the Terms of Service",
+            "我已阅读并同意服务条款"));
+        suAgree.name = "agree";
+        suAgree.data = Gallery.model.suAgree;
+        Gallery.demoSignup = new FormGroup();
+        Gallery.demoSignup.Add(Gallery.T("Username", "用户名"), suName)
+            .Rule(FormRule.Required(Gallery.T("Username is required", "请输入用户名")))
+            .Rule(FormRule.MinLen(2, Gallery.T("At least 2 characters", "至少 2 个字符")));
+        Gallery.demoSignup.Add(Gallery.T("Email", "邮箱"), suMail)
+            .Rule(FormRule.Required(Gallery.T("Email is required", "请输入邮箱")))
+            .Rule(FormRule.Email(Gallery.T("Not a valid email address", "邮箱格式不对")));
+        Gallery.demoSignup.Add(Gallery.T("Password", "密码"), suPwd)
+            .Rule(FormRule.Required(Gallery.T("Password is required", "请输入密码")))
+            .Rule(FormRule.MinLen(6, Gallery.T("At least 6 characters", "至少 6 个字符")));
+        Gallery.demoSignup.Add(Gallery.T("Confirm password", "确认密码"), suPwd2)
+            .Rule(FormRule.EqualsField(Gallery.demoSignup.Field("pwd"),
+                Gallery.T("Passwords do not match", "两次输入的密码不一致")));
+        Gallery.demoSignup.Add("", suAgree)
+            .Rule(FormRule.Checked(Gallery.T("Please agree first", "请先勾选同意")));
+        Panel signupActions = Panel.Row().Gap(app.Scale(10));
+        Button signupGo = new Button { Text = Gallery.T("Create account", "创建账号"), Class = "primary" };
+        signupGo.OnClick(() => {
+            if (Gallery.demoSignup.Validate()) {
+                Gallery.demoSignupStatus.Text = Gallery.T(
+                    "Submitted - all checks passed.", "提交成功：全部校验通过。");
+                Gallery.demoSignupStatus.Class = "success";
+            } else {
+                Gallery.demoSignupStatus.Text = Gallery.T(
+                    "Fix the highlighted fields first ("
+                        + Convert.ToString(Gallery.demoSignup.ErrorCount()) + ").",
+                    "请先修改标红的字段（" + Convert.ToString(Gallery.demoSignup.ErrorCount()) + " 处）。");
+                Gallery.demoSignupStatus.Class = "error";
+            }
+        });
+        Button signupReset = new Button { Text = Gallery.T("Reset", "重置") };
+        signupReset.OnClick(() => {
+            suName.SetText(""); suMail.SetText(""); suPwd.SetText(""); suPwd2.SetText("");
+            suAgree.SetChecked(false);
+            Gallery.demoSignup.ClearErrors();
+            Gallery.demoSignupStatus.Text = "";
+            Gallery.demoSignupStatus.Class = "";
+        });
+        signupActions.With(signupGo);
+        signupActions.With(signupReset);
+        Gallery.demoSignupStatus = new Label("");
+        Gallery.demoSignup.With(signupActions);
+        Gallery.demoSignup.With(Gallery.demoSignupStatus);
+        // ---- Form.dependencies：依赖联动的配送单 --------------------
+        // Radio / Switch 只负责把选择写进模型；显隐由预览分支每帧按
+        // 模型值 SetShown（gallery 的轮询写法，无需事件时序假设）。
+        // 整行隐藏 = 标题、控件、错误行一起走，且不再参与校验。
+        Radio shipExpress = new Radio(0, Gallery.T("Express delivery", "快递配送"));
+        shipExpress.data = Gallery.model.orderShip;
+        Radio shipPickup = new Radio(1, Gallery.T("Store pickup", "到店自提"));
+        shipPickup.data = Gallery.model.orderShip;
+        Input orderAddr = new Input(Gallery.T("Street, city, postcode", "省市区 / 街道 / 门牌"));
+        orderAddr.name = "addr";
+        orderAddr.data = Gallery.model.orderAddr;
+        SelectBox orderStore = new SelectBox(Gallery.T("Pick a store", "选择自提门店"));
+        orderStore.name = "store";
+        orderStore.AddOption(Gallery.T("Flagship - Nanjing Rd", "旗舰店 · 南京路"));
+        orderStore.AddOption(Gallery.T("Campus - Tech Park", "园区店 · 科技园"));
+        orderStore.AddOption(Gallery.T("Harbor - Pier 7", "港口店 · 七号栈"));
+        Switch orderGift = new Switch();
+        orderGift.name = "gift";
+        orderGift.data = Gallery.model.orderGift;
+        Input orderGiftNote = new Input(Gallery.T("Message on the card", "贺卡留言"));
+        orderGiftNote.name = "giftNote";
+        orderGiftNote.data = Gallery.model.orderGiftNote;
+        Switch orderInvoice = new Switch();
+        orderInvoice.name = "invoice";
+        orderInvoice.data = Gallery.model.orderInvoice;
+        Input orderTitle = new Input(Gallery.T("Company or person", "抬头（单位或个人）"));
+        orderTitle.name = "title";
+        orderTitle.data = Gallery.model.orderInvoiceTitle;
+        Gallery.demoOrder = new FormGroup();
+        Panel shipRow = Panel.Column().Gap(app.Scale(4));
+        shipRow.With(new Label(Gallery.T("Delivery method", "配送方式")));
+        shipRow.With(Panel.Row().Gap(app.Scale(24)).With(shipExpress).With(shipPickup));
+        Gallery.demoOrder.With(shipRow);
+        Gallery.demoOrder.Add(Gallery.T("Shipping address", "收货地址"), orderAddr)
+            .Rule(FormRule.Required(Gallery.T("Address is required for delivery", "快递配送需要收货地址")));
+        Gallery.demoOrder.Add(Gallery.T("Pickup store", "自提门店"), orderStore)
+            .Rule(FormRule.Required(Gallery.T("Pick a store first", "请选择自提门店")));
+        Gallery.demoOrder.Add(Gallery.T("Gift wrap + card", "礼品包装 + 贺卡"), orderGift);
+        Gallery.demoOrder.Add("", orderGiftNote);
+        Gallery.demoOrder.Add(Gallery.T("Invoice", "需要发票"), orderInvoice);
+        Gallery.demoOrder.Add(Gallery.T("Invoice title", "发票抬头"), orderTitle)
+            .Rule(FormRule.Required(Gallery.T("Invoice title is required", "开具发票需要抬头")));
+        Panel orderActions = Panel.Row().Gap(app.Scale(10));
+        Button orderGo = new Button { Text = Gallery.T("Place order", "提交订单"), Class = "primary" };
+        orderGo.OnClick(() => {
+            if (Gallery.demoOrder.Validate()) {
+                Gallery.demoOrderStatus.Text = Gallery.T("Order placed.", "订单已提交。");
+                Gallery.demoOrderStatus.Class = "success";
+            } else {
+                Gallery.demoOrderStatus.Text = Gallery.T(
+                    "Check the highlighted fields ("
+                        + Convert.ToString(Gallery.demoOrder.ErrorCount()) + ").",
+                    "请先处理标红的字段（" + Convert.ToString(Gallery.demoOrder.ErrorCount()) + " 处）。");
+                Gallery.demoOrderStatus.Class = "error";
+            }
+        });
+        orderActions.With(orderGo);
+        Gallery.demoOrderStatus = new Label("");
+        Gallery.demoOrder.With(orderActions);
+        Gallery.demoOrder.With(Gallery.demoOrderStatus);
+        // ---- Switch.master：总开关禁用子开关组 ----------------------
+        Gallery.demoMaster = new Switch();
+        Gallery.demoMaster.data = Gallery.model.masterOn;
+        Gallery.demoMasterA = new Switch();
+        Gallery.demoMasterA.data = Gallery.model.featA;
+        Gallery.demoMasterB = new Switch();
+        Gallery.demoMasterB.data = Gallery.model.featB;
+        Gallery.demoMasterGroup = Panel.Column().Gap(app.Scale(8));
+        Panel masterRowA = Panel.Row().Gap(app.Scale(12));
+        masterRowA.With(new Label(Gallery.T("Email alerts", "邮件提醒")));
+        masterRowA.With(Gallery.demoMasterA);
+        Panel masterRowB = Panel.Row().Gap(app.Scale(12));
+        masterRowB.With(new Label(Gallery.T("Weekly digest", "每周摘要")));
+        masterRowB.With(Gallery.demoMasterB);
+        Gallery.demoMasterGroup.With(masterRowA);
+        Gallery.demoMasterGroup.With(masterRowB);
+        // ---- Radio.dependent：「其他」才启用的备注输入框 -------------
+        Gallery.demoHowhearNote = new Input(Gallery.T("Tell us more", "请具体说明"));
+        Gallery.demoHowhearNote.name = "howhearNote";
+        Gallery.demoHowhearNote.data = Gallery.model.otherNote;
         // New usage: instance widgets bound to plain model fields via `.data`.
         Gallery.demoCheck = new Checkbox("Checked");
         Gallery.demoCheck.data = Gallery.model.toggle;
@@ -918,7 +1150,7 @@ class Gallery {
         Gallery.demoCountdownC.Finish.Add(() => {
             Gallery.demoCountdownC.Class = "small error";
         });
-        Gallery.demoCountdownCtl = new Countdown(10 * 1000, "ss.S");
+        Gallery.demoCountdownCtl = new Countdown(10 * 1000, "ss.SS");
         Gallery.demoCountdownCtl.Finish.Add(() => {
             Gallery.demoCountdownStatus.Text = Gallery.T(
                 "Finished - press Restart to run again.", "已归零 — 点重摆再来一轮。");
@@ -1079,7 +1311,8 @@ class Gallery {
         Gallery.designer.Seed(app);
 
         // Bilingual + persistent demo models.
-        Gallery.lang = new SignalInt(0);
+        // （lang 的创建已提前到 demoForm 之前——复杂表单演示在更早处
+        // 就要用 Gallery.T，见那里的注释。）
         // 之后建的演示数据要用 Gallery.T，所以必须排在 lang 之后。
         Gallery.BuildSelectDemos();
         Gallery.splitVFirst = new SignalInt(app.Scale(150));
@@ -1190,6 +1423,9 @@ class Gallery {
                     if (st == "table") { Gallery.demoTablePick.SetOpen(true); }
                     else if (st == "virtual") { Gallery.demoHugePick.SetOpen(true); }
                     else if (st == "hover") { Gallery.demoHoverPick.SetOpen(true); }
+                    else if (st == "cascade") { Gallery.demoCascade.SetOpen(true); }
+                    else if (st == "tree") { Gallery.demoTreePick.SetOpen(true); }
+                    else if (st == "group") { Gallery.demoGroupPick.SetOpen(true); }
                     else { Gallery.demoFilter.SetOpen(true); }
                 }
             }
@@ -1249,8 +1485,15 @@ class Gallery {
             // keep animating) when either wants a repaint; otherwise block.
             Gallery.filePicker.ApplySkin(app.ThemeMenuIndex());
             int r;
+            // 自动化驱动活动时要求本循环保持轮询（标准循环以 pollPending
+            // 表达该约定，见 App.ProcessEvent）：wait 到时与注入批次排空
+            // 都要靠下一圈 UiDriver.Tick，若此处阻塞在 WaitEvent 上就
+            // 永远等不到下一圈。驱动结束后 Tick 不再置位，循环回到阻塞。
+            bool driverPoll = app.pollPending;
+            app.pollPending = false;
             if (Gallery.filePicker.NeedsRedraw()
-                || (!Gallery.filePicker.IsOpen() && app.needsRedraw)) {
+                || (!Gallery.filePicker.IsOpen()
+                    && (app.needsRedraw || driverPoll))) {
                 int since = Window.GetTickMs() - app.lastPresentMs;
                 if (app.lastPresentMs > 0 && since < 16) {
                     Window.SleepMs(16 - since);
@@ -1466,6 +1709,12 @@ class Gallery {
         Gallery.calHeat = null;
         Gallery.comps = new List<Comp>();
         Gallery.BuildComps(Gallery.comps);
+        // 重建发生在帧中途（点击处理器里跑，ResetFrame 已把 id 计数器
+        // 回卷过）：本轮新建的 retained 控件（各 Demo 的 copyBtn 等）
+        // 领到的是帧回收区间 id。把帧基线重新钉到当前计数之上，
+        // 之后的 ResetFrame 才不会把这些 id 重新发给每帧重建的演示
+        // 控件——否则语言切换后又是「点 Copy 触发 Radio 的 Change」。
+        WidgetId.Mark();
     }
 
     /// Builds the demo plant every HMI preview shares: one tag table plus the
@@ -1674,6 +1923,66 @@ class Gallery {
         Rect content = new Rect(0, top, w, h - top);
         Gallery.RenderNav(app, c, t, content, sw);
         Gallery.RenderDetail(app, c, t, content, sw);
+        // toast/通知队列是全局状态，任何页面的按钮都可能入队；每帧在页面
+        // 之上画一次。此前挂在 RenderOverlay 末尾，Alert 这类没有 overlay
+        // 演示的页面整页都不会执行到它，入队的消息永远不被绘制。
+        Layer.RenderToasts(app);
+        Layer.RenderNotifs(app);
+        Gallery.PublishProbes(app);
+    }
+
+    /// 自动化驱动会话中每帧推送模型探针（ZAN_UI_SCRIPT 的
+    /// `assert probe` 用它拿到与渲染同步的真值，不依赖截图）。
+    /// 驱动未活动时整段跳过，正常运行的画廊零开销。
+    /// 另附注入点击的生命周期探针（sticky，按释放事件冻结）：
+    /// click.target = 释放时命中的控件 id，click.delivered =
+    /// 释放后是否有过一帧读到该点击——丢点时用这两个值定位阶段。
+    static int drvClickSeq;
+    static int drvClickTarget;
+    static bool drvClickDelivered;
+
+    static void PublishProbes(App app) {
+        if (!UiDriver.Active()) { return; }
+        // 注入点击生命周期（sticky）：按下即复位，释放时冻结
+        // 「命中 id」与「本帧是否被读到」。EventKind 在空闲时停留
+        // 在最后一个事件上，等待期不会重复触发分支。
+        int evSeq = app.window.EventSeq();
+        int evKind = app.EventKind();
+        if (evSeq != Gallery.drvClickSeq && (evKind == 2 || evKind == 3)) {
+            Gallery.drvClickSeq = evSeq;
+            if (evKind == 3) {
+                Gallery.drvClickTarget = app.ClickTarget();
+                // 本帧渲染已结束：此刻绑定仍为当前帧说明控件已读到。
+                Gallery.drvClickDelivered = app.ClickFrameCurrent();
+            } else {
+                Gallery.drvClickTarget = -999;
+                Gallery.drvClickDelivered = false;
+            }
+        }
+        UiDriver.SetProbe("click.target",
+            Convert.ToString(Gallery.drvClickTarget));
+        UiDriver.SetProbe("click.delivered",
+            Gallery.drvClickDelivered ? "true" : "false");
+        UiDriver.SetProbe("click.relSeq", Convert.ToString(evSeq));
+        UiDriver.SetProbe("lang", Convert.ToString(Gallery.lang.Get()));
+        UiDriver.SetProbe("form.errCount",
+            Convert.ToString(Gallery.demoSignup.ErrorCount()));
+        UiDriver.SetProbe("form.status", Gallery.demoSignupStatus.Str());
+        UiDriver.SetProbe("order.ship", Convert.ToString(Gallery.model.orderShip));
+        UiDriver.SetProbe("order.gift",
+            Gallery.model.orderGift ? "true" : "false");
+        UiDriver.SetProbe("order.invoice",
+            Gallery.model.orderInvoice ? "true" : "false");
+        UiDriver.SetProbe("switch.masterOn",
+            Gallery.model.masterOn ? "true" : "false");
+        UiDriver.SetProbe("switch.featA",
+            Gallery.model.featA ? "true" : "false");
+        UiDriver.SetProbe("switch.featB",
+            Gallery.model.featB ? "true" : "false");
+        UiDriver.SetProbe("radio.howhear",
+            Convert.ToString(Gallery.model.howhear));
+        UiDriver.SetProbe("radio.noteDisabled",
+            Gallery.demoHowhearNote.IsDisabled() ? "true" : "false");
     }
 
     /// Left navigation: category headers interleaved with clickable component
@@ -2447,6 +2756,11 @@ class Gallery {
         if (name == "Skeleton") { return 175; }
         if (name == "CheckboxGroup") { return 205; }
         if (name == "Form") { return 320; }
+        if (name == "Form.validate") { return 470; }
+        if (name == "Form.dependencies") { return 520; }
+        if (name == "Switch.states") { return 110; }
+        if (name == "Switch.master") { return 140; }
+        if (name == "Radio.dependent") { return 130; }
         if (name == "Empty") { return 175; }
         if (name == "Button") { return 470; }
         if (name == "Icon") { return 360; }
@@ -2460,7 +2774,7 @@ class Gallery {
         if (name == "ClickEvent") { return 175; }
         if (name == "DataTable 1M") { return 430; }
         if (name == "DataTable") { return 320; }
-        if (name == "PivotTable") { return 270; }
+        if (name == "PivotTable") { return 330; }
         if (name == "Chart") { return 320; }
         if (name == "Alert.types") { return 195; }
         if (name == "Alert.queue") { return 155; }
@@ -2470,6 +2784,7 @@ class Gallery {
         if (name == "Collapse") { return 190; }
         if (name == "Table") { return 225; }
         if (name == "ListView") { return 335; }
+        if (name == "Calendar") { return 360; }
         if (name == "Carousel") { return 300; }
         if (name == "Layer") { return 360; }
         if (name == "Menu") { return 180; }
@@ -2623,6 +2938,66 @@ class Gallery {
         Gallery.demoHoverPick.AddOption("Charlie");
         Gallery.demoHoverPick.AddOption("Delta");
         Gallery.demoHoverPick.AddOption("Echo");
+
+        // 级联：省 / 市 / 区三级，点中带子级的选项在右侧展开下一列。
+        Gallery.demoCascade = new SelectBox("省 / 市 / 区").Cascade();
+        int zj = Gallery.demoCascade.AddBranch("浙江省");
+        int hz = Gallery.demoCascade.AddChild(zj, "杭州市");
+        Gallery.demoCascade.AddChild(hz, "西湖区");
+        Gallery.demoCascade.AddChild(hz, "滨江区");
+        Gallery.demoCascade.AddChild(hz, "余杭区");
+        int nb = Gallery.demoCascade.AddChild(zj, "宁波市");
+        Gallery.demoCascade.AddChild(nb, "海曙区");
+        Gallery.demoCascade.AddChild(nb, "鄞州区");
+        int js = Gallery.demoCascade.AddBranch("江苏省");
+        int sz = Gallery.demoCascade.AddChild(js, "苏州市");
+        Gallery.demoCascade.AddChild(sz, "姑苏区");
+        Gallery.demoCascade.AddChild(sz, "工业园区");
+        int nj = Gallery.demoCascade.AddChild(js, "南京市");
+        Gallery.demoCascade.AddChild(nj, "玄武区");
+        Gallery.demoCascade.AddChild(nj, "鼓楼区");
+        int gd = Gallery.demoCascade.AddBranch("广东省");
+        int gz = Gallery.demoCascade.AddChild(gd, "广州市");
+        Gallery.demoCascade.AddChild(gz, "天河区");
+        Gallery.demoCascade.AddChild(gz, "越秀区");
+        int sz2 = Gallery.demoCascade.AddChild(gd, "深圳市");
+        Gallery.demoCascade.AddChild(sz2, "南山区");
+        Gallery.demoCascade.AddChild(sz2, "福田区");
+
+        // 树形：弹层内嵌一颗真 TreeView，叶节点收值
+        // （payload 是完整路径，触发器显示它）。
+        Gallery.treeSelNodes = new List<TreeNode>();
+        Gallery.treeSelNodes.Add(TreeNode.Dir("src", 0, true));
+        Gallery.treeSelNodes.Add(TreeNode.Dir("compiler", 1, true));
+        Gallery.treeSelNodes.Add(TreeNode.File("lexer.c", 2)
+            .WithPayload("src / compiler / lexer.c"));
+        Gallery.treeSelNodes.Add(TreeNode.File("parser.c", 2)
+            .WithPayload("src / compiler / parser.c"));
+        Gallery.treeSelNodes.Add(TreeNode.Dir("runtime", 1, true));
+        Gallery.treeSelNodes.Add(TreeNode.File("arc.c", 2)
+            .WithPayload("src / runtime / arc.c"));
+        Gallery.treeSelNodes.Add(TreeNode.File("scheduler.c", 2)
+            .WithPayload("src / runtime / scheduler.c"));
+        Gallery.treeSelNodes.Add(TreeNode.Dir("stdlib", 0, true));
+        Gallery.treeSelNodes.Add(TreeNode.File("Gui.zan", 1)
+            .WithPayload("stdlib / Gui.zan"));
+        Gallery.demoTreePick = new SelectBox("Pick a source file")
+            .Tree()
+            .TreeNodes(Gallery.treeSelNodes);
+
+        // 分组 + 禁用项：标题行不可选，禁用项置灰不可点。
+        Gallery.demoGroupPick = new SelectBox("Pick a language");
+        Gallery.demoGroupPick.AddGroup("Popular");
+        Gallery.demoGroupPick.AddOption("Zan");
+        Gallery.demoGroupPick.AddOption("Rust");
+        Gallery.demoGroupPick.AddOption("Python");
+        Gallery.demoGroupPick.AddGroup("Systems");
+        Gallery.demoGroupPick.AddOption("C");
+        Gallery.demoGroupPick.AddOption("C++", true);
+        Gallery.demoGroupPick.AddOption("Zig");
+        Gallery.demoGroupPick.AddGroup("Legacy");
+        Gallery.demoGroupPick.AddOption("Pascal", true);
+        Gallery.demoGroupPick.AddOption("COBOL", true);
     }
 
     /// 立即模式的演示（直接把内容 Draw/Render 到算好的坐标上，没有控件树
@@ -2711,6 +3086,40 @@ class Gallery {
             + "</svg>";
     }
 
+    // 真实照片（600x415 JPEG，naive-ui 轮播图，assets/carousel1.jpeg）：
+    // 按运行目录探测仓库内路径，找不到时照片演示回退到合成渐变。
+    static string PhotoPath() {
+        return Gallery.PhotoAsset("carousel1.jpeg");
+    }
+
+    /// gallery 自带照片资产（naive-ui 轮播示例图 carousel1-4.jpeg）。
+    /// 按运行目录的三种可能深度探测，找不到返回空串，演示回退到
+    /// base64 占位图。
+    static string PhotoAsset(string name) {
+        List<string> candidates = new List<string>{
+            "examples/gui_gallery/assets/" + name,
+            "../examples/gui_gallery/assets/" + name,
+            "assets/" + name };
+        for (int i = 0; i < candidates.Count; i = i + 1) {
+            if (File.Exists(candidates[i])) { return candidates[i]; }
+        }
+        return "";
+    }
+
+    /// 四张示例照片里实际存在的那些（缺资产的跳过）。
+    static List<string> PhotoSet() {
+        List<string> all = new List<string>{
+            "carousel1.jpeg", "carousel2.jpeg",
+            "carousel3.jpeg", "carousel4.jpeg" };
+        List<string> found = new List<string>();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            string p = Gallery.PhotoAsset(all[i]);
+            if (p != "") { found.Add(p); }
+        }
+        if (found.Count == 0) { found.Add(Gallery.DataUriPnm()); }
+        return found;
+    }
+
     // URL 演示的本地回环服务（127.0.0.1:18747）。首次进入演示时启动；
     // 端口被占用时该演示只剩 Error 占位，不影响其它演示。
     static void EnsureImageServer() {
@@ -2734,6 +3143,13 @@ class Gallery {
             return HttpResponse.Bytes(Gallery.PnmBytes(),
                                       Gallery.imageDemoPnmLen,
                                       "image/x-portable-anymap");
+        }
+        if (req.path == "/photo.jpeg") {
+            string p = Gallery.PhotoPath();
+            if (p != "") {
+                byte[] bytes = File.ReadAllBytes(p);
+                return HttpResponse.Bytes(bytes, bytes.Length, "image/jpeg");
+            }
         }
         return HttpResponse.NotFound();
     }
@@ -3164,23 +3580,61 @@ class Gallery {
         } else if (name == "Radio") {
             // A radio GROUP = every option shares one two-way data binding;
             // clicking any option writes the group value to the model field.
+            // Each row is its own group on its own model field: labels,
+            // sizes (small / large), semantic accents, and the disabled
+            // state — clicking a disabled radio must do nothing.
             Radio ra = new Radio(0, "Option A");
-            ra.data = Gallery.model.level;
+            ra.data = Gallery.model.radioChoice;
             Radio rb = new Radio(1, "Option B");
-            rb.data = Gallery.model.level;
-            // A large, success-styled second group on its OWN model value --
-            // an independent group must not share `level` with the first one.
-            Radio gl = new Radio(0, "Large");
-            gl.Class = "large";
-            gl.data = Gallery.model.radioGroup2;
-            Radio gs = new Radio(1, "Large");
-            gs.Class = "large success";
-            gs.data = Gallery.model.radioGroup2;
-            Panel col = Panel.Column().Gap(app.Scale(14));
-            col.With(Panel.Row().Gap(app.Scale(24)).With(ra).With(rb));
-            col.With(Panel.Row().Gap(app.Scale(24)).With(gl).With(gs));
+            rb.data = Gallery.model.radioChoice;
+            Radio rc = new Radio(2, "Option C");
+            rc.data = Gallery.model.radioChoice;
+            // Sizes are classes: the ring/dot rescale with the label font.
+            Radio rs = new Radio(0, "Small");
+            rs.Class = "small";
+            rs.data = Gallery.model.radioSize;
+            Radio rm = new Radio(1, "Default");
+            rm.data = Gallery.model.radioSize;
+            Radio rl = new Radio(2, "Large");
+            rl.Class = "large";
+            rl.data = Gallery.model.radioSize;
+            // Semantic accents recolor the checked ring + dot.
+            Radio ri = new Radio(0, "Info");
+            ri.Class = "info";
+            ri.data = Gallery.model.radioGroup2;
+            Radio rw = new Radio(1, "Success");
+            rw.Class = "success";
+            rw.data = Gallery.model.radioGroup2;
+            Radio rn = new Radio(2, "Warning");
+            rn.Class = "warning";
+            rn.data = Gallery.model.radioGroup2;
+            Radio re = new Radio(3, "Error");
+            re.Class = "error";
+            re.data = Gallery.model.radioGroup2;
+            // Disabled pair on its own field: one checked, one not —
+            // the checked one shows the muted accent, and neither fires.
+            Radio rd0 = new Radio(0, "Locked off");
+            rd0.Disabled = true;
+            rd0.data = Gallery.model.radioLock;
+            Radio rd1 = new Radio(1, "Locked on");
+            rd1.Disabled = true;
+            rd1.data = Gallery.model.radioLock;
+            Panel col = Panel.Column().Gap(app.Scale(12));
+            col.With(Panel.Row().Gap(app.Scale(24)).With(ra).With(rb).With(rc));
+            col.With(Panel.Row().Gap(app.Scale(24)).With(rs).With(rm).With(rl));
+            col.With(Panel.Row().Gap(app.Scale(20))
+                .With(ri).With(rw).With(rn).With(re));
+            col.With(Panel.Row().Gap(app.Scale(24)).With(rd0).With(rd1));
             Gallery.LayoutAuto(app, col, name, px, py - app.Scale(12),
-                             w - app.Scale(36), app.Scale(120));
+                             w - app.Scale(36), app.Scale(220));
+            // 基础组翻转的那一帧把 Change 报到 LIVE STATES 行：绑定值
+            // 就是组选择，轮询对比即可，无需 lambda 捕获。
+            if (Gallery.model.radioChoice != Gallery.radioPrevChoice) {
+                Gallery.radioPrevChoice = Gallery.model.radioChoice;
+                Gallery.Fired(app, name, Gallery.T("Changed -> option ",
+                    "已切换 -> 选项 ")
+                    + Convert.ToString(Gallery.model.radioChoice + 1));
+            }
         } else if (name == "Switch") {
             Flex row = Flex.Wrapped().Gap(app.Scale(12));
             row.With(Gallery.demoSwitch);
@@ -3460,42 +3914,154 @@ class Gallery {
             Gallery.LayoutAuto(app, row, name, px, py,
                              w - app.Scale(36), app.Scale(60));
         } else if (name == "Image.fit") {
-            // 同一来源，四种 Fit 放进固定盒子：contain 留白、
-            // cover 裁剪铺满、fill 拉伸、none 原始尺寸居中。
+            // 同一来源，四种 Fit 内嵌在 Flex 列里：contain 留白、
+            // cover 裁剪铺满、fill 拉伸、none 原始尺寸居中。盒子尺寸
+            // 来自皮肤类 fit-box，说明文字用 label.caption 参与测量，
+            // 不手摆坐标、不直接绘制。
             string src = Gallery.DataUriPnm();
-            int bw = app.Scale(110);
-            int bh = app.Scale(70);
-            int gx = app.Scale(16);
-            int ix = px;
+            Flex row = Flex.Wrapped().Gap(app.Scale(20));
             List<string> fits = new List<string>{
                 "contain", "cover", "fill", "none" };
             for (int i = 0; i < fits.Count; i = i + 1) {
                 Image im = new Image(src, "", fits[i]);
-                im.RenderInside(app, new Rect(ix, py, bw, bh));
-                c.DrawText(ix, py + bh + app.Scale(5), fits[i],
-                           t.textTertiary, t.fontSizeSmall);
-                ix = ix + bw + gx;
+                im.Class = "fit-box";
+                Panel cell = Panel.Column().Gap(app.Scale(6));
+                cell.With(im);
+                cell.With(new Label { Text = fits[i], Class = "caption" });
+                row.With(cell);
             }
+            Gallery.LayoutAuto(app, row, name, px, py,
+                             w - app.Scale(36), app.Scale(160));
         } else if (name == "Image.url") {
             // http(s) 地址在后台线程取回，App.Post 封送回 UI 线程解码。
-            // 本地 HttpServer 兜底，演示离线可跑。
+            // 本地 HttpServer 兜底，演示离线可跑；照片区放大到 560x300，
+            // 二进制正文经 HttpClient 的字节安全通道取回。
             Gallery.EnsureImageServer();
-            Flex col = Flex.Column().Gap(app.Scale(8));
+            Panel col = Panel.Column().Gap(app.Scale(8));
             Image net = new Image("http://127.0.0.1:18747/img.pnm",
                                   "loading...", "");
             net.Loaded += () => app.RequestRedraw();
             net.Error += () => app.RequestRedraw();
             col.With(net);
+            Image photoNet = new Image("http://127.0.0.1:18747/photo.jpeg",
+                                       "loading 64KB photo...", "contain");
+            photoNet.Class = "url-photo";
+            photoNet.Loaded += () => app.RequestRedraw();
+            photoNet.Error += () => app.RequestRedraw();
+            col.With(photoNet);
             col.With(new Label {
-                Text = "http://127.0.0.1:18747/img.pnm -- background fetch",
-                Class = "secondary" });
+                Text = "http://127.0.0.1:18747/{img.pnm, photo.jpeg} -- background fetch",
+                Class = "caption" });
             Gallery.LayoutAuto(app, col, name, px, py,
-                             w - app.Scale(36), app.Scale(80));
+                             w - app.Scale(36), app.Scale(430));
+        } else if (name == "Image.photofit") {
+            // 真实照片（600x415 / 800x450）放进比例失衡的固定盒子：
+            // cover 的两个分支各裁一个轴（宽盒裁上下、高盒裁左右），
+            // contain 完整显示留白。内嵌 Flex 列 + caption，说明文字
+            // 参与测量；盒子要多大有多大，不再挤在小格里。
+            List<string> photos = Gallery.PhotoSet();
+            string photo = photos[0];
+            Flex row = Flex.Wrapped().Gap(app.Scale(20));
+            Panel c1 = Panel.Column().Gap(app.Scale(6));
+            Image wide = new Image(photo, "", "cover");
+            wide.Class = "photo-banner";
+            c1.With(wide);
+            c1.With(new Label {
+                Text = "cover 560x300 -- crops top/bottom",
+                Class = "caption" });
+            row.With(c1);
+            Panel c2 = Panel.Column().Gap(app.Scale(6));
+            Image sq = new Image(photo, "", "cover");
+            sq.Class = "photo-card";
+            c2.With(sq);
+            c2.With(new Label {
+                Text = "cover 300x220 -- crops sides",
+                Class = "caption" });
+            row.With(c2);
+            Panel c3 = Panel.Column().Gap(app.Scale(6));
+            Image tall = new Image(photo, "", "cover");
+            tall.Class = "photo-tall";
+            c3.With(tall);
+            c3.With(new Label {
+                Text = "cover 220x340 -- crops sides",
+                Class = "caption" });
+            row.With(c3);
+            Panel c4 = Panel.Column().Gap(app.Scale(6));
+            Image cont = new Image(photo, "", "contain");
+            cont.Class = "photo-wide";
+            c4.With(cont);
+            c4.With(new Label {
+                Text = "contain 560x260 -- letterbox",
+                Class = "caption" });
+            row.With(c4);
+            Gallery.LayoutAuto(app, row, name, px, py,
+                             w - app.Scale(36), app.Scale(640));
+        } else if (name == "Image.photoscale") {
+            // 同一张 600x415 的照片缩到四个尺寸：缩小时对覆盖到的源
+            // 像素做面积平均（box filter），细线不丢列，边缘不闪烁。
+            // 各档宽高比与原图一致，差别只在像素密度。
+            List<string> photos = Gallery.PhotoSet();
+            string photo = photos[0];
+            Flex row = Flex.Wrapped().Gap(app.Scale(20));
+            List<string> boxes = new List<string>{
+                "scale-360", "scale-240", "scale-160", "scale-80" };
+            List<string> names = new List<string>{
+                "600x415 -> 360x249", "-> 240x166", "-> 160x111",
+                "-> 80x55" };
+            for (int i = 0; i < boxes.Count; i = i + 1) {
+                Image sim = new Image(photo, "", "fill");
+                sim.Class = boxes[i];
+                Panel cell = Panel.Column().Gap(app.Scale(6));
+                cell.With(sim);
+                cell.With(new Label { Text = names[i], Class = "caption" });
+                row.With(cell);
+            }
+            Gallery.LayoutAuto(app, row, name, px, py,
+                             w - app.Scale(36), app.Scale(320));
+        } else if (name == "Image.carousel") {
+            // naive-ui 轮播示例的那几张真实照片：Carousel 挂图片页
+            // （AddSlideView 内嵌 Image 组件），cover 铺满、自动播放、
+            // 滑动过渡；箭头与指示点是轮播自带的，这里只负责内嵌。
+            if (Gallery.photoCarAnim == null) {
+                Gallery.photoCarAnim = new CarouselAnim();
+            }
+            Carousel car = new Carousel();
+            List<string> carPhotos = Gallery.PhotoSet();
+            for (int i = 0; i < carPhotos.Count; i = i + 1) {
+                Image slide = new Image(carPhotos[i], "", "cover");
+                car.AddSlideView(slide);
+            }
+            car.autoplay = true;
+            car.intervalMs = 3500;
+            car.Animate(Gallery.photoCarAnim);
+            car.Class = "photo-car";
+            Panel col = Panel.Column().Gap(app.Scale(6));
+            col.With(car);
+            col.With(new Label {
+                Text = "Image slides via AddSlideView -- autoplay 3.5s, cover-fit, arrows/dots built in",
+                Class = "caption" });
+            Gallery.LayoutAuto(app, col, name, px, py,
+                             w - app.Scale(36), app.Scale(440));
+        } else if (name == "Image.grid") {
+            // 图片墙：示例照片按 cover 裁成统一比例的瓦片，
+            // Flex.Wrapped 在窄窗口里自动折行。
+            List<string> gridPhotos = Gallery.PhotoSet();
+            Flex row = Flex.Wrapped().Gap(app.Scale(14));
+            for (int i = 0; i < gridPhotos.Count; i = i + 1) {
+                Image tile = new Image(gridPhotos[i], "", "cover");
+                tile.Class = "photo-thumb";
+                row.With(tile);
+            }
+            Gallery.LayoutAuto(app, row, name, px, py,
+                             w - app.Scale(36), app.Scale(330));
         } else if (name == "Watermark.text") {
             // 水印盖在内容上：作为最后一个子节点 Grow() 铺满剩余空间，
             // 默认 -22° 倾斜、内置淡黑。多行文本整块一起倾斜。
+            // 水印自身测量为 0×0（覆盖层不参与排版），宿主必须自己
+            // 有高度——Prefer 定住文档框，Grow 的水印才有剩余空间可占。
             Panel doc = Panel.Column().Gap(app.Scale(8));
             doc.Class = "wm-doc";
+            doc.Prefer(0, app.Scale(170));
             doc.With(new Label { Text = "Q3 business review (draft)", Class = "title" });
             doc.With(new Label {
                 Text = "Numbers below are unaudited and still being reconciled.",
@@ -3509,9 +4075,10 @@ class Gallery {
                              w - app.Scale(36), app.Scale(170));
         } else if (name == "Watermark.style") {
             // 颜色 / 字号 / 角度 / 间距都归调用方：品牌色水平平铺 +
-            // 密间距，读起来更像表格底纹。
+            // 密间距，读起来更像表格底纹。宿主同样要自己定高度。
             Panel doc = Panel.Column().Gap(app.Scale(8));
             doc.Class = "wm-doc";
+            doc.Prefer(0, app.Scale(170));
             doc.With(new Label { Text = "Console export", Class = "title" });
             doc.With(new Label { Text = "Rows 1-4,012 of 41,038 -- environment: staging.", Class = "caption" });
             Watermark wm = new Watermark("STAGING");
@@ -3637,23 +4204,25 @@ class Gallery {
             int rh = t.heightMedium;
             Table.RenderRow(app, px, ty0 + rh, t0, widths, false);
             Table.RenderRow(app, px, ty0 + rh * 2, t1, widths, true);
-            Table.RenderRow(app, px, ty0 + rh * 3, t2, widths, false);
+            // 第三行以选中态示人：主色浅底 + 左缘强调条。
+            Table.RenderRowSel(app, px, ty0 + rh * 3, t2, widths, false, true);
             Table.RenderRow(app, px, ty0 + rh * 4, t3, widths, true);
         } else if (name == "PivotTable") {
-            // region(0) x year(1) with two measures: units(2) and revenue(3).
-            List<DataRow> rows = new List<DataRow>();
-            DataRow p0 = new DataRow();
-            p0.Push("North"); p0.Push("2025"); p0.Push("42"); p0.Push("120"); rows.Add(p0);
-            DataRow p1 = new DataRow();
-            p1.Push("North"); p1.Push("2026"); p1.Push("55"); p1.Push("160"); rows.Add(p1);
-            DataRow p2 = new DataRow();
-            p2.Push("South"); p2.Push("2025"); p2.Push("35"); p2.Push("90"); rows.Add(p2);
-            DataRow p3 = new DataRow();
-            p3.Push("South"); p3.Push("2026"); p3.Push("48"); p3.Push("140"); rows.Add(p3);
-            PivotConfig cfg = new PivotConfig(0, 1, 2, 0);
-            PivotConfig.AddValue(cfg, 2, 0, "Units");
-            PivotConfig.AddValue(cfg, 3, 0, "Rev");
-            PivotTable.Render(app, px, py - app.Scale(20), w - app.Scale(36), app.Scale(190), rows, cfg);
+            // region(0) x quarter(1), two measures: units (absolute) and
+            // revenue (% of grand total). Heat tinting + digit grouping on;
+            // the 6x4 grid overflows the box so the vertical scroll with its
+            // pinned total row is visible. Hover highlights, click selects.
+            if (Gallery.demoPivotState == null) {
+                Gallery.demoPivotState = new PivotState();
+            }
+            PivotConfig cfg = new PivotConfig(0, 1);
+            cfg.measures.Add(new PivotMeasure(2, 0, "Units", 0));
+            cfg.measures.Add(new PivotMeasure(3, 0, "Rev", 3));
+            cfg.groupDigits = true;
+            cfg.heat = true;
+            PivotTable.Render(app, px, py - app.Scale(20), w - app.Scale(36),
+                              app.Scale(290), Gallery.PivotDemoRows(), cfg,
+                              Gallery.demoPivotState);
         } else if (name == "TreeView") {
             // Multi-level tree with selection checkboxes: click a folder to
             // expand/collapse, click a row to select, click a box to (de)select
@@ -3728,6 +4297,38 @@ class Gallery {
             col.With(c);
             Gallery.LayoutAuto(app, col, name, px, py - app.Scale(20),
                              w - app.Scale(36), app.Scale(140));
+        } else if (name == "Calendar.basic") {
+            // month 整幅月历卡：每帧重建，选中值经宿主静态字段回灌，
+            // Change 里再写回 —— 点选跨帧保留，事件行给出所选日期。
+            Calendar cal = new Calendar();
+            if (Gallery.demoCalSel != null) { cal.SetDate(Gallery.demoCalSel); }
+            cal.AddMark(DateTime.Now(), Gallery.T("Standup", "站会"), 1);
+            cal.AddMark(DateTime.Now().AddDays(1), Gallery.T("Release", "发布"), 3);
+            cal.AddMark(DateTime.Now().AddDays(2),
+                        Gallery.T("Design review", "设计评审"), 2);
+            cal.OnChange(() => {
+                Gallery.demoCalSel = cal.GetDate();
+                Gallery.FiredN(app, name,
+                    "Change -> " + Gallery.demoCalSel.ToDateString());
+            });
+            cal.OnPanelChange(() => {
+                Gallery.FiredN(app, name, "PanelChange");
+            });
+            Panel calCol = Panel.Column().Gap(app.Scale(8));
+            calCol.With(cal);
+            Gallery.LayoutAuto(app, calCol, name, px, py - app.Scale(10),
+                               w - app.Scale(36), app.Scale(320));
+        } else if (name == "Calendar.panel") {
+            // panel 紧凑面板：单月网格 + 今天/清除 底部操作。
+            Calendar cal = new Calendar();
+            cal.Mode = "panel";
+            cal.OnChange(() => {
+                Gallery.FiredN(app, name, "Change");
+            });
+            Panel calCol = Panel.Column().Gap(app.Scale(8));
+            calCol.With(cal);
+            Gallery.LayoutAuto(app, calCol, name, px, py - app.Scale(10),
+                               w - app.Scale(36), app.Scale(290));
         } else if (name == "Carousel.basic") {
             Carousel car = new Carousel();
             car.AddSlide("First slide"); car.AddSlide("Second slide"); car.AddSlide("Third slide");
@@ -3755,6 +4356,50 @@ class Gallery {
             col.With(car);
             Gallery.LayoutAuto(app, col, name, px, py - app.Scale(10),
                              w - app.Scale(36), app.Scale(140));
+        } else if (name == "Marquee.basic") {
+            // 经典公告栏：默认 48 px/s，一个循环等于可视宽，文本完全
+            // 滚出左缘后从右缘重新进入。
+            if (Gallery.demoMarquee == null) {
+                Gallery.demoMarquee = new MarqueeAnim();
+            }
+            Marquee mq = new Marquee();
+            mq.Text = Gallery.T(
+                "Zan ships with a retained-mode GUI standard library -- this strip scrolls left at 48 px per second and loops seamlessly.",
+                "Zan 自带保留模式 GUI 标准库——这条横幅正以每秒 48 像素的速度向左滚动，并无缝循环。");
+            mq.Animate(Gallery.demoMarquee);
+            Panel col = Panel.Column().Gap(app.Scale(8));
+            col.With(mq);
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(10),
+                             w - app.Scale(36), app.Scale(40));
+        } else if (name == "Marquee.autofill") {
+            // 无缝流：短文本按 gap 间距重复铺满可视宽，永远没有空档；
+            // 调快到 80 px/s 展示 speed 的作用。
+            if (Gallery.demoMarqueeFill == null) {
+                Gallery.demoMarqueeFill = new MarqueeAnim();
+            }
+            Marquee mq = new Marquee("Zan · GUI · Marquee · ");
+            mq.AutoFill(true);
+            mq.Speed(80);
+            mq.Animate(Gallery.demoMarqueeFill);
+            Panel col = Panel.Column().Gap(app.Scale(8));
+            col.With(mq);
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(10),
+                             w - app.Scale(36), app.Scale(40));
+        } else if (name == "Marquee.notice") {
+            // 公告条：皮肤类 marquee.notice 给它淡主色底与圆角。
+            if (Gallery.demoMarqueeNotice == null) {
+                Gallery.demoMarqueeNotice = new MarqueeAnim();
+            }
+            Marquee mq = new Marquee();
+            mq.Class = "notice";
+            mq.Text = Gallery.T(
+                "System maintenance tonight 02:00 - 04:00. Services will be briefly unavailable.",
+                "系统将于今晚 02:00 - 04:00 维护，期间服务短暂不可用。");
+            mq.Animate(Gallery.demoMarqueeNotice);
+            Panel col = Panel.Column().Gap(app.Scale(8));
+            col.With(mq);
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(10),
+                             w - app.Scale(36), app.Scale(52));
         } else if (name == "Chart.line") {
             // ECharts line1 dataset in its plain form: five traffic sources
             // over one week with the legend shown. The related ECharts row
@@ -5914,24 +6559,93 @@ class Gallery {
             Gallery.LayoutAuto(app, col, name, px, py - app.Scale(12),
                              w - app.Scale(36), app.Scale(150));
         } else if (name == "Progress.line") {
-            Panel col = Panel.Column().Gap(app.Scale(10));
+            // Naive UI basic: one line bar per type, plus a bare bar with no
+            // indicator text.
+            Panel col = Panel.Column().Gap(app.Scale(12));
             col.With(new Progress(72, 0));
             col.With(new Progress(45, 2));
             col.With(new Progress(90, 3));
             col.With(new Progress(30, 4));
+            col.With(new Progress(60, 0).ShowText(false));
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(12),
+                             w - app.Scale(36), app.Scale(170));
+        } else if (name == "Progress.processing") {
+            // Naive UI processing state: Processing(true) rolls highlight
+            // stripes through the fill while the task runs.
+            Panel col = Panel.Column().Gap(app.Scale(12));
+            col.With(new Progress(65, 0).Processing(true));
+            col.With(new Progress(80, 3).Processing(true));
+            col.With(new Progress(35, 4).Processing(true));
+            col.With(new Progress(95, 5).Processing(true));
             Gallery.LayoutAuto(app, col, name, px, py - app.Scale(12),
                              w - app.Scale(36), app.Scale(150));
+        } else if (name == "Progress.height") {
+            // Naive UI custom height: StrokeWidth thickens the track in px.
+            Panel col = Panel.Column().Gap(app.Scale(12));
+            col.With(new Progress(72, 0).StrokeWidth(4));
+            col.With(new Progress(72, 0).StrokeWidth(10));
+            col.With(new Progress(72, 0).StrokeWidth(18));
+            col.With(new Progress(72, 0).StrokeWidth(26));
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(12),
+                             w - app.Scale(36), app.Scale(160));
+        } else if (name == "Progress.colors") {
+            // Naive UI custom colour: FillColor swaps the fill, RailColor the
+            // track (0 restores the skin).
+            Panel col = Panel.Column().Gap(app.Scale(12));
+            col.With(new Progress(66, 0)
+                .FillColor(Theme.Rgb(122, 90, 248))
+                .RailColor(Theme.Rgb(238, 236, 252)));
+            col.With(new Progress(80, 0)
+                .FillColor(Theme.Rgb(0, 150, 136))
+                .RailColor(Theme.Rgb(224, 242, 241)));
+            col.With(new Progress(45, 0)
+                .FillColor(Theme.Rgb(240, 98, 146))
+                .RailColor(Theme.Rgb(252, 228, 236)));
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(12),
+                             w - app.Scale(36), app.Scale(130));
+        } else if (name == "Progress.indicator") {
+            // Naive UI custom indicator: every {0} in the Format template
+            // becomes the percent number.
+            Panel col = Panel.Column().Gap(app.Scale(12));
+            col.With(new Progress(66, 0).Format("已完成 {0}%"));
+            col.With(new Progress(45, 4).Format("剩余 {0}%"));
+            col.With(new Progress(80, 2).Format("8 hours {0}%"));
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(12),
+                             w - app.Scale(36), app.Scale(130));
         } else if (name == "Progress.circle") {
-            Flex row = Flex.Wrapped().Gap(app.Scale(28));
-            Progress p1 = new Progress(72, 0);
-            p1.Ring();
-            Progress p2 = new Progress(90, 3);
-            p2.Ring();
-            Progress p3 = new Progress(45, 4);
-            p3.Ring();
-            row.With(p1); row.With(p2); row.With(p3);
+            // Naive UI circle: rings per type, a smaller Size(48) pair and one
+            // with the indicator text off.
+            Flex row = Flex.Wrapped().Gap(app.Scale(24));
+            row.With(new Progress(72, 0).Ring());
+            row.With(new Progress(90, 3).Ring());
+            row.With(new Progress(45, 4).Ring());
+            row.With(new Progress(60, 2).Ring().Size(48));
+            row.With(new Progress(30, 0).Ring().ShowText(false).Size(48));
             Gallery.LayoutAuto(app, row, name, px, py - app.Scale(6),
-                             w - app.Scale(36), app.Scale(90));
+                             w - app.Scale(36), app.Scale(110));
+        } else if (name == "Progress.dashboard") {
+            // Naive UI dashboard: a 270° arc starting at the lower-left with a
+            // gap at the bottom.
+            Flex row = Flex.Wrapped().Gap(app.Scale(24));
+            row.With(new Progress(45, 0).Dashboard());
+            row.With(new Progress(70, 3).Dashboard());
+            row.With(new Progress(60, 4).Dashboard());
+            row.With(new Progress(85, 2).Dashboard());
+            Gallery.LayoutAuto(app, row, name, px, py - app.Scale(6),
+                             w - app.Scale(36), app.Scale(120));
+        } else if (name == "Progress.multi") {
+            // Naive UI multiple circles: one ring per AddCircle(value, type),
+            // outermost first; the centre lists every ring in its own colour.
+            Flex row = Flex.Wrapped().Gap(app.Scale(32));
+            row.With(new Progress(0, 0).Multi()
+                .AddCircle(90, 3).AddCircle(60, 0).AddCircle(30, 2));
+            row.With(new Progress(0, 0).Multi()
+                .AddCircle(45, 4).AddCircle(75, 5));
+            row.With(new Progress(0, 0).Multi().Size(120)
+                .AddCircle(80, 2).AddCircle(55, 3).AddCircle(35, 4)
+                .AddCircle(15, 5));
+            Gallery.LayoutAuto(app, row, name, px, py - app.Scale(6),
+                             w - app.Scale(36), app.Scale(140));
         } else if (name == "Alert.types") {
             // Inline banners: one per role, the full type set side by side.
             int aw = w - app.Scale(36);
@@ -6798,6 +7512,88 @@ class Gallery {
             Gallery.LayoutAuto(app, Gallery.demoForm, name,
                 px, y + app.Scale(34), w - app.Scale(36),
                 app.Scale(280));
+        } else if (name == "Form.validate") {
+            // 整棵 FormGroup 是保留态（Main 里建一次）：输入焦点、
+            // 校验状态、按钮处理器都跨帧存活。
+            Gallery.LayoutAuto(app, Gallery.demoSignup, name,
+                px, y + app.Scale(34), w - app.Scale(36), app.Scale(470));
+        } else if (name == "Form.dependencies") {
+            // 联动是每帧按模型值同步的（gallery 的轮询写法）：radio 选
+            // 「到店自提」时地址行隐藏、门店行出现；两个 switch 分别
+            // 控制贺卡与抬头行。隐藏的行不参与 Validate。
+            bool express = Gallery.model.orderShip == 0;
+            FormRow addrRow = Gallery.demoOrder.Field("addr");
+            FormRow storeRow = Gallery.demoOrder.Field("store");
+            FormRow noteRow = Gallery.demoOrder.Field("giftNote");
+            FormRow titleRow = Gallery.demoOrder.Field("title");
+            if (addrRow != null) { addrRow.SetShown(express); }
+            if (storeRow != null) { storeRow.SetShown(!express); }
+            if (noteRow != null) { noteRow.SetShown(Gallery.model.orderGift); }
+            if (titleRow != null) { titleRow.SetShown(Gallery.model.orderInvoice); }
+            Gallery.LayoutAuto(app, Gallery.demoOrder, name,
+                px, y + app.Scale(34), w - app.Scale(36), app.Scale(520));
+        } else if (name == "Switch.states") {
+            // 每帧组装行是本文件 radio/checkbox 演示的同一写法：开关的
+            // 状态都在模型字段里，行本身只是当帧的排布。
+            Switch swTiny = new Switch();
+            swTiny.Class = "small";
+            swTiny.data = Gallery.model.toggle;
+            Switch swLarge = new Switch();
+            swLarge.Class = "large";
+            swLarge.data = Gallery.model.toggle;
+            Switch swLoading = new Switch();
+            swLoading.Loading = true;
+            Switch swOff = new Switch();
+            swOff.data = Gallery.model.toggleB;
+            Switch swDis = new Switch();
+            swDis.Disabled = true;
+            swDis.data = Gallery.model.toggle;
+            Flex row = Flex.Wrapped().Gap(app.Scale(16));
+            row.With(swTiny);
+            row.With(Gallery.demoSwitch);
+            row.With(swLarge);
+            row.With(swLoading);
+            row.With(swOff);
+            row.With(swDis);
+            Panel col = Panel.Column().Gap(app.Scale(6));
+            col.With(row);
+            col.With(new Label {
+                Text = Gallery.T("toggle is ", "当前状态：")
+                    + (Gallery.model.toggle
+                        ? Gallery.T("ON", "开") : Gallery.T("OFF", "关")),
+                Class = "secondary" });
+            Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34),
+                             w - app.Scale(36), app.Scale(110));
+        } else if (name == "Switch.master") {
+            // 总开关关 -> 整组 Disabled（沿树继承，置灰 + 不响应），
+            // 每帧从模型值同步，无需事件订阅。
+            Gallery.demoMasterGroup.Disabled = !Gallery.model.masterOn;
+            Panel head = Panel.Row().Gap(app.Scale(12));
+            head.With(Gallery.demoMaster);
+            head.With(new Label(Gallery.T("Power features", "高级功能")));
+            Panel col = Panel.Column().Gap(app.Scale(10));
+            col.With(head);
+            col.With(Gallery.demoMasterGroup);
+            Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34),
+                             w - app.Scale(36), app.Scale(140));
+        } else if (name == "Radio.dependent") {
+            // 依赖联动（禁用形态）：选中「其他」才允许编辑备注；字段
+            // 一直可见但 Disabled 随组值变化，与 Form.dependencies 的
+            // 整行显隐互补。备注框是保留态输入框，打字焦点不漂移。
+            Radio hearAd = new Radio(0, Gallery.T("From an ad", "广告"));
+            hearAd.data = Gallery.model.howhear;
+            Radio hearFriend = new Radio(1, Gallery.T("A friend", "朋友推荐"));
+            hearFriend.data = Gallery.model.howhear;
+            Radio hearOther = new Radio(2, Gallery.T("Other", "其他"));
+            hearOther.data = Gallery.model.howhear;
+            Gallery.demoHowhearNote.Disabled = Gallery.model.howhear != 2;
+            Panel col = Panel.Column().Gap(app.Scale(10));
+            col.With(new Label(Gallery.T("How did you hear about us?", "你从哪里了解到我们？")));
+            col.With(Panel.Row().Gap(app.Scale(18))
+                .With(hearAd).With(hearFriend).With(hearOther));
+            col.With(Gallery.demoHowhearNote);
+            Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34),
+                             w - app.Scale(36), app.Scale(130));
         } else if (name == "CheckboxGroup") {
             // 子项留在 Gallery.demoCbg 上，勾选状态跨帧保持。“全选”
             // 父项就是一个真的 Checkbox：三态由 Indeterminate 表达
@@ -6884,6 +7680,9 @@ class Gallery {
         if (name == "SelectBox.table") { return true; }
         if (name == "SelectBox.virtual") { return true; }
         if (name == "SelectBox.hover") { return true; }
+        if (name == "SelectBox.cascade") { return true; }
+        if (name == "SelectBox.tree") { return true; }
+        if (name == "SelectBox.group") { return true; }
         if (name == "DataTable") { return true; }
         if (name == "DataTable 1M") { return true; }
         if (name == "Compose") { return true; }
@@ -6956,6 +7755,28 @@ class Gallery {
                     + " · " + Gallery.demoHoverPick.OptionLabel(hv);
             }
             Gallery.Fired(app, name, hvText);
+        } else if (name == "SelectBox.cascade") {
+            // 级联：点中带子级的选项在右侧展开下一列；叶子收值后
+            // 触发器显示完整路径。
+            Gallery.demoCascade.Render(app, px, py, app.Scale(220));
+            Gallery.SelCaption(app, name, px, py + t.heightMedium + app.Scale(12),
+                Gallery.T("Cascade() · pick a leaf, columns expand to the right",
+                          "Cascade() · 选到叶子为止，逐列向右展开"));
+            Gallery.SelReport(app, name, Gallery.demoCascade);
+        } else if (name == "SelectBox.tree") {
+            // 树形：弹层内嵌真 TreeView，展开/折叠/滚动都是它自己的行为。
+            Gallery.demoTreePick.Render(app, px, py, app.Scale(240));
+            Gallery.SelCaption(app, name, px, py + t.heightMedium + app.Scale(12),
+                Gallery.T("Tree() · the popup embeds a real TreeView",
+                          "Tree() · 弹层内嵌真 TreeView"));
+            Gallery.SelReport(app, name, Gallery.demoTreePick);
+        } else if (name == "SelectBox.group") {
+            // 分组 + 禁用项：标题行只是小标题，禁用项置灰不可点。
+            Gallery.demoGroupPick.Render(app, px, py, app.Scale(220));
+            Gallery.SelCaption(app, name, px, py + t.heightMedium + app.Scale(12),
+                Gallery.T("AddGroup(title) + AddOption(label, true) · headers are not selectable, disabled items are grayed out",
+                          "AddGroup(title) + AddOption(label, true) · 标题行不可选，禁用项置灰"));
+            Gallery.SelReport(app, name, Gallery.demoGroupPick);
         } else if (name == "Select") {
             // Retained instance: owns its open state and defers the option list
             // to the framework overlay layer (draws above the code panel, one
@@ -7208,9 +8029,6 @@ class Gallery {
                 Gallery.photoIdx, Gallery.photoAnim);
             if (close) { Gallery.photosOpen.Set(false); }
         }
-
-        Layer.RenderToasts(app);
-        Layer.RenderNotifs(app);
     }
 
     /// Spawns a new floating Layer window, cascaded down-right from the last
@@ -7339,6 +8157,15 @@ class Gallery {
         Gallery.BuildLayout(list);
         Gallery.BuildEvents(list);
         Gallery.BuildHmi(list);
+        // 老式 desc/code 组件的「Basic usage」卡必须在这里（WidgetId.Mark
+        // 之前）就合成，不能留给 EffectiveDemos 在页面首帧中途补建：Demo
+        // 的 copyBtn 是 retained 控件，帧中途领到的是 ResetFrame 之后的
+        // 帧回收区间 id，下一帧起这个 id 会被重新发放给每帧重建的第一个
+        // 演示控件（Radio 页恰好是 new Radio）——点击卡片的 Copy 就会
+        // 同时触发那个控件的 Change。
+        for (int ci = 0; ci < list.Count; ci = ci + 1) {
+            Gallery.EffectiveDemos(list[ci]);
+        }
     }
 
     /// HMI / SCADA category: the Gui.Hmi widgets an operator screen is built
@@ -7735,16 +8562,44 @@ class Gallery {
             .AddProp("fields[].kind", "string", "-", "Any ControlFactory kind: Input / TextArea / SelectBox / Switch / Checkbox / Radio / Rate / Slider / Panel ...")
             .AddProp("fields[].label", "string", "\"\"", "Field caption. Controls that carry their own label (Checkbox, Radio) get it; the rest get a caption line above them.")
             .AddProp("fields[].span", "int", "24", "Column span out of 24 (12 = half row).")
-            .AddEvent("Read values", "control.data", "Keep references to built controls or bind paths; values land in your model like any retained widget.");
+            .AddEvent("Read values", "control.data", "Keep references to built controls or bind paths; values land in your model like any retained widget.")
+            .WithBasic(320)
+            .AddDemo(Gallery.T("Validation", "错误校验"),
+                Gallery.T("FormGroup turns every Add() into a field row (caption + control + error line) and Validate() runs each row's rules, painting the first failure inline: Input shows its own red border + message, everything else a `label.error` line under the field. Hidden or disabled rows are skipped, so dependent forms stay consistent. Here the submit button reports pass/fail on the status line below.",
+                    "FormGroup 把每个 Add() 包成字段行（标题 + 控件 + 错误行），Validate() 逐行跑规则并就地显示第一条错误：Input 用自带的红框 + 字段下消息，其余控件用字段下方的 `label.error`。被隐藏/禁用的行自动跳过，联动表单因此保持一致。这里「创建账号」按钮把校验结果报到表单底部的状态行。"),
+                "Form.validate", 470,
+                "FormGroup form = new FormGroup();\nform.Add(\"用户名\", nameInput)\n    .Rule(FormRule.Required(\"请输入用户名\"))\n    .Rule(FormRule.MinLen(2, \"至少 2 个字符\"));\nform.Add(\"邮箱\", mailInput)\n    .Rule(FormRule.Email(\"邮箱格式不对\"));\nform.Add(\"确认密码\", pwd2)\n    .Rule(FormRule.EqualsField(form.Field(\"pwd\"),\n                               \"两次输入不一致\"));\nform.Add(\"\", agreeCb)                  // Checkbox 用 Checked\n    .Rule(FormRule.Checked(\"请先勾选同意\"));\n\nsubmit.OnClick(() => {\n    if (form.Validate()) { Save(); }   // 失败行就地标红\n});\nform.Add(actionsRow);   // FormGroup 也是 Panel，按钮行直接 With",
+                "")
+            .AddDemo(Gallery.T("Dependent fields (show / hide / disable)", "依赖联动（显隐 / 禁用）"),
+                Gallery.T("One order form, three kinds of dependency: the delivery radios swap the address row for a pickup-store row (whole-row show/hide -- SetShown on the FormRow hides caption, control and error line together), the gift-wrap and invoice switches reveal their detail rows, and a hidden required row stops counting as an error, so 'store pickup' submits without an address. Same FormGroup, same Validate.",
+                    "一张配送单，三种依赖：配送方式 radio 把「收货地址」整行换成「自提门店」行（对 FormRow 做 SetShown，标题、控件、错误行一起走）；礼品包装 / 发票两个 switch 各自展开明细行；被隐藏的必填行不再算错误——选「到店自提」时没有地址也能提交。同一个 FormGroup、同一次 Validate。"),
+                "Form.dependencies", 520,
+                "FormGroup order = new FormGroup();\norder.Add(\"收货地址\", addr)\n    .Rule(FormRule.Required(\"请填写收货地址\"));\norder.Add(\"自提门店\", store);\norder.Add(\"需要发票\", invoiceSwitch);\norder.Add(\"发票抬头\", title)\n    .Rule(FormRule.Required(\"开发票需要抬头\"));\n\n// 联动：radio / switch 把选择写进模型，每帧按模型值显隐整行\nbool express = model.orderShip == 0;\norder.Field(\"addr\").SetShown(express);\norder.Field(\"store\").SetShown(!express);\norder.Field(\"title\").SetShown(model.orderInvoice);\n\nif (order.Validate()) { Place(); }   // 隐藏行自动跳过",
+                "")
+            .AddProp("Add(caption, ctl)", "FormRow", "-", "Add one field row (caption + control + error line); chain .Rule(...) on the returned row.")
+            .AddProp("FormRule", "static", "-", "Required / MinLen / MaxLen / Email / Range / Checked / EqualsField, or a custom `new FormRule(v => ...)`.")
+            .AddProp("Validate()", "bool", "-", "Run every rule; each failed row paints its first error inline. Hidden/disabled rows are skipped.")
+            .AddProp("Field(name)", "FormRow", "-", "Row lookup by the control's name. SetShown on the row hides caption + control + error together.")
+            .AddProp("Value(name)", "string", "-", "Read a field's value as text (BoolValue / IntValue for typed reads); ValueOf(ctl) is the per-control extractor.")
+            .AddProp("ClearErrors()", "void", "-", "Reset the error display; Valid() / FirstError() / ErrorCount() report state without painting.");
         Gallery.Add(list, "Data Entry", "Radio",
-            Gallery.T("Radio buttons: bind the same int model field to every radio via `.data`; each has a distinct option value.",
-                "单选按钮：通过 `.data` 把同一个 int 模型字段绑定到组内每个单选框；每个按钮对应不同的选项值。"),
-            "class Form { int choice; }\nForm form = new Form();\nRadio a = new Radio(0, \"Option A\");\nRadio b = new Radio(1, \"Option B\");\na.data = form.choice;   // bind the SAME field on every radio\nb.data = form.choice;\n// each frame:\na.Render(app, 40, 80, \"Option A\");\nb.Render(app, 40, 110, \"Option B\");")
-            .Json("{\n  \"type\": \"Column\",\n  \"name\": \"choice\",\n  \"gap\": 6,\n  \"children\": [\n    {\n      \"type\": \"Radio\",\n      \"label\": \"Option A\",\n      \"option\": 0,\n      \"bind\": \"form.choice\"\n    },\n    {\n      \"type\": \"Radio\",\n      \"label\": \"Option B\",\n      \"option\": 1,\n      \"bind\": \"form.choice\"\n    }\n  ]\n}")
+            Gallery.T("A radio GROUP is every option sharing one two-way `.data` binding: picking any option writes its value into the model field and fires Change. Sizes (small / large), semantic accents (info / success / warning / error) and the disabled state are just classes and the Disabled flag — a disabled radio never fires.",
+                "单选组 = 所有选项共享同一个 `.data` 双向绑定：点选任一项就把它的值写入模型字段并触发 Change。尺寸（small / large）、语义强调色（info / success / warning / error）与禁用态只是 class 和 Disabled 标志——禁用的单选框不会触发任何事件。"),
+            "class Form { int choice; int accent; }\nForm form = new Form();\n\n// a GROUP = every radio bound to the SAME field, one value each\nRadio a = new Radio(0, \"Option A\");\nRadio b = new Radio(1, \"Option B\");\nRadio c = new Radio(2, \"Option C\");\na.data = form.choice;\nb.data = form.choice;\nc.data = form.choice;\n\n// variants are classes; accents recolor the checked ring + dot\nRadio ok  = new Radio(0, \"Info\");   ok.Class  = \"info\";    ok.data  = form.accent;\nRadio bad = new Radio(1, \"Error\");  bad.Class = \"error\";   bad.data = form.accent;\n\n// disabled: drawn muted, never fires (click or keyboard)\nRadio na  = new Radio(0, \"N/A\");    na.Disabled = true;\n\n// each frame:\na.Render(app, 40, 80, \"Option A\");\nb.Render(app, 40, 110, \"Option B\");\nc.Render(app, 40, 140, \"Option C\");")
+            .Json("{\n  \"type\": \"Column\",\n  \"name\": \"choice\",\n  \"gap\": 6,\n  \"children\": [\n    {\n      \"type\": \"Radio\",\n      \"label\": \"Option A\",\n      \"option\": 0,\n      \"bind\": \"form.choice\"\n    },\n    {\n      \"type\": \"Radio\",\n      \"label\": \"Option B\",\n      \"option\": 1,\n      \"bind\": \"form.choice\"\n    },\n    {\n      \"type\": \"Radio\",\n      \"label\": \"Option C\",\n      \"option\": 2,\n      \"bind\": \"form.choice\"\n    },\n    {\n      \"type\": \"Radio\",\n      \"label\": \"Success\",\n      \"option\": 0,\n      \"class\": \"success\",\n      \"bind\": \"form.accent\"\n    }\n  ]\n}")
             .AddProp("label", "string", "\"\"", "Text drawn next to the dot.")
-            .AddProp("data", "Binding<int>", "-", "Shared selected value; bind the same model field on every radio.")
+            .AddProp("data", "Binding<int>", "-", "Shared selected value; bind the same model field on every radio of a group.")
             .AddProp("value", "int", "-", "This option's value (constructor).")
-            .AddEvent("Change", "() => void", "Fires when this radio is picked (Render handles the click).");
+            .AddProp("class", "string", "\"\"", "small / large rescale the ring and font; info / success / warning / error recolor the checked ring + dot.")
+            .AddProp("Disabled", "bool", "false", "Muted look, no hover, no click and no keyboard activation; never fires Change.")
+            .AddEvent("Change", "() => void", "Fires when this radio is picked and the group value moves (Render handles the click); disabled radios never fire.")
+            .WithBasic(235)
+            .AddDemo(Gallery.T("Dependent choices (disable)", "依赖联动（禁用）"),
+                Gallery.T("The dependency pattern on one field: the note input stays in place but is Disabled unless the group value is the \"Other\" option -- `note.Disabled = model.howhear != 2`, synced each frame from the bound model value, so no event ordering to reason about. For whole-row show/hide plus validation interplay see the Form page's dependent-fields demo.",
+                    "单个字段上的依赖形态：备注输入框位置不动，但只有组值选中「其他」才启用——`note.Disabled = model.howhear != 2`，每帧从绑定的模型值同步，不涉及事件时序。整行显隐 + 校验联动的完整形态见 Form 页的「依赖联动」演示。"),
+                "Radio.dependent", 130,
+                "Radio ad     = new Radio(0, \"广告\");     ad.data = model.howhear;\nRadio friend = new Radio(1, \"朋友推荐\"); friend.data = model.howhear;\nRadio other  = new Radio(2, \"其他\");     other.data = model.howhear;\n\n// 备注只在「其他」时可编辑（每帧同步，字段保留态）：\nnote.Disabled = model.howhear != 2;\nnote.data = model.otherNote;",
+                "");
         Gallery.Add(list, "Data Entry", "Switch",
             Gallery.T("A toggle switch. Bind its `.data` to a bool model field; Render dispatches its own click and keeps the field in sync both ways. Naive UI style props: size (small/medium/large → switch.small/.large skin classes), loading (dimmed track while a remote op is in flight), round (pill thumb by default; class-controlled in skin).",
                 "开关。将 `.data` 绑定到 bool 模型字段；Render 自行处理点击并双向同步该字段。Naive UI 风格 props：size (small/medium/large → 皮肤类 switch.small/.large)、loading (远端操作进行时变暗轨道)、round (默认胶囊形 thumb，类控制)。"),
@@ -7754,7 +8609,20 @@ class Gallery {
             .AddProp("size", "enum", "medium", "small/medium/large (Naive UI size).")
             .AddProp("loading", "bool", "false", "Dimmed track -- 'op in flight' state (Naive UI loading).")
             .AddProp("round", "bool", "true", "Pill-shaped thumb (Naive UI round).")
-            .AddEvent("Change", "() => void", "Fires when flipped (Render handles the click).");
+            .AddEvent("Change", "() => void", "Fires when flipped (Render handles the click).")
+            .WithBasic(60)
+            .AddDemo(Gallery.T("Sizes, loading & disabled", "尺寸 / 加载 / 禁用"),
+                Gallery.T("Every variant on one row: size is a class (small / medium / large), Loading dims the track while a remote op is in flight, and Disabled greys the switch out and ignores clicks. The interactive switches all bind `model.toggle`, so the caption below reads the model field back live.",
+                    "一行看全所有变体：尺寸是 class（small / medium / large），Loading 在远端操作进行时变暗轨道，Disabled 置灰且忽略点击。可交互的开关都绑定 `model.toggle`，下方文字实时回读模型字段。"),
+                "Switch.states", 110,
+                "Switch tiny   = new Switch { Size = \"small\" };\ntiny.data = model.on;\nSwitch big    = new Switch { Class = \"large\" };  // class 同样生效\nbig.data = model.on;\nSwitch busy   = new Switch { Loading = true };   // op in flight\nSwitch locked = new Switch();\nlocked.Disabled = true;\n\n// caption reads the model field every frame:\nstatus.Text = model.on ? \"ON\" : \"OFF\";",
+                "")
+            .AddDemo(Gallery.T("Master toggle (disable a group)", "总开关（禁用整组）"),
+                Gallery.T("One switch silences a whole section: Disabled inherits down the tree, so `group.Disabled = !model.masterOn` greys out and deafens every child switch at once -- no per-child bookkeeping. The gallery syncs it each frame from the model; a Change handler on the master works the same.",
+                    "一个开关管住一组：Disabled 沿树向下继承，`group.Disabled = !model.masterOn` 一句就把子开关全部置灰并失聪——不必逐个记录状态。gallery 这里每帧从模型值同步；订阅总开关的 Change 再赋值效果相同。"),
+                "Switch.master", 140,
+                "Panel group = Panel.Column().Gap(8);\ngroup.With(row(\"邮件提醒\", alertsSwitch));\ngroup.With(row(\"每周摘要\", digestSwitch));\n\n// 每帧：总开关的模型值禁用整组\nmaster.data = model.masterOn;\ngroup.Disabled = !model.masterOn;   // 沿树继承：子项一起置灰失效",
+                "");
         Gallery.Add(list, "Data Entry", "Slider",
             Gallery.T("A range slider. Construct with (min, max); bind `.data` to an int model field for two-way editing; Render(app, x, y, width) each frame. Naive UI style props: step (snap to N increments, default 0 = any value), keyboard arrow / Home / End stepping also honors step.",
                 "范围滑块。构造时给定 (min, max)；将 `.data` 绑定到 int 模型字段实现双向编辑；每帧调用 Render(app, x, y, width)。Naive UI 风格 props：step (吸附到 N 整数倍，默认 0 = 任意值)，键盘方向键/Home/End 步进也遵循 step。"),
@@ -7804,6 +8672,24 @@ class Gallery {
                     "指针下的选项一变，Hover 就触发，Hovered() 给出是哪一条。弹层的位置由框架决定（越界时会翻转），调用方靠触发器几何算不出来，只能由控件报出。"),
                 "SelectBox.hover", 110,
                 "SelectBox pick = new SelectBox(\"Hover the options\");\npick.AddOption(\"Alpha\");  pick.AddOption(\"Bravo\");\npick.Hover += () => {\n    int i = pick.Hovered();       // -1 when nothing is hovered\n    preview.Show(i);\n};\npick.Render(app, x, y, 220);",
+                "")
+            .AddDemo(Gallery.T("Cascade", "级联"),
+                Gallery.T("Cascade() turns the popup into linked columns: options built with AddBranch/AddChild expand one level per column, and picking a leaf writes the full path (\"浙江 / 杭州\") into the trigger. Text() returns that path; Selected() is the leaf's flat index.",
+                    "Cascade() 把弹层变成联动列：AddBranch/AddChild 建立的层级每列展开一级，选中叶子时触发器写入完整路径（\"浙江 / 杭州\"）。Text() 返回路径，Selected() 是叶子的平铺下标。"),
+                "SelectBox.cascade", 120,
+                "SelectBox area = new SelectBox(\"省 / 市\").Cascade();\nint zj = area.AddBranch(\"浙江省\");\nint hz = area.AddChild(zj, \"杭州市\");\narea.AddChild(hz, \"西湖区\");\narea.AddChild(hz, \"滨江区\");\nint nb = area.AddChild(zj, \"宁波市\");\narea.AddChild(nb, \"海曙区\");\narea.Render(app, x, y, 220);\n\nstring path = area.Text();   // \"浙江省 / 杭州市 / 西湖区\"",
+                "")
+            .AddDemo(Gallery.T("Tree select", "树形选择"),
+                Gallery.T("Tree() embeds a real TreeView in the popup: expand/collapse, scrolling and hover are all the TreeView's own behavior. Selecting a leaf writes its payload (or label) into the trigger.",
+                    "Tree() 在弹层内嵌一颗真 TreeView：展开/折叠、滚动、悬停全是 TreeView 自己的行为。选中叶节点时触发器写入它的 payload（未设则 label）。"),
+                "SelectBox.tree", 120,
+                "List<TreeNode> nodes = new List<TreeNode>{\n    TreeNode.Dir(\"src\", 0, true),\n    TreeNode.Dir(\"compiler\", 1, true),\n    TreeNode.File(\"lexer.c\", 2).WithPayload(\"src / compiler / lexer.c\"),\n    TreeNode.File(\"parser.c\", 2).WithPayload(\"src / compiler / parser.c\")\n};\nSelectBox pick = new SelectBox(\"Pick a file\")\n    .Tree().TreeNodes(nodes);\npick.Render(app, x, y, 240);\n\nstring path = pick.Text();   // payload of the picked leaf",
+                "")
+            .AddDemo(Gallery.T("Groups & disabled", "分组与禁用项"),
+                Gallery.T("AddGroup(title) inserts a non-selectable caption row; AddOption(label, true) adds a grayed-out option that ignores hover and clicks. While filtering, a group header survives only when something in its group still matches.",
+                    "AddGroup(title) 插入一条不可选的小标题行；AddOption(label, true) 加置灰项，不响应悬停与点击。键入筛选时，组内没有命中项的标题会随组一起隐藏。"),
+                "SelectBox.group", 120,
+                "SelectBox lang = new SelectBox(\"Pick a language\");\nlang.AddGroup(\"Popular\");\nlang.AddOption(\"Zan\");\nlang.AddOption(\"Rust\");\nlang.AddGroup(\"Legacy\");\nlang.AddOption(\"Pascal\");\nlang.AddOption(\"COBOL\", true);   // disabled\nlang.Render(app, x, y, 220);",
                 "")
             .AddProp("hint", "string", "\"\"", "Placeholder text.")
             .AddProp("clearable", "bool", "false", "Show a clear button (Clearable).")
@@ -7929,12 +8815,24 @@ class Gallery {
         im.AddDemo("Data URI", "A base64 data URI (PNM bytes synthesized in code) and an inline SVG data URI -- both decode in memory, nothing touches disk.", "Image.datauri", 76,
             "Image a = new Image(\"data:image/x-portable-anymap;base64,...\");\nImage b = new Image(\"data:image/svg+xml,<svg .../></svg>\");\nrow.With(a);\nrow.With(b);",
             "{\n  \"type\": \"Image\",\n  \"name\": \"logo\",\n  \"src\": \"data:image/png;base64,iVBORw0...\",\n  \"fit\": \"contain\"\n}");
-        im.AddDemo("Fit modes", "One source, four fits inside fixed 110x70 boxes: contain letterboxes, cover crops to fill, fill stretches, none draws at natural size centred in the box.", "Image.fit", 110,
-            "Image img = new Image(src, \"alt\", \"cover\");\nimg.RenderInside(app, new Rect(x, y, 110, 70));",
-            "{\n  \"type\": \"Image\",\n  \"name\": \"cover\",\n  \"src\": \"wallpaper.jpg\",\n  \"fit\": \"cover\"\n}");
-        im.AddDemo("URL", "An http(s) src fetches on a background thread and marshals the bytes back through App.Post; a loopback HttpServer serves /img.pnm so the demo runs offline. While loading and on failure the image shows its Alt placeholder.", "Image.url", 96,
-            "Image img = new Image(\"http://127.0.0.1:18747/img.pnm\", \"loading...\");\nimg.Loaded += () => app.RequestRedraw();\nimg.Error += () => app.RequestRedraw();",
+        im.AddDemo("Fit modes", "One source, four fits in 170x110 boxes laid out as Flex columns: contain letterboxes, cover crops to fill, fill stretches, none draws at natural size centred. Each caption is a plain Label -- the whole demo is a component tree, nothing is hand-drawn.", "Image.fit", 170,
+            "Image img = new Image(src, \"alt\", \"cover\");\nimg.Class = \"fit-box\";          // 170x110 from the skin\ncol.With(img);\ncol.With(new Label { Text = \"cover\", Class = \"caption\" });",
+            "{\n  \"type\": \"Image\",\n  \"name\": \"cover\",\n  \"src\": \"wallpaper.jpg\",\n  \"fit\": \"cover\",\n  \"class\": \"fit-box\"\n}");
+        im.AddDemo("URL", "An http(s) src fetches on a background thread and marshals the bytes back through App.Post; a loopback HttpServer serves /img.pnm and /photo.jpeg so the demo runs offline. The 64KB photo arrives through the byte-safe HttpClient path (binary bodies survive embedded NUL bytes) into a 560x300 contain box; while loading and on failure the image shows its Alt placeholder.", "Image.url", 430,
+            "Image img = new Image(\"http://127.0.0.1:18747/photo.jpeg\", \"loading...\", \"contain\");\nimg.Class = \"url-photo\";       // 560x300\nimg.Loaded += () => app.RequestRedraw();\nimg.Error += () => app.RequestRedraw();",
             "{\n  \"type\": \"Image\",\n  \"name\": \"remote\",\n  \"src\": \"https://example.com/logo.webp\",\n  \"alt\": \"Logo\",\n  \"fit\": \"contain\"\n}");
+        im.AddDemo("Photo fit", "A real 600x415 photo in generous aspect-mismatched boxes. Cover crops exactly one axis: a box wider than the photo crops top/bottom, a taller box crops the sides, and the crop rect stays centred. Contain letterboxes with a symmetric margin. Every cell is a Flex column of Image + caption Label.", "Image.photofit", 640,
+            "Image img = new Image(photoPath, \"\", \"cover\");\nimg.Class = \"photo-banner\";     // 560x300: crops top/bottom\nImage sq = new Image(photoPath, \"\", \"cover\");\nsq.Class = \"photo-card\";        // 300x220: crops sides",
+            "{\n  \"type\": \"Image\",\n  \"name\": \"banner\",\n  \"src\": \"assets/photo.jpg\",\n  \"fit\": \"cover\",\n  \"class\": \"photo-banner\"\n}");
+        im.AddDemo("Scale quality", "The same photo shrunk to four aspect-true sizes (360/240/160/80 wide). Shrinking averages every covered source pixel (box filter), so thin lines and text survive at thumbnail sizes -- the previous nearest sampler dropped whole source columns and shimmered on motion. Growing or 1:1 stays nearest on pixel centres.", "Image.photoscale", 320,
+            "Image img = new Image(photoPath, \"\", \"fill\");\nimg.Class = \"scale-360\";        // 600x415 -> 360x249\nImage tiny = new Image(photoPath, \"\", \"fill\");\ntiny.Class = \"scale-80\";         // -> 80x55, lines still intact",
+            "{\n  \"type\": \"Image\",\n  \"name\": \"thumb\",\n  \"src\": \"assets/photo.jpg\",\n  \"fit\": \"fill\",\n  \"class\": \"scale-360\"\n}");
+        im.AddDemo("Photo carousel", "A Carousel whose slides are real Image components embedded with AddSlideView: the carousel manages layout, clipping, the slide transition and the arrows/dots, while each slide keeps the full Image address semantics (path / data URI / URL / SVG) and cover-crops to the 640x360 frame. Autoplay advances every 3.5s, mirroring the naive-ui carousel demo.", "Image.carousel", 450,
+            "Carousel car = new Carousel();\ncar.AddSlideView(new Image(photo1, \"\", \"cover\"));\ncar.AddSlideView(new Image(photo2, \"\", \"cover\"));\ncar.autoplay = true;\ncar.intervalMs = 3500;\ncar.Animate(anim);\ncar.Class = \"photo-car\";         // 640x360",
+            "{\n  \"type\": \"Carousel\",\n  \"name\": \"photos\",\n  \"autoplay\": true,\n  \"intervalMs\": 3500,\n  \"class\": \"photo-car\",\n  \"children\": [\n    { \"type\": \"Image\", \"src\": \"carousel1.jpeg\", \"fit\": \"cover\" },\n    { \"type\": \"Image\", \"src\": \"carousel2.jpeg\", \"fit\": \"cover\" }\n  ]\n}");
+        im.AddDemo("Photo grid", "The four bundled photos cover-cropped into uniform 200x140 tiles on a wrapping Flex row -- narrow windows reflow instead of clipping.", "Image.grid", 340,
+            "Flex row = Flex.Wrapped().Gap(14);\nImage tile = new Image(photoPath, \"\", \"cover\");\ntile.Class = \"photo-thumb\";     // 200x140\nrow.With(tile);",
+            "[\n  { \"type\": \"Image\", \"src\": \"carousel1.jpeg\", \"fit\": \"cover\", \"class\": \"photo-thumb\" },\n  { \"type\": \"Image\", \"src\": \"carousel2.jpeg\", \"fit\": \"cover\", \"class\": \"photo-thumb\" }\n]");
         im.AddProp("src", "string", "-", "File path, http(s) URL, data URI or SVG.");
         im.AddProp("alt", "string", "-", "Placeholder / accessibility text.");
         im.AddProp("fit", "enum", "contain", "contain/cover/fill/none.");
@@ -7967,13 +8865,13 @@ class Gallery {
             .AddProp("label", "string", "-", "Descriptive caption.")
             .AddProp("value", "string", "-", "Highlighted value.");
         Gallery.Add(list, "Data Display", "Countdown",
-            Gallery.T("Count down from a duration to zero and fire Finish. Active pauses/resumes with the remainder preserved; Format picks the displayed units with tokens D, HH, mm, ss and S (tenths); anything else is literal text.",
-                "从一个时长倒数到零并触发 Finish。Active 暂停/恢复且剩余值不丢；Format 用令牌 D、HH、mm、ss、S（十分之一秒）选择显示位面，其余字符原样输出。"),
+            Gallery.T("Count down from a duration to zero and fire Finish. Active pauses/resumes with the remainder preserved; Format picks the displayed units with tokens D, HH, mm, ss, S (tenths) and SS (centiseconds, repainted at the 60 fps display cap, not 100 Hz); anything else is literal text.",
+                "从一个时长倒数到零并触发 Finish。Active 暂停/恢复且剩余值不丢；Format 用令牌 D、HH、mm、ss、S（十分之一秒）、SS（百分之一秒，按显示帧率 60fps 封顶重绘而非每秒 100 次）选择显示位面，其余字符原样输出。"),
             "Countdown cd = new Countdown(5 * 60000, \"mm:ss\");\ncd.Finish += () => { status.Text = \"Done\"; };\ncd.RenderInside(app, new Rect(40, 60, 140, 34));\n\n// drive it from code\ncd.Active = false;   // paused, remainder frozen\ncd.Active = true;    // resumes\ncd.Restart();        // re-arm to Duration")
             .Json("{\n  \"type\": \"Countdown\",\n  \"name\": \"sale\",\n  \"duration\": 90000,\n  \"active\": true,\n  \"format\": \"mm:ss\"\n}")
             .AddProp("duration", "int", "60000", "Total length in ms; changing it re-arms the countdown.")
             .AddProp("active", "bool", "true", "false pauses; true resumes.")
-            .AddProp("format", "string", "HH:mm:ss", "Tokens: D, HH, mm, ss, S; other chars are literal.")
+            .AddProp("format", "string", "HH:mm:ss", "Tokens: D, HH, mm, ss, S, SS; other chars are literal.")
             .AddEvent("Finish", "() => void", "The countdown reached zero (once per run).")
             .AddDemo(Gallery.T("Controls", "代码控制"),
                 Gallery.T("Restart() re-arms the timer; toggling Active pauses and resumes without losing the remainder. The status line is fed by Finish.",
@@ -8054,13 +8952,14 @@ class Gallery {
             .AddProp("summary", "DataColumn.summary / Derived", "0", "Per-column total; Derived columns compute from other aggregates.")
             .AddEvent("scroll", "state.scrollRow / scrollX", "Virtual row + horizontal column window.");
         Gallery.Add(list, "Data Display", "PivotTable",
-            Gallery.T("Cross-tab rows by row/column fields with one or more measures, plus row/column/grand totals.",
-                "按行/列字段交叉汇总，支持一个或多个度量值，并含行/列/总计。"),
-            "PivotConfig cfg = new PivotConfig(0, 1, 2, 0);\nPivotConfig.AddValue(cfg, 2, 0, \"Units\");\nPivotConfig.AddValue(cfg, 3, 0, \"Rev\");\nPivotTable.Render(app, 40, 60, 560, 280, rows, cfg);")
+            Gallery.T("Cross-tab with scrolling, pinned totals, hover cross-hair, click selection, % of row/col/grand measures, heat tinting and adaptive column widths.",
+                "交叉汇总：可滚动、合计固定、悬浮十字高亮、点击选中，度量可显示为占行/列/总计的百分比，支持热力着色与自适应列宽。"),
+            "PivotConfig cfg = new PivotConfig(0, 1);\ncfg.measures.Add(new PivotMeasure(2, 0, \"Units\", 0));\ncfg.measures.Add(new PivotMeasure(3, 0, \"Rev\", 3));  // % of grand\ncfg.groupDigits = true;\ncfg.heat = true;\nPivotState st = new PivotState();\nPivotTable.Render(app, 40, 60, 560, 280, rows, cfg, st);\nif (st.TakeClick()) { Use(st.clickRowKey, st.clickColKey); }")
             .Json("{\n  \"type\": \"PivotTable\",\n  \"name\": \"pivot\",\n  \"rows\": [\n    \"Region\"\n  ],\n  \"cols\": [\n    \"Quarter\"\n  ],\n  \"measure\": \"sales\"\n}")
-            .AddProp("cfg", "PivotConfig", "-", "Row/column/value fields + aggregation.")
+            .AddProp("cfg", "PivotConfig", "-", "Row/column fields, measures, rowSort, groupDigits, heat.")
+            .AddProp("st", "PivotState", "-", "Retained scroll/selection/click state (keep across frames).")
             .AddProp("rows", "List<DataRow>", "-", "Source rows to summarize.")
-            .AddEvent("AddValue", "static", "Add a measure (field + agg + title); measures render side by side under each column.");
+            .AddEvent("measures", "List<PivotMeasure>", "One or more measures: field + agg (0 sum/1 count/2 avg/3 max/4 min) + showAs (0 abs/1 %row/2 %col/3 %grand) + title.");
         Gallery.Add(list, "Data Display", "TreeView",
             Gallery.T("Expandable dir/file tree with selection checkboxes, get-selected APIs and a right-click action menu.",
                 "可展开的目录/文件树，带选择复选框、获取选中项 API 和右键操作菜单。"),
@@ -8080,6 +8979,24 @@ class Gallery {
             .AddProp("panels", "List<CollapsePanel>", "-", "Section title/body records.")
             .AddProp("open", "SignalInt", "-", "Index of the expanded section.")
             .AddEvent("Change", "HandleClick(...)", "Clicking a header sets the open index.");
+        Comp cal = new Comp("Data Display", "Calendar",
+            Gallery.T("A month calendar for picking dates and showing per-day agendas. Month mode is a full-bleed card: the header moves months (‹ title › plus a Today shortcut), the 7x6 grid fills the card and adjacent-month days render grayed but stay clickable; a day can carry up to two agenda marks (color dot + text, tone 0..4 = primary/info/success/warning/error). Panel mode is a compact month panel with Today/Clear footer actions. IsDateDisabled (a DateFilter delegate) dims and blocks days, mirroring naive-ui's is-date-disabled. Change fires when the picked value changes; PanelChange fires when the visible month moves.",
+                "月历组件：用于选日期和展示每日议程。month 模式是整幅月历卡：头部 ‹ 年月 › 加「今天」快捷键翻转月份，7×6 网格撑满卡片，相邻月日期灰显但仍可点选；每天最多挂两条议程（色点+文本，tone 0..4 = primary/info/success/warning/error）。panel 模式是紧凑单月面板，底部「今天/清除」操作。IsDateDisabled（DateFilter 委托）禁用并阻塞日期，对应 naive-ui 的 is-date-disabled。点选值变化触发 Change，可见月份变化触发 PanelChange。"), "");
+        cal.AddDemo("Basic", Gallery.T("Month mode with agendas: click a day to select it (grayed adjacent-month days work too); the header and 今天 move months and report PanelChange.",
+                "month 模式带议程：点任一天选中（灰显的相邻月日期也可以）；头部与「今天」翻月并上报 PanelChange。"), "Calendar.basic", 360,
+            "Calendar cal = new Calendar();\ncal.AddMark(DateTime.Now(), \"站会\", 1);\ncal.AddMark(DateTime.Now().AddDays(1), \"发布\", 3);\ncal.Change += () => { Save(cal.GetDate()); };\ncal.RenderInside(app, new Rect(20, 60, 560, 300));",
+            "{\n  \"type\": \"Calendar\",\n  \"name\": \"calendar\",\n  \"text\": \"2026-08-28\",\n  \"mode\": \"month\"\n}");
+        cal.AddDemo("Panel", Gallery.T("Compact panel mode: one month grid with Today/Clear footer actions, for toolbars and sidebars.",
+                "panel 紧凑模式：单月网格加「今天/清除」底部操作，适合工具栏与侧栏。"), "Calendar.panel", 320,
+            "Calendar cal = new Calendar();\ncal.Mode = \"panel\";\ncal.Change += () => { Save(cal.GetDate()); };\ncal.RenderInside(app, new Rect(20, 60, 260, 290));",
+            "{\n  \"type\": \"Calendar\",\n  \"name\": \"calendar\",\n  \"mode\": \"panel\"\n}");
+        cal.AddProp("text", "string", "today", "Selected date, YYYY-MM-DD; empty = none (GetExtra/SetProp).");
+        cal.AddProp("Mode", "Binding<string>", "\"month\"", "month | panel.");
+        cal.AddProp("marks", "List<CalendarMark>", "-", "Per-day agendas: AddMark(day, text, tone 0..4).");
+        cal.AddProp("IsDateDisabled", "DateFilter", "-", "Delegate that disables days (naive-ui is-date-disabled).");
+        cal.AddEvent("Change", "cal.Change += h", "Fires when the picked value changes.");
+        cal.AddEvent("PanelChange", "cal.PanelChange += h", "Fires when the visible month moves.");
+        list.Add(cal);
         Comp car = new Comp("Data Display", "Carousel",
             "A slide panel with prev/next arrows and indicator dots, driven by a two-way active index. Carousel.Of(slides, idx) swaps slides instantly; .Animate(anim) slides the outgoing/incoming panels horizontally via a host-owned CarouselAnim. Arrows and dots are wired inside the control. For an immersive full-screen viewer, wrap it in Layer.RenderPhotos.", "");
         car.AddDemo("Basic", "Carousel.Of(slides, idx).RenderInside(app, rect) draws the current slide with arrows + dots; the index jumps instantly.", "Carousel.basic", 230,
@@ -8093,6 +9010,20 @@ class Gallery {
         car.AddProp("anim", "CarouselAnim", "-", "Caller-owned slide-transition state (RenderAnimated).");
         car.AddEvent("Change", "HandleClick(...)", "Arrows / dots advance the active slide.");
         list.Add(car);
+        Comp mq = new Comp("Data Display", "Marquee",
+            Gallery.T("A horizontal ticker: the text scrolls left at a constant speed (speed, in px/s, default 48) and loops seamlessly. With autoFill the content repeats to fill the width -- short text never shows a blank gap; otherwise one loop equals the strip width and the text re-enters from the right after scrolling fully out. The phase advances by wall time, so the speed is frame-rate independent; when the host rebuilds the control tree every frame, pass a host-owned MarqueeAnim via Animate() (same pattern as Carousel.Animate).",
+                "水平跑马灯：文本以恒定速度向左滚动（speed，像素/秒，默认 48）并无缝循环。autoFill 时内容自动重复铺满可视宽，短文本也不会出现空档；否则一个循环等于可视宽，文本完全滚出后从右侧重新进入。相位按真实时间推进，速度与帧率无关；每帧重建控件树的宿主请通过 Animate() 传入一个宿主持有的 MarqueeAnim（与 Carousel.Animate 同一套路）。"), "");
+        mq.AddDemo("Basic", "A plain ticker at the default 48 px/s. Animate(hostAnim) keeps the phase alive across per-frame rebuilds of the control.", "Marquee.basic", 60,
+            "Marquee mq = new Marquee();\nmq.Text = vm.notice;      // binding, re-read every frame\nmq.Animate(hostAnim);     // survives per-frame rebuilds\nparent.Add(mq);", "{\n  \"type\": \"Marquee\",\n  \"name\": \"ticker\",\n  \"text\": \"Rolling notice text\",\n  \"speed\": 48\n}");
+        mq.AddDemo("Auto fill", "Short text repeats to fill the width (spacing = the style's gap) and the strip never blanks. Speed(80) doubles the default pace.", "Marquee.autofill", 60,
+            "Marquee mq = new Marquee(\"Zan · GUI · Marquee · \")\n    .AutoFill(true).Speed(80);\nparent.Add(mq);", "{\n  \"type\": \"Marquee\",\n  \"name\": \"fill\",\n  \"text\": \"Zan · GUI · Marquee · \",\n  \"speed\": 80,\n  \"autoFill\": true\n}");
+        mq.AddDemo("Notice bar", "Skin classes restyle the strip: marquee.notice paints a soft primary bar with rounded corners (set height in the skin or via Prefer).", "Marquee.notice", 70,
+            "Marquee mq = new Marquee(\"System maintenance tonight 02:00 - 04:00\");\nmq.Class = \"notice\";\nparent.Add(mq);", "{\n  \"type\": \"Marquee\",\n  \"name\": \"notice\",\n  \"text\": \"System maintenance tonight 02:00 - 04:00\",\n  \"class\": \"notice\"\n}");
+        mq.AddProp("Text", "Binding<string>", "-", "Scrolling text (re-read every frame).");
+        mq.AddProp("speed", "int", "48", "Scroll speed in pixels per second (Naive UI speed).");
+        mq.AddProp("autoFill", "bool", "false", "Repeat the content to fill the width (Naive UI auto-fill).");
+        mq.AddProp("anim", "MarqueeAnim", "-", "Caller-owned scroll phase (Animate) for per-frame rebuilds.");
+        list.Add(mq);
         Comp ch = new Comp("Data Display", "Chart",
             Gallery.T("Declarative charts: one ChartOption carries the title, axes and every series (ChartSeries typed factories like ChartSeries.Line/Bar/StackedLine, or OfCandles/OfBubbles/OfBoxes/OfErrors/OfPoints for the multi-value families), then ChartView.Of(option).Render(app, x, y, w, h). The option model follows familiar chart conventions while retaining Zan-specific APIs. Data can be parsed from JSON (ChartOption.FromJson) so the same chart is code- or data-driven. ChartView plays a grow-in intro, draws gradient/smoothed series and an optional hover crosshair + value tooltip. Beyond the cartesian/pie basics it covers gauge, step line, stacked area, stacked line, candlestick (OHLC), bubble, box plot, error bars, polar/radar, funnel/pyramid, rose, waterfall, treemap, sunburst and sankey. Dense series decimate to plot width to stay fast on huge data.",
                 "声明式图表：一个 ChartOption 携带标题、坐标轴和全部系列（ChartSeries 类型化工厂，如 Line/Bar/StackedLine，或多值家族的 OfCandles/OfBubbles/OfBoxes/OfErrors/OfPoints），然后调用 ChartView.Of(option).Render(app, x, y, w, h)。选项模型采用常见图表约定，同时保留 Zan 自身 API。数据可从 JSON 解析（ChartOption.FromJson），同一图表既可代码驱动也可数据驱动。ChartView 播放生长入场动画、绘制渐变/平滑系列和可选的悬停十字线与数值提示。除笛卡尔/饼图基础外，还覆盖仪表盘、阶梯折线、堆积面积、堆积折线、K 线（OHLC）、气泡、箱线、误差棒、极坐标/雷达、漏斗/金字塔、玫瑰、瀑布、矩形式树图、旭日图和桑基图。密集系列按绘图宽度降采样。"), "");
@@ -8405,15 +9336,50 @@ class Gallery {
         al.AddEvent("Layer.Notify(text, type)", "void", Gallery.T("Push a top-right notification card.", "推送一张右上角通知卡。"));
         list.Add(al);
         Comp pr = new Comp("Feedback", "Progress",
-            "Progress indicators. A line bar shows a labelled percentage; a ring gauge shows the same value as a circle. type selects the colour (0 default, 2 info, 3 success, 4 warning).", "");
-        pr.AddDemo("Line", "A Progress draws a labelled horizontal bar; the label is the progress::label part.", "Progress.line", 210,
-            "new Progress(72, 0).RenderAt(app, 40, 40, 300);\nnew Progress(45, 2).RenderAt(app, 40, 70, 300);", "{\n  \"type\": \"Progress\",\n  \"name\": \"progress\",\n  \"variant\": \"line\",\n  \"bind\": \"model.percent\",\n  \"showText\": true\n}");
-        pr.AddDemo("Circle", "A Progress switched to Ring() draws a ring gauge.", "Progress.circle", 150,
-            "new Progress(72, 0).Ring().RenderAt(app, 56, 36);\nnew Progress(90, 3).Ring().RenderAt(app, 156, 36);", "{\n  \"type\": \"Progress\",\n  \"name\": \"progress\",\n  \"variant\": \"circle\",\n  \"bind\": \"model.percent\",\n  \"showText\": true\n}");
-        pr.AddProp("w", "int", "-", "Bar width in px (line).");
-        pr.AddProp("radius", "int", "-", "Ring radius in px (circle).");
-        pr.AddProp("percent", "int", "-", "Filled fraction, 0-100.");
-        pr.AddProp("type", "int", "0", "Colour: 0 default, 2 info, 3 success, 4 warning.");
+            Gallery.T("Progress indicators in four shapes: a line bar, a ring gauge, multiple stacked rings and a 270-degree dashboard arc. type picks the colour (0/1 default, 2 info, 3 success, 4 warning, 5 error). Ring()/Multi()/Dashboard() switch the shape; Processing() rolls animated stripes over the fill while the task runs; FillColor()/RailColor() override the skin colours; Format() rewrites the percent label from a {0} template; Size() sets the ring diameter; StrokeWidth() sets the track height or ring thickness.",
+                "四种形状的进度指示器：线性条、圆环、多圆环和 270 度仪表盘弧。type 选颜色（0/1 default，2 info，3 success，4 warning，5 error）。Ring()/Multi()/Dashboard() 切换形状；Processing() 在任务执行期间于填充上叠加滚动斜纹；FillColor()/RailColor() 覆盖皮肤颜色；Format() 用 {0} 模板重写百分比文本；Size() 设圆环直径；StrokeWidth() 设轨道高度或圆环厚度。"), "");
+        pr.AddDemo("Line", Gallery.T(
+            "A Progress draws a labelled horizontal bar; the label is the progress::label part. ShowText(false) hides it.",
+            "Progress 画一条带百分比的横条，标签由 progress::label 部件着色；ShowText(false) 隐藏标签。"), "Progress.line", 200,
+            "new Progress(72, 0).RenderAt(app, 40, 40, 300);\nnew Progress(45, 2).RenderAt(app, 40, 70, 300);", "{\n  \"type\": \"Progress\",\n  \"name\": \"progress\",\n  \"percent\": 72,\n  \"shape\": \"bar\",\n  \"showIndicator\": true\n}");
+        pr.AddDemo("Processing", Gallery.T(
+            "Processing(true) rolls highlight stripes through the fill while the task runs; turn it off once the value reaches 100.",
+            "Processing(true) 在任务执行期间让填充滚动高光斜纹；到 100 后关掉即可。"), "Progress.processing", 150,
+            "new Progress(65, 0).Processing(true);\nnew Progress(80, 3).Processing(true);", "{\n  \"type\": \"Progress\",\n  \"name\": \"progress\",\n  \"percent\": 65,\n  \"processing\": true\n}");
+        pr.AddDemo("Height", Gallery.T(
+            "StrokeWidth sets the track height in px (Naive UI stroke-width); 0 uses the skin default.",
+            "StrokeWidth 以像素设轨道高度（Naive UI stroke-width）；0 用皮肤默认。"), "Progress.height", 160,
+            "new Progress(72, 0).StrokeWidth(10);\nnew Progress(72, 0).StrokeWidth(20);", "{\n  \"type\": \"Progress\",\n  \"name\": \"progress\",\n  \"percent\": 72,\n  \"strokeWidth\": 10\n}");
+        pr.AddDemo("Colors", Gallery.T(
+            "FillColor / RailColor override the skin colours (Naive UI color / rail-color); 0 restores the theme.",
+            "FillColor / RailColor 覆盖皮肤颜色（Naive UI color / rail-color）；0 恢复主题。"), "Progress.colors", 130,
+            "new Progress(66, 0).FillColor(Theme.Rgb(122, 90, 248));", "{\n  \"type\": \"Progress\",\n  \"name\": \"progress\",\n  \"percent\": 66,\n  \"color\": \"#FF7A5AF8\",\n  \"railColor\": \"#FFEEECFC\"\n}");
+        pr.AddDemo("Indicator", Gallery.T(
+            "Format rewrites the percent label; every {0} in the template becomes the number (Naive UI indicator).",
+            "Format 重写百分比标签，模板里的每个 {0} 都会替换成数字（Naive UI indicator）。"), "Progress.indicator", 130,
+            "new Progress(66, 0).Format(\"已完成 {0}%\");", "{\n  \"type\": \"Progress\",\n  \"name\": \"progress\",\n  \"percent\": 66,\n  \"format\": \"已完成 {0}%\"\n}");
+        pr.AddDemo("Circle", Gallery.T(
+            "A Progress switched to Ring() draws a ring gauge; Size() sets the diameter in px.",
+            "Progress 切到 Ring() 画圆环仪表；Size() 以像素设直径。"), "Progress.circle", 120,
+            "new Progress(72, 0).Ring().RenderAt(app, 56, 36);\nnew Progress(90, 3).Ring().RenderAt(app, 156, 36);", "{\n  \"type\": \"Progress\",\n  \"name\": \"progress\",\n  \"percent\": 72,\n  \"shape\": \"ring\",\n  \"ringSize\": 72\n}");
+        pr.AddDemo("Dashboard", Gallery.T(
+            "Dashboard() draws a 270-degree gauge: the arc starts at the lower-left and leaves a gap at the bottom.",
+            "Dashboard() 画 270 度仪表盘：弧从左下开始，底部留缺口。"), "Progress.dashboard", 130,
+            "new Progress(45, 0).Dashboard().RenderAt(app, 40, 20, 96, 96);", "{\n  \"type\": \"Progress\",\n  \"name\": \"progress\",\n  \"percent\": 45,\n  \"shape\": \"dashboard\"\n}");
+        pr.AddDemo("Multiple circles", Gallery.T(
+            "Multi() stacks one ring per AddCircle(value, type), outermost first; the centre lists every ring's percent in that ring's colour.",
+            "Multi() 为每个 AddCircle(值, 类型) 画一圈，从最外层开始；中心按各环颜色逐行列出百分比。"), "Progress.multi", 150,
+            "new Progress(0, 0).Multi().AddCircle(90, 3).AddCircle(60, 0).AddCircle(30, 2);", "{\n  \"type\": \"Progress\",\n  \"name\": \"progress\",\n  \"shape\": \"multi\",\n  \"circles\": \"90:3,60:0,30:2\"\n}");
+        pr.AddProp("percent", "int", "0", "Filled fraction, 0-100 (clamped).");
+        pr.AddProp("type", "int", "0", "Colour: 0/1 default, 2 info, 3 success, 4 warning, 5 error.");
+        pr.AddProp("shape", "int", "0", "0 line, 1 ring (Ring()), 2 multi (Multi()), 3 dashboard (Dashboard()).");
+        pr.AddProp("showIndicator", "bool", "true", Gallery.T("Draw the percent label (show-indicator).", "绘制百分比文本（show-indicator）。"));
+        pr.AddProp("strokeWidth", "int", "0", Gallery.T("Track height / ring thickness in px (stroke-width); 0 = skin.", "轨道高度 / 圆环厚度（像素，stroke-width）；0 用皮肤。"));
+        pr.AddProp("processing", "bool", "false", Gallery.T("Roll animated stripes over the fill (processing).", "填充上叠加滚动斜纹（processing）。"));
+        pr.AddProp("color", "int", "0", Gallery.T("Custom fill colour; 0 = skin.", "自定义填充色；0 用皮肤。"));
+        pr.AddProp("railColor", "int", "0", Gallery.T("Custom track colour; 0 = skin.", "自定义轨道色；0 用皮肤。"));
+        pr.AddProp("format", "string", "-", Gallery.T("Indicator template; {0} becomes the percent.", "指示文本模板；{0} 替换为百分比。"));
+        pr.AddProp("ringSize", "int", "0", Gallery.T("Ring diameter in px; 0 = default (72).", "圆环直径（像素）；0 用默认（72）。"));
         list.Add(pr);
         Gallery.Add(list, "Feedback", "Result",
             Gallery.T("A centered status block (icon + title + description) for full-page outcomes. status: 0 info, 1 success, 2 warning, 3 error. As a retained Control it needs no coordinates.",

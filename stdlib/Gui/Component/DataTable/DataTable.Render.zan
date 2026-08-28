@@ -1174,6 +1174,13 @@ partial class DataTable {
         int edW = 0;
         int edH = 0;
         bool edVis = false;
+        // 键盘/鼠标光标所在的焦点单元格（Excel 式描边），
+        // 同样在循环中捕获、行绘制完成后统一描边。
+        int fcX = 0;
+        int fcY = 0;
+        int fcW = 0;
+        int fcH = 0;
+        bool fcVis = false;
 
         int r = 0;
         while (r < visRows && (start + r) < total) {
@@ -1273,6 +1280,9 @@ partial class DataTable {
             int rowBg = DataTable.RowBackground(st, src, rowIdx, stripeBg,
                                                 sRowSel.BgOr(0), sRowHover.BgOr(0), rSel, rHover);
             c.FillRect(x + 1, ry, viewW - 2, rowH, rowBg);
+            // 选中行左缘的强调条：与 VirtualList / 树的选中条
+            // 同一语言，给"这一行被选中"一个不依赖底色的信号。
+            if (rSel) { c.FillRect(x + 1, ry, app.Scale(3), rowH, sAccent.BgOr(0)); }
 
             int cx2 = x;
             if (st.showRowNum) {
@@ -1380,6 +1390,9 @@ partial class DataTable {
                     if (st.editing && rowIdx == st.editRow && cc == st.editCol) {
                         edX = ccl; edY = ry; edW = cw; edH = rowH; edVis = true;
                     }
+                    if (rowIdx == st.hitRow && cc == st.hitCol) {
+                        fcX = ccl; fcY = ry; fcW = cw; fcH = rowH; fcVis = true;
+                    }
                     // 自定义绘制器完全接管单元格。将画布裁剪到
                     // 自身的矩形内，行为异常的绘制器不会溢出到
                     // 相邻单元格或表格之外。
@@ -1413,6 +1426,21 @@ partial class DataTable {
 
             c.FillRect(x + 1, ry + rowH - 1, viewW - 2, 1, gridColor);
             r = r + 1;
+        }
+
+        // ---------------- 焦点单元格描边 ----------------
+        // Excel/DevExpress 式：单元格光标所在处一圈 1px 强调线，
+        // 让键盘导航有落点。编辑器打开时不画——编辑器自带
+        // 更粗的焦点边。行选择模式（hitCol = -1）没有光标单元格。
+        if (fcVis && !st.editing) {
+            int fvi = DataTable.VisPos(frameColumns, st.hitCol);
+            if (fvi >= 0) {
+                FrameColumn focusColumn = frameColumns[fvi];
+                DataTable.PushBandClip(c, focusColumn.band, firstDataX, bandX, bandW,
+                                       rightX, pinnedW, pinnedRW, fcY, fcH, clipRight);
+                c.DrawRect(fcX, fcY, fcW, fcH, sAccent.BgOr(0), 1);
+                c.PopClip();
+            }
         }
 
         // ---------------- 新行占位符 ----------------
@@ -1535,6 +1563,44 @@ partial class DataTable {
                 else { pci = pci - 1; }
             }
         }
+
+        // ---------------- 截断单元格的悬停提示 ----------------
+        // 商业网格的惯例：文本放不下被截断的单元格，悬停
+        // 片刻后弹出完整内容。只在纯文本/链接/标签单元格上
+        // 生效；编辑器、菜单、拖选进行中一律不打扰。指针停稳
+        // (DefaultDelayMs) 前持续请求该区域重绘，让计时器有帧可用；
+        // 计时器在指针离开或换格时重置。
+        if (ptrOi >= 0 && ptrCol >= 0 && DataTable.DispKind(st, ptrOi) == 0
+            && !st.editing && !st.ctxOpen && !st.hdrCtxOpen && !st.chartOpen
+            && st.openMenu < 0 && !st.rangeDrag && !st.rowSelDrag && st.dragRow < 0) {
+            DataColumn tipCol = cols[ptrCol];
+            if (!tipCol.isBool
+                && (tipCol.cellType == 0 || tipCol.cellType == 1 || tipCol.cellType == 2)) {
+                string tipFull = src.CellText(DataTable.DispRowOf(st, ptrOi), ptrCol);
+                if (tipCol.cellType != 2) { tipFull = DataTable.FormatCell(tipCol, tipFull); }
+                int tipW = st.dispW[ptrCol];
+                if (Canvas.MeasureText(tipFull, fs) > tipW - t.paddingSmall * 2) {
+                    int tipNowMs = Window.GetTickMs();
+                    if (st.tipOi != ptrOi || st.tipCol != ptrCol) {
+                        st.tipOi = ptrOi;
+                        st.tipCol = ptrCol;
+                        st.tipSinceMs = tipNowMs;
+                    }
+                    int tvi = DataTable.VisPos(frameColumns, ptrCol);
+                    int tipRy = bodyTop + (ptrOi - start) * rowH;
+                    if (tipNowMs - st.tipSinceMs < Tooltip.DefaultDelayMs()) {
+                        if (tvi >= 0) {
+                            app.RequestAnimationFrameIn(0, frameColumns[tvi].x, tipRy,
+                                                        tipW, rowH);
+                        }
+                    } else if (tvi >= 0) {
+                        Tooltip.RequestBox(app, frameColumns[tvi].x, tipRy, tipW, rowH,
+                                           tipFull, Tooltip.Bottom(), app.Scale(280));
+                    }
+                } else { st.tipOi = -1; }
+            } else { st.tipOi = -1; }
+        } else { st.tipOi = -1; }
+
         int ek = app.EventKind();
         int eb = app.window.EventButton();
         int emods = app.window.EventMods();
@@ -1770,6 +1836,7 @@ partial class DataTable {
                     st.rangeC0 = ptrCol;
                     st.rangeC1 = ptrCol;
                     st.rangeDrag = true;
+                    st.rangeSelTouched.Clear();
                     st.selAnchor = ptrOi;
                     st.hitOrder = ptrOi;
                     st.hitRow = DataTable.DispRowOf(st, ptrOi);
@@ -1793,6 +1860,9 @@ partial class DataTable {
             if (st.rangeDrag && ptrOi >= 0) {
                 st.rangeR1 = ptrOi;
                 if (ptrCol >= 0) { st.rangeC1 = ptrCol; }
+                // 选择列表格：高亮矩形覆盖到哪几行，
+                // 勾选框就勾到哪几行（范围缩小时实时退勾）。
+                DataTable.SyncRangeChecks(st);
                 app.RequestRedraw();
             }
             if (st.dragRow >= 0) {
@@ -1804,7 +1874,7 @@ partial class DataTable {
 
         // 左键释放
         if (ek == 3 && eb == 0) {
-            if (st.rangeDrag) { st.rangeDrag = false; app.RequestRedraw(); }
+            if (st.rangeDrag) { st.rangeDrag = false; st.rangeSelTouched.Clear(); app.RequestRedraw(); }
             if (st.rowSelDrag) { st.rowSelDrag = false; app.RequestRedraw(); }
             if (st.dragRow >= 0) {
                 if (st.groupCols.Count == 0 && st.dragMoved && ptrOi >= 0 && ptrOi != st.dragRow

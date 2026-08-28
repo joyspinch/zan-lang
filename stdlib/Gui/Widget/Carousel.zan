@@ -28,6 +28,44 @@ class CarouselAnim {
 ///     Carousel car = Carousel.Of(slides, idx);
 ///     car.Animate(Gallery.carAnim);
 ///     car.RenderInside(app, rect);
+/// 轮播的覆盖层：箭头与指示点必须浮在控件页（图片页）之上，而
+/// RenderTree 先画父节点自己的 OnPaint 再画子树，父级里画的部件
+/// 会被图片页盖住。覆盖层作为最后一个子控件参与子树绘制，天然
+/// 位于所有页面之上；箭头/指示点的命中登记与点击处理也在这里做，
+/// 保持"同一帧内先登记后派发"的次序。
+class CarouselChrome : Control {
+    Carousel owner;
+
+    void InitChrome(Carousel c) {
+        this.InitControl("carousel-chrome", 0);
+        owner = c;
+        wiresOwnEvents = true;
+    }
+
+    CarouselChrome(Carousel c) { InitChrome(c); }
+
+    override void OnPaint(App app) {
+        if (owner == null) { return; }
+        owner.EnsureIds();
+        int count = owner.slides.Count;
+        if (count == 0) { return; }
+        int cur = owner.model.Get();
+        if (cur < 0) { cur = 0; }
+        if (cur >= count) { cur = count - 1; }
+        owner.PaintChrome(app, count, cur);
+        if (this.IsDisabled() || app.EventKind() != 3) { return; }
+        int hit = app.ClickTarget();
+        if (hit == owner.baseId) {
+            owner.GoTo(app, owner.model.Get() - 1);
+        } else if (hit == owner.baseId + 1) {
+            owner.GoTo(app, owner.model.Get() + 1);
+        } else if (hit >= owner.baseId + 2
+            && hit < owner.baseId + 2 + count) {
+            owner.GoTo(app, hit - owner.baseId - 2);
+        }
+    }
+}
+
 class Carousel : Control {
     List<string> slides;
     SignalInt model;
@@ -46,6 +84,13 @@ class Carousel : Control {
     string dotPlacement;
     /// 上次翻页时刻（autoplay 用）。
     int lastTickMs;
+    /// 箭头/指示点覆盖层：始终是最后一个子控件，见 CarouselChrome。
+    CarouselChrome chrome;
+    /// 控件页（AddSlideView 加入）：与 slides 平行的子控件列表。页面
+    /// 就是真正的控件（典型是 Gui.Widget.Image——文件路径 / data URI /
+    /// http(s) URL / SVG 的地址语义全部由 Image 承担），由轮播负责
+    /// 排布、可见性与过渡。null = 全部是文字页。
+    List<Control> slideViews;
 
     void InitCarousel(SignalInt m) {
         this.InitControl("carousel", 1);
@@ -59,6 +104,10 @@ class Carousel : Control {
         autoplay = false;
         intervalMs = 3000;
         dotPlacement = "bottom";
+        slideViews = null;
+        // chrome 惰性挂载：首次 Arrange 时滑片都已 Add 完，把它追加为
+        // 最后一个子控件，绘制顺序才能压在控件页（如 Image）之上。
+        chrome = null;
     }
 
     Carousel() { InitCarousel(new SignalInt(0)); }
@@ -66,6 +115,15 @@ class Carousel : Control {
 
     /// 命名为 AddSlide（而非 Add），以免遮蔽 Control.Add(Control)。
     void AddSlide(string label) { slides.Add(label); }
+
+    /// 加入一个控件页：v 成为轮播的子控件并占满整个轮播框，裁剪与
+    /// 过渡动画由轮播管理。与 AddSlide 可混用（控件页的标题留空）。
+    void AddSlideView(Control v) {
+        slides.Add("");
+        if (slideViews == null) { slideViews = new List<Control>(); }
+        slideViews.Add(v);
+        this.Add(v);
+    }
 
     static Carousel Of(List<string> labels, SignalInt m) {
         Carousel car = new Carousel(m);
@@ -109,6 +167,25 @@ class Carousel : Control {
         app.RequestRedraw();
     }
 
+    override void Arrange(int px, int py, int pw, int ph) {
+        if (pw < 0) { pw = 0; }
+        if (ph < 0) { ph = 0; }
+        bx = px;
+        by = py;
+        bw = pw;
+        bh = ph;
+        if (slideViews != null) {
+            for (int i = 0; i < slideViews.Count; i = i + 1) {
+                slideViews[i].Arrange(px, py, pw, ph);
+            }
+        }
+        if (chrome == null) {
+            chrome = new CarouselChrome(this);
+            this.Add(chrome);
+        }
+        chrome.Arrange(px, py, pw, ph);
+    }
+
     override void OnMeasure(App app) {
         string origClass = Class;
         // dot-placement 映射为 Class：皮肤通过 carousel.dots-top
@@ -146,6 +223,7 @@ class Carousel : Control {
         if (cur < 0) { cur = 0; }
         if (cur >= count) { cur = count - 1; }
 
+        this.ShowSlides(cur, cur, 0, 1);
         c.PushClip(bx, by, bw, bh);
         if (anim == null) {
             this.PaintSlide(app, bx, cur);
@@ -173,29 +251,48 @@ class Carousel : Control {
                 int shift = bw * prog / 1000;
                 int outX = bx - anim.dir * shift;
                 int inX = outX + anim.dir * bw;
+                this.ShowSlides(anim.from, cur, shift, anim.dir);
                 this.PaintSlide(app, outX, anim.from);
                 this.PaintSlide(app, inX, cur);
                 app.RequestRedraw();
             } else {
+                this.ShowSlides(cur, cur, 0, 1);
                 this.PaintSlide(app, bx, cur);
             }
         }
         c.PopClip();
 
-        this.PaintChrome(app, count, cur);
+        // 箭头/指示点由覆盖层子控件在子树绘制阶段画，天然位于
+        // 控件页（图片页）之上；命中处理也在覆盖层里。
+    }
 
-        if (this.IsDisabled() || app.EventKind() != 3) { return; }
-        int hit = app.ClickTarget();
-        if (hit == baseId) { this.GoTo(app, model.Get() - 1); }
-        else if (hit == baseId + 1) { this.GoTo(app, model.Get() + 1); }
-        else if (hit >= baseId + 2 && hit < baseId + 2 + count) {
-            this.GoTo(app, hit - baseId - 2);
+    /// 让控件页与过渡状态一致：静止帧只有当前页可见（占满轮播框）；
+    /// 过渡帧离开页停在 bx-dir*shift、进入页在进入位，其余页隐藏。
+    /// 控件的 OnPaint 之后才会画子树，所以这里赶在子树绘制前把
+    /// 矩形与可见性摆好即可。
+    void ShowSlides(int from, int to, int shift, int dir) {
+        if (slideViews == null) { return; }
+        for (int i = 0; i < slideViews.Count; i = i + 1) {
+            if (slideViews[i] == null) { continue; }
+            if (i == from || i == to) {
+                int x = bx;
+                if (i == from && from != to) { x = bx - dir * shift; }
+                slideViews[i].Arrange(x, by, bw, bh);
+                slideViews[i].SetShown(true);
+            } else {
+                slideViews[i].SetShown(false);
+            }
         }
     }
 
     /// 在任意 x 位置绘制一张幻灯片（主体 + 居中标签），过渡时可
-    /// 并排绘制离开和进入的面板。
+    /// 并排绘制离开和进入的面板。控件页自己会画（RenderTree 的
+    /// 子树遍历），这里只负责文字页。
     void PaintSlide(App app, int x, int i) {
+        if (slideViews != null && i < slideViews.Count
+            && slideViews[i] != null) {
+            return;
+        }
         Canvas c = app.canvas;
         Theme t = app.theme;
         int roleIndex = i % 5;
@@ -228,7 +325,7 @@ class Carousel : Control {
         StyleBox dotStyle = this.ResolvePartAs(app, "carousel", "dot", "", Class,
                                                Style.SNormal());
         StyleBox dotOn = this.ResolvePartAs(app, "carousel", "dot", "", Class,
-                                            Style.SChecked());
+                                            Style.SSelected());
 
         int ab = arrow.HeightOr(t.heightMedium);
         int ay = by + (bh - ab) / 2;

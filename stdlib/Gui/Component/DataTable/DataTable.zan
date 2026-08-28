@@ -276,6 +276,59 @@ partial class DataTable {
         st.rangeC1 = -1;
     }
 
+    /// 让选择列的勾选框跟随当前单元格范围：范围跨多行
+    /// （即一次"区域选择"）时，覆盖的行全部勾上；本手势
+    /// 早先勾上、但已随拖动移出范围的行再取消——勾选框
+    /// 实时镜像高亮的矩形，而不是等松手才对账。
+    /// 单格点击（范围只有一行）不碰勾选框：那是单元格
+    /// 选择，不是区域选择；勾选框自己的点击也不受影响。
+    /// `st.rangeSelTouched` 只记录本手势勾过的行，
+    /// 松手或重按即清空，绝不会退掉用户此前手动勾的行。
+    static void SyncRangeChecks(DataTableState st) {
+        if (!st.showSelect) { return; }
+        int rLo = -1;
+        int rHi = -1;
+        if (DataTable.HasRange(st)) {
+            rLo = DataTable.MinI(st.rangeR0, st.rangeR1);
+            rHi = DataTable.MaxI(st.rangeR0, st.rangeR1);
+        }
+        bool span = rHi > rLo;
+        bool changed = false;
+        // 手势勾过、但现在已不在跨行范围内的行退勾。
+        int ti = 0;
+        while (ti < st.rangeSelTouched.Count) {
+            int slot = st.rangeSelTouched[ti];
+            bool inside = span && slot >= rLo && slot <= rHi
+                          && slot < DataTable.DispCount(st)
+                          && DataTable.DispKind(st, slot) == 0;
+            if (!inside) {
+                int ri = DataTable.DispRowOf(st, slot);
+                if (ri >= 0 && ri < st.selected.Count && st.selected[ri]) {
+                    st.selected[ri] = false;
+                    changed = true;
+                }
+                st.rangeSelTouched.RemoveAt(ti);
+            } else { ti = ti + 1; }
+        }
+        // 勾上当前范围内所有数据行；只把手势自己勾的
+        // 记入 touched——范围内本来已勾的行与本手势无关。
+        if (span) {
+            int k = rLo;
+            while (k <= rHi) {
+                if (k >= 0 && k < DataTable.DispCount(st) && DataTable.DispKind(st, k) == 0) {
+                    int ri = DataTable.DispRowOf(st, k);
+                    if (!st.selected[ri]) {
+                        st.selected[ri] = true;
+                        st.rangeSelTouched.Add(k);
+                        changed = true;
+                    }
+                }
+                k = k + 1;
+            }
+        }
+        if (changed) { st.SelectionChanged.Raise(); }
+    }
+
     // 将位于顺序位置 `from` 的行移到顺序位置
     // `to`，其余行顺移——即可见顺序的手动拖拽重排。
     static void MoveOrder(DataTableState st, int from, int to) {
@@ -443,12 +496,17 @@ partial class DataTable {
             }
             st.rangeR1 = oi;
             st.rangeC1 = col;
+            // 键盘 Shift 扩展与鼠标区域拖选同一语义：
+            // 选择列的勾选框实时跟随范围行集。
+            DataTable.SyncRangeChecks(st);
         } else {
             st.rangeR0 = oi;
             st.rangeR1 = oi;
             st.rangeC0 = col;
             st.rangeC1 = col;
             st.selAnchor = oi;
+            // 上一个区域手势的勾选跟踪到此为止。
+            st.rangeSelTouched.Clear();
         }
         return true;
     }

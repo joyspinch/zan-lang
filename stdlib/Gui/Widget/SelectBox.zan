@@ -11,11 +11,35 @@ class SelectOption {
     /// 表格式下拉（SelectBox.Table）里这一行除首列以外的单元格。
     /// null 表示这条只有 label —— 普通列表模式下始终如此。
     List<string> cells;
+    /// 级联模式的子层级；null = 叶子。
+    List<SelectOption> children;
+    /// 在 SelectBox.opts 平铺列表中的下标。AddOption / AddBranch /
+    /// AddChild 都会追加到 opts，级联展开链用它寻址。
+    int flatIdx;
+    /// 分组标题行：只作小标题展示，不可悬停、不可选择。
+    bool grp;
+    /// 禁用项：可见、置灰，但不可选择。
+    bool disabled;
 
     SelectOption(string label, bool chosen) {
         this.label = label;
         this.chosen = chosen;
         this.cells = null;
+        this.children = null;
+        this.flatIdx = 0 - 1;
+        this.grp = false;
+        this.disabled = false;
+    }
+
+    /// 级联：给本选项挂一个子级，并回填它的平铺下标。
+    void Attach(SelectOption child, int idx) {
+        if (children == null) { children = new List<SelectOption>(); }
+        child.flatIdx = idx;
+        children.Add(child);
+    }
+
+    bool HasChildren() {
+        return children != null && children.Count > 0;
     }
 
     /// 第 `i` 列的文本（0 为 label 列），越界返回空串。
@@ -73,6 +97,9 @@ class SelectBox : Control {
     bool clearable;
     bool open;
     int scrollY;
+    /// 弹层滚动偏移的信号视图：内嵌 Scrollbar 直接拖它，
+    /// 每帧与 `scrollY` 互相同步。
+    SignalInt scrollSignal;
     /// 尺寸档：0 small / 1 medium / 2 large。Binding<int> 使
     /// 属性面板的 size 行真正写回；渲染时映射为 select.small/.large
     /// 档位 class（base.css 的 --height-* token 规则）。
@@ -86,6 +113,24 @@ class SelectBox : Control {
     bool filterable;
     /// 当前搜索关键词。
     string filterText;
+    /// 筛选搜索框：弹层顶部内嵌的真 Input 组件（不是自绘的假输入条），
+    /// 焦点、光标、选区、Ctrl+A/C/X/V、清除按钮全部由 Input 自持。
+    /// 打开弹层期间焦点锁定在它上面，键入才不需要先点一下搜索框。
+    Input filterBox;
+    /// 级联模式：选项带子级，弹层逐列展开（省市区这类层级）。
+    bool cascade;
+    /// 级联当前展开链：每列已展开选项的平铺下标（flatIdx）。
+    List<int> cascadePath;
+    /// 级联顶层选项（AddBranch 建立的那些），弹层第一列渲染它们。
+    List<SelectOption> cascRoots;
+    /// 树形模式：弹层内嵌一颗真 TreeView，展开/折叠、滚动、悬停
+    /// 全部由 TreeView 自持，SelectBox 只负责摆位与收值。
+    bool treeMode;
+    TreeView treeBox;
+    /// 树形模式上次见到的选中下标（-1 无），用于每帧轮询选中变化。
+    int treeSelSeen;
+    /// 级联/树形选中的完整路径文本（"浙江 / 杭州"），供 Text() 显示。
+    string pathText;
     /// 过滤后的选项索引列表（null = 不启用过滤）。每帧根据 filterText 重建。
     List<int> filteredIdx;
     // 每帧暂存锚点几何，使延迟弹出层（OnPaintOverlay、
@@ -163,6 +208,13 @@ class SelectBox : Control {
         this.headers = null;
         this.colWidths = null;
         this.filterHint = "";
+        this.cascade = false;
+        this.cascadePath = null;
+        this.cascRoots = null;
+        this.treeMode = false;
+        this.treeBox = null;
+        this.treeSelSeen = 0 - 1;
+        this.pathText = "";
         this.popupW = 0;
         this.popupWDirty = true;
         this.Change = new UiEvent();
@@ -327,8 +379,18 @@ class SelectBox : Control {
     void SetOpen(bool v) {
         if (open == v) { return; }
         open = v;
-        Console.WriteLine("SB SetOpen " + Convert.ToString(v)); // PROBE
-        if (v) { scrollY = 0; Open.Raise(); }
+        if (v) {
+            scrollY = 0;
+            // 级联弹层从第一列重新开始。
+            cascadePath = new List<int>();
+            // 开层即一次新搜索：清掉上一次的关键词。
+            if (filterable && filterBox != null) {
+                filterBox.SetText("");
+                filterText = "";
+                this.RebuildFilter();
+            }
+            Open.Raise();
+        }
         else { Close.Raise(); }
     }
 
@@ -358,6 +420,8 @@ class SelectBox : Control {
     /// 事件集中在一处，使所有入口行为一致。
     void Choose(int idx) {
         if (idx < 0 || idx >= opts.Count) { return; }
+        // 分组标题与禁用项不是可选项。
+        if (opts[idx].grp || opts[idx].disabled) { return; }
         if (multi) {
             opts[idx].chosen = !opts[idx].chosen;
         } else {
@@ -369,12 +433,83 @@ class SelectBox : Control {
         Change.Raise();
     }
 
+    /// 级联选择模式。层级用 AddBranch / AddChild 建立，
+    /// 弹层逐列展开，选中叶子时触发器显示完整路径
+    /// （"浙江 / 杭州 / 西湖区"）。
+    SelectBox Cascade() {
+        cascade = true;
+        return this;
+    }
+
+    /// 加一个顶层分支（级联第一列的条目），返回它的平铺下标
+    /// （继续 AddChild 时作父下标用）。
+    int AddBranch(string label) {
+        SelectOption o = new SelectOption(label, false);
+        o.flatIdx = opts.Count;
+        opts.Add(o);
+        if (cascRoots == null) { cascRoots = new List<SelectOption>(); }
+        cascRoots.Add(o);
+        popupWDirty = true;
+        return o.flatIdx;
+    }
+
+    /// 给第 `parent` 个选项挂一个子级（父下标是 AddBranch /
+    /// AddChild 的返回值），返回子级的平铺下标。挂在同一父级
+    /// 下的子级按插入顺序排成一列。
+    int AddChild(int parent, string label) {
+        if (parent < 0 || parent >= opts.Count) { return 0 - 1; }
+        SelectOption o = new SelectOption(label, false);
+        o.flatIdx = opts.Count;
+        opts.Add(o);
+        opts[parent].Attach(o, o.flatIdx);
+        popupWDirty = true;
+        return o.flatIdx;
+    }
+
+    /// 树形选择模式：弹层内嵌一颗真 TreeView。层级用
+    /// TreeNode.Dir / TreeNode.File 构建，经 TreeNodes 绑定；
+    /// 叶节点被选中时触发器显示它的 payload（未设则 label）。
+    /// 树的展开、滚动、悬停全部是 TreeView 自己的行为。
+    SelectBox Tree() {
+        treeMode = true;
+        treeBox = new TreeView();
+        treeSelSeen = 0 - 1;
+        return this;
+    }
+
+    /// 绑定树节点（调用方的列表，TreeView.Bind 不复制）。
+    SelectBox TreeNodes(List<TreeNode> nodes) {
+        if (treeBox == null) { this.Tree(); }
+        treeBox.Bind(nodes);
+        return this;
+    }
+
     static SelectBox Multi(string hintText) {
         return new SelectBox(hintText, true);
     }
 
     void AddOption(string label) {
         opts.Add(new SelectOption(label, false));
+        popupWDirty = true;
+    }
+
+    /// 加一个禁用项：占正常位置、置灰显示，但不响应悬停与点击。
+    void AddOption(string label, bool disabled) {
+        SelectOption o = new SelectOption(label, false);
+        o.flatIdx = opts.Count;
+        o.disabled = disabled;
+        opts.Add(o);
+        popupWDirty = true;
+    }
+
+    /// 加一个分组标题：随后 AddOption 的条目在视觉上归属该组。
+    /// 标题行本身不可悬停、不可选择；键入筛选时若组内没有命中
+    /// 项，标题随组一起隐藏。
+    void AddGroup(string title) {
+        SelectOption o = new SelectOption(title, false);
+        o.flatIdx = opts.Count;
+        o.grp = true;
+        opts.Add(o);
         popupWDirty = true;
     }
 
@@ -409,6 +544,7 @@ class SelectBox : Control {
     /// 搜索框的提示文字。不设则用 "Search"。
     SelectBox FilterHint(string s) {
         filterHint = s;
+        if (filterBox != null) { filterBox.SetHint(s); }
         return this;
     }
 
@@ -418,6 +554,7 @@ class SelectBox : Control {
     /// 以编程方式设置关键词并重建过滤结果。
     void SetFilterText(string s) {
         filterText = s;
+        if (filterBox != null) { filterBox.SetText(s); }
         scrollY = 0;
         this.RebuildFilter();
     }
@@ -431,14 +568,21 @@ class SelectBox : Control {
         List<int> r = new List<int>();
         string q = filterText.ToLower();
         bool tbl = this.IsTable();
+        // 分组标题不参与匹配：只有当它后面（到下一个标题前）有
+        // 命中项时才保留，孤立的标题随组一起隐藏。
+        int pendingGrp = 0 - 1;
         for (int i = 0; i < opts.Count; i = i + 1) {
+            if (opts[i].grp) { pendingGrp = i; continue; }
             bool hit = opts[i].label.ToLower().Contains(q);
             if (!hit && tbl) {
                 for (int j = 1; j < colWidths.Count; j = j + 1) {
                     if (opts[i].Cell(j).ToLower().Contains(q)) { hit = true; break; }
                 }
             }
-            if (hit) { r.Add(i); }
+            if (hit) {
+                if (pendingGrp >= 0) { r.Add(pendingGrp); pendingGrp = 0 - 1; }
+                r.Add(i);
+            }
         }
         filteredIdx = r;
     }
@@ -459,6 +603,7 @@ class SelectBox : Control {
             }
             return false;
         }
+        if (pathText != "") { return true; }
         return selected >= 0 && selected < opts.Count;
     }
 
@@ -474,6 +619,9 @@ class SelectBox : Control {
 
     void Clear() {
         selected = 0 - 1;
+        pathText = "";
+        treeSelSeen = 0 - 1;
+        if (treeBox != null) { treeBox.ClearSelection(); }
         for (int i = 0; i < opts.Count; i = i + 1) {
             opts[i].chosen = false;
         }
@@ -502,6 +650,8 @@ class SelectBox : Control {
             }
             return acc;
         }
+        // 级联/树形显示完整路径，而不是叶子的短标签。
+        if (pathText != "") { return pathText; }
         if (selected >= 0 && selected < opts.Count) { return opts[selected].label; }
         return "";
     }
@@ -802,6 +952,17 @@ class SelectBox : Control {
                                                  Class, Style.SSelected());
         int arrowSlot = arrowStyle.WidthOr(t.paddingLarge + t.iconSizeSmall);
 
+        // 级联/树形是独立的弹层形态：不走平铺列表的虚表/分列/
+        // 过滤机制，在各自的覆盖绘制里自持。
+        if (this.cascade) {
+            this.CascadeOverlay(app, x, y, w, h, fs, arrowSlot);
+            return;
+        }
+        if (this.treeMode) {
+            this.TreeOverlay(app, x, y, w, h);
+            return;
+        }
+
         int ek = app.EventKind();
 
         // 过滤开着时 ColumnCount/RowCount 已按过滤后的条数算，
@@ -813,7 +974,12 @@ class SelectBox : Control {
         if (visRows > maxVisible) { visRows = maxVisible; }
         int fbH = this.FilterBarH(app);
         int hdH = this.HeaderH(app);
-        int viewH = OverlayPopup.FitH(app, visRows * optH + fbH + hdH);
+        // 搜索框是弹层顶部的一块真输入框样式（与 input 同族 token），
+        // 四周留外间距，不与弹层边缘粘连。
+        int sbMargin = app.Scale(8);
+        int sbChrome = hdH;
+        if (filterable && fbH > 0) { sbChrome = hdH + fbH + sbMargin * 2; }
+        int viewH = OverlayPopup.FitH(app, visRows * optH + sbChrome);
         int contentH = nRows * optH;
         // 由框架放置，保证列表不超出窗口：
         // 靠近底部边缘时向上翻转，而不是
@@ -824,57 +990,25 @@ class SelectBox : Control {
 
         // ---- filterable 搜索框处理 ----
         bool overSearch = false;
-        bool overClearBtn = false;
-        int searchBarX = popX;
-        int searchBarY = popY;
-        int searchBarW = w;
+        int searchBarX = popX + sbMargin;
+        int searchBarY = popY + sbMargin;
+        int searchBarW = w - sbMargin * 2;
         int searchBarH = fbH;
         if (filterable && searchBarH > 0) {
             overSearch = app.mouseX >= searchBarX
                 && app.mouseX < searchBarX + searchBarW
                 && app.mouseY >= searchBarY
                 && app.mouseY < searchBarY + searchBarH;
-            int clearBtnW = app.Scale(28);
-            overClearBtn = overSearch
-                && app.mouseX >= searchBarX + searchBarW - clearBtnW;
-            // 搜索框内接受键盘输入。
-            if (ek == 4) {
-                int kc = app.window.EventKeyCode();
-                Console.WriteLine("SB key kc=" + Convert.ToString(kc) // PROBE
-                    + " overSearch=" + Convert.ToString(overSearch));
-                if (kc == 8) {
-                    // Backspace：删掉最后一个字符。
-                    if (filterText.Length > 0) {
-                        filterText = Text.Left(filterText, filterText.Length - 1);
-                        this.RebuildFilter();
-                        app.RequestRedraw();
-                    }
-                } else if (kc == 27) {
-                    // Escape：清空并关闭。
-                    filterText = "";
-                    this.SetOpen(false);
-                    app.RequestRedraw();
-                } else {
-                    string ch = Text.CharStr(kc);
-                    if (ch.Length > 0) {
-                        filterText = filterText + ch;
-                        this.RebuildFilter();
-                        app.RequestRedraw();
-                    }
-                }
-            }
-            // 清空按钮点击。
-            if (overClearBtn && app.ClickAvailable()) {
-                filterText = "";
-                app.ClaimClick();
-                app.RequestRedraw();
-            }
         }
 
         // 弹层内容区（选项列表）Y 起始：搜索框与表头下方。
-        int headerY = popY + searchBarH;
+        int listTop = popY;
+        if (filterable && searchBarH > 0) {
+            listTop = searchBarY + searchBarH + sbMargin;
+        }
+        int headerY = listTop;
         int listY = headerY + hdH;
-        int listH = viewH - searchBarH - hdH;
+        int listH = popY + viewH - listY;
         if (listH < 0) { listH = 0; }
         bool overPopup = app.mouseX >= popX && app.mouseX < popX + w
             && app.mouseY >= popY && app.mouseY < popY + viewH;
@@ -892,9 +1026,13 @@ class SelectBox : Control {
             int col = (app.mouseX - popX) / colW;
             if (col >= nCols) { col = nCols - 1; }
             if (col < 0) { col = 0; }
-            if (row >= 0 && row < nRows) {
-                over = this.RowToOpt(col * nRows + row);
-            }
+                if (row >= 0 && row < nRows) {
+                    over = this.RowToOpt(col * nRows + row);
+                    // 标题行与禁用项不可悬停：不高亮，也不报 Hover。
+                    if (over >= 0 && (opts[over].grp || opts[over].disabled)) {
+                        over = 0 - 1;
+                    }
+                }
         }
         if (over != hoverRow) {
             hoverRow = over;
@@ -924,38 +1062,27 @@ class SelectBox : Control {
         app.BlockHitsRect(popX, popY, w, viewH);
 
         // ---- 搜索框渲染（filterable）----
+        // 弹层顶部内嵌一颗真 Input 组件：字段底/边框/焦点环、光标、
+        // 选区、Ctrl+A/C/X/V、Backspace、清除按钮全部由 Input 自持，
+        // SelectBox 只负责摆位与收成关键词。焦点在弹层打开期间锁定
+        // 在它上面——展开即可键入，不必先点一下搜索框。
         if (filterable && searchBarH > 0) {
-            StyleBox sbStyle = this.ResolvePartAs(app, "select", "searchbar", "",
-                                                  Class, Style.SNormal());
-            sbStyle.Paint(app, searchBarX, searchBarY, searchBarW, searchBarH);
-            int sbPad = sbStyle.PadLOr(t.paddingSmall);
-            int sbFs = sbStyle.FontOr(fs);
-            // 放大镜图标：颜色由 sbStyle.fg 派生（FgOr fallback
-            // 来自皮肤的 `select::searchbar` 规则与默认主题色）。
-            int iconSz = app.Scale(14);
-            int textColor = sbStyle.FgOr(0);
-            c.DrawGlyphIn("search", searchBarX + sbPad, searchBarY,
-                iconSz, searchBarH, iconSz, textColor);
-            // 搜索文字。
-            int textX = searchBarX + sbPad + iconSz + app.Scale(4);
-            int clearBtnW = app.Scale(28);
-            int textW = searchBarW - (textX - searchBarX) - clearBtnW - sbPad;
-            if (textW > 0) {
-                string sbText = filterText;
-                if (sbText == "") {
-                    sbText = filterHint;
-                    if (sbText == "") { sbText = "Search"; }
-                }
-                c.DrawText(textX, Canvas.CenterTextY(searchBarY, searchBarH, sbFs),
-                            Ellipsis.Fit(sbText, textW, sbFs), textColor, sbFs);
+            if (filterBox == null) {
+                string bh = filterHint;
+                if (bh == "") { bh = "Search"; }
+                filterBox = new Input(bh);
+                filterBox.Clearable = true;
             }
-            // 清空按钮。
-            if (filterText != "") {
-                int cbX = searchBarX + searchBarW - clearBtnW;
-                StyleBox clrStyle = this.ResolvePartAs(app, "select", "icon", "",
-                                                       Class, Style.SNormal());
-                c.DrawGlyphIn("x", cbX, searchBarY, clearBtnW, searchBarH,
-                               iconSz, clrStyle.FgOr(0));
+            if (!app.focus.IsFocused(filterBox.WidgetId())) {
+                app.focus.SetFocused(filterBox.WidgetId());
+            }
+            filterBox.Render(app, searchBarX, searchBarY, searchBarW, searchBarH);
+            string live = filterBox.GetText();
+            if (live != filterText) {
+                filterText = live;
+                scrollY = 0;
+                this.RebuildFilter();
+                app.RequestRedraw();
             }
         }
 
@@ -996,15 +1123,33 @@ class SelectBox : Control {
                 bool isSel = false;
                 if (multi) { isSel = opts[realIdx].chosen; }
                 else { isSel = realIdx == selected; }
+                bool isGrp = opts[realIdx].grp;
+                bool isOff = opts[realIdx].disabled;
 
+                // 标题行与禁用项不吃悬停/选中态：标题走小号次级色，
+                // 禁用项走 :disabled 置灰。
                 int st = Style.SNormal();
-                if (overRow) { st = st + Style.SHover(); }
-                if (isSel) { st = st + Style.SSelected(); }
+                if (isGrp || isOff) {
+                    st = Style.SDisabled();
+                } else {
+                    if (overRow) { st = st + Style.SHover(); }
+                    if (isSel) { st = st + Style.SSelected(); }
+                }
                 StyleBox row = this.ResolvePartAs(app, "select", "option", "option",
                                                    Class, st);
                 row.Paint(app, ox + 1, oy, colW - 2, optH);
                 int rowFs = row.FontOr(fs);
                 int rowPad = row.PadLOr(t.paddingSmall);
+                if (isGrp) {
+                    StyleBox grpStyle = this.ResolvePartAs(app, "select", "group",
+                                                          "", Class, Style.SNormal());
+                    c.DrawText(ox + t.paddingSmall,
+                        Canvas.CenterTextY(oy, optH, rowFs),
+                        Ellipsis.Fit(opts[realIdx].label,
+                                     colW - t.paddingSmall * 2, rowFs),
+                        grpStyle.FgOr(row.fg), grpStyle.FontOr(rowFs));
+                    continue;
+                }
                 if (this.IsTable()) {
                     // 一行按列宽切开，每格自己收省略号 —— 列因此是对齐的，
                     // 而不是把整行拼成一个长字符串再统一截断。
@@ -1035,59 +1180,54 @@ class SelectBox : Control {
         }
         c.PopClip();
 
-        // 弹层滚动条。
+        // 弹层滚动条：内嵌真 Scrollbar 组件，拖滑块与点轨道跳转
+        // 由它自持。原先这里是一只手绘 thumb，只摆样子 —— 20000 项
+        // 的虚拟列表除了滚轮无路可走。scrollY 与信号每帧互同步，
+        // 拖动写出的一帧内滞后由 RequestRedraw 在下一帧收敛。
         if (contentH > listH && listH > 0) {
-            StyleBox scrollbarStyle = this.ResolvePartAs(app, "select", "scrollbar", "",
-                                                          Class, Style.SSelected());
-            int barW = scrollbarStyle.WidthOr(app.Scale(6));
-            int bx = popX + w - barW - app.Scale(2);
-            int minThumb = app.Scale(24);
-            if (minThumb > listH) { minThumb = listH; }
-            int thumbH = listH * listH / contentH;
-            if (thumbH < minThumb) { thumbH = minThumb; }
-            if (thumbH > listH) { thumbH = listH; }
-            int travel = listH - thumbH;
-            if (travel < 0) { travel = 0; }
-            int thumbY = listY;
-            if (maxScroll > 0) { thumbY = listY + scrollY * travel / maxScroll; }
-            if (thumbY < listY) { thumbY = listY; }
-            if (thumbY + thumbH > listY + listH) { thumbY = listY + listH - thumbH; }
-            c.PushClip(popX, popY, w, viewH);
-            c.FillRoundRect(bx, thumbY, barW, thumbH,
-                            scrollbarStyle.RadiusOr(barW / 2),
-                            scrollbarStyle.BgOr(pop.fg));
-            c.PopClip();
+            if (scrollSignal == null) { scrollSignal = new SignalInt(scrollY); }
+            scrollSignal.Set(scrollY);
+            Scrollbar.RenderVerticalScroll(app, popX + w - app.Scale(12),
+                listY, listH, listH, contentH, scrollSignal);
+            int sbScroll = scrollSignal.Get();
+            if (sbScroll > maxScroll) { sbScroll = maxScroll; }
+            if (sbScroll < 0) { sbScroll = 0; }
+            if (sbScroll != scrollY) {
+                scrollY = sbScroll;
+                app.RequestRedraw();
+            }
         }
 
         // ---- 弹层输入处理 ----
         if (app.ClickAvailable()) {
-            Console.WriteLine("SB click kind=" + Convert.ToString(ek) // PROBE
-                + " overSearch=" + Convert.ToString(overSearch)
-                + " overPopup=" + Convert.ToString(overPopup)
-                + " mx=" + Convert.ToString(app.mouseX)
-                + " my=" + Convert.ToString(app.mouseY));
             if (overSearch) {
-                // 搜索框区域点击不关闭弹层（输入已在上面处理）。
+                // 搜索框区域点击不关闭弹层（输入由内嵌 Input 处理）。
             } else if (overPopup && app.mouseY >= listY) {
-                int rel = app.mouseY - listY + scrollY;
-                int col = (app.mouseX - popX) / colW;
-                if (col >= nCols) { col = nCols - 1; }
-                if (col < 0) { col = 0; }
-                int rowHit = rel / optH;
-                int realIdx = 0 - 1;
-                if (rowHit >= 0 && rowHit < nRows) {
-                    realIdx = this.RowToOpt(col * nRows + rowHit);
-                }
-                if (realIdx >= 0 && realIdx < opts.Count) {
-                    Console.WriteLine("SB pick idx=" + Convert.ToString(realIdx)); // PROBE
+                // 释放点落在弹层内已注册的控件（内嵌 Scrollbar 的
+                // 滑块/轨道）上时交给它 —— 拖滑块收尾的那一下
+                // 不能当成行选择，误选鼠标正好压住的行。
+                if (app.hitTester.HitTestBelowBlockers(app.mouseX, app.mouseY) != 0 - 1) {
+                    app.ClaimClick();
+                } else {
+                    int rel = app.mouseY - listY + scrollY;
+                    int col = (app.mouseX - popX) / colW;
+                    if (col >= nCols) { col = nCols - 1; }
+                    if (col < 0) { col = 0; }
+                    int rowHit = rel / optH;
+                    int realIdx = 0 - 1;
+                    if (rowHit >= 0 && rowHit < nRows) {
+                        realIdx = this.RowToOpt(col * nRows + rowHit);
+                    }
+                if (realIdx >= 0 && realIdx < opts.Count
+                    && !opts[realIdx].grp && !opts[realIdx].disabled) {
                     this.Choose(realIdx);
                     if (!multi) { this.SetOpen(false); }
                     app.ClaimClick();
                     app.RequestRedraw();
                 }
+                }
             } else {
                 // 点击弹层外部任意位置（含触发器）即关闭。
-                Console.WriteLine("SB outside-close"); // PROBE
                 this.SetOpen(false);
                 app.RequestRedraw();
             }
@@ -1096,5 +1236,175 @@ class SelectBox : Control {
             this.SetOpen(false);
             app.RequestRedraw();
         }
+    }
+
+    /// 级联/树形弹层共用的收尾手势：点击弹层外部（含触发器）
+    /// 关闭；弹层内没被任何子控件认领的点击在这里吃掉，不能
+    /// 落到弹层下面的内容上；Esc 关闭。须在弹层内容处理完
+    /// 点击之后调用。
+    void OverlayDismiss(App app, int popX, int popY, int w, int viewH, int ek) {
+        if (app.ClickAvailable()) {
+            bool inside = app.mouseX >= popX && app.mouseX < popX + w
+                && app.mouseY >= popY && app.mouseY < popY + viewH;
+            if (!inside) { this.SetOpen(false); }
+            app.RequestRedraw();
+            return;
+        }
+        if (ek == 4 && app.window.EventKeyCode() == 27) {
+            this.SetOpen(false);
+            app.RequestRedraw();
+        }
+    }
+
+    /// 级联弹层：一列一级。点中带子级的选项在其右侧展开下一列，
+    /// 叶子（或没有子级的分支）选中收值并关闭。列宽对分弹层，
+    /// 最多同时 4 列。
+    void CascadeOverlay(App app, int x, int y, int w, int h, int fs,
+                        int arrowSlot) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        if (cascRoots == null || cascRoots.Count == 0) { return; }
+        if (cascadePath == null) { cascadePath = new List<int>(); }
+        int optH = h;
+        int nCols = cascadePath.Count + 1;
+        if (nCols > 4) { nCols = 4; }
+        int visRows = maxVisible;
+        if (visRows < 4) { visRows = 4; }
+        int viewH = OverlayPopup.FitH(app, visRows * optH);
+        // 每列一个固定列宽（不窄于触发器）：展开新列时弹层向右
+        // 生长，已展开的列保持原宽 —— 而不是把固定总宽越分越窄。
+        // 超出窗口右缘才整体收窄。
+        int colBase = w;
+        if (colBase < app.Scale(160)) { colBase = app.Scale(160); }
+        w = colBase * nCols;
+        int room = app.canvas.Width() - app.Scale(8);
+        if (w > room) { w = room; }
+        int popX = OverlayPopup.FitX(app, x, w);
+        int popY = OverlayPopup.FitY(app, y + h + app.Scale(4), h, viewH);
+        app.BlockHitsBelow();
+        StyleBox pop = this.ResolvePartAs(app, "select", "popup", "popup",
+                                          Class, Style.SSelected());
+        pop.Paint(app, popX, popY, w, viewH);
+        app.BlockHitsRect(popX, popY, w, viewH);
+        int colW = w / nCols;
+        if (colW < 1) { colW = 1; }
+        int rowPad = t.paddingSmall;
+        // 逐列走层级链：第 0 列是顶层选项，第 k 列是
+        // cascadePath[k-1] 的子级。
+        List<SelectOption> cur = cascRoots;
+        bool consumed = false;
+        for (int col = 0; col < nCols && cur != null; col = col + 1) {
+            int cx = popX + col * colW;
+            int n = cur.Count;
+            if (n > visRows) { n = visRows; }
+            for (int r = 0; r < n; r = r + 1) {
+                SelectOption o = cur[r];
+                int ry = popY + r * optH;
+                if (ry + optH > popY + viewH) { break; }
+                bool hov = app.mouseX >= cx && app.mouseX < cx + colW
+                    && app.mouseY >= ry && app.mouseY < ry + optH;
+                int st = Style.SNormal();
+                if (hov) { st = st + Style.SHover(); }
+                if (o.flatIdx == selected) { st = st + Style.SSelected(); }
+                StyleBox row = this.ResolvePartAs(app, "select", "option", "",
+                                                  Class, st);
+                row.Paint(app, cx, ry, colW, optH);
+                int labW = colW - rowPad * 2;
+                if (o.HasChildren()) { labW = labW - arrowSlot; }
+                c.DrawText(cx + rowPad, Canvas.CenterTextY(ry, optH, fs),
+                    Ellipsis.Fit(o.label, labW, fs), row.fg, fs);
+                if (o.HasChildren()) {
+                    c.DrawGlyphIn("chevron-right", cx + colW - arrowSlot, ry,
+                        arrowSlot, optH, arrowSlot - t.paddingSmall, row.fg);
+                }
+                if (hov && app.ClickAvailable() && !consumed) {
+                    consumed = true;
+                    app.ClaimClick();
+                    if (o.HasChildren()) {
+                        // 展开下一列：截断本列之后的旧链再推入。
+                        List<int> next = new List<int>();
+                        for (int i = 0; i < col && i < cascadePath.Count;
+                             i = i + 1) {
+                            next.Add(cascadePath[i]);
+                        }
+                        next.Add(o.flatIdx);
+                        cascadePath = next;
+                    } else {
+                        this.ChooseCascade(o);
+                    }
+                    app.RequestRedraw();
+                }
+            }
+            // 下一列 = 本列已展开项的子级；没有链或没有子级即止。
+            cur = null;
+            if (col < cascadePath.Count) {
+                int pi = cascadePath[col];
+                if (pi >= 0 && pi < opts.Count && opts[pi].HasChildren()) {
+                    cur = opts[pi].children;
+                }
+            }
+        }
+        this.OverlayDismiss(app, popX, popY, w, viewH, app.EventKind());
+    }
+
+    /// 级联选中叶子：路径 = 已展开链 + 本叶，写入触发器、
+    /// 同步绑定并关闭。
+    void ChooseCascade(SelectOption leaf) {
+        string path = "";
+        if (cascadePath != null) {
+            for (int i = 0; i < cascadePath.Count; i = i + 1) {
+                int pi = cascadePath[i];
+                if (pi < 0 || pi >= opts.Count) { continue; }
+                if (path != "") { path = path + " / "; }
+                path = path + opts[pi].label;
+            }
+        }
+        if (path != "") { path = path + " / "; }
+        path = path + leaf.label;
+        pathText = path;
+        selected = leaf.flatIdx;
+        if (model != null) { model.Set(selected); lastModel = selected; }
+        if (data != null) { data.Set(selected); lastData = selected; }
+        Change.Raise();
+        this.SetOpen(false);
+    }
+
+    /// 树形弹层：内嵌真 TreeView，选中叶节点收值关闭。
+    /// 展开/折叠、滚动、悬停全部是 TreeView 自己的行为；
+    /// SelectBox 只给矩形、轮询选中、把叶子收成路径文本。
+    void TreeOverlay(App app, int x, int y, int w, int h) {
+        if (treeBox == null) { return; }
+        Theme t = app.theme;
+        int optH = h;
+        int viewH = OverlayPopup.FitH(app, maxVisible * optH
+            + t.paddingSmall * 2);
+        if (w < app.Scale(260)) { w = app.Scale(260); }
+        int popX = OverlayPopup.FitX(app, x, w);
+        int popY = OverlayPopup.FitY(app, y + h + app.Scale(4), h, viewH);
+        app.BlockHitsBelow();
+        StyleBox pop = this.ResolvePartAs(app, "select", "popup", "popup",
+                                          Class, Style.SSelected());
+        pop.Paint(app, popX, popY, w, viewH);
+        app.BlockHitsRect(popX, popY, w, viewH);
+        int pad = app.Scale(4);
+        treeBox.RenderInside(app, new Rect(popX + pad, popY + pad,
+            w - pad * 2, viewH - pad * 2));
+        // 轮询选中变化：叶节点收值（payload 优先于 label）并关闭；
+        // 目录节点的选中只高亮，不收值。
+        int si = treeBox.SelectedIndex();
+        if (si >= 0 && si != treeSelSeen) {
+            treeSelSeen = si;
+            if (si < treeBox.data.Count) {
+                TreeNode node = treeBox.data[si];
+                if (!node.isDir) {
+                    pathText = node.payload;
+                    if (pathText == "") { pathText = node.label; }
+                    Change.Raise();
+                    app.RequestRedraw();
+                    this.SetOpen(false);
+                }
+            }
+        }
+        this.OverlayDismiss(app, popX, popY, w, viewH, app.EventKind());
     }
 }

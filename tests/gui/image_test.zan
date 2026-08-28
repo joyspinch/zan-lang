@@ -24,6 +24,32 @@ class Program {
         Console.WriteLine($"FAIL {what}: got '{got}' want '{want}'");
     }
 
+    static int RampVal(int i) {
+        if (i == 0) { return 0; }
+        if (i == 1) { return 100; }
+        if (i == 2) { return 200; }
+        return 255;
+    }
+
+    /// 渐变图的灰度字节直接写进 byte[]（值可以超过 ASCII 范围）。
+    static int LoadRamp(string key, int w, int h, int v0, int v1, int v2,
+                        int v3) {
+        string head = "P5\n" + w + " " + h + "\n255\n";
+        byte[] all = new byte[head.Length + 4];
+        for (int i = 0; i < head.Length; i = i + 1) {
+            all[i] = (byte)(head[i] & 255);
+        }
+        all[head.Length + 0] = (byte)v0;
+        all[head.Length + 1] = (byte)v1;
+        all[head.Length + 2] = (byte)v2;
+        all[head.Length + 3] = (byte)v3;
+        return Canvas.ImageLoadMem(key, all, head.Length + 4);
+    }
+
+    static int Gray(Canvas c, int x, int y) {
+        return c.GetPixel(x, y) & 255;
+    }
+
     static void Main() {
         fails = 0;
         Canvas c = new Canvas(64, 64);
@@ -68,6 +94,60 @@ class Program {
         w = Canvas.ImageLoadMem("mem:t.b64", bytes, n[0]);
         Eq("b64 width", w, 4);
         Eq("b64 height", Canvas.ImageHeight("mem:t.b64"), 2);
+
+        // ---- 采样器边界（GetPixel 读回断言）--------------------------
+        // 缩小走 box filter（覆盖到的源像素求平均），放大/1:1 按目标
+        // 像素中心最近邻；裁剪与部分越界都不得越界读。
+        int rw = LoadRamp("mem:t.ramp", 4, 1, 0, 100, 200, 255);
+        Eq("ramp width", rw, 4);
+        c.Clear(0xFFFFFFFF);
+        // 1:1 逐像素恒等。
+        c.BlitImage("mem:t.ramp", 0, 0, 4, 1, 0, 0, 0, 0);
+        for (int i = 0; i < 4; i = i + 1) {
+            Eq("identity " + i, Gray(c, i, 0), RampVal(i));
+        }
+        Eq("identity alpha", (c.GetPixel(0, 0) >> 24) & 255, 255);
+        // 缩小 4→2：box filter 平均，四舍五入。
+        c.BlitImage("mem:t.ramp", 0, 2, 2, 1, 0, 0, 0, 0);
+        Eq("box 4->2 lo", Gray(c, 0, 2), 50);
+        Eq("box 4->2 hi", Gray(c, 1, 2), 228);
+        // 缩小 4→3：非整数比，各目标列覆盖 2 个源像素。
+        c.BlitImage("mem:t.ramp", 0, 12, 3, 1, 0, 0, 0, 0);
+        Eq("box 4->3 a", Gray(c, 0, 12), 50);
+        Eq("box 4->3 b", Gray(c, 1, 12), 150);
+        Eq("box 4->3 c", Gray(c, 2, 12), 228);
+        // 放大 4→8：中心采样，两两成对且对称。
+        c.BlitImage("mem:t.ramp", 0, 4, 8, 1, 0, 0, 0, 0);
+        for (int i = 0; i < 8; i = i + 1) {
+            Eq("up4->8 " + i, Gray(c, i, 4),
+               RampVal(i / 2));
+        }
+        // 放大 3→4：中心采样复制中间列（旧的 floor 映射会偏左）。
+        LoadRamp("mem:t.ramp3", 3, 1, 0, 128, 255, 0);
+        c.BlitImage("mem:t.ramp3", 0, 6, 4, 1, 0, 0, 0, 0);
+        Eq("up3->4 a", Gray(c, 0, 6), 0);
+        Eq("up3->4 b", Gray(c, 1, 6), 128);
+        Eq("up3->4 c", Gray(c, 2, 6), 128);
+        Eq("up3->4 d", Gray(c, 3, 6), 255);
+        // 源矩形裁剪（cover 的一般化）：sx=1,sw=2 放大到 4 宽。
+        c.BlitImage("mem:t.ramp", 0, 9, 4, 1, 1, 0, 2, 1);
+        Eq("crop up a", Gray(c, 0, 9), 100);
+        Eq("crop up b", Gray(c, 1, 9), 100);
+        Eq("crop up c", Gray(c, 2, 9), 200);
+        Eq("crop up d", Gray(c, 3, 9), 200);
+        // 目标部分越界（负 dx / 右溢出）：可见部分仍逐像素正确。
+        c.BlitImage("mem:t.ramp", -2, 8, 4, 1, 0, 0, 0, 0);
+        Eq("clip left", Gray(c, 0, 8), 200);
+        Eq("clip left2", Gray(c, 1, 8), 255);
+        c.BlitImage("mem:t.ramp", 62, 10, 4, 1, 0, 0, 0, 0);
+        Eq("clip right", Gray(c, 62, 10), 0);
+        Eq("clip right2", Gray(c, 63, 10), 100);
+        // 垂直方向同上：1x4 渐变，dy=-2 起可见的是源第 2/3 行。
+        LoadRamp("mem:t.vamp", 1, 4, 0, 100, 200, 255);
+        c.BlitImage("mem:t.vamp", 20, -2, 1, 4, 0, 0, 0, 0);
+        Eq("clip top", Gray(c, 20, 0), 200);
+        Eq("clip top2", Gray(c, 20, 1), 255);
+        Eq("oob", c.GetPixel(999, 999), -1);
 
         // ---- 组件模型（对齐 prop_test 的往返方式）。
         Image img = new Image("https://example.com/a.png", "pic", "cover");

@@ -1,5 +1,6 @@
 using System;
 using Gui;
+using Gui.Backend;
 
 namespace Gui.Widget;
 
@@ -53,6 +54,10 @@ class VirtualList : Control {
     int builtLast;
     /// 模板行独占的 WidgetId 段起点（-1 = 还没建过行）。
     int rowSeqBase;
+    /// 字符串行悬停提示的跟踪状态：正在计时的行号（-1 无）
+    /// 与指针进入该行的时刻。指针换行或离开即重置。
+    int tipIdx;
+    int tipSinceMs;
 
     VirtualList() {
         this.InitControl("virtualList", 5);
@@ -67,6 +72,8 @@ class VirtualList : Control {
         this.builtFirst = 0 - 1;
         this.builtLast = 0 - 1;
         this.rowSeqBase = 0 - 1;
+        this.tipIdx = 0 - 1;
+        this.tipSinceMs = 0;
     }
 
     override string Kind() { return "VirtualList"; }
@@ -235,6 +242,7 @@ class VirtualList : Control {
         // 将行裁剪到视口，使边缘处多画/画一半的行
         // 不会渗出带边框的区域。
         c.PushClip(area.x, area.y, area.width, area.height);
+        bool tipSeen = false;
         int i = first;
         while (i < last) {
             int ry = area.y + i * rh - dy;
@@ -274,10 +282,38 @@ class VirtualList : Control {
                 c.DrawText(area.x + t.paddingLarge, ty,
                     Ellipsis.Fit(items[i], rowW - t.paddingLarge * 2, rowFont),
                     tc, rowFont);
+                // 放不下被截断的行：悬停片刻弹出完整文本，
+                // 计时器在指针换行/离开时重置；等待期间持续
+                // 请求该行重绘，让计时器有帧可用。
+                if (over && items[i].Length > 0
+                    && Canvas.MeasureText(items[i], rowFont) > rowW - t.paddingLarge * 2) {
+                    int tipNowMs = Window.GetTickMs();
+                    if (this.tipIdx != i) {
+                        this.tipIdx = i;
+                        this.tipSinceMs = tipNowMs;
+                    }
+                    if (tipNowMs - this.tipSinceMs < Tooltip.DefaultDelayMs()) {
+                        app.RequestAnimationFrameIn(0, area.x, ry, rowW, rh);
+                    } else {
+                        Tooltip.RequestBox(app, area.x, ry, rowW, rh, items[i],
+                                           Tooltip.Bottom(), app.Scale(280));
+                    }
+                    tipSeen = true;
+                }
             }
             i = i + 1;
         }
         c.PopClip();
+        if (!tipSeen) { this.tipIdx = 0 - 1; }
+
+        // 空态：列表没有条目时给一句提示，而不是一片空白。
+        if (n == 0) {
+            StyleBox sHint = Style.Part(app, "virtuallist", "hint", "", "", "",
+                                        Style.SNormal());
+            c.DrawTextCentered(area.x, area.y, area.width, area.height,
+                               "暂无数据  No items", sHint.FgOr(0),
+                               Style.FontFallback(app, "small"));
+        }
 
         scroll.End(app, area);
 
