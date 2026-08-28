@@ -48,9 +48,14 @@ ZanIDE禁止任何自绘必须全部用标准库组件来完成
    PR-body `.md`, or `*.diff` files in the repo.
 6. **`.gitignore` is a safety net, not a license to litter.** Even ignored
    files must not pile up in the source tree.
-7. **Every task ends clean.** Run `git status` before finishing; there should
-   be no stray untracked files. Review `git diff --stat` and commit only what
-   the task requires. Never `git add .` / `git add -A` blindly.
+7. **Every task ends clean — and ends with a commit.** Run `git status` before
+   finishing; there should be no stray untracked files. Review
+   `git diff --stat` and commit only what the task requires. Never
+   `git add .` / `git add -A` blindly. Once the relevant test tier passes,
+   **commit on your own**: do not ask for permission and do not leave verified
+   work uncommitted. If `git push` fails (e.g. network), leave the commit on
+   local `main` and say so. Hold the commit only when verification failed or
+   the working tree mixes in unrelated in-flight changes you must not touch.
 8. **Pick a test tier; never run all 1035 tests for a small change.** The suite
    is labelled in three tiers (`scripts\test.ps1 <tier>`, or `ctest -L <tier>`):
    `smoke` (75 tests, ~5 s — goldens, diagnostics, ABI, runtimes, tools, GUI:
