@@ -64,6 +64,15 @@ class ChartKinds {
         return "custom";
     }
 
+    /// ECharts series.symbol 形状族规范化：circle/emptyCircle/rectangle/
+    /// diamond/triangle（2.2.x 无 arrow/none——arrow 归 circle，none 由
+    /// showSymbol=0 表达）。未知名返回 ""（渲染器按族默认圆点）。
+    static string SymbolSanitize(string s) {
+        if (s == "emptyCircle" || s == "rectangle" || s == "diamond"
+            || s == "triangle" || s == "circle") { return s; }
+        return "";
+    }
+
     static ChartAxisType AxisOf(string s) {
         if (s == "value") { return ChartAxisType.Value; }
         if (s == "time") { return ChartAxisType.Time; }
@@ -91,6 +100,8 @@ class ChartData {
     int color;      // 0 = 继承系列颜色
     bool hidden;    // 饼图扇区隐藏（不进 total/角度/tooltip）
     bool selected;  // 饼图扇区静态选中：沿中角外偏 selectedOffset
+    int size;       // ECharts symbolSize 逐项覆盖；sizeSet=false 时忽略
+    bool sizeSet;
 
     static ChartData Of(int v) {
         ChartData d = new ChartData();
@@ -101,6 +112,8 @@ class ChartData {
         d.color = 0;
         d.hidden = false;
         d.selected = false;
+        d.size = 0;
+        d.sizeSet = false;
         return d;
     }
 
@@ -226,12 +239,16 @@ class ChartStage {
 class ChartNode {
     string name;
     int val;
+    string symbol;   // ECharts force symbol 逐节点形状（"" = 圆）
+    int size;        // 逐节点尺寸（直径像素；0 = 自动）
     List<ChartNode> children;
 
     static ChartNode Leaf(string name, int val) {
         ChartNode n = new ChartNode();
         n.name = name;
         n.val = val;
+        n.symbol = "";
+        n.size = 0;
         n.children = new List<ChartNode>();
         return n;
     }
@@ -240,7 +257,17 @@ class ChartNode {
         ChartNode n = new ChartNode();
         n.name = name;
         n.val = 0;
+        n.symbol = "";
+        n.size = 0;
         n.children = children;
+        return n;
+    }
+
+    /// 形状 + 尺寸变体（force 分类符号：diamond/triangle/rectangle…）。
+    static ChartNode Shaped(string name, int val, string symbol, int size) {
+        ChartNode n = ChartNode.Leaf(name, val);
+        n.symbol = ChartKinds.SymbolSanitize(symbol);
+        n.size = size;
         return n;
     }
 
@@ -272,9 +299,19 @@ class ChartLink {
 class ChartPoint {
     int x;
     int y;
+    int size;    // 逐点 symbolSize；sizeSet=false 时忽略
+    bool sizeSet;
+    int color;   // 逐点颜色；0 = 继承系列颜色
 
     static ChartPoint Of(int x, int y) {
-        return new ChartPoint { x = x, y = y };
+        return new ChartPoint { x = x, y = y, size = 0, sizeSet = false, color = 0 };
+    }
+
+    static ChartPoint Sized(int x, int y, int size) {
+        ChartPoint p = ChartPoint.Of(x, y);
+        p.size = size;
+        p.sizeSet = true;
+        return p;
     }
 }
 
@@ -623,6 +660,10 @@ class ChartSeries {
     int selectedOffset; // ECharts pie.selectedOffset：选中扇区外偏像素（默认 10）
     int barWidth;    // ECharts bar.barWidth：柱宽像素；0 = 自动
     int barGapPct;   // ECharts bar.barGap：同系列柱间距百分比；-1 = 旧固定缝
+    string symbol;   // ECharts series.symbol 形状族（Sanitized：circle/emptyCircle/
+                     //   rectangle/diamond/triangle；"" = 按族默认）
+    int symbolSize;  // ECharts series.symbolSize 像素；0 = 自动（族默认）
+    int showSymbol;  // ECharts line.showSymbol：-1 自动 | 0 隐藏点 | 1 显示
     bool showBackground; // ECharts bar.showBackground：零线到满刻度的底带
     int backgroundColor; // backgroundStyle.color；0 = 网格线色
     int innerPct;    // 饼图环形孔占外半径的百分比（0 = 实心饼）
@@ -666,6 +707,9 @@ class ChartSeries {
         s.selectedOffset = 10;
         s.barWidth = 0;
         s.barGapPct = 0 - 1;
+        s.symbol = "";
+        s.symbolSize = 0;
+        s.showSymbol = 0 - 1;
         s.showBackground = false;
         s.backgroundColor = 0;
         s.innerPct = 0;
@@ -1631,7 +1675,15 @@ class ChartOption {
             if (it.IsArray() && it.Count() >= 2) {
                 into.Add(ChartPoint.Of(it.At(0).AsInt(0), it.At(1).AsInt(0)));
             } else if (it.IsObject()) {
-                into.Add(ChartPoint.Of(it.Int("x", 0), it.Int("y", 0)));
+                ChartPoint p = ChartPoint.Of(it.Int("x", 0), it.Int("y", 0));
+                if (it.Has("symbolSize")) {
+                    p.size = it.Int("symbolSize", 0);
+                    p.sizeSet = true;
+                }
+                if (it.Has("color")) {
+                    p.color = ChartOption.ParseColor(it.Get("color"), 0);
+                }
+                into.Add(p);
             }
         }
     }
@@ -1802,6 +1854,15 @@ class ChartOption {
                     cs.barGapPct = s.Int("barGap", cs.barGapPct);
                 }
                 cs.showBackground = s.Bool("showBackground", cs.showBackground);
+                // symbol 形状族 / 尺寸 / showSymbol（bool 或 int 形式）。
+                cs.symbol = ChartKinds.SymbolSanitize(s.Str("symbol", cs.symbol));
+                cs.symbolSize = s.Int("symbolSize", cs.symbolSize);
+                JsonValue sym = s.Get("showSymbol");
+                if (sym != null && sym.IsBool()) {
+                    cs.showSymbol = sym.AsBool(true) ? 1 : 0;
+                } else if (sym != null && sym.IsNumber()) {
+                    cs.showSymbol = sym.AsInt(1);
+                }
                 JsonValue bgs = s.Get("backgroundStyle");
                 if (bgs != null && bgs.IsObject()) {
                     if (bgs.Has("color")) {
@@ -1843,6 +1904,10 @@ class ChartOption {
                             item.color = it.Int("color", 0);
                             item.hidden = it.Bool("hidden", item.hidden);
                             item.selected = it.Bool("selected", item.selected);
+                            if (it.Has("symbolSize")) {
+                                item.size = it.Int("symbolSize", 0);
+                                item.sizeSet = true;
+                            }
                             cs.data.Add(item);
                         } else if (it.IsNumber()) {
                             cs.data.Add(ChartData.Numeric(it.AsDouble(0.0)));

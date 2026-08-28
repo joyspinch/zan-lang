@@ -1,0 +1,112 @@
+using System;
+using Gui;
+using Gui.Component.Chart;
+
+/// Gui.Component.Chart 符号形状族（Chart.DrawSymbol）的无窗口回归：
+/// 五种形状（circle/emptyCircle/rectangle/diamond/triangle）在离屏
+/// Canvas 上的逐扫描线几何——中心列有墨、外接框尺寸、逐行宽度的
+/// 张开/收窄方向、空心圆中心无墨。断言全部是几何/定性判断，
+/// 在 GDI（Windows）与 FreeType（Linux）两条栅格化路径上成立。
+class Program {
+    static int fails;
+
+    static void True(string what, bool got) {
+        if (got) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static int Ink(Canvas c, int x, int y) {
+        return (c.GetPixel(x, y) & 0x00FFFFFF) == 0x00FFFFFF ? 0 : 1;
+    }
+
+    /// 形状的墨迹外接框：minX, minY, maxX, maxY, 行数, 每行墨宽。
+    static void Bounds(Canvas c, int w, int h, int cx, int cy, int r, List<int> outp) {
+        int mnx = 0; int mny = 0; int mxx = 0 - 1; int mxy = 0 - 1;
+        for (int y = cy - r - 2; y <= cy + r + 2; y = y + 1) {
+            int rowInk = 0;
+            for (int x = 0; x < w; x = x + 1) {
+                if (Ink(c, x, y) == 1) {
+                    rowInk = rowInk + 1;
+                    if (mxx < 0) { mnx = x; mny = y; }
+                    if (x < mnx) { mnx = x; }
+                    if (y < mny) { mny = y; }
+                    if (x > mxx) { mxx = x; }
+                    if (y > mxy) { mxy = y; }
+                }
+            }
+        }
+        outp.Add(mnx); outp.Add(mny); outp.Add(mxx); outp.Add(mxy);
+    }
+
+    static void RowWidths(Canvas c, int w, int cy, int r, List<int> outp) {
+        for (int y = cy - r; y <= cy + r; y = y + 1) {
+            int first = 0 - 1; int last = 0 - 1;
+            for (int x = 0; x < w; x = x + 1) {
+                if (Ink(c, x, y) == 1) {
+                    if (first < 0) { first = x; }
+                    last = x;
+                }
+            }
+            outp.Add(first < 0 ? 0 : last - first + 1);
+        }
+    }
+
+    static void Shape(Canvas c, int w, int h, int cx, int cy, int r, string shape) {
+        c.Clear(0xFFFFFFFF);
+        Chart.DrawSymbol(c, cx, cy, r, shape, Chart.Rgb(84, 112, 198), 0, 0);
+    }
+
+    static void Main() {
+        fails = 0;
+        int W = 80; int H = 80; int cx = 40; int cy = 40; int r = 12;
+        Canvas c = new Canvas(W, H);
+        List<int> b = new List<int>();
+        List<int> rw = new List<int>();
+
+        // ---- circle：中心有墨，外接框 ≈ 2r+1 见方 ----
+        Shape(c, W, H, cx, cy, r, "circle");
+        True("circle center", Ink(c, cx, cy) == 1);
+        b = new List<int>(); Bounds(c, W, H, cx, cy, r, b);
+        True("circle bbox", b[2] - b[0] >= 2 * r - 2 && b[3] - b[1] >= 2 * r - 2);
+        True("circle corner empty", Ink(c, b[0], b[1]) == 0);
+
+        // ---- rectangle：四角有墨，外接框内几乎全满 ----
+        Shape(c, W, H, cx, cy, r, "rectangle");
+        b = new List<int>(); Bounds(c, W, H, cx, cy, r, b);
+        True("rect corner ink", Ink(c, b[0] + 1, b[1] + 1) == 1 && Ink(c, b[2] - 1, b[3] - 1) == 1);
+        True("rect narrower than circle", b[2] - b[0] < 2 * r);
+
+        // ---- diamond：中心行最宽，向上下收窄到顶点 ----
+        Shape(c, W, H, cx, cy, r, "diamond");
+        rw = new List<int>(); RowWidths(c, W, cy, r, rw);
+        int n = rw.Count;
+        True("diamond mid widest", rw[n / 2] >= 2 * r);
+        True("diamond apex narrow", rw[0] <= 2 && rw[n - 1] <= 2);
+        True("diamond center", Ink(c, cx, cy) == 1);
+
+        // ---- triangle：顶行窄、底行宽，底行接近 2r+1 ----
+        Shape(c, W, H, cx, cy, r, "triangle");
+        rw = new List<int>(); RowWidths(c, W, cy, r, rw);
+        n = rw.Count;
+        True("triangle apex narrow", rw[0] <= 2);
+        True("triangle base wide", rw[n - 1] >= 2 * r);
+        True("triangle top corner empty", Ink(c, 0 - 20 + (cx - r), cy - r) == 0);
+
+        // ---- emptyCircle：中心无墨、中右环上有墨、外接框同圆 ----
+        Shape(c, W, H, cx, cy, r, "emptyCircle");
+        True("ring center empty", Ink(c, cx, cy) == 0);
+        True("ring side ink", Ink(c, cx + r, cy) == 1);
+        b = new List<int>(); Bounds(c, W, H, cx, cy, r, b);
+        True("ring bbox", b[2] - b[0] >= 2 * r - 2);
+
+        // ---- 描边：圆 + borderColor 边框像素存在（轮廓有墨、中心仍有墨）----
+        c.Clear(0xFFFFFFFF);
+        Chart.DrawSymbol(c, cx, cy, r, "circle", Chart.Rgb(84, 112, 198),
+            Chart.Rgb(255, 0, 0), 2);
+        True("border center ink", Ink(c, cx, cy) == 1);
+        True("border ring ink", Ink(c, cx + r, cy) == 1);
+
+        Console.WriteLine("symbol-shapes:" + Convert.ToString(fails == 0 ? 1 : 0));
+    }
+}
