@@ -1,0 +1,176 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// 跑马灯的滚动相位，独立成对象，使每帧重建控件的宿主仍能
+/// 持有进行中的滚动（同 CarouselAnim 的角色）。
+class MarqueeAnim {
+    int phase;
+    int lastMs;
+
+    MarqueeAnim() {
+        this.phase = 0;
+        this.lastMs = 0;
+    }
+}
+
+/// 跑马灯：一段文本在自己的矩形内匀速向左滚动，滚完一个循环宽度后
+/// 无缝衔接，循环往复。仿 Naive UI 的 Marquee 组件：
+///
+///   * `speed` 是滚动速度（像素/秒，默认 48）；
+///   * `autoFill` 为 false（默认）时一个循环等于可视宽，文本完全
+///     滚出左缘后从右缘重新进入（经典公告栏；文本比框宽时取内容宽，
+///     镜像副本在它滚出的同时从右侧补位）；
+///   * `autoFill` 为 true 时按 `gap` 的间距用副本铺满可视宽，
+///     文本再短也没有空档（无缝流）。
+///
+///     Marquee mq = new Marquee();
+///     mq.Text = vm.notice;      // 绑定，每帧重读
+///     mq.Speed(120);            // 更快
+///     mq.AutoFill(true);        // 无缝铺满
+///
+/// 相位按真实时间推进（与帧率无关）。控件被销毁重建后从头滚；
+/// 要跨帧续滚时传一个宿主持有的 MarqueeAnim：
+///
+///     mq.Animate(Gallery.demoMarquee);
+class Marquee : Control {
+    /// 可绑定文本：`mq.Text = vm.notice;` 每帧重新读取模型字段
+    /// （编译器降级的 Binding）；字面量则存为常量。
+    Binding<string> Text;
+    /// 滚动速度（像素/秒）。
+    int speed;
+    /// 为 true 时用内容副本铺满可视宽。
+    bool autoFill;
+    /// 滚动相位（像素）与上次推进时刻。控件跨帧存活时够用；
+    /// 每帧重建的宿主改用 MarqueeAnim。
+    int phase;
+    int lastMs;
+    /// 宿主持有的滚动状态（Animate() 传入），非空时优先于自身字段。
+    MarqueeAnim anim;
+
+    void InitMarquee(string txt) {
+        this.InitControl(txt, 1);
+        Text = txt;
+        speed = 48;
+        autoFill = false;
+        phase = 0;
+        lastMs = 0;
+        anim = null;
+    }
+
+    Marquee() { InitMarquee(""); }
+    Marquee(string txt) { InitMarquee(txt); }
+
+    /// 当前文本（通过绑定解析）。
+    string Str() {
+        if (Text == null) { return ""; }
+        return Text.Get();
+    }
+
+    /// 设置滚动速度（像素/秒），链式。
+    Marquee Speed(int pxPerSec) {
+        if (pxPerSec > 0) { speed = pxPerSec; }
+        return this;
+    }
+
+    /// 设置是否用副本铺满可视宽，链式。
+    Marquee AutoFill(bool v) {
+        autoFill = v;
+        return this;
+    }
+
+    /// 把滚动相位交给 `state`：宿主每帧重建控件时传同一个对象，
+    /// 滚动就不会从头再来（同 Carousel.Animate）。
+    Marquee Animate(MarqueeAnim state) {
+        anim = state;
+        return this;
+    }
+
+    StyleBox ResolvedStyle(App app) {
+        return this.ResolveStyleCached(app, "marquee", Class, Style.SNormal());
+    }
+
+    override void OnMeasure(App app) {
+        StyleBox s = this.ResolvedStyle(app);
+        int fs = s.FontOr(Style.FontFallback(app, "medium"));
+        // 皮肤/类声明了高度（如公告栏的一条横幅）就照它；否则一行文本。
+        prefH = s.HeightOr(Canvas.FontHeight(fs) + app.theme.gapSmall);
+        prefW = s.WidthOr(Canvas.MeasureText(this.Str(), fs));
+    }
+
+    override void OnPaint(App app) {
+        StyleBox s = this.ResolvedStyle(app);
+        int fs = s.FontOr(Style.FontFallback(app, "medium"));
+        string txt = this.Str();
+        int cw = Canvas.MeasureText(txt, fs);
+        if (cw <= 0 || bw <= 0 || bh <= 0) { return; }
+
+        // 相位按真实时间推进：帧率不同的机器上速度一致。停更超过一秒
+        // （窗口被遮挡/休眠醒来）不追帧，避免文本跳一大段。
+        int now = Window.GetTickMs();
+        int ph = phase;
+        int last = lastMs;
+        if (anim != null) { ph = anim.phase; last = anim.lastMs; }
+        if (last == 0) { last = now; }
+        int delta = now - last;
+        last = now;
+        if (delta > 0 && delta < 1000) { ph = ph + delta * speed / 1000; }
+
+        // 循环宽与副本间距：autoFill 时副本按内容宽+gap 铺满（循环宽向上
+        // 取整到间距的整数倍，副本图案才和相位取模后完全一致）；否则
+        // 循环宽取可视宽与内容宽的较大者——内容更宽时镜像副本恰好在其
+        // 滚出左缘时从右缘补位。
+        int gap = s.GapOr(app.theme.gapMedium);
+        int fillStep = cw + gap;
+        int loop = bw;
+        int drawStep = bw;
+        if (autoFill) {
+            loop = (bw + fillStep - 1) / fillStep * fillStep;
+            drawStep = fillStep;
+        } else if (fillStep > loop) {
+            loop = fillStep;
+        }
+        if (loop <= 0) { loop = 1; }
+        ph = ph % loop;
+
+        if (anim != null) { anim.phase = ph; anim.lastMs = last; }
+        else { phase = ph; lastMs = last; }
+
+        Canvas c = app.canvas;
+        int ty = Canvas.CenterTextY(by, bh, fs);
+        int fg = s.FgOr(0);
+        c.PushClip(bx, by, bw, bh);
+        int k = 0;
+        while (k * drawStep < bw + ph) {
+            c.DrawText(bx - ph + k * drawStep, ty, txt, fg, fs);
+            k = k + 1;
+        }
+        c.PopClip();
+        // 动画控件：持续请求重绘，滚起来才不会停。
+        app.RequestRedraw();
+    }
+
+    // ---- 设计器 / 序列化模型 ----
+
+    override string Kind() { return "Marquee"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec text = PropSpec.Text("text", "Text");
+        text.str = Text;
+        text.AsName();
+        ps.Add(text);
+        PropSpec sp = PropSpec.Int("speed", "Speed (px/s)");
+        sp.num = speed;
+        sp.Step(8, 1, 1000);
+        sp.WithTip("Scroll speed in pixels per second (Naive UI speed, default 48).");
+        ps.Add(sp);
+        PropSpec af = PropSpec.Bool("autoFill", "Auto fill");
+        af.flag = autoFill;
+        af.WithTip("Repeat the content to fill the width, so short text loops without a blank gap.");
+        ps.Add(af);
+        ps.Add(PropSpec.Text("class", "Classes"));
+        return ps;
+    }
+}
