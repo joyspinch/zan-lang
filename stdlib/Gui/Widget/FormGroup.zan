@@ -1,0 +1,337 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// 校验规则委托：传入字段当前值文本，返回 "" 表示通过，否则返回要
+/// 显示的错误消息。内置规则见 FormRule 的静态方法；业务自定义规则
+/// 直接构造：`new FormRule(v => v == "expected" ? "" : "不一致")`。
+delegate string FormCheck(string value);
+
+/// 一条字段校验规则。规则是无状态的：每次校验时拿字段的当前值文本
+/// 重跑一遍，字段隐藏/禁用时整行跳过（见 FormRow.Active）。
+class FormRule {
+    FormCheck check;
+
+    FormRule(FormCheck c) {
+        check = c;
+    }
+
+    /// 对当前值执行本规则："" = 通过，否则为错误消息。
+    string Apply(string value) {
+        return check(value);
+    }
+
+    /// 必填：去空白后不能为空。
+    static FormRule Required(string msg) {
+        return new FormRule(v => {
+            if (v.Trim() == "") { return msg; }
+            return "";
+        });
+    }
+
+    /// 最短长度。
+    static FormRule MinLen(int n, string msg) {
+        return new FormRule(v => {
+            if (v.Length < n) { return msg; }
+            return "";
+        });
+    }
+
+    /// 最长长度。
+    static FormRule MaxLen(int n, string msg) {
+        return new FormRule(v => {
+            if (v.Length > n) { return msg; }
+            return "";
+        });
+    }
+
+    /// 电子邮件格式：`@` 不在首尾，`@` 后还有带点的域名。空值不判
+    /// （是否可空交给 Required 决定），这样「选填的邮箱」只填一半才报错。
+    static FormRule Email(string msg) {
+        return new FormRule(v => {
+            string s = v.Trim();
+            if (s == "") { return ""; }
+            int at = s.IndexOf("@");
+            if (at < 1 || at == s.Length - 1) { return msg; }
+            string host = s.Substring(at + 1);
+            int dot = host.IndexOf(".");
+            if (dot < 1 || dot == host.Length - 1) { return msg; }
+            return "";
+        });
+    }
+
+    /// 整数值域（含端点）。空值不判；非数字按越界处理。
+    static FormRule Range(int lo, int hi, string msg) {
+        return new FormRule(v => {
+            string s = v.Trim();
+            if (s == "") { return ""; }
+            if (!FormRule.IsInt(s)) { return msg; }
+            int n = Convert.ToInt32(s);
+            if (n < lo || n > hi) { return msg; }
+            return "";
+        });
+    }
+
+    /// 与另一行的值一致（确认密码、再次输入邮箱）。peer 在校验时
+    /// 实时取值，先填后改都算。
+    static FormRule EqualsField(FormRow peer, string msg) {
+        return new FormRule(v => {
+            if (peer == null) { return ""; }
+            if (v != peer.Value()) { return msg; }
+            return "";
+        });
+    }
+
+    /// 必须为真（同意条款、开启某前提）。布尔类控件（Checkbox /
+    /// Switch / Radio）的值是 "true"/"false"，Required 只看非空、
+    /// 对未勾选的 "false" 无感，所以这类约束用它。
+    static FormRule Checked(string msg) {
+        return new FormRule(v => {
+            if (v != "true") { return msg; }
+            return "";
+        });
+    }
+
+    /// 十进制整数（允许负号）。手动扫一遍而不是直接 Convert：非法
+    /// 输入在这里是常态（校验器就是为它存在的），不该走异常路径。
+    static bool IsInt(string s) {
+        if (s == "") { return false; }
+        int i = 0;
+        if (s.StartsWith("-")) { i = 1; }
+        if (i >= s.Length) { return false; }
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch < "0" || ch > "9") { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+}
+
+/// 表单里的一行：标题（可选）+ 字段控件 + 错误消息行，竖直排布。
+///
+/// 错误画法分两类：Input 自带 SetError（红框 + 字段下小字，编辑即
+/// 清除），直接用它；其余控件（TextArea / SelectBox / Switch /
+/// Checkbox / 自定义控件）没有错误态，由行内的 `label.error` 承担。
+/// 两种画法的消息都落在字段正下方，视觉一致。
+class FormRow : Panel {
+    Control field;
+    Label err;
+    List<FormRule> rules;
+
+    FormRow(string caption, Control ctl) {
+        this.InitPanel("formrow", 3);
+        this.layout = 1;
+        this.logGap = 4;
+        field = ctl;
+        rules = new List<FormRule>();
+        if (caption != "") {
+            Label cap = new Label(caption);
+            this.With(cap);
+        }
+        this.With(ctl);
+        err = new Label("");
+        err.Class = "error";
+        err.SetShown(false);
+        this.With(err);
+    }
+
+    /// 字段控件名（FormGroup.Field 的查找键）。
+    string Name() {
+        if (field == null) { return ""; }
+        return field.name;
+    }
+
+    /// 字段当前值（FormGroup.ValueOf 的类型聚合视图）。
+    string Value() {
+        return FormGroup.ValueOf(field);
+    }
+
+    /// 追加一条规则（链式）：`form.Add("邮箱", email)
+    ///   .Rule(FormRule.Required("必填")).Rule(FormRule.Email("格式不对"))`。
+    FormRow Rule(FormRule r) {
+        rules.Add(r);
+        return this;
+    }
+
+    /// 该行是否参与校验：被联动隐藏或禁用的字段不算错误——依赖
+    /// 表单里「选了配送才出现的地址」在自提时不应阻塞提交。
+    bool Active() {
+        if (field == null) { return false; }
+        return field.StyleVisible() && !field.IsDisabled();
+    }
+
+    /// 运行全部规则并就地绘制状态；返回第一条错误消息（"" = 通过）。
+    string Check() {
+        if (!this.Active()) { this.Clear(); return ""; }
+        string v = this.Value();
+        for (int i = 0; i < rules.Count; i = i + 1) {
+            string msg = rules[i].Apply(v);
+            if (msg != "") {
+                this.Paint(msg);
+                return msg;
+            }
+        }
+        this.Clear();
+        return "";
+    }
+
+    /// 静默检查：不改任何显示状态，返回第一条错误消息。
+    string Peek() {
+        if (!this.Active()) { return ""; }
+        string v = this.Value();
+        for (int i = 0; i < rules.Count; i = i + 1) {
+            string msg = rules[i].Apply(v);
+            if (msg != "") { return msg; }
+        }
+        return "";
+    }
+
+    /// 清除该行的错误显示。
+    void Clear() {
+        if (field != null && field is Input) { ((Input)field).ClearError(); }
+        err.SetShown(false);
+    }
+
+    /// 显示一条错误消息。Input 自带错误态（红框 + 字段下消息），但
+    /// 那条消息画在自身矩形之外（y+h+2 处），行式布局里正好落在下一
+    /// 行的背景之下会被整条盖掉——留一个空的错误标签占住这一行，
+    /// 消息就画在预留出的空间里。
+    void Paint(string msg) {
+        if (field != null && field is Input) {
+            ((Input)field).SetError(msg);
+            err.Text = "";
+            err.SetShown(true);
+            return;
+        }
+        err.Text = msg;
+        err.SetShown(true);
+    }
+}
+
+/// 带校验的表单容器：`Add` 进来的每个字段包成一行（标题 + 控件 +
+/// 错误行），Validate() 按规则逐行校验并就地显示第一条错误；被联动
+/// 隐藏/禁用的行自动跳过，因此「radio 切换显隐 + 必填」可以同框工作。
+///
+///     FormGroup form = new FormGroup();
+///     form.Add("用户名", name)
+///         .Rule(FormRule.Required("请输入用户名"))
+///         .Rule(FormRule.MinLen(3, "至少 3 个字符"));
+///     form.Add("确认密码", pwd2)
+///         .Rule(FormRule.EqualsField(form.Field("pwd"), "两次输入不一致"));
+///     submit.OnClick(() => { if (form.Validate()) { Save(); } });
+class FormGroup : Panel {
+    List<FormRow> rows;
+    /// 上一次 Validate 的失败行数。
+    int badCount;
+
+    FormGroup() {
+        this.InitPanel("formgroup", 3);
+        this.layout = 1;
+        this.logGap = 10;
+        rows = new List<FormRow>();
+        badCount = 0;
+    }
+
+    override string Kind() { return "FormGroup"; }
+
+    /// 添加一行字段：`caption` 为标题（可为 ""），`ctl` 是任意数据
+    /// 控件（Input / SelectBox / Switch / Checkbox / DatePicker …）。
+    /// 返回该行以便链式追加规则。
+    FormRow Add(string caption, Control ctl) {
+        FormRow r = new FormRow(caption, ctl);
+        rows.Add(r);
+        this.With(r);
+        return r;
+    }
+
+    /// 按字段控件名查行；不存在返回 null。
+    FormRow Field(string name) {
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].Name() == name) { return rows[i]; }
+        }
+        return null;
+    }
+
+    /// 行数。
+    int Count() { return rows.Count; }
+
+    /// 全量校验：逐行 Check()，失败行就地显示错误。全部通过返回 true。
+    bool Validate() {
+        badCount = 0;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].Check() != "") { badCount = badCount + 1; }
+        }
+        return badCount == 0;
+    }
+
+    /// 上一次 Validate 的失败行数。
+    int ErrorCount() { return badCount; }
+
+    /// 清除全部错误显示（重置表单时）。
+    void ClearErrors() {
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            rows[i].Clear();
+        }
+        badCount = 0;
+    }
+
+    /// 静默检查：不改动任何显示状态，全部有效才为 true。
+    bool Valid() {
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].Peek() != "") { return false; }
+        }
+        return true;
+    }
+
+    /// 静默检查时的第一条错误消息（全部有效为 ""）。
+    string FirstError() {
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            string msg = rows[i].Peek();
+            if (msg != "") { return msg; }
+        }
+        return "";
+    }
+
+    // ---- 取值 ----
+
+    /// 控件当前值的文本视图：文本类控件给文本，布尔类给
+    /// "true"/"false"，选项类给选中项文本。未知控件回退到属性
+    /// 协议的 `value`（GetExtra），再没有就为空串。
+    static string ValueOf(Control ctl) {
+        if (ctl == null) { return ""; }
+        if (ctl is Input) { return ((Input)ctl).GetText(); }
+        if (ctl is TextArea) { return ((TextArea)ctl).GetText(); }
+        if (ctl is SelectBox) { return ((SelectBox)ctl).Text(); }
+        if (ctl is Checkbox) {
+            return ((Checkbox)ctl).IsChecked() ? "true" : "false";
+        }
+        if (ctl is Switch) {
+            return ((Switch)ctl).IsOn() ? "true" : "false";
+        }
+        if (ctl is Radio) {
+            return ((Radio)ctl).IsSelected() ? "true" : "false";
+        }
+        return ctl.GetProp("value");
+    }
+
+    /// 按字段名取值（控件不存在为 ""）。
+    string Value(string name) {
+        FormRow r = this.Field(name);
+        if (r == null) { return ""; }
+        return r.Value();
+    }
+
+    /// 按字段名取布尔值（"true" 才为真）。
+    bool BoolValue(string name) {
+        return this.Value(name) == "true";
+    }
+
+    /// 按字段名取整数值（空/非法/越界回退 `def`）。
+    int IntValue(string name, int def) {
+        string s = this.Value(name).Trim();
+        if (!FormRule.IsInt(s)) { return def; }
+        return Convert.ToInt32(s);
+    }
+}

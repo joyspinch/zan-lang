@@ -1,0 +1,162 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// Covers FormGroup: the validated form container. Rules run against each
+/// field's current value, hidden/disabled rows are skipped (dependent forms
+/// hide required fields by design), and error display lands on the field
+/// itself (Input.SetError) or on the row's error label for controls that
+/// have no error state of their own. Pure computation -- no window needed.
+///
+/// Field identity is the control's `name`; the widget constructors default
+/// it to the widget kind ("input" / "switch" / ...), so every field here
+/// sets its name explicitly, exactly like a .zform document does.
+class FormGroupTest {
+    static int fails;
+
+    static void Eq(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got '" + got + "' want '" + want + "'");
+    }
+
+    static void IsTrue(string what, bool got) {
+        if (got) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void Main() {
+        fails = 0;
+
+        // ---- rules in isolation -------------------------------------
+        FormRule req = FormRule.Required("必填");
+        FormGroupTest.Eq("required blank", req.Apply("   "), "必填");
+        FormGroupTest.Eq("required ok", req.Apply(" x "), "");
+
+        FormRule min = FormRule.MinLen(3, "太短");
+        FormGroupTest.Eq("minlen short", min.Apply("ab"), "太短");
+        FormGroupTest.Eq("minlen ok", min.Apply("abc"), "");
+
+        FormRule max = FormRule.MaxLen(3, "太长");
+        FormGroupTest.Eq("maxlen long", max.Apply("abcd"), "太长");
+        FormGroupTest.Eq("maxlen ok", max.Apply("abc"), "");
+
+        FormRule mail = FormRule.Email("格式不对");
+        FormGroupTest.Eq("email empty passes", mail.Apply(""), "");
+        FormGroupTest.Eq("email no at", mail.Apply("zanzan.example"), "格式不对");
+        FormGroupTest.Eq("email at first", mail.Apply("@example.com"), "格式不对");
+        FormGroupTest.Eq("email no dot", mail.Apply("a@examplecom"), "格式不对");
+        FormGroupTest.Eq("email ok", mail.Apply("a@b.c"), "");
+
+        FormRule rng = FormRule.Range(1, 100, "超出范围");
+        FormGroupTest.Eq("range nonnumeric", rng.Apply("abc"), "超出范围");
+        FormGroupTest.Eq("range low", rng.Apply("0"), "超出范围");
+        FormGroupTest.Eq("range high", rng.Apply("101"), "超出范围");
+        FormGroupTest.Eq("range ok", rng.Apply("42"), "");
+        FormGroupTest.Eq("range negative ok", rng.Apply("-20"), "超出范围");
+        FormGroupTest.Eq("range empty passes", rng.Apply(""), "");
+
+        // ---- group: validate, locate, read back ---------------------
+        FormGroup form = new FormGroup();
+        Input name = new Input("username");
+        name.name = "name";
+        Input mail2 = new Input("you@example.com");
+        mail2.name = "email";
+        Input pwd = new Input("password");
+        pwd.name = "password";
+        Input pwd2 = new Input("repeat password");
+        pwd2.name = "confirm";
+        Checkbox agree = new Checkbox("I agree");
+        agree.name = "agree";
+        form.Add("用户名", name)
+            .Rule(FormRule.Required("请输入用户名"))
+            .Rule(FormRule.MinLen(3, "至少 3 个字符"));
+        form.Add("邮箱", mail2).Rule(FormRule.Email("邮箱格式不对"));
+        form.Add("密码", pwd).Rule(FormRule.Required("请输入密码"));
+        form.Add("确认密码", pwd2)
+            .Rule(FormRule.Required("请再输入一次"))
+            .Rule(FormRule.EqualsField(form.Field("password"), "两次输入不一致"));
+        form.Add("同意条款", agree).Rule(FormRule.Checked("请先勾选同意"));
+        FormGroupTest.Eq("row count", Convert.ToString(form.Count()), "5");
+        FormRow confirmRow = form.Field("confirm");
+        if (confirmRow == null) { FormGroupTest.IsTrue("field lookup", false); }
+        else { FormGroupTest.Eq("field lookup", confirmRow.Name(), "confirm"); }
+
+        name.SetText("ab");
+        pwd.SetText("secret");
+        pwd2.SetText("different");
+        agree.SetChecked(false);
+        FormGroupTest.IsTrue("validate fails", !form.Validate());
+        FormGroupTest.Eq("error count", Convert.ToString(form.ErrorCount()), "3");
+        // The checkbox row paints through its own error label (Check
+        // returns the message; the Input rows paint theirs on the field).
+        FormRow agreeRow = form.Field("agree");
+        if (agreeRow == null) { FormGroupTest.IsTrue("agree row", false); }
+        else {
+            FormGroupTest.Eq("agree row error", agreeRow.Check(), "请先勾选同意");
+            FormGroupTest.Eq("agree row error again", agreeRow.Check(), "请先勾选同意");
+        }
+
+        // Fix everything and the same Validate passes clean.
+        name.SetText("zan");
+        mail2.SetText("zan@example.com");
+        pwd2.SetText("secret");
+        agree.SetChecked(true);
+        FormGroupTest.IsTrue("validate passes", form.Validate());
+        FormGroupTest.Eq("no errors left", Convert.ToString(form.ErrorCount()), "0");
+        FormGroupTest.IsTrue("valid() quiet check", form.Valid());
+        FormGroupTest.Eq("first error empty", form.FirstError(), "");
+        form.ClearErrors();
+        FormGroupTest.Eq("clear keeps count at 0", Convert.ToString(form.ErrorCount()), "0");
+
+        // ---- values --------------------------------------------------
+        FormGroupTest.Eq("value text", form.Value("name"), "zan");
+        FormGroupTest.IsTrue("boolvalue true", form.BoolValue("agree"));
+        agree.SetChecked(false);
+        FormGroupTest.IsTrue("boolvalue false", !form.BoolValue("agree"));
+        agree.SetChecked(true);
+        FormGroupTest.Eq("missing field", form.Value("nope"), "");
+        FormGroupTest.Eq("intvalue default", Convert.ToString(form.IntValue("nope", 7)), "7");
+
+        // ---- hidden / disabled rows are skipped ----------------------
+        SelectBox pick = new SelectBox("pick one");
+        pick.name = "pick";
+        pick.AddOption("A");
+        pick.AddOption("B");
+        FormRow pickRow = form.Add("选项", pick).Rule(FormRule.Required("请选择"));
+        FormGroupTest.Eq("unselected select errors", pickRow.Check(), "请选择");
+        pick.Select(1);
+        FormGroupTest.Eq("selected select reads text", form.Value("pick"), "B");
+        FormGroupTest.IsTrue("select passes", form.Validate());
+
+        // A FormRow also works standalone inside any container: hidden and
+        // disabled fields are skipped by Active(), the same rule a dependent
+        // form relies on.
+        Input secret = new Input("required when visible");
+        secret.name = "secret";
+        FormRow secretRow = new FormRow("", secret).Rule(FormRule.Required("必填"));
+        FormGroupTest.Eq("visible row errors", secretRow.Check(), "必填");
+        secret.SetShown(false);
+        FormGroupTest.Eq("hidden row skipped", secretRow.Check(), "");
+        secret.SetShown(true);
+        secret.Disabled = true;
+        FormGroupTest.Eq("disabled row skipped", secretRow.Check(), "");
+        secret.Disabled = false;
+        FormGroupTest.Eq("re-enabled row errors", secretRow.Check(), "必填");
+
+        // EqualsField tracks the peer live.
+        Input a2 = new Input("");
+        Input b2 = new Input("");
+        FormRow aRow = new FormRow("", a2);
+        FormRow bRow = new FormRow("", b2).Rule(FormRule.EqualsField(aRow, "不一致"));
+        a2.SetText("x");
+        b2.SetText("x");
+        FormGroupTest.Eq("equal ok", bRow.Check(), "");
+        a2.SetText("y");
+        FormGroupTest.Eq("peer changed", bRow.Check(), "不一致");
+
+        if (fails == 0) { Console.WriteLine("formgroup_test: OK"); }
+        else { Console.WriteLine("formgroup_test: " + Convert.ToString(fails) + " failure(s)"); }
+    }
+}
