@@ -59,6 +59,30 @@ class LayerState {
     // 最小化任务条槽位（左下角横排第几个），由 RenderStack 每帧
     // 按堆叠顺序指派；单独 Render 的窗口保持 0。
     int minSlot;
+    // page 层的嵌入式正文控件树（layui page 层放任意 HTML 的等价物）：
+    // 宿主构造一棵保留的组件树（表单/面板等）挂进来，每帧渲染在
+    // 正文区。构造必须包在 Layer.BeginBody()/EndBody() 里领保留段 id。
+    Control view;
+    // 点遮罩关闭（模态对话框）：按下与抬起都落在遮罩、且不在对话框
+    // 矩形内时报告 action 2，由调用方关闭。
+    bool shadeClose;
+    // prompt 形态：0 文本，1 密码（Input.password），2 多行（TextArea）。
+    int promptFormType;
+    // >0 时输入的 UTF-8 字节上限（Input 内部按字节计游标）。
+    int promptMaxLen;
+    TextArea promptArea; // formType 2 的多行输入框（此时 promptInput 为 null）
+    // ---- 窗口缩放（左/右/下缘 + 左下/右下角） ----
+    bool sizing;
+    int rDir;            // 1 左缘，2 右缘，3 下缘，4 右下角，5 左下角
+    int rStartX;
+    int rStartY;
+    int rStartW;
+    int rStartH;
+    int rsLId;
+    int rsRId;
+    int rsBId;
+    int rsSEId;
+    int rsSWId;
 
     // Layer 专用保留 id 段的游标（seq 域，id = 1000000 + 段内序号）。
     static int winSeq;
@@ -107,6 +131,23 @@ class LayerState {
         this.cancelBtn = new Button { };
         this.altBtn = new Button { };
         this.promptInput = null;
+        this.promptArea = null;
+        this.view = null;
+        this.shadeClose = false;
+        this.promptFormType = 0;
+        this.promptMaxLen = 0;
+        this.sizing = false;
+        this.rDir = 0;
+        this.rStartX = 0;
+        this.rStartY = 0;
+        this.rStartW = 0;
+        this.rStartH = 0;
+        // 缩放把手也领保留段 id（渲染时每帧注册，id 必须跨帧稳定）。
+        this.rsLId = WidgetId.Next();
+        this.rsRId = WidgetId.Next();
+        this.rsBId = WidgetId.Next();
+        this.rsSEId = WidgetId.Next();
+        this.rsSWId = WidgetId.Next();
         WidgetId.SetSeq(outer);
     }
 
@@ -142,18 +183,44 @@ class LayerState {
 
     /// 带文本输入框的居中模态 prompt 对话框（OK + Cancel）。
     static LayerState Prompt(string title, string hint) {
-        LayerState s = new LayerState(title, 0, 0, 420, 220);
+        return LayerState.PromptWith(title, hint, 0, "", 0);
+    }
+
+    /// 强化版 prompt：formType 0 文本 / 1 密码 / 2 多行，value 为
+    /// 初值（"" 表示空），maxLen > 0 时限制输入的 UTF-8 字节长度。
+    static LayerState PromptWith(string title, string hint, int formType,
+                                 string value, int maxLen) {
+        LayerState s = new LayerState(title, 0, 0, 420,
+                                      formType == 2 ? 340 : 220);
         s.kind = 2;
         s.modal = true;
         s.dtype = 0;
         s.twoButtons = true;
+        s.promptFormType = formType;
+        s.promptMaxLen = maxLen;
         // promptInput 在构造器之外创建，同样领保留段 id（理由见构造器）。
         int outer = WidgetId.SeqValue();
         WidgetId.SetSeq(930000 + LayerState.winSeq);
         LayerState.winSeq = LayerState.winSeq + 16;
-        s.promptInput = new Input(hint);
+        if (formType == 2) {
+            s.promptArea = new TextArea(hint);
+            if (value != "") { s.promptArea.SetText(value); }
+        } else {
+            s.promptInput = new Input(hint);
+            if (value != "") { s.promptInput.SetText(value); }
+            if (formType == 1) { s.promptInput.password = true; }
+            if (maxLen > 0) { s.promptInput.MaxLen = maxLen; }
+        }
         WidgetId.SetSeq(outer);
         return s;
+    }
+
+    /// page 层宿主控件：把一棵保留的组件树挂进窗口正文
+    /// （layui page 层放任意 HTML 的等价物——表单、面板等组合）。
+    /// 构造这棵树时必须包在 Layer.BeginBody()/EndBody() 里，否则
+    /// 控件在点击回调里中途领宿主计数器的 id，会重演“信号污染”。
+    void SetBody(Control v) {
+        view = v;
     }
 
     void Open() {
@@ -161,10 +228,16 @@ class LayerState {
         action = 0;
         openMs = Window.GetTickMs();
         if (state == 2) { state = 0; }
+        // 进打开注册表（按打开顺序，末尾最上）——键盘语义
+        // （Esc/Enter）与 CloseLast/CloseAll 依赖这份次序。
+        Layer.EnsureZorder();
+        Layer.zorder.Remove(this);
+        Layer.zorder.Add(this);
     }
 
     /// 用户在 prompt layer 中键入的文字（未输入时为空）。
     string PromptText() {
+        if (promptArea != null) { return promptArea.GetText(); }
         if (promptInput == null) { return ""; }
         return promptInput.GetText();
     }
@@ -210,6 +283,153 @@ class Layer {
     // 什么也没画）。
     static List<int> toastPrev;
     static List<int> notifPrev;
+    // ---- 打开注册表（键盘语义与 CloseLast/CloseAll 的次序依据） ----
+    // Open() 时按打开顺序入表（末尾最上），关闭后惰性剔除。
+    static List<LayerState> zorder;
+    // ---- photos 的键盘会话状态：RenderPhotos 每帧刷新， ----
+    // Key() 借此判断照片层是否仍在屏上（250ms 内算活着）。
+    static int photosTick;
+    static SignalInt photosIdx;
+    static int photoCount;
+    static bool photosCloseReq;
+    // ---- page 层正文控件树的保留 id 段游标（seq 域） ----
+    static int savedSeq;
+    static int bodySeq;
+
+    static void EnsureZorder() {
+        if (Layer.zorder == null) { Layer.zorder = new List<LayerState>(); }
+    }
+
+    /// 剔除已关闭的注册项（随渲染路径惰性调用）。
+    static void PruneZorder() {
+        Layer.EnsureZorder();
+        for (int i = Layer.zorder.Count - 1; i >= 0; i = i - 1) {
+            if (!Layer.zorder[i].open) { Layer.zorder.RemoveAt(i); }
+        }
+    }
+
+    /// 最上层打开中的对话框（kind 1/2），无则 null。
+    static LayerState TopmostDialog() {
+        Layer.EnsureZorder();
+        int i = Layer.zorder.Count - 1;
+        while (i >= 0) {
+            LayerState s = Layer.zorder[i];
+            if (s.open && s.kind != 0) { return s; }
+            i = i - 1;
+        }
+        return null;
+    }
+
+    /// `s` 是否是当前最上层打开中的 layer（渲染路径里避免同一键
+    /// 事件被多个对话框重复消费）。
+    static bool IsTopmost(LayerState s) {
+        Layer.EnsureZorder();
+        int i = Layer.zorder.Count - 1;
+        while (i >= 0) {
+            if (Layer.zorder[i].open) { return Layer.zorder[i] == s; }
+            i = i - 1;
+        }
+        return false;
+    }
+
+    /// Esc 的语义：最上层对话框报告取消（action 2，由调用方关闭；
+    /// 与 X 的 action 3、按钮的 1/2 一致）。photos 在屏时请求关闭。
+    static bool CloseTopmostDialog() {
+        LayerState top = Layer.TopmostDialog();
+        if (top != null) {
+            top.action = 2;
+            return true;
+        }
+        if (Window.GetTickMs() - Layer.photosTick < 250) {
+            Layer.photosCloseReq = true;
+            return true;
+        }
+        return false;
+    }
+
+    /// 关闭最上层打开中的 layer（直接置 open=false，不产生 action）。
+    /// kind 0 窗口 / 1 对话框 / 2 提示框，-1 不限。无则返回 false。
+    static bool CloseLast(int kind) {
+        Layer.PruneZorder();
+        int i = Layer.zorder.Count - 1;
+        while (i >= 0) {
+            LayerState s = Layer.zorder[i];
+            if (s.open && (kind < 0 || s.kind == kind)) {
+                s.open = false;
+                return true;
+            }
+            i = i - 1;
+        }
+        if (kind < 0 && Window.GetTickMs() - Layer.photosTick < 250) {
+            Layer.photosCloseReq = true;
+            return true;
+        }
+        return false;
+    }
+
+    /// 关闭全部打开中的 layer（不产生 action）。photos 不经注册表，
+    /// 由 CloseLast(-1) 的兜底分支请求关闭。
+    static void CloseAll(int kind) {
+        Layer.PruneZorder();
+        for (int i = 0; i < Layer.zorder.Count; i = i + 1) {
+            LayerState s = Layer.zorder[i];
+            if (s.open && (kind < 0 || s.kind == kind)) { s.open = false; }
+        }
+    }
+
+    /// 键盘语义（宿主在 key-down 事件里调用；对话框与 photos 的渲染
+    /// 路径也经此消费）。Esc 关最上层（对话框优先、photos 次之），
+    /// Enter 确认最上层对话框（多行 prompt 除外——Enter 是换行），
+    /// ←/→ 在 photos 里翻页。有下拉/菜单等框架弹层打开时让位
+    /// （框架自己收 Esc）。返回 true 表示本次按键已被层消费。
+    static bool Key(App app, int code) {
+        if (app.HasOverlays()) { return false; }
+        if (code == 27) {
+            if (Layer.CloseTopmostDialog()) {
+                app.RequestRedraw();
+                return true;
+            }
+            return false;
+        }
+        if (code == 13) {
+            LayerState top = Layer.TopmostDialog();
+            if (top != null && top.promptFormType != 2) {
+                top.action = 1;
+                app.RequestRedraw();
+                return true;
+            }
+            return false;
+        }
+        if ((code == 37 || code == 39)
+            && Window.GetTickMs() - Layer.photosTick < 250) {
+            SignalInt idx = Layer.photosIdx;
+            if (idx != null && Layer.photoCount > 0) {
+                int v = idx.Get() + (code == 39 ? 1 : 0 - 1);
+                if (v < 0) { v = Layer.photoCount - 1; }
+                if (v >= Layer.photoCount) { v = 0; }
+                idx.Set(v);
+                app.RequestRedraw();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// page 层正文控件树的构造包裹（与 LayerState.SetBody 配对）：
+    /// BeginBody 把 WidgetId 计数器切到 Layer 专属的 body 保留段
+    /// （seq 980000 起，每棵树步长 1024），EndBody 构造完还原宿主
+    /// 计数器并前进游标。正文控件在点击回调里中途 new 出来，若直接
+    /// 从宿主计数领号，领走的正是随后每帧控件的本命 id（“信号污染”）。
+    static void BeginBody() {
+        if (Layer.bodySeq < 980000) { Layer.bodySeq = 980000; }
+        Layer.savedSeq = WidgetId.SeqValue();
+        WidgetId.SetSeq(Layer.bodySeq);
+    }
+
+    static void EndBody() {
+        Layer.bodySeq = Layer.bodySeq + 1024;
+        WidgetId.SetSeq(Layer.savedSeq);
+    }
 
     static void EnsureQueues() {
         if (Layer.toasts == null) { Layer.toasts = new List<ToastItem>(); }
@@ -650,6 +870,17 @@ class Layer {
         int H = c.Height();
         int top = app.titlebarH;
 
+        // 键盘会话：记录当前索引/张数与活跃时刻（Key 判断照片层
+        // 是否顶屏），消费宿主或上帧转来的关闭请求。
+        Layer.photosTick = Window.GetTickMs();
+        Layer.photosIdx = idx;
+        Layer.photoCount = slides.Count;
+        bool wantClose = Layer.photosCloseReq;
+        Layer.photosCloseReq = false;
+        if (app.EventKind() == 4) {
+            Layer.Key(app, app.window.EventKeyCode());
+        }
+
         StyleBox s = Style.Of(app, "photos", "", Style.SNormal());
         int fontSize = s.FontOr(Style.FontFallback(app, "medium"));
         c.FillRect(0, top, W, H - top, s.bg);
@@ -696,6 +927,8 @@ class Layer {
             && app.ClickTarget() == scrimId) {
             return true;
         }
+        // Esc（Layer.Key 置的关闭请求）：下一帧在渲染开头兑现。
+        if (wantClose) { return true; }
         return false;
     }
 
@@ -730,6 +963,49 @@ class Layer {
 
     static bool Inside(int mx, int my, int x, int y, int w, int h) {
         return mx >= x && mx < x + w && my >= y && my < y + h;
+    }
+
+    /// 缩放拖拽的几何推导：从 rStart* 起始几何与当前鼠标位推出新的
+    /// x/y/w/h（含最小尺寸与客户区钳制）。dir 与 s.rDir 同义：
+    /// 1 左缘，2 右缘，3 下缘，4 右下角，5 左下角。渲染拖动与
+    /// 无窗口回归共用这一份推导。
+    static void ApplyResize(App app, LayerState s, int mx, int my) {
+        int W = app.canvas.Width();
+        int H = app.canvas.Height();
+        int minW = app.Scale(220);
+        int minH = app.Scale(120);
+        int dir = s.rDir;
+        int dx = mx - s.grabDx;
+        int dy = my - s.grabDy;
+        if (dir == 1 || dir == 5) {
+            // 左缘：x/w 联动，最小宽度时钉住左缘，钳到客户区左界。
+            int nx = s.rStartX + dx;
+            int nw = s.rStartW - dx;
+            if (nw < minW) {
+                nw = minW;
+                nx = s.rStartX + s.rStartW - minW;
+            }
+            if (nx < 0) {
+                nw = nw + nx;
+                nx = 0;
+            }
+            s.x = nx;
+            s.w = nw;
+        }
+        if (dir == 2 || dir == 4) {
+            // 右缘：只动宽度，最小宽度与客户区右界钳制。
+            int nw = s.rStartW + dx;
+            if (nw < minW) { nw = minW; }
+            if (s.rStartX + nw > W) { nw = W - s.rStartX; }
+            s.w = nw;
+        }
+        if (dir >= 3) {
+            // 下缘/两角：只动高度，最小高度与客户区底界钳制。
+            int nh = s.rStartH + dy;
+            if (nh < minH) { nh = minH; }
+            if (s.rStartY + nh > H) { nh = H - s.rStartY; }
+            s.h = nh;
+        }
     }
 
     /// 最小化窗口在左下角任务条上的位置（仅剩一条标题栏，宽 260）：
@@ -791,6 +1067,7 @@ class Layer {
     /// 任一窗口都会将其置顶；只有指针下最顶层的窗口（或被拖动者）
     /// 才消费鼠标事件。
     static void RenderStack(App app, List<LayerState> list) {
+        Layer.PruneZorder();
         int ek = app.EventKind();
         int mx = app.mouseX;
         int my = app.mouseY;
@@ -895,6 +1172,23 @@ class Layer {
         app.focus.RegisterFocusable(s.maxId);
         app.focus.RegisterFocusable(s.closeId);
 
+        // 缩放把手（仅正常态）：左右缘 SIZEWE、下缘 SIZENS、
+        // 右下/左下角走对角缩放光标（wtype 7/8）。右缘从标题栏
+        // 下方开始，避免盖住关闭钮；后注册覆盖先注册，把手压过
+        // 窗体拦截区与标题栏左缘（与 Windows 边缘行为一致）。
+        if (s.state == 0) {
+            int g = app.Scale(5);
+            int cg = app.Scale(9);
+            app.hitTester.RegisterRect(s.rsLId, ex, ey, g, eh - cg, 4);
+            app.hitTester.RegisterRect(s.rsRId, ex + ew - g, ey + bar, g,
+                                       eh - bar - g, 4);
+            app.hitTester.RegisterRect(s.rsBId, ex + cg, ey + eh - g,
+                                       ew - cg * 2, g, 5);
+            app.hitTester.RegisterRect(s.rsSEId, ex + ew - cg,
+                                       ey + eh - cg, cg, cg, 7);
+            app.hitTester.RegisterRect(s.rsSWId, ex, ey + eh - cg, cg, cg, 8);
+        }
+
         if (!active) { ek = 0; }
 
         if (active && s.state == 0 && Ui.PressedDown(app, s.barId)) {
@@ -958,6 +1252,41 @@ class Layer {
             app.RequestRedraw();
         }
 
+        // 缩放：按下把手记起始几何与鼠标位（grabDx/Dy 复用为起始
+        // 鼠标位），拖动期间由 ApplyResize 从起始几何现推新矩形。
+        if (active && s.state == 0 && ek == 2 && !s.dragging) {
+            int dir = 0;
+            if (Ui.PressedDown(app, s.rsSEId)) { dir = 4; }
+            else if (Ui.PressedDown(app, s.rsSWId)) { dir = 5; }
+            else if (Ui.PressedDown(app, s.rsLId)) { dir = 1; }
+            else if (Ui.PressedDown(app, s.rsRId)) { dir = 2; }
+            else if (Ui.PressedDown(app, s.rsBId)) { dir = 3; }
+            if (dir > 0) {
+                s.sizing = true;
+                s.rDir = dir;
+                s.rStartX = s.x;
+                s.rStartY = s.y;
+                s.rStartW = s.w;
+                s.rStartH = s.h;
+                s.grabDx = mx;
+                s.grabDy = my;
+            }
+        }
+        if (ek == 1 && s.sizing) {
+            Layer.ApplyResize(app, s, mx, my);
+            ex = s.x;
+            ey = s.y;
+            ew = s.w;
+            eh = s.h;
+            closeX = ex + ew - bw;
+            maxX = closeX - bw;
+            minX = maxX - bw;
+            app.RequestRedraw();
+        }
+        if (Ui.MouseReleased(app) && s.sizing) {
+            s.sizing = false;
+        }
+
         c.FillRoundRect(ex - app.Scale(1), ey + app.Scale(6), ew + app.Scale(2),
                         eh, rad + app.Scale(4), 0x22000000);
         c.FillRoundRect(ex + app.Scale(1), ey + app.Scale(3), ew - app.Scale(2),
@@ -1017,6 +1346,15 @@ class Layer {
             if (s.body != "") {
                 c.DrawText(bx, byy, s.body, bodyStyle.fg, bodyFont);
             }
+            // page 层的嵌入式控件树：占满正文剩余空间（正文文本在
+            // 上方时下移一行）。树由宿主构造一次（BeginBody/EndBody
+            // 领保留段 id），这里每帧原样渲染。
+            if (s.view != null) {
+                int vy = byy;
+                if (s.body != "") { vy = byy + app.Scale(28); }
+                s.view.RenderInside(app, new Rect(bx, vy,
+                    ew - app.Scale(40), bodyBottom - vy - app.Scale(8)));
+            }
             if (s.action == 1) {
                 app.canvas.DrawStyledText(
                     Style.Of(app, "label", "secondary", Style.SNormal()),
@@ -1063,6 +1401,13 @@ class Layer {
 
         int entP = Layer.Entrance(app, s);
 
+        // 键盘：Esc=取消、Enter=确认。只由最上层对话框消费（同帧多
+        // 个对话框不重复消费），且 photos 顶屏时让位给照片层。
+        if (app.EventKind() == 4 && Layer.IsTopmost(s)
+            && Window.GetTickMs() - Layer.photosTick >= 250) {
+            Layer.Key(app, app.window.EventKeyCode());
+        }
+
         int w = app.Scale(s.w);
         int h = app.Scale(s.h);
         int x = (W - w) / 2;
@@ -1076,7 +1421,7 @@ class Layer {
         StyleBox surf = Style.Part(app, "dialog", "surface", "", "", "",
                                    Style.SNormal());
         c.FillRect(0, 0, W, H, ov.bg);
-        app.BlockHitsBelow();
+        int shadeId = app.BlockHitsBelow();
         NativeLayer.Occlude(app, 0, 0, W, H);
 
         c.FillRoundRect(x + surf.shadowDx, y + surf.shadowDy, w, h, rad,
@@ -1174,6 +1519,14 @@ class Layer {
         if (app.EventKind() == 3
             && app.ClickTarget() == closeId) {
             s.action = 3;
+        }
+        // shadeClose：按下与抬起都落在遮罩、且不在对话框矩形内，
+        // 视为取消（action 2，由调用方关闭）。
+        if (s.shadeClose && app.EventKind() == 3
+            && app.ClickTarget() == shadeId
+            && app.PressTarget() == shadeId
+            && !Layer.Inside(app.mouseX, app.mouseY, x, y, w, h)) {
+            s.action = 2;
         }
     }
 

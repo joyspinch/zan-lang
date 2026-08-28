@@ -297,6 +297,10 @@ class App {
     // 局部帧（悬停条带、动画矩形、纯特效就地呈现）的总开关，默认
     // 关闭：每一帧都整窗重绘并整窗上传。见 SetPartialFrames。
     bool partialFrames;
+    // 刚处理过滚轮（kind 13）：滚动把内容挪到了指针底下，而悬停
+    // 目标按旧内容解析的，需要在出帧（命中区已按新位置重注册）之后
+    // 重算一次。见 RefreshScrollHover。
+    bool scrollHoverDirty;
     // 本应用要求的光栅器：RenderBackend.Cpu/Gpu/Auto。默认 CPU，见
     // SetRenderBackend。
     int renderBackendMode;
@@ -763,6 +767,7 @@ class App {
         this.partialBlocked = false;
         this.forceFullNext = false;
         this.partialFrames = false;
+        this.scrollHoverDirty = false;
         this.renderBackendMode = RenderBackend.Cpu();
         this.dmgW = 0;
         this.dmgH = 0;
@@ -2521,6 +2526,24 @@ class App {
         }
     }
 
+    /// 滚轮把内容挪到指针底下之后重算悬停目标。滚轮帧处理时命中
+    /// 区还是上一帧（滚动前）的，就地 HitTest 只会得到同样过期的
+    /// 目标——所以在出帧之后按新注册的矩形重算；变了就补一条
+    /// 悬停条带帧，把新旧两个目标的预览都画对。没有这一步，滚轮
+    /// 滚过后悬停预览一直挂在滚动前的那一行上（指针明明已经在
+    /// 另一行上），直到下一次指针移动才被纠正。
+    void RefreshScrollHover() {
+        if (!this.scrollHoverDirty) { return; }
+        this.scrollHoverDirty = false;
+        int nh = hitTester.HitTest(mouseX, mouseY);
+        if (nh == focus.hoveredId) { return; }
+        int oh = focus.hoveredId;
+        focus.SetHovered(nh);
+        this.NoteRedrawWhy("scroll-hover");
+        if (!needsRedraw) { this.NoteHoverDamage(oh, nh); }
+        needsRedraw = true;
+    }
+
     /// <summary>记录一条被捕获的界面异常。</summary>
     void NoteFrameError(string origin, string message) {
         lastFrameError = origin + ": " + message;
@@ -3802,6 +3825,10 @@ class App {
                 Window.SetCursor(4);
             } else if (wtype == 6) {
                 Window.SetCursor(6);
+            } else if (wtype == 7) {
+                Window.SetCursor(7);
+            } else if (wtype == 8) {
+                Window.SetCursor(8);
             } else {
                 Window.SetCursor(0);
             }
@@ -3883,6 +3910,9 @@ class App {
             int viewH = canvas.Height() - titlebarH;
             mouseX = window.EventX();
             mouseY = window.EventY();
+            // 滚动把新内容挪到了指针底下：悬停按出帧后的命中区重算
+            // （此刻命中区还是上一帧的，只能在 PresentFrame 之后做）。
+            this.scrollHoverDirty = true;
             if (this.HasOverlays() || blocksInputBelow) {
                 // 弹层和模态遮罩拥有本输入帧。让它们的
                 // 渲染路径消费滚轮，而不是移动
@@ -4062,6 +4092,8 @@ class App {
             else if (wtype == 4) { Window.SetCursor(3); }
             else if (wtype == 5) { Window.SetCursor(4); }
             else if (wtype == 6) { Window.SetCursor(6); }
+            else if (wtype == 7) { Window.SetCursor(7); }
+            else if (wtype == 8) { Window.SetCursor(8); }
             else { Window.SetCursor(0); }
         }
 
@@ -4535,6 +4567,11 @@ class App {
         // 使下一渲染帧能检测进入/离开和焦点/失焦转换
         // （Ui.Entered/Left/FocusGained/FocusLost）。
         focus.RollFrame();
+        // 滚轮把内容挪到指针底下的那一帧在出完帧后重算悬停目标：
+        // 此时命中区已按滚动后的新位置注册完毕，重算才是准的。
+        // （放在 PresentFrame 而不是 SafeFrame/RunLoop——自托管应用
+        // 大多写自己的循环，只有这里是所有应用共用的收口。）
+        this.RefreshScrollHover();
     }
 
     /// 帧分析器的空闲侧：记一圈事件循环走了哪条等待路径、被什么

@@ -151,6 +151,7 @@ class Program {
         slides.Add("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'"
             + " width='72' height='48'><rect width='72' height='48'"
             + " fill='#2b6cb0'/></svg>");
+        slides.Add(slides[0]);
         int cbw = Layer.BtnW(app);
         int ccx = 50 + 300 - cbw + cbw / 2;
         int ccy = 60 + Layer.BarH(app) / 2;
@@ -178,6 +179,111 @@ class Program {
         Layer.RenderStack(app, stack);
         Eq("window close recovers after photos closed",
            app.hitTester.AnchorIdOf(1), win.closeId);
+
+        // ---- 窗口缩放：把手命中区 + 几何推导 ----------------------
+        // 把手领保留段 id（跨帧稳定）：右缘 wtype 4 (SIZEWE)、下缘
+        // 5 (SIZENS)、右下角 7 / 左下角 8（对角缩放光标）。几何推导
+        // ApplyResize 与渲染拖动共用，直接喂合成鼠标位断言。
+        app.hitTester.Clear();
+        Layer.RenderStack(app, stack);
+        List<int> rz = app.hitTester.RectOf(win.rsRId);
+        True("resize right zone", rz != null);
+        if (rz != null) {
+            Eq("resize right x", rz[0], 50 + 300 - app.Scale(5));
+            Eq("resize right type", app.hitTester.GetWidgetType(win.rsRId), 4);
+        }
+        List<int> rb = app.hitTester.RectOf(win.rsBId);
+        True("resize bottom zone", rb != null);
+        if (rb != null) {
+            Eq("resize bottom type", app.hitTester.GetWidgetType(win.rsBId), 5);
+        }
+        Eq("resize SE type", app.hitTester.GetWidgetType(win.rsSEId), 7);
+        Eq("resize SW type", app.hitTester.GetWidgetType(win.rsSWId), 8);
+
+        win.rDir = 2;
+        win.rStartX = 50; win.rStartY = 60;
+        win.rStartW = 300; win.rStartH = 200;
+        win.grabDx = 350; win.grabDy = 0;
+        Layer.ApplyResize(app, win, 420, 0);
+        Eq("resize right grows w", win.w, 370);
+        win.rDir = 1;
+        win.rStartX = 50; win.rStartW = 300;
+        win.grabDx = 50;
+        Layer.ApplyResize(app, win, 30, 0);
+        Eq("resize left edge moves x", win.x, 30);
+        Eq("resize left edge grows w", win.w, 320);
+        win.rStartX = 50; win.rStartW = 300;
+        // 向右拖收窄（mx-grabDx=+200 > 300-220），触发最小宽钳制。
+        Layer.ApplyResize(app, win, 250, 0);
+        Eq("resize left min width", win.w, app.Scale(220));
+        Eq("resize left min pins x", win.x, 50 + 300 - app.Scale(220));
+        win.rDir = 3;
+        win.rStartY = 60; win.rStartH = 200;
+        win.grabDy = 260;
+        Layer.ApplyResize(app, win, 0, 400);
+        Eq("resize bottom grows h", win.h, 340);
+        win.rDir = 4;
+        win.rStartW = 300; win.rStartH = 200;
+        win.grabDx = 350; win.grabDy = 260;
+        Layer.ApplyResize(app, win, 450, 360);
+        Eq("resize SE grows w", win.w, 400);
+        Eq("resize SE grows h", win.h, 300);
+
+        // ---- 键盘语义：Esc/Enter/箭头 ------------------------------
+        // Enter 确认最上层对话框（action 1），Esc 取消（action 2），
+        // ←/→ 在 photos 会话里翻页（250ms 活跃窗），Esc 无对话框时
+        // 请求关闭 photos。
+        LayerState dlg2 = LayerState.Confirm("Q", "body", 0);
+        dlg2.Open();
+        True("key: dialog consumed enter",
+             Layer.Key(app, 13) && dlg2.action == 1);
+        dlg2.open = false;
+        dlg2.action = 0;
+        dlg2.Open();
+        True("key: dialog consumed esc",
+             Layer.Key(app, 27) && dlg2.action == 2);
+        // 宿主读到 action 后关闭（Key 不直接置 open——关闭权在调用方）。
+        dlg2.open = false;
+        True("key: photos eats right arrow", Layer.Key(app, 39));
+        Eq("key: photos idx advanced", pidx.Get(), 1);
+        True("key: photos eats left arrow", Layer.Key(app, 37));
+        Eq("key: photos idx back", pidx.Get(), 0);
+        True("key: photos eats esc", Layer.Key(app, 27));
+        app.hitTester.Clear();
+        True("photos close request delivered",
+             Layer.RenderPhotos(app, slides, pidx, panim));
+
+        // ---- page 层正文控件树：BeginBody/EndBody 保留段 ----------
+        // 正文控件在点击回调里中途构造，若从宿主计数领号会重演
+        // “信号污染”；包裹后宿主计数零消耗、控件 id 落在 body 段。
+        int hostA2 = WidgetId.Next();
+        Layer.BeginBody();
+        Panel form = Panel.Column();
+        Button formBtn = new Button("Save");
+        form.With(formBtn);
+        Layer.EndBody();
+        int hostB2 = WidgetId.Next();
+        Eq("body view host counter untouched", hostB2 - hostA2, 1);
+        True("body view id in reserved band", formBtn.wid >= 1980001);
+        win.SetBody(form);
+        app.hitTester.Clear();
+        Layer.RenderStack(app, stack);
+        True("body view rendered", app.hitTester.RectOf(win.barId) != null);
+
+        // ---- 关闭编排：CloseLast / CloseAll ------------------------
+        LayerState win4 = new LayerState("W4", 10, 10, 200, 150);
+        win4.Open();
+        LayerState dlg3 = LayerState.Confirm("C", "b", 0);
+        dlg3.Open();
+        True("closeLast kind1 closes dialog", Layer.CloseLast(1));
+        True("dialog closed", !dlg3.open);
+        True("closeLast kind0 closes window", Layer.CloseLast(0));
+        True("window4 closed", !win4.open);
+        win4.Open();
+        dlg3.Open();
+        Layer.CloseAll(0);
+        True("closeAll windows closed", !win4.open && !win.open);
+        True("closeAll keeps dialogs", dlg3.open);
 
         if (fails == 0) {
             Console.WriteLine("layer: OK");
