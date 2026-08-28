@@ -2482,3 +2482,21 @@ ImageHttp 二进制路径的 `body` 恰为 null，滚动触发任意页图片取
 - 遗留观察（未修，1/41 记录）：`ResolvedSeries_Of` 读 `addr=0x5`
   ——null ChartSeries 直接解引用，属应用级空引用，与探针缺陷不同类；
   该记录出自旧构建，gui_charts 正在重构，随重构观察。
+
+---
+
+## Gui/Chart 后续（2.2.7 对齐轮遗留）
+
+ECharts 2.2.7 全 134 示例对齐六批已收口（见 docs/CHART_VS_ECHARTS_227.md）；
+以下为本轮范围裁决时**有意不做**、单独立项的后续：
+
+* [ ] **chart timeline 子系统**：2.2.7 `timeline`（bar11/map14/map19/pie7/
+  scatter4 五例）——帧序列 + 播放控制 + option 时间轴合并。牵涉
+  ChartOption 多帧数据模型与 App 时钟接入（本封装全链路确定性，帧推进需显式
+  frame 入参而非读时钟），是一个组件级子系统，非字段补齐；判定标准：五个
+  timeline 示例可在 gallery 播放。
+* [ ] **架构注记 A：共享坐标系共存层**：2.2.7 跨图族混搭（mix3 地图+饼选、
+  mix11 仪表+漏斗）靠每族自带定位项共存；我们按 LeadType 单渲染器分发
+  （ChartView.DispatchKind），一族一画布。做整图族定位共存 = 抽出共享
+  坐标系/布局层供多渲染器叠画，重构面大于收益，待真实需求再立项。
+  附带同批缺口：`dataRange.hoverLink` 反向联动、connect() 多图联动。

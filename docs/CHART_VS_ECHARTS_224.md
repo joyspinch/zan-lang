@@ -4,6 +4,17 @@
 > 审计方式：stdlib/Gui/Component/Chart/ 全部 21 个文件（≈8.6k 行）逐文件通读 +
 > 缺失项 grep 反证。标注口径：**已实现**=有代码路径且可从 option/API 表达；
 > **部分实现**=有入口但语义缩水；**未实现**=全目录 grep 无任何消费点。
+>
+> **📌 时效声明（2026-08）**：本账本是补齐**前**的审计快照，其中「未实现/部分实现」
+> 多数已随六批补齐落地（symbol 形状族、markLine average/min/max、axisLabel
+> rotate/interval + nameLocation、HBarCore、emphasis 闭环 + pie/map 选中、
+> radar shape/splitArea、dataRange 组件（calculable + splitList）、legend
+> formatter/orient/selectedMode、force scaling/gravity/min-maxRadius、
+> chord sort/sortSub/gap/ribbonType、funnel funnelAlign/gap/转化率、
+> wordCloud sizeRange/textRotation）。逐示例可表达性的**当前**口径见
+> [CHART_VS_ECHARTS_227.md](CHART_VS_ECHARTS_227.md)；下文保留作历史审计依据，
+> 未再逐项回改。仍开放的：timeline 子系统、hoverLink 反向联动、整图族定位共存层
+> （connect 多图联动）——见 TASKS.md。
 
 ## ⚠ 口径修订：以 2.2.4 为准的重新定性
 
