@@ -1733,7 +1733,7 @@ ApplyEvent 之间消失，与命中区无关。样本极少且均发生在锁屏
 # A63 · Gui.Widget.Countdown 倒计时组件（Naive UI n-countdown）—— ✅ 已完成（2026-08-28）
 
 目标：纯 Zan 倒计时控件，`Duration` 毫秒倒数、归零触发 `Finish`、`Active` 暂停/恢复、
-`Format` 令牌控制显示位面。零 runtime 改动。
+`Format` 令牌控制显示位面（`S` 十分位、`SS` 百分位）。零 runtime 改动。
 
 - **组件**（`stdlib/Gui/Widget/Countdown.zan`）：`Duration`（Binding<int>，变化即
 重摆）、`Active`（Binding<bool>，暂停冻结剩余值、恢复不跳变）、`Format`（空串按
@@ -1750,6 +1750,8 @@ ApplyEvent 之间消失，与命中区无关。样本极少且均发生在锁屏
 
 - **注册**：ControlFactory（Kinds + Create）、`tools/mcp_server/zform.controls.txt`
 补 Countdown 行（policy_zform_schema 守门）。
+
+- **运行时节奏**（后续补充）：Win32 后端 Init 补 `timeBeginPeriod(1)`——系统默认时钟中断约 15.6ms 一拍，`MsgWaitForMultipleObjects`/`Sleep` 超时拖到下一拍，动画截止 16ms 实际落在 15.6~31.2ms，帧间隔 16↔31ms 交替即"背景动画一卡一卡"的根因；`SS` 百分位按 60fps 封顶排程（16ms）而非 10ms，显示值由 tick 差值现算逐帧准确。
 
 - **测试**：`tests/gui/countdown_test.zan` + golden（无窗口，时刻由测试注入）：
 格式令牌九例（默认/双写/十分位/天/零/负钳制/字面量/尾随 s）、tick 推进/掉帧追平/

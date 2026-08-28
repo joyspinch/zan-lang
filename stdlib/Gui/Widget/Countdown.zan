@@ -13,14 +13,17 @@ namespace Gui.Widget;
 ///   | mm   | 分（补零）               |
 ///   | ss   | 秒（补零）               |
 ///   | S    | 十分之一秒（1 位数字）    |
+///   | SS   | 百分之一秒（补零，2 位）  |
 ///
 /// 时间单位一律双写，其余字符（含单个 h/m/s）原样输出，因此
 /// `"mm:ss"`、`"ss.S"`、`"D 天 HH:mm:ss"` 都是合法格式，而
 /// `"T-minus"` 这类字面量不会被吃掉；`"sss"` 渲染成 `"05s"`。
 /// 时刻由 tick 差值推得（不按帧数累计），掉帧、窗口失焦再回来
 /// 都不会走慢；走动期间经 `App.RequestAnimationFrameIn` 限速
-/// 重绘——秒级格式只在对齐秒边界时醒来，含 `S` 才以 100ms 节奏
-/// 刷新。
+/// 重绘——秒级格式只在对齐秒边界时醒来，含 `S` 以 100ms 节奏、
+/// 含 `SS` 以 16ms（60fps，显示帧率封顶）节奏刷新。百分位**不**
+/// 按 10ms 排程：显示值每帧由 tick 差值现算，60fps 下依然逐帧
+/// 准确，而 100 次唤醒/秒会让事件循环永远睡不成。
 ///
 ///     Countdown cd = new Countdown(5 * 60000, "mm:ss");
 ///     cd.Finish += () => { label.Text = "Done"; };
@@ -44,7 +47,7 @@ class Countdown : Control {
     int lastDuration;    // 探测 Duration 绑定变化
     bool finished;
     bool activeNow;
-    bool usesTenths;     // 格式含 S：100ms 节奏重绘
+    int subCad;          // 副秒位面：0 无 / 1 十分位(100ms) / 2 百分位(16ms)
 
     void InitCountdown(int durationMs, string fmt) {
         this.InitControl("countdown", 1);
@@ -57,7 +60,7 @@ class Countdown : Control {
         lastDuration = durationMs;
         finished = false;
         activeNow = true;
-        usesTenths = false;
+        subCad = 0;
     }
     Countdown() { InitCountdown(60000, ""); }
     Countdown(int durationMs) { InitCountdown(durationMs, ""); }
@@ -152,6 +155,9 @@ class Countdown : Control {
             } else if (ch == 's' && i + 1 < fmt.Length && fmt[i + 1] == 's') {
                 outp = outp + Countdown.Pad2(rem % 60000 / 1000);
                 i = i + 2;
+            } else if (ch == 'S' && i + 1 < fmt.Length && fmt[i + 1] == 'S') {
+                outp = outp + Countdown.Pad2(rem % 1000 / 10);
+                i = i + 2;
             } else if (ch == 'S') {
                 outp = outp + rem % 1000 / 100;
                 i = i + 1;
@@ -181,7 +187,10 @@ class Countdown : Control {
     override void OnPaint(App app) {
         this.SyncProps();
         this.Tick(Window.GetTickMs());
-        usesTenths = this.Fmt().Contains("S");
+        string fmt = this.Fmt();
+        subCad = 0;
+        if (fmt.Contains("SS")) { subCad = 2; }
+        else if (fmt.Contains("S")) { subCad = 1; }
 
         Canvas c = app.canvas;
         StyleBox s = this.ResolvePartAs(app, "countdown", "value", "text",
@@ -189,10 +198,14 @@ class Countdown : Control {
         int f = s.FontOr(Style.FontFallback(app, "large"));
         c.DrawTextCentered(bx, by, bw, bh, this.DisplayText(), s.FgOr(0), f);
 
-        // 走动时限速重绘：秒级格式睡到下一个秒边界，含 S 才 100ms。
+        // 走动时限速重绘：秒级格式睡到下一个秒边界；十分位 100ms；
+        // 百分位按显示帧率 16ms 封顶而不是 10ms——显示值绘制时由
+        // tick 差值现算，60fps 下逐帧依然准确，100 唤醒/秒却会让
+        // 事件循环永远睡不成（空闲功耗与其它动画的调度都被拖累）。
         if (activeNow && remainingMs > 0 && bw > 0 && bh > 0) {
-            int wait = 100;
-            if (!usesTenths) { wait = remainingMs % 1000 + 1; }
+            int wait = remainingMs % 1000 + 1;
+            if (subCad == 1) { wait = 100; }
+            else if (subCad == 2) { wait = 16; }
             app.RequestAnimationFrameIn(wait, bx, by, bw, bh);
         }
     }

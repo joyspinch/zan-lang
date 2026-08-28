@@ -135,8 +135,9 @@ tags.Render(app, 40, 80);
 
 从 `Duration` 毫秒倒数到零触发 `Finish`（每轮一次）。`Active` 暂停/恢复（剩余值冻结、
 恢复不跳变），`Format` 用令牌选位面：`D` 总天数、`HH`/`mm`/`ss`（一律双写）、`S` 十分
-之一秒；其余字符原样输出，`"T-minus"` 这类字面量不会被吃掉，`"sss"` 渲染成 `"05s"`。
+之一秒、`SS` 百分之一秒（补零 2 位）；其余字符原样输出，`"T-minus"` 这类字面量不会被吃掉，`"sss"` 渲染成 `"05s"`。
 `Restart()` 重摆到当前 `Duration`；外部改 `Duration`（含双向绑定）自动重摆。
+走动时限速重绘：秒级格式睡到秒边界、`S` 100ms、`SS` 16ms（60fps 显示帧率封顶，显示值绘制时由 tick 差值现算，不按 10ms 排程——100 唤醒/秒会让事件循环永远睡不成）。另外 Win32 后端在 Init 里 `timeBeginPeriod(1)`：系统默认时钟中断约 15.6ms，rAF-in/唤醒的超时会拖到下一拍，动画帧间隔 16↔31ms 交替正是"背景动画一卡一卡"的根因；SDL 后端 SDL 自理，macOS/Linux 时钟本就高精度。
 
 ```zan
 Countdown cd = new Countdown(5 * 60000, "mm:ss");
