@@ -874,8 +874,7 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef lval = emit_expr(g, expr->binary.left, locals);
             if (LLVMGetTypeKind(LLVMTypeOf(lval)) != LLVMIntegerTypeKind ||
                 LLVMGetIntTypeWidth(LLVMTypeOf(lval)) != 1) {
-                lval = zan_icmp(g->builder, LLVMIntNE, lval,
-                                     LLVMConstNull(LLVMTypeOf(lval)), "tobool");
+                lval = zan_tobool(g->builder, lval, "tobool");
             }
             LLVMBasicBlockRef left_bb = LLVMGetInsertBlock(g->builder);
             LLVMBasicBlockRef rhs_bb  = LLVMAppendBasicBlockInContext(g->ctx, fn, "sc.rhs");
@@ -891,8 +890,7 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef rval = emit_expr(g, expr->binary.right, locals);
             if (LLVMGetTypeKind(LLVMTypeOf(rval)) != LLVMIntegerTypeKind ||
                 LLVMGetIntTypeWidth(LLVMTypeOf(rval)) != 1) {
-                rval = zan_icmp(g->builder, LLVMIntNE, rval,
-                                     LLVMConstNull(LLVMTypeOf(rval)), "tobool");
+                rval = zan_tobool(g->builder, rval, "tobool");
             }
             LLVMBasicBlockRef rhs_end = LLVMGetInsertBlock(g->builder);
             LLVMBuildBr(g->builder, merge);
@@ -6204,10 +6202,7 @@ static LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
         /* ternary: condition ? then_expr : else_expr */
         LLVMValueRef cond = emit_expr(g, expr->conditional.cond, locals);
         /* normalize to i1 */
-        if (LLVMTypeOf(cond) != LLVMInt1TypeInContext(g->ctx)) {
-            cond = zan_icmp(g->builder, LLVMIntNE, cond,
-                                 LLVMConstInt(LLVMTypeOf(cond), 0, 0), "cond");
-        }
+        cond = zan_tobool(g->builder, cond, "cond");
         LLVMBasicBlockRef then_bb = LLVMAppendBasicBlockInContext(g->ctx,
             LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder)), "tern.then");
         LLVMBasicBlockRef else_bb = LLVMAppendBasicBlockInContext(g->ctx,

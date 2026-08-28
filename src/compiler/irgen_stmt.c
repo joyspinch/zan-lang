@@ -1245,11 +1245,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         int then_start = locals->count;
         LLVMValueRef cond = emit_expr(g, stmt->if_stmt.cond, locals);
         /* ensure cond is i1 */
-        if (LLVMGetTypeKind(LLVMTypeOf(cond)) != LLVMIntegerTypeKind ||
-            LLVMGetIntTypeWidth(LLVMTypeOf(cond)) != 1) {
-            cond = zan_icmp(g->builder, LLVMIntNE, cond,
-                                 LLVMConstInt(LLVMTypeOf(cond), 0, 0), "tobool");
-        }
+        cond = zan_tobool(g->builder, cond, "tobool");
 
         LLVMBasicBlockRef then_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "then");
         LLVMBasicBlockRef else_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "else");
@@ -1304,11 +1300,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBuildBr(g->builder, cond_bb);
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
         LLVMValueRef cond = emit_expr(g, stmt->while_stmt.cond, locals);
-        if (LLVMGetTypeKind(LLVMTypeOf(cond)) != LLVMIntegerTypeKind ||
-            LLVMGetIntTypeWidth(LLVMTypeOf(cond)) != 1) {
-            cond = zan_icmp(g->builder, LLVMIntNE, cond,
-                                 LLVMConstInt(LLVMTypeOf(cond), 0, 0), "tobool");
-        }
+        cond = zan_tobool(g->builder, cond, "tobool");
         LLVMBuildCondBr(g->builder, cond, body_bb, end_bb);
 
         LLVMPositionBuilderAtEnd(g->builder, body_bb);
@@ -1366,11 +1358,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
         if (stmt->for_stmt.cond) {
             LLVMValueRef cond = emit_expr(g, stmt->for_stmt.cond, locals);
-            if (LLVMGetTypeKind(LLVMTypeOf(cond)) != LLVMIntegerTypeKind ||
-                LLVMGetIntTypeWidth(LLVMTypeOf(cond)) != 1) {
-                cond = zan_icmp(g->builder, LLVMIntNE, cond,
-                                     LLVMConstInt(LLVMTypeOf(cond), 0, 0), "tobool");
-            }
+            cond = zan_tobool(g->builder, cond, "tobool");
             LLVMBuildCondBr(g->builder, cond, body_bb, end_bb);
         } else {
             LLVMBuildBr(g->builder, body_bb);
@@ -2266,10 +2254,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
         LLVMValueRef cond = emit_expr(g, stmt->while_stmt.cond, locals);
-        if (LLVMTypeOf(cond) != LLVMInt1TypeInContext(g->ctx)) {
-            cond = zan_icmp(g->builder, LLVMIntNE, cond,
-                                 LLVMConstInt(LLVMTypeOf(cond), 0, 0), "dcond");
-        }
+        cond = zan_tobool(g->builder, cond, "dcond");
         LLVMBuildCondBr(g->builder, cond, body_bb, end_bb);
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);

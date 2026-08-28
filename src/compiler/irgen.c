@@ -83,6 +83,21 @@ static LLVMValueRef zan_icmp(LLVMBuilderRef b, LLVMIntPredicate p,
     return LLVMBuildICmp(b, p, l, r, n);
 }
 
+/* Normalize a condition to i1. Zan admits truthy conditions with a checker
+ * warning, so the operand may be an integer, an object reference or a float.
+ * All non-i1 cases compare against LLVMConstNull of the operand's own type:
+ * LLVMConstInt(LLVMTypeOf(v), 0, 0) mints an invalid i0 constant for pointer
+ * (and float) operands and fails LLVM verification. */
+static LLVMValueRef zan_tobool(LLVMBuilderRef b, LLVMValueRef v, const char *n) {
+    LLVMTypeRef ty = LLVMTypeOf(v);
+    LLVMTypeKind k = LLVMGetTypeKind(ty);
+    if (k == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(ty) == 1) { return v; }
+    if (k == LLVMFloatTypeKind || k == LLVMDoubleTypeKind) {
+        return LLVMBuildFCmp(b, LLVMRealUNE, v, LLVMConstNull(ty), n);
+    }
+    return LLVMBuildICmp(b, LLVMIntNE, v, LLVMConstNull(ty), n);
+}
+
 #include <llvm-c/Analysis.h>
 #include <llvm-c/BitWriter.h>
 #include <llvm-c/DebugInfo.h>
