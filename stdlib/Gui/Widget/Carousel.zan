@@ -11,6 +11,9 @@ class CarouselAnim {
     int startFrame;
     bool animating;
     int dir;
+    /// autoplay 的挂钟：宿主每帧重建控件时实例字段会归零，
+    /// 计时永远走不完；跟着 anim 一样由宿主持有才能跨帧存活。
+    int tickMs;
 
     CarouselAnim() {
         this.shown = 0;
@@ -18,6 +21,7 @@ class CarouselAnim {
         this.startFrame = 0;
         this.animating = false;
         this.dir = 1;
+        this.tickMs = 0;
     }
 }
 
@@ -82,6 +86,9 @@ class Carousel : Control {
     int intervalMs;
     /// 指示点位置：bottom / top / left / right（Naive UI dot-placement）。
     string dotPlacement;
+    /// 滑动方向：horizontal（默认，左右滑）/ vertical（上下滑，
+    /// Naive UI direction）。
+    string direction;
     /// 上次翻页时刻（autoplay 用）。
     int lastTickMs;
     /// 箭头/指示点覆盖层：始终是最后一个子控件，见 CarouselChrome。
@@ -104,6 +111,7 @@ class Carousel : Control {
         autoplay = false;
         intervalMs = 3000;
         dotPlacement = "bottom";
+        direction = "horizontal";
         slideViews = null;
         // chrome 惰性挂载：首次 Arrange 时滑片都已 Add 完，把它追加为
         // 最后一个子控件，绘制顺序才能压在控件页（如 Image）之上。
@@ -113,16 +121,28 @@ class Carousel : Control {
     Carousel() { InitCarousel(new SignalInt(0)); }
     Carousel(SignalInt m) { InitCarousel(m); }
 
+    /// 纵向轮播？上下滑动、箭头朝上/下。
+    bool Vert() { return direction == "vertical"; }
+
+    /// 设定滑动方向："horizontal"（默认）/ "vertical"。返回自身便于链式。
+    Carousel Direction(string d) { direction = d; return this; }
+
     /// 命名为 AddSlide（而非 Add），以免遮蔽 Control.Add(Control)。
     void AddSlide(string label) { slides.Add(label); }
 
     /// 加入一个控件页：v 成为轮播的子控件并占满整个轮播框，裁剪与
     /// 过渡动画由轮播管理。与 AddSlide 可混用（控件页的标题留空）。
+    /// chrome 已挂载时把它挪回末位——晚加的页不能排到覆盖层之后，
+    /// 否则又会被页盖住。
     void AddSlideView(Control v) {
         slides.Add("");
         if (slideViews == null) { slideViews = new List<Control>(); }
         slideViews.Add(v);
         this.Add(v);
+        if (chrome != null) {
+            children.Remove(chrome);
+            this.Add(chrome);
+        }
     }
 
     static Carousel Of(List<string> labels, SignalInt m) {
@@ -193,6 +213,7 @@ class Carousel : Control {
         if (dotPlacement == "top") { this.AddClass("dots-top"); }
         else if (dotPlacement == "left") { this.AddClass("dots-left"); }
         else if (dotPlacement == "right") { this.AddClass("dots-right"); }
+        if (this.Vert()) { this.AddClass("vertical"); }
         StyleBox s = this.ResolveStyleAs(app, "carousel", Class,
                                         Style.SNormal());
         prefW = s.WidthOr(app.Scale(320));
@@ -203,17 +224,21 @@ class Carousel : Control {
     override void OnPaint(App app) {
         Canvas c = app.canvas;
         this.SyncBinding();
-        // autoplay 计时：每 intervalMs 毫秒翻页一帧。
+        // autoplay 计时：每 intervalMs 毫秒翻页一帧。计时放在宿主
+        // 持有的 anim 里（没有 anim 才退回实例字段）：即时模式宿主
+        // 每帧重建控件，实例字段一换就归零，计时永远走不完。
         if (autoplay && slides.Count > 1) {
             int now = Window.GetTickMs();
-            if (lastTickMs == 0) { lastTickMs = now; }
-            if (now - lastTickMs >= intervalMs) {
-                lastTickMs = now;
+            int last = (anim != null) ? anim.tickMs : lastTickMs;
+            if (last == 0) { last = now; }
+            if (now - last >= intervalMs) {
+                last = now;
                 int nxt = (model.Get() + 1) % slides.Count;
                 model.Set(nxt);
                 if (Index != null) { Index.Set(nxt); }
                 Change.Raise();
             }
+            if (anim != null) { anim.tickMs = last; } else { lastTickMs = last; }
             app.RequestRedraw();
         }
         this.EnsureIds();
@@ -226,7 +251,7 @@ class Carousel : Control {
         this.ShowSlides(cur, cur, 0, 1);
         c.PushClip(bx, by, bw, bh);
         if (anim == null) {
-            this.PaintSlide(app, bx, cur);
+            this.PaintSlide(app, bx, by, cur);
         } else {
             // 目标索引变化时启动过渡。
             if (!anim.animating && anim.shown != cur) {
@@ -248,16 +273,27 @@ class Carousel : Control {
                 }
             }
             if (anim.animating) {
-                int shift = bw * prog / 1000;
-                int outX = bx - anim.dir * shift;
-                int inX = outX + anim.dir * bw;
+                // 位移轴随 direction：横向滑 x、纵向滑 y，跨度取各自的边。
+                int span = this.Vert() ? bh : bw;
+                int shift = span * prog / 1000;
+                int outX = bx;
+                int outY = by;
+                int inX = bx;
+                int inY = by;
+                if (this.Vert()) {
+                    outY = by - anim.dir * shift;
+                    inY = outY + anim.dir * bh;
+                } else {
+                    outX = bx - anim.dir * shift;
+                    inX = outX + anim.dir * bw;
+                }
                 this.ShowSlides(anim.from, cur, shift, anim.dir);
-                this.PaintSlide(app, outX, anim.from);
-                this.PaintSlide(app, inX, cur);
+                this.PaintSlide(app, outX, outY, anim.from);
+                this.PaintSlide(app, inX, inY, cur);
                 app.RequestRedraw();
             } else {
                 this.ShowSlides(cur, cur, 0, 1);
-                this.PaintSlide(app, bx, cur);
+                this.PaintSlide(app, bx, by, cur);
             }
         }
         c.PopClip();
@@ -267,17 +303,21 @@ class Carousel : Control {
     }
 
     /// 让控件页与过渡状态一致：静止帧只有当前页可见（占满轮播框）；
-    /// 过渡帧离开页停在 bx-dir*shift、进入页在进入位，其余页隐藏。
-    /// 控件的 OnPaint 之后才会画子树，所以这里赶在子树绘制前把
-    /// 矩形与可见性摆好即可。
+    /// 过渡帧离开页沿滑动轴停在 bx/by-dir*shift、进入页在进入位，
+    /// 其余页隐藏。控件的 OnPaint 之后才会画子树，所以这里赶在子树
+    /// 绘制前把矩形与可见性摆好即可。
     void ShowSlides(int from, int to, int shift, int dir) {
         if (slideViews == null) { return; }
         for (int i = 0; i < slideViews.Count; i = i + 1) {
             if (slideViews[i] == null) { continue; }
             if (i == from || i == to) {
                 int x = bx;
-                if (i == from && from != to) { x = bx - dir * shift; }
-                slideViews[i].Arrange(x, by, bw, bh);
+                int y = by;
+                if (i == from && from != to) {
+                    if (this.Vert()) { y = by - dir * shift; }
+                    else { x = bx - dir * shift; }
+                }
+                slideViews[i].Arrange(x, y, bw, bh);
                 slideViews[i].SetShown(true);
             } else {
                 slideViews[i].SetShown(false);
@@ -285,10 +325,10 @@ class Carousel : Control {
         }
     }
 
-    /// 在任意 x 位置绘制一张幻灯片（主体 + 居中标签），过渡时可
-    /// 并排绘制离开和进入的面板。控件页自己会画（RenderTree 的
-    /// 子树遍历），这里只负责文字页。
-    void PaintSlide(App app, int x, int i) {
+    /// 在任意位置绘制一张文字页（主体 + 居中标签），过渡时可并排
+    /// 绘制离开和进入的面板。控件页自己会画（RenderTree 的子树
+    /// 遍历），这里只负责文字页。
+    void PaintSlide(App app, int x, int y, int i) {
         if (slideViews != null && i < slideViews.Count
             && slideViews[i] != null) {
             return;
@@ -306,12 +346,12 @@ class Carousel : Control {
         StyleBox caption = this.ResolvePartAs(app, "carousel", "caption", "",
                                               Class, Style.SNormal());
         // 裁剪到幻灯片区域，防止长标签溢出边界。
-        c.PushClip(x, by, bw, bh);
-        c.FillRoundRect(x, by, bw, bh, s.RadiusOr(t.borderRadiusLarge), s.BgOr(0));
+        c.PushClip(x, y, bw, bh);
+        c.FillRoundRect(x, y, bw, bh, s.RadiusOr(t.borderRadiusLarge), s.BgOr(0));
         int fs = caption.FontOr(
             s.FontOr(Style.FontFallback(app, "huge")));
         int tw = Canvas.MeasureText(slides[i], fs);
-        c.DrawText(x + (bw - tw) / 2, Canvas.CenterTextY(by, bh, fs),
+        c.DrawText(x + (bw - tw) / 2, y + Canvas.CenterTextY(0, bh, fs),
                    slides[i], caption.FgOr(0), fs);
         c.PopClip();
     }
@@ -328,24 +368,56 @@ class Carousel : Control {
                                             Style.SSelected());
 
         int ab = arrow.HeightOr(t.heightMedium);
-        int ay = by + (bh - ab) / 2;
-        int prevX = bx + t.paddingMedium;
-        int nextX = bx + bw - ab - t.paddingMedium;
-        int abg = arrow.BgOr(0);
-        c.FillRoundRect(prevX, ay, ab, ab, arrow.RadiusOr(ab / 2), abg);
-        c.FillRoundRect(nextX, ay, ab, ab, arrow.RadiusOr(ab / 2), abg);
-        int gl = arrow.WidthOr(t.iconSizeSmall);
-        int afg = arrow.FgOr(0);
-        c.DrawGlyphIn("arrow-left", prevX, ay, ab, ab, gl, afg);
-        c.DrawGlyphIn("arrow-right", nextX, ay, ab, ab, gl, afg);
-        app.hitTester.RegisterRect(baseId, prevX, ay, ab, ab, 0);
-        app.hitTester.RegisterRect(baseId + 1, nextX, ay, ab, ab, 0);
-
+        // 圆点度量先行：指示点竖排在左/右缘时，横向箭头要内缩让位。
         int dot = dotStyle.HeightOr(t.gapSmall);
         int dotGap = dotStyle.GapOr(t.gapSmall);
         int dotsW = count * dot + (count - 1) * dotGap;
+        bool dotsCol = dotPlacement == "left" || dotPlacement == "right";
+        int prevX;
+        int prevY;
+        int nextX;
+        int nextY;
+        string prevGlyph = "arrow-left";
+        string nextGlyph = "arrow-right";
+        if (this.Vert()) {
+            // 纵向：上/下箭头贴顶/底居中。
+            prevGlyph = "arrow-up";
+            nextGlyph = "arrow-down";
+            prevX = bx + (bw - ab) / 2;
+            prevY = by + t.paddingMedium;
+            nextX = prevX;
+            nextY = by + bh - ab - t.paddingMedium;
+        } else {
+            int inset = dotsCol ? dot * 2 + dotGap : 0;
+            prevX = bx + t.paddingMedium
+                        + (dotPlacement == "left" ? inset : 0);
+            prevY = by + (bh - ab) / 2;
+            nextX = bx + bw - ab - t.paddingMedium
+                        - (dotPlacement == "right" ? inset : 0);
+            nextY = prevY;
+        }
+        int abg = arrow.BgOr(0);
+        c.FillRoundRect(prevX, prevY, ab, ab, arrow.RadiusOr(ab / 2), abg);
+        c.FillRoundRect(nextX, nextY, ab, ab, arrow.RadiusOr(ab / 2), abg);
+        int gl = arrow.WidthOr(t.iconSizeSmall);
+        int afg = arrow.FgOr(0);
+        c.DrawGlyphIn(prevGlyph, prevX, prevY, ab, ab, gl, afg);
+        c.DrawGlyphIn(nextGlyph, nextX, nextY, ab, ab, gl, afg);
+        app.hitTester.RegisterRect(baseId, prevX, prevY, ab, ab, 0);
+        app.hitTester.RegisterRect(baseId + 1, nextX, nextY, ab, ab, 0);
+
+        // 位置随 dotPlacement：bottom/top 横排居中，left/right 沿边
+        // 竖排居中（此前位置写死在底部，placement 只挂类不生效）。
         int dx = bx + (bw - dotsW) / 2;
         int dy = by + bh - t.paddingLarge;
+        int xRight = bx + bw - t.paddingMedium;
+        if (dotPlacement == "top") {
+            dy = by + t.paddingMedium;
+        } else if (dotsCol) {
+            dx = (dotPlacement == "left") ? bx + t.paddingMedium
+                                          : xRight - dot;
+            dy = by + (bh - dotsW) / 2;
+        }
         for (int i = 0; i < count; i = i + 1) {
             int dcolor = dotStyle.BgOr(0);
             int dw = dot;
@@ -353,11 +425,13 @@ class Carousel : Control {
                 dcolor = dotOn.BgOr(0);
                 dw = dot * 2;
             }
+            if (dotsCol && dotPlacement == "right") { dx = xRight - dw; }
             c.FillRoundRect(dx, dy, dw, dot, dot / 2, dcolor);
             app.hitTester.RegisterRect(baseId + 2 + i, dx,
                                                     dy - dot, dw + dot,
                                                     dot * 3, 0);
-            dx = dx + dw + dotGap;
+            if (dotsCol) { dy = dy + dw + dotGap; }
+            else { dx = dx + dw + dotGap; }
         }
     }
 
@@ -383,6 +457,10 @@ class Carousel : Control {
             new List<string>{ "bottom", "top", "left", "right" });
         dp.num = 0;
         ps.Add(dp);
+        PropSpec dr = PropSpec.Enum("direction", "Direction",
+            new List<string>{ "horizontal", "vertical" });
+        dr.num = this.Vert() ? 1 : 0;
+        ps.Add(dr);
         ps.Add(PropSpec.Text("class", "Classes"));
         return ps;
     }

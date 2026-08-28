@@ -1708,6 +1708,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_flex${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # The Carousel's slide placement is pure geometry: horizontal slides along
+  # x, vertical along y (Direction("vertical")); the chrome overlay must stay
+  # the LAST child -- lazily mounted on first Arrange and re-appended when a
+  # slide view is added later -- so RenderTree paints it above image slides.
+  # Pinned headlessly, no window needed.
+  add_test(NAME conformance_gui_carousel
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/carousel_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_carousel.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_carousel${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # The CSS skin pipeline (Css parser -> StyleSheet -> StyleBox) is pure
   # computation, so it is verified headlessly against a golden dump.
   add_test(NAME conformance_gui_css
@@ -1760,7 +1774,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_colorinject${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_flex conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable conformance_gui_css conformance_gui_tailwind conformance_gui_props conformance_gui_tree conformance_gui_webview_interop conformance_gui_colorinject conformance_gui_calendar PROPERTIES
+  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_flex conformance_gui_carousel conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable conformance_gui_css conformance_gui_tailwind conformance_gui_props conformance_gui_tree conformance_gui_webview_interop conformance_gui_colorinject conformance_gui_calendar PROPERTIES
     ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 
