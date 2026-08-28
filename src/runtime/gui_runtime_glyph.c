@@ -31,6 +31,7 @@ typedef struct {
     int      kind;
     int      size;
     uint64_t used;     /* LRU tick */
+    uint64_t stamped;  /* store epoch of the last find/store (see sweep) */
     size_t   bytes;    /* payload accounted against the budget */
     zan_glyph_tile tile;
 } zan_atlas_slot;
@@ -46,10 +47,63 @@ typedef struct {
 
 static zan_atlas_slot g_atlas[ZAN_ATLAS_CAP];
 static uint64_t g_atlas_clock = 0;
+static uint64_t g_atlas_stores = 0;
 static size_t g_atlas_bytes = 0;
 static uint32_t g_atlas_next_id = 1;
 static uint64_t g_atlas_hits = 0;
 static uint64_t g_atlas_misses = 0;
+static uint64_t g_atlas_swept = 0;
+
+/* Coverage-buffer pool. A churn UI -- counters, clocks, log lines -- cycles
+ * tile allocations through store/sweep forever. Routing those buffers
+ * through malloc/free made the CRT heap climb to a fragmentation high-water,
+ * which read as "still leaking" under fast clicking even though every tile
+ * was recycled. The pool keeps released coverage buffers and hands them back,
+ * so a steady state performs zero heap traffic.
+ *
+ * Exact-size matching would almost never hit: on proportional fonts every
+ * new string value rasterizes a few pixels wider or narrower than the last,
+ * so allocations are rounded up to bucket steps first -- 1KB for the small
+ * glyph tiles, 8KB for whole-line run tiles -- collapsing the recurring
+ * sizes into a handful of buckets that recycle perfectly. The waste is
+ * bounded by one step per tile. The pool is capped by count and total bytes;
+ * overflow falls back to free() as before. */
+#define ZAN_ATLAS_POOL_CAP 256
+#define ZAN_ATLAS_POOL_BYTES (4u * 1024u * 1024u)
+static struct { void *p; size_t bytes; } g_cov_pool[ZAN_ATLAS_POOL_CAP];
+static int g_cov_pool_n = 0;
+static size_t g_cov_pool_bytes = 0;
+
+static size_t zan_cov_round(size_t bytes) {
+    if (bytes <= 4096) { return (bytes + 1023) & ~(size_t)1023; }
+    return (bytes + 8191) & ~(size_t)8191;
+}
+
+static void *zan_cov_pool_take(size_t bytes) {
+    for (int i = 0; i < g_cov_pool_n; i++) {
+        if (g_cov_pool[i].bytes == bytes) {
+            void *p = g_cov_pool[i].p;
+            g_cov_pool[i] = g_cov_pool[g_cov_pool_n - 1];
+            g_cov_pool_n--;
+            g_cov_pool_bytes -= bytes;
+            return p;
+        }
+    }
+    return malloc(bytes);
+}
+
+static void zan_cov_pool_put(void *p, size_t bytes) {
+    if (!p) return;
+    if (g_cov_pool_n >= ZAN_ATLAS_POOL_CAP
+        || g_cov_pool_bytes + bytes > ZAN_ATLAS_POOL_BYTES) {
+        free(p);
+        return;
+    }
+    g_cov_pool[g_cov_pool_n].p = p;
+    g_cov_pool[g_cov_pool_n].bytes = bytes;
+    g_cov_pool_n++;
+    g_cov_pool_bytes += bytes;
+}
 
 static uint64_t zan_atlas_hash(int kind, int size,
                                const char *key, int key_len) {
@@ -68,7 +122,7 @@ static uint64_t zan_atlas_hash(int kind, int size,
 static void zan_atlas_release(zan_atlas_slot *slot) {
     if (!slot->key) return;
     free(slot->key);
-    free((void *)slot->tile.cov);
+    zan_cov_pool_put((void *)slot->tile.cov, zan_cov_round(slot->bytes));
     g_atlas_bytes -= slot->bytes;
     memset(slot, 0, sizeof(*slot));
 }
@@ -85,6 +139,34 @@ static void zan_atlas_trim(void) {
     }
 }
 
+/* A tile stops earning its bytes once no frame has found it for this many
+ * subsequent stores. Every string a live frame still draws is re-found (and
+ * re-stamped) every frame, while dynamic values -- counters, clocks, log and
+ * chat lines -- are superseded and never drawn again. Stores only happen when
+ * some text on screen CHANGES, so a threshold of a few dozen covers every
+ * realistic lifetime of a displayed value; text that has been superseded this
+ * many stores ago cannot come back (worst case: one re-rasterisation when a
+ * long-idle screen is revisited). */
+#define ZAN_ATLAS_COLD_STORES 64
+/* Sweep cadence: amortises the full-slot scan over this many stores. */
+#define ZAN_ATLAS_SWEEP 64
+
+/* Drop every cold tile. Without this, a UI that renders ever-changing text
+ * (the gallery's `count: N` labels, per-click) mints one run tile per
+ * distinct value and holds all of them until the 32 MB hard cap, so RSS
+ * climbs linearly with use. Sweeping recycles exactly the superseded values
+ * and never touches text the current frames still draw. */
+static void zan_atlas_sweep(void) {
+    for (int i = 0; i < ZAN_ATLAS_CAP; i++) {
+        zan_atlas_slot *e = &g_atlas[i];
+        if (!e->key) continue;
+        if (g_atlas_stores - e->stamped >= ZAN_ATLAS_COLD_STORES) {
+            zan_atlas_release(e);
+            g_atlas_swept++;
+        }
+    }
+}
+
 /* The cached tile for this key, or NULL when the caller has to rasterize. */
 static const zan_glyph_tile *zan_atlas_find(int kind, int size,
                                             const char *key, int key_len) {
@@ -96,6 +178,7 @@ static const zan_glyph_tile *zan_atlas_find(int kind, int size,
         if (e->kind == kind && e->size == size && e->key_len == key_len
             && memcmp(e->key, key, (size_t)key_len) == 0) {
             e->used = ++g_atlas_clock;
+            e->stamped = g_atlas_stores;
             g_atlas_hits++;
             return &e->tile;
         }
@@ -127,7 +210,7 @@ static const zan_glyph_tile *zan_atlas_store(
 
     size_t bytes = (size_t)w * (size_t)h * (size_t)bpp;
     char *key_copy = (char *)malloc((size_t)key_len ? (size_t)key_len : 1);
-    void *cov_copy = bytes ? malloc(bytes) : NULL;
+    void *cov_copy = bytes ? zan_cov_pool_take(zan_cov_round(bytes)) : NULL;
     if (!key_copy || (bytes && !cov_copy)) {
         free(key_copy);
         free(cov_copy);
@@ -142,6 +225,7 @@ static const zan_glyph_tile *zan_atlas_store(
     victim->kind = kind;
     victim->size = size;
     victim->used = ++g_atlas_clock;
+    victim->stamped = g_atlas_stores;
     victim->bytes = bytes;
     victim->tile.id = g_atlas_next_id++;
     victim->tile.rev = 1;
@@ -153,6 +237,8 @@ static const zan_glyph_tile *zan_atlas_store(
     victim->tile.bpp = bpp;
     victim->tile.cov = cov_copy;
     g_atlas_bytes += bytes;
+    g_atlas_stores++;
+    if ((g_atlas_stores & (ZAN_ATLAS_SWEEP - 1)) == 0) { zan_atlas_sweep(); }
     zan_atlas_trim();
     return &victim->tile;
 }

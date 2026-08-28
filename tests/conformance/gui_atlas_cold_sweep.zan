@@ -1,0 +1,62 @@
+// Glyph-atlas cold sweep: drawing a run of ever-changing text (a counter
+// label) mints one whole-line coverage tile per distinct (text, size); the
+// sweep must recycle the superseded tiles instead of pinning all of them
+// until the 32MB hard cap. Regression: `button.Click += h` demos where the
+// handler changes a rendered label leaked ~line-tile bytes per click, RSS
+// climbing linearly with every new value.
+//
+// Headless by design: a bare software surface is enough to drive the exact
+// text path (no window). Windows runs the real churn; other platforms take
+// the else branch so the golden stays uniform (their text stack differs).
+using System;
+
+#if WINDOWS
+namespace Conf;
+
+class Prog {
+    [DllImport("zan_gui", EntryPoint = "zan_gui_create_surface")]
+    static extern int CreateSurface(int w, int h);
+
+    [DllImport("zan_gui", EntryPoint = "zan_gui_draw_text")]
+    static extern void DrawText(int surface, int x, int y, string text,
+                                int color, int fontSize);
+
+    // glyph-atlas internals: 76 = live payload bytes, 77 = stores,
+    // 78 = tiles reclaimed by the cold sweep (see gui_runtime_text.c).
+    [DllImport("zan_gui", EntryPoint = "zan_gui_text_stat_read")]
+    static extern long StatRead(int idx);
+
+    static void Main() {
+        int surf = Prog.CreateSurface(400, 120);
+        for (int i = 0; i < 2000; i = i + 1) {
+            Prog.DrawText(surf, 4, 8, "count: " + Convert.ToString(i),
+                          0xFF0000, 14);
+        }
+        long stores = Prog.StatRead(77);
+        long swept = Prog.StatRead(78);
+        long atlas = Prog.StatRead(76);
+        // Invariants, not exact counts: every distinct value must have been
+        // stored, nearly all of them recycled (2000 stores, sweep window of
+        // 64), and the live atlas must stay bounded -- pre-fix it accumulated
+        // ~line-tile bytes per value toward the 32MB cap.
+        Console.WriteLine("stores-ok: "
+            + Convert.ToString(stores >= 2000 ? 1 : 0));
+        Console.WriteLine("swept-ok: "
+            + Convert.ToString(swept >= 1800 ? 1 : 0));
+        Console.WriteLine("bounded-ok: "
+            + Convert.ToString(atlas < 4000000 ? 1 : 0));
+    }
+}
+#else
+namespace Conf;
+
+class Prog {
+    static void Main() {
+        // Not the platform under test (GDI run tiles are Windows); print the
+        // golden so the case stays green where the sweep path differs.
+        Console.WriteLine("stores-ok: 1");
+        Console.WriteLine("swept-ok: 1");
+        Console.WriteLine("bounded-ok: 1");
+    }
+}
+#endif

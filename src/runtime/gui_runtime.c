@@ -1649,9 +1649,6 @@ EXPORT i32 zan_gui_surface_dump(i32 surface_id, const char *path) {
         u32 *src = s->pixels + (size_t)j * (size_t)s->stride;
         for (int i = 0; i < w; i++) {
             u32 p = src[i];
-            row[i * 3 + 0] = (unsigned char)((p >> 16) & 0xFF);
-            row[i * 3 + 1] = (unsigned char)((p >> 8) & 0xFF);
-            row[i * 3 + 2] = (unsigned char)(p & 0xFF);
             /* BMP 24bpp is B,G,R byte order (the surface is 0xAARRGGBB);
              * writing it the other way swaps red and blue on readback. */
             row[i * 3 + 0] = (unsigned char)(p & 0xFF);
@@ -3215,6 +3212,7 @@ EXPORT void *zan_gui_get_pixels(i32 surface_id) {
     }
     return (void *)s->pixels;
 }
+
 /* One frame pixel as 0xAARRGGBB, or -1 outside the surface. Windowless
  * assertions (tests) read sampled blits back through this. */
 EXPORT i32 zan_gui_read_pixel(i32 surface_id, i32 x, i32 y) {
@@ -3228,7 +3226,6 @@ EXPORT i32 zan_gui_read_pixel(i32 surface_id, i32 x, i32 y) {
     }
     return (i32)(s->pixels[(size_t)y * (size_t)s->stride + (size_t)x]);
 }
-
 
 /* The other present seam: hand the frame to the screen without a CPU copy.
  * `native_window` is the shell's window handle (HWND on Win32, X11 Window as an
@@ -3584,9 +3581,17 @@ EXPORT i32 zan_gui_image_load_svg(const char *key, const char *text, i32 len,
     return w;
 }
 
-/* Blit a region of an image file onto a GUI surface (nearest-neighbour scale).
+/* Blit a region of an image file onto a GUI surface.
  * sx/sy/sw/sh = source rect in the image (all zero = use the full image).
- * dx/dy/dw/dh = destination rect on the surface. */
+ * dx/dy/dw/dh = destination rect on the surface.
+ *
+ * Sampling: shrinking an axis averages every source pixel the destination
+ * touches (box filter) -- plain nearest drops whole columns/rows, which made
+ * thin lines shimmer away on photo thumbnails. Growing or 1:1 samples the
+ * centre of each destination pixel, (2i+1)*src/(2*dst): the old floor mapping
+ * i*src/dst pinned destination column 0 to source column 0 and duplicated the
+ * left/top edge, so upscaled sprites hugged one corner. 1:1 is exact under
+ * both formulas, so unscaled blits are bit-identical to before. */
 static void cpu_blit_image(zan_surface_t *s, const char *path,
                            int dx, int dy, int dw, int dh,
                            int sx, int sy, int sw, int sh)
@@ -3606,34 +3611,86 @@ static void cpu_blit_image(zan_surface_t *s, const char *path,
     x1 = idx2 + idw < s->clip_x1 ? idx2 + idw : s->clip_x1;
     y1 = idy  + idh < s->clip_y1 ? idy  + idh : s->clip_y1;
     ZAN_STAT(g_st_img, (long long)(x1 - x0) * (long long)(y1 - y0));
-    /* Nearest-neighbour walk with a fixed-point source step: the source column
-     * used to cost an integer divide per pixel, and every pixel went through
-     * the general blend even where the sprite is fully transparent (most of a
-     * tile sheet's cell) or fully opaque. Sprites and tiles are the bulk of a
-     * game frame's pixels, so both are worth avoiding. */
-    if (idw <= 0 || idh <= 0) return;
-    /* Exactly (i * isw) / idw, stepped instead of divided (i >= 0 always: the
-     * loop starts at the clipped destination edge, never left of it). */
-    int qxStep = isw / idw, rxStep = isw % idw;
+    if (idw <= 0 || idh <= 0 || x1 <= x0 || y1 <= y0) return;
+
+    int boxX = idw < isw;
+    int boxY = idh < ish;
+    /* Fixed-point column walk with a running (quotient, remainder) pair: the
+     * source column used to cost an integer divide per pixel, and every pixel
+     * went through the general blend even where the sprite is fully
+     * transparent (most of a tile sheet's cell) or fully opaque. Sprites and
+     * tiles are the bulk of a game frame's pixels, so both are worth avoiding.
+     * i >= 0 always: the loop starts at the clipped destination edge, never
+     * left of it. */
+    long long nDen = boxX ? idw : 2 * (long long)idw;
+    long long t0 = boxX ? (long long)(x0 - idx2) * isw
+                        : ((long long)(x0 - idx2) * 2 + 1) * isw;
+    long long tStep = boxX ? isw : 2 * (long long)isw;
+    int qx = (int)(t0 / nDen);
+    int rx = (int)(t0 % nDen);
+    int qxStep = (int)(tStep / nDen);
+    int rxStep = (int)(tStep % nDen);
+    int rDen = (int)nDen;
+    /* Second stepper only when shrinking X: the exclusive end of the source
+     * range, ceil((i+1)*isw/idw). */
+    int qx2 = (int)((((long long)(x0 - idx2) + 1) * isw + idw - 1) / idw);
+    int rx2 = (int)((((long long)(x0 - idx2) + 1) * isw + idw - 1) % idw);
     for (py = y0; py < y1; py++) {
-        int sry = isy + (py - idy) * ish / idh;
-        if (sry < 0 || sry >= img->h) continue;
-        const u32 *srow = img->pix + (size_t)sry * (size_t)img->w;
+        int sy0, sy1;
+        if (boxY) {
+            sy0 = isy + (int)((long long)(py - idy) * ish / idh);
+            sy1 = isy + (int)(((long long)(py - idy + 1) * ish + idh - 1) / idh);
+            if (sy1 <= sy0) { sy1 = sy0 + 1; }
+        } else {
+            /* Dest-pixel centre row: (2i+1)*ish / (2*idh), one divide/row. */
+            sy0 = isy + (int)(((long long)(py - idy) * 2 + 1) * ish / (2 * (long long)idh));
+            sy1 = sy0 + 1;
+        }
+        if (sy0 < 0 || sy1 > img->h || sy0 >= sy1) continue;
         u32 *drow = s->pixels + (size_t)py * (size_t)s->stride;
-        int i0 = x0 - idx2;
-        int qx = (int)(((long long)i0 * isw) / idw);
-        int rx = (int)(((long long)i0 * isw) % idw);
+        int qxR = qx, rxR = rx, qx2R = qx2, rx2R = rx2;
         for (px = x0; px < x1; px++) {
-            int srx = isx + qx;
-            qx += qxStep;
-            rx += rxStep;
-            if (rx >= idw) { rx -= idw; qx++; }
-            if (srx < 0 || srx >= img->w) continue;
-            u32 sp = srow[srx];
-            u32 sa = sp >> 24;
-            if (sa == 0) continue;
-            if (sa == 0xFF) { drow[px] = sp; continue; }
-            drow[px] = blend_over(drow[px], sp);
+            int sx0 = isx + qxR;
+            int sx1 = boxX ? isx + qx2R : sx0 + 1;
+            if (boxX && sx1 <= sx0) { sx1 = sx0 + 1; }
+            qxR += qxStep; rxR += rxStep;
+            if (rxR >= rDen) { rxR -= rDen; qxR++; }
+            if (boxX) {
+                qx2R += qxStep; rx2R += rxStep;
+                if (rx2R >= idw) { rx2R -= idw; qx2R++; }
+            }
+            if (sx0 < 0 || sx1 > img->w || sx0 >= sx1) continue;
+            u32 sp;
+            if (sy1 - sy0 == 1 && sx1 - sx0 == 1) {
+                sp = img->pix[(size_t)sy0 * (size_t)img->w + (size_t)sx0];
+            } else {
+                /* Box average, straight alpha: weight every covered source
+                 * pixel equally and round half up. For sprites the alpha
+                 * average is an approximation (exact only over uniform
+                 * alpha); photos and UI chrome are fully opaque. */
+                int sa = 0, sr = 0, sg = 0, sb = 0, n = 0;
+                for (int yy = sy0; yy < sy1; yy++) {
+                    const u32 *srow = img->pix + (size_t)yy * (size_t)img->w;
+                    for (int xx = sx0; xx < sx1; xx++) {
+                        u32 p = srow[xx];
+                        sa += (int)(p >> 24);
+                        sr += (int)((p >> 16) & 255);
+                        sg += (int)((p >> 8) & 255);
+                        sb += (int)(p & 255);
+                        n++;
+                    }
+                }
+                int ha = n / 2;
+                sp = (u32)((sa + ha) / n) << 24
+                   | (u32)((sr + ha) / n) << 16
+                   | (u32)((sg + ha) / n) << 8
+                   | (u32)((sb + ha) / n);
+            }
+            u32 dp = drow[px];
+            u32 da = sp >> 24;
+            if (da == 0) continue;
+            if (da == 0xFF) { drow[px] = sp; continue; }
+            drow[px] = blend_over(dp, sp);
         }
     }
 }

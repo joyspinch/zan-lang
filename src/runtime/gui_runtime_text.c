@@ -76,6 +76,11 @@ EXPORT i64 zan_gui_text_stat_read(i32 idx) {
         case 9: return (i64)g_text_draw_us;
         case 10: return (i64)g_text_measure_us;
         case 11: return (i64)g_text_height_us;
+        /* glyph-atlas internals (gui_runtime_glyph.c part): live payload
+         * bytes, stores so far, tiles reclaimed by the cold sweep. */
+        case 76: return (i64)g_atlas_bytes;
+        case 77: return (i64)g_atlas_stores;
+        case 78: return (i64)g_atlas_swept;
         default:
             if (idx >= 12 && idx < 76) {
                 return (i64)g_text_size_calls[idx - 12];
@@ -383,7 +388,6 @@ EXPORT void zan_gui_draw_text_rot(
         g_text_draw_us += text_qpc_us() - t0;
     }
 }
-
 
 /* --- Measured-width cache -------------------------------------------------
  * zan_gui_measure_text runs a GDI GetTextExtentPoint32W round-trip plus two
