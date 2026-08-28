@@ -1,0 +1,416 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// 动态标签：一排可增删的 Tag，尾部带一个「+ 新建标签」触发器，
+/// 点击后原位变成一个输入框（Naive UI 的 n-dynamic-tags）：
+///
+///     DynamicTags tags = new DynamicTags();
+///     tags.SetItems(new List<string>{ "调查中", "已发布" });
+///     tags.Change += () => { Save(tags.Items()); };
+///     tags.Render(app, 40, 80);          // 或作为停靠控件放进容器
+///
+/// 交互与 Naive UI 对齐：点触发器打开输入框；回车或点击别处（失焦）
+/// 提交，文本非空才追加；点标签尾部的 x 移除该条。Closable 默认
+/// true，Max 限制数量、达到后触发器置灰且不再打开输入框（Esc 关闭
+/// 输入框且不追加，是 Naive 没有的桌面补充）。
+///
+/// 事件在改动发生处同步抛出（与 Tabs 的 TabClosed 同款）：移除在
+/// 标签循环内抛出后立即结束本帧绘制，输入框提交在循环外抛出，
+/// 处理器里改标签集合是安全的。
+///
+/// 可识别的类只是皮肤定义的选择器（与 Tag 共用一套，作用于整排
+/// 标签；尾部触发器固定追加 `add` 类，皮肤用 `tag.add` 画虚线框）：
+///
+///     tag                                        默认
+///     .primary .info .success .warning .error     语义类型
+///     .tiny .small .medium .large                 尺寸（Size 字段）
+///     tag.add                                     尾部触发器
+class DynamicTags : Control {
+    /// 标签文本，按显示顺序。整体重置走 SetItems；单个增删走
+    /// Add/RemoveAt（两者都会触发 Change）。
+    List<string> items;
+    /// 每个标签带尾部关闭字形，点击移除（Naive UI closable，
+    /// 动态标签下默认 true）。
+    bool Closable;
+    /// 标签数量上限；0 = 不限（Naive UI max）。达到后触发器置灰
+    /// 且不再打开输入框；程序化 Add 不受限。
+    int Max;
+    /// 触发器文案；"" = 跟随界面语言（「新建标签」）。
+    string AddText;
+    /// 输入框占位文字；"" = 无。
+    string Placeholder;
+    /// 尺寸档（tiny/small/medium/large），映射为 tag 皮肤类；
+    /// `Binding<string>` 使 `tags.Size = vm.density;` 可响应式换档。
+    Binding<string> Size;
+    /// 标签集合被改动时触发（`tags.Change += h;`）。SetItems/Clear
+    /// 是宿主驱动的整体同步，不触发。
+    UiEvent Change;
+
+    /// 每个标签一对命中 id（整体 tagBase+i、关闭字形
+    /// tagBase+512+i），从预留段按下标分配，标签增删不会挪动其他
+    /// 控件的 id。上限 512 个标签，与 Tabs 的预留段同款。
+    int tagBase;
+    int triggerId;
+    /// 内联输入框（保留实例，不挂进控件树）：点触发器后原位渲染
+    /// 并接管键盘，光标、选区、IME 组合窗都由它处理。
+    Input editor;
+    /// 输入框开着时为 true；占据触发器的位置。
+    bool editing;
+    /// 打开输入框的这一帧在其 Render 返回后把焦点交给它。
+    bool takeFocus;
+    /// 上一帧输入框是否持有焦点：由有到无即失焦，按 Naive 的
+    /// handleInputBlur 语义提交。
+    bool editorFocused;
+
+    /// 内置触发器文案的 UI 语言（0 = 英语，1 = 简体中文），与
+    /// Tabs 相同：不设语言的发布版界面本身是中文的。
+    static int lang = 1;
+
+    static string TT(string en, string zh) {
+        if (DynamicTags.lang == 1) { return zh; }
+        return en;
+    }
+
+    void InitDynamicTags() {
+        this.InitControl("dynamictags", 1);
+        items = new List<string>();
+        Closable = true;
+        Max = 0;
+        AddText = "";
+        Placeholder = "";
+        Size = "medium";
+        tagBase = WidgetId.Block(1024);
+        triggerId = WidgetId.Next();
+        editor = new Input("");
+        editing = false;
+        takeFocus = false;
+        editorFocused = false;
+        wiresOwnEvents = true;
+        Change = new UiEvent();
+    }
+
+    DynamicTags() { InitDynamicTags(); }
+
+    /// 给定初值的构造；列表被拷贝，之后的结构改动走 Add/RemoveAt。
+    DynamicTags(List<string> initial) {
+        InitDynamicTags();
+        if (initial != null) {
+            for (int i = 0; i < initial.Count; i = i + 1) {
+                items.Add(initial[i]);
+            }
+        }
+    }
+
+    int Count() { return items.Count; }
+
+    string TextAt(int i) {
+        if (i < 0 || i >= items.Count) { return ""; }
+        return items[i];
+    }
+
+    /// 活动列表。读随意；结构改动请走 Add/RemoveAt/Clear，让
+    /// 订阅者收到 Change。
+    List<string> Items() { return items; }
+
+    /// 追加一个标签并触发 Change。不受 Max 限制（那是给交互
+    /// 触发器的闸门，拦不住宿主自己的数据）。
+    void Add(string text) {
+        items.Add(text);
+        Change.Raise();
+    }
+
+    /// 移除第 i 个标签并触发 Change；越界为空操作。
+    void RemoveAt(int i) {
+        if (i < 0 || i >= items.Count) { return; }
+        items.RemoveAt(i);
+        Change.Raise();
+    }
+
+    /// 以 `src` 的内容重置标签（拷贝）。整体同步不触发 Change，
+    /// 并会关掉开着的输入框——列表都换了，编辑中的草稿没有意义。
+    void SetItems(List<string> src) {
+        items = new List<string>();
+        if (src != null) {
+            for (int i = 0; i < src.Count; i = i + 1) {
+                items.Add(src[i]);
+            }
+        }
+        editing = false;
+        takeFocus = false;
+    }
+
+    void Clear() {
+        items = new List<string>();
+        editing = false;
+        takeFocus = false;
+    }
+
+    /// 触发器还允许再添加吗（未设 Max 或未达上限）。
+    bool CanAdd() {
+        if (Max <= 0) { return true; }
+        return items.Count < Max;
+    }
+
+    /// 触发器文案。
+    string AddLabel() {
+        if (AddText != "") { return AddText; }
+        return DynamicTags.TT("Add", "新建标签");
+    }
+
+    /// 打开输入框（占据触发器位置）。达到 Max 或整控件禁用时
+    /// 是空操作。
+    void StartEdit() {
+        if (editing || this.IsDisabled() || !this.CanAdd()) { return; }
+        editing = true;
+        editor.SetText("");
+        takeFocus = true;
+        editorFocused = true;
+    }
+
+    /// 关闭输入框；`add` 为真且文本非空时先追加（回车与失焦），
+    /// 否则丢弃草稿（Esc）。
+    void FinishEdit(App app, bool add) {
+        if (!editing) { return; }
+        string t = editor.GetText();
+        editing = false;
+        takeFocus = false;
+        editorFocused = false;
+        editor.SetText("");
+        if (add && t != "" && this.CanAdd()) {
+            this.Add(t);
+        }
+        app.RequestRedraw();
+    }
+
+    /// 触发器自然宽度：加号字形 + 文案 + 标签内边距。
+    int TriggerWidth(App app, string cls) {
+        Theme t = app.theme;
+        StyleBox s = Style.Of(app, "tag", cls, Style.SNormal());
+        int fontPx = s.FontOr(Style.FontFallback(app, "small"));
+        return BoxContent.Width("plus", this.AddLabel(), "", fontPx,
+                                s.GapOr(t.gapSmall))
+            + s.PadLOr(t.paddingSmall) + s.PadROr(t.paddingSmall);
+    }
+
+    /// 整行自然宽度：所有标签 + 间距 + 触发器（输入框开着时它
+    /// 原位让给输入框，宽度按触发器计，测量阶段编辑未开）。
+    int RowWidth(App app, string cls) {
+        Theme t = app.theme;
+        StyleBox s = Style.Of(app, "tag", cls, Style.SNormal());
+        int gap = s.GapOr(t.gapSmall);
+        int total = 0;
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (i > 0) { total = total + gap; }
+            if (Closable) { total = total + Tag.ClosableWidth(app, items[i], cls); }
+            else { total = total + Tag.Width(app, items[i], cls); }
+        }
+        if (items.Count > 0) { total = total + gap; }
+        return total + this.TriggerWidth(app, cls + " add");
+    }
+
+    /// 绘制整行；返回触发器 id（无它用时可忽略）。行内所有点击
+    /// 都在本方法里就地处理：关 x 移除、触发器开编辑框。
+    int Render(App app, int x, int y) {
+        bool disabled = this.IsDisabled();
+        string origClass = Class;
+        this.AddClass(this.SizeCls());
+        string cls = Class;
+        Theme t = app.theme;
+        StyleBox bs = Style.Of(app, "tag", cls, Style.SNormal());
+        int rowH = bs.HeightOr(t.heightTiny);
+        int gap = bs.GapOr(t.gapSmall);
+        int fontPx = bs.FontOr(Style.FontFallback(app, "small"));
+
+        // 失焦提交：上一帧还持有焦点、这一帧没有了。先于输入框
+        // 渲染执行，点击别处的同一帧草稿就已落袋。
+        if (editing && !takeFocus && !editorFocused) {
+            this.FinishEdit(app, true);
+        }
+        // 回车提交 / Esc 放弃：读键必须在输入框渲染之前，否则
+        // 它先把按键吃掉，这里就只能看到残渣（SessionList 同款）。
+        if (editing) {
+            int ekind = app.EventKind();
+            int ekey = app.window.EventKeyCode();
+            if (ekind == 6 && ekey == 13) {
+                this.FinishEdit(app, true);
+            } else if (ekind == 4 && ekey == 27) {
+                this.FinishEdit(app, false);
+            }
+        }
+
+        int tx = x;
+        int i = 0;
+        while (i < items.Count) {
+            string text = items[i];
+            int w = Tag.Width(app, text, cls);
+            int bodyId = tagBase + i;
+            int closeId = tagBase + 512 + i;
+            string trailing = "";
+            if (Closable) {
+                w = w + gap + BoxContent.GlyphSize(fontPx);
+                trailing = "close";
+            }
+            StyleBox s = this.ResolveEasedStyleAsIn(
+                app, bodyId, "tag", cls, disabled, false, tx, y, w, rowH);
+            int closeX = BoxContent.Paint(app, bodyId, "tag", cls, name, s,
+                                          tx, y, w, rowH, "", text, trailing,
+                                          false, disabled);
+            app.hitTester.RegisterRect(bodyId, tx, y, w, rowH, 0);
+            if (Closable && !disabled && i < 512) {
+                int glyph = BoxContent.GlyphSize(fontPx);
+                // 关闭字形后注册，命中测试取最后注册者，点 x 不会
+                // 落到整签命中区里。
+                app.hitTester.RegisterRect(closeId, closeX, y, glyph, rowH, 0);
+                if (Ui.Clicked(app, closeId)) {
+                    this.RemoveAt(i);
+                    app.RequestRedraw();
+                    // 列表在本帧变短了：余下的标签交给请求的重绘
+                    // 按新列表画（Tabs 的标签条同款）。
+                    break;
+                }
+            }
+            tx = tx + w + gap;
+            i = i + 1;
+        }
+
+        if (editing) {
+            // 输入框原位替换触发器；每帧重设占位文字，
+            // 改成绑定后依然跟手。
+            if (Placeholder != "") { editor.hint = Placeholder; }
+            int ew = app.Scale(96);
+            int eid = editor.Render(app, tx, y, ew, rowH);
+            if (takeFocus) {
+                app.focus.SetFocused(eid);
+                takeFocus = false;
+                editorFocused = true;
+            } else {
+                editorFocused = app.focus.IsFocused(eid);
+            }
+        } else {
+            // 尾部「+ 新建标签」：虚线框触发器（tag.add）。达到
+            // Max 或禁用时置灰且不再打开。
+            string tcls = cls + " add";
+            bool inert = disabled || !this.CanAdd();
+            int tw = this.TriggerWidth(app, tcls);
+            StyleBox s = this.ResolveEasedStyleAsIn(
+                app, triggerId, "tag", tcls, inert, false, tx, y, tw, rowH);
+            BoxContent.Paint(app, triggerId, "tag", tcls, name, s,
+                             tx, y, tw, rowH, "plus", this.AddLabel(), "",
+                             false, inert);
+            if (Ui.Activate(app, triggerId, tx, y, tw, rowH) && !inert) {
+                this.StartEdit();
+                // 同帧原位铺开输入框并把焦点交给它：点开的那个
+                // 框就已在打字状态，不必再点一下。
+                int ew = app.Scale(96);
+                if (Placeholder != "") { editor.hint = Placeholder; }
+                int eid = editor.Render(app, tx, y, ew, rowH);
+                app.focus.SetFocused(eid);
+                takeFocus = false;
+                editorFocused = true;
+                app.RequestRedraw();
+            }
+        }
+
+        Class = origClass;
+        return triggerId;
+    }
+
+    // ---- 设计器 / 序列化模型 --------------------------------------
+
+    override string Kind() { return "DynamicTags"; }
+    override Binding<string> SizeOf() { return Size; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec cl = PropSpec.Bool("closable", "Closable");
+        cl.flag = Closable;
+        cl.WithTip("Every tag shows a close X (Naive UI closable, default on for dynamic tags).");
+        ps.Add(cl);
+        PropSpec mx = PropSpec.Int("max", "Max");
+        mx.num = Max;
+        mx.Step(1, 0, 999);
+        mx.WithTip("Tag count limit; 0 = unlimited. The add trigger greys out at the limit.");
+        ps.Add(mx);
+        PropSpec at = PropSpec.Text("addText", "Add text");
+        at.str = AddText;
+        at.WithTip("Trigger label; empty follows the UI language.");
+        ps.Add(at);
+        PropSpec ph = PropSpec.Text("placeholder", "Placeholder");
+        ph.str = Placeholder;
+        ps.Add(ph);
+        PropSpec sz = PropSpec.Enum("size", "Size",
+            new List<string>{ "tiny", "small", "medium", "large" });
+        sz.str = Size;
+        ps.Add(sz);
+        ps.Add(PropSpec.Text("class", "Classes"));
+        return ps;
+    }
+
+    /// 标签集合按 `|` 分隔的原样文本回读（Tabs.SetItemsText 同款），
+    /// 供设计器与 .zform 序列化。
+    override string GetExtra(string key) {
+        if (key == "options") {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < items.Count; i = i + 1) {
+                if (i > 0) { sb.Append("|"); }
+                sb.Append(items[i]);
+            }
+            return sb.ToString();
+        }
+        return "";
+    }
+
+    override bool SetExtra(string key, string val) {
+        if (key == "options") {
+            List<string> parsed = new List<string>();
+            List<string> parts = val.Split("|");
+            for (int i = 0; i < parts.Count; i = i + 1) {
+                if (parts[i] == "") { continue; }
+                parsed.Add(parts[i]);
+            }
+            this.SetItems(parsed);
+            return true;
+        }
+        return false;
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change") { Change.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    // ---- 保留式钩子（Control） --------------------------------------
+
+    override void OnMeasure(App app) {
+        string origClass = Class;
+        this.AddClass(this.SizeCls());
+        StyleBox s = this.ResolveStyleAs(app, "tag", Class, Style.SNormal());
+        prefW = s.WidthOr(this.RowWidth(app, Class));
+        prefH = s.HeightOr(app.theme.heightTiny);
+        Class = origClass;
+    }
+
+    override void OnPaint(App app) {
+        if (bw <= 0) { return; }
+        string origClass = Class;
+        this.AddClass(this.SizeCls());
+        StyleBox s = this.ResolveStyleAs(app, "tag", Class, Style.SNormal());
+        int rowH = s.HeightOr(app.theme.heightTiny);
+        // 行通常比标签高，在停靠边界内居中；内容比分配的宽度宽时
+        // 裁在本控件边界内，不漫到兄弟控件上。
+        int py = by;
+        if (bh > rowH) { py = by + (bh - rowH) / 2; }
+        app.canvas.PushClip(bx, by, bw, bh);
+        this.Render(app, bx, py);
+        app.canvas.PopClip();
+        Class = origClass;
+    }
+}

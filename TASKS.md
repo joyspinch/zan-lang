@@ -1570,6 +1570,50 @@ plain join、join into、终端 group、group into 八种形态）三档孪生�
   未入库（离线造不出 1x1 webp），解码路径由 RIFF 嗅探单测覆盖在
   gui_runtime（libwebp 自带上游测试）。
 
+# A61 · Gui.Widget.DynamicTags 动态标签（Naive UI n-dynamic-tags）—— ✅ 已完成（2026-08-28）
+
+目标：对应 Naive UI 的 dynamic-tags——一排可增删的 Tag，尾部虚线「+ 新建标签」
+触发器，点击后原位变成输入框，回车/失焦提交、Esc 放弃；对齐其 `closable`
+（默认 true）与 `max`（达到后触发器置灰）语义。
+
+- **组件**（`stdlib/Gui/Widget/DynamicTags.zan`，纯 Zan，零 runtime 改动）：
+  自持 `List<string>`（无列表绑定，与 Tabs/SelectBox 同风格），`Add/RemoveAt/
+  SetItems/Clear/Items()` 模型 API，`Change` 事件同步抛出（移除在标签循环内
+  抛出后立即 break，提交在循环外抛出，处理器改集合安全）。`Size`
+  （tiny/small/medium/large）经 `SizeOf()` 映射 tag 皮肤类；`AddText`/
+  `Placeholder` 定文案（默认文案走 `lang`/`TT`，与 Tabs 同款）。
+- **内联编辑器**：成员 `Input` 保留实例（SessionList 行内重命名同款），占据
+  触发器位置原位渲染，`focus.SetFocused` 同帧接管键盘（IME/选区/剪贴板全由
+  Input 处理）；回车（kind 6 code 13）与 Esc（kind 4 code 27）在它渲染前
+  轮询读取，失焦提交靠"上一帧 IsFocused 快照"（对齐 Naive 的
+  handleInputBlur→handleInputConfirm）。打开同帧即铺开输入框，点一次就处于
+  打字状态。
+- **命中 id**：`WidgetId.Block(1024)` 段按下标分配每标签一对 id（整体
+  tagBase+i、关 x tagBase+512+i），标签增删不挪其他控件 id；关 x 矩形在整体
+  矩形之后注册，命中测试取最后注册者。触发器经 `Ui.Activate`（注册 + 点击 +
+  键盘激活）。
+- **皮肤**：base.css 增 `tag.add`（虚线框触发器，transparent 底、
+  `--border-secondary` 虚线边）与 `:hover`（染主色）、`:disabled` 规则；语义
+  类（primary/error…）作用于整排标签。
+- **注册**：ControlFactory（Kinds + Create）、
+  `tools/mcp_server/zform.controls.txt`（policy_zform_schema 守门）、
+  designer Props（closable/max/addText/placeholder/size）+ `options` 经
+  `GetExtra/SetExtra`（`|` 连接，Tabs.SetItemsText 同款）。
+- **测试**：`tests/gui/dynamictags_test.zan` + golden（无窗口）：默认值、
+  SetItems 不触发 Change、Add/RemoveAt 各触发一次、越界静默、Max 只闸交互
+  不闸程序化 Add、options 往返与空段折叠、未知键返回 false。注册
+  `conformance_gui_dynamictags`。
+- **gallery / IDE**：gallery "Data Display" 增 DynamicTags 组件条目 + 实时
+  预览（保留实例，编辑状态跨帧存活；变更数报进卡片头部事件栏）；IDE 帮助
+  topics.json 增主题（preview=DynamicTags）+ ComponentGallery 演示。
+- **实测**：`zanc tests/gui/dynamictags_test.zan stdlib/Gui/Widget/DynamicTags.zan
+  --auto-stdlib` 输出与 golden 逐行一致；tabs/props/image/icon 同法回归全绿；
+  gallery 以隔离副本编译通过（305 文件）；gallery coverage / css comment
+  hygiene 政策绿。
+- **已知限制**：单行不折行（超宽由容器裁剪，Tag/Tabs 同策略）；标签文本含
+  `|` 会破坏 options 序列化（Tabs items 同款限制）；Esc 放弃是 Naive 没有
+  的桌面补充（Naive 仅回车/失焦）。
+
 # A58 · 全量收口执行计划（2026-08-27 定序）
 
 排序依据三条：① 先修"编译通过但结果错/编译器崩"的，因为它们会污染后面每一次

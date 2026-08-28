@@ -79,6 +79,27 @@ Canvas.EvictImage("mem:logo");                              // 丢弃（路径�
 `Reload()` 重新解析。加载中与失败画 `image` CSS 规则的底色 + `Alt` 文本占位。
 注意：位图内容按矩形裁剪，CSS 圆角只作用于背景与边框（光栅器暂无圆角剪裁路径）。
 
+### 动态标签 Gui.Widget.DynamicTags（Naive UI n-dynamic-tags）
+
+一排可增删的 Tag + 尾部虚线「+ 新建标签」触发器；点击触发器原位变成输入框，
+回车或点击别处提交（非空才追加），Esc 放弃（Naive 没有的桌面补充），标签尾部
+x 移除。`Closable` 默认 true；`Max` 限制数量、达到后触发器置灰；`Size`
+（tiny/small/medium/large）映射 tag 皮肤类；`AddText`/`Placeholder` 定文案。
+
+```zan
+DynamicTags tags = new DynamicTags();
+tags.SetItems(new List<string>{ "调查中", "已发布" });
+tags.Change += () => { Save(tags.Items()); };   // 增删时触发（SetItems 不触发）
+tags.Render(app, 40, 80);
+```
+
+实现要点：组件自持 `List<string>`（无列表绑定），内联编辑器是成员 `Input` 保留
+实例、原位渲染并 `focus.SetFocused` 接管键盘；回车/Esc 在它渲染前轮询读取
+（SessionList 同款），失焦提交靠"上一帧焦点快照"。每标签一对命中 id 从
+`WidgetId.Block(1024)` 段按下标分配（tagBase+i / tagBase+512+i），关 x 后注册、
+命中测试取最后注册者。触发器走 `tag.add` 皮肤规则（虚线框）。设计器序列化经
+`GetExtra/SetExtra("options")`（`|` 连接，Tabs.SetItemsText 同款）。
+
 ## 控件与组件在哪
 
 | 想要 | 去哪 |

@@ -1485,6 +1485,18 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_tabs${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # Dynamic tags model bookkeeping: add/remove raise exactly one Change each,
+  # Max gates the interactive trigger only, and the `|`-joined options text
+  # round-trips through GetExtra/SetExtra for the designer.
+  add_test(NAME conformance_gui_dynamictags
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/dynamictags_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Widget/DynamicTags.zan;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_dynamictags.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_dynamictags${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # VirtualList template rows: rows are built lazily (never at SetRows, only
   # when a frame needs them in the viewport) and the string-mode bookkeeping
   # stays intact across the mode switch.
