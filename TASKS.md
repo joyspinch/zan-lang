@@ -1524,6 +1524,38 @@ plain join、join into、终端 group、group into 八种形态）三档孪生�
 - **证据**：`tests/conformance/pattern_value_types.zan`（表达式/语句两形态、
   `when` 守卫、绑定变量、不同值类型不得匹配、以及 string/class/double/bool 判别式）。
 
+# A60 · 局部帧裁剪吃掉条带外点击 + Switch 禁用可点 + 条件真值化 i0 —— ✅ 已修（2026-08-28）
+
+三个独立暴露、其中两个同根因的缺陷：
+
+- **局部帧只注册条带内命中区，事件解析扑空（Gui 框架）**：损伤条带帧只渲染条带内
+  控件，`HitTester` 池里也只剩条带内区域；事件在 ApplyEvent 里按「上一帧」解析目标，
+  上一帧恰是条带帧时条带外所有点击静默丢失——用户感知为「点了开关半天才反应」，
+  自动化感知为注入点击随机丢（`click.target=-1`，`dump hitregions` 仅 17 个区域可证）。
+  条带裁剪的前提是条带外像素/控件不变，故最近一次整帧的命中区对条带外依然成立。
+  - **修复 1**：`HitTester` 增加「最近完整帧」快照（`KeepFullSnapshot`，整帧
+    PresentFrame 时按值拷贝），`AnchorAt` 改读快照；锚点矩形认领机制不变。
+  - **修复 2**：输入事件（按下/释放/按键）触发的帧禁止条带化——`App.inputNeedsFrame`
+    在 `TakeDueFrame` 裁剪判定与 `BeginFrame` 的 partialPending 继承两处都拦下
+    （后者尤其隐蔽：纯动画帧声明的条带会被下一个输入帧继承，控件照样出不了条带）。
+    悬停条带（kind 1，NoteHoverDamage 自声明）与动画帧优化不受影响。
+  - **证据**：画廊默认模式（局部帧开）`sw14` 四连点 + `assert probe` 8/8 全绿
+    （修复前同脚本 2/4 失败）；`_scratch/uidrv`（已清理）。
+- **Switch 禁用不拦点击**（`Switch.zan`）：`fire = Ui.Clicked(...)` 缺其他控件都有的
+  `&& !IsDisabled()`，灰掉的开关照样翻转。已照 Radio/Checkbox 惯例补上（键盘路径同拦）。
+- **条件真值化铸出非法 i0（编译器）**：非 bool 值直接作条件（类引用/Binding/浮点）
+  时，三元、if/while/do-while/for 的归一化用 `LLVMConstInt(LLVMTypeOf(v),0,0)` 对
+  指针/浮点铸出 `i0` 常量，LLVM verification 失败。统一走新助手 `zan_tobool`
+  （irgen.c：整数比零、指针比 null、浮点 fcmpUNE），六处换用。
+  **证据**：`tests/conformance/truthy_cond.zan`（对象/int/float 条件、
+  while/do/for 退出语义、&&/|| 仍强制 bool）四档（conformance/determinism/
+  leakcheck/arcguard）全绿。
+
+**遗留未解（低频，1/40 量级）**：注入点击批次偶发整批丢失——探针显示 press 已到、
+release 从未被泵出（`click.target=-999`、`delivered=false`），即事件在原生队列与
+ApplyEvent 之间消失，与命中区无关。样本极少且均发生在锁屏/高负载时段，疑环境性；
+待可复现样本再查 `Window.InjectEvent` → 原生队列 → 泵路径。
+
 # A59 · Gui.Image 图片组件：传地址即渲染 —— ✅ 已完成（2026-08-28）
 
 目标：`Gui.Widget.Image` 控件，`Src` 传地址就出图——本地文件路径、
@@ -1569,6 +1601,45 @@ plain join、join into、终端 group、group into 八种形态）三档孪生�
   矩形裁剪、CSS 圆角只作用于背景/边框；URL 无磁盘缓存。WebP 真实样本
   未入库（离线造不出 1x1 webp），解码路径由 RIFF 嗅探单测覆盖在
   gui_runtime（libwebp 自带上游测试）。
+
+# A60 · PivotTable 整体重写：滚动/选中/百分比/热力/钉住合计 —— ✅ 已完成（2026-08-28）
+
+目标：原 `PivotTable` 只是一个静态聚合网格（4 参构造 + 单度量），按"不兼容直接
+重写"的定调整体换新 API，不对旧签名做任何兼容层。
+
+- **新 API**（`stdlib/Gui/Component/PivotTable.zan`）：
+  `PivotMeasure(field, agg, title, showAs)`（agg：Sum/Count/Avg/Max/Min；
+  showAs：绝对值 / %行 / %列 / %总计）+ `PivotConfig(rowField, colField)`
+  （measures 列表、groupDigits、rowSort：升/降/按值降/按值升、heat）+
+  `PivotState`（scrollX/scrollY、选中格、`TakeClick()` 事件泵——clickR/C/M、
+  clickRowKey/ColKey）。唯一入口
+  `PivotTable.Render(app, x, y, viewW, viewH, rows, cfg, st)`。
+- **能力**：两级表头（组标题行 + 度量子列）随列带横滚；行头列与合计列/合计行
+  钉住（合计行在数据不满一屏时紧跟最后一行，溢出时钉视口下缘）；滚轮垂直可滚
+  则滚垂直、否则横滚（`CaptureWheel`）；悬停行/列十字高亮 + 单元格点击选中；
+  百分比度量在合计上保持同一语义（%行的行合计恒为 100%、%列的列合计恒为
+  100%、其余按占总计换算、基数为 0 显示 "-"）；热力图按度量内 min-max 调
+  `Style.Fade` 着色；列宽自适应（Scale(64)..Scale(220)）、行头自适应
+  （Scale(90)..Scale(260)）；千分位分组；空态（无度量/无数据）。
+- **样式**：base.css 新增 `pivottable::hover`/`pivottable::sel`（两处重复块
+  同步），`tests/gui/css_test.zan` 内嵌表同步。外框线在全部内容之后补画：
+  表头/行/合计的填充都从矩形边缘起笔，先画外框会被整段盖掉（表现为
+  部分布局下边框丢失），钉底合计行与钉右合计列两处尤其明显。
+- **调试期修掉的编译器缺陷**（规则 10，非绕过）：`irgen_call.c` 通用实例方法
+  调用路径无条件把 receiver 压进实参表，`this.StaticMethod()` 形态（静态方法
+  经实例调用）会把 `this` 当首个形参传——已按泛型路径同款语义
+  （`callee_static` → 不发 receiver、`cur_inst` 作 recv_ty、dispatch 传
+  NULL cls）修复。
+- **示例**：`examples/gui_gallery/gui_gallery.zan` 与
+  `src/ide_zan/src/pages/ComponentGallery.zan` 的透视表演示全部改写为新 API
+  （双度量 + 千分位 + 热力 + 值降序）。
+- **实测**：UiDriver 脚本（`ZAN_UI_SCRIPT`）注入真实 `clickid`/`scroll` 事件：
+  点击 North×Q1·Avg·Price → `pivot-click r=5 c=0 m=2 row=North col=Q1` 精确；
+  滚轮横滚后合计行 Q1=403、Q2=416 与可见单元格求和逐一相符；`dump pixels`
+  像素级核对两级表头/钉住合计/热力/选中高亮。
+  `scripts/test.ps1 smoke -Match "gui|css|pivot"` → **25/25 全绿**；
+  `scripts/build_ide.ps1` 编译期 ComponentGallery 零错误（构建挂在旁支
+  ZanIDE.Docs.zan 的进行中改动，与本任务无关）。
 
 # A61 · Gui.Widget.DynamicTags 动态标签（Naive UI n-dynamic-tags）—— ✅ 已完成（2026-08-28）
 
@@ -2037,3 +2108,57 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
 `System.Windows`(71) 仍各带 Threading + Diagnostics，其中 `Automation/Window.zan`
 与 `Management/Cpu.zan` 疑似只为 `Thread.Sleep` 付全价，待核；`System.Net`(97) /
 `System.Web`(108) / `System.Data`(115) 的体量是真实并发/驱动面，不属于误拉。
+
+# A64 · System 栈封装审查修复（网络协议 / ORM / HTTP MVC）—— ✅ 第一批完成（2026-08-28）
+
+对 `stdlib/System` 的封装审查（~75 项，P0→P3）按序修复的第一批。
+
+**P0 · 协议正确性**
+- **MQTT broker 边界检查 + 客户端 varint**：主题/包长越界不再越界读写；
+  `mqtt_loopback` 用例通过。
+- **WebSocket 整改**：帧边界、掩码、关闭握手收口；`ws_loopback` 通过。
+
+**P0/P1 · ORM 错误信号统一**：驱动层失败一律抛 `DbException`（携带驱动
+  原生错误码与文本），不再以 -1 / 空结果集静默表示失败。
+  `db_error_throw` 17/17。`OrmSelect.BuildCount` 派生表别名、
+  `LastIdSql`/CodeFirst 方言补齐（36 用例）。
+
+**P1 · Web/Net**
+- `GenRoute` 表单→对象绑定 + 可选参数（`web_typed_binding` 22/22）。
+- **HttpClient keep-alive 连接复用**：每客户端池化 `HttpFramer` +
+  连接/TLS 上下文；并发请求回退一次性路径（busy 标志）；陈旧池化连接
+  透明重试一次；204/304/HEAD 无体、EOF 定界不复用、`Connection: close`
+  驱动弃池；公开 `Close()` / `DisableKeepAlive()`。新增
+  `tests/conformance/http_client_keepalive.zan`（11 项断言）。
+- **HttpsServer 二进制响应体**：`bodyBytes` 分块发送，与 HttpServer 对齐；
+  新增 `tests/conformance/https_binary_body.zan`（12 项断言，含复用 TLS
+  连接的二次二进制/文本请求）。
+
+**P2 · HTTP MVC 参数族**
+- `InRaw/InInt/InLong/InBool` 统一 route→query→form 优先级与严格解析
+  （全量消费、正负号、溢出保护）；`Input*` 家族收编为一行蹦床，删除约
+  40 行重复实现；`ParseLongStrict` 静默回绕改守卫。
+- `JsonBody()` 惰性缓存（空体返回 null）；multipart/form-data 字段可见
+  于 `In()/Form()`（`ParseMultipartFields`，含带引号 boundary/name）。
+  `http_params` 35 项断言。
+
+**P2 · 数据层**
+- **ODBC 诊断**：`SQLGetDiagRec` 接入两分支（odbc32/odbc），失败消息带
+  驱动原生文本；三个取值循环的每格 4KB 缓冲提升为跨行复用。
+- **SQLite prepare 缓存**（`SqliteConnection`）：同一条 SQL 首次 prepare
+  后缓存，后续 reset + 重绑复用；`stmtBusy` 在途标志使并发同句回退到
+  一次性语句（不碰缓存句柄）；多语句文本（pzTail 非空）不入缓存；
+  `ReleaseStmt` 覆盖全部退出路径；`Close()` 先 finalize 缓存语句再
+  `sqlite3_close`（否则 SQLITE_BUSY）。探针覆盖缓存命中重绑、错误后
+  可用性、多语句路径。
+
+**明确延后（非静默跳过）**
+- **ODBC prepare 缓存**：本机无可用的 live ODBC 驱动验证语句复用语义
+  （SQLExecDirect 与 SQLPrepare/SQLExecute 混用、游标保持行为），
+  不做未验证的优化。待有驱动环境再补。
+- P3（WS 服务器回调风格对齐、HttpClient 错误模型文档、CSRF 中间件、
+  TextByte 扫描器沉淀）在下一批。
+
+**证据**：域内回归 `ctest -L standard -R "db_|orm_|zandb|sqlite|http_|ws_|webdav|mqtt|tls|https"`
+55/56 绿（唯一失败 `policy_zform_schema` 为 Gui WIP 的 zform 清单缺
+Marquee 条目，与本批无关）。

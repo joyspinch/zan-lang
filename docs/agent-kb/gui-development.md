@@ -109,6 +109,7 @@ wm.Color = 0x2E1890FF; wm.FontPx = 18; wm.Rotate = 0; wm.GapX = 44;
 （run 瓦片 key 带 0xFF 前缀 + 角度，不与普通文本 key 碰撞）；CPU/GL
 合成器不变（瓦片内已烘焙旋转）。macOS 暂回落不旋转（CoreText 旋转蒙版
 待补）。
+
 ### 动态标签 Gui.Widget.DynamicTags（Naive UI n-dynamic-tags）
 
 一排可增删的 Tag + 尾部虚线「+ 新建标签」触发器；点击触发器原位变成输入框，

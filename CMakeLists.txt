@@ -1634,12 +1634,23 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_props${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  # Calendar: the pure-logic surface without a window -- strict
-  # YYYY-MM-DD parsing, the 7x6 grid's cell->date mapping
-  # (leading/trailing adjacent-month cells), the prop protocol
-  # (text/mode), the is-date-disabled filter, mark normalization to
-  # midnight, and how change / panel-change fire on picks within and
-  # across months.
+  # FormGroup/FormRule: caption+control+error-line rows, rule evaluation
+  # (required/length/email/range/checked/equals-field) and the dependent-form
+  # semantics -- hidden/disabled rows skip validation.
+  add_test(NAME conformance_gui_formgroup
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/formgroup_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_formgroup.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_formgroup${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  # Calendar: the pure-logic surface without a window -- strict YYYY-MM-DD
+  # parsing, the 7x6 grid's cell->date mapping (leading/trailing
+  # adjacent-month cells), the prop protocol (text/mode), the
+  # is-date-disabled filter, mark normalization to midnight, and how
+  # change / panel-change fire on picks within and across months.
   add_test(NAME conformance_gui_calendar
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
