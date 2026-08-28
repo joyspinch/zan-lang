@@ -147,11 +147,110 @@ class Program {
         Program.Eq("same-month no panel",
                    Convert.ToString(Program.panelFired - p4), "0");
 
+        // ---- 议程渲染：行高由真实字号推导，紧跟日期行排，放不下不画。
+        // ---- 回归点：此前用拍的 Scale(13) 预留行高（250% DPI 下实际
+        // ---- 行高 ~tinyFs*1.25），底对齐的议程文字压过了格底线。
+        int rw = 440;
+        int rh = 400;
+        App app = new App("cal-render", rw + 20, rh + 20);
+        int tinyFs = Style.FontFallback(app, "tiny");
+        int lh = tinyFs + tinyFs / 3;
+        Calendar bare = new Calendar();
+        bare.ClearDate();
+        bare.RenderInside(app, new Rect(10, 10, rw, rh));
+        int cellW = rw / 7;
+        int cellH = (rh - app.Scale(44) - app.Scale(26)) / 6;
+        Program.Ok("probe fits number and one agenda line",
+                   app.Scale(26) + lh <= cellH);
+        Program.Ok("probe cannot fit two agenda lines",
+                   app.Scale(26) + 2 * lh > cellH);
+        Program.Eq("bare bands clean",
+                   Convert.ToString(Program.BandsInk(app, 10, 10, cellW,
+                                                     cellH, 7, 6)),
+                   "0");
+
+        app.canvas.Clear(0xFFFFFFFF);
+        Calendar marked = new Calendar();
+        marked.SetDate(DateTime.ParseDate("2026-08-15"));
+        marked.AddMark(DateTime.ParseDate("2026-08-28"), "站会", 1);
+        marked.AddMark(DateTime.ParseDate("2026-08-29"), "发布", 3);
+        marked.AddMark(DateTime.ParseDate("2026-08-30"), "设计评审", 2);
+        marked.RenderInside(app, new Rect(10, 10, rw, rh));
+        // 2026-08-01 是周六：start=6，28/29/30 号各在自己格子里。
+        int[] markIdx = new int[]{ 6 + 27, 6 + 28, 6 + 29 };
+        for (int n = 0; n < 3; n = n + 1) {
+            int idx = markIdx[n];
+            int ink = Program.CellBandInk(app, 10 + (idx % 7) * cellW,
+                                          10 + app.Scale(44) + app.Scale(26)
+                                              + (idx / 7) * cellH,
+                                          cellW, cellH);
+            Program.Ok("mark ink on 2026-08-"
+                       + Convert.ToString(28 + n), ink > 0);
+        }
+        int plain = 6 + 9;
+        Program.Eq("unmarked band clean",
+                   Convert.ToString(Program.CellBandInk(
+                       app, 10 + (plain % 7) * cellW,
+                       10 + app.Scale(44) + app.Scale(26)
+                           + (plain / 7) * cellH,
+                       cellW, cellH)),
+                   "0");
+        // 溢出断言（用户报的「内容跑到框外」）：末行 30 号（idx=35）的
+        // 格底线以下、画布范围内不得有任何议程墨迹。
+        int gridBottom = 10 + app.Scale(44) + app.Scale(26) + 6 * cellH;
+        int stripTop = gridBottom + 1;
+        int stripBottom = gridBottom + lh + 2;
+        int canvasH = app.canvas.Height();
+        if (stripBottom > canvasH) { stripBottom = canvasH; }
+        int spill = 0;
+        for (int y = stripTop; y < stripBottom; y = y + 1) {
+            for (int x = 10 + app.Scale(3); x < 10 + cellW - app.Scale(3);
+                 x = x + 1) {
+                if ((app.canvas.GetPixel(x, y) & 0x00FFFFFF) != 0x00FFFFFF) {
+                    spill = spill + 1;
+                }
+            }
+        }
+        Program.Eq("no ink past the grid bottom",
+                   Convert.ToString(spill), "0");
+
         if (fails == 0) {
             Console.WriteLine("calendar_test: OK");
             return;
         }
         Console.WriteLine("calendar_test: " + Convert.ToString(fails)
                           + " failure(s)");
+    }
+
+    /// 单元格议程带的非白像素数：带在 y ∈ [cy+Scale(26), cy+ch-Scale(2))
+    /// （日期行之下、格底线之上）、x 两侧各缩进 Scale(3) 避开格边细线。
+    static int CellBandInk(App app, int cx, int cy, int cw, int ch) {
+        int y0 = cy + app.Scale(26);
+        int y1 = cy + ch - app.Scale(2);
+        int x0 = cx + app.Scale(3);
+        int x1 = cx + cw - app.Scale(3);
+        int ink = 0;
+        for (int y = y0; y < y1; y = y + 1) {
+            for (int x = x0; x < x1; x = x + 1) {
+                if ((app.canvas.GetPixel(x, y) & 0x00FFFFFF) != 0x00FFFFFF) {
+                    ink = ink + 1;
+                }
+            }
+        }
+        return ink;
+    }
+
+    /// 整片网格所有格子议程带的总墨量（空白日历应为 0）。
+    static int BandsInk(App app, int gx, int gy, int cw, int ch,
+                        int cols, int rows) {
+        int top = gy + app.Scale(44) + app.Scale(26);
+        int ink = 0;
+        for (int r = 0; r < rows; r = r + 1) {
+            for (int c = 0; c < cols; c = c + 1) {
+                ink = ink + Program.CellBandInk(app, gx + c * cw,
+                                                top + r * ch, cw, ch);
+            }
+        }
+        return ink;
     }
 }
