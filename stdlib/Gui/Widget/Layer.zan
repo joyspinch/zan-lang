@@ -83,6 +83,18 @@ class LayerState {
     int rsBId;
     int rsSEId;
     int rsSWId;
+    // ---- 生命周期回调（layui success/end 的等价物） ----
+    // Opened：入场动画走完（或无动画时首帧渲染）触发一次。
+    // Closed：层关闭后的第一次渲染沿（或 Layer.Close 立即）触发
+    // 一次——直接置 open=false 的宿主只要照常渲染该层就会收到。
+    UiEvent Opened;
+    UiEvent Closed;
+    // 渲染沿检测用：Open 时置位，Closed 触发时清掉（重开重新武装）。
+    bool wasOpen;
+    bool openedRaised;
+    // >0 时打开这么多毫秒后自动关闭（layui 的 time），经 Layer.Close
+    // 走统一路径（同样触发 Closed）。
+    int AutoCloseMs;
 
     // Layer 专用保留 id 段的游标（seq 域，id = 1000000 + 段内序号）。
     static int winSeq;
@@ -148,6 +160,11 @@ class LayerState {
         this.rsBId = WidgetId.Next();
         this.rsSEId = WidgetId.Next();
         this.rsSWId = WidgetId.Next();
+        this.Opened = new UiEvent();
+        this.Closed = new UiEvent();
+        this.wasOpen = false;
+        this.openedRaised = false;
+        this.AutoCloseMs = 0;
         WidgetId.SetSeq(outer);
     }
 
@@ -227,6 +244,10 @@ class LayerState {
         open = true;
         action = 0;
         openMs = Window.GetTickMs();
+        // 重新武装生命周期回调：Opened 等入场走完再触发一次，
+        // Closed 在下一次关闭沿触发。
+        wasOpen = true;
+        openedRaised = false;
         if (state == 2) { state = 0; }
         // 进打开注册表（按打开顺序，末尾最上）——键盘语义
         // （Esc/Enter）与 CloseLast/CloseAll 依赖这份次序。
@@ -330,6 +351,30 @@ class Layer {
             i = i - 1;
         }
         return false;
+    }
+
+    /// 规范关闭入口：立即清拖动/缩放状态并触发 Closed（不必等下一帧
+    /// 渲染）。直接置 open=false 的宿主也没问题——关闭沿会在该层
+    /// 下一次渲染时补触发 Closed（正好一次）。
+    static void Close(App app, LayerState s) {
+        if (!s.open) { return; }
+        s.open = false;
+        s.dragging = false;
+        s.sizing = false;
+        if (s.wasOpen) {
+            s.wasOpen = false;
+            s.Closed.Raise();
+        }
+        app.RequestRedraw();
+    }
+
+    /// 弹出完成回调：入场进度到 1000（或无入场）的第一帧触发一次。
+    /// 渲染路径在算完 Entrance 后调用。
+    static void NotifyOpened(LayerState s) {
+        if (s.wasOpen && !s.openedRaised) {
+            s.openedRaised = true;
+            s.Opened.Raise();
+        }
     }
 
     /// Esc 的语义：最上层对话框报告取消（action 2，由调用方关闭；
@@ -1115,7 +1160,20 @@ class Layer {
     }
 
     static void RenderActive(App app, LayerState s, bool active) {
-        if (!s.open) { return; }
+        if (!s.open) {
+            // 关闭沿：无论谁置的 open=false（X、宿主、CloseLast/CloseAll、
+            // 自动关闭），该层下一次渲染时在这里触发一次 Closed。
+            if (s.wasOpen) {
+                s.wasOpen = false;
+                s.Closed.Raise();
+            }
+            return;
+        }
+        if (s.AutoCloseMs > 0 && s.openMs > 0
+            && Window.GetTickMs() - s.openMs >= s.AutoCloseMs) {
+            Layer.Close(app, s);
+            return;
+        }
         if (s.modal) { Layer.RenderDialog(app, s); return; }
         Canvas c = app.canvas;
         Theme t = app.theme;
@@ -1142,6 +1200,7 @@ class Layer {
         // 入场：上升 + 回稳。
         int entP = Layer.Entrance(app, s);
         ey = ey - (1000 - entP) * app.Scale(10) / 1000;
+        if (entP >= 1000) { Layer.NotifyOpened(s); }
 
         int mx = app.mouseX;
         int my = app.mouseY;
@@ -1215,8 +1274,7 @@ class Layer {
         }
 
         if (active && Ui.Clicked(app, s.closeId)) {
-            s.open = false;
-            s.dragging = false;
+            Layer.Close(app, s);
             return;
         }
         if (active && Ui.Clicked(app, s.maxId)) {
@@ -1400,6 +1458,7 @@ class Layer {
         int rad = t.borderRadiusLarge;
 
         int entP = Layer.Entrance(app, s);
+        if (entP >= 1000) { Layer.NotifyOpened(s); }
 
         // 键盘：Esc=取消、Enter=确认。只由最上层对话框消费（同帧多
         // 个对话框不重复消费），且 photos 顶屏时让位给照片层。

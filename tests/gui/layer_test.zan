@@ -34,6 +34,12 @@ class Program {
         return id >= 1930001 && id < 1930400;
     }
 
+    // 生命周期回调计数（Opened / Closed）。
+    static int openedCount;
+    static int closedCount;
+    static void OnOpened() { openedCount = openedCount + 1; }
+    static void OnClosed() { closedCount = closedCount + 1; }
+
     static void Main() {
         fails = 0;
 
@@ -261,6 +267,54 @@ class Program {
         twinA.open = false;
         twinB.open = false;
 
+        // ---- 生命周期回调：Opened / Closed / AutoCloseMs -----------
+        // Opened 在入场动画走完的第一帧触发一次（入场中不触发）；
+        // Closed 在关闭沿触发一次——宿主直接置 open=false 时由下一次
+        // 渲染补触发，Layer.Close 立即触发，AutoCloseMs 到期自动关闭
+        // 并触发。重开重新武装两个回调。
+        openedCount = 0;
+        closedCount = 0;
+        LayerState lc = new LayerState("LC", 40, 40, 300, 200);
+        lc.Opened += OnOpened;
+        lc.Closed += OnClosed;
+        List<LayerState> lcStack = new List<LayerState>();
+        lcStack.Add(lc);
+        lc.Open();
+        app.hitTester.Clear();
+        Layer.RenderStack(app, lcStack);
+        Eq("opened suppressed during entrance", openedCount, 0);
+        Window.SleepMs(220);
+        app.hitTester.Clear();
+        Layer.RenderStack(app, lcStack);
+        Eq("opened fired once after entrance", openedCount, 1);
+        app.hitTester.Clear();
+        Layer.RenderStack(app, lcStack);
+        Eq("opened fires exactly once", openedCount, 1);
+        // 宿主直接置 open=false：关闭沿在下一次渲染触发 Closed。
+        lc.open = false;
+        app.hitTester.Clear();
+        Layer.RenderStack(app, lcStack);
+        Eq("closed edge after host close", closedCount, 1);
+        app.hitTester.Clear();
+        Layer.RenderStack(app, lcStack);
+        Eq("closed fires exactly once", closedCount, 1);
+        // 重开再关：Opened 再计一次，Layer.Close 立即触发 Closed。
+        lc.Open();
+        Window.SleepMs(220);
+        app.hitTester.Clear();
+        Layer.RenderStack(app, lcStack);
+        Eq("reopened fires opened again", openedCount, 2);
+        Layer.Close(app, lc);
+        Eq("close fires closed immediately", closedCount, 2);
+        // AutoCloseMs：到期经 Layer.Close 自动关闭并触发 Closed。
+        lc.Open();
+        lc.AutoCloseMs = 60;
+        Window.SleepMs(120);
+        app.hitTester.Clear();
+        Layer.RenderStack(app, lcStack);
+        True("autoclose closed the layer", !lc.open);
+        Eq("autoclose fires closed", closedCount, 3);
+
         // ---- 键盘语义：Esc/Enter/箭头 ------------------------------
         // Enter 确认最上层对话框（action 1），Esc 取消（action 2），
         // ←/→ 在 photos 会话里翻页（250ms 活跃窗），Esc 无对话框时
@@ -276,6 +330,10 @@ class Program {
              Layer.Key(app, 27) && dlg2.action == 2);
         // 宿主读到 action 后关闭（Key 不直接置 open——关闭权在调用方）。
         dlg2.open = false;
+        // 重新渲染 photos 刷新键盘会话（photosTick 有 250ms 新鲜度窗，
+        // 前面缩放/孪生/生命周期段的耗时会让它过期）。
+        app.hitTester.Clear();
+        Layer.RenderPhotos(app, slides, pidx, panim);
         True("key: photos eats right arrow", Layer.Key(app, 39));
         Eq("key: photos idx advanced", pidx.Get(), 1);
         True("key: photos eats left arrow", Layer.Key(app, 37));
