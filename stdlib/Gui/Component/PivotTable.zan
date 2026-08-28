@@ -1,64 +1,45 @@
 using System;
 using Gui;
 using Gui.Component.DataTable;
+using Gui.Widget;
 
 namespace Gui.Component;
 
-/// PivotTable 交叉表（cross-tabulation）的配置。
-/// rowField  ：列索引，其不同取值成为透视表的行
-/// colField  ：列索引，其不同取值成为透视表的列
-/// valueField：数值列索引，在每个交叉点处聚合
-/// aggType   ：0 求和，1 计数，2 平均，3 最大，4 最小
-///
-/// 单个度量可内联给出（valueField/aggType）。若要多个
-/// 度量并排显示，请调用 AddValue(...) 一次或多次；此时内联的
-/// value 被忽略，每个 colKey 在两级列标题下展开为每个度量
-/// 一个子列。
-class PivotConfig {
-    int rowField;
-    int colField;
-    int valueField;
-    int aggType;
-    string rowTitle;
-    string colTitle;
-    string valueTitle;
+/// 一个度量：读取哪一列、如何聚合、如何展示（绝对值或
+/// 占行/列/总计的百分比）以及显示标题。
+/// agg   ：0 求和，1 计数，2 平均，3 最大，4 最小
+/// showAs：0 绝对值，1 占行合计 %，2 占列合计 %，3 占总计 %
+/// 度量的数值经 ParseReal 读取，天然支持小数。
+class PivotMeasure {
+    int field;
+    int agg;
+    int showAs;
+    string title;
 
-    List<PivotMeasure> measures; // 额外的度量（字段 + 聚合方式 + 标题）
-
-    PivotConfig(int rowField, int colField, int valueField, int aggType) {
-        this.rowField = rowField;
-        this.colField = colField;
-        this.valueField = valueField;
-        this.aggType = aggType;
-        this.rowTitle = "";
-        this.colTitle = "";
-        this.valueTitle = "";
-        this.measures = new List<PivotMeasure>();
-    }
-
-    /// 添加一个度量（数值字段 + 聚合方式）。流式：返回配置本身。
-    static PivotConfig AddValue(PivotConfig p, int field, int agg, string title) {
-        p.measures.Add(new PivotMeasure(field, agg, title));
-        return p;
+    PivotMeasure(int field, int agg, string title, int showAs) {
+        this.field = field;
+        this.agg = agg;
+        this.title = title;
+        this.showAs = showAs;
     }
 }
 
-/// 单个透视单元格或合计的聚合累加器（求和/计数/最大/最小）。
-/// 取代旧的 sum/cnt/mx/mn 平行列表约定。
+/// 单个透视单元格或合计的聚合累加器（求和/计数/平均/最大/
+/// 最小）。以 double 累加，小数度量不丢精度。
 class PivotAgg {
-    int sum;
+    double sum;
     int cnt;
-    int mx;
-    int mn;
+    double mx;
+    double mn;
 
     PivotAgg() {
-        sum = 0;
+        sum = 0.0;
         cnt = 0;
-        mx = 0;
-        mn = 0;
+        mx = 0.0;
+        mn = 0.0;
     }
 
-    void Add(int v) {
+    void Add(double v) {
         if (cnt == 0) {
             mx = v;
             mn = v;
@@ -70,29 +51,96 @@ class PivotAgg {
         cnt = cnt + 1;
     }
 
-    int Value(int aggType) {
-        return PivotTable.AggValue(sum, cnt, mx, mn, aggType);
+    double Value(int aggType) {
+        if (cnt == 0) { return 0.0; }
+        if (aggType == 0) { return sum; }
+        if (aggType == 1) { return (double)cnt; }
+        if (aggType == 2) { return sum / (double)cnt; }
+        if (aggType == 3) { return mx; }
+        return mn;
     }
 }
 
-/// 一个已解析的度量：读取哪一列、如何聚合以及它的
-/// 显示标题。取代旧的 field/agg/title 平行列表。
-class PivotMeasure {
-    int field;
-    int agg;
-    string title;
+/// PivotTable 的保留状态：滚动偏移、选中单元格与点击脉冲。
+/// 由调用方创建并跨帧持有（与 DataTableState 同一套约定）；
+/// 每帧重建会丢失滚动位置与选中。
+class PivotState {
+    SignalInt scrollX;   // 列带的水平滚动像素
+    SignalInt scrollY;   // 行区的垂直滚动像素
+    int selR;            // 选中单元格（可见行/列/度量，-1 = 无）
+    int selC;
+    int selM;
+    int clickSeq;        // 每次单元格点击自增；轮询检测新点击
+    int clickSeen;
+    int clickR;          // 最近一次点击（可见行/列/度量索引）
+    int clickC;
+    int clickM;
+    string clickRowKey;  // 最近一次点击的行/列键（排序后的可见键）
+    string clickColKey;
 
-    PivotMeasure(int f, int a, string tt) {
-        field = f;
-        agg = a;
-        title = tt;
+    PivotState() {
+        scrollX = new SignalInt(0);
+        scrollY = new SignalInt(0);
+        selR = -1;
+        selC = -1;
+        selM = -1;
+        clickSeq = 0;
+        clickSeen = 0;
+        clickR = -1;
+        clickC = -1;
+        clickM = -1;
+        clickRowKey = "";
+        clickColKey = "";
+    }
+
+    /// 自上次调用以来是否发生了新的单元格点击；
+    /// 点击载荷在 clickR/C/M 与 clickRowKey/clickColKey。
+    bool TakeClick() {
+        if (clickSeq == clickSeen) { return false; }
+        clickSeen = clickSeq;
+        return true;
     }
 }
 
-/// 交叉表/透视表。按两个字段对原始 DataRows 分组，并在每个
-/// 行列交叉点聚合一个或多个数值度量，带行
-/// 合计、列合计和总计。聚合每帧运行（每个轴上的
-/// 不同键数量预计不会太多）。
+/// PivotTable 交叉表的配置。
+/// rowField：列索引，其不同取值成为透视表的行
+/// colField：列索引，其不同取值成为透视表的列
+/// measures：一个或多个度量（字段 + 聚合 + 展示 + 标题）；
+///           多于一个度量时列标题变为两级（colKey 组 + 度量）。
+/// 可选项：groupDigits 数值千位分隔、rowSort 行排序方式、
+/// heat 热力着色。
+class PivotConfig {
+    int rowField;
+    int colField;
+    List<PivotMeasure> measures;
+    bool groupDigits;
+    int rowSort;   // 0 名称升序，1 名称降序，2 按行合计降序，3 按行合计升序
+    bool heat;
+
+    PivotConfig(int rowField, int colField) {
+        this.rowField = rowField;
+        this.colField = colField;
+        this.measures = new List<PivotMeasure>();
+        this.groupDigits = false;
+        this.rowSort = 0;
+        this.heat = false;
+    }
+}
+
+/// 交叉表/透视表。按两个字段对原始 DataRows 分组，在每个
+/// 行列交叉点聚合一个或多个数值度量，带固定在右缘/下缘的
+/// 行合计列与总计行。
+///
+/// 交互与呈现：
+/// - 行区垂直滚动 + 列带水平滚动（滚轮垂直优先，行不溢出时
+///   滚轮改为横滚；滚动条可拖动），合计行/列滚动时保持固定；
+/// - 悬浮十字高亮（行头 + 列头 + 单元格），点击选中单元格，
+///   点击脉冲经 PivotState.TakeClick 轮询；
+/// - 度量可显示为占行/列/总计的百分比；
+/// - 可选热力着色：按度量内展示值的范围给单元格铺主色底；
+/// - 行键可按名称或行合计排序；列宽/行头宽按内容自适应；
+/// - 数值千位分隔可选，小数保留至多两位并去尾零。
+/// 聚合每帧运行（每个轴上的不同键数量预计不会太多）。
 class PivotTable {
 
     static string AggName(int a) {
@@ -103,20 +151,14 @@ class PivotTable {
         return "Min";
     }
 
-    static int AggValue(int s, int n, int mx, int mn, int a) {
-        if (n == 0) { return 0; }
-        if (a == 0) { return s; }
-        if (a == 1) { return n; }
-        if (a == 2) { return s / n; }
-        if (a == 3) { return mx; }
-        return mn;
-    }
-
-    // 子列标题的简短度量说明："Sum" 或 "Sum · Score"。
-    static string MeasureLabel(int agg, string title) {
-        string nm = PivotTable.AggName(agg);
-        if (title.Length > 0) { return nm + " · " + title; }
-        return nm;
+    // 度量子列标题："Sum"、"Sum · Rev"、"Sum · Rev · % grand"。
+    static string MeasureLabel(int agg, string title, int showAs) {
+        string s = PivotTable.AggName(agg);
+        if (title.Length > 0) { s = s + " · " + title; }
+        if (showAs == 1) { s = s + " · % row"; }
+        if (showAs == 2) { s = s + " · % col"; }
+        if (showAs == 3) { s = s + " · % grand"; }
+        return s;
     }
 
     // 字段的不同取值，返回时已排序。通过重复选择最小值
@@ -141,43 +183,175 @@ class PivotTable {
         return res;
     }
 
+    // 数值文本：整数走整型路径；小数保留至多两位并去尾零
+    // （42.50 -> "42.5"，42.00 -> "42"）。group 打开时对整数
+    // 部分插千位分隔。
+    static string FormatNum(double v, bool group) {
+        string s;
+        int iv = (int)v;
+        if ((double)iv == v) {
+            s = Convert.ToString(iv);
+        } else {
+            s = PivotTable.TrimZeros(DataTable.FormatReal(v, 2));
+        }
+        if (!group) { return s; }
+        return PivotTable.GroupAll(s);
+    }
+
+    // 去掉小数部分的尾零；全为零时连小数点一起去掉。
+    static string TrimZeros(string s) {
+        int dot = -1;
+        int i = 0;
+        while (i < s.Length) {
+            if ((int)s[i] == 46) { dot = i; i = s.Length; } else { i = i + 1; }
+        }
+        if (dot < 0) { return s; }
+        int end = s.Length;
+        while (end > dot + 1 && (int)s[end - 1] == 48) { end = end - 1; }
+        if (end == dot + 1) { end = end - 1; }
+        return s.Substring(0, end);
+    }
+
+    // 对数字文本的整数部分插千位分隔（符号与小数部分原样保留）。
+    static string GroupAll(string s) {
+        string sign = "";
+        string body = s;
+        if (body.Length > 0 && (int)body[0] == 45) {
+            sign = "-";
+            body = body.Substring(1);
+        }
+        int dot = -1;
+        int i = 0;
+        while (i < body.Length) {
+            if ((int)body[i] == 46) { dot = i; i = body.Length; } else { i = i + 1; }
+        }
+        string ip = body;
+        string fp = "";
+        if (dot >= 0) {
+            ip = body.Substring(0, dot);
+            fp = body.Substring(dot);
+        }
+        return sign + DataTable.GroupDigits(ip) + fp;
+    }
+
+    // 百分比文本：一位小数，如 "12.3%"（负值带符号）。
+    static string FmtPct1(double pct) {
+        bool neg = pct < 0.0;
+        double a = pct;
+        if (neg) { a = -pct; }
+        int tenths = (int)(a * 10.0 + 0.5);
+        string s = Convert.ToString(tenths / 10) + "." + Convert.ToString(tenths % 10) + "%";
+        if (neg) { s = "-" + s; }
+        return s;
+    }
+
     static void DrawNum(Canvas c, int cx, int cy, int cw, int rowH, int pad, string val, int color, int fs) {
         int tw = Canvas.MeasureText(val, fs);
         int ty = Canvas.CenterTextY(cy, rowH, fs);
         c.DrawText(cx + cw - tw - pad, ty, val, color, fs);
     }
 
+    // 空数据占位：外框 + 居中提示。
+    static void DrawEmpty(App app, int x, int y, int viewW, int viewH, string msg) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = Style.FontFallback(app, "medium");
+        StyleBox surfaceStyle = Style.Part(app, "pivottable", "surface", "",
+                                           "", "", Style.SNormal());
+        StyleBox emptyStyle = Style.Part(app, "pivottable", "body-empty", "",
+                                         "", "", Style.SNormal());
+        c.FillRoundRect(x, y, viewW, viewH, t.borderRadiusMedium, surfaceStyle.BgOr(0));
+        c.DrawRoundRect(x, y, viewW, viewH, t.borderRadiusMedium,
+                        surfaceStyle.BorderOr(0), 1);
+        c.DrawTextCentered(x, y, viewW, viewH, msg, emptyStyle.FgOr(0), fs);
+    }
+
+    // 水平滚动条：Scrollbar.RenderVerticalScroll 的转置版本
+    // （stdlib 目前没有水平变体）。支持滑块拖动与点按跳转。
+    static void HScroll(App app, int x, int y, int w, int viewW,
+                        int contentW, SignalInt offset) {
+        if (w <= 0) { return; }
+        int id = app.focus.AllocId();
+        Canvas c = app.canvas;
+        int barH = app.Scale(10);
+        int radius = barH / 2;
+        int mo = contentW - viewW;
+        if (mo < 0) { mo = 0; }
+        int minThumb = app.Scale(24);
+        int thumbW = w;
+        if (contentW > viewW && contentW > 0) { thumbW = w * viewW / contentW; }
+        if (thumbW < minThumb) { thumbW = minThumb; }
+        if (thumbW > w) { thumbW = w; }
+        int travel = w - thumbW;
+
+        bool active = app.focus.IsPressed(id);
+        if (active && travel > 0 && mo > 0) {
+            int rel = app.mouseX - x - thumbW / 2;
+            if (rel < 0) { rel = 0; }
+            if (rel > travel) { rel = travel; }
+            int newOff = rel * mo / travel;
+            if (newOff != offset.Get()) {
+                offset.Set(newOff);
+                app.RequestRedraw();
+            }
+        }
+        int cur = offset.Get();
+        if (cur < 0) { cur = 0; }
+        if (cur > mo) { cur = mo; }
+
+        bool hovered = app.focus.IsHovered(id);
+        StyleBox track = Style.Of(app, "scrollbar", "", Style.SNormal());
+        int thumbState = Style.SNormal();
+        if (hovered || active) { thumbState = Style.SHover(); }
+        StyleBox thumb = Style.Part(app, "scrollbar", "thumb", "", "", "",
+                                    thumbState);
+        c.PushClip(x, y, w, barH);
+        c.FillRoundRect(x, y, w, barH, radius, track.bg);
+        if (mo > 0) {
+            int thumbX = x;
+            if (travel > 0) { thumbX = x + cur * travel / mo; }
+            c.FillRoundRect(thumbX, y, thumbW, barH, radius, thumb.bg);
+        }
+        c.PopClip();
+        app.hitTester.RegisterRect(id, x, y - app.Scale(5), w, barH + app.Scale(5), 0);
+    }
+
+    /// 渲染透视表。`st` 由调用方跨帧持有（滚动/选中/点击脉冲
+    /// 都存在里面）。典型用法：
+    ///
+    ///   PivotState st = new PivotState();
+    ///   PivotConfig cfg = new PivotConfig(0, 1);
+    ///   cfg.measures.Add(new PivotMeasure(2, 0, "Units", 0));
+    ///   cfg.measures.Add(new PivotMeasure(3, 3, "Rev", 3));  // 占总计 %
+    ///   cfg.heat = true;
+    ///   PivotTable.Render(app, x, y, w, h, rows, cfg, st);
+    ///   if (st.TakeClick()) { Use(st.clickRowKey, st.clickColKey); }
     static void Render(App app, int x, int y, int viewW, int viewH,
-                       List<DataRow> rows, PivotConfig cfg) {
+                       List<DataRow> rows, PivotConfig cfg, PivotState st) {
+        if (viewW <= 0 || viewH <= 0) { return; }
+
+        // 解析度量列表；M 始终 >= 1（否则走空态）。
+        int M = cfg.measures.Count;
+
+        if (M == 0) { PivotTable.DrawEmpty(app, x, y, viewW, viewH, "No measures"); return; }
+        if (rows.Count == 0) { PivotTable.DrawEmpty(app, x, y, viewW, viewH, "No data"); return; }
+
         Canvas c = app.canvas;
         Theme t = app.theme;
         int fs = Style.FontFallback(app, "medium");
         int fsS = Style.FontFallback(app, "small");
         int pad = t.paddingSmall;
 
-        // 解析度量列表：显式的 AddValue 度量，否则是单个
-        // 内联数值字段。M 始终 >= 1。
-        List<PivotMeasure> measures = new List<PivotMeasure>();
-        if (cfg.measures.Count > 0) {
-            foreach (PivotMeasure pm in cfg.measures) {
-                measures.Add(new PivotMeasure(pm.field, pm.agg, pm.title));
-            }
-        } else {
-            measures.Add(new PivotMeasure(cfg.valueField, cfg.aggType, cfg.valueTitle));
-        }
-        int M = measures.Count;
-
         List<string> rowKeys = PivotTable.SortedDistinct(rows, cfg.rowField);
         List<string> colKeys = PivotTable.SortedDistinct(rows, cfg.colField);
         int R = rowKeys.Count;
         int C = colKeys.Count;
+        if (R == 0 || C == 0) { PivotTable.DrawEmpty(app, x, y, viewW, viewH, "No data"); return; }
 
-        // 逐单元格累加器，按 (r, c, measure) 展平；每个一个 PivotAgg。
-        int cells = R * C * M;
+        // 逐单元格累加器，按 (r, c, measure) 展平；每个一个
+        // PivotAgg。逐行/逐列/总计累加器按 (axis, measure) 组织。
         List<PivotAgg> cell = new List<PivotAgg>();
-        for (int k = 0; k < cells; k = k + 1) { cell.Add(new PivotAgg()); }
-
-        // 逐行/逐列/总计累加器，每个按 (axis, measure) 组织。
+        for (int k = 0; k < R * C * M; k = k + 1) { cell.Add(new PivotAgg()); }
         List<PivotAgg> rowAgg = new List<PivotAgg>();
         for (int ir = 0; ir < R * M; ir = ir + 1) { rowAgg.Add(new PivotAgg()); }
         List<PivotAgg> colAgg = new List<PivotAgg>();
@@ -185,13 +359,14 @@ class PivotTable {
         List<PivotAgg> grand = new List<PivotAgg>();
         for (int ig = 0; ig < M; ig = ig + 1) { grand.Add(new PivotAgg()); }
 
-        for (int ri2 = 0; ri2 < rows.Count; ri2 = ri2 + 1) {
-            DataRow row = rows[ri2];
+        for (int ri = 0; ri < rows.Count; ri = ri + 1) {
+            DataRow row = rows[ri];
             int ridx = rowKeys.IndexOf(row.At(cfg.rowField));
             int cidx = colKeys.IndexOf(row.At(cfg.colField));
             if (ridx >= 0 && cidx >= 0) {
                 for (int m = 0; m < M; m = m + 1) {
-                    int v = DataTable.ParseInt(row.At(measures[m].field));
+                    PivotMeasure pm = cfg.measures[m];
+                    double v = DataTable.ParseReal(row.At(pm.field));
                     cell[(ridx * C + cidx) * M + m].Add(v);
                     rowAgg[ridx * M + m].Add(v);
                     colAgg[cidx * M + m].Add(v);
@@ -200,18 +375,218 @@ class PivotTable {
             }
         }
 
-        int headerH = t.heightMedium;
-        int rowH = t.heightMedium;
-        int rowHeadW = app.Scale(150);
-        int subW = app.Scale(112);
+        // 行排序：构造置换 perm（新行序 -> 旧行序）并重排
+        // rowKeys / cell / rowAgg。列键始终按名称升序。
+        if (cfg.rowSort != 0) {
+            List<int> perm = new List<int>();
+            for (int i = 0; i < R; i = i + 1) { perm.Add(i); }
+            int k2 = 0;
+            while (k2 < R) {
+                int best = k2;
+                int i2 = k2 + 1;
+                while (i2 < R) {
+                    bool take = false;
+                    if (cfg.rowSort == 1) {
+                        if (DataTable.CompareCell(rowKeys[perm[i2]], rowKeys[perm[best]], false) > 0) { take = true; }
+                    } else {
+                        double vi = rowAgg[perm[i2] * M].Value(cfg.measures[0].agg);
+                        double vb = rowAgg[perm[best] * M].Value(cfg.measures[0].agg);
+                        if (cfg.rowSort == 2) {
+                            if (vi > vb) { take = true; }
+                        } else {
+                            if (vi < vb) { take = true; }
+                        }
+                    }
+                    if (take) { best = i2; }
+                    i2 = i2 + 1;
+                }
+                if (best != k2) {
+                    int tmp = perm[k2];
+                    perm[k2] = perm[best];
+                    perm[best] = tmp;
+                }
+                k2 = k2 + 1;
+            }
+            List<string> keys2 = new List<string>();
+            List<PivotAgg> cell2 = new List<PivotAgg>();
+            List<PivotAgg> rowAgg2 = new List<PivotAgg>();
+            for (int q = 0; q < R * C * M; q = q + 1) { cell2.Add(new PivotAgg()); }
+            for (int q = 0; q < R * M; q = q + 1) { rowAgg2.Add(new PivotAgg()); }
+            for (int nr = 0; nr < R; nr = nr + 1) {
+                int orow = perm[nr];
+                keys2.Add(rowKeys[orow]);
+                for (int m2 = 0; m2 < M; m2 = m2 + 1) {
+                    rowAgg2[nr * M + m2] = rowAgg[orow * M + m2];
+                    for (int nc = 0; nc < C; nc = nc + 1) {
+                        cell2[(nr * C + nc) * M + m2] = cell[(orow * C + nc) * M + m2];
+                    }
+                }
+            }
+            rowKeys = keys2;
+            cell = cell2;
+            rowAgg = rowAgg2;
+        }
+
+        // 展示值与文本：cellVal 存换算后的展示值（百分比已折算，
+        // 供热力着色），cellText 为空串表示空单元格（画 "-"）。
+        // 合计始终显示绝对值（百分比的合计即 100%，无信息量）。
+        List<string> cellText = new List<string>();
+        List<double> cellVal = new List<double>();
+        for (int q = 0; q < R * C * M; q = q + 1) {
+            cellText.Add("");
+            cellVal.Add(0.0);
+        }
+        List<string> rowTotalText = new List<string>();
+        List<string> colTotalText = new List<string>();
+        List<string> grandText = new List<string>();
+        List<double> heatMn = new List<double>();
+        List<double> heatMx = new List<double>();
+        List<int> heatHas = new List<int>();
+
+        // 合计文本与 rowAgg/colAgg 同布局：行/列主序，度量最快（idx* M + m）。
+        // 百分比度量的合计与单元格同一语义：%row 的行合计恒为 100%、
+        // %col 的列合计恒为 100%，其余按占总计换算；基数为 0 时显示 "-"。
+        for (int m = 0; m < M; m = m + 1) {
+            heatMn.Add(0.0);
+            heatMx.Add(0.0);
+            heatHas.Add(0);
+        }
+        for (int r = 0; r < R; r = r + 1) {
+            for (int m = 0; m < M; m = m + 1) {
+                PivotMeasure pm = cfg.measures[m];
+                double v = rowAgg[r * M + m].Value(pm.agg);
+                string txt;
+                if (pm.showAs == 0) {
+                    txt = PivotTable.FormatNum(v, cfg.groupDigits);
+                } else if (pm.showAs == 1) {
+                    txt = PivotTable.FmtPct1(100.0);
+                } else {
+                    double tot = grand[m].Value(pm.agg);
+                    if (tot == 0.0) { txt = "-"; }
+                    else { txt = PivotTable.FmtPct1(PivotTable.PctOf(v, tot)); }
+                }
+                rowTotalText.Add(txt);
+            }
+        }
+        for (int cc = 0; cc < C; cc = cc + 1) {
+            for (int m = 0; m < M; m = m + 1) {
+                PivotMeasure pm = cfg.measures[m];
+                double v = colAgg[cc * M + m].Value(pm.agg);
+                string txt;
+                if (pm.showAs == 0) {
+                    txt = PivotTable.FormatNum(v, cfg.groupDigits);
+                } else if (pm.showAs == 2) {
+                    txt = PivotTable.FmtPct1(100.0);
+                } else {
+                    double tot = grand[m].Value(pm.agg);
+                    if (tot == 0.0) { txt = "-"; }
+                    else { txt = PivotTable.FmtPct1(PivotTable.PctOf(v, tot)); }
+                }
+                colTotalText.Add(txt);
+            }
+        }
+        for (int m = 0; m < M; m = m + 1) {
+            PivotMeasure pm = cfg.measures[m];
+            if (pm.showAs > 0) {
+                grandText.Add(PivotTable.FmtPct1(100.0));
+            } else {
+                grandText.Add(PivotTable.FormatNum(grand[m].Value(pm.agg), cfg.groupDigits));
+            }
+        }
+
+        for (int r = 0; r < R; r = r + 1) {
+            for (int cc = 0; cc < C; cc = cc + 1) {
+                for (int m = 0; m < M; m = m + 1) {
+                    int idx = (r * C + cc) * M + m;
+                    PivotAgg a = cell[idx];
+                    if (a.cnt == 0) { continue; }
+                    PivotMeasure pm = cfg.measures[m];
+                    double v = a.Value(pm.agg);
+                    double disp = v;
+                    bool ok = true;
+                    if (pm.showAs == 1) {
+                        double tot = rowAgg[r * M + m].Value(pm.agg);
+                        disp = PivotTable.PctOf(v, tot);
+                        if (tot == 0.0) { ok = false; }
+                    } else if (pm.showAs == 2) {
+                        double tot = colAgg[cc * M + m].Value(pm.agg);
+                        disp = PivotTable.PctOf(v, tot);
+                        if (tot == 0.0) { ok = false; }
+                    } else if (pm.showAs == 3) {
+                        double tot = grand[m].Value(pm.agg);
+                        disp = PivotTable.PctOf(v, tot);
+                        if (tot == 0.0) { ok = false; }
+                    }
+                    if (!ok) { continue; }
+                    cellVal[idx] = disp;
+                    if (pm.showAs > 0) {
+                        cellText[idx] = PivotTable.FmtPct1(disp);
+                    } else {
+                        cellText[idx] = PivotTable.FormatNum(disp, cfg.groupDigits);
+                    }
+                    if (heatHas[m] == 0) {
+                        heatMn[m] = disp;
+                        heatMx[m] = disp;
+                        heatHas[m] = 1;
+                    } else {
+                        if (disp < heatMn[m]) { heatMn[m] = disp; }
+                        if (disp > heatMx[m]) { heatMx[m] = disp; }
+                    }
+                }
+            }
+        }
+
+        // 自适应列宽：取 colKey、度量子列标题（两级表头时）与
+        // 所有值/合计文本的最大宽度，限幅 [Scale(64), Scale(220)]；
+        // 行头宽取行键文本最大宽度，限幅 [Scale(90), Scale(260)]。
+        int subW = app.Scale(64);
+        int subWMax = app.Scale(220);
+        for (int cc = 0; cc < C; cc = cc + 1) {
+            int tw = Canvas.MeasureText(colKeys[cc], fs) + pad * 2;
+            if (tw > subW) { subW = tw; }
+        }
+        for (int m = 0; m < M; m = m + 1) {
+            PivotMeasure pm = cfg.measures[m];
+            if (M > 1) {
+                int tw = Canvas.MeasureText(PivotTable.MeasureLabel(pm.agg, pm.title, pm.showAs), fsS) + pad * 2;
+                if (tw > subW) { subW = tw; }
+            }
+            for (int r = 0; r < R; r = r + 1) {
+                for (int cc = 0; cc < C; cc = cc + 1) {
+                    string s = cellText[(r * C + cc) * M + m];
+                    if (s.Length > 0) {
+                        int tw = Canvas.MeasureText(s, fs) + pad * 2;
+                        if (tw > subW) { subW = tw; }
+                    }
+                }
+            }
+            for (int r = 0; r < R; r = r + 1) {
+                int tw = Canvas.MeasureText(rowTotalText[r * M + m], fs) + pad * 2;
+                if (tw > subW) { subW = tw; }
+            }
+            for (int cc = 0; cc < C; cc = cc + 1) {
+                int tw = Canvas.MeasureText(colTotalText[cc * M + m], fs) + pad * 2;
+                if (tw > subW) { subW = tw; }
+            }
+            int gw = Canvas.MeasureText(grandText[m], fs) + pad * 2;
+            if (gw > subW) { subW = gw; }
+        }
+        if (subW > subWMax) { subW = subWMax; }
+
+        int rowHeadW = app.Scale(90);
+        int rowHeadMax = app.Scale(260);
+        for (int r = 0; r < R; r = r + 1) {
+            int tw = Canvas.MeasureText(rowKeys[r], fs) + pad * 2;
+            if (tw > rowHeadW) { rowHeadW = tw; }
+        }
+        if (rowHeadW > rowHeadMax) { rowHeadW = rowHeadMax; }
+
         StyleBox surfaceStyle = Style.Part(app, "pivottable", "surface", "",
                                            "", "", Style.SNormal());
         StyleBox headStyle = Style.Part(app, "pivottable", "head", "",
                                         "", "", Style.SNormal());
         StyleBox totalStyle = Style.Part(app, "pivottable", "total", "",
                                          "", "", Style.SNormal());
-        StyleBox cornerStyle = Style.Part(app, "pivottable", "corner", "",
-                                          "", "", Style.SNormal());
         StyleBox headLabelStyle = Style.Part(app, "pivottable", "head-label", "",
                                              "", "", Style.SNormal());
         StyleBox headMutedStyle = Style.Part(app, "pivottable", "head-muted", "",
@@ -226,184 +601,358 @@ class PivotTable {
                                         "", "", Style.SNormal());
         StyleBox accentStyle = Style.Part(app, "pivottable", "accent", "",
                                           "", "", Style.SNormal());
+        StyleBox hoverStyle = Style.Part(app, "pivottable", "hover", "",
+                                         "", "", Style.SNormal());
+        StyleBox selStyle = Style.Part(app, "pivottable", "sel", "",
+                                       "", "", Style.SNormal());
         int gridColor = gridStyle.BgOr(0);
+        int primaryColor = accentStyle.FgOr(0);
 
-        // 多于一个度量时使用两行列标题：colKey 组在上，
-        // 度量说明在下。单个度量保持紧凑标题。
+        // 布局：行头列与表头带固定，行合计列固定在滚动带右缘、
+        // 总计行固定在下缘（空间容不下至少一个数据组 + 合计
+        // 时才整体省去）。
+        int headerH = t.heightMedium;
+        int rowH = t.heightMedium;
         bool twoRow = M > 1;
-        int hTop = headerH;
-        int hBot = 0;
-        if (twoRow) { hBot = headerH; }
-        int headBand = hTop + hBot;
+        int headBand = headerH;
+        if (twoRow) { headBand = headerH * 2; }
 
-        int clipRight = x + viewW - app.Scale(2);
-        int clipBottom = y + viewH - app.Scale(2);
+        int inner = app.Scale(2);
+        int rx = x + viewW - inner;
+        int bx2 = y + viewH - inner;
+        bool showTotalCol = (rx - (x + rowHeadW)) >= 2 * subW * M;
+        bool showTotalRow = (bx2 - (y + headBand)) >= 2 * rowH;
+        int totalColW = 0;
+        if (showTotalCol) { totalColW = subW * M; }
+        int bandX = x + rowHeadW;
+        int bandW = rx - bandX - totalColW;
+        int bandY = y + headBand;
+        int bandH = bx2 - bandY;
+        if (showTotalRow) { bandH = bandH - rowH; }
+        int contentW = C * subW * M;
+        int contentH = R * rowH;
 
-        // 外框
+        // 滚动偏移按内容尺寸夹紧（数据变化后自动回弹）。
+        int maxSX = contentW - bandW;
+        if (maxSX < 0) { maxSX = 0; }
+        int maxSY = contentH - bandH;
+        if (maxSY < 0) { maxSY = 0; }
+        int sx0 = st.scrollX.Get();
+        if (sx0 < 0) { sx0 = 0; }
+        if (sx0 > maxSX) { sx0 = maxSX; }
+        st.scrollX.Set(sx0);
+        int sy0 = st.scrollY.Get();
+        if (sy0 < 0) { sy0 = 0; }
+        if (sy0 > maxSY) { sy0 = maxSY; }
+        st.scrollY.Set(sy0);
+
+        // 滚轮：垂直可滚时滚垂直；否则水平可滚时滚水平
+        // （列带溢出而行不溢出时，滚轮无需修饰键即横滚）。
+        if (maxSY > 0 && bandW > 0 && bandH > 0) {
+            Scrollbar.HandleWheel(app, bandX, bandY, bandW, bandH, contentH, st.scrollY);
+        } else if (maxSX > 0 && bandW > 0 && bandH > 0) {
+            if (Ui.Over(app, bandX, bandY, bandW, bandH)
+                && app.CaptureWheel(bandX, bandY, bandW, bandH)
+                && app.EventKind() == 13) {
+                int delta = app.window.EventKeyCode();
+                int nx = st.scrollX.Get() - delta * app.scrollSpeed / 120;
+                if (nx < 0) { nx = 0; }
+                if (nx > maxSX) { nx = maxSX; }
+                if (nx != st.scrollX.Get()) {
+                    st.scrollX.Set(nx);
+                    app.NoteScrollDamage(bandX, bandY, bandW, bandH);
+                }
+            }
+        }
+
+        // 外框底色 + 对整表硬裁剪：保证任何单元格、表头或网格线
+        // 都不会画到表格自身的矩形之外。外框线在内容之后补画
+        // （见方法末尾），否则边缘填充会把它盖掉。
         c.FillRoundRect(x, y, viewW, viewH, t.borderRadiusMedium, surfaceStyle.BgOr(0));
-        c.DrawRoundRect(x, y, viewW, viewH, t.borderRadiusMedium,
-                        surfaceStyle.BorderOr(0), 1);
-
-        // 对视图框硬裁剪：逐列/行的 clipRight/clipBottom
-        // 计算已阻止大部分溢出，但此处保证任何单元格、表头
-        // 或网格线都不会画到表格自身的矩形之外。
         c.PushClip(x, y, viewW, viewH);
 
-        // ---- 角格（聚合描述符）----
+        // ---- 角格（度量描述）----
         c.FillRect(x, y, rowHeadW, headBand, headStyle.BgOr(0));
-        string corner = PivotTable.AggName(measures[0].agg);
-        if (M > 1) { corner = Convert.ToString(M) + " measures"; }
-        else if (measures[0].title.Length > 0) { corner = corner + " of " + measures[0].title; }
+        string corner = PivotTable.AggName(cfg.measures[0].agg);
+        if (M > 1) {
+            corner = Convert.ToString(M) + " measures";
+        } else if (cfg.measures[0].title.Length > 0) {
+            corner = corner + " of " + cfg.measures[0].title;
+        }
+        corner = DataTable.Truncate(corner, fsS, rowHeadW - pad * 2);
         int cornerY = Canvas.CenterTextY(y, headBand, fsS);
-        c.DrawText(x + pad, cornerY, corner, cornerStyle.FgOr(0), fsS);
+        c.DrawText(x + pad, cornerY, corner, headMutedStyle.FgOr(0), fsS);
 
-        // ---- 列标题（colKey 组，每组 M 个子列宽）----
-        int cx = x + rowHeadW;
-        int cjj = 0;
-        while (cjj < C) {
-            if (cx >= clipRight) { cjj = C; } else {
-                int groupW = subW * M;
-                if (cx + groupW > clipRight) { groupW = clipRight - cx; }
-                c.FillRect(cx, y, groupW, hTop, headStyle.BgOr(0));
-                c.FillRect(cx, y, 1, headBand, gridColor);
-                string ct = DataTable.Truncate(colKeys[cjj], fs, groupW - pad * 2);
-                c.DrawTextCentered(cx, y, groupW, hTop, ct,
-                                   headLabelStyle.FgOr(0), fs);
-                if (twoRow) {
-                    for (int mj = 0; mj < M; mj = mj + 1) {
-                        int sx = cx + subW * mj;
-                        if (sx < clipRight) {
-                            int sw = subW;
-                            if (sx + sw > clipRight) { sw = clipRight - sx; }
-                            c.FillRect(sx, y + hTop, sw, hBot, headStyle.BgOr(0));
-                            if (mj > 0) { c.FillRect(sx, y + hTop, 1, hBot, gridColor); }
-                            string ml = DataTable.Truncate(PivotTable.MeasureLabel(measures[mj].agg, measures[mj].title), fsS, sw - pad * 2);
-                            c.DrawTextCentered(sx, y + hTop, sw, hBot, ml,
+        // ---- 列标题（colKey 组 + 两级度量副标题，随列带横滚）----
+        if (bandW > 0) {
+            c.PushClip(bandX, y, bandW, headBand);
+            c.FillRect(bandX, y, bandW, headBand, headStyle.BgOr(0));
+            int cj = 0;
+            while (cj < C) {
+                int gx = bandX + cj * subW * M - sx0;
+                if (gx + subW * M > bandX && gx < bandX + bandW) {
+                    bool colHov = app.mouseX >= gx && app.mouseX < gx + subW * M
+                                  && app.mouseY >= y && app.mouseY < y + headBand;
+                    StyleBox gh = headStyle;
+                    if (colHov) { gh = hoverStyle; }
+                    c.FillRect(gx, y, subW * M, headerH, gh.BgOr(0));
+                    c.FillRect(gx, y, 1, headBand, gridColor);
+                    string ct = DataTable.Truncate(colKeys[cj], fs, subW * M - pad * 2);
+                    c.DrawTextCentered(gx, y, subW * M, headerH, ct,
+                                       headLabelStyle.FgOr(0), fs);
+                    if (twoRow) {
+                        int mj = 0;
+                        while (mj < M) {
+                            int sx = gx + subW * mj;
+                            StyleBox sh = headStyle;
+                            if (colHov) { sh = hoverStyle; }
+                            c.FillRect(sx, y + headerH, subW, headerH, sh.BgOr(0));
+                            if (mj > 0) { c.FillRect(sx, y + headerH, 1, headerH, gridColor); }
+                            string ml = DataTable.Truncate(
+                                PivotTable.MeasureLabel(cfg.measures[mj].agg,
+                                                        cfg.measures[mj].title,
+                                                        cfg.measures[mj].showAs),
+                                fsS, subW - pad * 2);
+                            c.DrawTextCentered(sx, y + headerH, subW, headerH, ml,
                                                headMutedStyle.FgOr(0), fsS);
+                            mj = mj + 1;
                         }
                     }
                 }
-                cx = cx + groupW;
-                if (groupW < subW * M) { cjj = C; } else { cjj = cjj + 1; }
+                cj = cj + 1;
             }
+            c.PopClip();
         }
-        int totalColX = cx;
-        bool showTotalCol = (cx + subW * M) <= clipRight;
+
+        // ---- 行合计列表头（固定右缘）----
         if (showTotalCol) {
-            int gW = subW * M;
-            c.FillRect(cx, y, gW, hTop, totalStyle.BgOr(0));
-            c.FillRect(cx, y, 1, headBand, gridColor);
-            c.DrawTextCentered(cx, y, gW, hTop, "Total",
+            int tx = bandX + bandW;
+            c.FillRect(tx, y, totalColW, headerH, totalStyle.BgOr(0));
+            c.FillRect(tx, y, 1, headBand, gridColor);
+            c.DrawTextCentered(tx, y, totalColW, headerH, "Total",
                                headLabelStyle.FgOr(0), fs);
             if (twoRow) {
-                for (int mj = 0; mj < M; mj = mj + 1) {
-                    int sx = cx + subW * mj;
-                    c.FillRect(sx, y + hTop, subW, hBot, totalStyle.BgOr(0));
-                    if (mj > 0) { c.FillRect(sx, y + hTop, 1, hBot, gridColor); }
-                    string ml = DataTable.Truncate(PivotTable.MeasureLabel(measures[mj].agg, measures[mj].title), fsS, subW - pad * 2);
-                    c.DrawTextCentered(sx, y + hTop, subW, hBot, ml,
+                int mj = 0;
+                while (mj < M) {
+                    int sx = tx + subW * mj;
+                    c.FillRect(sx, y + headerH, subW, headerH, totalStyle.BgOr(0));
+                    if (mj > 0) { c.FillRect(sx, y + headerH, 1, headerH, gridColor); }
+                    string ml = DataTable.Truncate(
+                        PivotTable.MeasureLabel(cfg.measures[mj].agg,
+                                                cfg.measures[mj].title,
+                                                cfg.measures[mj].showAs),
+                        fsS, subW - pad * 2);
+                    c.DrawTextCentered(sx, y + headerH, subW, headerH, ml,
                                        headMutedStyle.FgOr(0), fsS);
+                    mj = mj + 1;
                 }
             }
         }
         c.FillRect(x, y + headBand - 1, viewW, 1, gridColor);
 
-        // ---- 主体行 ----
-        int by = y + headBand;
-        int rii = 0;
-        while (rii < R) {
-            if (by + rowH > clipBottom) { rii = R; } else {
-                c.FillRect(x, by, rowHeadW, rowH, headStyle.BgOr(0));
-                string rt = DataTable.Truncate(rowKeys[rii], fs, rowHeadW - pad * 2);
-                c.DrawText(x + pad, Canvas.CenterTextY(by, rowH, fs), rt,
-                           bodyLabelStyle.FgOr(0), fs);
-                c.FillRect(x + rowHeadW, by, 1, rowH, gridColor);
+        // ---- 主体行（行头固定，列带滚动）----
+        if (bandW > 0 && bandH > 0) {
+            int ri = 0;
+            while (ri < R) {
+                int ry = bandY + ri * rowH - sy0;
+                if (ry + rowH > bandY && ry < bandY + bandH) {
+                    bool rowHov = app.mouseY >= ry && app.mouseY < ry + rowH;
+                    // 行头单元格
+                    StyleBox rh = headStyle;
+                    if (rowHov) { rh = hoverStyle; }
+                    c.FillRect(x, ry, rowHeadW, rowH, rh.BgOr(0));
+                    string rt = DataTable.Truncate(rowKeys[ri], fs, rowHeadW - pad * 2);
+                    c.DrawText(x + pad, Canvas.CenterTextY(ry, rowH, fs), rt,
+                               bodyLabelStyle.FgOr(0), fs);
+                    c.FillRect(x + rowHeadW, ry, 1, rowH, gridColor);
 
-                int cx2 = x + rowHeadW;
-                int cj2 = 0;
-                while (cj2 < C) {
-                    if (cx2 >= clipRight) { cj2 = C; } else {
-                        for (int mj = 0; mj < M; mj = mj + 1) {
-                            int sx = cx2 + subW * mj;
-                            if (sx < clipRight) {
-                                int sw = subW;
-                                if (sx + sw > clipRight) { sw = clipRight - sx; }
-                                c.FillRect(sx, by, 1, rowH, gridColor);
-                                int idx = (rii * C + cj2) * M + mj;
-                                if (cell[idx].cnt > 0) {
-                                    int v = cell[idx].Value(measures[mj].agg);
-                                    PivotTable.DrawNum(c, sx, by, sw, rowH, pad,
-                                                       Convert.ToString(v),
-                                                       bodyValueStyle.FgOr(0), fs);
-                                } else {
-                                    c.DrawTextCentered(sx, by, sw, rowH, "-",
-                                                       bodyEmptyStyle.FgOr(0), fs);
+                    // 滚动列带内的数据单元格
+                    c.PushClip(bandX, bandY, bandW, bandH);
+                    int cj2 = 0;
+                    while (cj2 < C) {
+                        int gx = bandX + cj2 * subW * M - sx0;
+                        if (gx + subW * M > bandX && gx < bandX + bandW) {
+                            bool colHov = app.mouseX >= gx && app.mouseX < gx + subW * M;
+                            int m3 = 0;
+                            while (m3 < M) {
+                                int sx = gx + subW * m3;
+                                if (sx + subW > bandX && sx < bandX + bandW) {
+                                    if (m3 > 0) {
+                                        c.FillRect(sx, ry, 1, rowH, gridColor);
+                                    } else {
+                                        c.FillRect(gx, ry, 1, rowH, gridColor);
+                                    }
+                                    int idx = (ri * C + cj2) * M + m3;
+                                    bool cellHov = rowHov && colHov
+                                                   && app.mouseX >= sx && app.mouseX < sx + subW;
+                                    // 背景：选中 > 悬浮 > 热力
+                                    if (st.selR == ri && st.selC == cj2 && st.selM == m3) {
+                                        c.FillRect(sx + 1, ry, subW - 1, rowH, selStyle.BgOr(0));
+                                    } else if (cellHov) {
+                                        c.FillRect(sx + 1, ry, subW - 1, rowH, hoverStyle.BgOr(0));
+                                    } else if (cfg.heat && cell[idx].cnt > 0 && heatHas[m3] == 1) {
+                                        int alpha = 0;
+                                        if (heatMx[m3] > heatMn[m3]) {
+                                            double tt = (cellVal[idx] - heatMn[m3])
+                                                        / (heatMx[m3] - heatMn[m3]);
+                                            alpha = (int)(tt * 80.0) + 14;
+                                        }
+                                        if (alpha > 0) {
+                                            c.FillRect(sx + 1, ry, subW - 1, rowH,
+                                                       Style.Fade(primaryColor, alpha));
+                                        }
+                                    }
+                                    if (cellText[idx].Length > 0) {
+                                        PivotTable.DrawNum(c, sx, ry, subW, rowH, pad,
+                                                           cellText[idx],
+                                                           bodyValueStyle.FgOr(0), fs);
+                                    } else {
+                                        c.DrawTextCentered(sx, ry, subW, rowH, "-",
+                                                           bodyEmptyStyle.FgOr(0), fs);
+                                    }
+                                    // 点击命中（矩形与列带求交，避免点到
+                                    // 被固定列盖住或裁掉的部分）
+                                    int hx = sx;
+                                    int hw = subW;
+                                    if (hx < bandX) { hx = bandX; }
+                                    if (hx + hw > bandX + bandW) { hw = bandX + bandW - hx; }
+                                    if (hw > 0) {
+                                        int cellId = app.focus.AllocId();
+                                        app.hitTester.RegisterRect(cellId, hx, ry, hw, rowH, 0);
+                                        if (app.ClickTarget() == cellId && app.ClickAvailable()) {
+                                            st.selR = ri;
+                                            st.selC = cj2;
+                                            st.selM = m3;
+                                            st.clickR = ri;
+                                            st.clickC = cj2;
+                                            st.clickM = m3;
+                                            st.clickRowKey = rowKeys[ri];
+                                            st.clickColKey = colKeys[cj2];
+                                            st.clickSeq = st.clickSeq + 1;
+                                        }
+                                    }
                                 }
+                                m3 = m3 + 1;
                             }
                         }
-                        cx2 = cx2 + subW * M;
-                        if (cx2 > clipRight) { cj2 = C; } else { cj2 = cj2 + 1; }
+                        cj2 = cj2 + 1;
                     }
-                }
-                if (showTotalCol) {
-                    for (int mj = 0; mj < M; mj = mj + 1) {
-                        int sx = totalColX + subW * mj;
-                        c.FillRect(sx, by, subW, rowH, headStyle.BgOr(0));
-                        c.FillRect(sx, by, 1, rowH, gridColor);
-                        int rm = rii * M + mj;
-                        int vtt = rowAgg[rm].Value(measures[mj].agg);
-                        PivotTable.DrawNum(c, sx, by, subW, rowH, pad,
-                                           Convert.ToString(vtt),
-                                           bodyValueStyle.FgOr(0), fs);
+                    c.PopClip();
+
+                    // 行合计列（固定右缘）
+                    if (showTotalCol) {
+                        int tx2 = bandX + bandW;
+                        c.FillRect(tx2, ry, 1, rowH, gridColor);
+                        int m4 = 0;
+                        while (m4 < M) {
+                            int sx = tx2 + subW * m4;
+                            StyleBox tb = headStyle;
+                            if (rowHov) { tb = hoverStyle; }
+                            c.FillRect(sx, ry, subW, rowH, tb.BgOr(0));
+                            if (m4 > 0) { c.FillRect(sx, ry, 1, rowH, gridColor); }
+                            PivotTable.DrawNum(c, sx, ry, subW, rowH, pad,
+                                               rowTotalText[ri * M + m4],
+                                               bodyValueStyle.FgOr(0), fs);
+                            m4 = m4 + 1;
+                        }
                     }
+                    // 行底线横贯整表（含行头与合计列）
+                    c.FillRect(x, ry + rowH - 1, viewW, 1, gridColor);
                 }
-                c.FillRect(x, by + rowH - 1, viewW, 1, gridColor);
-                by = by + rowH;
-                rii = rii + 1;
+                ri = ri + 1;
             }
         }
 
-        // ---- 总计行 ----
-        if (by + rowH <= clipBottom) {
-            c.FillRect(x, by, viewW, rowH, totalStyle.BgOr(0));
-            c.DrawText(x + pad, Canvas.CenterTextY(by, rowH, fs), "Total",
+        // ---- 总计行（数据不满一屏时紧跟最后一行，溢出时钉在视口下缘）----
+        int bodyH = bandH;
+        if (showTotalRow && contentH < bandH) { bodyH = contentH; }
+        if (showTotalRow) {
+            int ty = bandY + bodyH;
+            c.FillRect(x, ty, viewW, rowH, totalStyle.BgOr(0));
+            c.FillRect(x, ty, viewW, 1, gridColor);
+            c.DrawText(x + pad, Canvas.CenterTextY(ty, rowH, fs), "Total",
                        headLabelStyle.FgOr(0), fs);
-            c.FillRect(x + rowHeadW, by, 1, rowH, gridColor);
-            int cx3 = x + rowHeadW;
-            int cj3 = 0;
-            while (cj3 < C) {
-                if (cx3 >= clipRight) { cj3 = C; } else {
-                    for (int mj = 0; mj < M; mj = mj + 1) {
-                        int sx = cx3 + subW * mj;
-                        if (sx < clipRight) {
-                            int sw = subW;
-                            if (sx + sw > clipRight) { sw = clipRight - sx; }
-                            c.FillRect(sx, by, 1, rowH, gridColor);
-                            int cm = cj3 * M + mj;
-                            if (colAgg[cm].cnt > 0) {
-                                int v = colAgg[cm].Value(measures[mj].agg);
-                                PivotTable.DrawNum(c, sx, by, sw, rowH, pad,
-                                                   Convert.ToString(v),
-                                                   bodyValueStyle.FgOr(0), fs);
+            c.FillRect(x + rowHeadW, ty, 1, rowH, gridColor);
+            if (bandW > 0) {
+                c.PushClip(bandX, ty, bandW, rowH);
+                int cj3 = 0;
+                while (cj3 < C) {
+                    int gx = bandX + cj3 * subW * M - sx0;
+                    if (gx + subW * M > bandX && gx < bandX + bandW) {
+                        bool colHov = app.mouseX >= gx && app.mouseX < gx + subW * M
+                                      && app.mouseY >= ty && app.mouseY < ty + rowH;
+                        int m5 = 0;
+                        while (m5 < M) {
+                            int sx = gx + subW * m5;
+                            if (sx + subW > bandX && sx < bandX + bandW) {
+                                if (m5 > 0) {
+                                    c.FillRect(sx, ty, 1, rowH, gridColor);
+                                } else {
+                                    c.FillRect(gx, ty, 1, rowH, gridColor);
+                                }
+                                if (colHov) {
+                                    c.FillRect(sx + 1, ty, subW - 1, rowH, hoverStyle.BgOr(0));
+                                }
+                                int cm = cj3 * M + m5;
+                                if (colAgg[cm].cnt > 0) {
+                                    PivotTable.DrawNum(c, sx, ty, subW, rowH, pad,
+                                                       colTotalText[cm],
+                                                       bodyValueStyle.FgOr(0), fs);
+                                } else {
+                                    c.DrawTextCentered(sx, ty, subW, rowH, "-",
+                                                       bodyEmptyStyle.FgOr(0), fs);
+                                }
                             }
+                            m5 = m5 + 1;
                         }
                     }
-                    cx3 = cx3 + subW * M;
-                    if (cx3 > clipRight) { cj3 = C; } else { cj3 = cj3 + 1; }
+                    cj3 = cj3 + 1;
                 }
+                c.PopClip();
             }
             if (showTotalCol) {
-                for (int mj = 0; mj < M; mj = mj + 1) {
-                    int sx = totalColX + subW * mj;
-                    c.FillRect(sx, by, 1, rowH, gridColor);
-                    int vg = grand[mj].Value(measures[mj].agg);
-                    PivotTable.DrawNum(c, sx, by, subW, rowH, pad,
-                                       Convert.ToString(vg), accentStyle.FgOr(0), fs);
+                int tx3 = bandX + bandW;
+                c.FillRect(tx3, ty, 1, rowH, gridColor);
+                int m6 = 0;
+                while (m6 < M) {
+                    int sx = tx3 + subW * m6;
+                    if (m6 > 0) { c.FillRect(sx, ty, 1, rowH, gridColor); }
+                    PivotTable.DrawNum(c, sx, ty, subW, rowH, pad, grandText[m6],
+                                       accentStyle.FgOr(0), fs);
+                    m6 = m6 + 1;
                 }
+            }
+        }
+
+        // ---- 滚动条（叠加在滚动带右/下缘；两个方向同时溢出时
+        // 互相让出角落）----
+        if (maxSY > 0 && bandH > 0) {
+            int vLen = bandH;
+            if (maxSX > 0) { vLen = bandH - app.Scale(10); }
+            if (vLen > 0) {
+                Scrollbar.RenderVerticalScroll(app, bandX + bandW - app.Scale(10),
+                                               bandY, vLen, bandH, contentH,
+                                               st.scrollY);
+            }
+        }
+        if (maxSX > 0 && bandW > 0) {
+            int hLen = bandW;
+            if (maxSY > 0) { hLen = bandW - app.Scale(10); }
+            if (hLen > 0) {
+                PivotTable.HScroll(app, bandX, bandY + bodyH - app.Scale(10),
+                                   hLen, bandW, contentW, st.scrollX);
             }
         }
 
         c.PopClip();
+
+        // 外框线最后画：表头/行/合计的填充都从矩形边缘起笔，
+        // 先画会被整段盖掉（表现为部分边框丢失）。
+        c.DrawRoundRect(x, y, viewW, viewH, t.borderRadiusMedium,
+                        surfaceStyle.BorderOr(0), 1);
+    }
+
+    static double PctOf(double v, double total) {
+        return v * 100.0 / total;
     }
 }
-
