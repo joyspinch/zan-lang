@@ -140,6 +140,13 @@ typedef struct zan_gui_backend_s {
                  int corner_radius, int corner_mask);
     void (*snapshot)(struct zan_surface_s *s, int x, int y, int w, int h,
                      int slot);
+    /* Refreshes part of an existing snapshot in place: the slot keeps its
+     * original geometry, so whole-window restores keep matching after a
+     * damage-strip frame re-rendered a region of the snapshotted page.
+     * No-op when the slot does not hold a snapshot of this surface that
+     * fully contains the rect. */
+    void (*snapshot_patch)(struct zan_surface_s *s, int x, int y, int w, int h,
+                           int slot);
     /* Returns 0 when the slot does not match this surface/geometry, in which
      * case the caller must repaint the region instead of trusting the slot. */
     int  (*restore)(struct zan_surface_s *s, int x, int y, int w, int h,

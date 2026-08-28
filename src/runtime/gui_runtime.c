@@ -1518,6 +1518,43 @@ EXPORT void zan_gui_snapshot_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i3
                                     (int)slot);
 }
 
+EXPORT void zan_gui_snapshot_patch_rect(i32 surface_id, i32 x, i32 y, i32 w,
+                                        i32 h, i32 slot) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    ZAN_IMPL(s, snapshot_patch)->snapshot_patch(s, (int)x, (int)y, (int)w,
+                                                (int)h, (int)slot);
+}
+
+/* Refreshes [x,y,w,h] inside an existing snapshot without changing the
+ * slot's geometry: a damage-strip frame re-renders only its strip, and the
+ * caller folds the strip's fresh pixels back into the whole-window snapshot
+ * so whole-window restores keep matching it. Refuses (no-op) when the slot
+ * does not hold a valid snapshot of this surface containing the rect --
+ * the caller then treats the snapshot as unusable, exactly like a failed
+ * restore. */
+static void cpu_snapshot_patch(zan_surface_t *s, int x, int y, int w, int h,
+                               int slot) {
+    zan_blur_cache_t *c = zan_snap_slot(slot);
+    if (!c) return;
+    if (!c->valid || !c->pixels || c->sid != s->id) return;
+    int x0 = clamp_i(x, 0, s->width);
+    int y0 = clamp_i(y, 0, s->height);
+    int x1 = clamp_i(x + w, 0, s->width);
+    int y1 = clamp_i(y + h, 0, s->height);
+    if (x1 <= x0 || y1 <= y0) return;
+    if (x0 < c->x0 || y0 < c->y0
+        || x1 > c->x0 + c->rw || y1 > c->y0 + c->rh) {
+        return;
+    }
+    for (int j = y0; j < y1; j++) {
+        u32 *row = s->pixels + j * s->stride + x0;
+        u32 *dst = c->pixels + (size_t)(j - c->y0) * c->rw + (x0 - c->x0);
+        for (int i = 0; i < x1 - x0; i++) dst[i] = row[i];
+    }
+}
+
 static int cpu_restore_rect(zan_surface_t *s, int x, int y, int w, int h,
                             int slot) {
     zan_blur_cache_t *c = zan_snap_slot(slot);
@@ -3855,6 +3892,7 @@ const zan_gui_backend zan_cpu_backend = {
     .polyline     = cpu_polyline,
     .blur         = cpu_blur,
     .snapshot     = cpu_snapshot,
+    .snapshot_patch = cpu_snapshot_patch,
     .restore      = cpu_restore,
     .draw_text    = NULL,   /* the font engine is platform code, not a backend */
     .glyph_run    = cpu_glyph_run,

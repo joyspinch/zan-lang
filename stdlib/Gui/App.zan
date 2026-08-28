@@ -369,6 +369,10 @@ class App {
     int perfFxMs;
     int perfOverlayMs;
     int lastPresentMs;
+    // 上一*整窗*帧的提交时刻：条带帧不计。特效快照的突发跳过判据
+    // 以它为准——条带帧期间快照靠条带回写保鲜（见 PresentFrame），
+    // 只有整帧连发（滚动/拖拽风暴）才让快照注定白做。
+    int lastFullFrameMs;
     // 空闲循环采样（同一个开关）：不画帧也在烧 CPU 的那份活只能
     // 在这里看见——每 2 秒记一行「循环转了多少圈、走的哪条等待
     // 路径、醒来是因为哪种事件」。帧数为 0 却有几百圈循环就是空转，
@@ -720,6 +724,7 @@ class App {
         this.perfTreeUs = 0;
         this.perfBeginMs = 0;
         this.lastPresentMs = 0;
+        this.lastFullFrameMs = 0;
         this.perfLoopAt = 0;
         this.perfLoops = 0;
         this.perfPollPath = 0;
@@ -3490,10 +3495,17 @@ class App {
     /// 表示这一拍已由特效层就地呈现、还该继续等下一拍。
     bool TakeDueFrame(int now) {
         bool fxOnly = animNextMs < 0 || now < animNextMs;
-        if (fxOnly && this.FxPresent() && !this.inputNeedsFrame) {
-            // 已就地呈现；继续等待下一个 tick。输入事件不等：
-            // 点击目标所在的控件可能根本不在已呈现的范围里。
-            return false;
+        if (fxNextMs >= 0 && now >= fxNextMs && !this.inputNeedsFrame
+            && this.FxPresent()) {
+            if (fxOnly) {
+                // 纯特效拍已就地呈现；继续等待下一个 tick。输入事件
+                // 不等：点击目标所在的控件可能根本不在已呈现的范围里。
+                return false;
+            }
+            // 特效拍就地推进了（条带外的背景动画不因持续动画的条带帧
+            // 冻结），而页面帧也已到期：接着出页面帧。落到底下通用
+            // 路径，纯动画帧照旧裁剪到动画声明的范围。
+            needsRedraw = true;
         }
         if (fxOnly && animNextMs >= 0
             && animNextMs - now <= this.FxIntervalMs()
@@ -4195,25 +4207,41 @@ class App {
                 // 只有损伤条带被重绘（因此那里是合成前的像素），
                 // 裁剪仍然生效：以上一整帧的相位重新合成
                 // 特效，只覆盖该条带，其余像素保持已合成的状态。
+                if (fxSnapValid && presentW * presentH * 2
+                    <= fc.Width() * fc.Height()) {
+                    // 条带外的画布像素自上一拍以来没被改动过（裁剪
+                    // 保证），把条带的干净基面（特效重合成之前）补进
+                    // 快照——补丁保持槽的整窗几何，FxPresent 的整窗
+                    // 恢复继续匹配，快照对整窗继续有效——持续动画
+                    // （倒计时条带帧）期间特效拍仍走"恢复快照+重合成
+                    // +整窗提交"的廉价路径，条带外的背景动画照常推进。
+                    // 快照本来就无效（上次整帧是突发帧）时补丁救不回
+                    // 条带外，保持无效，等下一次非突发整帧重建。条带
+                    // 大过半窗时补丁接近整窗复制，放弃——条带外本来
+                    // 也剩不下多少特效。
+                    fc.SnapshotPatchRect(presentX, presentY, presentW,
+                                         presentH, App.FxSnapSlot());
+                }
                 BackdropFx.Render(this, fc, this.EffectiveFx(), 0, 0, fc.Width(),
                                   fc.Height(), fxFrameMs, theme, dpiScale);
                 BackdropFx.TakeDamage();
-                fxSnapValid = false;
                 fxDamage = null;
                 fxTouched = null;
                 fxTouchedFull = false;
-                fxNextMs = fxNow + this.FxIntervalMs();
+                if (fxNextMs < 0 || fxNow >= fxNextMs) {
+                    // 这一条带帧占用了本该到期的特效拍：把拍子挪到
+                    // 此刻，循环下一圈就以廉价特效拍推进条带外的背景。
+                    // 到期之前的节奏原样保留——否则条带帧（间隔可短于
+                    // 特效周期）会把拍子无限后推，背景动画整段冻结。
+                    fxNextMs = fxNow;
+                }
             } else {
-            // 突发判定按"下一次页面帧之前有没有特效拍"来定，而不是
-            // 只看与上次提交的间隔：持续动画（如倒计时）把页面帧压到
-            // 100ms 一次时，旧的 120ms 间隔规则会让快照永远无效——
-            // 每个特效拍都退回整窗控件重栅，背景动画因此一卡一卡。
-            // 页面帧已排定且早于下一拍时，快照注定用不上，才跳过；
-            // 其余情况（含空闲、秒级页面帧）一律快照，让特效拍走
-            // "恢复+合成+提交"的廉价路径。
-            bool burst = (lastPresentMs > 0 && fxNow - lastPresentMs < 120)
-                || (animNextMs >= 0
-                    && animNextMs - fxNow <= this.FxIntervalMs());
+            // 突发判定只看上一*整窗*帧（条带帧不计，快照的条带区域
+            // 随后回写保鲜）：整帧连发（滚动/拖拽风暴）时下一帧反正
+            // 还是整帧重栅，复制整个表面纯属开销，跳过；其余情况
+            // 一律快照，让特效拍走"恢复+合成+提交"的廉价路径。
+            bool burst = lastFullFrameMs > 0
+                && fxNow - lastFullFrameMs < 120;
             if (burst) {
                 fxSnapValid = false;
                 fxDamage = null;
@@ -4301,6 +4329,7 @@ class App {
             // 上传之后，影子与屏幕永久失步，差异比对会把旧帧内容
             // 当作已呈现，滚动停下的残带就是这样留下的。
             window.PresentFull();
+            lastFullFrameMs = Window.GetTickMs();
         }
         this.SettleGlassRefresh();
         // 完整帧结束时刷新事件解析基准：条带帧不刷新，条带外沿用
@@ -4840,8 +4869,9 @@ class App {
         animRectAll = false;
         // inputNeedsFrame 此处不清：TakeDueFrame 与本函数下方的条带
         // 裁剪决策都要读它，消费后再复位（见 partialFrame 判定之后）。
-        // 本帧正在重新渲染，槽位 7 的 fx 快照已过期。
-        fxSnapValid = false;
+        // 槽位 7 的 fx 快照是否过期要到下面 partialFrame 判定之后才能
+        // 下结论：条带帧只重画条带，条带外的快照像素仍然准确，条带
+        // 分支会把条带的干净基面回写快照，整体继续有效；整帧才作废。
         // 匿名玻璃表面的逐帧编号从头开始（有身份的面板走
         // BlurSlotFor 的常驻表，跨帧保持自己的槽）。
         blurSlotSeq = 0;
@@ -4890,6 +4920,11 @@ class App {
         // 整窗帧重画了每一个像素，动画的旧位置已被覆盖：
         // 下一次动画帧不必再把它算进裁剪。
         if (!partialFrame) { animPrevValid = false; }
+        // 本帧正在重新渲染：整帧会覆盖整个画布，槽位 7 的 fx 快照
+        // 从此过期，交给帧尾的突发判定/非突发整帧重建；条带帧只
+        // 覆盖条带，快照其余部分仍准确，保持有效使特效拍在持续
+        // 动画（倒计时条带）期间仍能廉价整窗推进（条带分支回写）。
+        if (!partialFrame) { fxSnapValid = false; }
         if (partialFrame) {
             // 下方内容照常绘制；裁剪将其限制在
             // 损坏条带内，上一帧未触及的像素得以保留。
