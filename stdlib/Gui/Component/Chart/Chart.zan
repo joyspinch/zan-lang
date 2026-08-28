@@ -279,6 +279,25 @@ class Chart {
         return defaultR;
     }
 
+    /// axisLabel.interval 语义（ECharts）：-1/非整数 = 自动（渲染器
+    /// 走防重叠贪心），>=0 = 每 (interval+1) 个画一个。纯函数，
+    /// conformance 直接断言。
+    static bool LabelShown(int ci, int interval) {
+        if (interval < 0) { return true; }
+        return ci % (interval + 1) == 0;
+    }
+
+    /// 旋转分类标签的竖直占位（像素）：行盒 w×h 绕锚点旋转
+    /// |deg| 度后的垂直跨度 = w·|sin| + h·|cos|。用 ChartView 的
+    /// 1000 倍三角表，确定性整数。
+    static int RotatedLabelH(int maxW, int fh, int deg) {
+        int a = deg < 0 ? 0 - deg : deg;
+        if (a > 90) { a = 90; }
+        int s = ChartView.SinDeg(a);
+        int co = a >= 90 ? 0 : ChartView.CosDeg(a);
+        return (maxW * s + fh * co) / 1000 + 2;
+    }
+
     // ---- 比例辅助 ----
 
     // 将原始最大值向上取整为友好的轴边界（2/5/10 * 10^n）。
@@ -1315,6 +1334,20 @@ class Chart {
         if (hasRight) { rightGut = Chart.TickLabelW(rightLo, rightHi, ticks, fs) + app.Scale(12); }
         int botGut = fh + app.Scale(12);
         if (x0.title.Length > 0) { botGut = botGut + fh + app.Scale(2); }
+        // 旋转分类标签：按最宽标签的旋转后垂直跨度扩底栏（未旋转
+        // 与旋转都成立——interval>=0 抽稀时贪心不再兜底防重叠）。
+        if (x0.labelRotate != 0 && labels.Count > 0) {
+            int rotMaxW = 0;
+            for (int ri = 0; ri < labels.Count; ri = ri + 1) {
+                int rwi = Canvas.MeasureText(labels[ri], fs);
+                if (rwi > rotMaxW) { rotMaxW = rwi; }
+            }
+            int need = Chart.RotatedLabelH(rotMaxW, fh, x0.labelRotate) + app.Scale(4);
+            int baseNeed = fh + app.Scale(12);
+            if (need > baseNeed) {
+                botGut = botGut - baseNeed + need;
+            }
+        }
         int topGut = 0;
         if (y0.title.Length > 0 || y1.title.Length > 0) { topGut = fh + app.Scale(2); }
 
@@ -1421,6 +1454,8 @@ class Chart {
             } else {
                 int labelGap = app.Scale(6);
                 int labelRight = plotX - labelGap;
+                int rot = x0.labelRotate;
+                int ivl = x0.labelInterval;
                 for (int ci = 0; ci < n; ci = ci + 1) {
                     int cxs = f.CatLeft(ci, n);
                     int cellW = f.CatWidth(ci, n);
@@ -1428,21 +1463,56 @@ class Chart {
                     int labelLeft = cxs + (cellW - labelW) / 2;
                     if (labelLeft < cxs) { labelLeft = cxs; }
                     bool last = ci == n - 1;
-                    if (last || labelLeft >= labelRight + labelGap) {
-                        c.DrawTextCentered(cxs, plotBot + app.Scale(4), cellW,
-                            fh + app.Scale(4), labels[ci], sAxis.FgOr(0), fs);
-                        labelRight = labelLeft + labelW;
+                    bool show;
+                    if (ivl >= 0) {
+                        // 显式抽稀：每 (interval+1) 个画一个，贪心让位。
+                        show = Chart.LabelShown(ci, ivl);
+                    } else if (rot != 0) {
+                        // 旋转标签不再贪心防重叠（底栏已按旋转跨度扩过）。
+                        show = true;
+                    } else {
+                        show = last || labelLeft >= labelRight + labelGap;
+                    }
+                    if (show) {
+                        if (rot != 0) {
+                            // DrawTextRot 绕未旋转行盒左上角顺时针旋转：
+                            // 负角取行盒右缘为锚（文本向右下伸展、标签尾
+                            // 对齐格子中线），正角取左缘（文本向右上收）。
+                            int ax = labelLeft + labelW;
+                            if (rot > 0) { ax = labelLeft; }
+                            c.DrawTextRot(ax, plotBot + app.Scale(4), labels[ci],
+                                sAxis.FgOr(0), fs, rot);
+                            labelRight = labelLeft + labelW;
+                        } else {
+                            c.DrawTextCentered(cxs, plotBot + app.Scale(4), cellW,
+                                fh + app.Scale(4), labels[ci], sAxis.FgOr(0), fs);
+                            labelRight = labelLeft + labelW;
+                        }
                     }
                 }
             }
         }
 
-        // 轴标题
+        // 轴标题：nameLocation（ECharts）——x 轴 start|middle|end 控
+        // 水平对齐；y 轴 middle（默认，= 现状顶部）|start(底)|end(顶)。
         if (x0.title.Length > 0) {
-            c.DrawTextCentered(plotX, plotBot + app.Scale(6) + fh, plotW, fh, x0.title, sAxisTitle.FgOr(0), fs);
+            int tw = Canvas.MeasureText(x0.title, fs);
+            int ty = plotBot + app.Scale(6) + fh;
+            if (x0.nameLocation == "start") {
+                c.DrawText(plotX, ty, x0.title, sAxisTitle.FgOr(0), fs);
+            } else if (x0.nameLocation == "end") {
+                c.DrawText(plotX + plotW - tw, ty, x0.title, sAxisTitle.FgOr(0), fs);
+            } else {
+                c.DrawTextCentered(plotX, ty, plotW, fh, x0.title, sAxisTitle.FgOr(0), fs);
+            }
         }
         if (y0.title.Length > 0) {
-            c.DrawText(plotX, plotTop, y0.title, sAxisTitle.FgOr(0), fs);
+            if (y0.nameLocation == "start") {
+                c.DrawText(plotX, plotBot - fh, y0.title, sAxisTitle.FgOr(0), fs);
+            } else {
+                // "middle"（默认）与 "end" 都留在绘图区左上。
+                c.DrawText(plotX, plotTop, y0.title, sAxisTitle.FgOr(0), fs);
+            }
         }
         // 右轴标题只在真的存在第二条轴时画（YAxis1 在单轴时会
         // 回退到 YAxis0，不设防会把左轴标题镜像到右上角）。

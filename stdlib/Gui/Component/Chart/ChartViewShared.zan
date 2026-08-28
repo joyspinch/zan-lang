@@ -445,6 +445,84 @@ partial class ChartView {
         return minI;
     }
 
+    // 窗口 [i0,i1] 内系列均值（ECharts markLine type:'average' 的
+    // 纯推导 seam；空窗口返回 0）。
+    static int SeriesAverage(ChartSeries s, int i0, int i1) {
+        int sum = 0;
+        int cnt = 0;
+        for (int j = i0; j <= i1 && j < s.Count(); j = j + 1) {
+            sum = sum + s.Value(j);
+            cnt = cnt + 1;
+        }
+        if (cnt < 1) { return 0; }
+        return sum / cnt;
+    }
+
+    /// markLine 一条线的实际 y 值（threshold seam）：kind
+    /// average/min/max 从窗口推导，显式线用 yValue；窗口无数据
+    /// 返回 Auto() 哨兵 = 不画。
+    static int MarkLineValue(ChartMarkLine m, ChartSeries s, int i0, int i1) {
+        if (m.kind == "average") { return ChartView.SeriesAverage(s, i0, i1); }
+        if (m.kind == "max") {
+            int mi = ChartView.SeriesMaxIndex(s, i0, i1);
+            return mi < 0 ? ChartOption.Auto() : s.Value(mi);
+        }
+        if (m.kind == "min") {
+            int mi = ChartView.SeriesMinIndex(s, i0, i1);
+            return mi < 0 ? ChartOption.Auto() : s.Value(mi);
+        }
+        return m.yValue;
+    }
+
+    /// 系列级 markLine（ECharts series.markLine）：窗口水平线 +
+    /// 右端标签。kind average/min/max 从窗口推导；显式 yValue。
+    /// 线色默认系列色（2.x markLine 用 itemStyle 色，非全局 mark
+    /// 灰），lineType 默认 dashed。柱/线渲染器共用。
+    static void DrawSeriesMarkLines(App app, ChartFrame f, ChartSeries s,
+                                    int i0, int i1, ChartOption o) {
+        if (s.markLines.Count < 1) { return; }
+        Canvas c = app.canvas;
+        int nWin = i1 - i0 + 1;
+        if (nWin < 1) { nWin = 1; }
+        for (int mi = 0; mi < s.markLines.Count; mi = mi + 1) {
+            ChartMarkLine m = s.markLines[mi];
+            int val = ChartView.MarkLineValue(m, s, i0, i1);
+            if (val == ChartOption.Auto()) { continue; }
+            int ly = f.YOf(val, s.axisIndex);
+            int col = m.color != 0 ? m.color : s.color;
+            string lt = m.lineType;
+            if (lt.Length == 0) { lt = "dashed"; }
+            if (lt == "solid") {
+                c.FillRect(f.plotX, ly, f.plotW, 1, col);
+            } else {
+                int dash = app.Scale(6);
+                int gap = lt == "dotted" ? app.Scale(2) : app.Scale(6);
+                if (lt == "dotted") { dash = app.Scale(2); }
+                int dx = f.plotX;
+                while (dx < f.plotX + f.plotW) {
+                    int seg = dash;
+                    if (dx + seg > f.plotX + f.plotW) { seg = f.plotX + f.plotW - dx; }
+                    c.FillRect(dx, ly, seg, 1, col);
+                    dx = dx + dash + gap;
+                }
+            }
+            string lbl = m.label;
+            if (lbl.Length == 0) {
+                if (m.kind == "average") { lbl = "avg"; }
+                else if (m.kind == "min") { lbl = "min"; }
+                else if (m.kind == "max") { lbl = "max"; }
+                else { lbl = Convert.ToString(val); }
+            } else {
+                lbl = lbl.Replace("{value}", Convert.ToString(val));
+            }
+            int fs = Style.FontFallback(app, "small");
+            int lw = Canvas.MeasureText(lbl, fs);
+            int lx = f.plotX + f.plotW - lw;
+            if (lx < f.plotX) { lx = f.plotX; }
+            c.DrawText(lx, ly - Canvas.FontHeight(fs) - app.Scale(1), lbl, col, fs);
+        }
+    }
+
     // 系列 markPoint 标记：o.markPoint=true 时自动标出窗口
     // [i0,i1] 内的最大/最小值；series.marks 的显式项也绘制
     // （dataIndex 定位；kind=max/min 回退到自动推导的极值）。

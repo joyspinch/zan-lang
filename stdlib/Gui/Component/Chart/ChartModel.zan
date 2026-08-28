@@ -392,6 +392,34 @@ class ChartMarkPoint {
     }
 }
 
+/// ECharts series.markLine.data 的一条阈值线：kind 为
+/// "average"/"min"/"max" 时从窗口数据自动推导；显式线用
+/// yValue（水平线）；xValue + yValue 为定点斜线。label 支持
+/// {value} 占位；lineType "" = 虚线（ECharts 默认）。
+class ChartMarkLine {
+    string kind;
+    int xValue;
+    int yValue;
+    bool hasPoint;
+    string label;
+    string lineType;
+    int color;
+
+    static ChartMarkLine Of(string kind) {
+        return new ChartMarkLine { kind = kind, xValue = 0, yValue = 0,
+            hasPoint = false, label = "", lineType = "", color = 0 };
+    }
+    static ChartMarkLine Average() { return ChartMarkLine.Of("average"); }
+    static ChartMarkLine Min() { return ChartMarkLine.Of("min"); }
+    static ChartMarkLine Max() { return ChartMarkLine.Of("max"); }
+    static ChartMarkLine At(int yValue, string label) {
+        ChartMarkLine m = ChartMarkLine.Of("");
+        m.yValue = yValue;
+        m.label = label;
+        return m;
+    }
+}
+
 class ChartScalar {
     int amount;
     bool percent;
@@ -685,6 +713,7 @@ class ChartSeries {
     List<ChartMapRegion> regions;  // Map 种类
     List<ChartEvent> events;       // Event River 种类
     List<ChartMarkPoint> marks;    // markPoint.data（线/柱系列）
+    List<ChartMarkLine> markLines; // markLine.data（阈值/平均线，线/柱系列）
 
     GaugeOption gauge;
 
@@ -731,6 +760,7 @@ class ChartSeries {
         s.regions = new List<ChartMapRegion>();
         s.events = new List<ChartEvent>();
         s.marks = new List<ChartMarkPoint>();
+        s.markLines = new List<ChartMarkLine>();
         s.gauge = GaugeOption.Create();
         return s;
     }
@@ -940,6 +970,9 @@ class ChartSeries {
     /// 渲染器也会自动推导 max/min；显式 marks 优先展示。
     ChartSeries MarkPoint(ChartMarkPoint m) { this.marks.Add(m); return this; }
 
+    /// 给线/柱系列追加一条 markLine（threshold/average/min/max）。
+    ChartSeries MarkLine(ChartMarkLine m) { this.markLines.Add(m); return this; }
+
     /// 仪表盘的几何与范围。百分比相对图表主体。
     ChartSeries GaugeRange(int min, int max) { this.gauge.min = min; this.gauge.max = max; return this; }
     ChartSeries GaugeArc(int startAngle, int endAngle) {
@@ -1002,6 +1035,9 @@ class ChartAxis {
     bool reversed;    // 翻转轴（ECharts inverse）
     int ticks;        // 数值轴刻度数（默认 5）
     bool showGrid;    // 为此轴绘制网格线
+    int labelRotate;   // ECharts axisLabel.rotate：度（钳 -90..90），0 = 水平
+    int labelInterval; // ECharts axisLabel.interval：-1 = 自动防重叠，>=0 = 每 (n+1) 个画一个
+    string nameLocation; // ECharts nameLocation："start"|"middle"(默认)|"end"
     List<string> categories;
 
     static ChartAxis Category(List<string> cats) {
@@ -1013,6 +1049,9 @@ class ChartAxis {
         a.reversed = false;
         a.ticks = 5;
         a.showGrid = false;
+        a.labelRotate = 0;
+        a.labelInterval = 0 - 1;
+        a.nameLocation = "middle";
         a.categories = cats;
         return a;
     }
@@ -1032,6 +1071,9 @@ class ChartAxis {
         a.reversed = false;
         a.ticks = 5;
         a.showGrid = true;
+        a.labelRotate = 0;
+        a.labelInterval = 0 - 1;
+        a.nameLocation = "middle";
         a.categories = new List<string>();
         return a;
     }
@@ -1754,6 +1796,49 @@ class ChartOption {
         }
     }
 
+    /// ECharts series.markLine：{data:[{type:'average'}|{yAxis:3}
+    /// |[{xAxis,yAxis},{xAxis,yAxis}], label|name]}。也吃裸数组。
+    static void ParseMarkLines(JsonValue v, List<ChartMarkLine> into) {
+        if (v == null) { return; }
+        JsonValue data = v;
+        if (v.IsObject()) { data = v.Get("data"); }
+        if (data == null || !data.IsArray()) { return; }
+        for (int i = 0; i < data.Count(); i = i + 1) {
+            JsonValue it = data.At(i);
+            if (it.IsArray() && it.Count() >= 2) {
+                // 两点斜线：取第一点（定点线暂按水平线近似）。
+                JsonValue p0 = it.At(0);
+                ChartMarkLine m = ChartMarkLine.Of("");
+                m.hasPoint = true;
+                m.xValue = p0.Int("xAxis", p0.Int("xValue", 0));
+                m.yValue = p0.Int("yAxis", p0.Int("yValue", 0));
+                into.Add(m);
+                continue;
+            }
+            if (!it.IsObject()) { continue; }
+            string kind = it.Str("type", it.Str("kind", ""));
+            ChartMarkLine m;
+            if (kind == "average" || kind == "min" || kind == "max") {
+                m = ChartMarkLine.Of(kind);
+            } else {
+                m = ChartMarkLine.Of("");
+                m.yValue = it.Int("yAxis", it.Int("value", it.Int("yValue", 0)));
+            }
+            m.label = it.Str("label", it.Str("name", ""));
+            if (m.label.Length == 0) {
+                JsonValue lb = it.Get("label");
+                if (lb != null && lb.IsObject()) { m.label = lb.Str("formatter", ""); }
+            }
+            JsonValue ls = it.Get("lineStyle");
+            if (ls != null && ls.IsObject()) {
+                m.lineType = ls.Str("type", "");
+                JsonValue lc = ls.Get("color");
+                if (lc != null) { m.color = ChartOption.ParseColor(lc, 0); }
+            }
+            into.Add(m);
+        }
+    }
+
     static void ParseMarks(JsonValue v, List<ChartMarkPoint> into) {
         if (v == null || !v.IsObject()) { return; }
         JsonValue data = v.Get("data");
@@ -1895,6 +1980,7 @@ class ChartOption {
                 ChartOption.ParseEvents(s.Get("events"), cs.events);
                 ChartOption.ParseRegions(s.Get("regions"), cs.regions);
                 ChartOption.ParseMarks(s.Get("markPoint"), cs.marks);
+                ChartOption.ParseMarkLines(s.Get("markLine"), cs.markLines);
                 JsonValue da = s.Get("data");
                 if (da != null && da.IsArray()) {
                     for (int j = 0; j < da.Count(); j = j + 1) {
@@ -1981,6 +2067,15 @@ class ChartOption {
         }
         a.title = v.Str("name", "");
         a.reversed = v.Bool("inverse", false);
+        a.nameLocation = v.Str("nameLocation", a.nameLocation);
+        JsonValue al = v.Get("axisLabel");
+        if (al != null && al.IsObject()) {
+            a.labelRotate = al.Int("rotate", a.labelRotate);
+            if (a.labelRotate > 90) { a.labelRotate = 90; }
+            if (a.labelRotate < 0 - 90) { a.labelRotate = 0 - 90; }
+            JsonValue iv = al.Get("interval");
+            if (iv != null && iv.IsNumber()) { a.labelInterval = iv.AsInt(0 - 1); }
+        }
         into.Add(a);
     }
 }
