@@ -2019,8 +2019,13 @@ class OverlayPopup {
     /// 箭头），并为每个可点击 / 子菜单行注册命中 id `idBase + rowIndex`。
     /// `ph` 是可视高度，行按 `scrollY` 上移并裁进面板（可滚动主面板
     /// 用，子菜单面板传 0）。返回光标所在的行索引，没有则为 -1。
+    /// `barW` 是面板右缘滚动条条带的宽度（无可滚动时为 0）：
+    /// 行悬停不含条带——条带归滚动条，悬停伸进去会让拖动滑块
+    /// 的指针扫出子菜单父行，子面板开合顶漂覆盖层 AllocId，
+    /// 滚动条 IsPressed 失配后拖动中断、恢复时瞬移。
     static int PaintRichPanel(App app, List<MenuItem> items, int px, int py,
-                              int pw, int ph, int idBase, int scrollY) {
+                              int pw, int ph, int idBase, int scrollY,
+                              int barW) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int rowH = OverlayPopup.MenuRowH(app);
@@ -2068,6 +2073,7 @@ class OverlayPopup {
         app.BlockHitsRect(px, py, pw, ph);
 
         int hoverRow = 0 - 1;
+        int hoverMaxX = px + pw - barW;
         int rowY = py + padV - scrollY;
         c.PushClip(px, py, pw, ph);
         for (int i = 0; i < items.Count; i = i + 1) {
@@ -2087,7 +2093,7 @@ class OverlayPopup {
             } else {
                 bool vis = rowY + rowH > py && rowY < py + ph;
                 bool hovered = vis
-                    && app.mouseX >= px && app.mouseX < px + pw
+                    && app.mouseX >= px && app.mouseX < hoverMaxX
                     && app.mouseY >= rowY && app.mouseY < rowY + rowH;
                 int fg = itemFg;
                 int hoverBg = itemHoverBg;
@@ -2186,8 +2192,10 @@ class OverlayPopup {
         // 富菜单行由几何驱动：不注册命中 id，因此面板内移动指针
         // 不会改变悬停 id，也就不会安排重绘。只在悬停行真的变了时
         // 重绘，而不是菜单开着就每个鼠标移动事件重绘一整帧。
+        int barW = 0;
+        if (maxScroll > 0) { barW = app.Scale(10); }
         int overRow = OverlayPopup.PaintRichPanel(app, items, px, py, pw, viewH,
-            baseId, scrollY);
+            baseId, scrollY, barW);
         if (overRow != OverlayPopup.lastRichHover) {
             OverlayPopup.lastRichHover = overRow;
             app.RequestRedraw();
@@ -2247,8 +2255,14 @@ class OverlayPopup {
             if (cy + chd > ch - margin) { cy = ch - margin - chd; }
             if (cy < margin) { cy = margin; }
             childOver = OverlayPopup.PaintRichPanel(app, ck, cx, cy, cwd, chd,
-                baseId + 128, 0);
+                baseId + 128, 0, 0);
             childOpen = true;
+        } else {
+            // 子面板没开也要占掉它的 barrier id：覆盖层 AllocId 按
+            // 注册顺序发号，子面板开/关增减一个命中区会把其后注册
+            // 的滚动条 id 顶得漂移，拖动中 IsPressed 突然失配中断
+            // 拖动，等 id 回来又按 jump-to-mouse 瞬移——来回跳跃。
+            app.focus.AllocId();
         }
 
         // 滚动条：画在行之上，命中区在行之后注册，拖动优先于行点击。
