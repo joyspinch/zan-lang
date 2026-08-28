@@ -170,6 +170,17 @@ partial class ChartView {
         }
         int fp = ChartView.FingerprintCore(
             app.ThemeMenuIndex() * 7919 + app.bgThemeGen, zoomLo, zoomHi, o, resolved);
+        // dataRange 交互态（滑条 q + 分段隐藏位）会改快照像素
+        // （条本体也在快照里），故折入缓存指纹。
+        if (o.dataRangeShow && resolved.wid != 0) {
+            fp = (fp * 31 + app.StateGet(Chart.DRangeLoKey(resolved.wid), 0)
+                + app.StateGet(Chart.DRangeHiKey(resolved.wid), 1000) * 7
+                + 1) % 2000000000;
+            for (int bi = 0; bi < o.dataRangeList.Count; bi = bi + 1) {
+                fp = (fp * 31 + app.StateGet(Chart.DRangeBandKey(resolved.wid, bi), 0)
+                    + 3) % 2000000000;
+            }
+        }
         // 视口：快照槽位绑定像素矩形；控件移动 / 缩放而
         // 复用旧快照会画出错位像素，因此矩形进入指纹。
         fp = (fp * 31 + x * 7 + y * 13 + w * 17 + h * 19) % 2000000000;
@@ -212,6 +223,15 @@ partial class ChartView {
         }
         h = ChartView.FoldStr(h, o.radarShape, 26);
         h = (h * 31 + (o.radarSplitArea ? 1 : 0)) % 2000000000;
+        // legend 布局/格式与 dataRange 配置改像素，须入指纹。
+        h = ChartView.FoldStr(h, o.legendOrient, 32);
+        h = ChartView.FoldStr(h, o.legendFormatter, 33);
+        h = (h * 31 + (o.dataRangeShow ? 1 : 0) + (o.dataRangeCalculable ? 2 : 0)
+            + o.dataRangeLo + o.dataRangeHi + o.dataRangeSplit) % 2000000000;
+        for (int di = 0; di < o.dataRangeList.Count; di = di + 1) {
+            h = ChartView.FoldStr(h, o.dataRangeList[di].label, 34);
+            h = (h * 31 + o.dataRangeList[di].lo + o.dataRangeList[di].hi) % 2000000000;
+        }
         // 轴配置：类型/范围/翻转/刻度/网格/标题 + 分类标签
         // （标签直接决定绘制文字，长度哈希与系列名约定一致）。
         for (int ai = 0; ai < o.xAxes.Count; ai = ai + 1) {
@@ -495,14 +515,23 @@ partial class ChartView {
         ChartView.ApplyMagic(drawOption, app.StateGet(Chart.TbMagicKey(wid), 0));
         option = drawOption;
         Chart.toolReserve = 0;
+        Chart.legendOpt = drawOption;   // 图例 orient/selectedMode/formatter 的帧内来源
         if (drawOption.toolboxShow) {
             Chart.toolReserve = ChartToolbox.Width(app, drawOption);
         }
+        // dataRange 条固定在控件底部：分派前把高度扣掉，面板与
+        // 绘图区只在剩余矩形里布局（同 toolReserve 的帧内约定）。
+        int drH = ChartViewDataRange.Height(app, drawOption);
+        int innerH = h - drH;
+        if (drH > 0 && innerH < app.Scale(80)) { drH = 0; innerH = h; }
 
         // 把每种图表裁剪到自己的矩形，防止绘图线、柱条、
         // 轴标签和图例溢出到相邻控件。
         app.canvas.PushClip(x, y, w, h);
-        this.DispatchRender(app, x, y, w, h, g);
+        this.DispatchRender(app, x, y, w, innerH, g);
+        if (drH > 0) {
+            ChartViewDataRange.Draw(app, x, y + innerH, w, drH, drawOption);
+        }
         app.canvas.PopClip();
 
         // ECharts 工具箱：右上角。o.toolboxShow 关闭时不画。

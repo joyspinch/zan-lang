@@ -1,0 +1,193 @@
+using System;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+/// ECharts 2.x dataRange：图表底部的值域筛选条（两种形态）。
+/// splitList：每段一个色块，点击把该段灰掉（DRangeBandKey）；
+/// 连续形态：色带（RampAt 分段着色），calculable 时两端叠加
+/// 可拖拽手柄（0..1000 量化状态，同 zoom 条约定）。
+/// 过滤判定统一走消费方 seam Chart.DRangeOk（地图区域 / 散点），
+/// 本组件只负责画条与写状态。占位由 Render() 在分派前扣掉，
+/// 与 Chart.toolReserve 同一帧内静态模式（这里直接缩 h 传参，
+/// 不新增全局）。
+class ChartViewDataRange {
+    static int Pad(App app) { return app.theme.paddingMedium; }
+
+    /// 条占用的总高度（0 = dataRange 未开启）。
+    static int Height(App app, ChartOption o) {
+        if (!o.dataRangeShow) { return 0; }
+        return app.Scale(30);
+    }
+
+    /// 数据定义域：可见系列 data / points.y / regions.value 的
+    /// min/max；无可见值时回退 [0,100]。
+    static void DataSpan(ChartOption o, out int lo, out int hi) {
+        bool any = false;
+        lo = 0; hi = 0;
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries s = o.series[si];
+            if (s.hidden) { continue; }
+            for (int i = 0; i < s.data.Count; i = i + 1) {
+                int v = s.Value(i);
+                if (!any) { lo = v; hi = v; any = true; }
+                if (v < lo) { lo = v; }
+                if (v > hi) { hi = v; }
+            }
+            for (int i = 0; i < s.points.Count; i = i + 1) {
+                int v = s.points[i].y;
+                if (!any) { lo = v; hi = v; any = true; }
+                if (v < lo) { lo = v; }
+                if (v > hi) { hi = v; }
+            }
+            for (int i = 0; i < s.regions.Count; i = i + 1) {
+                int v = s.regions[i].value;
+                if (!any) { lo = v; hi = v; any = true; }
+                if (v < lo) { lo = v; }
+                if (v > hi) { hi = v; }
+            }
+        }
+        if (!any) { lo = 0; hi = 100; }
+    }
+
+    /// 在 (x,y,w,h) 矩形内画 dataRange 条。h = Height() 返回值。
+    static void Draw(App app, int x, int y, int w, int h, ChartOption o) {
+        if (!o.dataRangeShow || o.iwid == 0) { return; }
+        Canvas c = app.canvas;
+        int fs = Style.FontFallback(app, "small");
+        int fg = Style.Part(app, "chart", "axis", "", "", "",
+                            Style.SNormal()).FgOr(0);
+        if (o.dataRangeList.Count > 0) {
+            ChartViewDataRange.DrawSplits(app, c, x, y, w, o, fs, fg);
+            return;
+        }
+        int dLo = 0; int dHi = 0;
+        ChartViewDataRange.DataSpan(o, out dLo, out dHi);
+        if (o.dataRangeLo != ChartOption.Auto()) { dLo = o.dataRangeLo; }
+        if (o.dataRangeHi != ChartOption.Auto()) { dHi = o.dataRangeHi; }
+        if (dHi <= dLo) { dHi = dLo + 1; }
+        int pad = ChartViewDataRange.Pad(app);
+        int bx = x + pad;
+        int bw = w - pad * 2;
+        if (bw < app.Scale(24)) { return; }
+        int barY = y + app.Scale(2);
+        int barH = app.Scale(12);
+        int nSeg = o.dataRangeSplit;
+        if (nSeg < 2) { nSeg = 5; }
+        int segW = bw / nSeg;
+        if (segW < 1) { segW = 1; }
+        // 色带：段 i 的颜色取段中点（与 ECharts 2.x 离散 dataRange 观感一致）。
+        for (int i = 0; i < nSeg; i = i + 1) {
+            int sx = bx + i * segW;
+            int swd = segW;
+            if (i == nSeg - 1) { swd = bx + bw - sx; }
+            int col = Chart.Rgb(214, 217, 222);
+            if (o.rampColors != null && o.rampColors.Count >= 2) {
+                col = Chart.RampAt(o.rampColors, (2 * i + 1) * 500 / nSeg);
+            }
+            c.FillRect(sx, barY, swd, barH, col);
+        }
+        // 两端值标签。
+        string ls = Convert.ToString(dLo);
+        string hs = Convert.ToString(dHi);
+        int lw = Canvas.MeasureText(ls, fs);
+        int lh = Canvas.FontHeight(fs);
+        c.DrawText(bx, barY + barH + app.Scale(2), ls, fg, fs);
+        c.DrawText(bx + bw - Canvas.MeasureText(hs, fs),
+                   barY + barH + app.Scale(2), hs, fg, fs);
+        if (!o.dataRangeCalculable) { return; }
+
+        // calculable：色带上叠加双滑块窗口（DRangeLo/HiKey 0..1000，
+        // 默认 0..1000 = 不裁剪）。
+        int loQ = app.StateGet(Chart.DRangeLoKey(o.iwid), 0);
+        int hiQ = app.StateGet(Chart.DRangeHiKey(o.iwid), 1000);
+        int hw = app.Scale(6);
+        int loX = bx + loQ * bw / 1000;
+        int hiX = bx + hiQ * bw / 1000;
+        int outX = loX;
+        int outW = hiX - loX;
+        if (outX < bx) { outW = outW - (bx - outX); outX = bx; }
+        if (outX + outW > bx + bw) { outW = bx + bw - outX; }
+        if (outW < 0) { outW = 0; }
+        c.FillRect(outX, barY, outW, barH, Chart.WithAlpha(fg, 36));
+        c.FillRoundRect(loX - hw, barY - app.Scale(1), hw * 2, barH + app.Scale(2),
+                        app.Scale(3), Chart.Rgb(88, 93, 100));
+        c.FillRoundRect(hiX - hw, barY - app.Scale(1), hw * 2, barH + app.Scale(2),
+                        app.Scale(3), Chart.Rgb(88, 93, 100));
+        int loId = app.focus.AllocId();
+        int hiId = app.focus.AllocId();
+        app.hitTester.RegisterRect(loId, loX - hw, barY - app.Scale(2),
+                                   hw * 2, barH + app.Scale(4), 3);
+        app.hitTester.RegisterRect(hiId, hiX - hw, barY - app.Scale(2),
+                                   hw * 2, barH + app.Scale(4), 3);
+        int mxQ = (app.mouseX - bx) * 1000 / bw;
+        if (mxQ < 0) { mxQ = 0; }
+        if (mxQ > 1000) { mxQ = 1000; }
+        int minGap = 20;
+        bool dirty = false;
+        if (Ui.Pressed(app, loId)) {
+            int nv = mxQ;
+            if (nv > hiQ - minGap) { nv = hiQ - minGap; }
+            if (nv < 0) { nv = 0; }
+            if (nv != loQ) {
+                app.StateSet(Chart.DRangeLoKey(o.iwid), nv);
+                dirty = true;
+            }
+        } else if (Ui.Pressed(app, hiId)) {
+            int nv = mxQ;
+            if (nv < loQ + minGap) { nv = loQ + minGap; }
+            if (nv > 1000) { nv = 1000; }
+            if (nv != hiQ) {
+                app.StateSet(Chart.DRangeHiKey(o.iwid), nv);
+                dirty = true;
+            }
+        }
+        if (dirty) { app.RequestRedraw(); }
+    }
+
+    /// splitList 形态：横向色块 + 标签，点击切灰。
+    static void DrawSplits(App app, Canvas c, int x, int y, int w,
+                           ChartOption o, int fs, int fg) {
+        int pad = ChartViewDataRange.Pad(app);
+        int sw = app.Scale(10);
+        int gap = app.Scale(6);
+        int rowH = Canvas.FontHeight(fs) + app.Scale(4);
+        int cx = x + pad;
+        int cy = y + (ChartViewDataRange.Height(app, o) - rowH) / 2;
+        int maxX = x + w - pad;
+        int n = o.dataRangeList.Count;
+        int lgFs = fs;
+        for (int bi = 0; bi < n; bi = bi + 1) {
+            ChartRangeSplit sp = o.dataRangeList[bi];
+            string lbl = sp.label;
+            int tw = Canvas.MeasureText(lbl, lgFs);
+            int chipW = sw + app.Scale(4) + tw + gap;
+            if (cx > x + pad && cx + chipW > maxX) {
+                cx = x + pad;
+                cy = cy + rowH + app.Scale(2);
+            }
+            bool off = app.StateGet(Chart.DRangeBandKey(o.iwid, bi), 0) != 0;
+            int col = Chart.Rgb(214, 217, 222);
+            if (o.rampColors != null && o.rampColors.Count >= 2 && n > 1) {
+                col = Chart.RampAt(o.rampColors, bi * 1000 / (n - 1));
+            }
+            if (off) { col = Chart.WithAlpha(col, 60); }
+            c.FillRoundRect(cx, cy + app.Scale(1), sw, sw,
+                            app.Scale(2), col);
+            int tcol = fg;
+            if (off) { tcol = Chart.WithAlpha(fg, 100); }
+            c.DrawText(cx + sw + app.Scale(4), cy + app.Scale(2), lbl, tcol, lgFs);
+            if (off) {
+                int my = cy + app.Scale(2) + Canvas.FontHeight(lgFs) / 2;
+                c.FillRect(cx + sw + app.Scale(4), my, tw, 1, tcol);
+            }
+            int hitId = app.focus.AllocId();
+            app.hitTester.RegisterRect(hitId, cx, cy, sw + app.Scale(4) + tw, rowH, 3);
+            if (Ui.Clicked(app, hitId)) {
+                app.StateSet(Chart.DRangeBandKey(o.iwid, bi), off ? 0 : 1);
+                app.RequestRedraw();
+            }
+            cx = cx + chipW;
+        }
+    }
+}

@@ -83,6 +83,13 @@ class ChartKinds {
     // selectedMode seam：是否允许点击选中（"false" 关闭）。
     static bool SelectedModeEnabled(string s) { return s != "false"; }
 
+    // legend.selectedMode 白名单："single" | "false" | 其余（含
+    // "multiple"）归一为 ""（多选 = 现状默认）。
+    static string LegendModeSanitize(string s) {
+        if (s == "single" || s == "false") { return s; }
+        return "";
+    }
+
     static ChartAxisType AxisOf(string s) {
         if (s == "value") { return ChartAxisType.Value; }
         if (s == "time") { return ChartAxisType.Time; }
@@ -1154,6 +1161,17 @@ class ChartOption {
     List<int> radarMax; // 雷达每轴满刻度（空 = 从数据推导）
     string radarShape;  // ECharts radar.shape："circle"（默认=现状）| "polygon"
     bool radarSplitArea; // ECharts radar.splitArea.show：环带交替色
+    // ---- legend 选项（ECharts legend）----
+    string legendOrient;        // "horizontal"（默认）| "vertical"
+    string legendSelectedMode;  // ""=multiple | "single" | "false"
+    string legendFormatter;     // 标签模板，{name} = 系列名（"" = 原名）
+    // ---- dataRange（ECharts 2.x 值域筛选组件）----
+    bool dataRangeShow;
+    int dataRangeLo;            // 固定下界（Auto = 数据最小值）
+    int dataRangeHi;            // 固定上界（Auto = 数据最大值）
+    bool dataRangeCalculable;   // true = 双把手滑条；false = 分段点选
+    int dataRangeSplit;         // splitList 为空时的均分段数（<=0 视为 5）
+    List<ChartRangeSplit> dataRangeList; // splitList：命名区间
     bool zoom;        // 在直角坐标系图表下方显示 dataZoom 范围滑块
     int markLine;     // 左轴上的水平阈值线（Auto = 无）
     bool markPoint;   // 折线系列的最大值标记
@@ -1210,6 +1228,15 @@ class ChartOption {
         o.radarMax = new List<int>();
         o.radarShape = "circle";
         o.radarSplitArea = false;
+        o.legendOrient = "horizontal";
+        o.legendSelectedMode = "";
+        o.legendFormatter = "";
+        o.dataRangeShow = false;
+        o.dataRangeLo = ChartOption.Auto();
+        o.dataRangeHi = ChartOption.Auto();
+        o.dataRangeCalculable = false;
+        o.dataRangeSplit = 0 - 1;
+        o.dataRangeList = new List<ChartRangeSplit>();
         o.zoom = false;
         o.markLine = ChartOption.Auto();
         o.markPoint = false;
@@ -1894,7 +1921,42 @@ class ChartOption {
         ChartOption.ParseDataZoom(v.Get("dataZoom"), o);
 
         JsonValue lg = v.Get("legend");
-        if (lg != null && lg.IsObject()) { o.showLegend = lg.Bool("show", o.showLegend); }
+        if (lg != null && lg.IsObject()) {
+            o.showLegend = lg.Bool("show", o.showLegend);
+            string ori = lg.Str("orient", o.legendOrient);
+            if (ori == "vertical") { o.legendOrient = "vertical"; }
+            o.legendSelectedMode = ChartKinds.LegendModeSanitize(
+                lg.Str("selectedMode", o.legendSelectedMode));
+            o.legendFormatter = lg.Str("formatter", o.legendFormatter);
+        }
+
+        // dataRange（2.x）：min/max/calculable/splitNumber/data[]。
+        JsonValue dr = v.Get("dataRange");
+        if (dr != null && dr.IsObject()) {
+            o.dataRangeShow = dr.Bool("show", true);
+            if (dr.Has("min")) { o.dataRangeLo = dr.Int("min", o.dataRangeLo); }
+            if (dr.Has("max")) { o.dataRangeHi = dr.Int("max", o.dataRangeHi); }
+            o.dataRangeCalculable = dr.Bool("calculable", false);
+            o.dataRangeSplit = dr.Int("splitNumber", 0 - 1);
+            JsonValue drd = dr.Get("data");
+            if (drd != null && drd.IsArray()) {
+                for (int di2 = 0; di2 < drd.Count(); di2 = di2 + 1) {
+                    JsonValue e = drd.At(di2);
+                    if (!e.IsObject()) { continue; }
+                    int bLo = e.Has("start") ? e.Int("start", 0) : ChartOption.Auto();
+                    int bHi = e.Has("end") ? e.Int("end", 0) : ChartOption.Auto();
+                    o.dataRangeList.Add(ChartRangeSplit.Of(
+                        e.Str("name", e.Str("label", "")), bLo, bHi));
+                }
+            }
+            JsonValue drColors = dr.Get("color");
+            if (drColors != null && drColors.IsArray() && o.rampColors.Count < 1) {
+                for (int ci2 = 0; ci2 < drColors.Count(); ci2 = ci2 + 1) {
+                    o.rampColors.Add(ChartOption.ParseColor(
+                        drColors.At(ci2), 0));
+                }
+            }
+        }
         JsonValue tp = v.Get("tooltip");
         if (tp != null && tp.IsObject()) { o.showTooltip = tp.Bool("show", o.showTooltip); }
         if (v.Has("markLine")) { o.markLine = v.Int("markLine", o.markLine); }
@@ -2100,6 +2162,22 @@ class ChartOption {
             if (iv != null && iv.IsNumber()) { a.labelInterval = iv.AsInt(0 - 1); }
         }
         into.Add(a);
+    }
+}
+
+/// dataRange.splitList 的一个命名值区间（ECharts dataRange.data）。
+/// lo/hi 用 ChartOption.Auto() 表示开口。
+class ChartRangeSplit {
+    string label;
+    int lo;
+    int hi;
+
+    static ChartRangeSplit Of(string label, int lo, int hi) {
+        ChartRangeSplit s = new ChartRangeSplit();
+        s.label = label;
+        s.lo = lo;
+        s.hi = hi;
+        return s;
     }
 }
 

@@ -172,6 +172,10 @@ class Chart {
     // 本帧工具箱占用的右上角宽度；DrawPanelI / PanelHead 让开它。
     static int toolReserve;
 
+    // 本帧 option（图例子字段 orient/selectedMode/formatter 的来源）；
+    // Render() 分派前置位，与 toolReserve 同为帧内静态。
+    static ChartOption legendOpt;
+
     // 多段线性色带插值（visualMap inRange）：t ∈ [0,1000] 均匀映射
     // 到 colors 首尾之间，段内线性混合。colors 少于 2 个时取首色。
     static int RampAt(List<int> colors, int t) {
@@ -591,6 +595,48 @@ class Chart {
 
     // 交互 id `wid` 下系列 `si` 的图例隐藏状态键。
     static int LegendKey(int wid, int si) { return 6000000 + wid * 64 + si; }
+    // dataRange 交互态：calculable 滑条两端（0..1000 量化，同
+    // zoom 条约定）与 splitList 分段隐藏位（1 = 该段被点掉）。
+    static int DRangeLoKey(int wid) { return 7300000 + wid * 4; }
+    static int DRangeHiKey(int wid) { return 7300000 + wid * 4 + 1; }
+    static int DRangeBandKey(int wid, int bi) { return 7400000 + wid * 32 + bi; }
+
+    /// legend.formatter 纯 seam：{name} 占位替换（模板空 = 原名）。
+    static string LegendLabel(string fmt, string name) {
+        if (fmt.Length < 1) { return name; }
+        return fmt.Replace("{name}", name);
+    }
+
+    // ---- legend 选项帧内访问器（Chart.legendOpt 未置 = 保持旧行为）----
+    static bool LegendVertical() {
+        ChartOption lo = Chart.legendOpt;
+        if (lo == null) { return false; }
+        return lo.legendOrient == "vertical";
+    }
+    static string LegendFmt() {
+        ChartOption lo = Chart.legendOpt;
+        if (lo == null) { return ""; }
+        return lo.legendFormatter;
+    }
+    // 0 = multiple（现状）| 1 = single | -1 = false（不可点）
+    static int LegendSelMode() {
+        ChartOption lo = Chart.legendOpt;
+        if (lo == null) { return 0; }
+        if (lo.legendSelectedMode == "single") { return 1; }
+        if (lo.legendSelectedMode == "false") { return 0 - 1; }
+        return 0;
+    }
+
+    /// dataRange calculable 滑条位置（0..1000）到值域的线性映射
+    /// （纯 seam）：q=0 → dLo、q=1000 → dHi。下界默认 q=0、
+    /// 上界默认 q=1000，即未拖动时两端都不裁剪。
+    static int DataRangeValue(int dLo, int dHi, int q) {
+        int span = dHi - dLo;
+        if (span < 0) { span = 0; }
+        if (q < 0) { q = 0; }
+        if (q > 1000) { q = 1000; }
+        return dLo + span * q / 1000;
+    }
 
     // 饼/漏斗/玫瑰扇区、和弦/力导节点：按 (系列, 数据项) 持久化隐藏。
     // 与 LegendKey 分段错开，避免单系列多扇区共用一个键把整图关掉。
@@ -823,6 +869,8 @@ class Chart {
     static int LegendRowCount(App app, int x, int w, string title,
                               List<ChartSeries> series) {
         if (series == null || series.Count < 1) { return 0; }
+        if (Chart.LegendVertical()) { return series.Count; }
+        string fmt = Chart.LegendFmt();
         int pad = app.theme.paddingMedium;
         int lgFs = Style.FontFallback(app, "small");
         int sw = app.Scale(12);
@@ -834,7 +882,7 @@ class Chart {
             int maxX = x + w - pad;
             for (int si = 0; si < series.Count; si = si + 1) {
                 int chipW = sw + app.Scale(6)
-                    + Canvas.MeasureText(series[si].name, lgFs);
+                    + Canvas.MeasureText(Chart.LegendLabel(fmt, series[si].name), lgFs);
                 if (xCur > x + pad && xCur + chipW > maxX) {
                     extra = extra + 1;
                     xCur = x + pad;
@@ -852,7 +900,7 @@ class Chart {
         }
         int si = series.Count - 1;
         while (si >= 0) {
-            int tw = Canvas.MeasureText(series[si].name, lgFs);
+            int tw = Canvas.MeasureText(Chart.LegendLabel(fmt, series[si].name), lgFs);
             int rowLeft = lx - tw - app.Scale(6) - sw;
             if (rowLeft < leftLimit) {
                 extra = extra + 1;
@@ -915,8 +963,8 @@ class Chart {
         }
 
         if (showLegend) {
-        // 有工具箱：图例整排下移到标题/工具箱行之下，永不互挡。
-        // 无工具箱：仍与标题同行，从右往左排，放不下再换行。
+        // 有工具箱或 orient=vertical：图例整排下移到标题/工具箱行之下。
+        // vertical 时每个色块独占一行（左对齐）；否则从右往左排，放不下换行。
         StyleBox sLegend = Style.Part(app, "chart", "legend", "", "", "",
                                       Style.SNormal());
         StyleBox sLegendOff = Style.Part(app, "chart", "legend", "", "off", "",
@@ -924,7 +972,10 @@ class Chart {
         int sw = app.Scale(12);
         int lgFs = Style.FontFallback(app, "small");
         int rowH = Canvas.FontHeight(lgFs) + app.Scale(6);
-        bool below = Chart.toolReserve > 0;
+        string fmt = Chart.LegendFmt();
+        int lmode = Chart.LegendSelMode();
+        bool vert = Chart.LegendVertical();
+        bool below = vert || Chart.toolReserve > 0;
         int headH = titleH;
         if (below) {
             int toolH = ChartToolbox.Height(app);
@@ -935,24 +986,27 @@ class Chart {
             lgY = y + pad + headH + app.Scale(4);
             int xCur = x + pad;
             int maxX = x + w - pad;
-            int totW = 0;
-            for (int sm = 0; sm < series.Count; sm = sm + 1) {
-                totW = totW + sw + app.Scale(6)
-                    + Canvas.MeasureText(series[sm].name, lgFs) + app.Scale(14);
-            }
-            if (series.Count > 0) { totW = totW - app.Scale(14); }
-            if (totW > 0 && totW <= maxX - xCur) {
-                xCur = xCur + (maxX - xCur - totW) / 2;
+            if (!vert) {
+                int totW = 0;
+                for (int sm = 0; sm < series.Count; sm = sm + 1) {
+                    totW = totW + sw + app.Scale(6)
+                        + Canvas.MeasureText(Chart.LegendLabel(fmt, series[sm].name), lgFs)
+                        + app.Scale(14);
+                }
+                if (series.Count > 0) { totW = totW - app.Scale(14); }
+                if (totW > 0 && totW <= maxX - xCur) {
+                    xCur = xCur + (maxX - xCur - totW) / 2;
+                }
             }
             for (int si = 0; si < series.Count; si = si + 1) {
                 bool hid = series[si].hidden;
                 if (wid != 0) {
                     hid = app.StateGet(Chart.LegendKey(wid, si), hid ? 1 : 0) == 1;
                 }
-                string nm = series[si].name;
+                string nm = Chart.LegendLabel(fmt, series[si].name);
                 int tw = Canvas.MeasureText(nm, lgFs);
                 int chipW = sw + app.Scale(6) + tw;
-                if (xCur > x + pad && xCur + chipW > maxX) {
+                if (xCur > x + pad && (vert || xCur + chipW > maxX)) {
                     xCur = x + pad;
                     lgY = lgY + rowH;
                 }
@@ -965,15 +1019,11 @@ class Chart {
                     int my = lgY + app.Scale(2) + Canvas.FontHeight(lgFs) / 2;
                     c.FillRect(xCur + sw + app.Scale(6), my, tw, 1, sLegendOff.FgOr(0));
                 }
-                if (wid != 0) {
+                if (wid != 0 && lmode != 0 - 1) {
                     int hitId = app.focus.AllocId();
                     app.hitTester.RegisterRect(hitId, xCur, lgY, chipW, rowH, 3);
                     if (Ui.Clicked(app, hitId)) {
-                        int nv = 1;
-                        if (hid) { nv = 0; }
-                        app.StateSet(Chart.LegendKey(wid, si), nv);
-                        hid = (nv == 1);
-                        app.RequestRedraw();
+                        hid = Chart.LegendClick(app, wid, series, si, hid, lmode);
                     }
                 }
                 series[si].hidden = hid;
@@ -994,7 +1044,7 @@ class Chart {
                 hid = app.StateGet(Chart.LegendKey(wid, si), hid ? 1 : 0) == 1;
             }
 
-            string nm = series[si].name;
+            string nm = Chart.LegendLabel(fmt, series[si].name);
             int tw = Canvas.MeasureText(nm, lgFs);
             int rowLeft = lx - tw - app.Scale(6) - sw;
             if (rowLeft < leftLimit) {
@@ -1017,16 +1067,12 @@ class Chart {
                 c.FillRect(lx - tw, my, tw, 1, sLegendOff.FgOr(0));
             }
 
-            if (wid != 0) {
+            if (wid != 0 && lmode != 0 - 1) {
                 int hitId = app.focus.AllocId();
                 app.hitTester.RegisterRect(hitId, rowLeft,
                     lgY, (lx) - rowLeft, sw + app.Scale(4), 3);
                 if (Ui.Clicked(app, hitId)) {
-                    int nv = 1;
-                    if (hid) { nv = 0; }
-                    app.StateSet(Chart.LegendKey(wid, si), nv);
-                    hid = (nv == 1);
-                    app.RequestRedraw();
+                    hid = Chart.LegendClick(app, wid, series, si, hid, lmode);
                 }
             }
 
@@ -1038,6 +1084,25 @@ class Chart {
         }
 
         return Chart.PanelContentTop(app, x, y, w, title, series, showLegend);
+    }
+
+    /// legend 色块点击（单一实现供两个布局分支复用）：写隐藏态，
+    /// single 模式下「显示一个」同时隐藏其余系列。返回点击后的 hid。
+    static bool LegendClick(App app, int wid, List<ChartSeries> series,
+                            int si, bool hid, int mode) {
+        int nv = 1;
+        if (hid) { nv = 0; }
+        app.StateSet(Chart.LegendKey(wid, si), nv);
+        if (nv == 0 && mode == 1) {
+            for (int oi = 0; oi < series.Count; oi = oi + 1) {
+                if (oi != si) {
+                    app.StateSet(Chart.LegendKey(wid, oi), 1);
+                    series[oi].hidden = true;
+                }
+            }
+        }
+        app.RequestRedraw();
+        return nv == 1;
     }
 
     /// 只算不画：与 DrawPanelI 完全一致的面板内容顶部
@@ -1061,6 +1126,49 @@ class Chart {
         int areaBase = Style.Part(app, "chart", "mark-area", "", "", "",
                                   Style.SNormal()).BgOr(0);
         c.FillRect(f.plotX, y0, f.plotW, y1 - y0, Chart.WithAlpha(areaBase, 28));
+    }
+
+    // ---- dataRange 值过滤（消费方共用 seam）----
+
+    // 生效筛选窗口的下界：固定 dataRangeLo 优先；calculable 时
+    // 再取滑条状态位（q 0..1000，默认 0 = 不裁剪）线性映射。
+    static int DRangeEff(App app, ChartOption o, int wid, int dMin, int dMax,
+                         bool upper) {
+        int baseV = upper ? o.dataRangeHi : o.dataRangeLo;
+        if (baseV == ChartOption.Auto()) { baseV = upper ? dMax : dMin; }
+        if (o.dataRangeCalculable && wid != 0) {
+            int q = app.StateGet(upper ? Chart.DRangeHiKey(wid)
+                                       : Chart.DRangeLoKey(wid),
+                                 upper ? 1000 : 0);
+            int sv = Chart.DataRangeValue(dMin, dMax, q);
+            if (upper) { if (sv < baseV) { baseV = sv; } }
+            else { if (sv > baseV) { baseV = sv; } }
+        }
+        return baseV;
+    }
+
+    // 值 v 是否落在 splitList 的某个「未点掉」分段里（无列表 = 放行）。
+    static bool DRangeBandOk(App app, ChartOption o, int wid, int v) {
+        if (o.dataRangeList.Count < 1) { return true; }
+        for (int bi = 0; bi < o.dataRangeList.Count; bi = bi + 1) {
+            ChartRangeSplit sp = o.dataRangeList[bi];
+            if ((sp.lo == ChartOption.Auto() || v >= sp.lo)
+                && (sp.hi == ChartOption.Auto() || v <= sp.hi)) {
+                if (wid != 0 && app.StateGet(Chart.DRangeBandKey(wid, bi), 0) != 0) {
+                    return false;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 统一消费 seam：v 是否通过当前 dataRange 过滤。
+    static bool DRangeOk(App app, ChartOption o, int wid, int dMin, int dMax, int v) {
+        if (!o.dataRangeShow) { return true; }
+        if (v < Chart.DRangeEff(app, o, wid, dMin, dMax, false)) { return false; }
+        if (v > Chart.DRangeEff(app, o, wid, dMin, dMax, true)) { return false; }
+        return Chart.DRangeBandOk(app, o, wid, v);
     }
 
     // 左轴 markLine 处的水平阈值线，带可选的
