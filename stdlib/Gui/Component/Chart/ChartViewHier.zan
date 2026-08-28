@@ -12,9 +12,12 @@ class WordCloudItem {
     int h;
     int fontSize;
     int color;
+    // 旋转角（0/90，ECharts wordCloud.rotateRange 的 0/90 两态）；
+    // 旋转项的 x/y/w/h 存的是旋转后的包围盒。
+    int rot;
 
     static WordCloudItem Of(ChartData data, int x, int y, int w, int h,
-                            int fontSize, int color) {
+                            int fontSize, int color, int rot) {
         WordCloudItem item = new WordCloudItem();
         item.data = data;
         item.x = x;
@@ -23,6 +26,7 @@ class WordCloudItem {
         item.h = h;
         item.fontSize = fontSize;
         item.color = color;
+        item.rot = rot;
         return item;
     }
 }
@@ -653,13 +657,17 @@ partial class ChartView {
             if (lead.data[i].val > maxV) { maxV = lead.data[i].val; }
         }
 
-        int minFs = app.Scale(11);
-        int maxFs = app.Scale(36);
+        int minFs = lead != null && lead.wcMinFontSize > 0
+            ? app.Scale(lead.wcMinFontSize) : app.Scale(11);
+        int maxFs = lead != null && lead.wcMaxFontSize > 0
+            ? app.Scale(lead.wcMaxFontSize) : app.Scale(36);
         if (maxFs > ah / 3) { maxFs = ah / 3; }
         if (maxFs > aw / 6) { maxFs = aw / 6; }
         if (maxFs < minFs) { maxFs = minFs; }
+        bool vary = lead != null && lead.wcRotate == "vary";
 
-        int wfp = ChartView.WordCloudFingerprint(lead.data, aw, ah, minFs, maxFs);
+        int wfp = ChartView.WordCloudFingerprint(lead.data, aw, ah, minFs, maxFs,
+            vary ? 1 : 0);
         if (ChartView.wcCache == null) {
             ChartView.wcCache = new List<WordCloudCacheEntry>();
         }
@@ -669,7 +677,7 @@ partial class ChartView {
 
         if (placed == null) {
             placed = ChartView.PlaceWordCloud(app, t, lead.data, aw, ah,
-                minFs, maxFs, maxV);
+                minFs, maxFs, maxV, vary);
             WordCloudCacheEntry.Store(ChartView.wcCache, wfp, placed, 4);
         }
 
@@ -680,15 +688,25 @@ partial class ChartView {
         for (int wi = 0; wi < placed.Count; wi = wi + 1) {
             WordCloudItem it = placed[wi];
             int col = Chart.WithAlpha(it.color, alpha);
-            c.DrawText(ax + it.x, ay + it.y, it.data.name, col, it.fontSize);
+            if (it.rot == 0) {
+                c.DrawText(ax + it.x, ay + it.y, it.data.name, col, it.fontSize);
+            } else {
+                // 绕锚点顺时针 90°：锚点取旋转后包围盒右上角，字形
+                // 落回 [x, x+w]×[y, y+h]（w/h 已是交换后的包围盒）。
+                c.DrawTextRot(ax + it.x + it.w, ay + it.y, it.data.name,
+                    col, it.fontSize, it.rot);
+            }
         }
         c.PopClip();
     }
 
     /// 阿基米德螺旋放置：字号按权重，放不下就缩小，坐标相对绘图区。
+    /// vary 为真时奇数词条旋转 90°（ECharts wordCloud rotateRange
+    /// 的 0/90 两态；随机角度非确定性，故不取随机），其包围盒按
+    /// 旋转后宽高交换登记，碰撞检测与裁剪都用包围盒。
     static List<WordCloudItem> PlaceWordCloud(App app, Theme t, List<ChartData> src,
                                               int aw, int ah, int minFs, int maxFs,
-                                              int maxV) {
+                                              int maxV, bool vary) {
         List<ChartData> words = new List<ChartData>();
         for (int i = 0; i < src.Count; i = i + 1) { words.Add(src[i]); }
         for (int a = 0; a < words.Count; a = a + 1) {
@@ -713,18 +731,23 @@ partial class ChartView {
             int fs = minFs + (maxFs - minFs) * word.val / maxV;
             int color = word.color;
             if (color == 0) { color = Chart.Palette(t, wi); }
+            bool rot = vary && wi % 2 == 1;
+            int rotDeg = rot ? 90 : 0;
             bool done = false;
             int shrink = 0;
             while (!done && shrink < 10) {
                 int tw = Canvas.MeasureText(word.name, fs) + app.Scale(6);
                 int th = Canvas.FontHeight(fs) + app.Scale(2);
-                if (tw > aw - 2) {
+                // 旋转项占位盒宽高交换（90° 刚体旋转后的包围盒）。
+                int bw = rot ? th : tw;
+                int bh = rot ? tw : th;
+                if (bw > aw - 2) {
                     if (fs <= minFs) { done = true; }
                     else { fs = fs - 2; if (fs < minFs) { fs = minFs; } }
                     shrink = shrink + 1;
                     continue;
                 }
-                if (th > ah - 2) {
+                if (bh > ah - 2) {
                     if (fs <= minFs) { done = true; }
                     else { fs = fs - 2; if (fs < minFs) { fs = minFs; } }
                     shrink = shrink + 1;
@@ -736,15 +759,16 @@ partial class ChartView {
                     int radius = maxR * attempt / attempts;
                     int cx = aw / 2 + ChartView.CosDeg(angle) * radius / 1000;
                     int cy = ah / 2 + ChartView.SinDeg(angle) * radius / 1000;
-                    int tx = cx - tw / 2;
-                    int ty = cy - th / 2;
+                    int tx = cx - bw / 2;
+                    int ty = cy - bh / 2;
                     if (tx < 0) { tx = 0; }
                     if (ty < 0) { ty = 0; }
-                    if (tx + tw > aw) { tx = aw - tw; }
-                    if (ty + th > ah) { ty = ah - th; }
-                    if (tx >= 0 && ty >= 0 && tx + tw <= aw && ty + th <= ah
-                        && ChartView.WordCloudFits(placed, tx, ty, tw, th)) {
-                        placed.Add(WordCloudItem.Of(word, tx, ty, tw, th, fs, color));
+                    if (tx + bw > aw) { tx = aw - bw; }
+                    if (ty + bh > ah) { ty = ah - bh; }
+                    if (tx >= 0 && ty >= 0 && tx + bw <= aw && ty + bh <= ah
+                        && ChartView.WordCloudFits(placed, tx, ty, bw, bh)) {
+                        placed.Add(WordCloudItem.Of(word, tx, ty, bw, bh, fs, color,
+                            rotDeg));
                         done = true;
                     } else {
                         attempt = attempt + 1;
@@ -761,8 +785,9 @@ partial class ChartView {
     }
 
     static int WordCloudFingerprint(List<ChartData> data, int aw, int ah,
-                                    int minFs, int maxFs) {
-        int fp = (aw * 7 + ah * 13 + minFs * 17 + maxFs * 19) % 2000000000;
+                                    int minFs, int maxFs, int rotate) {
+        int fp = (aw * 7 + ah * 13 + minFs * 17 + maxFs * 19 + rotate * 29)
+            % 2000000000;
         for (int i = 0; i < data.Count; i = i + 1) {
             fp = ChartView.FoldStr(fp, data[i].name, 23);
             fp = (fp * 31 + data[i].val) % 2000000000;

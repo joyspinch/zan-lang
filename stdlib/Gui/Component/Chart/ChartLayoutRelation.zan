@@ -69,7 +69,12 @@ class ChordLayout {
     int gap;        // 每节点稳定间隙（度）
     int arcTotal;   // 所有节点弧总度数（= 360 - n*gap）
 
-    static ChordLayout Of(List<ChartLink> links) {
+    /// sortMode：0 = 首现序（现状逐像素一致）| 1 = 权重降序 | 2 = 升序
+    /// （ECharts 2.x chord.sort）。sortSub = sortSub：true 时子弧按
+    /// link 值降序（ECharts chord.sortSub），false = 旧对端序。
+    /// gapDeg：节点间隙度数，-1 = 自动（2，拥挤时 0；现状）。
+    static ChordLayout Of(List<ChartLink> links, int sortMode, bool sortSub,
+                          int gapDeg) {
         ChordLayout l = new ChordLayout();
         l.ribbons = new List<ChordRibbon>();
         l.nodes = new List<ChordNodeArc>();
@@ -97,10 +102,35 @@ class ChordLayout {
             }
         }
 
+        // 节点弧序（ECharts chord.sort）：权重稳定插入排序；
+        // 索引随 nodes 移动，ribbon 端点由下方按名重映射。
+        if (sortMode == 1 || sortMode == 2) {
+            for (int a = 1; a < nn; a = a + 1) {
+                ChordNodeArc cur = l.nodes[a];
+                int b = a - 1;
+                while (b >= 0) {
+                    bool keep;
+                    if (sortMode == 1) {
+                        keep = l.nodes[b].weight >= cur.weight;
+                    } else {
+                        keep = l.nodes[b].weight <= cur.weight;
+                    }
+                    if (keep) { break; }
+                    l.nodes[b + 1] = l.nodes[b];
+                    b = b - 1;
+                }
+                l.nodes[b + 1] = cur;
+            }
+        }
+
         // 稳定间隙 + 总弧长。
         int gap = 2;
+        if (gapDeg >= 0) { gap = gapDeg; }
         int arcTotal = 360 - nn * gap;
-        if (arcTotal < 180) { gap = 0; arcTotal = 360; }
+        if (arcTotal < 180) {
+            if (gapDeg < 0) { gap = 0; arcTotal = 360; }
+        }
+        if (arcTotal < 1) { arcTotal = 1; }
         l.gap = gap;
         l.arcTotal = arcTotal;
 
@@ -135,7 +165,7 @@ class ChordLayout {
             if (ti != fi) { inc[ti].Add(li); }
         }
         for (int i = 0; i < nn; i = i + 1) {
-            ChordLayout.SortInc(inc[i], links, l.nodes, i);
+            ChordLayout.SortInc(inc[i], links, l.nodes, i, sortSub);
         }
         // subC[i][pos] = 节点 i 第 pos 个 incident link 的子弧中心角。
         List<List<int>> subC = new List<List<int>>();
@@ -207,15 +237,23 @@ class ChordLayout {
     }
 
     static void SortInc(List<int> inc, List<ChartLink> links,
-                        List<ChordNodeArc> nodes, int self) {
+                        List<ChordNodeArc> nodes, int self, bool byValue) {
         for (int a = 1; a < inc.Count; a = a + 1) {
             int v = inc[a];
             int ov = ChordLayout.OtherIndex(nodes, links[v], self);
             int b = a - 1;
             while (b >= 0) {
                 int ou = ChordLayout.OtherIndex(nodes, links[inc[b]], self);
-                bool keep = ou < ov;
-                if (!keep && ou == ov && inc[b] <= v) { keep = true; }
+                bool keep;
+                if (byValue) {
+                    // sortSub：子弧按 link 值降序，同值保持 link 原序。
+                    keep = links[inc[b]].val >= links[v].val;
+                    if (!keep && links[inc[b]].val == links[v].val
+                        && inc[b] <= v) { keep = true; }
+                } else {
+                    keep = ou < ov;
+                    if (!keep && ou == ov && inc[b] <= v) { keep = true; }
+                }
                 if (keep) { break; }
                 inc[b + 1] = inc[b];
                 b = b - 1;
@@ -288,7 +326,11 @@ class ForceLayout {
     /// (w/2, h/2)，钳制到 [0..w]×[0..h]。调用方绘制时再平移到
     /// 屏幕位置。这样布局只取决于数据与盒子尺寸——卡片滚动
     /// 时形状不变，逐帧缓存也能跨滚动位置命中。
-    static ForceLayout Of(List<ChartLink> links, int r, int w, int h) {
+    /// scaling / gravity（百分比，100 = 现状逐像素一致）：
+    /// 分别缩放弹簧斥力/边吸引与中心引力（ECharts force.scaling /
+    /// force.gravity）。
+    static ForceLayout Of(List<ChartLink> links, int r, int w, int h,
+                          int scaling, int gravity) {
         ForceLayout l = new ForceLayout();
         l.edges = new List<ForceEdge>();
         l.nodes = new List<ForceNode>();
@@ -372,7 +414,7 @@ class ForceLayout {
                     int d = ChartView.ISqrt(d2);
                     if (d < 8) { d = 8; }
                     if (d < k) {
-                        int fr = (k - d) * 4 / 10;
+                        int fr = (k - d) * 4 * scaling / 1000;
                         dx = dx - dijx * fr / d;
                         dy = dy - dijy * fr / d;
                     }
@@ -391,7 +433,7 @@ class ForceLayout {
                     int d2 = dijx * dijx + dijy * dijy;
                     int d = ChartView.ISqrt(d2);
                     if (d < 8) { d = 8; }
-                    int fa = (d - rest) * 2 / 10;
+                    int fa = (d - rest) * 2 * scaling / 1000;
                     dx = dx + dijx * fa / d;
                     dy = dy + dijy * fa / d;
                 }
@@ -402,8 +444,8 @@ class ForceLayout {
                 int nx = xi + dx * 3 / 8;
                 int ny = yi + dy * 3 / 8;
                 // 中心引力 + 边界钳制。
-                nx = nx + (cx - nx) / 32;
-                ny = ny + (cy - ny) / 32;
+                nx = nx + (cx - nx) * gravity / 3200;
+                ny = ny + (cy - ny) * gravity / 3200;
                 if (nx < 0) { nx = 0; }
                 if (nx > w) { nx = w; }
                 if (ny < 0) { ny = 0; }
@@ -426,13 +468,29 @@ class ForceLayout {
     /// 节点形状放在 series.tree（ChartNode.Shaped 叶），布局仍由 links
     /// 推导，这里按名匹配把 symbol/size 抄到 ForceNode 上。未匹配的
     /// 节点保持圆 + 自动尺寸。
-    static void ApplyShapes(ForceLayout l, List<ChartNode> shapes) {
+    /// minR/maxR（ECharts force.minSize/maxSize，像素，0 = 关闭）：
+    /// 无显式 size 的节点直径按权重在两者间线性插值；显式 size 仍
+    /// 优先。绘制端用 size/2 当半径。
+    static void ApplyShapes(ForceLayout l, List<ChartNode> shapes,
+                            int minR, int maxR) {
+        int maxW = 1;
+        for (int i = 0; i < l.nodes.Count; i = i + 1) {
+            if (l.nodes[i].weight > maxW) { maxW = l.nodes[i].weight; }
+        }
+        for (int i = 0; i < l.nodes.Count; i = i + 1) {
+            ForceNode nd = l.nodes[i];
+            if (minR > 0) {
+                int hi = maxR > 0 ? maxR : minR;
+                if (hi < minR) { hi = minR; }
+                nd.size = 2 * (minR + (hi - minR) * nd.weight / maxW);
+            }
+        }
         if (shapes == null) { return; }
         for (int si = 0; si < shapes.Count; si = si + 1) {
             int idx = ForceLayout.NodeIndex(l.nodes, shapes[si].name);
             if (idx >= 0) {
                 l.nodes[idx].symbol = shapes[si].symbol;
-                l.nodes[idx].size = shapes[si].size;
+                if (shapes[si].size > 0) { l.nodes[idx].size = shapes[si].size; }
             }
         }
     }

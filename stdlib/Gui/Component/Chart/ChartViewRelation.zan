@@ -13,8 +13,9 @@ partial class ChartView {
     // 重算 O(n²) 迭代。小容量即可——同屏一般只有一两个力导向图。
     static List<ForceLayoutCache> forceCache;
 
-    static int ForceFingerprint(List<ChartLink> links, int r, int w, int h) {
-        int fp = (r * 17 + w * 19 + h * 23) % 2000000000;
+    static int ForceFingerprint(List<ChartLink> links, int r, int w, int h,
+                                int scaling, int gravity) {
+        int fp = (r * 17 + w * 19 + h * 23 + scaling * 29 + gravity * 31) % 2000000000;
         for (int i = 0; i < links.Count; i = i + 1) {
             ChartLink lk = links[i];
             fp = ChartView.FoldStr(fp, lk.from, 21);
@@ -25,15 +26,16 @@ partial class ChartView {
     }
 
     static ForceLayout CachedForceLayout(List<ChartLink> links,
-                                         int r, int w, int h) {
-        if (links.Count < 1) { return ForceLayout.Of(links, r, w, h); }
-        int fp = ChartView.ForceFingerprint(links, r, w, h);
+                                         int r, int w, int h,
+                                         int scaling, int gravity) {
+        if (links.Count < 1) { return ForceLayout.Of(links, r, w, h, scaling, gravity); }
+        int fp = ChartView.ForceFingerprint(links, r, w, h, scaling, gravity);
         if (ChartView.forceCache == null) {
             ChartView.forceCache = new List<ForceLayoutCache>();
         }
         ForceLayout hit = ForceLayoutCache.Lookup(ChartView.forceCache, fp);
         if (hit != null) { return hit; }
-        ForceLayout layout = ForceLayout.Of(links, r, w, h);
+        ForceLayout layout = ForceLayout.Of(links, r, w, h, scaling, gravity);
         ForceLayoutCache.Store(ChartView.forceCache, fp, layout, 4);
         return layout;
     }
@@ -47,7 +49,8 @@ partial class ChartView {
         ChartSeries lead = ChartView.LeadSeries(o);
         if (lead == null || lead.links.Count < 1) { return; }
 
-        ChordLayout layout = ChordLayout.Of(lead.links);
+        ChordLayout layout = ChordLayout.Of(lead.links, lead.chordSort,
+            lead.chordSortSub, lead.chordGapDeg);
         int nn = layout.nodes.Count;
         if (nn < 1) { return; }
         int nr = layout.ribbons.Count;
@@ -106,12 +109,14 @@ partial class ChartView {
             if (layout.ribbons[i].val > maxVal) { maxVal = layout.ribbons[i].val; }
         }
         int ribbonR = r * 88 / 100;
-        bool thin = lead.innerPct > 0;
+        bool thin = lead.chordRibbonType == "path" || lead.innerPct > 0;
+        // chordStyle：外环宽（占半径 %，默认 22 = 现状 78/100）。
+        int ringW = lead.chordRingWidthPct > 0 ? lead.chordRingWidthPct : 22;
+        int rInner0 = r * (100 - ringW) / 100;
         int hoverRibbon = 0 - 1;
         int mxH = app.mouseX;
         int myH = app.mouseY;
         int distH = ChartView.ISqrt((mxH - cx) * (mxH - cx) + (myH - cy) * (myH - cy));
-        int rInner0 = r * 78 / 100;
         if (myH >= bodyY && distH >= rInner0 && distH <= r + app.Scale(4)) {
             int angH = ChartView.AngleOf(mxH - cx, myH - cy);
             for (int hi = 0; hi < nn; hi = hi + 1) {
@@ -173,7 +178,7 @@ partial class ChartView {
         }
 
         // 节点弧：外环上按权重分的扇区，随 g 扫入。
-        int rInner = r * 78 / 100;
+        int rInner = rInner0;
         int sweepMax = 360 * g / 1000;
         for (int i = 0; i < nn; i = i + 1) {
             if (i < nodeHid.Count && nodeHid[i]) { continue; }
@@ -365,10 +370,11 @@ partial class ChartView {
         int oy = top;
 
         ForceLayout layout = ChartView.CachedForceLayout(lead.links,
-            r, areaW, areaH);
-        // 逐节点形状（不改几何，仅 symbol/size 元数据，幂等重放，
-        // 对共享缓存安全）。
-        ForceLayout.ApplyShapes(layout, lead.tree);
+            r, areaW, areaH, lead.forceScaling, lead.forceGravity);
+        // 逐节点形状 + minRadius/maxRadius 权重插值（不改几何，仅
+        // symbol/size 元数据，幂等重放，对共享缓存安全）。
+        ForceLayout.ApplyShapes(layout, lead.tree,
+            app.Scale(lead.forceMinRadius), app.Scale(lead.forceMaxRadius));
         int nn = layout.nodes.Count;
         if (nn < 1) { return; }
         List<bool> nodeHid = new List<bool>();
@@ -384,6 +390,9 @@ partial class ChartView {
         for (int i = 0; i < layout.edges.Count; i = i + 1) {
             if (layout.edges[i].val > maxVal) { maxVal = layout.edges[i].val; }
         }
+        // linkStyle/nodeStyle 显式色（0 = 逐节点调色板，现状）。
+        int linkCol0 = lead.forceLinkColor;
+        int nodeCol0 = lead.forceNodeColor;
         // 悬停节点（若有）：相邻边高亮。
         int hoverNode = 0 - 1;
         if (o.showTooltip) {
@@ -410,7 +419,8 @@ partial class ChartView {
             ForceEdge e = layout.edges[i];
             if (e.a < nodeHid.Count && nodeHid[e.a]) { continue; }
             if (e.b < nodeHid.Count && nodeHid[e.b]) { continue; }
-            int col = Chart.Palette(t, e.a);
+            int col = linkCol0;
+            if (col == 0) { col = Chart.Palette(t, e.a); }
             int w2 = 1 + app.Scale(2) * e.val / maxVal;
             c.DrawLine(ox + layout.nodes[e.a].x, oy + layout.nodes[e.a].y,
                 ox + layout.nodes[e.b].x, oy + layout.nodes[e.b].y,
@@ -420,7 +430,8 @@ partial class ChartView {
             for (int i = 0; i < layout.edges.Count; i = i + 1) {
                 ForceEdge e = layout.edges[i];
                 if (e.a != hoverNode && e.b != hoverNode) { continue; }
-                int col = Chart.Palette(t, e.a);
+                int col = linkCol0;
+                if (col == 0) { col = Chart.Palette(t, e.a); }
                 c.DrawLine(ox + layout.nodes[e.a].x, oy + layout.nodes[e.a].y,
                     ox + layout.nodes[e.b].x, oy + layout.nodes[e.b].y,
                     col, app.Scale(3));
@@ -433,7 +444,8 @@ partial class ChartView {
         for (int i = 0; i < nn; i = i + 1) {
             if (i < nodeHid.Count && nodeHid[i]) { continue; }
             ForceNode nd = layout.nodes[i];
-            int col = Chart.Palette(t, i);
+            int col = nodeCol0;
+            if (col == 0) { col = Chart.Palette(t, i); }
             int nr = nodeR;
             if (nd.size > 0) { nr = app.Scale(nd.size) / 2; }
             Chart.DrawSymbol(c, ox + nd.x, oy + nd.y, nr, nd.symbol, col,
