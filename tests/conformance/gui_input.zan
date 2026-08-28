@@ -1,0 +1,132 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// Headless checks for the text-box enhancements (Naive UI Input parity):
+/// the counting primitives (code-point `Text.Chars`, UTF-8 decode
+/// `Text.CpAt`, grapheme-cluster `Text.Graphemes`), the built-in filters and
+/// the "current / max" count text, the Insert gate (filter + MaxLen, with
+/// full rollback), status-class sanitization, and the designer property
+/// round-trip — for both Input and TextArea. Everything here is pure
+/// computation: no window is created and no frame is rendered.
+class GuiInputTest {
+    // Multi-scalar sample strings, built by code point so the golden never
+    // depends on the lexer's \U escape (there is none) nor the terminal's
+    // glyph coverage.
+    static string ThumbsUp()  { return Text.CharStr(0x1F44D); }           // 1 cp
+    static string Combining() { return "e" + Text.CharStr(0x0301); }      // 2 cp, 1 grapheme
+    static string Flag()      { return Text.CharStr(0x1F1E6) + Text.CharStr(0x1F1FF); } // 2 cp, 1 grapheme
+    static string Keycap()    { return "1" + Text.CharStr(0xFE0F); }      // 2 cp, 1 grapheme
+    static string Family() {
+        // man ZWJ woman ZWJ girl: 5 code points, one cluster.
+        return Text.CharStr(0x1F468) + Text.CharStr(0x200D)
+             + Text.CharStr(0x1F469) + Text.CharStr(0x200D)
+             + Text.CharStr(0x1F467);
+    }
+
+    static string Hex(int cp) {
+        if (cp < 0) { return "<"; }
+        string digits = "0123456789ABCDEF";
+        string s = "";
+        int v = cp;
+        if (v == 0) { return "0"; }
+        while (v > 0) {
+            s = "" + digits[v % 16] + s;
+            v = v / 16;
+        }
+        return s;
+    }
+
+    static void Main() {
+        // ---- 1. Code-point counting -------------------------------------
+        Console.WriteLine(Text.Chars("") + " " + Text.Chars("abc")
+            + " " + Text.Chars("中文"));
+        Console.WriteLine(Text.Chars(ThumbsUp()) + " "
+            + Text.Chars("a" + ThumbsUp() + "b"));
+
+        // ---- 2. UTF-8 decode (CpAt) -------------------------------------
+        Console.WriteLine(Hex(Text.CpAt("A", 0)) + " " + Hex(Text.CpAt("中", 0))
+            + " " + Hex(Text.CpAt(ThumbsUp(), 0)));
+
+        // ---- 3. Grapheme clusters (chars vs graphemes) ------------------
+        Console.WriteLine(Text.Chars(Combining()) + " " + Text.Graphemes(Combining()));
+        Console.WriteLine(Text.Chars(Flag()) + " " + Text.Graphemes(Flag()));
+        Console.WriteLine(Text.Chars(Keycap()) + " " + Text.Graphemes(Keycap()));
+        Console.WriteLine(Text.Chars(Family()) + " " + Text.Graphemes(Family()));
+        Console.WriteLine(Text.Chars("hello") + " " + Text.Graphemes("hello"));
+
+        // ---- 4. Built-in filters + count text ---------------------------
+        Console.WriteLine("[" + Input.OnlyDigits("a1b2 3") + "]");
+        Console.WriteLine("[" + Input.NoSpaces("  hi there  ") + "]");
+        Console.WriteLine(Input.CountText(5, 30) + " | "
+            + Input.CountText(150, 200) + " | " + Input.CountText(7, 0));
+
+        // ---- 5. Input Insert gate (filter + MaxLen + rollback) ----------
+        Input num = new Input("n");
+        int changes = 0;
+        num.Change += () => { changes = changes + 1; };
+        num.MaxLen = 3;
+        num.Filter = Input.OnlyDigits;
+        num.SetText("");
+        Console.WriteLine(num.Insert("12") + " '" + num.GetText() + "' c=" + changes);
+        // Would push past MaxLen -> rejected, no state change, no event.
+        Console.WriteLine(num.Insert("34") + " '" + num.GetText() + "' c=" + changes);
+        // Non-digits filtered away entirely -> zero net change, silent.
+        Console.WriteLine(num.Insert("x") + " '" + num.GetText() + "' c=" + changes);
+        // "9x" at "12": candidate "129x", filter trims to "129" (3 chars,
+        // fits MaxLen 3) -> accepted with a rewritten text.
+        Console.WriteLine(num.Insert("9x") + " '" + num.GetText() + "' c=" + changes);
+        Console.WriteLine(num.CountValue());
+
+        // ---- 6. Status sanitization + designer round-trip ---------------
+        Input f = new Input("f");
+        f.SetStatus("warning");
+        Console.WriteLine("'" + f.GetProp("status") + "'");
+        f.SetStatus("bogus");
+        Console.WriteLine("'" + f.GetProp("status") + "'");
+        f.SetProp("maxlen", "20");
+        f.SetProp("showCount", "true");
+        f.SetProp("round", "true");
+        Console.WriteLine(f.MaxLen + " " + f.GetProp("showCount") + " "
+            + f.GetProp("round") + " " + f.GetProp("maxlen"));
+
+        // ---- 7. Grapheme counting through the widget -------------------
+        Input g = new Input("g");
+        g.CountGraphemes = true;
+        g.ShowCount = true;
+        g.MaxLen = 4;
+        g.SetText(ThumbsUp());
+        Console.WriteLine(g.CountValue() + " " + Input.CountText(g.CountValue(), g.MaxLen));
+        // A 2-flag-character (one cluster) append keeps the count at 2, so a
+        // further 3-cluster word trips the MaxLen=4 gate instead.
+        Console.WriteLine(g.Insert("abc") + " count=" + g.CountValue());
+        Console.WriteLine(g.Insert(Flag()) + " count=" + g.CountValue());
+
+        // ---- 8. Manual ops without a host are safe no-ops ---------------
+        g.Focus();
+        g.Blur();
+        g.ScrollToEnd();
+        g.ScrollToStart();
+        Console.WriteLine("manual-ops-survive '" + g.GetText() + "'");
+
+        // ---- 9. TextArea gate + status + count --------------------------
+        TextArea ta = new TextArea("t");
+        int tac = 0;
+        ta.Change += () => { tac = tac + 1; };
+        ta.MaxLen = 4;
+        ta.ShowCount = true;
+        ta.SetStatus("error");
+        Console.WriteLine("ta-status '" + ta.GetProp("status") + "'");
+        ta.SetStatus("nope");
+        Console.WriteLine("ta-status '" + ta.GetProp("status") + "'");
+        Console.WriteLine(ta.Insert("abc") + " '" + ta.GetText() + "' c=" + tac);
+        // "\n" rides the same gate and counts as one code point.
+        Console.WriteLine(ta.Insert("\n") + " count=" + ta.CountValue());
+        Console.WriteLine(ta.Insert("def") + " '" + ta.GetText() + "' c=" + tac);
+        ta.Filter = Input.NoSpaces;
+        ta.Clear();
+        Console.WriteLine(ta.Insert("  x  ") + " '" + ta.GetText() + "' c=" + tac);
+        ta.SetProp("maxlen", "9");
+        Console.WriteLine(ta.MaxLen + " " + ta.GetProp("showCount") + " " + ta.GetProp("round"));
+    }
+}

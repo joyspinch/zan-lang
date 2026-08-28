@@ -6,6 +6,11 @@ using Gui.Component.CodeEditor;
 
 namespace Gui.Widget;
 
+/// 输入过滤回调（Naive UI allow-input）：收到「插入后的完整候选
+/// 文本」，返回清洗后的文本；返回 null 表示拒绝这次插入。
+/// 用于「只允许数字」「不许前后空格」这类输入约束。
+delegate string InputFilterFn(string candidate);
+
 /// 带光标、占位符和响应式绑定的单行文本输入框。
 ///
 /// 保留式 C# 风格控件：拥有稳定标识（因此焦点在
@@ -19,6 +24,12 @@ namespace Gui.Widget;
 /// Delete、Left/Right/Home/End），就地编辑绑定的 SignalString，并将
 /// 光标位置上报给框架，使 IME 组合窗口
 /// 跟随光标移动。
+///
+/// 能力面（对齐 Naive UI Input）：`Disabled`（继承自 Control）、
+/// `SetStatus` 校验态描边、`Prefix`/`Suffix` 文字槽与 `PrefixIcon`、
+/// `Loading` 转圈、`ShowCount`+`MaxLen`(+`CountGraphemes`) 字数统计、
+/// `Round` 圆角、`PassiveActivated` 回车激活、`Filter` 输入过滤、
+/// 以及 Clear/Focus/Blur/SelectAll/ScrollToEnd 手动操作。
 class Input : Control {
     SignalString model;
     /// 双向绑定文本：`name.data = user.name;` 使输入框与
@@ -32,6 +43,10 @@ class Input : Control {
     // 任何普通光标移动或编辑时清除。
     int selAnchor;
     int wid;
+    /// 上一帧渲染时的宿主 App：手动操作（Focus/Blur/Clear/
+    /// ScrollToEnd）需要在事件回调里改焦点并请求重绘，而回调
+    /// 没有 app 形参——渲染沿顺手记一笔即可。
+    App liveApp;
     /// 密码掩码：设置后文本以 `*` 渲染，直到被明文显示。
     bool password;
     /// 掩码字段当前是否显示明文（通过眼睛图标切换）。
@@ -59,10 +74,48 @@ class Input : Control {
     bool Autoselect;
     /// 跟踪 autoselect 已执行过（防止每次获焦都全选）。
     bool autoselected;
-    /// 输入字节上限（>0 生效）。Input 内部按 UTF-8 字节计游标，
-    /// 因此这是字节长度而非字符数——一个 CJK 字符占 3 字节。
-    /// 0 表示不限。
+    /// 输入字符上限（>0 生效）。按码点计——一个 CJK 字符记 1，
+    /// `CountGraphemes` 打开时按字素簇计（👨‍‍👧 记 1）。
+    /// 与 `ShowCount` 显示的计数同一口径。0 表示不限。
     int MaxLen;
+
+    // ---- 增强：Naive UI Input 的能力面（前缀/后缀/字数/校验态/
+    // 加载/圆角/被动激活）全部走同一套「类选择器 + ::part」样式
+    // 层，控件代码只做几何与输入处理。 --------------------------------
+
+    /// 前缀 / 后缀文字槽（Naive UI prefix/suffix）。画在文本与图标
+    /// 之间，颜色来自 `input::prefix` / `input::suffix`。
+    string Prefix;
+    string Suffix;
+    /// 自定义图标名（Gui.Icon）：前缀槽用 `PrefixIcon`、后缀槽用
+    /// `iconTrail`；密码框用 `PasswordIcon`（默认 "eye"），清除钮用
+    /// `ClearIcon`（默认 "x"）。
+    string PrefixIcon;
+    string PasswordIcon;
+    string ClearIcon;
+    /// 是否显示字数统计（"当前 / 上限"）。上限来自 MaxLen；未设
+    /// MaxLen 时按纯显示处理（Naive UI show-count）。
+    bool ShowCount;
+    /// 字数统计与 MaxLen 是否按字素簇计数（Naive UI count-graphemes）。
+    /// false 时按码点计数。
+    bool CountGraphemes;
+    /// 加载态：后缀区画一个转圈指示器，并禁用编辑（Naive UI loading）。
+    bool Loading;
+    /// 圆角字段：整高半圆角（Naive UI round），走 `.round` 类，
+    /// 皮肤可覆写。
+    bool Round;
+    /// 校验状态：""/success/warning/error，映射到 base.css 的
+    /// 字段状态类。与 errMsg 独立（后者是具体消息文案）。
+    string FieldStatus;
+    /// 被动激活（Naive UI passively-activated）：聚焦后先不接收
+    /// 文本输入，按回车才开始编辑——避免误触 Tab 聚焦就吞掉输入。
+    bool PassiveActivated;
+    bool passiveActive;
+
+    /// 输入过滤（Naive UI allow-input）：返回清洗后的候选文本，
+    /// null 表示原样拒绝。用于「只允许数字」「trim 空白」这类
+    /// 输入约束。内置 `Input.OnlyDigits` / `Input.NoSpaces`。
+    InputFilterFn Filter;
 
     /// 立即模式工厂与保留模式构造函数共用的初始化函数：
     /// 设置 Control 基类（停靠顶部，使追加的输入框
@@ -83,6 +136,20 @@ class Input : Control {
         Clearable = false;
         Autoselect = false;
         autoselected = false;
+        Prefix = "";
+        Suffix = "";
+        PrefixIcon = "";
+        PasswordIcon = "";
+        ClearIcon = "";
+        ShowCount = false;
+        CountGraphemes = false;
+        Loading = false;
+        Round = false;
+        FieldStatus = "";
+        PassiveActivated = false;
+        passiveActive = false;
+        Filter = null;
+        liveApp = null;
         wiresOwnEvents = true;
         Change = new UiEvent();
         Submit = new UiEvent();
@@ -132,6 +199,98 @@ class Input : Control {
     void SelectAll() {
         selAnchor = 0;
         cursorPos = model.Get().Length;
+    }
+
+    /// 清空内容（Naive UI ref.clear()）。触发 Change，光标归零。
+    void Clear() {
+        if (model.Get() == "") { return; }
+        model.Set("");
+        cursorPos = 0;
+        selAnchor = -1;
+        Edited();
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+    }
+
+    /// 以编程方式把焦点抢到本输入框（Naive UI ref.focus()）。
+    /// 禁用态不响应。
+    void Focus() {
+        if (liveApp == null || this.IsDisabled()) { return; }
+        liveApp.focus.SetFocused(wid);
+        liveApp.RequestRedraw();
+    }
+
+    /// 交出焦点（Naive UI ref.blur()）。
+    void Blur() {
+        if (liveApp == null) { return; }
+        if (liveApp.focus.IsFocused(wid)) { liveApp.focus.ClearFocus(); }
+        liveApp.RequestRedraw();
+    }
+
+    /// 光标移到行尾（Naive UI ref.scrollTo 的等价物：渲染沿本来
+    /// 就会把光标滚进视口）。
+    void ScrollToEnd() {
+        cursorPos = model.Get().Length;
+        selAnchor = -1;
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+    }
+
+    /// 光标移到行首。
+    void ScrollToStart() {
+        cursorPos = 0;
+        selAnchor = -1;
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+    }
+
+    /// 设置校验状态（""/success/warning/error），即 base.css 的
+    /// 字段状态类。与 errMsg 互不影响：前者描边，后者带消息。
+    /// 非白名单值归一为 ""（设计器经 PropSpec 直写字段时，渲染沿兜底同见）。
+    void SetStatus(string v) {
+        string s = Control.StatusSanitize(v);
+        if (s == FieldStatus) { return; }
+        FieldStatus = s;
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+    }
+
+    // ---- 计数与过滤（纯函数，无窗口即可验证） ------------------------
+
+    /// 当前文本的计数值（按 CountGraphemes 口径）。
+    int CountOf(string s) {
+        if (CountGraphemes) { return Text.Graphemes(s); }
+        return Text.Chars(s);
+    }
+
+    /// 当前文本的计数值。
+    int CountValue() { return this.CountOf(model.Get()); }
+
+    /// 字数统计的显示文本："当前 / 上限"；计数超过 99 时上限侧
+    /// 截为 "99+"（Naive UI 的显示口径）。
+    static string CountText(int count, int max) {
+        string cur = "";
+        if (count > 99) { cur = "99+"; } else { cur = Convert.ToString(count); }
+        if (max <= 0) { return cur; }
+        return cur + " / " + Convert.ToString(max);
+    }
+
+    /// 内置过滤器：只允许数字（Naive UI allow-input 示例一）。
+    static string OnlyDigits(string s) {
+        string outStr = "";
+        int i = 0;
+        while (i < s.Length) {
+            int e = Text.NextCharEnd(s, i);
+            string ch = s.Substring(i, e - i);
+            if (ch.Length == 1) {
+                int b = s[i];
+                if (b >= 48 && b <= 57) { outStr = outStr + ch; }
+            }
+            i = e;
+        }
+        return outStr;
+    }
+
+    /// 内置过滤器：不许有前后空格（Naive UI allow-input 示例二，
+    /// 边输边 trim；词与词之间的空格照常输入）。
+    static string NoSpaces(string s) {
+        return TextWrap.Trim(s);
     }
 
     /// 给字段标记校验错误；绘制红色边框，并显示
@@ -196,10 +355,73 @@ class Input : Control {
         selAnchor = -1;
     }
 
+    /// 插入的唯一闸门：先替换选区，再过宿主过滤器与字符上限。
+    /// 被拒绝时完整回滚（选区也还回去）——"30 上限里再敲一个
+    /// 字"不应有任何可见变化。过滤后整体被改写时（在 "12" 的
+    /// 数字框中间插 "a" → "12"），光标按净增字节平移，不会被
+    /// trim 式过滤器甩到文末。上限按 CountOf 口径计，与字数
+    /// 统计显示同一个数。
+    bool Insert(string s) {
+        string orig = model.Get();
+        int origCursor = cursorPos;
+        int origAnchor = selAnchor;
+        bool hadSel = HasSel();
+        if (hadSel) { DeleteSel(); }
+        string txt = model.Get();
+        string cand = Text.InsertAt(txt, cursorPos, s);
+        string final = cand;
+        if (Filter != null) { final = Filter(cand); }
+        if (final == null
+            || (MaxLen > 0 && this.CountOf(final) > MaxLen)) {
+            model.Set(orig);
+            cursorPos = origCursor;
+            selAnchor = origAnchor;
+            return false;
+        }
+        int delta = final.Length - cand.Length;
+        int cp = cursorPos + s.Length + delta;
+        if (cp < 0) { cp = 0; }
+        if (cp > final.Length) { cp = final.Length; }
+        if (final == txt && cp == cursorPos && !hadSel) {
+            // 净零变化（插入即被过滤掉）：不发 Change、不动状态。
+            selAnchor = -1;
+            return false;
+        }
+        model.Set(final);
+        cursorPos = cp;
+        selAnchor = -1;
+        Edited();
+        return true;
+    }
+
+    /// 退格/删除的候选整体再过一次过滤器：删掉词边界上的字母
+    /// 可能"暴露"出前后空格（NoSpaces 场景），删除路径也要被
+    /// 清洗。返回 false 表示过滤器拒绝该结果。
+    bool DeleteCandidate(string cand) {
+        string final = cand;
+        if (Filter != null) { final = Filter(cand); }
+        if (final == null) { return false; }
+        if (final == model.Get()) { return false; }
+        model.Set(final);
+        if (cursorPos > final.Length) { cursorPos = final.Length; }
+        if (selAnchor > final.Length) { selAnchor = final.Length; }
+        Edited();
+        return true;
+    }
+
     void HandleInput(App app) {
         ClampCursor();
         int kind = app.EventKind();
         string txt = model.Get();
+        // 被动激活：聚焦后先用回车"解锁"，解锁前不消费任何编辑键
+        // （Naive UI passively-activated：Tab 聚焦不该吞掉输入）。
+        if (PassiveActivated && !passiveActive) {
+            if (kind == 6 && app.window.EventKeyCode() == 13) {
+                passiveActive = true;
+                app.RequestRedraw();
+            }
+            return;
+        }
         if (kind == 6) {
             int code = app.window.EventKeyCode();
             if (code == 8) {
@@ -209,9 +431,9 @@ class Input : Control {
                     app.RequestRedraw();
                 } else if (cursorPos > 0) {
                     int start = Text.PrevCharStart(txt, cursorPos);
-                    model.Set(Text.DeleteBefore(txt, cursorPos));
-                    cursorPos = start;
-                    Edited();
+                    if (this.DeleteCandidate(Text.DeleteBefore(txt, cursorPos))) {
+                        cursorPos = start;
+                    }
                     app.RequestRedraw();
                 }
             } else if (code == 13) {
@@ -222,15 +444,8 @@ class Input : Control {
             } else {
                 string ch = Text.CharStr(code);
                 if (ch.Length > 0) {
-                    if (HasSel()) { DeleteSel(); txt = model.Get(); }
-                    // MaxLen 字节上限：放不下的插入直接忽略。
-                    if (MaxLen <= 0 || txt.Length + ch.Length <= MaxLen) {
-                        model.Set(Text.InsertAt(txt, cursorPos, ch));
-                        cursorPos = cursorPos + ch.Length;
-                        selAnchor = -1;
-                        Edited();
-                        app.RequestRedraw();
-                    }
+                    // IME 组合：直接插入（上限/过滤同样生效）。
+                    if (this.Insert(ch)) { app.RequestRedraw(); }
                 }
             }
         } else if (kind == 4) {
@@ -256,15 +471,10 @@ class Input : Control {
                     app.RequestRedraw();
                 }
             } else if (ctrl && kc == 86) {
-                // Ctrl+V：粘贴并覆盖选区。
+                // Ctrl+V：粘贴（整段走同一过滤+上限闸门）。
                 string clip = Clipboard.GetText();
                 if (clip.Length > 0) {
-                    if (HasSel()) { DeleteSel(); txt = model.Get(); }
-                    model.Set(Text.InsertAt(txt, cursorPos, clip));
-                    cursorPos = cursorPos + clip.Length;
-                    selAnchor = -1;
-                    Edited();
-                    app.RequestRedraw();
+                    if (this.Insert(clip)) { app.RequestRedraw(); }
                 }
             } else if (kc == 37 || kc == 39 || kc == 36 || kc == 35) {
                 // 方向键/Home/End：Shift 从光标处扩展选区；
@@ -293,9 +503,9 @@ class Input : Control {
                     Edited();
                     app.RequestRedraw();
                 } else if (cursorPos < txt.Length) {
-                    model.Set(Text.RemoveAt(txt, cursorPos));
-                    Edited();
-                    app.RequestRedraw();
+                    if (this.DeleteCandidate(Text.RemoveAt(txt, cursorPos))) {
+                        app.RequestRedraw();
+                    }
                 }
             }
         }
@@ -305,9 +515,12 @@ class Input : Control {
         int id = wid;
         Canvas c = app.canvas;
         Theme t = app.theme;
+        // 事件回调没有 app 形参，渲染沿记一笔宿主供手动操作使用。
+        liveApp = app;
 
+        bool off = this.IsDisabled();
         app.focus.RegisterFocusable(id);
-        bool focused = app.focus.IsFocused(id);
+        bool focused = app.focus.IsFocused(id) && !off;
 
         // Size 字段映射为 Class 片段（small/medium/large），
         // base.css 的 input.small/large 规则负责重设高度/字号。
@@ -316,6 +529,12 @@ class Input : Control {
         if (Size != null) { szv = Size.Get(); }
         this.AddClass(Control.SizeClass(szv));
         // medium 是默认，不附加。
+        // 校验状态与圆角同理：`.success/.warning/.error` 描边
+        // （base.css 已有），`.round` 整高半圆角。设计器可经
+        // PropSpec 直写字段，脏值先过白名单，不会长出没人认的 class。
+        string stCls = Control.StatusSanitize(FieldStatus);
+        if (stCls != "") { this.AddClass(stCls); }
+        if (Round) { this.AddClass("round"); }
 
         if (focused) {
             // Autoselect: 首次获焦时全选。
@@ -325,7 +544,10 @@ class Input : Control {
             }
             HandleInput(app);
         }
-        if (!focused) { autoselected = false; }
+        if (!focused) {
+            autoselected = false;
+            passiveActive = false;
+        }
 
         SyncBinding();
         string txt = model.Get();
@@ -335,7 +557,7 @@ class Input : Control {
         // 来自样式层，因此皮肤的 `input:hover / input:focus`
         // 规则即可重设字段样式，无需改动此代码。
         StyleBox s = this.ResolveEasedStyleAsIn(
-            app, id, "input", Class, false, false, x, y, w, h);
+            app, id, "input", Class, off, false, x, y, w, h);
         s.Paint(app, x, y, w, h);
         int fs = s.FontOr(Style.FontFallback(app, "medium"));
         int accent = s.accent;
@@ -350,18 +572,46 @@ class Input : Control {
         }
 
         int pad = s.PadLOr(t.paddingSmall);
-        // 为每个图标预留方形槽位，文本不会跑到图标下面。
-        // 密码框始终在尾端带一个眼睛切换图标。
+        // 尾端槽从右往左排：清除钮 / 密码眼 / 加载圈 共用一个图标位
+        // （优先级 loading > clear > eye > iconTrail），其后是后缀
+        // 文字、字数统计。前缀槽与前置图标在最左。
         int glyphSz = fs;
+        string preIcon = iconLead;
+        if (preIcon == "" && PrefixIcon != "") { preIcon = PrefixIcon; }
+        string pfx = "";
+        if (Prefix != null) { pfx = Prefix; }
+        string sfx = "";
+        if (Suffix != null) { sfx = Suffix; }
+        bool showClear = Clearable && txt != "" && !off && !Loading
+            && (focused || app.focus.IsHovered(id));
+        bool passEye = password && !showClear && !Loading;
         string trailIcon = iconTrail;
-        if (password) { trailIcon = "eye"; }
-        // Clearable：文本非空且获焦时在尾端附加 X 清除按钮。
-        bool showClear = Clearable && txt != "" && focused;
-        if (showClear) { trailIcon = "x"; }
+        if (passEye) {
+            trailIcon = PasswordIcon;
+            if (trailIcon == "") { trailIcon = "eye"; }
+        }
+        if (showClear) {
+            trailIcon = ClearIcon;
+            if (trailIcon == "") { trailIcon = "x"; }
+        }
+        // loading 时不画静态图标，转圈单独绘制（占同一槽位）。
+        bool trailArea = Loading || trailIcon != "";
+        int iconW = 0;
+        if (trailArea) { iconW = glyphSz + pad; }
+        int sfxW = 0;
+        if (sfx != "") { sfxW = Canvas.MeasureText(sfx, fs) + pad; }
+        string countTxt = "";
+        int countW = 0;
+        if (ShowCount) {
+            int n = this.CountOf(txt);
+            countTxt = Input.CountText(n, MaxLen);
+            int cfs = Style.FontFallback(app, "small");
+            countW = Canvas.MeasureText(countTxt, cfs) + pad;
+        }
         int leadSlot = 0;
-        if (iconLead != "") { leadSlot = glyphSz + pad; }
-        int trailSlot = 0;
-        if (trailIcon != "") { trailSlot = glyphSz + pad; }
+        if (preIcon != "") { leadSlot = leadSlot + glyphSz + pad; }
+        if (pfx != "") { leadSlot = leadSlot + Canvas.MeasureText(pfx, fs) + pad; }
+        int trailSlot = iconW + sfxW + countW;
         int innerX = x + pad + leadSlot;
         int innerW = w - pad - s.PadROr(t.paddingSmall) - leadSlot - trailSlot;
         if (innerW < 0) { innerW = 0; }
@@ -369,8 +619,16 @@ class Input : Control {
         // 掩码显示：字节长度不变，cursorPos 仍可正确索引。
         string disp = txt;
         if (password && !reveal) { disp = Input.Mask(txt); }
-        int trailX = x + w - trailSlot;
-        bool onTrail = trailSlot > 0 && app.mouseX >= trailX
+        int iconX = x + w - s.PadROr(t.paddingSmall) - iconW + pad;
+        int sfxX = iconX + iconW - sfxW;
+        if (!trailArea && sfxW > 0) { sfxX = x + w - s.PadROr(t.paddingSmall) - sfxW; }
+        int countX = sfxX;
+        if (countW > 0) {
+            int rEdge = x + w - s.PadROr(t.paddingSmall);
+            if (trailArea) { rEdge = rEdge - iconW - sfxW; }
+            countX = rEdge - countW;
+        }
+        bool onTrail = trailArea && !off && app.mouseX >= iconX
             && app.mouseX < x + w && app.mouseY >= y && app.mouseY < y + h;
 
         StyleBox placeholderStyle = this.ResolveEasedPartAsIn(
@@ -419,31 +677,70 @@ class Input : Control {
         }
         c.PopClip();
 
-        // 图标位于文本裁剪区外预留的填充槽位中，因此
-        // 它们要在 PopClip 之后绘制——否则文本裁剪区（只覆盖
-        // innerX..innerX+innerW）会把它们裁掉，什么都看不到。
-        if (iconLead != "" || trailIcon != "") {
+        // 槽位文字/图标位于文本裁剪区之外，在 PopClip 之后绘制。
+        // 前后缀文字颜色来自 `input::prefix` / `input::suffix`。
+        int slotX = x + pad;
+        if (preIcon != "") {
+            StyleBox iconStyle = this.ResolvePartAs(
+                app, "input", "icon", "", Class, Style.SNormal());
+            c.DrawGlyphIn(preIcon, slotX, y, glyphSz, h, glyphSz,
+                iconStyle.FgOr(s.fg));
+            slotX = slotX + glyphSz + pad;
+        }
+        if (pfx != "") {
+            StyleBox pfxStyle = this.ResolvePartAs(
+                app, "input", "prefix", "", Class, Style.SNormal());
+            c.DrawText(slotX, textY, pfx, pfxStyle.FgOr(s.fg), fs);
+        }
+        if (sfx != "") {
+            StyleBox sfxStyle = this.ResolvePartAs(
+                app, "input", "suffix", "", Class, Style.SNormal());
+            c.DrawText(sfxX, textY, sfx, sfxStyle.FgOr(s.fg), fs);
+        }
+        // 字数统计：右对齐在文本与后缀之间（`input::count`，小一号）。
+        if (countTxt != "") {
+            StyleBox countStyle = this.ResolvePartAs(
+                app, "input", "count", "", Class, Style.SNormal());
+            int cfs = countStyle.FontOr(Style.FontFallback(app, "small"));
+            c.DrawText(countX, Canvas.CenterTextY(y, h, cfs), countTxt,
+                       countStyle.FgOr(s.fg), cfs);
+        }
+        if (Loading) {
+            // 8 点转圈，墙钟相位每 90ms 一步（与 Spin 同一节奏），
+            // 头部用强调色。限制重绘只在框可见时。
+            int active = (Window.GetTickMs() / 90) % 8;
+            int spinC = s.AccentOr(accent);
+            int faintC = App.WithAlpha(spinC, 80);
+            int dotR = glyphSz / 8;
+            if (dotR < app.Scale(1)) { dotR = app.Scale(1); }
+            int cx = iconX + iconW / 2 - pad / 2;
+            int cy = y + h / 2;
+            int ring = glyphSz / 2 - dotR - app.Scale(1);
+            if (ring < 1) { ring = 1; }
+            for (int i = 0; i < 8; i = i + 1) {
+                int px = cx + (ring * Spin.OffX(i)) / 1000;
+                int py = cy + (ring * Spin.OffY(i)) / 1000;
+                int d = (active - i + 8) % 8;
+                c.FillCircle(px, py, dotR + (d == 0 ? app.Scale(1) : 0),
+                             d <= 1 ? spinC : faintC);
+            }
+            app.RequestAnimationFrameIn(90, iconX, y, iconW, h);
+        } else if (trailIcon != "") {
             // 图标颜色来自 `input::icon`：悬停用 :hover，密码明文
             // （眼睛常亮）用 :selected。
             StyleBox iconStyle = this.ResolvePartAs(
                 app, "input", "icon", "", Class, Style.SNormal());
-            if (iconLead != "") {
-                c.DrawGlyphIn(iconLead, x + pad, y, glyphSz, h, glyphSz,
-                    iconStyle.FgOr(s.fg));
+            int iconState = Style.SNormal();
+            if (onTrail) { iconState = Style.SHover(); }
+            if (password && reveal && !showClear) {
+                iconState = iconState + Style.SSelected();
             }
-            if (trailIcon != "") {
-                int iconState = Style.SNormal();
-                if (onTrail) { iconState = Style.SHover(); }
-                if (password && reveal) {
-                    iconState = iconState + Style.SSelected();
-                }
-                if (iconState != Style.SNormal()) {
-                    iconStyle = this.ResolvePartAs(
-                        app, "input", "icon", "", Class, iconState);
-                }
-                c.DrawGlyphIn(trailIcon, trailX, y, glyphSz, h, glyphSz,
-                              iconStyle.FgOr(s.fg));
+            if (iconState != Style.SNormal()) {
+                iconStyle = this.ResolvePartAs(
+                    app, "input", "icon", "", Class, iconState);
             }
+            c.DrawGlyphIn(trailIcon, iconX, y, glyphSz, h, glyphSz,
+                          iconStyle.FgOr(s.fg));
         }
         // 校验消息显示在字段下方（在 PopClip 之后绘制，
         // 文本裁剪区无法截断它）。
@@ -458,23 +755,19 @@ class Input : Control {
         // 密码明文 / 清空按钮点击：都在尾端图标上释放左键。
         if (onTrail && app.EventKind() == 3
                 && app.window.EventButton() == 0 && app.ClickAvailable()) {
-            if (password) {
+            if (showClear) {
+                this.Clear();
+            } else if (password) {
                 reveal = !reveal;
-            } else if (showClear) {
-                // Clearable: 清空内容，触发 Change，置光标到行首。
-                model.Set("");
-                cursorPos = 0;
-                selAnchor = -1;
-                Edited();
+                app.RequestRedraw();
             }
             app.ClaimClick();
-            app.RequestRedraw();
         }
 
         // 鼠标选择：按下锚定选区并放置光标；
         // 按住拖动移动光标端；松开保留选区
         // （收起为空的选区清除锚点）。
-        if (Ui.PressedDown(app, id) && !onTrail) {
+        if (Ui.PressedDown(app, id) && !onTrail && !off) {
             int rel = app.mouseX - innerX + scrollX;
             cursorPos = CodeEditor.ColFromX(disp, rel, fs);
             if (Modifiers.HasShift(app.window.EventMods()) && selAnchor >= 0) {
@@ -494,7 +787,7 @@ class Input : Control {
         }
         // 单消费者点击：当本输入框是框架解析出的
         // 点击目标时，放置光标。
-        if (Ui.Clicked(app, id) && !onTrail) {
+        if (Ui.Clicked(app, id) && !onTrail && !off) {
             int rel = app.mouseX - innerX + scrollX;
             cursorPos = CodeEditor.ColFromX(disp, rel, fs);
             if (selAnchor == cursorPos) { selAnchor = -1; }
@@ -531,6 +824,32 @@ class Input : Control {
         PropSpec asel = PropSpec.Bool("autoselect", "Autoselect");
         asel.flag = Autoselect;
         ps.Add(asel);
+        PropSpec pfx = PropSpec.Text("prefix", "Prefix");
+        pfx.str = Prefix;
+        ps.Add(pfx);
+        PropSpec sfx = PropSpec.Text("suffix", "Suffix");
+        sfx.str = Suffix;
+        ps.Add(sfx);
+        PropSpec st = PropSpec.Enum("status", "Status",
+            new List<string>{ "", "success", "warning", "error" });
+        st.str = FieldStatus;
+        ps.Add(st);
+        PropSpec ml = PropSpec.Int("maxlen", "MaxLen");
+        ml.num = MaxLen;
+        ml.Step(1, 0, 4096);
+        ps.Add(ml);
+        PropSpec sc = PropSpec.Bool("showCount", "ShowCount");
+        sc.flag = ShowCount;
+        ps.Add(sc);
+        PropSpec rd = PropSpec.Bool("round", "Round");
+        rd.flag = Round;
+        ps.Add(rd);
+        PropSpec ld = PropSpec.Bool("loading", "Loading");
+        ld.flag = Loading;
+        ps.Add(ld);
+        PropSpec pa = PropSpec.Bool("passive", "PassiveActivated");
+        pa.flag = PassiveActivated;
+        ps.Add(pa);
         return ps;
     }
 
@@ -550,6 +869,15 @@ class Input : Control {
         if (key == "password") { password = (val == "true"); return true; }
         if (key == "iconLead" || key == "icon") { iconLead = val; return true; }
         if (key == "iconTrail") { iconTrail = val; return true; }
+        if (key == "prefixIcon" || key == "iconLead2") {
+            PrefixIcon = val; return true;
+        }
+        if (key == "passwordIcon") { PasswordIcon = val; return true; }
+        if (key == "clearIcon") { ClearIcon = val; return true; }
+        if (key == "status") { this.SetStatus(val); return true; }
+        if (key == "countGraphemes") {
+            CountGraphemes = (val == "true"); return true;
+        }
         return false;
     }
 

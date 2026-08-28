@@ -137,6 +137,81 @@ class Text {
         if (pos <= 0) { return s; }
         return Text.Left(s, Text.PrevCharStart(s, pos)) + Text.Right(s, pos);
     }
+
+    /// `s` 里的码点个数（一个 CJK 字 / 一个基础 emoji 记 1，与字节数
+    /// 无关）。字符上限与字数统计都按这个口径。
+    static int Chars(string s) {
+        int n = 0;
+        int i = 0;
+        while (i < s.Length) { i = Text.NextCharEnd(s, i); n = n + 1; }
+        return n;
+    }
+
+    /// `pos` 处码点的数值（越界返回 -1）。按 UTF-8 前导字节还原：
+    /// n 字节序列取前导字节低 7-n 位，续字节各取低 6 位。
+    static int CpAt(string s, int pos) {
+        int len = s.Length;
+        if (pos < 0 || pos >= len) { return -1; }
+        int b = s[pos];
+        int n = Text.SeqLen(b);
+        if (n == 1) { return b; }
+        int mask = 0xFF >> (n + 1);
+        int cp = b & mask;
+        int k = 1;
+        while (k < n) { cp = cp * 64 + (s[pos + k] & 63); k = k + 1; }
+        return cp;
+    }
+
+    /// 码点是否属于"并入前一簇"的扩展集（简化规则，覆盖 emoji 与
+    /// 带音拉丁字母的常见情形）：Mn 组合段、符号组合段、变体选择符、
+    /// 半标记、组合键帽、肤色修饰符、emoji tag、韩文字母尾音段。
+    static bool IsExtend(int cp) {
+        if (cp >= 0x0300 && cp <= 0x036F) { return true; }
+        if (cp >= 0x20D0 && cp <= 0x20FF) { return true; }
+        if (cp >= 0xFE00 && cp <= 0xFE0F) { return true; }
+        if (cp >= 0xFE20 && cp <= 0xFE2F) { return true; }
+        if (cp == 0x20E3) { return true; }
+        if (cp >= 0x1F3FB && cp <= 0x1F3FF) { return true; }
+        if (cp >= 0xE0020 && cp <= 0xE007F) { return true; }
+        if (cp >= 0x1160 && cp <= 0x11FF) { return true; }
+        if (cp >= 0xD7B0 && cp <= 0xD7FF) { return true; }
+        return false;
+    }
+
+    /// `s` 里的字素簇个数（Naive UI `count-graphemes` 的口径）。在码点
+    /// 计数上合并扩展簇：区域指示符成对（🇨🇳=1）、零宽连接符把后一个
+    /// 码点并入同簇（👨‍👩‍👧=1）、其余组合标记/变体/肤色/tag
+    /// 并入当前簇（💐️=1、🥷🏿=1）。
+    static int Graphemes(string s) {
+        int n = 0;
+        int len = s.Length;
+        int i = 0;
+        while (i < len) {
+            int cp = Text.CpAt(s, i);
+            int p = Text.NextCharEnd(s, i);
+            // 区域指示符：恰好吞掉紧随的第二个。
+            if (cp >= 0x1F1E6 && cp <= 0x1F1FF && p < len) {
+                int cp2 = Text.CpAt(s, p);
+                if (cp2 >= 0x1F1E6 && cp2 <= 0x1F1FF) {
+                    p = Text.NextCharEnd(s, p);
+                }
+            }
+            // 吞掉扩展段：组合标记直接并；ZWJ 再把后一个码点并进来。
+            while (p < len) {
+                int q = Text.CpAt(s, p);
+                if (q == 0x200D) {
+                    p = Text.NextCharEnd(s, p);
+                    if (p < len) { p = Text.NextCharEnd(s, p); }
+                    continue;
+                }
+                if (Text.IsExtend(q)) { p = Text.NextCharEnd(s, p); continue; }
+                break;
+            }
+            i = p;
+            n = n + 1;
+        }
+        return n;
+    }
 }
 
 /// 位于 `Text` 类之外的文本辅助函数，这样声明了同名

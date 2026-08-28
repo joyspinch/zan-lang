@@ -28,6 +28,11 @@ namespace Gui.Widget;
 ///   TextArea body = new TextArea("Write something...");
 ///   body.Dock(Dock.Top()).Prefer(0, 90);
 ///   root.Add(body);
+///
+/// 能力面（对齐 Naive UI 的 type="textarea"）：`Disabled`（继承自
+/// Control）、`SetStatus` 校验态描边、`ShowCount`+`MaxLen`
+/// (+`CountGraphemes`) 字数统计、`Round` 圆角、`Filter` 输入过滤，
+/// 以及 Clear/Focus/Blur/SelectAll/ScrollToEnd 手动操作。
 /// </summary>
 class TextArea : Control {
     SignalString model;
@@ -71,6 +76,23 @@ class TextArea : Control {
     bool readOnly;
     /// 高度跟着内容走（放进滚动列里的正文用），而不是固定一格。
     bool autoHeight;
+    /// 由本帧渲染沿记一笔宿主 App：手动操作（Focus/Blur/Clear/
+    /// ScrollToEnd）要在没有 app 形参的事件回调里改焦点、请求重绘。
+    App liveApp;
+    /// 输入字符上限（>0 生效），按码点计；CountGraphemes 打开时按
+    /// 字素簇计（与 ShowCount 显示同一口径）。0 表示不限。
+    int MaxLen;
+    /// 是否显示字数统计（"当前 / 上限"），画在框内右下角。
+    bool ShowCount;
+    /// 计数口径：true 按字素簇，false 按码点。
+    bool CountGraphemes;
+    /// 校验状态：""/success/warning/error，映射 base.css 字段状态类。
+    string FieldStatus;
+    /// 圆角框（整高半圆角），走 `.round` 类。
+    bool Round;
+    /// 输入过滤（Naive UI allow-input）：收到插入后的完整候选文本，
+    /// 返回清洗后的文本；null 表示拒绝该插入。
+    InputFilterFn Filter;
     /// 文本变化时触发（C# 风格：`area.Change += h;`）。
     UiEvent Change;
 
@@ -96,6 +118,13 @@ class TextArea : Control {
         errMsg = "";
         readOnly = false;
         autoHeight = false;
+        liveApp = null;
+        MaxLen = 0;
+        ShowCount = false;
+        CountGraphemes = false;
+        FieldStatus = "";
+        Round = false;
+        Filter = null;
         wiresOwnEvents = true;
         Change = new UiEvent();
     }
@@ -199,6 +228,71 @@ class TextArea : Control {
         errMsg = "";
     }
 
+    // ---- 增强：与 Input 同款的校验状态、计数与手动操作 ----------------
+
+    /// 设置校验状态（""/success/warning/error），即 base.css 的字段
+    /// 状态类。与 errMsg 互不影响：前者描边，后者带消息。
+    void SetStatus(string v) {
+        string s = Control.StatusSanitize(v);
+        if (s == FieldStatus) { return; }
+        FieldStatus = s;
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+    }
+
+    /// 当前文本的计数值（按 CountGraphemes 口径）。
+    int CountOf(string s) {
+        if (CountGraphemes) { return Text.Graphemes(s); }
+        return Text.Chars(s);
+    }
+
+    /// 当前文本的计数值。
+    int CountValue() { return this.CountOf(model.Get()); }
+
+    /// 选中全部文本（等同于用户按 Ctrl+A）。
+    void SelectAll() {
+        selAnchor = 0;
+        cursorPos = model.Get().Length;
+    }
+
+    /// 清空内容（Naive UI ref.clear()）。触发 Change，光标归零。
+    void Clear() {
+        if (model.Get() == "") { return; }
+        model.Set("");
+        cursorPos = 0;
+        selAnchor = -1;
+        Edited();
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+    }
+
+    /// 以编程方式把焦点抢到本文本框（Naive UI ref.focus()）。
+    /// 禁用态不响应。
+    void Focus() {
+        if (liveApp == null || this.IsDisabled()) { return; }
+        liveApp.focus.SetFocused(wid);
+        liveApp.RequestRedraw();
+    }
+
+    /// 交出焦点（Naive UI ref.blur()）。
+    void Blur() {
+        if (liveApp == null) { return; }
+        if (liveApp.focus.IsFocused(wid)) { liveApp.focus.ClearFocus(); }
+        liveApp.RequestRedraw();
+    }
+
+    /// 光标移到文末（渲染沿本就会把光标滚进视口）。
+    void ScrollToEnd() {
+        cursorPos = model.Get().Length;
+        selAnchor = -1;
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+    }
+
+    /// 光标移到文首。
+    void ScrollToStart() {
+        cursorPos = 0;
+        selAnchor = -1;
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+    }
+
     void ClampCursor() {
         string txt = model.Get();
         if (cursorPos > txt.Length) { cursorPos = txt.Length; }
@@ -224,6 +318,56 @@ class TextArea : Control {
         model.Set(txt.Substring(0, s) + txt.Substring(e, txt.Length - e));
         cursorPos = s;
         selAnchor = -1;
+    }
+
+    /// 插入的唯一闸门：先替换选区，再过宿主过滤器与字符上限。
+    /// 被拒绝时完整回滚（选区也还回去）。与 Input 同款：过滤后
+    /// 整体被改写时光标按净增字节平移，上限按 CountOf 口径计。
+    bool Insert(string s) {
+        string orig = model.Get();
+        int origCursor = cursorPos;
+        int origAnchor = selAnchor;
+        bool hadSel = HasSel();
+        if (hadSel) { DeleteSel(); }
+        string txt = model.Get();
+        string cand = Text.InsertAt(txt, cursorPos, s);
+        string final = cand;
+        if (Filter != null) { final = Filter(cand); }
+        if (final == null
+            || (MaxLen > 0 && this.CountOf(final) > MaxLen)) {
+            model.Set(orig);
+            cursorPos = origCursor;
+            selAnchor = origAnchor;
+            return false;
+        }
+        int delta = final.Length - cand.Length;
+        int cp = cursorPos + s.Length + delta;
+        if (cp < 0) { cp = 0; }
+        if (cp > final.Length) { cp = final.Length; }
+        if (final == txt && cp == cursorPos && !hadSel) {
+            // 净零变化（插入即被过滤掉）：不发 Change、不动状态。
+            selAnchor = -1;
+            return false;
+        }
+        model.Set(final);
+        cursorPos = cp;
+        selAnchor = -1;
+        Edited();
+        return true;
+    }
+
+    /// 退格/删除的候选整体再过一次过滤器：删除路径也可能"暴露"
+    /// 出非法文本（如 trim 场景删掉词边界字母露出空格）。
+    bool DeleteCandidate(string cand) {
+        string final = cand;
+        if (Filter != null) { final = Filter(cand); }
+        if (final == null) { return false; }
+        if (final == model.Get()) { return false; }
+        model.Set(final);
+        if (cursorPos > final.Length) { cursorPos = final.Length; }
+        if (selAnchor > final.Length) { selAnchor = final.Length; }
+        Edited();
+        return true;
     }
 
     /// 文本按行返回，每次编辑最多拆分一次。
@@ -354,31 +498,20 @@ class TextArea : Control {
                     app.RequestRedraw();
                 } else if (cursorPos > 0) {
                     int start = Text.PrevCharStart(txt, cursorPos);
-                    model.Set(Text.DeleteBefore(txt, cursorPos));
-                    cursorPos = start;
-                    Edited();
+                    if (this.DeleteCandidate(Text.DeleteBefore(txt, cursorPos))) {
+                        cursorPos = start;
+                    }
                     app.RequestRedraw();
                 }
             } else if (code == 13) {
-                if (HasSel()) { DeleteSel(); txt = model.Get(); }
-                model.Set(Text.InsertAt(txt, cursorPos, "\n"));
-                cursorPos = cursorPos + 1;
-                Edited();
-                app.RequestRedraw();
+                // 换行走同一闸门：上限/过滤对 Enter 同样生效。
+                if (this.Insert("\n")) { app.RequestRedraw(); }
             } else if (code == 9) {
-                if (HasSel()) { DeleteSel(); txt = model.Get(); }
-                model.Set(Text.InsertAt(txt, cursorPos, "  "));
-                cursorPos = cursorPos + 2;
-                Edited();
-                app.RequestRedraw();
+                if (this.Insert("  ")) { app.RequestRedraw(); }
             } else {
                 string ch = Text.CharStr(code);
                 if (ch.Length > 0) {
-                    if (HasSel()) { DeleteSel(); txt = model.Get(); }
-                    model.Set(Text.InsertAt(txt, cursorPos, ch));
-                    cursorPos = cursorPos + ch.Length;
-                    Edited();
-                    app.RequestRedraw();
+                    if (this.Insert(ch)) { app.RequestRedraw(); }
                 }
             }
         } else if (kind == 4) {
@@ -405,16 +538,11 @@ class TextArea : Control {
                     app.RequestRedraw();
                 }
             } else if (ctrl && kc == 86) {
-                // Ctrl+V：粘贴并覆盖选区（多行文本整段插入）。
+                // Ctrl+V：粘贴并覆盖选区（整段走同一过滤+上限闸门）。
                 if (readOnly) { return; }
                 string clip = Clipboard.GetText();
                 if (clip.Length > 0) {
-                    if (HasSel()) { DeleteSel(); txt = model.Get(); }
-                    model.Set(Text.InsertAt(txt, cursorPos, clip));
-                    cursorPos = cursorPos + clip.Length;
-                    selAnchor = -1;
-                    Edited();
-                    app.RequestRedraw();
+                    if (this.Insert(clip)) { app.RequestRedraw(); }
                 }
             } else if (kc == 37 || kc == 39 || kc == 38 || kc == 40
                        || kc == 36 || kc == 35) {
@@ -458,9 +586,9 @@ class TextArea : Control {
                     Edited();
                     app.RequestRedraw();
                 } else if (cursorPos < txt.Length) {
-                    model.Set(Text.RemoveAt(txt, cursorPos));
-                    Edited();
-                    app.RequestRedraw();
+                    if (this.DeleteCandidate(Text.RemoveAt(txt, cursorPos))) {
+                        app.RequestRedraw();
+                    }
                 }
             }
         }
@@ -482,9 +610,20 @@ class TextArea : Control {
         int id = wid;
         Canvas c = app.canvas;
         Theme t = app.theme;
+        // 事件回调没有 app 形参，渲染沿记一笔宿主供手动操作使用。
+        liveApp = app;
 
+        bool off = this.IsDisabled();
         app.focus.RegisterFocusable(id);
-        bool focused = app.focus.IsFocused(id);
+        bool focused = app.focus.IsFocused(id) && !off;
+
+        // 校验状态与圆角：与 Input 同款，把类并进 Class 再解析
+        // （渲染末恢复，避免设计器读到污染字段），base.css 的
+        // `.success/.warning/.error` 与 `.round` 规则负责外观。
+        string origClass = Class;
+        string stCls = Control.StatusSanitize(FieldStatus);
+        if (stCls != "") { this.AddClass(stCls); }
+        if (Round) { this.AddClass("round"); }
 
         if (focused && !skipKeys) { this.HandleInput(app); }
         skipKeys = false;
@@ -496,7 +635,7 @@ class TextArea : Control {
         // 外框（填充、边框、圆角、hover/focus 淡变）全部来自样式层，
         // 皮肤的 `textarea:hover / textarea:focus` 规则即可重设。
         StyleBox s = this.ResolveEasedStyleAsIn(
-            app, id, "textarea", Class, false, false, x, y, w, h);
+            app, id, "textarea", Class, off, false, x, y, w, h);
         if (!readOnly) { s.Paint(app, x, y, w, h); }
         int fs = s.FontOr(Style.FontFallback(app, "medium"));
         // 校验错误：颜色与线宽来自 `textarea::error` 部件（在样式层之后
@@ -643,11 +782,22 @@ class TextArea : Control {
                        errorStyle.FgOr(s.fg),
                        errorStyle.FontOr(Style.FontFallback(app, "small")));
         }
+        // 字数统计（Naive UI show-count）：框外右下角，与 errMsg
+        // 同排左右分置；口径与 MaxLen 一致（CountOf）。
+        if (ShowCount) {
+            StyleBox countStyle = this.ResolvePartAs(
+                app, "textarea", "count", "", Class, Style.SNormal());
+            int cfs = countStyle.FontOr(Style.FontFallback(app, "small"));
+            string countTxt = Input.CountText(this.CountOf(txt), MaxLen);
+            int cw = Canvas.MeasureText(countTxt, cfs);
+            c.DrawText(x + w - cw, y + h + app.Scale(2), countTxt,
+                       countStyle.FgOr(s.fg), cfs);
+        }
 
         app.hitTester.RegisterRect(id, x, y, w, h, 1);
 
         // 鼠标选择：按下锚定选区并放置光标，按住拖动移动活动端。
-        if (Ui.PressedDown(app, id)) {
+        if (Ui.PressedDown(app, id) && !off) {
             cursorPos = this.PosFromMouse(app, innerX, innerY, lineH, fs);
             if (!Modifiers.HasShift(app.window.EventMods()) || selAnchor < 0) {
                 selAnchor = cursorPos;
@@ -664,13 +814,16 @@ class TextArea : Control {
         }
         // 单消费者点击：当此区域是框架解析出的点击
         // 目标时放置光标。
-        if (Ui.Clicked(app, id)) {
+        if (Ui.Clicked(app, id) && !off) {
             cursorPos = this.PosFromMouse(app, innerX, innerY, lineH, fs);
             if (selAnchor == cursorPos) { selAnchor = -1; }
             this.ClampCursor();
             app.RequestRedraw();
         }
         if (!focused && selAnchor >= 0) { selAnchor = -1; }
+
+        // 恢复 Class，避免设计器/序列化器读到污染字段。
+        Class = origClass;
 
         On.Fire(app, id);
         return id;
@@ -689,6 +842,20 @@ class TextArea : Control {
         ph.Also("placeholder");
         ps.Add(ph);
         ps.Add(PropSpec.Text("text", "Text"));
+        PropSpec st = PropSpec.Enum("status", "Status",
+            new List<string>{ "", "success", "warning", "error" });
+        st.str = FieldStatus;
+        ps.Add(st);
+        PropSpec ml = PropSpec.Int("maxlen", "MaxLen");
+        ml.num = MaxLen;
+        ml.Step(1, 0, 4096);
+        ps.Add(ml);
+        PropSpec sc = PropSpec.Bool("showCount", "ShowCount");
+        sc.flag = ShowCount;
+        ps.Add(sc);
+        PropSpec rd = PropSpec.Bool("round", "Round");
+        rd.flag = Round;
+        ps.Add(rd);
         return ps;
     }
 
@@ -699,11 +866,20 @@ class TextArea : Control {
     }
 
     override bool SetExtra(string key, string val) {
-        if (key != "text" && key != "value") { return false; }
-        // 值没变就别碰光标/选区：属性写入可能每帧都来，而 SetText 的语义是
-        // 「换了一段文本」——光标收到末尾。
-        if (val != model.Get()) { this.SetText(val); }
-        return true;
+        if (key == "text" || key == "value") {
+            // 值没变就别碰光标/选区：属性写入可能每帧都来，而 SetText 的语义是
+            // 「换了一段文本」——光标收到末尾。
+            if (val != model.Get()) { this.SetText(val); }
+            return true;
+        }
+        if (key == "status") { this.SetStatus(val); return true; }
+        if (key == "maxlen") { MaxLen = Convert.ToInt32(val); return true; }
+        if (key == "showCount") { ShowCount = (val == "true"); return true; }
+        if (key == "round") { Round = (val == "true"); return true; }
+        if (key == "countGraphemes") {
+            CountGraphemes = (val == "true"); return true;
+        }
+        return false;
     }
 
     override List<string> Events() {
