@@ -1524,6 +1524,30 @@ plain join、join into、终端 group、group into 八种形态）三档孪生�
 - **证据**：`tests/conformance/pattern_value_types.zan`（表达式/语句两形态、
   `when` 守卫、绑定变量、不同值类型不得匹配、以及 string/class/double/bool 判别式）。
 
+# A66 · gallery Switch/Radio 演示扩充：设置卡片行 / 异步 loading / 卡片选择 / RadioGroup 页 —— ✅ 已完成（2026-08-28）
+
+回应用户「Switch Radio 还有更丰富的展示形式」：全部用既有组件能力组合，不改组件、
+不加皮肤规则。
+
+- **Switch.settings（设置卡片行）**：每行一张卡片——`Panel.Column()` 置
+  `style = 0` 得卡片表面，左侧标题 + `hint` 描述、开关用 Flex `grow` 占位标签推到
+  行尾，底部一行实时汇总启用数。行每帧重建，开关保留态（WidgetId 稳定）。
+- **Switch.async（异步切换）**：`loading` 的真实用途——拨动先回卷
+  （`model.asyncOn = applied`）、Loading 点亮 36 帧模拟远端操作、完成那一刻才落值；
+  操作期间的再点击同样被回卷，小状态机单入口、无事件时序假设。
+- **Radio.cards（卡片选择）**：选项整卡可读——单选钮（只画圆点）+ 标题 + 描述，
+  选中卡 `Plain(bgActive)` 内联高亮（优先于样式表，无需新皮肤规则）+ 标题换
+  `primary`；三个保留态 Radio 共享同一模型字段。
+- **RadioGroup 独立组件页**：组容器 `AddOption` + 组排布（宽度不够自动换行）+
+  `Selected()` 共享信号读回；此前该容器只有 CheckboxGroup 有页。
+
+验证：build_gallery 通过；UiDriver 注入四脚本共 12/12 断言——`rg.sel` 0→2→0、
+`switch.setN` 1→2→1、`switch.asyncLoading/asyncOn` false→true→（落值）true→false、
+`radio.pick` 0→2（`clickid` 命中区域注入 + probe 断言，脚本/输出全反斜杠字面路径）；
+settings 卡片 `dump pixels` 目视核对（卡片边框、标题/描述、右对齐开关、汇总行）。
+坑位记录：页面级滚动对代码框声称滚轮的事件敏感，取内容列右缘 (1690,400) 注入
+wheel 才可靠落在页面滚动容器上。
+
 # A60 · 局部帧裁剪吃掉条带外点击 + Switch 禁用可点 + 条件真值化 i0 —— ✅ 已修（2026-08-28）
 
 三个独立暴露、其中两个同根因的缺陷：
@@ -1778,6 +1802,7 @@ ApplyEvent 之间消失，与命中区无关。样本极少且均发生在锁屏
 补 Countdown 行（policy_zform_schema 守门）。
 
 - **运行时节奏**（后续补充）：Win32 后端 Init 补 `timeBeginPeriod(1)`——系统默认时钟中断约 15.6ms 一拍，`MsgWaitForMultipleObjects`/`Sleep` 超时拖到下一拍，动画截止 16ms 实际落在 15.6~31.2ms，帧间隔 16↔31ms 交替即"背景动画一卡一卡"的根因；`SS` 百分位按 60fps 封顶排程（16ms）而非 10ms，显示值由 tick 差值现算逐帧准确。
+- **背景动画互扰根治**（探针实测，`_scratch/cd_fx_probe.zan` 模式）：倒计时走动时背景特效"一卡一卡"的三层根因——① `FxPresent` 被 `ForceFullFrames` 一票否决，默认应用（partialFrames 关）特效快速路径整个失效，空闲背景动画每拍都整窗控件重栅（实测 28s 39 次→修复后 0 次）；② `PresentFrame` 突发判定只看与上次提交的间隔（<120ms），倒计时把页面帧压到 100ms 后快照永不生效；③ 特效拍无法就地呈现时立即再排整窗重栅，与倒计时自己的页面帧叠加打满 CPU。改为按截止时间判突发 + 特效拍等一拍之内的整窗页面帧。修复后：空闲整窗渲染 0 次，倒计时走动期页面帧中位 101ms/max 106ms 零超时。局部帧开启且页面帧只是条带时不延迟（条带外特效会冻结）。
 
 - **测试**：`tests/gui/countdown_test.zan` + golden（无窗口，时刻由测试注入）：
 格式令牌九例（默认/双写/十分位/天/零/负钳制/字面量/尾随 s）、tick 推进/掉帧追平/
