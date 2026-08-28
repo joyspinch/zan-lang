@@ -4273,6 +4273,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     if (method_sym) fill_default_args(g, expr, method_sym);
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                 if (method_sym) {
+                    /* `expr.StaticMethod(args)` is legal (the generic path's
+                     * recv_params handling already allows it): a static method
+                     * has no receiver parameter, so the receiver expression is
+                     * not passed — `this.F()` inside the class and `T.F()`
+                     * both land here as plain static calls. */
+                    bool callee_static = (method_sym->modifiers & MOD_STATIC) != 0;
                     int spec = try_method_spec(g, method_sym, expr,
                                                callee->member.object, locals);
                     if (spec >= 0)
@@ -4280,54 +4286,63 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                                      callee->member.object, locals);
                     for (int fi = irgen_find_function(g, method_sym); fi >= 0; fi = -1) {
                         if (g->functions[fi].sym == method_sym) {
-                            int argc = expr->call.args.count + 1;
-                            LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
-                            LLVMValueRef recv_val = emit_guarded_member_object(
-                                g, callee, locals);
-                            /* receiver: the object pointer produced by the
-                             * expression (field load, index, call, ...). */
-                            call_args[0] = recv_val;
-                            /* A struct receiver that arrives by value (a call
-                             * result, a field read, an element) has no address,
-                             * but `this` is passed by pointer: spill it. */
-                            if (LLVMGetTypeKind(LLVMTypeOf(recv_val)) == LLVMStructTypeKind) {
-                                LLVMValueRef rslot = emit_entry_alloca(g, LLVMTypeOf(recv_val), "recv.tmp");
-                                LLVMBuildStore(g->builder, recv_val, rslot);
-                                call_args[0] = rslot;
-                            }
-                            /* an owned receiver temp must survive a throwing
-                             * callee: keep it on the EH temp stack so a catch
-                             * can release it (longjmp skips the release below) */
+                            int recv_off = callee_static ? 0 : 1;
+                            int argc = expr->call.args.count + recv_off;
+                            LLVMValueRef *call_args = (LLVMValueRef *)calloc(
+                                (size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
+                            LLVMValueRef recv_val = NULL;
                             int recv_eh_pushed = 0;
-                            {
-                                zan_type_t *rty = infer_expr_type(g, callee->member.object, locals);
-                                if (rty && rty->kind == TYPE_CLASS &&
-                                    !expr_is_local_ident(callee->member.object, locals) &&
-                                    expr_yields_owned_rc_value(g, callee->member.object, locals) &&
-                                    LLVMGetTypeKind(LLVMTypeOf(recv_val)) == LLVMPointerTypeKind) {
-                                    emit_eh_tmp_push(g, recv_val);
-                                    recv_eh_pushed = 1;
+                            if (!callee_static) {
+                                recv_val = emit_guarded_member_object(
+                                    g, callee, locals);
+                                /* receiver: the object pointer produced by the
+                                 * expression (field load, index, call, ...). */
+                                call_args[0] = recv_val;
+                                /* A struct receiver that arrives by value (a call
+                                 * result, a field read, an element) has no address,
+                                 * but `this` is passed by pointer: spill it. */
+                                if (LLVMGetTypeKind(LLVMTypeOf(recv_val)) == LLVMStructTypeKind) {
+                                    LLVMValueRef rslot = emit_entry_alloca(g, LLVMTypeOf(recv_val), "recv.tmp");
+                                    LLVMBuildStore(g->builder, recv_val, rslot);
+                                    call_args[0] = rslot;
+                                }
+                                /* an owned receiver temp must survive a throwing
+                                 * callee: keep it on the EH temp stack so a catch
+                                 * can release it (longjmp skips the release below) */
+                                {
+                                    zan_type_t *rty = infer_expr_type(g, callee->member.object, locals);
+                                    if (rty && rty->kind == TYPE_CLASS &&
+                                        !expr_is_local_ident(callee->member.object, locals) &&
+                                        expr_yields_owned_rc_value(g, callee->member.object, locals) &&
+                                        LLVMGetTypeKind(LLVMTypeOf(recv_val)) == LLVMPointerTypeKind) {
+                                        emit_eh_tmp_push(g, recv_val);
+                                        recv_eh_pushed = 1;
+                                    }
                                 }
                             }
                             for (int k = 0; k < expr->call.args.count; k++) {
-                                call_args[k + 1] = emit_arg_typed(g, expr->call.args.items[k],
+                                call_args[k + recv_off] = emit_arg_typed(g, expr->call.args.items[k],
                                     method_param_type_at(g, method_sym, k, expr,
                                                          callee->member.object, locals),
                                     locals);
                             }
-                            zan_type_t *recv_ty = infer_expr_type(g, callee->member.object, locals);
+                            zan_type_t *recv_ty = callee_static ? g->cur_inst
+                                : infer_expr_type(g, callee->member.object, locals);
                             LLVMTypeRef mft = g->functions[fi].fn_type;
                             LLVMValueRef mfn = route_generic_method(g, recv_ty,
                                 method_sym, g->functions[fi].fn, mft, &mft);
                             const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(mft)) == LLVMVoidTypeKind) ? "" : "mcall";
-                            LLVMValueRef result = emit_dispatch_call(g, recv_cls, method_sym,
+                            LLVMValueRef result = emit_dispatch_call(g,
+                                callee_static ? NULL : recv_cls, method_sym,
                                 mfn, mft, call_args, argc, cn);
                             result = coerce_generic_result(g, result, method_sym, recv_ty);
                             if (recv_eh_pushed) emit_eh_tmp_pop(g);
-                            emit_release_owned_call_temp(g, callee->member.object, recv_val, locals);
+                            if (!callee_static) {
+                                emit_release_owned_call_temp(g, callee->member.object, recv_val, locals);
+                            }
                             for (int k = 0; k < expr->call.args.count; k++) {
                                 emit_release_owned_call_temp(g, expr->call.args.items[k],
-                                    call_args[k + 1], locals);
+                                    call_args[k + recv_off], locals);
                             }
                             free(call_args);
                             return result;
@@ -4677,10 +4692,43 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 int argc = expr->call.args.count;
                 LLVMValueRef *call_args = (LLVMValueRef *)calloc(
                     (size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
+                LLVMTypeRef fn_type = LLVMGlobalGetValueType(global_fn);
+                /* Bare literals mint i64, but an extern's formal may be a
+                 * narrower int (or a differently-typed pointer). LLVM demands
+                 * call operands match the declared signature exactly, so
+                 * coerce each argument to the formal's type here. */
+                unsigned nparams = LLVMCountParamTypes(fn_type);
+                LLVMTypeRef ptypes[16];
+                if (nparams > 16) { nparams = 16; }
+                if (nparams > 0) {
+                    LLVMGetParamTypes(fn_type, ptypes);
+                }
                 for (int k = 0; k < argc; k++) {
                     call_args[k] = emit_expr(g, expr->call.args.items[k], locals);
+                    if ((unsigned)k >= nparams) { continue; }
+                    LLVMTypeRef at = LLVMTypeOf(call_args[k]);
+                    LLVMTypeRef pt = ptypes[k];
+                    if (at == pt) { continue; }
+                    if (LLVMGetTypeKind(at) == LLVMIntegerTypeKind
+                        && LLVMGetTypeKind(pt) == LLVMIntegerTypeKind) {
+                        unsigned aw = LLVMGetIntTypeWidth(at);
+                        unsigned pw = LLVMGetIntTypeWidth(pt);
+                        if (aw < pw) {
+                            call_args[k] = (aw == 1)
+                                ? LLVMBuildZExt(g->builder, call_args[k], pt,
+                                                "arg.zext")
+                                : LLVMBuildSExt(g->builder, call_args[k], pt,
+                                                "arg.sext");
+                        } else if (aw > pw) {
+                            call_args[k] = LLVMBuildTrunc(g->builder,
+                                call_args[k], pt, "arg.trunc");
+                        }
+                    } else if (LLVMGetTypeKind(at) == LLVMPointerTypeKind
+                        && LLVMGetTypeKind(pt) == LLVMPointerTypeKind) {
+                        call_args[k] = LLVMBuildBitCast(g->builder,
+                            call_args[k], pt, "arg.ptrc");
+                    }
                 }
-                LLVMTypeRef fn_type = LLVMGlobalGetValueType(global_fn);
                 const char *gcn = (LLVMGetTypeKind(LLVMGetReturnType(fn_type)) == LLVMVoidTypeKind) ? "" : "gcall";
                 LLVMValueRef result = zan_call2(g->builder, fn_type,
                     global_fn, call_args, (unsigned)argc, gcn);

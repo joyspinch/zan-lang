@@ -3671,18 +3671,40 @@ ordinary_member:
         }
     }
 
-    /* field: type name [= initializer]; */
+    /* field: type name [= initializer] {, name [= initializer]} ;
+     * C#-style comma declarators: each name becomes its own field sharing the
+     * declared type and modifiers. Extra declarators queue through
+     * pending_members so the class body keeps declaration order. */
     zan_ast_node_t *init = NULL;
     if (parser_match(p, TK_EQ)) {
         init = parse_expression(p);
     }
-    parser_expect(p, TK_SEMICOLON);
 
     zan_ast_node_t *n = zan_ast_new(p->arena, AST_FIELD_DECL, loc);
     n->field_decl.name = name;
     n->field_decl.type = type;
     n->field_decl.initializer = init;
     n->field_decl.modifiers = mods;
+    while (parser_match(p, TK_COMMA)) {
+        if (!parser_check(p, TK_IDENT)) {
+            zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                          "expected member name");
+            return parser_error_node(p);
+        }
+        parser_advance(p);
+        zan_istr_t extra = p->previous.str_val;
+        zan_ast_node_t *extra_init = NULL;
+        if (parser_match(p, TK_EQ)) {
+            extra_init = parse_expression(p);
+        }
+        zan_ast_node_t *e = zan_ast_new(p->arena, AST_FIELD_DECL, loc);
+        e->field_decl.name = extra;
+        e->field_decl.type = type;
+        e->field_decl.initializer = extra_init;
+        e->field_decl.modifiers = mods;
+        zan_ast_list_push(&p->pending_members, e, p->arena);
+    }
+    parser_expect(p, TK_SEMICOLON);
     return n;
 }
 
