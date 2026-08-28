@@ -15,16 +15,31 @@ partial class ChartView {
         List<string> labels = o.XCategories();
 
         if (horizontal) {
-            // 水平布局委托给 HBar 渲染器。轴范围按*未缩放*的最终值
-            // 定标（full），动画缩放只作用于柱长——否则入场动画期间
-            // 轴刻度会从 0..5 逐帧跳到真实范围（首帧闪跳）。
-            // 传 o.iwid 使图例色块可点击切换系列显隐。
+            // 水平布局委托给 HBar 渲染器。直接传原系列 + 动画因子 g
+            // （柱长在消费点乘 g），轴范围因此天然按未缩放最终值定标，
+            // 且样式字段（barWidth/stackName/itemStyle/marks...）不再
+            // 被克隆过程丢弃。传 o.iwid 使图例色块可点击切换系列显隐。
             bool hstack = false;
             for (int hsi = 0; hsi < series.Count; hsi = hsi + 1) {
                 if (series[hsi].stackName.Length > 0) { hstack = true; }
             }
-            ChartView.HBarCore(app, x, y, w, h, o, labels,
-                ChartView.Scaled(series, g), hstack, series);
+            // dataZoom：与纵向柱同一窗口 seam——锁 [i0,i1] 并预留滑块条带。
+            int hzoomH = 0;
+            int hFullN = labels.Count;
+            int hi0 = 0;
+            int hi1 = hFullN - 1;
+            if (o.zoom && o.iwid != 0 && hFullN > 1) {
+                hi0 = Chart.ZoomI0(app, o, o.iwid, hFullN);
+                hi1 = Chart.ZoomI1(app, o, o.iwid, hFullN);
+                hzoomH = app.Scale(24);
+            }
+            List<string> hWin = Chart.WindowLabels(labels, hi0, hi1);
+            ChartFrame hf = ChartView.HBarCore(app, x, y, w, h - hzoomH, o,
+                hWin, series, hstack, g, hi0);
+            if (hzoomH > 0 && hf != null) {
+                Chart.DrawZoomBar(app, hf.plotX, hf.plotW, y + h - app.Scale(18),
+                    app.Scale(12), o.iwid, hFullN);
+            }
             return;
         }
 
@@ -412,35 +427,16 @@ partial class ChartView {
         if (r3 < 1) { c.FillRect(x, y + h - rm, rm, rm, color); }
     }
 
-    /// 返回 `series` 的副本，每个值按 g/1000 缩放（用于
-    /// 给只接受普通序列列表的渲染器做动画）。
-    static List<ChartSeries> Scaled(List<ChartSeries> series, int g) {
-        List<ChartSeries> outp = new List<ChartSeries>();
-        for (int i = 0; i < series.Count; i = i + 1) {
-            ChartSeries s = series[i];
-            List<int> vs = new List<int>();
-            for (int j = 0; j < s.Count(); j = j + 1) {
-                vs.Add(s.Value(j) * g / 1000);
-            }
-            ChartSeries d = ChartSeries.Of(s.name, s.type, vs);
-            d.axisIndex = s.axisIndex;
-            d.stack = s.stack;
-            d.color = s.color;
-            d.hidden = s.hidden;
-            d.smooth = s.smooth;
-            outp.Add(d);
-        }
-        return outp;
-    }
-
     /// 水平柱状图：类别在左纵排，数值横伸。stacked 为 true 时，
     /// 共享 stackName 的序列每组堆成一条水平色带
     /// （对应 ECharts stacked bar4），各行上下排列各组。
-    /// `full` 是未缩放的原系列（轴范围按最终值定标）。
     /// 含负值时从零轴左右展开（旋风 / 人口金字塔）。
-    static void HBarCore(App app, int x, int y, int w, int h, ChartOption o,
-                         List<string> labels, List<ChartSeries> series, bool stacked,
-                         List<ChartSeries> full) {
+    /// `g` 为动画因子（柱长乘 g，轴范围用最终值）；`baseIdx` 是
+    /// labels[0] 对应的数据索引（dataZoom 窗口起点）。绘图区几何
+    /// 以 ChartFrame 返回，供调用方画缩放滑块。
+    static ChartFrame HBarCore(App app, int x, int y, int w, int h, ChartOption o,
+                               List<string> labels, List<ChartSeries> series,
+                               bool stacked, int g, int baseIdx) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         c.PushClip(x, y, w, h);
@@ -448,16 +444,9 @@ partial class ChartView {
         int axisFs = Style.FontFallback(app, "small");
         int n = labels.Count;
         int ns = series.Count;
-        List<ChartSeries> legendSrc = full;
         int wid = o.iwid;
-        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.title, legendSrc, wid, o.showLegend);
-        // 图例切换写回 full 的 hidden 标志；绘制列表继承同一状态
-        // （Scaled 复制了 hidden，但图例解析发生在本帧绘制之前，
-        // 因此把解析结果同步到绘制列表），再剔除隐藏序列，
-        // 使槽位布局只按可见序列分配。
-        for (int hi = 0; hi < series.Count && hi < full.Count; hi = hi + 1) {
-            series[hi].hidden = full[hi].hidden;
-        }
+        int plotTop = Chart.DrawPanelI(app, x, y, w, h, o.title, series, wid, o.showLegend);
+        // 剔除隐藏序列，使槽位布局只按可见序列分配。
         List<ChartSeries> visSeries = new List<ChartSeries>();
         for (int hi2 = 0; hi2 < series.Count; hi2 = hi2 + 1) {
             if (!series[hi2].hidden) { visSeries.Add(series[hi2]); }
@@ -466,14 +455,14 @@ partial class ChartView {
         ns = series.Count;
         if (ns < 1) { ns = 1; }
 
-        if (n < 1 || ns < 1) { c.PopClip(); return; }
+        if (n < 1 || ns < 1) { c.PopClip(); return null; }
 
         int dataMin = 0;
         int dataMax = 0;
-        for (int fi = 0; fi < full.Count; fi = fi + 1) {
-            if (!full[fi].hidden) {
-                for (int fj = 0; fj < full[fi].Count(); fj = fj + 1) {
-                    int fv = full[fi].Value(fj);
+        for (int fi = 0; fi < series.Count; fi = fi + 1) {
+            if (!series[fi].hidden) {
+                for (int fj = 0; fj < series[fi].Count(); fj = fj + 1) {
+                    int fv = series[fi].Value(fj);
                     if (fv > dataMax) { dataMax = fv; }
                     if (fv < dataMin) { dataMin = fv; }
                 }
@@ -481,7 +470,13 @@ partial class ChartView {
         }
         int lo = Chart.NiceMin(dataMin);
         int hi = Chart.NiceMax(dataMax);
-        if (stacked) { hi = Chart.NiceMax(Chart.MaxStackAll(full, n)); }
+        if (stacked) {
+            int stMax = 0;
+            for (int qi = 0; qi < series.Count; qi = qi + 1) {
+                if (series[qi].Count() > stMax) { stMax = series[qi].Count(); }
+            }
+            hi = Chart.NiceMax(Chart.MaxStackAll(series, stMax));
+        }
         if (hi <= lo) { hi = lo + 1; }
         int span = hi - lo;
 
@@ -497,7 +492,7 @@ partial class ChartView {
         int plotW = (x + w - pad) - plotX;
         int plotH = (y + h - pad - botGut) - plotY;
         if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
-        if (plotH < app.Scale(8)) { c.PopClip(); return; }
+        if (plotH < app.Scale(8)) { c.PopClip(); return null; }
 
         // 垂直数值网格线 + 标签（覆盖负值）
         StyleBox sGrid = Style.Part(app, "chart", "grid", "", "", "",
@@ -535,6 +530,15 @@ partial class ChartView {
                 labels[li], sLabel.FgOr(0), axisFs);
         }
         ChartView.PushPlotClip(app, plotX, plotY, plotW, plotH);
+        // markArea：数值轴上的纵向区间带（与纵向柱的横向带互为转置）。
+        if (o.markLo != ChartOption.Auto() && o.markHi != ChartOption.Auto()) {
+            int aX0 = Chart.ValueX(plotX, plotW, lo, hi, o.markLo);
+            int aX1 = Chart.ValueX(plotX, plotW, lo, hi, o.markHi);
+            if (aX1 < aX0) { int tmp = aX0; aX0 = aX1; aX1 = tmp; }
+            int areaBase = Style.Part(app, "chart", "mark-area", "", "", "",
+                                      Style.SNormal()).BgOr(0);
+            c.FillRect(aX0, plotY, aX1 - aX0, plotH, Chart.WithAlpha(areaBase, 28));
+        }
 
         if (stacked) {
             // 堆叠组（ECharts stackName）：同名序列从零轴起
@@ -571,7 +575,8 @@ partial class ChartView {
                         int gi = ChartView.GroupIndex(grp, sc.stackName);
                         if (gi < 0) { gi = 0; }
                         int v = 0;
-                        if (i < sc.Count()) { v = sc.Value(i); }
+                        int sdi = baseIdx + i;
+                        if (sdi < sc.Count()) { v = sc.Value(sdi) * g / 1000; }
                         int x0 = Chart.ValueX(plotX, plotW, lo, hi, accs[gi]);
                         int x1 = Chart.ValueX(plotX, plotW, lo, hi, accs[gi] + v);
                         int drawX = x0;
@@ -642,7 +647,8 @@ partial class ChartView {
                 int rowY = plotY + i * rowH;
                 for (int si = 0; si < ns; si = si + 1) {
                     int v = 0;
-                    if (i < series[si].Count()) { v = series[si].Value(i); }
+                    int ndi = baseIdx + i;
+                    if (ndi < series[si].Count()) { v = series[si].Value(ndi) * g / 1000; }
                     int x1 = Chart.ValueX(plotX, plotW, lo, hi, v);
                     int bx = x0;
                     int bw = x1 - x0;
@@ -682,6 +688,15 @@ partial class ChartView {
             }
         }
         c.PopClip();
+        // 系列级 markLine（转置）：数值 = 窗口内推导值，画成纵向
+        // 线 + 绘图区顶部标签。放 clip 外以露出顶部标签文字。
+        int winLast = baseIdx + n - 1;
+        for (int si3 = 0; si3 < series.Count; si3 = si3 + 1) {
+            ChartSeries sm = series[si3];
+            if (sm.hidden || sm.markLines.Count < 1) { continue; }
+            ChartView.DrawHBarMarkLines(app, plotX, plotY, plotW, plotH,
+                lo, hi, sm, baseIdx, winLast);
+        }
 
         if (o.showTooltip && n > 0 && rowH > 0) {
             if (mx >= plotX && mx < plotX + plotW
@@ -706,7 +721,8 @@ partial class ChartView {
                     ChartSeries ts = series[ti];
                     if (!ts.hidden) {
                         int tv = 0;
-                        if (idx < ts.Count()) { tv = ts.Value(idx); }
+                        int tdi = baseIdx + idx;
+                        if (tdi < ts.Count()) { tv = ts.Value(tdi); }
                         rows.Add(TooltipRow.Of(ts.color,
                             ts.name + "  " + Convert.ToString(tv)));
                     }
@@ -715,6 +731,15 @@ partial class ChartView {
             }
         }
         c.PopClip();
+
+        ChartFrame fr = new ChartFrame();
+        fr.plotX = plotX;
+        fr.plotY = plotY;
+        fr.plotW = plotW;
+        fr.plotH = plotH;
+        fr.leftMin = lo;
+        fr.leftMax = hi;
+        return fr;
     }
 
     // ---- 饼图 / 环形图（扫掠角随 g 增长） ----
