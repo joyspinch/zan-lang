@@ -1,0 +1,215 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// DatePicker 的无窗口回归，两类容易回归的机制。
+///
+/// 1. 十一种形式的文本往返（date/datetime/daterange/datetimerange/
+///    week/month/monthrange/quarter/quarterrange/year/yearrange）：
+///    起止颠倒自动交换、week 的周一起始、季度小写归一为 "Q"、
+///    非法文本保留原值且不崩。
+/// 2. 弹层指针捕获——曾经用裸 mouseX/mouseY 判定归属：gallery 里
+///    多个日期框并排，弹层展开后正好压住邻居的触发按钮，鼠标在
+///    弹层里一滑动，邻居就把"当前实例"抢走，正开着的日历随之关闭。
+///    测试用 BeginFrame/RunOverlays 手工推帧：帧 1 让 open1 展开弹层
+///    （覆盖阶段登记全窗+弹层矩形阻挡区），帧 2 把指针放进弹层内部、
+///    恰好压在邻居触发按钮上——邻居必须看不到这次悬停（Ui.Over 经
+///    PointerCaptured 把被弹层接管的指针排除掉），open1 保持打开。
+///    帧 3/4 再验证弹层关掉后归属仍随指针正常转移、新归属关闭旧实例。
+class Program {
+    static int fails;
+
+    static void True(string what, bool got) {
+        if (got) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void EqStr(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got '{got}' want '{want}'");
+    }
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got {got} want {want}");
+    }
+
+    static void EqDate(string what, DateTime got, int y, int m, int d) {
+        if (got != null && got.Year() == y && got.Month() == m
+            && got.Day() == d) { return; }
+        fails = fails + 1;
+        string shown = "null";
+        if (got != null) {
+            shown = got.ToDateString();
+        }
+        Console.WriteLine($"FAIL {what}: got {shown} want {y}-{m}-{d}");
+    }
+
+    static DatePicker NewOf(string type) {
+        DatePicker p = new DatePicker();
+        p.SetExtra("type", type);
+        return p;
+    }
+
+    static void Main() {
+        fails = 0;
+
+        // ---- 十一种形式：文本往返 --------------------------------
+        DatePicker d = new DatePicker();
+        d.SetText("2026-08-27");
+        EqStr("date text", d.Text(), "2026-08-27");
+        EqDate("date value", d.GetDate(), 2026, 8, 27);
+        EqStr("date fmt", d.FormatText(), "2026-08-27");
+        // 非法文本：编辑框保留原样，值不被破坏。
+        d.SetText("2026-02-30");
+        EqStr("invalid kept in editor", d.Text(), "2026-02-30");
+        EqDate("invalid keeps value", d.GetDate(), 2026, 8, 27);
+
+        DatePicker dt = NewOf("datetime");
+        dt.SetText("2026-08-27 14:30");
+        EqStr("datetime fmt", dt.FormatText(), "2026-08-27 14:30");
+        EqDate("datetime value", dt.GetDate(), 2026, 8, 27);
+        EqInt("datetime hour", dt.hour, 14);
+        EqInt("datetime minute", dt.minute, 30);
+
+        DatePicker dr = NewOf("daterange");
+        dr.SetText("2026-08-01 ~ 2026-08-15");
+        EqStr("daterange fmt", dr.FormatText(), "2026-08-01 ~ 2026-08-15");
+        EqDate("daterange start", dr.GetStart(), 2026, 8, 1);
+        EqDate("daterange end", dr.GetEnd(), 2026, 8, 15);
+        // 起止颠倒：自动交换回升序。
+        dr.SetText("2026-08-15 ~ 2026-08-01");
+        EqStr("daterange swapped fmt", dr.FormatText(),
+              "2026-08-01 ~ 2026-08-15");
+        EqDate("daterange swapped start", dr.GetStart(), 2026, 8, 1);
+
+        DatePicker dtr = NewOf("datetimerange");
+        dtr.SetText("2026-08-01 08:30 ~ 2026-08-15 22:10");
+        EqStr("datetimerange fmt", dtr.FormatText(),
+              "2026-08-01 08:30 ~ 2026-08-15 22:10");
+        EqInt("datetimerange start h", dtr.hour, 8);
+        EqInt("datetimerange start m", dtr.minute, 30);
+        EqInt("datetimerange end h", dtr.endHour, 22);
+        EqInt("datetimerange end m", dtr.endMinute, 10);
+        // 起止颠倒时连同各自的时分一起交换。
+        dtr.SetText("2026-08-15 22:10 ~ 2026-08-01 08:30");
+        EqStr("datetimerange swapped fmt", dtr.FormatText(),
+              "2026-08-01 08:30 ~ 2026-08-15 22:10");
+        EqInt("swapped start h", dtr.hour, 8);
+        EqInt("swapped end h", dtr.endHour, 22);
+
+        // week：一次点击选中整周，起=周一、止=周日。2026-08-13 是
+        // 周四 → 08-10(一) ~ 08-16(日)；跨月的 2026-08-31 是周一
+        // → 08-31 ~ 09-06。
+        DatePicker wk = NewOf("week");
+        wk.PickDate(DateTime.FromDate(2026, 8, 13));
+        EqStr("week fmt", wk.Text(), "2026-08-10 ~ 2026-08-16");
+        EqDate("week start", wk.GetStart(), 2026, 8, 10);
+        EqDate("week end", wk.GetEnd(), 2026, 8, 16);
+        True("week click closes", wk.open == false);
+        wk.PickDate(DateTime.FromDate(2026, 8, 31));
+        EqStr("week cross month", wk.Text(), "2026-08-31 ~ 2026-09-06");
+
+        DatePicker mo = NewOf("month");
+        mo.SetText("2026-11");
+        EqStr("month fmt", mo.FormatText(), "2026-11");
+        EqDate("month value", mo.GetDate(), 2026, 11, 1);
+        mo.SetText("2026-13");
+        EqDate("month invalid keeps value", mo.GetDate(), 2026, 11, 1);
+
+        DatePicker mr = NewOf("monthrange");
+        mr.SetText("2026-03 ~ 2026-08");
+        EqDate("monthrange start", mr.GetStart(), 2026, 3, 1);
+        EqDate("monthrange end", mr.GetEnd(), 2026, 8, 1);
+
+        DatePicker q = NewOf("quarter");
+        q.SetText("2026-Q3");
+        EqDate("quarter value", q.GetDate(), 2026, 7, 1);
+        // 小写 q 照样解析，格式化归一为大写 Q。
+        q.SetText("2026-q3");
+        EqStr("quarter text kept", q.Text(), "2026-q3");
+        EqStr("quarter fmt canonical", q.FormatText(), "2026-Q3");
+
+        DatePicker qr = NewOf("quarterrange");
+        qr.SetText("2026-Q1 ~ 2026-Q3");
+        EqDate("quarterrange start", qr.GetStart(), 2026, 1, 1);
+        EqDate("quarterrange end", qr.GetEnd(), 2026, 7, 1);
+
+        DatePicker y = NewOf("year");
+        y.SetText("2026");
+        EqDate("year value", y.GetDate(), 2026, 1, 1);
+        EqStr("year fmt", y.FormatText(), "2026");
+
+        DatePicker yr = NewOf("yearrange");
+        yr.SetText("2020 ~ 2026");
+        EqDate("yearrange start", yr.GetStart(), 2020, 1, 1);
+        EqDate("yearrange end", yr.GetEnd(), 2026, 1, 1);
+
+        // ---- 分类辅助 ---------------------------------------------
+        True("week is range", wk.IsRange());
+        True("daterange is range", dr.IsRange());
+        True("yearrange is range", yr.IsRange());
+        True("date not range", d.IsRange() == false);
+        True("datetime has time", dt.HasTime());
+        True("datetimerange has time", dtr.HasTime());
+        True("date no time", d.HasTime() == false);
+        EqStr("month gran", mo.Granularity(), "month");
+        EqStr("quarter gran", q.Granularity(), "quarter");
+        EqStr("year gran", y.Granularity(), "year");
+        EqStr("date gran", d.Granularity(), "day");
+
+        // ---- 弹层指针捕获：邻居不得抢走打开中的实例 ----------------
+        App app = new App("dp-regression", 800, 600);
+        DatePicker open1 = new DatePicker();
+        DatePicker neighbour = new DatePicker();
+
+        // 帧 1：open1 打开；弹层在覆盖阶段登记全窗 + 弹层矩形阻挡区。
+        // 几何（96 DPI）：触发器 (40,40,200,34)，弹层 (40,78,224,200)，
+        // 邻居 (60,100,200,34) 的日历按钮 (226,100,34,34) 整个被压住。
+        app.BeginFrame();
+        app.mouseX = 0;
+        app.mouseY = 0;
+        open1.SetText("2026-08-27");
+        open1.ToggleOpen();
+        open1.RenderInside(app, new Rect(40, 40, 200, 34));
+        app.RunOverlays();
+        True("popup blocker registered", app.hitTester.BlockerAt(240, 112));
+
+        // 帧 2：指针滑进弹层内部、恰好压在邻居的日历按钮上。修复前
+        // 邻居用裸坐标看到"悬停"并抢走 current，正开着的弹层随之关闭。
+        app.BeginFrame();
+        app.mouseX = 240;
+        app.mouseY = 112;
+        neighbour.SetText("2026-09-15");
+        neighbour.RenderInside(app, new Rect(60, 100, 200, 34));
+        True("pointer captured by popup", app.PointerCaptured());
+        True("open picker keeps current", DatePicker.current == open1);
+        True("popup stays open", open1.open);
+        True("neighbour stays closed", neighbour.open == false);
+
+        // 帧 3：弹层关闭后（等价于在弹层外点了一下），指针仍停在
+        // 邻居按钮上——归属必须正常转移过去。
+        app.BeginFrame();
+        open1.ToggleOpen();
+        open1.RenderInside(app, new Rect(40, 40, 200, 34));
+        neighbour.RenderInside(app, new Rect(60, 100, 200, 34));
+        True("ownership follows pointer", DatePicker.current == neighbour);
+        True("old picker closed", open1.open == false);
+
+        // 帧 4：没有弹层遮挡时，新归属会关掉正开着的旧实例（Use 的
+        // 单例契约在正常路径下仍然生效）。
+        app.BeginFrame();
+        open1.ToggleOpen();
+        open1.RenderInside(app, new Rect(40, 40, 200, 34));
+        neighbour.RenderInside(app, new Rect(60, 100, 200, 34));
+        True("neighbour steals again", DatePicker.current == neighbour);
+        True("reopen closed by steal", open1.open == false);
+
+        if (fails == 0) {
+            Console.WriteLine("datepicker_test OK");
+        }
+    }
+}

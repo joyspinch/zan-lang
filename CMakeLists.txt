@@ -1563,6 +1563,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_countdown${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # DatePicker 十一种形式的文本往返（起止颠倒交换、week 周一起始、
+  # 季度小写归一、非法文本保留原值），以及弹层指针捕获：弹层展开后
+  # 压住邻居的触发按钮，鼠标在弹层里滑动不得让邻居抢走 current 把
+  # 正开着的日历关掉（归属判定必须走 Ui.Over/PointerCaptured）。
+  add_test(NAME conformance_gui_datepicker
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datepicker_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datepicker.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datepicker${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   add_test(NAME conformance_gui_watermark
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
