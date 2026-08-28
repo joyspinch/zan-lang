@@ -3,14 +3,23 @@ using Gui;
 
 namespace Gui.Widget;
 
-/// 日期编辑控件：可键盘编辑的 YYYY-MM-DD 输入框，右侧带日历按钮。
-/// 月历在覆盖层中绘制，日期选择通过 OnChange 报告。
+/// 日期编辑控件：可键盘编辑的取值输入框，右侧带日历按钮。
+/// 弹层在覆盖层中绘制，取值通过 OnChange 报告。
 /// Type 字段控制变体（Naive UI type prop）：
-///   "date"      — 默认，单个日期
-///   "datetime"  — 含时分（HH:MM），时分通过弹层底部两个数字框输入
-///   "daterange" — 起止日期对，弹层为左右双月历（左=选中月，
-///                 右=下个月），第一次点击=起始，第二次=结束；
-///                 已点起始后悬停实时预览区间
+///   "date"          — 默认，单个日期（YYYY-MM-DD）
+///   "datetime"      — 含时分；弹层底部 HH:MM 数字区点击递增
+///   "daterange"     — 起止日期对，弹层为左右双月历（左=选中月，
+///                     右=下个月），点起始再点结束，悬停实时预览区间
+///   "datetimerange" — 双月历 + 各面板底部一组 HH:MM（起始时间复用
+///                     hour/minute 字段，结束时间为 endHour/endMinute）
+///   "week"          — 整周选择：点任意一天选中其所在周（周一~周日），
+///                     文本 "周一 ~ 周日"
+///   "month"         — 12 宫格选月，文本 YYYY-MM（取值=当月 1 日）
+///   "monthrange"    — 双面板选月区间（右面板 = 下一年）
+///   "quarter"       — Q1-Q4 选季度，文本 YYYY-Qn（取值=季首月 1 日）
+///   "quarterrange"  — 双面板选季度区间
+///   "year"          — 12 年一页选年份，取值=当年 1 月 1 日
+///   "yearrange"     — 双面板选年份区间（右面板 = 下一个 12 年页）
 class DatePicker : Control {
     static DatePicker current;
     Input editor;
@@ -21,18 +30,23 @@ class DatePicker : Control {
     int viewMonth;
     DateTime selected;
     /// range 模式下第一个点击（pending）；第二次点击后才关闭弹层。
+    /// week 模式下一次点击即同时写入起（周一）止（周日）。
     DateTime pendingStart;
     bool hasPending;
     /// 已点起始、等待第二个点击。重新打开弹层后复位，
     /// 让"再点一次"总是开启一条新区间而不是续接旧区间。
     bool pickingEnd;
-    /// 本帧悬停到的日期（仅弹层绘制期间有效），用于区间预览。
+    /// 本帧悬停到的取值（仅弹层绘制期间有效），用于区间预览。
     bool hasHover;
     DateTime hoverDate;
     int hour;
     int minute;
+    /// datetimerange 的结束时间；起始时间复用 hour/minute。
+    int endHour;
+    int endMinute;
     int wid;
-    /// Naive UI type prop：date | datetime | daterange。
+    /// Naive UI type prop：date | datetime | daterange | datetimerange |
+    /// week | month | monthrange | quarter | quarterrange | year | yearrange。
     string Type;
     /// Naive UI size prop：small | medium | large。Binding<string>
     /// 映射为 input.small/large 档位 class，支持响应式换档。
@@ -60,6 +74,8 @@ class DatePicker : Control {
         hoverDate = null;
         hour = 0;
         minute = 0;
+        endHour = 0;
+        endMinute = 0;
         wid = WidgetId.Next();
         DatePicker.current = this;
         wiresOwnEvents = true;
@@ -86,11 +102,14 @@ class DatePicker : Control {
         // DateTime is exposed through the existing Text()/SetText() pair;
         // the editor's SignalString remains owned by the child Input.
         PropSpec text = PropSpec.Text("text", "Date");
-        text.WithTip("Date value in YYYY-MM-DD format. For datetime use "
-                     + "'YYYY-MM-DD HH:MM'; for daterange use 'A ~ B'.");
+        text.WithTip("Formats: date 'YYYY-MM-DD'; datetime 'YYYY-MM-DD HH:MM'"
+                     + "; ranges 'A ~ B'; month 'YYYY-MM'; quarter 'YYYY-Qn'"
+                     + "; year 'YYYY'.");
         ps.Add(text);
         PropSpec type = PropSpec.Enum("type", "Type",
-            new List<string>{ "date", "datetime", "daterange" });
+            new List<string>{ "date", "datetime", "daterange",
+                "datetimerange", "week", "month", "monthrange",
+                "quarter", "quarterrange", "year", "yearrange" });
         type.num = 0;
         ps.Add(type);
         PropSpec sz = PropSpec.Enum("size", "Size",
@@ -112,7 +131,11 @@ class DatePicker : Control {
             return true;
         }
         if (key == "type") {
-            if (val == "datetime" || val == "daterange" || val == "date") {
+            if (val == "date" || val == "datetime" || val == "daterange" ||
+                val == "datetimerange" || val == "week" || val == "month" ||
+                val == "monthrange" || val == "quarter" ||
+                val == "quarterrange" || val == "year" ||
+                val == "yearrange") {
                 Type = val;
                 editor.SetText(this.FormatText());
             }
@@ -139,24 +162,41 @@ class DatePicker : Control {
 
     string Text() { return editor.GetText(); }
     DateTime GetDate() { return selected; }
-    /// 范围模式下的起始日；非 range 模式时 == GetDate()。
+    /// range 模式下的起始值；非 range 模式时 == GetDate()。
     DateTime GetStart() {
-        if (Type == "daterange" && hasPending) { return pendingStart; }
+        if (this.IsRange() && hasPending) { return pendingStart; }
         return selected;
     }
-    /// 范围模式下的结束日；非 range 模式时 == GetDate()。
+    /// range 模式下的结束值；非 range 模式时 == GetDate()。
     DateTime GetEnd() { return selected; }
-    bool IsRange() { return Type == "daterange"; }
+    bool IsRange() {
+        return Type == "daterange" || Type == "datetimerange" ||
+            Type == "monthrange" || Type == "quarterrange" ||
+            Type == "yearrange" || Type == "week";
+    }
     bool IsDateTime() { return Type == "datetime"; }
+    bool HasTime() { return Type == "datetime" || Type == "datetimerange"; }
+
+    /// 面板粒度：day（date/datetime/week/daterange/datetimerange）、
+    /// month、quarter、year。month/quarter/year 复用同一套宫格绘制。
+    string Granularity() {
+        if (Type == "month" || Type == "monthrange") { return "month"; }
+        if (Type == "quarter" || Type == "quarterrange") { return "quarter"; }
+        if (Type == "year" || Type == "yearrange") { return "year"; }
+        return "day";
+    }
 
     void SetDate(DateTime value) {
         selected = value;
         viewYear = value.Year();
         viewMonth = value.Month();
         if (Type == "datetime") {
-            DateTime t = value;
-            hour = t.Hour();
-            minute = t.Minute();
+            hour = value.Hour();
+            minute = value.Minute();
+        }
+        if (Type == "datetimerange") {
+            endHour = value.Hour();
+            endMinute = value.Minute();
         }
         editor.SetText(this.FormatText());
     }
@@ -172,10 +212,36 @@ class DatePicker : Control {
             return selected.ToDateString() + " " + DateTime.Pad2(hour)
                 + ":" + DateTime.Pad2(minute);
         }
-        if (Type == "daterange" && hasPending) {
-            return pendingStart.ToDateString() + " ~ " + selected.ToDateString();
+        if (Type == "datetimerange") {
+            if (!hasPending) {
+                return selected.ToDateString() + " " +
+                    DateTime.Pad2(endHour) + ":" + DateTime.Pad2(endMinute);
+            }
+            return pendingStart.ToDateString() + " " +
+                DateTime.Pad2(hour) + ":" + DateTime.Pad2(minute) +
+                " ~ " + selected.ToDateString() + " " +
+                DateTime.Pad2(endHour) + ":" + DateTime.Pad2(endMinute);
         }
-        return selected.ToDateString();
+        if (this.IsRange() && hasPending) {
+            return this.FormatValue(pendingStart) + " ~ " +
+                this.FormatValue(selected);
+        }
+        return this.FormatValue(selected);
+    }
+
+    /// 单个取值的文本形式（不含时间与范围分隔符）。
+    string FormatValue(DateTime d) {
+        string gran = this.Granularity();
+        if (gran == "month") {
+            return Convert.ToString(d.Year()) + "-" +
+                DateTime.Pad2(d.Month());
+        }
+        if (gran == "quarter") {
+            return Convert.ToString(d.Year()) + "-Q" +
+                Convert.ToString((d.Month() + 2) / 3);
+        }
+        if (gran == "year") { return Convert.ToString(d.Year()); }
+        return d.ToDateString();
     }
 
     static int Digit(string s) {
@@ -215,23 +281,127 @@ class DatePicker : Control {
         return DateTime.FromDate(y, m, d);
     }
 
+    /// 按 Granularity 解析单值文本：month "YYYY-MM"、
+    /// quarter "YYYY-Qn"、year "YYYY"，day 走 ParseDate。
+    DateTime ParseSingle(string raw) {
+        string gran = this.Granularity();
+        if (gran == "month") {
+            if (raw.Length != 7 || raw.Substring(4, 1) != "-") {
+                return null;
+            }
+            int y = DatePicker.Number(raw, 0, 4);
+            int m = DatePicker.Number(raw, 5, 2);
+            if (y < 1 || m < 1 || m > 12) { return null; }
+            return DateTime.FromDate(y, m, 1);
+        }
+        if (gran == "quarter") {
+            // "YYYY-Qn"：下划线位置 4 是连字符，Q 在 5、季度数字在 6。
+            if (raw.Length != 7 || raw.Substring(4, 1) != "-") {
+                return null;
+            }
+            string q = raw.Substring(5, 1);
+            if (q != "Q" && q != "q") { return null; }
+            int y = DatePicker.Number(raw, 0, 4);
+            int n = DatePicker.Number(raw, 6, 1);
+            if (y < 1 || n < 1 || n > 4) { return null; }
+            return DateTime.FromDate(y, n * 3 - 2, 1);
+        }
+        if (gran == "year") {
+            if (raw.Length != 4) { return null; }
+            int y = DatePicker.Number(raw, 0, 4);
+            if (y < 1) { return null; }
+            return DateTime.FromDate(y, 1, 1);
+        }
+        return DatePicker.ParseDate(raw);
+    }
+
+    /// "YYYY-MM-DD[ HH:MM]" 解析；start=true 把时分写进 hour/minute
+    /// （起始时间），否则写进 endHour/endMinute（结束时间）。
+    DateTime ParseTime(string raw, bool start) {
+        int sp = raw.IndexOf(" ");
+        string datePart = raw;
+        if (sp >= 0) { datePart = raw.Substring(0, sp); }
+        DateTime d = DatePicker.ParseDate(datePart);
+        if (d == null) { return null; }
+        int h = hour;
+        int mi = minute;
+        if (!start) { h = endHour; mi = endMinute; }
+        if (sp >= 0) {
+            string tail = raw.Substring(sp + 1, raw.Length - sp - 1);
+            int colon = tail.IndexOf(":");
+            if (colon >= 0) {
+                int hh = DatePicker.Number(tail, 0, colon);
+                int mm = DatePicker.Number(tail, colon + 1, 2);
+                if (hh >= 0) { h = hh; }
+                if (mm >= 0) { mi = mm; }
+            }
+        }
+        if (h > 23) { h = 23; }
+        if (mi > 59) { mi = 59; }
+        if (start) {
+            hour = h;
+            minute = mi;
+        } else {
+            endHour = h;
+            endMinute = mi;
+        }
+        return d;
+    }
+
     void Edited() {
         string raw = editor.GetText();
-        if (Type == "daterange") {
-            // "YYYY-MM-DD ~ YYYY-MM-DD" / "YYYY-MM-DD~YYYY-MM-DD" / 单日期
+        if (Type == "datetimerange") {
+            // "YYYY-MM-DD HH:MM ~ YYYY-MM-DD HH:MM"
+            int sep = raw.IndexOf("~");
+            if (sep < 0) { return; }
+            DateTime startV = this.ParseTime(
+                raw.Substring(0, sep).Trim(), true);
+            DateTime endV = this.ParseTime(
+                raw.Substring(sep + 1, raw.Length - sep - 1).Trim(), false);
+            if (startV == null || endV == null) { return; }
+            if (endV.IsBefore(startV)) {
+                // 起止颠倒时连同各自的时分一起交换。
+                DateTime td = startV;
+                startV = endV;
+                endV = td;
+                int th = hour;
+                hour = endHour;
+                endHour = th;
+                int tm = minute;
+                minute = endMinute;
+                endMinute = tm;
+            }
+            pendingStart = startV;
+            hasPending = true;
+            if (!selected.Equals(endV)) {
+                selected = endV;
+                viewYear = endV.Year();
+                viewMonth = endV.Month();
+                Change.Raise();
+            }
+            return;
+        }
+        if (this.IsRange()) {
+            // "A ~ B" / "A~B" / 单值（day: YYYY-MM-DD；month: YYYY-MM；
+            // quarter: YYYY-Qn；year: YYYY；week: 周一 ~ 周日）。
             int sep = raw.IndexOf("~");
             DateTime startV = null;
             DateTime endV = null;
             if (sep >= 0) {
-                startV = DatePicker.ParseDate(
+                startV = this.ParseSingle(
                     raw.Substring(0, sep).Trim());
-                endV = DatePicker.ParseDate(
+                endV = this.ParseSingle(
                     raw.Substring(sep + 1, raw.Length - sep - 1).Trim());
             } else {
-                startV = DatePicker.ParseDate(raw);
+                startV = this.ParseSingle(raw);
                 endV = startV;
             }
             if (startV == null || endV == null) { return; }
+            if (endV.IsBefore(startV)) {
+                DateTime td = startV;
+                startV = endV;
+                endV = td;
+            }
             pendingStart = startV;
             hasPending = true;
             if (!selected.Equals(endV)) {
@@ -270,7 +440,7 @@ class DatePicker : Control {
             Change.Raise();
             return;
         }
-        DateTime value = DatePicker.ParseDate(raw);
+        DateTime value = this.ParseSingle(raw);
         if (value == null) { return; }
         if (!value.Equals(selected)) {
             selected = value;
@@ -296,23 +466,23 @@ class DatePicker : Control {
 
     void ToggleOpen() {
         open = !open;
-        if (open) {
-            pickingEnd = false;
-            if (Type == "daterange") {
-                // 编辑框文本是 "A ~ B"，ParseDate 解析不了；左面板
-                // 直接对到已有区间的起始月（Naive UI 的行为）。
-                if (hasPending) {
-                    viewYear = pendingStart.Year();
-                    viewMonth = pendingStart.Month();
-                }
-                return;
+        if (!open) { return; }
+        pickingEnd = false;
+        if (this.IsRange()) {
+            // 编辑框文本是 "A ~ B"，ParseSingle 解析不了；左面板
+            // 直接对到已有区间的起始（Naive UI 的行为）。
+            if (hasPending) {
+                viewYear = pendingStart.Year();
+                viewMonth = pendingStart.Month();
             }
-            DateTime value = DatePicker.ParseDate(editor.GetText());
-            if (value != null) {
-                selected = value;
-                viewYear = value.Year();
-                viewMonth = value.Month();
-            }
+            return;
+        }
+        if (Type == "datetime") { return; }
+        DateTime value = this.ParseSingle(editor.GetText());
+        if (value != null) {
+            selected = value;
+            viewYear = value.Year();
+            viewMonth = value.Month();
         }
     }
 
@@ -322,12 +492,63 @@ class DatePicker : Control {
         if (viewMonth > 12) { viewMonth = 1; viewYear = viewYear + 1; }
     }
 
+    /// 头部箭头的翻页步进：day=±1 个月，month/quarter=±1 年，
+    /// year=±1 页（12 年）。
+    void MoveView(int delta) {
+        string gran = this.Granularity();
+        if (gran == "day") { this.MoveMonth(delta); return; }
+        if (gran == "year") { viewYear = viewYear + delta * 12; return; }
+        viewYear = viewYear + delta;
+    }
+
+    /// year 粒度页起始（12 年一页，页内年=起..起+11）。
+    int PageStart(int year) { return year - year % 12; }
+
+    /// 面板头部标题：day="YYYY-MM"、month="YYYY年"、quarter="YYYY"、
+    /// year="起 - 止"。
+    string TitleText(int year, int month) {
+        string gran = this.Granularity();
+        if (gran == "day") {
+            return Convert.ToString(year) + "-" + DateTime.Pad2(month);
+        }
+        if (gran == "month") {
+            return Convert.ToString(year) + "年";
+        }
+        if (gran == "year") {
+            int startV = this.PageStart(year);
+            return Convert.ToString(startV) + " - " +
+                Convert.ToString(startV + 11);
+        }
+        return Convert.ToString(year);
+    }
+
+    /// picked 所在周的周一（周一起始；DayOfWeek() 0=周日）。
+    DateTime WeekStart(DateTime d) {
+        int offset = d.DayOfWeek() + 6;
+        if (offset >= 7) { offset = offset - 7; }
+        long back = offset;
+        return d.AddDays(-back);
+    }
+
     void PickDay(int day) {
         this.PickDate(DateTime.FromDate(viewYear, viewMonth, day));
     }
 
     void PickDate(DateTime picked) {
-        if (Type == "daterange") {
+        if (Type == "week") {
+            // 周选择：一次点击选中整周，起=周一、止=周日。
+            DateTime startV = this.WeekStart(picked);
+            pendingStart = startV;
+            long six = 6;
+            selected = startV.AddDays(six);
+            hasPending = true;
+            pickingEnd = false;
+            editor.SetText(this.FormatText());
+            open = false;
+            Change.Raise();
+            return;
+        }
+        if (this.IsRange()) {
             // 第一次点击 = 起始；第二次点击 = 结束。结束 < 起始时
             // 自动交换，让用户总能先点开始再点结束。重新打开弹层后
             // pickingEnd 已复位，第一次点击开启的是新区间。
@@ -406,15 +627,16 @@ class DatePicker : Control {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int scale = app.Scale(1);
-        int buttonW = app.Scale(34);
         if (!open || DatePicker.current != this) { return; }
-        bool rangeMode = Type == "daterange";
+        string gran = this.Granularity();
+        bool dayPanels = gran == "day";
+        bool dual = this.IsRange();
         int panelW = app.Scale(224);
         int popH = app.Scale(200);
-        if (Type == "datetime") { popH = popH + app.Scale(40); }
-        // range 弹层横向并排两个月历面板（Naive UI daterange）。
+        if (this.HasTime()) { popH = popH + app.Scale(40); }
+        // range 弹层横向并排两个面板（Naive UI *range 系列）。
         int popW = panelW;
-        if (rangeMode) { popW = panelW + panelW; }
+        if (dual) { popW = panelW + panelW; }
         int popX = OverlayPopup.FitX(app, bx, popW);
         int popY = OverlayPopup.FitY(app, by + bh + app.Scale(4), bh, popH);
         StyleBox pop = this.ResolvePartAs(app, "select", "popup", "popup",
@@ -427,24 +649,48 @@ class DatePicker : Control {
         int fs = Style.FontFallback(app, "small");
         int pad = app.Scale(6);
         int headerH = app.Scale(28);
-        int cellW = (panelW - pad * 2) / 7;
-        int cellH = app.Scale(24);
+        int cellW;
+        int cellH;
+        if (dayPanels) {
+            cellW = (panelW - pad * 2) / 7;
+            cellH = app.Scale(24);
+        } else {
+            int cols = 3;
+            if (gran == "quarter") { cols = 1; }
+            cellW = (panelW - pad * 2) / cols;
+            cellH = app.Scale(38);
+        }
         int top = popY + headerH;
 
-        // 右面板始终是左面板的下一个月。
-        int rightMonth = viewMonth + 1;
+        // 双面板时右面板 = 左面板的下一档：day=下个月，
+        // month/quarter=下一年，year=下一个 12 年页。
         int rightYear = viewYear;
-        if (rightMonth > 12) { rightMonth = 1; rightYear = rightYear + 1; }
+        int rightMonth = viewMonth;
+        if (gran == "day") {
+            rightMonth = viewMonth + 1;
+            if (rightMonth > 12) { rightMonth = 1; rightYear = rightYear + 1; }
+        } else if (gran == "year") {
+            rightYear = viewYear + 12;
+        } else {
+            rightYear = viewYear + 1;
+        }
+        // year 粒度的网格从页起点（PageStart）画起，标题也按页起点
+        // 显示 —— 两边必须同源，否则标题写 2016-2027 而网格是
+        // 2026-2037。
+        int leftBase = viewYear;
+        int rightBase = rightYear;
+        if (gran == "year") {
+            leftBase = this.PageStart(viewYear);
+            rightBase = leftBase + 12;
+        }
 
-        if (rangeMode) {
-            // 双月历头部：上月/下月箭头分居弹层两端，"YYYY-MM"
-            // 标题在各自面板内居中。
-            int arrowW = app.Scale(22);
+        // 头部：单面板标题在左、双箭头在右；双面板箭头分居弹层
+        // 两端，标题在各自面板内居中。
+        int arrowW = app.Scale(22);
+        if (dual) {
             int titleW = panelW - pad * 2 - arrowW * 2;
-            string leftTitle = Convert.ToString(viewYear) + "-" +
-                DateTime.Pad2(viewMonth);
-            string rightTitle = Convert.ToString(rightYear) + "-" +
-                DateTime.Pad2(rightMonth);
+            string leftTitle = this.TitleText(viewYear, viewMonth);
+            string rightTitle = this.TitleText(rightYear, rightMonth);
             c.DrawText(popX + pad + arrowW +
                        (titleW - Canvas.MeasureText(leftTitle, fs)) / 2,
                        Canvas.CenterTextY(popY, headerH, fs),
@@ -461,92 +707,129 @@ class DatePicker : Control {
                 if (app.mouseX >= popX &&
                     app.mouseX < popX + pad + arrowW &&
                     app.mouseY >= popY && app.mouseY < popY + headerH) {
-                    this.MoveMonth(-1); app.ClaimClick(); app.RequestRedraw(); return;
+                    this.MoveView(-1); app.ClaimClick(); app.RequestRedraw(); return;
                 }
                 if (app.mouseX >= popX + popW - pad - arrowW &&
                     app.mouseX < popX + popW &&
                     app.mouseY >= popY && app.mouseY < popY + headerH) {
-                    this.MoveMonth(1); app.ClaimClick(); app.RequestRedraw(); return;
+                    this.MoveView(1); app.ClaimClick(); app.RequestRedraw(); return;
                 }
             }
         } else {
             c.DrawText(popX + pad, Canvas.CenterTextY(popY, headerH, fs),
-                       Convert.ToString(viewYear) + "-" +
-                       DateTime.Pad2(viewMonth), pop.fg, fs);
+                       this.TitleText(viewYear, viewMonth), pop.fg, fs);
             c.DrawGlyphIn("chevron-left", popX + popW - app.Scale(48),
-                          popY, app.Scale(22), headerH, app.Scale(13), pop.fg);
+                          popY, arrowW, headerH, app.Scale(13), pop.fg);
             c.DrawGlyphIn("chevron-right", popX + popW - app.Scale(24),
-                          popY, app.Scale(22), headerH, app.Scale(13), pop.fg);
+                          popY, arrowW, headerH, app.Scale(13), pop.fg);
             if (clicked) {
                 if (app.mouseX >= popX + popW - app.Scale(50) &&
                     app.mouseX < popX + popW - app.Scale(26) &&
                     app.mouseY >= popY && app.mouseY < popY + headerH) {
-                    this.MoveMonth(-1); app.ClaimClick(); app.RequestRedraw(); return;
+                    this.MoveView(-1); app.ClaimClick(); app.RequestRedraw(); return;
                 }
                 if (app.mouseX >= popX + popW - app.Scale(26) &&
                     app.mouseX < popX + popW &&
                     app.mouseY >= popY && app.mouseY < popY + headerH) {
-                    this.MoveMonth(1); app.ClaimClick(); app.RequestRedraw(); return;
+                    this.MoveView(1); app.ClaimClick(); app.RequestRedraw(); return;
                 }
             }
         }
 
-        // 区间预览：先把悬停日整帧扫出来再绘制，两个面板
-        // 才能看到同一个 hover 值。
+        // 区间预览和格子 hover 反馈都要在绘制前拿到整帧统一的
+        // hover 值，所以先把悬停取值扫出来。
         hasHover = false;
         hoverDate = null;
-        if (rangeMode) {
+        if (dayPanels) {
             hoverDate = this.HoverDay(app, popX, top, pad, cellW, cellH,
                                       viewYear, viewMonth);
-            if (hoverDate == null) {
+            if (dual && hoverDate == null) {
                 hoverDate = this.HoverDay(app, popX + panelW, top, pad,
                                           cellW, cellH, rightYear, rightMonth);
             }
-            hasHover = hoverDate != null;
-        }
-
-        if (this.PaintMonth(app, c, pop, popX, top, pad, cellW, cellH,
-                            fs, pop.fg, viewYear, viewMonth, clicked)) {
-            return;
-        }
-        if (rangeMode) {
-            if (this.PaintMonth(app, c, pop, popX + panelW, top, pad, cellW,
-                                cellH, fs, pop.fg, rightYear, rightMonth,
-                                clicked)) {
-                return;
+        } else {
+            hoverDate = this.HoverCell(app, popX, top, pad, cellW, cellH,
+                                       leftBase);
+            if (dual && hoverDate == null) {
+                hoverDate = this.HoverCell(app, popX + panelW, top, pad,
+                                           cellW, cellH, rightBase);
             }
         }
-        // ---- datetime 模式的时间输入行 ----
-        if (Type == "datetime") {
-            int timeY = top + (7 + 1) * cellH;  // 7 行日期后
-            int tw = app.Scale(36);
-            int gap = app.Scale(4);
-            int totalTimeW = tw * 2 + gap;
-            int startX = popX + (popW - totalTimeW) / 2;
-            int hourX = startX;
-            int colonX = startX + tw;
-            int minX = colonX + gap;
-            c.DrawText(hourX, Canvas.CenterTextY(timeY, cellH, fs),
-                       DateTime.Pad2(hour), pop.fg, fs);
-            c.DrawText(colonX + app.Scale(8),
-                       Canvas.CenterTextY(timeY, cellH, fs),
-                       ":", pop.fg, fs);
-            c.DrawText(minX, Canvas.CenterTextY(timeY, cellH, fs),
-                       DateTime.Pad2(minute), pop.fg, fs);
-            // 增/减按钮（点击小时区：循环 0-23，点击分钟区：循环 0-59）。
-            if (clicked) {
-                if (app.mouseY >= timeY && app.mouseY < timeY + cellH) {
-                    if (app.mouseX >= hourX && app.mouseX < hourX + tw) {
-                        hour = (hour + 1) % 24;
-                        editor.SetText(this.FormatText());
-                        app.ClaimClick(); app.RequestRedraw(); return;
-                    }
-                    if (app.mouseX >= minX && app.mouseX < minX + tw) {
-                        minute = (minute + 1) % 60;
-                        editor.SetText(this.FormatText());
-                        app.ClaimClick(); app.RequestRedraw(); return;
-                    }
+        hasHover = hoverDate != null;
+
+        if (dayPanels) {
+            if (this.PaintMonth(app, c, pop, popX, top, pad, cellW, cellH,
+                                fs, pop.fg, viewYear, viewMonth, clicked)) {
+                return;
+            }
+            if (dual) {
+                if (this.PaintMonth(app, c, pop, popX + panelW, top, pad,
+                                    cellW, cellH, fs, pop.fg,
+                                    rightYear, rightMonth, clicked)) {
+                    return;
                 }
+            }
+        } else {
+            if (this.PaintCellGrid(app, c, pop, popX, top, pad, cellW, cellH,
+                                   fs, pop.fg, leftBase, clicked)) {
+                return;
+            }
+            if (dual) {
+                if (this.PaintCellGrid(app, c, pop, popX + panelW, top, pad,
+                                       cellW, cellH, fs, pop.fg, rightBase,
+                                       clicked)) {
+                    return;
+                }
+            }
+        }
+        // ---- 含时分变体的时间输入行（点击数字区递增） ----
+        if (Type == "datetime") {
+            int timeY = top + 8 * cellH;  // 7 行日期之后
+            int groupW = app.Scale(64);
+            int gx = popX + (popW - groupW) / 2;
+            int hit = this.PaintTimeGroup(app, c, pop, gx, timeY, cellH,
+                                          fs, hour, minute, clicked);
+            if (hit == 1) {
+                hour = (hour + 1) % 24;
+                editor.SetText(this.FormatText());
+                app.ClaimClick(); app.RequestRedraw(); return;
+            }
+            if (hit == 2) {
+                minute = (minute + 1) % 60;
+                editor.SetText(this.FormatText());
+                app.ClaimClick(); app.RequestRedraw(); return;
+            }
+        }
+        if (Type == "datetimerange") {
+            int timeY = top + 8 * cellH;
+            int groupW = app.Scale(64);
+            int hit = this.PaintTimeGroup(app, c, pop,
+                                          popX + (panelW - groupW) / 2,
+                                          timeY, cellH, fs,
+                                          hour, minute, clicked);
+            if (hit == 1) {
+                hour = (hour + 1) % 24;
+                editor.SetText(this.FormatText());
+                app.ClaimClick(); app.RequestRedraw(); return;
+            }
+            if (hit == 2) {
+                minute = (minute + 1) % 60;
+                editor.SetText(this.FormatText());
+                app.ClaimClick(); app.RequestRedraw(); return;
+            }
+            hit = this.PaintTimeGroup(app, c, pop,
+                                      popX + panelW + (panelW - groupW) / 2,
+                                      timeY, cellH, fs,
+                                      endHour, endMinute, clicked);
+            if (hit == 1) {
+                endHour = (endHour + 1) % 24;
+                editor.SetText(this.FormatText());
+                app.ClaimClick(); app.RequestRedraw(); return;
+            }
+            if (hit == 2) {
+                endMinute = (endMinute + 1) % 60;
+                editor.SetText(this.FormatText());
+                app.ClaimClick(); app.RequestRedraw(); return;
             }
         }
         if (clicked && (app.mouseX < popX || app.mouseX >= popX + popW ||
@@ -575,6 +858,45 @@ class DatePicker : Control {
         return null;
     }
 
+    /// 扫描 month/quarter/year 宫格，返回悬停格子的取值（无则 null）。
+    DateTime HoverCell(App app, int panelX, int top, int pad, int cellW,
+                       int cellH, int year) {
+        string gran = this.Granularity();
+        int cols = 3;
+        int count = 12;
+        if (gran == "quarter") { cols = 1; count = 4; }
+        for (int idx = 0; idx < count; idx = idx + 1) {
+            int dx = panelX + pad + (idx % cols) * cellW;
+            int dy = top + (idx / cols) * cellH;
+            if (app.mouseX >= dx && app.mouseX < dx + cellW &&
+                app.mouseY >= dy && app.mouseY < dy + cellH) {
+                return this.CellValue(gran, idx, year);
+            }
+        }
+        return null;
+    }
+
+    /// month/quarter/year 宫格里第 idx 个格子的文字。
+    string CellLabel(string gran, int idx, int year) {
+        if (gran == "month") {
+            return Convert.ToString(idx + 1) + "月";
+        }
+        if (gran == "quarter") {
+            return "Q" + Convert.ToString(idx + 1);
+        }
+        return Convert.ToString(year + idx);
+    }
+
+    /// month/quarter/year 宫格里第 idx 个格子的取值
+    /// （当月 1 日 / 季首月 1 日 / 当年 1 月 1 日）。
+    DateTime CellValue(string gran, int idx, int year) {
+        if (gran == "month") { return DateTime.FromDate(year, idx + 1, 1); }
+        if (gran == "quarter") {
+            return DateTime.FromDate(year, idx * 3 + 1, 1);
+        }
+        return DateTime.FromDate(year + idx, 1, 1);
+    }
+
     /// 绘制一个月的星期条与日期网格并处理日期点击。
     /// 返回 true 表示本次点击命中了日期格，调用方应立即结束本次
     /// 覆盖绘制，不再做弹层外部关闭判定。
@@ -598,18 +920,33 @@ class DatePicker : Control {
             int dy = top + cellH + row * cellH;
             string label = Convert.ToString(day);
             int color = fg;
-            // 范围模式：高亮整段范围（Naive UI daterange）。已点
-            // 起始、未点结束时用悬停日做预览终点。
+            DateTime cur = DateTime.FromDate(year, month, day);
+            // 高亮规则：week 高亮整周（悬停预览 / 已选周一~周日）；
+            // 其余 range 变体高亮起止区间；单值只标当前值。
             bool inRange = false;
             bool isEndpoint = false;
-            if (Type == "daterange" && hasPending) {
-                DateTime endRef = selected;
-                if (pickingEnd && hasHover) { endRef = hoverDate; }
-                DateTime cur = DateTime.FromDate(year, month, day);
-                // pendingStart <= cur <= endRef。终点一侧必须用
+            if (Type == "week") {
+                if (hasHover) {
+                    if (this.WeekStart(cur).Equals(this.WeekStart(hoverDate))) {
+                        inRange = true;
+                    }
+                } else if (hasPending) {
+                    if (cur.IsBefore(pendingStart) == false &&
+                        selected.IsBefore(cur) == false) {
+                        inRange = true;
+                    }
+                    if (cur.Equals(pendingStart) || cur.Equals(selected)) {
+                        isEndpoint = true;
+                    }
+                }
+            } else if (this.IsRange() && hasPending) {
+                // range 变体：高亮整段范围（Naive UI *range）。已点
+                // 起始、未点结束时用悬停值做预览终点。终点一侧必须用
                 // endRef.IsBefore(cur)（cur <= endRef）；旧代码写成
                 // cur.IsBefore(selected) == false（cur >= selected），
                 // 结果终点之后整月都被填进区间。
+                DateTime endRef = selected;
+                if (pickingEnd && hasHover) { endRef = hoverDate; }
                 if (cur.IsBefore(pendingStart) == false &&
                     endRef.IsBefore(cur) == false) {
                     inRange = true;
@@ -621,9 +958,17 @@ class DatePicker : Control {
                        year == selected.Year()) {
                 isEndpoint = true;
             }
+            if (hasHover && !inRange && !isEndpoint &&
+                cur.Equals(hoverDate)) {
+                StyleBox hov = Style.Part(app, "datepicker", "cell", "", "",
+                                          "", Style.SHover());
+                c.FillRoundRect(dx + app.Scale(1), dy + app.Scale(1),
+                                cellW - app.Scale(2), cellH - app.Scale(2),
+                                app.Scale(3), hov.BgOr(pop.accent));
+            }
             if (inRange) {
                 StyleBox range = Style.Part(app, "datepicker", "range", "", "",
-                                             "", Style.SHover());
+                                            "", Style.SHover());
                 c.FillRect(dx, dy + app.Scale(1),
                            cellW, cellH - app.Scale(2),
                            range.BgOr(pop.accent));
@@ -640,12 +985,104 @@ class DatePicker : Control {
                        Canvas.CenterTextY(dy, cellH, fs), label, color, fs);
             if (clicked && app.mouseX >= dx && app.mouseX < dx + cellW &&
                 app.mouseY >= dy && app.mouseY < dy + cellH) {
-                this.PickDate(DateTime.FromDate(year, month, day));
+                this.PickDate(cur);
                 app.ClaimClick();
                 app.RequestRedraw();
                 return true;
             }
         }
         return false;
+    }
+
+    /// 绘制 month/quarter/year 选择宫格并处理点击。
+    /// year 传页起始（PageStart）；返回 true 表示点击命中了格子。
+    bool PaintCellGrid(App app, Canvas c, StyleBox pop, int panelX, int top,
+                       int pad, int cellW, int cellH, int fs, int fg,
+                       int year, bool clicked) {
+        string gran = this.Granularity();
+        int cols = 3;
+        int count = 12;
+        if (gran == "quarter") { cols = 1; count = 4; }
+        for (int idx = 0; idx < count; idx = idx + 1) {
+            int dx = panelX + pad + (idx % cols) * cellW;
+            int dy = top + (idx / cols) * cellH;
+            DateTime cur = this.CellValue(gran, idx, year);
+            string label = this.CellLabel(gran, idx, year);
+            int color = fg;
+            // range 变体：已点起始、未点结束时用悬停值预览终点。
+            bool inRange = false;
+            bool isEndpoint = false;
+            if (this.IsRange() && hasPending) {
+                DateTime endRef = selected;
+                if (pickingEnd && hasHover) { endRef = hoverDate; }
+                if (cur.IsBefore(pendingStart) == false &&
+                    endRef.IsBefore(cur) == false) {
+                    inRange = true;
+                }
+                if (cur.Equals(pendingStart) || cur.Equals(endRef)) {
+                    isEndpoint = true;
+                }
+            } else if (cur.Equals(selected)) {
+                isEndpoint = true;
+            }
+            if (hasHover && !inRange && !isEndpoint &&
+                cur.Equals(hoverDate)) {
+                StyleBox hov = Style.Part(app, "datepicker", "cell", "", "",
+                                          "", Style.SHover());
+                c.FillRoundRect(dx + app.Scale(1), dy + app.Scale(1),
+                                cellW - app.Scale(2), cellH - app.Scale(2),
+                                app.Scale(3), hov.BgOr(pop.accent));
+            }
+            if (inRange) {
+                StyleBox range = Style.Part(app, "datepicker", "range", "",
+                                            "", "", Style.SHover());
+                c.FillRoundRect(dx + app.Scale(1), dy + app.Scale(1),
+                                cellW - app.Scale(2), cellH - app.Scale(2),
+                                app.Scale(3), range.BgOr(pop.accent));
+            }
+            if (isEndpoint) {
+                StyleBox sel = Style.Part(app, "datepicker", "day", "", "",
+                                          "", Style.SSelected());
+                c.FillRoundRect(dx + app.Scale(1), dy + app.Scale(1),
+                                cellW - app.Scale(2), cellH - app.Scale(2),
+                                app.Scale(3), sel.BgOr(pop.accent));
+                color = sel.FgOr(pop.bg);
+            }
+            c.DrawText(dx + (cellW - Canvas.MeasureText(label, fs)) / 2,
+                       Canvas.CenterTextY(dy, cellH, fs), label, color, fs);
+            if (clicked && app.mouseX >= dx && app.mouseX < dx + cellW &&
+                app.mouseY >= dy && app.mouseY < dy + cellH) {
+                this.PickDate(cur);
+                app.ClaimClick();
+                app.RequestRedraw();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// 绘制一组 "HH:MM" 数字（三段按文本宽度排布，整体居中于
+    /// gx 起的槽内）；点击命中返回 1=小时、2=分钟，由调用方对
+    /// 相应字段做递增循环。
+    int PaintTimeGroup(App app, Canvas c, StyleBox pop, int gx, int timeY,
+                       int rowH, int fs, int h, int mi, bool clicked) {
+        string hh = DateTime.Pad2(h);
+        string mm = DateTime.Pad2(mi);
+        int hhW = Canvas.MeasureText(hh, fs);
+        int mmW = Canvas.MeasureText(mm, fs);
+        int colonW = Canvas.MeasureText(":", fs);
+        int step = app.Scale(6);
+        int ty = Canvas.CenterTextY(timeY, rowH, fs);
+        c.DrawText(gx, ty, hh, pop.fg, fs);
+        c.DrawText(gx + hhW + step, ty, ":", pop.fg, fs);
+        int minX = gx + hhW + step + colonW + step;
+        c.DrawText(minX, ty, mm, pop.fg, fs);
+        if (!clicked) { return 0; }
+        if (app.mouseY < timeY || app.mouseY >= timeY + rowH) { return 0; }
+        if (app.mouseX >= gx && app.mouseX < gx + hhW + step) { return 1; }
+        if (app.mouseX >= minX - step && app.mouseX < minX + mmW) {
+            return 2;
+        }
+        return 0;
     }
 }
