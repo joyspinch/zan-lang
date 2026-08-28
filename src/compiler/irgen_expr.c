@@ -6174,7 +6174,25 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                         !expr_yields_owned_ref(arg->binary.right)) {
                                         emit_rc_retain_for_type(g, fsym->type, fval);
                                     }
-                                    zan_store_fit(g, fval, fptr);
+                                    /* ARC: the constructor ran before these initializer
+                                     * writes and may have populated RC fields
+                                     * (`new Label { Text = "x" }` — Label's ctor wraps
+                                     * Text in a binding), so the overwritten value must
+                                     * be released or it leaks on every construction.
+                                     * Weak fields are non-owning slots: releasing the
+                                     * previous value there would over-release, and
+                                     * value-typed fields have nothing to release. */
+                                    if (fsym && fsym->type && fval &&
+                                        is_rc_managed_type(fsym->type) &&
+                                        !(fsym->modifiers & MOD_WEAK) &&
+                                        LLVMGetTypeKind(LLVMTypeOf(fval)) == LLVMPointerTypeKind) {
+                                        LLVMValueRef fval_old = LLVMBuildLoad2(g->builder,
+                                            LLVMTypeOf(fval), fptr, "arc.fold");
+                                        zan_store_fit(g, fval, fptr);
+                                        emit_rc_release_for_type(g, fsym->type, fval_old);
+                                    } else {
+                                        zan_store_fit(g, fval, fptr);
+                                    }
                                 }
                             }
                         }
