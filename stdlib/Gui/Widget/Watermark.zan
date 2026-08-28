@@ -14,9 +14,19 @@ namespace Gui.Widget;
 /// 的间距由 `GapX`/`GapY` 控制（逻辑 px），`OffsetX`/`OffsetY` 平移
 /// 整层——把 offset 取在半个间距内可以让拼缝错开内容的关键部位。
 ///
+/// `LineHeight` 给出显式行盒高（逻辑 px，0 = 字体行高）；`TileW`/
+/// `TileH` 给出显式贴片盒（0 = 按内容测量），设置后块内行按
+/// `TextAlign`（0 左 / 1 中 / 2 右）在盒内水平对齐。`Weight` >= 600
+/// 时同行重描一次做模拟加粗——文本管线没有字重字体，与
+/// StyleBox.DrawRun 同一做法。
+///
 /// `Color` 为 0xAARRGGBB，alpha 参与混合（0 视为不透明，文本渲染的
 /// 约定）；0 表示交给 CSS `color`，再退内置的淡黑。`FontPx` 为 0 时
 /// 取 CSS `font-size`，再退 14。
+///
+/// 平铺默认被自身矩形裁剪；`NoClip` 为 true 时越过边界继续铺——
+/// 宿主想留边距又想让水印铺到边时，把水印框缩进去、开着 NoClip
+/// 即可（能铺多远取决于各层祖先的裁剪，一般到宿主面板边缘）。
 ///
 /// `Src` 指向图像（文件路径或 mem: 内存 key）时改为平铺图像：像素
 /// 自带的 alpha 参与混合，倾斜应预先烘进图里——位图旋转不在图像
@@ -42,6 +52,18 @@ class Watermark : Control {
     /// 整层平移（逻辑 px）。
     int OffsetX;
     int OffsetY;
+    /// 显式行盒高（逻辑 px）；0 = 字体行高。
+    int LineHeight;
+    /// 显式贴片盒（逻辑 px）；0 = 按内容测量。TileW > 0 时行按
+    /// `TextAlign` 在盒内水平对齐。
+    int TileW;
+    int TileH;
+    /// 贴片内文字水平对齐：0 左 / 1 中 / 2 右。
+    int TextAlign;
+    /// >= 600 时同行重描一次（模拟加粗，见 StyleBox.DrawRun）。
+    int Weight;
+    /// true 时不被自身矩形裁剪，平铺越过边界继续（默认 false）。
+    bool NoClip;
 
     void InitWatermark() {
         this.InitControl("watermark", 0);
@@ -54,6 +76,12 @@ class Watermark : Control {
         GapY = 100;
         OffsetX = 0;
         OffsetY = 0;
+        LineHeight = 0;
+        TileW = 0;
+        TileH = 0;
+        TextAlign = 0;
+        Weight = 0;
+        NoClip = false;
     }
     Watermark() { this.InitWatermark(); }
     Watermark(string content) {
@@ -89,13 +117,15 @@ class Watermark : Control {
         string src = Src;
         if (src == null) { src = ""; }
         Canvas c = app.canvas;
-        c.PushClip(bx, by, bw, bh);
+        // NoClip：越过自身边界继续铺（上层祖先的裁剪仍然生效），其余
+        // 场合贴片始终限制在控件矩形里。
+        if (!NoClip) { c.PushClip(bx, by, bw, bh); }
         if (src != "") {
             this.PaintImageTiles(app, c, src);
         } else {
             this.PaintTextTiles(app, c, s);
         }
-        c.PopClip();
+        if (!NoClip) { c.PopClip(); }
     }
 
     void PaintTextTiles(App app, Canvas c, StyleBox s) {
@@ -106,18 +136,27 @@ class Watermark : Control {
         int fs = this.EffectiveFont(app, s);
         int color = this.EffectiveColor(s);
         int lineH = Canvas.FontHeight(fs);
+        if (LineHeight > 0) { lineH = app.Scale(LineHeight); }
         int tileW = 0;
         for (int i = 0; i < lines.Count; i = i + 1) {
             int w = Canvas.MeasureText(lines[i], fs);
             if (w > tileW) { tileW = w; }
         }
+        if (TileW > 0) { tileW = app.Scale(TileW); }
         int tileH = lineH * lines.Count;
+        if (TileH > 0 && app.Scale(TileH) > tileH) {
+            tileH = app.Scale(TileH);
+        }
         int pitchX = tileW + app.Scale(GapX);
         int pitchY = tileH + app.Scale(GapY);
         if (pitchX <= 0 || pitchY <= 0) { return; }
         int offX = app.Scale(OffsetX);
         int offY = app.Scale(OffsetY);
         int rot = this.RotClamped();
+        int bold = Weight >= 600 ? 1 : 0;
+        double rad = (double)rot * 3.14159265358979323846 / 180.0;
+        double cs = Math.Cos(rad);
+        double sn = Math.Sin(rad);
         // 从盒子左上角外一个间距起铺：倾斜块的包围盒越出未旋转的盒子，
         // 四周多铺一圈保证边缘不缺角。
         for (int ty = by - pitchY + offY; ty < by + bh + pitchY + offY;
@@ -125,35 +164,43 @@ class Watermark : Control {
             for (int tx = bx - pitchX + offX; tx < bx + bw + pitchX + offX;
                  tx = tx + pitchX) {
                 this.PaintTextTile(c, lines, tx, ty, tileW, lineH, fs, color,
-                                   rot);
+                                   rot, bold, cs, sn);
             }
         }
     }
 
     /// 画一块文字水印。倾斜时每行的锚点先绕块中心旋转，运行时再把
     /// 整行绕锚点转过去——两步合成 = 整块绕中心的刚性旋转（每行绕
-    /// 自己左上角转同一角度并非刚性，多行会扇形张开）。
+    /// 自己左上角转同一角度并非刚性，多行会扇形张开）。`TileW` 给出
+    /// 的盒内余量按 `TextAlign` 分给每行的锚点，倾斜后仍是整块对齐。
     void PaintTextTile(Canvas c, List<string> lines, int tx, int ty,
-                       int tileW, int lineH, int fs, int color, int rot) {
-        if (rot == 0) {
-            int ly = ty;
-            for (int i = 0; i < lines.Count; i = i + 1) {
-                c.DrawText(tx, ly, lines[i], color, fs);
-                ly = ly + lineH;
-            }
-            return;
-        }
-        double rad = (double)rot * 3.14159265358979323846 / 180.0;
-        double cs = Math.Cos(rad);
-        double sn = Math.Sin(rad);
+                       int tileW, int lineH, int fs, int color, int rot,
+                       int bold, double cs, double sn) {
         int cx = tx + tileW / 2;
         int cy = ty + lineH * lines.Count / 2;
         for (int i = 0; i < lines.Count; i = i + 1) {
-            int dx = tx - cx;
+            int lx = tx;
+            if (tileW > 0) {
+                int lw = Canvas.MeasureText(lines[i], fs);
+                if (TextAlign == 1) { lx = tx + (tileW - lw) / 2; }
+                else if (TextAlign == 2) { lx = tx + tileW - lw; }
+                if (lx < tx) { lx = tx; }
+            }
+            if (rot == 0) {
+                c.DrawText(lx, ty + i * lineH, lines[i], color, fs);
+                if (bold == 1) {
+                    c.DrawText(lx + 1, ty + i * lineH, lines[i], color, fs);
+                }
+                continue;
+            }
+            int dx = lx - cx;
             int dy = ty + i * lineH - cy;
             int ax = cx + (int)(cs * (double)dx - sn * (double)dy);
             int ay = cy + (int)(sn * (double)dx + cs * (double)dy);
             c.DrawTextRot(ax, ay, lines[i], color, fs, rot);
+            if (bold == 1) {
+                c.DrawTextRot(ax + 1, ay, lines[i], color, fs, rot);
+            }
         }
     }
 
@@ -210,6 +257,25 @@ class Watermark : Control {
         PropSpec oy = PropSpec.Int("offsety", "Offset Y");
         oy.num = OffsetY;
         ps.Add(oy);
+        PropSpec lh = PropSpec.Int("lineheight", "Line Height");
+        lh.num = LineHeight;
+        ps.Add(lh);
+        PropSpec tw = PropSpec.Int("tilew", "Tile Width");
+        tw.num = TileW;
+        ps.Add(tw);
+        PropSpec th = PropSpec.Int("tileh", "Tile Height");
+        th.num = TileH;
+        ps.Add(th);
+        PropSpec ta = PropSpec.Enum("textalign", "Text Align",
+            new List<string> { "left", "center", "right" });
+        ta.num = TextAlign;
+        ps.Add(ta);
+        PropSpec wt = PropSpec.Int("weight", "Weight");
+        wt.num = Weight;
+        ps.Add(wt);
+        PropSpec nc = PropSpec.Bool("noclip", "Cross Boundary");
+        nc.flag = NoClip;
+        ps.Add(nc);
         ps.Add(PropSpec.Text("class", "Classes"));
         return ps;
     }
