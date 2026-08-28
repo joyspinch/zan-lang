@@ -16,6 +16,9 @@ class SelectOption {
     /// 在 SelectBox.opts 平铺列表中的下标。AddOption / AddBranch /
     /// AddChild 都会追加到 opts，级联展开链用它寻址。
     int flatIdx;
+    /// 父级的平铺下标（顶层为 -1）。级联多选沿它向上修祖链的勾选态，
+    /// 过滤结果拼完整路径、重开弹层自动展开选中链也靠它。
+    int parentIdx;
     /// 分组标题行：只作小标题展示，不可悬停、不可选择。
     bool grp;
     /// 禁用项：可见、置灰，但不可选择。
@@ -27,6 +30,7 @@ class SelectOption {
         this.cells = null;
         this.children = null;
         this.flatIdx = 0 - 1;
+        this.parentIdx = 0 - 1;
         this.grp = false;
         this.disabled = false;
     }
@@ -123,6 +127,28 @@ class SelectBox : Control {
     List<int> cascadePath;
     /// 级联顶层选项（AddBranch 建立的那些），弹层第一列渲染它们。
     List<SelectOption> cascRoots;
+    /// 级联过滤的命中下标（filterable + 关键词非空时重建）：平铺所有
+    /// 层级里标签命中的节点，行上显示完整路径。
+    List<int> cascadeFilter;
+    /// 级联父子联动（Naive UI `cascade` prop，默认开）：勾选父级带动
+    /// 全部子孙，父级的勾/半勾由子孙推导；关掉后任何层级的选项都可
+    /// 独立勾选，单选下也允许直接选中带子级的分支。
+    bool cascadeLink;
+    /// 勾选策略（Naive UI check-strategy）：0 all 全部勾选节点、
+    /// 1 parent 只算没被更深勾选祖先盖住的节点（完整勾选子树的顶）、
+    /// 2 child 只算勾选的叶子。
+    int checkStrategy;
+    /// 触发器/标签显示完整路径（"浙江 / 杭州 / 西湖区"，
+    /// Naive UI show-path）；关掉只显示末级短标签。
+    bool showPath;
+    /// 悬停即展开下一列（Naive UI hover-trigger）；默认点击展开。
+    bool hoverExpand;
+    /// 从过滤结果选中后清掉搜索词（默认清）。
+    bool clearFilterAfter;
+    /// 级联各列的滚动偏移（按下标取，多退少补）。
+    List<int> cascadeScroll;
+    /// 各列内嵌 Scrollbar 的信号视图，懒建，与 cascadeScroll 同步。
+    List<SignalInt> cascadeScrollSig;
     /// 树形模式：弹层内嵌一颗真 TreeView，展开/折叠、滚动、悬停
     /// 全部由 TreeView 自持，SelectBox 只负责摆位与收值。
     bool treeMode;
@@ -211,6 +237,14 @@ class SelectBox : Control {
         this.cascade = false;
         this.cascadePath = null;
         this.cascRoots = null;
+        this.cascadeFilter = null;
+        this.cascadeLink = true;
+        this.checkStrategy = 0;
+        this.showPath = true;
+        this.hoverExpand = false;
+        this.clearFilterAfter = true;
+        this.cascadeScroll = null;
+        this.cascadeScrollSig = null;
         this.treeMode = false;
         this.treeBox = null;
         this.treeSelSeen = 0 - 1;
@@ -381,8 +415,19 @@ class SelectBox : Control {
         open = v;
         if (v) {
             scrollY = 0;
-            // 级联弹层从第一列重新开始。
+            // 级联弹层回到第一列；单选已有选中值时把它的祖先链展开，
+            // 重开弹层能直接看到选中路径（多选没有单一选中，回第一列）。
             cascadePath = new List<int>();
+            cascadeScroll = null;
+            if (cascade && !multi && selected >= 0 && selected < opts.Count) {
+                List<int> chain = new List<int>();
+                int walk = opts[selected].parentIdx;
+                while (walk >= 0 && walk < opts.Count && chain.Count < 3) {
+                    chain.Insert(0, walk);
+                    walk = opts[walk].parentIdx;
+                }
+                cascadePath = chain;
+            }
             // 开层即一次新搜索：清掉上一次的关键词。
             if (filterable && filterBox != null) {
                 filterBox.SetText("");
@@ -435,9 +480,49 @@ class SelectBox : Control {
 
     /// 级联选择模式。层级用 AddBranch / AddChild 建立，
     /// 弹层逐列展开，选中叶子时触发器显示完整路径
-    /// （"浙江 / 杭州 / 西湖区"）。
+    /// （"浙江 / 杭州 / 西湖区"）。配合 Multi(true) 得到勾选式
+    /// 多选（父子联动 + 勾选策略 + 标签芯片触发器）。
     SelectBox Cascade() {
         cascade = true;
+        return this;
+    }
+
+    static int CheckAll() { return 0; }
+    static int CheckParent() { return 1; }
+    static int CheckChild() { return 2; }
+
+    /// 级联父子联动（Naive UI `cascade` prop，默认开）：勾选父级带动
+    /// 全部子孙；关掉后任何层级的选项独立勾选，单选下也允许直接选中
+    /// 带子级的分支。
+    SelectBox CascadeLink(bool v) {
+        cascadeLink = v;
+        return this;
+    }
+
+    /// 勾选策略：CheckAll / CheckParent / CheckChild（Naive UI
+    /// check-strategy）。决定哪些勾选节点计入触发器的值集合。
+    SelectBox CheckStrategy(int v) {
+        if (v >= 0 && v <= 2) { checkStrategy = v; }
+        return this;
+    }
+
+    /// 触发器是否显示完整路径；false 只显示末级短标签
+    /// （Naive UI show-path）。
+    SelectBox ShowPath(bool v) {
+        showPath = v;
+        return this;
+    }
+
+    /// 悬停即展开下一列（Naive UI hover-trigger）；默认点击展开。
+    SelectBox HoverExpand(bool v) {
+        hoverExpand = v;
+        return this;
+    }
+
+    /// 从过滤结果里选中后是否清掉搜索词（Naive UI
+    /// clear-filter-after-select，默认清）。
+    SelectBox ClearFilterAfter(bool v) {
+        clearFilterAfter = v;
         return this;
     }
 
@@ -460,6 +545,7 @@ class SelectBox : Control {
         if (parent < 0 || parent >= opts.Count) { return 0 - 1; }
         SelectOption o = new SelectOption(label, false);
         o.flatIdx = opts.Count;
+        o.parentIdx = parent;
         opts.Add(o);
         opts[parent].Attach(o, o.flatIdx);
         popupWDirty = true;
@@ -560,13 +646,29 @@ class SelectBox : Control {
     }
 
     /// 根据 filterText 重建过滤索引列表（空文本/未启用 → 全量）。
-    /// 表格模式下匹配整行的所有单元格，否则只匹配 label：一张表里
+    /// 级联模式下平铺所有层级、按标签匹配（行上显示完整路径）；
+    /// 表格模式匹配整行的所有单元格，否则只匹配 label：一张表里
     /// 按代码搜和按名称搜同样自然，只认首列会让另一半列形同虚设。
     void RebuildFilter() {
         popupWDirty = true;
-        if (!filterable || filterText == "") { filteredIdx = null; return; }
+        if (!filterable || filterText == "") {
+            filteredIdx = null;
+            cascadeFilter = null;
+            return;
+        }
         List<int> r = new List<int>();
         string q = filterText.ToLower();
+        if (cascade) {
+            // 级联过滤：所有层级的节点都参与匹配，命中项平铺单列展示，
+            // 行文本是完整路径。分组标题不参与。
+            for (int i = 0; i < opts.Count; i = i + 1) {
+                if (opts[i].grp) { continue; }
+                if (opts[i].label.ToLower().Contains(q)) { r.Add(i); }
+            }
+            cascadeFilter = r;
+            cascadeScroll = null;
+            return;
+        }
         bool tbl = this.IsTable();
         // 分组标题不参与匹配：只有当它后面（到下一个标题前）有
         // 命中项时才保留，孤立的标题随组一起隐藏。
@@ -621,6 +723,7 @@ class SelectBox : Control {
         selected = 0 - 1;
         pathText = "";
         treeSelSeen = 0 - 1;
+        cascadeScroll = null;
         if (treeBox != null) { treeBox.ClearSelection(); }
         for (int i = 0; i < opts.Count; i = i + 1) {
             opts[i].chosen = false;
@@ -641,6 +744,16 @@ class SelectBox : Control {
 
     string Text() {
         if (multi) {
+            // 级联多选：按勾选策略取值集合，显示路径或短标签。
+            if (cascade) {
+                List<string> labs = this.ValueLabels();
+                string acc = "";
+                for (int i = 0; i < labs.Count; i = i + 1) {
+                    if (i > 0) { acc = acc + ", "; }
+                    acc = acc + labs[i];
+                }
+                return acc;
+            }
             string acc = "";
             for (int i = 0; i < opts.Count; i = i + 1) {
                 if (opts[i].chosen) {
@@ -650,7 +763,14 @@ class SelectBox : Control {
             }
             return acc;
         }
-        // 级联/树形显示完整路径，而不是叶子的短标签。
+        // 级联按当前 showPath 动态出路径/短标签（选择后切换设置也
+        // 立即生效）；树形仍用收值时缓存的 payload 文本。
+        if (cascade) {
+            if (selected >= 0 && selected < opts.Count) {
+                return this.ValueText(selected);
+            }
+            return pathText;
+        }
         if (pathText != "") { return pathText; }
         if (selected >= 0 && selected < opts.Count) { return opts[selected].label; }
         return "";
@@ -722,6 +842,16 @@ class SelectBox : Control {
         PropSpec flt = PropSpec.Bool("filterable", "Filterable");
         flt.flag = filterable;
         ps.Add(flt);
+        PropSpec sp = PropSpec.Bool("showPath", "ShowPath");
+        sp.flag = showPath;
+        ps.Add(sp);
+        PropSpec cs = PropSpec.Enum("checkStrategy", "CheckStrategy",
+            new List<string>{ "all", "parent", "child" });
+        cs.num = checkStrategy;
+        ps.Add(cs);
+        PropSpec he = PropSpec.Bool("hoverExpand", "HoverExpand");
+        he.flag = hoverExpand;
+        ps.Add(he);
         return ps;
     }
 
@@ -826,7 +956,13 @@ class SelectBox : Control {
         string shown = this.Text();
         StyleBox placeholderStyle = this.ResolvePartAs(app, "select", "placeholder", "",
                                                         cls, partState);
-        if (shown == "") {
+        if (multi && cascade && shown != "") {
+            // 级联多选：勾选值渲染成标签芯片（× 可单独移除，
+            // 放不下折叠 +N），而不是一长串逗号文本。
+            this.DrawCascadeTags(app, c, t, cls, partState, x, y, w, h,
+                                 pad, arrowSlot, showClear, clearSize, fs,
+                                 leftUp);
+        } else if (shown == "") {
             int hintFs = placeholderStyle.FontOr(fs);
             int hintY = Canvas.CenterTextY(y, h, hintFs);
             c.DrawText(x + pad, hintY,
@@ -856,7 +992,8 @@ class SelectBox : Control {
         // ---- 触发控件输入（仅关闭状态） ----
         // 弹出层自身的点击（选择选项 / 外部关闭）在
         // OnPaintOverlay 中处理，使其在覆盖阶段解析于内容之上。
-        if (leftUp && !open) {
+        // 芯片 × 移除值的点击已在 DrawCascadeTags 里认领，跳过。
+        if (leftUp && !open && !app.ClickClaimed()) {
             if (overClear) {
                 this.Clear();
                 app.RequestRedraw();
@@ -1256,8 +1393,11 @@ class SelectBox : Control {
         }
     }
 
-    /// 级联弹层：一列一级。点中带子级的选项在其右侧展开下一列，
-    /// 叶子（或没有子级的分支）选中收值并关闭。列宽对分弹层，
+    /// 级联弹层：一列一级。点中带子级的选项在其右侧展开下一列
+    /// （HoverExpand 时悬停即展开），叶子（联动关闭时的任意层级）
+    /// 选中收值；多选渲染行首勾选框，勾/半勾沿父子推导。每列自带
+    /// 滚动（滚轮 + 内嵌真 Scrollbar）；filterable 时顶部搜索条，
+    /// 命中项平铺单列、行文本是完整路径。列宽固定、弹层向右生长，
     /// 最多同时 4 列。
     void CascadeOverlay(App app, int x, int y, int w, int h, int fs,
                         int arrowSlot) {
@@ -1265,108 +1405,509 @@ class SelectBox : Control {
         Theme t = app.theme;
         if (cascRoots == null || cascRoots.Count == 0) { return; }
         if (cascadePath == null) { cascadePath = new List<int>(); }
+        int ek = app.EventKind();
         int optH = h;
-        int nCols = cascadePath.Count + 1;
-        if (nCols > 4) { nCols = 4; }
         int visRows = maxVisible;
         if (visRows < 4) { visRows = 4; }
-        int viewH = OverlayPopup.FitH(app, visRows * optH);
-        // 每列一个固定列宽（不窄于触发器）：展开新列时弹层向右
-        // 生长，已展开的列保持原宽 —— 而不是把固定总宽越分越窄。
-        // 超出窗口右缘才整体收窄。
-        int colBase = w;
-        if (colBase < app.Scale(160)) { colBase = app.Scale(160); }
-        w = colBase * nCols;
+        // 过滤开启时顶部留出搜索条；行区在它下面。
+        int fbH = this.FilterBarH(app);
+        int sbMargin = app.Scale(8);
+        int chrome = 0;
+        if (filterable && fbH > 0) { chrome = fbH + sbMargin * 2; }
+        int viewH = OverlayPopup.FitH(app, visRows * optH + chrome);
+        int rowsY = 0;
+        int rowsH = viewH - chrome;
+
+        // 过滤态：命中项平铺单列，行文本是完整路径。
+        bool filtering = filterable && filterText != "";
+        List<int> flat = null;
+        if (filtering) {
+            if (cascadeFilter == null) { this.RebuildFilter(); }
+            flat = cascadeFilter;
+        }
+
+        int nCols;
+        int colW;
+        if (filtering) {
+            nCols = 1;
+            colW = w;
+            if (colW < app.Scale(220)) { colW = app.Scale(220); }
+            w = colW;
+        } else {
+            nCols = cascadePath.Count + 1;
+            if (nCols > 4) { nCols = 4; }
+            // 每列一个固定列宽（不窄于触发器）：展开新列时弹层向右
+            // 生长，已展开的列保持原宽 —— 而不是把固定总宽越分越窄。
+            // 超出窗口右缘才整体收窄。
+            colW = w;
+            if (colW < app.Scale(160)) { colW = app.Scale(160); }
+            w = colW * nCols;
+        }
         int room = app.canvas.Width() - app.Scale(8);
         if (w > room) { w = room; }
         int popX = OverlayPopup.FitX(app, x, w);
         int popY = OverlayPopup.FitY(app, y + h + app.Scale(4), h, viewH);
+        rowsY = popY + chrome;
         app.BlockHitsBelow();
         StyleBox pop = this.ResolvePartAs(app, "select", "popup", "popup",
                                           Class, Style.SSelected());
         pop.Paint(app, popX, popY, w, viewH);
         app.BlockHitsRect(popX, popY, w, viewH);
-        int colW = w / nCols;
-        if (colW < 1) { colW = 1; }
         int rowPad = t.paddingSmall;
-        // 逐列走层级链：第 0 列是顶层选项，第 k 列是
-        // cascadePath[k-1] 的子级。
-        List<SelectOption> cur = cascRoots;
         bool consumed = false;
-        for (int col = 0; col < nCols && cur != null; col = col + 1) {
+        int over = 0 - 1;
+
+        // ---- 搜索条（filterable）----
+        // 与平铺弹层同一颗内嵌真 Input：焦点在弹层打开期间锁定在它
+        // 上面，展开即可键入。
+        if (filterable && fbH > 0) {
+            if (filterBox == null) {
+                string bh = filterHint;
+                if (bh == "") { bh = "Search"; }
+                filterBox = new Input(bh);
+                filterBox.Clearable = true;
+            }
+            if (!app.focus.IsFocused(filterBox.WidgetId())) {
+                app.focus.SetFocused(filterBox.WidgetId());
+            }
+            filterBox.Render(app, popX + sbMargin, popY + sbMargin,
+                             w - sbMargin * 2, fbH);
+            string live = filterBox.GetText();
+            if (live != filterText) {
+                filterText = live;
+                this.RebuildFilter();
+                flat = cascadeFilter;
+                filtering = filterText != "";
+                app.RequestRedraw();
+            }
+        }
+
+        for (int col = 0; col < nCols; col = col + 1) {
+            // 本列可见窗口的选项下标：列模式按滚动窗口切层级列表，
+            // 过滤态取命中表的一片。
+            int count = 0;
+            List<int> rowsIdx = new List<int>();
+            if (filtering) {
+                count = 0;
+                if (flat != null) { count = flat.Count; }
+                int off = this.ColScroll(0, count * optH, rowsH);
+                int r = off / optH;
+                while (r * optH < off + rowsH && r < count) {
+                    rowsIdx.Add(flat[r]);
+                    r = r + 1;
+                }
+            } else {
+                List<SelectOption> cur = cascRoots;
+                if (col > 0) {
+                    cur = null;
+                    int pi = cascadePath[col - 1];
+                    if (pi >= 0 && pi < opts.Count) { cur = opts[pi].children; }
+                }
+                if (cur != null) { count = cur.Count; }
+                int off = this.ColScroll(col, count * optH, rowsH);
+                int r = off / optH;
+                while (r * optH < off + rowsH && r < count) {
+                    rowsIdx.Add(cur[r].flatIdx);
+                    r = r + 1;
+                }
+            }
+            int offCol = this.ColScroll(col, count * optH, rowsH);
             int cx = popX + col * colW;
-            int n = cur.Count;
-            if (n > visRows) { n = visRows; }
-            for (int r = 0; r < n; r = r + 1) {
-                SelectOption o = cur[r];
-                int ry = popY + r * optH;
-                if (ry + optH > popY + viewH) { break; }
-                bool hov = app.mouseX >= cx && app.mouseX < cx + colW
-                    && app.mouseY >= ry && app.mouseY < ry + optH;
+            // 悬停行（可见窗口内的相对行号）。
+            int hovRel = 0 - 1;
+            if (app.mouseX >= cx && app.mouseX < cx + colW
+                && app.mouseY >= rowsY && app.mouseY < rowsY + rowsH) {
+                int rel = (app.mouseY - rowsY + offCol) / optH;
+                if (rel >= 0 && rel < rowsIdx.Count) { hovRel = rel; }
+            }
+            c.PushClip(cx, rowsY, colW, rowsH);
+            for (int rr = 0; rr < rowsIdx.Count; rr = rr + 1) {
+                int idx = rowsIdx[rr];
+                SelectOption o = opts[idx];
+                int ry = rowsY + rr * optH - offCol;
+                bool hov = rr == hovRel && !o.grp && !o.disabled;
                 int st = Style.SNormal();
-                if (hov) { st = st + Style.SHover(); }
-                if (o.flatIdx == selected) { st = st + Style.SSelected(); }
-                StyleBox row = this.ResolvePartAs(app, "select", "option", "",
-                                                  Class, st);
+                if (o.disabled) {
+                    st = Style.SDisabled();
+                } else {
+                    if (hov) { st = st + Style.SHover(); }
+                    if (!multi && idx == selected) {
+                        st = st + Style.SSelected();
+                    }
+                }
+                StyleBox row = this.ResolvePartAs(app, "select", "option",
+                                                  "option", Class, st);
                 row.Paint(app, cx, ry, colW, optH);
-                int labW = colW - rowPad * 2;
-                if (o.HasChildren()) { labW = labW - arrowSlot; }
-                c.DrawText(cx + rowPad, Canvas.CenterTextY(ry, optH, fs),
-                    Ellipsis.Fit(o.label, labW, fs), row.fg, fs);
-                if (o.HasChildren()) {
+                int rowFs = row.FontOr(fs);
+                int tx = cx + rowPad;
+                if (multi) {
+                    int bs = this.DrawCascadeCheck(app, c, t, Class, cx, ry,
+                                                   optH, o.chosen,
+                                                   this.IsPartial(idx));
+                    tx = cx + rowPad + bs + app.Scale(8);
+                }
+                string label = o.label;
+                if (filtering) { label = this.PathOf(idx); }
+                int labW = cx + colW - rowPad - tx;
+                if (o.HasChildren() && !filtering) {
+                    labW = labW - arrowSlot;
+                }
+                c.DrawText(tx, Canvas.CenterTextY(ry, optH, rowFs),
+                    Ellipsis.Fit(label, labW, rowFs), row.fg, rowFs);
+                if (o.HasChildren() && !filtering) {
                     c.DrawGlyphIn("chevron-right", cx + colW - arrowSlot, ry,
                         arrowSlot, optH, arrowSlot - t.paddingSmall, row.fg);
+                }
+                if (hov) { over = idx; }
+                // 悬停展开：带子级的行指上即展开（不收拢、不点选）。
+                if (hov && hoverExpand && !filtering && o.HasChildren()) {
+                    List<int> np = new List<int>();
+                    for (int i = 0; i < col && i < cascadePath.Count;
+                         i = i + 1) {
+                        np.Add(cascadePath[i]);
+                    }
+                    np.Add(idx);
+                    if (!this.SamePath(np)) {
+                        cascadePath = np;
+                        app.RequestRedraw();
+                    }
                 }
                 if (hov && app.ClickAvailable() && !consumed) {
                     consumed = true;
                     app.ClaimClick();
-                    if (o.HasChildren()) {
+                    if (filtering) {
+                        // 过滤结果平铺展示：每行都直接收值/勾选，
+                        // 不再展开（下一列被过滤表盖住了）。
+                        if (multi) {
+                            this.SetChecked(idx, !o.chosen);
+                            if (clearFilterAfter) { this.SetFilterText(""); }
+                        } else {
+                            if (clearFilterAfter) { this.SetFilterText(""); }
+                            this.ChooseCascade(idx);
+                        }
+                    } else if (multi && (app.mouseX < tx || !o.HasChildren()
+                                         || !cascadeLink)) {
+                        // 勾选框区（或叶子、或联动关闭）勾选本行；
+                        // 带子级的分支点标签区仍是展开。
+                        this.SetChecked(idx, !o.chosen);
+                    } else if (!multi && (!o.HasChildren() || !cascadeLink)) {
+                        this.ChooseCascade(idx);
+                    } else {
                         // 展开下一列：截断本列之后的旧链再推入。
                         List<int> next = new List<int>();
                         for (int i = 0; i < col && i < cascadePath.Count;
                              i = i + 1) {
                             next.Add(cascadePath[i]);
                         }
-                        next.Add(o.flatIdx);
+                        next.Add(idx);
                         cascadePath = next;
-                    } else {
-                        this.ChooseCascade(o);
                     }
                     app.RequestRedraw();
                 }
             }
-            // 下一列 = 本列已展开项的子级；没有链或没有子级即止。
-            cur = null;
-            if (col < cascadePath.Count) {
-                int pi = cascadePath[col];
-                if (pi >= 0 && pi < opts.Count && opts[pi].HasChildren()) {
-                    cur = opts[pi].children;
+            c.PopClip();
+            // 弹层内已注册控件（内嵌滚动条的滑块/轨道）上的释放交给
+            // 它，不能当成行选择。
+            if (app.ClickAvailable() && !consumed
+                && app.hitTester.HitTestBelowBlockers(app.mouseX,
+                                                      app.mouseY) != 0 - 1) {
+                consumed = true;
+                app.ClaimClick();
+            }
+            // 每列自带滚动：滚轮滚动本列，内嵌真 Scrollbar 可拖。
+            if (count * optH > rowsH && rowsH > 0) {
+                bool ownsWheel = app.CaptureWheel(cx, rowsY, colW, rowsH);
+                if (ownsWheel && ek == 13) {
+                    int d = app.window.EventKeyCode();
+                    int v = this.ColScroll(col, count * optH, rowsH);
+                    this.SetColScroll(col, v - d * app.scrollSpeed / 120);
+                    app.RequestRedraw();
+                }
+                if (cascadeScrollSig == null) {
+                    cascadeScrollSig = new List<SignalInt>();
+                }
+                while (cascadeScrollSig.Count <= col) {
+                    cascadeScrollSig.Add(null);
+                }
+                if (cascadeScrollSig[col] == null) {
+                    cascadeScrollSig[col] = new SignalInt(0);
+                }
+                SignalInt sig = cascadeScrollSig[col];
+                sig.Set(this.ColScroll(col, count * optH, rowsH));
+                Scrollbar.RenderVerticalScroll(app,
+                    cx + colW - app.Scale(12), rowsY + app.Scale(2),
+                    rowsH - app.Scale(4), rowsH - app.Scale(4),
+                    count * optH, sig);
+                int sb = sig.Get();
+                if (sb > count * optH - rowsH) { sb = count * optH - rowsH; }
+                if (sb < 0) { sb = 0; }
+                if (sb != this.ColScroll(col, count * optH, rowsH)) {
+                    this.SetColScroll(col, sb);
+                    app.RequestRedraw();
                 }
             }
         }
-        this.OverlayDismiss(app, popX, popY, w, viewH, app.EventKind());
+
+        // 过滤没有命中项：整个行区一行浅色提示。
+        if (filtering && (flat == null || flat.Count == 0)) {
+            StyleBox grpStyle = this.ResolvePartAs(app, "select", "group", "",
+                                                   Class, Style.SNormal());
+            c.DrawText(popX + rowPad, Canvas.CenterTextY(rowsY, optH, fs),
+                Ellipsis.Fit("No matches", w - rowPad * 2, fs),
+                grpStyle.FgOr(pop.fg), grpStyle.FontOr(fs));
+        }
+
+        if (over != hoverRow) {
+            hoverRow = over;
+            // 级联行悬停变化同样对外报 Hover（Hovered() 是平铺下标）。
+            Hover.Raise();
+            app.RequestRedraw();
+        }
+        this.OverlayDismiss(app, popX, popY, w, viewH, ek);
     }
 
-    /// 级联选中叶子：路径 = 已展开链 + 本叶，写入触发器、
-    /// 同步绑定并关闭。
-    void ChooseCascade(SelectOption leaf) {
-        string path = "";
-        if (cascadePath != null) {
-            for (int i = 0; i < cascadePath.Count; i = i + 1) {
-                int pi = cascadePath[i];
-                if (pi < 0 || pi >= opts.Count) { continue; }
-                if (path != "") { path = path + " / "; }
-                path = path + opts[pi].label;
+    void SetColScroll(int col, int v) {
+        if (cascadeScroll == null) { cascadeScroll = new List<int>(); }
+        while (cascadeScroll.Count <= col) { cascadeScroll.Add(0); }
+        cascadeScroll[col] = v;
+    }
+
+    /// 级联行首的勾选框：复用 checkbox 的 box/check 样式 part。勾上
+    /// 打勾，半勾（联动模式下子孙有勾选）画短横。返回方框宽度，
+    /// 供点击分区（框区勾选、标签区展开）。
+    int DrawCascadeCheck(App app, Canvas c, Theme t, string cls,
+                         int cx, int ry, int optH, bool on, bool partial) {
+        int st = Style.SNormal();
+        if (on || partial) { st = st + Style.SChecked(); }
+        StyleBox box = this.ResolvePartAs(app, "checkbox", "box", "", cls, st);
+        int bs = box.WidthOr(app.Scale(16));
+        int maxBs = optH - app.Scale(8);
+        if (maxBs < app.Scale(10)) { maxBs = app.Scale(10); }
+        if (bs > maxBs) { bs = maxBs; }
+        int bx = cx + t.paddingSmall;
+        int by = ry + (optH - bs) / 2;
+        box.Paint(app, bx, by, bs, bs);
+        if (on || partial) {
+            StyleBox chk = this.ResolvePartAs(app, "checkbox", "check", "",
+                                              cls, st);
+            int gs = bs - app.Scale(8);
+            if (gs < app.Scale(8)) { gs = bs - app.Scale(4); }
+            string glyph = "minus";
+            if (on) { glyph = "check"; }
+            c.DrawGlyphIn(glyph, bx, by, bs, bs, gs,
+                          chk.FgOr(box.AccentOr(box.fg)));
+        }
+        return bs;
+    }
+
+    /// 级联多选的触发器：勾选值渲染成一排标签芯片（select::tag
+    /// part），每片带 ×，点 × 单独移除该值；放不下的折叠成 +N ——
+    /// maxTagCount 由触发器宽度自适应兜住。showPath 决定片上的
+    /// 文本是完整路径还是末级短标签。
+    void DrawCascadeTags(App app, Canvas c, Theme t, string cls,
+                         int partState, int x, int y, int w, int h,
+                         int pad, int arrowSlot, bool showClear,
+                         int clearSize, int fs, bool leftUp) {
+        List<int> vs = this.ValueIdxs();
+        int rightEdge = x + w - pad - arrowSlot - t.paddingSmall;
+        if (showClear) { rightEdge = rightEdge - clearSize - t.paddingSmall; }
+        int chipH = h - app.Scale(8);
+        if (chipH > app.Scale(24)) { chipH = app.Scale(24); }
+        if (chipH < app.Scale(16)) { chipH = h - app.Scale(4); }
+        int chipFs = fs;
+        if (chipFs > chipH - app.Scale(8)) { chipFs = chipH - app.Scale(8); }
+        if (chipFs < 8) { chipFs = 8; }
+        int gap = app.Scale(4);
+        int cx = x + pad;
+        int cy = y + (h - chipH) / 2;
+        int shownN = 0;
+        for (int i = 0; i < vs.Count; i = i + 1) {
+            string label = this.ValueText(vs[i]);
+            int tw = Canvas.MeasureText(label, chipFs);
+            // 内距 ×2 + 文本 + × 字形槽。
+            int cw = tw + app.Scale(10) + app.Scale(10) + chipFs;
+            if (cx + cw > rightEdge) { break; }
+            StyleBox chip = this.ResolvePartAs(app, "select", "tag", "",
+                                               cls, partState);
+            chip.Paint(app, cx, cy, cw, chipH);
+            c.DrawText(cx + app.Scale(5),
+                Canvas.CenterTextY(cy, chipH, chipFs),
+                Ellipsis.Fit(label, tw + app.Scale(2), chipFs),
+                chip.fg, chipFs);
+            int xx = cx + cw - app.Scale(5) - chipFs;
+            c.DrawGlyphIn("close", xx, cy, chipFs + app.Scale(4), chipH,
+                          chipFs - 2, chip.fg);
+            if (leftUp && !app.ClickClaimed()
+                && app.mouseX >= xx - app.Scale(2)
+                && app.mouseX < cx + cw
+                && app.mouseY >= cy && app.mouseY < cy + chipH) {
+                app.ClaimClick();
+                this.SetChecked(vs[i], false);
+                app.RequestRedraw();
+            }
+            cx = cx + cw + gap;
+            shownN = shownN + 1;
+        }
+        if (shownN < vs.Count) {
+            string more = "+" + Convert.ToString(vs.Count - shownN);
+            int mw = Canvas.MeasureText(more, chipFs) + app.Scale(10);
+            if (cx + mw <= rightEdge) {
+                StyleBox chip = this.ResolvePartAs(app, "select", "tag", "",
+                                                   cls, partState);
+                chip.Paint(app, cx, cy, mw, chipH);
+                c.DrawText(cx + app.Scale(5),
+                    Canvas.CenterTextY(cy, chipH, chipFs), more,
+                    chip.fg, chipFs);
             }
         }
-        if (path != "") { path = path + " / "; }
-        path = path + leaf.label;
-        pathText = path;
-        selected = leaf.flatIdx;
+    }
+
+    /// 级联选中一个节点（平铺下标）：写入触发器（showPath 决定完整
+    /// 路径还是末级短标签）、同步绑定并关闭。联动开启时只有叶子能
+    /// 走到这里；关闭时带子级的分支也可以直接选中。
+    void ChooseCascade(int idx) {
+        if (idx < 0 || idx >= opts.Count) { return; }
+        pathText = this.ValueText(idx);
+        selected = idx;
         if (model != null) { model.Set(selected); lastModel = selected; }
         if (data != null) { data.Set(selected); lastData = selected; }
         Change.Raise();
         this.SetOpen(false);
+    }
+
+    /// 第 `idx` 个选项的完整路径文本（"浙江省 / 杭州市 / 西湖区"）。
+    string PathOf(int idx) {
+        if (idx < 0 || idx >= opts.Count) { return ""; }
+        List<int> chain = new List<int>();
+        int cur = idx;
+        while (cur >= 0 && cur < opts.Count) {
+            chain.Insert(0, cur);
+            cur = opts[cur].parentIdx;
+        }
+        string path = "";
+        for (int i = 0; i < chain.Count; i = i + 1) {
+            if (i > 0) { path = path + " / "; }
+            path = path + opts[chain[i]].label;
+        }
+        return path;
+    }
+
+    /// 值的显示文本：showPath 决定完整路径还是末级短标签。
+    string ValueText(int idx) {
+        if (!showPath) { return this.OptionLabel(idx); }
+        return this.PathOf(idx);
+    }
+
+    /// 勾选策略下的值集合（平铺下标）：all = 全部勾选节点；
+    /// parent = 没有被更深的勾选祖先盖住的节点（完整勾选子树的顶）；
+    /// child = 勾选的叶子。
+    List<int> ValueIdxs() {
+        List<int> r = new List<int>();
+        for (int i = 0; i < opts.Count; i = i + 1) {
+            if (!opts[i].chosen || opts[i].grp) { continue; }
+            if (checkStrategy == 2) {
+                if (!opts[i].HasChildren()) { r.Add(i); }
+                continue;
+            }
+            if (checkStrategy == 1) {
+                int p = opts[i].parentIdx;
+                bool covered = false;
+                while (p >= 0 && p < opts.Count) {
+                    if (opts[p].chosen) { covered = true; break; }
+                    p = opts[p].parentIdx;
+                }
+                if (covered) { continue; }
+            }
+            r.Add(i);
+        }
+        return r;
+    }
+
+    /// 值集合的显示标签（配合 ValueText 的 showPath 语义）。
+    List<string> ValueLabels() {
+        List<int> vs = this.ValueIdxs();
+        List<string> r = new List<string>();
+        for (int i = 0; i < vs.Count; i = i + 1) {
+            r.Add(this.ValueText(vs[i]));
+        }
+        return r;
+    }
+
+    /// 级联多选：把 `idx` 的勾选态设为 `on`。联动开启时带动全部
+    /// 子孙，再沿父链回推（父级 = 全部子级勾上才算勾上）；
+    /// 关闭时只改自己。统一触发 Change。
+    void SetChecked(int idx, bool on) {
+        if (idx < 0 || idx >= opts.Count) { return; }
+        if (opts[idx].grp || opts[idx].disabled) { return; }
+        this.ApplyCheck(idx, on);
+        this.FixupAncestors(idx);
+        Change.Raise();
+    }
+
+    void ApplyCheck(int idx, bool on) {
+        opts[idx].chosen = on;
+        if (cascadeLink && opts[idx].HasChildren()) {
+            List<SelectOption> kids = opts[idx].children;
+            for (int i = 0; i < kids.Count; i = i + 1) {
+                this.ApplyCheck(kids[i].flatIdx, on);
+            }
+        }
+    }
+
+    /// 沿父链回推勾选态：全子勾上 → 父勾上，否则父取消。
+    /// 某层已一致就停——更上层不可能因此变化。
+    void FixupAncestors(int idx) {
+        if (!cascadeLink) { return; }
+        int p = opts[idx].parentIdx;
+        while (p >= 0 && p < opts.Count) {
+            bool all = true;
+            List<SelectOption> kids = opts[p].children;
+            for (int i = 0; i < kids.Count; i = i + 1) {
+                if (!kids[i].chosen) { all = false; break; }
+            }
+            if (opts[p].chosen == all) { break; }
+            opts[p].chosen = all;
+            p = opts[p].parentIdx;
+        }
+    }
+
+    /// 第 `idx` 个选项的半勾态：自身未勾但有勾选的子孙（联动模式）。
+    bool IsPartial(int idx) {
+        if (idx < 0 || idx >= opts.Count) { return false; }
+        if (opts[idx].chosen || !cascadeLink) { return false; }
+        return this.HasCheckedDescendant(idx);
+    }
+
+    bool HasCheckedDescendant(int idx) {
+        if (!opts[idx].HasChildren()) { return false; }
+        List<SelectOption> kids = opts[idx].children;
+        for (int i = 0; i < kids.Count; i = i + 1) {
+            if (kids[i].chosen) { return true; }
+            if (this.HasCheckedDescendant(kids[i].flatIdx)) { return true; }
+        }
+        return false;
+    }
+
+    /// 第 `col` 列的滚动偏移（像素），按内容高度钳制。
+    int ColScroll(int col, int contentH, int viewH) {
+        if (cascadeScroll == null) { cascadeScroll = new List<int>(); }
+        while (cascadeScroll.Count <= col) { cascadeScroll.Add(0); }
+        int maxOff = contentH - viewH;
+        if (maxOff < 0) { maxOff = 0; }
+        int v = cascadeScroll[col];
+        if (v > maxOff) { v = maxOff; }
+        if (v < 0) { v = 0; }
+        cascadeScroll[col] = v;
+        return v;
+    }
+
+    bool SamePath(List<int> a) {
+        if (cascadePath == null) { return a.Count == 0; }
+        if (a.Count != cascadePath.Count) { return false; }
+        for (int i = 0; i < a.Count; i = i + 1) {
+            if (a[i] != cascadePath[i]) { return false; }
+        }
+        return true;
     }
 
     /// 树形弹层：内嵌真 TreeView，选中叶节点收值关闭。

@@ -1748,6 +1748,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   # InputNumber's value math is pure computation too: the fixed-point
   # display/parse pair (NumberText / ParseScaled incl. half-up rounding and
   # comma-grouping), the Naive-UI format/parse hooks, the validator's error
+  # SelectBox 级联增强：父子指针链（单选路径/重开自动展开/联动关闭
+  # 选分支）、多选勾选模型（联动带动、祖链回推、半勾）、勾选策略
+  # 取值（all/parent/child）、级联过滤平铺，以及弹层 blocker、悬停
+  # 行到平铺下标的映射和列滚动钳制。
+  add_test(NAME conformance_gui_selectbox_cascade
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/selectbox_cascade_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_selectbox_cascade.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_selectbox_cascade${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # flag + Invalid event, step/clamp, and the designer Extra round-trip
   # (precision / group / loading / prefix / suffix / placement).
   # Pinned headlessly, no window needed.

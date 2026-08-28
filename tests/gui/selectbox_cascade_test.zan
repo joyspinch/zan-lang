@@ -1,0 +1,246 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// SelectBox 级联增强的无窗口回归。级联不再只是「点开逐列、选叶子」：
+/// 父子指针链撑起了四个容易回归的机制，各自断言——
+///
+/// 1. 单选路径与重开自动展开：选中叶子后触发器是完整路径
+///    （showPath=false 时退回末级短标签），重开弹层时 cascadePath
+///    沿 parentIdx 自动展开到选中链，而不是每次都回到第一列。
+/// 2. 联动关闭（CascadeLink(false)）：带子级的分支可以直接选中，
+///    路径含分支本身；联动开启时分支只能展开。
+/// 3. 多选勾选模型：SetChecked 联动带动全部子孙、FixupAncestors
+///    沿父链回推（全子勾上 → 父勾上，取消同理），半勾 IsPartial
+///    只在「自身未勾但有勾选子孙」时为真；Clear 全清。
+/// 4. 勾选策略取值：all = 全部勾选节点，parent = 没被更深的勾选
+///    祖先盖住的节点（完整勾选子树的顶），child = 勾选的叶子；
+///    Text() 与 ValueLabels() 按同一策略出值。
+/// 另有几何断言：弹层 blocker 注册、指针悬停行映射到平铺下标
+/// （Hover 事件的数据源）、列滚动偏移的钳制与回读。
+class Program {
+    static int fails;
+
+    static void True(string what, bool got) {
+        if (got) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void EqStr(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got '{got}' want '{want}'");
+    }
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got {got} want {want}");
+    }
+
+    static void EqList(string what, List<int> got, string want) {
+        string acc = "";
+        for (int i = 0; i < got.Count; i = i + 1) {
+            if (i > 0) { acc = acc + ","; }
+            acc = acc + Convert.ToString(got[i]);
+        }
+        if (acc == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got '{acc}' want '{want}'");
+    }
+
+    static void Main() {
+        fails = 0;
+
+        // ---- 建树：两省；苏州市恰好两个区，供祖链回推断言 ------------
+        SelectBox area = new SelectBox("pick").Cascade();
+        int zj = area.AddBranch("浙江省");
+        int hz = area.AddChild(zj, "杭州市");
+        for (int i = 0; i < 12; i = i + 1) {
+            area.AddChild(hz, "区" + Convert.ToString(i + 1));
+        }
+        int nb = area.AddChild(zj, "宁波市");
+        int nh = area.AddChild(nb, "宁海县");
+        int js = area.AddBranch("江苏省");
+        int sz = area.AddChild(js, "苏州市");
+        int gs = area.AddChild(sz, "姑苏区");
+        int gy = area.AddChild(sz, "工业园区");
+        // 平铺顺序 = 建树顺序；父链回填到每个子级。
+        EqInt("flat count", area.Count(), 2 + 1 + 12 + 1 + 1 + 1 + 2);
+        EqInt("branch parent", area.opts[zj].parentIdx, 0 - 1);
+        EqInt("city parent", area.opts[hz].parentIdx, zj);
+        EqInt("leaf parent", area.opts[gs].parentIdx, sz);
+        EqStr("root path", area.PathOf(gs), "江苏省 / 苏州市 / 姑苏区");
+
+        // ---- 单选：路径文本 + showPath 短标签 --------------------------
+        area.ChooseCascade(gs);
+        EqStr("path text", area.Text(), "江苏省 / 苏州市 / 姑苏区");
+        EqInt("selected flat", area.Selected(), gs);
+        True("has value", area.HasValue());
+        area.ShowPath(false);
+        EqStr("short label", area.Text(), "姑苏区");
+        area.ShowPath(true);
+
+        // 重开弹层：沿父链自动展开选中链，而不是回到第一列。
+        area.SetOpen(true);
+        EqInt("reopen chain depth", area.cascadePath.Count, 2);
+        EqInt("reopen chain0", area.cascadePath[0], js);
+        EqInt("reopen chain1", area.cascadePath[1], sz);
+        area.SetOpen(false);
+
+        // ---- 联动关闭：分支直接选中 ------------------------------------
+        SelectBox any = new SelectBox("any").Cascade().CascadeLink(false);
+        int azj = any.AddBranch("浙江省");
+        int ahz = any.AddChild(azj, "杭州市");
+        any.AddChild(ahz, "西湖区");
+        any.ChooseCascade(ahz);
+        EqStr("branch picked", any.Text(), "浙江省 / 杭州市");
+
+        // ---- 多选勾选模型：联动带动 + 祖链回推 + 半勾 ------------------
+        // 浙江省放两个市：勾全杭州市后省仍是半勾（宁波未动）。
+        SelectBox m = new SelectBox("m", true).Cascade();
+        int mzj = m.AddBranch("浙江省");
+        int mhz = m.AddChild(mzj, "杭州市");
+        int mxh = m.AddChild(mhz, "西湖区");
+        int mbj = m.AddChild(mhz, "滨江区");
+        int mnb = m.AddChild(mzj, "宁波市");
+        int msz = m.AddBranch("江苏省");
+        int mnj = m.AddChild(msz, "南京市");
+        int mxw = m.AddChild(mnj, "玄武区");
+        int mgl = m.AddChild(mnj, "鼓楼区");
+
+        m.SetChecked(mxh, true);
+        True("leaf chosen", m.IsChosen(mxh));
+        True("parent awaits children", !m.IsChosen(mhz));
+        True("parent partial", m.IsPartial(mhz));
+        True("grandparent partial", m.IsPartial(mzj));
+        m.SetChecked(mbj, true);
+        True("all children -> parent chosen", m.IsChosen(mhz));
+        True("parent no longer partial", !m.IsPartial(mhz));
+        True("grandparent still partial", m.IsPartial(mzj));
+        // 值集合按平铺下标升序：市先于它的区。
+        EqStr("multi text all", m.Text(),
+            "浙江省 / 杭州市, 浙江省 / 杭州市 / 西湖区, 浙江省 / 杭州市 / 滨江区");
+
+        // 联动带动：勾市 → 全部区勾上；取消市 → 全部区取消；
+        // 省下还有未勾的宁波，省不回推为勾。
+        m.SetChecked(mhz, true);
+        True("cascade down on", m.IsChosen(mxh) && m.IsChosen(mbj));
+        True("province stays partial", !m.IsChosen(mzj) && m.IsPartial(mzj));
+        EqStr("multi text all 2", m.Text(),
+            "浙江省 / 杭州市, 浙江省 / 杭州市 / 西湖区, 浙江省 / 杭州市 / 滨江区");
+        m.SetChecked(mhz, false);
+        True("cascade down off", !m.IsChosen(mxh) && !m.IsChosen(mbj));
+        True("province cleared", !m.IsChosen(mzj) && !m.IsPartial(mzj));
+        EqStr("multi text all 3", m.Text(), "");
+
+        // 半勾不算值：勾一个区，策略 all 只报该区，父链半勾。
+        m.SetChecked(mxw, true);
+        EqList("values all", m.ValueIdxs(), Convert.ToString(mxw));
+        True("city partial", m.IsPartial(mnj));
+        True("province partial", m.IsPartial(msz));
+        m.Clear();
+        True("clear resets", !m.IsChosen(mxw) && m.Text() == "");
+
+        // ---- 勾选策略：child 只算叶子，parent 只算子树顶 ----------------
+        // 浙江省两个市：勾全杭州市不会把省带成勾，parent 策略的值
+        // 停在市这一层。
+        SelectBox s = new SelectBox("s", true).Cascade()
+            .CheckStrategy(SelectBox.CheckChild());
+        int szj = s.AddBranch("浙江省");
+        int shz = s.AddChild(szj, "杭州市");
+        int sxh = s.AddChild(shz, "西湖区");
+        int sbj = s.AddChild(shz, "滨江区");
+        int snb = s.AddChild(szj, "宁波市");
+        int snh = s.AddChild(snb, "宁海县");
+        s.SetChecked(shz, true);          // 联动：市带两区
+        EqList("child strategy", s.ValueIdxs(),
+            Convert.ToString(sxh) + "," + Convert.ToString(sbj));
+        EqStr("child text", s.Text(),
+            "浙江省 / 杭州市 / 西湖区, 浙江省 / 杭州市 / 滨江区");
+        s.CheckStrategy(SelectBox.CheckParent());
+        EqList("parent strategy", s.ValueIdxs(), Convert.ToString(shz));
+        EqStr("parent text", s.Text(), "浙江省 / 杭州市");
+        s.CheckStrategy(SelectBox.CheckAll());
+        EqList("all strategy", s.ValueIdxs(),
+            Convert.ToString(shz) + "," + Convert.ToString(sxh)
+            + "," + Convert.ToString(sbj));
+        // showPath=false：Text() 的标签退回末级短标签。
+        s.ShowPath(false);
+        EqStr("strategy short text", s.Text(), "杭州市, 西湖区, 滨江区");
+
+        // 联动关闭的多选：逐项独立，父不回推。
+        SelectBox ind = new SelectBox("ind", true).Cascade()
+            .CascadeLink(false);
+        int izj = ind.AddBranch("浙江省");
+        int ihz = ind.AddChild(izj, "杭州市");
+        ind.SetChecked(ihz, true);
+        True("independent parent", ind.IsChosen(ihz));
+        True("independent no fixup", !ind.IsChosen(izj));
+        EqList("independent values", ind.ValueIdxs(), Convert.ToString(ihz));
+
+        // ---- 级联过滤：平铺命中，路径为行文本 --------------------------
+        SelectBox f = new SelectBox("f").Cascade().Filterable(true);
+        int fzj = f.AddBranch("浙江省");
+        int fhz = f.AddChild(fzj, "杭州市");
+        int fxh = f.AddChild(fhz, "西湖区");
+        int fjs = f.AddBranch("江苏省");
+        int fsz = f.AddChild(fjs, "苏州市");
+        int fgs = f.AddChild(fsz, "姑苏区");
+        f.SetFilterText("苏");
+        EqList("filter hits", f.cascadeFilter,
+            Convert.ToString(fjs) + "," + Convert.ToString(fsz)
+            + "," + Convert.ToString(fgs));
+        f.SetFilterText("");
+        True("filter cleared", f.cascadeFilter == null);
+        // 过滤结果直接收值：路径走 showPath 语义（ValueText）。
+        f.SetFilterText("姑苏");
+        f.ChooseCascade(fgs);
+        EqStr("filter pick path", f.Text(), "江苏省 / 苏州市 / 姑苏区");
+
+        // ---- 几何：blocker 注册 + 悬停行映射 + 列滚动钳制 --------------
+        App app = new App("sb-cascade", 800, 600);
+        area.SetOpen(true);   // 已选姑苏区：自动展开到 江苏省/苏州市
+        app.BeginFrame();
+        area.RenderIn(app, 40, 40, 200, 34);
+        app.RunOverlays();
+        int optH = area.lastH;          // 实际行高 = 样式化头部高度
+        int popY = 40 + optH + app.Scale(4);
+        int colW = 200;
+        if (colW < app.Scale(160)) { colW = app.Scale(160); }
+        True("cascade blocker", app.hitTester.BlockerAt(40 + colW / 2,
+            popY + optH));
+        // 指针放进第三列第一行：苏州市的两个子级里姑苏区排第 0。
+        app.BeginFrame();
+        app.mouseX = 40 + 2 * colW + app.Scale(10);
+        app.mouseY = popY + optH / 2;
+        area.RenderIn(app, 40, 40, 200, 34);
+        app.RunOverlays();
+        EqInt("hover col2 row0", area.Hovered(), gs);
+        // 指针移出弹层：悬停清零。
+        app.BeginFrame();
+        app.mouseX = 700;
+        app.mouseY = 500;
+        area.RenderIn(app, 40, 40, 200, 34);
+        app.RunOverlays();
+        EqInt("hover cleared", area.Hovered(), 0 - 1);
+        area.SetOpen(false);
+
+        // 列滚动：偏移按内容高度钳制，负值回零（12 区 × optH 的内容
+        // 在 6 行视口里要能滚到最后一行）。
+        EqInt("scroll clamp low", area.ColScroll(1, 12 * optH, 6 * optH), 0);
+        area.SetColScroll(1, 0 - 50);
+        EqInt("scroll clamp neg", area.ColScroll(1, 12 * optH, 6 * optH), 0);
+        area.SetColScroll(1, 99 * optH);
+        EqInt("scroll clamp high", area.ColScroll(1, 12 * optH, 6 * optH),
+            6 * optH);
+
+        if (fails == 0) {
+            Console.WriteLine("selectbox_cascade_test OK");
+        } else {
+            Console.WriteLine("selectbox_cascade_test FAIL "
+                + Convert.ToString(fails));
+        }
+    }
+}
