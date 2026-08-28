@@ -1745,9 +1745,6 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_slider${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  # InputNumber's value math is pure computation too: the fixed-point
-  # display/parse pair (NumberText / ParseScaled incl. half-up rounding and
-  # comma-grouping), the Naive-UI format/parse hooks, the validator's error
   # SelectBox 级联增强：父子指针链（单选路径/重开自动展开/联动关闭
   # 选分支）、多选勾选模型（联动带动、祖链回推、半勾）、勾选策略
   # 取值（all/parent/child）、级联过滤平铺，以及弹层 blocker、悬停
@@ -1761,6 +1758,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_selectbox_cascade${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # Menu v2 (tree menu): pure-model flatten/default-expand asserts plus a
+  # headless-frame pass over hit registration and the three batch render hooks.
+  add_test(NAME conformance_gui_menu
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/menu_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_menu.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_menu${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  # InputNumber's value math is pure computation too: the fixed-point
+  # display/parse pair (NumberText / ParseScaled incl. half-up rounding and
+  # comma-grouping), the Naive-UI format/parse hooks, the validator's error
   # flag + Invalid event, step/clamp, and the designer Extra round-trip
   # (precision / group / loading / prefix / suffix / placement).
   # Pinned headlessly, no window needed.
@@ -1825,7 +1836,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_colorinject${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_flex conformance_gui_carousel conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable conformance_gui_css conformance_gui_tailwind conformance_gui_props conformance_gui_tree conformance_gui_webview_interop conformance_gui_colorinject conformance_gui_calendar PROPERTIES
+  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_flex conformance_gui_carousel conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable conformance_gui_css conformance_gui_tailwind conformance_gui_props conformance_gui_tree conformance_gui_menu conformance_gui_webview_interop conformance_gui_colorinject conformance_gui_calendar PROPERTIES
     ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 

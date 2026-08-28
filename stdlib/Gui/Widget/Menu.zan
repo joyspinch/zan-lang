@@ -3,10 +3,63 @@ using Gui;
 
 namespace Gui.Widget;
 
+// ---- v2 批量渲染钩子 --------------------------------------------------
+// 三个委托对齐 layui 的 render-label / render-icon / expand-icon：每行
+// 渲染前调用一次，传入该行的 MenuItem，返回替换后的文本/字形名/展开箭头。
+// 传 null 的钩子退化为条目自带字段 + 默认箭头。委托在调用点绑定（方法组
+// 或 lambda 字面量），Zan 委托不能捕获局部变量，逐行上下文即 MenuItem 本身。
+delegate string MenuLabelOf(MenuItem item);
+delegate string MenuIconOf(MenuItem item);
+delegate string MenuExpandIconOf(MenuItem item, bool expanded);
+
+/// 树形菜单的一行：条目 + 深度（顶层 0，子项逐级 +1，用于缩进）。
+class MenuRow {
+    MenuItem item;
+    int depth;
+
+    MenuRow(MenuItem it, int d) {
+        this.item = it;
+        this.depth = d;
+    }
+}
+
+/// 展开态：以 key 集合记录当前展开的组。宿主持有，跨帧存活；RenderTree
+/// 首次调用时按 defaultExpandedKeys / 选中项父级初始化一次。
+class MenuExpandState {
+    List<string> keys;
+    bool initialized;
+
+    MenuExpandState() {
+        this.keys = new List<string>();
+        this.initialized = false;
+    }
+
+    bool Contains(string key) {
+        return this.keys.IndexOf(key) >= 0;
+    }
+
+    void Expand(string key) {
+        if (!this.Contains(key)) { this.keys.Add(key); }
+    }
+
+    void Collapse(string key) {
+        int i = this.keys.IndexOf(key);
+        if (i >= 0) { this.keys.RemoveAt(i); }
+    }
+
+    void Toggle(string key) {
+        if (this.Contains(key)) { this.Collapse(key); }
+        else { this.Expand(key); }
+    }
+}
+
 /// 带响应式选中的垂直导航菜单（NaiveUI n-menu 风格）。
-/// 条目是扁平列表；选中项获得强调条 + 底色。
+/// v1：`RenderVertical`/`HandleClick`——扁平纯文字列表 + SignalInt 索引。
+/// v2：`RenderTree`/`HandleTreeClick`——树形条目（Gui.MenuItem），key 化
+/// 选中（SignalString）、子菜单展开、三个批量渲染钩子，对齐 layui「菜单强化」。
 /// `scrollOffset` 滚动列表；完全在 [y, bottomY) 之外的行被剔除。
 class Menu {
+    // ---- v1：扁平列表 --------------------------------------------------
     static int RenderVertical(App app, int x, int y, int w, int bottomY, int itemH,
                               List<string> items, SignalInt selected, int scrollOffset) {
         int firstId = app.focus.AllocId();
@@ -83,5 +136,284 @@ class Menu {
                 app.RequestRedraw();
             }
         }
+    }
+
+    // ---- v2：树形菜单 + 批量渲染钩子 + 展开控制 ------------------------
+    /// 行的稳定标识：显式 key 优先，空串时退化为 label（layui 的 key/name 对位）。
+    static string KeyOf(MenuItem m) {
+        if (m.key != null && m.key != "") { return m.key; }
+        return m.label;
+    }
+
+    /// 是否为可展开组：显式 submenu（kind==3），或挂有子项的普通项。
+    static bool IsGroup(MenuItem m) {
+        if (m.kind == 3) { return true; }
+        return m.children != null && m.children.Count > 0;
+    }
+
+    /// 先序展平为可见行：收起的组只输出组行本身、跳过整棵子树。
+    static List<MenuRow> BuildVisibleRows(List<MenuItem> items, MenuExpandState st) {
+        List<MenuRow> rows = new List<MenuRow>();
+        Menu.AppendRows(rows, items, 0, st);
+        return rows;
+    }
+
+    static void AppendRows(List<MenuRow> rows, List<MenuItem> items, int depth,
+                           MenuExpandState st) {
+        int i = 0;
+        while (i < items.Count) {
+            MenuItem m = items[i];
+            rows.Add(new MenuRow(m, depth));
+            if (Menu.IsGroup(m) && st.Contains(Menu.KeyOf(m))) {
+                Menu.AppendRows(rows, m.children, depth + 1, st);
+            }
+            i = i + 1;
+        }
+    }
+
+    /// 展开 key 的全部祖先组（key 命中某祖先的子树时）。返回是否找到 key。
+    static bool ExpandAncestors(List<MenuItem> items, MenuExpandState st, string key) {
+        int i = 0;
+        while (i < items.Count) {
+            MenuItem m = items[i];
+            if (Menu.IsGroup(m)) {
+                if (Menu.ContainsDeep(m.children, key)) {
+                    st.Expand(Menu.KeyOf(m));
+                    Menu.ExpandAncestors(m.children, st, key);
+                    return true;
+                }
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    static bool ContainsDeep(List<MenuItem> items, string key) {
+        int i = 0;
+        while (i < items.Count) {
+            MenuItem m = items[i];
+            if (Menu.KeyOf(m) == key) { return true; }
+            if (Menu.IsGroup(m) && Menu.ContainsDeep(m.children, key)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// 首次渲染套一次展开策略：有 defaultExpandedKeys 则展开每个 key 的父级链
+    /// 并把 key 自身也展开；否则展开选中项的全部父级。
+    static void InitDefaults(List<MenuItem> items, MenuExpandState st,
+                             List<string> defaultExpandedKeys, string selectedKey) {
+        if (st.initialized) { return; }
+        st.initialized = true;
+        if (defaultExpandedKeys != null && defaultExpandedKeys.Count > 0) {
+            int i = 0;
+            while (i < defaultExpandedKeys.Count) {
+                string k = defaultExpandedKeys[i];
+                Menu.ExpandAncestors(items, st, k);
+                st.Expand(k);
+                i = i + 1;
+            }
+            return;
+        }
+        if (selectedKey != null && selectedKey != "") {
+            Menu.ExpandAncestors(items, st, selectedKey);
+        }
+    }
+
+    /// v2 渲染入口。每个可见行（含不可交互的分隔线/表头/禁用行）占一个 id，
+    /// 保证 id 在展平行序里连续，ClickTree 才能按 firstId+idx 反查。
+    /// 返回 firstId，与 HandleTreeClick/ClickTree 配对。
+    static int RenderTree(App app, int x, int y, int w, int bottomY, int itemH,
+                          List<MenuItem> items, SignalString selectedKey,
+                          MenuExpandState state, MenuLabelOf renderLabel,
+                          MenuIconOf renderIcon, MenuExpandIconOf expandIcon,
+                          List<string> defaultExpandedKeys, int scrollOffset) {
+        Menu.InitDefaults(items, state, defaultExpandedKeys, selectedKey.Get());
+        List<MenuRow> rows = Menu.BuildVisibleRows(items, state);
+
+        int firstId = app.focus.AllocId();
+        int count = rows.Count;
+        int i = 1;
+        while (i < count) {
+            app.focus.AllocId();
+            i = i + 1;
+        }
+
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        string selKey = selectedKey.Get();
+        int accent = app.Scale(3);
+        StyleBox normal = Style.Part(app, "menu", "item", "", "", "",
+                                     Style.SNormal());
+        StyleBox hover = Style.Part(app, "menu", "item", "", "", "",
+                                    Style.SHover());
+        StyleBox selectedStyle = Style.Part(app, "menu", "item", "", "", "",
+                                            Style.SSelected());
+        StyleBox disabledStyle = Style.Part(app, "menu", "item", "", "", "",
+                                            Style.SDisabled());
+        StyleBox headerStyle = Style.Part(app, "menu", "header", "", "", "",
+                                          Style.SNormal());
+        StyleBox arrowStyle = Style.Part(app, "menu", "arrow", "", "", "",
+                                         Style.SNormal());
+        StyleBox iconStyle = Style.Part(app, "menu", "icon", "", "", "",
+                                        Style.SNormal());
+        StyleBox sepStyle = Style.Part(app, "menu", "separator", "", "", "",
+                                       Style.SNormal());
+
+        int viewH = bottomY - y;
+        if (viewH < 0) { viewH = 0; }
+        c.PushClip(x, y, w, viewH);
+
+        i = 0;
+        while (i < count) {
+            int id = firstId + i;
+            int iy = y + i * itemH - scrollOffset;
+            if (iy + itemH > y && iy < bottomY) {
+                Menu.PaintTreeRow(app, c, t, id, x, iy, w, itemH, accent,
+                                  rows[i], selKey, state, normal, hover, selectedStyle,
+                                  disabledStyle, headerStyle, arrowStyle,
+                                  iconStyle, sepStyle, renderLabel, renderIcon,
+                                  expandIcon);
+            }
+            i = i + 1;
+        }
+        c.PopClip();
+        return firstId;
+    }
+
+    static void PaintTreeRow(App app, Canvas c, Theme t, int id, int x, int iy,
+                             int w, int itemH, int accent, MenuRow row,
+                             string selKey, MenuExpandState state, StyleBox normal,
+                             StyleBox hover,
+                             StyleBox selectedStyle, StyleBox disabledStyle,
+                             StyleBox headerStyle, StyleBox arrowStyle,
+                             StyleBox iconStyle, StyleBox sepStyle,
+                             MenuLabelOf renderLabel, MenuIconOf renderIcon,
+                             MenuExpandIconOf expandIcon) {
+        MenuItem m = row.item;
+        int fontSize = normal.FontOr(Style.FontFallback(app, "medium"));
+        int depthIndent = app.Scale(16) * row.depth;
+        int tx = x + t.paddingLarge + depthIndent;
+
+        if (m.kind == 1) {
+            // 分隔线：水平细线，颜色走 menu::separator 背景，缺省回退分隔色。
+            int lineY = iy + itemH / 2;
+            int lineCol = sepStyle.bg;
+            if (lineCol == 0) { lineCol = t.textSecondary; }
+            c.FillRect(x + t.paddingLarge + depthIndent, lineY,
+                       w - (t.paddingLarge + depthIndent) * 2, app.Scale(1), lineCol);
+            return;
+        }
+
+        bool group = Menu.IsGroup(m);
+        bool header = m.kind == 2;
+
+        int labelFg = normal.fg;
+        StyleBox s = normal;
+        if (header) {
+            int hfg = headerStyle.fg;
+            if (hfg != 0) { labelFg = hfg; }
+            else { labelFg = t.textTertiary; }
+            int hsize = headerStyle.FontOr(fontSize);
+            int hy = Canvas.CenterTextY(iy, itemH, hsize);
+            c.DrawText(tx, hy, Ellipsis.Fit(Menu.RowText(renderLabel, m),
+                       w - (tx - x) - t.paddingLarge, hsize), labelFg, hsize);
+            return;
+        }
+
+        bool active = !header && !m.disabled
+            && Menu.KeyOf(m) == selKey && selKey != null && selKey != "";
+        int hv = 0;
+        if (!active && !m.disabled) {
+            hv = Ui.HoverLevelMsIn(app, id, 0, x, iy, w, itemH);
+        }
+        if (active) { s = selectedStyle; labelFg = s.fg; }
+        else if (m.disabled) {
+            labelFg = disabledStyle.fg;
+            if (labelFg == 0) { labelFg = t.textDisabled; }
+        } else if (hv > 0) {
+            s = StyleBox.Blend(normal, hover, hv);
+            labelFg = s.fg;
+        }
+
+        if (active) {
+            c.FillRect(x, iy, w, itemH, s.bg);
+            c.FillRect(x, iy, accent, itemH, s.accent);
+        } else if (hv > 0 && s.bg != 0 && !m.disabled) {
+            c.FillRect(x, iy, w, itemH, s.bg);
+        }
+
+        int cur = tx;
+        int glyphSize = app.Scale(16);
+        int glyphY = iy + (itemH - glyphSize) / 2;
+
+        // 展开箭头（组行右缘）——先于标签定行高一致。
+        string icon = "";
+        if (renderIcon != null) { icon = renderIcon(m); }
+        else { icon = m.icon; }
+        if (icon != null && icon != "") {
+            int ifg = iconStyle.fg;
+            if (ifg == 0) { ifg = labelFg; }
+            c.DrawGlyphIn(icon, cur, glyphY, glyphSize, glyphSize, glyphSize, ifg);
+            cur = cur + glyphSize + app.Scale(6);
+        }
+
+        int ty = Canvas.CenterTextY(iy, itemH, fontSize);
+        int rightPad = t.paddingLarge;
+        int arrowBox = 0;
+        if (group) { arrowBox = glyphSize + app.Scale(4); }
+        int textMaxW = (x + w - rightPad - arrowBox) - cur;
+        if (textMaxW < 0) { textMaxW = 0; }
+        c.DrawText(cur, ty, Ellipsis.Fit(Menu.RowText(renderLabel, m),
+                   textMaxW, fontSize), labelFg, fontSize);
+
+        if (group) {
+            bool grpExpanded = state.Contains(Menu.KeyOf(m));
+            string arrow = "";
+            if (expandIcon != null) { arrow = expandIcon(m, grpExpanded); }
+            else { if (grpExpanded) { arrow = "chevron-down"; } else { arrow = "chevron-right"; } }
+            int afx = x + w - rightPad - glyphSize;
+            int afg = arrowStyle.fg;
+            if (afg == 0) { afg = labelFg; }
+            c.DrawGlyphIn(arrow, afx, glyphY, glyphSize, glyphSize, glyphSize, afg);
+        }
+
+        if (!m.disabled) {
+            app.hitTester.RegisterRect(id, x, iy, w, itemH, 0);
+        }
+    }
+
+    static string RowText(MenuLabelOf renderLabel, MenuItem m) {
+        if (renderLabel != null) { return renderLabel(m); }
+        return m.label;
+    }
+
+    /// v2 点击入口：命中组行只 toggle 展开不动 selectedKey；命中可用叶子写
+    /// selectedKey；禁用/表头/越界 id 安全无操作。
+    static void HandleTreeClick(App app, int firstId, List<MenuItem> items,
+                                MenuExpandState state, SignalString selectedKey) {
+        if (app.EventKind() != 3) { return; }
+        Menu.ClickTree(app, firstId, items, state, selectedKey, app.ClickTarget());
+    }
+
+    static bool ClickTree(App app, int firstId, List<MenuItem> items,
+                          MenuExpandState state, SignalString selectedKey, int hit) {
+        if (hit < firstId) { return false; }
+        List<MenuRow> rows = Menu.BuildVisibleRows(items, state);
+        int idx = hit - firstId;
+        if (idx < 0 || idx >= rows.Count) { return false; }
+        MenuItem m = rows[idx].item;
+        if (m.kind == 2) { return false; }   // 表头不响应
+        if (m.disabled) { return false; }
+        if (Menu.IsGroup(m)) {
+            state.Toggle(Menu.KeyOf(m));
+            app.RequestRedraw();
+            return true;
+        }
+        string key = Menu.KeyOf(m);
+        if (selectedKey.Get() == key) { return false; }
+        selectedKey.Set(key);
+        app.RequestRedraw();
+        return true;
     }
 }

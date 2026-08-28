@@ -1,0 +1,80 @@
+using System;
+
+/// out/ref 参数的字段访问对位（irgen：out 参数类字段写入损坏调用方引用）。
+/// 回归：`t.field = v` 与 `t.field` 读取在 `t` 是 out 类参数时必须
+/// 先透过调用方槽位加载对象指针；直接对入参指针做 GEP 会把值写进
+/// 调用方的引用槽本身，覆盖对象指针并在调用方读取时 use-after-free。
+class OutParamField {
+    static int fails;
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got "
+            + Convert.ToString(got) + " want " + Convert.ToString(want));
+    }
+
+    static void Str(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got '" + got
+            + "' want '" + want + "'");
+    }
+
+    class Box {
+        int n;
+        string s;
+        Box next;
+    }
+
+    static void Fill(out Box b) {
+        b = new Box();
+        b.n = 7;
+        b.s = "seven";
+        Box c = new Box();
+        c.n = 9;
+        b.next = c;
+    }
+
+    static void Mutate(Box b) {
+        b.n = b.n + 1;
+    }
+
+    static void Main() {
+        fails = 0;
+
+        Box x;
+        OutParamField.Fill(out x);
+        OutParamField.Eq("n via out", x.n, 7);
+        OutParamField.Str("s via out", x.s, "seven");
+        OutParamField.True0("next via out", x.next != null);
+        if (x.next != null) { OutParamField.Eq("next.n", x.next.n, 9); }
+
+        // 字段读写往返：先赋非零哨兵，再 out 写——哨兵对象必须被释放
+        // 而不是泄漏引用（写错槽位会让调用方读到垃圾）。
+        Box y = new Box();
+        y.n = 100;
+        OutParamField.Fill(out y);
+        OutParamField.Eq("reassigned n", y.n, 7);
+
+        // ref 参数（无 out 初始化，读先行）同理。
+        Box z = new Box();
+        z.n = 1;
+        OutParamField.Mutate(z);
+        OutParamField.Eq("ref mutate", z.n, 2);
+        OutParamField.Mutate(z);
+        OutParamField.Eq("ref mutate twice", z.n, 3);
+
+        if (fails == 0) { Console.WriteLine("out_param_field_test: OK"); }
+        else {
+            Console.WriteLine("out_param_field_test: "
+                + Convert.ToString(fails) + " failure(s)");
+        }
+    }
+
+    static void True0(string what, bool ok) {
+        if (ok) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+}

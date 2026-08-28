@@ -1458,6 +1458,15 @@ static LLVMValueRef struct_base_ptr(zan_irgen_t *g, local_var_t *local, LLVMType
         if (LLVMGetTypeKind(alloc_t) == LLVMPointerTypeKind) {
             base = LLVMBuildLoad2(g->builder, LLVMPointerType(st, 0), base, "objld");
         }
+    } else if (local->byref_slot && local->type &&
+               local->type->kind == TYPE_CLASS) {
+        /* A `ref`/`out` class parameter's slot is the caller's storage address,
+         * so the object pointer has to be loaded through it before field
+         * access. Without this the GEP is computed off the pointer-to-slot
+         * and a store like `t.field = v` overwrites the caller's reference
+         * slot itself (and the later read in the caller faults). Value-type
+         * refs never reach here -- they are not laid out as a pointer. */
+        base = LLVMBuildLoad2(g->builder, LLVMPointerType(st, 0), base, "objld");
     }
     return base;
 }
