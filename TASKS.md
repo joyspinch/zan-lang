@@ -2360,3 +2360,43 @@ arg 释放同语义。
 真正放大的是循环内的链式转换）。其余内建降级路径的 receiver 释放
 已在 A53/A57 体系内有 arg/receiver 覆盖，未发现同类缺口；如需全量
 审计可另立任务。
+
+# A66 · Carousel 纵向方向 + 演示重做 + autoplay 即时模式修复 —— ✅ 已完成（2026-08-28）
+
+A65 的后续：轮播组件补 Naive UI 的 direction，gallery 的 Carousel 演示页
+从三个纯文字页扩成六个（默认内嵌图片、纵向、自定义组件页等），并修掉
+三个被演示压出来的真问题。
+
+- **direction（纵向轮播）**：`Direction("vertical")` 后过渡沿 y 滑
+  （位移跨度取 bh）、箭头改 ↑/↓ 贴上/下缘居中、皮肤挂 `vertical` 类；
+  `dotPlacement` 四个方位的指示点位置也一并真正落地——此前
+  PaintChrome 把圆点写死在底部居中，`dots-left/top/right` 只挂类没人
+  读，从未生效。指示点左/右竖排时横向箭头内缩让位（否则箭头压在点
+  列上）。
+- **autoplay 在即时模式宿主下永远不动**（演示截出来的）：gallery 每帧
+  重建控件，`lastTickMs` 与 `model` 都是实例状态，一帧一换、计时永远
+  走不完、页码永远归零——四张图卡在第一张，箭头点击也不记忆。修复：
+  autoplay 计时挪进宿主持有的 `CarouselAnim`（新增 tickMs 字段，与
+  shown 同一存活方式）；演示给轮播传入持久的 `SignalInt` 作 model。
+  修复后 4.5s 间隔连拍可见图片页 3→4 翻动、纵向 North→East→South
+  循环回绕。
+- **chrome 次序的晚加页边界**：chrome 惰性挂载后，Arrange 之后再
+  `AddSlideView` 会把页排到覆盖层之后（又被盖住）——AddSlideView 现在
+  把 chrome 挪回末位。无窗口回归 `tests/gui/carousel_test.zan` 钉死：
+  横/纵两轴的 ShowSlides 几何（静止帧/过渡帧/反向往返）、chrome 惰性
+  挂载时序、晚加页后 chrome 仍殿后、重复 Arrange 不重复挂载
+  （`conformance_gui_carousel`）。
+- **gallery Carousel 演示页**（六个）：Basic（双向索引）／Image slides
+  （AddSlideView 四张实拍图 + autoplay 3s，默认推荐用法）／Vertical
+  （Direction("vertical") + autoplay）／Custom component slides
+  （Flex 居中标题页、图文混排页、带按钮交互页三页轮换）／Many slides
+  （指示点随页数伸缩）／Dot placement（left 竖排）。Comp 说明、
+  Props（direction/dotPlacement/autoplay/intervalMs）与代码/JSON 示例
+  同步重写，代码示例示范宿主持有的 SignalInt + CarouselAnim 模式。
+- **证据**：`ctest -R conformance_gui_carousel` 绿；smoke 档除两项
+  既有失败外全绿——`policy_zform_schema`（缺 IconView 清单条目，随
+  f0d544cc 入库时未重新生成）与 `policy_theme_color_budget`
+  （Countdown.zan 4 处语义色直读，工作区 WIP）均为并行 Gui WIP 的
+  既有状态，与本批无关（同 A64 的处理先例）；gallery 截图逐一核验：
+  图片轮播 3→4 翻动、纵向循环回绕、自定义页翻页、dots-left 竖排 +
+  箭头让位。
