@@ -1,0 +1,192 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Threading;
+using Gui;
+using Gui.Widget;
+
+namespace Gui;
+
+/// <summary>Image 控件的网络图片加载器。分工与 DownloadJob 一致：
+/// 取回在后台 OS 线程上以协程 await 完成（不阻塞 UI），结果经
+/// <see cref="App.Post"/> 封送回 UI 线程再解码注册；单个共享 worker
+/// 逐条处理排队的请求。UI 线程入口是 <see cref="Fetch"/>。</summary>
+class ImageHttp {
+    /// 一次取回请求：UI 线程排队，worker 领走，完成后经 Post 通知。
+    class Req {
+        string url;
+        string key;
+        App app;
+        Image img;
+    }
+
+    static nint lockHandle;
+    static List<Req> pending;
+    static bool workerStarted;
+
+    /// UI 线程调用：排队一次 URL 取回。worker 首次需要时启动。
+    static void Fetch(App app, Image img, string url, string key) {
+        if (lockHandle == 0) {
+            lockHandle = Mutex.Create();
+            pending = new List<Req>();
+        }
+        Req r = new Req();
+        r.url = url;
+        r.key = key;
+        r.app = app;
+        r.img = img;
+        Mutex.Lock(lockHandle);
+        pending.Add(r);
+        bool needWorker = !workerStarted;
+        workerStarted = true;
+        Mutex.Unlock(lockHandle);
+        if (needWorker) {
+            if (!Thread.Start(ImageHttp.WorkerLoop)) {
+                // 线程起不来：直接把失败交回 UI 线程，控件显示失败占位。
+                app.Post(() => { img.OnFetchFailed(); });
+            }
+        }
+    }
+
+    /// worker 线程入口：逐条取回直到队列清空，然后退出
+    ///（下一次 Fetch 会重新拉起）。await 让出期间 IO 反应器推进传输。
+    static void WorkerLoop() {
+        Socket.Initialize();
+        while (true) {
+            Req r = ImageHttp.Take();
+            if (r == null) {
+                Mutex.Lock(lockHandle);
+                if (pending.Count == 0) {
+                    workerStarted = false;
+                    Mutex.Unlock(lockHandle);
+                    return;
+                }
+                Mutex.Unlock(lockHandle);
+                continue;
+            }
+            await ImageHttp.FetchOne(r);
+        }
+    }
+
+    static Req Take() {
+        Req r = null;
+        Mutex.Lock(lockHandle);
+        if (pending.Count > 0) {
+            r = pending[0];
+            pending.RemoveAt(0);
+        }
+        Mutex.Unlock(lockHandle);
+        return r;
+    }
+
+    /// 取回单个 URL。传输里任何一处抛出（DNS、TLS、断开的套接字、
+    /// 超时）都必须变成一条错误结果：不接住的话 worker 静静死掉，
+    /// 控件会永远停在加载占位上。
+    static async int FetchOne(Req r) {
+        string err = "";
+        string body = null;
+        byte[] bytes = null;
+        int blen = 0;
+        ImageHttp.UrlParts p = ImageHttp.ParseUrl(r.url);
+        if (p.host == "") {
+            err = "bad url";
+        } else {
+            try {
+                HttpClient client;
+                if (p.tls) {
+                    client = HttpClient.CreateHttps(p.host, p.port);
+                } else {
+                    client = new HttpClient(p.host, p.port);
+                }
+                client.SetTimeout(15000);
+                HttpResponse resp = await client.SendAsync("GET", p.path, "");
+                if (resp.statusCode != 200) {
+                    err = "HTTP " + resp.statusCode;
+                } else if (resp.IsBinary()) {
+                    bytes = resp.bodyBytes;
+                    blen = resp.BodyLength();
+                } else {
+                    body = resp.body;
+                    blen = resp.BodyLength();
+                }
+            } catch (Exception ex) {
+                err = ex.Message;
+            }
+        }
+        string e = err;
+        string b = body;
+        byte[] bb = bytes;
+        int n = blen;
+        r.app.Post(() => { ImageHttp.Apply(r, bb, b, n, e); });
+        return 0;
+    }
+
+    /// UI 线程：把取回的字节注册进图像缓存并通知控件。解码必须发生
+    /// 在 UI 线程（图像注册表与光栅器只从 UI 线程触碰）。
+    static void Apply(Req r, byte[] bytes, string body, int len, string err) {
+        if (err == "") {
+            int w = 0;
+            if (bytes != null) {
+                w = Canvas.ImageLoadMem(r.key, bytes, len);
+            } else if (body != null) {
+                if (body.Contains("<svg")) {
+                    r.img.OnSvgFetched(body);
+                    return;
+                }
+                w = Canvas.ImageLoadMem(r.key, body, len);
+            }
+            if (w > 0) {
+                r.img.OnFetched(r.key, w, Canvas.ImageHeight(r.key));
+                return;
+            }
+        }
+        r.img.OnFetchFailed();
+    }
+
+    class UrlParts {
+        string host;
+        int port;
+        string path;
+        bool tls;
+    }
+
+    static UrlParts ParseUrl(string url) {
+        UrlParts p = new UrlParts();
+        p.host = "";
+        p.port = 80;
+        p.path = "/";
+        p.tls = false;
+        string rest = url;
+        if (rest.StartsWith("https://")) {
+            p.tls = true;
+            p.port = 443;
+            rest = rest.Substring(8);
+        } else if (rest.StartsWith("http://")) {
+            rest = rest.Substring(7);
+        } else {
+            return p;
+        }
+        int slash = rest.IndexOf("/");
+        string authority = rest;
+        if (slash >= 0) {
+            authority = rest.Substring(0, slash);
+            p.path = rest.Substring(slash);
+        }
+        int colon = authority.IndexOf(":");
+        if (colon > 0) {
+            p.host = authority.Substring(0, colon);
+            string ps = authority.Substring(colon + 1);
+            int port = 0;
+            for (int i = 0; i < ps.Length; i = i + 1) {
+                int d = (ps[i] & 255) - 48;
+                if (d < 0 || d > 9) { port = 0; break; }
+                port = port * 10 + d;
+            }
+            if (port > 0) { p.port = port; }
+        } else {
+            p.host = authority;
+        }
+        return p;
+    }
+}

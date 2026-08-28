@@ -1524,6 +1524,52 @@ plain join、join into、终端 group、group into 八种形态）三档孪生�
 - **证据**：`tests/conformance/pattern_value_types.zan`（表达式/语句两形态、
   `when` 守卫、绑定变量、不同值类型不得匹配、以及 string/class/double/bool 判别式）。
 
+# A59 · Gui.Image 图片组件：传地址即渲染 —— ✅ 已完成（2026-08-28）
+
+目标：`Gui.Widget.Image` 控件，`Src` 传地址就出图——本地文件路径、
+`http(s)://` URL、`data:image/...;base64,...`、SVG（任意来源）。网页渲染
+不在此列（`CefBrowser`/`WebView` 已覆盖）。
+
+- **解码器 vendor**（`src/runtime/`，带 COPYING/README 记录子集与改动）：
+  libwebp 1.4.0 仅解码子集（src/dec + 标量/SSE2 dsp + utils；无 encoder、
+  SSE41、线程、mux；`src/webp/config.h` 为桩，`HAVE_CONFIG_H` 由
+  gui_runtime.c 定义）+ nanosvg（nanosvg.h/nanosvgrast.h，MIT）。
+  关键约束：~8 个 `build_*.ps1` 都把 `gui_runtime.c` 当**单 TU 无 -I** 编译，
+  所以 vendor 源码全部改成文件相对 include、由 gui_runtime.c unity-include
+  （`gui_image_svg.c` 同理），CMake 与各脚本零改动。unity 里的两个符号冲突
+  处理：`clip_8b` → `clip_8b_ql`（quant_levels_dec_utils.c）；lossless.h 的
+  encoder-only 声明块删除（解码路径不用）。
+- **运行时**（gui_runtime.c）：新增 64 项 `mem:` key 内存注册表（与路径 FIFO
+  并列；`zan_img_load` 先查它，mem key 绝不回落文件打开或负缓存），导出
+  `zan_gui_image_load_mem`（RIFF/WEBP 嗅探 → libwebp，否则 stb
+  load_from_memory）与 `zan_gui_image_load_svg`（nanosvg 解析 + contain
+  光栅 + RGBA→ARGB32；无固有尺寸视为失败而非造 512）；路径缓存 16→64；
+  `zan_gui_image_evict` 同时清 mem 注册表。驱动导出 65→66。
+- **Zan 侧**：`Canvas.ImageLoadMem(key, string|byte[], len)`、
+  `Canvas.ImageLoadSvg(key, string|byte[], len, w, h)`（Render.zan，
+  byte[] 形态用 `EntryPoint` 别名）；新控件 `Widget/Image.zan`（四类地址
+  解析、Fit contain/cover/fill/none、Alt 占位、Loaded/Error 事件、Reload()、
+  SVG 按盒子重光栅 `@WxH` key 并驱逐旧光栅）；`Gui/ImageHttp.zan`
+  （DownloadJob 同款：Mutex 队列 + 单 worker `Thread.Start` + 协程
+  await + `App.Post` 封送回 UI 线程解码注册）；ControlFactory/Kinds 注册；
+  base.css `image {}` 规则。
+- **测试**：`tests/gui/image_test.zan` + golden（无窗口）：程序内合成 P5
+  PNM → ImageLoadMem 尺寸/blit/evict/重注册；垃圾字节 → 0 且不产生尺寸；
+  SVG 固有 48x24、按 32x24 盒 contain → 32x16；坏 SVG → 0；base64 往返；
+  Kind/Props/Events/SetExtra/ControlFactory 往返。注册
+  `conformance_gui_image`；`tools/mcp_server/zform.controls.txt` 补 Image
+  行（policy_zform_schema 守门）。
+- **gallery**：Data Display 加 Image 组件三演示——Data URI（base64 PNM +
+  内联 SVG，全部程序内合成）、Fit modes（同一来源四种 fit 固定盒）、URL
+  （本地回环 HttpServer 127.0.0.1:18747/img.pnm 离线演示后台取回）。
+- **实测**：`zanc tests/gui/image_test.zan --auto-stdlib` → `image_test OK`；
+  `ctest -R 'gui_image|policy_zform_schema'` 全绿；
+  `scripts/build_gallery.ps1` → GALLERY_BUILD_OK；smoke 档全绿。
+- **已知限制**（写进了 gui-development.md）：stb GIF 只取第一帧；位图内容
+  矩形裁剪、CSS 圆角只作用于背景/边框；URL 无磁盘缓存。WebP 真实样本
+  未入库（离线造不出 1x1 webp），解码路径由 RIFF 嗅探单测覆盖在
+  gui_runtime（libwebp 自带上游测试）。
+
 # A58 · 全量收口执行计划（2026-08-27 定序）
 
 排序依据三条：① 先修"编译通过但结果错/编译器崩"的，因为它们会污染后面每一次

@@ -61,15 +61,29 @@ int w = Canvas.ImageWidth(path);      // 静态，读尺寸；失败返回 <=0
 int h = Canvas.ImageHeight(path);
 canvas.BlitImage(path, dx, dy, dw, dh, sx, sy, sw, sh);   // 缩放绘制
 canvas.DrawImage(path, x, y);                              // 原尺寸
+// 内存图像：字节（含 WebP）或 SVG 文本注册到 key，之后 key 当路径用
+int w = Canvas.ImageLoadMem("mem:logo", bytes, len);       // PNG/JPEG/BMP/GIF/TGA/PNM/PSD/WebP
+int w = Canvas.ImageLoadSvg("mem:icon", svgText, boxW, boxH);  // SVG，contain 适配盒子
+Canvas.EvictImage("mem:logo");                              // 丢弃（路径或 mem key 通用）
 ```
 
 **`ImageWidth<=0` 就是"图不存在/读不了"**，用它做"有截图就画截图，没有就画占位"的判断。
+
+### 图片组件 Gui.Widget.Image（传地址即渲染）
+
+`new Image(src, alt, fit)` 直接吃四类地址，按前缀自动识别：本地文件路径
+（PNG/JPEG/BMP/GIF/TGA/PNM/PSD/WebP，`.svg` 走矢量光栅）、`http(s)://` URL
+（`Gui.ImageHttp` 后台线程取回 + `App.Post` 封送，不阻塞 UI）、
+`data:image/...;base64,...` 数据 URI、内联/远程 SVG（首帧后按盒子尺寸重光栅）。
+`Fit`：contain（默认）/cover/fill/none；`Loaded`/`Error` 事件报告结果；
+`Reload()` 重新解析。加载中与失败画 `image` CSS 规则的底色 + `Alt` 文本占位。
+注意：位图内容按矩形裁剪，CSS 圆角只作用于背景与边框（光栅器暂无圆角剪裁路径）。
 
 ## 控件与组件在哪
 
 | 想要 | 去哪 |
 | --- | --- |
-| 基础控件（58 个） | `stdlib/Gui/Widget/`：Button Input SelectBox Table Tabs TreeView ListView VirtualList Slider Switch Steps Timeline Pagination Progress Rate Tag Card Panel Collapse Popover Tooltip Dropdown Menu ContextMenu Breadcrumb PageHeader Result Empty Skeleton Spin Statistic … |
+| 基础控件（58 个） | `stdlib/Gui/Widget/`：Button Input SelectBox Image Table Tabs TreeView ListView VirtualList Slider Switch Steps Timeline Pagination Progress Rate Tag Card Panel Collapse Popover Tooltip Dropdown Menu ContextMenu Breadcrumb PageHeader Result Empty Skeleton Spin Statistic … |
 | 外壳容器 | `Widget/ToolStrip.zan` `StatusBar.zan` `SplitPanel.zan` `Split.zan` `Ribbon.zan` `Component/Dock.zan`（DockPanel）；自定义标题栏见 `App.RenderChrome` |
 | 向导/对话框 | `Widget/Wizard.zan`（新建项目/新建文件都用它）、`Widget/Prompt.zan`、`Widget/Layer.zan`（通知/浮层） |
 | 复合组件 | `Component/`：`Chart` `DataTable` `CodeEditor` `WebView` `PivotTable` `LogView` `FilePicker` `SessionList` |

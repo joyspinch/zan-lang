@@ -1759,43 +1759,48 @@ static int gdi_upload_chunks(HDC dc, u32 *pix, BITMAPINFO *bmi,
     int y = ry;
     int end = ry + rh;
     int w = bmi->bmiHeader.biWidth;
-    /* Rows are reversed into a staging buffer and uploaded as a genuine
-     * bottom-up DIB (positive biHeight). Passing the top-down surface
-     * directly with source offsets is what produced the 错乱: YSrc=y over
-     * the full surface with StartScan=0/cScanLines=h rendered every
-     * 128-row chunk bottom-up in place (title bar at the window bottom,
-     * half-cut sidebar rows) on real Win10 19044, and a zero-based
-     * bits-offset variant shifted whole chunks the other way. Reversal
-     * was verified pixel-exact on that box: screen row y+i displays the
-     * stage's row (ch-1-i), so stage row j carries surface row
-     * y+ch-1-j. The staged form also keeps every SetDIBitsToDevice call
-     * short, preserving the bounded tear exposure that chunking exists
-     * for. */
-    static u32 *stage;
-    static int stage_cap;
-    int need = (ZAN_CHUNK_H > rh ? ZAN_CHUNK_H : rh) * rw;
-    if (need > stage_cap) {
-        u32 *ns = (u32 *)realloc(stage, (size_t)need * 4);
-        if (!ns) return calls;
-        stage = ns;
-        stage_cap = need;
-    }
+    /* Upload each chunk through a top-down memory DIB with BitBlt instead of
+     * feeding SetDIBitsToDevice directly. SetDIBitsToDevice streams scans
+     * through the DC's clip region, and on a WS_CLIPCHILDREN window hosting
+     * native child HWNDs (WebView2/CEF) that region has a huge hole where the
+     * children sit; the scan accounting against the holed DC corrupted the
+     * upload -- content landed rolled by one chunk height, the chrome rows
+     * swapped top/bottom (the "上下颠倒/错位" reports), while childless
+     * windows with an unclipped DC stayed pixel-exact through this very same
+     * code. BitBlt positions every chunk absolutely: the clip region can only
+     * mask rows, never move them, so hosting children no longer matters.
+     * Rows are copied un-reversed: the stage DIB is top-down (negative
+     * biHeight) and shares the surface origin, chunk for chunk. */
+    HDC sdc = GetDC(0);
+    HDC mdc = CreateCompatibleDC(sdc);
+    ReleaseDC(0, sdc);
+    if (!mdc) return calls;
     BITMAPINFOHEADER cbh = bmi->bmiHeader;
     cbh.biWidth = rw;
+    cbh.biHeight = -(ZAN_CHUNK_H > rh ? ZAN_CHUNK_H : rh);
+    void *stage = NULL;
+    HBITMAP bm = CreateDIBSection(mdc, (BITMAPINFO *)&cbh, DIB_RGB_COLORS,
+                                  &stage, NULL, 0);
+    if (!bm) {
+        DeleteDC(mdc);
+        return calls;
+    }
+    HGDIOBJ old = SelectObject(mdc, bm);
     while (y < end) {
         int ch = end - y;
         if (ch > ZAN_CHUNK_H) ch = ZAN_CHUNK_H;
         for (int j = 0; j < ch; j++) {
-            memcpy(stage + (size_t)j * rw,
-                   pix + (size_t)(y + ch - 1 - j) * (size_t)w + rx,
+            memcpy((u32 *)stage + (size_t)j * rw,
+                   pix + (size_t)(y + j) * (size_t)w + rx,
                    (size_t)rw * 4);
         }
-        cbh.biHeight = ch;  /* bottom-up: scan 0 is stage's last row */
-        SetDIBitsToDevice(dc, rx, y, rw, ch, 0, 0, 0, ch, stage,
-                          (BITMAPINFO *)&cbh, DIB_RGB_COLORS);
+        BitBlt(dc, rx, y, rw, ch, mdc, 0, 0, SRCCOPY);
         calls++;
         y += ch;
     }
+    SelectObject(mdc, old);
+    DeleteObject(bm);
+    DeleteDC(mdc);
     return calls;
 }
 
@@ -3244,8 +3249,54 @@ EXPORT void zan_gui_release_window(void *native_window) {
 #define STBI_NO_HDR
 #define STB_IMAGE_IMPLEMENTATION
 #include "../../stdlib/SDL3/native/stb_image.h"
+/* WebP and SVG: stb_image does not decode either, so the vendored libwebp
+ * decode-only subset (src/runtime/libwebp, scalar + baseline SSE2, no
+ * threads) and the nanosvg raster TU are compiled in below, unity-build
+ * style -- the same pattern as the gui_runtime_* siblings, which keeps the
+ * one-file runtime compiles (build_ide.ps1, build_gallery.ps1, the CMake
+ * zan_gui target) working unchanged. HAVE_CONFIG_H switches libwebp to the
+ * vendored src/webp/config.h stub: SSE2 on, SSE41/threads off (see the
+ * stub). See src/runtime/libwebp/README.md for the subset. */
+#define HAVE_CONFIG_H
+#include "libwebp/src/dec/alpha_dec.c"
+#include "libwebp/src/dec/buffer_dec.c"
+#include "libwebp/src/dec/frame_dec.c"
+#include "libwebp/src/dec/idec_dec.c"
+#include "libwebp/src/dec/io_dec.c"
+#include "libwebp/src/dec/quant_dec.c"
+#include "libwebp/src/dec/tree_dec.c"
+#include "libwebp/src/dec/vp8_dec.c"
+#include "libwebp/src/dec/vp8l_dec.c"
+#include "libwebp/src/dec/webp_dec.c"
+#include "libwebp/src/dsp/alpha_processing.c"
+#include "libwebp/src/dsp/alpha_processing_sse2.c"
+#include "libwebp/src/dsp/cpu.c"
+#include "libwebp/src/dsp/dec.c"
+#include "libwebp/src/dsp/dec_sse2.c"
+#include "libwebp/src/dsp/dec_clip_tables.c"
+#include "libwebp/src/dsp/filters.c"
+#include "libwebp/src/dsp/filters_sse2.c"
+#include "libwebp/src/dsp/lossless.c"
+#include "libwebp/src/dsp/lossless_sse2.c"
+#include "libwebp/src/dsp/rescaler.c"
+#include "libwebp/src/dsp/rescaler_sse2.c"
+#include "libwebp/src/dsp/upsampling.c"
+#include "libwebp/src/dsp/upsampling_sse2.c"
+#include "libwebp/src/dsp/yuv.c"
+#include "libwebp/src/dsp/yuv_sse2.c"
+#include "libwebp/src/utils/bit_reader_utils.c"
+#include "libwebp/src/utils/color_cache_utils.c"
+#include "libwebp/src/utils/filters_utils.c"
+#include "libwebp/src/utils/huffman_utils.c"
+#include "libwebp/src/utils/palette.c"
+#include "libwebp/src/utils/quant_levels_dec_utils.c"
+#include "libwebp/src/utils/random_utils.c"
+#include "libwebp/src/utils/rescaler_utils.c"
+#include "libwebp/src/utils/thread_utils.c"
+#include "libwebp/src/utils/utils.c"
+#include "gui_image_svg.c"
 
-#define ZAN_IMG_CACHE_CAP 16
+#define ZAN_IMG_CACHE_CAP 64
 typedef struct {
     char path[512];
     u32 *pix;   /* ARGB32: (a<<24)|(r<<16)|(g<<8)|b */
@@ -3282,14 +3333,70 @@ static void zan_img_mark_bad(const char *path) {
     g_img_bad_n++;
 }
 
+/* ---- memory-keyed images --------------------------------------------- */
+/* Decoded pixels registered under a caller-chosen key instead of a file
+ * path: base64 data URIs, HTTP downloads and SVG rasters land here so the
+ * path-based width/height/blit/evict exports work on them unchanged. Keys
+ * use a "mem:" prefix; zan_img_load looks them up here and never falls
+ * through to the file path (and never marks them bad), so a key that is
+ * not registered is simply absent and the Zan side re-registers on
+ * demand. Only ever touched from the UI thread, like g_imgs. */
+#define ZAN_IMG_MEM_CAP 64
+static zan_img_t g_mem_imgs[ZAN_IMG_MEM_CAP];
+static int       g_mem_img_n = 0;
+
+static int zan_img_is_mem_key(const char *key) {
+    return key && strncmp(key, "mem:", 4) == 0;
+}
+
+static zan_img_t *zan_img_mem_find(const char *key) {
+    int i;
+    for (i = 0; i < g_mem_img_n; i++)
+        if (strncmp(g_mem_imgs[i].path, key, 511) == 0) return &g_mem_imgs[i];
+    return NULL;
+}
+
+/* Takes ownership of pix. FIFO-evicts the oldest entry when full; the Zan
+ * side re-registers an evicted key from its retained source bytes. */
+static zan_img_t *zan_img_mem_put(const char *key, u32 *pix, int w, int h) {
+    zan_img_t *e = zan_img_mem_find(key);
+    if (e) { free(pix); return e; }   /* already registered: keep the first */
+    if (g_mem_img_n >= ZAN_IMG_MEM_CAP) {
+        free(g_mem_imgs[0].pix);
+        memmove(&g_mem_imgs[0], &g_mem_imgs[1],
+                sizeof(zan_img_t) * (ZAN_IMG_MEM_CAP - 1));
+        g_mem_img_n = ZAN_IMG_MEM_CAP - 1;
+    }
+    e = &g_mem_imgs[g_mem_img_n++];
+    strncpy(e->path, key, 511); e->path[511] = '\0';
+    e->pix = pix; e->w = w; e->h = h;
+    return e;
+}
+
+/* RGBA8 (stb / libwebp / nanosvg layout) -> ARGB32 pixel buffer. */
+static u32 *zan_rgba_to_argb(const unsigned char *data, int w, int h) {
+    u32 *pix = (u32 *)malloc((size_t)w * (size_t)h * sizeof(u32));
+    int i, n = w * h;
+    if (!pix) return NULL;
+    for (i = 0; i < n; i++) {
+        unsigned char r = data[i*4], g = data[i*4+1],
+                      b = data[i*4+2], a = data[i*4+3];
+        pix[i] = ((u32)a << 24) | ((u32)r << 16) | ((u32)g << 8) | b;
+    }
+    return pix;
+}
+
 static zan_img_t *zan_img_load(const char *path) {
     zan_img_t *e;
-    int i, w, h, n;
+    int w, h, n;
     unsigned char *data;
     u32 *pix;
     if (!path || !path[0]) return NULL;
     e = zan_img_find(path);
     if (e) return e;
+    /* Memory-keyed images never fall through to the file path: an
+     * unregistered key is absent until the Zan side re-registers it. */
+    if (zan_img_is_mem_key(path)) return zan_img_mem_find(path);
     if (zan_img_is_bad(path)) return NULL;
 #ifdef _WIN32
     /* stbi_load goes through fopen, which on Windows interprets the bytes in
@@ -3335,14 +3442,9 @@ static zan_img_t *zan_img_load(const char *path) {
         zan_img_mark_bad(path);
         return NULL;
     }
-    pix = (u32 *)malloc((size_t)w * (size_t)h * sizeof(u32));
-    if (!pix) { stbi_image_free(data); return NULL; }
-    for (i = 0; i < w * h; i++) {
-        unsigned char r = data[i*4], g = data[i*4+1],
-                      b = data[i*4+2], a = data[i*4+3];
-        pix[i] = ((u32)a << 24) | ((u32)r << 16) | ((u32)g << 8) | b;
-    }
+    pix = zan_rgba_to_argb(data, w, h);
     stbi_image_free(data);
+    if (!pix) return NULL;
     if (g_img_n >= ZAN_IMG_CACHE_CAP) {
         free(g_imgs[0].pix);
         memmove(&g_imgs[0], &g_imgs[1], sizeof(zan_img_t) * (ZAN_IMG_CACHE_CAP - 1));
@@ -3363,7 +3465,8 @@ EXPORT i32 zan_gui_image_height(const char *path) {
     return e ? (i64)e->h : 0;
 }
 
-/* Evict cached pixels for a path (call after the source file changes). */
+/* Evict cached pixels for a path or a "mem:" key (call after the source
+ * file changes, or to release a memory image). */
 EXPORT void zan_gui_image_evict(const char *path) {
     int i;
     if (!path) return;
@@ -3375,6 +3478,15 @@ EXPORT void zan_gui_image_evict(const char *path) {
             break;
         }
     }
+    for (i = 0; i < g_mem_img_n; i++) {
+        if (strncmp(g_mem_imgs[i].path, path, 511) == 0) {
+            free(g_mem_imgs[i].pix);
+            memmove(&g_mem_imgs[i], &g_mem_imgs[i+1],
+                    sizeof(zan_img_t) * (g_mem_img_n - i - 1));
+            g_mem_img_n--;
+            return;
+        }
+    }
     for (i = 0; i < g_img_n; i++) {
         if (strncmp(g_imgs[i].path, path, 511) == 0) {
             free(g_imgs[i].pix);
@@ -3383,6 +3495,74 @@ EXPORT void zan_gui_image_evict(const char *path) {
             return;
         }
     }
+}
+
+/* ---- in-memory image registration ------------------------------------- */
+
+/* Register a decoded image under a caller-chosen "mem:..." key. data/len is
+ * a raw image byte blob: WebP is sniffed from the RIFF header and decoded by
+ * the vendored libwebp; everything else (PNG/JPEG/BMP/GIF/TGA/PNM/PSD) goes
+ * through stb_image. Re-registering a live key is a no-op returning the
+ * cached width. Returns the image width, 0 on decode failure -- the caller
+ * keeps the source bytes and may retry with the same key. */
+EXPORT i32 zan_gui_image_load_mem(const char *key, const char *data, i32 len) {
+    int w, h;
+    u32 *pix = NULL;
+    if (!key || !key[0] || !data || len <= 0) return 0;
+    zan_img_t *e = zan_img_mem_find(key);
+    if (e) return e->w;
+    if (len >= 12 && memcmp(data, "RIFF", 4) == 0
+        && memcmp(data + 8, "WEBP", 4) == 0) {
+        if (WebPGetInfo((const uint8_t *)data, (size_t)len, &w, &h)) {
+            uint8_t *rgba = WebPDecodeRGBA((const uint8_t *)data, (size_t)len,
+                                           &w, &h);
+            if (rgba) {
+                pix = zan_rgba_to_argb(rgba, w, h);
+                WebPFree(rgba);
+            }
+        }
+    } else {
+        int n;
+        unsigned char *rgba = stbi_load_from_memory((const unsigned char *)data,
+                                                    (int)len, &w, &h, &n, 4);
+        if (rgba) {
+            if (w > 0 && h > 0 && w <= 32768 && h <= 32768)
+                pix = zan_rgba_to_argb(rgba, w, h);
+            else
+                w = h = 0;
+            stbi_image_free(rgba);
+        }
+    }
+    if (!pix || w <= 0 || h <= 0) { free(pix); return 0; }
+    zan_img_mem_put(key, pix, w, h);
+    return w;
+}
+
+/* byte[] flavor of load_mem: the Zan array marshals as the same raw
+ * pointer+len pair a string body would, so it forwards verbatim. */
+EXPORT i32 zan_gui_image_load_mem_bytes(const char *key, const char *data,
+                                        i32 len) {
+    return zan_gui_image_load_mem(key, data, len);
+}
+
+/* Rasterize an SVG document (gui_image_svg.c, vendored nanosvg) into a
+ * "mem:" key. rasterW/rasterH are the target box: the document keeps its
+ * aspect ratio and is fitted inside (contain); <= 0 uses the document's
+ * intrinsic size. Returns the raster width, 0 on failure. */
+EXPORT i32 zan_gui_image_load_svg(const char *key, const char *text, i32 len,
+                                  i32 rasterW, i32 rasterH) {
+    u32 *pix = NULL;
+    int w = 0, h = 0;
+    if (!key || !key[0] || !text) return 0;
+    zan_img_t *e = zan_img_mem_find(key);
+    if (e) return e->w;
+    if (len < 0) len = (i32)strlen(text);
+    if (len <= 0) return 0;
+    if (!zan_svg_raster(text, (int)len, &pix, &w, &h, (int)rasterW,
+                        (int)rasterH))
+        return 0;
+    zan_img_mem_put(key, pix, w, h);
+    return w;
 }
 
 /* Blit a region of an image file onto a GUI surface (nearest-neighbour scale).

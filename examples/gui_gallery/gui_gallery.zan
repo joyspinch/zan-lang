@@ -1,6 +1,9 @@
 /// Zan GUI component gallery.
 using System;
 using System.Threading;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Security.Cryptography;
 using Gui;
 using Gui.Widget;
 using Gui.Component;
@@ -2592,6 +2595,82 @@ class Gallery {
         return Gallery.Captioned(app, row, caption);
     }
 
+    // ---- Image 演示的共享数据 ------------------------------------------
+    // 全部在程序内合成，离线可复现，不依赖仓库里的任何图片资源。
+
+    // 程序内合成的一张 64x40 RGB 渐变（PNM P6），构建一次后缓存：
+    // base64 数据 URI 演示与本地 HttpServer 演示共用同一份字节。
+    static byte[] imageDemoPnm;
+    static int imageDemoPnmLen;
+    static string imageDemoB64;
+    static bool imageServerStarted;
+
+    static byte[] PnmBytes() {
+        if (Gallery.imageDemoPnm != null) { return Gallery.imageDemoPnm; }
+        int w = 64;
+        int h = 40;
+        string header = "P6\n" + w + " " + h + "\n255\n";
+        int hl = header.Length;
+        byte[] all = new byte[hl + w * h * 3];
+        for (int i = 0; i < hl; i = i + 1) { all[i] = (byte)(header[i] & 255); }
+        int o = hl;
+        for (int y = 0; y < h; y = y + 1) {
+            for (int x = 0; x < w; x = x + 1) {
+                all[o] = (byte)(40 + x * 3);
+                all[o + 1] = (byte)(30 + y * 4);
+                all[o + 2] = (byte)(120 + (x + y) * 3 % 120);
+                o = o + 3;
+            }
+        }
+        Gallery.imageDemoPnm = all;
+        Gallery.imageDemoPnmLen = o;
+        return all;
+    }
+
+    static string DataUriPnm() {
+        if (Gallery.imageDemoB64 != null) { return Gallery.imageDemoB64; }
+        string raw = Gallery.PnmBytes().ToStr(0, Gallery.imageDemoPnmLen);
+        Gallery.imageDemoB64 = "data:image/x-portable-anymap;base64,"
+            + Base64.Encode(raw, Gallery.imageDemoPnmLen);
+        return Gallery.imageDemoB64;
+    }
+
+    static string SvgDataUri() {
+        return "data:image/svg+xml,"
+            + "<svg xmlns='http://www.w3.org/2000/svg' width='72' height='48'>"
+            + "<rect width='72' height='48' rx='10' fill='#2b6cb0'/>"
+            + "<circle cx='24' cy='24' r='12' fill='#f6ad55'/>"
+            + "<rect x='44' y='12' width='16' height='24' fill='#68d391'/>"
+            + "</svg>";
+    }
+
+    // URL 演示的本地回环服务（127.0.0.1:18747）。首次进入演示时启动；
+    // 端口被占用时该演示只剩 Error 占位，不影响其它演示。
+    static void EnsureImageServer() {
+        if (Gallery.imageServerStarted) { return; }
+        Gallery.imageServerStarted = true;
+        Thread.Start(Gallery.ImageServerLoop);
+    }
+
+    // 工作线程里驱动 HttpServer 的协程调度（DownloadJob 的
+    // Thread.Start + await 写法：worker 线程自带调度器）。
+    static void ImageServerLoop() {
+        Socket.Initialize();
+        HttpServer server = new HttpServer("127.0.0.1", 18747);
+        server.OnRequest(Gallery.ImageServerHandle);
+        Task.Spawn(server.Start());
+        while (true) { await Task.Delay(1000); }
+    }
+
+    static async HttpResponse ImageServerHandle(HttpRequest req) {
+        if (req.path == "/img.pnm") {
+            return HttpResponse.Bytes(Gallery.PnmBytes(),
+                                      Gallery.imageDemoPnmLen,
+                                      "image/x-portable-anymap");
+        }
+        return HttpResponse.NotFound();
+    }
+
     /// 上一帧为 `name` 量到的内容底边偏移（设备像素，自框顶算起），
     /// 没有或卡片宽度已变则返回 0（调用方回退到种子高度）。
     /// `cardW` 是预览卡的宽度，也就是 PreviewBoxH 拿到的那个 w。
@@ -3286,6 +3365,46 @@ class Gallery {
             row.With(new Avatar("", 42, "settings"));
             Gallery.LayoutAuto(app, row, name, px, py,
                              w - app.Scale(36), app.Scale(52));
+        } else if (name == "Image.datauri") {
+            // base64 数据 URI 与内联 SVG 数据 URI：全部内存解码，
+            // 不落盘。占位框显示 Alt 文本。
+            Flex row = Flex.Wrapped().Gap(app.Scale(18));
+            row.With(new Image(Gallery.DataUriPnm(), "base64 pnm", ""));
+            row.With(new Image(Gallery.SvgDataUri(), "inline svg", ""));
+            Gallery.LayoutAuto(app, row, name, px, py,
+                             w - app.Scale(36), app.Scale(60));
+        } else if (name == "Image.fit") {
+            // 同一来源，四种 Fit 放进固定盒子：contain 留白、
+            // cover 裁剪铺满、fill 拉伸、none 原始尺寸居中。
+            string src = Gallery.DataUriPnm();
+            int bw = app.Scale(110);
+            int bh = app.Scale(70);
+            int gx = app.Scale(16);
+            int ix = px;
+            List<string> fits = new List<string>{
+                "contain", "cover", "fill", "none" };
+            for (int i = 0; i < fits.Count; i = i + 1) {
+                Image im = new Image(src, "", fits[i]);
+                im.RenderInside(app, new Rect(ix, py, bw, bh));
+                c.DrawText(ix, py + bh + app.Scale(5), fits[i],
+                           t.textTertiary, t.fontSizeSmall);
+                ix = ix + bw + gx;
+            }
+        } else if (name == "Image.url") {
+            // http(s) 地址在后台线程取回，App.Post 封送回 UI 线程解码。
+            // 本地 HttpServer 兜底，演示离线可跑。
+            Gallery.EnsureImageServer();
+            Flex col = Flex.Column().Gap(app.Scale(8));
+            Image net = new Image("http://127.0.0.1:18747/img.pnm",
+                                  "loading...", "");
+            net.Loaded += () => app.RequestRedraw();
+            net.Error += () => app.RequestRedraw();
+            col.With(net);
+            col.With(new Label {
+                Text = "http://127.0.0.1:18747/img.pnm -- background fetch",
+                Class = "secondary" });
+            Gallery.LayoutAuto(app, col, name, px, py,
+                             w - app.Scale(36), app.Scale(80));
         } else if (name == "Badge.dot") {
             Flex row = Flex.Wrapped().Gap(app.Scale(14));
             row.With(new Badge(0));
@@ -7656,6 +7775,23 @@ class Gallery {
             "Badge.CountAt(app, 40, 40, 5);\nBadge.CountAt(app, 100, 40, 12);\nBadge.CountAt(app, 170, 40, 99);", "{\n  \"type\": \"Badge\",\n  \"name\": \"badge\",\n  \"count\": 8,\n  \"max\": 99,\n  \"children\": [\n    {\n      \"type\": \"Icon\",\n      \"glyph\": \"mail\"\n    }\n  ]\n}");
         bg.AddProp("count", "int", "-", "Number shown (Count); Dot() has no count.");
         list.Add(bg);
+        Comp im = new Comp("Data Display", "Image",
+            "Pass an address, get a picture. Src understands local file paths (PNG/JPEG/BMP/GIF/TGA/PNM/PSD/WebP, plus .svg vector files), http(s):// URLs fetched on a background thread, data:image/...;base64,... payloads decoded in memory, and SVG from any of those sources (parsed and rasterized, re-rastered when the box size changes). Fit selects contain/cover/fill/none; Alt fills the loading and error placeholder; Loaded/Error report the outcome.", "");
+        im.AddDemo("Data URI", "A base64 data URI (PNM bytes synthesized in code) and an inline SVG data URI -- both decode in memory, nothing touches disk.", "Image.datauri", 76,
+            "Image a = new Image(\"data:image/x-portable-anymap;base64,...\");\nImage b = new Image(\"data:image/svg+xml,<svg .../></svg>\");\nrow.With(a);\nrow.With(b);",
+            "{\n  \"type\": \"Image\",\n  \"name\": \"logo\",\n  \"src\": \"data:image/png;base64,iVBORw0...\",\n  \"fit\": \"contain\"\n}");
+        im.AddDemo("Fit modes", "One source, four fits inside fixed 110x70 boxes: contain letterboxes, cover crops to fill, fill stretches, none draws at natural size centred in the box.", "Image.fit", 110,
+            "Image img = new Image(src, \"alt\", \"cover\");\nimg.RenderInside(app, new Rect(x, y, 110, 70));",
+            "{\n  \"type\": \"Image\",\n  \"name\": \"cover\",\n  \"src\": \"wallpaper.jpg\",\n  \"fit\": \"cover\"\n}");
+        im.AddDemo("URL", "An http(s) src fetches on a background thread and marshals the bytes back through App.Post; a loopback HttpServer serves /img.pnm so the demo runs offline. While loading and on failure the image shows its Alt placeholder.", "Image.url", 96,
+            "Image img = new Image(\"http://127.0.0.1:18747/img.pnm\", \"loading...\");\nimg.Loaded += () => app.RequestRedraw();\nimg.Error += () => app.RequestRedraw();",
+            "{\n  \"type\": \"Image\",\n  \"name\": \"remote\",\n  \"src\": \"https://example.com/logo.webp\",\n  \"alt\": \"Logo\",\n  \"fit\": \"contain\"\n}");
+        im.AddProp("src", "string", "-", "File path, http(s) URL, data URI or SVG.");
+        im.AddProp("alt", "string", "-", "Placeholder / accessibility text.");
+        im.AddProp("fit", "enum", "contain", "contain/cover/fill/none.");
+        im.AddEvent("Loaded", "() => void", "Image decoded and cached.");
+        im.AddEvent("Error", "() => void", "Decode or fetch failed.");
+        list.Add(im);
         Gallery.Add(list, "Data Display", "Statistic",
             Gallery.T("Show a highlighted numeric value with a descriptive label.",
                 "以醒目的数值配合说明文字进行展示。"),

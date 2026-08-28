@@ -1,0 +1,113 @@
+using System;
+using System.Security.Cryptography;
+using Gui;
+using Gui.Widget;
+
+namespace ImageTest;
+
+/// Gui.Image 的无窗口回归：内存图像注册表（ImageLoadMem /
+/// ImageLoadSvg / EvictImage）与组件模型（Kind/Props/Events/
+/// ControlFactory）。像素数据在程序内合成（PNM P5 文本头 +
+/// ASCII 范围内的灰度字节），不依赖任何外部资源。
+class Program {
+    static int fails;
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got {got} want {want}");
+    }
+
+    static void EqStr(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got '{got}' want '{want}'");
+    }
+
+    static void Main() {
+        fails = 0;
+        Canvas c = new Canvas(64, 64);
+
+        // ---- 内存注册表：合成 P5 PNM（4x2，灰度字节全为 'd'=100，
+        // 保持整个缓冲区落在 ASCII 范围，跨平台逐字节确定）。
+        string pnm = "P5\n4 2\n255\n" + "dddddddd";
+        int w = Canvas.ImageLoadMem("mem:t.pnm", pnm, pnm.Length);
+        Eq("pnm width", w, 4);
+        Eq("pnm height", Canvas.ImageHeight("mem:t.pnm"), 2);
+        c.BlitImage("mem:t.pnm", 0, 0, 8, 4, 0, 0, 0, 0);
+        Canvas.EvictImage("mem:t.pnm");
+        Eq("pnm evicted", Canvas.ImageWidth("mem:t.pnm"), 0);
+        w = Canvas.ImageLoadMem("mem:t.pnm", pnm, pnm.Length);
+        Eq("pnm re-registered", w, 4);
+
+        // ---- 垃圾字节：解码失败返回 0，且不产生可查询的尺寸
+        //（mem key 绝不回落到文件路径加载）。
+        string junk = "not an image at all";
+        Eq("garbage", Canvas.ImageLoadMem("mem:t.bad", junk, junk.Length), 0);
+        Eq("garbage size", Canvas.ImageWidth("mem:t.bad"), 0);
+
+        // ---- SVG：固有 48x24；按 32x24 盒子 contain 重光栅 → 32x16。
+        string svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" "
+            + "width=\"48\" height=\"24\">"
+            + "<rect width=\"48\" height=\"24\" fill=\"#204060\"/></svg>";
+        w = Canvas.ImageLoadSvg("mem:t.svg", svg, 0, 0);
+        Eq("svg intrinsic w", w, 48);
+        Eq("svg intrinsic h", Canvas.ImageHeight("mem:t.svg"), 24);
+        w = Canvas.ImageLoadSvg("mem:t.svg@32x24", svg, 32, 24);
+        Eq("svg box w", w, 32);
+        Eq("svg box h", Canvas.ImageHeight("mem:t.svg@32x24"), 16);
+        Eq("bad svg", Canvas.ImageLoadSvg("mem:t.badsvg", "<svg", 0, 0), 0);
+
+        // ---- base64 载荷：与 Image 组件解析 data URI 走同一条
+        // Decode + ImageLoadMem 路径。
+        string b64 = Base64.Encode(pnm, pnm.Length);
+        List<int> n = new List<int>();
+        n.Add(0);
+        byte[] bytes = Base64.Decode(b64, n);
+        Eq("b64 length", n[0], pnm.Length);
+        w = Canvas.ImageLoadMem("mem:t.b64", bytes, n[0]);
+        Eq("b64 width", w, 4);
+        Eq("b64 height", Canvas.ImageHeight("mem:t.b64"), 2);
+
+        // ---- 组件模型（对齐 prop_test 的往返方式）。
+        Image img = new Image("https://example.com/a.png", "pic", "cover");
+        EqStr("kind", img.Kind(), "Image");
+        Eq("props count", img.Props().Count, 4);
+        EqStr("fit", img.GetExtra("fit"), "cover");
+        img.SetExtra("fit", "fill");
+        EqStr("fit after set", img.GetExtra("fit"), "fill");
+        img.SetProp("src", "x.png");
+        EqStr("prop src", img.GetProp("src"), "x.png");
+        img.SetProp("alt", "hello");
+        EqStr("prop alt", img.GetProp("alt"), "hello");
+        bool hasLoaded = false;
+        bool hasError = false;
+        List<string> evs = img.Events();
+        for (int i = 0; i < evs.Count; i = i + 1) {
+            if (evs[i] == "Loaded") { hasLoaded = true; }
+            if (evs[i] == "Error") { hasError = true; }
+        }
+        if (!hasLoaded) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL events: no Loaded");
+        }
+        if (!hasError) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL events: no Error");
+        }
+        Control made = ControlFactory.Create("Image");
+        if (made == null) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL factory: null");
+        } else {
+            EqStr("factory kind", made.Kind(), "Image");
+        }
+
+        if (fails == 0) {
+            Console.WriteLine("image_test OK");
+        } else {
+            Console.WriteLine($"image_test FAILURES {fails}");
+        }
+        c.Destroy();
+    }
+}

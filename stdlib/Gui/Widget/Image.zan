@@ -1,0 +1,433 @@
+using System;
+using System.IO;
+using System.Security.Cryptography;
+using Gui;
+
+namespace Gui.Widget;
+
+/// 图片：传一个地址即可渲染。`Src` 支持四类来源，按前缀自动识别：
+///
+///   1. 文件路径 —— PNG/JPEG/BMP/GIF/TGA/PNM/PSD/WebP 直接解码，
+///      `.svg` 文件按矢量光栅化；
+///   2. `http://` / `https://` 网络地址 —— 后台线程取回（见
+///      ImageHttp），完成前后都是占位，不阻塞 UI；
+///   3. `data:image/...;base64,...` 数据 URI —— base64 解码后内存
+///      解码，不落盘；
+///   4. SVG（上述任意来源指向 SVG，或 mime 带 `svg` 的 data URI）——
+///      以固有尺寸光栅化，首帧绘制后再按盒子尺寸重光栅一次。
+///
+/// `Fit` 控制缩放方式：contain（默认，等比留白）、cover（等比裁剪
+/// 铺满）、fill（拉伸铺满）、none（原始尺寸居中裁剪）。加载中与失败
+/// 由 `image` CSS 规则画的底色加 `Alt` 文本占位；`Loaded` / `Error`
+/// 事件通知结果。
+///
+///     Image img = new Image { Src = "https://example.com/logo.png" };
+///     img.Error += () => img.Reload();
+///
+/// 圆角：CSS `border-radius` 作用于背景与边框；位图内容本身按矩形
+/// 裁剪（当前光栅器只有矩形剪裁路径）。
+class Image : Control {
+    Binding<string> Src;
+    /// 替代文本：加载中/失败时显示在占位框里（也供无障碍用途）。
+    string Alt;
+    /// 缩放方式：contain / cover / fill / none。
+    string Fit;
+
+    /// 图片就绪（已解码并缓存）。工作线程触发时自动封送回 UI 线程。
+    UiEvent Loaded;
+    /// 解码失败、URL 取回失败或超时。
+    UiEvent Error;
+
+    // ---- 解析状态（只在 UI 线程触碰） ------------------------------
+    string resolvedSrc;    // 已解析过的 Src；null = 尚未解析
+    string imgKey;         // 绘制用 key：文件路径或 mem: 注册 key
+    int imgW;              // 已知像素尺寸
+    int imgH;
+    int loadState;         // 0 占位/加载中，1 已加载，2 失败
+    bool isSvg;
+    string svgText;        // SVG 源文本（文件 / URL / 非 base64 data URI）
+    byte[] svgBytes;       // SVG 源字节（base64 data URI）
+    int svgBytesLen;
+    string svgBaseKey;     // SVG 的固有尺寸注册 key
+    string svgRasterKey;   // 当前按盒子尺寸光栅的注册 key
+    int svgRasterW;
+    int svgRasterH;
+
+    void InitImage(string src, string alt, string fit) {
+        this.InitControl("image", 1);
+        // 占位框与图片都由 OnPaint 自绘，框架不要再铺样式表面
+        //（否则行高盒会被样式表面铺成整框，参见 Avatar 的说明）。
+        styleSurfaceOwned = true;
+        Src = src;
+        Alt = alt;
+        Fit = fit;
+        Loaded = new UiEvent();
+        Error = new UiEvent();
+        resolvedSrc = null;
+        imgKey = "";
+        imgW = 0;
+        imgH = 0;
+        loadState = 0;
+        isSvg = false;
+        svgText = "";
+        svgBytes = null;
+        svgBytesLen = 0;
+        svgBaseKey = "";
+        svgRasterKey = "";
+        svgRasterW = 0;
+        svgRasterH = 0;
+    }
+    Image() { InitImage("", "", ""); }
+    Image(string src) { InitImage(src, "", ""); }
+    Image(string src, string alt) { InitImage(src, alt, ""); }
+    Image(string src, string alt, string fit) { InitImage(src, alt, fit); }
+
+    string FitMode() {
+        if (Fit == "cover") { return "cover"; }
+        if (Fit == "fill") { return "fill"; }
+        if (Fit == "none") { return "none"; }
+        return "contain";
+    }
+
+    // ---- 来源解析 ---------------------------------------------------
+
+    /// Src 变化时重新解析来源并（重）注册内存图像。每帧Measure/Paint
+    /// 调用，未变化的 Src 直接返回。
+    void Resolve(App app) {
+        string src = "";
+        if (Src != null) { src = Src.Get(); }
+        if (src == null) { src = ""; }
+        if (resolvedSrc != null && src == resolvedSrc) { return; }
+        resolvedSrc = src;
+        this.ResetState();
+        if (src == "") { return; }
+        if (src.StartsWith("data:")) { this.ResolveDataUri(src); return; }
+        if (src.StartsWith("http://") || src.StartsWith("https://")) {
+            this.ResolveUrl(app, src);
+            return;
+        }
+        if (src.ToLower().EndsWith(".svg")) { this.ResolveSvgFile(src); return; }
+        this.ResolveFile(src);
+    }
+
+    void ResetState() {
+        loadState = 0;
+        imgW = 0;
+        imgH = 0;
+        imgKey = "";
+        isSvg = false;
+        svgText = "";
+        svgBytes = null;
+        svgBytesLen = 0;
+        svgBaseKey = "";
+        svgRasterKey = "";
+        svgRasterW = 0;
+        svgRasterH = 0;
+    }
+
+    void MarkLoaded(int w, int h) {
+        imgW = w;
+        imgH = h;
+        loadState = 1;
+        Loaded.Post();
+    }
+
+    void ResolveFile(string src) {
+        imgKey = src;
+        int w = Canvas.ImageWidth(src);
+        if (w > 0) {
+            this.MarkLoaded(w, Canvas.ImageHeight(src));
+        } else {
+            loadState = 2;
+        }
+    }
+
+    void ResolveSvgFile(string path) {
+        string text = File.ReadAllText(path);
+        if (text == null || text.Length == 0) {
+            loadState = 2;
+            return;
+        }
+        isSvg = true;
+        svgText = text;
+        svgBaseKey = "mem:s" + StrHash(path);
+        this.RasterSvg(0, 0);
+    }
+
+    void ResolveDataUri(string src) {
+        int comma = src.IndexOf(",");
+        if (comma < 0) { loadState = 2; return; }
+        string head = src.Substring(0, comma).ToLower();
+        string payload = src.Substring(comma + 1);
+        if (head.Contains("svg")) {
+            // SVG：base64 载荷解码成字节，文本载荷直接用。
+            isSvg = true;
+            svgBaseKey = "mem:d" + StrHash(src);
+            if (head.Contains(";base64")) {
+                List<int> outLen = new List<int>();
+                outLen.Add(0);
+                svgBytes = Base64.Decode(payload, outLen);
+                if (svgBytes == null || outLen[0] <= 0) {
+                    loadState = 2;
+                    return;
+                }
+                svgBytesLen = outLen[0];
+            } else {
+                svgText = payload;
+            }
+            this.RasterSvg(0, 0);
+            return;
+        }
+        if (!head.Contains(";base64")) { loadState = 2; return; }
+        List<int> n = new List<int>();
+        n.Add(0);
+        byte[] bytes = Base64.Decode(payload, n);
+        if (bytes == null || n[0] <= 0) { loadState = 2; return; }
+        imgKey = "mem:b" + StrHash(src);
+        int w = Canvas.ImageLoadMem(imgKey, bytes, n[0]);
+        if (w > 0) {
+            this.MarkLoaded(w, Canvas.ImageHeight(imgKey));
+        } else {
+            loadState = 2;
+        }
+    }
+
+    void ResolveUrl(App app, string src) {
+        imgKey = "mem:u" + StrHash(src);
+        // 同一 URL 已注册过（列表复用、页面回退）就直接用缓存。
+        int w = Canvas.ImageWidth(imgKey);
+        if (w > 0) {
+            this.MarkLoaded(w, Canvas.ImageHeight(imgKey));
+            return;
+        }
+        loadState = 0;
+        ImageHttp.Fetch(app, this, src, imgKey);
+    }
+
+    /// 把 SVG 源光栅化到 imgKey。boxW/boxH > 0 时按盒子尺寸光栅
+    ///（key 加 @WxH 后缀），否则用文档固有尺寸。
+    void RasterSvg(int boxW, int boxH) {
+        string key = svgBaseKey;
+        if (boxW > 0 && boxH > 0) { key = svgBaseKey + "@" + boxW + "x" + boxH; }
+        int w = 0;
+        if (svgBytes != null) {
+            w = Canvas.ImageLoadSvg(key, svgBytes, svgBytesLen, boxW, boxH);
+        } else {
+            w = Canvas.ImageLoadSvg(key, svgText, boxW, boxH);
+        }
+        if (w <= 0) { loadState = 2; return; }
+        // 尺寸变化后丢掉上一份光栅，注册表不积垃圾。
+        if (svgRasterKey != "" && svgRasterKey != key) {
+            Canvas.EvictImage(svgRasterKey);
+        }
+        svgRasterKey = key;
+        svgRasterW = w;
+        svgRasterH = Canvas.ImageHeight(key);
+        imgKey = key;
+        imgW = w;
+        imgH = svgRasterH;
+        loadState = 1;
+    }
+
+    // ---- ImageHttp 回调（已封送回 UI 线程） ------------------------
+
+    void OnFetched(string key, int w, int h) {
+        if (key != imgKey || loadState == 1) { return; }
+        this.MarkLoaded(w, h);
+    }
+
+    void OnSvgFetched(string text) {
+        if (loadState == 1) { return; }
+        isSvg = true;
+        svgText = text;
+        svgBaseKey = imgKey;
+        this.RasterSvg(0, 0);
+        if (loadState == 1) { Loaded.Post(); }
+    }
+
+    void OnFetchFailed() {
+        if (loadState == 1) { return; }
+        loadState = 2;
+        Error.Post();
+    }
+
+    /// 丢弃解析状态并重新加载当前 Src：URL 失败重试、源文件或
+    /// 远端内容变化后刷新。真正的工作在下一次绘制时发生。
+    void Reload() {
+        if (imgKey != "" && (imgKey.StartsWith("mem:u") || svgRasterKey != "")) {
+            Canvas.EvictImage(imgKey);
+        }
+        resolvedSrc = null;
+    }
+
+    /// FNV-1a 变体（djb2 取模）：内存图像 key 由源地址派生，同一
+    /// 地址稳定复用缓存，长 int 运算避免 32 位回绕的歧义。
+    static long StrHash(string s) {
+        long h = 5381;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            h = (h * 33 + (s[i] & 255)) % 2147483647;
+        }
+        return h;
+    }
+
+    static int ScaleTo(int v, int num, int den) {
+        if (den <= 0) { return v; }
+        return v * num / den;
+    }
+
+    // ---- 保留模式钩子（Control）-------------------------------------
+
+    void OnMeasure(App app) {
+        this.Resolve(app);
+        StyleBox s = this.ResolveStyleAs(app, "image", Class, Style.SNormal());
+        int cssW = s.WidthOr(-1);
+        int cssH = s.HeightOr(-1);
+        int dw = 96;
+        int dh = 96;
+        if (cssW > 0 && cssH > 0) {
+            dw = cssW;
+            dh = cssH;
+        } else if (loadState == 1 && imgW > 0 && imgH > 0) {
+            // 已知图片尺寸：CSS 只给一边时按纵横比补另一边。
+            if (cssW > 0) {
+                dw = cssW;
+                dh = this.ScaleTo(cssW, imgH, imgW);
+            } else if (cssH > 0) {
+                dh = cssH;
+                dw = this.ScaleTo(cssH, imgW, imgH);
+            } else {
+                dw = app.Scale(imgW);
+                dh = app.Scale(imgH);
+            }
+        } else {
+            if (cssW > 0) { dw = cssW; }
+            if (cssH > 0) { dh = cssH; }
+        }
+        prefW = dw;
+        prefH = dh;
+    }
+
+    void OnPaint(App app) {
+        this.Resolve(app);
+        if (bw <= 0 || bh <= 0) { return; }
+        Canvas c = app.canvas;
+        StyleBox s = this.ResolveStyleAs(app, "image", Class, Style.SNormal());
+        s.Paint(app, bx, by, bw, bh);
+        if (loadState == 1 && imgW > 0 && imgH > 0) {
+            if (isSvg && (bw != svgRasterW || bh != svgRasterH)) {
+                // 首帧拿到真实盒子后按盒子尺寸重光栅一次。
+                this.RasterSvg(bw, bh);
+            }
+            if (loadState == 1) {
+                this.BlitFitted(app, c);
+                return;
+            }
+        }
+        this.DrawPlaceholder(app, c, s);
+    }
+
+    void BlitFitted(App app, Canvas c) {
+        c.PushClip(bx, by, bw, bh);
+        string fit = this.FitMode();
+        if (fit == "fill") {
+            c.BlitImage(imgKey, bx, by, bw, bh, 0, 0, 0, 0);
+        } else if (fit == "none") {
+            int dw = app.Scale(imgW);
+            int dh = app.Scale(imgH);
+            c.BlitImage(imgKey, bx + (bw - dw) / 2, by + (bh - dh) / 2,
+                        dw, dh, 0, 0, 0, 0);
+        } else if (fit == "cover") {
+            // 等比铺满：裁掉超出的源区域（壁纸 cover 数学的一般化）。
+            int sw = imgW;
+            int sh = imgH;
+            int sx = 0;
+            int sy = 0;
+            if (bw * imgH >= bh * imgW) {
+                sw = this.ScaleTo(imgH, bw, bh);
+                sx = (imgW - sw) / 2;
+            } else {
+                sh = this.ScaleTo(imgW, bh, bw);
+                sy = (imgH - sh) / 2;
+            }
+            c.BlitImage(imgKey, bx, by, bw, bh, sx, sy, sw, sh);
+        } else {
+            // contain：等比缩进盒子，居中（Wizard 预览的 contain 数学）。
+            int dw = bw;
+            int dh = bh;
+            if (bw * imgH <= bh * imgW) {
+                dh = this.ScaleTo(bw, imgH, imgW);
+            } else {
+                dw = this.ScaleTo(bh, imgW, imgH);
+            }
+            c.BlitImage(imgKey, bx + (bw - dw) / 2, by + (bh - dh) / 2,
+                        dw, dh, 0, 0, 0, 0);
+        }
+        c.PopClip();
+    }
+
+    void DrawPlaceholder(App app, Canvas c, StyleBox s) {
+        string label = Alt;
+        if (label == null) { label = ""; }
+        if (label == "" && loadState == 2) { label = "..."; }
+        if (label == "") { return; }
+        c.DrawTextCentered(bx, by, bw, bh, label, s.FgOr(0),
+                           s.FontOr(app.Scale(13)));
+    }
+
+    // ---- 设计器 / 序列化模型 ---------------------------------------
+
+    override string Kind() { return "Image"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec src = PropSpec.Text("src", "Src");
+        src.str = Src;
+        ps.Add(src);
+        PropSpec alt = PropSpec.Text("alt", "Alt");
+        alt.str = Alt;
+        ps.Add(alt);
+        PropSpec fit = PropSpec.Enum("fit", "Fit",
+            new List<string>{ "contain", "cover", "fill", "none" });
+        fit.num = this.FitIndex();
+        ps.Add(fit);
+        ps.Add(PropSpec.Text("class", "Classes"));
+        return ps;
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Loaded");
+        e.Add("Error");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Loaded") { Loaded.Add(a); return; }
+        if (evt == "Error") { Error.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    override string GetExtra(string key) {
+        if (key == "fit") { return this.FitMode(); }
+        return "";
+    }
+
+    override bool SetExtra(string key, string val) {
+        if (key == "fit") {
+            if (val == "cover") { Fit = "cover"; }
+            else if (val == "fill") { Fit = "fill"; }
+            else if (val == "none") { Fit = "none"; }
+            else { Fit = "contain"; }
+            return true;
+        }
+        return false;
+    }
+
+    int FitIndex() {
+        string f = this.FitMode();
+        if (f == "cover") { return 1; }
+        if (f == "fill") { return 2; }
+        if (f == "none") { return 3; }
+        return 0;
+    }
+}
