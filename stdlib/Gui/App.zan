@@ -409,6 +409,13 @@ class App {
     // 至少有一个动画没有声明范围，于是由动画唤醒的下一帧仍整窗重绘。
     bool animRectValid;
     bool animRectAll;
+    // 自上一帧以来收到过需要重绘的真实输入事件（按下/释放/按键）。
+    // 这类事件改变哪些像素只有控件自己在渲染中读到 Ui.Clicked/焦点
+    // 之后才知道，控件不可能提前声明；裁剪到动画声明范围的帧又只
+    // 渲染条带内的控件——点击目标不在条带里就既读不到点击也画不出
+    // 状态，直到某次偶然覆盖它的帧（表现为点击迟钝甚至丢失）。所以
+    // 输入帧必须整帧：partialPending 只允许纯动画/唤醒帧设置。
+    bool inputNeedsFrame;
     int animRX;
     int animRY;
     int animRW;
@@ -737,6 +744,7 @@ class App {
         this.wakeFrameNextMs = -1;
         this.animRectValid = false;
         this.animRectAll = false;
+        this.inputNeedsFrame = false;
         this.animRW = 0;
         this.animRH = 0;
         this.animPrevValid = false;
@@ -2312,6 +2320,7 @@ class App {
         dmgH = 0;
         animRectValid = false;
         animRectAll = false;
+        inputNeedsFrame = false;
         animPrevValid = false;
         fxSnapValid = false;
         fxDamage = null;
@@ -3477,8 +3486,9 @@ class App {
     /// 表示这一拍已由特效层就地呈现、还该继续等下一拍。
     bool TakeDueFrame(int now) {
         bool fxOnly = animNextMs < 0 || now < animNextMs;
-        if (fxOnly && this.FxPresent()) {
-            // 已就地呈现；继续等待下一个 tick。
+        if (fxOnly && this.FxPresent() && !this.inputNeedsFrame) {
+            // 已就地呈现；继续等待下一个 tick。输入事件不等：
+            // 点击目标所在的控件可能根本不在已呈现的范围里。
             return false;
         }
         if (fxOnly && wakeFrameNextMs >= 0 && now >= wakeFrameNextMs) {
@@ -3497,8 +3507,12 @@ class App {
         this.NoteRedrawWhy("ProcessEvent");
         needsRedraw = true;
         // 纯动画唤醒：若上一帧所有动画都声明了范围，
-        // 把这一帧裁剪到它们的并集。
+        // 把这一帧裁剪到它们的并集。输入事件触发的帧不裁剪：
+        // 点击/按键改变哪些像素只有控件渲染时读到 Ui.Clicked
+        // 才知道，无法提前声明；而裁剪帧只渲染条带内的控件，
+        // 点击目标在条带外时点击既不被处理也不被重绘。
         if (!fxOnly && animRectValid && !animRectAll
+            && !this.inputNeedsFrame
             && !this.ForceFullFrames()
             && !this.HasOverlays()) {
             int adX = animRX;
@@ -3653,6 +3667,10 @@ class App {
         this.PerfMark("sh.posts");
 
         int kind = window.EventKind();
+        // 按下/释放/按键触发的那一帧必须整帧重绘（见 inputNeedsFrame）。
+        if (kind == 2 || kind == 3 || kind == 4 || kind == 5 || kind == 6) {
+            inputNeedsFrame = true;
+        }
         // 新的释放事件：解除上一释放的帧绑定，让本次点击
         // 重新锁定到处理它的那一帧（见 ClickFrameCurrent）。
         // 只认没见过的新事件：动画到期路径可能不泵就出帧，
@@ -3909,6 +3927,10 @@ class App {
     bool ApplyEvent(nint evHwnd) {
         bool mine = evHwnd == window.GetHandle();
         int kind = window.EventKind();
+        // 按下/释放/按键触发的那一帧必须整帧重绘（见 inputNeedsFrame）。
+        if (kind == 2 || kind == 3 || kind == 4 || kind == 5 || kind == 6) {
+            inputNeedsFrame = true;
+        }
         // 新的释放事件：解除上一释放的帧绑定（见 ClickFrameCurrent）。
         // 与 ProcessEvent 相同，只认没见过的新事件——自定义循环
         // （gallery 等）的动画分支不泵就出帧，EventKind 会回读
@@ -4248,6 +4270,9 @@ class App {
             window.PresentFull();
         }
         this.SettleGlassRefresh();
+        // 完整帧结束时刷新事件解析基准：条带帧不刷新，条带外沿用
+        // 最近一次整帧的命中区（见 HitTester.KeepFullSnapshot）。
+        if (!partialFrame) { hitTester.KeepFullSnapshot(); }
         window.Present(canvas);
         UiDriver.NotifyPresented(this);
         if (App.PerfOn()) {
@@ -4780,6 +4805,8 @@ class App {
         wakeFrameNextMs = -1;
         animRectValid = false;
         animRectAll = false;
+        // inputNeedsFrame 此处不清：TakeDueFrame 与本函数下方的条带
+        // 裁剪决策都要读它，消费后再复位（见 partialFrame 判定之后）。
         // 本帧正在重新渲染，槽位 7 的 fx 快照已过期。
         fxSnapValid = false;
         // 匿名玻璃表面的逐帧编号从头开始（有身份的面板走
@@ -4808,6 +4835,11 @@ class App {
         partialFrame = false;
         partialBlocked = false;
         glassDeferred = false;
+        // 输入事件（按下/释放/按键）触发的帧不得继承上一帧遗留的
+        // 条带裁剪：条带外的控件本帧不渲染、不注册命中区，锚点认领
+        // 与 Ui.Clicked 都会落空——表现为点击无响应/迟钝。条带是
+        // 纯动画帧自己声明的，输入帧永远整帧（见 inputNeedsFrame）。
+        if (inputNeedsFrame) { partialPending = false; }
         if (partialPending && dmgW > 0 && dmgH > 0) {
             partialFrame = true;
         }
@@ -4819,6 +4851,9 @@ class App {
             forceFullNext = false;
             this.NoteRedrawWhy("force-full");
         }
+        // 输入帧的整帧承诺已兑现（partialPending 已被上面的判定
+        // 消费），复位给下一个事件周期。
+        inputNeedsFrame = false;
         // 整窗帧重画了每一个像素，动画的旧位置已被覆盖：
         // 下一次动画帧不必再把它算进裁剪。
         if (!partialFrame) { animPrevValid = false; }

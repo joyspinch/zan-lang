@@ -589,6 +589,20 @@ class HitTester {
     List<int> anchorSet;
     List<int> anchorDone;
 
+    // 事件解析基准：最近一个完整帧的命中区快照。局部帧只渲染损伤
+    // 条带，条带外的控件本帧不注册命中区；若事件按「上一帧」解析，
+    // 上一帧恰好是条带帧时，条带外的点击会全部扑空（表现为点击
+    // 无响应/迟钝）。条带裁剪的前提是条带外像素与控件均未变化，
+    // 所以最近一次整帧的命中区对条带外依然正确——整帧结束时由
+    // App 拷贝一份（KeepFullSnapshot）作为解析基准。
+    List<int> snapId;
+    List<int> snapX;
+    List<int> snapY;
+    List<int> snapW;
+    List<int> snapH;
+    List<int> snapType;
+    int snapUsed;
+
     HitTester() {
         poolA = new List<HitRegion>();
         poolB = new List<HitRegion>();
@@ -605,6 +619,36 @@ class HitTester {
         anchorType = new List<int>{ 0, 0, 0, 0 };
         anchorSet = new List<int>{ 0, 0, 0, 0 };
         anchorDone = new List<int>{ 0, 0, 0, 0 };
+        snapId = new List<int>();
+        snapX = new List<int>();
+        snapY = new List<int>();
+        snapW = new List<int>();
+        snapH = new List<int>();
+        snapType = new List<int>();
+        snapUsed = 0;
+    }
+
+    /// 整帧（非条带帧）渲染结束时调用：把当前命中区拷贝为事件
+    /// 解析的基准。regions 是复用池，对象会被下一帧就地改写，因此
+    /// 必须按值拷贝（AnchorAt 只用到这六个 int）。
+    void KeepFullSnapshot() {
+        int n = used;
+        snapId.Clear();
+        snapX.Clear();
+        snapY.Clear();
+        snapW.Clear();
+        snapH.Clear();
+        snapType.Clear();
+        for (int i = 0; i < n; i = i + 1) {
+            HitRegion r = regions[i];
+            snapId.Add(r.id);
+            snapX.Add(r.x);
+            snapY.Add(r.y);
+            snapW.Add(r.width);
+            snapH.Add(r.height);
+            snapType.Add(r.widgetType);
+        }
+        snapUsed = n;
     }
 
     void Clear() {
@@ -616,23 +660,24 @@ class HitTester {
         for (int k = 0; k < 4; k = k + 1) { anchorDone[k] = 0; }
     }
 
-    /// 在上一帧的命中区上解析 (px, py) 的目标并记入锚点 `k`；
-    /// `below` 为真时跳过阻挡区，解析其下方的控件（右键用）。
+    /// 在最近一个完整帧的命中区快照上解析 (px, py) 的目标并记入
+    /// 锚点 `k`；`below` 为真时跳过阻挡区，解析其下方的控件（右键用）。
     int AnchorAt(int k, int px, int py, bool below) {
-        int i = used - 1;
+        int i = snapUsed - 1;
         while (i >= 0) {
-            HitRegion r = regions[i];
-            bool skip = below && r.widgetType == -1;
-            if (!skip && r.Contains(px, py)) {
-                anchorId[k] = r.id;
-                anchorX[k] = r.x;
-                anchorY[k] = r.y;
-                anchorW[k] = r.width;
-                anchorH[k] = r.height;
-                anchorType[k] = r.widgetType;
+            int wtype = snapType[i];
+            bool skip = below && wtype == -1;
+            if (!skip && px >= snapX[i] && px < snapX[i] + snapW[i]
+                && py >= snapY[i] && py < snapY[i] + snapH[i]) {
+                anchorId[k] = snapId[i];
+                anchorX[k] = snapX[i];
+                anchorY[k] = snapY[i];
+                anchorW[k] = snapW[i];
+                anchorH[k] = snapH[i];
+                anchorType[k] = wtype;
                 anchorSet[k] = 1;
                 anchorDone[k] = 0;
-                return r.id;
+                return snapId[i];
             }
             i = i - 1;
         }
