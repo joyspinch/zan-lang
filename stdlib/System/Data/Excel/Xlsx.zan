@@ -1,0 +1,553 @@
+using System;
+using System.IO;
+using System.Text;
+using System.IO.Compression;
+
+namespace System.Data.Excel;
+
+/// <summary>xlsx 单元格值。用静态构造器创建：<see cref="Str"/> 文本、
+/// <see cref="Num"/> 数字、<see cref="Bool"/> 真值、<see cref="Date"/> 日期
+/// （自 1970-01-01 的天数，与 DataTable 的日期键一致）。kind 0 的空
+/// 单元格（含 <c>Str("")</c>）在写出时跳过。</summary>
+class XlsxCell {
+    /// 0 空，1 文本，2 数字，3 布尔，4 日期。
+    int kind;
+    /// kind 1 的文本内容；kind 2 的十进制字面量——写入时即定形，
+    /// 避免 Convert.ToString(double) 只有约 6 位有效数字的损耗。
+    string text;
+    /// kind 4：自 1970-01-01 起的天数（可为负）。
+    int days;
+    /// kind 3 的真值。
+    bool flag;
+
+    XlsxCell() {
+        this.kind = 0;
+        this.text = "";
+        this.days = 0;
+        this.flag = false;
+    }
+
+    /// 文本单元格；空字符串写出为空单元格。
+    static XlsxCell Str(string v) {
+        XlsxCell c = new XlsxCell();
+        c.kind = 1;
+        c.text = v;
+        return c;
+    }
+
+    /// 数字单元格。写出取能精确往返的最短十进制表示。
+    static XlsxCell Num(double v) {
+        XlsxCell c = new XlsxCell();
+        c.kind = 2;
+        c.text = Xlsx.RealToText(v);
+        return c;
+    }
+
+    /// 布尔单元格（Excel 的 t="b"，显示为 TRUE/FALSE）。
+    static XlsxCell Bool(bool v) {
+        XlsxCell c = new XlsxCell();
+        c.kind = 3;
+        c.flag = v;
+        return c;
+    }
+
+    /// 日期单元格：写出为 Excel 序列日期（1900 日期制），
+    /// 挂 yyyy-mm-dd 数字格式，Excel 里显示为日期而非数字。
+    static XlsxCell Date(int unixDays) {
+        XlsxCell c = new XlsxCell();
+        c.kind = 4;
+        c.days = unixDays;
+        return c;
+    }
+}
+
+/// <summary>xlsx 工作表。行是 <see cref="XlsxCell"/> 列表（可参差，
+/// 缺的列按空处理）；默认开启表头加粗（首行）、冻结首行与列宽
+/// 自适应，按需关掉即可。</summary>
+class XlsxSheet {
+    public string name;
+    /// 首行按表头处理：加粗。默认 true。
+    public bool headerBold;
+    /// 冻结首行（Excel 的冻结窗格）。默认 true。
+    public bool freezeHeader;
+    /// 按内容估算列宽（前 200 行）。默认 true。
+    public bool autoWidth;
+    List<List<XlsxCell>> rows;
+    int maxCols;
+
+    XlsxSheet(string name) {
+        this.name = name;
+        this.headerBold = true;
+        this.freezeHeader = true;
+        this.autoWidth = true;
+        this.rows = new List<List<XlsxCell>>();
+        this.maxCols = 0;
+    }
+
+    /// 追加一行。行内单元格数可以少于其他行。
+    void AddRow(List<XlsxCell> cells) {
+        rows.Add(cells);
+        if (cells.Count > maxCols) { maxCols = cells.Count; }
+    }
+
+    /// 写入指定单元格，行/列自动扩展；中间缺位补空单元格。
+    void SetCell(int row, int col, XlsxCell v) {
+        while (rows.Count <= row) { rows.Add(new List<XlsxCell>()); }
+        List<XlsxCell> r = rows[row];
+        while (r.Count <= col) { r.Add(new XlsxCell()); }
+        r[col] = v;
+        if (col + 1 > maxCols) { maxCols = col + 1; }
+    }
+
+    int RowCount() { return rows.Count; }
+}
+
+/// <summary>
+/// 极简 XLSX（Office Open XML SpreadsheetML）写出器，纯 Zan 实现：
+/// 每张工作表一个 worksheet XML，连同 workbook/styles/rels 一起用
+/// <see cref="Zip"/> 打包。字符串写 inlineStr（免共享字符串表），
+/// 支持文本/数字/布尔/日期单元格、表头加粗、冻结首行与列宽自适应；
+/// 不写时间戳，同一本书每次生成的字节完全一致。
+/// 与 Excel、WPS、LibreOffice、openpyxl 互通。
+///
+///   XlsxBook book = XlsxBook.New();
+///   XlsxSheet sh = book.AddSheet("报表");
+///   List<XlsxCell> head = new List<XlsxCell>();
+///   head.Add(XlsxCell.Str("品名"));
+///   head.Add(XlsxCell.Str("单价"));
+///   sh.AddRow(head);
+///   sh.SetCell(1, 0, XlsxCell.Str("椅子"));
+///   sh.SetCell(1, 1, XlsxCell.Num(123.45));
+///   sh.SetCell(1, 2, XlsxCell.Date(20458));   // 2026-01-05
+///   book.Save("out.xlsx");                    // 或 SaveToBytes() 给 HTTP 下载
+/// </summary>
+class XlsxBook {
+    List<XlsxSheet> sheets;
+
+    XlsxBook() {
+        this.sheets = new List<XlsxSheet>();
+    }
+
+    /// 新建空工作簿。
+    static XlsxBook New() { return new XlsxBook(); }
+
+    /// 添加工作表并返回它。名字会清洗 Excel 的非法字符
+    /// （: \ / ? * [ ] 与首尾撇号）、截到 31 字符，并与已有表名去重。
+    XlsxSheet AddSheet(string name) {
+        string clean = "";
+        for (int i = 0; i < name.Length && clean.Length < 31; i = i + 1) {
+            int c = (int)name[i];
+            bool edge = i == 0 || i == name.Length - 1;
+            if (c == 58 || c == 92 || c == 47 || c == 63 || c == 42
+                || c == 91 || c == 93) {
+                clean = clean + "_";
+            } else if (c == 39 && edge) {
+                // Excel 禁止表名以撇号开头或结尾。
+            } else {
+                clean = clean + name.Substring(i, 1);
+            }
+        }
+        if (clean == "") { clean = "Sheet"; }
+        string unique = clean;
+        int n = 2;
+        while (XlsxBook.IndexOfSheet(sheets, unique) >= 0) {
+            unique = clean + Convert.ToString(n);
+            n = n + 1;
+        }
+        XlsxSheet s = new XlsxSheet(unique);
+        sheets.Add(s);
+        return s;
+    }
+
+    /// 便捷构建：全文本表格。`firstRowIsHeader` 为 false 时关闭
+    /// 表头加粗与冻结；需要数字/日期/布尔请用 AddSheet + XlsxCell。
+    static XlsxBook FromText(List<List<string>> rows, bool firstRowIsHeader) {
+        XlsxBook b = new XlsxBook();
+        XlsxSheet sh = b.AddSheet("Sheet1");
+        for (int r = 0; r < rows.Count; r = r + 1) {
+            List<XlsxCell> row = new List<XlsxCell>();
+            List<string> src = rows[r];
+            for (int c = 0; c < src.Count; c = c + 1) {
+                row.Add(XlsxCell.Str(src[c]));
+            }
+            sh.AddRow(row);
+        }
+        if (!firstRowIsHeader) {
+            sh.headerBold = false;
+            sh.freezeHeader = false;
+        }
+        return b;
+    }
+
+    /// 生成完整 xlsx 字节（zip 包）。输出只由数据决定，可复现。
+    byte[] SaveToBytes() {
+        List<ZipEntry> entries = new List<ZipEntry>();
+        entries.Add(XlsxBook.Part("[Content_Types].xml",
+            XlsxBook.ContentTypes(sheets.Count)));
+        entries.Add(XlsxBook.Part("_rels/.rels", XlsxBook.RootRels()));
+        entries.Add(XlsxBook.Part("docProps/core.xml", XlsxBook.CoreProps()));
+        entries.Add(XlsxBook.Part("docProps/app.xml",
+            XlsxBook.AppProps()));
+        entries.Add(XlsxBook.Part("xl/workbook.xml",
+            XlsxBook.WorkbookXml(sheets)));
+        entries.Add(XlsxBook.Part("xl/_rels/workbook.xml.rels",
+            XlsxBook.WorkbookRels(sheets.Count)));
+        entries.Add(XlsxBook.Part("xl/styles.xml", XlsxBook.StylesXml()));
+        for (int i = 0; i < sheets.Count; i = i + 1) {
+            string part = "xl/worksheets/sheet" + Convert.ToString(i + 1) + ".xml";
+            entries.Add(XlsxBook.Part(part, XlsxBook.SheetXml(sheets[i])));
+        }
+        return Zip.Create(entries, 6);
+    }
+
+    /// 写入 .xlsx 文件。路径打不开时抛 <see cref="IOException"/>。
+    void Save(string path) {
+        File.WriteAllBytes(path, SaveToBytes());
+    }
+
+    static ZipEntry Part(string name, string xml) {
+        ZipEntry e = new ZipEntry(name);
+        e.data = xml.ToBytes();
+        return e;
+    }
+
+    static int IndexOfSheet(List<XlsxSheet> sheets, string name) {
+        for (int i = 0; i < sheets.Count; i = i + 1) {
+            if (sheets[i].name == name) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    // ---------- OPC 部件 ----------
+
+    static string ContentTypes(int sheetCount) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">");
+        sb.Append("<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>");
+        sb.Append("<Default Extension=\"xml\" ContentType=\"application/xml\"/>");
+        sb.Append("<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>");
+        for (int i = 1; i <= sheetCount; i = i + 1) {
+            sb.Append("<Override PartName=\"/xl/worksheets/sheet");
+            sb.Append(Convert.ToString(i));
+            sb.Append(".xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>");
+        }
+        sb.Append("<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>");
+        sb.Append("<Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>");
+        sb.Append("<Override PartName=\"/docProps/app.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.extended-properties+xml\"/>");
+        sb.Append("</Types>");
+        return sb.ToString();
+    }
+
+    static string RootRels() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");
+        sb.Append("<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>");
+        sb.Append("<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/>");
+        sb.Append("<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties\" Target=\"docProps/app.xml\"/>");
+        sb.Append("</Relationships>");
+        return sb.ToString();
+    }
+
+    static string CoreProps() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">");
+        sb.Append("<dc:creator>Zan</dc:creator>");
+        sb.Append("</cp:coreProperties>");
+        return sb.ToString();
+    }
+
+    static string AppProps() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\">");
+        sb.Append("<Application>Zan</Application>");
+        sb.Append("</Properties>");
+        return sb.ToString();
+    }
+
+    static string WorkbookXml(List<XlsxSheet> sheets) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets>");
+        for (int i = 0; i < sheets.Count; i = i + 1) {
+            sb.Append("<sheet name=\"" + Xlsx.EscAttr(sheets[i].name));
+            sb.Append("\" sheetId=\"" + Convert.ToString(i + 1));
+            sb.Append("\" r:id=\"rId" + Convert.ToString(i + 1) + "\"/>");
+        }
+        sb.Append("</sheets></workbook>");
+        return sb.ToString();
+    }
+
+    static string WorkbookRels(int sheetCount) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");
+        for (int i = 1; i <= sheetCount; i = i + 1) {
+            sb.Append("<Relationship Id=\"rId" + Convert.ToString(i));
+            sb.Append("\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet");
+            sb.Append(Convert.ToString(i));
+            sb.Append(".xml\"/>");
+        }
+        sb.Append("<Relationship Id=\"rId" + Convert.ToString(sheetCount + 1));
+        sb.Append("\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>");
+        sb.Append("</Relationships>");
+        return sb.ToString();
+    }
+
+    // 样式表：s=0 默认，s=1 日期（numFmt 164 = yyyy-mm-dd），
+    // s=2 表头加粗，s=3 日期 + 加粗。numFmts 必须在 fonts 之前
+    //（schema 顺序），Excel 才认。
+    static string StylesXml() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">");
+        sb.Append("<numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\"yyyy\\-mm\\-dd\"/></numFmts>");
+        sb.Append("<fonts count=\"2\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font><font><b/><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts>");
+        sb.Append("<fills count=\"2\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill></fills>");
+        sb.Append("<borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders>");
+        sb.Append("<cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>");
+        sb.Append("<cellXfs count=\"4\">");
+        sb.Append("<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>");
+        sb.Append("<xf numFmtId=\"164\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/>");
+        sb.Append("<xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/>");
+        sb.Append("<xf numFmtId=\"164\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\" applyFont=\"1\"/>");
+        sb.Append("</cellXfs>");
+        sb.Append("<cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles>");
+        sb.Append("</styleSheet>");
+        return sb.ToString();
+    }
+
+    static string SheetXml(XlsxSheet s) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">");
+        sb.Append("<sheetViews><sheetView workbookViewId=\"0\">");
+        if (s.freezeHeader && s.RowCount() > 0) {
+            sb.Append("<pane ySplit=\"1\" topLeftCell=\"A2\" activePane=\"bottomLeft\" state=\"frozen\"/>");
+            sb.Append("<selection pane=\"bottomLeft\" activeCell=\"A2\" sqref=\"A2\"/>");
+        }
+        sb.Append("</sheetView></sheetViews>");
+        if (s.autoWidth && s.maxCols > 0) {
+            sb.Append("<cols>");
+            for (int c = 0; c < s.maxCols; c = c + 1) {
+                sb.Append("<col min=\"" + Convert.ToString(c + 1));
+                sb.Append("\" max=\"" + Convert.ToString(c + 1));
+                sb.Append("\" width=\"" + Convert.ToString(XlsxBook.ColWidth(s, c)));
+                sb.Append("\" customWidth=\"1\"/>");
+            }
+            sb.Append("</cols>");
+        }
+        sb.Append("<sheetData>");
+        for (int r = 0; r < s.rows.Count; r = r + 1) {
+            List<XlsxCell> row = s.rows[r];
+            sb.Append("<row r=\"" + Convert.ToString(r + 1) + "\">");
+            bool bold = s.headerBold && r == 0;
+            for (int c = 0; c < row.Count; c = c + 1) {
+                XlsxCell cell = row[c];
+                if (cell == null || cell.kind == 0) { continue; }
+                if (cell.kind == 1 && cell.text == "") { continue; }
+                string rf = "<c r=\"" + Xlsx.ColRef(c) + Convert.ToString(r + 1) + "\"";
+                int style = 0;
+                if (cell.kind == 4) { style = 1; }
+                if (bold) { style = style + 2; }
+                if (style > 0) { rf = rf + " s=\"" + Convert.ToString(style) + "\""; }
+                if (cell.kind == 1) {
+                    sb.Append(rf + " t=\"inlineStr\"><is><t");
+                    if ((int)cell.text[0] == 32
+                        || (int)cell.text[cell.text.Length - 1] == 32) {
+                        sb.Append(" xml:space=\"preserve\"");
+                    }
+                    sb.Append(">" + Xlsx.Esc(cell.text) + "</t></is></c>");
+                } else if (cell.kind == 2) {
+                    sb.Append(rf + "><v>" + cell.text + "</v></c>");
+                } else if (cell.kind == 3) {
+                    sb.Append(rf + " t=\"b\"><v>");
+                    if (cell.flag) { sb.Append("1"); } else { sb.Append("0"); }
+                    sb.Append("</v></c>");
+                } else if (cell.kind == 4) {
+                    // Excel 1900 日期制：1970-01-01 = 序列 25569。
+                    sb.Append(rf + "><v>" + Convert.ToString((long)cell.days + 25569) + "</v></c>");
+                }
+            }
+            sb.Append("</row>");
+        }
+        sb.Append("</sheetData></worksheet>");
+        return sb.ToString();
+    }
+
+    // 列宽估算：内容显示宽度 + 2 的余量，夹在 [10, 60]。
+    // 只扫前 200 行——宽度是观感问题，不值得为十万行扫描。
+    static int ColWidth(XlsxSheet s, int col) {
+        int w = 8;
+        int limit = s.rows.Count;
+        if (limit > 200) { limit = 200; }
+        for (int r = 0; r < limit; r = r + 1) {
+            List<XlsxCell> row = s.rows[r];
+            if (col >= row.Count) { continue; }
+            XlsxCell cell = row[col];
+            if (cell == null || cell.kind == 0) { continue; }
+            int len = 8;
+            if (cell.kind == 1) { len = Xlsx.WideLen(cell.text); }
+            else if (cell.kind == 2) { len = cell.text.Length + 1; }
+            else if (cell.kind == 4) { len = 10; }
+            if (len > w) { w = len; }
+        }
+        w = w + 2;
+        if (w < 10) { w = 10; }
+        if (w > 60) { w = 60; }
+        return w;
+    }
+}
+
+/// <summary>Xlsx 模块的共享工具：XML 转义、列号转字母、
+/// double 的精确文本化与显示宽度估算。</summary>
+class Xlsx {
+    /// XML 文本转义：&amp; &lt; &gt;，并剥掉 XML 1.0 不允许的
+    /// 控制字符（保留制表符、换行、回车）。
+    static string Esc(string s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = (int)s[i];
+            if (c == 38) { sb.Append("&amp;"); }
+            else if (c == 60) { sb.Append("&lt;"); }
+            else if (c == 62) { sb.Append("&gt;"); }
+            else if (c < 32 && c != 9 && c != 10 && c != 13) {
+                // XML 1.0 非法控制字符：丢弃。
+            } else {
+                sb.Append(s.Substring(i, 1));
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// 属性值转义：在 <see cref="Esc"/> 基础上再转义双引号。
+    static string EscAttr(string s) {
+        string t = Xlsx.Esc(s);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < t.Length; i = i + 1) {
+            if ((int)t[i] == 34) { sb.Append("&quot;"); }
+            else { sb.Append(t.Substring(i, 1)); }
+        }
+        return sb.ToString();
+    }
+
+    /// 0 → A、25 → Z、26 → AA……（Excel 列引用）。
+    static string ColRef(int c) {
+        string s = "";
+        int n = c + 1;
+        while (n > 0) {
+            int m = (n - 1) - ((n - 1) / 26) * 26;
+            s = Encoding.Utf8FromCodePoint(65 + m) + s;
+            n = (n - 1) / 26;
+        }
+        return s;
+    }
+
+    /// double → 十进制文本：从 0 位小数起逐位尝试，取首个能按
+    /// 相对容差往返的表示；|v| ≥ 1e15 或非零 |v| < 1e-9 时写科学
+    /// 计数法。绝不用 Convert.ToString(double)——它只有约 6 位
+    /// 有效数字，123.45 会被写成 123.45（碰巧）但 123.4567 变 123.457。
+    static string RealToText(double v) {
+        if (v == 0.0) { return "0"; }
+        bool neg = v < 0.0;
+        double a = v;
+        if (neg) { a = 0.0 - a; }
+        if (a >= Xlsx.Pow10(15) || a < 1.0 / Xlsx.Pow10(9)) {
+            int exp = 0;
+            while (a >= 10.0) { a = a / 10.0; exp = exp + 1; }
+            while (a < 1.0) { a = a * 10.0; exp = exp - 1; }
+            string mant = Xlsx.Shortest(a, 15);
+            string sign = "E+";
+            if (exp < 0) { sign = "E-"; exp = 0 - exp; }
+            string s = mant + sign + Convert.ToString(exp);
+            if (neg) { s = "-" + s; }
+            return s;
+        }
+        // 整数位数决定小数位上限，保证 a*10^d 不超出 long。
+        int digits = 1;
+        double t = a;
+        while (t >= 10.0) { t = t / 10.0; digits = digits + 1; }
+        string f = Xlsx.Shortest(a, 18 - digits);
+        if (neg) { return "-" + f; }
+        return f;
+    }
+
+    // 0..maxDec 位小数逐个尝试，返回首个按相对容差 1e-15
+    // 往返的定点表示；都不行则返回最长表示兜底。
+    static string Shortest(double a, int maxDec) {
+        string last = Xlsx.FixedReal(a, maxDec);
+        for (int d = 0; d <= maxDec; d = d + 1) {
+            string s = Xlsx.FixedReal(a, d);
+            double p = Xlsx.ParseFixed(s);
+            double diff = p - a;
+            if (diff < 0.0) { diff = 0.0 - diff; }
+            if (diff <= a / Xlsx.Pow10(15)) { return s; }
+        }
+        return last;
+    }
+
+    // a >= 0：渲染为恰好 `decimals` 位小数（四舍五入）。
+    static string FixedReal(double a, int decimals) {
+        double scale = Xlsx.Pow10(decimals);
+        long total = (long)(a * scale + 0.5);
+        long ip = total;
+        string frac = "";
+        if (decimals > 0) {
+            long p = (long)scale;
+            ip = total / p;
+            long fp = total - ip * p;
+            frac = ".";
+            string fs = Convert.ToString(fp);
+            while (fs.Length < decimals) { fs = "0" + fs; }
+            frac = frac + fs;
+        }
+        return Convert.ToString(ip) + frac;
+    }
+
+    // 严格十进制解析（我自己生成的文本，格式可控）。
+    static double ParseFixed(string s) {
+        double v = 0.0;
+        int i = 0;
+        bool neg = false;
+        if (i < s.Length && (int)s[i] == 45) { neg = true; i = i + 1; }
+        while (i < s.Length) {
+            int c = (int)s[i];
+            if (c == 46) { i = i + 1; break; }
+            if (c < 48 || c > 57) { return 0.0; }
+            v = v * 10.0 + (double)(c - 48);
+            i = i + 1;
+        }
+        double scale = 1.0;
+        while (i < s.Length) {
+            int c = (int)s[i];
+            if (c < 48 || c > 57) { return 0.0; }
+            scale = scale / 10.0;
+            v = v + (double)(c - 48) * scale;
+            i = i + 1;
+        }
+        if (neg) { return 0.0 - v; }
+        return v;
+    }
+
+    static double Pow10(int n) {
+        double p = 1.0;
+        for (int i = 0; i < n; i = i + 1) { p = p * 10.0; }
+        return p;
+    }
+
+    /// 显示宽度估算：CJK/全角按 2，其他按 1（代理对按 2）。
+    /// Excel 的列宽单位约等于一个 ASCII 字符，这只求观感不较真。
+    static int WideLen(string s) {
+        int w = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = (int)s[i];
+            if (c >= 0xD800 && c <= 0xDFFF) { w = w + 2; }
+            else if (c >= 0x2E80 || (c >= 0x1100 && c <= 0x115F)) { w = w + 2; }
+            else { w = w + 1; }
+        }
+        return w;
+    }
+}

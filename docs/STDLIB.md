@@ -170,7 +170,8 @@ stdlib/
 │   ├── Json/                        # Json.zan, JsonValue.zan
 │   ├── Linq/                        # Enumerable.zan, Expression.zan
 │   │
-│   └── (Automation, Compiler, Data/, Drawing/, Globalization, Input,
+│   └── (Automation, Compiler, Data/ — 含 Excel/（XlsxBook，
+│       纯 Zan 写 .xlsx）, Drawing/, Globalization, Input,
 │       Management, Resources, Scripting/, Security/, ServiceProcess,
 │       Web/, Windows/)
 │

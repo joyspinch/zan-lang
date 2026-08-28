@@ -1,0 +1,293 @@
+/// DataTable 导出示例：Excel 式表格 + 三种导出——
+///   · 导出 Excel：整个（过滤/排序后）视图 → .xlsx（数字列写数字、
+///     日期列写 Excel 日期、bool 列写布尔，Excel 里可直接求和筛选）
+///   · 导出 CSV：整个视图 → .csv（UTF-8 带 BOM，Excel 双击不乱码）
+///   · 导出选中：只导勾选行 / 单元格范围 → .xlsx
+/// 保存路径走 FilePicker 保存对话框。序列化本体在数据层
+/// System.Data.Excel（XlsxBook），不依赖 GUI——服务端、控制台
+/// 程序生成报表直接用它即可。
+///
+/// Build & run:
+///   build/zanc examples/gui_excel_export/gui_excel_export.zan --auto-stdlib -o build/gui_excel_export.exe
+///   build/gui_excel_export.exe
+using System;
+using System.IO;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Component.DataTable;
+
+/// 列式销售数据源：CellText 给显示文本，类型化键（CellNum/CellReal/
+/// CellDay/CellBool）与列声明走同一条路径——排序、汇总和导出
+/// 用的都是它们。
+class SaleSource : DataSource {
+    List<string> names;
+    List<string> regions;
+    int[] qtys;
+    double[] prices;
+    int[] days;        // 下单日，自 1970-01-01 的天数
+    bool[] delivered;
+
+    static SaleSource Demo() {
+        SaleSource s = new SaleSource();
+        s.names = new List<string>();
+        s.regions = new List<string>();
+        s.qtys = new int[12];
+        s.prices = new double[12];
+        s.days = new int[12];
+        s.delivered = new bool[12];
+        SaleSource.Push(s, "人体工学椅", "华东", 12, 1299.0, 2026, 1, 5, true);
+        SaleSource.Push(s, "升降桌", "华北", 5, 2599.0, 2026, 1, 18, true);
+        SaleSource.Push(s, "显示器支架", "华南", 34, 249.5, 2026, 2, 2, true);
+        SaleSource.Push(s, "机械键盘", "华东", 18, 599.0, 2026, 2, 14, false);
+        SaleSource.Push(s, "无线鼠标", "西南", 42, 199.0, 2026, 2, 21, true);
+        SaleSource.Push(s, "4K 显示器", "华北", 9, 3299.0, 2026, 3, 3, false);
+        SaleSource.Push(s, "USB-C 扩展坞", "华东", 27, 399.0, 2026, 3, 12, true);
+        SaleSource.Push(s, "降噪耳机", "华南", 15, 1499.0, 2026, 3, 25, false);
+        SaleSource.Push(s, "网络摄像头", "华北", 22, 459.0, 2026, 4, 6, true);
+        SaleSource.Push(s, "桌面麦克风", "西南", 11, 749.0, 2026, 4, 19, false);
+        SaleSource.Push(s, "缓解灯带", "华南", 63, 89.9, 2026, 5, 8, true);
+        SaleSource.Push(s, "笔记本支架", "华东", 30, 159.0, 2026, 5, 27, false);
+        return s;
+    }
+
+    static void Push(SaleSource s, string name, string region, int qty,
+                     double price, int y, int m, int d, bool done) {
+        s.names.Add(name);
+        s.regions.Add(region);
+        s.qtys[s.names.Count - 1] = qty;
+        s.prices[s.names.Count - 1] = price;
+        s.days[s.names.Count - 1] = SaleSource.DaysFromCivil(y, m, d);
+        s.delivered[s.names.Count - 1] = done;
+    }
+
+    override int RowCount() { return names.Count; }
+
+    override string CellText(int row, int col) {
+        if (col == 0) { return names[row]; }
+        if (col == 1) { return regions[row]; }
+        if (col == 2) { return Convert.ToString(qtys[row]); }
+        if (col == 3) { return SaleSource.Money(prices[row]); }
+        if (col == 4) { return SaleSource.DateText(days[row]); }
+        if (delivered[row]) { return "true"; }
+        return "false";
+    }
+
+    override int CellNum(int row, int col) {
+        if (col == 2) { return qtys[row]; }
+        return (int)prices[row];
+    }
+
+    override double CellReal(int row, int col) {
+        if (col == 3) { return prices[row]; }
+        return (double)qtys[row];
+    }
+
+    override int CellDay(int row, int col) { return days[row]; }
+
+    override bool CellBool(int row, int col) { return delivered[row]; }
+
+    // 两位小数定点渲染（与 DataColumn.Money 的显示一致）。
+    static string Money(double v) {
+        bool neg = v < 0.0;
+        double a = v;
+        if (neg) { a = 0.0 - a; }
+        long cents = (long)(a * 100.0 + 0.5);
+        long ip = cents / 100;
+        int fp = (int)(cents - ip * 100);
+        string frac = Convert.ToString(fp);
+        if (fp < 10) { frac = "0" + frac; }
+        string s = Convert.ToString(ip) + "." + frac;
+        if (neg) { s = "-" + s; }
+        return s;
+    }
+
+    // 天数 → "yyyy-MM-dd"。
+    static string DateText(int days) {
+        int z = days + 719468;
+        int era = z / 146097;
+        int doe = z - era * 146097;
+        int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        int y = yoe + era * 400;
+        int doy = doe - (yoe * 365 + yoe / 4 - yoe / 100);
+        int mp = (5 * doy + 2) / 153;
+        int d = doy - (153 * mp + 2) / 5 + 1;
+        int m = mp + 3;
+        if (mp >= 10) { m = m - 12; }
+        if (m <= 2) { y = y + 1; }
+        string mm = Convert.ToString(m);
+        if (m < 10) { mm = "0" + mm; }
+        string dd = Convert.ToString(d);
+        if (d < 10) { dd = "0" + dd; }
+        return Convert.ToString(y) + "-" + mm + "-" + dd;
+    }
+
+    // 天数 ← "yyyy-MM-dd"（Howard Hinnant 的 civil_from_days 逆变换）。
+    static int DaysFromCivil(int y, int m, int d) {
+        if (m <= 2) { y = y - 1; }
+        int era = y / 400;
+        int yoe = y - era * 400;
+        int mi = m + 9;
+        if (m > 2) { mi = m - 3; }
+        int doy = (153 * mi + 2) / 5 + d - 1;
+        int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        return era * 146097 + doe - 719468;
+    }
+}
+
+class ExportDemo {
+    static App app;
+    static DataTableState st;
+    static SaleSource src;
+    static List<DataColumn> cols;
+    static FilePicker picker;
+    static Button xlsxBtn;
+    static Button csvBtn;
+    static Button selBtn;
+    static Label status;
+    /// 非 "" 表示下一圈循环先弹保存对话框："" 不能在 Click 处理器里
+    /// 直接 BeginSaveFile——子窗口弹出前父窗口必须先完整画一帧拿到
+    /// 焦点交接（见 gui_gallery）。
+    static string pendingKind;
+    static int lastKind;   // 对话框确认时对应哪种导出：1 xlsx / 2 csv / 3 选中
+
+    static void Main() {
+        app = App.CreateDark("DataTable 导出示例", 1040, 660);
+        st = new DataTableState();
+        st.showStatusBar = true;
+        st.showSummary = true;
+        src = SaleSource.Demo();
+        picker = new FilePicker();
+        pendingKind = "";
+        lastKind = 0;
+
+        cols = new List<DataColumn>();
+        cols.Add(DataColumn.Pin(DataColumn.Text("品名", app.Scale(150))));
+        cols.Add(DataColumn.Text("区域", app.Scale(100)));
+        cols.Add(DataColumn.Sum(DataColumn.Numeric("数量", app.Scale(90))));
+        cols.Add(DataColumn.Money(DataColumn.Numeric("单价", app.Scale(110)), "$"));
+        cols.Add(DataColumn.Date("下单日", app.Scale(120)));
+        cols.Add(DataColumn.Bool("已交付", app.Scale(90)));
+
+        xlsxBtn = new Button { Text = "导出 Excel (.xlsx)" };
+        xlsxBtn.Click += ExportDemo.OnExportXlsx;
+        csvBtn = new Button { Text = "导出 CSV (.csv)" };
+        csvBtn.Click += ExportDemo.OnExportCsv;
+        selBtn = new Button { Text = "导出选中为 Excel" };
+        selBtn.Click += ExportDemo.OnExportSelection;
+        status = new Label("勾选行（或拖选单元格范围）后可只导选中；不选则导出整个视图。");
+
+        app.Show();
+        WidgetId.Mark();
+        while (app.isRunning) {
+            if (ExportDemo.pendingKind != "") {
+                ExportDemo.Frame();
+                if (pendingKind == "xlsx") {
+                    picker.BeginSaveFile("", ".xlsx", "sales.xlsx", "导出 Excel");
+                    lastKind = 1;
+                } else if (pendingKind == "csv") {
+                    picker.BeginSaveFile("", ".csv", "sales.csv", "导出 CSV");
+                    lastKind = 2;
+                } else {
+                    picker.BeginSaveFile("", ".xlsx", "sales-selection.xlsx", "导出选中为 Excel");
+                    lastKind = 3;
+                }
+                pendingKind = "";
+            }
+            // 一个事件泵同时驱动主窗口与 FilePicker 的子对话框窗口：
+            // 任何一方要重绘就用 PollEvent 保持动画，否则阻塞等待。
+            picker.ApplySkin(app.ThemeMenuIndex());
+            int r;
+            if (picker.NeedsRedraw()
+                || (!picker.IsOpen() && app.needsRedraw)) {
+                r = app.window.PollEvent();
+                if (r == 1) { r = app.window.WaitEventTimeout(16); }
+            } else {
+                r = app.window.WaitEvent();
+            }
+            if (r < 0) { break; }
+            app.DrainPosts();
+            // 自定义事件循环要自行推进自动化驱动（标准循环在
+            // ProcessEvent 里做），否则 ZAN_UI_SCRIPT 永不前进。
+            UiDriver.Tick();
+            nint evh = Window.EventHwnd();
+            int kind = app.window.EventKind();
+            if (kind == 8) {
+                if (picker.OwnsWindow(evh)) {
+                    picker.ApplyEvent(evh);
+                } else if (evh == app.WindowHandle()) {
+                    break;
+                }
+            } else if (picker.OwnsWindow(evh)) {
+                picker.ApplyEvent(evh);
+            } else {
+                bool inputEv = kind == 2 || kind == 3 || kind == 13
+                    || kind == 4 || kind == 6;
+                if (app.needsRedraw || inputEv || kind == 1) {
+                    app.ApplyEvent(evh);
+                    ExportDemo.Frame();
+                }
+            }
+            // 画子对话框（若开着）并收割结果。
+            picker.RenderWindow();
+            int pr = picker.TakeResult();
+            if (pr != 0) {
+                // 对话框刚关：子窗口不白拿前台，关闭后 OS 会把前台给
+                // 别的窗口——重新激活父窗口并重绘（同 gui_gallery）。
+                app.window.Show();
+                app.RequestRedraw();
+                if (pr == 1) { ExportDemo.SaveAs(picker.SelectedPath()); }
+            }
+        }
+    }
+
+    static void Frame() {
+        app.BeginFrame();
+        WidgetId.ResetFrame();
+        ExportDemo.Render();
+        app.RenderChrome("DataTable 导出示例");
+        app.PresentFrame();
+    }
+
+    static void Render() {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int W = c.Width();
+        int H = c.Height();
+        int top = app.titlebarH;
+        c.FillRect(0, top, W, H - top, t.bgPrimary);
+        int pad = app.Scale(16);
+        int by = top + pad;
+        int bw = app.Scale(170);
+        int bx = pad;
+        xlsxBtn.Render(app, bx, by, bw);
+        csvBtn.Render(app, bx + bw + app.Scale(10), by, bw);
+        selBtn.Render(app, bx + (bw + app.Scale(10)) * 2, by, bw + app.Scale(20));
+        int ty = by + app.theme.heightMedium + app.Scale(14);
+        DataTable.RenderSource(app, pad, ty, W - pad * 2,
+            H - ty - app.Scale(52), cols, src, st);
+        status.RenderAt(app, pad, H - app.Scale(34), W - pad * 2);
+    }
+
+    static void OnExportXlsx() { ExportDemo.pendingKind = "xlsx"; }
+    static void OnExportCsv() { ExportDemo.pendingKind = "csv"; }
+    static void OnExportSelection() { ExportDemo.pendingKind = "sel"; }
+
+    static void SaveAs(string path) {
+        if (path == "") { return; }
+        bool ok = false;
+        if (lastKind == 2) {
+            ok = DataTable.ExportToCsv(st, cols, src, path, false);
+        } else if (lastKind == 3) {
+            ok = DataTable.ExportToXlsx(st, cols, src, path, true);
+            if (!ok) {
+                status.Text = "没有勾选行，也没有单元格范围——先勾几行再导出。";
+                return;
+            }
+        } else {
+            ok = DataTable.ExportToXlsx(st, cols, src, path, false);
+        }
+        if (ok) { status.Text = "已导出：" + path; }
+        else { status.Text = "导出失败（路径不可写？）：" + path; }
+    }
+}

@@ -1,0 +1,122 @@
+using System;
+using System.Data.Excel;
+using System.IO;
+
+namespace Gui.Component.DataTable;
+
+/// DataTable 分部：文件导出。行选择语义与 <see cref="BuildText"/>
+/// （剪贴板复制）完全一致，"所见即所得"——导出的就是过滤/排序后
+/// 看到的行；序列化本体在 <see cref="XlsxBook"/>（数据层），不依赖
+/// GUI，服务端/控制台程序直接用 XlsxBook 即可。
+partial class DataTable {
+    // ---------- 文件导出（CSV / XLSX） ----------
+
+    /// 导出为 CSV 文件，始终含表头行。行选择：
+    /// `selectionOnly` 为 false 时导出整个过滤/排序后的视图；
+    /// 为 true 时有单元格范围导范围（行×列），否则导勾选行，
+    /// 两者皆无返回 false。内容与复制粘贴一致（显示文本，
+    /// RFC 4180 转义）。UTF-8 带 BOM，Excel 双击打开不乱码。
+    static bool ExportToCsv(DataTableState st, List<DataColumn> cols,
+                            DataSource src, string path, bool selectionOnly) {
+        if (!DataTable.ExportSelectionExists(st, selectionOnly)) { return false; }
+        string text = DataTable.BuildText(st, cols, src, true, true);
+        try {
+            File.WriteAllBytes(path, DataTable.WithBom(text));
+            return true;
+        } catch (Exception ex) {
+            return false;
+        }
+    }
+
+    /// 导出为 .xlsx 文件，语义与 <see cref="ExportToCsv"/> 相同，
+    /// 但按列声明的类型写出真值：数值列写数字（可参与 Excel 汇总）、
+    /// 日期列写 Excel 日期、bool 列写布尔，其余写文本；首行加粗、
+    /// 冻结首行、列宽自适应。路径打不开时返回 false。
+    static bool ExportToXlsx(DataTableState st, List<DataColumn> cols,
+                             DataSource src, string path, bool selectionOnly) {
+        if (!DataTable.ExportSelectionExists(st, selectionOnly)) { return false; }
+        int c0 = 0;
+        int c1 = cols.Count - 1;
+        List<int> rowsOut = new List<int>();
+        if (selectionOnly && DataTable.HasRange(st)) {
+            c0 = DataTable.MaxI(0, DataTable.MinI(st.rangeC0, st.rangeC1));
+            c1 = DataTable.MinI(cols.Count - 1,
+                DataTable.MaxI(st.rangeC0, st.rangeC1));
+            int rLo = DataTable.MaxI(0, DataTable.MinI(st.rangeR0, st.rangeR1));
+            int rHi = DataTable.MinI(st.order.Count - 1,
+                DataTable.MaxI(st.rangeR0, st.rangeR1));
+            for (int oi = rLo; oi <= rHi; oi = oi + 1) { rowsOut.Add(st.order[oi]); }
+        } else if (selectionOnly) {
+            for (int oi = 0; oi < st.order.Count; oi = oi + 1) {
+                int ri = st.order[oi];
+                if (st.selected[ri]) { rowsOut.Add(ri); }
+            }
+        } else {
+            for (int oi = 0; oi < st.order.Count; oi = oi + 1) {
+                rowsOut.Add(st.order[oi]);
+            }
+        }
+        if (c1 < c0 || rowsOut.Count == 0) { return false; }
+        XlsxBook book = XlsxBook.New();
+        XlsxSheet sh = book.AddSheet("Sheet1");
+        List<XlsxCell> head = new List<XlsxCell>();
+        for (int cc = c0; cc <= c1; cc = cc + 1) {
+            head.Add(XlsxCell.Str(cols[cc].title));
+        }
+        sh.AddRow(head);
+        for (int k = 0; k < rowsOut.Count; k = k + 1) {
+            List<XlsxCell> row = new List<XlsxCell>();
+            for (int cc = c0; cc <= c1; cc = cc + 1) {
+                row.Add(DataTable.ExportCell(cc, cols[cc], src, rowsOut[k]));
+            }
+            sh.AddRow(row);
+        }
+        try {
+            book.Save(path);
+            return true;
+        } catch (Exception ex) {
+            return false;
+        }
+    }
+
+    // 单元格 → xlsx 值：按列声明的类型键取数（与排序/汇总走的
+    // 是同一条路径，导出与表格显示不会各说各话）。
+    // 空单元格返回 null（写出时跳过）。
+    static XlsxCell ExportCell(int ci, DataColumn col, DataSource src, int row) {
+        string raw = src.CellText(row, ci);
+        if (raw == "") { return null; }
+        if (col.isDate) {
+            int day = src.CellDay(row, ci, col.dateOrder);
+            if (day == DataTable.NoDate()) { return XlsxCell.Str(raw); }
+            return XlsxCell.Date(day);
+        }
+        if (col.isBool) { return XlsxCell.Bool(src.CellBool(row, ci)); }
+        if (col.numeric) {
+            if (col.decimals > 0) { return XlsxCell.Num(src.CellReal(row, ci)); }
+            return XlsxCell.Num((double)src.CellNum(row, ci));
+        }
+        return XlsxCell.Str(raw);
+    }
+
+    // selectionOnly 时有没有可导出的东西：单元格范围或至少一行勾选。
+    static bool ExportSelectionExists(DataTableState st, bool selectionOnly) {
+        if (!selectionOnly) { return true; }
+        if (DataTable.HasRange(st)) { return true; }
+        for (int oi = 0; oi < st.order.Count; oi = oi + 1) {
+            if (st.selected[st.order[oi]]) { return true; }
+        }
+        return false;
+    }
+
+    // UTF-8 带 BOM：Excel 双击打开 CSV 时，不带 BOM 会按本地
+    // 旧代码页猜编码，中文必乱码。
+    static byte[] WithBom(string text) {
+        byte[] body = text.ToBytes();
+        byte[] all = new byte[3 + body.Length];
+        all[0] = 239;
+        all[1] = 187;
+        all[2] = 191;
+        for (int i = 0; i < body.Length; i = i + 1) { all[3 + i] = body[i]; }
+        return all;
+    }
+}

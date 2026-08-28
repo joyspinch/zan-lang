@@ -1,0 +1,134 @@
+// XLSX 写出器：构建一本两工作表的 xlsx（文本/数字/布尔/日期、
+// XML 特殊字符、表头加粗、冻结首行、列宽自适应），在内存里用
+// Zip.Read + Zip.Extract 解包，断言各部件的关键内容，再落盘读回
+// 验证字节一致与可复现性（不写时间戳）。
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Data.Excel;
+
+namespace Prog;
+
+class Prog {
+    // 在归档里按名找条目并解压为文本（部件都是 UTF-8 XML）。
+    static string Decode(byte[] zip, List<ZipEntry> entries, string name) {
+        for (int i = 0; i < entries.Count; i = i + 1) {
+            if (entries[i].name == name) {
+                byte[] b = Zip.Extract(zip, entries[i]);
+                if (b == null) { return ""; }
+                nint buf = NativeMemory.Alloc(b.Length + 1);
+                for (int k = 0; k < b.Length; k = k + 1) {
+                    new Span<byte>(buf + k, 1)[0] = b[k];
+                }
+                string s = NativeMemory.GetString(buf, 0, b.Length);
+                NativeMemory.Free(buf);
+                return s;
+            }
+        }
+        return "";
+    }
+
+    // 子串包含（tests 里没有 string.Contains 可依赖）。
+    static bool Has(string hay, string needle) {
+        if (needle.Length == 0) { return true; }
+        if (needle.Length > hay.Length) { return false; }
+        for (int i = 0; i + needle.Length <= hay.Length; i = i + 1) {
+            bool same = true;
+            for (int k = 0; k < needle.Length; k = k + 1) {
+                if (hay[i + k] != needle[k]) { same = false; break; }
+            }
+            if (same) { return true; }
+        }
+        return false;
+    }
+
+    static void Check(bool ok, string label) {
+        if (ok) { Console.WriteLine("ok " + label); } else { Console.WriteLine("FAIL " + label); }
+    }
+
+    static void Main() {
+        XlsxBook book = XlsxBook.New();
+        XlsxSheet sh = book.AddSheet("订单");
+        List<XlsxCell> head = new List<XlsxCell>();
+        head.Add(XlsxCell.Str("品名"));
+        head.Add(XlsxCell.Str("数量"));
+        head.Add(XlsxCell.Str("单价"));
+        head.Add(XlsxCell.Str("下单日"));
+        head.Add(XlsxCell.Str("启用"));
+        sh.AddRow(head);
+        List<XlsxCell> r1 = new List<XlsxCell>();
+        r1.Add(XlsxCell.Str("办公椅"));
+        r1.Add(XlsxCell.Num(12.0));
+        r1.Add(XlsxCell.Num(123.45));
+        r1.Add(XlsxCell.Date(20458));                       // 2026-01-05 → 序列 46027
+        r1.Add(XlsxCell.Bool(true));
+        sh.AddRow(r1);
+        List<XlsxCell> r2 = new List<XlsxCell>();
+        r2.Add(XlsxCell.Str("A&B<C>引\"号"));                // XML 特殊字符
+        r2.Add(XlsxCell.Num(1234567.0));
+        r2.Add(XlsxCell.Num(0.5));
+        r2.Add(XlsxCell.Date(1));                            // 1970-01-02 → 序列 25570
+        r2.Add(XlsxCell.Bool(false));
+        sh.AddRow(r2);
+        sh.SetCell(2, 1, XlsxCell.Str(""));                  // 覆盖成空 → 跳过
+        sh.SetCell(3, 5, XlsxCell.Str("备注列"));             // 参差行 → 列 F
+
+        XlsxSheet second = book.AddSheet("第二张");
+        second.SetCell(0, 0, XlsxCell.Str("合计"));
+        second.SetCell(0, 1, XlsxCell.Num(123.4567));
+
+        // 表名去重：再叫"订单"的表会得到唯一名。
+        XlsxSheet dup = book.AddSheet("订单");
+        dup.SetCell(0, 0, XlsxCell.Str("x"));
+
+        byte[] zip = book.SaveToBytes();
+        Console.WriteLine("zip bytes: " + Convert.ToString(zip.Length));
+
+        List<ZipEntry> entries = Zip.Read(zip);
+        Check(entries != null, "zip-read");
+        // 3 张表 + workbook/rels/styles/内容类型/docProps×2/.rels = 10
+        Check(entries.Count == 10, "entry-count " + Convert.ToString(entries.Count));
+
+        string wb = Decode(zip, entries, "xl/workbook.xml");
+        Check(Has(wb, "<sheet name=\"订单\" sheetId=\"1\" r:id=\"rId1\"/>"), "workbook-sheet1");
+        Check(Has(wb, "name=\"订单2\""), "sheet-name-dedup");
+        Check(Has(wb, "<sheet name=\"第二张\""), "workbook-sheet2");
+
+        string s1 = Decode(zip, entries, "xl/worksheets/sheet1.xml");
+        Check(Has(s1, "<pane ySplit=\"1\" topLeftCell=\"A2\" activePane=\"bottomLeft\" state=\"frozen\"/>"), "freeze-pane");
+        Check(Has(s1, "r=\"A1\" s=\"2\" t=\"inlineStr\"><is><t>品名</t></is></c>"), "header-bold");
+        Check(Has(s1, "<is><t>办公椅</t></is></c>"), "inline-str");
+        Check(Has(s1, "r=\"B2\"><v>12</v></c>"), "int-cell");
+        Check(Has(s1, "r=\"C2\"><v>123.45</v></c>"), "real-cell");
+        Check(Has(s1, "r=\"C3\"><v>0.5</v></c>"), "real-half");
+        Check(Has(s1, "r=\"D2\" s=\"1\"><v>46027</v></c>"), "date-cell");
+        Check(Has(s1, "r=\"E2\" t=\"b\"><v>1</v></c>"), "bool-cell");
+        Check(Has(s1, "r=\"E3\" t=\"b\"><v>0</v></c>"), "bool-false");
+        Check(Has(s1, "A&amp;B&lt;C&gt;"), "xml-escape");
+        Check(Has(s1, "r=\"F4\""), "ragged-col");
+        Check(!Has(s1, "B3"), "empty-cell-skipped");
+        Check(Has(s1, "<col min=\"1\" max=\"1\" width="), "autowidth");
+
+        string s2 = Decode(zip, entries, "xl/worksheets/sheet2.xml");
+        Check(Has(s2, "<v>123.4567</v>"), "precision-7digits");
+
+        string styles = Decode(zip, entries, "xl/styles.xml");
+        Check(Has(styles, "<numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\"yyyy\\-mm\\-dd\"/></numFmts>")
+            && Has(styles, "cellXfs count=\"4\""), "styles");
+
+        string ct = Decode(zip, entries, "[Content_Types].xml");
+        Check(Has(ct, "/xl/worksheets/sheet3.xml"), "content-types");
+
+        // 落盘 → 读回：字节一致（可复现），且仍是合法 zip。
+        book.Save("xlsx_write_tmp.xlsx");
+        byte[] disk = File.ReadAllBytes("xlsx_write_tmp.xlsx");
+        bool same = disk.Length == zip.Length;
+        for (int i = 0; same && i < zip.Length; i = i + 1) {
+            if (disk[i] != zip[i]) { same = false; }
+        }
+        Check(same, "deterministic-bytes");
+        List<ZipEntry> reread = Zip.Read(disk);
+        Check(reread != null && reread.Count == 10, "reread");
+        File.Delete("xlsx_write_tmp.xlsx");
+    }
+}
