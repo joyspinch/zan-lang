@@ -1,0 +1,131 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// 无窗口回归：InputNumber 的定点数数学（NumberText / ParseScaled 的
+/// 四舍五入与截断、分组串的双向换算）、千分位分组展示、自定义
+/// Formatter/Parser 钩子、Validator 的 error 标记与 Invalid 事件、
+/// 步进钳制（step/min/max），以及设计器 Extra 键的往返。全部是
+/// 纯计算，不需要窗口，对着 golden 比。
+class Program {
+    static void Line(string s) { Console.WriteLine(s); }
+
+    static bool GroupFmt = false;
+
+    static string Yen(string s) { return s + " ¥"; }
+    static string StripYen(string s) { return s.Replace(" ¥", ""); }
+    static bool MinTen(int v) { return v >= 10; }
+
+    static void Main() {
+        // ---- NumberText：定长小数展示 ---------------------------------
+        Line("nt 1234@0 " + InputNumber.NumberText(1234, 0));
+        Line("nt 1079@2 " + InputNumber.NumberText(1079, 2));
+        Line("nt -5@2 " + InputNumber.NumberText(0 - 5, 2));
+        Line("nt 7@3 " + InputNumber.NumberText(7, 3));
+        Line("nt 0@2 " + InputNumber.NumberText(0, 2));
+
+        // ---- GroupThousands：分组与幂等 --------------------------------
+        Line("g 1234 " + InputNumber.GroupThousands("1234"));
+        Line("g -1234567 " + InputNumber.GroupThousands("-1234567"));
+        Line("g 1234.5 " + InputNumber.GroupThousands("1234.5"));
+        Line("g 123 " + InputNumber.GroupThousands("123"));
+        Line("g 12345 " + InputNumber.GroupThousands("12,345"));
+
+        // ---- ParseScaled：解析 / 截断 / 四舍五入 / 回退 ----------------
+        Line("p 10.79@2 " + InputNumber.ParseScaled("10.79", 2, 0, null));
+        Line("p 1079@0 " + InputNumber.ParseScaled("1079", 0, 0, null));
+        Line("p 10.795@2 " + InputNumber.ParseScaled("10.795", 2, 0, null));
+        Line("p 10.999@2 " + InputNumber.ParseScaled("10.999", 2, 0, null));
+        Line("p 10.7@2 " + InputNumber.ParseScaled("10.7", 2, 0, null));
+        Line("p -0.05@2 " + InputNumber.ParseScaled("-0.05", 2, 0, null));
+        Line("p 1,234@0 " + InputNumber.ParseScaled("1,234", 0, 0, null));
+        Line("p empty " + InputNumber.ParseScaled("", 2, 42, null));
+        Line("p minus " + InputNumber.ParseScaled("-", 2, 42, null));
+        Line("p junk " + InputNumber.ParseScaled("abc", 2, 42, null));
+        Line("p 10. " + InputNumber.ParseScaled("10.", 2, 0, null));
+
+        // ---- Parser 钩子（"1,079 ¥" -> "1079"）------------------------
+        NumParser strip = StripYen;
+        Line("ph 1,079 yen " + InputNumber.ParseScaled("1,079 ¥", 0, 0, strip));
+
+        // ---- 实例：分组展示 + 编辑缓冲 --------------------------------
+        InputNumber n = new InputNumber(0, 100000);
+        n.SetValue(1075);
+        Line("v " + n.Value());
+        n.Precision = 2;
+        n.SetValue(1079);
+        Line("v2 " + n.DisplayText());
+        n.GroupDigits = true;
+        n.SetValue(1079);
+        Line("v3 " + n.DisplayText());
+        Line("v3 set " + n.Value());
+
+        // step 按缩放单位：0.01
+        InputNumber st = new InputNumber(0, 10000);
+        st.Precision = 2;
+        st.stepV = 25;
+        st.SetValue(1000);
+        Line("st " + st.DisplayText());
+        st.SetRaw(st.StepUpVal(st.Value()));
+        Line("st up " + st.DisplayText());
+        Line("st up raw " + st.Value());
+
+        // ---- 钳制与步进 -------------------------------------------------
+        InputNumber cl = new InputNumber(0, 10);
+        cl.SetRaw(120);
+        Line("clamp hi " + cl.Value());
+        cl.SetRaw(-5);
+        Line("clamp lo " + cl.Value());
+        Line("step " + cl.StepUpVal(10) + " " + cl.StepDownVal(0));
+
+        // ---- Validator：error 标记 + Invalid 事件 ----------------------
+        InputNumber vd = new InputNumber(0, 100);
+        NumValidator ok = MinTen;
+        int invalidHits = 0;
+        vd.Invalid.Add(() => { invalidHits = invalidHits + 1; });
+        vd.WithValidator(ok);
+        vd.SetValue(5);
+        Line("vd bad " + vd.GetExtra("value") + " invalid=" + Convert.ToString(invalidHits)
+            + " flag=" + (vd.invalidFlag ? "1" : "0"));
+        vd.SetValue(50);
+        Line("vd good flag=" + (vd.invalidFlag ? "1" : "0")
+            + " invalid=" + Convert.ToString(invalidHits));
+
+        // ---- Formatter 钩子（"1,075" -> "1,075 ¥"）--------------------
+        InputNumber fm = new InputNumber(0, 100000);
+        fm.Precision = 0;
+        fm.GroupDigits = true;
+        NumFormatter yen = Yen;
+        fm.WithFormatter(yen);
+        fm.SetValue(1075);
+        Line("fm " + fm.DisplayText());
+        fm.SetExtra("value", "2,300");
+        Line("fm parse-back " + fm.Value() + " " + fm.DisplayText());
+
+        // ---- Extra 往返（设计器通道） ---------------------------------
+        InputNumber ex = new InputNumber(0, 100);
+        ex.SetExtra("precision", "2");
+        ex.SetExtra("group", "true");
+        ex.SetExtra("loading", "true");
+        ex.SetExtra("prefix", "¥");
+        ex.SetExtra("suffix", "%");
+        ex.SetExtra("placement", "right");
+        Line("ex " + ex.GetExtra("precision") + " " + ex.GetExtra("group")
+            + " " + ex.GetExtra("loading") + " " + ex.GetExtra("prefix")
+            + " " + ex.GetExtra("suffix") + " " + ex.GetExtra("placement"));
+        bool exUnknown = ex.SetExtra("nope", "1");
+        Line("ex unknown " + Convert.ToString(exUnknown));
+
+        // ---- Submit / Change 事件各触发一次 ----------------------------
+        InputNumber ev = new InputNumber(0, 100);
+        int changes = 0;
+        int submits = 0;
+        ev.Change.Add(() => { changes = changes + 1; });
+        ev.Submit.Add(() => { submits = submits + 1; });
+        ev.SetValue(9);
+        Line("ev change " + Convert.ToString(changes));
+        // 提交路径：SetValue 写值走 Change；Submit 只在回车沿触发，
+        // 无窗口时直接验证事件对象可挂接即可。
+        Line("ev submit wired " + (ev.Submit != null ? "1" : "0"));
+    }
+}

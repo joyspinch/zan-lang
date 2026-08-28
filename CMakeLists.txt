@@ -1745,6 +1745,21 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_slider${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # InputNumber's value math is pure computation too: the fixed-point
+  # display/parse pair (NumberText / ParseScaled incl. half-up rounding and
+  # comma-grouping), the Naive-UI format/parse hooks, the validator's error
+  # flag + Invalid event, step/clamp, and the designer Extra round-trip
+  # (precision / group / loading / prefix / suffix / placement).
+  # Pinned headlessly, no window needed.
+  add_test(NAME conformance_gui_inputnumber
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/inputnumber_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_inputnumber.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_inputnumber${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # The CSS skin pipeline (Css parser -> StyleSheet -> StyleBox) is pure
   # computation, so it is verified headlessly against a golden dump.
   add_test(NAME conformance_gui_css

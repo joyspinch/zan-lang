@@ -1,20 +1,47 @@
 using System;
 using Gui;
+using Gui.Backend;
 
 namespace Gui.Widget;
 
-/// 数字输入框（Naive UI n-input-number）：左右内嵌 −/+ 步进按钮，
+/// 展示串的格式化钩子（Naive UI `format`）：在分组/小数之后对
+/// 数值文本再加工，如 s => s + " ¥"。
+delegate string NumFormatter(string text);
+
+/// 展示串的解析钩子（Naive UI `parse`）：提交前把展示串还原成
+/// 原始数值串，如 s => Text.Replace(s, " ¥", "")。
+delegate string NumParser(string text);
+
+/// 自定义验证（Naive UI `validator`）：对将要写入的新值投票，
+/// false 时值仍会写入，但整框标 error（红描边）并触发 Invalid。
+delegate bool NumValidator(int value);
+
+/// 数字输入框（Naive UI n-input-number）：内嵌 −/+ 步进按钮，
 /// 中间是可编辑的数字区。绑定 SignalInt / `.data` 双向同步；
 /// min/max 钳制，step 定步长；聚焦后 ↑/↓ 键同样加减，回车提交。
 ///
 ///     InputNumber age = new InputNumber(0, 120);
 ///     age.data = form.age;          // two-way
 ///     age.Change += () => { ... };
+///     age.Prefix = "¥";             // 前缀
 ///     age.Render(app, 40, 40, 160, 34);
 ///
+/// Naive UI 对齐的能力：
+/// - `Prefix` / `Suffix`：常显前后缀（"¥ 0"、"0 %"）；
+/// - `Placement`：步进钮位置 "both"（默认左右各一）/ "right"
+///   （两枚并排收在右侧，Naive UI button-placement）；
+/// - `Loading`：加载态——整框落灰、步进钮换成旋转圆点、输入忽略；
+/// - `GroupDigits`：千分位分组展示（"1,075"），编辑缓冲仍存原始串；
+/// - `Precision`：小数位数（定点数：模型值 = 显示值 × 10^Precision，
+///   step/min/max 同按缩放单位计）；
+/// - `Formatter` / `Parser`：自定义展示/解析钩子（Naive UI
+///   format/parse，设了 format 通常就要设 parse）；
+/// - `Check`：自定义验证——未通过时红描边 + `Invalid` 事件；
+/// - `Submit`：回车提交事件。
+///
 /// 外观走 `input` 类型规则（尺寸档 input.small/.large 直接生效），
-/// 步进按钮颜色取 `input::icon` part——代码只留几何与交互，
-/// 不直读主题语义色。
+/// 步进按钮颜色取 `input::icon` part、前后缀取 `input::prefix` /
+/// `input::suffix` part——代码只留几何与交互，不直读主题语义色。
 class InputNumber : Control {
     /// 值信号：立即模式与保留模式共用一条真值来源。
     SignalInt model;
@@ -26,9 +53,11 @@ class InputNumber : Control {
     string hint;
     int minV;
     int maxV;
-    /// 步进量：按钮/↑↓ 每次 ±step。0 视为 1。
+    /// 步进量：按钮/↑↓ 每次 ±step。0 视为 1。带小数时按缩放单位计
+    /// （Precision=2 时 step=1 即 0.01）。
     int stepV;
-    /// 聚焦编辑中的文本缓冲；失焦、回车或点击步进时提交。
+    /// 聚焦编辑中的文本缓冲（原始串，不含分组逗号）；失焦、回车或
+    /// 点击步进时提交。
     string editBuf;
     bool hadFocus;
     int wid;
@@ -36,8 +65,39 @@ class InputNumber : Control {
     int plusId;
     /// 值被用户改变时触发（C# 风格：`n.Change += h;`）。
     UiEvent Change;
+    /// 回车提交编辑缓冲时触发（Naive UI 的键盘提交沿）。
+    UiEvent Submit;
+    /// 自定义验证未通过时触发（值已写入，仅标记 error 状态）。
+    UiEvent Invalid;
     /// 尺寸变体：对应 Class = "small" / "large"（Naive UI size prop）。
     Binding<string> Size;
+
+    /// 前缀文本（Naive UI prefix）：画在数值左侧的常显文字，如 "¥"。
+    Binding<string> Prefix;
+    /// 后缀文本（Naive UI suffix）：画在数值右侧的常显文字，如 "%"。
+    Binding<string> Suffix;
+    /// 步进按钮位置（Naive UI button-placement）："both"（默认，左右
+    /// 各一）| "right"（两枚并排收在右侧）。
+    Binding<string> Placement;
+    /// 加载状态（Naive UI loading）：置真时整框落灰、步进钮换成旋转
+    /// 圆点、指针与键盘都不响应（远端校验/取数进行中的典型形态）。
+    bool Loading;
+    /// 小数位数（Naive UI precision）：钳制到 0..6。值模型仍是 int，
+    /// 按定点数解释——模型存显示值 × 10^Precision（2 位小数时 1079
+    /// 显示 "10.79"）。
+    int Precision;
+    /// 千分位分组：整数部分每三位插一个逗号（"1,079"）。编辑缓冲
+    /// 始终存原始串，分组只作用于展示与提交解析。
+    bool GroupDigits;
+    /// 自定义展示钩子（Naive UI format）；null 走内置展示。
+    NumFormatter Formatter;
+    /// 自定义解析钩子（Naive UI parse）；null 走内置解析。
+    NumParser Parser;
+    /// 自定义验证（Naive UI validator）；null 恒过。
+    NumValidator Check;
+    /// 最近一次提交/步进是否未通过 Check：置真时画 `input::error`
+    /// 描边，下一次通过验证的写入清除。
+    bool invalidFlag;
 
     void InitNumber(SignalInt m, int lo, int hi) {
         this.InitControl("inputNumber", 1);
@@ -53,7 +113,19 @@ class InputNumber : Control {
         plusId = WidgetId.Next();
         wiresOwnEvents = true;
         Change = new UiEvent();
+        Submit = new UiEvent();
+        Invalid = new UiEvent();
         Size = "medium";
+        Prefix = "";
+        Suffix = "";
+        Placement = "both";
+        Loading = false;
+        Precision = 0;
+        GroupDigits = false;
+        Formatter = null;
+        Parser = null;
+        Check = null;
+        invalidFlag = false;
     }
 
     /// Default design-time constructor（范围 0..100）。
@@ -83,21 +155,197 @@ class InputNumber : Control {
         return this;
     }
 
+    InputNumber OnSubmit(Action a) {
+        Submit.Add(a);
+        return this;
+    }
+
+    InputNumber OnInvalid(Action a) {
+        Invalid.Add(a);
+        return this;
+    }
+
+    InputNumber WithFormatter(NumFormatter f) { Formatter = f; return this; }
+    InputNumber WithParser(NumParser p) { Parser = p; return this; }
+    InputNumber WithValidator(NumValidator v) { Check = v; return this; }
+
     int Step() {
         if (stepV < 1) { return 1; }
         return stepV;
     }
 
+    /// 生效的小数位数（钳到 0..6，与展示/解析共用一条口径）。
+    int Decimals() {
+        if (Precision < 0) { return 0; }
+        if (Precision > 6) { return 6; }
+        return Precision;
+    }
+
     /// 当前值（经绑定解析）。
     int Value() { return model.Get(); }
 
-    void SetRaw(int v) {
+    // ---- 定点数数学（纯函数，无窗口可测） ------------------------------
+
+    /// 10^n（n 钳到 0..6）。
+    static int Pow10(int n) {
+        if (n < 0) { n = 0; }
+        if (n > 6) { n = 6; }
+        int acc = 1;
+        for (int i = 0; i < n; i = i + 1) { acc = acc * 10; }
+        return acc;
+    }
+
+    /// 把缩放整数值写成定长小数的数值文本：1079@2 -> "10.79"、
+    /// -5@2 -> "-0.05"、1234@0 -> "1234"。
+    static string NumberText(int scaled, int decimals) {
+        int scale = InputNumber.Pow10(decimals);
+        string sign = "";
+        long v = scaled;
+        if (v < 0) { sign = "-"; v = 0 - v; }
+        string ip = Convert.ToString((int)(v / scale));
+        if (decimals == 0) { return sign + ip; }
+        string fp = Convert.ToString((int)(v % scale));
+        while (fp.Length < decimals) { fp = "0" + fp; }
+        return sign + ip + "." + fp;
+    }
+
+    /// 整数部分加千分位逗号（只认首个 '.' 前的部分；已含逗号则原样
+    /// 返回，供编辑缓冲的分组展示复用）。"-1234.5" -> "-1,234.5"。
+    static string GroupThousands(string s) {
+        if (s == "") { return s; }
+        if (s.IndexOf(",") >= 0) { return s; }
+        int dot = s.IndexOf(".");
+        string head = s;
+        string tail = "";
+        if (dot >= 0) {
+            head = s.Substring(0, dot);
+            tail = s.Substring(dot, s.Length - dot);
+        }
+        string sign = "";
+        if (head.StartsWith("-")) {
+            sign = "-";
+            head = head.Substring(1, head.Length - 1);
+        }
+        string outp = "";
+        int rem = head.Length % 3;
+        if (rem == 0) { rem = 3; }
+        for (int i = 0; i < head.Length; i = i + 1) {
+            if (i > 0 && (i - rem) % 3 == 0) { outp = outp + ","; }
+            outp = outp + head.Substring(i, 1);
+        }
+        return sign + outp + tail;
+    }
+
+    /// 展示用的原始数值文本（含小数，未分组未套钩子）。
+    string PlainText(int scaled) {
+        return InputNumber.NumberText(scaled, this.Decimals());
+    }
+
+    /// 当前完整展示串（分组 + Formatter），即字段里显示的那段数字。
+    string DisplayText() {
+        string s = this.PlainText(model.Get());
+        if (GroupDigits) { s = InputNumber.GroupThousands(s); }
+        if (Formatter != null) { s = Formatter(s); }
+        return s;
+    }
+
+    /// 把编辑缓冲（或任意展示串）解析为缩放整数：先过 Parser 钩子，
+    /// 再剥分组逗号，按小数点拆分、多余小数四舍五入到 Precision 位。
+    /// 非法/空串回退 def。"-1,0.795"@2 -> -108（795 舍入为 80 进位）。
+    static int ParseScaled(string text, int decimals, int def, NumParser parser) {
+        if (parser != null) { text = parser(text); }
+        string s = "";
+        for (int i = 0; i < text.Length; i = i + 1) {
+            string ch = text.Substring(i, 1);
+            if (ch != ",") { s = s + ch; }
+        }
+        if (s == "" || s == "-" || s == "." || s == "-.") { return def; }
+        bool neg = false;
+        int i0 = 0;
+        if (s.StartsWith("-")) { neg = true; i0 = 1; }
+        int dot = s.IndexOf(".");
+        string ip = s.Substring(i0, s.Length - i0);
+        string fp = "";
+        if (dot >= 0) {
+            ip = s.Substring(i0, dot - i0);
+            fp = s.Substring(dot + 1, s.Length - dot - 1);
+        }
+        if (ip == "") { ip = "0"; }
+        long ipart = 0;
+        for (int i = 0; i < ip.Length; i = i + 1) {
+            string ch = ip.Substring(i, 1);
+            if (ch < "0" || ch > "9") { return def; }
+            ipart = ipart * 10 + Convert.ToInt32(ch);
+            if (ipart > 214748364) { ipart = 214748364; }
+        }
+        int scale = InputNumber.Pow10(decimals);
+        long fpart = 0;
+        for (int i = 0; i < fp.Length; i = i + 1) {
+            string ch = fp.Substring(i, 1);
+            if (ch < "0" || ch > "9") {
+                // 尾随小数点（"10."）合法：按已读位数继续。
+                if (ch == "." && i == fp.Length - 1) { break; }
+                return def;
+            }
+            fpart = fpart * 10 + Convert.ToInt32(ch);
+        }
+        int extra = fp.Length - decimals;
+        if (extra > 0) {
+            // 多余位折回：(f + div/2) / div 四舍五入，满 scale 进整。
+            long div = InputNumber.Pow10(extra);
+            long r = (fpart + div / 2) / div;
+            if (r >= scale) { r = r - scale; ipart = ipart + 1; }
+            fpart = r;
+        } else if (extra < 0) {
+            fpart = fpart * InputNumber.Pow10(0 - extra);
+        }
+        long total = ipart * scale + fpart;
+        if (neg) { total = 0 - total; }
+        if (total > 2147483647) { total = 2147483647; }
+        if (total < 0 - 2147483647) { total = 0 - 2147483647; }
+        return Convert.ToInt32(total);
+    }
+
+    /// 步进一步（未钳制）：v ± step。
+    int StepUpVal(int v) { return v + this.Step(); }
+    int StepDownVal(int v) { return v - this.Step(); }
+
+    /// 钳制到 [min, max]（公开供测试与宿主复用）。
+    int Clamp(int v) {
         if (v < minV) { v = minV; }
         if (v > maxV) { v = maxV; }
+        return v;
+    }
+
+    /// 对将要写入的值跑一次 Check，刷新 invalidFlag，返回该值。
+    void RunValidator(int v) {
+        bool ok = true;
+        if (Check != null) { ok = Check(v); }
+        invalidFlag = !ok;
+        if (!ok) { Invalid.Raise(); }
+    }
+
+    /// 编辑缓冲的即时展示串（分组 + Formatter）。
+    string EditDisplay() {
+        string s = editBuf;
+        if (GroupDigits) { s = InputNumber.GroupThousands(s); }
+        if (Formatter != null) { s = Formatter(s); }
+        return s;
+    }
+
+    void SetRaw(int v) {
+        v = this.Clamp(v);
         if (model.Get() == v) { return; }
         model.Set(v);
         if (data != null) { data.Set(v); }
+        this.RunValidator(v);
         Change.Raise();
+    }
+
+    /// 程序化写值（与用户输入同一条校验/事件路径）。
+    void SetValue(int v) {
+        this.CommitBuffer();
+        this.SetRaw(v);
     }
 
     /// 把绑定的模型值拉入本地信号并钳制（model -> UI）。
@@ -132,10 +380,10 @@ class InputNumber : Control {
         return Convert.ToInt32(acc);
     }
 
-    /// 解析编辑缓冲为数值并提交（空缓冲非法串还原当前值）。
+    /// 解析编辑缓冲为数值并提交（空缓冲/非法串还原当前值）。
     void CommitBuffer() {
         if (editBuf == "") { return; }
-        int v = ParseInt(editBuf, model.Get());
+        int v = ParseScaled(editBuf, this.Decimals(), model.Get(), Parser);
         editBuf = "";
         this.SetRaw(v);
     }
@@ -146,10 +394,11 @@ class InputNumber : Control {
         int id = wid;
         SyncBinding();
 
-        bool focused = Ui.Focused(app, id) && !this.IsDisabled();
-        // 进入聚焦：把当前值灌进编辑缓冲；离开聚焦：提交缓冲。
+        bool focused = Ui.Focused(app, id) && !this.IsDisabled() && !Loading;
+        // 进入聚焦：把当前值的原始（未分组）文本灌进编辑缓冲；
+        // 离开聚焦：提交缓冲。
         if (focused && !hadFocus && editBuf == "") {
-            editBuf = Convert.ToString(model.Get());
+            editBuf = this.PlainText(model.Get());
         }
         if (!focused && hadFocus) { this.CommitBuffer(); }
         hadFocus = focused;
@@ -157,15 +406,15 @@ class InputNumber : Control {
         this.PaintBox(app, x, y, w, h);
         app.focus.RegisterFocusable(id);
 
-        if (!this.IsDisabled()) {
+        if (!this.IsDisabled() && !Loading) {
             if (Ui.Clicked(app, minusId)) {
                 this.CommitBuffer();
-                this.SetRaw(model.Get() - this.Step());
+                this.SetRaw(this.StepDownVal(model.Get()));
                 app.RequestRedraw();
             }
             if (Ui.Clicked(app, plusId)) {
                 this.CommitBuffer();
-                this.SetRaw(model.Get() + this.Step());
+                this.SetRaw(this.StepUpVal(model.Get()));
                 app.RequestRedraw();
             }
             this.HandleKeys(app, focused);
@@ -174,41 +423,93 @@ class InputNumber : Control {
         return id;
     }
 
-    /// 绘制字段盒、两侧步进钮与中间数值。颜色来自解析样式盒
-    /// （input 类规则）与 `input::icon` / placeholder / caret parts。
+    /// 绘制字段盒、前后缀、步进钮（或加载圆点）与中间数值。颜色来自
+    /// 解析样式盒（input 类规则）与 `input::icon` / `input::prefix` /
+    /// `input::suffix` / placeholder / caret / error parts。
     void PaintBox(App app, int x, int y, int w, int h) {
         Canvas c = app.canvas;
         Theme t = app.theme;
+        string pfx = "";
+        if (Prefix != null) { pfx = Prefix.Get(); }
+        string sfx = "";
+        if (Suffix != null) { sfx = Suffix.Get(); }
+        bool rightBtns = (Placement != null && Placement.Get() == "right");
         // Size 字段映射为档位 class（input.small/.large 重设高度/字号）。
         string origClass = Class;
         this.AddClass(this.SizeCls());
-        bool off = this.IsDisabled();
+        bool off = this.IsDisabled() || Loading;
         StyleBox s = this.ResolveEasedStyleAsIn(
             app, wid, "input", Class, off, false, x, y, w, h);
         s.Paint(app, x, y, w, h);
         int fs = s.FontOr(Style.FontFallback(app, "medium"));
         int btnW = app.Scale(26);
+        int pad = app.Scale(6);
 
-        StyleBox iconStyle = Style.Part(app, "input", "icon", "", Class,
-                                        "", Style.SNormal());
-        int glyphColor = iconStyle.FgOr(s.fg);
-        int glyphSz = fs;
-        c.DrawGlyphIn("minus", x + (btnW - glyphSz) / 2, y,
-                      glyphSz, h, glyphSz, glyphColor);
-        c.DrawGlyphIn("plus",
-                      x + w - btnW + (btnW - glyphSz) / 2, y,
-                      glyphSz, h, glyphSz, glyphColor);
-        app.hitTester.RegisterRect(minusId, x, y, btnW, h, 2);
-        app.hitTester.RegisterRect(plusId, x + w - btnW, y, btnW, h, 2);
+        // 步进钮占位：both=左右各一；right=右侧两枚并排。加载态占
+        // 右侧两枚的位置画圆点（不可点）。
+        int leftBtnW = (rightBtns || Loading) ? 0 : btnW;
+        int rightBtnW = btnW * ((rightBtns || Loading) ? 2 : 1);
+        int minusX = x;
+        int plusX = x + w - btnW;
+        if (rightBtns && !Loading) {
+            minusX = x + w - btnW * 2;
+            plusX = x + w - btnW;
+        }
 
-        int innerX = x + btnW + app.Scale(6);
-        int innerW = w - (btnW + app.Scale(6)) * 2;
+        // 前后缀占位（贴数值两侧）。
+        int pfxW = 0;
+        int sfxW = 0;
+        if (pfx != "") { pfxW = Canvas.MeasureText(pfx, fs) + pad; }
+        if (sfx != "") { sfxW = Canvas.MeasureText(sfx, fs) + pad; }
+
+        // 校验失败：`input::error` 的 2px 红描边压在盒上（与 Input 同族）。
+        if (invalidFlag) {
+            StyleBox errStyle = Style.Part(app, "input", "error", "",
+                                           Class, "", Style.SNormal());
+            c.DrawRect(x, y, w, h, errStyle.BorderOr(errStyle.fg),
+                       errStyle.BorderWOr(2));
+        }
+
+        if (!Loading) {
+            StyleBox iconBase = Style.Part(app, "input", "icon", "", Class,
+                                           "", Style.SNormal());
+            int glyphColor = iconBase.FgOr(s.fg);
+            int minusColor = glyphColor;
+            int plusColor = glyphColor;
+            if (!this.IsDisabled()) {
+                StyleBox iconHover = Style.Part(app, "input", "icon", "", Class,
+                                                "", Style.SHover());
+                if (Ui.Hovered(app, minusId)) { minusColor = iconHover.FgOr(glyphColor); }
+                if (Ui.Hovered(app, plusId)) { plusColor = iconHover.FgOr(glyphColor); }
+            }
+            int glyphSz = fs;
+            c.DrawGlyphIn("minus", minusX + (btnW - glyphSz) / 2, y,
+                          glyphSz, h, glyphSz, minusColor);
+            c.DrawGlyphIn("plus", plusX + (btnW - glyphSz) / 2, y,
+                          glyphSz, h, glyphSz, plusColor);
+            app.hitTester.RegisterRect(minusId, minusX, y, btnW, h, 2);
+            app.hitTester.RegisterRect(plusId, plusX, y, btnW, h, 2);
+        } else {
+            // 加载态：右侧钮位换成旋转圆点（8 点相位，与 Spin 同款），
+            // 不注册命中区。
+            StyleBox accentStyle = Style.Part(app, "spin", "accent", "spin",
+                                              "", "", Style.SNormal());
+            StyleBox restStyle = Style.Part(app, "spin", "rest", "spin",
+                                            "", "", Style.SNormal());
+            int accent = accentStyle.FgOr(s.accent);
+            int rest = restStyle.FgOr(s.fg);
+            this.PaintSpinnerDots(app, x + w - btnW - app.Scale(4),
+                                  y + h / 2, app.Scale(8), accent, rest);
+        }
+
+        int innerX = x + leftBtnW + pad + pfxW;
+        int innerW = w - leftBtnW - rightBtnW - pad * 2 - pfxW - sfxW;
         if (innerW < 0) { innerW = 0; }
         c.PushClip(innerX, y, innerW, h);
         string txt = "";
-        if (editBuf != "") { txt = editBuf; }
+        if (editBuf != "") { txt = this.EditDisplay(); }
         else if (!(hint != "" && !hadFocus && model.Get() == 0)) {
-            txt = Convert.ToString(model.Get());
+            txt = this.DisplayText();
         } else { txt = ""; }
         if (txt == "") {
             StyleBox phStyle = Style.Part(app, "input", "placeholder", "",
@@ -223,36 +524,71 @@ class InputNumber : Control {
             int tw = Canvas.MeasureText(disp, fs);
             int tx = innerX + (innerW - tw) / 2;
             c.DrawText(tx, Canvas.CenterTextY(y, h, fs), disp, s.fg, fs);
-        }
-        // 编辑光标线：贴在文本末尾。
-        if (editBuf != "") {
-            StyleBox caretStyle = Style.Part(app, "input", "caret", "",
-                                            Class, "", Style.SNormal());
-            int caretH = Canvas.FontHeight(fs);
-            int cx0 = innerX + (innerW - Canvas.MeasureText(txt, fs)) / 2
-                + Canvas.MeasureText(txt, fs);
-            c.FillRect(cx0, y + (h - caretH) / 2, caretStyle.WidthOr(1),
-                       caretH, caretStyle.BgOr(s.accent));
+            // 编辑光标线：贴在文本末尾。
+            if (editBuf != "") {
+                StyleBox caretStyle = Style.Part(app, "input", "caret", "",
+                                                Class, "", Style.SNormal());
+                int caretH = Canvas.FontHeight(fs);
+                int cx0 = tx + tw;
+                c.FillRect(cx0, y + (h - caretH) / 2, caretStyle.WidthOr(1),
+                           caretH, caretStyle.BgOr(s.accent));
+            }
         }
         c.PopClip();
+
+        // 前后缀画在数值裁剪区外（贴数值两侧），颜色取 `input::prefix` /
+        // `input::suffix`（缺省回退字段前景色）。
+        if (pfx != "") {
+            StyleBox pStyle = Style.Part(app, "input", "prefix", "input",
+                                         Class, "", Style.SNormal());
+            c.DrawText(x + leftBtnW + pad, Canvas.CenterTextY(y, h, fs), pfx,
+                       pStyle.FgOr(s.fg), pStyle.FontOr(fs));
+        }
+        if (sfx != "") {
+            StyleBox stStyle = Style.Part(app, "input", "suffix", "input",
+                                          Class, "", Style.SNormal());
+            c.DrawText(x + w - rightBtnW - pad - sfxW,
+                       Canvas.CenterTextY(y, h, fs), sfx,
+                       stStyle.FgOr(s.fg), stStyle.FontOr(fs));
+        }
         Class = origClass;
     }
 
-    /// 键处理：↑/↓ 步进；数字键写入缓冲；回车提交；Esc 还原。
+    /// 一圈 8 枚小圆点的加载指示（与 Spin 同相位规则），画在钮位上。
+    void PaintSpinnerDots(App app, int cx, int cy, int radius,
+                          int accent, int rest) {
+        Canvas c = app.canvas;
+        int active = (Window.GetTickMs() / 90) % 8;
+        int dotR = app.Scale(2);
+        for (int i = 0; i < 8; i = i + 1) {
+            int px = cx + Spin.OffX(i) * radius / 1000;
+            int py = cy + Spin.OffY(i) * radius / 1000;
+            int d = (active - i + 8) % 8;
+            int col = rest;
+            if (d == 0) { col = accent; }
+            c.FillCircle(px, py, dotR, col);
+        }
+        // 旋转动画：可见时限帧驱动（与 Spin 同一节奏，~11fps）。
+        int span = radius + dotR + app.Scale(2);
+        app.RequestAnimationFrameIn(90, cx - span, cy - span, span * 2, span * 2);
+    }
+
+    /// 键处理：↑/↓ 步进；数字/小数点/逗号写入缓冲；回车提交；Esc 还原。
     void HandleKeys(App app, bool focused) {
         int kind = app.EventKind();
         if (kind == 4) {
             int kc = app.window.EventKeyCode();
             if (kc == 38) {
                 this.CommitBuffer();
-                this.SetRaw(model.Get() + this.Step());
+                this.SetRaw(this.StepUpVal(model.Get()));
                 app.RequestRedraw();
             } else if (kc == 40) {
                 this.CommitBuffer();
-                this.SetRaw(model.Get() - this.Step());
+                this.SetRaw(this.StepDownVal(model.Get()));
                 app.RequestRedraw();
             } else if (kc == 13 && focused) {
                 this.CommitBuffer();
+                Submit.Raise();
                 app.RequestRedraw();
             } else if (kc == 27 && focused) {
                 editBuf = "";
@@ -267,7 +603,16 @@ class InputNumber : Control {
             int code = app.window.EventKeyCode();
             string ch = Text.CharStr(code);
             if (ch.Length == 0 || ch < " ") { return; }
-            if (ch >= "0" && ch <= "9" && editBuf.Length < 10) {
+            if (ch >= "0" && ch <= "9" && editBuf.Length < 16) {
+                editBuf = editBuf + ch;
+                app.RequestRedraw();
+            } else if (ch == "." && this.Decimals() > 0 && editBuf.IndexOf(".") < 0
+                       && editBuf.Length < 16) {
+                if (editBuf == "" || editBuf == "-") { editBuf = editBuf + "0."; }
+                else { editBuf = editBuf + "."; }
+                app.RequestRedraw();
+            } else if (ch == "," && GroupDigits && editBuf.Length < 16) {
+                // 分组逗号原样收下，提交时统一剥除。
                 editBuf = editBuf + ch;
                 app.RequestRedraw();
             } else if (ch == "-" && editBuf == "" && minV < 0) {
@@ -282,8 +627,9 @@ class InputNumber : Control {
     override List<PropSpec> Props() {
         List<PropSpec> ps = new List<PropSpec>();
         // 只有真正活绑定的字段才挂 PropSpec（snum 直写 model、
-        // str 直写 Size）；min/max/step/hint 是设计期常量，
-        // 经 GetExtra/SetExtra 应答文档键，避免快照 Binding 写不回。
+        // str 直写 Size/Prefix/Suffix/Placement）；min/max/step/hint/
+        // precision/group/loading 是设计期常量，经 GetExtra/SetExtra
+        // 应答文档键，避免快照 Binding 写不回。
         PropSpec val = PropSpec.Int("value", "Value");
         val.snum = model;
         val.Also("text");
@@ -292,17 +638,39 @@ class InputNumber : Control {
             new List<string>{ "tiny", "small", "medium", "large" });
         sz.str = Size;
         ps.Add(sz);
+        PropSpec pfx = PropSpec.Text("prefix", "Prefix");
+        pfx.str = Prefix;
+        ps.Add(pfx);
+        PropSpec sfx = PropSpec.Text("suffix", "Suffix");
+        sfx.str = Suffix;
+        ps.Add(sfx);
+        PropSpec plc = PropSpec.Enum("placement", "Button Placement",
+            new List<string>{ "both", "right" });
+        plc.str = Placement;
+        ps.Add(plc);
         return ps;
     }
 
     override string GetExtra(string key) {
-        if (key == "value") { return Convert.ToString(model.Get()); }
+        if (key == "value") { return this.DisplayText(); }
+        if (key == "min") { return Convert.ToString(minV); }
+        if (key == "max") { return Convert.ToString(maxV); }
+        if (key == "step") { return Convert.ToString(stepV); }
+        if (key == "hint" || key == "placeholder") { return hint; }
+        if (key == "precision") { return Convert.ToString(this.Decimals()); }
+        if (key == "group" || key == "groupDigits") {
+            return GroupDigits ? "true" : "false";
+        }
+        if (key == "loading") { return Loading ? "true" : "false"; }
+        if (key == "prefix") { return Prefix.Get(); }
+        if (key == "suffix") { return Suffix.Get(); }
+        if (key == "placement") { return Placement.Get(); }
         return "";
     }
 
     override bool SetExtra(string key, string val) {
         if (key == "value") {
-            this.SetRaw(ParseInt(val, model.Get()));
+            this.SetRaw(ParseScaled(val, this.Decimals(), model.Get(), Parser));
             return true;
         }
         if (key == "min") {
@@ -321,17 +689,36 @@ class InputNumber : Control {
             hint = val;
             return true;
         }
+        if (key == "precision") {
+            Precision = Convert.ToInt32(val);
+            return true;
+        }
+        if (key == "group" || key == "groupDigits") {
+            GroupDigits = (val == "true");
+            return true;
+        }
+        if (key == "loading") {
+            Loading = (val == "true");
+            return true;
+        }
+        if (key == "prefix") { Prefix = val; return true; }
+        if (key == "suffix") { Suffix = val; return true; }
+        if (key == "placement") { Placement = val; return true; }
         return false;
     }
 
     override List<string> Events() {
         List<string> e = Control.CommonEvents();
         e.Add("Change");
+        e.Add("Submit");
+        e.Add("Invalid");
         return e;
     }
 
     override void BindEvent(string evt, Action a) {
         if (evt == "Change") { Change.Add(a); return; }
+        if (evt == "Submit") { Submit.Add(a); return; }
+        if (evt == "Invalid") { Invalid.Add(a); return; }
         On.AddByName(evt, a);
     }
 
