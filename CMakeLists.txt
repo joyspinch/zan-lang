@@ -755,6 +755,32 @@ add_test(NAME diag_array_init_count_mismatch
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_array_init_count_mismatch PROPERTIES TIMEOUT 60)
 
+# Regression (gallery funnel_pair 闪退): checker_arg_type_mismatch skipped
+# every call with a type argument, so a concrete generic container reaching a
+# value parameter (List<Cat> into Cat) -- and the mirror direction -- compiled
+# silently and the runtime stored the wrong carrier in the slot, faulting on
+# first use. Both directions must be a hard error; same-container variance
+# (List<int> -> List<Box>) stays with irgen, and Binding<T>/generic-instantiation
+# sites stay deferred (checked at the use site after substitution).
+add_test(NAME diag_arg_list_to_class
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/arg_list_to_class.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_arg_list_to_class${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert .List. to .Cat. in argument 1 of .Count."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_arg_list_to_class PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_arg_class_to_list
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/arg_class_to_list.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_arg_class_to_list${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert .Cat. to .List. in argument 1 of .TakeList."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_arg_class_to_list PROPERTIES TIMEOUT 60)
+
+
 # ---- Declared access control ----
 # public/private/internal/protected were parsed into metadata but the checker
 # never enforced them. Unmarked members stay public; an explicit modifier now

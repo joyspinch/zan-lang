@@ -814,8 +814,16 @@ static bool checker_type_derives_from_depth(zan_type_t *sub, zan_type_t *sup,
     for (int i = 0; i < sub->interface_count; i++)
         if (checker_type_derives_from_depth(sub->interfaces[i], sup, depth + 1))
             return true;
-    if (sub->base_type && sub->base_type != sub)
-        return checker_type_derives_from_depth(sub->base_type, sup, depth + 1);
+    zan_type_t *base = sub->base_type;
+    /* A generic instantiation resolved before the base-wiring pass carries a
+     * stale NULL base_type (binder.c copies base->base_type at make time);
+     * fall back to the definition's chain. Non-generic sups (Control) match
+     * through it soundly; generic sups stay an exact type-equal concern
+     * handled by checker_type_equal above. */
+    if (!base && sub->sym && sub->sym->type && sub->sym->type != sub)
+        base = sub->sym->type->base_type;
+    if (base && base != sub)
+        return checker_type_derives_from_depth(base, sup, depth + 1);
     return false;
 }
 
@@ -1327,10 +1335,40 @@ static bool type_is_scalar_register(zan_type_t *t) {
  *
  * Generic instantiations stay with irgen's invariance check; null literals and
  * numeric conversions are left to the existing paths. */
+/* True when `t` (recursively through type/element/delegate positions) still
+ * mentions an unsubstituted generic type parameter. Such a type is only
+ * concrete at an instantiation site, so argument checks that would compare it
+ * against a base layout must be deferred to irgen (mirrors the "generic
+ * instantiations stay with irgen" rule in checker_arg_type_mismatch). */
+static bool type_refs_type_param_d(zan_type_t *t, int depth) {
+    if (!t || depth > 4) return false;
+    if (t->kind == TYPE_TYPE_PARAM) return true;
+    if (t->element_type && type_refs_type_param_d(t->element_type, depth + 1))
+        return true;
+    if (t->delegate_ret_type && type_refs_type_param_d(t->delegate_ret_type, depth + 1))
+        return true;
+    for (int i = 0; i < t->type_arg_count && t->type_args; i++)
+        if (type_refs_type_param_d(t->type_args[i], depth + 1)) return true;
+    return false;
+}
+static bool type_refs_type_param(zan_type_t *t) { return type_refs_type_param_d(t, 0); }
+
 static bool checker_arg_type_mismatch(zan_checker_t *c, zan_type_t *target,
                                       zan_type_t *value) {
     if (!target || !value) return false;
-    if (target->type_arg_count || value->type_arg_count) return false;
+    /* A generic *method* instantiation or a reference that still mentions a
+     * type parameter (GridSource<T> inside the DataGrid<T> body) is re-checked
+     * at the use site with substituted arguments -- the checker cannot see the
+     * base layout through an unsubstituted parameter. But a *concrete*
+     * instantiation (List<Cat>) reaching a non-generic parameter is not a
+     * variance case at all -- the carriers differ -- so it falls through and
+     * is rejected; that hole let `ChartOption.Single(fd)` compile and crash at
+     * runtime. Same-container variance mismatches (List<int> -> List<Box>)
+     * stay with irgen's precise invariance diagnostic. */
+    if (type_refs_type_param(target) || type_refs_type_param(value) ||
+        (target->type_arg_count && value->type_arg_count &&
+         same_generic_container(target, value) &&
+         !checker_type_equal(target, value))) return false;
     if (type_is_scalar_register(value)) {
         bool ref_target = target->kind == TYPE_OBJECT ||
                           target->kind == TYPE_INTERFACE ||
@@ -1341,7 +1379,9 @@ static bool checker_arg_type_mismatch(zan_checker_t *c, zan_type_t *target,
         return !checker_has_user_conversion(c, target, value);
     }
     if (target->kind != TYPE_CLASS && target->kind != TYPE_STRUCT) return false;
-    if (!target->sym) return false;
+    /* target->sym is absent on instantiated generic carriers (List<Cat>),
+     * which is exactly the shape we must reject a non-list argument for; the
+     * assignability helpers cope with NULL syms. */
     bool ref_value = value->kind == TYPE_CLASS || value->kind == TYPE_STRUCT ||
                      value->kind == TYPE_STRING || value->kind == TYPE_ARRAY ||
                      value->kind == TYPE_DELEGATE ||
