@@ -536,9 +536,8 @@ typedef struct zc_browser_s {
     cef_dev_tools_message_observer_t observer;
 
     int bx, by, bw, bh;         /* last requested bounds, host coordinates */
-#ifdef __APPLE__
-    char *clip_spec;            /* region the mask layer was built for */
-#endif
+    char *clip_spec;            /* region the clip/mask was last built for */
+    int shown;                  /* last visibility applied; -1 = not yet */
     char url[2048];
     char title[512];
     int loading, can_back, can_forward;
@@ -1291,9 +1290,7 @@ ZC_EXPORT int zan_cef_create(void *parent, int x, int y, int w, int h,
                 b->queue[q] = NULL;
             }
             free(b->taken);
-#ifdef __APPLE__
             free(b->clip_spec);
-#endif
             int id = i + 1;
             memset(b, 0, sizeof(*b));
             b->id = id;
@@ -1315,6 +1312,7 @@ ZC_EXPORT int zan_cef_create(void *parent, int x, int y, int w, int h,
     b->by = y;
     b->bw = w > 0 ? w : 1;
     b->bh = h > 0 ? h : 1;
+    b->shown = -1;
     zc_browser_init_handlers(b);
 
     cef_window_info_t wi;
@@ -1447,12 +1445,10 @@ ZC_EXPORT void zan_cef_set_bounds(int h, int x, int y, int w, int hh) {
         zc_browser_t *bb = zc_get(h);
         if (bb) {
             bb->bx = x; bb->by = y; bb->bw = w; bb->bh = hh;
-#ifdef __APPLE__
-            /* The mask was built for the old frame: force the next set_clip to
-             * rebuild it instead of matching its cached spec. */
+            /* The clip/mask was built for the old frame: force the next
+             * set_clip to rebuild it instead of matching its cached spec. */
             free(bb->clip_spec);
             bb->clip_spec = NULL;
-#endif
         }
     }
 #ifdef _WIN32
@@ -1528,6 +1524,11 @@ ZC_EXPORT void zan_cef_set_bounds(int h, int x, int y, int w, int hh) {
 ZC_EXPORT void zan_cef_set_visible(int h, int visible) {
     zc_browser_t *b = zc_get(h);
     if (!b || !b->browser) return;
+    /* The host calls this every frame (from set_clip); ShowWindow and
+     * WasHidden both end in repaint/notify churn when nothing changed. */
+    int state = visible ? 1 : 0;
+    if (b->shown == state) return;
+    b->shown = state;
     void *wnd = zan_cef_window(h);
 #ifdef _WIN32
     if (wnd) ShowWindow((HWND)wnd, visible ? SW_SHOWNA : SW_HIDE);
@@ -1652,7 +1653,12 @@ ZC_EXPORT void zan_cef_set_clip(int h, const char *spec) {
     }
 #ifdef _WIN32
     void *wnd = zan_cef_window(h);
-    if (visible && wnd) {
+    /* SetWindowRgn repaints the child window even when the region is
+     * identical, and the host calls this every frame -- without the guard
+     * the page flickers (the WebView2 backend and the macOS mask path both
+     * skip when the spec is unchanged). */
+    if (visible && wnd
+        && (!b->clip_spec || strcmp(b->clip_spec, spec) != 0)) {
         HRGN total = CreateRectRgn(0, 0, 0, 0);
         const char *p = spec;
         while (*p) {
@@ -1683,6 +1689,8 @@ ZC_EXPORT void zan_cef_set_clip(int h, const char *spec) {
         }
         /* SetWindowRgn takes ownership of the region. */
         SetWindowRgn((HWND)wnd, total, TRUE);
+        free(b->clip_spec);
+        b->clip_spec = zc_dup(spec, strlen(spec));
     }
 #elif defined(__APPLE__)
     /* The browser is an NSView sibling of the host's software canvas, so it

@@ -201,6 +201,8 @@ class Win32Shell {
     static extern int QueryPerformanceCounter(nint slot);
     [DllImport("kernel32", EntryPoint = "QueryPerformanceFrequency")]
     static extern int QueryPerformanceFrequency(nint slot);
+    [DllImport("winmm", EntryPoint = "timeBeginPeriod")]
+    static extern int TimeBeginPeriod(int ms);
     [DllImport("kernel32", EntryPoint = "GlobalAlloc")]
     static extern nint GlobalAlloc(int flags, long bytes);
     [DllImport("kernel32", EntryPoint = "GlobalLock")]
@@ -391,7 +393,6 @@ class Win32Shell {
     static nint scratchMsg;
     static nint bitmapInfo;
     static int bgColor;
-
     /// 读取 32 位字段。Win32 RECT / POINT 坐标在
     /// 多显示器布局下会为负，因此该值保持有符号。
     static int S32(nint p, int off) {
@@ -402,6 +403,14 @@ class Win32Shell {
     static void Init() {
         if (Win32Shell.ready) { return; }
         Win32Shell.ready = true;
+        // 动画节奏依赖毫秒级唤醒：系统默认时钟中断约 15.6ms 一拍，
+        // MsgWaitForMultipleObjects / Sleep 的超时都会拖到下一拍才醒，
+        // 16ms 的动画截止实际落在 15.6~31.2ms，帧间隔 16↔31ms 交替
+        // 正是"动画一卡一卡"的来源。提到 1ms（对齐 QPC 时钟的精度）。
+        // SDL 后端由 SDL 自理；macOS/Linux 的事件等待本就纳秒级精度，
+        // 均无需同等处理。GUI 进程空闲时本就阻塞等事件，不空转，
+        // 1ms 时钟中断的功耗代价可接受（Chrome/SDL 同款取舍）。
+        Win32Shell.TimeBeginPeriod(1);
         Win32Shell.capHwnd = new List<nint>();
         Win32Shell.capCount = new List<int>();
         Win32Shell.fixedHwnd = new List<nint>();
@@ -577,6 +586,21 @@ class Win32Shell {
 
     static nint OnMessage(nint hwnd, int msg, nint wp, nint lp) {
         Win32Shell.eventHwnd = hwnd;
+        if (msg == 0x007C && wp == (nint)(0 - 20)
+                && Win32Shell.IsLayerHost(hwnd)) {
+            // WM_STYLECHANGING(GWL_EXSTYLE)：宿主了原生子窗口的窗口一旦
+            // 带上 WS_EX_LAYERED，重定向表面/ULW 呈现就不合成子 HWND——
+            // 网页内容黑屏、DWM 阴影消失。玻璃、异形、透明度这些进程内
+            // 写入方都有 IsLayerHost 守卫，但外部工具会跨进程直接写这个
+            // 位，每帧"加位→SweepLayered 剥位"的拉锯本身就是闪屏。在
+            // 样式生效前就地拒绝，位根本落不了地（跨进程调用同样会先
+            // 经过目标窗口过程，所以这里拦得住）。只改 styleNew，消息
+            // 照常走完后续链路。
+            int exNew = Win32Shell.S32(lp, 4);          // STYLESTRUCT.styleNew
+            if ((exNew & 0x00080000) != 0) {
+                new Span<int>(lp + 4, 1)[0] = exNew & ~0x00080000;
+            }
+        }
         if (msg == 0x010D || msg == 0x010F || msg == 0x0281) {
             // WM_IME_STARTCOMPOSITION / WM_IME_COMPOSITION / WM_IME_SETCONTEXT
             Win32Shell.ImeReposition(hwnd);
@@ -934,7 +958,8 @@ class Win32Shell {
             // GPU 直通：帧交换到屏幕上，一个像素都不经过 CPU 位图。
             // 只在客户区不大于表面时走这条路——窗口刚放大、表面还没跟上
             // 的那一帧要靠下面的 FillRect 补边。
-            if (Win32Shell.zan_gui_present_window(surface, hwnd) == 1) {
+            int gpu = Win32Shell.zan_gui_present_window(surface, hwnd);
+            if (gpu == 1) {
                 if (Win32Shell.dirtyHwnd == hwnd) {
                     Win32Shell.dirty.Clear();
                     Win32Shell.dirtyOverflow = false;
@@ -1578,7 +1603,9 @@ class Win32Shell {
     /// 每帧清扫一次：宿主原生子窗口的窗口若又被加上分层位则清掉。
     /// 返回是否清过（供调用方请求重绘）。
     static bool SweepLayered() {
-        if (Win32Shell.noLayerHosts == null) { return false; }
+        if (Win32Shell.noLayerHosts == null) {
+            return false;
+        }
         bool cleaned = false;
         for (int i = 0; i < Win32Shell.noLayerHosts.Count; i = i + 1) {
             if (Win32Shell.StripLayered((nint)Win32Shell.noLayerHosts[i])) {
@@ -2197,8 +2224,10 @@ class Win32Shell {
 
     /// 来自同一个性能计数器的单调微秒，用于分相位计时：一帧只有几
     /// 毫秒，按毫秒取整时每个相位都被截成 0 或 1，看不出谁贵。
-    /// 只保留秒的低三位（每 1000 秒回绕一次），免得计数乘到微秒时
-    /// 把 64 位撑爆——它只用来算同一帧内的差值。
+    /// 返回低 32 位（约 71.6 分钟回绕）：回绕周期整除 int 的模长，
+    /// 跨回绕的带符号差值仍然精确（±35.7 分钟内）。不能换成任意
+    /// 周期（比如 1000 秒）——跨点的差值会错出整整一圈，UiDriver
+    /// 的 wait 就要多等一整圈才超时。
     static int TickUs() {
         Win32Shell.Init();
         nint slot = NativeMemory.Alloc(16);
@@ -2210,7 +2239,8 @@ class Win32Shell {
         if (freq <= 0) { return Win32Shell.GetTickCount() * 1000; }
         long secs = now / freq;
         long rem = now % freq;
-        return (int)((secs % 1000) * 1000000 + rem * 1000000 / freq);
+        long us = secs * 1000000 + rem * 1000000 / freq;
+        return (int)us;
     }
 
     static void Sleep(int ms) {
