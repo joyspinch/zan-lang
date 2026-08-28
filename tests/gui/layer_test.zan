@@ -1,0 +1,144 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// Gui.Layer 的无窗口回归：两条容易回归的机制。
+///
+/// 1. 窗口 id 保留段——LayerState 可以在点击回调里中途创建，而即时模式
+///    宿主每帧 WidgetId.ResetFrame 会把计数器回卷重发；若构造器直接从
+///    宿主计数领号，窗口标题栏/关闭钮领走的正是宿主随后每帧控件的本命
+///    id（gallery：点窗口标题栏触发 Photos 按钮，点关闭触发别的演示
+///    控件——即“信号污染”）。断言：构造器前后宿主计数器连续，窗口
+///    自身与子控件的 id 全部落进 Layer 专属的 930000 保留段，且多窗口
+///    之间互不重叠。
+/// 2. 最小化任务条——state=2 的窗口按堆叠顺序在左下角横排成一条标题
+///    栏（宽 260、高一条标题栏），命中区与绘制取同一个 MinPos；还原后
+///    回到原几何，余下窗口向左收拢。断言全部走 hitTester.RectOf，与
+///    屏幕命中同源。
+class Program {
+    static int fails;
+
+    static void True(string what, bool got) {
+        if (got) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got {got} want {want}");
+    }
+
+    static bool InBand(int id) {
+        return id >= 1930001 && id < 1930400;
+    }
+
+    static void Main() {
+        fails = 0;
+
+        // ---- id 保留段：宿主计数器不受中途创建窗口的影响 ----------
+        int hostA = WidgetId.Next();
+        LayerState win = new LayerState("W", 50, 60, 300, 200);
+        int hostB = WidgetId.Next();
+        Eq("host counter untouched", hostB - hostA, 1);
+        True("barId in band", InBand(win.barId));
+        True("closeId in band", InBand(win.closeId));
+        True("maxId in band", InBand(win.maxId));
+        True("minId in band", InBand(win.minId));
+        True("chrome ids distinct",
+             win.closeId != win.barId && win.maxId != win.closeId
+             && win.minId != win.maxId);
+        True("okBtn in band", InBand(win.okBtn.wid));
+        True("cancelBtn in band", InBand(win.cancelBtn.wid));
+        True("altBtn in band", InBand(win.altBtn.wid));
+        LayerState ask = LayerState.Prompt("P", "hint");
+        True("promptInput in band", InBand(ask.promptInput.wid));
+        // 第二、三个窗口向后继续领段，互不重叠。
+        LayerState win2 = new LayerState("W2", 0, 0, 100, 100);
+        LayerState w3 = new LayerState("W3", 90, 100, 300, 200);
+        True("windows use disjoint bands",
+             win2.barId > win.minId && w3.barId > win2.minId
+             && ask.promptInput.wid > win.minId
+             && ask.promptInput.wid < win2.barId);
+
+        // ---- 最小化任务条：左下角横排 ------------------------------
+        App app = new App("layer", 800, 600);
+        int H = app.canvas.Height();
+        int bar = Layer.BarH(app);
+        int margin = app.Scale(8);
+        int mw = app.Scale(260);
+        int gap = app.Scale(8);
+
+        List<LayerState> stack = new List<LayerState>();
+        win.Open();
+        win2.Open();
+        w3.Open();
+        stack.Add(win);
+        stack.Add(win2);
+        stack.Add(w3);
+        // 等入场动画（180ms）走完，命中区落在终位再断言。测试直接调
+        // RenderStack 不经 BeginFrame，命中区不会自动清帧——每帧先
+        // Clear() 再渲染，RectOf 读到的才是本帧注册的几何。
+        Window.SleepMs(220);
+        app.hitTester.Clear();
+        Layer.RenderStack(app, stack);
+
+        List<int> r0 = app.hitTester.RectOf(win.barId);
+        if (r0 == null) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL normal bar registered");
+        } else {
+            Eq("normal bar x", r0[0], 50);
+            Eq("normal bar y", r0[1], 60);
+        }
+
+        win2.state = 2;
+        w3.state = 2;
+        app.hitTester.Clear();
+        Layer.RenderStack(app, stack);
+        List<int> r1 = app.hitTester.RectOf(win2.barId);
+        List<int> r2 = app.hitTester.RectOf(w3.barId);
+        if (r1 == null || r2 == null) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL minimized bars registered");
+        } else {
+            // barId 的命中区是标题栏去掉三个 caption 按钮的部分：
+            // 宽 260 - 3*BtnW，从 chip 左缘起。槽位间距仍是一整个 chip。
+            Eq("min chip bar w", r1[2], mw - Layer.BtnW(app) * 3);
+            Eq("min chip h", r1[3], bar);
+            Eq("min slot0 x", r1[0], margin);
+            Eq("min slot0 bottom", r1[1] + r1[3], H - margin);
+            Eq("min slot1 x", r2[0], margin + mw + gap);
+            Eq("min slot1 y", r2[1], r1[1]);
+            // 命中解析与命中区同源：任务条中点必须点中自己的标题栏。
+            Eq("min slot0 hit", app.hitTester.HitTest(r1[0] + r1[2] / 2,
+               r1[1] + r1[3] / 2), win2.barId);
+            // 正常态的窗口不受影响。
+            List<int> r0b = app.hitTester.RectOf(win.barId);
+            Eq("normal bar still x", r0b[0], 50);
+        }
+
+        // 还原 win2：它回到原几何，w3 向左收拢到槽 0。
+        win2.state = 0;
+        app.hitTester.Clear();
+        Layer.RenderStack(app, stack);
+        List<int> r1b = app.hitTester.RectOf(win2.barId);
+        List<int> r2b = app.hitTester.RectOf(w3.barId);
+        Eq("restored x", r1b[0], 0);
+        Eq("restored y", r1b[1], 0);
+        Eq("re-slotted x", r2b[0], margin);
+
+        // 关闭后不再注册命中区。
+        w3.open = false;
+        app.hitTester.Clear();
+        Layer.RenderStack(app, stack);
+        True("closed chip unregistered", app.hitTester.RectOf(w3.barId) == null);
+
+        if (fails == 0) {
+            Console.WriteLine("layer: OK");
+        } else {
+            Console.WriteLine("layer: FAIL " + Convert.ToString(fails));
+        }
+    }
+}

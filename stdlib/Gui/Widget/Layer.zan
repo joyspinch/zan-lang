@@ -56,8 +56,25 @@ class LayerState {
     Button altBtn;
     Input promptInput;   // kind 2 的文本输入框（其他情况为 null）
     int openMs;          // layer 打开时的墙钟毫秒数（入场动画用）
+    // 最小化任务条槽位（左下角横排第几个），由 RenderStack 每帧
+    // 按堆叠顺序指派；单独 Render 的窗口保持 0。
+    int minSlot;
+
+    // Layer 专用保留 id 段的游标（seq 域，id = 1000000 + 段内序号）。
+    static int winSeq;
 
     LayerState(string title, int x, int y, int w, int h) {
+        // 窗口在点击回调里中途创建，而即时模式宿主每帧 ResetFrame
+        // 会把计数器回卷重发：从这里直接领号，领走的正是宿主随后
+        // 每帧控件的本命 id（gallery 里 barId 恰好等于下一帧 Photos
+        // 按钮的 id——点窗口标题栏会触发 Photos，点关闭触发别的
+        // 演示控件，即“信号污染”）。与 ChildWindow / FilePicker /
+        // Designer 一样改钉专属高位段，与宿主计数器互不相扰。
+        // 930000 与 Designer(840000/860000)、FilePicker/ChildWindow
+        // (900000) 错开；步长 16 远超本构造器 + 子控件的一次用量。
+        int outer = WidgetId.SeqValue();
+        WidgetId.SetSeq(930000 + LayerState.winSeq);
+        LayerState.winSeq = LayerState.winSeq + 16;
         this.title = title;
         this.body = "";
         this.x = x;
@@ -89,8 +106,8 @@ class LayerState {
         this.okBtn = new Button { Class = "primary" };
         this.cancelBtn = new Button { };
         this.altBtn = new Button { };
-        this.closeId = WidgetId.Next();
         this.promptInput = null;
+        WidgetId.SetSeq(outer);
     }
 
     /// 居中的模态确认对话框（OK + Cancel）。dtype 决定图标。
@@ -130,7 +147,12 @@ class LayerState {
         s.modal = true;
         s.dtype = 0;
         s.twoButtons = true;
+        // promptInput 在构造器之外创建，同样领保留段 id（理由见构造器）。
+        int outer = WidgetId.SeqValue();
+        WidgetId.SetSeq(930000 + LayerState.winSeq);
+        LayerState.winSeq = LayerState.winSeq + 16;
         s.promptInput = new Input(hint);
+        WidgetId.SetSeq(outer);
         return s;
     }
 
@@ -696,6 +718,24 @@ class Layer {
         return mx >= x && mx < x + w && my >= y && my < y + h;
     }
 
+    /// 最小化窗口在左下角任务条上的位置（仅剩一条标题栏，宽 260）：
+    /// 槽位从左往右横排，一行放不下向上折行。命中区（Bounds）与
+    /// 绘制（RenderActive）都从这里取位，保证两者始终一致。
+    static void MinPos(App app, LayerState s, List<int> outv) {
+        int mw = app.Scale(260);
+        int gap = app.Scale(8);
+        int margin = app.Scale(8);
+        int bar = Layer.BarH(app);
+        int W = app.canvas.Width();
+        int H = app.canvas.Height();
+        int perRow = (W - margin * 2 + gap) / (mw + gap);
+        if (perRow < 1) { perRow = 1; }
+        int col = s.minSlot % perRow;
+        int row = s.minSlot / perRow;
+        outv.Add(margin + col * (mw + gap));
+        outv.Add(H - margin - bar - row * (bar + gap));
+    }
+
     /// `s` 实际在屏幕上的边界（考虑最大化 / 最小化），
     /// 写入 4 元素 int 列表 [x, y, w, h]。
     static void Bounds(App app, LayerState s, List<int> outv) {
@@ -705,6 +745,9 @@ class Layer {
         if (s.state == 1) {
             ex = 0; ey = top; ew = app.canvas.Width(); eh = app.canvas.Height() - top;
         } else if (s.state == 2) {
+            List<int> mp = new List<int>();
+            Layer.MinPos(app, s, mp);
+            ex = mp[0]; ey = mp[1];
             ew = app.Scale(260); eh = bar;
         }
         outv.Add(ex); outv.Add(ey); outv.Add(ew); outv.Add(eh);
@@ -760,6 +803,17 @@ class Layer {
             active = list.Count - 1;
         }
 
+        // 最小化窗口按当前堆叠顺序领取左下角任务条槽位；
+        // 某个窗口还原离场后，余者自动向左收拢。
+        int minIdx = 0;
+        for (int k = 0; k < list.Count; k = k + 1) {
+            LayerState ms = list[k];
+            if (ms.open && ms.state == 2) {
+                ms.minSlot = minIdx;
+                minIdx = minIdx + 1;
+            }
+        }
+
         for (int k = 0; k < list.Count; k = k + 1) {
             Layer.RenderActive(app, list[k], k == active);
         }
@@ -788,6 +842,9 @@ class Layer {
         if (s.state == 1) {
             ex = 0; ey = top; ew = W; eh = H - top;
         } else if (s.state == 2) {
+            List<int> mp = new List<int>();
+            Layer.MinPos(app, s, mp);
+            ex = mp[0]; ey = mp[1];
             ew = app.Scale(260); eh = bar;
         }
 
@@ -872,6 +929,12 @@ class Layer {
                 }
                 s.state = 2;
             }
+            app.RequestRedraw();
+        }
+        if (active && s.state == 2 && Ui.Clicked(app, s.barId)) {
+            // 最小化只剩左下角一条任务条：点标题即还原。
+            // 原几何从未被移动（最小化位置是按槽位现算的），直接回 0 态。
+            s.state = 0;
             app.RequestRedraw();
         }
         if (Ui.MouseReleased(app) && s.dragging) {
