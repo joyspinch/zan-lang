@@ -39,82 +39,117 @@ class DropdownChrome {
 }
 
 /// <summary>
-/// Dropdown&lt;T&gt;：展开后下拉显示 T 列表的触发器。
+/// Dropdown：触发器下方弹出动作菜单的控件。
 ///
-/// 与 ListView&lt;T&gt; 结构相同——条目是普通实体，控件负责
-/// 其余一切（展开状态、位置、滚动、命中测试、选中）：
+/// 与 SelectBox 分工：SelectBox 是「从列表里选一个值」；Dropdown
+/// 是「点开菜单执行一个动作」。两种数据形态：
+///
+/// 1. 命令菜单（MenuItem）——图标、快捷键、分隔线、分组标题、
+///    禁用/危险项和一层悬停展开的多级子菜单；叶子点击后其
+///    `action` 写入并触发 Change，触发器不保留选中值：
+///
+///     menu.BindMenu(new List&lt;MenuItem&gt; {
+///         MenuItem.Item("Share", "share", 0),
+///         MenuItem.Separator(),
+///         MenuItem.Danger("Delete", "trash", 1),
+///         MenuItem.Submenu("Export", "download", kids),
+///     });
+///     menu.OnChange(OnAct);       // menu.Action() 是命中的 action
+///
+/// 2. 实体列表（与 SelectBox 的数据形态一致）——条目是普通实体，
+///    `textOf` 取显示文本，选中索引语义与 SelectBox 相同，适合
+///    简单的「选一个再执行」场景：
 ///
 ///     Dropdown&lt;City&gt; pick = new Dropdown&lt;City&gt;(c =&gt; c.name);
 ///     pick.Bind(cities);
-///     pick.OnChange(OnCity);
-///     parent.Add(pick);            // 尺寸和位置由布局决定
+///     pick.OnChange(OnCity);      // pick.Selected() 是所选实体
+///     parent.Add(pick);           // 尺寸和位置由布局决定
 ///
-/// 条目可以是完整组件而不只是文本，与列表行完全一致：
-///
-///     Dropdown&lt;User&gt; who = new Dropdown&lt;User&gt;(u =&gt; UserCard(u));
-///
-/// 面板延迟到框架覆盖层绘制，因此总是显示在
-/// 后续内容之上，拦截穿透点击，并在外部点击
-/// 或按 Escape 时关闭。
+/// 弹层是共享的富菜单组件（OverlayPopup.RichMenu）：延迟到框架
+/// 覆盖层绘制，总是显示在后续内容之上，拦截穿透点击，外部点击
+/// 或 Esc 关闭；长菜单出滚动条，滚轮与拖动都可用。
 /// </summary>
 class Dropdown<T> : Control {
-    /// 面板内容：由列表控件管理行、模板和滚动。
-    ListView<T> list;
+    /// 命令菜单条目（BindMenu 模式）；flat 模式为 null。
+    List<MenuItem> menuItems;
+    /// 实体数据源（flat 模式）。每帧重新读取。
+    List<T> data;
     CellOf<T> textOf;
     string hint;
-    bool open;
+    /// 选中实体（flat 模式选择后存储；仅在选择发生时写入）。
+    T selItem;
+    int selIndex;
+    /// 最近一次选择的 action id（菜单模式）。
+    int lastAction;
     int wid;
     /// 每帧暂存触发器几何信息，使延迟面板（在覆盖
-    /// 层阶段绘制）能定位到触发器下方。
+    /// 层阶段绘制）能定位到触发器下方；面板宽度也不窄于触发器。
     int trigX;
     int trigY;
     int trigW;
     int trigH;
-    int lastSel;
-    int maxVisible;
-    /// 条目是文本行（可以按最长文本量出面板宽度），还是模板控件行。
-    bool textRows;
+    /// 面板在滚动前显示的可点击行数（Rows(n)）。
+    int maxRows;
+    /// 上一帧的打开状态：RenderRich 关闭菜单只写 menuOpen 信号，
+    /// 这里的跳变沿负责补发 Opened/Closed 与选中结算。
+    bool wasOpen;
 
-    /// 选中不同条目时触发。
+    /// 富菜单的信号组：结果 / 子菜单展开 / 滚动偏移都由宿主跨帧
+    /// 持有（弹窗每帧重建）。
+    SignalBool menuOpen;
+    SignalInt menuResult;
+    SignalInt menuSub;
+    SignalInt menuScroll;
+    /// 覆盖层命中 id 保留段（RenderRich 要求至少 256 个连续 id）。
+    int menuBase;
+
+    /// 选中不同条目 / 命中命令时触发。
     UiEvent Change;
     UiEvent Opened;
     UiEvent Closed;
 
-    void InitDropdown(ListView<T> content) {
+    void InitDropdown() {
         this.InitControl("dropdown", 0);
         wid = WidgetId.Next();
         wiresOwnEvents = true;
         hint = "";
-        open = false;
-        maxVisible = 8;
-        lastSel = 0 - 1;
+        maxRows = 8;
+        selIndex = 0 - 1;
+        lastAction = 0 - 1;
+        menuOpen = new SignalBool(false);
+        menuResult = new SignalInt(0 - 1);
+        menuSub = new SignalInt(0 - 1);
+        menuScroll = new SignalInt(0);
+        menuBase = WidgetId.Block(256);
         Change = new UiEvent();
         Opened = new UiEvent();
         Closed = new UiEvent();
-        list = content;
-        list.Class = "flat headless";
     }
 
     /// 文本条目：`new Dropdown<City>(c => c.name)`。
     Dropdown(CellOf<T> text) {
+        this.InitDropdown();
         textOf = text;
-        textRows = true;
-        this.InitDropdown(new ListView<T>(new ListColumn<T>("", text)));
-    }
-
-    /// 组件条目：`new Dropdown<User>(u => UserCard(u))`。
-    Dropdown(RowOf<T> item) {
-        this.InitDropdown(new ListView<T>(item));
     }
 
     override string Kind() { return "Dropdown"; }
 
     override string StyleType() { return "select"; }
 
-    /// 绑定数据源；列表每帧重新读取。
+    /// 绑定实体数据源；列表每帧重新读取。选择被清除。
     Dropdown<T> Bind(List<T> src) {
-        list.Bind(src);
-        lastSel = list.SelectedIndex();
+        data = src;
+        selIndex = 0 - 1;
+        return this;
+    }
+
+    /// 绑定命令菜单（MenuItem 树）。命中的叶子 action 在 Change
+    /// 之后可经 `Action()` 读取；触发器不保留选中值，回到提示语。
+    Dropdown<T> BindMenu(List<MenuItem> items) {
+        menuItems = items;
+        data = null;
+        selIndex = 0 - 1;
+        lastAction = 0 - 1;
         return this;
     }
 
@@ -125,48 +160,60 @@ class Dropdown<T> : Control {
     /// 未选中任何条目时显示的提示文本。
     Dropdown<T> Hint(string text) { hint = text; return this; }
 
-    /// 组件条目（`new Dropdown<User>(u => UserCard(u))`）的触发器文本：
-    /// 模板行画的是控件，没有可显示的文本，不给这个的话触发器选中后
-    /// 仍然只显示提示语。
+    /// flat 模式选择后的触发器文本：默认用 `textOf`，绑定后仍可
+    /// 用 Label 换一个取文本的口径。
     Dropdown<T> Label(CellOf<T> text) { textOf = text; return this; }
 
-    /// 面板在滚动前显示的条目数。
+    /// 面板在滚动前显示的可点击行数。
     Dropdown<T> Rows(int n) {
-        if (n > 0) { maxVisible = n; }
+        if (n > 0) { maxRows = n; }
         return this;
     }
 
-    int Count() { return list.Count(); }
-    int SelectedIndex() { return list.SelectedIndex(); }
-    bool HasSelection() { return list.HasSelection(); }
-    T Selected() { return list.Selected(); }
+    int Count() {
+        if (menuItems != null) { return menuItems.Count; }
+        if (data != null) { return data.Count; }
+        return 0;
+    }
+
+    int SelectedIndex() { return selIndex; }
+    bool HasSelection() { return selIndex >= 0; }
+    T Selected() { return selItem; }
+
+    /// 菜单模式：最近一次命中的叶子 action；无则为 -1。
+    int Action() { return lastAction; }
 
     void SelectIndex(int row) {
-        list.SelectIndex(row);
-        lastSel = list.SelectedIndex();
+        if (data == null || row < 0 || row >= data.Count) { return; }
+        selIndex = row;
+        selItem = data[row];
     }
 
+    /// 清除选择：触发器回到提示语（动作菜单语义）。
     void Clear() {
-        list.ClearSelection();
-        lastSel = 0 - 1;
+        selIndex = 0 - 1;
+        lastAction = 0 - 1;
     }
 
-    bool IsOpen() { return open; }
+    bool IsOpen() { return menuOpen.Get(); }
 
     void SetOpen(bool want) {
-        if (open == want) { return; }
-        open = want;
-        if (open) { Opened.Post(); } else { Closed.Post(); }
+        if (menuOpen.Get() == want) { return; }
+        if (want) {
+            menuScroll.Set(0);
+            menuSub.Set(0 - 1);
+            menuResult.Set(0 - 1);
+        }
+        menuOpen.Set(want);
     }
 
     void Open() { this.SetOpen(true); }
     void Close() { this.SetOpen(false); }
 
-    /// 触发器标签：所选条目的文本，否则为提示文本。
+    /// 触发器标签：flat 模式所选条目的文本，否则为提示文本
+    /// （命令菜单不把选中值留在触发器上）。
     string TriggerText() {
-        if (list.HasSelection() && textOf != null) {
-            return textOf(list.Selected());
-        }
+        if (selIndex >= 0 && textOf != null) { return textOf(selItem); }
         return hint;
     }
 
@@ -181,11 +228,8 @@ class Dropdown<T> : Control {
     void PaintTrigger(App app) {
         Canvas c = app.canvas;
         Theme t = app.theme;
-        StyleBox option = Style.Part(app, "select", "option", "option", "",
-                                     "", Style.SNormal());
-        int optionFont = option.FontOr(Style.FontFallback(app, "small"));
         StyleBox s = this.ResolveEasedStyleAsIn(
-            app, wid, "select", Class, false, open, bx, by, bw, bh);
+            app, wid, "select", Class, false, menuOpen.Get(), bx, by, bw, bh);
         s.Paint(app, bx, by, bw, bh);
         int fs = s.FontOr(Style.FontFallback(app, "medium"));
         int textY = Canvas.CenterTextY(by, bh, fs);
@@ -216,86 +260,65 @@ class Dropdown<T> : Control {
             if (kc == 13 || kc == 32) { toggle = true; }
         }
         if (toggle) {
-            bool want = !open;
+            bool want = !menuOpen.Get();
             this.SetOpen(want);
-            // 拦截这次打开点击，防止刚弹出的面板把它当作
+            // 拦截这次打开点击，防止刚弹出的菜单把它当作
             // 外部点击而在同一帧再次关闭。
             if (want) { app.ClaimClick(); }
-            app.RequestRedraw();
         }
         On.Fire(app, wid);
 
-        if (open) { app.AddOverlay(OverlayPopup.Host(this)); }
-    }
-
-    /// 延迟面板：在所有内容之后绘制并分发事件，因此位于
-    /// 所有控件之上并接收最上层的点击。
-    /// 面板宽度：不窄于触发器，但至少能放下最长的一条文本。
-    /// 按触发器宽度开面板会把每一条都截成 "Agnes AI / agnes-2..."，
-    /// 选项之间看不出区别。模板行（组件条目）没有可量的文本，
-    /// 保持触发器宽度。
-    int PopupWidth(App app) {
-        int w = trigW;
-        if (!textRows || textOf == null) { return w; }
-        Theme t = app.theme;
-        StyleBox option = Style.Part(app, "select", "option", "option", "",
-                                     "", Style.SNormal());
-        int optionFont = option.FontOr(Style.FontFallback(app, "small"));
-        // 列表行的左右内边距 + 滚动条位置（参见 ListView.PaintColumnRows）。
-        int chrome = t.paddingMedium * 3 + app.Scale(10);
-        int n = list.Count();
-        for (int i = 0; i < n; i = i + 1) {
-            int tw = Canvas.MeasureText(textOf(list.ItemAt(i)), optionFont);
-            if (tw + chrome > w) { w = tw + chrome; }
+        // 打开/关闭跳变沿：RenderRich 关闭菜单只写信号，事件与
+        // 选中结算都收口在这里（代码 SetOpen 与用户点击同路）。
+        bool nowOpen = menuOpen.Get();
+        if (wasOpen && !nowOpen) {
+            int act = menuResult.Get();
+            if (act >= 0) {
+                lastAction = act;
+                if (data != null && act < data.Count) {
+                    selIndex = act;
+                    selItem = data[act];
+                }
+                Change.Post();
+            }
+            menuResult.Set(0 - 1);
+            Closed.Post();
+            app.RequestRedraw();
         }
-        int room = app.canvas.Width() - app.Scale(8);
-        if (w > room) { w = room; }
-        return w;
+        if (!wasOpen && nowOpen) { Opened.Post(); }
+        wasOpen = nowOpen;
+
+        if (menuOpen.Get()) { app.AddOverlay(OverlayPopup.Host(this)); }
     }
 
+    /// flat 模式把实体列表转成菜单条目（action = 行号）。每帧重建：
+    /// 数据是调用方的，绑定后原地修改也要在下一帧生效。
+    List<MenuItem> SyncItems(App app) {
+        if (menuItems != null) { return menuItems; }
+        List<MenuItem> items = new List<MenuItem>();
+        if (data == null) { return items; }
+        int n = data.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            items.Add(MenuItem.Item(textOf(data[i]), "", i));
+        }
+        return items;
+    }
+
+    /// 延迟面板：交给共享富菜单（图标/分隔线/子菜单/滚动条）在
+    /// 覆盖层阶段绘制与分发。面板不窄于触发器；定位按 Rows
+    /// 钳制后的可视高度算，长菜单才不会按整高翻到触发器上方
+    /// 把触发器盖住（触发器的开合点击会被首行抢走）。
     override void OnPaintOverlay(App app) {
-        if (!open) { return; }
-        Theme t = app.theme;
-        int rowH = t.heightMedium;
-        int vis = list.Count();
-        if (vis > maxVisible) { vis = maxVisible; }
-        if (vis < 1) { vis = 1; }
-        int viewH = OverlayPopup.FitH(app, vis * rowH + app.Scale(2));
-        int popW = this.PopupWidth(app);
+        if (!menuOpen.Get()) { return; }
+        List<MenuItem> items = this.SyncItems(app);
+        int popW = OverlayPopup.RichWidth(app, items);
+        if (popW < trigW) { popW = trigW; }
+        int popH = OverlayPopup.RichViewH(app, items, maxRows);
         int popX = OverlayPopup.FitX(app, trigX, popW);
         int popY = OverlayPopup.FitY(app, trigY + trigH + app.Scale(4),
-                                     trigH, viewH);
-
-        app.BlockHitsBelow();
-        StyleBox pop = this.ResolvePartAs(app, "select", "popup", "popup",
-                                          Class, Style.SSelected());
-        pop.Paint(app, popX, popY, popW, viewH);
-        app.BlockHitsRect(popX, popY, popW, viewH);
-
-        list.RenderInside(app, new Rect(popX, popY, popW, viewH));
-
-        // 选择由列表负责；选中变化时关闭面板，并以一次 Change
-        // 事件上报。
-        if (list.SelectedIndex() != lastSel) {
-            lastSel = list.SelectedIndex();
-            this.SetOpen(false);
-            Change.Post();
-            app.ClaimClick();
-            app.RequestRedraw();
-            return;
-        }
-        if (app.ClickAvailable()) {
-            bool inside = app.mouseX >= popX && app.mouseX < popX + popW
-                && app.mouseY >= popY && app.mouseY < popY + viewH;
-            if (!inside) {
-                this.SetOpen(false);
-                app.RequestRedraw();
-            }
-        }
-        if (app.EventKind() == 4 && app.window.EventKeyCode() == 27) {
-            this.SetOpen(false);
-            app.RequestRedraw();
-        }
+                                     trigH, popH);
+        app.AddOverlay(OverlayPopup.RichMenu(popX, popY, items, menuBase,
+            menuResult, menuOpen, menuSub, menuScroll, maxRows, popW));
     }
 
     override List<string> Events() {

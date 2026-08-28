@@ -780,6 +780,7 @@ class HitTester {
         return -1;
     }
 
+
     /// 上一帧为 `id` 注册的区域，以扁平的 [x,y,w,h] 列表表示；
     /// 若该 id 未拥有区域则为 null。让框架只重绘
     /// 状态变化的控件，而不是整个窗口。
@@ -820,8 +821,6 @@ class MenuItem {
     string label;
     string icon;
     string shortcut;
-    /// 稳定标识（Gui.Widget.Menu v2 的选中/展开 key）；空串时菜单退化为用 label 当 key。上下文菜单忽略本字段。
-    string key;
     int action;
     bool disabled;
     bool danger;
@@ -833,7 +832,6 @@ class MenuItem {
         m.label = label;
         m.icon = icon;
         m.shortcut = "";
-        m.key = "";
         m.action = action;
         m.disabled = false;
         m.danger = false;
@@ -872,7 +870,6 @@ class MenuItem {
         m.label = "";
         m.icon = "";
         m.shortcut = "";
-        m.key = "";
         m.action = 0 - 1;
         m.disabled = false;
         m.danger = false;
@@ -886,7 +883,6 @@ class MenuItem {
         m.label = label;
         m.icon = "";
         m.shortcut = "";
-        m.key = "";
         m.action = 0 - 1;
         m.disabled = false;
         m.danger = false;
@@ -900,7 +896,6 @@ class MenuItem {
         m.label = label;
         m.icon = icon;
         m.shortcut = "";
-        m.key = "";
         m.action = 0 - 1;
         m.disabled = false;
         m.danger = false;
@@ -944,6 +939,14 @@ class OverlayPopup {
     SignalInt result;
     SignalInt subOpen;
 
+    // 富菜单滚动：弹窗每帧重建，偏移由宿主跨帧持有。richMaxRows
+    // 限制主面板可见的可点击行数，长菜单出滚动条（滚轮 + 拖动）；
+    // null / <=0 时面板保持整高不滚（与旧版一致）。richMinW 是
+    // 面板宽度下限（Dropdown 让面板不窄于触发器），0 时不生效。
+    SignalInt richScroll;
+    int richMaxRows;
+    int richMinW;
+
     // 自定义宿主模式：弹窗由 Control 的
     // OnPaintOverlay 绘制并分发（参见 Host），适用于需要定制
     // 面板而非内置选项列表/菜单/抽屉类型的浮动控件。
@@ -957,6 +960,17 @@ class OverlayPopup {
     static OverlayPopup RichMenu(int x, int y, List<MenuItem> items, int baseId,
                                  SignalInt result, SignalBool openFlag,
                                  SignalInt subOpen) {
+        return OverlayPopup.RichMenu(x, y, items, baseId, result, openFlag,
+            subOpen, null, 0, 0);
+    }
+
+    /// 滚动/宽度扩展版富菜单：`scroll` + `maxRows` 让长菜单只显示
+    /// maxRows 行并出滚动条（偏移由宿主跨帧持有）；`minW` 给面板
+    /// 宽度下限。其余同上。
+    static OverlayPopup RichMenu(int x, int y, List<MenuItem> items, int baseId,
+                                 SignalInt result, SignalBool openFlag,
+                                 SignalInt subOpen, SignalInt scroll,
+                                 int maxRows, int minW) {
         OverlayPopup p = new OverlayPopup();
         p.rich = true;
         p.x = x;
@@ -970,6 +984,9 @@ class OverlayPopup {
         p.subOpen = subOpen;
         p.triggerId = 0 - 1;
         p.showCheck = false;
+        p.richScroll = scroll;
+        p.richMaxRows = maxRows;
+        p.richMinW = minW;
         return p;
     }
 
@@ -1950,6 +1967,17 @@ class OverlayPopup {
     /// 条目多，一行 26 逻辑像素才能一屏放下。
     static int MenuRowH(App app) { return app.Scale(26); }
 
+    /// 富项目列表的可视高度：条目总高被 maxRows 行的可点击
+    /// 高度钳制（maxRows <= 0 时整高）。定位与渲染共用同一
+    /// 口径，宿主传进来的 y 才不会按整高翻转到触发器上方。
+    static int RichViewH(App app, List<MenuItem> items, int maxRows) {
+        int fullH = OverlayPopup.RichHeight(app, items);
+        if (maxRows <= 0) { return fullH; }
+        int cap = app.Scale(12) + maxRows * OverlayPopup.MenuRowH(app);
+        if (fullH > cap) { return cap; }
+        return fullH;
+    }
+
     /// 富项目列表的面板高度（分隔线和标题比
     /// 可点击行更矮）。
     static int RichHeight(App app, List<MenuItem> items) {
@@ -1983,9 +2011,10 @@ class OverlayPopup {
 
     /// 在 (px,py) 处绘制一个富菜单面板（图标 / 分隔线 / 标题 / 子菜单
     /// 箭头），并为每个可点击 / 子菜单行注册命中 id `idBase + rowIndex`。
-    /// 返回光标所在的行索引，没有则为 -1。
+    /// `ph` 是可视高度，行按 `scrollY` 上移并裁进面板（可滚动主面板
+    /// 用，子菜单面板传 0）。返回光标所在的行索引，没有则为 -1。
     static int PaintRichPanel(App app, List<MenuItem> items, int px, int py,
-                              int pw, int ph, int idBase) {
+                              int pw, int ph, int idBase, int scrollY) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int rowH = OverlayPopup.MenuRowH(app);
@@ -2033,19 +2062,26 @@ class OverlayPopup {
         app.BlockHitsRect(px, py, pw, ph);
 
         int hoverRow = 0 - 1;
-        int rowY = py + padV;
+        int rowY = py + padV - scrollY;
+        c.PushClip(px, py, pw, ph);
         for (int i = 0; i < items.Count; i = i + 1) {
             MenuItem m = items[i];
             if (m.kind == 1) {
-                c.FillRect(px + padH, rowY + sepH / 2, pw - padH * 2, 1,
-                           separatorBg);
+                if (rowY + sepH > py && rowY < py + ph) {
+                    c.FillRect(px + padH, rowY + sepH / 2, pw - padH * 2, 1,
+                               separatorBg);
+                }
                 rowY = rowY + sepH;
             } else if (m.kind == 2) {
-                int ty = Canvas.CenterTextY(rowY, hdrH, Style.FontFallback(app, "small"));
-                c.DrawText(px + padH, ty, m.label, headerFg, Style.FontFallback(app, "small"));
+                if (rowY + hdrH > py && rowY < py + ph) {
+                    int ty = Canvas.CenterTextY(rowY, hdrH, Style.FontFallback(app, "small"));
+                    c.DrawText(px + padH, ty, m.label, headerFg, Style.FontFallback(app, "small"));
+                }
                 rowY = rowY + hdrH;
             } else {
-                bool hovered = app.mouseX >= px && app.mouseX < px + pw
+                bool vis = rowY + rowH > py && rowY < py + ph;
+                bool hovered = vis
+                    && app.mouseX >= px && app.mouseX < px + pw
                     && app.mouseY >= rowY && app.mouseY < rowY + rowH;
                 int fg = itemFg;
                 int hoverBg = itemHoverBg;
@@ -2054,29 +2090,39 @@ class OverlayPopup {
                     fg = itemDangerFg;
                     hoverBg = dangerHoverBg;
                 }
-                if (hovered && !m.disabled) {
+                if (vis && hovered && !m.disabled) {
                     c.FillRect(px + 1, rowY, pw - 2, rowH, hoverBg);
                 }
-                if (m.icon != "") {
-                    c.DrawGlyphIn(m.icon, px + padH, rowY,
-                        t.iconSizeSmall, rowH, t.iconSizeSmall, fg);
+                if (vis) {
+                    if (m.icon != "") {
+                        c.DrawGlyphIn(m.icon, px + padH, rowY,
+                            t.iconSizeSmall, rowH, t.iconSizeSmall, fg);
+                    }
+                    int ty = Canvas.CenterTextY(rowY, rowH, Style.FontFallback(app, "medium"));
+                    c.DrawText(px + padH + iconCol, ty, m.label, fg, Style.FontFallback(app, "medium"));
+                    if (m.kind == 3) {
+                        c.DrawGlyphIn("chevron-right",
+                            px + pw - padH - t.iconSizeSmall, rowY,
+                            t.iconSizeSmall, rowH, t.iconSizeSmall, fg);
+                    } else if (m.shortcut != "") {
+                        int sw = Canvas.MeasureText(m.shortcut, Style.FontFallback(app, "small"));
+                        c.DrawText(px + pw - padH - sw, ty, m.shortcut,
+                            accelFg, Style.FontFallback(app, "small"));
+                    }
+                    if (hovered) { hoverRow = i; }
+                    // 命中区裁到可视范围：滚动时首尾的半行只以可见
+                    // 部分响应点击，面板边缘外的不可见部分不拦截。
+                    int vy0 = rowY;
+                    if (vy0 < py) { vy0 = py; }
+                    int vy1 = rowY + rowH;
+                    if (vy1 > py + ph) { vy1 = py + ph; }
+                    app.hitTester.RegisterRect(idBase + i, px, vy0, pw,
+                                               vy1 - vy0, 0);
                 }
-                int ty = Canvas.CenterTextY(rowY, rowH, Style.FontFallback(app, "medium"));
-                c.DrawText(px + padH + iconCol, ty, m.label, fg, Style.FontFallback(app, "medium"));
-                if (m.kind == 3) {
-                    c.DrawGlyphIn("chevron-right",
-                        px + pw - padH - t.iconSizeSmall, rowY,
-                        t.iconSizeSmall, rowH, t.iconSizeSmall, fg);
-                } else if (m.shortcut != "") {
-                    int sw = Canvas.MeasureText(m.shortcut, Style.FontFallback(app, "small"));
-                    c.DrawText(px + pw - padH - sw, ty, m.shortcut,
-                        accelFg, Style.FontFallback(app, "small"));
-                }
-                if (hovered) { hoverRow = i; }
-                app.hitTester.RegisterRect(idBase + i, px, rowY, pw, rowH, 0);
                 rowY = rowY + rowH;
             }
         }
+        c.PopClip();
         return hoverRow;
     }
 
@@ -2090,19 +2136,52 @@ class OverlayPopup {
         int ch = c.Height();
 
         int pw = OverlayPopup.RichWidth(app, items);
-        int ph = OverlayPopup.RichHeight(app, items);
+        if (richMinW > pw) { pw = richMinW; }
+        int fullH = OverlayPopup.RichHeight(app, items);
         int px = x;
         if (px + pw > cw - margin) { px = cw - margin - pw; }
         if (px < margin) { px = margin; }
+        // 可滚动主面板：可视高度按 richMaxRows 收口，超出部分滚轮
+        // 和拖动滚动条都可用。
+        int viewH = fullH;
+        int scrollY = 0;
+        int maxScroll = 0;
         int py = y;
-        if (py + ph > ch - margin) { py = ch - margin - ph; }
+        if (richScroll != null && richMaxRows > 0) {
+            viewH = OverlayPopup.RichViewH(app, items, richMaxRows);
+            maxScroll = fullH - viewH;
+            if (maxScroll < 0) { maxScroll = 0; }
+        }
+        if (py + viewH > ch - margin) { py = ch - margin - viewH; }
         if (py < margin) { py = margin; }
+        if (maxScroll > 0) {
+            // 滚轮直接按几何认领（CaptureWheel 仲裁），不走
+            // Ui.Over：本弹层已铺全屏遮罩，PointerCaptured 恒为
+            // 真，经 Ui.Over 的 HandleWheel 在弹层里永远拿不到
+            // 滚轮事件。
+            bool ownsWheel = app.CaptureWheel(px, py, pw, viewH);
+            if (ownsWheel && app.EventKind() == 13) {
+                int wdelta = app.window.EventKeyCode();
+                int cur = richScroll.Get() - wdelta * app.scrollSpeed / 120;
+                if (cur < 0) { cur = 0; }
+                if (cur > maxScroll) { cur = maxScroll; }
+                if (cur != richScroll.Get()) {
+                    richScroll.Set(cur);
+                    app.NoteScrollDamage(px, py, pw, viewH);
+                }
+            }
+            scrollY = richScroll.Get();
+            if (scrollY < 0) { scrollY = 0; }
+            if (scrollY > maxScroll) { scrollY = maxScroll; }
+            richScroll.Set(scrollY);
+        }
 
         app.BlockHitsBelow();
         // 富菜单行由几何驱动：不注册命中 id，因此面板内移动指针
         // 不会改变悬停 id，也就不会安排重绘。只在悬停行真的变了时
         // 重绘，而不是菜单开着就每个鼠标移动事件重绘一整帧。
-        int overRow = OverlayPopup.PaintRichPanel(app, items, px, py, pw, ph, baseId);
+        int overRow = OverlayPopup.PaintRichPanel(app, items, px, py, pw, viewH,
+            baseId, scrollY);
         if (overRow != OverlayPopup.lastRichHover) {
             OverlayPopup.lastRichHover = overRow;
             app.RequestRedraw();
@@ -2126,7 +2205,8 @@ class OverlayPopup {
             childH = OverlayPopup.RichHeight(app, kids);
             childX = px + pw - app.Scale(4);
             if (childX + childW > cw - margin) { childX = px - childW + app.Scale(4); }
-            childY = OverlayPopup.RichRowTop(app, items, curSub, py + app.Scale(6));
+            childY = OverlayPopup.RichRowTop(app, items, curSub, py + app.Scale(6))
+                - scrollY;
             if (childY + childH > ch - margin) { childY = ch - margin - childH; }
             if (childY < margin) { childY = margin; }
             haveChild = true;
@@ -2156,12 +2236,20 @@ class OverlayPopup {
             chd = OverlayPopup.RichHeight(app, ck);
             cx = px + pw - app.Scale(4);
             if (cx + cwd > cw - margin) { cx = px - cwd + app.Scale(4); }
-            cy = OverlayPopup.RichRowTop(app, items, newSub, py + app.Scale(6));
+            cy = OverlayPopup.RichRowTop(app, items, newSub, py + app.Scale(6))
+                - scrollY;
             if (cy + chd > ch - margin) { cy = ch - margin - chd; }
             if (cy < margin) { cy = margin; }
             childOver = OverlayPopup.PaintRichPanel(app, ck, cx, cy, cwd, chd,
-                baseId + 128);
+                baseId + 128, 0);
             childOpen = true;
+        }
+
+        // 滚动条：画在行之上，命中区在行之后注册，拖动优先于行点击。
+        if (maxScroll > 0) {
+            Widget.Scrollbar.RenderVerticalScrollIn(app,
+                px + pw - app.Scale(10), py, viewH, viewH, fullH, richScroll,
+                px, py, pw, viewH);
         }
 
         // 交互由几何驱动（右键目标不会填充
@@ -2172,12 +2260,22 @@ class OverlayPopup {
         int kind = app.EventKind();
         int btn = app.window.EventButton();
         bool inMain = app.mouseX >= px && app.mouseX < px + pw
-            && app.mouseY >= py && app.mouseY < py + ph;
+            && app.mouseY >= py && app.mouseY < py + viewH;
         bool inChild = childOpen
             && app.mouseX >= cx && app.mouseX < cx + cwd
             && app.mouseY >= cy && app.mouseY < cy + chd;
+        // 滚动条条带上的按下/松开属于滚动交互（拖动中常越出
+        // 面板底部）：既不算叶子行激活，也不关闭菜单。
+        bool onBar = maxScroll > 0 && app.mouseX >= px + pw - app.Scale(10)
+            && app.mouseX < px + pw;
 
-        if (kind == 3 && btn == 0) {
+        // 叶子激活只认「本帧首次到达、未被认领」的释放：打开
+        // 菜单的那次触发器释放已在同帧被 ClaimClick 认领，若这里
+        // 直接读原始事件，会把同一次释放当成行点击（触发器与
+        // 首行重叠），菜单开了即选第 0 项。EventKind 在空闲帧
+        // 停留不变，ClickFrameCurrent 同时挡住陈旧释放的重放。
+        if (kind == 3 && btn == 0 && !onBar && app.ClickFrameCurrent()
+            && !app.ClickClaimed()) {
             if (childOpen && childOver >= 0
                 && childOver < items[newSub].children.Count) {
                 MenuItem hcm = items[newSub].children[childOver];
@@ -2198,7 +2296,13 @@ class OverlayPopup {
             }
         }
         bool leftEvt = (kind == 2 || kind == 3) && btn == 0;
-        if (leftEvt && !inMain && !inChild) {
+        // 释放引发的关闭只认本帧首次到达且未被认领的释放：打开
+        // 菜单的那次触发器释放（已被认领）落在面板之外，直接读
+        // 原始事件会在同帧把刚打开的菜单关掉；EventKind 在空闲
+        // 帧停留不变，ClickFrameCurrent 同时挡住陈旧释放重放。
+        bool releaseOwned = kind == 2
+            || (app.ClickFrameCurrent() && !app.ClickClaimed());
+        if (leftEvt && releaseOwned && !inMain && !inChild && !onBar) {
             openFlag.Set(false);
             subOpen.Set(0 - 1);
             app.RequestRedraw();
