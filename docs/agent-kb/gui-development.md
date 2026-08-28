@@ -24,6 +24,13 @@ while (app.isRunning) {
    目标。如果某个窗口的绘制顺序/数量在帧间变化，按钮会"点不动"。
    子窗口的做法见 `ZanIDE.Shell.zan`：进入子窗口帧前 `WidgetId.SetSeq(850000)` 钉一个
    固定基线，画完 `WidgetId.SetSeq(savedSeq)` 还原。**新增子窗口时照抄这个模式。**
+   已钉的段（seq 域，实际 id = 1000000 + 段值 + n）：Designer `800000/840000/860000`、
+   ZanIDE.Shell `850000`、FilePicker/ChildWindow `900000`、LayerState（可拖动窗口）
+   `930000`。**保留式控件若会在帧中途创建（点击回调里 `new`），绝不能从宿主计数器直接
+   领号**：即时模式宿主每帧 `WidgetId.ResetFrame()` 会回卷重发，领走的正是随后每帧控件
+   的本命 id——表现为"点 A 控件触发 B 控件"的信号污染（gallery 曾是"点 Layer 窗口
+   标题栏弹出 Photos"）。照 `LayerState` 构造器：`SetSeq(段基)` 领号、
+   `SetSeq(outer)` 还原。
 2. **状态放在调用方**，用 `SignalInt` / `Input` 等承载（`Gui/Reactive.zan`、
    `Widget/Input.zan`），控件本身不存状态。
 3. **不要在绘制中做阻塞 IO**。长任务丢到后台并用面板/通知反馈（IDE 的构建/发布就是
@@ -89,8 +96,15 @@ Canvas.EvictImage("mem:logo");                              // 丢弃（路径�
 `OffsetX/OffsetY` 整体偏移。纯绘制层：不注册命中 id，事件照常落到下层
 控件。
 
+**宿主必须自己有高度**：水印是覆盖层，自身测量 0×0、不参与排版——宿主
+容器若靠内容撑高（`Gallery.LayoutAuto`、流式面板），`Grow()`/`DockFill()`
+的水印会分到 0 高、什么都不画。给宿主 `Prefer(0, 高度)`（stack 面板不吃
+CSS height，`Prefer` 才设置 `prefSet`）。另外 `Panel.Column` 的样式类型是
+`stack` 不是 `panel`，给演示容器写皮肤要写 `stack.xxx`。
+
 ```zan
 Panel doc = Panel.Column().Gap(8);
+doc.Prefer(0, 170);                                    // 宿主定高，水印才有剩余空间
 doc.With(new Label { Text = "合同正文..." });
 doc.With(new Watermark("INTERNAL USE ONLY").Grow());   // 默认 -22°
 // 品牌样式：

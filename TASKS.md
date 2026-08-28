@@ -1625,6 +1625,17 @@ ApplyEvent 之间消失，与命中区无关。样本极少且均发生在锁屏
   同步），`tests/gui/css_test.zan` 内嵌表同步。外框线在全部内容之后补画：
   表头/行/合计的填充都从矩形边缘起笔，先画外框会被整段盖掉（表现为
   部分布局下边框丢失），钉底合计行与钉右合计列两处尤其明显。
+- **边框二修（同日）**：外框线补画后仍有"部分边框不可见"的观感，根因不在
+  画线而在面板底色——`pivottable::surface` 用 `var(--bg-primary)`，而深色
+  主题里它恰与窗口底色同值，于是 `inner=Scale(2)` 的内边距条带（钉右合计
+  列右侧、钉底合计行下侧）与数据不满一屏时的下方空白全部透出窗口底色，
+  边框内侧隔出一条同色缝，视觉上像边框断裂/悬浮。修法：面板底色改
+  `var(--bg-secondary)`，新增 `pivottable::cell { background:
+  var(--bg-primary) }` 给数据格铺回原底色，保住表头/数据的两级层次
+  （`PushClip` 只有矩形裁剪，圆角处内容不能贴边，内边距必须保留，故从
+  配色入手）。四种布局（高/矮溢出/窄隐藏合计列/空态）`dump pixels` 逐边
+  核对：四边边框除圆角 4px 弧段外无一缺失，缝与空白均呈面板色；
+  smoke gui|css|pivot 30/30。
 - **调试期修掉的编译器缺陷**（规则 10，非绕过）：`irgen_call.c` 通用实例方法
   调用路径无条件把 receiver 压进实参表，`this.StaticMethod()` 形态（静态方法
   经实例调用）会把 `this` 当首个形参传——已按泛型路径同款语义
@@ -1729,6 +1740,17 @@ ApplyEvent 之间消失，与命中区无关。样本极少且均发生在锁屏
   B,G,R。无 golden 消费 BMP 字节（断言走进程内 GetPixel），零测试影响。
 - **已知限制**：macOS 文字水印不旋转（回落 DrawText）；ClearType 在旋转
   路径下不可用（GDI 限制，灰度 AA）；`Src` 平铺按自然尺寸不做缩放。
+- **复盘补丁（同日，用户实测 gallery 水印不显示）**：水印是 0×0 覆盖层，
+  gallery 演示把宿主交给 `LayoutAuto` 按内容测高——两行 Label 撑起的 ~60px
+  全被标签吃掉，`Grow()` 的水印分到 0 高，OnPaint 的 `bh<=0` 守卫直接什么
+  都不画（此前无窗口测试用 `Arrange` 固定矩形，绕过了布局路径，没拦住）。
+  修法：宿主 `doc.Prefer(0, Scale(170))` 定高（stack 面板不吃裸 CSS
+  height——`ApplySelector` 只写 prefH 不置 `prefSet`，`OnMeasure` 无视之；
+  `Prefer` 才是受认可路径）。另 `Panel.Column` 的样式类型是 `stack`，
+  演示皮肤选择器 `panel.wm-doc` 从未命中，已改 `stack.wm-doc`；Comp 代码
+  片段/JSON 同步补宿主高度，agent-kb 增"宿主必须自己有高度"条目。
+  布局路径探针（复刻 LayoutAuto 测量→排布→绘制）实测水印分到 496×42，
+  Dump 目视 -22° 平铺清晰可见。
 
 # A63 · Gui.Widget.Countdown 倒计时组件（Naive UI n-countdown）—— ✅ 已完成（2026-08-28）
 
@@ -2164,3 +2186,50 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
 **证据**：域内回归 `ctest -L standard -R "db_|orm_|zandb|sqlite|http_|ws_|webdav|mqtt|tls|https"`
 55/56 绿（唯一失败 `policy_zform_schema` 为 Gui WIP 的 zform 清单缺
 Marquee 条目，与本批无关）。
+
+# A64b · System 栈封装审查修复第二批（P3 收尾 + 运行时 accept 唤醒）—— ✅ 已完成（2026-08-28）
+
+**运行时（两处真实缺陷，非测试绕行）**
+- **`TcpListener.Stop()` 先 CancelIoEx 再关句柄（Windows）**：closesocket 不会给
+  挂起的 AcceptEx 投递完成包，accept 里的协程带着整条服务端对象链永远挂起——
+  POSX 侧 dead-fd sweep（io_sweep_entries/io_flush_dead）在 20ms 内救援，Windows
+  侧没有对应机制。与 `Socket.ShutdownBoth` 给 recv 用的 CancelIoEx 同款补法；
+  探针 `_scratch/wake_probe.zan`（已清）验证 `woke=1`、快速干净退出。
+- **`MqttBroker`**：监听句柄从 RunAsync 局部落到字段，`Stop()` 真正关停并唤醒
+  accept（此前只置标志位，句柄永远不关）；`ReadByteAsync` 对死套接字
+  （RST 后恒"可读"）不再无限重试空转，`n<=0` 一律结束会话。
+
+**泄漏收口**：全量 leakcheck 双胎 427 → 433+ 绿。修绿的 10 个：
+http_client_keepalive / http_client_binary / https_binary_body / mqtt_loopback /
+ws_loopback（本工作流创建，补 Stop + 收尾静默窗：关客户端→Delay→停监听→
+再 Delay，让 woken accept 与连接协程在退出前收干净）；http_framing /
+http_server_stress / http_smuggling / web_framing / tls_hostname（既有用例，
+同样模式，静默窗位置必须在 Run 尾部而非辅助函数内）。
+**仍红（待查，非本批范围）**：http_forwarder_keepalive / http_forwarder_tunnel
+（forwarder 自身协程收尾，文件在另一工作流未提交 WIP 中）、checkbox_group（Gui
+WIP）、reflect_members / server_mvc_timezone / sqlserver_tds / tdengine_rest；
+db_error_throw 的 leakcheck 在编译器重链接后出现 5 对象漂移
+（DbParams×2 + Model.IsApplied×2 仍可达），通过/失败随构建指纹翻转，待根因。
+
+**P3 完成**
+- **CSRF 中间件（opt-in）**：`System.Web` 新增 `Csrf` 类——double-submit cookie。
+  `app.Before(Csrf.Guard)` 一行启用：安全方法补发无 HttpOnly 的随机 token
+  cookie（`HttpContext.SetCookieJs`，SameSite=Lax 保留），不安全方法要求
+  X-CSRF-Token 头或 _csrf 字段与 cookie 常时比较相等，不匹配 403 短路；
+  `Csrf.Skip(prefix)` 豁免自带签名校验的回调路由。token 无状态（16 随机字节
+  hex），重启/多 worker 皆有效。`tests/conformance/csrf_guard.zan` 18 项断言，
+  四胎（conformance/determinism/leakcheck/arcguard）全绿。
+- **WS 服务器回调风格对齐**：`WssServer` 补上与 `WebSocketServer` 同款的
+  子类重写路径（未注册委托时消息走 `OnMessage(string)`，默认 echo）。
+- **HttpClient 错误模型文档**：类头补齐三类 API 的三种约定（请求/动词抛
+  HttpRequestException 且 HTTP 状态不视为错误；文件下载返回负数哨兵 -1/-2
+  文本在 GetLastError；SseSink 探测以 "ok"/"err: ..." 标记）。
+- **字符串扫描器沉淀**：`string.IndexOf/LastIndexOf(needle[, from])` 编译器
+  内建（strstr，无分配）早已存在，8 个文件各自手写的 O(n·m) 且每位置
+  Substring 分配的私有副本全部删除，调用点改走内建：ProcessList（IndexOf +
+  LastIndexOf）、Background、Hotkey、Keyboard、IniFile、KnownFolders、PathEx、
+  Cpu、Model.IndexOfSub、ServerMetrics.LastIndexOf；FileInfoEx.LastIndexOfAny
+  保留（内建无 any-of 语义）。覆盖用例 48/48 绿。
+
+**验证**：域内回归 `ctest -L standard -R "db_|orm_|zandb|sqlite|http_|ws_|webdav|mqtt|tls|https|csrf|web_|server_"`
+67/67 绿；泄漏双胎全量 446 项仅剩上述 8 项待查（详见上）。
