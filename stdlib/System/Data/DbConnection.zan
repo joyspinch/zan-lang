@@ -58,6 +58,9 @@ class DbProvider {
 ///   db.Close();
 ///
 ///   DbConnection any = DbConnection.OpenODBC("DSN=mydsn;UID=u;PWD=p;");
+///
+/// 语句失败时抛出 <see cref="DbException"/>；空结果集总
+/// 意味着「无行」，错误文本可通过 GetError() 获取。
 /// </summary>
 class DbConnection : IDbConnection {
     nint handle;       // ODBC 连接（dbc）句柄
@@ -123,6 +126,11 @@ class DbConnection : IDbConnection {
 
     [DllImport("odbc32")]
     static extern int SQLFreeStmt(nint stmt, int option);
+
+    [DllImport("odbc32")]
+    static extern int SQLGetDiagRec(int handleType, nint handle, int recNum,
+        string sqlState, string nativeErrPtr, string msgBuf, int msgBufLen,
+        string msgLenPtr);
     #else
     [DllImport("odbc")]
     static extern int SQLAllocHandle(int handleType, nint inputHandle, string outputHandle);
@@ -174,6 +182,11 @@ class DbConnection : IDbConnection {
 
     [DllImport("odbc")]
     static extern int SQLFreeStmt(nint stmt, int option);
+
+    [DllImport("odbc")]
+    static extern int SQLGetDiagRec(int handleType, nint handle, int recNum,
+        string sqlState, string nativeErrPtr, string msgBuf, int msgBufLen,
+        string msgLenPtr);
     #endif
 
     DbConnection() {
@@ -400,6 +413,7 @@ class DbConnection : IDbConnection {
             SQLFreeHandle(2, dbcH);
             SQLFreeHandle(1, envH);
             conn.lastError = "SQLDriverConnect failed";
+            conn.Diagnose(2, conn.handle);
         }
         return conn;
     }
@@ -417,17 +431,52 @@ class DbConnection : IDbConnection {
         return stmt;
     }
 
-    /// <summary>执行非查询语句（INSERT/UPDATE/DELETE/DDL）。</summary>
+    /// <summary>抛出记录的失败。provider 指明来自哪个引擎，
+    /// 处理方无需解析消息即可分支处理；错误文本仍可通过
+    /// <see cref="GetError"/> 获取。</summary>
+    void Fail() {
+        string why = this.lastError;
+        if (why.Length == 0) {
+            why = "the statement failed";
+        }
+        throw new DbException(why, 0, this.provider);
+    }
+
+    /// <summary>把最近一条 ODBC 诊断记录的文本读进 lastError，替代
+    /// 纯静态描述——"SQLExecDirect failed" 不告诉用户是列名拼错还是
+    /// 表不存在，驱动的诊断文本才会。句柄无效或没有记录时不改动
+    /// lastError（静态描述兜底）。只取第一条记录：ODBC 的失败原因
+    /// 几乎总在第一条。</summary>
+    void Diagnose(int handleType, nint h) {
+        if (h == 0) { return; }
+        byte[] state = new byte[8];
+        byte[] native = new byte[8];
+        byte[] msg = new byte[1024];
+        byte[] mlen = new byte[8];
+        int rc = SQLGetDiagRec(handleType, h, 1, state, native, msg, 1024,
+                               mlen);
+        if (rc == 0 || rc == 1) {
+            string text = BufToString(msg, 1024);
+            if (text.Length > 0) { this.lastError = text; }
+        }
+    }
+
+    /// <summary>执行非查询语句（INSERT/UPDATE/DELETE/DDL）。
+    /// 失败时抛出 <see cref="DbException"/>。</summary>
     int Execute(string sql) {
-        if (!this.connected) { return -1; }
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.Fail();
+        }
         nint stmt = AllocStmt();
-        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; return -1; }
+        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; this.Fail(); }
 
         int rc = SQLExecDirect(stmt, sql, -3);   // SQL_NTS
         if (!OdbcSuccess(rc)) {
             this.lastError = "SQLExecDirect failed";
+            this.Diagnose(3, stmt);
             SQLFreeHandle(3, stmt);
-            return -1;
+            this.Fail();
         }
 
         byte[] pRows = new byte[8];
@@ -466,6 +515,7 @@ class DbConnection : IDbConnection {
                 ind);
             if (!OdbcSuccess(rc)) {
                 this.lastError = "SQLBindParameter failed";
+            this.Diagnose(3, stmt);
                 return -1;
             }
         }
@@ -475,7 +525,7 @@ class DbConnection : IDbConnection {
     /// <summary>执行非查询语句。SQLPrepare carries the managed SQL string
     /// synchronously; handle-only SQLExecute crosses the blocking boundary.
     /// 带 prms 时走真参数绑定：占位符就是 ODBC 原生的 `?`，
-    /// 不再做任何文本内联。</summary>
+    /// 不再做任何文本内联。失败时抛出 <see cref="DbException"/>。</summary>
     async int ExecuteAsync(string sql) {
         return await this.ExecuteCoreAsync(sql, null);
     }
@@ -485,14 +535,18 @@ class DbConnection : IDbConnection {
     }
 
     async int ExecuteCoreAsync(string sql, DbParams prms) {
-        if (!this.connected) { return -1; }
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.Fail();
+        }
         nint stmt = AllocStmt();
-        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; return -1; }
+        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; this.Fail(); }
         int rc = SQLPrepare(stmt, sql, -3);   // SQL_NTS
         if (!OdbcSuccess(rc)) {
             this.lastError = "SQLPrepare failed";
+            this.Diagnose(3, stmt);
             SQLFreeHandle(3, stmt);
-            return -1;
+            this.Fail();
         }
         // 缓冲活到 await 之后：驱动在 SQLExecute 期间读取。
         List<string> keepValues = new List<string>();
@@ -500,15 +554,16 @@ class DbConnection : IDbConnection {
         if (prms != null && prms.Count() > 0) {
             if (this.BindParams(stmt, prms, keepValues, keepInds) < 0) {
                 SQLFreeHandle(3, stmt);
-                return -1;
+                this.Fail();
             }
         }
         int erc = await SQLExecute(stmt);
         if (!OdbcSuccess(erc)) {
             this.lastError = "SQLExecute failed";
+            this.Diagnose(3, stmt);
             SQLFreeStmt(stmt, 0);
             SQLFreeHandle(3, stmt);
-            return -1;
+            this.Fail();
         }
         byte[] pRows = new byte[8];
         SQLRowCount(stmt, pRows);
@@ -519,7 +574,8 @@ class DbConnection : IDbConnection {
     }
 
     /// <summary>执行查询并返回结果集。带 prms 时走真参数绑定
-    /// （见 ExecuteCoreAsync）。</summary>
+    /// （见 ExecuteCoreAsync）。失败时抛出
+    /// <see cref="DbException"/>，因此空结果总意味着「无行」。</summary>
     async DbResult QueryAsync(string sql) {
         return await this.QueryCoreAsync(sql, null);
     }
@@ -529,30 +585,35 @@ class DbConnection : IDbConnection {
     }
 
     async DbResult QueryCoreAsync(string sql, DbParams prms) {
-        if (!this.connected) { return DbResult.Empty(); }
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.Fail();
+        }
         DbResult result = new DbResult();
         nint stmt = AllocStmt();
-        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; return result; }
+        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; this.Fail(); }
         int rc = SQLPrepare(stmt, sql, -3);   // SQL_NTS
         if (!OdbcSuccess(rc)) {
             this.lastError = "SQLPrepare failed";
+            this.Diagnose(3, stmt);
             SQLFreeHandle(3, stmt);
-            return result;
+            this.Fail();
         }
         List<string> keepValues = new List<string>();
         List<byte[]> keepInds = new List<byte[]>();
         if (prms != null && prms.Count() > 0) {
             if (this.BindParams(stmt, prms, keepValues, keepInds) < 0) {
                 SQLFreeHandle(3, stmt);
-                return result;
+                this.Fail();
             }
         }
         int erc = await SQLExecute(stmt);
         if (!OdbcSuccess(erc)) {
             this.lastError = "SQLExecute failed";
+            this.Diagnose(3, stmt);
             SQLFreeStmt(stmt, 0);
             SQLFreeHandle(3, stmt);
-            return result;
+            this.Fail();
         }
         byte[] pcc = new byte[4];
         SQLNumResultCols(stmt, pcc);
@@ -572,14 +633,18 @@ class DbConnection : IDbConnection {
         }
 
         // SQL_SUCCESS = 0, SQL_SUCCESS_WITH_INFO = 1, SQL_NO_DATA = 100.
+
+        // 单元格取值缓冲跨行复用：每格 new 一个 4096 字节缓冲的代价
+        // 在宽表/深结果集上比取值本身还贵。BufToString 当场复制成串，
+        // 复用是安全的。
+        byte[] buf = new byte[4096];
+        byte[] pInd = new byte[8];
         int fr = await SQLFetch(stmt);
         while (fr == 0 || fr == 1) {
             List<string> row = new List<string>();
             List<bool> nulls = new List<bool>();
             c = 0;
             while (c < colCount) {
-                byte[] buf = new byte[4096];
-                byte[] pInd = new byte[8];
                 int g = SQLGetData(stmt, c + 1, 1, buf, 4096, pInd);
                 // SQL_NULL_DATA = -1：指示缓冲由驱动填写，此前从未读过，
                 // NULL 被不可逆地压成 ""，IsNull() 永远不触发。
@@ -605,18 +670,23 @@ class DbConnection : IDbConnection {
     }
 
     /// <summary>同步查询（阻塞调用线程——服务端代码请改用
-    /// QueryAsync）。SQLExecDirect 直发，无参数版本。</summary>
+    /// QueryAsync）。SQLExecDirect 直发，无参数版本。
+    /// 失败时抛出 <see cref="DbException"/>。</summary>
     DbResult Query(string sql) {
-        if (!this.connected) { return DbResult.Empty(); }
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.Fail();
+        }
         DbResult result = new DbResult();
         nint stmt = AllocStmt();
-        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; return result; }
+        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; this.Fail(); }
 
         int rc = SQLExecDirect(stmt, sql, -3);   // SQL_NTS
         if (!OdbcSuccess(rc)) {
             this.lastError = "SQLExecDirect failed";
+            this.Diagnose(3, stmt);
             SQLFreeHandle(3, stmt);
-            return result;
+            this.Fail();
         }
 
         byte[] pcc = new byte[4];
@@ -636,14 +706,18 @@ class DbConnection : IDbConnection {
             result.AddColumnName(BufToString(nameBuf, 256));
         }
 
+
+        // 单元格取值缓冲跨行复用：每格 new 一个 4096 字节缓冲的代价
+        // 在宽表/深结果集上比取值本身还贵。BufToString 当场复制成串，
+        // 复用是安全的。
+        byte[] buf = new byte[4096];
+        byte[] pInd = new byte[8];
         int fr = SQLFetch(stmt);
         while (fr == 0 || fr == 1) {
             List<string> row = new List<string>();
             List<bool> nulls = new List<bool>();
             c = 0;
             while (c < colCount) {
-                byte[] buf = new byte[4096];
-                byte[] pInd = new byte[8];
                 int g = SQLGetData(stmt, c + 1, 1, buf, 4096, pInd);
                 bool isNull = g == 100
                     || ((pInd[0] & 255) == 255 && (pInd[1] & 255) == 255
@@ -758,31 +832,37 @@ class DbConnection : IDbConnection {
 
     /// <summary>执行带参数的非查询语句（同步）。真参数绑定，
     /// 与异步路径一致——`?` 是 ODBC 原生占位符，值以数据形式
-    /// 上线，不再有任何文本内联。</summary>
+    /// 上线，不再有任何文本内联。失败时抛出
+    /// <see cref="DbException"/>。</summary>
     int Execute(string sql, DbParams prms) {
-        if (!this.connected) { return -1; }
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.Fail();
+        }
         nint stmt = AllocStmt();
-        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; return -1; }
+        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; this.Fail(); }
         int rc = SQLPrepare(stmt, sql, -3);
         if (!OdbcSuccess(rc)) {
             this.lastError = "SQLPrepare failed";
+            this.Diagnose(3, stmt);
             SQLFreeHandle(3, stmt);
-            return -1;
+            this.Fail();
         }
         List<string> keepValues = new List<string>();
         List<byte[]> keepInds = new List<byte[]>();
         if (prms != null && prms.Count() > 0) {
             if (this.BindParams(stmt, prms, keepValues, keepInds) < 0) {
                 SQLFreeHandle(3, stmt);
-                return -1;
+                this.Fail();
             }
         }
         int erc = SQLExecute(stmt);
         if (!OdbcSuccess(erc)) {
             this.lastError = "SQLExecute failed";
+            this.Diagnose(3, stmt);
             SQLFreeStmt(stmt, 0);
             SQLFreeHandle(3, stmt);
-            return -1;
+            this.Fail();
         }
         byte[] pRows = new byte[8];
         SQLRowCount(stmt, pRows);
@@ -793,33 +873,39 @@ class DbConnection : IDbConnection {
     }
 
     /// <summary>执行带参数的查询（同步）。真参数绑定，取数逻辑与
-    /// 无参 Query 共用同一形状。</summary>
+    /// 无参 Query 共用同一形状。失败时抛出
+    /// <see cref="DbException"/>。</summary>
     DbResult Query(string sql, DbParams prms) {
-        if (!this.connected) { return DbResult.Empty(); }
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.Fail();
+        }
         DbResult result = new DbResult();
         nint stmt = AllocStmt();
-        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; return result; }
+        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; this.Fail(); }
 
         int rc = SQLPrepare(stmt, sql, -3);
         if (!OdbcSuccess(rc)) {
             this.lastError = "SQLPrepare failed";
+            this.Diagnose(3, stmt);
             SQLFreeHandle(3, stmt);
-            return result;
+            this.Fail();
         }
         List<string> keepValues = new List<string>();
         List<byte[]> keepInds = new List<byte[]>();
         if (prms != null && prms.Count() > 0) {
             if (this.BindParams(stmt, prms, keepValues, keepInds) < 0) {
                 SQLFreeHandle(3, stmt);
-                return result;
+                this.Fail();
             }
         }
         int erc = SQLExecute(stmt);
         if (!OdbcSuccess(erc)) {
             this.lastError = "SQLExecute failed";
+            this.Diagnose(3, stmt);
             SQLFreeStmt(stmt, 0);
             SQLFreeHandle(3, stmt);
-            return result;
+            this.Fail();
         }
 
         byte[] pcc = new byte[4];
@@ -839,14 +925,18 @@ class DbConnection : IDbConnection {
             result.AddColumnName(BufToString(nameBuf, 256));
         }
 
+
+        // 单元格取值缓冲跨行复用：每格 new 一个 4096 字节缓冲的代价
+        // 在宽表/深结果集上比取值本身还贵。BufToString 当场复制成串，
+        // 复用是安全的。
+        byte[] buf = new byte[4096];
+        byte[] pInd = new byte[8];
         int fr = SQLFetch(stmt);
         while (fr == 0 || fr == 1) {
             List<string> row = new List<string>();
             List<bool> nulls = new List<bool>();
             c = 0;
             while (c < colCount) {
-                byte[] buf = new byte[4096];
-                byte[] pInd = new byte[8];
                 int g = SQLGetData(stmt, c + 1, 1, buf, 4096, pInd);
                 bool isNull = g == 100
                     || ((pInd[0] & 255) == 255 && (pInd[1] & 255) == 255

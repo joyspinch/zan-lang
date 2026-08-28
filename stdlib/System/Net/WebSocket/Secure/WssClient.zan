@@ -14,13 +14,18 @@ class WssClient {
     TlsStream stream;
     string host;
     string path;
-    string pending;
+    // 握手与帧共用一个带显式长度的累积缓冲（WsReader）。
+    // 此前用字符串拼接攒帧：帧负载里的 NUL 会让按 strlen 计长
+    // 的帧长判断与切片全部错位。
+    WsReader reader;
+    WsAssembler asm;
     bool connected;
 
     WssClient() {
         this.host = "";
         this.path = "/";
-        this.pending = "";
+        this.reader = null;
+        this.asm = new WsAssembler(16777216);
         this.connected = false;
     }
 
@@ -49,31 +54,30 @@ class WssClient {
         int sent = await client.stream.SendAsync(request, request.Length);
         if (sent <= 0) { client.CloseNow(); return client; }
 
-        string response = "";
+        // 响应头可能被 TLS 记录边界拆开；头之后的字节已是帧
+        // （可能含 NUL）。全部落进 reader 的显式长度缓冲。
+        client.reader = WsReader.WrapTls(client.stream);
         int headerEnd = -1;
         while (headerEnd < 0) {
-            string chunk = await client.stream.RecvAsync(8192);
-            if (chunk.Length == 0) { client.CloseNow(); return client; }
-            response = response + chunk;
-            headerEnd = WssClient.IndexOf(response, "\r\n\r\n", 0);
+            if (client.reader.Buffered() > 65536) { client.CloseNow(); return client; }
+            int n = await client.reader.FillMore();
+            if (n == 0) { client.CloseNow(); return client; }
+            headerEnd = client.reader.FindHeaderEnd();
         }
-        if (response.Length < 12 || response.Substring(9, 3) != "101") {
+        string head = client.reader.Slice(headerEnd);
+        if (head.Length < 12 || head.Substring(9, 3) != "101") {
             client.CloseNow();
             return client;
         }
         string acceptSource = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
         string expectedAccept = Base64.Encode(
             Sha1.Hash(acceptSource, acceptSource.Length), 20);
-        string actualAccept = WssClient.Header(response.Substring(0, headerEnd),
-                                               "Sec-WebSocket-Accept");
+        string actualAccept = WssClient.Header(head, "Sec-WebSocket-Accept");
         if (actualAccept != expectedAccept) {
             client.CloseNow();
             return client;
         }
-        int bodyStart = headerEnd + 4;
-        if (bodyStart < response.Length) {
-            client.pending = response.Substring(bodyStart);
-        }
+        client.reader.Consume(headerEnd + 4);
         client.connected = true;
         return client;
     }
@@ -92,30 +96,29 @@ class WssClient {
 
     async string RecvText() {
         while (this.connected) {
-            int total = this.FrameLength();
+            int total = this.reader.FrameSize();
             while (total < 0) {
-                if (total == -2) { this.CloseNow(); return ""; }
-                string chunk = await this.stream.RecvAsync(65536);
-                if (chunk.Length == 0) { this.CloseNow(); return ""; }
-                this.pending = this.pending + chunk;
-                total = this.FrameLength();
+                if (total == -2 || total == -3) { this.CloseNow(); return ""; }
+                int n = await this.reader.FillMore();
+                if (n == 0) { this.CloseNow(); return ""; }
+                total = this.reader.FrameSize();
             }
-            WsFrame frame = WsFrame.Decode(this.pending, total);
-            if (total < this.pending.Length) {
-                this.pending = this.pending.Substring(total);
-            } else {
-                this.pending = "";
-            }
+            WsFrame frame = this.reader.TakeFrame(total);
             if (frame.opcode == WsOpcode.Close) {
                 this.CloseNow();
                 return "";
             }
             if (frame.opcode == WsOpcode.Ping) {
                 await this.SendFrame(WsOpcode.Pong, frame.payload, frame.payloadLen);
-            } else if (frame.opcode == WsOpcode.Text
-                       || frame.opcode == WsOpcode.Binary) {
-                return frame.payload;
+                continue;
             }
+            if (frame.opcode == WsOpcode.Pong) { continue; }
+            // 分片消息在 fin 时整条交付——此前 continuation 帧被
+            // 静默丢弃。
+            int feed = this.asm.Feed(frame);
+            if (feed < 0) { this.CloseNow(); return ""; }
+            if (feed == 0) { continue; }
+            return this.asm.Complete();
         }
         return "";
     }
@@ -165,44 +168,12 @@ class WssClient {
         if (sent <= 0) { this.CloseNow(); }
     }
 
-    int FrameLength() {
-        if (this.pending.Length < 2) { return -1; }
-        int b1 = this.pending[1] & 255;
-        int payloadLen = b1 & 127;
-        int pos = 2;
-        if (payloadLen == 126) {
-            if (this.pending.Length < 4) { return -1; }
-            payloadLen = ((this.pending[2] & 255) << 8)
-                | (this.pending[3] & 255);
-            pos = 4;
-        } else if (payloadLen == 127) {
-            if (this.pending.Length < 10) { return -1; }
-            // 64 位长度的高 32 位必须为零（RFC 要求连接失败）：
-            // 不检查时置位的高位会把 payloadLen 变成负数，total 随之
-            // 为负、长度比较永远通过，解码端按负帧长越界。
-            if ((this.pending[2] & 255) != 0 || (this.pending[3] & 255) != 0
-                || (this.pending[4] & 255) != 0 || (this.pending[5] & 255) != 0) {
-                return -2;
-            }
-            payloadLen = ((this.pending[6] & 255) << 24)
-                | ((this.pending[7] & 255) << 16)
-                | ((this.pending[8] & 255) << 8)
-                | (this.pending[9] & 255);
-            pos = 10;
-        }
-        if ((b1 & 128) != 0) { pos = pos + 4; }
-        int total = pos + payloadLen;
-        if (total < 0) { return -2; }
-        if (this.pending.Length < total) { return -1; }
-        return total;
-    }
-
     void CloseNow() {
         this.connected = false;
         if (this.stream != null) { this.stream.Close(); this.stream = null; }
         if (this.conn != null) { this.conn.Close(); this.conn = null; }
         if (this.context != null) { this.context.Free(); this.context = null; }
-        this.pending = "";
+        this.reader = null;
     }
 
     static string Header(string headers, string name) {

@@ -72,6 +72,74 @@ class Program {
         Program.Ok("off word", p.InputBool("f1", true) == false, true);
         Program.Ok("garbage keeps dflt", p.InputBool("f2", true) == true, true);
 
+        // ---- In* 家族与 Input* 同序同规则（收编后的契约）----
+        // In* 曾经反着合并（form → query → route），同名参数在两族里
+        // 会读到不同来源。现在 In* 也走 route → query → form，数值解析
+        // 同样整串消费。
+        p.routeParams.Set("id", "77");
+        p.query.Set("id", "55");
+        p.form.Set("id", "33");
+        Program.Ok("in route beats query", p.InInt("id", 0) == 77, true);
+        Program.Eq("in route raw", p.InRaw("id"), "77");
+        p.query.Set("pick", "11");
+        p.form.Set("pick", "22");
+        Program.Ok("in query beats form", p.InInt("pick", 0) == 11, true);
+        Program.Ok("in form fallback", p.InInt("name", 0) == 0, true);
+        p.query.Set("junk", "12abc");
+        Program.Ok("in int junk rejected", p.InInt("junk", 7) == 7, true);
+        p.query.Set("plus2", "+6");
+        Program.Ok("in int plus sign", p.InInt("plus2", 7) == 6, true);
+        p.query.Set("huge2", "2147483648");
+        Program.Ok("in int overflow to dflt", p.InInt("huge2", 5) == 5, true);
+        p.form.Set("emptyq", "");
+        p.query.Set("emptyq", "still-here");
+        // 空值视同缺失：query 的值不被 form 里的空串遮蔽。
+        Program.Eq("empty does not shadow", p.InRaw("emptyq"), "still-here");
+
+        // ---- JsonBody：惰性解析一次 ----
+        string jp = "POST /api HTTP/1.1\r\nHost: h\r\n"
+                    + "Content-Type: application/json\r\n"
+                    + "Content-Length: 26\r\n\r\n{\"a\":7,\"s\":\"hi there\"}";
+        HttpContext j = new HttpContext(HttpRequest.Parse(jp), "127.0.0.1");
+        JsonValue jb = j.JsonBody();
+        JsonValue ja = jb == null ? null : jb.Get("a");
+        JsonValue js = jb == null ? null : jb.Get("s");
+        Program.Ok("json body parsed", ja != null && ja.AsLong(0) == 7, true);
+        Program.Eq("json string field",
+                   js == null ? "" : js.AsString(""), "hi there");
+        Program.Ok("json cached", j.JsonBody() == jb, true);
+        string je = "POST /api HTTP/1.1\r\nHost: h\r\n"
+                    + "Content-Type: application/json\r\n"
+                    + "Content-Length: 0\r\n\r\n";
+        HttpContext j2 = new HttpContext(HttpRequest.Parse(je), "127.0.0.1");
+        Program.Ok("json empty is null", j2.JsonBody() == null, true);
+
+        // ---- multipart 文本字段进 form 表 ----
+        // 同一张表单里文本输入与文件输入混排：文本字段必须能被
+        // Form()/In* 读到，文件部件（带 filename=）不能混进 form。
+        string mp = "POST /upload HTTP/1.1\r\nHost: h\r\n"
+            + "Content-Type: multipart/form-data; boundary=XBND\r\n"
+            + "Content-Length: 232\r\n\r\n"
+            + "--XBND\r\n"
+            + "Content-Disposition: form-data; name=\"title\"\r\n"
+            + "\r\n"
+            + "hello multipart\r\n"
+            + "--XBND\r\n"
+            + "Content-Disposition: form-data; name=\"tag\"\r\n"
+            + "\r\n"
+            + "z\r\n"
+            + "--XBND\r\n"
+            + "Content-Disposition: form-data; name=\"doc\"; filename=\"a.bin\"\r\n"
+            + "Content-Type: application/octet-stream\r\n"
+            + "\r\n"
+            + "RAWBYTES\r\n"
+            + "--XBND--\r\n";
+        HttpContext m = new HttpContext(HttpRequest.Parse(mp), "127.0.0.1");
+        Program.Eq("multipart title", m.Form("title"), "hello multipart");
+        Program.Eq("multipart tag", m.In("tag"), "z");
+        Program.Ok("multipart file part skipped", m.Form("doc").Length == 0,
+                   true);
+
         if (Program.failures > 0) {
             Console.WriteLine("fail: " + Convert.ToString(Program.failures));
         } else {

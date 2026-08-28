@@ -153,8 +153,29 @@ class HttpsServer {
             HttpResponse response = await ProcessRequest(request);
             response = response.SetKeepAlive(keepAlive);
 
-            string responseData = response.Build();
-            int _sent = await stream.SendAsync(responseData, responseData.Length);
+            // 与明文 HTTP 相同的二进制正文处理：SendAsync 按 strlen 定长，
+            // 正文里的 NUL 会把响应截断。二进制正文用 BuildHeaders +
+            // bodyBytes 按显式字节数分块发送（Content-Length 与发送长度
+            // 同取自 BodyLength）；ToStr 按长度复制，NUL 原样加密上线。
+            if (response.IsBinary()) {
+                string head = response.BuildHeaders();
+                int _h2 = await stream.SendAsync(head, head.Length);
+                int blen = response.BodyLength();
+                int off = 0;
+                while (blen - off > 0) {
+                    int chunk = blen - off;
+                    if (chunk > 16384) { chunk = 16384; }
+                    string part = response.bodyBytes.ToStr(off, chunk);
+                    int _b2 = await stream.SendAsync(part, chunk);
+                    off = off + chunk;
+                }
+            } else {
+                string responseData = response.Build();
+                int _sent = await stream.SendAsync(responseData,
+                                                  responseData.Length);
+            }
+            response.Dispose();
+            response = null;
 
             if (!keepAlive) {
                 break;

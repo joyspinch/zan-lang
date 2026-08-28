@@ -26,6 +26,26 @@ delegate bool HttpCancelFn();
 /// 解析后的 <see cref="HttpResponse"/>；各动词辅助方法仍只返回
 /// 响应体。客户端不缓存上次响应的任何内容，因此单个
 /// 客户端可被多个协程同时使用。
+///
+/// 连接复用：同一客户端串行的请求默认复用一条 keep-alive 连接
+/// （HTTP/1.1 持久连接），省去每个请求的三次握手；空闲连接被对端
+/// 回收时换新连接重试一次，对调用方不可见。同一时刻只允许一个
+/// 请求占用复用连接，并发请求各自走一次性 Connection: close 通道，
+/// 互不干扰。对端宣布 close、EOF 定界的响应、以及 <see cref="Close"/>
+/// 都会终结复用。<see cref="DisableKeepAlive"/> 可整体退回旧行为。
+///
+/// 错误模型（三类 API，三种约定，调用前先认清用的是哪一类）：
+/// 1. 请求/动词方法（<see cref="SendAsync"/> 及 Get/Post 等动词）：
+///    传输层失败一律抛 <see cref="HttpRequestException"/>——连接、TLS
+///    握手、超时、响应中途断开都在其中。HTTP 状态本身不是错误：
+///    到达的响应（含 4xx/5xx）正常返回，状态码由调用方检查。
+/// 2. 文件下载方法（<see cref="DownloadRangeToFileAsync"/> /
+///    <see cref="DownloadBinaryToFileAsync"/>）：不抛错，以负数哨兵
+///    返回——-1 = 连接/握手失败或响应不完整（文本见
+///    <see cref="GetLastError"/>），-2 = 取消探针触发（已收字节保留，
+///    可续传）；成功返回落盘字节数。
+/// 3. 探测路径（<see cref="SseSink"/> 系）：绝不抛错，每次尝试以
+///    "ok" 或 "err: ..." 标记结束，便于轮询方统一判别。
 /// </summary>
 class HttpClient {
     string host;
@@ -41,11 +61,20 @@ class HttpClient {
     // 下面的开发开关在发布二进制中会被编译掉。
     List<string> tlsPins;
     bool pinningEnabled;
+    // 证书策略：链/主机名校验不通过时逐连接裁决（见 SetCertPolicy）。
+    CertPolicyFn certPolicy;
     // cookie 存储；null = 不参与 cookie（Set-Cookie 只留在响应头里）。
     CookieJar jar;
     // 取消探针；null = 不可取消（见 SetCancelProbe）。
     HttpCancelFn cancelProbe;
     string lastDownloadError;
+    // ---- keep-alive 连接复用（见 RequestAliveAsync）----
+    HttpFramer ka;        // 非空 = 池中有一条空闲可复用的连接
+    TcpClient kaConn;
+    TlsStream kaTls;
+    TlsContext kaCtx;
+    bool kaBusy;          // 在途请求标志：并发请求退回一次性通道
+    bool kaEnabled;
 
     [DllImport("crt")]
     static extern nint fopen(string path, string mode);
@@ -79,9 +108,16 @@ class HttpClient {
         this.defaultHeaders = new List<string>();
         this.tlsPins = null;
         this.pinningEnabled = false;
+        this.certPolicy = null;
         this.jar = null;
         this.cancelProbe = null;
         this.lastDownloadError = "";
+        this.ka = null;
+        this.kaConn = null;
+        this.kaTls = null;
+        this.kaCtx = null;
+        this.kaBusy = false;
+        this.kaEnabled = true;
     }
 
     /// <summary>为指定的主机和端口创建 HTTPS 客户端。</summary>
@@ -102,6 +138,36 @@ class HttpClient {
     HttpClient DisableTlsVerify() {
         this.verifyTls = false;
         return this;
+    }
+
+    /// <summary>设置证书策略：链/主机名校验不通过（verify_result
+    /// != 0）时以 (verifyResult, 对端证书文本) 调用，返回 true 放行
+    /// 本次连接，false 拒绝（拒绝原因带证书文本）。校验本身不关——
+    /// 与 DisableTlsVerify 的整体放开不同，每个连接都过策略，
+    /// 典型用途是老系统缺根证书时按已知签发者（GlobalSign/
+    /// Certum 签发的 Alibaba 证书）放行。</summary>
+    HttpClient SetCertPolicy(CertPolicyFn fn) {
+        this.certPolicy = fn;
+        return this;
+    }
+
+    /// 客户端 TLS 上下文（客户端证书/策略统一在此挂上）。
+    TlsContext ClientTlsContext() {
+        TlsContext ctx;
+        if (this.clientCertificateFile.Length > 0
+            && this.clientPrivateKeyFile.Length > 0) {
+            ctx = TlsContext.CreateClientWithCertificate(
+                this.clientCertificateFile, this.clientPrivateKeyFile);
+        } else {
+            ctx = TlsContext.CreateClient();
+        }
+        if (ctx != null && this.certPolicy != null) {
+            ctx.SetCertPolicy(this.certPolicy);
+        }
+        if (ctx != null && this.certPolicy != null) {
+            ctx.SetCertPolicy(this.certPolicy);
+        }
+        return ctx;
     }
 
     /// <summary>为此客户端启用 cookie：响应里的 Set-Cookie 被存下来，
@@ -201,6 +267,34 @@ class HttpClient {
         return this;
     }
 
+    /// <summary>关闭复用的 keep-alive 连接（若在）。客户端仍可继续
+    /// 使用：下一次请求会重新建立连接。进程退出前或长寿命客户端
+    /// 空闲时调用，避免悬挂的半开连接。</summary>
+    void Close() {
+        this.DropAlive();
+    }
+
+    /// <summary>禁用连接复用：每个请求各建一条连接并在响应后关闭
+    /// （与旧版行为一致）。返回自身以便链式调用。</summary>
+    HttpClient DisableKeepAlive() {
+        this.kaEnabled = false;
+        this.DropAlive();
+        return this;
+    }
+
+    // 丢弃池中的连接。连接可能已被对端半关或处于错误状态，
+    // 因此四个句柄都要收干净；幂等，可在任何时候调用。
+    void DropAlive() {
+        if (this.ka != null) { this.ka.Dispose(); }
+        this.ka = null;
+        if (this.kaTls != null) { this.kaTls.Close(); }
+        this.kaTls = null;
+        if (this.kaConn != null) { this.kaConn.Close(); }
+        this.kaConn = null;
+        if (this.kaCtx != null) { this.kaCtx.Free(); }
+        this.kaCtx = null;
+    }
+
     /// <summary>当 <see cref="SetHeader"/> 已提供过一个名字
     /// （ASCII 大小写不敏感）匹配的头部时返回 true。这样 BuildRequest 可以只保留
     /// 调用者自选的 Content-Type，而非总是强制表单编码。</summary>
@@ -230,8 +324,10 @@ class HttpClient {
         return true;
     }
 
-    // 构建原始 HTTP/1.1 请求文本（Connection: close 帧结构）。
-    string BuildRequest(string method, string path, string body) {
+    // 构建原始 HTTP/1.1 请求文本。<paramref name="close"/> 选择帧结构：
+    // true 发 Connection: close 并读至对端关闭（读至 EOF 的调用方）；
+    // false 发 Connection: keep-alive，供连接复用路径使用。
+    string BuildRequest(string method, string path, string body, bool close) {
         StringBuilder sb = new StringBuilder();
         sb.Append(method);
         sb.Append(" ");
@@ -266,7 +362,11 @@ class HttpClient {
             }
         }
 
-        sb.Append("Connection: close\r\n");
+        if (close) {
+            sb.Append("Connection: close\r\n");
+        } else {
+            sb.Append("Connection: keep-alive\r\n");
+        }
         sb.Append("\r\n");
         if (body.Length > 0) {
             sb.Append(body);
@@ -307,8 +407,16 @@ class HttpClient {
     /// 或请求未在超时内完成时，抛出
     /// HttpRequestException。
     /// 连接在请求文本构建之前建立，因此
-    /// 连接失败抛出时，本帧内没有存活的分配。</summary>
+    /// 连接失败抛出时，本帧内没有存活的分配。
+    ///
+    /// 默认走 keep-alive 复用通道（同一客户端同时只允许一个在途
+    /// 请求）；已有请求在途时，并发调用退回一次性 Connection: close
+    /// 通道，各自读到对端关闭为止。</summary>
     async string RequestAsync(string method, string path, string body) {
+        if (this.kaEnabled && !this.kaBusy) {
+            string alive = await this.RequestAliveAsync(method, path, body);
+            return alive;
+        }
         if (this.useTls) {
             string raw = await RequestTlsAsync(method, path, body);
             return raw;
@@ -323,7 +431,7 @@ class HttpClient {
         // 就沉默不语的对端会让本协程永久挂起，
         // 因为 reactor 唤醒无法取消。
         int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
-        int _sent = await conn.SendAsync(BuildRequest(method, path, body));
+        int _sent = await conn.SendAsync(BuildRequest(method, path, body, true));
 
         // 读取响应。chunk 被提到循环外并在之后清空，
         // 因为超时是通过 `throw` 展开的，而它不会
@@ -380,6 +488,9 @@ class HttpClient {
         } else {
             ctx = TlsContext.CreateClient();
         }
+        if (ctx != null && this.certPolicy != null) {
+            ctx.SetCertPolicy(this.certPolicy);
+        }
         if (ctx == null) {
             conn.Close();
             string tlsError = TlsStream.LastError();
@@ -404,7 +515,7 @@ class HttpClient {
         // 握手已完成；像普通路径那样，用相同方式约束
         // 数据交换本身。
         int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
-        string requestData = BuildRequest(method, path, body);
+        string requestData = BuildRequest(method, path, body, true);
         int _sent = await stream.SendAsync(requestData, requestData.Length);
 
         StringBuilder respSb = new StringBuilder();
@@ -442,6 +553,222 @@ class HttpClient {
         return result;
     }
 
+    // keep-alive 请求：复用池中的连接，直到对端宣布关闭。同一客户端
+    // 同时只允许一个在途请求（kaBusy 拦截，并发请求走一次性通道）；
+    // 空闲连接被对端回收时，换一条新连接透明地重试一次。
+    async string RequestAliveAsync(string method, string path, string body) {
+        this.kaBusy = true;
+        string raw = "";
+        try {
+            raw = await this.RequestAliveCore(method, path, body);
+        } catch (Exception __alive) {
+            this.kaBusy = false;
+            throw;
+        }
+        this.kaBusy = false;
+        return raw;
+    }
+
+    // 复用通道的实际收发。响应组装用 StringBuilder 按显式长度拼接：
+    // 二进制正文里的 NUL 不能让 a+b 的 strlen 语义把响应截断。
+    async string RequestAliveCore(string method, string path, string body) {
+        int attempt = 0;
+        while (true) {
+            attempt = attempt + 1;
+            bool reused = this.ka != null;
+            if (!reused) {
+                this.DropAlive();
+                bool ok = await this.ConnectAlive();
+                if (!ok) {
+                    FailConnect();
+                }
+            }
+            int watch = HttpDeadline.Arm(this.kaConn.Sock(), this.timeout);
+            string req = this.BuildRequest(method, path, body, false);
+            int _sent;
+            if (this.kaTls != null) {
+                _sent = await this.kaTls.SendAsync(req, req.Length);
+            } else {
+                _sent = await this.kaConn.SendAsync(req);
+            }
+            int he = await this.ka.ReadHead(65536);
+            if (he == 0 && reused && attempt == 1) {
+                // 空闲连接已被对端回收，请求未被处理：换新连接重试。
+                HttpDeadline.Disarm(watch);
+                this.DropAlive();
+                continue;
+            }
+            if (he == 0) {
+                bool late = HttpDeadline.Expired(watch);
+                HttpDeadline.Disarm(watch);
+                this.DropAlive();
+                req = "";
+                if (late) {
+                    method = "";
+                    path = "";
+                    body = "";
+                    FailTimeout();
+                }
+                throw new HttpRequestException(
+                    "connection closed before a response arrived");
+            }
+            if (he < 0) {
+                HttpDeadline.Disarm(watch);
+                this.DropAlive();
+                req = "";
+                throw new HttpRequestException(
+                    "response header block exceeds 65536 bytes");
+            }
+            string head = this.ka.Head(he);
+            HttpRequest hp = HttpRequest.Parse(head, he);
+            HttpResponse probe = HttpResponse.Parse(head);
+            bool serverClose = HttpClient.HeadSaysClose(head);
+            // 204/304 与 HEAD 的响应没有正文，不能按 Content-Length
+            // 或 EOF 去等。
+            bool noBody = probe.statusCode == 204 || probe.statusCode == 304
+                || method == "HEAD";
+            string bodyOut = "";
+            bool keep = false;
+            if (noBody) {
+                this.ka.Consume(he);
+                keep = !serverClose;
+            } else if (hp.chunked || HttpClient.HeadHasContentLength(head)) {
+                int st = await this.ka.ReadBody(hp, 67108864);
+                if (st == 0) {
+                    bodyOut = hp.body;
+                    this.ka.Consume(this.ka.RequestBytes());
+                    keep = !serverClose;
+                } else if (st == -1) {
+                    // 对端在正文中途关闭。与头部前关闭不同，响应已开始
+                    // 到达，说明服务器处理过这个请求，因此不重试
+                    // （重试非幂等请求可能重复执行）。
+                    bool late = HttpDeadline.Expired(watch);
+                    HttpDeadline.Disarm(watch);
+                    this.DropAlive();
+                    req = "";
+                    if (late) {
+                        method = "";
+                        path = "";
+                        body = "";
+                        FailTimeout();
+                    }
+                    throw new HttpRequestException(
+                        "connection closed in the middle of the response body");
+                } else if (st == 413) {
+                    HttpDeadline.Disarm(watch);
+                    this.DropAlive();
+                    req = "";
+                    throw new HttpRequestException(
+                        "response body exceeds 67108864 bytes");
+                } else {
+                    HttpDeadline.Disarm(watch);
+                    this.DropAlive();
+                    req = "";
+                    throw new HttpRequestException(
+                        "malformed chunked response body");
+                }
+            } else {
+                // 没有 Content-Length 也没有分块：EOF 定界——读到对端
+                // 关闭为止，这样的连接不再复用。
+                StringBuilder rest = new StringBuilder();
+                int pend = this.ka.Pending();
+                rest.Append(this.ka.Slice(he, pend - he));
+                this.ka.Consume(pend);
+                while (!this.ka.Closed()) {
+                    int n = await this.ka.Fill();
+                    if (n > 0) {
+                        rest.Append(this.ka.Slice(0, n));
+                        this.ka.Consume(n);
+                    }
+                }
+                bodyOut = rest.ToString();
+                keep = false;
+            }
+            bool late2 = HttpDeadline.Expired(watch);
+            HttpDeadline.Disarm(watch);
+            if (!keep || late2) { this.DropAlive(); }
+            if (late2) {
+                bodyOut = "";
+                head = "";
+                req = "";
+                method = "";
+                path = "";
+                body = "";
+                FailTimeout();
+            }
+            StringBuilder rsb = new StringBuilder();
+            rsb.Append(head);
+            rsb.Append(bodyOut);
+            string result = rsb.ToString();
+            this.AbsorbCookies(path, result);
+            return result;
+        }
+    }
+
+    // 为复用通道建立底层连接（明文或 TLS 握手）。返回 false 表示
+    // 连接失败（调用方 FailConnect() 报告）；TLS 失败直接抛出，
+    // 错误文本与一次性通道一致。
+    async bool ConnectAlive() {
+        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
+                                                     this.timeout);
+        if (conn == null) { return false; }
+        if (!this.useTls) {
+            this.kaConn = conn;
+            this.ka = HttpFramer.Create(conn.Sock());
+            return true;
+        }
+        Socket.Initialize();
+        TlsContext ctx;
+        if (this.clientCertificateFile.Length > 0
+            && this.clientPrivateKeyFile.Length > 0) {
+            ctx = TlsContext.CreateClientWithCertificate(
+                this.clientCertificateFile, this.clientPrivateKeyFile);
+        } else {
+            ctx = TlsContext.CreateClient();
+        }
+        if (ctx != null && this.certPolicy != null) {
+            ctx.SetCertPolicy(this.certPolicy);
+        }
+        if (ctx == null) {
+            conn.Close();
+            string tlsError = TlsStream.LastError();
+            if (tlsError == "") { tlsError = "TLS 上下文初始化失败"; }
+            throw new HttpRequestException(tlsError);
+        }
+        if (!this.verifyTls) {
+            ctx.DisableVerify();
+        }
+        this.ApplyPinning(ctx);
+        TlsStream stream = await TlsStream.ConnectAsync(ctx, conn.Sock(),
+                                                       this.host);
+        if (stream == null) {
+            conn.Close();
+            ctx.Free();
+            string tlsHandshakeError = TlsStream.LastError();
+            if (tlsHandshakeError == "") {
+                tlsHandshakeError = "TLS 握手失败";
+            }
+            throw new HttpRequestException(tlsHandshakeError);
+        }
+        this.kaConn = conn;
+        this.kaTls = stream;
+        this.kaCtx = ctx;
+        this.ka = HttpFramer.CreateTls(stream);
+        return true;
+    }
+
+    // 头部块里是否声明了 Content-Length。HttpRequest.Parse 把缺失的
+    // Content-Length 记为 0，与"声明为 0"无法区分，所以要在头部
+    // 文本里找（头部块是 ASCII，整体小写后按行首匹配）。
+    static bool HeadHasContentLength(string head) {
+        return head.ToLower().Contains("\ncontent-length:");
+    }
+
+    // 头部块是否带 Connection: close（值大小写不敏感）。
+    static bool HeadSaysClose(string head) {
+        return head.ToLower().Contains("connection: close");
+    }
+
     /// <summary>发送请求并返回解析后的响应，使调用者可以看到
     /// 状态行和头部，而不只是正文：来自网关的 502
     /// 与一个负载古怪的 200 响应本来无法区分。
@@ -449,6 +776,297 @@ class HttpClient {
     async HttpResponse SendAsync(string method, string path, string body) {
         string raw = await RequestAsync(method, path, body);
         return HttpResponse.Parse(raw);
+    }
+
+    /// <summary>二进制安全的一次性请求。通道与 <see cref="SendAsync"/>
+    /// 相同（Connection: close，读至对端关闭或定界完成），但响应全程按
+    /// 显式字节数组装（<see cref="HttpFramer"/> + ByteBuffer）：
+    /// 正文里的 NUL 不会把响应截断，结果的 bodyBytes/bodyBytesLen
+    /// 有效，<see cref="HttpResponse.IsBinary"/> 与
+    /// <see cref="HttpResponse.BodyLength"/> 据此工作。适合图片、
+    /// 字体等二进制资源的下载；文本响应照常可用 body 读取。</summary>
+    async HttpResponse SendBytesAsync(string method, string path, string body) {
+        if (this.useTls) {
+            HttpResponse tResp = await this.SendBytesTlsAsync(method, path,
+                                                              body);
+            return tResp;
+        }
+        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
+                                                     this.timeout);
+        if (conn == null) { FailConnect(); }
+        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
+        string req = this.BuildRequest(method, path, body, true);
+        int _sent = await conn.SendAsync(req);
+        HttpFramer fr = HttpFramer.Create(conn.Sock());
+        int he = await fr.ReadHead(65536);
+        if (he == 0) {
+            bool lateHead = HttpDeadline.Expired(watch);
+            HttpDeadline.Disarm(watch);
+            fr.Dispose();
+            conn.Close();
+            req = "";
+            if (lateHead) { FailTimeout(); }
+            throw new HttpRequestException(
+                "connection closed before a response arrived");
+        }
+        if (he < 0) {
+            HttpDeadline.Disarm(watch);
+            fr.Dispose();
+            conn.Close();
+            req = "";
+            throw new HttpRequestException(
+                "response header block exceeds 65536 bytes");
+        }
+        string head = fr.Head(he);
+        HttpResponse resp = HttpResponse.Parse(head);
+        HttpRequest hp = HttpRequest.Parse(head, he);
+        bool noBody = resp.statusCode == 204 || resp.statusCode == 304
+            || method == "HEAD";
+        if (!noBody) {
+            if (hp.chunked || HttpClient.HeadHasContentLength(head)) {
+                int st = await fr.ReadBody(hp, 67108864);
+                if (st == -1) {
+                    bool lateBody = HttpDeadline.Expired(watch);
+                    HttpDeadline.Disarm(watch);
+                    fr.Dispose();
+                    conn.Close();
+                    req = "";
+                    head = "";
+                    if (lateBody) { FailTimeout(); }
+                    throw new HttpRequestException(
+                        "connection closed in the middle of the response body");
+                }
+                if (st == 413) {
+                    HttpDeadline.Disarm(watch);
+                    fr.Dispose();
+                    conn.Close();
+                    req = "";
+                    head = "";
+                    throw new HttpRequestException(
+                        "response body exceeds 67108864 bytes");
+                }
+                if (st != 0) {
+                    HttpDeadline.Disarm(watch);
+                    fr.Dispose();
+                    conn.Close();
+                    req = "";
+                    head = "";
+                    throw new HttpRequestException(
+                        "malformed chunked response body");
+                }
+                // ReadBody 按精确字节数把正文放进 hp.body，内嵌 NUL
+                // 原样保留；按下标显式复制，绝不过 strlen。
+                int n = hp.bodyLength;
+                byte[] outb = new byte[n + 1];
+                for (int i = 0; i < n; i = i + 1) {
+                    outb[i] = (byte)(hp.body[i] & 255);
+                }
+                resp.bodyBytes = outb;
+                resp.bodyBytesLen = n;
+                // 文本调用方继续走 body：NUL 保留在缓冲里，strlen 只在
+                // 二进制正文上会变短，而那类正文以 bodyBytes 为准。
+                resp.body = hp.body;
+            } else {
+                // 没有 Content-Length 也没有分块：EOF 定界，读到对端
+                // 关闭为止，按字节累积。
+                ByteBuffer acc = ByteBuffer.Alloc(8192);
+                int pend = fr.Pending();
+                if (pend > he) {
+                    acc.WriteRaw(fr.Slice(he, pend - he), pend - he);
+                }
+                fr.Consume(pend);
+                while (!fr.Closed()) {
+                    int nb = await fr.Fill();
+                    if (nb > 0) {
+                        acc.WriteRaw(fr.Slice(0, nb), nb);
+                        fr.Consume(nb);
+                    }
+                }
+                int total = acc.Length();
+                byte[] oute = new byte[total + 1];
+                for (int i = 0; i < total; i = i + 1) {
+                    oute[i] = (byte)acc.ByteAt(i);
+                }
+                resp.body = acc.ToStr();
+                acc.Free();
+                resp.bodyBytes = oute;
+                resp.bodyBytesLen = total;
+            }
+        }
+        bool late = HttpDeadline.Expired(watch);
+        HttpDeadline.Disarm(watch);
+        fr.Dispose();
+        conn.Close();
+        req = "";
+        if (late) {
+            head = "";
+            FailTimeout();
+        }
+        this.AbsorbCookies(path, head);
+        head = "";
+        return resp;
+    }
+
+    // SendBytesAsync 的 TLS 变体：握手与一次性通道一致，只是读取
+    // 走 HttpFramer.CreateTls（TlsStream.RecvIntoAsync 同样给出
+    // 精确字节数）。
+    async HttpResponse SendBytesTlsAsync(string method, string path,
+                                         string body) {
+        Socket.Initialize();
+        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
+                                                     this.timeout);
+        if (conn == null) { FailConnect(); }
+        TlsContext ctx;
+        if (this.clientCertificateFile.Length > 0
+            && this.clientPrivateKeyFile.Length > 0) {
+            ctx = TlsContext.CreateClientWithCertificate(
+                this.clientCertificateFile, this.clientPrivateKeyFile);
+        } else {
+            ctx = TlsContext.CreateClient();
+        }
+        if (ctx != null && this.certPolicy != null) {
+            ctx.SetCertPolicy(this.certPolicy);
+        }
+        if (ctx == null) {
+            conn.Close();
+            string tlsError = TlsStream.LastError();
+            if (tlsError == "") { tlsError = "TLS 上下文初始化失败"; }
+            throw new HttpRequestException(tlsError);
+        }
+        if (!this.verifyTls) {
+            ctx.DisableVerify();
+        }
+        this.ApplyPinning(ctx);
+        TlsStream stream = await TlsStream.ConnectAsync(ctx, conn.Sock(),
+                                                       this.host);
+        if (stream == null) {
+            conn.Close();
+            ctx.Free();
+            string tlsHandshakeError = TlsStream.LastError();
+            if (tlsHandshakeError == "") {
+                tlsHandshakeError = "TLS 握手失败";
+            }
+            throw new HttpRequestException(tlsHandshakeError);
+        }
+        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
+        string req = this.BuildRequest(method, path, body, true);
+        int _sent = await stream.SendAsync(req, req.Length);
+        HttpFramer fr = HttpFramer.CreateTls(stream);
+        int he = await fr.ReadHead(65536);
+        if (he == 0) {
+            bool lateHead = HttpDeadline.Expired(watch);
+            HttpDeadline.Disarm(watch);
+            fr.Dispose();
+            stream.Close();
+            conn.Close();
+            ctx.Free();
+            req = "";
+            if (lateHead) { FailTimeout(); }
+            throw new HttpRequestException(
+                "connection closed before a response arrived");
+        }
+        if (he < 0) {
+            HttpDeadline.Disarm(watch);
+            fr.Dispose();
+            stream.Close();
+            conn.Close();
+            ctx.Free();
+            req = "";
+            throw new HttpRequestException(
+                "response header block exceeds 65536 bytes");
+        }
+        string head = fr.Head(he);
+        HttpResponse resp = HttpResponse.Parse(head);
+        HttpRequest hp = HttpRequest.Parse(head, he);
+        bool noBody = resp.statusCode == 204 || resp.statusCode == 304
+            || method == "HEAD";
+        if (!noBody) {
+            if (hp.chunked || HttpClient.HeadHasContentLength(head)) {
+                int st = await fr.ReadBody(hp, 67108864);
+                if (st == -1) {
+                    bool lateBody = HttpDeadline.Expired(watch);
+                    HttpDeadline.Disarm(watch);
+                    fr.Dispose();
+                    stream.Close();
+                    conn.Close();
+                    ctx.Free();
+                    req = "";
+                    head = "";
+                    if (lateBody) { FailTimeout(); }
+                    throw new HttpRequestException(
+                        "connection closed in the middle of the response body");
+                }
+                if (st == 413) {
+                    HttpDeadline.Disarm(watch);
+                    fr.Dispose();
+                    stream.Close();
+                    conn.Close();
+                    ctx.Free();
+                    req = "";
+                    head = "";
+                    throw new HttpRequestException(
+                        "response body exceeds 67108864 bytes");
+                }
+                if (st != 0) {
+                    HttpDeadline.Disarm(watch);
+                    fr.Dispose();
+                    stream.Close();
+                    conn.Close();
+                    ctx.Free();
+                    req = "";
+                    head = "";
+                    throw new HttpRequestException(
+                        "malformed chunked response body");
+                }
+                int n = hp.bodyLength;
+                byte[] outb = new byte[n + 1];
+                for (int i = 0; i < n; i = i + 1) {
+                    outb[i] = (byte)(hp.body[i] & 255);
+                }
+                resp.bodyBytes = outb;
+                resp.bodyBytesLen = n;
+                // 文本调用方继续走 body：NUL 保留在缓冲里，strlen 只在
+                // 二进制正文上会变短，而那类正文以 bodyBytes 为准。
+                resp.body = hp.body;
+            } else {
+                ByteBuffer acc = ByteBuffer.Alloc(8192);
+                int pend = fr.Pending();
+                if (pend > he) {
+                    acc.WriteRaw(fr.Slice(he, pend - he), pend - he);
+                }
+                fr.Consume(pend);
+                while (!fr.Closed()) {
+                    int nb = await fr.Fill();
+                    if (nb > 0) {
+                        acc.WriteRaw(fr.Slice(0, nb), nb);
+                        fr.Consume(nb);
+                    }
+                }
+                int total = acc.Length();
+                byte[] oute = new byte[total + 1];
+                for (int i = 0; i < total; i = i + 1) {
+                    oute[i] = (byte)acc.ByteAt(i);
+                }
+                resp.body = acc.ToStr();
+                acc.Free();
+                resp.bodyBytes = oute;
+                resp.bodyBytesLen = total;
+            }
+        }
+        bool late = HttpDeadline.Expired(watch);
+        HttpDeadline.Disarm(watch);
+        fr.Dispose();
+        stream.Close();
+        conn.Close();
+        ctx.Free();
+        req = "";
+        if (late) {
+            head = "";
+            FailTimeout();
+        }
+        this.AbsorbCookies(path, head);
+        head = "";
+        return resp;
     }
 
     /// <summary>发送 GET 请求并返回响应体。</summary>
@@ -680,7 +1298,7 @@ class HttpClient {
         }
 
         int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
-        string requestData = BuildRequest("POST", path, body);
+        string requestData = BuildRequest("POST", path, body, true);
         if (this.useTls) {
             int _s = await stream.SendAsync(requestData, requestData.Length);
         } else {

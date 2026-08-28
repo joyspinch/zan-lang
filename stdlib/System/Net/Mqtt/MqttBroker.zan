@@ -17,6 +17,7 @@ class MqttSession {
     List<string> filters;
     List<int> qos;
     bool alive;
+    bool connected;
     int connectedAt;
     int keepAlive;
     int msgsIn;
@@ -30,6 +31,7 @@ class MqttSession {
         this.filters = new List<string>();
         this.qos = new List<int>();
         this.alive = true;
+        this.connected = false;
         this.connectedAt = 0;
         this.keepAlive = 0;
         this.msgsIn = 0;
@@ -129,6 +131,10 @@ class MqttBroker {
     List<MqttSession> sessions;
     List<MqttTopicStat> topics;
     bool running;
+    // 监听句柄由 RunAsync 落到字段上，Stop 才能在 Windows 上先
+    // CancelIoEx 唤醒挂起的 accept 再关句柄（只置 running=false
+    // 的话，accept 协程带着整个 broker 对象链永远挂起）。
+    nint listenSock;
 
     int nextId;
     int startedAt;
@@ -149,6 +155,7 @@ class MqttBroker {
         this.sessions = new List<MqttSession>();
         this.topics = new List<MqttTopicStat>();
         this.running = false;
+        this.listenSock = -1;
         this.nextId = 0;
         this.startedAt = MqttBroker.Now();
         this.totalConnections = 0;
@@ -176,7 +183,8 @@ class MqttBroker {
 
     int Count() { return this.sessions.Count; }
 
-    /// <summary>绑定、监听并服务客户端。永不返回。</summary>
+    /// <summary>绑定、监听并服务客户端，直到 <see cref="Stop"/>
+    /// 被调用（Worker 集成里则随进程存活）。</summary>
     async void RunAsync() {
         Socket.Initialize();
         nint s = Socket.CreateTcp();
@@ -189,6 +197,7 @@ class MqttBroker {
         }
         Socket.Listen(s, 511);
         Socket.SetNonBlocking(s);
+        this.listenSock = s;
         this.running = true;
         Console.WriteLine("[MqttBroker] listening on mqtt://" + this.host + ":"
             + Convert.ToString(this.port));
@@ -199,6 +208,11 @@ class MqttBroker {
                 Task.Spawn(this.HandleConnection(c));
             }
         }
+        // Stop() 已关句柄（或调用方放弃）：accept 以 -1 复位后到这里。
+        if (this.listenSock >= 0) {
+            this.listenSock = -1;
+            Socket.Close(s);
+        }
     }
 
     // ---- 帧解析（二进制安全的读取；理由见 MqttClient） ----
@@ -208,12 +222,14 @@ class MqttBroker {
         while (true) {
             await Socket.ReadReady(sock);
             int n = Socket.Recv(sock, b, 1);
-            if (n == 0) { return -1; }
-            if (n > 0) {
-                return b[0] & 255;
+            if (n <= 0) {
+                // 0 = 对端关闭；<0 = 套接字已死（RST 等）。两者都
+                // 结束本会话：死套接字永远"可读"，重试只会让
+                // 协程原地空转，会话对象也永远不清账。
+                return -1;
             }
+            return b[0] & 255;
         }
-        return -1;
     }
 
     async byte[] ReadBytesAsync(nint sock, int need) {
@@ -419,7 +435,11 @@ class MqttBroker {
             MqttSession sess = this.sessions[i];
             if (sess.clientId == clientId) {
                 sess.alive = false;
-                Socket.Close(sess.sock);
+                // shutdown 而非 close：直接关闭描述符会让停靠在该
+                // 套接字上的属主协程永远无法恢复（见 Socket.ShutdownBoth
+                // 的说明）。属主协程在 EOF 后自行把会话从表里摘除
+                // 并关闭 fd。
+                Socket.ShutdownBoth(sess.sock);
                 this.sessions.RemoveAt(i);
                 return true;
             }
@@ -551,6 +571,10 @@ class MqttBroker {
             int packetType = (b0 >> 4) & 15;
 
             if (packetType == MqttPacketType.CONNECT) {
+                // MQTT 禁止同一条连接发第二条 CONNECT——按协议错误断连，
+                // 否则同一会话对象会被重复加入会话表。
+                if (sess.connected) { break; }
+                sess.connected = true;
                 // 可变头：协议名（2+4）+ 级别（1）+ 标志（1）+
                 // 保活（2）= 10 字节；然后是客户端 id（2 + n）。
                 if (remainLen >= 12) {
@@ -563,6 +587,17 @@ class MqttBroker {
                 if (sess.clientId.Length == 0) {
                     sess.clientId = "anon-" + Convert.ToString(sess.id);
                 }
+                // 同一 clientId 的旧会话还在表里（客户端未发 DISCONNECT
+                // 就重连）：shutdown 旧套接字让其属主协程走 EOF 清理路径，
+                // 直接 close 会让那个协程永远无法恢复（见 Socket.ShutdownBoth）。
+                for (int s = this.sessions.Count - 1; s >= 0; s = s - 1) {
+                    MqttSession old = this.sessions[s];
+                    if (old != sess && old.clientId == sess.clientId) {
+                        old.alive = false;
+                        Socket.ShutdownBoth(old.sock);
+                        this.sessions.RemoveAt(s);
+                    }
+                }
                 this.totalConnections = this.totalConnections + 1;
                 this.sessions.Add(sess);
                 byte[] connack = new byte[4];
@@ -572,10 +607,18 @@ class MqttBroker {
                 connack[3] = 0;   // 已接受
                 int _c = await Socket.SendAsync(sock, connack, 4);
             } else if (packetType == MqttPacketType.PUBLISH) {
+                // 变头最少 2 字节主题长度；畸形包按协议直接断连
+                //（此前 remainLen==0 时 body 是 1 字节缓冲，
+                // body[0] 直接越界崩溃——公网 broker 一个坏包打死进程）。
+                if (remainLen < 2) { break; }
                 int qos = (b0 >> 1) & 3;
                 int topicLen = ((body[0] & 255) << 8) + (body[1] & 255);
-                string topic = body.ToStr(2, topicLen);
                 int offset = 2 + topicLen;
+                // 主题必须落在报文内且非空；QoS>0 时其后还有
+                // 2 字节包标识。越界即协议错误。
+                if (topicLen <= 0 || offset > remainLen
+                        || (qos > 0 && offset + 2 > remainLen)) { break; }
+                string topic = body.ToStr(2, topicLen);
                 int pid = 0;
                 if (qos > 0) {
                     pid = ((body[offset] & 255) << 8) + (body[offset + 1] & 255);
@@ -597,13 +640,19 @@ class MqttBroker {
                     int _a = await Socket.SendAsync(sock, puback, 4);
                 }
             } else if (packetType == MqttPacketType.SUBSCRIBE) {
+                if (remainLen < 2) { break; }   // 包标识 2 字节
                 int pid = ((body[0] & 255) << 8) + (body[1] & 255);
                 // 主题过滤器：（2 字节长度 + 过滤器 + 1 字节 qos）*
                 int offset = 2;
                 List<int> grantedQos = new List<int>();
+                bool malformed = false;
                 while (offset + 2 < remainLen) {
                     int fLen = ((body[offset] & 255) << 8) + (body[offset + 1] & 255);
                     offset = offset + 2;
+                    // 过滤器与其后的 qos 字节都必须落在报文内：
+                    // 此前 fLen 可由攻击者设为任意值，body[offset]
+                    // 读到缓冲外直接崩溃。
+                    if (offset + fLen + 1 > remainLen) { malformed = true; break; }
                     string filter = body.ToStr(offset, fLen);
                     offset = offset + fLen;
                     int reqQos = body[offset] & 255;
@@ -613,6 +662,7 @@ class MqttBroker {
                     sess.qos.Add(reqQos);
                     grantedQos.Add(reqQos);
                 }
+                if (malformed) { break; }
                 int ackLen = 4 + grantedQos.Count;
                 byte[] suback = new byte[ackLen + 1];
                 suback[0] = (byte)(MqttPacketType.SUBACK << 4);
@@ -624,11 +674,14 @@ class MqttBroker {
                 }
                 int _s = await Socket.SendAsync(sock, suback, ackLen);
             } else if (packetType == MqttPacketType.UNSUBSCRIBE) {
+                if (remainLen < 2) { break; }   // 包标识 2 字节
                 int pid = ((body[0] & 255) << 8) + (body[1] & 255);
                 int offset = 2;
+                bool malformed = false;
                 while (offset + 2 <= remainLen) {
                     int fLen = ((body[offset] & 255) << 8) + (body[offset + 1] & 255);
                     offset = offset + 2;
+                    if (offset + fLen > remainLen) { malformed = true; break; }
                     string filter = body.ToStr(offset, fLen);
                     offset = offset + fLen;
                     int k = 0;
@@ -641,6 +694,7 @@ class MqttBroker {
                         }
                     }
                 }
+                if (malformed) { break; }
                 byte[] unsuback = new byte[5];
                 unsuback[0] = (byte)(MqttPacketType.UNSUBACK << 4);
                 unsuback[1] = 2;
@@ -669,5 +723,14 @@ class MqttBroker {
 
     void Stop() {
         this.running = false;
+        if (this.listenSock >= 0) {
+            #if WINDOWS
+            // CancelIoEx 必须先于关句柄：closesocket 不会给挂起的
+            // AcceptEx 投递完成包，accept 协程会永远挂起。
+            Socket.ShutdownBoth(this.listenSock);
+            #endif
+            Socket.Close(this.listenSock);
+            this.listenSock = -1;
+        }
     }
 }

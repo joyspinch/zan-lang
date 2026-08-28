@@ -1,4 +1,5 @@
-// Conformance: signature-bound actions and the [Tx] transaction scope.
+// Conformance: signature-bound actions, [Opt] optional parameters, form→object
+// binding, and the [Tx] transaction scope.
 //
 //   1. a typed action parameter is read and converted by the generated
 //      trampoline -- the action sees an int, not a raw string;
@@ -6,7 +7,13 @@
 //      trampoline answers the uniform 400/0003 before the first statement;
 //   3. the same names feed the route's documented parameters;
 //   4. [Tx] wraps the action in __TxBegin/__TxCommit, and a Fail() inside
-//      the action rolls back before the ApiError answer goes out.
+//      the action rolls back before the ApiError answer goes out;
+//   5. [Opt("name=default")] turns a signature parameter optional: missing
+//      reads the declared default, and the docs carry required=false + the
+//      default (parameters not named in [Opt] stay required);
+//   6. a class-typed parameter is bound field by field from the request:
+//      present fields are set, absent ones keep their initializers, and the
+//      route documents the primitive fields as optional form parameters.
 //
 // The generated trampolines are invoked directly on a hand-parsed context:
 // no sockets, so the leak-check twins stay meaningful (a parked accept
@@ -64,6 +71,35 @@ class DocController : Controller {
     override async bool __TxBegin() { TxLog.Push("begin"); return true; }
     override async void __TxCommit() { TxLog.Push("commit"); }
     override async void __TxRollback() { TxLog.Push("rollback"); }
+}
+
+/// Form-binding shape: parameterless construction, primitive fields.
+/// String fields carry initializers so an absent field is never null.
+class ItemForm {
+    string sku = "";
+    int qty;
+    string note = "none";
+    double weight;
+}
+
+[Route("/api/items")]
+class ItemController : Controller {
+    [HttpGet]
+    [Opt("page=1", "kw=")]
+    [Description("浏览")]
+    void Browse(int page, int limit, string kw) {
+        this.Ok("{\"page\":" + Convert.ToString(page)
+            + ",\"limit\":" + Convert.ToString(limit)
+            + ",\"kw\":\"" + kw + "\"}");
+    }
+
+    [HttpPost]
+    [Description("保存")]
+    void Save(ItemForm f) {
+        this.Ok("{\"sku\":\"" + f.sku + "\",\"qty\":"
+            + Convert.ToString(f.qty) + ",\"note\":\"" + f.note
+            + "\",\"weight\":" + Convert.ToString(f.weight) + "}");
+    }
 }
 
 class Program {
@@ -148,6 +184,79 @@ class Program {
         Program.Check(p6.IndexOf("400 Bad") >= 0, "tx failure answers 400");
         Program.Check(TxLog.Joined() == "begin,action:box:-1,rollback",
             "tx rollback order");
+
+        // 7. [Opt] parameters: given values used, missing ones take the
+        //    declared defaults -- no 400.
+        HttpContext c7 = Program.Ctx("GET", "/api/items/browse?limit=10&page=7&kw=ab");
+        await Task.WhenAll(await Program.Call(
+            Task.Spawn(__AttrRoutes.__h_ItemController_Browse(c7))));
+        string p7 = c7.BuildResponse(true);
+        Program.Check(p7.IndexOf("200 OK") >= 0, "opt params answer 200");
+        Program.Check(p7.IndexOf("\"page\":7") >= 0, "opt given value wins");
+        Program.Check(p7.IndexOf("\"kw\":\"ab\"") >= 0, "opt string given");
+
+        HttpContext c8 = Program.Ctx("GET", "/api/items/browse?limit=10");
+        await Task.WhenAll(await Program.Call(
+            Task.Spawn(__AttrRoutes.__h_ItemController_Browse(c8))));
+        string p8 = c8.BuildResponse(true);
+        Program.Check(p8.IndexOf("200 OK") >= 0, "opt missing answers 200");
+        Program.Check(p8.IndexOf("\"page\":1") >= 0, "opt int default used");
+        Program.Check(p8.IndexOf("\"kw\":\"\"") >= 0, "opt string default used");
+
+        // 8. A parameter not named in [Opt] stays required.
+        HttpContext c9 = Program.Ctx("GET", "/api/items/browse");
+        await Task.WhenAll(await Program.Call(
+            Task.Spawn(__AttrRoutes.__h_ItemController_Browse(c9))));
+        string p9 = c9.BuildResponse(true);
+        Program.Check(p9.IndexOf("400 Bad") >= 0
+            && p9.IndexOf("\"0003\"") >= 0,
+            "non-opt param still required");
+
+        // 9. Docs: optional params carry required=false + their default.
+        Route browse = null;
+        Route save = null;
+        for (int i = 0; i < routes.Count; i = i + 1) {
+            if (routes[i].pattern == "/api/items/browse") { browse = routes[i]; }
+            if (routes[i].pattern == "/api/items/save") { save = routes[i]; }
+        }
+        Program.Check(browse != null && browse.docParams.Count == 3
+            && browse.docParams[0].Name() == "page"
+            && !browse.docParams[0].Required()
+            && browse.docParams[0].Default() == "1"
+            && browse.docParams[1].Name() == "limit"
+            && browse.docParams[1].Required()
+            && !browse.docParams[2].Required()
+            && browse.docParams[2].Default() == "",
+            "opt params documented with defaults");
+
+        // 10. Form→object: present fields bound, absent keep initializers.
+        HttpContext c10 = Program.Ctx("POST", "/api/items/save?sku=box&qty=3");
+        await Task.WhenAll(await Program.Call(
+            Task.Spawn(__AttrRoutes.__h_ItemController_Save(c10))));
+        string p10 = c10.BuildResponse(true);
+        Program.Check(p10.IndexOf("200 OK") >= 0, "form object answers 200");
+        Program.Check(p10.IndexOf("\"sku\":\"box\"") >= 0
+            && p10.IndexOf("\"qty\":3") >= 0,
+            "form fields bound by name");
+        Program.Check(p10.IndexOf("\"note\":\"none\"") >= 0,
+            "absent field keeps initializer");
+
+        HttpContext c11 = Program.Ctx("POST", "/api/items/save?sku=pen");
+        await Task.WhenAll(await Program.Call(
+            Task.Spawn(__AttrRoutes.__h_ItemController_Save(c11))));
+        string p11 = c11.BuildResponse(true);
+        Program.Check(p11.IndexOf("\"qty\":0") >= 0
+            && p11.IndexOf("\"weight\":0") >= 0,
+            "absent numeric fields stay zero");
+
+        // 11. Docs: primitive fields become optional form parameters.
+        Program.Check(save != null && save.docParams.Count == 4
+            && save.docParams[0].Name() == "sku"
+            && save.docParams[0].Source() == "form"
+            && !save.docParams[0].Required()
+            && save.docParams[3].Name() == "weight"
+            && save.docParams[3].Type() == "double",
+            "form fields documented as optional form params");
 
         TxLog.Drop();
         Console.WriteLine("failures=" + Convert.ToString(Program.failures));

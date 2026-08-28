@@ -129,12 +129,48 @@ class MqttClient {
             }
             encoded = await ReadByteAsync();
             if (encoded < 0) {
-                return acc;
+                // varint 中途对端关闭：把不完整的累计值当成功
+                // 返回会让上层把残包当真报文解析。
+                this.connected = false;
+                return -1;
             }
             acc = acc + (encoded & 127) * multiplier;
             multiplier = multiplier * 128;
         }
         return acc;
+    }
+
+    /// <summary>MQTT "remaining length" varint 编码所需的字节数（1-4）。</summary>
+    static int RemainLenBytes(int remainLen) {
+        int n = 1;
+        int rl = remainLen >> 7;
+        while (rl > 0) {
+            n = n + 1;
+            rl = rl >> 7;
+        }
+        return n;
+    }
+
+    /// <summary>把 "remaining length" 编码为 MQTT varint 写入
+    /// <paramref name="packet"/> 的 <paramref name="offset"/> 处，
+    /// 返回写入的字节数（1-4）。此前各报文构建器把 remainLen
+    /// 截进单字节，报文一旦超过 127 字节就违反协议、让 broker
+    /// 端的 varint 解码从此错位。</summary>
+    static int WriteRemainLen(byte[] packet, int offset, int remainLen) {
+        int rl = remainLen;
+        int written = 0;
+        while (true) {
+            int digit = rl & 127;
+            rl = rl >> 7;
+            if (rl > 0) {
+                packet[offset + written] = (byte)(digit | 128);
+            } else {
+                packet[offset + written] = (byte)digit;
+                break;
+            }
+            written = written + 1;
+        }
+        return written + 1;
     }
 
     /// <summary>读取并丢弃一个完整控制报文（如 SUBACK / PUBACK），
@@ -165,7 +201,7 @@ class MqttClient {
         if (mqtt.conn == null) { return mqtt; }
 
         byte[] packet = mqtt.BuildConnectPacket();
-        int sent = await mqtt.conn.SendBytesAsync(packet, mqtt.CalcConnectLen());
+        int sent = await mqtt.conn.SendBytesAsync(packet, packet.Length);
 
         // CONNACK：固定头（2 字节）+ 可变头（2 字节）；
         // body 的第 2 字节为连接返回码（0 = 已接受）。
@@ -198,12 +234,11 @@ class MqttClient {
             remainLen = remainLen + 2;
         }
 
-        byte[] packet = new byte[remainLen + 2];
+        byte[] packet = new byte[1 + MqttClient.RemainLenBytes(remainLen) + remainLen];
         int offset = 0;
         packet[offset] = (byte)(byte0);
         offset = offset + 1;
-        packet[offset] = (byte)(remainLen);
-        offset = offset + 1;
+        offset = offset + MqttClient.WriteRemainLen(packet, offset, remainLen);
 
         packet[offset] = (byte)((topicLen >> 8) & 255);
         offset = offset + 1;
@@ -249,13 +284,12 @@ class MqttClient {
         this.nextPacketId = this.nextPacketId + 1;
 
         int remainLen = 2 + 2 + topicLen + 1;
-        byte[] packet = new byte[remainLen + 2];
+        byte[] packet = new byte[1 + MqttClient.RemainLenBytes(remainLen) + remainLen];
         int offset = 0;
 
         packet[offset] = (byte)((MqttPacketType.SUBSCRIBE << 4) + 2);
         offset = offset + 1;
-        packet[offset] = (byte)(remainLen);
-        offset = offset + 1;
+        offset = offset + MqttClient.WriteRemainLen(packet, offset, remainLen);
 
         packet[offset] = (byte)((pid >> 8) & 255);
         offset = offset + 1;
@@ -288,13 +322,12 @@ class MqttClient {
         this.nextPacketId = this.nextPacketId + 1;
 
         int remainLen = 2 + 2 + topicLen;
-        byte[] packet = new byte[remainLen + 2];
+        byte[] packet = new byte[1 + MqttClient.RemainLenBytes(remainLen) + remainLen];
         int offset = 0;
 
         packet[offset] = (byte)((MqttPacketType.UNSUBSCRIBE << 4) + 2);
         offset = offset + 1;
-        packet[offset] = (byte)(remainLen);
-        offset = offset + 1;
+        offset = offset + MqttClient.WriteRemainLen(packet, offset, remainLen);
 
         packet[offset] = (byte)((pid >> 8) & 255);
         offset = offset + 1;
@@ -320,37 +353,53 @@ class MqttClient {
     /// 在 IO reactor 上挂起直到数据到达。对 broker 的
     /// PINGREQ 透明响应，并继续等待真正的消息。</summary>
     async string ReceiveAsync() {
-        int byte0 = await ReadByteAsync();
-        if (byte0 < 0) {
-            this.connected = false;
-            return "";
-        }
-        int remainLen = await ReadRemainingLenAsync();
-        byte[] body = await ReadBytesAsync(remainLen);
+        // 循环而非递归：恶意 broker 连发 PINGREQ 会把
+        // 递归版本的协程栈打穿。
+        while (true) {
+            int byte0 = await ReadByteAsync();
+            if (byte0 < 0) {
+                this.connected = false;
+                return "";
+            }
+            int remainLen = await ReadRemainingLenAsync();
+            if (remainLen < 0) {
+                this.connected = false;
+                return "";
+            }
+            byte[] body = await ReadBytesAsync(remainLen);
 
-        int packetType = (byte0 >> 4) & 15;
+            int packetType = (byte0 >> 4) & 15;
 
-        if (packetType == MqttPacketType.PUBLISH) {
-            // 请求体：主题长度（2）+ 主题 + [qos>0 时的报文 id（2）] + 负载
-            int topicLen = ((body[0] & 255) << 8) + (body[1] & 255);
-            int offset = 2 + topicLen;
+            if (packetType == MqttPacketType.PUBLISH) {
+                // 请求体：主题长度（2）+ 主题 + [qos>0 时的报文 id（2）] + 负载
+                if (remainLen < 2) { return ""; }
+                int topicLen = ((body[0] & 255) << 8) + (body[1] & 255);
+                int offset = 2 + topicLen;
 
-            int qos = (byte0 >> 1) & 3;
-            if (qos > 0) {
-                offset = offset + 2;
+                int qos = (byte0 >> 1) & 3;
+                if (qos > 0) {
+                    offset = offset + 2;
+                }
+
+                // 主题/包标识越界说明对端错位（或恶意）：
+                // 此时流已不可信，断开并返回空。
+                if (offset > remainLen) {
+                    this.connected = false;
+                    return "";
+                }
+
+                int payloadLen = remainLen - offset;
+                return body.ToStr(offset, payloadLen);
+            } else if (packetType == MqttPacketType.PINGREQ) {
+                byte[] pong = new byte[2];
+                pong[0] = (byte)(MqttPacketType.PINGRESP << 4);
+                pong[1] = 0;
+                int sent = await this.conn.SendBytesAsync(pong, 2);
+                continue;
             }
 
-            int payloadLen = remainLen - offset;
-            return body.ToStr(offset, payloadLen);
-        } else if (packetType == MqttPacketType.PINGREQ) {
-            byte[] pong = new byte[2];
-            pong[0] = (byte)(MqttPacketType.PINGRESP << 4);
-            pong[1] = 0;
-            int sent = await this.conn.SendBytesAsync(pong, 2);
-            return await ReceiveAsync();
+            return body.ToStr(0, remainLen);
         }
-
-        return body.ToStr(0, remainLen);
     }
 
     /// <summary>发送 PINGREQ 保活，在 IO reactor 上挂起。
@@ -383,13 +432,12 @@ class MqttClient {
         int clientIdLen = (int)strlen(this.clientId);
         int remainLen = 10 + 2 + clientIdLen;
 
-        byte[] packet = new byte[remainLen + 2];
+        byte[] packet = new byte[1 + MqttClient.RemainLenBytes(remainLen) + remainLen];
         int offset = 0;
 
         packet[offset] = (byte)(MqttPacketType.CONNECT << 4);
         offset = offset + 1;
-        packet[offset] = (byte)(remainLen);
-        offset = offset + 1;
+        offset = offset + MqttClient.WriteRemainLen(packet, offset, remainLen);
 
         packet[offset] = 0;
         offset = offset + 1;
@@ -426,10 +474,5 @@ class MqttClient {
         }
 
         return packet;
-    }
-
-    int CalcConnectLen() {
-        int clientIdLen = (int)strlen(this.clientId);
-        return 2 + 10 + 2 + clientIdLen;
     }
 }

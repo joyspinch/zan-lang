@@ -149,7 +149,7 @@ class GenRoute {
     static bool AttrIsStructural(string n) {
         if (GenRoute.AttrHttpVerb(n).Length > 0) { return true; }
         if (n == "Route" || n == "ApiController" || n == "NonAction" ||
-            n == "Tx" ||
+            n == "Tx" || n == "Opt" ||
             n == "Description" || n == "AttributeUsage" ||
             n == "DllImport" || n == "StructLayout" || n == "Obsolete") {
             return true;
@@ -164,6 +164,27 @@ class GenRoute {
             if (attrs.At(i).Str("name", "") == nm) { return true; }
         }
         return false;
+    }
+
+    /// 属性类上 <name>(...) 的全部字符串字面量参数;无则空表。
+    static List<string> AttrStringArgs(JsonValue d, string nm) {
+        List<string> outp = new List<string>();
+        JsonValue attrs = d.Get("attrs");
+        if (attrs == null || !attrs.IsArray()) { return outp; }
+        for (int i = 0; i < attrs.Count(); i = i + 1) {
+            JsonValue a = attrs.At(i);
+            if (a.Str("name", "") != nm) { continue; }
+            JsonValue args = a.Get("args");
+            if (args == null || !args.IsArray()) { return outp; }
+            for (int j = 0; j < args.Count(); j = j + 1) {
+                JsonValue a0 = args.At(j);
+                if (a0.Str("k", "") == "lit" && a0.Str("t", "") == "str") {
+                    outp.Add(a0.Str("v", ""));
+                }
+            }
+            return outp;
+        }
+        return outp;
     }
 
     /// 属性类上第一个 <name>(...) 的字符串参数;无则 ""。
@@ -817,8 +838,9 @@ class GenRoute {
             }
 
             /* 支持的形状:0 参数、单个 HttpContext 参数,或实例 action 的
-             * 全基元签名(string/int/long/double/bool)——后者由蹦床按
-             * 签名从请求绑定,action 体里不再手写 In() 拉取。 */
+             * 全可绑定签名(string/int/long/double/bool,或可表单化的
+             * 类)——后者由蹦床按签名从请求绑定:基元逐参数,类参数
+             * new 出来后按字段名逐字段(action 体里不再手写 In() 拉取)。 */
             JsonValue ps = m.Get("params");
             int np = ps != null ? ps.Count() : 0;
             bool ctxParam = false;
@@ -872,21 +894,68 @@ class GenRoute {
             bool tx = !isStatic && (GenRoute.AttrNamed(m, "Tx") ||
                                     GenRoute.AttrNamed(cls, "Tx"));
             /* 签名参数绑定:类型化 action 的实参在蹦床里生成,缺失或
-             * 非法都在进 action 前以统一的 ApiError(400) 应答。 */
+             * 非法都在进 action 前以统一的 ApiError(400) 应答;
+             * [Opt("名=默认")] 点名的参数改为缺省读,类参数按字段
+             * 逐个绑定(请求未携带的字段保留声明时的初始值)。 */
             List<string> bindLines = new List<string>();
-            List<string> bindNames = new List<string>();
-            List<string> bindTypes = new List<string>();
+            List<string> docName = new List<string>();
+            List<string> docType = new List<string>();
+            List<bool> docReq = new List<bool>();
+            List<string> docDef = new List<string>();
+            List<string> docWhere = new List<string>();
+            Dict<string, string> opts = GenRoute.OptArgs(m);
             if (bindable) {
                 arg = "";
                 for (int pi = 0; pi < np; pi = pi + 1) {
                     string pt = ps.At(pi).Str("type", "");
                     string pn = ps.At(pi).Str("name", "");
-                    bindTypes.Add(pt);
-                    bindNames.Add(pn);
-                    bindLines.Add("                " +
-                                  GenRoute.BindLine(pt, pn) + "\n");
                     if (pi > 0) { arg = arg + ", "; }
                     arg = arg + pn;
+                    JsonValue fcls = GenRoute.FormClassOf(pt);
+                    if (fcls != null) {
+                        bindLines.Add("                " + pt + " " + pn +
+                                      " = new " + pt + "();\n");
+                        JsonValue fields = fcls.Get("fields");
+                        if (fields != null && fields.IsArray()) {
+                            for (int fi = 0; fi < fields.Count();
+                                 fi = fi + 1) {
+                                string ft = fields.At(fi).Str("type", "");
+                                string fn = fields.At(fi).Str("name", "");
+                                if (!GenRoute.BindableType(ft)) { continue; }
+                                string flabel = GenRoute.Esc(fn);
+                                bindLines.Add("                if (__c.HasIn(\""
+                                    + flabel + "\")) { " + pn + "." + fn
+                                    + " = " + GenRoute.InCall(ft, flabel, "")
+                                    + "; }\n");
+                                docName.Add(fn);
+                                docType.Add(ft);
+                                docReq.Add(false);
+                                docDef.Add("");
+                                docWhere.Add("form");
+                            }
+                        }
+                        continue;
+                    }
+                    if (opts.ContainsKey(pn)) {
+                        string def = "";
+                        string have = "";
+                        if (opts.TryGetValue(pn, out have)) { def = have; }
+                        bindLines.Add("                " +
+                            GenRoute.OptBindLine(pt, pn, def) + "\n");
+                        docName.Add(pn);
+                        docType.Add(pt);
+                        docReq.Add(false);
+                        docDef.Add(def);
+                        docWhere.Add("query");
+                        continue;
+                    }
+                    docName.Add(pn);
+                    docType.Add(pt);
+                    docReq.Add(true);
+                    docDef.Add("");
+                    docWhere.Add("query");
+                    bindLines.Add("                " +
+                                  GenRoute.BindLine(pt, pn) + "\n");
                 }
             }
 
@@ -962,15 +1031,16 @@ class GenRoute {
             GenRoute.PDef = new List<string>();
             GenRoute.PDesc = new List<string>();
             GenRoute.PWhere = new List<string>();
-            /* 签名绑定的参数先进文档表(必填、query 来源);随后
+            /* 签名绑定的参数进文档表(必填基元为 query 来源,[Opt] 带
+             * 默认值,类参数的基元字段为 form 来源且一律可选);随后
              * ScanCalls/ParamsFromPath 对同名项做"强声明合并"。 */
-            for (int si = 0; si < bindNames.Count; si = si + 1) {
-                GenRoute.PName.Add(bindNames[si]);
-                GenRoute.PType.Add(bindTypes[si]);
-                GenRoute.PRequired.Add(true);
-                GenRoute.PDef.Add("");
+            for (int si = 0; si < docName.Count; si = si + 1) {
+                GenRoute.PName.Add(docName[si]);
+                GenRoute.PType.Add(docType[si]);
+                GenRoute.PRequired.Add(docReq[si]);
+                GenRoute.PDef.Add(docDef[si]);
                 GenRoute.PDesc.Add("");
-                GenRoute.PWhere.Add("query");
+                GenRoute.PWhere.Add(docWhere[si]);
             }
             GenRoute.ScanCalls(cname, mname);
             GenRoute.ParamsFromPath(path);
@@ -996,10 +1066,12 @@ class GenRoute {
         return GenRoute.AttrHttpVerb(GenRoute.FirstVerbAttr(m));
     }
 
-    /// 参数类型能否由蹦床从请求绑定(string/int/long/double/bool)。
+    /// 参数类型能否由蹦床从请求绑定(string/int/long/double/bool,
+    /// 或本单元内可表单化的类)。
     static bool BindableParams(JsonValue ps) {
         for (int i = 0; i < ps.Count(); i = i + 1) {
-            if (!GenRoute.BindableType(ps.At(i).Str("type", ""))) {
+            string t = ps.At(i).Str("type", "");
+            if (!GenRoute.BindableType(t) && GenRoute.FormClassOf(t) == null) {
                 return false;
             }
         }
@@ -1010,6 +1082,107 @@ class GenRoute {
     static bool BindableType(string t) {
         return t == "string" || t == "int" || t == "long" ||
                t == "double" || t == "bool";
+    }
+
+    /* ---- 签名绑定:可选参数与表单→对象 ---- */
+
+    /// 参数类型指向的表单类:本单元已知、是 class、能以无参构造
+    /// (显式声明了无参构造,或根本没声明构造)。返回类 JSON,否则 null。
+    static JsonValue FormClassOf(string t) {
+        JsonValue cls = GenRoute.ClassGet(t);
+        if (cls == null) { return null; }
+        if (cls.Str("kind", "") != "class") { return null; }
+        JsonValue methods = cls.Get("methods");
+        bool hasCtor = false;
+        if (methods != null && methods.IsArray()) {
+            for (int i = 0; i < methods.Count(); i = i + 1) {
+                JsonValue m = methods.At(i);
+                if (!m.Bool("ctor", false)) { continue; }
+                hasCtor = true;
+                JsonValue cps = m.Get("params");
+                if (cps != null && cps.Count() == 0) { return cls; }
+            }
+        }
+        if (!hasCtor) { return cls; }
+        return null;
+    }
+
+    /// [Opt("page=1","kw=")]:可选签名参数 name → default。
+    static Dict<string, string> OptArgs(JsonValue m) {
+        Dict<string, string> opt = new Dict<string, string>();
+        List<string> args = GenRoute.AttrStringArgs(m, "Opt");
+        for (int i = 0; i < args.Count; i = i + 1) {
+            string a = args[i];
+            int eq = a.IndexOf("=");
+            string nm = eq >= 0 ? a.Substring(0, eq) : a;
+            string dv = eq >= 0 ? a.Substring(eq + 1) : "";
+            bool dup = false;
+            foreach (string have in opt.Keys) {
+                if (have == nm) { dup = true; break; }
+            }
+            if (!dup) { opt.Add(nm, dv); }
+        }
+        return opt;
+    }
+
+    /// In* 读表达式:string 走 In,其余带类型化默认。
+    static string InCall(string t, string label, string def) {
+        if (t == "int") {
+            return "__c.InInt(\"" + label + "\", " +
+                   Convert.ToString(GenRoute.Atoi(def)) + ")";
+        }
+        if (t == "long") {
+            return "__c.InLong(\"" + label + "\", " +
+                   Convert.ToString(GenRoute.Atoi(def)) + ")";
+        }
+        if (t == "double") {
+            return "__c.InDouble(\"" + label + "\", " +
+                   Convert.ToString(GenRoute.AtoD(def)) + ")";
+        }
+        if (t == "bool") {
+            return "__c.InBool(\"" + label + "\", " +
+                   (def == "true" ? "true" : "false") + ")";
+        }
+        return "__c.In(\"" + label + "\")";
+    }
+
+    /// 可选参数的绑定语句:[Opt("page=1")] 下的 `int page` 生成
+    /// `int page = __c.InInt("page", 1);`——缺失取默认值,不再 400。
+    static string OptBindLine(string t, string n, string def) {
+        string label = GenRoute.Esc(n);
+        string line = t + " " + n + " = " + GenRoute.InCall(t, label, def) + ";";
+        if (t == "string" && def.Length > 0) {
+            line = line + " if (" + n + ".Length == 0) { " + n + " = \"" +
+                   GenRoute.Esc(def) + "\"; }";
+        }
+        return line;
+    }
+
+    /// 十进制小数字面量解析(默认值只可能是源码里写得出的简单形状)。
+    static double AtoD(string s) {
+        double v = 0.0;
+        int i = 0;
+        bool neg = false;
+        if (s.Length > 0 && s.Substring(0, 1) == "-") { neg = true; i = 1; }
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { break; }
+            v = v * 10 + (c - 48);
+            i = i + 1;
+        }
+        if (i < s.Length && s.Substring(i, 1) == ".") {
+            i = i + 1;
+            double frac = 1.0;
+            while (i < s.Length) {
+                int c2 = s[i] & 255;
+                if (c2 < 48 || c2 > 57) { break; }
+                frac = frac / 10.0;
+                v = v + (c2 - 48) * frac;
+                i = i + 1;
+            }
+        }
+        if (neg) { v = 0.0 - v; }
+        return v;
     }
 
     /// 一条绑定语句:`long id = __c.NeedLong("id", "id");`。必填语义:

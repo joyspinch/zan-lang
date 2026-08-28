@@ -43,6 +43,10 @@ class HttpContext {
                          // accounting; -1 for anything not a route (an asset)
     string uploadPath;   // spooled multipart body ("" when none)
     long uploadSize;
+    // JSON 正文的惰性缓存：JsonBody() 第一次调用时解析一次，之后
+    // 直接返回缓存（同一个请求体往往被多个读取方消费）。
+    JsonValue jsonBody;
+    bool jsonParsed;
 
     int status;
     string statusText;
@@ -88,6 +92,8 @@ class HttpContext {
         this.routeSlot = 0 - 1;
         this.uploadPath = "";
         this.uploadSize = 0;
+        this.jsonBody = null;
+        this.jsonParsed = false;
         this.status = 200;
         this.statusText = "OK";
         this.contentType = "text/html; charset=utf-8";
@@ -102,9 +108,16 @@ class HttpContext {
         this.frames = 0;
         this.framesBytes = 0;
         HttpContext.ParsePairs(req.queryString, this.query);
+        // 表单在这里解析一次，服务的是直接构造 HttpContext 的调用方
+        // （此时 request.body 已是完整正文）。WebApp 的连接循环里正文
+        // 是在构造之后才由 HttpFramer 缓冲齐的，那里经 ParseFormBody
+        // 再解析一次——空正文时 ParsePairs 立即返回，同一条请求的
+        // 表单仍然只被真正解析一次。
         if (req.method == "POST" || req.method == "PUT" || req.method == "PATCH") {
             if (HttpContext.StartsWith(req.contentType, "application/x-www-form-urlencoded")) {
                 HttpContext.ParsePairs(req.body, this.form);
+            } else if (HttpContext.StartsWith(req.contentType, "multipart/form-data")) {
+                HttpContext.ParseMultipartFields(req, this);
             }
         }
     }
@@ -120,6 +133,113 @@ class HttpContext {
         }
     }
 
+    /// <summary>multipart/form-data 的文本字段进 form 表。浏览器在同一张
+    /// 表单里混排文本输入与文件输入，此前只有 urlencoded 的字段被解析，
+    /// multipart 请求里的文本字段在服务端不可见。文件部件不在这里展开：
+    /// 流式上传路径的正文已整体落盘（WebApp.StreamBodyToFile），内存路径
+    /// 的文件部件由处理器按需取用——只有带 filename= 的部件被跳过，
+    /// 其余部件的值原样进入 form（multipart 值不做百分号解码）。</summary>
+    static void ParseMultipartFields(HttpRequest req, HttpContext ctx) {
+        string ctype = req.contentType;
+        int bIdx = HttpContext.FindNoCaseFrom(ctype, "boundary=", 0);
+        if (bIdx < 0) { return; }
+        int bs = bIdx + 9;
+        int be = bs;
+        while (be < ctype.Length && (ctype[be] & 255) != 59) { be = be + 1; }
+        string raw = ctype.Substring(bs, be - bs);
+        // boundary 参数可带引号。
+        if (raw.Length >= 2 && (raw[0] & 255) == 34
+            && (raw[raw.Length - 1] & 255) == 34) {
+            raw = raw.Substring(1, raw.Length - 2);
+        }
+        if (raw.Length == 0) { return; }
+        string delim = "--" + raw;
+        string body = req.body;
+        int n = body.Length;
+        int dlen = delim.Length;
+        int pos = HttpContext.FindFrom(body, delim, 0);
+        while (pos >= 0) {
+            int after = pos + dlen;
+            if (after + 1 < n && (body[after] & 255) == 45
+                && (body[after + 1] & 255) == 45) {
+                break;   // "--boundary--"：结束分隔
+            }
+            if (after + 1 < n && (body[after] & 255) == 13
+                && (body[after + 1] & 255) == 10) {
+                after = after + 2;
+            } else if (after < n && (body[after] & 255) == 10) {
+                after = after + 1;
+            }
+            int hb = HttpContext.FindFrom(body, "\r\n\r\n", after);
+            if (hb < 0 || hb + 4 > n) { break; }
+            string head = body.Substring(after, hb + 4 - after);
+            int vStart = hb + 4;
+            string name = HttpContext.DispositionName(head);
+            int next = HttpContext.FindFrom(body, delim, vStart);
+            if (name.Length > 0 && next > vStart) {
+                int vEnd = next;
+                // 值尾的 CRLF 属于分隔符前缀，不属于值。
+                if (vEnd > vStart && (body[vEnd - 1] & 255) == 10) { vEnd = vEnd - 1; }
+                if (vEnd > vStart && (body[vEnd - 1] & 255) == 13) { vEnd = vEnd - 1; }
+                ctx.form.Set(name, body.Substring(vStart, vEnd - vStart));
+            }
+            if (next < 0) { break; }
+            pos = next;
+        }
+    }
+
+    /// <summary>部件 Content-Disposition 里的 name 值；带 filename= 的
+    /// 部件是文件，返回空串让调用方跳过（文件字节不能混进 form 表）。</summary>
+    static string DispositionName(string head) {
+        if (HttpContext.FindNoCaseFrom(head, "filename=", 0) >= 0) { return ""; }
+        int k = HttpContext.FindNoCaseFrom(head, "name=", 0);
+        if (k < 0) { return ""; }
+        int qs = k + 5;
+        if (qs < head.Length && (head[qs] & 255) == 34) {
+            int qe = HttpContext.FindFrom(head, "\"", qs + 1);
+            if (qe < 0) { return ""; }
+            return head.Substring(qs + 1, qe - qs - 1);
+        }
+        int e = qs;
+        while (e < head.Length) {
+            int c = head[e] & 255;
+            if (c == 59 || c == 13 || c == 10) { break; }  // ';' CR LF
+            e = e + 1;
+        }
+        return head.Substring(qs, e - qs);
+    }
+
+    static int FindFrom(string hay, string needle, int from) {
+        int n = hay.Length;
+        int m = needle.Length;
+        for (int i = from; i + m <= n; i = i + 1) {
+            int k = 0;
+            while (k < m && (hay[i + k] & 255) == (needle[k] & 255)) {
+                k = k + 1;
+            }
+            if (k == m) { return i; }
+        }
+        return -1;
+    }
+
+    static int FindNoCaseFrom(string hay, string needle, int from) {
+        int n = hay.Length;
+        int m = needle.Length;
+        for (int i = from; i + m <= n; i = i + 1) {
+            int k = 0;
+            while (k < m) {
+                int a = hay[i + k] & 255;
+                int b = needle[k] & 255;
+                if (a >= 65 && a <= 90) { a = a + 32; }
+                if (b >= 65 && b <= 90) { b = b + 32; }
+                if (a != b) { break; }
+                k = k + 1;
+            }
+            if (k == m) { return i; }
+        }
+        return -1;
+    }
+
     // ---- request accessors ----
 
     string Param(string name) { return this.routeParams.Get(name); }
@@ -127,51 +247,51 @@ class HttpContext {
     string Form(string name) { return this.form.Get(name); }
     string Body() { return this.request.body; }
 
+    /// <summary>Request body as JSON, parsed once and cached. Returns null
+    /// for an empty body. Lenient parse: a malformed body yields whatever
+    /// partial tree the reader recovered rather than an exception — callers
+    /// validating user input should still check the fields they read.</summary>
+    JsonValue JsonBody() {
+        if (!this.jsonParsed) {
+            this.jsonParsed = true;
+            this.jsonBody = null;
+            string b = this.request.body;
+            if (b.Length > 0) {
+                this.jsonBody = JsonValue.ParseLenient(b);
+            }
+        }
+        return this.jsonBody;
+    }
+
     // ================= 类型化取参族 =================
     //
-    // Input* 家族按 route → query → form 合并取值（Param 只看
-    // route 路径参数，语义保持不变）。空串一律视同缺失（空表单
-    // 字段直接落到默认值）。数值解析全部手写：Convert.ToInt 目前
-    // 降级为 C 的 atoi（负数零扩展缺陷，编译器票在案），而且
-    // atoi 的部分消费语义（"12abc" 得 12）对 HTTP 参数是错的——
-    // 这里要求整串消费干净，否则返回默认值。
+    // Input* 是 In* 家族的类型化别名（历史上是两套并行实现，合并顺序
+    // 一度相反——route→query→form 对 form→query→route——同一个名字
+    // 在两族里会解析到不同来源）。现在统一走 InRaw/InInt/InLong/InBool：
+    // 一份合并顺序、一份解析规则，生成的蹦床与手写控制器读到的值一致。
 
-    /// <summary>按 route → query → form 顺序取原始字符串；
+    /// <summary>按 route → query → form 顺序取原始字符串（未过滤）；
     /// 三处都缺时返回空串。</summary>
     string InputString(string name) {
-        string v = this.routeParams.Get(name);
-        if (v.Length > 0) { return v; }
-        v = this.query.Get(name);
-        if (v.Length > 0) { return v; }
-        return this.form.Get(name);
+        return this.InRaw(name);
     }
 
     /// <summary>按合并顺序取整型；缺失、非整数或溢出时返回
     /// `dflt`。"42"、"-7"、"+7" 合法；"12abc"、"2.5"、"" 不合法。</summary>
     int InputInt(string name, int dflt) {
-        return HttpContext.ParseIntStrict(this.InputString(name), dflt);
+        return this.InInt(name, dflt);
     }
 
     /// <summary>按合并顺序取 64 位整型；规则同 InputInt。</summary>
     long InputLong(string name, long dflt) {
-        return HttpContext.ParseLongStrict(this.InputString(name), dflt);
+        return this.InLong(name, dflt);
     }
 
     /// <summary>按合并顺序取布尔："1"/"true"/"on"/"yes"
     /// （大小写不敏感）为真，"0"/"false"/"off"/"no" 为假，
     /// 其余返回 `dflt`。</summary>
     bool InputBool(string name, bool dflt) {
-        string v = this.InputString(name);
-        if (v.Length == 0) { return dflt; }
-        if (HttpContext.AsciiEq(v, "1")) { return true; }
-        if (HttpContext.AsciiEq(v, "true")) { return true; }
-        if (HttpContext.AsciiEq(v, "on")) { return true; }
-        if (HttpContext.AsciiEq(v, "yes")) { return true; }
-        if (HttpContext.AsciiEq(v, "0")) { return false; }
-        if (HttpContext.AsciiEq(v, "false")) { return false; }
-        if (HttpContext.AsciiEq(v, "off")) { return false; }
-        if (HttpContext.AsciiEq(v, "no")) { return false; }
-        return dflt;
+        return this.InBool(name, dflt);
     }
 
     /// <summary>严格十进制解析：可选 +/- 前缀、其余必须全为数字、
@@ -209,9 +329,9 @@ class HttpContext {
             int c = v[i] & 255;
             if (c < 48 || c > 57) { return dflt; }
             acc = acc * 10 + (c - 48);
-            if (acc > 9223372036854775807L) {
-                return dflt;
-            }
+            // 只有全是数字时 acc 才可能为负：变负即说明 64 位已回绕，
+            // 当作解析失败而不是把回绕值当结果返回。
+            if (acc < 0) { return dflt; }
             i = i + 1;
         }
         return neg ? 0 - acc : acc;
@@ -261,15 +381,22 @@ class HttpContext {
 
     // ---- unified, filtered input --------------------------------------------
     // Prefer these over Form/Query/Param: every frontend parameter is resolved
-    // from the same place (form -> query -> route param) and passed through the
-    // central Filter, so sanitising is uniform across all controllers.
+    // from the same place (route param -> query -> form, most specific first)
+    // and passed through the central Filter, so sanitising is uniform across
+    // all controllers. An empty value counts as missing (an emptied form field
+    // falls through to the next source instead of shadowing it), matching the
+    // contract http_params pins for the whole family. The generator's route
+    // trampolines emit these same accessors, so attribute-routed actions and
+    // hand-written controllers read parameters identically.
 
-    /// <summary>Raw, UNFILTERED value (form -> query -> route param). Only use
+    /// <summary>Raw, UNFILTERED value (route param -> query -> form). Only use
     /// when you deliberately need the untouched bytes.</summary>
     string InRaw(string name) {
-        if (this.form.Has(name)) { return this.form.Get(name); }
-        if (this.query.Has(name)) { return this.query.Get(name); }
-        return this.routeParams.Get(name);
+        string v = this.routeParams.Get(name);
+        if (v.Length > 0) { return v; }
+        v = this.query.Get(name);
+        if (v.Length > 0) { return v; }
+        return this.form.Get(name);
     }
 
     /// <summary>Filtered value: trimmed, control chars stripped. The default
@@ -279,11 +406,19 @@ class HttpContext {
     /// <summary>Filtered + HTML-escaped value, safe to render into a page.</summary>
     string InText(string name) { return Filter.Html(this.InRaw(name)); }
 
-    /// <summary>Filtered integer with a fallback for missing/invalid input.</summary>
-    int InInt(string name, int def) { return Filter.ToInt(this.InRaw(name), def); }
+    /// <summary>Filtered integer with a fallback for missing/invalid input.
+    /// Full-consumption strict parse with range check: "12abc", "2.5" and
+    /// out-of-range values all fall to `def` (an atoi-style prefix parse
+    /// would accept "12abc" as 12, and an unchecked accumulator would wrap).</summary>
+    int InInt(string name, int def) {
+        return HttpContext.ParseIntStrict(Filter.Clean(this.InRaw(name)), def);
+    }
 
-    /// <summary>Filtered long with a fallback for missing/invalid input.</summary>
-    long InLong(string name, long def) { return Filter.ToLong(this.InRaw(name), def); }
+    /// <summary>Filtered long with a fallback for missing/invalid input.
+    /// Same strict rules as InInt, widened to 64 bits.</summary>
+    long InLong(string name, long def) {
+        return HttpContext.ParseLongStrict(Filter.Clean(this.InRaw(name)), def);
+    }
 
     /// <summary>Filtered number with a fallback for missing/invalid input.</summary>
     double InDouble(string name, double def) {
@@ -351,6 +486,20 @@ class HttpContext {
             + HttpContext.HeaderSafe(val)
             + "; Max-Age=" + Convert.ToString(maxAgeSeconds)
             + "; Path=/; HttpOnly; SameSite=Lax");
+        return this;
+    }
+
+    /// <summary>Sets a JS-readable cookie (no HttpOnly). The only
+    /// legitimate use is the CSRF double-submit token: the browser script
+    /// must read the cookie to echo it in X-CSRF-Token, so it cannot be
+    /// HttpOnly. SameSite=Lax stays, which is itself the first line of
+    /// defense. Everything else should use <see cref="SetCookie"/>.</summary>
+    HttpContext SetCookieJs(string name, string val, int maxAgeSeconds) {
+        if (this.headers == null) { this.headers = new List<string>(); }
+        this.headers.Add("Set-Cookie: " + HttpContext.HeaderSafe(name) + "="
+            + HttpContext.HeaderSafe(val)
+            + "; Max-Age=" + Convert.ToString(maxAgeSeconds)
+            + "; Path=/; SameSite=Lax");
         return this;
     }
 

@@ -107,19 +107,29 @@ class OrmDialect {
         return 0;
     }
 
-    /// <summary>刚插入行的自增值。</summary>
+    /// <summary>刚插入行的自增值。没有会话级「最后自增 id」的
+    /// 引擎（Firebird 用 INSERT … RETURNING 读生成器，TDengine
+    /// 没有自增列）直接抛错，而不是发出别的方言的 SQL 让
+    /// 服务器报一条费解的错。</summary>
     static string LastIdSql(IDbExecutor db) {
         int p = db.GetProvider();
-        string sql = "SELECT last_insert_rowid()";
-        if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
-            sql = "SELECT LAST_INSERT_ID()";
-        } else if (p == DbProvider.PostgreSQL || p == DbProvider.OpenGauss
-                || p == DbProvider.Kingbase) {
-            sql = "SELECT lastval()";
-        } else if (p == DbProvider.SqlServer || p == DbProvider.DM) {
-            sql = "SELECT SCOPE_IDENTITY()";
+        if (p == DbProvider.SQLite) {
+            return "SELECT last_insert_rowid()";
         }
-        return sql;
+        if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
+            return "SELECT LAST_INSERT_ID()";
+        }
+        if (p == DbProvider.PostgreSQL || p == DbProvider.OpenGauss
+                || p == DbProvider.Kingbase) {
+            return "SELECT lastval()";
+        }
+        if (p == DbProvider.SqlServer || p == DbProvider.DM) {
+            return "SELECT SCOPE_IDENTITY()";
+        }
+        throw new DbException(
+            "the provider has no session-wide last id; read the identity "
+            + "via INSERT ... RETURNING instead (provider id "
+            + Convert.ToString(p) + ")", 0, p);
     }
 
     static int LastId(IDbExecutor db) {
@@ -153,14 +163,36 @@ class OrmDialect {
         return "";
     }
 
+    /* 这些引擎提供 information_schema 目录（DM 兼容 SQL Server 的
+     * 目录视图）。不在此列、也没有专门分支的引擎，CodeFirst
+     * 的目录探测会显式抛错而不是发出一句必然失败的 SQL。 */
+    static bool HasInformationSchema(int p) {
+        return p == DbProvider.MySQL || p == DbProvider.MariaDB
+            || p == DbProvider.PostgreSQL || p == DbProvider.OpenGauss
+            || p == DbProvider.Kingbase || p == DbProvider.SqlServer
+            || p == DbProvider.DM;
+    }
+
     static string HasTableSql(IDbExecutor db) {
         int p = db.GetProvider();
         if (p == DbProvider.SQLite) {
             return "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'"
                 + " AND name = ?";
         }
-        return "SELECT COUNT(*) FROM information_schema.tables"
-            + " WHERE table_name = ?" + OrmDialect.OwnScope(p);
+        if (p == DbProvider.Firebird) {
+            // 未加引号的标识符以大写存储；CHAR(N) 比较按标准
+            // 补空格，视图不算表。
+            return "SELECT COUNT(*) FROM RDB$RELATIONS"
+                + " WHERE RDB$RELATION_NAME = UPPER(?)"
+                + " AND RDB$VIEW_BLR IS NULL";
+        }
+        if (OrmDialect.HasInformationSchema(p)) {
+            return "SELECT COUNT(*) FROM information_schema.tables"
+                + " WHERE table_name = ?" + OrmDialect.OwnScope(p);
+        }
+        throw new DbException(
+            "CodeFirst catalog queries are not supported for provider id "
+            + Convert.ToString(p), 0, p);
     }
 
     static bool HasTable(IDbExecutor db, string t) {
@@ -187,15 +219,27 @@ class OrmDialect {
         int p = db.GetProvider();
         DbResult r;
         int nameCol = 0;
+        bool padded = false;
         if (p == DbProvider.SQLite) {
             r = db.Query("PRAGMA table_info(" + t + ")");
             nameCol = 1;
-        } else {
+        } else if (p == DbProvider.Firebird) {
+            r = db.Query("SELECT RDB$FIELD_NAME FROM RDB$RELATION_FIELDS"
+                + " WHERE RDB$RELATION_NAME = UPPER(?)"
+                + " ORDER BY RDB$FIELD_POSITION", new DbParams().Add(t));
+            padded = true;   // CHAR(31) 取出来带尾部空格
+        } else if (OrmDialect.HasInformationSchema(p)) {
             r = db.Query(OrmDialect.ColsSql(p), new DbParams().Add(t));
+        } else {
+            throw new DbException(
+                "CodeFirst catalog queries are not supported for provider id "
+                + Convert.ToString(p), 0, p);
         }
         int i = 0;
         while (i < r.RowCount()) {
-            cols.Add(r.GetString(i, nameCol));
+            string nm = r.GetString(i, nameCol);
+            if (padded) { nm = nm.Trim(); }
+            cols.Add(nm);
             i = i + 1;
         }
         return cols;
@@ -206,17 +250,29 @@ class OrmDialect {
         int p = db.GetProvider();
         DbResult r;
         int nameCol = 0;
+        bool padded = false;
         if (p == DbProvider.SQLite) {
             string ps = "PRAGMA table_info(" + t + ")";
             r = await db.QueryAsync(ps);
             nameCol = 1;
-        } else {
+        } else if (p == DbProvider.Firebird) {
+            r = await db.QueryAsync("SELECT RDB$FIELD_NAME FROM RDB$RELATION_FIELDS"
+                + " WHERE RDB$RELATION_NAME = UPPER(?)"
+                + " ORDER BY RDB$FIELD_POSITION", new DbParams().Add(t));
+            padded = true;
+        } else if (OrmDialect.HasInformationSchema(p)) {
             string cs = OrmDialect.ColsSql(p);
             r = await db.QueryAsync(cs, new DbParams().Add(t));
+        } else {
+            throw new DbException(
+                "CodeFirst catalog queries are not supported for provider id "
+                + Convert.ToString(p), 0, p);
         }
         int i = 0;
         while (i < r.RowCount()) {
-            cols.Add(r.GetString(i, nameCol));
+            string nm = r.GetString(i, nameCol);
+            if (padded) { nm = nm.Trim(); }
+            cols.Add(nm);
             i = i + 1;
         }
         return cols;
@@ -224,7 +280,9 @@ class OrmDialect {
 
     /* 二级索引：声明在实体上，缺了就补，已有就不动。
      * `CREATE INDEX IF NOT EXISTS` 不是各家都有的写法（MySQL 没有），
-     * 所以存在性自己按方言查。 */
+     * 所以存在性自己按方言查。探测参数由 <see cref="IndexProbeParams"/>
+     * 按同一方言给出——MySQL/SQL Server 的索引名只在表内唯一，
+     * 必须连同表名一起比对，别的表的同名索引不算「已存在」。 */
     static string HasIndexSql(int p) {
         if (p == DbProvider.SQLite) {
             return "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'"
@@ -232,9 +290,37 @@ class OrmDialect {
         }
         if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
             return "SELECT COUNT(*) FROM information_schema.statistics"
-                + " WHERE index_name = ? AND table_schema = DATABASE()";
+                + " WHERE index_name = ? AND table_schema = DATABASE()"
+                + " AND table_name = ?";
         }
-        return "SELECT COUNT(*) FROM pg_indexes WHERE indexname = ?";
+        if (p == DbProvider.SqlServer || p == DbProvider.DM) {
+            return "SELECT COUNT(*) FROM sys.indexes"
+                + " WHERE name = ? AND object_id = OBJECT_ID(?)";
+        }
+        if (p == DbProvider.Firebird) {
+            // 索引名数据库内唯一，无须再按表过滤。
+            return "SELECT COUNT(*) FROM RDB$INDICES"
+                + " WHERE RDB$INDEX_NAME = UPPER(?)";
+        }
+        if (p == DbProvider.PostgreSQL || p == DbProvider.OpenGauss
+                || p == DbProvider.Kingbase) {
+            // 索引在 schema 内唯一（索引本身是一种关系）。
+            return "SELECT COUNT(*) FROM pg_indexes"
+                + " WHERE indexname = ? AND schemaname = current_schema()";
+        }
+        throw new DbException(
+            "CodeFirst catalog queries are not supported for provider id "
+            + Convert.ToString(p), 0, p);
+    }
+
+    /// <summary><see cref="HasIndexSql"/> 对应的探测参数：
+    /// 按表名一起比对的方言为 (索引名, 表名)，其余为 (索引名)。</summary>
+    static DbParams IndexProbeParams(int p, string nm, string t) {
+        if (p == DbProvider.MySQL || p == DbProvider.MariaDB
+                || p == DbProvider.SqlServer || p == DbProvider.DM) {
+            return new DbParams().Add(nm).Add(t);
+        }
+        return new DbParams().Add(nm);
     }
 
     static string IndexDdl(int p, string nm, string t, string cols,
@@ -247,19 +333,26 @@ class OrmDialect {
                             bool uniq) {
         int p = db.GetProvider();
         DbResult r = db.Query(OrmDialect.HasIndexSql(p),
-                              new DbParams().Add(nm));
+                              OrmDialect.IndexProbeParams(p, nm, t));
         if (r.RowCount() > 0 && r.GetInt(0, 0) > 0) { return; }
-        db.Execute(OrmDialect.IndexDdl(p, nm, t, cols, uniq));
+        string ddl = OrmDialect.IndexDdl(p, nm, t, cols, uniq);
+        int n = db.Execute(ddl);
+        if (n < 0) {
+            throw new DbException("DDL failed: " + ddl, 0, DbProvider.Unknown);
+        }
     }
 
     static async void EnsureIndexAsync(IDbExecutor db, string nm, string t,
                                        string cols, bool uniq) {
         int p = db.GetProvider();
         DbResult r = await db.QueryAsync(OrmDialect.HasIndexSql(p),
-                                         new DbParams().Add(nm));
+                                         OrmDialect.IndexProbeParams(p, nm, t));
         if (r.RowCount() > 0 && r.GetInt(0, 0) > 0) { return; }
-        int _n = await db.ExecuteAsync(OrmDialect.IndexDdl(p, nm, t, cols,
-                                                           uniq));
+        string ddl = OrmDialect.IndexDdl(p, nm, t, cols, uniq);
+        int n = await db.ExecuteAsync(ddl);
+        if (n < 0) {
+            throw new DbException("DDL failed: " + ddl, 0, DbProvider.Unknown);
+        }
     }
 
     /// <summary>列的 DDL 类型。kind：0 int/enum、1 double、2 bool、

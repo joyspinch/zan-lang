@@ -1,0 +1,159 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+// Error signaling across the data stack: failing statements raise
+// DbException (with the driver's own error code and text) instead of
+// returning -1 or an empty result set, so an empty result always means
+// "no rows". ORM schema sync and migrations turn executor failures into
+// throws as well, and a failed statement leaves the connection usable.
+
+/// Stands in for an executor that reports failure the legacy way —
+/// negative return code, no exception (custom user executors may do
+/// this). Proves the ORM layer converts silent failures into throws.
+class FlakyExecutor : IDbExecutor {
+    string failMarker;
+
+    FlakyExecutor(string marker) {
+        this.failMarker = marker;
+    }
+
+    DbResult Query(string sql) {
+        DbResult r = new DbResult();
+        r.SetColumnCount(1);
+        r.AddColumnName("c");
+        return r;
+    }
+
+    DbResult Query(string sql, DbParams prms) { return Query(sql); }
+
+    int Execute(string sql) {
+        if (sql.IndexOf(this.failMarker) >= 0) { return 0 - 1; }
+        return 1;
+    }
+
+    int Execute(string sql, DbParams prms) { return Execute(sql); }
+    string ExecuteScalar(string sql) { return "0"; }
+    string ExecuteScalar(string sql, DbParams prms) { return ExecuteScalar(sql); }
+    async DbResult QueryAsync(string sql) { return this.Query(sql); }
+    async DbResult QueryAsync(string sql, DbParams prms) { return this.Query(sql, prms); }
+    async int ExecuteAsync(string sql) { return this.Execute(sql); }
+    async int ExecuteAsync(string sql, DbParams prms) { return this.Execute(sql, prms); }
+    async string ExecuteScalarAsync(string sql) { return this.ExecuteScalar(sql); }
+    async string ExecuteScalarAsync(string sql, DbParams prms) { return this.ExecuteScalar(sql, prms); }
+    int GetProvider() { return DbProvider.SQLite; }
+}
+
+class Program {
+    static int passed = 0;
+    static int failed = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) {
+            Program.passed = Program.passed + 1;
+        } else {
+            Program.failed = Program.failed + 1;
+            Console.WriteLine("FAIL: " + name);
+        }
+    }
+
+    static void Main() {
+        string path = "db_error_throw.tmp.db";
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+        Check("open", db.IsConnected());
+        Check("provider", db.GetProvider() == DbProvider.SQLite);
+        Check("create", db.Execute("CREATE TABLE t_err (id INTEGER PRIMARY KEY, name TEXT)") == 0);
+        Check("insert", db.Execute("INSERT INTO t_err (name) VALUES ('a')") == 1);
+
+        // 1. A failing statement raises DbException carrying the driver's
+        //    own error code; the connection stays usable afterwards.
+        bool threw = false;
+        int code = 0;
+        try {
+            db.Execute("INSERT INTO t_nope (name) VALUES ('x')");
+        } catch (DbException e) {
+            threw = true;
+            code = e.Code;
+        }
+        Check("execute-throws", threw);
+        Check("execute-code", code == 1);   // SQLITE_ERROR
+        Check("execute-text", db.GetError().IndexOf("no such table") >= 0);
+        Check("still-usable", db.Execute("INSERT INTO t_err (name) VALUES ('b')") == 1);
+        Check("row-count", db.ExecuteScalar("SELECT COUNT(*) FROM t_err") == "2");
+
+        // 2. Constraint violations carry SQLITE_CONSTRAINT (19), so handlers
+        //    can branch without parsing the message.
+        db.Execute("CREATE TABLE t_pk (id INTEGER PRIMARY KEY)");
+        db.Execute("INSERT INTO t_pk VALUES (1)");
+        bool constraintThrew = false;
+        int constraintCode = 0;
+        try {
+            db.Execute("INSERT INTO t_pk VALUES (1)");
+        } catch (DbException e) {
+            constraintThrew = true;
+            constraintCode = e.Code;
+        }
+        Check("constraint-throws", constraintThrew);
+        Check("constraint-code", constraintCode == 19);
+
+        // 3. Queries raise too — a missing table no longer masquerades as
+        //    an empty result set.
+        bool qthrew = false;
+        try {
+            db.Query("SELECT * FROM t_nope");
+        } catch (DbException e) {
+            qthrew = true;
+        }
+        Check("query-throws", qthrew);
+
+        // 4. The parameterized path raises as well.
+        bool pthrew = false;
+        try {
+            db.Execute("INSERT INTO t_nope2 VALUES (?)", new DbParams().AddInt(1));
+        } catch (DbException e) {
+            pthrew = true;
+        }
+        Check("param-throws", pthrew);
+
+        // 5. An unconnected handle refuses to execute, with the same
+        //    exception type as every other failure.
+        SqliteConnection dead = SqliteConnection.Open("no_such_dir/db_error_throw.db");
+        Check("dead-open", !dead.IsConnected());
+        bool dthrew = false;
+        try {
+            dead.Execute("SELECT 1");
+        } catch (DbException e) {
+            dthrew = true;
+        }
+        Check("dead-throws", dthrew);
+
+        // 6. Migrations apply and record on the real driver, and fail
+        //    loudly on a legacy-style executor that only returns -1 —
+        //    the failed run is not recorded.
+        List<Migration> migs = new List<Migration>();
+        migs.Add(Migration.New("mig_ok", "CREATE TABLE mig_ok_t (id INTEGER)",
+                               "DROP TABLE mig_ok_t"));
+        Migration.RunAll(db, migs);
+        Check("migration-applied",
+            db.ExecuteScalar("SELECT COUNT(*) FROM _migrations WHERE name = 'mig_ok'") == "1");
+
+        FlakyExecutor flaky = new FlakyExecutor("m_bad_t");
+        bool fthrew = false;
+        try {
+            List<Migration> badMigs = new List<Migration>();
+            badMigs.Add(Migration.New("m_bad", "CREATE TABLE m_bad_t (id INTEGER)", ""));
+            Migration.RunAll(flaky, badMigs);
+        } catch (DbException e) {
+            fthrew = true;
+        }
+        Check("migration-fails-loudly", fthrew);
+
+        db.Close();
+        File.Delete(path);
+        Console.WriteLine("pass: " + Convert.ToString(Program.passed));
+        Console.WriteLine("fail: " + Convert.ToString(Program.failed));
+    }
+}

@@ -1,4 +1,5 @@
 using System;
+using System.Security.Cryptography;
 using System.Threading;
 
 namespace System.Web;
@@ -112,3 +113,86 @@ class LockManager {
     }
 }
 
+
+/// <summary>
+/// CSRF 防护（opt-in）：double-submit cookie。注册一行：
+///   app.Before(Csrf.Guard);
+///
+/// 语义：
+/// - 安全方法（GET/HEAD/OPTIONS）不拦截；首次访问补发随机 token
+///   cookie（不带 HttpOnly——浏览器脚本必须读它、回显到
+///   X-CSRF-Token 头或 _csrf 表单字段；SameSite=Lax 保留，本身就是
+///   第一道防线）。
+/// - 不安全方法要求 X-CSRF-Token（或 _csrf 字段）与 cookie 逐字节
+///   相等；缺失或不匹配 → 403 并短路（返回 false，路由不再执行）。
+/// - 比较走常时路径（按最大长度累积异或），不因首个差异字节提前
+///   返回。
+/// - token 无状态（16 随机字节的 hex），重启/多 worker 之间均有效，
+///   服务端不需要存储与过期清扫。
+/// - 豁免：自带签名校验的回调路由用 <see cref="Csrf.Skip"/> 登记
+///   前缀。
+/// </summary>
+class Csrf {
+    static string CookieName = "csrf_token";
+    static string HeaderName = "X-CSRF-Token";
+    static string FormName = "_csrf";
+    static List<string> skips;
+
+    /// <summary>登记豁免前缀：路径以其开头即不拦截。用于支付回调、
+    /// webhook 等自带签名校验、调用方不可能持有 cookie 的路由。</summary>
+    static void Skip(string prefix) {
+        if (Csrf.skips == null) { Csrf.skips = new List<string>(); }
+        Csrf.skips.Add(prefix);
+    }
+
+    static bool Skipped(string path) {
+        if (Csrf.skips == null) { return false; }
+        int n = Csrf.skips.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            string p = Csrf.skips[i];
+            if (p.Length > 0 && HttpContext.StartsWith(path, p)) { return true; }
+        }
+        return false;
+    }
+
+    /// <summary>Before 钩子本体。返回 false 表示已写好 403 响应，
+    /// 管线短路。</summary>
+    static bool Guard(HttpContext ctx) {
+        bool safe = ctx.method == "GET" || ctx.method == "HEAD"
+            || ctx.method == "OPTIONS";
+        if (safe) {
+            if (ctx.Cookie(Csrf.CookieName).Length == 0) {
+                ctx.SetCookieJs(Csrf.CookieName, Csrf.NewToken(), 43200);
+            }
+            return true;
+        }
+        if (Csrf.Skipped(ctx.path)) { return true; }
+        string cookie = ctx.Cookie(Csrf.CookieName);
+        string sent = ctx.Header(Csrf.HeaderName);
+        if (sent.Length == 0) { sent = ctx.Form(Csrf.FormName); }
+        if (cookie.Length == 0 || sent.Length == 0
+            || !Csrf.ConstantTimeEquals(cookie, sent)) {
+            ctx.Status(403, "Forbidden");
+            ctx.Text("csrf token missing or invalid");
+            return false;
+        }
+        return true;
+    }
+
+    static string NewToken() {
+        return Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+    }
+
+    static bool ConstantTimeEquals(string a, string b) {
+        int la = a.Length;
+        int lb = b.Length;
+        int n = la > lb ? la : lb;
+        int diff = la == lb ? 0 : 1;
+        for (int i = 0; i < n; i = i + 1) {
+            int x = i < la ? a[i] & 255 : 0;
+            int y = i < lb ? b[i] & 255 : 0;
+            diff = diff | (x ^ y);
+        }
+        return diff == 0;
+    }
+}

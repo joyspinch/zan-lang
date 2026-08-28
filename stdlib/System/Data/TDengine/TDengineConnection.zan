@@ -25,6 +25,11 @@ namespace System.Data.TDengine;
 /// TDengine 没有事务，因此这里没有 Begin/Commit
 /// 等操作可用。
 ///
+/// 语句失败（服务端报错、无法到达 taosAdapter、占位符
+/// 个数不匹配）时抛出 <see cref="DbException"/>，
+/// 携带 taosAdapter 响应中的错误码；空结果集总意味着
+/// 「无行」。错误文本仍可通过 GetError() 获取。
+///
 /// 用法：
 ///   TDengineConnection db = TDengineConnection.Open("127.0.0.1", 6041,
 ///                               "root", "taosdata", "demo");
@@ -41,6 +46,7 @@ class TDengineConnection : IDbConnection {
     string database;      // "" 表示未设置默认数据库
     bool connected;
     string lastError;
+    int lastCode;         // taosAdapter 的错误码（响应 JSON 的 `code`）
     int affected;
 
     TDengineConnection() {
@@ -50,6 +56,7 @@ class TDengineConnection : IDbConnection {
         this.database = "";
         this.connected = false;
         this.lastError = "";
+        this.lastCode = 0;
         this.affected = 0;
     }
 
@@ -313,6 +320,7 @@ class TDengineConnection : IDbConnection {
     /// 返回 "" 并设置 lastError。</summary>
     string Post(string sql) {
         this.lastError = "";
+        this.lastCode = 0;
         nint sock = Socket.CreateTcp();
         if (sock <= 0) {
             this.lastError = "socket creation failed";
@@ -345,6 +353,7 @@ class TDengineConnection : IDbConnection {
     /// 可以同时有多条语句在途。</summary>
     async string PostAsync(string sql) {
         this.lastError = "";
+        this.lastCode = 0;
         nint sock = Socket.CreateTcp();
         if (sock <= 0) {
             this.lastError = "socket creation failed";
@@ -378,18 +387,31 @@ class TDengineConnection : IDbConnection {
     // ===== 响应解码 =====
 
     /// <summary>响应报告服务端错误时返回 true；
-    /// 错误描述保存在 lastError 中。3.x 的（`code` != 0）
-    /// 和 2.x 的（`status` == "error"）都会被识别。</summary>
+    /// 错误描述保存在 lastError 中，错误码保存在 lastCode 中。
+    /// 3.x 的（`code` != 0）和 2.x 的（`status` == "error"）
+    /// 都会被识别。</summary>
     bool Failed(JsonValue root) {
         if (!root.IsObject()) {
             this.lastError = "malformed response from taosAdapter";
+            this.lastCode = 0;
             return true;
         }
         bool bad = root.Int("code", 0) != 0 || root.Str("status", "succ") == "error";
         if (bad) {
             this.lastError = root.Str("desc", root.Str("status", "unknown error"));
+            this.lastCode = root.Int("code", 0);
         }
         return bad;
+    }
+
+    /// <summary>抛出记录的失败，携带 taosAdapter 自身的
+    /// 错误码，调用方无需解析消息即可分支处理。</summary>
+    void Fail() {
+        string why = this.lastError;
+        if (why.Length == 0) {
+            why = "the statement failed";
+        }
+        throw new DbException(why, this.lastCode, DbProvider.TDengine);
     }
 
     /// <summary>将一个 `/rest/sql` 响应文档转换为结果集，
@@ -456,36 +478,65 @@ class TDengineConnection : IDbConnection {
 
     // ===== IDbExecutor =====
 
-    /// <summary>执行查询并返回结果集。</summary>
+    /// <summary>执行查询并返回结果集。服务器报错或无法到达
+    /// taosAdapter 时抛出 <see cref="DbException"/>，
+    /// 因此空结果总意味着「无行」；错误信息仍可通过
+    /// <see cref="GetError"/> 获取。</summary>
     DbResult Query(string sql) {
-        return Decode(Post(sql));
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.lastCode = 0;
+            this.Fail();
+        }
+        DbResult r = Decode(Post(sql));
+        if (this.lastError.Length > 0) { this.Fail(); }
+        return r;
     }
 
     /// <summary>执行查询，其中 `?` 占位符从
-    /// <paramref name="prms"/> 填充。</summary>
+    /// <paramref name="prms"/> 填充。占位符个数不匹配时
+    /// 抛出 <see cref="DbException"/>。</summary>
     DbResult Query(string sql, DbParams prms) {
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.lastCode = 0;
+            this.Fail();
+        }
         string text = TDengineConnection.RenderSql(sql, prms);
         if (text.Length == 0 && sql.Length > 0) {
             this.lastError = "parameter count does not match the placeholders";
-            return DbResult.Empty();
+            this.lastCode = 0;
+            this.Fail();
         }
         return Query(text);
     }
 
-    /// <summary>执行语句并返回受影响的行数，失败返回 -1
-    /// 。</summary>
+    /// <summary>执行语句并返回受影响的行数。失败时抛出
+    /// <see cref="DbException"/>。</summary>
     int Execute(string sql) {
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.lastCode = 0;
+            this.Fail();
+        }
         DbResult r = Decode(Post(sql));
-        if (this.lastError.Length > 0) { return 0 - 1; }
+        if (this.lastError.Length > 0) { this.Fail(); }
         return this.affected;
     }
 
-    /// <summary>执行带参数的语句。</summary>
+    /// <summary>执行带参数的语句。占位符个数不匹配或语句
+    /// 失败时抛出 <see cref="DbException"/>。</summary>
     int Execute(string sql, DbParams prms) {
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.lastCode = 0;
+            this.Fail();
+        }
         string text = TDengineConnection.RenderSql(sql, prms);
         if (text.Length == 0 && sql.Length > 0) {
             this.lastError = "parameter count does not match the placeholders";
-            return 0 - 1;
+            this.lastCode = 0;
+            this.Fail();
         }
         return Execute(text);
     }
@@ -506,36 +557,64 @@ class TDengineConnection : IDbConnection {
 
     // ===== 协程 API =====
 
-    /// <summary>查询，不阻塞 worker 线程。</summary>
+    /// <summary>查询，不阻塞 worker 线程。失败时抛出
+    /// <see cref="DbException"/>。</summary>
     async DbResult QueryAsync(string sql) {
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.lastCode = 0;
+            this.Fail();
+        }
         string body = await PostAsync(sql);
-        return Decode(body);
+        DbResult r = Decode(body);
+        if (this.lastError.Length > 0) { this.Fail(); }
+        return r;
     }
 
-    /// <summary>参数化查询，不阻塞 worker 线程。</summary>
+    /// <summary>参数化查询，不阻塞 worker 线程。占位符个数
+    /// 不匹配时抛出 <see cref="DbException"/>。</summary>
     async DbResult QueryAsync(string sql, DbParams prms) {
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.lastCode = 0;
+            this.Fail();
+        }
         string text = TDengineConnection.RenderSql(sql, prms);
         if (text.Length == 0 && sql.Length > 0) {
             this.lastError = "parameter count does not match the placeholders";
-            return DbResult.Empty();
+            this.lastCode = 0;
+            this.Fail();
         }
         return await QueryAsync(text);
     }
 
-    /// <summary>执行语句，不阻塞 worker 线程。</summary>
+    /// <summary>执行语句，不阻塞 worker 线程。失败时抛出
+    /// <see cref="DbException"/>。</summary>
     async int ExecuteAsync(string sql) {
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.lastCode = 0;
+            this.Fail();
+        }
         string body = await PostAsync(sql);
         DbResult r = Decode(body);
-        if (this.lastError.Length > 0) { return 0 - 1; }
+        if (this.lastError.Length > 0) { this.Fail(); }
         return this.affected;
     }
 
-    /// <summary>执行参数化语句，不阻塞 worker 线程。</summary>
+    /// <summary>执行参数化语句，不阻塞 worker 线程。失败时
+    /// 抛出 <see cref="DbException"/>。</summary>
     async int ExecuteAsync(string sql, DbParams prms) {
+        if (!this.connected) {
+            this.lastError = "not connected";
+            this.lastCode = 0;
+            this.Fail();
+        }
         string text = TDengineConnection.RenderSql(sql, prms);
         if (text.Length == 0 && sql.Length > 0) {
             this.lastError = "parameter count does not match the placeholders";
-            return 0 - 1;
+            this.lastCode = 0;
+            this.Fail();
         }
         return await ExecuteAsync(text);
     }

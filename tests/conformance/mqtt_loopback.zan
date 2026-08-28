@@ -1,0 +1,90 @@
+// MQTT v3.1.1 端到端回归（loopback，进程内同时扮演 broker 与客户端）：
+//
+// 1. varint remaining length：300 字节负载的 PUBLISH 需要 2 字节
+//    varint——旧客户端把它截进单字节，报文非法、broker 端流从此错位。
+//    订阅 QoS1 后由第二个客户端发布，验证订阅者原样收到 300 字节。
+// 2. 畸形包韧性：裸套接字发一个 remaining length == 0 的 PUBLISH
+//    （变头连 2 字节主题长度都没有）——旧 broker 对 body[0] 越界读
+//    直接 rt_crash；修复后按协议错误断开该连接，broker 继续服务。
+// 3. 同 clientId 重连去重：旧 broker 把两个同名会话都放进表里；
+//    修复后旧会话被 shutdown（EOF），新会话正常收发。
+// 打印 golden：payload_len / match / malformed_closed / dup_kicked。
+using System;
+using System.Net.Mqtt;
+using System.Net.Sockets;
+using System.Threading;
+
+class Program {
+    static async int Run() {
+        Socket.Initialize();
+        MqttBroker broker = new MqttBroker("127.0.0.1", 19731);
+        Task.Spawn(broker.RunAsync());
+
+        // 订阅者：重试连接直到 broker 完成绑定。
+        MqttClient sub = null;
+        for (int i = 0; i < 100; i = i + 1) {
+            sub = await MqttClient.ConnectAsync("127.0.0.1", 19731, "sub-1");
+            if (sub.IsConnected()) { break; }
+            Thread.Sleep(20);
+        }
+        if (!sub.IsConnected()) {
+            Console.WriteLine("payload_len=-1");
+            return 0;
+        }
+        int _s = await sub.SubscribeAsync("sensor/temp", MqttQos.AtLeastOnce);
+
+        // 300 字节负载：触发 2 字节 varint remaining length。
+        string payload = "";
+        for (int i = 0; i < 300; i = i + 1) { payload = payload + "x"; }
+
+        MqttClient pub = await MqttClient.ConnectAsync("127.0.0.1", 19731, "pub-1");
+        if (!pub.IsConnected()) {
+            Console.WriteLine("payload_len=-2");
+            return 0;
+        }
+        int _p = await pub.PublishAsync("sensor/temp", payload, MqttQos.AtLeastOnce);
+        string got = await sub.ReceiveAsync();
+        Console.WriteLine("payload_len=" + got.Length);
+        Console.WriteLine("match=" + (got == payload ? "1" : "0"));
+
+        // 畸形 PUBLISH：broker 应断开而非崩溃；随后正常客户端仍可用。
+        nint raw = Socket.CreateTcp();
+        Socket.SetReuseAddr(raw);
+        Socket.Connect(raw, "127.0.0.1", 19731);
+        Socket.SetNonBlocking(raw);
+        byte[] bad = new byte[2];
+        bad[0] = (byte)(3 << 4);   // PUBLISH, qos0
+        bad[1] = 0;                // remaining length 0 —— 变头都不足
+        Socket.Send(raw, bad, 2);
+        string dead = await Socket.RecvAsync(raw, 16, 3000);
+        bool closed = dead.Length == 0 && !Socket.LastRecvTimedOut();
+        Console.WriteLine("malformed_closed=" + (closed ? "1" : "0"));
+        Socket.Close(raw);
+
+        // broker 活着：再发布一条小消息仍能送达。
+        int _p2 = await pub.PublishAsync("sensor/temp", "ok", MqttQos.AtMostOnce);
+        string got2 = await sub.ReceiveAsync();
+        Console.WriteLine("alive=" + (got2 == "ok" ? "1" : "0"));
+
+        // 同 clientId 重连：旧会话被踢成 EOF，新会话正常。
+        MqttClient dupA = await MqttClient.ConnectAsync("127.0.0.1", 19731, "dup-1");
+        MqttClient dupB = await MqttClient.ConnectAsync("127.0.0.1", 19731, "dup-1");
+        bool dupBok = dupB.IsConnected();
+        string stale = dupBok ? await dupA.ReceiveAsync() : "?";
+        Console.WriteLine("dup_kicked=" + (dupBok && stale.Length == 0 ? "1" : "0"));
+
+        int _d1 = await pub.DisconnectAsync();
+        int _d2 = await sub.DisconnectAsync();
+        int _d3 = await dupB.DisconnectAsync();
+        broker.Stop();
+        // Stop 关闭监听句柄并唤醒挂起的 accept（Windows 上先
+        // CancelIoEx）；这几个泵转让 accept 循环与连接协程收干净，
+        // 退出时的泄漏探测才不会把 broker 对象链记为仍可达。
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

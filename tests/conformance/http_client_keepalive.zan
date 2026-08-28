@@ -1,0 +1,331 @@
+// Conformance: HttpClient keep-alive connection reuse.
+//
+// The client used to frame every request with Connection: close and read the
+// response to EOF, paying a TCP handshake per request. The pooled path now
+// keeps one connection per client and frames responses explicitly (the same
+// HttpFramer the servers use). The upstream here is a raw socket server so
+// reuse is directly observable: it counts accepted connections and how many
+// requests each carried, and it exercises the cases where reuse must NOT
+// happen:
+//   /len     Content-Length framed              -> reusable
+//   /echo    echoes the request body (CL frame) -> reusable
+//   /chunked chunked response                   -> reusable (decoded)
+//   /204     no body by definition              -> reusable
+//   /head    HEAD: CL present but no body       -> reusable
+//   /close   keep-alive framing but Connection: close -> not pooled
+//   /nolen   no length, delimited by close      -> not pooled
+// plus the race every keep-alive client must survive: the server drops the
+// idle connection between requests and the next request must transparently
+// ride a fresh one.
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Threading;
+
+namespace Conf;
+
+class Prog {
+    static int PORT = 9641;
+    static int accepted;
+    static int requests;
+    static bool killIdle;
+    static TcpListener l;
+    static bool probing = true;
+
+    static async void Serve() {
+        Prog.l = new TcpListener("127.0.0.1", Prog.PORT);
+        Prog.l.Start();
+        while (true) {
+            nint c = await Prog.l.AcceptAsync();
+            if (c < 0) { break; }
+            if (Prog.probing) {
+                // The startup probe's accept: not a counted client. Clearing
+                // the flag here is race-free because this is the only
+                // coroutine that accepts.
+                Prog.probing = false;
+            } else {
+                Prog.accepted = Prog.accepted + 1;
+            }
+            Task.Spawn(Prog.ServeOne(c));
+        }
+        Prog.l.Stop();
+        // 收尾后放掉静态引用：退出时的泄漏探测不再看到监听器。
+        // 这里是最后碰 Prog.l 的地方（accept 循环已退出）。
+        Prog.l = null;
+    }
+
+    /// Serves requests on one connection until the peer or the response ends
+    /// the connection. Reads Content-Length framed request bodies.
+    static async void ServeOne(nint c) {
+        string buf = "";
+        while (true) {
+            int hb = Prog.Find(buf, "\r\n\r\n");
+            while (hb < 0) {
+                string piece = await Socket.RecvAsync(c, 8192);
+                if (piece.Length == 0) { Socket.Close(c); return; }
+                buf = buf + piece;
+                hb = Prog.Find(buf, "\r\n\r\n");
+            }
+            string head = buf.Substring(0, hb + 4);
+            string rest = buf.Substring(hb + 4, buf.Length - hb - 4);
+            int cl = Prog.ContentLength(head);
+            while (rest.Length < cl) {
+                string piece2 = await Socket.RecvAsync(c, 8192);
+                if (piece2.Length == 0) { Socket.Close(c); return; }
+                rest = rest + piece2;
+            }
+            buf = rest.Substring(cl, rest.Length - cl);
+            Prog.requests = Prog.requests + 1;
+            bool reqClose = Prog.FindNoCase(head, "connection: close") >= 0;
+
+            if (Prog.Find(head, "/chunked") >= 0) {
+                int _c = await Socket.SendStringAsync(c,
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    + "5\r\nchunk\r\n0\r\n\r\n");
+            } else if (Prog.Find(head, "/nolen") >= 0) {
+                // Neither Content-Length nor chunked: the body ends when the
+                // connection does, so this link can never be pooled.
+                int _n = await Socket.SendStringAsync(c,
+                    "HTTP/1.1 200 OK\r\n\r\nstreamed");
+                Socket.Close(c);
+                return;
+            } else if (Prog.Find(head, "/close") >= 0) {
+                int _x = await Socket.SendStringAsync(c,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+                    + "Connection: close\r\n\r\nbye!!");
+                Socket.Close(c);
+                return;
+            } else if (Prog.Find(head, "/204") >= 0) {
+                int _e = await Socket.SendStringAsync(c,
+                    "HTTP/1.1 204 No Content\r\n\r\n");
+            } else if (Prog.FindNoCase(head, "head /head") == 0) {
+                // HEAD: Content-Length announces a body that never follows.
+                int _h = await Socket.SendStringAsync(c,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n");
+            } else if (Prog.Find(head, "/echo") >= 0) {
+                string rb = "len=" + Convert.ToString(cl)
+                    + ":" + rest.Substring(0, cl);
+                int _r = await Socket.SendStringAsync(c,
+                    "HTTP/1.1 200 OK\r\nContent-Length: "
+                    + Convert.ToString(rb.Length) + "\r\n\r\n" + rb);
+            } else {
+                int _o = await Socket.SendStringAsync(c,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nlenbdy");
+            }
+            if (reqClose) {
+                Socket.Close(c);
+                return;
+            }
+            if (Prog.killIdle) {
+                // Drop the idle link the way a real upstream does when its own
+                // keep-alive timer fires. Closing right after the response is
+                // race-free: TCP delivers the response bytes before the FIN,
+                // so the next request always lands on a closed connection.
+                Socket.Close(c);
+                return;
+            }
+        }
+    }
+
+    static int ContentLength(string head) {
+        int i = Prog.FindNoCase(head, "content-length:");
+        if (i < 0) { return 0; }
+        int s = i + 15;
+        while (s < head.Length && head[s] == ' ') { s = s + 1; }
+        int v = 0;
+        while (s < head.Length && head[s] >= '0' && head[s] <= '9') {
+            v = v * 10 + (head[s] - 48);
+            s = s + 1;
+        }
+        return v;
+    }
+
+    static int Find(string hay, string needle) {
+        int n = hay.Length;
+        int m = needle.Length;
+        for (int i = 0; i + m <= n; i = i + 1) {
+            int k = 0;
+            while (k < m && (hay[i + k] & 255) == (needle[k] & 255)) {
+                k = k + 1;
+            }
+            if (k == m) { return i; }
+        }
+        return -1;
+    }
+
+    static int FindNoCase(string hay, string needle) {
+        int n = hay.Length;
+        int m = needle.Length;
+        for (int i = 0; i + m <= n; i = i + 1) {
+            int k = 0;
+            while (k < m) {
+                int a = hay[i + k] & 255;
+                int b = needle[k] & 255;
+                if (a >= 65 && a <= 90) { a = a + 32; }
+                if (b >= 65 && b <= 90) { b = b + 32; }
+                if (a != b) { break; }
+                k = k + 1;
+            }
+            if (k == m) { return i; }
+        }
+        return -1;
+    }
+
+    static async void BackgroundGet(HttpClient c, List<string> sink) {
+        string r = await c.GetAsync("/len");
+        sink.Add(r);
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        Prog.accepted = 0;
+        Prog.requests = 0;
+        Prog.killIdle = false;
+        Task.Spawn(Prog.Serve());
+        // Probe until the listener answers; a fixed sleep would flake under
+        // parallel ctest load. The probe's own accept is not counted: the
+        // request/accept counters are zeroed after it.
+        bool up = false;
+        for (int i = 0; i < 250 && !up; i = i + 1) {
+            TcpClient probe = await TcpClient.ConnectAsync("127.0.0.1",
+                                                          Prog.PORT, 200);
+            if (probe != null) {
+                probe.Close();
+                up = true;
+            } else {
+                await Task.Delay(20);
+            }
+        }
+
+        HttpClient c = new HttpClient("127.0.0.1", Prog.PORT);
+        c.SetTimeout(8000);
+
+        // 1. Serial requests ride one connection.
+        string b1 = await c.GetAsync("/len");
+        string b2 = await c.GetAsync("/len");
+        string b3 = await c.GetAsync("/len");
+        Console.WriteLine("bodies: " + b1 + b2 + b3);
+        Console.WriteLine("reuse-one-conn: "
+            + Convert.ToString(Prog.accepted == 1 ? 1 : 0));
+        Console.WriteLine("requests-seen: " + Convert.ToString(Prog.requests));
+
+        // 2. A POST body is framed with Content-Length on the reused link.
+        string echoed = await c.PostAsync("/echo", "a=1&b=2");
+        Console.WriteLine("echo: " + echoed);
+        Console.WriteLine("still-one-conn: "
+            + Convert.ToString(Prog.accepted == 1 ? 1 : 0));
+
+        // 3. Chunked responses decode and keep the link.
+        string chunked = await c.GetAsync("/chunked");
+        Console.WriteLine("chunked: " + chunked);
+        Console.WriteLine("chunked-one-conn: "
+            + Convert.ToString(Prog.accepted == 1 ? 1 : 0));
+
+        // 4. 204 carries no body: not a hang, not a broken link.
+        string r204 = await c.GetAsync("/204");
+        Console.WriteLine("empty204: "
+            + Convert.ToString(r204.Length == 0 ? 1 : 0));
+        Console.WriteLine("after204-one-conn: "
+            + Convert.ToString(Prog.accepted == 1 ? 1 : 0));
+
+        // 5. HEAD: Content-Length announces six bytes that never follow.
+        HttpResponse head = await c.SendAsync("HEAD", "/head", "");
+        Console.WriteLine("head-empty: "
+            + Convert.ToString(head.body.Length == 0 ? 1 : 0));
+        Console.WriteLine("head-status: "
+            + Convert.ToString(head.statusCode));
+        Console.WriteLine("head-one-conn: "
+            + Convert.ToString(Prog.accepted == 1 ? 1 : 0));
+
+        // 6. Connection: close retires the link after a correct body.
+        string closed = await c.GetAsync("/close");
+        int accAfterClose = Prog.accepted;
+        string afterClose = await c.GetAsync("/len");
+        Console.WriteLine("close-body: " + closed);
+        Console.WriteLine("close-not-pooled: "
+            + Convert.ToString(Prog.accepted == accAfterClose + 1 ? 1 : 0));
+        Console.WriteLine("after-close: " + afterClose);
+
+        // 7. A close-delimited response is read in full and not pooled.
+        string nolen = await c.GetAsync("/nolen");
+        int accAfterNolen = Prog.accepted;
+        string afterNolen = await c.GetAsync("/len");
+        Console.WriteLine("nolen: " + nolen);
+        Console.WriteLine("nolen-not-pooled: "
+            + Convert.ToString(Prog.accepted == accAfterNolen + 1 ? 1 : 0));
+        Console.WriteLine("after-nolen: " + afterNolen);
+
+        // 8. The upstream drops the idle link: the next request transparently
+        //    retries on a fresh one (one extra accept, same body).
+        Prog.killIdle = true;
+        string _warm = await c.GetAsync("/len");
+        int accBeforeRevive = Prog.accepted;
+        string revived = await c.GetAsync("/len");
+        Console.WriteLine("revived: " + revived);
+        Console.WriteLine("revive-one-extra-conn: "
+            + Convert.ToString(Prog.accepted == accBeforeRevive + 1 ? 1 : 0));
+
+        // The revive check ran with killIdle set, so the upstream closed the
+        // link it just served. Stop the killing and rebuild one stable pooled
+        // link for the explicit-close check below.
+        Prog.killIdle = false;
+        string _reprime = await c.GetAsync("/len");
+
+        // 9. A second in-flight request on the same client falls back to its
+        //    own one-shot connection; both answers come back.
+        Prog.killIdle = false;
+        int accBeforeConc = Prog.accepted;
+        HttpClient cc = new HttpClient("127.0.0.1", Prog.PORT);
+        cc.SetTimeout(8000);
+        List<string> sink = new List<string>();
+        Task.Spawn(Prog.BackgroundGet(cc, sink));
+        string mainB = await cc.GetAsync("/len");
+        for (int i = 0; i < 400 && sink.Count == 0; i = i + 1) {
+            await Task.Delay(25);
+        }
+        Console.WriteLine("concurrent-main: " + mainB);
+        Console.WriteLine("concurrent-bg: "
+            + Convert.ToString(sink.Count == 1 ? 1 : 0)
+            + (sink.Count == 1 ? ":" + sink[0] : ""));
+        Console.WriteLine("concurrent-two-conns: "
+            + Convert.ToString(Prog.accepted == accBeforeConc + 2 ? 1 : 0));
+
+        // 10. DisableKeepAlive returns to one connection per request.
+        int accBeforeNoKa = Prog.accepted;
+        HttpClient nk = new HttpClient("127.0.0.1", Prog.PORT);
+        nk.SetTimeout(8000);
+        nk.DisableKeepAlive();
+        string _na = await nk.GetAsync("/len");
+        string _nb = await nk.GetAsync("/len");
+        Console.WriteLine("noka-two-conns: "
+            + Convert.ToString(Prog.accepted == accBeforeNoKa + 2 ? 1 : 0));
+
+        // 11. Close() drops the pooled link; the next request reconnects.
+        int accBeforeExplicit = Prog.accepted;
+        string _p1 = await c.GetAsync("/len");
+        c.Close();
+        string _p2 = await c.GetAsync("/len");
+        Console.WriteLine("explicit-close-reconnects: "
+            + Convert.ToString(Prog.accepted == accBeforeExplicit + 1 ? 1 : 0));
+
+        // Close the pooled links so no client socket outlives the test.
+        c.Close();
+        cc.Close();
+        // Stop wakes the parked accept (CancelIoEx before the fd closes);
+        // the settle window lets the accept loop and the last ServeOne
+        // unwind on the reactor before the forwarder-style exit, so the
+        // leakcheck sweep sees no reachable server objects.
+        Prog.l.Stop();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        Console.WriteLine("keepalive-done: 1");
+        return 0;
+    }
+
+    // void Main + await: the process ends when Run's coroutine completes,
+    // without draining coroutines parked forever in the accept loop (the
+    // shape http_forwarder_keepalive also uses).
+    static void Main() {
+        int _rc = await Run();
+    }
+}

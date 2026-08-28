@@ -2149,11 +2149,21 @@ class Worker {
         }
         framer.Dispose();
         WsWriter writer = new WsWriter();
+        WsAssembler asm = new WsAssembler(reader.MaxLen());
         MessageHandler onFrameData = this.MessageHandlerOf();
         bool active = true;
         while (active && !conn.closed) {
             int total = reader.FrameSize();
             while (total < 0) {
+                if (total == -2 || total == -3) {
+                    // -2 = 帧长编码违规（1002）；-3 = 消息过大（1009）。
+                    // 无上限时对端声明一个 2GB 的帧就能把缓冲撑到 OOM。
+                    byte[] enc = WsFrame.CloseFrameWithCode(total == -3 ? 1009 : 1002).Encode();
+                    writer.Append(enc, 4);
+                    int _v = await writer.Flush(client);
+                    active = false;
+                    break;
+                }
                 // Nothing more to answer from this batch: put the replies on the
                 // wire before parking on the reactor.
                 if (writer.Pending()) { int _f = await writer.Flush(client); }
@@ -2168,34 +2178,52 @@ class Worker {
 
             WsFrame frame = reader.TakeFrame(total);
 
-            if (frame.opcode == WsOpcode.Text || frame.opcode == WsOpcode.Binary) {
-                BumpStat();
-                string response = "";
-                if (onFrameData != null) {
-                    response = await onFrameData(conn, frame.payload);
-                } else {
-                    response = frame.payload;   // default: echo
-                }
-                if (response.Length > 0) {
-                    WsFrame respFrame = WsFrame.TextFrame(response);
-                    respFrame.opcode = frame.opcode;
-                    byte[] encoded = respFrame.Encode();
-                    int hdrLen = 2;
-                    if (response.Length > 65535) { hdrLen = 10; }
-                    else if (response.Length > 125) { hdrLen = 4; }
-                    writer.Append(encoded, hdrLen + response.Length);
-                    BumpSent();
-                }
-            } else if (frame.opcode == WsOpcode.Ping) {
+            if (frame.opcode == WsOpcode.Ping) {
                 WsFrame pong = WsFrame.PongFrame();
                 byte[] encoded = pong.Encode();
                 writer.Append(encoded, 2);
-            } else if (frame.opcode == WsOpcode.Close) {
+                continue;
+            }
+            if (frame.opcode == WsOpcode.Pong) { continue; }
+            if (frame.opcode == WsOpcode.Close) {
                 WsFrame closeResp = WsFrame.CloseFrame();
                 byte[] enc2 = closeResp.Encode();
                 writer.Append(enc2, 2);
                 int _c = await writer.Flush(client);
                 active = false;
+                break;
+            }
+            // 数据帧（Text/Binary/Continuation）：分片消息在 fin 时
+            // 整条交付——此前 continuation 帧被静默丢弃。
+            int feed = asm.Feed(frame);
+            if (feed < 0) {
+                byte[] enc = WsFrame.CloseFrameWithCode(feed == -2 ? 1009 : 1002).Encode();
+                writer.Append(enc, 4);
+                int _r = await writer.Flush(client);
+                active = false;
+                break;
+            }
+            if (feed == 0) { continue; }
+
+            int msgOpcode = asm.MessageOpcode();
+            string message = asm.Complete();
+
+            BumpStat();
+            string response = "";
+            if (onFrameData != null) {
+                response = await onFrameData(conn, message);
+            } else {
+                response = message;   // default: echo
+            }
+            if (response.Length > 0) {
+                WsFrame respFrame = WsFrame.TextFrame(response);
+                respFrame.opcode = msgOpcode;
+                byte[] encoded = respFrame.Encode();
+                int hdrLen = 2;
+                if (response.Length > 65535) { hdrLen = 10; }
+                else if (response.Length > 125) { hdrLen = 4; }
+                writer.Append(encoded, hdrLen + response.Length);
+                BumpSent();
             }
         }
 

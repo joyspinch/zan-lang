@@ -806,14 +806,31 @@ class Migration {
         this.downSql = down;
     }
 
+    static Migration New(string name, string up, string down) {
+        return new Migration(name, up, down);
+    }
+
+    /// <summary>执行一条迁移语句；执行器以负数报告失败时抛出
+    /// <see cref="DbException"/>——迁移绝不能悄悄落空，
+    /// 否则记录表照样登记，失败被永久掩盖（内置驱动语句失败
+    /// 本就直接抛，这里给不抛异常的自定义执行器兜底）。</summary>
+    static int Exec(IDbExecutor db, string sql) {
+        int n = db.Execute(sql);
+        if (n < 0) {
+            throw new DbException("statement failed: " + sql, 0,
+                                  DbProvider.Unknown);
+        }
+        return n;
+    }
+
     /// <summary>执行迁移（运行 UP SQL）。</summary>
     void Up(IDbExecutor db) {
-        db.Execute(this.upSql);
+        Migration.Exec(db, this.upSql);
     }
 
     /// <summary>回退迁移（运行 DOWN SQL）。</summary>
     void Down(IDbExecutor db) {
-        db.Execute(this.downSql);
+        Migration.Exec(db, this.downSql);
     }
 
     /// <summary>确保迁移记录表存在。SQLite 可以以
@@ -822,10 +839,11 @@ class Migration {
     static void EnsureTable(IDbExecutor db) {
         int p = db.GetProvider();
         if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
-            db.Execute("CREATE TABLE IF NOT EXISTS _migrations "
+            Migration.Exec(db, "CREATE TABLE IF NOT EXISTS _migrations "
                 + "(name VARCHAR(255) PRIMARY KEY, applied_at VARCHAR(64))");
         } else {
-            db.Execute("CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY, applied_at TEXT)");
+            Migration.Exec(db, "CREATE TABLE IF NOT EXISTS _migrations "
+                + "(name TEXT PRIMARY KEY, applied_at TEXT)");
         }
     }
 
@@ -844,9 +862,13 @@ class Migration {
             Migration m = migrations[i];
             if (!IsApplied(db, m.name)) {
                 m.Up(db);
-                db.Execute(
+                int mark = db.Execute(
                     "INSERT INTO _migrations (name, applied_at) VALUES (?, 'now')",
                     new DbParams().Add(m.name));
+                if (mark < 0) {
+                    throw new DbException("recording the migration failed: "
+                        + m.name, 0, DbProvider.Unknown);
+                }
                 Console.WriteLine("[Migration] Applied: " + m.name);
             }
         }

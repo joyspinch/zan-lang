@@ -4,6 +4,14 @@ using System.Security.Cryptography;
 
 namespace System.Net.Tls;
 
+/// 证书策略：客户端握手后若链/主机名校验不通过（verify_result
+/// != 0），以 (verifyResult, 对端证书文本) 调用；返回 true 放行
+/// 本次连接，false 拒绝。证书文本形如
+/// "issuer=/CN=GlobalSign.../O=Alibaba subject=/CN=example.com"。
+/// 典型用途：老系统缺根证书时按已知签发者放行（.NET
+/// ServerCertificateValidationCallback 的对应物）。
+delegate bool CertPolicyFn(long verifyResult, string certText);
+
 /// <summary>
 /// TLS 上下文：封装 OpenSSL 的 SSL_CTX。每个服务器（带
 /// 证书 + 私钥）或每个客户端创建一个，再据此为每个连接派生
@@ -48,6 +56,12 @@ class TlsContext {
     static extern int X509_STORE_add_cert(string store, string x);
     [DllImport("crypto")]
     static extern void X509_free(string x);
+    [DllImport("crypto")]
+    static extern string X509_get_issuer_name(string x);
+    [DllImport("crypto")]
+    static extern string X509_get_subject_name(string x);
+    [DllImport("crypto")]
+    static extern int X509_NAME_oneline(string name, byte[] buf, int size);
     [DllImport("crt", EntryPoint = "memcpy")]
     static extern nint PlatMemCopyIn(byte[] dst, nint src, long n);
     [DllImport("crt", EntryPoint = "memcpy")]
@@ -79,6 +93,9 @@ class TlsContext {
     // 持有系统信任的合法证书的中间人（MITM）攻击。
     List<string> pins;
     bool pinRequired;
+    // 证书策略（客户端）：设置后握手不再因证书校验失败中止，
+    // 校验结果照常记入 verify_result，握手完成后交给策略裁决。
+    CertPolicyFn certPolicy;
 
     TlsContext() {
         this.ctx = null;
@@ -88,7 +105,17 @@ class TlsContext {
         this.trust = "";
         this.pins = null;
         this.pinRequired = false;
+        this.certPolicy = null;
     }
+
+    /// <summary>设置证书策略（见 <see cref="CertPolicyFn"/>）。
+    /// 只影响客户端方向；与 DisableVerify() 互斥的放宽手段：
+    /// 校验仍在跑，放行与否由策略逐连接决定。</summary>
+    void SetCertPolicy(CertPolicyFn fn) {
+        this.certPolicy = fn;
+    }
+
+    bool PolicyActive() { return this.certPolicy != null; }
 
     /// <summary>添加一个可接受的服务器公钥 pin：即
     /// DER SubjectPublicKeyInfo 的 base64 SHA-256（即由
@@ -433,6 +460,8 @@ class TlsStream {
     [DllImport("ssl")]
     static extern int SSL_get_error(string ssl, int ret);
     [DllImport("ssl")]
+    static extern int SSL_set_verify(string ssl, int mode, string callback);
+    [DllImport("ssl")]
     static extern int SSL_shutdown(string ssl);
     [DllImport("ssl")]
     static extern int SSL_ctrl(string ssl, int cmd, int larg, string parg);
@@ -581,6 +610,15 @@ class TlsStream {
                 }
             }
         }
+        // 策略模式：握手不再因证书校验失败中止（OpenSSL 层关掉
+        // SSL_VERIFY_PEER），链/主机名校验结果照常记在
+        // verify_result 里，握手完成后由策略裁决。没有策略时保持
+        // SSL_VERIFY_PEER 原语义——握手中失败即断开。
+        if (ctx.PolicyActive()) {
+            int verifyNone = 0;
+            SSL_CTX_set_verify(ctx.ctx, verifyNone, null);
+            SSL_set_verify(s.ssl, verifyNone, null);
+        }
         int ok = await s.HandshakeAsync();
         if (ok != 1) {
             // SSL_VERIFY_PEER 下证书不受信任在握手中就失败，此时真正的原因
@@ -602,10 +640,21 @@ class TlsStream {
         if (ctx.verify) {
             long vr = SSL_get_verify_result(s.ssl);
             if (vr != 0) {
-                TlsStream.SetLastError("TLS 证书链或主机名校验失败（verify_result="
-                + Convert.ToString(vr) + "）" + ctx.TrustHint());
-                s.Close();
-                return null;
+                string certText = "";
+                if (ctx.PolicyActive()) {
+                    certText = TlsStream.PeerCertText(s.ssl);
+                }
+                if (ctx.PolicyActive() && ctx.certPolicy(vr, certText)) {
+                    // 策略放行：调用方口径（如老系统缺根证书时的
+                    // 已知签发者白名单）接受本次连接。
+                } else {
+                    TlsStream.SetLastError(
+                        "TLS 证书链或主机名校验失败（verify_result="
+                    + Convert.ToString(vr) + "）" + certText
+                    + ctx.TrustHint());
+                    s.Close();
+                    return null;
+                }
             }
         }
         if (ctx.PinningActive()) {
@@ -633,6 +682,34 @@ class TlsStream {
             i = i + 1;
         }
         return hasColon || onlyDigitDot;
+    }
+
+    /// 对端证书的可读文本："issuer=... subject=..."；无对端证书
+    /// 时返回 ""。证书策略回调与错误报告共用。
+    static string PeerCertText(string ssl) {
+        string cert = SSL_get1_peer_certificate(ssl);
+        if (cert == null) { return ""; }
+        string text = "issuer=" + TlsStream.NameText(
+                          X509_get_issuer_name(cert))
+                      + " subject=" + TlsStream.NameText(
+                          X509_get_subject_name(cert));
+        X509_free(cert);
+        return text;
+    }
+
+    /// X509_NAME → 单行可读文本（X509_NAME_oneline 形式）。
+    static string NameText(string name) {
+        if (name == null) { return ""; }
+        byte[] buf = new byte[600];
+        int cap = 600;
+        int n = X509_NAME_oneline(name, buf, cap);
+        if (n <= 0) { return ""; }
+        int end = -1;
+        for (int i = 0; i < 600; i = i + 1) {
+            if (buf[i] == 0) { end = i; break; }
+        }
+        if (end <= 0) { return ""; }
+        return buf.ToStr(0, end);
     }
 
     /// <summary>对端证书 DER

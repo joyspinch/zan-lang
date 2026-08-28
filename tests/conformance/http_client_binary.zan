@@ -1,0 +1,143 @@
+// Conformance: the HTTP client's binary-safe response path (SendBytesAsync).
+//
+// Zan strings are NUL-terminated and `a + b` is strlen-based, so a response
+// body assembled from string chunks used to truncate at the first NUL byte:
+// a 2500-byte all-zero body arrived as length 0, a JPEG (whose SOI/quant
+// tables put NULs in the first bytes) arrived as a handful of bytes, and
+// resp.bodyBytes was never populated on the client at all. SendBytesAsync
+// assembles the response with explicit byte counts (HttpFramer +
+// ByteBuffer) and fills bodyBytes/bodyBytesLen, so IsBinary()/BodyLength()
+// work and image downloads survive binary payloads.
+//
+// Covered here: a Content-Length body of pure NULs, spot-checked byte
+// positions across a 0..255 pattern, a 204 (no body), a text body, a 404,
+// and an EOF-delimited binary body (HTTP/1.0, no Content-Length) served by
+// a raw socket so the missing header is real.
+using System;
+using System.IO;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Threading;
+
+class Program {
+    static int PORT = 9567;
+
+    static async HttpResponse Handle(HttpRequest req) {
+        if (req.path == "/nuls") {
+            // 2500 bytes, every one of them NUL.
+            byte[] b = new byte[2500];
+            return HttpResponse.Bytes(b, 2500, "application/octet-stream");
+        }
+        if (req.path == "/pattern") {
+            byte[] b = new byte[256];
+            for (int i = 0; i < 256; i = i + 1) {
+                b[i] = (byte)i;
+            }
+            return HttpResponse.Bytes(b, 256, "application/octet-stream");
+        }
+        if (req.path == "/nocontent") {
+            HttpResponse resp = HttpResponse.Text("");
+            resp.statusCode = 204;
+            return resp;
+        }
+        if (req.path == "/text") {
+            return HttpResponse.Text("plain text body");
+        }
+        return HttpResponse.NotFound();
+    }
+
+    // HTTP/1.0 one-shot response with no Content-Length: the body is
+    // delimited by the connection close, not by a declared count. Served
+    // from a raw socket so the absent header is genuine. Async socket
+    // calls throughout: the accepted fd lives on the IO reactor, and a
+    // blocking sync accept/send on it races the client's async read.
+    static async int EofServer() {
+        nint listener = Socket.CreateTcp();
+        Socket.SetReuseAddr(listener);
+        Socket.Bind(listener, "127.0.0.1", PORT + 1);
+        Socket.Listen(listener, 8);
+        nint client = await Socket.AcceptAsync(listener);
+        // Drain the request first: closesocket with unread inbound data
+        // aborts the connection (RST) and discards the queued response.
+        await Socket.ReadReady(client);
+        string _req = Socket.Receive(client, 4096);
+        int _h = await Socket.SendStringAsync(client,
+            "HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n");
+        // byte[].ToStr stops at the first NUL, so the NUL-bearing payload
+        // goes through ByteBuffer, whose Str/ToStr are length-based.
+        ByteBuffer bb = ByteBuffer.Alloc(8);
+        bb.WriteU8(97);
+        bb.WriteU8(98);
+        bb.WriteU8(0);
+        bb.WriteU8(0);
+        bb.WriteU8(99);
+        bb.WriteU8(100);
+        string payload = bb.ToStr();
+        int blen = bb.Length();
+        int _b = await Socket.SendAsync(client, payload, blen);
+        bb.Free();
+        Socket.Close(client);
+        Socket.Close(listener);
+        return 0;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer server = new HttpServer("127.0.0.1", PORT);
+        server.OnRequest(Program.Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(50);
+
+        HttpClient c = new HttpClient("127.0.0.1", PORT);
+        c.SetTimeout(5000);
+
+        HttpResponse nuls = await c.SendBytesAsync("GET", "/nuls", "");
+        Console.WriteLine("nuls=" + Convert.ToString(nuls.statusCode)
+            + " bin=" + Convert.ToString(nuls.IsBinary())
+            + " len=" + Convert.ToString(nuls.BodyLength()));
+
+        HttpResponse pat = await c.SendBytesAsync("GET", "/pattern", "");
+        byte[] pb = pat.bodyBytes;
+        Console.WriteLine("pattern=" + Convert.ToString(pat.statusCode)
+            + " len=" + Convert.ToString(pat.BodyLength())
+            + " b0=" + Convert.ToString(pb[0] & 255)
+            + " b1=" + Convert.ToString(pb[1] & 255)
+            + " b65=" + Convert.ToString(pb[65] & 255)
+            + " b255=" + Convert.ToString(pb[255] & 255));
+
+        HttpResponse nc = await c.SendBytesAsync("GET", "/nocontent", "");
+        Console.WriteLine("nocontent=" + Convert.ToString(nc.statusCode)
+            + " bin=" + Convert.ToString(nc.IsBinary())
+            + " len=" + Convert.ToString(nc.BodyLength()));
+
+        HttpResponse tx = await c.SendBytesAsync("GET", "/text", "");
+        Console.WriteLine("text bin=" + Convert.ToString(tx.IsBinary())
+            + " body=" + tx.body);
+
+        HttpResponse nf = await c.SendBytesAsync("GET", "/missing", "");
+        Console.WriteLine("missing=" + Convert.ToString(nf.statusCode));
+
+        Task.Spawn(Program.EofServer());
+        await Task.Delay(100);
+        HttpClient e = new HttpClient("127.0.0.1", PORT + 1);
+        e.SetTimeout(5000);
+        HttpResponse eof = await e.SendBytesAsync("GET", "/raw", "");
+        byte[] eb = eof.bodyBytes;
+        Console.WriteLine("eof=" + Convert.ToString(eof.statusCode)
+            + " bin=" + Convert.ToString(eof.IsBinary())
+            + " len=" + Convert.ToString(eof.BodyLength())
+            + " b0=" + Convert.ToString(eb[0] & 255)
+            + " b2=" + Convert.ToString(eb[2] & 255)
+            + " b5=" + Convert.ToString(eb[5] & 255));
+        // 唤醒挂起的 accept 并让服务器协程退出；不加这一步，
+        // 退出时的泄漏探测会把整条服务端对象链记为仍可达。
+        server.Stop();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Program.Run();
+    }
+}

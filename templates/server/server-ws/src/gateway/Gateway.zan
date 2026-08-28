@@ -140,29 +140,50 @@ class Gateway {
 
         /* ---- 读循环 ---- */
         WsReader reader = new WsReader(clientSock);
+        WsAssembler asm = new WsAssembler(reader.MaxLen());
         bool connected = true;
         while (connected) {
             int total = reader.FrameSize();
             while (total < 0) {
+                if (total == -2 || total == -3) {
+                    /* -2 = 帧长编码违规（1002）；-3 = 消息过大（1009）*/
+                    bool vr = Gateway.SendFrame(conn.sock,
+                        WsFrame.CloseFrameWithCode(total == -3 ? 1009 : 1002).Encode(), 4);
+                    connected = false;
+                    break;
+                }
                 int n = await reader.FillMore();
                 if (n == 0) { connected = false; break; }
                 total = reader.FrameSize();
             }
             if (!connected) { break; }
 
-            WsFrame frame = WsFrame.Decode(reader.buf, total);
-            reader.Consume(total);
+            WsFrame frame = reader.TakeFrame(total);
 
-            if (frame.opcode == WsOpcode.Text || frame.opcode == WsOpcode.Binary) {
-                string outMsg = await ChatWorker.OnMessage(conn, frame.payload);
-                if (outMsg.Length > 0) {
-                    int bc = this.Broadcast(outMsg);
-                }
-            } else if (frame.opcode == WsOpcode.Ping) {
+            if (frame.opcode == WsOpcode.Ping) {
                 bool qr = Gateway.SendFrame(conn.sock, WsFrame.PongFrame().Encode(), 2);
-            } else if (frame.opcode == WsOpcode.Close) {
+                continue;
+            }
+            if (frame.opcode == WsOpcode.Pong) { continue; }
+            if (frame.opcode == WsOpcode.Close) {
                 bool cr = Gateway.SendFrame(conn.sock, WsFrame.CloseFrame().Encode(), 2);
                 connected = false;
+                break;
+            }
+            /* 数据帧：分片消息在 fin 时整条交付 */
+            int feed = asm.Feed(frame);
+            if (feed < 0) {
+                bool br = Gateway.SendFrame(conn.sock,
+                    WsFrame.CloseFrameWithCode(feed == -2 ? 1009 : 1002).Encode(), 4);
+                connected = false;
+                break;
+            }
+            if (feed == 0) { continue; }
+
+            string message = asm.Complete();
+            string outMsg = await ChatWorker.OnMessage(conn, message);
+            if (outMsg.Length > 0) {
+                int bc = this.Broadcast(outMsg);
             }
         }
 

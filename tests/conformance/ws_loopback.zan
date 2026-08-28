@@ -1,0 +1,145 @@
+// WebSocket 端到端回归（loopback）：WebSocketServer + 裸帧客户端。
+//
+// 1. 分片重组：一条消息拆成 Text(fin=0) + Continuation(fin=0) +
+//    Continuation(fin=1) 三个帧——旧服务器把 continuation 帧静默
+//    丢弃，消息只剩第一片。
+// 2. NUL 帧对齐：带内嵌 NUL 的二进制帧后跟普通文本帧——旧路径按
+//    strlen 计长会错位；echo 是 string API（NUL 处截断），
+//    这里断言 echo 回首字节且后续文本帧仍对齐。
+// 3. 帧上限：声明 32 MiB 的帧（超过 16 MiB 上限）→ 服务器以
+//    带状态码的关闭帧（1009）断开，而不是把缓冲翻倍到 OOM。
+using System;
+using System.Net.WebSocket;
+using System.Net.Sockets;
+using System.Threading;
+using System.Text;
+
+class Program {
+    static async string Echo(string m) { return m; }
+
+    // 发一个掩码帧（测试用固定掩码；服务器不校验掩码内容）。
+    static void SendMasked(nint s, int opcode, bool fin, string payload, int len) {
+        byte[] f = new byte[2 + 4 + len + 1];
+        f[0] = (byte)((fin ? 128 : 0) | opcode);
+        f[1] = (byte)(128 | len);
+        f[2] = 1; f[3] = 2; f[4] = 3; f[5] = 4;
+        for (int i = 0; i < len; i = i + 1) {
+            f[6 + i] = (byte)((payload[i] & 255) ^ (byte)(i % 4 + 1));
+        }
+        int _n = Socket.Send(s, f, 6 + len);
+    }
+
+    // 读一个未掩码的回显帧，返回其负载。
+    static async string ReadEcho(nint s) {
+        string raw = "";
+        int need = 2;
+        while (raw.Length < need) {
+            await Socket.ReadReady(s);
+            raw = raw + Socket.Receive(s, 4096);
+            if (raw.Length >= 2) {
+                int l0 = raw[1] & 255;
+                if (l0 < 126) { need = 2 + l0; }
+            }
+        }
+        int opcode = raw[0] & 15;
+        int plen = raw[1] & 127;
+        return raw.Substring(2, plen);
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        WebSocketServer server = new WebSocketServer("127.0.0.1", 19732);
+        server.OnMessage(Echo);
+        Task.Spawn(server.Start());
+
+        nint s = 0;
+        bool ok = false;
+        // 用会挂起（yield 到调度器）的异步连接重试：Task.Spawn 的
+        // 服务端协程要等主协程首次挂起才有机会 bind；同步 connect
+        // 加线程休眠从不让出，端口永远拒绝。
+        for (int i = 0; i < 100; i = i + 1) {
+            TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", 19732);
+            if (c != null) { s = c.Sock(); ok = true; break; }
+            Thread.Sleep(20);
+        }
+        if (!ok) { Console.WriteLine("frag=UNREACHABLE"); return 0; }
+        Socket.SetNonBlocking(s);
+
+        // 握手（文本，安全）。
+        string req = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: WebSocket\r\n"
+            + "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            + "Sec-WebSocket-Version: 13\r\n\r\n";
+        Socket.SendString(s, req);
+        string head = "";
+        while (Program.FindHead(head) < 0) {
+            await Socket.ReadReady(s);
+            head = head + Socket.Receive(s, 4096);
+        }
+        // 服务器对 Upgrade 值应做大小写不敏感比较（这里发的是
+        // "WebSocket" 标准拼写——旧实现只认两种小写形态，会 400）。
+        Console.WriteLine("handshake=" + (head.Substring(9, 3) == "101" ? "1" : "0"));
+
+        // 1. 分片消息重组。
+        SendMasked(s, 1, false, "Hel", 3);
+        SendMasked(s, 0, false, "lo ", 3);
+        SendMasked(s, 0, true, "WS", 2);
+        string frag = await ReadEcho(s);
+        Console.WriteLine("frag=" + frag);
+
+        // 2. NUL 帧对齐：binary "a\0b" 后接 text "ping"。
+        byte[] bin = new byte[10];   // 2 头 + 4 掩码 + 3 负载 + 1 裕量
+        bin[0] = (byte)(128 | 2);
+        bin[1] = (byte)(128 | 3);
+        bin[2] = 1; bin[3] = 2; bin[4] = 3; bin[5] = 4;
+        bin[6] = (byte)(97 ^ 1);
+        bin[7] = (byte)(0 ^ 2);
+        bin[8] = (byte)(98 ^ 3);
+        int _b = Socket.Send(s, bin, 9);
+        string nulEcho = await ReadEcho(s);
+        SendMasked(s, 1, true, "ping", 4);
+        string after = await ReadEcho(s);
+        Console.WriteLine("nul_survived=" + ((nulEcho == "a" && after == "ping") ? "1" : "0"));
+
+        // 3. 超长帧 → 1009 关闭帧。
+        byte[] big = new byte[11];
+        big[0] = (byte)(128 | 2);
+        big[1] = 127;
+        big[6] = 2;   // 32 MiB > 16 MiB 上限
+        int _g = Socket.Send(s, big, 10);
+        await Socket.ReadReady(s);
+        string cls = "";
+        while (cls.Length < 4) {
+            string part = Socket.Receive(s, 4096);
+            if (part.Length == 0) { break; }
+            cls = cls + part;
+        }
+        int closeCode = 0;
+        if (cls.Length >= 4 && (cls[0] & 15) == 8 && (cls[1] & 127) == 2) {
+            closeCode = ((cls[2] & 255) << 8) + (cls[3] & 255);
+        }
+        Console.WriteLine("close_code=" + closeCode);
+
+        Socket.Close(s);
+        server.Stop();
+        // 停止会唤醒挂起的 accept（Windows 上 CancelIoEx 先于关句柄）；
+        // 这几个泵转让 accept 循环与连接协程收干净，退出时的泄漏
+        // 探测才不会把服务端对象链记为仍可达。
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        return 0;
+    }
+
+    static int FindHead(string s) {
+        int n = s.Length - 3;
+        for (int i = 0; i < n; i = i + 1) {
+            if ((s[i] & 255) == 13 && (s[i + 1] & 255) == 10
+                && (s[i + 2] & 255) == 13 && (s[i + 3] & 255) == 10) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}
