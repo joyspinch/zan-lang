@@ -88,6 +88,20 @@ CORE = [
     "book-2", "notebook", "rss", "antenna", "signal-5g", "broadcast",
     "satellite", "radar-2", "crosshair", "target", "shield-half",
     "hand-stop", "heart-rate-monitor", "legs", "run", "walk",
+    # ---- 窗口/软件常用（标题栏、面板、状态）——语义必备，不靠打分 ----
+    # minimize/maximize/restore 经 Iconify search 确认 Tabler 原生存在；
+    # unlock 不存在（语义对应 lock-open，由 IconSvg 的别名表处理）。
+    "minimize", "maximize", "restore", "window", "app-window",
+    "app-window-filled", "window-minimize", "window-maximize",
+    "fullscreen", "picture-in-picture",
+    "arrows-minimize", "arrows-maximize", "collapse", "expand",
+    "pinned", "pinned-off", "pin", "lock-open", "square-key",
+    "layout-navbar-collapse", "fold", "unfold", "fold-up", "fold-down",
+    "eye-off",
+    # 语义图标集（Icon.SvgName 映射）需要的具体形态：
+    "star-filled", "device-floppy", "align-left", "align-center",
+    "align-right", "square", "typography", "select-all", "hand",
+    "align-top", "align-middle", "align-bottom",
 ]
 
 # Substrings that add relevance for names outside the core list. Coarse on
