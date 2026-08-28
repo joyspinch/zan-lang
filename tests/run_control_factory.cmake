@@ -63,7 +63,11 @@ if(last_class GREATER_EQUAL 0)
       string(REGEX MATCH
         "class[ \t]+${class}(<[A-Za-z0-9_, \t]*>)?[ \t]*[:{]" class_match "${text}")
       if(class_match)
-        string(FIND "${text}" "class ${class}" class_pos)
+        # Anchor on the full regex match (e.g. "class Marquee :"), not a bare
+        # "class ${class}" FIND: a sibling class whose name extends this one
+        # ("class MarqueeAnim" in the same file) otherwise hijacks the slice
+        # and the Kind() check inspects the wrong body.
+        string(FIND "${text}" "${class_match}" class_pos)
         string(SUBSTRING "${text}" ${class_pos} -1 class_source)
         string(FIND "${class_source}" "\nclass " next_class)
         if(next_class GREATER 0)
