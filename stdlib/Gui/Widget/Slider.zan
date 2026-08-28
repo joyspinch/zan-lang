@@ -3,22 +3,41 @@ using Gui;
 
 namespace Gui.Widget;
 
-/// 滑块，支持响应式 int 绑定与实时拖拽 / 点击定位。
-/// 按住滑块（或轨道）时值跟随指针移动，
-/// 与 NaiveUI 的 n-slider 行为一致。所有尺寸均按 DPI 缩放。
+/// 滑块（对齐 Naive UI n-slider）：响应式 int 绑定与实时拖拽 / 点击定位，
+/// 双柄范围（range）、垂直（vertical）、倒转（reverse）、标记刻度
+/// （marks，AddMark(值, 文案)）、限取标记值（stepMark，即 step="mark"）、
+/// 拖拽值气泡（tooltip / showTooltip / tipFormat 模板）、键盘微调
+/// （keyboard）与 Disabled 禁用态（皮肤 `slider:disabled`）。
+/// 所有尺寸均按 DPI 缩放。
 ///
 /// C# 风格保留式实例：
 ///     Slider vol = Slider.Bind(0, 100, model);
 ///     vol.Change += () => { ... };   // 拖动过程中值变化时触发
 ///     vol.Render(app, x, y, width);
-/// 为现有调用方保留旧版立即模式静态方法。
+/// 范围模式（值 = [Low, High] 区间，Naive UI range）：
+///     Slider rg = new Slider(0, 100);
+///     rg.range = true;
+///     rg.data = rangeModel.lo;       // 低值双向绑定
+///     rg.dataHigh = rangeModel.hi;   // 高值双向绑定
+///     rg.Low(); rg.High(); rg.SetRange(20, 70);
+/// 标记刻度（Naive UI marks / step="mark"）：
+///     sl.AddMark(20, "20°C"); sl.AddMark(37, "37°C");
+///     sl.stepMark = true;            // 只能停在标记值上
+/// 垂直（Naive UI vertical）：布局里给足高度（Grow/Prefer），
+/// 立即模式直接调用请用 RenderIn 显式给 height。
 class Slider : Control {
     int minVal;
     int maxVal;
+    /// 单值模式的值；range 模式下是低值（Naive UI value[0]）。
     SignalInt model;
+    /// range 模式的高值（Naive UI value[1]）。
+    SignalInt hiModel;
     /// 双向绑定值：`vol.data = settings.volume;` 保持模型
     /// 字段与滑块双向同步（编译器降级的 Binding）。
+    /// range 模式绑定低值，高值走 dataHigh。
     Binding<int> data;
+    /// range 模式高值的双向绑定。
+    Binding<int> dataHigh;
     int wid;
     /// 值变化时触发（C# 风格：`s.Change += h;`）。
     UiEvent Change;
@@ -26,31 +45,171 @@ class Slider : Control {
     UiEvent DragEnd;
     /// 拖动步长（Naive UI step prop）。0 = 任意（默认）。
     int step;
+    /// 范围模式（Naive UI range）：双滑块钮，值是 [Low, High] 区间。
+    bool range;
+    /// 垂直模式（Naive UI vertical）：轨道竖放，min 在下、值向上增长。
+    bool vertical;
+    /// 倒转（Naive UI reverse）：轨道调头，min 落在右端 / 顶端。
+    bool reverse;
+    /// 拖拽 / 悬停圆钮时显示值气泡（Naive UI tooltip，默认开）。
+    bool tooltip;
+    /// 始终显示值气泡（Naive UI show-tooltip）。
+    bool showTooltip;
+    /// 气泡文案模板（Naive UI format-tooltip）："{v}" 替换为当前值，
+    /// 如 "{v}%"。空 = 直接显示数字。
+    string tipFormat;
+    /// 只能取标记值（Naive UI step="mark"）。
+    bool stepMark;
+    /// 键盘方向键微调（Naive UI keyboard prop，默认开）。
+    bool keyboard;
+    /// 标记刻度：AddMark(值, 文案)，按值升序保持。
+    List<int> markVals;
+    List<string> markLabels;
+    /// designer 往返串："20=20°C|37=37°C"（GetExtra/SetExtra("marks")）。
+    string marksSpec;
+    /// 正在拖拽的钮：0 无 / 1 低（单值）/ 2 高。按住期间保持，
+    /// 松开清零——按轨道选中"最近的钮"只在按下那一刻决定。
+    int dragThumb;
+    /// range 模式里最近一次编辑的钮，键盘微调作用于它。
+    int lastEdited;
 
-    /// 将任意值量化到 `[min, max]` 区间内 `step` 整数倍。
-    /// step <= 0 时直接夹紧到边界。
+    // id 段（WidgetId.Block(32)）：wid = 轨道（焦点/键盘/点击定位），
+    // wid+1 = 低值钮，wid+2 = 高值钮，wid+8+i = 第 i 个标记（上限 24）。
+    static int MarkCap() { return 24; }
+
+    /// 将任意值量化到 `step` 整数倍 / 最近的标记值，再夹回
+    /// `[min, max]`——先量化后夹，max 端点永远可达。
     int Quantize(int v) {
-        if (v < minVal) { v = minVal; }
-        if (v > maxVal) { v = maxVal; }
-        if (step > 0) {
+        if (stepMark && markVals.Count > 0) {
+            v = this.NearestMarkVal(v);
+        } else if (step > 0) {
             int k = (v - minVal + step / 2) / step;
             v = minVal + k * step;
-            if (v < minVal) { v = minVal; }
-            if (v > maxVal) { v = maxVal; }
         }
+        if (v < minVal) { v = minVal; }
+        if (v > maxVal) { v = maxVal; }
         return v;
+    }
+
+    /// 离 `v` 最近的标记值（markVals 已升序，等距取更小者）。
+    int NearestMarkVal(int v) {
+        int best = markVals[0];
+        int bd = 2000000000;
+        for (int i = 0; i < markVals.Count; i = i + 1) {
+            int d = markVals[i] - v;
+            if (d < 0) { d = 0 - d; }
+            if (d < bd) { bd = d; best = markVals[i]; }
+        }
+        return best;
+    }
+
+    /// 下一个 / 上一个标记值；没有更远的标记时夹到 max / min。
+    int NextMarkVal(int v, bool up) {
+        int best = up ? maxVal : minVal;
+        for (int i = 0; i < markVals.Count; i = i + 1) {
+            int mv = markVals[i];
+            if (up) {
+                if (mv > v && mv <= best) { best = mv; }
+            } else {
+                if (mv < v && mv >= best) { best = mv; }
+            }
+        }
+        return best;
+    }
+
+    /// 键盘步进 +1 档：stepMark 时在标记间跳，否则按 step（缺省 1）。
+    int StepUpVal(int v) {
+        if (stepMark && markVals.Count > 0) { return this.NextMarkVal(v, true); }
+        int s = step > 0 ? step : 1;
+        return v + s;
+    }
+
+    /// 键盘步进 -1 档。
+    int StepDownVal(int v) {
+        if (stepMark && markVals.Count > 0) { return this.NextMarkVal(v, false); }
+        int s = step > 0 ? step : 1;
+        return v - s;
+    }
+
+    int Span() {
+        int r = maxVal - minVal;
+        if (r < 1) { r = 1; }
+        return r;
+    }
+
+    /// 值 → 千分比（0..1000）。
+    int FracOf(int v) {
+        int f = (v - minVal) * 1000 / Span();
+        if (f < 0) { f = 0; }
+        if (f > 1000) { f = 1000; }
+        return f;
+    }
+
+    /// 千分比 → 轨道上的像素位置。默认：横向 min 在左、竖向 min 在下；
+    /// reverse 把起点换到右端 / 顶端。
+    int PxAt(int f, int pos, int len) {
+        int off = f * len / 1000;
+        if (vertical) {
+            if (reverse) { return pos + off; }
+            return pos + len - off;
+        }
+        if (reverse) { return pos + len - off; }
+        return pos + off;
+    }
+
+    /// 轨道上的指针位置 → 量化后的值（横向/竖向、reverse 通吃）。
+    int ValAt(int p, int pos, int len) {
+        int rel = p - pos;
+        if (rel < 0) { rel = 0; }
+        if (rel > len) { rel = len; }
+        // 横向默认 min 在左（rel 即进度）；竖向默认 min 在下
+        // （要翻一次）。reverse 再翻一次 → 恰好是 vertical != reverse。
+        if (vertical != reverse) { rel = len - rel; }
+        int f = rel * 1000 / len;
+        return this.Quantize(minVal + f * Span() / 1000);
+    }
+
+    /// 气泡文案：tipFormat 里的 "{v}" 替换为值（Naive UI format-tooltip）。
+    string TipText(int v) {
+        string num = Convert.ToString(v);
+        if (tipFormat == null) { return num; }
+        if (tipFormat == "") { return num; }
+        string outS = "";
+        string rest = tipFormat;
+        int at = rest.IndexOf("{v}");
+        while (at >= 0) {
+            outS = outS + rest.Substring(0, at) + num;
+            rest = rest.Substring(at + 3, rest.Length - at - 3);
+            at = rest.IndexOf("{v}");
+        }
+        return outS + rest;
     }
 
     void InitSlider(int lo, int hi, SignalInt m) {
         this.InitControl("slider", 1);
+        if (hi < lo) { hi = lo; }
         minVal = lo;
         maxVal = hi;
         model = m;
-        wid = WidgetId.Next();
+        hiModel = new SignalInt(hi);
+        wid = WidgetId.Block(32);
         wiresOwnEvents = true;
         Change = new UiEvent();
         DragEnd = new UiEvent();
         step = 0;
+        range = false;
+        vertical = false;
+        reverse = false;
+        tooltip = true;
+        showTooltip = false;
+        tipFormat = "";
+        stepMark = false;
+        keyboard = true;
+        markVals = new List<int>();
+        markLabels = new List<string>();
+        marksSpec = "";
+        dragThumb = 0;
+        lastEdited = 1;
     }
 
     /// Default design-time constructor.
@@ -74,34 +233,177 @@ class Slider : Control {
 
     int Value() { return model.Get(); }
 
+    /// range 模式的低值（单值模式与 Value() 相同）。
+    int Low() { return model.Get(); }
+
+    /// range 模式的高值（单值模式返回同一个值）。
+    int High() { return range ? hiModel.Get() : model.Get(); }
+
+    /// 写入当前值（量化 + 同步双向绑定）。不触发 Change——
+    /// 程序化赋值不算用户手势。
+    void SetValue(int v) {
+        v = this.Quantize(v);
+        model.Set(v);
+        if (data != null) { data.Set(v); }
+    }
+
+    /// 一次写入区间两端（各自量化并保持 low <= high）。
+    void SetRange(int lo, int hi) {
+        lo = this.Quantize(lo);
+        hi = this.Quantize(hi);
+        if (hi < lo) { int tmp = lo; lo = hi; hi = tmp; }
+        model.Set(lo);
+        hiModel.Set(hi);
+        if (data != null) { data.Set(lo); }
+        if (dataHigh != null) { dataHigh.Set(hi); }
+    }
+
+    /// 加一枚标记刻度（Naive UI marks 的成员）。同值重复添加覆盖
+    /// 文案；列表保持按值升序。
+    void AddMark(int v, string label) {
+        List<int> vs = new List<int>();
+        List<string> ls = new List<string>();
+        bool placed = false;
+        for (int i = 0; i < markVals.Count; i = i + 1) {
+            if (markVals[i] == v) {
+                vs.Add(v);
+                ls.Add(label);
+                placed = true;
+            } else {
+                if (!placed && v < markVals[i]) {
+                    vs.Add(v);
+                    ls.Add(label);
+                    placed = true;
+                }
+                vs.Add(markVals[i]);
+                ls.Add(markLabels[i]);
+            }
+        }
+        if (!placed) { vs.Add(v); ls.Add(label); }
+        markVals = vs;
+        markLabels = ls;
+        marksSpec = this.MarksText();
+    }
+
+    void ClearMarks() {
+        markVals = new List<int>();
+        markLabels = new List<string>();
+        marksSpec = "";
+    }
+
+    int MarkCount() { return markVals.Count; }
+
+    int MarkValueAt(int i) { return markVals[i]; }
+
+    string MarkLabelAt(int i) { return markLabels[i]; }
+
+    /// designer 往返串："20=20°C|37=37°C|100=100°C"。
+    string MarksText() {
+        string s = "";
+        for (int i = 0; i < markVals.Count; i = i + 1) {
+            if (s != "") { s = s + "|"; }
+            s = s + Convert.ToString(markVals[i]) + "=" + markLabels[i];
+        }
+        return s;
+    }
+
+    void SetMarksText(string spec) {
+        markVals = new List<int>();
+        markLabels = new List<string>();
+        marksSpec = "";
+        if (spec == null || spec == "") { return; }
+        List<string> parts = spec.Split("|");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string it = parts[i];
+            if (it != "") {
+                int eq = it.IndexOf("=");
+                if (eq > 0) {
+                    int mv = Convert.ToInt32(it.Substring(0, eq));
+                    string lab = it.Substring(eq + 1, it.Length - eq - 1);
+                    this.AddMark(mv, lab);
+                }
+            }
+        }
+    }
+
+    /// 设计器挂钩：marks 不是单个字段，走 "20=20°C|37=37°C" 串往返。
+    override string GetExtra(string key) {
+        if (key == "marks") { return marksSpec; }
+        return "";
+    }
+
+    override bool SetExtra(string key, string val) {
+        if (key == "marks") { this.SetMarksText(val); return true; }
+        return false;
+    }
+
     /// 将绑定的模型值拉入本地信号（model -> UI）。
     void SyncBinding() {
-        if (data == null) { return; }
-        int cur = data.Get();
-        if (cur != model.Get()) { model.Set(cur); }
+        if (data != null) {
+            int cur = data.Get();
+            if (cur != model.Get()) { model.Set(cur); }
+        }
+        if (dataHigh != null) {
+            int cur = dataHigh.Get();
+            if (cur != hiModel.Get()) { hiModel.Set(cur); }
+        }
     }
 
     int Render(App app, int x, int y, int width) {
+        int h = this.prefH;
+        if (h <= 0) { h = vertical ? app.Scale(160) : app.theme.heightMedium; }
+        return this.RenderIn(app, x, y, width, h);
+    }
+
+    /// 显式盒高版本：竖向滑块需要调用方给高度。保留式布局走
+    /// Arrange/OnPaint 自动带 bh；立即模式请直接调这个。
+    int RenderIn(App app, int x, int y, int width, int height) {
         int id = wid;
         SyncBinding();
         app.focus.RegisterFocusable(id);
-        bool changed = this.PaintStyled(app, id, x, y, width);
-        // 键盘：方向键微调获得焦点的滑块。
-        if (Ui.Focused(app, id) && app.EventKind() == 4) {
+        bool disabled = this.IsDisabled();
+        bool changed = this.PaintStyled(app, id, x, y, width, height);
+        // 键盘：方向键步进（stepMark 时在标记间跳），Home/End 直达
+        // 两端；range 模式作用于最近编辑的那枚钮。
+        if (!disabled && keyboard && Ui.Focused(app, id)
+            && app.EventKind() == 4) {
             int kc = app.window.EventKeyCode();
-            int v = model.Get();
-            if (kc == 37 || kc == 40) { v = v - 1; }
-            if (kc == 39 || kc == 38) { v = v + 1; }
+            bool hi = range && lastEdited == 2;
+            int cur = hi ? hiModel.Get() : model.Get();
+            int v = cur;
+            if (kc == 37 || kc == 40) { v = this.StepDownVal(cur); }
+            if (kc == 39 || kc == 38) { v = this.StepUpVal(cur); }
+            if (kc == 36) { v = minVal; }
+            if (kc == 35) { v = maxVal; }
             if (v < minVal) { v = minVal; }
             if (v > maxVal) { v = maxVal; }
-            if (v != model.Get()) { model.Set(v); changed = true; app.RequestRedraw(); }
+            if (v != cur) {
+                if (hi) {
+                    if (v < model.Get()) { v = model.Get(); }
+                    hiModel.Set(v);
+                } else {
+                    if (range && v > hiModel.Get()) { v = hiModel.Get(); }
+                    model.Set(v);
+                }
+                changed = true;
+                app.RequestRedraw();
+            }
         }
         if (changed) {
             if (data != null) { data.Set(model.Get()); }
+            if (range && dataHigh != null) { dataHigh.Set(hiModel.Get()); }
             Change.Raise();
         }
-        DragEnd.RaiseIf(Ui.MouseUpOn(app, id));
-        On.Fire(app, id);
+        DragEnd.RaiseIf(Ui.MouseUpOn(app, id) || Ui.MouseUpOn(app, id + 1)
+                        || Ui.MouseUpOn(app, id + 2));
+        if (this.On.Any()) {
+            On.Fire(app, id);
+            On.Fire(app, id + 1);
+            On.Fire(app, id + 2);
+            for (int i = 0; i < markVals.Count && i < MarkCap(); i = i + 1) {
+                On.Fire(app, id + 8 + i);
+            }
+        }
         return id;
     }
 
@@ -125,10 +427,46 @@ class Slider : Control {
         PropSpec val = PropSpec.Int("value", "Value");
         val.snum = model;
         ps.Add(val);
+        PropSpec valHi = PropSpec.Int("valueHigh", "High value");
+        valHi.snum = hiModel;
+        valHi.WithTip("Range mode's high thumb (Naive UI range value[1]).");
+        ps.Add(valHi);
         PropSpec stp = PropSpec.Int("step", "Step");
         stp.num = step;
         stp.WithTip("Drag/keyboard increment. 0 = any value (Naive UI step prop).");
         ps.Add(stp);
+        PropSpec rng = PropSpec.Bool("range", "Range");
+        rng.flag = range;
+        rng.WithTip("Dual thumbs; value = [Low, High] (Naive UI range).");
+        ps.Add(rng);
+        PropSpec vert = PropSpec.Bool("vertical", "Vertical");
+        vert.flag = vertical;
+        vert.WithTip("Track stands up; needs a real height (Grow/Prefer).");
+        ps.Add(vert);
+        PropSpec rev = PropSpec.Bool("reverse", "Reverse");
+        rev.flag = reverse;
+        rev.WithTip("Flip the track: min sits at the right / top end.");
+        ps.Add(rev);
+        PropSpec sm = PropSpec.Bool("stepMark", "Step on marks");
+        sm.flag = stepMark;
+        sm.WithTip("Restrict selectable values to marks (Naive UI step=\"mark\").");
+        ps.Add(sm);
+        PropSpec tip = PropSpec.Bool("tooltip", "Tooltip");
+        tip.flag = tooltip;
+        tip.WithTip("Show the value bubble while dragging / hovering a thumb.");
+        ps.Add(tip);
+        PropSpec stiff = PropSpec.Bool("showTooltip", "Always tooltip");
+        stiff.flag = showTooltip;
+        stiff.WithTip("Keep the value bubble visible (Naive UI show-tooltip).");
+        ps.Add(stiff);
+        PropSpec kb = PropSpec.Bool("keyboard", "Keyboard");
+        kb.flag = keyboard;
+        kb.WithTip("Arrow keys nudge the focused slider; Home/End jump.");
+        ps.Add(kb);
+        PropSpec fmt = PropSpec.Text("tipFormat", "Tooltip format");
+        fmt.str = tipFormat;
+        fmt.WithTip("Format-tooltip template; \"{v}\" becomes the value, e.g. \"{v}%\".");
+        ps.Add(fmt);
         return ps;
     }
 
@@ -138,108 +476,380 @@ class Slider : Control {
         On.AddByName(evt, a);
     }
 
-    bool PaintStyled(App app, int id, int x, int y, int width) {
+    /// 圆钮命中（悬停气泡用）：指针落在钮的外扩方框里。
+    bool NearThumb(App app, int cx, int cy, int r) {
+        int dx = app.mouseX - cx;
+        if (dx < 0) { dx = 0 - dx; }
+        int dy = app.mouseY - cy;
+        if (dy < 0) { dy = 0 - dy; }
+        int pad = r + app.Scale(4);
+        return dx <= pad && dy <= pad;
+    }
+
+    /// 值气泡挂在帧末刷新的延迟队列上（盖在后续控件之上）：
+    /// 横向悬在钮上方（placement 0 = top），竖向挂在右侧
+    ///（placement 3 = right）。
+    void RequestTip(App app, int cx, int cy, int r, int v) {
+        if (vertical) {
+            Tooltip.Request(cx + r + app.Scale(6), cy, this.TipText(v), 3, 0);
+        } else {
+            Tooltip.Request(cx, cy - r - app.Scale(6), this.TipText(v), 0, 0);
+        }
+    }
+
+    /// 绘制 + 指针定位。返回本帧值是否变化（RenderIn 据此回写
+    /// 双向绑定并触发 Change）。轨道/填充/圆钮/标记的颜色全在
+    /// `slider::track/::fill/::thumb/::mark/::mark-label` 规则里，
+    /// 悬停与拖拽档由 ResolveEasedPartAs 淡变，代码只管值域→几何。
+    bool PaintStyled(App app, int id, int x, int y, int width, int height) {
         Canvas c = app.canvas;
         Theme t = app.theme;
-        int animH = this.prefH;
-        if (animH <= 0) { animH = t.heightMedium; }
+        bool disabled = this.IsDisabled();
+        bool hasMarks = markVals.Count > 0;
+
+        // 刻度文字排版：横向在轨道下方占一行，竖向在轨道右侧占一列。
+        StyleBox labStyle = this.ResolveEasedPartAsIn(
+            app, id, "slider", "mark-label", "", Class, disabled, false,
+            x, y, width, height);
+        int labFs = labStyle.FontOr(Style.FontFallback(app, "small"));
+        int labH = Canvas.FontHeight(labFs);
+        int labGap = app.Scale(8);
+        int labArea = 0;
+        int labCol = 0;
+        if (hasMarks) {
+            if (vertical) {
+                int mw = 0;
+                for (int i = 0; i < markLabels.Count; i = i + 1) {
+                    int w = Canvas.MeasureText(markLabels[i], labFs);
+                    if (w > mw) { mw = w; }
+                }
+                labCol = labGap + mw;
+            } else {
+                labArea = labGap + labH;
+            }
+        }
+
+        int boxH = height;
+        if (boxH <= 0) { boxH = t.heightMedium; }
         StyleBox root = this.ResolveEasedStyleAsIn(
-            app, id, "slider", Class, false, false, x, y, width, animH);
+            app, id, "slider", Class, disabled, false, x, y, width, boxH);
         StyleBox trackStyle = this.ResolveEasedPartAsIn(
-            app, id, "slider", "track", "", Class, false, false,
-            x, y, width, animH);
+            app, id, "slider", "track", "", Class, disabled, false,
+            x, y, width, boxH);
         StyleBox fillStyle = this.ResolveEasedPartAsIn(
-            app, id, "slider", "fill", "", Class, false, false,
-            x, y, width, animH);
-        StyleBox thumbStyle = this.ResolveEasedPartAsIn(
-            app, id, "slider", "thumb", "", Class, false, false,
-            x, y, width, animH);
+            app, id, "slider", "fill", "", Class, disabled, false,
+            x, y, width, boxH);
 
         int totalW = root.WidthOr(width);
-        int totalH = root.HeightOr(t.heightMedium);
-        int trackW = trackStyle.WidthOr(totalW);
-        if (trackW < 1) { trackW = 1; }
-        int trackH = trackStyle.HeightOr(app.Scale(4));
-        if (trackH < 1) { trackH = 1; }
-        int trackX = x + (totalW - trackW) / 2;
-        int trackY = y + (totalH - trackH) / 2;
-        bool active = app.focus.IsPressed(id);
-        bool changed = false;
-        int range = maxVal - minVal;
-        if (range < 1) { range = 1; }
+        int totalH = root.HeightOr(boxH);
+        if (totalW < 1) { totalW = 1; }
+        if (totalH < 1) { totalH = 1; }
 
-        if (active) {
-            int rel = app.mouseX - trackX;
-            if (rel < 0) { rel = 0; }
-            if (rel > trackW) { rel = trackW; }
-            int newVal = minVal + (rel * range + trackW / 2) / trackW;
-            newVal = this.Quantize(newVal);
-            if (newVal != model.Get()) {
-                model.Set(newVal);
-                changed = true;
-                app.RequestRedraw();
-            }
-        }
-
-        int currentVal = model.Get();
-        int fillW = (currentVal - minVal) * trackW / range;
-        if (fillW < 0) { fillW = 0; }
-        if (fillW > trackW) { fillW = trackW; }
-        root.Paint(app, x, y, totalW, totalH);
-        // 轨道/填充/圆钮的颜色全在 `slider::track/::fill/::thumb` 规则里，
-        // 悬停与拖拽档由 ResolveEasedPartAs 淡变，代码只管值域→几何。
-        c.FillRoundRect(trackX, trackY, trackW, trackH,
-                        trackStyle.RadiusOr(trackH / 2),
-                        trackStyle.BgOr(root.fg));
-        if (fillW > 0) {
-            int fillH = fillStyle.HeightOr(trackH);
-            int fillY = trackY + (trackH - fillH) / 2;
-            c.FillRoundRect(trackX, fillY, fillW, fillH,
-                            fillStyle.RadiusOr(fillH / 2),
-                            fillStyle.BgOr(fillStyle.AccentOr(root.accent)));
-        }
-
-        int thumbW = thumbStyle.WidthOr(app.Scale(18));
-        int thumbH = thumbStyle.HeightOr(thumbW);
-        int thumbSize = thumbW;
-        if (thumbH < thumbSize) { thumbSize = thumbH; }
-        if (thumbSize < 2) { thumbSize = 2; }
-        int thumbR = thumbSize / 2;
-        int thumbX = trackX + fillW;
-        if (trackW <= thumbSize) {
-            thumbX = trackX + trackW / 2;
+        // 轨道矩形：横向沿 x 铺（::track 的 width 可收窄），竖向沿 y
+        // 铺；厚度一律来自 ::track 的 height。横向把刻度文字行留出后
+        // 垂直居中，竖向把文字列留出后水平居中。
+        int thick = trackStyle.HeightOr(app.Scale(4));
+        if (thick < 1) { thick = 1; }
+        int trackX;
+        int trackY;
+        int trackW;
+        int trackH;
+        if (vertical) {
+            trackW = thick;
+            trackH = totalH;
+            trackX = x + (totalW - labCol - trackW) / 2;
+            trackY = y;
         } else {
-            if (thumbX < trackX + thumbR) { thumbX = trackX + thumbR; }
-            if (thumbX > trackX + trackW - thumbR) {
-                thumbX = trackX + trackW - thumbR;
+            trackW = trackStyle.WidthOr(totalW);
+            if (trackW < 1) { trackW = 1; }
+            trackH = thick;
+            trackX = x + (totalW - trackW) / 2;
+            trackY = y + (totalH - labArea - trackH) / 2;
+        }
+        int pos = vertical ? trackY : trackX;
+        int len = vertical ? trackH : trackW;
+        if (len < 1) { len = 1; }
+
+        int vLo = model.Get();
+        int vHi = range ? hiModel.Get() : vLo;
+        int fLo = this.FracOf(vLo);
+        int fHi = this.FracOf(vHi);
+
+        // ---- 指针：点标记取值 / 按钮拖动 / 按轨道定位并继续拖 -------
+        bool changed = false;
+        if (!disabled) {
+            for (int i = 0; i < markVals.Count && i < MarkCap(); i = i + 1) {
+                if (app.focus.IsPressed(id + 8 + i)) {
+                    int mv = markVals[i];
+                    int useHi = 0;
+                    if (range) {
+                        int dlo = mv - vLo;
+                        if (dlo < 0) { dlo = 0 - dlo; }
+                        int dhi = mv - vHi;
+                        if (dhi < 0) { dhi = 0 - dhi; }
+                        useHi = dhi < dlo ? 1 : 0;
+                    }
+                    if (useHi == 1) {
+                        if (mv < model.Get()) { mv = model.Get(); }
+                        if (mv != hiModel.Get()) {
+                            hiModel.Set(mv);
+                            changed = true;
+                            app.RequestRedraw();
+                        }
+                        lastEdited = 2;
+                    } else {
+                        if (range && mv > hiModel.Get()) { mv = hiModel.Get(); }
+                        if (mv != model.Get()) {
+                            model.Set(mv);
+                            changed = true;
+                            app.RequestRedraw();
+                        }
+                        lastEdited = 1;
+                    }
+                }
+            }
+            int pnt = vertical ? app.mouseY : app.mouseX;
+            if (app.focus.IsPressed(id + 1)) { dragThumb = 1; }
+            else if (range && app.focus.IsPressed(id + 2)) { dragThumb = 2; }
+            else if (app.focus.IsPressed(id)) {
+                if (dragThumb == 0) {
+                    // 按下轨道那一刻挑最近的钮，之后整段拖动固定它。
+                    dragThumb = 1;
+                    if (range) {
+                        int dlo = pnt - this.PxAt(fLo, pos, len);
+                        if (dlo < 0) { dlo = 0 - dlo; }
+                        int dhi = pnt - this.PxAt(fHi, pos, len);
+                        if (dhi < 0) { dhi = 0 - dhi; }
+                        if (dhi < dlo) { dragThumb = 2; }
+                    }
+                }
+            } else { dragThumb = 0; }
+            if (dragThumb > 0) {
+                int nv = this.ValAt(pnt, pos, len);
+                if (dragThumb == 2) {
+                    if (nv < model.Get()) { nv = model.Get(); }
+                    if (nv != hiModel.Get()) {
+                        hiModel.Set(nv);
+                        changed = true;
+                        app.RequestRedraw();
+                    }
+                    lastEdited = 2;
+                } else {
+                    if (range && nv > hiModel.Get()) { nv = hiModel.Get(); }
+                    if (nv != model.Get()) {
+                        model.Set(nv);
+                        changed = true;
+                        app.RequestRedraw();
+                    }
+                    lastEdited = 1;
+                }
+            }
+        } else {
+            dragThumb = 0;
+        }
+
+        vLo = model.Get();
+        vHi = range ? hiModel.Get() : vLo;
+        fLo = this.FracOf(vLo);
+        fHi = this.FracOf(vHi);
+
+        // ---- 轨道 + 填充 -------------------------------------------
+        root.Paint(app, x, y, totalW, totalH);
+        c.FillRoundRect(trackX, trackY, trackW, trackH,
+                        trackStyle.RadiusOr(thick / 2),
+                        trackStyle.BgOr(root.fg));
+        // 填充段：单值 = 起始边到钮（reverse 换起始边）；range = 两钮
+        // 之间。像素直接取 min/max，横向竖向一套代码。
+        int pLo = this.PxAt(fLo, pos, len);
+        int pHi = this.PxAt(fHi, pos, len);
+        int pStart;
+        if (vertical) { pStart = reverse ? trackY : trackY + trackH; }
+        else { pStart = reverse ? trackX + trackW : trackX; }
+        int fillA = range ? pLo : pStart;
+        int fillB = range ? pHi : pLo;
+        int fillMin = fillA < fillB ? fillA : fillB;
+        int fillMax = fillA < fillB ? fillB : fillA;
+        int fillSpan = fillMax - fillMin;
+        if (fillSpan > 0) {
+            int fillThick = fillStyle.HeightOr(vertical ? trackW : trackH);
+            int fillColor = fillStyle.BgOr(fillStyle.AccentOr(root.accent));
+            c.FillRoundRect(
+                vertical ? trackX + (trackW - fillThick) / 2 : fillMin,
+                vertical ? fillMin : trackY + (trackH - fillThick) / 2,
+                vertical ? fillThick : fillSpan,
+                vertical ? fillSpan : fillThick,
+                fillStyle.RadiusOr(fillThick / 2),
+                fillColor);
+        }
+
+        // ---- 标记刻度：轨道上的圆点 + 下/右侧文字，可点 ------------
+        if (hasMarks) {
+            StyleBox mkOff = this.ResolveEasedPartAsIn(
+                app, id, "slider", "mark", "", Class, disabled, false,
+                x, y, width, boxH);
+            StyleBox mkOn = this.ResolveEasedPartAsIn(
+                app, id, "slider", "mark-on", "", Class, disabled, false,
+                x, y, width, boxH);
+            StyleBox labOn = this.ResolveEasedPartAsIn(
+                app, id, "slider", "mark-label-on", "", Class, disabled,
+                false, x, y, width, boxH);
+            int dotD = mkOff.WidthOr(app.Scale(10));
+            if (dotD < 2) { dotD = 2; }
+            int dotR = dotD / 2;
+            for (int i = 0; i < markVals.Count && i < MarkCap(); i = i + 1) {
+                int mv = markVals[i];
+                if (mv >= minVal && mv <= maxVal) {
+                    int mp = this.PxAt(this.FracOf(mv), pos, len);
+                    int cx = vertical ? trackX + trackW / 2 : mp;
+                    int cy = vertical ? mp : trackY + trackH / 2;
+                    bool on = mp >= fillMin && mp <= fillMax;
+                    StyleBox mk = on ? mkOn : mkOff;
+                    c.FillCircle(cx, cy, dotR, mk.BorderOr(0));
+                    int inner = dotR - mk.BorderWOr(app.Scale(2));
+                    if (inner >= 1) { c.FillCircle(cx, cy, inner, mk.BgOr(0)); }
+                    string txt = i < markLabels.Count ? markLabels[i] : "";
+                    if (txt != "") {
+                        StyleBox lb = on ? labOn : labStyle;
+                        int lcol = lb.FgOr(root.fg);
+                        if (vertical) {
+                            c.DrawText(trackX + trackW + labGap,
+                                       cy - labH / 2, txt, lcol, labFs);
+                        } else {
+                            int tw = Canvas.MeasureText(txt, labFs);
+                            c.DrawText(cx - tw / 2, trackY + trackH + labGap,
+                                       txt, lcol, labFs);
+                        }
+                    }
+                    // 命中：点标记直接取该值（wid+8+i 段）。
+                    app.hitTester.RegisterRect(id + 8 + i,
+                        cx - dotR - app.Scale(2), cy - dotR - app.Scale(2),
+                        dotD + app.Scale(4), dotD + app.Scale(4), 3);
+                    if (txt != "") {
+                        int tw2 = Canvas.MeasureText(txt, labFs);
+                        if (vertical) {
+                            app.hitTester.RegisterRect(id + 8 + i,
+                                trackX + trackW + labGap, cy - labH / 2,
+                                tw2, labH, 3);
+                        } else {
+                            app.hitTester.RegisterRect(id + 8 + i,
+                                cx - tw2 / 2, trackY + trackH + labGap,
+                                tw2, labH, 3);
+                        }
+                    }
+                }
             }
         }
-        int thumbY = trackY + trackH / 2;
-        // 悬停/拖拽光晕来自 `slider:hover::thumb { box-shadow }`（blur 即
-        // 外扩半径），描边点亮同样是 CSS 的 :hover/:active 规则。
-        int halo = thumbStyle.shadowBlur;
-        if (halo > 0 && thumbStyle.shadow != 0) {
-            c.FillCircle(thumbX + thumbStyle.shadowDx,
-                         thumbY + thumbStyle.shadowDy,
-                         thumbR + halo, thumbStyle.shadow);
-        }
-        c.FillCircle(thumbX, thumbY, thumbR, thumbStyle.BorderOr(root.fg));
-        int innerR = thumbR - thumbStyle.BorderWOr(app.Scale(2));
-        if (innerR < 1) { innerR = 1; }
-        c.FillCircle(thumbX, thumbY, innerR, thumbStyle.BgOr(0));
 
+        // 轨道整盒命中：按住即定位并进入拖拽（钮的矩形在后注册、
+        // 命中优先，避免抓钮时又被当轨道跳位）。
         app.hitTester.RegisterRect(id, x, y, totalW, totalH, 3);
+
+        // ---- 圆钮（range 两枚；悬停光晕走 ::thumb 的 box-shadow）----
+        int loCx = 0;
+        int loCy = 0;
+        int hiCx = 0;
+        int hiCy = 0;
+        int thumbR = app.Scale(9);
+        int nThumbs = range ? 2 : 1;
+        for (int th = 1; th <= nThumbs; th = th + 1) {
+            int tid = th == 1 ? id + 1 : id + 2;
+            int tf = th == 1 ? fLo : fHi;
+            StyleBox thStyle = this.ResolveEasedPartAsIn(
+                app, tid, "slider", "thumb", "", Class, disabled, false,
+                x, y, width, boxH);
+            int tw = thStyle.WidthOr(app.Scale(18));
+            int thh = thStyle.HeightOr(tw);
+            int tsize = tw < thh ? tw : thh;
+            if (tsize < 2) { tsize = 2; }
+            thumbR = tsize / 2;
+            int tp = this.PxAt(tf, pos, len);
+            int cx;
+            int cy;
+            if (vertical) {
+                cx = trackX + trackW / 2;
+                cy = tp;
+                if (cy < trackY + thumbR) { cy = trackY + thumbR; }
+                if (cy > trackY + trackH - thumbR) {
+                    cy = trackY + trackH - thumbR;
+                }
+            } else {
+                cx = tp;
+                cy = trackY + trackH / 2;
+                if (cx < trackX + thumbR) { cx = trackX + thumbR; }
+                if (cx > trackX + trackW - thumbR) {
+                    cx = trackX + trackW - thumbR;
+                }
+            }
+            int halo = thStyle.shadowBlur;
+            if (halo > 0 && thStyle.shadow != 0) {
+                c.FillCircle(cx + thStyle.shadowDx, cy + thStyle.shadowDy,
+                             thumbR + halo, thStyle.shadow);
+            }
+            c.FillCircle(cx, cy, thumbR, thStyle.BorderOr(root.fg));
+            int innerR = thumbR - thStyle.BorderWOr(app.Scale(2));
+            if (innerR < 1) { innerR = 1; }
+            c.FillCircle(cx, cy, innerR, thStyle.BgOr(0));
+            app.hitTester.RegisterRect(tid,
+                cx - thumbR - app.Scale(2), cy - thumbR - app.Scale(2),
+                tsize + app.Scale(4), tsize + app.Scale(4), 3);
+            if (th == 1) { loCx = cx; loCy = cy; }
+            else { hiCx = cx; hiCy = cy; }
+        }
+
+        // ---- 值气泡：拖 / 悬钮时显示；showTooltip 常显 -------------
+        if (!disabled && (tooltip || showTooltip)) {
+            bool wantLo = false;
+            bool wantHi = false;
+            if (showTooltip) {
+                wantLo = true;
+                wantHi = range;
+            } else {
+                wantLo = dragThumb == 1
+                         || this.NearThumb(app, loCx, loCy, thumbR);
+                wantHi = range && (dragThumb == 2
+                                   || this.NearThumb(app, hiCx, hiCy, thumbR));
+            }
+            if (wantLo) {
+                this.RequestTip(app, loCx, loCy, thumbR, model.Get());
+            }
+            if (wantHi) {
+                this.RequestTip(app, hiCx, hiCy, thumbR, hiModel.Get());
+            }
+        }
         return changed;
     }
 
     override void OnMeasure(App app) {
         StyleBox root = this.ResolveStyleAs(app, "slider", Class,
                                             Style.SNormal());
-        prefH = root.HeightOr(app.theme.heightMedium);
-        prefW = root.WidthOr(app.Scale(160));
+        bool hasMarks = markVals.Count > 0;
+        if (vertical) {
+            prefH = root.HeightOr(app.Scale(160));
+            prefW = app.Scale(24);
+            if (hasMarks) {
+                StyleBox lab = Style.Part(app, "slider", "mark-label", "",
+                                          Class, "", Style.SNormal());
+                int fs = lab.FontOr(Style.FontFallback(app, "small"));
+                int mw = 0;
+                for (int i = 0; i < markLabels.Count; i = i + 1) {
+                    int w = Canvas.MeasureText(markLabels[i], fs);
+                    if (w > mw) { mw = w; }
+                }
+                prefW = prefW + app.Scale(8) + mw;
+            }
+        } else {
+            prefH = root.HeightOr(app.theme.heightMedium);
+            if (hasMarks) {
+                StyleBox lab = Style.Part(app, "slider", "mark-label", "",
+                                          Class, "", Style.SNormal());
+                int fs = lab.FontOr(Style.FontFallback(app, "small"));
+                prefH = prefH + app.Scale(8) + Canvas.FontHeight(fs);
+            }
+            prefW = root.WidthOr(app.Scale(160));
+        }
     }
 
     override void OnPaint(App app) {
-        this.Render(app, bx, by, bw);
+        this.RenderIn(app, bx, by, bw, bh);
     }
 }

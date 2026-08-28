@@ -1722,6 +1722,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_carousel${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # The Slider's value math is pure computation: step / step="mark"
+  # quantization and keyboard steps, the orientation x reverse geometry
+  # mapping (ValAt/PxAt are inverses), range-thumb read/write with two-way
+  # bindings, the tooltip format template, and the designer marks
+  # round-trip string. Pinned headlessly, no window needed.
+  add_test(NAME conformance_gui_slider
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/slider_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_slider.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_slider${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # The CSS skin pipeline (Css parser -> StyleSheet -> StyleBox) is pure
   # computation, so it is verified headlessly against a golden dump.
   add_test(NAME conformance_gui_css
