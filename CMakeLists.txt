@@ -1604,6 +1604,21 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_props${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # Calendar: the pure-logic surface without a window -- strict
+  # YYYY-MM-DD parsing, the 7x6 grid's cell->date mapping
+  # (leading/trailing adjacent-month cells), the prop protocol
+  # (text/mode), the is-date-disabled filter, mark normalization to
+  # midnight, and how change / panel-change fire on picks within and
+  # across months.
+  add_test(NAME conformance_gui_calendar
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/calendar_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_calendar.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_calendar${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # The tree invariant every container shares: one place per control, so a
   # re-parent moves it, and a control never becomes its own descendant (a cycle
   # makes every recursive walk overflow the stack).
@@ -1682,7 +1697,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_colorinject${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_flex conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable conformance_gui_css conformance_gui_tailwind conformance_gui_props conformance_gui_tree conformance_gui_webview_interop conformance_gui_colorinject PROPERTIES
+  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_flex conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable conformance_gui_css conformance_gui_tailwind conformance_gui_props conformance_gui_tree conformance_gui_webview_interop conformance_gui_colorinject conformance_gui_calendar PROPERTIES
     ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 

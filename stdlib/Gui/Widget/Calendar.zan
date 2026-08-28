@@ -1,0 +1,607 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// <summary>
+/// is-date-disabled 回调（Naive UI 的 is-date-disabled prop）：
+/// 返回 true 表示该日禁用——灰显、不可点选。
+/// </summary>
+delegate bool DateFilter(DateTime d);
+
+/// <summary>
+/// 单元格议程（Naive UI default slot 的最小对应）：某天的一条标注。
+/// month 模式在日号下方渲染"色点 + 文本"（每格最多两条，放不下截断），
+/// panel 模式渲染成日号下方一枚色点。tone：0 primary，1 info，
+/// 2 success，3 warning，4 error。
+/// </summary>
+class CalendarMark {
+    DateTime day;
+    string text;
+    int tone;
+
+    CalendarMark(DateTime d, string t, int tn) {
+        day = d;
+        text = t;
+        tone = tn;
+    }
+}
+
+/// <summary>
+/// 日历（Naive UI Calendar）。Mode 选择外形：
+///   "month" — 整幅月历卡：头部 ‹ 年月 › + 右侧"今天"，星期条，
+///             7×6 网格撑满分配的矩形（相邻月日期灰显、可点选）；
+///   "panel" — 紧凑面板：单月日网格 + 底部"今天 / 清除"动作行。
+/// 点击日期经 Change 报告（on-update:value），可见月份变化经
+/// PanelChange 报告（on-panel-change）；IsDateDisabled 挂
+/// is-date-disabled，AddMark 挂逐日议程。value 可为空（panel 的
+/// "清除"），GetDate() 此时返回 null。
+///
+///     Calendar cal = new Calendar();
+///     cal.OnChange(() => { title.Text = cal.GetDate().ToDateString(); });
+///     cal.AddMark(DateTime.Now(), "站会", 1);
+///     cal.RenderInside(app, new Rect(20, 60, 560, 300));
+/// </summary>
+class Calendar : Control {
+    /// 显示模式：month | panel（Binding<string>，设计器可读写）。
+    Binding<string> Mode;
+    /// 选中日期（当天 00:00）；null = 未选。
+    DateTime selected;
+    /// 视图所在年月：跟随选中日、翻页箭头与"今天"。
+    int viewYear;
+    int viewMonth;
+    /// 选中变化（on-update:value）。
+    UiEvent Change;
+    /// 可见月份变化（on-panel-change）。
+    UiEvent PanelChange;
+    /// 该回调返回 true 的日期不可选（Naive UI is-date-disabled）。
+    DateFilter IsDateDisabled;
+    /// 逐日议程，见 CalendarMark。
+    List<CalendarMark> marks;
+    /// 命中 id 块：0 prev，1 next，2 today（month 头部），3 now
+    /// （panel 底部），4 clear（panel 底部），5..46 六行七列日期格。
+    int baseId;
+    bool idsReady;
+
+    /// 默认选中今天、视图停在当月。
+    Calendar() {
+        this.InitControl("calendar", 5);
+        Mode = "month";
+        Change = new UiEvent();
+        PanelChange = new UiEvent();
+        marks = new List<CalendarMark>();
+        baseId = 0;
+        idsReady = false;
+        wiresOwnEvents = true;
+        styleSurfaceOwned = true;
+        DateTime today = DateTime.Now();
+        selected = Calendar.DayOf(today);
+        viewYear = today.Year();
+        viewMonth = today.Month();
+    }
+
+    Calendar(DateTime value) : this() {
+        this.SetDate(value);
+    }
+
+    // ---- 纯几何 / 文本助手（无 App，回归测试直接断言）------------
+
+    /// 把任意时刻归一化到当天 00:00，使选中值、议程与网格单元
+    /// 之间的相等比较都落在同一天。
+    static DateTime DayOf(DateTime t) {
+        return DateTime.FromDate(t.Year(), t.Month(), t.Day());
+    }
+
+    static DateTime TodayRef() {
+        return Calendar.DayOf(DateTime.Now());
+    }
+
+    /// 月视图网格的起始格：本月 1 号落在 7 列里的第几格（0=周日列）。
+    static int GridStart(int year, int month) {
+        return DateTime.FromDate(year, month, 1).DayOfWeek();
+    }
+
+    /// 网格第 index 格（0..41）对应的日期：前导格属于上月、尾部格
+    /// 属于下月——Naive UI 相邻月日期灰显仍可点的行为。
+    static DateTime CellDate(int year, int month, int index) {
+        int start = Calendar.GridStart(year, month);
+        int days = DateTime.DaysInMonth(year, month);
+        if (index < start) {
+            int py = year;
+            int pm = month - 1;
+            if (pm < 1) { pm = 12; py = py - 1; }
+            int pd = DateTime.DaysInMonth(py, pm) - (start - index) + 1;
+            return DateTime.FromDate(py, pm, pd);
+        }
+        if (index >= start + days) {
+            int nx = month + 1;
+            int ny = year;
+            if (nx > 12) { nx = 1; ny = ny + 1; }
+            return DateTime.FromDate(ny, nx, index - start - days + 1);
+        }
+        return DateTime.FromDate(year, month, index - start + 1);
+    }
+
+    /// 头部标题（Naive UI 的"2026年8月"）。
+    static string MonthLabel(int year, int month) {
+        return "" + year + "年" + month + "月";
+    }
+
+    /// 议程色调对应的类片段（calendar::mark.info 等 CSS 规则）。
+    static string ToneClass(int tone) {
+        if (tone == 1) { return "info"; }
+        if (tone == 2) { return "success"; }
+        if (tone == 3) { return "warning"; }
+        if (tone == 4) { return "error"; }
+        return "";
+    }
+
+    // ---- 取值 / 设值 ------------------------------------------------
+
+    /// 选中日期；panel 的"清除"之后为 null。
+    DateTime GetDate() { return selected; }
+
+    /// 程序化设值（归一化到当天 00:00 并把视图带到该月），
+    /// 不触发 Change——与 Input.SetText 的语义一致。
+    void SetDate(DateTime value) {
+        if (value == null) { this.ClearDate(); return; }
+        DateTime d = Calendar.DayOf(value);
+        selected = d;
+        viewYear = d.Year();
+        viewMonth = d.Month();
+    }
+
+    /// 清空选中（panel 模式"清除"动作，Naive UI clear）。
+    void ClearDate() {
+        if (selected == null) { return; }
+        selected = null;
+        Change.Raise();
+    }
+
+    /// 追加一条议程；day 归一化到当天 00:00，调用方传 DateTime.Now()
+    /// 这类带时刻的值也能正确落到格子上。
+    void AddMark(DateTime day, string text, int tone) {
+        marks.Add(new CalendarMark(Calendar.DayOf(day), text, tone));
+    }
+
+    /// 清空全部议程（数据驱动宿主重填前调用）。
+    void ClearMarks() { marks = new List<CalendarMark>(); }
+
+    bool IsDayDisabled(DateTime d) {
+        if (IsDateDisabled == null) { return false; }
+        return IsDateDisabled(d);
+    }
+
+    Calendar OnChange(Action a) {
+        Change.Add(a);
+        return this;
+    }
+
+    Calendar OnPanelChange(Action a) {
+        PanelChange.Add(a);
+        return this;
+    }
+
+    // ---- 交互 --------------------------------------------------------
+
+    /// 翻到上/下个月（delta = ∓1），跨年自动进位。
+    void MoveMonth(int delta) {
+        viewMonth = viewMonth + delta;
+        if (viewMonth < 1) { viewMonth = viewMonth + 12; viewYear = viewYear - 1; }
+        if (viewMonth > 12) { viewMonth = viewMonth - 12; viewYear = viewYear + 1; }
+        PanelChange.Raise();
+    }
+
+    /// 视图跳回今天所在月份（Naive UI month 头部的"今天"按钮）：
+    /// 只滚回当月，不改变选中值。
+    void JumpToToday() {
+        DateTime now = DateTime.Now();
+        if (viewYear == now.Year() && viewMonth == now.Month()) { return; }
+        viewYear = now.Year();
+        viewMonth = now.Month();
+        PanelChange.Raise();
+    }
+
+    /// 点选一天：跨月点选把视图带到目标月，相邻月的两次报告
+    /// （Change + PanelChange）与 Naive UI 保持一致。
+    void PickDate(DateTime picked) {
+        if (this.IsDayDisabled(picked)) { return; }
+        bool monthChanged = picked.Month() != viewMonth
+            || picked.Year() != viewYear;
+        bool valueChanged = selected == null || !selected.Equals(picked);
+        selected = picked;
+        viewYear = picked.Year();
+        viewMonth = picked.Month();
+        if (valueChanged) { Change.Raise(); }
+        if (monthChanged) { PanelChange.Raise(); }
+    }
+
+    void EnsureIds() {
+        if (idsReady) { return; }
+        baseId = WidgetId.Block(47);
+        idsReady = true;
+    }
+
+    // ---- 设计器 / 序列化模型 ----------------------------------------
+
+    override string Kind() { return "Calendar"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec text = PropSpec.Text("text", "Date");
+        text.WithTip("Selected date in YYYY-MM-DD; empty = none (cleared).");
+        ps.Add(text);
+        PropSpec mode = PropSpec.Enum("mode", "Mode",
+            new List<string>{ "month", "panel" });
+        mode.str = Mode;
+        ps.Add(mode);
+        PropSpec cls = PropSpec.Text("class", "Classes");
+        cls.str = Class;
+        ps.Add(cls);
+        return ps;
+    }
+
+    override string GetExtra(string key) {
+        if (key == "text" || key == "value") {
+            if (selected == null) { return ""; }
+            return selected.ToDateString();
+        }
+        return "";
+    }
+
+    override bool SetExtra(string key, string val) {
+        if (key == "text" || key == "value") {
+            DateTime d = DateTime.ParseDate(val);
+            if (d == null) { return true; }
+            selected = d;
+            viewYear = d.Year();
+            viewMonth = d.Month();
+            return true;
+        }
+        return false;
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        e.Add("PanelChange");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change") { Change.Add(a); return; }
+        if (evt == "PanelChange") { PanelChange.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    // ---- 测量与绘制 --------------------------------------------------
+
+    override void OnMeasure(App app) {
+        StyleBox s = this.ResolveStyleCached(app, "calendar", Class,
+                                             Style.SNormal());
+        if (Mode.Get() == "panel") {
+            prefW = s.WidthOr(app.Scale(250));
+            prefH = s.HeightOr(app.Scale(32 + 24 + 6 * 28 + 36));
+        } else {
+            prefW = s.WidthOr(app.Scale(600));
+            prefH = s.HeightOr(app.Scale(300));
+        }
+    }
+
+    override void OnPaint(App app) {
+        this.EnsureIds();
+        StyleBox s = this.ResolveStyleCached(app, "calendar", Class,
+                                             Style.SNormal());
+        s.Paint(app, bx, by, bw, bh);
+        if (Mode.Get() == "panel") {
+            this.PaintPanelMode(app, s);
+        } else {
+            this.PaintMonthMode(app, s);
+        }
+        this.DispatchClick(app);
+    }
+
+    /// month 模式：头部（‹ 年月 › + 今天）、星期条、撑满剩余高度的
+    /// 7×6 网格。格与格之间补细分隔线（Naive UI 的单元边框）。
+    void PaintMonthMode(App app, StyleBox s) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = app.Scale(12);
+        int headerH = app.Scale(44);
+        int arrow = app.Scale(24);
+        int fs = Style.FontFallback(app, "small");
+        int tinyFs = Style.FontFallback(app, "tiny");
+        int fg = s.FgOr(t.textPrimary);
+        bool en = !this.IsDisabled();
+        StyleBox titleS = this.ResolvePartAs(app, "calendar", "title", "",
+                                             Class, Style.SNormal());
+        StyleBox weekdayS = this.ResolvePartAs(app, "calendar", "weekday",
+                                               "", Class, Style.SNormal());
+        StyleBox gridS = this.ResolvePartAs(app, "calendar", "grid", "",
+                                            Class, Style.SNormal());
+        StyleBox cellHover = this.ResolvePartAs(app, "calendar", "cell", "",
+                                                Class, Style.SHover());
+        StyleBox cellSel = this.ResolvePartAs(app, "calendar", "cell", "",
+                                              Class, Style.SSelected());
+        StyleBox todayS = this.ResolvePartAs(app, "calendar", "today", "",
+                                             Class, Style.SNormal());
+        StyleBox footS = this.ResolvePartAs(app, "calendar", "footer", "",
+                                            Class, Style.SNormal());
+        int tf = titleS.FontOr(Style.FontFallback(app, "medium"));
+
+        // 头部：prev、标题、next 从左排，右侧"今天"。
+        int hy = by + (headerH - arrow) / 2;
+        c.DrawGlyphIn("chevron-left", bx + pad, hy, arrow, arrow,
+                      app.Scale(13), footS.FgOr(fg));
+        string label = Calendar.MonthLabel(viewYear, viewMonth);
+        int titleX = bx + pad + arrow + app.Scale(8);
+        c.DrawText(titleX, Canvas.CenterTextY(by, headerH, tf), label,
+                   titleS.FgOr(fg), tf);
+        int nextX = titleX + Canvas.MeasureText(label, tf) + app.Scale(8);
+        c.DrawGlyphIn("chevron-right", nextX, hy, arrow, arrow,
+                      app.Scale(13), footS.FgOr(fg));
+        int todayW = app.Scale(52);
+        int todayH = app.Scale(24);
+        int tx = bx + bw - pad - todayW;
+        int ty = by + (headerH - todayH) / 2;
+        if (en && app.mouseX >= tx && app.mouseX < tx + todayW &&
+            app.mouseY >= ty && app.mouseY < ty + todayH) {
+            c.FillRoundRect(tx, ty, todayW, todayH, app.Scale(4),
+                            cellHover.BgOr(t.bgHover));
+        }
+        c.DrawTextCentered(tx, ty, todayW, todayH, "今天",
+                           footS.FgOr(t.primary), fs);
+        app.hitTester.RegisterRect(baseId, bx + pad, hy, arrow, arrow, 0);
+        app.hitTester.RegisterRect(baseId + 1, nextX, hy, arrow, arrow, 0);
+        app.hitTester.RegisterRect(baseId + 2, tx, ty, todayW, todayH, 0);
+
+        // 星期条。
+        int weekY = by + headerH;
+        int weekH = app.Scale(26);
+        string[] names = new string[]{"日", "一", "二", "三", "四", "五", "六"};
+        int cellW = bw / 7;
+        if (cellW < 1) { cellW = 1; }
+        int wcolor = weekdayS.FgOr(t.textTertiary);
+        for (int i = 0; i < 7; i = i + 1) {
+            c.DrawTextCentered(bx + i * cellW, weekY, cellW, weekH,
+                               names[i], wcolor, tinyFs);
+        }
+
+        // 日期网格：先画格子（含悬停/选中底色与议程），最后补线。
+        int top = weekY + weekH;
+        int gridH = by + bh - top;
+        if (gridH < 6) { gridH = 6; }
+        int cellH = gridH / 6;
+        DateTime today = Calendar.TodayRef();
+        for (int i = 0; i < 42; i = i + 1) {
+            int col = i % 7;
+            int row = i / 7;
+            int cx = bx + col * cellW;
+            int cy = top + row * cellH;
+            DateTime d = Calendar.CellDate(viewYear, viewMonth, i);
+            bool inMonth = d.Month() == viewMonth && d.Year() == viewYear;
+            bool dis = this.IsDayDisabled(d);
+            bool sel = selected != null && selected.Equals(d);
+            bool isToday = d.Equals(today);
+            bool hov = en && !dis && app.mouseX >= cx &&
+                app.mouseX < cx + cellW && app.mouseY >= cy &&
+                app.mouseY < cy + cellH;
+            if (sel) {
+                c.FillRoundRect(cx + 1, cy + 1, cellW - 2, cellH - 2,
+                                app.Scale(3), cellSel.BgOr(t.primary));
+            } else if (hov) {
+                c.FillRoundRect(cx + 1, cy + 1, cellW - 2, cellH - 2,
+                                app.Scale(3), cellHover.BgOr(t.bgHover));
+            }
+            int ncolor = fg;
+            if (dis) { ncolor = t.textDisabled; }
+            else if (!inMonth) { ncolor = weekdayS.FgOr(t.textTertiary); }
+            else if (sel) { ncolor = cellSel.FgOr(fg); }
+            else if (isToday) { ncolor = todayS.FgOr(t.primary); }
+            int nx = cx + app.Scale(7);
+            int ny = cy + app.Scale(5);
+            if (isToday && !sel) {
+                c.FillRoundRect(nx - app.Scale(4), ny - app.Scale(2),
+                                app.Scale(26), app.Scale(20),
+                                app.Scale(10), todayS.BgOr(t.bgHover));
+            }
+            c.DrawText(nx, ny, Convert.ToString(d.Day()), ncolor, fs);
+            int my = cy + app.Scale(26);
+            int drawn = 0;
+            for (int k = 0; k < marks.Count && drawn < 2; k = k + 1) {
+                CalendarMark mk = marks[k];
+                if (!mk.day.Equals(d)) { continue; }
+                if (my + app.Scale(14) > cy + cellH) { break; }
+                int mc = this.MarkColor(app, mk.tone, fg);
+                c.FillRoundRect(cx + app.Scale(7), my + app.Scale(5),
+                                app.Scale(5), app.Scale(5),
+                                app.Scale(2), mc);
+                c.DrawText(cx + app.Scale(16), my,
+                           Ellipsis.Fit(mk.text, cellW - app.Scale(26),
+                                        tinyFs), mc, tinyFs);
+                my = my + app.Scale(14);
+                drawn = drawn + 1;
+            }
+            app.hitTester.RegisterRect(baseId + 5 + i, cx, cy, cellW,
+                                       cellH, 0);
+        }
+        int line = gridS.BgOr(t.divider);
+        int gridBottom = top + cellH * 6;
+        for (int v = 1; v < 7; v = v + 1) {
+            c.DrawLine(bx + v * cellW, top, bx + v * cellW, gridBottom,
+                       line, 1);
+        }
+        for (int h = 1; h < 6; h = h + 1) {
+            c.DrawLine(bx, top + h * cellH, bx + cellW * 7,
+                       top + h * cellH, line, 1);
+        }
+    }
+
+    /// panel 模式：居中标题两端翻页箭头、星期条、紧凑日网格
+    /// （选中日是实心圆角块，同 datepicker::day:selected 的 token）、
+    /// 底部"今天 / 清除"动作行（Naive UI actions: now/clear）。
+    void PaintPanelMode(App app, StyleBox s) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = app.Scale(12);
+        int headerH = app.Scale(32);
+        int arrow = app.Scale(24);
+        int fs = Style.FontFallback(app, "small");
+        int tinyFs = Style.FontFallback(app, "tiny");
+        int fg = s.FgOr(t.textPrimary);
+        bool en = !this.IsDisabled();
+        StyleBox titleS = this.ResolvePartAs(app, "calendar", "title", "",
+                                             Class, Style.SNormal());
+        StyleBox weekdayS = this.ResolvePartAs(app, "calendar", "weekday",
+                                               "", Class, Style.SNormal());
+        StyleBox cellHover = this.ResolvePartAs(app, "calendar", "cell", "",
+                                                Class, Style.SHover());
+        StyleBox daySel = this.ResolvePartAs(app, "calendar", "day", "",
+                                             Class, Style.SSelected());
+        StyleBox footS = this.ResolvePartAs(app, "calendar", "footer", "",
+                                            Class, Style.SNormal());
+        int tf = titleS.FontOr(fs);
+
+        int hy = by + (headerH - arrow) / 2;
+        c.DrawGlyphIn("chevron-left", bx + pad, hy, arrow, arrow,
+                      app.Scale(13), footS.FgOr(fg));
+        c.DrawGlyphIn("chevron-right", bx + bw - pad - arrow, hy, arrow,
+                      arrow, app.Scale(13), footS.FgOr(fg));
+        c.DrawTextCentered(bx, by, bw, headerH,
+                           Calendar.MonthLabel(viewYear, viewMonth),
+                           titleS.FgOr(fg), tf);
+        app.hitTester.RegisterRect(baseId, bx + pad, hy, arrow, arrow, 0);
+        app.hitTester.RegisterRect(baseId + 1, bx + bw - pad - arrow, hy,
+                                   arrow, arrow, 0);
+
+        int weekY = by + headerH;
+        int weekH = app.Scale(24);
+        int cellW = (bw - pad * 2) / 7;
+        if (cellW < 1) { cellW = 1; }
+        int gx = bx + (bw - cellW * 7) / 2;
+        string[] names = new string[]{"日", "一", "二", "三", "四", "五", "六"};
+        int wcolor = weekdayS.FgOr(t.textTertiary);
+        for (int i = 0; i < 7; i = i + 1) {
+            c.DrawTextCentered(gx + i * cellW, weekY, cellW, weekH,
+                               names[i], wcolor, tinyFs);
+        }
+
+        int footerH = app.Scale(36);
+        int top = weekY + weekH;
+        int cellH = (bh - headerH - weekH - footerH) / 6;
+        if (cellH < 1) { cellH = 1; }
+        DateTime today = Calendar.TodayRef();
+        int dotFs = fs;
+        for (int i = 0; i < 42; i = i + 1) {
+            int col = i % 7;
+            int row = i / 7;
+            int cx = gx + col * cellW;
+            int cy = top + row * cellH;
+            DateTime d = Calendar.CellDate(viewYear, viewMonth, i);
+            bool inMonth = d.Month() == viewMonth && d.Year() == viewYear;
+            bool dis = this.IsDayDisabled(d);
+            bool sel = selected != null && selected.Equals(d);
+            bool isToday = d.Equals(today);
+            bool hov = en && !dis && app.mouseX >= cx &&
+                app.mouseX < cx + cellW && app.mouseY >= cy &&
+                app.mouseY < cy + cellH;
+            if (sel) {
+                c.FillRoundRect(cx + 1, cy + 1, cellW - 2, cellH - 2,
+                                app.Scale(4), daySel.BgOr(t.primary));
+            } else if (hov) {
+                c.FillRoundRect(cx + 1, cy + 1, cellW - 2, cellH - 2,
+                                app.Scale(4), cellHover.BgOr(t.bgHover));
+            }
+            string num = Convert.ToString(d.Day());
+            int ncolor = fg;
+            if (dis) { ncolor = t.textDisabled; }
+            else if (!inMonth) { ncolor = weekdayS.FgOr(t.textTertiary); }
+            else if (sel) { ncolor = daySel.FgOr(t.bgPrimary); }
+            else if (isToday) { ncolor = t.primary; }
+            int nw = Canvas.MeasureText(num, dotFs);
+            c.DrawText(cx + (cellW - nw) / 2,
+                       Canvas.CenterTextY(cy, cellH, dotFs), num, ncolor,
+                       dotFs);
+            if (cellH >= app.Scale(30)) {
+                int tone = 0;
+                bool found = false;
+                for (int k = 0; k < marks.Count && !found; k = k + 1) {
+                    if (marks[k].day.Equals(d)) {
+                        tone = marks[k].tone;
+                        found = true;
+                    }
+                }
+                if (found) {
+                    c.FillRoundRect(cx + cellW / 2 - app.Scale(2),
+                                    cy + cellH - app.Scale(9),
+                                    app.Scale(5), app.Scale(5),
+                                    app.Scale(2), this.MarkColor(app, tone, fg));
+                }
+            }
+            app.hitTester.RegisterRect(baseId + 5 + i, cx, cy, cellW,
+                                       cellH, 0);
+        }
+
+        // 底部动作行：今天（选中并跳到今天）、清除（置空）。
+        int fy = by + bh - footerH;
+        int bw2 = app.Scale(52);
+        int bh2 = app.Scale(24);
+        int by2 = fy + (footerH - bh2) / 2;
+        int nowX = bx + pad;
+        int clearX = bx + bw - pad - bw2;
+        if (en && app.mouseX >= nowX && app.mouseX < nowX + bw2 &&
+            app.mouseY >= by2 && app.mouseY < by2 + bh2) {
+            c.FillRoundRect(nowX, by2, bw2, bh2, app.Scale(4),
+                            cellHover.BgOr(t.bgHover));
+        }
+        if (en && app.mouseX >= clearX && app.mouseX < clearX + bw2 &&
+            app.mouseY >= by2 && app.mouseY < by2 + bh2) {
+            c.FillRoundRect(clearX, by2, bw2, bh2, app.Scale(4),
+                            cellHover.BgOr(t.bgHover));
+        }
+        c.DrawTextCentered(nowX, by2, bw2, bh2, "今天",
+                           footS.FgOr(t.primary), fs);
+        c.DrawTextCentered(clearX, by2, bw2, bh2, "清除",
+                           footS.FgOr(t.primary), fs);
+        app.hitTester.RegisterRect(baseId + 3, nowX, fy, bw2, footerH, 0);
+        app.hitTester.RegisterRect(baseId + 4, clearX, fy, bw2, footerH, 0);
+    }
+
+    /// 议程色调颜色：`calendar::mark.<tone>` 的 color，未配置时回退
+    /// 主文本色。
+    int MarkColor(App app, int tone, int fallback) {
+        string cls = Class;
+        string toneCls = Calendar.ToneClass(tone);
+        if (toneCls != "") { cls = Class + " " + toneCls; }
+        StyleBox ms = this.ResolvePartAs(app, "calendar", "mark", "", cls,
+                                         Style.SNormal());
+        return ms.FgOr(fallback);
+    }
+
+    /// 点击分发：命中 id 已在绘制时注册，这里只查表映射到动作。
+    void DispatchClick(App app) {
+        if (this.IsDisabled() || app.EventKind() != 3) { return; }
+        int hit = app.ClickTarget();
+        if (hit == 0) { return; }
+        if (hit == baseId) {
+            this.MoveMonth(-1);
+            app.RequestRedraw();
+        } else if (hit == baseId + 1) {
+            this.MoveMonth(1);
+            app.RequestRedraw();
+        } else if (hit == baseId + 2) {
+            this.JumpToToday();
+            app.RequestRedraw();
+        } else if (hit == baseId + 3) {
+            this.PickDate(Calendar.TodayRef());
+            app.RequestRedraw();
+        } else if (hit == baseId + 4) {
+            this.ClearDate();
+            app.RequestRedraw();
+        } else if (hit >= baseId + 5 && hit < baseId + 47) {
+            this.PickDate(Calendar.CellDate(viewYear, viewMonth,
+                                            hit - baseId - 5));
+            app.RequestRedraw();
+        }
+    }
+}

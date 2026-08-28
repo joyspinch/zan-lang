@@ -1,0 +1,157 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// 无窗口回归：Calendar 的纯逻辑面 —— 严格的 "YYYY-MM-DD" 解析、
+/// 7×6 网格的 cell→日期映射（含上月/下月的灰色前导格与尾部格）、
+/// 月份标题、属性协议（text/mode 经 GetProp/SetProp）、
+/// is-date-disabled 过滤、议程归一化到当天零点，以及翻页/选中时
+/// Change 与 PanelChange 的触发次数。几何常量取自
+/// 2026-08（1 号是周六）与 2026-02（1 号是周日）。
+class Program {
+    static int fails;
+    static int changeFired;
+    static int panelFired;
+
+    static void Eq(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got '" + got + "' want '"
+                          + want + "'");
+    }
+
+    static void Ok(string what, bool cond) {
+        if (cond) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void OnChange() { Program.changeFired = Program.changeFired + 1; }
+    static void OnPanel() { Program.panelFired = Program.panelFired + 1; }
+
+    static void Main() {
+        fails = 0;
+
+        // ---- 文本解析：长度、分隔符、取值越界、非数字都拒绝 ----
+        DateTime d = DateTime.ParseDate("2026-08-15");
+        Program.Ok("parse valid", d != null);
+        Program.Eq("parse year", Convert.ToString(d.Year()), "2026");
+        Program.Eq("parse month", Convert.ToString(d.Month()), "8");
+        Program.Eq("parse day", Convert.ToString(d.Day()), "15");
+        Program.Ok("reject month 13", DateTime.ParseDate("2026-13-01") == null);
+        Program.Ok("reject feb 30", DateTime.ParseDate("2026-02-30") == null);
+        Program.Ok("reject letters", DateTime.ParseDate("2026-08-1a") == null);
+        Program.Ok("reject short", DateTime.ParseDate("2026-8-5") == null);
+        Program.Ok("reject empty", DateTime.ParseDate("") == null);
+
+        // ---- 网格映射：2026-08 前导 6 格属于七月，尾部 5 格属于九月 ----
+        Program.Eq("aug grid start",
+                   Convert.ToString(Calendar.GridStart(2026, 8)), "6");
+        Program.Eq("leading cell",
+                   Calendar.CellDate(2026, 8, 0).ToDateString(), "2026-07-26");
+        Program.Eq("first day",
+                   Calendar.CellDate(2026, 8, 6).ToDateString(), "2026-08-01");
+        Program.Eq("last day",
+                   Calendar.CellDate(2026, 8, 36).ToDateString(), "2026-08-31");
+        Program.Eq("trailing cell",
+                   Calendar.CellDate(2026, 8, 41).ToDateString(), "2026-09-05");
+        // 2026-02-01 是周日：无前导格，第 0 格就是 1 号。
+        Program.Eq("feb grid start",
+                   Convert.ToString(Calendar.GridStart(2026, 2)), "0");
+        Program.Eq("feb first cell",
+                   Calendar.CellDate(2026, 2, 0).ToDateString(), "2026-02-01");
+        // 头部标题。
+        Program.Eq("month label", Calendar.MonthLabel(2026, 8), "2026年8月");
+
+        // ---- 翻页数学与 on-panel-change：12 月翻页进位年份 ----
+        Calendar cal = new Calendar(DateTime.ParseDate("2026-12-05"));
+        cal.OnChange(Program.OnChange);
+        cal.OnPanelChange(Program.OnPanel);
+        cal.MoveMonth(1);
+        Program.Eq("dec -> jan month",
+                   Convert.ToString(cal.viewMonth), "1");
+        Program.Eq("dec -> jan year", Convert.ToString(cal.viewYear), "2027");
+        cal.MoveMonth(1);
+        Program.Eq("jan -> feb", Convert.ToString(cal.viewMonth), "2");
+        Program.Eq("panel change fired twice",
+                   Convert.ToString(Program.panelFired), "2");
+
+        // ---- 属性协议：mode 绑定 Mode 字段，text 走 GetExtra/SetExtra ----
+        Calendar c2 = new Calendar();
+        Program.Eq("mode default", c2.GetProp("mode"), "month");
+        c2.SetProp("mode", "panel");
+        Program.Eq("mode set", c2.GetProp("mode"), "panel");
+        c2.SetProp("text", "2026-08-15");
+        Program.Eq("text set", c2.GetDate().ToDateString(), "2026-08-15");
+        Program.Eq("text get", c2.GetProp("text"), "2026-08-15");
+        Program.Eq("view follows text", Convert.ToString(c2.viewMonth), "8");
+        c2.SetProp("text", "not-a-date");
+        Program.Eq("bad text keeps old",
+                   c2.GetDate().ToDateString(), "2026-08-15");
+
+        // ---- is-date-disabled：13 号禁用，点选被忽略 ----
+        c2.IsDateDisabled = d2 => d2.Day() == 13;
+        Program.Ok("13th disabled",
+                   c2.IsDayDisabled(DateTime.ParseDate("2026-08-13")));
+        Program.Ok("14th enabled",
+                   !c2.IsDayDisabled(DateTime.ParseDate("2026-08-14")));
+        c2.SetDate(DateTime.ParseDate("2026-08-12"));
+        c2.OnChange(Program.OnChange);
+        int ch0 = Program.changeFired;
+        c2.PickDate(DateTime.ParseDate("2026-08-14"));
+        Program.Eq("picked value", c2.GetDate().ToDateString(), "2026-08-14");
+        Program.Eq("pick fires change",
+                   Convert.ToString(Program.changeFired - ch0), "1");
+        int ch1 = Program.changeFired;
+        c2.PickDate(DateTime.ParseDate("2026-08-13"));
+        Program.Eq("disabled pick ignored",
+                   c2.GetDate().ToDateString(), "2026-08-14");
+        Program.Eq("disabled pick silent",
+                   Convert.ToString(Program.changeFired - ch1), "0");
+
+        // ---- 议程：DateTime.Now() 这类带时刻的值归一化到当天零点 ----
+        c2.AddMark(DateTime.Now(), "standup", 1);
+        Program.Eq("mark count", Convert.ToString(c2.marks.Count), "1");
+        Program.Ok("mark normalized",
+                   c2.marks[0].day.Equals(Calendar.DayOf(DateTime.Now())));
+        Program.Eq("mark tone", Convert.ToString(c2.marks[0].tone), "1");
+        c2.ClearMarks();
+        Program.Eq("marks cleared",
+                   Convert.ToString(c2.marks.Count), "0");
+
+        // ---- 清除：值置空 + Change，text 读回空串 ----
+        int ch2 = Program.changeFired;
+        c2.ClearDate();
+        Program.Ok("cleared date is null", c2.GetDate() == null);
+        Program.Eq("clear fires change",
+                   Convert.ToString(Program.changeFired - ch2), "1");
+        Program.Eq("cleared text empty", c2.GetProp("text"), "");
+
+        // ---- 跨月点选：Change 与 PanelChange 同帧各报一次；同月不报 ----
+        Calendar c3 = new Calendar(DateTime.ParseDate("2026-01-31"));
+        c3.OnChange(Program.OnChange);
+        c3.OnPanelChange(Program.OnPanel);
+        int ch3 = Program.changeFired;
+        int p3 = Program.panelFired;
+        c3.PickDate(DateTime.ParseDate("2026-03-02"));
+        Program.Eq("cross-month value",
+                   c3.GetDate().ToDateString(), "2026-03-02");
+        Program.Eq("cross-month change",
+                   Convert.ToString(Program.changeFired - ch3), "1");
+        Program.Eq("cross-month panel",
+                   Convert.ToString(Program.panelFired - p3), "1");
+        Program.Eq("view follows pick",
+                   Convert.ToString(c3.viewMonth), "3");
+        int p4 = Program.panelFired;
+        c3.PickDate(DateTime.ParseDate("2026-03-09"));
+        Program.Eq("same-month no panel",
+                   Convert.ToString(Program.panelFired - p4), "0");
+
+        if (fails == 0) {
+            Console.WriteLine("calendar_test: OK");
+            return;
+        }
+        Console.WriteLine("calendar_test: " + Convert.ToString(fails)
+                          + " failure(s)");
+    }
+}
