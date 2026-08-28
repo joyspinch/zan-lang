@@ -1,28 +1,135 @@
 using System;
 using System.Data.Excel;
 using System.IO;
+using System.Text;
+using System.Threading;
 
 namespace Gui.Component.DataTable;
 
-/// DataTable 分部：文件导出。行选择语义与 <see cref="BuildText"/>
-/// （剪贴板复制）完全一致，"所见即所得"——导出的就是过滤/排序后
-/// 看到的行；序列化本体在 <see cref="XlsxBook"/>（数据层），不依赖
-/// GUI，服务端/控制台程序直接用 XlsxBook 即可。
+/// <summary>
+/// DataTable 导出的进度/取消钩子。回调都在后台写盘线程上发生：
+/// OnStart 一次、OnProgress 约每 512 行一次、OnDone 一次；
+/// Cancelled() 每行都会问一次（请保持便宜，例如读一个原子标志）。
+/// 要更新 UI 控件，在回调里用 App.Post 把工作切回 UI 线程——不要
+/// 直接碰控件。不需要进度/取消时传 null 即可（同步导出就是这么
+/// 用的）。
+/// </summary>
+class DataTableExportProgress {
+    /// <summary>开始写盘。`totalRows` 为总行数（含表头行）。</summary>
+    virtual void OnStart(int totalRows) { }
+
+    /// <summary>进度：已完成 `doneRows` / `totalRows` 行。</summary>
+    virtual void OnProgress(int doneRows, int totalRows) { }
+
+    /// <summary>结束。`ok` 为 false 时 `error` 给出原因
+    /// （"已取消" / "已有导出在运行" / I/O 错误消息）。</summary>
+    virtual void OnDone(bool ok, string error) { }
+
+    /// <summary>返回 true 中止导出：半成品文件被删除，随后
+    /// OnDone(false, "已取消")。</summary>
+    virtual bool Cancelled() { return false; }
+}
+
+/// 导出行集快照：UI 线程上一次性冻结的列区间与行序。
+class DataTableExportSnapshot {
+    public List<int> rows;
+    public int c0;
+    public int c1;
+}
+
+/// <summary>
+/// <see cref="XlsxRowSource"/> 适配器：把快照 + DataSource 逐行喂给
+/// 流式写盘。排序/过滤/勾选状态已在快照里冻结（所见即所得）；
+/// CellText/CellNum 等直接读应用侧数据源——导出期间应用不应改写
+/// 数据源内容（行数上限 1048576 由 XlsxBook 自动分表兜住）。
+/// </summary>
+class DataTableRowSource : XlsxRowSource {
+    public DataSource src;
+    public List<DataColumn> cols;
+    public DataTableExportSnapshot snap;
+    public DataTableExportProgress progress;
+
+    override int RowCount() { return this.snap.rows.Count + 1; }
+
+    override bool FillRow(int index, List<XlsxCell> row) {
+        if (index == 0) {
+            for (int cc = this.snap.c0; cc <= this.snap.c1; cc = cc + 1) {
+                row.Add(XlsxCell.Str(this.cols[cc].title));
+            }
+            return true;
+        }
+        int ri = this.snap.rows[index - 1];
+        for (int cc = this.snap.c0; cc <= this.snap.c1; cc = cc + 1) {
+            row.Add(DataTable.ExportCell(cc, this.cols[cc], this.src, ri));
+        }
+        return true;
+    }
+
+    override void OnProgress(int done, int total) {
+        if (this.progress != null) { this.progress.OnProgress(done, total); }
+    }
+
+    override bool Cancelled() {
+        return this.progress != null && this.progress.Cancelled();
+    }
+}
+
+/// <summary>
+/// 后台导出任务。Zan 的委托不能捕获局部变量或绑定 this，线程
+/// 入口必须是静态方法——任务本体放在 <see cref="DataTable"/>
+/// 的静态槽里（进程内同一时刻至多一个导出），Worker 从槽里取。
+/// 与 DownloadJob 同一范式。
+/// </summary>
+class ExportJob {
+    /// 1 = xlsx，2 = csv。
+    public int kind;
+    public DataTableExportSnapshot snap;
+    public List<DataColumn> cols;
+    public DataSource src;
+    public string path;
+    public DataTableExportProgress progress;
+
+    static void Worker() {
+        ExportJob j = DataTable.sExportJob;
+        try {
+            if (j.kind == 1) {
+                DataTable.ExportXlsxSnapshot(j.snap, j.cols, j.src, j.path, j.progress);
+            } else {
+                DataTable.ExportCsvSnapshot(j.snap, j.cols, j.src, j.path, j.progress);
+            }
+        } catch (Exception ex) {
+            if (j.progress != null) { j.progress.OnDone(false, ex.Message); }
+        }
+        DataTable.sExportJob = null;
+        DataTable.sExportBusy.Store(0);
+    }
+}
+
+/// DataTable 分部：文件导出（CSV / XLSX，同步 + 异步流式）。
+/// 行选择语义与 <see cref="BuildText"/>（剪贴板复制）完全一致，
+/// "所见即所得"——导出的就是过滤/排序后看到的行。序列化本体在
+/// <see cref="XlsxBook"/>（数据层），不依赖 GUI；服务端/控制台
+/// 程序直接用 XlsxBook.SaveStreaming 即可。
 partial class DataTable {
-    // ---------- 文件导出（CSV / XLSX） ----------
+    // 后台导出的单任务槽与忙标志：避免两个导出互相抢文件与
+    // 进度回调（与 DownloadJob 的单任务语义一致）。
+    static ExportJob sExportJob;
+    static AtomicInt sExportBusy = new AtomicInt(0);
+
+    // ---------- 同步导出（小表；大表请用 *Async） ----------
 
     /// 导出为 CSV 文件，始终含表头行。行选择：
     /// `selectionOnly` 为 false 时导出整个过滤/排序后的视图；
     /// 为 true 时有单元格范围导范围（行×列），否则导勾选行，
     /// 两者皆无返回 false。内容与复制粘贴一致（显示文本，
     /// RFC 4180 转义）。UTF-8 带 BOM，Excel 双击打开不乱码。
+    /// 逐行流式写出，内存占用与行数无关；路径打不开返回 false。
     static bool ExportToCsv(DataTableState st, List<DataColumn> cols,
                             DataSource src, string path, bool selectionOnly) {
-        if (!DataTable.ExportSelectionExists(st, selectionOnly)) { return false; }
-        string text = DataTable.BuildText(st, cols, src, true, true);
+        DataTableExportSnapshot snap = DataTable.ExportSnapshot(st, cols.Count, selectionOnly);
+        if (snap == null) { return false; }
         try {
-            File.WriteAllBytes(path, DataTable.WithBom(text));
-            return true;
+            return DataTable.ExportCsvSnapshot(snap, cols, src, path, null);
         } catch (Exception ex) {
             return false;
         }
@@ -31,16 +138,106 @@ partial class DataTable {
     /// 导出为 .xlsx 文件，语义与 <see cref="ExportToCsv"/> 相同，
     /// 但按列声明的类型写出真值：数值列写数字（可参与 Excel 汇总）、
     /// 日期列写 Excel 日期、bool 列写布尔，其余写文本；首行加粗、
-    /// 冻结首行、列宽自适应。路径打不开时返回 false。
+    /// 冻结首行、列宽自适应。流式写盘（内存占用与行数无关），超
+    /// 1048576 行自动分表；路径打不开时返回 false。
     static bool ExportToXlsx(DataTableState st, List<DataColumn> cols,
                              DataSource src, string path, bool selectionOnly) {
-        if (!DataTable.ExportSelectionExists(st, selectionOnly)) { return false; }
+        DataTableExportSnapshot snap = DataTable.ExportSnapshot(st, cols.Count, selectionOnly);
+        if (snap == null) { return false; }
+        try {
+            return DataTable.ExportXlsxSnapshot(snap, cols, src, path, null);
+        } catch (Exception ex) {
+            return false;
+        }
+    }
+
+    // ---------- 异步导出（大表；进度/取消经 DataTableExportProgress） ----------
+
+    /// <summary>
+    /// 异步导出为 .xlsx：立即返回 true 表示任务已启动，写盘在后台
+    /// 线程上流式进行。行集/列区间在本调用内（当前线程）冻结成
+    /// 快照——之后表格的排序、过滤、勾选变化不影响本次导出；数据
+    /// 源内容本身请保持只读。进度/取消经 `progress` 回调（在后台
+    /// 线程上发生，UI 更新用 App.Post 切回），结束时必有一次
+    /// OnDone。返回 false：已有导出在运行（并回调
+    /// OnDone(false, "已有导出在运行")）或无可导内容（不回调）。
+    /// </summary>
+    static bool ExportToXlsxAsync(DataTableState st, List<DataColumn> cols,
+                                  DataSource src, string path, bool selectionOnly,
+                                  DataTableExportProgress progress) {
+        DataTableExportSnapshot snap = DataTable.ExportBegin(selectionOnly,
+            st, cols.Count, progress);
+        if (snap == null) { return false; }
+        ExportJob job = new ExportJob();
+        job.kind = 1;
+        job.snap = snap;
+        job.cols = cols;
+        job.src = src;
+        job.path = path;
+        job.progress = progress;
+        DataTable.sExportJob = job;
+        if (!Thread.Start(ExportJob.Worker)) {
+            DataTable.sExportJob = null;
+            DataTable.sExportBusy.Store(0);
+            if (progress != null) { progress.OnDone(false, "无法启动导出线程"); }
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>异步导出为 CSV，语义与 <see cref="ExportToXlsxAsync"/>
+    /// 相同（逐行流式 + BOM + RFC 4180 转义）。</summary>
+    static bool ExportToCsvAsync(DataTableState st, List<DataColumn> cols,
+                                 DataSource src, string path, bool selectionOnly,
+                                 DataTableExportProgress progress) {
+        DataTableExportSnapshot snap = DataTable.ExportBegin(selectionOnly,
+            st, cols.Count, progress);
+        if (snap == null) { return false; }
+        ExportJob job = new ExportJob();
+        job.kind = 2;
+        job.snap = snap;
+        job.cols = cols;
+        job.src = src;
+        job.path = path;
+        job.progress = progress;
+        DataTable.sExportJob = job;
+        if (!Thread.Start(ExportJob.Worker)) {
+            DataTable.sExportJob = null;
+            DataTable.sExportBusy.Store(0);
+            if (progress != null) { progress.OnDone(false, "无法启动导出线程"); }
+            return false;
+        }
+        return true;
+    }
+
+    // 异步导出的公共前置：忙标志占位 + 当前线程冻结快照。失败
+    // 时负责把忙标志放回去。返回 null = 拒绝启动。
+    static DataTableExportSnapshot ExportBegin(bool selectionOnly, DataTableState st,
+                                               int colCount, DataTableExportProgress progress) {
+        if (DataTable.sExportBusy.CompareExchange(0, 1) != 0) {
+            if (progress != null) { progress.OnDone(false, "已有导出在运行"); }
+            return null;
+        }
+        DataTableExportSnapshot snap = DataTable.ExportSnapshot(st, colCount, selectionOnly);
+        if (snap == null) {
+            DataTable.sExportBusy.Store(0);
+        }
+        return snap;
+    }
+
+    // ---------- 内部：快照与写盘核心 ----------
+
+    // 在调用线程（通常是 UI 线程）冻结导出行集：列区间与行序一次
+    // 取走，之后表格再排序/过滤/勾选都不影响本次导出。无可导内容
+    // 返回 null。
+    static DataTableExportSnapshot ExportSnapshot(DataTableState st, int colCount,
+                                                  bool selectionOnly) {
         int c0 = 0;
-        int c1 = cols.Count - 1;
+        int c1 = colCount - 1;
         List<int> rowsOut = new List<int>();
         if (selectionOnly && DataTable.HasRange(st)) {
             c0 = DataTable.MaxI(0, DataTable.MinI(st.rangeC0, st.rangeC1));
-            c1 = DataTable.MinI(cols.Count - 1,
+            c1 = DataTable.MinI(colCount - 1,
                 DataTable.MaxI(st.rangeC0, st.rangeC1));
             int rLo = DataTable.MaxI(0, DataTable.MinI(st.rangeR0, st.rangeR1));
             int rHi = DataTable.MinI(st.order.Count - 1,
@@ -56,25 +253,93 @@ partial class DataTable {
                 rowsOut.Add(st.order[oi]);
             }
         }
-        if (c1 < c0 || rowsOut.Count == 0) { return false; }
+        if (c1 < c0 || rowsOut.Count == 0) { return null; }
+        DataTableExportSnapshot snap = new DataTableExportSnapshot();
+        snap.rows = rowsOut;
+        snap.c0 = c0;
+        snap.c1 = c1;
+        return snap;
+    }
+
+    // xlsx 写盘核心（同步与后台线程共用）。progress 为 null 表示
+    // 不需要进度/取消。返回 false = 取消或写盘失败。
+    static bool ExportXlsxSnapshot(DataTableExportSnapshot snap, List<DataColumn> cols,
+                                   DataSource src, string path,
+                                   DataTableExportProgress progress) {
+        int total = snap.rows.Count + 1;
+        if (progress != null) { progress.OnStart(total); }
         XlsxBook book = XlsxBook.New();
-        XlsxSheet sh = book.AddSheet("Sheet1");
-        List<XlsxCell> head = new List<XlsxCell>();
-        for (int cc = c0; cc <= c1; cc = cc + 1) {
-            head.Add(XlsxCell.Str(cols[cc].title));
-        }
-        sh.AddRow(head);
-        for (int k = 0; k < rowsOut.Count; k = k + 1) {
-            List<XlsxCell> row = new List<XlsxCell>();
-            for (int cc = c0; cc <= c1; cc = cc + 1) {
-                row.Add(DataTable.ExportCell(cc, cols[cc], src, rowsOut[k]));
+        book.AddSheet("Sheet1");
+        DataTableRowSource rs = new DataTableRowSource();
+        rs.src = src;
+        rs.cols = cols;
+        rs.snap = snap;
+        rs.progress = progress;
+        bool ok = book.SaveStreaming(path, new List<XlsxRowSource>{ rs });
+        if (progress != null) {
+            if (ok) {
+                progress.OnProgress(total, total);
+                progress.OnDone(true, "");
+            } else if (progress.Cancelled()) {
+                progress.OnDone(false, "已取消");
+            } else {
+                progress.OnDone(false, "写入失败");
             }
-            sh.AddRow(row);
         }
+        return ok;
+    }
+
+    // CSV 写盘核心：逐行流式（UTF-8 带 BOM；RFC 4180 转义与
+    // 复制粘贴一致）。返回 false = 取消或写盘失败。
+    static bool ExportCsvSnapshot(DataTableExportSnapshot snap, List<DataColumn> cols,
+                                  DataSource src, string path,
+                                  DataTableExportProgress progress) {
+        int total = snap.rows.Count + 1;
+        if (progress != null) { progress.OnStart(total); }
+        StreamWriter w = new StreamWriter(path);
         try {
-            book.Save(path);
+            // UTF-8 BOM：Excel 双击打开 CSV 时没有它按本地旧代码
+            // 页猜编码，中文必乱码。
+            w.Write(Encoding.Utf8FromCodePoint(65279));
+            StringBuilder sb = new StringBuilder();
+            for (int cc = snap.c0; cc <= snap.c1; cc = cc + 1) {
+                if (cc > snap.c0) { sb.Append(","); }
+                sb.Append(DataTable.CsvField(cols[cc].title));
+            }
+            sb.Append("\r\n");
+            w.Write(sb.ToString());
+            for (int k = 0; k < snap.rows.Count; k = k + 1) {
+                if (progress != null && progress.Cancelled()) {
+                    w.Close();
+                    File.Delete(path);
+                    progress.OnDone(false, "已取消");
+                    return false;
+                }
+                int ri = snap.rows[k];
+                sb = new StringBuilder();
+                for (int cc = snap.c0; cc <= snap.c1; cc = cc + 1) {
+                    if (cc > snap.c0) { sb.Append(","); }
+                    sb.Append(DataTable.CsvField(src.CellText(ri, cc)));
+                }
+                sb.Append("\r\n");
+                w.Write(sb.ToString());
+                if ((k & 511) == 511 && progress != null) {
+                    progress.OnProgress(k + 2, total);
+                }
+            }
+            w.Close();
+            if (progress != null) {
+                progress.OnProgress(total, total);
+                progress.OnDone(true, "");
+            }
             return true;
         } catch (Exception ex) {
+            w.Close();
+            File.Delete(path);
+            if (progress != null) {
+                if (progress.Cancelled()) { progress.OnDone(false, "已取消"); }
+                else { progress.OnDone(false, "写入失败"); }
+            }
             return false;
         }
     }
@@ -96,27 +361,5 @@ partial class DataTable {
             return XlsxCell.Num((double)src.CellNum(row, ci));
         }
         return XlsxCell.Str(raw);
-    }
-
-    // selectionOnly 时有没有可导出的东西：单元格范围或至少一行勾选。
-    static bool ExportSelectionExists(DataTableState st, bool selectionOnly) {
-        if (!selectionOnly) { return true; }
-        if (DataTable.HasRange(st)) { return true; }
-        for (int oi = 0; oi < st.order.Count; oi = oi + 1) {
-            if (st.selected[st.order[oi]]) { return true; }
-        }
-        return false;
-    }
-
-    // UTF-8 带 BOM：Excel 双击打开 CSV 时，不带 BOM 会按本地
-    // 旧代码页猜编码，中文必乱码。
-    static byte[] WithBom(string text) {
-        byte[] body = text.ToBytes();
-        byte[] all = new byte[3 + body.Length];
-        all[0] = 239;
-        all[1] = 187;
-        all[2] = 191;
-        for (int i = 0; i < body.Length; i = i + 1) { all[3 + i] = body[i]; }
-        return all;
     }
 }

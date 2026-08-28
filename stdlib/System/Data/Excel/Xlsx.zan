@@ -103,6 +103,29 @@ class XlsxSheet {
 }
 
 /// <summary>
+/// 流式写出的行供给源：<see cref="XlsxBook.SaveStreaming"/> 按需调
+/// <see cref="FillRow"/> 取行。行号从 0 起，第 0 行约定为表头（若
+/// 有）。FillRow 把第 `index` 行填进 `row`（先 Clear，行内单元格数
+/// 可参差）并返回 true；返回 false 视为数据失败、中止导出。数据源
+/// 必须可重入——列宽估算会对每个分表的前 200 行重新预扫一遍。
+/// 所有回调都在写出线程上发生；GUI 程序请用 App.Post 把进度切回
+/// UI 线程再改控件。
+/// </summary>
+class XlsxRowSource {
+    /// 数据总行数（含表头行）。
+    virtual int RowCount() { return 0; }
+
+    /// 填第 `index` 行。返回 false 中止导出（文件被删除）。
+    virtual bool FillRow(int index, List<XlsxCell> row) { return true; }
+
+    /// 已写完 `done`/`total` 行（写线程回调，约每 512 行一次）。
+    virtual void OnProgress(int done, int total) { }
+
+    /// 返回 true 中止导出：半成品被删除，SaveStreaming 返回 false。
+    virtual bool Cancelled() { return false; }
+}
+
+/// <summary>
 /// 极简 XLSX（Office Open XML SpreadsheetML）写出器，纯 Zan 实现：
 /// 每张工作表一个 worksheet XML，连同 workbook/styles/rels 一起用
 /// <see cref="Zip"/> 打包。字符串写 inlineStr（免共享字符串表），
@@ -203,6 +226,169 @@ class XlsxBook {
     /// 写入 .xlsx 文件。路径打不开时抛 <see cref="IOException"/>。
     void Save(string path) {
         File.WriteAllBytes(path, SaveToBytes());
+    }
+
+    /// 单张工作表的最大行数（xlsx 格式上限 1048576）。流式写
+    /// 出超出时自动续接分表；测试/演示可调小以驱动分表路径。
+    static int maxRowsPerSheet = 1048576;
+
+    /// <summary>
+    /// 流式写出：工作表内容经 <paramref name="sources"/>（与 sheets
+    /// 一一对应，缺位的用空源）逐行供给，边生成边压缩落盘，内存
+    /// 占用与总行数无关。单表超过 <see cref="maxRowsPerSheet"/> 时
+    /// 自动续接分表（原表名后缀 2、3……去重；表头/冻结窗格留在
+    /// 第一分表）。数据源的 Cancelled() 返回 true 时中止写盘、
+    /// 删除半成品并返回 false；路径打不开时抛 IOException。
+    /// 输出同样不含时间戳，可复现。
+    /// </summary>
+    bool SaveStreaming(string path, List<XlsxRowSource> sources) {
+        ZipWriter zw = ZipWriter.Open(path);
+        // 先写工作表部件（zip 内条目顺序无所谓），收集实际写出
+        // 的分表清单，最后按它生成 workbook/rels/content-types。
+        List<XlsxSheet> parts = new List<XlsxSheet>();
+        int partNo = 0;
+        bool cancelled = false;
+        for (int i = 0; i < sheets.Count && !cancelled; i = i + 1) {
+            XlsxRowSource src = i < sources.Count ? sources[i] : new XlsxRowSource();
+            int total = src.RowCount();
+            int done = 0;
+            int round = 0;
+            while ((done < total || round == 0) && !cancelled) {
+                int n = total - done;
+                if (n > XlsxBook.maxRowsPerSheet) { n = XlsxBook.maxRowsPerSheet; }
+                XlsxSheet part = sheets[i];
+                if (round > 0) {
+                    part = new XlsxSheet(XlsxBook.PartName(sheets, parts, sheets[i].name));
+                    part.headerBold = false;
+                    part.freezeHeader = false;
+                }
+                parts.Add(part);
+                partNo = partNo + 1;
+                if (!XlsxBook.StreamSheetPart(part, src, done, n, zw, partNo, total)) {
+                    cancelled = true;
+                }
+                done = done + n;
+                round = round + 1;
+            }
+        }
+        if (cancelled) {
+            zw.Abort();
+            return false;
+        }
+        zw.AddEntry("[Content_Types].xml",
+            XlsxBook.ContentTypes(parts.Count).ToBytes(), 6);
+        zw.AddEntry("_rels/.rels", XlsxBook.RootRels().ToBytes(), 6);
+        zw.AddEntry("docProps/core.xml", XlsxBook.CoreProps().ToBytes(), 6);
+        zw.AddEntry("docProps/app.xml", XlsxBook.AppProps().ToBytes(), 6);
+        zw.AddEntry("xl/workbook.xml", XlsxBook.WorkbookXml(parts).ToBytes(), 6);
+        zw.AddEntry("xl/_rels/workbook.xml.rels",
+            XlsxBook.WorkbookRels(parts.Count).ToBytes(), 6);
+        zw.AddEntry("xl/styles.xml", XlsxBook.StylesXml().ToBytes(), 6);
+        zw.Close();
+        return true;
+    }
+
+    // 分表命名：`baseName` 撞上现有表或已写分表时后缀 2、3……。
+    static string PartName(List<XlsxSheet> sheets, List<XlsxSheet> parts,
+                           string baseName) {
+        string unique = baseName;
+        int n = 2;
+        while (XlsxBook.IndexOfSheet(sheets, unique) >= 0
+               || XlsxBook.IndexOfSheet(parts, unique) >= 0) {
+            unique = baseName + Convert.ToString(n);
+            n = n + 1;
+        }
+        return unique;
+    }
+
+    // 写出一个分表的 worksheet 部件：表头加粗/冻结窗格只在分表
+    // 覆盖绝对第 0 行时生效；列宽对区间前 200 行做预扫（FillRow
+    // 必须可重入）；行体攒到 32KB 冲一次压缩流。返回 false =
+    // 数据源取消/失败。
+    static bool StreamSheetPart(XlsxSheet s, XlsxRowSource src, int rowStart,
+                                int rows, ZipWriter zw, int partNo, int total) {
+        zw.BeginEntry("xl/worksheets/sheet" + Convert.ToString(partNo) + ".xml", 6);
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">");
+        sb.Append("<sheetViews><sheetView workbookViewId=\"0\">");
+        if (s.freezeHeader && rowStart == 0 && rows > 0) {
+            sb.Append("<pane ySplit=\"1\" topLeftCell=\"A2\" activePane=\"bottomLeft\" state=\"frozen\"/>");
+            sb.Append("<selection pane=\"bottomLeft\" activeCell=\"A2\" sqref=\"A2\"/>");
+        }
+        sb.Append("</sheetView></sheetViews>");
+        int ncols = 0;
+        List<int> widths = new List<int>();
+        if (s.autoWidth && rows > 0) {
+            int preview = rows < 200 ? rows : 200;
+            List<XlsxCell> probe = new List<XlsxCell>();
+            for (int i = 0; i < preview; i = i + 1) {
+                if (src.Cancelled()) { return false; }
+                probe.Clear();
+                if (!src.FillRow(rowStart + i, probe)) { return false; }
+                if (probe.Count > ncols) { ncols = probe.Count; }
+                for (int c = 0; c < probe.Count; c = c + 1) {
+                    int len = XlsxBook.CellWidth(probe[c]);
+                    if (c >= widths.Count) { widths.Add(len); }
+                    else if (len > widths[c]) { widths[c] = len; }
+                }
+            }
+            if (ncols > 0) {
+                sb.Append("<cols>");
+                for (int c = 0; c < ncols; c = c + 1) {
+                    int w = c < widths.Count ? widths[c] : 8;
+                    w = w + 2;
+                    if (w < 10) { w = 10; }
+                    if (w > 60) { w = 60; }
+                    sb.Append("<col min=\"" + Convert.ToString(c + 1));
+                    sb.Append("\" max=\"" + Convert.ToString(c + 1));
+                    sb.Append("\" width=\"" + Convert.ToString(w));
+                    sb.Append("\" customWidth=\"1\"/>");
+                }
+                sb.Append("</cols>");
+            }
+        }
+        sb.Append("<sheetData>");
+        byte[] pre = sb.ToString().ToBytes();
+        zw.WriteData(pre, pre.Length);
+        StringBuilder body = new StringBuilder();
+        int bodyChars = 0;
+        List<XlsxCell> row = new List<XlsxCell>();
+        for (int i = 0; i < rows; i = i + 1) {
+            if (src.Cancelled()) { return false; }
+            row.Clear();
+            if (!src.FillRow(rowStart + i, row)) { return false; }
+            int abs = rowStart + i;
+            body.Append("<row r=\"" + Convert.ToString(abs + 1) + "\">");
+            bool bold = s.headerBold && abs == 0;
+            for (int c = 0; c < row.Count; c = c + 1) {
+                XlsxBook.AppendCellXml(body, row[c], abs + 1, c, bold);
+            }
+            body.Append("</row>");
+            bodyChars = bodyChars + row.Count + 1;
+            if (bodyChars >= 2048) {
+                byte[] flush = body.ToString().ToBytes();
+                zw.WriteData(flush, flush.Length);
+                body = new StringBuilder();
+                bodyChars = 0;
+            }
+            if ((abs & 511) == 511) {
+                src.OnProgress(abs + 1, total);
+            }
+        }
+        if (bodyChars > 0) {
+            byte[] flush = body.ToString().ToBytes();
+            zw.WriteData(flush, flush.Length);
+        }
+        if (rows > 0) {
+            src.OnProgress(rowStart + rows, total);
+        }
+        body = new StringBuilder();
+        body.Append("</sheetData></worksheet>");
+        byte[] tail = body.ToString().ToBytes();
+        zw.WriteData(tail, tail.Length);
+        zw.EndEntry();
+        return true;
     }
 
     static ZipEntry Part(string name, string xml) {
@@ -346,36 +532,51 @@ class XlsxBook {
             sb.Append("<row r=\"" + Convert.ToString(r + 1) + "\">");
             bool bold = s.headerBold && r == 0;
             for (int c = 0; c < row.Count; c = c + 1) {
-                XlsxCell cell = row[c];
-                if (cell == null || cell.kind == 0) { continue; }
-                if (cell.kind == 1 && cell.text == "") { continue; }
-                string rf = "<c r=\"" + Xlsx.ColRef(c) + Convert.ToString(r + 1) + "\"";
-                int style = 0;
-                if (cell.kind == 4) { style = 1; }
-                if (bold) { style = style + 2; }
-                if (style > 0) { rf = rf + " s=\"" + Convert.ToString(style) + "\""; }
-                if (cell.kind == 1) {
-                    sb.Append(rf + " t=\"inlineStr\"><is><t");
-                    if ((int)cell.text[0] == 32
-                        || (int)cell.text[cell.text.Length - 1] == 32) {
-                        sb.Append(" xml:space=\"preserve\"");
-                    }
-                    sb.Append(">" + Xlsx.Esc(cell.text) + "</t></is></c>");
-                } else if (cell.kind == 2) {
-                    sb.Append(rf + "><v>" + cell.text + "</v></c>");
-                } else if (cell.kind == 3) {
-                    sb.Append(rf + " t=\"b\"><v>");
-                    if (cell.flag) { sb.Append("1"); } else { sb.Append("0"); }
-                    sb.Append("</v></c>");
-                } else if (cell.kind == 4) {
-                    // Excel 1900 日期制：1970-01-01 = 序列 25569。
-                    sb.Append(rf + "><v>" + Convert.ToString((long)cell.days + 25569) + "</v></c>");
-                }
+                XlsxBook.AppendCellXml(sb, row[c], r + 1, c, bold);
             }
             sb.Append("</row>");
         }
         sb.Append("</sheetData></worksheet>");
         return sb.ToString();
+    }
+
+    // 单个 <c> 单元格（含 r/s/t 属性与内容）追加到 sb。kind 0
+    // 或空文本的单元格不产生输出。
+    static void AppendCellXml(StringBuilder sb, XlsxCell cell, int row1,
+                              int col, bool bold) {
+        if (cell == null || cell.kind == 0) { return; }
+        if (cell.kind == 1 && cell.text == "") { return; }
+        string rf = "<c r=\"" + Xlsx.ColRef(col) + Convert.ToString(row1) + "\"";
+        int style = 0;
+        if (cell.kind == 4) { style = 1; }
+        if (bold) { style = style + 2; }
+        if (style > 0) { rf = rf + " s=\"" + Convert.ToString(style) + "\""; }
+        if (cell.kind == 1) {
+            sb.Append(rf + " t=\"inlineStr\"><is><t");
+            if ((int)cell.text[0] == 32
+                || (int)cell.text[cell.text.Length - 1] == 32) {
+                sb.Append(" xml:space=\"preserve\"");
+            }
+            sb.Append(">" + Xlsx.Esc(cell.text) + "</t></is></c>");
+        } else if (cell.kind == 2) {
+            sb.Append(rf + "><v>" + cell.text + "</v></c>");
+        } else if (cell.kind == 3) {
+            sb.Append(rf + " t=\"b\"><v>");
+            if (cell.flag) { sb.Append("1"); } else { sb.Append("0"); }
+            sb.Append("</v></c>");
+        } else if (cell.kind == 4) {
+            // Excel 1900 日期制：1970-01-01 = 序列 25569。
+            sb.Append(rf + "><v>" + Convert.ToString((long)cell.days + 25569) + "</v></c>");
+        }
+    }
+
+    // 单格的列宽贡献值（8 兜底；文本按显示宽、数字 +1、日期 10）。
+    static int CellWidth(XlsxCell cell) {
+        if (cell == null || cell.kind == 0) { return 8; }
+        if (cell.kind == 1) { return Xlsx.WideLen(cell.text); }
+        if (cell.kind == 2) { return cell.text.Length + 1; }
+        if (cell.kind == 4) { return 10; }
+        return 8;
     }
 
     // 列宽估算：内容显示宽度 + 2 的余量，夹在 [10, 60]。
@@ -387,12 +588,7 @@ class XlsxBook {
         for (int r = 0; r < limit; r = r + 1) {
             List<XlsxCell> row = s.rows[r];
             if (col >= row.Count) { continue; }
-            XlsxCell cell = row[col];
-            if (cell == null || cell.kind == 0) { continue; }
-            int len = 8;
-            if (cell.kind == 1) { len = Xlsx.WideLen(cell.text); }
-            else if (cell.kind == 2) { len = cell.text.Length + 1; }
-            else if (cell.kind == 4) { len = 10; }
+            int len = XlsxBook.CellWidth(row[col]);
             if (len > w) { w = len; }
         }
         w = w + 2;

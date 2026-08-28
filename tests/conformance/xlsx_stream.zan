@@ -1,0 +1,232 @@
+// XLSX 流式写出：DeflateChunker 分块压缩往返、ZipWriter 流式归档
+// 与 Zip.Read 互通、XlsxBook.SaveStreaming（行供给源 + 超限自动
+// 分表 + 取消删除半成品 + 字节可复现）。
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Data.Excel;
+
+namespace Prog;
+
+class Prog {
+    static int fails = 0;
+
+    static void Check(string name, bool cond) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            fails = fails + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    // 确定性伪随机（LCG）低熵字节——可压缩、可复现。
+    static byte[] Blob(int n, int seed) {
+        byte[] b = new byte[n];
+        int s = seed;
+        for (int i = 0; i < n; i = i + 1) {
+            s = (s * 1103515245 + 12345) & 2147483647;
+            b[i] = (byte)(65 + (s >> 16) % 8);
+        }
+        return b;
+    }
+
+    static string Decode(byte[] zip, List<ZipEntry> entries, string name) {
+        for (int i = 0; i < entries.Count; i = i + 1) {
+            if (entries[i].name == name) {
+                byte[] b = Zip.Extract(zip, entries[i]);
+                if (b == null) { return ""; }
+                nint buf = NativeMemory.Alloc(b.Length + 1);
+                for (int k = 0; k < b.Length; k = k + 1) {
+                    new Span<byte>(buf + k, 1)[0] = b[k];
+                }
+                string s = NativeMemory.GetString(buf, 0, b.Length);
+                NativeMemory.Free(buf);
+                return s;
+            }
+        }
+        return "";
+    }
+
+    static ZipEntry Find(List<ZipEntry> es, string name) {
+        for (int i = 0; i < es.Count; i = i + 1) {
+            if (es[i].name == name) { return es[i]; }
+        }
+        return null;
+    }
+
+    static bool SameBytes(byte[] a, byte[] b) {
+        if (a.Length != b.Length) { return false; }
+        for (int i = 0; i < a.Length; i = i + 1) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    static void Main() {
+        string path = "xlsx_stream_tmp.zip";
+        string path2 = "xlsx_stream_tmp2.zip";
+        string path3 = "xlsx_stream_tmp3.xlsx";
+        string path4 = "xlsx_stream_tmp4.xlsx";
+
+        // ---- DeflateChunker：3 块分块压出的流 = 一条合法 DEFLATE ----
+        byte[] whole = Blob(600000, 7);
+        DeflateChunker ch = new DeflateChunker();
+        int total = 0;
+        for (int off = 0; off < whole.Length; off = off + 200000) {
+            int len = whole.Length - off < 200000 ? whole.Length - off : 200000;
+            byte[] chunk = new byte[len];
+            for (int i = 0; i < len; i = i + 1) { chunk[i] = whole[off + i]; }
+            total = total + ch.Push(chunk, 6).Length;
+        }
+        total = total + ch.Finish().Length;
+        // 分块压出的流与整块压缩几乎等长（哈希链每块重建，1MB 级
+        // 块的压缩比损失可忽略），至多多 3 个块头 + 残位字节。
+        byte[] wholeDef = Deflate.Deflate(whole, 6);
+        Check("chunker-vs-whole", total < wholeDef.Length + 4096);
+        // 重新走一遍收集字节（上一次只数了长度）。
+        DeflateChunker ch2 = new DeflateChunker();
+        List<byte[]> packs = new List<byte[]>();
+        int packedLen = 0;
+        for (int off = 0; off < whole.Length; off = off + 200000) {
+            int len = whole.Length - off < 200000 ? whole.Length - off : 200000;
+            byte[] chunk = new byte[len];
+            for (int i = 0; i < len; i = i + 1) { chunk[i] = whole[off + i]; }
+            byte[] p = ch2.Push(chunk, 6);
+            packs.Add(p);
+            packedLen = packedLen + p.Length;
+        }
+        byte[] fin = ch2.Finish();
+        byte[] packed = new byte[packedLen + fin.Length];
+        int pp = 0;
+        for (int i = 0; i < packs.Count; i = i + 1) {
+            for (int k = 0; k < packs[i].Length; k = k + 1) { packed[pp + k] = packs[i][k]; }
+            pp = pp + packs[i].Length;
+        }
+        for (int k = 0; k < fin.Length; k = k + 1) { packed[pp + k] = fin[k]; }
+        byte[] back = Deflate.Inflate(packed, 0, packed.Length, whole.Length + 1);
+        bool roundtrip = back != null && back.Length == whole.Length;
+        for (int i = 0; roundtrip && i < whole.Length; i = i + 40009) {
+            if (back[i] != whole[i]) { roundtrip = false; }
+        }
+        Check("chunker-roundtrip", roundtrip);
+
+        // ---- ZipWriter：小条目 + 分块大条目 + stored 条目 ----
+        ZipWriter zw = ZipWriter.Open(path);
+        zw.AddEntry("small.txt", "你好 zip".ToBytes(), 6);
+        zw.BeginEntry("big.bin", 6);
+        for (int i = 0; i < 3; i = i + 1) {
+            byte[] c = Blob(200000, 100 + i);
+            zw.WriteData(c, c.Length);
+        }
+        zw.EndEntry();
+        zw.BeginEntry("stored.bin", 0);
+        byte[] st = Blob(1000, 55);
+        zw.WriteData(st, st.Length);
+        zw.EndEntry();
+        zw.Close();
+        byte[] zbytes = File.ReadAllBytes(path);
+        List<ZipEntry> es = Zip.Read(zbytes);
+        Check("zw-read", es != null && es.Count == 3);
+        byte[] small = Zip.Extract(zbytes, Find(es, "small.txt"));
+        Check("zw-small-utf8", small != null && small.Length == 10);
+        byte[] big = Zip.Extract(zbytes, Find(es, "big.bin"));
+        bool bigOk = big != null && big.Length == 600000;
+        for (int i = 0; bigOk && i < 600000; i = i + 99991) {
+            byte[] refc = Blob(200000, 100 + i / 200000);
+            if (big[i] != refc[i % 200000]) { bigOk = false; }
+        }
+        Check("zw-big-roundtrip", bigOk);
+        byte[] stored = Zip.Extract(zbytes, Find(es, "stored.bin"));
+        Check("zw-stored", stored != null && stored.Length == 1000);
+
+        // ---- SaveStreaming：2500 数据行 + 表头，限每表 1000 行 → 3 分表 ----
+        XlsxBook book = XlsxBook.New();
+        book.AddSheet("数据");
+        GenSource src = new GenSource();
+        src.n = 2500;
+        XlsxBook.maxRowsPerSheet = 1000;
+        Check("ss-ok", book.SaveStreaming(path3, new List<XlsxRowSource>{ src }));
+        XlsxBook.maxRowsPerSheet = 1048576;
+        byte[] xb = File.ReadAllBytes(path3);
+        List<ZipEntry> xe = Zip.Read(xb);
+        Check("ss-entry-count", xe != null && xe.Count == 10);
+        Check("ss-parts", Find(xe, "xl/worksheets/sheet1.xml") != null
+            && Find(xe, "xl/worksheets/sheet2.xml") != null
+            && Find(xe, "xl/worksheets/sheet3.xml") != null);
+        string wb = Decode(xb, xe, "xl/workbook.xml");
+        Check("ss-workbook-parts", wb.Contains("<sheet name=\"数据\" sheetId=\"1\"")
+            && wb.Contains("<sheet name=\"数据2\" sheetId=\"2\"")
+            && wb.Contains("<sheet name=\"数据3\" sheetId=\"3\""));
+        string s1 = Decode(xb, xe, "xl/worksheets/sheet1.xml");
+        string s3 = Decode(xb, xe, "xl/worksheets/sheet3.xml");
+        Check("ss-freeze-first-only", s1.Contains("state=\"frozen\"")
+            && !s3.Contains("state=\"frozen\""));
+        Check("ss-part-row-range", s1.Contains("<row r=\"1000\">")
+            && !s1.Contains("<row r=\"1001\">"));
+        // 第三分表保留绝对行号：从源第 2000 行（Excel 第 2001 行）起。
+        Check("ss-absolute-rows", s3.Contains("<row r=\"2001\">"));
+        Check("ss-values", s1.Contains("<v>1</v>") && s3.Contains("<v>2500</v>"));
+
+        // ---- 取消：第 11 行起失败 → 半成品删除 ----
+        XlsxBook book2 = XlsxBook.New();
+        book2.AddSheet("X");
+        CancelSource cs = new CancelSource();
+        cs.n = 100000;
+        Check("ss-cancelled", !book2.SaveStreaming(path4, new List<XlsxRowSource>{ cs }));
+        Check("ss-cancel-deleted", !File.Exists(path4));
+
+        // ---- 确定性：同书同源同配置写两遍字节一致 ----
+        XlsxBook.maxRowsPerSheet = 1000;
+        Check("ss-deterministic", book.SaveStreaming(path3.Replace(".xlsx", "b.xlsx"),
+            new List<XlsxRowSource>{ src })
+            && SameBytes(xb, File.ReadAllBytes(path3.Replace(".xlsx", "b.xlsx"))));
+        XlsxBook.maxRowsPerSheet = 1048576;
+
+        File.Delete(path);
+        File.Delete(path2);
+        File.Delete(path3);
+        File.Delete(path3.Replace(".xlsx", "b.xlsx"));
+
+        Console.WriteLine(fails == 0 ? "ALL OK" : "FAILED");
+    }
+}
+
+/// 生成器源：第 0 行表头，之后行号 + 文本 + 数字 + 日期。
+class GenSource : XlsxRowSource {
+    public int n;
+
+    override int RowCount() { return this.n + 1; }
+
+    override bool FillRow(int index, List<XlsxCell> row) {
+        if (index == 0) {
+            row.Add(XlsxCell.Str("行号"));
+            row.Add(XlsxCell.Str("名称"));
+            row.Add(XlsxCell.Num(0.0));
+            row.Add(XlsxCell.Date(20458));
+            return true;
+        }
+        row.Add(XlsxCell.Num((double)index));
+        row.Add(XlsxCell.Str("项目-" + Convert.ToString(index)));
+        row.Add(XlsxCell.Num((double)index * 1.25));
+        row.Add(XlsxCell.Date(20458 + index));
+        return true;
+    }
+}
+
+/// 写若干行后失败的源（FillRow 返回 false → 视为取消路径删除文件）。
+class CancelSource : XlsxRowSource {
+    public int n;
+
+    override int RowCount() { return this.n + 1; }
+
+    override bool FillRow(int index, List<XlsxCell> row) {
+        if (index == 0) {
+            row.Add(XlsxCell.Str("头"));
+            return true;
+        }
+        if (index > 10) { return false; }
+        row.Add(XlsxCell.Num((double)index));
+        return true;
+    }
+}

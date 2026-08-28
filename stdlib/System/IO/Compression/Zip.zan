@@ -355,3 +355,255 @@ class Zip {
         off = off + 4;
     }
 }
+
+/// <summary>
+/// 流式 ZIP 写出器：条目边生成边压缩、边落盘，内存占用与条目
+/// 大小无关（分块压缩走 <see cref="DeflateChunker"/>）。与
+/// <see cref="Zip"/> 互通——这里写出的归档 Zip.Read/Extract/
+/// ExtractToDirectory 以及标准解压工具都能读。单条目与整个
+/// 归档都 ≤ 4GB（头部是 u32 字段，ZIP64 暂不支持）。用法：
+///
+///   ZipWriter zw = ZipWriter.Open("out.zip");
+///   zw.AddEntry("a.txt", smallBytes, 6);   // 小条目一次写入
+///   zw.BeginEntry("big.xml", 6);           // 大条目分块写入
+///   zw.WriteData(chunk1, chunk1.Length);
+///   zw.WriteData(chunk2, chunk2.Length);
+///   zw.EndEntry();                          // 回填 CRC/尺寸
+///   zw.Close();
+///
+/// 中途放弃时调 <see cref="Abort"/> 删掉半成品文件。
+/// </summary>
+class ZipWriter {
+    [DllImport("crt", EntryPoint = "zan_file_fopen")]
+    static extern nint fopen(string path, string mode);
+    [DllImport("crt")]
+    static extern int fclose(nint fp);
+    [DllImport("crt")]
+    static extern int fseek(nint fp, int offset, int origin);
+    [DllImport("crt")]
+    static extern int ftell(nint fp);
+    [DllImport("crt")]
+    static extern long fwrite(string buf, long size, long count, nint fp);
+    [DllImport("crt", EntryPoint = "zan_file_remove")]
+    static extern int remove(string path);
+
+    nint fp;
+    string path;
+    // 中央目录累积：每结束一个条目记一笔，Close 时写出。
+    List<long> offsets;
+    List<string> names;
+    List<int> methods;
+    List<long> crcs;
+    List<long> csizes;
+    List<long> usizes;
+
+    // 进行中的分块条目状态（Begin/End 之间有效）。
+    string curName;
+    int curMethod;
+    int curLevel;
+    int curCrc;
+    long curCsize;
+    long curUsize;
+    long curHdrPos;
+    DeflateChunker curChunker;
+
+    ZipWriter() {
+        this.fp = 0;
+        this.offsets = new List<long>();
+        this.names = new List<string>();
+        this.methods = new List<int>();
+        this.crcs = new List<long>();
+        this.csizes = new List<long>();
+        this.usizes = new List<long>();
+        this.curChunker = null;
+    }
+
+    /// <summary>创建/截断归档文件。打不开时抛 IOException。</summary>
+    static ZipWriter Open(string path) {
+        nint h = ZipWriter.fopen(path, "w+b");
+        if (h == 0) { throw new IOException("Could not open file for writing: " + path); }
+        ZipWriter w = new ZipWriter();
+        w.fp = h;
+        w.path = path;
+        return w;
+    }
+
+    /// <summary>一次性写入整个条目（内容已在内存）。级别 0 存储，
+    /// 1-9 deflate；内容 < 64 字节时自动转为存储。</summary>
+    void AddEntry(string name, byte[] data, int level) {
+        int crc = Crc32.Compute(data, 0, data.Length, 0);
+        int method = Zip.MethodStored;
+        byte[] payload = data;
+        if (level > 0 && data.Length >= 64) {
+            method = Zip.MethodDeflate;
+            payload = Deflate.Deflate(data, level);
+        }
+        long hpos = this.Tell();
+        this.WriteHeader(name, method, crc, payload.Length, data.Length);
+        this.WriteRaw(payload, payload.Length);
+        this.offsets.Add(hpos);
+        this.names.Add(name);
+        this.methods.Add(method);
+        this.crcs.Add(crc);
+        this.csizes.Add(payload.Length);
+        this.usizes.Add(data.Length);
+    }
+
+    /// <summary>开始一个分块条目：写出本地头（CRC/尺寸先占位，
+    /// <see cref="EndEntry"/> 时回填）。之后用 <see cref="WriteData"/>
+    /// 喂数据。级别 0 表示存储（原样写盘），1-9 分块 deflate。</summary>
+    void BeginEntry(string name, int level) {
+        this.curName = name;
+        this.curMethod = level > 0 ? Zip.MethodDeflate : Zip.MethodStored;
+        this.curLevel = level;
+        this.curCrc = 0;
+        this.curCsize = 0;
+        this.curUsize = 0;
+        if (level > 0) {
+            this.curChunker = new DeflateChunker();
+        } else {
+            this.curChunker = null;
+        }
+        this.curHdrPos = this.Tell();
+        this.WriteHeader(name, this.curMethod, 0, 0, 0);
+    }
+
+    /// <summary>向进行中的分块条目追加一块数据。</summary>
+    void WriteData(byte[] chunk, int len) {
+        if (len <= 0) { return; }
+        this.curCrc = Crc32.Compute(chunk, 0, len, this.curCrc);
+        this.curUsize = this.curUsize + len;
+        if (this.curMethod == Zip.MethodDeflate) {
+            byte[] packed = this.curChunker.Push(chunk, this.curLevel);
+            this.WriteRaw(packed, packed.Length);
+            this.curCsize = this.curCsize + packed.Length;
+        } else {
+            this.WriteRaw(chunk, len);
+            this.curCsize = this.curCsize + len;
+        }
+    }
+
+    /// <summary>结束进行中的分块条目：冲出压缩尾块、回填本地头的
+    /// CRC/尺寸、登记中央目录。</summary>
+    void EndEntry() {
+        if (this.curMethod == Zip.MethodDeflate) {
+            byte[] tail = this.curChunker.Finish();
+            this.WriteRaw(tail, tail.Length);
+            this.curCsize = this.curCsize + tail.Length;
+            this.curChunker = null;
+        }
+        // 回填：重写本地头，CRC/尺寸落到固定字段。
+        byte[] hdr = new byte[30];
+        int off = 0;
+        this.BuildHeader(hdr, ref off, this.curName, this.curMethod,
+            this.curCrc, this.curCsize, this.curUsize);
+        this.Seek((int)this.curHdrPos);
+        this.WriteRaw(hdr, 30);
+        this.offsets.Add(this.curHdrPos);
+        this.names.Add(this.curName);
+        this.methods.Add(this.curMethod);
+        this.crcs.Add(this.curCrc);
+        this.csizes.Add(this.curCsize);
+        this.usizes.Add(this.curUsize);
+        // 回到文件尾，后续条目继续追加。
+        this.SeekEnd();
+    }
+
+    /// <summary>写中央目录与 EOCD，关闭文件。之后归档可读。</summary>
+    void Close() {
+        long cdPos = this.Tell();
+        int cdSize = 0;
+        for (int i = 0; i < this.names.Count; i = i + 1) {
+            byte[] rec = new byte[46 + this.names[i].Length];
+            int p = 0;
+            string name = this.names[i];
+            Zip.WriteU32(rec, ref p, Zip.SigCentral);
+            Zip.WriteU16(rec, ref p, 20);               // 制作版本
+            Zip.WriteU16(rec, ref p, 20);               // 所需版本
+            Zip.WriteU16(rec, ref p, 0);                // 标志
+            Zip.WriteU16(rec, ref p, this.methods[i]);
+            Zip.WriteU16(rec, ref p, 0);                // 修改时间
+            Zip.WriteU16(rec, ref p, 0);                // 修改日期
+            Zip.WriteU32(rec, ref p, this.crcs[i]);
+            Zip.WriteU32(rec, ref p, this.csizes[i]);
+            Zip.WriteU32(rec, ref p, this.usizes[i]);
+            Zip.WriteU16(rec, ref p, name.Length);
+            Zip.WriteU16(rec, ref p, 0);                // 额外字段
+            Zip.WriteU16(rec, ref p, 0);                // 注释
+            Zip.WriteU16(rec, ref p, 0);                // 起始磁盘
+            Zip.WriteU16(rec, ref p, 0);                // 内部属性
+            Zip.WriteU32(rec, ref p, 0);                // 外部属性
+            Zip.WriteU32(rec, ref p, this.offsets[i]);
+            for (int k = 0; k < name.Length; k = k + 1) {
+                rec[p + k] = (byte)name[k];
+            }
+            this.WriteRaw(rec, rec.Length);
+            cdSize = cdSize + rec.Length;
+        }
+        byte[] eocd = new byte[22];
+        int q = 0;
+        Zip.WriteU32(eocd, ref q, Zip.SigEnd);
+        Zip.WriteU16(eocd, ref q, 0);
+        Zip.WriteU16(eocd, ref q, 0);
+        Zip.WriteU16(eocd, ref q, this.names.Count);
+        Zip.WriteU16(eocd, ref q, this.names.Count);
+        Zip.WriteU32(eocd, ref q, cdSize);
+        Zip.WriteU32(eocd, ref q, cdPos);
+        Zip.WriteU16(eocd, ref q, 0);
+        this.WriteRaw(eocd, 22);
+        ZipWriter.fclose(this.fp);
+        this.fp = 0;
+    }
+
+    /// <summary>关闭并删除半成品归档（导出被取消/出错时用）。</summary>
+    void Abort() {
+        if (this.fp != 0) {
+            ZipWriter.fclose(this.fp);
+            this.fp = 0;
+        }
+        ZipWriter.remove(this.path);
+    }
+
+    // 30 字节本地文件头（不含名称）。签名+版本+标志+方法+时间
+    // 日期+CRC+两尺寸+两长度。
+    void WriteHeader(string name, int method, int crc, long csize, long usize) {
+        byte[] hdr = new byte[30];
+        int off = 0;
+        this.BuildHeader(hdr, ref off, name, method, crc, csize, usize);
+        this.WriteRaw(hdr, 30);
+        byte[] nb = new byte[name.Length];
+        for (int k = 0; k < name.Length; k = k + 1) {
+            nb[k] = (byte)name[k];
+        }
+        this.WriteRaw(nb, nb.Length);
+    }
+
+    void BuildHeader(byte[] hdr, ref int off, string name, int method, int crc,
+                     long csize, long usize) {
+        Zip.WriteU32(hdr, ref off, Zip.SigLocal);
+        Zip.WriteU16(hdr, ref off, 20);                 // 所需版本
+        Zip.WriteU16(hdr, ref off, 0);                  // 标志
+        Zip.WriteU16(hdr, ref off, method);
+        Zip.WriteU16(hdr, ref off, 0);                  // 修改时间
+        Zip.WriteU16(hdr, ref off, 0);                  // 修改日期
+        Zip.WriteU32(hdr, ref off, crc);
+        Zip.WriteU32(hdr, ref off, csize);
+        Zip.WriteU32(hdr, ref off, usize);
+        Zip.WriteU16(hdr, ref off, name.Length);
+        Zip.WriteU16(hdr, ref off, 0);                  // 额外字段
+    }
+
+    long Tell() { return ZipWriter.ftell(this.fp); }
+
+    // 定位参数与 CRT 一致：0=文件头 1=当前位置 2=文件尾。
+    void Seek(int pos) { ZipWriter.fseek(this.fp, pos, 0); }
+    void SeekEnd() { ZipWriter.fseek(this.fp, 0, 2); }
+
+    void WriteRaw(byte[] data, int len) {
+        long put = ZipWriter.fwrite(data, 1, len, this.fp);
+        if (put != len) {
+            throw new IOException("ZipWriter: short write (" + Convert.ToString(put)
+                + "/" + Convert.ToString(len) + ")");
+        }
+    }
+}

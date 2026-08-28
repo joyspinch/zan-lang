@@ -3,6 +3,8 @@
 ///     日期列写 Excel 日期、bool 列写布尔，Excel 里可直接求和筛选）
 ///   · 导出 CSV：整个视图 → .csv（UTF-8 带 BOM，Excel 双击不乱码）
 ///   · 导出选中：只导勾选行 / 单元格范围 → .xlsx
+/// 导出走 ExportTo*Async：后台线程流式写盘（内存占用与行数无关，
+/// 百万行 × 70 列也不涨内存），底部进度条实时显示、可随时取消。
 /// 保存路径走 FilePicker 保存对话框。序列化本体在数据层
 /// System.Data.Excel（XlsxBook），不依赖 GUI——服务端、控制台
 /// 程序生成报表直接用它即可。
@@ -145,6 +147,12 @@ class ExportDemo {
     static Button csvBtn;
     static Button selBtn;
     static Label status;
+    static Progress bar;           // 导出进度条（导出中显示）
+    static Button cancelBtn;       // 导出中显示的取消按钮
+    static UiProgress prog;        // 进度/取消钩子
+    static bool exporting;
+    static string exportPath;
+    static int activeSlot;         // 当前在跑的导出批次（防过期回调刷 UI）
     /// 非 "" 表示下一圈循环先弹保存对话框："" 不能在 Click 处理器里
     /// 直接 BeginSaveFile——子窗口弹出前父窗口必须先完整画一帧拿到
     /// 焦点交接（见 gui_gallery）。
@@ -160,6 +168,13 @@ class ExportDemo {
         picker = new FilePicker();
         pendingKind = "";
         lastKind = 0;
+        exporting = false;
+        exportPath = "";
+        activeSlot = 0;
+        prog = new UiProgress();
+        bar = new Progress(0, 0);
+        cancelBtn = new Button { Text = "取消导出" };
+        cancelBtn.Click += ExportDemo.OnCancelExport;
 
         cols = new List<DataColumn>();
         cols.Add(DataColumn.Pin(DataColumn.Text("品名", app.Scale(150))));
@@ -264,8 +279,16 @@ class ExportDemo {
         csvBtn.Render(app, bx + bw + app.Scale(10), by, bw);
         selBtn.Render(app, bx + (bw + app.Scale(10)) * 2, by, bw + app.Scale(20));
         int ty = by + app.theme.heightMedium + app.Scale(14);
+        int bottom = ExportDemo.exporting ? app.Scale(84) : app.Scale(52);
         DataTable.RenderSource(app, pad, ty, W - pad * 2,
-            H - ty - app.Scale(52), cols, src, st);
+            H - ty - bottom, cols, src, st);
+        if (ExportDemo.exporting) {
+            // 导出中：进度条 + 取消按钮占一行，状态文本在其下。
+            int rowY = H - app.Scale(58);
+            int cancelW = app.Scale(110);
+            bar.RenderAt(app, pad, rowY, W - pad * 2 - cancelW - app.Scale(12));
+            cancelBtn.Render(app, W - pad - cancelW, rowY - app.Scale(6), cancelW);
+        }
         status.RenderAt(app, pad, H - app.Scale(34), W - pad * 2);
     }
 
@@ -273,21 +296,104 @@ class ExportDemo {
     static void OnExportCsv() { ExportDemo.pendingKind = "csv"; }
     static void OnExportSelection() { ExportDemo.pendingKind = "sel"; }
 
+    static void OnCancelExport() {
+        UiProgress.cancelRequested = true;
+        status.Text = "正在取消…";
+        app.RequestRedraw();
+    }
+
     static void SaveAs(string path) {
         if (path == "") { return; }
-        bool ok = false;
+        if (ExportDemo.exporting) { return; }   // 库层还有原子忙等待兜底
+        ExportDemo.exportPath = path;
+        UiProgress.cancelRequested = false;
+        UiProgress.finished = false;
+        int slot = ExportDemo.activeSlot + 1;
+        ExportDemo.prog.slot = slot;
+        bool started = false;
         if (lastKind == 2) {
-            ok = DataTable.ExportToCsv(st, cols, src, path, false);
+            started = DataTable.ExportToCsvAsync(st, cols, src, path, false, prog);
         } else if (lastKind == 3) {
-            ok = DataTable.ExportToXlsx(st, cols, src, path, true);
-            if (!ok) {
-                status.Text = "没有勾选行，也没有单元格范围——先勾几行再导出。";
-                return;
-            }
+            started = DataTable.ExportToXlsxAsync(st, cols, src, path, true, prog);
         } else {
-            ok = DataTable.ExportToXlsx(st, cols, src, path, false);
+            started = DataTable.ExportToXlsxAsync(st, cols, src, path, false, prog);
         }
-        if (ok) { status.Text = "已导出：" + path; }
-        else { status.Text = "导出失败（路径不可写？）：" + path; }
+        if (!started) {
+            if (lastKind == 3 && !UiProgress.finished) {
+                status.Text = "没有勾选行，也没有单元格范围——先勾几行再导出。";
+            } else if (!UiProgress.finished) {
+                status.Text = "导出未能启动（路径不可写？）：" + path;
+            }
+            // started == false 且已有回调的情况（忙等待）由 FinishUi 报告。
+            app.RequestRedraw();
+            return;
+        }
+        ExportDemo.activeSlot = slot;
+        ExportDemo.exporting = true;
+        ExportDemo.bar.SetPercent(0);
+        status.Text = "正在导出… 0%";
+        app.RequestRedraw();
+    }
+}
+
+/// <summary>
+/// 导出进度 UI 钩子：OnStart/OnProgress/OnDone 都在后台写盘线程上
+/// 发生——这里只更新静态镜像字段，随即 App.Post 把刷 UI 的工作切回
+/// UI 线程（事件循环里 DrainPosts 消费）。取消用静态标志：库层每写
+/// 一行都会问一次 Cancelled，必须便宜。
+/// </summary>
+class UiProgress : DataTableExportProgress {
+    public static int done;
+    public static int total;
+    public static bool finished;
+    public static bool okFlag;
+    public static string message;
+    public static bool cancelRequested;
+    /// 本钩子所属的导出批次；过期回调（忙等待拒绝的那次）不刷 UI。
+    public int slot;
+
+    override void OnStart(int t) {
+        UiProgress.total = t;
+        UiProgress.done = 0;
+        ExportDemo.app.Post(UiProgress.RefreshUi);
+    }
+
+    override void OnProgress(int d, int t) {
+        UiProgress.done = d;
+        UiProgress.total = t;
+        ExportDemo.app.Post(UiProgress.RefreshUi);
+    }
+
+    override void OnDone(bool ok, string error) {
+        UiProgress.okFlag = ok;
+        UiProgress.message = error;
+        UiProgress.finished = true;
+        ExportDemo.app.Post(UiProgress.FinishUi);
+    }
+
+    override bool Cancelled() { return UiProgress.cancelRequested; }
+
+    static void RefreshUi() {
+        if (ExportDemo.prog.slot != ExportDemo.activeSlot) { return; }
+        int pct = 0;
+        if (UiProgress.total > 0) { pct = UiProgress.done * 100 / UiProgress.total; }
+        if (pct > 100) { pct = 100; }
+        ExportDemo.bar.SetPercent(pct);
+        ExportDemo.status.Text = "正在导出… " + Convert.ToString(pct) + "%";
+        ExportDemo.app.RequestRedraw();
+    }
+
+    static void FinishUi() {
+        if (ExportDemo.prog.slot != ExportDemo.activeSlot) { return; }
+        ExportDemo.exporting = false;
+        ExportDemo.bar.SetPercent(0);
+        if (UiProgress.okFlag) {
+            ExportDemo.status.Text = "已导出：" + ExportDemo.exportPath;
+        } else if (UiProgress.message == "已取消") {
+            ExportDemo.status.Text = "导出已取消。";
+        } else {
+            ExportDemo.status.Text = "导出失败：" + UiProgress.message;
+        }
+        ExportDemo.app.RequestRedraw();
     }
 }

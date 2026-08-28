@@ -2324,3 +2324,39 @@ A59 的后续：用真实照片（naive-ui carousel 样例四图）压出渲染�
   `ctest -R conformance_http_client_binary` 绿；gallery 截图核验——
   轮播箭头/圆点绘制在照片页之上、active 圆点白色加长胶囊、网格四瓦片
   cover 一致。
+
+# A60 · 百万行×70列导出压测探出 irgen 泄漏：链式调用的接收者临时量不释放 —— ✅ 已修（2026-08-28）
+
+为 DataTable 导出补"异步 + 进度 + 流式落盘"（XlsxBook.SaveStreaming /
+ZipWriter / DeflateChunker，随本次入库）时，百万行×70列压测的私有内存
+随行数线性增长（约 2.3KB/行，全程 2.4GB），而设计上流式路径的驻留内存
+应与行数无关。逐层二分（探针均在 `_scratch/`，已删）：
+
+- 70M 个短命 XlsxCell/字符串纯分配：内存平稳 6MB → ARC 本体无辜；
+- ZipWriter + DeflateChunker + fwrite，50k 次 32KB flush：平稳 6MB →
+  压缩/写盘链路无辜；
+- 纯行组装（拼接 + StringBuilder 累积 + 重赋值 + ColRef）：平稳 7MB →
+  组装侧无辜；
+- 组装 + `body.ToString().ToBytes()`：线性暴涨 → 锁定该形态；
+- 最小探针：`sb.ToString().ToBytes()`（链式）30M 次 1905MB，
+  拆成 `string s = sb.ToString(); byte[] b = s.ToBytes();` 则平稳 →
+  **链式调用中间量泄漏**。
+
+根因：`irgen_expr.c` 的 `emit_bytes_call`（`ToBytes` / `ToStr` 内建降级）
+`emit_expr` 出接收者后直接消费、从不释放；泛型方法路径早有
+`emit_release_owned_call_temp` 惯例（args 与 receiver 都走它），这两个
+内建分支漏了。修法：两个分支在最后一次使用接收者之后补
+`emit_release_owned_call_temp(g, callee->member.object, obj_v, locals)`——
+本地变量接收者经 `expr_is_local_ident` 直通，字面量/非常量路径与既有
+arg 释放同语义。
+
+修复后：90M 次链式调用（三相位）私有内存平稳 1MB；百万行×70列压测
+重跑见下文证据。回归守卫：`tests/conformance/arc_chained_temp.zan`
+（功能断言 + 双链 `Label(7).ToBytes().ToStr()`），其 `leakcheck_` 双胞胎
+以 `--check-leaks` 退出零可达守住。
+
+**范围提示**：此修复惠及所有链式 `ToBytes/ToStr` 调用点（stdlib 里
+`Part(name, xml)`、`xml.ToBytes()` 一类单调用点此前只漏一次、量小；
+真正放大的是循环内的链式转换）。其余内建降级路径的 receiver 释放
+已在 A53/A57 体系内有 arg/receiver 覆盖，未发现同类缺口；如需全量
+审计可另立任务。

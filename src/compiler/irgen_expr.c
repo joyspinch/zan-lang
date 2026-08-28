@@ -252,13 +252,18 @@ static bool emit_bytes_call(zan_irgen_t *g, zan_ast_node_t *expr,
         if (ot->kind != TYPE_STRING || expr->call.args.count != 0) return false;
         /* normalize a null receiver to the shared empty string before
          * handing it to strlen */
-        LLVMValueRef s = emit_str_nonnull(g,
-            emit_expr(g, callee->member.object, locals));
+        LLVMValueRef obj_v = emit_expr(g, callee->member.object, locals);
+        LLVMValueRef s = emit_str_nonnull(g, obj_v);
         LLVMTypeRef strlen_ty = LLVMFunctionType(i64t, (LLVMTypeRef[]){ i8ptr }, 1, 0);
         LLVMValueRef len = zan_call2(g->builder, strlen_ty, g->fn_strlen, &s, 1, "tb.len");
         LLVMValueRef arr = zan_array_alloc(g, len, len);
         zan_call2(g->builder, memcpy_ty, memcpy_fn,
                   (LLVMValueRef[]){ arr, s, len }, 3, "");
+        /* A chained receiver (`sb.ToString().ToBytes()`) is an owned
+         * temporary this lowering consumed; a plain local passes through
+         * untouched. Missing this release leaked the receiver string on
+         * every call. */
+        emit_release_owned_call_temp(g, callee->member.object, obj_v, locals);
         *out = arr;
         return true;
     }
@@ -300,6 +305,9 @@ static bool emit_bytes_call(zan_irgen_t *g, zan_ast_node_t *expr,
               (LLVMValueRef[]){ s, src, len }, 3, "");
     LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, s, &len, 1, "ts.end");
     LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0), endp);
+    /* Same owned-receiver release as the to_bytes branch above — a chained
+     * `zip.Extract(...).ToStr()` leaked the receiver array on every call. */
+    emit_release_owned_call_temp(g, callee->member.object, arr, locals);
     *out = s;
     return true;
 }

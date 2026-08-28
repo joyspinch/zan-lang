@@ -377,25 +377,36 @@ class Deflate {
     // LZ77 + 固定 Huffman。输出一个最终块；字面量和长度/
     // 距离对用固定表编码。
     static byte[] FixedCompress(byte[] src, int level) {
-        int n = src.Length;
-        int maxChain = 4;
-        if (level >= 3) { maxChain = 16; }
-        if (level >= 5) { maxChain = 64; }
-        if (level >= 7) { maxChain = 256; }
-        if (level >= 9) { maxChain = 1024; }
+        byte[] out2 = new byte[src.Length + src.Length / 2 + 64];
+        int bitPos = 0;
+        // 块头：BFINAL=1, BTYPE=01（固定）。
+        Deflate.WriteBits(out2, ref bitPos, 1, 1);
+        Deflate.WriteBits(out2, ref bitPos, 1, 2);
+        bitPos = Deflate.BlockInto(src, src.Length, Deflate.ChainLength(level),
+            out2, bitPos);
+        int bytes = (bitPos + 7) / 8;
+        return Deflate.Trim(out2, bytes);
+    }
+
+    static int ChainLength(int level) {
+        if (level >= 9) { return 1024; }
+        if (level >= 7) { return 256; }
+        if (level >= 5) { return 64; }
+        if (level >= 3) { return 16; }
+        return 4;
+    }
+
+    // 固定 Huffman 块体：LZ77 哈希链匹配 + 块结束符。从
+    // `bitPos` 起按位续写（调用方已写好块头），返回结束时的
+    // 位位置。head/prev 每次调用新建，因此匹配从不跨块——
+    // 分块压缩（<see cref="DeflateChunker"/>）正依赖这一点。
+    static int BlockInto(byte[] src, int n, int maxChain, byte[] out2,
+                         int bitPos) {
         // 哈希表：16 位哈希 -> 链头位置（从 1 开始，0 表示空）。
         int hsize = 65536;
         int[] head = new int[hsize];
         int[] prev = new int[n];
         for (int i = 0; i < n; i = i + 1) { prev[i] = 0; }
-
-        byte[] out2 = new byte[n + n / 2 + 64];
-        int outLen = 0;
-        // 位写入器状态。
-        int bitPos = 0;         // out2 中的绝对位位置
-        // 块头：BFINAL=1, BTYPE=01（固定）。
-        Deflate.WriteBits(out2, ref bitPos, 1, 1);
-        Deflate.WriteBits(out2, ref bitPos, 1, 2);
 
         int pos = 0;
         while (pos < n) {
@@ -440,8 +451,7 @@ class Deflate {
         }
         // 块结束符号 256（固定：7 位，码 0）。
         Deflate.WriteBits(out2, ref bitPos, 0, 7);
-        int bytes = (bitPos + 7) / 8;
-        return Deflate.Trim(out2, bytes);
+        return bitPos;
     }
 
     static void EmitLitFixed(byte[] out2, ref int bitPos, int sym) {
@@ -571,6 +581,67 @@ class Deflate {
         out2[deflated.Length + 4] = (byte)((ad >> 8) & 255);
         out2[deflated.Length + 5] = (byte)(ad & 255);
         return out2;
+    }
+}
+
+/// <summary>
+/// DEFLATE 分块压缩器：大条目按块压成一条合法的流，内存占用
+/// 与数据总量无关。DEFLATE 的块在流里是位连续的，不能按字节
+/// 拼接，因此每块从上一块遗留的部分字节继续写；哈希链每块
+/// 重建、匹配从不跨块，对 1MB 量级的块压缩比损失可以忽略。
+/// <see cref="Push"/> 每次返回可直接落盘的完整字节（残位留在
+/// 内部状态里随下一块续写）；数据写完后调 <see cref="Finish"/>
+/// 发射收尾块并冲出最后的残位。与 Inflate 互通：Push+Finish
+/// 的输出整体是一次合法的 DEFLATE 流。
+/// </summary>
+class DeflateChunker {
+    // 上一块遗留的部分字节（低 pendingBits 位有效）。
+    int pending;
+    int pendingBits;
+
+    DeflateChunker() {
+        this.pending = 0;
+        this.pendingBits = 0;
+    }
+
+    /// <summary>压缩一块（非收尾块）。返回可落盘的完整字节。</summary>
+    byte[] Push(byte[] chunk, int level) {
+        if (chunk.Length == 0) { return new byte[0]; }
+        // 最坏情况：全字面量固定码 9 位/字节 + 头尾。
+        byte[] out2 = new byte[chunk.Length * 2 + 16];
+        out2[0] = (byte)this.pending;
+        int bitPos = this.pendingBits;
+        // 块头：BFINAL=0, BTYPE=01（固定）。
+        Deflate.WriteBits(out2, ref bitPos, 0, 1);
+        Deflate.WriteBits(out2, ref bitPos, 1, 2);
+        bitPos = Deflate.BlockInto(chunk, chunk.Length, Deflate.ChainLength(level),
+            out2, bitPos);
+        return DeflateChunker.TakeComplete(out2, bitPos, this);
+    }
+
+    /// <summary>收尾：发射 BFINAL=1 的空块并冲出最后的残位。</summary>
+    byte[] Finish() {
+        byte[] out2 = new byte[16];
+        out2[0] = (byte)this.pending;
+        int bitPos = this.pendingBits;
+        Deflate.WriteBits(out2, ref bitPos, 1, 1);
+        Deflate.WriteBits(out2, ref bitPos, 1, 2);
+        // 空块的块结束符号（7 位，码 0）。
+        Deflate.WriteBits(out2, ref bitPos, 0, 7);
+        this.pending = 0;
+        this.pendingBits = 0;
+        int bytes = (bitPos + 7) / 8;
+        return Deflate.Trim(out2, bytes);
+    }
+
+    // 把位流切成完整字节返回；末尾残位存回 chunker 状态。
+    static byte[] TakeComplete(byte[] out2, int bitPos, DeflateChunker ch) {
+        int bytes = bitPos / 8;
+        int rem = bitPos - bytes * 8;
+        ch.pendingBits = rem;
+        ch.pending = 0;
+        if (rem > 0) { ch.pending = out2[bytes] & 255; }
+        return Deflate.Trim(out2, bytes);
     }
 }
 

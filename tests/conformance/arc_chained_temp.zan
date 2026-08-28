@@ -1,0 +1,40 @@
+// ARC：链式调用的接收者临时量必须释放。emit_bytes_call（ToBytes /
+// ToStr 内建降级）曾只 emit 接收者不释放——`sb.ToString().ToBytes()`
+// 每次调用泄漏 ToString 的中间字符串（90M 次调用涨 1.9GB，探针见
+// TASKS.md A60）。本用例验证两种链式的功能正确；泄漏回归由
+// leakcheck_arc_chained_temp 双胞胎守住（--check-leaks 退出时任何
+// rc 对象仍可达即失败）。
+using System;
+using System.Text;
+
+namespace Prog;
+
+class Prog {
+    // 返回新建字符串的用户方法：链式接收者是调用点拥有的临时量，
+    // 不是本地变量——释放判定走"表达式产生拥有权"这条路径。
+    static string Label(int i) {
+        return "item-" + Convert.ToString(i);
+    }
+
+    static void Main() {
+        long sink = 0;
+        for (int i = 0; i < 20000; i = i + 1) {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("item-" + Convert.ToString(i));
+            // 链式：ToString() 的结果是 ToBytes() 的接收者临时量。
+            byte[] b = sb.ToString().ToBytes();
+            sink = sink + b.Length;
+        }
+        // "item-<i>"：0-9 十条 6 字节，10-99 九十条 7 字节，
+        // 100-999 九百条 8 字节，1000-9999 九千条 9 字节，
+        // 10000-19999 一万条 10 字节。
+        if (sink != 188890) {
+            Console.WriteLine("FAIL bytes " + Convert.ToString(sink));
+            return;
+        }
+        // 反向双链：Label(7) → ToBytes → ToStr，两级接收者都是临时量。
+        string back = Label(7).ToBytes().ToStr();
+        Console.WriteLine("ok bytes " + Convert.ToString(sink));
+        Console.WriteLine("ok roundtrip " + back);
+    }
+}

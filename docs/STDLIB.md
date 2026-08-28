@@ -170,8 +170,10 @@ stdlib/
 │   ├── Json/                        # Json.zan, JsonValue.zan
 │   ├── Linq/                        # Enumerable.zan, Expression.zan
 │   │
-│   └── (Automation, Compiler, Data/ — 含 Excel/（XlsxBook，
-│       纯 Zan 写 .xlsx）, Drawing/, Globalization, Input,
+│   └── (Automation, Compiler, Data/ — 含 Excel/（XlsxBook 纯 Zan
+│       写 .xlsx：SaveToBytes 整表内存 / SaveStreaming 流式落盘
+│       —— XlsxRowSource 逐行供给、超 1048576 行自动分表、可取消）,
+│       Drawing/, Globalization, Input,
 │       Management, Resources, Scripting/, Security/, ServiceProcess,
 │       Web/, Windows/)
 │
