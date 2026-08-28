@@ -1,0 +1,85 @@
+using System;
+
+namespace Gui;
+
+/// SVG 矢量图标集：精选 Tabler Icons 子集（MIT 授权），数据与名称
+/// 表在 IconSvgData，由 scripts/gen_icons_tabler.py 生成。
+///
+/// 与 Icon/IconVector（手绘线段近似，零依赖）互补：框架内部的
+/// 语义图标（"close"、"check" 等固定小集合）继续走 canvas.DrawGlyph；
+/// 需要更大覆盖面时用这里的 Tabler 原名，如
+/// `IconSvg.Draw(canvas, "brand-github", x, y, 24, color)`。
+///
+/// 实现：把 SVG body 包装成完整文档，经 Canvas.ImageLoadSvg（nanosvg）
+/// 光栅到 (box,box) 并以 `mem:i...` key 进入运行时图像缓存，再用
+/// BlitImage 贴图。运行时的 mem 图像缓存容量有限（ZAN_IMG_MEM_CAP，
+/// 当前 64）且按 FIFO 逐出，契约是"Zan 侧保留来源、按需重注册"
+/// （同 Image 组件）；因此这里不用自己的"已注册"表，而是每次绘制
+/// 前用 Canvas.ImageWidth(key) 探测——key 不在缓存（尚未光栅或已被
+/// 逐出）就重新光栅一次，再 BlitImage。同一（名称, 尺寸, 颜色）在
+/// 缓存存活期间只光栅一次；24~48px 的位图每份约 2~9 KB。
+class IconSvg {
+    /// 在 (x,y) 处绘制 box×box 的图标。color 为 ARGB，alpha&lt;255
+    /// 以不透明度落到 SVG 的 fill/stroke 上。未知名称不绘制。
+    static void Draw(Canvas c, string name, int x, int y, int box, int color) {
+        if (box < 4) { box = 4; }
+        int idx = IconSvgData.IndexOf(name);
+        if (idx < 0) { return; }
+        string col = IconSvg.HexColor(color);
+        string key = "mem:i" + name + "@" + box + "@" + col;
+        if (Canvas.ImageWidth(key) <= 0) {
+            string body = IconSvgData.Body(idx);
+            if (body.Contains("currentColor")) {
+                body = body.Replace("currentColor", col);
+            }
+            string svg = "<svg xmlns='http://www.w3.org/2000/svg'"
+                + " viewBox='0 0 24 24' width='" + box + "' height='" + box
+                + "' fill='none' stroke='" + col + "' stroke-width='2'"
+                + " stroke-linecap='round' stroke-linejoin='round'"
+                + IconSvg.AlphaAttrs(color) + ">" + body + "</svg>";
+            Canvas.ImageLoadSvg(key, svg, box, box);
+        }
+        c.BlitImage(key, x, y, box, box, 0, 0, 0, 0);
+    }
+
+    /// 在矩形内居中绘制，box 取矩形较短边。
+    static void DrawIn(Canvas c, int rx, int ry, int rw, int rh,
+                       string name, int color) {
+        int box = rw;
+        if (rh < box) { box = rh; }
+        IconSvg.Draw(c, name, rx + (rw - box) / 2, ry + (rh - box) / 2,
+                     box, color);
+    }
+
+    /// 表内图标个数。
+    static int Count() { return IconSvgData.Count(); }
+
+    /// 全部图标名（升序），供画廊 / 文档工具枚举。
+    static List<string> Names() { return IconSvgData.Names(); }
+
+    /// ARGB 的低三字节 → "#rrggbb"（小写）。
+    static string HexColor(int color) {
+        string digits = "0123456789abcdef";
+        int r = (color >> 16) & 255;
+        int g = (color >> 8) & 255;
+        int b = color & 255;
+        return "#" + digits.Substring((r >> 4) & 15, 1)
+                     + digits.Substring(r & 15, 1)
+                     + digits.Substring((g >> 4) & 15, 1)
+                     + digits.Substring(g & 15, 1)
+                     + digits.Substring((b >> 4) & 15, 1)
+                     + digits.Substring(b & 15, 1);
+    }
+
+    /// alpha&lt;255 时给出 fill/stroke 不透明度属性；不透明返回 ""。
+    /// alpha=0 也输出（0.00 = 完全透明），不能回落到不透明。
+    static string AlphaAttrs(int color) {
+        int a = (color >> 24) & 255;
+        if (a == 255) { return ""; }
+        string digits = "0123456789";
+        int pct = a * 100 / 255;
+        string op = "0." + digits.Substring(pct / 10, 1)
+                        + digits.Substring(pct % 10, 1);
+        return " fill-opacity='" + op + "' stroke-opacity='" + op + "'";
+    }
+}
