@@ -1722,7 +1722,11 @@ class App {
     /// 无有效快照时返回 false（调用方回退为完整渲染），
     /// 例如在尺寸变化之后。
     bool FxPresent() {
-        if (this.ForceFullFrames()) { fxNextMs = -1; return false; }
+        // 纯特效拍与局部帧无关：它不渲染控件树，只是整窗恢复快照 +
+        // 重合成特效 + 整窗提交，partialFrames 关闭（默认）时同样正确。
+        // 此前按 ForceFullFrames 一票否决，等于在默认配置下把快速路径
+        // 整个废掉——背景动画每拍都退回整窗控件重栅（实测首帧 36ms），
+        // 任何持续动画（如倒计时）加入后 CPU 光栅饱和，一卡一卡。
         if (!fxSnapValid || !this.FxActive()) { fxNextMs = -1; return false; }
         int perfFxT0 = 0;
         int perfFxRestoreT0 = 0;
@@ -3491,6 +3495,23 @@ class App {
             // 点击目标所在的控件可能根本不在已呈现的范围里。
             return false;
         }
+        if (fxOnly && animNextMs >= 0
+            && animNextMs - now <= this.FxIntervalMs()
+            && !(wakeNextMs >= 0 && now >= wakeNextMs)
+            && !(wakeFrameNextMs >= 0 && now >= wakeFrameNextMs)
+            && (this.ForceFullFrames() || !animRectValid || animRectAll
+                || this.HasOverlays())) {
+            // 特效拍没能就地呈现（突发期快照被跳过/失效），但下一个
+            // 页面帧已排定且就在一拍之内，而且那一帧会是整窗渲染：
+            // 等它。页面帧本就要整窗渲染，顺路以新相位合成特效，背景
+            // 动画照常推进。原先这一拍会立即再排一帧整窗重栅——持续
+            // 动画（倒计时 100ms/16ms）把页面帧压密之后，特效拍全部
+            // 退化成整窗重栅，10~60 次/秒把 CPU 光栅打满，正是
+            // "倒计时一动，背景动画一卡一卡"。
+            // 局部帧开启且动画声明了范围时页面帧只是条带，条带外的
+            // 特效不会推进，不能等——维持原来的立即整窗渲染。
+            return false;
+        }
         if (fxOnly && wakeFrameNextMs >= 0 && now >= wakeFrameNextMs) {
             wakeFrameNextMs = -1;
             if (wakeNextMs >= 0 && now >= wakeNextMs) {
@@ -4180,7 +4201,16 @@ class App {
                 fxTouchedFull = false;
                 fxNextMs = fxNow + this.FxIntervalMs();
             } else {
-            bool burst = lastPresentMs > 0 && fxNow - lastPresentMs < 120;
+            // 突发判定按"下一次页面帧之前有没有特效拍"来定，而不是
+            // 只看与上次提交的间隔：持续动画（如倒计时）把页面帧压到
+            // 100ms 一次时，旧的 120ms 间隔规则会让快照永远无效——
+            // 每个特效拍都退回整窗控件重栅，背景动画因此一卡一卡。
+            // 页面帧已排定且早于下一拍时，快照注定用不上，才跳过；
+            // 其余情况（含空闲、秒级页面帧）一律快照，让特效拍走
+            // "恢复+合成+提交"的廉价路径。
+            bool burst = (lastPresentMs > 0 && fxNow - lastPresentMs < 120)
+                || (animNextMs >= 0
+                    && animNextMs - fxNow <= this.FxIntervalMs());
             if (burst) {
                 fxSnapValid = false;
                 fxDamage = null;
