@@ -2413,3 +2413,72 @@ A65 的后续：轮播组件补 Naive UI 的 direction，gallery 的 Carousel �
   既有状态，与本批无关（同 A64 的处理先例）；gallery 截图逐一核验：
   图片轮播 3→4 翻动、纵向循环回绕、自定义页翻页、dots-left 竖排 +
   箭头让位。
+
+# A67 · string[i] 静态类型在 irgen 丢失：char 逐字文本化输出十进制码 —— ✅ 已修（2026-08-28）
+
+## 现象与根因
+
+gallery 倒计时场景页的 `"D 天 HH:mm:ss"` 格式串画出 `3 å¤© 13:59:47`
+（UTF-8 三字节被逐个再编码）。顺藤摸出两个叠加缺陷：
+
+1. **`s + s[i]` 把字节当数字格式化**（连 ASCII 都错：'m' 变 "109"）。
+   checker 把 `string[i]` 判为 `char`（checker.c），irgen 的
+   `infer_expr_type` 对 AST_INDEX 落到 `container_elem_type`，对
+   TYPE_STRING 返回 NULL——静态类型丢失，`emit_to_cstr_of` 的
+   `expr_is_char` 判假，走了数值 itoa。修复：irgen 侧对 string 对象的
+   索引同样返回 `binder->type_char`。插值 / String.Format / WriteLine /
+   实参转换同经 `infer_expr_type`，一并修复。
+2. **字节×码点语义冲突（语言级，未改，待定夺）**：`string` 是字节串
+   （索引/NUL 守卫/Length 全按字节；FbReader/TDS 等 codec 按字节长度
+   索引 string 字段），而 `char` 是码点类型，拼接/打印按码点 UTF-8
+   编码（char_and_ulong_text 金测钉死）。于是 `s + s[i]` 对非 ASCII
+   必然膨胀（0xE5 → "å"）——两侧都是有意设计，合在一起即陷阱；修复
+   任何一侧破坏面都大（解码式索引会打断字节偏移与 codec 语义）。故
+   Countdown.FormatText 的字面段改走字节透明的 Substring 整段拷贝
+   （"D 天 HH:mm:ss" 已正确显示），语言级出路（Rune/ByteAt API、
+   解码式索引等）留待专项定夺。
+
+## 证据
+
+- `tests/conformance/string_index_char_text`：拼接/实参/插值/Format/
+  WriteLine 全按字符输出、逐字 roundtrip 相等、`(int)` 仍出字节码。
+- 探针：修复前 `"" + s[i]` 产出 "10910958115115"（len 14），修复后
+  ASCII roundtrip 相等；FormatText 五组格式全对（含 "3 天 14:12:34"）。
+
+# A68 · null 引用进入字符串头探针：IsBadReadPtr(null-8) 在 KERNEL32 内 AV，偶发致命 —— ✅ 已修（2026-08-29）
+
+## 现象与根因
+
+gallery 透视表演示里来回滚动偶发**闪退**（进程死亡，非卡死）。
+`build/zan_crash.log` 41 条记录中 40 条同签名：`DrainPosts → lambda_4`
+（ImageHttp 取回结果封送闭包）读 `0xfffffffffffffff8` AV，
+fault 在 `KERNEL32.DLL+0x15e11`（IsBadReadPtr 内部）、`rcx=-8`。
+
+根因在编译器发射，不在 Gui：`emit_string_len_ex` /
+`emit_string_len_invalidate`（irgen_generics.c）把「对象头可读性探针」
+与「对象非空」用 `and` 融合成一个条件——**IsBadReadPtr(obj-8) 无条件
+执行**，obj 为 null 时探针地址 `null-8` 落进内核空间，本机
+IsBadReadPtr 自身先 AV（其内部 `__try` 通常吞掉，VEH 记一条
+first-chance；偶发窗口内致命即用户看到的闪退）。触发面很宽：调用点
+降序时 callee 若仅有声明（函数体未发射，如定义在调用者之后的
+`ImageHttp.Apply`），string 实参按 extern 语义做 length 缓存失效；
+ImageHttp 二进制路径的 `body` 恰为 null，滚动触发任意页图片取回完成
+即撞一次。修复（irgen.c）：`zan_hdr_read_ok` 改收 payload 对象，
+判空以**控制流**先行短路（null → phi 直接判不可读，探针调用不发射），
+两个调用点改传 `payload`；rt 侧 retain/release 原本就先判空，不动。
+
+## 证据
+
+- 最小复现（`_scratch/post_null_probe2.zan`，纯 System；callee 定义在
+  调用点之后）：旧 zanc 200 万次调用 **13353 条** first-chance AV，
+  签名与 gallery 日志逐字段一致（addr/rcx/rdx/fault 偏移）；新 zanc
+  **0 条**，干净退出。
+- Gui 全链路复现（`_scratch/post_null_probe.zan`，worker Post 20 万
+  个 null 捕获闭包 + UI 循环 DrainPosts）：旧 zanc 20 秒 **5488 条**；
+  新 zanc 20 万条全部 drain、**0 条**，`zan_crash.log` 未生成。
+- 非 GUI smoke **129/129**（`ctest -L smoke -E gui`）。GUI 用例当刻
+  大面积失败系并行 Chart.zan WIP 的语法中间态（报错全在
+  Chart.zan:1110-1127，HEAD 上此前编译通过），与本修复无关。
+- 遗留观察（未修，1/41 记录）：`ResolvedSeries_Of` 读 `addr=0x5`
+  ——null ChartSeries 直接解引用，属应用级空引用，与探针缺陷不同类；
+  该记录出自旧构建，gui_charts 正在重构，随重构观察。

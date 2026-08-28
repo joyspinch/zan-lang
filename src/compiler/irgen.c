@@ -370,24 +370,53 @@ static LLVMValueRef zan_hdr_is_string(zan_irgen_t *g, LLVMValueRef word,
                     LLVMConstInt(i64, ZAN_STRING_TAG, 0), nm);
 }
 
-/* i1 telling whether the 8 header bytes at `ptr8` may be read, or NULL when
- * the target needs no probe. Same contract as emit_header_read_guard, but as a
- * value: callers that must produce a length instead of returning early branch
- * on it themselves. Only Windows has IsBadReadPtr; elsewhere the ARC runtime
- * reads a string header unprobed as well. */
-static LLVMValueRef zan_hdr_read_ok(zan_irgen_t *g, LLVMValueRef ptr8) {
+/* i1 telling whether the 8 header bytes at obj-8 may be read, or NULL when
+ * the target needs no probe. Same contract as emit_header_read_guard, but as
+ * a value: callers that must produce a length instead of returning early
+ * branch on it themselves. Takes the payload object, not the header pointer:
+ * a null reference has no header and must never reach the probe — probing
+ * null-8 sends IsBadReadPtr through kernel space, where it faults on some
+ * Windows builds. Folding the null test in with an AND would still execute
+ * the call unconditionally, so the short-circuit is emitted as control flow.
+ * Only Windows has IsBadReadPtr; elsewhere the ARC runtime reads a string
+ * header unprobed as well. */
+static LLVMValueRef zan_hdr_read_ok(zan_irgen_t *g, LLVMValueRef obj) {
     if (!g->target_is_windows) return NULL;
-    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i1t = LLVMInt1TypeInContext(g->ctx);
+    LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8p = LLVMPointerType(i8t, 0);
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef args[] = { i8p, i64t };
     LLVMTypeRef fnty = LLVMFunctionType(i32t, args, 2, 0);
     LLVMValueRef isbad = LLVMGetNamedFunction(g->mod, "IsBadReadPtr");
     if (!isbad) isbad = LLVMAddFunction(g->mod, "IsBadReadPtr", fnty);
+    LLVMBasicBlockRef entry_bb = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(entry_bb);
+    LLVMBasicBlockRef probe_bb = LLVMAppendBasicBlockInContext(g->ctx, fn,
+        "hdr.probe");
+    LLVMBasicBlockRef join_bb = LLVMAppendBasicBlockInContext(g->ctx, fn,
+        "hdr.join");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, obj, LLVMConstNull(LLVMTypeOf(obj)),
+                 "hdr.isnull"),
+        join_bb, probe_bb);
+    LLVMPositionBuilderAtEnd(g->builder, probe_bb);
+    LLVMValueRef ptr8 = LLVMBuildGEP2(g->builder, i8t, obj,
+        &(LLVMValueRef){ LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1) },
+        1, "hdr.ptr8");
     LLVMValueRef cargs[] = { ptr8, LLVMConstInt(i64t, 8, 0) };
-    LLVMValueRef bad = zan_call2(g->builder, fnty, isbad, cargs, 2, "hdr.badread");
-    return zan_icmp(g->builder, LLVMIntEQ, bad, LLVMConstInt(i32t, 0, 0),
-                    "hdr.readok");
+    LLVMValueRef bad = zan_call2(g->builder, fnty, isbad, cargs, 2,
+        "hdr.badread");
+    LLVMValueRef ok = zan_icmp(g->builder, LLVMIntEQ, bad,
+        LLVMConstInt(i32t, 0, 0), "hdr.readok");
+    LLVMBuildBr(g->builder, join_bb);
+    LLVMPositionBuilderAtEnd(g->builder, join_bb);
+    LLVMValueRef phi = LLVMBuildPhi(g->builder, i1t, "hdr.ok");
+    LLVMValueRef vals[] = { LLVMConstInt(i1t, 0, 0), ok };
+    LLVMBasicBlockRef preds[] = { entry_bb, probe_bb };
+    LLVMAddIncoming(phi, vals, preds, 2);
+    return phi;
 }
 
 static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,

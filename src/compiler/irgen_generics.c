@@ -1193,7 +1193,10 @@ static LLVMValueRef emit_string_len_ex(zan_irgen_t *g, LLVMValueRef payload,
     LLVMValueRef hdr_ptr = LLVMBuildGEP2(g->builder, i8, payload,
         &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1) }, 1,
         "strbuf.hdrp");
-    LLVMValueRef read_ok = zan_hdr_read_ok(g, hdr_ptr);
+    /* zan_hdr_read_ok takes the payload and short-circuits null in control
+     * flow: the IsBadReadPtr probe must never run on a null reference
+     * (probing null-8 faults inside IsBadReadPtr itself on Windows). */
+    LLVMValueRef read_ok = zan_hdr_read_ok(g, payload);
     /* A null string keeps faulting inside strlen the way it always has, rather
      * than in front of address 0 where the header would be. */
     LLVMValueRef probe_ok = zan_icmp(g->builder, LLVMIntNE, payload,
@@ -1307,7 +1310,10 @@ static void emit_string_len_invalidate(zan_irgen_t *g, LLVMValueRef payload) {
     LLVMValueRef hdr_ptr = LLVMBuildGEP2(g->builder, i8, payload,
         &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1) }, 1,
         "strinv.hdrp");
-    LLVMValueRef read_ok = zan_hdr_read_ok(g, hdr_ptr);
+    /* zan_hdr_read_ok takes the payload and short-circuits null in control
+     * flow: the IsBadReadPtr probe must never run on a null reference
+     * (probing null-8 faults inside IsBadReadPtr itself on Windows). */
+    LLVMValueRef read_ok = zan_hdr_read_ok(g, payload);
     LLVMValueRef nonnull = zan_icmp(g->builder, LLVMIntNE, payload,
         LLVMConstNull(LLVMTypeOf(payload)), "strinv.nonnull");
     if (read_ok) nonnull = zan_and(g->builder, nonnull, read_ok, "strinv.ok");
