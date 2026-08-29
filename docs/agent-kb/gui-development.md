@@ -166,6 +166,37 @@ cd.RenderInside(app, new Rect(40, 60, 140, 34));
 回归在 `tests/gui/countdown_test.zan`。皮肤走 `countdown::value`（字号三档小/中/大
 对应 `.small`/默认/`.large`，状态色 `.success`/`.warning`/`.error`）。
 
+### 数值动画 Gui.Widget.NumberAnimation（countup.js 风格数值滚动）
+
+在 `Duration` 毫秒内把显示值从 `From` 缓动滚到 `To`，到位触发一次 `Finish`
+（每轮恰一次，`Restart()` 或改 `From/To/Duration` 重摆后可再触发）。数值是
+**scaled 定点整数**（显示值 × 10^`Precision`，口径同 InputNumber）：
+`Precision` 0..6 补小数位、`Separator` 千分位分组（`""` 关闭）、`Decimal`
+小数点串（俄语 `Separator=" " Decimal=","` → `699 700,699`）、`Prefix`/`Suffix`
+贴单位；展示符变化不重摆，只有 `From/To/Duration` 变化才重摆。`Active`
+暂停/恢复：落沿在 `SyncProps` 结算/重锚时间轴，恢复第一拍零增量（无跳变）。
+`SetRange(double from, double to)` 按当前 Precision 舍入，宿主免手算缩放。
+每帧显示值 = `ValueAt(From, To, App.Ease(p))` 现算（不逐帧累加），掉帧/失焦
+不走样；走动期间 `RequestAnimationFrameIn(16, …)` 按显示帧率封顶只刷自己条带。
+
+```zan
+NumberAnimation na = new NumberAnimation(0, 12039, 2000);
+na.Finish += () => { status.Text = "Done"; };
+playBtn.Click += () => na.Restart();
+
+NumberAnimation ru = new NumberAnimation(0, 699700699, 2000);
+ru.Precision = 3; ru.Separator = " "; ru.Decimal = ",";  // 699 700,699
+```
+
+实现要点：绘制形态与 Countdown 同构（`numberanim::box` 卡片 + `::track`/`::fill`
+完成度进度条 + `::value` 居中文本，太小退化裸文本），暂停落 `:disabled` 档
+（到位不降调）；`OnMeasure` 宽度取 From/To **端点文本较大者**——动画中值单调
+介于两端、字符串长度不超包络，一次测量全程不重排。缓动/格式化是纯函数
+`NumberAnimation.ValueAt/Format/GroupWith/ScaleIt`，无窗口回归在
+`tests/gui/numberanimation_test.zan`（conformance_gui_numberanimation，自动进
+smoke/standard 档）。皮肤命名空间 `numberanim`（base.css 三处：size 档、
+`::value` + 角色类、box/track/fill + disabled）。
+
 ## 控件与组件在哪
 
 | 想要 | 去哪 |

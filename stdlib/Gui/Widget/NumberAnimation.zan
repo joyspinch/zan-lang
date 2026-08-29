@@ -1,0 +1,476 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// 数值滚动动画：在 `Duration` 毫秒内把显示值从 `From` 缓动到
+/// `To`，到位触发一次 `Finish`。数字按 countup.js 风格逐帧变化，
+/// 用于把"营业额 12039"这类数据从静止文本变成有科技感的入场。
+///
+/// 数值模型是**定点 scaled 整数**：`From`/`To` 存的是显示值 ×
+/// 10^`Precision`（口径同 InputNumber）。这样精度、千分位、小数
+/// 点串全部在整数域推导，任意时刻的显示文本只由 (From,To,t) 决
+/// 定——掉帧、失焦、暂停恢复都不会让数字与时间轴脱钩。便捷方法
+/// `SetRange(from,to)` 接受 double 并按当前 `Precision` 舍入到
+/// scaled，宿主无需手算缩放。
+///
+///   | 属性       | 含义                                           |
+///   |------------|------------------------------------------------|
+///   | From/To    | 起止 scaled 值；任一变化即重摆并重新起跑       |
+///   | Duration   | 动画毫秒，钳 ≥1；默认 2000                     |
+///   | Active     | false 暂停（冻结当前值），true 恢复且无跳变；   |
+///   |            | 默认 true 即首绘自动开播（AutoStart 语义）      |
+///   | Precision  | 小数位 0..6；默认 0                            |
+///   | Separator  | 千分位分组符，默认 ","；"" 关闭分组            |
+///   | Decimal    | 小数点串，默认 "."（俄语场景传 ","）           |
+///   | Prefix     | 前缀（如 "-"、货币符号），默认 ""              |
+///   | Suffix     | 后缀（如 " 条群消息"、"/月"），默认 ""         |
+///
+/// `Separator`/`Decimal`/`Prefix`/`Suffix`/`Precision` 的变化**不**
+/// 重摆（只影响显示），`From`/`To`/`Duration` 的变化才重摆。
+///
+/// 缓动用全库统一的 Smoothstep（App.Ease），曲线本身不进组件的
+/// 逐帧累加——每帧显示值 = ValueAt(From, To, Ease(p)) 现算，与帧
+/// 率无关。`Finish` 每轮到位恰触发一次，Restart 或改 To 重摆后
+/// 可再次触发；`From==To` 时仍要跑满 Duration 才到位（避免首帧
+/// 立刻回调）。
+///
+/// 绘制形态：与 Countdown 同构——默认皮肤下套一张圆角卡片
+/// （`numberanim::box`）+ 底部进度条（`::track`/`::fill`，占比为
+/// 动画完成度，success/warning/error 角色类给进度条换色）；控件
+/// 太小（密集布局内嵌）时退化裸文本。暂停时落到 disabled 皮肤，
+/// 数字与面板一起降调；到位不降调（到位是常态，区别于归零）。
+///
+///     NumberAnimation na = new NumberAnimation(12039);
+///     na.Finish += () => { status.Text = "完成"; };
+///     playBtn.Click += () => { na.Restart(); };
+///
+///     // 国际化：俄语小数点是逗号、千分位是空格
+///     NumberAnimation ru = new NumberAnimation(0, 699700699, 2000);
+///     ru.Precision = 3;
+///     ru.Separator = " ";  ru.Decimal = ",";   // -> "699 700,699"
+class NumberAnimation : Control {
+    /// 起点 scaled 值（显示值 × 10^Precision）；默认 0。变化即重摆。
+    Binding<int> From;
+    /// 终点 scaled 值；默认 0（静止）。变化即重摆。
+    Binding<int> To;
+    /// 动画时长（毫秒），钳 ≥1；默认 2000。变化即重摆。
+    Binding<int> Duration;
+    /// 是否走动。false 暂停（冻结当前值），true 恢复且无跳变。
+    Binding<bool> Active;
+    /// 小数位 0..6（钳制口径同 InputNumber）；默认 0。
+    Binding<int> Precision;
+    /// 千分位分组符；默认 ","；"" 关闭分组。
+    Binding<string> Separator;
+    /// 小数点串；默认 "."（俄语场景传 ","）。
+    Binding<string> Decimal;
+    /// 前缀（如负号、货币符号）；默认 ""。
+    Binding<string> Prefix;
+    /// 后缀（如单位）；默认 ""。
+    Binding<string> Suffix;
+
+    /// 动画到位（每轮仅触发一次；Restart 或改 To 重摆后再次到位会
+    /// 再触发）。
+    UiEvent Finish;
+
+    // ---- 运行状态（只在 UI 线程触碰） ------------------------------
+    int curScaled;         // 当前显示值（scaled）
+    int fromS, toS, durS;  // SyncProps 快照
+    int precS;             // 精度快照
+    string sepS, decS, preS, sufS;  // 展示符快照
+    int elapsedMs;         // 已累计的走动毫秒（Active 为 true 才累加）
+    int lastTickMs;        // 上次 Tick 的时刻；-1 表示下一拍重定基准
+    int lastFrom, lastTo, lastDur;  // 探测 From/To/Duration 绑定变化
+    bool activeNow;
+    bool finished;         // 本轮已触发 Finish
+
+    void InitNumberAnimation(int from, int to, int dur) {
+        this.InitControl("numberanim", 1);
+        From = from;
+        To = to;
+        Duration = dur;
+        Active = true;
+        Precision = 0;
+        Separator = ",";
+        Decimal = ".";
+        Prefix = "";
+        Suffix = "";
+        Finish = new UiEvent();
+        curScaled = from;
+        fromS = from;
+        toS = to;
+        durS = dur < 1 ? 1 : dur;
+        lastFrom = from;
+        lastTo = to;
+        lastDur = durS;
+        precS = 0;
+        sepS = ",";
+        decS = ".";
+        preS = "";
+        sufS = "";
+        elapsedMs = 0;
+        lastTickMs = 0 - 1;
+        activeNow = true;
+        finished = false;
+    }
+    NumberAnimation() { InitNumberAnimation(0, 0, 2000); }
+    NumberAnimation(int to) { InitNumberAnimation(0, to, 2000); }
+    NumberAnimation(int from, int to) {
+        InitNumberAnimation(from, to, 2000);
+    }
+    NumberAnimation(int from, int to, int durationMs) {
+        InitNumberAnimation(from, to, durationMs);
+    }
+    /// 当前 scaled 显示值（宿主轮询用；推模式请挂 `Finish`）。
+    int Value() { return curScaled; }
+
+    /// 当前完整展示串（前后缀 + 格式化数字）。
+    string CurrentText() { return this.DisplayText(); }
+
+    /// 按 double 设起止并立即开跑：入参按当前 Precision 舍入到
+    /// scaled。例 `SetRange(0, 12039)`、`SetRange(0, 24.0)` @2。
+    void SetRange(double from, double to) {
+        int p = precS;
+        int scale = InputNumber.Pow10(p);
+        int f = NumberAnimation.ScaleIt(from, scale);
+        int t = NumberAnimation.ScaleIt(to, scale);
+        this.Arm(f, t, durS);
+    }
+
+    /// double -> scaled 整数（四舍五入，向零取整的绝对值舍入）。
+    static int ScaleIt(double v, int scale) {
+        long s = (long)scale;
+        long x = (long)(v * (double)s + (v < 0.0 ? -0.5 : 0.5));
+        if (x > 2147483647) { x = 2147483647; }
+        if (x < 0 - 2147483647) { x = 0 - 2147483647; }
+        return (int)x;
+    }
+
+    /// 重摆到当前 From/To/Duration 并从头开跑。暂停态下只清零进度，
+    /// 不改变 `Active`。
+    void Restart() {
+        this.SyncProps(Window.GetTickMs());
+        this.Arm(lastFrom, lastTo, lastDur);
+    }
+
+    void Arm(int from, int to, int dur) {
+        fromS = from;
+        toS = to;
+        durS = dur < 1 ? 1 : dur;
+        lastFrom = from;
+        lastTo = to;
+        lastDur = durS;
+        curScaled = fromS;
+        elapsedMs = 0;
+        lastTickMs = 0 - 1;
+        finished = false;
+    }
+
+    /// 推进动画并按需触发 Finish。`nowMs` 由调用方传入
+    /// （绘制路径传 `Window.GetTickMs()`），测试可注入确定时刻。
+    /// 走动毫秒只在 Active 为 true 时累加，故暂停-恢复无跳变。
+    void Tick(int nowMs) {
+        if (lastTickMs < 0) { lastTickMs = nowMs; }
+        if (activeNow) {
+            int dt = nowMs - lastTickMs;
+            if (dt > 0) { elapsedMs = elapsedMs + dt; }
+        }
+        lastTickMs = nowMs;
+        int p = elapsedMs * 1000 / durS;
+        if (p > 1000) { p = 1000; }
+        curScaled = NumberAnimation.ValueAt(fromS, toS, App.Ease(p));
+        if (p >= 1000) {
+            if (!finished) {
+                finished = true;
+                Finish.Raise();
+            }
+        } else {
+            finished = false;
+        }
+    }
+
+    /// 读取绑定快照；From/To/Duration 变化即重摆。展示符（精度、
+    /// 分隔符、前后缀）变化只刷新显示，不重摆。Active 落沿在此
+    /// 结算/重定时间轴，故需当前时刻（绘制路径传 GetTickMs，
+    /// 测试注入确定时刻）。
+    void SyncProps(int nowMs) {
+        int fr = lastFrom;
+        int tt = lastTo;
+        int du = lastDur;
+        if (From != null) { fr = From.Get(); }
+        if (To != null) { tt = To.Get(); }
+        if (Duration != null) {
+            du = Duration.Get();
+            if (du < 1) { du = 1; }
+        }
+        bool act = true;
+        if (Active != null) { act = Active.Get(); }
+        if (act != activeNow) {
+            if (act) {
+                // 暂停->恢复：重定基准，恢复后第一拍不走动（无跳变）。
+                lastTickMs = 0 - 1;
+            } else if (lastTickMs >= 0) {
+                // 进入暂停：结算本段走动（暂停期间不再累加）。
+                int dt = nowMs - lastTickMs;
+                if (dt > 0) { elapsedMs = elapsedMs + dt; }
+                lastTickMs = nowMs;
+            }
+            activeNow = act;
+        }
+        int pr = precS;
+        if (Precision != null) {
+            pr = Precision.Get();
+            if (pr < 0) { pr = 0; }
+            if (pr > 6) { pr = 6; }
+        }
+        precS = pr;
+        if (Separator != null) { sepS = Separator.Get(); }
+        if (Decimal != null) { decS = Decimal.Get(); }
+        if (Prefix != null) { preS = Prefix.Get(); }
+        if (Suffix != null) { sufS = Suffix.Get(); }
+        if (fr != lastFrom || tt != lastTo || du != lastDur) {
+            this.Arm(fr, tt, du);
+        }
+    }
+
+    string DisplayText() {
+        string t = NumberAnimation.Format(curScaled, precS, sepS, decS);
+        string p = preS; if (p == null) { p = ""; }
+        string s = sufS; if (s == null) { s = ""; }
+        return p + t + s;
+    }
+
+    // ---- 纯函数（无窗口可测） --------------------------------------
+
+    /// 千分比 e（已缓动 0..1000）下 from->to 的插值，四舍五入
+    /// （远离零语义，正负向对称）、long 中间量、int 钳制；
+    /// `e<=0` 取 from、`e>=1000` 取 to 短路，保证落点精确。
+    static int ValueAt(int from, int to, int e) {
+        if (e <= 0) { return from; }
+        if (e >= 1000) { return to; }
+        long d = (long)to - from;
+        long half = d >= 0 ? 500 : -500;
+        long v = from + (d * e + half) / 1000;
+        if (v > 2147483647) { v = 2147483647; }
+        if (v < 0 - 2147483647) { v = 0 - 2147483647; }
+        return (int)v;
+    }
+
+    /// scaled 定点 -> 展示文本：precision 补零、负号前置、分组符
+    /// 只作用整数段、小数点串可配（俄语 dec=","）；sep="" 关闭分组。
+    /// 例：1203900@2 "," "." -> "12,039.00"；699700699@3 " " ","
+    /// -> "699 700,699"；-5@2 -> "-0.05"；1000000@0 "" -> "1000000"。
+    static string Format(int scaled, int precision, string sep, string dec) {
+        int pr = precision;
+        if (pr < 0) { pr = 0; }
+        if (pr > 6) { pr = 6; }
+        string d = dec;
+        if (d == null || d == "") { d = "."; }
+        int scale = InputNumber.Pow10(pr);
+        string sign = "";
+        long v = scaled;
+        if (v < 0) { sign = "-"; v = 0 - v; }
+        string ip = Convert.ToString((int)(v / (long)scale));
+        if (sep != null && sep != "") {
+            ip = NumberAnimation.GroupWith(ip, sep);
+        }
+        string body = ip;
+        if (pr > 0) {
+            string fp = Convert.ToString((int)(v % (long)scale));
+            while (fp.Length < pr) { fp = "0" + fp; }
+            body = ip + d + fp;
+        }
+        return sign + body;
+    }
+
+    /// 整数部分加 `sep` 分组（只认首个小数点串前的部分；小数段
+    /// 原样保留）。与 InputNumber.GroupThousands 同算法，但分组符
+    /// 参数化且不做"已含逗号原样返回"的编辑缓冲幂等——动画值恒为
+    /// 刚生成的规范文本。"-1234.5" @"," -> "-1,234.5"。
+    static string GroupWith(string s, string sep) {
+        if (s == "" || sep == null || sep == "") { return s; }
+        int dot = s.IndexOf(".");
+        string head = s;
+        string tail = "";
+        if (dot >= 0) {
+            head = s.Substring(0, dot);
+            tail = s.Substring(dot, s.Length - dot);
+        }
+        string sign = "";
+        if (head.StartsWith("-")) {
+            sign = "-";
+            head = head.Substring(1, head.Length - 1);
+        }
+        // 按**数字位数**每 3 位插分组符——分组符允许多字符（俄语空格
+        // 与小数逗号同屏时，按 head.Length 下标插会错切）；尾段（首个
+        // '.' 起的原样尾巴）不参与计数。
+        string outp = "";
+        int digits = 0;
+        for (int i = 0; i < head.Length; i = i + 1) {
+            string ch = head.Substring(i, 1);
+            if (digits > 0 && (head.Length - i) % 3 == 0) {
+                outp = outp + sep;
+            }
+            outp = outp + ch;
+            if (ch != ".") { digits = digits + 1; }
+        }
+        return sign + outp + tail;
+    }
+
+    // ---- 保留模式钩子（Control）-------------------------------------
+
+    override void OnMeasure(App app) {
+        this.SyncProps(Window.GetTickMs());
+        StyleBox s = this.ResolvePartAs(app, "numberanim", "value", "text",
+                                        Class, Style.SNormal());
+        int f = s.FontOr(Style.FontFallback(app, "large"));
+        int pad = app.Scale(12);
+        int inset = app.Scale(8);
+        int barH = app.Scale(4);
+        // 宽度取 From 与 To 两个端点文本的较大者：动画中途数值单调
+        // 介于两端，字符串长度不会超过端点包络，一次测量全程不重排。
+        string a = this.DisplayTextOf(fromS);
+        string b = this.DisplayTextOf(toS);
+        int wa = Canvas.MeasureText(a, f);
+        int wb = Canvas.MeasureText(b, f);
+        int wmax = wa > wb ? wa : wb;
+        prefW = wmax + pad * 2 + app.Scale(2);
+        prefH = Canvas.FontHeight(f) + inset * 2 + barH + inset / 2;
+    }
+
+    /// 指定 scaled 值的完整展示串（供 OnMeasure 量端点包络）。
+    string DisplayTextOf(int scaled) {
+        string t = NumberAnimation.Format(scaled, precS, sepS, decS);
+        string p = preS; if (p == null) { p = ""; }
+        string s = sufS; if (s == null) { s = ""; }
+        return p + t + s;
+    }
+
+    override void OnPaint(App app) {
+        this.SyncProps(Window.GetTickMs());
+        this.Tick(Window.GetTickMs());
+        Canvas c = app.canvas;
+        // 暂停落到 disabled 皮肤整卡降调；到位不降调（到位是常态）。
+        // 字号仍按常态解析，避免皮肤在禁用态改字号导致测量与绘制不一致。
+        int st = activeNow ? Style.SNormal() : Style.SDisabled();
+        StyleBox fontS = this.ResolvePartAs(app, "numberanim", "value", "text",
+                                            Class, Style.SNormal());
+        int f = fontS.FontOr(Style.FontFallback(app, "large"));
+        StyleBox s = this.ResolvePartAs(app, "numberanim", "value", "text",
+                                        Class, st);
+        StyleBox box = this.ResolvePartAs(app, "numberanim", "box", "",
+                                          Class, st);
+        StyleBox trackS = this.ResolvePartAs(app, "numberanim", "track", "",
+                                             Class, st);
+        StyleBox fillS = this.ResolvePartAs(app, "numberanim", "fill", "",
+                                            Class, st);
+        int fh = Canvas.FontHeight(f);
+        int pad = app.Scale(12);
+        int inset = app.Scale(8);
+        int barH = app.Scale(4);
+        bool card = bw > pad * 2 + app.Scale(48)
+            && bh > fh + inset * 2 + barH + inset / 2;
+        if (card) {
+            int radius = box.RadiusOr(app.Scale(12));
+            c.FillRoundRect(bx, by, bw, bh, radius, box.BgOr(0));
+            int border = box.BorderOr(0);
+            int borderW = box.BorderWOr(0);
+            if (borderW > 0 && border != 0) {
+                c.DrawRoundRect(bx, by, bw, bh, radius, border, borderW);
+            }
+        }
+        int textY = by;
+        int textH = bh;
+        if (card) {
+            textY = by + inset;
+            textH = bh - inset * 2 - barH - inset / 2;
+        }
+        c.DrawTextCentered(bx, textY, bw, textH, this.DisplayText(),
+                           s.FgOr(0), f);
+        if (card) {
+            int trackW = bw - pad * 2;
+            int trackY = by + bh - inset - barH;
+            c.FillRoundRect(bx + pad, trackY, trackW, barH, barH / 2,
+                            trackS.BgOr(0));
+            // 进度条占比 = 动画完成度（Ease 前的线性进度，与 Countdown
+            // 的剩余占比同构）；到位静态帧画满。
+            int p = elapsedMs * 1000 / durS;
+            if (p > 1000) { p = 1000; }
+            long fillW = (long)p * trackW / 1000;
+            if (fillW < 0) { fillW = 0; }
+            if (fillW > trackW) { fillW = trackW; }
+            if (fillW > 0) {
+                c.FillRoundRect(bx + pad, trackY, (int)fillW, barH,
+                                barH / 2, fillS.BgOr(0));
+            }
+        }
+
+        // 走动时限速重绘：按显示帧率 16ms 封顶（同 Countdown 百分位
+        // 先例——10ms 会饿死事件循环）。到位当帧仍请求一拍，保证最终
+        // 画面精确等于 To。
+        if (activeNow && !finished && bw > 0 && bh > 0) {
+            app.RequestAnimationFrameIn(16, bx, by, bw, bh);
+        }
+    }
+
+    // ---- 设计器 / 序列化模型 ---------------------------------------
+
+    override string Kind() { return "NumberAnimation"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec to = PropSpec.Int("to", "To (scaled)");
+        to.num = To;
+        to.Step(1, 0 - 2147483647, 2147483647);
+        to.WithTip("End value in scaled units (display * 10^Precision). Changing it re-arms and replays.");
+        ps.Add(to);
+        PropSpec fr = PropSpec.Int("from", "From (scaled)");
+        fr.num = From;
+        fr.Step(0 - 2147483647, 0 - 2147483647, 2147483647);
+        fr.WithTip("Start value in scaled units. Changing it re-arms and replays.");
+        ps.Add(fr);
+        PropSpec du = PropSpec.Int("duration", "Duration (ms)");
+        du.num = Duration;
+        du.Step(100, 1, 600000);
+        du.WithTip("Roll length in ms (clamped >= 1); changing it re-arms.");
+        ps.Add(du);
+        PropSpec act = PropSpec.Bool("active", "Active");
+        act.flag = Active;
+        act.WithTip("false pauses (freeze current value); true resumes without a jump.");
+        ps.Add(act);
+        PropSpec pr = PropSpec.Int("precision", "Precision");
+        pr.num = Precision;
+        pr.Step(1, 0, 6);
+        pr.WithTip("Decimal places 0..6 (does NOT re-arm; display only).");
+        ps.Add(pr);
+        PropSpec sep = PropSpec.Text("separator", "Separator");
+        sep.str = Separator;
+        sep.WithTip("Thousands separator; \"\" disables grouping. Default \",\".");
+        ps.Add(sep);
+        PropSpec dec = PropSpec.Text("decimal", "Decimal");
+        dec.str = Decimal;
+        dec.WithTip("Decimal point string (ru-RU uses \",\"). Default \".\".");
+        ps.Add(dec);
+        PropSpec pre = PropSpec.Text("prefix", "Prefix");
+        pre.str = Prefix;
+        pre.WithTip("Text before the number (e.g. currency sign). Default \"\".");
+        ps.Add(pre);
+        PropSpec suf = PropSpec.Text("suffix", "Suffix");
+        suf.str = Suffix;
+        suf.WithTip("Text after the number (e.g. \" 条群消息\"). Default \"\".");
+        ps.Add(suf);
+        ps.Add(PropSpec.Text("class", "Classes"));
+        return ps;
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Finish");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Finish") { Finish.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+}

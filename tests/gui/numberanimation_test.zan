@@ -1,0 +1,194 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// Gui.NumberAnimation 的无窗口回归：缓动/插值纯函数、千分位与
+/// 国际化格式化、tick 推进 / 暂停 / 重摆 / Finish 单次触发，以及
+/// 组件模型（Kind/Props/Events/ControlFactory）。时刻由测试注入，
+/// 不依赖真实时钟。
+class NumberAnimationTest {
+    static int fails;
+    static int finCount;
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got {got} want {want}");
+    }
+
+    static void EqStr(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got '{got}' want '{want}'");
+    }
+
+    static void OnFin() { finCount = finCount + 1; }
+
+    static void Main() {
+        fails = 0;
+
+        // ---- 插值纯函数（NumberAnimation.ValueAt）------------------
+        Eq("at 0", NumberAnimation.ValueAt(0, 12039, 0), 0);
+        Eq("at 1000", NumberAnimation.ValueAt(0, 12039, 1000), 12039);
+        Eq("at mid", NumberAnimation.ValueAt(0, 1000, 500), 500);
+        // 负向（倒数）：1000 -> 0，千分比 250 -> 750。
+        Eq("reverse", NumberAnimation.ValueAt(1000, 0, 250), 750);
+        // 四舍五入：(d*e+500)/1000，余数 >= 半千进位。
+        Eq("round up", NumberAnimation.ValueAt(0, 999, 100), 100);
+        Eq("round down", NumberAnimation.ValueAt(0, 999, 101), 101);
+        // 极值不溢出：from/to 取 int 边界，中间量走 long。
+        Eq("extreme span", NumberAnimation.ValueAt(0 - 2000000000,
+            2000000000, 500), 0);
+        // 单调遍历：0..1000 步 100，首尾精确、中间非降。
+        int prev = NumberAnimation.ValueAt(0, 12039, 0);
+        bool mono = true;
+        for (int e = 100; e <= 1000; e = e + 100) {
+            int cur = NumberAnimation.ValueAt(0, 12039, e);
+            if (cur < prev) { mono = false; }
+            prev = cur;
+        }
+        Eq("monotonic", mono ? 1 : 0, 1);
+        Eq("monotonic ends at to", prev, 12039);
+
+        // ---- 格式化（NumberAnimation.Format 纯函数）----------------
+        // 精度补零 + 千分位分组（分组只作用整数段）。
+        EqStr("grouped 2dp", NumberAnimation.Format(1203900, 2, ",", "."),
+              "12,039.00");
+        // 俄语 locale：千分位空格、小数点逗号。699700699@3 -> 699700.699。
+        EqStr("ru locale", NumberAnimation.Format(699700699, 3, " ", ","),
+              "699 700,699");
+        // 负值：整数部分补 0、负号前置。-5@2 -> -0.05。
+        EqStr("neg frac", NumberAnimation.Format(0 - 5, 2, ",", "."),
+              "-0.05");
+        EqStr("neg grouped", NumberAnimation.Format(0 - 1234567, 0, ",", "."),
+              "-1,234,567");
+        // sep="" 关闭分组；尾随零仍按 precision 补齐。
+        EqStr("no group", NumberAnimation.Format(1000000, 0, "", "."),
+              "1000000");
+        EqStr("6dp pad", NumberAnimation.Format(1000, 6, ",", "."),
+              "0.001000");
+        // 大整数分组：边界 3/4 位。
+        EqStr("4 digit", NumberAnimation.Format(1234, 0, ",", "."), "1,234");
+        EqStr("3 digit", NumberAnimation.Format(999, 0, ",", "."), "999");
+        EqStr("zero", NumberAnimation.Format(0, 0, ",", "."), "0");
+
+        // ---- GroupWith 只分组整数段 --------------------------------
+        EqStr("group with tail", NumberAnimation.GroupWith("1234.567", ","),
+              "1,234.567");
+        EqStr("group neg", NumberAnimation.GroupWith("-1234", ","), "-1,234");
+
+        // ---- ScaleIt（double -> scaled 四舍五入）-------------------
+        Eq("scale pos", NumberAnimation.ScaleIt(24.0001, 100), 2400);
+        Eq("scale neg", NumberAnimation.ScaleIt(0 - 1.239, 100), 0 - 124);
+
+        // ---- tick 推进：走动、暂停、恢复、重摆 ----------------------
+        NumberAnimation na = new NumberAnimation(0, 12039, 2000);
+        Eq("initial value", na.Value(), 0);
+        finCount = 0;
+        na.Finish.Add(NumberAnimationTest.OnFin);
+        // 第一拍定基准；中点 1000ms -> Ease(500)=500 -> ValueAt 中间值。
+        na.Tick(1000);
+        na.Tick(2000);
+        Eq("mid elapsed", NumberAnimation.ValueAt(0, 12039, App.Ease(500)),
+           na.Value());
+        // 到位：超过 Duration 后精确落到 To，Finish 恰一次。
+        na.Tick(3500);
+        Eq("finished value", na.Value(), 12039);
+        EqStr("finished text", na.CurrentText(), "12,039");
+        Eq("finish fired once", finCount, 1);
+        // 到位后再来的拍不重复触发。
+        na.Tick(4000);
+        Eq("finish stays once", finCount, 1);
+
+        // 暂停：显示值冻结，恢复时不跳变（走动毫秒只在 Active 时累加）。
+        NumberAnimation na2 = new NumberAnimation(0, 1000, 1000);
+        na2.Tick(100);   // 定基准
+        na2.Tick(300);   // 走了 200ms
+        int pausedVal = na2.Value();
+        na2.SetProp("active", "false");
+        na2.SyncProps(300);   // 落沿进入暂停：结算本段（dt=0）
+        na2.Tick(300);
+        na2.Tick(2000);  // 暂停期间不推进
+        Eq("paused frozen", na2.Value(), pausedVal);
+        na2.SetProp("active", "true");
+        na2.SyncProps(2000);  // 落沿恢复：重定基准，恢复后第一拍不走动
+        na2.Tick(2100);
+        Eq("resume first tick", na2.Value(), pausedVal);
+        na2.Tick(2200);  // 此后正常走动：总进度 300ms
+        Eq("resume walks from pause", na2.Value(),
+           NumberAnimation.ValueAt(0, 1000, App.Ease(300)));
+
+        // Restart 重摆到当前 From/To/Duration；重摆后第一拍重新定基准。
+        na.Restart();
+        Eq("restart re-arms", na.Value(), 0);
+        na.Tick(5000);
+        Eq("restart rebased", na.Value(), 0);
+        na.Tick(7000);
+        Eq("second run done", na.Value(), 12039);
+        Eq("finish fired twice", finCount, 2);
+
+        // 改 To（设计器 SetProp 走这条路）自动重摆：重摆后第一拍只定
+        // 基准（值回 From），下一拍起才走动。
+        na.SetProp("to", "500");
+        na.SyncProps(7000);
+        Eq("to re-arms", na.Value(), 0);
+        na.Tick(7000);
+        Eq("run rebased", na.Value(), 0);
+        na.Tick(9000);
+        Eq("short run done", na.Value(), 500);
+        Eq("finish fired thrice", finCount, 3);
+
+        // from==to 时仍要跑满 Duration 才触发。
+        NumberAnimation flat = new NumberAnimation(7, 7, 2000);
+        int fin0 = finCount;
+        flat.Finish.Add(NumberAnimationTest.OnFin);
+        flat.Tick(1000);
+        flat.Tick(1500);   // 走了 500ms
+        Eq("flat not done yet", finCount, fin0);
+        Eq("flat value", flat.Value(), 7);
+        flat.Tick(3100);   // 跑满 2000ms
+        Eq("flat done", finCount, fin0 + 1);
+
+        // Duration<=0 钳到 1，不除零。
+        NumberAnimation clampd = new NumberAnimation(0, 100, 0);
+        clampd.Tick(0);
+        clampd.Tick(5);
+        Eq("clamped dur", clampd.Value(), 100);
+
+        // ---- 组件模型（对齐 countdown_test 的往返方式）-------------
+        NumberAnimation na3 = new NumberAnimation(100, 999999, 3000);
+        na3.Precision = 2;
+        na3.Separator = " ";
+        na3.Decimal = ",";
+        na3.Prefix = "-";
+        na3.Suffix = "/mo";
+        EqStr("kind", na3.Kind(), "NumberAnimation");
+        Eq("props count", na3.Props().Count, 10);
+        EqStr("to prop", na3.GetProp("to"), "999999");
+        EqStr("precision prop", na3.GetProp("precision"), "2");
+        EqStr("separator prop", na3.GetProp("separator"), " ");
+        EqStr("prefix prop", na3.GetProp("prefix"), "-");
+        bool hasFinish = false;
+        List<string> evs = na3.Events();
+        for (int i = 0; i < evs.Count; i = i + 1) {
+            if (evs[i] == "Finish") { hasFinish = true; }
+        }
+        if (!hasFinish) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL events: no Finish");
+        }
+        Control made = ControlFactory.Create("NumberAnimation");
+        if (made == null) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL factory: null");
+        } else {
+            EqStr("factory kind", made.Kind(), "NumberAnimation");
+        }
+
+        if (fails == 0) {
+            Console.WriteLine("numberanimation_test OK");
+        } else {
+            Console.WriteLine($"numberanimation_test FAILURES {fails}");
+        }
+    }
+}

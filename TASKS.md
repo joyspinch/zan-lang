@@ -2568,3 +2568,68 @@ Overlay / CascadeOverlay）入口记 `overlayBase = RegionCount()`，
 另一会话的在途波（SelectBox +689、Event +139 非本修复行；Steps/
 DataGrid 在途编译反复），索引里还有该波的暂存回滚态，hunk 级拆分
 不可行。待该波落地后整文件提交本修复 + 新测试 + CMakeLists 登记。
+
+# A70 · Gui.Widget.NumberAnimation 数值滚动动画组件 —— ✅ 已完成（2026-08-29）
+
+## 组件
+
+`stdlib/Gui/Widget/NumberAnimation.zan`（新建）：在 `Duration` 毫秒内把显示值
+从 `From` 缓动滚到 `To`（countup.js / Element Plus「数值动画」对位），到位触发
+一次 `Finish`。数值模型为 **scaled 定点整数**（显示值 × 10^`Precision`，口径同
+InputNumber）：`Precision` 0..6 补小数位；`Separator` 千分位分组符（`""` 关闭
+分组）；`Decimal` 小数点串（俄语 `Separator=" " Decimal=","` → `699 700,699`）；
+`Prefix`/`Suffix` 贴单位。展示符变化不重摆（只刷新显示），`From/To/Duration`
+变化即重摆重播；`Active` 暂停/恢复——落沿在 `SyncProps` 结算/重锚时间轴，恢复
+第一拍零增量（无跳变）；`Restart()` 手动重播；`SetRange(double, double)` 按当前
+Precision 舍入，宿主免手算缩放。每帧显示值 = `ValueAt(From,To,App.Ease(p))` 现算
+（不逐帧累加，掉帧/失焦不走样），走动期间 `RequestAnimationFrameIn(16,…)` 按
+显示帧率封顶只刷自己条带（Countdown SS 先例）。纯函数静态方法：`ValueAt`
+（千分比插值，远离零四舍五入、long 中间量、精确落点）、`Format`（scaled →
+文本：补零/负号/分组只作用整数段/小数点串可配）、`GroupWith`（sep 参数化分组，
+不动 InputNumber.GroupThousands 的幂等编辑缓冲语义）、`ScaleIt`（double →
+scaled）。缓动全库统一 Smoothstep（App.Ease），不做可配曲线。
+
+## 皮肤
+
+base.css 三处对照 countdown：`numberanim.small/large::value` 字号档；
+`numberanim::value` + success/warning/error 角色类；`numberanim::box/track/fill`
+卡片 + 完成度进度条（角色类重着色已走段）+ `:disabled` 暂停降调档（到位不降调，
+到位是常态）。绘制形态与 Countdown 同构：卡片太小退化裸文本；`OnMeasure` 宽度取
+From/To 端点文本较大者（动画中值单调介于两端、长度不超包络，全程不重排防抖）。
+
+## 注册
+
+ControlFactory（Kinds + Create 各一行）、`tools/mcp_server/zform.controls.txt`
+补 NumberAnimation 行（字母序 Marquee 后）；组件侧 `Kind()/Props()`（10 条：
+to/from/duration/active/precision/separator/decimal/prefix/suffix/class）、
+`Events()` 含 Finish、`BindEvent` 接线。
+
+## 测试
+
+`tests/gui/numberanimation_test.zan` + golden `tests/conformance/gui_numberanimation.out`
+（无窗口，时刻由测试注入）：ValueAt 端点精确/中点/负向对称舍入/极值不溢出/单调
+遍历；Format 八组（分组、补零、负分数、俄语 locale、关闭分组）；GroupWith 尾段
+保护；ScaleIt 舍入；Tick 推进（Ease(500) 中点、到位精确落点、Finish 每轮恰一次、
+续帧不重复）；暂停冻结 + 恢复平移无跳变（落沿结算/重锚）；Restart 重摆可再触发；
+SetProp 改 To 自动重摆；from==to 跑满 Duration 才触发；Duration≤0 钳 1 不除零；
+组件模型往返（Kind/Props 计数/GetProp/Events/ControlFactory.Create）。注册
+`conformance_gui_numberanimation`（名字派生自动进 smoke/standard 档）。
+
+## gallery
+
+`examples/gui_gallery/gui_gallery.zan`：Data Display 类目 NumberAnimation 条目
+（9 AddProp + Finish 事件 + 5 子演示）——基础条（默认/large/small 三档）、
+`.play`（播放按钮 Restart + Finish 状态行）、`.precision`（2400@2 → 24.00）、
+`.separator`（按钮切换 ","↔""，改 Separator 不重摆）、`.locale`（俄语
+699 700,699）、`.callback`（结束后发消息）。`PreviewHeight` 补基础卡条目。
+
+## 实测
+
+`zanc tests/gui/numberanimation_test.zan --auto-stdlib` → `numberanimation_test OK`；
+`ctest -R "numberanimation|conformance_gui_countdown|policy_control_factory|policy_no_widget_drawing|policy_css_comment_hygiene|gui_theme_font_budget|policy_raw_color_budget|conformance_gui_statistic"`
+→ 8/8 全绿。gallery 全量编译通过（311 文件，`_scratch/gallery_probe.exe`）。
+本任务改动与并行会话（InputOtp/otp 皮肤、SelectBox 重构、diag 测试）在工作区混叠
+（ControlFactory/base.css/CMakeLists/gui_gallery 同文件不同 hunk），提交用临时索引
+仅取本任务 hunk。既有欠账（非本任务）：policy_gallery_demo_wiring 报 Menu.expand/
+Pagination/Scrollbar 三个未注册渲染分支；policy_zform_schema 报 ColorPicker 缺清单
+行；smoke 的 cef_profile/gui_input/watermark 三例失败处于并行在途改动区域。
