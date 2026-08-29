@@ -1601,6 +1601,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_numberanimation${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # 步骤指示器（Naive UI n-steps）：StatusNorm 白名单、StateClass
+  # 位置→状态类、items 串往返（"A|B=desc"）、GetProp/SetProp 往返
+  # （placement/status/finishIcon/errorIcon/clickable + class/name
+  # 走基类）、GetExtra/SetExtra("items")、Change 事件接线。
+  add_test(NAME conformance_gui_steps
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/steps_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_steps.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_steps${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # DatePicker 十一种形式的文本往返（起止颠倒交换、week 周一起始、
   # 季度小写归一、非法文本保留原值），以及弹层指针捕获：弹层展开后
   # 压住邻居的触发按钮，鼠标在弹层里滑动不得让邻居抢走 current 把

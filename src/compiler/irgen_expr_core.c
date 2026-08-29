@@ -1665,6 +1665,15 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
     }
     case AST_THIS_EXPR:
         return g->current_type_sym ? g->current_type_sym->type : NULL;
+    case AST_BASE_EXPR:
+        /* `base.Method(...)` 成员调用的接收者类型：按 C# 语义取基类，
+         * 使重载解析在基类符号表上进行（绑定路径在 M2 已处理，这里补
+         * irgen 侧的静态类型）。没有基类时落 error，与 checker 一致。 */
+        if (g->current_type_sym && g->current_type_sym->type
+            && g->current_type_sym->type->base_type) {
+            return g->current_type_sym->type->base_type;
+        }
+        return g->current_type_sym ? g->current_type_sym->type : NULL;
     case AST_AWAIT_EXPR:
         /* `await E` yields the (unwrapped) result type of the awaited async
          * call — i.e. the callee's declared return type. */

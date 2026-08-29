@@ -525,8 +525,11 @@ static LLVMValueRef emit_property_getter_call(zan_irgen_t *g,
             unsigned argc = 0;
             if (!is_static) args[argc++] = rval;
             const char *cn = "pget";
+            /* recv_type == NULL marks a `base.Prop` read: bind to the base
+             * getter statically, exactly like the `base.Method()` call path
+             * (a vtable dispatch would re-enter the overriding getter). */
             LLVMValueRef result = emit_dispatch_call(g,
-                is_static ? NULL : recv_type->sym, getter,
+                (is_static || !recv_type) ? NULL : recv_type->sym, getter,
                 mfn, mft, args, (int)argc, cn);
             result = coerce_generic_result(g, result, getter, recv_type);
             /* an owned receiver temp must outlive the call */
@@ -4043,6 +4046,12 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                     if (getter) {
                         zan_type_t *rct = infer_expr_type(g, expr->member.object, locals);
                         LLVMValueRef rval = emit_guarded_member_object(g, expr, locals);
+                        /* `base.Prop` must call the base getter directly: the
+                         * normal vtable dispatch re-enters the override that
+                         * is executing (slot still points at B_get_Name). */
+                        if (expr->member.object->kind == AST_BASE_EXPR)
+                            return emit_property_getter_call(g, getter, NULL,
+                                rval, expr->member.object, locals);
                         return emit_property_getter_call(g, getter, rct, rval,
                                                          expr->member.object,
                                                          locals);

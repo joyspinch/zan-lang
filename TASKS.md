@@ -2633,3 +2633,89 @@ SetProp 改 To 自动重摆；from==to 跑满 Duration 才触发；Duration≤0 
 仅取本任务 hunk。既有欠账（非本任务）：policy_gallery_demo_wiring 报 Menu.expand/
 Pagination/Scrollbar 三个未注册渲染分支；policy_zform_schema 报 ColorPicker 缺清单
 行；smoke 的 cef_profile/gui_input/watermark 三例失败处于并行在途改动区域。
+
+# A71 · Gui.Widget.Steps 强化 + base.Method()/base.Prop 编译器支持 —— ✅ 已完成（2026-08-29）
+
+## 编译器：base 调用族修复（先决条件）
+
+Steps 的 GetProp/SetProp 覆写要走 `base.GetProp(key)` / `base.SetProp(key, val)`
+委托基类，但 base 成员访问在 irgen 有两个致命缺陷（此前会话已发现 base.Method()
+段错误）：
+
+1. **`base.F()` 虚表再入**（`irgen_call.c` emit_expr_call）：接收者是
+   `AST_BASE_EXPR` 时仍把 `recv_cls` 传给 emit_dispatch_call，vtable 槽位仍指向
+   本 override 自身，`base.F()` 递归调回自己直到栈溢出。修法：接收者为
+   `AST_BASE_EXPR` 时传 NULL 静态符号，让 emit_dispatch_call 走直呼静态分支
+   （语义等价 C#：base 调用绑定到最近基类实现的静态版本，非虚分派）。
+2. **`base.Prop` getter 同根**（`irgen_expr.c`）：属性 getter 的 vtable 分派同样
+   再入重写者。属性读取路径新增 AST_BASE_EXPR 分支直呼基类 getter
+   （recv_type 传 NULL 标记 base 读取），`emit_property_getter_call` 里
+   `!recv_type` 与 `is_static` 同走直呼。
+3. **`base` 的静态类型推断**（`irgen_expr_core.c` infer_expr_type）：补
+   AST_BASE_EXPR 分支，有基类时返回 `base_type`（重载解析落在基类符号表），
+   无基类时与 checker 一致落 error。
+
+语义澄清（探针 ov_test60 的 IR 验证）：`base.Reset()` 执行的是基类**方法体**，
+基类体内的字段写入按正常顺序生效——派生类先写、`base.` 调用后写时基类体是
+最后一次写（C# 同款语义），不是 bug。conformance `tests/conformance/base_call.zan`
+锁定：两级 base.Name() 链（"shape/rect"）、base 上 protected 字段读写、
+base 调用后基类体写入生效（void 返回 `[]` 场景）。
+
+## 组件
+
+`stdlib/Gui/Widget/Steps.zan` 对齐 Naive UI n-steps 批量强化：
+
+- **Placement**（""/`"right"`）：次要文字从圆点行下方移到标题右列（`IsRight()`），
+  对位 Naive UI vertical 变体；水平/垂直/右置三套 PaintBody 布局。
+- **Status**（success/error/warning 白名单归一，脏值回 ""）：整条流程的语义状态
+  类（`steps.success` 等）令 done/active 圆点与连接线整体切状态色——回顾完成的
+  向导 / 定位失败的流程只看一个色系；标题只用前景色不与圆点争强调。
+- **FinishIcon / ErrorIcon**：完成态对勾可换任意图标名（如 `"smile"`），错误态
+  默认 `"!"` 亦可换；每步图标 `AddStepIcon(label, icon)` /
+  `AddStepIconDesc(label, desc, icon)` 覆盖默认圆点（咖啡步骤图标演示）。
+- **Clickable + Change**：`Clickable = true` 后点**已到达**（非 error）圆点可回退
+  当前步，经 WidgetId 命中（EnsureIds 稳定 id），触发 `Change` UiEvent；
+  `ClickAvailable` 门控与全局命中规则一致。
+- 组件模型：Props() 10 条（placement/status/finishIcon/errorIcon/clickable 等
+  无字段 prop 由 GetProp/SetProp 钩子应答，走刚修好的 base 委托），ItemsText/
+  SetItemsText 经 GetExtra/SetExtra("items") 往返（"A|B=desc" 编码），
+  Events() 含 Change，BindEvent 接线；`StatusNorm` 白名单静态方法。
+
+## 皮肤
+
+base.css：`steps::marker { height: 26; }` 让圆点直径走 CSS height token
+（small 20 / medium 26 / large 32 与代码侧缺省同源，`steps.small::marker`/
+`steps.large::marker` 覆写）；`steps.success/error/warning::marker.done|active`
+与 `::connector.done|active` 流程级状态色三组 + `::title.active` 前景两行。
+
+## 测试
+
+- `tests/gui/steps_test.zan` + golden `tests/conformance/gui_steps.out`（43 检，
+  无窗口）：StatusNorm 白名单 6 组、StateClass 位置→状态类、ItemsText 往返、
+  GetProp/SetProp 往返（脏 status 归一 + class/name 走基类路径——正是 base
+  修复的端到端验证）、GetExtra/SetExtra、Change 事件接线（静态方法组处理器，
+  Zan lambda 无捕获）+ PropOf（有字段的 size 出 spec，无字段的 status 出 null）、
+  Kind。注册 `conformance_gui_steps`（smoke/standard 档）。
+- `tests/conformance/base_call.zan|.out`：base.Method()/base.Prop 直呼语义
+  回归（两级 base 链、protected 字段、基类体后写生效）。
+
+## gallery
+
+`examples/gui_gallery/gui_gallery.zan` Steps 页扩到 8 演示（GalleryModel 补
+`stepClick` 演示绑定字段，PreviewHeight 420→820，Arrange 380→760）：原三卡
+（水平绑定/错误步/垂直带描述）+ placement right（3 步带描述）+ status
+success/error 双联 + 定制图标（finishIcon=smile + per-step coffee）+ Clickable
+点击回退（LIVE EVENTS 实况）；AddDemo 词条补 9 属性 + Change 事件，
+JSON 补 placement/status/clickable。
+
+## 实测
+
+`ctest --test-dir build -R "conformance_gui_steps|conformance_base_call"` → 2/2 绿；
+`ctest -L smoke` 除 5 例外全绿——这 5 例（cef_profile/gui_input/watermark/
+policy_zform_schema/policy_gallery_demo_wiring）在**不含本任务改动的 HEAD 基线
+上同样失败**（stash 验证），均属并行会话在途区域（ColorPicker 未进清单、
+Menu.expand/Pagination/Scrollbar 渲染分支、Watermark props 计数、cef/input 无头
+环境依赖），与本任务无关。gallery 全量编译通过。工作区混叠并行会话
+（Pagination/QrCode/IconSvg/DataTable 导出/Tooltip/otp 等多处），提交按文件 +
+临时 blob（gui_gallery）/apply --cached 分片（base.css/CMakeLists）仅取本任务
+hunk；既有欠账照录不扩大。

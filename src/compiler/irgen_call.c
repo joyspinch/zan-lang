@@ -4332,9 +4332,17 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             LLVMValueRef mfn = route_generic_method(g, recv_ty,
                                 method_sym, g->functions[fi].fn, mft, &mft);
                             const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(mft)) == LLVMVoidTypeKind) ? "" : "mcall";
+                            /* `base.F()` binds to the nearest base implementation
+                             * statically: vtable dispatch would re-enter this
+                             * very override (slot still points at B_F) and
+                             * recurse to a stack overflow. A NULL declared type
+                             * makes emit_dispatch_call take the direct static
+                             * branch instead. */
+                            bool base_recv =
+                                callee->member.object->kind == AST_BASE_EXPR;
                             LLVMValueRef result = emit_dispatch_call(g,
-                                callee_static ? NULL : recv_cls, method_sym,
-                                mfn, mft, call_args, argc, cn);
+                                (callee_static || base_recv) ? NULL : recv_cls,
+                                method_sym, mfn, mft, call_args, argc, cn);
                             result = coerce_generic_result(g, result, method_sym, recv_ty);
                             if (recv_eh_pushed) emit_eh_tmp_pop(g);
                             if (!callee_static) {

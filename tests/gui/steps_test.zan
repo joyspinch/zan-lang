@@ -1,0 +1,142 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// 无窗口回归：Steps 的状态数学与 designer 往返。全部是纯计算，
+/// 不需要窗口，对着 golden 比。
+/// - StatusNorm 白名单（success/error/warning 之外全部归 ""）
+/// - StateClass 位置→状态类（done/active/pending/error 优先级）
+/// - ItemsText/SetItemsText 往返（"A|B=desc" 格式，含空段跳过）
+/// - Props 计数与键序、GetProp/SetProp 往返（placement/status/
+///   finishIcon/errorIcon/clickable + class 退化为样式类）
+/// - GetExtra/SetExtra("items")、Events() 含 Change
+/// - 状态归一写路径：SetProp("status", 脏值) 不落脏 class
+class Program {
+    static void Line(string s) { Console.WriteLine(s); }
+    static int fails = 0;
+    static int chgCount = 0;
+
+    static void Eq(string label, string got, string want) {
+        if (got == want) { Line("ok " + label + " = " + got); }
+        else { fails = fails + 1; Line("FAIL " + label + " got [" + got + "] want [" + want + "]"); }
+    }
+
+    static void Eq(string label, int got, int want) {
+        if (got == want) { Line("ok " + label + " = " + Convert.ToString(got)); }
+        else { fails = fails + 1; Line("FAIL " + label + " got " + Convert.ToString(got) + " want " + Convert.ToString(want)); }
+    }
+
+    static void Main() {
+        // ---- StatusNorm 白名单 ------------------------------------------
+        Eq("norm success", Steps.StatusNorm("success"), "success");
+        Eq("norm error", Steps.StatusNorm("error"), "error");
+        Eq("norm warning", Steps.StatusNorm("warning"), "warning");
+        Eq("norm dirty", Steps.StatusNorm("info"), "");
+        Eq("norm empty", Steps.StatusNorm(""), "");
+        Eq("norm case", Steps.StatusNorm("Success"), "");
+
+        // ---- StateClass：位置→状态类（Steps.StateClass 是 cls+状态）------
+        Eq("state done", Steps.StateClass("", 0, 2, -1), " done");
+        Eq("state active", Steps.StateClass("", 2, 2, -1), " active");
+        Eq("state pending", Steps.StateClass("", 3, 2, -1), " pending");
+        Eq("state error", Steps.StateClass("", 1, 3, 1), " error");
+        Eq("state cls", Steps.StateClass("large", 0, 2, -1), "large done");
+        // Style.StateClass：裸状态词。
+        Eq("style done", Style.StateClass(0, 2, -1), "done");
+        Eq("style active", Style.StateClass(2, 2, -1), "active");
+        Eq("style pending", Style.StateClass(3, 2, -1), "pending");
+        Eq("style error", Style.StateClass(1, 3, 1), "error");
+
+        // ---- ItemsText / SetItemsText 往返 ------------------------------
+        Steps a = new Steps();
+        a.AddStep("Details");
+        a.AddStepDesc("Review", "第二阶段");
+        a.AddStep("Done");
+        Eq("items text", a.ItemsText(), "Details|Review=第二阶段|Done");
+        Steps b = new Steps();
+        b.SetItemsText("Account|Profile=头像与昵称|");
+        Eq("parsed count", Convert.ToString(b.GetProp("current") == null ? -1 : 0), "0");
+        Eq("parsed text", b.ItemsText(), "Account|Profile=头像与昵称");
+        Steps c = new Steps();
+        c.SetItemsText("");
+        Eq("empty spec", c.ItemsText(), "");
+        Steps d = new Steps();
+        d.SetItemsText("Only");
+        Eq("single", d.ItemsText(), "Only");
+
+        // ---- GetProp / SetProp 往返 --------------------------------------
+        Steps g = new Steps();
+        g.AddStep("A");
+        Eq("get default placement", g.GetProp("placement"), "");
+        Eq("get default status", g.GetProp("status"), "");
+        Eq("get default finish", g.GetProp("finishIcon"), "");
+        Eq("get default errorIcon", g.GetProp("errorIcon"), "");
+        Eq("get default clickable", g.GetProp("clickable"), "false");
+        g.SetProp("placement", "right");
+        g.SetProp("status", "error");
+        g.SetProp("finishIcon", "smile");
+        g.SetProp("errorIcon", "flash");
+        g.SetProp("clickable", "true");
+        Eq("set placement", g.GetProp("placement"), "right");
+        Eq("set status", g.GetProp("status"), "error");
+        Eq("set finish", g.GetProp("finishIcon"), "smile");
+        Eq("set errorIcon", g.GetProp("errorIcon"), "flash");
+        Eq("set clickable", g.GetProp("clickable"), "true");
+        // 脏 status 归一：不落脏值。
+        g.SetProp("status", "info");
+        Eq("dirty status", g.GetProp("status"), "");
+        // class / name 退化为基类路径（base.GetProp/SetProp）。
+        g.SetProp("class", "vertical large");
+        Eq("class prop", g.GetProp("class"), "vertical large");
+        g.SetProp("name", "wiz");
+        Eq("name prop", g.GetProp("name"), "wiz");
+        // PropOf 只应答 IsBound 的 spec（str/snum/flag 等指向字段或
+        // signal 的属性）；placement/status 等无绑定字段，由 GetProp
+        // 钩子应答，PropOf 落 null。
+        Eq("propof size", g.PropOf("size") == null ? "null" : "spec", "spec");
+        Eq("propof status unbound", g.PropOf("status") == null ? "null" : "spec", "null");
+
+        // ---- GetExtra / SetExtra("items") --------------------------------
+        Steps e = new Steps();
+        e.AddStep("One");
+        e.AddStepDesc("Two", "second");
+        Eq("extra items", e.GetExtra("items"), "One|Two=second");
+        bool setOk = e.SetExtra("items", "X|Y=z");
+        Eq("set extra", setOk ? "true" : "false", "true");
+        Eq("after set", e.GetExtra("items"), "X|Y=z");
+        Eq("unknown extra", e.GetExtra("nope"), "");
+        bool badExtra = e.SetExtra("nope", "v");
+        Eq("unknown set", badExtra ? "true" : "false", "false");
+
+        // ---- Events / BindEvent ------------------------------------------
+        Steps ev = new Steps();
+        List<string> events = ev.Events();
+        bool hasChange = false;
+        for (int i = 0; i < events.Count; i = i + 1) {
+            if (events[i] == "Change") { hasChange = true; }
+        }
+        Eq("events change", hasChange ? "yes" : "no", "yes");
+        // BindEvent("Change") 与 Change.Add 等价（计数走静态字段，
+        // 同 Pagination.Change 测试的轮询写法）。
+        chgCount = 0;
+        ev.BindEvent("Change", StepsTest.OnChg);
+        ev.Change.Raise();
+        Eq("change raised", chgCount, 1);
+        // 公共事件落 On（不炸即可）。
+        ev.BindEvent("Click", StepsTest.OnChg);
+        Line("ok bind common");
+
+        // ---- Kind / 尺寸 / 工厂 -------------------------------------------
+        Eq("kind", ev.Kind(), "Steps");
+
+        if (fails > 0) {
+            Line("steps_test FAILED " + Convert.ToString(fails));
+        } else {
+            Line("steps_test OK");
+        }
+    }
+}
+
+class StepsTest {
+    static void OnChg() { Program.chgCount = Program.chgCount + 1; }
+}
