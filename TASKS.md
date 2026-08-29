@@ -1067,15 +1067,20 @@ sel = sel.OrderByDescending(x => x.id);   // error: 'string' has no member 'Orde
 悬停 emphasis，新增和弦/力导向/事件河/韦恩渲染器 + `examples/gui_charts`
 独立示例）时，对照 ECharts 2.2.4 明确**不做**、留待后续的部分。均非缺陷绕过：
 现有 API 已解析相关字段或留有占位，只是渲染层未接。
+（2026-08-30 复核：toolbox、地图渲染器已落地；timeline 已落地为
+`ChartTimeline` 组件，见「Gui/Chart 后续」节与 docs/CHART_VS_ECHARTS_227.md。）
 
 * [ ] **数值 / 时间 / 对数 X 轴**：`ChartAxisType.Value/Time/Log` 已定义且
   `FromJson` 已解析，但 `Chart.BuildAxes*` 仍按类别槽布局——X 轴只能等距分类。
 * [ ] **itemStyle / emphasis 完整样式树**：`ChartItemStyle` 等样式类已建模，
   但渲染器尚未逐项消费（目前只有三级颜色控制 option < series < data item）。
-* [ ] **toolbox / visualMap / timeline 组件**：ECharts 的工具箱、视觉映射与
-  时间轴组件无对应物。
-* [ ] **地图渲染器**：`ChartType.Map` 目前渲染占位面板
-  （`ChartView.DrawMapPlaceholder`）；需要地理边界数据（GeoJSON），标准库不内置。
+* [x] **toolbox / visualMap / timeline 组件** ✅（2026-08-30 复核）：toolbox
+  （数据视图/类型切换/还原/保存/缩放）与 dataRange（visualMap 2.x 前身）已在
+  批 4/5 落地；timeline 已落地为 `ChartTimeline` 组件（帧序列 + 播放器条 +
+  autoPlay + JSON 解析）。
+* [x] **地图渲染器** ✅（2026-08-30 复核）：`ChartGeoJson` + `ChartMapRegion/
+  ChartMapRing(hole)` 已落地（官方 china.json 运行时解码 + 内嵌副本），
+  roam/选中/markPoint/dataRange 全通。
 * [ ] **Canvas 曲线/旋转原语**：和弦 ribbon、韦恩等用密集折线采样 +
   `FillPolygon`（Zan 侧扫描线）近似，受"不新增原生 Canvas 导出"约束
   （五平台预编译驱动，`Render.zan` 注释）。若未来开放原生导出可替换为真贝塞尔。
@@ -2486,21 +2491,29 @@ ImageHttp 二进制路径的 `body` 恰为 null，滚动触发任意页图片取
 
 ---
 
-## Gui/Chart 后续（2.2.7 对齐轮遗留）
+## Gui/Chart 后续（2.2.7 对齐轮遗留）—— ✅ 全部收口（2026-08-30）
 
 ECharts 2.2.7 全 134 示例对齐六批已收口（见 docs/CHART_VS_ECHARTS_227.md）；
-以下为本轮范围裁决时**有意不做**、单独立项的后续：
+下两项为当时**有意不做**、单独立项的后续，现已落地，账本 134/134 全 ✅：
 
-* [ ] **chart timeline 子系统**：2.2.7 `timeline`（bar11/map14/map19/pie7/
-  scatter4 五例）——帧序列 + 播放控制 + option 时间轴合并。牵涉
-  ChartOption 多帧数据模型与 App 时钟接入（本封装全链路确定性，帧推进需显式
-  frame 入参而非读时钟），是一个组件级子系统，非字段补齐；判定标准：五个
-  timeline 示例可在 gallery 播放。
-* [ ] **架构注记 A：共享坐标系共存层**：2.2.7 跨图族混搭（mix3 地图+饼选、
-  mix11 仪表+漏斗）靠每族自带定位项共存；我们按 LeadType 单渲染器分发
-  （ChartView.DispatchKind），一族一画布。做整图族定位共存 = 抽出共享
-  坐标系/布局层供多渲染器叠画，重构面大于收益，待真实需求再立项。
-  附带同批缺口：`dataRange.hoverLink` 反向联动、connect() 多图联动。
+* [x] **chart timeline 子系统** ✅ 已落地（2026-08-30）：新增
+  `ChartTimeline`——多帧 option 序列 + 底部播放器条（播放/暂停、前/后帧、
+  帧轴点选、帧标签）+ autoPlay（节拍判断用挂钟，帧号/播放态/上拍时刻
+  持久化在 7600000 段 App 状态键，即时模式宿主每帧重建不丢）+ `Merge`
+  帧合并（baseOption 外壳保留、同名系列逐帧换数据）+ JSON
+  `timeline.data[]/options[]` 解析。全链路确定性：帧推进只由显式输入
+  （点击/节拍）驱动。gui_charts pie7 已接线。回归：chart_timeline 17 断言。
+* [x] **connect() 多图联动** ✅ 已落地（2026-08-30）：`ChartOption.connectGroup`
+  + 组长登记（8600000 段组键）+ `ResolvedChart.stateWid` 交互键重定向——
+  dataZoom 窗口/图例开关/十字线悬停类别跨图同帧共享；`CartesianTooltip`
+  兼作联动 seam（指针不在本图上时画跟随十字线）。gui_charts mix9 已接线。
+  回归：chart_option_behavior 补 cg* 四断言。
+* [ ] **架构注记 A：共享坐标系共存层**（仍开放）：2.2.7 跨图族混搭
+  （mix3 地图+饼选、mix11 仪表+漏斗）靠每族自带定位项共存；我们按
+  LeadType 单渲染器分发（ChartView.DispatchKind），一族一画布。做整图族
+  定位共存 = 抽出共享坐标系/布局层供多渲染器叠画，重构面大于收益，待
+  真实需求再立项。注：其原「附带缺口」hoverLink 与 connect() 已分别于
+  批 A4 / 批 C 闭合，本条只剩叠画重构本身。
 
 # A69 · PivotTable 部分可见行无裁剪：行头/行合计格越进表头带，滚动后表头错位 —— ✅ 已修（2026-08-29）
 
@@ -2720,3 +2733,27 @@ Menu.expand/Pagination/Scrollbar 渲染分支、Watermark props 计数、cef/inp
 （Pagination/QrCode/IconSvg/DataTable 导出/Tooltip/otp 等多处），提交按文件 +
 临时 blob（gui_gallery）/apply --cached 分片（base.css/CMakeLists）仅取本任务
 hunk；既有欠账照录不扩大。
+
+# A70 · `Thread.Start` 不能携带实例方法组（带标记闭包记录 vs 裸函数指针 ABI）—— ⏳ 已登记，暂缓修复（2026-08-29）
+
+- **症状**：`Thread.Start(job.Run)`（`Run` 为实例方法组，`job` 是堆对象）
+  在启动瞬间 SEGFAULT（进程 exit 139），无任何诊断。最小复现
+  `_scratch/threadjob.zan`：`class J { public int v; public void Run(){…} }`
+  → `ThreadStart ts = j.Run; Thread.Start(ts);`。静态方法组同形写法正常。
+- **根因**：A33-2 的委托 ABI 里，静态方法组 = 裸函数指针（可直接交 C），
+  实例方法组 = 堆上带标记闭包记录 `{fn@0, dtor@8, target@16}`（奇数指针，
+  bit0=1，`ZAN_CLOSURE_TAG`，`src/common/zan_abi.h:108-111`；生成端
+  `src/compiler/irgen_arc.c:68-84`）。而 `src/runtime/rt_sync.c:854` 的
+  `zan_thread_start(void*)` 把参数原样强转成裸 `void(*)()` 直接调用——
+  带着 tag 位的记录指针被当代码地址跳进去即崩。`Threading.zan` 文档
+  只写了"委托必须是非捕获的"，checker 也不拦这个调用位置。
+- **当前回避（标准库两处同构）**：线程入口用**静态方法组** + 静态队列/
+  Mutex/workerStarted 单 worker 循环，实例绑定经队列项传递——
+  `stdlib/Gui/Image/ImageHttp.zan`（下载）与 `stdlib/Gui/Widget/Upload.zan`
+  （上传 `UploadJob.Run`）均此形。不违规则 10：组件逻辑仍是 Zan 实现，
+  只是入口形状受 ABI 限制。
+- **修法建议**（二者之一或都做）：① 运行时：`zan_thread_start` 检查
+  bit0，若是带标记记录则解包 `record.fn` 并以 `record.target` 作 receiver
+  经 `emit_delegate_invoke` 同款 trampoline 调用；② checker：在实参转换
+  点拒绝"实例方法组 → ThreadStart"并给出指向日志。建议 ① 为根治，
+  顺带让 `new Thread(instance.Run)` 一类写法全部自然可用。

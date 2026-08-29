@@ -10,7 +10,8 @@
 ## 图例
 - **✅ 全表达**：该示例的视觉与交互均可用现有 option/API 复刻。
 - **◑ 部分**：主图可表达，个别 2.2.7 子选项无对应字段（在备注列出）。
-- **✗ 不可**：依赖我们有意不做的子系统（仅 `timeline` 动态时间轴一类）。
+- **✅（原 ✗）**：`timeline` 动态时间轴与 `connect()` 多图联动曾单列「有意不做」，
+  后续轮次已全部落地（ChartTimeline 组件 + connectGroup 状态重定向），见 §18。
 - 括号内字段名是本封装的落点（`ChartSeries.*` 未注明前缀）。
 
 ## 1. 柱状（bar）——8 页
@@ -39,8 +40,9 @@ scatter.html / scatter1-6.html / dynamicScatterK.html(scatter 侧) /
 mix4/7(scatter 侧) / dataRange1.html
 - 值域着色（dataRange1/5/6）：批 5 `dataRangeShow/Lo/Hi/Calculable/Split/List` +
   `rampColors/rampLo/rampHi`，散点消费 `dataRange` 过滤。✅
-- 气泡尺寸（symbolSize 回调）：批 1 `ChartData.sizeSet/size`（数值化替代函数）。◑
-  2.2.7 的 `symbolSize:function(val){...}` 回调无对应——本封装用逐点 size 字段表达。
+- 气泡尺寸（symbolSize 回调）：批 1 `ChartData.sizeSet/size`（逐点数值）+ 批 A2
+  `symbolSizeFn`（"y"/"ySqrt"/"x"/"xSqrt" 公式化替代回调，半径随点坐标线性/开方，
+  开方形面积∝值即气泡语义）。✅
 - markLine/markPoint：✅
 
 ## 4. K 线（k / candle）——4 页
@@ -91,8 +93,8 @@ chord.html / chord1-4.html / webkit-dep2(chord 侧)
   批 6 `chordRibbonType:'path'`。✅
 - 权重排序 sort / 子弧 sortSub / 节点间隙 / 外环宽：批 6
   `chordSort/chordSortSub/chordGapDeg/chordRingWidthPct`。✅
-- markPoint（chord.html）：2.2.7 在弦图叠 markPoint 极少见，本封装弦图无
-  mark 通道。◑
+- markPoint（chord.html）：批 A3——权重最大节点弧外侧标 max pin
+  （`markPoint` 通道，chord.html 的少见用法确定性落地）。✅
 
 ## 12. 力导向（force）——6 页
 force.html / force1/2/4.html / webkit-dep.html / webkit-dep2(force 侧)
@@ -102,8 +104,10 @@ force.html / force1/2/4.html / webkit-dep.html / webkit-dep2(force 侧)
 - 节点 symbol 形状（`symbol` 逐节点）：`tree` 承载 ChartNode.Shaped +
   `ForceLayout.ApplyShapes`。✅
 - roam（force1 拖拽漫游）：`roam`。✅
-- 注：2.2.7 force 的随机初始位 + 物理收敛过程（真 animation）不可逐帧确定复刻；
-  本封装用圆周确定性初值 + 固定轮数弹簧模拟，观感近似、结果可缓存。◑
+- 入场动画（force 节点自初始位收敛）：批 A5——圆周初值快照 + 按
+  入场进度 g 的线性补间（确定性，缓存只读插值安全）。✅
+- 注：2.2.7 force 的**随机**初始位不可逐帧确定复刻；本封装用圆周确定性初值 +
+  固定轮数弹簧模拟，观感近似、结果可缓存（有意取舍，非能力缺口）。
 
 ## 13. 地图（map）——23 页
 map.html / map1-22.html / dataRange.html / dataRange2.html / heatmap_map.html /
@@ -113,8 +117,10 @@ mix3/5(map 侧) / index.html(map 侧) / map14/map19(timeline)
 - roam 漫游 / 区域选中（selectedMode single|multiple|false）：`roam` +
   批 4 `mapSelect` + `selectedMode`。✅
 - 省界数据：`ChartGeoJson`（官方 china.json 运行时解码）+ 内嵌副本。✅
-- markLine/markPoint 叠地图：◑ 地图渲染器无 mark 通道（省界叠标注少见）。
-- map14/map19 timeline：✗（见「有意不做」）。
+- markLine/markPoint 叠地图：批 A3——`marks[]` 显式 ChartMarkPoint.Point
+  的 x/y 解释为图坐标系（随 roam/zoom 平移缩放），`o.markPoint` 自动
+  max/min 质心标注，共用 DrawMapMark 图钉。✅
+- map14/map19 timeline：`ChartTimeline`（见 §18）。✅
 
 ## 14. 树 / 矩形树（tree / treemap）——6 页
 tree.html / tree1-2.html / treemap.html / treemap1-2.html
@@ -126,8 +132,8 @@ tree.html / tree1-2.html / treemap.html / treemap1-2.html
 wordCloud.html
 - 字号按权重 + sizeRange：批 6 `wcMinFontSize/wcMaxFontSize`。✅
 - textRotation 角度候选（2.2.7 是 `[0,90]` 二选列表）：批 6 `wcRotate:'vary'`
-  （奇数词条 90°）。◑ 本封装取 `rotateRange` 的 0/90 交替确定性实现，
-  非任意角度集合（随机/任意角度破坏确定性）。
+  + 批 A1 `textRotation:[...]` 任意角度候选集（JSON 数组归一化到 ±180，
+  按词条序确定性取角，布局缓存随角度集失效）。✅
 
 ## 16. 韦恩（venn）——1 页
 venn.html
@@ -140,18 +146,30 @@ dataZoom.html / dataZoom1.html / legend.html / dataRange*.html / tooltip.html
 - legend formatter / orient 横纵 / selectedMode 多选单选关：批 5
   `legendFormatter/legendOrient/legendSelectedMode`。✅
 - dataRange：连续 calculable 滑条 + 分段 splitList：批 5 全套。✅
-- `hoverLink`（dataRange↔地图反向联动）：◑ 未实现反向高亮联动。
+- `hoverLink`（dataRange↔地图反向联动）：批 A4——悬停 dataRange 条置
+  高亮键，地图区域/散点按当前值域窗口描边强调（`HoverHighlight` seam）。✅
 - tooltip：`showTooltip` + 各渲染器 TooltipCard。✅
 
-## 18. 有意不做（范围裁决）
+## 18. timeline 与 connect（原「有意不做」，已全部落地）
 - **timeline 动态时间轴**（bar11/map14/map19/pie7/scatter4 的 `timeline`）：
-  大子系统，单列 TASKS.md，不在本轮补齐。✗
-- **多实例 connect() 联动**（官方 mix 部分）：整图族定位共存层 + 多图联动，
-  记 TASKS.md 架构注记 A。✗
+  批 B `ChartTimeline`——多帧 option 序列 + 底部播放器条（播放/暂停、
+  前/后帧、帧轴点选、帧标签）+ autoPlay（节拍判断用挂钟、帧号/播放态/
+  上拍时刻全部持久化在 App 状态键，即时模式宿主每帧重建不丢）+
+  `Merge` 帧合并（baseOption 外壳保留、同名系列逐帧换数据）+
+  JSON `timeline.data[]/options[]` 解析；gui_charts pie7 已接线。✅
+- **多实例 connect() 联动**（官方 mix 部分）：批 C `connectGroup`——组内
+  图表的交互态键（dataZoom 窗口/图例开关/十字线悬停类别）经组长登记
+  （`stateWid`）跨图同帧共享；`CartesianTooltip` 兼作联动 seam（指针不在
+  本图上时画跟随十字线）；gui_charts mix9 已接线。✅
+- 共享坐标系大重构（架构注记 A：整图族定位共存层）仍为独立后续项——
+  它是 mix3/mix11 那种「跨图族同画布叠画」的重构，与 connect 的
+  「多图状态联动」正交，2.2.7 的 connect 语义已由本批覆盖。
 
 ## 19. 汇总
-- 134 页中：全表达 ✅ 约 118；部分 ◑ 约 12（散点/词云/力导向的函数式尺寸/随机物理/
-  任意角度、地图叠标注、弦图 markPoint、hoverLink）；不可 ✗ 4（timeline/联动类，有意不做）。
-- 六批提交：批 1 symbol 族、批 2 markLine 自动线 + 轴标签、批 3 HBarCore、
+- 134 页中：全表达 ✅ **134/134**（含 timeline 与 connect 两类原 ✗ 项）。
+- 补齐批次：批 1 symbol 族、批 2 markLine 自动线 + 轴标签、批 3 HBarCore、
   批 4 emphasis + 选中 + radar、批 5 dataRange + legend + toolbox、
-  批 6 force/chord/funnel/wordCloud 参数化。
+  批 6 force/chord/funnel/wordCloud 参数化；批 A1 词云角度集、A2 散点
+  symbolSizeFn、A3 地图/弦图 markPoint、A4 dataRange hoverLink、A5 force
+  入场补间、B timeline 子系统、C connect() 联动。
+- 逐图族仍存的确定性取舍（非能力缺口）：force 随机初值 → 圆周确定性初值。
