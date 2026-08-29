@@ -1,5 +1,6 @@
 using System;
 using Gui;
+using Gui.Backend;
 
 namespace Gui.Widget;
 
@@ -10,21 +11,51 @@ namespace Gui.Widget;
 ///     dark.Change += () => { ... };
 ///     dark.Render(app, x, y);
 /// 为现有调用方保留旧版立即模式静态方法。
+///
+/// 增强能力（对位 Ant Design Switch 文档演示）：
+/// - 内嵌文字/图标：`CheckedText` / `UncheckedText` / `CheckedIcon` /
+///   `UncheckedIcon`，有内容时轨道自动加宽；
+/// - 形状：`Round = false` 得方形轨道 + 圆角方形拇指；
+/// - 加载中：`Loading = true` 时拇指上叠画弧线 spinner、轨道变暗，
+///   且点击/键盘不再切换；
+/// - 自定义颜色：`CheckedColor` / `UncheckedColor`（0 = 跟随皮肤）；
+/// - 自定义选中值：`CheckedValue` / `UncheckedValue` + int 绑定轴
+///   `value`（或保留式 `Switch.BindValue(model, 1, 0)`），开关表达
+///   「值 == 选中值」。绑定轴优先级：`value`(int) > `data`(bool) > model。
 class Switch : Control {
     SignalBool model;
     /// 双向绑定状态：`sw.data = settings.darkMode;` 保持模型
     /// 字段与开关双向同步（编译器降级的 Binding）。
     Binding<bool> data;
+    /// int 绑定轴：`sw.value = form.status;` 配 `CheckedValue` /
+    /// `UncheckedValue`，开关表达「值 == 选中值」。该轴激活时
+    /// `data`/`model` 让位（`GetProp("value")` 也应答于此轴）。
+    Binding<int> value;
+    /// int 轴的保留式变体：`Switch.BindValue(model, cv, uv)` 直持
+    /// SignalInt（与 `value` 二选一，同 Radio 的双通道模式）。
+    SignalInt valSignal;
     int wid;
     /// 开关切换时触发（C# 风格：`sw.Change += h;`）。
     UiEvent Change;
-    /// 尺寸变体：small / medium / large（Naive UI size prop）。
+    /// 尺寸变体：tiny / small / medium / large。
     /// Binding<string> 支持响应式换档。
     Binding<string> Size;
-    /// 加载中：开 + 旋转圆环（Naive UI loading prop）。
+    /// 加载中：轨道变暗 + 拇指叠画旋转弧线，且不再响应点击。
     bool Loading;
-    /// 圆角轨道 + 圆形 thumb（Naive UI round prop）。
+    /// 圆角轨道 + 圆形 thumb；false 得方形（小圆角）形状。
     bool Round;
+    /// 选中/未选中时轨道内嵌文字（空 = 无）；有内容时轨道自动加宽。
+    Binding<string> CheckedText;
+    Binding<string> UncheckedText;
+    /// 选中/未选中时轨道内嵌图标（Icon.zan glyph 名，空 = 无）。
+    Binding<string> CheckedIcon;
+    Binding<string> UncheckedIcon;
+    /// 自定义轨道色（Progress fillColor 同款约定：0 = 跟随皮肤）。
+    int CheckedColor;
+    int UncheckedColor;
+    /// int 轴的选中值/未选中值（默认 1/0，即等价于 bool）。
+    int CheckedValue;
+    int UncheckedValue;
 
     void InitSwitch(SignalBool m) {
         this.InitControl("switch", 1);
@@ -35,6 +66,14 @@ class Switch : Control {
         Size = "medium";
         Loading = false;
         Round = true;
+        CheckedText = "";
+        UncheckedText = "";
+        CheckedIcon = "";
+        UncheckedIcon = "";
+        CheckedColor = 0;
+        UncheckedColor = 0;
+        CheckedValue = 1;
+        UncheckedValue = 0;
     }
 
     /// 保留式构造器：`Switch dark = new Switch();`
@@ -48,14 +87,50 @@ class Switch : Control {
         return s;
     }
 
-    bool IsOn() { return model.Get(); }
+    /// 保留式 int 轴工厂：`Switch sw = Switch.BindValue(m, 1, 2);`，
+    /// 开关表达 `m == 1`，切换写回 1/2（对位 Radio 的 optionValue 模式）。
+    static Switch BindValue(SignalInt model, int checkedValue, int uncheckedValue) {
+        Switch s = new Switch();
+        s.valSignal = model;
+        s.CheckedValue = checkedValue;
+        s.UncheckedValue = uncheckedValue;
+        return s;
+    }
+
+    bool HasValueAxis() { return value != null || valSignal != null; }
+
+    int IntGet() {
+        if (value != null) { return value.Get(); }
+        return valSignal.Get();
+    }
+
+    void IntSet(int v) {
+        if (value != null) { value.Set(v); return; }
+        valSignal.Set(v);
+    }
+
+    bool IsOn() {
+        if (HasValueAxis()) { return IntGet() == CheckedValue; }
+        return model.Get();
+    }
+
     void SetOn(bool v) {
+        if (HasValueAxis()) {
+            if (v) { IntSet(CheckedValue); } else { IntSet(UncheckedValue); }
+            model.Set(v);
+            return;
+        }
         model.Set(v);
         if (data != null) { data.Set(v); }
     }
 
     /// 将绑定的模型值拉入本地信号（model -> UI）。
     void SyncBinding() {
+        if (HasValueAxis()) {
+            bool on = IntGet() == CheckedValue;
+            if (on != model.Get()) { model.Set(on); }
+            return;
+        }
         if (data == null) { return; }
         bool cur = data.Get();
         if (cur != model.Get()) { model.Set(cur); }
@@ -67,14 +142,14 @@ class Switch : Control {
         this.PaintStyled(app, id, x, y, model.Get());
         app.focus.RegisterFocusable(id);
 
-        bool fire = Ui.Clicked(app, id) && !this.IsDisabled();
-        if (!this.IsDisabled() && Ui.Focused(app, id) && app.EventKind() == 4) {
+        bool fire = Ui.Clicked(app, id) && !this.IsDisabled() && !Loading;
+        if (!this.IsDisabled() && !Loading && Ui.Focused(app, id)
+            && app.EventKind() == 4) {
             int kc = app.window.EventKeyCode();
             if (kc == 32 || kc == 13) { fire = true; }
         }
         if (fire) {
-            model.Toggle();
-            if (data != null) { data.Set(model.Get()); }
+            SetOn(!model.Get());
             Change.Raise();
             app.RequestRedraw();
         }
@@ -109,6 +184,38 @@ class Switch : Control {
         PropSpec rd = PropSpec.Bool("round", "Round");
         rd.flag = Round;
         ps.Add(rd);
+        PropSpec ct = PropSpec.Text("checkedText", "Checked text");
+        ct.str = CheckedText;
+        ct.WithTip("Inner text shown while on (Ant Design children); the track widens to fit. Empty = none.");
+        ps.Add(ct);
+        PropSpec ut = PropSpec.Text("uncheckedText", "Unchecked text");
+        ut.str = UncheckedText;
+        ut.WithTip("Inner text shown while off; the track widens to fit. Empty = none.");
+        ps.Add(ut);
+        PropSpec ci = PropSpec.Text("checkedIcon", "Checked icon");
+        ci.str = CheckedIcon;
+        ci.WithTip("Inner icon (glyph name) shown while on. Empty = none.");
+        ps.Add(ci);
+        PropSpec ui = PropSpec.Text("uncheckedIcon", "Unchecked icon");
+        ui.str = UncheckedIcon;
+        ui.WithTip("Inner icon (glyph name) shown while off. Empty = none.");
+        ps.Add(ui);
+        PropSpec cc = PropSpec.Color("checkedColor", "Checked color");
+        cc.num = CheckedColor;
+        cc.WithTip("Custom track colour while on. 0 = skin.");
+        ps.Add(cc);
+        PropSpec uc = PropSpec.Color("uncheckedColor", "Unchecked color");
+        uc.num = UncheckedColor;
+        uc.WithTip("Custom track colour while off. 0 = skin.");
+        ps.Add(uc);
+        PropSpec cv = PropSpec.Int("checkedValue", "Checked value");
+        cv.num = CheckedValue;
+        cv.WithTip("Value stored in the int `value` binding while on.");
+        ps.Add(cv);
+        PropSpec uv = PropSpec.Int("uncheckedValue", "Unchecked value");
+        uv.num = UncheckedValue;
+        uv.WithTip("Value stored in the int `value` binding while off.");
+        ps.Add(uv);
         return ps;
     }
 
@@ -117,21 +224,100 @@ class Switch : Control {
         On.AddByName(evt, a);
     }
 
+    // int 轴激活时，"value" 键的读写改走值语义（其余仍走基类
+    // PropSpec 路径）。写 "true" 落 CheckedValue、"false" 落 UncheckedValue。
+    override string GetProp(string key) {
+        if (key == "value" && HasValueAxis()) {
+            return PropSpec.Flag(IsOn());
+        }
+        return base.GetProp(key);
+    }
+
+    override void SetProp(string key, string val) {
+        if (key == "value" && HasValueAxis()) {
+            SetOn(PropSpec.IsOn(val));
+            return;
+        }
+        base.SetProp(key, val);
+    }
+
+    // ---- 纯函数（黄金测试直连，PaintStyled/OnMeasure 共用） -------------
+
+    /// 轨道圆角：Round 为胶囊（半高），否则小圆角方块（对位 checkbox::box）。
+    static int TrackRadius(int trackH, bool round) {
+        if (round) { return trackH / 2; }
+        return 2;
+    }
+
+    /// 有内嵌内容时的轨道宽：容纳「拇指 + 两侧间隙 + 内容槽」。
+    static int ExpandedTrackW(int cssW, int thumbD, int slotW, int pad) {
+        if (slotW <= 0) { return cssW; }
+        int need = thumbD + slotW + pad * 2;
+        if (need > cssW) { return need; }
+        return cssW;
+    }
+
+    /// spinner 相位（千分位 0..999）：墙钟每 100ms 转 1/8 圈，
+    /// 与 Spin 的节奏同源、与页面实际重绘频率无关。
+    static int SpinnerPhase(int tickMs) {
+        int step = (tickMs / 100) % 10;
+        return step * 100;
+    }
+
+    /// Size 字段 → 皮肤类片段。tiny 是 Switch 独有档位（共享的
+    /// Control.SizeClass 把 tiny 并入 small，这里不借用、不改动它）。
+    static string SizeClsFor(string size) {
+        if (size == "tiny") { return "tiny"; }
+        if (size == "small") { return "small"; }
+        if (size == "large") { return "large"; }
+        return "";
+    }
+
+    int ActiveSizeCls() {
+        string sz = "";
+        if (Size != null) { sz = Size.Get(); }
+        return Switch.SizeClsFor(sz);
+    }
+
+    // 内嵌内容测量（文字取实测宽，图标取字号级方框）。
+    static int SlotWidth(App app, string text, string icon, int fs) {
+        int w = 0;
+        if (text != "") {
+            w = Canvas.MeasureText(text, fs);
+            int gap = app.Scale(2);
+            if (icon != "") { w = w + gap; }
+        }
+        if (icon != "") {
+            int glyph = fs + app.Scale(2);
+            if (glyph > w) { w = glyph; }
+        }
+        return w;
+    }
+
+    string TextOf(Binding<string> b) {
+        if (b == null) { return ""; }
+        return b.Get();
+    }
+
     int PaintStyled(App app, int id, int x, int y, bool isOn) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int target = 0;
         if (isOn) { target = 1000; }
+        // Size 字段映射为 Class 片段：tiny/small/large 由 base.css 的
+        // switch.tiny / switch.small / switch.large 规则提供尺寸。
+        string origClass = Class;
+        // 先落局部变量再传入：codegen 对 `AddClass(this.M())` 的嵌套
+        // 调用形式报 no overload（见 TASKS.md）。
+        string sizeCls = this.ActiveSizeCls();
+        this.AddClass(sizeCls);
+        // medium 是默认。
+        if (Loading) { this.AddClass("loading"); }
+        if (!Round) { this.AddClass("square"); }
         int animW = this.prefW;
         if (animW <= 0) { animW = app.Scale(40); }
         int animH = this.prefH;
         if (animH <= 0) { animH = t.heightMedium; }
-        // Size 字段映射为 Class 片段：small/medium/large 由 base.css 的
-        // switch.small / switch.large 规则提供尺寸。
-        string origClass = Class;
-        this.AddClass(this.SizeCls());
-        // medium 是默认。
-        if (Loading) { this.AddClass("loading"); }
         int e = app.AnimToIn(id, target, 140, x, y, animW, animH);
         int latched = Style.SChecked();
         StyleBox root = this.ResolveEasedLatchedStyleAsIn(
@@ -143,9 +329,24 @@ class Switch : Control {
         StyleBox thumbStyle = this.ResolveEasedLatchedPartAsIn(
             app, id, "switch", "thumb", "", Class, false, latched, e,
             x, y, animW, animH);
+        StyleBox innerStyle = Style.Part(app, "switch", "inner", "",
+                                         Class, "", Style.SNormal());
 
-        int trackW = trackStyle.WidthOr(app.Scale(40));
+        int cssTrackW = trackStyle.WidthOr(app.Scale(40));
         int trackH = trackStyle.HeightOr(app.Scale(22));
+        int margin = trackStyle.PadLOr(app.Scale(2));
+        int thumbSize = thumbStyle.WidthOr(trackH - margin * 2);
+
+        // 内嵌内容：文字/图标取选中与未选中两态较宽者，轨道按需加宽。
+        int fs = innerStyle.FontOr(Style.FontFallback(app, "small"));
+        int slotW = Switch.SlotWidth(app, this.TextOf(CheckedText),
+                                     this.TextOf(CheckedIcon), fs);
+        int slotW2 = Switch.SlotWidth(app, this.TextOf(UncheckedText),
+                                      this.TextOf(UncheckedIcon), fs);
+        if (slotW2 > slotW) { slotW = slotW2; }
+        int pad = app.Scale(6);
+        int trackW = Switch.ExpandedTrackW(cssTrackW, thumbSize, slotW, pad);
+
         int totalW = root.WidthOr(trackW);
         int totalH = root.HeightOr(t.heightMedium);
         int trackX = x + (totalW - trackW) / 2;
@@ -153,24 +354,83 @@ class Switch : Control {
         root.Paint(app, x, y, totalW, totalH);
 
         // 轨道 off/on 与 hover 档全在 `switch::track` 的 CSS 规则里，
-        // ResolveEasedLatchedPartAs 已按动画进度混好。
+        // ResolveEasedLatchedPartAsIn 已按动画进度混好；
+        // 自定义色（0 = 跟随皮肤）直接覆盖混色结果。
+        int trackBg = trackStyle.BgOr(root.accent);
+        if (isOn && CheckedColor != 0) { trackBg = CheckedColor; }
+        if (!isOn && UncheckedColor != 0) { trackBg = UncheckedColor; }
         c.FillRoundRect(trackX, trackY, trackW, trackH,
-                        trackStyle.RadiusOr(trackH / 2),
-                        trackStyle.BgOr(root.accent));
+                        Switch.TrackRadius(trackH, Round), trackBg);
 
-        int margin = trackStyle.PadLOr(app.Scale(2));
-        int thumbSize = thumbStyle.WidthOr(trackH - margin * 2);
         int thumbR = thumbSize / 2;
         int offX = trackX + thumbR + margin;
         int onX = trackX + trackW - thumbR - margin;
         int thumbX = App.Lerp(offX, onX, e);
         int thumbY = trackY + trackH / 2;
+        int thumbColor = thumbStyle.BgOr(root.fg);
         // 投影来自 `switch::thumb { box-shadow }`；没有声明时不画。
         if (thumbStyle.shadow != 0) {
-            c.FillCircle(thumbX, thumbY + thumbStyle.shadowDy, thumbR,
-                         thumbStyle.shadow);
+            if (Round) {
+                c.FillCircle(thumbX, thumbY + thumbStyle.shadowDy, thumbR,
+                             thumbStyle.shadow);
+            } else {
+                c.FillRoundRect(thumbX - thumbR,
+                                thumbY + thumbStyle.shadowDy - thumbR,
+                                thumbSize, thumbSize,
+                                Switch.TrackRadius(thumbSize, false),
+                                thumbStyle.shadow);
+            }
         }
-        c.FillCircle(thumbX, thumbY, thumbR, thumbStyle.BgOr(root.fg));
+        if (Round) {
+            c.FillCircle(thumbX, thumbY, thumbR, thumbColor);
+        } else {
+            c.FillRoundRect(thumbX - thumbR, thumbY - thumbR,
+                            thumbSize, thumbSize,
+                            Switch.TrackRadius(thumbSize, false), thumbColor);
+        }
+
+        // 内嵌文字/图标：选中内容画在拇指左侧空区（on 态拇指已滑到右），
+        // 未选中内容画在拇指右侧空区；颜色取拇指底色（反色对比），
+        // 随切换进度 e 交叉淡显（on 全显 Checked、off 全显 Unchecked）。
+        if (slotW > 0) {
+            int innerColor = innerStyle.FgOr(thumbColor);
+            int minSlot = app.Scale(6);
+            int lx = trackX + margin;
+            int lw = (thumbX - thumbR) - lx;
+            if (lw > minSlot) {
+                this.DrawInner(app, c, lx, trackY, lw, trackH,
+                               this.TextOf(CheckedText),
+                               this.TextOf(CheckedIcon),
+                               innerColor, e, fs);
+            }
+            int rx2 = thumbX + thumbR;
+            int rw2 = (trackX + trackW - margin) - rx2;
+            if (rw2 > minSlot) {
+                this.DrawInner(app, c, rx2, trackY, rw2, trackH,
+                               this.TextOf(UncheckedText),
+                               this.TextOf(UncheckedIcon),
+                               innerColor, 1000 - e, fs);
+            }
+        }
+
+        // 加载中：拇指圆心叠画弧线 spinner（色=轨道底色），墙钟相位
+        // 驱动；仅在屏幕上且可见时保持重绘（仿 Spin，防 CPU 空转）。
+        if (Loading) {
+            int cx = thumbX;
+            int cy = thumbY;
+            int r = thumbR - app.Scale(2);
+            if (r > app.Scale(3)) {
+                int phase = Switch.SpinnerPhase(Window.GetTickMs());
+                int a0 = phase * 360 / 1000;
+                c.DrawArc(cx, cy, r - app.Scale(2), r, a0, a0 + 270,
+                          trackBg, app.Scale(2));
+            }
+            if (Spin.OnScreen(app, cx, cy, thumbR)) {
+                int span = thumbR + app.Scale(2);
+                app.RequestAnimationFrameIn(40, cx - span, cy - span,
+                                            span * 2, span * 2);
+            }
+        }
 
         app.hitTester.RegisterRect(id, x, y, totalW, totalH, 0);
         // 恢复 Class，避免设计器/序列化器读到污染的字段。
@@ -178,16 +438,62 @@ class Switch : Control {
         return id;
     }
 
+    // 画一段内嵌内容（文字在前、图标紧随其后，整体居中于给定槽）。
+    void DrawInner(App app, Canvas c, int rx, int ry, int rw, int rh,
+                   string text, string icon, int color, int alpha, int fs) {
+        if (alpha <= 0) { return; }
+        int a = alpha;
+        if (a > 1000) { a = 1000; }
+        int col = App.WithAlpha(color, (255 * a) / 1000);
+        int tw = 0;
+        if (text != "") { tw = Canvas.MeasureText(text, fs); }
+        int gw = 0;
+        if (icon != "") { gw = fs + app.Scale(2); }
+        int gap = 0;
+        if (text != "" && icon != "") { gap = app.Scale(2); }
+        int total = tw + gw + gap;
+        int tx = rx + (rw - total) / 2;
+        if (tx < rx) { tx = rx; }
+        if (text != "") {
+            int ty = Canvas.CenterTextY(ry, rh, fs);
+            c.DrawText(tx, ty, text, col, fs);
+        }
+        if (icon != "") {
+            int gx = tx + tw + gap;
+            c.DrawGlyphIn(icon, gx, ry + (rh - gw) / 2, gw, gw, gw, col);
+        }
+    }
+
     override void OnMeasure(App app) {
         string origClass = Class;
-        this.AddClass(this.SizeCls());
+        // 先落局部变量再传入：codegen 对 `AddClass(this.M())` 的嵌套
+        // 调用形式报 no overload（见 TASKS.md）。
+        string sizeCls = this.ActiveSizeCls();
+        this.AddClass(sizeCls);
+        if (Loading) { this.AddClass("loading"); }
+        if (!Round) { this.AddClass("square"); }
         int latched = 0;
         if (model.Get()) { latched = Style.SChecked(); }
         StyleBox root = this.ResolveStyleAs(app, "switch", Class, latched);
         StyleBox trackStyle = this.ResolvePartAs(app, "switch", "track", "",
                                                  Class, latched);
+        StyleBox thumbStyle = this.ResolvePartAs(app, "switch", "thumb", "",
+                                                 Class, latched);
+        int fs = Style.Part(app, "switch", "inner", "", Class, "",
+                            Style.SNormal())
+                     .FontOr(Style.FontFallback(app, "small"));
+        int slotW = Switch.SlotWidth(app, this.TextOf(CheckedText),
+                                     this.TextOf(CheckedIcon), fs);
+        int slotW2 = Switch.SlotWidth(app, this.TextOf(UncheckedText),
+                                      this.TextOf(UncheckedIcon), fs);
+        if (slotW2 > slotW) { slotW = slotW2; }
+        int trackH = trackStyle.HeightOr(app.Scale(22));
+        int margin = trackStyle.PadLOr(app.Scale(2));
+        int thumbSize = thumbStyle.WidthOr(trackH - margin * 2);
+        int trackW = Switch.ExpandedTrackW(trackStyle.WidthOr(app.Scale(40)),
+                                           thumbSize, slotW, app.Scale(6));
         prefH = root.HeightOr(app.theme.heightMedium);
-        prefW = root.WidthOr(trackStyle.WidthOr(app.Scale(40)));
+        prefW = root.WidthOr(trackW);
         Class = origClass;
     }
 

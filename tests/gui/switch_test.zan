@@ -1,0 +1,164 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// 无窗口回归：Switch 的值数学与 designer 往返。全部是纯计算，
+/// 不需要窗口，对着 golden 比。
+/// - SizeClsFor 四档映射（tiny 是 Switch 独有档位）
+/// - TrackRadius / ExpandedTrackW / SpinnerPhase 纯几何与相位
+/// - Props 键：新增 checkedText/Icon/Color、unchecked*、checkedValue/
+///   uncheckedValue 的 GetProp/SetProp 往返与默认值
+/// - bool 轴：SetProp("value") toggle、Change 事件计数
+/// - int 轴：BindValue 值==选中值语义；int 轴激活时 GetProp/SetProp
+///   ("value") 改走值语义（写回 CheckedValue/UncheckedValue）
+/// - Loading 门控（IsOn 不受点击路径影响，此处验证属性往返与默认）
+class Program {
+    static void Line(string s) { Console.WriteLine(s); }
+    static int fails = 0;
+    static int chgCount = 0;
+
+    static void Eq(string label, string got, string want) {
+        if (got == want) { Line("ok " + label + " = " + got); }
+        else { fails = fails + 1; Line("FAIL " + label + " got [" + got + "] want [" + want + "]"); }
+    }
+
+    static void Eq(string label, int got, int want) {
+        if (got == want) { Line("ok " + label + " = " + Convert.ToString(got)); }
+        else { fails = fails + 1; Line("FAIL " + label + " got " + Convert.ToString(got) + " want " + Convert.ToString(want)); }
+    }
+
+    static void Main() {
+        // ---- SizeClsFor：四档映射 ----------------------------------------
+        Eq("size tiny", Switch.SizeClsFor("tiny"), "tiny");
+        Eq("size small", Switch.SizeClsFor("small"), "small");
+        Eq("size medium", Switch.SizeClsFor("medium"), "");
+        Eq("size large", Switch.SizeClsFor("large"), "large");
+        Eq("size dirty", Switch.SizeClsFor("huge"), "");
+
+        // ---- TrackRadius：圆/方 -------------------------------------------
+        Eq("radius round 22", Switch.TrackRadius(22, true), 11);
+        Eq("radius round odd", Switch.TrackRadius(23, true), 11);
+        Eq("radius square", Switch.TrackRadius(22, false), 2);
+        Eq("radius square small", Switch.TrackRadius(3, false), 2);
+
+        // ---- ExpandedTrackW：空槽=CSS 宽，内容撑开 -------------------------
+        Eq("expand empty", Switch.ExpandedTrackW(40, 18, 0, 6), 40);
+        Eq("expand fit", Switch.ExpandedTrackW(40, 18, 4, 6), 40);
+        Eq("expand grow", Switch.ExpandedTrackW(40, 18, 30, 6), 60);
+
+        // ---- SpinnerPhase：墙钟千分位相位 ----------------------------------
+        Eq("phase t0", Switch.SpinnerPhase(0), 0);
+        Eq("phase t150", Switch.SpinnerPhase(150), 100);
+        Eq("phase wrap", Switch.SpinnerPhase(1000), 0);
+        Eq("phase neg", Switch.SpinnerPhase(-50), 0);
+
+        // ---- 默认值 ---------------------------------------------------------
+        Switch d = new Switch();
+        Eq("default size", d.GetProp("size"), "medium");
+        Eq("default loading", d.GetProp("loading"), "false");
+        Eq("default round", d.GetProp("round"), "true");
+        Eq("default checkedText", d.GetProp("checkedText"), "");
+        Eq("default uncheckedText", d.GetProp("uncheckedText"), "");
+        Eq("default checkedIcon", d.GetProp("checkedIcon"), "");
+        Eq("default uncheckedIcon", d.GetProp("uncheckedIcon"), "");
+        Eq("default checkedColor", d.GetProp("checkedColor"), "0");
+        Eq("default uncheckedColor", d.GetProp("uncheckedColor"), "0");
+        Eq("default checkedValue", d.GetProp("checkedValue"), "1");
+        Eq("default uncheckedValue", d.GetProp("uncheckedValue"), "0");
+        Eq("default value off", d.GetProp("value"), "false");
+
+        // ---- 新属性往返 ------------------------------------------------------
+        d.SetProp("checkedText", "开");
+        d.SetProp("uncheckedText", "关");
+        d.SetProp("checkedIcon", "check");
+        d.SetProp("uncheckedIcon", "close");
+        d.SetProp("checkedColor", "16711680");
+        d.SetProp("uncheckedColor", "8421504");
+        d.SetProp("checkedValue", "7");
+        d.SetProp("uncheckedValue", "3");
+        d.SetProp("round", "false");
+        d.SetProp("loading", "true");
+        d.SetProp("size", "tiny");
+        Eq("r checkedText", d.GetProp("checkedText"), "开");
+        Eq("r uncheckedText", d.GetProp("uncheckedText"), "关");
+        Eq("r checkedIcon", d.GetProp("checkedIcon"), "check");
+        Eq("r uncheckedIcon", d.GetProp("uncheckedIcon"), "close");
+        Eq("r checkedColor", d.GetProp("checkedColor"), "16711680");
+        Eq("r uncheckedColor", d.GetProp("uncheckedColor"), "8421504");
+        Eq("r checkedValue", d.GetProp("checkedValue"), "7");
+        Eq("r uncheckedValue", d.GetProp("uncheckedValue"), "3");
+        Eq("r round", d.GetProp("round"), "false");
+        Eq("r loading", d.GetProp("loading"), "true");
+        Eq("r size", d.GetProp("size"), "tiny");
+
+        // ---- bool 轴：value 键读写 + Change 事件 -----------------------------
+        Switch b = new Switch();
+        b.BindEvent("Change", SwitchTest.OnChg);
+        b.SetProp("value", "true");
+        Eq("bool on", b.GetProp("value"), "true");
+        Eq("bool isOn", b.IsOn() ? "yes" : "no", "yes");
+        b.SetProp("on", "false");
+        Eq("bool off", b.GetProp("value"), "false");
+        // 别名 checked/on/value 都应答同一轴（bool 轴下 value 键不拦截）。
+        Eq("alias checked", b.GetProp("checked"), "false");
+
+        // ---- int 轴：BindValue 值==选中值 ------------------------------------
+        SignalInt m = new SignalInt(5);
+        Switch v = Switch.BindValue(m, 2, 5);
+        Eq("val initial on", v.GetProp("value"), "false");
+        v.SetProp("value", "true");
+        Eq("val writes CV", m.Get(), 2);
+        Eq("val on", v.GetProp("value"), "true");
+        v.SetProp("value", "false");
+        Eq("val writes UV", m.Get(), 5);
+        Eq("val off", v.GetProp("value"), "false");
+        // 外部改模型 -> SyncBinding 反映到开关（Render 每帧调用；无窗口
+        // 这里直接验证 IsOn 即时读到新值）。
+        m.Set(2);
+        Eq("val model on", v.IsOn() ? "yes" : "no", "yes");
+        m.Set(0);
+        Eq("val model off", v.IsOn() ? "yes" : "no", "no");
+
+        // ---- Bind(SignalBool) 保留式 -----------------------------------------
+        SignalBool sb = new SignalBool(false);
+        Switch r = Switch.Bind(sb);
+        r.SetOn(true);
+        Eq("retained on", sb.Get() ? "true" : "false", "true");
+        sb.Set(false);
+        r.SyncBinding();
+        Eq("retained sync", r.IsOn() ? "true" : "false", "false");
+
+        // ---- Events / Kind ---------------------------------------------------
+        Switch ev = new Switch();
+        List<string> events = ev.Events();
+        bool hasChange = false;
+        bool hasToggle = false;
+        for (int i = 0; i < events.Count; i = i + 1) {
+            if (events[i] == "Change") { hasChange = true; }
+            if (events[i] == "Toggle") { hasToggle = true; }
+        }
+        Eq("events change", hasChange ? "yes" : "no", "yes");
+        Eq("events toggle", hasToggle ? "yes" : "no", "yes");
+        Eq("kind", ev.Kind(), "Switch");
+        // class/name 仍走基类路径。
+        ev.SetProp("class", "hero");
+        Eq("class prop", ev.GetProp("class"), "hero");
+
+        // ---- Change 经 UiEvent 直接触发（计数走静态字段） ----------------------
+        chgCount = 0;
+        Switch cb = new Switch();
+        cb.BindEvent("Toggle", SwitchTest.OnChg);
+        cb.Change.Raise();
+        Eq("toggle raised", chgCount, 1);
+
+        if (fails > 0) {
+            Line("switch_test FAILED " + Convert.ToString(fails));
+        } else {
+            Line("switch_test OK");
+        }
+    }
+}
+
+class SwitchTest {
+    static void OnChg() { Program.chgCount = Program.chgCount + 1; }
+}

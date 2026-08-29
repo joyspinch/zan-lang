@@ -1523,6 +1523,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_dynamictags${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # Switch 增强回归：SizeClsFor 四档映射（tiny 是 Switch 独有的真实
+  # 档位）、圆/方轨道几何、内嵌内容的轨道加宽、spinner 相位、新属性
+  # （checkedText/Icon/Color、unchecked*、checkedValue/uncheckedValue）
+  # 的 GetProp/SetProp 往返，bool 轴 toggle，以及 int 轴（BindValue）
+  # 「值==选中值」语义与 value 键的值语义拦截。
+  add_test(NAME conformance_gui_switch
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/switch_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_switch.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_switch${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # VirtualList template rows: rows are built lazily (never at SetRows, only
   # when a frame needs them in the viewport) and the string-mode bookkeeping
   # stays intact across the mode switch.
