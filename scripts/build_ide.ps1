@@ -104,11 +104,17 @@ $zanArgs += $entry
 $zanArgs += $files
 $zanArgs += @("-DZAN_PROJECT_COMPONENTS")
 $zanArgs += @("-o", "build\ZanIDE.exe", "--subsystem", "windows")
-# DWARF line tables: the crash handler resolves every in-module frame to
-# `function  <file>.zan:line` in build\zan_crash.log, so a dev build always
-# says which source line faulted instead of module+offset.
-$zanArgs += @("-g")
-# ...but not the debug ARC guards -g turns on by default. --arc-guard never
+# Release shape (--publish): Os codegen + the optimization sweep + a stripped
+# link. The unoptimized dev default (O0 + fast_codegen) made the exe ~21 MB,
+# of which 13.8 MB was .text alone; the same sources publish to ~14 MB. The
+# debug ARC guards are off either way (below), so a long-running editor loses
+# nothing it was using. Crash line numbers in build\zan_crash.log were the
+# -g DWARF line tables: drop the crash-log source resolution for now; module
+# +offset still lands there, and ZAN_IDE_ZANC_ARGS="-g" brings the tables back
+# for a dedicated debug build when a crash needs triaging.
+$zanArgs += @("--publish")
+# ...but not the debug ARC guards --publish omits either (they were the -g
+# defaults). --arc-guard never
 # returns a released object to the allocator (it quarantines it so a stale
 # retain/release traps), and --check-leaks adds an atomic pair to every
 # allocation and release. In a long-running editor that reads as an
