@@ -4,8 +4,16 @@ using Gui;
 namespace Gui.Widget;
 
 /// 星级评分（NaiveUI n-rate），带响应式 int 绑定与悬停预览。
-/// 使用矢量 Icon 组件（"star" / "star-empty"），使实心和空心
-/// 星星在各平台渲染一致。
+/// 图标走图标组件管线（IconSvg 优先、IconVector 回退）：
+/// `Icon` / `VoidIcon` 给出实心/空心档的图标名（默认 "star" /
+/// "star-empty"），换成 "heart"、"flame" 等任何图标集认识的名字
+/// 即可自定义外观。
+///
+/// 鼠标语义与框架对齐：点击走 `App.ClickAvailable()`（一次释放只
+/// 被消费一帧，弹层已认领的点击不再穿透）；半星模式下每颗星注册
+/// 左右两个命中矩形，点击落在哪一半、悬停预览到哪一半都直接由
+/// 命中 id 决定，不再用 mouseX 对格子取余。悬停预览值变化时触发
+/// `HoverChange`（`HoverValue()` 读取，0 = 已离开）。
 ///
 /// C# 风格的有状态实例：
 ///     Rate stars = Rate.Bind(model, 5);
@@ -14,34 +22,53 @@ namespace Gui.Widget;
 class Rate : Control {
     SignalInt model;
     /// 双向绑定的评分：`stars.data = review.score;` 使模型字段与评分
-    /// 双向保持同步（编译器降级的 Binding）。
+    /// 双向保持同步（编译器降级的 Binding）。allowHalf 时同样按 *2
+    /// 编码（7 = 3.5 星），与模型信号、HoverValue 同一套语义。
     Binding<int> data;
     int maxStars;
     int baseId;
     /// 评分变化时触发（C# 风格：`r.Change += h;`）。
     UiEvent Change;
+    /// 悬停预览值变化时触发（含离开归 0）。`r.HoverChange += h;`
+    /// 之后用 `r.HoverValue()` 读取当前预览值。
+    UiEvent HoverChange;
     /// 允许半星（Naive UI allow-half）。true 时点击星星左半
     /// = i+0.5，右半 = i+1，模型用 *2 存储。
     bool allowHalf;
-    /// 只读：禁止点击编辑，但仍绘制（Naive UI readonly）。
+    /// 只读：禁止点击编辑、无悬停预览，但仍绘制（Naive UI readonly）。
     bool readOnly;
-    /// 可清空：再次点击同一星清除评分（Naive UI clearable）。
+    /// 可清空：再次点击同一半格清除评分（Naive UI clearable）。
     bool clearable;
     /// 尺寸变体：small/medium/large（Naive UI size）。Binding<string>
     /// 支持响应式换档，属性面板直接读写选项文本。
     Binding<string> Size;
+    /// 实心档图标名（Binding<string> 支持响应式，属性面板直写）。
+    Binding<string> Icon;
+    /// 空心档图标名。
+    Binding<string> VoidIcon;
+    /// 上一帧的悬停预览值；0 = 未悬停。Half 模式按 *2 编码。
+    int lastHover;
 
     void InitRate(SignalInt m, int stars) {
         this.InitControl("rate", 1);
         model = m;
         maxStars = stars;
-        baseId = WidgetId.Block(stars);
+        // 必须预留 2×：allowHalf 时 PaintStars 注册 baseId+i 与
+        // baseId+maxStars+i 两组 id——只 Block(stars) 的话右半格
+        // id 越界进后一个控件的 id 空间：两个控件互相误认领对方的
+        // 悬停/点击（悬停 A 行 → B 行跟着预览、点 B 行 → A 行值
+        // 被改写）。allowHalf 是构造后才设的，这里一律按 2× 预留。
+        baseId = WidgetId.Block(stars * 2);
         wiresOwnEvents = true;
         Change = new UiEvent();
+        HoverChange = new UiEvent();
         allowHalf = false;
         readOnly = false;
         clearable = false;
         Size = "medium";
+        Icon = "star";
+        VoidIcon = "star-empty";
+        lastHover = 0;
     }
 
     /// Default design-time constructor.
@@ -86,6 +113,14 @@ class Rate : Control {
             new List<string>{ "small", "medium", "large" });
         sz.str = Size;
         ps.Add(sz);
+        PropSpec ico = PropSpec.Text("icon", "Icon");
+        ico.str = Icon;
+        ico.WithTip("Filled-state icon name (star / heart / flame ...).");
+        ps.Add(ico);
+        PropSpec vic = PropSpec.Text("voidIcon", "Void icon");
+        vic.str = VoidIcon;
+        vic.WithTip("Empty-state icon name.");
+        ps.Add(vic);
         return ps;
     }
 
@@ -95,17 +130,18 @@ class Rate : Control {
     }
 
     int Value() { return model.Get(); }
-    /// 半星模式下 *2 编码：模型字段 3 = 1.5 星。
-    int RawValue() {
-        if (allowHalf) { return model.Get() / 2; }
-        return model.Get();
-    }
 
-    /// 将绑定的模型值拉入本地信号（model -> UI）。
+    /// 当前悬停预览值（`HoverChange` 报告的同一个数）：
+    /// 整星模式 = 将点亮的星数；半星模式按 *2 编码（3 = 1.5 星）；
+    /// 0 = 指针已离开。
+    int HoverValue() { return lastHover; }
+
+    /// 将绑定的模型值拉入本地信号（model -> UI）。data 与 model
+    /// 同一种编码（allowHalf 时都是 *2），直接比较即可——一边除
+    /// 一边乘的换算会把 3.5 星量化回 3 星。
     void SyncBinding() {
         if (data == null) { return; }
         int cur = data.Get();
-        if (allowHalf) { cur = cur * 2; }
         if (cur != model.Get()) { model.Set(cur); }
     }
 
@@ -127,59 +163,69 @@ class Rate : Control {
             + s.GapOr(app.theme.paddingTiny);
     }
 
+    /// 悬停预览值落定：变化的那一帧才触发 HoverChange（边沿触发，
+    /// 处理器里改模型不会造成重绘风暴）。
+    void SetHover(App app, int v) {
+        if (v == lastHover) { return; }
+        lastHover = v;
+        HoverChange.Raise();
+    }
+
     int Render(App app, int x, int y) {
         SyncBinding();
         this.PaintStars(app, x, y);
-        if (!readOnly && app.EventKind() == 3) {
+        // 一次释放只在它到达的那一帧被消费：ClickAvailable 挡掉
+        // 持续动画帧里 EventKind 停留在 3 的重放（否则 clearable
+        // 会清零又被下一帧原样写回，来回跳变）、被弹层认领的点击
+        // 和右键释放。值本身由命中矩形直接给出——半星左右两半
+        // 是两个不同的矩形 id，不需要再用 mouseX 对格子取余。
+        if (!readOnly && app.ClickAvailable()) {
             int hit = app.ClickTarget();
-            if (hit >= baseId && hit < baseId + maxStars) {
-                int idx = hit - baseId;
+            int span = allowHalf ? maxStars * 2 : maxStars;
+            if (hit >= baseId && hit < baseId + span) {
+                int newVal;
                 if (allowHalf) {
-                    // 利用鼠标 x 位置判断左右半：图标左半 = 半星。
-                    int cellW = this.StepPx(app);
-                    int rel = app.mouseX - x;
-                    bool isLeftHalf = (rel % cellW) < (cellW / 2);
-                    int newVal = idx * 2 + (isLeftHalf ? 1 : 2);
-                    if (clearable && model.Get() == newVal) { newVal = 0; }
-                    if (newVal != model.Get()) {
-                        model.Set(newVal);
-                        if (data != null) { data.Set(newVal / 2); }
-                        Change.Raise();
-                        app.RequestRedraw();
+                    if (hit >= baseId + maxStars) {
+                        newVal = (hit - baseId - maxStars) * 2 + 2;
+                    } else {
+                        newVal = (hit - baseId) * 2 + 1;
                     }
                 } else {
-                    int newVal = idx + 1;
-                    if (clearable && model.Get() == newVal) { newVal = 0; }
-                    if (newVal != model.Get()) {
-                        model.Set(newVal);
-                        if (data != null) { data.Set(newVal); }
-                        Change.Raise();
-                        app.RequestRedraw();
-                    }
+                    newVal = hit - baseId + 1;
+                }
+                if (clearable && model.Get() == newVal) { newVal = 0; }
+                if (newVal != model.Get()) {
+                    model.Set(newVal);
+                    if (data != null) { data.Set(newVal); }
+                    Change.Raise();
+                    app.RequestRedraw();
                 }
             }
         }
-        On.Fire(app, baseId);
         return baseId;
     }
 
     override List<string> Events() {
         List<string> e = Control.CommonEvents();
         e.Add("Change");
+        e.Add("HoverChange");
         return e;
     }
 
-    /// 将评分的 Change 路由到其 UiEvent 字段；其余一切
-    /// 落到 `On` 的公共事件集（其 AddByName 忽略
+    /// 将评分的 Change / HoverChange 路由到各自 UiEvent 字段；其余
+    /// 一切落到 `On` 的公共事件集（其 AddByName 忽略
     /// 不认识的名称）。
     override void BindEvent(string evt, Action a) {
         if (evt == "Change") { Change.Add(a); return; }
+        if (evt == "HoverChange") { HoverChange.Add(a); return; }
         On.AddByName(evt, a);
     }
 
-    /// 按 `rate` CSS 规则绘制星星，悬停的星星预览
-    /// 将要设置的评分。半星模式（allowHalf）下，
-    /// 整星 = 实心，半星 = 50% alpha 实心（`rate::star-half`）。
+    /// 按 `rate` CSS 规则绘制星星，悬停的星（半星模式下是悬停的
+    /// 半格）预览将要设置的评分。半星模式（allowHalf）下每颗星
+    /// 注册左右两个命中矩形：左半 id = baseId+i（= i+0.5 星），
+    /// 右半 id = baseId+maxStars+i（= i+1 星），命中/悬停/预览
+    /// 共用这一份几何。半星 = 50% alpha 实心（`rate::star-half`）。
     void PaintStars(App app, int x, int y) {
         Canvas c = app.canvas;
         Theme t = app.theme;
@@ -199,44 +245,77 @@ class Rate : Control {
         int fs = s.FontOr(Style.FontFallback(app, "huge"));
         int step = fs + s.GapOr(app.theme.paddingTiny);
         int rowH = Canvas.FontHeight(fs);
+        int halfW = step / 2;
 
-        int preview = 0 - 1;
-        int i = 0;
-        for (; i < maxStars; i = i + 1) {
-            if (app.focus.IsHovered(baseId + i)) { preview = i; }
-        }
-        // 评分以 *2 编码；显示时除以 2。
-        int fillTwos = model.Get();
-        int fillTo = fillTwos;
-        if (preview >= 0) {
-            // 悬停预览也按 *2
-            fillTo = preview * 2 + 2;
-        }
-
-        int offColor = off.FgOr(0);
-        int onColor = on.FgOr(0);
-        int halfColor = half != null ? half.FgOr(onColor) : onColor;
-        i = 0;
-        while (i < maxStars) {
-            int sx = x + i * step;
-            int color = offColor;
-            string name = "star-empty";
+        // 悬停预览值：命中矩形 id 直接编码了档位（整星 i+1；
+        // 半星左半 2i+1 / 右半 2i+2），0 = 未悬停。
+        int hoverVal = 0;
+        if (!readOnly) {
+            int i = 0;
+            for (; i < maxStars; i = i + 1) {
+                if (app.focus.IsHovered(baseId + i)) {
+                    hoverVal = allowHalf ? i * 2 + 1 : i + 1;
+                }
+            }
             if (allowHalf) {
-                int twosHere = fillTo - i * 2;
+                for (i = 0; i < maxStars; i = i + 1) {
+                    if (app.focus.IsHovered(baseId + maxStars + i)) {
+                        hoverVal = i * 2 + 2;
+                    }
+                }
+            }
+        }
+        this.SetHover(app, hoverVal);
+        // 评分与预览同一种编码（半星 *2），显示时直接比较。
+        int fillTo = model.Get();
+        if (hoverVal > 0) { fillTo = hoverVal; }
+
+        // 颜色都要过一次 Fade：rate::star-half 用 CSS `opacity: 500`
+        // 表达半颗，只取 FgOr 会把半星画成实心 100%——3.5 星看起来
+        // 像 4 星，悬停左/右半格视觉上毫无区别（“鼠标滑过没反应”）。
+        int offColor = off.Fade(off.FgOr(0));
+        int onRaw = on.FgOr(0);
+        int onColor = on.Fade(onRaw);
+        int halfColor = half != null ? half.Fade(half.FgOr(onRaw)) : onColor;
+        string onName = "star";
+        string offName = "star-empty";
+        if (Icon != null && Icon.Get() != "") { onName = Icon.Get(); }
+        if (VoidIcon != null && VoidIcon.Get() != "") { offName = VoidIcon.Get(); }
+        int i2 = 0;
+        while (i2 < maxStars) {
+            int sx = x + i2 * step;
+            int color = offColor;
+            string name = offName;
+            if (allowHalf) {
+                int twosHere = fillTo - i2 * 2;
                 if (twosHere >= 2) {
-                    color = onColor; name = "star";
+                    color = onColor; name = onName;
                 } else if (twosHere == 1) {
-                    color = halfColor; name = "star";
+                    color = halfColor; name = onName;
                 }
             } else {
-                if (i < fillTo) {
-                    color = onColor; name = "star";
+                if (i2 < fillTo) {
+                    color = onColor; name = onName;
                 }
             }
             c.DrawGlyphIn(name, sx, y, step, rowH, fs, color);
-            app.hitTester.RegisterRect(baseId + i, sx, y, step,
-                                                    rowH, 0);
-            i = i + 1;
+            if (!readOnly) {
+                if (allowHalf) {
+                    // 半星：左半 id = baseId+i（i+0.5 星），右半 id =
+                    // baseId+maxStars+i（i+1 星），两半拼满整格。
+                    app.hitTester.RegisterRect(baseId + i2, sx, y, halfW,
+                                               rowH, 0);
+                    app.hitTester.RegisterRect(baseId + maxStars + i2,
+                        sx + halfW, y, step - halfW, rowH, 0);
+                } else {
+                    // 整星：整格一个矩形——只注册左半会让每颗星的
+                    // 右半成为悬停/点击死区。
+                    app.hitTester.RegisterRect(baseId + i2, sx, y, step,
+                                               rowH, 0);
+                }
+                if (this.On.Any()) { On.Fire(app, baseId + i2); }
+            }
+            i2 = i2 + 1;
         }
         Class = origClass;
     }
