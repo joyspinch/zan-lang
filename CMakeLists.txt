@@ -1537,6 +1537,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_switch${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # 滚轮路由回归（用户报告“窗口有滚动条时滚轮跳跃”）：逐格线性不重
+  # 放不丢格；指针瞬移进滚动区时泵期 cap 判据过期仍兜底出整帧（旧代
+  # 码静默吞格→步幅忽大忽小）；嵌套声明者独占一格、外层冻结（修复
+  # 前图表 hover 消费与外层翻页双触发）。
+  add_test(NAME conformance_gui_wheel_route
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/wheel_route_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_wheel_route.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_wheel_route${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # VirtualList template rows: rows are built lazily (never at SetRows, only
   # when a frame needs them in the viewport) and the string-mode bookkeeping
   # stays intact across the mode switch.

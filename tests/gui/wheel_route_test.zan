@@ -1,0 +1,152 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// 滚轮路由 conformance（回归用户报告的“窗口有滚动条时滚轮跳跃”）：
+/// 1. 逐格线性：指针悬在视口内，每一格滚轮恰好把偏移推进 scrollSpeed
+///    px，不重放、不丢格（无事件的渲染帧不得再消费事件槽里的旧值）。
+/// 2. 跨界不吞帧：指针瞬移进/出滚动区时泵期的 cap 判据（上一帧的）
+///    已过期；kind==13 泵分支必须兜底承诺整帧——旧代码在无声明者时
+///    既不报损伤也不置 needsRedraw，RunLoop 直接跳过渲染，这一格滚
+///    轮被静默吞掉，步幅忽大忽小即用户所见的“跳跃”。
+/// 3. 嵌套独占：外层 ScrollView 与内层声明者叠在同一指针下时，一格
+///    滚轮只推进内层（最后声明者），外层冻结。修复前图表类只按
+///    hover-id 消费滚轮、不声明 CaptureWheel，一格同时缩放图表又翻
+///    页——本用例把双消费的后果（外层被推进）显式锁死。
+class WheelRouteTest {
+    static int fails;
+    static App app;
+    static ScrollView outer;
+    static ScrollView inner;
+    static Rect outerArea;
+    static Rect innerArea;
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got "
+            + Convert.ToString(got) + " want " + Convert.ToString(want));
+    }
+
+    static void True(string what, bool got) {
+        if (got) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    // 帧体只负责画内容：BeginFrame/PresentFrame 由 FrameGuarded 完成。
+    static void Body() {
+        outer.Begin(app, outerArea, 5000);
+        // 内层声明在外层之后（渲染序即 z 序，嵌套视图最后声明者赢）。
+        if (inner != null) {
+            inner.Begin(app, innerArea, 5000);
+            inner.End(app, innerArea);
+        }
+        outer.End(app, outerArea);
+    }
+
+    static void PumpAndFrame() {
+        app.PumpGuarded();
+        app.FrameGuarded(WheelRouteTest.Body);
+    }
+
+    // 无事件帧：只出帧，不泵（PumpGuarded 无事件会阻塞在 WaitEvent）。
+    static void FrameOnly() {
+        app.FrameGuarded(WheelRouteTest.Body);
+    }
+
+    // 真实循环里每一次渲染都 preceded 一次泵：move 事件既是指针推进
+    // 也是“清槽”节拍，滚轮的旧 delta 从这一刻起不再可见。
+    static void MoveTo(int x, int y) {
+        app.window.InjectEvent(1, x, y, 0, 0, 0);
+        app.PumpGuarded();
+        app.FrameGuarded(WheelRouteTest.Body);
+    }
+
+    static int Speed() {
+        return app.scrollSpeed;
+    }
+
+    static void Main() {
+        fails = 0;
+        app = new App("wheel-route", 400, 300);
+        app.Show();
+        app.RequestAnimationFrame(16);
+        outer = new ScrollView();
+        inner = null;
+        outerArea = new Rect(20, 40, 240, 200);
+        app.mouseX = 100;
+        app.mouseY = 100;
+
+        // ---- 1. 逐格线性：连续三格，步幅恒等于 scrollSpeed ----------
+        // 首个 move 帧登记认领（move 无滚轮可消费），之后滚轮逐格线性。
+        // 真实循环里每一次渲染都 preceded 一次泵（PollEvent 入队先清
+        // 槽），所以“下一帧不得重放旧滚轮”的锁法就是在两次滚轮之间
+        // 垫一个 move 帧。
+        WheelRouteTest.MoveTo(100, 100);
+        int o0 = outer.offset;
+        for (int g = 0; g < 3; g = g + 1) {
+            app.window.InjectEvent(13, 100, 100, 0, -120, 0);
+            WheelRouteTest.PumpAndFrame();
+            EqInt("notch linear g" + Convert.ToString(g),
+                  outer.offset - o0, Speed() * (g + 1));
+        }
+        // 滚轮之后的 move 帧不得重放滚轮（泵把 kind 清零，槽里留着
+        // 旧 delta 也不能再被消费）。
+        WheelRouteTest.MoveTo(100, 100);
+        EqInt("no replay on plain frame", outer.offset, o0 + 3 * Speed());
+
+        // ---- 2. 跨界不吞帧 ------------------------------------------
+        // 2a. 指针瞬移进视口（无任何 move 帧）后的第一格滚轮：泵期
+        //     cap 判据过期（上一帧无声明者）也必须承诺整帧。
+        app.window.InjectEvent(1, 30, 30, 0, 0, 0);
+        WheelRouteTest.PumpAndFrame();    // 出区 move 帧：cap 清空
+        WheelRouteTest.MoveTo(30, 30);    // 再一无事件帧，状态稳定
+        app.mouseX = 100;
+        app.mouseY = 100;                 // “瞬移”进视口，不出 move 帧
+        app.window.InjectEvent(13, 100, 100, 0, -120, 0);
+        app.PumpGuarded();
+        True("stale-cap wheel promises a frame", app.needsRedraw);
+        // 渲染帧登记认领（owner 未武装，本格不消费——这是设计：认领
+        // 从下一格起生效），但帧必须正常出。
+        WheelRouteTest.FrameOnly();                  // 登记认领（本格不消费）
+        app.window.InjectEvent(13, 100, 100, 0, -120, 0);
+        WheelRouteTest.PumpAndFrame();    // 第二格：线性推进
+        EqInt("teleport-in re-applies from second notch",
+              outer.offset, o0 + 4 * Speed());
+
+        // 2b. move+wheel 同帧注入：泵一次只取一条，move 帧登记认领、
+        //     wheel 帧消费——跨界不得吞格。
+        app.window.InjectEvent(1, 30, 30, 0, 0, 0);
+        WheelRouteTest.PumpAndFrame();    // 出区帧
+        WheelRouteTest.MoveTo(30, 30);    // 无认领帧，owner 归零
+        int before = outer.offset;
+        app.window.InjectEvent(1, 100, 100, 0, 0, 0);
+        app.window.InjectEvent(13, 100, 100, 0, -120, 0);
+        app.window.InjectEvent(13, 100, 100, 0, -120, 0);
+        WheelRouteTest.PumpAndFrame();    // 泵 move → 登记
+        WheelRouteTest.PumpAndFrame();    // 泵 wheel#1 → 消费
+        WheelRouteTest.PumpAndFrame();    // 泵 wheel#2 → 消费
+        EqInt("move+wheel pair loses no notch",
+              outer.offset - before, 2 * Speed());
+
+        // ---- 3. 嵌套独占：一格滚轮只推进内层 ------------------------
+        inner = new ScrollView();
+        innerArea = new Rect(100, 80, 120, 100);
+        WheelRouteTest.MoveTo(120, 100);  // 悬在两层之下；登记最后声明者=内层
+        int outerHold = outer.offset;
+        int innerHold = inner.offset;
+        app.window.InjectEvent(13, 120, 100, 0, -120, 0);
+        WheelRouteTest.PumpAndFrame();    // owner=上帧最后序(2) → 内层赢
+        EqInt("outer frozen under inner claim", outer.offset, outerHold);
+        EqInt("inner advanced alone", inner.offset, innerHold + Speed());
+        // 反方向一格：同样只动内层。
+        app.window.InjectEvent(13, 120, 100, 0, 120, 0);
+        WheelRouteTest.PumpAndFrame();
+        EqInt("outer still frozen", outer.offset, outerHold);
+        EqInt("inner returned", inner.offset, innerHold);
+
+        Console.WriteLine(fails == 0 ? "WHEELROUTE PASS" : "WHEELROUTE FAIL "
+            + Convert.ToString(fails));
+    }
+}
