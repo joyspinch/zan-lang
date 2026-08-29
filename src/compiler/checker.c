@@ -846,6 +846,9 @@ static bool checker_type_is_ref(zan_type_t *t) {
 /* Merge the then/else branch types of a conditional expression. NULL means
  * the two are unrelated and the conditional is an error. */
 static zan_type_t *merge_conditional_types(zan_checker_t *c,
+                                           zan_type_t *a, zan_type_t *b);
+static bool expr_is_null_literal(zan_ast_node_t *e);
+static zan_type_t *merge_conditional_types(zan_checker_t *c,
                                            zan_type_t *a, zan_type_t *b) {
     if (!a) return b;
     if (!b) return a;
@@ -1502,6 +1505,82 @@ static zan_symbol_t *expr_method_group(zan_checker_t *c, zan_ast_node_t *e) {
     return NULL;
 }
 
+/* Walk a method body's statement tree (not into nested expressions/lambdas,
+ * which have their own return scope). Returns false if any `return` yields
+ * neither `this` nor null; *count receives the number of `return this`
+ * statements seen. */
+static bool body_returns_this(zan_ast_node_t *n, int depth, int *count) {
+    if (!n || depth > CHECKER_DERIVES_MAX_DEPTH) return true;
+    switch (n->kind) {
+    case AST_RETURN_STMT:
+        if (n->ret.value && n->ret.value->kind == AST_THIS_EXPR) {
+            (*count)++;
+            return true;
+        }
+        if (n->ret.value && n->ret.value->kind == AST_NULL_LITERAL)
+            return true;
+        if (!n->ret.value) return true; /* bare `return;` (void) */
+        return false;
+    case AST_BLOCK:
+        for (int i = 0; i < n->block.stmts.count; i++)
+            if (!body_returns_this(n->block.stmts.items[i], depth + 1, count))
+                return false;
+        return true;
+    case AST_IF_STMT:
+        return body_returns_this(n->if_stmt.then_body, depth + 1, count) &&
+               body_returns_this(n->if_stmt.else_body, depth + 1, count);
+    case AST_WHILE_STMT: case AST_DO_WHILE_STMT:
+        return body_returns_this(n->while_stmt.body, depth + 1, count);
+    case AST_FOR_STMT:
+        return body_returns_this(n->for_stmt.body, depth + 1, count);
+    case AST_FOREACH_STMT:
+        return body_returns_this(n->foreach_stmt.body, depth + 1, count);
+    case AST_SWITCH_STMT: {
+        for (int i = 0; i < n->switch_stmt.cases.count; i++) {
+            zan_ast_node_t *sec = n->switch_stmt.cases.items[i];
+            if (sec && !body_returns_this(sec->switch_case.body, depth + 1, count))
+                return false;
+        }
+        return true;
+    }
+    case AST_TRY_STMT: {
+        if (!body_returns_this(n->try_stmt.try_body, depth + 1, count))
+            return false;
+        for (int i = 0; i < n->try_stmt.catches.count; i++) {
+            zan_ast_node_t *cat = n->try_stmt.catches.items[i];
+            if (cat && !body_returns_this(cat->catch_clause.body, depth + 1, count))
+                return false;
+        }
+        return body_returns_this(n->try_stmt.finally_body, depth + 1, count);
+    }
+    default:
+        return true;
+    }
+}
+
+/* True when `method`'s body always returns the receiver itself (`this`) or
+ * null -- the fluent-setter contract (`Control Gap(...) { ...; return this; }`).
+ * Methods like this preserve the receiver's exact type, so a call typed by
+ * the *declared* base return would be a needless lie: `Panel.Column().Gap(n)`
+ * returns the same Panel the head produced. The Gui stdlib is built on this
+ * idiom (base declares `Control`, subclasses never override), and irgen never
+ * inserted a cast for it, so only the checker's view has to catch up. */
+static bool expr_is_this_call(zan_checker_t *c, zan_symbol_t *method,
+                              zan_type_t *recv) {
+    if (!method || !method->decl) return false;
+    zan_ast_node_t *m = method->decl;
+    if (m->kind != AST_METHOD_DECL) return false;
+    zan_ast_node_t *rt = m->method_decl.return_type;
+    if (!rt) return false;
+    zan_type_t *ret = zan_binder_resolve_type(c->binder, rt);
+    if (!ret || !checker_type_is_ref(ret)) return false;
+    if (!recv || recv == ret || !checker_type_derives_from(recv, ret))
+        return false;
+    int count = 0;
+    if (!body_returns_this(m->method_decl.body, 0, &count)) return false;
+    return count > 0;
+}
+
 static void reject_method_group(zan_checker_t *c, zan_ast_node_t *e) {
     zan_symbol_t *m = expr_method_group(c, e);
     if (!m) return;
@@ -1947,6 +2026,32 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 return c->binder->type_void; /* explicit void return */
             }
         }
+        /* Resolved call of a uniquely-named method (`obj.M(...)`,
+         * `Type.S(...)`, or a same-class call by bare name): typed by the
+         * method's declared return type. Falling through to type_error here
+         * made every call result unchecked: `return M();` from an int method
+         * where M returns string compiled clean and irgen then truncated the
+         * 64-bit pointer into the i32 return slot (the Switch demo segfault).
+         * `arg_sig` is only set for unambiguous, non-generic signatures (see
+         * call_arg_signature), so overload/generic calls keep the old
+         * permissive type_error fallback rather than risk a wrong type. */
+        if (arg_sig && arg_sig->decl &&
+            arg_sig->decl->kind == AST_METHOD_DECL) {
+            if (arg_sig->decl->method_decl.return_type) {
+                /* Fluent `return this` methods (`Control Gap(...)`) keep the
+                 * receiver's concrete type; see expr_is_this_call. */
+                if (expr_is_this_call(c, arg_sig, recv)) {
+                    no_runtime_warn_arc_return(c, expr, recv);
+                    return recv;
+                }
+                zan_type_t *ret = zan_binder_resolve_type(
+                    c->binder, arg_sig->decl->method_decl.return_type);
+                no_runtime_warn_arc_return(c, expr, ret);
+                return ret;
+            }
+            no_runtime_warn_arc_return(c, expr, c->binder->type_void);
+            return c->binder->type_void; /* explicit void return */
+        }
         no_runtime_warn_arc_return(c, expr, callee_is_method ? callee_type : NULL);
         return c->binder->type_error;
     }
@@ -2123,6 +2228,19 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         zan_type_t *then_type = zan_checker_check_expr(c, expr->conditional.then_expr);
         zan_type_t *else_type = zan_checker_check_expr(c, expr->conditional.else_expr);
         zan_type_t *merged = merge_conditional_types(c, then_type, else_type);
+        if (!merged) {
+            /* `cond ? refExpr : null` / `cond ? null : refExpr`: C# gives the
+             * reference type. The checker types the `null` literal as
+             * `object`, and most reference classes do not derive from it, so
+             * the derive-based merge cannot see it -- pair the *literal* with
+             * any reference arm at the call site, where the syntax is known. */
+            if (expr_is_null_literal(expr->conditional.else_expr) &&
+                checker_type_is_ref(then_type))
+                merged = then_type;
+            else if (expr_is_null_literal(expr->conditional.then_expr) &&
+                     checker_type_is_ref(else_type))
+                merged = else_type;
+        }
         if (!merged) {
             zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
                 "cannot apply '?:' operator to operands of type '%s' and '%s': "

@@ -1,0 +1,68 @@
+using System;
+
+// A call's result must be typed by the callee's *declared* return type. The
+// checker used to hand back type_error for every uniquely-resolved method
+// call, which silently swallowed all conversion checking at those positions:
+// `int F() { return S(); }` with `static string S()` compiled clean and irgen
+// truncated the 64-bit string pointer into the i32 return slot -- the Switch
+// demo segfaulted on the garbage pointer (Switch.ActiveSizeCls was exactly
+// this shape). This program is the positive twin: correct code in the same
+// shapes must compile AND run.
+//
+// Covered shapes:
+//  1. A static call's declared return type drives `return` (a wrong one is
+//     rejected by the diag test diag_return_call_type_mismatch).
+//  2. Fluent `return this` setters keep the receiver's concrete type: the Gui
+//     stdlib builds `Panel p = Panel.Column().Gap(8)` throughout, and the
+//     checker may not degrade the result to the declared base.
+//  3. `cond ? call() : null` merges the reference arm with the null literal
+//     (GenDb.RewriteConflict relies on it once the call is properly typed).
+
+class Base {
+    public int n;
+
+    Base WithN(int v) { this.n = v; return this; }
+    static Base Bare() { return new Base(); }
+}
+
+class Derived : Base {
+    static Derived Head() { return new Derived(); }
+    // the derived chain node: base declares the setter returning Base, the
+    // call on a Derived receiver must read back as Derived.
+    static Derived Build(int v) {
+        Derived d = Derived.Head().WithN(v);
+        return d;
+    }
+}
+
+class Program {
+    static string Name(bool on) { return on ? "on" : ""; }
+    static int Pick() { return 7; }
+
+    // declared string returned into int-typed locals via the *right* path
+    // (int call) and via nullable ternary:
+    static string Maybe(int i) {
+        string t = i > 0 ? Program.Name(true) : null;
+        return t;
+    }
+
+    static void Main() {
+        // 1. plain declared return through return-call
+        int seven = Program.Pick();
+        Console.WriteLine("pick=" + seven);
+
+        // 2. fluent return-this keeps the concrete receiver type
+        Derived d = Derived.Build(42);
+        Console.WriteLine("build=" + d.n + " isDerived=" + (d is Derived));
+        Derived d2 = Derived.Head().WithN(99);
+        Console.WriteLine("chain=" + d2.n);
+        Base b = Base.Bare().WithN(5);
+        Console.WriteLine("base=" + b.n);
+
+        // 3. reference vs null in a conditional
+        string m1 = Program.Maybe(1);
+        string m2 = Program.Maybe(-1);
+        Console.WriteLine("maybe=" + (m1 == "on" ? "on" : "BROKEN") +
+                          "," + (m2 == null ? "null" : "BROKEN"));
+    }
+}

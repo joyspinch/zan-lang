@@ -2353,7 +2353,8 @@ set(_new_diag_cases
   unrelated_argument_type
   scalar_argument_to_reference
   call_not_callable
-  expression_nesting_depth)
+  expression_nesting_depth
+  return_call_type_mismatch)
 foreach(_case ${_new_diag_cases})
   if(_case STREQUAL cyclic_inheritance)
     set(_diag_regex "cyclic inheritance")
@@ -2365,6 +2366,8 @@ foreach(_case ${_new_diag_cases})
     set(_diag_regex "cannot convert 'int' to 'Handler'")
   elseif(_case STREQUAL local_assignment_type_mismatch)
     set(_diag_regex "cannot convert 'string' to 'int' in assignment")
+  elseif(_case STREQUAL return_call_type_mismatch)
+    set(_diag_regex "cannot convert 'string' to 'int' in return statement")
   elseif(_case STREQUAL unrelated_argument_type)
     set(_diag_regex "in argument 1 of 'Paint'")
   elseif(_case STREQUAL scalar_argument_to_reference)
