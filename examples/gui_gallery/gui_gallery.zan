@@ -52,6 +52,41 @@ class BigDataSource : DataSource {
     }
 }
 
+/// Progress hook for the two DataTable demos' "Export Excel" buttons: the
+/// callbacks fire on the export worker thread, so every UI touch is marshalled
+/// back with App.Post as a static method group (delegates can't capture), and
+/// the handler then reads these static mirrors. Both demo panes share one
+/// hook — the library allows a single export job at a time anyway — and the
+/// mirror `slot` says which pane's status line the posted handler updates.
+class GalleryExportProgress : DataTableExportProgress {
+    public static bool running;
+    public static int done;
+    public static int total;
+    public static int slot;
+    public static bool okFlag;
+    public static string message;
+    public static string path;
+
+    override void OnStart(int t) {
+        GalleryExportProgress.total = t;
+        GalleryExportProgress.done = 0;
+        Gallery.app.Post(Gallery.ApplyExportProgress);
+    }
+
+    override void OnProgress(int d, int t) {
+        GalleryExportProgress.done = d;
+        GalleryExportProgress.total = t;
+        Gallery.app.Post(Gallery.ApplyExportProgress);
+    }
+
+    override void OnDone(bool ok, string error) {
+        GalleryExportProgress.running = false;
+        GalleryExportProgress.okFlag = ok;
+        GalleryExportProgress.message = error;
+        Gallery.app.Post(Gallery.ApplyExportDone);
+    }
+}
+
 /// Appearance hook for the DataTable demo. Zan delegates can't capture locals,
 /// so a styler is a subclass rather than a lambda: it reads the row it is asked
 /// about straight from the source. Here, under-performers are tinted, the Score
@@ -354,6 +389,9 @@ class Demo {
     // The code panel's Copy control is a real Button, retained per card so it
     // keeps its own hover/press state across frames.
     Button copyBtn;
+    // Copy-success feedback deadline (app.nowMs): while now < this the Copy
+    // button shows the green "已复制" state, then reverts to "Copy".
+    int copiedUntilMs;
 
     Demo(string title, string desc, string previewId,
             int previewH, string code, string json) {
@@ -482,6 +520,7 @@ class NumDemoHooks {
 /// caller owning a Signal, so edits flow both ways through the field.
 class GalleryModel {
     string inputText;
+    string otpCode;        // InputOtp.form 的双向绑定目标
     bool toggle;
     bool toggleB;
     bool cbSmall;
@@ -491,6 +530,11 @@ class GalleryModel {
     bool cbSuccess;
     bool cbWarning;
     int level;
+    // ---- Slider 演示族（Naive UI n-slider 对齐）的模型字段 ----------
+    int sldLo;              // Slider.range 低值（双柄范围演示）
+    int sldHi;              // Slider.range 高值
+    int sldMark;            // Slider.marks / Slider.stepmark 共享当前值
+    int sldFmt;             // Slider.tooltip 三态演示共享当前值
     // ---- InputNumber 演示族（Naive UI n-input-number 对齐）的模型字段 --
     int numBasic;           // 基础 / 按钮位置 / 尺寸三卡共享（双向同步）
     int numMin;             // 最小值&最大值演示：低界盒
@@ -507,6 +551,15 @@ class GalleryModel {
     int radioChoice;
     int radioSize;
     int radioLock;
+    // 第五组：每个选项一个语义 class，选中谁就亮谁的强调色。
+    int radioAccent;
+    // Radio.bordered 演示的三组（基础 / 语义色 / 禁用）。
+    int radioBorder;
+    int radioBorder2;
+    int radioBorder3;
+    // RadioGroup.options / .buttons 演示：组级绑定字段与 LIVE STATES
+    // 的上一帧值。
+    int rgCity;
     string notes;
     int pick;
     int slide;
@@ -531,6 +584,17 @@ class GalleryModel {
     // Radio.dependent：渠道单选，「其他」的备注。
     int howhear;            // 0 广告 / 1 朋友推荐 / 2 其他
     string otherNote;
+    // ---- 更丰富的 Switch / Radio 展示 --------------------------------
+    // Switch.settings：三行设置的模型字段（行每帧重建，开关保留态）。
+    bool setSync;
+    bool setCompact;
+    bool setPublic;
+    // Switch.async：异步保存——「保存完成」那一刻才落值的影子字段。
+    bool asyncOn;
+    // Switch.value：自定义选中值的 int 绑定轴（10 = 开、20 = 关）。
+    int swVal;
+    // Radio.cards：选中卡片下标（三张卡的单选钮共享绑定）。
+    int radioPick;
     // ---- Rate 演示族（半星按 *2 编码；悬浮预览值由 HoverChange
     // 处理器写入，0 = 指针已离开）----
     int rateHalf;
@@ -549,8 +613,31 @@ class GalleryModel {
     bool qrLogo;       // 叠加 logo（自动升 H）
     int qrPx;          // 主卡边长（逻辑 px）
     bool qrSvg;        // 导出卡渲染类型：false 画布 / true SVG
+    // ---- Pagination 演示族：100 页大分页的当前页（窗口省略号、
+    // 跳页输入框与每页条数下拉共享它）----
+    int pagJump;
+    // ---- Watermark.custom：自定义水印演示的配置面板字段 ----------
+    // 面板控件经 .data 双向绑到这里；水印每帧按字段现造——旋钮改
+    // 字段，下一帧水印直接长成新样子，没有事件时序要操心。
+    string wmText;     // 水印内容（\n 分行）
+    string wmColor;    // 颜色文本：0x/#/裸十六进制（AARRGGBB 或 RRGGBB），空 = 默认淡黑
+    int wmFontPx;      // 字体大小（逻辑 px）
+    int wmWeight;      // 字重：0 正常 / 1 加粗（下拉框下标）
+    int wmRotate;      // 旋转角度（度，正 = 顺时针）
+    int wmLineH;       // 行高（逻辑 px，0 = 默认行高）
+    int wmTileW;       // 贴片宽（逻辑 px，0 = 按内容）
+    int wmTileH;       // 贴片高（逻辑 px，0 = 按内容）
+    int wmGapX;        // X 轴间隔（逻辑 px）
+    int wmGapY;        // Y 轴间隔（逻辑 px）
+    int wmOffX;        // X 轴偏移（逻辑 px）
+    int wmOffY;        // Y 轴偏移（逻辑 px）
+    int wmAlign;       // 文本对齐：0 左 / 1 中 / 2 右
+    bool wmNoClip;     // 是否跨越边界（不被水印框裁剪）
     // ---- Steps 演示族：点击切换演示绑定的当前步（0..2）----------
     int stepClick;
+    // ---- ColorPicker 演示族：打包色模型字段（0xAARRGGBB）--------
+    int cpBase;        // 基础卡 / 无透明度卡共享（双向同步）
+    int cpForm;        // 和表单一起使用卡（data 双向绑定）
 }
 
 class Gallery {
@@ -561,6 +648,7 @@ class Gallery {
     // Radio 演示的上一帧基础组取值：翻转的那一帧才把 Change 报到
     // LIVE STATES 行（轮询写法，免去 lambda 捕获）。
     static int radioPrevChoice;
+    static int radioAccentPrev;
     static SignalBool demoBool;
     static SignalInt demoInt;
     static Input demoInput;
@@ -587,6 +675,23 @@ class Gallery {
     static Input demoPassive;
     static Input demoManual;
     static Label manualLog;
+    // 验证码输入族（antd Input.OTP）：与 Input 同理必须保留态——焦点、
+    // 活动格、已填内容都活在控件里，每帧重建等于每帧清空。
+    static InputOtp demoOtp;
+    static InputOtp demoOtpMask;
+    static InputOtp demoOtpBlock;
+    static InputOtp demoOtpRo;
+    static InputOtp demoOtpDis;
+    static InputOtp demoOtpWarn;
+    static InputOtp demoOtpErr;
+    static InputOtp demoOtpGroup;
+    static InputOtp demoOtpSmall;
+    static InputOtp demoOtpMed;
+    static InputOtp demoOtpLarge;
+    static InputOtp demoOtpForm;
+    static InputOtp demoOtpDigits;
+    static InputOtp demoOtpLetters;
+    static Label otpFormLog;
     // 三种模式的日期选择器。同样必须保留态：弹出的月历是控件自己的
     // 覆盖层，每帧重建就等于每帧把它关掉。
     static DatePicker demoDay;
@@ -598,8 +703,20 @@ class Gallery {
     static DatePicker demoQuarter;
     static DatePicker demoYear;
     static DatePicker demoMonthRange;
+    // 颜色选择器演示族（Naive UI n-color-picker 对位）：弹层与
+    // DatePicker 同理走框架覆盖层，实例必须保留态——每帧 new 等于
+    // 每帧把弹层关掉。
+    static ColorPicker demoCp;
+    static ColorPicker demoCpNoAlpha;
+    static ColorPicker demoCpHex;
+    static ColorPicker demoCpForm;
+    static Label cpFormLog;
     // 全选父项演示的保留态复选框组（含半选父框的可视状态）。
     static CheckboxGroup demoCbg;
+    // RadioGroup.options / .buttons 演示的保留态组（WidgetId 稳定，
+    // 同 RadioGroup.demoRg 的理由）。
+    static RadioGroup demoRgOpt;
+    static RadioGroup demoRgBtn;
     // JSON design document -> real control tree (FormBuilder.Build).
     static Control demoForm;
     // ---- 复杂表单演示（保留态：整棵 FormGroup 连同其中的输入控件
@@ -618,12 +735,67 @@ class Gallery {
     static Switch demoMasterB;
     // Radio.dependent：「其他」单选启用备注输入框（禁用联动）。
     static Input demoHowhearNote;
+    // Switch.settings：三行设置的保留态开关（行/文字每帧重建没关系，
+    // 开关必须跨帧存活，否则 WidgetId 漂移、点击落不回同一控件）。
+    static Switch demoSetSync;
+    static Switch demoSetCompact;
+    static Switch demoSetPublic;
+    static int setPrevCount;
+    // Switch.async：异步保存状态机（0 = 空闲，>0 = 剩余帧数）。
+    static Switch demoAsyncSw;
+    static int asyncPending;
+    static bool asyncTarget;
+    static bool asyncApplied;
+    // Switch.value：int 绑定轴的保留开关（CheckedValue=10、
+    // UncheckedValue=20，切换把值写回 model.swVal）。
+    static Switch demoSwVal;
+    // Watermark.custom：自定义水印演示的配置面板（保留态——每帧 new
+    // 会让 WidgetId 漂移，点击/焦点/输入法组合态就再也落不回同一控件；
+    // 值经 .data 双向绑到 model.wm* 字段，水印本身每帧按字段现造）。
+    static Input wmTextInput;
+    static Input wmColorInput;
+    static InputNumber wmFontNum;
+    static SelectBox wmWeightSel;
+    static Slider wmRotateSld;
+    static InputNumber wmLineHNum;
+    static InputNumber wmTileWNum;
+    static InputNumber wmTileHNum;
+    static InputNumber wmGapXNum;
+    static InputNumber wmGapYNum;
+    static InputNumber wmOffXNum;
+    static InputNumber wmOffYNum;
+    static SelectBox wmAlignSel;
+    static Switch wmClipSw;
+    // Radio.cards：三张选项卡里的单选钮（保留态，共享 radioPick）。
+    static Radio demoPick0;
+    static Radio demoPick1;
+    static Radio demoPick2;
+    static int radioPickPrev;
+    // RadioGroup：整组保留态（组自持选项排布与选中信号）。
+    static RadioGroup demoRg;
+    static int rgPrev;
+    // RadioGroup.options / .buttons 演示的上一帧选中值（LIVE STATES）。
+    static int rgOptPrev;
+    static int rgBtnPrev;
     static SignalBool popTipOn;
     static Checkbox demoCheck;
     static Switch demoSwitch;
     static Radio demoRadioA;
     static Radio demoRadioB;
     static Slider demoSlider;
+    // Slider 演示族（全部保留态：每帧 new 会让 WidgetId 漂移，
+    // 悬停/拖拽就再也落不回同一控件）。
+    static Slider demoSliderRange;
+    static Slider demoSliderMarks;
+    static Slider demoSliderStepMark;
+    static Slider demoSliderVt;
+    static Slider demoSliderVtRev;
+    static Slider demoSliderNoTip;
+    static Slider demoSliderAlways;
+    static Slider demoSliderFmt;
+    static Slider demoSliderDisabled;
+    static InputNumber demoSliderLo;
+    static InputNumber demoSliderHi;
     // Transfer 演示族（保留态：Bind 的就是这些宿主自持的实时列表，
     // 移动按钮直接在列表上增删——和真实宿主用法完全一致）。
     static Transfer<string> demoTransfer;
@@ -672,6 +844,10 @@ class Gallery {
     static int rateHoverPrev;
     static TextArea demoArea;
     static TextArea demoTaCount;
+    static TextArea demoTaRound;
+    static TextArea demoTaOk;
+    static TextArea demoTaWarn;
+    static TextArea demoTaDigits;
     static SelectBox demoSelect;
     static SelectBox demoMulti;
     static SelectBox demoLong;
@@ -691,6 +867,18 @@ class Gallery {
     static List<TreeNode> treeSelNodes;
     // 分组标题 + 禁用项。
     static SelectBox demoGroupPick;
+    // Pagination 演示的保留态实例与整根标签列（BuildPaginationDemos 建
+    // 一次）：sizes 弹层开合、跳页输入框草稿这些状态住在实例字段里，
+    // 每帧 new 会让「弹层打开」活不过下一帧 —— 下拉看起来永远点不开。
+    static Pagination pgDefault;
+    static Pagination pgPill;
+    static Pagination pgSmall;
+    static Pagination pgSimple;
+    static Pagination pgRich;
+    static Pagination pgCounted;
+    static Pagination pgArrowed;
+    static Pagination pgOrdered;
+    static Panel pgPanel;
     // Dropdown 演示（动作菜单定位）：基础用法选中即执行动作，
     // 第二只是 Rows(n) 长命令菜单。
     static Dropdown<string> demoDropdownAct;
@@ -859,6 +1047,13 @@ class Gallery {
     static ScrollView detailView;
     // Content height measured on the previous frame (fed back to the view).
     static SignalInt detailContentH;
+    // 开页预量：详情页第一次渲染（或宽度变了）的那一帧把整页所有演示
+    // 卡都「量而不画」一遍，让每个 LayoutAuto 演示的真实高度在用户滚动
+    // 之前就进缓存。没有这一步，contentH 会随滚动历史阶梯变化 —— 首滚
+    // 到某卡才量出真实高度，滑块位置（offset*travel/mo）当场重标定，
+    // 看起来就是滚轮往下滚、滚动条往回跳。
+    static bool detailMeasured;
+    static int detailMeasureW;
     // Visible detail viewport bounds (set each frame by RenderDetail) so the
     // glass backdrop blur can be clamped to it -- BlurRect ignores the clip
     // rect, so without this a scrolled card would smear pixels above/below.
@@ -963,10 +1158,97 @@ class Gallery {
     static SignalInt bigRowsSel;
     static int bigRowCount;
     static int bigBuildMs;
+    // The two DataTable demos' "Export Excel" buttons: retained (built once),
+    // driving the library's async streaming export. Progress lands in the
+    // status line via GalleryExportProgress (see its note about App.Post).
+    static Button dtExportBtn;
+    static Button bigExportBtn;
+    static List<DataColumn> dtDemoCols;   // last frame's column list — the demo rebuilds it per frame, the export click takes the latest
+    static string dtExportStatus;
+    static string bigExportStatus;
     static DataRow DtRow7(string a, string b, string cc, string d, string e, string f, string g) {
         DataRow r = new DataRow();
         r.Push(a); r.Push(b); r.Push(cc); r.Push(d); r.Push(e); r.Push(f); r.Push(g);
         return r;
+    }
+
+    // ---- The DataTable demos' async Excel export ----
+    // which: 1 = the DataTable demo (list source), 2 = the DataTable 1M demo
+    // (virtual source). The UI guard only stops double clicks; the library's
+    // single-job AtomicInt busy gate stays as the final backstop.
+    static void OnDtExportClick() { Gallery.StartExport(1); }
+    static void OnBigExportClick() { Gallery.StartExport(2); }
+
+    static void StartExport(int which) {
+        if (GalleryExportProgress.running) {
+            Gallery.SetExportStatus(which, Gallery.T("An export is already running.", "已有导出在运行。"));
+            Gallery.app.RequestRedraw();
+            return;
+        }
+        string path;
+        List<DataColumn> cols;
+        DataSource src;
+        DataTableState st;
+        if (which == 1) {
+            if (Gallery.dtDemoCols == null || Gallery.demoRows == null) { return; }
+            path = "datatable_demo.xlsx";
+            cols = Gallery.dtDemoCols;
+            src = new RowListSource(Gallery.demoRows);
+            st = Gallery.demoTableState;
+        } else {
+            if (Gallery.bigCols == null || Gallery.bigSource == null) { return; }
+            path = "datatable_1m_export.xlsx";
+            cols = Gallery.bigCols;
+            src = Gallery.bigSource;
+            st = Gallery.bigTableState;
+        }
+        GalleryExportProgress prog = new GalleryExportProgress();
+        GalleryExportProgress.running = true;
+        GalleryExportProgress.done = 0;
+        GalleryExportProgress.total = 0;
+        GalleryExportProgress.okFlag = false;
+        GalleryExportProgress.message = "";
+        GalleryExportProgress.path = path;
+        GalleryExportProgress.slot = which;
+        if (!DataTable.ExportToXlsxAsync(st, cols, src, path, false, prog)) {
+            // "Nothing to export" returns without a callback; a thread-start
+            // failure does call OnDone and overwrites this status line.
+            GalleryExportProgress.running = false;
+            Gallery.SetExportStatus(which, Gallery.T("Nothing to export.", "没有可导出的内容。"));
+            Gallery.app.RequestRedraw();
+            return;
+        }
+        Gallery.SetExportStatus(which, Gallery.T("Exporting… 0%", "正在导出… 0%"));
+        Gallery.app.RequestRedraw();
+    }
+
+    static void SetExportStatus(int which, string s) {
+        if (which == 1) { Gallery.dtExportStatus = s; }
+        else { Gallery.bigExportStatus = s; }
+    }
+
+    // The two below run on the UI thread via App.Post and only read the
+    // static mirrors on GalleryExportProgress.
+    static void ApplyExportProgress() {
+        int pct = 0;
+        if (GalleryExportProgress.total > 0) {
+            pct = GalleryExportProgress.done * 100 / GalleryExportProgress.total;
+            if (pct > 100) { pct = 100; }
+        }
+        Gallery.SetExportStatus(GalleryExportProgress.slot,
+            Gallery.T("Exporting… ", "正在导出… ") + Convert.ToString(pct) + "%");
+        Gallery.app.RequestRedraw();
+    }
+
+    static void ApplyExportDone() {
+        if (GalleryExportProgress.okFlag) {
+            Gallery.SetExportStatus(GalleryExportProgress.slot,
+                Gallery.T("Exported: ", "已导出：") + GalleryExportProgress.path);
+        } else {
+            Gallery.SetExportStatus(GalleryExportProgress.slot,
+                Gallery.T("Export failed: ", "导出失败：") + GalleryExportProgress.message);
+        }
+        Gallery.app.RequestRedraw();
     }
     /// The Dept column's dropdown list, covering every value in the demo rows so
     /// the strict editor accepts what is already there.
@@ -991,6 +1273,7 @@ class Gallery {
     static Button formOk;
     static SignalBool tipsOn;
     static SignalBool tipClickOn;
+    static SignalBool tipManual;
     static SignalInt scrollOff;
     static SignalInt tipScroll;
     static SignalBool photosOpen;
@@ -1012,6 +1295,10 @@ class Gallery {
     static int apiSelB;
     static bool apiSelDrag;
     static int apiCopiedFrame;
+    // Copy-feedback deadlines (app.nowMs) for the two API-table Copy buttons:
+    // while now < deadline the button shows the green "已复制" state.
+    static int apiPropsCopiedUntilMs;
+    static int apiEventsCopiedUntilMs;
     // Phase counter for the live-updating Chart.dynamic demo (bumped per frame).
     static int dynPhase;
     // Static 96x48 heatmap option for the Chart.performance demo, built once
@@ -1145,6 +1432,7 @@ class Gallery {
         Gallery.model.inputText = "Zan";
         Gallery.model.toggle = true;
         Gallery.model.toggleB = false;
+        Gallery.model.swVal = 20;
         Gallery.model.cbDefault = true;
         Gallery.model.cbPrimary = true;
         Gallery.model.cbSuccess = true;
@@ -1152,6 +1440,14 @@ class Gallery {
         Gallery.model.radioChoice = 0;
         Gallery.model.radioSize = 1;
         Gallery.model.radioLock = 1;
+        Gallery.model.radioAccent = 1;
+        Gallery.radioAccentPrev = 1;
+        Gallery.model.radioBorder = 0;
+        Gallery.model.radioBorder2 = 0;
+        Gallery.model.radioBorder3 = 1;
+        Gallery.model.rgCity = 20;
+        Gallery.rgOptPrev = 20;
+        Gallery.rgBtnPrev = 0;
         Gallery.demoInput = new Input("type here");
         Gallery.demoInput.data = Gallery.model.inputText;
         // 变体输入框：只初始化一次，帧间保持同一 WidgetId。
@@ -1212,12 +1508,66 @@ class Gallery {
         Gallery.demoManual.Clearable = true;
         Gallery.demoManual.SetText("Zan GUI");
         Gallery.manualLog = new Label { Text = "idle", Class = "secondary" };
+        // Input OTP 演示族。SetValue 走与键入相同的过滤/落格路径，
+        // 让卡片开箱即有可见状态。
+        Gallery.demoOtp = new InputOtp();
+        Gallery.demoOtp.SetValue("123456");
+        Gallery.demoOtpMask = new InputOtp();
+        Gallery.demoOtpMask.MaskMode = true;
+        Gallery.demoOtpMask.SetValue("918273");
+        Gallery.demoOtpBlock = new InputOtp();
+        Gallery.demoOtpBlock.Block = true;
+        Gallery.demoOtpRo = new InputOtp();
+        Gallery.demoOtpRo.ReadOnly = true;
+        Gallery.demoOtpRo.SetValue("123456");
+        Gallery.demoOtpDis = new InputOtp();
+        Gallery.demoOtpDis.Disabled = true;
+        Gallery.demoOtpDis.SetValue("123456");
+        Gallery.demoOtpWarn = new InputOtp();
+        Gallery.demoOtpWarn.SetStatus(Control.StatusWarning());
+        Gallery.demoOtpWarn.SetValue("1234");
+        Gallery.demoOtpErr = new InputOtp();
+        Gallery.demoOtpErr.SetStatus(Control.StatusError());
+        Gallery.demoOtpErr.SetValue("12345");
+        Gallery.demoOtpGroup = new InputOtp(6);
+        Gallery.demoOtpGroup.Groups.Add(2);
+        Gallery.demoOtpGroup.Groups.Add(2);
+        Gallery.demoOtpGroup.Groups.Add(2);
+        Gallery.demoOtpGroup.SetValue("654321");
+        Gallery.demoOtpSmall = new InputOtp();
+        Gallery.demoOtpSmall.Size = "small";
+        Gallery.demoOtpSmall.SetValue("123456");
+        Gallery.demoOtpMed = new InputOtp();
+        Gallery.demoOtpMed.SetValue("123456");
+        Gallery.demoOtpLarge = new InputOtp();
+        Gallery.demoOtpLarge.Size = "large";
+        Gallery.demoOtpLarge.SetValue("123456");
+        Gallery.demoOtpForm = new InputOtp(6);
+        Gallery.demoOtpForm.data = Gallery.model.otpCode;
+        Gallery.demoOtpForm.Filter = Input.OnlyDigits;
+        Gallery.otpFormLog = new Label { Text = "", Class = "secondary" };
+        Gallery.demoOtpDigits = new InputOtp(6);
+        Gallery.demoOtpDigits.Filter = Input.OnlyDigits;
+        Gallery.demoOtpLetters = new InputOtp(6);
+        Gallery.demoOtpLetters.Filter = InputOtp.OnlyLetters;
+        // TextArea 增强演示族：一卡一品，字段跨帧保留态。round 与 status
+        // 分家——胶囊圆角叠校验描边只会把两张卡都画糊（textarea.round
+        // 现为固定软圆角，见 base.css）。
         Gallery.demoTaCount = new TextArea("notes with count");
-        Gallery.demoTaCount.Round = true;
         Gallery.demoTaCount.ShowCount = true;
         Gallery.demoTaCount.MaxLen = 100;
-        Gallery.demoTaCount.SetStatus(Control.StatusWarning());
-        Gallery.demoTaCount.SetText("Count / maxlen / status / round / filter work here too.");
+        Gallery.demoTaCount.SetText("The counter under the box ticks with every keystroke.");
+        Gallery.demoTaRound = new TextArea("round textarea");
+        Gallery.demoTaRound.Round = true;
+        Gallery.demoTaRound.SetText("Round softens the corners; a multiline field stays a rounded rect, never a stadium.");
+        Gallery.demoTaOk = new TextArea("looks good");
+        Gallery.demoTaOk.SetStatus(Control.StatusSuccess());
+        Gallery.demoTaWarn = new TextArea("needs a look");
+        Gallery.demoTaWarn.SetStatus(Control.StatusWarning());
+        Gallery.demoTaDigits = new TextArea("digits only");
+        Gallery.demoTaDigits.Filter = Input.OnlyDigits;
+        Gallery.demoTaDigits.ShowCount = true;
+        Gallery.demoTaDigits.MaxLen = 8;
         Gallery.demoDay = new DatePicker();
         Gallery.demoDay.SetText("2026-08-27");
         Gallery.demoWhen = new DatePicker();
@@ -1241,6 +1591,21 @@ class Gallery {
         Gallery.demoMonthRange = new DatePicker();
         Gallery.demoMonthRange.SetExtra("type", "monthrange");
         Gallery.demoMonthRange.SetText("2026-03 ~ 2026-08");
+        // ---- ColorPicker 演示族：保留态 + 各自的模型字段 ------------
+        // 基础卡：默认 rgba 文本格式，与触发条同色开场。
+        Gallery.model.cpBase = 0xFF5B3737;
+        Gallery.demoCp = new ColorPicker(0xFF5B3737);
+        // showAlpha=false：透明度条隐藏、alpha 恒 1、文本回 rgb()/#RRGGBB。
+        Gallery.demoCpNoAlpha = new ColorPicker(0xFF18A058);
+        Gallery.demoCpNoAlpha.SetShowAlpha(false);
+        // modes 锁定 hex：输入行只留 HEX 一组，文本恒 #RRGGBBAA。
+        Gallery.demoCpHex = new ColorPicker(0xFF2080F0);
+        Gallery.demoCpHex.Modes("hex", "", "", "");
+        // 和表单一起使用：data 双向绑定 model.cpForm，Change 报 LIVE STATES。
+        Gallery.cpFormLog = new Label { Text = "", Class = "secondary" };
+        Gallery.demoCpForm = new ColorPicker(0xFFF0A020);
+        Gallery.demoCpForm.data = Gallery.model.cpForm;
+        Gallery.demoCpForm.Change += Gallery.OnCpChange;
         // 全选父项 + 半选（indeterminate）演示组。
         Gallery.demoCbg = new CheckboxGroup();
         Gallery.demoCbg.AddOption("Cheese");
@@ -1404,6 +1769,90 @@ class Gallery {
         Gallery.demoHowhearNote = new Input(Gallery.T("Tell us more", "请具体说明"));
         Gallery.demoHowhearNote.name = "howhearNote";
         Gallery.demoHowhearNote.data = Gallery.model.otherNote;
+        // ---- Switch.settings：设置行（左标题+描述，右开关）----------
+        Gallery.model.setSync = true;
+        Gallery.demoSetSync = new Switch();
+        Gallery.demoSetSync.data = Gallery.model.setSync;
+        Gallery.demoSetCompact = new Switch();
+        Gallery.demoSetCompact.data = Gallery.model.setCompact;
+        Gallery.demoSetPublic = new Switch();
+        Gallery.demoSetPublic.data = Gallery.model.setPublic;
+        Gallery.setPrevCount = 0;
+        // ---- Switch.async：异步保存（拨动后 Loading 半秒再落值）-----
+        Gallery.demoAsyncSw = new Switch();
+        Gallery.demoAsyncSw.data = Gallery.model.asyncOn;
+        // ---- Switch.value：int 绑定轴（开关表达 swVal==10，写回 10/20）--
+        Gallery.demoSwVal = new Switch();
+        Gallery.demoSwVal.value = Gallery.model.swVal;
+        Gallery.demoSwVal.CheckedValue = 10;
+        Gallery.demoSwVal.UncheckedValue = 20;
+        // Watermark.custom：配置面板控件建一次并双向绑到 model.wm*。
+        // InputNumber/Slider 自带取值范围，越界值在控件里就被钳住，
+        // 水印侧不必再防野值。
+        Gallery.model.wmText = "内部资料\nINTERNAL";
+        Gallery.model.wmColor = "0x4D808080";
+        Gallery.model.wmFontPx = 16;
+        Gallery.model.wmWeight = 0;
+        Gallery.model.wmRotate = 0 - 22;
+        Gallery.model.wmLineH = 0;
+        Gallery.model.wmTileW = 0;
+        Gallery.model.wmTileH = 0;
+        Gallery.model.wmGapX = 100;
+        Gallery.model.wmGapY = 100;
+        Gallery.model.wmOffX = 0;
+        Gallery.model.wmOffY = 0;
+        Gallery.model.wmAlign = 0;
+        Gallery.model.wmNoClip = false;
+        Gallery.wmTextInput = new Input("水印文本，\\n 分行");
+        Gallery.wmTextInput.data = Gallery.model.wmText;
+        Gallery.wmColorInput = new Input("0xAARRGGBB / RRGGBB");
+        Gallery.wmColorInput.data = Gallery.model.wmColor;
+        Gallery.wmFontNum = new InputNumber(4, 72);
+        Gallery.wmFontNum.data = Gallery.model.wmFontPx;
+        Gallery.wmWeightSel = SelectBox.FromOptions(
+            new List<string> { Gallery.T("Normal", "正常"),
+                               Gallery.T("Bold", "加粗") }, "");
+        Gallery.wmWeightSel.data = Gallery.model.wmWeight;
+        Gallery.wmRotateSld = new Slider(0 - 90, 90);
+        Gallery.wmRotateSld.data = Gallery.model.wmRotate;
+        Gallery.wmLineHNum = new InputNumber(0, 64);
+        Gallery.wmLineHNum.data = Gallery.model.wmLineH;
+        Gallery.wmTileWNum = new InputNumber(0, 400);
+        Gallery.wmTileWNum.data = Gallery.model.wmTileW;
+        Gallery.wmTileHNum = new InputNumber(0, 240);
+        Gallery.wmTileHNum.data = Gallery.model.wmTileH;
+        Gallery.wmGapXNum = new InputNumber(0, 200);
+        Gallery.wmGapXNum.data = Gallery.model.wmGapX;
+        Gallery.wmGapYNum = new InputNumber(0, 200);
+        Gallery.wmGapYNum.data = Gallery.model.wmGapY;
+        Gallery.wmOffXNum = new InputNumber(0 - 100, 100);
+        Gallery.wmOffXNum.data = Gallery.model.wmOffX;
+        Gallery.wmOffYNum = new InputNumber(0 - 100, 100);
+        Gallery.wmOffYNum.data = Gallery.model.wmOffY;
+        Gallery.wmAlignSel = SelectBox.FromOptions(
+            new List<string> { Gallery.T("Left", "左对齐"),
+                               Gallery.T("Center", "居中"),
+                               Gallery.T("Right", "右对齐") }, "");
+        Gallery.wmAlignSel.data = Gallery.model.wmAlign;
+        Gallery.wmClipSw = new Switch();
+        Gallery.wmClipSw.data = Gallery.model.wmNoClip;
+        Gallery.asyncApplied = false;
+        Gallery.asyncPending = 0;
+        // ---- Radio.cards：三张选项卡的单选钮（只画圆点，文字在卡上）--
+        Gallery.demoPick0 = new Radio(0, "");
+        Gallery.demoPick0.data = Gallery.model.radioPick;
+        Gallery.demoPick1 = new Radio(1, "");
+        Gallery.demoPick1.data = Gallery.model.radioPick;
+        Gallery.demoPick2 = new Radio(2, "");
+        Gallery.demoPick2.data = Gallery.model.radioPick;
+        Gallery.radioPickPrev = 0;
+        // ---- RadioGroup：组容器自持选项排布与选中信号 ----------------
+        Gallery.demoRg = new RadioGroup();
+        Gallery.demoRg.AddOption(Gallery.T("Same-day delivery", "当日达配送"));
+        Gallery.demoRg.AddOption(Gallery.T("Store pickup (flagship)", "门店自提（旗舰店）"));
+        Gallery.demoRg.AddOption(Gallery.T("Courier locker", "快递柜投递"));
+        Gallery.demoRg.AddOption(Gallery.T("Scheduled slot", "预约时段配送"));
+        Gallery.rgPrev = 0;
         // New usage: instance widgets bound to plain model fields via `.data`.
         Gallery.demoCheck = new Checkbox("Checked");
         Gallery.demoCheck.data = Gallery.model.toggle;
@@ -1415,6 +1864,54 @@ class Gallery {
         Gallery.demoRadioB.data = Gallery.model.level;
         Gallery.demoSlider = new Slider(0, 100);
         Gallery.demoSlider.data = Gallery.model.level;
+        // ---- Slider 演示族：范围 / 标记 / 垂直 / 气泡 / 禁用 ----------
+        Gallery.model.sldLo = 30;
+        Gallery.model.sldHi = 70;
+        Gallery.demoSliderRange = new Slider(0, 100);
+        Gallery.demoSliderRange.range = true;
+        Gallery.demoSliderRange.data = Gallery.model.sldLo;
+        Gallery.demoSliderRange.dataHigh = Gallery.model.sldHi;
+        Gallery.demoSliderLo = new InputNumber(0, 100);
+        Gallery.demoSliderLo.data = Gallery.model.sldLo;
+        Gallery.demoSliderHi = new InputNumber(0, 100);
+        Gallery.demoSliderHi.data = Gallery.model.sldHi;
+        Gallery.model.sldMark = 37;
+        Gallery.demoSliderMarks = new Slider(0, 100);
+        Gallery.demoSliderMarks.AddMark(0, "0°C");
+        Gallery.demoSliderMarks.AddMark(20, "20°C");
+        Gallery.demoSliderMarks.AddMark(37, "37°C");
+        Gallery.demoSliderMarks.AddMark(100, "100°C");
+        Gallery.demoSliderMarks.data = Gallery.model.sldMark;
+        Gallery.demoSliderStepMark = new Slider(0, 100);
+        Gallery.demoSliderStepMark.AddMark(0, "0°C");
+        Gallery.demoSliderStepMark.AddMark(20, "20°C");
+        Gallery.demoSliderStepMark.AddMark(37, "37°C");
+        Gallery.demoSliderStepMark.AddMark(100, "100°C");
+        Gallery.demoSliderStepMark.stepMark = true;
+        Gallery.demoSliderStepMark.data = Gallery.model.sldMark;
+        Gallery.demoSliderVt = new Slider(0, 100);
+        Gallery.demoSliderVt.vertical = true;
+        Gallery.demoSliderVt.AddMark(0, "0°C");
+        Gallery.demoSliderVt.AddMark(37, "37°C");
+        Gallery.demoSliderVt.AddMark(100, "100°C");
+        Gallery.demoSliderVt.data = Gallery.model.sldMark;
+        Gallery.demoSliderVtRev = new Slider(0, 100);
+        Gallery.demoSliderVtRev.vertical = true;
+        Gallery.demoSliderVtRev.reverse = true;
+        Gallery.demoSliderVtRev.data = Gallery.model.sldMark;
+        Gallery.model.sldFmt = 50;
+        Gallery.demoSliderNoTip = new Slider(0, 100);
+        Gallery.demoSliderNoTip.tooltip = false;
+        Gallery.demoSliderNoTip.data = Gallery.model.sldFmt;
+        Gallery.demoSliderAlways = new Slider(0, 100);
+        Gallery.demoSliderAlways.showTooltip = true;
+        Gallery.demoSliderAlways.data = Gallery.model.sldFmt;
+        Gallery.demoSliderFmt = new Slider(0, 100);
+        Gallery.demoSliderFmt.tipFormat = "{v}%";
+        Gallery.demoSliderFmt.data = Gallery.model.sldFmt;
+        Gallery.demoSliderDisabled = new Slider(0, 100);
+        Gallery.demoSliderDisabled.SetValue(50);
+        Gallery.demoSliderDisabled.Disabled = true;
         // ---- Transfer 演示族：基础 / 可过滤 / 一大堆数据 / 自定义标签。
         // 两侧列表都是 Gallery 自持的实时列表，Bind 不拷贝——中缝按钮
         // 直接在这两份列表上增删，宿主读回的就是同一对象。
@@ -1459,6 +1956,7 @@ class Gallery {
         Gallery.demoTransferUser.Bind(Gallery.trfUserSrc, Gallery.trfUserTgt);
         Gallery.demoTransferUser.WithLabel(u => u.name + " · " + u.role);
         Gallery.demoTransferUser.WithIcon(u => u.vip ? "star" : "");
+        Gallery.demoTransferUser.WithSearch();
         // ---- InputNumber 演示族：位置 / 前后缀 / 范围 / 分组 / 精度 /
         // 加载 / 验证（Naive UI n-input-number 对齐，全部保留态）。
         Gallery.model.numBasic = 1;
@@ -1936,6 +2434,7 @@ class Gallery {
         Gallery.dlgPrompt = LayerState.Prompt("Rename item", "new name");
         Gallery.tipsOn = new SignalBool(false);
         Gallery.tipClickOn = new SignalBool(false);
+        Gallery.tipManual = new SignalBool(false);
         Gallery.popTipOn = new SignalBool(false);
         Gallery.lastEvent = new Dictionary<string, string>();
         Gallery.eventN = new Dictionary<string, int>();
@@ -1958,6 +2457,8 @@ class Gallery {
         Gallery.apiSelB = 0;
         Gallery.apiSelDrag = false;
         Gallery.apiCopiedFrame = 0;
+        Gallery.apiPropsCopiedUntilMs = 0;
+        Gallery.apiEventsCopiedUntilMs = 0;
         Gallery.designer = new Designer();
         Gallery.designer.Seed(app);
 
@@ -1967,6 +2468,7 @@ class Gallery {
         // 之后建的演示数据要用 Gallery.T，所以必须排在 lang 之后。
         Gallery.BuildSelectDemos();
         Gallery.BuildUploadDemos();
+        Gallery.BuildPaginationDemos(app);
         Gallery.splitVFirst = new SignalInt(app.Scale(150));
         Gallery.splitHFirst = new SignalInt(app.Scale(70));
         Gallery.treeSel = new SignalInt(2);
@@ -2281,12 +2783,12 @@ class Gallery {
                         Gallery.ringIdx = (Gallery.ringIdx + 1) % 50;
                     }
                 }
-            }
                 // 落点不在任何拖放区的文件：出帧后清空，免得滞留到
                 // 下一次 kind 9（兼作 blur）时被某个 Upload 意外认领。
                 if (kind == 9 && app.window.DropPending()) {
                     app.window.TakeDroppedFiles();
                 }
+            }
 
             // Paint the dialog window (if open) and harvest its result.
             Gallery.filePicker.RenderWindow();
@@ -2321,6 +2823,13 @@ class Gallery {
     // Handler registered with `button.Click += ...`. Fires on the UI thread.
     static void OnDemoClick() {
         Gallery.evtClicks = Gallery.evtClicks + 1;
+    }
+
+    // ColorPicker.form 的 Change 处理器：双向绑定已把值写进
+    // model.cpForm，这里只负责把最新文本报到 LIVE STATES 行。
+    static void OnCpChange() {
+        Gallery.cpFormLog.Text = Gallery.T("value = ", "当前值 = ")
+            + Gallery.demoCpForm.Text();
     }
 
     // Click handler registered on the EventHub. Spawns a background worker
@@ -2686,6 +3195,108 @@ class Gallery {
         Gallery.PublishProbes(app);
     }
 
+    // ---- Switch.settings / Radio.cards 的行构造器 -------------------
+    // 面板语义：Panel.Column() 是透明竖排容器，把 style 置 0 即得到
+    // 卡片表面（base.css 的 panel 规则：背景/边框/圆角/内边距）。
+    // 行内的左右推挤用 Flex 的 grow 占位标签（吃掉剩余宽度）。
+
+    /// 一行设置：卡片上放「左标题+描述、右开关」。卡片与行每帧重建
+    /// 没关系——里面唯一的交互控件是调用方传入的保留态开关。
+    // ---- Watermark.custom 的两个小助手 ------------------------------
+
+    /// 配置格：小标签在上、控件在下（antd 配置面板的样式）。`w` 定住
+    /// 控件宽——各控件的测量宽参差（Input 220 / InputNumber 140 /
+    /// SelectBox 200），不定宽两列就齐不了。
+    static Panel WmCell(App app, string label, Control ctl, int w) {
+        if (w > 0) { ctl.Prefer(app.Scale(w), 0); }
+        Panel cell = Panel.Column().Gap(app.Scale(4));
+        cell.With(new Label { Text = label, Class = "caption" });
+        cell.With(ctl);
+        return cell;
+    }
+
+    /// 颜色文本 -> 0xAARRGGBB。接受 `0x`/`#` 前缀的 AARRGGBB 或
+    /// RRGGBB（alpha 缺省 0x4D ≈ 30%）；见到认不出的字符即整体失败
+    /// 返回 0 = 交给 CSS `color`，再退内置淡黑——与控件 `Color = 0`
+    /// 的语义一致，所以清空颜色框就是「回到默认」。
+    static int WmColorParse(string s) {
+        string t = s.Trim().ToLower();
+        if (t.StartsWith("0x")) { t = t.Substring(2, t.Length - 2); }
+        else if (t.StartsWith("#")) { t = t.Substring(1, t.Length - 1); }
+        if (t.Length != 6 && t.Length != 8) { return 0; }
+        int v = 0;
+        for (int i = 0; i < t.Length; i = i + 1) {
+            int d = "0123456789abcdef".IndexOf(t.Substring(i, 1));
+            if (d < 0) { return 0; }
+            v = v * 16 + d;
+        }
+        if (t.Length == 6) { v = v + 0x4D000000; }
+        return v;
+    }
+
+    static Panel SettingsRow(App app, string title, string desc, Switch sw) {
+        Panel left = Panel.Column().Gap(app.Scale(2));
+        left.With(new Label { Text = title });
+        left.With(new Label { Text = desc, Class = "hint" });
+        Flex row = Flex.Wrapped().Gap(app.Scale(12));
+        row.With(left);
+        Label sp = new Label { Text = "" };
+        sp.Class = "grow";
+        row.With(sp);
+        row.With(sw);
+        Panel card = Panel.Column();
+        card.style = 0;
+        card.With(row);
+        return card;
+    }
+
+    /// 一张选项卡：单选钮 + 标题/描述。选中时用主题高亮色内联填充
+    /// （Plain() 优先于样式表，不必为演示加皮肤规则），标题换 primary。
+    static Panel PickCard(App app, Radio r, string title, string desc,
+                          bool picked) {
+        Panel left = Panel.Column().Gap(app.Scale(2));
+        Label tl = new Label { Text = title };
+        if (picked) { tl.Class = "primary"; }
+        left.With(tl);
+        left.With(new Label { Text = desc, Class = "hint" });
+        Flex row = Flex.Wrapped().Gap(app.Scale(12));
+        row.With(r);
+        row.With(left);
+        Panel card = Panel.Column();
+        if (picked) {
+            card.Plain(app.theme.bgActive);
+        } else {
+            card.style = 0;
+        }
+        card.With(row);
+        return card;
+    }
+
+    /// Radio.cards 的整卡命中层：布局之后调用，`card` 的矩形已定。
+    /// Ui.Activate 把整张卡注册成命中区域（几何点击 + 聚焦后的键盘
+    /// 激活都算换选）；选中的卡描主题强调色实边，未选中的卡悬停时
+    /// 淡入同色细边。id 来自调用方每帧 WidgetId.Next()，行序固定
+    /// 所以帧间稳定。
+    static void PickCardHit(App app, int id, Panel card, int idx,
+                            int accent, int radius) {
+        if (card.bw <= 0 || card.bh <= 0) { return; }
+        bool picked = Gallery.model.radioPick == idx;
+        if (Ui.Activate(app, id, card.bx, card.by, card.bw, card.bh)
+            && !picked) {
+            Gallery.model.radioPick = idx;
+            app.RequestRedraw();
+        }
+        int hv = picked ? 1000
+                        : Ui.HoverLevelMsIn(app, id, 0, card.bx, card.by,
+                                            card.bw, card.bh);
+        if (hv > 0) {
+            int alpha = picked ? 255 : App.Lerp(0, 80, hv);
+            app.canvas.DrawRoundRect(card.bx, card.by, card.bw, card.bh,
+                                     radius, App.WithAlpha(accent, alpha),
+                                     app.Scale(picked ? 2 : 1));
+        }
+    }
+
     /// 自动化驱动会话中每帧推送模型探针（ZAN_UI_SCRIPT 的
     /// `assert probe` 用它拿到与渲染同步的真值，不依赖截图）。
     /// 驱动未活动时整段跳过，正常运行的画廊零开销。
@@ -2719,6 +3330,8 @@ class Gallery {
         UiDriver.SetProbe("click.delivered",
             Gallery.drvClickDelivered ? "true" : "false");
         UiDriver.SetProbe("click.relSeq", Convert.ToString(evSeq));
+        UiDriver.SetProbe("pager.pageSize",
+            Gallery.pgRich == null ? "?" : Convert.ToString(Gallery.pgRich.PageSize()));
         UiDriver.SetProbe("lang", Convert.ToString(Gallery.lang.Get()));
         UiDriver.SetProbe("form.errCount",
             Convert.ToString(Gallery.demoSignup.ErrorCount()));
@@ -2738,6 +3351,21 @@ class Gallery {
             Convert.ToString(Gallery.model.howhear));
         UiDriver.SetProbe("radio.noteDisabled",
             Gallery.demoHowhearNote.IsDisabled() ? "true" : "false");
+        UiDriver.SetProbe("switch.setN", Convert.ToString(
+            (Gallery.model.setSync ? 1 : 0) + (Gallery.model.setCompact ? 1 : 0)
+                + (Gallery.model.setPublic ? 1 : 0)));
+        UiDriver.SetProbe("switch.asyncLoading",
+            Gallery.asyncPending > 0 ? "true" : "false");
+        UiDriver.SetProbe("switch.asyncOn",
+            Gallery.model.asyncOn ? "true" : "false");
+        UiDriver.SetProbe("radio.pick",
+            Convert.ToString(Gallery.model.radioPick));
+        UiDriver.SetProbe("rg.sel",
+            Convert.ToString(Gallery.demoRg.Selected().Get()));
+        // 上一帧被 try/catch 吞掉的帧异常（空串 = 无）。页面整页
+        // 画不出来时第一件事就是看它，不用再靠减法猜谁在抛。
+        UiDriver.SetProbe("frame.err",
+            Gallery.app != null ? Gallery.app.LastFrameError() : "");
     }
 
     /// Left navigation: category headers interleaved with clickable component
@@ -2841,6 +3469,8 @@ class Gallery {
                         Gallery.selected.Set(row.compIndex);
                         Gallery.codeScroll.Set(0);
                         Gallery.detailView.ScrollTo(0);
+                        // 换页：已量高度全部作废，下一帧整页重新预量。
+                        Gallery.detailMeasured = false;
                         Gallery.selHas = false;
                         Gallery.selDrag = false;
                         Gallery.apiSelKind = 0;
@@ -2970,16 +3600,22 @@ class Gallery {
         List<int> ovX = new List<int>();
         List<int> ovY = new List<int>();
         List<int> ovW = new List<int>();
+        // 开页预量（见 detailMeasured 注释）：本帧把还没量过高度的演示卡
+        // 「量而不画」跑一遍 —— 只走 RenderPreview 里的测量/记录，装饰和
+        // 代码面板照常被视口裁剪。此后 contentH 不再依赖滚动历史。
+        bool measureAll = !Gallery.detailMeasured
+            || Gallery.detailMeasureW != cw;
         for (int dj = 0; dj < demos.Count; dj = dj + 1) {
             Demo d = demos[dj];
             d.EnsureCache(app, t, cw, d.tab);
             int cardTop = yy;
             int cardBottom = cardTop + Gallery.DemoCardHeight(app, t, d, cw);
+            bool vis = cardBottom >= contentTop && cardTop <= viewBottom;
             // Viewport culling: a card fully above/below the visible area still
             // costs one GDI text render + alpha blend per DrawText if drawn, so
             // skip its draws entirely and just advance past it. This keeps
             // scrolling cheap regardless of how many cards the page has.
-            if (cardBottom >= contentTop && cardTop <= viewBottom) {
+            if (vis) {
                 c.DrawText(cx, yy, d.title, t.textPrimary, t.fontSizeMedium);
                 yy = yy + app.Scale(22);
                 if (d.desc != "") {
@@ -2994,8 +3630,8 @@ class Gallery {
                 }
                 yy = yy + app.Scale(10);
                 int pvY = yy;
-                Gallery.RenderPreview(app, c, t, d.previewId, cx, pvY, cw,
-                    d.previewH);
+                Gallery.RenderPreviewEx(app, c, t, d.previewId, cx, pvY, cw,
+                    d.previewH, false);
                 if (Gallery.IsOverlayComp(d.previewId)) {
                     ovName.Add(d.previewId);
                     ovX.Add(cx); ovY.Add(pvY); ovW.Add(cw);
@@ -3003,9 +3639,19 @@ class Gallery {
                 yy = yy + Gallery.PreviewBoxH(app, d.previewId, d.previewH, cw)
                     + app.Scale(12);
                 Gallery.RenderCardCode(app, c, t, d, cx, yy, cw, d.tab);
+            } else if (measureAll
+                       && Gallery.AutoContentH(d.previewId, cw) == 0) {
+                // 量而不画：框高 y 取卡顶即可，LayoutAuto/RecordBottom 记的
+                // 都是「内容底边相对框顶」的距离，与框在屏上的位置无关。
+                // 弹层类演示（IsOverlayComp）不在此列：它们的高度由种子
+                // 决定、从不回写，没有随滚动漂移的问题。
+                Gallery.RenderPreviewEx(app, c, t, d.previewId, cx, cardTop,
+                    cw, d.previewH, true);
             }
             yy = cardBottom;
         }
+        Gallery.detailMeasured = true;
+        Gallery.detailMeasureW = cw;
 
         int propsH = Gallery.TableH(app, t, e.props);
         if (propsH > 0 && yy + propsH >= contentTop && yy <= viewBottom) {
@@ -3103,10 +3749,17 @@ class Gallery {
         c.DrawText(cx, yy, title, t.textPrimary, t.fontSizeMedium);
 
         // Copy button on the title row (right-aligned) — a real Button, one
-        // retained instance per table kind so both tables keep their own state.
+        // retained instance per table kind so both tables keep their own state
+        // (and each table shows its own copy-success feedback).
         Button cpBtn = Gallery.apiCopyProps;
         if (!isProps) { cpBtn = Gallery.apiCopyEvents; }
-        cpBtn.Text = Gallery.T("Copy", "复制");
+        int copiedUntil = Gallery.apiPropsCopiedUntilMs;
+        if (!isProps) { copiedUntil = Gallery.apiEventsCopiedUntilMs; }
+        bool copied = app.nowMs < copiedUntil;
+        cpBtn.Text = copied ? Gallery.T("Copied", "已复制")
+                            : Gallery.T("Copy", "复制");
+        cpBtn.Icon = copied ? "check" : "copy";
+        cpBtn.Class = copied ? "success small" : "secondary small";
         int cpH = app.Scale(20);
         cpBtn.MeasureTree(app);
         int cpW = cpBtn.prefW;
@@ -3116,9 +3769,6 @@ class Gallery {
         int cpY = yy - app.Scale(2);
         cpBtn.Arrange(cpX, cpY, cpW, cpH);
         cpBtn.RenderTree(app);
-        bool cpHot = !app.PointerCaptured()
-            && app.mouseX >= cpX && app.mouseX < cpX + cpW
-            && app.mouseY >= cpY && app.mouseY < cpY + cpH;
 
         yy = yy + app.Scale(30);
         int nameX = cx + app.Scale(6);
@@ -3203,8 +3853,9 @@ class Gallery {
             yy = yy + rowH;
         }
 
-        // Copy: selected rows for this table, else the whole table.
-        if (app.window.EventKind() == 3 && cpHot) {
+        // Copy: selected rows for this table, else the whole table. Clicked
+        // through the button's own event semantics, not a raw rect check.
+        if (cpBtn.WasClicked()) {
             int from = 0;
             int to = rows.Count - 1;
             if (hasSel) { from = selLo; to = selHi; }
@@ -3215,9 +3866,21 @@ class Gallery {
                 outp = outp + Gallery.ApiRowText(rows[k], isProps);
                 k = k + 1;
             }
-            Clipboard.SetText(outp);
-            Gallery.apiCopiedFrame = 8;
-            app.RequestRedraw();
+            // Feedback only when the copy actually took (see RenderCardCode).
+            if (Clipboard.SetText(outp)) {
+                if (isProps) { Gallery.apiPropsCopiedUntilMs = app.nowMs + 1200; }
+                else { Gallery.apiEventsCopiedUntilMs = app.nowMs + 1200; }
+                app.RequestRedraw();
+            }
+        }
+        int sustainUntil = Gallery.apiPropsCopiedUntilMs;
+        if (!isProps) { sustainUntil = Gallery.apiEventsCopiedUntilMs; }
+        if (app.nowMs < sustainUntil) {
+            // Sustain repaints while the feedback shows so the label reverts
+            // on time with no input. Re-reads the deadline: on the copy frame
+            // itself the click handler above has just moved it forward, and
+            // this timer chain is what unwinds it later.
+            app.RequestAnimationFrameIn(32, cpX, cpY, cpW, cpH);
         }
 
         return yy + app.Scale(16);
@@ -3263,7 +3926,15 @@ class Gallery {
         }
 
         // Copy is a real Button control (retained on the card), laid out in the
-        // panel header instead of a hand-drawn pill.
+        // panel header instead of a hand-drawn pill. Clicks go through the
+        // button's own event path (WasClicked), so a press that starts on some
+        // other control can never trigger a copy here, and a completed copy
+        // flips the button into a green "已复制" state for a moment.
+        bool copied = app.nowMs < d.copiedUntilMs;
+        d.copyBtn.Text = copied ? Gallery.T("Copied", "已复制")
+                                : Gallery.T("Copy", "复制");
+        d.copyBtn.Icon = copied ? "check" : "copy";
+        d.copyBtn.Class = copied ? "success small" : "primary small";
         int cpH = app.Scale(20);
         d.copyBtn.MeasureTree(app);
         int cpW = d.copyBtn.prefW;
@@ -3273,17 +3944,26 @@ class Gallery {
         int cpY = cy + (hdrH - cpH) / 2;
         d.copyBtn.Arrange(cpX, cpY, cpW, cpH);
         d.copyBtn.RenderTree(app);
-        bool cpHot = !app.PointerCaptured()
-            && app.mouseX >= cpX && app.mouseX < cpX + cpW
-            && app.mouseY >= cpY && app.mouseY < cpY + cpH;
         // This code box owns the selection only if its uid+tab match.
         bool selMine = Gallery.selOwner == d.uid && Gallery.selTab == tab;
-        if (app.window.EventKind() == 3 && cpHot) {
-            // Copy the current selection when there is one, else the whole snippet.
+        if (d.copyBtn.WasClicked()) {
+            // Copy the current selection when there is one, else the whole
+            // snippet. Feedback only when the copy actually took: a failed
+            // SetText (clipboard momentarily held by another process) keeps
+            // the button in its normal "Copy" state.
             string toCopy = src;
             if (selMine && Gallery.SelNonEmpty()) { toCopy = Gallery.SelectedText(displayLines); }
-            Clipboard.SetText(toCopy);
-            app.RequestRedraw();
+            if (Clipboard.SetText(toCopy)) {
+                d.copiedUntilMs = app.nowMs + 1200;
+                app.RequestRedraw();
+            }
+        }
+        if (app.nowMs < d.copiedUntilMs) {
+            // Keep repaints coming while the feedback shows, so the label
+            // reverts on time even with no input. (Checked after the click
+            // handler: on the copy frame itself the deadline was only just
+            // set, and this timer chain is what unwinds it later.)
+            app.RequestAnimationFrameIn(32, cpX, cpY, cpW, cpH);
         }
 
         // Drag to select text in the code body: press sets the anchor, moving
@@ -3487,7 +4167,7 @@ class Gallery {
         if (name == "Label") { return 195; }
         if (name == "Events") { return 175; }
         if (name == "Checkbox") { return 175; }
-        if (name == "Radio") { return 235; }
+        if (name == "Radio") { return 270; }
         if (name == "Statistic") { return 130; }
         if (name == "Countdown") { return 110; }
         if (name == "Countdown.controls") { return 130; }
@@ -3512,6 +4192,18 @@ class Gallery {
         if (name == "Switch.states") { return 110; }
         if (name == "Switch.master") { return 140; }
         if (name == "Radio.dependent") { return 130; }
+        if (name == "Radio.bordered") { return 160; }
+        if (name == "RadioGroup.options") { return 120; }
+        if (name == "RadioGroup.buttons") { return 190; }
+        if (name == "Switch.settings") { return 230; }
+        if (name == "Switch.async") { return 120; }
+        if (name == "Switch.content") { return 150; }
+        if (name == "Switch.value") { return 110; }
+        if (name == "Radio.cards") { return 230; }
+        if (name == "RadioGroup") { return 150; }
+        // Rate 的各演示卡高度走 AddDemo 的 previewH 种子 + LayoutAuto
+        // 自测量，PreviewHeight 这张表只喂 EffectiveDemos 的合成卡，
+        // 这里不需要条目。
         if (name == "Empty") { return 175; }
         if (name == "Button") { return 470; }
         if (name == "Icon") { return 360; }
@@ -3541,8 +4233,8 @@ class Gallery {
         if (name == "Menu.render") { return 260; }
         if (name == "Menu.expand") { return 460; }
         if (name == "Steps") { return 820; }
-        if (name == "Tooltip") { return 440; }
-        if (name == "Pagination") { return 360; }
+        if (name == "Tooltip") { return 640; }
+        if (name == "Pagination") { return 740; }
         if (name == "Scrollbar") { return 180; }
         if (name == "FloatButton") { return 300; }
         if (name == "FilePicker") { return 215; }
@@ -3583,6 +4275,16 @@ class Gallery {
             int gcols = (w - app.Scale(24)) / cell;
             if (gcols < 1) { gcols = 1; }
             int n = Icon.Names().Count;
+            int rows = (n + gcols - 1) / gcols;
+            if (rows < 1) { rows = 1; }
+            return app.Scale(34) + rows * cell + app.Scale(12);
+        }
+        if (name == "IconSvg.catalog") {
+            int cell = app.Scale(62);
+            int gcols = (w - app.Scale(24)) / cell;
+            if (gcols < 1) { gcols = 1; }
+            int n = IconSvg.Count();
+            if (n > 120) { n = 120; }
             int rows = (n + gcols - 1) / gcols;
             if (rows < 1) { rows = 1; }
             return app.Scale(34) + rows * cell + app.Scale(12);
@@ -3775,6 +4477,57 @@ class Gallery {
         Gallery.demoGroupPick.AddGroup("Legacy");
         Gallery.demoGroupPick.AddOption("Pascal", true);
         Gallery.demoGroupPick.AddOption("COBOL", true);
+    }
+
+    /// Pagination 演示的八个保留态实例 + 整根标签列。只建一次；每帧
+    /// 重渲染这棵树即可。必须排在 lang 就绪之后（Prefix/Suffix 用了
+    /// Gallery.T），且 model 已存在（Page 双向绑定）。
+    static void BuildPaginationDemos(App app) {
+        Gallery.pgDefault = new Pagination(12);
+        Gallery.pgDefault.Page = Gallery.model.pick;
+        Gallery.pgPill = new Pagination(12);
+        Gallery.pgPill.Page = Gallery.model.pick;
+        Gallery.pgPill.Class = "pill";
+        Gallery.pgSmall = new Pagination(12);
+        Gallery.pgSmall.Page = Gallery.model.pick;
+        Gallery.pgSmall.Class = "small";
+        Gallery.pgSimple = new Pagination(12);
+        Gallery.pgSimple.Page = Gallery.model.pick;
+        Gallery.pgSimple.Class = "simple";
+        Gallery.pgRich = new Pagination(100);
+        Gallery.pgRich.Page = Gallery.model.pagJump;
+        Gallery.pgRich.Jumper(true).ShowSizes(true).ShowTotal(true);
+        Gallery.pgRich.Prefix(Gallery.T("Items", "条目"));
+        Gallery.pgRich.Suffix(Gallery.T("end", "完"));
+        Gallery.pgCounted = Pagination.WithCount(205, 20,
+                                                  Gallery.model.pagJump);
+        Gallery.pgCounted.ShowSizes(true);
+        Gallery.pgArrowed = new Pagination(101);
+        Gallery.pgArrowed.Page = Gallery.model.pagJump;
+        Gallery.pgArrowed.PrevText(Gallery.T("Back", "往回走"));
+        Gallery.pgArrowed.NextText(Gallery.T("Onward", "继续走"));
+        Gallery.pgOrdered = new Pagination(100);
+        Gallery.pgOrdered.Page = Gallery.model.pagJump;
+        Gallery.pgOrdered.Jumper(true).ShowSizes(true);
+        Gallery.pgOrdered.SetOrderText("jumper, sizes, pager");
+        Panel col = Panel.Column().Gap(app.Scale(10));
+        col.With(new Label { Text = "Default · windowed with ellipses", Class = "secondary" });
+        col.With(Gallery.pgDefault);
+        col.With(new Label { Text = "Pill · rounded buttons", Class = "secondary" });
+        col.With(Gallery.pgPill);
+        col.With(new Label { Text = "Small · compact size", Class = "secondary" });
+        col.With(Gallery.pgSmall);
+        col.With(new Label { Text = "Simple · editable current page (Enter)", Class = "secondary" });
+        col.With(Gallery.pgSimple);
+        col.With(new Label { Text = "100 pages · total + jumper + page sizes + prefix/suffix · ellipsis jumps ±5", Class = "secondary" });
+        col.With(Gallery.pgRich);
+        col.With(new Label { Text = "Item-count mode · 205 items at 20/page derives 11 pages", Class = "secondary" });
+        col.With(Gallery.pgCounted);
+        col.With(new Label { Text = "Custom prev/next labels", Class = "secondary" });
+        col.With(Gallery.pgArrowed);
+        col.With(new Label { Text = "Custom order: jumper, sizes, pager", Class = "secondary" });
+        col.With(Gallery.pgOrdered);
+        Gallery.pgPanel = col;
     }
 
     /// Upload 演示组（对齐 Naive UI 上传文档的卡片集）。传输三件套
@@ -4162,6 +4915,44 @@ class Gallery {
         return "";
     }
 
+    /// echarts@4.9 官方 china.json（assets/，构建 --embed 烤进 exe）经
+    /// ChartGeoJson 运行时解码；值按省名确定性散列到 10..800（map1
+    /// 参考站的销量本就是虚构数）。
+    static List<ChartMapRegion> chinaRegions;
+    static List<ChartMapRegion> ChinaRegions() {
+        if (Gallery.chinaRegions != null) { return Gallery.chinaRegions; }
+        List<ChartMapRegion> rs = ChartGeoJson.ParseText(Gallery.DataText("china.json"));
+        for (int i = 0; i < rs.Count; i = i + 1) {
+            rs[i].value = 10 + Gallery.NameValue(rs[i].name) % 791;
+        }
+        Gallery.chinaRegions = rs;
+        return rs;
+    }
+
+    /// 读 assets/<name>：先盘上（gallery 惯例的三级候选路径），没有再
+    /// 查 --embed 内嵌副本。都没有返回空串（demo 呈现空地图而非崩溃）。
+    static string DataText(string name) {
+        List<string> candidates = new List<string>{
+            "examples/gui_gallery/assets/" + name,
+            "../examples/gui_gallery/assets/" + name,
+            "assets/" + name };
+        for (int i = 0; i < candidates.Count; i = i + 1) {
+            if (File.Exists(candidates[i]) || File.EmbedExists(candidates[i])) {
+                return File.ReadAllText(candidates[i]);
+            }
+        }
+        return "";
+    }
+
+    /// 字符串 → 确定性散列（与 gui_charts 的 Charts.NameValue 同源）。
+    static int NameValue(string name) {
+        int h = 7;
+        for (int i = 0; i < name.Length; i = i + 1) {
+            h = (h * 31 + (name[i] & 255)) % 2147483647;
+        }
+        return h;
+    }
+
     /// 四张示例照片里实际存在的那些（缺资产的跳过）。
     static List<string> PhotoSet() {
         List<string> all = new List<string>{
@@ -4506,43 +5297,55 @@ class Gallery {
         return root;
     }
 
+    /// measureOnly=false 的常规入口：画框、跑演示、量高度一步到位。
     static int RenderPreview(App app, Canvas c, Theme t, string name,
             int x, int y, int w, int previewHUnscaled) {
+        return Gallery.RenderPreviewEx(app, c, t, name, x, y, w,
+            previewHUnscaled, false);
+    }
+
+    /// measureOnly：开页预量专用 —— 跳过框体/玻璃模糊/LIVE STATES 等纯
+    /// 装饰（玻璃模糊不理裁剪区，画到视口外的卡上会把糊块抹进页眉），
+    /// 只跑演示分支里的测量与记录。视口裁剪仍然兜底，看不见任何像素。
+    static int RenderPreviewEx(App app, Canvas c, Theme t, string name,
+            int x, int y, int w, int previewHUnscaled, bool measureOnly) {
         // 把这一段的耗时和「凭什么整窗重绘」都记到演示名下（ZAN_FRAME_PROF
         // 关着时是空操作）。整窗帧比损伤帧贵十几倍，出问题时得能指名道姓
         // 地问是哪个演示要的。
         app.PerfMark(name);
         Gallery.demoBtns.Clear();
         int h = Gallery.PreviewBoxH(app, name, previewHUnscaled, w);
-        if (t.glass != 0) {
-            // Real frosted glass: blur the wallpaper behind the box (clamped to
-            // the scroll viewport so it never smears the fixed header), then a
-            // light translucent tint + white frost veil + top sheen + rim.
-            int by = y;
-            int bh = h;
-            if (by < Gallery.detailClipTop) {
-                bh = bh - (Gallery.detailClipTop - by);
-                by = Gallery.detailClipTop;
+        if (!measureOnly) {
+            if (t.glass != 0) {
+                // Real frosted glass: blur the wallpaper behind the box (clamped to
+                // the scroll viewport so it never smears the fixed header), then a
+                // light translucent tint + white frost veil + top sheen + rim.
+                int by = y;
+                int bh = h;
+                if (by < Gallery.detailClipTop) {
+                    bh = bh - (Gallery.detailClipTop - by);
+                    by = Gallery.detailClipTop;
+                }
+                if (by + bh > Gallery.detailClipBottom) {
+                    bh = Gallery.detailClipBottom - by;
+                }
+                if (bh > 0) {
+                    c.BlurRectCached(x, by, w, bh, app.Scale(22),
+                        app.NextBlurSlot(), app.BackdropDirty());
+                }
+                c.FillRoundRect(x, y, w, h, app.Scale(6), Style.Fade(t.bgSecondary, 300));
+                c.FillRoundRect(x, y, w, h, app.Scale(6), Style.Fade(t.textPrimary, 40));
+                c.FillRoundRect(x, y, w, app.Scale(2), app.Scale(6),
+                                Style.Fade(t.textPrimary, 140));
+                c.DrawRect(x, y, w, h, Style.Fade(t.textPrimary, 85), 1);
+            } else {
+                c.FillRoundRect(x, y, w, h, app.Scale(6), t.bgSecondary);
+                c.DrawRect(x, y, w, h, t.borderPrimary, 1);
             }
-            if (by + bh > Gallery.detailClipBottom) {
-                bh = Gallery.detailClipBottom - by;
-            }
-            if (bh > 0) {
-                c.BlurRectCached(x, by, w, bh, app.Scale(22),
-                    app.NextBlurSlot(), app.BackdropDirty());
-            }
-            c.FillRoundRect(x, y, w, h, app.Scale(6), Style.Fade(t.bgSecondary, 300));
-            c.FillRoundRect(x, y, w, h, app.Scale(6), Style.Fade(t.textPrimary, 40));
-            c.FillRoundRect(x, y, w, app.Scale(2), app.Scale(6),
-                            Style.Fade(t.textPrimary, 140));
-            c.DrawRect(x, y, w, h, Style.Fade(t.textPrimary, 85), 1);
-        } else {
-            c.FillRoundRect(x, y, w, h, app.Scale(6), t.bgSecondary);
-            c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+            c.DrawText(x + app.Scale(12), y + app.Scale(9), "LIVE STATES",
+                t.textTertiary, t.fontSizeSmall);
+            Gallery.DrawLastEvent(app, c, t, name, x, y, w);
         }
-        c.DrawText(x + app.Scale(12), y + app.Scale(9), "LIVE STATES",
-            t.textTertiary, t.fontSizeSmall);
-        Gallery.DrawLastEvent(app, c, t, name, x, y, w);
         // 实测高度的两个基准（框顶、卡片宽度）在这里就位，好让延迟到
         // 覆盖通道去画的演示也能报自己的高度。
         Gallery.previewBoxTop = y;
@@ -4552,7 +5355,7 @@ class Gallery {
         if (Gallery.IsOverlayComp(name)) {
             // 自检也要覆盖它们：这一路提前返回，否则弹层类演示在
             // gallery_audit.log 里整批缺席，看起来像「没这几个演示」。
-            Gallery.Audit(app, name, x, y, w, h, true);
+            if (!measureOnly) { Gallery.Audit(app, name, x, y, w, h, true); }
             return h;
         }
         // Clip every base demo to the preview box so nothing bleeds into the
@@ -4686,6 +5489,135 @@ class Gallery {
                     "copied  c.DrawGlyph(\"" + Gallery.copiedIcon + "\", ...)",
                     t.success, t.fontSizeSmall);
             }
+        } else if (name == "IconSvg") {
+            // 组件嵌套的用法：IconView 控件放进 Flex/Panel 树，交给
+            // 布局测量排列，而不是逐个手绘定位。三排样本——常用图标、
+            // 尺寸阶梯、语义色与窗口铬件形；卡片高度由 LayoutAuto 量
+            // 出来跟着长。完整清单见 IconSvg.Names()（997 个）。
+            Panel col = Panel.Column().Gap(app.Scale(14));
+            Flex common = Flex.Wrapped().Gap(app.Scale(14));
+            common.With(new IconView { Name = "home", Box = 22 });
+            common.With(new IconView { Name = "search", Box = 22 });
+            common.With(new IconView { Name = "settings", Box = 22 });
+            common.With(new IconView { Name = "user", Box = 22 });
+            common.With(new IconView { Name = "folder", Box = 22 });
+            common.With(new IconView { Name = "save", Box = 22 });
+            common.With(new IconView { Name = "edit", Box = 22 });
+            common.With(new IconView { Name = "trash", Box = 22 });
+            common.With(new IconView { Name = "copy", Box = 22 });
+            common.With(new IconView { Name = "cut", Box = 22 });
+            common.With(new IconView { Name = "clipboard", Box = 22 });
+            common.With(new IconView { Name = "download", Box = 22 });
+            common.With(new IconView { Name = "upload", Box = 22 });
+            common.With(new IconView { Name = "refresh", Box = 22 });
+            common.With(new IconView { Name = "plus", Box = 22 });
+            common.With(new IconView { Name = "close", Box = 22 });
+            common.With(new IconView { Name = "check", Box = 22 });
+            common.With(new IconView { Name = "warning", Box = 22 });
+            common.With(new IconView { Name = "info", Box = 22 });
+            common.With(new IconView { Name = "star", Box = 22 });
+            common.With(new IconView { Name = "heart", Box = 22 });
+            common.With(new IconView { Name = "lock", Box = 22 });
+            common.With(new IconView { Name = "pin", Box = 22 });
+            common.With(new IconView { Name = "eye", Box = 22 });
+            common.With(new IconView { Name = "bell", Box = 22 });
+            common.With(new IconView { Name = "mail", Box = 22 });
+            common.With(new IconView { Name = "calendar", Box = 22 });
+            common.With(new IconView { Name = "clock", Box = 22 });
+            col.With(common);
+            col.With(new Label {
+                Text = "sizes 16/24/32/48/64 · alpha 50%",
+                Class = "hint" });
+            Flex sizes = Flex.Row().Gap(app.Scale(22));
+            sizes.With(new IconView { Name = "settings", Box = 16 });
+            sizes.With(new IconView { Name = "settings", Box = 24 });
+            sizes.With(new IconView { Name = "settings", Box = 32 });
+            sizes.With(new IconView { Name = "settings", Box = 48 });
+            sizes.With(new IconView { Name = "settings", Box = 64 });
+            sizes.With(new IconView { Name = "heart", Box = 48,
+                Color = Style.Fade(t.primary, 500) });
+            col.With(sizes);
+            Flex roles = Flex.Wrapped().Gap(app.Scale(14));
+            roles.With(new IconView { Name = "circle-check", Box = 24,
+                Color = t.success });
+            roles.With(new IconView { Name = "circle-x", Box = 24,
+                Color = t.error });
+            roles.With(new IconView { Name = "alert-triangle", Box = 24,
+                Color = t.warning });
+            roles.With(new IconView { Name = "info-circle", Box = 24,
+                Color = t.info });
+            roles.With(new IconView { Name = "star-filled", Box = 24,
+                Color = t.warning });
+            roles.With(new IconView { Name = "window-minimize", Box = 24 });
+            roles.With(new IconView { Name = "window-maximize", Box = 24 });
+            roles.With(new IconView { Name = "lock-open", Box = 24,
+                Color = t.success });
+            col.With(roles);
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(16),
+                w - app.Scale(36), app.Scale(240));
+        } else if (name == "IconSvg.software") {
+            // 软件/窗口铬件专用的一批：窗口框架、最小化/最大化/还原、
+            // 折叠展开、图钉、锁、电源、密钥。标题栏、对话框、托盘
+            // 菜单都从这一批取形；每格是 IconView + Label 的组件嵌套。
+            List<string> soft = new List<string>{
+                "window", "app-window", "window-minimize", "window-maximize",
+                "minimize", "maximize", "restore", "picture-in-picture",
+                "arrows-minimize", "arrows-maximize",
+                "layout-navbar-collapse", "fold", "fold-up", "fold-down",
+                "pinned", "pinned-off", "pin", "lock", "lock-open",
+                "power", "key", "square-key", "shield-lock", "eye-off" };
+            Flex batch = Flex.Wrapped().Gap(app.Scale(18));
+            for (int si = 0; si < soft.Count; si = si + 1) {
+                Flex cell = Flex.Column().Gap(app.Scale(6));
+                cell.With(new IconView { Name = soft[si], Box = 28 });
+                cell.With(new Label { Text = soft[si], Class = "hint" });
+                batch.With(cell);
+            }
+            Gallery.LayoutAuto(app, batch, name, px, y + Gallery.PreviewPadTop(app),
+                w - app.Scale(36), app.Scale(90));
+        } else if (name == "IconSvg.catalog") {
+            // 与 Icon 页网格同样的交互：悬停高亮、点击复制名字。
+            // 只展示前 120 个（字母序），完整清单见 IconSvg.Names()。
+            List<string> ticons = IconSvg.Names();
+            int shown = IconSvg.Count();
+            if (shown > 120) { shown = 120; }
+            int tcell = app.Scale(62);
+            int tsz = app.Scale(24);
+            int tcols = (w - app.Scale(24)) / tcell;
+            if (tcols < 1) { tcols = 1; }
+            bool tsvgClick = app.window.EventKind() == 3;
+            int tx0 = x + app.Scale(12);
+            int ty0 = y + app.Scale(34);
+            for (int ti = 0; ti < shown; ti = ti + 1) {
+                int tr = ti / tcols;
+                int tc = ti % tcols;
+                int tx = tx0 + tc * tcell;
+                int ty = ty0 + tr * tcell;
+                bool thot = !app.PointerCaptured()
+                    && app.mouseX >= tx && app.mouseX < tx + tcell
+                    && app.mouseY >= ty && app.mouseY < ty + tcell;
+                if (thot) {
+                    c.FillRoundRect(tx, ty, tcell - app.Scale(4),
+                        tcell - app.Scale(4), app.Scale(4), t.bgHover);
+                }
+                IconSvg.Draw(c, ticons[ti],
+                    tx + (tcell - app.Scale(4) - tsz) / 2, ty + app.Scale(6),
+                    tsz, t.textPrimary);
+                c.DrawTextCentered(tx, ty + tsz + app.Scale(12),
+                    tcell - app.Scale(6), Canvas.FontHeight(t.fontSizeSmall),
+                    Ellipsis.Fit(ticons[ti], tcell - app.Scale(6), t.fontSizeSmall),
+                    t.textTertiary, t.fontSizeSmall);
+                if (thot && tsvgClick) {
+                    Clipboard.SetText("\"" + ticons[ti] + "\"");
+                    Gallery.copiedIcon = ticons[ti];
+                    app.RequestRedraw();
+                }
+            }
+            if (Gallery.copiedIcon != "") {
+                c.DrawText(x + app.Scale(110), y + app.Scale(9),
+                    "copied  \"" + Gallery.copiedIcon + "\"",
+                    t.success, t.fontSizeSmall);
+            }
         } else if (name == "Label") {
             Panel col = Panel.Column().Gap(app.Scale(10));
             col.With(new Label { Text = "Title", Class = "title" });
@@ -4719,13 +5651,33 @@ class Gallery {
             col.With(Gallery.demoArea);
             Gallery.LayoutAuto(app, col, name, px, py - app.Scale(20),
                              w - app.Scale(36), app.Scale(180));
-        } else if (name == "TextArea.enh") {
-            // 多行同款增强：count / maxlen / status / round / filter。
-            Panel colT = Panel.Column().Gap(app.Scale(8));
-            colT.With(new Label { Text = "Count + status + round", Class = "secondary" });
-            colT.With(Gallery.demoTaCount);
-            Gallery.LayoutAuto(app, colT, name, px, py - app.Scale(20),
-                             w - app.Scale(36), app.Scale(220));
+        } else if (name == "TextArea.count") {
+            // 多行同款增强拆卡：count / round / status / filter 各一景。
+            Gallery.LayoutAuto(app,
+                Gallery.FieldWithCaption(app, "Show count", Gallery.demoTaCount,
+                    Gallery.T("Same \"current / max\" part as Input, under the box, right-aligned.",
+                        "与 Input 同款「当前 / 上限」部件，位于框下右对齐。")),
+                name, px, py - app.Scale(20), w - app.Scale(36), app.Scale(140));
+        } else if (name == "TextArea.round") {
+            Gallery.LayoutAuto(app,
+                Gallery.FieldWithCaption(app, "Round", Gallery.demoTaRound,
+                    Gallery.T("Soft rounded corners -- multiline fields never pull to a stadium pill.",
+                        "软圆角——多行框不拉整高胶囊，保持矩形观感。")),
+                name, px, py - app.Scale(20), w - app.Scale(36), app.Scale(140));
+        } else if (name == "TextArea.status") {
+            Panel colTa = Panel.Column().Gap(app.Scale(8));
+            colTa.With(new Label { Text = "Success", Class = "secondary" });
+            colTa.With(Gallery.demoTaOk);
+            colTa.With(new Label { Text = "Warning", Class = "secondary" });
+            colTa.With(Gallery.demoTaWarn);
+            Gallery.LayoutAuto(app, colTa, name, px, py - app.Scale(20),
+                             w - app.Scale(36), app.Scale(210));
+        } else if (name == "TextArea.filter") {
+            Gallery.LayoutAuto(app,
+                Gallery.FieldWithCaption(app, "Only digits", Gallery.demoTaDigits,
+                    Gallery.T("Filter rewrites every candidate before it lands; rejected text never inserts.",
+                        "Filter 逐候选改写后才落地；被拒绝的输入不会插入。")),
+                name, px, py - app.Scale(20), w - app.Scale(36), app.Scale(140));
         } else if (name == "Checkbox") {
             // Sizes + semantic accents, laid out by Panel flow (no coordinates).
             // EVERY checkbox is bound to its own model field via `.data` so
@@ -4770,6 +5722,9 @@ class Gallery {
             rs.data = Gallery.model.radioSize;
             Radio rm = new Radio(1, "Default");
             rm.data = Gallery.model.radioSize;
+            Radio rt = new Radio(3, "Tiny");
+            rt.Class = "tiny";
+            rt.data = Gallery.model.radioSize;
             Radio rl = new Radio(2, "Large");
             rl.Class = "large";
             rl.data = Gallery.model.radioSize;
@@ -4794,12 +5749,29 @@ class Gallery {
             Radio rd1 = new Radio(1, "Locked on");
             rd1.Disabled = true;
             rd1.data = Gallery.model.radioLock;
+            // One group, one accent PER OPTION: whoever is checked lights
+            // up in its own semantic color — the tier meaning travels with
+            // the option, not with the group.
+            Radio ma = new Radio(0, "Basic");
+            ma.data = Gallery.model.radioAccent;
+            Radio mb = new Radio(1, "Pro");
+            mb.Class = "info";
+            mb.data = Gallery.model.radioAccent;
+            Radio mc = new Radio(2, "Team");
+            mc.Class = "success";
+            mc.data = Gallery.model.radioAccent;
+            Radio md = new Radio(3, "Enterprise");
+            md.Class = "warning";
+            md.data = Gallery.model.radioAccent;
             Panel col = Panel.Column().Gap(app.Scale(12));
             col.With(Panel.Row().Gap(app.Scale(24)).With(ra).With(rb).With(rc));
-            col.With(Panel.Row().Gap(app.Scale(24)).With(rs).With(rm).With(rl));
+            col.With(Panel.Row().Gap(app.Scale(20))
+                .With(rs).With(rm).With(rt).With(rl));
             col.With(Panel.Row().Gap(app.Scale(20))
                 .With(ri).With(rw).With(rn).With(re));
             col.With(Panel.Row().Gap(app.Scale(24)).With(rd0).With(rd1));
+            col.With(Panel.Row().Gap(app.Scale(20))
+                .With(ma).With(mb).With(mc).With(md));
             Gallery.LayoutAuto(app, col, name, px, py - app.Scale(12),
                              w - app.Scale(36), app.Scale(220));
             // 基础组翻转的那一帧把 Change 报到 LIVE STATES 行：绑定值
@@ -4810,6 +5782,127 @@ class Gallery {
                     "已切换 -> 选项 ")
                     + Convert.ToString(Gallery.model.radioChoice + 1));
             }
+            if (Gallery.model.radioAccent != Gallery.radioAccentPrev) {
+                Gallery.radioAccentPrev = Gallery.model.radioAccent;
+                Gallery.Fired(app, name, Gallery.T("Tier -> ",
+                    "已切换 -> 档位 ")
+                    + Convert.ToString(Gallery.radioAccentPrev + 1));
+            }
+        } else if (name == "Radio.bordered") {
+            // 边框变体（el-radio border）：整项变描边圆角盒，选中描边
+            // 走强调色；禁用与语义色联动各一枚。
+            Radio bo0 = new Radio(0, "每日送");
+            bo0.Bordered = true;
+            bo0.data = Gallery.model.radioBorder;
+            Radio bo1 = new Radio(1, "自提");
+            bo1.Bordered = true;
+            bo1.data = Gallery.model.radioBorder;
+            Radio bo2 = new Radio(0, "成功");
+            bo2.Bordered = true;
+            bo2.Class = "success";
+            bo2.data = Gallery.model.radioBorder2;
+            Radio bo3 = new Radio(1, "警告");
+            bo3.Bordered = true;
+            bo3.Class = "warning";
+            bo3.data = Gallery.model.radioBorder2;
+            Radio bo4 = new Radio(0, "锁定");
+            bo4.Bordered = true;
+            bo4.Disabled = true;
+            bo4.data = Gallery.model.radioBorder3;
+            Radio bo5 = new Radio(1, "锁定选中");
+            bo5.Bordered = true;
+            bo5.Disabled = true;
+            bo5.data = Gallery.model.radioBorder3;
+            Panel colB = Panel.Column().Gap(app.Scale(12));
+            colB.With(Panel.Row().Gap(app.Scale(16)).With(bo0).With(bo1));
+            colB.With(Panel.Row().Gap(app.Scale(16)).With(bo2).With(bo3));
+            colB.With(Panel.Row().Gap(app.Scale(16)).With(bo4).With(bo5));
+            Gallery.LayoutAuto(app, colB, name, px, py - app.Scale(12),
+                             w - app.Scale(36), app.Scale(160));
+        } else if (name == "RadioGroup.options") {
+            // Options 数据源：选项带自定义 value 与禁用位；组级 Value
+            // 双向绑定到模型字段；LIVE STATES 上报选中 value。
+            if (Gallery.demoRgOpt == null) {
+                Gallery.demoRgOpt = new RadioGroup();
+                Gallery.demoRgOpt.AddOption("北京", 10);
+                Gallery.demoRgOpt.AddOption("上海", 20);
+                Gallery.demoRgOpt.AddOption("广州", 30, true);
+                Gallery.demoRgOpt.AddOption("深圳", 40);
+                Gallery.demoRgOpt.Value = Gallery.model.rgCity;
+                Gallery.model.rgCity = 20;
+                Gallery.demoRgOpt.SyncGroup();
+            }
+            Panel colO = Panel.Column().Gap(app.Scale(10));
+            colO.With(Gallery.demoRgOpt);
+            colO.With(new Label {
+                Text = Gallery.T("Selected value: ", "选中值：")
+                    + Convert.ToString(Gallery.demoRgOpt.SelectedValue())
+                    + Gallery.T("  (index ", "  （下标 ")
+                    + Convert.ToString(Gallery.demoRgOpt.SelectedIndex()) + ")",
+                Class = "secondary" });
+            Gallery.LayoutAuto(app, colO, name, px, py - app.Scale(8),
+                             w - app.Scale(36), app.Scale(120));
+            if (Gallery.demoRgOpt.SelectedValue() != Gallery.rgOptPrev) {
+                Gallery.rgOptPrev = Gallery.demoRgOpt.SelectedValue();
+                Gallery.Fired(app, name, Gallery.T("Changed -> value ",
+                    "已切换 -> 值 ")
+                    + Convert.ToString(Gallery.rgOptPrev));
+            }
+        } else if (name == "RadioGroup.buttons") {
+            // 按钮组形态：连体段，禁用段置灰；尺寸档位两排对照。
+            if (Gallery.demoRgBtn == null) {
+                Gallery.demoRgBtn = new RadioGroup();
+                Gallery.demoRgBtn.AddOption("当日达配送");
+                Gallery.demoRgBtn.AddOption("门店自提（旗舰店）");
+                Gallery.demoRgBtn.AddOption("快递柜投递", 3, true);
+                Gallery.demoRgBtn.Buttons = true;
+                Gallery.demoRgBtn.SyncGroup();
+            }
+            RadioGroup gL = new RadioGroup();
+            gL.AddOption("Rock'n'Roll Star");
+            gL.AddOption("Shakermaker");
+            gL.AddOption("Live Forever");
+            gL.AddOption("Up in the Sky");
+            gL.Buttons = true;
+            gL.Size = "medium";
+            gL.SyncGroup();
+            RadioGroup gS = new RadioGroup();
+            gS.AddOption("Rock'n'Roll Star");
+            gS.AddOption("Shakermaker");
+            gS.AddOption("Live Forever");
+            gS.AddOption("Up in the Sky");
+            gS.Buttons = true;
+            gS.Size = "small";
+            gS.SyncGroup();
+            Panel colB2 = Panel.Column().Gap(app.Scale(12));
+            colB2.With(Gallery.demoRgBtn);
+            colB2.With(gL);
+            colB2.With(gS);
+            Gallery.LayoutAuto(app, colB2, name, px, py - app.Scale(8),
+                             w - app.Scale(36), app.Scale(190));
+            if (Gallery.demoRgBtn.SelectedValue() != Gallery.rgBtnPrev) {
+                Gallery.rgBtnPrev = Gallery.demoRgBtn.SelectedValue();
+                Gallery.Fired(app, name, Gallery.T("Changed -> option ",
+                    "已切换 -> 选项 ")
+                    + Convert.ToString(Gallery.rgBtnPrev + 1));
+            }
+        } else if (name == "RadioGroup") {
+            // 组容器：AddOption 把选项交给组排布，宽度不够自动换行；
+            // Selected() 是全组共享的选中信号，直接读即可。
+            Panel col = Panel.Column().Gap(app.Scale(10));
+            col.With(Gallery.demoRg);
+            col.With(new Label {
+                Text = Gallery.T("Selected: option ", "当前选中：选项 ")
+                    + Convert.ToString(Gallery.demoRg.Selected().Get() + 1),
+                Class = "secondary" });
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(8),
+                             w - app.Scale(36), app.Scale(120));
+            if (Gallery.demoRg.Selected().Get() != Gallery.rgPrev) {
+                Gallery.rgPrev = Gallery.demoRg.Selected().Get();
+                Gallery.Fired(app, name, Gallery.T("Changed -> option ",
+                    "已切换 -> 选项 ")
+                    + Convert.ToString(Gallery.rgPrev + 1));
+            }
         } else if (name == "Switch") {
             Flex row = Flex.Wrapped().Gap(app.Scale(12));
             row.With(Gallery.demoSwitch);
@@ -4817,11 +5910,80 @@ class Gallery {
             Gallery.LayoutAuto(app, row, name, px, py - app.Scale(8),
                              w - app.Scale(36), app.Scale(40));
         } else if (name == "Slider") {
+            Gallery.demoSlider.Prefer(app.Scale(360), 0);
             Panel col = Panel.Column().Gap(app.Scale(6));
             col.With(new Label { Text = "Level: " + Convert.ToString(Gallery.model.level), Class = "secondary" });
             col.With(Gallery.demoSlider);
             Gallery.LayoutAuto(app, col, name, px, py - app.Scale(12),
                              w - app.Scale(36), app.Scale(70));
+        } else if (name == "Slider.range") {
+            // 范围：双柄共享一对模型字段，两枚 InputNumber 也绑同一对
+            // 字段——滑块和输入框互相同步（Naive UI range 演示同款）。
+            Panel col = Panel.Column().Gap(app.Scale(8));
+            col.With(Gallery.demoSliderRange);
+            Panel row = Panel.Row().Gap(app.Scale(12));
+            row.With(Gallery.demoSliderLo);
+            row.With(Gallery.demoSliderHi);
+            col.With(row);
+            Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34),
+                             w - app.Scale(36), app.Scale(110));
+        } else if (name == "Slider.marks") {
+            // 标记刻度 + 限取标记值：上面一条自由取值、刻度只是可视
+            // 锚点；下面一条 stepMark=true 只能停在标记上（键盘同样）。
+            Gallery.demoSliderMarks.Prefer(app.Scale(360), 0);
+            Gallery.demoSliderStepMark.Prefer(app.Scale(360), 0);
+            Panel col = Panel.Column().Gap(app.Scale(10));
+            // 两侧留白，让 0/100 端点标记的文字不被演示框裁掉。
+            Panel mkRow = Panel.Row();
+            mkRow.Padding(0, app.Scale(30), 0, app.Scale(30));
+            mkRow.With(Gallery.demoSliderMarks);
+            col.With(mkRow);
+            Panel smkRow = Panel.Row();
+            smkRow.Padding(0, app.Scale(30), 0, app.Scale(30));
+            smkRow.With(Gallery.demoSliderStepMark);
+            col.With(smkRow);
+            col.With(new Label {
+                Text = Gallery.T("value = ", "当前值 = ")
+                    + Convert.ToString(Gallery.model.sldMark)
+                    + Gallery.T("  -- bottom slider: stepMark restricts to marks.",
+                                "  —— 下面一条 stepMark=true，只能停在标记上。"),
+                Class = "secondary" });
+            Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34),
+                             w - app.Scale(36), app.Scale(150));
+        } else if (name == "Slider.vertical") {
+            // 垂直 + 倒转：竖向滑块需要真实高度（Prefer 定死），
+            // 左边普通（min 在下、刻度文字在右），右边 reverse（min 在上）。
+            Gallery.demoSliderVt.Prefer(app.Scale(80), app.Scale(220));
+            Gallery.demoSliderVtRev.Prefer(app.Scale(80), app.Scale(220));
+            Panel row = Panel.Row().Gap(app.Scale(28));
+            row.With(Gallery.demoSliderVt);
+            row.With(Gallery.demoSliderVtRev);
+            Panel col = Panel.Column().Gap(app.Scale(6));
+            col.With(row);
+            col.With(new Label {
+                Text = Gallery.T("vertical marks / vertical + reverse (min at top)",
+                                 "垂直刻度 / 垂直 + 倒转（min 在顶端）"),
+                Class = "secondary" });
+            Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34),
+                             w - app.Scale(36), app.Scale(270));
+        } else if (name == "Slider.tooltip") {
+            // 气泡三态：tooltip=false 拖动也不出泡；showTooltip 常显；
+            // tipFormat="{v}%" 格式化（Naive UI format-tooltip）。
+            // 行距要大于气泡全高（约 63 逻辑像素）：常显气泡悬在拇指
+            // 上方，贴太近就把上一条滑块的拇指盖住了。
+            Panel col = Panel.Column().Gap(app.Scale(64));
+            Gallery.demoSliderNoTip.Prefer(app.Scale(360), 0);
+            Gallery.demoSliderAlways.Prefer(app.Scale(360), 0);
+            Gallery.demoSliderFmt.Prefer(app.Scale(360), 0);
+            col.With(Gallery.demoSliderNoTip);
+            col.With(Gallery.demoSliderAlways);
+            col.With(Gallery.demoSliderFmt);
+            col.With(new Label {
+                Text = Gallery.T("tooltip=false / showTooltip / tipFormat \"{v}%\"",
+                                 "tooltip=false 关泡 / showTooltip 常显 / tipFormat \"{v}%\" 格式化"),
+                Class = "secondary" });
+            Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34),
+                             w - app.Scale(36), app.Scale(260));
         } else if (name == "InputNumber") {
             // 基础 + 尺寸 + 按钮位置：三行共享一个模型字段，改哪一行
             // 其余两行跟着同步（Naive UI 尺寸/按钮位置演示同款布局）。
@@ -4931,6 +6093,15 @@ class Gallery {
             col.With(new Label {
                 Text = Gallery.T("validator rejects < 10: value commits, red ring + Invalid event fires.",
                                  "validator 拒绝 < 10 的值：值照常写入，红描边 + 触发 Invalid。"),
+                Class = "secondary" });
+            Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34),
+                             w - app.Scale(36), app.Scale(90));
+        } else if (name == "Slider.disabled") {
+            Panel col = Panel.Column().Gap(app.Scale(6));
+            col.With(Gallery.demoSliderDisabled);
+            col.With(new Label {
+                Text = Gallery.T("Disabled = true greys the whole slider and ignores pointer / keyboard.",
+                                 "Disabled = true 整条落灰，指针与键盘都不响应。"),
                 Class = "secondary" });
             Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34),
                              w - app.Scale(36), app.Scale(90));
@@ -5184,9 +6355,8 @@ class Gallery {
             col.With(s7);
             col.With(new Label { Text = "Clickable · click a reached step to go back (LIVE EVENTS)", Class = "secondary" });
             col.With(s8);
-            col.MeasureTree(app);
-            col.Arrange(px, py - app.Scale(20), w - app.Scale(36), app.Scale(760));
-            col.RenderTree(app);
+            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(20),
+                             w - app.Scale(36), app.Scale(760));
         } else if (name == "Breadcrumb") {
             // WYSIWYG: a retained Breadcrumb instance, auto-measured/placed.
             Breadcrumb bc = new Breadcrumb();
@@ -5224,30 +6394,14 @@ class Gallery {
             Gallery.LayoutAuto(app, col, name, px, py - app.Scale(16),
                              w - app.Scale(36), app.Scale(64));
         } else if (name == "Pagination") {
-            // Multiple styles, each bound to its own current-page signal,
-            // stacked by a Panel column with a label above each one.
-            Pagination pg = new Pagination(12);
-            pg.Page = Gallery.model.pick;   // two-way
-            Pagination pill = new Pagination(12);
-            pill.Page = Gallery.model.pick;   // two-way
-            pill.Class = "pill";
-            Pagination small = new Pagination(12);
-            small.Page = Gallery.model.pick;   // two-way
-            small.Class = "small";
-            Pagination simple = new Pagination(12);
-            simple.Page = Gallery.model.pick;   // two-way
-            simple.Class = "simple";
-            Panel col = Panel.Column().Gap(app.Scale(10));
-            col.With(new Label { Text = "Default · windowed with ellipses", Class = "secondary" });
-            col.With(pg);
-            col.With(new Label { Text = "Pill · rounded buttons", Class = "secondary" });
-            col.With(pill);
-            col.With(new Label { Text = "Small · compact size", Class = "secondary" });
-            col.With(small);
-            col.With(new Label { Text = "Simple · prev / total / next", Class = "secondary" });
-            col.With(simple);
-            Gallery.LayoutAuto(app, col, name, px, py - app.Scale(20),
-                             w - app.Scale(36), app.Scale(310));
+            // 八个实例连同标签列由 BuildPaginationDemos 建一次（保留态，
+            // 同 Form.validate 的 FormGroup）：sizes 弹层开合、跳页输入框
+            // 草稿的状态住在实例字段里，每帧 new 会让「弹层打开」活不过
+            // 下一帧 —— 下拉看起来永远点不开。每帧只是把这棵保留树重新
+            // 测量、排进预览框。
+            Gallery.LayoutAuto(app, Gallery.pgPanel, name, px,
+                               py - app.Scale(20), w - app.Scale(36),
+                               app.Scale(700));
         } else if (name == "Card") {
             int cy0 = py - app.Scale(12);
             int cw = app.Scale(380);
@@ -5583,6 +6737,141 @@ class Gallery {
             doc.With(wm.Grow());
             Gallery.LayoutAuto(app, doc, name, px, py,
                              w - app.Scale(36), app.Scale(170));
+        } else if (name == "Watermark.custom") {
+            // 自定义水印：右侧配置面板的每个旋钮都双向绑到 model.wm*，
+            // 水印每帧按字段现造——拖滑块/改输入的下一帧就是新样子，
+            // 没有事件要接。预览文档与 antd 的自定义水印演示同构：
+            // 标题 + 段落 + 轻量表格 + 图片，水印作为最后一个子节点
+            // Grow() 盖在最上面。控件已在 Main 里建好（保留态），
+            // 这里只负责摆进格子和按字段造水印。
+            int cw = app.Scale(124);
+            Panel conf = Panel.Column().Gap(app.Scale(10));
+            Panel r1 = Panel.Row().Gap(app.Scale(12));
+            r1.With(Gallery.WmCell(app,
+                Gallery.T("Watermark content", "水印内容"),
+                Gallery.wmTextInput, cw * 2 + app.Scale(12)));
+            conf.With(r1);
+            Panel r2 = Panel.Row().Gap(app.Scale(12));
+            r2.With(Gallery.WmCell(app, Gallery.T("Font size", "字体大小"),
+                Gallery.wmFontNum, cw));
+            r2.With(Gallery.WmCell(app, Gallery.T("Font color", "字体颜色"),
+                Gallery.wmColorInput, cw));
+            conf.With(r2);
+            Panel r3 = Panel.Row().Gap(app.Scale(12));
+            r3.With(Gallery.WmCell(app, Gallery.T("Font weight", "字重"),
+                Gallery.wmWeightSel, cw));
+            r3.With(Gallery.WmCell(app, Gallery.T("Text align", "文本对齐"),
+                Gallery.wmAlignSel, cw));
+            conf.With(r3);
+            Panel r4 = Panel.Row().Gap(app.Scale(12));
+            r4.With(Gallery.WmCell(app,
+                Gallery.T("Rotate (-90 ~ 90)", "旋转角度（-90 ~ 90）"),
+                Gallery.wmRotateSld, cw * 2 + app.Scale(12)));
+            conf.With(r4);
+            Panel r5 = Panel.Row().Gap(app.Scale(12));
+            r5.With(Gallery.WmCell(app,
+                Gallery.T("Line height (0 = auto)", "行高（0 = 默认）"),
+                Gallery.wmLineHNum, cw));
+            r5.With(Gallery.WmCell(app,
+                Gallery.T("Tile width (0 = auto)", "贴片宽（0 = 自适应）"),
+                Gallery.wmTileWNum, cw));
+            conf.With(r5);
+            Panel r6 = Panel.Row().Gap(app.Scale(12));
+            r6.With(Gallery.WmCell(app,
+                Gallery.T("Tile height (0 = auto)", "贴片高（0 = 自适应）"),
+                Gallery.wmTileHNum, cw));
+            r6.With(Gallery.WmCell(app, Gallery.T("Gap X", "X 轴间隔"),
+                Gallery.wmGapXNum, cw));
+            conf.With(r6);
+            Panel r7 = Panel.Row().Gap(app.Scale(12));
+            r7.With(Gallery.WmCell(app, Gallery.T("Gap Y", "Y 轴间隔"),
+                Gallery.wmGapYNum, cw));
+            r7.With(Gallery.WmCell(app, Gallery.T("Offset X", "X 轴偏移"),
+                Gallery.wmOffXNum, cw));
+            conf.With(r7);
+            Panel r8 = Panel.Row().Gap(app.Scale(12));
+            r8.With(Gallery.WmCell(app, Gallery.T("Offset Y", "Y 轴偏移"),
+                Gallery.wmOffYNum, cw));
+            r8.With(Gallery.WmCell(app,
+                Gallery.T("Cross boundary", "是否跨越边界"),
+                Gallery.wmClipSw, 0));
+            conf.With(r8);
+            // 左侧预览：定住高度（水印测量 0×0，Grow 才有剩余空间可
+            // 占），内容只是给水印垫背景的——真正的主角是水印层。
+            Panel doc = Panel.Column().Gap(app.Scale(8));
+            doc.Class = "wm-doc";
+            doc.Prefer(0, app.Scale(470));
+            doc.Grow();
+            doc.With(new Label {
+                Text = Gallery.T("Q3 business review", "三季度经营复盘"),
+                Class = "title" });
+            doc.With(new Label {
+                Text = Gallery.T(
+                    "Numbers below are unaudited and still being reconciled; figures lock once finance closes the books.",
+                    "以下数字未经审计、仍在核对口径，财务关账后锁定。"),
+                Class = "paragraph" });
+            int cw0 = app.Scale(96);
+            int cw1 = app.Scale(72);
+            int cw2 = app.Scale(64);
+            Panel tbl = Panel.Column().Gap(0);
+            Panel th = Panel.Row().Gap(0);
+            th.With(new Label { Text = Gallery.T("Metric", "指标"), Class = "caption" }
+                .Prefer(cw0, 0));
+            th.With(new Label { Text = Gallery.T("This quarter", "本季"), Class = "caption" }
+                .Prefer(cw1, 0));
+            th.With(new Label { Text = Gallery.T("QoQ", "环比"), Class = "caption" }
+                .Prefer(cw2, 0));
+            tbl.With(th);
+            for (int i = 0; i < 3; i = i + 1) {
+                string m;
+                string q;
+                string d;
+                if (i == 0) {
+                    m = Gallery.T("Revenue", "营收");
+                    q = "¥ 12.8M";
+                    d = "+8.2%";
+                } else if (i == 1) {
+                    m = Gallery.T("Active users", "活跃用户");
+                    q = "1.24M";
+                    d = "+3.1%";
+                } else {
+                    m = Gallery.T("NPS", "净推荐值");
+                    q = "54";
+                    d = "-2";
+                }
+                Panel tr = Panel.Row().Gap(0);
+                tr.With(new Label { Text = m, Class = "secondary" }.Prefer(cw0, 0));
+                tr.With(new Label { Text = q, Class = "secondary" }.Prefer(cw1, 0));
+                tr.With(new Label { Text = d, Class = "secondary" }.Prefer(cw2, 0));
+                tbl.With(tr);
+            }
+            doc.With(tbl);
+            Image ph = new Image(Gallery.PhotoSet()[0], "", "cover");
+            ph.Class = "photo-thumb";
+            doc.With(ph);
+            Watermark wm = new Watermark(Gallery.model.wmText);
+            wm.Color = Gallery.WmColorParse(Gallery.model.wmColor);
+            wm.FontPx = Gallery.model.wmFontPx;
+            if (Gallery.model.wmWeight == 1) { wm.Weight = 600; }
+            wm.Rotate = Gallery.model.wmRotate;
+            wm.LineHeight = Gallery.model.wmLineH;
+            wm.TileW = Gallery.model.wmTileW;
+            wm.TileH = Gallery.model.wmTileH;
+            wm.GapX = Gallery.model.wmGapX;
+            wm.GapY = Gallery.model.wmGapY;
+            wm.OffsetX = Gallery.model.wmOffX;
+            wm.OffsetY = Gallery.model.wmOffY;
+            wm.TextAlign = Gallery.model.wmAlign;
+            wm.NoClip = Gallery.model.wmNoClip;
+            doc.With(wm.Grow());
+            // 参考版式：预览在左（吃掉剩余宽），配置面板靠右。Row 用
+            // flex 而不是 dock 面板——加满顺序 = 视觉顺序，Grow 原地
+            // 扩展，不会像 dock fill 那样被排到非 grow 兄弟的后面。
+            Flex host = Flex.Row().Gap(app.Scale(16));
+            host.With(doc.Grow());
+            host.With(conf);
+            Gallery.LayoutAuto(app, host, name, px, py,
+                             w - app.Scale(36), app.Scale(470));
         } else if (name == "Badge.dot") {
             Flex row = Flex.Wrapped().Gap(app.Scale(14));
             row.With(new Badge(0));
@@ -8044,11 +9333,11 @@ class Gallery {
         } else if (name == "Chart.echarts_map") {
             // ECharts map1（iphone 销量）：省份数值地图——区域值映射
             // 连续色域（dataRange），省份标签常显，悬停 emphasis 高亮
-            // 并弹数值提示卡。省界几何由 echarts china.json 抽稀生成。
+            // 并弹数值提示卡。省界几何为官方 echarts china.json 运行时解码。
             ChartOption cmp = ChartOption.Of(Gallery.T("iphone sales", "iphone 销量"), null,
                 new List<ChartSeries>{
                     ChartSeries.OfRegions(Gallery.T("iphone3", "iphone3"),
-                        MapChinaData.Regions()) });
+                        Gallery.ChinaRegions()) });
             cmp.showLegend = false;
             ChartView.KeyedStatic(cmp, 8418).Render(
                 app, x + app.Scale(14), y + app.Scale(30), w - app.Scale(28), app.Scale(420));
@@ -8618,17 +9907,21 @@ class Gallery {
                              w - app.Scale(36), app.Scale(220));
         } else if (name == "Tooltip") {
             // Triggers: hover shows the tip while the pointer is over the target;
-            // click toggles it. Both drive the same Tooltip.RenderAt renderer.
+            // click toggles it; manual is fully programmatic (Show/Hide buttons
+            // drive the bubble from caller state alone). All three feed the same
+            // Tooltip.RenderAt / RenderBox renderer.
             app.canvas.DrawStyledText(
                 Style.Of(app, "label", "secondary", Style.SNormal()),
-                px, py - app.Scale(28), "Triggers · hover / click",
+                px, py - app.Scale(28),
+                Gallery.T("Triggers · hover / click / manual",
+                          "触发方式 · 悬浮 / 点击 / 手动"),
                 app.theme.textPrimary, app.theme.fontSizeMedium);
-            int bw = app.Scale(120);
+            int bw = app.Scale(110);
             // Hover tip: the Button's Tip property handles everything inside the
             // component (no manual anchor math at the call site).
             int hoverId = new Button { Text = "Hover me", Tip = "Shown on hover" }
                 .Render(app, px, py, bw);
-            int clickX = px + bw + app.Scale(16);
+            int clickX = px + bw + app.Scale(14);
             int clickId = new Button { Text = "Click me" }.Render(app, clickX, py, bw);
             if (Ui.Clicked(app, clickId)) {
                 Gallery.tipClickOn.Set(!Gallery.tipClickOn.Get());
@@ -8638,13 +9931,33 @@ class Gallery {
                 Tooltip.RenderBox(app, clickX, py, bw, t.heightMedium,
                                   "Toggled by click", 1, 0);
             }
+            // Manual: the caller owns the on/off state entirely — like Naive
+            // UI's "manual" trigger, no pointer involvement at all.
+            int manX = clickX + bw + app.Scale(14);
+            int mbw = app.Scale(76);
+            int showId = new Button { Text = Gallery.T("Show", "显示") }
+                .Render(app, manX, py, mbw);
+            if (Ui.Clicked(app, showId)) { Gallery.tipManual.Set(true); }
+            int hideX = manX + mbw + app.Scale(14);
+            int hideId = new Button { Text = Gallery.T("Hide", "隐藏") }
+                .Render(app, hideX, py, mbw);
+            if (Ui.Clicked(app, hideId)) { Gallery.tipManual.Set(false); }
+            if (Gallery.tipManual.Get()) {
+                Tooltip.RenderBox(app, manX, py, mbw * 2 + app.Scale(14),
+                                  t.heightMedium,
+                                  Gallery.T("Controlled by caller state",
+                                            "完全由调用方状态控制"),
+                                  3, 0);
+            }
 
             // Placements: four widely-spaced anchors, each always-on so all four
             // sides are visible at once without overlapping.
             int rowY = py + app.Scale(120);
             app.canvas.DrawStyledText(
                 Style.Of(app, "label", "secondary", Style.SNormal()),
-                px, rowY - app.Scale(30), "Placements · top / bottom / left / right",
+                px, rowY - app.Scale(30),
+                Gallery.T("Placements · top / bottom / left / right",
+                          "位置 · 上 / 下 / 左 / 右"),
                 app.theme.textPrimary, app.theme.fontSizeMedium);
             int dot = app.Scale(7);
             int pw = w - app.Scale(52);
@@ -8659,12 +9972,34 @@ class Gallery {
             c.FillCircle(p0 + pstep * 3, rowY, dot, t.primary);
             Tooltip.RenderAt(app, p0 + pstep * 3 + dot, rowY, "Right", 3, 0);
 
-            // Long text: wraps automatically; a scrollbar appears past the cap
-            // and the wheel scrolls the bubble content while the pointer is over it.
-            int longY = py + app.Scale(250);
+            // Body style: Tooltip.RenderRich paints a two-line bubble — bold
+            // title over a muted description — for hint content that needs a
+            // little more structure than one plain line.
+            int richY = py + app.Scale(250);
             app.canvas.DrawStyledText(
                 Style.Of(app, "label", "secondary", Style.SNormal()),
-                px, longY - app.Scale(8), "Long text · auto-wrap + wheel scroll",
+                px, richY - app.Scale(30),
+                Gallery.T("Body style · bold title + muted description",
+                          "主体样式 · 粗体标题 + 弱化描述"),
+                app.theme.textPrimary, app.theme.fontSizeMedium);
+            int richId = new Button { Text = Gallery.T("California girl", "加州女孩") }
+                .Render(app, px, richY, bw);
+            if (app.focus.IsHovered(richId)) {
+                Tooltip.RenderRich(app, px,
+                                   richY + t.heightMedium + app.Scale(8),
+                                   Gallery.T("California girl", "加州女孩"),
+                                   Gallery.T("Bold title on top, muted description below.",
+                                             "粗体标题在上，弱化描述在下。"));
+            }
+
+            // Long text: wraps automatically; a scrollbar appears past the cap
+            // and the wheel scrolls the bubble content while the pointer is over it.
+            int longY = py + app.Scale(380);
+            app.canvas.DrawStyledText(
+                Style.Of(app, "label", "secondary", Style.SNormal()),
+                px, longY - app.Scale(8),
+                Gallery.T("Long text · auto-wrap + wheel scroll",
+                          "长文本 · 自动换行 + 滚轮滚动"),
                 app.theme.textPrimary, app.theme.fontSizeMedium);
             c.FillCircle(p0, longY + app.Scale(18), dot, t.info);
             string longTip = "Long text wraps automatically onto multiple lines. When it grows past the height cap a scrollbar appears on the right and the mouse wheel scrolls the content while the pointer is over the bubble, so nothing is clipped away and the bubble still stays fully on screen no matter which edge it is near.";
@@ -8682,6 +10017,23 @@ class Gallery {
                 app.RequestRedraw();
             }
             Tooltip.RenderScroll(app, tipAX, tipAY, longTip, 3, tipMaxW, Gallery.tipScroll.Get());
+
+            // Edge flip: the anchor asks for Right but sits close enough to the
+            // window's right edge that the bubble cannot fit, so BoxRect flips
+            // it to the Left instead of clipping it.
+            int flipY = py + app.Scale(510);
+            app.canvas.DrawStyledText(
+                Style.Of(app, "label", "secondary", Style.SNormal()),
+                px, flipY - app.Scale(30),
+                Gallery.T("Edge flip · asked Right, clamped to Left by the window edge",
+                          "贴边自动翻转 · 请求 Right，被窗口右缘翻成 Left"),
+                app.theme.textPrimary, app.theme.fontSizeMedium);
+            int flipX = px + w - app.Scale(56);
+            c.FillCircle(flipX, flipY, dot, t.primary);
+            Tooltip.RenderAt(app, flipX, flipY,
+                Gallery.T("Asked for Right, flipped to Left near the window edge",
+                          "请求 Right，靠近窗口右缘自动翻到 Left"), 3, 0);
+            Gallery.RecordBottom(app, name, flipY + app.Scale(44));
         } else if (name == "Spin.plain") {
             Spin big = new Spin(56);
             big.Class = "info";
@@ -9435,6 +10787,86 @@ class Gallery {
             colM.With(Gallery.manualLog);
             Gallery.LayoutAuto(app, colM, name, px, y + app.Scale(34), w - app.Scale(36),
                 app.Scale(150));
+        } else if (name == "InputOtp") {
+            Gallery.LayoutAuto(app,
+                Gallery.FieldWithCaption(app, "Verification code", Gallery.demoOtp,
+                    Gallery.T("Six cells, one character per cell; type to fill left to right, Backspace walks back.",
+                        "六个格子，一格一字符；键入从左到右填充，退格向回走。")),
+                name, px, y + app.Scale(34), w - app.Scale(36),
+                app.Scale(90));
+        } else if (name == "InputOtp.mask") {
+            Gallery.LayoutAuto(app,
+                Gallery.FieldWithCaption(app, "Password mode", Gallery.demoOtpMask,
+                    Gallery.T("MaskMode shows a dot (or MaskChar) per filled cell.",
+                        "MaskMode：已填格子以圆点（或 MaskChar）显示。")),
+                name, px, y + app.Scale(34), w - app.Scale(36),
+                app.Scale(90));
+        } else if (name == "InputOtp.block") {
+            Gallery.LayoutAuto(app,
+                Gallery.FieldWithCaption(app, "Block", Gallery.demoOtpBlock,
+                    Gallery.T("Block stretches the cells across the full width given to Render.",
+                        "Block：格子横向平铺到 Render 给的整个宽度。")),
+                name, px, y + app.Scale(34), w - app.Scale(36),
+                app.Scale(90));
+        } else if (name == "InputOtp.status") {
+            Panel colO = Panel.Column().Gap(app.Scale(10));
+            colO.With(Gallery.Captioned(app, Gallery.demoOtpRo,
+                Gallery.T("readonly — focusable, never edits", "只读 — 可聚焦、不可编辑")));
+            colO.With(Gallery.Captioned(app, Gallery.demoOtpDis,
+                Gallery.T("disabled", "禁用")));
+            colO.With(Gallery.Captioned(app, Gallery.demoOtpWarn,
+                    Gallery.T("status warning", "状态 warning")));
+            colO.With(Gallery.Captioned(app, Gallery.demoOtpErr,
+                    Gallery.T("status error", "状态 error")));
+            Gallery.LayoutAuto(app, colO, name, px, y + app.Scale(34), w - app.Scale(36),
+                app.Scale(230));
+        } else if (name == "InputOtp.group") {
+            Gallery.LayoutAuto(app,
+                Gallery.FieldWithCaption(app, "Custom render", Gallery.demoOtpGroup,
+                    Gallery.T("Groups {2,2,2} + separator '-' draws 65-43-21.",
+                        "Groups {2,2,2} 加分隔符 '-'，渲染成 65-43-21。")),
+                name, px, y + app.Scale(34), w - app.Scale(36),
+                app.Scale(90));
+        } else if (name == "InputOtp.size") {
+            Panel colS = Panel.Column().Gap(app.Scale(10));
+            colS.With(Gallery.Captioned(app, Gallery.demoOtpSmall, "small"));
+            colS.With(Gallery.Captioned(app, Gallery.demoOtpMed, "medium"));
+            colS.With(Gallery.Captioned(app, Gallery.demoOtpLarge, "large"));
+            Gallery.LayoutAuto(app, colS, name, px, y + app.Scale(34), w - app.Scale(36),
+                app.Scale(180));
+        } else if (name == "InputOtp.form") {
+            // 配合表单：data 双向绑定 model.otpCode，验证按钮读 IsFull。
+            Button bOtp = new Button { Text = Gallery.T("Verify", "验证"), Class = "primary" };
+            bOtp.Click += () => {
+                if (Gallery.demoOtpForm.IsFull()) {
+                    Gallery.demoOtpForm.SetStatus("");
+                    Gallery.otpFormLog.Text = Gallery.T("code: ", "验证码：")
+                        + Gallery.demoOtpForm.GetCode();
+                } else {
+                    Gallery.demoOtpForm.SetStatus(Control.StatusError());
+                    Gallery.otpFormLog.Text = Gallery.T("please enter the 6-digit code",
+                        "请输入完整 6 位验证码");
+                }
+            };
+            Panel rowF = Panel.Row().Gap(app.Scale(10));
+            rowF.With(new Label { Text = Gallery.T("Verification code", "验证码") });
+            rowF.With(Gallery.demoOtpForm);
+            rowF.With(bOtp);
+            Panel colF = Panel.Column().Gap(app.Scale(8));
+            colF.With(rowF);
+            colF.With(Gallery.otpFormLog);
+            Gallery.LayoutAuto(app, colF, name, px, y + app.Scale(34), w - app.Scale(36),
+                app.Scale(110));
+        } else if (name == "InputOtp.allowinput") {
+            Panel colA = Panel.Column().Gap(app.Scale(10));
+            colA.With(Gallery.Captioned(app, Gallery.demoOtpDigits,
+                Gallery.T("Filter = Input.OnlyDigits — letters are silently dropped",
+                          "Filter = Input.OnlyDigits — 字母被静默丢弃")));
+            colA.With(Gallery.Captioned(app, Gallery.demoOtpLetters,
+                Gallery.T("Filter = InputOtp.OnlyLetters — digits are silently dropped",
+                          "Filter = InputOtp.OnlyLetters — 数字被静默丢弃")));
+            Gallery.LayoutAuto(app, colA, name, px, y + app.Scale(34), w - app.Scale(36),
+                app.Scale(150));
         } else if (name == "DatePicker") {
             // 各模式并排。月历/宫格弹层由 DatePicker 自己在框架的覆盖
             // 层里画（OnPaintOverlay），所以这里和普通字段没有区别：
@@ -9466,6 +10898,37 @@ class Gallery {
                           "monthrange — 双面板选月区间")));
             Gallery.LayoutAuto(app, row2, name, px, y + app.Scale(116),
                 w - app.Scale(36), app.Scale(70));
+        } else if (name == "ColorPicker") {
+            // 弹层由 ColorPicker 自己在框架的覆盖层里画
+            // （OnPaintOverlay），这里和普通字段没有区别：排进去就行。
+            Panel col = Panel.Column().Gap(app.Scale(10));
+            col.With(new Label {
+                Text = Gallery.T("value = ", "当前值 = ")
+                    + Gallery.demoCp.Text()
+                    + Gallery.T("  -- drag the panel / bars, or type in any format.",
+                                "  —— 拖色盘 / 色条，或直接输入任意格式。"),
+                Class = "secondary" });
+            col.With(Gallery.demoCp);
+            Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34),
+                w - app.Scale(36), app.Scale(76));
+        } else if (name == "ColorPicker.noalpha") {
+            Panel col = Panel.Column().Gap(app.Scale(10));
+            col.With(Gallery.Captioned(app, Gallery.demoCpNoAlpha,
+                Gallery.T("showAlpha = false -- the alpha bar is hidden and the value is always opaque (rgb() / #RRGGBB).",
+                          "showAlpha = false —— 透明度条隐藏，取值恒为不透明（rgb() / #RRGGBB）。")));
+            col.With(Gallery.Captioned(app, Gallery.demoCpHex,
+                Gallery.T("modes = [\"hex\"] -- the format tabs collapse to one, the value reads #RRGGBBAA.",
+                          "modes = [\"hex\"] —— 格式页签只剩一个，取值恒为 #RRGGBBAA。")));
+            Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34),
+                w - app.Scale(36), app.Scale(150));
+        } else if (name == "ColorPicker.form") {
+            // 配合表单：data 双向绑定 model.cpForm，Change 报 LIVE STATES，
+            // 下方灰字实时回显最新取值文本。
+            Panel colF = Panel.Column().Gap(app.Scale(8));
+            colF.With(Gallery.demoCpForm);
+            colF.With(Gallery.cpFormLog);
+            Gallery.LayoutAuto(app, colF, name, px, y + app.Scale(34),
+                w - app.Scale(36), app.Scale(90));
         } else if (name == "Avatar.shape") {
             Avatar aC = new Avatar("A", 44, "");
             Avatar aR = new Avatar("R", 44, "");
@@ -9508,6 +10971,9 @@ class Gallery {
         } else if (name == "Switch.states") {
             // 每帧组装行是本文件 radio/checkbox 演示的同一写法：开关的
             // 状态都在模型字段里，行本身只是当帧的排布。
+            Switch swMini = new Switch();
+            swMini.Size = "tiny";
+            swMini.data = Gallery.model.toggle;
             Switch swTiny = new Switch();
             swTiny.Class = "small";
             swTiny.data = Gallery.model.toggle;
@@ -9516,16 +10982,21 @@ class Gallery {
             swLarge.data = Gallery.model.toggle;
             Switch swLoading = new Switch();
             swLoading.Loading = true;
+            Switch swSquare = new Switch();
+            swSquare.Round = false;
+            swSquare.data = Gallery.model.toggleB;
             Switch swOff = new Switch();
             swOff.data = Gallery.model.toggleB;
             Switch swDis = new Switch();
             swDis.Disabled = true;
             swDis.data = Gallery.model.toggle;
             Flex row = Flex.Wrapped().Gap(app.Scale(16));
+            row.With(swMini);
             row.With(swTiny);
             row.With(Gallery.demoSwitch);
             row.With(swLarge);
             row.With(swLoading);
+            row.With(swSquare);
             row.With(swOff);
             row.With(swDis);
             Panel col = Panel.Column().Gap(app.Scale(6));
@@ -9567,6 +11038,179 @@ class Gallery {
             col.With(Gallery.demoHowhearNote);
             Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34),
                              w - app.Scale(36), app.Scale(130));
+        } else if (name == "Switch.settings") {
+            // 设置卡片行：卡片（Column + 卡片表面）里一行 Flex——左侧
+            // 标题 + 描述，右侧开关由 grow 占位推到行尾；底部一行实时
+            // 汇总启用数。行每帧重建，开关是保留态。
+            Panel col = Panel.Column().Gap(app.Scale(8));
+            col.With(Gallery.SettingsRow(app,
+                Gallery.T("Background sync", "后台同步"),
+                Gallery.T("Changes upload automatically while you work",
+                    "改动在工作时自动上传"),
+                Gallery.demoSetSync));
+            col.With(Gallery.SettingsRow(app,
+                Gallery.T("Compact rows", "紧凑行距"),
+                Gallery.T("Fit more content on screen", "一屏容纳更多内容"),
+                Gallery.demoSetCompact));
+            col.With(Gallery.SettingsRow(app,
+                Gallery.T("Public profile", "公开资料"),
+                Gallery.T("Anyone can see your stats", "任何人都能看到你的统计"),
+                Gallery.demoSetPublic));
+            int n = (Gallery.model.setSync ? 1 : 0)
+                + (Gallery.model.setCompact ? 1 : 0)
+                + (Gallery.model.setPublic ? 1 : 0);
+            col.With(new Label {
+                Text = Gallery.T(Convert.ToString(n) + " of 3 enabled",
+                    Convert.ToString(n) + " / 3 项已启用"),
+                Class = "secondary" });
+            Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34),
+                             w - app.Scale(36), app.Scale(210));
+            if (n != Gallery.setPrevCount) {
+                Gallery.setPrevCount = n;
+                Gallery.Fired(app, name, Convert.ToString(n) + "/3");
+            }
+        } else if (name == "Switch.async") {
+            // 异步保存：拨动不立即生效——把点击回卷成「没点过」，点亮
+            // Loading 跑约半秒，完成那一刻才落值。操作期间的再点击同样
+            // 被回卷，小状态机只有一个入口，没有事件时序要操心。
+            if (Gallery.asyncPending > 0) {
+                Gallery.model.asyncOn = Gallery.asyncApplied;
+                Gallery.asyncPending = Gallery.asyncPending - 1;
+                if (Gallery.asyncPending == 0) {
+                    Gallery.model.asyncOn = Gallery.asyncTarget;
+                    Gallery.asyncApplied = Gallery.asyncTarget;
+                    Gallery.demoAsyncSw.Loading = false;
+                    Gallery.Fired(app, name, Gallery.T("Saved", "已保存"));
+                }
+            } else if (Gallery.model.asyncOn != Gallery.asyncApplied) {
+                Gallery.asyncTarget = Gallery.model.asyncOn;
+                Gallery.model.asyncOn = Gallery.asyncApplied;
+                Gallery.asyncPending = 36;
+                Gallery.demoAsyncSw.Loading = true;
+            }
+            Panel col = Panel.Column().Gap(app.Scale(8));
+            Flex row = Flex.Wrapped().Gap(app.Scale(12));
+            row.With(Gallery.demoAsyncSw);
+            row.With(new Label { Text = Gallery.T("Cloud sync", "云同步") });
+            col.With(row);
+            Label st = new Label { Class = "secondary" };
+            if (Gallery.asyncPending > 0) {
+                st.Text = Gallery.T("Saving…", "正在保存…");
+            } else if (Gallery.asyncApplied) {
+                st.Text = Gallery.T("Synced just now", "刚刚完成同步");
+            } else {
+                st.Text = Gallery.T("Sync is off", "同步未开启");
+            }
+            col.With(st);
+            Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34),
+                             w - app.Scale(36), app.Scale(120));
+        } else if (name == "Switch.content") {
+            // 内嵌内容：文字/图标画在拇指对侧空区、轨道自动撑宽；
+            // Round=false 得方形；自定义色覆盖皮肤 off/on 底色
+            // （Progress color= 同款约定，0 = 跟随皮肤）。
+            Switch swTxt = new Switch();
+            swTxt.CheckedText = "开";
+            swTxt.UncheckedText = "关";
+            swTxt.data = Gallery.model.toggle;
+            Switch swIco = new Switch();
+            swIco.CheckedIcon = "check";
+            swIco.UncheckedIcon = "close";
+            swIco.data = Gallery.model.toggleB;
+            Switch swSq = new Switch();
+            swSq.Round = false;
+            swSq.CheckedText = "开";
+            swSq.UncheckedText = "关";
+            swSq.data = Gallery.model.toggle;
+            Switch swCol = new Switch();
+            swCol.CheckedColor = 0x1677FF;
+            swCol.UncheckedColor = 0x0E9F6E;
+            swCol.CheckedText = "开";
+            swCol.data = Gallery.model.toggleB;
+            Switch swLoad = new Switch();
+            swLoad.Loading = true;
+            swLoad.CheckedText = "同步";
+            swLoad.data = Gallery.model.toggle;
+            Flex row = Flex.Wrapped().Gap(app.Scale(16));
+            row.With(swTxt);
+            row.With(swIco);
+            row.With(swSq);
+            row.With(swCol);
+            row.With(swLoad);
+            Panel col = Panel.Column().Gap(app.Scale(6));
+            col.With(row);
+            col.With(new Label {
+                Text = Gallery.T("Inner text/icons widen the track; "
+                    + "Round=false squares it; custom colors override "
+                    + "the skin; Loading spins on the thumb and deafens clicks.",
+                    "内嵌文字/图标会撑宽轨道；Round=false 得方形；"
+                    + "自定义色覆盖皮肤底色；Loading 在拇指上转圈并屏蔽点击。"),
+                Class = "secondary" });
+            Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34),
+                             w - app.Scale(36), app.Scale(150));
+        } else if (name == "Switch.value") {
+            // 自定义选中值：开关表达「model.swVal == CheckedValue」，
+            // 拨动写回 10/20（Ant Design checked-value / unchecked-value）。
+            Panel col = Panel.Column().Gap(app.Scale(8));
+            Flex row = Flex.Wrapped().Gap(app.Scale(12));
+            row.With(Gallery.demoSwVal);
+            row.With(new Label { Text = Gallery.T("Server status (int field)",
+                                                  "服务器状态（int 字段）") });
+            col.With(row);
+            Label st = new Label { Class = "secondary" };
+            if (Gallery.model.swVal == 10) {
+                st.Text = Gallery.T("model.swVal = 10 (ON)", "swVal = 10（开）");
+            } else if (Gallery.model.swVal == 20) {
+                st.Text = Gallery.T("model.swVal = 20 (OFF)", "swVal = 20（关）");
+            } else {
+                st.Text = Gallery.T("model.swVal = ", "swVal = ")
+                    + Convert.ToString(Gallery.model.swVal)
+                    + Gallery.T(" (neither value -> switch shows off)",
+                                "（两值皆非 → 开关显示关）");
+            }
+            col.With(st);
+            Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34),
+                             w - app.Scale(36), app.Scale(110));
+        } else if (name == "Radio.cards") {
+            // 卡片选择：点整张卡即选中，不必瞄准小圆点。卡片每帧重建
+            // 没关系——布局完成后读回每张卡的实际矩形，用 Ui.Activate 把
+            // 命中区域注册成整卡：几何点击与聚焦后的键盘激活都算换选。
+            // 单选钮仍是共享 radioPick 的保留态 Radio；选中的卡再描一圈
+            // 主题强调色边，未选中的卡悬停时淡入同色的细边。
+            int id0 = WidgetId.Next();
+            int id1 = WidgetId.Next();
+            int id2 = WidgetId.Next();
+            Panel col = Panel.Column().Gap(app.Scale(8));
+            Panel c0 = Gallery.PickCard(app, Gallery.demoPick0,
+                Gallery.T("Starter", "入门版"),
+                Gallery.T("Up to 3 projects", "最多 3 个项目"),
+                Gallery.model.radioPick == 0);
+            col.With(c0);
+            Panel c1 = Gallery.PickCard(app, Gallery.demoPick1,
+                Gallery.T("Team", "团队版"),
+                Gallery.T("Unlimited projects, shared workspaces",
+                    "项目数不限，共享工作区"),
+                Gallery.model.radioPick == 1);
+            col.With(c1);
+            Panel c2 = Gallery.PickCard(app, Gallery.demoPick2,
+                Gallery.T("Enterprise", "企业版"),
+                Gallery.T("SSO, audit logs, dedicated support",
+                    "SSO 登录、审计日志、专属支持"),
+                Gallery.model.radioPick == 2);
+            col.With(c2);
+            Gallery.LayoutAuto(app, col, name, px, y + app.Scale(34),
+                             w - app.Scale(36), app.Scale(230));
+            StyleBox cards = Style.Of(app, "card", "", Style.SNormal());
+            int acc = cards.AccentOr(0);
+            int rad = cards.RadiusOr(t.borderRadiusMedium);
+            Gallery.PickCardHit(app, id0, c0, 0, acc, rad);
+            Gallery.PickCardHit(app, id1, c1, 1, acc, rad);
+            Gallery.PickCardHit(app, id2, c2, 2, acc, rad);
+            if (Gallery.model.radioPick != Gallery.radioPickPrev) {
+                Gallery.radioPickPrev = Gallery.model.radioPick;
+                Gallery.Fired(app, name, Gallery.T("Picked -> plan ",
+                    "已选择 -> 套餐 ")
+                    + Convert.ToString(Gallery.radioPickPrev + 1));
+            }
         } else if (name == "CheckboxGroup") {
             // 子项留在 Gallery.demoCbg 上，勾选状态跨帧保持。“全选”
             // 父项就是一个真的 Checkbox：三态由 Indeterminate 表达
@@ -9604,7 +11248,9 @@ class Gallery {
             c.DrawText(px + app.Scale(46), py + app.Scale(28), "Copy the API example below to use it.", t.textSecondary, t.fontSizeSmall);
         }
         c.PopClip();
-        Gallery.Audit(app, name, x, y, w, h, rendered);
+        if (!measureOnly) {
+            Gallery.Audit(app, name, x, y, w, h, rendered);
+        }
         return h;
     }
 
@@ -9850,6 +11496,21 @@ class Gallery {
             DataTable.RenderSource(app, px, py + app.Scale(12), w - app.Scale(36),
                 app.Scale(336), Gallery.bigCols, Gallery.bigSource,
                 Gallery.bigTableState);
+            // Export Excel: streams the whole virtual view to a real .xlsx on a
+            // worker thread; the status line below reports progress/done.
+            if (Gallery.bigExportBtn == null) {
+                Gallery.bigExportBtn = new Button { Text = Gallery.T("Export Excel", "导出 Excel") };
+                Gallery.bigExportBtn.Click += Gallery.OnBigExportClick;
+            }
+            Gallery.bigExportBtn.Text = Gallery.T("Export Excel", "导出 Excel");
+            int gexY = py + app.Scale(356);
+            Gallery.bigExportBtn.Render(app, px, gexY, app.Scale(130));
+            if (Gallery.bigExportStatus != null && Gallery.bigExportStatus != "") {
+                app.canvas.DrawStyledText(
+                    Style.Of(app, "label", "secondary", Style.SNormal()),
+                    px + app.Scale(142), gexY + app.Scale(6), Gallery.bigExportStatus,
+                    app.theme.textPrimary, app.theme.fontSizeMedium);
+            }
         } else if (name == "DataTable") {
             List<DataColumn> cols = new List<DataColumn>();
             // Every column is named, so the styler below and any handler can
@@ -9879,8 +11540,24 @@ class Gallery {
                 Style.Of(app, "label", "secondary", Style.SNormal()),
                 px, py - app.Scale(20), Gallery.T("Team/Name frozen left, Total frozen right — scroll sideways and both edges stay put · drag a header to reorder · right-click to freeze to either edge/group/aggregate/insert/delete · click a cell, then arrows/Tab/PgUp/PgDn · Ctrl+C/V · F2 edits: Score spins, Dept picks from a list, Name is required · the last row adds a new one; Ctrl+Del removes, Ctrl+Z puts it back · a CellStyler tints rows under 80, colours Score by band and paints City itself", "Team/Name 冻结在左、Total 冻结在右——横向滚动时两侧都不动 · 拖动表头可换序 · 右键可冻结到左/右、分组/汇总/插入/删除 · 点击单元格后可用方向键/Tab/PgUp/PgDn · Ctrl+C/V · F2 编辑：Score 可微调，Dept 下拉选择，Name 必填 · 末行可新增，Ctrl+Del 删除、Ctrl+Z 撤销 · CellStyler 为低于 80 分的行着色、按区间给 Score 上色，并自绘 City 列"),
                 app.theme.textPrimary, app.theme.fontSizeMedium);
+            Gallery.dtDemoCols = cols;
             DataTable.Render(app, px, py, w - app.Scale(36),
-                app.Scale(280), cols, Gallery.demoRows, Gallery.demoTableState);
+                app.Scale(256), cols, Gallery.demoRows, Gallery.demoTableState);
+            // Export Excel: async streaming export of this small grid, with the
+            // progress/result reported on the status line below the table.
+            if (Gallery.dtExportBtn == null) {
+                Gallery.dtExportBtn = new Button { Text = Gallery.T("Export Excel", "导出 Excel") };
+                Gallery.dtExportBtn.Click += Gallery.OnDtExportClick;
+            }
+            Gallery.dtExportBtn.Text = Gallery.T("Export Excel", "导出 Excel");
+            int dexY = py + app.Scale(266);
+            Gallery.dtExportBtn.Render(app, px, dexY, app.Scale(130));
+            if (Gallery.dtExportStatus != null && Gallery.dtExportStatus != "") {
+                app.canvas.DrawStyledText(
+                    Style.Of(app, "label", "secondary", Style.SNormal()),
+                    px + app.Scale(142), dexY + app.Scale(6), Gallery.dtExportStatus,
+                    app.theme.textPrimary, app.theme.fontSizeMedium);
+            }
         } else if (name == "Compose") {
             // Fluent retained-mode composition: a titled card holding a column
             // of a label, a progress bar and a row of buttons — all nested with
@@ -10475,11 +12152,39 @@ class Gallery {
             .AddProp("size", "int", "-", "Glyph size in px.")
             .AddProp("color", "int", "-", "ARGB stroke/fill color.")
             .AddEvent("Names()", "List<string>", "All available icon names.");
+        Gallery.Add(list, "Basic", "IconSvg",
+            Gallery.T("997 curated Tabler icons (MIT, generated from upstream SVG into IconSvgData) drawn through the runtime's SVG raster cache. Each (name, size, colour) combination rasterizes once and is re-rastered on demand if the runtime image cache evicts it. Names are Tabler's own. Nest the IconView widget in a Flex/Panel tree (below); DrawGlyph/DrawGlyphIn also serve these glyphs for the classic semantic names, falling back to the hand-drawn vector set when a name has no SVG form.",
+                "997 个精选 Tabler 图标（MIT，由上游 SVG 生成进 IconSvgData），经运行时 SVG 光栅缓存绘制。每个（名称, 尺寸, 颜色）组合只光栅一次，被运行时图像缓存逐出后按需重光栅。名字用 Tabler 原名。用 IconView 控件嵌进 Flex/Panel 组件树（如下）；DrawGlyph/DrawGlyphIn 对经典语义名也优先走这套 SVG，没有 SVG 形的名字回退手绘矢量集。"),
+            "Flex row = Flex.Wrapped().Gap(8);\nrow.With(new IconView { Name = \"home\" });\nrow.With(new IconView { Name = \"settings\", Box = 32 });\nrow.With(new IconView { Name = \"heart\", Box = 32, Color = app.theme.primary });\n\n// 或直接画：\nIconSvg.Draw(c, \"home\", x, y, 24, color);\nIconSvg.DrawIn(c, rx, ry, rw, rh, \"settings\", color);")
+            .Json("{\n  \"type\": \"IconView\",\n  \"name\": \"icon\",\n  \"glyph\": \"home\",\n  \"size\": 24\n}")
+            .AddProp("name", "string", "-", "Tabler icon name (see the samples above).")
+            .AddProp("box", "int", "-", "Square size in px (min 4).")
+            .AddProp("color", "int", "-", "ARGB; alpha<255 becomes fill/stroke opacity.")
+            .AddEvent("Names()", "List<string>", "All icon names, sorted.")
+            .AddEvent("Count()", "int", "Icons in the table.")
+            .AddDemo("Basic usage",
+                Gallery.T("Nest the IconView widget in a Flex/Panel tree and let layout measure and arrange it. Sizes and colours are props; alpha below 255 becomes fill/stroke opacity. The classic semantic names (close/save/undo...) resolve through DrawGlyph to this set.",
+                    "把 IconView 控件嵌进 Flex/Panel 组件树，交给布局测量排列。尺寸与颜色都是属性；alpha<255 会落到 fill/stroke 不透明度。经典语义名（close/save/undo…）经 DrawGlyph 也解析到这套图标。"),
+                "IconSvg", 240,
+                "Flex row = Flex.Wrapped().Gap(8);\nrow.With(new IconView { Name = \"home\" });\nrow.With(new IconView { Name = \"settings\", Box = 32 });\nrow.With(new IconView { Name = \"heart\", Box = 32, Color = app.theme.primary });\n\n// 或直接画：\nIconSvg.Draw(c, \"home\", x, y, 24, color);",
+                "{\n  \"type\": \"IconView\",\n  \"name\": \"icon\",\n  \"glyph\": \"home\",\n  \"size\": 24\n}")
+            .AddDemo("Icon catalog",
+                Gallery.T("The first 120 names of the table in alphabetical order -- hover to highlight, click to copy the name. The full 997-name list is IconSvg.Names(); the classic semantic names on the Icon page draw from this set through DrawGlyph too.",
+                    "表中前 120 个名字（字母序）——悬停高亮，点击复制名字。完整 997 个见 IconSvg.Names()；Icon 页的经典语义名也经 DrawGlyph 从这套取形。"),
+                "IconSvg.catalog", 400,
+                "IconSvg.Draw(c, \"home\", x, y, 24, app.theme.textPrimary);\nforeach (string n in IconSvg.Names()) { /* browse / filter */ }",
+                "{\n  \"type\": \"IconView\",\n  \"name\": \"icon\",\n  \"glyph\": \"home\",\n  \"size\": 24\n}")
+            .AddDemo("Software icons",
+                Gallery.T("The window/app-chrome batch: window frames, minimize/maximize/restore, collapse and fold arrows, pins, locks, power and keys -- the shapes title bars, dialogs and tray menus are built from. Each cell is an IconView + Label nested in a wrapped Flex.",
+                    "软件/窗口铬件专用的一批：窗口框架、最小化/最大化/还原、折叠展开、图钉、锁、电源、密钥——标题栏、对话框、托盘菜单都从这批取形。每格是 IconView + Label 嵌在自动换行的 Flex 里。"),
+                "IconSvg.software", 90,
+                "Flex batch = Flex.Wrapped().Gap(18);\nFlex cell = Flex.Column().Gap(6);\ncell.With(new IconView { Name = \"lock-open\", Box = 28 });\ncell.With(new Label { Text = \"lock-open\", Class = \"hint\" });\nbatch.With(cell);",
+                "{\n  \"type\": \"IconView\",\n  \"name\": \"icon\",\n  \"glyph\": \"lock-open\",\n  \"size\": 28\n}");
     }
 
     static void BuildDataEntry(List<Comp> list) {
         Comp inp = new Comp("Data Entry", "Input",
-            "A single-line text field. Construct it with a hint, bind its `.data` to a plain model field for two-way editing, then Render(app, x, y, w, h) each frame; GetText()/SetText() also read and replace the value. Naive UI style props: size (tiny/small/medium/large), clearable (X button when text is non-empty and field is focused), autoselect (auto-select all on focus, for 'click to replace' fields). Naive UI parity: prefix/suffix text + prefixIcon slots, loading spinner, showCount/maxlen (+count-graphemes), round, validation status (success/warning/error), passively-activated, allow-input filtering, and Clear/Focus/Blur/SelectAll/ScrollToEnd manual ops.", "");
+            "A single-line text field. Construct it with a hint, bind its `.data` to a plain model field for two-way editing, then Render(app, x, y, w, h) each frame; GetText()/SetText() also read and replace the value. Naive UI style props: size (tiny/small/medium/large), clearable (X button when text is non-empty and field is focused), autoselect (auto-select all on focus, for 'click to replace' fields).", "");
         inp.AddDemo("Basic", "Construct with a hint, bind `.data` to a model field, Render each frame.",
             "Input", 120,
             "class Form { string name; }\nForm form = new Form();\nform.name = \"\";\nInput name = new Input(\"your name\");\nname.data = form.name;   // two-way: edits flow back into form.name\n// each frame:\nname.Render(app, 40, 40, 260, 34);", "{\n  \"type\": \"Input\",\n  \"name\": \"name\",\n  \"hint\": \"your name\",\n  \"bind\": \"form.name\"\n}");
@@ -10565,15 +12270,75 @@ class Gallery {
         inp.AddProp("w", "int", "-", "Field width in pixels (Render argument).");
         inp.AddProp("h", "int", "-", "Field height in pixels (Render argument).");
         list.Add(inp);
+        Comp otp = new Comp("Data Entry", "Input OTP",
+            "One-time-code input (Ant Design Input.OTP): N single-character cells (default 6) you type across. Click a cell to make it active, arrows/Home/End move the caret, Backspace clears and walks back, Ctrl+V pastes into consecutive cells. Supports mask mode, block (fill width), readonly/disabled/warning/error states, grouped rendering with separators, three sizes, and an allow-input filter. Bind `.data` to a model field for two-way editing.", "");
+        otp.AddDemo("Basic", "Six cells by default; typing fills left to right, Backspace walks back through filled cells.",
+            "InputOtp", 90,
+            "InputOtp code = new InputOtp();   // 6 cells\ncode.SetValue(\"123456\");     // optional prefill\n// each frame:\ncode.Render(app, 40, 40, 260, 34);\nstring v = code.GetCode();", "{\n  \"type\": \"InputOtp\",\n  \"length\": 6\n}");
+        otp.AddDemo("Password mode", "MaskMode renders each filled cell as a dot (or your MaskChar) — the code is still a plain string in the model.",
+            "InputOtp.mask", 90,
+            "InputOtp code = new InputOtp(6);\ncode.maskMode = true;\ncode.maskChar = \"\";   // empty -> '•'\ncode.Render(app, 40, 40, 260, 34);",
+            "{\n  \"type\": \"InputOtp\",\n  \"length\": 6,\n  \"mask\": true\n}");
+        otp.AddDemo("Block", "Block stretches the cells across the whole width passed to Render, like a full-width form field.",
+            "InputOtp.block", 90,
+            "InputOtp code = new InputOtp(6);\ncode.block = true;\ncode.Render(app, 40, 40, 420, 34);",
+            "{\n  \"type\": \"InputOtp\",\n  \"block\": true\n}");
+        otp.AddDemo("Status", "readonly (focusable, never edits), disabled, and the warning / error border colors from the field status classes.",
+            "InputOtp.status", 230,
+            "InputOtp ro = new InputOtp();\nro.readonly = true;\nInputOtp di = new InputOtp();\ndi.disabled = true;\nInputOtp warn = new InputOtp();\nwarn.SetStatus(Control.StatusWarning());\nInputOtp err = new InputOtp();\nerr.SetStatus(Control.StatusError());",
+            "[\n  { \"type\": \"InputOtp\", \"readonly\": true },\n  { \"type\": \"InputOtp\", \"disabled\": true },\n  { \"type\": \"InputOtp\", \"status\": \"warning\" },\n  { \"type\": \"InputOtp\", \"status\": \"error\" }\n]");
+        otp.AddDemo("Custom render", "Groups splits the cells into runs with a separator drawn between them (antd: custom render / formatted display).",
+            "InputOtp.group", 90,
+            "InputOtp code = new InputOtp(6);\ncode.Groups.Add(2); code.Groups.Add(2); code.Groups.Add(2);\ncode.separator = \"-\";   // default\ncode.SetValue(\"654321\");  // renders 65-43-21",
+            "{\n  \"type\": \"InputOtp\",\n  \"length\": 6,\n  \"groups\": \"2,2,2\",\n  \"separator\": \"-\"\n}");
+        otp.AddDemo("Size", "small / medium / large map to the otp.small / otp.large skin classes (same height tokens as Input).",
+            "InputOtp.size", 180,
+            "InputOtp a = new InputOtp(); a.Size = \"small\";\nInputOtp b = new InputOtp();          // medium\nInputOtp c = new InputOtp(); c.Size = \"large\";",
+            "[\n  { \"type\": \"InputOtp\", \"size\": \"small\" },\n  { \"type\": \"InputOtp\" },\n  { \"type\": \"InputOtp\", \"size\": \"large\" }\n]");
+        otp.AddDemo("With form", "Bind `.data` to a model field for two-way editing; Complete fires once when the last cell fills, so a Verify button can gate on IsFull().",
+            "InputOtp.form", 110,
+            "class Form { string code; }\nForm form = new Form();\nInputOtp code = new InputOtp(6);\ncode.data = form.code;   // two-way\ncode.Complete += () => { submit(); };",
+            "{\n  \"type\": \"InputOtp\",\n  \"length\": 6,\n  \"bind\": \"form.code\"\n}");
+        otp.AddDemo("Allow-input filter", "Filter rewrites every candidate before it lands (null rejects the edit silently): digits-only or letters-only codes.",
+            "InputOtp.allowinput", 150,
+            "InputOtp num = new InputOtp(6);\nnum.Filter = Input.OnlyDigits;      // letters dropped\nInputOtp word = new InputOtp(6);\nword.Filter = InputOtp.OnlyLetters; // digits dropped",
+            "{\n  \"type\": \"InputOtp\",\n  \"length\": 6,\n  \"allow-input\": \"OnlyDigits\"\n}");
+        otp.AddProp("length", "int", "6", "Number of cells (constructor arg or `length` prop; clamped >= 1, SetLength preserves the prefix).");
+        otp.AddProp("size", "enum", "medium", "small / medium / large (maps to the otp skin classes).");
+        otp.AddProp("maskMode", "bool", "false", "Render filled cells with the mask char instead of the value.");
+        otp.AddProp("maskChar", "string", "\"•\"", "Mask glyph when maskMode is on (empty string falls back to '•').");
+        otp.AddProp("block", "bool", "false", "Stretch cells across the full Render width (antd block).");
+        otp.AddProp("readonly", "bool", "false", "Focusable and visible but never accepts edits.");
+        otp.AddProp("disabled", "bool", "false", "Greyed out; no focus, no edits (inherited from Control).");
+        otp.AddProp("status", "enum", "\"\"", "success / warning / error border tint via SetStatus.");
+        otp.AddProp("groups", "List<int>", "{}", "Cell-group sizes for separated rendering, e.g. {2,2,2} -> '65-43-21'.");
+        otp.AddProp("separator", "string", "\"-\"", "Text drawn between groups when groups is set.");
+        otp.AddProp("filter", "InputFilterFn", "null", "allow-input rewriter over the full candidate string; null rejects the edit (Input.OnlyDigits / InputOtp.OnlyLetters).");
+        otp.AddProp("data", "Binding<string>", "-", "Two-way bound code: `otp.data = model.field;`.");
+        otp.AddEvent("Change", "UiEvent", "Fired after any edit lands.");
+        otp.AddEvent("Complete", "UiEvent", "Fired once on the empty->full transition (Enter also auto-completes when full).");
+        list.Add(otp);
         Gallery.Add(list, "Data Entry", "TextArea",
             Gallery.T("Multiline text input. Owns caret movement (arrows / Home / End), newline editing (Enter) and its own viewport clipping + vertical scrolling (mouse wheel and an auto scrollbar; it keeps the caret in view). Binds to a SignalString.",
-                "多行文本输入。自带光标移动（方向键 / Home / End）、换行编辑（Enter），以及自身的视口裁剪与垂直滚动（鼠标滚轮加自动滚动条，并保持光标可见）。绑定到 SignalString。同 Input 的 Naive UI 对齐项：showCount/maxlen（可按字素计数）、round、status、filter。"),
+                "多行文本输入。自带光标移动（方向键 / Home / End）、换行编辑（Enter），以及自身的视口裁剪与垂直滚动（鼠标滚轮加自动滚动条，并保持光标可见）。绑定到 SignalString。"),
             "class Doc { string body; }\nDoc doc = new Doc();\ndoc.body = \"\";\nTextArea notes = new TextArea(\"Write something...\");\nnotes.data = doc.body;   // two-way\n// each frame:\nnotes.Render(app, 40, 80, 360, 120);")
             .Json("{\n  \"type\": \"TextArea\",\n  \"name\": \"notes\",\n  \"hint\": \"Write something...\",\n  \"bind\": \"doc.body\"\n}")
-            .AddDemo("Show count & status", "TextArea takes the same Naive UI parity props as Input: ShowCount + MaxLen draw \"current / max\" below the box (right-aligned), SetStatus tints the border, Round pulls it to a pill, and Filter rejects unwanted candidates.",
-                "TextArea.enh", 240,
-                "TextArea notes = new TextArea(\"notes...\");\nnotes.showCount = true;\nnotes.maxlen = 100;\nnotes.round = true;\nnotes.SetStatus(Control.StatusWarning());\nnotes.Render(app, 40, 80, 360, 120);",
-                "{\n  \"type\": \"TextArea\",\n  \"show-count\": true,\n  \"maxlength\": 100,\n  \"round\": true\n}")
+            .AddDemo("Show count", "ShowCount + MaxLen draw \"current / max\" below the box (right-aligned), exactly like Input; the cap is enforced per code point.",
+                "TextArea.count", 150,
+                "TextArea notes = new TextArea(\"notes...\");\nnotes.showCount = true;\nnotes.maxlen = 100;\nnotes.Render(app, 40, 80, 360, 120);",
+                "{\n  \"type\": \"TextArea\",\n  \"show-count\": true,\n  \"maxlength\": 100\n}")
+            .AddDemo("Round", "Round = true gives the multiline box soft rounded corners -- a gentler rectangle, not a full-height pill (that shape is reserved for single-line Input, where a stadium actually reads well).",
+                "TextArea.round", 150,
+                "TextArea r = new TextArea(\"round\");\nr.round = true;\nr.Render(app, 40, 80, 360, 120);",
+                "{\n  \"type\": \"TextArea\",\n  \"round\": true\n}")
+            .AddDemo("Validation status", "SetStatus(Control.StatusSuccess()/StatusWarning()/StatusError()) tints the border via the matching textarea:: part -- semantic states without a message.",
+                "TextArea.status", 240,
+                "TextArea ok = new TextArea(\"ok\");\nok.SetStatus(Control.StatusSuccess());\nTextArea warn = new TextArea(\"warn\");\nwarn.SetStatus(Control.StatusWarning());",
+                "{\n  \"type\": \"TextArea\",\n  \"status\": \"warning\"\n}")
+            .AddDemo("Allow-input filter", "Filter (Naive UI allow-input) rewrites every candidate before it lands; rejected text never inserts and the caret stays put. Built-ins: Input.OnlyDigits / Input.NoSpaces.",
+                "TextArea.filter", 150,
+                "TextArea qty = new TextArea(\"digits only\");\nqty.Filter = Input.OnlyDigits;\nqty.maxlen = 8;\nqty.Render(app, 40, 80, 360, 120);",
+                "{\n  \"type\": \"TextArea\",\n  \"allow-input\": \"OnlyDigits\"\n}")
             .AddProp("hint", "string", "\"\"", "Placeholder shown while empty (Create).")
             .AddProp("data", "Binding<string>", "-", "Two-way bound text: `notes.data = doc.body;`.")
             .AddProp("w", "int", "-", "Box width in px (Render).")
@@ -10581,7 +12346,7 @@ class Gallery {
             .AddProp("showCount", "bool", "false", "Draw \"current / max\" below the box, right-aligned (with maxlen).")
             .AddProp("maxlen", "int", "0", "Hard char cap, 0 = unlimited; code points (grapheme clusters with countGraphemes).")
             .AddProp("countGraphemes", "bool", "false", "Count grapheme clusters, like Input.")
-            .AddProp("round", "bool", "false", "Pill border-radius (skin class textarea.round).")
+            .AddProp("round", "bool", "false", "Soft rounded corners for the multiline box (skin class textarea.round); the full pill is single-line Input only.")
             .AddProp("status", "enum", "\"\"", "success/warning/error border tint via SetStatus.")
             .AddProp("filter", "InputFilterFn", "null", "allow-input rewriter (Input.OnlyDigits/NoSpaces built-ins).");
         Gallery.Add(list, "Data Entry", "Checkbox",
@@ -10641,38 +12406,104 @@ class Gallery {
             .AddProp("label", "string", "\"\"", "Text drawn next to the dot.")
             .AddProp("data", "Binding<int>", "-", "Shared selected value; bind the same model field on every radio of a group.")
             .AddProp("value", "int", "-", "This option's value (constructor).")
-            .AddProp("class", "string", "\"\"", "small / large rescale the ring and font; info / success / warning / error recolor the checked ring + dot.")
+            .AddProp("class", "string", "\"\"", "tiny / small / large rescale the ring and font; info / success / warning / error recolor the checked ring + dot.")
+            .AddProp("size", "enum", "medium", "tiny/small/medium/large (Naive UI size prop) — mapped to the same skin classes as `class`.")
+            .AddProp("bordered", "bool", "false", "Bordered variant (Element Plus el-radio border): the whole option becomes an outlined rounded box; the checked outline follows the accent.")
             .AddProp("Disabled", "bool", "false", "Muted look, no hover, no click and no keyboard activation; never fires Change.")
             .AddEvent("Change", "() => void", "Fires when this radio is picked and the group value moves (Render handles the click); disabled radios never fire.")
-            .WithBasic(235)
+            .WithBasic(270)
             .AddDemo(Gallery.T("Dependent choices (disable)", "依赖联动（禁用）"),
                 Gallery.T("The dependency pattern on one field: the note input stays in place but is Disabled unless the group value is the \"Other\" option -- `note.Disabled = model.howhear != 2`, synced each frame from the bound model value, so no event ordering to reason about. For whole-row show/hide plus validation interplay see the Form page's dependent-fields demo.",
                     "单个字段上的依赖形态：备注输入框位置不动，但只有组值选中「其他」才启用——`note.Disabled = model.howhear != 2`，每帧从绑定的模型值同步，不涉及事件时序。整行显隐 + 校验联动的完整形态见 Form 页的「依赖联动」演示。"),
                 "Radio.dependent", 130,
                 "Radio ad     = new Radio(0, \"广告\");     ad.data = model.howhear;\nRadio friend = new Radio(1, \"朋友推荐\"); friend.data = model.howhear;\nRadio other  = new Radio(2, \"其他\");     other.data = model.howhear;\n\n// 备注只在「其他」时可编辑（每帧同步，字段保留态）：\nnote.Disabled = model.howhear != 2;\nnote.data = model.otherNote;",
+                "")
+            .AddDemo(Gallery.T("Bordered", "边框变体"),
+                Gallery.T("Bordered = true turns each option into an outlined rounded box (Element Plus el-radio border): the checked outline follows the accent, semantic classes still apply per option, and a disabled bordered radio greys out entirely.",
+                    "Bordered = true 把每个选项变成描边圆角盒（Element Plus el-radio border）：选中描边跟随强调色，语义色类照常按选项生效，禁用项整盒置灰。"),
+                "Radio.bordered", 160,
+                "Radio a = new Radio(0, \"每日送\");\na.Bordered = true;\na.data = form.ship;\nRadio b = new Radio(1, \"自提\");\nb.Bordered = true;\nb.data = form.ship;\n// 语义色 + 禁用照常可用：\nRadio s = new Radio(0, \"成功\"); s.Bordered = true; s.Class = \"success\";",
+                "{\n  \"type\": \"Radio\",\n  \"label\": \"每日送\",\n  \"bordered\": true,\n  \"bind\": \"form.ship\"\n}")
+            .AddDemo(Gallery.T("Card picker", "卡片选择"),
+                Gallery.T("Options as cards: each row is a card panel holding the radio plus title and description; the picked card fills with the theme's active background (Panel.Plain is an inline fill that beats the stylesheet) and its title turns primary. The radios are the same retained Radio bound to one field -- the cards are just that value made visible.",
+                    "选项卡片化：每行是一张卡片面板，内含单选钮 + 标题 + 描述；选中的卡片用主题高亮色填充（Panel.Plain 内联填充优先于样式表），标题换 primary 色。单选钮还是共享同一字段的保留态 Radio——卡片只是把这个值可视化了。"),
+                "Radio.cards", 230,
+                "Panel col = Panel.Column().Gap(8);\nint id = WidgetId.Next();           // 每张卡一个整卡命中 id\nfor (int i = 0; i < 3; i = i + 1) {\n    Panel card = Panel.Column();\n    card.style = 0;                    // 卡片表面\n    if (model.plan == i) {\n        card.Plain(app.theme.bgActive); // 选中卡：内联高亮\n    }\n    Flex row = Flex.Wrapped().Gap(12);\n    row.With(radios[i]);               // 保留态，绑定 model.plan\n    row.With(new Label { Text = titles[i] });\n    card.With(row);\n    col.With(card);\n}\n// 布局完成后读回卡片实际矩形（bx/by/bw/bh），把命中区注册成整卡：\n// 点卡身任意位置即换选，聚焦后 Enter/Space 同样生效。\nif (Ui.Activate(app, id, card.bx, card.by, card.bw, card.bh)\n    && model.plan != i) {\n    model.plan = i;\n    app.RequestRedraw();\n}",
                 "");
+        Gallery.Add(list, "Data Entry", "RadioGroup",
+            Gallery.T("A radio group container: AddOption hands each label to the group, the group measures and lays the options out, and rows wrap when the width runs out. Selected() is the group's shared SignalInt -- read it directly instead of binding every option to one field by hand (compare the raw Radio page).",
+                "单选组容器：AddOption 把选项交给组，组负责测量与排布，宽度不够时自动换行成多行。Selected() 是全组共享的选中信号（SignalInt）——直接读它即可，不必像裸 Radio 那样逐个把选项绑到同一字段。"),
+            "RadioGroup ship = new RadioGroup();\nship.AddOption(\"当日达配送\");\nship.AddOption(\"门店自提（旗舰店）\");\nship.AddOption(\"快递柜投递\");\n\n// 全组共享一个选中信号：\nint pick = ship.Selected().Get();    // 选中下标\nship.Selected().Changed += () => {   // 组级变更通知\n    Refresh();\n};\n\nform.Add(ship);   // FormGroup / Panel 都能收")
+            .Json("{\"type\": \"RadioGroup\", \"name\": \"ship\", \"options\": [\"当日达配送\", \"门店自提（旗舰店）\", \"快递柜投递\"]}")
+            .AddProp("options", "List<string>", "-", "Added via AddOption(label); the group lays them out and wraps when narrow.")
+            .AddProp("Selected()", "SignalInt", "-", "The group's shared selected index (0-based).")
+            .AddProp("Count()", "int", "-", "How many options the group holds.")
+            .AddEvent("Selected().Changed", "() => void", "Fires when the selection moves (signal-level, not per-option).")
+            .AddDemo("Options with values", "AddOption(label, value) / AddOption(label, value, disabled): each option carries its own int value (Element Plus options; label-field/value-field's explicit counterpart) and can ship disabled. SelectedValue/SetSelectedValue read and write by value; SelectedIndex stays the positional view. SetOptions takes a projected List<RadioOption>.",
+                "RadioGroup.options", 170,
+                "RadioGroup city = new RadioGroup();\ncity.AddOption(\"北京\", 10);\ncity.AddOption(\"上海\", 20);\ncity.AddOption(\"广州\", 30, true);  // disabled option\ncity.Value = form.city;              // group-level two-way binding\ncity.SetSelectedValue(20);           // programmatic, by value\ncity.OnChange(() => { Refresh(); });",
+                "{\n  \"type\": \"RadioGroup\",\n  \"name\": \"city\",\n  \"options\": [\"北京\", \"上海\", \"广州\"]\n}")
+            .AddDemo("Button style", "Buttons = true renders the group as joined segments (Element Plus el-radio-button): shared 1px seams, the checked segment outlined in the accent and drawn last so its border overlaps the seam; Size rescales the whole set. AddOption overload with a disabled option shows the muted segment.",
+                "RadioGroup.buttons", 170,
+                "RadioGroup ship = new RadioGroup();\nship.AddOption(\"当日达配送\");\nship.AddOption(\"门店自提（旗舰店）\");\nship.AddOption(\"快递柜投递\", 3, true);  // disabled segment\nship.Buttons = true;   // joined button segments\nship.Size = \"large\";   // tiny/small/medium/large, whole group",
+                "{\n  \"type\": \"RadioGroup\",\n  \"buttons\": true,\n  \"options\": [\"当日达配送\", \"门店自提（旗舰店）\", \"快递柜投递\"]\n}")
+            .AddProp("Value", "Binding<int>", "-", "Group-level two-way binding by option value: `g.Value = form.city;` (dirty values snap back).")
+            .AddProp("Buttons", "bool", "false", "Button-segment form (Element Plus el-radio-button).")
+            .AddProp("Size", "enum", "medium", "tiny/small/medium/large, applied to every option.")
+            .AddProp("SetSelectedValue(v) / SetSelectedIndex(i)", "void", "-", "Programmatic select (silent; disabled / out-of-range values are ignored).")
+            .AddEvent("Change", "() => void", "Fires when any option is toggled by the user (`g.OnChange(h)`).")
+            .WithBasic(150);
         Gallery.Add(list, "Data Entry", "Switch",
-            Gallery.T("A toggle switch. Bind its `.data` to a bool model field; Render dispatches its own click and keeps the field in sync both ways. Naive UI style props: size (small/medium/large → switch.small/.large skin classes), loading (dimmed track while a remote op is in flight), round (pill thumb by default; class-controlled in skin).",
-                "开关。将 `.data` 绑定到 bool 模型字段；Render 自行处理点击并双向同步该字段。Naive UI 风格 props：size (small/medium/large → 皮肤类 switch.small/.large)、loading (远端操作进行时变暗轨道)、round (默认胶囊形 thumb，类控制)。"),
-            "class Prefs { bool dark; bool sync; }\nPrefs prefs = new Prefs();\nprefs.dark = true;\nprefs.sync = false;\nSwitch dark = new Switch();\ndark.data = prefs.dark;   // two-way\n// Naive UI style variants:\nSwitch small  = new Switch { Size = \"small\" };\nSwitch med    = new Switch { Size = \"medium\" };\nSwitch large  = new Switch { Size = \"large\" };\nSwitch syncing = new Switch { Loading = true };  // dimmed track\n// each frame (dispatches its own click):\ndark.Render(app, 40, 80);\nsmall.Render(app, 200, 80);\nmed.Render(app, 320, 80);\nlarge.Render(app, 480, 80);\nsyncing.Render(app, 620, 80);")
-            .Json("{\n  \"type\": \"Column\",\n  \"name\": \"switches\",\n  \"gap\": 8,\n  \"children\": [\n    { \"type\": \"Switch\", \"name\": \"dark\",   \"bind\": \"prefs.dark\", \"size\": \"medium\" },\n    { \"type\": \"Switch\", \"name\": \"small\",  \"size\": \"small\" },\n    { \"type\": \"Switch\", \"name\": \"large\",  \"size\": \"large\" },\n    { \"type\": \"Switch\", \"name\": \"sync\",   \"loading\": true }\n  ]\n}")
+            Gallery.T("A toggle switch. Bind its `.data` to a bool model field; Render dispatches its own click and keeps the field in sync both ways. Props: size (tiny/small/medium/large → switch.tiny/.small/.large skin classes), loading (thumb spinner + dimmed track; clicks are deaf while it's on), round (pill by default, false gives a small-radius square), checkedText/uncheckedText and checkedIcon/uncheckedIcon (inner content -- the track widens to fit), checkedColor/uncheckedColor (0 = skin), and the int value axis: checkedValue/uncheckedValue with `.value` bound to an int field (or Switch.BindValue(signal, on, off)) so the switch means \"value == checkedValue\".",
+                "开关。将 `.data` 绑定到 bool 模型字段；Render 自行处理点击并双向同步。Props：size（tiny/small/medium/large → 皮肤类 switch.tiny/.small/.large）、loading（拇指转圈 + 轨道变暗，加载期间不响应点击）、round（默认胶囊形，false 得小圆角方形）、checkedText/uncheckedText 与 checkedIcon/uncheckedIcon（内嵌文字/图标，轨道自动撑宽）、checkedColor/uncheckedColor（0 = 跟随皮肤）、以及 int 值轴：checkedValue/uncheckedValue 配 `.value` 绑定 int 字段（或 Switch.BindValue(信号, 开值, 关值)），开关表达「值 == 选中值」。"),
+            "class Prefs { bool dark; bool sync; int stage; }\nPrefs prefs = new Prefs();\nprefs.dark = true;\nprefs.sync = false;\nprefs.stage = 20;\nSwitch dark = new Switch();\ndark.data = prefs.dark;   // two-way bool\n// Naive UI style variants:\nSwitch tiny   = new Switch { Size = \"tiny\" };\nSwitch small  = new Switch { Size = \"small\" };\nSwitch large  = new Switch { Size = \"large\" };\nSwitch syncing = new Switch { Loading = true };  // thumb spinner\n// inner content (track widens), square, custom colors:\nSwitch cn = new Switch { CheckedText = \"开\", UncheckedText = \"关\" };\nSwitch sq = new Switch { Round = false };\nSwitch col = new Switch { CheckedColor = 0x1677FF };\n// int value axis: on means prefs.stage == 10, off writes back 10/20\nSwitch stage = new Switch { CheckedValue = 10, UncheckedValue = 20 };\nstage.value = prefs.stage;\n// each frame (dispatches its own click):\ndark.Render(app, 40, 80);\ncn.Render(app, 120, 80);\nstage.Render(app, 260, 80);")
+            .Json("{\n  \"type\": \"Column\",\n  \"name\": \"switches\",\n  \"gap\": 8,\n  \"children\": [\n    { \"type\": \"Switch\", \"name\": \"dark\",   \"bind\": \"prefs.dark\", \"size\": \"medium\" },\n    { \"type\": \"Switch\", \"name\": \"small\",  \"size\": \"small\" },\n    { \"type\": \"Switch\", \"name\": \"large\",  \"size\": \"large\" },\n    { \"type\": \"Switch\", \"name\": \"sync\",   \"loading\": true },\n    { \"type\": \"Switch\", \"name\": \"cn\",     \"checkedText\": \"开\", \"uncheckedText\": \"关\" }\n  ]\n}")
             .AddProp("data", "Binding<bool>", "-", "On/off state (two-way): `sw.data = model.field;`.")
-            .AddProp("size", "enum", "medium", "small/medium/large (Naive UI size).")
-            .AddProp("loading", "bool", "false", "Dimmed track -- 'op in flight' state (Naive UI loading).")
-            .AddProp("round", "bool", "true", "Pill-shaped thumb (Naive UI round).")
+            .AddProp("value", "Binding<int>", "-", "Int binding axis (two-way): with checkedValue/uncheckedValue the switch means `value == checkedValue`; takes precedence over `data` when both are set.")
+            .AddProp("checkedValue / uncheckedValue", "int", "1 / 0", "Values written by the int value axis (Ant Design checked-value / unchecked-value).")
+            .AddProp("size", "enum", "medium", "tiny/small/medium/large → switch.tiny/.small/.large skin classes.")
+            .AddProp("loading", "bool", "false", "Thumb arc spinner + dimmed track; clicks and keyboard are ignored while on (Ant Design loading).")
+            .AddProp("round", "bool", "true", "Pill track + round thumb; false gives the small-radius square shape (Ant Design shape=\"square\").")
+            .AddProp("checkedText / uncheckedText", "string", "-", "Inner text per state; the track widens to fit (Ant Design children).")
+            .AddProp("checkedIcon / uncheckedIcon", "string", "-", "Inner icon per state (Gui.Icon glyph name, e.g. \"check\" / \"close\").")
+            .AddProp("checkedColor / uncheckedColor", "color", "0", "Custom track colour per state; 0 = follow the skin (Progress color= convention).")
             .AddEvent("Change", "() => void", "Fires when flipped (Render handles the click).")
             .WithBasic(60)
-            .AddDemo(Gallery.T("Sizes, loading & disabled", "尺寸 / 加载 / 禁用"),
-                Gallery.T("Every variant on one row: size is a class (small / medium / large), Loading dims the track while a remote op is in flight, and Disabled greys the switch out and ignores clicks. The interactive switches all bind `model.toggle`, so the caption below reads the model field back live.",
-                    "一行看全所有变体：尺寸是 class（small / medium / large），Loading 在远端操作进行时变暗轨道，Disabled 置灰且忽略点击。可交互的开关都绑定 `model.toggle`，下方文字实时回读模型字段。"),
+            .AddDemo(Gallery.T("Sizes, square, loading & disabled", "尺寸 / 方形 / 加载 / 禁用"),
+                Gallery.T("Every variant on one row: size is a class (tiny / small / medium / large -- tiny is Switch's own fourth tier), Loading dims the track and spins an arc on the thumb while a remote op is in flight, Round=false squares the shape, and Disabled greys the switch out and ignores clicks. The interactive switches all bind `model.toggle`, so the caption below reads the model field back live.",
+                    "一行看全所有变体：尺寸是 class（tiny / small / medium / large——tiny 是 Switch 独有的第四档），Loading 变暗轨道并在拇指上叠画弧线（远端操作进行中），Round=false 得方形，Disabled 置灰且忽略点击。可交互的开关都绑定 `model.toggle`，下方文字实时回读模型字段。"),
                 "Switch.states", 110,
-                "Switch tiny   = new Switch { Size = \"small\" };\ntiny.data = model.on;\nSwitch big    = new Switch { Class = \"large\" };  // class 同样生效\nbig.data = model.on;\nSwitch busy   = new Switch { Loading = true };   // op in flight\nSwitch locked = new Switch();\nlocked.Disabled = true;\n\n// caption reads the model field every frame:\nstatus.Text = model.on ? \"ON\" : \"OFF\";",
+                "Switch tiny   = new Switch { Size = \"tiny\" };\ntiny.data = model.on;\nSwitch big    = new Switch { Class = \"large\" };  // class 同样生效\nbig.data = model.on;\nSwitch busy   = new Switch { Loading = true };   // thumb spinner\nSwitch sq     = new Switch { Round = false };    // 方形\nSwitch locked = new Switch();\nlocked.Disabled = true;\n\n// caption reads the model field every frame:\nstatus.Text = model.on ? \"ON\" : \"OFF\";",
+                "")
+            .AddDemo(Gallery.T("Inner content & custom colors", "内嵌内容与自定义颜色"),
+                Gallery.T("Text or icons live inside the track on the free side of the thumb, drawn in the thumb's own colour and cross-faded with the slide animation; the track widens to fit the larger of the two states. Round=false squares the shape, CheckedColor/UncheckedColor override the skin off/on colours (0 = skin), and Loading keeps working on top of all of it -- spinner on the thumb, clicks ignored.",
+                    "文字/图标画在轨道内拇指的对侧，用拇指底色随滑动动画交叉淡显，轨道按两态较宽者自动撑宽。Round=false 得方形；CheckedColor/UncheckedColor 覆盖皮肤 off/on 底色（0 = 跟随皮肤）；Loading 可叠加其上——拇指转圈、点击失聪。"),
+                "Switch.content", 150,
+                "// 内嵌文字：轨道自动撑宽\nSwitch cn = new Switch { CheckedText = \"开\", UncheckedText = \"关\" };\ncn.data = model.on;\n// 内嵌图标（Gui.Icon 名）\nSwitch ico = new Switch { CheckedIcon = \"check\", UncheckedIcon = \"close\" };\n// 方形 + 自定义色（0 = 跟随皮肤）\nSwitch sq = new Switch { Round = false, CheckedText = \"开\", UncheckedText = \"关\" };\nSwitch col = new Switch { CheckedColor = 0x1677FF, UncheckedColor = 0x0E9F6E };\nSwitch busy = new Switch { Loading = true, CheckedText = \"同步\" };",
+                "")
+            .AddDemo(Gallery.T("Custom checked value (int field)", "自定义选中值（int 字段）"),
+                Gallery.T("The switch can drive an int field instead of a bool: bind `.value` and say which value means \"on\" with CheckedValue / UncheckedValue -- the switch shows on exactly when `value == CheckedValue`, and flipping writes those values back. Values outside the pair read as off, and a Change handler can round-trip through a designer-friendly string model too.",
+                    "开关也能驱动 int 字段而非 bool：绑定 `.value`，用 CheckedValue / UncheckedValue 指明「哪个值算选中」——开关在「值 == CheckedValue」时为开，拨动则写回这两个值。绑定外的值一律显示为关。"),
+                "Switch.value", 110,
+                "class Server { int stage; }   // 10 = 在线, 20 = 离线\nServer srv = new Server();\nsrv.stage = 20;\nSwitch st = new Switch();\nst.value = srv.stage;         // int 绑定轴\nst.CheckedValue = 10;         // 哪个值算「开」\nst.UncheckedValue = 20;       // 拨关写回的值\nst.Change += () => {\n    status.Text = Convert.ToString(srv.stage);  // 读回 10/20\n};",
                 "")
             .AddDemo(Gallery.T("Master toggle (disable a group)", "总开关（禁用整组）"),
                 Gallery.T("One switch silences a whole section: Disabled inherits down the tree, so `group.Disabled = !model.masterOn` greys out and deafens every child switch at once -- no per-child bookkeeping. The gallery syncs it each frame from the model; a Change handler on the master works the same.",
                     "一个开关管住一组：Disabled 沿树向下继承，`group.Disabled = !model.masterOn` 一句就把子开关全部置灰并失聪——不必逐个记录状态。gallery 这里每帧从模型值同步；订阅总开关的 Change 再赋值效果相同。"),
                 "Switch.master", 140,
                 "Panel group = Panel.Column().Gap(8);\ngroup.With(row(\"邮件提醒\", alertsSwitch));\ngroup.With(row(\"每周摘要\", digestSwitch));\n\n// 每帧：总开关的模型值禁用整组\nmaster.data = model.masterOn;\ngroup.Disabled = !model.masterOn;   // 沿树继承：子项一起置灰失效",
+                "")
+            .AddDemo(Gallery.T("Settings rows (card list)", "设置卡片行"),
+                Gallery.T("The settings-page pattern: each row is a card panel (title + hint on the left, the switch pushed to the end by a flex grow spacer), and a summary line reads the three model fields back live. The rows themselves are rebuilt every frame -- only the switches are retained -- so the layout is just data.",
+                    "设置页形态：每行是一张卡片面板（左侧标题 + 描述，开关用 flex grow 占位推到行尾），底部一行实时汇总三个模型字段的启用数。行本身每帧重建——只有开关是保留态——布局即数据。"),
+                "Switch.settings", 230,
+                "Panel col = Panel.Column().Gap(8);\ncol.With(SettingsRow(\"后台同步\", \"改动自动上传\", syncSwitch));\ncol.With(SettingsRow(\"紧凑行距\", \"一屏容纳更多\", compactSwitch));\ncol.With(SettingsRow(\"公开资料\", \"任何人可见\", publicSwitch));\n\n// 一行 = 卡片表面 + 左文右开关（grow 占位推到行尾）：\nstatic Panel SettingsRow(string title, string desc, Switch sw) {\n    Panel card = Panel.Column();\n    card.style = 0;                 // 卡片表面\n    Flex row = Flex.Wrapped().Gap(12);\n    row.With(new Label { Text = title });\n    Label sp = new Label();\n    sp.Class = \"grow\";              // 吃掉剩余宽度\n    row.With(sp);\n    row.With(sw);\n    card.With(row);\n    return card;\n}",
+                "")
+            .AddDemo(Gallery.T("Async flip (loading)", "异步切换（loading）"),
+                Gallery.T("The loading prop doing its real job: flipping does not write the value -- the click is rolled back, Loading lights the track for about half a second (the simulated remote op), and the value lands when the op completes. Extra clicks mid-flight are rolled back the same way, so the little state machine has exactly one entry point and no event ordering to reason about.",
+                    "loading 的真实用途：拨动不立即写值——先把点击回卷成「没点过」，Loading 点亮轨道约半秒（模拟远端操作），完成那一刻值才落地。操作期间的再点击同样被回卷，小状态机只有一个入口，不存在事件时序问题。"),
+                "Switch.async", 120,
+                "sw.data = model.asyncOn;\n// 每帧：\nif (pending > 0) {\n    model.asyncOn = applied;          // 回卷操作中的拨动\n    pending = pending - 1;\n    if (pending == 0) {\n        model.asyncOn = target;       // 完成那一刻才落值\n        applied = target;\n        sw.Loading = false;\n    }\n} else if (model.asyncOn != applied) {\n    target = model.asyncOn;           // 刚拨动：先按住\n    model.asyncOn = applied;\n    pending = 36;                     // ~0.6s\n    sw.Loading = true;\n}",
                 "");
         Gallery.Add(list, "Data Entry", "Slider",
             Gallery.T("A range slider aligned with Naive UI n-slider. Construct with (min, max); bind `.data` to an int model field for two-way editing; Render(app, x, y, width) each frame. Props: step (snap to N increments), range (dual thumbs, value = [Low, High] via data + dataHigh), vertical + reverse, marks (AddMark(value, label), clickable) with stepMark = Naive UI step=\"mark\", value bubble (tooltip / showTooltip / tipFormat template), keyboard arrow / Home / End stepping, Disabled greys everything out.",
@@ -10681,10 +12512,6 @@ class Gallery {
             .Json("{\n  \"type\": \"Column\",\n  \"name\": \"sliders\",\n  \"gap\": 12,\n  \"children\": [\n    { \"type\": \"Slider\", \"name\": \"vol\",  \"min\": 0, \"max\": 100, \"bind\": \"audio.volume\" },\n    { \"type\": \"Slider\", \"name\": \"eq\",   \"min\": -12, \"max\": 12, \"step\": 3, \"bind\": \"audio.eq\" }\n  ]\n}")
             .AddProp("min / max", "int", "-", "Range bounds (constructor).")
             .AddProp("step", "int", "0", "Snap to N increments on drag + keyboard (Naive UI step).")
-            .AddProp("data", "Binding<int>", "-", "Bound value within [min, max]: `slider.data = model.field;`.")
-            .AddProp("width", "int", "-", "Track width in px (Render argument).")
-            .AddEvent("Change", "() => void", "Dragging or clicking the track updates data.")
-            .AddEvent("DragEnd", "() => void", "Fires when the drag gesture ends (pointer up).")
             .AddProp("data", "Binding<int>", "-", "Bound value within [min, max] (the low thumb in range mode): `slider.data = model.field;`.")
             .AddProp("range", "bool", "false", "Dual thumbs; value = [Low, High]. Bind data (low) + dataHigh (high); SetRange(lo, hi) writes both.")
             .AddProp("dataHigh", "Binding<int>", "-", "Range mode's high value binding.")
@@ -10695,6 +12522,8 @@ class Gallery {
             .AddProp("showTooltip", "bool", "false", "Keep the bubble visible all the time (Naive UI show-tooltip).")
             .AddProp("tipFormat", "string", "\"\"", "Bubble template: \"{v}\" becomes the value, e.g. \"{v}%\" (Naive UI format-tooltip).")
             .AddProp("keyboard", "bool", "true", "Arrow keys nudge (by step), Home/End jump to min/max.")
+            .AddProp("width", "int", "-", "Track width in px (Render argument).")
+            .AddEvent("Change", "() => void", "Dragging or clicking the track updates data.")
             .AddEvent("DragEnd", "() => void", "Fires when the drag gesture ends (pointer up).")
             .AddDemo(Gallery.T("Range", "范围"),
                 Gallery.T("range turns the slider into a dual-thumb [Low, High] editor: data binds the low thumb, dataHigh the high one. Pressing the track grabs the nearest thumb and keeps it for the whole drag; thumbs cannot cross. The two input numbers share the same model fields, so slider and inputs stay in sync both ways.",
@@ -10965,6 +12794,31 @@ class Gallery {
             // EffectiveDemos 只在演示列表为空时才合成它，补了 AddDemo
             // 就必须显式 WithBasic，否则基础用法这一节直接消失。
             .WithBasic(90);
+        Gallery.Add(list, "Data Entry", "ColorPicker",
+            Gallery.T("A trigger bar tinted with the current colour opens a popup: a saturation/value two-gradient panel, a hue spectrum bar, an alpha bar over a checkerboard, and an input row whose label tabs switch the format (rgb / hex / hsl / hsb, Naive UI modes). Dragging or editing commits through Change; the value is a packed 0xAARRGGBB (SignalInt / Binding<int> two-way). The popup uses the framework overlay layer so it draws on top of any later content.",
+                "以当前颜色着色的触发条点开弹层：饱和度/明度双层渐变面板、色相光谱条、棋盘格衬底的透明度条，以及一行标签页签可切换格式的输入行（rgb / hex / hsl / hsb，对位 Naive UI modes）。拖动或输入经 Change 落定；取值是打包的 0xAARRGGBB（SignalInt / Binding<int> 双向）。弹层走框架覆盖层绘制，永久显示在后续内容之上。"),
+            "class Theme { int accent; }\nTheme theme = new Theme();\ntheme.accent = 0xFF5B3737;\n\nColorPicker pick = new ColorPicker(0xFF5B3737);\npick.data = theme.accent;      // two-way\npick.Change += () => {\n    string v = pick.Text();    // \"rgba(91, 55, 55, 1)\"\n};\n// each frame (the popup registers its own hit rects):\npick.Render(app, 40, 60, 220);\n\n// value can also come as text (hex or any css func):\npick.SetText(\"#18A05880\");")
+            .Json("{\n  \"type\": \"ColorPicker\",\n  \"name\": \"pick\",\n  \"value\": \"rgba(91, 55, 55, 1)\",\n  \"showAlpha\": true,\n  \"mode\": \"rgb\"\n}")
+            .AddProp("data", "Binding<int>", "-", "Current packed colour 0xAARRGGBB (two-way): `pick.data = model.field;`.")
+            .AddProp("value", "string", "\"rgba(0, 0, 0, 1)\"", "Value as text. Accepts #RGB / #RRGGBB / #RRGGBBAA and rgba()/rgb()/hsl()/hsb(); Text() reads it back in the current mode (SetExtra key: value/color/text).")
+            .AddProp("showAlpha", "bool", "true", "Show the alpha slider; false hides it and the value is always opaque (Naive UI show-alpha).")
+            .AddProp("mode", "enum", "rgb", "Format of the value text: rgb / hex / hsl / hsb (Naive UI modes[0]; label tabs switch it live).")
+            .AddProp("modes", "List<string>", "all", "Restrict the selectable formats; a single entry locks the tabs and the value format (Modes(\"hex\", \"\", \"\", \"\") or SetModes).")
+            .AddProp("size", "enum", "medium", "Trigger height tier via the colorpicker skin class (heightMedium by default).")
+            .AddEvent("Change", "() => void", "Fires when a drag lands or an edited value is accepted; the model and two-way binding already hold the packed colour.")
+            .AddDemo(Gallery.T("No alpha / locked format", "无透明度 / 锁定格式"),
+                Gallery.T("showAlpha = false hides the alpha bar and forces the value opaque -- rgb(r, g, b) / #RRGGBB. modes = [\"hex\"] goes further: the input-row tabs collapse to a single HEX entry and every value reads #RRGGBBAA. The label tabs on the input row still switch back within the allowed set.",
+                    "showAlpha = false 隐藏透明度条，取值恒为不透明——rgb(r, g, b) / #RRGGBB。modes = [\"hex\"] 更进一步：输入行页签只剩 HEX 一组，取值恒为 #RRGGBBAA。输入行的标签页签仍在允许集合内可切回。"),
+                "ColorPicker.noalpha", 150,
+                "ColorPicker solid = new ColorPicker(0xFF18A058);\nsolid.SetShowAlpha(false);   // rgb() / #RRGGBB\n\nColorPicker hex = new ColorPicker(0xFF2080F0);\nhex.Modes(\"hex\", \"\", \"\", \"\");  // lock to #RRGGBBAA\nsolid.Render(app, 40, 60, 220);\nhex.Render(app, 40, 120, 220);",
+                "{\n  \"type\": \"ColorPicker\",\n  \"value\": \"#18A058\",\n  \"showAlpha\": false\n}")
+            .AddDemo(Gallery.T("With a form", "和表单一起使用"),
+                Gallery.T("Bind `.data` to a model field and the picker behaves like any other form control: edits flow back into the model, external writes (SetColor / SetText) flow into the panel, and Change fires once per committed gesture. The grey line below echoes the latest value text live.",
+                    "把 `.data` 绑到模型字段，选择器就和其它表单控件一样：编辑写回模型，外部赋值（SetColor / SetText）拉入面板，Change 在每次手势落定时触发一次。下方灰字实时回显最新取值文本。"),
+                "ColorPicker.form", 90,
+                "class Profile { int tint; }\nProfile p = new Profile();\np.tint = 0xFFF0A020;\n\nColorPicker pick = new ColorPicker(0xFFF0A020);\npick.data = p.tint;            // two-way\npick.Change += () => {\n    label.Text = \"value = \" + pick.Text();\n};\npick.Render(app, 40, 60, 220);",
+                "{\n  \"type\": \"ColorPicker\",\n  \"name\": \"tint\",\n  \"bind\": \"profile.tint\",\n  \"value\": \"rgba(240, 160, 32, 1)\"\n}")
+            .WithBasic(120);
         Gallery.Add(list, "Data Entry", "DatePicker",
             Gallery.T("An editable value box with a trailing calendar button. The popup uses the framework overlay layer so it draws on top of any later content. Naive UI type prop covers all 11 variants: date, datetime (hour/minute row), daterange/datetimerange (two side-by-side day panels, click start then end with a live hover preview), week (click any day to take its Monday..Sunday), month, monthrange (two 12-cell panels), quarter (Q1..Q4), quarterrange, year (a 12-year page) and yearrange (two pages).",
                 "可编辑取值框，右侧日历按钮打开弹层。弹层走框架覆盖层绘制，永久显示在后续内容之上。Naive UI type 覆盖全部 11 种形式：date；datetime（底部时分行）；daterange/datetimerange（左右双日历面板，点起始再点结束，悬停实时预览区间）；week（点任意一天选中其周一~周日整周）；month；monthrange（双 12 宫格面板）；quarter（Q1-Q4）；quarterrange；year（12 年一页）；yearrange（双页）。"),
@@ -11179,13 +13033,19 @@ class Gallery {
         im.AddEvent("Error", "() => void", "Decode or fetch failed.");
         list.Add(im);
         Comp wm = new Comp("Data Display", "Watermark",
-            "A translucent tiling overlay that marks a page's state (internal, draft, staging, tenant name) without touching the content underneath. Add it as the LAST child of a panel and Grow()/DockFill() it: children paint in order, so the watermark ends up on top while still passing clicks through (it registers no hit region). Content supports \\n multi-line tiles rotated rigidly as a group; Rotate is degrees, positive = clockwise (default -22); GapX/GapY space the tiles; OffsetX/OffsetY shift the whole layer; Color is 0xAARRGGBB (alpha blends; 0 falls back to the CSS color, then the built-in faint black); FontPx 0 follows CSS font-size. Src points at an image (file or mem: key) instead of text -- bitmap tiles are drawn as-is, so bake any tilt into the pixels.", "");
+            "A translucent tiling overlay that marks a page's state (internal, draft, staging, tenant name) without touching the content underneath. Add it as the LAST child of a panel and Grow()/DockFill() it: children paint in order, so the watermark ends up on top while still passing clicks through (it registers no hit region). Content supports \\n multi-line tiles rotated rigidly as a group; Rotate is degrees, positive = clockwise (default -22); GapX/GapY space the tiles; OffsetX/OffsetY shift the whole layer; Color is 0xAARRGGBB (alpha blends; 0 falls back to the CSS color, then the built-in faint black); FontPx 0 follows CSS font-size. LineHeight overrides the per-line box (0 = font line height); TileW/TileH force an explicit tile box (0 = measured) that TextAlign (left/center/right) aligns lines within; Weight >= 600 double-strikes each line for simulated bold. NoClip = true lets tiles spill past the control's own rect (clipped only by ancestors). Src points at an image (file or mem: key) instead of text -- bitmap tiles are drawn as-is, so bake any tilt into the pixels.", "");
         wm.AddDemo("Text tiles", "A draft document with a multi-line watermark on top. The watermark is the last child of the panel and grows to fill it; every tile rotates about its own centre, so the pitch stays a clean grid.", "Watermark.text", 170,
             "Panel doc = Panel.Column();\ndoc.Prefer(0, 170);   // host keeps its own height; the watermark measures 0x0\ndoc.With(title);\nWatermark wm = new Watermark(\"INTERNAL USE ONLY\\nDo not distribute\");\nwm.GapX = 80;\nwm.GapY = 64;\ndoc.With(wm.Grow());   // last child = paints on top",
             "{\n  \"type\": \"Panel\",\n  \"name\": \"doc\",\n  \"height\": 170,\n  \"children\": [\n    { \"type\": \"Label\", \"text\": \"Q3 business review (draft)\" },\n    {\n      \"type\": \"Watermark\",\n      \"name\": \"wm\",\n      \"content\": \"INTERNAL USE ONLY\\nDo not distribute\",\n      \"gapx\": 80,\n      \"gapy\": 64,\n      \"dock\": \"fill\"\n    }\n  ]\n}");
         wm.AddDemo("Style knobs", "Color/FontPx/Rotate/GapX/GapY are plain properties: a brand-blue (18% alpha) horizontal STAGING tiling with a tight gap reads like table ruling.", "Watermark.style", 170,
             "Watermark wm = new Watermark(\"STAGING\");\nwm.Color = 0x2E1890FF;  // brand blue, 18% alpha\nwm.FontPx = 18;\nwm.Rotate = 0;         // horizontal grid\nwm.GapX = 44;\nwm.GapY = 36;",
             "{\n  \"type\": \"Watermark\",\n  \"name\": \"wm\",\n  \"content\": \"STAGING\",\n  \"color\": \"0x2E1890FF\",\n  \"fontpx\": 18,\n  \"rotate\": 0,\n  \"gapx\": 44,\n  \"gapy\": 36\n}");
+        wm.AddDemo(Gallery.T("Custom watermark", "自定义水印"),
+            Gallery.T("Every knob on one panel, wired live: content (\\n splits tile lines), font size / weight / colour, rotate, line height, explicit tile box with in-box text alignment, gap X/Y, offset X/Y, and whether tiles cross the watermark's own boundary. The panel controls are retained and two-way bound to model fields; the watermark is rebuilt from those fields every frame, so the preview follows the controls with zero event plumbing. Colour text accepts 0xAARRGGBB, #RRGGBB or bare RRGGBB (30% alpha); clearing it falls back to the built-in faint black.",
+                "水印的全部旋钮摆在一块面板上实时联动：内容（\\n 分行）、字号/字重/颜色、旋转角、行高、显式贴片盒与盒内对齐、X/Y 间隔、X/Y 偏移、是否跨越边界。面板控件保留态、双向绑到模型字段；水印每帧按字段现造——预览即改即见，一行事件代码都不用接。颜色文本接受 0xAARRGGBB、#RRGGBB 或裸 RRGGBB（30% alpha）；清空则回退内置淡黑。"),
+            "Watermark.custom", 500,
+            "// 面板控件保留态，双向绑到模型字段（Zan 合成的 Binding）：\nfontNum.data = model.wmFontPx;      // InputNumber 4..72\nrotate.data = model.wmRotate;       // Slider -90..90\ntext.data = model.wmText;           // Input，\\n 分行\n\n// 水印每帧按字段现造，画在预览文档最后（= 最上层）：\nWatermark wm = new Watermark(model.wmText);\nwm.Color  = WmColorParse(model.wmColor);  // 0xAARRGGBB，0 = 默认\nwm.FontPx = model.wmFontPx;\nif (model.wmBold) { wm.Weight = 600; }    // >= 600 模拟加粗\nwm.Rotate = model.wmRotate;\nwm.LineHeight = model.wmLineH;      // 0 = 字体行高\nwm.TileW = model.wmTileW;           // 0 = 按内容测量\nwm.TextAlign = model.wmAlign;       // 0 左 / 1 中 / 2 右\nwm.GapX = model.wmGapX;\nwm.NoClip = model.wmNoClip;         // 跨越水印自身边界\ndoc.With(wm.Grow());",
+            "{\n  \"type\": \"Panel\",\n  \"children\": [\n    { \"type\": \"Label\", \"text\": \"Q3 business review\" },\n    {\n      \"type\": \"Watermark\",\n      \"name\": \"wm\",\n      \"content\": \"内部资料\\nINTERNAL\",\n      \"color\": \"0x4D808080\",\n      \"fontpx\": 16,\n      \"weight\": 600,\n      \"rotate\": -22,\n      \"lineheight\": 0,\n      \"tilew\": 0,\n      \"tileh\": 0,\n      \"textalign\": 0,\n      \"gapx\": 100,\n      \"gapy\": 100,\n      \"offsetx\": 0,\n      \"offsety\": 0,\n      \"noclip\": false,\n      \"dock\": \"fill\"\n    }\n  ]\n}");
         wm.AddProp("content", "string", "-", "Watermark text; \\n splits tile lines.");
         wm.AddProp("src", "string", "-", "Image tile source; replaces text when set.");
         wm.AddProp("color", "int", "css", "0xAARRGGBB; 0 = CSS color, then faint black.");
@@ -11195,6 +13055,12 @@ class Gallery {
         wm.AddProp("gapy", "int", "100", "Vertical tile pitch gap (logical px).");
         wm.AddProp("offsetx", "int", "0", "Whole-layer horizontal shift.");
         wm.AddProp("offsety", "int", "0", "Whole-layer vertical shift.");
+        wm.AddProp("lineheight", "int", "0", "Per-line box height in px; 0 = font line height.");
+        wm.AddProp("tilew", "int", "0", "Explicit tile width; 0 = measured text. Enables TextAlign.");
+        wm.AddProp("tileh", "int", "0", "Explicit tile height; 0 = lines * line height.");
+        wm.AddProp("textalign", "enum", "left", "left/center/right within the tile box (TileW > 0).");
+        wm.AddProp("weight", "int", "0", ">= 600 double-strikes each line (simulated bold).");
+        wm.AddProp("noclip", "bool", "false", "Tiles keep tiling past the control's own rect.");
         list.Add(wm);
         Gallery.Add(list, "Data Display", "Statistic",
             Gallery.T("Show a highlighted numeric value with a descriptive label.",
@@ -11402,8 +13268,8 @@ class Gallery {
             .AddProp("summary", "DataColumn.summary / Derived", "0", "Per-column total; Derived columns compute from other aggregates.")
             .AddEvent("scroll", "state.scrollRow / scrollX", "Virtual row + horizontal column window.");
         Gallery.Add(list, "Data Display", "PivotTable",
-            Gallery.T("Cross-tab with scrolling, pinned totals, hover cross-hair, click selection, % of row/col/grand measures, heat tinting and adaptive column widths.",
-                "交叉汇总：可滚动、合计固定、悬浮十字高亮、点击选中，度量可显示为占行/列/总计的百分比，支持热力着色与自适应列宽。"),
+            Gallery.T("Cross-tab with scrolling, pinned totals, full-row hover, click selection, % of row/col/grand measures, heat tinting and adaptive column widths.",
+                "交叉汇总：可滚动、合计固定、悬停整行高亮、点击选中，度量可显示为占行/列/总计的百分比，支持热力着色与自适应列宽。"),
             "PivotConfig cfg = new PivotConfig(0, 1);\ncfg.measures.Add(new PivotMeasure(2, 0, \"Units\", 0));\ncfg.measures.Add(new PivotMeasure(3, 0, \"Rev\", 3));  // % of grand\ncfg.groupDigits = true;\ncfg.heat = true;\nPivotState st = new PivotState();\nPivotTable.Render(app, 40, 60, 560, 280, rows, cfg, st);\nif (st.TakeClick()) { Use(st.clickRowKey, st.clickColKey); }")
             .Json("{\n  \"type\": \"PivotTable\",\n  \"name\": \"pivot\",\n  \"rows\": [\n    \"Region\"\n  ],\n  \"cols\": [\n    \"Quarter\"\n  ],\n  \"measure\": \"sales\"\n}")
             .AddProp("cfg", "PivotConfig", "-", "Row/column fields, measures, rowSort, groupDigits, heat.")
@@ -11746,8 +13612,8 @@ class Gallery {
         ch.AddDemo("ECharts · 矩形树图", Gallery.T("ECharts treemap: smartphone market share as a two-level nested rectangle tree -- ChartNode.Group/Leaf data, alternating split direction per depth.",
                 "ECharts treemap：智能手机市场份额两级嵌套矩形树图——ChartNode.Group/Leaf 数据，逐层交替切分方向。"), "Chart.echarts_treemap", 460,            "ChartNode root = ChartNode.Group(\"智能手机市场\", new List<ChartNode>{\n    ChartNode.Group(\"安卓阵营\", new List<ChartNode>{\n        ChartNode.Leaf(\"华为\", 320), ChartNode.Leaf(\"小米\", 260),\n        ChartNode.Leaf(\"OPPO\", 210) }),\n    ChartNode.Group(\"iOS\", new List<ChartNode>{\n        ChartNode.Leaf(\"iPhone\", 400) }) });\nChartOption m = ChartOption.Of(\"市场份额\", null,\n    new List<ChartSeries>{\n        ChartSeries.OfTree(\"手机品牌\", ChartType.Treemap, root) });\nChartView.Of(m).Render(app, 40, 40, 640, 350);",
             "{\n  \"title\": { \"text\": \"市场份额\" },\n  \"series\": [\n    { \"name\": \"手机品牌\", \"type\": \"treemap\",\n      \"data\": [\n        { \"name\": \"安卓阵营\", \"children\": [\n          { \"name\": \"华为\", \"value\": 320 },\n          { \"name\": \"小米\", \"value\": 260 },\n          { \"name\": \"OPPO\", \"value\": 210 }] },\n        { \"name\": \"iOS\", \"children\": [\n          { \"name\": \"iPhone\", \"value\": 400 }] }\n      ] }\n  ]\n}");
-        ch.AddDemo("ECharts · 地图", Gallery.T("ECharts map1: per-province iphone sales on the china map -- region values ramp through the dataRange colour scale, province labels stay on, and hover raises the emphasis highlight with a value tooltip. Outlines are simplified from echarts china.json (MapChinaData.zan).",
-                "ECharts map1：iphone 销量省份数值地图——区域值映射 dataRange 连续色域，省份标签常显，悬停 emphasis 高亮并弹出数值提示卡。省界几何由 echarts china.json 抽稀生成（MapChinaData.zan）。"), "Chart.echarts_map", 460,            "ChartOption m = ChartOption.Of(\"iphone 销量\", null,\n    new List<ChartSeries>{\n        ChartSeries.OfRegions(\"iphone3\", MapChinaData.Regions()) });\nm.showLegend = false;\nChartView.Of(m).Render(app, 40, 40, 640, 350);",
+        ch.AddDemo("ECharts · 地图", Gallery.T("ECharts map1: per-province iphone sales on the china map -- region values ramp through the dataRange colour scale, province labels stay on, and hover raises the emphasis highlight with a value tooltip. Outlines come from the official echarts china.json (assets/china.json, decoded at runtime by ChartGeoJson).",
+                "ECharts map1：iphone 销量省份数值地图——区域值映射 dataRange 连续色域，省份标签常显，悬停 emphasis 高亮并弹出数值提示卡。省界几何为 echarts@4.9 官方 china.json（assets/，运行时经 ChartGeoJson 解码）。"), "Chart.echarts_map", 460,            "ChartOption m = ChartOption.Of(\"iphone 销量\", null,\n    new List<ChartSeries>{\n        ChartSeries.OfRegions(\"iphone3\", Gallery.ChinaRegions()) });\nm.showLegend = false;\nChartView.Of(m).Render(app, 40, 40, 640, 350);",
             "{\n  \"title\": { \"text\": \"iphone 销量\" },\n  \"series\": [\n    { \"name\": \"iphone3\", \"type\": \"map\", \"mapType\": \"china\",\n      \"data\": [\n        { \"name\": \"广东\", \"value\": 505 },\n        { \"name\": \"北京\", \"value\": 830 },\n        { \"name\": \"四川\", \"value\": 312 } ] }\n  ]\n}");
         ch.AddProp("option", "ChartOption", "-", "Declarative config: title, axes, series (typed ChartSeries factories per kind). Build in code or via ChartOption.FromJson.");
         ch.AddProp("series", "List<ChartSeries>", "-", "Each series carries its own type/color/axisIndex/stackName, so mixed charts are just a list.");
@@ -11876,13 +13742,15 @@ class Gallery {
             .AddProp("Text(x, y, w)", "helper", "-", "Single text-line placeholder.")
             .AddProp("Rect(x, y, w, h)", "helper", "-", "Rectangular block placeholder.");
         Gallery.Add(list, "Feedback", "Tooltip",
-            Gallery.T("A floating hint anchored to a point. Four placements (Top/Bottom/Left/Right, auto-flipping near a screen edge), automatic word wrapping when a max width is given, and a scrollbar when the wrapped text is taller than the height cap. Show it from any trigger: on hover, or toggled by a click.",
-                "锚定到某个点的浮动提示。四种方位（上/下/左/右，靠近屏幕边缘时自动翻转），给定最大宽度时自动换行，换行文本超过高度上限时显示滚动条。可由任意触发方式弹出：悬停，或点击切换。"),
-            "// hover trigger:\nint id = new Button { Text = \"Hover me\" }.Render(app, 40, 60, 120);\nif (app.focus.IsHovered(id)) {\n    Tooltip.RenderAt(app, 100, 60, \"Shown on hover\", Tooltip.Top(), 0);\n}\n// click trigger (toggle a SignalBool):\nif (Ui.Clicked(app, clickId)) { open.Set(!open.Get()); }\nif (open.Get()) { Tooltip.RenderAt(app, x, y, \"Toggled\", Tooltip.Bottom(), 0); }\n// long text: pass a max width (px) to wrap; a scrollbar appears past the cap:\nTooltip.RenderAt(app, x, y, longText, Tooltip.Right(), 190);")
+            Gallery.T("A floating hint anchored to a point. Four placements (Top/Bottom/Left/Right, auto-flipping near a screen edge), automatic word wrapping when a max width is given, a scrollbar when the wrapped text is taller than the height cap, and a two-line rich body (bold title + muted description) via RenderRich. Triggers: hover (Button.Tip), a click toggle, or fully manual caller state; widgets use the deferred RequestBox + frame-end Flush.",
+                "锚定到某个点的浮动提示。四种方位（上/下/左/右，靠近屏幕边缘时自动翻转），给定最大宽度时自动换行，换行文本超过高度上限时显示滚动条，RenderRich 还能画两行富主体（粗体标题 + 弱化描述）。触发方式：悬浮（Button.Tip）、点击切换，或完全由调用方状态手动控制；组件内部走 RequestBox 延迟请求 + 帧末 Flush。"),
+            "// hover trigger:\nint id = new Button { Text = \"Hover me\" }.Render(app, 40, 60, 120);\nif (app.focus.IsHovered(id)) {\n    Tooltip.RenderAt(app, 100, 60, \"Shown on hover\", Tooltip.Top(), 0);\n}\n// click trigger (toggle a SignalBool):\nif (Ui.Clicked(app, clickId)) { open.Set(!open.Get()); }\nif (open.Get()) { Tooltip.RenderAt(app, x, y, \"Toggled\", Tooltip.Bottom(), 0); }\n// manual trigger: the caller state alone decides:\nif (Ui.Clicked(app, showId)) { on.Set(true); }\nif (on.Get()) { Tooltip.RenderBox(app, x, y, w, h, \"Manual\", Tooltip.Right(), 0); }\n// rich two-line body (no arrow, clamped to the window):\nTooltip.RenderRich(app, x, y, \"Title\", \"Muted description.\");\n// inside widgets: request at hover, flush once at end of frame:\nTooltip.RequestBox(app, x, y, w, h, \"Tip\", Tooltip.Bottom(), 260);\nTooltip.Flush(app);\n// long text: pass a max width (px) to wrap; a scrollbar appears past the cap:\nTooltip.RenderAt(app, x, y, longText, Tooltip.Right(), 190);")
             .Json("{\n  \"type\": \"Tooltip\",\n  \"name\": \"tip\",\n  \"text\": \"More info\",\n  \"placement\": \"top\",\n  \"children\": [\n    {\n      \"type\": \"Icon\",\n      \"glyph\": \"info\"\n    }\n  ]\n}")
             .AddProp("text", "string", "-", "Hint text shown in the bubble.")
             .AddProp("placement", "int", "Top()", "Top / Bottom / Left / Right (auto-flips near an edge).")
-            .AddProp("maxW", "int", "0", "Wrap width in px; 0 = single line.");
+            .AddProp("maxW", "int", "0", "Wrap width in px; 0 = single line.")
+            .AddProp("RenderRich(x, y, title, desc)", "helper", "-", "Two-line bubble: bold title + muted description.")
+            .AddProp("RequestBox(...) + Flush(app)", "helper", "-", "Deferred frame-end tip used inside widgets (Button.Tip hovers 900ms).");
         Gallery.Add(list, "Feedback", "Popover",
             Gallery.T("Retained popover. Owns its open state and paints in the overlay pass, so the panel draws above other content, blocks clicks to the widgets beneath it (no click-through), word-wraps its body, clamps to the window on every edge and closes on an outside press or Esc.",
                 "保留态气泡卡片。自持展开状态并在覆盖层绘制，因此面板显示在其他内容之上，拦截对下方组件的点击（不穿透），正文自动换行，各边都会限制在窗口内，点击外部或按 Esc 关闭。"),
@@ -11915,6 +13783,7 @@ class Gallery {
             .AddProp("Notify(title, type)", "void", "-", "Queue a corner notification.")
             .AddProp("RenderLoad(x,y,w,h,tip)", "void", "-", "Masked spinner over a region.")
             .AddProp("Tips(ax, ay, text)", "void", "-", "Anchored tip bubble.")
+            
             .AddProp("RenderPhotos(slides,idx,anim)", "bool", "-", "Full-screen carousel; true on close (X, mask click or Esc).")
             .AddProp("PromptWith(title,hint,formType,value,maxLen)", "LayerState", "-", "formType 0 text / 1 password / 2 multiline; initial value; maxLen in UTF-8 bytes.")
             .AddProp("shadeClose", "bool", "false", "Modal dialog: press+release on the shade (outside the box) reports action 2.")
@@ -12009,15 +13878,21 @@ class Gallery {
             .AddProp("subtitle", "string", "-", "Secondary line.")
             .AddEvent("Render(...)", "int", "Returns the back-action id (use Ui.Clicked).");
         Gallery.Add(list, "Navigation", "Pagination",
-            Gallery.T("Navigate pages with a SignalInt current page. Styles: Render (windowed numbers with ellipses), RenderPill (rounded), RenderSmall (compact) and RenderSimple (prev / total / next).",
-                "用 SignalInt 表示当前页进行翻页。样式：Render（带省略号的窗口式页码）、RenderPill（圆角）、RenderSmall（紧凑）和 RenderSimple（上一页 / 总数 / 下一页）。"),
-            "Pagination pg = new Pagination(12);\npg.Page = model.page;   // two-way\n// pick a style with the class list:\n// pg.Class = \"pill\";    // rounded\n// pg.Class = \"small\";   // compact\n// pg.Class = \"simple\";  // prev / total / next\npg.RenderAt(app, 40, 60);")
-            .Json("{\n  \"type\": \"Pagination\",\n  \"name\": \"pager\",\n  \"bind\": \"model.page\",\n  \"total\": 100,\n  \"pageSize\": 10\n}")
+            Gallery.T("Navigate pages with a SignalInt current page. The windowed pager ellipses jump a whole window per click; optional segments cover the total label, the quick-jump input (Enter) and a page-size dropdown. Item-count mode derives pages from item count / page size; prev/next accept custom text and the segment order is configurable.",
+                "用 SignalInt 表示当前页进行翻页。窗口式页码的省略号每次点击整窗翻页；可选段覆盖总页数标签、快速跳页输入框（回车提交）和每页条数下拉。条目数模式由条目数 / 每页条数推导页数；上一页 / 下一页可自定义文字，段顺序可配置。"),
+            "Pagination pg = new Pagination(100);\npg.Page = model.page;   // two-way\npg.Jumper(true).ShowSizes(true).ShowTotal(true);\npg.Prefix(\"Items\").Suffix(\"end\");\n// styles via classes:\n// pg.Class = \"pill\";    // rounded\n// pg.Class = \"small\";   // compact\n// pg.Class = \"simple\";  // editable prev [page] / total next\n// item-count mode:\n// Pagination cnt = Pagination.WithCount(205, 20, model.page); // 11 pages\npg.RenderAt(app, 40, 60);")
+            .Json("{\n  \"type\": \"Pagination\",\n  \"name\": \"pager\",\n  \"bind\": \"model.page\",\n  \"total\": 100,\n  \"pageSize\": 10,\n  \"pageSizes\": \"10, 20, 50, 100\",\n  \"jumper\": \"true\",\n  \"order\": \"total, pager, jumper, sizes\"\n}")
             .AddProp("total", "int", "-", "Number of pages.")
             .AddProp("page", "SignalInt", "-", "Current page (two-way).")
-            .AddProp("RenderPill / RenderSmall", "int", "-", "Rounded / compact styles (use HandleClick).")
-            .AddProp("RenderSimple", "int", "-", "prev / total / next (use HandleClickSimple).")
-            .AddEvent("Change", "HandleClick(...)", "Clicking a page sets page.");
+            .AddProp("itemCount", "int", "-", "Item-count mode: pages derive from itemCount / pageSize.")
+            .AddProp("pageSize", "int", "-", "Items per page.")
+            .AddProp("pageSizes", "string", "-", "Comma-separated dropdown options, e.g. \"10, 20, 50\".")
+            .AddProp("jumper / showTotal", "bool", "-", "Quick-jump input / total-pages label.")
+            .AddProp("prefix / suffix", "string", "-", "Custom text before / after the pager.")
+            .AddProp("prevText / nextText", "string", "-", "Custom prev / next labels (empty = chevrons).")
+            .AddProp("order", "string", "-", "Segment order: total, pager, jumper, sizes, prefix, suffix.")
+            .AddEvent("Change", "HandleClick(...)", "Clicking a page sets page.")
+            .AddEvent("SizeChange", "-", "Page size chosen in the sizes dropdown.");
         Gallery.Add(list, "Navigation", "Scrollbar",
             Gallery.T("A vertical scrollbar for a custom scrollable surface. RenderVerticalScroll is interactive: drag the thumb or click the track (the thumb centres on the pointer) to update a bound scroll-offset signal. RenderVertical is the static, display-only variant.",
                 "用于自定义可滚动区域的垂直滚动条。RenderVerticalScroll 可交互：拖动滑块或点击轨道（滑块会居中到指针处）以更新绑定的滚动偏移信号。RenderVertical 是静态、仅显示的变体。"),

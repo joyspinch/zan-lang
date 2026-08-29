@@ -1550,6 +1550,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_wheel_route${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # ScrollView 拖拽重锚定回归（用户报告“滚动条滚动时界面卡死/页面自
+  # 己跑”）：拖拽期间内容高度变化（自动量高、图片加载）时旧锚点公式
+  # off = dragOffset0 + dyPix*mo/travel 用新 mo 配旧锚点 —— 按住不动
+  # 也会自己滚，mo 越大正反馈越强。修复后 mo 变化即以当前位置重锚。
+  add_test(NAME conformance_gui_scroll_drag_reanchor
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/scroll_drag_reanchor_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_scroll_drag_reanchor.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_scroll_drag_reanchor${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # VirtualList template rows: rows are built lazily (never at SetRows, only
   # when a frame needs them in the viewport) and the string-mode bookkeeping
   # stays intact across the mode switch.
@@ -1616,9 +1629,6 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_countdown${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  # 数值滚动动画（countup.js 风格）：ValueAt 插值与 Format 千分位/
-  # 国际化纯函数，tick 注入驱动的走动/暂停恢复无跳变/重摆/Finish
-  # 单次触发，以及组件模型（Kind/Props/Events/ControlFactory）。
   # 上传组件：模型往返（Kind/15 Props/Events/工厂）、门与状态机
   # （Accept/Max/BeforeUpload/Disabled、CustomRequest、Submit、
   #  SetItem* 与 Finish/Error/Remove/Clear 计数、LastItem、Upload
@@ -1633,6 +1643,22 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_upload${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # 分页组件：Element Plus 页码窗口算法（省略号 = 0 占位，领起/
+  # 居中/收尾三态与 slots 边界）、item-count 计页与钳制、SetPage
+  # 的 Change 恰好一次、sizes/段顺序/自定义文案往返，以及组件
+  # 模型（Props/GetProp/SetProp/SetExtra/Events/ControlFactory）。
+  add_test(NAME conformance_gui_pagination
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/pagination_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_pagination.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_pagination${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  # 数值滚动动画（countup.js 风格）：ValueAt 插值与 Format 千分位/
+  # 国际化纯函数，tick 注入驱动的走动/暂停恢复无跳变/重摆/Finish
+  # 单次触发，以及组件模型（Kind/Props/Events/ControlFactory）。
   add_test(NAME conformance_gui_numberanimation
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -1880,6 +1906,22 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_transfer${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # ColorPicker 的无窗口回归：32 位负打包色的通道提取/构造/比较（
+  # 0xAARRGGBB 回绕成负 int），HSV/HSL 纯色与灰阶边界，HEX/函数串
+  # 解析（parseOk 成功标志——高 alpha 打包色回绕成负数后 -1 不能再
+  # 当失败哨兵），modes 缩小后的取值格式跟随，designer Extra 往返，
+  # 以及弹层帧推演：blocker 登记、透明度条 id 在色相条与输入行之间
+  # 命中可见（rowY 双扣曾让输入行压住透明度条）、弹层外点击关闭、
+  # 触发条重开、Change 事件与双向绑定。
+  add_test(NAME conformance_gui_colorpicker
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/colorpicker_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_colorpicker.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_colorpicker${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # SelectBox 级联增强：父子指针链（单选路径/重开自动展开/联动关闭
   # 选分支）、多选勾选模型（联动带动、祖链回推、半勾）、勾选策略
   # 取值（all/parent/child）、级联过滤平铺，以及弹层 blocker、悬停
@@ -1891,6 +1933,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_selectbox_cascade.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_selectbox_cascade${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  # SelectBox 弹层选项点击的基线命中回归：弹层「内部控件让行」的
+  # 判定只看弹层基线（OnPaintOverlay 入口）之后注册的区域——按真实
+  # 帧序重放内容滑杆/全窗+弹层 blocker/内嵌滚动条的注册序列，锁住
+  # 基线跳过内容区、滚动条仍让行、blocker 不算控件、顶层优先。
+  add_test(NAME conformance_gui_selectbox_popup_hit
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/selectbox_popup_hit_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_selectbox_popup_hit.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_selectbox_popup_hit${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Menu v2 (tree menu): pure-model flatten/default-expand asserts plus a

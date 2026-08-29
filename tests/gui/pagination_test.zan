@@ -1,0 +1,237 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// Gui.Pagination 的无窗口回归：Element Plus 页码窗口算法
+///（BuildPagesSlots，0 = 省略号）、item-count 计页与钳制、
+/// SetPage/Change 事件、sizes / 顺序 / 自定义文案往返，以及
+/// 组件模型（Kind/Props/GetProp/SetProp/SetExtra/Events/
+/// ControlFactory）。页码走注入的 SignalInt 读取，不需要 App。
+class PaginationTest {
+    static int fails;
+    static int chgCount;
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got {got} want {want}");
+    }
+
+    static void EqStr(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got '{got}' want '{want}'");
+    }
+
+    static void EqBool(string what, bool got, bool want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got {got} want {want}");
+    }
+
+    static void EqList(string what, List<int> got, string want) {
+        string acc = "";
+        for (int i = 0; i < got.Count; i = i + 1) {
+            if (i > 0) { acc = acc + ","; }
+            acc = acc + Convert.ToString(got[i]);
+        }
+        if (acc == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got [{acc}] want [{want}]");
+    }
+
+    static void OnChg() { chgCount = chgCount + 1; }
+
+    static void Main() {
+        fails = 0;
+
+        // ---- 页码窗口算法（值 0 = 省略号）--------------------------
+        // 总页数 <= 槽位：全部平铺。
+        EqList("flat 6", Pagination.BuildPages(6, 3), "1,2,3,4,5,6");
+        // 领起长串（当前页靠前）：1..6 + 省略号 + 尾页。
+        EqList("front", Pagination.BuildPages(100, 1),
+               "1,2,3,4,5,6,0,100");
+        // 边界：当前页 = slots-2 = 5 仍在领起串里，6 起进入居中窗口。
+        EqList("front edge 5", Pagination.BuildPages(100, 5),
+               "1,2,3,4,5,6,0,100");
+        EqList("mid edge 6", Pagination.BuildPages(100, 6),
+               "1,0,4,5,6,7,8,0,100");
+        // 居中：当前页 ± half-1，两侧省略号。
+        EqList("mid", Pagination.BuildPages(100, 50),
+               "1,0,48,49,50,51,52,0,100");
+        EqList("mid edge 95", Pagination.BuildPages(100, 95),
+               "1,0,93,94,95,96,97,0,100");
+        // 收尾长串：省略号 + 最后 6 页。
+        EqList("tail", Pagination.BuildPages(100, 100),
+               "1,0,95,96,97,98,99,100");
+        EqList("tail edge 96", Pagination.BuildPages(100, 96),
+               "1,0,95,96,97,98,99,100");
+        // 槽位数 5：居中窗口变 ±1。
+        EqList("slots 5 mid", Pagination.BuildPagesSlots(100, 50, 5),
+               "1,0,49,50,51,0,100");
+        // 当前页越界钳制。
+        EqList("clamp high", Pagination.BuildPages(3, 99), "1,2,3");
+        EqList("clamp low", Pagination.BuildPages(3, 0), "1,2,3");
+
+        // ---- item-count 模式：条目数 + 每页条数推导页数 -------------
+        SignalInt m = new SignalInt(1);
+        Pagination p = Pagination.WithCount(101, 10, m);
+        Eq("count 101/10 pages", p.TotalPages(), 11);
+        EqBool("count mode on", p.UsesItemCount(), true);
+        Eq("item count kept", p.ItemCount(), 101);
+        Eq("default size", p.PageSize(), 10);
+        // 改每页条数自动重算，当前页越界静默钳回。
+        p.SetPageSize(20);
+        Eq("count 101/20 pages", p.TotalPages(), 6);
+        p.SetPage(99);
+        Eq("clamped to last", m.Get(), 6);
+        // ceil 边界：整除不加页，余 1 加一页。
+        Eq("count 200/20", Pagination.WithCount(200, 20, new SignalInt(1))
+           .TotalPages(), 10);
+        Eq("count 201/20", Pagination.WithCount(201, 20, new SignalInt(1))
+           .TotalPages(), 11);
+        // SetTotal 回到显式页数模式。
+        p.SetTotal(12);
+        EqBool("count mode off", p.UsesItemCount(), false);
+        Eq("explicit pages", p.TotalPages(), 12);
+
+        // ---- SetPage：钳制 + Change 恰好一次 ------------------------
+        SignalInt m2 = new SignalInt(1);
+        Pagination p2 = new Pagination(12, m2);
+        chgCount = 0;
+        p2.Change.Add(PaginationTest.OnChg);
+        p2.SetPage(3);
+        Eq("setpage moved", m2.Get(), 3);
+        Eq("change fired once", chgCount, 1);
+        p2.SetPage(3);
+        Eq("same page silent", chgCount, 1);
+        p2.SetPage(0);
+        Eq("setpage low clamp", m2.Get(), 1);
+        p2.SetPage(999);
+        Eq("setpage high clamp", m2.Get(), 12);
+        Eq("clamped moves fire", chgCount, 3);
+        // BindEvent("Change") 与 Change.Add 等价。
+        Pagination p2b = new Pagination(12, new SignalInt(1));
+        chgCount = 0;
+        p2b.BindEvent("Change", PaginationTest.OnChg);
+        p2b.SetPage(2);
+        Eq("bindevent change", chgCount, 1);
+
+        // ---- 每页条数选项（sizes）往返 -------------------------------
+        Pagination p3 = new Pagination(10);
+        p3.SetPageSizesText("10, 20, 50");
+        EqStr("sizes roundtrip", p3.PageSizesText(), "10, 20, 50");
+        Eq("sizes kept", p3.PageSizes().Count, 3);
+        // 非数字段丢弃，空段跳过。
+        p3.SetPageSizesText("10, abc, , 20");
+        EqStr("sizes filtered", p3.PageSizesText(), "10, 20");
+        // ShowSizes 在空列表上给默认档位。
+        Pagination p3b = new Pagination(10);
+        p3b.ShowSizes(true);
+        EqStr("sizes default", p3b.PageSizesText(), "10, 20, 50, 100");
+        EqBool("has sizes", p3b.HasSizes(), true);
+        EqBool("no sizes on fresh", new Pagination(10).HasSizes(), false);
+        EqBool("sizes after text", p3.HasSizes(), true);
+
+        // ---- 段顺序（默认 + 指定 + 补 pager）-------------------------
+        Pagination p4 = new Pagination(10);
+        p4.Prefix("A").Suffix("B").ShowTotal(true);
+        p4.Jumper(true).ShowSizes(true);
+        EqStr("order default", p4.OrderText(),
+              "prefix, total, pager, suffix, jumper, sizes");
+        p4.SetOrderText("jumper, sizes, pager");
+        EqStr("order custom", p4.OrderText(), "jumper, sizes, pager");
+        // 缺 pager 自动补回；非法段名丢弃。
+        p4.SetOrderText("jumper");
+        EqStr("order pager appended", p4.OrderText(), "jumper, pager");
+        p4.SetOrderText("bogus, jumper");
+        EqStr("order bogus dropped", p4.OrderText(), "jumper, pager");
+        // 空串回到默认顺序。
+        p4.SetOrderText("");
+        EqStr("order reset", p4.OrderText(),
+              "prefix, total, pager, suffix, jumper, sizes");
+
+        // ---- 窗口按钮数规范化（奇数、>=5）---------------------------
+        Pagination p5 = new Pagination(10);
+        Eq("default slots", p5.PagerCount(), 7);
+        Eq("default step", p5.EllipsisStep(), 5);
+        p5.SetPagerCount(4);
+        Eq("slots floor", p5.PagerCount(), 5);
+        p5.SetPagerCount(8);
+        Eq("slots even", p5.PagerCount(), 7);
+        p5.SetPagerCount(9);
+        Eq("slots kept", p5.PagerCount(), 9);
+        Eq("slots step", p5.EllipsisStep(), 7);
+        p5.SetPagerCount(25);
+        Eq("slots cap", p5.PagerCount(), 21);
+
+        // ---- 组件模型：Kind/Props/GetProp/SetProp --------------------
+        Pagination p6 = new Pagination(12);
+        EqStr("kind", p6.Kind(), "Pagination");
+        Eq("props count", p6.Props().Count, 13);
+        EqStr("prop total", p6.GetProp("total"), "12");
+        EqStr("prop pageSize", p6.GetProp("pageSize"), "10");
+        // SetProp 带副作用收口：钳制 / 重算 / 退出 item-count。
+        p6.SetProp("pageSize", "50");
+        Eq("setprop pageSize", p6.PageSize(), 50);
+        EqStr("prop pageSize sync", p6.GetProp("pageSize"), "50");
+        p6.SetProp("itemCount", "205");
+        EqBool("setprop itemCount mode", p6.UsesItemCount(), true);
+        Eq("setprop itemCount pages", p6.TotalPages(), 5);
+        p6.SetProp("total", "12");
+        EqBool("setprop total exits count", p6.UsesItemCount(), false);
+        p6.SetProp("jumper", "true");
+        EqBool("setprop jumper", p6.HasJumper(), true);
+        p6.SetProp("prevText", "Back");
+        EqStr("prop prevText", p6.GetProp("prevText"), "Back");
+        // 当前页经 model 从 page 属性读出。
+        p6.SetPage(3);
+        EqStr("prop page", p6.GetProp("page"), "3");
+
+        // ---- 设计器扩展属性（GetExtra/SetExtra）----------------------
+        Pagination p7 = new Pagination(10);
+        p7.SetExtra("pageSizes", "10, 20");
+        EqStr("extra pageSizes", p7.GetExtra("pageSizes"), "10, 20");
+        p7.SetExtra("order", "sizes, pager");
+        EqStr("extra order", p7.GetExtra("order"), "sizes, pager");
+        p7.JumperLabel("Go to");
+        EqStr("extra jumperLabel", p7.GetExtra("jumperLabel"), "Go to");
+        p7.SetExtra("jumperSuffix", "页");
+        EqStr("extra jumperSuffix", p7.GetExtra("jumperSuffix"), "页");
+        EqStr("extra unknown", p7.GetExtra("nope"), "");
+
+        // ---- 事件表与控件工厂 ----------------------------------------
+        List<string> evs = p7.Events();
+        bool hasChange = false;
+        bool hasSize = false;
+        for (int i = 0; i < evs.Count; i = i + 1) {
+            if (evs[i] == "Change") { hasChange = true; }
+            if (evs[i] == "SizeChange") { hasSize = true; }
+        }
+        if (!hasChange) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL events: no Change");
+        }
+        if (!hasSize) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL events: no SizeChange");
+        }
+        Control made = ControlFactory.Create("Pagination");
+        if (made == null) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL factory: null");
+        } else {
+            EqStr("factory kind", made.Kind(), "Pagination");
+        }
+        SignalInt m8 = new SignalInt(4);
+        Pagination ofd = Pagination.Of(12, m8);
+        Eq("of pages", ofd.TotalPages(), 12);
+        Eq("of page", m8.Get(), 4);
+
+        if (fails == 0) {
+            Console.WriteLine("pagination_test OK");
+        } else {
+            Console.WriteLine($"pagination_test FAILURES {fails}");
+        }
+    }
+}

@@ -3,33 +3,114 @@ using Gui;
 
 namespace Gui.Widget;
 
-/// 带响应式页码绑定的分页组件。页数较多时，中间会
-/// 用省略号窗口化（NaiveUI 风格）：1 … 4 5 [6] 7 8 … 200。
+/// 分页组件（Element Plus 对位）。页数较多时中间用省略号
+/// 窗口化：1 … 4 5 [6] 7 8 … 200；省略号本身可点击，向前/
+/// 向后整窗翻页（快速跳页）。
+///
+/// 两种计页方式：直接给页数 `new Pagination(12, page)`，或给
+/// 条目数 + 每页条数（SetItemCount），总页数随之推导、改
+/// pageSize 自动重算。
+///
+/// 附属段（都可选）：
+///   - `Jumper(true)`   尾部“跳至 [输入框]”快速跳页，回车提交；
+///   - `ShowSizes(true)` 尾部“n / 页”每页条数下拉（SetPageSizes 定选项）；
+///   - `Prefix/Suffix`   前后缀文案；`ShowTotal` “共 N 页”；
+///   - `PrevText/NextText` 自定义上一页/下一页文字（空 = 箭头图标）；
+///   - `SetOrder`       调整各段展示顺序。
 ///
 /// 外观来自类列表：`small` 缩小按钮，`pill` 让按钮变圆，
-/// `simple` 把按钮条收窄成“prev  cur / total  next”。
+/// `simple` 把按钮条收窄成“prev [cur] / total next”，当前页
+/// 变成可编辑输入框（回车提交）。
 ///
-///     Pagination pg = new Pagination(12, page);
-///     pg.Class = "pill";
+///     Pagination pg = new Pagination(100, page);
+///     pg.Jumper(true).ShowSizes(true);
 ///     pg.RenderAt(app, x, y);
 class Pagination : Control {
     SignalInt model;
     /// 双向绑定的当前页，从 1 开始。
     Binding<int> Page;
+    /// 显式页数（未启用 item-count 模式时生效）。
     int totalPages;
     /// 页码变化后触发。
     UiEvent Change;
+    /// 每页条数变化后触发（ShowSizes 下拉选择）。
+    UiEvent SizeChange;
     int baseId;
     int idCount;
+
+    // ---- item-count 模式 ----
+    bool useItemCount;
+    int itemCount;
+    /// 每页条数（>0）。item-count 模式下参与计页，其余模式仅由宿主读取。
+    int pageSize;
+    /// ShowSizes 下拉的候选条数；空列表 = 不显示 sizes 段。
+    List<int> pageSizes;
+    int sizeIdx;
+    bool sizeOpen;
+    /// sizes 下拉弹出层的锚点几何（绘制时登记，覆盖阶段读取）。
+    int sizeBoxX;
+    int sizeBoxY;
+    int sizeBoxW;
+    int sizeBoxH;
+
+    // ---- 文案段 ----
+    string prefixText;
+    string suffixText;
+    /// 自定义上一页 / 下一页文字；空串用箭头图标（Element Plus prev/next 插槽）。
+    string prevText;
+    string nextText;
+    bool showTotal;
+
+    // ---- 快速跳页段 ----
+    bool jumper;
+    string jumperLabel;
+    string jumperSuffix;
+
+    // ---- 展示顺序 ----
+    /// 段名列表（prefix/total/pager/suffix/jumper/sizes 子集）；
+    /// null = 按 enablement 的默认顺序。宿主一经 SetOrder 即全权指定，
+    /// 缺 "pager" 会被补回。
+    List<string> order;
+
+    // ---- 页码小输入框（jumper 与 simple 模式共用）----
+    int fieldId;
+    string fieldBuf;
+
+    /// 窗口页码按钮数（Element Plus pager-count），奇数、>=5。
+    int pagerCount;
 
     void InitPagination(int total, SignalInt m) {
         this.InitControl("pagination", 1);
         totalPages = total;
+        if (totalPages < 1) { totalPages = 1; }
         model = m;
         baseId = 0;
         idCount = 0;
         wiresOwnEvents = true;
         Change = new UiEvent();
+        SizeChange = new UiEvent();
+        useItemCount = false;
+        itemCount = 0;
+        pageSize = 10;
+        pageSizes = new List<int>();
+        sizeIdx = 0 - 1;
+        sizeOpen = false;
+        sizeBoxX = 0;
+        sizeBoxY = 0;
+        sizeBoxW = 0;
+        sizeBoxH = 0;
+        prefixText = "";
+        suffixText = "";
+        prevText = "";
+        nextText = "";
+        showTotal = false;
+        jumper = false;
+        jumperLabel = "";
+        jumperSuffix = "";
+        order = null;
+        fieldId = 0;
+        fieldBuf = "";
+        pagerCount = 7;
     }
 
     Pagination() : this(1) { }
@@ -40,33 +121,187 @@ class Pagination : Control {
         return new Pagination(total, m);
     }
 
-    void SetTotal(int total) { totalPages = total; }
-    int Total() { return totalPages; }
+    /// item-count 模式：由条目数与每页条数推导总页数
+    ///（Element Plus item-count + page-size）。当前页随之钳制。
+    static Pagination WithCount(int items, int size, SignalInt m) {
+        Pagination p = new Pagination(1, m);
+        p.useItemCount = true;
+        p.itemCount = items;
+        p.SetPageSize(size);
+        return p;
+    }
 
-    /// 为当前页构建可见页码列表。值 0 表示
-    /// 省略号占位。小范围（<= 7 页）显示全部页码。
-    static List<int> BuildPages(int totalPages, int current) {
+    /// 显式页数（退出 item-count 模式）。
+    void SetTotal(int total) {
+        useItemCount = false;
+        totalPages = total;
+        if (totalPages < 1) { totalPages = 1; }
+        this.Normalize();
+    }
+    /// 总页数：item-count 模式推导，否则显式值。
+    int TotalPages() {
+        if (useItemCount) {
+            int sz = pageSize;
+            if (sz < 1) { sz = 1; }
+            int n = (itemCount + sz - 1) / sz;
+            if (n < 1) { n = 1; }
+            return n;
+        }
+        return totalPages;
+    }
+    int Total() { return this.TotalPages(); }
+
+    void SetItemCount(int items) {
+        useItemCount = true;
+        itemCount = items;
+        this.Normalize();
+    }
+    int ItemCount() { return itemCount; }
+    bool UsesItemCount() { return useItemCount; }
+
+    void SetPageSize(int size) {
+        if (size < 1) { size = 1; }
+        pageSize = size;
+        sizeIdx = 0 - 1;
+        for (int i = 0; i < pageSizes.Count; i = i + 1) {
+            if (pageSizes[i] == size) { sizeIdx = i; }
+        }
+        this.Normalize();
+    }
+    int PageSize() { return pageSize; }
+
+    /// ShowSizes 的候选条数（宿主列表，不复制）。
+    void SetPageSizes(List<int> sizes) {
+        pageSizes = sizes;
+        if (pageSizes == null) { pageSizes = new List<int>(); }
+        sizeIdx = 0 - 1;
+        for (int i = 0; i < pageSizes.Count; i = i + 1) {
+            if (pageSizes[i] == pageSize) { sizeIdx = i; }
+        }
+    }
+    List<int> PageSizes() { return pageSizes; }
+
+    /// `"10, 20, 50, 100"` ↔ 候选条数列表（设计器 / JSON 往返）。
+    void SetPageSizesText(string text) {
         List<int> r = new List<int>();
-        if (totalPages <= 7) {
-            int i = 1;
-            while (i <= totalPages) { r.Add(i); i = i + 1; }
+        int i = 0;
+        while (i < text.Length) {
+            int comma = text.IndexOf(",", i);
+            string seg = "";
+            if (comma < 0) { seg = text.Substring(i); i = text.Length; }
+            else { seg = text.Substring(i, comma - i); i = comma + 1; }
+            seg = seg.Trim();
+            if (seg.Length == 0) { continue; }
+            bool digits = true;
+            for (int k = 0; k < seg.Length; k = k + 1) {
+                if (seg[k] < 48 || seg[k] > 57) { digits = false; }
+            }
+            if (!digits) { continue; }
+            int v = Convert.ToInt32(seg);
+            if (v > 0) { r.Add(v); }
+        }
+        this.SetPageSizes(r);
+    }
+
+    string PageSizesText() {
+        string acc = "";
+        for (int i = 0; i < pageSizes.Count; i = i + 1) {
+            if (i > 0) { acc = acc + ", "; }
+            acc = acc + Convert.ToString(pageSizes[i]);
+        }
+        return acc;
+    }
+
+    Pagination Jumper(bool v) { jumper = v; return this; }
+    bool HasJumper() { return jumper; }
+    Pagination ShowSizes(bool v) {
+        if (v && pageSizes.Count == 0) {
+            pageSizes.Add(10);
+            pageSizes.Add(20);
+            pageSizes.Add(50);
+            pageSizes.Add(100);
+            sizeIdx = 0 - 1;
+            for (int i = 0; i < pageSizes.Count; i = i + 1) {
+                if (pageSizes[i] == pageSize) { sizeIdx = i; }
+            }
+        }
+        return this;
+    }
+    bool HasSizes() { return pageSizes.Count > 0; }
+
+    Pagination Prefix(string t) { prefixText = t; return this; }
+    Pagination Suffix(string t) { suffixText = t; return this; }
+    Pagination PrevText(string t) { prevText = t; return this; }
+    Pagination NextText(string t) { nextText = t; return this; }
+    Pagination ShowTotal(bool v) { showTotal = v; return this; }
+    Pagination JumperLabel(string t) { jumperLabel = t; return this; }
+    Pagination JumperSuffix(string t) { jumperSuffix = t; return this; }
+
+    /// 窗口页码按钮数：规范化为 >=5 的奇数（Element Plus pager-count）。
+    void SetPagerCount(int n) {
+        if (n < 5) { n = 5; }
+        if (n > 21) { n = 21; }
+        if (n % 2 == 0) { n = n - 1; }
+        pagerCount = n;
+    }
+    int PagerCount() { return pagerCount; }
+
+    // ---- 展示顺序（Element Plus layout/display-order）----
+
+    /// 段顺序：宿主列表优先（缺 pager 补回），否则按
+    /// prefix/total/suffix → pager → jumper → sizes 的默认顺序，
+    /// 只保留启用中的段。
+    List<string> EffOrder() {
+        List<string> r = new List<string>();
+        if (order != null) {
+            for (int i = 0; i < order.Count; i = i + 1) { r.Add(order[i]); }
+            bool hasPager = false;
+            for (int i = 0; i < r.Count; i = i + 1) {
+                if (r[i] == "pager") { hasPager = true; }
+            }
+            if (!hasPager) { r.Add("pager"); }
             return r;
         }
-        r.Add(1);
-        int lo = current - 1;
-        int hi = current + 1;
-        if (lo < 2) { lo = 2; }
-        if (hi > totalPages - 1) { hi = totalPages - 1; }
-        if (lo > 2) { r.Add(0); }
-        int p = lo;
-        while (p <= hi) { r.Add(p); p = p + 1; }
-        if (hi < totalPages - 1) { r.Add(0); }
-        r.Add(totalPages);
+        if (prefixText != "") { r.Add("prefix"); }
+        if (showTotal) { r.Add("total"); }
+        r.Add("pager");
+        if (suffixText != "") { r.Add("suffix"); }
+        if (jumper) { r.Add("jumper"); }
+        if (pageSizes.Count > 0) { r.Add("sizes"); }
         return r;
     }
 
-    /// 给定页数下控件的总像素宽度，供调用方
-    /// 居中放置。与绘制时所用的条目布局一致。
+    /// `"jumper, sizes, pager"` ↔ 段顺序（设计器 / JSON 往返）。
+    void SetOrderText(string text) {
+        List<string> r = new List<string>();
+        int i = 0;
+        while (i < text.Length) {
+            int comma = text.IndexOf(",", i);
+            string seg = "";
+            if (comma < 0) { seg = text.Substring(i); i = text.Length; }
+            else { seg = text.Substring(i, comma - i); i = comma + 1; }
+            seg = seg.Trim().ToLower();
+            if (seg == "prefix" || seg == "total" || seg == "pager"
+                || seg == "suffix" || seg == "jumper" || seg == "sizes") {
+                r.Add(seg);
+            }
+        }
+        if (r.Count == 0) { order = null; return; }
+        order = r;
+    }
+
+    string OrderText() {
+        List<string> eff = this.EffOrder();
+        string acc = "";
+        for (int i = 0; i < eff.Count; i = i + 1) {
+            if (i > 0) { acc = acc + ", "; }
+            acc = acc + eff[i];
+        }
+        return acc;
+    }
+
+    /// 给定页数下控件 pager 段的总像素宽度（纯按钮条，供
+    /// DataTable 等调用方定位）。与绘制所用的条目布局一致。
     static int MeasureWidth(App app, int totalPages, int current) {
         Theme t = app.theme;
         int btnSize = t.heightMedium;
@@ -74,6 +309,55 @@ class Pagination : Control {
         List<int> pages = Pagination.BuildPages(totalPages, current);
         int count = pages.Count + 2; // 上一页 + 页码 + 下一页
         return count * (btnSize + gap) - gap;
+    }
+
+    /// 省略号快速跳页步长：向前/向后翻一整窗（默认 7 槽即 ±5，
+    /// Element Plus 行为）。
+    int EllipsisStep() { return pagerCount - 2; }
+
+    /// Element Plus 页码窗口算法。值 0 表示省略号占位：
+    ///   - 总页数 <= 槽位：全部平铺；
+    ///   - 当前页靠前 / 靠后：领起 / 收尾长串；
+    ///   - 居中：当前页 ± half。
+    static List<int> BuildPages(int totalPages, int current) {
+        return Pagination.BuildPagesSlots(totalPages, current, 7);
+    }
+
+    static List<int> BuildPagesSlots(int totalPages, int current, int slots) {
+        List<int> r = new List<int>();
+        if (totalPages < 1) { totalPages = 1; }
+        if (current < 1) { current = 1; }
+        if (current > totalPages) { current = totalPages; }
+        if (totalPages <= slots) {
+            int i = 1;
+            while (i <= totalPages) { r.Add(i); i = i + 1; }
+            return r;
+        }
+        int half = (slots - 1) / 2;
+        bool prevMore = current > slots - 2;
+        bool nextMore = current < totalPages - slots + 3;
+        if (prevMore && !nextMore) {
+            int start = totalPages - (slots - 2);
+            int p = start;
+            while (p < totalPages) { r.Add(p); p = p + 1; }
+        } else if (!prevMore && nextMore) {
+            int p = 2;
+            while (p < slots) { r.Add(p); p = p + 1; }
+        } else if (prevMore && nextMore) {
+            int off = half - 1;
+            int p = current - off;
+            while (p <= current + off) { r.Add(p); p = p + 1; }
+        } else {
+            int p = 2;
+            while (p < totalPages) { r.Add(p); p = p + 1; }
+        }
+        List<int> full = new List<int>();
+        full.Add(1);
+        if (prevMore) { full.Add(0); }
+        for (int i = 0; i < r.Count; i = i + 1) { full.Add(r[i]); }
+        if (nextMore) { full.Add(0); }
+        full.Add(totalPages);
+        return full;
     }
 
     int ButtonSize(App app, StyleBox s) {
@@ -96,46 +380,159 @@ class Pagination : Control {
     }
 
     /// Prev、每个窗口条目一个 id（含省略号，使 id 与
-    /// 布局对齐）以及 next；作为连续块一次性保留。
+    /// 布局对齐）、next、页码输入框与 sizes 箭头；作为
+    /// 连续块一次性保留。
     void EnsureIds(int entries) {
-        int need = entries + 2;
+        int need = entries + 4;
         if (idCount >= need) { return; }
         baseId = WidgetId.Block(need);
         idCount = need;
     }
 
-    void GoTo(App app, int pg) {
-        if (pg < 1 || pg > totalPages || pg == model.Get()) { return; }
+    /// 稳定的当前页读写：同步 model 与双向绑定，触发 Change。
+    /// 编程入口（测试 / 宿主），不检查禁用态。
+    void SetPage(int pg) {
+        int tp = this.TotalPages();
+        if (pg < 1) { pg = 1; }
+        if (pg > tp) { pg = tp; }
+        if (pg == model.Get()) { return; }
         model.Set(pg);
         if (Page != null) { Page.Set(pg); }
         Change.Raise();
-        app.RequestRedraw();
+    }
+
+    /// 用户路径的 GoTo：禁用态直接忽略。
+    void GoTo(App app, int pg) {
+        if (this.IsDisabled()) { return; }
+        int before = model.Get();
+        this.SetPage(pg);
+        if (model.Get() != before) { app.RequestRedraw(); }
     }
 
     void SyncBinding() {
-        if (Page == null) { return; }
-        int cur = Page.Get();
-        if (cur != model.Get()) { model.Set(cur); }
+        if (Page != null) {
+            int cur = Page.Get();
+            if (cur != model.Get()) { model.Set(cur); }
+        }
+        // 绑定 / 宿主把页写超出范围（SetTotal 缩小、pageSize 增大）
+        // 时静默钳回，不触发 Change。
+        int tp = this.TotalPages();
+        int cur2 = model.Get();
+        if (cur2 > tp) {
+            model.Set(tp);
+            if (Page != null) { Page.Set(tp); }
+        } else if (cur2 < 1) {
+            model.Set(1);
+            if (Page != null) { Page.Set(1); }
+        }
+    }
+
+    /// pageSize / itemCount / total 变更后的统一收口：钳制当前页、
+    /// 重找 sizes 选中项。
+    void Normalize() {
+        if (pageSize < 1) { pageSize = 1; }
+        int tp = this.TotalPages();
+        int cur = model.Get();
+        if (cur > tp) {
+            model.Set(tp);
+            if (Page != null) { Page.Set(tp); }
+        }
+        if (cur < 1) {
+            model.Set(1);
+            if (Page != null) { Page.Set(1); }
+        }
+        sizeIdx = 0 - 1;
+        for (int i = 0; i < pageSizes.Count; i = i + 1) {
+            if (pageSizes[i] == pageSize) { sizeIdx = i; }
+        }
     }
 
     override void OnMeasure(App app) {
         StyleBox s = this.ResolveStyleAs(app, "pagination", Class,
                                         Style.SNormal());
         int btnSize = this.ButtonSize(app, s);
-        int gap = s.GapOr(app.theme.gapSmall);
         prefH = btnSize;
+        int gap = s.GapOr(app.theme.gapSmall);
+        int fs = this.FontSize(app, s);
+        prefW = this.TotalWidth(app, s, fs, gap);
+    }
+
+    /// 全控件宽度：按生效顺序累加各段（与绘制同一套算法），
+    /// 供宿主居中 / 右对齐放置。
+    int TotalWidth(App app, StyleBox s, int fs, int gap) {
         if (Style.Has(Class, "simple")) {
-            prefW = btnSize * 4 + gap * 2;
-            return;
+            int btnSize = this.ButtonSize(app, s);
+            int fieldW = app.Scale(46);
+            return btnSize * 2 + fieldW + gap * 2;
         }
-        List<int> pages = Pagination.BuildPages(totalPages, model.Get());
-        prefW = (pages.Count + 2) * (btnSize + gap) - gap;
+        List<string> segs = this.EffOrder();
+        int w = 0;
+        for (int i = 0; i < segs.Count; i = i + 1) {
+            int sw = this.SegmentWidth(app, s, fs, segs[i]);
+            if (sw <= 0) { continue; }
+            if (w > 0) { w = w + gap; }
+            w = w + sw;
+        }
+        return w;
+    }
+
+    /// 单段宽度（0 = 该段不显示）。必须与 OnPaint 的摆放一致。
+    int SegmentWidth(App app, StyleBox s, int fs, string seg) {
+        Theme t = app.theme;
+        int btnSize = this.ButtonSize(app, s);
+        int gap = s.GapOr(t.gapSmall);
+        if (seg == "prefix") {
+            if (prefixText == "") { return 0; }
+            return Canvas.MeasureText(prefixText, fs);
+        }
+        if (seg == "total") {
+            if (!showTotal) { return 0; }
+            return Canvas.MeasureText(this.TotalText(), fs);
+        }
+        if (seg == "suffix") {
+            if (suffixText == "") { return 0; }
+            return Canvas.MeasureText(suffixText, fs);
+        }
+        if (seg == "jumper") {
+            if (!jumper) { return 0; }
+            int w = app.Scale(48);
+            string lab = this.JumperLabelText();
+            if (lab != "") { w = w + gap + Canvas.MeasureText(lab, fs); }
+            string suf = jumperSuffix;
+            if (suf != "") { w = w + gap + Canvas.MeasureText(suf, fs); }
+            return w;
+        }
+        if (seg == "sizes") {
+            if (pageSizes.Count == 0) { return 0; }
+            int chev = t.iconSizeSmall;
+            int textW = Canvas.MeasureText(this.SizeText(pageSize), fs);
+            return textW + chev + t.paddingSmall * 2 + app.Scale(8);
+        }
+        // pager（simple 模式见 TotalWidth）。
+        List<int> pages = Pagination.BuildPagesSlots(this.TotalPages(),
+                                                     model.Get(), pagerCount);
+        return (pages.Count + 2) * (btnSize + gap) - gap;
+    }
+
+    string TotalText() {
+        return "共 " + Convert.ToString(this.TotalPages()) + " 页";
+    }
+
+    string JumperLabelText() {
+        if (jumperLabel != "") { return jumperLabel; }
+        return "跳至";
+    }
+
+    /// sizes 框与选项的文字：“n / 页”。
+    string SizeText(int n) {
+        return Convert.ToString(n) + " / 页";
     }
 
     override void OnPaint(App app) {
         this.SyncBinding();
         if (Style.Has(Class, "simple")) {
             this.PaintSimple(app);
+            if (sizeOpen) { app.AddOverlay(OverlayPopup.Host(this)); }
             return;
         }
         Canvas c = app.canvas;
@@ -144,8 +541,6 @@ class Pagination : Control {
                                         Style.SNormal());
         StyleBox item = this.ResolvePartAs(app, "pagination", "item", "", Class,
                                           Style.SNormal());
-        StyleBox sel = this.ResolvePartAs(app, "pagination", "item", "", Class,
-                                         Style.SSelected());
         StyleBox arrow = this.ResolvePartAs(app, "pagination", "arrow", "",
                                             Class, Style.SNormal());
         int btnSize = this.ButtonSize(app, s);
@@ -154,91 +549,319 @@ class Pagination : Control {
         int gap = s.GapOr(t.gapSmall);
         int ico = arrow.WidthOr(t.iconSizeSmall);
         int current = model.Get();
-        List<int> pages = Pagination.BuildPages(totalPages, current);
+        bool off = this.IsDisabled();
+        List<int> pages = Pagination.BuildPagesSlots(this.TotalPages(),
+                                                     current, pagerCount);
         this.EnsureIds(pages.Count);
+        int nextId = baseId + 1 + pages.Count;
+        int fldId = baseId + 2 + pages.Count;
+        int chevId = baseId + 3 + pages.Count;
+        fieldId = fldId;
+        app.focus.RegisterFocusable(fldId);
 
         int cx = bx;
-        this.PaintArrow(app, "chevron-left", baseId, cx, btnSize, radius, ico,
-                        current <= 1, item, arrow);
-        cx = cx + btnSize + gap;
-
-        int i = 0;
-        for (; i < pages.Count; i = i + 1) {
-            int pageId = baseId + 1 + i;
-            int pg = pages[i];
-            if (pg == 0) {
-                StyleBox el = this.ResolvePartAs(app, "pagination", "ellipsis",
-                                                 "", Class, Style.SNormal());
-                c.DrawTextCentered(cx, by, btnSize, btnSize, "…",
-                                   el.FgOr(0),
-                                   el.FontOr(fontSize));
-            } else {
-                bool active = pg == current;
-                int bg = item.BgOr(0);
-                int textColor = item.FgOr(0);
-                int borderC = item.BorderOr(0);
-                if (active) {
-                    bg = sel.BgOr(0);
-                    textColor = sel.FgOr(0);
-                    borderC = sel.BorderOr(0);
-                } else if (app.focus.IsHovered(pageId)) {
-                    StyleBox hov = this.ResolvePartAs(app, "pagination", "item",
-                                                      "", Class, Style.SHover());
-                    bg = hov.BgOr(0);
-                    borderC = hov.BorderOr(0);
+        List<string> segs = this.EffOrder();
+        for (int si = 0; si < segs.Count; si = si + 1) {
+            string seg = segs[si];
+            if (seg == "prefix" && prefixText != "") {
+                StyleBox lbl = this.ResolvePartAs(app, "pagination", "label",
+                                                  "", Class, Style.SNormal());
+                c.DrawText(cx, Canvas.CenterTextY(by, btnSize, fontSize),
+                           prefixText, lbl.FgOr(0), fontSize);
+                cx = cx + Canvas.MeasureText(prefixText, fontSize) + gap;
+            } else if (seg == "total" && showTotal) {
+                StyleBox lbl = this.ResolvePartAs(app, "pagination", "label",
+                                                  "", Class, Style.SNormal());
+                c.DrawText(cx, Canvas.CenterTextY(by, btnSize, fontSize),
+                           this.TotalText(), lbl.FgOr(0), fontSize);
+                cx = cx + Canvas.MeasureText(this.TotalText(), fontSize) + gap;
+            } else if (seg == "pager") {
+                this.PaintArrow(app, "chevron-left", baseId, cx, btnSize,
+                                radius, ico, current <= 1 || off, item, arrow);
+                cx = cx + btnSize + gap;
+                int i = 0;
+                for (; i < pages.Count; i = i + 1) {
+                    int pageId = baseId + 1 + i;
+                    int pg = pages[i];
+                    if (pg == 0) {
+                        this.PaintEllipsis(app, pageId, cx, btnSize, radius,
+                                           fontSize, current, off);
+                    } else {
+                        this.PaintPage(app, pageId, pg, cx, btnSize, radius,
+                                       fontSize, current, off);
+                    }
+                    cx = cx + btnSize + gap;
                 }
-                c.SurfaceRoundRect(cx, by, btnSize, btnSize, radius, bg,
-                                   borderC, item.BorderWOr(1));
-                c.DrawTextCentered(cx, by, btnSize, btnSize,
-                                   Convert.ToString(pg), textColor, fontSize);
-                app.hitTester.RegisterRect(pageId, cx, by, btnSize,
-                                                        btnSize, 0);
+                this.PaintArrow(app, "chevron-right", nextId, cx, btnSize,
+                                radius, ico, current >= this.TotalPages() || off,
+                                item, arrow);
+                cx = cx + btnSize + gap;
+            } else if (seg == "suffix" && suffixText != "") {
+                StyleBox lbl = this.ResolvePartAs(app, "pagination", "label",
+                                                  "", Class, Style.SNormal());
+                c.DrawText(cx, Canvas.CenterTextY(by, btnSize, fontSize),
+                           suffixText, lbl.FgOr(0), fontSize);
+                cx = cx + Canvas.MeasureText(suffixText, fontSize) + gap;
+            } else if (seg == "jumper" && jumper) {
+                string lab = this.JumperLabelText();
+                if (lab != "") {
+                    StyleBox lbl = this.ResolvePartAs(app, "pagination",
+                                                      "label", "", Class,
+                                                      Style.SNormal());
+                    c.DrawText(cx, Canvas.CenterTextY(by, btnSize, fontSize),
+                               lab, lbl.FgOr(0), fontSize);
+                    cx = cx + Canvas.MeasureText(lab, fontSize) + gap;
+                }
+                this.PaintField(app, fldId, cx, by, app.Scale(48), btnSize,
+                                radius, fontSize, current, off);
+                cx = cx + app.Scale(48) + gap;
+                if (jumperSuffix != "") {
+                    StyleBox lbl = this.ResolvePartAs(app, "pagination",
+                                                      "label", "", Class,
+                                                      Style.SNormal());
+                    c.DrawText(cx, Canvas.CenterTextY(by, btnSize, fontSize),
+                               jumperSuffix, lbl.FgOr(0), fontSize);
+                    cx = cx + Canvas.MeasureText(jumperSuffix, fontSize) + gap;
+                }
+            } else if (seg == "sizes" && pageSizes.Count > 0) {
+                int sw = this.SegmentWidth(app, s, fontSize, "sizes");
+                sizeBoxX = cx;
+                sizeBoxY = by;
+                sizeBoxW = sw;
+                sizeBoxH = btnSize;
+                this.PaintSizesBox(app, chevId, cx, by, sw, btnSize, radius,
+                                   fontSize, off);
+                cx = cx + sw + gap;
             }
-            cx = cx + btnSize + gap;
         }
 
-        int nextId = baseId + 1 + pages.Count;
-        this.PaintArrow(app, "chevron-right", nextId, cx, btnSize, radius, ico,
-                        current >= totalPages, item, arrow);
+        if (sizeOpen) { app.AddOverlay(OverlayPopup.Host(this)); }
 
-        if (this.IsDisabled() || app.EventKind() != 3) { return; }
+        this.HandleInput(app, pages, nextId, fldId, chevId, off);
+    }
+
+    /// 主阶段输入：页码点击、省略号整窗翻页、输入框键入、
+    /// sizes 箭头开合。sizes 弹层开着时主阶段不吃任何输入，
+    /// 由覆盖阶段统一处理（点外部 = 只关闭）。
+    void HandleInput(App app, List<int> pages, int nextId, int fldId,
+                     int chevId, bool off) {
+        if (off || sizeOpen) { return; }
+        int current = model.Get();
+        bool click = app.EventKind() == 3;
+
+        // 页码输入框：焦点在框上时先处理键盘；点击别处交回焦点。
+        bool fieldFocused = app.focus.IsFocused(fldId);
+        if (fieldFocused && app.EventKind() == 6) {
+            int code = app.window.EventKeyCode();
+            if (code == 13) {
+                this.CommitField(app, fldId);
+                app.RequestRedraw();
+            } else if (code == 8) {
+                if (fieldBuf.Length > 0) {
+                    fieldBuf = fieldBuf.Substring(0, fieldBuf.Length - 1);
+                }
+                app.RequestRedraw();
+            } else if (code >= 48 && code <= 57 && fieldBuf.Length < 7) {
+                fieldBuf = fieldBuf + Convert.ToString(code - 48);
+                app.RequestRedraw();
+            }
+            return;
+        }
+        if (fieldFocused && app.EventKind() == 4
+            && app.window.EventKeyCode() == 27) {
+            fieldBuf = "";
+            app.focus.ClearFocus();
+            app.RequestRedraw();
+            return;
+        }
+
+        if (!app.ClickAvailable()) { return; }
         int hit = app.ClickTarget();
+
+        // 点击输入框以外的任何地方都交回焦点（下次聚焦重新全选）。
+        if (fieldFocused && hit != fldId) {
+            fieldBuf = "";
+            app.focus.ClearFocus();
+        }
         if (hit == baseId) { this.GoTo(app, current - 1); return; }
         if (hit == nextId) { this.GoTo(app, current + 1); return; }
-        i = 0;
+        if (hit == fldId) {
+            fieldBuf = Convert.ToString(current);
+            app.focus.SetFocused(fldId);
+            app.RequestRedraw();
+            return;
+        }
+        if (hit == chevId) {
+            sizeOpen = true;
+            app.ClaimClick();
+            app.RequestRedraw();
+            return;
+        }
+        int i = 0;
         while (i < pages.Count) {
             if (hit == baseId + 1 + i) {
-                if (pages[i] != 0) { this.GoTo(app, pages[i]); }
+                int pg = pages[i];
+                if (pg == 0) {
+                    // 省略号快速跳页：左侧向前、右侧向后翻一整窗。
+                    if (i * 2 + 1 < pages.Count) {
+                        this.GoTo(app,
+                            current + (i < pages.Count / 2
+                                       ? 0 - this.EllipsisStep()
+                                       : this.EllipsisStep()));
+                    }
+                } else {
+                    this.GoTo(app, pg);
+                }
                 return;
             }
             i = i + 1;
         }
     }
 
-    /// 一个 prev/next 控件：一个表面、一个在范围末端置灰的箭头，
-    /// 以及它的命中区域。
+    /// 提交页码输入框：纯数字才接受，钳到 [1, 总页数]；
+    /// 空串 / 非法恢复当前页。成功后保持焦点（Element Plus 行为）。
+    void CommitField(App app, int fldId) {
+        string t = fieldBuf.Trim();
+        fieldBuf = "";
+        if (t.Length == 0) { return; }
+        for (int i = 0; i < t.Length; i = i + 1) {
+            if (t[i] < 48 || t[i] > 57) { return; }
+        }
+        this.GoTo(app, Convert.ToInt32(t));
+    }
+
+    /// 页码 / 跳页输入框。聚焦时画光标，回车提交、Esc 还原、
+    /// 点外面交回焦点。
+    void PaintField(App app, int id, int x, int y, int w, int h, int radius,
+                    int fontSize, int current, bool off) {
+        Canvas c = app.canvas;
+        bool focused = !off && app.focus.IsFocused(id);
+        StyleBox f = this.ResolvePartAs(app, "pagination", "field", "",
+                                        Class,
+                                        focused ? Style.SFocus()
+                                                : Style.SNormal());
+        f.Paint(app, x, y, w, h);
+        string shown = focused && fieldBuf != "" ? fieldBuf
+                                                 : Convert.ToString(current);
+        int fs = f.FontOr(fontSize);
+        int textX = x + (w - Canvas.MeasureText(shown, fs)) / 2;
+        if (textX < x + 2) { textX = x + 2; }
+        int ty = Canvas.CenterTextY(y, h, fs);
+        c.DrawText(textX, ty, shown, f.FgOr(0), fs);
+        if (focused) {
+            int caretX = textX + Canvas.MeasureText(shown, fs) + 1;
+            c.FillRect(caretX, ty, 1, Canvas.FontHeight(fs), f.AccentOr(0));
+        }
+        app.hitTester.RegisterRect(id, x, y, w, h, 1);
+    }
+
+    /// 一个 prev/next 控件：一个表面、一个在范围末端（或整体
+    /// 禁用）置灰的箭头 / 自定义文字，以及它的命中区域。
     void PaintArrow(App app, string glyph, int id, int cx, int btnSize,
                     int radius, int ico, bool atEnd, StyleBox item,
                     StyleBox arrow) {
         Canvas c = app.canvas;
         Theme t = app.theme;
-        int bg = item.BgOr(0);
-        if (app.focus.IsHovered(id) && !atEnd) {
-            bg = this.ResolvePartAs(app, "pagination", "item", "", Class,
-                                    Style.SHover()).BgOr(0);
+        bool off = this.IsDisabled();
+        string txt = glyph == "chevron-left" ? prevText : nextText;
+        StyleBox st = item;
+        if (atEnd || off) {
+            st = this.ResolvePartAs(app, "pagination", "arrow", "", Class,
+                                    Style.SDisabled());
+        } else if (app.focus.IsHovered(id)) {
+            st = this.ResolvePartAs(app, "pagination", "item", "", Class,
+                                    Style.SHover());
         }
-        StyleBox disabledArrow = this.ResolvePartAs(app, "pagination", "arrow", "",
-                                                    Class, Style.SDisabled());
-        int fg = (atEnd ? disabledArrow : arrow).FgOr(0);
-        c.SurfaceRoundRect(cx, by, btnSize, btnSize, radius, bg,
-                           item.BorderOr(0),
-                           item.BorderWOr(1));
-        c.DrawGlyph(glyph, cx + (btnSize - ico) / 2, by + (btnSize - ico) / 2,
-                    ico, fg);
+        c.SurfaceRoundRect(cx, by, btnSize, btnSize, radius, st.BgOr(0),
+                           item.BorderOr(0), item.BorderWOr(1));
+        if (txt != "") {
+            int fs = st.FontOr(this.FontSize(app, item));
+            c.DrawTextCentered(cx, by, btnSize, btnSize, txt, st.FgOr(0), fs);
+        } else {
+            int fg = (atEnd || off) ? st.FgOr(0) : arrow.FgOr(0);
+            c.DrawGlyph(glyph, cx + (btnSize - ico) / 2,
+                        by + (btnSize - ico) / 2, ico, fg);
+        }
         app.hitTester.RegisterRect(id, cx, by, btnSize, btnSize, 0);
     }
 
-    /// `simple` 类：prev 箭头、“current / total”文本、next 箭头。
+    /// 省略号：悬停时提示可以整窗翻页（变为箭头），点击翻页。
+    void PaintEllipsis(App app, int id, int cx, int btnSize, int radius,
+                       int fontSize, int current, bool off) {
+        Canvas c = app.canvas;
+        StyleBox el = this.ResolvePartAs(app, "pagination", "ellipsis", "",
+                                         Class, Style.SNormal());
+        int fg = el.FgOr(0);
+        string glyph = "…";
+        int ico = fontSize;
+        if (!off && app.focus.IsHovered(id)) {
+            bool left = cx < bx + btnSize * 2;
+            glyph = left ? "chevrons-left" : "chevrons-right";
+            ico = fontSize;
+        }
+        if (glyph == "…") {
+            c.DrawTextCentered(cx, by, btnSize, btnSize, glyph, fg, fontSize);
+        } else {
+            c.DrawGlyph(glyph, cx + (btnSize - ico) / 2,
+                        by + (btnSize - ico) / 2, ico, fg);
+        }
+        app.hitTester.RegisterRect(id, cx, by, btnSize, btnSize, 0);
+    }
+
+    /// 一个页码按钮：normal / hover / selected 三态，禁用整体置灰。
+    void PaintPage(App app, int id, int pg, int cx, int btnSize, int radius,
+                   int fontSize, int current, bool off) {
+        Canvas c = app.canvas;
+        StyleBox item = this.ResolvePartAs(app, "pagination", "item", "",
+                                          Class,
+                                          off ? Style.SDisabled()
+                                              : Style.SNormal());
+        bool active = pg == current;
+        int bg = item.BgOr(0);
+        int textColor = item.FgOr(0);
+        int borderC = item.BorderOr(0);
+        if (active) {
+            StyleBox sel = this.ResolvePartAs(app, "pagination", "item", "",
+                                             Class, Style.SSelected());
+            bg = sel.BgOr(0);
+            textColor = sel.FgOr(0);
+            borderC = sel.BorderOr(0);
+        } else if (!off && app.focus.IsHovered(id)) {
+            StyleBox hov = this.ResolvePartAs(app, "pagination", "item", "",
+                                             Class, Style.SHover());
+            bg = hov.BgOr(0);
+            borderC = hov.BorderOr(0);
+        }
+        c.SurfaceRoundRect(cx, by, btnSize, btnSize, radius, bg, borderC,
+                           item.BorderWOr(1));
+        c.DrawTextCentered(cx, by, btnSize, btnSize, Convert.ToString(pg),
+                           textColor, item.FontOr(fontSize));
+        app.hitTester.RegisterRect(id, cx, by, btnSize, btnSize, 0);
+    }
+
+    /// “n / 页”每页条数框：一张表面 + 当前值 + 下拉箭头；
+    /// 选项列表在覆盖阶段绘制（见 OnPaintOverlay）。
+    void PaintSizesBox(App app, int id, int x, int y, int w, int h,
+                       int radius, int fontSize, bool off) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        StyleBox box = this.ResolvePartAs(app, "pagination", "sizes", "",
+                                          Class,
+                                          off ? Style.SDisabled()
+                                              : Style.SNormal());
+        int fs = box.FontOr(fontSize);
+        int chev = t.iconSizeSmall;
+        box.Paint(app, x, y, w, h);
+        c.DrawText(x + t.paddingSmall, Canvas.CenterTextY(y, h, fs),
+                   this.SizeText(pageSize), box.FgOr(0), fs);
+        int chevX = x + w - chev - t.paddingSmall;
+        c.DrawGlyph("chevron-down", chevX, y + (h - chev) / 2, chev,
+                    box.FgOr(0));
+        app.hitTester.RegisterRect(id, x, y, w, h, 0);
+    }
+
+    /// `simple` 类：prev 箭头、可编辑的当前页输入框、
+    /// “/ total”文本、next 箭头。
     void PaintSimple(App app) {
         Canvas c = app.canvas;
         Theme t = app.theme;
@@ -254,28 +877,154 @@ class Pagination : Control {
         int radius = this.Radius(app, item, btnSize);
         int gap = s.GapOr(t.gapSmall);
         int ico = arrow.WidthOr(t.iconSizeSmall);
+        int fontSize = this.FontSize(app, s);
         int cur = model.Get();
+        bool off = this.IsDisabled();
         this.EnsureIds(1);
+        int fldId = baseId + 1;
+        int nextId = baseId + 2;
+        fieldId = fldId;
+        app.focus.RegisterFocusable(fldId);
 
         int cx = bx;
         this.PaintArrow(app, "chevron-left", baseId, cx, btnSize, radius, ico,
-                        cur <= 1, item, arrow);
+                        cur <= 1 || off, item, arrow);
         cx = cx + btnSize + gap;
 
-        int textW = btnSize * 2;
-        c.DrawTextCentered(cx, by, textW, btnSize,
-            Convert.ToString(cur) + " / " + Convert.ToString(totalPages),
-            lbl.FgOr(0), lbl.FontOr(Style.FontFallback(app, "medium")));
-        cx = cx + textW + gap;
+        int fieldW = app.Scale(46);
+        this.PaintField(app, fldId, cx, by, fieldW, btnSize, radius, fontSize,
+                        cur, off);
+        cx = cx + fieldW;
 
-        int nextId = baseId + 2;
+        string totalStr = "/ " + Convert.ToString(this.TotalPages());
+        StyleBox lb2 = off ? this.ResolvePartAs(app, "pagination", "label", "",
+                                                Class, Style.SDisabled())
+                           : lbl;
+        int fs = lb2.FontOr(fontSize);
+        c.DrawTextCentered(cx, by, btnSize * 2, btnSize, totalStr, lb2.FgOr(0),
+                           fs);
+        cx = cx + btnSize * 2 + gap;
+
         this.PaintArrow(app, "chevron-right", nextId, cx, btnSize, radius, ico,
-                        cur >= totalPages, item, arrow);
+                        cur >= this.TotalPages() || off, item, arrow);
 
-        if (this.IsDisabled() || app.EventKind() != 3) { return; }
+        // simple 的输入处理与标准布局共用；pager 段的页码 id
+        // 在此布局下不存在，传空表即可。
+        if (!sizeOpen) {
+            this.HandleSimpleInput(app, nextId, fldId, off);
+        }
+    }
+
+    void HandleSimpleInput(App app, int nextId, int fldId, bool off) {
+        if (off || sizeOpen) { return; }
+        int current = model.Get();
+        bool fieldFocused = app.focus.IsFocused(fldId);
+        if (fieldFocused && app.EventKind() == 6) {
+            int code = app.window.EventKeyCode();
+            if (code == 13) {
+                this.CommitField(app, fldId);
+                app.RequestRedraw();
+            } else if (code == 8) {
+                if (fieldBuf.Length > 0) {
+                    fieldBuf = fieldBuf.Substring(0, fieldBuf.Length - 1);
+                }
+                app.RequestRedraw();
+            } else if (code >= 48 && code <= 57 && fieldBuf.Length < 7) {
+                fieldBuf = fieldBuf + Convert.ToString(code - 48);
+                app.RequestRedraw();
+            }
+            return;
+        }
+        if (fieldFocused && app.EventKind() == 4
+            && app.window.EventKeyCode() == 27) {
+            fieldBuf = "";
+            app.focus.ClearFocus();
+            app.RequestRedraw();
+            return;
+        }
+        if (!app.ClickAvailable()) { return; }
         int hit = app.ClickTarget();
-        if (hit == baseId) { this.GoTo(app, cur - 1); }
-        else if (hit == nextId) { this.GoTo(app, cur + 1); }
+        if (fieldFocused && hit != fldId) {
+            fieldBuf = "";
+            app.focus.ClearFocus();
+        }
+        if (hit == baseId) { this.GoTo(app, current - 1); return; }
+        if (hit == nextId) { this.GoTo(app, current + 1); return; }
+        if (hit == fldId) {
+            fieldBuf = Convert.ToString(current);
+            app.focus.SetFocused(fldId);
+            app.RequestRedraw();
+        }
+    }
+
+    /// sizes 弹层：锚定在条数框下方（超出窗口底部则翻转到上方），
+    /// 每行一个候选条数。行由几何驱动（不注册命中 id）。
+    override void OnPaintOverlay(App app) {
+        if (!sizeOpen) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        StyleBox s = this.ResolveStyleAs(app, "pagination", Class,
+                                        Style.SNormal());
+        int fs = this.FontSize(app, s);
+        int optH = this.ButtonSize(app, s);
+        int pad = app.Scale(4);
+        int n = pageSizes.Count;
+        if (n > 6) { n = 6; }
+        int popW = sizeBoxW;
+        if (popW < app.Scale(88)) { popW = app.Scale(88); }
+        int popH = n * optH + pad * 2;
+        int popX = OverlayPopup.FitX(app, sizeBoxX, popW);
+        int popY = OverlayPopup.FitY(app, sizeBoxY + sizeBoxH + app.Scale(4),
+                                     sizeBoxH, popH);
+
+        app.BlockHitsBelow();
+        StyleBox pop = this.ResolvePartAs(app, "pagination", "popup", "popup",
+                                          Class, Style.SSelected());
+        pop.Paint(app, popX, popY, popW, popH);
+        app.BlockHitsRect(popX, popY, popW, popH);
+
+        bool overPop = app.mouseX >= popX && app.mouseX < popX + popW
+            && app.mouseY >= popY && app.mouseY < popY + popH;
+        int over = 0 - 1;
+        if (overPop) {
+            int row = (app.mouseY - popY - pad) / optH;
+            if (row >= 0 && row < n) { over = row; }
+        }
+
+        for (int i = 0; i < n; i = i + 1) {
+            int ry = popY + pad + i * optH;
+            int st = Style.SNormal();
+            if (i == sizeIdx) { st = st + Style.SSelected(); }
+            else if (i == over) { st = st + Style.SHover(); }
+            StyleBox row = this.ResolvePartAs(app, "pagination", "option", "",
+                                              Class, st);
+            row.Paint(app, popX + pad, ry, popW - pad * 2, optH);
+            int rfs = row.FontOr(fs);
+            c.DrawText(popX + pad + t.paddingSmall,
+                       Canvas.CenterTextY(ry, optH, rfs),
+                       this.SizeText(pageSizes[i]), row.FgOr(0), rfs);
+        }
+
+        if (app.ClickAvailable()) {
+            if (over >= 0) {
+                this.SetPageSize(pageSizes[over]);
+                sizeOpen = false;
+                SizeChange.Raise();
+                app.ClaimClick();
+                app.RequestRedraw();
+            } else if (!overPop) {
+                sizeOpen = false;
+                app.ClaimClick();
+                app.RequestRedraw();
+            } else {
+                // 弹层内的空白处：吃掉点击，不穿透。
+                app.ClaimClick();
+            }
+        }
+        if (app.EventKind() == 4 && app.window.EventKeyCode() == 27) {
+            sizeOpen = false;
+            app.RequestRedraw();
+        }
     }
 
     // ---- 设计器 / 序列化模型 ----
@@ -286,34 +1035,102 @@ class Pagination : Control {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec total = PropSpec.Int("total", "Page count");
         total.num = totalPages;
+        total.WithTip("Explicit page count. Ignored once itemCount > 0.");
         ps.Add(total);
         PropSpec pg = PropSpec.Int("page", "Current page");
         pg.snum = model;
         ps.Add(pg);
+        PropSpec items = PropSpec.Int("itemCount", "Item count");
+        items.num = itemCount;
+        items.WithTip("Total item count; pages derive from it and pageSize.");
+        ps.Add(items);
         PropSpec sz = PropSpec.Int("pageSize", "Page size");
-        sz.num = 10;
-        sz.WithTip("Rows per page (read by host; not drawn by the widget).");
+        sz.num = pageSize;
+        sz.WithTip("Items per page. In itemCount mode it recomputes pages.");
         ps.Add(sz);
         PropSpec sizes = PropSpec.Text("pageSizes", "Page sizes");
-        sizes.str = "10, 20, 50, 100";
-        sizes.WithTip("Comma-separated selectable page sizes (read by host).");
+        sizes.str = this.PageSizesText();
+        sizes.WithTip("Comma-separated selectable page sizes (10, 20, 50).");
         ps.Add(sizes);
-        PropSpec sh = PropSpec.Bool("showTotal", "Show total/total");
-        sh.flag = false;
-        sh.WithTip("Show 'cur/total' text (simple mode already shows it).");
+        PropSpec sh = PropSpec.Bool("showTotal", "Show total");
+        sh.flag = showTotal;
+        sh.WithTip("Show the '共 N 页' label.");
         ps.Add(sh);
+        PropSpec jp = PropSpec.Bool("jumper", "Jumper");
+        jp.flag = jumper;
+        jp.WithTip("Show the '跳至 [page]' quick-jump input.");
+        ps.Add(jp);
+        PropSpec pre = PropSpec.Text("prefix", "Prefix");
+        pre.str = prefixText;
+        ps.Add(pre);
+        PropSpec suf = PropSpec.Text("suffix", "Suffix");
+        suf.str = suffixText;
+        ps.Add(suf);
+        PropSpec pt = PropSpec.Text("prevText", "Prev text");
+        pt.str = prevText;
+        pt.WithTip("Custom prev label; empty shows the chevron icon.");
+        ps.Add(pt);
+        PropSpec nt = PropSpec.Text("nextText", "Next text");
+        nt.str = nextText;
+        nt.WithTip("Custom next label; empty shows the chevron icon.");
+        ps.Add(nt);
+        PropSpec pc = PropSpec.Int("pagerCount", "Pager count");
+        pc.num = pagerCount;
+        pc.WithTip("Windowed page-button count (odd, >= 5).");
+        ps.Add(pc);
         ps.Add(PropSpec.Text("class", "Classes"));
         return ps;
+    }
+
+    override string GetExtra(string key) {
+        if (key == "pageSizes") { return this.PageSizesText(); }
+        if (key == "order") { return this.OrderText(); }
+        if (key == "jumperLabel") { return jumperLabel; }
+        if (key == "jumperSuffix") { return jumperSuffix; }
+        return "";
+    }
+
+    override bool SetExtra(string key, string val) {
+        if (key == "pageSizes") { this.SetPageSizesText(val); return true; }
+        if (key == "order") { this.SetOrderText(val); return true; }
+        if (key == "jumperLabel") { jumperLabel = val; return true; }
+        if (key == "jumperSuffix") { jumperSuffix = val; return true; }
+        return false;
+    }
+
+    /// 有副作用收口的属性（钳制 / 重算 / 重找选中项）在基类
+    /// 写完后统一走 Normalize。
+    override void SetProp(string key, string val) {
+        base.SetProp(key, val);
+        if (key == "total") { this.SetTotal(Convert.ToInt32(val)); }
+        else if (key == "pageSize") { this.SetPageSize(Convert.ToInt32(val)); }
+        else if (key == "itemCount") {
+            this.SetItemCount(Convert.ToInt32(val));
+        }
+        else if (key == "pagerCount") {
+            this.SetPagerCount(Convert.ToInt32(val));
+        }
+        else if (key == "jumper") { jumper = val == "true"; }
+        else if (key == "showTotal") { showTotal = val == "true"; }
+        else if (key == "prefix") { prefixText = val; }
+        else if (key == "suffix") { suffixText = val; }
+        else if (key == "prevText") { prevText = val; }
+        else if (key == "nextText") { nextText = val; }
     }
 
     override List<string> Events() {
         List<string> e = Control.CommonEvents();
         e.Add("Change");
+        e.Add("SizeChange");
         return e;
     }
 
     override void BindEvent(string evt, Action a) {
         if (evt == "Change") { Change.Add(a); return; }
+        if (evt == "SizeChange" || evt == "SizeChanged") {
+            SizeChange.Add(a);
+            return;
+        }
         On.AddByName(evt, a);
     }
 }

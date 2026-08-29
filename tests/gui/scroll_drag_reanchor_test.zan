@@ -1,0 +1,105 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// ScrollView 拖拽重锚定 conformance（回归「按住滑块不动页面自己跑」）：
+/// 拖拽期间内容高度变化（mo 变了）时，按旧锚点公式
+/// off = dragOffset0 + dyPix * mo / travel 用新 mo 重算，锚点还压着
+/// 旧值 —— mo 越大同样的 dyPix 推得越远，正反馈让页面自己滚走。
+/// 修复后 mo 变化即以当前位置重新锚定（dragOffset0=offset、
+/// dragMouseY0=mouseY、dragMo0=mo），同一次拖拽内 dyPix 从零点起算，
+/// 页面不再自走；按住不动 offset 分毫不变。
+class ScrollDragReanchorTest {
+    static int fails;
+    static App app;
+    static ScrollView sv;
+    static Rect area;
+    static int contentH;
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got "
+            + Convert.ToString(got) + " want " + Convert.ToString(want));
+    }
+
+    // 帧体：Begin/End 一对；End 在内容溢出时画滚动条并处理拖拽。
+    static void Body() {
+        sv.Begin(app, area, contentH);
+        sv.End(app, area);
+    }
+
+    static void PumpAndFrame() {
+        app.PumpGuarded();
+        app.FrameGuarded(ScrollDragReanchorTest.Body);
+    }
+
+    static void Main() {
+        fails = 0;
+        app = new App("scroll-drag", 400, 300);
+        app.Show();
+        app.RequestAnimationFrame(16);
+        sv = new ScrollView();
+        area = new Rect(0, 0, 390, 280);
+        contentH = 2800;
+
+        // 稳定帧：注册命中区（滚动条几何）。几何量全部按框架公式复算
+        //（End：bw=Scale(8)、inset=Scale(2)、thumbH=bh*bh/contentH），
+        // 避免把测试钉死在某台机器的 DPI 上。
+        ScrollDragReanchorTest.PumpAndFrame();
+        int bw = app.Scale(8);
+        int inset = app.Scale(2);
+        int bx = area.x + area.width - bw - inset;
+        int bh = area.height;
+        int thumbH0 = bh * bh / contentH;
+        int minThumb = app.Scale(24);
+        if (thumbH0 < minThumb) { thumbH0 = minThumb; }
+        int travel = bh - thumbH0;
+        int startX = bx + bw / 2;
+        int startY = thumbH0 / 2;          // offset=0：滑块贴轨道顶
+        app.mouseX = startX;
+        app.mouseY = startY;
+
+        // 按下滑块中心：进入拖拽，offset 仍为 0。
+        int mo = contentH - bh;
+        app.window.InjectEvent(2, startX, startY, 0, 0, 0);
+        ScrollDragReanchorTest.PumpAndFrame();
+        EqInt("dragging after press", sv.dragging ? 1 : 0, 1);
+        EqInt("offset still 0", sv.offset, 0);
+
+        // 拖到中途：dyPix=+70，off = 70*mo/travel。
+        int off70 = 70 * mo / travel;
+        app.mouseY = startY + 70;
+        app.window.InjectEvent(1, startX, startY + 70, 0, 0, 0);
+        ScrollDragReanchorTest.PumpAndFrame();
+        EqInt("mid-drag offset", sv.offset, off70);
+
+        // —— 关键回归：拖拽中内容长高（mo 变大），指针只挪 1px ——
+        // 旧代码顶着旧锚点（anchorY=press 时的 y、anchorMo=旧 mo）用
+        // 新 mo 计算：71 格 dyPix 全额换算成 71*mo2/travel —— 指针没
+        // 怎么动页面却窜出一大截，且 mo 越大窜得越远（正反馈，自走）。
+        // 修复后帧内即以当前位置重锚（anchorY=当前 y、anchorOff=当前
+        // offset、anchorMo=新 mo），dyPix 从新的零点起算：本帧 offset
+        // 原地不动。
+        contentH = 5600;
+        app.mouseY = startY + 71;
+        app.window.InjectEvent(1, startX, startY + 71, 0, 0, 0);
+        ScrollDragReanchorTest.PumpAndFrame();
+        // 旧代码这一帧会得到 off70 + 71*mo2/travelNew（自走量巨大）；
+        // 修复后 offset 必须停在 off70。
+        EqInt("no runaway on mo change", sv.offset, off70);
+
+        // 指针完全不动再来一帧：offset 必须分毫不动（自走复发即挂）。
+        app.window.InjectEvent(1, startX, startY + 71, 0, 0, 0);
+        ScrollDragReanchorTest.PumpAndFrame();
+        EqInt("hold still keeps offset", sv.offset, off70);
+
+        // 释放后拖拽状态清空。
+        app.window.InjectEvent(3, startX, startY + 71, 0, 0, 0);
+        ScrollDragReanchorTest.PumpAndFrame();
+        EqInt("released", sv.dragging ? 1 : 0, 0);
+
+        Console.WriteLine(fails == 0 ? "SCROLLDRAG PASS"
+            : "SCROLLDRAG FAIL " + Convert.ToString(fails));
+    }
+}
