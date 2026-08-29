@@ -3,41 +3,60 @@ using Gui;
 
 namespace Gui.Widget;
 
-/// 时间线条目：时间/元信息标签、标题、描述以及
-/// 圆点携带的类（`success`、`error`、…——共享语义角色）。
+/// 时间线条目：时间/元信息标签、标题、描述、圆点携带的类
+/// （`success`、`error`、…——共享语义角色）、可选的自定义图标
+/// （`icon`，图标组件认识的语义名），以及可选的待办态
+/// （`pending`：空心圈 + 虚线尾）。
 class TimelineItem {
     string time;
     string title;
     string description;
     string cls;
+    string icon;
+    bool pending;
 
     /// 不带语义类的条目：圆点用默认样式。
     TimelineItem(string time, string title, string description)
-        : this(time, title, description, "") { }
+        : this(time, title, description, "", "") { }
 
     TimelineItem(string time, string title, string description,
-                 string cls) {
+                 string cls)
+        : this(time, title, description, cls, "") { }
+
+    /// 带自定义图标的条目：`icon` 非空时圆点改画该图标，
+    /// 颜色取圆点样式的前/背景（随语义角色走）。
+    TimelineItem(string time, string title, string description,
+                 string cls, string icon) {
         this.time = time;
         this.title = title;
         this.description = description;
         this.cls = cls;
+        this.icon = icon;
     }
 }
 
-/// 垂直时间线：每个条目一个圆点和连接线，旁边是时间 / 标题 /
-/// 描述块。圆点、连接线和三行文本都是
+/// 时间线：每个条目一个圆点（或图标）和连接线，旁边是
+/// 时间 / 标题 / 描述块。圆点、连接线和三行文本都是
 /// 样式部件（`timeline::dot`、`::line`、`::time`、`::title`、`::desc`），
-/// 皮肤可重设样式，代码侧只需简单赋值：
+/// 皮肤可重设样式，代码侧只需简单赋值。
+///
+/// 形态全部走 class/字段，与 Steps 同一套词汇：
+/// - `Class = "large"` / `Size = "large"`：大小档（medium 默认）。
+/// - `Class = "right"`：轴线镜像到右侧，文字右对齐。
+/// - `Class = "horizontal"`：轴线横贯顶部，每条目占一列。
+/// - 条目 `icon`：圆点换成图标；条目 `pending`：空心圈 + 虚线尾。
 ///
 ///     Timeline tl = new Timeline { Class = "primary" };
 ///     tl.AddItem("09:00", "Created", "Project initialized");
 ///     tl.Add(new TimelineItem("12:30", "Published", "", "success", ""));
 class Timeline : Control {
     List<TimelineItem> items;
+    Binding<string> Size;
 
     void InitTimeline() {
         this.InitControl("timeline", 1);
         items = new List<TimelineItem>();
+        Size = "medium";
     }
 
     Timeline() { InitTimeline(); }
@@ -52,19 +71,108 @@ class Timeline : Control {
     }
 
     void AddItem(string time, string title, string desc) {
-        items.Add(new TimelineItem(time, title, desc, ""));
+        items.Add(new TimelineItem(time, title, desc, "", ""));
+    }
+
+    /// 带语义类与图标的入口（对齐 Steps 的 AddStepIcon 命名）。
+    void AddItemIcon(string time, string title, string desc,
+                     string cls, string icon) {
+        items.Add(new TimelineItem(time, title, desc, cls, icon));
+    }
+
+    bool IsHorizontal() { return Style.Has(Class, "horizontal"); }
+
+    bool IsRight() { return Style.Has(Class, "right"); }
+
+    override Binding<string> SizeOf() { return Size; }
+
+    /// 参与样式解析的完整类串：用户 class + 尺寸档片段
+    /// （皮肤用 `timeline.large` 规则改点径/字号）。
+    string FullCls(App app) {
+        return Class + " " + this.SizeCls();
+    }
+
+    // ---- 样式驱动的几何 ------------------------------------------
+
+    /// 圆点半径：皮肤 `timeline::dot { height }` 给物理直径，
+    /// 否则按尺寸档 small 8 / medium 10 / large 14（app.Scale）。
+    static int DotRadius(App app, string cls) {
+        StyleBox dot = Style.Part(app, "timeline", "dot", "", cls, "",
+                                  Style.SNormal());
+        int d = dot.HeightOr(0);
+        if (d > 0) { return d / 2; }
+        if (Style.Has(cls, "small")) { return app.Scale(4); }
+        if (Style.Has(cls, "large")) { return app.Scale(7); }
+        return app.Scale(5);
+    }
+
+    static int TimeFont(App app, string cls) {
+        StyleBox tm = Style.Part(app, "timeline", "time", "", cls, "",
+                                 Style.SNormal());
+        return tm.FontOr(Style.FontFallback(app, "small"));
+    }
+
+    static int TitleFont(App app, string cls) {
+        StyleBox ti = Style.Part(app, "timeline", "title", "", cls, "",
+                                 Style.SNormal());
+        return ti.FontOr(Style.FontFallback(app,
+            Style.Has(cls, "large") ? "large" : "medium"));
+    }
+
+    static int DescFont(App app, string cls) {
+        StyleBox de = Style.Part(app, "timeline", "desc", "", cls, "",
+                                 Style.SNormal());
+        return de.FontOr(Style.FontFallback(app, "small"));
+    }
+
+    /// 竖排条目行高：三行文本 + 间距 + 兜底（容纳点/图标），
+    /// 字号随尺寸档变化（按 cls 解析样式）。
+    static int RowHeightFor(App app, string cls) {
+        Theme t = app.theme;
+        int body = Canvas.FontHeight(TimeFont(app, cls))
+                 + Canvas.FontHeight(TitleFont(app, cls))
+                 + Canvas.FontHeight(DescFont(app, cls))
+                 + t.paddingTiny + t.gapSmall;
+        int marker = Timeline.DotRadius(app, cls) * 2 + t.paddingMedium;
+        int floor = body > marker ? body : marker;
+        return floor + t.paddingMedium;
+    }
+
+    /// 兼容旧调用：默认（无尺寸档）行高。
+    static int RowHeight(App app) {
+        return Timeline.RowHeightFor(app, "");
     }
 
     override void OnMeasure(App app) {
-        StyleBox s = this.ResolveStyleAs(app, "timeline", Class,
+        string cls = this.FullCls(app);
+        StyleBox s = this.ResolveStyleAs(app, "timeline", cls,
                                          Style.SNormal());
-        prefH = Timeline.RowHeight(app) * items.Count;
+        if (this.IsHorizontal()) {
+            prefH = this.HBlockHeight(app, cls);
+        } else {
+            prefH = Timeline.RowHeightFor(app, cls) * items.Count;
+            // 末条待办的虚线短尾多占半行，画出来才不会顶出盒子。
+            if (items.Count > 0 && items[items.Count - 1].pending) {
+                prefH = prefH + Timeline.RowHeightFor(app, cls) / 2;
+            }
+        }
         prefW = s.WidthOr(app.Scale(240));
     }
 
-    override void OnPaint(App app) {
-        string cls = Class;
+    /// 横排一列的文本块高度（时间/标题/描述逐条换行）。
+    int HBlockHeight(App app, string cls) {
+        Theme t = app.theme;
+        int r = Timeline.DotRadius(app, cls);
+        int fhT = Canvas.FontHeight(Timeline.TimeFont(app, cls));
+        int fhA = Canvas.FontHeight(Timeline.TitleFont(app, cls));
+        int fhD = Canvas.FontHeight(Timeline.DescFont(app, cls));
+        return r * 2 + t.gapLarge
+             + fhT + t.paddingTiny + fhA + t.gapSmall + fhD
+             + t.paddingMedium;
+    }
 
+    override void OnPaint(App app) {
+        string cls = this.FullCls(app);
         Canvas c = app.canvas;
         Theme t = app.theme;
         StyleBox s = Style.Of(app, "timeline", cls, Style.SNormal());
@@ -78,71 +186,266 @@ class Timeline : Control {
                                  Style.SNormal());
 
         int n = items.Count;
-        int rowH = Timeline.RowHeight(app);
-        int dotR = app.Scale(5);
+        int r = Timeline.DotRadius(app, cls);
         int lw = ln.HeightOr(app.Scale(2));
-        int lineX = bx + dotR;
-        int timeFont = tm.FontOr(Style.FontFallback(app, "small"));
-        int titleFont = ti.FontOr(Style.FontFallback(app, "medium"));
-        int descFont = de.FontOr(Style.FontFallback(app, "small"));
+        int timeFont = Timeline.TimeFont(app, cls);
+        int titleFont = Timeline.TitleFont(app, cls);
+        int descFont = Timeline.DescFont(app, cls);
+
+        if (this.IsHorizontal()) {
+            this.PaintHorizontal(app, cls, n, r, lw, timeFont, titleFont,
+                                 descFont);
+            return;
+        }
+
+        // ---- 竖排（左向 / right 镜像） ----------------------------
+        int rowH = Timeline.RowHeightFor(app, cls);
+        bool right = this.IsRight();
+        int lineX = right ? bx + bw - r : bx + r;
 
         for (int i = 0; i < n; i = i + 1) {
             TimelineItem it = items[i];
             int top = by + i * rowH;
-            int cy = top + dotR + app.Scale(2);
+            int cy = top + r + app.Scale(2);
             if (i < n - 1) {
-                c.FillRect(lineX - lw / 2, cy, lw, rowH,
-                           ln.BgOr(0));
+                this.PaintTail(c, lineX - lw / 2, cy, lw, rowH,
+                               ln.BgOr(0), it.pending, false, app);
+            } else if (it.pending) {
+                // 末条待办：点下方留一段虚线短尾，表示流程未完。
+                this.PaintTail(c, lineX - lw / 2, cy, lw, rowH / 2,
+                               ln.BgOr(0), true, false, app);
             }
             // 条目自身的类选择其圆点样式，一个出错的步骤就是
             // 记录上的一个类，而不是调用点的颜色参数。
             string role = Style.RoleClass(it.cls);
+            if (it.pending && role == "") { role = "grey"; }
             StyleBox dot = Style.Part(app, "timeline", "dot", "",
                                       cls + " " + role, "", Style.SNormal());
-            int dotColor = dot.BgOr(0);
-            c.FillCircle(lineX, cy, dot.HeightOr(dotR * 2) / 2, dotColor);
+            this.PaintMarker(app, c, dot, it.icon, lineX, cy, r);
 
-            int tx = bx + dotR * 2 + t.gapLarge;
+            int contentR = right ? lineX - r : bx + bw - app.Scale(4);
+            int textL = right ? bx + app.Scale(4)
+                              : lineX + r + t.gapLarge;
             int ty = top;
             if (it.time != "") {
-                c.DrawText(tx, ty, it.time, tm.FgOr(0), timeFont);
+                this.PaintLine(c, right, contentR, textL, ty, it.time,
+                               tm.FgOr(0), timeFont);
                 ty = ty + Canvas.FontHeight(timeFont) + t.paddingTiny;
             }
-            c.DrawText(tx, ty, it.title, ti.FgOr(0), titleFont);
+            this.PaintLine(c, right, contentR, textL, ty, it.title,
+                           ti.FgOr(0), titleFont);
             ty = ty + Canvas.FontHeight(titleFont) + t.gapSmall;
             if (it.description != "") {
-                c.DrawText(tx, ty, it.description, de.FgOr(0),
-                           descFont);
+                this.PaintLine(c, right, contentR, textL, ty,
+                               it.description, de.FgOr(0), descFont);
             }
         }
     }
 
-
-
-    static int RowHeight(App app) {
-        Theme t = app.theme;
-        StyleBox tm = Style.Part(app, "timeline", "time", "", "", "",
-                                 Style.SNormal());
-        StyleBox ti = Style.Part(app, "timeline", "title", "", "", "",
-                                 Style.SNormal());
-        StyleBox de = Style.Part(app, "timeline", "desc", "", "", "",
-                                 Style.SNormal());
-        return Canvas.FontHeight(tm.FontOr(Style.FontFallback(app, "small")))
-             + Canvas.FontHeight(ti.FontOr(Style.FontFallback(app, "medium")))
-             + Canvas.FontHeight(de.FontOr(Style.FontFallback(app, "small")))
-             + t.paddingTiny + t.gapSmall + t.paddingMedium;
+    /// 一行文本：右对齐版把起点算到 `contentR - w`，左对齐版直接
+    /// 从 textL 起画。
+    void PaintLine(Canvas c, bool right, int contentR, int textL, int y,
+                   string text, int color, int font) {
+        if (right) {
+            int w = Canvas.MeasureText(text, font);
+            int x = contentR - w;
+            if (x < textL) { x = textL; }
+            c.DrawText(x, y, text, color, font);
+        } else {
+            c.DrawText(textL, y, text, color, font);
+        }
     }
 
+    /// 条目尾连接线：待办条目画虚线段（dash/gap 各 Scale(4)），
+    /// 普通条目画实心。vertical=false 时横着画。
+    void PaintTail(Canvas c, int x, int y, int lw, int len, int color,
+                   bool pending, bool horizontal, App app) {
+        if (!pending) {
+            if (horizontal) {
+                c.FillRect(x, y - lw / 2, len, lw, color);
+            } else {
+                c.FillRect(x, y, lw, len, color);
+            }
+            return;
+        }
+        int dash = app.Scale(4);
+        int gap = app.Scale(4);
+        int p = 0;
+        while (p < len) {
+            int seg = (p + dash <= len) ? dash : len - p;
+            if (horizontal) {
+                c.FillRect(x + p, y - lw / 2, seg, lw, color);
+            } else {
+                c.FillRect(x, y + p, lw, seg, color);
+            }
+            p = p + dash + gap;
+        }
+    }
 
+    /// 圆点：`icon` 非空画语义图标（颜色随圆点样式走），否则画
+    /// 描边圈（外圈圆点色 + 内圈底色透出）。图标盒比点圈大一档
+    /// （直径 r*2 + Scale(4) 居中），字形才清晰可辨。
+    void PaintMarker(App app, Canvas c, StyleBox dot, string icon,
+                     int cx, int cy, int r) {
+        int color = dot.BgOr(0);
+        if (icon != "") {
+            int glyph = dot.FgOr(color);
+            int box = r * 2 + app.Scale(4);
+            c.DrawGlyph(icon, cx - box / 2, cy - box / 2,
+                        box - app.Scale(2), glyph);
+            return;
+        }
+        int thick = r < app.Scale(4) ? 1 : app.Scale(2);
+        c.DrawCircle(cx, cy, r - thick / 2, color, thick);
+    }
 
+    // ---- 横排 ------------------------------------------------------
 
+    /// 轴线横贯顶部，每条目占一列等宽；点在上、列内容在下。
+    void PaintHorizontal(App app, string cls, int n, int r, int lw,
+                         int timeFont, int titleFont, int descFont) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        StyleBox ln = Style.Part(app, "timeline", "line", "", cls, "",
+                                 Style.SNormal());
+        StyleBox tm = Style.Part(app, "timeline", "time", "", cls, "",
+                                 Style.SNormal());
+        StyleBox ti = Style.Part(app, "timeline", "title", "", cls, "",
+                                 Style.SNormal());
+        StyleBox de = Style.Part(app, "timeline", "desc", "", cls, "",
+                                 Style.SNormal());
+        if (n < 1) { return; }
+
+        int rowH = this.HBlockHeight(app, cls);
+        int colW = bw / n;
+        int cy = by + r + app.Scale(2);
+
+        for (int i = 0; i < n; i = i + 1) {
+            TimelineItem it = items[i];
+            int colX = bx + i * colW;
+            int dotCx = colX + r;
+            if (i < n - 1) {
+                this.PaintTail(c, dotCx + r, cy, lw,
+                               (colX + colW + r) - (dotCx + r),
+                               ln.BgOr(0), it.pending, true, app);
+            } else if (it.pending) {
+                // 末列待办：轴线以虚线延到列右缘。
+                this.PaintTail(c, dotCx + r, cy, lw,
+                               (colX + colW) - (dotCx + r),
+                               ln.BgOr(0), true, true, app);
+            }
+            string role = Style.RoleClass(it.cls);
+            if (it.pending && role == "") { role = "grey"; }
+            StyleBox dot = Style.Part(app, "timeline", "dot", "",
+                                      cls + " " + role, "", Style.SNormal());
+            this.PaintMarker(app, c, dot, it.icon, dotCx, cy, r);
+
+            // 内容整列落在点下方（与截图一致），从列左缘起排。
+            int tx = colX;
+            int ty = by + r * 2 + t.gapLarge;
+            int blockBottom = by + rowH;
+            if (it.time != "") {
+                this.PaintWrapped(c, it.time, tx, ty, colX + colW
+                                  - app.Scale(4), tm.FgOr(0), timeFont,
+                                  blockBottom);
+                ty = ty + Canvas.FontHeight(timeFont) + t.paddingTiny;
+            }
+            this.PaintWrapped(c, it.title, tx, ty, colX + colW
+                              - app.Scale(4), ti.FgOr(0), titleFont,
+                              blockBottom);
+            ty = ty + Canvas.FontHeight(titleFont) + t.gapSmall;
+            if (it.description != "") {
+                this.PaintWrapped(c, it.description, tx, ty, colX + colW
+                                  - app.Scale(4), de.FgOr(0), descFont,
+                                  blockBottom);
+            }
+        }
+    }
+
+    /// 横排列内容的朴素逐词换行（按空格断词，整词绘制；
+    /// 中文串无空格时整行不换，由列宽兜底）。
+    void PaintWrapped(Canvas c, string text, int x, int y, int right,
+                      int color, int font, int bottom) {
+        if (text == "") { return; }
+        int fh = Canvas.FontHeight(font);
+        string line = "";
+        int cy = y;
+        List<string> parts = text.Split(" ");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string word = parts[i];
+            string trial = line == "" ? word : line + " " + word;
+            if (line != ""
+                && Canvas.MeasureText(trial, font) > right - x) {
+                if (cy + fh > bottom) { return; }
+                c.DrawText(x, cy, line, color, font);
+                cy = cy + fh;
+                line = word;
+            } else {
+                line = trial;
+            }
+        }
+        if (line != "") {
+            if (cy + fh > bottom) { return; }
+            c.DrawText(x, cy, line, color, font);
+        }
+    }
 
     // ---- 设计器 / 序列化模型 -------------------------------------
+
+    /// designer 往返串（GetExtra/SetExtra("items")），条目用 `|`，
+    /// 条目内字段用 `;`（五个字段都写全）：`时间;标题;描述;类;图标`，
+    /// 待办态追加第六段 `pending`（`12:30;Deploy;;;;pending`）。
+    /// `;` 而非 `:`——时间字段自带冒号（`09:00`、`2018-04-03 20:46`）。
+    string ItemsText() {
+        string s = "";
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (s != "") { s = s + "|"; }
+            TimelineItem it = items[i];
+            s = s + it.time + ";" + it.title + ";" + it.description
+                 + ";" + it.cls + ";" + it.icon;
+            if (it.pending) { s = s + ";pending"; }
+        }
+        return s;
+    }
+
+    void SetItemsText(string spec) {
+        items = new List<TimelineItem>();
+        if (spec == null || spec == "") { return; }
+        List<string> parts = spec.Split("|");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string it = parts[i];
+            if (it == "") { continue; }
+            List<string> f = it.Split(";");
+            string time = f.Count > 0 ? f[0] : "";
+            string title = f.Count > 1 ? f[1] : "";
+            string desc = f.Count > 2 ? f[2] : "";
+            string cls = f.Count > 3 ? f[3] : "";
+            string icon = f.Count > 4 ? f[4] : "";
+            TimelineItem item = new TimelineItem(time, title, desc, cls,
+                                                 icon);
+            if (f.Count > 5 && f[5] == "pending") { item.pending = true; }
+            items.Add(item);
+        }
+    }
+
+    override string GetExtra(string key) {
+        if (key == "items") { return this.ItemsText(); }
+        return "";
+    }
+
+    override bool SetExtra(string key, string val) {
+        if (key == "items") { this.SetItemsText(val); return true; }
+        return false;
+    }
 
     override string Kind() { return "Timeline"; }
 
     override List<PropSpec> Props() {
         List<PropSpec> ps = new List<PropSpec>();
+        PropSpec sz = PropSpec.Enum("size", "Size",
+            new List<string>{ "small", "medium", "large" });
+        sz.str = Size;
+        ps.Add(sz);
         ps.Add(PropSpec.Text("class", "Classes"));
         return ps;
     }

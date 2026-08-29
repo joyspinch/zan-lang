@@ -1628,6 +1628,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_steps${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # 时间线强化：TimelineItem 构造重载（icon/pending 字段）、SizeClass
+  # 映射、horizontal/right 形态判定（token 匹配）、items 串往返
+  # （`;` 分段——时间自带冒号；pending 尾段）、Of/AddItemIcon、
+  # Props 键序（size/class）与 Size→SizeCls 联动。
+  add_test(NAME conformance_gui_timeline
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/timeline_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_timeline.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_timeline${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # DatePicker 十一种形式的文本往返（起止颠倒交换、week 周一起始、
   # 季度小写归一、非法文本保留原值），以及弹层指针捕获：弹层展开后
   # 压住邻居的触发按钮，鼠标在弹层里滑动不得让邻居抢走 current 把
