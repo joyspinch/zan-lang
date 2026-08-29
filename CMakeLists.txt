@@ -1853,6 +1853,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_slider${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # 穿梭框的无窗口回归：Bind 实时视图与勾选集合、MoveRight/MoveLeft 的
+  # 行序搬移（倒序删不漂移、目标侧追加、移过去默认不勾）、过滤只搬命中
+  # 行（Order 缓存按 计数+关键词 失效，SetQuery 驱动）、外部改列表 +
+  # Refresh 后缓存重建、ClearChecked 全量/过滤两态、oneWay，及组件模型
+  # （Kind/StyleType/Props 经 Binding 活写入往返/Events/ControlFactory）。
+  add_test(NAME conformance_gui_transfer
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/transfer_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_transfer.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_transfer${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # SelectBox 级联增强：父子指针链（单选路径/重开自动展开/联动关闭
   # 选分支）、多选勾选模型（联动带动、祖链回推、半勾）、勾选策略
   # 取值（all/parent/child）、级联过滤平铺，以及弹层 blocker、悬停

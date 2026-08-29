@@ -1,0 +1,733 @@
+using System;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Widget;
+
+/// 行首图标委托：返回 Gui.Icon 图标名，"" 表示本行不画图标。
+delegate string IconOf<T>(T item);
+
+/// 穿梭框一栏的瞬时状态：勾选标记、滚动、过滤行序与内嵌搜索框。
+/// 勾选标记与绑定的列表按行序平行伸缩；order 缓存过滤后的
+/// 原列表下标，计数与关键词都没变就不重扫。
+class TransferPane {
+    List<bool> flags;
+    SignalInt scroll;
+    List<int> order;
+    Input search;
+    string query;
+    /// 最近一次量出 order 时数据计数与关键词。
+    int orderFor;
+    string orderQuery;
+
+    TransferPane() {
+        flags = new List<bool>();
+        scroll = new SignalInt(0);
+        order = new List<int>();
+        search = null;
+        query = "";
+        orderFor = 0 - 1;
+        orderQuery = "";
+    }
+}
+
+/// 穿梭框（Transfer）：左右两栏列表，左栏勾选后经中缝按钮「穿梭」
+/// 到右栏，右栏勾选可移回。每一栏是一块独立的虚拟化面板——头部
+/// （全选 / 计数 / 清除）、可选搜索框、复选行区与空态占位——所以
+/// 四万项与一屏同开销。绑定的是调用方自己的两个列表（不拷贝），
+/// 行文本由 `CellOf<T>` 委托读出（未给时取 `item.ToString()`）。
+///
+///     Transfer<string> t = new Transfer<string>();
+///     t.Bind(model.left, model.right);       // 两个 List<string>
+///     t.WithSearch();                         // 两栏各加一个过滤框
+///     t.Change += () => { Save(); };          // 数据移动后触发
+///     t.Render(app, x, y, w, h);              // 每帧画进这块框
+///
+/// 勾选态是控件的瞬时 UI 状态（不反向写进宿主列表），`Checked()` /
+/// `CheckedRight()` 随时可读。中缝的移动按钮走保留态 `Button`
+/// （primary 皮肤、Disabled 联动对应侧的勾选数），因此外观与
+/// 全库按钮一体，宿主也能经 `MoveRightButton()` 直接拿到引用定制。
+/// 移动只搬「当前过滤结果里被勾的」行：滚多远都不会丢点。
+class Transfer<T> : Control {
+    List<T> source;
+    List<T> target;
+    TransferPane left;
+    TransferPane right;
+    CellOf<T> label;
+    IconOf<T> iconOf;
+    bool searchable;
+    string leftHint;
+    string rightHint;
+    bool oneWay;
+    string emptyText;
+    /// 表头文案：全选复选框标题 / 计数 / 已选 / 清除。
+    string selectAllText;
+    string totalText;
+    string selectedText;
+    string clearText;
+    /// 中缝移动按钮（保留态 Button，不入树 children——由 Render
+    /// 每帧显式绘制；文字非空时文字优先于图标）。
+    Button rightBtn;
+    Button leftBtn;
+
+    /// 数据移动后触发（宿主读回 source/target 或做持久化）。
+    UiEvent Change;
+    /// 任意一侧勾选集合变化。
+    UiEvent SelectChanged;
+    /// 表头 / 中缝 / 搜索框的布局度量，ComputeMetrics 里算好，
+    /// OnMeasure 与 Render 共用（保证宿主给的框高第一次就够）。
+    int opW;
+    int opGap;
+    int opH;
+    int searchH;
+    int headH;
+
+    void InitTransfer() {
+        this.InitControl("transfer", 5);
+        source = new List<T>();
+        target = new List<T>();
+        left = new TransferPane();
+        right = new TransferPane();
+        label = null;
+        iconOf = null;
+        searchable = false;
+        leftHint = "";
+        rightHint = "";
+        oneWay = false;
+        emptyText = "无数据";
+        selectAllText = "全选";
+        totalText = "共";
+        selectedText = "已选";
+        clearText = "清除";
+        rightBtn = new Button();
+        rightBtn.Class = "primary small";
+        rightBtn.Icon = "chevron-right";
+        leftBtn = new Button();
+        leftBtn.Class = "primary small";
+        leftBtn.Icon = "chevron-left";
+        wiresOwnEvents = true;
+        Change = new UiEvent();
+        SelectChanged = new UiEvent();
+        opW = 0;
+        opGap = 0;
+        opH = 0;
+        searchH = 0;
+        headH = 0;
+    }
+
+    /// 默认构造：绑定前两侧都是空列表。
+    Transfer() { InitTransfer(); }
+
+    /// 直接带初始数据（宿主通常用 Bind 保留实时视图）。
+    Transfer(List<T> src, List<T> tgt) {
+        InitTransfer();
+        this.Bind(src, tgt);
+    }
+
+    override string Kind() { return "Transfer"; }
+
+    override string StyleType() { return "transfer"; }
+
+    // ---- 数据 ----
+
+    /// 绑定两侧列表。不拷贝：每帧都从中读行，所以宿主改动列表
+    /// （增删条目）后下一帧即生效；勾选标记按行序自动伸缩。
+    Transfer<T> Bind(List<T> src, List<T> tgt) {
+        if (src != null) { source = src; }
+        if (tgt != null) { target = tgt; }
+        this.Invalidate();
+        return this;
+    }
+
+    /// 标记两侧过滤行序过期（宿主在 Bind 之外改了数据时调用）。
+    void Refresh() { this.Invalidate(); }
+
+    void Invalidate() {
+        left.orderFor = 0 - 1;
+        right.orderFor = 0 - 1;
+    }
+
+    /// 行文本委托（未设时取 `item.ToString()`）。
+    Transfer<T> WithLabel(CellOf<T> text) { label = text; this.Invalidate(); return this; }
+
+    /// 行首图标委托（返回 Gui.Icon 名）。
+    Transfer<T> WithIcon(IconOf<T> icon) { iconOf = icon; return this; }
+
+    /// 两栏头部下各加一个搜索框（按行文本子串过滤，忽略大小写）。
+    Transfer<T> WithSearch() { searchable = true; return this; }
+
+    /// 搜索框占位文字（两栏同一文案）。
+    Transfer<T> WithSearchHint(string hint) {
+        searchable = true;
+        leftHint = hint;
+        rightHint = hint;
+        return this;
+    }
+
+    /// 两栏各自的搜索框占位文字。
+    Transfer<T> WithSearchHints(string lh, string rh) {
+        searchable = true;
+        leftHint = lh;
+        rightHint = rh;
+        return this;
+    }
+
+    /// 仅右移：左向按钮彻底消失，右栏变成只读列表（不可回退）。
+    Transfer<T> WithOneWay() {
+        oneWay = true;
+        return this;
+    }
+
+    /// 空栏占位文案（默认「无数据」）。
+    Transfer<T> WithEmptyText(string text) { emptyText = text; return this; }
+
+    /// 表头文案（按中文默认：全选 / 共 / 已选 / 清除；空参不改）。
+    Transfer<T> WithHeaderText(string selectAll, string total,
+                               string selected, string clear) {
+        if (selectAll != "") { selectAllText = selectAll; }
+        if (total != "") { totalText = total; }
+        if (selected != "") { selectedText = selected; }
+        if (clear != "") { clearText = clear; }
+        return this;
+    }
+
+    /// 中缝按钮图标（两枚，默认 chevron-right / chevron-left）。
+    Transfer<T> WithOperationIcons(string rightIcon, string leftIcon) {
+        if (rightIcon != "") { rightBtn.Icon = rightIcon; }
+        if (leftIcon != "") { leftBtn.Icon = leftIcon; }
+        return this;
+    }
+
+    /// 中缝按钮文字（Ant Design operations：给了文字就取代图标）。
+    Transfer<T> WithOperation(string rightLabel, string leftLabel) {
+        rightBtn.Text = rightLabel;
+        rightBtn.Icon = "";
+        leftBtn.Text = leftLabel;
+        leftBtn.Icon = "";
+        return this;
+    }
+
+    /// 暴露中缝移动按钮：宿主可继续定制（Text / Icon / Tip /
+    /// OnClick 追加自己的逻辑）。
+    Button MoveRightButton() { return rightBtn; }
+    Button MoveLeftButton() { return leftBtn; }
+
+    // ---- 勾选与移动 ----
+
+    int SourceCount() { return source.Count; }
+    int TargetCount() { return target.Count; }
+
+    /// 某侧在当前过滤关键词下可见的行数（Order 缓存的重建结果）。
+    int VisibleCount(bool isSource) {
+        TransferPane p = isSource ? left : right;
+        List<T> data = isSource ? source : target;
+        return this.Order(p, data).Count;
+    }
+
+    List<T> Source() { return source; }
+    List<T> Target() { return target; }
+
+    /// `item` 当前所在一侧是否被勾选。
+    bool IsChecked(T item) {
+        int i = source.IndexOf(item);
+        if (i >= 0) { return this.FlagAt(left, i); }
+        int j = target.IndexOf(item);
+        if (j >= 0) { return this.FlagAt(right, j); }
+        return false;
+    }
+
+    bool FlagAt(TransferPane p, int i) {
+        if (i < 0 || i >= p.flags.Count) { return false; }
+        return p.flags[i];
+    }
+
+    /// `item` 所在一侧的勾选开关；找不到（还没 Bind）则为空操作。
+    void SetChecked(T item, bool on) {
+        int i = source.IndexOf(item);
+        if (i >= 0) { this.SetFlag(left, i, on, source.Count); return; }
+        int j = target.IndexOf(item);
+        if (j >= 0) { this.SetFlag(right, j, on, target.Count); }
+    }
+
+    void SetFlag(TransferPane p, int i, bool on, int n) {
+        this.SyncFlags(p, n);
+        if (i < 0 || i >= p.flags.Count) { return; }
+        if (p.flags[i] == on) { return; }
+        p.flags[i] = on;
+        SelectChanged.Post();
+    }
+
+    /// 左栏当前被勾选的实体（按行序）。
+    List<T> Checked() { return this.CheckedIn(source, left); }
+    /// 右栏当前被勾选的实体。
+    List<T> CheckedRight() { return this.CheckedIn(target, right); }
+
+    /// 两侧当前被勾选的行数（头部计数与半选态用）。
+    int CheckedSource() { return this.CheckedCount(left, source.Count); }
+    int CheckedTarget() { return this.CheckedCount(right, target.Count); }
+
+    List<T> CheckedIn(List<T> data, TransferPane p) {
+        List<T> outp = new List<T>();
+        int n = data.Count;
+        if (n > p.flags.Count) { n = p.flags.Count; }
+        for (int i = 0; i < n; i = i + 1) {
+            if (p.flags[i]) { outp.Add(data[i]); }
+        }
+        return outp;
+    }
+
+    int CheckedCount(TransferPane p, int count) {
+        int c = 0;
+        int n = count;
+        if (n > p.flags.Count) { n = p.flags.Count; }
+        for (int i = 0; i < n; i = i + 1) { if (p.flags[i]) { c = c + 1; } }
+        return c;
+    }
+
+    /// 编程式移动：把源侧被勾选项搬到目标侧末尾（保持行序），
+    /// 触发 Change。宿主在自定义移动入口里调用。
+    void MoveRight() {
+        this.Move(left, source, right, target);
+        Change.Post();
+    }
+    void MoveLeft() {
+        this.Move(right, target, left, source);
+        Change.Post();
+    }
+
+    /// 清空两侧的勾选标记（all=false 只清当前过滤结果里的勾选）。
+    void ClearChecked(bool all) {
+        this.ClearPane(left, source, all);
+        this.ClearPane(right, target, all);
+    }
+
+    void ClearPane(TransferPane p, List<T> data, bool all) {
+        bool dirty = false;
+        if (all) {
+            for (int i = 0; i < p.flags.Count; i = i + 1) {
+                if (p.flags[i]) { p.flags[i] = false; dirty = true; }
+            }
+        } else {
+            List<int> order = this.Order(p, data);
+            for (int k = 0; k < order.Count; k = k + 1) {
+                int i = order[k];
+                if (i < p.flags.Count && p.flags[i]) {
+                    p.flags[i] = false;
+                    dirty = true;
+                }
+            }
+        }
+        if (dirty) { SelectChanged.Post(); }
+    }
+
+    /// 移动核心：按源侧当前可见行序（过滤时只搬看得见的勾选）
+    /// 把勾选项 append 到目标侧末尾，并从源侧原位删除
+    /// （倒序删避免行序漂移）。搬完源侧勾选清零。
+    void Move(TransferPane from, List<T> fd, TransferPane to, List<T> td) {
+        List<int> order = this.Order(from, fd);
+        List<T> moved = new List<T>();
+        for (int k = 0; k < order.Count; k = k + 1) {
+            int i = order[k];
+            if (i < from.flags.Count && from.flags[i]) { moved.Add(fd[i]); }
+        }
+        if (moved.Count == 0) { return; }
+        for (int k = order.Count - 1; k >= 0; k = k - 1) {
+            int i = order[k];
+            if (i < from.flags.Count && from.flags[i]) {
+                fd.RemoveAt(i);
+                from.flags.RemoveAt(i);
+            }
+        }
+        for (int k = 0; k < moved.Count; k = k + 1) { td.Add(moved[k]); }
+        this.SyncFlags(to, td.Count);
+        this.Invalidate();
+    }
+
+    /// flags 与数据长度对齐（宿主在 Bind 之外改了列表时自愈）。
+    void SyncFlags(TransferPane p, int n) {
+        while (p.flags.Count < n) { p.flags.Add(false); }
+        while (p.flags.Count > n) { p.flags.RemoveAt(p.flags.Count - 1); }
+    }
+
+    /// 一栏当前过滤后的行序（缓存：数据计数与关键词都没变就复用）。
+    List<int> Order(TransferPane p, List<T> data) {
+        if (p.orderFor == data.Count && p.orderQuery == p.query) {
+            return p.order;
+        }
+        List<int> res = new List<int>();
+        string q = p.query.ToLower();
+        for (int i = 0; i < data.Count; i = i + 1) {
+            if (q == "" || this.LabelOf(data[i]).ToLower().Contains(q)) {
+                res.Add(i);
+            }
+        }
+        p.order = res;
+        p.orderFor = data.Count;
+        p.orderQuery = p.query;
+        return res;
+    }
+
+    string LabelOf(T item) {
+        if (label != null) { return label(item); }
+        return Convert.ToString(item);
+    }
+
+    // ---- 布局与渲染 ----
+
+    /// 跨帧保留的搜索框（未渲染前为 null）：宿主经它定制
+    /// Clearable、MaxLen 等 Input 能力。
+    Input SearchBox(bool isSource) {
+        TransferPane p = isSource ? left : right;
+        return p.search;
+    }
+
+    /// 程序化设定某侧过滤关键词（远程搜索 / 代码驱动筛选用）：等价于
+    /// 往那侧搜索框里打字，行序缓存随之失效。渲染过搜索框时同步回显。
+    Transfer<T> SetQuery(bool isSource, string q) {
+        TransferPane p = isSource ? left : right;
+        string want = q;
+        if (want == null) { want = ""; }
+        if (p.query == want) { return this; }
+        p.query = want;
+        p.scroll.Set(0);
+        if (p.search != null) { p.search.SetText(want); }
+        return this;
+    }
+
+    /// 某侧当前的过滤关键词（"" 表示未过滤）。
+    string Query(bool isSource) {
+        TransferPane p = isSource ? left : right;
+        return p.query;
+    }
+
+    /// 每帧入口（保留模式由 OnPaint 代调）：把穿梭框画进
+    /// (x,y,w,h)。先摆中缝按钮，再画两栏面板。
+    void Render(App app, int x, int y, int w, int h) {
+        this.SyncFlags(left, source.Count);
+        this.SyncFlags(right, target.Count);
+
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        StyleBox root = this.ResolveStyleAs(app, "transfer", Class,
+                                            Style.SNormal());
+        int pad = root.PadLOr(app.Scale(12));
+        int radius = root.RadiusOr(t.borderRadiusMedium);
+        c.SurfaceRoundRect(x, y, w, h, radius, root.BgOr(0),
+                           root.BorderOr(0),
+                           root.BorderWOr(app.Scale(1)));
+
+        int ix = x + pad;
+        int iy = y + pad;
+        int iw = w - pad * 2;
+        int ih = h - pad * 2;
+        if (iw < app.Scale(240)) { return; }
+        this.ComputeMetrics(app);
+
+        int panelW = (iw - opW - opGap * 2) / 2;
+        if (panelW < app.Scale(100)) { panelW = app.Scale(100); }
+
+        // 中缝两枚按钮：不在树 children 里（避免与 RenderTree 的
+        // 子节点遍历重复绘制），显式渲染——按下/抬起/禁用外观、
+        // 皮肤全部由 Button 自持。对应侧没有勾选就禁用。
+        int opX = ix + panelW + opGap;
+        bool moved = false;
+        rightBtn.Disabled = this.CheckedCount(left, source.Count) == 0
+                            || this.IsDisabled();
+        rightBtn.RenderIn(app, opX, iy + ih / 2 - opH - opGap / 2, opW, opH);
+        if (rightBtn.WasClicked()) { this.MoveRight(); moved = true; }
+        if (!oneWay) {
+            leftBtn.Disabled = this.CheckedCount(right, target.Count) == 0
+                               || this.IsDisabled();
+            leftBtn.RenderIn(app, opX, iy + ih / 2 + opGap / 2, opW, opH);
+            if (leftBtn.WasClicked()) { this.MoveLeft(); moved = true; }
+        }
+
+        bool dirty = this.RenderPane(app, left, source, ix, iy, panelW, ih,
+                                     true);
+        dirty = this.RenderPane(app, right, target,
+                                ix + panelW + opW + opGap * 2, iy,
+                                panelW, ih, false) || dirty;
+        dirty = moved || dirty;
+        if (dirty) {
+            app.NoteDamage(x, y, w, h);
+            app.window.Wake();
+        }
+    }
+
+    /// 量出跨帧一致的布局度量（OnMeasure 与 Render 共用，
+    /// 保证宿主给的框高第一次就对）。
+    void ComputeMetrics(App app) {
+        Theme t = app.theme;
+        opGap = app.Scale(8);
+        opH = t.heightSmall;
+        searchH = app.Scale(30);
+        headH = t.heightSmall;
+        opW = app.Scale(40);
+        StyleBox op = Style.Part(app, "transfer", "operation", "", Class, "",
+                                 Style.SNormal());
+        int osw = op.WidthOr(0);
+        if (osw > opW) { opW = osw; }
+        int bw = rightBtn.AutoWidth(app);
+        int lw = leftBtn.AutoWidth(app);
+        if (lw > bw) { bw = lw; }
+        bw = bw + app.Scale(8);
+        if (bw > opW) { opW = bw; }
+    }
+
+    /// 一栏：头部（全选/计数 或 清除/已选）、可选搜索框、虚拟化
+    /// 复选行区、空态。返回本帧是否有状态变化（需要重绘）。
+    bool RenderPane(App app, TransferPane p, List<T> data, int x, int y,
+                    int w, int h, bool isSource) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        bool dirty = false;
+        StyleBox panel = Style.Part(app, "transfer", "panel", "", Class, "",
+                                    Style.SNormal());
+        StyleBox header = Style.Part(app, "transfer", "header", "", Class, "",
+                                     Style.SNormal());
+        StyleBox divider = Style.Part(app, "transfer", "divider", "", Class,
+                                      "", Style.SNormal());
+        StyleBox row = Style.Part(app, "transfer", "row", "", Class, "",
+                                  Style.SNormal());
+        StyleBox meta = Style.Part(app, "transfer", "meta", "", Class, "",
+                                   Style.SNormal());
+        StyleBox root = this.ResolveStyleAs(app, "transfer", Class,
+                                            Style.SNormal());
+        int fs = header.FontOr(Style.FontFallback(app, "small"));
+        int rowH = row.HeightOr(app.Scale(36));
+        int pad = t.paddingMedium;
+
+        c.SurfaceRoundRect(x, y, w, h, panel.RadiusOr(t.borderRadiusMedium),
+                           panel.BgOr(0), panel.BorderOr(0),
+                           panel.BorderWOr(1));
+        int ix = x + 1;
+        int iy = y + 1;
+        int iw = w - 2;
+        int ih = h - 2;
+
+        // ---- 头部 ----
+        int count = data.Count;
+        int checkedN = this.CheckedCount(p, count);
+
+        // 搜索框的关键词先收进 p.query 再量行序：Order 的缓存键
+        // 含关键词，晚一步就按旧词过滤——本帧列表不动、下一帧才跳。
+        // 真正的绘制排在表头之后（与头部行不重叠）。
+        if (searchable && p.search != null) {
+            string live = p.search.GetText();
+            if (live != p.query) {
+                p.query = live;
+                p.scroll.Set(0);
+                dirty = true;
+            }
+        }
+        List<int> order = this.Order(p, data);
+
+        c.FillRect(ix, iy, iw, headH, header.BgOr(0));
+        c.FillRect(ix, iy + headH - 1, iw, 1, divider.BgOr(0));
+        int hx = ix + pad;
+        int hy = Canvas.CenterTextY(iy, headH, fs);
+        if (isSource) {
+            // 全选框：过滤后的可见行全勾=已勾，部分=半选。
+            int hbox = app.Scale(16);
+            int hby = iy + (headH - hbox) / 2;
+            int allN = 0;
+            int selN = 0;
+            for (int k = 0; k < order.Count; k = k + 1) {
+                int i = order[k];
+                if (i < p.flags.Count) {
+                    allN = allN + 1;
+                    if (p.flags[i]) { selN = selN + 1; }
+                }
+            }
+            if (selN > 0 && selN == allN) {
+                Checkbox.PaintBox(app, hx, hby, hbox, 1000);
+            } else if (selN > 0) {
+                Checkbox.PaintBoxIndeterminate(app, hx, hby, hbox);
+            } else {
+                Checkbox.PaintBox(app, hx, hby, hbox, 0);
+            }
+            int cid = app.focus.AllocId();
+            c.DrawText(hx + hbox + app.Scale(6), hy, selectAllText,
+                       header.FgOr(root.fg), fs);
+            int lw = Canvas.MeasureText(selectAllText, fs);
+            app.hitTester.RegisterRect(cid, hx, iy,
+                                       hbox + app.Scale(6) + lw, headH, 2);
+            if (Ui.Clicked(app, cid) && !this.IsDisabled()) {
+                bool on = selN < allN;
+                for (int k = 0; k < order.Count; k = k + 1) {
+                    int i = order[k];
+                    if (i < p.flags.Count) { p.flags[i] = on; }
+                }
+                SelectChanged.Post();
+                dirty = true;
+            }
+            hx = hx + hbox + app.Scale(6) + lw + pad;
+            c.DrawText(hx, hy,
+                       totalText + " " + Convert.ToString(count) + " 项",
+                       meta.FgOr(root.fg), fs);
+        } else {
+            // 清除 + 已选 N 项（单向模式下右栏只读，没有可清）。
+            int cid = app.focus.AllocId();
+            bool canClear = !oneWay && checkedN > 0 && !this.IsDisabled();
+            StyleBox link = Style.Part(app, "transfer", "link", "", Class, "",
+                canClear ? Style.SNormal() : Style.SDisabled());
+            c.DrawText(hx, hy, clearText,
+                       link.FgOr(root.accent), fs);
+            int lw = Canvas.MeasureText(clearText, fs);
+            app.hitTester.RegisterRect(cid, hx, iy, lw, headH, 2);
+            if (Ui.Clicked(app, cid) && canClear) {
+                this.ClearPane(right, target, true);
+                dirty = true;
+            }
+            c.DrawText(hx + lw + pad, hy,
+                       selectedText + " " + Convert.ToString(checkedN) + " 项",
+                       meta.FgOr(root.fg), fs);
+        }
+        iy = iy + headH;
+        ih = ih - headH;
+
+        // ---- 搜索框（内嵌真 Input：焦点/选区/清除钮全归它）----
+        if (searchable) {
+            if (p.search == null) {
+                string hint = isSource ? leftHint : rightHint;
+                p.search = new Input(hint);
+                p.search.iconLead = "search";
+                p.search.Class = "small";
+                dirty = true;
+            }
+            p.search.Render(app, ix + pad, iy + app.Scale(6),
+                            iw - pad * 2, searchH);
+            iy = iy + searchH + app.Scale(10);
+            ih = ih - searchH - app.Scale(10);
+        }
+
+        // ---- 行区：只画视口（虚拟化：4 万项与一屏同开销）----
+        int n = order.Count;
+        int contentH = n * rowH;
+        Scrollbar.HandleWheel(app, ix, iy, iw, ih, contentH, p.scroll);
+        int maxOff = contentH - ih;
+        if (maxOff < 0) { maxOff = 0; }
+        if (p.scroll.Get() > maxOff) { p.scroll.Set(maxOff); }
+        if (p.scroll.Get() < 0) { p.scroll.Set(0); }
+        int off = p.scroll.Get();
+        bool overflow = contentH > ih;
+        int barW = app.Scale(10);
+        int bodyW = iw;
+        if (overflow) { bodyW = iw - barW; }
+        int first = off / rowH;
+        if (first < 0) { first = 0; }
+        int last = (off + ih) / rowH;
+        if (last >= n) { last = n - 1; }
+        c.PushClip(ix, iy, bodyW, ih);
+        int rfs = row.FontOr(Style.FontFallback(app, "medium"));
+        int rbox = app.Scale(16);
+        int k = first;
+        while (k <= last) {
+            int i = order[k];
+            int ry = iy + k * rowH - off;
+            bool checkedK = i < p.flags.Count && p.flags[i];
+            int id = app.focus.AllocId();
+            app.hitTester.RegisterRect(id, ix, ry, bodyW, rowH, 2);
+            bool over = app.focus.IsHovered(id);
+            if (over) {
+                StyleBox hover = Style.Part(app, "transfer", "row", "", Class,
+                                            "", Style.SHover());
+                c.FillRect(ix, ry, bodyW, rowH, hover.BgOr(0));
+            }
+            int bx = ix + pad;
+            int by = ry + (rowH - rbox) / 2;
+            if (!oneWay || isSource) {
+                int lvl = 0;
+                if (checkedK) { lvl = 1000; }
+                Checkbox.PaintBox(app, bx, by, rbox, lvl);
+            }
+            int tx = bx + rbox + app.Scale(8);
+            if (oneWay && !isSource) { tx = ix + pad; }
+            string icon = "";
+            if (iconOf != null) { icon = iconOf(data[i]); }
+            if (icon != "") {
+                StyleBox ic = Style.Part(app, "transfer", "icon", "", Class,
+                                         "", Style.SNormal());
+                c.DrawGlyphIn(icon, tx, ry, rbox, rowH, rbox,
+                              ic.FgOr(root.fg));
+                tx = tx + rbox + app.Scale(6);
+            }
+            string text = Ellipsis.Fit(this.LabelOf(data[i]),
+                                       ix + bodyW - pad - tx, rfs);
+            c.DrawText(tx, Canvas.CenterTextY(ry, rowH, rfs), text,
+                       row.FgOr(root.fg), rfs);
+            if (Ui.Clicked(app, id) && !this.IsDisabled()
+                && (!oneWay || isSource)) {
+                if (i < p.flags.Count) { p.flags[i] = !p.flags[i]; }
+                SelectChanged.Post();
+                dirty = true;
+            }
+            k = k + 1;
+        }
+        c.PopClip();
+        if (overflow) {
+            Scrollbar.RenderVerticalScrollIn(app, ix + iw - barW, iy, ih,
+                ih, contentH, p.scroll, ix, iy, iw, ih);
+        }
+
+        // ---- 空态 ----
+        if (n == 0 && emptyText != "") {
+            StyleBox empty = Style.Part(app, "transfer", "empty", "", Class,
+                                        "", Style.SNormal());
+            c.DrawTextCentered(ix, iy, iw, ih, emptyText,
+                               empty.FgOr(root.fg),
+                               Style.FontFallback(app, "small"));
+        }
+        return dirty;
+    }
+
+    override void OnMeasure(App app) {
+        this.ComputeMetrics(app);
+        int pad = app.Scale(12);
+        int head = headH;
+        int search = searchable ? searchH + app.Scale(10) : 0;
+        // 默认尺寸：两栏各 ~160 宽、一屏 6 行；宿主给框即可。
+        prefW = pad * 2 + (app.Scale(160) * 2 + opW + opGap * 2);
+        prefH = pad * 2 + 2 + head + search + app.Scale(36) * 6;
+    }
+
+    override void OnPaint(App app) {
+        this.Render(app, bx, by, bw, bh);
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        e.Add("SelectChanged");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change") { Change.Add(a); return; }
+        if (evt == "SelectChanged") { SelectChanged.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec one = PropSpec.Bool("oneWay", "One way");
+        one.flag = oneWay;
+        one.WithTip("Only move right: the back button disappears and "
+                    + "the right column becomes read-only.");
+        ps.Add(one);
+        PropSpec sea = PropSpec.Bool("searchable", "Searchable");
+        sea.flag = searchable;
+        sea.WithTip("Add a filter input to the head of each panel.");
+        ps.Add(sea);
+        PropSpec emp = PropSpec.Text("emptyText", "Empty text");
+        emp.str = emptyText;
+        ps.Add(emp);
+        PropSpec lh = PropSpec.Text("searchHintLeft", "Left search hint");
+        lh.str = leftHint;
+        ps.Add(lh);
+        PropSpec rh = PropSpec.Text("searchHintRight", "Right search hint");
+        rh.str = rightHint;
+        ps.Add(rh);
+        return ps;
+    }
+}

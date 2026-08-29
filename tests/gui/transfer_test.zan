@@ -1,0 +1,187 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// Gui.Transfer 的无窗口回归：Bind 实时视图、勾选集合、MoveRight /
+/// MoveLeft 的行序搬移与倒序删除、过滤只搬命中行（含缓存失效）、
+/// ClearChecked 的全量/过滤两态、oneWay 下右栏不可勾，以及组件模型
+/// （Kind/StyleType/Props 往返/Events/ControlFactory）。事件经 Post
+/// 排到 UI 派发队列，headless 不泵事件，故只断言数据态。
+class TrfUser {
+    string name;
+    TrfUser(string n) { name = n; }
+    string Name() { return name; }
+}
+
+class TransferTest {
+    static int fails;
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got {got} want {want}");
+    }
+
+    static void EqStr(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got '{got}' want '{want}'");
+    }
+
+    static void Ok(string what, bool cond) {
+        if (cond) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static List<string> Seq(int n) {
+        List<string> r = new List<string>();
+        for (int i = 0; i < n; i = i + 1) {
+            r.Add("Option " + Convert.ToString(i));
+        }
+        return r;
+    }
+
+    static void Main() {
+        fails = 0;
+
+        // ---- Bind 实时视图 + 勾选集合 --------------------------------
+        List<string> a = Seq(10);
+        List<string> b = new List<string>();
+        Transfer<string> t = new Transfer<string>();
+        t.Bind(a, b);
+        Eq("src count", t.SourceCount(), 10);
+        Eq("tgt count", t.TargetCount(), 0);
+        Ok("bind is live view", t.Source() == a);
+        Eq("nothing checked", t.CheckedSource(), 0);
+        Ok("unbound item unchecked", !t.IsChecked("nope"));
+        t.SetChecked("Option 5", true);
+        t.SetChecked("Option 2", true);
+        t.SetChecked("Option 5", true);          // 重复勾选幂等
+        Eq("checked count", t.CheckedSource(), 2);
+        Ok("item checked", t.IsChecked("Option 2"));
+        List<string> ck = t.Checked();
+        Eq("checked in row order", ck.Count, 2);
+        EqStr("checked[0]", ck[0], "Option 2");
+        EqStr("checked[1]", ck[1], "Option 5");
+
+        // ---- MoveRight：只搬勾选项，按行序追加，源侧勾选清零 ----------
+        t.MoveRight();
+        Eq("after right src", a.Count, 8);
+        Eq("after right tgt", b.Count, 2);
+        EqStr("appended order 0", b[0], "Option 2");
+        EqStr("appended order 1", b[1], "Option 5");
+        Eq("right flags cleared", t.CheckedTarget(), 0);
+        Ok("source rows keep order", a[0] == "Option 0" && a[2] == "Option 3");
+        Ok("moved row unchecked", !t.IsChecked("Option 2"));
+
+        // ---- MoveLeft：右栏重新勾选后可移回 --------------------------
+        t.SetChecked("Option 5", true);
+        t.MoveLeft();
+        Eq("after left src", a.Count, 9);
+        Eq("after left tgt", b.Count, 1);
+        Ok("moved back row exists", a[7] == "Option 5" || a[8] == "Option 5");
+        Ok("right keeps remainder", b[0] == "Option 2");
+        t.SetChecked("Option 2", false);
+
+        // ---- 过滤：只搬命中且勾选的行；缓存按 (计数, 关键词) 失效 -----
+        t.SetQuery(true, "8");                   // 命中 Option 8
+        EqStr("query readback", t.Query(true), "8");
+        t.SetChecked("Option 8", true);
+        t.SetChecked("Option 3", true);          // 未命中：留在原地不动
+        t.MoveRight();
+        Eq("filtered move src", a.Count, 8);
+        Eq("filtered move tgt", b.Count, 2);
+        EqStr("filtered moved row", b[1], "Option 8");
+        Ok("hidden checked stays", t.IsChecked("Option 3"));
+        t.SetQuery(true, "");                    // 清过滤，行序重建
+        Eq("unfiltered src", t.VisibleCount(true), 8);
+
+        // ---- 外部改数据 + Refresh：缓存过期后重扫 --------------------
+        a.Add("Option 99");
+        t.Refresh();
+        t.SetQuery(true, "99");
+        t.SetChecked("Option 99", true);
+        Eq("filter hits new row", t.VisibleCount(true), 1);
+        t.MoveRight();
+        Eq("new row moved", b.Count, 3);
+        t.SetQuery(true, "");
+
+        // ---- ClearChecked：false 只清过滤命中，true 清全部 -----------
+        //（Option 3 自过滤段起一直勾着，本段再勾 0/1。）
+        t.SetChecked("Option 0", true);
+        t.SetChecked("Option 1", true);
+        t.SetQuery(true, "0");
+        t.ClearChecked(false);
+        Eq("clear visible only", t.CheckedSource(), 2);
+        t.SetQuery(true, "");
+        t.ClearChecked(true);
+        Eq("clear all", t.CheckedSource(), 0);
+        Eq("clear all keeps data", a.Count, 8);
+
+        // ---- oneWay：右栏行不可勾选，右移仍可用 ----------------------
+        List<string> wa = Seq(4);
+        List<string> wb = Seq(1);
+        Transfer<string> o = new Transfer<string>();
+        o.Bind(wa, wb);
+        o.WithOneWay();
+        o.SetChecked("Option 1", true);          // 左栏可勾
+        o.MoveRight();
+        Eq("one-way src", wa.Count, 3);
+        Eq("one-way tgt", wb.Count, 2);
+
+        // ---- 自定义 T + WithLabel/WithIcon（委托只读参数） -----------
+        List<TrfUser> ua = new List<TrfUser>();
+        List<TrfUser> ub = new List<TrfUser>();
+        ua.Add(new TrfUser("tom"));
+        ua.Add(new TrfUser("jerry"));
+        Transfer<TrfUser> ut = new Transfer<TrfUser>();
+        ut.Bind(ua, ub);
+        ut.WithLabel(u => u.Name());
+        ut.SetChecked(ua[1], true);
+        Eq("typed checked", ut.CheckedSource(), 1);
+        ut.MoveRight();
+        Eq("typed src moved", ua.Count, 1);
+        Eq("typed tgt moved", ub.Count, 1);
+
+        // ---- 空移动不扰动 ---------------------------------------------
+        int before = a.Count;
+        t.MoveRight();                           // 无勾选
+        Eq("no-op move", a.Count, before);
+
+        // ---- 组件模型：Kind / StyleType / Props / Events / 工厂 -------
+        EqStr("kind", t.Kind(), "Transfer");
+        EqStr("style type", t.StyleType(), "transfer");
+        List<PropSpec> ps = t.Props();
+        Eq("props count", ps.Count, 5);
+        EqStr("default oneWay prop", t.GetProp("oneWay"), "false");
+        EqStr("default empty prop", t.GetProp("emptyText"), "无数据");
+        t.SetProp("oneWay", "true");
+        EqStr("setProp oneWay readback", t.GetProp("oneWay"), "true");
+        t.SetProp("emptyText", "nothing here");
+        EqStr("setProp empty readback", t.GetProp("emptyText"),
+              "nothing here");
+        bool hasChange = false;
+        bool hasSelect = false;
+        List<string> evs = t.Events();
+        for (int i = 0; i < evs.Count; i = i + 1) {
+            if (evs[i] == "Change") { hasChange = true; }
+            if (evs[i] == "SelectChanged") { hasSelect = true; }
+        }
+        Ok("events has Change", hasChange);
+        Ok("events has SelectChanged", hasSelect);
+        Control made = ControlFactory.Create("Transfer");
+        if (made == null) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL factory: null");
+        } else {
+            EqStr("factory kind", made.Kind(), "Transfer");
+        }
+
+        if (fails == 0) {
+            Console.WriteLine("transfer_test OK");
+        } else {
+            Console.WriteLine($"transfer_test FAILURES {fails}");
+        }
+    }
+}

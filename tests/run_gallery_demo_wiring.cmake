@@ -28,7 +28,31 @@ set(_src "${ROOT}/examples/gui_gallery/gui_gallery.zan")
 if(NOT EXISTS "${_src}")
   message(FATAL_ERROR "missing ${_src}")
 endif()
-file(STRINGS "${_src}" _lines)
+# Read line-by-line WITHOUT file(STRINGS) / per-line CMake lists: `;` is the
+# CMake list separator, so any source line containing one (statement
+# terminators, or demo strings like "Pixel scroll; rows ...") fuses with or
+# splits against its neighbours once it passes through a list value, and the
+# "registered preview id" / "render branch" regex scans below miss lines that
+# actually exist -- that is how Menu.expand / Pagination / Scrollbar were
+# flagged as dead code while every AddDemo/Gallery.Add was present.  (The
+# usual `\;` escape is not available either: `${x}` expansion of a `;` re-splits
+# at the argument level, so no quoted argument can carry the two-character
+# escape into string()).
+#
+# Approach: map every `;` in the file to a SOH control char (never present in
+# source) and every newline to `|` (also never present), then slice physical
+# lines with a while loop and scan each one immediately -- the line only ever
+# lives in a scalar variable, never in a list.  Every regex below is free of
+# literal `;`, so matching against the SOH-protected line is exact; only the
+# captured ids (whose char classes exclude `;`) are appended to the
+# bookkeeping lists.
+file(READ "${_src}" _content)
+string(ASCII 1 _soh)
+string(ASCII 124 _pipe)
+string(REPLACE ";" "${_soh}" _content "${_content}")
+string(REPLACE "\r\n" "\n" _content "${_content}")
+string(REPLACE "\r" "\n" _content "${_content}")
+string(REPLACE "\n" "${_pipe}" _content "${_content}")
 
 # Split the file into the three regions we care about by their function headers.
 set(_region "")
@@ -36,7 +60,20 @@ set(_overlay_branch "")
 set(_overlay_listed "")
 set(_all_branch "")
 set(_registered "")
-foreach(_l IN LISTS _lines)
+set(_rem "${_content}")
+string(LENGTH "${_rem}" _rem_len)
+while(_rem_len GREATER 0)
+  string(FIND "${_rem}" "${_pipe}" _pos)
+  if(_pos EQUAL -1)
+    set(_l "${_rem}")
+    set(_rem_len 0)
+  else()
+    string(SUBSTRING "${_rem}" 0 ${_pos} _l)
+    math(EXPR _next "${_pos}+1")
+    string(SUBSTRING "${_rem}" ${_next} -1 _rem)
+    string(LENGTH "${_rem}" _rem_len)
+  endif()
+
   if(_l MATCHES "^    static bool IsOverlayComp\\(")
     set(_region "list")
   elseif(_l MATCHES "^    static void RenderOverlay\\(")
@@ -67,7 +104,7 @@ foreach(_l IN LISTS _lines)
       list(APPEND _overlay_listed "${_hit}")
     endif()
   endif()
-endforeach()
+endwhile()
 
 foreach(_v _overlay_branch _overlay_listed _all_branch _registered)
   if(${_v})
