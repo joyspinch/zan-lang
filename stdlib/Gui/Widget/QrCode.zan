@@ -1,0 +1,431 @@
+using System;
+using System.IO;
+using System.IO.Compression;
+using Gui;
+
+namespace Gui.Widget;
+
+/// 二维码（对标 layui qrcode 演示）。内容经 `Gui.QrEncoder` 编码为
+/// 模块矩阵，逐模块 `Canvas.FillRect`（行游程合并）绘制。
+///
+///     QrCode qr = new QrCode("https://zan-lang.dev");
+///     qr.Ecl = "H";
+///     qr.Logo = "assets/logo.png";   // 带 logo 自动升 H（同 layui）
+///     qr.Render(app, x, y);
+///     qr.SavePng("qr.png");          // 「下载」
+///     string svg = qr.ToSvg();       // 「渲染类型 = svg」
+///
+/// 颜色/尺寸/留白走 CSS 规则 `qrcode`（color / background-color /
+/// width）；显式属性值 0 = 交给 CSS。编码结果按 (Text,Ecl,Logo)
+/// 指纹缓存，属性不变不重算。
+class QrCode : Control {
+    /// 二维码内容（响应式）。
+    Binding<string> Text;
+    /// 纠错级别 "L"/"M"/"Q"/"H"（默认 "M"）。
+    Binding<string> Ecl;
+    /// 边长（逻辑 px，含留白）；0 = 按 CSS 盒 / 默认。
+    Binding<int> Size;
+    /// 深色模块 0xAARRGGBB；0 = CSS `color`，再退黑。
+    Binding<int> Dark;
+    /// 浅色底色 0xAARRGGBB；0 = CSS `background-color`，再退白。
+    Binding<int> Light;
+    /// 留白模块数（默认 4，ISO 静区建议值）。
+    Binding<int> Margin;
+    /// logo 图片（文件路径 / mem: key）；空 = 无 logo。
+    Binding<string> Logo;
+    /// logo 边长占整码的百分比（默认 18，钳到 1..30）。
+    Binding<int> LogoPct;
+    /// 内容/属性变化时触发。
+    UiEvent Change;
+
+    // (Text,Ecl,Logo) 指纹缓存的编码结果。
+    string cacheKey;
+    QrMatrix cacheMx;
+    int baseId;
+
+    void InitQr() {
+        this.InitControl("qrcode", 1);
+        baseId = WidgetId.Block(1);
+        Text = "";
+        Ecl = "M";
+        Size = 0;
+        Dark = 0;
+        Light = 0;
+        Margin = 4;
+        Logo = "";
+        LogoPct = 18;
+        cacheKey = "";
+        cacheMx = null;
+        Change = new UiEvent();
+        wiresOwnEvents = true;
+    }
+
+    /// 默认设计期构造。
+    QrCode() { this.InitQr(); }
+
+    /// 内容构造：`QrCode qr = new QrCode("https://...");`
+    QrCode(string text) {
+        this.InitQr();
+        Text = text;
+    }
+
+    override string Kind() { return "QrCode"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec tx = PropSpec.Text("text", "Content");
+        tx.str = Text;
+        tx.WithTip("Encoded content (URL, text, ...).");
+        ps.Add(tx);
+        PropSpec ec = PropSpec.Enum("ecl", "Error level",
+            new List<string>{ "L", "M", "Q", "H" });
+        ec.str = Ecl;
+        ec.WithTip("Reed-Solomon correction level; raised to H with a logo.");
+        ps.Add(ec);
+        PropSpec sz = PropSpec.Int("size", "Size px");
+        sz.num = Size;
+        sz.Step(8, 0, 2048);
+        sz.WithTip("Edge length in logical px (0 = CSS box / auto).");
+        ps.Add(sz);
+        PropSpec dk = PropSpec.Color("dark", "Dark color");
+        dk.num = Dark;
+        ps.Add(dk);
+        PropSpec lt = PropSpec.Color("light", "Light color");
+        lt.num = Light;
+        ps.Add(lt);
+        PropSpec mg = PropSpec.Int("margin", "Margin (modules)");
+        mg.num = Margin;
+        mg.Step(1, 0, 16);
+        ps.Add(mg);
+        PropSpec lg = PropSpec.Text("logo", "Logo image");
+        lg.str = Logo;
+        lg.WithTip("Image overlaid at the centre; forces error level H.");
+        ps.Add(lg);
+        PropSpec lp = PropSpec.Int("logoPct", "Logo %");
+        lp.num = LogoPct;
+        lp.Step(1, 1, 30);
+        ps.Add(lp);
+        return ps;
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change") { Change.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    // ---- 绘制 -----------------------------------------------------------
+
+    override void OnMeasure(App app) {
+        int margin = this.Margin.Get();
+        if (margin < 0) { margin = 0; }
+        int mods = this.Matrix().size + 2 * margin;
+        int px = this.BoxPx(app, mods);
+        prefW = px;
+        prefH = px;
+    }
+
+    override void OnPaint(App app) {
+        this.Render(app, bx, by);
+    }
+
+    /// 手动绘制（宿主自由布局时）。返回命中 id。
+    int Render(App app, int x, int y) {
+        QrMatrix mx = this.Matrix();
+        int margin = this.Margin.Get();
+        if (margin < 0) { margin = 0; }
+        int mods = mx.size + 2 * margin;
+        int box = this.BoxPx(app, mods);
+        // 整数模块步长，余量留右下，保证总宽不超盒。
+        int cell = box / mods;
+        if (cell < 1) { cell = 1; }
+        int dark = this.EffectiveDark(app);
+        int light = this.EffectiveLight(app);
+        Canvas c = app.canvas;
+        c.FillRect(x, y, mods * cell, mods * cell, light);
+        // 深色模块按行游程合并成横条：69x69 全码的 ~4800 次
+        // FillRect 压到 ~800 次，逐帧重画也不掉帧。
+        for (int my = 0; my < mx.size; my = my + 1) {
+            int runStart = -1;
+            for (int mxp = 0; mxp <= mx.size; mxp = mxp + 1) {
+                bool d = mxp < mx.size && mx.Get(mxp, my);
+                if (d && runStart < 0) { runStart = mxp; }
+                if (!d && runStart >= 0) {
+                    c.FillRect(x + (runStart + margin) * cell,
+                               y + (my + margin) * cell,
+                               (mxp - runStart) * cell, cell, dark);
+                    runStart = -1;
+                }
+            }
+        }
+        this.PaintLogo(app, c, mx, margin, cell, x, y);
+        app.hitTester.RegisterRect(baseId, x, y, mods * cell, mods * cell, 0);
+        return baseId;
+    }
+
+    /// logo 叠加：中心衬底（浅色）+ 等比缩放绘制。衬底盖住模块，
+    /// 因此 Matrix() 把纠错自动升到 H。
+    void PaintLogo(App app, Canvas c, QrMatrix mx, int margin, int cell,
+                   int x, int y) {
+        string src = Logo.Get();
+        if (src == null) { src = ""; }
+        if (src == "") { return; }
+        if (Canvas.ImageWidth(src) <= 0) { return; }
+        int pct = LogoPct.Get();
+        if (pct < 1) { pct = 1; }
+        if (pct > 30) { pct = 30; }
+        int full = mx.size + 2 * margin;
+        int side = full * cell * pct / 100;
+        if (side < 2) { return; }
+        int back = side + 2 * (side / 8 + 1);
+        int ox = x + (full * cell - back) / 2;
+        int oy = y + (full * cell - back) / 2;
+        c.FillRect(ox, oy, back, back, this.EffectiveLight(app));
+        c.BlitImage(src, ox + (back - side) / 2, oy + (back - side) / 2,
+                    side, side, 0, 0, 0, 0);
+    }
+
+    /// 生效盒边长（物理 px）：显式 Size 优先，其次 CSS width，
+    /// 再退每模块 6 逻辑 px 的默认。
+    int BoxPx(App app, int mods) {
+        if (Size != null && Size.Get() > 0) { return app.Scale(Size.Get()); }
+        StyleBox s = this.ResolveStyleCached(app, this.StyleType(), Class,
+                                             Style.SNormal());
+        int cssW = s.WidthOr(0);
+        if (cssW > 0) { return app.Scale(cssW); }
+        return app.Scale(6) * mods;
+    }
+
+    int EffectiveDark(App app) {
+        if (Dark != null && Dark.Get() != 0) { return Dark.Get(); }
+        StyleBox s = this.ResolveStyleCached(app, this.StyleType(), Class,
+                                             Style.SNormal());
+        return s.FgOr(0xFF000000);
+    }
+    int EffectiveLight(App app) {
+        if (Light != null && Light.Get() != 0) { return Light.Get(); }
+        StyleBox s = this.ResolveStyleCached(app, this.StyleType(), Class,
+                                             Style.SNormal());
+        return s.BgOr(0xFFFFFFFF);
+    }
+
+    /// 生效纠错级别：显式 Ecl 为基，带 Logo 时保底 H（同 layui）。
+    QrEcl EffectiveEcl() {
+        QrEcl r = QrEncoder.ParseEcl(Ecl.Get());
+        string lg = Logo.Get();
+        if (lg != null && lg != "") {
+            if ((int)r < (int)QrEcl.H) { r = QrEcl.H; }
+        }
+        return r;
+    }
+
+    /// 编码结果（指纹缓存）。超长内容抛异常——上层（画廊属性面板）
+    /// 自己捕获；缓存里保留旧矩阵的语义由调用方保证。
+    QrMatrix Matrix() {
+        string text = Text.Get();
+        if (text == null) { text = ""; }
+        string logo = Logo.Get();
+        if (logo == null) { logo = ""; }
+        // 指纹带上 text 长度：三段拼接即使内容含分隔符也不会混淆
+        // （长度不同 ⇒ key 不同；长度相同且余下完全相同 ⇒ 三元组相同）。
+        string key = Convert.ToString(text.Length) + ":" + text
+            + "|" + Ecl.Get() + "|" + logo;
+        if (key != cacheKey || cacheMx == null) {
+            cacheKey = key;
+            cacheMx = QrEncoder.Encode(text, this.EffectiveEcl());
+        }
+        return cacheMx;
+    }
+
+    // ---- 导出（纯 Zan，对标截图的「渲染类型」「下载」） ------------------
+
+    /// 当前二维码的 SVG 源（「渲染类型 = svg」）。headless 导出无
+    /// App 可用，颜色取显式 Dark/Light，未设时退黑白。
+    string ToSvg() {
+        int px = this.ExportBox();
+        return QrCode.SvgOf(this.Matrix(), this.Margin.Get(),
+                            this.ExportDark(), this.ExportLight(), px);
+    }
+
+    /// 当前二维码的 PNG 字节（「下载」落盘前的中间步）。
+    byte[] ToPngBytes() {
+        int px = this.ExportBox();
+        return QrCode.PngOf(this.Matrix(), this.Margin.Get(),
+                            this.ExportDark(), this.ExportLight(), px);
+    }
+
+    /// 写 PNG 文件并返回字节数——截图「下载」按钮的直接入口。
+    int SavePng(string path) {
+        byte[] data = this.ToPngBytes();
+        File.WriteAllBytes(path, data);
+        return data.Length;
+    }
+
+    int ExportBox() {
+        QrMatrix mx = this.Matrix();
+        int margin = this.Margin.Get();
+        if (margin < 0) { margin = 0; }
+        int mods = mx.size + 2 * margin;
+        if (Size != null && Size.Get() > 0) { return Size.Get(); }
+        return mods * 6;
+    }
+
+    int ExportDark() {
+        if (Dark != null && Dark.Get() != 0) { return Dark.Get(); }
+        return 0xFF000000;
+    }
+    int ExportLight() {
+        if (Light != null && Light.Get() != 0) { return Light.Get(); }
+        return 0xFFFFFFFF;
+    }
+
+    /// 静态导出：不经控件，由矩阵直接出 SVG（深色行游程合并成 rect）。
+    static string SvgOf(QrMatrix mx, int margin, int dark, int light,
+                        int boxPx) {
+        if (margin < 0) { margin = 0; }
+        int mods = mx.size + 2 * margin;
+        int cell = boxPx / mods;
+        if (cell < 1) { cell = 1; }
+        int px = mods * cell;
+        string svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\""
+            + Convert.ToString(px) + "\" height=\"" + Convert.ToString(px)
+            + "\" viewBox=\"0 0 " + Convert.ToString(px) + " "
+            + Convert.ToString(px) + "\">\n";
+        svg = svg + "<rect width=\"100%\" height=\"100%\" fill=\""
+            + QrCode.HexColor(light) + "\"/>\n";
+        svg = svg + "<g fill=\"" + QrCode.HexColor(dark) + "\">\n";
+        for (int my = 0; my < mx.size; my = my + 1) {
+            int runStart = -1;
+            for (int mxp = 0; mxp <= mx.size; mxp = mxp + 1) {
+                bool d = mxp < mx.size && mx.Get(mxp, my);
+                if (d && runStart < 0) { runStart = mxp; }
+                if (!d && runStart >= 0) {
+                    svg = svg + "<rect x=\""
+                        + Convert.ToString((runStart + margin) * cell)
+                        + "\" y=\"" + Convert.ToString((my + margin) * cell)
+                        + "\" width=\""
+                        + Convert.ToString((mxp - runStart) * cell)
+                        + "\" height=\"" + Convert.ToString(cell) + "\"/>\n";
+                    runStart = -1;
+                }
+            }
+        }
+        svg = svg + "</g>\n</svg>\n";
+        return svg;
+    }
+
+    /// 0xAARRGGBB → "#rrggbb"（alpha 忽略，SVG/PNG 全不透明底）。
+    static string HexColor(int argb) {
+        List<string> h = "0123456789abcdef".Split("");
+        string outp = "#";
+        int r = (argb >> 16) & 255;
+        int g = (argb >> 8) & 255;
+        int b = argb & 255;
+        outp = outp + h[r / 16] + h[r % 16];
+        outp = outp + h[g / 16] + h[g % 16];
+        outp = outp + h[b / 16] + h[b % 16];
+        return outp;
+    }
+
+    /// 静态导出：PNG（8bit RGB，模块最近邻放大；签名/IHDR/IDAT/IEND
+    /// 手工组包，压缩走 System.IO.Compression，CRC 走纯 Zan Crc32）。
+    static byte[] PngOf(QrMatrix mx, int margin, int dark, int light,
+                        int boxPx) {
+        if (margin < 0) { margin = 0; }
+        int mods = mx.size + 2 * margin;
+        int cell = boxPx / mods;
+        if (cell < 1) { cell = 1; }
+        int w = mods * cell;
+        int dr = (dark >> 16) & 255;
+        int dg = (dark >> 8) & 255;
+        int db = dark & 255;
+        int lr = (light >> 16) & 255;
+        int lg = (light >> 8) & 255;
+        int lb = light & 255;
+        // 每模块行 -> 逐模块色；再按 cell 重复成像素行。
+        // 扫描线：每行首字节 filter=0，其后 w*3 字节 RGB。
+        int stride = 1 + w * 3;
+        byte[] raw = new byte[stride * w];
+        int pos = 0;
+        for (int my = 0 - margin; my < mx.size + margin; my = my + 1) {
+            for (int rep = 0; rep < cell; rep = rep + 1) {
+                raw[pos] = 0;
+                pos = pos + 1;
+                for (int mxp = 0; mxp < mods; mxp = mxp + 1) {
+                    bool d = false;
+                    if (my >= 0 && my < mx.size && mxp >= margin
+                        && mxp < mx.size + margin) {
+                        d = mx.Get(mxp - margin, my);
+                    }
+                    int r = d ? dr : lr;
+                    int g = d ? dg : lg;
+                    int b = d ? db : lb;
+                    for (int px = 0; px < cell; px = px + 1) {
+                        raw[pos] = (byte)r;
+                        raw[pos + 1] = (byte)g;
+                        raw[pos + 2] = (byte)b;
+                        pos = pos + 3;
+                    }
+                }
+            }
+        }
+        byte[] idat = Deflate.ZlibCompress(raw, 9);
+        // 组装：签名 + IHDR + IDAT + IEND。
+        byte[] png = new byte[8 + (12 + 13) + (12 + idat.Length) + 12];
+        int at = 0;
+        png[at] = (byte)137; png[at + 1] = 80; png[at + 2] = 78;
+        png[at + 3] = 71; png[at + 4] = 13; png[at + 5] = 10;
+        png[at + 6] = 26; png[at + 7] = 10;
+        at = at + 8;
+        at = QrCode.WriteChunk(png, at, (byte)'I', (byte)'H', (byte)'D',
+                               (byte)'R', QrCode.Ihdr(w));
+        at = QrCode.WriteChunk(png, at, (byte)'I', (byte)'D', (byte)'A',
+                               (byte)'T', idat);
+        byte[] iend = new byte[0];
+        at = QrCode.WriteChunk(png, at, (byte)'I', (byte)'E', (byte)'N',
+                               (byte)'D', iend);
+        return png;
+    }
+
+    static byte[] Ihdr(int w) {
+        byte[] d = new byte[13];
+        d[0] = (byte)(w >> 24); d[1] = (byte)(w >> 16);
+        d[2] = (byte)(w >> 8); d[3] = (byte)w;
+        d[4] = (byte)(w >> 24); d[5] = (byte)(w >> 16);
+        d[6] = (byte)(w >> 8); d[7] = (byte)w;
+        d[8] = 8;    // bit depth
+        d[9] = 2;    // color type: RGB
+        d[10] = 0; d[11] = 0; d[12] = 0;
+        return d;
+    }
+
+    /// 写一个 PNG 分块（长度/类型/数据/CRC），返回新偏移。
+    static int WriteChunk(byte[] dst, int at, byte b0, byte b1, byte b2,
+                          byte b3, byte[] data) {
+        dst[at] = (byte)(data.Length >> 24);
+        dst[at + 1] = (byte)(data.Length >> 16);
+        dst[at + 2] = (byte)(data.Length >> 8);
+        dst[at + 3] = (byte)data.Length;
+        dst[at + 4] = b0; dst[at + 5] = b1;
+        dst[at + 6] = b2; dst[at + 7] = b3;
+        for (int i = 0; i < data.Length; i = i + 1) {
+            dst[at + 8 + i] = data[i];
+        }
+        byte[] crcSrc = new byte[4 + data.Length];
+        crcSrc[0] = b0; crcSrc[1] = b1; crcSrc[2] = b2; crcSrc[3] = b3;
+        for (int i = 0; i < data.Length; i = i + 1) {
+            crcSrc[4 + i] = data[i];
+        }
+        int crc = Crc32.Compute(crcSrc, 0, crcSrc.Length, 0);
+        dst[at + 8 + data.Length] = (byte)(crc >> 24);
+        dst[at + 9 + data.Length] = (byte)(crc >> 16);
+        dst[at + 10 + data.Length] = (byte)(crc >> 8);
+        dst[at + 11 + data.Length] = (byte)crc;
+        return at + 12 + data.Length;
+    }
+}
