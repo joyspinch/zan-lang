@@ -1,0 +1,70 @@
+using System;
+using Gui;
+
+/// SelectBox 弹层选项点击的基线命中回归（无窗口）。
+///
+/// 弹层输入处理里「释放点落在弹层内已注册控件（内嵌滚动条）上时
+/// 让给它」的判定，原先用 HitTestBelowBlockers——它扫整帧区域，
+/// 弹层正下方的内容控件（滑杆/输入框/表格行）早在内容帧就注册在
+/// 前，会被误当成弹层内部控件，点击被整体吞掉：弹层盖住任何可
+/// 交互控件时选项就选不中（gallery 自定义水印配置面板首当其冲，
+/// 那里每个下拉的正下方都是滑杆/数字输入框）。修复引入
+/// HitTestFrom(px, py, from)：只在弹层基线（OnPaintOverlay 入口
+/// 的 RegionCount）之后找——blocker 与弹层内部控件都注册在基线
+/// 之后，内容区域都在之前。本测试按真实帧序重放该场景，锁住
+/// 「基线跳过内容、滚动条仍让行、blocker 不算控件、顶层优先」
+/// 四条语义。
+class Program {
+    static int fails;
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got {got} want {want}");
+    }
+
+    static void Main() {
+        fails = 0;
+
+        // ---- 真实帧序重放 --------------------------------------------
+        // 内容帧：弹层正下方有一只滑杆轨道（内容阶段注册，下标 0）。
+        HitTester ht = new HitTester();
+        ht.RegisterRect(101, 40, 100, 200, 24, 0);
+        // OnPaintOverlay 入口记基线：此刻 regions 里只有内容区域。
+        int overlayBase = ht.RegionCount();
+        // 覆盖阶段：SelectBox 先铺全窗 blocker（BlockHitsBelow），
+        // 再铺弹层体 blocker（BlockHitsRect）。
+        ht.RegisterRect(102, 0, 0, 400, 300, 0 - 1);
+        ht.RegisterRect(103, 40, 90, 200, 120, 0 - 1);
+        // 弹层内部：内嵌滚动条的抓取区（覆盖阶段注册），与选项行
+        // 同高——正是「拖滑块收尾不能误选行」要保护的区域。
+        ht.RegisterRect(104, 220, 95, 17, 110, 0);
+
+        // 选项行坐标 (60, 110)：正下方是滑杆 101。基线之前的内容区
+        // 不得算「弹层内部控件」，释放点击要照常走行选择。
+        EqInt("trap: content under popup", ht.HitTestBelowBlockers(60, 110), 101);
+        EqInt("baseline skips content", ht.HitTestFrom(60, 110, overlayBase),
+            0 - 1);
+        // 滚动条坐标 (226, 110)：注册在基线之后，继续让行。
+        EqInt("scrollbar still yields", ht.HitTestFrom(226, 110, overlayBase),
+            104);
+        // blocker 自身不算内部控件：弹层体外/全窗遮罩上的点照旧
+        // 走「外部点击关闭」。
+        EqInt("blocker skipped", ht.HitTestFrom(20, 20, overlayBase), 0 - 1);
+        // 基线取到当前帧末尾等于空区间：晚记基线不会放大匹配面。
+        EqInt("empty window", ht.HitTestFrom(226, 110, ht.RegionCount()),
+            0 - 1);
+
+        // ---- 顶层优先：基线之后多个内部区域重叠，取后注册的 ----
+        ht.RegisterRect(105, 220, 95, 17, 110, 0);
+        EqInt("topmost internal wins", ht.HitTestFrom(226, 110, overlayBase),
+            105);
+
+        if (fails == 0) {
+            Console.WriteLine("selectbox_popup_hit_test OK");
+        } else {
+            Console.WriteLine("selectbox_popup_hit_test FAIL "
+                + Convert.ToString(fails));
+        }
+    }
+}

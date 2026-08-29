@@ -2532,3 +2532,39 @@ ECharts 2.2.7 全 134 示例对齐六批已收口（见 docs/CHART_VS_ECHARTS_22
 - `ctest -R "conformance_gui_datatable|policy_gallery|…css|carousel|flex"`
   6/6 绿；menu/input/selectbox 等 4 项失败系并行 Menu/Input WIP 改
   API 后其测试源未跟上（menu_test.zan 编译错），与本修复无关。
+
+## SelectBox 弹层选项选不中——基线命中修复（已验证、暂缓提交）
+
+现象（gallery 自定义水印演示首报）：下拉弹层打开后点选项毫无反应，
+勾选停在原值、弹层也不关。凡弹层正下方压着可交互控件（滑杆/数字
+输入框/表格行）的 SelectBox 都会中招——水印配置面板每个下拉的正
+下方都是控件，全部选不中。
+
+根因：平铺弹层的输入处理里「释放点落在弹层内已注册控件（内嵌滚动
+条）上时让行给它」的判定用 `HitTestBelowBlockers`，它扫**整帧**区
+域、跳过 blocker 返回第一个命中——覆盖阶段运行时，弹层正下方的内
+容控件早在内容帧注册在前（基线之前），被误判为弹层内部控件，点击
+被 `ClaimClick` 整体吞掉，永远走不到行选择。级联弹层不受影响：它
+的守卫在行处理之后。该守卫由 a44b9f24 引入。
+
+修复：`HitTester.HitTestFrom(px, py, from)`——只匹配 `from` 下标
+之后注册的区域（跳过 blocker）；SelectBox 三处弹层入口（OnPaint
+Overlay / CascadeOverlay）入口记 `overlayBase = RegionCount()`，
+两处守卫改走基线命中。滚动条/搜索框注册在基线之后，让行语义不变。
+
+证据：
+- `tests/gui/selectbox_popup_hit_test.zan`（新增，无窗口）：按真实
+  帧序重放内容滑杆 → 全窗+弹层 blocker → 内嵌滚动条，锁住基线跳过
+  内容区（旧 API 在选项点返回内容控件 id）、滚动条仍让行、blocker
+  不算控件、顶层优先四条语义。
+- 有头探针（_scratch/sb_probe）：弹层盖滑杆+输入框布局，UiDriver 点
+  触发器→点 Center 选项 → `CHANGE align idx=1 text=Center`、弹层关
+  闭；40 项弹层点滚动条条带不误选行、弹层保持开，后续行点击照常。
+- `ctest -R gui_selectbox|gui_menu|gui_datepicker|gui_formgroup|
+  gui_layer` 6/6 绿（含新增 conformance_gui_selectbox_popup_hit，
+  已登记 smoke/standard/full）。
+
+未提交（AGENTS 规则 7 例外）：SelectBox.zan / Event.zan 工作区混有
+另一会话的在途波（SelectBox +689、Event +139 非本修复行；Steps/
+DataGrid 在途编译反复），索引里还有该波的暂存回滚态，hunk 级拆分
+不可行。待该波落地后整文件提交本修复 + 新测试 + CMakeLists 登记。
