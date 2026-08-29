@@ -145,6 +145,7 @@ class ResolvedChart {
     ChartOption source;
     List<ResolvedSeries> series;
     int wid;
+    int stateWid;      // connect 组的交互态基址（组长 wid）；无组 = wid
     bool animate;
     int windowStart;   // dataZoom 窗口（类别索引，含端点）；
     int windowEnd;     //   无 zoom 时 = 全范围 [0, n-1]
@@ -155,6 +156,21 @@ class ResolvedChart {
         outp.series = new List<ResolvedSeries>();
         outp.wid = wid;
         outp.animate = source.animate;
+        // connect() 联动：交互态（dataZoom 窗口 / 图例开关）统一
+        // 存取在组长 wid 上。组长登记在组键里（组内第一张图写入），
+        // 本图非组长时用组长 wid 读写这些状态，实现跨图同帧联动。
+        int stateWid = wid;
+        if (app != null && wid != 0 && source.connectGroup != 0) {
+            int gk = Chart.ConnectGroupKey(source.connectGroup);
+            int leader = app.StateGet(gk, 0);
+            if (leader == 0) {
+                app.StateSet(gk, wid);
+                app.StateSet(Chart.ConnectHoverKey(wid), 0 - 1);
+            } else if (leader != wid) {
+                stateWid = leader;
+            }
+        }
+        outp.stateWid = stateWid;
         // dataZoom 窗口在解析期锁定一次，使指纹读取的窗口
         // 与渲染器读取的一致。无 zoom（或 n < 2）时
         // 是干净的全范围，不触发任何 App 状态读写。
@@ -162,9 +178,9 @@ class ResolvedChart {
         outp.windowEnd = 0 - 1;
         int n = source.XCategories().Count;
         if (n < 1) { n = 1; }
-        if (source.zoom && app != null && wid != 0 && n > 1) {
-            outp.windowStart = Chart.ZoomI0(app, source, wid, n);
-            outp.windowEnd = Chart.ZoomI1(app, source, wid, n);
+        if (source.zoom && app != null && stateWid != 0 && n > 1) {
+            outp.windowStart = Chart.ZoomI0(app, source, stateWid, n);
+            outp.windowEnd = Chart.ZoomI1(app, source, stateWid, n);
             if (outp.windowEnd < outp.windowStart) { outp.windowEnd = outp.windowStart; }
         } else {
             outp.windowStart = 0;
@@ -173,8 +189,8 @@ class ResolvedChart {
         for (int i = 0; i < source.series.Count; i = i + 1) {
             ChartSeries s = source.series[i];
             bool hidden = s.hidden;
-            if (app != null && wid != 0) {
-                hidden = app.StateGet(Chart.LegendKey(wid, i), hidden ? 1 : 0) == 1;
+            if (app != null && stateWid != 0) {
+                hidden = app.StateGet(Chart.LegendKey(stateWid, i), hidden ? 1 : 0) == 1;
             }
             ResolvedSeries rs = ResolvedSeries.Of(s, theme, i, wid, source.animate, hidden);
             // CSS 通道：样式表可用 chart::series-1..8 的 background
@@ -208,6 +224,8 @@ class ResolvedChart {
 
     /// 创建渲染器使用的帧内 option。数据集合继续共享，可能被旧
     /// 渲染器修改的 option/series 外壳则复制并与源模型隔离。
+    /// iwid 用 stateWid（connect 组的组长 wid）：渲染器所有交互
+    /// 键（dataZoom/图例/十字线）自动落到组共享的键上。
     ChartOption DrawOption(int wid, bool animate) {
         ChartOption o = ChartOption.Create();
         ChartOption s = this.source;
@@ -230,7 +248,8 @@ class ResolvedChart {
         o.gridTop = s.gridTop; o.gridBottom = s.gridBottom;
         o.zoomStart = s.zoomStart; o.zoomEnd = s.zoomEnd;
         o.windowStart = this.windowStart; o.windowEnd = this.windowEnd;
-        o.backgroundColor = s.backgroundColor; o.iwid = wid;
+        o.backgroundColor = s.backgroundColor; o.iwid = this.stateWid;
+        o.connectGroup = s.connectGroup;
         o.rampColors = s.rampColors; o.rampLo = s.rampLo; o.rampHi = s.rampHi;
         o.radarShape = s.radarShape; o.radarSplitArea = s.radarSplitArea;
         o.legendOrient = s.legendOrient; o.legendSelectedMode = s.legendSelectedMode;
