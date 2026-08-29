@@ -1,0 +1,131 @@
+using System;
+using System.IO;
+using System.IO.Compression;
+using Gui;
+using Gui.Widget;
+
+namespace Conf;
+
+/// QrCode 静态导出（纯 Zan）的可观察行为：PNG 手工组包——签名、
+/// IHDR 尺寸/位深/色彩类型、逐块 CRC32 校验、IDAT 回解出全部扫描线
+/// （filter=0 + RGB 放大）、模块颜色落位；SVG——viewBox、
+/// #rrggbb 颜色、游程合并的 rect 数量。
+class Program {
+    static byte[] png;
+    static QrMatrix mx;
+    static int cell;
+
+    static int Be(byte[] b, int i) {
+        return ((b[i] & 255) * 16777216) + ((b[i + 1] & 255) * 65536)
+            + ((b[i + 2] & 255) * 256) + (b[i + 3] & 255);
+    }
+
+    /// 分块类型的 4 个 ASCII 字节 → 名称（只认走包会用到的三种）。
+    static string ChunkType(byte[] b, int i) {
+        int t0 = b[i] & 255;
+        int t1 = b[i + 1] & 255;
+        int t2 = b[i + 2] & 255;
+        int t3 = b[i + 3] & 255;
+        if (t0 == 73 && t1 == 72 && t2 == 68 && t3 == 82) { return "IHDR"; }
+        if (t0 == 73 && t1 == 68 && t2 == 65 && t3 == 84) { return "IDAT"; }
+        if (t0 == 73 && t1 == 69 && t2 == 78 && t3 == 68) { return "IEND"; }
+        return "?";
+    }
+
+    static void Main() {
+        mx = QrEncoder.Encode("QR-Export", QrEcl.M);
+        int margin = 4;
+        int mods = mx.size + 2 * margin;
+        // 深色 0xFF112233 / 浅色 0xFFEEFF11：故意用可辨识字节验证
+        // 打包序与通道映射。
+        png = QrCode.PngOf(mx, margin, 0xFF112233, 0xFFEEFF11, 0);
+        Console.WriteLine("modules=" + Convert.ToString(mods));
+        // 1) 签名
+        int[] sig = new int[]{ 137, 80, 78, 71, 13, 10, 26, 10 };
+        bool sigOk = true;
+        for (int i = 0; i < 8; i = i + 1) {
+            if ((png[i] & 255) != sig[i]) { sigOk = false; }
+        }
+        Console.WriteLine("sig:" + (sigOk ? "ok" : "BAD"));
+        // 2) 逐块走：IHDR / IDAT / IEND，校验每块 CRC
+        int at = 8;
+        int w = 0;
+        int h = 0;
+        while (at < png.Length) {
+            int len = Be(png, at);
+            string type = ChunkType(png, at + 4);
+            byte[] crcSrc = new byte[4 + len];
+            for (int i = 0; i < 4 + len; i = i + 1) {
+                crcSrc[i] = png[at + 4 + i];
+            }
+            int crcGot = Be(png, at + 8 + len);
+            int crcCal = Crc32.Compute(crcSrc, 0, crcSrc.Length, 0);
+            Console.WriteLine(type + ":"
+                + (crcGot == crcCal ? "crc-ok" : "crc-BAD")
+                + " len=" + Convert.ToString(len));
+            if (type == "IHDR") {
+                w = Be(png, at + 8);
+                h = Be(png, at + 12);
+                Console.WriteLine("ihdr:" + Convert.ToString(w) + "x"
+                    + Convert.ToString(h) + " bd="
+                    + Convert.ToString(png[at + 16] & 255) + " ct="
+                    + Convert.ToString(png[at + 17] & 255));
+            }
+            if (type == "IDAT") {
+                // zlib 头合法性：(CMF*256+FLG) % 31 == 0（外部 zlib 解码
+                // 器首先检查这一条，FCHECK 写成 (256-v)%31 会在此暴露）。
+                int cmf = png[at + 8] & 255;
+                int flg = png[at + 9] & 255;
+                Console.WriteLine("zhdr:" + (((cmf * 256 + flg) % 31) == 0
+                    ? "ok" : "BAD") + " cmf=" + Convert.ToString(cmf)
+                    + " flg=" + Convert.ToString(flg));
+                byte[] comp = new byte[len];
+                for (int i = 0; i < len; i = i + 1) {
+                    comp[i] = png[at + 8 + i];
+                }
+                byte[] raw = Deflate.Inflate(comp, 2, len - 2, 0);
+                bool rowsOk = raw != null && raw.Length == h * (1 + 3 * w);
+                Console.WriteLine("idat:" + (rowsOk ? "rows-ok" : "rows-BAD"));
+                cell = w / mods;
+                // 3) 像素落位：margin 角 = 浅色；finder 中心 = 深色；
+                //    定时行（模块 y=6）深/浅交替。
+                int lr = (0xFFEEFF11 >> 16) & 255;
+                Console.WriteLine("corner:"
+                    + Convert.ToString(raw[1] & 255) + " "
+                    + Convert.ToString(raw[2] & 255) + " "
+                    + Convert.ToString(raw[3] & 255) + " expect:"
+                    + Convert.ToString(lr) + " "
+                    + Convert.ToString((0xFFEEFF11 >> 8) & 255) + " "
+                    + Convert.ToString(0xFFEEFF11 & 255));
+                int fx = (margin + 3) * cell * 3 + 1;
+                int fy = (margin + 3) * (1 + 3 * w);
+                Console.WriteLine("finder:"
+                    + Convert.ToString(raw[fy + fx] & 255) + " "
+                    + Convert.ToString(raw[fy + fx + 1] & 255) + " "
+                    + Convert.ToString(raw[fy + fx + 2] & 255)
+                    + " expect:17 34 51");
+                int ty = (margin + 6) * (1 + 3 * w);
+                int t0 = (margin + 8) * cell * 3 + 1;   // 深
+                int t1 = (margin + 9) * cell * 3 + 1;   // 浅
+                Console.WriteLine("timing:"
+                    + (((raw[ty + t0] & 255) == 0x11
+                        && (raw[ty + t1] & 255) == 0xEE) ? "ok" : "BAD"));
+            }
+            at = at + 12 + len;
+        }
+        // 4) SVG
+        string svg = QrCode.SvgOf(mx, margin, 0xFF112233, 0xFFEEFF11,
+                                  mods * 6);
+        bool head = svg.StartsWith("<svg ") && svg.Contains("viewBox");
+        bool colors = svg.Contains("#112233") && svg.Contains("#eeff11");
+        int rects = 0;
+        for (int i = 0; i + 5 < svg.Length; i = i + 1) {
+            if (svg.Substring(i, 5) == "<rect") { rects = rects + 1; }
+        }
+        Console.WriteLine("svg:" + (head ? "ok" : "BAD")
+            + (colors ? " colors-ok" : " colors-BAD")
+            + " rects=" + Convert.ToString(rects));
+        Console.WriteLine("svgtail:" + (svg.EndsWith("</svg>") ||
+            svg.EndsWith("</svg>\n") ? "ok" : "BAD"));
+    }
+}
