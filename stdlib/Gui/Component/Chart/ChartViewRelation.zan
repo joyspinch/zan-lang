@@ -407,12 +407,41 @@ partial class ChartView {
 
         ForceLayout layout = ChartView.CachedForceLayout(lead.links,
             r, areaW, areaH, lead.forceScaling, lead.forceGravity);
+        // 入场补间：g<1000 时节点位 = 圆周初值 → 终态的线性插值
+        // （ECharts force 的节点收敛入场；同一 ForceLayout 缓存对
+        // 只读插值，幂等安全）。g>=1000 或无初值快照时直接终态。
+        int tweenN = 0;
+        List<int> twX = null;
+        List<int> twY = null;
+        if (g < 1000 && layout.startX != null && layout.startX.Count == layout.nodes.Count) {
+            twX = new List<int>();
+            twY = new List<int>();
+            for (int ti = 0; ti < layout.nodes.Count; ti = ti + 1) {
+                twX.Add(layout.startX[ti] + (layout.nodes[ti].x - layout.startX[ti]) * g / 1000);
+                twY.Add(layout.startY[ti] + (layout.nodes[ti].y - layout.startY[ti]) * g / 1000);
+            }
+            tweenN = twX.Count;
+        }
         // 逐节点形状 + minRadius/maxRadius 权重插值（不改几何，仅
         // symbol/size 元数据，幂等重放，对共享缓存安全）。
         ForceLayout.ApplyShapes(layout, lead.tree,
             app.Scale(lead.forceMinRadius), app.Scale(lead.forceMaxRadius));
         int nn = layout.nodes.Count;
         if (nn < 1) { return; }
+        // 节点屏幕坐标统一出口：补间期 = 圆周初值→终态的线性插值，
+        // 否则终态。（Zan 局部函数不能捕获外层局部量，这里预先
+        // 物化成列表，下面命中/边/节点/标签统一读 px/py。）
+        List<int> px = new List<int>();
+        List<int> py = new List<int>();
+        for (int i = 0; i < nn; i = i + 1) {
+            if (tweenN > 0) {
+                px.Add(ox + twX[i]);
+                py.Add(oy + twY[i]);
+            } else {
+                px.Add(ox + layout.nodes[i].x);
+                py.Add(oy + layout.nodes[i].y);
+            }
+        }
         List<bool> nodeHid = new List<bool>();
         for (int ni = 0; ni < nn; ni = ni + 1) {
             bool h = false;
@@ -438,8 +467,8 @@ partial class ChartView {
             int bestD = 0;
             for (int i = 0; i < nn; i = i + 1) {
                 if (i < nodeHid.Count && nodeHid[i]) { continue; }
-                int ddx = mx - (ox + layout.nodes[i].x);
-                int ddy = my - (oy + layout.nodes[i].y);
+                int ddx = mx - px[i];
+                int ddy = my - py[i];
                 int d2 = ddx * ddx + ddy * ddy;
                 int rad = app.Scale(6);
                 if (d2 <= rad * rad) {
@@ -458,8 +487,8 @@ partial class ChartView {
             int col = linkCol0;
             if (col == 0) { col = Chart.Palette(t, e.a); }
             int w2 = 1 + app.Scale(2) * e.val / maxVal;
-            c.DrawLine(ox + layout.nodes[e.a].x, oy + layout.nodes[e.a].y,
-                ox + layout.nodes[e.b].x, oy + layout.nodes[e.b].y,
+            c.DrawLine(px[e.a], py[e.a],
+                px[e.b], py[e.b],
                 Chart.WithAlpha(col, alpha), w2);
         }
         if (hoverNode >= 0) {
@@ -468,8 +497,8 @@ partial class ChartView {
                 if (e.a != hoverNode && e.b != hoverNode) { continue; }
                 int col = linkCol0;
                 if (col == 0) { col = Chart.Palette(t, e.a); }
-                c.DrawLine(ox + layout.nodes[e.a].x, oy + layout.nodes[e.a].y,
-                    ox + layout.nodes[e.b].x, oy + layout.nodes[e.b].y,
+                c.DrawLine(px[e.a], py[e.a],
+                    px[e.b], py[e.b],
                     col, app.Scale(3));
             }
         }
@@ -484,12 +513,12 @@ partial class ChartView {
             if (col == 0) { col = Chart.Palette(t, i); }
             int nr = nodeR;
             if (nd.size > 0) { nr = app.Scale(nd.size) / 2; }
-            Chart.DrawSymbol(c, ox + nd.x, oy + nd.y, nr, nd.symbol, col,
+            Chart.DrawSymbol(c, px[i], py[i], nr, nd.symbol, col,
                 4294967295, app.Scale(1));
             string nm = nd.name;
             int tw = Canvas.MeasureText(nm, Style.FontFallback(app, "small"));
             int fs = Style.FontFallback(app, "small");
-            ChartView.DrawTextClamped(c, ox + nd.x - tw / 2, oy + nd.y + nr + app.Scale(3),
+            ChartView.DrawTextClamped(c, px[i] - tw / 2, py[i] + nr + app.Scale(3),
                 nm,
                 Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0),
                 fs, ox, oy, areaW, areaH);
