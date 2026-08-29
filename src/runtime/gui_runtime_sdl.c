@@ -1110,6 +1110,13 @@ EXPORT const char *zan_gui_get_clipboard(void) {
     return g_clip_buf;
 }
 
+/* Non-destructive peek: 1 while paths from a completed drop remain
+ * queued for zan_gui_drop_take. Kind 9 doubles as blur on some
+ * backends, so apps use this to tell a real file drop apart. */
+EXPORT int zan_gui_drop_pending(void) {
+    return g_drop_head != g_drop_tail ? 1 : 0;
+}
+
 /* Pops the oldest path dropped on a window, or "" when the queue is empty.
  * The returned buffer stays valid until the next call. */
 EXPORT const char *zan_gui_drop_take(void) {
