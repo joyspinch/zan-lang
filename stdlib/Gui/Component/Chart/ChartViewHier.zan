@@ -12,8 +12,8 @@ class WordCloudItem {
     int h;
     int fontSize;
     int color;
-    // 旋转角（0/90，ECharts wordCloud.rotateRange 的 0/90 两态）；
-    // 旋转项的 x/y/w/h 存的是旋转后的包围盒。
+    // 旋转角（度，0/90 来自 ECharts rotateRange 的两态，自定义角度集
+    // 由 wcRotateList 提供）；旋转项的 x/y/w/h 存的是旋转后的包围盒。
     int rot;
 
     static WordCloudItem Of(ChartData data, int x, int y, int w, int h,
@@ -665,9 +665,12 @@ partial class ChartView {
         if (maxFs > aw / 6) { maxFs = aw / 6; }
         if (maxFs < minFs) { maxFs = minFs; }
         bool vary = lead != null && lead.wcRotate == "vary";
+        string rotList = lead != null ? lead.wcRotateList : "";
+        if (rotList == "0") { rotList = ""; }   // 单一 0° = 不旋转，等同空
+        if (rotList.Length > 0) { vary = false; }
 
         int wfp = ChartView.WordCloudFingerprint(lead.data, aw, ah, minFs, maxFs,
-            vary ? 1 : 0);
+            vary ? 1 : 0 + ChartView.WordCloudRotListKey(rotList));
         if (ChartView.wcCache == null) {
             ChartView.wcCache = new List<WordCloudCacheEntry>();
         }
@@ -677,7 +680,7 @@ partial class ChartView {
 
         if (placed == null) {
             placed = ChartView.PlaceWordCloud(app, t, lead.data, aw, ah,
-                minFs, maxFs, maxV, vary);
+                minFs, maxFs, maxV, vary, rotList);
             WordCloudCacheEntry.Store(ChartView.wcCache, wfp, placed, 4);
         }
 
@@ -702,11 +705,23 @@ partial class ChartView {
 
     /// 阿基米德螺旋放置：字号按权重，放不下就缩小，坐标相对绘图区。
     /// vary 为真时奇数词条旋转 90°（ECharts wordCloud rotateRange
-    /// 的 0/90 两态；随机角度非确定性，故不取随机），其包围盒按
-    /// 旋转后宽高交换登记，碰撞检测与裁剪都用包围盒。
+    /// 的 0/90 两态）；rotList 非空时按词条序号对角度集取模轮转
+    /// （ECharts textRotation 数组的确定性取法——随机/任意角度会破坏
+    /// 布局缓存与截图回归，角度仍限于 ±90 内由 DrawTextRot 支持）。
+    /// 旋转项的包围盒按 |sin|/|cos| 投影计算（非 90° 角不再简单交换
+    /// 宽高），碰撞检测与裁剪都用包围盒。
     static List<WordCloudItem> PlaceWordCloud(App app, Theme t, List<ChartData> src,
                                               int aw, int ah, int minFs, int maxFs,
-                                              int maxV, bool vary) {
+                                              int maxV, bool vary, string rotList) {
+        List<int> angles = new List<int>();
+        if (rotList != null && rotList.Length > 0) {
+            List<string> parts = rotList.Split(',');
+            for (int pi = 0; pi < parts.Count; pi = pi + 1) {
+                int deg = Convert.ToInt32(parts[pi].Trim());
+                if (deg != 0) { angles.Add(deg); }
+            }
+            if (angles.Count == 0) { angles.Add(0); }
+        }
         List<ChartData> words = new List<ChartData>();
         for (int i = 0; i < src.Count; i = i + 1) { words.Add(src[i]); }
         for (int a = 0; a < words.Count; a = a + 1) {
@@ -731,16 +746,29 @@ partial class ChartView {
             int fs = minFs + (maxFs - minFs) * word.val / maxV;
             int color = word.color;
             if (color == 0) { color = Chart.Palette(t, wi); }
-            bool rot = vary && wi % 2 == 1;
-            int rotDeg = rot ? 90 : 0;
+            int rotDeg = 0;
+            if (angles.Count > 0) {
+                rotDeg = angles[wi % angles.Count];
+            } else if (vary && wi % 2 == 1) {
+                rotDeg = 90;
+            }
+            // 非零角度的占位盒：文本行绕锚点刚性旋转后的轴对齐包围盒。
+            // 90° 即宽高交换；其余角度按 |sin|/|cos| 投影（DrawTextRot
+            // 钳制 ±90，sin/cos 用同一张千分表）。
+            bool rot = rotDeg != 0;
+            int ad = rotDeg < 0 ? 0 - rotDeg : rotDeg;
+            int sPct = ChartView.SinDeg(ad);
+            int cPct = ChartView.CosDeg(ad);
             bool done = false;
             int shrink = 0;
             while (!done && shrink < 10) {
                 int tw = Canvas.MeasureText(word.name, fs) + app.Scale(6);
                 int th = Canvas.FontHeight(fs) + app.Scale(2);
-                // 旋转项占位盒宽高交换（90° 刚体旋转后的包围盒）。
-                int bw = rot ? th : tw;
-                int bh = rot ? tw : th;
+                // 旋转项占位盒 = 原行绕锚点旋转后的轴对齐包围盒。
+                int bw = rot ? (tw * cPct + th * sPct) / 1000 : tw;
+                int bh = rot ? (tw * sPct + th * cPct) / 1000 : th;
+                if (bw < 1) { bw = 1; }
+                if (bh < 1) { bh = 1; }
                 if (bw > aw - 2) {
                     if (fs <= minFs) { done = true; }
                     else { fs = fs - 2; if (fs < minFs) { fs = minFs; } }
@@ -793,6 +821,16 @@ partial class ChartView {
             fp = (fp * 31 + data[i].val) % 2000000000;
         }
         return fp;
+    }
+
+    /// 自定义角度集的指纹成分："0,45,-45" → 稳定小整数（空串 = 0）。
+    static int WordCloudRotListKey(string rotList) {
+        if (rotList == null || rotList.Length == 0) { return 0; }
+        int h = 977;
+        for (int i = 0; i < rotList.Length; i = i + 1) {
+            h = (h * 31 + rotList[i]) % 997;
+        }
+        return h + 2;
     }
 
     // 词云布局缓存：指纹 → 放置结果（小容量，见 WordCloudCacheEntry）。
