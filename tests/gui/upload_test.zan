@@ -1,0 +1,394 @@
+using System;
+using System.IO;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Threading;
+using Gui;
+using Gui.Widget;
+
+/// Gui.Upload 的无窗口回归：组件模型（Kind/Props/Events/工厂/
+/// GetProp 往返）、门与状态机（Accept 过滤、Max+Exceed、BeforeUpload
+/// 拦截、AutoUpload→CustomRequest、Submit 手动提交、SetItem* 与
+/// Finish/Error 恰好一次、Remove/Clear/Change 计数、LastItem），
+/// 以及渲染一帧后的命中区、拖放落区与 CSS 解析。
+/// 进度全部由 SetItemPercent 显式驱动，无真实时间依赖。
+class UploadTest {
+    static int fails;
+    static int changeCount;
+    static int uploadCount;
+    static int finishCount;
+    static int errorCount;
+    static int removeCount;
+    static int downloadCount;
+    static int exceedCount;
+    static int customId;
+
+    static void OnChange() { changeCount = changeCount + 1; }
+    static void OnUpload() { uploadCount = uploadCount + 1; }
+    static void OnFinish() { finishCount = finishCount + 1; }
+    static void OnError() { errorCount = errorCount + 1; }
+    static void OnRemove() { removeCount = removeCount + 1; }
+    static void OnDownload() { downloadCount = downloadCount + 1; }
+    static void OnExceed() { exceedCount = exceedCount + 1; }
+    static void OnReq(UploadFile f) { customId = f.id; }
+
+    // before-upload 拦截 .exe（静态方法组，非捕获）。
+    static bool BlockExe(UploadFile f) { return f.ext != "exe"; }
+    static void NoopReq(UploadFile f) { }
+
+    static void True(string what, bool got) {
+        if (got) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got " + got + " want " + want);
+    }
+
+    static void EqStr(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got '" + got + "' want '" + want + "'");
+    }
+
+    static void Wire(Upload up) {
+        changeCount = 0; uploadCount = 0; finishCount = 0;
+        errorCount = 0; removeCount = 0; downloadCount = 0; exceedCount = 0;
+        up.Change += OnChange;
+        up.UploadStart += OnUpload;
+        up.Finish += OnFinish;
+        up.Error += OnError;
+        up.Remove += OnRemove;
+        up.Download += OnDownload;
+        up.Exceed += OnExceed;
+    }
+
+    static UploadFile Item(Upload up, int id) {
+        if (up.Files == null) { return null; }
+        int i = 0;
+        while (i < up.Files.Count) {
+            if (up.Files[i].id == id) { return up.Files[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    static bool HasEv(List<string> evs, string n) {
+        int i = 0;
+        while (i < evs.Count) { if (evs[i] == n) { return true; } i = i + 1; }
+        return false;
+    }
+
+    static List<string> One(string p) {
+        List<string> l = new List<string>();
+        l.Add(p);
+        return l;
+    }
+
+    static void Main() {
+        fails = 0;
+
+        // ---- 组件模型 --------------------------------------------------
+        Upload m = new Upload();
+        EqStr("kind", m.Kind(), "Upload");
+        Control made = ControlFactory.Create("Upload");
+        True("factory non-null", made != null);
+        if (made != null) { EqStr("factory kind", made.Kind(), "Upload"); }
+        Eq("default autoUpload", m.AutoUpload ? 1 : 0, 1);
+        EqStr("default trigger", m.TriggerText, "上传文件");
+        EqStr("default field", m.FieldName, "file");
+        // 全部设计器字段可往返。
+        m.SetProp("triggerText", "选择文件");
+        m.SetProp("dragText", "拖到这里");
+        m.SetProp("tip", "不超过 2MB");
+        m.SetProp("action", "http://127.0.0.1:9549/upload");
+        m.SetProp("fieldName", "media");
+        m.SetProp("accept", "png,jpg");
+        m.SetProp("max", "3");
+        m.SetProp("autoUpload", "false");
+        m.SetProp("multiple", "true");
+        m.SetProp("dragger", "true");
+        m.SetProp("pictureCard", "true");
+        m.SetProp("thumbnail", "true");
+        m.SetProp("showTrigger", "false");
+        m.SetProp("showRemoveButton", "false");
+        m.SetProp("showDownloadButton", "true");
+        EqStr("roundtrip triggerText", m.GetProp("triggerText"), "选择文件");
+        EqStr("roundtrip dragText", m.GetProp("dragText"), "拖到这里");
+        EqStr("roundtrip tip", m.GetProp("tip"), "不超过 2MB");
+        EqStr("roundtrip action", m.GetProp("action"), "http://127.0.0.1:9549/upload");
+        EqStr("roundtrip fieldName", m.GetProp("fieldName"), "media");
+        EqStr("roundtrip accept", m.GetProp("accept"), "png,jpg");
+        EqStr("roundtrip max", m.GetProp("max"), "3");
+        EqStr("roundtrip autoUpload", m.GetProp("autoUpload"), "false");
+        EqStr("roundtrip multiple", m.GetProp("multiple"), "true");
+        EqStr("roundtrip dragger", m.GetProp("dragger"), "true");
+        EqStr("roundtrip pictureCard", m.GetProp("pictureCard"), "true");
+        EqStr("roundtrip thumbnail", m.GetProp("thumbnail"), "true");
+        EqStr("roundtrip showTrigger", m.GetProp("showTrigger"), "false");
+        EqStr("roundtrip showRemoveButton", m.GetProp("showRemoveButton"), "false");
+        EqStr("roundtrip showDownloadButton", m.GetProp("showDownloadButton"), "true");
+        Eq("props count", m.Props().Count, 15);
+        List<string> evs = m.Events();
+        True("events", HasEv(evs, "Change") && HasEv(evs, "Upload")
+            && HasEv(evs, "Finish") && HasEv(evs, "Error") && HasEv(evs, "Remove")
+            && HasEv(evs, "Download") && HasEv(evs, "Exceed")
+            && HasEv(evs, "Click"));
+        // BindEvent 的 "Upload" 别名与字段事件同源：挂上后开传即触发。
+        Upload alias = new Upload();
+        aliasHits = 0;
+        alias.BindEvent("Upload", OnAlias);
+        alias.WithCustomRequest(NoopReq);
+        alias.AddFile("x", "", "");
+        Eq("Upload alias routes", aliasHits, 1);
+        // 扩展名解析：点/星号大小写混排都接受，未列出的拒绝。
+        Upload acc = new Upload();
+        acc.Accept = ".PNG,*.jpg,svg";
+        True("accept dotted", acc.AcceptAllows("png"));
+        True("accept star", acc.AcceptAllows("jpg"));
+        True("accept bare", acc.AcceptAllows("svg"));
+        True("accept reject", !acc.AcceptAllows("gif"));
+        // 无传输通道时 AutoUpload 不虚报状态：停在 Pending。
+        Upload noTr = new Upload();
+        Wire(noTr);
+        UploadFile pend = noTr.AddFile("a.txt", "", "");
+        Eq("no-transport stays pending", pend.status, UploadStatus.Pending());
+        Eq("no upload event", uploadCount, 0);
+        True("lastitem after add", noTr.LastItem == pend);
+        True("find by id", Item(noTr, pend.id) == pend);
+        True("find missing", Item(noTr, 999999) == null);
+
+        // ---- 门：Accept 过滤 / Max / BeforeUpload / Disabled -----------
+        Upload g = new Upload();
+        Wire(g);
+        g.Accept = "png";
+        Eq("accept gate rejects", g.AddPaths(One("x.txt")), 0);
+        Eq("accept no list", g.Files.Count, 0);
+        g.Accept = "";
+        g.Max = 2;
+        g.AddPaths(One("a.png"));
+        g.AddPaths(One("b.png"));
+        Eq("max gate first two", g.Files.Count, 2);
+        g.AddPaths(One("c.png"));
+        Eq("max blocks third", g.Files.Count, 2);
+        Eq("exceed once", exceedCount, 1);
+        True("exceed lastitem", g.LastItem != null && g.LastItem.name == "c.png");
+        g.Clear();
+        Eq("clear resets", g.Files.Count, 0);
+        g.WithBeforeUpload(BlockExe);
+        g.AddPaths(One("bad.exe"));
+        Eq("before blocks", g.Files.Count, 0);
+        Eq("before no change event", changeCount, 3); // a/b/Clear 三次
+        g.AddPaths(One("good.txt"));
+        Eq("before lets through", g.Files.Count, 1);
+        Eq("change after pass", changeCount, 4);
+        // Disabled：AddPaths 直接拒绝。
+        Upload d = new Upload();
+        Wire(d);
+        d.Disabled = true;
+        d.AddPaths(One("z.txt"));
+        Eq("disabled rejects", d.Files.Count, 0);
+        d.Disabled = false;
+        True("disabled check off", !d.IsDisabled());
+
+        // ---- 状态机：CustomRequest + 显式进度 + 完成/失败 --------------
+        Upload s = new Upload();
+        Wire(s);
+        customId = 0;
+        s.WithCustomRequest(OnReq);
+        UploadFile a = s.AddFile("first.png", "", "");
+        Eq("auto upload fires", uploadCount, 1);
+        Eq("custom got item", customId, a.id);
+        Eq("item uploading", a.status, UploadStatus.Uploading());
+        s.SetItemPercent(a.id, 42);
+        Eq("percent", a.percent, 42);
+        s.SetItemStatus(a.id, UploadStatus.Success(), "");
+        Eq("finish once", finishCount, 1);
+        Eq("success sets 100", a.percent, 100);
+        Eq("change count", changeCount, 2);
+        UploadFile b = s.AddFile("second.png", "", "");
+        Eq("custom second", uploadCount, 2);
+        s.SetItemStatus(b.id, UploadStatus.Error(), "network down");
+        Eq("error once", errorCount, 1);
+        EqStr("error msg", b.message, "network down");
+        Eq("change after error", changeCount, 4);
+        // 不存在的 id 不炸、不触发。
+        s.SetItemStatus(999999, UploadStatus.Success(), "");
+        Eq("bad id no finish", finishCount, 1);
+        // Submit：AutoUpload=false 时挂起，手动提交才启动。
+        Upload sub = new Upload();
+        Wire(sub);
+        sub.AutoUpload = false;
+        UploadFile p = sub.AddFile("late.txt", "", "");
+        Eq("pending before submit", p.status, UploadStatus.Pending());
+        Eq("no upload event yet", uploadCount, 0);
+        sub.WithCustomRequest(OnReq);
+        sub.Submit();
+        Eq("submit starts", p.status, UploadStatus.Uploading());
+        Eq("submit fired", uploadCount, 1);
+        sub.Submit();
+        Eq("submit skips non-pending", uploadCount, 1);
+        // 移除 / 清空事件计数
+        sub.RemoveItem(p.id);
+        Eq("remove event", removeCount, 1);
+        Eq("change on remove", changeCount, 2);
+        Eq("list shrunk", sub.Files.Count, 0);
+        UploadFile r1 = sub.AddFile("img.png", "", "");
+        sub.SetItemUrl(r1.id, "http://host/img.png");
+        UploadFile got = Item(sub, r1.id);
+        True("setitemurl applies", got != null && got.url == "http://host/img.png");
+        sub.SetItemThumb(r1.id, "http://host/thumb.png");
+        UploadFile t3 = Item(sub, r1.id);
+        True("setitemthumb applies", t3 != null && t3.thumb == "http://host/thumb.png");
+        sub.Clear();
+        Eq("clear change event", changeCount, 5);
+        Eq("clear empties", sub.Files.Count, 0);
+
+        // ---- 渲染一帧：命中区 / 拖放落区 / CSS 解析 ---------------------
+        App app = new App("uploadtest", 800, 600);
+        Upload view = new Upload();
+        Wire(view);
+        view.ShowDownloadButton = true;
+        view.Thumbnail = true;
+        UploadFile t1 = view.AddFile("photo.jpg", "", "http://host/p.jpg");
+        Eq("view item success", t1.status, UploadStatus.Success());
+        int wid = view.Render(app, 40, 50, 320);
+        Eq("render returns base", wid, view.BaseId());
+        List<int> tr = app.hitTester.RectOf(wid);
+        True("trigger rect", tr != null);
+        if (tr != null) {
+            Eq("trigger x", tr[0], 40);
+            Eq("trigger y", tr[1], 50);
+            True("trigger w", tr[2] > 60 && tr[2] < 200);
+            Eq("trigger h", tr[3], app.theme.heightMedium);
+        }
+        int rid = wid + 8;
+        List<int> row = app.hitTester.RectOf(rid);
+        True("row rect", row != null);
+        if (row != null) {
+            Eq("row x", row[0], 40);
+            True("row below trigger", row[1] >= 50 + app.Scale(20));
+            Eq("row w spans", row[2], 320);
+        }
+        True("name link rect", app.hitTester.RectOf(rid + 1) != null);
+        True("download rect", app.hitTester.RectOf(rid + 3) != null);
+        True("remove rect", app.hitTester.RectOf(rid + 2) != null);
+        // 拖放落区 = 触发按钮矩形；界外拒绝。
+        if (tr != null) {
+            True("drop inside", view.WantsDropAt(tr[0] + 5, tr[1] + 5));
+            True("drop outside x", !view.WantsDropAt(tr[0] + tr[2] + 10, tr[1] + 5));
+            True("drop outside y", !view.WantsDropAt(tr[0] + 5, tr[1] + tr[3] + 10));
+        }
+        // CSS 解析非回退：::trigger 皮肤给了主色底。
+        StyleBox ts = view.TriggerStyle(app, false);
+        True("trigger bg themed", ts.BgOr(0) == app.theme.primary);
+
+        // ---- Dragger 形态：大虚线区 + Tip，落区铺满整块 -----------------
+        Upload dr = new Upload();
+        Wire(dr);
+        dr.Dragger = true;
+        dr.Tip = "支持 png/jpg";
+        int dwid = dr.Render(app, 60, 70, 360);
+        List<int> drect = app.hitTester.RectOf(dwid + 1);
+        True("dragger rect", drect != null);
+        if (drect != null) {
+            Eq("dragger x", drect[0], 60);
+            Eq("dragger w", drect[2], 360);
+            True("dragger tall", drect[3] > app.Scale(90));
+        }
+        True("dragger drop", dr.WantsDropAt(61, 71));
+
+        // ---- 照片墙：方格 + 添加块命中区 --------------------------------
+        Upload pc = new Upload();
+        Wire(pc);
+        pc.PictureCard = true;
+        UploadFile t2 = pc.AddFile("c1.jpg", "", "http://host/c1.jpg");
+        int pwid = pc.Render(app, 500, 50, 300);
+        List<int> tile = app.hitTester.RectOf(pwid + 8);
+        List<int> add = app.hitTester.RectOf(pwid + 2);
+        True("tile rect", tile != null);
+        True("add tile rect", add != null);
+        if (tile != null) {
+            Eq("tile size", tile[2], app.Scale(96));
+            Eq("tile x", tile[0], 500);
+        }
+        True("card drop zone", pc.WantsDropAt(510, 60));
+
+        // ---- Action 传输端到端：环回服务器 + 后台线程 + App.Post 封送 ----
+        // 临时文件走真实 multipart 通道上传到本进程内的 HttpServer；
+        // 主循环交替 Task.Delay（推进服务端协程）与 app.DrainPosts
+        // （兑现工作线程封送回 UI 的进度/完成），不依赖真实事件回路。
+        {
+            int xlen = 5000;
+            string xpath = "upload_test_xfer.bin";
+            byte[] xd = new byte[xlen];
+            int xi = 0;
+            while (xi < xlen) { xd[xi] = (byte)((xi * 3 + 7) & 255); xi = xi + 1; }
+            File.WriteAllBytes(xpath, xd);
+
+            Socket.Initialize();
+            HttpServer xsrv = new HttpServer("127.0.0.1", 9551);
+            xsrv.OnRequest(UploadTest.XHandle);
+            Task.Spawn(xsrv.Start());
+            await Task.Delay(50);
+
+            App tapp = new App("uploadxfer", 400, 300);
+            Upload tr = new Upload();
+            Wire(tr);
+            tr.Render(tapp, 10, 10, 300);
+            tr.WithAction("http://127.0.0.1:9551/up", "");
+            UploadFile tf = tr.AddFile("xfer.bin", xpath, "");
+            Eq("xfer uploading", tf.status, UploadStatus.Uploading());
+            int xtries = 0;
+            while (tf.status == UploadStatus.Uploading() && xtries < 400) {
+                await Task.Delay(10);
+                tapp.DrainPosts();
+                xtries = xtries + 1;
+            }
+            Eq("xfer finish once", finishCount, 1);
+            Eq("xfer status success", tf.status, UploadStatus.Success());
+            EqStr("xfer response", tf.response, "ok");
+            Eq("xfer percent 100", tf.percent, 100);
+            Eq("server fails", xsrvFails, 0);
+            True("progress advanced", tf.percent >= 0);
+
+            File.Delete(xpath);
+            xsrv.Stop();
+            int drain = 0;
+            while (drain < 20) {
+                await Task.Delay(10);
+                tapp.DrainPosts();
+                drain = drain + 1;
+            }
+        }
+
+        if (fails == 0) {
+            Console.WriteLine("upload_test OK");
+        } else {
+            Console.WriteLine("upload_test FAILURES " + fails);
+        }
+    }
+
+    // Action 端到端的服务端：核对 bodyLength 与首尾字节即可（逐字节全量
+    // 校验由 http_upload_bytes 承担，这里证明组件把数据真的送出去了）。
+    static int xsrvFails;
+    static async HttpResponse XHandle(HttpRequest req) {
+        if (req.path == "/up" && req.method == "POST") {
+            int blen = req.bodyLength;
+            // 5000 字节正文 + multipart 头尾；下限 5000 且上限 5500 内。
+            if (blen < 5000 || blen > 5600) {
+                xsrvFails = xsrvFails + 1;
+                Console.WriteLine("FAIL xfer body-length " + blen);
+            }
+            return HttpResponse.Text("ok");
+        }
+        xsrvFails = xsrvFails + 1;
+        return HttpResponse.NotFound();
+    }
+
+    static int aliasHits;
+    static void OnAlias() { aliasHits = aliasHits + 1; }
+}

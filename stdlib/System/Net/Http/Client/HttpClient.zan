@@ -11,6 +11,11 @@ namespace System.Net.Http.Client;
 /// 见 <see cref="HttpClient.SetCancelProbe"/>。</summary>
 delegate bool HttpCancelFn();
 
+/// <summary>上传进度探针：随字节上线推进（sentBytes/totalBytes）。
+/// 在传输所在的 worker 线程上回调，GUI 调用方需自行封送回 UI 线程。
+/// 见 <see cref="HttpClient.SetUploadProbe"/>。</summary>
+delegate void HttpUploadProgressFn(int sentBytes, int totalBytes);
+
 /// <summary>
 /// HTTP 客户端，支持 GET、POST、PUT、DELETE，走纯 TCP 或 TLS
 /// （通过 CreateHttps / UseTls 使用 https）。
@@ -67,6 +72,8 @@ class HttpClient {
     CookieJar jar;
     // 取消探针；null = 不可取消（见 SetCancelProbe）。
     HttpCancelFn cancelProbe;
+    // 上传进度探针；null = 不报进度（见 SetUploadProbe）。
+    HttpUploadProgressFn uploadProbe;
     string lastDownloadError;
     // ---- keep-alive 连接复用（见 RequestAliveAsync）----
     HttpFramer ka;        // 非空 = 池中有一条空闲可复用的连接
@@ -193,6 +200,23 @@ class HttpClient {
     HttpClient SetCancelProbe(HttpCancelFn f) {
         this.cancelProbe = f;
         return this;
+    }
+
+    /// <summary>安装上传进度探针：请求正文（头部、文件分块、尾部）
+    /// 每上线一段就回调一次（sentBytes/totalBytes，二者与
+    /// Content-Length 取自同一处）。探针在驱动请求的线程上被调用
+    /// （上传跑在工作线程时就是工作线程），只应更新共享进度并封送
+    /// 回 UI，不要在里面做别的事。目前 <see cref="UploadFileBytesAsync"/>
+    /// 汇报进度；其余请求不装探针。</summary>
+    HttpClient SetUploadProbe(HttpUploadProgressFn f) {
+        this.uploadProbe = f;
+        return this;
+    }
+
+    // 探针非空时上报一次进度；装探针的调用点在发送循环里，成本只有
+    // 一次空判 + 一次委托调用。
+    void UploadTick(int sentBytes, int totalBytes) {
+        if (this.uploadProbe != null) { this.uploadProbe(sentBytes, totalBytes); }
     }
 
     /// <summary>最近一次二进制下载失败的阶段诊断；成功或尚未下载时为空。</summary>
@@ -327,7 +351,13 @@ class HttpClient {
     // 构建原始 HTTP/1.1 请求文本。<paramref name="close"/> 选择帧结构：
     // true 发 Connection: close 并读至对端关闭（读至 EOF 的调用方）；
     // false 发 Connection: keep-alive，供连接复用路径使用。
-    string BuildRequest(string method, string path, string body, bool close) {
+    // 请求头部半区：请求行 + Host + 默认头 + Content-Length +
+    // Cookie + Connection + 空行。bodyLen <= 0 时不写 Content-Length，
+    // 与旧 BuildRequest 的空正文行为一致。二进制正文的调用方
+    // （SendBytesBodyAsync/SendBytesBodyTlsAsync）拿到头部后把
+    // 文件字节单独按显式长度发送。
+    string BuildRequestHead(string method, string path, int bodyLen,
+                            bool close) {
         StringBuilder sb = new StringBuilder();
         sb.Append(method);
         sb.Append(" ");
@@ -342,9 +372,9 @@ class HttpClient {
             sb.Append("\r\n");
         }
 
-        if (body.Length > 0) {
+        if (bodyLen > 0) {
             sb.Append("Content-Length: ");
-            sb.Append(Convert.ToString(body.Length));
+            sb.Append(Convert.ToString(bodyLen));
             sb.Append("\r\n");
             // 仅当调用者尚未设置 Content-Type 时才使用
             // 默认表单编码（微信 custom/send 等 JSON API 需要 application/json）。
@@ -368,10 +398,15 @@ class HttpClient {
             sb.Append("Connection: keep-alive\r\n");
         }
         sb.Append("\r\n");
-        if (body.Length > 0) {
-            sb.Append(body);
-        }
         return sb.ToString();
+    }
+
+    string BuildRequest(string method, string path, string body, bool close) {
+        string head = this.BuildRequestHead(method, path, body.Length, close);
+        if (body.Length > 0) {
+            return head + body;
+        }
+        return head;
     }
 
     // 把响应里的 Set-Cookie 交给存储。未启用 cookie 时什么都不做，
@@ -779,12 +814,14 @@ class HttpClient {
     }
 
     /// <summary>二进制安全的一次性请求。通道与 <see cref="SendAsync"/>
-    /// 相同（Connection: close，读至对端关闭或定界完成），但响应全程按
+    /// 相同（Connection: close，读至对端关闭或定界完成），但请求正文
+    /// 按显式字节长度发送（strlen 定长的发送会在内嵌 NUL 处截断，
+    /// TLS 变体本就按 req.Length 发送，这里对齐），响应全程按
     /// 显式字节数组装（<see cref="HttpFramer"/> + ByteBuffer）：
     /// 正文里的 NUL 不会把响应截断，结果的 bodyBytes/bodyBytesLen
     /// 有效，<see cref="HttpResponse.IsBinary"/> 与
     /// <see cref="HttpResponse.BodyLength"/> 据此工作。适合图片、
-    /// 字体等二进制资源的下载；文本响应照常可用 body 读取。</summary>
+    /// 字体等二进制资源的下载与上传；文本响应照常可用 body 读取。</summary>
     async HttpResponse SendBytesAsync(string method, string path, string body) {
         if (this.useTls) {
             HttpResponse tResp = await this.SendBytesTlsAsync(method, path,
@@ -796,24 +833,37 @@ class HttpClient {
         if (conn == null) { FailConnect(); }
         int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
         string req = this.BuildRequest(method, path, body, true);
-        int _sent = await conn.SendAsync(req);
-        HttpFramer fr = HttpFramer.Create(conn.Sock());
+        int _sent = await conn.SendBytesAsync(req, req.Length);
+        HttpResponse resp = await this.ReadFramedResponse(conn, path, method,
+                                                          watch, null, null);
+        return resp;
+    }
+
+    // SendBytesAsync / SendBytesTlsAsync / SendBytesBodyAsync 共用的
+    // 响应读取：从已发出请求的连接上按 HttpFramer 组装解析后的响应，
+    // 超时/对端关闭/超限走异常路径。stream/ctx 非 null 表示 TLS 通道，
+    // 清理时随连接一并关闭。（throw 不释放存活局部变量的缺陷已由
+    // A8-3/A8-12 修复，不再需要 throw 前逐个置空的历史卫生。）
+    async HttpResponse ReadFramedResponse(TcpClient conn, string path,
+            string method, int watch, TlsStream stream, TlsContext ctx) {
+        HttpFramer fr;
+        if (stream != null) {
+            fr = HttpFramer.CreateTls(stream);
+        } else {
+            fr = HttpFramer.Create(conn.Sock());
+        }
         int he = await fr.ReadHead(65536);
         if (he == 0) {
             bool lateHead = HttpDeadline.Expired(watch);
             HttpDeadline.Disarm(watch);
-            fr.Dispose();
-            conn.Close();
-            req = "";
+            this.CloseChannel(conn, fr, stream, ctx);
             if (lateHead) { FailTimeout(); }
             throw new HttpRequestException(
                 "connection closed before a response arrived");
         }
         if (he < 0) {
             HttpDeadline.Disarm(watch);
-            fr.Dispose();
-            conn.Close();
-            req = "";
+            this.CloseChannel(conn, fr, stream, ctx);
             throw new HttpRequestException(
                 "response header block exceeds 65536 bytes");
         }
@@ -828,29 +878,20 @@ class HttpClient {
                 if (st == -1) {
                     bool lateBody = HttpDeadline.Expired(watch);
                     HttpDeadline.Disarm(watch);
-                    fr.Dispose();
-                    conn.Close();
-                    req = "";
-                    head = "";
+                    this.CloseChannel(conn, fr, stream, ctx);
                     if (lateBody) { FailTimeout(); }
                     throw new HttpRequestException(
                         "connection closed in the middle of the response body");
                 }
                 if (st == 413) {
                     HttpDeadline.Disarm(watch);
-                    fr.Dispose();
-                    conn.Close();
-                    req = "";
-                    head = "";
+                    this.CloseChannel(conn, fr, stream, ctx);
                     throw new HttpRequestException(
                         "response body exceeds 67108864 bytes");
                 }
                 if (st != 0) {
                     HttpDeadline.Disarm(watch);
-                    fr.Dispose();
-                    conn.Close();
-                    req = "";
-                    head = "";
+                    this.CloseChannel(conn, fr, stream, ctx);
                     throw new HttpRequestException(
                         "malformed chunked response body");
                 }
@@ -895,16 +936,23 @@ class HttpClient {
         }
         bool late = HttpDeadline.Expired(watch);
         HttpDeadline.Disarm(watch);
-        fr.Dispose();
-        conn.Close();
-        req = "";
+        this.CloseChannel(conn, fr, stream, ctx);
         if (late) {
-            head = "";
             FailTimeout();
         }
         this.AbsorbCookies(path, head);
-        head = "";
         return resp;
+    }
+
+    // 响应读取后的统一通道清理：先拆 framer，再关 TLS 流（如有）、
+    // 连接，最后释放 TLS 上下文——与既有各变体的清理次序一致。
+    // fr 允许为 null（请求尚未发完就放弃时还没有 framer）。
+    void CloseChannel(TcpClient conn, HttpFramer fr, TlsStream stream,
+                      TlsContext ctx) {
+        if (fr != null) { fr.Dispose(); }
+        if (stream != null) { stream.Close(); }
+        conn.Close();
+        if (ctx != null) { ctx.Free(); }
     }
 
     // SendBytesAsync 的 TLS 变体：握手与一次性通道一致，只是读取
@@ -951,121 +999,114 @@ class HttpClient {
         int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
         string req = this.BuildRequest(method, path, body, true);
         int _sent = await stream.SendAsync(req, req.Length);
-        HttpFramer fr = HttpFramer.CreateTls(stream);
-        int he = await fr.ReadHead(65536);
-        if (he == 0) {
-            bool lateHead = HttpDeadline.Expired(watch);
-            HttpDeadline.Disarm(watch);
-            fr.Dispose();
-            stream.Close();
-            conn.Close();
-            ctx.Free();
-            req = "";
-            if (lateHead) { FailTimeout(); }
-            throw new HttpRequestException(
-                "connection closed before a response arrived");
-        }
-        if (he < 0) {
-            HttpDeadline.Disarm(watch);
-            fr.Dispose();
-            stream.Close();
-            conn.Close();
-            ctx.Free();
-            req = "";
-            throw new HttpRequestException(
-                "response header block exceeds 65536 bytes");
-        }
-        string head = fr.Head(he);
-        HttpResponse resp = HttpResponse.Parse(head);
-        HttpRequest hp = HttpRequest.Parse(head, he);
-        bool noBody = resp.statusCode == 204 || resp.statusCode == 304
-            || method == "HEAD";
-        if (!noBody) {
-            if (hp.chunked || HttpClient.HeadHasContentLength(head)) {
-                int st = await fr.ReadBody(hp, 67108864);
-                if (st == -1) {
-                    bool lateBody = HttpDeadline.Expired(watch);
-                    HttpDeadline.Disarm(watch);
-                    fr.Dispose();
-                    stream.Close();
-                    conn.Close();
-                    ctx.Free();
-                    req = "";
-                    head = "";
-                    if (lateBody) { FailTimeout(); }
-                    throw new HttpRequestException(
-                        "connection closed in the middle of the response body");
-                }
-                if (st == 413) {
-                    HttpDeadline.Disarm(watch);
-                    fr.Dispose();
-                    stream.Close();
-                    conn.Close();
-                    ctx.Free();
-                    req = "";
-                    head = "";
-                    throw new HttpRequestException(
-                        "response body exceeds 67108864 bytes");
-                }
-                if (st != 0) {
-                    HttpDeadline.Disarm(watch);
-                    fr.Dispose();
-                    stream.Close();
-                    conn.Close();
-                    ctx.Free();
-                    req = "";
-                    head = "";
-                    throw new HttpRequestException(
-                        "malformed chunked response body");
-                }
-                int n = hp.bodyLength;
-                byte[] outb = new byte[n + 1];
-                for (int i = 0; i < n; i = i + 1) {
-                    outb[i] = (byte)(hp.body[i] & 255);
-                }
-                resp.bodyBytes = outb;
-                resp.bodyBytesLen = n;
-                // 文本调用方继续走 body：NUL 保留在缓冲里，strlen 只在
-                // 二进制正文上会变短，而那类正文以 bodyBytes 为准。
-                resp.body = hp.body;
-            } else {
-                ByteBuffer acc = ByteBuffer.Alloc(8192);
-                int pend = fr.Pending();
-                if (pend > he) {
-                    acc.WriteRaw(fr.Slice(he, pend - he), pend - he);
-                }
-                fr.Consume(pend);
-                while (!fr.Closed()) {
-                    int nb = await fr.Fill();
-                    if (nb > 0) {
-                        acc.WriteRaw(fr.Slice(0, nb), nb);
-                        fr.Consume(nb);
-                    }
-                }
-                int total = acc.Length();
-                byte[] oute = new byte[total + 1];
-                for (int i = 0; i < total; i = i + 1) {
-                    oute[i] = (byte)acc.ByteAt(i);
-                }
-                resp.body = acc.ToStr();
-                acc.Free();
-                resp.bodyBytes = oute;
-                resp.bodyBytesLen = total;
+        HttpResponse resp = await this.ReadFramedResponse(conn, path, method,
+                                                          watch, stream, ctx);
+        return resp;
+    }
+
+    // UploadFileBytesAsync 的明文通道：头部 + 文件字节 + 尾部三段式，
+    // 每段按显式字节长度发送——strlen 定长的 SendAsync 会把内嵌 NUL
+    // 后的正文截掉；Content-Length（total）与各段发送长度取自同一处
+    // （与 HttpServer 发送二进制响应同一纪律）。文件按 64KB 分块
+    // 读取上线，进度探针随字节推进。
+    async HttpResponse SendBytesBodyAsync(string method, string path,
+            string head, string localPath, int fileLen, string tail,
+            int total) {
+        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
+                                                     this.timeout);
+        if (conn == null) { FailConnect(); }
+        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
+        string req = this.BuildRequestHead(method, path, total, true);
+        int _h = await conn.SendBytesAsync(req, req.Length);
+        int _m = await conn.SendBytesAsync(head, head.Length);
+        this.UploadTick(req.Length + head.Length, total);
+        int offset = 0;
+        while (offset < fileLen) {
+            int want = fileLen - offset;
+            if (want > 65536) { want = 65536; }
+            byte[] chunk = File.ReadBytes(localPath, offset, want);
+            if (chunk.Length < want) {
+                HttpDeadline.Disarm(watch);
+                this.CloseChannel(conn, null, null, null);
+                throw new HttpRequestException(
+                    "file shrank while being uploaded: " + localPath);
             }
+            int _c = await conn.SendBytesAsync(chunk, chunk.Length);
+            offset = offset + chunk.Length;
+            this.UploadTick(req.Length + head.Length + offset, total);
         }
-        bool late = HttpDeadline.Expired(watch);
-        HttpDeadline.Disarm(watch);
-        fr.Dispose();
-        stream.Close();
-        conn.Close();
-        ctx.Free();
-        req = "";
-        if (late) {
-            head = "";
-            FailTimeout();
+        int _t = await conn.SendBytesAsync(tail, tail.Length);
+        this.UploadTick(total, total);
+        HttpResponse resp = await this.ReadFramedResponse(conn, path, method,
+                                                          watch, null, null);
+        return resp;
+    }
+
+    // UploadFileBytesAsync 的 TLS 变体：握手同 SendBytesTlsAsync，
+    // 三段式正文按显式长度发送，读取走 HttpFramer.CreateTls。
+    async HttpResponse SendBytesBodyTlsAsync(string method, string path,
+            string head, string localPath, int fileLen, string tail,
+            int total) {
+        Socket.Initialize();
+        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
+                                                     this.timeout);
+        if (conn == null) { FailConnect(); }
+        TlsContext ctx;
+        if (this.clientCertificateFile.Length > 0
+            && this.clientPrivateKeyFile.Length > 0) {
+            ctx = TlsContext.CreateClientWithCertificate(
+                this.clientCertificateFile, this.clientPrivateKeyFile);
+        } else {
+            ctx = TlsContext.CreateClient();
         }
-        this.AbsorbCookies(path, head);
-        head = "";
+        if (ctx != null && this.certPolicy != null) {
+            ctx.SetCertPolicy(this.certPolicy);
+        }
+        if (ctx == null) {
+            conn.Close();
+            string tlsError = TlsStream.LastError();
+            if (tlsError == "") { tlsError = "TLS 上下文初始化失败"; }
+            throw new HttpRequestException(tlsError);
+        }
+        if (!this.verifyTls) {
+            ctx.DisableVerify();
+        }
+        this.ApplyPinning(ctx);
+        TlsStream stream = await TlsStream.ConnectAsync(ctx, conn.Sock(),
+                                                       this.host);
+        if (stream == null) {
+            conn.Close();
+            ctx.Free();
+            string tlsHandshakeError = TlsStream.LastError();
+            if (tlsHandshakeError == "") {
+                tlsHandshakeError = "TLS 握手失败";
+            }
+            throw new HttpRequestException(tlsHandshakeError);
+        }
+        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
+        string req = this.BuildRequestHead(method, path, total, true);
+        int _h = await stream.SendAsync(req, req.Length);
+        int _m = await stream.SendAsync(head, head.Length);
+        this.UploadTick(req.Length + head.Length, total);
+        int offset = 0;
+        while (offset < fileLen) {
+            int want = fileLen - offset;
+            if (want > 65536) { want = 65536; }
+            byte[] chunk = File.ReadBytes(localPath, offset, want);
+            if (chunk.Length < want) {
+                HttpDeadline.Disarm(watch);
+                this.CloseChannel(conn, null, stream, ctx);
+                throw new HttpRequestException(
+                    "file shrank while being uploaded: " + localPath);
+            }
+            int _c = await stream.SendAsync(chunk, chunk.Length);
+            offset = offset + chunk.Length;
+            this.UploadTick(req.Length + head.Length + offset, total);
+        }
+        int _t = await stream.SendAsync(tail, tail.Length);
+        this.UploadTick(total, total);
+        HttpResponse resp = await this.ReadFramedResponse(conn, path, method,
+                                                          watch, stream, ctx);
         return resp;
     }
 
@@ -1599,7 +1640,9 @@ class HttpClient {
     /// <paramref name="path"/>（<paramref name="field"/> 是表单名，
     /// <paramref name="fileName"/> 是上报给服务器的文件名）。
     /// 会将整个文件读入内存，适合中等大小的文件。返回解析后的
-    /// 响应。</summary>
+    /// 响应。注意正文经 ReadAllText 读取，只适合文本文件；
+    /// 二进制内容（图片、字体等）请用
+    /// <see cref="UploadFileBytesAsync"/>。</summary>
     async HttpResponse UploadFileAsync(string path, string field,
             string localPath, string fileName) {
         string fileData = File.ReadAllText(localPath);
@@ -1628,6 +1671,47 @@ class HttpClient {
         }
         string raw = await this.RequestAsync("POST", path, bodyStr);
         return HttpResponse.Parse(raw);
+    }
+
+    /// <summary>字节安全的 multipart/form-data 上传：
+    /// <paramref name="localPath"/> 按原始字节分块读取上线
+    /// （<see cref="UploadFileAsync"/> 走 ReadAllText，二进制内容会
+    /// 损坏），ASCII 头尾与文件字节都按显式字节长度发送，
+    /// Content-Length 与发送长度取自同一处，内嵌 NUL 原样到达。
+    /// <paramref name="field"/> 是表单名，<paramref name="fileName"/>
+    /// 是上报给服务器的文件名。传输层失败抛
+    /// <see cref="HttpRequestException"/>，HTTP 状态由调用方检查；
+    /// 进度（已上线字节/总字节）经 <see cref="SetUploadProbe"/> 上报。</summary>
+    async HttpResponse UploadFileBytesAsync(string path, string field,
+            string localPath, string fileName) {
+        int fileLen = File.GetSize(localPath);
+        if (fileLen < 0) {
+            throw new FileNotFoundException("Could not open file: "
+                + localPath);
+        }
+        string boundary = "----ZanFormBoundary"
+            + Convert.ToString(fileLen) + "z" + Convert.ToString(field.Length);
+        string head = "--" + boundary + "\r\n"
+            + "Content-Disposition: form-data; name=\"" + field
+            + "\"; filename=\"" + fileName + "\"\r\n"
+            + "Content-Type: " + HttpClient.GuessMime(fileName) + "\r\n\r\n";
+        string tail = "\r\n--" + boundary + "--\r\n";
+        int total = head.Length + fileLen + tail.Length;
+        if (!this.HasHeaderName("Content-Type")) {
+            this.SetHeader("Content-Type",
+                "multipart/form-data; boundary=" + boundary);
+        }
+        HttpResponse resp;
+        if (this.useTls) {
+            resp = await this.SendBytesBodyTlsAsync("POST", path, head,
+                                                    localPath, fileLen,
+                                                    tail, total);
+        } else {
+            resp = await this.SendBytesBodyAsync("POST", path, head,
+                                                 localPath, fileLen,
+                                                 tail, total);
+        }
+        return resp;
     }
 
     /// <summary>将 <paramref name="path"/> 下载到

@@ -1,0 +1,1336 @@
+using System;
+using System.IO;
+using System.Threading;
+using Gui;
+
+namespace Gui.Widget;
+
+/// <summary>
+/// 文件上传状态取值（对齐 Naive UI status:
+/// pending / uploading / finished / error）。
+/// </summary>
+class UploadStatus {
+    /// 等待上传：已入列但尚未开始（Submit() 或宿主启动）。
+    static int Pending() { return 0; }
+    /// 上传中：percent 为进度（0..100）。
+    static int Uploading() { return 1; }
+    /// 成功：url 可指向远端地址（配合下载/回显）。
+    static int Success() { return 2; }
+    /// 失败：message 携带原因。
+    static int Error() { return 3; }
+}
+
+/// before-upload 钩子：项入列前调用，返回 false 拦截入列
+/// （Naive UI on-before-upload）。必须是非捕获方法组。
+delegate bool UploadBeforeFn(UploadFile item);
+
+/// custom-request 钩子：接管一项的传输（Naive UI custom-request）。
+/// 组件已把项置为 Uploading，宿主自行推进 SetItemPercent /
+/// SetItemStatus。必须是非捕获方法组。
+delegate void UploadRequestFn(UploadFile item);
+
+/// Upload 列表中的一个文件项（Naive UI file-list 元素）。
+class UploadFile {
+    /// 组件内唯一 id（入列时由 Upload 赋值）。
+    int id;
+    /// 文件名（显示用，含扩展名）。
+    string name;
+    /// 远端地址：Success 且非空时名称渲染为可点击链接。
+    string url;
+    /// 缩略图来源（本地路径或 http/https）；空且项为图片时回退 path。
+    string thumb;
+    /// 本地文件路径（拖拽/选择/内置传输的来源；纯演示项为空）。
+    string path;
+    /// 状态附言：Error 时为失败原因。
+    string message;
+    /// 传输响应体（内置 HTTP 成功时填充；CustomRequest 可自填）。
+    string response;
+    /// 字节大小（已知时 > 0）。
+    int size;
+    /// UploadStatus.Pending/Uploading/Success/Error。
+    int status;
+    /// 进度百分比（0..100，Uploading 中刷新）。
+    int percent;
+    /// 小写扩展名（不含点）。
+    string ext;
+    /// 归属的 Upload 宿主（组件入列路径自动回填；宿主自造的受控项为 null）。
+    /// 让静态方法组形式的 CustomRequest 能回推 SetItemPercent/SetItemStatus。
+    Upload owner;
+
+    UploadFile() {
+        id = 0;
+        name = "";
+        url = "";
+        thumb = "";
+        path = "";
+        message = "";
+        response = "";
+        size = 0;
+        status = UploadStatus.Pending();
+        percent = 0;
+        ext = "";
+    }
+
+    /// 取小写扩展名（不含点）；无点返回 ""。
+    static string ExtOf(string fileName) {
+        string low = fileName.ToLower();
+        int i = low.Length - 1;
+        while (i >= 0) {
+            if (low[i] == 46) { return low.Substring(i + 1); }
+            i = i - 1;
+        }
+        return "";
+    }
+}
+
+/// 一项内置 HTTP 上传的工作对象：绑定到具体项（实例方法组，
+/// 规避闭包），在后台线程跑 HttpClient.UploadFileBytesAsync，
+/// 进度/完成经 App.Post 封送回 UI 线程。
+///
+/// 线程入口必须是静态方法组：实例方法组降级为带 `this` 的闭包
+/// 记录，而 `zan_thread_start` 只接受裸函数指针（ImageHttp、
+/// DataTable.Export 同受此约），故这里走「静态队列 + 单 worker」
+/// 范式：Enqueue 在空闲时拉起 UploadJob.Run，Run 取一项 await
+/// 一项，队列排空即退，下次入队再拉起。
+class UploadJob {
+    static nint lockHandle;
+    static List<UploadJob> pending;
+    static bool workerStarted;
+
+    Upload host;
+    UploadFile item;
+    int itemId;
+    bool tls;
+    string hostName;
+    int port;
+    string urlPart;
+    string field;
+    int lastPct;
+    int doneCode;
+    string doneBody;
+    string doneErr;
+    bool donePosted;
+
+    /// UI 线程：入队并（worker 空闲时）拉起后台线程。
+    /// 线程起不来时返回 false（任务已从队列摘除），调用方负责失败该项。
+    static bool Enqueue(UploadJob job) {
+        if (lockHandle == 0) {
+            lockHandle = Mutex.Create();
+            pending = new List<UploadJob>();
+        }
+        Mutex.Lock(lockHandle);
+        pending.Add(job);
+        bool needWorker = !workerStarted;
+        workerStarted = true;
+        Mutex.Unlock(lockHandle);
+        if (needWorker && !Thread.Start(UploadJob.Run)) {
+            Mutex.Lock(lockHandle);
+            int i = 0;
+            while (i < pending.Count) {
+                if (pending[i].itemId == job.itemId) { pending.RemoveAt(i); }
+                else { i = i + 1; }
+            }
+            workerStarted = false;
+            Mutex.Unlock(lockHandle);
+            return false;
+        }
+        return true;
+    }
+
+    /// 后台线程入口（静态方法组）：逐条取任务直到队列清空，
+    /// 然后退出（下一次入队会重新拉起）。await 让出期间
+    /// IO 反应器推进传输——与 ImageHttp.WorkerLoop 同构。
+    static void Run() {
+        Socket.Initialize();
+        while (true) {
+            UploadJob job = UploadJob.Take();
+            if (job == null) {
+                Mutex.Lock(lockHandle);
+                if (pending.Count == 0) {
+                    workerStarted = false;
+                    Mutex.Unlock(lockHandle);
+                    return;
+                }
+                Mutex.Unlock(lockHandle);
+                continue;
+            }
+            await job.Execute();
+        }
+    }
+
+    /// 取队首任务；null = 队列已空。
+    static UploadJob Take() {
+        UploadJob job = null;
+        Mutex.Lock(lockHandle);
+        if (pending.Count > 0) {
+            job = pending[0];
+            pending.RemoveAt(0);
+        }
+        Mutex.Unlock(lockHandle);
+        return job;
+    }
+
+    /// 解析 Action URL（scheme/host[:port]/path）并绑定任务。
+    void Init(Upload h, UploadFile f, string url, string fieldName) {
+        host = h;
+        item = f;
+        itemId = f.id;
+        field = fieldName;
+        lastPct = 0 - 1;
+        doneCode = 0;
+        doneBody = "";
+        doneErr = "";
+        donePosted = false;
+        string rest = url;
+        tls = false;
+        if (rest.StartsWith("https://")) {
+            tls = true;
+            rest = rest.Substring(8);
+        } else if (rest.StartsWith("http://")) {
+            rest = rest.Substring(7);
+        }
+        string authority = rest;
+        string pathPart = "/";
+        int i = 0;
+        while (i < rest.Length) {
+            if (rest[i] == 47) {
+                authority = rest.Substring(0, i);
+                pathPart = rest.Substring(i);
+                i = rest.Length;
+            } else { i = i + 1; }
+        }
+        int colon = 0 - 1;
+        i = 0;
+        while (i < authority.Length) {
+            if (authority[i] == 58) { colon = i; }
+            i = i + 1;
+        }
+        if (colon > 0) {
+            hostName = authority.Substring(0, colon);
+            port = Convert.ToInt32(authority.Substring(colon + 1));
+        } else {
+            hostName = authority;
+            if (tls) { port = 443; } else { port = 80; }
+        }
+        if (pathPart == "") { pathPart = "/"; }
+        urlPart = pathPart;
+    }
+
+    /// 后台线程上跑一项的传输（由静态 Run 循环调用）。
+    async int Execute() {
+        HttpClient cli;
+        if (tls) { cli = HttpClient.CreateHttps(hostName, port); }
+        else { cli = new HttpClient(hostName, port); }
+        cli.SetTimeout(120000);
+        cli.SetUploadProbe(this.Probe);
+        try {
+            HttpResponse resp = await cli.UploadFileBytesAsync(urlPart, field,
+                                                               item.path, item.name);
+            this.ReportDone(resp.statusCode, resp.body, "");
+        } catch (Exception ex) {
+            this.ReportDone(0, "", ex.Message);
+        }
+        return 0;
+    }
+
+    /// HttpClient 发送探针（后台线程）：折算百分比后封送回 UI。
+    void Probe(int sent, int total) {
+        if (total <= 0) { return; }
+        int pct = sent * 100 / total;
+        if (pct > 100) { pct = 100; }
+        if (pct == lastPct) { return; }
+        lastPct = pct;
+        if (host != null && host.uiApp != null) { host.uiApp.Post(this.FlushProgress); }
+    }
+
+    void ReportDone(int code, string body, string err) {
+        doneCode = code;
+        doneBody = body;
+        doneErr = err;
+        if (donePosted) { return; }
+        donePosted = true;
+        if (host != null && host.uiApp != null) { host.uiApp.Post(this.FlushDone); }
+    }
+
+    void FlushProgress() { if (host != null) { host.ApplyProgress(this); } }
+    void FlushDone() { if (host != null) { host.ApplyDone(this); } }
+}
+
+/// 文件上传（Naive UI n-upload 对位）：选择/拖拽入列，
+/// 内置 multipart HTTP POST 或 CustomRequest 自定义传输，
+/// 列表/缩略图/照片墙三形态渲染，进度/状态/移除/下载。
+///
+///     Upload up = new Upload();
+///     up.Action = "http://127.0.0.1:8080/upload";
+///     up.Change += OnChanged;
+///     up.Render(app, x, y, w);
+///
+/// 非受控：组件自建 Files；受控：宿主把自己的
+/// List&lt;UploadFile&gt; 赋给 Files（或 SetFiles）共享引用。
+/// 事件（Change/Upload/Finish/Error/Remove/Download/Exceed）
+/// 处理器读 LastItem 拿当前项。内置选择弹窗按 FilePicker
+/// 范式路由：OwnsEventWindow → ApplyEventWindow → RenderDialog。
+class Upload : Control {
+    /// 文件列表。null 时组件自建（非受控）；宿主赋入
+    /// 自己的 List 即受控共享引用（Naive UI file-list 对位）。
+    List<UploadFile> Files;
+    /// 入列即自动开始上传（Naive UI list-type 的默认行为；false 时
+    /// 停留在 Pending，等 Submit()）。默认 true。
+    bool AutoUpload;
+    /// 允许一次选择/拖入多个文件。默认 false（拖入仍逐项过门）。
+    bool Multiple;
+    /// 列表上限；0 = 不限。超出时触发 Exceed 并拒绝入列。
+    int Max;
+    /// 触发区形态：大虚线拖放框（Naive UI :default-slot 的
+    /// dragger 对位）；false 时为普通按钮。
+    bool Dragger;
+    /// Dragger 主文案。
+    string DragText;
+    /// Dragger 下方的灰色副文案（"" = 不画）。
+    string Tip;
+    /// 触发按钮文字（Naive UI :trigger 默认槽位）。
+    string TriggerText;
+    /// 显示触发入口（按钮 / 照片墙“+”块）。默认 true。
+    bool ShowTrigger;
+    /// 行尾/遮罩显示移除按钮。默认 true。
+    bool ShowRemoveButton;
+    /// Success 且有 url 时显示下载按钮、名称变主色链接
+    /// （点击触发 Download）。默认 false。
+    bool ShowDownloadButton;
+    /// 照片墙形态（Naive UI list-type="image-card"）：方格 + 添加块 +
+    /// hover 遮罩。
+    bool PictureCard;
+    /// 文本列表行内缩略图（图片项显示 30 方图）。默认 false。
+    bool Thumbnail;
+    /// 接受扩展名，逗号分隔（"png,jpg"；可带点/星号）；"" = 不限。
+    string Accept;
+    /// 内置 multipart POST 的目标 URL（"http(s)://host[:port]/path"）；
+    /// "" = 无内置传输（CustomRequest 或手动 SetItemStatus 驱动）。
+    string Action;
+    /// multipart 表单字段名。默认 "file"。
+    string FieldName;
+    /// before-upload 拦截钩子（Naive UI on-before-upload）。方法组
+    /// 只能在实参位转换，用 WithBeforeUpload 挂接。
+    UploadBeforeFn BeforeUpload;
+    /// 自定义传输钩子（Naive UI custom-request）；设置后优先于 Action。
+    /// 用 WithCustomRequest 挂接。
+    UploadRequestFn CustomRequest;
+    /// 列表任何变化时触发（入列/移除/状态写入）。
+    UiEvent Change;
+    /// 一项开始传输时触发（Naive UI on-before-upload 之后的提交沿）。
+    UiEvent UploadStart;
+    /// 一项传输成功时触发。
+    UiEvent Finish;
+    /// 一项失败时触发（message 已写入项）。
+    UiEvent Error;
+    /// 移除一项时触发。
+    UiEvent Remove;
+    /// 点击下载按钮/名称链接时触发（宿主自行发起下载）。
+    UiEvent Download;
+    /// 超出 Max 时触发（LastItem = 被拒项）。
+    UiEvent Exceed;
+    /// 当前事件对应的文件项（宿主在事件处理器里读它）。
+    UploadFile LastItem;
+
+    int baseId;
+    /// 全局流水号：跨实例唯一（宿主可按 id 反查项，多组件并存不撞号）。
+    static int uidCounter;
+    /// 最近一次渲染所属的 App（线程封送与重绘用）。
+    App uiApp;
+    FilePicker picker;
+    List<UploadJob> jobs;
+    // 本帧拖放落区（Render 时刷新；WantsDropAt 据此判定）。
+    int dropX;
+    int dropY;
+    int dropW;
+    int dropH;
+
+    void InitUpload() {
+        this.InitControl("upload", 1);
+        baseId = WidgetId.Block(520);
+        wiresOwnEvents = true;
+        Files = new List<UploadFile>();
+        jobs = new List<UploadJob>();
+        AutoUpload = true;
+        Multiple = false;
+        Max = 0;
+        Dragger = false;
+        DragText = "点击或者拖动文件到该区域来上传";
+        Tip = "";
+        TriggerText = "上传文件";
+        ShowTrigger = true;
+        ShowRemoveButton = true;
+        ShowDownloadButton = false;
+        PictureCard = false;
+        Thumbnail = false;
+        Accept = "";
+        Action = "";
+        FieldName = "file";
+        BeforeUpload = null;
+        CustomRequest = null;
+        Change = new UiEvent();
+        UploadStart = new UiEvent();
+        Finish = new UiEvent();
+        Error = new UiEvent();
+        Remove = new UiEvent();
+        Download = new UiEvent();
+        Exceed = new UiEvent();
+        LastItem = null;
+        picker = null;
+        dropX = 0;
+        dropY = 0;
+        dropW = 0;
+        dropH = 0;
+    }
+
+    Upload() {
+        this.InitUpload();
+    }
+
+    /// 挂 before-upload 拦截钩子（Naive UI on-before-upload）。
+    Upload WithBeforeUpload(UploadBeforeFn f) { this.BeforeUpload = f; return this; }
+
+    /// 挂自定义传输钩子（Naive UI custom-request），传 null 解除。
+    Upload WithCustomRequest(UploadRequestFn f) { this.CustomRequest = f; return this; }
+
+    /// 挂内置 HTTP 目标并（可选）指定字段名。
+    Upload WithAction(string url, string fieldName) {
+        this.Action = url;
+        if (fieldName != "") { this.FieldName = fieldName; }
+        return this;
+    }
+
+    override string Kind() { return "Upload"; }
+
+    /// 本组件的命中 id 基址（Render 返回值）。行命中区按
+    /// `BaseId() + 8 + 行号*4` 排布：行本体 +1 名称链接 +2 移除 +3 下载。
+    int BaseId() { return baseId; }
+
+    // ---- 设计器属性 ------------------------------------------------------
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec act = PropSpec.Text("action", "Action URL");
+        act.str = Action;
+        act.WithTip("Built-in multipart POST target; empty = no built-in transport.");
+        ps.Add(act);
+        PropSpec fld = PropSpec.Text("fieldName", "Field name");
+        fld.str = FieldName;
+        ps.Add(fld);
+        PropSpec acc = PropSpec.Text("accept", "Accept");
+        acc.str = Accept;
+        acc.WithTip("Comma-separated extensions (e.g. \"png,jpg\"); empty = all.");
+        ps.Add(acc);
+        PropSpec mx = PropSpec.Int("max", "Max files");
+        mx.num = Max;
+        mx.Step(1, 0, 999);
+        ps.Add(mx);
+        PropSpec au = PropSpec.Bool("autoUpload", "Auto upload");
+        au.flag = AutoUpload;
+        ps.Add(au);
+        PropSpec mu = PropSpec.Bool("multiple", "Multiple");
+        mu.flag = Multiple;
+        ps.Add(mu);
+        PropSpec tt = PropSpec.Text("triggerText", "Trigger text");
+        tt.str = TriggerText;
+        ps.Add(tt);
+        PropSpec sh = PropSpec.Bool("showTrigger", "Show trigger");
+        sh.flag = ShowTrigger;
+        ps.Add(sh);
+        PropSpec sr = PropSpec.Bool("showRemoveButton", "Remove button");
+        sr.flag = ShowRemoveButton;
+        ps.Add(sr);
+        PropSpec sd = PropSpec.Bool("showDownloadButton", "Download button");
+        sd.flag = ShowDownloadButton;
+        ps.Add(sd);
+        PropSpec dr = PropSpec.Bool("dragger", "Dragger");
+        dr.flag = Dragger;
+        ps.Add(dr);
+        PropSpec dt = PropSpec.Text("dragText", "Drag text");
+        dt.str = DragText;
+        ps.Add(dt);
+        PropSpec tp = PropSpec.Text("tip", "Tip");
+        tp.str = Tip;
+        ps.Add(tp);
+        PropSpec pc = PropSpec.Bool("pictureCard", "Picture card");
+        pc.flag = PictureCard;
+        ps.Add(pc);
+        PropSpec th = PropSpec.Bool("thumbnail", "Thumbnail");
+        th.flag = Thumbnail;
+        ps.Add(th);
+        return ps;
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        e.Add("Upload");
+        e.Add("Finish");
+        e.Add("Error");
+        e.Add("Remove");
+        e.Add("Download");
+        e.Add("Exceed");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change") { Change.Add(a); return; }
+        if (evt == "Upload" || evt == "UploadStart") { UploadStart.Add(a); return; }
+        if (evt == "Finish") { Finish.Add(a); return; }
+        if (evt == "Error") { Error.Add(a); return; }
+        if (evt == "Remove") { Remove.Add(a); return; }
+        if (evt == "Download") { Download.Add(a); return; }
+        if (evt == "Exceed") { Exceed.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    // ---- 数据入口 --------------------------------------------------------
+
+    /// 受控列表：共享宿主 List 引用（非受控时忽略 null）。
+    void SetFiles(List<UploadFile> files) {
+        if (files == null) { return; }
+        Files = files;
+        int i = 0;
+        while (i < files.Count) {
+            UploadFile f = files[i];
+            if (f.id >= uidCounter) { uidCounter = f.id + 1; }
+            i = i + 1;
+        }
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+
+    /// 接受一批本地路径（选择/拖拽统一入口）：逐项过
+    /// Accept → Max → BeforeUpload 门。返回实际入列数。
+    int AddPaths(List<string> paths) {
+        if (paths == null) { return 0; }
+        if (this.IsDisabled()) { return 0; }
+        if (Files == null) { Files = new List<UploadFile>(); }
+        int added = 0;
+        int i = 0;
+        while (i < paths.Count) {
+            string p = paths[i];
+            if (p != null && p != "" && this.TryAddPath(p)) { added = added + 1; }
+            i = i + 1;
+        }
+        return added;
+    }
+
+    bool TryAddPath(string path) {
+        string name = Path.GetFileName(path);
+        if (name == "") { name = path; }
+        UploadFile f = new UploadFile();
+        f.name = name;
+        f.path = path;
+        f.ext = UploadFile.ExtOf(name);
+        if (path != "" && File.Exists(path)) { f.size = File.GetSize(path); }
+        return this.Admit(f);
+    }
+
+    /// 程序化造项（默认文件列表/演示用）：不过 Accept/Max/BeforeUpload
+    /// 门（宿主显式添加）；url 非空 → Success，AutoUpload 且可启动 →
+    /// 立即开传。返回新建项。
+    UploadFile AddFile(string name, string path, string url) {
+        if (Files == null) { Files = new List<UploadFile>(); }
+        UploadFile f = new UploadFile();
+        f.name = name;
+        f.path = path;
+        f.url = url;
+        f.ext = UploadFile.ExtOf(name);
+        if (path != "" && File.Exists(path)) { f.size = File.GetSize(path); }
+        f.id = uidCounter;
+        f.owner = this;
+        uidCounter = uidCounter + 1;
+        if (url != "") {
+            f.status = UploadStatus.Success();
+            f.percent = 100;
+        } else {
+            f.status = UploadStatus.Pending();
+        }
+        Files.Add(f);
+        LastItem = f;
+        Change.Raise();
+        if (f.status == UploadStatus.Pending() && AutoUpload) {
+            this.StartItem(f);
+        }
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+        return f;
+    }
+
+    /// 入列唯一通路：id 分配 + Accept/Max/BeforeUpload 门 + 自动开传。
+    bool Admit(UploadFile f) {
+        if (this.IsDisabled()) { return false; }
+        if (Files == null) { Files = new List<UploadFile>(); }
+        f.id = uidCounter;
+        f.owner = this;
+        uidCounter = uidCounter + 1;
+        if (Accept != "" && !this.AcceptAllows(f.ext)) { return false; }
+        if (Max > 0 && Files.Count >= Max) {
+            LastItem = f;
+            Exceed.Raise();
+            return false;
+        }
+        if (BeforeUpload != null && !BeforeUpload(f)) { return false; }
+        Files.Add(f);
+        LastItem = f;
+        Change.Raise();
+        if (AutoUpload) { this.StartItem(f); }
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+        return true;
+    }
+
+    bool AcceptAllows(string ext) {
+        if (ext == "") { return true; }
+        string acc = Accept.ToLower();
+        string tok = "";
+        int i = 0;
+        while (i <= acc.Length) {
+            if (i == acc.Length || acc[i] == 44 || acc[i] == 59) {
+                tok = tok.Trim();
+                if (tok != "") {
+                    if (tok.StartsWith("*.")) { tok = tok.Substring(2); }
+                    else if (tok.StartsWith(".")) { tok = tok.Substring(1); }
+                    if (tok == "*" || tok == ext) { return true; }
+                }
+                tok = "";
+            } else {
+                tok = tok + acc.Substring(i, 1);
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    static bool IsImageExt(string ext) {
+        return ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "gif"
+            || ext == "bmp" || ext == "webp" || ext == "ico" || ext == "svg";
+    }
+
+    // ---- 传输 ------------------------------------------------------------
+
+    /// 把全部 Pending 项启动传输（AutoUpload=false 的手动提交，
+    /// Naive UI submit() 对位）。
+    void Submit() {
+        if (Files == null) { return; }
+        int i = 0;
+        while (i < Files.Count) {
+            UploadFile f = Files[i];
+            if (f.status == UploadStatus.Pending()) { this.StartItem(f); }
+            i = i + 1;
+        }
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+
+    /// 启动一项：CustomRequest 优先；否则 Action 非空且有界面循环
+    /// 时起后台线程。两者皆无则不改动状态（不撒谎，留在 Pending）。
+    void StartItem(UploadFile f) {
+        if (f == null) { return; }
+        if (CustomRequest != null) {
+            // 自定义传输接管一切（演示/纯内存项也可驱动）。
+        } else if (Action == "" || f.path == "" || uiApp == null) {
+            return;
+        }
+        f.status = UploadStatus.Uploading();
+        f.percent = 0;
+        f.message = "";
+        LastItem = f;
+        UploadStart.Raise();
+        if (CustomRequest != null) { CustomRequest(f); return; }
+        UploadJob job = new UploadJob();
+        job.Init(this, f, Action, FieldName);
+        jobs.Add(job);
+        UploadJob.Enqueue(job);
+    }
+
+    void DropJob(UploadJob job) {
+        int ji = jobs.IndexOf(job);
+        if (ji >= 0) { jobs.RemoveAt(ji); }
+    }
+
+    void FailItem(UploadFile f, string message) {
+        f.status = UploadStatus.Error();
+        f.message = message;
+        LastItem = f;
+        Error.Raise();
+        Change.Raise();
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+
+    /// 后台线程 → UI 线程封送的目标：进度写入（不发事件，只重绘）。
+    void ApplyProgress(UploadJob job) {
+        UploadFile f = this.Find(job.itemId);
+        if (f == null) { return; }
+        if (f.status != UploadStatus.Uploading()) { return; }
+        f.percent = job.lastPct;
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+
+    /// 后台线程 → UI 线程封送的目标：完成沿（2xx → Success + Finish，
+    /// 其余 → Error）。
+    void ApplyDone(UploadJob job) {
+        this.DropJob(job);
+        UploadFile f = this.Find(job.itemId);
+        if (f == null) { return; }
+        if (job.doneErr != "") {
+            this.FailItem(f, job.doneErr);
+            return;
+        }
+        if (job.doneCode >= 200 && job.doneCode < 300) {
+            f.status = UploadStatus.Success();
+            f.percent = 100;
+            f.message = "";
+            f.response = job.doneBody;
+            LastItem = f;
+            Finish.Raise();
+            Change.Raise();
+            if (uiApp != null) { uiApp.RequestRedraw(); }
+        } else {
+            this.FailItem(f, "HTTP " + Convert.ToString(job.doneCode));
+        }
+    }
+
+    // ---- 项操作 ----------------------------------------------------------
+
+    UploadFile Find(int id) {
+        if (Files == null) { return null; }
+        int i = 0;
+        while (i < Files.Count) {
+            if (Files[i].id == id) { return Files[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    /// 刷新一项进度（CustomRequest/演示用）。
+    void SetItemPercent(int id, int percent) {
+        UploadFile f = this.Find(id);
+        if (f == null) { return; }
+        if (percent < 0) { percent = 0; }
+        if (percent > 100) { percent = 100; }
+        f.percent = percent;
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+
+    /// 写入一项状态：Success → 触发 Finish，Error → 触发 Error，
+    /// 任一状态变化都触发 Change。
+    void SetItemStatus(int id, int status, string message) {
+        UploadFile f = this.Find(id);
+        if (f == null) { return; }
+        f.status = status;
+        if (message != null) { f.message = message; }
+        if (status == UploadStatus.Success()) {
+            f.percent = 100;
+            LastItem = f;
+            Finish.Raise();
+        } else if (status == UploadStatus.Error()) {
+            LastItem = f;
+            Error.Raise();
+        }
+        Change.Raise();
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+
+    /// 写入一项远端 url（成功回显/下载目标）。
+    void SetItemUrl(int id, string url) {
+        UploadFile f = this.Find(id);
+        if (f == null) { return; }
+        f.url = url;
+        Change.Raise();
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+
+    /// 写入一项缩略图来源（Naive UI on-create-thumbnail 的宿主替代）。
+    void SetItemThumb(int id, string thumb) {
+        UploadFile f = this.Find(id);
+        if (f == null) { return; }
+        f.thumb = thumb;
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+
+    /// 按 id 移除一项（触发 Remove + Change）。返回 false = 未找到。
+    bool RemoveItem(int id) {
+        UploadFile f = this.Find(id);
+        if (f == null) { return false; }
+        int idx = Files.IndexOf(f);
+        if (idx < 0) { return false; }
+        Files.RemoveAt(idx);
+        LastItem = f;
+        Remove.Raise();
+        Change.Raise();
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+        return true;
+    }
+
+    /// 清空列表（触发 Change）。
+    void Clear() {
+        if (Files != null) { Files.Clear(); }
+        Change.Raise();
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+
+    // ---- 拖放落区 --------------------------------------------------------
+
+    /// 指针 (x, y) 是否落在本组件的拖放落区（Dragger 大框 /
+    /// 照片墙区域 / 普通模式触发按钮）。宿主可直接用它判定
+    /// OS 文件拖放的落点（本帧渲染后有效）。
+    bool WantsDropAt(int x, int y) {
+        if (dropW <= 0 || dropH <= 0) { return false; }
+        return x >= dropX && x < dropX + dropW && y >= dropY && y < dropY + dropH;
+    }
+
+    /// 接收一批拖入的本地文件（等价 AddPaths，供宿主事件回路调用）。
+    int AcceptDropped(List<string> paths) { return this.AddPaths(paths); }
+
+    // ---- 内建文件选择弹窗（FilePicker 路由） ------------------------------
+
+    void EnsurePicker() {
+        if (picker != null) { return; }
+        picker = new FilePicker();
+        picker.Accepted.Add(this.OnPicked);
+    }
+
+    /// 打开内建选择弹窗（v1 单选；Accept 生成过滤器）。
+    /// 弹窗事件/渲染由宿主按 OwnsEventWindow 范式路由。
+    void OpenDialog() {
+        if (this.IsDisabled()) { return; }
+        this.EnsurePicker();
+        picker.BeginOpenFileFilters("", this.BuildFilters(), "选择文件");
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+
+    void OnPicked() {
+        if (picker == null) { return; }
+        string p = picker.SelectedPath();
+        if (p == "") { return; }
+        List<string> one = new List<string>();
+        one.Add(p);
+        this.AddPaths(one);
+    }
+
+    /// Accept 字符串 → 选择对话框过滤器（始终追加“所有文件”兜底）。
+    List<FileFilter> BuildFilters() {
+        List<FileFilter> items = new List<FileFilter>();
+        if (Accept != "") {
+            string acc = Accept.ToLower();
+            string pats = "";
+            string tok = "";
+            int i = 0;
+            while (i <= acc.Length) {
+                if (i == acc.Length || acc[i] == 44 || acc[i] == 59) {
+                    tok = tok.Trim();
+                    if (tok != "") {
+                        if (tok.StartsWith("*.")) { }
+                        else if (tok.StartsWith(".")) { tok = "*" + tok; }
+                        else { tok = "*." + tok; }
+                        if (pats != "") { pats = pats + ";"; }
+                        pats = pats + tok;
+                    }
+                    tok = "";
+                } else {
+                    tok = tok + acc.Substring(i, 1);
+                }
+                i = i + 1;
+            }
+            if (pats != "") {
+                items.Add(new FileFilter("接受的文件 (" + pats + ")", pats));
+            }
+        }
+        items.Add(new FileFilter("所有文件 (*.*)", ""));
+        return items;
+    }
+
+    /// 选择弹窗是否打开中。
+    bool DialogOpen() { return picker != null && picker.IsOpen(); }
+
+    /// 内建弹窗要求重绘（对位 FilePicker.NeedsRedraw：宿主用它决定
+    /// 主循环节奏——弹窗开着时不能阻塞在 WaitEvent 上）。
+    bool DialogNeedsRedraw() {
+        return picker != null && picker.NeedsRedraw();
+    }
+
+    /// 宿主事件路由：事件窗口属于 Upload 内建的弹窗时返回 true——
+    /// 命中后该帧的 OS 事件交给 ApplyEventWindow，其余交给弹窗自己的
+    /// 渲染通道 RenderDialog（FilePicker 文档范式）。
+    bool OwnsEventWindow(nint evh) {
+        return picker != null && picker.OwnsWindow(evh);
+    }
+
+    bool ApplyEventWindow(nint evh) {
+        if (picker == null) { return false; }
+        return picker.ApplyEvent(evh);
+    }
+
+    /// 渲染内建弹窗（OwnsEventWindow 为 true 的帧里，替代主窗口的
+    /// 一帧渲染）。
+    void RenderDialog() {
+        if (picker != null) { picker.RenderWindow(); }
+    }
+
+    /// 收一次弹窗结果（对位 FilePicker.TakeResult）：关闭瞬间触发
+    /// Accepted → OnPicked，选中路径已并入文件列表；0 = 本轮未关，
+    /// 2 = 用户取消。
+    int TakeDialogResult() {
+        if (picker == null) { return 0; }
+        return picker.TakeResult();
+    }
+
+    // ---- 样式辅助 --------------------------------------------------------
+
+    int StyleGap(App app) {
+        StyleBox s = this.ResolveStyleAs(app, "upload", Class, Style.SNormal());
+        return s.GapOr(app.theme.paddingTiny);
+    }
+
+    int RowH(App app) {
+        if (Thumbnail) { return app.Scale(44); }
+        return app.Scale(34);
+    }
+
+    StyleBox TriggerStyle(App app, bool off) {
+        bool hover = !off && app.focus.IsHovered(baseId);
+        int st = off ? Style.SDisabled() : (hover ? Style.SHover() : Style.SNormal());
+        return this.ResolvePartAs(app, "upload", "trigger", "", Class, st);
+    }
+
+    int TriggerH(App app) {
+        return this.TriggerStyle(app, true).HeightOr(app.theme.heightMedium);
+    }
+
+    int TriggerW(App app) {
+        StyleBox s = this.TriggerStyle(app, true);
+        int fs = s.FontOr(Style.FontFallback(app, "medium"));
+        string txt = TriggerText == "" ? "上传文件" : TriggerText;
+        return Canvas.MeasureText(txt, fs)
+            + s.PadLOr(app.theme.paddingLarge) + s.PadROr(app.theme.paddingLarge);
+    }
+
+    int DraggerH(App app) {
+        int fs = Style.FontFallback(app, "medium");
+        int h = app.Scale(22) + app.Scale(40) + app.Scale(12) + Canvas.FontHeight(fs)
+            + app.Scale(22);
+        if (Tip != "") {
+            h = h + app.Scale(4) + Canvas.FontHeight(Style.FontFallback(app, "small"));
+        }
+        return h;
+    }
+
+    static string Ellipsize(string s, int maxW, int fs) {
+        if (s == "" || maxW <= 0) { return s; }
+        if (Canvas.MeasureText(s, fs) <= maxW) { return s; }
+        string cut = s;
+        while (cut.Length > 1 && Canvas.MeasureText(cut + "…", fs) > maxW) {
+            cut = cut.Substring(0, cut.Length - 1);
+        }
+        return cut + "…";
+    }
+
+    /// 圆角矩形四边虚线框（拖放区/添加块），按 radius 收边。
+    void DashedRect(Canvas c, int x, int y, int w, int h, int color,
+                    int dash, int gapLen, int thickness, int radius) {
+        int r = radius;
+        if (r > h / 2) { r = h / 2; }
+        if (r > w / 2) { r = w / 2; }
+        int x0 = x + r;
+        int x1 = x + w - r;
+        int y0 = y + r;
+        int y1 = y + h - r;
+        int cxp = x0;
+        while (cxp < x1) {
+            int end = cxp + dash;
+            if (end > x1) { end = x1; }
+            c.DrawLine(cxp, y, end, y, color, thickness);
+            cxp = cxp + dash + gapLen;
+        }
+        cxp = x0;
+        while (cxp < x1) {
+            int end = cxp + dash;
+            if (end > x1) { end = x1; }
+            c.DrawLine(cxp, y + h, end, y + h, color, thickness);
+            cxp = cxp + dash + gapLen;
+        }
+        int cyp = y0;
+        while (cyp < y1) {
+            int end = cyp + dash;
+            if (end > y1) { end = y1; }
+            c.DrawLine(x, cyp, x, end, color, thickness);
+            cyp = cyp + dash + gapLen;
+        }
+        cyp = y0;
+        while (cyp < y1) {
+            int end = cyp + dash;
+            if (end > y1) { end = y1; }
+            c.DrawLine(x + w, cyp, x + w, end, color, thickness);
+            cyp = cyp + dash + gapLen;
+        }
+    }
+
+    /// 图片缩略图 cover 裁切：源图居中裁成方形，铺进目标正方形。
+    void BlitCover(Canvas c, string src, int dx, int dy, int size) {
+        int iw = Canvas.ImageWidth(src);
+        int ih = Canvas.ImageHeight(src);
+        if (iw <= 0 || ih <= 0) { return; }
+        int sw = iw;
+        int sh = ih;
+        int sx = 0;
+        int sy = 0;
+        if (iw > ih) { sw = ih; sx = (iw - ih) / 2; }
+        else if (ih > iw) { sh = iw; sy = (ih - iw) / 2; }
+        c.BlitImage(src, dx, dy, size, size, sx, sy, sw, sh);
+    }
+
+    // ---- 渲染 ------------------------------------------------------------
+
+    /// 立即模式入口：绘制整个 Upload（触发区 + 列表/照片墙），
+    /// 接线全部命中区，返回本组件的命中基址。
+    int Render(App app, int x, int y, int w) {
+        uiApp = app;
+        if (Files == null) { Files = new List<UploadFile>(); }
+        bool off = this.IsDisabled();
+        int gap = this.StyleGap(app);
+        int cy = y;
+        dropX = x;
+        dropY = y;
+        dropW = 0;
+        dropH = 0;
+        if (Dragger) {
+            int dh = this.DraggerH(app);
+            this.PaintDragger(app, x, y, w, dh, off);
+            dropW = w;
+            dropH = dh;
+            cy = y + dh + gap;
+            if (!off && Ui.Clicked(app, baseId + 1)) { this.OpenDialog(); }
+        } else if (ShowTrigger && !PictureCard) {
+            int tw = this.TriggerW(app);
+            int th = this.TriggerH(app);
+            this.PaintTrigger(app, x, y, tw, th, off);
+            dropW = tw;
+            dropH = th;
+            cy = y + th + gap;
+            if (!off && Ui.Clicked(app, baseId)) { this.OpenDialog(); }
+        }
+        if (PictureCard) {
+            cy = this.PaintTiles(app, x, cy, w, off);
+        } else {
+            cy = this.PaintRows(app, x, cy, w, off);
+        }
+        // OS 文件拖放：事件 9 兼作 blur，仅当落点在本帧落区且有文件时收取。
+        if (!off && dropW > 0 && app.EventKind() == 9) {
+            int dxp = app.window.EventX();
+            int dyp = app.window.EventY();
+            if (this.WantsDropAt(dxp, dyp)) {
+                List<string> drops = app.window.TakeDroppedFiles();
+                if (drops != null && drops.Count > 0) { this.AddPaths(drops); }
+            }
+        }
+        On.Fire(app, baseId);
+        return baseId;
+    }
+
+    void PaintTrigger(App app, int x, int y, int tw, int th, bool off) {
+        Canvas c = app.canvas;
+        StyleBox s = this.TriggerStyle(app, off);
+        int radius = s.RadiusOr(app.theme.borderRadiusMedium);
+        c.FillRoundRect(x, y, tw, th, radius, s.BgOr(app.theme.bgSecondary));
+        int bc = s.BorderOr(app.theme.borderPrimary);
+        if (bc != 0) { c.DrawRoundRect(x, y, tw, th, radius, bc, 1); }
+        int fs = s.FontOr(Style.FontFallback(app, "medium"));
+        string txt = TriggerText == "" ? "上传文件" : TriggerText;
+        int ty = y + (th - Canvas.FontHeight(fs)) / 2;
+        c.DrawText(x + s.PadLOr(app.theme.paddingLarge), ty, txt, s.FgOr(app.theme.textPrimary), fs);
+        app.hitTester.RegisterRect(baseId, x, y, tw, th, 0);
+    }
+
+    void PaintDragger(App app, int x, int y, int w, int h, bool off) {
+        Canvas c = app.canvas;
+        bool hover = !off && app.focus.IsHovered(baseId + 1);
+        int st = off ? Style.SDisabled() : (hover ? Style.SHover() : Style.SNormal());
+        StyleBox dg = this.ResolvePartAs(app, "upload", "dragger", "", Class, st);
+        int radius = dg.RadiusOr(app.theme.borderRadiusMedium);
+        c.FillRoundRect(x, y, w, h, radius, dg.BgOr(app.theme.bgSecondary));
+        this.DashedRect(c, x, y, w, h, dg.BorderOr(app.theme.borderPrimary),
+                        app.Scale(6), app.Scale(4), 1, radius);
+        StyleBox dic = this.ResolvePartAs(app, "upload", "dragger-icon", "", Class, st);
+        int iconCol = dic.FgOr(app.theme.primary);
+        int circle = app.Scale(40);
+        int cx = x + w / 2;
+        int circleY = y + app.Scale(22);
+        c.FillCircle(cx, circleY + circle / 2, circle / 2, App.Lighten(iconCol, 880));
+        c.DrawGlyphIn("upload", cx - circle / 2, circleY, circle, circle,
+                      app.Scale(20), iconCol);
+        int fs = dg.FontOr(Style.FontFallback(app, "medium"));
+        string main = DragText == "" ? "点击或者拖动文件到该区域来上传" : DragText;
+        int textY = circleY + circle + app.Scale(12);
+        int mw = Canvas.MeasureText(main, fs);
+        c.DrawText(cx - mw / 2, textY, main, dg.FgOr(app.theme.textPrimary), fs);
+        if (Tip != "") {
+            int fss = Style.FontFallback(app, "small");
+            int tw2 = Canvas.MeasureText(Tip, fss);
+            c.DrawText(cx - tw2 / 2, textY + Canvas.FontHeight(fs) + app.Scale(4),
+                       Tip, app.theme.textTertiary, fss);
+        }
+        app.hitTester.RegisterRect(baseId + 1, x, y, w, h, 0);
+    }
+
+    int PaintRows(App app, int x, int y, int w, bool off) {
+        Canvas c = app.canvas;
+        int rowH = this.RowH(app);
+        int rowGap = app.Scale(4);
+        int fs = Style.FontFallback(app, "medium");
+        int fss = Style.FontFallback(app, "small");
+        int n = Files.Count;
+        if (n > 128) { n = 128; }
+        int i = 0;
+        while (i < n) {
+            UploadFile f = Files[i];
+            int rid = baseId + 8 + i * 4;
+            bool hover = !off && app.focus.IsHovered(rid);
+            int st = hover ? Style.SHover() : Style.SNormal();
+            StyleBox item = this.ResolvePartAs(app, "upload", "item", "", Class, st);
+            int bg = item.BgOr(0);
+            if (bg != 0) { c.FillRect(x, y, w, rowH, bg); }
+            // 命中区：先整行，后行内子区（后注册者优先生效）。
+            app.hitTester.RegisterRect(rid, x, y, w, rowH, 0);
+            // 缩略图 / 类型图标
+            int tx = x + app.Scale(2);
+            int cell = rowH - app.Scale(6);
+            bool isImg = Upload.IsImageExt(f.ext);
+            string src = "";
+            if (Thumbnail && isImg) {
+                src = f.thumb != "" ? f.thumb : f.path;
+            }
+            if (src != "" && Canvas.ImageWidth(src) > 0) {
+                this.BlitCover(c, src, tx, y + app.Scale(3), cell);
+            } else {
+                StyleBox ic = this.ResolvePartAs(app, "upload", "icon", "", Class, st);
+                c.DrawGlyphIn(isImg ? "image" : "file", tx, y + app.Scale(3),
+                              cell, cell, app.Scale(18), ic.FgOr(app.theme.textSecondary));
+            }
+            int nx = tx + cell + app.Scale(8);
+            // 右侧槽位（从右往左预留）：移除 / 下载 / 状态
+            int rx = x + w - app.Scale(2);
+            int slot = app.Scale(22);
+            StyleBox err = this.ResolvePartAs(app, "upload", "error", "", Class, st);
+            if (ShowRemoveButton) {
+                rx = rx - slot;
+                bool rhover = !off && app.focus.IsHovered(rid + 2);
+                StyleBox rm = this.ResolvePartAs(app, "upload", "remove", "", Class,
+                                                 rhover ? Style.SHover() : st);
+                c.DrawGlyphIn("close", rx, y, slot, rowH, app.Scale(13),
+                              rm.FgOr(app.theme.textSecondary));
+                app.hitTester.RegisterRect(rid + 2, rx, y, slot, rowH, 0);
+                if (!off && Ui.Clicked(app, rid + 2)) { this.RemoveItem(f.id); }
+            }
+            if (ShowDownloadButton && f.status == UploadStatus.Success() && f.url != "") {
+                rx = rx - slot;
+                StyleBox dl = this.ResolvePartAs(app, "upload", "download", "", Class, st);
+                c.DrawGlyphIn("download", rx, y, slot, rowH, app.Scale(13),
+                              dl.FgOr(app.theme.textSecondary));
+                app.hitTester.RegisterRect(rid + 3, rx, y, slot, rowH, 0);
+                if (!off && Ui.Clicked(app, rid + 3)) { LastItem = f; Download.Raise(); }
+            }
+            if (f.status == UploadStatus.Success()) {
+                rx = rx - slot;
+                StyleBox ok = this.ResolvePartAs(app, "upload", "ok", "", Class, st);
+                c.DrawGlyphIn("check", rx, y, slot, rowH, app.Scale(14), ok.FgOr(app.theme.success));
+            } else if (f.status == UploadStatus.Error()) {
+                rx = rx - slot;
+                c.DrawGlyphIn("close", rx, y, slot, rowH, app.Scale(14), err.FgOr(app.theme.error));
+            }
+            // 文件名
+            int nameMax = rx - nx - app.Scale(8);
+            if (nameMax < app.Scale(24)) { nameMax = app.Scale(24); }
+            string label = Upload.Ellipsize(f.name, nameMax, fs);
+            int nameW = Canvas.MeasureText(label, fs);
+            int nameY = y + (rowH - Canvas.FontHeight(fs)) / 2;
+            StyleBox link = this.ResolvePartAs(app, "upload", "name-link", "", Class, st);
+            bool asLink = f.status == UploadStatus.Success() && f.url != "";
+            int nameCol = item.FgOr(app.theme.textPrimary);
+            if (asLink) { nameCol = link.FgOr(app.theme.primary); }
+            else if (f.status == UploadStatus.Error()) { nameCol = err.FgOr(app.theme.error); }
+            c.DrawText(nx, nameY, label, nameCol, fs);
+            if (asLink) {
+                app.hitTester.RegisterRect(rid + 1, nx - app.Scale(2), y,
+                                           nameW + app.Scale(4), rowH, 0);
+                if (!off && Ui.Clicked(app, rid + 1)) { LastItem = f; Download.Raise(); }
+            }
+            // 错误附言跟在名字后
+            if (f.status == UploadStatus.Error() && f.message != "") {
+                int msgX = nx + nameW + app.Scale(8);
+                if (msgX < rx - app.Scale(4)) {
+                    string msg = Upload.Ellipsize(f.message, rx - app.Scale(4) - msgX, fss);
+                    c.DrawText(msgX, y + (rowH - Canvas.FontHeight(fss)) / 2,
+                               msg, err.FgOr(app.theme.error), fss);
+                }
+            }
+            // 上传中：细进度条
+            if (f.status == UploadStatus.Uploading()) {
+                StyleBox trk = this.ResolvePartAs(app, "upload", "progress-track", "",
+                                                  Class, st);
+                StyleBox fil = this.ResolvePartAs(app, "upload", "progress-fill", "",
+                                                  Class, st);
+                int barH = app.Scale(3);
+                int barY = y + rowH - barH - app.Scale(2);
+                int pct = f.percent;
+                if (pct < 0) { pct = 0; }
+                if (pct > 100) { pct = 100; }
+                int fillW = nameMax * pct / 100;
+                if (pct > 0 && fillW < 2) { fillW = 2; }
+                c.FillRect(nx, barY, nameMax, barH, trk.BgOr(app.theme.bgTertiary));
+                c.FillRect(nx, barY, fillW, barH, fil.BgOr(app.theme.primary));
+            }
+            y = y + rowH + rowGap;
+            i = i + 1;
+        }
+        return y;
+    }
+
+    int PaintTiles(App app, int x, int y, int w, bool off) {
+        Canvas c = app.canvas;
+        int gap = this.StyleGap(app);
+        int tile = app.Scale(96);
+        int cols = (w + gap) / (tile + gap);
+        if (cols < 1) { cols = 1; }
+        int n = Files.Count;
+        if (n > 128) { n = 128; }
+        int i = 0;
+        int cx = x;
+        int cy = y;
+        int bottom = y;
+        while (i < n) {
+            if (cx > x && cx + tile > x + w) { cx = x; cy = cy + tile + gap; }
+            UploadFile f = Files[i];
+            int rid = baseId + 8 + i * 4;
+            bool hover = !off && app.focus.IsHovered(rid);
+            int st = hover ? Style.SHover() : Style.SNormal();
+            StyleBox tl = this.ResolvePartAs(app, "upload", "tile", "", Class, st);
+            int radius = tl.RadiusOr(app.theme.borderRadiusMedium);
+            c.FillRoundRect(cx, cy, tile, tile, radius, tl.BgOr(app.theme.bgTertiary));
+            bool isImg = Upload.IsImageExt(f.ext);
+            string src = f.thumb;
+            if (src == "" && isImg && f.path != "") { src = f.path; }
+            if (src != "" && Canvas.ImageWidth(src) > 0) {
+                this.BlitCover(c, src, cx, cy, tile);
+            } else {
+                StyleBox ic = this.ResolvePartAs(app, "upload", "icon", "", Class, st);
+                int gsz = app.Scale(32);
+                c.DrawGlyphIn(isImg ? "image" : "file", cx, cy + tile / 2 - gsz / 2,
+                              tile, gsz, app.Scale(28), ic.FgOr(app.theme.textTertiary));
+            }
+            app.hitTester.RegisterRect(rid, cx, cy, tile, tile, 0);
+            // 状态徽标：成功=右上绿勾圆，失败=红描边
+            if (f.status == UploadStatus.Success()) {
+                StyleBox ok = this.ResolvePartAs(app, "upload", "ok", "", Class, st);
+                int bs = app.Scale(20);
+                int ocx = cx + tile - bs / 2 - app.Scale(8);
+                int ocy = cy + bs / 2 + app.Scale(8);
+                c.FillCircle(ocx, ocy, bs / 2, ok.FgOr(app.theme.success));
+                c.DrawGlyphIn("check", ocx - bs / 2, ocy - bs / 2, bs, bs,
+                              app.Scale(11), app.theme.textInverse);
+            } else if (f.status == UploadStatus.Error()) {
+                StyleBox err = this.ResolvePartAs(app, "upload", "error", "", Class, st);
+                c.DrawRoundRect(cx, cy, tile, tile, radius, err.FgOr(app.theme.error), 2);
+            }
+            // 进度条（底部，无需悬停即可见）
+            if (f.status == UploadStatus.Uploading()) {
+                StyleBox trk = this.ResolvePartAs(app, "upload", "progress-track", "",
+                                                  Class, st);
+                StyleBox fil = this.ResolvePartAs(app, "upload", "progress-fill", "",
+                                                  Class, st);
+                int barH = app.Scale(4);
+                int pct = f.percent;
+                if (pct < 0) { pct = 0; }
+                if (pct > 100) { pct = 100; }
+                int fillW = tile * pct / 100;
+                if (pct > 0 && fillW < 2) { fillW = 2; }
+                c.FillRect(cx, cy + tile - barH, tile, barH, trk.BgOr(app.theme.bgTertiary));
+                c.FillRect(cx, cy + tile - barH, fillW, barH, fil.BgOr(app.theme.primary));
+            }
+            // hover 遮罩：移除 / 下载
+            if (hover) {
+                StyleBox mask = this.ResolvePartAs(app, "upload", "tile-mask", "",
+                                                   Class, st);
+                int mc = mask.BgOr(0);
+                if (mc != 0) { c.FillRoundRect(cx, cy, tile, tile, radius, mc); }
+                int btn = app.Scale(30);
+                int btnY = cy + tile / 2 - btn / 2;
+                if (ShowRemoveButton) {
+                    int bx1 = cx + tile / 2 - btn - app.Scale(5);
+                    c.FillCircle(bx1 + btn / 2, btnY + btn / 2, btn / 2, app.theme.bgPrimary);
+                    c.DrawGlyphIn("trash", bx1, btnY, btn, btn, app.Scale(14), app.theme.textPrimary);
+                    app.hitTester.RegisterRect(rid + 2, bx1, btnY, btn, btn, 0);
+                    if (Ui.Clicked(app, rid + 2)) { this.RemoveItem(f.id); }
+                }
+                if (ShowDownloadButton && f.status == UploadStatus.Success()
+                        && f.url != "") {
+                    int bx2 = cx + tile / 2 + app.Scale(5);
+                    c.FillCircle(bx2 + btn / 2, btnY + btn / 2, btn / 2, app.theme.bgPrimary);
+                    c.DrawGlyphIn("download", bx2, btnY, btn, btn, app.Scale(14),
+                                  app.theme.textPrimary);
+                    app.hitTester.RegisterRect(rid + 3, bx2, btnY, btn, btn, 0);
+                    if (Ui.Clicked(app, rid + 3)) { LastItem = f; Download.Raise(); }
+                }
+            }
+            cx = cx + tile + gap;
+            bottom = cy + tile;
+            i = i + 1;
+        }
+        // “+ 添加”块
+        if (ShowTrigger && !off) {
+            if (cx > x && cx + tile > x + w) { cx = x; cy = cy + tile + gap; }
+            int aid = baseId + 2;
+            bool ahover = app.focus.IsHovered(aid);
+            StyleBox ta = this.ResolvePartAs(app, "upload", "tile-add", "", Class,
+                                             ahover ? Style.SHover() : Style.SNormal());
+            int ar = ta.RadiusOr(app.theme.borderRadiusMedium);
+            c.FillRoundRect(cx, cy, tile, tile, ar, ta.BgOr(app.theme.bgTertiary));
+            this.DashedRect(c, cx, cy, tile, tile, ta.BorderOr(app.theme.borderPrimary),
+                            app.Scale(5), app.Scale(4), 1, ar);
+            c.DrawGlyphIn("plus", cx, cy, tile, tile, app.Scale(26),
+                          ta.FgOr(app.theme.textSecondary));
+            app.hitTester.RegisterRect(aid, cx, cy, tile, tile, 0);
+            if (Ui.Clicked(app, aid)) { this.OpenDialog(); }
+            if (cy + tile > bottom) { bottom = cy + tile; }
+        }
+        dropY = y;
+        dropW = w;
+        dropH = bottom > y ? bottom - y : tile;
+        return bottom;
+    }
+
+    // ---- 保留模式 --------------------------------------------------------
+
+    override void OnMeasure(App app) {
+        if (Files == null) { Files = new List<UploadFile>(); }
+        int gap = this.StyleGap(app);
+        int n = Files.Count;
+        if (n > 128) { n = 128; }
+        int headH = 0;
+        int listH = n * (this.RowH(app) + app.Scale(4));
+        if (PictureCard) {
+            int tile = app.Scale(96);
+            int cols = (app.Scale(420) + gap) / (tile + gap);
+            if (cols < 1) { cols = 1; }
+            int cells = n;
+            if (ShowTrigger) { cells = cells + 1; }
+            int rowsN = (cells + cols - 1) / cols;
+            listH = rowsN * (tile + gap);
+            prefW = cols * tile + (cols - 1) * gap;
+            prefH = listH > 0 ? listH : tile;
+            return;
+        }
+        if (Dragger) {
+            headH = this.DraggerH(app);
+            prefW = app.Scale(420);
+        } else if (ShowTrigger) {
+            headH = this.TriggerH(app);
+            prefW = this.TriggerW(app);
+        } else {
+            prefW = app.Scale(240);
+        }
+        prefH = headH + listH;
+        if (prefH < app.Scale(4)) { prefH = app.Scale(4); }
+    }
+
+    override void OnPaint(App app) {
+        this.Render(app, bx, by, bw);
+    }
+}

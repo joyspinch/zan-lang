@@ -1,0 +1,188 @@
+// Conformance: UploadFileBytesAsync — the byte-exact multipart upload path.
+//
+// The plain-text channel sent requests with strlen semantics, so a binary
+// file body truncated at its first NUL byte; SendBytesAsync's request side
+// had the same hole (its TLS twin already sent by explicit length). Upload
+// bodies are exactly the payload class that contains NULs, so the upload
+// path must be byte-exact end to end: ASCII multipart head and tail are
+// sent by explicit length, the file goes out in 64KB chunks read straight
+// from disk, and Content-Length is derived from the same three-part sum the
+// sends use. Progress probes fire once per part.
+//
+// Covered here: a 200000-byte file whose bytes follow (i*7+13)&255 (i=181
+// is NUL, one NUL every 256 bytes), uploaded to a loopback HttpServer that
+// verifies Content-Length, the multipart head, every file byte, the tail,
+// a 200 response, and exactly 6 probe ticks (head + 4 chunks + tail) whose
+// last report equals the total.
+using System;
+using System.IO;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Threading;
+
+class Program {
+    static int Port = 9548;
+    static int FileLen = 200000;
+    static string FilePath = "upload_bytes_tmp.bin";
+
+    // 期望的 multipart 拼装（Run 填好，handler 只读）：boundary 由
+    // 文件长度与表单名长度导出，MIME 按 .dat 兜底 application/octet-stream。
+    static string mpHead = "";
+    static string mpTail = "";
+    static int totalLen;
+
+    static int serverFails;
+    static int serverLen;
+
+    static int probeTicks;
+    static int probeLast;
+    static int probeTotal;
+
+    static int FileByte(int i) { return (i * 7 + 13) & 255; }
+
+    static void Probe(int sent, int total) {
+        probeLast = sent;
+        probeTotal = total;
+        probeTicks = probeTicks + 1;
+    }
+
+    static async HttpResponse Handle(HttpRequest req) {
+        if (req.path == "/up") {
+            if (req.method != "POST") {
+                serverFails = serverFails + 1;
+                Console.WriteLine("FAIL method " + req.method);
+            }
+            // 正文长度取 bodyLength：body.Length 只数到第一个 NUL，
+            // 二进制请求体必须按显式字节数核对。
+            int blen = req.bodyLength;
+            serverLen = blen;
+            if (blen != totalLen) {
+                serverFails = serverFails + 1;
+                Console.WriteLine("FAIL body-length " + blen
+                    + " != " + totalLen);
+                return HttpResponse.Text("ok");
+            }
+            int k = 0;
+            while (k < mpHead.Length) {
+                if (req.body[k] != mpHead[k]) {
+                    serverFails = serverFails + 1;
+                    Console.WriteLine("FAIL mp-head byte " + k);
+                    break;
+                }
+                k = k + 1;
+            }
+            int fbase = mpHead.Length;
+            k = 0;
+            while (k < FileLen) {
+                if (req.body[fbase + k] != FileByte(k)) {
+                    serverFails = serverFails + 1;
+                    Console.WriteLine("FAIL file byte " + k);
+                    break;
+                }
+                k = k + 1;
+            }
+            int tbase = fbase + FileLen;
+            k = 0;
+            while (k < mpTail.Length) {
+                if (req.body[tbase + k] != mpTail[k]) {
+                    serverFails = serverFails + 1;
+                    Console.WriteLine("FAIL mp-tail byte " + k);
+                    break;
+                }
+                k = k + 1;
+            }
+            return HttpResponse.Text("ok");
+        }
+        return HttpResponse.NotFound();
+    }
+
+    static async int Run() {
+        int fails = 0;
+
+        byte[] data = new byte[FileLen];
+        int i = 0;
+        while (i < FileLen) {
+            data[i] = (byte)FileByte(i);
+            i = i + 1;
+        }
+        File.WriteAllBytes(FilePath, data);
+
+        string boundary = "----ZanFormBoundary" + Convert.ToString(FileLen)
+            + "z" + Convert.ToString(4);
+        mpHead = "--" + boundary + "\r\n"
+            + "Content-Disposition: form-data; name=\"file\"; "
+            + "filename=\"bin.dat\"\r\n"
+            + "Content-Type: application/octet-stream\r\n\r\n";
+        mpTail = "\r\n--" + boundary + "--\r\n";
+        totalLen = mpHead.Length + FileLen + mpTail.Length;
+
+        Socket.Initialize();
+        HttpServer server = new HttpServer("127.0.0.1", Port);
+        server.OnRequest(Program.Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(50);
+
+        HttpClient cli = new HttpClient("127.0.0.1", Port);
+        cli.SetTimeout(8000);
+        cli.SetUploadProbe(Probe);
+        string uploadErr = "";
+        int status = 0;
+        string respText = "";
+        try {
+            HttpResponse resp = await cli.UploadFileBytesAsync("/up", "file",
+                FilePath, "bin.dat");
+            status = resp.statusCode;
+            respText = resp.body;
+        } catch (Exception e) {
+            uploadErr = e.Message;
+        }
+
+        // 进度探针：1 次头部 + 4 次 64KB 分块（200000 = 3*65536 + 32292）
+        // + 1 次尾部，终值恰为总长。
+        if (uploadErr != "") {
+            fails = fails + 1;
+            Console.WriteLine("FAIL upload-err " + uploadErr);
+        }
+        if (status != 200) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL status " + status);
+        }
+        if (respText != "ok") {
+            fails = fails + 1;
+            Console.WriteLine("FAIL body " + respText);
+        }
+        if (serverFails > 0) {
+            fails = fails + 1;
+        }
+        if (probeTotal != totalLen) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL probe-total " + probeTotal
+                + " != " + totalLen);
+        }
+        if (probeLast != totalLen) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL probe-last " + probeLast);
+        }
+        if (probeTicks != 6) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL probe-ticks " + probeTicks);
+        }
+
+        File.Delete(FilePath);
+        // 唤醒挂起的 accept 并让服务器协程退出；不加这一步，
+        // 退出时的泄漏探测会把整条服务端对象链记为仍可达。
+        server.Stop();
+        for (int i2 = 0; i2 < 20; i2 = i2 + 1) { await Task.Delay(10); }
+
+        if (fails == 0) {
+            Console.WriteLine("http_upload_bytes: OK");
+        } else {
+            Console.WriteLine("http_upload_bytes: FAIL " + fails);
+        }
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Program.Run();
+    }
+}
