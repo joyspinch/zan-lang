@@ -1606,6 +1606,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   # 数值滚动动画（countup.js 风格）：ValueAt 插值与 Format 千分位/
   # 国际化纯函数，tick 注入驱动的走动/暂停恢复无跳变/重摆/Finish
   # 单次触发，以及组件模型（Kind/Props/Events/ControlFactory）。
+  # 上传组件：模型往返（Kind/15 Props/Events/工厂）、门与状态机
+  # （Accept/Max/BeforeUpload/Disabled、CustomRequest、Submit、
+  #  SetItem* 与 Finish/Error/Remove/Clear 计数、LastItem、Upload
+  # 别名路由），以及无头渲染一帧后的触发/行/链接/下载命中区、
+  # 拖放落区与 ::trigger 主题色非回退断言。进度全部显式驱动。
+  add_test(NAME conformance_gui_upload
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/upload_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_upload.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_upload${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   add_test(NAME conformance_gui_numberanimation
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>

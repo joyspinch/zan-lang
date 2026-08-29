@@ -162,6 +162,27 @@ class BigSeriesSource : ChartSource {
 
 /// One rendered navigation row: category headers and component entries share
 /// one entity, so the list does not need a sentinel component index.
+/// Upload 演示卡的 mock 上传任务：CustomRequest 委托（静态方法组）
+/// 把它入队，后台线程模拟推进进度，经宿主 uiApp.Post 封送回 UI 线程
+/// 调 SetItemPercent/SetItemStatus（App.Post 是 Zan 侧调用，实例方法组
+/// 在那里是安全的——闭包 ABI 限制只在 Thread.Start 入口）。
+class MockUploadJob {
+    public Upload host;
+    public int itemId;
+    public int pct;
+    public bool done;
+
+    /// UI 线程：刷新当前进度。
+    public void Tick() {
+        if (host != null) { host.SetItemPercent(itemId, pct); }
+    }
+
+    /// UI 线程：置完成（Finish 事件由组件自己发）。
+    public void Done() {
+        if (host != null) { host.SetItemStatus(itemId, UploadStatus.Success(), ""); }
+    }
+}
+
 class GalleryNavRow {
     bool header;
     int compIndex;
@@ -696,6 +717,32 @@ class Gallery {
     static Countdown demoCountdownFlash;
     static Countdown demoCountdownLaunch;
     static Countdown demoCountdownSale;
+    // Upload 演示组：实例跨帧保活（WidgetId 防漂移范式），内建选文件
+    // 弹窗由主泵按 demoUploads 路由/绘制（OwnsEventWindow 范式）。
+    // Mock 传输走后台线程 + uiApp.Post 封送（画廊线程范式）。
+    static List<Upload> demoUploads;
+    static Upload demoUploadBasic;
+    static Upload demoUploadManual;
+    static Upload demoUploadCb;
+    static Upload demoUploadDefaults;
+    static Upload demoUploadThumbs;
+    static Upload demoUploadCustom;
+    static Upload demoUploadCtl;
+    static Upload demoUploadDl;
+    static Upload demoUploadLimit;
+    static Upload demoUploadDrag;
+    static Upload demoUploadWall;
+    static List<UploadFile> demoUploadCtlList;
+    static Label demoUploadCbLabel;
+    static Label demoUploadDlLabel;
+    static Button demoUploadSubmitBtn;
+    static Button demoUploadCtlAddBtn;
+    static Button demoUploadCtlClearBtn;
+    static int demoUploadAddSeq;
+    static nint demoMockLock;
+    static List<MockUploadJob> demoMockPending;
+    static bool demoMockWorker;
+
     // NumberAnimation 演示：基础三只（尺寸档）、播放重播、精度、
     // 分隔符开关、俄语 locale、结束回调。实例跨帧保活。
     static NumberAnimation demoNumA;
@@ -1853,6 +1900,7 @@ class Gallery {
         // 就要用 Gallery.T，见那里的注释。）
         // 之后建的演示数据要用 Gallery.T，所以必须排在 lang 之后。
         Gallery.BuildSelectDemos();
+        Gallery.BuildUploadDemos();
         Gallery.splitVFirst = new SignalInt(app.Scale(150));
         Gallery.splitHFirst = new SignalInt(app.Scale(70));
         Gallery.treeSel = new SignalInt(2);
@@ -2036,8 +2084,12 @@ class Gallery {
             // 永远等不到下一圈。驱动结束后 Tick 不再置位，循环回到阻塞。
             bool driverPoll = app.pollPending;
             app.pollPending = false;
+            // Upload 内建弹窗与 filePicker 同待遇：弹窗要重绘走快轮询；
+            // 任一弹窗开着时不得阻塞在 WaitEvent 上。
+            bool uploadOpen = Gallery.AnyUploadDialogOpen();
             if (Gallery.filePicker.NeedsRedraw()
-                || (!Gallery.filePicker.IsOpen()
+                || Gallery.AnyUploadDialogRedraw()
+                || (!Gallery.filePicker.IsOpen() && !uploadOpen
                     && (app.needsRedraw || driverPoll))) {
                 int since = Window.GetTickMs() - app.lastPresentMs;
                 if (app.lastPresentMs > 0 && since < 16) {
@@ -2055,7 +2107,7 @@ class Gallery {
                 if (r == 1) {
                     r = app.window.WaitEventTimeout(16);
                 }
-            } else if (!Gallery.filePicker.IsOpen()
+            } else if (!Gallery.filePicker.IsOpen() && !uploadOpen
                        && (app.animNextMs >= 0 || app.fxNextMs >= 0)) {
                 // A throttled animation (spinner/skeleton) and/or the skin
                 // effect layer wants its next frame; idle until the earliest
@@ -2102,6 +2154,8 @@ class Gallery {
             if (kind == 8) {
                 if (Gallery.filePicker.OwnsWindow(evh)) {
                     Gallery.filePicker.ApplyEvent(evh);
+                } else if (Gallery.UploadOwnsWindow(evh)) {
+                    Gallery.UploadApplyEvent(evh);
                 } else if (evh == app.WindowHandle()) {
                     break;
                 }
@@ -2113,6 +2167,8 @@ class Gallery {
                 // so the parent stays fully responsive while the child dialog is
                 // open and there is still no cross-window click-through.
                 Gallery.filePicker.ApplyEvent(evh);
+            } else if (Gallery.UploadOwnsWindow(evh)) {
+                Gallery.UploadApplyEvent(evh);
             } else {
                 // The gallery handles wheel scrolling and code selection inside
                 // its own Render pass, so it paints on every input event rather
@@ -2172,6 +2228,13 @@ class Gallery {
                 if (pr == 1) {
                     Gallery.pickerResult = Gallery.filePicker.SelectedPath();
                 }
+            }
+
+            // Upload 内建选文件弹窗：同款每圈绘制+收结果（关闭时经
+            // Accepted 事件自动把选中路径并进宿主组件列表）。
+            if (Gallery.RenderUploadDialogs()) {
+                app.window.Show();
+                app.RequestRedraw();
             }
         }
     }
@@ -3637,6 +3700,285 @@ class Gallery {
         Gallery.demoGroupPick.AddGroup("Legacy");
         Gallery.demoGroupPick.AddOption("Pascal", true);
         Gallery.demoGroupPick.AddOption("COBOL", true);
+    }
+
+    /// Upload 演示组（对齐 Naive UI 上传文档的卡片集）。传输三件套
+    /// （basic/manual/callback）挂同一个 mock CustomRequest：后台线程
+    /// 模拟推进度；defaults/thumbs/download 直接预置数据；limit 演示
+    /// accept+max 两道门；drag 演示大拖拽区；wall 演示照片墙。
+    static void BuildUploadDemos() {
+        Gallery.demoUploads = new List<Upload>();
+        Gallery.demoMockLock = Mutex.Create();
+        Gallery.demoMockPending = new List<MockUploadJob>();
+
+        Gallery.demoUploadBasic = new Upload();
+        Gallery.demoUploadBasic.WithCustomRequest(Gallery.MockUpload);
+        Gallery.demoUploadBasic.Tip = Gallery.T(
+            "Click the button to pick a file; the mock transport simulates progress.",
+            "点按钮选文件；mock 传输模拟进度推进。");
+        Gallery.demoUploadManual = new Upload();
+        Gallery.demoUploadManual.WithCustomRequest(Gallery.MockUpload);
+        Gallery.demoUploadManual.AutoUpload = false;
+        Gallery.demoUploadSubmitBtn = new Button {
+            Text = Gallery.T("Submit", "提交上传") };
+        Gallery.demoUploadSubmitBtn.OnClick(() => {
+            Gallery.demoUploadManual.Submit();
+        });
+        Gallery.demoUploadCb = new Upload();
+        Gallery.demoUploadCb.WithCustomRequest(Gallery.MockUpload);
+        Gallery.demoUploadCbLabel = new Label("");
+        Gallery.demoUploadCbLabel.Class = "secondary";
+        Gallery.demoUploadCb.Change.Add(() => {
+            UploadFile it = Gallery.demoUploadCb.LastItem;
+            Gallery.demoUploadCbLabel.Text = Gallery.T("Change: ", "列表变化：")
+                + Gallery.UploadStateName(it) + " · " + it.name;
+        });
+        Gallery.demoUploadCb.Finish.Add(() => {
+            Gallery.demoUploadCbLabel.Text = Gallery.T(
+                "Finish: ", "上传完成：") + Gallery.demoUploadCb.LastItem.name;
+        });
+
+        // 默认文件列表 / 缩略图列表 / 下载：预置数据，不依赖传输。
+        Gallery.demoUploadDefaults = new Upload();
+        Gallery.demoUploadDefaults.Multiple = true;
+        Gallery.demoUploadDefaults.AddFile("raffle.xlsx", "", "");
+        Gallery.demoUploadDefaults.AddFile("beef-sausage-bag.avif", "", "");
+        Gallery.demoUploadDefaults.AddFile("two-tigers.mp3", "", "");
+        Gallery.demoUploadThumbs = new Upload();
+        Gallery.demoUploadThumbs.Multiple = true;
+        Gallery.demoUploadThumbs.Thumbnail = true;
+        string ph1 = Gallery.PhotoAsset("carousel1.jpeg");
+        UploadFile th1 = Gallery.demoUploadThumbs.AddFile(
+            "carousel1.jpeg", ph1, ph1);
+        if (th1 != null) { th1.thumb = ph1; }
+        UploadFile th2 = Gallery.demoUploadThumbs.AddFile("cat.mp4", "", "");
+        th2.status = UploadStatus.Uploading();
+        th2.percent = 56;
+        Gallery.demoUploadThumbs.AddFile("two-tigers.mp3", "", "");
+
+        // 自定义上传：CustomRequest 只把项标成 Uploading 就返回，
+        // 进度与完成完全由「服务器」线程推进（mock 队列）。
+        Gallery.demoUploadCustom = new Upload();
+        Gallery.demoUploadCustom.WithCustomRequest(Gallery.MockUpload);
+        Gallery.demoUploadCustom.Tip = Gallery.T(
+            "CustomRequest takes over the transport; percent and finish come from the mock worker.",
+            "CustomRequest 接管传输；进度与完成由 mock 线程推进。");
+
+        // 受控的文件列表：宿主交出 List 引用，增删即时反映。
+        Gallery.demoUploadCtlList = new List<UploadFile>();
+        Gallery.demoUploadCtl = new Upload();
+        Gallery.demoUploadCtl.Multiple = true;
+        Gallery.demoUploadCtl.SetFiles(Gallery.demoUploadCtlList);
+        Gallery.demoUploadCtl.Clear();
+        Gallery.demoUploadCtl.AddFile("controlled-a.txt", "", "");
+        Gallery.demoUploadAddSeq = 1;
+        Gallery.demoUploadCtlAddBtn = new Button {
+            Text = Gallery.T("Add file", "外部加一项") };
+        Gallery.demoUploadCtlAddBtn.OnClick(() => {
+            Gallery.demoUploadCtl.AddFile(
+                "added-" + Convert.ToString(Gallery.demoUploadAddSeq) + ".txt",
+                "", "");
+            Gallery.demoUploadAddSeq = Gallery.demoUploadAddSeq + 1;
+        });
+        Gallery.demoUploadCtlClearBtn = new Button {
+            Text = Gallery.T("Clear", "清空") };
+        Gallery.demoUploadCtlClearBtn.OnClick(() => {
+            Gallery.demoUploadCtl.Clear();
+        });
+
+        // 下载：Success 且有 url 的文件名呈链接色，点击触发 Download。
+        Gallery.demoUploadDl = new Upload();
+        Gallery.demoUploadDl.ShowDownloadButton = true;
+        Gallery.demoUploadDlLabel = new Label("");
+        Gallery.demoUploadDlLabel.Class = "secondary";
+        UploadFile dl1 = Gallery.demoUploadDl.AddFile(
+            "report.pdf", "", "https://example.com/report.pdf");
+        UploadFile dl2 = Gallery.demoUploadDl.AddFile(
+            "archive.zip", "", "https://example.com/archive.zip");
+        Gallery.demoUploadDl.Download.Add(() => {
+            Gallery.demoUploadDlLabel.Text = Gallery.T(
+                "Download clicked: ", "点击下载：")
+                + Gallery.demoUploadDl.LastItem.name;
+        });
+
+        // 限制上传文件：accept 白名单 + max 上限 + Exceed 事件。
+        Gallery.demoUploadLimit = new Upload();
+        Gallery.demoUploadLimit.Multiple = true;
+        Gallery.demoUploadLimit.Accept = "png,jpg,jpeg,gif";
+        Gallery.demoUploadLimit.Max = 3;
+        Gallery.demoUploadLimit.Tip = Gallery.T(
+            "accept: png/jpg/jpeg/gif · max: 3 · excess files fire Exceed.",
+            "accept：png/jpg/jpeg/gif · max：3 · 超限触发 Exceed。");
+
+        // 拖拽上传：整块虚线区，支持 OS 文件拖入。
+        Gallery.demoUploadDrag = new Upload();
+        Gallery.demoUploadDrag.Dragger = true;
+        Gallery.demoUploadDrag.WithCustomRequest(Gallery.MockUpload);
+        Gallery.demoUploadDrag.Multiple = true;
+
+        // 照片墙：方格 + 「+」补位块，缩略图用画廊自带照片资产。
+        Gallery.demoUploadWall = new Upload();
+        Gallery.demoUploadWall.Multiple = true;
+        Gallery.demoUploadWall.PictureCard = true;
+        Gallery.demoUploadWall.WithCustomRequest(Gallery.MockUpload);
+        List<string> wallNames = new List<string>{ "carousel1.jpeg", "carousel2.jpeg",
+            "carousel3.jpeg", "carousel4.jpeg" };
+        for (int wi = 0; wi < wallNames.Count; wi = wi + 1) {
+            string wp = Gallery.PhotoAsset(wallNames[wi]);
+            UploadFile wf = Gallery.demoUploadWall.AddFile(
+                wallNames[wi], wp, wp);
+            if (wf != null) { wf.thumb = wp; }
+        }
+
+        Gallery.demoUploads.Add(Gallery.demoUploadBasic);
+        Gallery.demoUploads.Add(Gallery.demoUploadManual);
+        Gallery.demoUploads.Add(Gallery.demoUploadCb);
+        Gallery.demoUploads.Add(Gallery.demoUploadDefaults);
+        Gallery.demoUploads.Add(Gallery.demoUploadThumbs);
+        Gallery.demoUploads.Add(Gallery.demoUploadCustom);
+        Gallery.demoUploads.Add(Gallery.demoUploadCtl);
+        Gallery.demoUploads.Add(Gallery.demoUploadDl);
+        Gallery.demoUploads.Add(Gallery.demoUploadLimit);
+        Gallery.demoUploads.Add(Gallery.demoUploadDrag);
+        Gallery.demoUploads.Add(Gallery.demoUploadWall);
+    }
+
+    static string UploadStateName(UploadFile f) {
+        if (f.status == UploadStatus.Uploading()) {
+            return Gallery.T("uploading", "上传中");
+        }
+        if (f.status == UploadStatus.Success()) { return Gallery.T("success", "成功"); }
+        if (f.status == UploadStatus.Error()) { return Gallery.T("error", "失败"); }
+        return Gallery.T("pending", "待上传");
+    }
+
+    // ---- Upload 演示的 mock 传输 ------------------------------------------
+
+    /// CustomRequest 入口（静态方法组）：项已被组件标成 Uploading，
+    /// 这里只入队交给后台 worker。
+    static void MockUpload(UploadFile item) {
+        MockUploadJob j = new MockUploadJob();
+        j.host = item.owner;
+        j.itemId = item.id;
+        j.pct = 0;
+        j.done = false;
+        Mutex.Lock(Gallery.demoMockLock);
+        Gallery.demoMockPending.Add(j);
+        bool need = !Gallery.demoMockWorker;
+        Gallery.demoMockWorker = true;
+        Mutex.Unlock(Gallery.demoMockLock);
+        if (need) { Thread.Start(Gallery.MockUploadWorker); }
+    }
+
+    /// 后台线程入口（静态方法组，A70）：逐条推进 mock 任务直到全部
+    /// 完成，然后退场复位标志（ImageHttp/UploadJob 同款队列范式）。
+    static void MockUploadWorker() {
+        while (true) {
+            MockUploadJob job = Gallery.MockUploadNext();
+            if (job == null) {
+                bool empty = true;
+                Mutex.Lock(Gallery.demoMockLock);
+                int i = 0;
+                while (i < Gallery.demoMockPending.Count) {
+                    if (!Gallery.demoMockPending[i].done) { empty = false; break; }
+                    i = i + 1;
+                }
+                if (empty) {
+                    Gallery.demoMockWorker = false;
+                    Mutex.Unlock(Gallery.demoMockLock);
+                    return;
+                }
+                Mutex.Unlock(Gallery.demoMockLock);
+                Thread.Sleep(30);
+                continue;
+            }
+            Thread.Sleep(150);
+            job.pct = job.pct + 9;
+            if (job.pct >= 100) {
+                job.pct = 100;
+                job.done = true;
+                if (job.host != null && job.host.uiApp != null) {
+                    job.host.uiApp.Post(job.Done);
+                }
+            } else {
+                if (job.host != null && job.host.uiApp != null) {
+                    job.host.uiApp.Post(job.Tick);
+                }
+            }
+        }
+    }
+
+    static MockUploadJob MockUploadNext() {
+        MockUploadJob job = null;
+        Mutex.Lock(Gallery.demoMockLock);
+        int i = 0;
+        while (i < Gallery.demoMockPending.Count) {
+            if (!Gallery.demoMockPending[i].done) {
+                job = Gallery.demoMockPending[i];
+                break;
+            }
+            i = i + 1;
+        }
+        Mutex.Unlock(Gallery.demoMockLock);
+        return job;
+    }
+
+    // ---- 主泵对 Upload 内建弹窗的路由（与 filePicker 同款三段式） --------
+
+    static bool AnyUploadDialogOpen() {
+        if (Gallery.demoUploads == null) { return false; }
+        int i = 0;
+        while (i < Gallery.demoUploads.Count) {
+            if (Gallery.demoUploads[i].DialogOpen()) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    static bool AnyUploadDialogRedraw() {
+        if (Gallery.demoUploads == null) { return false; }
+        int i = 0;
+        while (i < Gallery.demoUploads.Count) {
+            if (Gallery.demoUploads[i].DialogNeedsRedraw()) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    static bool UploadOwnsWindow(nint evh) {
+        if (Gallery.demoUploads == null) { return false; }
+        int i = 0;
+        while (i < Gallery.demoUploads.Count) {
+            if (Gallery.demoUploads[i].OwnsEventWindow(evh)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    static void UploadApplyEvent(nint evh) {
+        if (Gallery.demoUploads == null) { return; }
+        int i = 0;
+        while (i < Gallery.demoUploads.Count) {
+            if (Gallery.demoUploads[i].ApplyEventWindow(evh)) { return; }
+            i = i + 1;
+        }
+    }
+
+    /// 每圈渲染所有开着的 Upload 弹窗并收结果；有弹窗刚关闭
+    /// 返回 true（宿主据此重新激活主窗口，与 filePicker 同款处理）。
+    static bool RenderUploadDialogs() {
+        bool closed = false;
+        if (Gallery.demoUploads == null) { return false; }
+        int i = 0;
+        while (i < Gallery.demoUploads.Count) {
+            Upload u = Gallery.demoUploads[i];
+            if (u.DialogOpen()) { u.RenderDialog(); }
+            // 收结果不问开合：关闭那一刻 IsOpen 已是 false，
+            // 只在开着时收会把选中路径永远漏掉（filePicker 同款语义）。
+            if (u.TakeDialogResult() != 0) { closed = true; }
+            i = i + 1;
+        }
+        return closed;
     }
 
     /// 立即模式的演示（直接把内容 Draw/Render 到算好的坐标上，没有控件树
@@ -5140,6 +5482,70 @@ class Gallery {
             row.With(st1); row.With(st2); row.With(st3);
             Gallery.LayoutAuto(app, row, name, px, py - app.Scale(8),
                              w - app.Scale(36), app.Scale(70));
+        } else if (name == "Upload") {
+            Panel ucol = Panel.Column().Gap(app.Scale(8));
+            ucol.With(Gallery.demoUploadBasic);
+            Gallery.LayoutAuto(app, ucol, name, px, py,
+                             w - app.Scale(36), app.Scale(120));
+        } else if (name == "Upload.manual") {
+            Panel ucol = Panel.Column().Gap(app.Scale(8));
+            ucol.With(Gallery.demoUploadManual);
+            Panel ubtns = Panel.Row().Gap(app.Scale(10));
+            ubtns.With(Gallery.demoUploadSubmitBtn);
+            ucol.With(ubtns);
+            Gallery.LayoutAuto(app, ucol, name, px, py,
+                             w - app.Scale(36), app.Scale(140));
+        } else if (name == "Upload.callback") {
+            Panel ucol = Panel.Column().Gap(app.Scale(8));
+            ucol.With(Gallery.demoUploadCb);
+            ucol.With(Gallery.demoUploadCbLabel);
+            Gallery.LayoutAuto(app, ucol, name, px, py,
+                             w - app.Scale(36), app.Scale(140));
+        } else if (name == "Upload.defaults") {
+            Panel ucol = Panel.Column().Gap(app.Scale(8));
+            ucol.With(Gallery.demoUploadDefaults);
+            Gallery.LayoutAuto(app, ucol, name, px, py,
+                             w - app.Scale(36), app.Scale(120));
+        } else if (name == "Upload.thumbs") {
+            Panel ucol = Panel.Column().Gap(app.Scale(8));
+            ucol.With(Gallery.demoUploadThumbs);
+            Gallery.LayoutAuto(app, ucol, name, px, py,
+                             w - app.Scale(36), app.Scale(150));
+        } else if (name == "Upload.custom") {
+            Panel ucol = Panel.Column().Gap(app.Scale(8));
+            ucol.With(Gallery.demoUploadCustom);
+            Gallery.LayoutAuto(app, ucol, name, px, py,
+                             w - app.Scale(36), app.Scale(120));
+        } else if (name == "Upload.controlled") {
+            Panel ucol = Panel.Column().Gap(app.Scale(8));
+            ucol.With(Gallery.demoUploadCtl);
+            Panel ubtns = Panel.Row().Gap(app.Scale(10));
+            ubtns.With(Gallery.demoUploadCtlAddBtn);
+            ubtns.With(Gallery.demoUploadCtlClearBtn);
+            ucol.With(ubtns);
+            Gallery.LayoutAuto(app, ucol, name, px, py,
+                             w - app.Scale(36), app.Scale(150));
+        } else if (name == "Upload.download") {
+            Panel ucol = Panel.Column().Gap(app.Scale(8));
+            ucol.With(Gallery.demoUploadDl);
+            ucol.With(Gallery.demoUploadDlLabel);
+            Gallery.LayoutAuto(app, ucol, name, px, py,
+                             w - app.Scale(36), app.Scale(130));
+        } else if (name == "Upload.limit") {
+            Panel ucol = Panel.Column().Gap(app.Scale(8));
+            ucol.With(Gallery.demoUploadLimit);
+            Gallery.LayoutAuto(app, ucol, name, px, py,
+                             w - app.Scale(36), app.Scale(120));
+        } else if (name == "Upload.dragger") {
+            Panel ucol = Panel.Column().Gap(app.Scale(8));
+            ucol.With(Gallery.demoUploadDrag);
+            Gallery.LayoutAuto(app, ucol, name, px, py,
+                             w - app.Scale(36), app.Scale(190));
+        } else if (name == "Upload.wall") {
+            Panel ucol = Panel.Column().Gap(app.Scale(8));
+            ucol.With(Gallery.demoUploadWall);
+            Gallery.LayoutAuto(app, ucol, name, px, py,
+                             w - app.Scale(36), app.Scale(230));
         } else if (name == "Countdown") {
             // 三种格式与三档字号；第三只归零后由 Finish 翻成 error 色。
             Flex crow = Flex.Wrapped().Gap(app.Scale(28));
@@ -10405,6 +10811,96 @@ class Gallery {
             .AddProp("type", "enum", "date", "date/datetime/daterange/datetimerange/week/month/monthrange/quarter/quarterrange/year/yearrange (Naive UI type).")
             .AddProp("size", "enum", "medium", "tiny/small/medium/large (Naive UI size; input.small/.large tier heights).")
             .AddEvent("Change", "() => void", "Fires when the value (or one side of a range) changes.");
+
+        Gallery.Add(list, "Data Entry", "Upload",
+            Gallery.T("File upload (Naive UI n-upload): a trigger button or a full dragger area feeds a file list with per-item status, progress, thumbnail, remove and download. Transport is pluggable -- built-in multipart HTTP POST via Action, a CustomRequest hook for your own channel, or pure manual Submit/SetItemStatus for controlled demos. BeforeUpload vetoes single files; accept+max gate the batch and fire Exceed.",
+                "文件上传（Naive UI n-upload 对位）：触发按钮或整块拖拽区喂给一个带逐项状态、进度、缩略图、移除与下载的文件列表。传输可插拔——Action 内置 multipart HTTP POST、CustomRequest 钩子接管成自己的通道，或纯手动 Submit/SetItemStatus 驱动演示。BeforeUpload 单文件拦截；accept+max 把关整批并触发 Exceed。"),
+            "Upload up = new Upload();\nup.WithAction(\"http://127.0.0.1:8080/upload\", \"file\");\nup.Multiple = true;\nup.Accept = \"png,jpg\";\nup.Max = 3;\nup.Change += () => {\n    UploadFile it = up.LastItem;   // 刚变化的那一项\n};\nup.Finish += () => log(up.LastItem.response);\n// each frame (registers its own hit rects):\nup.Render(app, 40, 60, 420);")
+            .Json("{\n  \"type\": \"Upload\",\n  \"name\": \"up\",\n  \"action\": \"/api/upload\",\n  \"multiple\": true,\n  \"accept\": \"png,jpg\",\n  \"max\": 3,\n  \"dragger\": false,\n  \"autoUpload\": true\n}")
+            .AddProp("action", "string", "\"\"", "Built-in multipart POST target (http/https, optional :port). \"\" = no transport; items stay Pending. Attach via WithAction(url, fieldName).")
+            .AddProp("fieldName", "string", "\"file\"", "Multipart form field name (WithAction second argument).")
+            .AddProp("accept", "string", "\"\"", "Extension whitelist, comma separated ('png,jpg' / '.png,image/jpeg' both parse).")
+            .AddProp("max", "int", "0", "Max admitted items (0 = unlimited); overflow raises Exceed with LastItem = the rejected file.")
+            .AddProp("autoUpload", "bool", "true", "Start transport right after a file is admitted; false = manual Submit().")
+            .AddProp("multiple", "bool", "false", "Batch picking/dropping.")
+            .AddProp("triggerText", "string", "\"上传文件\"", "Trigger button label.")
+            .AddProp("showTrigger", "bool", "true", "Hide the trigger (list-only view for controlled demos).")
+            .AddProp("showRemoveButton", "bool", "true", "Per-row x button (rows mode).")
+            .AddProp("showDownloadButton", "bool", "false", "Per-row download glyph; click raises Download (LastItem = the file).")
+            .AddProp("dragger", "bool", "false", "Whole-area dashed drop zone instead of a button (Naive UI dragger).")
+            .AddProp("dragText", "string", "\"点击或者拖动文件到该区域来上传\"", "Dragger main text.")
+            .AddProp("tip", "string", "\"\"", "Grey hint line under the trigger.")
+            .AddProp("pictureCard", "bool", "false", "Photo wall: square tiles + trailing add block (Naive UI picture-card).")
+            .AddProp("thumbnail", "bool", "false", "Rows mode: image rows draw a small cover thumb (thumb field, else path).")
+            .AddProp("SetFiles(list)", "List<UploadFile>", "self-built", "Controlled mode: share your own list reference; every mutation repaints the rows.")
+            .AddEvent("Change", "() => void", "File list mutated (add/remove/clear). LastItem = the touched file.")
+            .AddEvent("Upload", "() => void", "An item entered Uploading (alias of UploadStart).")
+            .AddEvent("Finish", "() => void", "An item reached Success (percent pinned to 100).")
+            .AddEvent("Error", "() => void", "An item failed; LastItem.message carries the reason.")
+            .AddEvent("Remove", "() => void", "An item removed (x button or RemoveItem).")
+            .AddEvent("Download", "() => void", "Name link / download glyph clicked; wire to your own save flow.")
+            .AddEvent("Exceed", "() => void", "Max exceeded by an incoming batch.")
+            .AddDemo(Gallery.T("Manual submit", "非受控手动提交"),
+                Gallery.T("autoUpload = false: picked files pile up as Pending rows and nothing moves until Submit() -- one button to flush the whole list.",
+                    "autoUpload = false：选进来的文件以「待上传」停在列表里，点提交按钮才整批开传。"),
+                "Upload.manual", 140,
+                "Upload up = new Upload();\nup.WithCustomRequest(mockRequest);\nup.AutoUpload = false;\nsaveBtn.Click += () => up.Submit();\n// Submit() starts every Pending item",
+                "")
+            .AddDemo(Gallery.T("Finish callback", "上传完成的回调"),
+                Gallery.T("Change fires on every list mutation and Finish when an item lands; LastItem points at the file being talked about. The grey line below echoes the events live.",
+                    "列表每次增删触发 Change，某项完成触发 Finish，LastItem 指向被提及的文件。下方灰字实时回显事件。"),
+                "Upload.callback", 140,
+                "up.Change += () => {\n    label.Text = \"Change: \" + up.LastItem.name;\n};\nup.Finish += () => {\n    label.Text = \"Finish: \" + up.LastItem.name;\n};",
+                "")
+            .AddDemo(Gallery.T("Default file list", "默认文件列表"),
+                Gallery.T("Pre-seeded rows via AddFile(name, path, url): with no transport they rest Pending, exactly the \"restore the draft\" view.",
+                    "AddFile(name, path, url) 预置行：无传输通道时停在待上传，正是「草稿回显」要的形态。"),
+                "Upload.defaults", 120,
+                "Upload up = new Upload();\nup.AddFile(\"raffle.xlsx\", \"\", \"\");\nup.AddFile(\"two-tigers.mp3\", \"\", \"\");",
+                "")
+            .AddDemo(Gallery.T("Thumbnail list", "缩略图文件列表"),
+                Gallery.T("thumbnail = true: image rows blit a small cover thumb (thumb field, falling back to the local path); a mid-flight row keeps its progress bar.",
+                    "thumbnail = true：图片行画小封面略图（thumb 字段优先，缺省回退本地路径），上传中的行保留进度条。"),
+                "Upload.thumbs", 150,
+                "Upload up = new Upload();\nup.Thumbnail = true;\nup.AddFile(\"carousel1.jpeg\", p, p);  // url 有值 = 已完成\nUploadFile f = up.AddFile(\"cat.mp4\", \"\", \"\");\nf.status = UploadStatus.Uploading();\nf.percent = 56;",
+                "")
+            .AddDemo(Gallery.T("Custom request", "自定义上传"),
+                Gallery.T("CustomRequest takes over the transport entirely: the component has already flipped the row to Uploading -- you drive SetItemPercent/SetItemStatus from your own channel (here: a mock worker thread posting back through App.Post).",
+                    "CustomRequest 完全接管传输：组件已把行标成上传中——进度与终态由你的通道推 SetItemPercent/SetItemStatus（这里用 mock 工作线程经 App.Post 封送回 UI）。"),
+                "Upload.custom", 120,
+                "up.WithCustomRequest(MyChannel);\nstatic void MyChannel(UploadFile item) {\n    // 起线程/协程，按进度:\n    item.owner.SetItemPercent(item.id, 42);\n    // 完成:\n    item.owner.SetItemStatus(item.id,\n        UploadStatus.Success(), \"\");\n}",
+                "")
+            .AddDemo(Gallery.T("Controlled list", "受控的文件列表"),
+                Gallery.T("SetFiles hands the component your List reference: buttons that add or clear files mutate the host's own list and the rows follow -- the state machine lives in the host.",
+                    "SetFiles 把你的 List 引用交给组件：外部按钮增删的是宿主自己的列表，行跟着变——状态机在宿主手里。"),
+                "Upload.controlled", 150,
+                "List<UploadFile> hostList = new List<UploadFile>();\nUpload up = new Upload();\nup.SetFiles(hostList);\naddBtn.Click += () => up.AddFile(\"added-1.txt\", \"\", \"\");\nclearBtn.Click += () => up.Clear();",
+                "")
+            .AddDemo(Gallery.T("Download", "下载文件"),
+                Gallery.T("A Success file with a url renders its name as a primary-coloured link; clicking it (or the download glyph) raises Download with LastItem set -- wire that to your save/export flow.",
+                    "带 url 的成功项把文件名画成主色链接；点名字或下载图标触发 Download，LastItem 指向该项——接到自己的保存流程上。"),
+                "Upload.download", 130,
+                "up.ShowDownloadButton = true;\nup.AddFile(\"report.pdf\", \"\",\n    \"https://example.com/report.pdf\");\nup.Download += () => save(up.LastItem.url);",
+                "")
+            .AddDemo(Gallery.T("Limits", "限制上传文件"),
+                Gallery.T("accept filters by extension before anything else; max caps the list and the overflowing picks fire Exceed instead of joining.",
+                    "accept 按扩展名先行过滤；max 封顶，装不下的触发 Exceed 而非入列。"),
+                "Upload.limit", 120,
+                "up.Accept = \"png,jpg,jpeg,gif\";\nup.Max = 3;\nup.Exceed += () => toast(\"最多 3 张\");",
+                "")
+            .AddDemo(Gallery.T("Dragger", "拖拽上传"),
+                Gallery.T("dragger = true swaps the button for a full-width dashed zone; clicking it opens the picker and dropping files from the OS feeds the same gate chain.",
+                    "dragger = true 把按钮换成整幅虚线区：点击开选择窗，从系统拖文件进来走同一道 accept/max 门。"),
+                "Upload.dragger", 190,
+                "Upload up = new Upload();\nup.Dragger = true;\nup.Multiple = true;\nup.WithCustomRequest(mockRequest);\nup.Render(app, 40, 60, 420);  // 支持 OS 拖入",
+                "")
+            .AddDemo(Gallery.T("Photo wall", "照片墙"),
+                Gallery.T("pictureCard = true: square tiles with cover-blitted previews, a trailing dashed add block, and hover masks with remove/download circles. Wall items use the gallery's own carousel assets.",
+                    "pictureCard = true：方格封面缩略 + 尾部虚线「+」块 + 悬停遮罩上的移除/下载圆钮。示例图用画廊自带轮播资产。"),
+                "Upload.wall", 230,
+                "Upload up = new Upload();\nup.PictureCard = true;\nup.Multiple = true;\nup.AddFile(\"carousel1.jpeg\", p, p);\nup.Render(app, 40, 60, 420);",
+                "")
+            .WithBasic(120);
     }
 
     static void BuildDataDisplay(List<Comp> list) {
