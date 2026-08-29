@@ -4,9 +4,13 @@ using Gui.Widget;
 
 /// Gui.Transfer 的无窗口回归：Bind 实时视图、勾选集合、MoveRight /
 /// MoveLeft 的行序搬移与倒序删除、过滤只搬命中行（含缓存失效）、
-/// ClearChecked 的全量/过滤两态、oneWay 下右栏不可勾，以及组件模型
-/// （Kind/StyleType/Props 往返/Events/ControlFactory）。事件经 Post
-/// 排到 UI 派发队列，headless 不泵事件，故只断言数据态。
+/// ClearChecked 的全量/过滤两态、oneWay 下右栏不可勾，右栏全选 /
+/// 清除 / 范围勾选的编程对位（SelectAll / SelectAllVisible / ClearAll /
+/// CheckRange 闭区间语义），真实帧序的按住拖拽扫带多选（按下与扫带
+/// 不提前入账、抬起按闭区间置态、单击=翻一行、双击回原态），以及
+/// 组件模型（Kind/StyleType/Props 往返/Events/ControlFactory）。
+/// 数据态事件经 Post 排到 UI 派发队列，headless 不泵事件，故只断言
+/// 数据态；拖拽段用 InjectEvent + PumpGuarded/FrameGuarded 出真帧。
 class TrfUser {
     string name;
     TrfUser(string n) { name = n; }
@@ -40,6 +44,49 @@ class TransferTest {
             r.Add("Option " + Convert.ToString(i));
         }
         return r;
+    }
+
+    // ---- 真实帧序拖拽重放（App + InjectEvent，仿 wheel_route_test）----
+    static App app;
+    static Transfer<string> dt;
+    static List<string> da;
+    static List<string> db;
+
+    static void DragBody() { dt.Render(app, 16, 16, 600, 480); }
+
+    static void PumpFrame() {
+        app.PumpGuarded();
+        app.FrameGuarded(TransferTest.DragBody);
+    }
+
+    /// 在左栏第 row 行投一个事件（1=移动 2=按下 3=释放），出一帧。
+    static void At(int row, int kind) {
+        int cx = 0;
+        int cy = 0;
+        if (!dt.RowCenter(true, row, out cx, out cy)) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL row " + Convert.ToString(row)
+                              + " not hittable");
+            return;
+        }
+        app.window.InjectEvent(kind, cx, cy, 0, 0, 0);
+        PumpFrame();
+    }
+
+    static string FlagsOf(Transfer<string> tt, int n) {
+        string s = "";
+        for (int i = 0; i < n; i = i + 1) {
+            if (tt.IsChecked("Option " + Convert.ToString(i))) {
+                s = s + "1";
+            } else {
+                s = s + "0";
+            }
+        }
+        return s;
+    }
+
+    static string DragFlags() {
+        return FlagsOf(dt, da.Count);
     }
 
     static void Main() {
@@ -129,6 +176,93 @@ class TransferTest {
         o.MoveRight();
         Eq("one-way src", wa.Count, 3);
         Eq("one-way tgt", wb.Count, 2);
+        o.SelectAll(false, true);                // 单向右栏只读：全选空操作
+        Eq("one-way right stays unchecked", o.CheckedTarget(), 0);
+        Eq("one-way CheckRange blocked", o.CheckRange(false, 0, 1, true), 0);
+
+        // ---- 右栏表头全选的编程对位：SelectAll / SelectAllVisible ----
+        Transfer<string> s2 = new Transfer<string>();
+        List<string> la = Seq(5);                // Option 0..4
+        List<string> lb = new List<string>();
+        lb.Add("Opt0");
+        lb.Add("Opt1");
+        lb.Add("Opt2");                          // 右栏用不同名，避开
+        s2.Bind(la, lb);                         // source-first 查找歧义
+        s2.SelectAll(false, true);
+        Eq("right select-all", s2.CheckedTarget(), 3);
+        s2.SelectAll(false, false);
+        Eq("right select-none", s2.CheckedTarget(), 0);
+        s2.SetChecked("Opt1", true);             // 部分勾选 → 半选口径
+        s2.SelectAllVisible(false);              // 未全 → 补成全选
+        Eq("right visible toggles to all", s2.CheckedTarget(), 3);
+        s2.SelectAllVisible(false);              // 已全 → 取消
+        Eq("right visible toggles to none", s2.CheckedTarget(), 0);
+        s2.SetChecked("Opt2", true);             // 只勾 1 行（部分）
+        s2.SetQuery(false, "Opt1");              // 过滤到 Opt1
+        s2.SelectAll(false, true);               // 只作用于可见行
+        Ok("visible right row checked", s2.IsChecked("Opt1"));
+        Ok("hidden right row keeps check", s2.IsChecked("Opt2"));
+        Eq("right visible checked count", s2.CheckedTarget(), 2);
+        s2.SetQuery(false, "");
+        s2.ClearAll();                           // 右栏清除（表头链接对位）
+        Eq("ClearAll empties right", s2.CheckedTarget(), 0);
+        Eq("ClearAll keeps data", lb.Count, 3);
+
+        // ---- CheckRange：拖带入账的同一核心（闭区间/反序/裁剪） ----
+        Transfer<string> s3 = new Transfer<string>();
+        s3.Bind(Seq(6), new List<string>());
+        Eq("range 1..3 sets 3", s3.CheckRange(true, 1, 3, true), 3);
+        EqStr("range bits", FlagsOf(s3, 6), "011100");
+        Eq("range reversed 4..2 clears 2",
+           s3.CheckRange(true, 4, 2, false), 2);  // 2..3 翻掉，4 本就是 0
+        EqStr("range reversed bits", FlagsOf(s3, 6), "010000");
+        Eq("single toggle", s3.CheckRange(true, 1, 1, false), 1);
+        Eq("idempotent re-set 0", s3.CheckRange(true, 1, 1, false), 0);
+        EqStr("all clear bits", FlagsOf(s3, 6), "000000");
+        Eq("range clamps high", s3.CheckRange(true, 3, 99, true), 3);
+        EqStr("clamped bits", FlagsOf(s3, 6), "000111");
+        Eq("negative low clamps to 0", s3.CheckRange(true, 0 - 3, 0, false), 0);
+        EqStr("low clamp keeps bits", FlagsOf(s3, 6), "000111");
+
+        // ---- RowCenter：未渲染（零几何）安全返回 false ---------------
+        int rcx = 0;
+        int rcy = 0;
+        Ok("RowCenter before render", !s3.RowCenter(true, 0, out rcx, out rcy));
+
+        // ---- 真实帧序拖拽重放（move→press→move×n→release）：按下与扫
+        // 带都不提前入账，抬起按两端闭区间置为目标态；单击=翻一行。
+        app = new App("transfer", 640, 520);
+        app.Show();
+        app.RequestAnimationFrame(16);
+        dt = new Transfer<string>();
+        da = Seq(8);
+        db = new List<string>();
+        db.Add("R0");
+        dt.Bind(da, db);
+        PumpFrame();
+        PumpFrame();
+        Ok("rendered row0 hittable", dt.RowCenter(true, 0, out rcx, out rcy));
+        EqStr("drag start", DragFlags(), "00000000");
+        At(1, 2);                                    // 按下 row1（立锚点）
+        EqStr("press defers", DragFlags(), "00000000");
+        At(2, 1);
+        At(3, 1);
+        At(4, 1);                                    // 按住扫过 2..4
+        EqStr("sweep defers", DragFlags(), "00000000");
+        At(4, 3);                                    // row4 抬起 → 带 [1,4] 入账
+        EqStr("release commits band", DragFlags(), "01111000");
+        At(3, 2);
+        At(5, 1);
+        At(5, 3);                    // 按 row3（勾着→目标不勾）扫到 5
+        EqStr("reverse band unchecks", DragFlags(), "01100000");
+        At(7, 2);
+        At(7, 3);                                    // 单击 row7 = 翻一行
+        EqStr("plain click toggles", DragFlags(), "01100001");
+        At(7, 2);
+        At(7, 3);                                    // 双击第二击 → 回原态
+        EqStr("double click reverts", DragFlags(), "01100000");
+        Eq("drag never moves data", da.Count, 8);
+        Eq("drag never touched right", dt.TargetCount(), 1);
 
         // ---- 自定义 T + WithLabel/WithIcon（委托只读参数） -----------
         List<TrfUser> ua = new List<TrfUser>();

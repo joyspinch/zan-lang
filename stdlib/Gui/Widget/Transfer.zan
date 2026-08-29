@@ -16,6 +16,21 @@ class TransferPane {
     List<int> order;
     Input search;
     string query;
+    /// 按住拖拽多选的锚点：按下行的原列表下标（-1 = 未在拖）与
+    /// 拖到的最远行下标；两端闭区间内的行取锚点目标态（橡皮筋
+    /// 只染扫过的带），带外行保持真实勾选。
+    int paintStart;
+    int paintEnd;
+    /// 锚点按下时暂存的切换（抬起帧统一入账，保住双击=两次翻勾
+    /// 的既有语义）：拖拽期间行画的是两端闭区间算出的预览态。
+    bool paintVal;
+    /// 命中区几何缓存（RenderPane 行区开画前记录）：RowCenter 据
+    /// 此把「第 i 行的屏幕位置」算给宿主拖放对接与无头回归重放。
+    int bodyX;
+    int bodyY;
+    int bodyW;
+    int bodyH;
+    int rowHPx;
     /// 最近一次量出 order 时数据计数与关键词。
     int orderFor;
     string orderQuery;
@@ -26,6 +41,14 @@ class TransferPane {
         order = new List<int>();
         search = null;
         query = "";
+        paintStart = 0 - 1;
+        paintEnd = 0 - 1;
+        paintVal = false;
+        bodyX = 0;
+        bodyY = 0;
+        bodyW = 0;
+        bodyH = 0;
+        rowHPx = 0;
         orderFor = 0 - 1;
         orderQuery = "";
     }
@@ -65,6 +88,15 @@ class Transfer<T> : Control {
     string totalText;
     string selectedText;
     string clearText;
+    /// 按住拖拽多选：按下行暂存的切换（抬起帧统一入账，保住
+    /// Ui.Clicked 的单次语义）、拖过即置的目标态，以及「上一次
+    /// 按下是否成过一次拖动」——双击的第二次按下若紧接一次拖动
+    /// 后落在同一行，不能把刚入账的切换再翻回去。
+    int pendRow;
+    int pendPane;
+    bool pendOn;
+    bool wasPaint;
+    bool lastDrag;
     /// 中缝移动按钮（保留态 Button，不入树 children——由 Render
     /// 每帧显式绘制；文字非空时文字优先于图标）。
     Button rightBtn;
@@ -301,6 +333,13 @@ class Transfer<T> : Control {
         this.ClearPane(right, target, all);
     }
 
+    /// 编程式「清除」：与右栏表头清除链接同一实现（清掉右栏全部
+    /// 勾选；单向模式右栏只读，为空操作）。
+    void ClearAll() {
+        if (oneWay) { return; }
+        this.ClearPane(right, target, true);
+    }
+
     void ClearPane(TransferPane p, List<T> data, bool all) {
         bool dirty = false;
         if (all) {
@@ -318,6 +357,43 @@ class Transfer<T> : Control {
             }
         }
         if (dirty) { SelectChanged.Post(); }
+    }
+
+    /// 程序化全选/取消勾选某侧（只作用于当前过滤结果的可见行，
+    /// 与表头全选框同一语义）。单向模式的右栏只读，为空操作。
+    void SelectAll(bool isSource, bool on) {
+        if (oneWay && !isSource) { return; }
+        TransferPane p = isSource ? left : right;
+        List<T> data = isSource ? source : target;
+        this.SyncFlags(p, data.Count);
+        List<int> order = this.Order(p, data);
+        bool dirty = false;
+        for (int k = 0; k < order.Count; k = k + 1) {
+            int i = order[k];
+            if (i < p.flags.Count && p.flags[i] != on) {
+                p.flags[i] = on;
+                dirty = true;
+            }
+        }
+        if (dirty) { SelectChanged.Post(); }
+    }
+
+    /// 勾选/取消勾选某侧当前过滤结果的全部可见行（表头全选框的
+    /// 单向对位：on=false 即清空可见勾选）。
+    void SelectAllVisible(bool isSource) {
+        TransferPane p = isSource ? left : right;
+        List<T> data = isSource ? source : target;
+        int selN = 0;
+        int allN = 0;
+        List<int> order = this.Order(p, data);
+        for (int k = 0; k < order.Count; k = k + 1) {
+            int i = order[k];
+            if (i < p.flags.Count) {
+                allN = allN + 1;
+                if (p.flags[i]) { selN = selN + 1; }
+            }
+        }
+        this.SelectAll(isSource, selN < allN);
     }
 
     /// 移动核心：按源侧当前可见行序（过滤时只搬看得见的勾选）
@@ -400,6 +476,24 @@ class Transfer<T> : Control {
         return p.query;
     }
 
+    /// 第 `dataIdx` 行（原列表下标）在屏幕上的中心点（cx/cy 出参）。
+    /// 尚未渲染过（Render 之前的空档）或该行不在该侧时返回 false。
+    bool RowCenter(bool isSource, int dataIdx, out int cx, out int cy) {
+        TransferPane p = isSource ? left : right;
+        cx = 0;
+        cy = 0;
+        if (p.rowHPx <= 0) { return false; }
+        List<int> order = p.order;
+        for (int k = 0; k < order.Count; k = k + 1) {
+            if (order[k] == dataIdx) {
+                cx = p.bodyX + p.bodyW / 2;
+                cy = p.bodyY + k * p.rowHPx + p.rowHPx / 2 - p.scroll.Get();
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// 每帧入口（保留模式由 OnPaint 代调）：把穿梭框画进
     /// (x,y,w,h)。先摆中缝按钮，再画两栏面板。
     void Render(App app, int x, int y, int w, int h) {
@@ -447,6 +541,24 @@ class Transfer<T> : Control {
         dirty = this.RenderPane(app, right, target,
                                 ix + panelW + opW + opGap * 2, iy,
                                 panelW, ih, false) || dirty;
+        // 按下/拖拽的勾选在抬起帧入账：拖过把整段扫带置为目标态，
+        // 普通点击就是单次翻勾（连按同一行两次=双击回到原状态，
+        // 与旧 Clicked 路径同语义）。失焦帧 pointerDown 已清、kind!=3，
+        // 锚点就地作废，预览回落到真实勾选。
+        if (app.EventKind() == 3) {
+            dirty = this.FlushPaint(left) || dirty;
+            dirty = this.FlushPaint(right) || dirty;
+        }
+        if (!app.pointerDown
+            && (left.paintStart >= 0 || right.paintStart >= 0)) {
+            // 失焦（窗口被抢走，抬键不会送达本窗）：就地作废锚点，
+            // 预览回落到真实勾选，绝不留「永远按着」。
+            left.paintStart = 0 - 1;
+            left.paintEnd = 0 - 1;
+            right.paintStart = 0 - 1;
+            right.paintEnd = 0 - 1;
+            dirty = true;
+        }
         dirty = moved || dirty;
         if (dirty) {
             app.NoteDamage(x, y, w, h);
@@ -474,8 +586,112 @@ class Transfer<T> : Control {
         if (bw > opW) { opW = bw; }
     }
 
-    /// 一栏：头部（全选/计数 或 清除/已选）、可选搜索框、虚拟化
-    /// 复选行区、空态。返回本帧是否有状态变化（需要重绘）。
+    /// 表头全选框（两栏共用）：画框（全勾/半选/空）+ 文案 + 命中
+    /// 区，点击时对当前过滤结果的可见行整体勾选/取消。返回本帧
+    /// 是否有勾选变更。单向模式右栏只读，不画框（行区同口径）。
+    bool HeadSelectAll(App app, TransferPane p, List<int> order,
+                       bool isSource, int hx, int iy, int headH,
+                       int hy, int fs, int fg) {
+        int hbox = app.Scale(16);
+        int hby = iy + (headH - hbox) / 2;
+        int allN = 0;
+        int selN = 0;
+        for (int k = 0; k < order.Count; k = k + 1) {
+            int i = order[k];
+            if (i < p.flags.Count) {
+                allN = allN + 1;
+                if (p.flags[i]) { selN = selN + 1; }
+            }
+        }
+        if (selN > 0 && selN == allN) {
+            Checkbox.PaintBox(app, hx, hby, hbox, 1000);
+        } else if (selN > 0) {
+            Checkbox.PaintBoxIndeterminate(app, hx, hby, hbox);
+        } else {
+            Checkbox.PaintBox(app, hx, hby, hbox, 0);
+        }
+        int cid = app.focus.AllocId();
+        app.canvas.DrawText(hx + hbox + app.Scale(6), hy, selectAllText,
+                            fg, fs);
+        int lw = Canvas.MeasureText(selectAllText, fs);
+        app.hitTester.RegisterRect(cid, hx, iy,
+                                   hbox + app.Scale(6) + lw, headH, 2);
+        if (Ui.Clicked(app, cid) && !this.IsDisabled()
+            && (isSource || !oneWay)) {
+            bool on = selN < allN;
+            for (int k = 0; k < order.Count; k = k + 1) {
+                int i = order[k];
+                if (i < p.flags.Count) { p.flags[i] = on; }
+            }
+            SelectChanged.Post();
+            return true;
+        }
+        return false;
+    }
+
+    /// 抬起帧入账一栏的按下/拖拽（见 PaintRange）。单向模式右栏
+    /// 只读、整件禁用：锚点直接作废，不入账。
+    bool FlushPaint(TransferPane p) {
+        if (p.paintStart < 0) { return false; }
+        int a = p.paintStart;
+        int b = p.paintEnd;
+        bool val = p.paintVal;
+        p.paintStart = 0 - 1;
+        p.paintEnd = 0 - 1;
+        if (this.IsDisabled() || (oneWay && p == right)) {
+            return false;
+        }
+        int changed = PaintRange(p, a, b, val);
+        if (changed > 0) { SelectChanged.Post(); }
+        return changed > 0;
+    }
+
+    /// 抬起入账：把锚点行与抬起行之间的闭区间（含端点、方向无关）
+    /// 统一置为锚点按下时暂存的目标态；带外行一律不碰（橡皮筋只染
+    /// 扫过的带）。单击（a==b）即翻一行——与旧 Clicked 路径同语义，
+    /// 双击连点回到原状态。无头回归直接重放本函数（见
+    /// tests/gui/transfer_test.zan）；越界端点自动收窄到 flags 内。
+    /// 返回变更的行数（调用方据此决定 Post 一次）。
+    static int PaintRange(TransferPane p, int a, int b, bool val) {
+        int lo = a < b ? a : b;
+        int hi = a < b ? b : a;
+        if (lo < 0) { lo = 0; }
+        if (hi > p.flags.Count - 1) { hi = p.flags.Count - 1; }
+        int changed = 0;
+        for (int i = lo; i <= hi; i = i + 1) {
+            if (p.flags[i] != val) { p.flags[i] = val; changed = changed + 1; }
+        }
+        return changed;
+    }
+
+    /// 程序化范围勾选（按住拖拽扫带入账的同一核心，也供无头回归
+    /// 重放）：把原列表下标闭区间 [a,b]（两端大小不限）整段置为
+    /// val，带外行不碰。返回变更行数；单向模式右栏只读，空操作。
+    int CheckRange(bool isSource, int a, int b, bool val) {
+        if (oneWay && !isSource) { return 0; }
+        TransferPane p = isSource ? left : right;
+        List<T> data = isSource ? source : target;
+        this.SyncFlags(p, data.Count);
+        int changed = PaintRange(p, a, b, val);
+        if (changed > 0) { SelectChanged.Post(); }
+        return changed;
+    }
+
+    /// 本行是否落在当前按下-拖拽带里（区间含端点、方向无关）。
+    /// 未按下时恒 false；行区渲染据此画预览态。
+    bool InPaintBand(TransferPane p, int i) {
+        if (p.paintStart < 0) { return false; }
+        int lo = p.paintStart;
+        int hi = p.paintEnd;
+        if (hi < lo) {
+            int tmp = lo; lo = hi; hi = tmp;
+        }
+        return i >= lo && i <= hi;
+    }
+
+    /// 一栏：头部（全选 / 计数 / 清除+已选）、可选搜索框、虚拟化
+    /// 复选行区（按住拖拽扫带多选）、空态。返回本帧是否有状态
+    /// 变化（需要重绘）。
     bool RenderPane(App app, TransferPane p, List<T> data, int x, int y,
                     int w, int h, bool isSource) {
         Canvas c = app.canvas;
@@ -526,47 +742,21 @@ class Transfer<T> : Control {
         c.FillRect(ix, iy + headH - 1, iw, 1, divider.BgOr(0));
         int hx = ix + pad;
         int hy = Canvas.CenterTextY(iy, headH, fs);
-        if (isSource) {
-            // 全选框：过滤后的可见行全勾=已勾，部分=半选。
-            int hbox = app.Scale(16);
-            int hby = iy + (headH - hbox) / 2;
-            int allN = 0;
-            int selN = 0;
-            for (int k = 0; k < order.Count; k = k + 1) {
-                int i = order[k];
-                if (i < p.flags.Count) {
-                    allN = allN + 1;
-                    if (p.flags[i]) { selN = selN + 1; }
-                }
-            }
-            if (selN > 0 && selN == allN) {
-                Checkbox.PaintBox(app, hx, hby, hbox, 1000);
-            } else if (selN > 0) {
-                Checkbox.PaintBoxIndeterminate(app, hx, hby, hbox);
-            } else {
-                Checkbox.PaintBox(app, hx, hby, hbox, 0);
-            }
-            int cid = app.focus.AllocId();
-            c.DrawText(hx + hbox + app.Scale(6), hy, selectAllText,
-                       header.FgOr(root.fg), fs);
-            int lw = Canvas.MeasureText(selectAllText, fs);
-            app.hitTester.RegisterRect(cid, hx, iy,
-                                       hbox + app.Scale(6) + lw, headH, 2);
-            if (Ui.Clicked(app, cid) && !this.IsDisabled()) {
-                bool on = selN < allN;
-                for (int k = 0; k < order.Count; k = k + 1) {
-                    int i = order[k];
-                    if (i < p.flags.Count) { p.flags[i] = on; }
-                }
-                SelectChanged.Post();
-                dirty = true;
-            }
-            hx = hx + hbox + app.Scale(6) + lw + pad;
-            c.DrawText(hx, hy,
-                       totalText + " " + Convert.ToString(count) + " 项",
-                       meta.FgOr(root.fg), fs);
-        } else {
-            // 清除 + 已选 N 项（单向模式下右栏只读，没有可清）。
+        int hbox = app.Scale(16);
+        // 两栏头部都有全选框：过滤时只作用于可见行（全选与中缝
+        // 移动只看过滤结果，与表头计数同一套口径）。
+        dirty = this.HeadSelectAll(app, p, order, isSource, hx, iy, headH,
+                                   hy, fs, header.FgOr(root.fg)) || dirty;
+        hx = hx + hbox + app.Scale(6) + Canvas.MeasureText(selectAllText, fs)
+             + pad;
+        c.DrawText(hx, hy,
+                   totalText + " " + Convert.ToString(count) + " 项",
+                   meta.FgOr(root.fg), fs);
+        hx = hx + Canvas.MeasureText(
+                 totalText + " " + Convert.ToString(count) + " 项", fs)
+             + pad;
+        if (!isSource) {
+            // 右栏追加：清除 + 已选 N 项（单向模式下右栏只读，没有可清）。
             int cid = app.focus.AllocId();
             bool canClear = !oneWay && checkedN > 0 && !this.IsDisabled();
             StyleBox link = Style.Part(app, "transfer", "link", "", Class, "",
@@ -618,17 +808,43 @@ class Transfer<T> : Control {
         if (first < 0) { first = 0; }
         int last = (off + ih) / rowH;
         if (last >= n) { last = n - 1; }
+        // 命中区几何缓存（本帧与 RowCenter 重放同源）。
+        p.bodyX = ix;
+        p.bodyY = iy;
+        p.bodyW = bodyW;
+        p.bodyH = ih;
+        p.rowHPx = rowH;
         c.PushClip(ix, iy, bodyW, ih);
         int rfs = row.FontOr(Style.FontFallback(app, "medium"));
         int rbox = app.Scale(16);
         int k = first;
+        bool painting = p.paintStart >= 0;
         while (k <= last) {
             int i = order[k];
             int ry = iy + k * rowH - off;
-            bool checkedK = i < p.flags.Count && p.flags[i];
             int id = app.focus.AllocId();
             app.hitTester.RegisterRect(id, ix, ry, bodyW, rowH, 2);
             bool over = app.focus.IsHovered(id);
+            bool selectable = !this.IsDisabled() && (!oneWay || isSource);
+            if (selectable && Ui.PressedDown(app, id)) {
+                // 按下即立锚点（不在此翻勾选——抬起帧统一入账，
+                // 保住双击=两次翻勾的既有语义，按下帧行外观不动）。
+                p.paintStart = i;
+                p.paintEnd = i;
+                p.paintVal = !(i < p.flags.Count && p.flags[i]);
+                painting = true;
+                dirty = true;
+            } else if (painting && app.pointerDown && over && i != p.paintStart) {
+                // 按住扫过：端点推进到本行；抬起按两端闭区间入账。
+                if (p.paintEnd != i) {
+                    p.paintEnd = i;
+                    dirty = true;
+                }
+            }
+            // 拖拽中本行画预览态：扫过的闭区间取锚点目标态，
+            // 没碰到的行保持真实勾选（橡皮筋只染扫过的带）。
+            bool checkedK = i < p.flags.Count && p.flags[i];
+            if (this.InPaintBand(p, i)) { checkedK = p.paintVal; }
             if (over) {
                 StyleBox hover = Style.Part(app, "transfer", "row", "", Class,
                                             "", Style.SHover());
@@ -656,12 +872,6 @@ class Transfer<T> : Control {
                                        ix + bodyW - pad - tx, rfs);
             c.DrawText(tx, Canvas.CenterTextY(ry, rowH, rfs), text,
                        row.FgOr(root.fg), rfs);
-            if (Ui.Clicked(app, id) && !this.IsDisabled()
-                && (!oneWay || isSource)) {
-                if (i < p.flags.Count) { p.flags[i] = !p.flags[i]; }
-                SelectChanged.Post();
-                dirty = true;
-            }
             k = k + 1;
         }
         c.PopClip();
