@@ -2799,3 +2799,37 @@ hunk；既有欠账照录不扩大。
   一般机制（skins 已手工做，icons 本次做了），例如约定
   `stdlib/<Ns>/data/` 自动 `--embed <dir>=<Ns>/data`，新组件的数据文件
   不再需要每次手接。
+
+# A72 · 标准库按需加载第二步：Pinyin 词典从编译期字符串改为数据文件 + zanc 自动内嵌 —— ✅ 已完成（2026-08-30）
+
+接 A71 的「其他组件 JSON 化」问题。全 stdlib 字面量密度扫描（lit B / src B）：
+Pinyin 91%（45,355B 源码里 41,156B 是 GB2312 词典字符串链）、TDengine 65%（SQL 模板，
+属代码不该动）、Lunar 48%（10.9KB，可选）、CodeEditor.Completion/Intelli 10-22%
+（关键词表，候选但收益小）。皮肤已是数据文件（16 包 733.8KB）。先落最大头 Pinyin。
+
+- **数据出体**：`stdlib/System/Text/data/pinyin.txt`（6,763 行 GB2312
+  "汉字拼音" 行，47.9KB UTF-8），Pinyin.zan 从 131 行/45KB 源码变 256 行
+  加载器，`Data()` 的 33 个巨型字符串字面量整体消失。
+- **零依赖加载器**：Pinyin 刻意不 using System.IO/Diagnostics——原来只
+  `using System`，拉上 IO 会把 27 个文件拖进每个只碰拼音的程序（实测 25→52
+  文件、exe 反涨 66KB）。文件读取走自声明 CRT DllImport（fopen/fread/
+  fclose），exe 路径走 GetModuleFileNameW/readlink（镜像 ProcessHost 但本
+  地实现），UTF-16 转换本地 WideToStr。内嵌 API（zan_embed_has/read）本地
+  声明——同名 DllImport 跨文件重复声明是既有合法形态。
+- **发现链**（对齐图标/皮肤惯例）：env `ZAN_PINYIN_DATA`（文件）→ exe 旁
+  `pinyin.txt` → 内嵌资源 `text/pinyin.txt` → 源码树回溯
+  `stdlib/System/Text/data/`（开发态）。替换文件覆盖内置词典，无需重编译。
+- **zanc 自动内嵌**（main.c，A71 图标钩子旁同款）：镜像含 `Pinyin_` 符号
+  且 stdlib 根存在该文件时，自动 `--embed <stdlib>/System/Text/data/
+  pinyin.txt=text/pinyin.txt`，发布程序零侧车。
+- **体积**：同程序（tryget_pinyin）--publish 251,904 → 221,696 B（-30KB，
+  -11.9%）。分段：.data 55.8→8.2KB（词典从 XOR 混淆可写段挪到只读 embed
+  表）、.text +14.8KB（加载代码）、.rdata +1KB。发布体积与词典大小同阶。
+- **回归**：conformance/determinism/leakcheck tryget_pinyin 3 项全绿；
+  发布态（无 stdlib 树的隔离目录）内嵌读取正确；env 覆盖与 exe 旁覆盖
+  实测生效（中→ZHONGX 触发预期 FAIL）；standard 档 643/647，4 失败
+  （gui_cef_profile/gui_input/gui_watermark/string_index_char_text）stash
+  验证为并行在途既有，与本次无关。
+- **教训**：标准库模块的 using 是传染的——一个 45KB 的词典模块若顺手
+  using System.IO，就让所有拼音用户多链半个 IO 族。数据文件化同时治了
+  这个：加载器只依赖 CRT。

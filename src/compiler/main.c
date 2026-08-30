@@ -2714,6 +2714,38 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* ---- Pinyin dictionary inside the executable -------------------
+         * stdlib/System/Text/Pinyin keeps its GB2312 hanzi->pinyin table in
+         * a data file (stdlib/System/Text/data/pinyin.txt) resolved at run
+         * time like the Gui icon packs: env override, a file beside the exe,
+         * embedded resources, then the stdlib copy. When the compiled
+         * program actually carries that module, the stdlib file is baked in
+         * automatically under its discovery name "text/pinyin.txt" so a
+         * published program converts hanzi with nothing beside the exe. */
+        if (resolved_stdlib_root[0] &&
+            zan_irgen_defines_prefix(&irgen, "Pinyin_")) {
+            char pinyin_path[1200];
+            snprintf(pinyin_path, sizeof(pinyin_path), "%s/System/Text/data/"
+                     "pinyin.txt", resolved_stdlib_root);
+            if (zan_file_exists(pinyin_path)) {
+                char *pinyin_spec = (char *)malloc(strlen(pinyin_path) + 32);
+                if (pinyin_spec) {
+                    /* resource name matches the reader's
+                     * File.EmbedExists("text/pinyin.txt") lookup */
+                    snprintf(pinyin_spec, strlen(pinyin_path) + 32,
+                             "%s=text/pinyin.txt", pinyin_path);
+                    if (embed_spec_count < 64) {
+                        embed_specs[embed_spec_count++] = pinyin_spec;
+                    } else {
+                        fprintf(stderr, "warning: cannot auto-embed the "
+                                "pinyin dictionary from '%s'; --embed "
+                                "resources limit reached\n", pinyin_path);
+                        free(pinyin_spec);
+                    }
+                }
+            }
+        }
+
         /* --embed: the project files that ship inside the executable rather
          * than beside it. Baked into this module (not a separately compiled
          * object) so it works for every target with no external C compiler.
