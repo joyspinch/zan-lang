@@ -1,0 +1,133 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace DataTableIdentityTest;
+
+class KeySource : DataSource {
+    List<DataRow> rows;
+
+    KeySource(List<DataRow> rs) {
+        this.rows = rs;
+    }
+
+    override int RowCount() { return this.rows.Count; }
+    override string CellText(int row, int col) { return this.rows[row].At(col); }
+    override int CellNum(int row, int col) { return DataTable.ParseInt(this.rows[row].At(col)); }
+    override void SetCell(int row, int col, string value) { this.rows[row].Set(col, value); }
+    override RowKey GetRowKey(int row) {
+        return RowKey.Of(this.rows[row].At(0));
+    }
+
+    void Set(int row, int col, string value) { this.rows[row].Set(col, value); }
+}
+
+class SourceKeyProvider : RowKeyProvider {
+    override RowKey Key(DataSource src, int row) { return src.GetRowKey(row); }
+}
+
+class FixedDetail : DetailProvider {
+    override int Slots(DataSource src, int row) { return 2; }
+}
+
+class Program {
+    static DataRow Row(string id, string name, string score) {
+        DataRow r = new DataRow();
+        r.Push(id);
+        r.Push(name);
+        r.Push(score);
+        return r;
+    }
+
+    static void Main() {
+        RowKey stable = RowKey.Of("order:17");
+        Console.WriteLine(stable.Canonical());
+        Console.WriteLine(stable.IsTemporary() == false);
+        Console.WriteLine(stable.Same(RowKey.Of("order:17")));
+        Console.WriteLine(RowKey.Legacy(3).IsTemporary());
+        Console.WriteLine(RowKey.Legacy(3).Canonical());
+
+        List<DataRow> rows = new List<DataRow>();
+        rows.Add(Row("a", "Alpha", "10"));
+        rows.Add(Row("b", "Beta", "30"));
+        rows.Add(Row("c", "Gamma", "20"));
+        KeySource src = new KeySource(rows);
+
+        List<DataColumn> cols = new List<DataColumn>();
+        cols.Add(DataColumn.Field(new DataColumn("Id", 70), "id"));
+        cols.Add(DataColumn.Field(new DataColumn("Name", 90), "name"));
+        cols.Add(DataColumn.Field(DataColumn.Numeric("Score", 70), "score"));
+
+        DataTableState st = new DataTableState();
+        DataTable.SetKeyProvider(st, new SourceKeyProvider());
+        DataTable.EnsureInit(st, cols, src);
+        DataTable.SortByField(st, cols, "score", 2);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine(src.CellText(st.order[0], 0) == "b");
+
+        RowKey saved = DataTable.RowKeyAt(st, src, st.order[0]);
+        DataTable.SortByField(st, cols, "name", 1);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine(DataTable.RowIndexOfKey(st, src, saved) == 1);
+
+        DataTable.SetDetail(st, new FixedDetail());
+        DataTable.ExpandRow(st, src, 1);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine(DataTable.ExpandedCount(st) == 1);
+        Console.WriteLine(DataTable.IsExpanded(st, src, 1));
+        Console.WriteLine(DataTable.DispCount(st) == 5);
+
+        src.Set(1, 1, "Aardvark");
+        DataTable.Refresh(st, src);
+        DataTable.SortByField(st, cols, "name", 1);
+        DataTable.Recompute(st, cols, src);
+        int moved = DataTable.RowIndexOfKey(st, src, RowKey.Of("b"));
+        Console.WriteLine(moved == 1);
+        Console.WriteLine(DataTable.IsExpanded(st, src, moved));
+        Console.WriteLine(DataTable.DispCount(st) == 5);
+
+        // Inserting before an expanded business row changes its locator,
+        // but not its key-based detail state.
+        rows.Insert(0, Row("z", "Zulu", "5"));
+        DataTable.Refresh(st, src);
+        int afterInsert = DataTable.RowIndexOfKey(st, src, RowKey.Of("b"));
+        Console.WriteLine(afterInsert == 2);
+        Console.WriteLine(DataTable.IsExpanded(st, src, afterInsert));
+
+        // Removing that row immediately removes its open detail state.
+        rows.RemoveAt(afterInsert);
+        DataTable.Refresh(st, src);
+        Console.WriteLine(DataTable.ExpandedCount(st) == 0);
+
+        src.Set(2, 0, "a");
+        DataTable.Refresh(st, src);
+        Console.WriteLine(DataTable.Diagnostics(st).Count == 1);
+        Console.WriteLine(DataTable.Diagnostics(st)[0].Code() == 1);
+        Console.WriteLine(DataTable.Diagnostics(st)[0].Row() == 2);
+
+        List<DataColumn> dynamicCols = new List<DataColumn>();
+        dynamicCols.Add(new DataColumn("Id", 70));
+        dynamicCols.Add(new DataColumn("Name", 90));
+        List<DataRow> dynamicRows = new List<DataRow>();
+        dynamicRows.Add(Row("x", "Xenon", ""));
+        dynamicRows.Add(Row("y", "Yttrium", ""));
+        DataSource dynamicSrc = new RowListSource(dynamicRows);
+        DataTableState dynamicSt = new DataTableState();
+        DataTable.EnsureInit(dynamicSt, dynamicCols, dynamicSrc);
+        DataTable.Recompute(dynamicSt, dynamicCols, dynamicSrc);
+        dynamicCols.Add(DataColumn.Field(DataColumn.Numeric("Score", 70), "score"));
+        dynamicRows[0].Set(2, "8");
+        dynamicRows[1].Set(2, "3");
+        DataTable.EnsureInit(dynamicSt, dynamicCols, dynamicSrc);
+        DataTable.Recompute(dynamicSt, dynamicCols, dynamicSrc);
+        Console.WriteLine(dynamicSt.colWidths.Count == 3);
+        Console.WriteLine(dynamicSt.filters.Count == 3);
+        Console.WriteLine(dynamicSt.aggMode.Count == 3);
+        Console.WriteLine(dynamicSt.summaryText.Count == 3);
+        Console.WriteLine(dynamicSt.colHidden.Count == 3);
+        Console.WriteLine(dynamicSt.colOrder.Count == 3);
+        DataTable.SortByField(dynamicSt, dynamicCols, "score", 1);
+        DataTable.Recompute(dynamicSt, dynamicCols, dynamicSrc);
+        Console.WriteLine(dynamicSrc.CellText(dynamicSt.order[0], 0) == "y");
+    }
+}

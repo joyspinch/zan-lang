@@ -303,7 +303,11 @@ partial class DataTable {
     /// null 可关闭（所有行折叠；其余状态不受影响）。
     static void SetDetail(DataTableState st, DetailProvider p) {
         st.detail = p;
-        if (p == null) { st.expandedRows.Clear(); }
+        if (p == null) {
+            st.expandedRows.Clear();
+            st.expandedKeys.Clear();
+            st.expandedByKey = false;
+        }
         st.dirty = true;
     }
 
@@ -319,8 +323,21 @@ partial class DataTable {
         return n;
     }
 
-    /// `row`（源索引）当前是否已展开。
+    /// `row`（源索引）当前是否已展开。旧重载保留给
+    /// 只持有源索引的兼容调用；内部渲染优先使用 key 重载。
     static bool IsExpanded(DataTableState st, int row) {
+        return st.expandedRows.IndexOf(row) >= 0;
+    }
+
+    static bool IsExpanded(DataTableState st, DataSource src, int row) {
+        if (st.expandedByKey) {
+            RowKey key = DataTable.RowKeyAt(st, src, row);
+            if (key == null) { return false; }
+            for (int i = 0; i < st.expandedKeys.Count; i = i + 1) {
+                if (st.expandedKeys[i].Same(key)) { return true; }
+            }
+            return false;
+        }
         return st.expandedRows.IndexOf(row) >= 0;
     }
 
@@ -336,8 +353,13 @@ partial class DataTable {
     /// 行保持不变。
     static void ExpandRow(DataTableState st, DataSource src, int row) {
         if (!DataTable.CanExpand(st, src, row)) { return; }
-        if (st.expandedRows.IndexOf(row) >= 0) { return; }
-        st.expandedRows.Add(row);
+        if (DataTable.IsExpanded(st, src, row)) { return; }
+        if (st.expandedByKey) {
+            RowKey key = DataTable.RowKeyAt(st, src, row);
+            if (key != null) { st.expandedKeys.Add(key); }
+        } else {
+            st.expandedRows.Add(row);
+        }
         st.dirty = true;
     }
 
@@ -349,21 +371,39 @@ partial class DataTable {
         st.dirty = true;
     }
 
+    static void CollapseRow(DataTableState st, DataSource src, int row) {
+        if (st.expandedByKey) {
+            RowKey key = DataTable.RowKeyAt(st, src, row);
+            int i = 0;
+            while (i < st.expandedKeys.Count) {
+                if (st.expandedKeys[i].Same(key)) { st.expandedKeys.RemoveAt(i); }
+                else { i = i + 1; }
+            }
+            st.dirty = true;
+            return;
+        }
+        DataTable.CollapseRow(st, row);
+    }
+
     /// 切换 `row` 详情面板的展开与收起。
     static void ToggleDetail(DataTableState st, DataSource src, int row) {
-        if (DataTable.IsExpanded(st, row)) { DataTable.CollapseRow(st, row); }
+        if (DataTable.IsExpanded(st, src, row)) { DataTable.CollapseRow(st, src, row); }
         else { DataTable.ExpandRow(st, src, row); }
     }
 
     /// 关闭所有已展开的详情面板。
     static void CollapseAllDetail(DataTableState st) {
-        if (st.expandedRows.Count == 0) { return; }
+        if (st.expandedRows.Count == 0 && st.expandedKeys.Count == 0) { return; }
         st.expandedRows.Clear();
+        st.expandedKeys.Clear();
         st.dirty = true;
     }
 
     /// 当前有多少行的详情面板处于展开状态。
-    static int ExpandedCount(DataTableState st) { return st.expandedRows.Count; }
+    static int ExpandedCount(DataTableState st) {
+        if (st.expandedByKey) { return st.expandedKeys.Count; }
+        return st.expandedRows.Count;
+    }
 
     // 数据行 `rowIdx` 在嵌套层级
     // `level` 所属分组的路由键——到该层为止各分组列值的拼接，
@@ -841,7 +881,7 @@ partial class DataTable {
     /// `DispRow`。
     static void EmitDetail(DataTableState st, DataSource src, int row) {
         if (st.detail == null) { return; }
-        if (st.expandedRows.IndexOf(row) < 0) { return; }
+        if (!DataTable.IsExpanded(st, src, row)) { return; }
         // provider 后来拒绝的行（例如子记录已删除）
         // 仍留在 expandedRows 但不产生 band，
         // 底层数据变化时也无需清理该列表。

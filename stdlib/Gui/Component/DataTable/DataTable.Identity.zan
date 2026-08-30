@@ -1,0 +1,161 @@
+using System;
+
+namespace Gui.Component.DataTable;
+
+/// 稳定的数据行身份。
+///
+/// 新的 DataTable 能力应使用 RowKey，而不是把当前显示位置或源数组
+/// 下标当成业务身份。文本形式采用调用方提供的规范化键；旧列表源
+/// 可通过 Legacy() 获得临时键，但临时键不承诺跨刷新或跨会话稳定。
+class RowKey {
+    string value;
+    bool temporary;
+
+    RowKey(string v, bool temp) {
+        this.value = v;
+        this.temporary = temp;
+    }
+
+    static RowKey Of(string value) {
+        if (value.Length == 0) { return RowKey.Legacy(""); }
+        return new RowKey(value, false);
+    }
+
+    /// 为没有业务主键的旧位置数据生成兼容键。
+    /// 该键只在当前源实例中有意义。
+    static RowKey Legacy(int row) {
+        return new RowKey("legacy:" + Convert.ToString(row), true);
+    }
+
+    static RowKey Legacy(string value) {
+        return new RowKey("legacy:" + value, true);
+    }
+
+    string Canonical() { return this.value; }
+    bool IsTemporary() { return this.temporary; }
+    bool Same(RowKey other) {
+        if (other == null) { return false; }
+        return this.value == other.value;
+    }
+}
+
+/// 行键与当前数据源位置的短期映射。
+/// locator 会随排序、过滤和页缓存变化，不能持久化为身份。
+class RowRef {
+    RowKey key;
+    int locator;
+    int revision;
+
+    RowRef(RowKey k, int at, int rev) {
+        this.key = k;
+        this.locator = at;
+        this.revision = rev;
+    }
+}
+
+/// 为 DataSource 提供稳定行键的适配点。
+/// 默认实现使用兼容的临时位置键。
+class RowKeyProvider {
+    virtual RowKey Key(DataSource src, int row) {
+        return RowKey.Legacy(row);
+    }
+}
+
+partial class DataTable {
+    /// 手动刷新数据源。刷新会使派生顺序、筛选、汇总和键索引失效；
+    /// 行本身的业务身份由 KeyProvider 决定。
+    static void Refresh(DataTableState st) {
+        st.dataRevision = st.dataRevision + 1;
+        st.rowKeys.Clear();
+        st.dirty = true;
+    }
+
+    /// 当前数据源的键快照发生变化时，重新建立查询/选择相关索引。
+    static void Refresh(DataTableState st, DataSource src) {
+        DataTable.Refresh(st);
+        DataTable.RebuildRowKeys(st, src);
+        DataTable.PruneExpandedKeys(st, src);
+    }
+
+    /// 移除已经不再存在于当前数据源的详情键。
+    /// 刷新/删除后不能让“幽灵”详情继续占用展开计数，
+    /// 也不能在后续重用同一键时意外复活旧面板。
+    static void PruneExpandedKeys(DataTableState st, DataSource src) {
+        int i = 0;
+        while (i < st.expandedKeys.Count) {
+            if (DataTable.RowIndexOfKey(st, src, st.expandedKeys[i]) < 0) {
+                st.expandedKeys.RemoveAt(i);
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+
+    /// 安装稳定行键提供器。传入 null 恢复兼容的临时位置键。
+    static void SetKeyProvider(DataTableState st, RowKeyProvider provider) {
+        if (provider == null) { st.keyProvider = new RowKeyProvider(); }
+        else { st.keyProvider = provider; }
+        st.expandedByKey = provider != null;
+        st.expandedRows.Clear();
+        st.expandedKeys.Clear();
+        st.rowKeys.Clear();
+        st.dataRevision = st.dataRevision + 1;
+        st.dirty = true;
+    }
+
+    /// 重建当前源的键快照。调用方应只在源身份改变或首次绑定时触发；
+    /// 列表位置不是持久身份，旧源因此只能得到临时 legacy 键。
+    static void RebuildRowKeys(DataTableState st, DataSource src) {
+        st.rowKeys.Clear();
+        st.diagnostics.Clear();
+        Dict<string, bool> seen = new Dict<string, bool>();
+        int n = src.RowCount();
+        for (int row = 0; row < n; row = row + 1) {
+            RowKey key = null;
+            if (st.keyProvider != null) { key = st.keyProvider.Key(src, row); }
+            else { key = src.GetRowKey(row); }
+            if (key == null) { key = RowKey.Legacy(row); }
+            string canonical = key.Canonical();
+            if (seen.ContainsKey(canonical)) {
+                st.diagnostics.Add(DataTable.DuplicateKeyDiagnostic(canonical, row));
+            } else {
+                seen[canonical] = true;
+            }
+            st.rowKeys.Add(key);
+        }
+        st.rowKeysRevision = st.dataRevision;
+    }
+
+    /// 读取当前源行的稳定键。返回的 locator 仍是瞬时索引，
+    /// 业务代码应保存返回的 RowKey 而不是 row。
+    static RowKey RowKeyAt(DataTableState st, DataSource src, int row) {
+        if (row < 0 || row >= src.RowCount()) { return null; }
+        if (st.rowKeysRevision != st.dataRevision
+            || st.rowKeys.Count != src.RowCount()) {
+            DataTable.RebuildRowKeys(st, src);
+        }
+        return st.rowKeys[row];
+    }
+
+    /// 以稳定键查找当前源位置；找不到返回 -1。
+    static int RowIndexOfKey(DataTableState st, DataSource src, RowKey key) {
+        if (key == null) { return -1; }
+        if (st.rowKeysRevision != st.dataRevision
+            || st.rowKeys.Count != src.RowCount()) {
+            DataTable.RebuildRowKeys(st, src);
+        }
+        for (int row = 0; row < st.rowKeys.Count; row = row + 1) {
+            if (st.rowKeys[row].Same(key)) { return row; }
+        }
+        return -1;
+    }
+
+    /// 清除并返回当前结构诊断；调用方可在每次绑定或刷新后读取。
+    static List<TableDiagnostic> Diagnostics(DataTableState st) {
+        return st.diagnostics;
+    }
+
+    static int DataRevision(DataTableState st) { return st.dataRevision; }
+    static int QueryRevision(DataTableState st) { return st.queryRevision; }
+    static int ViewRevision(DataTableState st) { return st.viewRevision; }
+}

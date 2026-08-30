@@ -19,6 +19,10 @@ delegate double GridReal<T>(T row);
 /// 从实体读取布尔值，用于复选框 / bool 列。
 delegate bool GridBool<T>(T row);
 
+/// 从实体读取稳定行键。推荐使用数据库主键或业务复合键；
+/// 未设置时由兼容层使用临时位置键。
+delegate RowKey GridKey<T>(T row);
+
 /// 把编辑后的值写回实体（就地编辑）。未提供时，
 /// 即使网格其他部分允许编辑，该列也只读显示。
 delegate void GridSet<T>(T row, string v);
@@ -124,6 +128,9 @@ class GridSource<T> : DataSource {
     List<GridColumn<T>> cols;
     /// 空白行实体工厂；null 使数据源保持只读。
     GridNew<T> factory;
+    /// 领域实体的稳定键读取器；null 时回退到临时位置键。
+    GridKey<T> key;
+
 
     override int RowCount() {
         if (this.data == null) { return 0; }
@@ -142,6 +149,12 @@ class GridSource<T> : DataSource {
         if (col < 0 || col >= this.cols.Count) { return ""; }
         if (!this.Row(row)) { return ""; }
         return this.cols[col].Raw(this.data[row]);
+    }
+
+    override RowKey GetRowKey(int row) {
+        if (!this.Row(row)) { return null; }
+        if (this.key != null) { return this.key(this.data[row]); }
+        return RowKey.Legacy(row);
     }
 
     override int CellNum(int row, int col) {
@@ -230,6 +243,7 @@ class DataGrid<T> : Control {
         this.source.cols = this.gcols;
         this.source.data = null;
         this.source.factory = null;
+        this.source.key = null;
         this.descs = new List<DataColumn>();
         this.boundN = 0 - 1;
         // 引擎自行完成整个网格的命中测试 / 绘制，
@@ -252,10 +266,34 @@ class DataGrid<T> : Control {
         if (src != null) { n = src.Count; }
         // 换了列表、或者行数变了：引擎里的行号集合（st.order）还是上一份数据
         // 的，不重算就会拿越界行号去取单元格。
-        if (this.data != src || n != this.boundN) { this.st.dirty = true; }
+        if (this.data != src || n != this.boundN) {
+            this.st.dirty = true;
+            this.st.dataRevision = this.st.dataRevision + 1;
+            this.st.rowKeys.Clear();
+        }
         this.data = src;
         this.source.data = src;
         this.boundN = n;
+        return this;
+    }
+
+    /// 绑定实体的稳定键。key 参与选择、详情、排序平局和后续远程事务；
+    /// 未设置时仍保留旧的临时位置键行为。
+    DataGrid<T> KeyBy(GridKey<T> provider) {
+        this.source.key = provider;
+        this.st.expandedByKey = provider != null;
+        this.st.expandedRows.Clear();
+        this.st.expandedKeys.Clear();
+        this.st.rowKeys.Clear();
+        this.st.dataRevision = this.st.dataRevision + 1;
+        this.st.dirty = true;
+        return this;
+    }
+
+    /// 数据对象字段被原地修改、但列表引用和行数不变时调用，
+    /// 使排序、筛选、汇总和条件格式重新读取实体。
+    DataGrid<T> Refresh() {
+        DataTable.Refresh(this.st, this.source);
         return this;
     }
 

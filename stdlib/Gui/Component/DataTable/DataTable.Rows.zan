@@ -8,31 +8,38 @@ namespace Gui.Component.DataTable;
 partial class DataTable {
     // ---------- 状态维护 ----------
 
-    static void EnsureInit(DataTableState st, List<DataColumn> cols, DataSource src) {
-        if (!st.inited) {
-            int i = 0;
-            for (; i < cols.Count; i = i + 1) {
-                st.colWidths.Add(cols[i].width);
-                st.filters.Add(new ColFilter());
-                st.aggMode.Add(cols[i].summary);
-                st.summaryText.Add("");
-                st.colHidden.Add(false);
-                st.colFreeze.Add(cols[i].freeze);
-                st.colOrder.Add(i);
-                if (cols[i].summary > 0) { st.showSummary = true; }
-            }
-            i = 0;
-            int nrows = src.RowCount();
-            while (i < nrows) {
-                st.selected.Add(false);
-                i = i + 1;
-            }
-            st.inited = true;
-            st.dirty = true;
+    /// 补齐所有按列对齐的状态列表。列可以在网格首帧之后
+    /// 动态增加；因此不能只补 selected/hidden/freeze，
+    /// 否则筛选、宽度、聚合或条件格式会访问过短列表。
+    static void EnsureColumnSlots(DataTableState st, List<DataColumn> cols) {
+        int i = st.colWidths.Count;
+        while (i < cols.Count) {
+            st.colWidths.Add(cols[i].width);
+            if (cols[i].summary > 0) { st.showSummary = true; }
+            i = i + 1;
         }
-        while (st.selected.Count < src.RowCount()) { st.selected.Add(false); }
+        while (st.filters.Count < cols.Count) { st.filters.Add(new ColFilter()); }
+        int a = st.aggMode.Count;
+        while (a < cols.Count) {
+            st.aggMode.Add(cols[a].summary);
+            a = a + 1;
+        }
+        while (st.summaryText.Count < cols.Count) { st.summaryText.Add(""); }
+        while (st.aggValue.Count < cols.Count) { st.aggValue.Add(0); }
+        while (st.aggReal.Count < cols.Count) { st.aggReal.Add(0.0); }
+        while (st.aggSumR.Count < cols.Count) { st.aggSumR.Add(0.0); }
+        while (st.aggMinR.Count < cols.Count) { st.aggMinR.Add(0.0); }
+        while (st.aggMaxR.Count < cols.Count) { st.aggMaxR.Add(0.0); }
+        while (st.cfMin.Count < cols.Count) { st.cfMin.Add(0); }
+        while (st.cfMax.Count < cols.Count) { st.cfMax.Add(0); }
+        while (st.cfMinR.Count < cols.Count) { st.cfMinR.Add(0.0); }
+        while (st.cfMaxR.Count < cols.Count) { st.cfMaxR.Add(0.0); }
         while (st.colHidden.Count < cols.Count) { st.colHidden.Add(false); }
-        while (st.colFreeze.Count < cols.Count) { st.colFreeze.Add(0); }
+        int fz = st.colFreeze.Count;
+        while (fz < cols.Count) {
+            st.colFreeze.Add(cols[fz].freeze);
+            fz = fz + 1;
+        }
         while (st.filterRowText.Count < cols.Count) { st.filterRowText.Add(""); }
         // colOrder 中每列只出现一次；追加尚未列出的列。
         for (int co = 0; co < cols.Count; co = co + 1) {
@@ -40,7 +47,58 @@ partial class DataTable {
         }
     }
 
+    static void EnsureInit(DataTableState st, List<DataColumn> cols, DataSource src) {
+        if (!st.inited) {
+            int nrows = src.RowCount();
+            int i = 0;
+            while (i < nrows) {
+                st.selected.Add(false);
+                i = i + 1;
+            }
+            st.inited = true;
+            st.dirty = true;
+        }
+        bool colsChanged = st.columnCount != cols.Count;
+        DataTable.EnsureColumnSlots(st, cols);
+        if (colsChanged) {
+            st.columnCount = cols.Count;
+            st.dirty = true;
+        }
+        while (st.selected.Count < src.RowCount()) { st.selected.Add(false); }
+        // 新绑定或外部刷新后，键快照必须与当前源重新对齐。
+        if (st.rowKeys.Count != src.RowCount()) {
+            st.dataRevision = st.dataRevision + 1;
+            st.rowKeys.Clear();
+            st.dirty = true;
+            DataTable.RebuildRowKeys(st, src);
+            DataTable.PruneExpandedKeys(st, src);
+        } else if (st.rowKeysRevision != st.dataRevision) {
+            DataTable.RebuildRowKeys(st, src);
+            DataTable.PruneExpandedKeys(st, src);
+        }
+    }
+
     // ---------- 行添加/删除 + 撤销 ----------
+
+    /// 源行插入/删除会改变后续的兼容索引；在 RowKey
+    /// 完成迁移前，至少保持旧 expandedRows 的索引语义一致。
+    static void ShiftExpandedOnInsert(DataTableState st, int at) {
+        for (int i = 0; i < st.expandedRows.Count; i = i + 1) {
+            if (st.expandedRows[i] >= at) { st.expandedRows[i] = st.expandedRows[i] + 1; }
+        }
+    }
+
+    static void ShiftExpandedOnDelete(DataTableState st, int at) {
+        int i = 0;
+        while (i < st.expandedRows.Count) {
+            int row = st.expandedRows[i];
+            if (row == at) { st.expandedRows.RemoveAt(i); }
+            else {
+                if (row > at) { st.expandedRows[i] = row - 1; }
+                i = i + 1;
+            }
+        }
+    }
 
     /// 将可逆更改压入日志；达到上限时丢弃最旧的条目
     /// 。撤销本身产生的写入不会被记录——
@@ -93,8 +151,11 @@ partial class DataTable {
         if (at > n) { at = n; }
         if (!src.InsertRow(at)) { return -1; }
 
+        DataTable.ShiftExpandedOnInsert(st, at);
         while (st.selected.Count < at) { st.selected.Add(false); }
         st.selected.Insert(at, false);
+        st.dataRevision = st.dataRevision + 1;
+        st.rowKeys.Clear();
 
         // 新行初始为空，但 bool 列没有空白：给它
         // 该列自身的 false 文本，使其读回为有效值。
@@ -135,7 +196,10 @@ partial class DataTable {
         List<string> cells = DataTable.RowCells(src, cols, at);
         if (!src.RemoveRow(at)) { return false; }
 
+        DataTable.ShiftExpandedOnDelete(st, at);
         if (at < st.selected.Count) { st.selected.RemoveAt(at); }
+        st.dataRevision = st.dataRevision + 1;
+        st.rowKeys.Clear();
 
         // 被删行上打开的编辑器现在指向已不存在的行
         // （更糟的是指向后继行）；将其关闭，而不是让
