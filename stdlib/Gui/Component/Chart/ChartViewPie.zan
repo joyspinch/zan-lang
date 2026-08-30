@@ -87,7 +87,7 @@ class PieLayout {
                 l.ringInner.Add(inner);
                 int rt = 0;
                 for (int di = 0; di < s.Count(); di = di + 1) {
-                    if (!s.data[di].hidden) { rt = rt + s.Value(di); }
+                    if (!s.data[di].hidden && s.Value(di) > 0) { rt = rt + s.Value(di); }
                 }
                 l.ringTotal.Add(rt);
                 l.total = l.total + rt;
@@ -97,6 +97,7 @@ class PieLayout {
                     ChartData d = s.data[di2];
                     if (d.hidden) { continue; }
                     int v = s.Value(di2);
+                    if (v <= 0) { continue; }
                     int a0 = acc * 360 / rt;
                     int a1 = (acc + v) * 360 / rt;
                     l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, di2, origIdx[r] * 16 + di2),
@@ -120,7 +121,7 @@ class PieLayout {
         for (int p = 0; p < pies.Count; p = p + 1) {
             ChartSeries s = pies[p];
             for (int di = 0; di < s.Count(); di = di + 1) {
-                if (!s.data[di].hidden) { total = total + s.Value(di); }
+                if (!s.data[di].hidden && s.Value(di) > 0) { total = total + s.Value(di); }
             }
         }
         l.ringTotal.Add(total);
@@ -133,6 +134,7 @@ class PieLayout {
                 ChartData d = s.data[di2];
                 if (d.hidden) { continue; }
                 int v = s.Value(di2);
+                if (v <= 0) { continue; }
                 int a0 = acc2 * 360 / total;
                 int a1 = (acc2 + v) * 360 / total;
                 l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, di2, origIdx[p2] * 16 + di2),
@@ -165,6 +167,30 @@ class PieLayout {
 }
 
 partial class ChartView {
+    /// 计算一个环在当前半径下的实际内外径。绘制、命中和
+    /// emphasis 必须共享这组边界，避免配置内孔被不同路径重复夹取。
+    static void PieRingBounds(PieLayout layout, int ring, int ringCount,
+                              int rOuter, int band, int minGap,
+                              out int ri, out int ro) {
+        if (ringCount < 1) { ringCount = 1; }
+        if (ring < 0) { ring = 0; }
+        if (ring >= ringCount) { ring = ringCount - 1; }
+        ro = rOuter - ring * band;
+        ri = rOuter - (ring + 1) * band;
+        if (ring == ringCount - 1 && layout.ringInner.Count > ring
+            && layout.ringInner[ring] > 0) {
+            int hole = rOuter * layout.ringInner[ring] / 100;
+            int holeMax = ro - minGap;
+            if (holeMax < 0) { holeMax = 0; }
+            if (hole > holeMax) { hole = holeMax; }
+            ri = hole;
+        }
+        if (ri < 0) { ri = 0; }
+        if (ro < 1) { ro = 1; }
+        if (ri >= ro) { ri = ro - 1; }
+        if (ri < 0) { ri = 0; }
+    }
+
     static void DrawPie(App app, int x, int y, int w, int h,
                         ChartOption o, bool sliceLabels, int g) {
         Canvas c = app.canvas;
@@ -259,45 +285,78 @@ partial class ChartView {
         int band = 0;
         if (ringCount > 1) { band = rOuter / ringCount; }
         if (band < app.Scale(2)) { band = app.Scale(2); }
+        if (ringCount > 1 && band * ringCount > rOuter) {
+            band = rOuter / ringCount;
+            if (band < 1) { band = 1; }
+        }
+        int ringGap = app.Scale(2);
+        if (ringGap < 1) { ringGap = 1; }
 
         int hoverK = 0 - 1;
         int mx0 = app.mouseX;
         int my0 = app.mouseY;
-        int dist0 = ChartView.ISqrt((mx0 - cx) * (mx0 - cx) + (my0 - cy) * (my0 - cy));
-        int angR0 = ((ChartView.AngleOf(mx0 - cx, my0 - cy) - rot) % 360 + 360) % 360;
         if (my0 >= bodyY) {
             for (int kh = slices.Count - 1; kh >= 0; kh = kh - 1) {
                 PieSlice sh = slices[kh];
                 int ringH = sh.ring;
-                if (ringH >= ringCount) { ringH = ringCount - 1; }
-                if (ringH < 0) { ringH = 0; }
-                int riH = rOuter - (ringH + 1) * band;
-                int roH = rOuter - ringH * band;
-                if (ringCount == 1 && layout.ringInner.Count > 0) {
-                    riH = rOuter * layout.ringInner[0] / 100;
-                    roH = rOuter;
+                int riH = 0;
+                int roH = 0;
+                ChartView.PieRingBounds(layout, ringH, ringCount, rOuter, band,
+                    ringGap, out riH, out roH);
+                int hitCx = cx;
+                int hitCy = cy;
+                if (sh.selected && sh.seriesIndex >= 0
+                    && sh.seriesIndex < o.series.Count) {
+                    int offHit = app.Scale(o.series[sh.seriesIndex].selectedOffset);
+                    if (offHit < 1) { offHit = app.Scale(8); }
+                    int midHit = rot + (sh.a0 + sh.a1) / 2;
+                    hitCx = cx + ChartView.FillDx(midHit) * offHit / 1000;
+                    hitCy = cy + ChartView.FillDy(midHit) * offHit / 1000;
                 }
-                if (riH < 0) { riH = 0; }
-                if (dist0 >= riH && dist0 <= roH && angR0 >= sh.a0 && angR0 < sh.a1) {
+                int ddxH = mx0 - hitCx;
+                int ddyH = my0 - hitCy;
+                int distH = ChartView.ISqrt(ddxH * ddxH + ddyH * ddyH);
+                int angH = ((ChartView.AngleOf(ddxH, ddyH) - rot) % 360 + 360) % 360;
+                int endH = sh.a1;
+                if (endH > sweepMax) { endH = sweepMax; }
+                if (distH >= riH && distH < roH && endH > sh.a0
+                    && angH >= sh.a0 && angH < endH) {
                     hoverK = kh;
                     break;
                 }
             }
         }
+        if (hoverK >= 0) {
+            PieSlice hot = slices[hoverK];
+            ChartSeries hotSeries = null;
+            if (hot.seriesIndex >= 0 && hot.seriesIndex < o.series.Count) {
+                hotSeries = o.series[hot.seriesIndex];
+            }
+            if (hotSeries != null) {
+                ChartHit ph = ChartHit.Of(ChartElementType.PieSlice,
+                    hot.seriesIndex, hotSeries.name, hot.dataIndex, hot.name,
+                    hot.value, mx0, my0);
+                if (hot.dataIndex >= 0 && hot.dataIndex < hotSeries.data.Count) {
+                    ph.numberValueSet = hotSeries.data[hot.dataIndex].numberSet;
+                    ph.numberValue = hotSeries.data[hot.dataIndex].number;
+                }
+                ChartView.OfferActiveHit(ph);
+            }
+        }
         if (hoverK >= 0 && o.iwid != 0
-            && app.EventKind() == 3 && app.ClickFrameCurrent()
-            && !app.ClickClaimed()) {
+            && ChartView.activeEventView != null
+            && ChartView.OwnsActiveClick(app,
+                ChartView.activeEventView.eventHitId)) {
             PieSlice clk = slices[hoverK];
             if (clk.seriesIndex >= 0 && clk.seriesIndex < o.series.Count) {
                 int key = Chart.PieSelKey(o.iwid, clk.seriesIndex, clk.dataIndex);
                 int nv = 1;
                 if (clk.selected) { nv = 0; }
                 app.StateSet(key, nv);
-                ChartInteractionEvent pe = ChartInteractionEvent.Series(
+                ChartInteractionEvent pe = ChartInteractionEvent.DataPoint(
                     ChartEventType.PieSelected, o.iwid, clk.seriesIndex,
-                    o.series[clk.seriesIndex].name);
-                pe.dataIndex = clk.dataIndex;
-                pe.dataName = clk.name;
+                    o.series[clk.seriesIndex].name, clk.dataIndex, clk.name,
+                    ChartElementType.PieSlice);
                 pe.value = clk.value;
                 pe.selected = nv == 1;
                 ChartView.RaiseActive(pe);
@@ -305,31 +364,16 @@ partial class ChartView {
             }
         }
 
+        c.PushClip(x + pad, bodyY, areaW, areaH);
         for (int k = 0; k < slices.Count; k = k + 1) {
             PieSlice sl = slices[k];
             int ring = sl.ring;
             if (ring >= ringCount) { ring = ringCount - 1; }
             if (ring < 0) { ring = 0; }
-            int ri = rOuter - (ring + 1) * band;
-            if (ringCount > 1 && ring == ringCount - 1 && layout.ringInner.Count > ring
-                && layout.ringInner[ring] > 0) {
-                // 最内环仍按配置开孔，让中心不糊成实心；但开孔不得
-                // 越过本环带的内缘——默认 donutPct(55%) 在多环时会
-                // 把最内环夹成空带（55% > 50%），整环消失。
-                int hole = rOuter * layout.ringInner[ring] / 100;
-                int holeMax = rOuter - band - app.Scale(2);
-                if (holeMax < 0) { holeMax = 0; }
-                if (hole > holeMax) { hole = holeMax; }
-                ri = hole;
-            }
-            int ro = rOuter - ring * band;
-            if (ringCount == 1) {
-                ri = rOuter * layout.ringInner[0] / 100;
-                ro = rOuter;
-            }
-            if (ri < 0) { ri = 0; }
-            if (ri >= ro) { ri = ro - 1; }
-            if (ri < 0) { ri = 0; }
+            int ri = 0;
+            int ro = 0;
+            ChartView.PieRingBounds(layout, ring, ringCount, rOuter, band,
+                ringGap, out ri, out ro);
             int a0 = sl.a0;
             int a1 = sl.a1;
             // 入场扫掠沿旋转后的起始边顺时针推进；扇区可见弧段
@@ -340,7 +384,7 @@ partial class ChartView {
             // 静态选中：沿中角方向向外偏 selectedOffset 像素。
             int sx = 0;
             int sy = 0;
-            bool pop = sl.selected || k == hoverK
+            bool pop = sl.selected
                 || (sl.seriesIndex == hotSi && sl.dataIndex == hotDi);
             if (pop && sl.seriesIndex >= 0
                 && sl.seriesIndex < o.series.Count) {
@@ -356,7 +400,6 @@ partial class ChartView {
             int paEnd = aEnd + rot;
             if (paEnd > pa0) {
                 int aHi = paEnd;
-                if (aHi > pa0 + 2) { aHi = paEnd - 1; }
                 c.FillSector(scx, scy, ri, ro, pa0, aHi, sl.color);
                 if (pop) {
                     StrokeSector(c, scx, scy, ri, ro, pa0, aHi,
@@ -373,6 +416,7 @@ partial class ChartView {
                 }
             }
         }
+        c.PopClip();
 
         // 可选的分片百分比标签，位于扇区中角处。百分比按
         // 该片所属环的 total 计算（环模式各环独立）。
@@ -402,7 +446,7 @@ partial class ChartView {
                     Style.SNormal()).FgOr(0);
                 int lcx = cx;
                 int lcy = cy;
-                bool popL = sl.selected || p == hoverK
+                bool popL = sl.selected
                     || (sl.seriesIndex == hotSi && sl.dataIndex == hotDi);
                 if (popL && sl.seriesIndex >= 0
                     && sl.seriesIndex < o.series.Count) {
@@ -511,18 +555,28 @@ partial class ChartView {
                 int ring = sl.ring;
                 if (ring >= ringCount) { ring = ringCount - 1; }
                 if (ring < 0) { ring = 0; }
-                int ri = rOuter - (ring + 1) * band;
-                if (ringCount > 1 && ring == ringCount - 1 && layout.ringInner.Count > ring
-                    && layout.ringInner[ring] > 0) {
-                    ri = rOuter * layout.ringInner[ring] / 100;
+                int ri = 0;
+                int ro = 0;
+                ChartView.PieRingBounds(layout, ring, ringCount, rOuter, band,
+                    ringGap, out ri, out ro);
+                int tipCx = cx;
+                int tipCy = cy;
+                if (sl.selected && sl.seriesIndex >= 0
+                    && sl.seriesIndex < o.series.Count) {
+                    int offTip = app.Scale(o.series[sl.seriesIndex].selectedOffset);
+                    if (offTip < 1) { offTip = app.Scale(8); }
+                    int midTip = rot + (sl.a0 + sl.a1) / 2;
+                    tipCx = cx + ChartView.FillDx(midTip) * offTip / 1000;
+                    tipCy = cy + ChartView.FillDy(midTip) * offTip / 1000;
                 }
-                int ro = rOuter - ring * band;
-                if (ringCount == 1) {
-                    ri = rOuter * layout.ringInner[0] / 100;
-                    ro = rOuter;
-                }
-                if (ri < 0) { ri = 0; }
-                if (dist >= ri && dist <= ro && angR >= sl.a0 && angR < sl.a1) {
+                int tipDx = mx - tipCx;
+                int tipDy = my - tipCy;
+                int tipDist = ChartView.ISqrt(tipDx * tipDx + tipDy * tipDy);
+                int tipAng = ((ChartView.AngleOf(tipDx, tipDy) - rot) % 360 + 360) % 360;
+                int aEndTip = sl.a1;
+                if (aEndTip > sweepMax) { aEndTip = sweepMax; }
+                if (tipDist >= ri && tipDist < ro && aEndTip > sl.a0
+                    && tipAng >= sl.a0 && tipAng < aEndTip) {
                     int ringTot = total;
                     if (ring < layout.ringTotal.Count && layout.ringTotal[ring] > 0) {
                         ringTot = layout.ringTotal[ring];
@@ -539,11 +593,15 @@ partial class ChartView {
                         int aEnd2 = sl.a1;
                         if (aEnd2 > sweepMax) { aEnd2 = sweepMax; }
                         if (aEnd2 > sl.a0 && hs2.itemStyle.emphasis.color != 0) {
-                            int offH = app.Scale(hs2.selectedOffset);
-                            if (offH < 1) { offH = app.Scale(8); }
-                            int midH = rot + (sl.a0 + sl.a1) / 2;
-                            int hcx = cx + ChartView.FillDx(midH) * offH / 1000;
-                            int hcy = cy + ChartView.FillDy(midH) * offH / 1000;
+                            int hcx = cx;
+                            int hcy = cy;
+                            if (sl.selected) {
+                                int offH = app.Scale(hs2.selectedOffset);
+                                if (offH < 1) { offH = app.Scale(8); }
+                                int midH = rot + (sl.a0 + sl.a1) / 2;
+                                hcx = cx + ChartView.FillDx(midH) * offH / 1000;
+                                hcy = cy + ChartView.FillDy(midH) * offH / 1000;
+                            }
                             c.FillSector(hcx, hcy, ri, ro,
                                 rot + sl.a0, rot + aEnd2, hiFill);
                             int bc = hs2.itemStyle.emphasis.borderColor;

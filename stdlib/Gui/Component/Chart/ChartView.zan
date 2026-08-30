@@ -42,6 +42,8 @@ partial class ChartView {
     ChartEventHub eventHub;
     int eventHitId;
     bool pointerWasOver;
+    ChartHit currentHit;
+    ChartHit previousHit;
     int lastZoomLo;
     int lastZoomHi;
     int lastEventStateWid;
@@ -62,6 +64,8 @@ partial class ChartView {
         eventHub = new ChartEventHub();
         eventHitId = 0 - 1;
         pointerWasOver = false;
+        currentHit = null;
+        previousHit = null;
         lastZoomLo = 0 - 1;
         lastZoomHi = 0 - 1;
         lastEventStateWid = 0 - 1;
@@ -211,6 +215,159 @@ partial class ChartView {
         e.x = px;
         e.y = py;
         return e;
+    }
+
+    static ChartInteractionEvent EventFromHit(ChartEventType type, int wid,
+                                               ChartHit hit) {
+        if (hit == null) { return ChartInteractionEvent.Of(type, wid); }
+        ChartInteractionEvent e = ChartInteractionEvent.DataPoint(type, wid,
+            hit.seriesIndex, hit.seriesName, hit.dataIndex, hit.dataName,
+            hit.elementType);
+        e.value = hit.value;
+        e.numberValueSet = hit.numberValueSet;
+        e.numberValue = hit.numberValue;
+        e.xValueSet = hit.xValueSet;
+        e.xValue = hit.xValue;
+        e.yValueSet = hit.yValueSet;
+        e.yValue = hit.yValue;
+        e.x = hit.pixelX;
+        e.y = hit.pixelY;
+        e.axisIndex = hit.axisIndex;
+        return e;
+    }
+
+    /// 当前帧由 renderer 提供的命中候选。renderer 按绘制顺序调用，
+    /// 后来的具体图元覆盖早先的候选，但不会产生额外事件。
+    static void OfferActiveHit(ChartHit hit) {
+        if (ChartView.activeEventView != null && hit != null) {
+            ChartView.activeEventView.currentHit = hit;
+        }
+    }
+
+    static ChartHit MakeDataHit(ChartSeries s, int seriesIndex, int dataIndex,
+                                string fallbackName, ChartElementType elementType,
+                                int px, int py, int value) {
+        if (s == null) { return null; }
+        string dataName = fallbackName;
+        if (dataIndex >= 0 && dataIndex < s.data.Count
+            && s.data[dataIndex].name.Length > 0) {
+            dataName = s.data[dataIndex].name;
+        }
+        ChartHit h = ChartHit.Of(elementType, seriesIndex, s.name,
+            dataIndex, dataName, value, px, py);
+        h.axisIndex = s.axisIndex;
+        if (dataIndex >= 0 && dataIndex < s.data.Count) {
+            ChartData d = s.data[dataIndex];
+            h.numberValueSet = d.numberSet;
+            h.numberValue = d.number;
+        }
+        return h;
+    }
+
+    static void OfferCategoryPointHits(App app, ChartFrame f,
+                                       List<string> labels,
+                                       List<ChartSeries> series, int baseIdx,
+                                       int g, ChartElementType elementType) {
+        if (f == null || labels == null || labels.Count < 1 || series == null) { return; }
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        if (mx < f.plotX || mx >= f.plotX + f.plotW
+            || my < f.plotY || my >= f.plotY + f.plotH) { return; }
+        int n = labels.Count;
+        int bestD = 0;
+        ChartHit best = null;
+        for (int si = 0; si < series.Count; si = si + 1) {
+            ChartSeries s = series[si];
+            if (s == null || s.hidden || s.type != ChartType.Line) { continue; }
+            for (int vi = 0; vi < n; vi = vi + 1) {
+                int oi = baseIdx + vi;
+                if (oi < 0 || oi >= s.Count()) { continue; }
+                int px = f.CatMid(vi, n);
+                int py = f.YOf(s.Value(oi) * g / 1000, s.axisIndex);
+                int dx = mx - px;
+                int dy = my - py;
+                int d2 = dx * dx + dy * dy;
+                if (best == null || d2 < bestD) {
+                    bestD = d2;
+                    best = ChartView.MakeDataHit(s, si, oi, labels[vi],
+                        elementType, px, py, s.Value(oi));
+                }
+            }
+        }
+        int hitR = app.Scale(10);
+        if (best != null && bestD <= hitR * hitR) {
+            best.pixelX = mx;
+            best.pixelY = my;
+            ChartView.OfferActiveHit(best);
+        }
+    }
+
+    static bool HasInteraction(ChartView v, ChartEventType type) {
+        if (v == null) { return false; }
+        if (v.eventHub != null && v.eventHub.Count(type) > 0) { return true; }
+        if (v.controller != null && v.controller.HasEvent(type)) { return true; }
+        return false;
+    }
+
+    static bool OwnsActiveClick(App app, int id) {
+        if (ChartView.activeEventView == null || id < 0) { return false; }
+        return Ui.OwnsClick(app, id);
+    }
+
+    void DispatchPointerEvents(App app, int x, int y, int w, int h,
+                               string statusNow) {
+        bool over = statusNow == "ready"
+            && app.mouseX >= x && app.mouseX < x + w
+            && app.mouseY >= y && app.mouseY < y + h;
+        ChartHit hit = over ? this.currentHit : null;
+        if (hit != null) {
+            hit.pixelX = app.mouseX;
+            hit.pixelY = app.mouseY;
+        }
+        bool entered = over && !this.pointerWasOver;
+        bool left = !over && this.pointerWasOver;
+        bool hitChanged = !ChartHit.Same(this.previousHit, hit);
+        if ((hitChanged || left) && this.previousHit != null) {
+            ChartInteractionEvent me = ChartView.EventFromHit(
+                ChartEventType.MouseOut, this.wid, this.previousHit);
+            this.RaiseInteraction(me);
+        }
+        if ((hitChanged || entered) && hit != null) {
+            ChartInteractionEvent he = ChartView.EventFromHit(
+                ChartEventType.Hover, this.wid, hit);
+            this.RaiseInteraction(he);
+        } else if (entered && hit == null) {
+            ChartInteractionEvent he2 = ChartView.EventAt(
+                ChartEventType.Hover, this.wid, app.mouseX, app.mouseY);
+            this.RaiseInteraction(he2);
+        } else if (left && hit == null && this.previousHit == null) {
+            ChartInteractionEvent me2 = ChartView.EventAt(
+                ChartEventType.MouseOut, this.wid, app.mouseX, app.mouseY);
+            this.RaiseInteraction(me2);
+        }
+        this.pointerWasOver = over;
+        if (statusNow == "ready" && this.eventHitId >= 0
+            && Ui.Clicked(app, this.eventHitId)) {
+            if (hit != null) {
+                ChartInteractionEvent ce = ChartView.EventFromHit(
+                    ChartEventType.Click, this.wid, hit);
+                this.RaiseInteraction(ce);
+            } else {
+                ChartInteractionEvent ce2 = ChartView.EventAt(
+                    ChartEventType.Click, this.wid, app.mouseX, app.mouseY);
+                this.RaiseInteraction(ce2);
+            }
+        }
+        if (statusNow == "ready" && this.eventHitId >= 0
+            && Ui.DoubleClicked(app, this.eventHitId)) {
+            ChartInteractionEvent de = hit != null
+                ? ChartView.EventFromHit(ChartEventType.DoubleClick, this.wid, hit)
+                : ChartView.EventAt(ChartEventType.DoubleClick, this.wid,
+                                    app.mouseX, app.mouseY);
+            this.RaiseInteraction(de);
+        }
+        this.previousHit = ChartHit.Copy(hit);
+        ChartView.activeEventView = null;
     }
 
     ChartView OnClick(ChartInteractionHandler handler) {
@@ -659,6 +816,22 @@ partial class ChartView {
         return o.series[0];
     }
 
+    static int LeadSeriesIndex(ChartOption o) {
+        if (o == null || o.series.Count < 1) { return 0 - 1; }
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            if (!o.series[i].hidden) { return i; }
+        }
+        return 0;
+    }
+
+    static int SeriesIndexOf(ChartOption o, ChartSeries target) {
+        if (o == null || target == null) { return 0 - 1; }
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            if (o.series[i] == target) { return i; }
+        }
+        return 0 - 1;
+    }
+
     /// 主导图表族：第一个可见序列的类型（
     /// 整图系列族 —— pie、gauge、heatmap 等 —— 从中选择布局，
     /// 笛卡尔系列族则逐序列混用）。全部隐藏时仍用首条系列类型，
@@ -861,10 +1034,18 @@ partial class ChartView {
         // 把每种图表裁剪到自己的矩形，防止绘图线、柱条、
         // 轴标签和图例溢出到相邻控件。
         ChartView.activeEventView = this;
-        if (this.eventHitId < 0 && (this.eventHub.Count(ChartEventType.Click) > 0
-            || this.eventHub.Count(ChartEventType.DoubleClick) > 0
-            || this.eventHub.Count(ChartEventType.Hover) > 0
-            || this.eventHub.Count(ChartEventType.MouseOut) > 0)) {
+        this.currentHit = null;
+        string pointerKind = ChartView.DispatchKind(drawOption);
+        bool selectionSurface = (pointerKind == "pie" || pointerKind == "rose")
+            ? drawOption.iwid != 0
+            : (pointerKind == "map" && drawOption.mapSelect && drawOption.iwid != 0);
+        if (this.eventHitId < 0 && (ChartView.HasInteraction(this, ChartEventType.Click)
+            || ChartView.HasInteraction(this, ChartEventType.DoubleClick)
+            || ChartView.HasInteraction(this, ChartEventType.Hover)
+            || ChartView.HasInteraction(this, ChartEventType.MouseOut)
+            || ChartView.HasInteraction(this, ChartEventType.PieSelected)
+            || ChartView.HasInteraction(this, ChartEventType.MapSelected)
+            || selectionSurface)) {
             // 独立高位段，不随即时模式控件的分配顺序漂移。
             this.eventHitId = 9700000 + this.wid;
         }
@@ -890,31 +1071,7 @@ partial class ChartView {
             this.Status(), this.StatusMessage());
 
         string statusNow = this.Status();
-        bool over = statusNow == "ready"
-            && app.mouseX >= x && app.mouseX < x + w
-            && app.mouseY >= y && app.mouseY < y + h;
-        if (over && !this.pointerWasOver) {
-            ChartInteractionEvent he = ChartView.EventAt(
-                ChartEventType.Hover, this.wid, app.mouseX, app.mouseY);
-            this.RaiseInteraction(he);
-        } else if (!over && this.pointerWasOver) {
-            ChartInteractionEvent me = ChartView.EventAt(
-                ChartEventType.MouseOut, this.wid, app.mouseX, app.mouseY);
-            this.RaiseInteraction(me);
-        }
-        this.pointerWasOver = over;
-        if (statusNow == "ready" && this.eventHitId >= 0
-            && Ui.Clicked(app, this.eventHitId)) {
-            ChartInteractionEvent ce = ChartView.EventAt(
-                ChartEventType.Click, this.wid, app.mouseX, app.mouseY);
-            this.RaiseInteraction(ce);
-        }
-        if (statusNow == "ready" && this.eventHitId >= 0
-            && Ui.DoubleClicked(app, this.eventHitId)) {
-            ChartInteractionEvent de = ChartView.EventAt(
-                ChartEventType.DoubleClick, this.wid, app.mouseX, app.mouseY);
-            this.RaiseInteraction(de);
-        }
+        this.DispatchPointerEvents(app, x, y, w, h, statusNow);
         int zlo = statusNow == "ready"
             ? app.StateGet(Chart.ZoomLoKey(this.wid), 0) : 0;
         int zhi = statusNow == "ready"

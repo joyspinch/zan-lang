@@ -219,6 +219,73 @@ partial class ChartView {
 
     // ---- 折线 / 面积 / 阶梯线（可叠加柱状 + 散点） ----
 
+    // 混合折线图中的柱/散点覆盖层不经过各自主渲染器，
+    // 因此在同一分类槽位复算实际矩形/圆点几何，避免视觉上
+    // 可见却只能收到整图 Click 的错位。
+    static void OfferCategoryOverlayHits(App app, ChartFrame f,
+                                         List<string> labels,
+                                         List<ChartSeries> series, int baseIdx,
+                                         int g) {
+        if (f == null || labels == null || labels.Count < 1 || series == null) { return; }
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        if (mx < f.plotX || mx >= f.plotX + f.plotW
+            || my < f.plotY || my >= f.plotY + f.plotH) { return; }
+        int n = labels.Count;
+        int step = f.plotW / n;
+        int bw = step / 2;
+        int bx0 = (step - bw) / 2;
+        int baseY = f.plotY + f.plotH;
+        int bestD = 0;
+        ChartHit best = null;
+        for (int si = 0; si < series.Count; si = si + 1) {
+            ChartSeries s = series[si];
+            if (s == null || s.hidden || s.type == ChartType.Line) { continue; }
+            int ax = s.axisIndex;
+            for (int vi = 0; vi < n; vi = vi + 1) {
+                int oi = baseIdx + vi;
+                if (oi < 0 || oi >= s.Count()) { continue; }
+                int val = s.Value(oi);
+                int px = f.CatMid(vi, n);
+                int py = f.YOf(val * g / 1000, ax);
+                bool inside = false;
+                int d2 = 0;
+                ChartElementType et = ChartElementType.ScatterPoint;
+                if (s.type == ChartType.Bar) {
+                    int by = py;
+                    int bh = baseY - by;
+                    if (bh < 0) { bh = 0; }
+                    int bx = f.CatLeft(vi, n) + bx0;
+                    inside = mx >= bx && mx < bx + bw
+                        && my >= by && my < by + bh && bw > 0;
+                    d2 = (mx - px) * (mx - px);
+                    et = ChartElementType.Bar;
+                } else if (s.type == ChartType.Scatter) {
+                    int rr = Chart.SymbolRadius(s.symbolSize, app.Scale(3));
+                    if (oi < s.data.Count && s.data[oi].sizeSet && s.data[oi].size > 0) {
+                        rr = s.data[oi].size / 2;
+                    }
+                    rr = rr + app.Scale(2);
+                    int dx = mx - px;
+                    int dy = my - py;
+                    d2 = dx * dx + dy * dy;
+                    inside = d2 <= rr * rr;
+                    et = ChartElementType.ScatterPoint;
+                }
+                if (inside && (best == null || d2 < bestD)) {
+                    bestD = d2;
+                    best = ChartView.MakeDataHit(s, si, oi, labels[vi], et,
+                        px, py, val);
+                }
+            }
+        }
+        if (best != null) {
+            best.pixelX = mx;
+            best.pixelY = my;
+            ChartView.OfferActiveHit(best);
+        }
+    }
+
     static void DrawLines(App app, int x, int y, int w, int h,
                           ChartOption o, int g) {
         Canvas c = app.canvas;
@@ -418,6 +485,9 @@ partial class ChartView {
         }
         c.PopClip();
         Chart.DrawMarkLine(app, f, o);
+        ChartView.OfferCategoryPointHits(app, f, winLabels, series, i0, g,
+            ChartElementType.LinePoint);
+        ChartView.OfferCategoryOverlayHits(app, f, winLabels, series, i0, g);
         if (o.showTooltip) {
             ChartView.CartesianTooltip(app, f, winLabels, series, maxV, step, half, i0);
         }
@@ -425,6 +495,73 @@ partial class ChartView {
 
     // ---- 柱状图（分组 / 堆叠 / 水平） ----
     // ---- 堆叠面积图（按 stackName 分组的累计填充带） ----
+
+    // 堆叠面积的可视点位位于累计 top/bottom 带上，而不是原始值
+    // 的 Y。命中沿用绘制时相同的组/序列累加顺序，避免指针落在
+    // 色带上却把事件坐标解析到带外；事件 value 仍保留源项值。
+    static void OfferStackedAreaHits(App app, ChartFrame f,
+                                     List<string> labels,
+                                     List<ChartSeries> series, int baseIdx,
+                                     int g, int maxV) {
+        if (f == null || labels == null || labels.Count < 1 || maxV < 1) { return; }
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        if (mx < f.plotX || mx >= f.plotX + f.plotW
+            || my < f.plotY || my >= f.plotY + f.plotH) { return; }
+        List<string> groups = new List<string>();
+        for (int gi = 0; gi < series.Count; gi = gi + 1) {
+            ChartSeries gs = series[gi];
+            if (!gs.hidden && ChartView.GroupIndex(groups, gs.stackName) < 0) {
+                groups.Add(gs.stackName);
+            }
+        }
+        int bestD = 0;
+        ChartHit best = null;
+        int n = labels.Count;
+        for (int si = 0; si < series.Count; si = si + 1) {
+            ChartSeries s = series[si];
+            if (s.hidden) { continue; }
+            int group = ChartView.GroupIndex(groups, s.stackName);
+            if (group < 0) { continue; }
+            for (int vi = 0; vi < n; vi = vi + 1) {
+                int oi = baseIdx + vi;
+                if (oi < 0 || oi >= s.Count()) { continue; }
+                int prev = 0;
+                for (int pg = 0; pg < group; pg = pg + 1) {
+                    for (int ps = 0; ps < series.Count; ps = ps + 1) {
+                        ChartSeries psr = series[ps];
+                        if (!psr.hidden && ChartView.GroupIndex(groups, psr.stackName) == pg
+                            && oi < psr.Count()) { prev = prev + psr.Value(oi); }
+                    }
+                }
+                for (int ps2 = 0; ps2 < si; ps2 = ps2 + 1) {
+                    ChartSeries psr2 = series[ps2];
+                    if (!psr2.hidden && psr2.stackName == s.stackName
+                        && oi < psr2.Count()) { prev = prev + psr2.Value(oi); }
+                }
+                int val = s.Value(oi);
+                int top = f.plotY + f.plotH - (prev + val) * g * f.plotH / 1000 / maxV;
+                int bot = f.plotY + f.plotH - prev * g * f.plotH / 1000 / maxV;
+                int lo = top < bot ? top : bot;
+                int hi = top > bot ? top : bot;
+                int px = f.CatMid(vi, n);
+                int dx = mx - px;
+                int d2 = dx * dx;
+                if (my >= lo && my <= hi && (best == null || d2 < bestD)) {
+                    bestD = d2;
+                    best = ChartView.MakeDataHit(s, si, oi, labels[vi],
+                        ChartElementType.LinePoint, px, my, val);
+                }
+            }
+        }
+        int slotR = f.CatWidth(0, n);
+        if (slotR < app.Scale(10)) { slotR = app.Scale(10); }
+        if (best != null && bestD <= slotR * slotR) {
+            best.pixelX = mx;
+            best.pixelY = my;
+            ChartView.OfferActiveHit(best);
+        }
+    }
 
     static void DrawStackedArea(App app, int x, int y, int w, int h,
                                 ChartOption o, int g) {
@@ -528,6 +665,7 @@ partial class ChartView {
             }
         }
         c.PopClip();
+        ChartView.OfferStackedAreaHits(app, f, winLabels, series, i0, g, maxV);
         if (o.showTooltip) {
             ChartView.CartesianTooltip(app, f, winLabels, series, maxV, step, half, i0);
         }

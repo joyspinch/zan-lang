@@ -173,4 +173,4 @@ dataZoom.html / dataZoom1.html / legend.html / dataRange*.html / tooltip.html
   symbolSizeFn、A3 地图/弦图 markPoint、A4 dataRange hoverLink、A5 force
   入场补间、B timeline 子系统、C connect() 联动。
 - 逐图族仍存的确定性取舍（非能力缺口）：force 随机初值 → 圆周确定性初值。
-- 仍需单独建设的 L3 能力包括 typed 事件回调、实例生命周期、完整动态 option API、可配置导出、加载/空数据状态和跨图层坐标系；当前实现的已知边界和差异以 `docs/CHART_COMPATIBILITY_227.md` 为准。
+- typed 事件基础已经落地，line/bar/scatter/heatmap/pie/map 已有首批数据点/图元 payload；仍不等价于完整 ECharts DOM `event.params`、任意 formatter 或完整 JavaScript `on/un`。其他 L3 能力、可配置导出、以及跨图层共享坐标系仍需单独建设；当前实现的已知边界和差异以 `docs/CHART_COMPATIBILITY_227.md` 为准。

@@ -253,6 +253,63 @@ ChartOption 的可变持有者。用于立即模式 GUI 中的动态数据：
   - 清空一个系列的数据，保留系列名称、类型、样式和轴绑定。
 
 
+## ChartElementType (enum)
+
+图表命中图元分类。`Chart` 表示整图空白区域；其余类型表示首批可提供数据点事件的图元。
+
+- Chart
+- LinePoint
+- Bar
+- ScatterPoint
+- HeatmapCell
+- PieSlice
+- MapRegion
+- FunnelStage
+- Node
+- Link
+
+
+## ChartHit (class)
+
+渲染器内部使用的当前几何命中快照。`Same` 只比较图元、系列和源数据索引，不比较鼠标像素或可变展示名称，因此同一数据点内移动不会重复触发 Hover。
+
+- ChartElementType elementType;
+
+- int seriesIndex;
+
+- string seriesName;
+
+- int dataIndex;
+
+- string dataName;
+
+- int value;
+
+- bool numberValueSet;
+
+- double numberValue;
+
+- bool xValueSet;
+
+- double xValue;
+
+- bool yValueSet;
+
+- double yValue;
+
+- int pixelX;
+
+- int pixelY;
+
+- int axisIndex;
+
+- static ChartHit Of(ChartElementType elementType, int seriesIndex, string seriesName, int dataIndex, string dataName, int value, int pixelX, int pixelY)
+
+- static bool Same(ChartHit a, ChartHit b)
+
+- static ChartHit Copy(ChartHit src)
+
+
 ## ChartData (class)
 
 一个数据点（ECharts series.data[i]）：一个值加可选名称
@@ -283,6 +340,7 @@ ChartOption 的可变持有者。用于立即模式 GUI 中的动态数据：
 - static ChartData Colored(int v, int color)
 
 - static ChartData Full(int v, string name, int color)
+  - `Numeric/NamedNumber` 保留原始 double，并通过 `numberSet` 表示该字段存在；`Value/Number` 分别提供兼容整数和原始数值视图。
 
 
 ## ChartDataset (class)
@@ -326,6 +384,63 @@ EncodeBy / EncodeNamed 选择不同维度来驱动多个图表——
 - List<int> values;
 
 - static ChartDimension Of(string name, List<int> values)
+
+
+## ChartInteractionEvent (class)
+
+带载荷的 typed 图表交互事件。未命中的图表级事件使用 `dataHit=false`、`elementType=Chart`、`dataIndex=-1`；命中首批 line/bar/scatter/heatmap/pie/map 图元时填充源数据索引、名称、兼容整数值和可用的 double/x/y 字段。
+
+- ChartEventType type;
+
+- ChartElementType elementType;
+
+- bool dataHit;
+
+- int chartWid;
+
+- int seriesIndex;
+
+- string seriesName;
+
+- int dataIndex;
+
+- string dataName;
+
+- int value;
+
+- bool numberValueSet;
+
+- double numberValue;
+
+- bool xValueSet;
+
+- double xValue;
+
+- bool yValueSet;
+
+- double yValue;
+
+- int x;
+
+- int y;
+
+- int axisIndex;
+
+- bool selected;
+
+- int zoomStart;
+
+- int zoomEnd;
+
+- static ChartInteractionEvent Of(ChartEventType type, int chartWid)
+
+- static ChartInteractionEvent DataPoint(ChartEventType type, int chartWid, int seriesIndex, string seriesName, int dataIndex, string dataName, ChartElementType elementType)
+
+- static string ElementName(ChartElementType type)
+
+- string TypeName()
+
+`PieSelected` 与 `MapSelected` 是选择状态变化事件，与通用点级 `Click` 分开；右键和地图拖拽释放不会触发选择。事件计算不依赖 `showTooltip`。这组 API 是 Zan typed delegate，不等同 ECharts DOM `event.params` 或完整 JavaScript `on/un`。
 
 
 ## ChartEvent (class)
@@ -1199,6 +1314,20 @@ StackedBar / StackedArea 工厂默认 stack = 1）。
 
 - static void DrawEmptyState(App app, int x, int y, int w, int h, ChartOption o)
   - 未知 / 空 kind 的明确空状态：不绘制错误的图表。
+
+- static void OfferActiveHit(ChartHit hit)
+  - 渲染器内部命中 seam；由 `ChartView` 统一比较前后帧并派发 Hover、MouseOut、Click。
+
+- static bool HasInteraction(ChartView v, ChartEventType type)
+  - 同时检查 view 与 controller 的 typed 事件订阅。
+
+- static bool OwnsActiveClick(App app, int id)
+  - 选择事件的点击所有权检查；几何命中仍由对应 renderer 完成。
+
+### Typed data-point events
+
+`ChartInteractionEvent` 的 `dataHit`、`elementType`、源 `dataIndex`、`dataName`、`value` 和可选 `numberValue/numberValueSet` 描述数据图元命中。散点还填充 `xValue/yValue`；屏幕位置仍由 `x/y` 表示。line、bar、scatter、heatmap、pie、map 已接入首批命中。`showTooltip=false` 不会关闭事件；点级事件优先于空白图表级事件。`PieSelected` / `MapSelected` 是独立的选择状态变化事件。
+
 
 - static bool HasArea(ChartOption o)
   - 任一序列为面积线时返回 true（对应 ECharts line.areaStyle.show）。

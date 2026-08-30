@@ -46,9 +46,9 @@ ECharts 的 `formatter`、动态颜色、`symbolSize`、位置和 tooltip 回调
 
 Chart 的立即模式入口是 `ChartView.Render(app, x, y, w, h)`，状态使用稳定 key 保存在 `App.StateGet/StateSet`。保留的 `ChartView` 已提供 `GetOption`、`SetOption`、`Restore`、`Clear`、`Refresh`、`ShowLoading`/`HideLoading`、`SetEmptyMessage`、`SetErrorMessage` 和 `Dispose`，并可订阅 Rendered/Resized/Updated/Disposed 的无参数生命周期事件。
 
-带载荷的交互事件通过 `ChartEventType`、`ChartInteractionEvent` 和 `ChartInteractionHandler` 提供。`ChartView` 与 `ChartController` 都支持 `On(type, handler)`、`Off(type, handler)`、`ClearEvents()` 以及 `OnClick`、`OnDoubleClick`、`OnHover`、`OnMouseOut`、`OnLegendSelected`、`OnDataZoom`、`OnDataRange`、`OnRestore`、`OnDataChanged` 便捷入口。当前已接入的事件包括图表级点击/进入/离开、图例切换、dataZoom/dataRange 状态变化、toolbox magicType、restore、resize 和 controller 数据变更；`seriesIndex`、`seriesName`、坐标、选中状态和 zoom 范围在适用时填入，其余字段使用明确的空值哨兵。事件回调是 Zan typed delegate，不是可执行任意 JavaScript 的 ECharts DOM `on/un`。
+带载荷的交互事件通过 `ChartEventType`、`ChartInteractionEvent` 和 `ChartInteractionHandler` 提供。`ChartView` 与 `ChartController` 都支持 `On(type, handler)`、`Off(type, handler)`、`ClearEvents()` 以及 `OnClick`、`OnDoubleClick`、`OnHover`、`OnMouseOut`、`OnLegendSelected`、`OnDataZoom`、`OnDataRange`、`OnRestore`、`OnDataChanged` 便捷入口。line、bar、scatter、heatmap、pie、map 的首批数据点/图元命中会填充 `dataHit`、`elementType`、`seriesIndex`、`seriesName`、源 `dataIndex`、`dataName`、屏幕坐标和兼容的整数 `value`；可用时还填充 `numberValue/numberValueSet`，散点填充 `xValue/yValue`。命中计算独立于 `showTooltip`，关闭 tooltip 不会关闭 Hover、MouseOut 或 Click。点级事件优先于空白图表级事件，点 A 切换到点 B 时先发 A 的 MouseOut 再发 B 的 Hover。事件回调是 Zan typed delegate，不是可执行任意 JavaScript 的 ECharts DOM `on/un`。
 
-这些回调在 Render seam 或状态更新点触发，不是完整 ECharts DOM 事件载荷；扇区、地图区域、层级节点和 force 布局的专用命中载荷仍在后续接入。与 ECharts 的 `resize()`、完整 `on/un` 模型仍有差异，调用方不应假定所有 ECharts 实例方法已经存在。
+`PieSelected` 与 `MapSelected` 表示选择状态变化，保留为独立专用事件；同一次有效主键点击仍可另外收到通用点级 `Click`。右键释放不会触发这些选择事件，地图拖拽释放也不会被误判为区域选择。其他层级节点、force/link 等专用命中载荷仍未全部接入。与 ECharts 的 `resize()`、完整 `on/un` 模型仍有差异，调用方不应假定所有 ECharts 实例方法已经存在。
 
 ### 动画
 
@@ -80,7 +80,7 @@ Force 使用确定性圆周初值和固定轮数弹簧模拟，以便缓存和�
 | timeline、connect | 已建模 | 立即模式状态持久化 |
 | GeoJSON 与压缩地图坐标 | 已建模 | 运行时解析，见 `ChartGeoJson` |
 | 任意 JavaScript formatter | 不支持 | 使用模板/内置 formatter/后续 Zan delegate |
-| typed Chart 交互事件 | 部分覆盖 | `ChartEventType`/`ChartInteractionEvent` 支持点击、悬停、图例、zoom、dataRange、地图/饼图选择、漫游、timeline 等已接入路径；专用命中载荷仍在建设 |
+| typed Chart 交互事件 | 部分覆盖 | `ChartEventType`/`ChartInteractionEvent` 已提供图表级与首批 line/bar/scatter/heatmap/pie/map 数据点载荷；专用选择事件独立保留，完整 ECharts DOM `event.params` 与全部图元命中仍不承诺 |
 | 完整 `on/un` 与实例生命周期 | 建设中 | 当前 API 是 Zan typed delegate + Render/Controller 入口，不承诺任意 ECharts DOM 实例方法 |
 | 任意 magicType 类型互换 | 不支持 | 当前提供有限 line/bar 切换 |
 | calculable 数据孤岛工作流 | 部分 | dataRange 拖拽不等同完整数据孤岛 |

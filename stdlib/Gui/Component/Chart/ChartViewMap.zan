@@ -122,7 +122,7 @@ class MapLayout {
     // 命中：返回包含 (px,py) 的区域下标（在任一外环内且不在
     // 任何洞内），否则 -1。
     static int RegionAt(MapLayout l, int px, int py) {
-        for (int r = 0; r < l.regionCount; r = r + 1) {
+        for (int r = l.regionCount - 1; r >= 0; r = r - 1) {
             bool hit = false;
             for (int i = 0; i < l.polys.Count; i = i + 1) {
                 MapPolygon p = l.polys[i];
@@ -181,7 +181,7 @@ partial class ChartView {
             if (poly[i].y > maxY) { maxY = poly[i].y; }
         }
         List<int> xs = new List<int>();
-        for (int y = minY; y <= maxY; y = y + 1) {
+        for (int y = minY; y < maxY; y = y + 1) {
             xs.Clear();
             int j = n - 1;
             for (int i = 0; i < n; i = i + 1) {
@@ -205,7 +205,7 @@ partial class ChartView {
             for (int e = 0; e + 1 < xs.Count; e = e + 2) {
                 int x0 = xs[e];
                 int x1 = xs[e + 1];
-                if (x1 >= x0) { c.FillRect(x0, y, x1 - x0 + 1, 1, color); }
+                if (x1 > x0) { c.FillRect(x0, y, x1 - x0, 1, color); }
             }
         }
     }
@@ -246,12 +246,17 @@ partial class ChartView {
         int zoom = 100;
         int panX = 0;
         int panY = 0;
+        bool mapWasDragged = false;
         if (o.roam && o.iwid != 0) {
             zoom = app.StateGet(Chart.MapZoomKey(o.iwid), 100);
             if (zoom < 40) { zoom = 100; app.StateSet(Chart.MapZoomKey(o.iwid), 100); }
             panX = app.StateGet(Chart.MapPanXKey(o.iwid), 0);
             panY = app.StateGet(Chart.MapPanYKey(o.iwid), 0);
             int panId = 7100000 + o.iwid;
+            if (ChartView.activeEventView != null
+                && ChartView.activeEventView.eventHitId >= 0) {
+                panId = ChartView.activeEventView.eventHitId;
+            }
             app.hitTester.RegisterRect(panId, plotX, plotY, plotW, plotH, 3);
             // 默认 zoom 消费绘图区滚轮；pass/none 不声明捕获，
             // 让外层 ScrollView 继续处理页面滚动。CaptureWheel 的
@@ -279,13 +284,24 @@ partial class ChartView {
                 app.StateSet(Chart.MapDragPanYKey(o.iwid), panY);
                 app.StateSet(Chart.MapDragKey(o.iwid), 1);
             }
-            if (app.EventKind() == 3) { app.StateSet(Chart.MapDragKey(o.iwid), 0); }
-            if (app.StateGet(Chart.MapDragKey(o.iwid), 0) == 1
-                && Ui.Pressed(app, panId) && app.EventKind() == 1) {
-                panX = app.StateGet(Chart.MapDragPanXKey(o.iwid), panX)
-                    - (app.mouseX - app.StateGet(Chart.MapDragXKey(o.iwid), app.mouseX));
-                panY = app.StateGet(Chart.MapDragPanYKey(o.iwid), panY)
-                    - (app.mouseY - app.StateGet(Chart.MapDragYKey(o.iwid), app.mouseY));
+            bool draggingMap = app.StateGet(Chart.MapDragKey(o.iwid), 0) == 1;
+            if (app.EventKind() == 3) {
+                if (draggingMap) {
+                    int dxUp = app.mouseX - app.StateGet(Chart.MapDragXKey(o.iwid), app.mouseX);
+                    int dyUp = app.mouseY - app.StateGet(Chart.MapDragYKey(o.iwid), app.mouseY);
+                    if (dxUp != 0 || dyUp != 0) {
+                        mapWasDragged = true;
+                        app.ClaimClick();
+                    }
+                }
+                app.StateSet(Chart.MapDragKey(o.iwid), 0);
+            }
+            if (draggingMap && Ui.Pressed(app, panId) && app.EventKind() == 1) {
+                int dxMove = app.mouseX - app.StateGet(Chart.MapDragXKey(o.iwid), app.mouseX);
+                int dyMove = app.mouseY - app.StateGet(Chart.MapDragYKey(o.iwid), app.mouseY);
+                if (dxMove != 0 || dyMove != 0) { mapWasDragged = true; }
+                panX = app.StateGet(Chart.MapDragPanXKey(o.iwid), panX) - dxMove;
+                panY = app.StateGet(Chart.MapDragPanYKey(o.iwid), panY) - dyMove;
                 app.StateSet(Chart.MapPanXKey(o.iwid), panX);
                 app.StateSet(Chart.MapPanYKey(o.iwid), panY);
                 ChartInteractionEvent panEvent = ChartInteractionEvent.Of(
@@ -342,6 +358,7 @@ partial class ChartView {
         bool cached = g >= 1000 && app.StateGet(Chart.CacheKey(slot), 0) == fp
             && c.RestoreRect(plotX, plotY, plotW, plotH, slot);
         int bg = Style.Full(app, "chart", "", "", Style.SNormal()).BgOr(0);
+        c.PushClip(plotX, plotY, plotW, plotH);
         if (g < 1000 && !cached) {
             c.FillRect(plotX, plotY, plotW, plotH, bg);
         } else if (!cached) {
@@ -368,7 +385,7 @@ partial class ChartView {
                 if (!Chart.DRangeOk(app, o, o.iwid, vMin, vMax, lead.regions[p.region].value)) {
                     col = Chart.Rgb(204, 204, 204);
                 }
-                ChartView.PolyOutline(c, p.points, col);
+                if (!p.hole) { ChartView.PolyOutline(c, p.points, col); }
                 if (!p.hole) {
                     string nm = lead.regions[p.region].name;
                     if (nm.Length > 0) {
@@ -389,6 +406,7 @@ partial class ChartView {
                 app.StateSet(Chart.CacheKey(slot), fp);
             }
         }
+        c.PopClip();
 
         // selectedMode：""/"single" = 单区域（沿用 MapSelKey），
         // "multiple" = 多区域（MapRegionSelKey 逐项），"false"/mapSelect
@@ -410,10 +428,21 @@ partial class ChartView {
         }
         int mx = app.mouseX;
         int my = app.mouseY;
-        int hit = MapLayout.RegionAt(layout, mx, my);
-        if (canSelect && app.window.EventKind() == 3
-            && mx >= plotX && mx < plotX + plotW
-            && my >= plotY && my < plotY + plotH) {
+        bool insidePlot = mx >= plotX && mx < plotX + plotW
+            && my >= plotY && my < plotY + plotH;
+        int hit = insidePlot ? MapLayout.RegionAt(layout, mx, my) : 0 - 1;
+        if (hit >= 0) {
+            ChartHit mh = ChartHit.Of(ChartElementType.MapRegion,
+                ChartView.SeriesIndexOf(o, lead), lead.name, hit,
+                lead.regions[hit].name, lead.regions[hit].value, mx, my);
+            ChartView.OfferActiveHit(mh);
+        }
+        int mapOwnerId = ChartView.activeEventView != null
+            ? ChartView.activeEventView.eventHitId : 0 - 1;
+        if (mapOwnerId < 0 && o.iwid != 0) { mapOwnerId = 7100000 + o.iwid; }
+        if (canSelect && !mapWasDragged
+            && ChartView.OwnsActiveClick(app, mapOwnerId)
+            && hit >= 0) {
             if (hit >= 0) {
                 if (mode == 1) {
                     int oldv = app.StateGet(Chart.MapRegionSelKey(o.iwid, hit), 0);
@@ -422,10 +451,10 @@ partial class ChartView {
                     if (sel == hit) { sel = 0 - 1; } else { sel = hit; }
                     app.StateSet(Chart.MapSelKey(o.iwid), sel);
                 }
-                ChartInteractionEvent mapEvent = ChartInteractionEvent.Of(
-                    ChartEventType.MapSelected, o.iwid);
-                mapEvent.dataIndex = hit;
-                mapEvent.dataName = lead.regions[hit].name;
+                ChartInteractionEvent mapEvent = ChartInteractionEvent.DataPoint(
+                    ChartEventType.MapSelected, o.iwid,
+                    ChartView.SeriesIndexOf(o, lead), lead.name, hit,
+                    lead.regions[hit].name, ChartElementType.MapRegion);
                 mapEvent.value = lead.regions[hit].value;
                 mapEvent.selected = mode == 1
                     ? app.StateGet(Chart.MapRegionSelKey(o.iwid, hit), 0) == 1
@@ -451,6 +480,7 @@ partial class ChartView {
             }
             if (!dup) { hiRegs.Add(hit); }
         }
+        c.PushClip(plotX, plotY, plotW, plotH);
         for (int hq = 0; hq < hiRegs.Count; hq = hq + 1) {
             int hi = hiRegs[hq];
             if (hi < 0 || hi >= lead.regions.Count) { continue; }
@@ -461,19 +491,19 @@ partial class ChartView {
             for (int pi = 0; pi < layout.polys.Count; pi = pi + 1) {
                 MapPolygon pp = layout.polys[pi];
                 if (pp.region != hi) { continue; }
-                if (pp.hole) {
-                    ChartView.FillPolygon(c, pp.points, bg2);
-                } else {
+                if (!pp.hole) {
                     ChartView.FillPolygon(c, pp.points, Chart.WithAlpha(eFill, alpha));
+                    ChartView.PolyOutline(c, pp.points, eLine);
                 }
-                ChartView.PolyOutline(c, pp.points, eLine);
             }
         }
+        c.PopClip();
 
         // dataRange.hoverLink：悬停值域条时，值落在当前滑动窗口内的
         // 区域白描边强调（反色高亮，与 hover 语义一致的逆联动）。
         if (o.dataRangeHoverLink && o.iwid != 0
             && app.StateGet(Chart.DRangeHoverKey(o.iwid), 0) == 1) {
+            c.PushClip(plotX, plotY, plotW, plotH);
             for (int ri2 = 0; ri2 < lead.regions.Count; ri2 = ri2 + 1) {
                 if (!ChartViewDataRange.HoverHighlight(app, o, vMin, vMax,
                     lead.regions[ri2].value)) { continue; }
@@ -483,6 +513,7 @@ partial class ChartView {
                     ChartView.PolyOutline(c, pq.points, Chart.Rgb(255, 255, 255));
                 }
             }
+            c.PopClip();
         }
 
         if (barW > 0) {
@@ -570,8 +601,10 @@ partial class ChartView {
                             int fg, int fs, int clipX, int clipY, int clipW, int clipH) {
         int off = app.Scale(10);
         int ey = py - off;
+        c.PushClip(clipX, clipY, clipW, clipH);
         c.DrawLine(px, py, px, ey, fg, 1);
         c.FillCircle(px, py, app.Scale(2), fg);
+        c.PopClip();
         if (txt == null || txt.Length == 0) { return; }
         int tw = Canvas.MeasureText(txt, fs);
         int thh = Canvas.FontHeight(fs);
@@ -579,6 +612,7 @@ partial class ChartView {
         if (tx + tw > clipX + clipW) { tx = clipX + clipW - tw; }
         int ty = ey - thh;
         if (ty < clipY) { ty = clipY; }
-        c.DrawText(tx, ty, txt, fg, fs);
+        ChartView.DrawTextClamped(c, tx, ty, txt, fg, fs,
+            clipX, clipY, clipW, clipH);
     }
 }
