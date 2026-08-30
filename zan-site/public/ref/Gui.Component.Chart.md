@@ -388,7 +388,7 @@ EncodeBy / EncodeNamed 选择不同维度来驱动多个图表——
 
 ## ChartInteractionEvent (class)
 
-带载荷的 typed 图表交互事件。未命中的图表级事件使用 `dataHit=false`、`elementType=Chart`、`dataIndex=-1`；命中首批 line/bar/scatter/heatmap/pie/map 图元时填充源数据索引、名称、兼容整数值和可用的 double/x/y 字段。
+带载荷的 typed 图表交互事件。未命中的图表级事件使用 `dataHit=false`、`elementType=Chart`、`dataIndex=-1`；命中首批 line/bar/scatter/heatmap/pie/map 图元以及 Chord/Force/Sankey/Bubbles 的稳定节点、连线或气泡时，填充源/布局索引、名称、兼容整数值和可用的 double/x/y 字段。
 
 - ChartEventType type;
 

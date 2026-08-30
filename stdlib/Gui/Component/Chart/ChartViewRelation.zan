@@ -64,6 +64,8 @@ partial class ChartView {
         }
 
         int hoverNode = 0 - 1;
+        int dataNode = 0 - 1;
+        int dataRibbon = 0 - 1;
         int bodyY = top;
         if (o.showLegend) {
             int x0 = x + pad;
@@ -116,17 +118,24 @@ partial class ChartView {
         int hoverRibbon = 0 - 1;
         int mxH = app.mouseX;
         int myH = app.mouseY;
+        int sweepMax = 360 * g / 1000;
+        bool insideChord = mxH >= boxX && mxH < boxX + boxW
+            && myH >= boxY && myH < boxY + boxH;
         int distH = ChartView.ISqrt((mxH - cx) * (mxH - cx) + (myH - cy) * (myH - cy));
-        if (myH >= bodyY && distH >= rInner0 && distH <= r + app.Scale(4)) {
+        if (insideChord && distH >= rInner0 && distH <= r + app.Scale(4)) {
             int angH = ChartView.AngleOf(mxH - cx, myH - cy);
             for (int hi = 0; hi < nn; hi = hi + 1) {
                 if (hi < nodeHid.Count && nodeHid[hi]) { continue; }
-                if (ChartView.InSweep(angH, layout.nodes[hi].a0, layout.nodes[hi].a1)) {
+                ChordNodeArc ha = layout.nodes[hi];
+                int endH = ha.a1;
+                if (endH > ha.a0 + sweepMax) { endH = ha.a0 + sweepMax; }
+                if (endH > ha.a0 && ChartView.InSweep(angH, ha.a0, endH)) {
                     hoverNode = hi;
+                    dataNode = hi;
                 }
             }
         }
-        if (hoverNode < 0 && myH >= bodyY) {
+        if (dataNode < 0 && insideChord) {
             for (int ri = 0; ri < nr; ri = ri + 1) {
                 ChordRibbon rbh = layout.ribbons[ri];
                 if (rbh.from < nodeHid.Count && nodeHid[rbh.from]) { continue; }
@@ -143,13 +152,30 @@ partial class ChartView {
                     int it = 100 - tq;
                     int bx = (it * it * x1h + 2 * it * tq * cx + tq * tq * x2h) / 10000;
                     int by = (it * it * y1h + 2 * it * tq * cy + tq * tq * y2h) / 10000;
-                    if (ChartView.DistToSeg(mxH, myH, pxh, pyh, bx, by) <= app.Scale(8)) {
+                    int thH = app.Scale(2) + app.Scale(6) * rbh.val / maxVal;
+                    int hitRH = app.Scale(4) + thH / 2;
+                    if (ChartView.DistToSeg(mxH, myH, pxh, pyh, bx, by) <= hitRH) {
                         hoverRibbon = ri;
+                        dataRibbon = ri;
                     }
                     pxh = bx;
                     pyh = by;
                 }
             }
+        }
+
+        if (dataNode >= 0) {
+            ChordNodeArc nh = layout.nodes[dataNode];
+            ChartHit ch = ChartHit.Of(ChartElementType.Node, 0, lead.name,
+                dataNode, nh.name, nh.weight, mxH, myH);
+            ChartView.OfferActiveHit(ch);
+        } else if (dataRibbon >= 0) {
+            ChordRibbon rh = layout.ribbons[dataRibbon];
+            string rn = layout.nodes[rh.from].name + " -> "
+                + layout.nodes[rh.to].name;
+            ChartHit ch2 = ChartHit.Of(ChartElementType.Link, 0, lead.name,
+                dataRibbon, rn, rh.val, mxH, myH);
+            ChartView.OfferActiveHit(ch2);
         }
 
         // 先画 ribbon：端点落在对应节点子弧上（FillSector 角）。
@@ -179,7 +205,6 @@ partial class ChartView {
 
         // 节点弧：外环上按权重分的扇区，随 g 扫入。
         int rInner = rInner0;
-        int sweepMax = 360 * g / 1000;
         for (int i = 0; i < nn; i = i + 1) {
             if (i < nodeHid.Count && nodeHid[i]) { continue; }
             ChordNodeArc na = layout.nodes[i];
@@ -221,7 +246,9 @@ partial class ChartView {
                 int ang = ChartView.AngleOf(ddx, ddy);
                 for (int i = 0; i < nn; i = i + 1) {
                     ChordNodeArc na = layout.nodes[i];
-                    if (ChartView.InSweep(ang, na.a0, na.a1)) {
+                    int endT = na.a1;
+                    if (endT > na.a0 + sweepMax) { endT = na.a0 + sweepMax; }
+                    if (endT > na.a0 && ChartView.InSweep(ang, na.a0, endT)) {
                         if (i < nodeHid.Count && nodeHid[i]) { continue; }
                         List<TooltipRow> rows = new List<TooltipRow>{
                             TooltipRow.Of(0, o.title),
@@ -261,6 +288,7 @@ partial class ChartView {
                     py = by;
                 }
                 if (hit) {
+                    dataRibbon = i;
                     string fn = layout.nodes[rb.from].name;
                     string tn = layout.nodes[rb.to].name;
                     List<TooltipRow> rows = new List<TooltipRow>{
@@ -458,24 +486,37 @@ partial class ChartView {
         // linkStyle/nodeStyle 显式色（0 = 逐节点调色板，现状）。
         int linkCol0 = lead.forceLinkColor;
         int nodeCol0 = lead.forceNodeColor;
-        // 悬停节点（若有）：相邻边高亮。
+        // 悬停节点（若有）：相邻边高亮。命中半径与实际节点
+        // symbol 半径一致，并保留少量边缘容差；不依赖 tooltip 开关。
+        int nodeR = app.Scale(5);
         int hoverNode = 0 - 1;
-        if (o.showTooltip) {
-            int mx = app.mouseX;
-            int my = app.mouseY;
-            int best = 0 - 1;
-            int bestD = 0;
-            for (int i = 0; i < nn; i = i + 1) {
-                if (i < nodeHid.Count && nodeHid[i]) { continue; }
-                int ddx = mx - px[i];
-                int ddy = my - py[i];
-                int d2 = ddx * ddx + ddy * ddy;
-                int rad = app.Scale(6);
-                if (d2 <= rad * rad) {
-                    if (best < 0 || d2 < bestD) { best = i; bestD = d2; }
-                }
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        int best = 0 - 1;
+        int bestD = 0;
+        bool insideForce = mx >= ox && mx < ox + areaW
+            && my >= oy && my < oy + areaH;
+        for (int i = 0; i < nn; i = i + 1) {
+            if (i < nodeHid.Count && nodeHid[i]) { continue; }
+            ForceNode nd = layout.nodes[i];
+            int nrHit = nodeR;
+            if (nd.size > 0) { nrHit = app.Scale(nd.size) / 2; }
+            int hitR = nrHit + app.Scale(2);
+            int ddx = mx - px[i];
+            int ddy = my - py[i];
+            int d2 = ddx * ddx + ddy * ddy;
+            if (d2 <= hitR * hitR) {
+                if (best < 0 || d2 < bestD) { best = i; bestD = d2; }
             }
-            hoverNode = best;
+        }
+        if (!insideForce) { best = 0 - 1; }
+        hoverNode = best;
+        if (hoverNode >= 0) {
+            ForceNode ndHit = layout.nodes[hoverNode];
+            int hitValue = ndHit.weight;
+            ChartHit fh = ChartHit.Of(ChartElementType.Node, 0, lead.name,
+                hoverNode, ndHit.name, hitValue, px[hoverNode], py[hoverNode]);
+            ChartView.OfferActiveHit(fh);
         }
 
         // 边：先画普通边，再盖悬停高亮。
@@ -505,7 +546,6 @@ partial class ChartView {
 
         // 节点 + 标签。显式形状经 series.tree 的 ChartNode.Shaped
         // 叶按名匹配（ECharts force 的逐节点 symbol/symbolSize）。
-        int nodeR = app.Scale(5);
         for (int i = 0; i < nn; i = i + 1) {
             if (i < nodeHid.Count && nodeHid[i]) { continue; }
             ForceNode nd = layout.nodes[i];
@@ -541,7 +581,7 @@ partial class ChartView {
             }
         }
 
-        if (hoverNode >= 0) {
+        if (o.showTooltip && hoverNode >= 0) {
             ForceNode nd = layout.nodes[hoverNode];
             List<TooltipRow> rows = new List<TooltipRow>{
                 TooltipRow.Of(0, o.title),
