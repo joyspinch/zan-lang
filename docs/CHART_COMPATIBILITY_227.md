@@ -33,6 +33,7 @@
 - 地图 GeoJSON、UTF8Encoding 压缩坐标、区域选择和漫游；
 - `connectGroup` 对多图的 dataZoom、图例和 Cartesian hover 联动；
 - `ChartController` 的 option、系列数据替换和追加；
+- `ChartController` / `ChartView` 的快照读取、Restore/Clear、Loading/Empty/Error 状态和 Dispose 语义；
 - `ChartBig` 面向大数据量折线/面积图的抽样与缓存。
 
 ## 与 ECharts 2.2.7 的明确差异
@@ -43,7 +44,7 @@ ECharts 的 `formatter`、动态颜色、`symbolSize`、位置和 tooltip 回调
 
 ### 实例生命周期与事件
 
-Chart 的立即模式入口是 `ChartView.Render(app, x, y, w, h)`，状态使用稳定 key 保存在 `App.StateGet/StateSet`。这与 ECharts 的 DOM 实例 `resize()`、`on/un`、`dispose()` 模型不同；事件和生命周期 API 按阶段补齐，调用方不应假定所有 ECharts 实例方法已经存在。
+Chart 的立即模式入口是 `ChartView.Render(app, x, y, w, h)`，状态使用稳定 key 保存在 `App.StateGet/StateSet`。保留的 `ChartView` 已提供 `GetOption`、`SetOption`、`Restore`、`Clear`、`Refresh`、`ShowLoading`/`HideLoading`、`SetEmptyMessage`、`SetErrorMessage` 和 `Dispose`，并可订阅 Rendered/Resized/Updated/Disposed 的无参数生命周期事件；这些回调在 Render seam 触发，不是完整 ECharts DOM 事件载荷。与 ECharts 的 `resize()`、带 payload 的 `on/un` 模型仍有差异，调用方不应假定所有 ECharts 实例方法已经存在。
 
 ### 动画
 

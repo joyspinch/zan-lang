@@ -14,7 +14,10 @@ namespace Gui.Component.Chart;
 partial class ChartView {
     ChartOption option;
     ChartOption sourceOption;
+    ChartOption initialOption;
     ChartController controller;
+    string directStatus;
+    string directStatusMessage;
     ResolvedChart resolved;
     bool staticFrame;
     // 每个图表稳定的动画键。默认为新 WidgetId，但
@@ -22,6 +25,36 @@ partial class ChartView {
     // 行滚动进出而变动）应通过 Keyed() 传入自有稳定键，
     // 避免增长入场动画每帧被重置为 0。
     int wid;
+
+    // 保留式生命周期通知。图表仍由 Render 驱动，但调用方
+    // 可以在创建后订阅，不必改写每个 renderer 的交互分支。
+    UiEvent Rendered;
+    UiEvent Resized;
+    UiEvent Updated;
+    UiEvent Disposed;
+    int lastRenderW;
+    int lastRenderH;
+    int directVersion;
+    int lastControllerVersion;
+    int lastDirectVersion;
+    bool hasRendered;
+    bool disposed;
+
+    void InitLifecycle() {
+        Rendered = new UiEvent();
+        Resized = new UiEvent();
+        Updated = new UiEvent();
+        Disposed = new UiEvent();
+        lastRenderW = 0;
+        lastRenderH = 0;
+        directVersion = 1;
+        lastControllerVersion = 0 - 1;
+        lastDirectVersion = 0 - 1;
+        hasRendered = false;
+        disposed = false;
+        directStatus = "ready";
+        directStatusMessage = "";
+    }
 
     /// 把图例开关写回 data.hidden（多数据项）或 series.hidden（单值系列）。
     /// 画廊每帧重建 option，必须从 App 状态恢复，否则点了等于没点。
@@ -58,9 +91,12 @@ partial class ChartView {
     static int ttDepth;
 
     static ChartView Of(ChartOption o) {
+        if (o == null) { o = ChartOption.Create(); }
         ChartView v = new ChartView();
+        v.InitLifecycle();
         v.option = o;
         v.sourceOption = o;
+        v.initialOption = ChartOption.Clone(o);
         v.staticFrame = false;
         v.wid = WidgetId.Next();
         return v;
@@ -68,10 +104,13 @@ partial class ChartView {
 
     /// 绑定一个选项及调用方所有的稳定动画键。
     static ChartView Keyed(ChartOption o, int key) {
+        if (o == null) { o = ChartOption.Create(); }
         ChartView v = new ChartView();
+        v.InitLifecycle();
         v.option = o;
         v.controller = null;
         v.sourceOption = o;
+        v.initialOption = ChartOption.Clone(o);
         v.staticFrame = false;
         v.wid = key;
         return v;
@@ -90,9 +129,15 @@ partial class ChartView {
     /// 将 ChartView 绑定到可变 controller。Render 时读取 controller 的当前 option。
     static ChartView Bind(ChartController controller) {
         ChartView v = new ChartView();
+        v.InitLifecycle();
         v.controller = controller;
-        if (controller != null) { v.option = controller.Option(); v.sourceOption = v.option; }
-        else { v.option = ChartOption.Create(); v.sourceOption = v.option; }
+        if (controller != null) {
+            v.option = controller.Option(); v.sourceOption = v.option;
+            v.initialOption = controller.GetOption();
+        } else {
+            v.option = ChartOption.Create(); v.sourceOption = v.option;
+            v.initialOption = ChartOption.Clone(v.option);
+        }
         v.staticFrame = false;
         v.wid = WidgetId.Next();
         return v;
@@ -103,6 +148,124 @@ partial class ChartView {
         ChartView v = ChartView.Bind(controller);
         v.wid = key;
         return v;
+    }
+
+    /// 生命周期事件：在保留的 ChartView 实例上订阅。
+    ChartView OnRendered(Action a) { Rendered.Add(a); return this; }
+    ChartView OnResize(Action a) { Resized.Add(a); return this; }
+    ChartView OnUpdated(Action a) { Updated.Add(a); return this; }
+    ChartView OnDisposed(Action a) { Disposed.Add(a); return this; }
+
+    /// 返回 option 快照；controller 绑定和直接 option 两种模式都不暴露
+    /// 内部可变对象。
+    ChartOption GetOption() {
+        if (this.controller != null) { return this.controller.GetOption(); }
+        return ChartOption.Clone(this.sourceOption);
+    }
+
+    string Status() {
+        if (this.disposed) { return "disposed"; }
+        if (this.controller != null) { return this.controller.Status(); }
+        return this.directStatus;
+    }
+
+    string StatusMessage() {
+        if (this.disposed) { return ""; }
+        if (this.controller != null) { return this.controller.StatusMessage(); }
+        return this.directStatusMessage;
+    }
+
+    bool IsDisposed() { return this.disposed; }
+
+    /// 替换 option；绑定 controller 时保留 controller 身份。
+    ChartView SetOption(ChartOption next) {
+        if (this.disposed || next == null) { return this; }
+        if (this.controller != null) { this.controller.SetOption(next); }
+        else {
+            this.sourceOption = next; this.option = next;
+            this.initialOption = ChartOption.Clone(next);
+            this.directStatus = "ready"; this.directStatusMessage = "";
+            this.directVersion = this.directVersion + 1;
+        }
+        return this;
+    }
+
+    /// 立即模式的显式刷新入口。Render 每帧都会读取最新 option，
+    /// 因此这里仅提供与 ECharts refresh() 对齐的可链式语义。
+    ChartView Refresh() { return this; }
+
+    ChartView Restore() {
+        if (this.disposed) { return this; }
+        if (this.controller != null) { this.controller.Restore(); }
+        else {
+            this.sourceOption = ChartOption.Clone(this.initialOption); this.option = this.sourceOption;
+            this.directStatus = "ready"; this.directStatusMessage = "";
+            this.directVersion = this.directVersion + 1;
+        }
+        return this;
+    }
+
+    ChartView Clear() {
+        if (this.disposed) { return this; }
+        if (this.controller != null) { this.controller.Clear(); }
+        else {
+            for (int i = 0; i < this.sourceOption.series.Count; i = i + 1) {
+                this.sourceOption.series[i].data = new List<ChartData>();
+            }
+            this.directStatus = "empty"; this.directStatusMessage = "";
+            this.directVersion = this.directVersion + 1;
+        }
+        return this;
+    }
+
+    ChartView ShowLoading(string message) {
+        if (this.disposed) { return this; }
+        if (this.controller != null) { this.controller.ShowLoading(message); }
+        else {
+            this.directStatus = "loading"; this.directStatusMessage = message;
+            this.directVersion = this.directVersion + 1;
+        }
+        return this;
+    }
+
+    ChartView HideLoading() {
+        if (this.disposed) { return this; }
+        if (this.controller != null) { this.controller.HideLoading(); }
+        else {
+            this.directStatus = "ready"; this.directStatusMessage = "";
+            this.directVersion = this.directVersion + 1;
+        }
+        return this;
+    }
+
+    ChartView SetEmptyMessage(string message) {
+        if (this.disposed) { return this; }
+        if (this.controller != null) { this.controller.SetEmptyMessage(message); }
+        else {
+            this.directStatus = "empty"; this.directStatusMessage = message;
+            this.directVersion = this.directVersion + 1;
+        }
+        return this;
+    }
+
+    ChartView SetErrorMessage(string message) {
+        if (this.disposed) { return this; }
+        if (this.controller != null) { this.controller.SetErrorMessage(message); }
+        else {
+            this.directStatus = "error"; this.directStatusMessage = message;
+            this.directVersion = this.directVersion + 1;
+        }
+        return this;
+    }
+
+    /// 释放 view 的事件订阅并使后续 Render/操作失效。
+    /// controller 的生命周期由创建它的调用方拥有，view 不会替其 Dispose。
+    void Dispose() {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        this.directStatus = "disposed"; this.directStatusMessage = "";
+        if (this.Disposed.Count() > 0) { this.Disposed.Raise(); }
+        this.Rendered.Clear(); this.Resized.Clear(); this.Updated.Clear();
     }
 
     // RenderCached 的动态快照槽位分配器：运行时池按需增长
@@ -477,6 +640,30 @@ partial class ChartView {
             Style.FontFallback(app, "small"));
     }
 
+    static void DrawStatusState(App app, int x, int y, int w, int h,
+                                string status, string message) {
+        if (status == "ready") { return; }
+        Theme t = app.theme;
+        StyleBox panel = Style.Full(app, "chart", "", "", Style.SNormal());
+        int bg = panel.BgOr(0);
+        int fg = panel.FgOr(0);
+        if (status == "loading") { bg = 0xCCFFFFFF; }
+        if (status == "error") { fg = 0xFFC0392B; }
+        app.canvas.SurfaceRoundRect(x, y, w, h, t.borderRadiusMedium, bg,
+            panel.BorderOr(0), 1);
+        string msg = message;
+        if (msg.Length == 0) {
+            if (status == "loading") { msg = "Loading..."; }
+            else if (status == "empty") { msg = "(no data)"; }
+            else if (status == "error") { msg = "Chart error"; }
+            else { msg = "(disposed)"; }
+        }
+        int fs = Style.FontFallback(app, "small");
+        int mw = Canvas.MeasureText(msg, fs);
+        app.canvas.DrawText(x + w / 2 - mw / 2,
+            Canvas.CenterTextYAt(y + h / 2, fs), msg, fg, fs);
+    }
+
     /// 任一序列为面积线时返回 true（对应 ECharts line.areaStyle.show）。
     static bool HasArea(ChartOption o) {
         for (int i = 0; i < o.series.Count; i = i + 1) {
@@ -507,7 +694,21 @@ partial class ChartView {
     }
 
     void Render(App app, int x, int y, int w, int h) {
-        if (this.controller != null) { this.sourceOption = this.controller.Option(); }
+        if (this.disposed) { return; }
+        bool resized = this.hasRendered && (this.lastRenderW != w || this.lastRenderH != h);
+        bool updated = false;
+        if (this.controller != null) {
+            int cv = this.controller.Version();
+            updated = this.hasRendered && cv != this.lastControllerVersion;
+            ChartOption current = this.controller.Option();
+            // Controller.Dispose() 清空其 option，但 view 仍可把最后一帧
+            // 作为背景绘出，并由状态层显示 disposed，而不是把 null
+            // 传给 resolved/layout。
+            if (current != null) { this.sourceOption = current; }
+        } else {
+            updated = this.hasRendered && this.directVersion != this.lastDirectVersion;
+        }
+        if (this.sourceOption == null) { this.sourceOption = ChartOption.Create(); }
         Theme t = app.theme;
         this.resolved = ResolvedChart.Resolve(this.sourceOption, t, app, wid);
         bool animate = this.resolved.animate;
@@ -558,6 +759,16 @@ partial class ChartView {
             ChartView.DrawToolbox(app, x, y, w, h, this.wid, drawOption);
             ChartView.FlushToolboxSave(app, this.wid);
         }
+        ChartView.DrawStatusState(app, x, y, w, h,
+            this.Status(), this.StatusMessage());
+        if (resized && this.Resized.Count() > 0) { this.Resized.Raise(); }
+        if (updated && this.Updated.Count() > 0) { this.Updated.Raise(); }
+        if (this.Rendered.Count() > 0) { this.Rendered.Raise(); }
+        this.lastRenderW = w;
+        this.lastRenderH = h;
+        if (this.controller != null) { this.lastControllerVersion = this.controller.Version(); }
+        else { this.lastDirectVersion = this.directVersion; }
+        this.hasRendered = true;
     }
 
     /// connect() 组交互键重定向：组内第一张到达的图把「组长 wid」
