@@ -2757,3 +2757,45 @@ hunk；既有欠账照录不扩大。
   经 `emit_delegate_invoke` 同款 trampoline 调用；② checker：在实参转换
   点拒绝"实例方法组 → ThreadStart"并给出指向日志。建议 ① 为根治，
   顺带让 `new Thread(instance.Run)` 一类写法全部自然可用。
+
+# A71 · 标准库按需加载第一步：Gui 图标表从编译期代码改为 JSON 数据包 + zanc 自动内嵌 —— ✅ 已完成（2026-08-30）
+
+- **动机**：空窗口 --publish 2.08MB 里 483KB 是 997 个 Tabler 图标的 SVG
+  body——它们原是 `IconSvgData.zan` 里两条巨型 `List<string>` 字面量，被
+  展开成 .data 的 XOR 混淆字符串节（--publish 全量混淆，deobf ctor 启动时
+  整表还原），没画过图标的程序也全款背走，且字符串常量不可按需丢弃。
+- **改造**（stdlib/Gui/IconSvgData.zan 重写为惰性加载器）：
+  · 数据搬进 `stdlib/Gui/icons/tabler.json`（~258KB，`{"名": "SVG body"}`，
+    升序）；`scripts/gen_icons_tabler.py` 改为输出 JSON 包。
+  · `Ensure()` 首次画图标才解析：`ZAN_GUI_ICONS` env（文件或目录）→
+    exe 旁 `icons/`、`assets/icons/` → 内嵌资源 `icons/*.json` →
+    `stdlib/Gui/icons/`（开发树），多包有序合并（先到先得、同名覆盖按
+    "磁盘包 > 内置包"排序保证），插入排序恢复全局升序供二分。
+  · 扩展性：应用丢一个自己的 json（exe 旁 icons/ 或 env 指向）即可追加/
+    覆盖个别图标，无需动标准库。
+- **zanc 自动内嵌**（src/compiler/main.c）：程序镜像真的含有
+  `IconSvgData_` 符号（即 GUI 图标模块被链入）且 stdlib 根存在
+  `Gui/icons/` 时，自动追加 `--embed <stdlib>/Gui/icons=icons`，资源名
+  `icons/<file>` 与读取端 `zan_embed_list("icons/")` 对齐；磁盘包发现序
+  在内嵌之前，替换包仍可覆盖。发布 GUI 程序零侧车文件。
+- **体积**：空窗口 --publish 2,078,720 → 1,995,776 B（-81KB）；.data
+  529→234KB、.rdata 284→521KB（embed 表为只读常量，还顺带把图标字节从
+  可写段挪出）。gallery --publish 11.44→11.37MB。编译期收益：
+  IconSvgData_Ensure 的 92KB .text 代码消失。
+- **回归**：conformance_gui_icon/gui_css/gui_props 等 53 项 GUI standard
+  档仅 3 失败（cef_profile/gui_input/watermark，stash 验证为并行在途既有
+  失败）；clipboard_roundtrip 复跑 5 次全过。发布探针验证：内嵌态 997 枚
+  全可读、ZAN_GUI_ICONS 自定义包合并生效（997+1=998、序保持升序）。
+- **后续路线（按需加载仍未完的部分）**：
+  ① `-ffunction-sections` + `--gc-sections`：LLVM C API（20.1.8）没有
+  function-sections 开关，需在 irgen 每函数设 section 属性
+  (`LLVMSetSection(fn, ".text$<name>")`) 或升级暴露 TargetMachineOptions
+  的 C API；空窗口 .text 1.12MB 预计可砍近半（DataTable/CefCdp/
+  HttpClient 等未被调用的族全在镜像里）。
+  ② globaldce 根因：`zan_opt_strip_unused` 只跑 globaldce，但 vtable/
+  refl mtab/site-dtor 三张全类表把所有类的方法体钉进可达集——按需加载
+  想真正生效必须让这三张表只含被实例化/被反射到的类。
+  ③ auto-embed 泛化：把「stdlib 命名空间数据目录自动烤进镜像」推广成
+  一般机制（skins 已手工做，icons 本次做了），例如约定
+  `stdlib/<Ns>/data/` 自动 `--embed <dir>=<Ns>/data`，新组件的数据文件
+  不再需要每次手接。

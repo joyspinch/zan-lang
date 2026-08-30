@@ -2679,6 +2679,41 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* ---- Gui icon packs inside the executable ----------------------
+         * stdlib/Gui/IconSvgData keeps its icon table in JSON data packs
+         * (stdlib/Gui/icons/*.json) and resolves them at run time through the
+         * same discovery chain as skin packs: env ZAN_GUI_ICONS, an icons/
+         * folder beside the exe, embedded resources, then the stdlib copy.
+         * When the compiled program actually carries that module (its symbols
+         * are in the image), the stdlib packs are baked in automatically under
+         * their discovery names so a published GUI app draws icons with
+         * nothing beside the exe. Disk packs win over embedded ones (the
+         * discovery order tries them first), so shipping a replacement pack
+         * still overrides the baked-in table without touching zanc. */
+        if (resolved_stdlib_root[0] &&
+            zan_irgen_defines_prefix(&irgen, "IconSvgData_")) {
+            char icons_dir[1200];
+            snprintf(icons_dir, sizeof(icons_dir), "%s/Gui/icons",
+                     resolved_stdlib_root);
+            if (zan_file_exists(icons_dir)) {
+                char *icon_spec = (char *)malloc(strlen(icons_dir) + 32);
+                if (icon_spec) {
+                    /* resource names "icons/<file>" match the reader's
+                     * zan_embed_list("icons/") prefix scan */
+                    snprintf(icon_spec, strlen(icons_dir) + 32,
+                             "%s=icons", icons_dir);
+                    if (embed_spec_count < 64) {
+                        embed_specs[embed_spec_count++] = icon_spec;
+                    } else {
+                        fprintf(stderr, "warning: cannot auto-embed Gui icon "
+                                "packs from '%s'; --embed resources limit "
+                                "reached\n", icons_dir);
+                        free(icon_spec);
+                    }
+                }
+            }
+        }
+
         /* --embed: the project files that ship inside the executable rather
          * than beside it. Baked into this module (not a separately compiled
          * object) so it works for every target with no external C compiler.

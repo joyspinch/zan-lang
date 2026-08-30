@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generate stdlib/Gui/IconSvgData.zan — the curated Tabler icon table for
-Gui.IconSvg.
+"""Generate stdlib/Gui/icons/tabler.json — the curated Tabler icon pack for
+Gui.IconSvgData.
 
 Selection: a hand-picked core list of everyday app-UI names is always kept
 (dropped silently if Tabler renamed them); "-filled" twins of picked outline
@@ -16,7 +16,7 @@ wrapper hardcode the viewBox.
 
 Usage:
     python scripts/gen_icons_tabler.py --count 1000 \
-        --out stdlib/Gui/IconSvgData.zan
+        --out stdlib/Gui/icons/tabler.json
 
 Tabler Icons is MIT licensed: https://github.com/tabler/tabler-icons
 """
@@ -152,7 +152,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--count", type=int, default=1000)
     ap.add_argument("--family-cap", type=int, default=8)
-    ap.add_argument("--out", default="stdlib/Gui/IconSvgData.zan")
+    ap.add_argument("--out", default="stdlib/Gui/icons/tabler.json")
     args = ap.parse_args()
 
     col = fetch_json(f"{API}/collection?prefix=tabler")
@@ -225,79 +225,13 @@ def main() -> int:
         return 1
     picked = sorted(bodies)
 
-    def emit_names() -> str:
-        return "\n".join(f'            "{n}",' for n in picked)
-
-    def emit_bodies() -> str:
-        return "\n".join(f'            "{bodies[n]}",' for n in picked)
-
-    src = f'''using System;
-
-namespace Gui;
-
-/// IconSvg 的数据表:{len(picked)} 个 Tabler Icons 精选子集(MIT 授权,
-/// https://github.com/tabler/tabler-icons),由 scripts/gen_icons_tabler.py
-/// 从 Iconify API 生成——**生成物,请勿手改**;要换子集或更新上游版本时
-/// 重跑该脚本(--count/--out 可调)。
-///
-/// 约定:
-///   · names 与 bodies 平行且按名称升序,IndexOf 用二分查找;
-///   · 所有图标均为 24x24 viewBox,IconSvg 据此包装 SVG 文档;
-///   · body 里的双引号已改写为单引号,避免 Zan 字面量转义;
-///   · body 保留 currentColor 占位,颜色由 IconSvg 在绘制时替换。
-class IconSvgData {{
-    static List<string> names;
-    static List<string> bodies;
-
-    static void Ensure() {{
-        if (names != null) {{ return; }}
-        names = new List<string>{{
-{emit_names()}
-        }};
-        bodies = new List<string>{{
-{emit_bodies()}
-        }};
-    }}
-
-    /// 表内图标个数。
-    static int Count() {{
-        IconSvgData.Ensure();
-        return names.Count;
-    }}
-
-    /// 全部图标名(升序)。供画廊、文档工具枚举。
-    static List<string> Names() {{
-        IconSvgData.Ensure();
-        return names;
-    }}
-
-    /// 二分查找图标名,未命中返回 -1。
-    static int IndexOf(string name) {{
-        IconSvgData.Ensure();
-        int lo = 0;
-        int hi = names.Count - 1;
-        while (lo <= hi) {{
-            int mid = (lo + hi) / 2;
-            int cmp = name.CompareTo(names[mid]);
-            if (cmp == 0) {{ return mid; }}
-            if (cmp < 0) {{ hi = mid - 1; }}
-            else {{ lo = mid + 1; }}
-        }}
-        return -1;
-    }}
-
-    /// 按下标取 SVG body(不含 <svg> 外壳)。
-    static string Body(int index) {{
-        IconSvgData.Ensure();
-        return bodies[index];
-    }}
-}}
-'''
+    pack = {n: bodies[n] for n in picked}
+    out_text = json.dumps(pack, ensure_ascii=False, separators=(",", ":")) + "\n"
     with open(args.out, "w", encoding="utf-8", newline="\n") as f:
-        f.write(src)
+        f.write(out_text)
     total = sum(len(bodies[n]) for n in picked)
     print(f"wrote {args.out}: {len(picked)} icons, {total} body bytes, "
-          f"source {len(src)} bytes")
+          f"pack {len(out_text)} bytes")
     return 0
 
 
