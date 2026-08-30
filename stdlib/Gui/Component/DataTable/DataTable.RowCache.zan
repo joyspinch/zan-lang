@@ -1,0 +1,227 @@
+using System;
+
+namespace Gui.Component.DataTable;
+
+/// 页缓存的完整身份。仅使用 start 会把不同查询的同一页错误复用；
+/// query/schema/server revision 均属于内容身份。
+class DataPageKey {
+    string dataset;
+    string queryText;
+    int queryHash;
+    int schemaVersion;
+    int serverRevision;
+    int generation;
+    int start;
+    int size;
+    string cursor;
+
+    DataPageKey(string name, string canonical, int hash, int schema, int server,
+                int gen, int at, int pageSize, string token) {
+        this.dataset = name;
+        if (this.dataset == null) { this.dataset = ""; }
+        this.queryText = canonical;
+        if (this.queryText == null) { this.queryText = ""; }
+        this.queryHash = hash;
+        this.schemaVersion = schema;
+        this.serverRevision = server;
+        this.generation = gen;
+        this.start = at;
+        this.size = pageSize;
+        this.cursor = token;
+        if (this.cursor == null) { this.cursor = ""; }
+    }
+
+    static DataPageKey Of(QueryDescriptor query, QueryViewport viewport,
+                          QueryRequestToken token) {
+        string name = "";
+        string canonical = "";
+        int hash = 0;
+        int gen = 0;
+        int schema = 0;
+        int server = 0;
+        if (query != null) {
+            name = query.Dataset();
+            canonical = query.QueryJson();
+        }
+        if (token != null) {
+            hash = token.QueryHash();
+            gen = token.Generation();
+            schema = token.SchemaVersion();
+            server = token.ServerRevision();
+        }
+        int at = 0;
+        int size = 1;
+        string cursor = "";
+        if (viewport != null) {
+            at = viewport.Start();
+            size = viewport.Count();
+            cursor = viewport.Cursor();
+        }
+        return new DataPageKey(name, canonical, hash, schema, server,
+            gen, at, size, cursor);
+    }
+
+    string Dataset() { return this.dataset; }
+    int QueryHash() { return this.queryHash; }
+    int SchemaVersion() { return this.schemaVersion; }
+    int ServerRevision() { return this.serverRevision; }
+    int Generation() { return this.generation; }
+    int Start() { return this.start; }
+    int Size() { return this.size; }
+    string Cursor() { return this.cursor; }
+
+    bool Same(DataPageKey other) {
+        if (other == null) { return false; }
+        return this.dataset == other.dataset
+            && this.queryText == other.queryText
+            && this.queryHash == other.queryHash
+            && this.schemaVersion == other.schemaVersion
+            && this.serverRevision == other.serverRevision
+            && this.generation == other.generation
+            && this.start == other.start
+            && this.size == other.size
+            && this.cursor == other.cursor;
+    }
+}
+
+class DataPageCacheEntry {
+    DataPageKey key;
+    QueryResult result;
+    int bytes;
+    bool pinned;
+    int lastUse;
+
+    DataPageCacheEntry(DataPageKey pageKey, QueryResult page,
+                       int byteSize, int stamp) {
+        this.key = pageKey;
+        this.result = page;
+        this.bytes = byteSize;
+        this.pinned = false;
+        this.lastUse = stamp;
+    }
+
+    DataPageKey Key() { return this.key; }
+    QueryResult Result() { return this.result; }
+    int Bytes() { return this.bytes; }
+    bool Pinned() { return this.pinned; }
+    int LastUse() { return this.lastUse; }
+}
+
+/// 按字节预算的确定性页缓存。实现使用小型数组，避免把线性 HashSet
+/// 当作高速索引；容量通常只包含当前视口附近的几十页，命中时更新 LRU。
+class DataPageCache {
+    int byteBudget;
+    int bytes;
+    int clock;
+    List<DataPageCacheEntry> entries;
+
+    DataPageCache(int budget) {
+        this.byteBudget = budget;
+        if (this.byteBudget < 1) { this.byteBudget = 1; }
+        this.bytes = 0;
+        this.clock = 0;
+        this.entries = new List<DataPageCacheEntry>();
+    }
+
+    int ByteBudget() { return this.byteBudget; }
+    int Bytes() { return this.bytes; }
+    int Count() { return this.entries.Count; }
+
+    int Find(DataPageKey key) {
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].Key().Same(key)) { return i; }
+        }
+        return -1;
+    }
+
+    QueryResult Get(DataPageKey key) {
+        int at = this.Find(key);
+        if (at < 0) { return null; }
+        this.clock = this.clock + 1;
+        this.entries[at].lastUse = this.clock;
+        return this.entries[at].Result();
+    }
+
+    void SetPinned(DataPageKey key, bool value) {
+        int at = this.Find(key);
+        if (at >= 0) { this.entries[at].pinned = value; }
+    }
+
+    int OldestEvictableExcept(int excluded) {
+        int found = -1;
+        int stamp = 2147483647;
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            DataPageCacheEntry e = this.entries[i];
+            if (i != excluded && !e.Pinned() && e.LastUse() < stamp) {
+                found = i;
+                stamp = e.LastUse();
+            }
+        }
+        return found;
+    }
+
+    int EvictableBytesExcept(int excluded) {
+        int total = 0;
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (i != excluded && !this.entries[i].Pinned()) {
+                total = total + this.entries[i].Bytes();
+            }
+        }
+        return total;
+    }
+
+    int OldestEvictable() { return this.OldestEvictableExcept(-1); }
+
+    bool EvictOne() {
+        int at = this.OldestEvictable();
+        if (at < 0) { return false; }
+        this.bytes = this.bytes - this.entries[at].Bytes();
+        this.entries.RemoveAt(at);
+        return true;
+    }
+
+    /// 插入/替换一页。单页大于预算时不缓存，但仍允许当前查询使用。
+    bool Put(DataPageKey key, QueryResult result, int byteSize) {
+        if (key == null || result == null) { return false; }
+        if (byteSize < 0) { return false; }
+        if (byteSize > this.byteBudget) { return false; }
+        int old = this.Find(key);
+        int oldBytes = 0;
+        bool preservePinned = false;
+        if (old >= 0) {
+            oldBytes = this.entries[old].Bytes();
+            preservePinned = this.entries[old].Pinned();
+        }
+        if (this.bytes < oldBytes) { return false; }
+        if (byteSize > 2147483647 - (this.bytes - oldBytes)) { return false; }
+        int projected = this.bytes - oldBytes + byteSize;
+        if (projected < 0) { return false; }
+        if (projected > this.byteBudget) {
+            int need = projected - this.byteBudget;
+            if (need > this.EvictableBytesExcept(old)) { return false; }
+        }
+        while (this.bytes - oldBytes + byteSize > this.byteBudget) {
+            int victim = this.OldestEvictableExcept(old);
+            if (victim < 0) { return false; }
+            this.bytes = this.bytes - this.entries[victim].Bytes();
+            this.entries.RemoveAt(victim);
+            if (old > victim) { old = old - 1; }
+        }
+        if (old >= 0) {
+            this.bytes = this.bytes - this.entries[old].Bytes();
+            this.entries.RemoveAt(old);
+        }
+        this.clock = this.clock + 1;
+        DataPageCacheEntry replacement =
+            new DataPageCacheEntry(key, result, byteSize, this.clock);
+        replacement.pinned = preservePinned;
+        this.entries.Add(replacement);
+        this.bytes = this.bytes + byteSize;
+        return true;
+    }
+
+    void Clear() {
+        this.entries.Clear();
+        this.bytes = 0;
+    }
+}

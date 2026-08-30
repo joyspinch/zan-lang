@@ -1,0 +1,154 @@
+using System;
+
+namespace Gui.Component.DataTable;
+
+/// 查询结果中的一行。RowKey 和 revision 随结果一起交付，避免页被
+/// 重新定位后仍把旧的源索引当成业务身份。
+class QueryRow {
+    RowKey key;
+    int revision;
+    DataRow cells;
+
+    QueryRow(RowKey rowKey, int rowRevision, DataRow values) {
+        this.key = rowKey;
+        this.revision = rowRevision;
+        this.cells = values;
+    }
+
+    RowKey Key() { return this.key; }
+    int Revision() { return this.revision; }
+    DataRow Cells() { return this.cells; }
+}
+
+/// 一页查询结果的传输元数据。totalKnown=false 时，total 不参与
+/// RowCount 推断，HasMore/continuation 才是尾部语义的来源。
+class QueryResult {
+    int requestId;
+    int generation;
+    string queryText;
+    int queryHash;
+    int schemaVersion;
+    int serverRevision;
+    int start;
+    int requestedCount;
+    string cursor;
+    int total;
+    bool totalKnown;
+    bool hasMore;
+    string continuation;
+    List<QueryRow> rows;
+    string error;
+    bool valid;
+
+    QueryResult(int id, int gen, string canonical, int hash, int schema, int server,
+                int at, int requested, string pageCursor,
+                List<QueryRow> values, int totalCount,
+                bool known, bool more, string nextCursor, string failure) {
+        this.requestId = id;
+        this.generation = gen;
+        this.queryText = canonical;
+        if (this.queryText == null) { this.queryText = ""; }
+        this.queryHash = hash;
+        this.schemaVersion = schema;
+        this.serverRevision = server;
+        this.start = at;
+        if (this.start < 0) { this.start = 0; }
+        this.requestedCount = requested;
+        if (this.requestedCount < 1) { this.requestedCount = 1; }
+        this.cursor = pageCursor;
+        if (this.cursor == null) { this.cursor = ""; }
+        this.rows = values;
+        if (this.rows == null) { this.rows = new List<QueryRow>(); }
+        this.total = totalCount;
+        this.totalKnown = known;
+        if (this.totalKnown && this.total < 0) { this.totalKnown = false; }
+        if (this.totalKnown && this.total < this.start + this.rows.Count) {
+            this.total = this.start + this.rows.Count;
+        }
+        this.hasMore = more;
+        this.continuation = nextCursor;
+        if (this.continuation == null) { this.continuation = ""; }
+        this.error = failure;
+        if (this.error == null) { this.error = ""; }
+        this.valid = true;
+        for (int i = 0; i < this.rows.Count; i = i + 1) {
+            if (this.rows[i] == null || this.rows[i].Key() == null
+                || this.rows[i].Revision() < 0) {
+                this.valid = false;
+            }
+        }
+        if (this.rows.Count > this.requestedCount && this.error.Length == 0) {
+            this.error = "query result row count exceeds viewport";
+            this.valid = false;
+        }
+        if (this.hasMore && this.cursor.Length > 0
+            && this.continuation.Length == 0 && this.error.Length == 0) {
+            this.error = "query result continuation is missing";
+            this.valid = false;
+        }
+    }
+
+    static QueryResult Empty(QueryRequestToken token, QueryViewport viewport) {
+        if (token == null || viewport == null) { return null; }
+        return new QueryResult(token.RequestId(), token.Generation(),
+            token.QueryText(), token.QueryHash(), token.SchemaVersion(), token.ServerRevision(),
+            viewport.Start(), viewport.Count(), viewport.Cursor(),
+            new List<QueryRow>(), 0, true, false, "", "");
+    }
+
+    static QueryResult EmptyAt(QueryRequestToken token, int at) {
+        if (token == null) { return null; }
+        return new QueryResult(token.RequestId(), token.Generation(),
+            token.QueryText(), token.QueryHash(), token.SchemaVersion(), token.ServerRevision(),
+            at, 1, "", new List<QueryRow>(), 0, true, false, "", "");
+    }
+
+    int RequestId() { return this.requestId; }
+    int Generation() { return this.generation; }
+    string QueryText() { return this.queryText; }
+    int QueryHash() { return this.queryHash; }
+    int SchemaVersion() { return this.schemaVersion; }
+    int ServerRevision() { return this.serverRevision; }
+    int Start() { return this.start; }
+    int RequestedCount() { return this.requestedCount; }
+    string Cursor() { return this.cursor; }
+    int Count() { return this.rows.Count; }
+    int Total() { return this.total; }
+    bool TotalKnown() { return this.totalKnown; }
+    bool HasMore() { return this.hasMore; }
+    string Continuation() { return this.continuation; }
+    string Error() { return this.error; }
+    bool Failed() { return this.error.Length > 0 || !this.valid; }
+
+    bool Covers(int row) {
+        return row >= this.start && row < this.start + this.rows.Count;
+    }
+
+    bool MatchesViewport(QueryViewport viewport) {
+        if (viewport == null) { return false; }
+        return this.start == viewport.Start()
+            && this.requestedCount == viewport.Count()
+            && this.cursor == viewport.Cursor();
+    }
+
+    QueryRow RowAt(int row) {
+        if (!this.Covers(row)) { return null; }
+        return this.rows[row - this.start];
+    }
+
+    string CellText(int row, int col) {
+        QueryRow value = this.RowAt(row);
+        if (value == null || value.Cells() == null) { return ""; }
+        return value.Cells().At(col);
+    }
+
+    bool Matches(QueryRequestToken token) {
+        if (token == null) { return false; }
+        return this.requestId == token.RequestId()
+            && this.generation == token.Generation()
+            && this.queryText == token.QueryText()
+            && this.queryHash == token.QueryHash()
+            && this.schemaVersion == token.SchemaVersion()
+            && this.serverRevision == token.ServerRevision();
+    }
+}

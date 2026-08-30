@@ -1,0 +1,69 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace DataTableQuerySourceTest;
+
+class DeferredSource : QueryDataSource {
+    DeferredSource() { this.Setup(); }
+
+    override void FetchQuery(QueryDescriptor query,
+                              QueryViewport viewport,
+                              QueryRequestToken token) { }
+}
+
+class Program {
+    static DataRow Cells(string value) {
+        DataRow row = new DataRow();
+        row.Push(value);
+        return row;
+    }
+
+    static QueryResult Result(QueryRequestToken token, int at, string value) {
+        List<QueryRow> rows = new List<QueryRow>();
+        rows.Add(new QueryRow(RowKey.Of("k" + value), 1, Program.Cells(value)));
+        return new QueryResult(token.RequestId(), token.Generation(),
+            token.QueryText(), token.QueryHash(), token.SchemaVersion(), token.ServerRevision(),
+            at, 10, "", rows, 100, true, false, "", "");
+    }
+
+    static void Main() {
+        DataTableState st = new DataTableState();
+        QueryDescriptor query = QueryDescriptor.Of(st, "orders", QueryCapabilities.Page);
+        QueryViewport viewport = new QueryViewport(20, 10, "");
+        DeferredSource source = new DeferredSource();
+
+        QueryRequestToken first = source.RequestQuery(query, viewport, null);
+        QueryRequestToken second = source.RequestQuery(query, viewport, null);
+        source.FinishQuery(Program.Result(first, 20, "stale"), first);
+        Console.WriteLine("stalePoll=" + source.Poll());
+        Console.WriteLine("staleRows=" + Convert.ToString(source.RowCount()));
+
+        source.FinishQuery(Program.Result(second, 20, "current"), second);
+        Console.WriteLine("currentPoll=" + source.Poll());
+        Console.WriteLine("currentReady=" + source.CellReady(20, 0));
+        Console.WriteLine("currentText=" + source.CellText(20, 0));
+        if (second == null) { return; }
+        source.FinishQuery(Program.Result(second, 20, "duplicate"), second);
+        Console.WriteLine("duplicatePoll=" + source.Poll());
+        QueryRequestToken rejected = source.RequestQuery(query, viewport, first);
+        Console.WriteLine("cancelledRejected=" + (rejected == null));
+
+        QueryResult empty = QueryResult.Empty(second, viewport);
+        Console.WriteLine("emptyViewport=" + (empty == null
+            || !empty.MatchesViewport(viewport)));
+
+        DataPageKey key1 = DataPageKey.Of(query, viewport, second);
+        DataPageCache cache = new DataPageCache(10);
+        Console.WriteLine("put1=" + cache.Put(key1, Program.Result(second, 20, "one"), 6));
+        Console.WriteLine("bytes1=" + Convert.ToString(cache.Bytes()));
+        QueryRequestToken other = new QueryRequestToken(9, second.Generation(),
+            second.QueryText(), second.QueryHash(), second.SchemaVersion(), second.ServerRevision());
+        QueryViewport viewport2 = new QueryViewport(30, 10, "");
+        DataPageKey key2 = DataPageKey.Of(query, viewport2, other);
+        Console.WriteLine("put2=" + cache.Put(key2, Program.Result(other, 30, "two"), 6));
+        Console.WriteLine("count=" + Convert.ToString(cache.Count()));
+        Console.WriteLine("evicted1=" + (cache.Get(key1) == null));
+        Console.WriteLine("hit2=" + (cache.Get(key2) != null));
+    }
+}

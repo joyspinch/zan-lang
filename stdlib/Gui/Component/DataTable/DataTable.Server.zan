@@ -39,8 +39,11 @@ class ServerDataSource : DataSource {
     bool loading;            // 获取进行中（合并 RequestBlock）
     int fetchStart;          // 进行中获取的首行
     bool blockDone;          // 进行中的获取已产生结果
-    List<DataRow> blockRows; // 进行中获取的结果缓冲区
+    List<DataRow> blockRows; // 进行中的获取结果缓冲区
     int blockCount;          // 获取产生的行数（短块 = 数据结束）
+    int nextFetchId;         // 单调请求 nonce
+    int activeFetchId;       // 当前 in-flight 请求 nonce
+
 
     /// 以给定块大小创建服务端数据源。
     /// 之后调用 SetKnownTotal 固定总行数；不调用则保持未知并持续增长。
@@ -60,12 +63,16 @@ class ServerDataSource : DataSource {
         this.blockDone = false;
         this.blockRows = new List<DataRow>();
         this.blockCount = 0;
+        this.nextFetchId = 0;
+        this.activeFetchId = 0;
     }
 
     /// 固定总行数。传 -1 回到未知/增长模式。
     /// 数据源可随时调用——例如计数查询返回后——
     /// 网格会在下一次 Poll() 时获取。
     void SetKnownTotal(int total) {
+        if (total < 0) { this.knownTotal = -1; return; }
+        if (total < this.cache.Count) { total = this.cache.Count; }
         this.knownTotal = total;
     }
 
@@ -96,12 +103,10 @@ class ServerDataSource : DataSource {
         if (this.loading) { return; }
         if (row < 0) { return; }
         if (!this.HasMore()) { return; }
-        int start = (row / this.blockSize) * this.blockSize;
-        // 该块已完全获取——无需操作。请求落在
-        // 参差的缓存边界上（滚动到底落在块中间）仍会
-        // 获取该块的剩余部分。
-        if (start + this.blockSize <= this.cache.Count) { return; }
-        this.StartFetch(start);
+        // 旧源明确是连续前缀模型：随机落入未加载中间位置时，
+        // 只能从当前前缀末端继续，不能把该页追加到错误的索引。
+        if (row < this.cache.Count) { return; }
+        this.StartFetch(this.cache.Count);
     }
 
     /// 获取已加载前缀之后的下一块。网格在
@@ -112,18 +117,18 @@ class ServerDataSource : DataSource {
     override void RequestNextBlock() {
         if (this.loading) { return; }
         if (!this.HasMore()) { return; }
-        int bs = this.blockSize;
-        int start = (this.cache.Count / bs) * bs;
-        if (start + bs <= this.cache.Count) { start = start + bs; }
-        this.StartFetch(start);
+        this.StartFetch(this.cache.Count);
     }
 
     void StartFetch(int start) {
+        if (start < this.cache.Count) { start = this.cache.Count; }
         this.fetchStart = start;
         this.loading = true;
         this.blockDone = false;
         this.blockRows = new List<DataRow>();
         this.blockCount = 0;
+        this.nextFetchId = this.nextFetchId + 1;
+        this.activeFetchId = this.nextFetchId;
         this.FetchBlock(start, this.blockSize);
     }
 
@@ -137,8 +142,17 @@ class ServerDataSource : DataSource {
         this.loading = false;
         this.blockDone = false;
         int n = this.blockCount;
+        if (this.fetchStart != this.cache.Count) { n = -1; }
+        if (n < 0 || n > this.blockRows.Count || n > this.blockSize) {
+            this.blockRows = new List<DataRow>();
+            this.blockCount = 0;
+            return false;
+        }
         if (n > 0) {
             for (int i = 0; i < n; i = i + 1) { this.cache.Add(this.blockRows[i]); }
+        }
+        if (this.knownTotal >= 0 && this.cache.Count > this.knownTotal) {
+            this.knownTotal = this.cache.Count;
         }
         if (this.knownTotal < 0 && n < this.blockSize) {
             // 短块表示服务器在说“这是最后一块”。
@@ -161,6 +175,18 @@ class ServerDataSource : DataSource {
     /// 保存进行中获取的结果。Poll() 在下一帧
     /// 将其并入缓存。
     void FinishBlock(List<DataRow> rows, int count) {
+        this.FinishBlock(rows, count, this.activeFetchId);
+    }
+
+    void FinishBlock(List<DataRow> rows, int count, int fetchId) {
+        if (!this.loading || this.blockDone || fetchId != this.activeFetchId) { return; }
+        if (rows == null || count < 0 || count > rows.Count
+            || count > this.blockSize) {
+            this.blockRows = new List<DataRow>();
+            this.blockCount = -1;
+            this.blockDone = true;
+            return;
+        }
         this.blockRows = rows;
         this.blockCount = count;
         this.blockDone = true;
@@ -246,6 +272,9 @@ class SparseServerDataSource : DataSource {
     int pendingCount;
     int pendingTotal;
     int pendingGeneration;
+    int pendingPageId;
+    int nextPageId;
+    int activePageId;
 
     SparseServerDataSource(int size) { this.Setup(size); }
 
@@ -262,11 +291,25 @@ class SparseServerDataSource : DataSource {
         this.pendingCount = 0;
         this.pendingTotal = -1;
         this.pendingGeneration = 0;
+        this.pendingPageId = 0;
+        this.nextPageId = 0;
+        this.activePageId = 0;
     }
 
     /// 服务器总数已知时固定 RowCount，使中部/尾部可直接定位。
     /// 传 -1 恢复未知总数模式；下一次短页会重新固定尾部。
-    void SetKnownTotal(int total) { this.knownTotal = total; }
+    void SetKnownTotal(int total) {
+        if (total < 0) { this.knownTotal = -1; return; }
+        int high = 0;
+        for (int i = 0; i < this.pages.Count; i = i + 1) {
+            SparseServerPage p = this.pages[i];
+            if (p.state == 2 && p.start + p.count > high) {
+                high = p.start + p.count;
+            }
+        }
+        if (total < high) { total = high; }
+        this.knownTotal = total;
+    }
 
     /// 查询、schema 或服务器 revision 变化时调用。旧页和旧响应
     /// 均失效，但不会让旧 generation 的结果污染新查询。
@@ -281,6 +324,8 @@ class SparseServerDataSource : DataSource {
         this.pendingCount = 0;
         this.pendingTotal = -1;
         this.pendingGeneration = 0;
+        this.pendingPageId = 0;
+        this.activePageId = this.activePageId + 1;
     }
 
     int Generation() { return this.generation; }
@@ -328,10 +373,14 @@ class SparseServerDataSource : DataSource {
 
     override bool HasMore() {
         if (this.knownTotal < 0) { return true; }
-        int at = 0;
-        while (at < this.knownTotal) {
-            if (!this.IsPageReady(at)) { return true; }
-            at = at + this.pageSize;
+        if (this.knownTotal == 0) { return false; }
+        int pageCount = (this.knownTotal + this.pageSize - 1) / this.pageSize;
+        for (int page = 0; page < pageCount; page = page + 1) {
+            int start = page * this.pageSize;
+            SparseServerPage p = this.PageAt(start);
+            if (p == null || p.generation != this.generation || p.state != 2) {
+                return true;
+            }
         }
         return false;
     }
@@ -355,7 +404,40 @@ class SparseServerDataSource : DataSource {
         this.pendingCount = 0;
         this.pendingTotal = -1;
         this.pendingGeneration = this.generation;
-        this.FetchPage(p.start, this.pageSize, this.generation);
+        this.nextPageId = this.nextPageId + 1;
+        this.activePageId = this.nextPageId;
+        this.pendingPageId = this.activePageId;
+        this.FetchPage(p.start, this.pageSize, this.generation, this.activePageId);
+    }
+
+    override void RequestNextBlock() {
+        if (this.loading) { return; }
+        int start = 0;
+        if (this.knownTotal >= 0) {
+            int pageCount = (this.knownTotal + this.pageSize - 1) / this.pageSize;
+            for (int page = 0; page < pageCount; page = page + 1) {
+                int candidate = page * this.pageSize;
+                SparseServerPage p = this.PageAt(candidate);
+                if (p == null || p.state != 2 || p.generation != this.generation) {
+                    start = candidate;
+                    break;
+                }
+                start = this.knownTotal;
+            }
+            if (start >= this.knownTotal) { return; }
+        } else {
+            int high = this.RowCount();
+            start = 0;
+            while (start < high) {
+                SparseServerPage p = this.PageAt(start);
+                if (p == null || p.state != 2 || p.generation != this.generation) {
+                    break;
+                }
+                start = start + this.pageSize;
+            }
+        }
+        SparseServerPage next = this.PageFor(start);
+        if (next.state != 2 && next.state != 1) { this.StartPage(next); }
     }
 
     override bool Poll() {
@@ -363,18 +445,33 @@ class SparseServerDataSource : DataSource {
         this.loading = false;
         this.pageDone = false;
         SparseServerPage p = this.pendingPage;
-        bool current = p != null && this.pendingGeneration == this.generation
+        bool current = p != null && this.pendingPageId == this.activePageId
+            && this.pendingGeneration == this.generation
             && p.generation == this.generation;
         if (current) {
-            if (this.pendingCount < 0) { p.state = 3; }
+            int expected = -1;
+            int resultTotal = this.pendingTotal;
+            if (this.knownTotal >= 0) { resultTotal = this.knownTotal; }
+            if (resultTotal >= 0) {
+                expected = resultTotal - p.start;
+                if (expected > this.pageSize) { expected = this.pageSize; }
+            }
+            bool valid = this.pendingCount >= 0
+                && this.pendingCount <= this.pendingRows.Count
+                && this.pendingCount <= this.pageSize;
+            if (expected >= 0 && this.pendingCount != expected) { valid = false; }
+            if (!valid) { p.state = 3; }
             else {
                 p.rows = this.pendingRows;
                 p.count = this.pendingCount;
                 p.total = this.pendingTotal;
                 p.state = 2;
-                if (p.total >= 0) { this.knownTotal = p.total; }
-                else if (this.knownTotal < 0 && p.count < this.pageSize) {
-                    this.knownTotal = p.start + p.count;
+                if (p.total >= 0) {
+                    int total = p.total;
+                    if (total < p.start + p.count) { total = p.start + p.count; }
+                    this.SetKnownTotal(total);
+                } else if (this.knownTotal < 0 && p.count < this.pageSize) {
+                    this.SetKnownTotal(p.start + p.count);
                 }
             }
         }
@@ -388,23 +485,34 @@ class SparseServerDataSource : DataSource {
 
     virtual void FetchPage(int start, int count, int gen) {
         int n = this.FillPage(start, count, this.pendingRows);
-        this.FinishPage(this.pendingRows, n, -1, gen);
+        this.FinishPage(this.pendingRows, n, -1, gen, this.activePageId);
     }
 
-    /// 异步完成页请求。generation 不匹配的结果会在 Poll 中丢弃。
+    virtual void FetchPage(int start, int count, int gen, int pageId) {
+        this.FetchPage(start, count, gen);
+    }
+
+    /// 异步完成页请求。pageId 与 generation 都必须匹配当前请求；
+    /// 旧的同 generation 回调也因此不能覆盖新页。
     void FinishPage(List<DataRow> rows, int count, int total, int gen) {
-        // 旧查询的异步回调可能在新请求已开始后才返回；它不能
-        // 覆盖当前 pending 页，即使回调恰好仍持有同一个 source。
-        if (!this.loading || gen != this.generation) { return; }
-        if (rows == null) { this.pendingCount = -1; }
-        else {
-            if (count < 0) { this.pendingCount = -1; }
-            else if (count > rows.Count) { this.pendingCount = rows.Count; }
-            else { this.pendingCount = count; }
+        this.FinishPage(rows, count, total, gen, this.activePageId);
+    }
+
+    void FinishPage(List<DataRow> rows, int count, int total, int gen, int pageId) {
+        if (!this.loading || this.pageDone || gen != this.generation
+            || pageId != this.activePageId) { return; }
+        if (rows == null) {
+            this.pendingRows = new List<DataRow>();
+            this.pendingCount = -1;
+        } else {
+            this.pendingRows = rows;
+            if (count < 0 || count > rows.Count || count > this.pageSize) {
+                this.pendingCount = -1;
+            } else { this.pendingCount = count; }
         }
-        this.pendingRows = rows;
         this.pendingTotal = total;
         this.pendingGeneration = gen;
+        this.pendingPageId = pageId;
         this.pageDone = true;
     }
 
