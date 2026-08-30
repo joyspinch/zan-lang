@@ -90,6 +90,37 @@ class QuerySortClause {
     int Kind() { return this.kind; }
 }
 
+/// 一个稳定的分组键。多个键按添加顺序形成分组路径。
+class QueryGroupClause {
+    int column;
+    int kind;
+
+    QueryGroupClause(int col, int valueKind) {
+        this.column = col;
+        this.kind = valueKind;
+    }
+
+    int Column() { return this.column; }
+    int Kind() { return this.kind; }
+}
+
+/// 一个声明式聚合。mode：1 sum、2 average、3 min、4 max、5 count。
+class QueryAggregateClause {
+    int column;
+    int mode;
+    int kind;
+
+    QueryAggregateClause(int col, int op, int valueKind) {
+        this.column = col;
+        this.mode = op;
+        this.kind = valueKind;
+    }
+
+    int Column() { return this.column; }
+    int Mode() { return this.mode; }
+    int Kind() { return this.kind; }
+}
+
 /// 可传给本地/远端查询执行器的稳定查询快照。
 /// 过滤器和排序键只使用声明式标量，不捕获 lambda 或 UI 对象，
 /// 因而可以直接序列化、哈希和下推到服务端。
@@ -104,6 +135,8 @@ class QueryDescriptor {
     int capabilities;
     List<QueryFilterClause> filters;
     List<QuerySortClause> sorts;
+    List<QueryGroupClause> groups;
+    List<QueryAggregateClause> aggregates;
 
     QueryDescriptor(string datasetName, int dataRev, int queryRev,
                     int viewRev, int caps) {
@@ -116,6 +149,8 @@ class QueryDescriptor {
         this.capabilities = caps;
         this.filters = new List<QueryFilterClause>();
         this.sorts = new List<QuerySortClause>();
+        this.groups = new List<QueryGroupClause>();
+        this.aggregates = new List<QueryAggregateClause>();
     }
 
     static QueryDescriptor Of(DataTableState st, string datasetName, int caps) {
@@ -130,6 +165,8 @@ class QueryDescriptor {
     int Capabilities() { return this.capabilities; }
     List<QueryFilterClause> Filters() { return this.filters; }
     List<QuerySortClause> Sorts() { return this.sorts; }
+    List<QueryGroupClause> Groups() { return this.groups; }
+    List<QueryAggregateClause> Aggregates() { return this.aggregates; }
 
     void AddFilter(QueryFilterClause clause) {
         if (clause != null) { this.filters.Add(clause); }
@@ -139,8 +176,18 @@ class QueryDescriptor {
         if (clause != null) { this.sorts.Add(clause); }
     }
 
+    void AddGroup(QueryGroupClause clause) {
+        if (clause != null) { this.groups.Add(clause); }
+    }
+
+    void AddAggregate(QueryAggregateClause clause) {
+        if (clause != null) { this.aggregates.Add(clause); }
+    }
+
     void ClearFilters() { this.filters.Clear(); }
     void ClearSorts() { this.sorts.Clear(); }
+    void ClearGroups() { this.groups.Clear(); }
+    void ClearAggregates() { this.aggregates.Clear(); }
 
     QueryPlan BuildPlan(int columnCount, QueryCapabilities supported) {
         return QueryPlan.Build(this, columnCount, supported);
@@ -188,6 +235,34 @@ class QueryDescriptor {
         return value;
     }
 
+    JsonValue GroupJson(QueryGroupClause clause) {
+        JsonValue value = JsonValue.NewObject();
+        value.Put("col", JsonValue.NewNum(Convert.ToString(clause.Column())));
+        value.Put("kind", JsonValue.NewNum(Convert.ToString(clause.Kind())));
+        return value;
+    }
+
+    JsonValue AggregateJson(QueryAggregateClause clause) {
+        JsonValue value = JsonValue.NewObject();
+        value.Put("col", JsonValue.NewNum(Convert.ToString(clause.Column())));
+        value.Put("op", JsonValue.NewNum(Convert.ToString(clause.Mode())));
+        value.Put("kind", JsonValue.NewNum(Convert.ToString(clause.Kind())));
+        return value;
+    }
+
+    void PutShape(JsonValue root) {
+        JsonValue groups = JsonValue.NewArray();
+        for (int i = 0; i < this.groups.Count; i = i + 1) {
+            groups.Append(this.GroupJson(this.groups[i]));
+        }
+        if (this.groups.Count > 0) { root.Put("groups", groups); }
+        JsonValue aggregates = JsonValue.NewArray();
+        for (int i = 0; i < this.aggregates.Count; i = i + 1) {
+            aggregates.Append(this.AggregateJson(this.aggregates[i]));
+        }
+        if (this.aggregates.Count > 0) { root.Put("aggregates", aggregates); }
+    }
+
     JsonValue ToJsonValue() {
         JsonValue root = JsonValue.NewObject();
         // 字段写入顺序固定，ToJson() 可作为稳定 canonical 文本。
@@ -207,6 +282,7 @@ class QueryDescriptor {
             sorts.Append(this.SortJson(this.sorts[i]));
         }
         if (this.sorts.Count > 0) { root.Put("sorts", sorts); }
+        this.PutShape(root);
         return root;
     }
 
@@ -231,6 +307,7 @@ class QueryDescriptor {
             sorts.Append(this.SortJson(this.sorts[i]));
         }
         if (this.sorts.Count > 0) { root.Put("sorts", sorts); }
+        this.PutShape(root);
         return root.ToJson();
     }
 
@@ -305,6 +382,37 @@ class QueryDescriptor {
                     return null;
                 }
                 result.AddSort(new QuerySortClause(col, dir, kind));
+            }
+        }
+        JsonValue groups = root.Get("groups");
+        if (groups != null) {
+            if (!groups.IsArray()) { return null; }
+            for (int i = 0; i < groups.Count(); i = i + 1) {
+                JsonValue item = groups.At(i);
+                if (item == null || !item.IsObject()
+                    || !item.Has("col") || !item.Has("kind")) { return null; }
+                int col = item.Int("col", -1);
+                int kind = item.Int("kind", -1);
+                if (col < 0 || kind < 0 || kind > 3) { return null; }
+                result.AddGroup(new QueryGroupClause(col, kind));
+            }
+        }
+        JsonValue aggregates = root.Get("aggregates");
+        if (aggregates != null) {
+            if (!aggregates.IsArray()) { return null; }
+            for (int i = 0; i < aggregates.Count(); i = i + 1) {
+                JsonValue item = aggregates.At(i);
+                if (item == null || !item.IsObject()
+                    || !item.Has("col") || !item.Has("op") || !item.Has("kind")) {
+                    return null;
+                }
+                int col = item.Int("col", -1);
+                int op = item.Int("op", 0);
+                int kind = item.Int("kind", -1);
+                if (col < 0 || op < 1 || op > 5 || kind < 0 || kind > 3) {
+                    return null;
+                }
+                result.AddAggregate(new QueryAggregateClause(col, op, kind));
             }
         }
         return result;
