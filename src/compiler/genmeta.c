@@ -681,6 +681,10 @@ static void gm_walk_expr(zan_ast_node_t *n, gm_ctx_t *c) {
         for (int i = 0; i < n->new_expr.args.count; i++)
             gm_walk_expr(n->new_expr.args.items[i], c);
         break;
+    case AST_COLL_INIT:
+        for (int i = 0; i < n->coll_init.items.count; i++)
+            gm_walk_expr(n->coll_init.items.items[i], c);
+        break;
     case AST_CAST_EXPR:
         gm_walk_expr(n->cast.expr, c);
         break;
@@ -1057,6 +1061,10 @@ static void gm_find_expr(zan_ast_node_t *n, gm_find_ctx_t *f) {
     case AST_NEW_EXPR:
         for (int i = 0; i < n->new_expr.args.count; i++)
             gm_find_expr(n->new_expr.args.items[i], f);
+        break;
+    case AST_COLL_INIT:
+        for (int i = 0; i < n->coll_init.items.count; i++)
+            gm_find_expr(n->coll_init.items.items[i], f);
         break;
     case AST_CAST_EXPR:
         gm_find_expr(n->cast.expr, f);

@@ -93,6 +93,10 @@ typedef enum {
     /* named call argument: `F(b: 2)` */
     AST_NAMED_ARG,
 
+    /* member collection initializer: `new C { Items = { a, b } }` -- the
+     * member named `name` receives Add(item) per element (C# semantics) */
+    AST_COLL_INIT,
+
     /* misc */
     AST_ATTRIBUTE,
     AST_ENUM_MEMBER,
@@ -505,6 +509,14 @@ struct zan_ast_node {
             zan_istr_t name;
             zan_ast_node_t *expr;
         } named_arg;
+
+        /* member collection initializer: `new C { Items = { a, b } }` --
+         * parsed inside an object initializer; irgen lowers it to Add(item)
+         * per element on the collection member `name`. */
+        struct {
+            zan_istr_t name;
+            zan_ast_list_t items;
+        } coll_init;
 
         /* type reference */
         struct {

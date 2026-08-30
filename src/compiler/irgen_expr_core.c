@@ -2146,6 +2146,11 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
             return NULL;
         }
         return resolve_type_ctx(g, e->new_expr.type);
+    case AST_COLL_INIT:
+        /* member collection initializer: its value is the collection member it
+         * names; inference goes through the object-initializer lowering, so no
+         * standalone type exists. NULL keeps every typed consumer off it. */
+        return NULL;
     case AST_UNARY:
         /* `!b` is bool; `-x`/`+x`/`~x` keep the operand's static type, so a
          * negated value still prints and feeds `var` inference. */

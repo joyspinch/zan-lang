@@ -325,6 +325,13 @@ static void da_expr(struct da_ctx *c, zan_ast_node_t *n) {
         da_expr(c, n->named_arg.expr);
         return;
 
+    /* member collection initializer inside an object initializer: only the
+     * element expressions run as ordinary reads (the Add() lowering happens
+     * in irgen against the new object, never against a local slot) */
+    case AST_COLL_INIT:
+        da_list(c, &n->coll_init.items);
+        return;
+
     case AST_SWITCH_EXPR:
         da_switch_expr(c, n);
         return;

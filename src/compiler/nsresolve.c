@@ -449,6 +449,9 @@ static void collect_shadows(nr_ctx_t *c, zan_ast_node_t *n) {
     case AST_NAMED_ARG:
         collect_shadows(c, n->named_arg.expr);
         break;
+    case AST_COLL_INIT:
+        collect_shadows_list(c, &n->coll_init.items);
+        break;
     case AST_THROW_STMT:
         collect_shadows(c, n->throw_stmt.value);
         break;
@@ -699,6 +702,10 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
 
     case AST_NAMED_ARG:
         nr_walk(c, n->named_arg.expr, ns, usings);
+        break;
+
+    case AST_COLL_INIT:
+        nr_walk_list(c, &n->coll_init.items, ns, usings);
         break;
 
     default:

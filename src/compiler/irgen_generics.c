@@ -76,6 +76,10 @@ static void collect_inst_expr(zan_irgen_t *g, zan_ast_node_t *e) {
         for (int i = 0; i < e->new_expr.args.count; i++)
             collect_inst_expr(g, e->new_expr.args.items[i]);
         break;
+    case AST_COLL_INIT:
+        for (int i = 0; i < e->coll_init.items.count; i++)
+            collect_inst_expr(g, e->coll_init.items.items[i]);
+        break;
     case AST_CAST_EXPR:
         collect_inst_typeref(g, e->cast.type);
         collect_inst_expr(g, e->cast.expr);
@@ -364,6 +368,54 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
     }
     if (e->kind == AST_MEMBER_ACCESS && expr_member_of_owned_temp(g, e, locals))
         return 1;
+    /* A custom-getter property read lowers to a call of the synthesized
+     * `get_Prop`, whose body retains the returned reference before returning
+     * (the shared return lowering), so the read hands the caller +1 exactly
+     * like any method call: a receiver that keeps the value must move it, not
+     * retain it again, and a discarded read must release it. Auto-properties
+     * and plain fields are slot loads and stay borrowed. */
+    if (e->kind == AST_MEMBER_ACCESS) {
+        zan_ast_node_t *obj = e->member.object;
+        zan_type_t *ot = infer_expr_type(g, obj, locals);
+        if (e->member.null_cond) ot = NULL;
+        zan_symbol_t *tsym = ot ? ot->sym : NULL;
+        if (ot && ot->kind == TYPE_TYPE_PARAM) {
+            zan_type_t *ct = concretize(g, ot);
+            tsym = ct ? ct->sym : NULL;
+        }
+        /* `base.Prop` binds statically to the base class getter. */
+        if (obj && obj->kind == AST_BASE_EXPR && g->current_type_sym &&
+            g->current_type_sym->type &&
+            g->current_type_sym->type->base_type)
+            tsym = g->current_type_sym->type->base_type->sym;
+        else if (obj && obj->kind == AST_THIS_EXPR)
+            tsym = g->current_type_sym;
+        if (!tsym && obj && obj->kind == AST_IDENTIFIER && locals &&
+            !local_find(locals, obj->ident.name) && g->current_type_sym) {
+            /* A bare member name inside the class body reads an instance
+             * field/property off `this` -- unless the name resolves to a
+             * static member's class/struct prefix, which stays borrowed
+             * (reads of static properties are shared globals). */
+            zan_symbol_t *fs = get_field_sym(g->current_type_sym,
+                                             e->member.name);
+            if (fs) {
+                if (fs->kind == SYM_PROPERTY && fs->decl &&
+                    fs->decl->field_decl.getter_body)
+                    return 1;
+            } else {
+                zan_symbol_t *cs = zan_binder_lookup(g->binder,
+                                                     obj->ident.name);
+                if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT))
+                    tsym = cs->type;
+            }
+        }
+        if (tsym) {
+            zan_symbol_t *fs = get_field_sym(tsym, e->member.name);
+            if (fs && fs->kind == SYM_PROPERTY && fs->decl &&
+                fs->decl->field_decl.getter_body)
+                return 1;
+        }
+    }
     if (e->kind == AST_NEW_EXPR || e->kind == AST_CALL ||
         e->kind == AST_QUERY_EXPR) return 1;
     /* A switch expression yields the owned (+1) value that its matching arm
@@ -1013,7 +1065,18 @@ static void emit_rc_store_field(zan_irgen_t *g, zan_type_t *type,
  * `--subsystem windows` there is no console behind stdout, so the print alone
  * means a failed bounds check looks exactly like the process vanishing -- no
  * message, no window, nothing to go on. Never returns. */
-static void emit_fatal_report(zan_irgen_t *g, LLVMValueRef text, int exit_code) {
+static void emit_fatal_report(zan_irgen_t *g, LLVMValueRef text, int exit_code);
+
+/* Report a guard failure on the fail-soft path and CONTINUE in a fresh block:
+ * the same message goes to stderr and to the runtime's dated log (deduped per
+ * site inside zan_rt_soft_note), but the program keeps running -- the guard's
+ * caller then yields a default value. Which path a guard actually takes is a
+ * RUNTIME decision (zan_rt_soft_is_hard, i.e. ZAN_RT_HARD=1): the compiler
+ * emits both and the branch picks. That keeps the test-suite's exit(70)
+ * semantics verifiable on the same binary that a production service runs
+ * soft by default. Runtime checks off = neither path exists. */
+static void emit_guard_report(zan_irgen_t *g, LLVMValueRef text, zan_loc_t loc,
+                              const char *msg);
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -1083,25 +1146,28 @@ static void emit_fopen_check(zan_irgen_t *g, LLVMValueRef fp, const char *msg) {
     emit_io_abort_if(g, isnull, msg);
 }
 
-/* Emit a runtime guard: when `is_error` is true at runtime, print
- * "<file>:<line>:<col>: runtime error: <msg>" and exit(70). Execution
- * continues (in a fresh block) on the non-error path. No-op when runtime
- * checks are disabled. Must be called with the builder inside `current_fn`. */
+/* Emit a runtime guard: when `is_error` is true at runtime, report
+ * "<file>:<line>:<col>: runtime error: <msg>". Soft mode (default) prints
+ * once and CONTINUES -- the fresh block after the report is the continuation
+ * the caller fills with a default value. Hard mode (ZAN_RT_HARD=1, how the
+ * test-suite runs) keeps the historical exit(70) so guard behavior stays
+ * pinned. No-op when runtime checks are disabled. Must be called with the
+ * builder inside `current_fn`. */
 static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
                                zan_loc_t loc, const char *msg) {
     if (!g->runtime_checks || !g->current_fn) return;
 
-    LLVMBasicBlockRef panic_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.panic");
-    LLVMBasicBlockRef cont_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.cont");
-    LLVMBuildCondBr(g->builder, is_error, panic_bb, cont_bb);
+    LLVMBasicBlockRef bad_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.bad");
+    LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.cont");
+    LLVMBuildCondBr(g->builder, is_error, bad_bb, cont_bb);
 
-    LLVMPositionBuilderAtEnd(g->builder, panic_bb);
+    LLVMPositionBuilderAtEnd(g->builder, bad_bb);
     char buf[640];
     const char *file = loc_site_file(g, loc);
     snprintf(buf, sizeof(buf), "%s:%u:%u: runtime error: %s\n",
              file, loc.line, loc.col, msg);
     LLVMValueRef text = LLVMBuildGlobalStringPtr(g->builder, buf, "rterr");
-    emit_fatal_report(g, text, 70);
+    emit_guard_report(g, text, loc, msg);
 
     LLVMPositionBuilderAtEnd(g->builder, cont_bb);
 }

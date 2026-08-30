@@ -6041,6 +6041,12 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     while (init_start > 0) {
                         zan_ast_node_t *a =
                             expr->new_expr.args.items[init_start - 1];
+                        if (a->kind == AST_COLL_INIT) {
+                            if (get_field_index(sym, a->coll_init.name) < 0)
+                                break;
+                            init_start--;
+                            continue;
+                        }
                         if (a->kind != AST_ASSIGNMENT ||
                             a->binary.left->kind != AST_IDENTIFIER ||
                             get_field_index(sym, a->binary.left->ident.name) < 0)
@@ -6148,6 +6154,110 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     {
                         for (int i = init_start; i < expr->new_expr.args.count; i++) {
                             zan_ast_node_t *arg = expr->new_expr.args.items[i];
+                            /* `Members = { a, b }`: lower to a synthetic
+                             * `<member>.Add(item)` AST per element and run the
+                             * ordinary call lowering, so every collection kind
+                             * (builtin List intrinsics, user Add methods,
+                             * Dict pairs) and every ARC rule comes from the one
+                             * code path that already owns them. The member is
+                             * read, never stored, so a getter-only property is
+                             * as valid as a field. */
+                            if (arg->kind == AST_COLL_INIT) {
+                                zan_istr_t cname = arg->coll_init.name;
+                                zan_symbol_t *msym = get_field_sym(sym, cname);
+                                if (!msym || !msym->type) continue;
+                                int getter_owned = 0;
+                                zan_ast_node_t *recv = zan_ast_new(g->arena,
+                                    AST_IDENTIFIER, arg->loc);
+                                recv->ident.name = cname;
+                                /* the receiver reads off `this`-of-the-new-
+                                 * object, which emit_expr_identifier cannot
+                                 * reach (the object is not registered in the
+                                 * local scope); splice the alloca in through a
+                                 * member read of the AST the lowering walks --
+                                 * i.e. build `member.Add(item)` calls against a
+                                 * temp local registered for this scope. */
+                                LLVMTypeRef coll_lt = map_type(g, msym->type);
+                                LLVMValueRef cslot = emit_entry_alloca(g,
+                                    coll_lt, "cinit.slot");
+                                zan_store_fit(g, LLVMConstNull(coll_lt), cslot);
+                                int cfi = get_field_index(sym, cname);
+                                zan_symbol_t *getter =
+                                    property_getter_sym(g, msym);
+                                if (getter) {
+                                    LLVMValueRef v = emit_property_getter_call(
+                                        g, getter,
+                                        new_inst ? new_inst : sym->type,
+                                        alloca, arg, locals);
+                                    zan_store_fit(g, v, cslot);
+                                    /* the getter handed us +1 on the
+                                     * collection; the temp slot took that
+                                     * reference and is dropped without a
+                                     * scope-exit release, so hand it back
+                                     * once the Adds are done */
+                                    getter_owned = 1;
+                                } else if (cfi >= 0) {
+                                    LLVMValueRef cptr = emit_field_ptr(g, sym,
+                                        st, alloca, cfi, "cinit.ptr");
+                                    LLVMValueRef v = LLVMBuildLoad2(g->builder,
+                                        coll_lt, cptr, "cinit.load");
+                                    zan_store_fit(g, v, cslot);
+                                } else {
+                                    continue;
+                                }
+                                local_add(locals, cname, cslot, msym->type);
+                                /* a class-typed snapshot is a borrowed load:
+                                 * the object itself owns the collection, so the
+                                 * temp must not release it at scope exit --
+                                 * keep it out of arc_own tracking by leaving
+                                 * arc_owned unset (local_add default). */
+                                for (int k = 0;
+                                     k < arg->coll_init.items.count; k++) {
+                                    zan_ast_node_t *item =
+                                        arg->coll_init.items.items[k];
+                                    zan_ast_node_t *madd = zan_ast_new(g->arena,
+                                        AST_MEMBER_ACCESS, item->loc);
+                                    madd->member.object = recv;
+                                    madd->member.name = (zan_istr_t){"Add", 3};
+                                    madd->member.null_cond = 0;
+                                    zan_ast_node_t *addcall = zan_ast_new(
+                                        g->arena, AST_CALL, item->loc);
+                                    addcall->call.callee = madd;
+                                    zan_ast_list_init(&addcall->call.args);
+                                    zan_ast_list_init(&addcall->call.type_args);
+                                    zan_ast_list_push(&addcall->call.args, item,
+                                                      g->arena);
+                                    /* Dict members take (key, value): the
+                                     * parser flattened `{ k, v }` braces into
+                                     * consecutive items, so pair them here. */
+                                    if (msym->type &&
+                                        type_named(msym->type, "Dict", 4) &&
+                                        k + 1 < arg->coll_init.items.count) {
+                                        zan_ast_list_push(&addcall->call.args,
+                                            arg->coll_init.items.items[++k],
+                                            g->arena);
+                                    }
+                                    emit_expr(g, addcall, locals);
+                                }
+                                /* drop the temp registration so a later
+                                 * same-named declaration is unaffected */
+                                for (int lv = locals->count - 1; lv >= 0; lv--) {
+                                    if (locals->vars[lv].name.len == cname.len &&
+                                        memcmp(locals->vars[lv].name.str,
+                                               cname.str, (size_t)cname.len) == 0) {
+                                        for (int sh = lv; sh < locals->count - 1; sh++)
+                                            locals->vars[sh] = locals->vars[sh + 1];
+                                        locals->count--;
+                                        break;
+                                    }
+                                }
+                                if (getter_owned) {
+                                    LLVMValueRef cv = LLVMBuildLoad2(g->builder,
+                                        coll_lt, cslot, "cinit.done");
+                                    emit_rc_release_for_type(g, msym->type, cv);
+                                }
+                                continue;
+                            }
                             if (arg->kind == AST_ASSIGNMENT && arg->binary.left->kind == AST_IDENTIFIER) {
                                 zan_symbol_t *fsym = get_field_sym(sym, arg->binary.left->ident.name);
                                 /* custom-setter property in an object
@@ -7933,6 +8043,7 @@ static void cap_scan(capture_scan_t *cs, zan_ast_node_t *n) {
                               cap_scan(cs, n->conditional.then_expr);
                               cap_scan(cs, n->conditional.else_expr); return;
     case AST_NEW_EXPR:        cap_scan_list(cs, &n->new_expr.args); return;
+    case AST_COLL_INIT:       cap_scan_list(cs, &n->coll_init.items); return;
     case AST_CAST_EXPR:       cap_scan(cs, n->cast.expr); return;
     case AST_IS_EXPR:
     case AST_AS_EXPR:         cap_scan(cs, n->type_test.expr); return;

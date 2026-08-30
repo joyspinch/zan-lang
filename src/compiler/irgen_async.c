@@ -555,6 +555,11 @@ static bool anf_expr_contains_await(zan_ast_node_t *e) {
             if (anf_expr_contains_await(e->new_expr.args.items[i])) return true;
         return false;
     }
+    case AST_COLL_INIT: {
+        for (int i = 0; i < e->coll_init.items.count; i++)
+            if (anf_expr_contains_await(e->coll_init.items.items[i])) return true;
+        return false;
+    }
     case AST_CAST_EXPR: return anf_expr_contains_await(e->cast.expr);
     case AST_IS_EXPR:
     case AST_AS_EXPR:  return anf_expr_contains_await(e->type_test.expr);
@@ -741,6 +746,14 @@ static zan_ast_node_t *anf_expr(anf_ctx_t *c, zan_ast_node_t *e) {
         }
         for (int i = 0; i < e->new_expr.args.count; i++)
             e->new_expr.args.items[i] = anf_expr(c, e->new_expr.args.items[i]);
+        return e;
+    case AST_COLL_INIT:
+        for (int i = 0; i < e->coll_init.items.count; i++) {
+            for (int j = i + 1; j < e->coll_init.items.count; j++)
+                anf_check_order(c, e->coll_init.items.items[i], e->coll_init.items.items[j]);
+        }
+        for (int i = 0; i < e->coll_init.items.count; i++)
+            e->coll_init.items.items[i] = anf_expr(c, e->coll_init.items.items[i]);
         return e;
     case AST_IS_EXPR:
     case AST_AS_EXPR:
@@ -1054,6 +1067,10 @@ static void async_scan_expr(async_scan_t *s, zan_ast_node_t *e) {
     case AST_NEW_EXPR:
         for (int i = 0; i < e->new_expr.args.count; i++)
             async_scan_expr(s, e->new_expr.args.items[i]);
+        break;
+    case AST_COLL_INIT:
+        for (int i = 0; i < e->coll_init.items.count; i++)
+            async_scan_expr(s, e->coll_init.items.items[i]);
         break;
     case AST_CAST_EXPR:
         async_scan_expr(s, e->cast.expr);

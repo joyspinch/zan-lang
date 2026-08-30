@@ -643,6 +643,11 @@ static int ctor_arg_count(zan_checker_t *c, zan_ast_node_t *expr,
     int n = expr->new_expr.args.count;
     while (n > 0) {
         zan_ast_node_t *a = expr->new_expr.args.items[n - 1];
+        if (a && a->kind == AST_COLL_INIT) {
+            if (!checker_find_field(type_sym, a->coll_init.name)) break;
+            n--;
+            continue;
+        }
         if (!a || a->kind != AST_ASSIGNMENT || !a->binary.left ||
             a->binary.left->kind != AST_IDENTIFIER ||
             !checker_find_field(type_sym, a->binary.left->ident.name))
@@ -651,6 +656,16 @@ static int ctor_arg_count(zan_checker_t *c, zan_ast_node_t *expr,
     }
     (void)c;
     return n;
+}
+
+/* The object-initializer tail starts at the first member-write argument
+ * (either `Field = v` or the member collection initializer `Field = { .. }`);
+ * everything before it is a positional constructor argument. */
+static bool arg_is_initializer_entry(zan_ast_node_t *a) {
+    if (!a) return false;
+    if (a->kind == AST_COLL_INIT) return true;
+    return a->kind == AST_ASSIGNMENT && a->binary.left &&
+           a->binary.left->kind == AST_IDENTIFIER;
 }
 
 /* True when `expr`'s object initializer writes every instance field and
@@ -673,7 +688,10 @@ static bool initializer_covers_all_members(zan_ast_node_t *expr,
             members++;
             for (int a = init_start; a < expr->new_expr.args.count; a++) {
                 zan_ast_node_t *as = expr->new_expr.args.items[a];
-                zan_istr_t n = as->binary.left->ident.name;
+                if (!arg_is_initializer_entry(as)) continue;
+                zan_istr_t n = as->kind == AST_COLL_INIT
+                    ? as->coll_init.name
+                    : as->binary.left->ident.name;
                 if (n.len == m->name.len &&
                     memcmp(n.str, m->name.str, (size_t)n.len) == 0) {
                     covered++;
@@ -2188,20 +2206,108 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
              * scope. Resolve the bare field name against that type first so a
              * same-named namespace type (for example Gui.Icon) cannot shadow
              * the actual field (Button.Icon). */
-            if (arg && arg->kind == AST_ASSIGNMENT &&
-                arg->binary.left &&
-                arg->binary.left->kind == AST_IDENTIFIER &&
-                type && type->sym) {
-                zan_symbol_t *field = checker_find_field(
-                    type->sym, arg->binary.left->ident.name);
+            if (arg && arg_is_initializer_entry(arg) && type && type->sym) {
+                zan_istr_t mname = arg->kind == AST_COLL_INIT
+                    ? arg->coll_init.name
+                    : arg->binary.left->ident.name;
+                zan_symbol_t *field = checker_find_field(type->sym, mname);
                 if (field) {
-                    /* a getter-only property has no setter to dispatch to */
-                    if (property_is_readonly(field)) {
+                    /* a getter-only property has no setter to dispatch to,
+                     * except a member collection initializer, which never
+                     * writes the member -- it reads it and calls Add() per
+                     * element (C# semantics) */
+                    if (property_is_readonly(field) &&
+                        arg->kind != AST_COLL_INIT) {
                         zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
                                       "property '%.*s' has no setter and "
                                       "cannot be assigned",
                                       (int)field->name.len, field->name.str);
                     }
+                }
+                if (arg->kind == AST_COLL_INIT) {
+                    /* member collection initializer: the member must name a
+                     * collection whose element type accepts every element. A
+                     * member that does not exist, or whose type has no Add
+                     * method, stays an error; a getter-only property is fine. */
+                    if (!field || !field->type) {
+                        zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                                      "'%.*s' has no member '%.*s'",
+                                      (int)type->name.len, type->name.str,
+                                      (int)mname.len, mname.str);
+                    } else {
+                        /* The collection member's Add: a user class declares it
+                         * as a real SYM_METHOD; the builtin List<T> has none
+                         * (it is compiler-lowered), so recognize it by name and
+                         * type. Array/Dict members are rejected: an initializer
+                         * tail on them would be a different lowering. */
+                        zan_istr_t add_istr = {(char *)"Add", 3};
+                        bool builtin_list = false;
+                        zan_type_t *coll = field->type;
+                        if (coll && (coll->name.len == 4 &&
+                                     memcmp(coll->name.str, "List", 4) == 0 ||
+                                     coll->name.len == 4 &&
+                                     memcmp(coll->name.str, "Dict", 4) == 0))
+                            builtin_list = true;
+                        zan_symbol_t *coll_sym =
+                            coll && (coll->kind == TYPE_CLASS ||
+                                     coll->kind == TYPE_STRUCT)
+                                ? coll->sym : NULL;
+                        zan_symbol_t *add = builtin_list
+                            ? (zan_symbol_t *)1
+                            : (coll_sym ? checker_find_method(coll_sym, add_istr)
+                                        : NULL);
+                        /* Dict<string,V> takes Add(key, value): its items were
+                         * parsed as flat `{ k, v, k2, v2 }` pairs; List takes
+                         * one element per Add. */
+                        bool dict_kv = coll && coll->name.len == 4 &&
+                                       memcmp(coll->name.str, "Dict", 4) == 0;
+                        zan_type_t *elem =
+                            coll && coll->type_arg_count >= 1
+                                ? coll->type_args[0]
+                                : (coll && coll->kind == TYPE_ARRAY
+                                   ? coll->element_type : NULL);
+                        zan_type_t *elem2 = coll && coll->type_arg_count >= 2
+                            ? coll->type_args[1] : NULL;
+                        if (!add) {
+                            zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                                          "type '%s' has no Add method for a "
+                                          "collection initializer",
+                                          type_name(coll));
+                        }
+                        for (int k = 0; k < arg->coll_init.items.count; k++) {
+                            zan_ast_node_t *item =
+                                arg->coll_init.items.items[k];
+                            zan_type_t *it = zan_checker_check_expr(c, item);
+                            if (elem && it && add && !dict_kv)
+                                checker_check_assignable(c, elem, it, item,
+                                                         item->loc,
+                                                         "collection initializer");
+                            if (dict_kv && add) {
+                                zan_ast_node_t *vnode =
+                                    k + 1 < arg->coll_init.items.count
+                                        ? arg->coll_init.items.items[k + 1]
+                                        : NULL;
+                                if (vnode) {
+                                    zan_type_t *vt =
+                                        zan_checker_check_expr(c, vnode);
+                                    if (elem && it)
+                                        checker_check_assignable(c, elem, it,
+                                                                 item, item->loc,
+                                                                 "collection initializer");
+                                    if (elem2 && vt)
+                                        checker_check_assignable(c, elem2, vt,
+                                                                 vnode, vnode->loc,
+                                                                 "collection initializer");
+                                    k++;
+                                } else if (elem && it) {
+                                    checker_check_assignable(c, elem, it, item,
+                                                             item->loc,
+                                                             "collection initializer");
+                                }
+                            }
+                        }
+                    }
+                    continue;
                 }
                 if (field && field->type) {
                     zan_type_t *right = zan_checker_check_expr(

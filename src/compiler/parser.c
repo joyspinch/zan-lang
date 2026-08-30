@@ -1240,9 +1240,42 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
         n->new_expr.type = type;
         zan_ast_list_init(&n->new_expr.args);
 
-        /* parse field = value pairs as assignment expressions */
+        /* parse field = value pairs as assignment expressions.
+         * `Name = { a, b }` is a member collection initializer (C#
+         * semantics): it is kept as a dedicated AST_COLL_INIT node so irgen
+         * lowers it to Add(item) per element on that member, instead of
+         * reading the braces as a nested dictionary entry. */
         while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
-            zan_ast_node_t *field_init = parse_expression(p);
+            zan_ast_node_t *field_init;
+            if (parser_check(p, TK_IDENT) &&
+                zan_lexer_peek(p->lex).kind == TK_EQ) {
+                zan_loc_t nloc = p->current.loc;
+                zan_istr_t name = p->current.str_val;
+                parser_advance(p); /* name */
+                parser_advance(p); /* = */
+                if (parser_match(p, TK_LBRACE)) {
+                    field_init = zan_ast_new(p->arena, AST_COLL_INIT, nloc);
+                    field_init->coll_init.name = name;
+                    zan_ast_list_init(&field_init->coll_init.items);
+                    while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+                        zan_ast_node_t *item = parse_expression(p);
+                        zan_ast_list_push(&field_init->coll_init.items, item,
+                                          p->arena);
+                        if (!parser_match(p, TK_COMMA)) break;
+                    }
+                    parser_expect(p, TK_RBRACE);
+                } else {
+                    field_init = zan_ast_new(p->arena, AST_ASSIGNMENT, nloc);
+                    zan_ast_node_t *lhs =
+                        zan_ast_new(p->arena, AST_IDENTIFIER, nloc);
+                    lhs->ident.name = name;
+                    field_init->binary.op = TK_EQ;
+                    field_init->binary.left = lhs;
+                    field_init->binary.right = parse_expression(p);
+                }
+            } else {
+                field_init = parse_expression(p);
+            }
             zan_ast_list_push(&n->new_expr.args, field_init, p->arena);
             if (!parser_match(p, TK_COMMA)) break;
         }
@@ -1577,6 +1610,33 @@ static zan_ast_node_t *parse_expression(zan_parser_t *p) {
         zan_token_kind_t op = p->current.kind;
         zan_loc_t loc = p->current.loc;
         parser_advance(p);
+
+        /* `member = { a, b, c }` is a member collection initializer (C#
+         * semantics): inside an object initializer the named member receives
+         * Add(item) per element. parse_primary has no brace expression, so
+         * without this branch the `{` reached it and died as "unexpected
+         * token". Statement-level `x = { ... }` was equally a parse error
+         * before, so this cannot change the meaning of existing programs;
+         * checker/irgen reject AST_COLL_INIT outside an object-initializer
+         * tail. */
+        if (op == TK_EQ && parser_check(p, TK_LBRACE) &&
+            (expr->kind == AST_IDENTIFIER || expr->kind == AST_MEMBER_ACCESS)) {
+            zan_istr_t name = (expr->kind == AST_IDENTIFIER)
+                                  ? expr->ident.name
+                                  : expr->member.name;
+            zan_ast_node_t *n = zan_ast_new(p->arena, AST_COLL_INIT, loc);
+            n->coll_init.name = name;
+            zan_ast_list_init(&n->coll_init.items);
+            parser_advance(p); /* { */
+            while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+                zan_ast_node_t *item = parse_expression(p);
+                zan_ast_list_push(&n->coll_init.items, item, p->arena);
+                if (!parser_match(p, TK_COMMA)) break;
+            }
+            parser_expect(p, TK_RBRACE);
+            return n;
+        }
+
         zan_ast_node_t *right = parse_expression(p);
 
         /* Desugar compound assignment `lhs OP= rhs` into `lhs = lhs OP rhs`.
