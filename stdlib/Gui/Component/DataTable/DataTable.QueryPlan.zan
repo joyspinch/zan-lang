@@ -105,6 +105,19 @@ class QueryPlan {
         this.issue = problem;
     }
 
+    /// 从已校验计划复制一个操作子集。子计划保留完整查询身份，
+    /// 只改变执行器可见的 clause 集合；列表和 clause 均重新复制。
+    static QueryPlan Subset(QueryPlan source, int caps,
+                            List<QueryFilterClause> fs,
+                            List<QuerySortClause> ss,
+                            List<QueryGroupClause> gs,
+                            List<QueryAggregateClause> aggs) {
+        if (source == null) { return null; }
+        return new QueryPlan(source.Dataset(), source.QueryText(), source.QueryHash(),
+            source.DataRevision(), source.QueryRevision(), caps,
+            fs, ss, gs, aggs, null);
+    }
+
     static QueryPlan Fail(QueryPlan plan, QueryPlanIssue problem) {
         return new QueryPlan(plan.Dataset(), plan.QueryText(), plan.QueryHash(),
             plan.DataRevision(), plan.QueryRevision(), plan.Capabilities(),
@@ -414,4 +427,135 @@ class QueryPlan {
         QuerySortClause s = this.sorts[index];
         return new QuerySortClause(s.Column(), s.Direction(), s.Kind());
     }
+}
+
+/// 远端查询的下推/残差契约。Pushed 是服务端明确承诺执行的
+/// 操作，Residual 必须由后续执行器在完整候选集上完成；二者都保留
+/// 原查询的 dataset、revision、canonical text 和 hash。
+class QueryPlanContract {
+    QueryPlan pushed;
+    QueryPlan residual;
+    int pushedCapabilities;
+    int residualCapabilities;
+    QueryPlanIssue issue;
+
+    QueryPlanContract(QueryPlan pushedPlan, QueryPlan residualPlan,
+                      int pushedMask, int residualMask,
+                      QueryPlanIssue problem) {
+        this.pushed = pushedPlan;
+        this.residual = residualPlan;
+        this.pushedCapabilities = pushedMask;
+        this.residualCapabilities = residualMask;
+        this.issue = problem;
+    }
+
+    static QueryPlanContract FromPlan(QueryPlan full, int supportedMask) {
+        if (full == null) {
+            return new QueryPlanContract(null, null, 0, 0,
+                new QueryPlanIssue(QueryPlan.InvalidQuery,
+                    "query plan is unavailable", -1, -1));
+        }
+        if (!full.IsValid()) {
+            return new QueryPlanContract(null, null, 0, 0, full.Issue());
+        }
+        List<QueryFilterClause> pushedFilters = new List<QueryFilterClause>();
+        List<QueryFilterClause> residualFilters = new List<QueryFilterClause>();
+        List<QuerySortClause> pushedSorts = new List<QuerySortClause>();
+        List<QuerySortClause> residualSorts = new List<QuerySortClause>();
+        List<QueryGroupClause> pushedGroups = new List<QueryGroupClause>();
+        List<QueryGroupClause> residualGroups = new List<QueryGroupClause>();
+        List<QueryAggregateClause> pushedAggregates = new List<QueryAggregateClause>();
+        List<QueryAggregateClause> residualAggregates = new List<QueryAggregateClause>();
+        int pushedMask = 0;
+        int residualMask = 0;
+
+        for (int i = 0; i < full.FilterCount(); i = i + 1) {
+            QueryFilterClause clause = full.FilterAt(i);
+            if ((supportedMask & QueryCapabilities.Filter) != 0) {
+                pushedFilters.Add(clause);
+            } else {
+                residualFilters.Add(clause);
+            }
+        }
+        for (int i = 0; i < full.SortCount(); i = i + 1) {
+            QuerySortClause clause = full.SortAt(i);
+            if ((supportedMask & QueryCapabilities.Sort) != 0) {
+                pushedSorts.Add(clause);
+            } else {
+                residualSorts.Add(clause);
+            }
+        }
+        for (int i = 0; i < full.GroupCount(); i = i + 1) {
+            QueryGroupClause clause = new QueryGroupClause(full.GroupColumnAt(i),
+                full.GroupKindAt(i));
+            if ((supportedMask & QueryCapabilities.Group) != 0) {
+                pushedGroups.Add(clause);
+            } else {
+                residualGroups.Add(clause);
+            }
+        }
+        for (int i = 0; i < full.AggregateCount(); i = i + 1) {
+            QueryAggregateClause clause = new QueryAggregateClause(
+                full.AggregateColumnAt(i), full.AggregateModeAt(i),
+                full.AggregateKindAt(i));
+            if ((supportedMask & QueryCapabilities.Aggregate) != 0) {
+                pushedAggregates.Add(clause);
+            } else {
+                residualAggregates.Add(clause);
+            }
+        }
+        if (pushedFilters.Count > 0) { pushedMask = pushedMask + QueryCapabilities.Filter; }
+        if (pushedSorts.Count > 0) { pushedMask = pushedMask + QueryCapabilities.Sort; }
+        if (pushedGroups.Count > 0) { pushedMask = pushedMask + QueryCapabilities.Group; }
+        if (pushedAggregates.Count > 0) {
+            pushedMask = pushedMask + QueryCapabilities.Aggregate;
+        }
+        if (residualFilters.Count > 0) {
+            residualMask = residualMask + QueryCapabilities.Filter;
+        }
+        if (residualSorts.Count > 0) { residualMask = residualMask + QueryCapabilities.Sort; }
+        if (residualGroups.Count > 0) { residualMask = residualMask + QueryCapabilities.Group; }
+        if (residualAggregates.Count > 0) {
+            residualMask = residualMask + QueryCapabilities.Aggregate;
+        }
+        QueryPlan pushedPlan = QueryPlan.Subset(full, supportedMask,
+            pushedFilters, pushedSorts, pushedGroups, pushedAggregates);
+        QueryPlan residualPlan = QueryPlan.Subset(full, 0,
+            residualFilters, residualSorts, residualGroups, residualAggregates);
+        return new QueryPlanContract(pushedPlan, residualPlan,
+            pushedMask, residualMask, null);
+    }
+
+    static QueryPlanContract Build(QueryDescriptor query, int columnCount,
+                                   QueryCapabilities supported) {
+        int supportedMask = 0;
+        if (supported != null) { supportedMask = supported.Mask(); }
+        int allOperations = QueryCapabilities.Filter + QueryCapabilities.Sort
+            + QueryCapabilities.Group + QueryCapabilities.Aggregate;
+        QueryPlan full = QueryPlan.Build(query, columnCount,
+            QueryCapabilities.Of(allOperations));
+        return QueryPlanContract.FromPlan(full, supportedMask);
+    }
+
+    static QueryPlanContract Build(QueryDescriptor query,
+                                   List<SchemaColumn> schema,
+                                   QueryCapabilities supported) {
+        int supportedMask = 0;
+        if (supported != null) { supportedMask = supported.Mask(); }
+        int allOperations = QueryCapabilities.Filter + QueryCapabilities.Sort
+            + QueryCapabilities.Group + QueryCapabilities.Aggregate;
+        QueryPlan full = QueryPlan.Build(query, schema,
+            QueryCapabilities.Of(allOperations));
+        return QueryPlanContract.FromPlan(full, supportedMask);
+    }
+
+    bool IsValid() { return this.issue == null; }
+    QueryPlanIssue Issue() { return this.issue; }
+    string Error() { return this.issue == null ? "" : this.issue.Message(); }
+    QueryPlan Pushed() { return this.pushed; }
+    QueryPlan Residual() { return this.residual; }
+    int PushedCapabilities() { return this.pushedCapabilities; }
+    int ResidualCapabilities() { return this.residualCapabilities; }
+    bool HasResidual() { return this.residualCapabilities != 0; }
+    bool IsComplete() { return this.IsValid() && !this.HasResidual(); }
 }

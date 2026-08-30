@@ -166,6 +166,16 @@ class QueryDataSource : DataSource {
     virtual QueryCapabilities Capabilities() {
         return QueryCapabilities.Of(QueryCapabilities.Page);
     }
+
+    /// 构建远端执行契约。schema 尚未描述时使用未知列数，
+    /// 避免把未初始化的远端源误判为零列。
+    virtual QueryPlanContract BuildQueryPlan(QueryDescriptor query) {
+        if (this.schema.Count > 0) {
+            return QueryPlanContract.Build(query, this.schema, this.Capabilities());
+        }
+        return QueryPlanContract.Build(query, -1, this.Capabilities());
+    }
+
     int SchemaVersion() { return this.schemaVersion; }
     int ServerRevision() { return this.serverRevision; }
 
@@ -243,7 +253,8 @@ class QueryDataSource : DataSource {
                 return token;
             }
         }
-        this.FetchQuery(query, viewport, token);
+        QueryPlanContract contract = this.BuildQueryPlan(query);
+        this.FetchQueryPlan(query, contract, viewport, token);
         return token;
     }
 
@@ -295,6 +306,29 @@ class QueryDataSource : DataSource {
                             QueryRequestToken token) {
         QueryResult result = this.Execute(query, viewport, token);
         this.FinishQuery(result, token);
+    }
+
+    /// 新的远端入口同时接收下推/残差契约；使用独立名称避免
+    /// 依赖同名重载虚分派。默认实现保留旧 FetchQuery 扩展点，
+    /// 已有数据源无需修改即可继续工作。
+    virtual void FetchQueryPlan(QueryDescriptor query,
+                                QueryPlanContract contract,
+                                QueryViewport viewport,
+                                QueryRequestToken token) {
+        if (contract == null || !contract.IsValid()) {
+            string message = "query plan contract is invalid";
+            if (contract != null && contract.Error().Length > 0) {
+                message = contract.Error();
+            }
+            this.FinishQuery(QueryResult.Failure(token, viewport, message), token);
+            return;
+        }
+        if (contract.HasResidual()) {
+            this.FinishQuery(QueryResult.Failure(token, viewport,
+                "query plan has residual operations"), token);
+            return;
+        }
+        this.FetchQuery(query, viewport, token);
     }
 
     virtual QueryResult Execute(QueryDescriptor query,

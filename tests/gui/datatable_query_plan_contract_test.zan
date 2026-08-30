@@ -1,0 +1,92 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace DataTableQueryPlanContractTest;
+
+class ContractSource : QueryDataSource {
+    bool sawContract;
+    int pushedFilters;
+    int residualFilters;
+    int residualSorts;
+
+    ContractSource() {
+        this.Setup();
+        this.sawContract = false;
+        this.pushedFilters = 0;
+        this.residualFilters = 0;
+        this.residualSorts = 0;
+    }
+
+    override QueryCapabilities Capabilities() {
+        return QueryCapabilities.Of(QueryCapabilities.Filter + QueryCapabilities.Page);
+    }
+
+    override void FetchQueryPlan(QueryDescriptor query, QueryPlanContract contract,
+                                 QueryViewport viewport, QueryRequestToken token) {
+        this.sawContract = contract != null && contract.IsValid();
+        if (this.sawContract) {
+            this.pushedFilters = contract.Pushed().FilterCount();
+            this.residualFilters = contract.Residual().FilterCount();
+            this.residualSorts = contract.Residual().SortCount();
+        }
+        this.FinishQuery(QueryResult.Empty(token, viewport), token);
+    }
+}
+
+class Program {
+    static void Main() {
+        DataTableState st = new DataTableState();
+        QueryDescriptor query = QueryDescriptor.Of(st, "orders", QueryCapabilities.Page);
+        query.AddFilter(new QueryFilterClause(0, QueryFilterMode.Equals, "ready", "", 0));
+        query.AddSort(new QuerySortClause(1, 1, 1));
+        query.AddGroup(new QueryGroupClause(0, 0));
+        query.AddAggregate(new QueryAggregateClause(1, 5, 1));
+
+        QueryPlanContract partial = QueryPlanContract.Build(query, 2,
+            QueryCapabilities.Of(QueryCapabilities.Filter + QueryCapabilities.Page));
+        Console.WriteLine("partialValid=" + partial.IsValid());
+        Console.WriteLine("partialPushed=" + Convert.ToString(partial.PushedCapabilities()));
+        Console.WriteLine("partialResidual=" + Convert.ToString(partial.ResidualCapabilities()));
+        Console.WriteLine("partialCounts=" + Convert.ToString(partial.Pushed().FilterCount())
+            + ":" + Convert.ToString(partial.Pushed().SortCount())
+            + ":" + Convert.ToString(partial.Pushed().GroupCount())
+            + ":" + Convert.ToString(partial.Pushed().AggregateCount()));
+        Console.WriteLine("residualCounts=" + Convert.ToString(partial.Residual().FilterCount())
+            + ":" + Convert.ToString(partial.Residual().SortCount())
+            + ":" + Convert.ToString(partial.Residual().GroupCount())
+            + ":" + Convert.ToString(partial.Residual().AggregateCount()));
+        Console.WriteLine("partialComplete=" + partial.IsComplete());
+        Console.WriteLine("identity=" + (partial.Pushed().Dataset() == query.Dataset()
+            && partial.Pushed().QueryText() == query.QueryJson()
+            && partial.Pushed().QueryHash() == query.QueryFingerprint()
+            && partial.Residual().QueryText() == query.QueryJson()));
+        query.ClearFilters();
+        query.ClearSorts();
+        query.ClearGroups();
+        query.ClearAggregates();
+        Console.WriteLine("snapshot=" + Convert.ToString(partial.Pushed().FilterCount())
+            + ":" + Convert.ToString(partial.Residual().SortCount()));
+
+        QueryPlanContract complete = QueryPlanContract.Build(
+            QueryDescriptor.Of(st, "orders", QueryCapabilities.Page), 2,
+            QueryCapabilities.Of(QueryCapabilities.Filter + QueryCapabilities.Sort
+                + QueryCapabilities.Group + QueryCapabilities.Aggregate));
+        Console.WriteLine("complete=" + complete.IsComplete());
+        Console.WriteLine("completeResidual=" + Convert.ToString(complete.ResidualCapabilities()));
+
+        ContractSource source = new ContractSource();
+        QueryDescriptor sourceQuery = QueryDescriptor.Of(st, "orders", QueryCapabilities.Page);
+        sourceQuery.AddFilter(new QueryFilterClause(0, QueryFilterMode.Equals, "ready", "", 0));
+        QueryPlanContract sourceContract = source.BuildQueryPlan(sourceQuery);
+        Console.WriteLine("sourceContract=" + sourceContract.IsValid());
+        QueryRequestToken token = source.RequestQuery(sourceQuery,
+            new QueryViewport(0, 5, ""), null);
+        Console.WriteLine("hookPoll=" + source.Poll());
+        Console.WriteLine("hookSeen=" + source.sawContract);
+        Console.WriteLine("hookCounts=" + Convert.ToString(source.pushedFilters)
+            + ":" + Convert.ToString(source.residualFilters)
+            + ":" + Convert.ToString(source.residualSorts));
+        Console.WriteLine("hookToken=" + (token != null));
+    }
+}
