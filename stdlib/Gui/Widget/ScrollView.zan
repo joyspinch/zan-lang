@@ -31,6 +31,16 @@ class ScrollView {
     int dragMouseY0;
     int dragOffset0;
     int dragMo0;
+    // 内容高度瞬时塌陷保护：mo 收缩把 offset 钳低的那一刻，先记住
+    // 「被钳前的位置」与「收缩前的 mo」；mo 恢复到收缩前的水平时，把
+    // offset 还原。内容高度由上一帧的实测结果决定，任何一帧误报（图片
+    // 未加载、列表延迟建行、容器测量抖动）都会让 mo 跳水，用户看到的
+    // 正是「滚下去的位置弹回来」；恢复通道让这类瞬时塌陷不再丢滚动
+    // 位置。lastMo 保存上一帧的 mo，供钳制时判断「收缩前水平」。
+    int collapseSavedOffset;
+    int collapseMo;
+    int lastMo;
+    bool collapsePending;
 
     ScrollView() {
         this.offset = 0;
@@ -42,6 +52,10 @@ class ScrollView {
         this.dragMouseY0 = 0;
         this.dragOffset0 = 0;
         this.dragMo0 = 0;
+        this.collapseSavedOffset = 0;
+        this.collapseMo = 0;
+        this.lastMo = 0;
+        this.collapsePending = false;
     }
 
     /// 从右侧内收滚动条，避开窗口的调整大小
@@ -72,6 +86,7 @@ class ScrollView {
     void ScrollTo(int y) {
         offset = y;
         if (offset < 0) { offset = 0; }
+        collapsePending = false;
     }
 
     /// <summary>
@@ -84,7 +99,12 @@ class ScrollView {
         contentH = contentHeight;
 
         bool inside = Ui.Over(app, area.x, area.y, area.width, area.height);
-
+        // 本帧滚轮是否把 offset 抬过了本帧的 mo（合法贴底钳制）：这时
+        // 的钳制不得武装塌陷恢复。mo0 用本帧 contentH/viewH（Begin 入口
+        // 已更新）——滚轮只动 offset 不动内容，先算可照算。
+        int mo0 = contentH - viewH;
+        if (mo0 < 0) { mo0 = 0; }
+        bool wheeledPastMo = false;
         if (inside) {
             // 认领滚轮事件，使页面（及任何外层容器）在指针位于此视口上时
             // 不会同时滚动。
@@ -97,14 +117,47 @@ class ScrollView {
                 if (offset != before) {
                     app.NoteScrollDamage(area.x, area.y,
                         area.width, area.height);
+                    // 滚轮向下（d<0）使 offset 增大：越过本帧 mo 就会被
+                    // 下面的钳制贴底——这是合法钳制，不武装塌陷恢复。
+                    if (offset > before && offset > mo0) {
+                        wheeledPastMo = true;
+                    }
                 }
+                // 用户滚轮接管：塌陷恢复让位给真实意图。
+                collapsePending = false;
             }
         }
 
         int mo = contentH - viewH;
         if (mo < 0) { mo = 0; }
-        if (offset > mo) { offset = mo; }
+        if (collapsePending && mo >= collapseMo && collapseSavedOffset > mo) {
+            // mo 恢复到收缩前的水平：还原被钳位置。滚轮/拖拽/ScrollTo
+            // 发生过的帧不会走到这里——那些路径先清 collapsePending；
+            // mo 仍低于收缩前水平时同样不命中（挂起标记继续挂着），
+            // 用户的位置既不丢、也不在塌陷期间被反复打扰。
+            offset = collapseSavedOffset;
+            collapsePending = false;
+            app.NoteScrollDamage(area.x, area.y,
+                area.width, area.height);
+        }
+        if (offset > mo) {
+            if (!wheeledPastMo) {
+                // mo 收缩：唯一会「往下掰」offset 的路径。用户滚轮把
+                // offset 抬到 mo 以上是合法贴底钳制（wheeledPastMo 为真，
+                // 不武装——否则此后内容正常增长会被误还原成「无输入的
+                // 向下跳」）。能到这里的就是 mo 本身缩水：上一帧的实测
+                // 高度被误报拉低（图片未加载、列表延迟建行、容器测量
+                // 抖动）。记住被钳前的位置与收缩前的 mo（lastMo），等
+                // mo 恢复就还原，滚动位置不因内容高度的瞬时塌陷而永久
+                // 丢失（用户感知为「滚下去的位置弹回来」）。
+                collapseSavedOffset = offset;
+                collapseMo = lastMo;
+                collapsePending = true;
+            }
+            offset = mo;
+        }
         if (offset < 0) { offset = 0; }
+        lastMo = mo;
 
         app.canvas.PushClip(area.x, area.y, area.width, area.height);
         return offset;
@@ -176,6 +229,8 @@ class ScrollView {
             dragMouseY0 = app.mouseY;
             dragOffset0 = offset;
             dragMo0 = mo;
+            // 用户直接操作滚动条：塌陷恢复让位给真实意图。
+            collapsePending = false;
         }
 
         if (dragging) {
