@@ -759,6 +759,8 @@ static bool zan_gen_codegen_triggered(json_value *m) {
  *   db_acc_head {id, name, conn}    `<acc>.<Entity>` chain head ->
  *                                   `__DbBind.<name>(<conn>)` on the receiver
  *   db_acc_root {id, tree}          whole call replaced by <tree>
+ *   db_repo_call {id, tree}          entity accessor call replaced by a
+ *                                   compile-time-resolved DAO call tree
  *   db_chain    {id, ops:[{m,args}]} chain `<recv>.<m>(args)...`, replaces call
  *   db_expr_arg {id, param, tree}   args[param] replaced by <tree>
  *
@@ -915,7 +917,8 @@ static void zan_apply_rewrites(zan_ast_node_t *unit, json_value *rw,
             continue;
         }
 
-        if (strcmp(opname, "db_acc_root") == 0) {
+        if (strcmp(opname, "db_acc_root") == 0 ||
+            strcmp(opname, "db_repo_call") == 0) {
             zan_ast_node_t *repl = zan_genmeta_expr_from_json(
                 json_obj_get(op, "tree"), arena);
             if (repl) *call = *repl;

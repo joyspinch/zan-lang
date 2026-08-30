@@ -2081,6 +2081,76 @@ class GenDb {
         return GenDb.TreeCall1(GenDb.TreeMem(acc.Get("o"), "__Conn"), null);
     }
 
+    /// 返回实体对应的手写 DAO 类。DAO 名称按实体的稳定短名约定为
+    /// `<Entity>Dao`;生成器只选择非静态、非 private/protected 的实例方法。
+    /// 这样 `this.User` 的领域方法仍由项目 DAO 负责，GenDb 不复制业务 SQL。
+    static JsonValue DaoClass(string entity) {
+        JsonValue dao;
+        if (GenDb.ClassOf.TryGetValue(entity + "Dao", out dao)) {
+            if (dao != null && dao.Str("kind", "") == "class") { return dao; }
+        }
+        /* Namespace resolution may mangle a colliding declaration. `orig` is
+         * exported for exactly this case, so do not silently lose the DAO. */
+        JsonValue classes = GenDb.Unit.Get("classes");
+        if (classes == null || !classes.IsArray()) { return null; }
+        string wanted = entity + "Dao";
+        for (int i = 0; i < classes.Count(); i = i + 1) {
+            JsonValue c = classes.At(i);
+            if (c == null || c.Str("kind", "") != "class") { continue; }
+            if (c.Str("orig", "") == wanted) { return c; }
+        }
+        return null;
+    }
+
+    static bool DaoAmbiguous(string entity) {
+        JsonValue classes = GenDb.Unit.Get("classes");
+        if (classes == null || !classes.IsArray()) { return false; }
+        string wanted = entity + "Dao";
+        int found = 0;
+        for (int i = 0; i < classes.Count(); i = i + 1) {
+            JsonValue c = classes.At(i);
+            if (c == null || c.Str("kind", "") != "class") { continue; }
+            string n = c.Str("name", "");
+            if (n == wanted || c.Str("orig", "") == wanted) {
+                found = found + 1;
+            }
+        }
+        return found > 1;
+    }
+
+    static string DaoName(JsonValue dao, string entity) {
+        if (dao == null) { return entity + "Dao"; }
+        return dao.Str("name", entity + "Dao");
+    }
+
+    static bool DaoHasMethod(JsonValue dao, string name, int argc) {
+        if (dao == null) { return false; }
+        JsonValue methods = dao.Get("methods");
+        if (methods == null || !methods.IsArray()) { return false; }
+        for (int i = 0; i < methods.Count(); i = i + 1) {
+            JsonValue m = methods.At(i);
+            if (m == null || m.Bool("static", false) ||
+                m.Bool("private", false) || m.Bool("protected", false) ||
+                m.Str("name", "") != name) { continue; }
+            JsonValue ps = m.Get("params");
+            if (ps != null && ps.Count() == argc) { return true; }
+        }
+        return false;
+    }
+
+    /// 构造 `new <Dao>(conn).Method(args...)` 的表达式树。此树只描述
+    /// 编译期已经确认的 DAO 调用，连接仍由 accessor 所属对象提供。
+    static JsonValue DaoCallTree(string dao, string method, JsonValue conn,
+                                 JsonValue args) {
+        JsonValue na = JsonValue.NewArray();
+        na.Append(conn);
+        JsonValue nw = JsonValue.NewObject();
+        nw.Put("k", JsonValue.NewStr("new"));
+        nw.Put("t", JsonValue.NewStr(dao));
+        nw.Put("a", na);
+        return GenDb.TreeCall(GenDb.TreeMem(nw, method), args);
+    }
+
     // ---- 调用点主分派(children-first,id 降序) ----
 
     static void VisitCall(JsonValue call) {
@@ -2169,6 +2239,25 @@ class GenDb {
                 GenDb.Rewrote.Add(id, "Q_" + accCls);
                 GenDb.Any = true;
                 GenDb.NeedAdd(accCls);
+                return;
+            }
+
+            /* Domain repository call: standard ORM heads above retain their
+             * existing lowering; every other callable is resolved against the
+             * entity's hand-written `<Entity>Dao`. */
+            JsonValue dao = GenDb.DaoClass(accCls);
+            if (GenDb.DaoAmbiguous(accCls)) {
+                GenDb.Diag(call, "ambiguous repository for entity " + accCls +
+                           "; qualify or map its DAO");
+                return;
+            }
+            if (GenDb.DaoHasMethod(dao, name, nargs)) {
+                JsonValue op = GenDb.NewOp("db_repo_call", call);
+                op.Put("tree", GenDb.DaoCallTree(
+                    GenDb.DaoName(dao, accCls), name, conn,
+                    call.Get("args")));
+                GenDb.AddRewrite(op);
+                GenDb.Any = true;
                 return;
             }
             if (!GenDb.SelectHead(name)) { return; }

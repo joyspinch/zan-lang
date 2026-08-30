@@ -1139,14 +1139,23 @@ endforeach()
 file(GLOB _gen_srcs ${CMAKE_SOURCE_DIR}/tests/gen/*.zan)
 foreach(_src ${_gen_srcs})
   get_filename_component(_name ${_src} NAME_WE)
-  set(_gen_regex
-    "\"op\": \"db_root\","
-    "\"name\": \"Q_Order\""
-    "\"op\": \"db_expr_arg\","
-    "\"v\": \"SUM\\(t\\.amount\\)\""
-    "\"op\": \"db_acc_head\","
-    "class __DbQ_Order"
-    "class __DbU_Order")
+  if(_name STREQUAL "db_repository")
+    set(_gen_regex
+      "\"op\": \"db_repo_call\""
+      "\"k\": \"new\""
+      "\"t\": \"UserDao\""
+      "\"n\": \"ById\""
+      "class __DbQ_User")
+  else()
+    set(_gen_regex
+      "\"op\": \"db_root\","
+      "\"name\": \"Q_Order\""
+      "\"op\": \"db_expr_arg\","
+      "\"v\": \"SUM\\(t\\.amount\\)\""
+      "\"op\": \"db_acc_head\","
+      "class __DbQ_Order"
+      "class __DbU_Order")
+  endif()
   set(_gen_forbid_regex
     "GetField(Int|Long|Double|String|Bool)"
     "SetField(Int|Long|Double|String|Bool)")
