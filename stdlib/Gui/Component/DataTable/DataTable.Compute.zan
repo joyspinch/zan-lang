@@ -42,17 +42,29 @@ partial class DataTable {
         if (n < 1) { n = 1; }
         if (n >= st.order.Count) { return; }
 
-        // 对幸存行的副本按值排序；原顺序通过
-        // 用保留集合过滤 st.order 恢复，
-        // 用户的排序不会被筛选打乱。
-        List<int> byVal = new List<int>();
-        for (int b = 0; b < st.order.Count; b = b + 1) { byVal.Add(st.order[b]); }
+        // 只保留 K 个候选值：Top 使用“最小值在根”的堆，
+        // Bottom 使用“最大值在根”的堆。这样不必把全部候选
+        // 排序，扫描复杂度为 O(N log K)，K 很小时内存也保持有界。
         bool desc = (mode == 1 || mode == 3);
-        DataTable.SortRowsByReal(byVal, src, c, desc);
+        List<int> heapRows = new List<int>();
+        List<double> heapVals = new List<double>();
+        for (int h = 0; h < st.order.Count; h = h + 1) {
+            int row = st.order[h];
+            double value = src.CellReal(row, c);
+            if (heapRows.Count < n) {
+                heapRows.Add(row);
+                heapVals.Add(value);
+                DataTable.HeapSiftUp(heapRows, heapVals, heapRows.Count - 1, desc);
+            } else if (DataTable.HeapWorse(heapVals[0], value, desc)) {
+                heapRows[0] = row;
+                heapVals[0] = value;
+                DataTable.HeapSiftDown(heapRows, heapVals, 0, desc);
+            }
+        }
 
         // 截断线上的并列值保留所有并列行，如同排行榜
         // 显示并列名次而非在并列处截断。
-        double cut = src.CellReal(byVal[n - 1], c);
+        double cut = heapVals[0];
         List<int> keep = new List<int>();
         for (int m = 0; m < st.order.Count; m = m + 1) {
             double v = src.CellReal(st.order[m], c);
@@ -63,28 +75,45 @@ partial class DataTable {
         st.order = keep;
     }
 
-    static void SortRowsByReal(List<int> rows, DataSource src, int col, bool desc) {
-        // 插入排序：集合阶段只对通过
-        // 单元格筛选的行排序，而实际 Top-N 场景中 N 都很小。
-        int i = 1;
-        while (i < rows.Count) {
-            int r = rows[i];
-            double v = src.CellReal(r, col);
-            int j = i - 1;
-            bool moving = true;
-            while (j >= 0 && moving) {
-                double w = src.CellReal(rows[j], col);
-                bool swap = w > v;
-                if (desc) { swap = w < v; }
-                if (swap) {
-                    rows[j + 1] = rows[j];
-                    j = j - 1;
-                } else {
-                    moving = false;
-                }
+    // 堆根始终是当前 K 个候选中的“最差”值：Top-N 为最小值，
+    // Bottom-N 为最大值。相等值不替换，保留源顺序供最终并列扫描。
+    static bool HeapWorse(double a, double b, bool desc) {
+        if (desc) { return a < b; }
+        return a > b;
+    }
+
+    static void HeapSwap(List<int> rows, List<double> vals, int a, int b) {
+        int ri = rows[a];
+        rows[a] = rows[b];
+        rows[b] = ri;
+        double rv = vals[a];
+        vals[a] = vals[b];
+        vals[b] = rv;
+    }
+
+    static void HeapSiftUp(List<int> rows, List<double> vals, int at, bool desc) {
+        int i = at;
+        while (i > 0) {
+            int p = (i - 1) / 2;
+            if (!DataTable.HeapWorse(vals[i], vals[p], desc)) { break; }
+            DataTable.HeapSwap(rows, vals, i, p);
+            i = p;
+        }
+    }
+
+    static void HeapSiftDown(List<int> rows, List<double> vals, int at, bool desc) {
+        int i = at;
+        while (true) {
+            int left = i * 2 + 1;
+            if (left >= rows.Count) { break; }
+            int worst = left;
+            int right = left + 1;
+            if (right < rows.Count && DataTable.HeapWorse(vals[right], vals[left], desc)) {
+                worst = right;
             }
-            rows[j + 1] = r;
-            i = i + 1;
+            if (!DataTable.HeapWorse(vals[worst], vals[i], desc)) { break; }
+            DataTable.HeapSwap(rows, vals, i, worst);
+            i = worst;
         }
     }
 
