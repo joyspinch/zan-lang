@@ -1083,6 +1083,9 @@ class Gallery {
     // 每个实测值是在多宽的预览卡里量出来的。宽度变了（窗口缩放导致
     // 换行行数变化）就必须重新量，否则会拿旧行数的高度去排新宽度。
     static Dictionary<string, int> autoW;
+    // 被 SuppressAuto 除名的演示（弹层类）：RecordAuto 丢弃它们的迟到
+    // 高度报告，框高永远用注册种子。
+    static Dictionary<string, bool> autoSuppressed;
     // 当前预览框的顶边与卡片宽度（RenderPreview 每帧在进入演示分支前
     // 设置）。LayoutAuto 用前者把内容底边换算成框高，RecordAuto 用后者
     // 作为失效键 —— 两边必须是同一个数，否则实测值永远读不回来。
@@ -3330,6 +3333,11 @@ class Gallery {
         UiDriver.SetProbe("click.delivered",
             Gallery.drvClickDelivered ? "true" : "false");
         UiDriver.SetProbe("click.relSeq", Convert.ToString(evSeq));
+        // 滚动回归探针：详情页滚动偏移与内容高度，滚轮平滑性验证用。
+        UiDriver.SetProbe("detail.offset",
+            Convert.ToString(Gallery.detailView.Offset()));
+        UiDriver.SetProbe("detail.contentH",
+            Convert.ToString(Gallery.detailContentH.Get()));
         UiDriver.SetProbe("pager.pageSize",
             Gallery.pgRich == null ? "?" : Convert.ToString(Gallery.pgRich.PageSize()));
         UiDriver.SetProbe("lang", Convert.ToString(Gallery.lang.Get()));
@@ -5011,6 +5019,22 @@ class Gallery {
         return Gallery.autoH[name];
     }
 
+    /// 把演示从「实测高度」体系里除名：PreviewBoxH 从此永远用它的种子
+    /// 高度，覆盖通道的迟到记录被 RecordAuto 丢弃。弹层类演示专用 ——
+    /// 它们的框高一旦被滚动中途改写，以下内容整体平移就是滚动跳跃。
+    static void SuppressAuto(string name) {
+        if (Gallery.autoH != null && Gallery.autoH.ContainsKey(name)) {
+            Gallery.autoH.Remove(name);
+            Gallery.autoW.Remove(name);
+        }
+        if (Gallery.autoSuppressed == null) {
+            Gallery.autoSuppressed = new Dictionary<string, bool>();
+        }
+        if (!Gallery.autoSuppressed.ContainsKey(name)) {
+            Gallery.autoSuppressed.Add(name, true);
+        }
+    }
+
     /// 记下这一帧量到的内容高度。与上一帧不同就请求重绘：卡片高度
     /// 已经按旧值排过了，得再来一帧才能对上。
     ///
@@ -5020,7 +5044,15 @@ class Gallery {
     /// 一旦不等于 PreviewBoxH 回读时用的值，实测高度就永远读不到，
     /// 于是那个演示不声不响退回注册处的手调高度 —— Input.disabled /
     /// Input.error 正是这样明明写了 LayoutAuto 却仍在用固定高度。
-    static void RecordAuto(App app, string name, int h) {
+    ///
+    /// 返回 1 表示本帧接受了新高度（调用方要重排），0 表示维持旧值。
+    static int RecordAuto(App app, string name, int h) {
+        // 被 SuppressAuto 除名的演示（弹层类）：内容在覆盖通道才画，
+        // 这里迟到的高度报告一律丢弃，否则框高在滚动中途改写会把该卡
+        // 以下的内容整体平移，用户感知为「滚轮一滚页面跳一下」。
+        if (Gallery.autoSuppressed != null && Gallery.autoSuppressed.ContainsKey(name)) {
+            return 0;
+        }
         if (Gallery.autoH == null) {
             Gallery.autoH = new Dictionary<string, int>();
             Gallery.autoW = new Dictionary<string, int>();
@@ -5028,7 +5060,21 @@ class Gallery {
         int cardW = Gallery.previewCardW;
         bool have = Gallery.autoH.ContainsKey(name);
         if (have && Gallery.autoH[name] == h && Gallery.autoW[name] == cardW) {
-            return;
+            return 0;
+        }
+        // 已有实测值时的新值若与旧值同代（相差 <= 缩放后的两像素），视为
+        // 同一内容在不同帧的舍入抖动，保持旧值：滚动中卡片高度改写会把
+        // 该卡以下的所有内容整体平移，用户感知为「滚轮滚动时页面跳跃」
+        // （实测 +7px/次，来自弹层类演示迟到两帧才报高度）。整档高差
+        // （换行数变化、内容真的变了）仍然照常接受。
+        if (have) {
+            int d = h - Gallery.autoH[name];
+            if (d < 0) { d = 0 - d; }
+            if (d <= app.Scale(2)) {
+                Gallery.autoW.Remove(name);
+                Gallery.autoW.Add(name, cardW);
+                return 0;
+            }
         }
         if (have) {
             Gallery.autoH.Remove(name);
@@ -5037,6 +5083,7 @@ class Gallery {
         Gallery.autoH.Add(name, h);
         Gallery.autoW.Add(name, cardW);
         app.RequestRedraw();
+        return 1;
     }
 
     /// 遍历演示的整棵控件树，把「刚才谁被按了 / 哪个值变了」报到卡片
@@ -5131,6 +5178,16 @@ class Gallery {
             Style.Of(app, "label", "secondary", Style.SNormal()),
             x, y, text, app.theme.textSecondary, fs);
         Gallery.RecordBottom(app, demo, y + Canvas.FontHeight(fs));
+    }
+
+    /// 弹层演示预览框内的说明行。弹层通道跑在滚动视口裁剪弹出之后
+    /// （弹窗要能浮到代码面板上方），这里的绘制不再受任何裁剪约束，
+    /// 长文字会一路画出卡片、直到窗口右缘——所以按卡片内宽用
+    /// Ellipsis.Fit 截断，静态文字永远留在框内，弹窗照常浮出。
+    static void BoxCaption(App app, int x, int y, int w, string text, int fs) {
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary", Style.SNormal()),
+            x, y, Ellipsis.Fit(text, w, fs), app.theme.textPrimary, fs);
     }
 
     /// 把下拉框当前的选择报到卡片头部：一个只能点开、点完什么都不说的
@@ -5353,8 +5410,12 @@ class Gallery {
         // Floating/interactive components are drawn later in the deferred
         // overlay pass (above the code panel); the base pass only frames them.
         if (Gallery.IsOverlayComp(name)) {
-            // 自检也要覆盖它们：这一路提前返回，否则弹层类演示在
-            // gallery_audit.log 里整批缺席，看起来像「没这几个演示」。
+            // 弹层类卡片高度提前定死：内容在覆盖通道才画，那里的
+            // SelCaption 等会把「说明行底边」迟到两帧才报到 autoH，
+            // 卡片滚进视口的瞬间框高 180→187、以下全部内容被推移，
+            // 用户看到「滚轮一滚页面跳一下」。框高一律用种子值
+            // Scale(previewH)，不再被覆盖通道的迟到记录改写。
+            Gallery.SuppressAuto(name);
             if (!measureOnly) { Gallery.Audit(app, name, x, y, w, h, true); }
             return h;
         }
@@ -11557,10 +11618,10 @@ class Gallery {
                 Gallery.bigBuildMs = Window.GetTickMs() - bt0;
             }
             Gallery.bigRowsSelect.Render(app, px, py - app.Scale(26), app.Scale(150));
-            app.canvas.DrawStyledText(
-                Style.Of(app, "label", "secondary", Style.SNormal()),
-                px + app.Scale(162), py - app.Scale(22), Convert.ToString(Gallery.bigRowCount) + Gallery.T(" rows x 70 cols · virtual source, flat memory · wheel scrolls rows, Shift+wheel pans columns", " 行 x 70 列 · 虚拟数据源，内存恒定 · 滚轮翻行，Shift+滚轮横向移动"),
-                app.theme.textPrimary, app.theme.fontSizeMedium);
+            Gallery.BoxCaption(app, px + app.Scale(162), py - app.Scale(22),
+                w - app.Scale(36) - app.Scale(162),
+                Convert.ToString(Gallery.bigRowCount) + Gallery.T(" rows x 70 cols · virtual source, flat memory · wheel scrolls rows, Shift+wheel pans columns", " 行 x 70 列 · 虚拟数据源，内存恒定 · 滚轮翻行，Shift+滚轮横向移动"),
+                app.theme.fontSizeMedium);
             DataTable.RenderSource(app, px, py + app.Scale(12), w - app.Scale(36),
                 app.Scale(336), Gallery.bigCols, Gallery.bigSource,
                 Gallery.bigTableState);
@@ -11604,10 +11665,10 @@ class Gallery {
             // re-resolves the ones it needs by name (and the theme colours,
             // so the tint follows the active theme).
             Gallery.demoStyler.Bind(app, cols);
-            app.canvas.DrawStyledText(
-                Style.Of(app, "label", "secondary", Style.SNormal()),
-                px, py - app.Scale(20), Gallery.T("Team/Name frozen left, Total frozen right — scroll sideways and both edges stay put · drag a header to reorder · right-click to freeze to either edge/group/aggregate/insert/delete · click a cell, then arrows/Tab/PgUp/PgDn · Ctrl+C/V · F2 edits: Score spins, Dept picks from a list, Name is required · the last row adds a new one; Ctrl+Del removes, Ctrl+Z puts it back · a CellStyler tints rows under 80, colours Score by band and paints City itself", "Team/Name 冻结在左、Total 冻结在右——横向滚动时两侧都不动 · 拖动表头可换序 · 右键可冻结到左/右、分组/汇总/插入/删除 · 点击单元格后可用方向键/Tab/PgUp/PgDn · Ctrl+C/V · F2 编辑：Score 可微调，Dept 下拉选择，Name 必填 · 末行可新增，Ctrl+Del 删除、Ctrl+Z 撤销 · CellStyler 为低于 80 分的行着色、按区间给 Score 上色，并自绘 City 列"),
-                app.theme.textPrimary, app.theme.fontSizeMedium);
+            Gallery.BoxCaption(app, px, py - app.Scale(20), w - app.Scale(36),
+                Gallery.T("Team/Name frozen left, Total frozen right · drag a header to reorder · right-click a header for freeze/group/aggregate · arrows/Tab move, F2 edits · Ctrl+Z undoes",
+                          "Team/Name 冻结在左、Total 冻结在右 · 拖动表头换序 · 右键表头可冻结/分组/汇总 · 方向键/Tab 移动，F2 编辑 · Ctrl+Z 撤销"),
+                app.theme.fontSizeMedium);
             Gallery.dtDemoCols = cols;
             DataTable.Render(app, px, py, w - app.Scale(36),
                 app.Scale(256), cols, Gallery.demoRows, Gallery.demoTableState);
@@ -12221,8 +12282,8 @@ class Gallery {
             .AddProp("color", "int", "-", "ARGB stroke/fill color.")
             .AddEvent("Names()", "List<string>", "All available icon names.");
         Gallery.Add(list, "Basic", "IconSvg",
-            Gallery.T("997 curated Tabler icons (MIT, generated from upstream SVG into IconSvgData) drawn through the runtime's SVG raster cache. Each (name, size, colour) combination rasterizes once and is re-rastered on demand if the runtime image cache evicts it. Names are Tabler's own. Nest the IconView widget in a Flex/Panel tree (below); DrawGlyph/DrawGlyphIn also serve these glyphs for the classic semantic names, falling back to the hand-drawn vector set when a name has no SVG form.",
-                "997 个精选 Tabler 图标（MIT，由上游 SVG 生成进 IconSvgData），经运行时 SVG 光栅缓存绘制。每个（名称, 尺寸, 颜色）组合只光栅一次，被运行时图像缓存逐出后按需重光栅。名字用 Tabler 原名。用 IconView 控件嵌进 Flex/Panel 组件树（如下）；DrawGlyph/DrawGlyphIn 对经典语义名也优先走这套 SVG，没有 SVG 形的名字回退手绘矢量集。"),
+            Gallery.T("997 curated Tabler icons (MIT, generated into the icon JSON pack that IconSvgData loads) drawn through the runtime's SVG raster cache. Each (name, size, colour) combination rasterizes once and is re-rastered on demand if the runtime image cache evicts it. Names are Tabler's own. Nest the IconView widget in a Flex/Panel tree (below); DrawGlyph/DrawGlyphIn also serve these glyphs for the classic semantic names, falling back to the hand-drawn vector set when a name has no SVG form.",
+                "997 个精选 Tabler 图标（MIT，由上游 SVG 生成进 IconSvgData 加载的 JSON 图标包），经运行时 SVG 光栅缓存绘制。每个（名称, 尺寸, 颜色）组合只光栅一次，被运行时图像缓存逐出后按需重光栅。名字用 Tabler 原名。用 IconView 控件嵌进 Flex/Panel 组件树（如下）；DrawGlyph/DrawGlyphIn 对经典语义名也优先走这套 SVG，没有 SVG 形的名字回退手绘矢量集。"),
             "Flex row = Flex.Wrapped().Gap(8);\nrow.With(new IconView { Name = \"home\" });\nrow.With(new IconView { Name = \"settings\", Box = 32 });\nrow.With(new IconView { Name = \"heart\", Box = 32, Color = app.theme.primary });\n\n// 或直接画：\nIconSvg.Draw(c, \"home\", x, y, 24, color);\nIconSvg.DrawIn(c, rx, ry, rw, rh, \"settings\", color);")
             .Json("{\n  \"type\": \"IconView\",\n  \"name\": \"icon\",\n  \"glyph\": \"home\",\n  \"size\": 24\n}")
             .AddProp("name", "string", "-", "Tabler icon name (see the samples above).")
