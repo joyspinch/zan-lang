@@ -1,0 +1,204 @@
+using System;
+
+namespace Gui.Component.DataTable;
+
+/// 查询计划的确定性校验问题。计划只保存声明式标量和错误文本，
+/// 不持有数据源、UI 或可执行回调，因而可安全交给本地/远端执行器。
+class QueryPlanIssue {
+    int code;
+    string message;
+    int column;
+    int clause;
+
+    QueryPlanIssue(int c, string msg, int col, int at) {
+        this.code = c;
+        this.message = msg;
+        this.column = col;
+        this.clause = at;
+    }
+
+    int Code() { return this.code; }
+    string Message() { return this.message; }
+    int Column() { return this.column; }
+    int Clause() { return this.clause; }
+}
+
+/// 已校验的查询快照。调用方不能通过它修改原 QueryDescriptor；过滤器
+/// 和排序键在构造时逐项复制，只通过按索引读取暴露给执行器。
+class QueryPlan {
+    static const int InvalidQuery = 1;
+    static const int InvalidRevision = 2;
+    static const int InvalidFilterColumn = 3;
+    static const int InvalidSortColumn = 4;
+    static const int UnsupportedFilter = 5;
+    static const int UnsupportedSort = 6;
+    static const int InvalidFilterOperator = 7;
+    static const int InvalidValueKind = 8;
+    static const int InvalidSortDirection = 9;
+    static const int EmptyDataset = 10;
+
+    string dataset;
+    string queryText;
+    int queryHash;
+    int dataRevision;
+    int queryRevision;
+    int capabilities;
+    List<QueryFilterClause> filters;
+    List<QuerySortClause> sorts;
+    QueryPlanIssue issue;
+
+    QueryPlan(string name, string text, int hash, int dataRev, int queryRev,
+              int caps, List<QueryFilterClause> fs, List<QuerySortClause> ss,
+              QueryPlanIssue problem) {
+        this.dataset = name;
+        if (this.dataset == null) { this.dataset = ""; }
+        this.queryText = text;
+        if (this.queryText == null) { this.queryText = ""; }
+        this.queryHash = hash;
+        this.dataRevision = dataRev;
+        this.queryRevision = queryRev;
+        this.capabilities = caps;
+        this.filters = new List<QueryFilterClause>();
+        this.sorts = new List<QuerySortClause>();
+        if (fs != null) {
+            for (int i = 0; i < fs.Count; i = i + 1) {
+                QueryFilterClause f = fs[i];
+                if (f != null) {
+                    this.filters.Add(new QueryFilterClause(f.Column(), f.Mode(),
+                        f.Value(), f.Value2(), f.Kind()));
+                }
+            }
+        }
+        if (ss != null) {
+            for (int i = 0; i < ss.Count; i = i + 1) {
+                QuerySortClause s = ss[i];
+                if (s != null) {
+                    this.sorts.Add(new QuerySortClause(s.Column(), s.Direction(), s.Kind()));
+                }
+            }
+        }
+        this.issue = problem;
+    }
+
+    static QueryPlan Build(QueryDescriptor query, int columnCount,
+                           QueryCapabilities supported) {
+        if (query == null) {
+            return new QueryPlan("", "", 0, 0, 0, 0, null, null,
+                new QueryPlanIssue(QueryPlan.InvalidQuery, "query descriptor is null", -1, -1));
+        }
+        int supportedMask = 0;
+        if (supported != null) { supportedMask = supported.Mask(); }
+        if (query.DataRevision() < 0 || query.QueryRevision() < 0
+            || query.ViewRevision() < 0) {
+            return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
+                query.DataRevision(), query.QueryRevision(), supportedMask,
+                query.Filters(), query.Sorts(),
+                new QueryPlanIssue(QueryPlan.InvalidRevision,
+                    "query revision must be non-negative", -1, -1));
+        }
+        for (int i = 0; i < query.Filters().Count; i = i + 1) {
+            QueryFilterClause f = query.Filters()[i];
+            if (f == null) {
+                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
+                    query.DataRevision(), query.QueryRevision(), supportedMask,
+                    query.Filters(), query.Sorts(),
+                    new QueryPlanIssue(QueryPlan.InvalidQuery,
+                        "query filter clause is null", -1, i));
+            }
+            if (f.Column() < 0 || (columnCount >= 0 && f.Column() >= columnCount)) {
+                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
+                    query.DataRevision(), query.QueryRevision(), supportedMask,
+                    query.Filters(), query.Sorts(),
+                    new QueryPlanIssue(QueryPlan.InvalidFilterColumn,
+                        "query filter column is outside schema", f.Column(), i));
+            }
+            if (f.Mode() < QueryFilterMode.Equals
+                || f.Mode() > QueryFilterMode.NotEmpty) {
+                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
+                    query.DataRevision(), query.QueryRevision(), supportedMask,
+                    query.Filters(), query.Sorts(),
+                    new QueryPlanIssue(QueryPlan.InvalidFilterOperator,
+                        "query filter operator is invalid", f.Column(), i));
+            }
+            if (f.Kind() < 0 || f.Kind() > 3) {
+                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
+                    query.DataRevision(), query.QueryRevision(), supportedMask,
+                    query.Filters(), query.Sorts(),
+                    new QueryPlanIssue(QueryPlan.InvalidValueKind,
+                        "query filter value kind is invalid", f.Column(), i));
+            }
+        }
+        if (query.Filters().Count > 0
+            && (supportedMask & QueryCapabilities.Filter) == 0) {
+            return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
+                query.DataRevision(), query.QueryRevision(), supportedMask,
+                query.Filters(), query.Sorts(),
+                new QueryPlanIssue(QueryPlan.UnsupportedFilter,
+                    "query source does not support filtering", -1, -1));
+        }
+        for (int i = 0; i < query.Sorts().Count; i = i + 1) {
+            QuerySortClause s = query.Sorts()[i];
+            if (s == null) {
+                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
+                    query.DataRevision(), query.QueryRevision(), supportedMask,
+                    query.Filters(), query.Sorts(),
+                    new QueryPlanIssue(QueryPlan.InvalidQuery,
+                        "query sort clause is null", -1, i));
+            }
+            if (s.Column() < 0 || (columnCount >= 0 && s.Column() >= columnCount)) {
+                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
+                    query.DataRevision(), query.QueryRevision(), supportedMask,
+                    query.Filters(), query.Sorts(),
+                    new QueryPlanIssue(QueryPlan.InvalidSortColumn,
+                        "query sort column is outside schema", s.Column(), i));
+            }
+            if (s.Direction() != 1 && s.Direction() != 2) {
+                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
+                    query.DataRevision(), query.QueryRevision(), supportedMask,
+                    query.Filters(), query.Sorts(),
+                    new QueryPlanIssue(QueryPlan.InvalidSortDirection,
+                        "query sort direction is invalid", s.Column(), i));
+            }
+            if (s.Kind() < 0 || s.Kind() > 3) {
+                return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
+                    query.DataRevision(), query.QueryRevision(), supportedMask,
+                    query.Filters(), query.Sorts(),
+                    new QueryPlanIssue(QueryPlan.InvalidValueKind,
+                        "query sort value kind is invalid", s.Column(), i));
+            }
+        }
+        if (query.Sorts().Count > 0
+            && (supportedMask & QueryCapabilities.Sort) == 0) {
+            return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
+                query.DataRevision(), query.QueryRevision(), supportedMask,
+                query.Filters(), query.Sorts(),
+                new QueryPlanIssue(QueryPlan.UnsupportedSort,
+                    "query source does not support sorting", -1, -1));
+        }
+        return new QueryPlan(query.Dataset(), query.QueryJson(), query.QueryFingerprint(),
+            query.DataRevision(), query.QueryRevision(), supportedMask,
+            query.Filters(), query.Sorts(), null);
+    }
+
+    bool IsValid() { return this.issue == null; }
+    QueryPlanIssue Issue() { return this.issue; }
+    string Error() { return this.issue == null ? "" : this.issue.Message(); }
+    string Dataset() { return this.dataset; }
+    string QueryText() { return this.queryText; }
+    int QueryHash() { return this.queryHash; }
+    int DataRevision() { return this.dataRevision; }
+    int QueryRevision() { return this.queryRevision; }
+    int Capabilities() { return this.capabilities; }
+    int FilterCount() { return this.filters.Count; }
+    int SortCount() { return this.sorts.Count; }
+    QueryFilterClause FilterAt(int index) {
+        if (index < 0 || index >= this.filters.Count) { return null; }
+        QueryFilterClause f = this.filters[index];
+        return new QueryFilterClause(f.Column(), f.Mode(), f.Value(), f.Value2(), f.Kind());
+    }
+    QuerySortClause SortAt(int index) {
+        if (index < 0 || index >= this.sorts.Count) { return null; }
+        QuerySortClause s = this.sorts[index];
+        return new QuerySortClause(s.Column(), s.Direction(), s.Kind());
+    }
+}

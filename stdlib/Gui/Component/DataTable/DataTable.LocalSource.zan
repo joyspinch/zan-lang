@@ -15,6 +15,23 @@ class LocalDataSource : QueryDataSource {
         this.ReplaceRows(values);
     }
 
+    override QueryCapabilities Capabilities() {
+        return QueryCapabilities.Of(QueryCapabilities.Filter
+            + QueryCapabilities.Sort + QueryCapabilities.Page
+            + QueryCapabilities.StableKeys + QueryCapabilities.Edit
+            + QueryCapabilities.Insert + QueryCapabilities.Delete);
+    }
+
+    int ColumnCount() {
+        int width = this.DescribeSchema().Count;
+        for (int i = 0; i < this.rows.Count; i = i + 1) {
+            if (this.rows[i] != null && this.rows[i].Count() > width) {
+                width = this.rows[i].Count();
+            }
+        }
+        return width;
+    }
+
     void ReplaceRows(List<DataRow> values) {
         this.rows = new List<DataRow>();
         if (values != null) {
@@ -175,19 +192,21 @@ class LocalDataSource : QueryDataSource {
         return true;
     }
 
-    bool RowPasses(int row, QueryDescriptor query) {
-        for (int i = 0; i < query.Filters().Count; i = i + 1) {
-            QueryFilterClause clause = query.Filters()[i];
-            if (clause.Column() < 0 || !this.FilterPass(this.rows[row].At(clause.Column()), clause)) {
+    bool RowPasses(int row, QueryPlan plan) {
+        for (int i = 0; i < plan.FilterCount(); i = i + 1) {
+            QueryFilterClause clause = plan.FilterAt(i);
+            if (clause == null) { return false; }
+            if (!this.FilterPass(this.rows[row].At(clause.Column()), clause)) {
                 return false;
             }
         }
         return true;
     }
 
-    int CompareRows(int left, int right, QueryDescriptor query) {
-        for (int i = 0; i < query.Sorts().Count; i = i + 1) {
-            QuerySortClause clause = query.Sorts()[i];
+    int CompareRows(int left, int right, QueryPlan plan) {
+        for (int i = 0; i < plan.SortCount(); i = i + 1) {
+            QuerySortClause clause = plan.SortAt(i);
+            if (clause == null) { return 0; }
             string a = this.rows[left].At(clause.Column());
             string b = this.rows[right].At(clause.Column());
             int cmp = this.CompareValue(a, b, clause.Kind());
@@ -199,21 +218,47 @@ class LocalDataSource : QueryDataSource {
         return left < right ? -1 : (left > right ? 1 : 0);
     }
 
+    void SortOrder(List<int> order, QueryPlan plan) {
+        int n = order.Count;
+        if (n < 2 || plan.SortCount() == 0) { return; }
+        List<int> work = new List<int>();
+        for (int i = 0; i < n; i = i + 1) { work.Add(0); }
+        int width = 1;
+        while (width < n) {
+            int left = 0;
+            while (left < n) {
+                int mid = left + width;
+                int right = mid + width;
+                if (mid > n) { mid = n; }
+                if (right > n) { right = n; }
+                int a = left; int b = mid; int outp = left;
+                while (a < mid || b < right) {
+                    if (b >= right || (a < mid && this.CompareRows(order[a], order[b], plan) <= 0)) {
+                        work[outp] = order[a]; a = a + 1;
+                    } else {
+                        work[outp] = order[b]; b = b + 1;
+                    }
+                    outp = outp + 1;
+                }
+                left = right;
+            }
+            for (int i = 0; i < n; i = i + 1) { order[i] = work[i]; }
+            if (width > 1073741823) { width = n; }
+            else { width = width * 2; }
+        }
+    }
+
     override QueryResult Execute(QueryDescriptor query,
                                   QueryViewport viewport,
                                   QueryRequestToken token) {
         if (token == null || viewport == null || query == null) { return null; }
+        QueryPlan plan = query.BuildPlan(this.ColumnCount(), this.Capabilities());
+        if (!plan.IsValid()) { return QueryResult.Failure(token, viewport, plan.Error()); }
         List<int> order = new List<int>();
         for (int row = 0; row < this.rows.Count; row = row + 1) {
-            if (this.RowPasses(row, query)) { order.Add(row); }
+            if (this.RowPasses(row, plan)) { order.Add(row); }
         }
-        for (int i = 1; i < order.Count; i = i + 1) {
-            int value = order[i]; int j = i - 1;
-            while (j >= 0 && this.CompareRows(order[j], value, query) > 0) {
-                order[j + 1] = order[j]; j = j - 1;
-            }
-            order[j + 1] = value;
-        }
+        this.SortOrder(order, plan);
         int start = viewport.Start();
         int requested = viewport.Count();
         List<QueryRow> resultRows = new List<QueryRow>();
