@@ -2,8 +2,11 @@
 (function () {
   var panel, tabs, toasts;
   var state = { tabs: [], active: '' };
-  var KEY = 'zanweb.admin.tabs';
+  var KEY = 'zanweb.admin.tabs.v2';
   var stream = null;
+  var streamGen = 0;
+  var loadSeq = 0;
+  var loadController = null;
   var ctxMenu = null;
   var paneMemo = {};
 
@@ -25,15 +28,41 @@
     } catch (e) { /* private mode: tabs simply do not survive a reload */ }
   }
 
+  function pathOf(path, keepHash) {
+    var u = new URL(path || '/admin', location.origin);
+    var q = Array.from(u.searchParams.entries()).sort(function (a, b) {
+      return a[0] === b[0] ? a[1].localeCompare(b[1]) : a[0].localeCompare(b[0]);
+    });
+    u.search = '';
+    q.forEach(function (p) { u.searchParams.append(p[0], p[1]); });
+    return u.pathname + (u.search ? u.search : '') +
+      (keepHash ? (u.hash || '') : '');
+  }
+
+  // A hash selects a pane inside the resource; it is not a second tab.
+  function normalize(path) { return pathOf(path, false); }
+
+  function rememberPane(path) {
+    var u = new URL(path || '/admin', location.origin);
+    if (u.hash && u.hash.length > 1) {
+      paneMemo[normalize(path)] = decodeURIComponent(u.hash.slice(1));
+    }
+  }
+
   function restore() {
     try {
       var raw = localStorage.getItem(KEY);
       if (raw) { state = JSON.parse(raw); }
     } catch (e) { state = { tabs: [], active: '' }; }
-    if (!state.tabs) { state.tabs = []; }
+    if (!state || !Array.isArray(state.tabs)) { state = { tabs: [], active: '' }; }
+    state.tabs = state.tabs.map(function (t) {
+      return { path: normalize(t.path), title: t.title || t.path };
+    });
+    state.active = state.active ? normalize(state.active) : '';
   }
 
   function find(path) {
+    path = normalize(path);
     for (var i = 0; i < state.tabs.length; i++) {
       if (state.tabs[i].path === path) { return i; }
     }
@@ -89,7 +118,10 @@
     }
   }
 
-  function base(path) { return (path || '').split('?')[0]; }
+  function base(path) {
+    var u = new URL(path || '/admin', location.origin);
+    return u.pathname;
+  }
 
   // Right-click on a tab: the usual workspace menu. Closing is deliberate --
   // a left click never closes anything but the tab's own ×.
@@ -159,41 +191,62 @@
     paint();
   }
 
-  function open(path, title) {
+  function open(path, title, replace) {
+    rememberPane(path);
+    path = normalize(path);
+    var same = state.active === path;
     var i = find(path);
     if (i < 0) { state.tabs.push({ path: path, title: title || path }); }
     state.active = path;
     paint();
+    if (replace || same) { history.replaceState({ path: path }, '', path); }
+    else { history.pushState({ path: path }, '', path); }
     load(path);
+  }
+
+  function restoreHistory() {
+    rememberPane(location.pathname + location.search + location.hash);
+    var path = normalize(location.pathname + location.search + location.hash);
+    var i = find(path);
+    var title = i >= 0 ? state.tabs[i].title : path;
+    open(path, title, true);
   }
 
   // ---- panel --------------------------------------------------------------
 
   function load(path) {
+    path = normalize(path);
+    var seq = ++loadSeq;
+    if (loadController) { loadController.abort(); }
+    loadController = window.AbortController ? new AbortController() : null;
     stopStream();
     panel.setAttribute('aria-busy', 'true');
-    return fetch(path, { headers: { 'X-Fragment': '1' }, credentials: 'same-origin' })
+    var opts = { headers: { 'X-Fragment': '1' }, credentials: 'same-origin' };
+    if (loadController) { opts.signal = loadController.signal; }
+    return fetch(path, opts)
       .then(function (r) {
+        if (seq !== loadSeq) { return ''; }
         if (r.status === 401) { location.href = '/admin/login'; return ''; }
+        if (!r.ok) { throw new Error('http ' + r.status); }
         var t = r.headers.get('X-Tab-Title');
         if (t) {
-          var i = find(state.active);
+          var i = find(path);
           if (i >= 0) { state.tabs[i].title = decodeURIComponent(t); paint(); }
         }
         return r.text();
       })
       .then(function (html) {
-        if (html === '') { return; }
+        if (html === '' || seq !== loadSeq) { return; }
         panel.innerHTML = html;
         panel.removeAttribute('aria-busy');
         panel.scrollTop = 0;
-        history.replaceState(null, '', path);
         startStream();
         runScripts(panel);
         restorePane(path);
         wireModelPick(panel);
       })
-      .catch(function () {
+      .catch(function (err) {
+        if (seq !== loadSeq || err.name === 'AbortError') { return; }
         panel.removeAttribute('aria-busy');
         toast('页面加载失败', 'bad');
       });
@@ -554,6 +607,7 @@
   // ---- live metrics -------------------------------------------------------
 
   function stopStream() {
+    streamGen++;
     if (stream) { stream.close(); stream = null; }
     if (dayTimer) { clearInterval(dayTimer); dayTimer = null; }
     dayPts = {};
@@ -566,17 +620,20 @@
   function startStream() {
     var host = panel.querySelector('[data-stream]');
     if (!host) { return; }
+    var gen = ++streamGen;
     var url = host.getAttribute('data-stream');
     stream = new EventSource(url);
     stream.addEventListener('metrics', function (ev) {
-      paintSnapshot(JSON.parse(ev.data));
+      if (gen !== streamGen) { return; }
+      try { paintSnapshot(JSON.parse(ev.data)); } catch (e) { toast('实时数据格式错误', 'bad'); }
     });
     stream.addEventListener('series', function (ev) {
-      paintSeries(JSON.parse(ev.data));
+      if (gen !== streamGen) { return; }
+      try { paintSeries(JSON.parse(ev.data)); } catch (e) { toast('实时序列格式错误', 'bad'); }
     });
     stream.onerror = function () { /* EventSource retries by itself */ };
     wireTopSort();
-    startDay(host.getAttribute('data-day'));
+    startDay(host.getAttribute('data-day'), gen);
   }
 
   // ---- today, cumulative --------------------------------------------------
@@ -589,12 +646,12 @@
   var dayPts = {};      // bucket second -> point, so history is merged, not replaced
   var dayDay = '';
 
-  function startDay(url) {
+  function startDay(url, gen) {
     if (!url) { return; }
     var tick = function () {
       fetch(url, { credentials: 'same-origin' })
         .then(function (r) { return r.ok ? r.json() : null; })
-        .then(function (j) { if (j) { paintDay(j); } })
+        .then(function (j) { if (j && gen === streamGen) { paintDay(j); } })
         .catch(function () { /* the next tick tries again */ });
     };
     tick();
@@ -1019,9 +1076,7 @@
       ev.preventDefault();
       var href = l.getAttribute('href');
       var path = href.charAt(0) === '?' ? base(state.active) + href : href;
-      state.active = path;
-      var i = find(path);
-      load(path);
+      open(path, l.getAttribute('data-title') || l.textContent.trim());
       return;
     }
     var d = ev.target.closest('[data-dialog]');
@@ -1091,8 +1146,7 @@
       });
       var path = search.getAttribute('action') || base(state.active);
       if (parts.length) { path = path + '?' + parts.join('&'); }
-      state.active = path;
-      load(path);
+      open(path, search.getAttribute('data-title') || path);
       return;
     }
     var form = ev.target.closest('[data-submit]');
@@ -1119,10 +1173,12 @@
     tabs = el('ad-tabs');
     toasts = el('ad-toasts');
     restore();
-    var here = location.pathname + location.search;
+    var here = normalize(location.pathname + location.search + location.hash);
+    rememberPane(location.pathname + location.search + location.hash);
     var title = document.body.getAttribute('data-tab-title') || here;
     if (find(here) < 0) { state.tabs.push({ path: here, title: title }); }
     state.active = here;
+    history.replaceState({ path: here }, '', here);
     paint();
     window.addEventListener('resize', paintTabNav);
     // A wheel over the strip pages it sideways, like a browser's tab bar.
@@ -1134,6 +1190,7 @@
     // The first screen is already in the panel, server-rendered.
     startStream();
     wireModelPick(panel);
+    window.addEventListener('popstate', restoreHistory);
   });
 
 
