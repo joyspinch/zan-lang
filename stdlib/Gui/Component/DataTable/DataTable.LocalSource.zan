@@ -2,6 +2,33 @@ using System;
 
 namespace Gui.Component.DataTable;
 
+/// 单个排序键的预计算值。文本仍直接读取源行；数值和 bool 只在
+/// 查询开始时解析一次，避免稳定归并排序的比较热路径反复转换。
+class LocalSortColumn {
+    int kind;
+    List<int> ints;
+    List<double> reals;
+    List<bool> bools;
+
+    LocalSortColumn(int valueKind) {
+        this.kind = valueKind;
+        this.ints = new List<int>();
+        this.reals = new List<double>();
+        this.bools = new List<bool>();
+    }
+
+    void Add(string value) {
+        if (value == null) { value = ""; }
+        if (this.kind == 1) { this.ints.Add(DataTable.ParseInt(value)); }
+        else if (this.kind == 2) { this.reals.Add(DataTable.ParseReal(value)); }
+        else if (this.kind == 3) { this.bools.Add(DataTable.ParseBool(value)); }
+    }
+
+    int IntAt(int row) { return this.ints[row]; }
+    double RealAt(int row) { return this.reals[row]; }
+    bool BoolAt(int row) { return this.bools[row]; }
+}
+
 /// 本地内存查询源。源保存自己的行快照，按 QueryViewport 同步交付一页，
 /// 不把当前页位置暴露为业务身份；无自定义键时使用带 temporary 标记的 legacy key。
 class LocalDataSource : QueryDataSource {
@@ -159,66 +186,99 @@ class LocalDataSource : QueryDataSource {
         return DataTable.CompareStr(leftText, rightText);
     }
 
-    bool FilterPass(string value, QueryFilterClause clause) {
+    bool FilterPassValues(string value, int mode, string a, string b, int kind) {
         if (value == null) { value = ""; }
-        string a = clause.Value();
-        string b = clause.Value2();
-        int cmp = this.CompareValue(value, a, clause.Kind());
-        if (clause.Mode() == QueryFilterMode.Equals) { return cmp == 0; }
-        if (clause.Mode() == QueryFilterMode.Contains) {
+        if (a == null) { a = ""; }
+        if (b == null) { b = ""; }
+        int cmp = this.CompareValue(value, a, kind);
+        if (mode == QueryFilterMode.Equals) { return cmp == 0; }
+        if (mode == QueryFilterMode.Contains) {
             if (a.Length == 0) { return true; }
             for (int i = 0; i + a.Length <= value.Length; i = i + 1) {
                 if (value.Substring(i, a.Length) == a) { return true; }
             }
             return false;
         }
-        if (clause.Mode() == QueryFilterMode.StartsWith) {
+        if (mode == QueryFilterMode.StartsWith) {
             return value.Length >= a.Length && value.Substring(0, a.Length) == a;
         }
-        if (clause.Mode() == QueryFilterMode.EndsWith) {
+        if (mode == QueryFilterMode.EndsWith) {
             return value.Length >= a.Length
                 && value.Substring(value.Length - a.Length, a.Length) == a;
         }
-        if (clause.Mode() == QueryFilterMode.Greater) { return cmp > 0; }
-        if (clause.Mode() == QueryFilterMode.GreaterOrEqual) { return cmp >= 0; }
-        if (clause.Mode() == QueryFilterMode.Less) { return cmp < 0; }
-        if (clause.Mode() == QueryFilterMode.LessOrEqual) { return cmp <= 0; }
-        if (clause.Mode() == QueryFilterMode.Between) {
-            int hi = this.CompareValue(value, b, clause.Kind());
+        if (mode == QueryFilterMode.Greater) { return cmp > 0; }
+        if (mode == QueryFilterMode.GreaterOrEqual) { return cmp >= 0; }
+        if (mode == QueryFilterMode.Less) { return cmp < 0; }
+        if (mode == QueryFilterMode.LessOrEqual) { return cmp <= 0; }
+        if (mode == QueryFilterMode.Between) {
+            int hi = this.CompareValue(value, b, kind);
             return cmp >= 0 && hi <= 0;
         }
-        if (clause.Mode() == QueryFilterMode.Empty) { return value.Length == 0; }
-        if (clause.Mode() == QueryFilterMode.NotEmpty) { return value.Length > 0; }
+        if (mode == QueryFilterMode.Empty) { return value.Length == 0; }
+        if (mode == QueryFilterMode.NotEmpty) { return value.Length > 0; }
         return true;
+    }
+
+    bool FilterPass(string value, QueryFilterClause clause) {
+        if (clause == null) { return false; }
+        return this.FilterPassValues(value, clause.Mode(), clause.Value(),
+            clause.Value2(), clause.Kind());
     }
 
     bool RowPasses(int row, QueryPlan plan) {
         for (int i = 0; i < plan.FilterCount(); i = i + 1) {
-            QueryFilterClause clause = plan.FilterAt(i);
-            if (clause == null) { return false; }
-            if (!this.FilterPass(this.rows[row].At(clause.Column()), clause)) {
+            int column = plan.FilterColumnAt(i);
+            if (!this.FilterPassValues(this.rows[row].At(column), plan.FilterModeAt(i),
+                    plan.FilterValueAt(i), plan.FilterValue2At(i), plan.FilterKindAt(i))) {
                 return false;
             }
         }
         return true;
     }
 
-    int CompareRows(int left, int right, QueryPlan plan) {
+    List<LocalSortColumn> BuildSortColumns(QueryPlan plan) {
+        List<LocalSortColumn> columns = new List<LocalSortColumn>();
         for (int i = 0; i < plan.SortCount(); i = i + 1) {
-            QuerySortClause clause = plan.SortAt(i);
-            if (clause == null) { return 0; }
-            string a = this.rows[left].At(clause.Column());
-            string b = this.rows[right].At(clause.Column());
-            int cmp = this.CompareValue(a, b, clause.Kind());
+            LocalSortColumn column = new LocalSortColumn(plan.SortKindAt(i));
+            for (int row = 0; row < this.rows.Count; row = row + 1) {
+                column.Add(this.rows[row].At(plan.SortColumnAt(i)));
+            }
+            columns.Add(column);
+        }
+        return columns;
+    }
+
+    int CompareRows(int left, int right, QueryPlan plan,
+                    List<LocalSortColumn> columns) {
+        for (int i = 0; i < plan.SortCount(); i = i + 1) {
+            int kind = plan.SortKindAt(i);
+            int cmp = 0;
+            if (kind == 1) {
+                int a = columns[i].IntAt(left);
+                int b = columns[i].IntAt(right);
+                cmp = a < b ? -1 : (a > b ? 1 : 0);
+            } else if (kind == 2) {
+                double a = columns[i].RealAt(left);
+                double b = columns[i].RealAt(right);
+                cmp = a < b ? -1 : (a > b ? 1 : 0);
+            } else if (kind == 3) {
+                bool a = columns[i].BoolAt(left);
+                bool b = columns[i].BoolAt(right);
+                cmp = a == b ? 0 : (a ? 1 : -1);
+            } else {
+                cmp = DataTable.CompareStr(this.rows[left].At(plan.SortColumnAt(i)),
+                    this.rows[right].At(plan.SortColumnAt(i)));
+            }
             if (cmp != 0) {
-                if (clause.Direction() == 2) { cmp = 0 - cmp; }
+                if (plan.SortDirectionAt(i) == 2) { cmp = 0 - cmp; }
                 return cmp;
             }
         }
         return left < right ? -1 : (left > right ? 1 : 0);
     }
 
-    void SortOrder(List<int> order, QueryPlan plan) {
+    void SortOrder(List<int> order, QueryPlan plan,
+                   List<LocalSortColumn> columns) {
         int n = order.Count;
         if (n < 2 || plan.SortCount() == 0) { return; }
         List<int> work = new List<int>();
@@ -233,7 +293,7 @@ class LocalDataSource : QueryDataSource {
                 if (right > n) { right = n; }
                 int a = left; int b = mid; int outp = left;
                 while (a < mid || b < right) {
-                    if (b >= right || (a < mid && this.CompareRows(order[a], order[b], plan) <= 0)) {
+                    if (b >= right || (a < mid && this.CompareRows(order[a], order[b], plan, columns) <= 0)) {
                         work[outp] = order[a]; a = a + 1;
                     } else {
                         work[outp] = order[b]; b = b + 1;
@@ -258,7 +318,8 @@ class LocalDataSource : QueryDataSource {
         for (int row = 0; row < this.rows.Count; row = row + 1) {
             if (this.RowPasses(row, plan)) { order.Add(row); }
         }
-        this.SortOrder(order, plan);
+        List<LocalSortColumn> sortColumns = this.BuildSortColumns(plan);
+        this.SortOrder(order, plan, sortColumns);
         int start = viewport.Start();
         int requested = viewport.Count();
         List<QueryRow> resultRows = new List<QueryRow>();
