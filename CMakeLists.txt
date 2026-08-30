@@ -1028,6 +1028,16 @@ add_test(NAME policy_server_mvc_ai_endpoint
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(policy_server_mvc_ai_endpoint PROPERTIES TIMEOUT 120)
 
+add_test(NAME policy_external_target
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/external_policy.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/external_policy.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/policy_external_target${_exe_ext}
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(policy_external_target PROPERTIES TIMEOUT 120)
+
 
 # The RA2 format tests were moved out of stdlib into
 # examples/game/ra2/stdlib_rts; they need its Formats sources on the command
@@ -1836,6 +1846,15 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_query_source.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_query_source${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  add_test(NAME conformance_gui_datatable_local_source
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_local_source_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_local_source.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_local_source${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # The property protocol (Props() specs -> Control.GetProp/SetProp) is what

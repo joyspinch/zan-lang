@@ -1,0 +1,290 @@
+using System;
+
+namespace System.Net.External;
+
+/// <summary>已规范化的外部 HTTP(S) 目标。实例只描述目标，不执行 DNS
+/// 或连接；调用方必须在连接前对主机名的全部解析结果做地址策略检查。</summary>
+class ExternalTarget {
+    string scheme;
+    string host;
+    string path;
+    string query;
+    string canonical;
+    int port;
+    bool literal;
+    bool safeLiteral;
+    bool loopback;
+
+    ExternalTarget() {
+        this.scheme = "";
+        this.host = "";
+        this.path = "/";
+        this.query = "";
+        this.canonical = "";
+        this.port = 0;
+        this.literal = false;
+        this.safeLiteral = false;
+        this.loopback = false;
+    }
+
+    /// <summary>严格解析绝对 HTTP(S) URL。失败返回 null；不会把输入
+    /// 猜测修正为另一个 URL。</summary>
+    static ExternalTarget Parse(string url) {
+        if (!ExternalTarget.ValidText(url)) { return null; }
+        int sep = url.IndexOf("://");
+        if (sep <= 0) { return null; }
+        string scheme = url.Substring(0, sep).ToLower();
+        if (scheme != "http" && scheme != "https") { return null; }
+        string rest = url.Substring(sep + 3, url.Length - sep - 3);
+        if (rest.Length == 0 || rest.Contains("#") || rest.Contains("\\")
+            || rest.Contains("@") || rest.Contains("%")) { return null; }
+
+        int slash = rest.IndexOf("/");
+        int question = rest.IndexOf("?");
+        int cut = slash;
+        if (cut < 0 || (question >= 0 && question < cut)) { cut = question; }
+        string authority = cut < 0 ? rest : rest.Substring(0, cut);
+        string tail = cut < 0 ? "" : rest.Substring(cut, rest.Length - cut);
+        if (authority.Length == 0) { return null; }
+
+        ExternalTarget t = new ExternalTarget();
+        t.scheme = scheme;
+        t.port = scheme == "https" ? 443 : 80;
+        string h = "";
+        int explicitPort = 0;
+        if (authority.StartsWith("[")) {
+            int close = authority.IndexOf("]");
+            if (close < 0) { return null; }
+            h = authority.Substring(1, close - 1).ToLower();
+            if (!ExternalTarget.ValidIPv6(h)) { return null; }
+            t.literal = true;
+            if (close + 1 < authority.Length) {
+                explicitPort = ExternalTarget.PortOf(authority, close + 1);
+                if (explicitPort < 0) { return null; }
+            }
+            if (explicitPort > 0) { t.port = explicitPort; }
+        } else {
+            if (authority.IndexOf("[") >= 0 || authority.IndexOf("]") >= 0) {
+                return null;
+            }
+            int colon = authority.IndexOf(":");
+            if (colon >= 0) {
+                if (authority.IndexOf(":", colon + 1) >= 0 ||
+                    colon == authority.Length - 1) { return null; }
+                h = authority.Substring(0, colon).ToLower();
+                explicitPort = ExternalTarget.PortOf(authority, colon);
+                if (explicitPort < 0) { return null; }
+                if (explicitPort > 0) { t.port = explicitPort; }
+            } else {
+                h = authority.ToLower();
+            }
+            if (ExternalTarget.ValidIPv4(h)) {
+                t.literal = true;
+            } else if (!ExternalTarget.ValidDnsName(h)) {
+                return null;
+            }
+        }
+        if (h.Length == 0) { return null; }
+        if (tail == "") {
+            t.path = "/";
+            t.query = "";
+        } else if (tail.StartsWith("?")) {
+            t.path = "/";
+            t.query = tail;
+        } else {
+            int q = tail.IndexOf("?");
+            if (q < 0) {
+                t.path = tail;
+                t.query = "";
+            } else {
+                t.path = tail.Substring(0, q);
+                t.query = tail.Substring(q, tail.Length - q);
+            }
+            if (t.path == "") { t.path = "/"; }
+        }
+        if (!t.path.StartsWith("/")) { return null; }
+        t.host = h;
+        t.loopback = ExternalTarget.IsLoopbackHost(h);
+        t.safeLiteral = !t.literal || ExternalTarget.SafeLiteral(h);
+        string authorityOut = t.host;
+        if (t.literal && h.IndexOf(":") >= 0) {
+            authorityOut = "[" + h + "]";
+        }
+        if (t.port != (scheme == "https" ? 443 : 80)) {
+            authorityOut = authorityOut + ":" + Convert.ToString(t.port);
+        }
+        t.canonical = scheme + "://" + authorityOut + t.path + t.query;
+        return t;
+    }
+
+    string Scheme() { return this.scheme; }
+    string Host() { return this.host; }
+    int Port() { return this.port; }
+    string Path() { return this.path; }
+    string Query() { return this.query; }
+    string Canonical() { return this.canonical; }
+    bool IsTls() { return this.scheme == "https"; }
+    bool IsLiteral() { return this.literal; }
+    bool IsSafeLiteral() { return this.safeLiteral; }
+    bool IsLoopback() { return this.loopback; }
+
+    static bool ValidText(string s) {
+        if (s == null || s.Length == 0) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c < 32 || c == 127 || c == 32) { return false; }
+        }
+        return true;
+    }
+
+    static int PortOf(string authority, int at) {
+        if (at >= authority.Length) { return 0; }
+        if (authority[at] != ':') { return -1; }
+        string p = authority.Substring(at + 1, authority.Length - at - 1);
+        if (p.Length == 0 || p.Length > 5) { return -1; }
+        int n = 0;
+        for (int i = 0; i < p.Length; i = i + 1) {
+            int c = p[i] & 255;
+            if (c < 48 || c > 57) { return -1; }
+            n = n * 10 + c - 48;
+        }
+        if (n < 1 || n > 65535) { return -1; }
+        return n;
+    }
+
+    static bool ValidDnsName(string h) {
+        if (h.Length == 0 || h.Length > 253 || h == "localhost") { return false; }
+        if (h.EndsWith(".")) { return false; }
+        if (h.EndsWith(".localhost") || h.EndsWith(".local")) { return false; }
+        int label = 0;
+        for (int i = 0; i < h.Length; i = i + 1) {
+            int c = h[i] & 255;
+            if (c == 46) {
+                if (label == 0 || h[i - 1] == '-') { return false; }
+                label = 0;
+            } else {
+                if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == '-')) {
+                    return false;
+                }
+                if (label == 0 && c == '-') { return false; }
+                label = label + 1;
+                if (label > 63) { return false; }
+            }
+        }
+        return label > 0 && h[h.Length - 1] != '-';
+    }
+
+    static bool ValidIPv4(string h) {
+        int parts = 0;
+        int value = 0;
+        int digits = 0;
+        for (int i = 0; i <= h.Length; i = i + 1) {
+            if (i == h.Length || h[i] == '.') {
+                if (digits == 0 || value > 255 || (digits > 1 && h[i - digits] == '0')) {
+                    return false;
+                }
+                parts = parts + 1;
+                value = 0;
+                digits = 0;
+            } else {
+                int c = h[i] & 255;
+                if (c < 48 || c > 57) { return false; }
+                value = value * 10 + c - 48;
+                digits = digits + 1;
+                if (digits > 3) { return false; }
+            }
+        }
+        return parts == 4;
+    }
+
+    static int HexValue(int c) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        if (c >= 97 && c <= 102) { return c - 87; }
+        if (c >= 65 && c <= 70) { return c - 55; }
+        return -1;
+    }
+
+    static int ParseHex(string s) {
+        if (s.Length == 0 || s.Length > 4) { return -1; }
+        int n = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int v = ExternalTarget.HexValue(s[i] & 255);
+            if (v < 0) { return -1; }
+            n = n * 16 + v;
+        }
+        return n;
+    }
+
+    static bool ValidIPv6(string h) {
+        if (h.Length < 2 || h.Contains(".")) { return false; }
+        int first = h.IndexOf("::");
+        if (first >= 0 && h.IndexOf("::", first + 2) >= 0) { return false; }
+        int groups = 0;
+        string part = "";
+        for (int i = 0; i <= h.Length; i = i + 1) {
+            if (i == h.Length || h[i] == ':') {
+                if (part.Length > 0) {
+                    if (ExternalTarget.ParseHex(part) < 0) { return false; }
+                    groups = groups + 1;
+                    part = "";
+                } else if (i == 0 || i == h.Length || h[i - 1] != ':') {
+                    return false;
+                }
+            } else {
+                part = part + h.Substring(i, 1);
+            }
+        }
+        if (first >= 0) { return groups < 8; }
+        return groups == 8;
+    }
+
+    static bool IsLoopbackHost(string h) {
+        if (ValidIPv4(h)) {
+            int dot = h.IndexOf(".");
+            string first = h.Substring(0, dot);
+            return Convert.ToInt(first) == 127;
+        }
+        if (h == "::1") { return true; }
+        return false;
+    }
+
+    static bool SafeLiteral(string h) {
+        if (ValidIPv4(h)) {
+            int a = 0;
+            int b = 0;
+            int c = 0;
+            int d = 0;
+            int p = 0;
+            int start = 0;
+            int[] v = new int[4];
+            for (int i = 0; i <= h.Length; i = i + 1) {
+                if (i == h.Length || h[i] == '.') {
+                    v[p] = Convert.ToInt(h.Substring(start, i - start));
+                    p = p + 1;
+                    start = i + 1;
+                }
+            }
+            a = v[0]; b = v[1]; c = v[2]; d = v[3];
+            if (a == 0 || a == 10 || a == 127 || a >= 224) { return false; }
+            if (a == 169 && b == 254) { return false; }
+            if (a == 172 && b >= 16 && b <= 31) { return false; }
+            if (a == 192 && (b == 168 || (b == 0 && c == 0))) { return false; }
+            if (a == 100 && b >= 64 && b <= 127) { return false; }
+            if (a == 198 && (b == 18 || b == 19 || b == 51)) { return false; }
+            if (a == 203 && b == 0 && c == 113) { return false; }
+            if (a == 255 && b == 255 && c == 255 && d == 255) { return false; }
+            return true;
+        }
+        if (!ValidIPv6(h)) { return false; }
+        string low = h.ToLower();
+        if (low == "::1" || low == "::") { return false; }
+        if (low.StartsWith("fe8") || low.StartsWith("fe9")
+            || low.StartsWith("fea") || low.StartsWith("feb")) { return false; }
+        if (low.StartsWith("fc") || low.StartsWith("fd") || low.StartsWith("ff")) {
+            return false;
+        }
+        if (low.StartsWith("2001:db8:")) { return false; }
+        if (low.StartsWith("::ffff:")) { return false; }
+        return true;
+    }
+}
