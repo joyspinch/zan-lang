@@ -1015,6 +1015,20 @@ add_custom_command(OUTPUT ${_stdlib_stamp}
   COMMENT "Stamping stdlib sources for the test suite")
 add_custom_target(stdlib_stamp ALL DEPENDS ${_stdlib_stamp})
 
+# AI outbound targets are an exact allowlist, not an arbitrary URL setting.
+# Keep this policy test independent of GUI availability and real providers.
+add_test(NAME policy_server_mvc_ai_endpoint
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/ai_endpoint_allowlist.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/ai_endpoint_allowlist.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/policy_server_mvc_ai_endpoint${_exe_ext}
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/templates/server/server-mvc/src/Feature/AiEndpointPolicy.zan"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(policy_server_mvc_ai_endpoint PROPERTIES TIMEOUT 120)
+
+
 # The RA2 format tests were moved out of stdlib into
 # examples/game/ra2/stdlib_rts; they need its Formats sources on the command
 # line so the compiler can resolve Ra2.StdlibRts.Formats.
