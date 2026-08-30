@@ -2295,7 +2295,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         } else if (fe_string) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMValueRef sp = LLVMBuildBitCast(g->builder, collection, i8ptr, "fe.sp");
-            fe_len = emit_string_length(g, sp);
+            fe_len = emit_string_length(g, sp, stmt->loc);
         }
 
         /* Iteration state (element, index, collection) of a `foreach` in an
@@ -2382,7 +2382,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             } else if (col_slot) {
                 LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 LLVMValueRef sp2 = LLVMBuildBitCast(g->builder, col_cond, i8p, "fe.sp2");
-                count = emit_string_length(g, sp2);
+                count = emit_string_length(g, sp2, stmt->loc);
             } else {
                 count = fe_len;
             }

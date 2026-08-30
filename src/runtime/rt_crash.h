@@ -1070,11 +1070,9 @@ static void zan__crash_frame(int fd, void *pc) {
             zan__crash_wr(fd, ")");
         }
     } else {
-        zan__crash_wr(fd, "0x");
         zan__crash_wr(fd, zan__crash_hex((unsigned long long)(size_t)pc, num));
     }
 #else
-    zan__crash_wr(fd, "0x");
     zan__crash_wr(fd, zan__crash_hex((unsigned long long)(size_t)pc, num));
 #endif
     zan__crash_wr(fd, "\n");

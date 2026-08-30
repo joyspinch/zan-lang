@@ -1106,6 +1106,22 @@ static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
     LLVMPositionBuilderAtEnd(g->builder, cont_bb);
 }
 
+/* Report a null (or, once stamped by the allocator's free path, freed) buffer
+ * that reached a string-length probe, then exit(70). Runs at the raw_bb tail
+ * of emit_string_len_ex, so the report is terminal there -- callers never
+ * observe control flow after it when runtime checks are on. */
+static void emit_string_null_report(zan_irgen_t *g, LLVMValueRef payload,
+                                    zan_loc_t loc) {
+    char buf[160];
+    const char *file = loc_site_file(g, loc);
+    snprintf(buf, sizeof(buf),
+             "%s:%u:%u: runtime error: null reference where a string/byte "
+             "buffer is required (length probe)\n",
+             file, loc.line, loc.col);
+    LLVMValueRef text = LLVMBuildGlobalStringPtr(g->builder, buf, "strnull");
+    emit_fatal_report(g, text, 70);
+}
+
 static LLVMValueRef emit_index_i64(zan_irgen_t *g, LLVMValueRef value,
                                    const char *name) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -1141,6 +1157,31 @@ static void emit_index_bounds_check(zan_irgen_t *g, LLVMValueRef index,
     emit_index_range_check(g, index, length, false, loc, kind);
 }
 
+/* Guard a string element access (`s[i]` read/write) whose receiver carries no
+ * reliable NUL bound -- a field, a parameter or an extern result that may be
+ * a raw FFI buffer. Those skip the bounds check by design (an explicit
+ * tracked length may exceed strlen, which is how the wire codecs index
+ * `string` fields), so a null reference or a negative index would otherwise
+ * reach the GEP+load unchecked and fault at (null + i) with no source
+ * location -- the addr=0x...fffe family a stripped release binary turns into
+ * an undiagnosable SIGSEGV. Null is never a valid buffer and no legitimate
+ * access reads before the payload, so both are reported like the other
+ * runtime guards; the upper bound stays unchecked, as the design requires. */
+static void emit_string_elem_guard(zan_irgen_t *g, LLVMValueRef payload,
+                                   LLVMValueRef index, zan_loc_t loc) {
+    if (!g->runtime_checks || !g->current_fn) return;
+    LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, payload,
+        LLVMConstNull(LLVMTypeOf(payload)), "stridx.null");
+    emit_runtime_check(g, isnull, loc,
+        "null reference where a string/byte buffer is required (element access)");
+    if (LLVMGetTypeKind(LLVMTypeOf(index)) != LLVMIntegerTypeKind) return;
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef idx = emit_index_i64(g, index, "stridx.i64");
+    LLVMValueRef neg = zan_icmp(g->builder, LLVMIntSLT, idx,
+                                LLVMConstInt(i64, 0, 0), "stridx.neg");
+    emit_runtime_check(g, neg, loc, "string index out of bounds");
+}
+
 /* Length of a `string`-typed payload, for `.Length` and for bounds checking.
  * Strings, byte[] and bare C pointers all share the payload pointer ABI, and
  * the second header word says which one this is:
@@ -1165,7 +1206,7 @@ static void emit_index_bounds_check(zan_irgen_t *g, LLVMValueRef index,
  * bounds checking wants) or with strlen (what `string.Length` has always
  * reported for a buffer that reached code typed `string`). */
 static LLVMValueRef emit_string_len_ex(zan_irgen_t *g, LLVMValueRef payload,
-                                      int array_count) {
+                                      int array_count, zan_loc_t loc) {
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8p = LLVMPointerType(i8, 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -1197,8 +1238,11 @@ static LLVMValueRef emit_string_len_ex(zan_irgen_t *g, LLVMValueRef payload,
      * flow: the IsBadReadPtr probe must never run on a null reference
      * (probing null-8 faults inside IsBadReadPtr itself on Windows). */
     LLVMValueRef read_ok = zan_hdr_read_ok(g, payload);
-    /* A null string keeps faulting inside strlen the way it always has, rather
-     * than in front of address 0 where the header would be. */
+    /* A null string reports where the reference came from and exits
+     * cleanly: strlen(null) faults inside libc with no source location,
+     * which is how a null dereference turns into an undiagnosable
+     * SIGSEGV in a stripped release binary. Programs that pass
+     * --no-runtime-checks keep the raw strlen (and its fault). */
     LLVMValueRef probe_ok = zan_icmp(g->builder, LLVMIntNE, payload,
         LLVMConstNull(LLVMTypeOf(payload)), "strbuf.nonnull");
     if (read_ok) probe_ok = zan_and(g->builder, probe_ok, read_ok, "strbuf.ok");
@@ -1219,6 +1263,8 @@ static LLVMValueRef emit_string_len_ex(zan_irgen_t *g, LLVMValueRef payload,
 
     /* Only a header that says "array" makes the count word meaningful. */
     LLVMValueRef count = NULL;
+    LLVMValueRef phi_raw = NULL;
+    LLVMBasicBlockRef phi_raw_pred = NULL;
     if (arr_bb) {
         LLVMBasicBlockRef arr_test_bb = arr_bb;
         arr_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.arrcount");
@@ -1275,10 +1321,24 @@ static LLVMValueRef emit_string_len_ex(zan_irgen_t *g, LLVMValueRef payload,
     LLVMBuildBr(g->builder, done_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, raw_bb);
-    LLVMValueRef raw_len = zan_call2(g->builder, strlen_ty, g->fn_strlen,
-                                     &payload, 1, "strbuf.rawlen");
-    LLVMBuildBr(g->builder, done_bb);
-
+    if (g->runtime_checks) {
+        /* Null reached a length/bounds probe: name the site and exit(70)
+         * instead of faulting inside strlen. The buffer-len variant (the
+         * one bounds checks use) also fires for freed blocks: their
+         * refcount was stamped 0 over the site word, so the tag half is
+         * gone and the pointer is dangling either way. emit_fatal_report
+         * ends in exit + Unreachable (on Windows it first raises so the
+         * crash filter records the site), so raw_bb is fully terminated
+         * here and contributes no phi edge. */
+        emit_string_null_report(g, payload, loc);
+    } else {
+        /* --no-runtime-checks keeps the historical behavior (strlen
+         * faults on null), the trade its callers accept. */
+        phi_raw = zan_call2(g->builder, strlen_ty, g->fn_strlen,
+                            &payload, 1, "strbuf.rawlen");
+        LLVMBuildBr(g->builder, done_bb);
+        phi_raw_pred = raw_bb;
+    }
     LLVMPositionBuilderAtEnd(g->builder, done_bb);
     LLVMValueRef phi = LLVMBuildPhi(g->builder, i64, "strbuf.len");
     LLVMAddIncoming(phi, (LLVMValueRef[]){ cached },
@@ -1288,8 +1348,9 @@ static LLVMValueRef emit_string_len_ex(zan_irgen_t *g, LLVMValueRef payload,
                         (LLVMBasicBlockRef[]){ arr_bb }, 1);
     LLVMAddIncoming(phi, (LLVMValueRef[]){ string_len },
                     (LLVMBasicBlockRef[]){ slow_end_bb }, 1);
-    LLVMAddIncoming(phi, (LLVMValueRef[]){ raw_len },
-                    (LLVMBasicBlockRef[]){ raw_bb }, 1);
+    if (phi_raw)
+        LLVMAddIncoming(phi, (LLVMValueRef[]){ phi_raw },
+                        (LLVMBasicBlockRef[]){ phi_raw_pred }, 1);
     return phi;
 }
 
@@ -1410,14 +1471,16 @@ static void emit_extern_call_len_invalidate(zan_irgen_t *g, LLVMValueRef fn,
 
 /* Bounds-checking length: a byte[] answers with its element count so embedded
  * NUL bytes do not truncate the valid index range. */
-static LLVMValueRef emit_string_buffer_len(zan_irgen_t *g, LLVMValueRef payload) {
-    return emit_string_len_ex(g, payload, 1);
+static LLVMValueRef emit_string_buffer_len(zan_irgen_t *g, LLVMValueRef payload,
+                                           zan_loc_t loc) {
+    return emit_string_len_ex(g, payload, 1, loc);
 }
 
 /* `string.Length`: strlen semantics, with the header cache short-circuiting
  * the walk for managed strings. */
-static LLVMValueRef emit_string_length(zan_irgen_t *g, LLVMValueRef payload) {
-    return emit_string_len_ex(g, payload, 0);
+static LLVMValueRef emit_string_length(zan_irgen_t *g, LLVMValueRef payload,
+                                       zan_loc_t loc) {
+    return emit_string_len_ex(g, payload, 0, loc);
 }
 
 static void emit_span_window_check(zan_irgen_t *g, LLVMValueRef start,
@@ -2214,8 +2277,8 @@ static LLVMValueRef emit_str_concat(zan_irgen_t *g, LLVMValueRef a, LLVMValueRef
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     a = emit_str_nonnull(g, a);
     b = emit_str_nonnull(g, b);
-    LLVMValueRef la = emit_string_length(g, a);
-    LLVMValueRef lb = emit_string_length(g, b);
+    LLVMValueRef la = emit_string_length(g, a, (zan_loc_t){0});
+    LLVMValueRef lb = emit_string_length(g, b, (zan_loc_t){0});
     LLVMValueRef tot = zan_add(g->builder, la, lb, "ct");
     tot = zan_add(g->builder, tot, LLVMConstInt(i64t, 1, 0), "ct1");
     LLVMValueRef buf = emit_string_alloc_rc(g, tot);

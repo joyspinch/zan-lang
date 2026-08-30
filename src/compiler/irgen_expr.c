@@ -2461,8 +2461,11 @@ binding_lowered:
                     if (local->type && local->type->kind == TYPE_STRING) {
                         LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
                         if (!local->opaque_string) {
-                            LLVMValueRef len = emit_string_buffer_len(g, arr_ptr);
+                            LLVMValueRef len = emit_string_buffer_len(g, arr_ptr, expr->loc);
                             emit_index_bounds_check(g, idx, len, expr->loc, "string");
+                        } else {
+                            /* No reliable bound: keep null/negative bare faults out. */
+                            emit_string_elem_guard(g, arr_ptr, idx, expr->loc);
                         }
                         LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
                         LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i8, arr_ptr, &idx, 1, "eidx");
@@ -2542,8 +2545,11 @@ binding_lowered:
                          * receivers carry a reliable NUL bound. */
                         if (fsym->type && fsym->type->kind == TYPE_STRING &&
                             expr_has_reliable_string_bounds(arr_expr, locals)) {
-                            LLVMValueRef len = emit_string_buffer_len(g, arr_ptr);
+                            LLVMValueRef len = emit_string_buffer_len(g, arr_ptr, expr->loc);
                             emit_index_bounds_check(g, idx, len, expr->loc, "string");
+                        } else if (fsym->type && fsym->type->kind == TYPE_STRING) {
+                            /* No reliable bound: keep null/negative bare faults out. */
+                            emit_string_elem_guard(g, arr_ptr, idx, expr->loc);
                         } else if (fsym->type && fsym->type->kind == TYPE_ARRAY &&
                                    fsym->type->array_rank <= 1) {
                             emit_index_bounds_check(g, idx, zan_array_len(g, arr_ptr),
@@ -2713,8 +2719,10 @@ binding_lowered:
                          * literal/local receiver carries a reliable bound. */
                         if (expr_has_reliable_string_bounds(arr_expr, locals))
                             emit_index_bounds_check(g, idx,
-                                emit_string_buffer_len(g, arr_ptr), expr->loc,
+                                emit_string_buffer_len(g, arr_ptr, expr->loc), expr->loc,
                                 "string");
+                        else
+                            emit_string_elem_guard(g, arr_ptr, idx, expr->loc);
                         LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i8, arr_ptr, &idx, 1, "eidx");
                         LLVMValueRef val8 = LLVMBuildTrunc(g->builder, right, i8, "byte");
                         zan_store_fit(g, val8, elem_ptr);
@@ -3169,8 +3177,11 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef arr_ptr = emit_expr(g, arr_expr, locals);
             LLVMValueRef idx = emit_expr(g, operand->index.index, locals);
             if (expr_has_reliable_string_bounds(arr_expr, locals)) {
-                LLVMValueRef str_len = emit_string_buffer_len(g, arr_ptr);
+                LLVMValueRef str_len = emit_string_buffer_len(g, arr_ptr, operand->loc);
                 emit_index_bounds_check(g, idx, str_len, operand->loc, "string");
+            } else {
+                /* No reliable bound: keep null/negative from faulting bare. */
+                emit_string_elem_guard(g, arr_ptr, idx, operand->loc);
             }
             slot_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
                 arr_ptr, &idx, 1, "eidx");
@@ -3359,7 +3370,7 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
                     /* already a string — a null one concatenates as "" (C#),
                      * so coerce before the length is taken */
                     strs[i] = emit_str_nonnull(g, val);
-                    lens[i] = emit_string_length(g, strs[i]);
+                    lens[i] = emit_string_length(g, strs[i], expr->loc);
                     owns[i] = expr_yields_owned_rc_value(g, part, locals) ? 1 : 0;
                 } else if (vtk == LLVMDoubleTypeKind || vtk == LLVMFloatTypeKind) {
                     /* snprintf(NULL, 0, fmt, val) to get length, then snprintf
@@ -3888,7 +3899,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             LLVMValueRef obj_val = emit_guarded_member_object(g, expr, locals);
             if (LLVMGetTypeKind(LLVMTypeOf(obj_val)) == LLVMPointerTypeKind) {
                 /* the length is an i64; `int` is i64 so return it directly. */
-                LLVMValueRef len = emit_string_length(g, obj_val);
+                LLVMValueRef len = emit_string_length(g, obj_val, expr->loc);
                 emit_release_owned_call_temp(g, expr->member.object, obj_val, locals);
                 return len;
             }
@@ -4400,8 +4411,12 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
         if (arr_ptr && arr_type && arr_type->kind == TYPE_STRING) {
             LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
             if (expr_has_reliable_string_bounds(expr->index.object, locals)) {
-                LLVMValueRef str_len = emit_string_buffer_len(g, arr_ptr);
+                LLVMValueRef str_len = emit_string_buffer_len(g, arr_ptr, expr->loc);
                 emit_index_bounds_check(g, idx, str_len, expr->loc, "string");
+            } else {
+                /* No reliable bound (field/param/extern receiver): still keep
+                 * null and negative indexes from faulting bare. */
+                emit_string_elem_guard(g, arr_ptr, idx, expr->loc);
             }
             if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
                 LLVMGetIntTypeWidth(LLVMTypeOf(idx)) != 64) {

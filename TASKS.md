@@ -2884,3 +2884,48 @@ A71 归因出四条编译器杠杆，本条把能实测的先测掉，用数据�
   析构调用（放弃动态表，release_dyn 退化为兜底）——最优但动 ARC 核心；
   ② 表按站点拆成 [1 x ptr] 独立全局（各占一节）+ 二级目录——ld 仍通过
   目录钉住全部，无效。① 是 A75 候选，预计空窗口再 -500KB 级。
+
+# A76 · WSL 内存非法访问排查：null 字符串探针/元素访问受控化 + 崩溃日志双 0x 修复 —— ✅ 已完成（2026-08-30）
+
+- **背景**：线上 Linux MVC 程序崩溃日志 `SIGSEGV(11) addr=0xfffffffffffffffe`，
+  strip+Os 发布二进制无符号无栈。WSL 排查确认这是 **null 基址 + 小负偏移**
+  家族：探针 `char c = s[-2]`（s 为 null static string 字段）逐字节复现该签名
+  （payload-2 的 GEP+load 落在 -2）。同族映射：null 对象字段读 → addr=0x0、
+  null 字符串 .Length/strlen → 0x0、null 数组 .Length → 0xfffffffffffffff0
+  （null-16，数组头）、null string[i] 负索引 → 0xfffffffffffffffe（null-2）。
+- **编译器修复面（runtime_checks 开启时全部受控：`file:line:col: runtime
+  error: …` + exit(70)，Windows 同样走 RaiseException 记崩溃日志）**：
+  - A 面 `emit_string_len_ex`（irgen_generics.c）：null/悬垂 buffer 走到
+    长度探针 raw_bb 时不再裸调 strlen——`emit_string_null_report` 报点位后
+    exit(70)。strhead/slice/subnull/foreach 等 8 处调用点全部穿 loc。
+    `--no-runtime-checks` 保留历史 strlen 行为（调用方自担）。
+  - B 面 string[i] 元素访问：field/参数/extern 接收者被
+    `expr_has_reliable_string_bounds` 判为不可靠（FFI 裸 buffer 可能在
+    NUL 后带数据，strlen 界会误伤 wire codec），读/写/复合赋值 5 处
+    在无 bounds check 分支补 `emit_string_elem_guard`：null 接收者 +
+    负索引受控报错；上界按设计仍不查（可靠界不存在）。idx 探针实测
+    `addr=0xfffffffffffffffe` 签名消除。
+  - C 面 rt_crash.h：`zan__crash_frame` 非 dladdr 分支手工 `"0x"` 前缀与
+    `zan__crash_hex` 自带 `0x` 叠加（线上日志 `0x0x390515` 即此），
+    去手工前缀；cross-rt（linux-musl/arm64/riscv64 + macos x64/arm64）
+    经 build_cross_rt.cmd 重建，实测日志为单 `0x`。
+- **跨平台批跑**：408 个 conformance linux-x64 -g 进 WSL：187 过/18 差异/
+  3 crash，与修复前基线一致（差异为 win 平台性/leakcheck 环境项，
+  crasher 见下，无新增回归）；Windows 侧 hello/idx/strhead/negidx 抽查
+  受控报错同效。
+- **3 个 crasher 根因（属应用层/悬垂问题，非编译器安全面，另行处理）**：
+  - https_binary_body + tls_hostname：`TlsStream.Close`（TlsStream.zan:909）
+    `SSL_free(this.ssl)` 后 crash 于 wbio 悬垂访问（SSL_set_bio 转移了
+    BIO 所有权，但 Zan 侧 `string` 字段仍持指针；libssl 3.x 上
+    BIO_ctrl_pending 段错误 addr=0x75…018 非空非小偏移）。疑 ARC 收走
+    wbio 字符串后 SSL 内部 BIO 悬垂——需按 Ownership 约定重审
+    Setup/Close 的 BIO 生命周期。
+  - sqlserver_tds：`Program_Live$resume`（sqlserver_tds.zan:521 pool.Close
+    场景）写 `(%rax)` 时 addr=0x7754cc964058——协程 resume 路径 null 实例
+    字段（与 TdsBytes.Release 后 Data()/Len() 读悬垂同族），非确定性复现。
+- **desc_hdr 在途 WIP 交接（已撤回）**：排查中段曾发现 desc_hdr 描述符模式
+  使 zanc 启动即崩（`__zan_desc_N` 只 reserve 无 initializer），临时强制
+  `g->desc_hdr = false` 绕行；其后并行 WIP 补上了 create_arc_desc 的
+  全零 initializer（模块死在 finalize 前也取安全回退路径），zanc 恢复
+  正常，本临时关闭随之撤回，desc_hdr 默认开启（check_leaks 仍走
+  site-index 布局）。

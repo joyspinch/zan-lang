@@ -1696,7 +1696,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 bool bounded = expr_has_reliable_string_bounds(sc->member.object,
                                                               locals) != 0;
                 LLVMValueRef total = (bounded || expr->call.args.count == 1)
-                    ? emit_string_length(g, s) : NULL;
+                    ? emit_string_length(g, s, expr->loc) : NULL;
                 LLVMValueRef slen;
                 if (expr->call.args.count == 2) {
                     slen = coerce_int_to(g,
@@ -1783,7 +1783,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     if (LLVMGetTypeKind(LLVMTypeOf(start)) == LLVMIntegerTypeKind &&
                         LLVMGetIntTypeWidth(LLVMTypeOf(start)) < 64)
                         start = LLVMBuildSExt(g->builder, start, i64, "idx.start");
-                    LLVMValueRef slen = emit_string_length(g, s);
+                    LLVMValueRef slen = emit_string_length(g, s, expr->loc);
                     LLVMValueRef nonneg = zan_icmp(g->builder, LLVMIntSGE, start,
                         LLVMConstInt(i64, 0, 0), "idx.nonneg");
                     LLVMValueRef within = zan_icmp(g->builder, LLVMIntSLE, start,
