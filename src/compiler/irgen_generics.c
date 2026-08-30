@@ -75,6 +75,8 @@ static void collect_inst_expr(zan_irgen_t *g, zan_ast_node_t *e) {
         collect_inst_typeref(g, e->new_expr.type);
         for (int i = 0; i < e->new_expr.args.count; i++)
             collect_inst_expr(g, e->new_expr.args.items[i]);
+        for (int i = 0; i < e->new_expr.arg_inits.count; i++)
+            collect_inst_expr(g, e->new_expr.arg_inits.items[i]);
         break;
     case AST_COLL_INIT:
         for (int i = 0; i < e->coll_init.items.count; i++)
@@ -1065,21 +1067,10 @@ static void emit_rc_store_field(zan_irgen_t *g, zan_type_t *type,
  * `--subsystem windows` there is no console behind stdout, so the print alone
  * means a failed bounds check looks exactly like the process vanishing -- no
  * message, no window, nothing to go on. Never returns. */
-static void emit_fatal_report(zan_irgen_t *g, LLVMValueRef text, int exit_code);
-
-/* Report a guard failure on the fail-soft path and CONTINUE in a fresh block:
- * the same message goes to stderr and to the runtime's dated log (deduped per
- * site inside zan_rt_soft_note), but the program keeps running -- the guard's
- * caller then yields a default value. Which path a guard actually takes is a
- * RUNTIME decision (zan_rt_soft_is_hard, i.e. ZAN_RT_HARD=1): the compiler
- * emits both and the branch picks. That keeps the test-suite's exit(70)
- * semantics verifiable on the same binary that a production service runs
- * soft by default. Runtime checks off = neither path exists. */
-static void emit_guard_report(zan_irgen_t *g, LLVMValueRef text, zan_loc_t loc,
-                              const char *msg);
-    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+static void emit_fatal_report(zan_irgen_t *g, LLVMValueRef text, int exit_code) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%s", "fatal_fmt");
     LLVMValueRef pargs[] = { fmt, text };
     zan_call2(g->builder, g->printf_type, g->fn_printf, pargs, 2, "");
@@ -1122,6 +1113,53 @@ static void emit_guard_report(zan_irgen_t *g, LLVMValueRef text, zan_loc_t loc,
     LLVMValueRef code = LLVMConstInt(i32t, (unsigned long long)exit_code, 0);
     zan_call2(g->builder, g->exit_type, g->fn_exit, &code, 1, "");
     LLVMBuildUnreachable(g->builder);
+}
+
+
+/* Report a guard failure on the fail-soft path and CONTINUE in a fresh block:
+ * the same message goes to stderr and to the runtime's dated log (deduped per
+ * site inside zan_rt_soft_note), but the program keeps running -- the guard's
+ * caller then yields a default value. Which path a guard actually takes is a
+ * RUNTIME decision (zan_rt_soft_is_hard, i.e. ZAN_RT_HARD=1): the compiler
+ * emits both and the branch picks. That keeps the test-suite's exit(70)
+ * semantics verifiable on the same binary that a production service runs
+ * soft by default. Runtime checks off = neither path exists. */
+static void emit_guard_report(zan_irgen_t *g, LLVMValueRef text, zan_loc_t loc,
+                              const char *msg) {
+    (void)loc; (void)msg; /* the location is already baked into text */
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+
+    /* Which path runs is a runtime decision read once per process, so the
+     * same binary serves the test suite (ZAN_RT_HARD=1 -> exit(70), what
+     * tests/runtime pins) and production services (default -> log once and
+     * keep running with a default value). */
+    LLVMTypeRef ishard_ty = LLVMFunctionType(i32t, NULL, 0, 0);
+    LLVMValueRef ishard_fn = LLVMGetNamedFunction(g->mod, "zan_rt_soft_is_hard");
+    if (!ishard_fn) ishard_fn = LLVMAddFunction(g->mod, "zan_rt_soft_is_hard",
+                                                ishard_ty);
+    LLVMValueRef hard = zan_call2(g->builder, ishard_ty, ishard_fn, NULL, 0,
+                                  "rt.hard");
+
+    LLVMTypeRef note_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                           (LLVMTypeRef[]){ i8p }, 1, 0);
+    LLVMValueRef note_fn = LLVMGetNamedFunction(g->mod, "zan_rt_soft_note");
+    if (!note_fn) note_fn = LLVMAddFunction(g->mod, "zan_rt_soft_note", note_ty);
+
+    LLVMBasicBlockRef hard_bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->current_fn, "rt.hardpath");
+    LLVMBasicBlockRef soft_cont_bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->current_fn, "rt.softcont");
+    LLVMBuildCondBr(g->builder,
+                    zan_icmp(g->builder, LLVMIntNE, hard,
+                             LLVMConstInt(i32t, 0, 0), "rt.hardcmp"),
+                    hard_bb, soft_cont_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, hard_bb);
+    emit_fatal_report(g, text, 70); /* never returns */
+
+    LLVMPositionBuilderAtEnd(g->builder, soft_cont_bb);
+    zan_call2(g->builder, note_ty, note_fn, &text, 1, "");
 }
 
 /* Emit: when `cond` (an i1) is true at runtime, print `msg` and exit(1), then
@@ -1168,14 +1206,17 @@ static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
              file, loc.line, loc.col, msg);
     LLVMValueRef text = LLVMBuildGlobalStringPtr(g->builder, buf, "rterr");
     emit_guard_report(g, text, loc, msg);
+    /* The report leaves the builder in its soft continuation (hard mode
+     * never returns), so route it into the join block. */
+    LLVMBuildBr(g->builder, cont_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, cont_bb);
 }
 
 /* Report a null (or, once stamped by the allocator's free path, freed) buffer
- * that reached a string-length probe, then exit(70). Runs at the raw_bb tail
- * of emit_string_len_ex, so the report is terminal there -- callers never
- * observe control flow after it when runtime checks are on. */
+ * that reached a string-length probe. Runs at the raw_bb tail of
+ * emit_string_len_ex: hard mode exits(70) inside the report, soft mode logs
+ * once and continues -- the caller joins done_bb with a 0-length answer. */
 static void emit_string_null_report(zan_irgen_t *g, LLVMValueRef payload,
                                     zan_loc_t loc) {
     char buf[160];
@@ -1185,7 +1226,7 @@ static void emit_string_null_report(zan_irgen_t *g, LLVMValueRef payload,
              "buffer is required (length probe)\n",
              file, loc.line, loc.col);
     LLVMValueRef text = LLVMBuildGlobalStringPtr(g->builder, buf, "strnull");
-    emit_fatal_report(g, text, 70);
+    emit_guard_report(g, text, loc, "null length probe");
 }
 
 static LLVMValueRef emit_index_i64(zan_irgen_t *g, LLVMValueRef value,
@@ -1232,20 +1273,56 @@ static void emit_index_bounds_check(zan_irgen_t *g, LLVMValueRef index,
  * location -- the addr=0x...fffe family a stripped release binary turns into
  * an undiagnosable SIGSEGV. Null is never a valid buffer and no legitimate
  * access reads before the payload, so both are reported like the other
- * runtime guards; the upper bound stays unchecked, as the design requires. */
-static void emit_string_elem_guard(zan_irgen_t *g, LLVMValueRef payload,
-                                   LLVMValueRef index, zan_loc_t loc) {
-    if (!g->runtime_checks || !g->current_fn) return;
+ * runtime guards; the upper bound stays unchecked, as the design requires.
+ *
+ * Soft mode keeps the program running, so the guard also returns a SANITIZED
+ * index: null buffer or negative index folds to 0, so the GEP that follows
+ * stays in-bounds (a null buffer reads the first byte of the empty answer the
+ * length probe reports). Hard mode exits inside the report, so the sanitized
+ * value is never used there. */
+static LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base,
+                                          LLVMValueRef isnull, zan_loc_t loc);
+static LLVMValueRef emit_string_elem_guard(zan_irgen_t *g, LLVMValueRef payload,
+                                           LLVMValueRef index, zan_loc_t loc,
+                                           LLVMValueRef *arr_ptr_out) {
+    if (!g->runtime_checks || !g->current_fn) return index;
     LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, payload,
         LLVMConstNull(LLVMTypeOf(payload)), "stridx.null");
     emit_runtime_check(g, isnull, loc,
         "null reference where a string/byte buffer is required (element access)");
-    if (LLVMGetTypeKind(LLVMTypeOf(index)) != LLVMIntegerTypeKind) return;
+    payload = emit_soft_base_select(g, payload, isnull, loc);
+    if (arr_ptr_out) *arr_ptr_out = payload;
+    LLVMValueRef unsafe = isnull;
+    if (LLVMGetTypeKind(LLVMTypeOf(index)) != LLVMIntegerTypeKind) return index;
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef idx = emit_index_i64(g, index, "stridx.i64");
     LLVMValueRef neg = zan_icmp(g->builder, LLVMIntSLT, idx,
                                 LLVMConstInt(i64, 0, 0), "stridx.neg");
     emit_runtime_check(g, neg, loc, "string index out of bounds");
+    unsafe = LLVMBuildOr(g->builder, unsafe, neg, "stridx.unsafe");
+    return LLVMBuildSelect(g->builder, unsafe,
+                           LLVMConstInt(LLVMTypeOf(idx), 0, 0), idx,
+                           "stridx.safe");
+}
+
+/* Substitute a null BASE with the runtime's scratch page so the lowered
+ * GEP+load that follows reads a zeroed object instead of faulting. Call
+ * AFTER the null report (which exits in hard mode and continues in soft
+ * mode); on the soft path the select swaps in zan_rt_soft_scratch(), on the
+ * --no-runtime-checks path the base is returned untouched. */
+static LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base,
+                                          LLVMValueRef isnull, zan_loc_t loc) {
+    if (!g->runtime_checks || !g->current_fn) return base;
+    if (LLVMGetTypeKind(LLVMTypeOf(base)) != LLVMPointerTypeKind) return base;
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef fn_ty = LLVMFunctionType(i8p, NULL, 0, 0);
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_rt_soft_scratch");
+    if (!fn) fn = LLVMAddFunction(g->mod, "zan_rt_soft_scratch", fn_ty);
+    LLVMValueRef scratch = zan_call2(g->builder, fn_ty, fn, NULL, 0,
+                                     "soft.scratch");
+    scratch = LLVMBuildBitCast(g->builder, scratch, LLVMTypeOf(base),
+                               "soft.scratch.bc");
+    return LLVMBuildSelect(g->builder, isnull, scratch, base, "soft.base");
 }
 
 /* Length of a `string`-typed payload, for `.Length` and for bounds checking.
@@ -1388,15 +1465,18 @@ static LLVMValueRef emit_string_len_ex(zan_irgen_t *g, LLVMValueRef payload,
 
     LLVMPositionBuilderAtEnd(g->builder, raw_bb);
     if (g->runtime_checks) {
-        /* Null reached a length/bounds probe: name the site and exit(70)
-         * instead of faulting inside strlen. The buffer-len variant (the
-         * one bounds checks use) also fires for freed blocks: their
-         * refcount was stamped 0 over the site word, so the tag half is
-         * gone and the pointer is dangling either way. emit_fatal_report
-         * ends in exit + Unreachable (on Windows it first raises so the
-         * crash filter records the site), so raw_bb is fully terminated
-         * here and contributes no phi edge. */
+        /* Null reached a length/bounds probe: name the site instead of
+         * faulting inside strlen. The buffer-len variant (the one bounds
+         * checks use) also fires for freed blocks: their refcount was
+         * stamped 0 over the site word, so the tag half is gone and the
+         * pointer is dangling either way. Hard mode exits(70) inside the
+         * report; soft mode returns here in its continuation, and the join
+         * below hands consumers a 0-length answer so the phi stays
+         * well-formed (an empty buffer, not a crash). */
         emit_string_null_report(g, payload, loc);
+        LLVMBuildBr(g->builder, done_bb);
+        phi_raw = LLVMConstInt(i64, 0, 0);
+        phi_raw_pred = LLVMGetInsertBlock(g->builder);
     } else {
         /* --no-runtime-checks keeps the historical behavior (strlen
          * faults on null), the trade its callers accept. */

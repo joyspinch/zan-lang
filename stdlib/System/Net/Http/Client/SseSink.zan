@@ -3,6 +3,13 @@ using System.Threading;
 
 namespace System.Net.Http.Client;
 
+/// <summary><see cref="SseSink.TakeCo"/> 的返回值：取走的数据与
+/// 尝试是否已结束。finished=true 时 data 是最后一批（可能为空串）。</summary>
+class SseDelivery {
+    string data;
+    bool finished;
+}
+
 /// <summary>流式响应体的目的地（text/event-stream，或
 /// 任何边到达边消费的应答）。
 ///
@@ -38,11 +45,20 @@ class SseSink {
     /// 已写入的总字节数，使轮询者无需排空缓冲区就能区分
     /// "仍在流式传输" 与 "尚无数据"。
     int total;
+    /// 终态：Abort/Overflow 后拒绝后续写入，避免消费者断开后
+    /// producer 继续触碰已无效的输出目标。
+    bool aborted;
+    bool overflowed;
+    /// 单次流的最大正文长度；0 表示由 transport 自己决定或不限制。
+    int maxBytes;
     /// 上游本次握手的响应状态、原始头部和失败正文。普通成功 SSE 只需状态
     /// 与头部；非 2xx 的正文供调用方在还没有向下游输出前作出重试决策。
     int responseStatus;
     string responseHeaders;
     string responseErrorBody;
+    /// 事件门：Write/Finish 时发信号，让消费者协程真挂起地等数据，
+    /// 而不是定时轮询 Take。 surplus 语义保证「先写后等」不丢唤醒。
+    Gate ready;
     #if WINDOWS
     nint lockHandle;
     #else
@@ -70,10 +86,14 @@ class SseSink {
         s.attempt = "";
         s.done = "";
         s.total = 0;
+        s.aborted = false;
+        s.overflowed = false;
+        s.maxBytes = 0;
         s.responseStatus = 0;
         s.responseHeaders = "";
         s.responseErrorBody = "";
         s.lockHandle = Mutex.Create();
+        s.ready = new Gate();
         return s;
     }
 
@@ -89,10 +109,14 @@ class SseSink {
         s.attempt = "";
         s.done = "";
         s.total = 0;
+        s.aborted = false;
+        s.overflowed = false;
+        s.maxBytes = 0;
         s.responseStatus = 0;
         s.responseHeaders = "";
         s.responseErrorBody = "";
         s.lockHandle = Mutex.Create();
+        s.ready = new Gate();
         return s;
     }
 
@@ -104,7 +128,11 @@ class SseSink {
         this.parts = new List<string>();
         this.cut = 0;
         this.attempt = "";
+        this.done = "";
         this.total = 0;
+        this.aborted = false;
+        this.overflowed = false;
+        this.maxBytes = 0;
         this.responseStatus = 0;
         this.responseHeaders = "";
         this.responseErrorBody = "";
@@ -116,22 +144,87 @@ class SseSink {
         }
     }
 
-    /// <summary>追加一个已解码的 chunk。</summary>
+    /// <summary>设置本次流的最大正文长度。0 表示不由 sink 限制。</summary>
+    void SetMaxBytes(int bytes) {
+        Mutex.Lock(this.lockHandle);
+        this.maxBytes = bytes > 0 ? bytes : 0;
+        Mutex.Unlock(this.lockHandle);
+    }
+
+    /// <summary>追加一个已解码的 chunk。终态后的写入会安全丢弃。</summary>
     void Write(string piece) {
-        if (piece.Length == 0) { return; }
-        if (this.path != "") {
+        this.TryWrite(piece);
+    }
+
+    /// <summary>追加 chunk 并返回是否被接受。超过上限时原子地进入
+    /// overflow 终态；调用方可以停止读取上游，后续写入都会丢弃。</summary>
+    bool TryWrite(string piece) {
+        if (piece.Length == 0) { return true; }
+        bool signal = false;
+        bool overflow = false;
+        int limit = 0;
+        Mutex.Lock(this.lockHandle);
+        bool stopped = this.aborted || this.overflowed
+            || this.attempt.Length > 0;
+        if (!stopped && this.maxBytes > 0
+            && this.total > this.maxBytes - piece.Length) {
+            this.overflowed = true;
+            overflow = true;
+            limit = this.maxBytes;
+        } else if (!stopped && this.path != "") {
             if (this.fp != 0) {
                 long _w = SseSink.fwrite(piece, 1, piece.Length, this.fp);
+                this.total = this.total + piece.Length;
             }
-            Mutex.Lock(this.lockHandle);
-            this.total = this.total + piece.Length;
             Mutex.Unlock(this.lockHandle);
-            return;
+            return true;
+        } else if (!stopped) {
+            this.parts.Add(piece);
+            this.total = this.total + piece.Length;
+            signal = true;
         }
-        Mutex.Lock(this.lockHandle);
-        this.parts.Add(piece);
-        this.total = this.total + piece.Length;
         Mutex.Unlock(this.lockHandle);
+        if (overflow) {
+            this.Finish("err: stream exceeds " + Convert.ToString(limit)
+                + " bytes");
+            return false;
+        }
+        if (signal && this.ready != null) { this.ready.Signal(); }
+        return !stopped;
+    }
+
+    /// <summary>消费者主动放弃时进入终态；重复调用安全。</summary>
+    void Abort() {
+        Mutex.Lock(this.lockHandle);
+        bool already = this.aborted || this.overflowed
+            || this.attempt.Length > 0;
+        if (!already) { this.aborted = true; }
+        Mutex.Unlock(this.lockHandle);
+        if (!already) { this.Finish("err: cancelled"); }
+    }
+
+    /// <summary>标记流超限并唤醒消费者；重复调用安全。</summary>
+    void Overflow() {
+        Mutex.Lock(this.lockHandle);
+        bool already = this.aborted || this.overflowed
+            || this.attempt.Length > 0;
+        if (!already) { this.overflowed = true; }
+        Mutex.Unlock(this.lockHandle);
+        if (!already) { this.Finish("err: stream limit exceeded"); }
+    }
+
+    bool Aborted() {
+        Mutex.Lock(this.lockHandle);
+        bool v = this.aborted;
+        Mutex.Unlock(this.lockHandle);
+        return v;
+    }
+
+    bool Overflowed() {
+        Mutex.Lock(this.lockHandle);
+        bool v = this.overflowed;
+        Mutex.Unlock(this.lockHandle);
+        return v;
     }
 
     /// <summary>Publishes the upstream handshake metadata for the current
@@ -178,9 +271,17 @@ class SseSink {
     /// <summary>以结果标记（"ok" 或 "err: ..."）结束一次尝试。
     /// 会重试的所有者用 <c>Attempt</c> 读取它并自行发布
     /// 最终结果；而普通的单次调用者（文件模式）则
-    /// 在此直接把它写入标记文件。</summary>
+    /// 在此直接把它写入标记文件。重复结束安全且只发布一次。</summary>
     void Finish(string marker) {
+        Mutex.Lock(this.lockHandle);
+        if (this.attempt.Length > 0) {
+            Mutex.Unlock(this.lockHandle);
+            return;
+        }
         if (this.fp != 0) { SseSink.fclose(this.fp); this.fp = 0; }
+        this.attempt = marker;
+        if (this.path != "") { this.done = marker; }
+        Mutex.Unlock(this.lockHandle);
         if (this.donePath != "") {
             nint dp = SseSink.fopen(this.donePath, "ab");
             if (dp != 0) {
@@ -188,10 +289,7 @@ class SseSink {
                 SseSink.fclose(dp);
             }
         }
-        Mutex.Lock(this.lockHandle);
-        this.attempt = marker;
-        if (this.path != "") { this.done = marker; }
-        Mutex.Unlock(this.lockHandle);
+        if (this.ready != null) { this.ready.Signal(); }
     }
 
     /// <summary>最近一次已结束尝试的结果（有尝试在运行时为 ""）。
@@ -246,6 +344,58 @@ class SseSink {
         return s;
     }
 
+    /// <summary>协程版消费：取走目前缓冲的全部内容；没有数据时
+    /// 挂起在事件门上直到 <c>Write</c> 或 <c>Finish</c> 唤醒（事件驱动，
+    /// 无轮询）。同时给出结束标志——true 表示本次尝试已终结
+    /// （成功或失败），返回值是最后一批数据。
+    /// 仅应在协程内调用；跨真实线程的消费者请用 <c>Take</c> 轮询。</summary>
+    async SseDelivery TakeCo() {
+        while (true) {
+            Mutex.Lock(this.lockHandle);
+            bool has = this.parts.Count > 0;
+            bool fin = this.attempt.Length > 0;
+            string s = "";
+            if (has) {
+                s = this.Join(0);
+                this.parts = new List<string>();
+                this.cut = 0;
+            }
+            Mutex.Unlock(this.lockHandle);
+            if (has || fin) {
+                SseDelivery d = new SseDelivery();
+                d.data = s;
+                d.finished = fin;
+                return d;
+            }
+            await this.ready.Wait();
+        }
+    }
+
+    /// <summary>TakeCo 的带超时版本：等待超过 <paramref name="timeoutMs"/>
+    /// 仍无数据且尝试未结束时返回空 data、finished=false。
+    /// 超时返回使消费者能在等待中插入保活或断连检查。</summary>
+    async SseDelivery TakeCo(int timeoutMs) {
+        while (true) {
+            Mutex.Lock(this.lockHandle);
+            bool has = this.parts.Count > 0;
+            bool fin = this.attempt.Length > 0;
+            string s = "";
+            if (has) {
+                s = this.Join(0);
+                this.parts = new List<string>();
+                this.cut = 0;
+            }
+            Mutex.Unlock(this.lockHandle);
+            if (has || fin) {
+                SseDelivery d = new SseDelivery();
+                d.data = s;
+                d.finished = fin;
+                return d;
+            }
+            await this.ready.Wait(timeoutMs);
+        }
+    }
+
     /// <summary>结果标记，流仍在运行时为 ""。
     /// </summary>
     string Done() {
@@ -264,10 +414,14 @@ class SseSink {
         return n;
     }
 
-    /// <summary>释放锁句柄。此后再使用该 sink 即非法。
-    /// </summary>
+    /// <summary>释放锁句柄与事件门引用。门本身不 Close：TakeCo 超时
+    /// 路径留下的看门狗协程在到点后仍会 zan_gate_signal 这个句柄，
+    /// 提前 free 存储就是段错误。与连接池（PoolCore）同一策略——
+    /// 门的存活期与对象一致，不提前销毁；ARC 会随 sink 一起回收它。
+    /// 此后再使用该 sink 即非法。</summary>
     void Dispose() {
         if (this.fp != 0) { SseSink.fclose(this.fp); this.fp = 0; }
+        this.ready = null;
         Mutex.Destroy(this.lockHandle);
     }
 }

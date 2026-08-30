@@ -3,6 +3,7 @@ using System.IO;
 using System.Net.Sockets;
 using System.Net.Http;
 using System.Net.Tls;
+using System.Net.External;
 using System.Threading;
 
 namespace System.Net.Http.Client;
@@ -74,6 +75,8 @@ class HttpClient {
     HttpCancelFn cancelProbe;
     // 上传进度探针；null = 不报进度（见 SetUploadProbe）。
     HttpUploadProgressFn uploadProbe;
+    // 共享外部调用预算；null 使用兼容的客户端 timeout 行为。
+    ExternalCallPolicy callPolicy;
     string lastDownloadError;
     // ---- keep-alive 连接复用（见 RequestAliveAsync）----
     HttpFramer ka;        // 非空 = 池中有一条空闲可复用的连接
@@ -118,6 +121,7 @@ class HttpClient {
         this.certPolicy = null;
         this.jar = null;
         this.cancelProbe = null;
+        this.callPolicy = null;
         this.lastDownloadError = "";
         this.ka = null;
         this.kaConn = null;
@@ -291,6 +295,41 @@ class HttpClient {
         return this;
     }
 
+    /// <summary>绑定统一外部调用预算。连接/读写仍复用现有 HTTP
+    /// 实现；请求/响应大小和重试能力由调用方按 policy 显式声明。</summary>
+    HttpClient SetCallPolicy(ExternalCallPolicy policy) {
+        this.callPolicy = policy;
+        if (policy != null) {
+            this.timeout = policy.TotalTimeoutMs();
+        }
+        return this;
+    }
+
+    /// <summary>当前外部调用预算；未绑定时返回 null。</summary>
+    ExternalCallPolicy CallPolicy() {
+        return this.callPolicy;
+    }
+
+    // 未绑定 policy 时保留历史请求行为；绑定 policy 后，正文在
+    // 建连前按统一 max request bytes 拒绝，避免副作用请求已经上线。
+    void CheckRequestLimit(int bodyBytes) {
+        if (this.callPolicy == null) { return; }
+        int limit = this.callPolicy.MaxRequestBytes();
+        if (limit > 0 && bodyBytes > limit) {
+            throw new HttpRequestException(
+                "request body exceeds " + Convert.ToString(limit) + " bytes");
+        }
+    }
+
+    // HttpFramer 的响应正文上限：无 policy 时沿用此前的 64 MiB，
+    // 有 policy 时由调用方显式预算覆盖。
+    int ResponseLimit() {
+        if (this.callPolicy == null) { return 67108864; }
+        int limit = this.callPolicy.MaxResponseBytes();
+        if (limit > 0) { return limit; }
+        return 67108864;
+    }
+
     /// <summary>关闭复用的 keep-alive 连接（若在）。客户端仍可继续
     /// 使用：下一次请求会重新建立连接。进程退出前或长寿命客户端
     /// 空闲时调用，避免悬挂的半开连接。</summary>
@@ -448,6 +487,7 @@ class HttpClient {
     /// 请求）；已有请求在途时，并发调用退回一次性 Connection: close
     /// 通道，各自读到对端关闭为止。</summary>
     async string RequestAsync(string method, string path, string body) {
+        this.CheckRequestLimit(body.Length);
         if (this.kaEnabled && !this.kaBusy) {
             string alive = await this.RequestAliveAsync(method, path, body);
             return alive;
@@ -473,6 +513,8 @@ class HttpClient {
         // 释放存活的局部变量——包括循环作用域内的
         // （见 docs/bugs/throw-leaks-live-locals.md）。
         StringBuilder respSb = new StringBuilder();
+        int responseBytes = 0;
+        int responseLimit = this.ResponseLimit();
         bool reading = true;
         string chunk = "";
         while (reading) {
@@ -480,7 +522,18 @@ class HttpClient {
             if (chunk.Length == 0) {
                 reading = false;
             } else {
+                if (responseBytes > responseLimit - chunk.Length) {
+                    chunk = "";
+                    respSb = null;
+                    HttpDeadline.Disarm(watch);
+                    conn.Close();
+                    conn = null;
+                    throw new HttpRequestException(
+                        "response exceeds " + Convert.ToString(responseLimit)
+                        + " bytes");
+                }
                 respSb.Append(chunk);
+                responseBytes = responseBytes + chunk.Length;
             }
         }
         chunk = "";
@@ -554,6 +607,8 @@ class HttpClient {
         int _sent = await stream.SendAsync(requestData, requestData.Length);
 
         StringBuilder respSb = new StringBuilder();
+        int responseBytes = 0;
+        int responseLimit = this.ResponseLimit();
         bool reading = true;
         string chunk = "";
         while (reading) {
@@ -561,7 +616,19 @@ class HttpClient {
             if (chunk.Length == 0) {
                 reading = false;
             } else {
+                if (responseBytes > responseLimit - chunk.Length) {
+                    chunk = "";
+                    respSb = null;
+                    HttpDeadline.Disarm(watch);
+                    stream.Close();
+                    conn.Close();
+                    ctx.Free();
+                    throw new HttpRequestException(
+                        "response exceeds " + Convert.ToString(responseLimit)
+                        + " bytes");
+                }
                 respSb.Append(chunk);
+                responseBytes = responseBytes + chunk.Length;
             }
         }
         chunk = "";
@@ -668,7 +735,7 @@ class HttpClient {
                 this.ka.Consume(he);
                 keep = !serverClose;
             } else if (hp.chunked || HttpClient.HeadHasContentLength(head)) {
-                int st = await this.ka.ReadBody(hp, 67108864);
+                int st = await this.ka.ReadBody(hp, this.ResponseLimit());
                 if (st == 0) {
                     bodyOut = hp.body;
                     this.ka.Consume(this.ka.RequestBytes());
@@ -694,7 +761,8 @@ class HttpClient {
                     this.DropAlive();
                     req = "";
                     throw new HttpRequestException(
-                        "response body exceeds 67108864 bytes");
+                        "response body exceeds " + Convert.ToString(
+                            this.ResponseLimit()) + " bytes");
                 } else {
                     HttpDeadline.Disarm(watch);
                     this.DropAlive();
@@ -706,13 +774,34 @@ class HttpClient {
                 // 没有 Content-Length 也没有分块：EOF 定界——读到对端
                 // 关闭为止，这样的连接不再复用。
                 StringBuilder rest = new StringBuilder();
+                int limit = this.ResponseLimit();
+                int bodyCount = this.ka.Pending() - he;
+                if (bodyCount > limit) {
+                    HttpDeadline.Disarm(watch);
+                    this.DropAlive();
+                    req = "";
+                    throw new HttpRequestException(
+                        "response body exceeds " + Convert.ToString(limit)
+                        + " bytes");
+                }
+                if (bodyCount > 0) {
+                    rest.Append(this.ka.Slice(he, bodyCount));
+                }
                 int pend = this.ka.Pending();
-                rest.Append(this.ka.Slice(he, pend - he));
                 this.ka.Consume(pend);
                 while (!this.ka.Closed()) {
                     int n = await this.ka.Fill();
                     if (n > 0) {
+                        if (bodyCount > limit - n) {
+                            this.DropAlive();
+                            req = "";
+                            HttpDeadline.Disarm(watch);
+                            throw new HttpRequestException(
+                                "response body exceeds " + Convert.ToString(limit)
+                                + " bytes");
+                        }
                         rest.Append(this.ka.Slice(0, n));
+                        bodyCount = bodyCount + n;
                         this.ka.Consume(n);
                     }
                 }
@@ -823,6 +912,7 @@ class HttpClient {
     /// <see cref="HttpResponse.BodyLength"/> 据此工作。适合图片、
     /// 字体等二进制资源的下载与上传；文本响应照常可用 body 读取。</summary>
     async HttpResponse SendBytesAsync(string method, string path, string body) {
+        this.CheckRequestLimit(body.Length);
         if (this.useTls) {
             HttpResponse tResp = await this.SendBytesTlsAsync(method, path,
                                                               body);
@@ -874,7 +964,7 @@ class HttpClient {
             || method == "HEAD";
         if (!noBody) {
             if (hp.chunked || HttpClient.HeadHasContentLength(head)) {
-                int st = await fr.ReadBody(hp, 67108864);
+                int st = await fr.ReadBody(hp, this.ResponseLimit());
                 if (st == -1) {
                     bool lateBody = HttpDeadline.Expired(watch);
                     HttpDeadline.Disarm(watch);
@@ -887,7 +977,8 @@ class HttpClient {
                     HttpDeadline.Disarm(watch);
                     this.CloseChannel(conn, fr, stream, ctx);
                     throw new HttpRequestException(
-                        "response body exceeds 67108864 bytes");
+                        "response body exceeds " + Convert.ToString(
+                            this.ResponseLimit()) + " bytes");
                 }
                 if (st != 0) {
                     HttpDeadline.Disarm(watch);
@@ -911,14 +1002,32 @@ class HttpClient {
                 // 没有 Content-Length 也没有分块：EOF 定界，读到对端
                 // 关闭为止，按字节累积。
                 ByteBuffer acc = ByteBuffer.Alloc(8192);
+                int limit = this.ResponseLimit();
                 int pend = fr.Pending();
-                if (pend > he) {
-                    acc.WriteRaw(fr.Slice(he, pend - he), pend - he);
+                int initial = pend - he;
+                if (initial > limit) {
+                    acc.Free();
+                    HttpDeadline.Disarm(watch);
+                    this.CloseChannel(conn, fr, stream, ctx);
+                    throw new HttpRequestException(
+                        "response body exceeds " + Convert.ToString(limit)
+                        + " bytes");
+                }
+                if (initial > 0) {
+                    acc.WriteRaw(fr.Slice(he, initial), initial);
                 }
                 fr.Consume(pend);
                 while (!fr.Closed()) {
                     int nb = await fr.Fill();
                     if (nb > 0) {
+                        if (acc.Length() > limit - nb) {
+                            acc.Free();
+                            HttpDeadline.Disarm(watch);
+                            this.CloseChannel(conn, fr, stream, ctx);
+                            throw new HttpRequestException(
+                                "response body exceeds " + Convert.ToString(limit)
+                                + " bytes");
+                        }
                         acc.WriteRaw(fr.Slice(0, nb), nb);
                         fr.Consume(nb);
                     }
@@ -1012,6 +1121,7 @@ class HttpClient {
     async HttpResponse SendBytesBodyAsync(string method, string path,
             string head, string localPath, int fileLen, string tail,
             int total) {
+        this.CheckRequestLimit(total);
         TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
                                                      this.timeout);
         if (conn == null) { FailConnect(); }
@@ -1047,6 +1157,7 @@ class HttpClient {
     async HttpResponse SendBytesBodyTlsAsync(string method, string path,
             string head, string localPath, int fileLen, string tail,
             int total) {
+        this.CheckRequestLimit(total);
         Socket.Initialize();
         TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
                                                      this.timeout);
@@ -1299,6 +1410,12 @@ class HttpClient {
     /// </summary>
     async int PostSseToSinkAsync(string path, string body, SseSink sink) {
         sink.Begin();
+        if (this.callPolicy != null
+            && body.Length > this.callPolicy.MaxRequestBytes()) {
+            sink.Finish("err: request body exceeds " + Convert.ToString(
+                this.callPolicy.MaxRequestBytes()) + " bytes");
+            return 0;
+        }
         Socket.Initialize();
         TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port, this.timeout);
         if (conn == null) {
@@ -1393,9 +1510,16 @@ class HttpClient {
         // 补全且调用方还会重试。本客户端有意不自动跟随重定向——
         // 跨源跳转携带 Authorization 是更大的错误。
         bool failed = status < 200 || status >= 300;
+        int streamLimit = 0;
+        if (!failed && this.callPolicy != null) {
+            streamLimit = this.callPolicy.MaxStreamBytes();
+            if (streamLimit > 0) { sink.SetMaxBytes(streamLimit); }
+        }
         string errBody = "";
         int got = 0;
         bool finished = false;
+        bool cancelled = false;
+        bool streamOverflow = false;
         // 当对端宣告结束时流才算完成：[DONE] 哨兵、
         // 终止的空 chunk、已完整收到的 Content-Length、
         // 或（如下所述）在 SSE 事件边界结束。若读取到 0 字节
@@ -1404,7 +1528,21 @@ class HttpClient {
         bool cleanEnd = false;
         string doneScan = "";
         bool sawDone = false;
+        if (!failed && streamLimit > 0 && bodyLen > streamLimit) {
+            streamOverflow = true;
+            finished = true;
+            sink.Overflow();
+        }
         while (!finished) {
+            // 消费者已不需要这份数据（下游客户端断开、请求被放弃）：
+            // 立即拆掉上游连接收工，不再为没人看的答案继续烧 token。
+            // 块边界外随时可退：sink 里已写入的字节保持原样。
+            if (this.CancelRequested()) {
+                finished = true;
+                cancelled = true;
+                cleanEnd = false;
+                break;
+            }
             if (chunked) {
                 bool progressed = true;
                 while (progressed) {
@@ -1422,13 +1560,23 @@ class HttpClient {
                             finished = true;
                             cleanEnd = true;
                             progressed = false;
+                        } else if (!failed && streamLimit > 0
+                                   && got > streamLimit - size) {
+                            streamOverflow = true;
+                            finished = true;
+                            sink.Overflow();
+                            progressed = false;
                         } else {
                             int need = crlf + 2 + size + 2;
                             if (pending.Length >= need) {
                                 string piece = pending.Substring(crlf + 2, size);
                                 got = got + piece.Length;
-                                if (failed) { errBody = HttpClient.KeepHead(errBody, piece); }
-                                else { sink.Write(piece); }
+                                if (failed) {
+                                    errBody = HttpClient.KeepHead(errBody, piece);
+                                } else if (!sink.TryWrite(piece)) {
+                                    streamOverflow = true;
+                                    finished = true;
+                                }
                                 doneScan = doneScan + piece;
                                 if (doneScan.Length > 64) {
                                     doneScan = doneScan.Substring(doneScan.Length - 64, 64);
@@ -1444,10 +1592,21 @@ class HttpClient {
                 }
             } else {
                 if (pending.Length > 0) {
-                    got = got + pending.Length;
-                    if (failed) { errBody = HttpClient.KeepHead(errBody, pending); }
-                    else { sink.Write(pending); }
-                    doneScan = doneScan + pending;
+                    if (!failed && streamLimit > 0
+                        && got > streamLimit - pending.Length) {
+                        streamOverflow = true;
+                        finished = true;
+                        sink.Overflow();
+                    } else {
+                        got = got + pending.Length;
+                        if (failed) {
+                            errBody = HttpClient.KeepHead(errBody, pending);
+                        } else if (!sink.TryWrite(pending)) {
+                            streamOverflow = true;
+                            finished = true;
+                        }
+                        doneScan = doneScan + pending;
+                    }
                     if (doneScan.Length > 64) {
                         doneScan = doneScan.Substring(doneScan.Length - 64, 64);
                     }
@@ -1463,22 +1622,37 @@ class HttpClient {
                 if (bodyLen > 0 && got >= bodyLen) { finished = true; cleanEnd = true; }
             }
             if (sawDone) { finished = true; cleanEnd = true; }
-            if (finished) {
-                // 已到达终止 chunk
-            } else {
-                string c;
-                if (this.useTls) { c = await stream.RecvAsync(65536); }
-                else { c = await conn.RecvAsync(65536); }
-                if (c.Length == 0) { finished = true; }
-                else {
-                    pending = pending + c;
-                    // 有数据到达：重启空闲窗口，这样健康
-                    // 的长连接流绝不会在传输中途被切断。
-                    if (!HttpDeadline.Expired(watch)) {
-                        HttpDeadline.Touch(watch, this.timeout);
+                if (finished) {
+                    // 已到达终止 chunk
+                } else {
+                    string c;
+                    if (this.useTls) { c = await stream.RecvAsync(65536); }
+                    else { c = await conn.RecvAsync(65536); }
+                    if (c.Length == 0) { finished = true; }
+                    else {
+                        int pendingLimit = streamLimit;
+                        if (failed && this.callPolicy != null) {
+                            pendingLimit = this.callPolicy.MaxErrorBytes();
+                        }
+                        if (pendingLimit > 0
+                            && pending.Length > pendingLimit - c.Length) {
+                            if (failed) {
+                                errBody = HttpClient.KeepHead(errBody, pending);
+                            } else {
+                                streamOverflow = true;
+                                sink.Overflow();
+                            }
+                            finished = true;
+                        } else {
+                            pending = pending + c;
+                            // 有数据到达：重启空闲窗口，这样健康
+                            // 的长连接流绝不会在传输中途被切断。
+                            if (!HttpDeadline.Expired(watch)) {
+                                HttpDeadline.Touch(watch, this.timeout);
+                            }
+                        }
                     }
                 }
-            }
         }
         bool late = HttpDeadline.Expired(watch);
         HttpDeadline.Disarm(watch);
@@ -1504,12 +1678,18 @@ class HttpClient {
         // 把它报告成传输问题（"connection closed"）既掩盖了
         // 服务商的信息，又让调用者重试一个注定
         // 再次失败的请求。
-        if (status < 200 || status >= 300) {
+        if (streamOverflow) {
+            sink.Finish("err: stream limit exceeded");
+        } else if (status < 200 || status >= 300) {
             sink.SetResponse(status, sink.ResponseHeaders(), errBody);
             string detail = HttpClient.OneLine(errBody);
             string marker = "err: HTTP " + Convert.ToString(status);
             if (detail != "") { marker = marker + ": " + detail; }
             sink.Finish(marker);
+        } else if (cancelled) {
+            // 消费者主动放弃（客户端断开）：既非上游失败也非超时，
+            // 调用方不应据此重试或轮换 key。
+            sink.Finish("err: cancelled");
         } else if (late) {
             sink.Finish("err: timeout");
         } else if (status == 0) {
@@ -1645,6 +1825,15 @@ class HttpClient {
     /// <see cref="UploadFileBytesAsync"/>。</summary>
     async HttpResponse UploadFileAsync(string path, string field,
             string localPath, string fileName) {
+        int fileLen = File.GetSize(localPath);
+        if (fileLen < 0) {
+            throw new FileNotFoundException("Could not open file: "
+                + localPath);
+        }
+        if (this.callPolicy != null
+            && fileLen > this.callPolicy.MaxRequestBytes()) {
+            this.CheckRequestLimit(fileLen);
+        }
         string fileData = File.ReadAllText(localPath);
         string boundary = "----ZanFormBoundary"
             + Convert.ToString(fileData.Length) + "z" + Convert.ToString(field.Length);

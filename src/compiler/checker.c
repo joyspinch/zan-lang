@@ -2134,7 +2134,12 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     case AST_NEW_EXPR: {
         no_runtime_reject(c, expr->loc, "allocation (`new`)");
         zan_type_t *type;
-        if (!expr->new_expr.type) {
+        if (expr->new_expr.call_init) {
+            /* `FactoryCall(...) { Members = { ... } }`: the type is whatever
+             * the call yields; the member-writes are validated against it
+             * below via the shared initializer loop (args is empty here). */
+            type = zan_checker_check_expr(c, expr->new_expr.call_init);
+        } else if (!expr->new_expr.type) {
             /* Anonymous object literal `new { a.x, b.y }`. Only meaningful as
              * a dbgen query projection (GroupBy / ToList / ToAggregate); the
              * checker validates the members and returns a placeholder type. */

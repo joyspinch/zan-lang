@@ -4031,8 +4031,26 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                         }
                         LLVMTypeRef st = get_struct_llvm_type(g, type_sym);
                         if (st) {
-                            /* load struct pointer or value, then GEP to field */
+                            /* load struct pointer or value, then GEP to field.
+                             * A null class local would fault on the GEP, so
+                             * the receiver gets the guard + scratch select. */
                             LLVMValueRef struct_ptr = struct_base_ptr(g, local, st);
+                            if (local->type->kind == TYPE_CLASS &&
+                                LLVMGetTypeKind(LLVMTypeOf(struct_ptr)) == LLVMPointerTypeKind) {
+                                LLVMValueRef isnull = zan_icmp(g->builder,
+                                    LLVMIntEQ, struct_ptr,
+                                    LLVMConstNull(LLVMTypeOf(struct_ptr)),
+                                    "recv.null");
+                                char recv_msg[256];
+                                snprintf(recv_msg, sizeof(recv_msg),
+                                    "null reference: receiver '%.*s' is null",
+                                    (int)expr->member.object->ident.name.len,
+                                    expr->member.object->ident.name.str);
+                                emit_runtime_check(g, isnull,
+                                    expr->member.object->loc, recv_msg);
+                                struct_ptr = emit_soft_base_select(g, struct_ptr,
+                                    isnull, expr->member.object->loc);
+                            }
                             LLVMValueRef field_ptr = emit_field_ptr(g, type_sym, st, struct_ptr, fi, "fld");
                             zan_symbol_t *fsym = get_field_sym(type_sym, expr->member.name);
                             /* A `T` field of Box<Vec> holds a Vec, not a
@@ -5585,6 +5603,113 @@ static LLVMValueRef emit_expr_tuple(zan_irgen_t *g, zan_ast_node_t *expr,
 
 static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
+        /* `FactoryCall(...) { Members = {...} }`: the braces continue a call
+         * (e.g. a GUI static factory), so lower the call first, then apply
+         * the member-writes to the returned object and hand it back. The
+         * whole thing is a call result: owned (+1) for rc-managed returns,
+         * which the consumers' expr_yields_owned_rc_value already reports. */
+        if (!expr->new_expr.type && expr->new_expr.call_init) {
+            LLVMValueRef obj = emit_expr(g, expr->new_expr.call_init, locals);
+            zan_type_t *otype = infer_expr_type(g, expr->new_expr.call_init,
+                                                locals);
+            if (!otype || !otype->sym ||
+                (otype->sym->kind != SYM_CLASS &&
+                 otype->sym->kind != SYM_STRUCT)) {
+                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    "object initializer can only continue a call that "
+                    "returns a class instance");
+                return obj;
+            }
+            zan_symbol_t *sym = otype->sym;
+            LLVMTypeRef st = get_struct_llvm_type(g, sym);
+            if (!st) return obj;
+            for (int i = 0; i < expr->new_expr.arg_inits.count; i++) {
+                zan_ast_node_t *arg = expr->new_expr.arg_inits.items[i];
+                if (arg->kind != AST_COLL_INIT && arg->kind != AST_ASSIGNMENT)
+                    continue;
+                zan_istr_t mname = (arg->kind == AST_COLL_INIT)
+                    ? arg->coll_init.name
+                    : arg->binary.left->ident.name;
+                zan_symbol_t *msym = get_field_sym(sym, mname);
+                if (!msym) continue;
+                if (arg->kind == AST_COLL_INIT) {
+                    int getter_owned = 0;
+                    zan_ast_node_t *recv = zan_ast_new(g->arena,
+                        AST_IDENTIFIER, arg->loc);
+                    recv->ident.name = mname;
+                    LLVMTypeRef coll_lt = map_type(g, msym->type);
+                    LLVMValueRef cslot = emit_entry_alloca(g, coll_lt,
+                                                           "cinit.slot");
+                    zan_store_fit(g, LLVMConstNull(coll_lt), cslot);
+                    zan_symbol_t *getter = property_getter_sym(g, msym);
+                    if (getter) {
+                        LLVMValueRef v = emit_property_getter_call(g, getter,
+                            otype, obj, arg, locals);
+                        zan_store_fit(g, v, cslot);
+                        getter_owned = 1;
+                    } else {
+                        int cfi = get_field_index(sym, mname);
+                        if (cfi < 0) continue;
+                        LLVMValueRef cptr = emit_field_ptr(g, sym, st, obj,
+                                                           cfi, "cinit.ptr");
+                        zan_store_fit(g, LLVMBuildLoad2(g->builder, coll_lt,
+                            cptr, "cinit.load"), cslot);
+                    }
+                    local_add(locals, mname, cslot, msym->type);
+                    for (int k = 0; k < arg->coll_init.items.count; k++) {
+                        zan_ast_node_t *item = arg->coll_init.items.items[k];
+                        zan_ast_node_t *madd = zan_ast_new(g->arena,
+                            AST_MEMBER_ACCESS, item->loc);
+                        madd->member.object = recv;
+                        madd->member.name = (zan_istr_t){"Add", 3};
+                        madd->member.null_cond = 0;
+                        zan_ast_node_t *addcall = zan_ast_new(g->arena,
+                            AST_CALL, item->loc);
+                        addcall->call.callee = madd;
+                        zan_ast_list_init(&addcall->call.args);
+                        zan_ast_list_init(&addcall->call.type_args);
+                        zan_ast_list_push(&addcall->call.args, item, g->arena);
+                        if (msym->type && type_named(msym->type, "Dict", 4) &&
+                            k + 1 < arg->coll_init.items.count) {
+                            zan_ast_list_push(&addcall->call.args,
+                                arg->coll_init.items.items[++k], g->arena);
+                        }
+                        emit_expr(g, addcall, locals);
+                    }
+                    for (int lv = locals->count - 1; lv >= 0; lv--) {
+                        if (locals->vars[lv].name.len == mname.len &&
+                            memcmp(locals->vars[lv].name.str, mname.str,
+                                   (size_t)mname.len) == 0) {
+                            for (int sh = lv; sh < locals->count - 1; sh++)
+                                locals->vars[sh] = locals->vars[sh + 1];
+                            locals->count--;
+                            break;
+                        }
+                    }
+                    if (getter_owned) {
+                        LLVMValueRef cv = LLVMBuildLoad2(g->builder, coll_lt,
+                            cslot, "cinit.done");
+                        emit_rc_release_for_type(g, msym->type, cv);
+                    }
+                    continue;
+                }
+                /* plain field/property write: go through a synthetic
+                 * `obj.Member = value` assignment so setters, ARC rules and
+                 * bindings come from the ordinary assignment lowering. */
+                zan_ast_node_t *mref = zan_ast_new(g->arena,
+                    AST_MEMBER_ACCESS, arg->loc);
+                mref->member.object = expr->new_expr.call_init;
+                mref->member.name = mname;
+                mref->member.null_cond = 0;
+                zan_ast_node_t *setn = zan_ast_new(g->arena,
+                    AST_ASSIGNMENT, arg->loc);
+                setn->binary.op = TK_EQ;
+                setn->binary.left = mref;
+                setn->binary.right = arg->binary.right;
+                emit_expr(g, setn, locals);
+            }
+            return obj;
+        }
         /* Anonymous object literal `new { ... }` must have been consumed by
          * the dbgen query pass; anything that survives to codegen is an error
          * (it has no real runtime type). */

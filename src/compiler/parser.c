@@ -1370,10 +1370,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             expr = n;
             continue;
         }
-        }
 
-        for (;;) {
-            zan_loc_t loc = p->current.loc;
         if (parser_check(p, TK_DOT) || parser_check(p, TK_QUESTION_DOT)) {
             int null_cond = parser_check(p, TK_QUESTION_DOT);
             parser_advance(p);
@@ -1523,7 +1520,6 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
         } else {
             break;
         }
-    }
     }
 
     return expr;

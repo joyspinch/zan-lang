@@ -20,6 +20,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
 static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
                                zan_loc_t loc, const char *msg);
+static LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base,
+                                          LLVMValueRef isnull, zan_loc_t loc);
 /* Emit a lambda literal, typing its parameters/return from `expected` (the
  * target delegate type) when the lambda omits annotations. Without this the
  * params default to `int`, so a class-typed parameter cannot resolve fields.
@@ -2145,6 +2147,10 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
             if (at && at->kind == TYPE_ARRAY) return at;
             return NULL;
         }
+        /* `FactoryCall(...) { Members = {...} }`: the value's type is the
+         * call's result type, not the (absent) type node. */
+        if (!e->new_expr.type && e->new_expr.call_init)
+            return infer_expr_type(g, e->new_expr.call_init, locals);
         return resolve_type_ctx(g, e->new_expr.type);
     case AST_COLL_INIT:
         /* member collection initializer: its value is the collection member it
@@ -2306,6 +2312,32 @@ static zan_symbol_t *weak_field_read_sym(zan_irgen_t *g, zan_ast_node_t *e,
 static void emit_weak_read_guard(zan_irgen_t *g, zan_ast_node_t *read_expr,
                                  LLVMValueRef value, zan_loc_t loc,
                                  local_scope_t *locals) {
+    /* A null class-typed receiver faults on the very first field/member load
+     * (addr=0x0 / 0x...fffe with no source location in a stripped release
+     * binary), so every member access guards its object the same way. The
+     * message names the receiver only when it is a plain identifier, which
+     * keeps the common `w.tag` case readable without extra emit machinery.
+     * Null-conditional access (`?.`) is excluded by the caller. */
+    zan_type_t *rt = infer_expr_type(g, read_expr, locals);
+    bool reflike = rt && (rt->kind == TYPE_OBJECT || rt->kind == TYPE_CLASS ||
+                          rt->kind == TYPE_INTERFACE ||
+                          rt->kind == TYPE_TYPE_PARAM ||
+                          rt->kind == TYPE_ERROR);
+    if (reflike && value &&
+        LLVMGetTypeKind(LLVMTypeOf(value)) == LLVMPointerTypeKind) {
+        LLVMValueRef is_null = zan_icmp(g->builder, LLVMIntEQ, value,
+                                        LLVMConstNull(LLVMTypeOf(value)),
+                                        "recv.null");
+        char msg[256];
+        if (read_expr && read_expr->kind == AST_IDENTIFIER)
+            snprintf(msg, sizeof(msg),
+                     "null reference: receiver '%.*s' is null",
+                     (int)read_expr->ident.name.len, read_expr->ident.name.str);
+        else
+            snprintf(msg, sizeof(msg),
+                     "null reference where an object is required (member access)");
+        emit_runtime_check(g, is_null, loc, msg);
+    }
     zan_symbol_t *field = weak_field_read_sym(g, read_expr, locals);
     if (!field || !value ||
         LLVMGetTypeKind(LLVMTypeOf(value)) != LLVMPointerTypeKind)
@@ -2322,7 +2354,10 @@ static void emit_weak_read_guard(zan_irgen_t *g, zan_ast_node_t *read_expr,
 
 /* Emit a member receiver once and guard it when the receiver expression is a
  * weak field read.  Null-conditional access owns its own null test and must
- * not receive a second fatal guard. */
+ * not receive a second fatal guard. On the soft path the returned value is
+ * the scratch substitute when the receiver is null, so the field load that
+ * follows reads a zeroed object instead of faulting (hard mode exits inside
+ * the report). */
 static LLVMValueRef emit_guarded_member_object(zan_irgen_t *g,
                                                zan_ast_node_t *member,
                                                local_scope_t *locals) {
@@ -2330,6 +2365,21 @@ static LLVMValueRef emit_guarded_member_object(zan_irgen_t *g,
     if (member && !member->member.null_cond)
         emit_weak_read_guard(g, member->member.object, value,
                              member->member.object->loc, locals);
+    if (member && value &&
+        LLVMGetTypeKind(LLVMTypeOf(value)) == LLVMPointerTypeKind) {
+        zan_type_t *rt = infer_expr_type(g, member->member.object, locals);
+        bool reflike = rt && (rt->kind == TYPE_OBJECT || rt->kind == TYPE_CLASS ||
+                              rt->kind == TYPE_INTERFACE ||
+                              rt->kind == TYPE_TYPE_PARAM ||
+                              rt->kind == TYPE_ERROR);
+        if (reflike && !member->member.null_cond) {
+            LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, value,
+                                           LLVMConstNull(LLVMTypeOf(value)),
+                                           "recv.null");
+            value = emit_soft_base_select(g, value, isnull,
+                                          member->member.object->loc);
+        }
+    }
     return value;
 }
 

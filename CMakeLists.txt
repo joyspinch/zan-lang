@@ -1038,6 +1038,26 @@ add_test(NAME policy_external_target
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(policy_external_target PROPERTIES TIMEOUT 120)
 
+add_test(NAME policy_http_client
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/http_client_policy.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/http_client_policy.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/policy_http_client${_exe_ext}
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(policy_http_client PROPERTIES TIMEOUT 120)
+
+add_test(NAME policy_sse_sink
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/sse_sink_policy.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/sse_sink_policy.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/policy_sse_sink${_exe_ext}
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(policy_sse_sink PROPERTIES TIMEOUT 120)
+
 
 # The RA2 format tests were moved out of stdlib into
 # examples/game/ra2/stdlib_rts; they need its Formats sources on the command

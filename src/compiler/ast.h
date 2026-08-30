@@ -220,7 +220,17 @@ struct zan_ast_node {
         /* new expression */
         struct {
             zan_ast_node_t *type;
+            /* `FactoryCall(...) { Members = { ... } }`: the callee the
+             * initializer continues. NULL for `new Type(...) { ... }`,
+             * which builds from `type`. */
+            zan_ast_node_t *call_init;
             zan_ast_list_t args;
+            /* Member-writes of an object initializer on a postfix generic
+             * type reference (`List<int> { ... }`): the checker/irgen merge
+             * these with the constructor args of the same NEW_EXPR. Empty
+             * for every other form, which stores its initializer entries
+             * directly in args. */
+            zan_ast_list_t arg_inits;
             bool is_array;       /* new Type[size] */
             bool array_init;     /* new Type[] { a, b } -- args are elements */
             int array_rank;      /* number of dimension sizes at args start
