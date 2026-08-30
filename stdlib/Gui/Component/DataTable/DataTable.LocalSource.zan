@@ -1,0 +1,105 @@
+using System;
+
+namespace Gui.Component.DataTable;
+
+/// 本地内存查询源。源保存自己的行快照，按 QueryViewport 同步交付一页，
+/// 不把当前页位置暴露为业务身份；无自定义键时使用带 temporary 标记的 legacy key。
+class LocalDataSource : QueryDataSource {
+    List<DataRow> rows;
+    RowKeyProvider keyProvider;
+
+    LocalDataSource(List<DataRow> values) {
+        this.Setup();
+        this.rows = new List<DataRow>();
+        this.keyProvider = null;
+        this.ReplaceRows(values);
+    }
+
+    void ReplaceRows(List<DataRow> values) {
+        this.rows = new List<DataRow>();
+        if (values != null) {
+            for (int i = 0; i < values.Count; i = i + 1) {
+                if (values[i] == null) { this.rows.Add(new DataRow()); }
+                else { this.rows.Add(values[i].Copy()); }
+            }
+        }
+        this.Refresh();
+    }
+
+    void SetKeyProvider(RowKeyProvider provider) {
+        this.keyProvider = provider;
+        this.Refresh();
+    }
+
+    List<DataRow> Snapshot() {
+        List<DataRow> result = new List<DataRow>();
+        for (int i = 0; i < this.rows.Count; i = i + 1) {
+            result.Add(this.rows[i].Copy());
+        }
+        return result;
+    }
+
+    override int RowCount() {
+        QueryResult current = this.CurrentResult();
+        if (current != null && current.TotalKnown()) { return current.Total(); }
+        return this.rows.Count;
+    }
+
+    override bool CellReady(int row, int col) {
+        return row >= 0 && row < this.rows.Count;
+    }
+
+    override RowKey GetRowKey(int row) {
+        if (row < 0 || row >= this.rows.Count) { return null; }
+        if (this.keyProvider != null) { return this.keyProvider.Key(this, row); }
+        return RowKey.Legacy(row);
+    }
+
+    override string CellText(int row, int col) {
+        if (row < 0 || row >= this.rows.Count) { return ""; }
+        return this.rows[row].At(col);
+    }
+
+    override void SetCell(int row, int col, string value) {
+        if (row < 0 || row >= this.rows.Count) { return; }
+        this.rows[row].Set(col, value);
+        this.Refresh();
+    }
+
+    override bool CanInsert() { return true; }
+
+    override bool InsertRow(int at) {
+        if (at < 0 || at > this.rows.Count) { return false; }
+        this.rows.Insert(at, new DataRow());
+        this.Refresh();
+        return true;
+    }
+
+    override bool RemoveRow(int at) {
+        if (at < 0 || at >= this.rows.Count) { return false; }
+        this.rows.RemoveAt(at);
+        this.Refresh();
+        return true;
+    }
+
+    override QueryResult Execute(QueryDescriptor query,
+                                  QueryViewport viewport,
+                                  QueryRequestToken token) {
+        if (token == null || viewport == null) { return null; }
+        int start = viewport.Start();
+        int requested = viewport.Count();
+        List<QueryRow> resultRows = new List<QueryRow>();
+        int end = start + requested;
+        if (end > this.rows.Count) { end = this.rows.Count; }
+        for (int row = start; row < end; row = row + 1) {
+            RowKey key = this.GetRowKey(row);
+            if (key == null) { key = RowKey.Legacy(row); }
+            resultRows.Add(new QueryRow(key, 0, this.rows[row].Copy()));
+        }
+        bool more = end < this.rows.Count;
+        return new QueryResult(token.RequestId(), token.Generation(),
+            token.QueryText(), token.QueryHash(), token.SchemaVersion(), token.ServerRevision(),
+            start, requested, viewport.Cursor(), resultRows,
+            this.rows.Count, true, more, "", "");
+    }
+}
