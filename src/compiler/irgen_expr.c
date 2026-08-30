@@ -2465,7 +2465,7 @@ binding_lowered:
                             emit_index_bounds_check(g, idx, len, expr->loc, "string");
                         } else {
                             /* No reliable bound: keep null/negative bare faults out. */
-                            emit_string_elem_guard(g, arr_ptr, idx, expr->loc);
+                            idx = emit_string_elem_guard(g, arr_ptr, idx, expr->loc, &arr_ptr);
                         }
                         LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
                         LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i8, arr_ptr, &idx, 1, "eidx");
@@ -2549,7 +2549,7 @@ binding_lowered:
                             emit_index_bounds_check(g, idx, len, expr->loc, "string");
                         } else if (fsym->type && fsym->type->kind == TYPE_STRING) {
                             /* No reliable bound: keep null/negative bare faults out. */
-                            emit_string_elem_guard(g, arr_ptr, idx, expr->loc);
+                            idx = emit_string_elem_guard(g, arr_ptr, idx, expr->loc, &arr_ptr);
                         } else if (fsym->type && fsym->type->kind == TYPE_ARRAY &&
                                    fsym->type->array_rank <= 1) {
                             emit_index_bounds_check(g, idx, zan_array_len(g, arr_ptr),
@@ -2722,7 +2722,7 @@ binding_lowered:
                                 emit_string_buffer_len(g, arr_ptr, expr->loc), expr->loc,
                                 "string");
                         else
-                            emit_string_elem_guard(g, arr_ptr, idx, expr->loc);
+                            idx = emit_string_elem_guard(g, arr_ptr, idx, expr->loc, &arr_ptr);
                         LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i8, arr_ptr, &idx, 1, "eidx");
                         LLVMValueRef val8 = LLVMBuildTrunc(g->builder, right, i8, "byte");
                         zan_store_fit(g, val8, elem_ptr);
@@ -3181,7 +3181,7 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 emit_index_bounds_check(g, idx, str_len, operand->loc, "string");
             } else {
                 /* No reliable bound: keep null/negative from faulting bare. */
-                emit_string_elem_guard(g, arr_ptr, idx, operand->loc);
+                idx = emit_string_elem_guard(g, arr_ptr, idx, operand->loc, &arr_ptr);
             }
             slot_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
                 arr_ptr, &idx, 1, "eidx");
@@ -3865,11 +3865,21 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             }
         }
 
-        /* array.Length: read the element count from the array header. */
+        /* array.Length: read the element count from the array header. A null
+         * array value would fault on the obj-16 GEP before any bounds check
+         * sees it, so the receiver gets the same null guard as members. */
         if (expr->member.name.len == 6 && memcmp(expr->member.name.str, "Length", 6) == 0) {
             zan_type_t *at = infer_expr_type(g, expr->member.object, locals);
             if (at && at->kind == TYPE_ARRAY) {
                 LLVMValueRef arr = emit_guarded_member_object(g, expr, locals);
+                if (LLVMGetTypeKind(LLVMTypeOf(arr)) == LLVMPointerTypeKind) {
+                    LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, arr,
+                        LLVMConstNull(LLVMTypeOf(arr)), "arr.null");
+                    emit_runtime_check(g, isnull, expr->member.object->loc,
+                        "null reference where an array is required (.Length)");
+                    arr = emit_soft_base_select(g, arr, isnull,
+                                                expr->member.object->loc);
+                }
                 return zan_array_len(g, arr);
             }
         }
@@ -4416,7 +4426,7 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
             } else {
                 /* No reliable bound (field/param/extern receiver): still keep
                  * null and negative indexes from faulting bare. */
-                emit_string_elem_guard(g, arr_ptr, idx, expr->loc);
+                idx = emit_string_elem_guard(g, arr_ptr, idx, expr->loc, &arr_ptr);
             }
             if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
                 LLVMGetIntTypeWidth(LLVMTypeOf(idx)) != 64) {
@@ -6152,8 +6162,24 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
 
                     /* object-initializer field writes, after construction */
                     {
-                        for (int i = init_start; i < expr->new_expr.args.count; i++) {
-                            zan_ast_node_t *arg = expr->new_expr.args.items[i];
+                        /* Ordinary initializers trail constructor arguments in
+                         * args; the generic-postfix form stores the same tail
+                         * in arg_inits. Present both shapes as one list so the
+                         * lowering and ARC rules stay identical. */
+                        zan_ast_list_t object_inits;
+                        zan_ast_list_init(&object_inits);
+                        for (int oi = init_start;
+                             oi < expr->new_expr.args.count; oi++) {
+                            zan_ast_list_push(&object_inits,
+                                expr->new_expr.args.items[oi], g->arena);
+                        }
+                        for (int oi = 0;
+                             oi < expr->new_expr.arg_inits.count; oi++) {
+                            zan_ast_list_push(&object_inits,
+                                expr->new_expr.arg_inits.items[oi], g->arena);
+                        }
+                        for (int i = 0; i < object_inits.count; i++) {
+                            zan_ast_node_t *arg = object_inits.items[i];
                             /* `Members = { a, b }`: lower to a synthetic
                              * `<member>.Add(item)` AST per element and run the
                              * ordinary call lowering, so every collection kind

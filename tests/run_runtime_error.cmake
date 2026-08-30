@@ -15,6 +15,9 @@ if(NOT compile_rc EQUAL 0)
   message(FATAL_ERROR "compile failed (rc=${compile_rc})\n${compile_out}${compile_err}")
 endif()
 
+# Runtime-error cases pin the historical fail-fast contract. Production keeps
+# the fail-soft default, so opt this harness into hard mode explicitly.
+set(ENV{ZAN_RT_HARD} "1")
 execute_process(
   COMMAND ${OUT_EXE}
   RESULT_VARIABLE run_rc

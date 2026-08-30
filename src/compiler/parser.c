@@ -1193,6 +1193,40 @@ static bool looks_like_type_args_before_dot(zan_parser_t *p) {
     return ok;
 }
 
+/* Disambiguate `Name<...>{` (object initializer on a constructed generic
+ * type, e.g. `List<int> { 1, 2 }` spelled as a postfix on the type name)
+ * from a `<` comparison: the matching `>` must be followed by `{`. */
+static bool looks_like_type_args_before_brace(zan_parser_t *p) {
+    zan_lexer_t saved_lex = *p->lex;
+    zan_token_t saved_cur = p->current;
+    zan_token_t saved_prev = p->previous;
+    bool ok = false;
+    int depth = 0;
+    while (p->current.kind != TK_EOF) {
+        zan_token_kind_t k = p->current.kind;
+        if (k == TK_LESS) {
+            depth++;
+        } else if (k == TK_GREATER || k == TK_GREATER_GREATER) {
+            depth -= (k == TK_GREATER_GREATER) ? 2 : 1;
+            if (depth <= 0) {
+                ok = (zan_lexer_peek(p->lex).kind == TK_LBRACE);
+                break;
+            }
+        } else if (k == TK_IDENT || k == TK_COMMA || k == TK_DOT ||
+                   k == TK_LBRACKET || k == TK_RBRACKET || k == TK_QUESTION ||
+                   is_type_kw(k)) {
+            /* still plausibly a type-argument list */
+        } else {
+            break;
+        }
+        parser_advance(p);
+    }
+    *p->lex = saved_lex;
+    p->current = saved_cur;
+    p->previous = saved_prev;
+    return ok;
+}
+
 /* `Task.WhenAll(handles)` / `Task.WhenAny(handles)` name the fan-out joins the
  * design docs promise, but the joins themselves are ordinary async standard
  * library code (System.Threading.TaskJoin) rather than compiler intrinsics:
@@ -1214,78 +1248,132 @@ static void desugar_task_join(zan_ast_node_t *member) {
     member->member.object->ident.name = (zan_istr_t){"TaskJoin", 8};
 }
 
-/* postfix: call, member access, index, ++, --, object initializer */
+    /* postfix: call, member access, index, ++, --, object initializer */
 static bool is_case_type_pattern(zan_parser_t *p);
 
 static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
     zan_ast_node_t *expr = parse_primary(p);
 
-    /* object initializer: Identifier { field = val, ... }
-     * Only when preceding expression is a simple identifier or member access */
-    if (parser_check(p, TK_LBRACE) &&
-        (expr->kind == AST_IDENTIFIER || expr->kind == AST_MEMBER_ACCESS)) {
-        zan_loc_t loc = p->current.loc;
-        parser_advance(p); /* { */
-
-        /* re-interpret: the identifier becomes the type in a new-expression */
-        zan_ast_node_t *type = zan_ast_new(p->arena, AST_TYPE_REF, expr->loc);
-        if (expr->kind == AST_IDENTIFIER) {
-            type->type_ref.name = expr->ident.name;
-        } else {
-            type->type_ref.name = expr->member.name;
-        }
-        zan_ast_list_init(&type->type_ref.type_args);
-
-        zan_ast_node_t *n = zan_ast_new(p->arena, AST_NEW_EXPR, loc);
-        n->new_expr.type = type;
-        zan_ast_list_init(&n->new_expr.args);
-
-        /* parse field = value pairs as assignment expressions.
-         * `Name = { a, b }` is a member collection initializer (C#
-         * semantics): it is kept as a dedicated AST_COLL_INIT node so irgen
-         * lowers it to Add(item) per element on that member, instead of
-         * reading the braces as a nested dictionary entry. */
-        while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
-            zan_ast_node_t *field_init;
-            if (parser_check(p, TK_IDENT) &&
-                zan_lexer_peek(p->lex).kind == TK_EQ) {
-                zan_loc_t nloc = p->current.loc;
-                zan_istr_t name = p->current.str_val;
-                parser_advance(p); /* name */
-                parser_advance(p); /* = */
-                if (parser_match(p, TK_LBRACE)) {
-                    field_init = zan_ast_new(p->arena, AST_COLL_INIT, nloc);
-                    field_init->coll_init.name = name;
-                    zan_ast_list_init(&field_init->coll_init.items);
-                    while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
-                        zan_ast_node_t *item = parse_expression(p);
-                        zan_ast_list_push(&field_init->coll_init.items, item,
-                                          p->arena);
-                        if (!parser_match(p, TK_COMMA)) break;
-                    }
-                    parser_expect(p, TK_RBRACE);
-                } else {
-                    field_init = zan_ast_new(p->arena, AST_ASSIGNMENT, nloc);
-                    zan_ast_node_t *lhs =
-                        zan_ast_new(p->arena, AST_IDENTIFIER, nloc);
-                    lhs->ident.name = name;
-                    field_init->binary.op = TK_EQ;
-                    field_init->binary.left = lhs;
-                    field_init->binary.right = parse_expression(p);
-                }
-            } else {
-                field_init = parse_expression(p);
-            }
-            zan_ast_list_push(&n->new_expr.args, field_init, p->arena);
-            if (!parser_match(p, TK_COMMA)) break;
-        }
-        parser_expect(p, TK_RBRACE);
-        expr = n;
-    }
-
     for (;;) {
         zan_loc_t loc = p->current.loc;
 
+        /* object initializer: Identifier { field = val, ... } — only when the
+         * preceding expression is a simple identifier (optionally carrying a
+         * constructed generic instantiation) or a member access. */
+        if (parser_check(p, TK_LBRACE) &&
+            (expr->kind == AST_IDENTIFIER || expr->kind == AST_MEMBER_ACCESS)) {
+            /* object initializer on a constructed generic type
+             * (`List<int> { 1, 2 }`): the instantiation was captured on the
+             * identifier by the `<...>` branch below, so the new-expression's
+             * type IS that instantiation and the braces hold member-writes. */
+            if (expr->kind == AST_IDENTIFIER && expr->inst_type_ref) {
+                zan_ast_node_t *n = zan_ast_new(p->arena, AST_NEW_EXPR, loc);
+                n->new_expr.type = expr->inst_type_ref;
+                zan_ast_list_init(&n->new_expr.args);
+                zan_ast_list_init(&n->new_expr.arg_inits);
+                parser_advance(p); /* { */
+                while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+                    zan_ast_node_t *field_init;
+                    if (parser_check(p, TK_IDENT) &&
+                        zan_lexer_peek(p->lex).kind == TK_EQ) {
+                        zan_loc_t nloc = p->current.loc;
+                        zan_istr_t name = p->current.str_val;
+                        parser_advance(p); /* name */
+                        parser_advance(p); /* = */
+                        if (parser_match(p, TK_LBRACE)) {
+                            field_init = zan_ast_new(p->arena, AST_COLL_INIT, nloc);
+                            field_init->coll_init.name = name;
+                            zan_ast_list_init(&field_init->coll_init.items);
+                            while (!parser_check(p, TK_RBRACE) &&
+                                   !parser_check(p, TK_EOF)) {
+                                zan_ast_node_t *item = parse_expression(p);
+                                zan_ast_list_push(&field_init->coll_init.items,
+                                                  item, p->arena);
+                                if (!parser_match(p, TK_COMMA)) break;
+                            }
+                            parser_expect(p, TK_RBRACE);
+                        } else {
+                            field_init = zan_ast_new(p->arena, AST_ASSIGNMENT, nloc);
+                            zan_ast_node_t *lhs =
+                                zan_ast_new(p->arena, AST_IDENTIFIER, nloc);
+                            lhs->ident.name = name;
+                            field_init->binary.op = TK_EQ;
+                            field_init->binary.left = lhs;
+                            field_init->binary.right = parse_expression(p);
+                        }
+                    } else {
+                        field_init = parse_expression(p);
+                    }
+                    zan_ast_list_push(&n->new_expr.arg_inits, field_init,
+                                      p->arena);
+                    if (!parser_match(p, TK_COMMA)) break;
+                }
+                parser_expect(p, TK_RBRACE);
+                expr = n;
+                continue;
+            }
+
+            /* plain identifier / member access: re-interpret it as the type
+             * name of a new-expression */
+            zan_ast_node_t *type = zan_ast_new(p->arena, AST_TYPE_REF, expr->loc);
+            if (expr->kind == AST_IDENTIFIER) {
+                type->type_ref.name = expr->ident.name;
+            } else {
+                type->type_ref.name = expr->member.name;
+            }
+            zan_ast_list_init(&type->type_ref.type_args);
+
+            zan_ast_node_t *n = zan_ast_new(p->arena, AST_NEW_EXPR, loc);
+            n->new_expr.type = type;
+            zan_ast_list_init(&n->new_expr.args);
+
+            /* parse field = value pairs as assignment expressions.
+             * `Name = { a, b }` is a member collection initializer (C#
+             * semantics): it is kept as a dedicated AST_COLL_INIT node so irgen
+             * lowers it to Add(item) per element on that member, instead of
+             * reading the braces as a nested dictionary entry. */
+            while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+                zan_ast_node_t *field_init;
+                if (parser_check(p, TK_IDENT) &&
+                    zan_lexer_peek(p->lex).kind == TK_EQ) {
+                    zan_loc_t nloc = p->current.loc;
+                    zan_istr_t name = p->current.str_val;
+                    parser_advance(p); /* name */
+                    parser_advance(p); /* = */
+                    if (parser_match(p, TK_LBRACE)) {
+                        field_init = zan_ast_new(p->arena, AST_COLL_INIT, nloc);
+                        field_init->coll_init.name = name;
+                        zan_ast_list_init(&field_init->coll_init.items);
+                        while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+                            zan_ast_node_t *item = parse_expression(p);
+                            zan_ast_list_push(&field_init->coll_init.items, item,
+                                              p->arena);
+                            if (!parser_match(p, TK_COMMA)) break;
+                        }
+                        parser_expect(p, TK_RBRACE);
+                    } else {
+                        field_init = zan_ast_new(p->arena, AST_ASSIGNMENT, nloc);
+                        zan_ast_node_t *lhs =
+                            zan_ast_new(p->arena, AST_IDENTIFIER, nloc);
+                        lhs->ident.name = name;
+                        field_init->binary.op = TK_EQ;
+                        field_init->binary.left = lhs;
+                        field_init->binary.right = parse_expression(p);
+                    }
+                } else {
+                    field_init = parse_expression(p);
+                }
+                zan_ast_list_push(&n->new_expr.args, field_init, p->arena);
+                if (!parser_match(p, TK_COMMA)) break;
+            }
+            parser_expect(p, TK_RBRACE);
+            expr = n;
+            continue;
+        }
+        }
+
+        for (;;) {
+            zan_loc_t loc = p->current.loc;
         if (parser_check(p, TK_DOT) || parser_check(p, TK_QUESTION_DOT)) {
             int null_cond = parser_check(p, TK_QUESTION_DOT);
             parser_advance(p);
@@ -1338,11 +1426,12 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             expr = n;
         } else if (parser_check(p, TK_LESS) && expr->kind == AST_IDENTIFIER &&
                    !expr->inst_type_ref &&
-                   looks_like_type_args_before_dot(p)) {
+                   (looks_like_type_args_before_dot(p) ||
+                    looks_like_type_args_before_brace(p))) {
             /* static access on a constructed generic type: Box<int>.Create(7).
              * The identifier keeps its simple name and carries the
-             * instantiation, so the following `.` is an ordinary member
-             * access. */
+             * instantiation, so the following `.` or initializer brace is
+             * handled by the ordinary postfix loop. */
             zan_ast_node_t *tref = zan_ast_new(p->arena, AST_TYPE_REF, expr->loc);
             tref->type_ref.name = expr->ident.name;
             tref->type_ref.is_nullable = false;
@@ -1434,6 +1523,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
         } else {
             break;
         }
+    }
     }
 
     return expr;

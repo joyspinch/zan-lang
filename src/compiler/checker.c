@@ -2199,8 +2199,15 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                                   (long long)prod);
             }
         }
-        for (int i = 0; i < expr->new_expr.args.count; i++) {
-            zan_ast_node_t *arg = expr->new_expr.args.items[i];
+        /* A postfix generic-type initializer (`List<int> { ... }`) keeps its
+         * member-writes in arg_inits (ctor args are always empty there), so
+         * both lists are checked by the same loop below. */
+        zan_ast_list_t *init_lists[2] = { &expr->new_expr.args,
+                                          &expr->new_expr.arg_inits };
+        for (int li = 0; li < 2; li++) {
+        zan_ast_list_t *init_args = init_lists[li];
+        for (int i = 0; i < init_args->count; i++) {
+            zan_ast_node_t *arg = init_args->items[i];
             /* Object-initializer assignments are field writes on the newly
              * allocated type, not ordinary assignments in the surrounding
              * scope. Resolve the bare field name against that type first so a
@@ -2325,6 +2332,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 memcmp(arg_type->name.str, "List", 4) == 0) {
                 expr->new_expr.list_copy = true;
             }
+        }
         }
         return type;
     }

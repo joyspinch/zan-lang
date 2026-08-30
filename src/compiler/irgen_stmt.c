@@ -646,7 +646,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                             /* object-initializer tail: `Field = v` writes and
                              * member collection initializers both trail any
                              * positional constructor arguments (mirrors the
-                             * init_start walk in emit_expr_new_expr). */
+                             * init_start walk in emit_expr_new_expr). A
+                             * postfix generic-type initializer keeps its
+                             * member-writes in arg_inits (args is empty). */
                             int init_start = init->new_expr.args.count;
                             while (init_start > 0) {
                                 zan_ast_node_t *a =
@@ -712,8 +714,24 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                     g, sym, new_inst ? new_inst : sym->type,
                                     alloca, locals);
                             }
-                            for (int i = init_start; i < init->new_expr.args.count; i++) {
-                                zan_ast_node_t *arg = init->new_expr.args.items[i];
+                            /* Ordinary initializers trail constructor
+                             * arguments in args; the generic-postfix form
+                             * stores the same tail in arg_inits. Present both
+                             * shapes as one list for identical lowering. */
+                            zan_ast_list_t object_inits;
+                            zan_ast_list_init(&object_inits);
+                            for (int oi = init_start;
+                                 oi < init->new_expr.args.count; oi++) {
+                                zan_ast_list_push(&object_inits,
+                                    init->new_expr.args.items[oi], g->arena);
+                            }
+                            for (int oi = 0;
+                                 oi < init->new_expr.arg_inits.count; oi++) {
+                                zan_ast_list_push(&object_inits,
+                                    init->new_expr.arg_inits.items[oi], g->arena);
+                            }
+                            for (int i = 0; i < object_inits.count; i++) {
+                                zan_ast_node_t *arg = object_inits.items[i];
                                 /* `Members = { a, b }`: same synthetic
                                  * `member.Add(item)` lowering as the
                                  * emit_expr_new_expr path, sharing its ARC
