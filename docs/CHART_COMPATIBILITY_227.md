@@ -44,7 +44,11 @@ ECharts 的 `formatter`、动态颜色、`symbolSize`、位置和 tooltip 回调
 
 ### 实例生命周期与事件
 
-Chart 的立即模式入口是 `ChartView.Render(app, x, y, w, h)`，状态使用稳定 key 保存在 `App.StateGet/StateSet`。保留的 `ChartView` 已提供 `GetOption`、`SetOption`、`Restore`、`Clear`、`Refresh`、`ShowLoading`/`HideLoading`、`SetEmptyMessage`、`SetErrorMessage` 和 `Dispose`，并可订阅 Rendered/Resized/Updated/Disposed 的无参数生命周期事件；这些回调在 Render seam 触发，不是完整 ECharts DOM 事件载荷。与 ECharts 的 `resize()`、带 payload 的 `on/un` 模型仍有差异，调用方不应假定所有 ECharts 实例方法已经存在。
+Chart 的立即模式入口是 `ChartView.Render(app, x, y, w, h)`，状态使用稳定 key 保存在 `App.StateGet/StateSet`。保留的 `ChartView` 已提供 `GetOption`、`SetOption`、`Restore`、`Clear`、`Refresh`、`ShowLoading`/`HideLoading`、`SetEmptyMessage`、`SetErrorMessage` 和 `Dispose`，并可订阅 Rendered/Resized/Updated/Disposed 的无参数生命周期事件。
+
+带载荷的交互事件通过 `ChartEventType`、`ChartInteractionEvent` 和 `ChartInteractionHandler` 提供。`ChartView` 与 `ChartController` 都支持 `On(type, handler)`、`Off(type, handler)`、`ClearEvents()` 以及 `OnClick`、`OnDoubleClick`、`OnHover`、`OnMouseOut`、`OnLegendSelected`、`OnDataZoom`、`OnDataRange`、`OnRestore`、`OnDataChanged` 便捷入口。当前已接入的事件包括图表级点击/进入/离开、图例切换、dataZoom/dataRange 状态变化、toolbox magicType、restore、resize 和 controller 数据变更；`seriesIndex`、`seriesName`、坐标、选中状态和 zoom 范围在适用时填入，其余字段使用明确的空值哨兵。事件回调是 Zan typed delegate，不是可执行任意 JavaScript 的 ECharts DOM `on/un`。
+
+这些回调在 Render seam 或状态更新点触发，不是完整 ECharts DOM 事件载荷；扇区、地图区域、层级节点和 force 布局的专用命中载荷仍在后续接入。与 ECharts 的 `resize()`、完整 `on/un` 模型仍有差异，调用方不应假定所有 ECharts 实例方法已经存在。
 
 ### 动画
 
@@ -76,8 +80,8 @@ Force 使用确定性圆周初值和固定轮数弹簧模拟，以便缓存和�
 | timeline、connect | 已建模 | 立即模式状态持久化 |
 | GeoJSON 与压缩地图坐标 | 已建模 | 运行时解析，见 `ChartGeoJson` |
 | 任意 JavaScript formatter | 不支持 | 使用模板/内置 formatter/后续 Zan delegate |
-| 完整 `on/un` 事件回调 | 建设中 | 当前内部交互状态已存在 |
-| 完整实例生命周期 API | 建设中 | Render/Controller 是当前主要入口 |
+| typed Chart 交互事件 | 部分覆盖 | `ChartEventType`/`ChartInteractionEvent` 支持点击、悬停、图例、zoom、dataRange、地图/饼图选择、漫游、timeline 等已接入路径；专用命中载荷仍在建设 |
+| 完整 `on/un` 与实例生命周期 | 建设中 | 当前 API 是 Zan typed delegate + Render/Controller 入口，不承诺任意 ECharts DOM 实例方法 |
 | 任意 magicType 类型互换 | 不支持 | 当前提供有限 line/bar 切换 |
 | calculable 数据孤岛工作流 | 部分 | dataRange 拖拽不等同完整数据孤岛 |
 | SVG/PDF/多格式导出 | 未承诺 | 当前导出路径以 PNG 为主 |

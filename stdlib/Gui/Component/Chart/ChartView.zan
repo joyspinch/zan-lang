@@ -39,6 +39,13 @@ partial class ChartView {
     int lastDirectVersion;
     bool hasRendered;
     bool disposed;
+    ChartEventHub eventHub;
+    int eventHitId;
+    bool pointerWasOver;
+    int lastZoomLo;
+    int lastZoomHi;
+    int lastEventStateWid;
+    static ChartView activeEventView;
 
     void InitLifecycle() {
         Rendered = new UiEvent();
@@ -52,6 +59,12 @@ partial class ChartView {
         lastDirectVersion = 0 - 1;
         hasRendered = false;
         disposed = false;
+        eventHub = new ChartEventHub();
+        eventHitId = 0 - 1;
+        pointerWasOver = false;
+        lastZoomLo = 0 - 1;
+        lastZoomHi = 0 - 1;
+        lastEventStateWid = 0 - 1;
         directStatus = "ready";
         directStatusMessage = "";
     }
@@ -156,6 +169,102 @@ partial class ChartView {
     ChartView OnUpdated(Action a) { Updated.Add(a); return this; }
     ChartView OnDisposed(Action a) { Disposed.Add(a); return this; }
 
+    /// 注册/移除带载荷的图表交互事件。
+    ChartView On(ChartEventType type, ChartInteractionHandler handler) {
+        if (!this.disposed) { this.eventHub.On(type, handler); }
+        return this;
+    }
+
+    ChartView Off(ChartEventType type, ChartInteractionHandler handler) {
+        if (!this.disposed) { this.eventHub.Off(type, handler); }
+        return this;
+    }
+
+    ChartView ClearEvents() {
+        if (!this.disposed) { this.eventHub.Clear(); }
+        return this;
+    }
+
+    void RaiseInteraction(ChartInteractionEvent eventArgs) {
+        if (this.disposed || eventArgs == null) { return; }
+        this.eventHub.Raise(eventArgs);
+        if (this.controller != null
+            && eventArgs.type != ChartEventType.DataChanged) {
+            this.controller.RaiseEvent(eventArgs);
+        }
+    }
+
+    void RaiseLocal(ChartInteractionEvent eventArgs) {
+        if (this.disposed || eventArgs == null) { return; }
+        this.eventHub.Raise(eventArgs);
+    }
+
+    static void RaiseActive(ChartInteractionEvent eventArgs) {
+        if (ChartView.activeEventView != null) {
+            ChartView.activeEventView.RaiseInteraction(eventArgs);
+        }
+    }
+
+    static ChartInteractionEvent EventAt(ChartEventType type, int wid,
+                                         int px, int py) {
+        ChartInteractionEvent e = ChartInteractionEvent.Of(type, wid);
+        e.x = px;
+        e.y = py;
+        return e;
+    }
+
+    ChartView OnClick(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.Click, handler);
+    }
+    ChartView OnDoubleClick(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.DoubleClick, handler);
+    }
+    ChartView OnHover(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.Hover, handler);
+    }
+    ChartView OnMouseOut(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.MouseOut, handler);
+    }
+    ChartView OnLegendSelected(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.LegendSelected, handler);
+    }
+    ChartView OnPieSelected(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.PieSelected, handler);
+    }
+    ChartView OnMapSelected(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.MapSelected, handler);
+    }
+    ChartView OnMapRoam(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.MapRoam, handler);
+    }
+    ChartView OnTimelineChanged(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.TimelineChanged, handler);
+    }
+    ChartView OnMagicTypeChanged(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.MagicTypeChanged, handler);
+    }
+    ChartView OnRefresh(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.Refresh, handler);
+    }
+    ChartView OnForceLayoutEnd(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.ForceLayoutEnd, handler);
+    }
+    ChartView OnDataZoom(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.DataZoom, handler);
+    }
+    ChartView OnDataRange(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.DataRange, handler);
+    }
+    ChartView OnRestore(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.Restore, handler);
+    }
+    ChartView OnResizeEvent(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.Resize, handler);
+    }
+    ChartView OnDataChanged(ChartInteractionHandler handler) {
+        return this.On(ChartEventType.DataChanged, handler);
+    }
+
     /// 返回 option 快照；controller 绑定和直接 option 两种模式都不暴露
     /// 内部可变对象。
     ChartOption GetOption() {
@@ -201,6 +310,9 @@ partial class ChartView {
             this.sourceOption = ChartOption.Clone(this.initialOption); this.option = this.sourceOption;
             this.directStatus = "ready"; this.directStatusMessage = "";
             this.directVersion = this.directVersion + 1;
+            ChartInteractionEvent re = ChartInteractionEvent.Of(
+                ChartEventType.Restore, this.wid);
+            this.RaiseInteraction(re);
         }
         return this;
     }
@@ -266,6 +378,7 @@ partial class ChartView {
         this.directStatus = "disposed"; this.directStatusMessage = "";
         if (this.Disposed.Count() > 0) { this.Disposed.Raise(); }
         this.Rendered.Clear(); this.Resized.Clear(); this.Updated.Clear();
+        this.eventHub.Clear();
     }
 
     // RenderCached 的动态快照槽位分配器：运行时池按需增长
@@ -747,6 +860,20 @@ partial class ChartView {
 
         // 把每种图表裁剪到自己的矩形，防止绘图线、柱条、
         // 轴标签和图例溢出到相邻控件。
+        ChartView.activeEventView = this;
+        if (this.eventHitId < 0 && (this.eventHub.Count(ChartEventType.Click) > 0
+            || this.eventHub.Count(ChartEventType.DoubleClick) > 0
+            || this.eventHub.Count(ChartEventType.Hover) > 0
+            || this.eventHub.Count(ChartEventType.MouseOut) > 0)) {
+            // 独立高位段，不随即时模式控件的分配顺序漂移。
+            this.eventHitId = 9700000 + this.wid;
+        }
+        if (this.eventHitId >= 0 && this.Status() == "ready") {
+            // 根命中区放在所有 renderer 之前；系列、图例和工具箱
+            // 后续注册的区域优先，未被更具体区域命中的空白点击
+            // 才到达图表级 Click。
+            app.hitTester.RegisterRect(this.eventHitId, x, y, w, h, 0);
+        }
         app.canvas.PushClip(x, y, w, h);
         this.DispatchRender(app, x, y, w, innerH, g);
         if (drH > 0) {
@@ -761,14 +888,72 @@ partial class ChartView {
         }
         ChartView.DrawStatusState(app, x, y, w, h,
             this.Status(), this.StatusMessage());
+
+        string statusNow = this.Status();
+        bool over = statusNow == "ready"
+            && app.mouseX >= x && app.mouseX < x + w
+            && app.mouseY >= y && app.mouseY < y + h;
+        if (over && !this.pointerWasOver) {
+            ChartInteractionEvent he = ChartView.EventAt(
+                ChartEventType.Hover, this.wid, app.mouseX, app.mouseY);
+            this.RaiseInteraction(he);
+        } else if (!over && this.pointerWasOver) {
+            ChartInteractionEvent me = ChartView.EventAt(
+                ChartEventType.MouseOut, this.wid, app.mouseX, app.mouseY);
+            this.RaiseInteraction(me);
+        }
+        this.pointerWasOver = over;
+        if (statusNow == "ready" && this.eventHitId >= 0
+            && Ui.Clicked(app, this.eventHitId)) {
+            ChartInteractionEvent ce = ChartView.EventAt(
+                ChartEventType.Click, this.wid, app.mouseX, app.mouseY);
+            this.RaiseInteraction(ce);
+        }
+        if (statusNow == "ready" && this.eventHitId >= 0
+            && Ui.DoubleClicked(app, this.eventHitId)) {
+            ChartInteractionEvent de = ChartView.EventAt(
+                ChartEventType.DoubleClick, this.wid, app.mouseX, app.mouseY);
+            this.RaiseInteraction(de);
+        }
+        int zlo = statusNow == "ready"
+            ? app.StateGet(Chart.ZoomLoKey(this.wid), 0) : 0;
+        int zhi = statusNow == "ready"
+            ? app.StateGet(Chart.ZoomHiKey(this.wid), 1000) : 1000;
+        if (this.lastZoomLo >= 0 && (zlo != this.lastZoomLo || zhi != this.lastZoomHi)) {
+            ChartInteractionEvent ze = ChartInteractionEvent.Of(
+                ChartEventType.DataZoom, this.wid);
+            ze.zoomStart = zlo;
+            ze.zoomEnd = zhi;
+            ze.x = app.mouseX;
+            ze.y = app.mouseY;
+            this.RaiseInteraction(ze);
+        }
+        this.lastZoomLo = zlo;
+        this.lastZoomHi = zhi;
         if (resized && this.Resized.Count() > 0) { this.Resized.Raise(); }
+        if (resized) {
+            ChartInteractionEvent re = ChartView.EventAt(
+                ChartEventType.Resize, this.wid, w, h);
+            this.RaiseInteraction(re);
+        }
         if (updated && this.Updated.Count() > 0) { this.Updated.Raise(); }
+        if (updated && this.controller == null) {
+            ChartInteractionEvent ue = ChartInteractionEvent.Of(
+                ChartEventType.DataChanged, this.wid);
+            this.RaiseInteraction(ue);
+        }
+        if (updated && this.controller != null) {
+            ChartInteractionEvent ue2 = ChartInteractionEvent.Of(
+                ChartEventType.DataChanged, this.wid);
+            this.RaiseLocal(ue2);
+        }
         if (this.Rendered.Count() > 0) { this.Rendered.Raise(); }
         this.lastRenderW = w;
         this.lastRenderH = h;
         if (this.controller != null) { this.lastControllerVersion = this.controller.Version(); }
         else { this.lastDirectVersion = this.directVersion; }
         this.hasRendered = true;
+        ChartView.activeEventView = null;
     }
 
     /// connect() 组交互键重定向：组内第一张到达的图把「组长 wid」
