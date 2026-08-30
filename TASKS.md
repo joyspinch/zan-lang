@@ -2962,8 +2962,20 @@ A71 归因出四条编译器杠杆，本条把能实测的先测掉，用数据�
   release 函数（此前被表钉死）；gallery 函数几乎全被真可达路径引用（A74 结论），
   desc 模式既删不掉更多代码，又多付 per-shape 记录的 .data，净 +282KB。后续方向：
   给 desc 全局加 LLVMSetUnnamedAddr + 合并同形状（已同形状合并）；或 tynames 列表
-  共享（同祖先链只发一份）可再省；gallery 真正的体积杠杆仍是 A73 杠杆④（ARC 冗余
-  对消除，预计 −10~15%）。
+  共享（同祖先链只发一份）可再省。
+- **A73 杠杆④预研证伪（2026-08-31，无代码落地）**：估的「ARC 冗余对消除 −10~15%」
+  前提不成立。量化：原始 irgen 输出（-O0 --emit-ir，10,147 函数）里同基本块同操作数
+  retain/release 对**只有 9 对**（全部是 CefOptions 各字符串属性的 getter——先 null
+  检查里 retain、末尾又 release 同一局部）；--publish 过 LLVM Os 管线后余 3 对、
+  同 BB 口径 18 对（JsonReader/Css/File 等，均为 LLVM 本身没合并的跨语句对），
+  对照全模块 3,561 个 ARC 调用（str_release 1,594 / release_dyn 1,104 / str_retain 401），
+  冗余对占比 <0.3%，即便全部消除也不到几 KB。结论：Zan 的 ARC 发射形态（局部
+  retain 立即随语句尾 release）天然不产相邻冗余对，LLVM Os 的 GVN/DSE 已把仅有的
+  几对消化殆尽——独立 ARC-pair pass 无收益，A71 原估的该部分清零。此前的 optimizer.c
+  zan_opt_arc 相邻对消除 pass 保留不动（-O1+ 才跑，当前数对属正常维护面）。
+  四杠杆至此全部落地或证伪：③ inline 分档 −23%（实落地）、① 三表钉死 A75 −3.5%
+  （空窗）、② PIC 证伪、④ 本条证伪。空窗/画廊体积的下一批候选只剩 desc 记录瘦身
+  与 tynames 列表共享（边际收益小），体积优化线暂告一段落。
 - **回归**：standard 643/647、smoke 181/184（失败均为并行在途既有：cef_profile/
   gui_input/watermark/string_index_char_text）；探针 isas.zan（is 命中/基类 is/as
   向下转型/object 槽 string is/descriptor 模式 GetType().Name 报 Dog）+ cc.zan
