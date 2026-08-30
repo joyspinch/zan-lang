@@ -2833,3 +2833,30 @@ Pinyin 91%（45,355B 源码里 41,156B 是 GB2312 词典字符串链）、TDengi
 - **教训**：标准库模块的 using 是传染的——一个 45KB 的词典模块若顺手
   using System.IO，就让所有拼音用户多链半个 IO 族。数据文件化同时治了
   这个：加载器只依赖 CRT。
+
+# A73 · 统一优化路线第一批实测：inline 阈值按优化档位分档 + PIC 假设证伪 —— ✅ 已完成（2026-08-30）
+
+A71 归因出四条编译器杠杆，本条把能实测的先测掉，用数据决定取舍。
+
+- **杠杆③ inline 分档（已落地）**：`--publish`（Os）下 alwaysinline 的
+  收录从 ≤4 基本块收紧到 ≤2 块（optimizer.c `small_cap`），其他档位不变。
+  依据：Os 是体积档，3-4 块小函数（ARC 包装、属性 getter）强制内联是
+  .text 膨胀主力之一；inlinehint 扩到 Os 的反向实验证明大函数内联在 Os
+  完全错误（gallery .text +615KB/+55%，已回退）。
+  实测：gallery --publish 11,324,928 → 8,726,528B（**-2.60MB，-23%**，
+  .text 9,072,128→6,473,216）；空窗口 1,947,136→1,779,712B（-167KB，
+  .text -14.7%）。回归：conformance 全套 503/503（首轮 1 个 flaky 复跑
+  过）、smoke 181/184（3 失败为并行在途既有）、determinism/leakcheck
+  抽样全过。折中说明：Os 档放弃 3-4 块内联会有一点调用开销，但该档
+  本来就以体积优先；性能档（O2/O3）的 ≤4bb 内联原样保留。
+- **杠杆② PIC→静态（证伪，未落地）**：irgen_emit.c 硬编码
+  LLVMRelocPIC 疑似白白付 GOT 相对寻址的体积税。实测 RelocDefault vs
+  RelocPIC 在 x64 COFF 上**逐字节一致**（仅 PE 时间戳 4 字节不同）：
+  x64 Windows 的 RIP 相对寻址本就是默认模型，reloc 模式不改变代码形态，
+  MinGW 链接 /DYNAMICBASE 与否也不由这里决定。原假设作废，相关代码
+  保持原样。此结论同时说明：A71 估的 −3~8% 里 PIC 部分不存在，
+  剩余空间必须从 DCE/inline/ARC 拿。
+- **对 A71 估计的修正**：四杠杆中②清零；③实测 −23%（gallery）超出
+  估计的 −5~10%（BB 阈值对 Zan 代码形状的杠杆比预想大——Zan 全虚
+  分发 + ARC 包装使 3-4 块函数密度远高于典型 C）；①（三表钉死 +
+  function-sections）与④（ARC 冗余对消除）仍待做，是下一批。

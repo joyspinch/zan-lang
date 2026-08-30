@@ -305,7 +305,8 @@ zan_inline_stats_t zan_opt_inline(zan_irgen_t *g, zan_opt_level_t level) {
              lk == LLVMAvailableExternallyLinkage);
         if (!LLVMIsDeclaration(fn) && !interposable) {
             unsigned bb_count = LLVMCountBasicBlocks(fn);
-            if (bb_count <= 4 && level >= ZAN_OPT_BASIC) {
+            unsigned small_cap = (level == ZAN_OPT_SIZE) ? 2 : 4;
+            if (bb_count <= small_cap && level >= ZAN_OPT_BASIC) {
                 LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)(-1),
                     LLVMCreateEnumAttribute(LLVMGetModuleContext(mod),
                         LLVMGetEnumAttributeKindForName("alwaysinline", 12), 0));
