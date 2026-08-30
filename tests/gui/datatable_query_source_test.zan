@@ -5,11 +5,20 @@ using Gui.Widget;
 namespace DataTableQuerySourceTest;
 
 class DeferredSource : QueryDataSource {
-    DeferredSource() { this.Setup(); }
+    int fetchCount;
+
+    DeferredSource() {
+        this.Setup();
+        this.fetchCount = 0;
+    }
 
     override void FetchQuery(QueryDescriptor query,
                               QueryViewport viewport,
-                              QueryRequestToken token) { }
+                              QueryRequestToken token) {
+        this.fetchCount = this.fetchCount + 1;
+    }
+
+    int FetchCount() { return this.fetchCount; }
 }
 
 class Program {
@@ -44,6 +53,34 @@ class Program {
         Console.WriteLine("currentReady=" + source.CellReady(20, 0));
         Console.WriteLine("currentText=" + source.CellText(20, 0));
         if (second == null) { return; }
+        QueryRequestToken cached = source.RequestQuery(query, viewport, null);
+        Console.WriteLine("cachePoll=" + source.Poll());
+        Console.WriteLine("cacheFetches=" + Convert.ToString(source.FetchCount()));
+        QueryViewport viewport2 = new QueryViewport(30, 10, "");
+        QueryRequestToken page2 = source.RequestQuery(query, viewport2, null);
+        source.FinishQuery(Program.Result(page2, 30, "page2"), page2);
+        Console.WriteLine("page2Poll=" + source.Poll());
+        Console.WriteLine("page2Text=" + source.CellText(30, 0));
+        Console.WriteLine("crossPageReady=" + source.CellReady(20, 0));
+        Console.WriteLine("crossPageText=" + source.CellText(20, 0));
+        QueryRequestToken cachedPage2 = source.RequestQuery(query, viewport2, null);
+        Console.WriteLine("page2CachePoll=" + source.Poll());
+        Console.WriteLine("page2CacheFetches=" + Convert.ToString(source.FetchCount()));
+        DataTable.InvalidateView(st);
+        QueryDescriptor viewQuery = QueryDescriptor.Of(st, "orders", QueryCapabilities.Page);
+        QueryRequestToken viewHit = source.RequestQuery(viewQuery, viewport, null);
+        Console.WriteLine("viewReusePoll=" + source.Poll());
+        Console.WriteLine("viewReuseFetches=" + Convert.ToString(source.FetchCount()));
+        DataTable.InvalidateQuery(st);
+        QueryDescriptor changedQuery = QueryDescriptor.Of(st, "orders", QueryCapabilities.Page);
+        QueryRequestToken changed = source.RequestQuery(changedQuery, viewport, null);
+        Console.WriteLine("queryMissFetches=" + Convert.ToString(source.FetchCount()));
+        source.SetSchema(null, 2);
+        QueryRequestToken schemaChanged = source.RequestQuery(changedQuery, viewport, null);
+        Console.WriteLine("schemaMissFetches=" + Convert.ToString(source.FetchCount()));
+        source.SetServerRevision(1);
+        QueryRequestToken serverChanged = source.RequestQuery(changedQuery, viewport, null);
+        Console.WriteLine("serverMissFetches=" + Convert.ToString(source.FetchCount()));
         source.FinishQuery(Program.Result(second, 20, "duplicate"), second);
         Console.WriteLine("duplicatePoll=" + source.Poll());
         QueryRequestToken rejected = source.RequestQuery(query, viewport, first);
@@ -59,11 +96,19 @@ class Program {
         Console.WriteLine("bytes1=" + Convert.ToString(cache.Bytes()));
         QueryRequestToken other = new QueryRequestToken(9, second.Generation(),
             second.QueryText(), second.QueryHash(), second.SchemaVersion(), second.ServerRevision());
-        QueryViewport viewport2 = new QueryViewport(30, 10, "");
-        DataPageKey key2 = DataPageKey.Of(query, viewport2, other);
+        QueryViewport viewport3 = new QueryViewport(30, 10, "");
+        DataPageKey key2 = DataPageKey.Of(query, viewport3, other);
         Console.WriteLine("put2=" + cache.Put(key2, Program.Result(other, 30, "two"), 6));
         Console.WriteLine("count=" + Convert.ToString(cache.Count()));
         Console.WriteLine("evicted1=" + (cache.Get(key1) == null));
         Console.WriteLine("hit2=" + (cache.Get(key2) != null));
+        cache.SetPinned(key2, true);
+        QueryRequestToken third = new QueryRequestToken(10, second.Generation(),
+            second.QueryText(), second.QueryHash(), second.SchemaVersion(), second.ServerRevision());
+        QueryViewport viewport4 = new QueryViewport(40, 10, "");
+        DataPageKey key3 = DataPageKey.Of(query, viewport4, third);
+        Console.WriteLine("pinnedReject=" + (!cache.Put(key3, Program.Result(third, 40, "three"), 6)));
+        Console.WriteLine("pinnedKeep=" + (cache.Get(key2) != null));
+        Console.WriteLine("pinnedBytes=" + Convert.ToString(cache.Bytes()));
     }
 }

@@ -85,6 +85,7 @@ class QueryDataSource : DataSource {
     int schemaVersion;
     int serverRevision;
     List<SchemaColumn> schema;
+    DataPageCache pageCache;
 
     QueryDataSource() { this.Setup(); }
 
@@ -103,6 +104,7 @@ class QueryDataSource : DataSource {
         this.schemaVersion = 1;
         this.serverRevision = 0;
         this.schema = new List<SchemaColumn>();
+        this.pageCache = new DataPageCache(268435456);
     }
 
     void SetPageSize(int size) {
@@ -115,6 +117,7 @@ class QueryDataSource : DataSource {
         this.errorResult = null;
         this.resultPending = false;
         this.requestActive = false;
+        this.pageCache.Clear();
         this.generation = this.generation + 1;
     }
 
@@ -130,6 +133,7 @@ class QueryDataSource : DataSource {
         if (version < 1) { version = 1; }
         this.schemaVersion = version;
         if (this.activeToken != null) { this.activeToken.Cancel(); }
+        this.pageCache.Clear();
         this.pendingResult = null;
         this.currentResult = null;
         this.errorResult = null;
@@ -156,6 +160,7 @@ class QueryDataSource : DataSource {
         if (this.serverRevision == revision) { return; }
         this.serverRevision = revision;
         if (this.activeToken != null) { this.activeToken.Cancel(); }
+        this.pageCache.Clear();
         this.pendingResult = null;
         this.currentResult = null;
         this.errorResult = null;
@@ -209,9 +214,21 @@ class QueryDataSource : DataSource {
         this.activeViewport = viewport;
         this.activeToken = token;
         this.pendingResult = null;
+        this.currentResult = null;
         this.errorResult = null;
         this.resultPending = false;
         this.requestActive = true;
+        QueryResult cached = this.pageCache.Get(
+            DataPageKey.For(query, viewport, this.generation,
+                this.schemaVersion, this.serverRevision));
+        if (cached != null) {
+            QueryResult rebound = cached.Rebind(token, viewport);
+            if (rebound != null) {
+                this.pendingResult = rebound;
+                this.resultPending = true;
+                return token;
+            }
+        }
         this.FetchQuery(query, viewport, token);
         return token;
     }
@@ -220,6 +237,7 @@ class QueryDataSource : DataSource {
     override void RequestBlock(int row) {
         if (row < 0) { return; }
         if (this.currentResult != null && this.currentResult.Covers(row)) { return; }
+        if (this.CachedRow(row) != null) { return; }
         if (this.requestActive && this.activeViewport != null) {
             int activeStart = this.activeViewport.Start();
             if (row >= activeStart && row < activeStart + this.activeViewport.Count()) {
@@ -288,6 +306,18 @@ class QueryDataSource : DataSource {
             this.activeViewport = null;
             return;
         }
+        int rowCount = result.Count();
+        int bytes = 1;
+        if (rowCount > 2147483647 / 64) {
+            bytes = 2147483647;
+        } else {
+            bytes = rowCount * 64;
+            if (bytes < 1) { bytes = 1; }
+        }
+        this.pageCache.Put(
+            DataPageKey.For(this.activeQuery, this.activeViewport,
+                this.generation, this.schemaVersion, this.serverRevision),
+            result, bytes);
         this.pendingResult = result;
         this.resultPending = true;
     }
@@ -329,6 +359,13 @@ class QueryDataSource : DataSource {
 
     QueryResult CurrentResult() { return this.currentResult; }
     QueryResult ErrorResult() { return this.errorResult; }
+    int CacheBytes() { return this.pageCache.Bytes(); }
+    void ClearCache() { this.pageCache.Clear(); }
+
+    QueryResult CachedRow(int row) {
+        return this.pageCache.GetRow(this.activeQuery, this.generation,
+            this.schemaVersion, this.serverRevision, row);
+    }
 
     override bool ServerControlled() { return true; }
 
@@ -339,19 +376,24 @@ class QueryDataSource : DataSource {
     }
 
     override bool CellReady(int row, int col) {
-        return this.currentResult != null && this.currentResult.Covers(row);
+        if (this.currentResult != null && this.currentResult.Covers(row)) { return true; }
+        return this.CachedRow(row) != null;
     }
 
     override RowKey GetRowKey(int row) {
-        if (this.currentResult == null) { return null; }
-        QueryRow value = this.currentResult.RowAt(row);
+        QueryResult result = this.currentResult;
+        if (result == null || !result.Covers(row)) { result = this.CachedRow(row); }
+        if (result == null) { return null; }
+        QueryRow value = result.RowAt(row);
         if (value == null) { return null; }
         return value.Key();
     }
 
     override string CellText(int row, int col) {
-        if (this.currentResult == null) { return ""; }
-        return this.currentResult.CellText(row, col);
+        QueryResult result = this.currentResult;
+        if (result == null || !result.Covers(row)) { result = this.CachedRow(row); }
+        if (result == null) { return ""; }
+        return result.CellText(row, col);
     }
 
     override int CellNum(int row, int col) {
