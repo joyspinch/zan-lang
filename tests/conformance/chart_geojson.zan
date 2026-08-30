@@ -1,0 +1,71 @@
+using System;
+using Gui.Component.Chart;
+
+namespace Conf;
+
+/// ChartGeoJson 解析的可观察行为：明文 GeoJSON（Polygon 部件内第 2
+/// 条环记洞、MultiPolygon 多部件）与 echarts UTF8Encoding 压缩形态
+/// （zigzag + 累加 + 1/scale 度）都归一到 0.01° 整数、y = -纬度×100
+/// 屏幕系（北朝上）；properties.value 透传；坏结构/空要素返回空表。
+class Program {
+    static void Main() {
+        // 明文：A 是带洞 Polygon（外环 4 点 + 洞 4 点），
+        // B 是双部件 MultiPolygon（第二部件在西南负象限）。
+        List<ChartMapRegion> plain = ChartGeoJson.ParseText(
+            "{\"type\":\"FeatureCollection\",\"features\":["
+            + "{\"type\":\"Feature\",\"properties\":{\"name\":\"A\",\"value\":5},"
+            + "\"geometry\":{\"type\":\"Polygon\",\"coordinates\":["
+            + "[[10.0,20.0],[10.5,20.0],[10.5,20.25],[10.0,20.25]],"
+            + "[[10.2,20.05],[10.3,20.05],[10.3,20.15],[10.2,20.15]]]}},"
+            + "{\"type\":\"Feature\",\"properties\":{\"name\":\"B\"},"
+            + "\"geometry\":{\"type\":\"MultiPolygon\",\"coordinates\":["
+            + "[[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,1.0]]],"
+            + "[[[-2.0,-2.0],[-1.5,-2.0],[-1.5,-1.5]]]]}}]}");
+        Console.WriteLine("plain:" + Convert.ToString(plain.Count));
+        Dump(plain);
+
+        // 编码形态：坐标对是 (dx,dy)，环串 "T@@XS@@W" = (10,0)(0,12)
+        // (-10,0)(0,-12)，zigzag 后 'T'=20→10、'X'=24→12、'S'=19→-10、
+        // 'W'=23→-12，起点 [10240,5120] = 10.0°E,5.0°N（UTF8Scale 默认
+        // 1024）；D 验证 MultiPolygon 的 offsets 逐部件索引与负 dx。
+        List<ChartMapRegion> enc = ChartGeoJson.ParseText(
+            "{\"type\":\"FeatureCollection\",\"UTF8Encoding\":true,\"features\":["
+            + "{\"type\":\"Feature\",\"properties\":{\"name\":\"C\",\"value\":77},"
+            + "\"geometry\":{\"type\":\"Polygon\",\"coordinates\":[\"T@@XS@@W\"],"
+            + "\"encodeOffsets\":[[10240,5120]]}},"
+            + "{\"type\":\"Feature\",\"properties\":{\"name\":\"D\"},"
+            + "\"geometry\":{\"type\":\"MultiPolygon\",\"coordinates\":["
+            + "[\"T@@XW@\"],[\"T@@XW@\"]],"
+            + "\"encodeOffsets\":[[[20480,10240]],[[20480,10240]]]}}]}");
+        Console.WriteLine("enc:" + Convert.ToString(enc.Count));
+        Dump(enc);
+
+        // 坏结构：非对象、无 features、环不足 3 点——全部空表。
+        Console.WriteLine("bad1:" + Convert.ToString(ChartGeoJson.ParseText("[]").Count));
+        Console.WriteLine("bad2:" + Convert.ToString(
+            ChartGeoJson.ParseText("{\"type\":\"FeatureCollection\",\"features\":[]}").Count));
+        Console.WriteLine("bad3:" + Convert.ToString(ChartGeoJson.ParseText(
+            "{\"type\":\"FeatureCollection\",\"features\":[{\"type\":\"Feature\","
+            + "\"properties\":{\"name\":\"E\"},\"geometry\":{\"type\":\"Polygon\","
+            + "\"coordinates\":[[[1.0,2.0],[3.0,4.0]]]}}]}").Count));
+        Console.WriteLine("bad4:" + Convert.ToString(ChartGeoJson.ParseText("").Count));
+    }
+
+    // 每区域一行 name:value:rings，每环一行 点数:hole:首点x:y:末点x:y。
+    static void Dump(List<ChartMapRegion> rs) {
+        for (int i = 0; i < rs.Count; i = i + 1) {
+            ChartMapRegion r = rs[i];
+            Console.WriteLine(r.name + ":" + Convert.ToString(r.value)
+                + ":r" + Convert.ToString(r.rings.Count));
+            for (int k = 0; k < r.rings.Count; k = k + 1) {
+                List<ChartMapPoint> ps = r.rings[k].points;
+                Console.WriteLine("r" + Convert.ToString(k) + ":"
+                    + Convert.ToString(ps.Count) + ":"
+                    + (r.rings[k].hole ? "hole" : "outer") + ":"
+                    + Convert.ToString(ps[0].x) + ":" + Convert.ToString(ps[0].y) + ":"
+                    + Convert.ToString(ps[ps.Count - 1].x) + ":"
+                    + Convert.ToString(ps[ps.Count - 1].y));
+            }
+        }
+    }
+}

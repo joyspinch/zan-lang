@@ -166,10 +166,11 @@ dataZoom.html / dataZoom1.html / legend.html / dataRange*.html / tooltip.html
   「多图状态联动」正交，2.2.7 的 connect 语义已由本批覆盖。
 
 ## 19. 汇总
-- 134 页中：全表达 ✅ **134/134**（含 timeline 与 connect 两类原 ✗ 项）。
+- 134 页中：主视觉与示例级交互可表达 ✅ **134/134**（含 timeline 与 connect 两类原 ✗ 项）。这不是“所有 ECharts option、实例方法和事件回调完全等价”的声明；完整兼容性分层见 `docs/CHART_COMPATIBILITY_227.md`。
 - 补齐批次：批 1 symbol 族、批 2 markLine 自动线 + 轴标签、批 3 HBarCore、
   批 4 emphasis + 选中 + radar、批 5 dataRange + legend + toolbox、
   批 6 force/chord/funnel/wordCloud 参数化；批 A1 词云角度集、A2 散点
   symbolSizeFn、A3 地图/弦图 markPoint、A4 dataRange hoverLink、A5 force
   入场补间、B timeline 子系统、C connect() 联动。
 - 逐图族仍存的确定性取舍（非能力缺口）：force 随机初值 → 圆周确定性初值。
+- 仍需单独建设的 L3 能力包括 typed 事件回调、实例生命周期、完整动态 option API、可配置导出、加载/空数据状态和跨图层坐标系；当前实现的已知边界和差异以 `docs/CHART_COMPATIBILITY_227.md` 为准。

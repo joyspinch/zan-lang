@@ -1,0 +1,177 @@
+using System;
+using System.Json;
+
+namespace Gui.Component.Chart;
+
+/// GeoJSON → ChartMapRegion 的运行时解析入口：地图几何以数据文件
+/// 随程序携带（echarts registerMap 的 china.json 等，构建时 --embed
+/// 烤进 exe 或从盘读取），不再生成代码硬编码。吃两种形态：
+/// ① 明文 GeoJSON（FeatureCollection / Feature，Polygon 与
+///    MultiPolygon，coordinates 为度）；
+/// ② echarts 官方地图 JSON 的 UTF8Encoding 压缩形态——环是
+///    delta+zigzag 编码串、逐环给 encodeOffsets 起点，解码算法与
+///    echarts parseGeoJson.js 一致（UTF8Scale 默认 1024）。
+/// 坐标统一量化到 0.01° 整数并翻成屏幕系（y = -纬度×100，北朝上），
+/// 与 ChartMapPoint/ChartViewMap 的数据约定一致。每个 Feature 聚成
+/// 一个区域：MultiPolygon 的各部件都是外环，部件内第 2 条起的环按
+/// GeoJSON 约定记洞。properties.value 存在时作区域值，否则 0，由
+/// 调用方按业务赋值。
+class ChartGeoJson {
+
+    /// 解析 GeoJSON 文本；结构不对或没有可渲染要素时返回空表。
+    static List<ChartMapRegion> ParseText(string json) {
+        if (json == null || json.Length == 0) { return new List<ChartMapRegion>(); }
+        return ChartGeoJson.Parse(JsonValue.ParseLenient(json));
+    }
+
+    static List<ChartMapRegion> Parse(JsonValue v) {
+        List<ChartMapRegion> outp = new List<ChartMapRegion>();
+        if (v == null || !v.IsObject()) { return outp; }
+        List<JsonValue> feats = new List<JsonValue>();
+        JsonValue fs = v.Get("features");
+        if (fs != null && fs.IsArray()) {
+            for (int i = 0; i < fs.Count(); i = i + 1) { feats.Add(fs.At(i)); }
+        } else if (v.Str("type", "") == "Feature") { feats.Add(v); }
+        bool encoded = v.Bool("UTF8Encoding", false);
+        int scale = v.Int("UTF8Scale", 1024);
+        if (scale < 1) { scale = 1024; }
+        for (int i = 0; i < feats.Count; i = i + 1) {
+            ChartGeoJson.Feature(feats[i], encoded, scale, outp);
+        }
+        return outp;
+    }
+
+    // 一个 Feature → 一个区域；geometry 缺失、类型未知或没有可用环
+    // 时跳过（Output of mapshaper may have geometry null）。
+    static void Feature(JsonValue f, bool encoded, int scale, List<ChartMapRegion> into) {
+        if (f == null || !f.IsObject()) { return; }
+        JsonValue geo = f.Get("geometry");
+        if (geo == null || !geo.IsObject()) { return; }
+        string type = geo.Str("type", "");
+        JsonValue coords = geo.Get("coordinates");
+        if (coords == null || !coords.IsArray() || coords.Count() < 1) { return; }
+        string name = "";
+        int val = 0;
+        JsonValue props = f.Get("properties");
+        if (props != null && props.IsObject()) {
+            name = props.Str("name", "");
+            val = props.Int("value", 0);
+        }
+        List<ChartMapRing> rings = new List<ChartMapRing>();
+        JsonValue offs = geo.Get("encodeOffsets");
+        if (type == "Polygon") {
+            ChartGeoJson.Polygon(coords, offs, encoded, scale, rings);
+        } else if (type == "MultiPolygon") {
+            for (int p = 0; p < coords.Count(); p = p + 1) {
+                ChartGeoJson.Polygon(coords.At(p), ChartGeoJson.At(offs, p),
+                    encoded, scale, rings);
+            }
+        } else { return; }
+        if (rings.Count < 1) { return; }
+        into.Add(ChartMapRegion.Of(name, val, rings));
+    }
+
+    // 一个部件的环组。encoded 时环是编码串（混入的明文数组环也认），
+    // offs 逐环给 [ox, oy] 起点；明文时环是 [[lng,lat],...]。
+    static void Polygon(JsonValue rings, JsonValue offs, bool encoded, int scale,
+                        List<ChartMapRing> into) {
+        if (rings == null || !rings.IsArray()) { return; }
+        for (int r = 0; r < rings.Count(); r = r + 1) {
+            bool hole = r > 0;
+            List<ChartMapPoint> pts = new List<ChartMapPoint>();
+            JsonValue ring = rings.At(r);
+            bool asEncoded = encoded && ring != null && !ring.IsArray();
+            if (asEncoded) {
+                JsonValue off = ChartGeoJson.At(offs, r);
+                if (off == null || !off.IsArray() || off.Count() < 2) { continue; }
+                pts = ChartGeoJson.DecodeRing(ring.AsString(""),
+                    off.At(0).AsInt(0), off.At(1).AsInt(0), scale);
+            } else {
+                if (ring == null || !ring.IsArray()) { continue; }
+                for (int j = 0; j < ring.Count(); j = j + 1) {
+                    JsonValue p = ring.At(j);
+                    if (p == null || !p.IsArray() || p.Count() < 2) { continue; }
+                    ChartGeoJson.PushPoint(pts,
+                        ChartGeoJson.QuantDeg(p.At(0).AsDouble(0.0)),
+                        0 - ChartGeoJson.QuantDeg(p.At(1).AsDouble(0.0)));
+                }
+            }
+            if (pts.Count < 3) { continue; }
+            into.Add(ChartMapRing.Of(pts, hole));
+        }
+    }
+
+    // echarts UTF8Encoding 环解码：码点-64 → zigzag → 累加成
+    // 1/scale 度的整数，再量化到 0.01°。
+    static List<ChartMapPoint> DecodeRing(string s, int ox, int oy, int scale) {
+        List<ChartMapPoint> pts = new List<ChartMapPoint>();
+        List<int> cps = ChartGeoJson.CodePoints(s);
+        int px = ox;
+        int py = oy;
+        for (int i = 0; i + 1 < cps.Count; i = i + 2) {
+            px = px + ChartGeoJson.Zig(cps[i]);
+            py = py + ChartGeoJson.Zig(cps[i + 1]);
+            ChartGeoJson.PushPoint(pts, ChartGeoJson.QuantScaled(px, scale),
+                0 - ChartGeoJson.QuantScaled(py, scale));
+        }
+        return pts;
+    }
+
+    // echarts zigzag：delta 编码（码点-64）还原成有符号数。
+    static int Zig(int c) {
+        c = c - 64;
+        return (c >> 1) ^ (0 - (c & 1));
+    }
+
+    // 0.01° 粒度下编码串常产生与上一点重合的量化点，直接丢掉，
+    // 免得留 <3 点的退化环和零长边。
+    static void PushPoint(List<ChartMapPoint> pts, int x, int y) {
+        if (pts.Count > 0) {
+            ChartMapPoint last = pts[pts.Count - 1];
+            if (last.x == x && last.y == y) { return; }
+        }
+        pts.Add(ChartMapPoint.Of(x, y));
+    }
+
+    // 度 → 0.01° 整数，半值远离零。
+    static int QuantDeg(double d) {
+        if (d >= 0.0) { return (int)(d * 100.0 + 0.5); }
+        return 0 - (int)((0.0 - d) * 100.0 + 0.5);
+    }
+
+    // echarts 坐标（1/scale 度的整数）→ 0.01° 整数，半值远离零。
+    static int QuantScaled(int v, int scale) {
+        int a = v;
+        if (a < 0) { a = 0 - a; }
+        int q = (a * 100 + scale / 2) / scale;
+        return v < 0 ? 0 - q : q;
+    }
+
+    // 编码串按 UTF-8 解成码点序列。echarts 编码以 JS charCodeAt 的
+    // UTF-16 码元为单位，但其 delta 有界，落在 BMP 内，码点即码元。
+    static List<int> CodePoints(string s) {
+        List<int> cps = new List<int>();
+        int n = s.Length;
+        int i = 0;
+        while (i < n) {
+            int b = s[i] & 255;
+            int cp = b;
+            int extra = 0;
+            if (b >= 240) { cp = b & 7; extra = 3; }
+            else if (b >= 224) { cp = b & 15; extra = 2; }
+            else if (b >= 192) { cp = b & 31; extra = 1; }
+            i = i + 1;
+            for (int k = 0; k < extra && i < n; k = k + 1) {
+                cp = (cp << 6) | (s[i] & 63);
+                i = i + 1;
+            }
+            if (cp > 0) { cps.Add(cp); }
+        }
+        return cps;
+    }
+
+    static JsonValue At(JsonValue v, int i) {
+        if (v == null || !v.IsArray() || i < 0 || i >= v.Count()) { return null; }
+        return v.At(i);
+    }
+}
