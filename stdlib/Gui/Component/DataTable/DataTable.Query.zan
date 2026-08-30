@@ -1,0 +1,154 @@
+using System;
+using System.Json;
+
+namespace Gui.Component.DataTable;
+
+/// 查询数据源独立能力。各能力彼此正交，使用位掩码而不是单一
+/// ServerControlled 开关，避免把“能服务端排序”误当成“能服务端聚合”。
+class QueryCapabilities {
+    static const int None = 0;
+    static const int Filter = 1;
+    static const int Sort = 2;
+    static const int Group = 4;
+    static const int Aggregate = 8;
+    static const int Page = 16;
+    static const int StableKeys = 32;
+    static const int Edit = 64;
+    static const int Insert = 128;
+    static const int Delete = 256;
+    static const int Server = 512;
+
+    int mask;
+
+    QueryCapabilities(int value) { this.mask = value; }
+
+    static QueryCapabilities Of(int value) {
+        return new QueryCapabilities(value);
+    }
+
+    int Mask() { return this.mask; }
+    bool Has(int capability) { return (this.mask & capability) != 0; }
+}
+
+/// 可传给本地/远端查询执行器的稳定查询快照。
+/// 当前版本只承载身份和 revision；过滤器、排序树等后续以声明式
+/// 字段加入，避免先把运行时 lambda 或 UI 状态序列化进查询协议。
+class QueryDescriptor {
+    static const int FormatVersion = 1;
+
+    int version;
+    string dataset;
+    int dataRevision;
+    int queryRevision;
+    int viewRevision;
+    int capabilities;
+
+    QueryDescriptor(string datasetName, int dataRev, int queryRev,
+                    int viewRev, int caps) {
+        this.version = QueryDescriptor.FormatVersion;
+        if (datasetName == null) { datasetName = ""; }
+        this.dataset = datasetName;
+        this.dataRevision = dataRev;
+        this.queryRevision = queryRev;
+        this.viewRevision = viewRev;
+        this.capabilities = caps;
+    }
+
+    static QueryDescriptor Of(DataTableState st, string datasetName, int caps) {
+        return new QueryDescriptor(datasetName, st.dataRevision,
+            st.queryRevision, st.viewRevision, caps);
+    }
+
+    string Dataset() { return this.dataset; }
+    int DataRevision() { return this.dataRevision; }
+    int QueryRevision() { return this.queryRevision; }
+    int ViewRevision() { return this.viewRevision; }
+    int Capabilities() { return this.capabilities; }
+
+    /// 逻辑查询相同的判断不包含 viewRevision；列宽、隐藏和冻结不应
+    /// 让远端查询缓存失效。
+    bool SameQuery(QueryDescriptor other) {
+        if (other == null) { return false; }
+        return this.version == other.version
+            && this.dataset == other.dataset
+            && this.dataRevision == other.dataRevision
+            && this.queryRevision == other.queryRevision
+            && this.capabilities == other.capabilities;
+    }
+
+    /// 渲染/显示快照是否仍对应当前状态。
+    bool IsCurrent(DataTableState st) {
+        if (st == null) { return false; }
+        return this.dataRevision == st.dataRevision
+            && this.queryRevision == st.queryRevision
+            && this.viewRevision == st.viewRevision;
+    }
+
+    JsonValue ToJsonValue() {
+        JsonValue root = JsonValue.NewObject();
+        // 字段写入顺序固定，ToJson() 可作为稳定 canonical 文本。
+        root.Put("ver", JsonValue.NewNum(Convert.ToString(this.version)));
+        root.Put("dataset", JsonValue.NewStr(this.dataset));
+        root.Put("data", JsonValue.NewNum(Convert.ToString(this.dataRevision)));
+        root.Put("query", JsonValue.NewNum(Convert.ToString(this.queryRevision)));
+        root.Put("view", JsonValue.NewNum(Convert.ToString(this.viewRevision)));
+        root.Put("caps", JsonValue.NewNum(Convert.ToString(this.capabilities)));
+        return root;
+    }
+
+    string ToJson() { return this.ToJsonValue().ToJson(); }
+
+    /// FNV-1a 的 30 位稳定指纹；只是缓存键辅助，不替代 SameQuery。
+    int Fingerprint() {
+        int h = 2166136261;
+        string text = this.ToJson();
+        for (int i = 0; i < text.Length; i = i + 1) {
+            h = ((h ^ ((int)text[i] & 255)) * 16777619) & 1073741823;
+        }
+        return h;
+    }
+
+    static QueryDescriptor FromJson(string text) {
+        if (text == null || text.Length == 0) { return null; }
+        JsonValue root = JsonValue.ParseLenient(text);
+        if (root == null || !root.IsObject()) { return null; }
+        if (!root.Has("ver") || !root.Has("dataset") || !root.Has("data")
+            || !root.Has("query") || !root.Has("view") || !root.Has("caps")) {
+            return null;
+        }
+        if (root.Int("ver", 0) != QueryDescriptor.FormatVersion) { return null; }
+        int dataRev = root.Int("data", -1);
+        int queryRev = root.Int("query", -1);
+        int viewRev = root.Int("view", -1);
+        int caps = root.Int("caps", -1);
+        if (dataRev < 0 || queryRev < 0 || viewRev < 0 || caps < 0) { return null; }
+        return new QueryDescriptor(root.Str("dataset", ""), dataRev,
+            queryRev, viewRev, caps);
+    }
+}
+
+partial class DataTable {
+    /// 数据内容、行键或 schema 改变：所有派生查询和显示结果失效。
+    static void InvalidateData(DataTableState st) {
+        st.dataRevision = st.dataRevision + 1;
+        st.queryRevision = st.queryRevision + 1;
+        st.viewRevision = st.viewRevision + 1;
+        st.rowKeysRevision = -1;
+        st.rowKeys.Clear();
+        st.dirty = true;
+    }
+
+    /// 过滤、排序、分组、汇总或分页参数改变：数据身份不变，
+    /// 只使查询和依赖它的显示模型失效。
+    static void InvalidateQuery(DataTableState st) {
+        st.queryRevision = st.queryRevision + 1;
+        st.viewRevision = st.viewRevision + 1;
+        st.dirty = true;
+    }
+
+    /// 列宽、顺序、隐藏、冻结或主题显示状态改变：只使几何/帧失效。
+    static void InvalidateView(DataTableState st) {
+        st.viewRevision = st.viewRevision + 1;
+        st.dirty = true;
+    }
+}
