@@ -1,0 +1,115 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace DataTableSparsePageTest;
+
+class SparseSource : SparseServerDataSource {
+    static List<DataRow> all;
+    static int calls;
+    static List<int> starts;
+
+    static SparseSource Create(List<DataRow> rows, int pageSize) {
+        SparseSource s = new SparseSource(pageSize);
+        s.Setup(pageSize);
+        SparseSource.all = rows;
+        SparseSource.calls = 0;
+        SparseSource.starts = new List<int>();
+        s.SetKnownTotal(rows.Count);
+        return s;
+    }
+
+    override int FillPage(int start, int count, List<DataRow> dst) {
+        SparseSource.calls = SparseSource.calls + 1;
+        SparseSource.starts.Add(start);
+        int n = 0;
+        for (int i = start; i < SparseSource.all.Count && n < count; i = i + 1) {
+            dst.Add(SparseSource.all[i]);
+            n = n + 1;
+        }
+        return n;
+    }
+}
+
+class AsyncSparseSource : SparseServerDataSource {
+    static List<DataRow> all;
+    static int requestedStart;
+    static int requestedGeneration;
+
+    static AsyncSparseSource Create(List<DataRow> rows, int pageSize) {
+        AsyncSparseSource s = new AsyncSparseSource(pageSize);
+        s.Setup(pageSize);
+        AsyncSparseSource.all = rows;
+        s.SetKnownTotal(rows.Count);
+        return s;
+    }
+
+    override void FetchPage(int start, int count, int gen) {
+        AsyncSparseSource.requestedStart = start;
+        AsyncSparseSource.requestedGeneration = gen;
+    }
+
+    void Deliver(int start, int gen) {
+        List<DataRow> result = new List<DataRow>();
+        result.Add(Program.Row(start));
+        this.FinishPage(result, 1, AsyncSparseSource.all.Count, gen);
+    }
+
+    void DeliverCurrent() {
+        this.Deliver(AsyncSparseSource.requestedStart, this.Generation());
+    }
+}
+
+class Program {
+    static DataRow Row(int i) {
+        DataRow r = new DataRow();
+        r.Push("r" + Convert.ToString(i));
+        r.Push(Convert.ToString(i));
+        return r;
+    }
+
+    static void Main() {
+        List<DataRow> rows = new List<DataRow>();
+        for (int i = 0; i < 100; i = i + 1) { rows.Add(Program.Row(i)); }
+        SparseSource src = SparseSource.Create(rows, 10);
+
+        src.RequestBlock(55);
+        Console.WriteLine("calls1=" + Convert.ToString(SparseSource.calls));
+        Console.WriteLine("poll1=" + src.Poll());
+        Console.WriteLine("ready55=" + src.CellReady(55, 0));
+        Console.WriteLine("ready0=" + src.CellReady(0, 0));
+        Console.WriteLine("text55=" + src.CellText(55, 0));
+        Console.WriteLine("rowCount=" + Convert.ToString(src.RowCount()));
+
+        src.RequestBlock(55);
+        Console.WriteLine("cacheHit=" + Convert.ToString(SparseSource.calls));
+        src.RequestBlock(5);
+        Console.WriteLine("calls2=" + Convert.ToString(SparseSource.calls));
+        Console.WriteLine("poll2=" + src.Poll());
+        Console.WriteLine("text5=" + src.CellText(5, 0));
+
+        int oldGen = src.Generation();
+        src.RequestBlock(25);
+        src.Invalidate();
+        Console.WriteLine("generation=" + Convert.ToString(src.Generation()));
+        Console.WriteLine("generationOk=" + (src.Generation() == oldGen + 1));
+        Console.WriteLine("ready55AfterInvalidate=" + src.CellReady(55, 0));
+        Console.WriteLine("text55AfterInvalidate=" + src.CellText(55, 0));
+        src.RequestBlock(95);
+        Console.WriteLine("poll3=" + src.Poll());
+        Console.WriteLine("text95=" + src.CellText(95, 0));
+        Console.WriteLine("hasMore=" + src.HasMore());
+
+        AsyncSparseSource pendingSource = AsyncSparseSource.Create(rows, 10);
+        pendingSource.RequestBlock(20);
+        int stale = pendingSource.Generation();
+        pendingSource.Invalidate();
+        pendingSource.FinishPage(new List<DataRow> { Program.Row(20) }, 1, rows.Count, stale);
+        Console.WriteLine("stalePoll=" + pendingSource.Poll());
+        Console.WriteLine("staleReady=" + pendingSource.CellReady(20, 0));
+        pendingSource.RequestBlock(20);
+        pendingSource.DeliverCurrent();
+        Console.WriteLine("currentPoll=" + pendingSource.Poll());
+        Console.WriteLine("currentText=" + pendingSource.CellText(20, 0));
+    }
+}
