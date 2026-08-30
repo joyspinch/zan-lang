@@ -2249,6 +2249,9 @@ done:
     emit_site_dtor_table(g);
     emit_site_tyname_table(g);
     emit_site_meta_table(g);
+    /* descriptor builds fill the per-shape records instead of the three
+     * tables above (which no-op there); needs every destructor declared */
+    zan_irgen_emit_arc_desc_init(g);
     emit_vtables(g);
     /* Reflected method/constructor tables: their records point at the real
      * functions and at thunks over them, so they can only be filled in once

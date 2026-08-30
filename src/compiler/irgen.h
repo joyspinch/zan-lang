@@ -382,6 +382,14 @@ struct zan_irgen {
     int          *site_coll;     /* per site: 0=class, 1=List, 2=StringBuilder */
     zan_type_t   **site_coll_elem; /* per site: List element type (for release) */
     int          leak_site_count; /* number of distinct `new` sites assigned */
+    /* Per-shape descriptor globals (non-check-leaks builds): one
+     * {dtor, tynames, meta, site_id} record per alloc-site shape, stored in
+     * the object header instead of a site index. All three pinning tables
+     * (site_dtors / site_tynames / site_meta) disappear in this mode, so
+     * --gc-sections can drop every descriptor's functions that no live code
+     * references. */
+    LLVMValueRef *desc_gv;       /* per shape: @__zan_desc_<i> global */
+    bool         desc_hdr;       /* header word = descriptor pointer mode */
     LLVMValueRef fn_report_leaks; /* void __zan_report_leaks(void) */
     const char  *src_file;        /* source path, for runtime diagnostics */
     bool         runtime_checks;  /* insert div-by-zero (etc.) guards; default true */

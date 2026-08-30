@@ -419,6 +419,36 @@ static LLVMValueRef zan_hdr_read_ok(zan_irgen_t *g, LLVMValueRef obj) {
     return phi;
 }
 
+/* Create the per-shape descriptor global for a freshly reserved site: an
+ * internal constant {i8* dtor, i8* tynames, i8* meta, i64 site}. Created at
+ * reserve time (allocation sites reference it immediately); the initializer
+ * is filled in at finalize once every release/typeinfo function exists. */
+static LLVMTypeRef arc_desc_type(zan_irgen_t *g) {
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    return LLVMStructType((LLVMTypeRef[]){ i8p, i8p, i8p, i64t }, 4, 0);
+}
+
+static LLVMValueRef create_arc_desc(zan_irgen_t *g, int site_idx) {
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef dt = arc_desc_type(g);
+    char dname[64];
+    snprintf(dname, sizeof(dname), "__zan_desc_%d", site_idx);
+    LLVMValueRef dg = LLVMAddGlobal(g->mod, dt, dname);
+    LLVMSetLinkage(dg, LLVMInternalLinkage);
+    LLVMSetGlobalConstant(dg, 1);
+    /* all-null until finalize fills the real {dtor, tynames, meta, site};
+     * a zeroed record makes every reader take its fallback (plain release,
+     * not-a-T, fallback typeinfo), which is also the safe state if the
+     * module dies before finalize */
+    LLVMValueRef z = LLVMConstNull(i8p);
+    LLVMSetInitializer(dg, LLVMConstNamedStruct(dt,
+        (LLVMValueRef[]){ z, z, z, LLVMConstInt(i64t, 0, 0) }, 4));
+    g->desc_gv[site_idx] = dg;
+    return dg;
+}
+
 static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
                             zan_type_t *inst, int coll_kind,
                             zan_type_t *coll_elem) {
@@ -446,6 +476,7 @@ static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
     if (g->site_inst) g->site_inst[site_idx] = inst;
     if (g->site_coll) g->site_coll[site_idx] = coll_kind;
     if (g->site_coll_elem) g->site_coll_elem[site_idx] = coll_elem;
+    if (g->desc_hdr) create_arc_desc(g, site_idx);
     return site_idx;
 }
 
@@ -464,7 +495,24 @@ static int reserve_closure_site(zan_irgen_t *g) {
     if (g->site_inst) g->site_inst[site_idx] = NULL;
     if (g->site_coll) g->site_coll[site_idx] = 0;
     if (g->site_coll_elem) g->site_coll_elem[site_idx] = NULL;
+    if (g->desc_hdr) {
+        /* closure shape: the record releases its own captures, so the
+         * descriptor's dtor stays null and release falls back to the plain
+         * rc decrement (same as the table's null entry did) */
+        create_arc_desc(g, site_idx);
+    }
     return site_idx;
+}
+
+/* The second zan_rt_alloc argument: in check-leaks builds the site index the
+ * leak report keys on; in descriptor builds the per-shape descriptor pointer
+ * release_dyn / is-as / reflect read back from the object header. */
+static LLVMValueRef arc_site_arg(zan_irgen_t *g, int site_idx) {
+    if (!g->desc_hdr)
+        return LLVMConstInt(LLVMInt64TypeInContext(g->ctx),
+                            (unsigned long long)site_idx, 0);
+    return LLVMBuildPtrToInt(g->builder, g->desc_gv[site_idx],
+                             LLVMInt64TypeInContext(g->ctx), "desc.arg");
 }
 
 /* String RC header magic and sentinel refcount, and the object header layout
@@ -1063,6 +1111,11 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMSetLinkage(g->g_live, LLVMInternalLinkage);
 
     g->leak_site_count = 0;
+    /* descriptor mode (default; check_leaks keeps the site-index layout):
+     * one record global per alloc-site shape, created lazily at reserve time
+     * and initialized at finalize */
+    g->desc_gv = (LLVMValueRef *)calloc(ZAN_MAX_LEAK_SITES, sizeof(LLVMValueRef));
+    g->desc_hdr = !check_leaks;
     {
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i8p  = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1074,21 +1127,29 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->g_site_names = LLVMAddGlobal(g->mod, g->site_names_type, "__zan_site_names");
         LLVMSetInitializer(g->g_site_names, LLVMConstNull(g->site_names_type));
         LLVMSetLinkage(g->g_site_names, LLVMInternalLinkage);
-        /* dynamic release dispatch: per-site concrete destructor table */
-        g->site_dtors_type = LLVMArrayType(i8p, ZAN_MAX_LEAK_SITES);
-        g->g_site_dtors = LLVMAddGlobal(g->mod, g->site_dtors_type, "__zan_site_dtors");
-        LLVMSetInitializer(g->g_site_dtors, LLVMConstNull(g->site_dtors_type));
-        LLVMSetLinkage(g->g_site_dtors, LLVMInternalLinkage);
+        /* per-site ancestor-name list pointers for runtime `is`/`as` checks.
+         * The three per-shape tables below exist ONLY in check-leaks mode:
+         * descriptor builds (default) store one {dtor, tynames, meta, site}
+         * record pointer in the object header instead, so no global array
+         * pins every class's methods and --gc-sections can drop dead ones. */
+        if (!g->desc_hdr) {
+            g->site_dtors_type = LLVMArrayType(i8p, ZAN_MAX_LEAK_SITES);
+            g->g_site_dtors = LLVMAddGlobal(g->mod, g->site_dtors_type, "__zan_site_dtors");
+            LLVMSetInitializer(g->g_site_dtors, LLVMConstNull(g->site_dtors_type));
+            LLVMSetLinkage(g->g_site_dtors, LLVMInternalLinkage);
+        }
         /* per-site ancestor-name list pointers for runtime `is`/`as` checks */
-        g->site_tynames_type = LLVMArrayType(i8p, ZAN_MAX_LEAK_SITES);
-        g->g_site_tynames = LLVMAddGlobal(g->mod, g->site_tynames_type, "__zan_site_tynames");
-        LLVMSetInitializer(g->g_site_tynames, LLVMConstNull(g->site_tynames_type));
-        LLVMSetLinkage(g->g_site_tynames, LLVMInternalLinkage);
-        /* per-site reflection type record, for obj.GetType() */
-        g->site_meta_type = LLVMArrayType(i8p, ZAN_MAX_LEAK_SITES);
-        g->g_site_meta = LLVMAddGlobal(g->mod, g->site_meta_type, "__zan_site_meta");
-        LLVMSetInitializer(g->g_site_meta, LLVMConstNull(g->site_meta_type));
-        LLVMSetLinkage(g->g_site_meta, LLVMInternalLinkage);
+        if (!g->desc_hdr) {
+            g->site_tynames_type = LLVMArrayType(i8p, ZAN_MAX_LEAK_SITES);
+            g->g_site_tynames = LLVMAddGlobal(g->mod, g->site_tynames_type, "__zan_site_tynames");
+            LLVMSetInitializer(g->g_site_tynames, LLVMConstNull(g->site_tynames_type));
+            LLVMSetLinkage(g->g_site_tynames, LLVMInternalLinkage);
+            /* per-site reflection type record, for obj.GetType() */
+            g->site_meta_type = LLVMArrayType(i8p, ZAN_MAX_LEAK_SITES);
+            g->g_site_meta = LLVMAddGlobal(g->mod, g->site_meta_type, "__zan_site_meta");
+            LLVMSetInitializer(g->g_site_meta, LLVMConstNull(g->site_meta_type));
+            LLVMSetLinkage(g->g_site_meta, LLVMInternalLinkage);
+        }
         g->site_syms = (zan_symbol_t **)calloc(ZAN_MAX_LEAK_SITES, sizeof(zan_symbol_t *));
         g->site_coll = (int *)calloc(ZAN_MAX_LEAK_SITES, sizeof(int));
         g->site_coll_elem = (zan_type_t **)calloc(ZAN_MAX_LEAK_SITES, sizeof(zan_type_t *));
@@ -1830,20 +1891,40 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
         LLVMValueRef sptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "sptr");
         LLVMValueRef siptr = LLVMBuildBitCast(g->builder, sptr, LLVMPointerType(i64, 0), "siptr");
-        LLVMValueRef site = LLVMBuildLoad2(g->builder, i64, siptr, "site");
-        LLVMValueRef inrange = zan_icmp(g->builder, LLVMIntULT, site,
-            LLVMConstInt(i64, ZAN_MAX_LEAK_SITES, 0), "inrange");
-        LLVMBuildCondBr(g->builder, inrange, lookup, fb);
-        LLVMPositionBuilderAtEnd(g->builder, lookup);
-        LLVMValueRef z32 = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
-        LLVMValueRef gidx[2] = { z32, site };
-        LLVMValueRef dpp = LLVMBuildGEP2(g->builder, g->site_dtors_type, g->g_site_dtors, gidx, 2, "dpp");
-        LLVMValueRef dtor = LLVMBuildLoad2(g->builder, i8ptr, dpp, "dtor");
-        LLVMValueRef hasd = zan_icmp(g->builder, LLVMIntNE, dtor, LLVMConstNull(i8ptr), "hasd");
-        LLVMBuildCondBr(g->builder, hasd, calld, fb);
+        LLVMValueRef dpp;
+        if (!g->desc_hdr) {
+            /* site-index mode (check-leaks): dispatch through the dtor table */
+            LLVMValueRef site = LLVMBuildLoad2(g->builder, i64, siptr, "site");
+            LLVMValueRef inrange = zan_icmp(g->builder, LLVMIntULT, site,
+                LLVMConstInt(i64, ZAN_MAX_LEAK_SITES, 0), "inrange");
+            LLVMBuildCondBr(g->builder, inrange, lookup, fb);
+            LLVMPositionBuilderAtEnd(g->builder, lookup);
+            LLVMValueRef z32 = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+            LLVMValueRef gidx[2] = { z32, site };
+            LLVMValueRef dtor = LLVMBuildLoad2(g->builder, i8ptr,
+                LLVMBuildGEP2(g->builder, g->site_dtors_type, g->g_site_dtors,
+                              gidx, 2, "dtorp"), "dtor");
+            dpp = dtor;
+            LLVMValueRef hasd = zan_icmp(g->builder, LLVMIntNE, dtor, LLVMConstNull(i8ptr), "hasd");
+            LLVMBuildCondBr(g->builder, hasd, calld, fb);
+        } else {
+            /* descriptor mode: the header word is the record pointer itself;
+             * load its dtor field (offset 0) and call it when non-null */
+            LLVMValueRef desc = LLVMBuildLoad2(g->builder, i64, siptr, "desc");
+            LLVMValueRef dnz = zan_icmp(g->builder, LLVMIntNE, desc,
+                LLVMConstInt(i64, 0, 0), "descnz");
+            LLVMBuildCondBr(g->builder, dnz, lookup, fb);
+            LLVMPositionBuilderAtEnd(g->builder, lookup);
+            LLVMValueRef desc_p = LLVMBuildIntToPtr(g->builder, desc,
+                LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0), "desc.p");
+            dpp = LLVMBuildLoad2(g->builder, i8ptr, desc_p, "dtor");
+            LLVMValueRef hasd = zan_icmp(g->builder, LLVMIntNE, dpp,
+                LLVMConstNull(i8ptr), "hasd");
+            LLVMBuildCondBr(g->builder, hasd, calld, fb);
+        }
         LLVMPositionBuilderAtEnd(g->builder, calld);
         LLVMTypeRef dfnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
-        LLVMValueRef dfn = LLVMBuildBitCast(g->builder, dtor, LLVMPointerType(dfnty, 0), "dfn");
+        LLVMValueRef dfn = LLVMBuildBitCast(g->builder, dpp, LLVMPointerType(dfnty, 0), "dfn");
         zan_call2(g->builder, dfnty, dfn, &obj, 1, "");
         LLVMBuildBr(g->builder, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, fb);
@@ -3243,7 +3324,7 @@ static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *exp
     LLVMTypeRef alloc_fn_type = LLVMFunctionType(i8ptr,
         (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0);
     LLVMValueRef args[] = { LLVMConstInt(i64, (unsigned long long)size, 0),
-                            LLVMConstInt(i64, (unsigned long long)site_idx, 0),
+                            arc_site_arg(g, site_idx),
                             site_name };
     return zan_call2(g->builder, alloc_fn_type, g->rt_alloc, args, 3, "coll");
 }

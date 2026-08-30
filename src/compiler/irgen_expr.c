@@ -1690,10 +1690,10 @@ static LLVMValueRef emit_binding_value(zan_irgen_t *g, zan_type_t *bind_t,
 
     /* heap-allocate the Binding object (same path as `new Binding<T>()`) */
     LLVMValueRef site_name = LLVMConstNull(i8ptr);
-    LLVMValueRef site_val = LLVMConstInt(i64, 0, 0);
+    LLVMValueRef site_val;
     {
         int site_idx = reserve_arc_site(g, bsym, bind_t, 0, NULL);
-        site_val = LLVMConstInt(i64, (unsigned long long)site_idx, 0);
+        site_val = arc_site_arg(g, site_idx);
         if (g->check_leaks) {
             char site_buf[600];
             const char *sfile = loc_site_file(g, rhs->loc);
@@ -5987,7 +5987,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                         LLVMValueRef sz = LLVMSizeOf(st);
                         LLVMValueRef site_name = LLVMConstNull(i8ptr);
-                        LLVMValueRef site_val = LLVMConstInt(i64, 0, 0);
+                        LLVMValueRef site_val;
                         {
                             /* Assign a stable allocation-site index (always: it
                              * also keys dynamic release dispatch to this site's
@@ -5997,7 +5997,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                 resolve_type_ctx(g, expr->new_expr.type);
                             int site_idx = reserve_arc_site(
                                 g, sym, site_inst, 0, NULL);
-                            site_val = LLVMConstInt(i64, (unsigned long long)site_idx, 0);
+                            site_val = arc_site_arg(g, site_idx);
                             if (g->check_leaks) {
                                 char site_buf[600];
                                 const char *sfile = loc_site_file(g, expr->loc);
@@ -7375,7 +7375,7 @@ static LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
     LLVMValueRef table = LLVMGetNamedGlobal(g->mod, "__zan_site_tynames");
-    if (!table) return LLVMConstInt(i1, 0, 0);
+    if (!g->desc_hdr && !table) return LLVMConstInt(i1, 0, 0);
     LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
     LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef false_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.f");
@@ -7387,16 +7387,17 @@ static LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
     LLVMBasicBlockRef loop = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.l");
     LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.b");
     LLVMBasicBlockRef next = LLVMAppendBasicBlockInContext(g->ctx, fn, "is.n");
+    (void)cur;
 
     /* null object: not a T */
     LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, x,
         LLVMConstNull(LLVMTypeOf(x)), "is.nul");
     LLVMBuildCondBr(g->builder, isnull, false_bb, head);
 
-    /* site index at obj-8 (second header word). A string stored in an
+    /* site word at obj-8 (second header word). A string stored in an
      * `object` slot is a bare buffer whose second header word carries
-     * the string tag instead of a site index, so probe for it first:
-     * `x is string` must match, anything else must not. */
+     * the string tag instead of a site index/descriptor, so probe for it
+     * first: `x is string` must match, anything else must not. */
     LLVMPositionBuilderAtEnd(g->builder, head);
     LLVMValueRef tstr = LLVMBuildGlobalStringPtr(g->builder, tname, "is.tn");
     LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
@@ -7427,20 +7428,39 @@ static LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
      * per-site name list is null for any never-registered index, so the walk
      * below answers false for those anyway. */
     LLVMPositionBuilderAtEnd(g->builder, oob_bb);
-    LLVMValueRef oob = zan_or(g->builder,
-        zan_icmp(g->builder, LLVMIntSLT, site, LLVMConstInt(i64, 0, 0), "is.neg"),
-        zan_icmp(g->builder, LLVMIntSGE, site,
-            LLVMConstInt(i64, ZAN_MAX_LEAK_SITES, 0), "is.oob"),
-        "is.oob2");
+    LLVMValueRef oob;
+    if (!g->desc_hdr) {
+        oob = zan_or(g->builder,
+            zan_icmp(g->builder, LLVMIntSLT, site, LLVMConstInt(i64, 0, 0), "is.neg"),
+            zan_icmp(g->builder, LLVMIntSGE, site,
+                LLVMConstInt(i64, ZAN_MAX_LEAK_SITES, 0), "is.oob"),
+            "is.oob2");
+    } else {
+        /* descriptor mode: the header word is the record pointer (never a
+         * small integer); zero means "no descriptor" -> not a T */
+        oob = zan_icmp(g->builder, LLVMIntEQ, site, LLVMConstInt(i64, 0, 0),
+                       "is.nodsc");
+    }
     LLVMBuildCondBr(g->builder, oob, false_bb, loop);
 
     /* walk the ancestor-name list */
     LLVMPositionBuilderAtEnd(g->builder, loop);
     LLVMValueRef idx = LLVMBuildPhi(g->builder, i64, "is.i");
-    LLVMValueRef list_p = LLVMBuildGEP2(g->builder,
-        LLVMArrayType(i8ptr, ZAN_MAX_LEAK_SITES), table,
-        (LLVMValueRef[]){ LLVMConstInt(i64, 0, 0), site }, 2, "is.lp");
-    LLVMValueRef list = LLVMBuildLoad2(g->builder, i8ptr, list_p, "is.list");
+    LLVMValueRef list;
+    if (!g->desc_hdr) {
+        LLVMValueRef list_p = LLVMBuildGEP2(g->builder,
+            LLVMArrayType(i8ptr, ZAN_MAX_LEAK_SITES), table,
+            (LLVMValueRef[]){ LLVMConstInt(i64, 0, 0), site }, 2, "is.lp");
+        list = LLVMBuildLoad2(g->builder, i8ptr, list_p, "is.list");
+    } else {
+        /* load the record, then its tynames field (offset 8) */
+        LLVMValueRef dp = LLVMBuildIntToPtr(g->builder, site,
+            LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0), "is.dsc");
+        LLVMValueRef tn_off = LLVMConstInt(i64, 8, 0);
+        LLVMValueRef tn_p = LLVMBuildGEP2(g->builder,
+            LLVMInt8TypeInContext(g->ctx), dp, &tn_off, 1, "is.tnp");
+        list = LLVMBuildLoad2(g->builder, i8ptr, tn_p, "is.list");
+    }
     LLVMValueRef lnull = zan_icmp(g->builder, LLVMIntEQ, list,
         LLVMConstNull(i8ptr), "is.ln");
     LLVMBuildCondBr(g->builder, lnull, false_bb, body);
@@ -8090,7 +8110,7 @@ static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
     }
     LLVMValueRef alloc_args[3] = {
         LLVMBuildPtrToInt(g->builder, LLVMSizeOf(rec_ty), i64, "clo.size"),
-        LLVMConstInt(i64, (unsigned long long)site_idx, 0), site_name };
+        arc_site_arg(g, site_idx), site_name };
     LLVMValueRef rec = zan_call2(g->builder,
         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0),
         g->rt_alloc, alloc_args, 3, "clo");
@@ -8214,7 +8234,7 @@ static LLVMValueRef emit_box_cell(zan_irgen_t *g, zan_loc_t loc,
     }
     LLVMValueRef alloc_args[3] = {
         LLVMBuildPtrToInt(g->builder, LLVMSizeOf(rec_ty), i64, "box.size"),
-        LLVMConstInt(i64, (unsigned long long)site_idx, 0), site_name };
+        arc_site_arg(g, site_idx), site_name };
     LLVMValueRef cell = zan_call2(g->builder,
         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0),
         g->rt_alloc, alloc_args, 3, "box");

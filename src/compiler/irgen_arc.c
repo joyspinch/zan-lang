@@ -1042,9 +1042,11 @@ static void emit_all_class_releases(zan_irgen_t *g) {
 
 /* Fill __zan_site_dtors[site] with the concrete per-class destructor recorded
  * for that allocation site, so zan_rt_release_dyn can dispatch on runtime
- * type. Must run after emit_all_class_releases (all destructors declared). */
+ * type. Must run after emit_all_class_releases (all destructors declared).
+ * Descriptor builds keep no table: the descriptor's dtor field is filled by
+ * emit_arc_desc_init below. */
 static void emit_site_dtor_table(zan_irgen_t *g) {
-    if (!g->site_syms) return;
+    if (!g->site_syms || g->desc_hdr) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     int n = ZAN_MAX_LEAK_SITES;
     LLVMValueRef *elems = (LLVMValueRef *)calloc((size_t)n, sizeof(LLVMValueRef));
@@ -1071,7 +1073,7 @@ static void emit_site_dtor_table(zan_irgen_t *g) {
  * their intrinsic name (List/StringBuilder/Dict). Runs at finalize, after all
  * sites are registered. */
 static void emit_site_tyname_table(zan_irgen_t *g) {
-    if (!g->site_syms) return;
+    if (!g->site_syms || g->desc_hdr) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     int n = ZAN_MAX_LEAK_SITES;
@@ -1117,6 +1119,18 @@ static void emit_site_tyname_table(zan_irgen_t *g) {
     LLVMSetInitializer(g->g_site_tynames, LLVMConstArray(i8ptr, elems, (unsigned)n));
     free(elems);
 }
+
+/* Descriptor builds (default): fill each __zan_desc_<site> with
+ * {dtor, tynames, meta, site}, replacing the three [4096 x i8*] tables. The
+ * per-field logic mirrors emit_site_dtor_table / emit_site_tyname_table /
+ * emit_site_meta_table; each descriptor is a small per-shape constant only
+ * live code references, so --gc-sections can drop every unreachable class's
+ * release function. Runs at finalize, after emit_all_class_releases declared
+ * every destructor. Defined at the end of irgen_reflect.c (needs
+ * refl_meta_for); declared here so the finalize sequence in irgen_emit.c
+ * reaches it. */
+void zan_irgen_emit_arc_desc_init(zan_irgen_t *g);
+
 
 /* ---- virtual dispatch: vtable globals + dynamic call ---------------------
  * Each class with virtual/override methods gets an internal global

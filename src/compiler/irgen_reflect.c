@@ -634,7 +634,7 @@ static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMValueRef raw = zan_call2(g->builder,
         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0),
         g->rt_alloc, (LLVMValueRef[]){ LLVMSizeOf(st),
-            LLVMConstInt(i64, (unsigned long long)site, 0),
+            arc_site_arg(g, site),
             LLVMConstNull(i8ptr) }, 3, "refl.newobj");
     LLVMValueRef obj = LLVMBuildBitCast(g->builder, raw,
                                         LLVMPointerType(st, 0), "refl.objp");
@@ -1454,13 +1454,30 @@ static LLVMValueRef refl_obj_type_fn(zan_irgen_t *g) {
 
     LLVMPositionBuilderAtEnd(g->builder, tbl);
     LLVMValueRef site = refl_hdr_i64(g, obj, ZAN_OBJ_SITE_OFF, "refl.site");
-    /* site 0 means "not recorded"; the string magic and any garbage are out of
-     * range for the unsigned compare */
-    LLVMValueRef in_range = LLVMBuildAnd(g->builder,
-        LLVMBuildICmp(g->builder, LLVMIntUGT, site, LLVMConstInt(i64, 0, 0), "refl.s0"),
-        LLVMBuildICmp(g->builder, LLVMIntULT, site,
-                      LLVMConstInt(i64, ZAN_MAX_LEAK_SITES, 0), "refl.sn"),
-        "refl.sok");
+    LLVMValueRef in_range;
+    if (!g->desc_hdr) {
+        /* site 0 means "not recorded"; the string magic and any garbage are out
+         * of range for the unsigned compare */
+        in_range = LLVMBuildAnd(g->builder,
+            LLVMBuildICmp(g->builder, LLVMIntUGT, site, LLVMConstInt(i64, 0, 0), "refl.s0"),
+            LLVMBuildICmp(g->builder, LLVMIntULT, site,
+                          LLVMConstInt(i64, ZAN_MAX_LEAK_SITES, 0), "refl.sn"),
+            "refl.sok");
+    } else {
+        /* descriptor mode: the header word is the record pointer; load its
+         * meta field (offset 16). Zero record -> fallback. */
+        LLVMValueRef dp = LLVMBuildIntToPtr(g->builder, site, i8ptr, "refl.dsc");
+        LLVMValueRef m_off = LLVMConstInt(i64, 16, 0);
+        LLVMValueRef m_p = LLVMBuildGEP2(g->builder, i8, dp, &m_off, 1, "refl.mp");
+        LLVMValueRef m = LLVMBuildLoad2(g->builder, i8ptr, m_p, "refl.m");
+        LLVMBuildCondBr(g->builder, LLVMBuildIsNull(g->builder, m, "refl.mnull"), fb, hit);
+        LLVMPositionBuilderAtEnd(g->builder, hit);
+        LLVMBuildRet(g->builder, m);
+        LLVMPositionBuilderAtEnd(g->builder, fb);
+        LLVMBuildRet(g->builder, fallback);
+        if (save) LLVMPositionBuilderAtEnd(g->builder, save);
+        return fn;
+    }
     LLVMBasicBlockRef ld = LLVMAppendBasicBlockInContext(g->ctx, fn, "ld");
     LLVMBuildCondBr(g->builder, in_range, ld, fb);
 
@@ -2657,4 +2674,88 @@ static void emit_site_meta_table(zan_irgen_t *g) {
     }
     LLVMSetInitializer(g->g_site_meta, LLVMConstArray(i8ptr, elems, (unsigned)n));
     free(elems);
+}
+
+/* Descriptor builds (default): fill each __zan_desc_<site> with
+ * {dtor, tynames, meta, site}, replacing the three [4096 x i8*] tables (see
+ * the declaration in irgen_arc.c). Each descriptor is a small per-shape
+ * constant only live code references, so --gc-sections can drop every
+ * unreachable class's release function. Runs at finalize, after
+ * emit_all_class_releases declared every destructor. */
+void zan_irgen_emit_arc_desc_init(zan_irgen_t *g) {
+    if (!g->desc_hdr || !g->desc_gv) return;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    for (int i = 0; i < g->leak_site_count; i++) {
+        LLVMValueRef dg = g->desc_gv[i];
+        if (!dg) continue;
+        LLVMTypeRef dt = LLVMGlobalGetValueType(dg);
+        LLVMValueRef dtor = LLVMConstNull(i8ptr);
+        LLVMValueRef tynames = LLVMConstNull(i8ptr);
+        LLVMValueRef meta = LLVMConstNull(i8ptr);
+        if (g->site_coll && g->site_coll[i]) {
+            LLVMValueRef fn = get_collection_release_decl(g, i);
+            if (fn) dtor = LLVMConstBitCast(fn, i8ptr);
+            const char *cn = g->site_coll[i] == 1 ? "List"
+                           : g->site_coll[i] == 2 ? "StringBuilder" : "Dict";
+            LLVMValueRef nptr[2] = {
+                LLVMBuildGlobalStringPtr(g->builder, cn, "tn"),
+                LLVMConstNull(i8ptr) };
+            LLVMTypeRef at = LLVMArrayType(i8ptr, 2);
+            char gname[64];
+            snprintf(gname, sizeof(gname), "__zan_tynames_%d", i);
+            LLVMValueRef gv = LLVMAddGlobal(g->mod, at, gname);
+            LLVMSetInitializer(gv, LLVMConstArray(i8ptr, nptr, 2));
+            LLVMSetLinkage(gv, LLVMInternalLinkage);
+            LLVMSetGlobalConstant(gv, 1);
+            LLVMValueRef idxs[] = { LLVMConstInt(i64, 0, 0),
+                                    LLVMConstInt(i64, 0, 0) };
+            tynames = LLVMBuildGEP2(g->builder, at, gv, idxs, 2, "tn.ptr");
+        } else if (g->site_syms[i]) {
+            zan_symbol_t *sym = g->site_syms[i];
+            LLVMValueRef fn = get_class_release_decl(g, sym,
+                                  g->site_inst ? g->site_inst[i] : NULL);
+            if (fn) dtor = LLVMConstBitCast(fn, i8ptr);
+            /* ancestor name list: the class itself plus every base class,
+             * most-derived first, with a trailing null */
+            const char *names[64];
+            int k = 0;
+            zan_symbol_t *cur = sym;
+            while (cur && k < 63) {
+                char buf[320];
+                int len = (int)cur->name.len;
+                if (len > 319) len = 319;
+                memcpy(buf, cur->name.str, (size_t)len);
+                buf[len] = 0;
+                names[k++] = zan_arena_strdup(g->arena, buf, (size_t)len);
+                cur = (cur->type && cur->type->base_type)
+                          ? cur->type->base_type->sym : NULL;
+            }
+            if (k > 0) {
+                LLVMValueRef *nptr = (LLVMValueRef *)calloc((size_t)k + 1,
+                                                            sizeof(LLVMValueRef));
+                for (int j = 0; j < k; j++)
+                    nptr[j] = LLVMBuildGlobalStringPtr(g->builder, names[j], "tn");
+                nptr[k] = LLVMConstNull(i8ptr);
+                LLVMTypeRef at = LLVMArrayType(i8ptr, (unsigned)k + 1);
+                char gname[64];
+                snprintf(gname, sizeof(gname), "__zan_tynames_%d", i);
+                LLVMValueRef gv = LLVMAddGlobal(g->mod, at, gname);
+                LLVMSetInitializer(gv, LLVMConstArray(i8ptr, nptr, (unsigned)k + 1));
+                LLVMSetLinkage(gv, LLVMInternalLinkage);
+                LLVMSetGlobalConstant(gv, 1);
+                free(nptr);
+                LLVMValueRef idxs[] = { LLVMConstInt(i64, 0, 0),
+                                        LLVMConstInt(i64, 0, 0) };
+                tynames = LLVMBuildGEP2(g->builder, at, gv, idxs, 2, "tn.ptr");
+            }
+            /* reflection type record (GetType); only when the module reflects */
+            if (g->refl_used && sym->type)
+                meta = refl_meta_for(g, sym->type, sym->name.str,
+                                     (int)sym->name.len);
+        }
+        LLVMValueRef fields[4] = { dtor, tynames, meta,
+                                   LLVMConstInt(i64, (unsigned long long)i, 0) };
+        LLVMSetInitializer(dg, LLVMConstNamedStruct(dt, fields, 4));
+    }
 }

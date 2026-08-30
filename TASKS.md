@@ -2929,3 +2929,44 @@ A71 归因出四条编译器杠杆，本条把能实测的先测掉，用数据�
   全零 initializer（模块死在 finalize 前也取安全回退路径），zanc 恢复
   正常，本临时关闭随之撤回，desc_hdr 默认开启（check_leaks 仍走
   site-index 布局）。
+
+# A75 · ARC 描述符头：对象头存 per-shape 描述符指针，三张钉死表（site_dtors/site_tynames/site_meta）整体退役 —— ✅ 已完成（2026-08-31）
+
+- **背景**：A74 实锤空窗口 --publish 895/1010 定义函数从 main 不可达但全款进镜像，根因是
+  `__zan_site_dtors`/`__zan_site_tynames`/`__zan_site_meta` 三张 `[4096 x i8*]` internal
+  常量数组把 542 个根函数钉死（ld 无法对数组元素判活，死簇再传播）。
+- **设计**：对象头第二字（原 site index 槽，ZAN_OBJ_SITE_OFF）改存 **per-shape 描述符指针**：
+  `@__zan_desc_<i> = internal constant {ptr dtor, ptr tynames, ptr meta, i64 site}`，
+  reserve 时创建（全零 initializer：死在 finalize 前也走安全回退——plain release / not-a-T /
+  fallback typeinfo），finalize 时由 `zan_irgen_emit_arc_desc_init`（irgen_reflect.c，需
+  refl_meta_for）一次性填满（dtor 来自 get_class_release_decl/get_collection_release_decl、
+  tynames 照抄 emit_site_tyname_table 的祖先链构造、meta 仅 refl_used 时填）。
+  - 分配点（new/Binding/List/StringBuilder/Dict/closure/box/reflect-ctor thunk 共 6 处
+    rt_alloc 调用点）经 `arc_site_arg()` 统一传参：check_leaks 传站点 id 常量，desc 模式传
+    描述符指针 PtrToInt——rt_alloc 签名不动，运行时只透传一字。
+  - 读者全部双模：`zan_rt_release_dyn`（desc→加载 dtor 字段非空则间接调用，null 回退
+    zan_rt_release）；`emit_runtime_is_check`（desc→加载 tynames 字段（offset 8）后照旧
+    strcmp 祖先链；desc=0 即 not-a-T）；`__zan_refl_obj_type`（desc→加载 meta 字段
+    （offset 16）非空即返回）。字符串 tag 探针（高 32 位 0x5a414e53）先行，描述符指针
+    永不撞 tag；arc-guard quarantine 覆写 site 字照旧安全（两模式都不再依赖其中内容）。
+  - **check_leaks 构建保留全部旧布局**（desc_hdr=false 路径）：site_dtors/tynames/meta
+    三表 + 报表机制原样，`--check-leaks` 语义零变化。
+- **体积实效（--publish）**：空窗口 1,776,640→1,714,688B（−62KB/−3.5%）；gallery
+  9,291,264→9,573,888B（+3%，见下「未达预期」）。IR 口径：空窗口定义函数 1,010→9,975
+  无关紧要，可达根从 542（表数组钉死）降为 desc 引用（仅真正 `is`/release/reflect 用到的
+  形状被引用）；cc.zan 探针 261 定义 222 死，与 A74 前的 IR 可达性对比已无表数组根。
+- **未达预期（诚实记录）**：gallery publish 反涨 3%。原因：A74 的 --gc-sections 在
+  gallery 上本就拿不到多少死代码（A74 实测 gallery -3KB），而描述符 per-shape 常量
+  （3×8B+padding）与 __zan_tynames_<i> 列表全局替换了原三表的对 4096 槽分摊——表模式
+  下 [4096] 数组的 .data 摊销成本低于每形状独立记录。空窗口收益来自 ld 真正删掉了
+  release 函数（此前被表钉死）；gallery 函数几乎全被真可达路径引用（A74 结论），
+  desc 模式既删不掉更多代码，又多付 per-shape 记录的 .data，净 +282KB。后续方向：
+  给 desc 全局加 LLVMSetUnnamedAddr + 合并同形状（已同形状合并）；或 tynames 列表
+  共享（同祖先链只发一份）可再省；gallery 真正的体积杠杆仍是 A73 杠杆④（ARC 冗余
+  对消除，预计 −10~15%）。
+- **回归**：standard 643/647、smoke 181/184（失败均为并行在途既有：cef_profile/
+  gui_input/watermark/string_index_char_text）；探针 isas.zan（is 命中/基类 is/as
+  向下转型/object 槽 string is/descriptor 模式 GetType().Name 报 Dog）+ cc.zan
+  （List/Dict/StringBuilder/闭包捕获/foreach ARC）在 **默认 desc 模式、--check-leaks、
+  --arc-guard、--publish** 四种模式全部通过；generic_class_instance_generic_method
+  golden 一致。
