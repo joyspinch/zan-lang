@@ -45,24 +45,63 @@ class LocalDataSource : QueryDataSource {
         return this.rows.Count;
     }
 
-    override bool CellReady(int row, int col) {
-        return row >= 0 && row < this.rows.Count;
-    }
-
-    override RowKey GetRowKey(int row) {
+    RowKey RawKey(int row) {
         if (row < 0 || row >= this.rows.Count) { return null; }
         if (this.keyProvider != null) { return this.keyProvider.Key(this, row); }
         return RowKey.Legacy(row);
     }
 
+    int SourceRowFor(int row) {
+        QueryResult current = this.CurrentResult();
+        if (current == null || !current.Covers(row)) {
+            current = this.CachedRow(row);
+        }
+        if (current == null || !current.Covers(row)) { return row; }
+        QueryRow queryRow = current.RowAt(row);
+        if (queryRow == null || queryRow.Key() == null) { return -1; }
+        for (int i = 0; i < this.rows.Count; i = i + 1) {
+            RowKey candidate = this.RawKey(i);
+            if (candidate != null && candidate.Same(queryRow.Key())) { return i; }
+        }
+        return -1;
+    }
+
+    override bool CellReady(int row, int col) {
+        QueryResult current = this.CurrentResult();
+        if (current != null && current.Covers(row)) { return true; }
+        if (this.CachedRow(row) != null) { return true; }
+        return current == null && row >= 0 && row < this.rows.Count;
+    }
+
+    override RowKey GetRowKey(int row) {
+        QueryResult current = this.CurrentResult();
+        if (current != null && current.Covers(row)) {
+            QueryRow value = current.RowAt(row);
+            if (value != null) { return value.Key(); }
+        }
+        QueryResult cached = this.CachedRow(row);
+        if (cached != null) {
+            QueryRow value = cached.RowAt(row);
+            if (value != null) { return value.Key(); }
+        }
+        return this.RawKey(row);
+    }
+
     override string CellText(int row, int col) {
-        if (row < 0 || row >= this.rows.Count) { return ""; }
+        QueryResult current = this.CurrentResult();
+        if (current != null && current.Covers(row)) {
+            return current.CellText(row, col);
+        }
+        QueryResult cached = this.CachedRow(row);
+        if (cached != null) { return cached.CellText(row, col); }
+        if (current != null || row < 0 || row >= this.rows.Count) { return ""; }
         return this.rows[row].At(col);
     }
 
     override void SetCell(int row, int col, string value) {
-        if (row < 0 || row >= this.rows.Count) { return; }
-        this.rows[row].Set(col, value);
+        int sourceRow = this.SourceRowFor(row);
+        if (sourceRow < 0 || sourceRow >= this.rows.Count) { return; }
+        this.rows[sourceRow].Set(col, value);
         this.Refresh();
     }
 
@@ -82,24 +121,114 @@ class LocalDataSource : QueryDataSource {
         return true;
     }
 
+    int CompareValue(string leftText, string rightText, int kind) {
+        if (leftText == null) { leftText = ""; }
+        if (rightText == null) { rightText = ""; }
+        if (kind == 1) {
+            int left = DataTable.ParseInt(leftText);
+            int right = DataTable.ParseInt(rightText);
+            return left < right ? -1 : (left > right ? 1 : 0);
+        }
+        if (kind == 2) {
+            double left = DataTable.ParseReal(leftText);
+            double right = DataTable.ParseReal(rightText);
+            return left < right ? -1 : (left > right ? 1 : 0);
+        }
+        if (kind == 3) {
+            bool left = DataTable.ParseBool(leftText);
+            bool right = DataTable.ParseBool(rightText);
+            return left == right ? 0 : (left ? 1 : -1);
+        }
+        return DataTable.CompareStr(leftText, rightText);
+    }
+
+    bool FilterPass(string value, QueryFilterClause clause) {
+        if (value == null) { value = ""; }
+        string a = clause.Value();
+        string b = clause.Value2();
+        int cmp = this.CompareValue(value, a, clause.Kind());
+        if (clause.Mode() == QueryFilterMode.Equals) { return cmp == 0; }
+        if (clause.Mode() == QueryFilterMode.Contains) {
+            if (a.Length == 0) { return true; }
+            for (int i = 0; i + a.Length <= value.Length; i = i + 1) {
+                if (value.Substring(i, a.Length) == a) { return true; }
+            }
+            return false;
+        }
+        if (clause.Mode() == QueryFilterMode.StartsWith) {
+            return value.Length >= a.Length && value.Substring(0, a.Length) == a;
+        }
+        if (clause.Mode() == QueryFilterMode.EndsWith) {
+            return value.Length >= a.Length
+                && value.Substring(value.Length - a.Length, a.Length) == a;
+        }
+        if (clause.Mode() == QueryFilterMode.Greater) { return cmp > 0; }
+        if (clause.Mode() == QueryFilterMode.GreaterOrEqual) { return cmp >= 0; }
+        if (clause.Mode() == QueryFilterMode.Less) { return cmp < 0; }
+        if (clause.Mode() == QueryFilterMode.LessOrEqual) { return cmp <= 0; }
+        if (clause.Mode() == QueryFilterMode.Between) {
+            int hi = this.CompareValue(value, b, clause.Kind());
+            return cmp >= 0 && hi <= 0;
+        }
+        if (clause.Mode() == QueryFilterMode.Empty) { return value.Length == 0; }
+        if (clause.Mode() == QueryFilterMode.NotEmpty) { return value.Length > 0; }
+        return true;
+    }
+
+    bool RowPasses(int row, QueryDescriptor query) {
+        for (int i = 0; i < query.Filters().Count; i = i + 1) {
+            QueryFilterClause clause = query.Filters()[i];
+            if (clause.Column() < 0 || !this.FilterPass(this.rows[row].At(clause.Column()), clause)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    int CompareRows(int left, int right, QueryDescriptor query) {
+        for (int i = 0; i < query.Sorts().Count; i = i + 1) {
+            QuerySortClause clause = query.Sorts()[i];
+            string a = this.rows[left].At(clause.Column());
+            string b = this.rows[right].At(clause.Column());
+            int cmp = this.CompareValue(a, b, clause.Kind());
+            if (cmp != 0) {
+                if (clause.Direction() == 2) { cmp = 0 - cmp; }
+                return cmp;
+            }
+        }
+        return left < right ? -1 : (left > right ? 1 : 0);
+    }
+
     override QueryResult Execute(QueryDescriptor query,
                                   QueryViewport viewport,
                                   QueryRequestToken token) {
-        if (token == null || viewport == null) { return null; }
+        if (token == null || viewport == null || query == null) { return null; }
+        List<int> order = new List<int>();
+        for (int row = 0; row < this.rows.Count; row = row + 1) {
+            if (this.RowPasses(row, query)) { order.Add(row); }
+        }
+        for (int i = 1; i < order.Count; i = i + 1) {
+            int value = order[i]; int j = i - 1;
+            while (j >= 0 && this.CompareRows(order[j], value, query) > 0) {
+                order[j + 1] = order[j]; j = j - 1;
+            }
+            order[j + 1] = value;
+        }
         int start = viewport.Start();
         int requested = viewport.Count();
         List<QueryRow> resultRows = new List<QueryRow>();
         int end = start + requested;
-        if (end > this.rows.Count) { end = this.rows.Count; }
-        for (int row = start; row < end; row = row + 1) {
+        if (end > order.Count) { end = order.Count; }
+        for (int pos = start; pos < end; pos = pos + 1) {
+            int row = order[pos];
             RowKey key = this.GetRowKey(row);
             if (key == null) { key = RowKey.Legacy(row); }
             resultRows.Add(new QueryRow(key, 0, this.rows[row].Copy()));
         }
-        bool more = end < this.rows.Count;
+        bool more = end < order.Count;
         return new QueryResult(token.RequestId(), token.Generation(),
             token.QueryText(), token.QueryHash(), token.SchemaVersion(), token.ServerRevision(),
             start, requested, viewport.Cursor(), resultRows,
-            this.rows.Count, true, more, "", "");
+            order.Count, true, more, "", "");
     }
 }

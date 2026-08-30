@@ -30,9 +30,70 @@ class QueryCapabilities {
     bool Has(int capability) { return (this.mask & capability) != 0; }
 }
 
+/// 声明式过滤操作。过滤值保持文本形式，执行器按 kind 解释它，
+/// 因而本地和远端都能使用同一份可序列化描述。
+class QueryFilterMode {
+    static const int Equals = 1;
+    static const int Contains = 2;
+    static const int StartsWith = 3;
+    static const int EndsWith = 4;
+    static const int Greater = 5;
+    static const int GreaterOrEqual = 6;
+    static const int Less = 7;
+    static const int LessOrEqual = 8;
+    static const int Between = 9;
+    static const int Empty = 10;
+    static const int NotEmpty = 11;
+}
+
+/// 一个可传输的过滤谓词。column 是 schema 中的稳定列槽位；kind：
+/// 0 文本、1 整数、2 实数、3 bool。
+class QueryFilterClause {
+    int column;
+    int mode;
+    int kind;
+    string value;
+    string value2;
+
+    QueryFilterClause(int col, int op, string a, string b, int valueKind) {
+        this.column = col;
+        this.mode = op;
+        this.kind = valueKind;
+        this.value = a;
+        if (this.value == null) { this.value = ""; }
+        this.value2 = b;
+        if (this.value2 == null) { this.value2 = ""; }
+    }
+
+    int Column() { return this.column; }
+    int Mode() { return this.mode; }
+    int Kind() { return this.kind; }
+    string Value() { return this.value; }
+    string Value2() { return this.value2; }
+}
+
+/// 一个可传输的稳定排序键。多个键按添加顺序组成字典序。
+/// kind 与 QueryFilterClause 相同。
+class QuerySortClause {
+    int column;
+    int direction;
+    int kind;
+
+    QuerySortClause(int col, int dir, int valueKind) {
+        this.column = col;
+        this.direction = dir;
+        if (this.direction != 2) { this.direction = 1; }
+        this.kind = valueKind;
+    }
+
+    int Column() { return this.column; }
+    int Direction() { return this.direction; }
+    int Kind() { return this.kind; }
+}
+
 /// 可传给本地/远端查询执行器的稳定查询快照。
-/// 当前版本只承载身份和 revision；过滤器、排序树等后续以声明式
-/// 字段加入，避免先把运行时 lambda 或 UI 状态序列化进查询协议。
+/// 过滤器和排序键只使用声明式标量，不捕获 lambda 或 UI 对象，
+/// 因而可以直接序列化、哈希和下推到服务端。
 class QueryDescriptor {
     static const int FormatVersion = 1;
 
@@ -42,6 +103,8 @@ class QueryDescriptor {
     int queryRevision;
     int viewRevision;
     int capabilities;
+    List<QueryFilterClause> filters;
+    List<QuerySortClause> sorts;
 
     QueryDescriptor(string datasetName, int dataRev, int queryRev,
                     int viewRev, int caps) {
@@ -52,6 +115,8 @@ class QueryDescriptor {
         this.queryRevision = queryRev;
         this.viewRevision = viewRev;
         this.capabilities = caps;
+        this.filters = new List<QueryFilterClause>();
+        this.sorts = new List<QuerySortClause>();
     }
 
     static QueryDescriptor Of(DataTableState st, string datasetName, int caps) {
@@ -64,6 +129,19 @@ class QueryDescriptor {
     int QueryRevision() { return this.queryRevision; }
     int ViewRevision() { return this.viewRevision; }
     int Capabilities() { return this.capabilities; }
+    List<QueryFilterClause> Filters() { return this.filters; }
+    List<QuerySortClause> Sorts() { return this.sorts; }
+
+    void AddFilter(QueryFilterClause clause) {
+        if (clause != null) { this.filters.Add(clause); }
+    }
+
+    void AddSort(QuerySortClause clause) {
+        if (clause != null) { this.sorts.Add(clause); }
+    }
+
+    void ClearFilters() { this.filters.Clear(); }
+    void ClearSorts() { this.sorts.Clear(); }
 
     /// 逻辑查询相同的判断不包含 viewRevision；列宽、隐藏和冻结不应
     /// 让远端查询缓存失效。
@@ -73,7 +151,8 @@ class QueryDescriptor {
             && this.dataset == other.dataset
             && this.dataRevision == other.dataRevision
             && this.queryRevision == other.queryRevision
-            && this.capabilities == other.capabilities;
+            && this.capabilities == other.capabilities
+            && this.QueryJson() == other.QueryJson();
     }
 
     /// 渲染/显示快照是否仍对应当前状态。
@@ -82,6 +161,24 @@ class QueryDescriptor {
         return this.dataRevision == st.dataRevision
             && this.queryRevision == st.queryRevision
             && this.viewRevision == st.viewRevision;
+    }
+
+    JsonValue FilterJson(QueryFilterClause clause) {
+        JsonValue value = JsonValue.NewObject();
+        value.Put("col", JsonValue.NewNum(Convert.ToString(clause.Column())));
+        value.Put("op", JsonValue.NewNum(Convert.ToString(clause.Mode())));
+        value.Put("kind", JsonValue.NewNum(Convert.ToString(clause.Kind())));
+        value.Put("a", JsonValue.NewStr(clause.Value()));
+        value.Put("b", JsonValue.NewStr(clause.Value2()));
+        return value;
+    }
+
+    JsonValue SortJson(QuerySortClause clause) {
+        JsonValue value = JsonValue.NewObject();
+        value.Put("col", JsonValue.NewNum(Convert.ToString(clause.Column())));
+        value.Put("dir", JsonValue.NewNum(Convert.ToString(clause.Direction())));
+        value.Put("kind", JsonValue.NewNum(Convert.ToString(clause.Kind())));
+        return value;
     }
 
     JsonValue ToJsonValue() {
@@ -93,6 +190,16 @@ class QueryDescriptor {
         root.Put("query", JsonValue.NewNum(Convert.ToString(this.queryRevision)));
         root.Put("view", JsonValue.NewNum(Convert.ToString(this.viewRevision)));
         root.Put("caps", JsonValue.NewNum(Convert.ToString(this.capabilities)));
+        JsonValue filters = JsonValue.NewArray();
+        for (int i = 0; i < this.filters.Count; i = i + 1) {
+            filters.Append(this.FilterJson(this.filters[i]));
+        }
+        if (this.filters.Count > 0) { root.Put("filters", filters); }
+        JsonValue sorts = JsonValue.NewArray();
+        for (int i = 0; i < this.sorts.Count; i = i + 1) {
+            sorts.Append(this.SortJson(this.sorts[i]));
+        }
+        if (this.sorts.Count > 0) { root.Put("sorts", sorts); }
         return root;
     }
 
@@ -107,6 +214,16 @@ class QueryDescriptor {
         root.Put("data", JsonValue.NewNum(Convert.ToString(this.dataRevision)));
         root.Put("query", JsonValue.NewNum(Convert.ToString(this.queryRevision)));
         root.Put("caps", JsonValue.NewNum(Convert.ToString(this.capabilities)));
+        JsonValue filters = JsonValue.NewArray();
+        for (int i = 0; i < this.filters.Count; i = i + 1) {
+            filters.Append(this.FilterJson(this.filters[i]));
+        }
+        if (this.filters.Count > 0) { root.Put("filters", filters); }
+        JsonValue sorts = JsonValue.NewArray();
+        for (int i = 0; i < this.sorts.Count; i = i + 1) {
+            sorts.Append(this.SortJson(this.sorts[i]));
+        }
+        if (this.sorts.Count > 0) { root.Put("sorts", sorts); }
         return root.ToJson();
     }
 
@@ -144,8 +261,46 @@ class QueryDescriptor {
         int viewRev = root.Int("view", -1);
         int caps = root.Int("caps", -1);
         if (dataRev < 0 || queryRev < 0 || viewRev < 0 || caps < 0) { return null; }
-        return new QueryDescriptor(root.Str("dataset", ""), dataRev,
-            queryRev, viewRev, caps);
+        QueryDescriptor result = new QueryDescriptor(root.Str("dataset", ""),
+            dataRev, queryRev, viewRev, caps);
+        JsonValue filters = root.Get("filters");
+        if (filters != null) {
+            if (!filters.IsArray()) { return null; }
+            for (int i = 0; i < filters.Count(); i = i + 1) {
+                JsonValue item = filters.At(i);
+                if (item == null || !item.IsObject()
+                    || !item.Has("col") || !item.Has("op") || !item.Has("kind")
+                    || !item.Has("a") || !item.Has("b")) { return null; }
+                int col = item.Int("col", -1);
+                int op = item.Int("op", 0);
+                int kind = item.Int("kind", -1);
+                if (col < 0 || op < QueryFilterMode.Equals
+                    || op > QueryFilterMode.NotEmpty || kind < 0 || kind > 3) {
+                    return null;
+                }
+                result.AddFilter(new QueryFilterClause(col, op,
+                    item.Str("a", ""), item.Str("b", ""), kind));
+            }
+        }
+        JsonValue sorts = root.Get("sorts");
+        if (sorts != null) {
+            if (!sorts.IsArray()) { return null; }
+            for (int i = 0; i < sorts.Count(); i = i + 1) {
+                JsonValue item = sorts.At(i);
+                if (item == null || !item.IsObject()
+                    || !item.Has("col") || !item.Has("dir") || !item.Has("kind")) {
+                    return null;
+                }
+                int col = item.Int("col", -1);
+                int dir = item.Int("dir", 0);
+                int kind = item.Int("kind", -1);
+                if (col < 0 || (dir != 1 && dir != 2) || kind < 0 || kind > 3) {
+                    return null;
+                }
+                result.AddSort(new QuerySortClause(col, dir, kind));
+            }
+        }
+        return result;
     }
 }
 
