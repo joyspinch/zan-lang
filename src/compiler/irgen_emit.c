@@ -2693,6 +2693,27 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
         }
 #endif
     }
+
+    /* Function-sections for size builds: give every defined function its own
+     * ".text.<name>" COFF section so the linker's --gc-sections can drop
+     * unreferenced ones. LLVM's own globaldce can't do this: the ARC tables
+     * (vtables / site dtors / site tynames / refl mtabs) reference every
+     * class's methods and pin them into the reachable set, but section GC
+     * runs later with the linker's root set. Names are unique mangled
+     * symbols already (Zan_/__zan_/main), safe as section suffixes. */
+    if (g->obfuscate_strings /* publish */) {
+        for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
+             fn = LLVMGetNextFunction(fn)) {
+            if (LLVMIsDeclaration(fn) || LLVMGetSection(fn)) continue;
+            size_t nlen = 0;
+            const char *nm = LLVMGetValueName2(fn, &nlen);
+            if (!nm || !nlen || nlen > 200) continue;
+            char sec[256];
+            snprintf(sec, sizeof(sec), ".text.%s", nm);
+            LLVMSetSection(fn, sec);
+        }
+    }
+
     LLVMTargetRef target;
     char *error = NULL;
 

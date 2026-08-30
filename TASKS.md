@@ -2860,3 +2860,27 @@ A71 归因出四条编译器杠杆，本条把能实测的先测掉，用数据�
   估计的 −5~10%（BB 阈值对 Zan 代码形状的杠杆比预想大——Zan 全虚
   分发 + ARC 包装使 3-4 块函数密度远高于典型 C）；①（三表钉死 +
   function-sections）与④（ARC 冗余对消除）仍待做，是下一批。
+
+# A74 · 统一优化第二批：function-sections + --gc-sections（发布档）+ 三表钉死量化 —— ✅ 已完成（2026-08-30）
+
+- **实现**：publish 档（`g->obfuscate_strings` 同源判定）在 write_obj 前给每个
+  有定义函数设独立 COFF 节 `.text.<fn>`（irgen_emit.c，llvm-c
+  `LLVMSetSection`，符号名本就是唯一 mangled 名）；Windows 打包链
+  （bundled ld.exe，main.c）在 publish 时追加 `--gc-sections`。
+- **实测**：空窗口 --publish 1,947,136→1,776,640B（-167KB，.text
+  1,125,888→958,464，-14.9%，.xdata/.rdata 同步缩）；gallery
+  8,726,528→8,723,456B（-3KB——gallery 里几乎所有函数都被真可达路径
+  引用，这与 IR 归因一致）。回归：standard 643/647（4 失败为并行在途
+  既有：cef_profile/gui_input/gui_watermark/string_index_char_text），
+  gc 后探针运行正常。
+- **IR 归因（关键发现）**：空窗口 IR 共 1,010 个定义函数，从 main 做调用图
+  可达性分析**只有 115 个可达，895 个死代码**——它们能进镜像是因为
+  `__zan_site_dtors`（[4096 x ptr] 内部常量数组）以重定位方式钉住 542 个
+  根 + 死簇内部互调传播；globaldce 对内部数组引用无能为力。这就是
+  A71 杠杆①的量化实锤：**空窗口理论上还有 ~72% 的 .text 是可去死的**
+  （当前 gc 只剪掉无表引用的部分）。
+- **去钉路线（未做，需 ARC 站点机制重构）**：site_dtors 在运行期按分配
+  站点 id 动态索引，ld 无法静态判活。两条路：① 分配站点直接内联具体
+  析构调用（放弃动态表，release_dyn 退化为兜底）——最优但动 ARC 核心；
+  ② 表按站点拆成 [1 x ptr] 独立全局（各占一节）+ 二级目录——ld 仍通过
+  目录钉住全部，无效。① 是 A75 候选，预计空窗口再 -500KB 级。

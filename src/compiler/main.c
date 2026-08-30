@@ -4124,7 +4124,12 @@ int main(int argc, char **argv) {
             argv[a++] = "-Bdynamic";
             /* 256 MB stack: the self-hosted compiler recurses deeply. */
             argv[a++] = "--stack"; argv[a++] = "268435456";
-            if (publish_mode) argv[a++] = "-s";
+            if (publish_mode) {
+                argv[a++] = "-s";
+                /* publish objects carry one .text.<fn> section per function
+                 * (irgen_emit.c); GC the unreferenced ones away. */
+                argv[a++] = "--gc-sections";
+            }
             /* GUI apps: hide the console window (still entered via main). */
             if (link_subsystem && strcmp(link_subsystem, "windows") == 0) {
                 argv[a++] = "--subsystem"; argv[a++] = "windows";
