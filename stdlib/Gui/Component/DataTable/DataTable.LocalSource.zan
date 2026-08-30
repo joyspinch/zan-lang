@@ -152,7 +152,8 @@ class LocalDataSource : QueryDataSource {
 
     override QueryCapabilities Capabilities() {
         return QueryCapabilities.Of(QueryCapabilities.Filter
-            + QueryCapabilities.Sort + QueryCapabilities.Page
+            + QueryCapabilities.Sort + QueryCapabilities.Group
+            + QueryCapabilities.Aggregate + QueryCapabilities.Page
             + QueryCapabilities.StableKeys + QueryCapabilities.Edit
             + QueryCapabilities.Insert + QueryCapabilities.Delete);
     }
@@ -427,6 +428,95 @@ class LocalDataSource : QueryDataSource {
         }
     }
 
+    string GroupAtom(string value, int kind) {
+        if (value == null) { value = ""; }
+        if (kind == 1) { return Convert.ToString(DataTable.ParseInt(value)); }
+        if (kind == 2) { return Convert.ToString(DataTable.ParseReal(value)); }
+        if (kind == 3) {
+            if (DataTable.ParseBool(value)) { return "true"; }
+            return "false";
+        }
+        return value;
+    }
+
+    string GroupKey(int row, QueryPlan plan) {
+        string key = "";
+        for (int i = 0; i < plan.GroupCount(); i = i + 1) {
+            string atom = this.GroupAtom(this.rows[row].At(plan.GroupColumnAt(i)),
+                plan.GroupKindAt(i));
+            key = key + Convert.ToString(atom.Length) + ":" + atom + ";";
+        }
+        return key;
+    }
+
+    void AddGroupBucket(List<QueryGroupBucket> buckets, string key) {
+        for (int i = 0; i < buckets.Count; i = i + 1) {
+            if (buckets[i].Key() == key) {
+                QueryGroupBucket old = buckets[i];
+                buckets[i] = new QueryGroupBucket(old.Key(), old.Count() + 1);
+                return;
+            }
+        }
+        buckets.Add(new QueryGroupBucket(key, 1));
+    }
+
+    List<QueryGroupBucket> BuildGroups(List<int> order, QueryPlan plan) {
+        List<QueryGroupBucket> buckets = new List<QueryGroupBucket>();
+        for (int i = 0; i < order.Count; i = i + 1) {
+            this.AddGroupBucket(buckets, this.GroupKey(order[i], plan));
+        }
+        return buckets;
+    }
+
+    double AggregateNumber(string value, int kind) {
+        if (kind == 1) { return (double)DataTable.ParseInt(value); }
+        if (kind == 2) { return DataTable.ParseReal(value); }
+        if (kind == 3) {
+            if (DataTable.ParseBool(value)) { return 1.0; }
+            return 0.0;
+        }
+        return DataTable.ParseReal(value);
+    }
+
+    List<QueryAggregateValue> BuildAggregates(List<int> order, QueryPlan plan) {
+        List<QueryAggregateValue> values = new List<QueryAggregateValue>();
+        for (int ai = 0; ai < plan.AggregateCount(); ai = ai + 1) {
+            int col = plan.AggregateColumnAt(ai);
+            int mode = plan.AggregateModeAt(ai);
+            int kind = plan.AggregateKindAt(ai);
+            if (mode == 5) {
+                values.Add(new QueryAggregateValue(col, mode, kind, "",
+                    (double)order.Count));
+            } else if (order.Count == 0) {
+                values.Add(new QueryAggregateValue(col, mode, kind, "", 0.0));
+            } else if (kind == 0 && (mode == 3 || mode == 4)) {
+                string selected = this.rows[order[0]].At(col);
+                for (int ri = 1; ri < order.Count; ri = ri + 1) {
+                    string candidate = this.rows[order[ri]].At(col);
+                    int cmp = DataTable.CompareStr(candidate, selected);
+                    if ((mode == 3 && cmp < 0) || (mode == 4 && cmp > 0)) {
+                        selected = candidate;
+                    }
+                }
+                values.Add(new QueryAggregateValue(col, mode, kind, selected, 0.0));
+            } else {
+                double sum = 0.0;
+                double selected = this.AggregateNumber(this.rows[order[0]].At(col), kind);
+                for (int ri = 0; ri < order.Count; ri = ri + 1) {
+                    double number = this.AggregateNumber(this.rows[order[ri]].At(col), kind);
+                    sum = sum + number;
+                    if (mode == 3 && number < selected) { selected = number; }
+                    if (mode == 4 && number > selected) { selected = number; }
+                }
+                double output = selected;
+                if (mode == 1) { output = sum; }
+                if (mode == 2) { output = sum / (double)order.Count; }
+                values.Add(new QueryAggregateValue(col, mode, kind, "", output));
+            }
+        }
+        return values;
+    }
+
     override QueryResult Execute(QueryDescriptor query,
                                   QueryViewport viewport,
                                   QueryRequestToken token) {
@@ -452,9 +542,14 @@ class LocalDataSource : QueryDataSource {
             resultRows.Add(new QueryRow(key, 0, this.rows[row].Copy()));
         }
         bool more = end < order.Count;
-        return new QueryResult(token.RequestId(), token.Generation(),
+        QueryResult result = new QueryResult(token.RequestId(), token.Generation(),
             token.QueryText(), token.QueryHash(), token.SchemaVersion(), token.ServerRevision(),
             start, requested, viewport.Cursor(), resultRows,
             order.Count, true, more, "", "");
+        if (plan.GroupCount() > 0 || plan.AggregateCount() > 0) {
+            result = result.WithShape(this.BuildGroups(order, plan),
+                this.BuildAggregates(order, plan));
+        }
+        return result;
     }
 }

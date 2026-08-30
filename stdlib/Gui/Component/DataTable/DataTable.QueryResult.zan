@@ -20,6 +20,47 @@ class QueryRow {
     DataRow Cells() { return this.cells; }
 }
 
+/// 查询结果中的分组元数据。rows 仍然是原始行快照，组树和小计
+/// 单独传递，避免为每个显示组复制整页行对象。
+class QueryGroupBucket {
+    string key;
+    int count;
+
+    QueryGroupBucket(string groupKey, int rowCount) {
+        this.key = groupKey;
+        this.count = rowCount;
+    }
+
+    string Key() { return this.key; }
+    int Count() { return this.count; }
+}
+
+/// 查询结果中的聚合值。number 用于数值/布尔聚合，text 保存文本
+/// min/max 的规范值；count 由 mode=5 表示。
+class QueryAggregateValue {
+    int column;
+    int mode;
+    int kind;
+    string text;
+    double number;
+
+    QueryAggregateValue(int col, int op, int valueKind, string valueText,
+                        double valueNumber) {
+        this.column = col;
+        this.mode = op;
+        this.kind = valueKind;
+        this.text = valueText;
+        if (this.text == null) { this.text = ""; }
+        this.number = valueNumber;
+    }
+
+    int Column() { return this.column; }
+    int Mode() { return this.mode; }
+    int Kind() { return this.kind; }
+    string Text() { return this.text; }
+    double Number() { return this.number; }
+}
+
 /// 一页查询结果的传输元数据。totalKnown=false 时，total 不参与
 /// RowCount 推断，HasMore/continuation 才是尾部语义的来源。
 class QueryResult {
@@ -37,6 +78,8 @@ class QueryResult {
     bool hasMore;
     string continuation;
     List<QueryRow> rows;
+    List<QueryGroupBucket> groups;
+    List<QueryAggregateValue> aggregates;
     string error;
     bool valid;
 
@@ -59,6 +102,8 @@ class QueryResult {
         if (this.cursor == null) { this.cursor = ""; }
         this.rows = values;
         if (this.rows == null) { this.rows = new List<QueryRow>(); }
+        this.groups = new List<QueryGroupBucket>();
+        this.aggregates = new List<QueryAggregateValue>();
         this.total = totalCount;
         this.totalKnown = known;
         if (this.totalKnown && this.total < 0) { this.totalKnown = false; }
@@ -129,6 +174,32 @@ class QueryResult {
     string Continuation() { return this.continuation; }
     string Error() { return this.error; }
     bool Failed() { return this.error.Length > 0 || !this.valid; }
+    List<QueryGroupBucket> Groups() { return this.groups; }
+    List<QueryAggregateValue> Aggregates() { return this.aggregates; }
+
+    QueryResult WithShape(List<QueryGroupBucket> groupValues,
+                          List<QueryAggregateValue> aggregateValues) {
+        QueryResult result = new QueryResult(this.requestId, this.generation,
+            this.queryText, this.queryHash, this.schemaVersion, this.serverRevision,
+            this.start, this.requestedCount, this.cursor, this.rows, this.total,
+            this.totalKnown, this.hasMore, this.continuation, this.error);
+        if (groupValues != null) {
+            for (int i = 0; i < groupValues.Count; i = i + 1) {
+                QueryGroupBucket g = groupValues[i];
+                if (g != null) { result.groups.Add(new QueryGroupBucket(g.Key(), g.Count())); }
+            }
+        }
+        if (aggregateValues != null) {
+            for (int i = 0; i < aggregateValues.Count; i = i + 1) {
+                QueryAggregateValue a = aggregateValues[i];
+                if (a != null) {
+                    result.aggregates.Add(new QueryAggregateValue(a.Column(), a.Mode(),
+                        a.Kind(), a.Text(), a.Number()));
+                }
+            }
+        }
+        return result;
+    }
 
     bool Covers(int row) {
         return row >= this.start && row < this.start + this.rows.Count;
@@ -168,9 +239,18 @@ class QueryResult {
         if (token == null || viewport == null || !this.MatchesViewport(viewport)) {
             return null;
         }
-        return new QueryResult(token.RequestId(), token.Generation(),
+        QueryResult result = new QueryResult(token.RequestId(), token.Generation(),
             token.QueryText(), token.QueryHash(), token.SchemaVersion(), token.ServerRevision(),
             viewport.Start(), viewport.Count(), viewport.Cursor(), this.rows,
             this.total, this.totalKnown, this.hasMore, this.continuation, this.error);
+        for (int i = 0; i < this.groups.Count; i = i + 1) {
+            result.groups.Add(new QueryGroupBucket(this.groups[i].Key(), this.groups[i].Count()));
+        }
+        for (int i = 0; i < this.aggregates.Count; i = i + 1) {
+            QueryAggregateValue a = this.aggregates[i];
+            result.aggregates.Add(new QueryAggregateValue(a.Column(), a.Mode(),
+                a.Kind(), a.Text(), a.Number()));
+        }
+        return result;
     }
 }
