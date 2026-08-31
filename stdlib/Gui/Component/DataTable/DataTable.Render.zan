@@ -41,6 +41,42 @@ partial class DataTable {
     /// 条件格式颜色仍然优先——在那里，颜色*就是*
     /// 单元格携带的信息。
     static void DrawCell(App app, DataColumn col, string val, int cx, int cy, int cw, int rowH, double cfLo, double cfHi, int fgOverride) {
+        DataTable.DrawCellIndented(app, col, val, cx, cy, cw, rowH, cfLo, cfHi, fgOverride, 0, false, false, false);
+    }
+
+    /// 树模式单元格：`indent` 层级换成左缩进；`isTreeCol`
+    /// 的行首绘制展开箭头（叶子行留空白边距）。其余
+    /// 列照常渲染——树列之外不受影响。
+    static void DrawCellIndented(App app, DataColumn col, string val, int cx, int cy, int cw, int rowH,
+                                 double cfLo, double cfHi, int fgOverride,
+                                 int indent, bool isTreeCol, bool canExpand, bool expanded) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingSmall;
+        // 树列的箭头占掉缩进头部：每层 16 逻辑像素。
+        int indentPx = indent * app.Scale(16);
+        if (isTreeCol && canExpand) {
+            int exSz = app.Scale(12);
+            int exX = cx + pad + indentPx;
+            int exY = cy + (rowH - exSz) / 2;
+            string chev = "chevron-down";
+            if (!expanded) { chev = "chevron-right"; }
+            c.DrawGlyph(chev, exX, exY, exSz, Style.Part(app, "datatable", "icon", "", "", "",
+                                                         Style.SNormal()).FgOr(0));
+            indentPx = indentPx + app.Scale(16);
+        } else if (isTreeCol) {
+            // 叶子行：与兄弟的箭头对齐的空白边距。
+            indentPx = indentPx + app.Scale(16);
+        }
+        // 走原渲染器：把缩进折进 x/宽（条件格式、格式化、
+        // 对齐全部保持原语义），箭头/缩进已画的部分靠
+        // 负偏移保护不被文本覆盖。
+        int inner = cx + indentPx;
+        DataTable.DrawCellRange(app, col, val, inner, cy, cw - indentPx, rowH, cfLo, cfHi, fgOverride);
+    }
+
+    /// DrawCell 的主体（缩进版把 x/宽收缩后委托到这里）。
+    static void DrawCellRange(App app, DataColumn col, string val, int cx, int cy, int cw, int rowH, double cfLo, double cfHi, int fgOverride) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int fs = Style.FontFallback(app, "medium");
@@ -1406,8 +1442,30 @@ partial class DataTable {
                         double cfLo = 0.0;
                         double cfHi = 0.0;
                         if (cc < st.cfMinR.Count) { cfLo = st.cfMinR[cc]; cfHi = st.cfMaxR[cc]; }
-                        DataTable.DrawCell(app, cols[cc], src.CellText(rowIdx, cc), ccl, ry, cw, rowH,
-                                           cfLo, cfHi, DataTable.CellForeground(st, src, rowIdx, cc));
+                        if (st.treeAdapter != null && cc == st.treeCol) {
+                            // 树列：缩进 + 行首展开箭头。命中区注册在
+                            // 箭头上（含缩进头部），点击切换展开。
+                            int depth = DataTable.DispDepth(st, oiRow);
+                            bool canExp = DataTable.CanTreeExpand(st, src, rowIdx);
+                            bool isExp = DataTable.IsTreeExpanded(st, src, rowIdx);
+                            if (canExp) {
+                                int exId = app.focus.AllocId();
+                                int exW = app.Scale(16) * (depth + 1);
+                                app.hitTester.RegisterRect(exId, ccl, ry, exW, rowH, 0);
+                                if (app.EventKind() == 3 && app.window.EventButton() == 0
+                                    && app.hitTester.HitTest(app.mouseX, app.mouseY) == exId) {
+                                    DataTable.TreeToggle(st, src, rowIdx);
+                                    app.RequestRedraw();
+                                }
+                            }
+                            DataTable.DrawCellIndented(app, cols[cc], src.CellText(rowIdx, cc),
+                                ccl, ry, cw, rowH, cfLo, cfHi,
+                                DataTable.CellForeground(st, src, rowIdx, cc),
+                                depth, true, canExp, isExp);
+                        } else {
+                            DataTable.DrawCell(app, cols[cc], src.CellText(rowIdx, cc), ccl, ry, cw, rowH,
+                                               cfLo, cfHi, DataTable.CellForeground(st, src, rowIdx, cc));
+                        }
                     }
                     // 可编辑的 bool 单元格单击即切换，
                     // 而不是打开内联编辑所用的文本编辑器。

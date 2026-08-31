@@ -323,6 +323,143 @@ partial class DataTable {
         DataTable.InvalidateView(st);
     }
 
+    // ---------- 树模式（TreeGrid） ----------
+    // 适配器描述层级，网格把源行交错成"父行后跟可见后代"。
+    // 展开状态按源行索引存放；排序/筛选改变顺序时身份跟随
+    // 源索引，与选择/详情的语义一致。适配器为 null 时全部
+    // API 是零开销空操作，显示模型退回扁平。
+
+    /// 启用树模式（传入适配器）或关闭（null）。`treeColumn`
+    /// 是渲染缩进与展开箭头的列索引（-1 = 首列）。关闭时
+    /// 展开状态一并清空；开启时保持干净状态。
+    static void SetTreeAdapter(DataTableState st, TreeAdapter adapter, int treeColumn) {
+        st.treeAdapter = adapter;
+        st.expandedTree.Clear();
+        if (treeColumn < -1) { treeColumn = -1; }
+        st.treeCol = treeColumn;
+        DataTable.InvalidateData(st);
+    }
+
+    /// 树模式是否启用。
+    static bool HasTree(DataTableState st) { return st.treeAdapter != null; }
+
+    /// 补齐按源行索引对齐的展开标志列表。
+    static void TreeReserve(DataTableState st, DataSource src) {
+        if (st.expandedTree == null) { st.expandedTree = new List<bool>(); }
+        while (st.expandedTree.Count < src.RowCount()) { st.expandedTree.Add(false); }
+    }
+
+    /// `row`（源索引）是否展开。折叠/叶子/越界均为 false。
+    static bool IsTreeExpanded(DataTableState st, DataSource src, int row) {
+        if (st.treeAdapter == null || row < 0 || row >= st.expandedTree.Count) {
+            return false;
+        }
+        return st.expandedTree[row];
+    }
+
+    /// `row` 是否有子行（可展开）。适配器为 null 或行越界
+    /// 时为 false。
+    static bool CanTreeExpand(DataTableState st, DataSource src, int row) {
+        if (st.treeAdapter == null || src == null) { return false; }
+        if (row < 0 || row >= src.RowCount()) { return false; }
+        return st.treeAdapter.ChildCount(src, row) > 0;
+    }
+
+    /// 展开 `row`。叶子或已展开的行保持不变。
+    static void TreeExpand(DataTableState st, DataSource src, int row) {
+        if (!DataTable.CanTreeExpand(st, src, row)) { return; }
+        DataTable.TreeReserve(st, src);
+        if (st.expandedTree[row]) { return; }
+        st.expandedTree[row] = true;
+        DataTable.InvalidateView(st);
+    }
+
+    /// 折叠 `row`。未展开的行保持不变。
+    static void TreeCollapse(DataTableState st, DataSource src, int row) {
+        if (st.treeAdapter == null || row < 0 || row >= st.expandedTree.Count) {
+            return;
+        }
+        if (!st.expandedTree[row]) { return; }
+        st.expandedTree[row] = false;
+        DataTable.InvalidateView(st);
+    }
+
+    /// 切换 `row` 的展开与折叠。
+    static void TreeToggle(DataTableState st, DataSource src, int row) {
+        if (DataTable.IsTreeExpanded(st, src, row)) {
+            DataTable.TreeCollapse(st, src, row);
+        } else {
+            DataTable.TreeExpand(st, src, row);
+        }
+    }
+
+    /// 展开全部含子行的行。远程/懒加载源上慎用：
+    /// 这会对每个行调用一次 ChildCount。
+    static void TreeExpandAll(DataTableState st, DataSource src) {
+        if (st.treeAdapter == null || src == null) { return; }
+        DataTable.TreeReserve(st, src);
+        bool changed = false;
+        for (int row = 0; row < src.RowCount(); row = row + 1) {
+            if (!st.expandedTree[row] && st.treeAdapter.ChildCount(src, row) > 0) {
+                st.expandedTree[row] = true;
+                changed = true;
+            }
+        }
+        if (changed) { DataTable.InvalidateView(st); }
+    }
+
+    /// 折叠全部行（根行保留）。
+    static void TreeCollapseAll(DataTableState st, DataSource src) {
+        if (st.treeAdapter == null) { return; }
+        bool changed = false;
+        for (int i = 0; i < st.expandedTree.Count; i = i + 1) {
+            if (st.expandedTree[i]) { st.expandedTree[i] = false; changed = true; }
+        }
+        if (changed) { DataTable.InvalidateView(st); }
+    }
+
+    /// 展开到指定深度：深度 < level 的祖先全部展开，
+    /// 深度 >= level 的行折叠。level 0 = 只显示根，
+    /// level 1 = 根 + 直接子行，以此类推。负值按 0 处理。
+    /// 深度来自适配器的层级投影（BuildTreeDisplay 与本
+    /// 方法共享同一 DFS 定义）。
+    static void TreeExpandToLevel(DataTableState st, DataSource src, int level) {
+        if (st.treeAdapter == null || src == null) { return; }
+        if (level < 0) { level = 0; }
+        DataTable.TreeCollapseAll(st, src);
+        // 与 BuildTreeDisplay 相同的迭代 DFS：把深度 < level
+        // 的祖先行标记为展开。子行关系直接问适配器，
+        // 不依赖显示模型。
+        List<int> stRow = new List<int>();
+        List<int> stDepth = new List<int>();
+        int roots = st.treeAdapter.RootCount(src);
+        for (int i = roots - 1; i >= 0; i = i - 1) {
+            int root = st.treeAdapter.RootAt(src, i);
+            if (root >= 0) { stRow.Add(root); stDepth.Add(0); }
+        }
+        DataTable.TreeReserve(st, src);
+        while (stRow.Count > 0) {
+            int last = stRow.Count - 1;
+            int row = stRow[last];
+            int depth = stDepth[last];
+            stRow.RemoveAt(last);
+            stDepth.RemoveAt(last);
+            if (depth >= level) { continue; }
+            int n = st.treeAdapter.ChildCount(src, row);
+            if (n <= 0) { continue; }
+            if (row >= st.expandedTree.Count) { continue; }
+            st.expandedTree[row] = true;
+            for (int k = n - 1; k >= 0; k = k - 1) {
+                int child = st.treeAdapter.ChildOf(src, row, k);
+                if (child >= 0 && child < src.RowCount()) {
+                    stRow.Add(child);
+                    stDepth.Add(depth + 1);
+                }
+            }
+        }
+        DataTable.InvalidateView(st);
+    }
+
     // ---------- 主从详情 ----------
     // 行可在其下方展开面板：子表、表单或图表。
     // 展开状态按*源*行索引跟踪，行在排序和筛选后
@@ -771,6 +908,13 @@ partial class DataTable {
         return st.dispRows[i].part;
     }
 
+    /// 树模式下数据槽位的嵌套深度（根 = 0；其他类型
+    /// 或非树模式为 0）。渲染把它换成树列的缩进。
+    static int DispDepth(DataTableState st, int i) {
+        if (st.dispFlat) { return 0; }
+        return st.dispRows[i].depth;
+    }
+
     /// 组表头槽位的嵌套深度（其他类型为 0）。深度存放在
     /// 该槽位指向的 `GroupRow` 上，而非显示槽位自身。
     static int DispLevel(DataTableState st, int i) {
@@ -786,6 +930,13 @@ partial class DataTable {
         st.groups.Clear();
         int G = st.groupCols.Count;
         st.dispFlat = false;
+        if (st.treeAdapter != null) {
+            // 树模式优先：显示模型按树交错（考虑筛选后的
+            // st.order 与排序顺序，但行次序以树的父子结构
+            // 重新投影——服务端源同样适用）。
+            DataTable.BuildTreeDisplay(st, cols, src);
+            return;
+        }
         if (G == 0 && st.detail == null) {
             // 有序行之间没有插入内容，槽位 i 即 order[i]：
             // 显示模型按需推导而非实体化。
@@ -897,6 +1048,75 @@ partial class DataTable {
                 DataTable.FillGroupAgg(st, cols, src, curGrp[fz], grpStart[fz], N, fz == 0);
             }
             fz = fz - 1;
+        }
+    }
+
+    /// 树模式显示模型：以适配器的父子结构重新投影
+    /// `st.order`。行先经筛选/排序（order 成员仍是源索引），
+    /// 再按"展开的父行后跟其可见后代"交错：
+    ///   - 只有 order 中存在的行（未被筛选掉的）参与投影；
+    ///   - 排序决定同层兄弟的相对次序（order 的相对顺序）；
+    ///   - 折叠的子树整段隐藏，但行仍在 order 中，展开后
+    ///     无需回源即可恢复。
+    ///
+    /// 实现是显式栈的 DFS（避免深树递归溢出），兄弟按
+    /// order 相对次序弹出。每行带 depth 供树列缩进；
+    /// 详情带在数据行之后照常发出。
+    static void BuildTreeDisplay(DataTableState st, List<DataColumn> cols,
+                                 DataSource src) {
+        // order 中每个源行的相对次序（小 = 早）。树投影用它
+        // 决定兄弟次序与根次序。
+        Dict<int, int> orderPos = new Dict<int, int>();
+        for (int i = 0; i < st.order.Count; i = i + 1) {
+            orderPos[st.order[i]] = i;
+        }
+        // order 成员的子行列表（按 order 次序排好）。构建一次，
+        // DFS 只查表不再扫描。
+        Dict<int, List<int>> kids = new Dict<int, List<int>>();
+        List<int> roots = new List<int>();
+        for (int i = 0; i < st.order.Count; i = i + 1) {
+            int row = st.order[i];
+            int parent = st.treeAdapter.ParentOf(src, row);
+            if (parent < 0 || !orderPos.ContainsKey(parent)) {
+                roots.Add(row);
+            } else {
+                if (!kids.ContainsKey(parent)) {
+                    kids[parent] = new List<int>();
+                }
+                kids[parent].Add(row);
+            }
+        }
+        // 根按 order 次序排（RootAt 语义对懒加载源更直接，
+        // 但筛选后 order 已是权威次序；两者取交集即可）。
+        // roots 本身已按 order 次序收集。
+        DataTable.TreeReserve(st, src);
+        List<int> stRow = new List<int>();
+        List<int> stDepth = new List<int>();
+        for (int i = roots.Count - 1; i >= 0; i = i - 1) {
+            stRow.Add(roots[i]);
+            stDepth.Add(0);
+        }
+        int dataNo = 0;
+        while (stRow.Count > 0) {
+            int last = stRow.Count - 1;
+            int row = stRow[last];
+            int depth = stDepth[last];
+            stRow.RemoveAt(last);
+            stDepth.RemoveAt(last);
+            dataNo = dataNo + 1;
+            DispRow d = new DispRow(0, row, dataNo);
+            d.depth = depth;
+            st.dispRows.Add(d);
+            DataTable.EmitDetail(st, src, row);
+            if (!DataTable.IsTreeExpanded(st, src, row)) { continue; }
+            List<int> childRows = null;
+            if (kids.ContainsKey(row)) { childRows = kids[row]; }
+            if (childRows == null) { continue; }
+            // 反向入栈使第一个子行先弹出。
+            for (int k = childRows.Count - 1; k >= 0; k = k - 1) {
+                stRow.Add(childRows[k]);
+                stDepth.Add(depth + 1);
+            }
         }
     }
 

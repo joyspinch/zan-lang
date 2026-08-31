@@ -1,0 +1,175 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace DataTableTreeTest;
+
+/// 父行索引由行值直接编码的树适配器：parent[i] == -1 是根，
+/// 否则是父行的源索引（最小结构，便于断言）。
+class ListTree : TreeAdapter {
+    List<int> parent;
+    ListTree(List<int> parentOf) { this.parent = parentOf; }
+    override int ChildCount(DataSource src, int row) {
+        int n = 0;
+        for (int i = 0; i < this.parent.Count; i = i + 1) {
+            if (this.parent[i] == row) { n = n + 1; }
+        }
+        return n;
+    }
+    override int ChildOf(DataSource src, int row, int index) {
+        int n = 0;
+        for (int i = 0; i < this.parent.Count; i = i + 1) {
+            if (this.parent[i] == row) {
+                if (n == index) { return i; }
+                n = n + 1;
+            }
+        }
+        return -1;
+    }
+    override int ParentOf(DataSource src, int row) {
+        if (row < 0 || row >= this.parent.Count) { return -1; }
+        return this.parent[row];
+    }
+}
+
+/// 单槽详情 provider：每行都可有详情带。
+class Slot1 : DetailProvider {
+    override int Slots(DataSource src, int row) { return 1; }
+    override void Paint(App app, DataSource src, int row, int x, int y, int w, int h) { }
+}
+
+class Program {
+    static DataRow Row(string id, string value) {
+        DataRow row = new DataRow();
+        row.Push(id);
+        row.Push(value);
+        return row;
+    }
+
+    /// 展开显示模型：数据行 "id@depth"，详情带 "[dRow]"。
+    static string Dump(DataSource src, DataTableState st) {
+        string s = "";
+        for (int i = 0; i < DataTable.DispCount(st); i = i + 1) {
+            int k = DataTable.DispKind(st, i);
+            if (k == 0) {
+                s = s + src.CellText(DataTable.DispRowOf(st, i), 0)
+                    + "@" + Convert.ToString(DataTable.DispDepth(st, i)) + " ";
+            } else if (k == 2) {
+                s = s + "[d" + Convert.ToString(DataTable.DispRowOf(st, i)) + "] ";
+            }
+        }
+        return s;
+    }
+
+    static void Main() {
+        // 结构：r0 = { r1 = { r3 }, r2 }, r4
+        List<int> parent = new List<int>();
+        parent.Add(-1); parent.Add(0); parent.Add(0); parent.Add(1); parent.Add(-1);
+        List<DataRow> rows = new List<DataRow>();
+        rows.Add(Row("r0", "10"));
+        rows.Add(Row("r1", "11"));
+        rows.Add(Row("r2", "12"));
+        rows.Add(Row("r3", "13"));
+        rows.Add(Row("r4", "14"));
+        LocalDataSource src = new LocalDataSource(rows);
+
+        List<DataColumn> cols = new List<DataColumn>();
+        cols.Add(DataColumn.Field(new DataColumn("Id", 70), "id"));
+        cols.Add(DataColumn.Field(DataColumn.Numeric("Value", 80), "value"));
+
+        DataTableState st = new DataTableState();
+        DataTable.EnsureInit(st, cols, src);
+        Console.WriteLine("init=" + (DataTable.HasTree(st) == false
+            && src.RowCount() == 5));
+
+        // ---- adapter wiring and capability flags ----
+        DataTable.SetTreeAdapter(st, new ListTree(parent), 0);
+        DataTable.TreeReserve(st, src);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("wire=" + (DataTable.HasTree(st)
+            && DataTable.CanTreeExpand(st, src, 0)
+            && !DataTable.CanTreeExpand(st, src, 3)
+            && !DataTable.IsTreeExpanded(st, src, 0)
+            && Dump(src, st) == "r0@0 r4@0 "));
+
+        // ---- expand / collapse / toggle ----
+        DataTable.TreeExpand(st, src, 0);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("exp0=" + (Dump(src, st) == "r0@0 r1@1 r2@1 r4@0 "));
+        DataTable.TreeToggle(st, src, 1);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("exp1=" + (Dump(src, st) == "r0@0 r1@1 r3@2 r2@1 r4@0 "));
+        DataTable.TreeCollapse(st, src, 0);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("collapsed=" + (Dump(src, st) == "r0@0 r4@0 "));
+
+        // expand to level 1: roots and their direct children
+        DataTable.TreeExpandToLevel(st, src, 1);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("level1=" + (Dump(src, st) == "r0@0 r1@1 r2@1 r4@0 "));
+
+        // ---- expand all / collapse all ----
+        DataTable.TreeExpandAll(st, src);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("all=" + (Dump(src, st) == "r0@0 r1@1 r3@2 r2@1 r4@0 "));
+        DataTable.TreeCollapseAll(st, src);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("colall=" + (Dump(src, st) == "r0@0 r4@0 "));
+
+        // ---- tree + detail bands interleave ----
+        DataTable.TreeExpand(st, src, 0);
+        DataTable.TreeExpand(st, src, 1);
+        DataTable.SetDetail(st, new Slot1());
+        DataTable.ExpandRow(st, src, 0);
+        DataTable.ExpandRow(st, src, 2);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("detail=" + (Dump(src, st)
+            == "r0@0 [d0] r1@1 r3@2 r2@1 [d2] r4@0 "));
+
+        // ---- collapsed rows hide content, selection keeps identity ----
+        DataTable.SetSelected(st, src, 3, true);
+        DataTable.TreeCollapse(st, src, 0);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("hidden=" + (DataTable.IsSelected(st, src, 3)
+            && Dump(src, st) == "r0@0 [d0] r4@0 "));
+        DataTable.TreeExpand(st, src, 0);
+        DataTable.TreeExpand(st, src, 1);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("kept=" + (DataTable.IsSelected(st, src, 3)
+            && Dump(src, st) == "r0@0 [d0] r1@1 r3@2 r2@1 [d2] r4@0 "));
+
+        // ---- sort: siblings keep sorted order, structure intact ----
+        DataTable.SetDetail(st, null);
+        DataTable.SortBy(st, 1, 2);
+        DataTable.Recompute(st, cols, src);
+        string ord = "";
+        for (int i = 0; i < st.order.Count; i = i + 1) {
+            ord = ord + src.CellText(st.order[i], 0) + " ";
+        }
+        Console.WriteLine("sorted=" + (ord == "r4 r3 r2 r1 r0 "
+            && Dump(src, st) == "r4@0 r0@0 r2@1 r1@1 r3@2 "));
+
+        // ---- filter row: filtered-out parent promotes child to root ----
+        st.showFilterRow = true;
+        while (st.filterRowText.Count < 2) { st.filterRowText.Add(""); }
+        st.filterRowText[0] = "r3";
+        st.filterRowText[1] = "";
+        st.dirty = true;
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("promote=" + (Dump(src, st) == "r3@0 "));
+
+        // ---- clearing the filter restores the sorted tree ----
+        st.filterRowText[0] = "";
+        st.dirty = true;
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("cleared=" + (Dump(src, st)
+            == "r4@0 r0@0 r2@1 r1@1 r3@2 "));
+
+        // ---- tree off: flat display, adapter state reset ----
+        DataTable.SetTreeAdapter(st, null, -1);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("off=" + (DataTable.HasTree(st) == false
+            && DataTable.DispCount(st) == 5
+            && DataTable.DispDepth(st, 0) == 0));
+    }
+}

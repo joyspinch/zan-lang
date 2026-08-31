@@ -631,13 +631,66 @@ class DispRow {
     /// 此槽位在多槽位详情带中的序号（其他
     /// kind 时为 0）。仅当 kind == 2 时有意义。
     int part;
+    /// 树模式下该数据行的嵌套深度（根 = 0，其他
+    /// kind 时为 0）。渲染把它换成树列的缩进。
+    int depth;
 
     DispRow(int k, int r, int n) {
         kind = k;
         row = r;
         no = n;
         part = 0;
+        depth = 0;
     }
+}
+
+/// 树模式适配器：把任意层级结构投影成"每行有若干子行"
+/// 的形状，网格据此交错显示。行身份仍是源行索引（与
+/// 排序/筛选/选择的读取路径一致）；适配器只回答结构问题。
+///
+/// 继承它并重写 RootCount / ChildCount / ChildOf：
+///   - `RootCount` 返回顶层行数，`RootAt(i)` 返回第 i 个
+///     顶层行的源索引。默认实现遍历源，把无父行（`ParentOf`
+///     返回 -1）当根；按需重写成直接索引。
+///   - `ChildCount(src, row)` 返回该行的子行数（0 = 叶子）；
+///     `ChildOf(src, row, index)` 返回第 index 个子行的源索引。
+///   - 可选重写 `ParentOf`（默认 -1）：无重写时根 = 全部行
+///     中 ParentOf < 0 者，需要 O(n) 扫描；重写后 RootAt 走
+///     RootCount 直接索引。
+class TreeAdapter {
+    /// 顶层行数。
+    virtual int RootCount(DataSource src) {
+        int n = 0;
+        if (src == null) { return 0; }
+        for (int row = 0; row < src.RowCount(); row = row + 1) {
+            if (this.ParentOf(src, row) < 0) { n = n + 1; }
+        }
+        return n;
+    }
+
+    /// 第 i 个顶层行的源索引。默认实现再次扫描源，
+    /// 与 RootCount 的判定保持一致。
+    virtual int RootAt(DataSource src, int i) {
+        if (src == null) { return -1; }
+        int seen = 0;
+        for (int row = 0; row < src.RowCount(); row = row + 1) {
+            if (this.ParentOf(src, row) < 0) {
+                if (seen == i) { return row; }
+                seen = seen + 1;
+            }
+        }
+        return -1;
+    }
+
+    /// `row` 的子行数；0 = 叶子。
+    virtual int ChildCount(DataSource src, int row) { return 0; }
+
+    /// `row` 的第 `index` 个子行的源索引；越界返回 -1。
+    virtual int ChildOf(DataSource src, int row, int index) { return -1; }
+
+    /// `row` 的父行源索引；顶层行返回 -1。仅默认
+    /// RootCount/RootAt 的"无父即根"判定使用它。
+    virtual int ParentOf(DataSource src, int row) { return -1; }
 }
 
 /// 分组表格中的一行分组标题：标题文本、嵌套层级、所含
@@ -897,6 +950,15 @@ class DataTableState {
     List<int> groupCols;       // 分组列，外→内（空 = 扁平表格）
     List<string> collapsedKeys;// 其行被折叠隐藏的分组路径键
     List<DispRow> dispRows;     // 扁平显示模型（见 DispRow）
+
+    // ---- 树模式（TreeGrid） ----
+    // 适配器非 null 即启用：显示模型按树交错（父行后跟
+    // 其可见后代），树列渲染缩进与展开箭头。展开状态
+    // 按源行索引保存在 expandedTree；行经历排序/筛选时
+    // 身份随源索引走，与选择/详情一致。
+    TreeAdapter treeAdapter;
+    List<bool> expandedTree;   // 按源行索引对齐的展开标志
+    int treeCol;               // 渲染缩进/箭头的列（-1 = 无，首列前不显示）
     /// 显示模型为隐式时为 true：未分组且无
     /// 展开详情带的表格，每个有序行对应一个显示槽位，
     /// 槽位可从 `order` 推导，`dispRows` 保持为空。
@@ -1113,6 +1175,9 @@ class DataTableState {
         this.BandToggled = new UiEvent();
         this.groupCols = new List<int>();
         this.collapsedKeys = new List<string>();
+        this.treeAdapter = null;
+        this.expandedTree = new List<bool>();
+        this.treeCol = -1;
         this.showGroupPanel = false;
         this.dragChip = -1;
         this.chipDropVis = -1;
