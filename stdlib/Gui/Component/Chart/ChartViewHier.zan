@@ -474,8 +474,6 @@ partial class ChartView {
         if (kids == 0) { return; }
         int ddx = px - cx;
         int ddy = py - cy;
-        int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
-        if (dist < depth * ringH || dist > (depth + 1) * ringH) { return; }
         int ang = ChartView.AngleOf(ddx, ddy);
         int a = a0;
         int visibleEnd = ChartView.SunburstVisibleEnd(a1, sweepMax);
@@ -489,16 +487,23 @@ partial class ChartView {
             if (hitEnd > visibleEnd) { hitEnd = visibleEnd; }
             if (ang >= a && ang < hitEnd) {
                 if (k.children.Count > 0) {
+                    // 组节点命中角度区间就递归：子叶所在的环带由
+                    // 叶子命中处自行校验，这里不做半径早退——否则
+                    // root 的 [0,ringH) 带检查会挡住所有外环指针。
                     ChartView.SunburstHit(app, cx, cy, ringH, k, depth + 1,
                         a, aEnd, sweepMax, px, py);
                 } else {
-                    ChartView.ttName = k.name;
-                    ChartView.ttVal = v;
-                    ChartView.ttA0 = a;
-                    // 高亮必须和本帧实际 reveal 的扇区相同，不能
-                    // 用未裁剪的 raw end 把尚未绘制的尾部画出来。
-                    ChartView.ttA1 = hitEnd;
-                    ChartView.ttDepth = depth;
+                    int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
+                    if (dist >= depth * ringH && dist <= (depth + 1) * ringH) {
+                        ChartView.ttName = k.name;
+                        ChartView.ttVal = v;
+                        ChartView.ttA0 = a;
+                        // 高亮必须和本帧实际 reveal 的扇区相同，不能
+                        // 用未裁剪的 raw end 把尚未绘制的尾部画出来。
+                        ChartView.ttA1 = hitEnd;
+                        ChartView.ttDepth = depth;
+                        ChartView.ttSunNode = k;
+                    }
                 }
                 return;
             }
@@ -537,30 +542,40 @@ partial class ChartView {
                 Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
         }
 
-        if (o.showTooltip) {
-            int mx = app.mouseX;
-            int my = app.mouseY;
-            int ddx = mx - cx;
-            int ddy = my - cy;
-            int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
-            if (dist <= rMax) {
-                ChartView.ttName = "";
-                ChartView.ttVal = 0;
-                ChartView.SunburstHit(app, cx, cy, ringH, root, 0, 0, 360,
-                    sweepMax, mx, my);
-                if (ChartView.ttName.Length > 0) {
-                    // 悬停扇区外缘的高亮圆环。
-                    int hiInner = (ChartView.ttDepth + 1) * ringH - app.Scale(2);
-                    int hiOuter = (ChartView.ttDepth + 1) * ringH;
-                    if (hiInner < 0) { hiInner = 0; }
-                    c.FillSector(cx, cy, hiInner, hiOuter,
-                        ChartView.ttA0, ChartView.ttA1, 4294967295);
-                    List<TooltipRow> rows = new List<TooltipRow>{
-                        TooltipRow.Of(0, o.title),
-                        TooltipRow.Of(4294967295,
-                            ChartView.ttName + "  " + Convert.ToString(ChartView.ttVal)) };
-                    ChartView.TooltipCard(app, mx, my, x + w, rows);
-                }
+        // 命中几何与 tooltip 展示解耦：关闭 tooltip 不能关闭
+        // Sunburst 叶子的 Hover/MouseOut/Click 事件。
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        int ddx = mx - cx;
+        int ddy = my - cy;
+        int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
+        if (dist <= rMax) {
+            ChartView.ttName = "";
+            ChartView.ttVal = 0;
+            ChartView.ttSunNode = null;
+            ChartView.SunburstHit(app, cx, cy, ringH, root, 0, 0, 360,
+                sweepMax, mx, my);
+            if (ChartView.ttSunNode != null
+                && ChartView.activeEventView != null) {
+                ChartHit th = ChartHit.Of(ChartElementType.Node,
+                    0, series[0].name,
+                    ChartView.TreeNodeIndex(root, ChartView.ttSunNode),
+                    ChartView.ttName, ChartView.ttVal, mx, my);
+                th.axisIndex = series[0].axisIndex;
+                ChartView.OfferActiveHit(th);
+            }
+            if (o.showTooltip && ChartView.ttName.Length > 0) {
+                // 悬停扇区外缘的高亮圆环。
+                int hiInner = (ChartView.ttDepth + 1) * ringH - app.Scale(2);
+                int hiOuter = (ChartView.ttDepth + 1) * ringH;
+                if (hiInner < 0) { hiInner = 0; }
+                c.FillSector(cx, cy, hiInner, hiOuter,
+                    ChartView.ttA0, ChartView.ttA1, 4294967295);
+                List<TooltipRow> rows = new List<TooltipRow>{
+                    TooltipRow.Of(0, o.title),
+                    TooltipRow.Of(4294967295,
+                        ChartView.ttName + "  " + Convert.ToString(ChartView.ttVal)) };
+                ChartView.TooltipCard(app, mx, my, x + w, rows);
             }
         }
     }
