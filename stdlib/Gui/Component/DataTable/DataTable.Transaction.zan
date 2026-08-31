@@ -99,6 +99,31 @@ class TableTransaction {
     string Error() { return this.error; }
     int Count() { return this.mutations.Count; }
 
+    bool IsValid() {
+        if (this.transactionId.Length == 0
+            || (this.mode != TransactionMode.AllOrNothing
+                && this.mode != TransactionMode.BestEffort)
+            || this.mutations.Count == 0) { return false; }
+        for (int i = 0; i < this.mutations.Count; i = i + 1) {
+            TableMutation mutation = this.mutations[i];
+            if (mutation == null || !mutation.IsValid()) { return false; }
+            for (int j = 0; j < i; j = j + 1) {
+                if (this.mutations[j].MutationId() == mutation.MutationId()) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool HasMutationId(string id) {
+        if (id == null) { return false; }
+        for (int i = 0; i < this.mutations.Count; i = i + 1) {
+            if (this.mutations[i].MutationId() == id) { return true; }
+        }
+        return false;
+    }
+
     bool Add(TableMutation mutation) {
         if (this.state != TransactionState.Draft || mutation == null
             || !mutation.IsValid()) { return false; }
@@ -233,6 +258,14 @@ class MutationResult {
     int ServerRevision() { return this.serverRevision; }
     string Message() { return this.message; }
 
+    bool IsValid() {
+        return this.mutationId.Length > 0
+            && (this.status == MutationResult.Accepted
+                || this.status == MutationResult.Rejected
+                || this.status == MutationResult.Conflict
+                || this.status == MutationResult.Cancelled);
+    }
+
     string ToJson() {
         JsonValue root = JsonValue.NewObject();
         root.Put("id", JsonValue.NewStr(this.mutationId));
@@ -248,6 +281,11 @@ class MutationResult {
 /// 一次事务的不可变结果快照。结果列表通过 Add 只在构造阶段填充，
 /// 读取时使用 ResultAt 的复制值，避免调用方修改内部对象。
 class TableTransactionResult {
+    static const int Acked = 1;
+    static const int Rejected = 2;
+    static const int Conflict = 3;
+    static const int Cancelled = 4;
+
     string transactionId;
     int status;
     List<MutationResult> results;
@@ -266,6 +304,15 @@ class TableTransactionResult {
     string TransactionId() { return this.transactionId; }
     int Status() { return this.status; }
     int Count() { return this.results.Count; }
+
+    bool IsValid() {
+        return this.transactionId.Length > 0
+            && (this.status == TableTransactionResult.Acked
+                || this.status == TableTransactionResult.Rejected
+                || this.status == TableTransactionResult.Conflict
+                || this.status == TableTransactionResult.Cancelled)
+            && this.results.Count > 0;
+    }
 
     bool Add(MutationResult result) {
         if (result == null) { return false; }
@@ -289,6 +336,18 @@ class TableTransactionResult {
     }
 
     int FailedCount() { return this.results.Count - this.AcceptedCount(); }
+
+    TableTransactionResult Copy() {
+        TableTransactionResult copy = TableTransactionResult.Create(
+            this.transactionId, this.status);
+        for (int i = 0; i < this.results.Count; i = i + 1) {
+            MutationResult result = this.results[i];
+            copy.Add(new MutationResult(result.MutationId(), result.Status(),
+                result.CanonicalValue(), result.ServerValue(),
+                result.ServerRevision(), result.Message()));
+        }
+        return copy;
+    }
 
     string ToJson() {
         JsonValue root = JsonValue.NewObject();

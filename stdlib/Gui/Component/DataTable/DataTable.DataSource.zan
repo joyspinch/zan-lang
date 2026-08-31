@@ -86,6 +86,14 @@ class QueryDataSource : DataSource {
     int serverRevision;
     List<SchemaColumn> schema;
     DataPageCache pageCache;
+    TableTransaction activeTransaction;
+    TransactionRequestToken activeTransactionToken;
+    TableTransactionResult pendingTransactionResult;
+    TableTransactionResult currentTransactionResult;
+    TableTransactionResult errorTransactionResult;
+    bool transactionPending;
+    bool transactionActive;
+    int nextTransactionRequestId;
 
     QueryDataSource() { this.Setup(); }
 
@@ -105,6 +113,31 @@ class QueryDataSource : DataSource {
         this.serverRevision = 0;
         this.schema = new List<SchemaColumn>();
         this.pageCache = new DataPageCache(268435456);
+        this.activeTransaction = null;
+        this.activeTransactionToken = null;
+        this.pendingTransactionResult = null;
+        this.currentTransactionResult = null;
+        this.errorTransactionResult = null;
+        this.transactionPending = false;
+        this.transactionActive = false;
+        this.nextTransactionRequestId = 1;
+    }
+
+    void ClearTransactionState(bool keepCurrent) {
+        if (this.activeTransactionToken != null) {
+            this.activeTransactionToken.Cancel();
+        }
+        if (this.activeTransaction != null
+            && this.activeTransaction.State() == TransactionState.Pending) {
+            this.activeTransaction.Cancel();
+        }
+        this.activeTransaction = null;
+        this.activeTransactionToken = null;
+        this.pendingTransactionResult = null;
+        this.errorTransactionResult = null;
+        this.transactionPending = false;
+        this.transactionActive = false;
+        if (!keepCurrent) { this.currentTransactionResult = null; }
     }
 
     void SetPageSize(int size) {
@@ -117,6 +150,7 @@ class QueryDataSource : DataSource {
         this.errorResult = null;
         this.resultPending = false;
         this.requestActive = false;
+        this.ClearTransactionState(false);
         this.pageCache.Clear();
         this.generation = this.generation + 1;
     }
@@ -133,6 +167,7 @@ class QueryDataSource : DataSource {
         this.requestActive = false;
         this.activeToken = null;
         this.activeViewport = null;
+        this.ClearTransactionState(false);
         this.pageCache.Clear();
         this.generation = this.generation + 1;
     }
@@ -153,6 +188,7 @@ class QueryDataSource : DataSource {
         this.errorResult = null;
         this.resultPending = false;
         this.requestActive = false;
+        this.ClearTransactionState(false);
         this.generation = this.generation + 1;
     }
 
@@ -198,6 +234,7 @@ class QueryDataSource : DataSource {
         this.errorResult = null;
         this.resultPending = false;
         this.requestActive = false;
+        this.ClearTransactionState(false);
         this.generation = this.generation + 1;
     }
 
@@ -345,6 +382,184 @@ class QueryDataSource : DataSource {
         return null;
     }
 
+    /// 构建独立于分页请求的事务传输包。
+    TransactionRequestEnvelope BuildTransactionRequest(
+        TableTransaction transaction, TransactionRequestToken token) {
+        return TransactionRequestEnvelope.Build(transaction, token);
+    }
+
+    /// 提交一个已完成本地校验的事务。事务必须处于 Pending，
+    /// 同一数据源同时只保留一个活动提交。
+    TransactionRequestToken SubmitTransaction(TableTransaction transaction) {
+        if (transaction == null || !transaction.IsValid()
+            || transaction.State() != TransactionState.Pending
+            || this.transactionActive) { return null; }
+        TransactionRequestToken token = new TransactionRequestToken(
+            this.nextTransactionRequestId, transaction.TransactionId(),
+            this.generation, this.schemaVersion, this.serverRevision);
+        this.nextTransactionRequestId = this.nextTransactionRequestId + 1;
+        this.activeTransaction = transaction;
+        this.activeTransactionToken = token;
+        this.pendingTransactionResult = null;
+        this.errorTransactionResult = null;
+        this.transactionPending = false;
+        this.transactionActive = true;
+        this.FetchTransaction(transaction, token);
+        return token;
+    }
+
+    /// 远端适配器重写此方法启动实际提交；完成时只调用 FinishTransaction。
+    virtual void FetchTransaction(TableTransaction transaction,
+                                  TransactionRequestToken token) {
+    }
+
+    bool TransactionResultShapeValid(TableTransactionResult result) {
+        if (result == null || !result.IsValid()
+            || this.activeTransaction == null
+            || result.TransactionId() != this.activeTransaction.TransactionId()
+            || result.Count() != this.activeTransaction.Count()) { return false; }
+        int accepted = 0;
+        int rejected = 0;
+        int conflicts = 0;
+        int cancelled = 0;
+        for (int i = 0; i < result.Count(); i = i + 1) {
+            MutationResult value = result.ResultAt(i);
+            if (value == null || !value.IsValid()
+                || !this.activeTransaction.HasMutationId(value.MutationId())) {
+                return false;
+            }
+            for (int j = 0; j < i; j = j + 1) {
+                MutationResult previous = result.ResultAt(j);
+                if (previous != null
+                    && previous.MutationId() == value.MutationId()) { return false; }
+            }
+            if (value.Status() == MutationResult.Accepted) { accepted = accepted + 1; }
+            else if (value.Status() == MutationResult.Rejected) { rejected = rejected + 1; }
+            else if (value.Status() == MutationResult.Conflict) { conflicts = conflicts + 1; }
+            else if (value.Status() == MutationResult.Cancelled) { cancelled = cancelled + 1; }
+        }
+        if (result.Status() == TableTransactionResult.Acked) {
+            return accepted == result.Count();
+        }
+        if (result.Status() == TableTransactionResult.Rejected) {
+            if (rejected < 1 || conflicts > 0 || cancelled > 0) { return false; }
+            return this.activeTransaction.Mode() == TransactionMode.BestEffort
+                || accepted == 0;
+        }
+        if (result.Status() == TableTransactionResult.Conflict) {
+            if (conflicts < 1 || rejected > 0 || cancelled > 0) { return false; }
+            return this.activeTransaction.Mode() == TransactionMode.BestEffort
+                || accepted == 0;
+        }
+        if (result.Status() == TableTransactionResult.Cancelled) {
+            return cancelled == result.Count();
+        }
+        return false;
+    }
+
+    /// 在收到完整且匹配身份的事务结果后排入 UI 线程 pending 槽。
+    bool FinishTransaction(TableTransactionResult result,
+                           TransactionRequestToken token) {
+        if (token == null || this.activeTransactionToken == null
+            || !token.SameIdentity(this.activeTransactionToken)
+            || !this.transactionActive || this.transactionPending
+            || this.activeTransaction.State() != TransactionState.Pending
+            || token.IsCancelled()
+            || result == null
+            || result.TransactionId() != token.TransactionId()
+            || !this.TransactionResultShapeValid(result)) { return false; }
+        this.pendingTransactionResult = result.Copy();
+        this.transactionPending = true;
+        return true;
+    }
+
+    /// 取消 transport token，并将仍在 Pending 的事务终结为 Cancelled。
+    void CancelTransaction(TransactionRequestToken token) {
+        if (token == null || this.activeTransactionToken == null
+            || !token.SameIdentity(this.activeTransactionToken)) { return; }
+        token.Cancel();
+        if (this.activeTransaction != null
+            && this.activeTransaction.State() == TransactionState.Pending) {
+            this.activeTransaction.Cancel();
+        }
+        this.activeTransaction = null;
+        this.activeTransactionToken = null;
+        this.pendingTransactionResult = null;
+        this.transactionPending = false;
+        this.transactionActive = false;
+    }
+
+    TableTransactionResult CurrentTransactionResult() {
+        if (this.currentTransactionResult == null) { return null; }
+        return this.currentTransactionResult.Copy();
+    }
+
+    TableTransactionResult ErrorTransaction() {
+        if (this.errorTransactionResult == null) { return null; }
+        return this.errorTransactionResult.Copy();
+    }
+
+    /// accepted 结果默认使查询页和缓存失效；具体 source 可重写此方法
+    /// 先更新后端/overlay，再调用 base 触发新 revision 查询。
+    virtual void ApplyTransactionResult(TableTransactionResult result) {
+        int newestRevision = this.serverRevision;
+        bool hasAcceptedRevision = false;
+        if (result != null) {
+            for (int i = 0; i < result.Count(); i = i + 1) {
+                MutationResult value = result.ResultAt(i);
+                if (value != null && value.Status() == MutationResult.Accepted
+                    && value.ServerRevision() > newestRevision) {
+                    newestRevision = value.ServerRevision();
+                    hasAcceptedRevision = true;
+                }
+            }
+        }
+        if (hasAcceptedRevision) { this.SetServerRevision(newestRevision); }
+        else { this.Refresh(); }
+    }
+
+    bool PollTransaction() {
+        if (!this.transactionPending) { return false; }
+        TableTransactionResult result = this.pendingTransactionResult;
+        this.pendingTransactionResult = null;
+        this.transactionPending = false;
+        if (result == null || this.activeTransaction == null
+            || this.activeTransactionToken == null
+            || this.activeTransaction.State() != TransactionState.Pending
+            || this.activeTransactionToken.IsCancelled()
+            || !this.TransactionResultShapeValid(result)) {
+            this.errorTransactionResult = result;
+            this.activeTransaction = null;
+            this.activeTransactionToken = null;
+            this.transactionActive = false;
+            return false;
+        }
+        TableTransaction transaction = this.activeTransaction;
+        if (result.Status() == TableTransactionResult.Acked) {
+            transaction.Ack();
+            this.ApplyTransactionResult(result);
+        } else if (result.Status() == TableTransactionResult.Conflict) {
+            string detail = "transaction conflict";
+            MutationResult first = result.ResultAt(0);
+            if (first != null && first.Message().Length > 0) { detail = first.Message(); }
+            transaction.MarkConflict(detail);
+        } else if (result.Status() == TableTransactionResult.Rejected) {
+            string detail = "transaction rejected";
+            MutationResult first = result.ResultAt(0);
+            if (first != null && first.Message().Length > 0) { detail = first.Message(); }
+            transaction.Reject(detail);
+        } else {
+            transaction.Cancel();
+        }
+        TableTransactionResult snapshot = result.Copy();
+        if (this.activeTransactionToken != null) { this.activeTransactionToken.Cancel(); }
+        this.activeTransaction = null;
+        this.activeTransactionToken = null;
+        this.transactionActive = false;
+        this.currentTransactionResult = snapshot;
+        return true;
+    }
+
     /// 迟到、取消、schema/revision 不匹配的结果在进入 pending 前丢弃。
     void FinishQuery(QueryResult result, QueryRequestToken token) {
         if (token == null || this.activeToken == null
@@ -379,7 +594,8 @@ class QueryDataSource : DataSource {
     }
 
     override bool Poll() {
-        if (!this.resultPending) { return false; }
+        bool changed = this.PollTransaction();
+        if (!this.resultPending) { return changed; }
         QueryResult result = this.pendingResult;
         this.pendingResult = null;
         this.resultPending = false;
@@ -390,7 +606,7 @@ class QueryDataSource : DataSource {
             this.requestActive = false;
             this.activeToken = null;
             this.activeViewport = null;
-            return false;
+            return changed;
         }
         this.currentResult = result;
         this.requestActive = false;

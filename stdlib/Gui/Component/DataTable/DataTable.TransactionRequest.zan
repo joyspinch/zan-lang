@@ -1,0 +1,102 @@
+using System;
+using System.Json;
+
+namespace Gui.Component.DataTable;
+
+/// 一次事务提交的独立请求身份。它不复用 QueryRequestToken，
+/// 因而 cell mutation 不会被误判为分页结果。
+class TransactionRequestToken {
+    int requestId;
+    string transactionId;
+    int generation;
+    int schemaVersion;
+    int serverRevision;
+    bool cancelled;
+
+    TransactionRequestToken(int id, string txId, int gen, int schema, int server) {
+        this.requestId = id;
+        this.transactionId = txId;
+        if (this.transactionId == null) { this.transactionId = ""; }
+        this.generation = gen;
+        this.schemaVersion = schema;
+        this.serverRevision = server;
+        this.cancelled = false;
+    }
+
+    int RequestId() { return this.requestId; }
+    string TransactionId() { return this.transactionId; }
+    int Generation() { return this.generation; }
+    int SchemaVersion() { return this.schemaVersion; }
+    int ServerRevision() { return this.serverRevision; }
+    bool IsCancelled() { return this.cancelled; }
+    void Cancel() { this.cancelled = true; }
+
+    bool SameIdentity(TransactionRequestToken other) {
+        if (other == null) { return false; }
+        return this.requestId == other.RequestId()
+            && this.transactionId == other.TransactionId()
+            && this.generation == other.Generation()
+            && this.schemaVersion == other.SchemaVersion()
+            && this.serverRevision == other.ServerRevision();
+    }
+}
+
+/// 把事务快照和独立请求身份绑定为服务端传输包。
+class TransactionRequestEnvelope {
+    static const int FormatVersion = 1;
+    TableTransaction transaction;
+    TransactionRequestToken token;
+
+    TransactionRequestEnvelope(TableTransaction value,
+                                TransactionRequestToken requestToken) {
+        this.transaction = value;
+        this.token = requestToken;
+    }
+
+    static TransactionRequestEnvelope Build(TableTransaction value,
+                                             TransactionRequestToken token) {
+        return new TransactionRequestEnvelope(value, token);
+    }
+
+    TableTransaction Transaction() { return this.transaction; }
+    TransactionRequestToken Token() { return this.token; }
+
+    bool IsValid() {
+        if (this.transaction == null || this.token == null
+            || !this.transaction.IsValid()
+            || this.transaction.State() != TransactionState.Pending
+            || this.transaction.TransactionId() != this.token.TransactionId()) {
+            return false;
+        }
+        return !this.token.IsCancelled();
+    }
+
+    string ToJson() {
+        JsonValue root = JsonValue.NewObject();
+        root.Put("ver", JsonValue.NewNum(Convert.ToString(
+            TransactionRequestEnvelope.FormatVersion)));
+        int requestId = 0;
+        int generation = 0;
+        int schema = 0;
+        int server = 0;
+        string transactionId = "";
+        if (this.token != null) {
+            requestId = this.token.RequestId();
+            generation = this.token.Generation();
+            schema = this.token.SchemaVersion();
+            server = this.token.ServerRevision();
+            transactionId = this.token.TransactionId();
+        }
+        root.Put("requestId", JsonValue.NewNum(Convert.ToString(requestId)));
+        root.Put("generation", JsonValue.NewNum(Convert.ToString(generation)));
+        root.Put("schema", JsonValue.NewNum(Convert.ToString(schema)));
+        root.Put("server", JsonValue.NewNum(Convert.ToString(server)));
+        root.Put("transactionId", JsonValue.NewStr(transactionId));
+        root.Put("valid", JsonValue.NewBool(this.IsValid()));
+        if (this.transaction != null) {
+            JsonValue value = JsonValue.ParseLenient(this.transaction.ToJson());
+            if (value != null) { root.Put("transaction", value); }
+        }
+        return root.ToJson();
+    }
+}

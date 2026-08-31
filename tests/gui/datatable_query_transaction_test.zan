@@ -1,0 +1,228 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Widget;
+
+namespace DataTableQueryTransactionTest;
+
+class TransactionSource : QueryDataSource {
+    int fetchCount;
+    int submitCount;
+    string value;
+    TableTransaction submitted;
+    TransactionRequestToken submittedToken;
+
+    TransactionSource() {
+        this.Setup();
+        this.fetchCount = 0;
+        this.submitCount = 0;
+        this.value = "before";
+        this.submitted = null;
+        this.submittedToken = null;
+    }
+
+    override void FetchQuery(QueryDescriptor query,
+                              QueryViewport viewport,
+                              QueryRequestToken token) {
+        this.fetchCount = this.fetchCount + 1;
+        List<QueryRow> rows = new List<QueryRow>();
+        DataRow cells = new DataRow();
+        cells.Push(this.value);
+        rows.Add(new QueryRow(RowKey.Of("order:7"), 4, cells));
+        QueryResult result = new QueryResult(token.RequestId(), token.Generation(),
+            token.QueryText(), token.QueryHash(), token.SchemaVersion(), token.ServerRevision(),
+            viewport.Start(), viewport.Count(), viewport.Cursor(), rows, 1, true, false, "", "");
+        this.FinishQuery(result, token);
+    }
+
+    override void FetchTransaction(TableTransaction transaction,
+                                    TransactionRequestToken token) {
+        this.submitCount = this.submitCount + 1;
+        this.submitted = transaction;
+        this.submittedToken = token;
+    }
+
+    override void ApplyTransactionResult(TableTransactionResult result) {
+        if (result != null && result.Status() == TableTransactionResult.Acked) {
+            MutationResult accepted = result.ResultAt(0);
+            if (accepted != null) { this.value = accepted.CanonicalValue(); }
+        }
+        base.ApplyTransactionResult(result);
+    }
+
+    int FetchCount() { return this.fetchCount; }
+    int SubmitCount() { return this.submitCount; }
+    TableTransaction Submitted() { return this.submitted; }
+    TransactionRequestToken SubmittedToken() { return this.submittedToken; }
+}
+
+class Program {
+    static TableTransaction Pending(string id, int mode, string mutationId,
+                                    RowKey key, string value) {
+        TableTransaction tx = TableTransaction.Create(id, mode);
+        tx.Add(TableMutation.Cell(mutationId, key, 0, 4, value));
+        tx.BeginValidation();
+        tx.MarkPending();
+        return tx;
+    }
+
+    static TableTransactionResult Accepted(string id, string mutationId,
+                                           string value, int revision) {
+        TableTransactionResult result = TableTransactionResult.Create(
+            id, TableTransactionResult.Acked);
+        result.Add(MutationResult.AcceptedValue(mutationId, value, revision));
+        return result;
+    }
+
+    static TableTransactionResult Conflict(string id, string mutationId,
+                                           string server, int revision) {
+        TableTransactionResult result = TableTransactionResult.Create(
+            id, TableTransactionResult.Conflict);
+        result.Add(MutationResult.ConflictValue(mutationId, server, revision, "stale"));
+        return result;
+    }
+
+    static TableTransactionResult Rejected(string id, string mutationId) {
+        TableTransactionResult result = TableTransactionResult.Create(
+            id, TableTransactionResult.Rejected);
+        result.Add(MutationResult.RejectedValue(mutationId, "denied"));
+        return result;
+    }
+
+    static void Main() {
+        DataTableState st = new DataTableState();
+        QueryDescriptor query = QueryDescriptor.Of(st, "orders",
+            QueryCapabilities.Page + QueryCapabilities.Edit);
+        QueryViewport viewport = new QueryViewport(0, 10, "");
+        TransactionSource source = new TransactionSource();
+
+        QueryRequestToken seed = source.RequestQuery(query, viewport, null);
+        Console.WriteLine("seedPoll=" + source.Poll());
+        Console.WriteLine("seedText=" + source.CellText(0, 0));
+        RowKey seedKey = source.GetRowKey(0);
+        Console.WriteLine("seedKey=" + (seedKey != null
+            && seedKey.Canonical() == "order:7"));
+
+        RowKey key = RowKey.Of("order:7");
+        TableTransaction tx = Program.Pending("tx-accepted", TransactionMode.BestEffort,
+            "m-accepted", key, "user value");
+        TableMutation txMutation = tx.At(0);
+        Console.WriteLine("txPending=" + (tx.IsValid()
+            && tx.State() == TransactionState.Pending
+            && txMutation != null
+            && txMutation.Key().Same(key)
+            && txMutation.ExpectedRevision() == 4));
+        TransactionRequestToken acceptedToken = source.SubmitTransaction(tx);
+        Console.WriteLine("submit=" + (acceptedToken != null
+            && source.SubmitCount() == 1
+            && source.Submitted() == tx
+            && source.SubmittedToken() == acceptedToken));
+        TransactionRequestEnvelope acceptedEnvelope =
+            source.BuildTransactionRequest(tx, acceptedToken);
+        Console.WriteLine("requestJson=" + (acceptedEnvelope != null
+            && acceptedEnvelope.IsValid()
+            && acceptedEnvelope.ToJson().Length > 0));
+        Console.WriteLine("preCommitText=" + source.CellText(0, 0));
+        Console.WriteLine("acceptedFinish=" + source.FinishTransaction(
+            Program.Accepted("tx-accepted", "m-accepted", "canonical", 1), acceptedToken));
+        Console.WriteLine("acceptedPoll=" + source.Poll());
+        Console.WriteLine("acceptedState=" + tx.State());
+        TableTransactionResult acceptedCurrent = source.CurrentTransactionResult();
+        int acceptedCount = -1;
+        int acceptedAccepted = -1;
+        int acceptedFailed = -1;
+        if (acceptedCurrent != null) {
+            acceptedCount = acceptedCurrent.Count();
+            acceptedAccepted = acceptedCurrent.AcceptedCount();
+            acceptedFailed = acceptedCurrent.FailedCount();
+        }
+        Console.WriteLine("acceptedCounts=" + Convert.ToString(acceptedCount)
+            + ":" + Convert.ToString(acceptedAccepted)
+            + ":" + Convert.ToString(acceptedFailed));
+        QueryRequestToken refreshed = source.RequestQuery(query, viewport, null);
+        Console.WriteLine("postCommitPoll=" + source.Poll());
+        Console.WriteLine("postCommitText=" + source.CellText(0, 0));
+        Console.WriteLine("refreshFetches=" + source.FetchCount());
+
+        TableTransaction oldTx = Program.Pending("tx-old", TransactionMode.BestEffort,
+            "m-old", key, "old");
+        TransactionRequestToken oldToken = source.SubmitTransaction(oldTx);
+        source.CancelTransaction(oldToken);
+        Console.WriteLine("cancel=" + (oldTx.State() == TransactionState.Cancelled));
+        Console.WriteLine("cancelledLateFinish=" + source.FinishTransaction(
+            Program.Accepted("tx-old", "m-old", "late", 2), oldToken));
+        Console.WriteLine("cancelledLatePoll=" + source.Poll());
+        Console.WriteLine("cancelledLateText=" + source.CellText(0, 0));
+
+        TableTransaction currentTx = Program.Pending("tx-current", TransactionMode.BestEffort,
+            "m-current", key, "current");
+        TransactionRequestToken currentToken = source.SubmitTransaction(currentTx);
+        Console.WriteLine("currentFinish=" + source.FinishTransaction(
+            Program.Accepted("tx-current", "m-current", "current canonical", 2), currentToken));
+        Console.WriteLine("currentPoll=" + source.Poll());
+        Console.WriteLine("currentState=" + currentTx.State());
+
+        QueryRequestToken conflictSeed = source.RequestQuery(query, viewport, null);
+        Console.WriteLine("conflictSeedPoll=" + source.Poll());
+        Console.WriteLine("conflictSeedText=" + source.CellText(0, 0));
+        TableTransaction conflictTx = Program.Pending("tx-conflict", TransactionMode.AllOrNothing,
+            "m-conflict", key, "conflict");
+        TransactionRequestToken conflictToken = source.SubmitTransaction(conflictTx);
+        Console.WriteLine("conflictFinish=" + source.FinishTransaction(
+            Program.Conflict("tx-conflict", "m-conflict", "server", 9), conflictToken));
+        Console.WriteLine("conflictPoll=" + source.Poll());
+        TableTransactionResult conflictCurrent = source.CurrentTransactionResult();
+        MutationResult conflictValue = null;
+        int conflictFailed = -1;
+        if (conflictCurrent != null) {
+            conflictValue = conflictCurrent.ResultAt(0);
+            conflictFailed = conflictCurrent.FailedCount();
+        }
+        string conflictServer = "";
+        if (conflictValue != null) { conflictServer = conflictValue.ServerValue(); }
+        Console.WriteLine("conflictState=" + conflictTx.State());
+        Console.WriteLine("conflictFailed=" + conflictFailed);
+        Console.WriteLine("conflictServer=" + conflictServer);
+        Console.WriteLine("conflictText=" + source.CellText(0, 0));
+
+        TableTransaction rejectedTx = Program.Pending("tx-rejected", TransactionMode.AllOrNothing,
+            "m-rejected", key, "rejected");
+        TransactionRequestToken rejectedToken = source.SubmitTransaction(rejectedTx);
+        Console.WriteLine("rejectedPoll=" + source.FinishTransaction(
+            Program.Rejected("tx-rejected", "m-rejected"), rejectedToken));
+        Console.WriteLine("rejectedDone=" + source.Poll());
+        Console.WriteLine("rejectedState=" + rejectedTx.State());
+        Console.WriteLine("rejectedError=" + rejectedTx.Error());
+
+        TableTransaction generationTx = Program.Pending("tx-generation", TransactionMode.BestEffort,
+            "m-generation", key, "generation");
+        TransactionRequestToken generationToken = source.SubmitTransaction(generationTx);
+        source.Refresh();
+        Console.WriteLine("generationCancel=" + (generationTx.State() == TransactionState.Cancelled));
+        Console.WriteLine("generationLateFinish=" + source.FinishTransaction(
+            Program.Accepted("tx-generation", "m-generation", "late generation", 10),
+            generationToken));
+        Console.WriteLine("generationLatePoll=" + source.Poll());
+
+        JsonValue txJson = JsonValue.ParseLenient(tx.ToJson());
+        JsonValue txMutations = null;
+        if (txJson != null) { txMutations = txJson.Get("mutations"); }
+        JsonValue requestJson = source.BuildTransactionRequest(tx, acceptedToken).ToJson() == "" ? null :
+            JsonValue.ParseLenient(source.BuildTransactionRequest(tx, acceptedToken).ToJson());
+        Console.WriteLine("txJson=" + (txJson != null && txMutations != null
+            && txJson.Str("id", "") == "tx-accepted"
+            && txMutations.Count() == 1));
+        Console.WriteLine("envelopeJson=" + (requestJson != null
+            && requestJson.Str("transactionId", "") == "tx-accepted"
+            && requestJson.Get("transaction") != null));
+        JsonValue resultJson = null;
+        if (acceptedCurrent != null) {
+            resultJson = JsonValue.ParseLenient(acceptedCurrent.ToJson());
+        }
+        JsonValue resultValues = null;
+        if (resultJson != null) { resultValues = resultJson.Get("results"); }
+        Console.WriteLine("resultJson=" + (resultJson != null
+            && resultJson.Int("status", 0) == TableTransactionResult.Acked
+            && resultValues != null && resultValues.Count() == 1));
+    }
+}
