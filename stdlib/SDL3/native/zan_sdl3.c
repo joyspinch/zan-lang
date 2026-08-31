@@ -109,17 +109,21 @@ ZAN_SDL_API zan_iptr zan_sdl_create_renderer(zan_iptr window, const char *name) 
 
 /* ---- Borderless drag/resize (custom title bar) ---------------------------
  * SDL calls the hit-test callback on every mouse-move probe. The caption strip
- * is the top 40 native px; resize handles live in the outer 6 px frame and
- * win over the caption at the corners. Maximized windows report NORMAL so the
- * frame is not draggable/resizable. Caption-button areas are excluded by the
- * game itself: it consumes those clicks as UI, so SDL never sees them. */
+ * is the top 40 design units; resize handles live in the outer 6 px frame and
+ * win over the caption at the corners. The game draws its caption buttons in
+ * *design* units (Host chrome: three 46x32 buttons, 8px gaps, 10px right
+ * inset), while the callback receives window *pixel* coordinates -- so the
+ * strip is mapped through the logical width passed to zan_sdl_set_game_hittest
+ * and excluded from dragging; otherwise a pressed button would start a window
+ * drag that swallows the click. */
 
 static SDL_HitTestResult zan_sdl_game_hittest(SDL_Window *win,
                                               const SDL_Point *area,
                                               void *data) {
-    (void)data;
+    int logicalW = data ? *(int *)data : 0;
     int W = 0, H = 0;
     SDL_GetWindowSize(win, &W, &H);
+    (void)H;
     int x = area->x, y = area->y;
     if (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) {
         return SDL_HITTEST_NORMAL;
@@ -134,14 +138,28 @@ static SDL_HitTestResult zan_sdl_game_hittest(SDL_Window *win,
     if (right) return SDL_HITTEST_RESIZE_RIGHT;
     if (top) return SDL_HITTEST_RESIZE_TOP;
     if (bottom) return SDL_HITTEST_RESIZE_BOTTOM;
-    if (y < 40) return SDL_HITTEST_DRAGGABLE;
+    if (logicalW > 0 && W > 0 && y * logicalW < 40 * W) {
+        /* the bar is authored in design units; compare in the same space */
+        int xL = x * logicalW / W;
+        int yL = y * logicalW / W;
+        const int BW = 46, BH = 32, GAP = 8, PAD = 10;
+        int stripL = logicalW - PAD - BW * 3 - GAP * 2;
+        int stripR = logicalW - PAD;
+        if (xL >= stripL && xL < stripR && yL >= 4 && yL < 36) {
+            return SDL_HITTEST_NORMAL;
+        }
+        return SDL_HITTEST_DRAGGABLE;
+    }
     return SDL_HITTEST_NORMAL;
 }
 
-ZAN_SDL_API zan_i32 zan_sdl_set_game_hittest(zan_iptr window) {
+ZAN_SDL_API zan_i32 zan_sdl_set_game_hittest(zan_iptr window, zan_i32 logical_w) {
     if (!window) return 0;
+    static int storedLogicalW;   /* one game window per process */
+    storedLogicalW = (int)logical_w;
     return zan_bool(SDL_SetWindowHitTest((SDL_Window *)zan_ptr(window),
-                                         zan_sdl_game_hittest, NULL));
+                                         zan_sdl_game_hittest,
+                                         &storedLogicalW));
 }
 
 ZAN_SDL_API zan_i32 zan_sdl_show_window_menu(zan_iptr window, zan_i32 x, zan_i32 y) {

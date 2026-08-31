@@ -194,14 +194,37 @@ class GlyphFont {
 
     static void Draw(SdlRenderer r, string text, int x, int y, int scale,
                      int cr, int cg, int cb, int ca) {
-        GlyphFont.atlas.SetColor(cr, cg, cb);
-        GlyphFont.atlas.SetOpacity(ca);
-        int pen = x;
         int dw = GlyphFont.cellW * scale / 6;
         int dh = GlyphFont.cellH * scale / 6;
         int m = GlyphFont.atlasScale;
         int scw = GlyphFont.cellW * m;
         int sch = GlyphFont.cellH * m;
+        // Batched path: every glyph is a same-texture quad from the atlas,
+        // so one label collapses into a single geometry run. The flush at
+        // the end keeps painter order with the surrounding immediate draws
+        // (each label is an atomic ordered group).
+        SdlSpriteBatch b = Host.FindBatch(r);
+        if (b != null) {
+            int pen = x;
+            for (int i = 0; i < text.Length; i = i + 1) {
+                int gi = (text[i] & 255) - 32;
+                if (gi >= 0 && gi < 95) {
+                    int col = gi % GlyphFont.cols;
+                    int row = gi / GlyphFont.cols;
+                    b.QueueRegion(GlyphFont.atlas, col * scw, row * sch,
+                        scw, sch, pen, y, dw, dh, cr, cg, cb, ca);
+                    pen = pen + GlyphFont.adv[gi] * scale / 6;
+                } else {
+                    pen = pen + GlyphFont.adv[0] * scale / 6;
+                }
+            }
+            b.End();
+            b.Begin();
+            return;
+        }
+        GlyphFont.atlas.SetColor(cr, cg, cb);
+        GlyphFont.atlas.SetOpacity(ca);
+        int pen2 = x;
         for (int i = 0; i < text.Length; i = i + 1) {
             int gi = (text[i] & 255) - 32;
             if (gi >= 0 && gi < 95) {
@@ -209,10 +232,10 @@ class GlyphFont {
                 int row = gi / GlyphFont.cols;
                 r.DrawTextureRegion(GlyphFont.atlas, col * scw,
                     row * sch, scw, sch,
-                    pen, y, dw, dh);
-                pen = pen + GlyphFont.adv[gi] * scale / 6;
+                    pen2, y, dw, dh);
+                pen2 = pen2 + GlyphFont.adv[gi] * scale / 6;
             } else {
-                pen = pen + GlyphFont.adv[0] * scale / 6;
+                pen2 = pen2 + GlyphFont.adv[0] * scale / 6;
             }
         }
         GlyphFont.atlas.ResetColor();
@@ -234,9 +257,11 @@ class Host {
 
     SdlWindow window;
     SdlRenderer r;
-    SdlTexture canvas;   // ss x supersample target; downsampled on present
+    SdlTexture canvas;   // offscreen target; downsampled on present
     int logicalW;
     int logicalH;
+    int canvasW;         // canvas raster size in native px (see CreateFull)
+    int canvasH;
     bool running;
     bool fullscreen;
     bool ignoreMax;   // swallow the maximize event fired when leaving fullscreen
@@ -244,11 +269,19 @@ class Host {
     int nextFrame;    // absolute tick deadline for the next frame start
     int idleMs;       // frame time while minimized (0 = no idle throttle)
     bool minimized;
+    int redrawMs;     // event-driven redraw interval (0 = render every frame)
+    int nextRedraw;   // absolute tick when the next render is due
+    bool hadEvent;    // any input/window event arrived since last render
     // Custom title bar (borderless window + game-drawn bar). SDL_HITTEST
     // handles dragging/resizing natively; the game only draws the bar.
     bool customBar;
     string barTitle;
     bool mouseBarDown;   // game feeds mouse state inside the bar zone
+    // Geometry-batched sprite submission (see SdlSpriteBatch). Created
+    // lazily against the renderer; Begin() opens a frame, End() flushes
+    // before Present. Sprite.Ball/Glow route their textured quads through
+    // it so hundreds of discs per frame cost runs, not draw calls.
+    SdlSpriteBatch sprBatch;
 
     // ss=3 bakes a ~4K raster target (razor-sharp on 4K panels). Fill-heavy
     // games (idle games repaint hundreds of scanline fills per frame) should
@@ -265,9 +298,14 @@ class Host {
     // customBar: borderless window + SDL hit-test drag/resize + game-drawn
     // title bar (Host.DrawTitleBar / TitleBarInput). The OS title bar on a
     // themed desktop clashes with game art; this keeps one visual language.
+    // The single live game host (games are one-window). Sprite batch
+    // routing resolves through it; null outside a game's lifetime.
+    static Host liveHost;
+
     static Host CreateFull(string title, int logicalW, int logicalH, int ss, bool customBar) {
         Sdl.Init(SdlInit.Video() + SdlInit.Events());
         Host h = new Host();
+        liveHost = h;
         int flags = SdlWindowFlags.Resizable() + SdlWindowFlags.HighPixelDensity();
         if (customBar) { flags = flags + SdlWindowFlags.Borderless(); }
         h.customBar = customBar;
@@ -277,24 +315,45 @@ class Host {
         // aware; F11 toggles fullscreen. The letterboxed logical canvas keeps
         // gameplay math resolution-independent.
         h.window = SdlWindow.Create(title, logicalW * 3 / 2, logicalH * 3 / 2, flags);
-        if (customBar) { h.window.SetGameHitTest(); }
+        if (customBar) { h.window.SetGameHitTest(logicalW); }
         h.r = SdlRenderer.Create(h.window);
         h.r.SetBlend(1);
         h.r.SetVSync(true);
-        // Rasterize the whole scene at ss x the logical canvas; at 1:1 on a
-        // matching display this is razor-sharp, and it merely down-samples
-        // cleanly on smaller windows. Game code keeps authoring in the fixed
-        // design units (logicalW x logicalH).
+        // Canvas sizing (supersample-while-downscaling, SSRT): the scene is
+        // rasterized into an offscreen target at the *output* resolution,
+        // clamped to [logical .. ss x logical]. Games keep authoring in fixed
+        // design units; r.Sc() maps them onto the canvas. This wastes no
+        // fill on pixels that would be thrown away: a 1.5x window renders
+        // 1920x1080 (1:1 with the display) instead of a blind 2x target, while
+        // a 4K fullscreen still gets the full ss x raster for sharpness.
+        // The linear downsample only happens when the window is smaller than
+        // the logical size, which is also where the extra AA comes from.
         int f = ss;
         if (f < 1) { f = 1; }
-        h.r.SetLogicalSize(logicalW * f, logicalH * f,
+        int outPacked = h.r.OutputSize();
+        int outW = outPacked & 65535;
+        int outH = outPacked >> 16;
+        h.canvasW = outW;
+        if (h.canvasW < logicalW) { h.canvasW = logicalW; }
+        if (h.canvasW > logicalW * f) { h.canvasW = logicalW * f; }
+        h.canvasH = outH;
+        if (h.canvasH < logicalH) { h.canvasH = logicalH; }
+        if (h.canvasH > logicalH * f) { h.canvasH = logicalH * f; }
+        // Fractional scale factor canvas/logical as num/den for r.Sc().
+        int num = h.canvasW;
+        int den = logicalW;
+        if (h.canvasH * den > h.canvasW * logicalH) { num = h.canvasH; den = logicalH; }
+        int g0 = num; int g1 = den;
+        while (g1 != 0) { int g = g0 % g1; g0 = g1; g1 = g; }
+        if (g0 > 1) { num = num / g0; den = den / g0; }
+        h.r.SetLogicalSize(h.canvasW, h.canvasH,
             SdlLogicalPresentation.Letterbox());
-        h.r.SetUiScale(f, 1);
-        // Actual supersampling: draw the frame into an ss x offscreen target
-        // and blit it back linear-filtered, so vector shapes get real edge
-        // anti-aliasing on any window size (logical presentation alone only
-        // scales coordinates and leaves jagged edges).
-        h.canvas = SdlTexture.CreateTarget(h.r, logicalW * f, logicalH * f);
+        h.r.SetUiScale(num, den);
+        // Vector shapes rasterize at canvas resolution: 1:1 windows are
+        // razor-sharp, smaller windows are anti-aliased by the linear
+        // downsample. (Presentation alone only scales coordinates and
+        // leaves jagged edges.)
+        h.canvas = SdlTexture.CreateTarget(h.r, h.canvasW, h.canvasH);
         Sprite.Bake(h.r);
         Draw.EnsureRound(h.r);
         h.logicalW = logicalW;
@@ -302,6 +361,7 @@ class Host {
         h.running = true;
         h.fullscreen = false;
         h.frameMs = 0;
+        h.nextRedraw = 0;   // first frame always renders
         // Tamper defense is release-only: dev builds (compiled without -DPUBLISH)
         // must stay debuggable, so the guard is never armed there.
         #if PUBLISH
@@ -336,6 +396,25 @@ class Host {
     void SetIdleFps(int fps) {
         if (fps < 1) { fps = 1; }
         this.idleMs = 1000 / fps;
+    }
+
+    // Event-driven redraw for mostly-static scenes (idle games, menus,
+    // turn-based boards). The loop keeps polling events and stepping the
+    // sim, but skips the whole render+present when nothing changed since
+    // the last frame: no input, no animation tick due, no explicit
+    // RequestRedraw(). A static scene then costs no GPU/CPU at all instead
+    // of repainting 60 identical frames a second. When the scene does
+    // animate, frames still pace at frameMs -- the interval only adds
+    // skips, never delays a due frame. 0 (default) = render every frame.
+    void SetRedrawInterval(int ms) {
+        if (ms < 0) { ms = 0; }
+        this.redrawMs = ms;
+    }
+
+    // Force the next frame to render even if nothing ticked (call after
+    // changing state outside Step(), e.g. async callbacks).
+    void RequestRedraw() {
+        this.nextRedraw = 0;
     }
 
     void SetMinimized(bool m) {
@@ -459,6 +538,7 @@ class Host {
         // Focus gained/lost events are deliberately ignored: an
         // unfocused-but-visible window keeps rendering at full rate. Only a
         // real minimize stretches the frame deadline (SetIdleFps).
+        this.MarkEvent();
         if (type == SdlEventType.WindowMinimized()) { this.SetMinimized(true); }
         if (type == SdlEventType.WindowMaximized()) {
             if (this.ignoreMax) { this.ignoreMax = false; return; }
@@ -475,6 +555,31 @@ class Host {
 
     void Minimize() { this.window.Minimize(); }
 
+    // Games call this from their event loop after draining input (Host
+    // also sets it internally for window events): any input means the
+    // next frame should render even if no animation tick is due.
+    void MarkEvent() {
+        this.hadEvent = true;
+    }
+
+    // True when the upcoming frame must actually render: input arrived,
+    // the redraw heartbeat came due, or the previous frame was skipped
+    // (never skip twice in a row -- keeps vsync latency bounded).
+    bool ShouldRender() {
+        if (this.redrawMs <= 0) { return true; }
+        int now = Sdl.Ticks();
+        if (this.hadEvent || now >= this.nextRedraw) {
+            this.hadEvent = false;
+            this.nextRedraw = now + this.redrawMs;
+            return true;
+        }
+        // Skipped frame: yield the CPU so the poll loop doesn't busy-spin
+        // between heartbeats. Short slices keep input latency bounded.
+        int slack = this.nextRedraw - now;
+        if (slack > 8) { Sdl.Delay(8); }
+        return false;
+    }
+
     int MouseX() {
         return this.r.LogicalX(SdlEvent.MouseX(), SdlEvent.MouseY())
             * this.r.ScaleDen() / this.r.ScaleNum();
@@ -484,18 +589,43 @@ class Host {
             * this.r.ScaleDen() / this.r.ScaleNum();
     }
 
+    // Sprite-side lookup: the batch bound to this renderer, or null.
+    // Games own exactly one Host/renderer, so a linear scan over the live
+    // host is fine (called once per batched quad family, not per pixel).
+    static SdlSpriteBatch FindBatch(SdlRenderer r) {
+        if (liveHost == null) { return null; }
+        SdlSpriteBatch b = liveHost.SprBatch();
+        if (b == null || b.IsValid() == false) { return null; }
+        return b;
+    }
+
+    // The host-owned sprite batch (lazy). Null while the renderer is
+    // missing, so every caller must tolerate a null return.
+    SdlSpriteBatch SprBatch() {
+        if (this.sprBatch == null && this.r != null && this.r.IsValid()) {
+            this.sprBatch = SdlSpriteBatch.Create(this.r, 1024);
+        }
+        return this.sprBatch;
+    }
+
     void Begin(int cr, int cg, int cb) {
         if (this.canvas != null && this.canvas.IsValid()) {
             this.r.SetTarget(this.canvas);
         }
         this.r.SetColor(cr, cg, cb, 255);
         this.r.Clear();
+        SdlSpriteBatch b = this.SprBatch();
+        if (b != null) { b.Begin(); }
     }
     void End() {
+        SdlSpriteBatch b = this.sprBatch;
+        if (b != null) { b.End(); }
         if (this.canvas != null && this.canvas.IsValid()) {
             this.r.ResetTarget();
             this.r.SetColor(0, 0, 0, 255);
             this.r.Clear();
+            // logical units: DrawTexture's Sc() maps them onto the actual
+            // canvas raster, whatever its size.
             this.r.DrawTexture(this.canvas, 0, 0, this.logicalW, this.logicalH);
         }
         this.r.Present();
@@ -506,6 +636,11 @@ class Host {
     }
 
     void Close() {
+        if (this.sprBatch != null) {
+            this.sprBatch.Close();
+            this.sprBatch = null;
+        }
+        if (liveHost == this) { liveHost = null; }
         this.window.Close();
         Sdl.Quit();
     }
@@ -568,12 +703,26 @@ class Sprite {
         Sprite.disc = d;
     }
 
+    // Route a tinted textured quad through the host's sprite batch when the
+    // renderer is the batch's target renderer; adjacent same-texture quads
+    // then collapse into one geometry run. Falls back to the immediate call
+    // where no batch exists (plain SdlRenderer consumers).
+    static bool QueueBatch(SdlRenderer r, SdlTexture tex,
+                           int x, int y, int w, int h,
+                           int cr, int cg, int cb, int ca) {
+        SdlSpriteBatch b = Host.FindBatch(r);
+        if (b == null) { return false; }
+        b.Queue(tex, x, y, w, h, 0, 0, 0, 0, cr, cg, cb, ca);
+        return true;
+    }
+
     // Solid tinted disc, one draw call. Falls back to scanline FillCircle if
     // baking failed (e.g. render targets unsupported).
     static void Ball(SdlRenderer r, int cx, int cy, int rad,
                      int cr, int cg, int cb, int ca) {
         if (rad <= 0) { return; }
         if (Sprite.disc == null) { Draw.FillCircle(r, cx, cy, rad, cr, cg, cb, ca); return; }
+        if (Sprite.QueueBatch(r, Sprite.disc, cx - rad, cy - rad, rad * 2, rad * 2, cr, cg, cb, ca)) { return; }
         Sprite.disc.SetColor(cr, cg, cb);
         Sprite.disc.SetOpacity(ca);
         r.DrawTexture(Sprite.disc, cx - rad, cy - rad, rad * 2, rad * 2);
@@ -584,6 +733,7 @@ class Sprite {
                      int cr, int cg, int cb, int ca) {
         if (rad <= 0) { return; }
         if (Sprite.glow == null) { Sprite.Ball(r, cx, cy, rad, cr, cg, cb, ca); return; }
+        if (Sprite.QueueBatch(r, Sprite.glow, cx - rad, cy - rad, rad * 2, rad * 2, cr, cg, cb, ca)) { return; }
         Sprite.glow.SetColor(cr, cg, cb);
         Sprite.glow.SetOpacity(ca);
         r.DrawTexture(Sprite.glow, cx - rad, cy - rad, rad * 2, rad * 2);
@@ -1103,23 +1253,71 @@ class Text {
 
     // Mixed ASCII + CJK draw: ASCII comes from the antialiased GlyphFont
     // atlas, everything else from the CjkFont atlas, on one shared pen.
+    // Batched variant: glyph quads from both atlases queue with per-quad
+    // tint; the whole label is one ordered group flushed at the end, so
+    // painter order against the surrounding immediate draws is unchanged.
     static void DrawMixed(SdlRenderer r, string text, int x, int y, int scale,
                           int cr, int cg, int cb, int ca) {
+        SdlSpriteBatch b = Host.FindBatch(r);
+        if (b != null) {
+            int pen = x;
+            int[] pos = new int[1];
+            pos[0] = 0;
+            while (pos[0] < text.Length) {
+                int cp = Utf8.Decode(text, pos);
+                if (cp >= 32 && cp <= 126) {
+                    int gi = cp - 32;
+                    int m = GlyphFont.atlasScale;
+                    int scw = GlyphFont.cellW * m;
+                    int sch = GlyphFont.cellH * m;
+                    int dw = GlyphFont.cellW * scale / 6;
+                    int dh = GlyphFont.cellH * scale / 6;
+                    if (gi >= 0 && gi < 95) {
+                        b.QueueRegion(GlyphFont.atlas,
+                            (gi % GlyphFont.cols) * scw, (gi / GlyphFont.cols) * sch,
+                            scw, sch, pen, y, dw, dh, cr, cg, cb, ca);
+                    }
+                    pen = pen + GlyphFont.adv[gi >= 0 && gi < 95 ? gi : 0] * scale / 6;
+                } else {
+                    int gi = CjkFont.Index(cp);
+                    int dw = CjkFont.cell * scale / 6;
+                    int dy = y + (57 - CjkFont.cell) * scale / 12;
+                    if (gi >= 0) {
+                        int m = CjkFont.scalePx;
+                        int scw = CjkFont.cell * m;
+                        b.QueueRegion(CjkFont.atlas,
+                            (gi % CjkFont.cols) * scw, (gi / CjkFont.cols) * scw,
+                            scw, scw, pen, dy, dw, dw, cr, cg, cb, ca);
+                    } else {
+                        // missing glyph placeholder is an immediate draw;
+                        // flush what queued so far to keep pen order
+                        b.End();
+                        b.Begin();
+                        r.SetColor(cr, cg, cb, ca);
+                        r.DrawRect(x + scale / 2, dy + scale / 2, dw - scale, dw - scale);
+                    }
+                    pen = pen + CjkFont.Advance(scale);
+                }
+            }
+            b.End();
+            b.Begin();
+            return;
+        }
         GlyphFont.atlas.SetColor(cr, cg, cb);
         GlyphFont.atlas.SetOpacity(ca);
         CjkFont.atlas.SetColor(cr, cg, cb);
         CjkFont.atlas.SetOpacity(ca);
         r.SetColor(cr, cg, cb, ca);
-        int pen = x;
-        int[] pos = new int[1];
-        pos[0] = 0;
-        while (pos[0] < text.Length) {
-            int cp = Utf8.Decode(text, pos);
+        int pen2 = x;
+        int[] pos2 = new int[1];
+        pos2[0] = 0;
+        while (pos2[0] < text.Length) {
+            int cp = Utf8.Decode(text, pos2);
             if (cp >= 32 && cp <= 126) {
-                pen = pen + GlyphFont.DrawGlyph(r, cp - 32, pen, y, scale);
+                pen2 = pen2 + GlyphFont.DrawGlyph(r, cp - 32, pen2, y, scale);
             } else {
-                CjkFont.DrawGlyph(r, cp, pen, y, scale);
-                pen = pen + CjkFont.Advance(scale);
+                CjkFont.DrawGlyph(r, cp, pen2, y, scale);
+                pen2 = pen2 + CjkFont.Advance(scale);
             }
         }
         GlyphFont.atlas.ResetColor();
