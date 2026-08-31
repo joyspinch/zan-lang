@@ -25,6 +25,13 @@ void zan_rt_soft_note(const char *text);
  * pointer identity, exactly like zan_rt_soft_note's text-pointer dedup);
  * the full text is composed on first sight, printed once, and logged. */
 void zan_rt_soft_note2(const char *prefix, const char *msg);
+/* The whole compiler guard in one runtime call: soft mode reports (note2) and
+ * RETURNS so the caller continues with a default value; hard mode (ZAN_RT_HARD=1)
+ * composes prefix+msg, prints it, raises the ZAN_RT_FAULT_MESSAGE record for
+ * the crash log, and exits(70) -- the raise resumes this thread, so exit runs.
+ * One call site per guard keeps 50k guard sites from each inlining this whole
+ * sequence (was several MB of .text across a big program). */
+void zan_rt_guard_fail2(const char *prefix, const char *msg);
 /* Non-zero when ZAN_RT_HARD=1 was set at startup: guards must exit(70)
  * instead of reporting and continuing. */
 int zan_rt_soft_is_hard(void);

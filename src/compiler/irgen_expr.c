@@ -1699,7 +1699,7 @@ static LLVMValueRef emit_binding_value(zan_irgen_t *g, zan_type_t *bind_t,
             const char *sfile = loc_site_file(g, rhs->loc);
             snprintf(site_buf, sizeof(site_buf), "%s:%u:%u",
                      sfile, rhs->loc.line, rhs->loc.col);
-            site_name = LLVMBuildGlobalStringPtr(g->builder, site_buf, "site");
+            site_name = zan_irgen_intern_string(g, site_buf);
         }
     }
     LLVMTypeRef alloc_fn_type = LLVMFunctionType(i8ptr,
@@ -1834,7 +1834,7 @@ static void emit_console_color(zan_irgen_t *g, LLVMValueRef color, int is_bg) {
     LLVMTypeRef pty = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 1);
     LLVMValueRef pf = LLVMGetNamedFunction(g->mod, "printf");
     if (!pf) pf = LLVMAddFunction(g->mod, "printf", pty);
-    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "\033[%dm", "sgrfmt");
+    LLVMValueRef fmt = zan_irgen_intern_string(g, "\033[%dm");
     zan_call2(g->builder, pty, pf, (LLVMValueRef[]){ fmt, code }, 2, "");
 }
 
@@ -1846,7 +1846,7 @@ static void emit_console_title(zan_irgen_t *g, LLVMValueRef s) {
     LLVMTypeRef pty = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 1);
     LLVMValueRef pf = LLVMGetNamedFunction(g->mod, "printf");
     if (!pf) pf = LLVMAddFunction(g->mod, "printf", pty);
-    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "\033]0;%s\007", "titlefmt");
+    LLVMValueRef fmt = zan_irgen_intern_string(g, "\033]0;%s\007");
     zan_call2(g->builder, pty, pf, (LLVMValueRef[]){ fmt, s }, 2, "");
 }
 
@@ -3386,8 +3386,8 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
                             LLVMDoubleTypeInContext(g->ctx), "f2d")
                         : val;
                     LLVMValueRef fmt = flen > 0
-                        ? LLVMBuildGlobalStringPtr(g->builder, fbuf, "ffmt")
-                        : LLVMBuildGlobalStringPtr(g->builder, "%g", "dfmt");
+                        ? zan_irgen_intern_string(g, fbuf)
+                        : zan_irgen_intern_string(g, "%g");
                     LLVMValueRef null_ptr = LLVMConstNull(i8ptr);
                     LLVMValueRef zero = LLVMConstInt(i64, 0, 0);
                     LLVMValueRef snp_args1[] = { null_ptr, zero, fmt, fval };
@@ -3445,8 +3445,8 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
                                 LLVMDoubleTypeInContext(g->ctx), "f2d")
                             : LLVMBuildSIToFP(g->builder, val64,
                                 LLVMDoubleTypeInContext(g->ctx), "i2d");
-                        LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
-                            fbuf, "ffmt");
+                        LLVMValueRef fmt = zan_irgen_intern_string(g,
+                            fbuf);
                         LLVMValueRef null_ptr = LLVMConstNull(i8ptr);
                         LLVMValueRef zero = LLVMConstInt(i64, 0, 0);
                         LLVMValueRef snp_args1[] = { null_ptr, zero, fmt, as_d };
@@ -3472,8 +3472,8 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
                         owns[i] = 1;
                         continue;
                     }
-                    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
-                        fbuf, "ifmt");
+                    LLVMValueRef fmt = zan_irgen_intern_string(g,
+                        fbuf);
                     LLVMValueRef null_ptr = LLVMConstNull(i8ptr);
                     LLVMValueRef zero = LLVMConstInt(i64, 0, 0);
                     LLVMValueRef snp_args1[] = { null_ptr, zero, fmt, val64 };
@@ -3865,10 +3865,31 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             }
         }
 
-        /* array.Length: read the element count from the array header. A null
+        /* array .Length: read the element count from the array header. A null
          * array value would fault on the obj-16 GEP before any bounds check
          * sees it, so the receiver gets the same null guard as members. */
-        if (expr->member.name.len == 6 && memcmp(expr->member.name.str, "Length", 6) == 0) {
+        /* array .Count is the same header read, aliased to .Length: the
+         * params bundle is a plain array, so a callee that reads
+         * `kindIds.Count` (List spelling) used to fall through to the
+         * constant-0 fallback and report an empty bundle. */
+        if (expr->member.name.len == 5 &&
+            memcmp(expr->member.name.str, "Count", 5) == 0) {
+            zan_type_t *at = infer_expr_type(g, expr->member.object, locals);
+            if (at && at->kind == TYPE_ARRAY) {
+                LLVMValueRef arr = emit_guarded_member_object(g, expr, locals);
+                if (LLVMGetTypeKind(LLVMTypeOf(arr)) == LLVMPointerTypeKind) {
+                    LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, arr,
+                        LLVMConstNull(LLVMTypeOf(arr)), "arr.null");
+                    emit_runtime_check(g, isnull, expr->member.object->loc,
+                        "null reference where an array is required (.Count)");
+                    arr = emit_soft_base_select(g, arr, isnull,
+                                                expr->member.object->loc);
+                }
+                return zan_array_len(g, arr);
+            }
+        }
+        if (expr->member.name.len == 6 &&
+            memcmp(expr->member.name.str, "Length", 6) == 0) {
             zan_type_t *at = infer_expr_type(g, expr->member.object, locals);
             if (at && at->kind == TYPE_ARRAY) {
                 LLVMValueRef arr = emit_guarded_member_object(g, expr, locals);
@@ -6168,7 +6189,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                 const char *sfile = loc_site_file(g, expr->loc);
                                 snprintf(site_buf, sizeof(site_buf), "%s:%u:%u",
                                          sfile, expr->loc.line, expr->loc.col);
-                                site_name = LLVMBuildGlobalStringPtr(g->builder, site_buf, "site");
+                                site_name = zan_irgen_intern_string(g, site_buf);
                             }
                         }
                         LLVMTypeRef alloc_fn_type = LLVMFunctionType(i8ptr,
@@ -7690,7 +7711,7 @@ static LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
      * the string tag instead of a site index/descriptor, so probe for it
      * first: `x is string` must match, anything else must not. */
     LLVMPositionBuilderAtEnd(g->builder, head);
-    LLVMValueRef tstr = LLVMBuildGlobalStringPtr(g->builder, tname, "is.tn");
+    LLVMValueRef tstr = zan_irgen_intern_string(g, tname);
     LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
     LLVMValueRef sptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
         x, &neg8, 1, "is.sptr");
@@ -7702,7 +7723,7 @@ static LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
 
     /* string object: `is T` holds iff T is `string` */
     LLVMPositionBuilderAtEnd(g->builder, str_bb);
-    LLVMValueRef ststr = LLVMBuildGlobalStringPtr(g->builder, "string", "is.stn");
+    LLVMValueRef ststr = zan_irgen_intern_string(g, "string");
     LLVMTypeRef sstrcmp_ty = LLVMFunctionType(i32,
         (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
     LLVMValueRef sstrcmp_fn = get_libc_fn(g, "strcmp", sstrcmp_ty);
@@ -8190,6 +8211,20 @@ static int node_writes_ident(zan_ast_node_t *n, zan_istr_t name) {
     return t && t->kind == AST_IDENTIFIER && istr_eq_c(t->ident.name, name);
 }
 
+/* The identifier `n` writes (assignment target, ++/-- operand, ref/out arg),
+ * or {NULL,0} when `n` is not a write. Used by the whole-body write-scan
+ * collector (A79-1), which needs the name itself rather than a yes/no. */
+static zan_istr_t node_write_name(zan_ast_node_t *n) {
+    zan_ast_node_t *t = NULL;
+    if (n->kind == AST_ASSIGNMENT) t = n->binary.left;
+    else if ((n->kind == AST_UNARY || n->kind == AST_POSTFIX_UNARY) &&
+             (n->unary.op == TK_PLUS_PLUS || n->unary.op == TK_MINUS_MINUS))
+        t = n->unary.operand;
+    else if (n->kind == AST_REF_ARG) t = n->ref_arg.expr;
+    return (t && t->kind == AST_IDENTIFIER) ? t->ident.name
+                                            : (zan_istr_t){ NULL, 0 };
+}
+
 static void cap_scan(capture_scan_t *cs, zan_ast_node_t *n);
 
 static void cap_scan_list(capture_scan_t *cs, zan_ast_list_t *l) {
@@ -8398,7 +8433,7 @@ static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
         char site_buf[600];
         snprintf(site_buf, sizeof(site_buf), "%s:%u:%u [closure]",
                  loc_site_file(g, loc), loc.line, loc.col);
-        site_name = LLVMBuildGlobalStringPtr(g->builder, site_buf, "site");
+        site_name = zan_irgen_intern_string(g, site_buf);
     }
     LLVMValueRef alloc_args[3] = {
         LLVMBuildPtrToInt(g->builder, LLVMSizeOf(rec_ty), i64, "clo.size"),
@@ -8471,10 +8506,238 @@ static LLVMTypeRef box_cell_type(zan_irgen_t *g, LLVMTypeRef payload) {
 
 /* Does `body` assign to `name` anywhere -- inside a lambda or not? A parameter
  * that is assigned needs a slot that owns its reference (see the parameter
- * binding in irgen_emit.c); one that is only read stays a zero-cost borrow. */
-static int body_writes_ident(zan_irgen_t *g, zan_ast_node_t *body,
-                             zan_istr_t name) {
+ * binding in irgen_emit.c); one that is only read stays a zero-cost borrow.
+ *
+ * The answer is memoized per {body, name} in g->body_write_memo (A79-1). The
+ * scan itself collects EVERY assigned name of the body in one walk, so the
+ * first question about a body costs one full traversal and every later
+ * question about the same body is a hash lookup: a method with N locals asks
+ * N times, which without the memo re-walked the whole body N times (quadratic
+ * -- a 12k-declaration method spent 18 minutes here alone). Identifiers are
+ * interned by the lexer, so name equality is pointer equality. */
+static int body_writes_ident_scan(zan_irgen_t *g, zan_ast_node_t *body,
+                                  zan_istr_t name);
+
+static unsigned body_write_memo_hash(zan_ast_node_t *body, zan_istr_t name) {
+    uint64_t h = 1469598103934665603ull;
+    uintptr_t bp = (uintptr_t)body;
+    for (unsigned i = 0; i < sizeof(bp); i++) {
+        h ^= (unsigned char)(bp >> (i * 8));
+        h *= 1099511628211ull;
+    }
+    for (int i = 0; i < name.len; i++) {
+        h ^= (unsigned char)name.str[i];
+        h *= 1099511628211ull;
+    }
+    return (unsigned)h;
+}
+
+static void body_write_collect(zan_irgen_t *g, zan_ast_node_t *n,
+                               zan_ast_node_t *body, int lam_depth);
+
+static void body_write_collect_list(zan_irgen_t *g, zan_ast_list_t *l,
+                                    zan_ast_node_t *body, int lam_depth) {
+    for (int i = 0; l && i < l->count; i++)
+        body_write_collect(g, l->items[i], body, lam_depth);
+}
+
+static struct zan_body_write_entry *body_write_memo_slot(zan_irgen_t *g,
+                                                         zan_ast_node_t *body,
+                                                         zan_istr_t name) {
+    if (g->body_write_memo_count * 2 >= g->body_write_memo_cap) {
+        unsigned ncap = g->body_write_memo_cap ? g->body_write_memo_cap * 2 : 256;
+        struct zan_body_write_entry *ns =
+            calloc((size_t)ncap, sizeof(*ns));
+        if (!ns) return NULL;
+        /* copy the live entries into the fresh table (name.str pointers are
+         * interned and stable for the whole compilation, so entries carry) */
+        for (unsigned i = 0; i < g->body_write_memo_cap; i++) {
+            if (!g->body_write_memo[i].known) continue;
+            unsigned mask = ncap - 1;
+            unsigned j = body_write_memo_hash(g->body_write_memo[i].body,
+                                              g->body_write_memo[i].name) & mask;
+            while (ns[j].known) j = (j + 1) & mask;
+            ns[j] = g->body_write_memo[i];
+        }
+        free(g->body_write_memo);
+        g->body_write_memo = ns;
+        g->body_write_memo_cap = ncap;
+    }
+    unsigned mask = g->body_write_memo_cap - 1;
+    unsigned i = body_write_memo_hash(body, name) & mask;
+    while (g->body_write_memo[i].known) {
+        if (g->body_write_memo[i].body == body &&
+            g->body_write_memo[i].name.str == name.str &&
+            g->body_write_memo[i].name.len == name.len)
+            return &g->body_write_memo[i];
+        i = (i + 1) & mask;
+    }
+    return &g->body_write_memo[i];
+}
+
+/* Collect every assigned identifier of `n` into the memo table (one entry per
+ * {body, name}). `body` is the root the walk started from. A write at
+ * lam_depth > 0 (inside a nested lambda) sets lam_written as well: the
+ * boxed-local rule (A33-2b) asks specifically "does a lambda assign to this
+ * local?", while the parameter-ownership rule asks "is it assigned at all?" --
+ * the two bits keep both questions answerable from one walk. */
+static void body_write_collect(zan_irgen_t *g, zan_ast_node_t *n,
+                               zan_ast_node_t *body, int lam_depth) {
+    if (!n) return;
+    zan_istr_t w = node_write_name(n);
+    if (w.str) {
+        struct zan_body_write_entry *e = body_write_memo_slot(g, body, w);
+        if (e) {
+            if (!e->known) {
+                e->body = body;
+                e->name = w;
+                e->written = 1;
+                e->lam_written = (lam_depth > 0) ? 1 : 0;
+                e->known = 1;
+                g->body_write_memo_count++;
+            } else if (lam_depth > 0) {
+                e->lam_written = 1;
+            }
+        }
+    }
+    switch (n->kind) {
+    case AST_LAMBDA: {
+        /* a nested lambda's parameters shadow enclosing names: writes to them
+         * inside the lambda do NOT reach the enclosing frame, so pre-seed them
+         * as "known, not written" for the outer body's question */
+        for (int i = 0; i < n->lambda.params.count; i++) {
+            zan_istr_t pn = n->lambda.params.items[i]->param.name;
+            struct zan_body_write_entry *e = body_write_memo_slot(g, body, pn);
+            if (e && !e->known) {
+                e->body = body;
+                e->name = pn;
+                e->written = 0;
+                e->lam_written = 0;
+                e->known = 1;
+                g->body_write_memo_count++;
+            }
+        }
+        body_write_collect(g, n->lambda.body, body, lam_depth + 1);
+        return;
+    }
+    case AST_BINARY:
+    case AST_ASSIGNMENT:      body_write_collect(g, n->binary.left, body, lam_depth);
+                              body_write_collect(g, n->binary.right, body, lam_depth); return;
+    case AST_UNARY:
+    case AST_POSTFIX_UNARY:   body_write_collect(g, n->unary.operand, body, lam_depth); return;
+    case AST_CALL:            body_write_collect(g, n->call.callee, body, lam_depth);
+                              body_write_collect_list(g, &n->call.args, body, lam_depth); return;
+    case AST_MEMBER_ACCESS:   body_write_collect(g, n->member.object, body, lam_depth); return;
+    case AST_INDEX:           body_write_collect(g, n->index.object, body, lam_depth);
+                              body_write_collect(g, n->index.index, body, lam_depth); return;
+    case AST_CONDITIONAL:     body_write_collect(g, n->conditional.cond, body, lam_depth);
+                              body_write_collect(g, n->conditional.then_expr, body, lam_depth);
+                              body_write_collect(g, n->conditional.else_expr, body, lam_depth); return;
+    case AST_NEW_EXPR:        body_write_collect_list(g, &n->new_expr.args, body, lam_depth); return;
+    case AST_COLL_INIT:       body_write_collect_list(g, &n->coll_init.items, body, lam_depth); return;
+    case AST_CAST_EXPR:       body_write_collect(g, n->cast.expr, body, lam_depth); return;
+    case AST_IS_EXPR:
+    case AST_AS_EXPR:         body_write_collect(g, n->type_test.expr, body, lam_depth); return;
+    case AST_AWAIT_EXPR:      body_write_collect(g, n->await_expr.expr, body, lam_depth); return;
+    case AST_REF_ARG:         body_write_collect(g, n->ref_arg.expr, body, lam_depth); return;
+    case AST_STRING_INTERP:   body_write_collect_list(g, &n->string_interp.parts, body, lam_depth); return;
+    case AST_QUERY_EXPR:      body_write_collect(g, n->query.source, body, lam_depth);
+                              body_write_collect(g, n->query.group_expr, body, lam_depth);
+                              body_write_collect(g, n->query.group_key, body, lam_depth);
+                              body_write_collect(g, n->query.select, body, lam_depth);
+                              body_write_collect_list(g, &n->query.clauses, body, lam_depth); return;
+    case AST_QUERY_WHERE:     body_write_collect(g, n->query_clause.expr, body, lam_depth); return;
+    case AST_QUERY_LET:       body_write_collect(g, n->query_clause.expr, body, lam_depth); return;
+    case AST_QUERY_ORDERBY:   body_write_collect(g, n->query_clause.expr, body, lam_depth); return;
+    case AST_QUERY_JOIN:      body_write_collect(g, n->query_clause.source, body, lam_depth);
+                              body_write_collect(g, n->query_clause.left_key, body, lam_depth);
+                              body_write_collect(g, n->query_clause.right_key, body, lam_depth); return;
+    case AST_SWITCH_EXPR:     body_write_collect(g, n->switch_expr.expr, body, lam_depth);
+                              body_write_collect_list(g, &n->switch_expr.arms, body, lam_depth); return;
+    case AST_SWITCH_ARM:      body_write_collect(g, n->switch_arm.pattern, body, lam_depth);
+                              body_write_collect(g, n->switch_arm.when_cond, body, lam_depth);
+                              body_write_collect(g, n->switch_arm.result, body, lam_depth); return;
+    case AST_BLOCK:           body_write_collect_list(g, &n->block.stmts, body, lam_depth); return;
+    case AST_VAR_DECL:        body_write_collect(g, n->var_decl.initializer, body, lam_depth);
+                              /* pre-seed the declared name as "known": the
+                               * declaration is a binding, not a write, so the
+                               * boxed-local rule answers on real writes only */
+                              {
+                                  zan_istr_t dn = n->var_decl.name;
+                                  if (dn.str) {
+                                      struct zan_body_write_entry *e =
+                                          body_write_memo_slot(g, body, dn);
+                                      if (e && !e->known) {
+                                          e->body = body;
+                                          e->name = dn;
+                                          e->written = 0;
+                                          e->lam_written = 0;
+                                          e->known = 1;
+                                          g->body_write_memo_count++;
+                                      }
+                                  }
+                              }
+                              return;
+    case AST_EXPR_STMT:       body_write_collect(g, n->expr_stmt.expr, body, lam_depth); return;
+    case AST_RETURN_STMT:     body_write_collect(g, n->ret.value, body, lam_depth); return;
+    case AST_IF_STMT:         body_write_collect(g, n->if_stmt.cond, body, lam_depth);
+                              body_write_collect(g, n->if_stmt.then_body, body, lam_depth);
+                              body_write_collect(g, n->if_stmt.else_body, body, lam_depth); return;
+    case AST_WHILE_STMT:
+    case AST_DO_WHILE_STMT:   body_write_collect(g, n->while_stmt.cond, body, lam_depth);
+                              body_write_collect(g, n->while_stmt.body, body, lam_depth); return;
+    case AST_FOR_STMT:        body_write_collect(g, n->for_stmt.init, body, lam_depth);
+                              body_write_collect(g, n->for_stmt.cond, body, lam_depth);
+                              body_write_collect(g, n->for_stmt.step, body, lam_depth);
+                              body_write_collect(g, n->for_stmt.body, body, lam_depth); return;
+    case AST_FOREACH_STMT:    body_write_collect(g, n->foreach_stmt.collection, body, lam_depth);
+                              body_write_collect(g, n->foreach_stmt.body, body, lam_depth); return;
+    case AST_THROW_STMT:      body_write_collect(g, n->throw_stmt.value, body, lam_depth); return;
+    case AST_TRY_STMT:        body_write_collect(g, n->try_stmt.try_body, body, lam_depth);
+                              body_write_collect_list(g, &n->try_stmt.catches, body, lam_depth);
+                              body_write_collect(g, n->try_stmt.finally_body, body, lam_depth); return;
+    case AST_CATCH_CLAUSE:    body_write_collect(g, n->catch_clause.body, body, lam_depth); return;
+    case AST_SWITCH_STMT:     body_write_collect(g, n->switch_stmt.expr, body, lam_depth);
+                              body_write_collect_list(g, &n->switch_stmt.cases, body, lam_depth); return;
+    case AST_SWITCH_CASE:     body_write_collect(g, n->switch_case.pattern, body, lam_depth);
+                              body_write_collect(g, n->switch_case.body, body, lam_depth); return;
+    case AST_LOCK_STMT:       body_write_collect(g, n->lock_stmt.expr, body, lam_depth);
+                              body_write_collect(g, n->lock_stmt.body, body, lam_depth); return;
+    case AST_YIELD_STMT:      body_write_collect(g, n->yield_stmt.value, body, lam_depth); return;
+    default: return;
+    }
+}
+
+/* Ensure the memo holds the full write-set of `body`; then answer for `name`
+ * from the table. Anything not in the table is "not written" -- the walk
+ * pre-seeds declarations and lambda parameters so shadowing stays exact. */
+static int body_writes_ident_memo(zan_irgen_t *g, zan_ast_node_t *body,
+                                  zan_istr_t name) {
     if (!body || !name.len) return 0;
+    if (!g->body_write_memo_cap) {
+        g->body_write_memo = calloc(256, sizeof(*g->body_write_memo));
+        if (!g->body_write_memo) return body_writes_ident_scan(g, body, name);
+        g->body_write_memo_cap = 256;
+        g->body_write_memo_count = 0;
+    }
+    if (g->body_write_scan_done != body) {
+        body_write_collect(g, body, body, 0);
+        g->body_write_scan_done = body;
+    }
+    unsigned mask = g->body_write_memo_cap - 1;
+    unsigned i = body_write_memo_hash(body, name) & mask;
+    while (g->body_write_memo[i].known) {
+        if (g->body_write_memo[i].body == body &&
+            g->body_write_memo[i].name.str == name.str &&
+            g->body_write_memo[i].name.len == name.len)
+            return g->body_write_memo[i].written;
+        i = (i + 1) & mask;
+    }
+    return 0;
+}
+
+static int body_writes_ident_scan(zan_irgen_t *g, zan_ast_node_t *body,
+                                  zan_istr_t name) {
     capture_scan_t cs;
     memset(&cs, 0, sizeof(cs));
     cs.g = g;
@@ -8486,19 +8749,32 @@ static int body_writes_ident(zan_irgen_t *g, zan_ast_node_t *body,
     return found;
 }
 
-/* Does a lambda in the body being compiled assign to `name`? */
+static int body_writes_ident(zan_irgen_t *g, zan_ast_node_t *body,
+                             zan_istr_t name) {
+    if (!body || !name.len) return 0;
+    return body_writes_ident_memo(g, body, name);
+}
+
+/* Does a lambda in the body being compiled assign to `name`? The memo carries
+ * two per-name bits: writes anywhere in the body (the parameter-ownership
+ * question) and writes from inside a lambda only (the boxed-local question --
+ * an enclosing local a lambda assigns must become a shared heap cell, while a
+ * local merely assigned by ordinary statements must NOT). */
 static int local_is_lambda_written(zan_irgen_t *g, local_scope_t *locals,
                                    zan_istr_t name) {
+    (void)locals;
     if (!g->current_fn_body || !name.len) return 0;
-    capture_scan_t cs;
-    memset(&cs, 0, sizeof(cs));
-    cs.g = g;
-    cs.outer = locals;
-    cs.want_write = name;
-    cap_scan(&cs, g->current_fn_body);
-    int found = cs.found_write;
-    cap_scan_free(&cs);
-    return found;
+    body_writes_ident_memo(g, g->current_fn_body, name);
+    unsigned mask = g->body_write_memo_cap - 1;
+    unsigned i = body_write_memo_hash(g->current_fn_body, name) & mask;
+    while (g->body_write_memo[i].known) {
+        if (g->body_write_memo[i].body == g->current_fn_body &&
+            g->body_write_memo[i].name.str == name.str &&
+            g->body_write_memo[i].name.len == name.len)
+            return g->body_write_memo[i].lam_written;
+        i = (i + 1) & mask;
+    }
+    return 0;
 }
 
 /* Allocate the cell for a boxed local and return it; `init` (may be null) is
@@ -8522,7 +8798,7 @@ static LLVMValueRef emit_box_cell(zan_irgen_t *g, zan_loc_t loc,
         char site_buf[600];
         snprintf(site_buf, sizeof(site_buf), "%s:%u:%u [captured local]",
                  loc_site_file(g, loc), loc.line, loc.col);
-        site_name = LLVMBuildGlobalStringPtr(g->builder, site_buf, "site");
+        site_name = zan_irgen_intern_string(g, site_buf);
     }
     LLVMValueRef alloc_args[3] = {
         LLVMBuildPtrToInt(g->builder, LLVMSizeOf(rec_ty), i64, "box.size"),

@@ -933,7 +933,9 @@ void zan_irgen_emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw)
     LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "oom.ok");
     LLVMBuildCondBr(g->builder, isnull, oom_bb, ok_bb);
     LLVMPositionBuilderAtEnd(g->builder, oom_bb);
-    LLVMValueRef text = LLVMBuildGlobalStringPtr(g->builder, "out of memory\n", "oomtxt");
+    /* interned: every allocation site emits this same text; without the
+     * intern table each site carried its own @oomtxt.N .rdata copy. */
+    LLVMValueRef text = zan_irgen_intern_string(g, "out of memory\n");
     emit_fatal_report(g, text, 1);
     LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }
@@ -988,7 +990,7 @@ static void emit_arc_fault_report(zan_irgen_t *g, LLVMValueRef obj,
     snprintf(msg, sizeof(msg),
              "zan runtime: ARC integrity failure: %s (refcount %%lld, "
              "object %%p, site/freed-by 0x%%llX)\n", what);
-    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, msg, "arcfmt");
+    LLVMValueRef fmt = zan_irgen_intern_string(g, msg);
     LLVMValueRef pargs[] = { fmt, rc_old, obj,
                              site ? site : LLVMConstInt(i64t, -1, 1) };
     zan_call2(g->builder, g->printf_type, g->fn_printf, pargs, 4, "");
@@ -1289,7 +1291,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_println, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
 
-    LLVMValueRef fmt_str = LLVMBuildGlobalStringPtr(g->builder, "%s\n", "println_fmt");
+    LLVMValueRef fmt_str = zan_irgen_intern_string(g, "%s\n");
     LLVMValueRef args[] = { fmt_str, LLVMGetParam(g->rt_println, 0) };
     zan_call2(g->builder, printf_type, printf_fn, args, 2, "");
     LLVMBuildRetVoid(g->builder);
@@ -1302,7 +1304,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 
     LLVMBasicBlockRef pint_entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_print_int, "entry");
     LLVMPositionBuilderAtEnd(g->builder, pint_entry);
-    LLVMValueRef int_fmt = LLVMBuildGlobalStringPtr(g->builder, "%lld\n", "int_fmt");
+    LLVMValueRef int_fmt = zan_irgen_intern_string(g, "%lld\n");
     LLVMValueRef iargs[] = { int_fmt, LLVMGetParam(g->rt_print_int, 0) };
     zan_call2(g->builder, printf_type, printf_fn, iargs, 2, "");
     LLVMBuildRetVoid(g->builder);
@@ -1312,7 +1314,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 
     LLVMBasicBlockRef puint_entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_print_uint, "entry");
     LLVMPositionBuilderAtEnd(g->builder, puint_entry);
-    LLVMValueRef uint_fmt = LLVMBuildGlobalStringPtr(g->builder, "%llu\n", "uint_fmt");
+    LLVMValueRef uint_fmt = zan_irgen_intern_string(g, "%llu\n");
     LLVMValueRef uargs[] = { uint_fmt, LLVMGetParam(g->rt_print_uint, 0) };
     zan_call2(g->builder, printf_type, printf_fn, uargs, 2, "");
     LLVMBuildRetVoid(g->builder);
@@ -1325,7 +1327,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 
     LLVMBasicBlockRef pdbl_entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_print_double, "entry");
     LLVMPositionBuilderAtEnd(g->builder, pdbl_entry);
-    LLVMValueRef dbl_fmt = LLVMBuildGlobalStringPtr(g->builder, "%g\n", "dbl_fmt");
+    LLVMValueRef dbl_fmt = zan_irgen_intern_string(g, "%g\n");
     LLVMValueRef dargs[] = { dbl_fmt, LLVMGetParam(g->rt_print_double, 0) };
     zan_call2(g->builder, printf_type, printf_fn, dargs, 2, "");
     LLVMBuildRetVoid(g->builder);
@@ -2355,6 +2357,10 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     free(g->struct_types);
     g->struct_types = NULL;
     g->struct_type_count = g->struct_type_cap = 0;
+    free(g->body_write_memo);
+    g->body_write_memo = NULL;
+    g->body_write_memo_cap = g->body_write_memo_count = 0;
+    g->body_write_scan_done = NULL;
     free(g->site_inst);
     g->site_inst = NULL;
     free(g->class_release);
@@ -3434,7 +3440,7 @@ static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *exp
         const char *estr = (elem_type && elem_type->name.len) ? elem_type->name.str : "?";
         snprintf(site_buf, sizeof(site_buf), "%s:%u:%u [%s<%.*s>]",
                  sfile, expr->loc.line, expr->loc.col, knm, elen, estr);
-        site_name = LLVMBuildGlobalStringPtr(g->builder, site_buf, "site");
+        site_name = zan_irgen_intern_string(g, site_buf);
     }
     LLVMTypeRef alloc_fn_type = LLVMFunctionType(i8ptr,
         (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0);

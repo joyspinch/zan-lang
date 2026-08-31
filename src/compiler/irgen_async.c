@@ -1461,8 +1461,9 @@ static void emit_eh_rethrow_current(zan_irgen_t *g) {
         LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
         if (printf_fn) {
             LLVMTypeRef printf_ty = LLVMFunctionType(i32, &i8ptr, 1, 1);
-            LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
-                "Unhandled exception\n", "aexfmt");
+            /* interned: one copy per async fn otherwise, all the same text. */
+            LLVMValueRef fmt = zan_irgen_intern_string(g,
+                "Unhandled exception\n");
             zan_call2(g->builder, printf_ty, printf_fn, &fmt, 1, "");
         }
         LLVMTypeRef exit_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i32, 1, 0);

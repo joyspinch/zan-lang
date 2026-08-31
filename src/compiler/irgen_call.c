@@ -874,7 +874,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             } else {
                 /* WriteLine() with no argument -> a blank line, matching C#. */
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                LLVMValueRef empty = LLVMBuildGlobalStringPtr(g->builder, "", "wl_nl");
+                LLVMValueRef empty = zan_irgen_intern_string(g, "");
                 zan_call2(g->builder,
                     LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr }, 1, 0),
                     g->rt_println, &empty, 1, "");
@@ -896,12 +896,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
 
                 if (LLVMGetTypeKind(arg_type) == LLVMPointerTypeKind) {
-                    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%s", "wfmt_s");
+                    LLVMValueRef fmt = zan_irgen_intern_string(g, "%s");
                     LLVMValueRef args[] = { fmt, arg };
                     zan_call2(g->builder, printf_type, printf_fn, args, 2, "");
                 } else if (LLVMGetTypeKind(arg_type) == LLVMDoubleTypeKind ||
                            LLVMGetTypeKind(arg_type) == LLVMFloatTypeKind) {
-                    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%g", "wfmt_d");
+                    LLVMValueRef fmt = zan_irgen_intern_string(g, "%g");
                     LLVMValueRef dbl_arg = arg;
                     if (LLVMGetTypeKind(arg_type) == LLVMFloatTypeKind)
                         dbl_arg = LLVMBuildFPExt(g->builder, arg, LLVMDoubleTypeInContext(g->ctx), "ext");
@@ -909,13 +909,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     zan_call2(g->builder, printf_type, printf_fn, args, 2, "");
                 } else if (llvm_is_nullable(arg_type)) {
                     LLVMValueRef ns = emit_to_cstr(g, arg);
-                    LLVMValueRef nfmt = LLVMBuildGlobalStringPtr(g->builder, "%s", "wfmt_n");
+                    LLVMValueRef nfmt = zan_irgen_intern_string(g, "%s");
                     LLVMValueRef nargs[] = { nfmt, ns };
                     zan_call2(g->builder, printf_type, printf_fn, nargs, 2, "");
                     emit_string_release(g, ns);
                 } else if (expr_is_char(g, arg_ast, locals)) {
                     LLVMValueRef cs = emit_char_to_cstr(g, arg);
-                    LLVMValueRef cfmt = LLVMBuildGlobalStringPtr(g->builder, "%s", "wfmt_c");
+                    LLVMValueRef cfmt = zan_irgen_intern_string(g, "%s");
                     LLVMValueRef cargs[] = { cfmt, cs };
                     zan_call2(g->builder, printf_type, printf_fn, cargs, 2, "");
                     emit_string_release(g, cs);
@@ -933,14 +933,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             LLVMConstNull(LLVMTypeOf(arg)), "w.bnz");
                     LLVMValueRef bs = LLVMBuildSelect(g->builder, cond, t, f,
                                                       "w.b");
-                    LLVMValueRef bfmt = LLVMBuildGlobalStringPtr(g->builder,
-                        "%s", "wfmt_b");
+                    LLVMValueRef bfmt = zan_irgen_intern_string(g, "%s");
                     LLVMValueRef bargs[] = { bfmt, bs };
                     zan_call2(g->builder, printf_type, printf_fn, bargs, 2, "");
                 } else {
                     LLVMValueRef fmt = expr_is_ulong(g, arg_ast, locals)
-                        ? LLVMBuildGlobalStringPtr(g->builder, "%llu", "wfmt_u")
-                        : LLVMBuildGlobalStringPtr(g->builder, "%lld", "wfmt_i");
+                        ? zan_irgen_intern_string(g, "%llu")
+                        : zan_irgen_intern_string(g, "%lld");
                     LLVMValueRef int_arg = emit_widen_i64_for_print(g, arg);
                     LLVMValueRef args[] = { fmt, int_arg };
                     zan_call2(g->builder, printf_type, printf_fn, args, 2, "");
@@ -1037,7 +1036,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMInt32TypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr }, 1, 1);
             LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
             if (!printf_fn) printf_fn = LLVMAddFunction(g->mod, "printf", printf_type);
-            LLVMValueRef esc = LLVMBuildGlobalStringPtr(g->builder, "\033[2J\033[H", "clrseq");
+            LLVMValueRef esc = zan_irgen_intern_string(g, "\033[2J\033[H");
             zan_call2(g->builder, printf_type, printf_fn, &esc, 1, "");
             return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
         }
@@ -1050,7 +1049,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMInt32TypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr }, 1, 1);
             LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
             if (!printf_fn) printf_fn = LLVMAddFunction(g->mod, "printf", printf_type);
-            LLVMValueRef esc = LLVMBuildGlobalStringPtr(g->builder, "\033[0m", "rstseq");
+            LLVMValueRef esc = zan_irgen_intern_string(g, "\033[0m");
             zan_call2(g->builder, printf_type, printf_fn, &esc, 1, "");
             emit_console_color_reset(g);
             return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
@@ -1645,7 +1644,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         if (atk == LLVMDoubleTypeKind || atk == LLVMFloatTypeKind) {
                             /* floating point: print with %g (varargs promote
                              * float to double), matching Console.WriteLine. */
-                            fmt = LLVMBuildGlobalStringPtr(g->builder, "%g", "ftoa_fmt");
+                            fmt = zan_irgen_intern_string(g, "%g");
                             if (atk == LLVMFloatTypeKind) {
                                 num_arg = LLVMBuildFPExt(g->builder, arg,
                                     LLVMDoubleTypeInContext(g->ctx), "ext");
@@ -2190,7 +2189,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMValueRef fmt;
                     LLVMValueRef num_arg = v;
                     if (vk == LLVMDoubleTypeKind || vk == LLVMFloatTypeKind) {
-                        fmt = LLVMBuildGlobalStringPtr(g->builder, "%g", "ftoa_fmt");
+                        fmt = zan_irgen_intern_string(g, "%g");
                         if (vk == LLVMFloatTypeKind) {
                             num_arg = LLVMBuildFPExt(g->builder, v,
                                 LLVMDoubleTypeInContext(g->ctx), "ext");
@@ -2314,7 +2313,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 fclose_fn = LLVMAddFunction(g->mod, "fclose", fclose_type);
             }
             /* open file */
-            LLVMValueRef mode = LLVMBuildGlobalStringPtr(g->builder, "rb", "rb");
+            LLVMValueRef mode = zan_irgen_intern_string(g, "rb");
             LLVMValueRef open_args[] = { path_arg, mode };
             LLVMValueRef fp = zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
@@ -2383,7 +2382,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef fclose_type = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0);
                 fclose_fn = LLVMAddFunction(g->mod, "fclose", fclose_type);
             }
-            LLVMValueRef mode = LLVMBuildGlobalStringPtr(g->builder, "w", "wmode");
+            LLVMValueRef mode = zan_irgen_intern_string(g, "w");
             LLVMValueRef open_args[] = { path_arg, mode };
             LLVMValueRef fp = zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
@@ -2547,7 +2546,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 g->fn_strcpy, strcpy_args, 2, "");
             /* strcat(buf, "/") */
-            LLVMValueRef sep = LLVMBuildGlobalStringPtr(g->builder, g->target_is_windows ? "\\" : "/", "sep");
+            LLVMValueRef sep = (g->target_is_windows ? zan_irgen_intern_string(g, "\\")
+                                  : zan_irgen_intern_string(g, "/"));
             LLVMValueRef cat1_args[] = { buf, sep };
             zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
@@ -2585,7 +2585,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef fclose_type = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0);
                 fclose_fn = LLVMAddFunction(g->mod, "fclose", fclose_type);
             }
-            LLVMValueRef mode = LLVMBuildGlobalStringPtr(g->builder, "a", "amode");
+            LLVMValueRef mode = zan_irgen_intern_string(g, "a");
             LLVMValueRef open_args[] = { path_arg, mode };
             LLVMValueRef fp = zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
@@ -2617,7 +2617,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef fclose_type = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr }, 1, 0);
                 fclose_fn = LLVMAddFunction(g->mod, "fclose", fclose_type);
             }
-            LLVMValueRef mode = LLVMBuildGlobalStringPtr(g->builder, "rb", "rb");
+            LLVMValueRef mode = zan_irgen_intern_string(g, "rb");
             LLVMValueRef open_args[] = { path_arg, mode };
             LLVMValueRef fp = zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
@@ -2718,7 +2718,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 fclose_fn = LLVMAddFunction(g->mod, "fclose", ft);
             }
             /* open source for reading */
-            LLVMValueRef rb = LLVMBuildGlobalStringPtr(g->builder, "rb", "rb");
+            LLVMValueRef rb = zan_irgen_intern_string(g, "rb");
             LLVMValueRef sargs[] = { src, rb };
             LLVMValueRef sfp = zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
@@ -2757,7 +2757,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             zan_call2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                 fclose_fn, &sfp, 1, "");
             /* open dest for writing */
-            LLVMValueRef wb = LLVMBuildGlobalStringPtr(g->builder, "wb", "wb");
+            LLVMValueRef wb = zan_irgen_intern_string(g, "wb");
             LLVMValueRef dargs[] = { dst, wb };
             LLVMValueRef dfp = zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
@@ -2805,7 +2805,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef ft = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0);
                 fclose_fn = LLVMAddFunction(g->mod, "fclose", ft);
             }
-            LLVMValueRef mode = LLVMBuildGlobalStringPtr(g->builder, "rb", "rb");
+            LLVMValueRef mode = zan_irgen_intern_string(g, "rb");
             LLVMValueRef open_args[] = { path_arg, mode };
             LLVMValueRef fp = zan_call2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
@@ -3079,12 +3079,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMTypeRef ft = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr }, 1, 0);
                     getenv_fn = LLVMAddFunction(g->mod, "getenv", ft);
                 }
-                LLVMValueRef key = LLVMBuildGlobalStringPtr(g->builder, "TMPDIR", "tmpdir_k");
+                LLVMValueRef key = zan_irgen_intern_string(g, "TMPDIR");
                 LLVMValueRef env = zan_call2(g->builder,
                     LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                     getenv_fn, &key, 1, "tmpenv");
                 LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, env, LLVMConstNull(i8ptr), "tnull");
-                LLVMValueRef deflt = LLVMBuildGlobalStringPtr(g->builder, "/tmp/", "tmpdef");
+                LLVMValueRef deflt = zan_irgen_intern_string(g, "/tmp/");
                 LLVMValueRef src = LLVMBuildSelect(g->builder, isnull, deflt, env, "tmpsrc");
                 LLVMValueRef cpy_args[] = { buf, src };
                 zan_call2(g->builder, LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
@@ -4548,8 +4548,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                             "null string passed to an extern function");
                                         call_args[k] = LLVMBuildSelect(g->builder,
                                             isnull,
-                                            LLVMBuildGlobalStringPtr(g->builder, "",
-                                                "extarg.empty"),
+                                            zan_irgen_intern_string(g, ""),
                                             call_args[k], "extarg.safe");
                                     }
                                 }
@@ -4728,8 +4727,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                         "null string passed to an extern function");
                                     call_args[k + extra] = LLVMBuildSelect(g->builder,
                                         isnull,
-                                        LLVMBuildGlobalStringPtr(g->builder, "",
-                                            "extarg.empty"),
+                                        zan_irgen_intern_string(g, ""),
                                         call_args[k + extra], "extarg.safe");
                                 }
                             }
@@ -4823,7 +4821,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         emit_runtime_check(g, isnull, expr->loc,
                             "null string passed to an extern function");
                         call_args[k] = LLVMBuildSelect(g->builder, isnull,
-                            LLVMBuildGlobalStringPtr(g->builder, "", "extarg.empty"),
+                            zan_irgen_intern_string(g, ""),
                             call_args[k], "extarg.safe");
                     }
                 }

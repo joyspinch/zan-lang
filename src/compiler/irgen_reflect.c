@@ -2699,7 +2699,7 @@ void zan_irgen_emit_arc_desc_init(zan_irgen_t *g) {
             const char *cn = g->site_coll[i] == 1 ? "List"
                            : g->site_coll[i] == 2 ? "StringBuilder" : "Dict";
             LLVMValueRef nptr[2] = {
-                LLVMBuildGlobalStringPtr(g->builder, cn, "tn"),
+                zan_irgen_intern_string(g, cn),
                 LLVMConstNull(i8ptr) };
             LLVMTypeRef at = LLVMArrayType(i8ptr, 2);
             char gname[64];
@@ -2735,7 +2735,7 @@ void zan_irgen_emit_arc_desc_init(zan_irgen_t *g) {
                 LLVMValueRef *nptr = (LLVMValueRef *)calloc((size_t)k + 1,
                                                             sizeof(LLVMValueRef));
                 for (int j = 0; j < k; j++)
-                    nptr[j] = LLVMBuildGlobalStringPtr(g->builder, names[j], "tn");
+                    nptr[j] = zan_irgen_intern_string(g, names[j]);
                 nptr[k] = LLVMConstNull(i8ptr);
                 LLVMTypeRef at = LLVMArrayType(i8ptr, (unsigned)k + 1);
                 char gname[64];

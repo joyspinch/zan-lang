@@ -1899,6 +1899,10 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
             if (ot->kind == TYPE_ARRAY && e->member.name.len == 6 &&
                 memcmp(e->member.name.str, "Length", 6) == 0)
                 return g->binder->type_int;
+            /* array .Count aliases .Length (params bundle spelling) */
+            if (ot->kind == TYPE_ARRAY && e->member.name.len == 5 &&
+                memcmp(e->member.name.str, "Count", 5) == 0)
+                return g->binder->type_int;
         }
         return NULL;
     }

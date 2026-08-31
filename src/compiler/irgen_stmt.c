@@ -295,8 +295,8 @@ static void emit_eh_propagate_tail(zan_irgen_t *g) {
         /* string throw: print the message itself */
         LLVMPositionBuilderAtEnd(g->builder, reh_str_bb);
         {
-            LLVMValueRef sfmt = LLVMBuildGlobalStringPtr(g->builder,
-                "Unhandled exception: %s\n", "reh.sfmt");
+            LLVMValueRef sfmt = zan_irgen_intern_string(g,
+                "Unhandled exception: %s\n");
             LLVMValueRef sargs[2] = { sfmt, exc };
             zan_call2(g->builder, printf_ty, printf_fn, sargs, 2, "");
         }
@@ -304,16 +304,16 @@ static void emit_eh_propagate_tail(zan_irgen_t *g) {
         /* class throw: name the category, the object is opaque here */
         LLVMPositionBuilderAtEnd(g->builder, reh_cls_bb);
         {
-            LLVMValueRef cfmt = LLVMBuildGlobalStringPtr(g->builder,
-                "Unhandled exception (class object)\n", "reh.cfmt");
+            LLVMValueRef cfmt = zan_irgen_intern_string(g,
+                "Unhandled exception (class object)\n");
             zan_call2(g->builder, printf_ty, printf_fn, &cfmt, 1, "");
         }
         LLVMBuildBr(g->builder, reh_cont_bb);
         /* no exception object in flight (internal rethrow miss) */
         LLVMPositionBuilderAtEnd(g->builder, reh_none_bb);
         {
-            LLVMValueRef nfmt = LLVMBuildGlobalStringPtr(g->builder,
-                "Unhandled exception\n", "reh.nfmt");
+            LLVMValueRef nfmt = zan_irgen_intern_string(g,
+                "Unhandled exception\n");
             zan_call2(g->builder, printf_ty, printf_fn, &nfmt, 1, "");
         }
         LLVMBuildBr(g->builder, reh_cont_bb);
@@ -2872,24 +2872,24 @@ throw_unwind:
                 LLVMBuildCondBr(g->builder, dstr, die_str_bb, die_cls_bb);
                 LLVMPositionBuilderAtEnd(g->builder, die_str_bb);
                 {
-                    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
-                        "Unhandled exception: %s\n", "die.sfmt");
+                    LLVMValueRef fmt = zan_irgen_intern_string(g,
+                        "Unhandled exception: %s\n");
                     LLVMValueRef args[] = { fmt, dexc };
                     zan_call2(g->builder, printf_ty, printf_fn, args, 2, "");
                 }
                 LLVMBuildBr(g->builder, die_cont_bb);
                 LLVMPositionBuilderAtEnd(g->builder, die_cls_bb);
                 {
-                    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
-                        "Unhandled exception (class object)\n", "die.cfmt");
+                    LLVMValueRef fmt = zan_irgen_intern_string(g,
+                        "Unhandled exception (class object)\n");
                     LLVMValueRef args[] = { fmt };
                     zan_call2(g->builder, printf_ty, printf_fn, args, 1, "");
                 }
                 LLVMBuildBr(g->builder, die_cont_bb);
                 LLVMPositionBuilderAtEnd(g->builder, die_none_bb);
                 {
-                    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
-                        "Unhandled exception\n", "die.nfmt");
+                    LLVMValueRef fmt = zan_irgen_intern_string(g,
+                        "Unhandled exception\n");
                     LLVMValueRef args[] = { fmt };
                     zan_call2(g->builder, printf_ty, printf_fn, args, 1, "");
                 }

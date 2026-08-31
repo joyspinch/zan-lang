@@ -1102,7 +1102,7 @@ static void emit_site_tyname_table(zan_irgen_t *g) {
         if (k == 0) continue;
         LLVMValueRef *nptr = (LLVMValueRef *)calloc((size_t)k + 1, sizeof(LLVMValueRef));
         for (int j = 0; j < k; j++)
-            nptr[j] = LLVMBuildGlobalStringPtr(g->builder, names[j], "tn");
+            nptr[j] = zan_irgen_intern_string(g, names[j]);
         nptr[k] = LLVMConstNull(i8ptr);
         LLVMTypeRef at = LLVMArrayType(i8ptr, (unsigned)k + 1);
         char gname[64];

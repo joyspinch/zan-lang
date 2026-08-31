@@ -3002,6 +3002,17 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                                               expr->member.name);
         if (rt) return rt;
     }
+    /* array .Length / .Count (the params-bundle spelling) both read the
+     * element count from the array header; irgen lowers them identically.
+     * Left untyped here, a callee reading `kindIds.Count` on a params bundle
+     * fell through to the constant-0 fallback and reported an empty array. */
+    if (obj_type && obj_type->kind == TYPE_ARRAY) {
+        bool is_len = expr->member.name.len == 6 &&
+            memcmp(expr->member.name.str, "Length", 6) == 0;
+        bool is_cnt = expr->member.name.len == 5 &&
+            memcmp(expr->member.name.str, "Count", 5) == 0;
+        if (is_len || is_cnt) return c->binder->type_int;
+    }
     /* Builtin scalar types (string, int, ...) declare no fields; the only
      * member they carry is the string.Length property (lowered by irgen).
      * Anything else is a typo: it used to fall through to irgen, which

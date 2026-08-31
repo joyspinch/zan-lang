@@ -410,11 +410,6 @@ struct zan_irgen {
     zan_str_intern_t **str_intern; /* chained hash, ZAN_STR_INTERN_BUCKETS */
                                    /* (bucket array calloc'd on first intern) */
     int          str_intern_cap; /* allocated bucket count */
-    /* Per-function scratch buffer for split guard reports (prefix+msg
-     * composed into one contiguous string on the hard path): one entry-block
-     * alloca per function, cached so a guard inside a loop reuses the slot. */
-    LLVMValueRef guard_buf_fn;     /* the function the buffer belongs to */
-    LLVMValueRef guard_buf_alloca; /* [1400 x i8] alloca in its entry block */
     bool         rt_guard_split;   /* split prefix/msg guard reports (needs
                                     * zan_rt_soft_note2 in the linked runtime;
                                     * false for cross targets until their
@@ -690,6 +685,27 @@ struct zan_irgen {
      * tracked as an owning reference (released at function exit) only when it
      * is declared at depth 0, so its stack slot dominates every exit block. */
     int arc_stmt_depth;
+
+    /* Whole-body write-scan memo (A79-1). body_writes_ident / local_is_lambda_
+     * written re-walked the entire function body once per declared local or
+     * parameter to ask "is this name assigned somewhere?", which made a method
+     * with N declarations cost O(N^2) AST visits -- a 12k-statement body spent
+     * 18 minutes in that loop alone. Per function body the scan now runs once,
+     * recording every assigned identifier (keyed {body, name}; the lexer
+     * interns identifiers, so name equality is pointer equality) with two
+     * bits: `written` = assigned anywhere in the body, `lam_written` =
+     * assigned from inside a nested lambda (the boxed-local rule). One
+     * open-addressing table, reset per compilation. */
+    struct zan_body_write_entry {
+        zan_ast_node_t *body;
+        zan_istr_t      name;
+        unsigned char   written;
+        unsigned char   lam_written;
+        unsigned char   known;
+    } *body_write_memo;
+    unsigned body_write_memo_cap;   /* power of two, or 0 = not built */
+    unsigned body_write_memo_count;
+    zan_ast_node_t *body_write_scan_done; /* body the full scan last covered */
 };
 
 /* Zan compiles a whole program (every reachable stdlib and user file) into one

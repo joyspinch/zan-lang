@@ -306,6 +306,38 @@ void zan_rt_soft_note2(const char *prefix, const char *msg) {
     zan_soft_append(buf);
 }
 
+void zan_rt_guard_fail2(const char *prefix, const char *msg) {
+    if (zan_soft_is_hard()) {
+#if defined(_WIN32)
+        /* Same contract as the old inline hard path in generated code: print
+         * prefix+msg, then raise the fault-message record so the crash filter
+         * appends it to zan_crash.log. The filter resumes this thread
+         * (CONTINUE_EXECUTION for 0xE0A2C010), so the exit below still runs --
+         * same exit status, same atexit reports. */
+        char buf[1400];
+        size_t n = prefix ? strlen(prefix) : 0;
+        if (n >= sizeof buf) n = sizeof buf - 1;
+        memcpy(buf, prefix ? prefix : "", n);
+        if (msg) {
+            size_t m = strlen(msg);
+            if (n + m >= sizeof buf) m = sizeof buf - 1 - n;
+            memcpy(buf + n, msg, m);
+            n += m;
+        }
+        buf[n] = '\0';
+        fprintf(stderr, "%s", buf);
+        fflush(stderr);
+        void (WINAPI *raise)(DWORD, DWORD, DWORD, const ULONG_PTR *) =
+            RaiseException;
+        unsigned long code = 0xE0A2C010u; /* ZAN_RT_FAULT_MESSAGE (keep in sync
+                                             with rt_crash.h / irgen_generics.c) */
+        ULONG_PTR args[2] = { (ULONG_PTR)buf, 70 };
+        raise(code, 0, 2, args);
+#endif
+        exit(70);
+    }
+    zan_rt_soft_note2(prefix, msg);
+}
 typedef enum zan_timer_kind {
     ZAN_TIMER_DELAY = 0,
     ZAN_TIMER_PUBLIC = 1

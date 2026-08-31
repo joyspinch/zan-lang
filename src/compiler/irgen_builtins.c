@@ -1295,7 +1295,9 @@ static void emit_eh_oom_abort(zan_irgen_t *g, const char *msg) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef pty = LLVMFunctionType(i32t, &i8ptr, 1, 1);
-    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, msg, "ehoom");
+    /* interned: only a handful of texts exist but each was a fresh global;
+     * the intern table also dedups across the multiple EH chunk helpers. */
+    LLVMValueRef fmt = zan_irgen_intern_string(g, msg);
     zan_call2(g->builder, pty, get_libc_fn(g, "printf", pty), &fmt, 1, "");
     LLVMTypeRef ety = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i32t, 1, 0);
     zan_call2(g->builder, ety, get_libc_fn(g, "exit", ety),
