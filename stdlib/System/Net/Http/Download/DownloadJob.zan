@@ -4,6 +4,7 @@ using System.IO.Compression;
 using System.Threading;
 using System.Net.Sockets;
 using System.Net.Http.Client;
+using System.Net.External;
 using System.Security.Cryptography;
 
 namespace System.Net.Http.Download;
@@ -49,6 +50,8 @@ class DownloadItem {
     string host;
     int port;
     bool tls;
+    /// ExternalTarget 规范化后的完整 URL；真正连接前再按策略复核。
+    string targetUrl;
     /// 请求行里的路径（含查询串），如 "/app/plus2.exe"。
     string path;
     /// 界面上显示的名字，默认取 URL 的最后一段。
@@ -68,6 +71,7 @@ class DownloadItem {
         this.host = "";
         this.port = 443;
         this.tls = true;
+        this.targetUrl = "";
         this.path = "/";
         this.name = "";
         this.localPath = "";
@@ -86,37 +90,18 @@ class DownloadItem {
         return it;
     }
 
-    /// <summary>解析 URL 到 host/port/tls/path，成功返回 true。</summary>
+    /// <summary>解析 URL 到 host/port/tls/path，成功返回 true。解析本身只负责
+    /// 拒绝畸形目标；HTTPS、私网和 loopback 的远程策略在真正建连前由
+    /// <see cref="ExternalTargetPolicy"/> 复核，这样离线模型 fixture 仍能解析本地 URL。</summary>
     bool SetUrl(string url) {
-        string u = url;
-        if (u.Length >= 8 && u.Substring(0, 8) == "https://") {
-            u = u.Substring(8, u.Length - 8);
-            this.tls = true;
-            this.port = 443;
-        } else if (u.Length >= 7 && u.Substring(0, 7) == "http://") {
-            u = u.Substring(7, u.Length - 7);
-            this.tls = false;
-            this.port = 80;
-        } else {
-            return false;
-        }
-        int slash = u.IndexOf("/");
-        string hostport = u;
-        string p = "/";
-        if (slash >= 0) {
-            hostport = u.Substring(0, slash);
-            p = u.Substring(slash, u.Length - slash);
-        }
-        int colon = hostport.IndexOf(":");
-        if (colon >= 0) {
-            string ps = hostport.Substring(colon + 1, hostport.Length - colon - 1);
-            this.port = Convert.ToInt32(ps);
-            hostport = hostport.Substring(0, colon);
-        }
-        if (hostport.Length == 0) { return false; }
-        this.host = hostport;
-        this.path = p;
-        if (this.name == "") { this.name = DownloadItem.LastSegment(p); }
+        ExternalTarget target = ExternalTarget.Parse(url);
+        if (target == null) { return false; }
+        this.host = target.Host();
+        this.port = target.Port();
+        this.tls = target.IsTls();
+        this.targetUrl = target.Canonical();
+        this.path = target.Path() + target.Query();
+        if (this.name == "") { this.name = DownloadItem.LastSegment(this.path); }
         return true;
     }
 
@@ -209,6 +194,8 @@ class DownloadJob {
     static AtomicInt sCancel;
 
     List<DownloadItem> items;
+    /// 每个 worker 请求绑定的外部调用预算；null = 使用下载默认预算。
+    ExternalCallPolicy callPolicy;
     /// 开跑前补齐条目的回调，null = 条目已经齐了。
     DownloadPrepareFn prepare;
     // ---- 共享状态（worker 写，读者在锁下取快照）----
@@ -227,6 +214,7 @@ class DownloadJob {
 
     DownloadJob() {
         this.items = new List<DownloadItem>();
+        this.callPolicy = null;
         this.prepare = null;
         this.stage = DownloadStage.Idle;
         this.index = 0;
@@ -259,6 +247,13 @@ class DownloadJob {
     /// <summary>加入一个待下载条目（<c>Start()</c> 之前）。</summary>
     DownloadJob Add(DownloadItem it) {
         if (it != null) { this.items.Add(it); }
+        return this;
+    }
+
+    /// <summary>设置每次下载请求的外部调用预算；可链式调用。任务开始时会
+    /// 快照该策略，因此开跑后修改调用方持有的策略不会改变在途任务。</summary>
+    DownloadJob SetCallPolicy(ExternalCallPolicy policy) {
+        this.callPolicy = policy;
         return this;
     }
 
@@ -300,6 +295,9 @@ class DownloadJob {
             this.SetFail("已有下载任务在运行");
             return false;
         }
+        // 任务入队前固定一份策略快照；每个条目随后都把这份有限预算
+        // 绑定到自己的 HttpClient，避免 worker 期间调用方改写策略。
+        this.callPolicy = DownloadJob.SnapshotPolicy(this.callPolicy);
         DownloadJob.sCancel.Store(0);
         DownloadJob.Lock();
         this.stage = DownloadStage.Idle;
@@ -445,13 +443,61 @@ class DownloadJob {
         job.Finish();
     }
 
+    static ExternalCallPolicy DefaultCallPolicy() {
+        return ExternalCallPolicy.Default()
+            .TotalTimeout(120000)
+            .ResponseLimit(256 * 1024 * 1024)
+            .StreamLimit(256 * 1024 * 1024);
+    }
+
+    static ExternalCallPolicy SnapshotPolicy(ExternalCallPolicy source) {
+        if (source == null) { return DownloadJob.DefaultCallPolicy(); }
+        int retryAttempts = source.RetryAttempts();
+        int retryBackoff = source.RetryBackoffMs();
+        ExternalCallPolicy p = ExternalCallPolicy.Default()
+            .ConnectTimeout(source.ConnectTimeoutMs())
+            .WriteTimeout(source.WriteTimeoutMs())
+            .ReadTimeout(source.ReadTimeoutMs())
+            .IdleTimeout(source.IdleTimeoutMs())
+            .TotalTimeout(source.TotalTimeoutMs())
+            .RequestLimit(source.MaxRequestBytes())
+            .ResponseLimit(source.MaxResponseBytes())
+            .ErrorLimit(source.MaxErrorBytes())
+            .StreamLimit(source.MaxStreamBytes())
+            .Redirects(source.MaxRedirects())
+            .RetryAttempts(retryAttempts)
+            .RetryBackoff(retryBackoff);
+        if (retryAttempts > 0
+            && source.CanRetry("GET", false, 0)) {
+            p.RetryNetwork(true);
+        }
+        if (source.IsIdempotent()) {
+            p.Idempotent(source.IdempotencyKey());
+        }
+        if (source.AllowsHttp() && source.LocalHttpOnly()) {
+            p.AllowLocalHttp();
+        } else if (source.AllowsLoopback()) {
+            p.AllowLoopback();
+        }
+        return p;
+    }
+
     /// <summary>一个条目的传输，断点续传由 HttpClient 负责。</summary>
     async long FetchAsync(DownloadItem it) {
+        ExternalTarget target = ExternalTarget.Parse(it.targetUrl);
+        ExternalCallPolicy policy = DownloadJob.SnapshotPolicy(this.callPolicy);
+        if (target == null || !ExternalTargetPolicy.IsAllowedTarget(
+                target, policy.AllowsLoopback(), policy.AllowsHttp())
+            || (policy.LocalHttpOnly() && !target.IsTls()
+                && (!target.IsLiteral() || !target.IsLoopback()))) {
+            this.downloadError = "external target is not allowed";
+            return 0 - 1;
+        }
         Directory.CreateDirectoryRecursive(DownloadJob.ParentDir(it.localPath));
         HttpClient cli;
         if (it.tls) { cli = HttpClient.CreateHttps(it.host, it.port); }
         else { cli = new HttpClient(it.host, it.port); }
-        cli.SetTimeout(120000);
+        cli.SetCallPolicy(policy);
         cli.SetCancelProbe(DownloadJob.CancelRequested);
         this.downloadError = "";
         try {

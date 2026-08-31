@@ -1058,6 +1058,29 @@ add_test(NAME policy_sse_sink
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(policy_sse_sink PROPERTIES TIMEOUT 120)
 
+add_test(NAME policy_http_media
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/http_media_policy.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/http_media_policy.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/policy_http_media${_exe_ext}
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(policy_http_media PROPERTIES TIMEOUT 120)
+
+# SDK clients must expose one policy injection surface across MP, Work, V2,
+# and legacy media/payment paths; this smoke stays offline and avoids generated
+# API network calls.
+add_test(NAME policy_sdk_wechat
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/sdk/wechat_policy.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/sdk/wechat_policy.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/policy_sdk_wechat${_exe_ext}
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(policy_sdk_wechat PROPERTIES TIMEOUT 120)
+
 
 # The RA2 format tests were moved out of stdlib into
 # examples/game/ra2/stdlib_rts; they need its Formats sources on the command

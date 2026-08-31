@@ -2,6 +2,7 @@ using System;
 using System.Net.Sockets;
 using System.Net.Http;
 using System.Net.Http.Client;
+using System.Net.External;
 using System.Threading;
 using Gui;
 using Gui.Widget;
@@ -88,21 +89,23 @@ class ImageHttp {
         string body = null;
         byte[] bytes = null;
         int blen = 0;
-        ImageHttp.UrlParts p = ImageHttp.ParseUrl(r.url);
-        if (p.host == "") {
+        ExternalTarget target = ExternalTarget.Parse(r.url);
+        if (target == null || !ExternalTargetPolicy.IsAllowedTarget(
+                target, false, false)) {
             err = "bad url";
         } else {
             try {
-                HttpClient client;
-                if (p.tls) {
-                    client = HttpClient.CreateHttps(p.host, p.port);
-                } else {
-                    client = new HttpClient(p.host, p.port);
-                }
-                client.SetTimeout(15000);
+                HttpClient client = HttpClient.CreateHttps(target.Host(),
+                    target.Port());
+                ExternalCallPolicy policy = ExternalCallPolicy.Default()
+                    .TotalTimeout(15000)
+                    .ResponseLimit(16 * 1024 * 1024)
+                    .StreamLimit(16 * 1024 * 1024);
+                client.SetCallPolicy(policy);
                 // 二进制安全通道：图片字节里的 NUL 不能让响应在
                 // strlen 语义下提前截断（否则 JPEG 头几个字节就是终点）。
-                HttpResponse resp = await client.SendBytesAsync("GET", p.path, "");
+                HttpResponse resp = await client.SendBytesAsync("GET",
+                    target.Path() + target.Query(), "");
                 if (resp.statusCode != 200) {
                     err = "HTTP " + resp.statusCode;
                 } else if (resp.IsBinary()) {
@@ -146,49 +149,4 @@ class ImageHttp {
         r.img.OnFetchFailed();
     }
 
-    class UrlParts {
-        string host;
-        int port;
-        string path;
-        bool tls;
-    }
-
-    static UrlParts ParseUrl(string url) {
-        UrlParts p = new UrlParts();
-        p.host = "";
-        p.port = 80;
-        p.path = "/";
-        p.tls = false;
-        string rest = url;
-        if (rest.StartsWith("https://")) {
-            p.tls = true;
-            p.port = 443;
-            rest = rest.Substring(8);
-        } else if (rest.StartsWith("http://")) {
-            rest = rest.Substring(7);
-        } else {
-            return p;
-        }
-        int slash = rest.IndexOf("/");
-        string authority = rest;
-        if (slash >= 0) {
-            authority = rest.Substring(0, slash);
-            p.path = rest.Substring(slash);
-        }
-        int colon = authority.IndexOf(":");
-        if (colon > 0) {
-            p.host = authority.Substring(0, colon);
-            string ps = authority.Substring(colon + 1);
-            int port = 0;
-            for (int i = 0; i < ps.Length; i = i + 1) {
-                int d = (ps[i] & 255) - 48;
-                if (d < 0 || d > 9) { port = 0; break; }
-                port = port * 10 + d;
-            }
-            if (port > 0) { p.port = port; }
-        } else {
-            p.host = authority;
-        }
-        return p;
-    }
 }

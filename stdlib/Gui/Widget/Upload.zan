@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Net.External;
 using System.Threading;
 using Gui;
 
@@ -100,6 +101,8 @@ class UploadJob {
     Upload host;
     UploadFile item;
     int itemId;
+    /// 作业创建时从 Upload 快照的统一外部调用策略。
+    ExternalCallPolicy callPolicy;
     bool tls;
     string hostName;
     int port;
@@ -171,10 +174,13 @@ class UploadJob {
     }
 
     /// 解析 Action URL（scheme/host[:port]/path）并绑定任务。
-    void Init(Upload h, UploadFile f, string url, string fieldName) {
+    /// policy 在此处快照，之后修改 Upload 不影响已排队的作业。
+    void Init(Upload h, UploadFile f, string url, string fieldName,
+              ExternalCallPolicy policy) {
         host = h;
         item = f;
         itemId = f.id;
+        callPolicy = policy;
         field = fieldName;
         lastPct = 0 - 1;
         doneCode = 0;
@@ -222,6 +228,7 @@ class UploadJob {
         if (tls) { cli = HttpClient.CreateHttps(hostName, port); }
         else { cli = new HttpClient(hostName, port); }
         cli.SetTimeout(120000);
+        cli.SetCallPolicy(callPolicy);
         cli.SetUploadProbe(this.Probe);
         try {
             HttpResponse resp = await cli.UploadFileBytesAsync(urlPart, field,
@@ -307,6 +314,10 @@ class Upload : Control {
     /// 内置 multipart POST 的目标 URL（"http(s)://host[:port]/path"）；
     /// "" = 无内置传输（CustomRequest 或手动 SetItemStatus 驱动）。
     string Action;
+    /// 内置 HTTP 上传使用的统一外部调用策略。默认拒绝明文 HTTP 和
+    /// loopback；需要本地 HTTP 时必须显式使用
+    /// `ExternalCallPolicy.Default().AllowLocalHttp()` 配置。
+    ExternalCallPolicy CallPolicy;
     /// multipart 表单字段名。默认 "file"。
     string FieldName;
     /// before-upload 拦截钩子（Naive UI on-before-upload）。方法组
@@ -365,6 +376,7 @@ class Upload : Control {
         Thumbnail = false;
         Accept = "";
         Action = "";
+        CallPolicy = ExternalCallPolicy.Default();
         FieldName = "file";
         BeforeUpload = null;
         CustomRequest = null;
@@ -390,7 +402,15 @@ class Upload : Control {
     /// 挂 before-upload 拦截钩子（Naive UI on-before-upload）。
     Upload WithBeforeUpload(UploadBeforeFn f) { this.BeforeUpload = f; return this; }
 
+    /// 配置内置 HTTP 上传的统一外部调用策略；null 恢复安全默认值。
+    Upload WithCallPolicy(ExternalCallPolicy policy) {
+        this.CallPolicy = policy == null ? ExternalCallPolicy.Default() : policy;
+        return this;
+    }
+
     /// 挂自定义传输钩子（Naive UI custom-request），传 null 解除。
+    /// CustomRequest 接管传输并绕过内置 HttpClient，故不受 CallPolicy 约束；
+    /// 宿主若在钩子中发起网络请求，必须自行绑定并执行 ExternalCallPolicy。
     Upload WithCustomRequest(UploadRequestFn f) { this.CustomRequest = f; return this; }
 
     /// 挂内置 HTTP 目标并（可选）指定字段名。
@@ -636,7 +656,7 @@ class Upload : Control {
         UploadStart.Raise();
         if (CustomRequest != null) { CustomRequest(f); return; }
         UploadJob job = new UploadJob();
-        job.Init(this, f, Action, FieldName);
+        job.Init(this, f, Action, FieldName, CallPolicy);
         jobs.Add(job);
         UploadJob.Enqueue(job);
     }

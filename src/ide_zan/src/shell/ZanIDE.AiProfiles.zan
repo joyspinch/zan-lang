@@ -2,6 +2,10 @@ using System;
 using System.IO;
 using System.Diagnostics;
 using System.Json;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Net.External;
+using System.Threading;
 using Gui;
 using Gui.Widget;
 using Gui.Component;
@@ -37,6 +41,12 @@ class AiChatBodyDoc {
 /// absent from the JSON altogether.
 class AiChatBodyMaxDoc : AiChatBodyDoc {
     int max_tokens;
+}
+
+/// Immutable snapshot handed to the model-list worker.
+class AiModelsFetchReq {
+    string baseUrl;
+    string key;
 }
 
 /// ZanIDE part: settings persistence, the parsed error list, the AI
@@ -363,6 +373,7 @@ partial class ZanIDE {
     // `limits` holds each model's configured context length and maximum output
     // length (both in tokens); a missing / zero entry means "use the default".
     static string AiProfilesPath() { return ZanIDE.UserConfigDir() + "/ai_profiles.json"; }
+    static AiModelsFetchReq aiModelsFetch;
     static string AiModelsRespPath() { return ZanIDE.WindowCacheDir() + "/ai_models.json"; }
     static string AiModelsDonePath() { return ZanIDE.WindowCacheDir() + "/ai_models_done.txt"; }
 
@@ -651,26 +662,91 @@ partial class ZanIDE {
         return outp;
     }
 
-    /// Launches a detached `GET {base}/models` request. The response and its
-    /// done-marker land in the user config dir and are polled by the UI.
-    /// Returns "" on success or a user-facing error message.
+    /// Starts a policy-bound GET /models worker. The response and done-marker
+    /// keep the existing file-polling protocol, but credentials and the URL
+    /// never enter a shell command.
     static string AiFetchModels(string baseUrl, string key) {
         if (key == "") {
             return ZanIDE.T("Set the API key first.", "请先填写 API 密钥。");
         }
         if (baseUrl == "") { baseUrl = "https://api.openai.com/v1"; }
+        while (baseUrl.Length > 0
+            && baseUrl.Substring(baseUrl.Length - 1, 1) == "/") {
+            baseUrl = baseUrl.Substring(0, baseUrl.Length - 1);
+        }
+        ExternalTarget target = ExternalTarget.Parse(baseUrl);
+        if (target == null || target.Query() != "") {
+            return ZanIDE.T("Invalid API base URL.", "接口地址无效。");
+        }
+        bool local = ExternalTargetPolicy.AllowExactLocal(baseUrl,
+            "http://127.0.0.1:11434/v1");
+        if (!ExternalTargetPolicy.IsAllowedTarget(target, local, local)) {
+            return ZanIDE.T("API endpoint is not allowed.", "接口地址不在允许范围内。");
+        }
         ZanIDE.EnsureCacheDir();
         if (File.Exists(ZanIDE.AiModelsRespPath())) { File.Delete(ZanIDE.AiModelsRespPath()); }
         if (File.Exists(ZanIDE.AiModelsDonePath())) { File.Delete(ZanIDE.AiModelsDonePath()); }
-        string cmd = "curl -s --max-time 60 \"" + baseUrl + "/models\""
-            + " -H \"Authorization: Bearer " + key + "\""
-            + " -o \"" + ZanIDE.AiModelsRespPath() + "\"";
-        #if WINDOWS
-        Process.RunDetached("(" + cmd + ") & echo ok > \"" + ZanIDE.AiModelsDonePath() + "\"");
-        #else
-        Process.RunDetached("(" + cmd + ") ; echo ok > \"" + ZanIDE.AiModelsDonePath() + "\"");
-        #endif
+        AiModelsFetchReq rq = new AiModelsFetchReq();
+        rq.baseUrl = baseUrl;
+        rq.key = key;
+        ZanIDE.aiModelsFetch = rq;
+        if (!Thread.Start(ZanIDE.AiFetchModelsWorker)) {
+            ZanIDE.aiModelsFetch = null;
+            return ZanIDE.T("Could not start model fetch.", "无法启动模型获取。");
+        }
         return "";
+    }
+
+    /// Drives the model-list request off the GUI thread. The policy is bounded
+    /// and permits HTTP/loopback only for the explicit canonical Ollama target.
+    static void AiFetchModelsWorker() {
+        AiModelsFetchReq rq = ZanIDE.aiModelsFetch;
+        if (rq == null) { return; }
+        string marker = "err: model fetch failed";
+        try {
+            ExternalTarget target = ExternalTarget.Parse(rq.baseUrl);
+            if (target == null || target.Query() != "") {
+                File.WriteAllText(ZanIDE.AiModelsDonePath(),
+                    "err: invalid API base URL");
+                return;
+            }
+            bool local = ExternalTargetPolicy.AllowExactLocal(rq.baseUrl,
+                "http://127.0.0.1:11434/v1");
+            ExternalCallPolicy policy = AiNet.Policy(local, "", 60000);
+            HttpClient cli;
+            if (target.IsTls()) {
+                cli = HttpClient.CreateHttps(target.Host(), target.Port());
+            } else {
+                cli = new HttpClient(target.Host(), target.Port());
+            }
+            cli.SetCallPolicy(policy);
+            cli.SetTimeout(policy.TotalTimeoutMs());
+            cli.SetHeader("Authorization", "Bearer " + rq.key);
+            string path = target.Path();
+            while (path.Length > 1 && path.Substring(path.Length - 1, 1) == "/") {
+                path = path.Substring(0, path.Length - 1);
+            }
+            int retry = 0;
+            string raw = "";
+            while (true) {
+                try {
+                    raw = await cli.GetAsync(path + "/models");
+                    marker = "ok";
+                    break;
+                } catch (Exception ex) {
+                    marker = "err: " + ex.Message;
+                    if (!policy.CanRetry("GET", false, 0)
+                        || retry >= policy.RetryAttempts()) { break; }
+                    retry = retry + 1;
+                    int delay = policy.RetryBackoffMs() * retry;
+                    if (delay > 0) { Thread.Sleep(delay); }
+                }
+            }
+            File.WriteAllText(ZanIDE.AiModelsRespPath(), raw);
+        } catch (Exception ex) {
+            marker = "err: " + ex.Message;
+        }
+        File.WriteAllText(ZanIDE.AiModelsDonePath(), marker);
     }
 
     /// Parses the /models response into a `;`-joined id list ("" on failure).
@@ -715,9 +791,9 @@ partial class ZanIDE {
     }
 
     /// Writes the chat transcript as an OpenAI-compatible /chat/completions
-    /// request and launches curl DETACHED (response + done-marker files are
-    /// polled from the event loop, so the UI stays responsive). Returns "" on
-    /// success or a user-facing error message.
+    /// request and queues a policy-bound in-process worker (response +
+    /// done-marker files are polled from the event loop, so the UI stays
+    /// responsive). Returns "" on success or a user-facing error message.
     /// The content of the last ``` fenced code block in the newest assistant
     /// reply, or "" when there is none.
     static string AiLastCode(List<ChatMessage> msgs) {

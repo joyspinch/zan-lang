@@ -310,8 +310,22 @@ class HttpClient {
         return this.callPolicy;
     }
 
-    // 未绑定 policy 时保留历史请求行为；绑定 policy 后，正文在
-    // 建连前按统一 max request bytes 拒绝，避免副作用请求已经上线。
+    // 绑定 policy 后，目标必须在建连前通过同一个 URL/地址策略；
+    // 这样图片、下载、上传和 AI 即使误用了裸 host API，也不会绕过
+    // ExternalTargetPolicy。DNS 多地址复核仍由 socket 层继续补齐。
+    void CheckTargetPolicy() {
+        if (this.callPolicy == null) { return; }
+        bool ok = ExternalTargetPolicy.IsClientAllowed(this.host, this.port,
+            this.useTls, this.callPolicy.AllowsLoopback(),
+            this.callPolicy.AllowsHttp(), this.callPolicy.LocalHttpOnly());
+        if (!ok) {
+            throw new HttpRequestException("external target is not allowed: "
+                + this.host + ":" + Convert.ToString(this.port));
+        }
+    }
+
+    // 绑定 policy 后，正文在建连前按统一 max request bytes 拒绝，
+    // 避免副作用请求已经上线。
     void CheckRequestLimit(int bodyBytes) {
         if (this.callPolicy == null) { return; }
         int limit = this.callPolicy.MaxRequestBytes();
@@ -488,6 +502,7 @@ class HttpClient {
     /// 通道，各自读到对端关闭为止。</summary>
     async string RequestAsync(string method, string path, string body) {
         this.CheckRequestLimit(body.Length);
+        this.CheckTargetPolicy();
         if (this.kaEnabled && !this.kaBusy) {
             string alive = await this.RequestAliveAsync(method, path, body);
             return alive;
@@ -913,6 +928,7 @@ class HttpClient {
     /// 字体等二进制资源的下载与上传；文本响应照常可用 body 读取。</summary>
     async HttpResponse SendBytesAsync(string method, string path, string body) {
         this.CheckRequestLimit(body.Length);
+        this.CheckTargetPolicy();
         if (this.useTls) {
             HttpResponse tResp = await this.SendBytesTlsAsync(method, path,
                                                               body);
@@ -1122,6 +1138,7 @@ class HttpClient {
             string head, string localPath, int fileLen, string tail,
             int total) {
         this.CheckRequestLimit(total);
+        this.CheckTargetPolicy();
         TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
                                                      this.timeout);
         if (conn == null) { FailConnect(); }
@@ -1158,6 +1175,7 @@ class HttpClient {
             string head, string localPath, int fileLen, string tail,
             int total) {
         this.CheckRequestLimit(total);
+        this.CheckTargetPolicy();
         Socket.Initialize();
         TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
                                                      this.timeout);
@@ -1410,6 +1428,17 @@ class HttpClient {
     /// </summary>
     async int PostSseToSinkAsync(string path, string body, SseSink sink) {
         sink.Begin();
+        if (this.callPolicy != null) {
+            bool targetOk = ExternalTargetPolicy.IsClientAllowed(this.host,
+                this.port, this.useTls,
+                this.callPolicy.AllowsLoopback(),
+                this.callPolicy.AllowsHttp(),
+                this.callPolicy.LocalHttpOnly());
+            if (!targetOk) {
+                sink.Finish("err: external target is not allowed");
+                return 0;
+            }
+        }
         if (this.callPolicy != null
             && body.Length > this.callPolicy.MaxRequestBytes()) {
             sink.Finish("err: request body exceeds " + Convert.ToString(
@@ -1886,6 +1915,8 @@ class HttpClient {
             + "Content-Type: " + HttpClient.GuessMime(fileName) + "\r\n\r\n";
         string tail = "\r\n--" + boundary + "--\r\n";
         int total = head.Length + fileLen + tail.Length;
+        this.CheckTargetPolicy();
+        this.CheckRequestLimit(total);
         if (!this.HasHeaderName("Content-Type")) {
             this.SetHeader("Content-Type",
                 "multipart/form-data; boundary=" + boundary);
@@ -1915,12 +1946,30 @@ class HttpClient {
     /// 当前磁盘上的字节数，连接/握手失败时返回 -1。</summary>
     async int DownloadRangeToFileAsync(string path, string localPath,
             string progressFile) {
+        this.SetDownloadError("");
+        int bodyLimit = 0;
+        if (this.callPolicy != null) { bodyLimit = this.callPolicy.MaxBodyBytes(); }
+        if (this.callPolicy != null) {
+            bool targetOk = ExternalTargetPolicy.IsClientAllowed(this.host,
+                this.port, this.useTls,
+                this.callPolicy.AllowsLoopback(),
+                this.callPolicy.AllowsHttp(),
+                this.callPolicy.LocalHttpOnly());
+            if (!targetOk) {
+                this.SetDownloadError("external target is not allowed");
+                return 0 - 1;
+            }
+        }
         int have = 0;
         nint probe = fopen(localPath, "rb");
         if (probe != 0) {
             fseek(probe, 0, 2);
             have = ftell(probe);
             fclose(probe);
+        }
+        if (bodyLimit > 0 && have > bodyLimit) {
+            this.SetDownloadError("已有文件超过 " + Convert.ToString(bodyLimit) + " bytes");
+            return 0 - 1;
         }
 
         Socket.Initialize();
@@ -2027,6 +2076,14 @@ class HttpClient {
             if (total <= 0) { total = HttpClient.HeaderInt(head, "content-length"); }
         }
 
+        if (bodyLimit > 0 && (written > bodyLimit
+                || (total > 0 && total > bodyLimit))) {
+            this.SetDownloadError("响应正文超过 " + Convert.ToString(bodyLimit) + " bytes");
+            HttpDeadline.Disarm(watch);
+            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+            else { conn.Close(); }
+            return 0 - 1;
+        }
         string mode = "wb";
         if (resume) { mode = "ab"; }
         nint outfp = fopen(localPath, mode);
@@ -2057,6 +2114,14 @@ class HttpClient {
                             int need = crlf + 2 + size + 2;
                             if (pending.Length >= need) {
                                 string piece = pending.Substring(crlf + 2, size);
+                                if (bodyLimit > 0 && written > bodyLimit - piece.Length) {
+                                    fclose(outfp);
+                                    this.SetDownloadError("响应正文超过 " + Convert.ToString(bodyLimit) + " bytes");
+                                    HttpDeadline.Disarm(watch);
+                                    if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+                                    else { conn.Close(); }
+                                    return 0 - 1;
+                                }
                                 int _w = (int)fwrite(piece, 1, piece.Length, outfp);
                                 written = written + piece.Length;
                                 pending = pending.Substring(need, pending.Length - need);
@@ -2067,6 +2132,14 @@ class HttpClient {
                 }
             } else {
                 if (pending.Length > 0) {
+                    if (bodyLimit > 0 && written > bodyLimit - pending.Length) {
+                        fclose(outfp);
+                        this.SetDownloadError("响应正文超过 " + Convert.ToString(bodyLimit) + " bytes");
+                        HttpDeadline.Disarm(watch);
+                        if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+                        else { conn.Close(); }
+                        return 0 - 1;
+                    }
                     int _w2 = (int)fwrite(pending, 1, pending.Length, outfp);
                     written = written + pending.Length;
                     pending = "";
@@ -2120,12 +2193,29 @@ class HttpClient {
     async long DownloadBinaryToFileAsync(string path, string localPath,
             string progressFile) {
         this.SetDownloadError("");
+        int bodyLimit = 0;
+        if (this.callPolicy != null) { bodyLimit = this.callPolicy.MaxBodyBytes(); }
+        if (this.callPolicy != null) {
+            bool targetOk = ExternalTargetPolicy.IsClientAllowed(this.host,
+                this.port, this.useTls,
+                this.callPolicy.AllowsLoopback(),
+                this.callPolicy.AllowsHttp(),
+                this.callPolicy.LocalHttpOnly());
+            if (!targetOk) {
+                this.SetDownloadError("external target is not allowed");
+                return 0 - 1;
+            }
+        }
         int have = 0;
         nint probe = fopen(localPath, "rb");
         if (probe != 0) {
             fseek(probe, 0, 2);
             have = ftell(probe);
             fclose(probe);
+        }
+        if (bodyLimit > 0 && have > bodyLimit) {
+            this.SetDownloadError("已有文件超过 " + Convert.ToString(bodyLimit) + " bytes");
+            return 0 - 1;
         }
 
         Socket.Initialize();
@@ -2273,6 +2363,14 @@ class HttpClient {
             }
         }
 
+        if (bodyLimit > 0 && (written > bodyLimit
+                || (total > 0 && total > bodyLimit))) {
+            this.SetDownloadError("响应正文超过 " + Convert.ToString(bodyLimit) + " bytes");
+            HttpDeadline.Disarm(watch);
+            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+            else { conn.Close(); }
+            return 0 - 1;
+        }
         string mode = "wb";
         if (resume) { mode = "ab"; }
         nint outfp = fopen(localPath, mode);
@@ -2297,6 +2395,14 @@ class HttpClient {
             lastBodyN = n;
             if (n <= 0) { finished = true; }
             else {
+                if (bodyLimit > 0 && written > bodyLimit - n) {
+                    fclose(outfp);
+                    this.SetDownloadError("响应正文超过 " + Convert.ToString(bodyLimit) + " bytes");
+                    HttpDeadline.Disarm(watch);
+                    if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+                    else { conn.Close(); }
+                    return 0 - 1;
+                }
                 long w = fwrite(buf, 1, n, outfp);
                 if (w < n) { finished = true; }
                 written = written + w;

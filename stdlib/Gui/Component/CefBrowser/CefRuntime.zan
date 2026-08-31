@@ -5,6 +5,7 @@ using System.Json;
 using System.Diagnostics;
 using System.Management;
 using System.Net.Http.Client;
+using System.Net.External;
 using System.Security.Cryptography;
 using System.Net.Http.Download;
 
@@ -412,12 +413,47 @@ class CefRuntime {
         e.port = port;
         e.tls = tls;
         e.prefix = prefix;
+        if (!CefRuntime.IsSecureEndpoint(e)) {
+            CefRuntime.Fail("CEF 镜像地址必须使用 https://：" + baseUrl);
+            return null;
+        }
         return e;
     }
 
     /// <summary>归档完整 URL（文件名中的 "+" 继续按 URL 规则转义）。</summary>
     static string ArchiveUrl(CefArchive a) {
         return CefRuntime.BaseUrl() + a.Path();
+    }
+
+    /// <summary>CEF 自举的网络预算：仅 HTTPS，限制响应体与总耗时，且不
+    /// 自动跟随重定向或重试。镜像即使来自配置也不能放宽传输边界。</summary>
+    static ExternalCallPolicy NetworkPolicy(int responseBytes, int totalMs) {
+        return ExternalCallPolicy.Default()
+            .TotalTimeout(totalMs)
+            .ResponseLimit(responseBytes)
+            .StreamLimit(responseBytes)
+            .Redirects(0)
+            .RetryNetwork(false)
+            .RetryAttempts(0);
+    }
+
+    static ExternalCallPolicy IndexPolicy() {
+        return CefRuntime.NetworkPolicy(16 * 1024 * 1024, 60000);
+    }
+
+    static ExternalCallPolicy ArchivePolicy() {
+        // 当前 pinned 归档最大约 394 MiB；保留余量但仍拒绝无界响应。
+        return CefRuntime.NetworkPolicy(512 * 1024 * 1024, 120000);
+    }
+
+    /// <summary>按 CEF 的官方/镜像地址检查策略。CEF 自举没有本地明文
+    /// 下载例外，因此这里始终只接受 HTTPS。</summary>
+    static bool IsSecureEndpoint(CefHttpEndpoint endpoint) {
+        if (endpoint == null || !endpoint.tls) { return false; }
+        ExternalCallPolicy policy = CefRuntime.NetworkPolicy(1, 1);
+        return ExternalTargetPolicy.IsClientAllowed(endpoint.host, endpoint.port,
+            endpoint.tls, policy.AllowsLoopback(), policy.AllowsHttp(),
+            policy.LocalHttpOnly());
     }
 
     static string DownloadEscapeHint() {
@@ -441,6 +477,7 @@ class CefRuntime {
         HttpClient client = endpoint.tls
             ? HttpClient.CreateHttps(endpoint.host, endpoint.port)
             : new HttpClient(endpoint.host, endpoint.port);
+        client.SetCallPolicy(CefRuntime.IndexPolicy());
         client.SetTimeout(60000);
         long n = 0;
         // 索引是 10 MB 量级的单次传输，一次连接抖动就够让整个自举失败，
@@ -708,6 +745,20 @@ class CefRuntime {
         CefRuntime.pendingDir = dir;
         CefRuntime.pendingVersion = a.cefVersion;
         if (CefRuntime.IsReady(dir)) { return true; }
+        CefHttpEndpoint endpoint = CefRuntime.Endpoint();
+        if (endpoint == null) { return false; }
+        ExternalCallPolicy archivePolicy = CefRuntime.ArchivePolicy();
+        if (!ExternalTargetPolicy.IsClientAllowed(endpoint.host, endpoint.port,
+                endpoint.tls, archivePolicy.AllowsLoopback(),
+                archivePolicy.AllowsHttp(), archivePolicy.LocalHttpOnly())) {
+            CefRuntime.Fail("CEF 归档地址未通过 HTTPS 外部调用策略："
+                + CefRuntime.BaseUrl());
+            return false;
+        }
+        if (a.size <= 0 || a.size > archivePolicy.MaxBodyBytes()) {
+            CefRuntime.Fail("CEF 归档大小超出安全预算：" + a.fileName);
+            return false;
+        }
         Directory.CreateDirectoryRecursive(CefRuntime.DownloadDir());
         string archive = CefRuntime.DownloadDir() + "/" + a.fileName;
         DownloadItem it = DownloadItem.FromUrl(
@@ -770,6 +821,7 @@ class CefRuntime {
         HttpClient client = endpoint.tls
             ? HttpClient.CreateHttps(endpoint.host, endpoint.port)
             : new HttpClient(endpoint.host, endpoint.port);
+        client.SetCallPolicy(CefRuntime.ArchivePolicy());
         client.SetTimeout(120000);
         long lastN = 0 - 1;
         bool transferred = false;

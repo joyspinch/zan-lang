@@ -67,9 +67,15 @@ class ExternalTargetPolicy {
         if (t == null) { return false; }
         if (!allowHttp && !t.IsTls()) { return false; }
         if (t.IsLiteral() && !t.IsSafeLiteral()) {
-            return allowLoopback && t.IsLoopback();
+            // 明文本地开发例外必须是明确的 loopback literal；不能用
+            // allowHttp 把任意公网 HTTP 目标一并放行。
+            return allowLoopback && t.IsLoopback()
+                && (t.IsTls() || allowHttp);
         }
-        if (t.IsLoopback() && !allowLoopback) { return false; }
+        if (t.IsLoopback()) {
+            return allowLoopback && (t.IsTls() || allowHttp);
+        }
+        if (!t.IsTls() && allowLoopback) { return false; }
         return true;
     }
 
@@ -78,6 +84,29 @@ class ExternalTargetPolicy {
     static bool IsPublicIPv4(string host) {
         ExternalTarget t = ExternalTarget.Parse("https://" + host + "/");
         return t != null && t.IsLiteral() && t.IsSafeLiteral();
+    }
+
+    /// <summary>把已拆出的 host/port 重新组成一个严格目标并执行策略。
+    /// 这是 HttpClient 的连接前门：调用方不能只验证 hostname 字符串后再
+    /// 绕过 URL 策略。IPv6 host 由此处补上 authority 所需的方括号。</summary>
+    static bool IsClientAllowed(string host, int port, bool tls,
+                                bool allowLoopback, bool allowHttp,
+                                bool localHttpOnly) {
+        if (host == null || host.Length == 0 || port < 1 || port > 65535) {
+            return false;
+        }
+        string authority = host;
+        if (host.IndexOf(":") >= 0 && !host.StartsWith("[")) {
+            authority = "[" + host + "]";
+        }
+        string scheme = tls ? "https" : "http";
+        string url = scheme + "://" + authority + ":"
+            + Convert.ToString(port) + "/";
+        ExternalTarget t = ExternalTarget.Parse(url);
+        if (t == null) { return false; }
+        if (localHttpOnly && (!t.IsTls())
+            && (!t.IsLiteral() || !t.IsLoopback())) { return false; }
+        return ExternalTargetPolicy.IsAllowedTarget(t, allowLoopback, allowHttp);
     }
 
     /// <summary>loopback 只接受明确的 IPv4 127/8 或 ::1 字面量。</summary>

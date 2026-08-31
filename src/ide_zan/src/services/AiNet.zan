@@ -4,6 +4,7 @@ using System.Threading;
 using System.Net.Sockets;
 using System.Net.Http;
 using System.Net.Http.Client;
+using System.Net.External;
 
 /// The AI chat transport: a real HTTPS request made with the Net standard
 /// library, running on a worker thread INSIDE the IDE process. The decoded
@@ -24,6 +25,49 @@ class AiNet {
     /// abandoned worker keeps writing into the sink it captured, which nobody
     /// reads any more.
     static AiReq sCur;
+
+    /// Builds the one bounded policy used by every AI SSE request. POST is
+    /// intentionally non-retryable unless a caller supplies an idempotency key.
+    /// Loopback/HTTP is never inferred from a hostname: it is an explicit
+    /// Ollama opt-in only.
+    static ExternalCallPolicy Policy(bool allowLocal, string idempotencyKey) {
+        return AiNet.Policy(allowLocal, idempotencyKey, 600000);
+    }
+
+    static ExternalCallPolicy Policy(bool allowLocal, string idempotencyKey,
+            int totalTimeoutMs) {
+        ExternalCallPolicy p = ExternalCallPolicy.Default()
+            .ConnectTimeout(15000)
+            .WriteTimeout(15000)
+            .ReadTimeout(totalTimeoutMs)
+            .IdleTimeout(totalTimeoutMs)
+            .TotalTimeout(totalTimeoutMs)
+            .RequestLimit(8388608)
+            .ResponseLimit(16777216)
+            .ErrorLimit(65536)
+            .StreamLimit(33554432)
+            .Redirects(0)
+            .RetryNetwork(true)
+            .RetryAttempts(2)
+            .RetryBackoff(1000);
+        if (allowLocal) { p.AllowLocalHttp(); }
+        if (idempotencyKey != null && idempotencyKey != "") {
+            p.Idempotent(idempotencyKey);
+        }
+        return p;
+    }
+
+    /// Local Ollama is allowed only when the profile explicitly points at the
+    /// canonical loopback endpoint; arbitrary HTTP/local targets remain denied.
+    static bool IsLocalOllama(string baseUrl) {
+        if (baseUrl == null) { return false; }
+        string u = baseUrl;
+        while (u.Length > 0 && u.Substring(u.Length - 1, 1) == "/") {
+            u = u.Substring(0, u.Length - 1);
+        }
+        return ExternalTargetPolicy.AllowExactLocal(u,
+            "http://127.0.0.1:11434/v1");
+    }
 
     /// Bumped by every Start and every Abandon, so a worker can tell whether
     /// it is still the request the panel cares about before it retries.
@@ -85,8 +129,11 @@ class AiNet {
         else { cli = new HttpClient(rq.host, rq.port); }
         if (!rq.verify) { cli.DisableTlsVerify(); }
         if (rq.key != "") { cli.SetHeader("Authorization", "Bearer " + rq.key); }
+        string idem = rq.policy.IdempotencyKey();
+        if (idem != "") { cli.SetHeader("Idempotency-Key", idem); }
         cli.SetHeader("Content-Type", "application/json");
         cli.SetHeader("Accept", "text/event-stream");
+        cli.SetCallPolicy(rq.policy);
         cli.SetTimeout(rq.timeout);
         int rr = await cli.PostSseToSinkAsync(rq.path, rq.body, rq.sink);
         return rr;
@@ -124,18 +171,16 @@ class AiNet {
         return false;
     }
 
-    /// Drives the request to completion on its own OS thread, retrying
-    /// transient failures. The thread's coroutine scheduler pumps every
-    /// `await` (connect / recv) until the stream ends. Only the final outcome
-    /// is published, so the GUI never sees a mid-retry error and a dropped
-    /// connection recovers on its own. Up to 3 attempts (2 retries) with a
-    /// growing backoff.
+    /// Drives the request to completion on its own OS thread. Retry count and
+    /// delay come only from the snapshotted policy; the policy also refuses a
+    /// POST retry unless an explicit idempotency key was supplied.
     static void Drive(AiReq rq) {
         Socket.Initialize();
         SseSink sink = rq.sink;
-        int attempt = 0;
+        ExternalCallPolicy policy = rq.policy;
+        int retry = 0;
         string last = "";
-        while (attempt < 3) {
+        while (true) {
             last = "";
             // A throw anywhere in the transport (DNS, TLS, a closed socket)
             // must still end as a marker: without this the worker dies
@@ -151,58 +196,47 @@ class AiNet {
                 sink.Publish("ok");
                 return;
             }
-            if (!AiNet.Retryable(last)) {
+            int status = sink.ResponseStatus();
+            // The SSE transport intentionally exposes no pre-send marker. A
+            // POST is therefore retryable here only when the policy carries an
+            // explicit idempotency key; the default policy always returns false.
+            bool canRetry = policy.CanRetry("POST", false, status)
+                && AiNet.Retryable(last);
+            if (!canRetry || retry >= policy.RetryAttempts()) {
+                if (last == "") { last = "err: request failed"; }
                 sink.Publish(last);
                 return;
             }
-            attempt = attempt + 1;
+            retry = retry + 1;
             // Nobody is reading this sink any more (stopped, or superseded by
             // the next question): stop instead of spending a backoff and
             // another provider call on an answer that is already gone.
             if (rq.gen != AiNet.sGen) { return; }
-            // Backoff 1s / 2s between retries: enough for a dropped
-            // connection to recover, short enough to not stall the reply.
-            if (attempt < 3) { Thread.Sleep(1000 * attempt); }
+            int delay = policy.RetryBackoffMs() * retry;
+            if (delay > 0) { Thread.Sleep(delay); }
         }
-        string msg = last;
-        if (msg == "") { msg = "err: request failed"; }
-        sink.Publish(msg);
     }
 
-    /// Parses `baseUrl` (scheme://host[:port][/base]) into `rq` and appends
-    /// `suffix` (e.g. "/chat/completions") to its path.
-    static void SetUrl(AiReq rq, string baseUrl, string suffix) {
-        string u = baseUrl;
-        bool tls = true;
-        int defPort = 443;
-        if (u.Length >= 8 && u.Substring(0, 8) == "https://") {
-            u = u.Substring(8, u.Length - 8); tls = true; defPort = 443;
-        } else if (u.Length >= 7 && u.Substring(0, 7) == "http://") {
-            u = u.Substring(7, u.Length - 7); tls = false; defPort = 80;
+    /// Parses `baseUrl` with the shared strict target parser and appends
+    /// `suffix` (e.g. "/chat/completions") to its path. Query-bearing,
+    /// malformed, or policy-denied profiles never enter the worker queue.
+    static bool SetUrl(AiReq rq, string baseUrl, string suffix) {
+        ExternalTarget target = ExternalTarget.Parse(baseUrl);
+        if (target == null || target.Query() != "") { return false; }
+        bool local = AiNet.IsLocalOllama(baseUrl);
+        if (!ExternalTargetPolicy.IsAllowedTarget(target, local, local)) {
+            return false;
         }
-        int slash = AiNet.FindByte(u, 47, 0);
-        string hostport = u;
-        string basePath = "";
-        if (slash >= 0) {
-            hostport = u.Substring(0, slash);
-            basePath = u.Substring(slash, u.Length - slash);
-        }
+        string basePath = target.Path();
         while (basePath.Length > 0
-            && (basePath[basePath.Length - 1] & 255) == 47) {
+            && basePath.Substring(basePath.Length - 1, 1) == "/") {
             basePath = basePath.Substring(0, basePath.Length - 1);
         }
-        int port = defPort;
-        string host = hostport;
-        int colon = AiNet.FindByte(hostport, 58, 0);
-        if (colon >= 0) {
-            host = hostport.Substring(0, colon);
-            port = AiNet.ParseInt(hostport.Substring(colon + 1,
-                hostport.Length - colon - 1), defPort);
-        }
-        rq.host = host;
-        rq.port = port;
-        rq.tls = tls;
+        rq.host = target.Host();
+        rq.port = target.Port();
+        rq.tls = target.IsTls();
         rq.path = basePath + suffix;
+        return true;
     }
 
     static int FindByte(string s, int b, int from) {
@@ -229,12 +263,25 @@ class AiNet {
     /// readable error when the thread cannot be started.
     static string Start(string baseUrl, string suffix, string key, string body,
             int timeoutMs, bool verify) {
+        return AiNet.Start(baseUrl, suffix, key, body, timeoutMs, verify, "");
+    }
+
+    /// Optional idempotency key for callers that explicitly know the POST is
+    /// safe to repeat. Normal chat calls use the overload above and never retry.
+    static string Start(string baseUrl, string suffix, string key, string body,
+            int timeoutMs, bool verify, string idempotencyKey) {
         AiReq rq = new AiReq();
-        AiNet.SetUrl(rq, baseUrl, suffix);
+        if (!AiNet.SetUrl(rq, baseUrl, suffix)) {
+            return "invalid or disallowed AI endpoint.";
+        }
         rq.key = key;
         rq.body = body;
         rq.timeout = timeoutMs;
         rq.verify = verify;
+        // The profile URL is snapshotted before the worker starts. Only the
+        // canonical local Ollama endpoint receives the explicit local policy;
+        // all other targets keep the secure remote defaults.
+        rq.policy = AiNet.Policy(AiNet.IsLocalOllama(baseUrl), idempotencyKey);
         rq.sink = SseSink.ToMemory();
         AiNet.sGen = AiNet.sGen + 1;
         rq.gen = AiNet.sGen;
@@ -309,6 +356,7 @@ class AiReq {
     string key;
     string body;
     int timeout;
+    ExternalCallPolicy policy;
     SseSink sink;
     int gen;
 }

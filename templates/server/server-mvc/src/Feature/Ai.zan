@@ -1,6 +1,7 @@
 using System;
 using System.Data;
 using System.Json;
+using System.Net.External;
 using System.Net.Http;
 using System.Net.Http.Client;
 using System.Text;
@@ -200,6 +201,34 @@ class Ai {
         return msgs.ToString();
     }
 
+    /* AI 外部调用预算：所有请求都必须有有限的大小、时间和重试预算。
+     * POST 补全没有幂等键，明确保持不可重试；本地例外只放行固定的
+     * 127.0.0.1 Ollama 端点，供应商精确白名单仍由 AiEndpointPolicy 负责。 */
+    static ExternalCallPolicy CallPolicy(AiEndpoint ep, bool streaming) {
+        int idle = streaming ? 60000 : 30000;
+        int total = streaming ? 300000 : 120000;
+        ExternalCallPolicy p = ExternalCallPolicy.Default()
+            .ConnectTimeout(10000)
+            .WriteTimeout(30000)
+            .ReadTimeout(60000)
+            .IdleTimeout(idle)
+            .TotalTimeout(total)
+            .RequestLimit(2 * 1024 * 1024)
+            .ResponseLimit(8 * 1024 * 1024)
+            .ErrorLimit(128 * 1024)
+            .StreamLimit(16 * 1024 * 1024)
+            .Redirects(0)
+            .RetryNetwork(false)
+            .RetryAttempts(0);
+        if (ep.Local()) { p.AllowLocalHttp(); }
+        return p;
+    }
+
+    static async int WaitStreamProducer(long producer) {
+        while (Task.IsDone(producer) == 0) { await Task.Delay(4); }
+        return 0;
+    }
+
     /* 非流式调用：发送 messages，返回文本或失败原因。 */
     static async AiReply Complete(AiEndpoint ep, string key, string model,
                                   string temp, string messages) {
@@ -214,7 +243,7 @@ class Ai {
 
         HttpClient http = new HttpClient(ep.Host(), ep.Port());
         if (ep.Tls()) { http = HttpClient.CreateHttps(ep.Host(), ep.Port()); }
-        http.SetTimeout(60000);
+        http.SetCallPolicy(Ai.CallPolicy(ep, false));
         http.SetHeader("Content-Type", "application/json");
         http.SetHeader("Accept", "application/json");
         if (key.Length > 0) { http.SetHeader("Authorization", "Bearer " + key); }
@@ -272,14 +301,23 @@ class Ai {
         HttpClient http = new HttpClient(ep.Host(), ep.Port());
         if (ep.Tls()) { http = HttpClient.CreateHttps(ep.Host(), ep.Port()); }
         /* 空闲超时：每个分片重设，慢响应也能存活，静默超时会被挂断。 */
-        http.SetTimeout(60000);
+        http.SetCallPolicy(Ai.CallPolicy(ep, true));
         http.SetHeader("Content-Type", "application/json");
         http.SetHeader("Accept", "text/event-stream");
         if (key.Length > 0) { http.SetHeader("Authorization", "Bearer " + key); }
 
         SseSink sink = SseSink.ToMemory();
-        Task.Spawn(http.PostSseToSinkAsync(ep.Path() + "/chat/completions",
-            body.ToString(), sink));
+        /* SseSend 失败后只标记 sink 为 aborted，并让 transport 自己收尾；
+         * 不在 producer 仍可能写入时 Dispose。 */
+        http.SetCancelProbe(() => {
+            if (!ctx.Hijacked()) {
+                sink.Abort();
+                return true;
+            }
+            return false;
+        });
+        long producer = Task.Spawn(http.PostSseToSinkAsync(
+            ep.Path() + "/chat/completions", body.ToString(), sink));
 
         StringBuilder full = new StringBuilder();
         string pending = "";
@@ -310,7 +348,10 @@ class Ai {
                     d.text = delta;
                     if (!await ctx.SseSend("delta",
                             Json.Serialize<AiDeltaDoc>(d))) {
-                        /* 用户关闭面板，停止读取。 */
+                        /* 用户关闭面板：先让 producer 在安全的 transport
+                         * 边界拆掉上游；不能在其仍运行时 Dispose sink。 */
+                        sink.Abort();
+                        await Ai.WaitStreamProducer(producer);
                         sink.Dispose();
                         return AiReply.Bad("客户端已断开");
                     }
@@ -318,6 +359,7 @@ class Ai {
                 nl = pending.IndexOf("\n");
             }
         }
+        await Ai.WaitStreamProducer(producer);
         string outcome = sink.Attempt();
         string text = full.ToString();
         sink.Dispose();
@@ -355,7 +397,7 @@ class Ai {
         if (ep == null) { return ids; }
         HttpClient http = new HttpClient(ep.Host(), ep.Port());
         if (ep.Tls()) { http = HttpClient.CreateHttps(ep.Host(), ep.Port()); }
-        http.SetTimeout(30000);
+        http.SetCallPolicy(Ai.CallPolicy(ep, false));
         http.SetHeader("Accept", "application/json");
         if (key.Length > 0) { http.SetHeader("Authorization", "Bearer " + key); }
         string raw = "";
@@ -432,6 +474,16 @@ class AiEndpoint {
     int Port() { return this.port; }
     string Path() { return this.path; }
     bool Tls() { return this.tls; }
+    bool Local() { return AiEndpointPolicy.IsLocal(this.Canonical()); }
+
+    string Canonical() {
+        string scheme = this.tls ? "https://" : "http://";
+        string authority = this.host;
+        if ((this.tls && this.port != 443) || (!this.tls && this.port != 80)) {
+            authority = authority + ":" + Convert.ToString(this.port);
+        }
+        return scheme + authority + this.path;
+    }
 
     /* 解析 URL，返回 null 表示不是允许的地址。 */
     static AiEndpoint Parse(string url) {
