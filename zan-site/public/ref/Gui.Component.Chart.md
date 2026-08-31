@@ -255,7 +255,7 @@ ChartOption 的可变持有者。用于立即模式 GUI 中的动态数据：
 
 ## ChartElementType (enum)
 
-图表命中图元分类。`Chart` 表示整图空白区域；其余类型表示首批可提供数据点事件的图元。
+图表命中图元分类。`Chart` 表示整图空白区域；其余类型表示可提供数据点事件的图元（全部成员均有对应 renderer）。
 
 - Chart
 - LinePoint
@@ -267,6 +267,14 @@ ChartOption 的可变持有者。用于立即模式 GUI 中的动态数据：
 - FunnelStage
 - Node
 - Link
+- VennCircle
+- EventBand
+- RadarAxis
+- Candlestick
+- BoxPlot
+- ErrorBar
+- Gauge
+- WordTag
 
 
 ## ChartHit (class)
@@ -388,7 +396,7 @@ EncodeBy / EncodeNamed 选择不同维度来驱动多个图表——
 
 ## ChartInteractionEvent (class)
 
-带载荷的 typed 图表交互事件。未命中的图表级事件使用 `dataHit=false`、`elementType=Chart`、`dataIndex=-1`；命中首批 line/bar/scatter/heatmap/pie/map 图元以及 Chord/Force/Sankey/Bubbles 的稳定节点、连线或气泡时，填充源/布局索引、名称、兼容整数值和可用的 double/x/y 字段。
+带载荷的 typed 图表交互事件。未命中的图表级事件使用 `dataHit=false`、`elementType=Chart`、`dataIndex=-1`；命中任意图元时填充源/布局索引、名称、兼容整数值和可用的 double/x/y 字段。`ChartElementType` 全部成员均有对应 renderer（含 VennCircle/EventBand/RadarAxis/Candlestick/BoxPlot/ErrorBar/Gauge/WordTag）。
 
 - ChartEventType type;
 
@@ -1326,7 +1334,7 @@ StackedBar / StackedArea 工厂默认 stack = 1）。
 
 ### Typed data-point events
 
-`ChartInteractionEvent` 的 `dataHit`、`elementType`、源 `dataIndex`、`dataName`、`value` 和可选 `numberValue/numberValueSet` 描述数据图元命中。散点还填充 `xValue/yValue`；屏幕位置仍由 `x/y` 表示。line、bar、scatter、heatmap、pie、map 已接入首批命中。`showTooltip=false` 不会关闭事件；点级事件优先于空白图表级事件。`PieSelected` / `MapSelected` 是独立的选择状态变化事件。
+`ChartInteractionEvent` 的 `dataHit`、`elementType`、源 `dataIndex`、`dataName`、`value` 和可选 `numberValue/numberValueSet` 描述数据图元命中。散点还填充 `xValue/yValue`；屏幕位置仍由 `x/y` 表示。全部 `ChartElementType` 成员均有 renderer 接入：line/bar/scatter/heatmap/pie/map 数据点，Chord/Force/Sankey/Treemap/Sunburst 的 Node/Link，Bubbles 散点，Venn 的 VennCircle（0=A/1=B/2=交集），EventRiver 的 EventBand（稳定排序前的源下标），Radar 的 RadarAxis（轴下标），Funnel 的 FunnelStage，Finance 的 Candlestick/BoxPlot/ErrorBar，Gauge，WordCloud 的 WordTag。`showTooltip=false` 不会关闭事件；点级事件优先于空白图表级事件。`PieSelected` / `MapSelected` 是独立的选择状态变化事件。
 
 
 - static bool HasArea(ChartOption o)
