@@ -60,6 +60,10 @@ $zanArgs = @()
 $zanArgs += $files
 $zanArgs += @("-o", $outExe, "--subsystem", "windows")
 $zanArgs += @("--link-mode", "static", "--driver-dir", (Join-Path $root "build\static_driver"))
+# Demo/props/events catalog + map geometry + photos (assets/) travel inside
+# the exe; File.ReadAllText falls back to the embedded copy when the loose
+# file is not next to the binary (the single-file output has no siblings).
+$zanArgs += @("--embed", "examples\gui_gallery\assets=assets")
 $zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_gallery_gnu")
 $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_gen_gallery.o"))
 # Native Win32 backend needs only the system libs it imports directly (the

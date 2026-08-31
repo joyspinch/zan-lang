@@ -40,6 +40,10 @@ try {
     $zanArgs += $files
     $zanArgs += @("-DZAN_PROJECT_COMPONENTS")
     $zanArgs += @("-o", "build\gallery_test.exe", "--subsystem", "windows")
+    # Demo/props/events catalog + map geometry (assets/) travel inside the
+    # exe; File.ReadAllText falls back to the embedded copy when the loose
+    # file is not next to the binary.
+    $zanArgs += @("--embed", "examples\gui_gallery\assets=assets")
     $zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_gallery_gnu")
     # Native Win32 backend needs only the system libs it imports directly (the
     # runtime's #pragma libs: dwmapi/user32/gdi32/imm32) plus the reactor deps.

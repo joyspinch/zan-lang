@@ -11,11 +11,15 @@
 #     placeholder, while the demo written in RenderOverlay is never called.
 #     Compose and DataTable each lost a complete example this way.
 #
-#  2. A demo only appears if some Comp registers its preview id via AddDemo (or
-#     the single-card Gallery.Add / new Comp form, whose preview id is the
-#     component name). A render branch whose id nobody registers is dead code:
-#     Alert.types / Alert.queue were fully implemented and never shown, so the
-#     Alert page was a single placeholder card.
+#  2. A demo only appears if some Comp registers its preview id. Registration
+#     used to live in the source (AddDemo / Gallery.Add); the catalog is now
+#     data-driven -- assets/gallery.json carries every demo card, so the
+#     registered-id set comes from the pack's comps[].demos[].previewId plus
+#     the comp names themselves (a comp with a code box gets a synthesized
+#     "Basic usage" card whose preview id is the component name). A render
+#     branch whose id nobody registers is still dead code: Alert.types /
+#     Alert.queue were fully implemented and never shown, so the Alert page
+#     was a single placeholder card.
 #
 # Both failures look identical from the outside -- a page that renders, with an
 # empty box on it -- which is why they survived. Compare the lists here instead.
@@ -27,6 +31,10 @@ endif()
 set(_src "${ROOT}/examples/gui_gallery/gui_gallery.zan")
 if(NOT EXISTS "${_src}")
   message(FATAL_ERROR "missing ${_src}")
+endif()
+set(_pack "${ROOT}/examples/gui_gallery/assets/gallery.json")
+if(NOT EXISTS "${_pack}")
+  message(FATAL_ERROR "missing ${_pack} -- the demo catalog must ship with the source")
 endif()
 # Read line-by-line WITHOUT file(STRINGS) / per-line CMake lists: `;` is the
 # CMake list separator, so any source line containing one (statement
@@ -60,6 +68,43 @@ set(_overlay_branch "")
 set(_overlay_listed "")
 set(_all_branch "")
 set(_registered "")
+# The pack's registered ids mirror BuildComps + EffectiveDemos: a comp with
+# demo cards registers every demos[].previewId; a comp without any registers
+# its own name once (the synthesized "Basic usage" card, only for comps that
+# have a code box). Registered sets are checked for duplicates against the
+# EFFECTIVE ids -- a comp whose first demo card is "Basic usage" with preview
+# id == comp name is the same single card, not a collision; but two comps
+# (or two demos) claiming one id would fight over one renderer.
+file(READ "${_pack}" _pack_json)
+string(REPLACE "\r\n" "\n" _pack_json "${_pack_json}")
+string(JSON _comp_count LENGTH "${_pack_json}" comps)
+math(EXPR _comp_last "${_comp_count} - 1")
+if(_comp_last GREATER_EQUAL 0)
+  foreach(_ci RANGE 0 ${_comp_last})
+    string(JSON _cname GET "${_pack_json}" comps ${_ci} name)
+    string(JSON _demo_count LENGTH "${_pack_json}" comps ${_ci} demos)
+    if(_demo_count GREATER 0)
+      math(EXPR _demo_last "${_demo_count} - 1")
+      foreach(_di RANGE 0 ${_demo_last})
+        string(JSON _pid GET "${_pack_json}" comps ${_ci} demos ${_di} previewId)
+        list(APPEND _registered "${_pid}")
+      endforeach()
+    else()
+      string(JSON _has_code ERROR_VARIABLE _jerr GET "${_pack_json}" comps ${_ci} code)
+      if(NOT _jerr AND NOT _has_code STREQUAL "")
+        list(APPEND _registered "${_cname}")
+      else()
+        message(SEND_ERROR
+          "gallery.json: comp \"${_cname}\" has no demo cards and no code box "
+          "-- it would render nothing. Add demos or a code snippet.")
+      endif()
+    endif()
+  endforeach()
+endif()
+if(NOT _registered)
+  message(FATAL_ERROR "gallery.json parsed no comps -- the pack is broken, "
+                      "not the gallery")
+endif()
 set(_rem "${_content}")
 string(LENGTH "${_rem}" _rem_len)
 while(_rem_len GREATER 0)
@@ -78,26 +123,28 @@ while(_rem_len GREATER 0)
     set(_region "list")
   elseif(_l MATCHES "^    static void RenderOverlay\\(")
     set(_region "overlay")
+  elseif(_l MATCHES "^    static int RenderPreviewEx[(]")
+    set(_region "render")
   elseif(_l MATCHES "^    static (int|void|bool|string|Comp|Control|Panel|Flex) ")
-    if(_region STREQUAL "list" OR _region STREQUAL "overlay")
+    if(NOT _region STREQUAL "")
       set(_region "")
     endif()
   endif()
 
-  # Registered preview ids, from anywhere in the file.
-  if(_l MATCHES "\"([A-Za-z0-9_. ]+)\",[ \t]*[0-9]+,")
-    list(APPEND _registered "${CMAKE_MATCH_1}")
-  endif()
-  if(_l MATCHES "Gallery\\.Add(Json)?\\(list,[ \t]*\"[^\"]*\",[ \t]*\"([A-Za-z0-9_. ]+)\"")
-    list(APPEND _registered "${CMAKE_MATCH_2}")
-  endif()
-  if(_l MATCHES "new Comp\\(\"[^\"]*\",[ \t]*\"([A-Za-z0-9_. ]+)\"")
-    list(APPEND _registered "${CMAKE_MATCH_1}")
+  # Comment-only lines never name a real branch (the loader's comment above
+  # BuildComps mentions the dispatch idiom in prose); skip them before the
+  # regexes so a commented example does not register a phantom id.
+  if(_l MATCHES "^[ \t]*//" OR _l MATCHES "^[ \t]*\\*")
+    continue()
   endif()
 
   if(_l MATCHES "name == \"([A-Za-z0-9_. ]+)\"")
     set(_hit "${CMAKE_MATCH_1}")
-    list(APPEND _all_branch "${_hit}")
+    # Height tables (PreviewHeight etc.) key on the same ids but draw
+    # nothing -- only RenderPreviewEx / RenderOverlay are render dispatch.
+    if(NOT _region STREQUAL "")
+      list(APPEND _all_branch "${_hit}")
+    endif()
     if(_region STREQUAL "overlay")
       list(APPEND _overlay_branch "${_hit}")
     elseif(_region STREQUAL "list")
@@ -105,6 +152,27 @@ while(_rem_len GREATER 0)
     endif()
   endif()
 endwhile()
+
+# A duplicated preview id makes two cards fight over one renderer (and one
+# copy button). Copy first, then scan the copy: REMOVE_AT inside the loop
+# over the same list would otherwise drain it item by item.
+set(_reg_work "${_registered}")
+set(_dup 0)
+foreach(_n IN LISTS _registered)
+  list(FIND _reg_work "${_n}" _first)
+  list(REMOVE_AT _reg_work ${_first})
+  list(FIND _reg_work "${_n}" _again)
+  if(NOT _again EQUAL -1)
+    message(SEND_ERROR
+      "gallery.json: preview id \"${_n}\" is registered more than once -- two "
+      "demo cards would render the same branch. Rename one of them.")
+    set(_dup 1)
+  endif()
+endforeach()
+unset(_reg_work)
+if(_dup)
+  message(FATAL_ERROR "gallery demo wiring check failed")
+endif()
 
 foreach(_v _overlay_branch _overlay_listed _all_branch _registered)
   if(${_v})

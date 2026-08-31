@@ -2637,6 +2637,26 @@ SetProp 改 To 自动重摆；from==to 跑满 Duration 才触发；Duration≤0 
 `.separator`（按钮切换 ","↔""，改 Separator 不重摆）、`.locale`（俄语
 699 700,699）、`.callback`（结束后发消息）。`PreviewHeight` 补基础卡条目。
 
+### 目录外置化（assets/gallery.json）· 2026-08-31
+
+组件目录（分类/名称/描述/代码框/JSON 配置/属性表/事件表/演示卡，84 组件
+270 演示卡）全部外置到 `examples/gui_gallery/assets/gallery.json`；
+`BuildComps` 运行时 `JsonValue.Parse` 一次按 `Gallery.lang` 取双语侧，
+8 个 BuildXxx 构造器（约 2100 行）撤除，gui_gallery.zan 1.09MB → 0.67MB
+——剩余几乎全是渲染分发。`withBasicH` 复刻 `WithBasic`：15 个组件的
+「Basic usage」卡（previewId == 组件名）在包里显式落盘。policy
+`run_gallery_demo_wiring.cmake` 改从 JSON 包取注册集（`string(JSON)`
++ CRLF 归一），新增有效 id 唯一性断言与「无演示又无 code 框」断言；
+mcp seed `gui-gallery` 条目补包文件。构建脚本
+（build_gallery.ps1 / build_gallery_single.ps1）补
+`--embed examples/gui_gallery/assets=assets`；IDE 发布链路
+（CopyResources + StageEmbedArgs）本来就盖住 assets/。
+**已知问题（与本任务无关，HEAD 同样崩）**：`scripts/build_gallery.ps1`
+的手挑 stdlib 文件列表（Gui 顶层 + Widget）在并行会话给 stdlib 引入
+System.Json/Mqtt 等新依赖后已经建不动——`--no-gen` 下是干净的
+`'Json' is not a known namespace` 错误，开 gen 则编译器 0xC0000005；
+等 stdlib 依赖链收口后该脚本要么补文件要么改走 `--auto-stdlib`。
+
 ## 实测
 
 `zanc tests/gui/numberanimation_test.zan --auto-stdlib` → `numberanimation_test OK`；
