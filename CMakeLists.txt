@@ -615,6 +615,33 @@ endif()
 add_test(NAME runtime_sync COMMAND zanrt_sync_test)
 add_dependencies(zanc zanrt_sync_test)
 
+# DNS all-address resolution + binary CIDR classification for the
+# external-call transport: literals and localhost only, no public net.
+add_executable(zanrt_io_addr_test
+    tests/runtime/rt_io_addr_test.c
+    src/runtime/rt_io.c
+    src/runtime/rt_co.c
+    src/runtime/rt_timer.c
+)
+target_compile_definitions(zanrt_io_addr_test PRIVATE ZAN_IO_STACKLESS_ONLY)
+target_include_directories(zanrt_io_addr_test PRIVATE ${CMAKE_SOURCE_DIR})
+set_target_properties(zanrt_io_addr_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+)
+if(WIN32)
+    target_link_libraries(zanrt_io_addr_test PRIVATE ws2_32)
+else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(zanrt_io_addr_test PRIVATE Threads::Threads)
+    if(NOT APPLE)
+        target_link_libraries(zanrt_io_addr_test PRIVATE rt)
+    endif()
+endif()
+add_test(NAME runtime_io_addr COMMAND zanrt_io_addr_test)
+set_tests_properties(runtime_io_addr PROPERTIES TIMEOUT 30)
+add_dependencies(zanc zanrt_io_addr_test)
+
 # A hung-up peer (a closed SSE tab) must not kill the process with SIGPIPE.
 # POSIX only: Windows has no such signal.
 if(NOT WIN32)
@@ -2189,7 +2216,23 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_colorinject${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_flex conformance_gui_carousel conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable conformance_gui_css conformance_gui_props conformance_gui_tree conformance_gui_menu conformance_gui_webview_interop conformance_gui_colorinject conformance_gui_calendar conformance_gui_rate PROPERTIES
+  # SdlSpriteBatch renders the same scene twice through the SDL3 stdlib --
+  # once immediate-mode, once through the geometry batch -- and diffs the
+  # offscreen targets pixel by pixel. The software renderer fallback makes
+  # this runnable headlessly (hidden window); a box without any renderer
+  # skips cleanly. Also pins the batch's per-frame statistics contract
+  # (queued counts drawable sprites, the clip-state boundary splits runs,
+  # fully-clipped quads land in dropped).
+  add_test(NAME conformance_gui_spritebatch
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/spritebatch_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_spritebatch.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_spritebatch${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_flex conformance_gui_carousel conformance_gui_text conformance_gui_codeeditor conformance_gui_datatable conformance_gui_css conformance_gui_props conformance_gui_tree conformance_gui_menu conformance_gui_webview_interop conformance_gui_colorinject conformance_gui_spritebatch conformance_gui_calendar conformance_gui_rate PROPERTIES
     ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 

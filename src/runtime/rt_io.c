@@ -547,31 +547,114 @@ int32_t zan_io_sockaddr_family(const void *sa, int32_t len) {
     return 0;
 }
 
+/* Classify the binary address that will actually be connected to.  This is
+ * deliberately kept beside the resolver so literal and DNS paths share the
+ * same CIDR table; text-prefix checks are not sufficient for mapped IPv6 or
+ * alternate textual spellings.  Return 1 only for a usable public address,
+ * or an explicit loopback exception. */
+int32_t zan_io_sockaddr_is_safe(const void *sa, int32_t len,
+                               int32_t allow_loopback) {
+    int family = zan_io_sockaddr_family(sa, len);
+    if (family == AF_INET) {
+        const struct sockaddr_in *v4 = (const struct sockaddr_in *)sa;
+        uint32_t a = ntohl(v4->sin_addr.s_addr);
+        uint32_t first = a >> 24;
+        uint32_t second = (a >> 16) & 255u;
+        if (first == 127u) return allow_loopback ? 1 : 0;
+        if (first == 0u || first == 10u || first >= 224u || first >= 240u)
+            return 0;
+        if (first == 169u && second == 254u) return 0;
+        if (first == 172u && second >= 16u && second <= 31u) return 0;
+        if (first == 192u && second == 168u) return 0;
+        if (first == 192u && second == 0u) return 0;
+        uint32_t third = (a >> 8) & 255u;
+        if (first == 192u && second == 2u) return 0;
+        if (first == 192u && second == 88u && third == 99u) return 0;
+        if (first == 198u && second >= 18u && second <= 19u) return 0;
+        if (first == 198u && second == 51u && third == 100u) return 0;
+        if (first == 203u && second == 0u && third == 113u) return 0;
+        if (first == 100u && second >= 64u && second <= 127u) return 0;
+        if (a == 0xffffffffu) return 0;
+        return 1;
+    }
+    if (family == AF_INET6) {
+        const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)sa;
+        const unsigned char *b = (const unsigned char *)&v6->sin6_addr;
+        int all_zero = 1;
+        for (int i = 0; i < 16; i++) if (b[i] != 0) all_zero = 0;
+        if (all_zero) return 0;
+        int loop = 1;
+        for (int i = 0; i < 15; i++) if (b[i] != 0) loop = 0;
+        if (loop && b[15] == 1) return allow_loopback ? 1 : 0;
+        if ((b[0] & 0xfeu) == 0xfcu) return 0;       /* ULA fc00::/7 */
+        if ((b[0] & 0xfeu) == 0xfeu && (b[1] & 0xc0u) == 0x80u)
+            return 0;                                 /* link-local fe80::/10 */
+        if (b[0] == 0xffu) return 0;                  /* multicast */
+        if (b[0] == 0x20u && b[1] == 0x01u && b[2] == 0x0du
+            && b[3] == 0xb8u) return 0;               /* documentation */
+        int mapped = 1;
+        for (int i = 0; i < 10; i++) if (b[i] != 0) mapped = 0;
+        if (mapped && b[10] == 0xffu && b[11] == 0xffu) {
+            struct sockaddr_in mapped4;
+            memset(&mapped4, 0, sizeof(mapped4));
+            mapped4.sin_family = AF_INET;
+            memcpy(&mapped4.sin_addr, b + 12, 4);
+            return zan_io_sockaddr_is_safe(&mapped4,
+                (int32_t)sizeof(mapped4), allow_loopback);
+        }
+        return 1;
+    }
+    return 0;
+}
+
 int32_t zan_io_resolve_all(const char *name, int32_t port, void *buf,
                            int32_t cap) {
-    if (!name || !*name || !buf || cap < ZAN_IO_SA_STRIDE) return 0;
+    if (!buf || cap <= 0) return 0;
+    if (!name || !*name || cap < ZAN_IO_SA_STRIDE) {
+        memset(buf, 0, (size_t)cap);
+        return 0;
+    }
     char portstr[16];
     snprintf(portstr, sizeof(portstr), "%d", port);
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_ADDRCONFIG;
+    /* Do not set AI_ADDRCONFIG: it suppresses valid A or AAAA answers based
+     * on the local interface configuration, which would make the reviewed set
+     * differ between machines. The caller needs every resolver candidate. */
+    hints.ai_flags = 0;
     struct addrinfo *res = NULL;
     if (getaddrinfo(name, portstr, &hints, &res) != 0 || !res) {
-        /* AI_ADDRCONFIG can reject ::1 on hosts with no non-loopback v6. */
-        hints.ai_flags = 0;
-        if (getaddrinfo(name, portstr, &hints, &res) != 0 || !res) return 0;
+        memset(buf, 0, (size_t)cap);
+        return 0;
     }
+    int32_t capacity = cap / ZAN_IO_SA_STRIDE;
     int32_t count = 0;
-    for (struct addrinfo *p = res;
-         p && (count + 1) * ZAN_IO_SA_STRIDE <= cap; p = p->ai_next) {
-        int32_t len = zan_io_sockaddr_family(p->ai_addr,
-            (int32_t)p->ai_addrlen) == AF_INET6
-            ? (int32_t)sizeof(struct sockaddr_in6)
-            : zan_io_sockaddr_family(p->ai_addr, (int32_t)p->ai_addrlen) == AF_INET
-            ? (int32_t)sizeof(struct sockaddr_in) : 0;
+    for (struct addrinfo *p = res; p; p = p->ai_next) {
+        int32_t family = zan_io_sockaddr_family(p->ai_addr,
+            (int32_t)p->ai_addrlen);
+        int32_t len = family == AF_INET6 ? (int32_t)sizeof(struct sockaddr_in6)
+                     : family == AF_INET ? (int32_t)sizeof(struct sockaddr_in) : 0;
         if (!len || p->ai_addrlen < (size_t)len) continue;
+        /* Stable de-duplication also makes a resolver returning duplicate A/AAAA
+         * records unable to consume an unbounded number of caller slots. */
+        int duplicate = 0;
+        for (int32_t i = 0; i < count; i++) {
+            unsigned char *old = (unsigned char *)buf + i * ZAN_IO_SA_STRIDE;
+            int oldfam = zan_io_sockaddr_family(old, len);
+            if (oldfam == family && memcmp(old, p->ai_addr, (size_t)len) == 0) {
+                duplicate = 1; break;
+            }
+        }
+        if (duplicate) continue;
+        if (count >= capacity) {
+            /* Never return a partial reviewable set: the caller must either
+             * inspect every resolver answer or receive failure. */
+            memset(buf, 0, (size_t)cap);
+            freeaddrinfo(res);
+            return 0;
+        }
         unsigned char *dst = (unsigned char *)buf + count * ZAN_IO_SA_STRIDE;
         memset(dst, 0, ZAN_IO_SA_STRIDE);
         memcpy(dst, p->ai_addr, (size_t)len);

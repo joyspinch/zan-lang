@@ -483,9 +483,10 @@ class HttpDeadline {
         }
     }
 
-    /// <summary>为 token 重启时间窗口（每个请求调用一次）。</summary>
+    /// <summary>为 token 重启阶段窗口。阶段预算为非正值时仍保留
+    /// total deadline；不能因为关闭某一阶段而把总截止时间一并关闭。</summary>
     static void Touch(HttpDeadlineToken token, int timeoutMs) {
-        if (token == null || token.disarmed || timeoutMs <= 0) { return; }
+        if (token == null || token.disarmed) { return; }
         lock (slots) {
             if (token.disarmed || token.slot < 0 || token.slot >= slots.Count) { return; }
             HttpDeadlineSlot slot = slots[token.slot];
@@ -494,10 +495,21 @@ class HttpDeadline {
             // 的超时可能在 await 返回后被 Touch 清掉。
             if (slot.fired) { return; }
             nowMs = Stopwatch.GetMilliseconds();
-            long next = nowMs + timeoutMs;
-            if (slot.totalDeadline > 0 && next > slot.totalDeadline) {
+            // 在扫描器尚未轮到本槽位时也要观察到过期，避免一次迟到的
+            // 收包把已经耗尽的窗口重新推到未来。
+            if (nowMs >= slot.deadline) {
+                slot.deadline = nowMs + 3600000;
+                slot.fired = true;
+                Socket.ShutdownBoth(slot.sock);
+                return;
+            }
+            long next = 0;
+            if (timeoutMs > 0) { next = nowMs + timeoutMs; }
+            if (slot.totalDeadline > 0
+                && (next <= 0 || next > slot.totalDeadline)) {
                 next = slot.totalDeadline;
             }
+            if (next <= 0) { return; }
             slot.deadline = next;
             slot.fired = false;
         }

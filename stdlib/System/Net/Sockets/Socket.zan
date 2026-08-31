@@ -218,6 +218,10 @@ class Socket {
     [DllImport("crt", EntryPoint = "zan_io_sockaddr_family")]
     static extern int NativeSockAddrFamily(nint sa, int len);
 
+    [DllImport("crt", EntryPoint = "zan_io_sockaddr_is_safe")]
+    static extern int NativeSockAddrIsSafe(nint sa, int len,
+                                           int allowLoopback);
+
     [DllImport("crt", EntryPoint = "zan_io_connect_sa")]
     static extern long NativeConnectSockAddr(nint sock, nint sa, int len,
                                              int timeoutMs);
@@ -467,30 +471,38 @@ class Socket {
         return null;
     }
 
-    /// <summary>异步解析全部地址候选。返回固定 32 字节记录数组；每条
-    /// 记录前 16/28 字节为 sockaddr，其余清零。解析失败返回空数组，
-    /// 绝不伪造 0.0.0.0。</summary>
-    static async byte[] ResolveAllAsync(string host, int port, int maxCandidates) {
-        if (host == "" || maxCandidates <= 0) { return new byte[0]; }
-        if (maxCandidates > 32) { maxCandidates = 32; }
-        byte[] records = new byte[maxCandidates * 32];
-        // Convert the managed values to stable raw addresses before crossing the
-        // async boundary. NativeResolveAllAsync copies no managed state.
+    /// <summary>同步解析全部地址候选到调用方提供的固定缓冲区。
+    /// 每条记录占 32 字节，前 16/28 字节为 sockaddr，其余清零；返回
+    /// 候选数，失败返回 0。</summary>
+    static int ResolveAll(string host, int port, byte[] records) {
+        if (host == "" || records == null) { return 0; }
+        return Socket.NativeResolveAll(host, port, records, records.Length);
+    }
+
+    /// <summary>异步解析全部地址候选到调用方提供的固定缓冲区。返回候选
+    /// 数，失败返回 0；解析失败绝不伪造 0.0.0.0。</summary>
+    static async int ResolveAllAsync(string host, int port, byte[] records) {
+        if (host == "" || records == null || records.Length < 32) { return 0; }
+        // Convert managed values to stable raw addresses before crossing the
+        // async boundary. The frame retains host and records while the worker
+        // writes only within this caller-owned buffer.
         nint hostPtr = (nint)host;
         nint recordsPtr = (nint)records;
         long n = await Socket.NativeResolveAllAsync(hostPtr, port, recordsPtr,
                                                     records.Length);
-        if (n <= 0) { return new byte[0]; }
-        int used = (int)n * 32;
-        if (used > records.Length) { used = records.Length; }
-        byte[] exact = new byte[used];
-        for (int i = 0; i < used; i = i + 1) { exact[i] = records[i]; }
-        return exact;
+        if (n <= 0) { return 0; }
+        return (int)n;
     }
 
     static int SockAddrFamily(byte[] record, int len) {
         nint p = (nint)record;
         return Socket.NativeSockAddrFamily(p, len);
+    }
+
+    static bool SockAddrIsSafe(byte[] record, int len, bool allowLoopback) {
+        nint p = (nint)record;
+        return Socket.NativeSockAddrIsSafe(p, len,
+            allowLoopback ? 1 : 0) != 0;
     }
 
     static bool IsV6Family(int family) {
@@ -653,8 +665,6 @@ class Socket {
     /// 无法取消，因此截止时间只能由本协程拥有的定时器
     /// 观察。套接字留给调用方关闭。</summary>
     static async int ConnectAsync(nint sock, string ip, int port, int timeoutMs) {
-        int limit = timeoutMs;
-        if (limit <= 0) { limit = 120000; }
         byte[] addr = await Socket.BuildSockAddrAsync(ip, port);
         if (addr == null) {
             Socket.MarkResolveFailed(true);
@@ -663,7 +673,7 @@ class Socket {
         int family = Socket.SockAddrFamily(addr, addr.Length);
         if (family == 0) { return -1; }
         return await Socket.ConnectSockAddrAsync(sock, addr,
-            Socket.IsV6Family(family) ? 28 : 16, limit);
+            Socket.IsV6Family(family) ? 28 : 16, timeoutMs);
     }
 
 

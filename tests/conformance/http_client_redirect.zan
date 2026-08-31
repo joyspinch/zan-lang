@@ -1,0 +1,202 @@
+// Conformance: explicit HTTP redirect policy and per-hop request rules.
+//
+// The client returns 3xx unchanged by default. With an explicit local policy it
+// follows only strict absolute HTTP(S) targets, applies a hop limit and cycle
+// check, converts POST on 301/302/303 to an empty GET, rejects unsafe 307/308
+// replay, and removes sensitive headers when the origin changes.
+using System;
+using System.Net.External;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Net.Sockets;
+using System.Threading;
+
+class Program {
+    static int PORT_A = 9671;
+    static int PORT_B = 9672;
+    static string seenMethod = "";
+    static int seenBodyLength = -1;
+    static string seenAuthorization = "";
+    static string seenCookie = "";
+    static string seenTrace = "";
+
+    static string UrlA(string path) {
+        return "http://127.0.0.1:" + Convert.ToString(Program.PORT_A) + path;
+    }
+
+    static string UrlB(string path) {
+        return "http://127.0.0.1:" + Convert.ToString(Program.PORT_B) + path;
+    }
+
+    static HttpResponse RedirectTo(int code, string url) {
+        HttpResponse r = HttpResponse.WithStatus(code, "Redirect", "");
+        r.SetHeader("Location", url);
+        return r;
+    }
+
+    static async HttpResponse HandleA(HttpRequest req) {
+        if (req.path == "/start") {
+            return Program.RedirectTo(302, Program.UrlB("/final"));
+        }
+        if (req.path == "/chain1") {
+            return Program.RedirectTo(302, Program.UrlB("/chain2"));
+        }
+        if (req.path == "/relative") {
+            return Program.RedirectTo(302, "/final");
+        }
+        if (req.path == "/loop") {
+            return Program.RedirectTo(302, Program.UrlA("/loop"));
+        }
+        if (req.path == "/post301") {
+            return Program.RedirectTo(301, Program.UrlB("/post-final"));
+        }
+        if (req.path == "/post302") {
+            return Program.RedirectTo(302, Program.UrlB("/post-final"));
+        }
+        if (req.path == "/post303") {
+            return Program.RedirectTo(303, Program.UrlB("/post-final"));
+        }
+        if (req.path == "/post307") {
+            return Program.RedirectTo(307, Program.UrlB("/post-final"));
+        }
+        if (req.path == "/post308") {
+            return Program.RedirectTo(308, Program.UrlB("/post-final"));
+        }
+        return HttpResponse.NotFound();
+    }
+
+    static async HttpResponse HandleB(HttpRequest req) {
+        if (req.path == "/chain2") {
+            return Program.RedirectTo(302, Program.UrlB("/final"));
+        }
+        if (req.path == "/post-final") {
+            Program.seenMethod = req.method;
+            Program.seenBodyLength = req.body.Length;
+            Program.seenAuthorization = req.GetHeader("Authorization");
+            Program.seenCookie = req.GetHeader("Cookie");
+            Program.seenTrace = req.GetHeader("X-Trace");
+            return HttpResponse.Text("post-final");
+        }
+        if (req.path == "/final") {
+            Program.seenAuthorization = req.GetHeader("Authorization");
+            Program.seenCookie = req.GetHeader("Cookie");
+            Program.seenTrace = req.GetHeader("X-Trace");
+            return HttpResponse.Text("final");
+        }
+        return HttpResponse.NotFound();
+    }
+
+    static ExternalCallPolicy LocalRedirects(int hops) {
+        return ExternalCallPolicy.Default().AllowLocalHttp().Redirects(hops);
+    }
+
+    static bool Has(string text, string needle) {
+        return text != null && text.IndexOf(needle) >= 0;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer a = new HttpServer("127.0.0.1", Program.PORT_A);
+        HttpServer b = new HttpServer("127.0.0.1", Program.PORT_B);
+        a.OnRequest(Program.HandleA);
+        b.OnRequest(Program.HandleB);
+        Task.Spawn(a.Start());
+        Task.Spawn(b.Start());
+        await Task.Delay(100);
+
+        // No policy means no automatic redirect following.
+        HttpClient plain = new HttpClient("127.0.0.1", Program.PORT_A);
+        HttpResponse untouched = await plain.SendAsync("GET", "/start", "");
+        Console.WriteLine("default302=" + Convert.ToString(untouched.statusCode == 302)
+            + " location=" + Convert.ToString(
+                untouched.GetHeader("Location") == Program.UrlB("/final")));
+
+        // Explicit policy follows and strips Authorization/Cookie across ports,
+        // while retaining a non-sensitive diagnostic header.
+        HttpClient followed = new HttpClient("127.0.0.1", Program.PORT_A);
+        followed.SetCallPolicy(Program.LocalRedirects(2));
+        followed.SetHeader("Authorization", "Bearer secret");
+        followed.SetHeader("Cookie", "manual=secret");
+        followed.SetHeader("X-Trace", "redirect-test");
+        HttpResponse finalResp = await followed.SendAsync("GET", "/start", "");
+        Console.WriteLine("follow=" + Convert.ToString(finalResp.statusCode == 200)
+            + " body=" + finalResp.body
+            + " auth=" + Convert.ToString(Program.seenAuthorization.Length == 0)
+            + " cookie=" + Convert.ToString(Program.seenCookie.Length == 0)
+            + " trace=" + Convert.ToString(Program.seenTrace == "redirect-test"));
+
+        HttpClient oneHop = new HttpClient("127.0.0.1", Program.PORT_A);
+        oneHop.SetCallPolicy(Program.LocalRedirects(1));
+        HttpResponse limited = await oneHop.SendAsync("GET", "/chain1", "");
+        Console.WriteLine("hop1=" + Convert.ToString(limited.statusCode == 302)
+            + " target=" + Convert.ToString(
+                limited.GetHeader("Location") == Program.UrlB("/final")));
+
+        HttpClient twoHop = new HttpClient("127.0.0.1", Program.PORT_A);
+        twoHop.SetCallPolicy(Program.LocalRedirects(2));
+        HttpResponse chained = await twoHop.SendAsync("GET", "/chain1", "");
+        Console.WriteLine("hop2=" + Convert.ToString(chained.statusCode == 200)
+            + " body=" + chained.body);
+
+        HttpClient relative = new HttpClient("127.0.0.1", Program.PORT_A);
+        relative.SetCallPolicy(Program.LocalRedirects(1));
+        try {
+            HttpResponse _relative = await relative.SendAsync("GET", "/relative", "");
+            Console.WriteLine("relativeReject=no");
+        } catch (HttpRequestException e) {
+            Console.WriteLine("relativeReject=" + Convert.ToString(
+                Has(e.Message, "redirect target is invalid or repeated")));
+        }
+
+        HttpClient loop = new HttpClient("127.0.0.1", Program.PORT_A);
+        loop.SetCallPolicy(Program.LocalRedirects(4));
+        try {
+            HttpResponse _loop = await loop.SendAsync("GET", "/loop", "");
+            Console.WriteLine("loopReject=no");
+        } catch (HttpRequestException e2) {
+            Console.WriteLine("loopReject=" + Convert.ToString(
+                Has(e2.Message, "redirect target is invalid or repeated")));
+        }
+
+        HttpClient post = new HttpClient("127.0.0.1", Program.PORT_A);
+        post.SetCallPolicy(Program.LocalRedirects(1));
+        post.SetHeader("X-Trace", "post-test");
+        string _p301 = await post.PostAsync("/post301", "abc");
+        Console.WriteLine("post301=" + Convert.ToString(Program.seenMethod == "GET")
+            + "/" + Convert.ToString(Program.seenBodyLength == 0));
+        string _p302 = await post.PostAsync("/post302", "abc");
+        Console.WriteLine("post302=" + Convert.ToString(Program.seenMethod == "GET")
+            + "/" + Convert.ToString(Program.seenBodyLength == 0));
+        string _p303 = await post.PostAsync("/post303", "abc");
+        Console.WriteLine("post303=" + Convert.ToString(Program.seenMethod == "GET")
+            + "/" + Convert.ToString(Program.seenBodyLength == 0));
+
+        HttpClient unsafe307 = new HttpClient("127.0.0.1", Program.PORT_A);
+        unsafe307.SetCallPolicy(Program.LocalRedirects(1));
+        try {
+            string _u307 = await unsafe307.PostAsync("/post307", "abc");
+            Console.WriteLine("post307Reject=no");
+        } catch (HttpRequestException e3) {
+            Console.WriteLine("post307Reject=" + Convert.ToString(
+                Has(e3.Message, "unsafe redirect replay")));
+        }
+        HttpClient unsafe308 = new HttpClient("127.0.0.1", Program.PORT_A);
+        unsafe308.SetCallPolicy(Program.LocalRedirects(1));
+        try {
+            string _u308 = await unsafe308.PostAsync("/post308", "abc");
+            Console.WriteLine("post308Reject=no");
+        } catch (HttpRequestException e4) {
+            Console.WriteLine("post308Reject=" + Convert.ToString(
+                Has(e4.Message, "unsafe redirect replay")));
+        }
+
+        a.Stop();
+        b.Stop();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        return 0;
+    }
+
+    static async void Main() {
+        int _rc = await Program.Run();
+    }
+}

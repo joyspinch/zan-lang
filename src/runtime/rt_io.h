@@ -81,6 +81,11 @@ int64_t zan_io_resolve_all_async(intptr_t name_ptr, int32_t port,
 /* Return AF_INET / AF_INET6 for a binary sockaddr, or 0 for an invalid or
  * unsupported address. This keeps family classification out of Zan code. */
 int32_t zan_io_sockaddr_family(const void *sa, int32_t len);
+/* Return 1 only when the binary destination is public and routable. The
+ * explicit loopback exception is reserved for local test/development callers;
+ * all other special ranges (including mapped IPv4) are rejected. */
+int32_t zan_io_sockaddr_is_safe(const void *sa, int32_t len,
+                               int32_t allow_loopback);
 
 /* Start an exact sockaddr connect without resolving or rewriting the address.
  * Returns 0 when connected, -2 while in progress, or a positive platform
