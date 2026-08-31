@@ -1,0 +1,112 @@
+using System;
+
+namespace SDL3;
+
+/// <summary>
+/// 通用 2D 精灵批次（SdlRenderer geometry 批量路径）。
+///
+/// 立即模式 <see cref="SdlRenderer"/> 每个精灵一次原生调用；一次
+/// 帧画几千个带纹理四边形时，驱动开销按次数计。本类把四边形在
+/// CPU 侧累积（内存帧间复用、只增不减），<see cref="End"/> 对每段
+/// 相邻同纹理的 run 提交一次 SDL_RenderGeometryRaw。
+///
+/// 顺序语义：默认严格保持入队顺序（painter order）。同纹理的相邻
+/// 四边形合并进同一个 run——半透明叠加依赖的绘制顺序永远不会被打乱。
+///
+/// 坐标语义：与立即模式一致，经 <see cref="SdlRenderer.SetUiScale"/>
+/// 的超采样缩放在 Queue 内自动应用；裁剪矩形同样按逻辑单位传入。
+///
+/// 帧模型：
+///   SdlSpriteBatch b = SdlSpriteBatch.Create(renderer, 4096);
+///   loop:
+///     b.Begin();
+///     b.Queue(tex, dx, dy, dw, dh, sx, sy, sw, sh, r, g, bl, a);  // N 次
+///     b.End();
+///
+/// 纹理生命周期：批次不拥有纹理；调用方保证 End() 之前纹理有效，
+/// renderer 销毁前先 <see cref="Close"/> 批次。
+/// 统计：End() 后可用 <see cref="Queued"/>/<see cref="Vertices"/>/
+/// <see cref="Runs"/>/<see cref="Dropped"/> 读回，供性能回归。
+/// </summary>
+class SdlSpriteBatch {
+    nint handle;
+    SdlRenderer ren;
+    int queued;
+    int vertices;
+    int runs;
+    int dropped;
+
+    /// <summary>创建绑定到 renderer 的批次。capacity 是初始四边形
+    /// 容量（仅影响首次分配；超出后 native 侧按倍增增长）。</summary>
+    static SdlSpriteBatch Create(SdlRenderer renderer, int capacity) {
+        SdlSpriteBatch b = new SdlSpriteBatch();
+        b.ren = renderer;
+        b.handle = SdlNative.zan_sb_new(renderer.Handle(), capacity);
+        return b;
+    }
+
+    bool IsValid() { return this.handle != 0; }
+
+    /// <summary>开始一帧：只清计数，已分配内存全部复用。</summary>
+    void Begin() {
+        if (this.handle == 0) { return; }
+        SdlNative.zan_sb_begin(this.handle);
+    }
+
+    /// <summary>入队一个带纹理四边形（整幅纹理）。r/g/b/a 是 0-255
+    /// 的调制色；坐标是逻辑单位，超采样缩放在这里统一应用。</summary>
+    void Queue(SdlTexture texture, int x, int y, int w, int h,
+               int sx, int sy, int sw, int sh,
+               int r, int g, int bl, int a) {
+        if (this.handle == 0) { return; }
+        SdlNative.zan_sb_queue(this.handle, texture.Handle(),
+            this.ren.Sc(x), this.ren.Sc(y), this.ren.Sc(w), this.ren.Sc(h),
+            sx, sy, sw, sh, r, g, bl, a, -1, 0, 0, 0);
+    }
+
+    /// <summary>入队一个带裁剪的四边形。cx/cy/cw/ch 是逻辑单位的
+    /// 裁剪矩形：完全出框的四边形被丢弃并计入 Dropped；与裁剪框
+    /// 相交的 run 由 native 在 run 边界切换 renderer 裁剪状态。</summary>
+    void QueueClipped(SdlTexture texture, int x, int y, int w, int h,
+                      int sx, int sy, int sw, int sh,
+                      int r, int g, int bl, int a,
+                      int cx, int cy, int cw, int ch) {
+        if (this.handle == 0) { return; }
+        SdlNative.zan_sb_queue(this.handle, texture.Handle(),
+            this.ren.Sc(x), this.ren.Sc(y), this.ren.Sc(w), this.ren.Sc(h),
+            sx, sy, sw, sh, r, g, bl, a,
+            this.ren.Sc(cx), this.ren.Sc(cy), this.ren.Sc(cw), this.ren.Sc(ch));
+    }
+
+    /// <summary>提交本帧：按相邻同纹理 run 一次 SDL_RenderGeometryRaw。
+    /// 返回 false 表示至少一次提交失败（错误细节走 SDL_GetError）。
+    /// 提交结束后 renderer 裁剪状态恢复为无裁剪。</summary>
+    bool End() {
+        if (this.handle == 0) { return false; }
+        int ok = SdlNative.zan_sb_end(this.handle);
+        int sa = SdlNative.zan_sb_stats_a(this.handle);
+        int sbv = SdlNative.zan_sb_stats_b(this.handle);
+        this.queued = sa & 0xFFFF;
+        this.vertices = (sa >> 16) & 0xFFFF;
+        this.runs = sbv & 0xFFFF;
+        this.dropped = (sbv >> 16) & 0xFFFF;
+        return ok != 0;
+    }
+
+    /// <summary>本帧可画的精灵数（End 后有效）。</summary>
+    int Queued() { return this.queued; }
+    /// <summary>本帧提交的顶点数（每四边形 6 个）。</summary>
+    int Vertices() { return this.vertices; }
+    /// <summary>本帧的原生绘制调用数（同纹理 run 合并后）。</summary>
+    int Runs() { return this.runs; }
+    /// <summary>本帧被丢弃的精灵数（完全出框 / 尺寸非法）。</summary>
+    int Dropped() { return this.dropped; }
+
+    /// <summary>释放 native 批次内存。renderer 销毁前必须调用；
+    /// 之后本对象不再可用。</summary>
+    void Close() {
+        if (this.handle == 0) { return; }
+        SdlNative.zan_sb_free(this.handle);
+        this.handle = 0;
+    }
+}

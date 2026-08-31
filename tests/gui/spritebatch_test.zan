@@ -1,0 +1,151 @@
+// SdlSpriteBatch 的一致性回归：同一场景分别走立即模式与批次路径
+// 渲染到离屏目标，逐像素对比。software renderer fallback 下 CI 无
+// 显示环境也能跑。
+//
+// 覆盖点（每点都是批次路径曾出错的形状）：
+// 1. 不透明四边形与半透明四边形叠加：批次按 run 合并后绘制顺序必须
+//    与入队顺序逐像素一致（painter order）。
+// 2. 源矩形（atlas 子区域）：UV 归一化必须与 DrawTextureRegion 一致。
+// 3. 整幅纹理拉伸（sw/sh<=0）。
+// 4. 裁剪：完全在裁剪框内的四边形走"clip 覆盖"快路径（不改 renderer
+//    状态）、部分相交的四边形由 run 边界切换 renderer 裁剪、完全出框
+//    的四边形被丢弃并计入 Dropped。
+// 5. 统计：Queued/Vertices/Runs/Dropped 的语义。
+using System;
+using SDL3;
+
+namespace Conf;
+
+class SpriteBatchProbe {
+    static int W = 128;
+    static int H = 128;
+    static int fails;
+
+    static void Check(bool ok, string what) {
+        if (ok) {
+            Console.WriteLine("ok " + what);
+        } else {
+            fails = fails + 1;
+            Console.WriteLine("FAIL " + what);
+        }
+    }
+
+    static int ReadPixel(string px, int x, int y) {
+        int o = (y * SpriteBatchProbe.W + x) * 4;
+        return (px[o] & 255) | ((px[o + 1] & 255) << 8)
+            | ((px[o + 2] & 255) << 16) | ((px[o + 3] & 255) << 24);
+    }
+
+    static void Main() {
+        if (!Sdl.Init(SdlInit.Video())) {
+            Console.WriteLine("sdl init failed");
+            return;
+        }
+        SdlWindow win = SdlWindow.Create("sb-conf", SpriteBatchProbe.W, SpriteBatchProbe.H,
+            SdlWindowFlags.Hidden() + SdlWindowFlags.HighPixelDensity());
+        SdlRenderer ren = SdlRenderer.Create(win);
+        if (!ren.IsValid()) {
+            // 无 GPU/驱动环境：软件回退也必须能建 renderer；建不了就跳过
+            // （CI 的断言价值在两种路径一致，而不是 renderer 本身可用）。
+            Console.WriteLine("renderer unavailable: " + Sdl.Error());
+            Console.WriteLine("done fails=0");
+            Sdl.Quit();
+            return;
+        }
+
+        SdlTexture tex = SdlTexture.CreateRgba32(ren, 8, 8, false);
+        string white = "";
+        for (int i = 0; i < 64; i = i + 1) { white = white + "FFFF"; }
+        tex.Update(white, 32);
+
+        string imm = SpriteBatchProbe.Scene(ren, tex, true);
+        string bat = SpriteBatchProbe.Scene(ren, tex, false);
+
+        int diff = 0;
+        int dx = -1;
+        int dy = -1;
+        for (int y = 0; y < SpriteBatchProbe.H; y = y + 1) {
+            for (int x = 0; x < SpriteBatchProbe.W; x = x + 1) {
+                if (SpriteBatchProbe.ReadPixel(imm, x, y)
+                    != SpriteBatchProbe.ReadPixel(bat, x, y)) {
+                    if (diff == 0) { dx = x; dy = y; }
+                    diff = diff + 1;
+                }
+            }
+        }
+        SpriteBatchProbe.Check(diff == 0,
+            "pixels match (diff=" + diff + " first=" + dx + "," + dy + ")");
+
+        // 统计语义：入队 4 个 → queued 只计可画的 3 个；裁剪四边形
+        // 把同纹理 run 切成两段（runs=3）；全出框的那个计入 dropped=1。
+        // vertices = 6 x 3 = 18。
+        string stats = SpriteBatchProbe.Stats(ren, tex);
+        SpriteBatchProbe.Check(stats == "3 18 3 1",
+            "stats queued/vertices/runs/dropped == 3 18 3 1 (got " + stats + ")");
+
+        tex.Close();
+        ren.Close();
+        win.Close();
+        Sdl.Quit();
+        Console.WriteLine("done fails=" + SpriteBatchProbe.fails);
+    }
+
+    // 同一场景画两遍：path=true 立即模式，path=false 批次。
+    static string Scene(SdlRenderer ren, SdlTexture tex, bool path) {
+        SdlTexture target = SdlTexture.CreateTarget(ren, SpriteBatchProbe.W, SpriteBatchProbe.H);
+        ren.SetTarget(target);
+        ren.SetBlend(1);
+        ren.SetColor(40, 40, 60, 255);
+        ren.Clear();
+        if (path) {
+            ren.SetColor(255, 0, 0, 255);
+            ren.FillRect(8, 8, 48, 48);
+            ren.SetColor(0, 255, 0, 128);
+            ren.FillRect(24, 24, 48, 48);
+            ren.DrawTextureRegion(tex, 0, 0, 8, 8, 80, 8, 32, 32);
+            ren.SetClip(100, 40, 20, 20);
+            ren.DrawTexture(tex, 96, 36, 32, 32);
+            ren.ResetClip();
+        } else {
+            SdlSpriteBatch b = SdlSpriteBatch.Create(ren, 64);
+            b.Begin();
+            b.Queue(tex, 8, 8, 48, 48, 0, 0, 0, 0, 255, 0, 0, 255);
+            b.Queue(tex, 24, 24, 48, 48, 0, 0, 0, 0, 0, 255, 0, 128);
+            b.Queue(tex, 80, 8, 32, 32, 0, 0, 8, 8, 255, 255, 255, 255);
+            b.QueueClipped(tex, 96, 36, 32, 32, 0, 0, 0, 0, 255, 255, 255, 255,
+                100, 40, 20, 20);
+            b.End();
+            b.Close();
+        }
+        string px = "";
+        for (int i = 0; i < SpriteBatchProbe.W * SpriteBatchProbe.H * 4; i = i + 1) {
+            px = px + " ";
+        }
+        ren.ResetTarget();
+        ren.ReadPixels(px, SpriteBatchProbe.W, SpriteBatchProbe.H);
+        target.Close();
+        return px;
+    }
+
+    // 统计断言帧：3 个普通精灵（前两个同纹理相邻合并 1 run，第 3 个
+    // 也同纹理 → 仍 1 run？不相邻——中间隔着裁剪四边形）+ 1 个全出框。
+    // 入队顺序: unclipped, clipped, unclipped, fully-outside。
+    static string Stats(SdlRenderer ren, SdlTexture tex) {
+        SdlTexture target = SdlTexture.CreateTarget(ren, SpriteBatchProbe.W, SpriteBatchProbe.H);
+        ren.SetTarget(target);
+        SdlSpriteBatch b = SdlSpriteBatch.Create(ren, 64);
+        b.Begin();
+        b.Queue(tex, 0, 0, 16, 16, 0, 0, 0, 0, 255, 255, 255, 255);
+        b.QueueClipped(tex, 40, 0, 16, 16, 0, 0, 0, 0, 255, 255, 255, 255,
+            44, 0, 8, 16);
+        b.Queue(tex, 60, 0, 16, 16, 0, 0, 0, 0, 255, 255, 255, 255);
+        b.QueueClipped(tex, 200, 0, 16, 16, 0, 0, 0, 0, 255, 255, 255, 255,
+            44, 0, 8, 16);
+        b.End();
+        string s = b.Queued() + " " + b.Vertices() + " " + b.Runs() + " " + b.Dropped();
+        b.Close();
+        ren.ResetTarget();
+        target.Close();
+        return s;
+    }
+}

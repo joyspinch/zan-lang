@@ -1559,3 +1559,244 @@ ZAN_SDL_API const char *zan_gpu_shader_format(zan_iptr handle) {
     if (f & SDL_GPU_SHADERFORMAT_PRIVATE) return "private";
     return "invalid";
 }
+
+
+/* ===================================================================
+ * SDL_Renderer sprite batch (SdlSpriteBatch).
+ *
+ * The immediate-mode SdlRenderer issues one native call per sprite; a
+ * 2D game drawing thousands of textured quads per frame pays driver
+ * overhead for each. This bridge accumulates quads on the CPU in
+ * memory that is reused across frames (grow-only), then End() submits
+ * one SDL_RenderGeometryRaw per *run* of same-texture quads. Painter
+ * order is preserved -- runs are only merged between adjacent quads
+ * sharing a texture, so translucent layering can never reorder.
+ *
+ * Frame model:
+ *   b = zan_sb_new(renderer, capacity)
+ *   loop:
+ *     zan_sb_begin(b)                    // reset counters, keep memory
+ *     zan_sb_queue(b, tex, dst, src, tint, clip)   // N times
+ *     zan_sb_end(b)                      // submit runs
+ *
+ * Coordinates are in *renderer* space (the Zan side applies the same
+ * Sc() scaling as immediate mode before queueing). Clip state is
+ * captured per quad at queue time: SDL_RenderGeometryRaw honors
+ * SDL_SetRenderClipRect, so End() switches the clip only at run
+ * boundaries and restores the caller's state afterwards.
+ * =================================================================== */
+
+typedef struct { float x, y; SDL_FColor col; float u, v; } ZanSbVertex;
+typedef struct { SDL_Texture *tex; int first; int count; } ZanSbRun;
+typedef struct {
+    SDL_Texture *tex;
+    float dx, dy, dw, dh;     /* destination rect */
+    float u0, v0, u1, v1;     /* normalized source rect */
+    float r, g, b, a;         /* tint */
+    int clip;                 /* 0 = unclipped, 1 = clip active */
+    float cl, ct, cr2, cb2;   /* clip rect when clip == 1 */
+} ZanSbCmd;
+
+typedef struct {
+    SDL_Renderer *ren;
+    ZanSbCmd *cmds;  int ccount, ccap;
+    ZanSbVertex *verts; int vcap;      /* worst case 6 * ccap */
+    ZanSbRun *runs;    int rcount, rcap;
+    /* statistics readable after End() */
+    int queued;      /* sprites accepted this frame */
+    int vertices;    /* vertices submitted this frame */
+    int runs_used;   /* draw calls submitted this frame */
+    int dropped;     /* sprites skipped (fully clipped / invalid) */
+} ZanSbCtx;
+
+ZAN_SDL_API zan_iptr zan_sb_new(zan_iptr renderer, zan_i32 capacity) {
+    SDL_Renderer *ren = (SDL_Renderer *)zan_ptr(renderer);
+    if (!ren) return 0;
+    if (capacity < 64) capacity = 64;
+    ZanSbCtx *b = (ZanSbCtx *)SDL_calloc(1, sizeof(ZanSbCtx));
+    if (!b) return 0;
+    b->ren = ren;
+    b->ccap = capacity;
+    b->vcap = capacity * 6;
+    b->cmds = (ZanSbCmd *)SDL_malloc(sizeof(ZanSbCmd) * (size_t)b->ccap);
+    b->verts = (ZanSbVertex *)SDL_malloc(sizeof(ZanSbVertex) * (size_t)b->vcap);
+    b->rcap = 16;
+    b->runs = (ZanSbRun *)SDL_malloc(sizeof(ZanSbRun) * (size_t)b->rcap);
+    if (!b->cmds || !b->verts || !b->runs) {
+        SDL_free(b->cmds); SDL_free(b->verts); SDL_free(b->runs);
+        SDL_free(b);
+        return 0;
+    }
+    return zan_handle(b);
+}
+
+ZAN_SDL_API void zan_sb_free(zan_iptr handle) {
+    ZanSbCtx *b = (ZanSbCtx *)zan_ptr(handle);
+    if (!b) return;
+    SDL_free(b->cmds);
+    SDL_free(b->verts);
+    SDL_free(b->runs);
+    SDL_free(b);
+}
+
+ZAN_SDL_API void zan_sb_begin(zan_iptr handle) {
+    ZanSbCtx *b = (ZanSbCtx *)zan_ptr(handle);
+    if (!b) return;
+    b->ccount = 0;
+    b->queued = 0; b->vertices = 0; b->runs_used = 0; b->dropped = 0;
+}
+
+/* Queue one textured quad. Coordinates are already in renderer space;
+ * source rect (sx, sy, sw, sh) is in texture pixels, sw/sh <= 0 means
+ * the whole texture. clip = (-1, ...) disables clipping for this quad;
+ * otherwise the rect is the renderer-space clip the quad must respect. */
+ZAN_SDL_API void zan_sb_queue(
+    zan_iptr handle, zan_iptr texture,
+    zan_i32 dx, zan_i32 dy, zan_i32 dw, zan_i32 dh,
+    zan_i32 sx, zan_i32 sy, zan_i32 sw, zan_i32 sh,
+    zan_i32 r, zan_i32 g, zan_i32 bl, zan_i32 a,
+    zan_i32 clip_x, zan_i32 clip_y, zan_i32 clip_w, zan_i32 clip_h) {
+    ZanSbCtx *b = (ZanSbCtx *)zan_ptr(handle);
+    SDL_Texture *tex = (SDL_Texture *)zan_ptr(texture);
+    if (!b || !tex) return;
+    if (dw <= 0 || dh <= 0) { b->dropped++; return; }
+
+    int clipped = clip_x >= 0;
+    if (clipped) {
+        if (dx + dw <= (float)clip_x || (float)dx >= (float)(clip_x + clip_w) ||
+            dy + dh <= (float)clip_y || (float)dy >= (float)(clip_y + clip_h)) {
+            b->dropped++;
+            return;
+        }
+        if ((float)clip_x <= dx && (float)clip_y <= dy &&
+            (float)(clip_x + clip_w) >= dx + dw &&
+            (float)(clip_y + clip_h) >= dy + dh) {
+            clipped = 0;   /* clip covers the quad entirely */
+        }
+    }
+
+    if (b->ccount + 1 > b->ccap) {
+        int ncap = b->ccap * 2;
+        ZanSbCmd *nc = (ZanSbCmd *)SDL_realloc(b->cmds, sizeof(ZanSbCmd) * (size_t)ncap);
+        ZanSbVertex *nv = (ZanSbVertex *)SDL_realloc(b->verts, sizeof(ZanSbVertex) * (size_t)ncap * 6);
+        if (!nc || !nv) {
+            if (nc) { b->cmds = nc; }
+            if (nv) { b->verts = nv; }
+            b->dropped++;
+            return;
+        }
+        b->cmds = nc; b->verts = nv; b->ccap = ncap; b->vcap = ncap * 6;
+    }
+    ZanSbCmd *c = &b->cmds[b->ccount];
+    c->tex = tex;
+    c->dx = (float)dx; c->dy = (float)dy; c->dw = (float)dw; c->dh = (float)dh;
+    float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
+    if (sw > 0 && sh > 0) {
+        float fw = 0.0f, fh = 0.0f;
+        if (SDL_GetTextureSize(tex, &fw, &fh) && fw > 0.0f && fh > 0.0f) {
+            u0 = (float)sx / fw; v0 = (float)sy / fh;
+            u1 = (float)(sx + sw) / fw; v1 = (float)(sy + sh) / fh;
+        }
+    }
+    c->u0 = u0; c->v0 = v0; c->u1 = u1; c->v1 = v1;
+    c->r = (float)r / 255.0f; c->g = (float)g / 255.0f;
+    c->b = (float)bl / 255.0f; c->a = (float)a / 255.0f;
+    c->clip = clipped;
+    if (clipped) {
+        c->cl = (float)clip_x; c->ct = (float)clip_y;
+        c->cr2 = (float)(clip_x + clip_w); c->cb2 = (float)(clip_y + clip_h);
+    }
+    b->ccount++;
+    b->queued++;
+}
+
+ZAN_SDL_API zan_i32 zan_sb_end(zan_iptr handle) {
+    ZanSbCtx *b = (ZanSbCtx *)zan_ptr(handle);
+    if (!b) return 0;
+    /* Build vertices + runs. Runs merge adjacent quads with the same
+     * texture AND the same clip state (a clip change must flush so the
+     * renderer's clip rect can follow). */
+    int vused = 0;
+    b->rcount = 0;
+    for (int i = 0; i < b->ccount; i++) {
+        ZanSbCmd *c = &b->cmds[i];
+        float x0 = c->dx, y0 = c->dy, x1 = c->dx + c->dw, y1 = c->dy + c->dh;
+        ZanSbVertex *v = &b->verts[vused];
+        v[0].x = x0; v[0].y = y0; v[0].col.r = c->r; v[0].col.g = c->g; v[0].col.b = c->b; v[0].col.a = c->a;
+        v[0].u = c->u0; v[0].v = c->v0;
+        v[1].x = x1; v[1].y = y0; v[1].col.r = c->r; v[1].col.g = c->g; v[1].col.b = c->b; v[1].col.a = c->a;
+        v[1].u = c->u1; v[1].v = c->v0;
+        v[2].x = x0; v[2].y = y1; v[2].col.r = c->r; v[2].col.g = c->g; v[2].col.b = c->b; v[2].col.a = c->a;
+        v[2].u = c->u0; v[2].v = c->v1;
+        v[3] = v[2];
+        v[4] = v[1];
+        v[5].x = x1; v[5].y = y1; v[5].col.r = c->r; v[5].col.g = c->g; v[5].col.b = c->b; v[5].col.a = c->a;
+        v[5].u = c->u1; v[5].v = c->v1;
+
+        int merged = 0;
+        if (b->rcount > 0) {
+            ZanSbRun *last = &b->runs[b->rcount - 1];
+            ZanSbCmd *first = &b->cmds[last->first / 6];
+            if (last->tex == c->tex && first->clip == c->clip) {
+                last->count += 6;
+                merged = 1;
+            }
+        }
+        if (!merged) {
+            if (b->rcount + 1 > b->rcap) {
+                b->rcap *= 2;
+                ZanSbRun *nr = (ZanSbRun *)SDL_realloc(b->runs, sizeof(ZanSbRun) * (size_t)b->rcap);
+                if (!nr) { vused += 6; continue; }
+                b->runs = nr;
+            }
+            ZanSbRun *run = &b->runs[b->rcount++];
+            run->tex = c->tex; run->first = vused; run->count = 6;
+        }
+        vused += 6;
+    }
+    /* Submit per run, switching the clip only when it changes. */
+    int cur_clip = -1;
+    int ok = 1;
+    for (int i = 0; i < b->rcount; i++) {
+        ZanSbRun *run = &b->runs[i];
+        ZanSbCmd *first = &b->cmds[run->first / 6];
+        if (first->clip != cur_clip) {
+            SDL_Rect rect;
+            if (first->clip) {
+                rect.x = (int)first->cl; rect.y = (int)first->ct;
+                rect.w = (int)(first->cr2 - first->cl);
+                rect.h = (int)(first->cb2 - first->ct);
+                SDL_SetRenderClipRect(b->ren, &rect);
+            } else {
+                SDL_SetRenderClipRect(b->ren, NULL);
+            }
+            cur_clip = first->clip;
+        }
+        if (!SDL_RenderGeometryRaw(b->ren, run->tex,
+                &b->verts[run->first].x, (int)sizeof(ZanSbVertex),
+                &b->verts[run->first].col, (int)sizeof(ZanSbVertex),
+                &b->verts[run->first].u, (int)sizeof(ZanSbVertex),
+                run->count, NULL, 0, 0)) {
+            ok = 0;
+        }
+    }
+    /* The batch never leaves the renderer clipped: immediate-mode calls
+     * that follow must not inherit a clip the batch set internally. */
+    if (cur_clip != -1) { SDL_SetRenderClipRect(b->ren, NULL); }
+    b->vertices = vused;
+    b->runs_used = b->rcount;
+    return ok;
+}
+
+/* Statistics after End(), two fields packed per call:
+ * stats_a = (vertices << 16) | queued, stats_b = (dropped << 16) | runs. */
+ZAN_SDL_API zan_i32 zan_sb_stats_a(zan_iptr handle) {
+    ZanSbCtx *b = (ZanSbCtx *)zan_ptr(handle);
+    if (!b) return 0;
+    return (zan_i32)((b->queued & 0xFFFF) | ((b->vertices & 0xFFFF) << 16));
+}
+ZAN_SDL_API zan_i32 zan_sb_stats_b(zan_iptr handle) {
+    ZanSbCtx *b = (ZanSbCtx *)zan_ptr(handle);
+    if (!b) return 0;
+    return (zan_i32)((b->runs_used & 0xFFFF) | ((b->dropped & 0xFFFF) << 16));
+}

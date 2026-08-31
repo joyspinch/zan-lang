@@ -44,6 +44,9 @@ class Program {
 - process lifecycle, errors, version and timing;
 - windows, size, title, visibility and fullscreen;
 - renderer creation, VSync, logical presentation and primitive drawing;
+- SdlSpriteBatch: geometry-batched sprite submission over the renderer
+  (reused vertex memory, same-texture run merging, painter order preserved,
+  per-quad clip, per-frame statistics);
 - RGBA32 streaming/static textures, PNG/JPEG loading with preserved Alpha,
   legacy BMP loading, texture regions, render targets, color/alpha modulation
   and blend modes;
