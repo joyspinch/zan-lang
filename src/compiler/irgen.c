@@ -2345,7 +2345,13 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     g->string_literal_count = g->string_literal_cap = 0;
     if (g->builder) LLVMDisposeBuilder(g->builder);
     if (g->mod) LLVMDisposeModule(g->mod);
-    if (g->ctx) LLVMContextDispose(g->ctx);
+    /* Keep the context alive past main(): its ~LLVMContextImpl frees LiveInfo
+     * and assorted caches, and the CRT exit table runs its own dtor over a
+     * separate garbage-pImpl static that frees cross-linked users first — a
+     * second full teardown double-frees that graph (c0000005, TASKS.md A80).
+     * The leak is bounded and a compiler is short-lived; correctness first. */
+    /* if (g->ctx) LLVMContextDispose(g->ctx); */
+    if (g->ctx) g->ctx = NULL;
     free(g->functions);
     g->functions = NULL;
     g->function_count = 0;

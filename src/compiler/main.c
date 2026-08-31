@@ -4604,6 +4604,13 @@ int main(int argc, char **argv) {
     zan_irgen_destroy(&irgen);
     zan_arena_free(arena);
     free(source);
+    /* LLVM statics registered in the CRT exit table (an LLVMContext teardown
+     * thunk at LLVMStopMultithreaded+0x10 over a static context whose pImpl is
+     * garbage) fault with c0000005 in ~LLVMContextImpl after the whole compile
+     * has churned the heap, even though the output was fully written (TASKS.md
+     * A80). llvm_shutdown clears the ManagedStatic registry the exit path
+     * would otherwise walk, so common_exit tears down nothing. */
+    LLVMShutdown();
     return 0;
 }
 

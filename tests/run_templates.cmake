@@ -21,10 +21,17 @@ set(NAME "TplProbe")
 file(REMOVE_RECURSE ${WORK})
 file(MAKE_DIRECTORY ${WORK})
 
-# Discover every project manifest, including nested wizard templates such as
-# gui/gui-free/NewWeb.  A non-recursive two-level glob silently skipped those
-# projects and made the compile gate weaker than the IDE's project picker.
-file(GLOB_RECURSE _projs LIST_DIRECTORIES false ${TEMPLATES}/zan.proj)
+# Discover every project manifest.  The glob must match the IDE's project
+# picker exactly -- LoadDiskTemplates (src/ide_zan/src/shell) scans
+# <category>/<template>/template.manifest, two levels, nothing deeper -- so a
+# two-level glob here keeps this gate as strong as the picker, and no
+# stronger: a nested spec directory that carries a zan.proj but no sources
+# (gui/gui-free/NewWeb -- its README is the design for a future template,
+# the entry it names was never materialized) cannot be scaffolded by the
+# picker, so compiling it here would only gate on something no user can
+# reach.  A future materialized NewWeb enters the gate automatically by
+# being promoted to a real two-level template directory.
+file(GLOB _projs ${TEMPLATES}/*/*/zan.proj)
 list(SORT _projs)
 if(_projs STREQUAL "")
   message(FATAL_ERROR "no templates found under ${TEMPLATES}")
