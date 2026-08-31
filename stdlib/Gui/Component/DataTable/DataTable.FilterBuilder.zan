@@ -1,0 +1,216 @@
+using System;
+
+namespace Gui.Component.DataTable;
+
+/// 程序化组合筛选（Filter Builder）。与每列独立的 ColFilter
+/// 弹层筛选正交：FilterGroup 是一棵 AND/OR 嵌套树，挂到
+/// state 上后 Recompute 在逐列筛选之外整体求值——同组条件
+/// 按组连接词合并，子组作为单个操作数递归参与。
+///
+/// 典型用法：
+/// ```zan
+/// FilterGroup root = FilterGroup.And();
+/// FilterGroup or = FilterGroup.Or();
+/// or.Conditions().Add(FilterCondition.Greater("price", "100"));
+/// or.Conditions().Add(FilterCondition.Equals("grade", "A"));
+/// root.Groups().Add(or);
+/// root.Conditions().Add(FilterCondition.Equals("region", "EU"));
+/// DataTable.SetFilterTree(st, root);
+/// ```
+///
+/// 条件按列 field 名寻址（列重排/插删后仍指向同一业务列）；
+/// 未注册 field 的条件视为不匹配（该行被拒），防止拼写错误
+/// 静默放行全部数据。
+class FilterCondition {
+    /// 条件运算：0 Contains，1 Equals（不区分大小写），
+    /// 2 NotEquals，3 Greater，4 GreaterOrEqual，5 Less，
+    /// 6 LessOrEqual，7 Between（含端点），8 IsEmpty，
+    /// 9 IsNotEmpty，10 StartsWith，11 EndsWith
+    int op;
+    string field;
+    string valueA;
+    string valueB;
+
+    FilterCondition(int conditionOp, string fieldName, string a, string b) {
+        this.op = conditionOp;
+        this.field = fieldName;
+        this.valueA = a;
+        this.valueB = b;
+    }
+
+    static FilterCondition Of(int op, string field, string a, string b) {
+        if (a == null) { a = ""; }
+        if (b == null) { b = ""; }
+        return new FilterCondition(op, field, a, b);
+    }
+
+    /// 文本包含（不区分大小写）。
+    static FilterCondition Contains(string field, string value) {
+        return FilterCondition.Of(0, field, value, "");
+    }
+
+    /// 相等（不区分大小写）。
+    static FilterCondition Equals(string field, string value) {
+        return FilterCondition.Of(1, field, value, "");
+    }
+
+    static FilterCondition NotEquals(string field, string value) {
+        return FilterCondition.Of(2, field, value, "");
+    }
+
+    /// 数值大于（非法数值按 0 处理）。
+    static FilterCondition Greater(string field, string value) {
+        return FilterCondition.Of(3, field, value, "");
+    }
+
+    static FilterCondition GreaterOrEqual(string field, string value) {
+        return FilterCondition.Of(4, field, value, "");
+    }
+
+    static FilterCondition Less(string field, string value) {
+        return FilterCondition.Of(5, field, value, "");
+    }
+
+    static FilterCondition LessOrEqual(string field, string value) {
+        return FilterCondition.Of(6, field, value, "");
+    }
+
+    /// 数值区间，含两端。
+    static FilterCondition Between(string field, string lo, string hi) {
+        return FilterCondition.Of(7, field, lo, hi);
+    }
+
+    /// 文本为空（Trim 后）。
+    static FilterCondition IsEmpty(string field) {
+        return FilterCondition.Of(8, field, "", "");
+    }
+
+    static FilterCondition IsNotEmpty(string field) {
+        return FilterCondition.Of(9, field, "", "");
+    }
+
+    static FilterCondition StartsWith(string field, string value) {
+        return FilterCondition.Of(10, field, value, "");
+    }
+
+    static FilterCondition EndsWith(string field, string value) {
+        return FilterCondition.Of(11, field, value, "");
+    }
+
+    int Op() { return this.op; }
+    string Field() { return this.field; }
+    string ValueA() { return this.valueA; }
+    string ValueB() { return this.valueB; }
+}
+
+/// AND/OR 组：`and` 为 true 时子条件与子组全部通过才通过，
+/// 为 false 时任一通过即通过。空组恒通过（AND 的单位元），
+/// 因此空 AND 组外层不会误杀全部行。
+class FilterGroup {
+    bool and;
+    List<FilterCondition> conditions;
+    List<FilterGroup> groups;
+
+    FilterGroup(bool isAnd) {
+        this.and = isAnd;
+        this.conditions = new List<FilterCondition>();
+        this.groups = new List<FilterGroup>();
+    }
+
+    /// 全部条件与子组取交集。
+    static FilterGroup And() { return new FilterGroup(true); }
+
+    /// 任一条件或子组通过即通过。
+    static FilterGroup Or() { return new FilterGroup(false); }
+
+    /// 组连接词：true = AND，false = OR。
+    bool IsAnd() { return this.and; }
+
+    List<FilterCondition> Conditions() { return this.conditions; }
+
+    List<FilterGroup> Groups() { return this.groups; }
+}
+
+partial class DataTable {
+    /// 挂接（或 null 清除）组合筛选树。改动即失效显示模型，
+    /// 与 SetFilter 等入口一致。
+    static void SetFilterTree(DataTableState st, FilterGroup root) {
+        st.filterTree = root;
+        DataTable.InvalidateQuery(st);
+    }
+
+    /// 当前组合筛选树（未挂接时 null）。
+    static FilterGroup FilterTreeOf(DataTableState st) {
+        return st.filterTree;
+    }
+
+    /// 组合筛选树是否有内容（null 或空组均为 false）。
+    static bool HasFilterTree(DataTableState st) {
+        return st.filterTree != null && DataTable.GroupHasContent(st.filterTree);
+    }
+
+    static bool GroupHasContent(FilterGroup g) {
+        if (g == null) { return false; }
+        return g.Conditions().Count > 0 || g.Groups().Count > 0;
+    }
+
+    /// 组求值：AND 组全过才过，OR 组一过即过。空组恒通过。
+    static bool GroupPasses(DataTableState st, FilterGroup g, List<DataColumn> cols,
+                            DataSource src, int row, int today) {
+        if (!DataTable.GroupHasContent(g)) { return true; }
+        int n = g.Conditions().Count;
+        for (int i = 0; i < n; i = i + 1) {
+            bool pass = DataTable.ConditionPasses(g.Conditions()[i], cols, src, row);
+            if (g.and && !pass) { return false; }
+            if (!g.and && pass) { return true; }
+        }
+        int gn = g.Groups().Count;
+        for (int i = 0; i < gn; i = i + 1) {
+            bool pass = DataTable.GroupPasses(st, g.Groups()[i], cols, src, row, today);
+            if (g.and && !pass) { return false; }
+            if (!g.and && pass) { return true; }
+        }
+        // AND 走到此处意味着全部通过；OR 意味着全部失败。
+        return g.and;
+    }
+
+    /// 条件求值。条件按 field 名找列；找不到的列按"不匹配"
+    /// 处理——拼错的 field 不应静默放行。
+    static bool ConditionPasses(FilterCondition c, List<DataColumn> cols,
+                                DataSource src, int row) {
+        int colIdx = -1;
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            if (cols[i].field == c.Field()) { colIdx = i; break; }
+        }
+        if (colIdx < 0) { return false; }
+        string v = src.CellText(row, colIdx);
+        if (v == null) { v = ""; }
+        int op = c.Op();
+        if (op == 8) { return DataTable.TrimSpace(v).Length == 0; }
+        if (op == 9) { return DataTable.TrimSpace(v).Length > 0; }
+        if (op == 0) { return DataTable.ContainsCI(v, c.ValueA()); }
+        if (op == 10) { return DataTable.StartsCI(v, c.ValueA()); }
+        if (op == 11) { return DataTable.EndsCI(v, c.ValueA()); }
+        if (op == 1) { return DataTable.EqCI(v, c.ValueA()); }
+        if (op == 2) { return !DataTable.EqCI(v, c.ValueA()); }
+        // 3..7 数值比较：数值解析失败（空文本等）按不匹配处理，
+        // 与比较筛选对纯数字的解释一致。
+        double a = DataTable.ParseReal(c.ValueA());
+        double b = DataTable.ParseReal(c.ValueB());
+        double x = DataTable.ParseReal(v);
+        if (op == 3) { return x > a; }
+        if (op == 4) { return x >= a; }
+        if (op == 5) { return x < a; }
+        if (op == 6) { return x <= a; }
+        if (op == 7) { return x >= a && x <= b; }
+        return false;
+    }
+
+    /// 行是否通过组合筛选树（Recompute 在逐列筛选之后调用）。
+    /// 未挂接树时恒真。
+    static bool RowPassesFilterTree(DataTableState st, List<DataColumn> cols,
+                                    DataSource src, int row, int today) {
+        if (!DataTable.HasFilterTree(st)) { return true; }
+        return DataTable.GroupPasses(st, st.filterTree, cols, src, row, today);
+    }
+}

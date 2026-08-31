@@ -1,0 +1,134 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace DataTableFilterTreeTest;
+
+class Program {
+    static DataRow Row(string id, string region, string price, string grade) {
+        DataRow row = new DataRow();
+        row.Push(id);
+        row.Push(region);
+        row.Push(price);
+        row.Push(grade);
+        return row;
+    }
+
+    static string Dump(DataSource src, DataTableState st) {
+        string s = "";
+        for (int i = 0; i < DataTable.DispCount(st); i = i + 1) {
+            s = s + src.CellText(DataTable.DispRowOf(st, i), 0) + " ";
+        }
+        return s;
+    }
+
+    static void Main() {
+        // 数据：a(EU,100,A) b(EU,50,B) c(US,200,C) d(APAC,30,A)
+        List<DataRow> rows = new List<DataRow>();
+        rows.Add(Program.Row("a", "EU", "100", "A"));
+        rows.Add(Program.Row("b", "EU", "50", "B"));
+        rows.Add(Program.Row("c", "US", "200", "C"));
+        rows.Add(Program.Row("d", "APAC", "30", "A"));
+        LocalDataSource src = new LocalDataSource(rows);
+
+        List<DataColumn> cols = new List<DataColumn>();
+        cols.Add(DataColumn.Field(new DataColumn("Id", 70), "id"));
+        cols.Add(DataColumn.Field(new DataColumn("Region", 80), "region"));
+        cols.Add(DataColumn.Field(DataColumn.Numeric("Price", 80), "price"));
+        cols.Add(DataColumn.Field(new DataColumn("Grade", 70), "grade"));
+
+        DataTableState st = new DataTableState();
+        DataTable.EnsureInit(st, cols, src);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("base=" + (Dump(src, st) == "a b c d "));
+
+        // ---- AND 组：region=EU AND price>40 ----
+        FilterGroup root = FilterGroup.And();
+        root.Conditions().Add(FilterCondition.Equals("region", "EU"));
+        root.Conditions().Add(FilterCondition.Greater("price", "40"));
+        DataTable.SetFilterTree(st, root);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("and=" + (Dump(src, st) == "a b "));
+
+        // ---- OR 组：region=APAC OR grade=A ----
+        FilterGroup or = FilterGroup.Or();
+        or.Conditions().Add(FilterCondition.Equals("region", "APAC"));
+        or.Conditions().Add(FilterCondition.Equals("grade", "A"));
+        DataTable.SetFilterTree(st, or);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("or=" + (Dump(src, st) == "a d "));
+
+        // ---- 嵌套：AND( region=EU, OR( price>150, grade=B ) ) ----
+        // a EU 但内组双否 -> 出；b EU 且 grade=B -> 入。
+        FilterGroup nested = FilterGroup.And();
+        nested.Conditions().Add(FilterCondition.Equals("region", "EU"));
+        FilterGroup inner = FilterGroup.Or();
+        inner.Conditions().Add(FilterCondition.Greater("price", "150"));
+        inner.Conditions().Add(FilterCondition.Equals("grade", "B"));
+        nested.Groups().Add(inner);
+        DataTable.SetFilterTree(st, nested);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("nested=" + (Dump(src, st) == "b "));
+
+        // ---- Between 含端点 ----
+        FilterGroup bt = FilterGroup.And();
+        bt.Conditions().Add(FilterCondition.Between("price", "40", "150"));
+        DataTable.SetFilterTree(st, bt);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("between=" + (Dump(src, st) == "a b "));
+
+        // ---- 未知 field 拒绝该行（防拼写错误静默放行） ----
+        bt.Conditions().Add(FilterCondition.Equals("nope", "x"));
+        DataTable.SetFilterTree(st, bt);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("unknownField=" + (Dump(src, st) == ""));
+
+        // ---- 文本族：StartsWith/EndsWith/IsEmpty/IsNotEmpty/NotEquals ----
+        FilterGroup text = FilterGroup.And();
+        text.Conditions().Add(FilterCondition.StartsWith("id", "a"));
+        DataTable.SetFilterTree(st, text);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("startsWith=" + (Dump(src, st) == "a "));
+        FilterGroup text2 = FilterGroup.And();
+        text2.Conditions().Add(FilterCondition.EndsWith("id", "c"));
+        DataTable.SetFilterTree(st, text2);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("endsWith=" + (Dump(src, st) == "c "));
+        FilterGroup text3 = FilterGroup.Or();
+        text3.Conditions().Add(FilterCondition.IsEmpty("grade"));
+        text3.Conditions().Add(FilterCondition.NotEquals("region", "EU"));
+        DataTable.SetFilterTree(st, text3);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("notEu=" + (Dump(src, st) == "c d "));
+        FilterGroup ne = FilterGroup.And();
+        ne.Conditions().Add(FilterCondition.NotEquals("grade", "A"));
+        DataTable.SetFilterTree(st, ne);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("notEquals=" + (Dump(src, st) == "b c "));
+
+        // ---- 空组是 AND 单位元（不筛任何行）；null 清除 ----
+        DataTable.SetFilterTree(st, FilterGroup.And());
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("emptyGroup=" + (DataTable.HasFilterTree(st) == false
+            && Dump(src, st) == "a b c d "));
+        DataTable.SetFilterTree(st, null);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("cleared=" + (DataTable.FilterTreeOf(st) == null
+            && Dump(src, st) == "a b c d "));
+
+        // ---- 与逐列弹层筛选共存：AND 语义 ----
+        // 菜单隐藏 EU/APAC（只剩 US=c），树 price>100 -> c。
+        FilterGroup ft = FilterGroup.And();
+        ft.Conditions().Add(FilterCondition.Greater("price", "100"));
+        DataTable.SetFilterTree(st, ft);
+        st.filters[1].Toggle("EU");
+        st.filters[1].Toggle("APAC");
+        st.dirty = true;
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("coexist=" + (Dump(src, st) == "c "));
+        st.filters[1].Reset();
+        DataTable.SetFilterTree(st, null);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("reset=" + (Dump(src, st) == "a b c d "));
+    }
+}

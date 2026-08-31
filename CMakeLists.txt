@@ -492,6 +492,31 @@ if(ZAN_BUILD_GUI)
     if(WIN32)
         add_library(zan_gui SHARED src/runtime/gui_runtime.c)
         target_link_libraries(zan_gui PRIVATE user32 gdi32 dwmapi shcore imm32 ole32)
+        # zanc's bundled GNU ld cannot read the MSVC zan_gui.lib the linker
+        # emits, and --driver-dir points the [DllImport("zan_gui")] lookup at
+        # this directory (templates_build, Gui conformance), so generate the
+        # GNU import lib here from the DLL's own export table. Regenerating on
+        # every link keeps it in step with newly added exports — a stale copy
+        # made GUI programs fail with "undefined reference to zan_gui_*" for
+        # symbols the committed bundle predated. llvm-dlltool ships with the
+        # LLVM the toolchain already requires; when absent the committed
+        # stdlib/Gui/drivers/win-x64/libzan_gui.dll.a still resolves (the
+        # build script scripts/build_gui_driver.ps1 refreshes it).
+        find_program(ZAN_LLVM_DLLTOOL llvm-dlltool)
+        if(ZAN_LLVM_DLLTOOL)
+            # llvm-dlltool needs a .def; the linker does not write one, so
+            # derive it from the DLL's export table with llvm-objdump.
+            find_program(ZAN_LLVM_OBJDUMP llvm-objdump)
+            if(ZAN_LLVM_OBJDUMP)
+                add_custom_command(TARGET zan_gui POST_BUILD
+                    COMMAND ${CMAKE_COMMAND}
+                            -DZAN_OBJDUMP=${ZAN_LLVM_OBJDUMP}
+                            -DDLL=$<TARGET_FILE:zan_gui>
+                            -DOUT=$<TARGET_FILE_DIR:zan_gui>/libzan_gui.dll.a
+                            -P ${CMAKE_SOURCE_DIR}/cmake/zan_dll_import_lib.cmake
+                    VERBATIM)
+            endif()
+        endif()
         # Embedded WebView needs nothing here: the Edge WebView2 backend is
         # written in Zan (stdlib/Gui/WebView2.zan) against its COM interfaces,
         # and resolves WebView2Loader.dll (shipped in the zan_gui driver
@@ -1997,6 +2022,15 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_tree.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_tree${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  add_test(NAME conformance_gui_datatable_filtertree
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_filtertree_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_filtertree.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_filtertree${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # The property protocol (Props() specs -> Control.GetProp/SetProp) is what
