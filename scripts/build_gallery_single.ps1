@@ -28,7 +28,12 @@ if ($LASTEXITCODE -ne 0) { throw "RUNTIME_COMPILE_FAILED" }
 clang --target=x86_64-w64-windows-gnu -O2 `
     -c src\runtime\zan_embed_api.c -o build\zan_embed_api.o
 if ($LASTEXITCODE -ne 0) { throw "EMBED_API_COMPILE_FAILED" }
-llvm-ar rcs build\libzan_gui_gallery_gnu.a build\zan_gui_gallery_gnu.o build\zan_embed_api.o
+# irgen emits zan_rt_guard_fail2/soft_note2 (guard-string dedup, dda956d3)
+# from rt_timer.c; the archive must carry it or guard sites fail to link.
+clang --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
+    -c src\runtime\rt_timer.c -o build\zan_gui_gallery_timer_gnu.o
+if ($LASTEXITCODE -ne 0) { throw "TIMER_COMPILE_FAILED" }
+llvm-ar rcs build\libzan_gui_gallery_gnu.a build\zan_gui_gallery_gnu.o build\zan_embed_api.o build\zan_gui_gallery_timer_gnu.o
 if ($LASTEXITCODE -ne 0) { throw "RUNTIME_LIB_FAILED" }
 
 # ---- bake the skin packs (base.css + skins) into the exe -----------------
@@ -39,10 +44,20 @@ Write-Output "[2/4] Embedding skin packs (base.css + all skins) ..."
 if ($LASTEXITCODE -ne 0) { throw "EMBED_GEN_FAILED" }
 
 # ---- static driver dir so zanc's --link-mode static resolves zan_gui ----
+# --driver-dir REPLACES the per-module stdlib driver dirs for every driver
+# the program links, not just zan_gui. The net stack reached from the
+# gallery's Image.url demo (HttpClient -> TlsStream [DllImport("ssl")]) owns
+# static OpenSSL archives under stdlib\System\Net\Tls; stage them too, or
+# the static link finds no libssl.a inside the override dir and dies on
+# -lssl (single-file publish broken).
 $staticDriver = Join-Path $root "build\static_driver\static"
 New-Item -ItemType Directory -Path $staticDriver -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $root "build\libzan_gui_gallery_gnu.a") `
     -Destination (Join-Path $staticDriver "libzan_gui.a") -Force
+$sslStatic = Join-Path $root "stdlib\System\Net\Tls\drivers\win-x64\static"
+if (Test-Path $sslStatic) {
+    Copy-Item -Path (Join-Path $sslStatic "*") -Destination $staticDriver -Force
+}
 
 # ---- compile + link through zanc (its own bundled ld) --------------------
 Write-Output "[3/4] Compiling and linking gui_gallery (static, single file) ..."
@@ -59,6 +74,9 @@ $outExe = Join-Path $outDir "gui_gallery.exe"
 $zanArgs = @()
 $zanArgs += $files
 $zanArgs += @("-o", $outExe, "--subsystem", "windows")
+# Optimized release: -Os + strip + --gc-sections (zanc --publish semantics),
+# without it the exe keeps the -O0 debug-build size.
+$zanArgs += @("--publish")
 $zanArgs += @("--link-mode", "static", "--driver-dir", (Join-Path $root "build\static_driver"))
 # Demo/props/events catalog + map geometry + photos (assets/) travel inside
 # the exe; File.ReadAllText falls back to the embedded copy when the loose
@@ -73,8 +91,13 @@ $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")
 $zanArgs += @("--link-lib", "dwmapi", "--link-lib", "gdi32", "--link-lib", "imm32")
 $zanArgs += @("--link-lib", "user32", "--link-lib", "rpcrt4")
 $zanArgs += @("--icon", (Join-Path (Get-Location) "assets\zan.ico"))
+# EAP=Stop makes PowerShell promote zanc's stderr *notes* (redirected via
+# 2>&1) into terminating NativeCommandErrors, killing the script mid-link
+# and orphaning the zanc process. Downgrade around the native call.
+$ErrorActionPreference = "Continue"
 $out = & build\zanc.exe @zanArgs 2>&1
 $code = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
 if ($code -ne 0) {
     $out | Select-Object -Last 40
     throw "GALLERY_LINK_FAILED code=$code"

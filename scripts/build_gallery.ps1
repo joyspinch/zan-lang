@@ -18,7 +18,12 @@ try {
     clang --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
         -c src\runtime\gui_runtime.c -o build\zan_gui_gallery_gnu.o
     if ($LASTEXITCODE -ne 0) { throw "RUNTIME_COMPILE_FAILED" }
-    llvm-ar rcs build\libzan_gui_gallery_gnu.a build\zan_gui_gallery_gnu.o
+    # irgen emits zan_rt_guard_fail2/soft_note2 (guard-string dedup, dda956d3)
+    # from rt_timer.c; the archive must carry it or guard sites fail to link.
+    clang --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
+        -c src\runtime\rt_timer.c -o build\zan_gui_gallery_timer_gnu.o
+    if ($LASTEXITCODE -ne 0) { throw "TIMER_COMPILE_FAILED" }
+    llvm-ar rcs build\libzan_gui_gallery_gnu.a build\zan_gui_gallery_gnu.o build\zan_gui_gallery_timer_gnu.o
     if ($LASTEXITCODE -ne 0) { throw "RUNTIME_LIB_FAILED" }
 
     Write-Output "[2/3] Scanning custom components..."
