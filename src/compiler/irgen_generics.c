@@ -1124,16 +1124,167 @@ static void emit_fatal_report(zan_irgen_t *g, LLVMValueRef text, int exit_code) 
  * emits both and the branch picks. That keeps the test-suite's exit(70)
  * semantics verifiable on the same binary that a production service runs
  * soft by default. Runtime checks off = neither path exists. */
-static void emit_guard_report(zan_irgen_t *g, LLVMValueRef text, zan_loc_t loc,
-                              const char *msg) {
-    (void)loc; (void)msg; /* the location is already baked into text */
+/* Compose `prefix` + `msg` into a per-function scratch buffer and return the
+ * buffer pointer. The buffer is one entry-block alloca per function (cached
+ * on the irgen state, invalidated per function), so a guard inside a loop
+ * reuses the same stack slot instead of growing the frame per firing; the
+ * hard path needs a single contiguous pointer for printf and for the
+ * RaiseException crash record (the filter resumes the same thread
+ * synchronously, so a stack buffer is valid at raise time). */
+static LLVMValueRef emit_guard_compose(zan_irgen_t *g, LLVMValueRef prefix_gv,
+                                       LLVMValueRef msg_gv) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    if (g->guard_buf_fn != g->current_fn) {
+        LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
+        /* The buffer alloca must sit in the entry block (a guard inside a
+         * loop reuses one stack slot instead of growing the frame per
+         * firing) but BEFORE the entry's existing instructions -- appending
+         * at its end would land behind the entry terminator. Position the
+         * builder before the first instruction, or at the (still empty)
+         * entry's end, then restore the caller's insertion point. */
+        LLVMValueRef entry = LLVMGetEntryBasicBlock(g->current_fn);
+        if (entry) {
+            LLVMValueRef first = LLVMGetFirstInstruction(entry);
+            if (first) LLVMPositionBuilderBefore(g->builder, first);
+            else LLVMPositionBuilderAtEnd(g->builder, entry);
+        }
+        LLVMTypeRef buf_ty = LLVMArrayType(LLVMInt8TypeInContext(g->ctx), 1400);
+        LLVMValueRef slot = LLVMBuildAlloca(g->builder, buf_ty, "rt.buf");
+        g->guard_buf_fn = g->current_fn;
+        g->guard_buf_alloca = slot;
+        if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+    }
+    LLVMValueRef buf = g->guard_buf_alloca;
+    LLVMValueRef bp = LLVMBuildBitCast(g->builder, buf, i8ptr, "rt.buf.p");
+    LLVMTypeRef cty = LLVMFunctionType(i8ptr,
+                                       (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
+    LLVMValueRef cpy = LLVMGetNamedFunction(g->mod, "strcpy");
+    if (!cpy) cpy = LLVMAddFunction(g->mod, "strcpy", cty);
+    LLVMValueRef cat = LLVMGetNamedFunction(g->mod, "strcat");
+    if (!cat) cat = LLVMAddFunction(g->mod, "strcat", cat);
+    LLVMValueRef s1[] = { bp, prefix_gv };
+    zan_call2(g->builder, cty, cpy, s1, 2, "rt.cp");
+    LLVMValueRef s2[] = { bp, msg_gv };
+    zan_call2(g->builder, cty, cat, s2, 2, "rt.cc");
+    return bp;
+}
+
+/* Hard path of a guard report: print the composed text, flush, then (Windows)
+ * raise the fault-message exception so the crash filter records it, and
+ * exit. `text` must be a pointer valid at raise time — a stack buffer works
+ * because the filter resumes the same thread synchronously. */
+static void emit_guard_hard(zan_irgen_t *g, LLVMValueRef text, int exit_code) {
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%s", "fatal_fmt");
+    LLVMValueRef pargs[] = { fmt, text };
+    zan_call2(g->builder, g->printf_type, g->fn_printf, pargs, 2, "");
+
+    if (g->target_is_windows) {
+        /* Insurance for an image whose filter never got installed: there the
+         * raise ends the process, and buffered stdout would be dropped along
+         * with the message we just printed. */
+        LLVMTypeRef fl_ty = LLVMFunctionType(i32t, &i8p, 1, 0);
+        LLVMValueRef fl = LLVMGetNamedFunction(g->mod, "fflush");
+        if (!fl) fl = LLVMAddFunction(g->mod, "fflush", fl_ty);
+        LLVMValueRef nullp = LLVMConstPointerNull(i8p);
+        zan_call2(g->builder, fl_ty, fl, &nullp, 1, "");
+
+        /* RaiseException(code, flags=0 i.e. continuable, 2, {text, exit}):
+         * the filter logs the record and resumes here, so the exit() below
+         * still runs -- same exit status, same atexit reports as before. */
+        LLVMTypeRef re_args[] = { i32t, i32t, i32t, LLVMPointerType(i64t, 0) };
+        LLVMTypeRef re_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                             re_args, 4, 0);
+        LLVMValueRef re = LLVMGetNamedFunction(g->mod, "RaiseException");
+        if (!re) re = LLVMAddFunction(g->mod, "RaiseException", re_ty);
+        LLVMValueRef slots = LLVMBuildArrayAlloca(g->builder, i64t,
+            LLVMConstInt(i32t, 2, 0), "fatalargs");
+        LLVMValueRef vals[2] = {
+            LLVMBuildPtrToInt(g->builder, text, i64t, "fatalmsg"),
+            LLVMConstInt(i64t, (unsigned long long)exit_code, 0)
+        };
+        for (int i = 0; i < 2; i++) {
+            LLVMValueRef idx = LLVMConstInt(i32t, (unsigned long long)i, 0);
+            LLVMValueRef slot = LLVMBuildGEP2(g->builder, i64t, slots, &idx, 1,
+                                              "fatalslot");
+            LLVMBuildStore(g->builder, vals[i], slot);
+        }
+        LLVMValueRef cargs[] = { LLVMConstInt(i32t, ZAN_RT_FAULT_MESSAGE, 0),
+                                 LLVMConstInt(i32t, 0, 0),
+                                 LLVMConstInt(i32t, 2, 0), slots };
+        zan_call2(g->builder, re_ty, re, cargs, 4, "");
+    }
+    LLVMValueRef code = LLVMConstInt(i32t, (unsigned long long)exit_code, 0);
+    zan_call2(g->builder, g->exit_type, g->fn_exit, &code, 1, "");
+    LLVMBuildUnreachable(g->builder);
+}
+
+/* Guard report over the split (prefix, msg) globals: soft mode calls
+ * zan_rt_soft_note2 (deduped per site by the prefix pointer, composed in the
+ * runtime); hard mode composes into `text` (a per-guard scratch buffer) and
+ * prints/raises/exits. */
+/* Guard report over the split (prefix, msg) globals: soft mode calls
+ * zan_rt_soft_note2 (deduped per site by the prefix pointer, composed in the
+ * runtime); hard mode composes into the per-function scratch buffer and
+ * prints/raises/exits. */
+static void emit_guard_report2(zan_irgen_t *g, LLVMValueRef prefix_gv,
+                               LLVMValueRef msg_gv,
+                               zan_loc_t loc, const char *msg);
+/* Guard report over a single merged-text global: the cross-target fallback
+ * (the committed per-target runtime objects may predate zan_rt_soft_note2).
+ * Same split as emit_guard_report2 but the soft path passes the whole text
+ * to the one-arg zan_rt_soft_note. */
+static void emit_guard_report_merged(zan_irgen_t *g, LLVMValueRef text);
+static void emit_guard_report2(zan_irgen_t *g, LLVMValueRef prefix_gv,
+                               LLVMValueRef msg_gv,
+                               zan_loc_t loc, const char *msg) {
+    (void)loc; (void)msg;
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
 
-    /* Which path runs is a runtime decision read once per process, so the
-     * same binary serves the test suite (ZAN_RT_HARD=1 -> exit(70), what
-     * tests/runtime pins) and production services (default -> log once and
-     * keep running with a default value). */
+    LLVMTypeRef ishard_ty = LLVMFunctionType(i32t, NULL, 0, 0);
+    LLVMValueRef ishard_fn = LLVMGetNamedFunction(g->mod, "zan_rt_soft_is_hard");
+    if (!ishard_fn) ishard_fn = LLVMAddFunction(g->mod, "zan_rt_soft_is_hard",
+                                                ishard_ty);
+    LLVMValueRef hard = zan_call2(g->builder, ishard_ty, ishard_fn, NULL, 0,
+                                  "rt.hard");
+
+    LLVMTypeRef note2_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                            (LLVMTypeRef[]){ i8p, i8p }, 2, 0);
+    LLVMValueRef note2_fn = LLVMGetNamedFunction(g->mod, "zan_rt_soft_note2");
+    if (!note2_fn) note2_fn = LLVMAddFunction(g->mod, "zan_rt_soft_note2",
+                                              note2_ty);
+
+    LLVMBasicBlockRef hard_bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->current_fn, "rt.hardpath");
+    LLVMBasicBlockRef soft_cont_bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->current_fn, "rt.softcont");
+    LLVMBuildCondBr(g->builder,
+                    zan_icmp(g->builder, LLVMIntNE, hard,
+                             LLVMConstInt(i32t, 0, 0), "rt.hardcmp"),
+                    hard_bb, soft_cont_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, hard_bb);
+    /* Compose prefix+msg into the per-function scratch buffer so printf and
+     * the crash-log raise both see one contiguous string. */
+    LLVMValueRef hard_text = emit_guard_compose(g, prefix_gv, msg_gv);
+    emit_guard_hard(g, hard_text, 70); /* never returns */
+
+    LLVMPositionBuilderAtEnd(g->builder, soft_cont_bb);
+    LLVMValueRef n2args[] = { prefix_gv, msg_gv };
+    zan_call2(g->builder, note2_ty, note2_fn, n2args, 2, "");
+}
+
+/* Guard report over a single merged-text global: the cross-target fallback
+ * (the committed per-target runtime objects may predate zan_rt_soft_note2).
+ * Same split as emit_guard_report2 but the soft path passes the whole text
+ * to the one-arg zan_rt_soft_note. */
+static void emit_guard_report_merged(zan_irgen_t *g, LLVMValueRef text) {
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+
     LLVMTypeRef ishard_ty = LLVMFunctionType(i32t, NULL, 0, 0);
     LLVMValueRef ishard_fn = LLVMGetNamedFunction(g->mod, "zan_rt_soft_is_hard");
     if (!ishard_fn) ishard_fn = LLVMAddFunction(g->mod, "zan_rt_soft_is_hard",
@@ -1156,7 +1307,7 @@ static void emit_guard_report(zan_irgen_t *g, LLVMValueRef text, zan_loc_t loc,
                     hard_bb, soft_cont_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, hard_bb);
-    emit_fatal_report(g, text, 70); /* never returns */
+    emit_guard_hard(g, text, 70); /* never returns */
 
     LLVMPositionBuilderAtEnd(g->builder, soft_cont_bb);
     zan_call2(g->builder, note_ty, note_fn, &text, 1, "");
@@ -1195,17 +1346,45 @@ static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
                                zan_loc_t loc, const char *msg) {
     if (!g->runtime_checks || !g->current_fn) return;
 
+    /* Cross targets link the committed per-target runtime objects, which may
+     * predate zan_rt_soft_note2 -- fall back to the self-contained merged
+     * text there (one interned global per site, knife-1 sizes). */
+    if (!g->rt_guard_split) {
+        LLVMBasicBlockRef bad_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.bad");
+        LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.cont");
+        LLVMBuildCondBr(g->builder, is_error, bad_bb, cont_bb);
+        LLVMPositionBuilderAtEnd(g->builder, bad_bb);
+        char buf[640];
+        const char *file0 = loc_site_file(g, loc);
+        snprintf(buf, sizeof(buf), "%s:%u:%u: runtime error: %s\n",
+                 file0, loc.line, loc.col, msg);
+        LLVMValueRef text0 = zan_irgen_intern_string(g, buf);
+        emit_guard_report_merged(g, text0);
+        LLVMBuildBr(g->builder, cont_bb);
+        LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+        return;
+    }
+
     LLVMBasicBlockRef bad_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.bad");
     LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.cont");
     LLVMBuildCondBr(g->builder, is_error, bad_bb, cont_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, bad_bb);
-    char buf[640];
+    /* Split storage: the prefix ("Gui/App.zan:818:40: runtime error: ") is
+     * unique per guard site while the message is one of a few hundred shared
+     * templates (780 distinct messages covered 56% of gallery guard bytes).
+     * Interning them separately stores each message once; the two are joined
+     * at report time -- soft mode composes inside zan_rt_soft_note2, hard
+     * mode into the per-function scratch buffer. */
     const char *file = loc_site_file(g, loc);
-    snprintf(buf, sizeof(buf), "%s:%u:%u: runtime error: %s\n",
-             file, loc.line, loc.col, msg);
-    LLVMValueRef text = zan_irgen_intern_string(g, buf);
-    emit_guard_report(g, text, loc, msg);
+    char pbuf[640];
+    snprintf(pbuf, sizeof(pbuf), "%s:%u:%u: runtime error: ",
+             file, loc.line, loc.col);
+    char mbuf[320];
+    snprintf(mbuf, sizeof(mbuf), "%s\n", msg);
+    LLVMValueRef prefix_gv = zan_irgen_intern_string(g, pbuf);
+    LLVMValueRef msg_gv = zan_irgen_intern_string(g, mbuf);
+    emit_guard_report2(g, prefix_gv, msg_gv, loc, msg);
     /* The report leaves the builder in its soft continuation (hard mode
      * never returns), so route it into the join block. */
     LLVMBuildBr(g->builder, cont_bb);
@@ -1219,14 +1398,24 @@ static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
  * once and continues -- the caller joins done_bb with a 0-length answer. */
 static void emit_string_null_report(zan_irgen_t *g, LLVMValueRef payload,
                                     zan_loc_t loc) {
-    char buf[160];
+    if (!g->rt_guard_split) {
+        char buf[160];
+        const char *file0 = loc_site_file(g, loc);
+        snprintf(buf, sizeof(buf),
+                 "%s:%u:%u: runtime error: null reference where a string/byte "
+                 "buffer is required (length probe)\n",
+                 file0, loc.line, loc.col);
+        emit_guard_report_merged(g, zan_irgen_intern_string(g, buf));
+        return;
+    }
     const char *file = loc_site_file(g, loc);
-    snprintf(buf, sizeof(buf),
-             "%s:%u:%u: runtime error: null reference where a string/byte "
-             "buffer is required (length probe)\n",
+    char pbuf[640];
+    snprintf(pbuf, sizeof(pbuf), "%s:%u:%u: runtime error: ",
              file, loc.line, loc.col);
-    LLVMValueRef text = zan_irgen_intern_string(g, buf);
-    emit_guard_report(g, text, loc, "null length probe");
+    LLVMValueRef prefix_gv = zan_irgen_intern_string(g, pbuf);
+    LLVMValueRef msg_gv = zan_irgen_intern_string(g,
+        "null reference where a string/byte buffer is required (length probe)\n");
+    emit_guard_report2(g, prefix_gv, msg_gv, loc, "null length probe");
 }
 
 static LLVMValueRef emit_index_i64(zan_irgen_t *g, LLVMValueRef value,

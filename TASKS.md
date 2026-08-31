@@ -3086,7 +3086,7 @@ A71 归因出四条编译器杠杆，本条把能实测的先测掉，用数据�
   容量/索引 63 边界（某 64 槽表零起步减一之类）。
 - **处置**：按 AGENTS.md 规则 10 登记，待专项修复；不绕过。
 
-## A78-4 · 守卫串体积治理（.rdata 里 5 万条 runtime-error 文本）—— ✅ 已完成（第一刀 + 共享去重）
+## A78-4 · 守卫串体积治理（.rdata 里 5 万条 runtime-error 文本）—— ✅ 两刀全部完成（2026-08-31）
 
 - **背景**：gallery 发布二进制 ~17MB 里 50,779 条守卫串（每处引用类型成员
   访问一条 `D:\project\zan-lang\build\..\stdlib\Gui\App.zan:818:40: runtime
@@ -3111,15 +3111,39 @@ A71 归因出四条编译器杠杆，本条把能实测的先测掉，用数据�
   **33,414 条/3,005,783B**（−34%），exe 22,330,042 → **20,782,863B**
   （−1.55MB）。运行行为：soft 模式打印短路径守卫一次后继续（rc=0），
   `ZAN_RT_HARD=1` exit(70) 不变。
-- **未做（第二刀设计已定，待并行会话编译器在途工作落地后一起做）**：
-  按 (file,line,col) **共享前缀 + 运行期拼接**——前缀
-  `<file>:<line>:<col>: runtime error: ` 与 msg 分开两个 global，新运行时
-  函数合成完整文本。难点：hard 模式 `RaiseException` 崩溃过滤器要单根
-  指针（需运行期缓冲，多线程安全）；`zan_rt_soft_note` 签名变更牵动
-  cross-rt 四后端。预估再省 ~1.2MB（gallery 口径），5 万条 × 35B 前缀。
-- **回归**：conformance 676 项标准档全跑（首跑 30 失败为并行会话同时在
-  途构建的干扰——单独复跑 26/30 即过；余 4 项
-  cef_profile/watermark/sparse_page/wiring 系并行在途既有，bounds_valid
-  系 string 下标语义在途改动，zanc_clean 同样失败）；EH/ARC 探针
-  （isas/cc 四模式、ehstart、eh1300、plain300/5000）全部通过。
+- **第二刀 ✅ 已完成（同日）——但实测数据推翻了原设计方向**：gallery 守卫串
+  33,414 条里**前缀只有 4.6% 重复**（31,877 个独立 file:line:col，守卫本就
+  一行一条，"每行 5 条守卫"的假设不成立），而 **msg 模板只有 780 个**、
+  覆盖 1.68MB（占 56%）——所以共享的是 **msg 不是前缀**：
+  - irgen_generics.c：`emit_runtime_check`/`emit_string_null_report` 改发
+    **两个 intern global**（prefix=`<file>:<line>:<col>: runtime error: `
+    每站点一条；msg=共享模板+\n，780 条全程序只发一份）。soft 路径调
+    **`zan_rt_soft_note2(prefix,msg)`**（rt_timer.c 新函数：按 prefix 指针
+    判重——每站点恰一条 prefix global，与旧整文本指针判重语义严格等价；
+    首见在 timer_lock 内合成完整文本后打印+记日志）。hard 路径在**函数
+    入口块的 [1400 x i8] 暂存槽**（`guard_buf_fn/guard_buf_alloca` 缓存，
+    每函数一条 alloca——守卫在循环里触发时复用同一槽，不逐次涨栈；
+    插入点在入口首指令**之前**，追加到末尾会落在 terminator 后面——
+    首版实测 `does not have terminator` 验证失败即此）里
+    strcpy+strcat 合成单根指针供 printf 与 Windows `RaiseException` 崩溃
+    记录用（过滤器同线程同步续跑，栈缓冲在 raise 时有效）。
+  - **cross 目标回退**：`--target` 交叉编译链的是 toolchain/ 下**已提交**
+    的 zanrt_*.o（本机无 zig 无法重建，缺 note2 符号），irgen 按是否
+    cross（`rt_guard_split`）走**merged 整文本回退**（即第一刀形态，
+    `emit_guard_report_merged`）。WSL 实测交叉 linux-x64 二进制：软路径
+    打印后继续、`ZAN_RT_HARD=1` exit(70)，与 host 行为一致；host 侧
+    软/硬两路径同样逐项验证。zig 就位的机器跑一遍
+    `scripts/build_cross_rt.cmd` 重建后即可切全量 split（irgen 侧无需
+    再改，只需去掉 cross 回退或在 note2 存在性上判）。
+- **第二刀实测（gui_gallery dev 档，与第一刀同口径）**：守卫串字节
+  3,005,783 → **1,522,495**（再 −49%，两刀合计 −67%，6.6MB→1.5MB）。
+  exe 总尺寸受并行会话在途改 gallery 源影响不可直接对比，以守卫串字节
+  为准。
+- **回归**：conformance 676 项标准档两轮全跑（每轮的批量为失败均为并行
+  会话同时在途构建的干扰——隔离复跑即过；确认残留
+  determinism/leakcheck_checkbox_group、determinism_bytebuffer_bounds 系
+  `--emit-ir` 宿主崩溃，zanc_clean 同样复现，属并行在途既有）；我的
+  改动面（exception*/thread_*/bounds/closure/bytebuffer conformance、
+  ehstart/eh1300/plain300/5000 探针、guard 软硬行为、cross 软硬行为）
+  全部通过。
 

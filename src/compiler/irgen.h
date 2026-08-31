@@ -409,7 +409,17 @@ struct zan_irgen {
      * (zan_rt_soft_seen), so sharing is semantically exact. */
     zan_str_intern_t **str_intern; /* chained hash, ZAN_STR_INTERN_BUCKETS */
                                    /* (bucket array calloc'd on first intern) */
-    int          str_intern_cap; /* allocated bucket count */    LLVMValueRef fn_report_leaks; /* void __zan_report_leaks(void) */
+    int          str_intern_cap; /* allocated bucket count */
+    /* Per-function scratch buffer for split guard reports (prefix+msg
+     * composed into one contiguous string on the hard path): one entry-block
+     * alloca per function, cached so a guard inside a loop reuses the slot. */
+    LLVMValueRef guard_buf_fn;     /* the function the buffer belongs to */
+    LLVMValueRef guard_buf_alloca; /* [1400 x i8] alloca in its entry block */
+    bool         rt_guard_split;   /* split prefix/msg guard reports (needs
+                                    * zan_rt_soft_note2 in the linked runtime;
+                                    * false for cross targets until their
+                                    * committed runtime objects are rebuilt) */
+    LLVMValueRef fn_report_leaks; /* void __zan_report_leaks(void) */
     const char  *src_file;        /* source path, for runtime diagnostics */
     bool         runtime_checks;  /* insert div-by-zero (etc.) guards; default true */
     bool         check_leaks;     /* emit a leak report at program exit */

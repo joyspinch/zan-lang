@@ -2360,6 +2360,14 @@ int main(int argc, char **argv) {
         return 1;
     }
     irgen.emit_debug = debug_info;
+    /* Split guard reports (shared message globals + zan_rt_soft_note2) need
+     * the runtime to actually export zan_rt_soft_note2. Host builds link the
+     * runtime object built from source alongside zanc, so they always have
+     * it; cross builds link the committed toolchain/<target>/zanrt_*.o
+     * objects, which lag until scripts/build_cross_rt.cmd runs on a box with
+     * zig -- until they are rebuilt, keep the self-contained merged-text
+     * form (same A78-4 knife-1 sizes, no missing-symbol risk). */
+    irgen.rt_guard_split = !cross_compiling;
     /* Publish builds scramble string literals in the image (un-scrambled by a
      * .ctors constructor at startup) so a `strings` pass over the exe reveals
      * no embedded keys/URLs/SQL/prompts. */

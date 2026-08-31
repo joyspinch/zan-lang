@@ -18,6 +18,13 @@ void zan_timer_runtime_reset(void);
  * keep running instead of exiting; ZAN_RT_HARD=1 flips every guard back to
  * the historical exit(70). */
 void zan_rt_soft_note(const char *text);
+/* Two-part soft report: `prefix` ("file.zan:818:40: runtime error: ") and
+ * `msg` ("null reference ...") are separate compiler-emitted string globals
+ * so the ~780 distinct message templates are stored once instead of being
+ * duplicated inside every guard site's text. Deduped per SITE (by `prefix`
+ * pointer identity, exactly like zan_rt_soft_note's text-pointer dedup);
+ * the full text is composed on first sight, printed once, and logged. */
+void zan_rt_soft_note2(const char *prefix, const char *msg);
 /* Non-zero when ZAN_RT_HARD=1 was set at startup: guards must exit(70)
  * instead of reporting and continuing. */
 int zan_rt_soft_is_hard(void);

@@ -275,6 +275,37 @@ void zan_rt_soft_note(const char *text) {
     zan_soft_append(text);
 }
 
+/* Two-part soft report. `prefix` is per-site ("Gui/App.zan:818:40: runtime
+ * error: "), `msg` is one of a few hundred shared templates. Site identity
+ * (and therefore the dedup key) is the prefix pointer: every guard site
+ * emits exactly one prefix global, mirroring how zan_rt_soft_note keys on
+ * the whole-text pointer. Composition happens under the same lock that
+ * guards the dedup table, into a buffer long enough for any prefix+msg the
+ * emitter produces (the compiler caps each part at 640 bytes). */
+void zan_rt_soft_note2(const char *prefix, const char *msg) {
+    if (!prefix) return;
+    char buf[1400];
+    timer_lock();
+    int seen = zan_soft_seen(prefix);
+    if (!seen) {
+        size_t n = strlen(prefix);
+        if (n >= sizeof buf) n = sizeof buf - 1;
+        memcpy(buf, prefix, n);
+        if (msg) {
+            size_t m = strlen(msg);
+            if (n + m >= sizeof buf) m = sizeof buf - 1 - n;
+            memcpy(buf + n, msg, m);
+            n += m;
+        }
+        buf[n] = '\0';
+    }
+    timer_unlock();
+    if (seen) return;
+    fprintf(stderr, "%s", buf);
+    fflush(stderr);
+    zan_soft_append(buf);
+}
+
 typedef enum zan_timer_kind {
     ZAN_TIMER_DELAY = 0,
     ZAN_TIMER_PUBLIC = 1
