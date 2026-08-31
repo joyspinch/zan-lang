@@ -1,0 +1,70 @@
+// Conformance: System.Globalization.Lang — Apple .strings 式键式查找。
+// 自建语言包目录（含坏 JSON 兄弟包），验证查找/回退/切换/缓存与
+// 消歧 @ 后缀键约定。
+using System;
+using System.IO;
+using System.Globalization;
+
+class LangCase {
+    static int fails = 0;
+
+    static void Check(string name, bool ok) {
+        if (!ok) { fails = fails + 1; }
+        Console.WriteLine(name + (ok ? " ok" : " FAIL"));
+    }
+
+    static void Main() {
+        // 准备包：lang/zh.json + 坏 JSON 的 ja.json。孤儿键与转义键也在包里。
+        Directory.CreateDirectory("lang_case_dir");
+        File.WriteAllText("lang_case_dir/zh.json",
+            "{\"Email\":\"邮箱\",\"Orphan\":\"孤儿键\",\"Esc\\nLine\":\"转义换行\","
+            + "\"Cloud@云服务\":\"云服务\",\"Cloud@点云\":\"点云\"}");
+        File.WriteAllText("lang_case_dir/ja.json", "{not valid json");
+
+        // 1) 源语言（未设代码）：直接回缺省串，不查表。
+        Check("t1", Lang.Tr("Email", "邮件") == "邮件");
+
+        // 2) zh 包命中。
+        Lang.LoadDir("lang_case_dir");
+        Lang.Set("zh");
+        Check("t2", Lang.Tr("Email", "邮件") == "邮箱");
+        Check("t3", Lang.Code() == "zh");
+
+        // 3) 键不在包里 -> 回调用方缺省串。
+        Check("t4", Lang.Tr("Left", "左对齐") == "左对齐");
+
+        // 4) 单参形式：命中用译文；未命中回键本身。
+        Check("t5", Lang.Tr("Email") == "邮箱");
+        Check("t6", Lang.Tr("Nope") == "Nope");
+
+        // 5) @ 消歧键：后缀参与键匹配，各自命中自己的译文。
+        Check("t7", Lang.Tr("Cloud@云服务", "云") == "云服务");
+        Check("t8", Lang.Tr("Cloud@点云", "云") == "点云");
+
+        // 6) 坏包（ja 解析失败）与缺失包（fr）：都逐条回缺省串，不抛异常。
+        Lang.Set("ja");
+        Check("t9", Lang.Tr("Email", "邮件") == "邮件");
+        Lang.Set("fr");
+        Check("t10", Lang.Tr("Email", "邮件") == "邮件");
+
+        // 7) 切回 zh：走缓存，仍然命中。
+        Lang.Set("zh");
+        Check("t11", Lang.Tr("Email", "邮件") == "邮箱");
+
+        // 8) 包里多余的键（孤儿键）不影响查找；转义键往返。
+        Check("t12", Lang.Tr("Orphan") == "孤儿键");
+        Check("t13", Lang.Tr("Esc\nLine", "f") == "转义换行");
+
+        // 9) Set 返回是否变化；同码重复 Set 不变。
+        Check("t14", Lang.Set("zh") == false);
+        Check("t15", Lang.Set("fr") == true);
+
+        // 10) 消歧键的源语言展示约定：剥首个 '@' 及其后内容
+        //     （调用方 T() 的职责，这里按约定复现一遍）。
+        string key = "Cloud@云服务";
+        int at = key.IndexOf("@");
+        Check("t16", at == 5 && key.Substring(0, at) == "Cloud");
+
+        if (fails == 0) { Console.WriteLine("LANG CONFORMANCE OK"); }
+    }
+}
