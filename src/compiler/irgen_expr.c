@@ -5674,7 +5674,21 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                             zan_ast_list_push(&addcall->call.args,
                                 arg->coll_init.items.items[++k], g->arena);
                         }
-                        emit_expr(g, addcall, locals);
+                        /* an Add that returns the element (the GUI
+                         * ControlChildren facade) hands the caller +1; the
+                         * initializer discards that value, so release it --
+                         * same rule as a discarded expression statement */
+                        LLVMValueRef addres = emit_expr(g, addcall, locals);
+                        if (addres && expr_yields_owned_rc_value(g, addcall,
+                                                      locals)) {
+                            zan_type_t *rt = infer_expr_type(g, addcall,
+                                                             locals);
+                            if (rt && is_rc_managed_type(rt) &&
+                                LLVMGetTypeKind(LLVMTypeOf(addres))
+                                    == LLVMPointerTypeKind) {
+                                emit_rc_release_for_type(g, rt, addres);
+                            }
+                        }
                     }
                     for (int lv = locals->count - 1; lv >= 0; lv--) {
                         if (locals->vars[lv].name.len == mname.len &&
@@ -5867,8 +5881,11 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     return LLVMBuildBitCast(g->builder, typed_ptr, i8ptr, "listv");
                 }
                 /* collection initializer items: new List<T>{ a, b, c }. The
-                 * parser stores them in new_expr.args (List has no ctor args). */
-                int ninit = expr->new_expr.args.count;
+                 * parser stores them in new_expr.args (List has no ctor args);
+                 * the postfix spelling (`List<int> { ... }`) keeps them in
+                 * arg_inits instead, so both shapes feed the same build. */
+                int ninit = expr->new_expr.args.count +
+                            expr->new_expr.arg_inits.count;
                 long long initcap = ninit > 8 ? (long long)ninit : 8;
                 /* count = ninit */
                 LLVMValueRef count_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, typed_ptr, 0, "cnt");
@@ -5890,7 +5907,10 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_store_fit(g, data_typed, data_field);
                 /* store each initializer item (with proper rc retain semantics) */
                 for (int ii = 0; ii < ninit; ii++) {
-                    zan_ast_node_t *item = expr->new_expr.args.items[ii];
+                    zan_ast_node_t *item = ii < expr->new_expr.args.count
+                        ? expr->new_expr.args.items[ii]
+                        : expr->new_expr.arg_inits.items[
+                              ii - expr->new_expr.args.count];
                     LLVMValueRef idxk = LLVMConstInt(i64,
                         (unsigned long long)ii * lwords, 0);
                     LLVMValueRef slot = LLVMBuildGEP2(g->builder, i64, data_typed, &idxk, 1, "iis");
@@ -5980,14 +6000,24 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef vf = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, typed_ptr, 3, "vf");
                 zan_store_fit(g, vals_typed, vf);
                 /* dictionary initializer entries: new Dict<K,V>{ {k, v}, ... }.
-                 * The parser flattens each `{ k, v }` pair into new_expr.args,
-                 * so consume them pairwise via the shared upsert helper. */
-                int ninit = expr->new_expr.args.count;
+                 * The parser flattens each `{ k, v }` pair into new_expr.args
+                 * (the postfix `Dict<K,V> { ... }` spelling keeps them in
+                 * arg_inits), so consume them pairwise via the shared upsert
+                 * helper. */
+                zan_ast_list_t dict_inits;
+                zan_ast_list_init(&dict_inits);
+                for (int di = 0; di < expr->new_expr.args.count; di++)
+                    zan_ast_list_push(&dict_inits,
+                        expr->new_expr.args.items[di], g->arena);
+                for (int di = 0; di < expr->new_expr.arg_inits.count; di++)
+                    zan_ast_list_push(&dict_inits,
+                        expr->new_expr.arg_inits.items[di], g->arena);
+                int ninit = dict_inits.count;
                 if (ninit >= 2) {
                     zan_type_t *kt = dict_key_type(g, dict_type);
                     for (int ii = 0; ii + 1 < ninit; ii += 2) {
-                        zan_ast_node_t *kexpr = expr->new_expr.args.items[ii];
-                        zan_ast_node_t *vexpr = expr->new_expr.args.items[ii + 1];
+                        zan_ast_node_t *kexpr = dict_inits.items[ii];
+                        zan_ast_node_t *vexpr = dict_inits.items[ii + 1];
                         LLVMValueRef key = emit_expr(g, kexpr, locals);
                         if (LLVMGetTypeKind(LLVMTypeOf(key)) == LLVMIntegerTypeKind) {
                             if (LLVMGetIntTypeWidth(LLVMTypeOf(key)) < 64)

@@ -1257,11 +1257,13 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
     for (;;) {
         zan_loc_t loc = p->current.loc;
 
-        /* object initializer: Identifier { field = val, ... } — only when the
+        /* object initializer: Identifier { field = val, ... } — when the
          * preceding expression is a simple identifier (optionally carrying a
-         * constructed generic instantiation) or a member access. */
+         * constructed generic instantiation), a member access, or a call
+         * (factory continuation: `Panel.Row() { ... }`). */
         if (parser_check(p, TK_LBRACE) &&
-            (expr->kind == AST_IDENTIFIER || expr->kind == AST_MEMBER_ACCESS)) {
+            (expr->kind == AST_IDENTIFIER || expr->kind == AST_MEMBER_ACCESS ||
+             expr->kind == AST_CALL)) {
             /* object initializer on a constructed generic type
              * (`List<int> { 1, 2 }`): the instantiation was captured on the
              * identifier by the `<...>` branch below, so the new-expression's
@@ -1313,6 +1315,56 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                 continue;
             }
 
+            /* factory-call continuation (`Panel.Row() { Children = {...} }`):
+             * the braces continue the just-parsed call, so keep the callee in
+             * call_init; the checker types it via the call and irgen lowers
+             * the call before applying the member-writes. */
+            if (expr->kind == AST_CALL) {
+                zan_ast_node_t *n = zan_ast_new(p->arena, AST_NEW_EXPR, loc);
+                n->new_expr.call_init = expr;
+                zan_ast_list_init(&n->new_expr.args);
+                zan_ast_list_init(&n->new_expr.arg_inits);
+                parser_advance(p); /* { */
+                while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+                    zan_ast_node_t *field_init;
+                    if (parser_check(p, TK_IDENT) &&
+                        zan_lexer_peek(p->lex).kind == TK_EQ) {
+                        zan_loc_t nloc = p->current.loc;
+                        zan_istr_t name = p->current.str_val;
+                        parser_advance(p); /* name */
+                        parser_advance(p); /* = */
+                        if (parser_match(p, TK_LBRACE)) {
+                            field_init = zan_ast_new(p->arena, AST_COLL_INIT, nloc);
+                            field_init->coll_init.name = name;
+                            zan_ast_list_init(&field_init->coll_init.items);
+                            while (!parser_check(p, TK_RBRACE) &&
+                                   !parser_check(p, TK_EOF)) {
+                                zan_ast_node_t *item = parse_expression(p);
+                                zan_ast_list_push(&field_init->coll_init.items,
+                                                  item, p->arena);
+                                if (!parser_match(p, TK_COMMA)) break;
+                            }
+                            parser_expect(p, TK_RBRACE);
+                        } else {
+                            field_init = zan_ast_new(p->arena, AST_ASSIGNMENT, nloc);
+                            zan_ast_node_t *lhs =
+                                zan_ast_new(p->arena, AST_IDENTIFIER, nloc);
+                            lhs->ident.name = name;
+                            field_init->binary.op = TK_EQ;
+                            field_init->binary.left = lhs;
+                            field_init->binary.right = parse_expression(p);
+                        }
+                    } else {
+                        field_init = parse_expression(p);
+                    }
+                    zan_ast_list_push(&n->new_expr.arg_inits, field_init,
+                                      p->arena);
+                    if (!parser_match(p, TK_COMMA)) break;
+                }
+                parser_expect(p, TK_RBRACE);
+                expr = n;
+                continue;
+            }
             /* plain identifier / member access: re-interpret it as the type
              * name of a new-expression */
             zan_ast_node_t *type = zan_ast_new(p->arena, AST_TYPE_REF, expr->loc);
