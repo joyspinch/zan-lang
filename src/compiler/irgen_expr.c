@@ -8518,6 +8518,14 @@ static LLVMTypeRef box_cell_type(zan_irgen_t *g, LLVMTypeRef payload) {
 static int body_writes_ident_scan(zan_irgen_t *g, zan_ast_node_t *body,
                                   zan_istr_t name);
 
+/* Content equality for interned-agnostic istrs: identifiers are NOT interned
+ * across AST nodes, so two spellings of the same name carry different `str`
+ * pointers -- compare bytes, never pointers. */
+static int memo_name_eq(zan_istr_t a, zan_istr_t b) {
+    return a.len == b.len && a.len > 0 &&
+           memcmp(a.str, b.str, (size_t)a.len) == 0;
+}
+
 static unsigned body_write_memo_hash(zan_ast_node_t *body, zan_istr_t name) {
     uint64_t h = 1469598103934665603ull;
     uintptr_t bp = (uintptr_t)body;
@@ -8567,8 +8575,7 @@ static struct zan_body_write_entry *body_write_memo_slot(zan_irgen_t *g,
     unsigned i = body_write_memo_hash(body, name) & mask;
     while (g->body_write_memo[i].known) {
         if (g->body_write_memo[i].body == body &&
-            g->body_write_memo[i].name.str == name.str &&
-            g->body_write_memo[i].name.len == name.len)
+            memo_name_eq(g->body_write_memo[i].name, name))
             return &g->body_write_memo[i];
         i = (i + 1) & mask;
     }
@@ -8728,8 +8735,7 @@ static int body_writes_ident_memo(zan_irgen_t *g, zan_ast_node_t *body,
     unsigned i = body_write_memo_hash(body, name) & mask;
     while (g->body_write_memo[i].known) {
         if (g->body_write_memo[i].body == body &&
-            g->body_write_memo[i].name.str == name.str &&
-            g->body_write_memo[i].name.len == name.len)
+            memo_name_eq(g->body_write_memo[i].name, name))
             return g->body_write_memo[i].written;
         i = (i + 1) & mask;
     }
@@ -8769,8 +8775,7 @@ static int local_is_lambda_written(zan_irgen_t *g, local_scope_t *locals,
     unsigned i = body_write_memo_hash(g->current_fn_body, name) & mask;
     while (g->body_write_memo[i].known) {
         if (g->body_write_memo[i].body == g->current_fn_body &&
-            g->body_write_memo[i].name.str == name.str &&
-            g->body_write_memo[i].name.len == name.len)
+            memo_name_eq(g->body_write_memo[i].name, name))
             return g->body_write_memo[i].lam_written;
         i = (i + 1) & mask;
     }
