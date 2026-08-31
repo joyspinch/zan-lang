@@ -41,12 +41,17 @@ class PieSlice {
 ///  - pieRings=true 时每条可见系列 = 一独立环，各自计算 total
 ///    （各自 360°）；否则所有可见系列的扇区合并进同一张饼；
 ///  - 颜色解析：数据项色 > 单数据项系列的系列色 > 按扇区序调色板。
+///  - 总和用 long 宽累计（totalWide / ringTotalWide），角度与
+///    百分比一律按宽值计算；int total / ringTotal 是饱和兼容
+///    字段，超过 int 上限时钉在 int.MaxValue。
 /// 不触碰 App/Canvas —— (主题, 选项) 进，扇区几何出。
 class PieLayout {
     List<PieSlice> slices;
-    int total;          // 非环模式：所有可见扇区值之和；环模式：各环之和
+    int total;          // 兼容字段：总和超过 int 上限时饱和为 int.MaxValue
+    long totalWide;     // 非环模式：所有可见扇区值之和（未截断）
     int ringCount;      // 环数（非环模式 = 1）
-    List<int> ringTotal; // 每环各自可见值之和（环模式角度分母）
+    List<int> ringTotal; // 兼容字段：每环总和饱和
+    List<long> ringTotalWide; // 每环各自可见值之和（环模式角度分母）
     List<int> ringInner; // 每环有效内径百分比（innerPct>0 ? innerPct : donutPct）
     int rot;            // 起始边顺时针偏移（度）：90 - series.startAngle
 
@@ -54,8 +59,10 @@ class PieLayout {
         PieLayout l = new PieLayout();
         l.slices = new List<PieSlice>();
         l.ringTotal = new List<int>();
+        l.ringTotalWide = new List<long>();
         l.ringInner = new List<int>();
         l.total = 0;
+        l.totalWide = 0;
         l.ringCount = 0;
         l.rot = 0;
 
@@ -85,21 +92,25 @@ class PieLayout {
                 if (inner < 0) { inner = 0; }
                 if (inner > 95) { inner = 95; }
                 l.ringInner.Add(inner);
-                int rt = 0;
+                long rt = 0;
                 for (int di = 0; di < s.Count(); di = di + 1) {
-                    if (!s.data[di].hidden && s.Value(di) > 0) { rt = rt + s.Value(di); }
+                    if (!s.data[di].hidden && s.Value(di) > 0) {
+                        rt = rt + s.Value(di);
+                    }
                 }
-                l.ringTotal.Add(rt);
-                l.total = l.total + rt;
+                l.ringTotalWide.Add(rt);
+                l.ringTotal.Add(PieLayout.ClampInt(rt));
+                l.totalWide = l.totalWide + rt;
+                l.total = PieLayout.ClampInt(l.totalWide);
                 if (rt < 1) { continue; }
-                int acc = 0;
+                long acc = 0;
                 for (int di2 = 0; di2 < s.Count(); di2 = di2 + 1) {
                     ChartData d = s.data[di2];
                     if (d.hidden) { continue; }
                     int v = s.Value(di2);
                     if (v <= 0) { continue; }
-                    int a0 = acc * 360 / rt;
-                    int a1 = (acc + v) * 360 / rt;
+                    int a0 = (int)(acc * 360 / rt);
+                    int a1 = (int)((acc + v) * 360 / rt);
                     l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, di2, origIdx[r] * 16 + di2),
                         PieLayout.SliceName(s, di2), origIdx[r], di2, a0, a1, r));
                     l.slices[l.slices.Count - 1].selected = d.selected;
@@ -117,17 +128,21 @@ class PieLayout {
         if (leadInner < 0) { leadInner = 0; }
         if (leadInner > 95) { leadInner = 95; }
         l.ringInner.Add(leadInner);
-        int total = 0;
+        long total = 0;
         for (int p = 0; p < pies.Count; p = p + 1) {
             ChartSeries s = pies[p];
             for (int di = 0; di < s.Count(); di = di + 1) {
-                if (!s.data[di].hidden && s.Value(di) > 0) { total = total + s.Value(di); }
+                if (!s.data[di].hidden && s.Value(di) > 0) {
+                    total = total + s.Value(di);
+                }
             }
         }
-        l.ringTotal.Add(total);
-        l.total = total;
+        l.ringTotalWide.Add(total);
+        l.ringTotal.Add(PieLayout.ClampInt(total));
+        l.totalWide = total;
+        l.total = PieLayout.ClampInt(total);
         if (total < 1) { return l; }
-        int acc2 = 0;
+        long acc2 = 0;
         for (int p2 = 0; p2 < pies.Count; p2 = p2 + 1) {
             ChartSeries s = pies[p2];
             for (int di2 = 0; di2 < s.Count(); di2 = di2 + 1) {
@@ -135,8 +150,8 @@ class PieLayout {
                 if (d.hidden) { continue; }
                 int v = s.Value(di2);
                 if (v <= 0) { continue; }
-                int a0 = acc2 * 360 / total;
-                int a1 = (acc2 + v) * 360 / total;
+                int a0 = (int)(acc2 * 360 / total);
+                int a1 = (int)((acc2 + v) * 360 / total);
                 l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, di2, origIdx[p2] * 16 + di2),
                     PieLayout.SliceName(s, di2), origIdx[p2], di2, a0, a1, 0));
                 l.slices[l.slices.Count - 1].selected = d.selected;
@@ -144,6 +159,14 @@ class PieLayout {
             }
         }
         return l;
+    }
+
+    /// long -> int 饱和夹取：兼容字段保持正值语义，超过 int 上限
+    /// 钉在 int.MaxValue，不发生二补码回绕成负数。
+    static int ClampInt(long v) {
+        if (v > 2147483647) { return 2147483647; }
+        if (v < 0) { return 0; }
+        return (int)v;
     }
 
     /// 扇区颜色：数据项色 > 单数据项系列的系列色 > 按数据项下标调色板。
@@ -209,7 +232,7 @@ partial class ChartView {
         int top = ChartView.PanelHead(app, x, y, w, h, o.title);
         PieLayout layout = PieLayout.Of(t, o);
         List<PieSlice> slices = layout.slices;
-        int total = layout.total;
+        long total = layout.totalWide;
         int ringCount = layout.ringCount;
         if (ringCount < 1) { ringCount = 1; }
 
@@ -229,14 +252,14 @@ partial class ChartView {
                 int visM = 0;
                 for (int dvm = 0; dvm < pm.data.Count; dvm = dvm + 1) {
                     if (!pm.data[dvm].hidden && pm.Value(dvm) > 0) {
-                        visM = visM + pm.Value(dvm);
+                        visM = PieLayout.ClampInt((long)visM + pm.Value(dvm));
                     }
                 }
                 for (int dim = 0; dim < pm.data.Count; dim = dim + 1) {
                     string nmm = PieLayout.SliceName(pm, dim);
                     int pctM = 0;
                     if (!pm.data[dim].hidden && visM > 0) {
-                        pctM = pm.Value(dim) * 100 / visM;
+                        pctM = (int)((long)pm.Value(dim) * 100 / visM);
                     }
                     string lbm = nmm + "  " + Convert.ToString(pctM) + "%";
                     rowW = rowW + Chart.LegendChipW(app, lbm) + gap;
@@ -255,7 +278,7 @@ partial class ChartView {
                 int visTot = 0;
                 for (int dv = 0; dv < ps.data.Count; dv = dv + 1) {
                     if (!ps.data[dv].hidden && ps.Value(dv) > 0) {
-                        visTot = visTot + ps.Value(dv);
+                        visTot = PieLayout.ClampInt((long)visTot + ps.Value(dv));
                     }
                 }
                 for (int di = 0; di < ps.data.Count; di = di + 1) {
@@ -263,7 +286,9 @@ partial class ChartView {
                     string nm = PieLayout.SliceName(ps, di);
                     bool hid = ps.data[di].hidden;
                     int pctL = 0;
-                    if (!hid && visTot > 0) { pctL = ps.Value(di) * 100 / visTot; }
+                    if (!hid && visTot > 0) {
+                        pctL = (int)((long)ps.Value(di) * 100 / visTot);
+                    }
                     string lbl = nm + "  " + Convert.ToString(pctL) + "%";
                     int cw = Chart.LegendChipW(app, lbl);
                     if (xCur > x0 && xCur + cw > maxX) {
@@ -439,11 +464,11 @@ partial class ChartView {
                 int ring = sl.ring;
                 if (ring >= ringCount) { ring = ringCount - 1; }
                 if (ring < 0) { ring = 0; }
-                int ringTot = total;
-                if (ring < layout.ringTotal.Count && layout.ringTotal[ring] > 0) {
-                    ringTot = layout.ringTotal[ring];
+                long ringTot = total;
+                if (ring < layout.ringTotalWide.Count && layout.ringTotalWide[ring] > 0) {
+                    ringTot = layout.ringTotalWide[ring];
                 }
-                int pct = sl.value * 100 / ringTot;
+                int pct = (int)(sl.value * 100 / ringTot);
                 // 系列级外置标签：series.label.show + labelLine（ECharts
                 // 2.x 语义）。引导线两段：沿中角出弧 L1，再水平收尾；
                 // 文本按左右半球锚定在水平段外侧。
@@ -530,8 +555,10 @@ partial class ChartView {
                 if (v4 > bestV) { bestV = v4; bestI = k4; }
                 if (v4 < worstV) { worstV = v4; worstI = k4; }
             }
-            ChartView.DrawPieMark(app, c, cx, cy, rOuter, rot, slices, bestI, "max", t);
-            ChartView.DrawPieMark(app, c, cx, cy, rOuter, rot, slices, worstI, "min", t);
+            ChartView.DrawPieMark(app, c, cx, cy, rOuter, rot, slices, bestI,
+                "max", t, o.series);
+            ChartView.DrawPieMark(app, c, cx, cy, rOuter, rot, slices, worstI,
+                "min", t, o.series);
         }
 
         // 环形图中心标注：选中扇区名优先，否则累计值。
@@ -592,9 +619,9 @@ partial class ChartView {
                 if (aEndTip > sweepMax) { aEndTip = sweepMax; }
                 if (tipDist >= ri && tipDist < ro && aEndTip > sl.a0
                     && tipAng >= sl.a0 && tipAng < aEndTip) {
-                    int ringTot = total;
-                    if (ring < layout.ringTotal.Count && layout.ringTotal[ring] > 0) {
-                        ringTot = layout.ringTotal[ring];
+                    long ringTot = total;
+                    if (ring < layout.ringTotalWide.Count && layout.ringTotalWide[ring] > 0) {
+                        ringTot = layout.ringTotalWide[ring];
                     }
                     // emphasis 高亮：命中扇区按强调色重画（覆盖普通
                     // 绘制，不改写源系列），再按配置描强调边框。
@@ -633,7 +660,7 @@ partial class ChartView {
                         }
                     }
                     if (o.showTooltip) {
-                        int pct3 = sl.value * 100 / ringTot;
+                        int pct3 = (int)(sl.value * 100 / ringTot);
                         List<TooltipRow> rows = new List<TooltipRow>{
                             TooltipRow.Of(0, o.title),
                             TooltipRow.Of(sl.color,
@@ -1385,17 +1412,17 @@ c.DrawText(labelX, labelY, lblF, Style.Part(app, "chart",
         // 预计算每扇区 [a0,a1) 与外半径；hover 与绘制共用。
         List<int> secA0 = new List<int>();
         List<int> secR = new List<int>();
-        int totalV = 0;
+        long totalV = 0;
         foreach (ChartStage st in stages) { totalV = totalV + st.val; }
         if (totalV < 1) { totalV = 1; }
-        int acc = 0;
+        long acc = 0;
         for (int i = 0; i < n; i = i + 1) {
             int v = stages[i].val;
             int a0;
             if (mode == "area") {
                 a0 = i * 360 / n;
             } else {
-                a0 = acc * 360 / totalV;
+                a0 = (int)(acc * 360 / totalV);
                 acc = acc + v;
             }
             secA0.Add(a0);
@@ -1492,17 +1519,27 @@ c.DrawText(labelX, labelY, lblF, Style.Part(app, "chart",
     // 饼图 markPoint：在扇区中角方向延伸一个标签。线 + 圆 + 文字。
     // idx < 0 时不画；与 SliceOutMidAngle 共享角度约定（rot + 中角），
     // 屏幕位置按数学域 +270° 换算（与 selectOffset 路径同源）。
+    // 扇区静态选中时整体外偏 selectedOffset：引线与标签必须锚在
+    // 偏移后的圆心，否则 mark 点落在与扇区脱开的位置。
     static void DrawPieMark(App app, Canvas c, int cx, int cy, int rOuter,
                             int rot, List<PieSlice> slices, int idx,
-                            string lbl, Theme t) {
+                            string lbl, Theme t, List<ChartSeries> series) {
         if (idx < 0 || idx >= slices.Count) { return; }
         PieSlice sl = slices[idx];
         int mid = rot + (sl.a0 + sl.a1) / 2;
-        int px = cx + ChartView.SinDeg(mid) * rOuter / 1000;
-        int py = cy + ChartView.SinDeg(mid + 270) * rOuter / 1000;
+        int markCx = cx;
+        int markCy = cy;
+        if (sl.selected && sl.seriesIndex >= 0 && sl.seriesIndex < series.Count) {
+            int offSel = app.Scale(ChartView.PieSelectedOffset(
+                series[sl.seriesIndex].selectedOffset));
+            markCx = cx + ChartView.FillDx(mid) * offSel / 1000;
+            markCy = cy + ChartView.FillDy(mid) * offSel / 1000;
+        }
+        int px = markCx + ChartView.SinDeg(mid) * rOuter / 1000;
+        int py = markCy + ChartView.SinDeg(mid + 270) * rOuter / 1000;
         int off = app.Scale(18);
-        int ex = cx + ChartView.SinDeg(mid) * (rOuter + off) / 1000;
-        int ey = cy + ChartView.SinDeg(mid + 270) * (rOuter + off) / 1000;
+        int ex = markCx + ChartView.SinDeg(mid) * (rOuter + off) / 1000;
+        int ey = markCy + ChartView.SinDeg(mid + 270) * (rOuter + off) / 1000;
         int sCol = Style.Part(app, "chart", "value", "", "", "", Style.SNormal()).FgOr(0);
         c.DrawLine(px, py, ex, ey, sCol, 1);
         c.FillCircle(ex, ey, app.Scale(2), sCol);
