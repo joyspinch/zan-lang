@@ -61,6 +61,53 @@ class HttpRequest {
         this.parseStatus = 0;
     }
 
+    static bool IsOws(int c) {
+        return c == 32 || c == 9;
+    }
+
+    // [start, stop) 去掉 RFC 7230 OWS（SP / HTAB）。
+    static int TrimOwsStart(string raw, int start, int stop) {
+        while (start < stop && HttpRequest.IsOws(raw[start] & 255)) {
+            start = start + 1;
+        }
+        return start;
+    }
+
+    static int TrimOwsStop(string raw, int start, int stop) {
+        while (stop > start && HttpRequest.IsOws(raw[stop - 1] & 255)) {
+            stop = stop - 1;
+        }
+        return stop;
+    }
+
+    // Transfer-Encoding 是逗号分隔的 token 列表；只有最后一个 token
+    // 为 chunked 时才可由 HttpFramer 解码。token 之间的 OWS 合法，
+    // 其它编码不被静默忽略，避免把未定界的字节当成下一条请求。
+    static bool FinalTransferChunked(string raw, int start, int stop) {
+        int p = start;
+        bool any = false;
+        bool finalChunked = false;
+        while (p < stop) {
+            p = HttpRequest.TrimOwsStart(raw, p, stop);
+            if (p >= stop) { return false; }
+            int e = p;
+            while (e < stop && (raw[e] & 255) != 44) { e = e + 1; }
+            int t = HttpRequest.TrimOwsStop(raw, p, e);
+            if (t <= p) { return false; }
+            int semi = p;
+            while (semi < t && (raw[semi] & 255) != 59) { semi = semi + 1; }
+            // transfer-coding parameters are allowed after ';'; the coding
+            // token itself must still be a valid non-empty token.
+            int codingStop = HttpRequest.TrimOwsStop(raw, p, semi);
+            if (codingStop <= p) { return false; }
+            bool isChunked = HttpRequest.RegionIs(raw, p, codingStop, "chunked");
+            finalChunked = isChunked;
+            any = true;
+            p = e + 1;
+        }
+        return any && finalChunked;
+    }
+
     /// <summary>把原始 HTTP 请求字符串解析为 HttpRequest。
     ///
     /// 按字节下标扫描（<c>raw[i] &amp; 255</c>），而不是
@@ -89,20 +136,26 @@ class HttpRequest {
         int rlEnd = lineEnd;
         if (rlEnd > 0 && (raw[rlEnd - 1] & 255) == 13) { rlEnd = rlEnd - 1; }
 
-        // 解析：METHOD PATH VERSION
+        // 解析：METHOD 1*(SP/HTAB) request-target 1*(SP/HTAB) VERSION。
         int sp1 = 0;
-        for (; sp1 < rlEnd && (raw[sp1] & 255) != 32; sp1 = sp1 + 1) {
+        while (sp1 < rlEnd && !HttpRequest.IsOws(raw[sp1] & 255)) {
+            sp1 = sp1 + 1;
         }
         req.method = raw.Substring(0, sp1);
-
-        int sp2 = sp1 + 1;
-        while (sp2 < rlEnd && (raw[sp2] & 255) != 32) {
+        int pathStart = HttpRequest.TrimOwsStart(raw, sp1, rlEnd);
+        int sp2 = pathStart;
+        while (sp2 < rlEnd && !HttpRequest.IsOws(raw[sp2] & 255)) {
             sp2 = sp2 + 1;
         }
-        int pathStart = sp1 + 1;
         int pathEnd = sp2;
-        if (sp2 < rlEnd) {
-            req.version = raw.Substring(sp2 + 1, rlEnd - sp2 - 1);
+        int versionStart = HttpRequest.TrimOwsStart(raw, sp2, rlEnd);
+        if (versionStart < rlEnd) {
+            req.version = raw.Substring(versionStart, rlEnd - versionStart);
+        } else {
+            req.parseStatus = 400;
+        }
+        if (req.method.Length == 0 || pathStart >= pathEnd) {
+            req.parseStatus = 400;
         }
 
         // 拆分路径和查询字符串
@@ -161,31 +214,29 @@ class HttpRequest {
                 colonPos = colonPos + 1;
             }
             if (colonPos < lineStop) {
-                int vStart = colonPos + 1;
-                // 去除前导空格
-                if (vStart < lineStop && (raw[vStart] & 255) == 32) {
-                    vStart = vStart + 1;
-                }
+                int vStart = HttpRequest.TrimOwsStart(raw, colonPos + 1,
+                    lineStop);
+                int vStop = HttpRequest.TrimOwsStop(raw, vStart, lineStop);
                 // 头名先按长度分流：本方法关心的七个头名长度互不相同
                 // （4/6/10/12/13/14/17），所以每行最多做一次 RegionIs。
                 // 逐个 RegionIs 试下去的话，每个头名都要把余下的候选串
                 // 全量 strlen 一遍——实测每请求 36 次比较、36 次 strlen。
                 int nameLen = colonPos - pos;
                 if (nameLen == 4 && RegionIs(raw, pos, colonPos, "host")) {
-                    req.host = raw.Substring(vStart, lineStop - vStart);
+                    req.host = raw.Substring(vStart, vStop - vStart);
                 } else if (nameLen == 12
                            && RegionIs(raw, pos, colonPos, "content-type")) {
-                    req.contentType = raw.Substring(vStart, lineStop - vStart);
+                    req.contentType = raw.Substring(vStart, vStop - vStart);
                 } else if (nameLen == 13
                            && RegionIs(raw, pos, colonPos, "authorization")) {
                     // 重复出现取第一条，与按名查找的结果一致。
                     if (req.authorization.Length == 0) {
-                        req.authorization = raw.Substring(vStart, lineStop - vStart);
+                        req.authorization = raw.Substring(vStart, vStop - vStart);
                     }
                 } else if (nameLen == 6
                            && RegionIs(raw, pos, colonPos, "cookie")) {
                     if (req.cookie.Length == 0) {
-                        req.cookie = raw.Substring(vStart, lineStop - vStart);
+                        req.cookie = raw.Substring(vStart, vStop - vStart);
                     }
                 } else if (nameLen == 14
                            && RegionIs(raw, pos, colonPos, "content-length")) {
@@ -196,7 +247,7 @@ class HttpRequest {
                     clAcc = 0;
                     bool bad = false;
                     int di = vStart;
-                    while (di < lineStop) {
+                    while (di < vStop) {
                         int d = raw[di] & 255;
                         if (d < 48 || d > 57) { bad = true; break; }
                         clAcc = clAcc * 10 + (d - 48);
@@ -208,7 +259,7 @@ class HttpRequest {
                         // 更精确的状态码，但两者都禁止继续信任该值。
                         bool overflow = true;
                         int ci = vStart;
-                        while (ci < lineStop) {
+                        while (ci < vStop) {
                             int dd = raw[ci] & 255;
                             if (dd < 48 || dd > 57) { overflow = false; break; }
                             ci = ci + 1;
@@ -232,13 +283,10 @@ class HttpRequest {
                     // 只有值恰好是 chunked 时正文才自定界
                     // （RFC 7230 §3.3.3）。其它编码（gzip 等）或
                     // 叠加编码无法据此找到正文结尾，仍按未实现处理。
-                    int teStop = lineStop;
-                    while (teStop > vStart && (raw[teStop - 1] & 255) == 32) {
-                        teStop = teStop - 1;
-                    }
-                    if (RegionIs(raw, vStart, teStop, "chunked")) {
-                        req.chunked = true;
-                    }
+                    // 多个 Transfer-Encoding 字段合并为一个列表；后一个
+                    // 字段不能把前一个非最终编码覆盖成 chunked，反之亦然。
+                    req.chunked = HttpRequest.FinalTransferChunked(raw,
+                        vStart, vStop);
                     // 服务器不实现 chunked 解码，绝不能忽略
                     // Transfer-Encoding——否则按 Content-Length（或无）
                     // 切分正文，而真实正文是分块编码，剩余 chunk 就被
@@ -258,14 +306,12 @@ class HttpRequest {
                         while (tEnd < lineStop && (raw[tEnd] & 255) != 44) {
                             tEnd = tEnd + 1;
                         }
-                        int tStop = tEnd;
-                        while (tStop > t && (raw[tStop - 1] & 255) == 32) {
-                            tStop = tStop - 1;
-                        }
+                        int tStop = HttpRequest.TrimOwsStop(raw, t, tEnd);
+                        t = HttpRequest.TrimOwsStart(raw, t, tStop);
                         if (RegionIs(raw, t, tStop, "close")) { connClose = true; }
                         if (RegionIs(raw, t, tStop, "keep-alive")) { connKeep = true; }
                         t = tEnd + 1;
-                        while (t < lineStop && (raw[t] & 255) == 32) { t = t + 1; }
+                        t = HttpRequest.TrimOwsStart(raw, t, lineStop);
                     }
                 }
             }
@@ -373,11 +419,11 @@ class HttpRequest {
             }
             if (colonPos < lineStop) {
                 if (RegionIsCi(this.rawHeaders, pos, colonPos, name)) {
-                    int vStart = colonPos + 1;
-                    if (vStart < lineStop && (this.rawHeaders[vStart] & 255) == 32) {
-                        vStart = vStart + 1;
-                    }
-                    return this.rawHeaders.Substring(vStart, lineStop - vStart);
+                    int vStart = HttpRequest.TrimOwsStart(this.rawHeaders,
+                        colonPos + 1, lineStop);
+                    int vStop = HttpRequest.TrimOwsStop(this.rawHeaders,
+                        vStart, lineStop);
+                    return this.rawHeaders.Substring(vStart, vStop - vStart);
                 }
             }
             pos = lineEnd + 1;

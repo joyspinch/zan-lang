@@ -344,6 +344,40 @@ class HttpClient {
         return 67108864;
     }
 
+    // 将阶段预算与总预算取较小值。返回值 <= 0 表示该阶段不设截止时间；
+    // policy 的四类 timeout 因而不会再被 SetCallPolicy 的 total 值静默覆盖。
+    int BudgetMin(int phaseMs) {
+        if (this.callPolicy == null) { return this.timeout; }
+        int total = this.callPolicy.TotalTimeoutMs();
+        if (phaseMs > 0 && total > 0) { return phaseMs < total ? phaseMs : total; }
+        if (phaseMs > 0) { return phaseMs; }
+        return total;
+    }
+
+    int ConnectBudget() {
+        if (this.callPolicy == null) { return this.timeout; }
+        return this.BudgetMin(this.callPolicy.ConnectTimeoutMs());
+    }
+    int WriteBudget() {
+        if (this.callPolicy == null) { return this.timeout; }
+        return this.BudgetMin(this.callPolicy.WriteTimeoutMs());
+    }
+    int ReadBudget() {
+        if (this.callPolicy == null) { return this.timeout; }
+        return this.BudgetMin(this.callPolicy.ReadTimeoutMs());
+    }
+    int IdleBudget() {
+        if (this.callPolicy == null) { return this.timeout; }
+        return this.BudgetMin(this.callPolicy.IdleTimeoutMs());
+    }
+    int HandshakeBudget() {
+        return this.ConnectBudget();
+    }
+    int TotalBudget() {
+        if (this.callPolicy == null) { return 0; }
+        return this.callPolicy.TotalTimeoutMs();
+    }
+
     /// <summary>关闭复用的 keep-alive 连接（若在）。客户端仍可继续
     /// 使用：下一次请求会重新建立连接。进程退出前或长寿命客户端
     /// 空闲时调用，避免悬挂的半开连接。</summary>
@@ -513,15 +547,16 @@ class HttpClient {
         }
 
         TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
-                                                     this.timeout);
+                                                     this.ConnectBudget());
         if (conn == null) {
             FailConnect();
         }
         // 从这里起，截止时间由清扫器接管：接受连接后
         // 就沉默不语的对端会让本协程永久挂起，
         // 因为 reactor 唤醒无法取消。
-        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
+        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
         int _sent = await conn.SendAsync(BuildRequest(method, path, body, true));
+        HttpDeadline.Touch(watch, this.ReadBudget());
 
         // 读取响应。chunk 被提到循环外并在之后清空，
         // 因为超时是通过 `throw` 展开的，而它不会
@@ -579,7 +614,7 @@ class HttpClient {
     async string RequestTlsAsync(string method, string path, string body) {
         Socket.Initialize();
         TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
-                                                     this.timeout);
+                                                     this.ConnectBudget());
         if (conn == null) {
             FailConnect();
         }
@@ -604,7 +639,8 @@ class HttpClient {
             ctx.DisableVerify();
         }
         this.ApplyPinning(ctx);
-        TlsStream stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host);
+        TlsStream stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host,
+                                                        this.HandshakeBudget());
         if (stream == null) {
             conn.Close();
             ctx.Free();
@@ -617,9 +653,10 @@ class HttpClient {
 
         // 握手已完成；像普通路径那样，用相同方式约束
         // 数据交换本身。
-        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
+        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
         string requestData = BuildRequest(method, path, body, true);
         int _sent = await stream.SendAsync(requestData, requestData.Length);
+        HttpDeadline.Touch(watch, this.ReadBudget());
 
         StringBuilder respSb = new StringBuilder();
         int responseBytes = 0;
@@ -700,7 +737,8 @@ class HttpClient {
                     FailConnect();
                 }
             }
-            int watch = HttpDeadline.Arm(this.kaConn.Sock(), this.timeout);
+            HttpDeadlineToken watch = HttpDeadline.Arm(this.kaConn.Sock(),
+                this.WriteBudget(), this.TotalBudget());
             string req = this.BuildRequest(method, path, body, false);
             int _sent;
             if (this.kaTls != null) {
@@ -708,6 +746,7 @@ class HttpClient {
             } else {
                 _sent = await this.kaConn.SendAsync(req);
             }
+            HttpDeadline.Touch(watch, this.ReadBudget());
             int he = await this.ka.ReadHead(65536);
             if (he == 0 && reused && attempt == 1) {
                 // 空闲连接已被对端回收，请求未被处理：换新连接重试。
@@ -849,7 +888,7 @@ class HttpClient {
     // 错误文本与一次性通道一致。
     async bool ConnectAlive() {
         TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
-                                                     this.timeout);
+                                                     this.ConnectBudget());
         if (conn == null) { return false; }
         if (!this.useTls) {
             this.kaConn = conn;
@@ -878,8 +917,8 @@ class HttpClient {
             ctx.DisableVerify();
         }
         this.ApplyPinning(ctx);
-        TlsStream stream = await TlsStream.ConnectAsync(ctx, conn.Sock(),
-                                                       this.host);
+        TlsStream stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host,
+                                                       this.HandshakeBudget());
         if (stream == null) {
             conn.Close();
             ctx.Free();
@@ -935,9 +974,9 @@ class HttpClient {
             return tResp;
         }
         TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
-                                                     this.timeout);
+                                                     this.ConnectBudget());
         if (conn == null) { FailConnect(); }
-        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
+        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
         string req = this.BuildRequest(method, path, body, true);
         int _sent = await conn.SendBytesAsync(req, req.Length);
         HttpResponse resp = await this.ReadFramedResponse(conn, path, method,
@@ -951,7 +990,9 @@ class HttpClient {
     // 清理时随连接一并关闭。（throw 不释放存活局部变量的缺陷已由
     // A8-3/A8-12 修复，不再需要 throw 前逐个置空的历史卫生。）
     async HttpResponse ReadFramedResponse(TcpClient conn, string path,
-            string method, int watch, TlsStream stream, TlsContext ctx) {
+            string method, HttpDeadlineToken watch, TlsStream stream, TlsContext ctx) {
+        // 请求已上线，后续响应等待使用 read phase，而非 write phase。
+        HttpDeadline.Touch(watch, this.ReadBudget());
         HttpFramer fr;
         if (stream != null) {
             fr = HttpFramer.CreateTls(stream);
@@ -1087,7 +1128,7 @@ class HttpClient {
                                          string body) {
         Socket.Initialize();
         TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
-                                                     this.timeout);
+                                                     this.ConnectBudget());
         if (conn == null) { FailConnect(); }
         TlsContext ctx;
         if (this.clientCertificateFile.Length > 0
@@ -1110,8 +1151,8 @@ class HttpClient {
             ctx.DisableVerify();
         }
         this.ApplyPinning(ctx);
-        TlsStream stream = await TlsStream.ConnectAsync(ctx, conn.Sock(),
-                                                       this.host);
+        TlsStream stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host,
+                                                       this.HandshakeBudget());
         if (stream == null) {
             conn.Close();
             ctx.Free();
@@ -1121,7 +1162,7 @@ class HttpClient {
             }
             throw new HttpRequestException(tlsHandshakeError);
         }
-        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
+        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
         string req = this.BuildRequest(method, path, body, true);
         int _sent = await stream.SendAsync(req, req.Length);
         HttpResponse resp = await this.ReadFramedResponse(conn, path, method,
@@ -1140,9 +1181,9 @@ class HttpClient {
         this.CheckRequestLimit(total);
         this.CheckTargetPolicy();
         TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
-                                                     this.timeout);
+                                                     this.ConnectBudget());
         if (conn == null) { FailConnect(); }
-        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
+        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
         string req = this.BuildRequestHead(method, path, total, true);
         int _h = await conn.SendBytesAsync(req, req.Length);
         int _m = await conn.SendBytesAsync(head, head.Length);
@@ -1178,7 +1219,7 @@ class HttpClient {
         this.CheckTargetPolicy();
         Socket.Initialize();
         TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port,
-                                                     this.timeout);
+                                                     this.ConnectBudget());
         if (conn == null) { FailConnect(); }
         TlsContext ctx;
         if (this.clientCertificateFile.Length > 0
@@ -1201,8 +1242,8 @@ class HttpClient {
             ctx.DisableVerify();
         }
         this.ApplyPinning(ctx);
-        TlsStream stream = await TlsStream.ConnectAsync(ctx, conn.Sock(),
-                                                       this.host);
+        TlsStream stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host,
+                                                       this.HandshakeBudget());
         if (stream == null) {
             conn.Close();
             ctx.Free();
@@ -1212,7 +1253,7 @@ class HttpClient {
             }
             throw new HttpRequestException(tlsHandshakeError);
         }
-        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
+        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
         string req = this.BuildRequestHead(method, path, total, true);
         int _h = await stream.SendAsync(req, req.Length);
         int _m = await stream.SendAsync(head, head.Length);
@@ -1357,39 +1398,64 @@ class HttpClient {
     // SSE 流按假尺寸行解析到乱码/截断。
     static bool HeadIsChunked(string head) {
         int lineStart = 0;
+        bool sawTe = false;
+        bool finalChunked = false;
         while (lineStart < head.Length) {
             int lineEnd = head.Length;
             int e = HttpClient.IndexOf(head, "\n", lineStart);
             if (e >= 0) { lineEnd = e; }
+            int stop = lineEnd;
+            if (stop > lineStart && (head[stop - 1] & 255) == 13) {
+                stop = stop - 1;
+            }
             int colon = -1;
-            for (int i = lineStart; i < lineEnd; i = i + 1) {
+            for (int i = lineStart; i < stop; i = i + 1) {
                 if ((head[i] & 255) == 58) { colon = i; break; }
             }
             if (colon == lineStart + 17
                 && HttpClient.AsciiNameEquals(
                     head.Substring(lineStart, 17), "transfer-encoding", 17)) {
-                // 取值部分最后一个逗号之后的项，去尾部空白后比较。
+                sawTe = true;
                 int p = colon + 1;
-                int lastComma = p - 1;
-                for (int i = p; i < lineEnd; i = i + 1) {
-                    if ((head[i] & 255) == 44) { lastComma = i; }
+                while (p < stop && ((head[p] & 255) == 32
+                        || (head[p] & 255) == 9)) { p = p + 1; }
+                bool lineSaw = false;
+                bool lineFinal = false;
+                while (p < stop) {
+                    int itemEnd = p;
+                    while (itemEnd < stop && (head[itemEnd] & 255) != 44) {
+                        itemEnd = itemEnd + 1;
+                    }
+                    int itemStop = itemEnd;
+                    while (itemStop > p && ((head[itemStop - 1] & 255) == 32
+                            || (head[itemStop - 1] & 255) == 9)) {
+                        itemStop = itemStop - 1;
+                    }
+                    if (itemStop <= p) { return false; }
+                    int semi = p;
+                    while (semi < itemStop && (head[semi] & 255) != 59) {
+                        semi = semi + 1;
+                    }
+                    int codingStop = semi;
+                    while (codingStop > p && ((head[codingStop - 1] & 255) == 32
+                            || (head[codingStop - 1] & 255) == 9)) {
+                        codingStop = codingStop - 1;
+                    }
+                    if (codingStop <= p) { return false; }
+                    lineFinal = codingStop - p == 7
+                        && HttpClient.AsciiNameEquals(
+                            head.Substring(p, codingStop - p), "chunked", 7);
+                    lineSaw = true;
+                    p = itemEnd + 1;
+                    while (p < stop && ((head[p] & 255) == 32
+                            || (head[p] & 255) == 9)) { p = p + 1; }
                 }
-                int itemStart = lastComma + 1;
-                int itemEnd = lineEnd;
-                while (itemEnd > itemStart) {
-                    int b = head[itemEnd - 1] & 255;
-                    if (b == 32 || b == 9 || b == 13) { itemEnd = itemEnd - 1; }
-                    else { break; }
-                }
-                return itemEnd - itemStart == 7
-                    && HttpClient.AsciiNameEquals(
-                        head.Substring(itemStart, itemEnd - itemStart),
-                        "chunked", 7);
+                if (lineSaw) { finalChunked = lineFinal; }
             }
             if (e < 0) { break; }
             lineStart = e + 1;
         }
-        return false;
+        return sawTe && finalChunked;
     }
 
     // 从 "HTTP/1.1 200 OK" 中解析出数字状态码。
@@ -1446,7 +1512,7 @@ class HttpClient {
             return 0;
         }
         Socket.Initialize();
-        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port, this.timeout);
+        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port, this.ConnectBudget());
         if (conn == null) {
             sink.Finish("err: connect to " + this.host + " failed");
             return 0;
@@ -1471,7 +1537,8 @@ class HttpClient {
             }
             if (!this.verifyTls) { ctx.DisableVerify(); }
             this.ApplyPinning(ctx);
-            stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host);
+            stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host,
+                                                        this.HandshakeBudget());
             if (stream == null) {
                 conn.Close();
                 ctx.Free();
@@ -1484,7 +1551,7 @@ class HttpClient {
             }
         }
 
-        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
+        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
         string requestData = BuildRequest("POST", path, body, true);
         if (this.useTls) {
             int _s = await stream.SendAsync(requestData, requestData.Length);
@@ -1507,7 +1574,7 @@ class HttpClient {
             if (scanFrom < 0) { scanFrom = 0; }
             head = head + c;
             hb = HttpClient.IndexOf(head, "\r\n\r\n", scanFrom);
-            HttpDeadline.Touch(watch, this.timeout);
+            HttpDeadline.Touch(watch, this.IdleBudget());
         }
 
         // 未找到头部终止符：对端提前关闭、超时，或发送了
@@ -1677,7 +1744,7 @@ class HttpClient {
                             // 有数据到达：重启空闲窗口，这样健康
                             // 的长连接流绝不会在传输中途被切断。
                             if (!HttpDeadline.Expired(watch)) {
-                                HttpDeadline.Touch(watch, this.timeout);
+                                HttpDeadline.Touch(watch, this.IdleBudget());
                             }
                         }
                     }
@@ -1973,7 +2040,7 @@ class HttpClient {
         }
 
         Socket.Initialize();
-        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port, this.timeout);
+        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port, this.ConnectBudget());
         if (conn == null) { return 0 - 1; }
         TlsStream stream = null;
         TlsContext ctx = null;
@@ -1994,7 +2061,8 @@ class HttpClient {
             }
             if (!this.verifyTls) { ctx.DisableVerify(); }
             this.ApplyPinning(ctx);
-            stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host);
+            stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host,
+                                                        this.HandshakeBudget());
             if (stream == null) {
                 this.SetDownloadError("TLS 阶段失败：" + TlsStream.LastError());
                 conn.Close();
@@ -2003,7 +2071,7 @@ class HttpClient {
             }
         }
 
-        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
+        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
         StringBuilder sb = new StringBuilder();
         sb.Append("GET ");
         sb.Append(path);
@@ -2036,7 +2104,7 @@ class HttpClient {
             if (scanFrom < 0) { scanFrom = 0; }
             head = head + c;
             hb = HttpClient.IndexOf(head, "\r\n\r\n", scanFrom);
-            HttpDeadline.Touch(watch, this.timeout);
+            HttpDeadline.Touch(watch, this.IdleBudget());
         }
         // 未找到头部终止符：对端提前关闭 / 超时 / 头部过大。
         if (hb < 0) {
@@ -2159,7 +2227,7 @@ class HttpClient {
                     // 切断：截止时间是一个空闲窗口，
                     // 每收到一个 chunk 就重新计时。
                     if (!HttpDeadline.Expired(watch)) {
-                        HttpDeadline.Touch(watch, this.timeout);
+                        HttpDeadline.Touch(watch, this.IdleBudget());
                     }
                 }
             }
@@ -2219,7 +2287,7 @@ class HttpClient {
         }
 
         Socket.Initialize();
-        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port, this.timeout);
+        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port, this.ConnectBudget());
         if (conn == null) {
             if (TcpClient.LastConnectResolveFailed()) {
                 this.SetDownloadError("DNS 解析失败");
@@ -2249,7 +2317,8 @@ class HttpClient {
             }
             if (!this.verifyTls) { ctx.DisableVerify(); }
             this.ApplyPinning(ctx);
-            stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host);
+            stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host,
+                                                        this.HandshakeBudget());
             if (stream == null) {
                 this.SetDownloadError("TLS 阶段失败：" + TlsStream.LastError());
                 conn.Close();
@@ -2258,7 +2327,7 @@ class HttpClient {
             }
         }
 
-        int watch = HttpDeadline.Arm(conn.Sock(), this.timeout);
+        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
         StringBuilder sb = new StringBuilder();
         sb.Append("GET ");
         sb.Append(path);
@@ -2303,7 +2372,7 @@ class HttpClient {
                 else if (c == 10 && (seen == 1 || seen == 3)) { seen = seen + 1; }
                 else { seen = 0; }
                 if (seen == 4) { endOfHead = true; }
-                HttpDeadline.Touch(watch, this.timeout);
+                HttpDeadline.Touch(watch, this.IdleBudget());
             }
         }
         if (!endOfHead) {
@@ -2419,7 +2488,7 @@ class HttpClient {
                 }
                 if (total > 0 && written >= total) { finished = true; }
                 if (!HttpDeadline.Expired(watch)) {
-                    HttpDeadline.Touch(watch, this.timeout);
+                    HttpDeadline.Touch(watch, this.IdleBudget());
                 }
                 // 块边界上优雅退出：已写入的字节都是完整的，下一轮
                 // 同一个调用会从这里接着下。

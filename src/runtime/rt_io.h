@@ -64,6 +64,32 @@ int32_t zan_io_resolve_ipv4(const char *hostname);
 int32_t zan_io_resolve_sa(const char *name, int32_t port, void *buf,
                           int32_t cap);
 
+/* Resolve every IPv4/IPv6 candidate into caller-owned fixed-size records.
+ * Each record occupies ZAN_IO_SA_STRIDE bytes, starts with the native
+ * sockaddr (16 bytes for AF_INET or 28 bytes for AF_INET6), and is zero-filled
+ * through the rest of the record. The return value is the number of records
+ * written; malformed arguments, resolver failure, or a buffer too small for
+ * one record return 0. No pointers from getaddrinfo escape this call. */
+#define ZAN_IO_SA_STRIDE 32
+int32_t zan_io_resolve_all(const char *name, int32_t port, void *buf,
+                           int32_t cap);
+/* Same operation with a scalar pointer ABI, intended for await native externs:
+ * the caller keeps name_ptr and buf_ptr valid until the await resumes. */
+int64_t zan_io_resolve_all_async(intptr_t name_ptr, int32_t port,
+                                 intptr_t buf_ptr, int32_t cap);
+
+/* Return AF_INET / AF_INET6 for a binary sockaddr, or 0 for an invalid or
+ * unsupported address. This keeps family classification out of Zan code. */
+int32_t zan_io_sockaddr_family(const void *sa, int32_t len);
+
+/* Start an exact sockaddr connect without resolving or rewriting the address.
+ * Returns 0 when connected, -2 while in progress, or a positive platform
+ * error code (-1 when no code is available). The socket is made nonblocking. */
+int32_t zan_io_connect_sa_start(intptr_t fd, const void *sa, int32_t salen);
+/* Worker-safe async ABI: exact sockaddr connect, returning 0 on success or
+ * the platform error code. This function never performs DNS. */
+int64_t zan_io_connect_sa(intptr_t fd, const void *sa, int32_t salen);
+
 /* Format the address part of a sockaddr (IPv4 or IPv6) as a dotted-quad /
  * colon-hex string. Returns a static buffer (INET6_ADDRSTRLEN), or "" when
  * the family is neither AF_INET nor AF_INET6. */

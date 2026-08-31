@@ -1,4 +1,5 @@
 using System.Json;
+using System.Net.Http;
 using System.Net.Sockets;
 using System.Text;
 using System.Diagnostics;
@@ -107,6 +108,7 @@ class HttpContext {
         this.wasHijacked = false;
         this.frames = 0;
         this.framesBytes = 0;
+        this.deadlineSlot = null;
         HttpContext.ParsePairs(req.queryString, this.query);
         // 表单在这里解析一次，服务的是直接构造 HttpContext 的调用方
         // （此时 request.body 已是完整正文）。WebApp 的连接循环里正文
@@ -595,6 +597,41 @@ class HttpContext {
     /// <summary>Attaches the live connection. Called by the server; a handler
     /// never needs it.</summary>
     void __Attach(TcpClient client) { this.conn = client; }
+
+    /// <summary>The live connection's socket, for handlers that must manage
+    /// their own deadlines (an SSE stream that legitimately stays silent for
+    /// minutes while the upstream model thinks). Returns 0 before __Attach.
+    /// </summary>
+    nint ClientSock() {
+        if (this.conn == null) { return 0; }
+        return this.conn.Sock();
+    }
+
+    /// <summary>The per-request deadline slot this connection rides on. A
+    /// long-lived stream handler must Touch it periodically (see
+    /// ClientStreamWatch): the connection sweeper shuts sockets down at the
+    /// deadline even mid-stream, which used to cut every SSE response that
+    /// ran past the server's request timeout (default 30s) — the exact
+    /// "upstream never finished but the client got dropped" signature.
+    /// null when the connection predates deadline tracking.</summary>
+    HttpDeadlineToken deadlineSlot;
+
+    HttpDeadlineToken DeadlineSlot() { return this.deadlineSlot; }
+
+    void __SetDeadlineSlot(HttpDeadlineToken slot) { this.deadlineSlot = slot; }
+
+    /// <summary>Re-arms this connection's request deadline for another full
+    /// window. A streaming handler calls this every time it has evidence the
+    /// stream is alive — data relayed, or a keep-alive ping accepted. Without
+    /// it the connection sweeper shuts the socket down at requestTimeoutMs
+    /// (default 30s) regardless of stream health, which is why long SSE
+    /// relays used to die mid-answer with "client disconnected".
+    /// No-op when the connection carries no deadline.</summary>
+    void TouchDeadline(int timeoutMs) {
+        if (this.deadlineSlot != null) {
+            HttpDeadline.Touch(this.deadlineSlot, timeoutMs);
+        }
+    }
 
     /// <summary>Whether this request took the connection over.</summary>
     bool Hijacked() { return this.hijacked; }

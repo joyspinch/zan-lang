@@ -537,6 +537,56 @@ int32_t zan_io_resolve_ipv4(const char *hostname) {
     return addr;
 }
 
+int32_t zan_io_sockaddr_family(const void *sa, int32_t len) {
+    if (!sa || len < 2) return 0;
+    const struct sockaddr *a = (const struct sockaddr *)sa;
+    if (a->sa_family == AF_INET && len >= (int32_t)sizeof(struct sockaddr_in))
+        return AF_INET;
+    if (a->sa_family == AF_INET6 && len >= (int32_t)sizeof(struct sockaddr_in6))
+        return AF_INET6;
+    return 0;
+}
+
+int32_t zan_io_resolve_all(const char *name, int32_t port, void *buf,
+                           int32_t cap) {
+    if (!name || !*name || !buf || cap < ZAN_IO_SA_STRIDE) return 0;
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_ADDRCONFIG;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(name, portstr, &hints, &res) != 0 || !res) {
+        /* AI_ADDRCONFIG can reject ::1 on hosts with no non-loopback v6. */
+        hints.ai_flags = 0;
+        if (getaddrinfo(name, portstr, &hints, &res) != 0 || !res) return 0;
+    }
+    int32_t count = 0;
+    for (struct addrinfo *p = res;
+         p && (count + 1) * ZAN_IO_SA_STRIDE <= cap; p = p->ai_next) {
+        int32_t len = zan_io_sockaddr_family(p->ai_addr,
+            (int32_t)p->ai_addrlen) == AF_INET6
+            ? (int32_t)sizeof(struct sockaddr_in6)
+            : zan_io_sockaddr_family(p->ai_addr, (int32_t)p->ai_addrlen) == AF_INET
+            ? (int32_t)sizeof(struct sockaddr_in) : 0;
+        if (!len || p->ai_addrlen < (size_t)len) continue;
+        unsigned char *dst = (unsigned char *)buf + count * ZAN_IO_SA_STRIDE;
+        memset(dst, 0, ZAN_IO_SA_STRIDE);
+        memcpy(dst, p->ai_addr, (size_t)len);
+        count++;
+    }
+    freeaddrinfo(res);
+    return count;
+}
+
+int64_t zan_io_resolve_all_async(intptr_t name_ptr, int32_t port,
+                                 intptr_t buf_ptr, int32_t cap) {
+    return (int64_t)zan_io_resolve_all((const char *)name_ptr, port,
+                                       (void *)buf_ptr, cap);
+}
+
 #if defined(_WIN32)
 /* Read the encoded DER pointer/length from a Windows PCCERT_CONTEXT.
  * Returns the pointer to the encoded bytes and writes the length to *out_len.
@@ -625,6 +675,53 @@ int32_t zan_io_connect_status(intptr_t fd) {
         return (int64_t)err;
     }
     return -2;
+}
+
+int32_t zan_io_connect_sa_start(intptr_t fd, const void *sa, int32_t salen) {
+    if (!sa || zan_io_sockaddr_family(sa, salen) == 0) return -1;
+    if (zan_io_set_nonblocking(fd) != 0) return -1;
+#if defined(_WIN32)
+    SOCKET s = (SOCKET)fd;
+    int r = connect(s, (const struct sockaddr *)sa, salen);
+    if (r == 0) return 0;
+    int e = WSAGetLastError();
+    if (e == WSAEINPROGRESS || e == WSAEWOULDBLOCK || e == WSAEALREADY)
+        return -2;
+    return e > 0 ? e : -1;
+#else
+    int r = connect((int)fd, (const struct sockaddr *)sa, (socklen_t)salen);
+    if (r == 0) return 0;
+    if (errno == EINPROGRESS || errno == EWOULDBLOCK || errno == EALREADY)
+        return -2;
+    return errno > 0 ? errno : -1;
+#endif
+}
+
+/* Blocking-worker variant of exact connect. The caller's sockaddr is consumed
+ * only during the initial syscall; no DNS or text conversion is performed. */
+int64_t zan_io_connect_sa(intptr_t fd, const void *sa, int32_t salen) {
+    int32_t r = zan_io_connect_sa_start(fd, sa, salen);
+    if (r == 0 || r != -2) return r;
+#if defined(_WIN32)
+    fd_set wfds, efds;
+    FD_ZERO(&wfds); FD_ZERO(&efds);
+    FD_SET((SOCKET)fd, &wfds); FD_SET((SOCKET)fd, &efds);
+    if (select(0, NULL, &wfds, &efds, NULL) <= 0) return -1;
+    int err = 0, len = (int)sizeof(err);
+    if (getsockopt((SOCKET)fd, SOL_SOCKET, SO_ERROR, (char *)&err, &len) != 0)
+        return -1;
+#else
+    fd_set wfds, efds;
+    FD_ZERO(&wfds); FD_ZERO(&efds);
+    if (fd < 0 || fd >= FD_SETSIZE) return -1;
+    FD_SET((int)fd, &wfds); FD_SET((int)fd, &efds);
+    if (select((int)fd + 1, NULL, &wfds, &efds, NULL) <= 0) return -1;
+    int err = 0;
+    socklen_t len = (socklen_t)sizeof(err);
+    if (getsockopt((int)fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0)
+        return -1;
+#endif
+    return err == 0 ? 0 : err;
 }
 
 /* ---- fd-indexed watcher slots (POSIX readiness backends) ----
@@ -2589,7 +2686,7 @@ void zan_rt_blocking_co(void *fn, int32_t argc,
     blocking_submit(&w->job);
 }
 
-/* ================= coroutine-facing ABI ================= */
+/* ---- coroutine-facing ABI ================= */
 
 /* ---- stackless (CPS) registration + idle bridge ---- */
 

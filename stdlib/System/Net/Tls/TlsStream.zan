@@ -559,7 +559,7 @@ class TlsStream {
         TlsStream s = Setup(ctx, sock);
         if (s == null) { return null; }
         SSL_set_accept_state(s.ssl);
-        int ok = await s.HandshakeAsync();
+        int ok = await s.HandshakeAsync(30000);
         if (ok != 1) {
             s.Close();
             return null;
@@ -570,7 +570,14 @@ class TlsStream {
     /// <summary>客户端：包装已连接的套接字，发送
     /// <paramref name="host"/> 的 SNI 并执行 TLS 握手。握手失败时
     /// 返回 null。</summary>
+    /// <summary>客户端 TLS 握手；timeoutMs 为握手阶段预算，&lt;= 0 表示不设
+    /// 握手截止时间。保留三参数入口供非 HTTP 调用方使用。</summary>
     static async TlsStream ConnectAsync(TlsContext ctx, nint sock, string host) {
+        return await TlsStream.ConnectAsync(ctx, sock, host, 30000);
+    }
+
+    static async TlsStream ConnectAsync(TlsContext ctx, nint sock, string host,
+                                         int timeoutMs) {
         TlsStream.SetLastError("");
         TlsStream s = Setup(ctx, sock);
         if (s == null) {
@@ -619,7 +626,7 @@ class TlsStream {
             SSL_CTX_set_verify(ctx.ctx, verifyNone, null);
             SSL_set_verify(s.ssl, verifyNone, null);
         }
-        int ok = await s.HandshakeAsync();
+        int ok = await s.HandshakeAsync(timeoutMs);
         if (ok != 1) {
             // SSL_VERIFY_PEER 下证书不受信任在握手中就失败，此时真正的原因
             // 记在 verify_result 里，只报「握手失败」看不出是信任库问题。
@@ -785,14 +792,15 @@ class TlsStream {
     /// 此前会无限循环 WANT_READ，钉死一个协程 + SSL + BIO + 17KB
     /// 暂存缓冲——面向公网的服务器这样被逐个耗干。超时返回 -2，
     /// 调用方照常关闭连接。</summary>
-    async int HandshakeAsync() {
-        long deadlineUs = MonotonicUs() + 30000000;
+    async int HandshakeAsync(int timeoutMs) {
+        long deadlineUs = 0;
+        if (timeoutMs > 0) { deadlineUs = MonotonicUs() + timeoutMs * 1000; }
         while (true) {
             int r = Norm(SSL_do_handshake(this.ssl));
             int flushed = await FlushOutAsync();
             if (flushed < 0) { return -1; }
             if (r == 1) { return 1; }
-            if (MonotonicUs() >= deadlineUs) { return -2; }
+            if (timeoutMs > 0 && MonotonicUs() >= deadlineUs) { return -2; }
             int err = SSL_get_error(this.ssl, r);
             // 2 = SSL_ERROR_WANT_READ, 3 = SSL_ERROR_WANT_WRITE
             if (err == 2) {

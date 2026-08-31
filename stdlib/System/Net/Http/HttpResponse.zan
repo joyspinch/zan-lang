@@ -72,9 +72,20 @@ class HttpResponse {
     /// <summary>正文是否为二进制缓冲区。</summary>
     bool IsBinary() { return this.bodyBytes != null; }
 
-    /// <summary>创建重定向响应。</summary>
+    static bool HasCrlf(string s) {
+        return s.IndexOf("\r") >= 0 || s.IndexOf("\n") >= 0;
+    }
+
+    /// <summary>创建重定向响应。Location 不允许注入折行；非法值
+    /// 被保守拒绝，不产生一个可被下游解释的重定向头。</summary>
     static HttpResponse Redirect(string url) {
         HttpResponse resp = new HttpResponse();
+        if (HttpResponse.HasCrlf(url)) {
+            resp.statusCode = 400;
+            resp.statusText = "Bad Request";
+            resp.body = "";
+            return resp;
+        }
         resp.statusCode = 302;
         resp.statusText = "Found";
         resp.headers.Add("Location: " + url);
@@ -118,8 +129,13 @@ class HttpResponse {
         this.bodyBytesLen = 0;
     }
 
-    /// <summary>设置响应头。</summary>
+    /// <summary>设置响应头。名称和值均禁止 CR/LF，避免注入
+    /// 额外字段或响应体；非法输入保持响应可序列化但不添加该头。</summary>
     HttpResponse SetHeader(string name, string headerValue) {
+        if (name.Length == 0 || HttpResponse.HasCrlf(name)
+            || HttpResponse.HasCrlf(headerValue)) {
+            return this;
+        }
         this.headers.Add(name + ": " + headerValue);
         return this;
     }
@@ -196,6 +212,24 @@ class HttpResponse {
         return this.BuildHeaders() + this.body;
     }
 
+    static bool IsOws(int c) {
+        return c == 32 || c == 9;
+    }
+
+    static int TrimOwsStart(string s, int start, int stop) {
+        while (start < stop && HttpResponse.IsOws(s[start] & 255)) {
+            start = start + 1;
+        }
+        return start;
+    }
+
+    static int TrimOwsStop(string s, int start, int stop) {
+        while (stop > start && HttpResponse.IsOws(s[stop - 1] & 255)) {
+            stop = stop - 1;
+        }
+        return stop;
+    }
+
     /// <summary>解析原始 HTTP 响应（客户端用法）。</summary>
     static HttpResponse Parse(string raw) {
         HttpResponse resp = new HttpResponse();
@@ -211,19 +245,28 @@ class HttpResponse {
             statusLine = statusLine.Substring(0, statusLine.Length - 1);
         }
 
-        // 解析状态码
+        // 解析状态码：HTTP-version 后必须至少一个 SP/HTAB；
+        // reason-phrase 前的 OWS 同样允许 HTAB。
         int sp1 = 0;
-        for (; sp1 < statusLine.Length && statusLine.Substring(sp1, 1) != " "; sp1 = sp1 + 1) {
+        while (sp1 < statusLine.Length
+                && !HttpResponse.IsOws(statusLine[sp1] & 255)) {
+            sp1 = sp1 + 1;
         }
-        int sp2 = sp1 + 1;
-        while (sp2 < statusLine.Length && statusLine.Substring(sp2, 1) != " ") {
+        int codeStart = HttpResponse.TrimOwsStart(statusLine, sp1,
+            statusLine.Length);
+        int sp2 = codeStart;
+        while (sp2 < statusLine.Length
+                && !HttpResponse.IsOws(statusLine[sp2] & 255)) {
             sp2 = sp2 + 1;
         }
-        if (sp2 > sp1 + 1) {
-            resp.statusCode = Convert.ToInt(statusLine.Substring(sp1 + 1, sp2 - sp1 - 1));
+        if (sp2 > codeStart) {
+            resp.statusCode = Convert.ToInt(statusLine.Substring(codeStart,
+                sp2 - codeStart));
         }
-        if (sp2 < statusLine.Length) {
-            resp.statusText = statusLine.Substring(sp2 + 1);
+        int reasonStart = HttpResponse.TrimOwsStart(statusLine, sp2,
+            statusLine.Length);
+        if (reasonStart < statusLine.Length) {
+            resp.statusText = statusLine.Substring(reasonStart);
         }
 
         // 解析头部直到空行
@@ -242,12 +285,17 @@ class HttpResponse {
                 bodyStart = hEnd + 1;
                 break;
             }
-            resp.headers.Add(headerLine);
-            // 解析 Content-Type
-            if (headerLine.Length > 14) {
-                string prefix = headerLine.Substring(0, 13);
-                if (prefix == "Content-Type:" || prefix == "content-type:") {
-                    resp.contentType = headerLine.Substring(14);
+            int colon = headerLine.IndexOf(":");
+            if (colon > 0) {
+                resp.headers.Add(headerLine);
+                string name = headerLine.Substring(0, colon).ToLower();
+                if (name == "content-type") {
+                    int valueStart = HttpResponse.TrimOwsStart(headerLine,
+                        colon + 1, headerLine.Length);
+                    int valueStop = HttpResponse.TrimOwsStop(headerLine,
+                        valueStart, headerLine.Length);
+                    resp.contentType = headerLine.Substring(valueStart,
+                        valueStop - valueStart);
                 }
             }
             pos = hEnd + 1;

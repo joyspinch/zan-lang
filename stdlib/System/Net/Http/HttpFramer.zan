@@ -135,19 +135,46 @@ class HttpFramer {
         return -1;
     }
 
+    // 头部读取不能调用无上限的 Fill：一次 64KB 的 recv 可能把
+    // maxHeaderBytes 直接冲过头，随后才检查已经太迟。只接收仍在
+    // cap 内的字节，并在追加后再次核验，保证恶意头不会先进入 pend。
+    async int FillHead(int maxHeaderBytes) {
+        int room = maxHeaderBytes - this.pend.Length();
+        if (room <= 0) { return -431; }
+        int want = this.bufCap;
+        if (want > room) { want = room; }
+        int n = 0;
+        if (this.tls != null) {
+            n = await this.tls.RecvIntoAsync(this.buf, want);
+        } else {
+            n = await Socket.RecvIntoAsync(this.sock, this.buf, want);
+        }
+        if (n <= 0) {
+            this.closed = true;
+            return 0;
+        }
+        if (n > room) { return -431; }
+        this.pend.WriteRaw(this.buf, n);
+        if (this.pend.Length() > maxHeaderBytes) { return -431; }
+        return n;
+    }
+
     /// <summary>一直接收，直到完整的头部块到齐。
     /// 返回头部块长度（含结束空行）；对端在请求中途关闭返回 0；
     /// 头部块超过 <paramref name="maxHeaderBytes"/> 返回 -431——
     /// 违规字节在被无限缓冲之前就被拒绝（slowloris 的一种形态是
     /// 只发头部却永不发空行）。</summary>
     async int ReadHead(int maxHeaderBytes) {
+        if (maxHeaderBytes <= 0) { return -431; }
         int he = this.HeaderEnd();
         while (he < 0) {
-            if (this.pend.Length() > maxHeaderBytes) { return -431; }
-            int n = await this.Fill();
+            int n = await this.FillHead(maxHeaderBytes);
+            if (n == -431) { return -431; }
             if (n == 0) { return 0; }
             he = this.HeaderEnd();
+            if (this.pend.Length() > maxHeaderBytes) { return -431; }
         }
+        if (he > maxHeaderBytes) { return -431; }
         return he;
     }
 

@@ -232,8 +232,21 @@ class HttpServer {
                                   HttpFramer framer,
                                   int maxHeaderBytes, int maxRequestBytes,
                                   int timeoutMs) {
+        HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, timeoutMs);
+        try {
+            await HttpServer.ServeFramedCore(clientSock, handler, framer,
+                maxHeaderBytes, maxRequestBytes, timeoutMs, watch);
+        } finally {
+            // Core also disarms on normal completion; this is the exception path.
+            HttpDeadline.Disarm(watch);
+        }
+    }
+
+    static async int ServeFramedCore(nint clientSock, HttpRequestHandler handler,
+                                  HttpFramer framer,
+                                  int maxHeaderBytes, int maxRequestBytes,
+                                  int timeoutMs, HttpDeadlineToken watch) {
         TcpClient client = TcpClient.FromSocket(clientSock);
-        int watch = HttpDeadline.Arm(clientSock, timeoutMs);
         bool keepAlive = true;
         int reject = 0;
 
@@ -334,6 +347,7 @@ class HttpServer {
         HttpDeadline.Disarm(watch);
         framer.Dispose();
         client.Close();
+        return 0;
     }
 
     /// <summary>停止服务器。</summary>
@@ -355,15 +369,33 @@ class HttpServer {
     }
 }
 
+class HttpDeadlineToken {
+    int slot;
+    int generation;
+    bool disarmed;
+
+    HttpDeadlineToken(int slot, int generation) {
+        this.slot = slot;
+        this.generation = generation;
+        this.disarmed = false;
+    }
+}
+
 class HttpDeadlineSlot {
     nint sock;
-    int deadline;
+    long deadline;
+    int generation;
+    bool active;
     bool fired;
+    long totalDeadline;
 
-    HttpDeadlineSlot(nint sock, int deadline) {
+    HttpDeadlineSlot(nint sock, long deadline) {
         this.sock = sock;
         this.deadline = deadline;
+        this.generation = 1;
+        this.active = true;
         this.fired = false;
+        this.totalDeadline = 0;
     }
 }
 
@@ -393,67 +425,101 @@ class HttpDeadline {
     static List<HttpDeadlineSlot> slots = new List<HttpDeadlineSlot>();
     static List<int> freeSlots = new List<int>();
     static bool sweeping = false;
-    // 由扫描器维护的粗粒度时钟：读取真实时钟需要一次系统调用
-    // （POSIX 上还有一次内存分配），而超时精度以秒计，
-    // 不必为每个请求付出该代价。
+    static int activeCount = 0;
+    // 仅作扫描器的缓存；Touch 会先刷新它，不能使用上一次 sweep 的旧值。
     static long nowMs = 0;
 
-    /// <summary>注册一个连接并返回其槽位；
-    /// 截止时间被禁用（timeoutMs &lt;= 0）时返回 -1。</summary>
-    static int Arm(nint sock, int timeoutMs) {
-        if (timeoutMs <= 0) { return -1; }
+    /// <summary>注册一个连接并返回带 generation 的 token；
+    /// 截止时间被禁用（timeoutMs &lt;= 0）时返回 null。</summary>
+    static HttpDeadlineToken Arm(nint sock, int timeoutMs) {
+        return HttpDeadline.Arm(sock, timeoutMs, 0);
+    }
+
+    /// <summary>注册阶段 deadline，并可附带从 Arm 时刻起的 total budget。
+    /// totalMs &lt;= 0 表示不设总预算。</summary>
+    static HttpDeadlineToken Arm(nint sock, int timeoutMs, int totalMs) {
+        if (timeoutMs <= 0 && totalMs <= 0) { return null; }
         lock (slots) {
-            if (!sweeping) {
-                sweeping = true;
-                nowMs = Stopwatch.GetMilliseconds();
-                Task.Spawn(HttpDeadline.Sweep());
-            }
+            nowMs = Stopwatch.GetMilliseconds();
+            int phase = timeoutMs;
+            if (phase <= 0) { phase = totalMs; }
+            int slot;
             int n = freeSlots.Count;
             if (n > 0) {
-                int slot = freeSlots[n - 1];
+                slot = freeSlots[n - 1];
                 freeSlots.RemoveAt(n - 1);
-                slots[slot].sock = sock;
-                slots[slot].deadline = nowMs + timeoutMs;
-                slots[slot].fired = false;
-                return slot;
+                HttpDeadlineSlot old = slots[slot];
+                old.generation = old.generation + 1;
+                if (old.generation <= 0) { old.generation = 1; }
+                old.sock = sock;
+                old.deadline = nowMs + phase;
+                old.fired = false;
+                old.active = true;
+                old.totalDeadline = totalMs > 0 ? nowMs + totalMs : 0;
+            } else {
+                slots.Add(new HttpDeadlineSlot(sock, nowMs + phase));
+                if (totalMs > 0) { slots[slots.Count - 1].totalDeadline = nowMs + totalMs; }
+                slot = slots.Count - 1;
             }
-            slots.Add(new HttpDeadlineSlot(sock, nowMs + timeoutMs));
-            return slots.Count - 1;
+            activeCount = activeCount + 1;
+            HttpDeadlineToken token = new HttpDeadlineToken(slot,
+                slots[slot].generation);
+            if (!sweeping) {
+                // sweeping 只在锁内读写；StopSweeping 在发现新连接时会
+                // 重新启动扫描器，避免最后一次 sweep 与 Arm 之间丢唤醒。
+                sweeping = true;
+                Task.Spawn(HttpDeadline.Sweep());
+            }
+            return token;
         }
     }
 
-    /// <summary>为某个槽位重启时间窗口（每个请求调用一次）。</summary>
-    static void Touch(int slot, int timeoutMs) {
-        if (slot < 0) { return; }
+    /// <summary>为 token 重启时间窗口（每个请求调用一次）。</summary>
+    static void Touch(HttpDeadlineToken token, int timeoutMs) {
+        if (token == null || token.disarmed || timeoutMs <= 0) { return; }
         lock (slots) {
-            slots[slot].deadline = nowMs + timeoutMs;
-            slots[slot].fired = false;
+            if (token.disarmed || token.slot < 0 || token.slot >= slots.Count) { return; }
+            HttpDeadlineSlot slot = slots[token.slot];
+            if (!slot.active || slot.generation != token.generation) { return; }
+            nowMs = Stopwatch.GetMilliseconds();
+            long next = nowMs + timeoutMs;
+            if (slot.totalDeadline > 0 && next > slot.totalDeadline) {
+                next = slot.totalDeadline;
+            }
+            slot.deadline = next;
+            slot.fired = false;
         }
     }
 
-    /// <summary>当扫描器已对该槽位执行挂断时返回 true，即唤醒
-    /// 归属者读取的是截止时间而非对端。需要报告
-    /// 超时的调用方（HTTP 客户端）必须在 Disarm 之前查询。</summary>
-    static bool Expired(int slot) {
-        if (slot < 0) { return false; }
+    /// <summary>当扫描器已对 token 执行挂断时返回 true。
+    /// 必须在 Disarm 前查询。</summary>
+    static bool Expired(HttpDeadlineToken token) {
+        if (token == null || token.disarmed) { return false; }
         lock (slots) {
-            return slots[slot].fired;
+            if (token.disarmed || token.slot < 0 || token.slot >= slots.Count) { return false; }
+            HttpDeadlineSlot slot = slots[token.slot];
+            return slot.active && slot.generation == token.generation && slot.fired;
         }
     }
 
-    /// <summary>连接结束时释放槽位。</summary>
-    static void Disarm(int slot) {
-        if (slot < 0) { return; }
+    /// <summary>连接结束时释放 token；重复释放安全，旧 token 不能释放新连接。</summary>
+    static void Disarm(HttpDeadlineToken token) {
+        if (token == null) { return; }
         lock (slots) {
-            slots[slot].sock = -1;
-            freeSlots.Add(slot);
+            if (token.disarmed) { return; }
+            token.disarmed = true;
+            if (token.slot < 0 || token.slot >= slots.Count) { return; }
+            HttpDeadlineSlot slot = slots[token.slot];
+            if (!slot.active || slot.generation != token.generation) { return; }
+            slot.active = false;
+            slot.sock = -1;
+            slot.fired = false;
+            activeCount = activeCount - 1;
+            freeSlots.Add(token.slot);
         }
     }
 
-    // 单次扫描：刷新粗粒度时钟并对超时的连接执行挂断。
-    // 不放入协程，是因为在 async 方法内部写入静态变量会
-    // 按值捕获——时钟更新会丢失，
-    // 导致所有连接都看起来超时。
+    // 单次扫描：刷新粗粒度时钟并对活动连接执行挂断。
     static bool SweepOnce() {
         lock (slots) {
             nowMs = Stopwatch.GetMilliseconds();
@@ -461,36 +527,34 @@ class HttpDeadline {
             for (int i = 0; i < n; i = i + 1) {
                 HttpDeadlineSlot slot = slots[i];
                 nint s = slot.sock;
-                if (s >= 0 && nowMs > slot.deadline) {
-                    // 将截止时间推远，确保每个槽位只被挂断一次；
-                    // 归属协程在展开时会通过 Disarm 释放它。
+                if (slot.active && s >= 0 && nowMs >= slot.deadline && !slot.fired) {
+                    // fired 保持到归属者查询/Disarm；generation 防止旧 token
+                    // 在槽位复用后误触碰新连接。
                     slot.deadline = nowMs + 3600000;
                     slot.fired = true;
                     Socket.ShutdownBoth(s);
                 }
             }
-            return slots.Count > freeSlots.Count;
+            return activeCount > 0;
         }
     }
 
-    static void StopSweeping() {
-        lock (slots) {
-            sweeping = false;
-        }
-    }
-
-    // 扫描器只在有连接被 Arm 时存活：让一个协程常驻于
-    // 永久定时循环会让调度器（以及整个进程）在最后一个
-    // 服务器任务结束后仍保持存活。Arm() 会重启它。
+    // 扫描器只在有活动 token 时存活；SweepOnce 返回后仍需在锁内
+    // 再确认一次 activeCount，避免 Arm 与扫描器退出之间丢失唤醒。
     static async void Sweep() {
-        bool live = true;
-        while (live) {
+        while (true) {
             await Task.Delay(1000);
-            live = HttpDeadline.SweepOnce();
+            bool live = HttpDeadline.SweepOnce();
+            if (live) { continue; }
+            lock (slots) {
+                if (activeCount > 0) { continue; }
+                sweeping = false;
+                return;
+            }
         }
-        HttpDeadline.StopSweeping();
     }
 }
+
 
 /// <summary>一条已注册的路由：method + path + 静态响应体，作为一个
 /// 整体保存，而非三个索引对齐的并行列表。</summary>
