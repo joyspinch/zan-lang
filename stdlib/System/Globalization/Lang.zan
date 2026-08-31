@@ -1,0 +1,111 @@
+using System;
+using System.IO;
+using System.Json;
+
+/// <summary>
+/// 键式多语言查找（Apple .strings 同构）：源代码里保留英文原文作为
+/// <b>键</b>（同时也是缺省值），各语言的译文放在独立的语言包文件里，
+/// 运行时按当前语言查表——命中用译文，未命中回退调用方提供的缺省串。
+/// 新增一门语言 = 新增一个包文件，不需要重编译。
+///
+/// 包文件布局：<c>&lt;dir&gt;/&lt;code&gt;.json</c>（如
+/// <c>assets/lang/zh.json</c>），内容是平铺的键值对象：
+/// <c>{ "English source text": "中文翻译", ... }</c>。键就是源代码里的
+/// 英文原文（与 .strings 把源文案当键一致）；包可以只覆盖一部分键，
+/// 缺口按调用方缺省串逐条回退，所以包可以增量翻译。
+///
+/// 加载通过普通 <see cref="File"/> 调用进行：相对路径先盘上、后 exe
+/// 内嵌副本（zanc --embed），发布形态无需特殊处理。包按需解析一次并
+/// 缓存；切语言不重新读盘。
+/// </summary>
+class Lang {
+    /// 当前语言代码（"en" / "zh" / ...）。空串 = 源语言（键本身），
+    /// 查找直接返回缺省串，不查表。
+    static string code = "";
+
+    /// 已解析的语言包缓存：<语言代码, 键 -> 译文>。
+    static Dictionary<string, Dictionary<string, string>> packs;
+
+    /// 语言包所在目录的候选列表（LoadDir/LoadDirs 记录）。按序探测：
+    /// 仓库内运行用工程相对路径，发布形态用 exe 旁的 assets/ 相对路径。
+    static List<string> dirs;
+
+    /// <summary>当前语言代码。</summary>
+    static string Code() { return Lang.code; }
+
+    /// <summary>切换语言（"en"/"zh"/...；空串 = 源语言）。包在首次
+    /// 查找时按需加载；未知语言在查找时表现为回退缺省串。返回是否
+    /// 发生了变化。</summary>
+    static bool Set(string newCode) {
+        if (Lang.code == newCode) { return false; }
+        Lang.code = newCode;
+        return true;
+    }
+
+    /// <summary>设置语言包目录并立即预载当前语言的包（可选）。之后
+    /// 每次切语言都会从同一目录按需加载对应包。</summary>
+    static void LoadDir(string langDir) {
+        List<string> ds = new List<string>();
+        ds.Add(langDir);
+        Lang.LoadDirs(ds);
+    }
+
+    /// <summary>同 LoadDir，但接受一组按序探测的候选目录（第一个存在
+    /// 对应包文件的获胜）——与宿主程序自己的资产路径解析约定对齐。
+    /// </summary>
+    static void LoadDirs(List<string> langDirs) {
+        Lang.dirs = langDirs;
+        if (Lang.code != "") { Lang.Pack(Lang.code); }
+    }
+
+    /// <summary>两参查找：<paramref name="key"/> 是源代码里的英文原文，
+    /// <paramref name="dflt"/> 是调用方内置的当前语言缺省串（兼容既有
+    /// T(en, zh) 调用形态）。当前语言命中包则用包译文；未命中回退
+    /// <paramref name="dflt"/>；源语言（空代码）直接返回缺省串。</summary>
+    static string Tr(string key, string dflt) {
+        if (Lang.code == "" || key == "") { return dflt; }
+        Dictionary<string, string> pack = Lang.Pack(Lang.code);
+        if (pack == null) { return dflt; }
+        if (pack.ContainsKey(key)) { return pack[key]; }
+        return dflt;
+    }
+
+    /// <summary>单参查找：没有内置缺省串的新代码用这个，包未命中时
+    /// 回退键本身（即英文原文），与 .strings 的 key-fallback 一致。</summary>
+    static string Tr(string key) {
+        return Lang.Tr(key, key);
+    }
+
+    /// <summary>语言代码 -> 键值表；解析失败/文件缺失返回 null（查找
+    /// 逐条回退缺省串，不打断程序）。包只解析一次，之后走缓存。</summary>
+    static Dictionary<string, string> Pack(string code) {
+        if (Lang.packs != null && Lang.packs.ContainsKey(code)) {
+            return Lang.packs[code];
+        }
+        Dictionary<string, string> pack = null;
+        if (Lang.dirs != null) {
+            for (int di = 0; di < Lang.dirs.Count; di = di + 1) {
+                string path = Lang.dirs[di] + "/" + code + ".json";
+                if (!File.Exists(path)) { continue; }
+                string raw = File.ReadAllText(path);
+                JsonValue root = null;
+                try { root = JsonValue.Parse(raw); }
+                catch (JsonException) { root = null; }
+                if (root != null && root.IsObject()) {
+                    pack = new Dictionary<string, string>();
+                    for (int i = 0; i < root.Count(); i = i + 1) {
+                        JsonValue v = root.ValAt(i);
+                        if (v == null || !v.IsString()) { continue; }
+                        pack.Add(root.KeyAt(i), v.AsString(""));
+                    }
+                }
+                break;  // 文件存在即认领（坏包也如此），与 DataText 一致
+            }
+        }
+        if (Lang.packs == null) {
+            Lang.packs = new Dictionary<string, Dictionary<string, string>>();
+        }
+        Lang.packs.Add(code, pack);
+        return pack;
+    }
+}
