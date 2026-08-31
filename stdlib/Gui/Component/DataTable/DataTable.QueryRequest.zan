@@ -1,0 +1,85 @@
+using System;
+using System.Json;
+
+namespace Gui.Component.DataTable;
+
+/// 远端查询请求的稳定传输包。它把不可变计划、视口和请求身份
+/// 绑定在一起，服务端可据此校验迟到响应、cursor 和 revision。
+class QueryRequestEnvelope {
+    static const int FormatVersion = 1;
+    QueryPlanContract contract;
+    QueryViewport viewport;
+    QueryRequestToken token;
+
+    QueryRequestEnvelope(QueryPlanContract planContract,
+                         QueryViewport pageViewport,
+                         QueryRequestToken requestToken) {
+        this.contract = planContract;
+        this.viewport = pageViewport;
+        this.token = requestToken;
+    }
+
+    static QueryRequestEnvelope Build(QueryPlanContract contract,
+                                      QueryViewport viewport,
+                                      QueryRequestToken token) {
+        return new QueryRequestEnvelope(contract, viewport, token);
+    }
+
+    QueryPlanContract Contract() { return this.contract; }
+    QueryViewport Viewport() { return this.viewport; }
+    QueryRequestToken Token() { return this.token; }
+
+    bool IsValid() {
+        if (this.contract == null || !this.contract.IsValid()
+            || this.contract.Pushed() == null || this.contract.Residual() == null
+            || this.viewport == null || this.token == null) { return false; }
+        return this.token.QueryText() == this.contract.Pushed().QueryText()
+            && this.token.QueryHash() == this.contract.Pushed().QueryHash()
+            && this.token.QueryText() == this.contract.Residual().QueryText()
+            && this.token.QueryHash() == this.contract.Residual().QueryHash();
+    }
+
+    /// canonical JSON：顶层先写请求身份和视口，再写完整 plan 包，
+    /// 方便服务端在不解析 rows 的情况下完成请求去重和 revision 校验。
+    string ToJson() {
+        JsonValue root = JsonValue.NewObject();
+        root.Put("ver", JsonValue.NewNum(Convert.ToString(QueryRequestEnvelope.FormatVersion)));
+        int requestId = 0;
+        int generation = 0;
+        int schema = 0;
+        int server = 0;
+        string queryText = "";
+        int queryHash = 0;
+        if (this.token != null) {
+            requestId = this.token.RequestId();
+            generation = this.token.Generation();
+            schema = this.token.SchemaVersion();
+            server = this.token.ServerRevision();
+            queryText = this.token.QueryText();
+            queryHash = this.token.QueryHash();
+        }
+        root.Put("requestId", JsonValue.NewNum(Convert.ToString(requestId)));
+        root.Put("generation", JsonValue.NewNum(Convert.ToString(generation)));
+        root.Put("schema", JsonValue.NewNum(Convert.ToString(schema)));
+        root.Put("server", JsonValue.NewNum(Convert.ToString(server)));
+        root.Put("query", JsonValue.NewStr(queryText));
+        root.Put("hash", JsonValue.NewNum(Convert.ToString(queryHash)));
+        int start = 0;
+        int count = 1;
+        string cursor = "";
+        if (this.viewport != null) {
+            start = this.viewport.Start();
+            count = this.viewport.Count();
+            cursor = this.viewport.Cursor();
+        }
+        root.Put("start", JsonValue.NewNum(Convert.ToString(start)));
+        root.Put("count", JsonValue.NewNum(Convert.ToString(count)));
+        root.Put("cursor", JsonValue.NewStr(cursor));
+        root.Put("valid", JsonValue.NewBool(this.IsValid()));
+        if (this.contract != null) {
+            JsonValue plan = JsonValue.ParseLenient(this.contract.ToJson());
+            if (plan != null) { root.Put("plan", plan); }
+        }
+        return root.ToJson();
+    }
+}
