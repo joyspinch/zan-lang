@@ -234,43 +234,74 @@ class Host {
 
     SdlWindow window;
     SdlRenderer r;
-    SdlTexture canvas;   // 3x supersample target; downsampled on present
+    SdlTexture canvas;   // ss x supersample target; downsampled on present
     int logicalW;
     int logicalH;
     bool running;
     bool fullscreen;
     bool ignoreMax;   // swallow the maximize event fired when leaving fullscreen
+    int frameMs;      // target frame time (>0 caps the fps; 0 = vsync only)
+    int nextFrame;    // absolute tick deadline for the next frame start
+    int idleMs;       // frame time while minimized (0 = no idle throttle)
+    bool minimized;
+    // Custom title bar (borderless window + game-drawn bar). SDL_HITTEST
+    // handles dragging/resizing natively; the game only draws the bar.
+    bool customBar;
+    string barTitle;
+    bool mouseBarDown;   // game feeds mouse state inside the bar zone
 
+    // ss=3 bakes a ~4K raster target (razor-sharp on 4K panels). Fill-heavy
+    // games (idle games repaint hundreds of scanline fills per frame) should
+    // pass 2: still anti-aliased after the linear downsample, at under half
+    // the fill cost.
     static Host Create(string title, int logicalW, int logicalH) {
+        return Host.CreateSs(title, logicalW, logicalH, 3);
+    }
+
+    static Host CreateSs(string title, int logicalW, int logicalH, int ss) {
+        return Host.CreateFull(title, logicalW, logicalH, ss, false);
+    }
+
+    // customBar: borderless window + SDL hit-test drag/resize + game-drawn
+    // title bar (Host.DrawTitleBar / TitleBarInput). The OS title bar on a
+    // themed desktop clashes with game art; this keeps one visual language.
+    static Host CreateFull(string title, int logicalW, int logicalH, int ss, bool customBar) {
         Sdl.Init(SdlInit.Video() + SdlInit.Events());
         Host h = new Host();
+        int flags = SdlWindowFlags.Resizable() + SdlWindowFlags.HighPixelDensity();
+        if (customBar) { flags = flags + SdlWindowFlags.Borderless(); }
+        h.customBar = customBar;
+        h.barTitle = title;
         // Windowed by default at 1.5x the logical size (comfortably large on
         // 1440p/4K without covering the desktop), resizable and high-DPI
         // aware; F11 toggles fullscreen. The letterboxed logical canvas keeps
         // gameplay math resolution-independent.
-        h.window = SdlWindow.Create(title, logicalW * 3 / 2, logicalH * 3 / 2,
-            SdlWindowFlags.Resizable() + SdlWindowFlags.HighPixelDensity());
+        h.window = SdlWindow.Create(title, logicalW * 3 / 2, logicalH * 3 / 2, flags);
+        if (customBar) { h.window.SetGameHitTest(); }
         h.r = SdlRenderer.Create(h.window);
         h.r.SetBlend(1);
         h.r.SetVSync(true);
-        // Rasterize the whole scene at ~native 4K by super-scaling the logical
-        // canvas 3x; on a ~3840px display this is 1:1 (razor-sharp vectors),
-        // and it merely down-samples cleanly on smaller windows. Game code keeps
-        // authoring in the fixed design units (logicalW x logicalH).
-        int f = 3;
+        // Rasterize the whole scene at ss x the logical canvas; at 1:1 on a
+        // matching display this is razor-sharp, and it merely down-samples
+        // cleanly on smaller windows. Game code keeps authoring in the fixed
+        // design units (logicalW x logicalH).
+        int f = ss;
+        if (f < 1) { f = 1; }
         h.r.SetLogicalSize(logicalW * f, logicalH * f,
             SdlLogicalPresentation.Letterbox());
         h.r.SetUiScale(f, 1);
-        // Actual supersampling: draw the frame into a 3x offscreen target and
-        // blit it back linear-filtered, so vector shapes get real edge
+        // Actual supersampling: draw the frame into an ss x offscreen target
+        // and blit it back linear-filtered, so vector shapes get real edge
         // anti-aliasing on any window size (logical presentation alone only
         // scales coordinates and leaves jagged edges).
         h.canvas = SdlTexture.CreateTarget(h.r, logicalW * f, logicalH * f);
         Sprite.Bake(h.r);
+        Draw.EnsureRound(h.r);
         h.logicalW = logicalW;
         h.logicalH = logicalH;
         h.running = true;
         h.fullscreen = false;
+        h.frameMs = 0;
         // Tamper defense is release-only: dev builds (compiled without -DPUBLISH)
         // must stay debuggable, so the guard is never armed there.
         #if PUBLISH
@@ -284,6 +315,54 @@ class Host {
     int Height() { return this.logicalH; }
     bool Running() { return this.running; }
     void Quit() { this.running = false; }
+
+    // Cap the render loop at ~fps. VSync usually already paces the loop, but
+    // a 165Hz display paces it at 165fps -- the GPU still burns 2.75x the
+    // frames a 2D idle game needs. This throttles to the requested budget by
+    // sleeping until the frame *start* deadline (not after Present), so the
+    // pace holds regardless of how fast Present returns.
+    void LimitFps(int fps) {
+        if (fps < 10) { fps = 10; }
+        if (fps > 240) { fps = 240; }
+        this.frameMs = 1000 / fps;
+        this.nextFrame = Sdl.Ticks();
+    }
+
+    // Drop to the idle fps while the window is minimized (or unfocused, see
+    // SetIdleFps callers), so a background idle game costs ~nothing: rendering
+    // to an invisible window is wasted power. Sim state keeps ticking because
+    // the game's Step() stays in the loop -- only the Present is skipped and
+    // the frame deadline stretched.
+    void SetIdleFps(int fps) {
+        if (fps < 1) { fps = 1; }
+        this.idleMs = 1000 / fps;
+    }
+
+    void SetMinimized(bool m) {
+        if (this.minimized == m) { return; }
+        this.minimized = m;
+        // skip the catch-up burst on restore
+        this.nextFrame = Sdl.Ticks() + this.frameMs;
+    }
+
+    bool Minimized() { return this.minimized; }
+
+    // Sleep until the next frame's start deadline, then advance it. Sleeping
+    // before Present would stall the swap chain, so this runs from End() --
+    // but on a vsync'd driver Present itself blocks, so the deadline is kept
+    // in absolute ticks and only the surplus is slept.
+    void PaceFrame() {
+        int ms = this.frameMs;
+        if (this.minimized && this.idleMs > ms) { ms = this.idleMs; }
+        if (ms <= 0) { return; }
+        int now = Sdl.Ticks();
+        if (now < this.nextFrame) {
+            int slack = this.nextFrame - now;
+            if (slack > 4) { Sdl.Delay(slack - 3); }
+        }
+        this.nextFrame = this.nextFrame + ms;
+        if (this.nextFrame < now) { this.nextFrame = now + ms; }
+    }
 
     void ToggleFullscreen() {
         this.fullscreen = !this.fullscreen;
@@ -300,9 +379,84 @@ class Host {
     }
     bool IsFullscreen() { return this.fullscreen; }
 
+    // ---- Custom title bar -------------------------------------------------
+    // Games call DrawTitleBar() first in their render pass (logical units)
+    // and TitleBarInput() in their event handler. Bar geometry is fixed:
+    // 40 design units tall, caption buttons on the right (46x32, 8 gap).
+
+    static int BarH() { return 40; }
+    static int BtnW() { return 46; }
+    static int BtnH() { return 32; }
+    static int BtnGap() { return 8; }
+    static int BtnPad() { return 10; }
+
+    bool HasCustomBar() { return this.customBar; }
+
+    // Draw the themed bar: title text left, minimize/maximize/close right.
+    // Returns the three button rects so the game can also use them for hover.
+    // ox/oy = x-offset of the button row (close btn x). Callers draw icons.
+    void DrawTitleBarChrome(SdlRenderer r, int w, int themeR, int themeG, int themeB) {
+        if (!this.customBar) { return; }
+        int bh = Host.BarH();
+        // bar background: slightly darker than game bg + bottom hairline
+        Draw.RoundRectFill(r, 0, 0, w, bh, 0, themeR, themeG, themeB, 255);
+        Draw.RoundRectFill(r, 0, bh - 1, w, 1, 0, 255, 255, 255, 26);
+        // title (left, vertically centered)
+        Text.DrawShadow(r, this.barTitle, 14, bh / 2 - 13, 2, 220, 226, 244, 2);
+    }
+
+    // Caption button rects (min, max, close) in logical units for width w.
+    void BarButtons(int w, int[] outRects) {
+        int bw = Host.BtnW();
+        int bh = Host.BtnH();
+        int y = (Host.BarH() - bh) / 2;
+        int closeX = w - Host.BtnPad() - bw;
+        int maxX = closeX - Host.BtnGap() - bw;
+        int minX = maxX - Host.BtnGap() - bw;
+        outRects[0] = minX; outRects[1] = y;
+        outRects[2] = maxX; outRects[3] = y;
+        outRects[4] = closeX; outRects[5] = y;
+    }
+
+    // Handle hover + click for the caption buttons. mx/my are window-client
+    // coords in design units (Host.MouseX/Y). Returns:
+    // 0 none, 1 minimize pressed, 2 maximize pressed, 3 close pressed.
+    // The game should draw the button glyphs itself (hover tint differs).
+    int BarInput(int mx, int my, int w) {
+        if (!this.customBar) { return 0; }
+        if (!Draw.PointIn(mx, my, 0, 0, w, Host.BarH())) { return 0; }
+        int[] rc = new int[6];
+        this.BarButtons(w, rc);
+        if (!Draw.PointIn(mx, my, rc[0], rc[1], Host.BtnW() * 3 + Host.BtnGap() * 2, Host.BtnH())) {
+            return 0;
+        }
+        if (!this.mouseBarDown) { return 0; }
+        if (Draw.PointIn(mx, my, rc[0], rc[1], Host.BtnW(), Host.BtnH())) { return 1; }
+        if (Draw.PointIn(mx, my, rc[2], rc[3], Host.BtnW(), Host.BtnH())) { return 2; }
+        if (Draw.PointIn(mx, my, rc[4], rc[5], Host.BtnW(), Host.BtnH())) { return 3; }
+        return 0;
+    }
+
+    // The game must feed mouse-down/up state for the bar zone each frame.
+    void SetBarMouseDown(bool down) { this.mouseBarDown = down; }
+
+    void ShowBarMenu() {
+        #if WINDOWS
+        Host.SdlShowSystemMenu(this.window.Handle());
+        #endif
+    }
+    #if WINDOWS
+    [DllImport("SDL3", EntryPoint = "SDL_ShowWindowSystemMenu")]
+    static extern int SdlShowSystemMenuRaw(nint win, int x, int y);
+    static void SdlShowSystemMenu(nint win) {
+        Host.SdlShowSystemMenuRaw(win, 0, 0);
+    }
+    #endif
+
     // The OS maximize button enters borderless fullscreen (same as F11), so a
     // maximized game never shows a title bar.
     void OnWindowEvent(int type) {
+        if (type == SdlEventType.WindowMinimized()) { this.SetMinimized(true); }
         if (type == SdlEventType.WindowMaximized()) {
             if (this.ignoreMax) { this.ignoreMax = false; return; }
             if (!this.fullscreen) {
@@ -310,8 +464,13 @@ class Host {
                 this.window.SetFullscreen(true);
             }
         }
-        if (type == SdlEventType.WindowRestored()) { this.ignoreMax = false; }
+        if (type == SdlEventType.WindowRestored()) {
+            this.ignoreMax = false;
+            this.SetMinimized(false);
+        }
     }
+
+    void Minimize() { this.window.Minimize(); }
 
     int MouseX() {
         return this.r.LogicalX(SdlEvent.MouseX(), SdlEvent.MouseY())
@@ -337,6 +496,7 @@ class Host {
             this.r.DrawTexture(this.canvas, 0, 0, this.logicalW, this.logicalH);
         }
         this.r.Present();
+        this.PaceFrame();
         #if PUBLISH
         Guard.Check();
         #endif
@@ -458,10 +618,161 @@ class Rng {
         if (hi <= lo) { return lo; }
         return lo + this.Next() % (hi - lo);
     }
+
+    // Uniform double in [0, 1).
+    double NextDouble01() {
+        return (this.Next() & 16777215) / 16777216.0;
+    }
 }
 
-// Integer drawing helpers not provided by the SDL wrapper.
-class Draw {
+    // Integer drawing helpers not provided by the SDL wrapper.
+    class Draw {
+        // Filled rectangle with rounded corners, drawn as one pre-baked nine-slice
+        // style texture (baked once per host) scaled over the target rect. This
+        // replaces the per-frame scanline rasterization of every panel/button --
+        // at 3x supersampling a fullscreen RoundRectFill is 2160 FillRectRaw calls
+        // (~4000px wide each); text-heavy games stacking 30+ panels per frame
+        // pegged the GPU. Falls back to scanlines only if baking failed.
+        static SdlTexture roundTex;
+    static bool roundTried;
+    static int RP() { return 24; }   // baked corner radius, native px
+    static int S() { return 4; }     // bake supersample
+
+    static void EnsureRound(SdlRenderer r) {
+        if (Draw.roundTried) { return; }
+        Draw.roundTried = true;
+        int s = Draw.S();
+        int rad = Draw.RP();
+        int side = rad * 2 * s;
+        SdlTexture t = SdlTexture.CreateTarget(r, side, side);
+        if (t == null || !t.IsValid()) { return; }
+        r.SetTarget(t);
+        r.SetBlend(0);
+        r.SetColor(255, 255, 255, 0);
+        r.Clear();
+        // Supersampled coverage mask for smooth anti-aliased corners. The
+        // texel grid is rad*2*s wide; rows are painted full-white, and the
+        // alpha ramp comes from the linear downsample when scaled.
+        for (int oy = 0; oy < side; oy = oy + 1) {
+            double dy = (oy + 0.5) / s - rad;
+            double under = rad * rad - dy * dy;
+            if (under < 0) { continue; }
+            double dxr = rad - Math.Sqrt(under);
+            int inset = (int)(dxr * s + 0.5);
+            int wid = side - inset * 2;
+            if (wid <= 0) { continue; }
+            r.SetColor(255, 255, 255, 255);
+            r.FillRectRaw(inset, oy, wid, 1);
+        }
+        t.SetBlendMode(1);
+        r.ResetTarget();
+        Draw.roundTex = t;
+    }
+
+    // Nine-slice draw of the baked rounded rect: corners 1:1, edges stretched,
+    // center stretched. The baked texel grid is rad*2*s wide; the top-left
+    // corner block (rad*s px native) is the only curved part, everything else
+    // samples from the solid middle. All slices source from one quadrant.
+    static void RoundTex(SdlRenderer r, int x, int y, int w, int h, int rad,
+                         int cr, int cg, int cb, int ca) {
+        if (w <= 0 || h <= 0) { return; }
+        if (rad * 2 > w) { rad = w / 2; }
+        if (rad * 2 > h) { rad = h / 2; }
+        if (Draw.roundTex == null || rad != Draw.RP()) {
+            // rad != baked radius: nine-slice would distort the corners. The
+            // scanline path below handles any radius; guard against mutual
+            // recursion by never calling back into RoundRectFill.
+            Draw.RoundRectScan(r, x, y, w, h, rad, cr, cg, cb, ca);
+            return;
+        }
+        Draw.roundTex.SetColor(cr, cg, cb);
+        Draw.roundTex.SetOpacity(ca);
+        int m = Draw.S();
+        int R = Draw.RP();          // design corner radius
+        int c = R * m;              // native corner block size
+        int g = R * 2 * m;          // native texel grid size
+        int midW = w - R * 2;
+        int midH = h - R * 2;
+        // center
+        if (midW > 0 && midH > 0) {
+            r.DrawTextureRegion(Draw.roundTex, c, c, 2, 2, x + R, y + R, midW, midH);
+        }
+        // top / bottom edge
+        if (midW > 0) {
+            r.DrawTextureRegion(Draw.roundTex, c, 0, 2, c, x + R, y, midW, R);
+            r.DrawTextureRegion(Draw.roundTex, c, c, 2, c,
+                x + R, y + h - R, midW, R);
+        }
+        // left / right edge
+        if (midH > 0) {
+            r.DrawTextureRegion(Draw.roundTex, c, c, c, 2, x, y + R, R, midH);
+            r.DrawTextureRegion(Draw.roundTex, c, c, c, 2,
+                x + w - R, y + R, R, midH);
+        }
+        // corners: the four native corner blocks of the baked grid
+        r.DrawTextureRegion(Draw.roundTex, 0, 0, c, c, x, y, R, R);
+        r.DrawTextureRegion(Draw.roundTex, c, 0, c, c, x + w - R, y, R, R);
+        r.DrawTextureRegion(Draw.roundTex, 0, c, c, c, x, y + h - R, R, R);
+        r.DrawTextureRegion(Draw.roundTex, c, c, c, c, x + w - R, y + h - R, R, R);
+        Draw.roundTex.ResetColor();
+        Draw.roundTex.SetOpacity(255);
+    }
+
+    // Cached 1x-h vertical gradient strip, stretched per draw so a fullscreen
+    // gradient costs one textured quad instead of h scanline fills.
+    static SdlTexture gradTex;
+    static int gradR0 = -1;
+    static int gradG0 = -1;
+    static int gradB0 = -1;
+    static int gradR1 = -1;
+    static int gradG1 = -1;
+    static int gradB1 = -1;
+    static int gradH = -1;
+
+    // One-quad vertical gradient into rect (x,y,w,h). Bakes a 1x-h strip on
+    // first use (or when colors/height change) and stretches it -- replaces
+    // h FillRect scanlines per frame with a single textured quad.
+    static void VGradient(SdlRenderer r, int x, int y, int w, int h,
+                          int r0, int g0, int b0, int r1, int g1, int b1, int ca) {
+        if (h <= 0) { return; }
+        if (Draw.gradTex == null || h != Draw.gradH
+            || r0 != Draw.gradR0 || g0 != Draw.gradG0 || b0 != Draw.gradB0
+            || r1 != Draw.gradR1 || g1 != Draw.gradG1 || b1 != Draw.gradB1) {
+            SdlTexture t = SdlTexture.CreateTarget(r, 1, h);
+            if (t != null && t.IsValid()) {
+                r.SetTarget(t);
+                r.SetBlend(0);
+                for (int j = 0; j < h; j = j + 1) {
+                    r.SetColor(r0 + (r1 - r0) * j / h,
+                               g0 + (g1 - g0) * j / h,
+                               b0 + (b1 - b0) * j / h, 255);
+                    r.FillRectRaw(0, j, 1, 1);
+                }
+                t.SetBlendMode(1);
+                r.SetBlend(1);
+                r.ResetTarget();
+                Draw.gradTex = t;
+                Draw.gradH = h;
+                Draw.gradR0 = r0; Draw.gradG0 = g0; Draw.gradB0 = b0;
+                Draw.gradR1 = r1; Draw.gradG1 = g1; Draw.gradB1 = b1;
+            }
+        }
+        if (Draw.gradTex != null && h == Draw.gradH) {
+            Draw.gradTex.SetOpacity(ca);
+            r.DrawTexture(Draw.gradTex, x, y, w, h);
+            Draw.gradTex.SetOpacity(255);
+            return;
+        }
+        // fallback: original scanline path
+        for (int j = 0; j < h; j = j + 1) {
+            int cr = r0 + (r1 - r0) * j / h;
+            int cg = g0 + (g1 - g0) * j / h;
+            int cb = b0 + (b1 - b0) * j / h;
+            r.SetColor(cr, cg, cb, ca);
+            r.FillRect(x, y + j, w, 1);
+        }
+    }
+
     static int Isqrt(int n) {
         if (n <= 0) { return 0; }
         int x = n;
@@ -549,9 +860,24 @@ class Draw {
         return px >= x && px < x + w && py >= y && py < y + h;
     }
 
-    // Filled rectangle with rounded corners, rasterized as one scanline pass at
-    // native resolution so translucent fills never double-blend at the corners.
+    // Filled rectangle with rounded corners. Uses the pre-baked nine-slice
+    // texture (one quad per slice) when possible; falls back to the scanline
+    // rasterizer while baking is unavailable.
     static void RoundRectFill(SdlRenderer r, int x, int y, int w, int h, int rad,
+                              int cr, int cg, int cb, int ca) {
+        if (w <= 0 || h <= 0) { return; }
+        if (rad * 2 > w) { rad = w / 2; }
+        if (rad * 2 > h) { rad = h / 2; }
+        if (Draw.roundTex != null) {
+            Draw.RoundTex(r, x, y, w, h, rad, cr, cg, cb, ca);
+            return;
+        }
+        Draw.RoundRectScan(r, x, y, w, h, rad, cr, cg, cb, ca);
+    }
+
+    // Scanline rasterizer for arbitrary radii (also the fallback while the
+    // baked nine-slice texture is unavailable).
+    static void RoundRectScan(SdlRenderer r, int x, int y, int w, int h, int rad,
                               int cr, int cg, int cb, int ca) {
         if (w <= 0 || h <= 0) { return; }
         if (rad * 2 > w) { rad = w / 2; }
@@ -575,19 +901,6 @@ class Draw {
     static void RoundRectStroke(SdlRenderer r, int x, int y, int w, int h, int rad,
                                 int t, int cr, int cg, int cb, int ca) {
         Draw.RoundRectFill(r, x - t, y - t, w + t * 2, h + t * 2, rad + t, cr, cg, cb, ca);
-    }
-
-    // Vertical gradient band (top color -> bottom color), simple scanlines.
-    static void VGradient(SdlRenderer r, int x, int y, int w, int h,
-                          int r0, int g0, int b0, int r1, int g1, int b1, int ca) {
-        if (h <= 0) { return; }
-        for (int j = 0; j < h; j = j + 1) {
-            int cr = r0 + (r1 - r0) * j / h;
-            int cg = g0 + (g1 - g0) * j / h;
-            int cb = b0 + (b1 - b0) * j / h;
-            r.SetColor(cr, cg, cb, ca);
-            r.FillRect(x, y + j, w, 1);
-        }
     }
 
     // Bottom-weighted darkening scrim to keep foreground text legible over art.
@@ -886,6 +1199,28 @@ class Ui {
             Draw.VGradient(r, 0, 0, w, h, 18, 22, 32, 8, 10, 16, 255);
         }
         Draw.Scrim(r, w, h);
+    }
+
+    // Bake a decorative background (gradient + scattered stars) into a target
+    // texture once; games blit it every frame for one draw call instead of
+    // hundreds of scanline fills. Return null when render targets are
+    // unavailable, in which case callers should fall back to VGradient.
+    static SdlTexture BakeBackdrop(SdlRenderer r, int w, int h, Rng rng,
+                                   int topR, int topG, int topB,
+                                   int botR, int botG, int botB, int stars) {
+        SdlTexture t = SdlTexture.CreateTarget(r, w, h);
+        if (t == null || !t.IsValid()) { return null; }
+        r.SetTarget(t);
+        Draw.VGradient(r, 0, 0, w, h, topR, topG, topB, botR, botG, botB, 255);
+        for (int i = 0; i < stars; i = i + 1) {
+            int sx = rng.Range(0, w);
+            int sy = rng.Range(0, h * 2 / 3);
+            int b = rng.Range(30, 130);
+            r.SetColor(200, 205, 255, b);
+            r.FillRect(sx, sy, 2, 2);
+        }
+        r.ResetTarget();
+        return t;
     }
 
     // Frosted translucent rounded panel with a hairline border.

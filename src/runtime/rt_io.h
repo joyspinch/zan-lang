@@ -88,7 +88,8 @@ int32_t zan_io_sockaddr_family(const void *sa, int32_t len);
 int32_t zan_io_connect_sa_start(intptr_t fd, const void *sa, int32_t salen);
 /* Worker-safe async ABI: exact sockaddr connect, returning 0 on success or
  * the platform error code. This function never performs DNS. */
-int64_t zan_io_connect_sa(intptr_t fd, const void *sa, int32_t salen);
+int64_t zan_io_connect_sa(intptr_t fd, const void *sa, int32_t salen,
+                           int32_t timeout_ms);
 
 /* Format the address part of a sockaddr (IPv4 or IPv6) as a dotted-quad /
  * colon-hex string. Returns a static buffer (INET6_ADDRSTRLEN), or "" when

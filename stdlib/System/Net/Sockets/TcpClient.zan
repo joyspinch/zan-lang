@@ -46,21 +46,7 @@ class TcpClient {
     /// 连接建立（非阻塞 connect）。连接失败时返回 null
     /// （例如被拒绝或不可达）。</summary>
     static async TcpClient ConnectAsync(string host, int port) {
-        Socket.Initialize();
-        TcpClient client = new TcpClient();
-        client.host = host;
-        client.port = port;
-        client.sock = Socket.CreateTcp();
-        Socket.SetNonBlocking(client.sock);
-        int err = await Socket.ConnectAsync(client.sock, host, port);
-        TcpClient.MarkConnectResolveFailed(Socket.LastResolveFailed());
-        if (err != 0) {
-            Socket.Close(client.sock);
-            client.sock = -1;
-            return null;
-        }
-        client.connected = true;
-        return client;
+        return await TcpClient.ConnectAsync(host, port, 120000);
     }
 
     /// <summary>带 <paramref name="timeoutMs"/> 截止时间的 ConnectAsync：
@@ -69,24 +55,50 @@ class TcpClient {
     /// 表示"不设截止时间"。</summary>
     static async TcpClient ConnectAsync(string host, int port, int timeoutMs) {
         Socket.Initialize();
-        TcpClient client = new TcpClient();
-        client.host = host;
-        client.port = port;
-        client.sock = Socket.CreateTcp();
-        Socket.SetNonBlocking(client.sock);
         TcpClient.MarkConnectTimeout(false);
-        int err = await Socket.ConnectAsync(client.sock, host, port, timeoutMs);
-        TcpClient.MarkConnectResolveFailed(Socket.LastResolveFailed());
-        if (err != 0) {
-            // 超时时套接字仍在连接过程中；关闭它会中止
-            // 挂起的握手，避免遗留描述符（或 SYN 重试）。
-            Socket.Close(client.sock);
-            client.sock = -1;
-            TcpClient.MarkConnectTimeout(err == -3);
+        TcpClient.MarkConnectResolveFailed(false);
+        int limit = timeoutMs;
+        if (limit <= 0) { limit = 120000; }
+        byte[] records = await Socket.ResolveAllAsync(host, port, 16);
+        int count = records.Length / 32;
+        if (count <= 0) {
+            TcpClient.MarkConnectResolveFailed(true);
             return null;
         }
-        client.connected = true;
-        return client;
+        long deadline = Socket.NativeMonotonicUs() + limit * 1000;
+        for (int i = 0; i < count; i = i + 1) {
+            byte[] rec = new byte[32];
+            int offset = i * 32;
+            for (int j = 0; j < 32; j = j + 1) { rec[j] = records[offset + j]; }
+            int family = Socket.SockAddrFamily(rec, 32);
+            if (family == 0) { continue; }
+            nint sock = Socket.IsV6Family(family) ? Socket.CreateTcp6() : Socket.CreateTcp();
+            if (sock < 0) { continue; }
+            Socket.SetNonBlocking(sock);
+            int remain = (int)((deadline - Socket.NativeMonotonicUs()) / 1000);
+            if (remain <= 0) {
+                Socket.Close(sock);
+                TcpClient.MarkConnectTimeout(true);
+                return null;
+            }
+            int err = await Socket.ConnectSockAddrAsync(sock, rec,
+                Socket.IsV6Family(family) ? 28 : 16, remain);
+            if (err == 0) {
+                TcpClient client = new TcpClient();
+                client.sock = sock;
+                client.host = host; // TLS metadata remains the original hostname.
+                client.port = port;
+                client.connected = true;
+                client.nonBlocking = true;
+                return client;
+            }
+            Socket.Close(sock);
+            if (err == -3) {
+                TcpClient.MarkConnectTimeout(true);
+                return null;
+            }
+        }
+        return null;
     }
 
     /// <summary>本线程最近一次 ConnectAsync 是因超时放弃

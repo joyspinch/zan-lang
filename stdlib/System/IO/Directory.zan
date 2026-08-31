@@ -84,25 +84,25 @@ class Directory {
 
     #if WINDOWS
     [DllImport("kernel32", EntryPoint = "GetFileAttributesW")]
-    static extern int WinGetFileAttributes(string path);
+    static extern int WinGetFileAttributes(nint path);
 
     [DllImport("kernel32", EntryPoint = "CreateDirectoryW")]
-    static extern int WinCreateDirectory(string path, nint secAttrs);
+    static extern int WinCreateDirectory(nint path, nint secAttrs);
 
     [DllImport("kernel32", EntryPoint = "RemoveDirectoryW")]
-    static extern int WinRemoveDirectory(string path);
+    static extern int WinRemoveDirectory(nint path);
 
     [DllImport("kernel32", EntryPoint = "GetCurrentDirectoryW")]
-    static extern int WinGetCurrentDirectory(int bufLen, string buf);
+    static extern int WinGetCurrentDirectory(int bufLen, nint buf);
 
     [DllImport("kernel32", EntryPoint = "SetCurrentDirectoryW")]
-    static extern int WinSetCurrentDirectory(string path);
+    static extern int WinSetCurrentDirectory(nint path);
 
     [DllImport("kernel32", EntryPoint = "FindFirstFileW")]
-    static extern nint WinFindFirstFile(string pattern, string findData);
+    static extern nint WinFindFirstFile(nint pattern, nint findData);
 
     [DllImport("kernel32", EntryPoint = "FindNextFileW")]
-    static extern int WinFindNextFile(nint handle, string findData);
+    static extern int WinFindNextFile(nint handle, nint findData);
 
     [DllImport("kernel32", EntryPoint = "FindClose")]
     static extern int WinFindClose(nint handle);
@@ -110,26 +110,14 @@ class Directory {
     static extern int WinGetLogicalDrives();
 
     [DllImport("kernel32", EntryPoint = "MultiByteToWideChar")]
-    static extern int WinToWide(
-        int codePage,
-        int flags,
-        string source,
-        int sourceLength,
-        string output,
-        int outputLength
-    );
+    static extern int WinToWide(int codePage, int flags, nint source,
+                                int sourceLength, nint output, int outputLength);
 
     [DllImport("kernel32", EntryPoint = "WideCharToMultiByte")]
-    static extern int WinToUtf8(
-        int codePage,
-        int flags,
-        string source,
-        int sourceLength,
-        string output,
-        int outputLength,
-        string defaultChar,
-        string usedDefaultChar
-    );
+    static extern int WinToUtf8(int codePage, int flags, nint source,
+                                int sourceLength, nint output, int outputLength,
+                                nint defaultChar, nint usedDefault);
+
     #else
     // POSIX 目录与文件系统原语（libc）。
     [DllImport("crt", EntryPoint = "opendir")]
@@ -155,30 +143,22 @@ class Directory {
     #endif
 
     #if WINDOWS
-    static byte[] winWide(string text) {
-        int count = WinToWide(65001, 0, text, -1, null, 0);
-        if (count <= 0) { return null; }
-        byte[] wide = new byte[count * 2];
-        WinToWide(65001, 0, text, -1, wide, count);
-        return wide;
+    static nint winWide(string text) {
+        if (text == null) { return 0; }
+        return Wide.Of(text);
     }
 
-    // WideCharToMultiByte 返回的 `count` 包含 NUL 终止符，因此
-    // 托管字符串保留 count-1 个字节。
-    static string winUtf8(string wide) {
-        int count = WinToUtf8(
-            65001, 0, wide, -1, null, 0, null, null);
-        if (count <= 0) { return ""; }
-        byte[] text = new byte[count];
-        WinToUtf8(
-            65001, 0, wide, -1, text, count, null, null);
-        return text.ToStr(0, count - 1);
+    static string winUtf8(nint wide) {
+        if (wide == 0) { return ""; }
+        return Wide.Read(wide);
     }
 
     static int winAttributesUtf8(string path) {
-        byte[] wide = winWide(path);
-        if (wide == null) { return -1; }
-        return WinGetFileAttributes(wide);
+        nint wide = winWide(path);
+        if (wide == 0) { return -1; }
+        int attrs = WinGetFileAttributes(wide);
+        NativeMemory.Free(wide);
+        return attrs;
     }
     #endif
 
@@ -207,9 +187,10 @@ class Directory {
     /// <summary>创建路径以 UTF-8 编码的目录。</summary>
     static void CreateDirectoryUtf8(string path) {
         #if WINDOWS
-        byte[] wide = winWide(path);
-        if (wide != null) {
+        nint wide = winWide(path);
+        if (wide != 0) {
             WinCreateDirectory(wide, 0);
+            NativeMemory.Free(wide);
         }
         #else
         CreateDirectory(path);
@@ -263,9 +244,10 @@ class Directory {
     /// <summary>在指定路径创建目录。</summary>
     static void CreateDirectory(string path) {
         #if WINDOWS
-        byte[] wide = winWide(path);
-        if (wide != null) {
+        nint wide = winWide(path);
+        if (wide != 0) {
             WinCreateDirectory(wide, 0);
+            NativeMemory.Free(wide);
         }
         #else
         mkdir(path, 511);   // 0o777（受 umask 影响）
@@ -275,9 +257,10 @@ class Directory {
     /// <summary>删除空目录。</summary>
     static void Delete(string path) {
         #if WINDOWS
-        byte[] wide = winWide(path);
-        if (wide != null) {
+        nint wide = winWide(path);
+        if (wide != 0) {
             WinRemoveDirectory(wide);
+            NativeMemory.Free(wide);
         }
         #else
         rmdir(path);
@@ -287,9 +270,10 @@ class Directory {
     /// <summary>获取当前工作目录。</summary>
     static string GetCurrentDirectory() {
         #if WINDOWS
-        byte[] wide = new byte[8192];
+        nint wide = NativeMemory.Alloc(8192);
         WinGetCurrentDirectory(4096, wide);
         string buf = winUtf8(wide);
+        NativeMemory.Free(wide);
         #else
         byte[] b = new byte[4096];
         getcwd(b, 4096);
@@ -303,9 +287,10 @@ class Directory {
     /// <summary>设置当前工作目录。</summary>
     static void SetCurrentDirectory(string path) {
         #if WINDOWS
-        byte[] wide = winWide(path);
-        if (wide != null) {
+        nint wide = winWide(path);
+        if (wide != 0) {
             WinSetCurrentDirectory(wide);
+            NativeMemory.Free(wide);
         }
         #else
         chdir(path);
@@ -314,9 +299,8 @@ class Directory {
 
     #if WINDOWS
     // 从 WIN32_FIND_DATAW 缓冲区读取 cFileName（UTF-16，位于字节偏移 +44）。
-    static string winName(byte[] findData) {
-        string wideName = findData.ToStr(44, 520);
-        return winUtf8(wideName);
+    static string winName(nint findData) {
+        return winUtf8(findData + 44);
     }
 
     static List<string> winList(
@@ -326,17 +310,19 @@ class Directory {
     ) {
         List<string> result = new List<string>();
         string pattern = path + "\\*";
-        byte[] widePattern = winWide(pattern);
-        byte[] findData = new byte[592];
+        nint widePattern = winWide(pattern);
+        nint findData = NativeMemory.Alloc(592);
         nint handle = -1;
-        if (widePattern != null) {
+        if (widePattern != 0) {
             handle = WinFindFirstFile(widePattern, findData);
+            NativeMemory.Free(widePattern);
         }
         if (handle != -1) {
             bool more = true;
             while (more) {
                 string fname = winName(findData);
-                int attrs = findData[0] + findData[1] * 256 + findData[2] * 65536 + findData[3] * 16777216;
+                Span<byte> attr = new Span<byte>(findData, 4);
+                int attrs = attr[0] + attr[1] * 256 + attr[2] * 65536 + attr[3] * 16777216;
                 bool isDir = (attrs & 16) != 0;
                 bool hidden = (attrs & 2) != 0;
                 if (fname != "." && fname != ".."
@@ -348,6 +334,7 @@ class Directory {
             }
             WinFindClose(handle);
         }
+        NativeMemory.Free(findData);
         return result;
     }
     #else

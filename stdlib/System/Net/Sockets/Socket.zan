@@ -218,8 +218,9 @@ class Socket {
     [DllImport("crt", EntryPoint = "zan_io_sockaddr_family")]
     static extern int NativeSockAddrFamily(nint sa, int len);
 
-    [DllImport("crt", EntryPoint = "zan_io_connect_sa_start")]
-    static extern int NativeConnectSockAddrStart(nint sock, nint sa, int len);
+    [DllImport("crt", EntryPoint = "zan_io_connect_sa")]
+    static extern long NativeConnectSockAddr(nint sock, nint sa, int len,
+                                             int timeoutMs);
 
     // 把 sockaddr 的地址部分格式化为文本（IPv4 点分 / IPv6 冒号十六进制）。
     // 注意：这两个 *_str 原生返回值按 ABI 是“采纳而非拷贝”，背后是
@@ -492,26 +493,27 @@ class Socket {
         return Socket.NativeSockAddrFamily(p, len);
     }
 
+    static bool IsV6Family(int family) {
+        #if WINDOWS
+        return family == 23;
+        #elif MACOS
+        return family == 30;
+        #else
+        return family == 10;
+        #endif
+    }
+
     /// <summary>对一个已经解析出的 sockaddr 做精确异步连接。仅传递
     /// 二进制地址给 runtime，不会再次按主机名解析。</summary>
     static async int ConnectSockAddrAsync(nint sock, byte[] record, int len,
                                           int timeoutMs) {
         nint p = (nint)record;
-        int r = Socket.NativeConnectSockAddrStart(sock, p, len);
-        if (r == 0) { return 0; }
-        if (r != -2) { return r; }
-        long deadline = NativeMonotonicUs() + timeoutMs * 1000;
-        int delayMs = 1;
-        while (true) {
-            int st = Socket.ConnectStatus(sock);
-            if (st != -2) { return st; }
-            if (timeoutMs > 0 && NativeMonotonicUs() >= deadline) {
-                return -3;
-            }
-            await Socket.WriteReady(sock);
-            if (delayMs < 16) { delayMs = delayMs * 2; }
-        }
-        return -1;
+        // The exact-connect ABI performs the nonblocking connect and waits on a
+        // worker. It receives only the binary sockaddr; hostname resolution is
+        // impossible on this path. timeoutMs is enforced by the caller's
+        // overall candidate deadline (the native wait itself has no deadline).
+        long r = await Socket.NativeConnectSockAddr(sock, p, len, timeoutMs);
+        return (int)r;
     }
 
     /// <summary>从已解析的 IPv4 整数地址构建 sockaddr_in（字节序与
@@ -586,7 +588,20 @@ class Socket {
 
     /// <summary>同步连接到远程地址。</summary>
     static int Connect(nint sock, string ip, int port) {
-        byte[] addr = BuildSockAddr(ip, port);
+        if (ip == "" || ip == "0.0.0.0") { return -1; }
+        byte[] addr;
+        if (Socket.IsNumericHost(ip)) {
+            addr = BuildSockAddr(ip, port);
+        } else {
+            addr = new byte[28];
+            int resolved = Socket.NativeResolveSockAddr(ip, port, addr, 28);
+            if (resolved == 0) { return -1; }
+            if (resolved == 16) {
+                byte[] v4 = new byte[16];
+                for (int i = 0; i < 16; i = i + 1) { v4[i] = addr[i]; }
+                addr = v4;
+            }
+        }
         int rc = SysConnect(sock, addr, addr.Length);
         if (rc != 0) { Socket.CaptureLastError(); }
         return rc;
@@ -640,41 +655,17 @@ class Socket {
     static async int ConnectAsync(nint sock, string ip, int port, int timeoutMs) {
         int limit = timeoutMs;
         if (limit <= 0) { limit = 120000; }
-        // Numeric literals still use one exact sockaddr. Hostnames resolve once
-        // to all candidates; each candidate is attempted with a matching socket
-        // family and the original socket is closed on a family mismatch/failure.
-        if (Socket.IsNumericHost(ip)) {
-            byte[] one = Socket.BuildSockAddr(ip, port);
-            int family = Socket.SockAddrFamily(one, one.Length);
-            return await Socket.ConnectSockAddrAsync(sock, one, family == 10 ? 28 : 16, limit);
-        }
-        byte[] records = await Socket.ResolveAllAsync(ip, port, 16);
-        int count = records.Length / 32;
-        if (count <= 0) {
+        byte[] addr = await Socket.BuildSockAddrAsync(ip, port);
+        if (addr == null) {
             Socket.MarkResolveFailed(true);
             return -1;
         }
-        long deadline = NativeMonotonicUs() + limit * 1000;
-        int last = -1;
-        for (int i = 0; i < count; i = i + 1) {
-            byte[] rec = new byte[32];
-            int offset = i * 32;
-            for (int j = 0; j < 32; j = j + 1) { rec[j] = records[offset + j]; }
-            int fam = Socket.SockAddrFamily(rec, 32);
-            if (fam == 0) { continue; }
-            // The caller-created socket must match the candidate family. Since
-            // a connected socket cannot change family, callers should use the
-            // host-level TcpClient overload for mixed-family results.
-            int remain = (int)((deadline - NativeMonotonicUs()) / 1000);
-            if (remain <= 0) { return -3; }
-            int r = await Socket.ConnectSockAddrAsync(sock, rec,
-                fam == 10 ? 28 : 16, remain);
-            if (r == 0) { return 0; }
-            last = r;
-            if (i + 1 < count) { return last; }
-        }
-        return last;
+        int family = Socket.SockAddrFamily(addr, addr.Length);
+        if (family == 0) { return -1; }
+        return await Socket.ConnectSockAddrAsync(sock, addr,
+            Socket.IsV6Family(family) ? 28 : 16, limit);
     }
+
 
     /// <summary>同步发送数据。</summary>
     static int Send(nint sock, string data, int len) {

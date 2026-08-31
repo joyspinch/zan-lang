@@ -699,14 +699,18 @@ int32_t zan_io_connect_sa_start(intptr_t fd, const void *sa, int32_t salen) {
 
 /* Blocking-worker variant of exact connect. The caller's sockaddr is consumed
  * only during the initial syscall; no DNS or text conversion is performed. */
-int64_t zan_io_connect_sa(intptr_t fd, const void *sa, int32_t salen) {
+int64_t zan_io_connect_sa(intptr_t fd, const void *sa, int32_t salen,
+                           int32_t timeout_ms) {
     int32_t r = zan_io_connect_sa_start(fd, sa, salen);
     if (r == 0 || r != -2) return r;
 #if defined(_WIN32)
     fd_set wfds, efds;
     FD_ZERO(&wfds); FD_ZERO(&efds);
     FD_SET((SOCKET)fd, &wfds); FD_SET((SOCKET)fd, &efds);
-    if (select(0, NULL, &wfds, &efds, NULL) <= 0) return -1;
+    struct timeval tv, *ptv = NULL;
+    if (timeout_ms >= 0) { tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000; ptv = &tv; }
+    if (select(0, NULL, &wfds, &efds, ptv) <= 0) return -3;
     int err = 0, len = (int)sizeof(err);
     if (getsockopt((SOCKET)fd, SOL_SOCKET, SO_ERROR, (char *)&err, &len) != 0)
         return -1;
@@ -715,7 +719,13 @@ int64_t zan_io_connect_sa(intptr_t fd, const void *sa, int32_t salen) {
     FD_ZERO(&wfds); FD_ZERO(&efds);
     if (fd < 0 || fd >= FD_SETSIZE) return -1;
     FD_SET((int)fd, &wfds); FD_SET((int)fd, &efds);
-    if (select((int)fd + 1, NULL, &wfds, &efds, NULL) <= 0) return -1;
+    struct timeval tv, *ptv = NULL;
+    if (timeout_ms >= 0) { tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000; ptv = &tv; }
+    int sr;
+    do { sr = select((int)fd + 1, NULL, &wfds, &efds, ptv); }
+    while (sr < 0 && errno == EINTR);
+    if (sr <= 0) return sr == 0 ? -3 : -1;
     int err = 0;
     socklen_t len = (socklen_t)sizeof(err);
     if (getsockopt((int)fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0)

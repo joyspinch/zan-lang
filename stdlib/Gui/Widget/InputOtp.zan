@@ -1,0 +1,686 @@
+using System;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Widget;
+
+/// 验证码输入框（Ant Design Input.OTP 对位）：N 个一格一字符的小框
+/// （默认 6），键盘直录、退格回退、方向键移格、Ctrl+V 整段粘贴。
+///
+/// 保留式控件：稳定 WidgetId 使焦点在兄弟/弹层变动后仍能保持，
+/// 点击/焦点由框架按整框一个命中区解析（格内定位走几何），编辑逻辑
+/// 全部收在不依赖 App 的纯函数里（TypeChar/Backspace/MoveLeft/
+/// Paste/SetCode…），无窗口即可单测：
+///     InputOtp code = new InputOtp();
+///     code.data = form.otp;          // 双向绑定验证码字符串
+///     code.Change += () => { ... };  // 每格编辑时触发
+///     code.Complete += () => { ... };// 最后一格填满时触发一次
+///     code.Render(app, 40, 40, 320, 40);
+///
+/// 能力面（对齐 antd Input.OTP 文档页）：`Length` 字符数、
+/// `MaskMode` 密码模式（点显）、`Block` 占满宽度、`Size` 三档、
+/// `ReadOnly`/`Disabled`/`SetStatus` 状态族、`Groups`+`Separator`
+/// 自定义分组渲染（"65-43-21"）、`Filter` 只允许特定值
+/// （内置 `Input.OnlyDigits` / `InputOtp.OnlyLetters`）。
+class InputOtp : Control {
+    List<string> cells;
+    int active;
+    int wid;
+    int length;
+    /// 上一帧渲染的宿主：Focus/Blur 要在没有 app 形参的回调里用。
+    App liveApp;
+    /// 双向绑定验证码：`otp.data = form.code;`（编译器降级的
+    /// Binding）。未设置时只编辑内部格子。
+    Binding<string> data;
+    /// 尺寸档位：tiny/small/medium/large，映射 `.small/.large` 类
+    /// （与 Input 同一路数，几何在 base.css 的 otp 规则里）。
+    Binding<string> Size;
+    /// 密码模式：格内以掩码字符（默认 •）显示。
+    bool MaskMode;
+    /// 自定义掩码字符（空串时用 •）。
+    string MaskChar;
+    /// 占满宽度：格子横向平铺到宿主给的宽度（antd block）。
+    bool Block;
+    /// 只读：可聚焦、可见值，但不接受任何编辑。
+    bool ReadOnly;
+    /// 校验状态：""/success/warning/error，走 base.css 的字段状态类。
+    string FieldStatus;
+    /// 分组渲染：各组格数（如 {2,2,2} → "65-43-21"）。空列表 = 不分组。
+    List<int> Groups;
+    /// 组间分隔文字（默认 "-"）。
+    string Separator;
+    /// 输入约束（antd allow-input）：收到「编辑后的完整候选」，
+    /// 返回清洗后的文本，null 表示整体拒绝。
+    InputFilterFn Filter;
+    /// 任何一次落地编辑触发。
+    UiEvent Change;
+    /// 从「未满」变「全部填满」的那一次编辑额外触发。
+    UiEvent Complete;
+    // 上一帧是否已满：Complete 只在跳变沿发一次。
+    bool wasFull;
+
+    /// 一格一个码点；内部按码点存，GetCode 拼回字符串。
+    static List<string> SplitCps(string s) {
+        List<string> outList = new List<string>();
+        int i = 0;
+        while (i < s.Length) {
+            int e = Text.NextCharEnd(s, i);
+            outList.Add(s.Substring(i, e - i));
+            i = e;
+        }
+        return outList;
+    }
+
+    /// 内置过滤器：只允许英文字母（antd allow-input 示例二；
+    /// 只允许数字直接用 `Input.OnlyDigits`）。
+    static string OnlyLetters(string s) {
+        string outStr = "";
+        int i = 0;
+        while (i < s.Length) {
+            int e = Text.NextCharEnd(s, i);
+            string ch = s.Substring(i, e - i);
+            if (ch.Length == 1) {
+                int b = s[i];
+                if ((b >= 65 && b <= 90) || (b >= 97 && b <= 122)) {
+                    outStr = outStr + ch;
+                }
+            }
+            i = e;
+        }
+        return outStr;
+    }
+
+    /// 组数 = 分隔符数量：只有当各组之和恰好等于格数时才分组，
+    /// 否则视为未配置（渲染回一视同仁的等距排）。纯函数，可单测。
+    int SeparatorCount() {
+        if (Groups == null || Groups.Count < 2) { return 0; }
+        int sum = 0;
+        for (int i = 0; i < Groups.Count; i = i + 1) {
+            sum = sum + Groups[i];
+        }
+        if (sum != length) { return 0; }
+        return Groups.Count - 1;
+    }
+
+    /// 格子 i 之后是否接一个分隔符槽。
+    bool SepAfter(int i) {
+        if (this.SeparatorCount() == 0) { return false; }
+        int pos = 0;
+        for (int g = 0; g < Groups.Count - 1; g = g + 1) {
+            pos = pos + Groups[g];
+            if (i == pos - 1) { return true; }
+        }
+        return false;
+    }
+
+    void InitOtp(int n) {
+        this.InitControl("otp", 1);
+        if (n < 1) { n = 1; }
+        length = n;
+        cells = new List<string>();
+        for (int i = 0; i < length; i = i + 1) { cells.Add(""); }
+        active = 0;
+        wid = WidgetId.Next();
+        liveApp = null;
+        Size = "medium";
+        MaskMode = false;
+        MaskChar = "";
+        Block = false;
+        ReadOnly = false;
+        FieldStatus = "";
+        Groups = new List<int>();
+        Separator = "-";
+        Filter = null;
+        wasFull = false;
+        wiresOwnEvents = true;
+        Change = new UiEvent();
+        Complete = new UiEvent();
+    }
+
+    /// 设计器默认构造：6 格。
+    InputOtp() { this.InitOtp(6); }
+
+    /// `InputOtp code = new InputOtp(6);`
+    InputOtp(int n) { this.InitOtp(n); }
+
+    int WidgetId() { return wid; }
+
+    /// 字符格数（<1 钳到 1）。缩小时保留已填的前缀。
+    void SetLength(int n) {
+        if (n < 1) { n = 1; }
+        if (n == length) { return; }
+        List<string> next = new List<string>();
+        for (int i = 0; i < n; i = i + 1) {
+            if (i < cells.Count) { next.Add(cells[i]); }
+            else { next.Add(""); }
+        }
+        cells = next;
+        length = n;
+        if (active > n - 1) { active = n - 1; }
+    }
+
+    int GetLength() { return length; }
+
+    /// 当前活动格索引（0 基）。
+    int ActiveIndex() { return active; }
+
+    /// 从绑定的模型拉一次变更（渲染沿的绑定拉取；无宿主也可调用，
+    /// 供脚本/测试驱动）。无绑定时空转。
+    void SetCodeFromModel() { this.SyncBinding(); }
+
+    string GetCode() {
+        string s = "";
+        for (int i = 0; i < length; i = i + 1) { s = s + cells[i]; }
+        return s;
+    }
+
+    int FilledCount() {
+        int n = 0;
+        for (int i = 0; i < length; i = i + 1) {
+            if (cells[i] != "") { n = n + 1; }
+        }
+        return n;
+    }
+
+    bool IsFull() { return FilledCount() == length; }
+
+    /// 把「完整候选字符串」写进格子（左对齐）；过 Filter 闸门。
+    /// 返回 false 表示被拒绝（状态不变）。
+    bool SetCode(string s) {
+        string final = s;
+        if (Filter != null) { final = Filter(s); }
+        if (final == null) { return false; }
+        List<string> cps = InputOtp.SplitCps(final);
+        for (int i = 0; i < length; i = i + 1) {
+            if (i < cps.Count) { cells[i] = cps[i]; }
+            else { cells[i] = ""; }
+        }
+        active = InputOtp.SplitCps(final).Count;
+        if (active > length - 1) { active = length - 1; }
+        if (active < 0) { active = 0; }
+        return true;
+    }
+
+    /// 程序化赋值（走 SetCode + 事件 + 回写绑定）。净零变化静默。
+    bool SetValue(string s) {
+        if (this.IsReadOnly()) { return false; }
+        string before = this.GetCode();
+        if (!this.SetCode(s)) { return false; }
+        if (this.GetCode() == before) { return false; }
+        this.Edited(true);
+        return true;
+    }
+
+    bool IsReadOnly() { return ReadOnly || this.IsDisabled(); }
+
+    void ClearAll() {
+        if (this.IsReadOnly()) { return; }
+        if (this.GetCode() == "") { return; }
+        for (int i = 0; i < length; i = i + 1) { cells[i] = ""; }
+        active = 0;
+        this.Edited(false);
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+    }
+
+    void Focus() {
+        if (liveApp == null || this.IsDisabled()) { return; }
+        liveApp.focus.SetFocused(wid);
+        liveApp.RequestRedraw();
+    }
+
+    void Blur() {
+        if (liveApp == null) { return; }
+        if (liveApp.focus.IsFocused(wid)) { liveApp.focus.ClearFocus(); }
+        liveApp.RequestRedraw();
+    }
+
+    /// 设置校验状态（白名单归一），与 Input 同族。
+    void SetStatus(string v) {
+        string s = Control.StatusSanitize(v);
+        if (s == FieldStatus) { return; }
+        FieldStatus = s;
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+    }
+
+    /// 把编辑缓冲区写回绑定并广播事件。`filled` = 本笔编辑填了空
+    /// 格——Complete 只在「这次真的把验证码填满」的沿上发（在满格
+    /// 上重敲同字 / 程序化覆盖不算「刚填上」）。
+    void Edited(bool filled) {
+        if (data != null) { data.Set(this.GetCode()); }
+        Change.Raise();
+        bool full = this.IsFull();
+        if (full && !wasFull && filled) { Complete.Raise(); }
+        wasFull = full;
+    }
+
+    // ---- 编辑原语（纯逻辑，无窗口可测） ------------------------------
+
+    /// 在 active 格起逐字符落格并前进；过 Filter 闸门，净零变化静默。
+    /// 返回 false = 被拒绝 / 只读 / 无变化。
+    bool TypeChar(string ch) {
+        if (this.IsReadOnly() || ch == "") { return false; }
+        int next = active;
+        if (next > length - 1) { next = length - 1; }
+        List<string> cps = InputOtp.SplitCps(ch);
+        if (cps.Count == 0) { return false; }
+        string before = this.GetCode();
+        // 候选 = 把 cps 从 active 起逐格覆盖（多出的字符继续后移，
+        // 即一次输入多字符等价于连续落格——粘贴路径也走这里）。
+        int idx = next;
+        List<string> snapshot = new List<string>();
+        for (int i = 0; i < length; i = i + 1) { snapshot.Add(cells[i]); }
+        bool didFill = false;
+        for (int i = 0; i < cps.Count && idx < length; i = i + 1) {
+            if (cells[idx] == "") { didFill = true; }
+            cells[idx] = cps[i];
+            idx = idx + 1;
+        }
+        string after = this.GetCode();
+        if (Filter != null) {
+            string final = Filter(after);
+            if (final == null) {
+                InputOtp.Restore(cells, snapshot);
+                return false;
+            }
+            if (final == before) {
+                // 过滤后回到原状：净零变化，不闪不响。
+                InputOtp.Restore(cells, snapshot);
+                return false;
+            }
+            if (!this.SetCode(final)) {
+                InputOtp.Restore(cells, snapshot);
+                return false;
+            }
+            // 重写路径：只要结果比原先多了字就按「填格」算。
+            if (InputOtp.SplitCps(final).Count > InputOtp.SplitCps(before).Count) {
+                didFill = true;
+            }
+            this.Edited(didFill);
+            return true;
+        }
+        if (after == before) {
+            // 在已填格上重敲同一字符：净零变化，静默。
+            return false;
+        }
+        if (idx > length - 1) { idx = length - 1; }
+        active = idx;
+        this.Edited(didFill);
+        return true;
+    }
+
+    static void Restore(List<string> cells, List<string> snapshot) {
+        for (int i = 0; i < cells.Count && i < snapshot.Count; i = i + 1) {
+            cells[i] = snapshot[i];
+        }
+    }
+
+    /// 退格：当前格有字符则清空并留格；空格则回退一格再清（回退
+    /// 后那格也空则整体无变化、静默）。
+    bool Backspace() {
+        if (this.IsReadOnly()) { return false; }
+        if (cells[active] != "") {
+            cells[active] = "";
+        } else if (active > 0) {
+            active = active - 1;
+            if (cells[active] == "") { return false; }
+            cells[active] = "";
+        } else {
+            return false;
+        }
+        this.Edited(false);
+        return true;
+    }
+
+    /// Delete：清当前格，不移动。
+    bool DeleteForward() {
+        if (this.IsReadOnly()) { return false; }
+        if (cells[active] == "") { return false; }
+        cells[active] = "";
+        this.Edited(false);
+        return true;
+    }
+
+    void MoveLeft() { if (active > 0) { active = active - 1; } }
+    void MoveRight() { if (active < length - 1) { active = active + 1; } }
+    void MoveHome() { active = 0; }
+
+    /// End：跳到最后一个已填格（全空则第一格）。
+    void MoveEnd() {
+        int last = 0;
+        for (int i = 0; i < length; i = i + 1) {
+            if (cells[i] != "") { last = i; }
+        }
+        active = last;
+    }
+
+    /// Ctrl+V：整段走同一候选闸门，从 active 起铺。
+    bool Paste(string clip) {
+        if (this.IsReadOnly() || clip == "") { return false; }
+        return this.TypeChar(clip);
+    }
+
+    /// 聚焦时的按键消费（与 Input 同构的事件口径：kind 6 字符、
+    /// kind 4 按键）。
+    void HandleKeys(App app) {
+        int kind = app.EventKind();
+        if (kind == 6) {
+            int code = app.window.EventKeyCode();
+            if (code == 8) {
+                if (this.Backspace()) { app.RequestRedraw(); }
+            } else if (code == 9) {
+                // Tab 交给框架焦点遍历。
+            } else if (!ReadOnly) {
+                string ch = Text.CharStr(code);
+                if (ch.Length > 0 && this.TypeChar(ch)) { app.RequestRedraw(); }
+            }
+        } else if (kind == 4) {
+            int kc = app.window.EventKeyCode();
+            int mods = app.window.EventMods();
+            if (Modifiers.HasCtrl(mods)) {
+                if (kc == 86) {
+                    // Ctrl+V：粘贴整段。
+                    string clip = Clipboard.GetText();
+                    if (clip.Length > 0 && this.Paste(clip)) { app.RequestRedraw(); }
+                } else if (kc == 65) {
+                    // Ctrl+A 对验证码无选区语义：全选 = 跳首格。
+                    this.MoveHome();
+                    app.RequestRedraw();
+                }
+                return;
+            }
+            if (kc == 37) { this.MoveLeft(); app.RequestRedraw(); }
+            else if (kc == 39) { this.MoveRight(); app.RequestRedraw(); }
+            else if (kc == 8) {
+                if (this.Backspace()) { app.RequestRedraw(); }
+            }
+            else if (kc == 46) {
+                if (this.DeleteForward()) { app.RequestRedraw(); }
+            }
+            else if (kc == 36) { this.MoveHome(); app.RequestRedraw(); }
+            else if (kc == 35) { this.MoveEnd(); app.RequestRedraw(); }
+        }
+    }
+
+    /// 把绑定模型的变更拉进格子（model -> UI）。长度对齐即可，
+    /// 相同就不动（避免每帧重写 active）。
+    void SyncBinding() {
+        if (data == null) { return; }
+        string cur = data.Get();
+        if (cur != this.GetCode()) {
+            int wantActive = active;
+            this.SetCode(cur);
+            active = wantActive;
+            if (active > length - 1) { active = length - 1; }
+        }
+    }
+
+    string CellDisplay(int i) {
+        string v = cells[i];
+        if (v != "" && MaskMode) {
+            string mc = MaskChar;
+            if (mc == "") { mc = "•"; }
+            return mc;
+        }
+        return v;
+    }
+
+    int Render(App app, int x, int y, int w, int h) {
+        int id = wid;
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        liveApp = app;
+
+        bool off = this.IsDisabled();
+        app.focus.RegisterFocusable(id);
+        bool focused = app.focus.IsFocused(id) && !off;
+
+        string origClass = Class;
+        this.AddClass(this.SizeCls());
+        string stCls = Control.StatusSanitize(FieldStatus);
+        if (stCls != "") { this.AddClass(stCls); }
+        // 设计器/绑定可能直写脏值，渲染沿兜底归一。
+        FieldStatus = stCls;
+
+        if (focused) { this.HandleKeys(app); }
+        this.SyncBinding();
+
+        // 基样式：默认态整框解析一次，取格子的静态外观。
+        StyleBox baseS = this.ResolveEasedStyleAsIn(
+            app, id, "otp", Class, off, false, x, y, w, h);
+        int fs = baseS.FontOr(Style.FontFallback(app, "medium"));
+        int cellSize = baseS.HeightOr(t.heightMedium);
+        int gap = baseS.PadLOr(app.Scale(8));
+        int n = length;
+        int sepCount = this.SeparatorCount();
+        string sep = Separator;
+        if (sep == "") { sep = "-"; }
+        int sepTextW = 0;
+        if (sepCount > 0) { sepTextW = Canvas.MeasureText(sep, fs); }
+        // 一格的横向步距：格宽 + 一个缝；组界处额外多一个「缝+分隔文字+缝」槽。
+        int cellW = cellSize;
+        int totalW = n * cellSize + (n - 1) * gap
+                   + sepCount * (sepTextW + gap);
+        if (Block) {
+            totalW = w;
+            int fixedW = (n - 1) * gap + sepCount * (sepTextW + gap);
+            cellW = (w - fixedW) / n;
+            if (cellW < app.Scale(12)) { cellW = app.Scale(12); }
+        }
+        int cellH = cellSize;
+        if (Block) { cellH = h; }
+        if (h < cellH) { cellH = h; }
+        int cy = y + (h - cellH) / 2;
+        int cx = x;
+        if (!Block && totalW < w) { cx = x + (w - totalW) / 2; }
+
+        // 悬停格：整框命中（框架算好遮挡）+ 指针几何定位到格。
+        int hoverCell = -1;
+        if (!off && app.focus.IsHovered(id)) {
+            hoverCell = this.CellIndexAt(x, cx, cellW, gap, sepTextW, w,
+                                         app.mouseX);
+        }
+        if (Ui.Clicked(app, id) && !off) {
+            int clicked = this.CellIndexAt(x, cx, cellW, gap, sepTextW, w,
+                                           app.mouseX);
+            if (clicked >= 0 && clicked != active) {
+                active = clicked;
+                app.RequestRedraw();
+            }
+        }
+
+        // 逐格：状态位（禁用 / 活动格聚焦 / 悬停）解析对应样式，
+        // 皮肤 otp:focus/:hover/:disabled 与 .small/.large/.error 生效。
+        StyleBox sepS = this.ResolvePartAs(app, "otp", "separator", "",
+                                           Class, Style.SNormal());
+        for (int i = 0; i < n; i = i + 1) {
+            int state = Style.SNormal();
+            if (off) { state = Style.SDisabled(); }
+            else if (focused && i == active) { state = Style.SFocus(); }
+            else if (i == hoverCell) { state = Style.SHover(); }
+            StyleBox cs = baseS;
+            if (state != Style.SNormal()) {
+                cs = this.ResolveStyleAs(app, "otp", Class, state);
+            }
+            cs.Paint(app, cx, cy, cellW, cellH);
+            string disp = this.CellDisplay(i);
+            if (disp != "") {
+                int tw = Canvas.MeasureText(disp, fs);
+                int th = Canvas.FontHeight(fs);
+                c.DrawText(cx + (cellW - tw) / 2, cy + (cellH - th) / 2,
+                           disp, cs.FgOr(baseS.fg), fs);
+            }
+            if (focused && i == active && !off && !ReadOnly && disp == "") {
+                // 空格的插入符；有字符时强调描边已经够响，不叠线。
+                int cw2 = cs.WidthOr(app.Scale(1));
+                int ch2 = Canvas.FontHeight(fs);
+                c.FillRect(cx + cellW / 2, cy + (cellH - ch2) / 2,
+                           cw2, ch2,
+                           cs.AccentOr(baseS.AccentOr(cs.FgOr(baseS.fg))));
+            }
+            cx = cx + cellW + gap;
+            if (this.SepAfter(i) && sepCount > 0) {
+                int sh = Canvas.FontHeight(fs);
+                c.DrawText(cx, cy + (cellH - sh) / 2, sep,
+                           sepS.FgOr(baseS.fg), fs);
+                cx = cx + sepTextW + gap;
+            }
+        }
+
+        app.hitTester.RegisterRect(id, x, y, w, h, 1);
+
+        // Tab 误聚焦时激活沿：首格聚焦后 Complete 重新武装。
+        if (focused && !wasFull) { completeArmed = false; }
+
+        Class = origClass;
+        On.Fire(app, id);
+        return id;
+    }
+
+    /// 指针 x -> 格索引（落在分隔符/空隙返回 -1）。步距几何与
+    /// Render 的逐格推进完全一致：格宽 + 缝，组界处多一个分隔槽。
+    int CellIndexAt(int boxX, int startX, int cellW, int gap, int sepTextW,
+                    int boxW, int px) {
+        if (px < boxX || px >= boxX + boxW) { return -1; }
+        int cx = startX;
+        for (int i = 0; i < length; i = i + 1) {
+            if (px >= cx && px < cx + cellW) { return i; }
+            cx = cx + cellW + gap;
+            if (this.SepAfter(i) && sepTextW > 0) {
+                if (px < cx + sepTextW) { return -1; }
+                cx = cx + sepTextW + gap;
+            }
+        }
+        return -1;
+    }
+
+    // --- 设计器 / 序列化模型 ---
+
+    override string Kind() { return "InputOtp"; }
+    override Binding<string> SizeOf() { return Size; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec len = PropSpec.Int("length", "Length");
+        len.num = length;
+        len.Step(1, 1, 32);
+        ps.Add(len);
+        PropSpec sz = PropSpec.Enum("size", "Size",
+            new List<string>{ "tiny", "small", "medium", "large" });
+        sz.str = Size;
+        ps.Add(sz);
+        PropSpec mask = PropSpec.Bool("mask", "Mask");
+        mask.flag = MaskMode;
+        ps.Add(mask);
+        PropSpec blk = PropSpec.Bool("block", "Block");
+        blk.flag = Block;
+        ps.Add(blk);
+        PropSpec ro = PropSpec.Bool("readonly", "ReadOnly");
+        ro.flag = ReadOnly;
+        ps.Add(ro);
+        PropSpec st = PropSpec.Enum("status", "Status",
+            new List<string>{ "", "success", "warning", "error" });
+        st.str = FieldStatus;
+        ps.Add(st);
+        PropSpec sep = PropSpec.Text("separator", "Separator");
+        sep.str = Separator;
+        ps.Add(sep);
+        return ps;
+    }
+
+    override string GetExtra(string key) {
+        if (key == "value" || key == "code") { return this.GetCode(); }
+        if (key == "maskChar") { return MaskChar; }
+        if (key == "groups") {
+            string s = "";
+            if (Groups != null) {
+                for (int i = 0; i < Groups.Count; i = i + 1) {
+                    if (s != "") { s = s + ","; }
+                    s = s + Convert.ToString(Groups[i]);
+                }
+            }
+            return s;
+        }
+        return "";
+    }
+
+    override bool SetExtra(string key, string val) {
+        if (key == "value" || key == "code") {
+            if (val != this.GetCode()) { return this.SetValue(val); }
+            return true;
+        }
+        if (key == "length") {
+            int n = Convert.ToInt32(val);
+            if (n >= 1) { this.SetLength(n); }
+            return true;
+        }
+        if (key == "mask") { MaskMode = (val == "true"); return true; }
+        if (key == "maskChar") { MaskChar = val; return true; }
+        if (key == "block") { Block = (val == "true"); return true; }
+        if (key == "readonly") { ReadOnly = (val == "true"); return true; }
+        if (key == "status") { this.SetStatus(val); return true; }
+        if (key == "separator") { Separator = val; return true; }
+        if (key == "groups") {
+            Groups = new List<int>();
+            int i = 0;
+            while (i < val.Length) {
+                int j = i;
+                while (j < val.Length && val[j] >= 48 && val[j] <= 57) {
+                    j = j + 1;
+                }
+                if (j > i) {
+                    int v = 0;
+                    for (int k = i; k < j; k = k + 1) {
+                        v = v * 10 + (val[k] - 48);
+                    }
+                    Groups.Add(v);
+                }
+                i = j + 1;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        e.Add("Complete");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change") { Change.Add(a); return; }
+        if (evt == "Complete") { Complete.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    // --- 保留模式钩子（Control） ---
+
+    override void OnMeasure(App app) {
+        Theme t = app.theme;
+        string origClass = Class;
+        this.AddClass(this.SizeCls());
+        string stCls = Control.StatusSanitize(FieldStatus);
+        if (stCls != "") { this.AddClass(stCls); }
+        StyleBox s = this.ResolveStyleAs(app, "otp", Class, Style.SNormal());
+        int cellSize = s.HeightOr(t.heightMedium);
+        int gap = s.PadLOr(app.Scale(8));
+        int sepCount = this.SeparatorCount();
+        int sepW = 0;
+        if (sepCount > 0) {
+            string sep = Separator;
+            if (sep == "") { sep = "-"; }
+            sepW = Canvas.MeasureText(sep, s.FontOr(Style.FontFallback(app, "medium")))
+                 + gap;
+        }
+        int n = length;
+        prefH = cellSize;
+        prefW = n * cellSize + (n - 1) * gap + sepCount * sepW
+              + app.Scale(8);
+        Class = origClass;
+    }
+
+    override void OnPaint(App app) {
+        this.Render(app, bx, by, bw, bh);
+    }
+}

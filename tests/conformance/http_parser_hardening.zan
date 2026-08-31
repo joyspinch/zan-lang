@@ -1,0 +1,57 @@
+// Conformance: HTTP parser OWS and response-header injection hardening.
+using System;
+using System.Net.Http;
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool ok, string name) {
+        if (ok) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static void Main() {
+        HttpRequest r = HttpRequest.Parse(
+            "GET\t/p?q=1\tHTTP/1.1\r\n"
+            + "Host:\th.example\t\r\n"
+            + "X-Test:\t value \t\r\n"
+            + "Connection:\t keep-alive\t,\tclose \r\n"
+            + "\r\n");
+        Program.Check(r.method == "GET", "request method with HTAB OWS");
+        Program.Check(r.path == "/p", "request target with HTAB OWS");
+        Program.Check(r.queryString == "q=1", "request query with HTAB OWS");
+        Program.Check(r.host == "h.example", "request value OWS trimmed");
+        Program.Check(r.GetHeader("X-Test") == "value", "generic header OWS trimmed");
+        Program.Check(!r.keepAlive, "connection tokens with OWS");
+
+        HttpResponse p = HttpResponse.Parse(
+            "HTTP/1.1\t200\tOK\r\n"
+            + "Content-Type:\t text/plain \t\r\n"
+            + "X-Test:\t yes \t\r\n\r\nbody");
+        Program.Check(p.statusCode == 200, "response status with HTAB OWS");
+        Program.Check(p.statusText == "OK", "response reason OWS trimmed");
+        Program.Check(p.contentType == "text/plain", "response content type OWS trimmed");
+        Program.Check(p.GetHeader("X-Test") == "yes", "response header OWS trimmed");
+        Program.Check(p.body == "body", "response body after OWS headers");
+
+        HttpResponse h = HttpResponse.Text("ok");
+        h.SetHeader("X-Bad\r\nInjected", "yes");
+        h.SetHeader("X-Bad-Value", "yes\r\nInjected: x");
+        Program.Check(h.Build().IndexOf("Injected") < 0,
+            "response SetHeader rejects CRLF");
+        HttpResponse safe = HttpResponse.Redirect("/next");
+        Program.Check(safe.statusCode == 302
+            && safe.GetHeader("Location") == "/next",
+            "safe redirect retained");
+        HttpResponse bad = HttpResponse.Redirect("/next\r\nX-Evil: 1");
+        Program.Check(bad.statusCode == 400
+            && bad.GetHeader("Location") == "",
+            "redirect CRLF rejected");
+
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+    }
+}

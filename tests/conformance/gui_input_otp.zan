@@ -1,0 +1,209 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// Headless checks for InputOtp (Ant Design Input.OTP parity). Everything
+/// here is pure computation: no window is created and no frame is rendered.
+/// The editing surface (cell filling, backspace walk-back, move ops,
+/// SetCode / paste with filter rollback, Complete rising-edge), the status
+/// sanitization, group geometry, the designer property round-trip and the
+/// two-way binding pull all run through the same app-free code paths the
+/// widget's Render uses.
+class GuiInputOtpTest {
+    class M {
+        public string code;
+    }
+
+    static void Main() {
+        // ---- 1. Construction / length -----------------------------------
+        InputOtp o = new InputOtp();
+        Console.WriteLine(o.GetCode() + "|" + o.GetLength());
+        o.SetCode("12345678");
+        Console.WriteLine("fill " + o.GetCode() + " n=" + o.GetLength());
+        o.SetCode("");
+        o.SetLength(4);
+        o.SetCode("abcd");
+        Console.WriteLine("shrink " + o.GetCode());
+        o.SetLength(6);
+        Console.WriteLine("grow '" + o.GetCode() + "' tail=" + o.CellDisplay(4));
+        o.SetCode("123456");
+        o.SetLength(0);
+        Console.WriteLine("clamp " + o.GetLength() + " '" + o.GetCode() + "'");
+
+        // ---- 2. TypeChar / active / Backspace / Delete ------------------
+        InputOtp t = new InputOtp(4);
+        int changes = 0;
+        t.Change += () => { changes = changes + 1; };
+        Console.WriteLine("t1 " + t.TypeChar("1") + " '" + t.GetCode()
+            + "' c=" + changes);
+        Console.WriteLine("t2 " + t.TypeChar("2") + " '" + t.GetCode() + "'");
+        Console.WriteLine("t3 " + t.TypeChar("3") + " '" + t.GetCode() + "'");
+        Console.WriteLine("last " + t.TypeChar("9") + " '" + t.GetCode() + "'");
+        Console.WriteLine("empty " + t.TypeChar("") + " '" + t.GetCode() + "'");
+        // Backspace on a filled cell clears it and stays in place.
+        Console.WriteLine("bk1 " + t.Backspace() + " '" + t.GetCode() + "'");
+        // Backspace on an empty cell walks back and clears THAT cell.
+        Console.WriteLine("bk2 " + t.Backspace() + " '" + t.GetCode() + "'");
+        // Double backspace at an already-empty cell: second is a no-op.
+        Console.WriteLine("bk3 " + t.Backspace() + " '" + t.GetCode() + "'");
+        Console.WriteLine("bk4 " + t.Backspace() + " '" + t.GetCode() + "'");
+        Console.WriteLine("bk5 " + t.Backspace() + " '" + t.GetCode() + "'");
+        Console.WriteLine("bk-empty " + t.Backspace() + " '" + t.GetCode()
+            + "' c=" + changes);
+        t.SetCode("abcd");
+        Console.WriteLine("del " + t.DeleteForward() + " '" + t.GetCode() + "'");
+        Console.WriteLine("del-empty " + t.DeleteForward() + " '" + t.GetCode() + "'");
+
+        // ---- 3. Move ops -------------------------------------------------
+        InputOtp m = new InputOtp(4);
+        m.SetCode("1234");
+        m.MoveHome();
+        Console.WriteLine("home " + m.ActiveIndex());
+        m.MoveLeft();
+        Console.WriteLine("left-at0 " + m.ActiveIndex());
+        m.MoveRight();
+        Console.WriteLine("right " + m.ActiveIndex());
+        m.MoveEnd();
+        Console.WriteLine("end-full " + m.ActiveIndex());
+        m.SetCode("12");
+        m.MoveEnd();
+        Console.WriteLine("end-partial " + m.ActiveIndex());
+
+        // ---- 4. Multi-cp typing + paste ---------------------------------
+        InputOtp p = new InputOtp(6);
+        int pc = 0;
+        p.Change += () => { pc = pc + 1; };
+        Console.WriteLine("multi " + p.TypeChar("1234") + " '" + p.GetCode() + "' c=" + pc);
+        Console.WriteLine("clip " + p.Paste("56789") + " '" + p.GetCode() + "'");
+        Console.WriteLine("clip-empty " + p.Paste("") + " '" + p.GetCode() + "' c=" + pc);
+
+        // ---- 5. Complete rising edge ------------------------------------
+        InputOtp f = new InputOtp(3);
+        int fc = 0;
+        f.Complete += () => { fc = fc + 1; };
+        f.TypeChar("1");
+        f.TypeChar("2");
+        Console.WriteLine("part " + fc);
+        f.TypeChar("3");
+        Console.WriteLine("full " + fc);
+        f.TypeChar("9");
+        Console.WriteLine("retype " + fc);
+        f.Backspace();
+        Console.WriteLine("unfull " + fc);
+        f.TypeChar("4");
+        Console.WriteLine("refull " + fc);
+
+        // ---- 6. Filter gate (rollback / rewrite) ------------------------
+        InputOtp g = new InputOtp(4);
+        int gc = 0;
+        g.Change += () => { gc = gc + 1; };
+        g.Filter = Input.OnlyDigits;
+        Console.WriteLine("letters " + g.TypeChar("ab") + " '" + g.GetCode() + "' c=" + gc);
+        Console.WriteLine("digits " + g.TypeChar("1") + " '" + g.GetCode() + "' c=" + gc);
+        g.MoveHome();
+        Console.WriteLine("mixed-paste " + g.Paste("2x3y") + " '" + g.GetCode() + "'");
+        InputOtp g2 = new InputOtp(4);
+        g2.Filter = Input.OnlyDigits;
+        Console.WriteLine("setcode-reject " + g2.SetValue("abc") + " '" + g2.GetCode() + "'");
+        Console.WriteLine("setcode-partial " + g2.SetValue("a1b2") + " '" + g2.GetCode() + "'");
+        InputOtp g3 = new InputOtp(4);
+        g3.Filter = InputOtp.OnlyLetters;
+        Console.WriteLine("letters-only " + g3.SetValue("a1b2c3") + " '" + g3.GetCode() + "'");
+
+        // ---- 7. ReadOnly / Disabled gates + ClearAll --------------------
+        InputOtp ro = new InputOtp(3);
+        int roc = 0;
+        ro.Change += () => { roc = roc + 1; };
+        ro.SetValue("123");
+        ro.ReadOnly = true;
+        Console.WriteLine("ro-type " + ro.TypeChar("9") + " ro-bk " + ro.Backspace()
+            + " ro-del " + ro.DeleteForward() + " ro-paste " + ro.Paste("45")
+            + " ro-set " + ro.SetValue("555") + " c=" + roc + " '" + ro.GetCode() + "'");
+        ro.ClearAll();
+        Console.WriteLine("ro-clear '" + ro.GetCode() + "' c=" + roc);
+        ro.ReadOnly = false;
+        ro.SetValue("987");
+        ro.Disabled = true;
+        Console.WriteLine("dis-type " + ro.TypeChar("1") + " '" + ro.GetCode() + "'");
+
+        // ---- 8. Status sanitize + designer props ------------------------
+        InputOtp d = new InputOtp(4);
+        d.SetStatus("warning");
+        Console.WriteLine("st '" + d.GetProp("status") + "'");
+        d.SetStatus("bogus");
+        Console.WriteLine("st-bad '" + d.GetProp("status") + "'");
+        d.SetProp("length", "6");
+        Console.WriteLine("len " + d.GetLength());
+        d.SetProp("length", "0");
+        Console.WriteLine("len-bad " + d.GetLength());
+        d.SetProp("mask", "true");
+        d.SetProp("block", "true");
+        d.SetProp("readonly", "true");
+        d.SetProp("separator", ":");
+        Console.WriteLine("props " + d.MaskMode + " " + d.Block + " " + d.ReadOnly + " '" + d.GetProp("separator") + "'");
+        d.SetProp("groups", "2,2,2");
+        Console.WriteLine("groups '" + d.GetProp("groups") + "'");
+        d.SetProp("nope", "xyz");
+        Console.WriteLine("fallback-class '" + d.Class + "'");
+
+        // ---- 9. Group geometry (pure) ------------------------------------
+        InputOtp gr = new InputOtp(6);
+        Console.WriteLine("none " + gr.SeparatorCount());
+        List<int> g1 = new List<int>();
+        g1.Add(2); g1.Add(2); g1.Add(2);
+        gr.Groups = g1;
+        Console.WriteLine("222 " + gr.SeparatorCount() + " sa "
+            + gr.SepAfter(1) + " " + gr.SepAfter(2) + " " + gr.SepAfter(3) + " " + gr.SepAfter(5));
+        List<int> g2 = new List<int>();
+        g2.Add(3); g2.Add(2);
+        gr.Groups = g2;
+        Console.WriteLine("mismatch " + gr.SeparatorCount());
+        gr.SetCode("abcdef");
+        Console.WriteLine("cellidx " + gr.CellIndexAt(0, 0, 40, 8, 10, 400, 0) + " "
+            + gr.CellIndexAt(0, 0, 40, 8, 10, 400, 50) + " "
+            + gr.CellIndexAt(0, 0, 40, 8, 10, 400, 82) + " "
+            + gr.CellIndexAt(0, 0, 40, 8, 10, 400, 92) + " "
+            + gr.CellIndexAt(0, 0, 40, 8, 10, 400, 399));
+        gr.Groups = new List<int>();
+
+        // ---- 10. Binding two-way push/pull -------------------------------
+        M model = new M();
+        model.code = "";
+        InputOtp b = new InputOtp(4);
+        int bc = 0;
+        b.Change += () => { bc = bc + 1; };
+        b.data = model.code;
+        b.SetValue("1234");
+        Console.WriteLine("push '" + model.code + "' c=" + bc);
+        model.code = "5678";
+        b.SetCodeFromModel();
+        Console.WriteLine("pull '" + b.GetCode() + "' c=" + bc);
+        model.code = "abcd";
+        b.SetCodeFromModel();
+        Console.WriteLine("pull-nofilter '" + b.GetCode() + "'");
+
+        // ---- 11. Mask display --------------------------------------------
+        InputOtp mk = new InputOtp(4);
+        mk.SetValue("1234");
+        Console.WriteLine("plain '" + mk.CellDisplay(0) + "'");
+        mk.MaskMode = true;
+        Console.WriteLine("mask '" + mk.CellDisplay(0) + "' empty '" + mk.CellDisplay(3) + "'");
+        mk.MaskChar = "*";
+        Console.WriteLine("mask-char '" + mk.CellDisplay(1) + "'");
+        mk.MaskMode = false;
+        Console.WriteLine("unmask '" + mk.CellDisplay(2) + "'");
+
+        // ---- 12. Value property round-trip ------------------------------
+        InputOtp j = new InputOtp(6);
+        int jc = 0;
+        j.Change += () => { jc = jc + 1; };
+        j.SetProp("value", "123456");
+        Console.WriteLine("value '" + j.GetProp("value") + "' c=" + jc);
+        j.SetProp("value", "654321");
+        Console.WriteLine("rewrite '" + j.GetCode() + "' c=" + jc);
+        j.SetProp("value", "654321");
+        Console.WriteLine("same-silent c=" + jc);
+
+        Console.WriteLine("ALL-OK");
+    }
+}

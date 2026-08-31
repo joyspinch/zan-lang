@@ -21,7 +21,10 @@ set(NAME "TplProbe")
 file(REMOVE_RECURSE ${WORK})
 file(MAKE_DIRECTORY ${WORK})
 
-file(GLOB _projs ${TEMPLATES}/*/*/zan.proj)
+# Discover every project manifest, including nested wizard templates such as
+# gui/gui-free/NewWeb.  A non-recursive two-level glob silently skipped those
+# projects and made the compile gate weaker than the IDE's project picker.
+file(GLOB_RECURSE _projs LIST_DIRECTORIES false ${TEMPLATES}/zan.proj)
 list(SORT _projs)
 if(_projs STREQUAL "")
   message(FATAL_ERROR "no templates found under ${TEMPLATES}")
@@ -38,13 +41,16 @@ foreach(_proj IN LISTS _projs)
   set(_type "")
   set(_target "exe")
   set(_entry "")
-  if(_manifest MATCHES "type[ \t]*=[ \t]*([^\r\n]*)")
+  # Accept both the canonical one-key-per-line manifest and the compact
+  # semicolon-separated form used by older templates.  Stop at either a
+  # semicolon or line ending so following keys cannot become part of a value.
+  if(_manifest MATCHES "type[ \t]*=[ \t]*([^;\r\n]*)")
     string(STRIP "${CMAKE_MATCH_1}" _type)
   endif()
-  if(_manifest MATCHES "target[ \t]*=[ \t]*([^\r\n]*)")
+  if(_manifest MATCHES "target[ \t]*=[ \t]*([^;\r\n]*)")
     string(STRIP "${CMAKE_MATCH_1}" _target)
   endif()
-  if(_manifest MATCHES "entry[ \t]*=[ \t]*([^\r\n]*)")
+  if(_manifest MATCHES "entry[ \t]*=[ \t]*([^;\r\n]*)")
     string(STRIP "${CMAKE_MATCH_1}" _entry)
   endif()
   string(REPLACE "{{NAME}}" "${NAME}" _entry "${_entry}")

@@ -379,6 +379,14 @@ class HttpDeadlineToken {
         this.generation = generation;
         this.disarmed = false;
     }
+
+    // A transport exception can unwind past the request body before its explicit
+    // cleanup point. Finalization is only a backstop; normal paths still disarm
+    // explicitly. Disarm is idempotent, so both paths are safe.
+    ~HttpDeadlineToken() {
+        // Backstop for an exception that unwinds past an explicit cleanup point.
+        HttpDeadline.Disarm(this);
+    }
 }
 
 class HttpDeadlineSlot {
@@ -443,6 +451,7 @@ class HttpDeadline {
             nowMs = Stopwatch.GetMilliseconds();
             int phase = timeoutMs;
             if (phase <= 0) { phase = totalMs; }
+            if (totalMs > 0 && phase > totalMs) { phase = totalMs; }
             int slot;
             int n = freeSlots.Count;
             if (n > 0) {
@@ -481,6 +490,9 @@ class HttpDeadline {
             if (token.disarmed || token.slot < 0 || token.slot >= slots.Count) { return; }
             HttpDeadlineSlot slot = slots[token.slot];
             if (!slot.active || slot.generation != token.generation) { return; }
+            // Sweep 已经触发时不能被阶段切换重新武装；否则发送阶段
+            // 的超时可能在 await 返回后被 Touch 清掉。
+            if (slot.fired) { return; }
             nowMs = Stopwatch.GetMilliseconds();
             long next = nowMs + timeoutMs;
             if (slot.totalDeadline > 0 && next > slot.totalDeadline) {

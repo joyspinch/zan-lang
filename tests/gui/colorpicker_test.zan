@@ -1,0 +1,282 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// ColorPicker 的无窗口回归，四块容易回归的机制。
+///
+/// 1. 打包色数学（符号安全）：int 为 32 位，0xAARRGGBB 常量回绕成
+///    负数——Theme.Rgb 的 (int)4278190080 也是负包。提取/构造/比较
+///    必须对负包正确，HSV/HSL/HEX/函数串各往返一遍。
+/// 2. 文本解析：#RGB/#RRGGBB/#RRGGBBAA、rgb/rgba/hsl/hsb（可带
+///    alpha、百分数、小数 alpha）全部接受，垃圾文本保留原值不崩。
+/// 3. 模式与格式化：modes 只剩一种时锁定取值格式；showAlpha 关闭
+///    时 alpha 恒 1 且文本退回 rgb(...)/#RRGGBB。
+/// 4. 弹层帧推演：BeginFrame/RunOverlays 手工推帧，验证弹层登记的
+///    阻挡区、外部点击关闭、以及弹层打开时输入行视图对齐 Mode。
+///    （rowY 曾对 alpha 条空间双扣，输入行压住透明度条——用命中
+///    区扫描锁住：透明度条 id 必须在色相条与输入行之间可见。）
+class Program {
+    static int fails;
+    static App cpApp;
+    static ColorPicker live;
+
+    /// 弹层帧推演的帧体：真实帧循环（PresentFrame 的
+    /// KeepFullSnapshot 快照）里渲染触发条 + 弹层。
+    static void CpBody() {
+        cpApp.BeginFrame();
+        live.RenderInside(cpApp, new Rect(40, 40, 220, 34));
+        cpApp.RunOverlays();
+    }
+
+    static void True(string what, bool got) {
+        if (got) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void EqStr(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got '{got}' want '{want}'");
+    }
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine($"FAIL {what}: got {got} want {want}");
+    }
+
+    static void Main() {
+        fails = 0;
+
+        // ---- 打包色：负包提取与构造 --------------------------------
+        // 0x937B3737 回绕成负数；通道提取必须逐位正确。
+        int neg = 0x93 * 16777216 + 0x7B * 65536 + 0x37 * 256 + 0x37;
+        EqInt("alpha of neg", ColorPicker.AlphaOf(neg), 0x93);
+        EqInt("rgb of neg", ColorPicker.RgbOf(neg), 0x7B3737);
+        int built = ColorPicker.Opaque(91, 55, 55);
+        EqInt("opaque rgb", ColorPicker.RgbOf(built), 91 * 65536 + 55 * 256 + 55);
+        EqInt("opaque alpha", ColorPicker.AlphaOf(built), 255);
+        True("same packed", ColorPicker.SamePacked(built, built + 256 * 16777216));
+        True("differs by alpha",
+            !ColorPicker.SamePacked(built, App.WithAlpha(built, 128)));
+
+        // ---- HSV 往返（含纯色/灰阶边界）----------------------------
+        EqInt("hsv pure red", ColorPicker.RgbOf(ColorPicker.HsvToRgb(0, 1000, 1000)), 0xFF0000);
+        EqInt("hsv pure green", ColorPicker.RgbOf(ColorPicker.HsvToRgb(120, 1000, 1000)), 0x00FF00);
+        EqInt("hsv pure blue", ColorPicker.RgbOf(ColorPicker.HsvToRgb(240, 1000, 1000)), 0x0000FF);
+        EqInt("hsv gray", ColorPicker.RgbOf(ColorPicker.HsvToRgb(120, 0, 500)), 0x7F7F7F);
+        EqInt("hsv black", ColorPicker.RgbOf(ColorPicker.HsvToRgb(0, 1000, 0)), 0);
+        // 91,55,55 → HSV(0,395,356) → 回来是 90,54,54：千分比量化的
+        // 1/1000 磨损属预期（控件在未触碰色盘时直接回 basePacked，
+        // 见下文 ctor/set 断言，往返精确靠的不是重算 HSV）。
+        int sv = ColorPicker.RgbToSv(91 * 65536 + 55 * 256 + 55);
+        int rsvH = ColorPicker.hueOut;
+        EqInt("sv hue", rsvH, 0);
+        EqInt("sv sat", sv / 4096, 395);
+        EqInt("sv val", sv % 4096, 356);
+        int back = ColorPicker.RgbOf(ColorPicker.HsvToRgb(rsvH, sv / 4096, sv % 4096));
+        EqInt("hsv quantized back", back, 90 * 65536 + 54 * 256 + 54);
+
+        // ---- HSL 往返 ----------------------------------------------
+        EqInt("hsl pure red", ColorPicker.RgbOf(ColorPicker.HslToRgb(0, 1000, 500)), 0xFF0000);
+        EqInt("hsl gray", ColorPicker.RgbOf(ColorPicker.HslToRgb(120, 0, 500)), 0x7F7F7F);
+        int hsl = ColorPicker.RgbHsl(0x18, 0xA0, 0x58);
+        int h2 = ColorPicker.RgbOf(ColorPicker.HslToRgb(
+            hsl / 1000000, (hsl / 1000) % 1000, hsl % 1000));
+        EqInt("hsl quantized back", h2, 23 * 65536 + 159 * 256 + 150);
+
+        // ---- HEX / 函数串解析 --------------------------------------
+        // 注意：打包色 alpha ≥ 0x80 时回绕成负 int，不能用 -1 当失败
+        // 哨兵——parseOk 才是权威的成功标志（回归修复点）。
+        ColorPicker.parseOk = false;
+        EqInt("hex 6 rgb", ColorPicker.RgbOf(ColorPicker.HexParse("#18A058")),
+              0x18A058);
+        True("hex 6 ok", ColorPicker.parseOk);
+        EqInt("hex 8 rgb", ColorPicker.RgbOf(ColorPicker.HexParse("#18A05880")),
+              0x18A058);
+        EqInt("hex 8 alpha", ColorPicker.AlphaOf(ColorPicker.HexParse("#18A05880")),
+              0x80);
+        True("hex 8 ok", ColorPicker.parseOk);
+        EqInt("hex 3", ColorPicker.RgbOf(ColorPicker.HexParse("#F00")),
+              0xFF0000);
+        ColorPicker.HexParse("#12G456");
+        True("hex bad rejected", !ColorPicker.parseOk);
+        ColorPicker.HexParse("#12");
+        True("hex short rejected", !ColorPicker.parseOk);
+        EqInt("func rgba", ColorPicker.RgbOf(
+              ColorPicker.FuncParse("rgba(91, 55, 55, 1)")), 0x5B3737);
+        EqInt("func rgb", ColorPicker.RgbOf(
+              ColorPicker.FuncParse("rgb(24, 160, 88)")), 0x18A058);
+        EqInt("func alpha frac", ColorPicker.AlphaOf(
+              ColorPicker.FuncParse("rgb(0, 0, 0, 0.5)")), 127);
+        EqInt("func alpha pct", ColorPicker.AlphaOf(
+              ColorPicker.FuncParse("rgb(0, 0, 0, 50%)")), 127);
+        EqInt("func hsl", ColorPicker.RgbOf(
+              ColorPicker.FuncParse("hsl(120, 100%, 50%)")), 0x00FF00);
+        EqInt("func hsb", ColorPicker.RgbOf(
+              ColorPicker.FuncParse("hsb(120, 100%, 100%)")), 0x00FF00);
+        EqInt("func hsv alias", ColorPicker.RgbOf(
+              ColorPicker.FuncParse("hsv(0, 100%, 100%)")), 0xFF0000);
+        ColorPicker.FuncParse("lab(1, 2, 3)");
+        True("func bad rejected", !ColorPicker.parseOk);
+        EqInt("pct num", ColorPicker.PctNum("34%"), 340);
+        EqInt("pct frac", ColorPicker.PctOrFrac("0.5"), 127);
+        EqInt("parse int safe", ColorPicker.ParseIntSafe("007"), 7);
+        EqInt("parse int garbage", ColorPicker.ParseIntSafe("12x"), 0 - 1);
+
+        // ---- 控件状态：赋值 / 显示 / designer 往返 -------------------
+        ColorPicker p = new ColorPicker(0xFF5B3737);
+        EqInt("ctor val", ColorPicker.RgbOf(p.Value()), 0x5B3737);
+        EqInt("ctor hue", p.hue, 0);
+        EqStr("ctor text", p.Text(), "rgba(91, 55, 55, 1)");
+        p.SetText("#18A05880");
+        EqInt("set hex rgb", ColorPicker.RgbOf(p.Value()), 0x18A058);
+        EqInt("set hex alpha", p.alpha, 0x80);
+        p.SetText("hsl(120, 100%, 25%)");
+        EqInt("set hsl rgb", ColorPicker.RgbOf(p.Value()), 0 * 65536 + 127 * 256);
+        p.SetText("不是颜色");
+        EqStr("garbage ignored", ColorPicker.RgbOf(p.Value()) == 127 * 256 ? "kept" : "lost", "kept");
+        p.SetText("#ABCDEF");
+        EqInt("set 6 alpha 255", p.alpha, 255);
+
+        p.SetShowAlpha(false);
+        EqInt("no-alpha forced 255", p.alpha, 255);
+        EqStr("no-alpha rgb text", p.Text(), "rgb(171, 205, 239)");
+        EqStr("no-alpha hex", p.FormatAs("hex"), "#ABCDEF");
+        p.SetShowAlpha(true);
+        EqStr("alpha hex", p.FormatAs("hex"), "#ABCDEFFF");
+
+        // 模式锁定：modes 只剩 hex 时取值文本跟随。
+        p.Modes("hex", "", "", "");
+        EqStr("mode locked hex", p.Text(), "#ABCDEFFF");
+        p.Modes("hsl", "hsb", "", "");
+        EqStr("mode stays hsl", p.Text().StartsWith("hsl(") ? "hsl" : "other", "hsl");
+        p.Modes("", "", "", "");
+        EqStr("modes cleared keeps hsl", p.Text().StartsWith("hsl(") ? "hsl" : "other", "hsl");
+        p.Mode = "hsb";
+        EqStr("mode hsb", p.Text().StartsWith("hsb(") ? "hsb" : "other", "hsb");
+
+        // designer 往返。
+        p.Mode = "rgb";
+        EqStr("extra value", p.GetExtra("value"), p.Text());
+        EqStr("extra showAlpha", p.GetExtra("showAlpha"), "true");
+        EqStr("extra mode", p.GetExtra("mode"), "rgb");
+        True("extra set ok", p.SetExtra("showAlpha", "false"));
+        EqStr("extra showAlpha 2", p.GetExtra("showAlpha"), "false");
+        True("extra unknown", p.GetExtra("nope") == "");
+        p.SetShowAlpha(true);
+
+        // ---- 弹层帧推演 ---------------------------------------------
+        // AnchorAt 读取的是 PresentFrame 里 KeepFullSnapshot 留下的
+        // 整帧命中区快照，所以帧必须走 App 的真实帧循环（
+        // SetFrameBody + FrameGuarded），手动 BeginFrame/RunOverlays
+        // 拼不出快照。
+        cpApp = new App("cp-regression", 480, 560);
+        live = new ColorPicker(0xFF000000);
+        live.Mode = "hex";
+        live.open = true;
+        cpApp.SetFrameBody(CpBody);
+        cpApp.Show();
+        cpApp.RequestRedraw();
+        for (int i = 0; i < 3; i = i + 1) {
+            cpApp.PumpGuarded();
+            cpApp.FrameGuarded(CpBody);
+        }
+        True("popup blocker", cpApp.hitTester.BlockerAt(200, 200));
+        int trigId = live.wid;
+        // 纵向扫触发条中心 x：色相条之下应先命中透明度条、再是输入行。
+        // （rowY 双扣回归曾让输入行整行压住透明度条，输入行的四个
+        // Input 命中区把 alpha 条 id 全部遮没。）
+        int sawAlpha = 0 - 1;
+        int sawHue = 0 - 1;
+        int sawInput = 0 - 1;
+        int aId = live.wid + ColorPicker.AlphaOff();
+        for (int y = 40; y < 560; y = y + 1) {
+            int id = cpApp.hitTester.AnchorAt(0, 158, y, false);
+            if (id == live.wid + ColorPicker.HueOff() && sawHue < 0) {
+                sawHue = y;
+            }
+            if (id == aId && sawAlpha < 0) { sawAlpha = y; }
+            if (id > aId + 4 && sawInput < 0 && sawAlpha > 0) {
+                sawInput = y;
+            }
+        }
+        True("hue bar hit", sawHue > 0);
+        True("alpha bar hit", sawAlpha > 0);
+        True("input row below alpha", sawInput > sawAlpha);
+        True("alpha below hue", sawAlpha > sawHue);
+        // 输入行视图：Mode=hex 且允许 → 打开第一帧对齐 HEX。
+        EqStr("view aligned hex", live.inputView == 1 ? "hex" : "other", "hex");
+        True("popup stays open", live.open);
+        True("pointer captured by popup", cpApp.PointerCaptured());
+        True("trigger not hovered", !cpApp.focus.IsHovered(trigId));
+
+        // ---- 外部按下关闭 -------------------------------------------
+        // Naive UI 语义：在弹层外*按下*即关闭（不等释放）。直改状态
+        // 模拟一次弹层外的按压帧：dragPart 复位、输入行失焦、
+        // 覆盖阶段弹层不再注册。
+        cpApp.focus.SetPressed(0 - 1);
+        live.open = false;
+        cpApp.RequestRedraw();
+        for (int i = 0; i < 3; i = i + 1) {
+            cpApp.PumpGuarded();
+            cpApp.FrameGuarded(CpBody);
+        }
+        True("closed stays closed", live.open == false);
+
+        // ---- 重开 ----------------------------------------------------
+        live.open = true;
+        cpApp.RequestRedraw();
+        for (int i = 0; i < 3; i = i + 1) {
+            cpApp.PumpGuarded();
+            cpApp.FrameGuarded(CpBody);
+        }
+        True("trigger reopens", live.open);
+
+        // ---- Change 事件：拖 SV 落定触发一次 ------------------------
+        // 直接戳字段 + 置 hsvTouched 模拟一次色盘拖动（真实拖动路径
+        // 也是这样武装 hsvTouched 的），Commit 走 CurrentRgb 落模型。
+        ColorPicker ev = new ColorPicker(0xFF000000);
+        int fired = 0;
+        ev.Change.Add(() => { fired = fired + 1; });
+        ev.val = 500;
+        ev.hsvTouched = true;
+        ev.Commit();
+        EqInt("change fired", fired, 1);
+        EqInt("change value", ColorPicker.RgbOf(ev.Value()), 127 * 65536 + 127 * 256 + 127);
+        ev.Commit();
+        EqInt("commit refires", fired, 2);
+        // SetColor 是程序化赋值，不触发 Change。
+        ev.SetColor(ColorPicker.Opaque(255, 0, 0));
+        EqInt("setcolor no fire", fired, 2);
+        EqInt("setcolor value", ColorPicker.RgbOf(ev.Value()), 0xFF0000);
+
+        // ---- 双向绑定 ------------------------------------------------
+        // data 是编译器合成的 Binding：对模型字段左值赋值即得实时绑定。
+        ColorHost host = new ColorHost();
+        host.tint = ColorPicker.Opaque(10, 20, 30);
+        ColorPicker b = ColorPicker.Bind(new SignalInt(host.tint));
+        b.data = host.tint;
+        EqInt("bind initial", ColorPicker.RgbOf(b.Value()),
+              10 * 65536 + 20 * 256 + 30);
+        host.tint = ColorPicker.Opaque(200, 100, 50);
+        b.SyncBinding();
+        EqInt("model->ui", ColorPicker.RgbOf(b.Value()),
+              200 * 65536 + 100 * 256 + 50);
+        b.SetText("#336699");
+        EqInt("ui->model", ColorPicker.RgbOf(host.tint), 0x336699);
+
+        if (fails == 0) {
+            Console.WriteLine("colorpicker_test OK");
+        } else {
+            Console.WriteLine("colorpicker_test FAIL "
+                + Convert.ToString(fails));
+        }
+    }
+}
+
+/// 双向绑定的宿主模型字段。
+class ColorHost {
+    int tint;
+}

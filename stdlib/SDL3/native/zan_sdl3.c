@@ -107,6 +107,61 @@ ZAN_SDL_API zan_iptr zan_sdl_create_renderer(zan_iptr window, const char *name) 
     return zan_handle(SDL_CreateRenderer((SDL_Window *)zan_ptr(window), name));
 }
 
+/* ---- Borderless drag/resize (custom title bar) ---------------------------
+ * SDL calls the hit-test callback on every mouse-move probe. The caption strip
+ * is the top 40 native px; resize handles live in the outer 6 px frame and
+ * win over the caption at the corners. Maximized windows report NORMAL so the
+ * frame is not draggable/resizable. Caption-button areas are excluded by the
+ * game itself: it consumes those clicks as UI, so SDL never sees them. */
+
+static SDL_HitTestResult zan_sdl_game_hittest(SDL_Window *win,
+                                              const SDL_Point *area,
+                                              void *data) {
+    (void)data;
+    int W = 0, H = 0;
+    SDL_GetWindowSize(win, &W, &H);
+    int x = area->x, y = area->y;
+    if (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) {
+        return SDL_HITTEST_NORMAL;
+    }
+    int b = 6;
+    int left = x < b, right = x >= W - b, top = y < b, bottom = y >= H - b;
+    if (left && top) return SDL_HITTEST_RESIZE_TOPLEFT;
+    if (left && bottom) return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+    if (right && top) return SDL_HITTEST_RESIZE_TOPRIGHT;
+    if (right && bottom) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+    if (left) return SDL_HITTEST_RESIZE_LEFT;
+    if (right) return SDL_HITTEST_RESIZE_RIGHT;
+    if (top) return SDL_HITTEST_RESIZE_TOP;
+    if (bottom) return SDL_HITTEST_RESIZE_BOTTOM;
+    if (y < 40) return SDL_HITTEST_DRAGGABLE;
+    return SDL_HITTEST_NORMAL;
+}
+
+ZAN_SDL_API zan_i32 zan_sdl_set_game_hittest(zan_iptr window) {
+    if (!window) return 0;
+    return zan_bool(SDL_SetWindowHitTest((SDL_Window *)zan_ptr(window),
+                                         zan_sdl_game_hittest, NULL));
+}
+
+ZAN_SDL_API zan_i32 zan_sdl_show_window_menu(zan_iptr window, zan_i32 x, zan_i32 y) {
+    if (!window) return 0;
+    return zan_bool(SDL_ShowWindowSystemMenu((SDL_Window *)zan_ptr(window),
+                                             (int)x, (int)y));
+}
+
+ZAN_SDL_API zan_i32 zan_sdl_maximize_window(zan_iptr window) {
+    if (!window) return 0;
+    SDL_MaximizeWindow((SDL_Window *)zan_ptr(window));
+    return 1;
+}
+
+ZAN_SDL_API zan_i32 zan_sdl_minimize_window(zan_iptr window) {
+    if (!window) return 0;
+    SDL_MinimizeWindow((SDL_Window *)zan_ptr(window));
+    return 1;
+}
+
 ZAN_SDL_API void zan_sdl_destroy_renderer(zan_iptr renderer) {
     if (renderer) SDL_DestroyRenderer((SDL_Renderer *)zan_ptr(renderer));
 }

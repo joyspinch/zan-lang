@@ -1,0 +1,1126 @@
+// 深渊矿队 Data — 数据表、数值公式、模拟循环、存档。
+// 由 main.zan(GameKit UI 宿主)驱动:Game.New() 建档,Game.Tick(dt) 推进,
+// Game.SaveGame()/LoadGame() 持久化。MINER_SIM 平衡自测在 main.zan 里。
+using System;
+using System.IO;
+using GameKit;
+
+namespace Miner;
+
+// ---------------- 数据表 ------------------------------------------------
+
+// 矿工单位类型。type 常量 == Unit.type == 下标。
+class UnitDef {
+    public string name;
+    public string desc;
+    public double interval;   // 基础挖掘间隔(秒)
+    public double yield;      // 单次基础产出
+    public double dmgMult;    // 伤害倍率(爆破手 3)
+    public int ore;           // 固定产出矿:0 铁 1 铜 2 金,-1 按层随机
+    public double cost;       // 1 级(首雇)基础价
+    public double growth;     // 雇佣/升级价格增长
+    public int cur;           // 消耗货币:0 铁 1 铜 2 金 3 萤晶 4 深渊核心
+    public int unlockFloor;   // 解锁层
+    public int glyph;         // UI 图标种类
+}
+
+// 强化项。
+class UpDef {
+    public string name;
+    public string desc;
+    public double cost;
+    public double growth;
+    public int cur;
+    public int unlockFloor;   // 按层解锁
+    public int needType;      // 需要先拥有该类矿工(-1 不需要)
+    public int maxLv;
+}
+
+// 圣物(遗物)。
+class Relic {
+    public int key;        // 0..5
+    public int quality;    // 1..99
+    public bool equipped;
+}
+
+// 队伍里的一个单位实例。
+class Unit {
+    public int type;
+    public double timer;
+    public double mult;    // 本轮时间倍率(图腾触发 0.5)
+}
+
+class FText {
+    public string text;
+    public double x;
+    public double y;
+    public long bornAt;
+    public int cr;
+    public int cg;
+    public int cb;
+    public bool big;
+}
+
+class Toast {
+    public string text;
+    public long bornAt;
+    public int cr;
+    public int cg;
+    public int cb;
+}
+
+// 活动事件。
+class Evt {
+    public int type;       // 0 矿脉涌动 1 黑市商人 2 遗迹探秘 3 深渊低语
+    public double until;   // playSec 截止
+    public bool done;
+}
+
+// ---------------- 核心 Game --------------------------------------------
+
+class Game {
+    public Rng rng;
+
+    // 货币(铁/铜/金/萤晶/深渊核心)
+    public double tie;
+    public double tong;
+    public double jin;
+    public double cry;
+    public double cores;
+
+    public int floor;          // 当前层(0 起)
+    public int best;           // 历史最深
+    public int prestiges;
+    public double playSec;
+    public double kills;
+    public double monsterHp;   // 当前怪剩余血
+    public double dispHp;      // UI 平滑血条
+    public int killStreak;     // 本层已击杀数
+    public int killNeed;       // 本层需要的击杀数
+
+    public List<Unit> crew;
+    public int[] upLv;         // [14]
+    public List<Relic> relics;
+    public int forgeLv;
+    public int astroMask;
+    public int[] coreLv;       // [7] 0攻 1矿 2速 3基金 4圣物 5离线 6自动
+    public bool soundOn;
+
+    public double buffUntil;   // playSec,深渊低语 +25% 伤害
+    public double nextEventAt;
+    public Evt ev;
+    public double relicTimer;
+    public double offlineGain; // LoadGame 返回的离线秒数(UI 读取)
+
+    public List<FText> floats;
+    public List<Toast> toasts;
+    public long lastKillAt;
+    public long shakeUntil;
+    public string bannerText;
+    public long bannerUntil;
+    public double autoTimer;
+
+    // ---- 常量表(实例持有,New() 里填充) ----
+    public UnitDef[] UD;
+    public UpDef[] UPD;
+    public int[] UpCurCol;
+    public string[] RelicName;
+    public string[] RelicDesc;
+    public int[] CurCost = new int[3];   // 占位
+    public static string[] OreName = new string[] { "铁", "铜", "金" };
+    public static int[] OreCol = new int[] { 0 };
+
+    // ---- 建档 -----------------------------------------------------------
+
+    public static Game New() {
+        Game g = new Game();
+        g.rng = Rng.Seed((long)DateTime.UtcNow().ToUnixSeconds() * 1000003 + 7);
+        g.tie = 150;
+        g.tong = 0;
+        g.jin = 0;
+        g.cry = 0;
+        g.cores = 0;
+        g.floor = 0;
+        g.best = 0;
+        g.prestiges = 0;
+        g.playSec = 0;
+        g.kills = 0;
+        g.crew = new List<Unit>();
+        g.upLv = new int[14];
+        g.relics = new List<Relic>();
+        g.forgeLv = 0;
+        g.astroMask = 0;
+        g.coreLv = new int[7];
+        g.soundOn = true;
+        g.buffUntil = 0;
+        g.nextEventAt = 100;
+        g.relicTimer = 0;
+        g.floats = new List<FText>();
+        g.toasts = new List<Toast>();
+        g.autoTimer = 0;
+        g.bannerText = "";
+        g.bannerUntil = 0;
+        g.InitTables();
+        g.monsterHp = g.MonsterMaxHp();
+        g.killNeed = 3;
+        g.dispHp = g.monsterHp;
+        return g;
+    }
+
+    public void InitTables() {
+        UD = new UnitDef[6];
+        UD[0] = NewUD("矿工", "可靠的铁镐手", 3.0, 1, 1, -1, 10, 1.15, 0, 0, 0);
+        UD[1] = NewUD("盗贼", "手快,还顺手牵羊", 1.5, 1, 1, -1, 60, 1.16, 0, 0, 1);
+        UD[2] = NewUD("萨满", "图腾指引铜脉", 2.0, 1, 1, 1, 300, 1.17, 1, 2, 2);
+        UD[3] = NewUD("爆破手", "三倍产出,三倍伤害", 4.0, 3, 3, -1, 1200, 1.19, 1, 5, 3);
+        UD[4] = NewUD("巨人", "一镐一个深坑", 6.0, 20, 1, -1, 6000, 1.21, 2, 8, 4);
+        UD[5] = NewUD("秘术师", "凝聚萤晶碎片", 6.0, 1, 1, -1, 25000, 1.24, 2, 12, 5);
+
+        UPD = new UpDef[14];
+        UPD[0] = NewUp("矿工重训", "矿工单次产出 +1", 30, 1.34, 0, 0, 0, 0);
+        UPD[1] = NewUp("熟练挥镐", "矿工间隔 -8%/级", 80, 1.5, 1, 1, 0, 0);
+        UPD[2] = NewUp("精准凿击", "矿工 10%/级 概率 +2 伤害", 120, 1.55, 2, 4, 0, 0);
+        UPD[3] = NewUp("轻捷技巧", "盗贼间隔 -0.1s/级", 100, 1.4, 0, 1, 1, 0);
+        UPD[4] = NewUp("黑市手法", "盗贼 15%/级 概率双倍产出", 200, 1.5, 1, 3, 1, 0);
+        UPD[5] = NewUp("顺手牵羊", "盗贼每次偷 (20%+5%/级)×2金", 400, 1.55, 2, 6, 1, 0);
+        UPD[6] = NewUp("强效图腾", "萨满 20%+10%/级 半程加速", 300, 1.5, 1, 4, 2, 0);
+        UPD[7] = NewUp("地脉感知", "萨满铜产出 +1/级", 350, 1.5, 2, 8, 2, 0);
+        UPD[8] = NewUp("巨力横扫", "巨人单次产出 +5/级", 900, 1.4, 2, 10, 4, 0);
+        UPD[9] = NewUp("重锤冲击", "巨人伤害 +100%/级 产出量", 1500, 1.5, 2, 12, 4, 0);
+        UPD[10] = NewUp("稳健步伐", "巨人铜/金权重 ×1.5/级", 1100, 1.45, 2, 12, 4, 0);
+        UPD[11] = NewUp("深渊号角", "全员间隔 -3%/级", 1, 1.6, 4, 0, -1, 20);
+        UPD[12] = NewUp("矿脉福星", "铜/金掉落权重 +8%/级", 8, 1.5, 3, 0, -1, 10);
+        UPD[13] = NewUp("蛮荒之力", "全员 5%/级 概率双倍伤害", 10, 1.5, 3, 0, -1, 10);
+
+        RelicName = new string[] { "炽热之刃", "黄金圣杯", "疾风之靴", "狂暴之心", "幸运骰子", "盗贼护符" };
+        RelicDesc = new string[] { "每次挖掘额外伤害", "金矿产出提高", "挖掘间隔缩短", "概率双倍伤害", "铜/金掉落提高", "概率直接得金" };
+    }
+
+    static UnitDef NewUD(string name, string desc, double itv, double y, double dm,
+                         int ore, double cost, double gr, int cur, int uf, int glyph) {
+        UnitDef d = new UnitDef();
+        d.name = name; d.desc = desc; d.interval = itv; d.yield = y; d.dmgMult = dm;
+        d.ore = ore; d.cost = cost; d.growth = gr; d.cur = cur; d.unlockFloor = uf;
+        d.glyph = glyph;
+        return d;
+    }
+    static UpDef NewUp(string name, string desc, double cost, double gr, int cur,
+                       int uf, int need, int maxLv) {
+        UpDef d = new UpDef();
+        d.name = name; d.desc = desc; d.cost = cost; d.growth = gr; d.cur = cur;
+        d.unlockFloor = uf; d.needType = need; d.maxLv = maxLv;
+        return d;
+    }
+
+    // ---- 货币 -----------------------------------------------------------
+
+    public double Cur(int idx) {
+        if (idx == 0) { return tie; }
+        if (idx == 1) { return tong; }
+        if (idx == 2) { return jin; }
+        if (idx == 3) { return cry; }
+        return cores;
+    }
+    public void AddCur(int idx, double n) {
+        if (idx == 0) { tie = tie + n; return; }
+        if (idx == 1) { tong = tong + n; return; }
+        if (idx == 2) { jin = jin + n; return; }
+        if (idx == 3) { cry = cry + n; return; }
+        cores = cores + n;
+    }
+    public bool Pay(int idx, double n) {
+        if (Cur(idx) < n) { return false; }
+        AddCur(idx, 0 - n);
+        return true;
+    }
+
+    // ---- 队伍/雇佣 ------------------------------------------------------
+
+    public int CrewCount(int type) {
+        int n = 0;
+        for (int i = 0; i < crew.Count; i = i + 1) {
+            if (crew[i].type == type) { n = n + 1; }
+        }
+        return n;
+    }
+    // 各类矿工平均持有量(平衡观测用):同类合并购买导致 crew 陡增,
+    // 单类 20+ 时全局间隔惩罚就会生效
+    public double CrewAvg() {
+        if (crew.Count == 0) { return 0; }
+        int filled = 0;
+        int sum = 0;
+        for (int t = 0; t < 6; t = t + 1) {
+            int c = CrewCount(t);
+            sum = sum + c;
+            if (c > 0) { filled = filled + 1; }
+        }
+        if (filled == 0) { return 0; }
+        return (double)sum / filled;
+    }
+    // 单类规模惩罚:某类矿工超过 15 人后,每多 1 人该类挖掘间隔 +3%(上限 3 倍)
+    // 鼓励均衡发展,同时给「爆兵单类」留一条费钱的路
+    public double CrowdMult(int type) {
+        int extra = CrewCount(type) - 15;
+        if (extra <= 0) { return 1; }
+        double m = 1 + extra * 0.03;
+        if (m > 3) { m = 3; }
+        return m;
+    }
+    // 每次购买 = 雇一名 + 该类全员等级 +1(合并制,价随等级涨)
+    public double HireCost(int type) {
+        UnitDef d = UD[type];
+        return Math.Floor(d.cost * Math.Pow(d.growth, HireLevel(type)));
+    }
+    public int HireLevel(int type) {
+        return upLv[UpIndexOfType(type)];
+    }
+    public static int UpIndexOfType(int type) {
+        if (type == 0) { return 0; }
+        if (type == 1) { return 3; }
+        if (type == 2) { return 6; }
+        if (type == 3) { return 7; }
+        if (type == 4) { return 8; }
+        return 10;
+    }
+    public bool TypeUnlocked(int type) {
+        return floor >= UD[type].unlockFloor;
+    }
+    public bool BuyHire(int type) {
+        if (!TypeUnlocked(type)) { return false; }
+        double c = HireCost(type);
+        if (!Pay(UD[type].cur, c)) { return false; }
+        upLv[UpIndexOfType(type)] = upLv[UpIndexOfType(type)] + 1;
+        Unit u = new Unit();
+        u.type = type;
+        u.timer = 0;
+        u.mult = 1;
+        crew.Add(u);
+        return true;
+    }
+
+    // ---- 强化 -----------------------------------------------------------
+
+    public bool UpUnlocked(int i) {
+        UpDef d = UPD[i];
+        if (floor < d.unlockFloor) { return false; }
+        if (d.needType >= 0 && CrewCount(d.needType) == 0) { return false; }
+        return true;
+    }
+    public double UpCost(int i) {
+        UpDef d = UPD[i];
+        return Math.Floor(d.cost * Math.Pow(d.growth, upLv[i]));
+    }
+    public bool BuyUp(int i) {
+        if (!UpUnlocked(i)) { return false; }
+        if (UPD[i].maxLv > 0 && upLv[i] >= UPD[i].maxLv) { return false; }
+        if (!Pay(UPD[i].cur, UpCost(i))) { return false; }
+        upLv[i] = upLv[i] + 1;
+        return true;
+    }
+
+    // ---- 全局倍率 -------------------------------------------------------
+
+    public double CoreDmgMult() { return 1 + coreLv[0] * 0.25 + forgeLv * 0.06 + 0.03 * AstroCount(0); }
+    public double CoreOreMult() { return 1 + coreLv[1] * 0.25 + forgeLv * 0.04 + 0.03 * AstroCount(1); }
+    public double SpeedMult() {   // 乘在间隔上,越小越快
+        double m = Math.Pow(0.97, upLv[11]);
+        m = m * (1 - 0.03 * AstroCount(2));
+        if (coreLv[2] > 0) { m = m * Math.Pow(0.94, coreLv[2]); }
+        return m;
+    }
+    public int AstroCount(int kind) {   // kind 0 攻 1 矿 2 速
+        int n = 0;
+        for (int i = 0; i < 12; i = i + 1) {
+            if ((astroMask & (1 << i)) != 0) {
+                int k = i % 3;
+                if (k == kind) { n = n + 1; }
+            }
+        }
+        return n;
+    }
+
+    // ---- 圣物 -----------------------------------------------------------
+
+    public double RelicPower(int key) {
+        double sum = 0;
+        for (int i = 0; i < relics.Count; i = i + 1) {
+            Relic r = relics[i];
+            if (r.equipped && r.key == key) {
+                sum = sum + RelicVal(r.key, r.quality);
+            }
+        }
+        return sum;
+    }
+    public static double RelicVal(int key, int q) {
+        if (key == 0) { return q * 0.5; }
+        if (key == 1) { return q * 0.5; }
+        if (key == 2) { double v = q * 0.3; if (v > 50) { v = 50; } return v; }
+        if (key == 3) { double v = q * 0.2; if (v > 50) { v = 50; } return v; }
+        if (key == 4) { return q * 0.4; }
+        double s = q * 0.15; if (s > 30) { s = 30; } return s;
+    }
+    public int EquippedCount() {
+        int n = 0;
+        for (int i = 0; i < relics.Count; i = i + 1) {
+            if (relics[i].equipped) { n = n + 1; }
+        }
+        return n;
+    }
+    public bool EquipToggle(int idx) {
+        if (idx < 0 || idx >= relics.Count) { return false; }
+        Relic r = relics[idx];
+        if (!r.equipped && EquippedCount() >= 6) { return false; }
+        r.equipped = !r.equipped;
+        return true;
+    }
+    // 熔合:同 key 两件最低品质合成,品质 = 平均 + 3
+    public bool MergeRelics() {
+        for (int k = 0; k < 6; k = k + 1) {
+            int a = -1; int b = -1; int qa = 999; int qb = 999;
+            for (int i = 0; i < relics.Count; i = i + 1) {
+                Relic r = relics[i];
+                if (r.key != k || r.equipped) { continue; }
+                if (r.quality < qa) { b = a; qb = qa; a = i; qa = r.quality; }
+                else if (r.quality < qb) { b = i; qb = r.quality; }
+            }
+            if (a >= 0 && b >= 0) {
+                int nq = (qa + qb) / 2 + 3;
+                if (nq > 99) { nq = 99; }
+                relics[a].quality = nq;
+                relics.RemoveAt(b);
+                return true;
+            }
+        }
+        return false;
+    }
+    // 出售:未装备中品质最低的一件,按品质给对应货币
+    public bool SellRelic() {
+        int a = -1; int qa = 999;
+        for (int i = 0; i < relics.Count; i = i + 1) {
+            Relic r = relics[i];
+            if (r.equipped) { continue; }
+            if (r.quality < qa) { a = i; qa = r.quality; }
+        }
+        if (a < 0) { return false; }
+        Relic r = relics[a];
+        double gain = Math.Floor((20 + r.key * 8) * r.quality);
+        if (r.quality <= 20) { AddCur(0, gain); }
+        else if (r.quality <= 40) { AddCur(1, gain); }
+        else { AddCur(2, gain); }
+        relics.RemoveAt(a);
+        return true;
+    }
+    public Relic RollRelic(int ceng) {
+        // 击杀掉落:3% 基础,圣物磁石核心每级 +2%
+        if (rng.Range(0, 100) >= RelicDropChance()) { return null; }
+        Relic r = new Relic();
+        r.key = rng.Range(0, 6);
+        int baseQ = (int)(ceng * 1.2);
+        if (baseQ > 96) { baseQ = 96; }
+        int q = baseQ + rng.Range(0, 10) - 4 + 1;
+        int cap = 20 + ceng / 2;
+        if (cap > 99) { cap = 99; }
+        if (q > cap) { q = cap; }
+        if (q < 1) { q = 1; }
+        r.quality = q;
+        r.equipped = false;
+        return r;
+    }
+    public int RelicDropChance() {
+        return 3 + coreLv[4] * 2;
+    }
+
+    // ---- 怪物/层数 ------------------------------------------------------
+
+    public bool IsBoss() {
+        return (floor + 1) % 10 == 0;
+    }
+    public double MonsterMaxHp() {
+        // 混合成长:指数底数 1.32 压前期斜率,线性项 +18%/层 保后期陡度
+        double hp = 30 * Math.Pow(1.32, floor) * (1 + floor * 0.18) * SpeedMult();
+        if (IsBoss()) { hp = hp * 2.5; }
+        return hp;
+    }
+
+    // ---- 掉落 -----------------------------------------------------------
+
+    // 层权重:铁 100-2.5c,铜 50-|c-20|×2,金 (c-5)×3
+    public void OreWeights(bool isJr, double[] w) {
+        int c = floor;
+        if (c < 0) { c = 0; }
+        w[0] = 100 - c * 2.5;
+        if (w[0] < 5) { w[0] = 5; }
+        w[1] = 50 - Math.Abs(c - 20) * 2;
+        if (w[1] < 0) { w[1] = 0; }
+        w[2] = (c - 5) * 3;
+        if (w[2] < 0) { w[2] = 0; }
+        double mult = 1 + upLv[12] * 0.08 + RelicPower(4) / 100;
+        if (isJr && upLv[10] > 0) { mult = mult * (1 + upLv[10] * 0.5); }
+        w[1] = w[1] * mult;
+        w[2] = w[2] * mult;
+    }
+    public int PickOre(bool isJr) {
+        double[] w = new double[3];
+        OreWeights(isJr, w);
+        double tot = w[0] + w[1] + w[2];
+        if (tot <= 0) { return 0; }
+        double rnd = rng.NextDouble01() * tot;
+        if (rnd < w[0]) { return 0; }
+        if (rnd < w[0] + w[1]) { return 1; }
+        return 2;
+    }
+    public double DropProb(int idx) {
+        double[] w = new double[3];
+        OreWeights(false, w);
+        double tot = w[0] + w[1] + w[2];
+        if (tot <= 0) { return idx == 0 ? 100 : 0; }
+        return w[idx] / tot * 100;
+    }
+
+    // ---- 单次挖掘 -------------------------------------------------------
+
+    public double UnitInterval(Unit u) {
+        UnitDef d = UD[u.type];
+        double t = d.interval;
+        if (u.type == 0) { t = t * Math.Pow(0.92, upLv[1]); }
+        if (u.type == 1) { t = t - upLv[3] * 0.1; }
+        double relic = RelicPower(2);
+        if (relic > 0) { t = t * (1 - Math.Min(0.8, relic / 100)); }
+        t = t * SpeedMult();
+        t = t * CrowdMult(u.type);
+        if (t < 0.1) { t = 0.1; }
+        return t;
+    }
+    public double UnitYield(Unit u) {
+        if (u.type < 0 || u.type >= UD.Length) { u.type = 0; }
+        UnitDef d = UD[u.type];
+        double y = d.yield;
+        if (u.type == 0) { y = 1 + upLv[0]; }
+        if (u.type == 2) { y = 1 + upLv[7]; }
+        if (u.type == 4) { y = 20 + upLv[8] * 5; }
+        return y * CoreOreMult();
+    }
+    // 单次挖掘的全流程;pushFloat 控制是否喷字(无头模拟时关)
+    public void DoDig(Unit u, bool fx) {
+        UnitDef d = UD[u.type];
+        double y = UnitYield(u);
+        // 盗贼双倍
+        if (u.type == 1 && upLv[4] > 0 && rng.NextDouble01() < Math.Min(1, upLv[4] * 0.15)) { y = y * 2; }
+        // 顺手牵羊
+        if (u.type == 1 && upLv[5] > 0 && rng.NextDouble01() < Math.Min(1, 0.2 + upLv[5] * 0.05)) {
+            double g = upLv[5] * 2;
+            AddCur(2, g);
+        }
+        // 盗贼护符窃金
+        double steal = RelicPower(5);
+        if (steal > 0 && rng.NextDouble01() < steal / 100) {
+            AddCur(2, Math.Max(1, Math.Floor(steal * 2)));
+        }
+        // 掉落
+        if (u.type == 5) {
+            if (rng.NextDouble01() < 0.25) { AddCur(3, y); if (fx) { Float("+1 萤晶", 186, 148, 255, false); } }
+        } else {
+            int ore = d.ore;
+            if (ore < 0) { ore = PickOre(u.type == 4); }
+            double n = y;
+            if (ore == 2) {
+                double rg = RelicPower(1);
+                if (rg > 0) { n = Math.Round(y * (1 + rg / 100)); }
+            }
+            AddCur(ore, n);
+            if (fx && rng.Range(0, 3) == 0) {
+                Float("+" + FmtNum(n) + " " + OreName[ore], OreColOf(ore), false);
+            }
+        }
+        // 伤害
+        double dmg = y * d.dmgMult;
+        if (u.type == 0 && upLv[2] > 0 && rng.NextDouble01() < Math.Min(1, upLv[2] * 0.1)) { dmg = dmg + upLv[2] * 2; }
+        if (u.type == 4 && upLv[9] > 0) { dmg = dmg + y * upLv[9]; }
+        dmg = dmg * CoreDmgMult();
+        double rc = RelicPower(0);
+        if (rc > 0) { dmg = dmg + rc; }
+        if (RelicPower(3) > 0 && rng.NextDouble01() < RelicPower(3) / 100) { dmg = dmg * 2; }
+        if (upLv[13] > 0 && rng.NextDouble01() < upLv[13] * 0.05) { dmg = dmg * 2; }
+        if (playSec < buffUntil) { dmg = dmg * 1.25; }
+        monsterHp = monsterHp - dmg;
+        if (monsterHp <= 0) { OnKill(fx); }
+        // 图腾:下轮半程
+        u.mult = 1;
+        if (u.type == 2 && upLv[6] > 0 && rng.NextDouble01() < Math.Min(0.8, 0.2 + upLv[6] * 0.1)) {
+            u.mult = 0.5;
+        }
+    }
+
+    public static int OreColOf(int ore) {
+        if (ore == 0) { return 1; }   // 编码:1=蓝(铁) 2=橙(铜) 3=金 4=紫
+        if (ore == 1) { return 2; }
+        return 3;
+    }
+
+    public void OnKill(bool fx) {
+        kills = kills + 1;
+        // 深层减配:每层击杀数 = 3 + floor/4(上限 20),防止后期一秒十层
+        int need = 3 + floor / 4;
+        if (need > 20) { need = 20; }
+        killNeed = need;
+        if (killStreak < need) {
+            killStreak = killStreak + 1;
+            monsterHp = MonsterMaxHp() * 0.35;   // 每次击杀只回 35%,同层连打
+            if (fx) { Float("击杀 " + killStreak + "/" + need, 255, 170, 110, false); }
+            return;
+        }
+        killStreak = 0;
+        floor = floor + 1;
+        if (floor > best) { best = floor; }
+        if ((floor % 10) == 0) {
+            double n = 6 + floor / 10;   // 首领萤晶:6、7…随深度涨(升核/星盘主力)
+            AddCur(3, n);
+            AddToast("击破首领!+" + FmtNum(n) + " 萤晶", 255, 200, 90);
+            if (fx) { Banner("首领击破!进入第 " + (floor + 1) + " 层"); }
+        } else if (fx && floor % 5 == 0) {
+            Banner("深入第 " + (floor + 1) + " 层");
+        }
+        Relic r = RollRelic(floor);
+        if (r != null) {
+            relics.Add(r);
+            AddToast("获得圣物「" + RelicName[r.key] + "」品质 " + r.quality, 186, 148, 255);
+            if (fx) { Banner("圣物:「" + RelicName[r.key] + "」+" + r.quality); }
+        }
+        if (floor == 10) { AddToast("轮回已解锁:第 15 层起可轮回取核", 120, 255, 200); }
+        monsterHp = MonsterMaxHp();
+    }
+
+    // ---- 事件 -----------------------------------------------------------
+
+    public void MaybeEvent() {
+        if (ev != null) { return; }
+        if (playSec < nextEventAt) { return; }
+        Evt e = new Evt();
+        e.type = rng.Range(0, 4);
+        e.until = playSec + 25;
+        e.done = false;
+        ev = e;
+        nextEventAt = playSec + 110 + rng.Range(0, 50);
+    }
+    public bool EventUsable(int opt) {
+        if (ev == null) { return false; }
+        if (ev.type == 1) { return jin >= jin * 0.3 && jin >= 100; }
+        return true;
+    }
+    public void EventChoose(int opt) {
+        if (ev == null) { return; }
+        int t = ev.type;
+        ev = null;
+        if (t == 0) {
+            // 矿脉涌动:60 秒铁铜产出
+            double[] w = new double[3];
+            OreWeights(false, w);
+            double gain = Math.Max(10, EstPerSec(0) * 45);
+            AddCur(0, gain);
+            AddToast("矿脉涌动!+" + FmtNum(gain) + " 铁", 125, 211, 252);
+        } else if (t == 1) {
+            double pay = jin * 0.3;
+            double n = 3 + floor / 10;
+            Pay(2, pay);
+            AddCur(3, n);
+            AddToast("黑市交易:-" + FmtNum(pay) + " 金,+" + FmtNum(n) + " 萤晶", 255, 200, 90);
+        } else if (t == 2) {
+            if (rng.Range(0, 100) < 50 + coreLv[4] * 2) {
+                Relic r = RollRelicForce();
+                relics.Add(r);
+                AddToast("遗迹探秘:发现「" + RelicName[r.key] + "」+" + r.quality, 186, 148, 255);
+            } else {
+                double g = EstPerSec(0) * 20 + 25;
+                AddCur(0, g);
+                AddToast("遗迹探秘:只挖到些铁矿 +" + FmtNum(g), 125, 211, 252);
+            }
+        } else {
+            buffUntil = playSec + 60;
+            AddToast("深渊低语:60 秒内伤害 +25%!", 255, 110, 110);
+        }
+    }
+    public Relic RollRelicForce() {
+        Relic r = new Relic();
+        r.key = rng.Range(0, 6);
+        int baseQ = (int)(floor * 1.2);
+        if (baseQ > 96) { baseQ = 96; }
+        int q = baseQ + rng.Range(0, 10) - 4 + 1;
+        int cap = 20 + floor / 2;
+        if (cap > 99) { cap = 99; }
+        if (q > cap) { q = cap; }
+        if (q < 1) { q = 1; }
+        r.quality = q;
+        r.equipped = false;
+        return r;
+    }
+
+    // 每秒产出估算(事件/离线用):kind 0 铁 1 铜 2 金
+    public double EstPerSec(int ore) {
+        double sum = 0;
+        for (int i = 0; i < crew.Count; i = i + 1) {
+            Unit u = crew[i];
+            if (u.type == 5) { continue; }
+            int o = UD[u.type].ore;
+            if (o < 0) {
+                double[] w = new double[3];
+                OreWeights(u.type == 4, w);
+                double tot = w[0] + w[1] + w[2];
+                if (tot <= 0) { o = 0; } else {
+                    double p = w[ore] / tot;
+                    if (p <= 0) { continue; }
+                    sum = sum + UnitYield(u) * p / UnitInterval(u);
+                    continue;
+                }
+            }
+            if (o == ore) { sum = sum + UnitYield(u) / UnitInterval(u); }
+        }
+        if (ore == 2) {
+            double rg = RelicPower(1);
+            if (rg > 0) { sum = sum * (1 + rg / 100); }
+        }
+        return sum;
+    }
+    public double EstDps() {
+        double sum = 0;
+        for (int i = 0; i < crew.Count; i = i + 1) {
+            Unit u = crew[i];
+            double d = UnitYield(u) * UD[u.type].dmgMult;
+            if (u.type == 4 && upLv[9] > 0) { d = d + UnitYield(u) * upLv[9]; }
+            sum = sum + d * (1 + upLv[13] * 0.05) / UnitInterval(u);
+        }
+        return sum * CoreDmgMult();
+    }
+
+    // ---- 主循环 ---------------------------------------------------------
+
+    public void Tick(double dt, bool fx) {
+        playSec = playSec + dt;
+        // 队伍挖掘
+        for (int i = 0; i < crew.Count; i = i + 1) {
+            Unit u = crew[i];
+            u.timer = u.timer + dt;
+            double itv = UnitInterval(u) * u.mult;
+            if (u.timer >= itv) {
+                u.timer = u.timer - itv;
+                DoDig(u, fx);
+            }
+        }
+        // 定时圣物
+        relicTimer = relicTimer + dt;
+        if (relicTimer >= 60) {
+            relicTimer = relicTimer - 60;
+            Relic r = RollRelic(floor);
+            if (r != null) {
+                relics.Add(r);
+                AddToast("圣物自深渊浮现:「" + RelicName[r.key] + "」+" + r.quality, 186, 148, 255);
+            }
+        }
+        MaybeEvent();
+        if (ev != null && playSec > ev.until) { ev = null; }
+        // 自动纪元:每 2s 买最便宜的可用项
+        if (coreLv[6] > 0) {
+            autoTimer = autoTimer + dt;
+            if (autoTimer >= 2) {
+                autoTimer = 0;
+                AutoBuy();
+            }
+        }
+    }
+
+    public void AutoBuy() {
+        // 找一次能买得起的最便宜项(雇佣+强化),只执行一笔,避免倾泻
+        int bestKind = -1; int bestIdx = 0; double bestCost = 1e30;
+        for (int t = 0; t < 6; t = t + 1) {
+            if (!TypeUnlocked(t)) { continue; }
+            double c = HireCost(t);
+            if (c < bestCost && Cur(UD[t].cur) >= c) { bestCost = c; bestKind = 0; bestIdx = t; }
+        }
+        for (int i = 0; i < 14; i = i + 1) {
+            if (!UpUnlocked(i)) { continue; }
+            if (UPD[i].maxLv > 0 && upLv[i] >= UPD[i].maxLv) { continue; }
+            double c = UpCost(i);
+            if (c < bestCost && Cur(UPD[i].cur) >= c) { bestCost = c; bestKind = 1; bestIdx = i; }
+        }
+        if (bestKind == 0) { BuyHire(bestIdx); }
+        else if (bestKind == 1) { BuyUp(bestIdx); }
+    }
+
+    public void Float(string text, int colCode, bool big) {
+        FText f = new FText();
+        f.text = text;
+        f.x = 640;
+        f.y = 300;
+        f.bornAt = (long)(playSec * 1000);
+        f.big = big;
+        if (colCode == 1) { f.cr = 125; f.cg = 211; f.cb = 252; }
+        else if (colCode == 2) { f.cr = 222; f.cg = 140; f.cb = 70; }
+        else if (colCode == 3) { f.cr = 255; f.cg = 215; f.cb = 0; }
+        else if (colCode == 4) { f.cr = 186; f.cg = 148; f.cb = 255; }
+        else { f.cr = 255; f.cg = 255; f.cb = 255; }
+        floats.Add(f);
+        if (floats.Count > 24) { floats.RemoveAt(0); }
+    }
+    public void Float(string text, int cr, int cg, int cb, bool big) {
+        FText f = new FText();
+        f.text = text;
+        f.bornAt = (long)(playSec * 1000);
+        f.cr = cr; f.cg = cg; f.cb = cb;
+        f.big = big;
+        floats.Add(f);
+        if (floats.Count > 24) { floats.RemoveAt(0); }
+    }
+    public void AddToast(string text, int cr, int cg, int cb) {
+        Toast t = new Toast();
+        t.text = text;
+        t.bornAt = (long)(playSec * 1000);
+        t.cr = cr; t.cg = cg; t.cb = cb;
+        toasts.Add(t);
+        if (toasts.Count > 6) { toasts.RemoveAt(0); }
+    }
+    public void Banner(string text) {
+        bannerText = text;
+        bannerUntil = (long)(playSec * 1000) + 2200;
+    }
+
+    // ---- 轮回 -----------------------------------------------------------
+
+    public double CoresFor() {
+        if (floor < 15) { return 0; }
+        return Math.Floor(Math.Pow((floor - 10) * 0.5, 1.25));
+    }
+    public void DoPrestige() {
+        double n = CoresFor();
+        if (n <= 0) { return; }
+        cores = cores + n;
+        prestiges = prestiges + 1;
+        floor = 0;
+        tie = 150 * Math.Pow(5, coreLv[3]);
+        tong = 0;
+        jin = 0;
+        crew = new List<Unit>();
+        upLv = new int[14];
+        relics = new List<Relic>();
+        relicTimer = 0;
+        ev = null;
+        buffUntil = 0;
+        nextEventAt = playSec + 100;
+        monsterHp = MonsterMaxHp();
+        AddToast("轮回完成!+" + FmtNum(n) + " 深渊核心", 120, 255, 200);
+        Banner("轮回 +" + FmtNum(n) + " 核心");
+    }
+
+    // ---- 星盘/锻造 ------------------------------------------------------
+
+    public double AstroCost(int i) {
+        int owned = 0;
+        for (int k = 0; k < 12; k = k + 1) {
+            if ((astroMask & (1 << k)) != 0) { owned = owned + 1; }
+        }
+        return Math.Floor(3 + owned * 1.5 + i * 0.5);
+    }
+    public bool AstroBuy(int i) {
+        if ((astroMask & (1 << i)) != 0) { return false; }
+        double c = AstroCost(i);
+        if (!Pay(3, c)) { return false; }
+        astroMask = astroMask | (1 << i);
+        return true;
+    }
+    public double ForgeCost() {
+        return Math.Floor(5 * Math.Pow(1.5, forgeLv));
+    }
+    public double ForgeJinCost() {
+        return Math.Floor(400 * Math.Pow(2, forgeLv));
+    }
+    public bool ForgeBuy() {
+        if (!Pay(3, ForgeCost())) { return false; }
+        if (!Pay(2, ForgeJinCost())) { AddCur(3, ForgeCost()); return false; }
+        forgeLv = forgeLv + 1;
+        return true;
+    }
+
+    // ---- 存档 -----------------------------------------------------------
+
+    static string SavePath() { return "miner_save.txt"; }
+
+    public static string Dbl2Str(double v) {
+        if (v < 0) { return "-" + Dbl2Str(0 - v); }
+        if (v >= 1e17) {
+            // 科学计数:mantissa e exp
+            int exp = 0;
+            double m = v;
+            while (m >= 10) { m = m / 10; exp = exp + 1; }
+            return Trim0(m) + "e" + exp;
+        }
+        long whole = (long)v;
+        long frac = (long)Math.Round((v - whole) * 100);
+        if (frac >= 100) { whole = whole + 1; frac = 0; }
+        if (frac == 0) { return "" + whole; }
+        if (frac < 10) { return whole + ".0" + frac; }
+        return whole + "." + frac;
+    }
+    static string Trim0(double v) {
+        long w = (long)v;
+        long f = (long)Math.Round((v - w) * 1000);
+        if (f == 0) { return "" + w; }
+        return w + "." + f;
+    }
+    public static double NumFrom(string s) {
+        if (s == null || s.Length == 0) { return 0; }
+        double sign = 1;
+        int i = 0;
+        if (s[0] == '-') { sign = -1; i = 1; }
+        else if (s[0] == '+') { i = 1; }
+        double v = 0;
+        for (; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); }
+            else { break; }
+        }
+        if (i < s.Length && s[i] == '.') {
+            i = i + 1;
+            double f = 0.1;
+            for (; i < s.Length; i = i + 1) {
+                int c = s[i] & 255;
+                if (c >= 48 && c <= 57) { v = v + (c - 48) * f; f = f / 10; }
+                else { break; }
+            }
+        }
+        if (i < s.Length && (s[i] == 'e')) {
+            i = i + 1;
+            bool eneg = false;
+            if (i < s.Length && s[i] == '-') { eneg = true; i = i + 1; }
+            int e = 0;
+            for (; i < s.Length; i = i + 1) {
+                int c = s[i] & 255;
+                if (c >= 48 && c <= 57) { e = e * 10 + (c - 48); } else { break; }
+            }
+            if (eneg) { e = 0 - e; }
+            v = v * Math.Pow(10, e);
+        }
+        return v * sign;
+    }
+    public static List<string> SplitChar(string s, char sep) {
+        List<string> outp = new List<string>();
+        string cur = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            if (s[i] == sep) { outp.Add(cur); cur = ""; }
+            else { cur = cur + s[i]; }
+        }
+        outp.Add(cur);
+        return outp;
+    }
+
+    public void SaveGame() {
+        string s = "v=3\n";
+        s = s + "res=" + Dbl2Str(tie) + "," + Dbl2Str(tong) + "," + Dbl2Str(jin) + "," + Dbl2Str(cry) + "," + Dbl2Str(cores) + "\n";
+        s = s + "prog=" + floor + "," + best + "," + prestiges + "\n";
+        s = s + "stat=" + Dbl2Str(playSec) + "," + Dbl2Str(kills) + "," + Dbl2Str(DateTime.UtcNow().ToUnixSeconds()) + "\n";
+        string crewS = "";
+        for (int i = 0; i < crew.Count; i = i + 1) {
+            if (i > 0) { crewS = crewS + ";"; }
+            crewS = crewS + crew[i].type + "," + Dbl2Str(crew[i].timer) + "," + Dbl2Str(crew[i].mult);
+        }
+        s = s + "crew=" + crewS + "\n";
+        string upS = "";
+        for (int i = 0; i < 14; i = i + 1) {
+            if (i > 0) { upS = upS + ","; }
+            upS = upS + upLv[i];
+        }
+        s = s + "up=" + upS + "\n";
+        string rl = "";
+        for (int i = 0; i < relics.Count; i = i + 1) {
+            if (i > 0) { rl = rl + ";"; }
+            rl = rl + relics[i].key + "," + relics[i].quality + "," + (relics[i].equipped ? 1 : 0);
+        }
+        s = s + "relics=" + rl + "\n";
+        string cl = "";
+        for (int i = 0; i < 7; i = i + 1) {
+            if (i > 0) { cl = cl + ","; }
+            cl = cl + coreLv[i];
+        }
+        s = s + "core=" + cl + "\n";
+        s = s + "misc=" + forgeLv + "," + astroMask + "," + (soundOn ? 1 : 0) + "\n";
+        File.WriteAllText(SavePath(), s);
+    }
+
+    // 返回离线秒数(>0 表示触发了离线结算)
+    public double LoadGame() {
+        if (!File.Exists(SavePath())) { return 0; }
+        List<string> lines = File.ReadAllLines(SavePath());
+        double lastUnix = 0;
+        for (int li = 0; li < lines.Count; li = li + 1) {
+            string ln = lines[li];
+            int eq = -1;
+            for (int j = 0; j < ln.Length; j = j + 1) {
+                if (ln[j] == '=') { eq = j; j = ln.Length; }
+            }
+            if (eq <= 0) { continue; }
+            string k = ln.Substring(0, eq);
+            string v = ln.Substring(eq + 1);
+            ApplySave(k, v);
+            if (k == "stat") { lastUnix = NumFrom(SplitChar(v, ',')[2]); }
+        }
+        if (monsterHp <= 0 || monsterHp > MonsterMaxHp() * 1.001) { monsterHp = MonsterMaxHp(); }
+        dispHp = monsterHp;
+        // 离线结算
+        double nowU = DateTime.UtcNow().ToUnixSeconds();
+        double away = nowU - lastUnix;
+        if (away > 60 && lastUnix > 0) {
+            offlineGain = Offline(away);
+            return offlineGain;
+        }
+        return 0;
+    }
+
+    void ApplySave(string k, string v) {
+        List<string> parts;
+        // 防御:存档可能被旧版编译器污染(字段缺失/错位),字段不足整段丢弃,
+        // 宁可少读一项也不让垃圾值进数值面(历史:SplitChar 失效期产出 ASCII 码串存档)。
+        if (k == "res") {
+            parts = SplitChar(v, ',');
+            if (parts.Count < 5) { return; }
+            tie = NumFrom(parts[0]);
+            tong = NumFrom(parts[1]);
+            jin = NumFrom(parts[2]);
+            cry = NumFrom(parts[3]);
+            cores = NumFrom(parts[4]);
+        } else if (k == "prog") {
+            parts = SplitChar(v, ',');
+            if (parts.Count < 3) { return; }
+            floor = (int)NumFrom(parts[0]);
+            best = (int)NumFrom(parts[1]);
+            prestiges = (int)NumFrom(parts[2]);
+        } else if (k == "stat") {
+            parts = SplitChar(v, ',');
+            if (parts.Count < 2) { return; }
+            playSec = NumFrom(parts[0]);
+            kills = NumFrom(parts[1]);
+        } else if (k == "crew") {
+            crew = new List<Unit>();
+            parts = SplitChar(v, ';');
+            for (int i = 0; i < parts.Count; i = i + 1) {
+                if (parts[i].Length == 0) { continue; }
+                List<string> f = SplitChar(parts[i], ',');
+                if (f.Count < 3) { continue; }
+                Unit u = new Unit();
+                u.type = (int)NumFrom(f[0]);
+                u.timer = NumFrom(f[1]);
+                u.mult = NumFrom(f[2]);
+                if (u.mult <= 0) { u.mult = 1; }
+                crew.Add(u);
+            }
+        } else if (k == "up") {
+            parts = SplitChar(v, ',');
+            for (int i = 0; i < 14 && i < parts.Count; i = i + 1) {
+                upLv[i] = (int)NumFrom(parts[i]);
+            }
+        } else if (k == "relics") {
+            relics = new List<Relic>();
+            parts = SplitChar(v, ';');
+            for (int i = 0; i < parts.Count; i = i + 1) {
+                if (parts[i].Length == 0) { continue; }
+                List<string> f = SplitChar(parts[i], ',');
+                if (f.Count < 3) { continue; }
+                Relic r = new Relic();
+                r.key = (int)NumFrom(f[0]);
+                r.quality = (int)NumFrom(f[1]);
+                r.equipped = NumFrom(f[2]) > 0;
+                relics.Add(r);
+            }
+        } else if (k == "core") {
+            parts = SplitChar(v, ',');
+            for (int i = 0; i < 7 && i < parts.Count; i = i + 1) {
+                coreLv[i] = (int)NumFrom(parts[i]);
+            }
+        } else if (k == "misc") {
+            parts = SplitChar(v, ',');
+            if (parts.Count < 3) { return; }
+            forgeLv = (int)NumFrom(parts[0]);
+            astroMask = (int)NumFrom(parts[1]);
+            soundOn = NumFrom(parts[2]) > 0;
+        }
+    }
+
+    // 离线收益:产出按期望直接结算;战斗按总伤害推层;返回实际结算秒数
+    public double Offline(double sec) {
+        double capH = 8 + coreLv[5] * 4;
+        double cap = capH * 3600;
+        double t = sec;
+        if (t > cap) { t = cap; }
+        for (int ore = 0; ore < 3; ore = ore + 1) {
+            AddCur(ore, EstPerSec(ore) * t);
+        }
+        AddCur(3, CryPerSec() * t);
+        // 推层:用平均血量近似,并套用同层多杀减配(killNeed)
+        double dmg = EstDps() * t;
+        double startFloor = floor;
+        int steps = 0;
+        int streak = 0;
+        while (dmg > 0 && steps < 2000) {
+            int need = 3 + floor / 4;
+            if (need > 20) { need = 20; }
+            double hp = MonsterMaxHp() * (streak < need ? 0.35 : 1.0);
+            if (dmg >= hp) {
+                dmg = dmg - hp;
+                kills = kills + 1;
+                streak = streak + 1;
+                if (streak >= need) {
+                    streak = 0;
+                    floor = floor + 1;
+                    if (floor % 10 == 0) { AddCur(3, 6 + floor / 10); }
+                    monsterHp = MonsterMaxHp();
+                } else {
+                    monsterHp = MonsterMaxHp();
+                }
+            } else {
+                monsterHp = MonsterMaxHp() - dmg;
+                dmg = 0;
+            }
+            steps = steps + 1;
+        }
+        if (floor > best) { best = floor; }
+        if (floor > startFloor) {
+            AddToast("离线结算:" + FmtDur(t) + " 推进至第 " + (floor + 1) + " 层", 120, 255, 200);
+        } else {
+            AddToast("离线结算:" + FmtDur(t) + " 资源已入账", 120, 255, 200);
+        }
+        return t;
+    }
+    public double CryPerSec() {
+        double sum = 0;
+        for (int i = 0; i < crew.Count; i = i + 1) {
+            if (crew[i].type == 5) { sum = sum + 0.25 * UnitYield(crew[i]) / UnitInterval(crew[i]); }
+        }
+        return sum;
+    }
+    public static string FmtDur(double sec) {
+        long s = (long)sec;
+        long h = s / 3600;
+        long m = (s - h * 3600) / 60;
+        if (h > 0) { return h + "小时" + m + "分"; }
+        if (m > 0) { return m + "分"; }
+        return s + "秒";
+    }
+
+    // ---- 数字格式化 -----------------------------------------------------
+
+    public static string FmtNum(double v) {
+        if (v < 0) { return "-" + FmtNum(0 - v); }
+        if (v >= 1e15) { return Trim1(v / 1e15) + "Q"; }
+        if (v >= 1e12) { return Trim1(v / 1e12) + "T"; }
+        if (v >= 1e9) { return Trim1(v / 1e9) + "B"; }
+        if (v >= 1e6) { return Trim1(v / 1e6) + "M"; }
+        if (v >= 1e4) { return Trim1(v / 1e3) + "K"; }
+        if (v >= 100) { return "" + (long)v; }
+        if (v >= 10) { return Trim1(v); }
+        if (v == Math.Floor(v)) { return "" + (long)v; }
+        return Trim1(v);
+    }
+    static string Trim1(double v) {
+        long w = (long)v;
+        long f = (long)Math.Round((v - w) * 10);
+        if (f >= 10) { w = w + 1; f = 0; }
+        if (f == 0) { return "" + w; }
+        return w + "." + f;
+    }
+}

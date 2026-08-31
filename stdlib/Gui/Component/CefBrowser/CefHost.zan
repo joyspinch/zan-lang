@@ -89,18 +89,23 @@ class CefHost {
     }
 
     /// <summary>浏览器进程的 CEF profile 目录（Cookie/缓存/localStorage），
-    /// 形如 `&lt;缓存&gt;/Zan/Cache/profile1`。
+    /// 形如 `&lt;缓存&gt;/Zan/Cache/profileN`。
     /// <see cref="CefOptions.profileDir"/> / ZAN_CEF_PROFILE 指定了就照用。
     ///
     /// 一个 Chromium profile 同时只能属于一个活进程：第二份副本指向同一个
-    /// 目录，`cef_initialize` 直接失败。桌面工具被开两份是常态，所以按槽位
-    /// 分配——第一份 `profile1`，同时开的第二份 `profile2`，依此类推；编号
-    /// 而不是按 pid，重启后还能找回自己那份登录态。
+    /// 目录，`cef_initialize` 直接失败。桌面工具被开两份是常态，所以要按
+    /// 槽位分配。
+    ///
+    /// 槽位不是「第一个空槽」而是按可执行文件完整路径散列出的首选槽位
+    /// （<see cref="PreferredSlot"/>）：同一份程序每次启动都回到同一个
+    /// profile，磁盘上的登录态跟着自己走，重启后不用重新登录；只有首选
+    /// 槽位被占（同一路径真多开）才顺位找空槽，此时靠宿主自己的 Cookie
+    /// 备份兜住登录态。
     ///
     /// 占用判定是 profile 目录里 <c>lockfile</c> 的系统级独占锁
     /// （<see cref="File.TryLock"/>）：锁随持有进程退出（含被杀、崩溃）由内核
-    /// 释放，所以 `profile2` 一空出来，下一次启动就接着用 `profile2`，既不会
-    /// 一直往上加号，也没有需要清理的陈旧标记。</summary>
+    /// 释放，所以槽位一空出来，下一次启动就接着用，既不会一直往上加号，
+    /// 也没有需要清理的陈旧标记。</summary>
     static string ProfileDir(string dir) {
         if (CefHost.profileDir != "") { return CefHost.profileDir; }
         string forced = CefOptions.ProfileDir();
@@ -110,19 +115,48 @@ class CefHost {
         }
         string root = CefHost.ProfileRoot(dir);
         int max = CefHost.MaxProfiles();
+        int preferred = CefHost.PreferredSlot(max);
+        long held = CefHost.TryTake(root + Convert.ToString(preferred));
+        if (held != 0) {
+            CefHost.profileLock = held;
+            CefHost.profileDir = root + Convert.ToString(preferred);
+            return CefHost.profileDir;
+        }
         for (int slot = 1; slot <= max; slot = slot + 1) {
-            string cand = root + Convert.ToString(slot);
-            Directory.CreateDirectoryRecursive(cand);
-            long held = File.TryLock(cand + "/" + CefHost.ProfileLockName());
+            if (slot == preferred) { continue; }
+            held = CefHost.TryTake(root + Convert.ToString(slot));
             if (held != 0) {
                 CefHost.profileLock = held;
-                CefHost.profileDir = cand;
-                return cand;
+                CefHost.profileDir = root + Convert.ToString(slot);
+                return CefHost.profileDir;
             }
         }
-        // 槽位都被占着：用第一个，让 CEF 自己报冲突。
-        CefHost.profileDir = root + "1";
+        // 槽位都被占着：回首选槽，让 CEF 自己报冲突。
+        CefHost.profileDir = root + Convert.ToString(preferred);
         return CefHost.profileDir;
+    }
+
+    /// <summary>创建槽位目录并抢它的锁，抢到返回锁句柄，被占返回 0。
+    /// </summary>
+    static long TryTake(string dir) {
+        Directory.CreateDirectoryRecursive(dir);
+        return File.TryLock(dir + "/" + CefHost.ProfileLockName());
+    }
+
+    /// <summary>本进程的首选 profile 槽位（1..max）：按可执行文件完整路径
+    /// 散列。路径不变就永远算出同一个槽位，登录态在磁盘上的家因此稳定；
+    /// 不同目录的安装各归各的槽。Windows 路径不区分大小写与斜杠方向，
+    /// 散列前先归一（\ → /、A-Z → a-z）。</summary>
+    static int PreferredSlot(int max) {
+        string exe = ProcessHost.SelfExe();
+        int hash = 0;
+        for (int i = 0; i < exe.Length; i = i + 1) {
+            int c = exe[i] & 255;
+            if (c == 92) { c = 47; }
+            if (c >= 65 && c <= 90) { c = c + 32; }
+            hash = (hash % 10007) * 137 + c;
+        }
+        return (hash % max) + 1;
     }
 
     /// <summary>追加到每个 Chromium 进程命令行的开关，取自

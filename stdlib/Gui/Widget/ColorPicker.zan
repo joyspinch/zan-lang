@@ -1,0 +1,1092 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// 颜色选择器（对齐 Naive UI n-color-picker）：触发条显示当前颜色，
+/// 点击弹出 SV 面板（饱和度×明度，两层渐变自绘）、色相条（六段
+/// 渐变）、透明度条（棋盘格打底）与 RGBA/HEX/HSL/HSB 输入行
+/// （左侧标签点击循环切换格式，回车提交）。所有尺寸按 DPI 缩放，
+/// 皮肤走 `colorpicker` 规则（`::trigger` / `::panel` / `::checker` /
+/// `::label`）。
+///
+/// C# 风格保留式实例：
+///     ColorPicker pick = ColorPicker.Bind(model);
+///     pick.Change += () => { ... };   // 值变化时触发
+///     pick.Render(app, x, y, width);
+/// 模式（Naive UI modes，决定取值文本格式）：
+///     pick.Modes("rgb", "hex", "", "");  // 限制可选格式
+///     pick.Mode = "hex";                 // 当前取值文本格式
+///     string v = pick.Text();            // "#5B3737FF"
+/// 带透明度（Naive UI show-alpha，默认开）：
+///     pick.SetShowAlpha(false);          // 隐藏透明度条，alpha 恒 1
+///
+/// 内部以 HSV（h 0..359、s/v 0..1000）+ alpha（0..255）工作，绑定
+/// 值是打包的 0xAARRGGBB（`SignalInt` / `Binding<int>` 双向）。Zan
+/// 的 int 是 32 位，打包色常以负数形式存储——凡提取分量一律走
+/// RgbOf / AlphaOf（App.LerpColor 同款符号安全写法），禁止裸除。
+class ColorPicker : Control {
+    SignalInt model;
+    /// 双向绑定值（打包 0xAARRGGBB）：`pick.data = model.color;`
+    /// 保持模型字段与选择器双向同步。
+    Binding<int> data;
+    int wid;
+    /// 值变化时触发（C# 风格：`pick.Change += h;`）。拖动面板/条、
+    /// 输入行回车提交都会触发；程序化 SetColor 不触发。
+    UiEvent Change;
+    /// 弹层展开状态。
+    bool open;
+    /// HSV 内部状态：h 0..359，s/v 0..1000（v=0 纯黑、s=0 灰阶）。
+    int hue;
+    int sat;
+    int val;
+    /// alpha 通道 0..255。
+    int alpha;
+    /// 显示透明度条（Naive UI show-alpha，默认开）。
+    bool showAlpha;
+    /// 可选格式（Naive UI modes）：rgb / hex / hsl / hsb 的子集。
+    /// 空列表 = 全部四种。取值文本跟随 Mode。
+    List<string> modes;
+    /// 当前取值文本格式（Naive UI 的 value 格式跟随 modes）。
+    Binding<string> Mode;
+    /// 正在拖动的部件：0 无 / 1 SV 面板 / 2 色相条 / 3 透明度条。
+    int dragPart;
+    /// RGBA 四个数字输入框（弹层内保留态，焦点跨帧存活）。
+    Input inR;
+    Input inG;
+    Input inB;
+    Input inA;
+    /// HEX 十六进制输入框（#RRGGBB 或 #RRGGBBAA）。
+    Input inHex;
+    /// HSL 三元组输入框（"h, s%, l%"）。
+    Input inHsl;
+    /// HSB 三元组输入框（"h, s%, v%"）。
+    Input inHsb;
+    /// 输入行当前显示的格式：0 RGBA / 1 HEX / 2 HSL / 3 HSB，
+    /// 左侧标签点击循环切换。
+    int inputView;
+
+    // id 段（WidgetId.Block(8)）：wid = 触发条，wid+1 = SV 面板，
+    // wid+2 = 色相条，wid+3 = 透明度条。
+    static int SvPanelOff() { return 1; }
+    static int HueOff() { return 2; }
+    static int AlphaOff() { return 3; }
+
+    // ---- 打包色工具（符号安全；int 为 32 位，0xAARRGGBB 常为负）----
+
+    /// 由 8 位 r/g/b 生成"不透明"打包色。255*2^24 在 32 位里回绕成
+    /// 负数——与 Theme.Rgb 的位型一致，属规范存储形式。
+    static int Opaque(int r, int g, int b) {
+        return 255 * 16777216 + r * 65536 + g * 256 + b;
+    }
+
+    /// 打包色的低 24 位 RGB（0..16777215，负数包也正确）。
+    static int RgbOf(int packed) {
+        int rgb = packed % 16777216;
+        if (rgb < 0) { rgb = rgb + 16777216; }
+        return rgb;
+    }
+
+    /// 打包色的 alpha 通道（0..255，负数包也正确）。
+    static int AlphaOf(int packed) {
+        int rgb = ColorPicker.RgbOf(packed);
+        int a = (packed - rgb) / 16777216;
+        if (a < 0) { a = a + 256; }
+        return a;
+    }
+
+    /// 两个打包色是否同一个颜色（各通道比较，兼容正负两种存储）。
+    static bool SamePacked(int a, int b) {
+        return ColorPicker.RgbOf(a) == ColorPicker.RgbOf(b)
+            && ColorPicker.AlphaOf(a) == ColorPicker.AlphaOf(b);
+    }
+
+    /// HSV → 打包不透明色（h 0..359，s/v 0..1000）。
+    static int HsvToRgb(int h, int s, int v) {
+        int r;
+        int g;
+        int b;
+        if (s <= 0) {
+            int gray = v * 255 / 1000;
+            return ColorPicker.Opaque(gray, gray, gray);
+        }
+        int sector = h * 6 / 360;
+        if (sector > 5) { sector = 5; }
+        int rem = h * 6 - sector * 360;
+        // rem 0..360 是扇区内 f = rem/360 的千分比展开；q/t 都以
+        // ÷360 把 rem 归一到 0..s（写成 ÷1000 会让纯色泄漏出杂色）。
+        int p1 = v * (1000 - s) / 1000;
+        int p2 = v * (1000 - s * rem / 360) / 1000;
+        int p3 = v * (1000 - s * (360 - rem) / 360) / 1000;
+        if (sector == 0) { r = v; g = p3; b = p1; }
+        else if (sector == 1) { r = p2; g = v; b = p1; }
+        else if (sector == 2) { r = p1; g = v; b = p3; }
+        else if (sector == 3) { r = p1; g = p2; b = v; }
+        else if (sector == 4) { r = p3; g = p1; b = v; }
+        else { r = v; g = p1; b = p2; }
+        return ColorPicker.Opaque(r * 255 / 1000, g * 255 / 1000,
+                                  b * 255 / 1000);
+    }
+
+    /// RGB（0..16777215 低 24 位）→ HSV。s/v 打包成 s*4096+v 返回，
+    /// h 写入静态 hueOut（Zan 无出参；调用后立即消费）。
+    static int hueOut;
+    static int RgbToSv(int rgb) {
+        int r = (rgb / 65536) % 256;
+        int g = (rgb / 256) % 256;
+        int b = rgb % 256;
+        int max = r; if (g > max) { max = g; } if (b > max) { max = b; }
+        int min = r; if (g < min) { min = g; } if (b < min) { min = b; }
+        int d = max - min;
+        int v = max * 1000 / 255;
+        int s = max > 0 ? d * 1000 / max : 0;
+        int h = 0;
+        if (d > 0) {
+            if (max == r) {
+                h = (g - b) * 60 / d;
+            } else if (max == g) {
+                h = 120 + (b - r) * 60 / d;
+            } else {
+                h = 240 + (r - g) * 60 / d;
+            }
+            if (h < 0) { h = h + 360; }
+            if (h > 359) { h = 359; }
+        }
+        hueOut = h;
+        return s * 4096 + v;
+    }
+
+    /// 打包色 → "#RRGGBB"。
+    static string HexText(int color) {
+        int rgb = ColorPicker.RgbOf(color);
+        string s = "#";
+        s = s + ColorPicker.Hex2((rgb / 65536) % 256);
+        s = s + ColorPicker.Hex2((rgb / 256) % 256);
+        s = s + ColorPicker.Hex2(rgb % 256);
+        return s;
+    }
+
+    /// 打包色 → "#RRGGBBAA"（alpha 始终写出）。
+    static string HexTextAlpha(int color) {
+        return ColorPicker.HexText(color)
+            + ColorPicker.Hex2(ColorPicker.AlphaOf(color));
+    }
+
+    static string Hex2(int b) {
+        string digits = "0123456789ABCDEF";
+        string s = "";
+        s = s + digits.Substring(b / 16, 1);
+        s = s + digits.Substring(b % 16, 1);
+        return s;
+    }
+
+    static int HexDigit(string ch) {
+        if (ch == "0") { return 0; } if (ch == "1") { return 1; }
+        if (ch == "2") { return 2; } if (ch == "3") { return 3; }
+        if (ch == "4") { return 4; } if (ch == "5") { return 5; }
+        if (ch == "6") { return 6; } if (ch == "7") { return 7; }
+        if (ch == "8") { return 8; } if (ch == "9") { return 9; }
+        if (ch == "a" || ch == "A") { return 10; }
+        if (ch == "b" || ch == "B") { return 11; }
+        if (ch == "c" || ch == "C") { return 12; }
+        if (ch == "d" || ch == "D") { return 13; }
+        if (ch == "e" || ch == "E") { return 14; }
+        if (ch == "f" || ch == "F") { return 15; }
+        return -1;
+    }
+
+    /// HexParse / FuncParse 最近一次是否解析成功（Zan 无出参；且
+    /// 合法打包色在 alpha ≥ 0x80 时回绕成负 int，-1 不能再当失败
+    /// 哨兵——旧写法把 "#RRGGBB" 一类高 alpha 颜色整体拒收。
+    /// hueOut 同款套路）。
+    static bool parseOk;
+
+    /// "#RGB"/"#RRGGBB"/"#RRGGBBAA" → 打包色（失败时 parseOk=false）。
+    static int HexParse(string s) {
+        ColorPicker.parseOk = false;
+        if (s.Length < 4 || s.Substring(0, 1) != "#") { return -1; }
+        string body = s.Substring(1, s.Length - 1);
+        if (body.Length == 3) {
+            body = body.Substring(0, 1) + body.Substring(0, 1)
+                 + body.Substring(1, 1) + body.Substring(1, 1)
+                 + body.Substring(2, 1) + body.Substring(2, 1);
+        }
+        if (body.Length != 6 && body.Length != 8) { return -1; }
+        int r = ColorPicker.HexDigit(body.Substring(0, 1)) * 16
+              + ColorPicker.HexDigit(body.Substring(1, 1));
+        int g = ColorPicker.HexDigit(body.Substring(2, 1)) * 16
+              + ColorPicker.HexDigit(body.Substring(3, 1));
+        int b = ColorPicker.HexDigit(body.Substring(4, 1)) * 16
+              + ColorPicker.HexDigit(body.Substring(5, 1));
+        if (r < 0 || g < 0 || b < 0) { return -1; }
+        int a = 255;
+        if (body.Length == 8) {
+            a = ColorPicker.HexDigit(body.Substring(6, 1)) * 16
+              + ColorPicker.HexDigit(body.Substring(7, 1));
+            if (a < 0) { return -1; }
+        }
+        ColorPicker.parseOk = true;
+        return a * 16777216 + r * 65536 + g * 256 + b;
+    }
+
+    /// "rgba(91, 55, 55, 1)" / "rgb(91, 55, 55)" /
+    /// "hsl(120, 50%, 40%)" / "hsb(120, 50%, 40%)"（可带第 4 个
+    /// alpha 参数）→ 打包色（失败时 parseOk=false）。
+    static int FuncParse(string s) {
+        ColorPicker.parseOk = false;
+        int lp = s.IndexOf("(");
+        if (lp < 0) { return -1; }
+        if (!s.EndsWith(")")) { return -1; }
+        string head = s.Substring(0, lp).Trim().ToLower();
+        string body = s.Substring(lp + 1, s.Length - lp - 2);
+        bool isHsl = head == "hsl" || head == "hsla";
+        bool isHsb = head == "hsb" || head == "hsv";
+        bool rgbish = head == "rgb" || head == "rgba";
+        if (!isHsl && !isHsb && !rgbish) { return -1; }
+        List<string> parts = body.Split(",");
+        if (parts.Count < 3) { return -1; }
+        int a = 255;
+        if (parts.Count >= 4) {
+            a = ColorPicker.PctOrFrac(parts[3].Trim());
+            if (a < 0) { return -1; }
+        }
+        int r;
+        int g;
+        int b;
+        if (isHsl) {
+            int h = ColorPicker.ParseIntSafe(parts[0].Trim());
+            int ss = ColorPicker.PctNum(parts[1].Trim());
+            int ll = ColorPicker.PctNum(parts[2].Trim());
+            if (h < 0 || h > 359 || ss < 0 || ll < 0) { return -1; }
+            int rgb = ColorPicker.RgbOf(ColorPicker.HslToRgb(h, ss, ll));
+            r = (rgb / 65536) % 256;
+            g = (rgb / 256) % 256;
+            b = rgb % 256;
+        } else if (isHsb) {
+            int h = ColorPicker.ParseIntSafe(parts[0].Trim());
+            int ss = ColorPicker.PctNum(parts[1].Trim());
+            int vv = ColorPicker.PctNum(parts[2].Trim());
+            if (h < 0 || h > 359 || ss < 0 || vv < 0) { return -1; }
+            int rgb = ColorPicker.RgbOf(ColorPicker.HsvToRgb(h, ss, vv));
+            r = (rgb / 65536) % 256;
+            g = (rgb / 256) % 256;
+            b = rgb % 256;
+        } else {
+            bool pct = parts[0].Trim().EndsWith("%");
+            if (pct) {
+                r = ColorPicker.PctNum(parts[0].Trim()) * 255 / 1000;
+                g = ColorPicker.PctNum(parts[1].Trim()) * 255 / 1000;
+                b = ColorPicker.PctNum(parts[2].Trim()) * 255 / 1000;
+            } else {
+                r = ColorPicker.ParseIntSafe(parts[0].Trim());
+                g = ColorPicker.ParseIntSafe(parts[1].Trim());
+                b = ColorPicker.ParseIntSafe(parts[2].Trim());
+            }
+            if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255) {
+                return -1;
+            }
+        }
+        ColorPicker.parseOk = true;
+        return a * 16777216 + r * 65536 + g * 256 + b;
+    }
+
+    /// "1" / "0.5" / "50%" → alpha 0..255（非法 -1）。
+    static int PctOrFrac(string s) {
+        if (s.EndsWith("%")) { return ColorPicker.PctNum(s) * 255 / 1000; }
+        int dot = s.IndexOf(".");
+        if (dot < 0) {
+            int v = ColorPicker.ParseIntSafe(s);
+            if (v == 1) { return 255; }
+            if (v == 0) { return 0; }
+            return -1;
+        }
+        int whole = ColorPicker.ParseIntSafe(s.Substring(0, dot));
+        string frac = s.Substring(dot + 1, s.Length - dot - 1);
+        while (frac.Length < 3) { frac = frac + "0"; }
+        if (frac.Length > 3) { frac = frac.Substring(0, 3); }
+        int f = ColorPicker.ParseIntSafe(frac);
+        if (whole < 0 || whole > 1 || f < 0) { return -1; }
+        return (whole * 1000 + f) * 255 / 1000;
+    }
+
+    /// "50%" → 0..1000 千分比（非法 -1）。
+    static int PctNum(string s) {
+        if (!s.EndsWith("%")) { return -1; }
+        int v = ColorPicker.ParseIntSafe(s.Substring(0, s.Length - 1));
+        if (v < 0 || v > 100) { return -1; }
+        return v * 10;
+    }
+
+    /// 纯数字串 → int（任何非数字字符返回 -1；防 Convert.ToInt32
+    /// 对垃圾输入的运行时错误）。
+    static int ParseIntSafe(string s) {
+        if (s == null || s.Length == 0) { return -1; }
+        int v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == "0") { v = v * 10; }
+            else if (ch == "1") { v = v * 10 + 1; }
+            else if (ch == "2") { v = v * 10 + 2; }
+            else if (ch == "3") { v = v * 10 + 3; }
+            else if (ch == "4") { v = v * 10 + 4; }
+            else if (ch == "5") { v = v * 10 + 5; }
+            else if (ch == "6") { v = v * 10 + 6; }
+            else if (ch == "7") { v = v * 10 + 7; }
+            else if (ch == "8") { v = v * 10 + 8; }
+            else if (ch == "9") { v = v * 10 + 9; }
+            else { return -1; }
+        }
+        return v;
+    }
+
+    /// RGB → HSL（h 0..359 * 1e6 | s 0..1000 * 1e3 | l 0..1000）。
+    static int RgbHsl(int r, int g, int b) {
+        int max = r; if (g > max) { max = g; } if (b > max) { max = b; }
+        int min = r; if (g < min) { min = g; } if (b < min) { min = b; }
+        int d = max - min;
+        int h = 0;
+        int s = 0;
+        int l = (max + min) * 500 / 255;
+        if (d > 0) {
+            if (max == r) { h = (g - b) * 60 / d; }
+            else if (max == g) { h = 120 + (b - r) * 60 / d; }
+            else { h = 240 + (r - g) * 60 / d; }
+            if (h < 0) { h = h + 360; }
+            if (h > 359) { h = 359; }
+            if (l > 500) { s = d * 1000 / (510 - max - min); }
+            else { s = d * 1000 / (max + min); }
+        }
+        if (s > 1000) { s = 1000; }
+        return h * 1000000 + s * 1000 + l;
+    }
+
+    /// HSL → 打包不透明色。
+    static int HslToRgb(int h, int s, int l) {
+        if (s <= 0) {
+            int gray = l * 255 / 1000;
+            return ColorPicker.Opaque(gray, gray, gray);
+        }
+        int c = (l < 500 ? l : 1000 - l) * s * 2 / 1000;
+        int hp = h * 6 / 360;
+        if (hp > 5) { hp = 5; }
+        int rem = h * 6 - hp * 360;
+        int xx = c * (360 - Math.Abs(rem * 2 - 360)) / 360;
+        int m = l - c / 2;
+        int r1;
+        int g1;
+        int b1;
+        if (hp == 0) { r1 = c; g1 = xx; b1 = 0; }
+        else if (hp == 1) { r1 = xx; g1 = c; b1 = 0; }
+        else if (hp == 2) { r1 = 0; g1 = c; b1 = xx; }
+        else if (hp == 3) { r1 = 0; g1 = xx; b1 = c; }
+        else if (hp == 4) { r1 = xx; g1 = 0; b1 = c; }
+        else { r1 = c; g1 = 0; b1 = xx; }
+        return ColorPicker.Opaque((r1 + m) * 255 / 1000,
+                                  (g1 + m) * 255 / 1000,
+                                  (b1 + m) * 255 / 1000);
+    }
+
+    // ---- 状态 ------------------------------------------------------
+
+    /// 正在拖动/已拖动色盘的标志：false 时 CurrentRgb 直接回
+    /// basePacked（赋值往返精确，不被 HSV 千分比量化磨损）。
+    bool hsvTouched;
+    /// 最近一次外部赋入的打包色（hsvTouched=false 时的取值基准）。
+    int basePacked;
+
+    void InitPicker(SignalInt m) {
+        this.InitControl("colorpicker", 1);
+        model = m;
+        wid = WidgetId.Block(8);
+        wiresOwnEvents = true;
+        Change = new UiEvent();
+        open = false;
+        hue = 0;
+        sat = 0;
+        val = 0;
+        alpha = 255;
+        hsvTouched = false;
+        basePacked = 0xFF000000;
+        showAlpha = true;
+        modes = new List<string>();
+        Mode = "rgb";
+        dragPart = 0;
+        inR = new Input("0");
+        inG = new Input("0");
+        inB = new Input("0");
+        inA = new Input("100");
+        inHex = new Input("#000000");
+        inHsl = new Input("0, 0%, 0%");
+        inHsb = new Input("0, 0%, 0%");
+        inputView = 0;
+        inR.Submit += ColorPicker.SubmitR;
+        inG.Submit += ColorPicker.SubmitG;
+        inB.Submit += ColorPicker.SubmitB;
+        inA.Submit += ColorPicker.SubmitA;
+        inHex.Submit += ColorPicker.SubmitHex;
+        inHsl.Submit += ColorPicker.SubmitHsl;
+        inHsb.Submit += ColorPicker.SubmitHsb;
+    }
+
+    /// Default design-time constructor（黑色）。
+    ColorPicker() {
+        this.InitPicker(new SignalInt(0xFF000000));
+        this.ApplyPacked(model.Get());
+    }
+
+    /// 保留模式构造：`ColorPicker pick = new ColorPicker(model);`
+    ColorPicker(SignalInt m) {
+        this.InitPicker(m);
+        this.ApplyPacked(m.Get());
+    }
+
+    /// 自持信号：`ColorPicker pick = new ColorPicker(0xFF5B3737);`
+    ColorPicker(int packed) {
+        this.InitPicker(new SignalInt(packed));
+        this.ApplyPacked(packed);
+    }
+
+    static ColorPicker Bind(SignalInt model) {
+        ColorPicker p = new ColorPicker(model);
+        return p;
+    }
+
+    /// 当前打包颜色。HSV 分量是 0..1000 的整数量化——纯 HSV 重算会把
+    /// 外部赋进来的颜色抹掉 1/1000（91,55,55 显示成 90,54,54）。在
+    /// 用户没动过色盘（hsvTouched=false）时直接回原包，赋值往返精确。
+    int CurrentRgb() {
+        int rgb = hsvTouched
+            ? ColorPicker.RgbOf(ColorPicker.HsvToRgb(hue, sat, val))
+            : ColorPicker.RgbOf(basePacked);
+        return App.WithAlpha(rgb, alpha);
+    }
+
+    /// 从打包色同步内部 HSV/alpha（外部 SetColor、绑定回拉共用）。
+    void ApplyPacked(int packed) {
+        basePacked = packed;
+        hsvTouched = false;
+        alpha = ColorPicker.AlphaOf(packed);
+        if (!showAlpha) { alpha = 255; }
+        int sv = ColorPicker.RgbToSv(ColorPicker.RgbOf(packed));
+        sat = sv / 4096;
+        val = sv % 4096;
+        hue = hueOut;
+    }
+
+    /// 程序化赋值（同步内部 HSV 与触发条；不触发 Change）。
+    void SetColor(int packed) {
+        this.ApplyPacked(packed);
+        model.Set(this.CurrentRgb());
+        if (data != null) { data.Set(this.CurrentRgb()); }
+    }
+
+    int Value() { return model.Get(); }
+
+    /// 用户手势落定：写模型、写回双向绑定、触发 Change。
+    void Commit() {
+        int packed = this.CurrentRgb();
+        model.Set(packed);
+        if (data != null) { data.Set(packed); }
+        Change.Raise();
+    }
+
+    /// 将绑定的模型值拉入内部状态（model -> UI）。
+    void SyncBinding() {
+        if (data == null) { return; }
+        int cur = data.Get();
+        if (!ColorPicker.SamePacked(cur, model.Get())) { model.Set(cur); }
+    }
+
+    /// 显示透明度条（Naive UI show-alpha）。关闭时 alpha 恒 1。
+    void SetShowAlpha(bool on) {
+        showAlpha = on;
+        if (!on) { alpha = 255; }
+    }
+
+    /// 设定可选格式（Naive UI modes）。空列表 = 全部。
+    /// 只配一种时取值格式随之锁定（Naive UI 传单一 modes 的行为），
+    /// 此处直接改写 Mode，纯计算路径（Text()）与渲染路径同源。
+    /// 当前 Mode 不在新集合里时改取集合首个（Naive UI 的行为：
+    /// modes 缩小后 value 格式必须仍是可选格式之一）。
+    void SetModes(List<string> list) {
+        modes = list;
+        if (modes == null) { modes = new List<string>(); }
+        if (modes.Count == 1) {
+            string m0 = modes[0].ToLower();
+            if (m0 == "rgb" || m0 == "hex" || m0 == "hsl" || m0 == "hsb") {
+                Mode = m0;
+                return;
+            }
+        }
+        string cur = this.ModeName();
+        bool ok = modes.Count == 0;
+        for (int i = 0; i < modes.Count; i = i + 1) {
+            if (modes[i].ToLower() == cur) { ok = true; }
+        }
+        if (!ok && modes.Count > 0) {
+            string first = modes[0].ToLower();
+            if (first == "rgb" || first == "hex" || first == "hsl"
+                || first == "hsb") {
+                Mode = first;
+            }
+        }
+    }
+
+    /// 限制可选格式：Modes("rgb", "hex", "", "")。
+    void Modes(string a, string b, string c, string d) {
+        List<string> list = new List<string>();
+        if (a != null && a != "") { list.Add(a); }
+        if (b != null && b != "") { list.Add(b); }
+        if (c != null && c != "") { list.Add(c); }
+        if (d != null && d != "") { list.Add(d); }
+        this.SetModes(list);
+    }
+
+    /// 当前取值文本（跟随 Mode / modes 缺省）。rgb →
+    /// "rgba(91, 55, 55, 1)"（showAlpha=false 时 "rgb(91, 55, 55)"），
+    /// hex → "#5B3737FF"（showAlpha=false → "#5B3737"），hsl/hsb
+    /// → "hsl(0, 34%, 29%)"。
+    string Text() {
+        return this.FormatAs(this.ModeName());
+    }
+
+    /// 当前生效的格式名（Mode 绑定值；非法/为空时取 modes 首个，
+    /// 再缺省 "rgb"）。
+    string ModeName() {
+        string m = Mode != null ? Mode.Get() : "";
+        if (m == null) { m = ""; }
+        m = m.ToLower();
+        if (m != "rgb" && m != "hex" && m != "hsl" && m != "hsb") {
+            m = "";
+        }
+        if (m == "" && modes != null && modes.Count == 1) {
+            m = modes[0].ToLower();
+        }
+        if (m != "rgb" && m != "hex" && m != "hsl" && m != "hsb") {
+            m = "rgb";
+        }
+        return m;
+    }
+
+    /// 按 `m` 格式格式化当前颜色。
+    string FormatAs(string m) {
+        int rgb = ColorPicker.RgbOf(this.CurrentRgb());
+        if (m == "hex") {
+            if (showAlpha) { return ColorPicker.HexTextAlpha(this.CurrentRgb()); }
+            return ColorPicker.HexText(this.CurrentRgb());
+        }
+        if (m == "hsl" || m == "hsb") {
+            string head = m == "hsl" ? "hsl" : "hsb";
+            int h;
+            int s2;
+            int l2;
+            if (m == "hsl") {
+                int packed = ColorPicker.RgbHsl((rgb / 65536) % 256,
+                                                (rgb / 256) % 256, rgb % 256);
+                h = packed / 1000000;
+                s2 = (packed / 1000) % 1000;
+                l2 = packed % 1000;
+            } else {
+                h = hue;
+                s2 = sat;
+                l2 = val;
+            }
+            string txt = head + "(" + Convert.ToString(h) + ", "
+                + Convert.ToString(s2 / 10) + "%, "
+                + Convert.ToString(l2 / 10) + "%";
+            if (showAlpha) {
+                txt = txt + ", " + this.AlphaText();
+            }
+            return txt + ")";
+        }
+        // rgb（缺省）：rgba(r, g, b, a) / rgb(r, g, b)。
+        string kind = showAlpha ? "rgba" : "rgb";
+        string parts = Convert.ToString((rgb / 65536) % 256) + ", "
+            + Convert.ToString((rgb / 256) % 256) + ", "
+            + Convert.ToString(rgb % 256);
+        if (showAlpha) {
+            return kind + "(" + parts + ", " + this.AlphaText() + ")";
+        }
+        return kind + "(" + parts + ")";
+    }
+
+    /// alpha 通道的文本形式：255 显示 "1"，其余 0..1 两位小数。
+    string AlphaText() {
+        if (alpha >= 255) { return "1"; }
+        int hundredths = alpha * 100 / 255;
+        int whole = hundredths / 100;
+        int frac = hundredths % 100;
+        string fs = Convert.ToString(frac);
+        if (frac < 10) { fs = "0" + fs; }
+        return Convert.ToString(whole) + "." + fs;
+    }
+
+    // ---- 设计器 ----------------------------------------------------
+
+    override string Kind() { return "ColorPicker"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec sm = PropSpec.Bool("showAlpha", "Show alpha");
+        sm.flag = showAlpha;
+        sm.WithTip("Show the alpha slider (Naive UI show-alpha).");
+        ps.Add(sm);
+        PropSpec md = PropSpec.Enum("mode", "Mode",
+            new List<string>{ "rgb", "hex", "hsl", "hsb" });
+        md.str = Mode;
+        md.WithTip("Format of the value text (Naive UI modes[0]).");
+        ps.Add(md);
+        return ps;
+    }
+
+    override string GetExtra(string key) {
+        if (key == "value" || key == "color") { return this.Text(); }
+        if (key == "showAlpha") { return showAlpha ? "true" : "false"; }
+        if (key == "mode") { return this.ModeName(); }
+        return "";
+    }
+
+    override bool SetExtra(string key, string val) {
+        if (key == "showAlpha") { this.SetShowAlpha(val == "true"); return true; }
+        if (key == "mode") { Mode = val; return true; }
+        if (key == "value" || key == "color" || key == "text") {
+            this.SetText(val);
+            return true;
+        }
+        return false;
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        return e;
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change") { Change.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    /// 从文本赋值（designer / 程序化）："#RRGGBB[AA]" 与
+    /// rgba()/rgb()/hsl()/hsb() 都接受，非法文本忽略。
+    void SetText(string value) {
+        int packed = ColorPicker.HexParse(value);
+        if (!ColorPicker.parseOk) { packed = ColorPicker.FuncParse(value); }
+        if (ColorPicker.parseOk) { this.SetColor(packed); }
+    }
+
+    // ---- 渲染 ------------------------------------------------------
+
+    /// 触发条高度（皮肤可写 colorpicker::trigger 的 height 覆盖）。
+    int TriggerH(App app) {
+        StyleBox s = this.ResolveStyleAs(app, "colorpicker", Class,
+                                          Style.SNormal());
+        return s.HeightOr(app.theme.heightMedium);
+    }
+
+    int Render(App app, int x, int y, int width) {
+        int h = this.TriggerH(app);
+        return this.RenderIn(app, x, y, width, h);
+    }
+
+    /// 显式盒高版本（保留式布局走 OnPaint 自动带 bh）。
+    int RenderIn(App app, int x, int y, int width, int height) {
+        int id = wid;
+        SyncBinding();
+        // 外部写模型（程序化赋值）时把内部 HSV 拉齐。
+        int ext = model.Get();
+        if (!ColorPicker.SamePacked(ext, this.CurrentRgb())) {
+            this.ApplyPacked(ext);
+        }
+        bool disabled = this.IsDisabled();
+        StyleBox root = this.ResolveEasedStyleAsIn(
+            app, id, "colorpicker", Class, disabled, false, x, y, width, height);
+        root.Paint(app, x, y, width, height);
+        // 触发条中央铺当前色块（Naive UI 是整块色 + 圆角）。
+        Canvas c = app.canvas;
+        StyleBox trg = this.ResolveEasedPartAsIn(
+            app, id, "colorpicker", "trigger", "", Class, disabled, false,
+            x, y, width, height);
+        int pad = root.BorderWOr(0) + root.PadLOr(app.Scale(3));
+        int swW = width - pad * 2;
+        int swH = height - pad * 2;
+        if (swW > 0 && swH > 0) {
+            c.FillRoundRect(x + pad, y + pad, swW, swH,
+                            trg.RadiusOr(app.Scale(4)), this.CurrentRgb());
+        }
+        app.hitTester.RegisterRect(id, x, y, width, height, 3);
+        app.focus.RegisterFocusable(id);
+        // 点击触发条开/关弹层；开着时触发条被弹层的 BlockHitsBelow
+        // 挡住，点击由弹层的"外部关闭"收口。
+        if (!disabled && Ui.Clicked(app, id)) {
+            open = !open;
+            viewAligned = false;
+            app.ClaimClick();
+            app.RequestRedraw();
+        }
+        if (disabled) { open = false; }
+        if (open) { app.AddOverlay(OverlayPopup.Host(this)); }
+        if (this.On.Any()) { On.Fire(app, id); }
+        return id;
+    }
+
+    // ---- 弹层（OnPaintOverlay 覆盖阶段绘制 + 分发）-------------------
+
+    override void OnPaintOverlay(App app) {
+        if (!open) { return; }
+        Canvas c = app.canvas;
+        int scale = app.Scale(1);
+        int panelW = app.Scale(236);
+        int pad = app.Scale(10);
+        int svH = app.Scale(148);
+        int barH = app.Scale(12);
+        int gap = app.Scale(8);
+        int rowsH = app.Scale(26);
+        int popH = pad + svH + gap + barH + gap + rowsH + pad;
+        if (showAlpha) { popH = popH + barH + gap; }
+        int popX = OverlayPopup.FitX(app, this.bx, panelW);
+        int popY = OverlayPopup.FitY(app, this.by + this.bh + scale * 4,
+                                     this.bh, popH);
+        StyleBox pop = this.ResolvePartAs(app, "colorpicker", "panel",
+                                          "select", Class, Style.SNormal());
+        pop.Paint(app, popX, popY, panelW, popH);
+        app.BlockHitsBelow();
+        app.BlockHitsRect(popX, popY, panelW, popH);
+
+        int svX = popX + pad;
+        int svY = popY + pad;
+        int svW = panelW - pad * 2;
+        bool clicked = app.ClickAvailable();
+
+        // ---- SV 面板：两层渐变合成（白→纯色横排、透明→黑纵排）----
+        int pure = ColorPicker.HsvToRgb(hue, 1000, 1000);
+        int svR = app.Scale(4);
+        c.FillGradMask(svX, svY, svW, svH, svR, Corner.All(), 1,
+                       0xFFFFFFFF, 0, pure);
+        c.FillGradMask(svX, svY, svW, svH, svR, Corner.All(), 0,
+                       0, 0, 0xFF000000);
+        int dotX = svX + sat * svW / 1000;
+        int dotY = svY + (1000 - val) * svH / 1000;
+        int dotR = app.Scale(5);
+        c.DrawCircle(dotX, dotY, dotR + scale, 0xFFFFFFFF, scale + 1);
+        c.DrawCircle(dotX, dotY, dotR, 0xFF000000, scale);
+        app.hitTester.RegisterRect(wid + ColorPicker.SvPanelOff(),
+                                   svX, svY, svW, svH, 3);
+
+        // ---- 色相条：红橙黄绿青蓝紫 六段渐变拼成 --------------------
+        int barY = svY + svH + gap;
+        int segN = 6;
+        int segW = svW / segN;
+        for (int i = 0; i < segN; i = i + 1) {
+            int c0 = ColorPicker.HsvToRgb(i * 60, 1000, 1000);
+            int c1 = ColorPicker.HsvToRgb((i + 1) * 60, 1000, 1000);
+            c.FillGradMask(popX + pad + i * segW, barY,
+                           i == segN - 1 ? svW - i * segW : segW, barH,
+                           0, 0, 1, c0, 0, c1);
+        }
+        int hueX = popX + pad + hue * svW / 360;
+        c.DrawCircle(hueX, barY + barH / 2, barH / 2 + scale - 1,
+                     0xFFFFFFFF, scale + 1);
+        app.hitTester.RegisterRect(wid + ColorPicker.HueOff(),
+                                   popX + pad, barY, svW, barH, 3);
+
+        // ---- 透明度条：棋盘格打底 + 白↔纯色水平渐变 -----------------
+        if (showAlpha) {
+            int aY = barY + barH + gap;
+            int chk = app.Scale(5);
+            StyleBox checker = this.ResolvePartAs(
+                app, "colorpicker", "checker", "", Class, Style.SNormal());
+            c.PushClip(popX + pad, aY, svW, barH);
+            int row = 0;
+            while (row * chk < barH) {
+                int col = 0;
+                while (col * chk < svW) {
+                    bool dark = (row + col) % 2 == 0;
+                    c.FillRect(popX + pad + col * chk, aY + row * chk,
+                               chk, chk,
+                               dark ? checker.BorderOr(0xFFCCCCCC)
+                                    : checker.BgOr(0xFFFFFFFF));
+                    col = col + 1;
+                }
+                row = row + 1;
+            }
+            c.PopClip();
+            c.FillGradMask(popX + pad, aY, svW, barH, 0, 0, 1,
+                           App.WithAlpha(pure, 0), 0,
+                           App.WithAlpha(pure, 255));
+            int aX = popX + pad + alpha * svW / 255;
+            c.DrawCircle(aX, aY + barH / 2, barH / 2 + scale - 1,
+                         0xFFFFFFFF, scale + 1);
+            app.hitTester.RegisterRect(wid + ColorPicker.AlphaOff(),
+                                       popX + pad, aY, svW, barH, 3);
+        }
+
+        // ---- 指针：拖 SV / 色相 / 透明度 ----------------------------
+        bool changed = false;
+        if (!this.IsDisabled()) {
+            if (app.focus.IsPressed(wid + ColorPicker.SvPanelOff())) {
+                dragPart = 1;
+            } else if (app.focus.IsPressed(wid + ColorPicker.HueOff())) {
+                dragPart = 2;
+            } else if (showAlpha
+                       && app.focus.IsPressed(wid + ColorPicker.AlphaOff())) {
+                dragPart = 3;
+            } else if (dragPart != 0 && app.EventKind() == 3) {
+                dragPart = 0;
+            }
+            if (dragPart == 1) {
+                int ns = (app.mouseX - svX) * 1000 / svW;
+                int nv = 1000 - (app.mouseY - svY) * 1000 / svH;
+                if (ns < 0) { ns = 0; } if (ns > 1000) { ns = 1000; }
+                if (nv < 0) { nv = 0; } if (nv > 1000) { nv = 1000; }
+                if (ns != sat || nv != val) {
+                    sat = ns; val = nv;
+                    hsvTouched = true;
+                    changed = true;
+                }
+            } else if (dragPart == 2) {
+                int nh = (app.mouseX - (popX + pad)) * 360 / svW;
+                if (nh < 0) { nh = 0; } if (nh > 359) { nh = 359; }
+                if (nh != hue) {
+                    hue = nh;
+                    hsvTouched = true;
+                    changed = true;
+                }
+            } else if (dragPart == 3) {
+                int na = (app.mouseX - (popX + pad)) * 255 / svW;
+                if (na < 0) { na = 0; } if (na > 255) { na = 255; }
+                if (na != alpha) {
+                    alpha = na;
+                    changed = true;
+                }
+            }
+        } else {
+            dragPart = 0;
+        }
+
+        // ---- 输入行：RGBA / HEX / HSL / HSB，标签点击循环切换 -------
+        // popH 已含透明度条的 barH+gap，行贴弹层底即可，不能再扣。
+        int rowY = popY + popH - pad - rowsH;
+        string modeName = this.ModeName();
+        // 输入行视图跟随模式：modes 只剩一种时锁定该格式。
+        if (modes != null && modes.Count == 1) {
+            inputView = ColorPicker.ViewOf(modeName);
+        }
+        // Mode 显式指定且允许时，弹层打开的第一帧把输入行对齐到它。
+        if (!viewAligned) {
+            viewAligned = true;
+            int want = ColorPicker.ViewOf(modeName);
+            if (modes == null || modes.Count == 0
+                || ColorPicker.Allowed(want, modes)) {
+                inputView = want;
+            }
+        }
+        StyleBox lab = this.ResolvePartAs(app, "colorpicker", "label",
+                                          "", Class, Style.SNormal());
+        int labFs = lab.FontOr(Style.FontFallback(app, "small"));
+        int labW = app.Scale(34);
+        c.DrawText(popX + pad,
+                   Canvas.CenterTextY(rowY, rowsH, labFs),
+                   ColorPicker.ViewLabel(inputView), lab.FgOr(pop.fg), labFs);
+        if (app.ClickAvailable()
+            && Ui.Over(app, popX + pad, rowY, labW, rowsH)) {
+            inputView = ColorPicker.NextAllowedView(inputView + 1, modes);
+            app.ClaimClick();
+            app.RequestRedraw();
+        }
+        editing = this;
+        this.PaintInputs(app, popX + pad + labW + scale * 6, rowY, rowsH,
+                         panelW - pad * 2 - labW - scale * 6, clicked);
+
+        if (changed) {
+            this.Commit();
+            app.RequestRedraw();
+        }
+
+        // ---- 关闭：点弹层外 ----------------------------------------
+        if (clicked && (app.mouseX < popX || app.mouseX >= popX + panelW ||
+                        app.mouseY < popY || app.mouseY >= popY + popH)) {
+            open = false;
+            app.ClaimClick();
+            app.RequestRedraw();
+        }
+    }
+
+    /// 输入行视图编号：0 RGBA / 1 HEX / 2 HSL / 3 HSB。
+    static int ViewOf(string m) {
+        if (m == "hex") { return 1; }
+        if (m == "hsl") { return 2; }
+        if (m == "hsb") { return 3; }
+        return 0;
+    }
+
+    static string ViewLabel(int view) {
+        if (view == 1) { return "HEX"; }
+        if (view == 2) { return "HSL"; }
+        if (view == 3) { return "HSB"; }
+        return "RGBA";
+    }
+
+    /// 从 `start` 往后找 modes 允许的第一个视图（全空/找不到回 start）。
+    static int NextAllowedView(int start, List<string> modes) {
+        int from = start % 4;
+        if (from < 0) { from = from + 4; }
+        if (modes == null || modes.Count == 0) { return from; }
+        for (int k = 0; k < 4; k = k + 1) {
+            int cand = (from + k) % 4;
+            for (int i = 0; i < modes.Count; i = i + 1) {
+                if (ColorPicker.ViewOf(modes[i].ToLower()) == cand) {
+                    return cand;
+                }
+            }
+        }
+        return from;
+    }
+
+    /// `view` 是否在允许的 modes 里（空列表 = 全部允许）。
+    static bool Allowed(int view, List<string> modes) {
+        if (modes == null || modes.Count == 0) { return true; }
+        for (int i = 0; i < modes.Count; i = i + 1) {
+            if (ColorPicker.ViewOf(modes[i].ToLower()) == view) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// 正在渲染输入行的选择器（Input 的 Submit 委托无法捕获 this，
+    /// 静态转发宿主，DatePicker.current 同款）。
+    static ColorPicker editing;
+
+    /// 弹层打开后是否已把输入行对齐到 Mode（每次打开重新对齐）。
+    bool viewAligned;
+
+    static void SubmitR() { if (editing != null) { editing.SubmitChannel(0); } }
+    static void SubmitG() { if (editing != null) { editing.SubmitChannel(1); } }
+    static void SubmitB() { if (editing != null) { editing.SubmitChannel(2); } }
+    static void SubmitA() { if (editing != null) { editing.SubmitChannel(3); } }
+    static void SubmitHex() { if (editing != null) { editing.SubmitChannel(4); } }
+    static void SubmitHsl() { if (editing != null) { editing.SubmitChannel(5); } }
+    static void SubmitHsb() { if (editing != null) { editing.SubmitChannel(6); } }
+
+    /// 输入行回车提交：0-2 替换单个 R/G/B 通道，3 写 alpha（0..100%），
+    /// 4-6 整色替换（hex / hsl / hsb）。非法文本忽略。解析成功的一律
+    /// 走 ApplyPacked 整色替换——单通道补丁会让 CurrentRgb 的
+    /// hsvTouched 基准停在旧包上。
+    void SubmitChannel(int which) {
+        bool ok = false;
+        if (which <= 2) {
+            string t = which == 0 ? inR.GetText()
+                     : which == 1 ? inG.GetText() : inB.GetText();
+            int v = ColorPicker.ParseIntSafe(t);
+            if (v >= 0) {
+                if (v > 255) { v = 255; }
+                int rgb = ColorPicker.RgbOf(this.CurrentRgb());
+                int r = (rgb / 65536) % 256;
+                int g = (rgb / 256) % 256;
+                int b = rgb % 256;
+                if (which == 0) { r = v; }
+                else if (which == 1) { g = v; }
+                else { b = v; }
+                this.ApplyPacked(App.WithAlpha(
+                    ColorPicker.Opaque(r, g, b), alpha));
+                ok = true;
+            }
+        } else if (which == 3) {
+            int v = ColorPicker.ParseIntSafe(inA.GetText());
+            if (v >= 0) {
+                if (v > 100) { v = 100; }
+                alpha = v * 255 / 100;
+                ok = true;
+            }
+        } else if (which == 4) {
+            int packed = ColorPicker.HexParse(inHex.GetText());
+            if (ColorPicker.parseOk) {
+                this.ApplyPacked(packed);
+                ok = true;
+            }
+        } else if (which == 5) {
+            int packed = ColorPicker.FuncParse(
+                "hsl(" + inHsl.GetText() + ")");
+            if (ColorPicker.parseOk) {
+                this.ApplyPacked(packed);
+                ok = true;
+            }
+        } else {
+            int packed = ColorPicker.FuncParse(
+                "hsb(" + inHsb.GetText() + ")");
+            if (ColorPicker.parseOk) {
+                this.ApplyPacked(packed);
+                ok = true;
+            }
+        }
+        if (ok) { this.Commit(); }
+    }
+
+    /// 输入行的保留态子控件排布 + 文本同步。四种格式各一组 Input，
+    /// 只排当前视图那组（其余不排布即不显示、不吃键盘）。
+    void PaintInputs(App app, int x, int y, int h, int w, bool clicked) {
+        if (inputView == 0) {
+            int each = (w - app.Scale(6) * 3) / 4;
+            this.LayInput(app, inR, x, y, each, h);
+            this.LayInput(app, inG, x + each + app.Scale(6), y, each, h);
+            this.LayInput(app, inB, x + (each + app.Scale(6)) * 2, y, each, h);
+            this.LayInput(app, inA, x + (each + app.Scale(6)) * 3, y,
+                          w - (each + app.Scale(6)) * 3, h);
+        } else if (inputView == 1) {
+            this.LayInput(app, inHex, x, y, w, h);
+        } else if (inputView == 2) {
+            this.LayInput(app, inHsl, x, y, w, h);
+        } else {
+            this.LayInput(app, inHsb, x, y, w, h);
+        }
+        // 内部状态 → 输入框文本（每帧）。正被编辑的字段跳过，
+        // 让用户打字不被打断。
+        int rgb = ColorPicker.RgbOf(this.CurrentRgb());
+        if (inputView == 0) {
+            this.SyncInput(app, inR, Convert.ToString((rgb / 65536) % 256));
+            this.SyncInput(app, inG, Convert.ToString((rgb / 256) % 256));
+            this.SyncInput(app, inB, Convert.ToString(rgb % 256));
+            this.SyncInput(app, inA, Convert.ToString(alpha * 100 / 255));
+        } else if (inputView == 1) {
+            string hex = showAlpha ? ColorPicker.HexTextAlpha(this.CurrentRgb())
+                                   : ColorPicker.HexText(this.CurrentRgb());
+            this.SyncInput(app, inHex, hex);
+        } else if (inputView == 2) {
+            int packed = ColorPicker.RgbHsl((rgb / 65536) % 256,
+                                            (rgb / 256) % 256, rgb % 256);
+            string txt = Convert.ToString(packed / 1000000) + ", "
+                + Convert.ToString((packed / 1000) % 1000 / 10) + "%, "
+                + Convert.ToString(packed % 1000 / 10) + "%";
+            this.SyncInput(app, inHsl, txt);
+        } else {
+            string txt2 = Convert.ToString(hue) + ", "
+                + Convert.ToString(sat / 10) + "%, "
+                + Convert.ToString(val / 10) + "%";
+            this.SyncInput(app, inHsb, txt2);
+        }
+    }
+
+    /// 子输入框在弹层里的排布（不走树的 Arrange，手动摆）。
+    void LayInput(App app, Input inp, int x, int y, int w, int h) {
+        inp.Render(app, x, y, w, h);
+    }
+
+    /// 文本相同或字段正被编辑就不写，避免每帧重置光标。
+    void SyncInput(App app, Input inp, string text) {
+        if (app.focus.IsFocused(inp.WidgetId())) { return; }
+        if (inp.GetText() == text) { return; }
+        inp.SetText(text);
+    }
+
+    override void OnMeasure(App app) {
+        StyleBox s = this.ResolveStyleAs(app, "colorpicker", Class,
+                                         Style.SNormal());
+        prefH = s.HeightOr(app.theme.heightMedium);
+        prefW = s.WidthOr(app.Scale(160));
+    }
+
+    override void OnPaint(App app) {
+        this.RenderIn(app, bx, by, bw, bh);
+    }
+}

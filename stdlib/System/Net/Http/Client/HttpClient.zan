@@ -639,8 +639,7 @@ class HttpClient {
             ctx.DisableVerify();
         }
         this.ApplyPinning(ctx);
-        TlsStream stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host,
-                                                        this.HandshakeBudget());
+        TlsStream stream = await this.ConnectTls(ctx, conn.Sock());
         if (stream == null) {
             conn.Close();
             ctx.Free();
@@ -707,6 +706,22 @@ class HttpClient {
         return result;
     }
 
+    // TLS 握手也必须挂到同一个 deadline sweep：TlsStream 的 timeout 参数
+    // 负责阶段预算，watch 负责唤醒可能停在 ReadReady 的 reactor 协程。
+    async TlsStream ConnectTls(TlsContext ctx, nint sock) {
+        HttpDeadlineToken watch = HttpDeadline.Arm(sock,
+            this.HandshakeBudget(), this.TotalBudget());
+        TlsStream stream = await TlsStream.ConnectAsync(ctx, sock, this.host,
+            this.HandshakeBudget());
+        bool late = HttpDeadline.Expired(watch);
+        HttpDeadline.Disarm(watch);
+        if (late && stream != null) {
+            stream.Close();
+            return null;
+        }
+        return stream;
+    }
+
     // keep-alive 请求：复用池中的连接，直到对端宣布关闭。同一客户端
     // 同时只允许一个在途请求（kaBusy 拦截，并发请求走一次性通道）；
     // 空闲连接被对端回收时，换一条新连接透明地重试一次。
@@ -747,35 +762,48 @@ class HttpClient {
                 _sent = await this.kaConn.SendAsync(req);
             }
             HttpDeadline.Touch(watch, this.ReadBudget());
-            int he = await this.ka.ReadHead(65536);
-            if (he == 0 && reused && attempt == 1) {
-                // 空闲连接已被对端回收，请求未被处理：换新连接重试。
-                HttpDeadline.Disarm(watch);
-                this.DropAlive();
-                continue;
-            }
-            if (he == 0) {
-                bool late = HttpDeadline.Expired(watch);
-                HttpDeadline.Disarm(watch);
-                this.DropAlive();
-                req = "";
-                if (late) {
-                    method = "";
-                    path = "";
-                    body = "";
-                    FailTimeout();
+            int he = 0;
+            string head = "";
+            while (true) {
+                he = await this.ka.ReadHead(65536);
+                if (he == 0 && reused && attempt == 1) {
+                    // 空闲连接已被对端回收，请求未被处理：换新连接重试。
+                    HttpDeadline.Disarm(watch);
+                    this.DropAlive();
+                    break;
                 }
-                throw new HttpRequestException(
-                    "connection closed before a response arrived");
+                if (he == 0) {
+                    bool late = HttpDeadline.Expired(watch);
+                    HttpDeadline.Disarm(watch);
+                    this.DropAlive();
+                    req = "";
+                    if (late) {
+                        method = "";
+                        path = "";
+                        body = "";
+                        FailTimeout();
+                    }
+                    throw new HttpRequestException(
+                        "connection closed before a response arrived");
+                }
+                if (he < 0) {
+                    HttpDeadline.Disarm(watch);
+                    this.DropAlive();
+                    req = "";
+                    throw new HttpRequestException(
+                        "response header block exceeds 65536 bytes");
+                }
+                head = this.ka.Head(he);
+                int interim = HttpClient.HeadStatus(head);
+                if (interim >= 100 && interim < 200 && interim != 101) {
+                    // 1xx（101 除外）是同一请求的临时响应；只消费其
+                    // 头部，绝不能把它当最终响应返回或再次发送请求。
+                    this.ka.Consume(he);
+                    continue;
+                }
+                break;
             }
-            if (he < 0) {
-                HttpDeadline.Disarm(watch);
-                this.DropAlive();
-                req = "";
-                throw new HttpRequestException(
-                    "response header block exceeds 65536 bytes");
-            }
-            string head = this.ka.Head(he);
+            if (he == 0 && reused && attempt == 1) { continue; }
             HttpRequest hp = HttpRequest.Parse(head, he);
             HttpResponse probe = HttpResponse.Parse(head);
             bool serverClose = HttpClient.HeadSaysClose(head);
@@ -917,8 +945,7 @@ class HttpClient {
             ctx.DisableVerify();
         }
         this.ApplyPinning(ctx);
-        TlsStream stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host,
-                                                       this.HandshakeBudget());
+        TlsStream stream = await this.ConnectTls(ctx, conn.Sock());
         if (stream == null) {
             conn.Close();
             ctx.Free();
@@ -979,6 +1006,7 @@ class HttpClient {
         HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
         string req = this.BuildRequest(method, path, body, true);
         int _sent = await conn.SendBytesAsync(req, req.Length);
+        HttpDeadline.Touch(watch, this.ReadBudget());
         HttpResponse resp = await this.ReadFramedResponse(conn, path, method,
                                                           watch, null, null);
         return resp;
@@ -999,22 +1027,32 @@ class HttpClient {
         } else {
             fr = HttpFramer.Create(conn.Sock());
         }
-        int he = await fr.ReadHead(65536);
-        if (he == 0) {
-            bool lateHead = HttpDeadline.Expired(watch);
-            HttpDeadline.Disarm(watch);
-            this.CloseChannel(conn, fr, stream, ctx);
-            if (lateHead) { FailTimeout(); }
-            throw new HttpRequestException(
-                "connection closed before a response arrived");
+        int he = 0;
+        string head = "";
+        while (true) {
+            he = await fr.ReadHead(65536);
+            if (he == 0) {
+                bool lateHead = HttpDeadline.Expired(watch);
+                HttpDeadline.Disarm(watch);
+                this.CloseChannel(conn, fr, stream, ctx);
+                if (lateHead) { FailTimeout(); }
+                throw new HttpRequestException(
+                    "connection closed before a response arrived");
+            }
+            if (he < 0) {
+                HttpDeadline.Disarm(watch);
+                this.CloseChannel(conn, fr, stream, ctx);
+                throw new HttpRequestException(
+                    "response header block exceeds 65536 bytes");
+            }
+            head = fr.Head(he);
+            int interim = HttpClient.HeadStatus(head);
+            if (interim >= 100 && interim < 200 && interim != 101) {
+                fr.Consume(he);
+                continue;
+            }
+            break;
         }
-        if (he < 0) {
-            HttpDeadline.Disarm(watch);
-            this.CloseChannel(conn, fr, stream, ctx);
-            throw new HttpRequestException(
-                "response header block exceeds 65536 bytes");
-        }
-        string head = fr.Head(he);
         HttpResponse resp = HttpResponse.Parse(head);
         HttpRequest hp = HttpRequest.Parse(head, he);
         bool noBody = resp.statusCode == 204 || resp.statusCode == 304
@@ -1151,8 +1189,7 @@ class HttpClient {
             ctx.DisableVerify();
         }
         this.ApplyPinning(ctx);
-        TlsStream stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host,
-                                                       this.HandshakeBudget());
+        TlsStream stream = await this.ConnectTls(ctx, conn.Sock());
         if (stream == null) {
             conn.Close();
             ctx.Free();
@@ -1200,11 +1237,13 @@ class HttpClient {
                     "file shrank while being uploaded: " + localPath);
             }
             int _c = await conn.SendBytesAsync(chunk, chunk.Length);
+            HttpDeadline.Touch(watch, this.WriteBudget());
             offset = offset + chunk.Length;
             this.UploadTick(req.Length + head.Length + offset, total);
         }
         int _t = await conn.SendBytesAsync(tail, tail.Length);
         this.UploadTick(total, total);
+        HttpDeadline.Touch(watch, this.ReadBudget());
         HttpResponse resp = await this.ReadFramedResponse(conn, path, method,
                                                           watch, null, null);
         return resp;
@@ -1242,8 +1281,7 @@ class HttpClient {
             ctx.DisableVerify();
         }
         this.ApplyPinning(ctx);
-        TlsStream stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host,
-                                                       this.HandshakeBudget());
+        TlsStream stream = await this.ConnectTls(ctx, conn.Sock());
         if (stream == null) {
             conn.Close();
             ctx.Free();
@@ -1270,11 +1308,13 @@ class HttpClient {
                     "file shrank while being uploaded: " + localPath);
             }
             int _c = await stream.SendAsync(chunk, chunk.Length);
+            HttpDeadline.Touch(watch, this.WriteBudget());
             offset = offset + chunk.Length;
             this.UploadTick(req.Length + head.Length + offset, total);
         }
         int _t = await stream.SendAsync(tail, tail.Length);
         this.UploadTick(total, total);
+        HttpDeadline.Touch(watch, this.ReadBudget());
         HttpResponse resp = await this.ReadFramedResponse(conn, path, method,
                                                           watch, stream, ctx);
         return resp;
@@ -1537,8 +1577,7 @@ class HttpClient {
             }
             if (!this.verifyTls) { ctx.DisableVerify(); }
             this.ApplyPinning(ctx);
-            stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host,
-                                                        this.HandshakeBudget());
+            stream = await this.ConnectTls(ctx, conn.Sock());
             if (stream == null) {
                 conn.Close();
                 ctx.Free();
@@ -1558,6 +1597,7 @@ class HttpClient {
         } else {
             int _s2 = await conn.SendAsync(requestData);
         }
+        HttpDeadline.Touch(watch, this.ReadBudget());
 
         // 读取响应头，以便把状态/头部与正文分开。
         // 扫描从末尾前几个字节重新开始，而非从 0 开始，且头部
@@ -2061,8 +2101,7 @@ class HttpClient {
             }
             if (!this.verifyTls) { ctx.DisableVerify(); }
             this.ApplyPinning(ctx);
-            stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host,
-                                                        this.HandshakeBudget());
+            stream = await this.ConnectTls(ctx, conn.Sock());
             if (stream == null) {
                 this.SetDownloadError("TLS 阶段失败：" + TlsStream.LastError());
                 conn.Close();
@@ -2317,8 +2356,7 @@ class HttpClient {
             }
             if (!this.verifyTls) { ctx.DisableVerify(); }
             this.ApplyPinning(ctx);
-            stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host,
-                                                        this.HandshakeBudget());
+            stream = await this.ConnectTls(ctx, conn.Sock());
             if (stream == null) {
                 this.SetDownloadError("TLS 阶段失败：" + TlsStream.LastError());
                 conn.Close();

@@ -1,0 +1,124 @@
+// Csrf.Guard（double-submit cookie）契约：
+// 安全方法补发 cookie 且放行；不安全方法要求 X-CSRF-Token 或 _csrf
+// 与 cookie 逐字节相等；缺失/不匹配 → 403 短路；豁免前缀放行；
+// 常时比较对不等长输入同样拒绝。
+using System;
+using System.Security.Cryptography;
+using System.Web;
+
+class Program {
+    static int failures = 0;
+
+    static void Ok(string what, bool got, bool want) {
+        if (got == want) {
+            Console.WriteLine("ok " + what);
+        } else {
+            Console.WriteLine("FAIL " + what + ": got "
+                + (got ? "true" : "false") + " want "
+                + (want ? "true" : "false"));
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static HttpContext Ctx(string raw) {
+        return new HttpContext(HttpRequest.Parse(raw), "127.0.0.1");
+    }
+
+    // token 在响应的 Set-Cookie 里；模拟后续请求时从这里取值、
+    // 回填进请求侧 Cookie 头。
+    static string TokenFrom(HttpContext c) {
+        for (int i = 0; i < c.headers.Count; i = i + 1) {
+            string h = c.headers[i];
+            int at = h.IndexOf("csrf_token=");
+            if (at >= 0) {
+                int start = at + 11;
+                int end = start;
+                while (end < h.Length && h[end] != ';') { end = end + 1; }
+                return h.Substring(start, end - start);
+            }
+        }
+        return "";
+    }
+
+    static void Main() {
+        // GET：放行并补发 token cookie。
+        HttpContext g = Program.Ctx("GET /list HTTP/1.1\r\nHost: h\r\n\r\n");
+        Program.Ok("get passes", Csrf.Guard(g), true);
+        string token = Program.TokenFrom(g);
+        Program.Ok("get sets token cookie", token.Length > 0, true);
+        Program.Ok("token is 32 hex chars", token.Length == 32, true);
+        // cookie 头还没写回请求侧——从响应头里确认 Set-Cookie 形态。
+        bool sawCookie = false;
+        bool jsReadable = true;
+        for (int i = 0; i < g.headers.Count; i = i + 1) {
+            string h = g.headers[i];
+            if (h.Contains("csrf_token=")) {
+                sawCookie = true;
+                if (h.Contains("HttpOnly")) { jsReadable = false; }
+            }
+        }
+        Program.Ok("set-cookie emitted", sawCookie, true);
+        Program.Ok("token cookie is JS-readable", jsReadable, true);
+
+        // POST 无 cookie / 无 token → 403 短路。
+        HttpContext p0 = Program.Ctx("POST /save HTTP/1.1\r\nHost: h\r\n\r\n");
+        Program.Ok("post without cookie blocked", Csrf.Guard(p0), false);
+        Program.Ok("blocked is 403", p0.status == 403, true);
+        Program.Ok("blocked short-circuits", p0.ended, true);
+
+        // POST 带 cookie 但无头 → 403。
+        HttpContext p1 = Program.Ctx("POST /save HTTP/1.1\r\nHost: h\r\n"
+            + "Cookie: csrf_token=" + token + "\r\n\r\n");
+        Program.Ok("post without token blocked", Csrf.Guard(p1), false);
+
+        // POST token 不匹配 → 403；等长与否都拒绝（常时比较不短路）。
+        HttpContext p2 = Program.Ctx("POST /save HTTP/1.1\r\nHost: h\r\n"
+            + "Cookie: csrf_token=" + token + "\r\n"
+            + "X-CSRF-Token: " + token.Substring(0, 30) + "ff\r\n\r\n");
+        Program.Ok("post with wrong token blocked", Csrf.Guard(p2), false);
+        HttpContext p3 = Program.Ctx("POST /save HTTP/1.1\r\nHost: h\r\n"
+            + "Cookie: csrf_token=" + token + "\r\nX-CSRF-Token: short\r\n\r\n");
+        Program.Ok("post with short token blocked", Csrf.Guard(p3), false);
+
+        // POST 头匹配 → 放行。
+        HttpContext p4 = Program.Ctx("POST /save HTTP/1.1\r\nHost: h\r\n"
+            + "Cookie: csrf_token=" + token + "\r\n"
+            + "X-CSRF-Token: " + token + "\r\n\r\n");
+        Program.Ok("post with matching header passes", Csrf.Guard(p4), true);
+
+        // 表单字段兜底。
+        string formTok = "Content-Length: " + Convert.ToString(6 + token.Length)
+            + "\r\n";
+        HttpContext p5 = Program.Ctx("POST /save HTTP/1.1\r\nHost: h\r\n"
+            + "Cookie: csrf_token=" + token + "\r\n"
+            + "Content-Type: application/x-www-form-urlencoded\r\n"
+            + formTok + "\r\n_csrf=" + token);
+        Program.Ok("post with matching form field passes", Csrf.Guard(p5), true);
+
+        // HEAD/OPTIONS 同样放行。
+        Program.Ok("head passes",
+            Csrf.Guard(Program.Ctx("HEAD / HTTP/1.1\r\nHost: h\r\n\r\n")), true);
+        Program.Ok("options passes",
+            Csrf.Guard(Program.Ctx("OPTIONS / HTTP/1.1\r\nHost: h\r\n\r\n")),
+            true);
+
+        // 豁免前缀：登记后 POST /pay/callback 即使无 token 也放行。
+        Csrf.Skip("/pay/");
+        HttpContext pay = Program.Ctx("POST /pay/callback HTTP/1.1\r\nHost: h\r\n\r\n");
+        Program.Ok("skipped prefix passes", Csrf.Guard(pay), true);
+        HttpContext pay2 = Program.Ctx("POST /other/cb HTTP/1.1\r\nHost: h\r\n\r\n");
+        Program.Ok("non-matching prefix still blocked", Csrf.Guard(pay2), false);
+
+        // token 唯一性抽查（两次取 token 不同）。
+        string t2 = CsrfTokenForFreshGet();
+        Program.Ok("fresh tokens differ", t2 != token, true);
+
+        Console.WriteLine("failures: " + Convert.ToString(Program.failures));
+    }
+
+    static string CsrfTokenForFreshGet() {
+        HttpContext c = Program.Ctx("GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+        Csrf.Guard(c);
+        return c.Cookie("csrf_token");
+    }
+}
