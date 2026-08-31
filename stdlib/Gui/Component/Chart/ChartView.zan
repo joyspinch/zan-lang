@@ -551,6 +551,7 @@ partial class ChartView {
         this.directStatus = "disposed"; this.directStatusMessage = "";
         if (this.Disposed.Count() > 0) { this.Disposed.Raise(); }
         this.Rendered.Clear(); this.Resized.Clear(); this.Updated.Clear();
+        if (ChartView.activeEventView == this) { ChartView.activeEventView = null; }
         this.eventHub.Clear();
     }
 
@@ -583,6 +584,10 @@ partial class ChartView {
     /// 几何变化自动失效（指纹比较 + 几何匹配）。
     /// 悬停反馈（如 HeatmapHover）由调用方在命中*之后*绘制，
     /// 使工具提示保持活跃。帧由缓存提供时返回 true。
+    /// 交互事件由每槽位的持久 owner view 承载：缓存命中帧也
+    /// 设置 activeEventView 并派发 Hover/MouseOut/Click/
+    /// DoubleClick，调用方补画的命中层（HeatmapHover 等）的
+    /// OfferActiveHit 由此到达持久 view，handler 不再丢失。
     static bool RenderCached(App app, ChartOption o, int slot,
                              int x, int y, int w, int h) {
         Canvas c = app.canvas;
@@ -591,8 +596,12 @@ partial class ChartView {
         int zwid = 300000 + slot;
         ResolvedChart resolved = ResolvedChart.Resolve(o, app.theme, app, zwid);
         int fp = ChartView.CacheFingerprint(app, o, resolved, x, y, w, h);
-        if (app.StateGet(Chart.CacheKey(slot), 0) == fp
-            && c.RestoreRect(x, y, w, h, slot)) {
+        bool cached = app.StateGet(Chart.CacheKey(slot), 0) == fp
+            && c.RestoreRect(x, y, w, h, slot);
+        if (cached) {
+            // 缓存命中帧：像素来自快照，但交互仍走持久 owner view。
+            ChartView owner = ChartView.CachedOwner(o, zwid, x, y, w, h);
+            owner.BeginCachedEventFrame(app, x, y, w, h);
             return true;
         }
         ChartView view = ChartView.Keyed(o, zwid);
@@ -600,7 +609,79 @@ partial class ChartView {
         view.Render(app, x, y, w, h);
         c.SnapshotRect(x, y, w, h, slot);
         app.StateSet(Chart.CacheKey(slot), fp);
+        ChartView.SetCachedOwner(zwid, view, x, y, w, h);
         return false;
+    }
+
+    /// RenderCached 每槽位的持久 owner view。Keyed 临时实例在
+    /// 缓存 miss 帧产生，这里把它保留下来：后续缓存命中帧复用
+    /// 同一实例，previousHit 连续性与事件订阅归属由此成立。
+    /// 平行数组按槽位序存放（slot 数量少且有限）。
+    static List<ChartView> cachedOwners;
+    static List<int> cachedOwnerKeys;
+    static List<int> cachedOwnerRects;
+
+    static void SetCachedOwner(int key, ChartView v, int x, int y, int w, int h) {
+        if (ChartView.cachedOwnerKeys == null) {
+            ChartView.cachedOwners = new List<ChartView>();
+            ChartView.cachedOwnerKeys = new List<int>();
+            ChartView.cachedOwnerRects = new List<int>();
+        }
+        for (int i = 0; i < ChartView.cachedOwnerKeys.Count; i = i + 1) {
+            if (ChartView.cachedOwnerKeys[i] == key) {
+                ChartView.cachedOwners[i] = v;
+                ChartView.cachedOwnerRects[i * 4] = x;
+                ChartView.cachedOwnerRects[i * 4 + 1] = y;
+                ChartView.cachedOwnerRects[i * 4 + 2] = w;
+                ChartView.cachedOwnerRects[i * 4 + 3] = h;
+                return;
+            }
+        }
+        ChartView.cachedOwnerKeys.Add(key);
+        ChartView.cachedOwners.Add(v);
+        ChartView.cachedOwnerRects.Add(x);
+        ChartView.cachedOwnerRects.Add(y);
+        ChartView.cachedOwnerRects.Add(w);
+        ChartView.cachedOwnerRects.Add(h);
+    }
+
+    static ChartView CachedOwner(ChartOption o, int key, int x, int y,
+                                 int w, int h) {
+        if (ChartView.cachedOwnerKeys != null) {
+            for (int i = 0; i < ChartView.cachedOwnerKeys.Count; i = i + 1) {
+                if (ChartView.cachedOwnerKeys[i] == key) {
+                    ChartView v = ChartView.cachedOwners[i];
+                    if (v != null && !v.disposed) {
+                        ChartView.cachedOwnerRects[i * 4] = x;
+                        ChartView.cachedOwnerRects[i * 4 + 1] = y;
+                        ChartView.cachedOwnerRects[i * 4 + 2] = w;
+                        ChartView.cachedOwnerRects[i * 4 + 3] = h;
+                        return v;
+                    }
+                }
+            }
+        }
+        // 没有可用 owner（首帧即命中、或 owner 已释放）：现建一个
+        // 并登记，事件订阅虽然只能由后续帧补上，但命中层立即生效。
+        ChartView nv = ChartView.Keyed(o, key);
+        ChartView.SetCachedOwner(key, nv, x, y, w, h);
+        return nv;
+    }
+
+    /// 缓存命中帧的事件帧开销等价于 Render 的尾部：注册根命中
+    /// 区、设置 activeEventView，由调用方补画的命中层填
+    /// currentHit，最后统一派发。像素不被触碰——快照已经恢复。
+    void BeginCachedEventFrame(App app, int x, int y, int w, int h) {
+        if (this.disposed) { return; }
+        ChartView.activeEventView = this;
+        this.currentHit = null;
+        if (this.eventHitId < 0) {
+            this.eventHitId = 9700000 + this.wid;
+        }
+        if (this.Status() == "ready") {
+            app.hitTester.RegisterRect(this.eventHitId, x, y, w, h, 0);
+        }
+        this.DispatchPointerEvents(app, x, y, w, h, this.Status());
     }
 
     /// RenderCached 的数据指纹：系列值 + 类型/轴/隐藏、
