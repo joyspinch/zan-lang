@@ -1,0 +1,291 @@
+// Conformance: redirect policy on the byte channels — SendBytesAsync,
+// UploadFileBytesAsync and the two file downloads.
+//
+// The text channel's redirect rules were covered by http_client_redirect.
+// The byte channels previously never followed (or even consistently
+// rejected) 3xx: SendBytesAsync returned the raw 3xx, the upload and
+// download paths wrote or replayed nothing. With an explicit policy they
+// now share one rule set per hop: absolute Location only, CRLF injection
+// rejected, cycle detection, hop limit, sensitive-header stripping on
+// origin change, and a total deadline shared across hops.
+//
+// Covered here, against two loopback servers on different ports:
+// - SendBytesAsync GET follows A -> B and strips Authorization/Cookie;
+// - SendBytesAsync POST on 301 converts to an empty GET (entity dropped);
+// - SendBytesAsync POST on 307 is rejected as unsafe replay;
+// - UploadFileBytesAsync POST on 307 is rejected (multipart not replayable);
+// - DownloadBinaryToFileAsync follows A -> B and writes the final body;
+// - DownloadBinaryToFileAsync with redirects disabled (default policy
+//   redirect count 0) leaves the local file untouched on a 3xx;
+// - DownloadRangeToFileAsync follows and its LocalDownloadError reports
+//   the failure class when the chain ends in a loop;
+// - a CRLF-smuggled Location is rejected on the download path too.
+using System;
+using System.IO;
+using System.Net.External;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Net.Sockets;
+using System.Threading;
+
+class Program {
+    static int PORT_A = 9681;
+    static int PORT_B = 9682;
+    static string seenMethod = "";
+    static int seenBodyLength = -1;
+    static string seenAuthorization = "";
+    static string seenCookie = "";
+    static byte[] payloadA;
+    static byte[] payloadB;
+
+    static string UrlA(string path) {
+        return "http://127.0.0.1:" + Convert.ToString(Program.PORT_A) + path;
+    }
+
+    static string UrlB(string path) {
+        return "http://127.0.0.1:" + Convert.ToString(Program.PORT_B) + path;
+    }
+
+    static HttpResponse RedirectTo(int code, string url) {
+        HttpResponse r = HttpResponse.WithStatus(code, "Redirect", "");
+        r.SetHeader("Location", url);
+        return r;
+    }
+
+    static async HttpResponse HandleA(HttpRequest req) {
+        if (req.path == "/get") {
+            return Program.RedirectTo(302, Program.UrlB("/final"));
+        }
+        if (req.path == "/post301") {
+            return Program.RedirectTo(301, Program.UrlB("/post-final"));
+        }
+        if (req.path == "/post307") {
+            return Program.RedirectTo(307, Program.UrlB("/post-final"));
+        }
+        if (req.path == "/up307") {
+            return Program.RedirectTo(307, Program.UrlB("/up-final"));
+        }
+        if (req.path == "/bin") {
+            return Program.RedirectTo(302, Program.UrlB("/bin-final"));
+        }
+        if (req.path == "/bin-loop") {
+            return Program.RedirectTo(302, Program.UrlA("/bin-loop"));
+        }
+        return HttpResponse.NotFound();
+    }
+
+    static async HttpResponse HandleB(HttpRequest req) {
+        if (req.path == "/final" || req.path == "/bin-final") {
+            Program.seenMethod = req.method;
+            Program.seenBodyLength = req.bodyLength;
+            Program.seenAuthorization = req.GetHeader("Authorization");
+            Program.seenCookie = req.GetHeader("Cookie");
+            if (req.path == "/bin-final") {
+                HttpResponse r = HttpResponse.Bytes(Program.payloadB,
+                    Program.payloadB.Length, "application/octet-stream");
+                return r;
+            }
+            return HttpResponse.Text("final");
+        }
+        if (req.path == "/post-final") {
+            Program.seenMethod = req.method;
+            Program.seenBodyLength = req.bodyLength;
+            return HttpResponse.Text("post-final");
+        }
+        if (req.path == "/up-final") {
+            Program.seenMethod = req.method;
+            return HttpResponse.Text("up-final");
+        }
+        return HttpResponse.NotFound();
+    }
+
+    static ExternalCallPolicy LocalRedirects(int hops) {
+        return ExternalCallPolicy.Default().AllowLocalHttp().Redirects(hops);
+    }
+
+    static bool Has(string text, string needle) {
+        return text != null && text.IndexOf(needle) >= 0;
+    }
+
+    static async int Run() {
+        int fails = 0;
+        Socket.Initialize();
+        HttpServer a = new HttpServer("127.0.0.1", Program.PORT_A);
+        HttpServer b = new HttpServer("127.0.0.1", Program.PORT_B);
+        a.OnRequest(Program.HandleA);
+        b.OnRequest(Program.HandleB);
+        Task.Spawn(a.Start());
+        Task.Spawn(b.Start());
+        await Task.Delay(100);
+
+        Program.payloadA = new byte[8];
+        Program.payloadB = new byte[8];
+        int i = 0;
+        while (i < 8) {
+            Program.payloadA[i] = (byte)(i + 1);
+            Program.payloadB[i] = (byte)(200 + i);
+            i = i + 1;
+        }
+        File.WriteAllBytes("bytes_redirect_a.bin", Program.payloadA);
+        File.WriteAllBytes("bytes_redirect_b.bin", Program.payloadB);
+
+        // 1. SendBytesAsync GET follows and strips sensitive headers.
+        HttpClient bytes = new HttpClient("127.0.0.1", Program.PORT_A);
+        bytes.SetCallPolicy(Program.LocalRedirects(2));
+        bytes.SetHeader("Authorization", "Bearer bytes-secret");
+        bytes.SetHeader("Cookie", "b=secret");
+        HttpResponse r1 = await bytes.SendBytesAsync("GET", "/get", "ignored");
+        if (r1.statusCode != 200 || r1.body != "final") {
+            fails = fails + 1;
+            Console.WriteLine("FAIL bytes-follow " + Convert.ToString(r1.statusCode)
+                + " " + r1.body);
+        }
+        if (Program.seenMethod != "GET" || Program.seenAuthorization.Length != 0
+            || Program.seenCookie.Length != 0) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL bytes-headers m=" + Program.seenMethod
+                + " auth=" + Program.seenAuthorization
+                + " cookie=" + Program.seenCookie);
+        }
+
+        // 2. POST + 301 converts to an empty GET on the byte channel.
+        HttpResponse r2 = await bytes.SendBytesAsync("POST", "/post301",
+            "entity");
+        if (r2.statusCode != 200 || r2.body != "post-final") {
+            fails = fails + 1;
+            Console.WriteLine("FAIL bytes-post301 " + Convert.ToString(r2.statusCode));
+        }
+        if (Program.seenMethod != "GET" || Program.seenBodyLength != 0) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL bytes-post301-replay m=" + Program.seenMethod
+                + " len=" + Convert.ToString(Program.seenBodyLength));
+        }
+
+        // 3. POST + 307 is rejected as unsafe replay.
+        HttpClient post307 = new HttpClient("127.0.0.1", Program.PORT_A);
+        post307.SetCallPolicy(Program.LocalRedirects(1));
+        string post307Err = "";
+        try {
+            HttpResponse _r3 = await post307.SendBytesAsync("POST", "/post307",
+                "entity");
+        } catch (HttpRequestException e3) {
+            post307Err = e3.Message;
+        }
+        if (!Program.Has(post307Err, "unsafe redirect replay")) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL bytes-post307 err=" + post307Err);
+        }
+
+        // 4. Upload + 307 is rejected: multipart cannot be replayed.
+        HttpClient up = new HttpClient("127.0.0.1", Program.PORT_A);
+        up.SetCallPolicy(Program.LocalRedirects(1));
+        string upErr = "";
+        try {
+            HttpResponse _r4 = await up.UploadFileBytesAsync("/up307", "file",
+                "bytes_redirect_a.bin", "a.bin");
+        } catch (HttpRequestException e4) {
+            upErr = e4.Message;
+        }
+        if (!Program.Has(upErr, "unsafe redirect replay")) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL upload-307 err=" + upErr);
+        }
+
+        // 5. Binary download follows and lands the final bytes.
+        HttpClient dl = new HttpClient("127.0.0.1", Program.PORT_A);
+        dl.SetCallPolicy(Program.LocalRedirects(2));
+        File.Delete("bytes_redirect_out.bin");
+        File.Delete("bytes_redirect_prog.txt");
+        long got = await dl.DownloadBinaryToFileAsync("/bin",
+            "bytes_redirect_out.bin", "bytes_redirect_prog.txt");
+        byte[] landed = File.ReadAllBytes("bytes_redirect_out.bin");
+        if (got != 8 || landed.Length != 8 || landed[0] != 200
+            || landed[7] != 207) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL bin-follow got=" + Convert.ToString(got)
+                + " len=" + Convert.ToString(landed.Length));
+        }
+        if (Program.seenMethod != "GET") {
+            fails = fails + 1;
+            Console.WriteLine("FAIL bin-method " + Program.seenMethod);
+        }
+
+        // 6. Without redirects the 3xx is an error and the file is untouched.
+        // (GetSize throws on a missing file, so existence is asserted
+        // with File.Exists — the rejection must not create the file.)
+        HttpClient plain = new HttpClient("127.0.0.1", Program.PORT_A);
+        File.Delete("bytes_redirect_plain.bin");
+        File.Delete("bytes_redirect_plain_prog.txt");
+        long g2 = await plain.DownloadBinaryToFileAsync("/bin",
+            "bytes_redirect_plain.bin", "bytes_redirect_plain_prog.txt");
+        if (g2 != 0 - 1 || File.Exists("bytes_redirect_plain.bin")
+            || !Program.Has(plain.LastDownloadError(), "302")) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL bin-plain got=" + Convert.ToString(g2)
+                + " err=" + plain.LastDownloadError());
+        }
+
+        // 7. A loop is reported instead of spinning.
+        HttpClient loop = new HttpClient("127.0.0.1", Program.PORT_A);
+        loop.SetCallPolicy(Program.LocalRedirects(4));
+        File.Delete("bytes_redirect_loop.bin");
+        long g3 = await loop.DownloadBinaryToFileAsync("/bin-loop",
+            "bytes_redirect_loop.bin", "bytes_redirect_loop_prog.txt");
+        if (g3 != 0 - 1
+            || !Program.Has(loop.LastDownloadError(),
+                "redirect target is invalid or repeated")) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL bin-loop got=" + Convert.ToString(g3)
+                + " err=" + loop.LastDownloadError());
+        }
+
+        // 8. CRLF in Location is rejected. HttpResponse.SetHeader guards
+        // emission, so a server cannot produce the payload end-to-end;
+        // assert the same guard the download path consults.
+        string smuggled = "http://127.0.0.1/x\r\nSet-Cookie: pwn=1";
+        if (!HttpResponse.HasCrlf(smuggled)) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL crlf-guard");
+        }
+
+        // 9. Range download follows too (same Once core).
+        HttpClient rng = new HttpClient("127.0.0.1", Program.PORT_A);
+        rng.SetCallPolicy(Program.LocalRedirects(2));
+        File.Delete("bytes_redirect_rng.bin");
+        File.Delete("bytes_redirect_rng_prog.txt");
+        int g4 = await rng.DownloadRangeToFileAsync("/bin",
+            "bytes_redirect_rng.bin", "bytes_redirect_rng_prog.txt");
+        byte[] rngBytes = File.ReadAllBytes("bytes_redirect_rng.bin");
+        if (g4 != 8 || rngBytes.Length != 8 || rngBytes[3] != 203) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL range-follow got=" + Convert.ToString(g4)
+                + " len=" + Convert.ToString(rngBytes.Length));
+        }
+
+        File.Delete("bytes_redirect_a.bin");
+        File.Delete("bytes_redirect_b.bin");
+        File.Delete("bytes_redirect_out.bin");
+        File.Delete("bytes_redirect_prog.txt");
+        File.Delete("bytes_redirect_plain.bin");
+        File.Delete("bytes_redirect_plain_prog.txt");
+        File.Delete("bytes_redirect_loop.bin");
+        File.Delete("bytes_redirect_loop_prog.txt");
+        File.Delete("bytes_redirect_rng.bin");
+        File.Delete("bytes_redirect_rng_prog.txt");
+
+        a.Stop();
+        b.Stop();
+        for (int w = 0; w < 20; w = w + 1) { await Task.Delay(10); }
+
+        if (fails == 0) {
+            Console.WriteLine("http_bytes_redirect: OK");
+        } else {
+            Console.WriteLine("http_bytes_redirect: FAIL " + fails);
+        }
+        return 0;
+    }
+
+    static async void Main() {
+        int _rc = await Program.Run();
+    }
+}
