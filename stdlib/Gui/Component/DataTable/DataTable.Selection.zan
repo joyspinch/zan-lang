@@ -1,0 +1,216 @@
+using System;
+using System.Json;
+
+namespace Gui.Component.DataTable;
+
+/// 选择粒度。Row 是默认的数据行选择模式；Cell/Range 为后续
+/// 单元格命令保留明确的协议值。
+class SelectionMode {
+    static const int Row = 1;
+    static const int Cell = 2;
+    static const int Range = 3;
+}
+
+/// 基于稳定 RowKey 的选择快照。
+///
+/// 普通模式维护显式选中的业务键；全选模式不物化全集，
+/// 只维护被排除的键。字典按 canonical string 做内容相等判断，
+/// 列表保留确定性的插入顺序用于快照和导出。
+class SelectionModel {
+    int mode;
+    bool allSelected;
+    List<string> explicitKeys;
+    Dict<string, bool> explicitIndex;
+    List<string> excludedKeys;
+    Dict<string, bool> excludedIndex;
+
+    SelectionModel(int selectionMode) {
+        this.mode = selectionMode;
+        if (this.mode != SelectionMode.Row
+            && this.mode != SelectionMode.Cell
+            && this.mode != SelectionMode.Range) {
+            this.mode = SelectionMode.Row;
+        }
+        this.allSelected = false;
+        this.explicitKeys = new List<string>();
+        this.explicitIndex = new Dict<string, bool>();
+        this.excludedKeys = new List<string>();
+        this.excludedIndex = new Dict<string, bool>();
+    }
+
+    static SelectionModel Row() { return new SelectionModel(SelectionMode.Row); }
+    static SelectionModel Cell() { return new SelectionModel(SelectionMode.Cell); }
+    static SelectionModel Range() { return new SelectionModel(SelectionMode.Range); }
+
+    int Mode() { return this.mode; }
+    void SetMode(int selectionMode) {
+        if (selectionMode != SelectionMode.Row
+            && selectionMode != SelectionMode.Cell
+            && selectionMode != SelectionMode.Range) { return; }
+        this.mode = selectionMode;
+    }
+
+    bool AllSelected() { return this.allSelected; }
+    int Count() {
+        if (this.allSelected) { return -1; }
+        return this.explicitKeys.Count;
+    }
+    int ExplicitCount() { return this.explicitKeys.Count; }
+    int ExcludedCount() { return this.excludedKeys.Count; }
+
+    bool ValidKey(string key) { return key != null && key.Length > 0; }
+
+    bool ContainsKey(string key) {
+        if (!this.ValidKey(key)) { return false; }
+        if (this.allSelected) { return !this.excludedIndex.ContainsKey(key); }
+        return this.explicitIndex.ContainsKey(key);
+    }
+
+    bool ExcludedKey(string key) {
+        if (!this.ValidKey(key)) { return false; }
+        return this.excludedIndex.ContainsKey(key);
+    }
+
+    bool AddExplicit(string key) {
+        if (!this.ValidKey(key) || this.explicitIndex.ContainsKey(key)) { return false; }
+        this.explicitIndex.Add(key, true);
+        this.explicitKeys.Add(key);
+        return true;
+    }
+
+    bool RemoveExplicit(string key) {
+        if (!this.ValidKey(key) || !this.explicitIndex.ContainsKey(key)) { return false; }
+        this.explicitIndex.Remove(key);
+        int at = this.explicitKeys.IndexOf(key);
+        if (at >= 0) { this.explicitKeys.RemoveAt(at); }
+        return true;
+    }
+
+    bool AddExcluded(string key) {
+        if (!this.ValidKey(key) || this.excludedIndex.ContainsKey(key)) { return false; }
+        this.excludedIndex.Add(key, true);
+        this.excludedKeys.Add(key);
+        return true;
+    }
+
+    bool RemoveExcluded(string key) {
+        if (!this.ValidKey(key) || !this.excludedIndex.ContainsKey(key)) { return false; }
+        this.excludedIndex.Remove(key);
+        int at = this.excludedKeys.IndexOf(key);
+        if (at >= 0) { this.excludedKeys.RemoveAt(at); }
+        return true;
+    }
+
+    bool SelectKey(string key) {
+        if (!this.ValidKey(key)) { return false; }
+        if (this.allSelected) { return this.RemoveExcluded(key); }
+        return this.AddExplicit(key);
+    }
+
+    bool DeselectKey(string key) {
+        if (!this.ValidKey(key)) { return false; }
+        if (this.allSelected) { return this.AddExcluded(key); }
+        return this.RemoveExplicit(key);
+    }
+
+    bool ToggleKey(string key) {
+        if (this.ContainsKey(key)) { return this.DeselectKey(key); }
+        return this.SelectKey(key);
+    }
+
+    /// 从选择快照中移除已经不存在的业务键。
+    /// 全选模式不新增排除项：删除的行不应在未来重建同键时
+    /// 因历史删除而被错误排除。
+    bool ForgetKey(string key) {
+        if (!this.ValidKey(key)) { return false; }
+        bool changed = false;
+        if (this.explicitIndex.ContainsKey(key)) {
+            this.RemoveExplicit(key);
+            changed = true;
+        }
+        if (this.excludedIndex.ContainsKey(key)) {
+            this.RemoveExcluded(key);
+            changed = true;
+        }
+        return changed;
+    }
+
+    void SelectAll() {
+        this.allSelected = true;
+        this.explicitKeys.Clear();
+        this.explicitIndex.Clear();
+    }
+
+    void Clear() {
+        this.allSelected = false;
+        this.explicitKeys.Clear();
+        this.explicitIndex.Clear();
+        this.excludedKeys.Clear();
+        this.excludedIndex.Clear();
+    }
+
+    List<string> Keys() {
+        List<string> copy = new List<string>();
+        for (int i = 0; i < this.explicitKeys.Count; i = i + 1) {
+            copy.Add(this.explicitKeys[i]);
+        }
+        return copy;
+    }
+
+    List<string> ExcludedKeys() {
+        List<string> copy = new List<string>();
+        for (int i = 0; i < this.excludedKeys.Count; i = i + 1) {
+            copy.Add(this.excludedKeys[i]);
+        }
+        return copy;
+    }
+
+    string ToJson() {
+        JsonValue root = JsonValue.NewObject();
+        root.Put("ver", JsonValue.NewNum("1"));
+        root.Put("mode", JsonValue.NewNum(Convert.ToString(this.mode)));
+        root.Put("all", JsonValue.NewBool(this.allSelected));
+        JsonValue keys = JsonValue.NewArray();
+        for (int i = 0; i < this.explicitKeys.Count; i = i + 1) {
+            keys.Append(JsonValue.NewStr(this.explicitKeys[i]));
+        }
+        root.Put("keys", keys);
+        JsonValue excluded = JsonValue.NewArray();
+        for (int i = 0; i < this.excludedKeys.Count; i = i + 1) {
+            excluded.Append(JsonValue.NewStr(this.excludedKeys[i]));
+        }
+        root.Put("excluded", excluded);
+        return root.ToJson();
+    }
+
+    static SelectionModel FromJson(string text) {
+        if (text == null || text.Length == 0) { return null; }
+        JsonValue root = JsonValue.ParseLenient(text);
+        if (root == null || !root.IsObject()) { return null; }
+        int mode = root.Int("mode", SelectionMode.Row);
+        SelectionModel result = new SelectionModel(mode);
+        result.allSelected = root.Bool("all", false);
+        JsonValue keys = root.Get("keys");
+        if (keys != null && keys.IsArray()) {
+            for (int i = 0; i < keys.Count(); i = i + 1) {
+                string key = keys.At(i).AsString("");
+                result.AddExplicit(key);
+            }
+        }
+        JsonValue excluded = root.Get("excluded");
+        if (excluded != null && excluded.IsArray()) {
+            for (int i = 0; i < excluded.Count(); i = i + 1) {
+                string key = excluded.At(i).AsString("");
+                result.AddExcluded(key);
+            }
+        }
+        if (result.allSelected) {
+            result.explicitKeys.Clear();
+            result.explicitIndex.Clear();
+        } else {
+            result.excludedKeys.Clear();
+            result.excludedIndex.Clear();
+        }
+        return result;
+    }
+}

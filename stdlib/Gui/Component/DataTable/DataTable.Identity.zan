@@ -154,4 +154,81 @@ partial class DataTable {
     static int DataRevision(DataTableState st) { return st.dataRevision; }
     static int QueryRevision(DataTableState st) { return st.queryRevision; }
     static int ViewRevision(DataTableState st) { return st.viewRevision; }
+
+    /// 当前稳定键选择模型。旧 source-index selected 仍作为渲染兼容投影。
+    static SelectionModel Selection(DataTableState st) {
+        if (st.selectionModel == null) { st.selectionModel = SelectionModel.Row(); }
+        return st.selectionModel;
+    }
+
+    /// 安装 key selection 模型。安装时不立即假定旧 bool 的含义，
+    /// 首次 SyncSelectionModel 会把当前兼容选择投影进稳定键集合。
+    static void SetSelectionModel(DataTableState st, SelectionModel model) {
+        if (st == null) { return; }
+        if (model == null) { model = SelectionModel.Row(); }
+        st.selectionModel = model;
+        st.selectionModelAuthoritative = false;
+    }
+
+    static bool HasStableKey(DataSource src, int row) {
+        if (src == null || row < 0 || row >= src.RowCount()) { return false; }
+        RowKey key = src.GetRowKey(row);
+        return key != null && !key.IsTemporary() && key.Canonical().Length > 0;
+    }
+
+    /// 将 stable-key 模型投影到旧 selected 数组；无稳定键的兼容源
+    /// 保留原有 bool 选择语义，不把 legacy key 误当持久身份。
+    static void SyncSelectionModel(DataTableState st, DataSource src) {
+        if (st == null || src == null || st.selectionModel == null) { return; }
+        bool anyStable = false;
+        for (int row = 0; row < src.RowCount(); row = row + 1) {
+            if (DataTable.HasStableKey(src, row)) { anyStable = true; row = src.RowCount(); }
+        }
+        if (!anyStable) { return; }
+        while (st.selected.Count < src.RowCount()) { st.selected.Add(false); }
+        if (!st.selectionModelAuthoritative) {
+            st.selectionModel.Clear();
+            for (int row = 0; row < src.RowCount(); row = row + 1) {
+                RowKey key = src.GetRowKey(row);
+                if (st.selected[row] && key != null && !key.IsTemporary()
+                    && key.Canonical().Length > 0) {
+                    st.selectionModel.SelectKey(key.Canonical());
+                }
+            }
+            st.selectionModelAuthoritative = true;
+        }
+        for (int row = 0; row < src.RowCount(); row = row + 1) {
+            RowKey key = src.GetRowKey(row);
+            bool selected = false;
+            if (key != null && !key.IsTemporary()) {
+                selected = st.selectionModel.ContainsKey(key.Canonical());
+            }
+            st.selected[row] = selected;
+        }
+    }
+
+    static bool IsSelected(DataTableState st, DataSource src, int row) {
+        if (st == null || src == null || row < 0 || row >= src.RowCount()) { return false; }
+        RowKey key = src.GetRowKey(row);
+        if (key != null && !key.IsTemporary() && key.Canonical().Length > 0
+            && st.selectionModel != null) {
+            return st.selectionModel.ContainsKey(key.Canonical());
+        }
+        return row < st.selected.Count && st.selected[row];
+    }
+
+    static void SetSelected(DataTableState st, DataSource src, int row, bool value) {
+        if (st == null || src == null || row < 0 || row >= src.RowCount()) { return; }
+        while (st.selected.Count < src.RowCount()) { st.selected.Add(false); }
+        RowKey key = src.GetRowKey(row);
+        if (key != null && !key.IsTemporary() && key.Canonical().Length > 0
+            && st.selectionModel != null) {
+            if (value) { st.selectionModel.SelectKey(key.Canonical()); }
+            else { st.selectionModel.DeselectKey(key.Canonical()); }
+            st.selectionModelAuthoritative = true;
+            st.selected[row] = value;
+            return;
+        }
+        st.selected[row] = value;
+    }
 }

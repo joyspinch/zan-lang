@@ -104,10 +104,10 @@ partial class DataTable {
         // 否则：选中的行；未勾选任何行时用整个视图
         bool anySel = false;
         int s = 0;
-        while (s < st.order.Count) { if (st.selected[st.order[s]]) { anySel = true; s = st.order.Count; } else { s = s + 1; } }
+        while (s < st.order.Count) { if (DataTable.IsSelected(st, src, st.order[s])) { anySel = true; s = st.order.Count; } else { s = s + 1; } }
         for (int oi = 0; oi < st.order.Count; oi = oi + 1) {
             int ri = st.order[oi];
-            if (!anySel || st.selected[ri]) {
+            if (!anySel || DataTable.IsSelected(st, src, ri)) {
                 string line = "";
                 int cc = c0;
                 while (cc <= c1) {
@@ -123,21 +123,44 @@ partial class DataTable {
         return outp;
     }
 
-    static void SelectAllRows(DataTableState st, bool val) {
-        for (int k = 0; k < st.order.Count; k = k + 1) { st.selected[st.order[k]] = val; }
+    /// 按当前显示顺序全选/反选。稳定键源走 SelectionModel
+    /// （全选不物化 bool[N]，只置 allSelected 或排除集合），
+    /// 兼容 keyless 源保持旧 bool 行为。
+    static void SelectAllRows(DataTableState st, DataSource src, bool val) {
+        if (src != null && st.selectionModel != null) {
+            bool stable = false;
+            for (int k = 0; k < st.order.Count; k = k + 1) {
+                if (DataTable.HasStableKey(src, st.order[k])) {
+                    stable = true;
+                    k = st.order.Count;
+                }
+            }
+            if (stable) {
+                if (val) { st.selectionModel.SelectAll(); }
+                else { st.selectionModel.Clear(); }
+                DataTable.SyncSelectionModel(st, src);
+                return;
+            }
+        }
+        for (int k = 0; k < st.order.Count; k = k + 1) {
+            int row = st.order[k];
+            st.selected[row] = val;
+        }
     }
 
     /// 把 `a`..`b`（顺序位置，可反向）之间的数据行设为唯一选中集合。
     /// 行号列上的拖动多选与 Shift 点击都走这里。
-    static void SelectRowSpan(DataTableState st, int a, int b) {
+    static void SelectRowSpan(DataTableState st, DataSource src, int a, int b) {
         if (a < 0) { a = b; }
         int lo = DataTable.MinI(a, b);
         int hi = DataTable.MaxI(a, b);
-        DataTable.SelectAllRows(st, false);
+        DataTable.SelectAllRows(st, src, false);
         int k = lo;
         while (k <= hi) {
             if (k >= 0 && k < DataTable.DispCount(st) && DataTable.DispKind(st, k) == 0) {
-                st.selected[DataTable.DispRowOf(st, k)] = true;
+                int row = DataTable.DispRowOf(st, k);
+                if (src != null) { DataTable.SetSelected(st, src, row, true); }
+                else { st.selected[row] = true; }
             }
             k = k + 1;
         }
@@ -145,7 +168,7 @@ partial class DataTable {
 
     /// 行号列上的按行选择：Shift 连续扩展、Ctrl 增删、
     /// 其余情况单选并把锚点落在该行。
-    static void PickRow(DataTableState st, int oi, int mods) {
+    static void PickRow(DataTableState st, DataSource src, int oi, int mods) {
         if (oi < 0 || DataTable.DispKind(st, oi) != 0) { return; }
         int ri = DataTable.DispRowOf(st, oi);
         st.hitOrder = oi;
@@ -155,13 +178,18 @@ partial class DataTable {
         bool shift = (mods & 2) != 0;
         bool ctrl = (mods & 1) != 0;
         if (shift && st.selAnchor >= 0) {
-            DataTable.SelectRowSpan(st, st.selAnchor, oi);
+            DataTable.SelectRowSpan(st, src, st.selAnchor, oi);
         } else if (ctrl) {
-            st.selected[ri] = !st.selected[ri];
+            bool selected = false;
+            if (src != null) { selected = DataTable.IsSelected(st, src, ri); }
+            else { selected = st.selected[ri]; }
+            if (src != null) { DataTable.SetSelected(st, src, ri, !selected); }
+            else { st.selected[ri] = !selected; }
             st.selAnchor = oi;
         } else {
-            DataTable.SelectAllRows(st, false);
-            st.selected[ri] = true;
+            DataTable.SelectAllRows(st, src, false);
+            if (src != null) { DataTable.SetSelected(st, src, ri, true); }
+            else { st.selected[ri] = true; }
             st.selAnchor = oi;
             DataTable.ClearRange(st);
         }
@@ -180,7 +208,14 @@ partial class DataTable {
     /// 独占选中单个源行（清除其他所有选择）。
     /// row < 0 或越界会清除选择。当模型侧变化时，
     /// 由 `selection` 绑定使用。
-    static void SetPrimarySelected(DataTableState st, int row) {
+    static void SetPrimarySelected(DataTableState st, DataSource src, int row) {
+        if (src != null) {
+            DataTable.SelectAllRows(st, src, false);
+            if (row >= 0 && row < src.RowCount()) {
+                DataTable.SetSelected(st, src, row, true);
+            }
+            return;
+        }
         for (int i = 0; i < st.selected.Count; i = i + 1) { st.selected[i] = false; }
         if (row >= 0 && row < st.selected.Count) { st.selected[row] = true; }
     }
@@ -189,13 +224,13 @@ partial class DataTable {
     /// 对账一次。与 Select 类似，上次同步后变化的一侧
     /// 胜出，因此编辑双向流动：model -> table 与 table -> model。
     /// 在 RenderSource 开头、选择列表定好大小之后调用。
-    static void SyncBindings(DataTableState st) {
+    static void SyncBindings(DataTableState st, DataSource src) {
         if (st.selection != null) {
             int cur = DataTable.PrimarySelected(st);
             int b = st.selection.Get();
             if (cur == b) { st.lastSelSync = cur; }
             else if (cur != st.lastSelSync) { st.selection.Set(cur); st.lastSelSync = cur; }
-            else { DataTable.SetPrimarySelected(st, b); st.lastSelSync = b; }
+            else { DataTable.SetPrimarySelected(st, src, b); st.lastSelSync = b; }
         }
         if (st.page != null) {
             int m = st.pageModel.Get();
@@ -284,7 +319,7 @@ partial class DataTable {
     /// 选择，不是区域选择；勾选框自己的点击也不受影响。
     /// `st.rangeSelTouched` 只记录本手势勾过的行，
     /// 松手或重按即清空，绝不会退掉用户此前手动勾的行。
-    static void SyncRangeChecks(DataTableState st) {
+    static void SyncRangeChecks(DataTableState st, DataSource src) {
         if (!st.showSelect) { return; }
         int rLo = -1;
         int rHi = -1;
@@ -303,8 +338,9 @@ partial class DataTable {
                           && DataTable.DispKind(st, slot) == 0;
             if (!inside) {
                 int ri = DataTable.DispRowOf(st, slot);
-                if (ri >= 0 && ri < st.selected.Count && st.selected[ri]) {
-                    st.selected[ri] = false;
+                if (ri >= 0 && ri < st.selected.Count
+                    && DataTable.IsSelected(st, src, ri)) {
+                    DataTable.SetSelected(st, src, ri, false);
                     changed = true;
                 }
                 st.rangeSelTouched.RemoveAt(ti);
@@ -317,8 +353,8 @@ partial class DataTable {
             while (k <= rHi) {
                 if (k >= 0 && k < DataTable.DispCount(st) && DataTable.DispKind(st, k) == 0) {
                     int ri = DataTable.DispRowOf(st, k);
-                    if (!st.selected[ri]) {
-                        st.selected[ri] = true;
+                    if (!DataTable.IsSelected(st, src, ri)) {
+                        DataTable.SetSelected(st, src, ri, true);
                         st.rangeSelTouched.Add(k);
                         changed = true;
                     }
@@ -480,7 +516,7 @@ partial class DataTable {
     /// 将单元格光标移到显示槽位 `oi`、列 `col`。`extend` 从锚点
     /// 扩展当前范围，而不是收缩为单个单元格。
     /// 目标不是可导航单元格时返回 false。
-    static bool MoveCursor(DataTableState st, int oi, int col, bool extend) {
+    static bool MoveCursor(DataTableState st, DataSource src, int oi, int col, bool extend) {
         if (oi < 0 || oi >= DataTable.DispCount(st)) { return false; }
         if (DataTable.DispKind(st, oi) != 0) { return false; }
         if (col < 0) { return false; }
@@ -498,7 +534,7 @@ partial class DataTable {
             st.rangeC1 = col;
             // 键盘 Shift 扩展与鼠标区域拖选同一语义：
             // 选择列的勾选框实时跟随范围行集。
-            DataTable.SyncRangeChecks(st);
+            DataTable.SyncRangeChecks(st, src);
         } else {
             st.rangeR0 = oi;
             st.rangeR1 = oi;

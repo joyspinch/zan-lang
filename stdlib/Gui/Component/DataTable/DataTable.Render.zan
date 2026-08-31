@@ -400,7 +400,7 @@ partial class DataTable {
         if (src.HasMore() && src.RowCount() == 0) { src.RequestBlock(0); }
 
         DataTable.EnsureInit(st, cols, src);
-        DataTable.SyncBindings(st);
+        DataTable.SyncBindings(st, src);
         DataTable.Recompute(st, cols, src);
 
         int titleRowH = t.heightMedium;
@@ -662,7 +662,7 @@ partial class DataTable {
             bool allChecked = st.order.Count > 0;
             int oi = 0;
             while (oi < st.order.Count) {
-                if (!st.selected[st.order[oi]]) { allChecked = false; oi = st.order.Count; } else { oi = oi + 1; }
+                if (!DataTable.IsSelected(st, src, st.order[oi])) { allChecked = false; oi = st.order.Count; } else { oi = oi + 1; }
             }
             int box = app.Scale(16);
             int bx = hx + (selW - box) / 2;
@@ -673,7 +673,7 @@ partial class DataTable {
             app.hitTester.RegisterRect(allId, hx, y, selW, headerH, 0);
             if (app.EventKind() == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == allId) {
                 bool target = !allChecked;
-                for (int k = 0; k < st.order.Count; k = k + 1) { st.selected[st.order[k]] = target; }
+                DataTable.SelectAllRows(st, src, target);
                 st.SelectionChanged.Raise();
                 app.RequestRedraw();
             }
@@ -1273,7 +1273,7 @@ partial class DataTable {
             int rowId = app.focus.AllocId();
             app.hitTester.RegisterRect(rowId, x, ry, viewW, rowH, 0);
             bool rHover = app.focus.IsHovered(rowId);
-            bool rSel = st.selected[rowIdx];
+            bool rSel = DataTable.IsSelected(st, src, rowIdx);
 
             int stripeBg = sRow.BgOr(0);
             if (st.striped && (DataTable.DispNo(st, oiRow) % 2 == 0)) { stripeBg = sRowStriped.BgOr(0); }
@@ -1356,7 +1356,7 @@ partial class DataTable {
                 int selId = app.focus.AllocId();
                 app.hitTester.RegisterRect(selId, cx2, ry, selW, rowH, 0);
                 if (app.EventKind() == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == selId) {
-                    st.selected[rowIdx] = !rSel;
+                    DataTable.SetSelected(st, src, rowIdx, !rSel);
                     st.hitRow = rowIdx;
                     st.SelectionChanged.Raise();
                     app.RequestRedraw();
@@ -1811,7 +1811,7 @@ partial class DataTable {
             } else if (app.mouseX >= x && app.mouseX < x + numW && !st.rowGripDrag) {
                 // 行号按下：选中该行并开始多选拖选（重排只能
                 // 从行号右侧的专用手柄发起，已在上面处理）。
-                DataTable.PickRow(st, ptrOi, emods);
+                DataTable.PickRow(st, src, ptrOi, emods);
                 st.rowSelDrag = true;
                 app.RequestRedraw();
             } else if (app.mouseX >= firstDataX && ptrCol >= 0) {
@@ -1851,7 +1851,7 @@ partial class DataTable {
         if (ek == 1) {
             // 行号列上拖动：从锚点到当前行连续选中（多选）
             if (st.rowSelDrag && ptrOi >= 0 && DataTable.DispKind(st, ptrOi) == 0) {
-                DataTable.SelectRowSpan(st, st.selAnchor, ptrOi);
+                DataTable.SelectRowSpan(st, src, st.selAnchor, ptrOi);
                 st.hitOrder = ptrOi;
                 st.hitRow = DataTable.DispRowOf(st, ptrOi);
                 st.SelectionChanged.Raise();
@@ -1862,7 +1862,7 @@ partial class DataTable {
                 if (ptrCol >= 0) { st.rangeC1 = ptrCol; }
                 // 选择列表格：高亮矩形覆盖到哪几行，
                 // 勾选框就勾到哪几行（范围缩小时实时退勾）。
-                DataTable.SyncRangeChecks(st);
+                DataTable.SyncRangeChecks(st, src);
                 app.RequestRedraw();
             }
             if (st.dragRow >= 0) {
@@ -1887,7 +1887,7 @@ partial class DataTable {
                     app.RequestRedraw();
                 } else if (!st.dragMoved && DataTable.DispKind(st, st.dragRow) == 0) {
                     // 手柄上没拖动就松手：当作按行选择的点击
-                    DataTable.PickRow(st, st.dragRow, emods);
+                    DataTable.PickRow(st, src, st.dragRow, emods);
                     app.RequestRedraw();
                 }
                 st.dragRow = -1;
@@ -1911,9 +1911,9 @@ partial class DataTable {
             // 就选中该行，让菜单的复制/导出有对象可用。
             if (ptrOi >= 0 && DataTable.DispKind(st, ptrOi) == 0 && !DataTable.HasRange(st)) {
                 int ri = DataTable.DispRowOf(st, ptrOi);
-                if (!st.selected[ri]) {
-                    DataTable.SelectAllRows(st, false);
-                    st.selected[ri] = true;
+                if (!DataTable.IsSelected(st, src, ri)) {
+                    DataTable.SelectAllRows(st, src, false);
+                    DataTable.SetSelected(st, src, ri, true);
                     st.selAnchor = ptrOi;
                 }
             }
@@ -2016,7 +2016,8 @@ partial class DataTable {
             string rowInfo = "行数: " + Convert.ToString(shownRows);
             if (shownRows != totalSrc) { rowInfo = rowInfo + " / " + Convert.ToString(totalSrc); }
             int selCount = 0;
-            for (int sci = 0; sci < st.selected.Count; sci = sci + 1) { if (st.selected[sci]) { selCount = selCount + 1; } }
+            if (st.selectionModel != null && st.selectionModel.AllSelected()) { selCount = -1; }
+            else { for (int sci = 0; sci < st.selected.Count; sci = sci + 1) { if (st.selected[sci]) { selCount = selCount + 1; } } }
             if (selCount > 0) { rowInfo = rowInfo + "    已选: " + Convert.ToString(selCount); }
             c.DrawText(x + t.paddingMedium, sbTy, rowInfo, sFooter.FgOr(0), sbFs);
 

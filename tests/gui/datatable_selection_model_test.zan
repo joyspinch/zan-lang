@@ -1,0 +1,106 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Widget;
+
+namespace DataTableSelectionModelTest;
+
+class KeySource : DataSource {
+    List<DataRow> rows;
+
+    KeySource(List<DataRow> values) { this.rows = values; }
+    override int RowCount() { return this.rows.Count; }
+    override string CellText(int row, int col) { return this.rows[row].At(col); }
+    override RowKey GetRowKey(int row) { return RowKey.Of(this.rows[row].At(0)); }
+}
+
+class Program {
+    static DataRow Row(string key, string value) {
+        DataRow row = new DataRow();
+        row.Push(key);
+        row.Push(value);
+        return row;
+    }
+
+    static void Main() {
+        SelectionModel model = SelectionModel.Row();
+        Console.WriteLine("initial=" + (model.Mode() == SelectionMode.Row
+            && !model.AllSelected() && model.Count() == 0
+            && model.ExplicitCount() == 0 && model.ExcludedCount() == 0));
+        Console.WriteLine("select=" + model.SelectKey("order:1"));
+        Console.WriteLine("duplicate=" + (!model.SelectKey("order:1")
+            && model.Count() == 1));
+        Console.WriteLine("toggle=" + (model.ToggleKey("order:1")
+            && !model.ContainsKey("order:1") && model.Count() == 0));
+        Console.WriteLine("invalid=" + (!model.SelectKey("") && !model.SelectKey(null)));
+
+        model.SelectKey("order:1");
+        model.SelectKey("order:2");
+        List<string> keys = model.Keys();
+        keys.Clear();
+        Console.WriteLine("snapshot=" + (model.Count() == 2 && model.Keys().Count == 2));
+        model.Clear();
+        model.SelectAll();
+        Console.WriteLine("selectAll=" + (model.AllSelected()
+            && model.Count() == -1 && model.ExplicitCount() == 0));
+        Console.WriteLine("exclude=" + (model.DeselectKey("order:2")
+            && model.ExcludedKey("order:2") && !model.ContainsKey("order:2")
+            && model.ContainsKey("order:1") && model.ExcludedCount() == 1));
+        Console.WriteLine("include=" + (model.SelectKey("order:2")
+            && !model.ExcludedKey("order:2") && model.ContainsKey("order:2")
+            && model.ExcludedCount() == 0));
+
+        model.SetMode(SelectionMode.Range);
+        Console.WriteLine("mode=" + (model.Mode() == SelectionMode.Range));
+        model.SetMode(99);
+        Console.WriteLine("invalidMode=" + (model.Mode() == SelectionMode.Range));
+
+        SelectionModel escaped = SelectionModel.Row();
+        escaped.SelectKey("quote:\"\\中");
+        JsonValue json = JsonValue.ParseLenient(escaped.ToJson());
+        JsonValue jsonKeys = null;
+        if (json != null) { jsonKeys = json.Get("keys"); }
+        SelectionModel roundTrip = SelectionModel.FromJson(escaped.ToJson());
+        Console.WriteLine("json=" + (json != null && json.IsObject()
+            && json.Int("ver", 0) == 1 && jsonKeys != null
+            && jsonKeys.Count() == 1 && roundTrip != null
+            && roundTrip.ContainsKey("quote:\"\\中")));
+
+        SelectionModel allRound = SelectionModel.Row();
+        allRound.SelectAll();
+        allRound.DeselectKey("order:9");
+        SelectionModel allCopy = SelectionModel.FromJson(allRound.ToJson());
+        Console.WriteLine("allJson=" + (allCopy != null && allCopy.AllSelected()
+            && allCopy.ContainsKey("order:8") && !allCopy.ContainsKey("order:9")
+            && allCopy.ExcludedCount() == 1));
+        RowKey legacy = RowKey.Legacy(3);
+        Console.WriteLine("temporary=" + (legacy.IsTemporary()
+            && !RowKey.Of("order:3").IsTemporary()));
+
+        List<DataRow> rows = new List<DataRow>();
+        rows.Add(Row("a", "Alpha"));
+        rows.Add(Row("b", "Beta"));
+        rows.Add(Row("c", "Gamma"));
+        KeySource source = new KeySource(rows);
+        DataTableState st = new DataTableState();
+        st.selected.Add(false);
+        st.selected.Add(true);
+        st.selected.Add(false);
+        DataTable.EnsureInit(st, new List<DataColumn>(), source);
+        SelectionModel installed = DataTable.Selection(st);
+        Console.WriteLine("projectionImport=" + (installed.ContainsKey("b")
+            && DataTable.IsSelected(st, source, 1) && st.selected[1]));
+        rows.Reverse();
+        DataTable.Refresh(st, source);
+        DataTable.SyncSelectionModel(st, source);
+        Console.WriteLine("projectionReorder=" + (source.GetRowKey(0).Canonical() == "c"
+            && DataTable.IsSelected(st, source, 1)
+            && st.selected[1] && !st.selected[0]));
+        DataTable.SetSelected(st, source, 0, true);
+        Console.WriteLine("setSelected=" + (installed.ContainsKey("c")
+            && DataTable.IsSelected(st, source, 0)));
+        DataTable.SetSelected(st, source, 0, false);
+        Console.WriteLine("clearSelected=" + (!installed.ContainsKey("c")
+            && !DataTable.IsSelected(st, source, 0)));
+    }
+}

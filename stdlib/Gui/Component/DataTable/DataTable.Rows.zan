@@ -80,6 +80,9 @@ partial class DataTable {
             DataTable.RebuildRowKeys(st, src);
             DataTable.PruneExpandedKeys(st, src);
         }
+        // 稳定键源：把旧 bool 选择投影进 SelectionModel（首次），
+        // 之后反向投影回来——同 key 重排/过滤不丢选择。
+        DataTable.SyncSelectionModel(st, src);
     }
 
     // ---------- 行添加/删除 + 撤销 ----------
@@ -197,8 +200,14 @@ partial class DataTable {
         // 在源丢弃行之前快照——RemoveRow 之后单元格
         // 已不存在，这是让删除可撤销的唯一机会。
         List<string> cells = DataTable.RowCells(src, cols, at);
+        RowKey deletedKey = DataTable.RowKeyAt(st, src, at);
         if (!src.RemoveRow(at)) { return false; }
 
+        // 已删除的业务键从选择模型中移除；全选模式不新增排除项
+        // （删除的行不应在未来同键行上复活为排除状态）。
+        if (deletedKey != null && st.selectionModel != null) {
+            st.selectionModel.ForgetKey(deletedKey.Canonical());
+        }
         DataTable.ShiftExpandedOnDelete(st, at);
         if (at < st.selected.Count) { st.selected.RemoveAt(at); }
         DataTable.InvalidateData(st);
@@ -226,9 +235,9 @@ partial class DataTable {
     static int DeleteSelectedRows(DataTableState st, List<DataColumn> cols, DataSource src) {
         DataTable.BeginUndoGroup(st);
         int gone = 0;
-        int i = st.selected.Count - 1;
+        int i = src.RowCount() - 1;
         while (i >= 0) {
-            if (i < src.RowCount() && st.selected[i]) {
+            if (i < st.selected.Count && DataTable.IsSelected(st, src, i)) {
                 if (DataTable.DeleteRow(st, cols, src, i)) { gone = gone + 1; }
             }
             i = i - 1;
