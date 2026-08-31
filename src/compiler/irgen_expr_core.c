@@ -1921,6 +1921,10 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         if (ot && type_named(ot, "Dict", 4) &&
             ot->type_arg_count == 2)
             return ot->type_args[1];
+        /* string[i] yields a `char` (the checker types it char too). Losing
+         * the type here made `s + s[i]` format the byte code in decimal and
+         * broke every hand-rolled split/parse loop built on it. */
+        if (ot && ot->kind == TYPE_STRING) return g->binder->type_char;
         return container_elem_type(ot);
     }
     case AST_CALL: {
