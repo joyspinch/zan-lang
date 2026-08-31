@@ -44,7 +44,16 @@ class Snd {
 // 主题配色(深紫黑基调 + 矿色高亮)
 class Th {
     public static int BG() { return 0; }
+    // 石板九宫格纹理(panel_nine.png,3x3 满铺 cell=320,纹理圆角约 95px),
+    // MinerApp.Create 时注入;缺失时回退矢量面板。
+    public static SdlTexture texPanel;
     public static void Panel(SdlRenderer r, int x, int y, int w, int h) {
+        if (Th.texPanel != null && Th.texPanel.IsValid()) {
+            // 源角块 101px(完整覆盖 95px 圆角 + 25px 金线 + 铆钉)缩到显示
+            // 16px,圆角约 15px、金线约 4px;矮面板由 NineImg 收紧 k 兜底。
+            MinerApp.NineImg(r, Th.texPanel, 960, 960, 101, 16, x, y, w, h);
+            return;
+        }
         Draw.RoundRectStroke(r, x, y, w, h, 14, 1, 255, 255, 255, 26);
         Draw.RoundRectFill(r, x, y, w, h, 14, 26, 28, 44, 232);
         Draw.RoundRectFill(r, x + 2, y + 2, w - 4, h / 4, 12, 255, 255, 255, 12);
@@ -71,6 +80,7 @@ class MinerApp {
     public int mouseY;
     public bool mouseDown;
     public long now;             // SDL ticks ms
+    public long lastStepAt;      // Step() 上次执行的墙钟(真实 dt 用)
     public double simAccum;
 
     // UI 状态
@@ -80,10 +90,111 @@ class MinerApp {
     public int selRelic;
     public double offlineGain;   // >0 时开场弹离线结算
     public string offlineText;
+    // 启动画面:加载纹理前先画 splash,纹理就绪后淡出进主界面
+    public long splashBorn;      // splash 出现时刻(SDL ticks ms)
+    public int splashMin = 1400; // 最短展示 ms(点击/按键可提前)
+    public long splashStage;     // 0=画 splash 1=已结束
     public SdlTexture bg;        // 烘焙背景(渐变+星点)
+    public SdlTexture texBg;       // 生图背景(assets 缺失回退烘焙)
+    public SdlTexture texMobNormal; // 怪物立绘
+    public SdlTexture texMobBoss;   // 首领立绘
+    public SdlTexture[] texIcon;    // 5 枚货币图标
+    public SdlTexture[] texCrew;    // 6 类矿工圆徽(矿队页+矿井页矿工行)
+    public SdlTexture[] texTab;     // 4 枚页签图标(矿井/矿队/深渊/设置)
+    public SdlTexture texRelic;     // 圣物按钮图标
+    public SdlTexture texForge;     // 锻造台图标
+    public SdlTexture texPrestige;  // 轮回图标
+    // UI 板材质(全部缺图时回退矢量面板/条)
+    public SdlTexture texBanner;    // 事件金边横幅
+    public SdlTexture texBtnGold;   // 金色大按钮底
+    public SdlTexture texBtnDark;   // 常规按钮底
+    public SdlTexture texBtnDarkHi; // 悬停按钮底(增亮变体)
+    public SdlTexture texBtnGoldHi; // 悬停金钮底(增亮变体)
+    public SdlTexture texBarTrough; // 血条槽
+    public SdlTexture texBarFill;   // 血条填充
+    public SdlTexture texRowStone;  // 列表行石条
+    public SdlTexture texSplashBg;  // 启动画面背景
+    public SdlTexture texTitlePlate;// 启动画面标题铭牌
+    public SdlTexture texLoadBar;   // 启动画面加载条
+    public SdlTexture texChrome;    // 标题栏石板条
+    public SdlTexture texWinGlyphs; // 最小化/最大化/关闭 字形图(384x128 三格)
+    public SdlTexture texSocket;    // 星盘空槽(圆形凹座)
+    public SdlTexture texGem;       // 白宝石(可染色:星盘点亮/圣物品质球)
 
     public static int W() { return 1280; }
     public static int H() { return 720; }
+
+    // 加载 assets 下的图片纹理;缺失或解码失败返回 null,调用方走矢量回退。
+    static SdlTexture LoadTex(SdlRenderer r, string path) {
+        string p = Assets.Find(path);
+        if (!File.Exists(p)) { return null; }
+        SdlTexture t = SdlTexture.LoadImage(r, p);
+        if (t == null || !t.IsValid()) { return null; }
+        t.SetNearest(false);
+        t.SetBlendMode(1);
+        return t;
+    }
+
+    // ---- 九宫格绘制(源为 3x3 满铺格子,四角含圆角+金饰实块) ----
+    // 语义与 GameKit Draw.RoundTex 一致:角块 1:1(源角块整块缩到 k 显示
+    // px,金线/圆角/铆钉比例不变形),边与中心从边/心线取样拉伸。矮面板
+    // 自动收紧 k,防止角块重叠。
+    static void NineImg(SdlRenderer r, SdlTexture tex, int tw, int th, int cell,
+                        int k, int x, int y, int w, int h) {
+        if (w <= 0 || h <= 0) { return; }
+        int maxK = w / 2; if (maxK > h / 2) { maxK = h / 2; }
+        if (maxK > cell) { maxK = cell; }
+        if (k > maxK) { k = maxK; }
+        if (k < 2) { k = 2; }
+        int c2 = cell / 2;
+        int mx = x + k; int my = y + k;
+        int mw = w - k * 2; int mh = h - k * 2;
+        int cx0 = cell - k;    // 右/下角块源起点
+        // 中心
+        if (mw > 0 && mh > 0) {
+            r.DrawTextureRegion(tex, c2 - 1, c2 - 1, 2, 2, mx, my, mw, mh);
+        }
+        // 上/下边、左/右边(源取边中线 1px 拉伸,只取净区不串角饰)
+        if (mw > 0) {
+            r.DrawTextureRegion(tex, c2 - 1, c2, 2, 1, mx, y, mw, k);
+            r.DrawTextureRegion(tex, c2 - 1, cell - c2 - 1, 2, 1, mx, y + h - k, mw, k);
+        }
+        if (mh > 0) {
+            r.DrawTextureRegion(tex, c2, c2 - 1, 1, 2, x, my, k, mh);
+            r.DrawTextureRegion(tex, cell - c2 - 1, c2 - 1, 1, 2, x + w - k, my, k, mh);
+        }
+        // 四角:源角块(含圆角+金饰)1:1 缩到 k
+        r.DrawTextureRegion(tex, 0, 0, k, k, x, y, k, k);
+        r.DrawTextureRegion(tex, cx0, 0, k, k, x + w - k, y, k, k);
+        r.DrawTextureRegion(tex, 0, cx0, k, k, x, y + h - k, k, k);
+        r.DrawTextureRegion(tex, cx0, cx0, k, k, x + w - k, y + h - k, k, k);
+        _ = tw; _ = th;
+    }
+
+    // 槽+比例填充条(血条/进度条通用):槽整绘,填充按 p 从左截源宽。
+    // 缺纹理回退 false,调用方走矢量。
+    static bool DrawTrough(SdlRenderer r, SdlTexture trough, SdlTexture fill,
+                           int x, int y, int w, int h, double p) {
+        return MinerApp.DrawTroughSrc(r, trough, 768, 96, fill, x, y, w, h, p);
+    }
+
+    // 变长版:trough 源宽任意(如 load_bar 1024x72),填充按 p 截同宽源。
+    static bool DrawTroughSrc(SdlRenderer r, SdlTexture trough, int tsw, int tsh,
+                              SdlTexture fill, int x, int y, int w, int h, double p) {
+        if (trough == null || !trough.IsValid() || fill == null || !fill.IsValid()) {
+            return false;
+        }
+        if (p < 0) { p = 0; }
+        if (p > 1) { p = 1; }
+        r.DrawTexture(trough, x, y, w, h);
+        int fw = (int)(w * p);
+        if (fw > 0) {
+            int sw = (int)(tsw * p);
+            if (sw < 1) { sw = 1; }
+            r.DrawTextureRegion(fill, 0, 0, sw, tsh, x, y, fw, h);
+        }
+        return true;
+    }
 
     // ---- 布局常量(复用点击区与绘制) ----
     // 左列 x=24..856, 右列 x=880..1256
@@ -104,6 +215,44 @@ class MinerApp {
         a.selRelic = 0;
         a.offlineText = "";
         a.snd = Snd.Create(true);
+        // 石板九宫格 + 板材质:Th.texPanel 注入后所有面板统一换肤
+        Th.texPanel = MinerApp.LoadTex(a.r, "examples/game/miner/assets/panel_nine.png");
+        a.texBanner = MinerApp.LoadTex(a.r, "examples/game/miner/assets/banner.png");
+        a.texBtnGold = MinerApp.LoadTex(a.r, "examples/game/miner/assets/btn_gold.png");
+        a.texBtnDark = MinerApp.LoadTex(a.r, "examples/game/miner/assets/btn_dark.png");
+        a.texBtnDarkHi = MinerApp.LoadTex(a.r, "examples/game/miner/assets/btn_dark_hi.png");
+        a.texBtnGoldHi = MinerApp.LoadTex(a.r, "examples/game/miner/assets/btn_gold_hi.png");
+        a.texBarTrough = MinerApp.LoadTex(a.r, "examples/game/miner/assets/bar_trough.png");
+        a.texBarFill = MinerApp.LoadTex(a.r, "examples/game/miner/assets/bar_fill.png");
+        a.texRowStone = MinerApp.LoadTex(a.r, "examples/game/miner/assets/row_stone.png");
+        a.texSplashBg = MinerApp.LoadTex(a.r, "examples/game/miner/assets/splash_bg.jpg");
+        a.texTitlePlate = MinerApp.LoadTex(a.r, "examples/game/miner/assets/title_plate.png");
+        a.texLoadBar = MinerApp.LoadTex(a.r, "examples/game/miner/assets/load_bar.png");
+        a.texChrome = MinerApp.LoadTex(a.r, "examples/game/miner/assets/bar_chrome.png");
+        a.texWinGlyphs = MinerApp.LoadTex(a.r, "examples/game/miner/assets/win_glyphs.png");
+        a.texSocket = MinerApp.LoadTex(a.r, "examples/game/miner/assets/astro_socket.png");
+        a.texGem = MinerApp.LoadTex(a.r, "examples/game/miner/assets/astro_gem_w.png");
+        a.texBg = MinerApp.LoadTex(a.r, "examples/game/miner/assets/bg_mine.jpg");
+        a.texMobNormal = MinerApp.LoadTex(a.r, "examples/game/miner/assets/monster_normal.png");
+        a.texMobBoss = MinerApp.LoadTex(a.r, "examples/game/miner/assets/monster_boss.png");
+        a.texIcon = new SdlTexture[5];
+        string[] iconFiles = new string[] { "icon_iron.png", "icon_copper.png", "icon_gold.png", "icon_crystal.png", "icon_core.png" };
+        for (int i = 0; i < 5; i = i + 1) {
+            a.texIcon[i] = MinerApp.LoadTex(a.r, "examples/game/miner/assets/" + iconFiles[i]);
+        }
+        a.texCrew = new SdlTexture[6];
+        string[] crewFiles = new string[] { "crew_miner.png", "crew_rogue.png", "crew_shaman.png", "crew_bomber.png", "crew_giant.png", "crew_occult.png" };
+        for (int i = 0; i < 6; i = i + 1) {
+            a.texCrew[i] = MinerApp.LoadTex(a.r, "examples/game/miner/assets/" + crewFiles[i]);
+        }
+        a.texTab = new SdlTexture[4];
+        string[] tabFiles = new string[] { "ui_tab_mine.png", "ui_tab_crew.png", "ui_tab_abyss.png", "ui_tab_set.png" };
+        for (int i = 0; i < 4; i = i + 1) {
+            a.texTab[i] = MinerApp.LoadTex(a.r, "examples/game/miner/assets/" + tabFiles[i]);
+        }
+        a.texRelic = MinerApp.LoadTex(a.r, "examples/game/miner/assets/ui_relic.png");
+        a.texForge = MinerApp.LoadTex(a.r, "examples/game/miner/assets/ui_forge.png");
+        a.texPrestige = MinerApp.LoadTex(a.r, "examples/game/miner/assets/ui_prestige.png");
         return a;
     }
 
@@ -118,11 +267,19 @@ class MinerApp {
     // ---------------- 模拟步进 ----------------
 
     public void Step() {
-        double dtMs = 16;
-        this.simAccum = this.simAccum + dtMs / 1000.0;
-        if (this.simAccum >= 0.2) {
-            this.g.Tick(this.simAccum, true);
-            this.simAccum = 0;
+        // dt 按真实墙钟走:循环在事件驱动重绘下会空转、会被跳帧,固定
+        // 16ms 会把模拟时间跑快。用上一帧到现在的时间差,上限 100ms 防止
+        // 卡顿后的追帧爆发。
+        double dtMs = (double)(this.now - this.lastStepAt);
+        this.lastStepAt = this.now;
+        if (dtMs < 0) { dtMs = 0; }
+        if (dtMs > 100) { dtMs = 100; }
+        if (dtMs > 0) {
+            this.simAccum = this.simAccum + dtMs / 1000.0;
+            if (this.simAccum >= 0.2) {
+                this.g.Tick(this.simAccum, true);
+                this.simAccum = 0;
+            }
         }
         // 血条平滑
         if (this.g.dispHp > this.g.monsterHp) {
@@ -183,25 +340,88 @@ class MinerApp {
     int CurG(int c) { return this.ColG(c + 1); }
     int CurB(int c) { return this.ColB(c + 1); }
 
-    bool Btn(int x, int y, int w, int h, string label, int scale, bool enabled, bool accent) {
-        bool hov = Draw.PointIn(this.mouseX, this.mouseY, x, y, w, h);
-        int mr = 52; int mg = 56; int mb = 78;
-        int dr = 28; int dg = 32; int db = 48;
-        int tc = 235;
-        if (!enabled) { mr = 34; mg = 36; mb = 46; dr = 22; dg = 24; db = 34; tc = 120; }
-        else if (accent) { mr = 62; mg = 128; mb = 96; dr = 34; dg = 86; db = 60; }
-        if (hov && enabled) {
-            int gr = 130; int gg = 170; int gb = 240;
-            if (accent) { gr = 120; gg = 230; gb = 170; }
-            Draw.RoundRectFill(this.r, x - 4, y - 4, w + 8, h + 8, 14, gr, gg, gb, 60);
-            mr = mr + 12; mg = mg + 12; mb = mb + 12;
+    // 职业圆徽:有生图徽章画徽章,否则回退彩色圆 + 职业首字
+    void DrawCrewBadge(int cx, int cy, int size, int type, bool unlocked) {
+        SdlTexture t = this.texCrew[type];
+        if (t != null && t.IsValid()) {
+            if (!unlocked) { t.SetOpacity(110); }
+            this.r.DrawTexture(t, cx - size / 2, cy - size / 2, size, size);
+            if (!unlocked) { t.SetOpacity(255); }
+            return;
         }
-        Draw.RoundRectFill(this.r, x - 2, y - 2, w + 4, h + 4, 12, 8, 10, 16, 235);
-        Draw.RoundRectFill(this.r, x, y, w, h, 10, mr, mg, mb, 255);
-        Draw.RoundRectFill(this.r, x + 2, y + h / 2, w - 4, h / 2 - 3, 10, dr, dg, db, 140);
-        Draw.RoundRectFill(this.r, x + 3, y + 3, w - 6, h / 3, 10, 255, 255, 255, 30);
-        Text.DrawCenteredShadow(this.r, label, x + w / 2, y + h / 2 - 4 * scale, scale, tc, tc, tc, 2);
-        return hov && this.mouseDown && enabled;
+        int code = type + 1;
+        Sprite.Glow(this.r, cx, cy, size / 2 + 5, this.ColR(code), this.ColG(code), this.ColB(code), unlocked ? 70 : 25);
+        Sprite.Ball(this.r, cx, cy, size / 2 - 2, this.ColR(code), this.ColG(code), this.ColB(code), unlocked ? 245 : 120);
+        TextCSh(this.g.UD[type].name.Substring(0, 1), cx, cy - size / 4, 2, 20, 20, 30);
+    }
+
+    // 精致扁平按钮:单层圆角底 + 1px 发丝描边,悬停轻提亮(无外发光/厚边框/
+    // 光泽分层)。accent = 金色高亮(选中页签/可购买),disabled 灰暗降透明。
+    bool Btn(int x, int y, int w, int h, string label, int scale, bool enabled, bool accent) {
+        return this.BtnIc(x, y, w, h, label, scale, enabled, accent, null);
+    }
+
+    // 精致扁平按钮:图片底(btn_dark/btn_gold 九宫格铺放)+ 悬停增亮变体,
+    // disabled 降透明。图标+文字整体居中,空间不够时退化为纯文字。
+    bool BtnIc(int x, int y, int w, int h, string label, int scale, bool enabled, bool accent, SdlTexture icon) {
+        bool hov = Draw.PointIn(this.mouseX, this.mouseY, x, y, w, h) && enabled;
+        SdlTexture btBase = accent ? this.texBtnGold : this.texBtnDark;
+        SdlTexture hi = accent ? this.texBtnGoldHi : this.texBtnDarkHi;
+        SdlTexture tex = hov ? hi : btBase;
+        if (tex == null || !tex.IsValid()) {
+            return this.BtnVec(x, y, w, h, label, scale, enabled, accent, icon);
+        }
+        if (!enabled) { tex.SetOpacity(150); }
+        MinerApp.NineImg(this.r, tex, 768, 192, 128, 14, x, y, w, h);
+        if (!enabled) { tex.SetOpacity(255); }
+        int tc = 228; int tg = 233; int tb = 248;
+        if (accent) { tc = 255; tg = 224; tb = 150; }
+        if (!enabled) { tc = 116; tg = 120; tb = 136; }
+        int lw = Text.Width(this.r, label, scale);
+        int ic = icon != null && icon.IsValid() ? scale * 13 : 0;
+        int gap = ic > 0 ? 8 : 0;
+        if (ic > 0 && ic + gap + lw > w - 10) { ic = 0; gap = 0; }
+        int sx = x + (w - ic - gap - lw) / 2;
+        if (ic > 0) {
+            if (!enabled) { icon.SetOpacity(130); }
+            this.r.DrawTexture(icon, sx, y + (h - ic) / 2, ic, ic);
+            if (!enabled) { icon.SetOpacity(255); }
+        }
+        Text.DrawShadow(this.r, label, sx + ic + gap, y + h / 2 - 4 * scale, scale, tc, tg, tb, 2);
+        return hov && this.mouseDown;
+    }
+
+    // 矢量按钮(缺素材兜底):单层圆角底 + 1px 描边。
+    bool BtnVec(int x, int y, int w, int h, string label, int scale, bool enabled, bool accent, SdlTexture icon) {
+        bool hov = Draw.PointIn(this.mouseX, this.mouseY, x, y, w, h) && enabled;
+        int mr = 40; int mg = 43; int mb = 60;      // 冷灰蓝底
+        int sr = 255; int sg = 255; int sb = 255; int sa = 20;
+        int tc = 228; int tg = 233; int tb = 248;
+        if (accent) {
+            mr = 74; mg = 60; mb = 32;              // 暗金底
+            sr = 255; sg = 205; sb = 115; sa = 70;
+            tc = 255; tg = 224; tb = 150;
+        }
+        if (!enabled) {
+            mr = 30; mg = 32; mb = 42; sa = 10;
+            tc = 116; tg = 120; tb = 136;
+        } else if (hov) {
+            mr = mr + 12; mg = mg + 12; mb = mb + 12; sa = accent ? 120 : 64;
+        }
+        Draw.RoundRectFill(this.r, x, y, w, h, 9, mr, mg, mb, enabled ? 235 : 195);
+        Draw.RoundRectStroke(this.r, x, y, w, h, 9, 1, sr, sg, sb, sa);
+        int lw = Text.Width(this.r, label, scale);
+        int ic = icon != null && icon.IsValid() ? scale * 13 : 0;
+        int gap = ic > 0 ? 8 : 0;
+        if (ic > 0 && ic + gap + lw > w - 10) { ic = 0; gap = 0; }
+        int sx = x + (w - ic - gap - lw) / 2;
+        if (ic > 0) {
+            if (!enabled) { icon.SetOpacity(130); }
+            this.r.DrawTexture(icon, sx, y + (h - ic) / 2, ic, ic);
+            if (!enabled) { icon.SetOpacity(255); }
+        }
+        Text.DrawShadow(this.r, label, sx + ic + gap, y + h / 2 - 4 * scale, scale, tc, tg, tb, 2);
+        return hov && this.mouseDown;
     }
 
     // 资源条:左列 5 枚货币胶囊,右侧深度/DPS
@@ -213,10 +433,20 @@ class MinerApp {
         for (int i = 0; i < 5; i = i + 1) {
             string t = icons[i] + " " + Game.FmtNum(vals[i]);
             int w = 118;
-            // 货币色点 + 胶囊
-            Draw.RoundRectFill(this.r, x, ry, w, 40, 12, 32, 34, 52, 225);
-            Draw.RoundRectFill(this.r, x, ry, w, 20, 12, 255, 255, 255, 14);
-            Sprite.Ball(this.r, x + 16, ry + 20, 7, this.CurR(i), this.CurG(i), this.CurB(i), 255);
+            // 货币胶囊:石条底(row_stone 裁高铺放);缺图回退矢量胶囊
+            SdlTexture row = this.texRowStone;
+            if (row != null && row.IsValid()) {
+                this.r.DrawTextureRegion(row, 8, 8, 400, 144, x, ry, w, 40);
+            } else {
+                Draw.RoundRectFill(this.r, x, ry, w, 40, 11, 34, 36, 52, 210);
+                Draw.RoundRectStroke(this.r, x, ry, w, 40, 11, 1, 255, 255, 255, 16);
+            }
+            SdlTexture ic = this.texIcon[i];
+            if (ic != null && ic.IsValid()) {
+                this.r.DrawTexture(ic, x + 6, ry + 6, 28, 28);
+            } else {
+                Sprite.Ball(this.r, x + 16, ry + 20, 7, this.CurR(i), this.CurG(i), this.CurB(i), 255);
+            }
             TextL(t, x + 30, ry + 12, 2, 235, 240, 255, 255);
             x = x + w + 10;
         }
@@ -226,8 +456,15 @@ class MinerApp {
         int dbw = Text.Width(this.r, depth, 2) + 28;
         int maxw = MinerApp.RX() - (x + 8) - 16;
         if (dbw > maxw) { dbw = maxw; }
-        Draw.RoundRectFill(this.r, x + 8, ry, dbw, 40, 12, 70, 40, 30, 225);
-        Draw.RoundRectFill(this.r, x + 8, ry, dbw, 20, 12, 255, 255, 255, 12);
+        SdlTexture row2 = this.texRowStone;
+        if (row2 != null && row2.IsValid()) {
+            this.texRowStone.SetColor(255, 205, 160);
+            this.r.DrawTextureRegion(row2, 8, 8, 400, 144, x + 8, ry, dbw, 40);
+            this.texRowStone.ResetColor();
+        } else {
+            Draw.RoundRectFill(this.r, x + 8, ry, dbw, 40, 11, 48, 36, 30, 210);
+            Draw.RoundRectStroke(this.r, x + 8, ry, dbw, 40, 11, 1, 255, 190, 140, 45);
+        }
         this.r.SetClip(x + 8, ry, dbw, 40);
         TextL(depth, x + 22, ry + 12, 2, 255, 190, 140, 255);
         this.r.ResetClip();
@@ -244,6 +481,8 @@ class MinerApp {
     void DrawMonsterCard(int x, int y, int w) {
         int h = 210;
         Th.Panel(this.r, x, y, w, h);
+        // 怪物悬浮/脉动动画是常态(不只在受击时),矿井页要持续重绘
+        this.host.MarkEvent();
         if (this.g.shakeUntil > 0 && this.now < this.g.shakeUntil) {
             int amp = 4;
             x = x + (int)(this.now * 7 % (amp * 2 + 1)) - amp;
@@ -254,7 +493,7 @@ class MinerApp {
         int ncr = 185; int ncg = 195; int ncb = 220;
         if (boss) { ncr = 255; ncg = 205; ncb = 120; }
         TextCSh(mobName, x + w / 2, y + 14, 3, ncr, ncg, ncb);
-        // 怪物本体:发光球 + 双眼(悬浮动画)
+        // 怪物本体:生图立绘(悬浮 + 呼吸脉动),加载失败回退发光球双眼
         int cx = x + w / 2;
         int bob = (int)((this.now / 400) % 2) * 3;
         int cy = y + 92 + bob;
@@ -264,15 +503,22 @@ class MinerApp {
         if (boss) { rad = rad + 12; }
         int mr = 150; int mg = 90; int mb = 200;
         if (boss) { mr = 210; mg = 70; mb = 80; }
-        Sprite.Glow(this.r, cx, cy, rad + 20, mr, mg, mb, boss ? 90 : 60);
-        Sprite.Ball(this.r, cx, cy, rad, mr, mg, mb, 235);
-        // 高光 + 双眼
-        Sprite.Ball(this.r, cx - rad / 3, cy - rad / 3, rad / 5, 255, 255, 255, 90);
-        int eo = rad / 2;
-        Sprite.Ball(this.r, cx - eo, cy - 4, rad / 5 + 3, 255, 245, 245, 255);
-        Sprite.Ball(this.r, cx + eo, cy - 4, rad / 5 + 3, 255, 245, 245, 255);
-        Sprite.Ball(this.r, cx - eo, cy - 2, rad / 9 + 3, 25, 15, 35, 255);
-        Sprite.Ball(this.r, cx + eo, cy - 2, rad / 9 + 3, 25, 15, 35, 255);
+        SdlTexture mob = boss ? this.texMobBoss : this.texMobNormal;
+        if (mob != null && mob.IsValid()) {
+            Sprite.Glow(this.r, cx, cy, rad + 24, mr, mg, mb, boss ? 90 : 60);
+            int size = rad * 2 + 24;
+            this.r.DrawTexture(mob, cx - size / 2, cy - size / 2, size, size);
+        } else {
+            Sprite.Glow(this.r, cx, cy, rad + 20, mr, mg, mb, boss ? 90 : 60);
+            Sprite.Ball(this.r, cx, cy, rad, mr, mg, mb, 235);
+            // 高光 + 双眼
+            Sprite.Ball(this.r, cx - rad / 3, cy - rad / 3, rad / 5, 255, 255, 255, 90);
+            int eo = rad / 2;
+            Sprite.Ball(this.r, cx - eo, cy - 4, rad / 5 + 3, 255, 245, 245, 255);
+            Sprite.Ball(this.r, cx + eo, cy - 4, rad / 5 + 3, 255, 245, 245, 255);
+            Sprite.Ball(this.r, cx - eo, cy - 2, rad / 9 + 3, 25, 15, 35, 255);
+            Sprite.Ball(this.r, cx + eo, cy - 2, rad / 9 + 3, 25, 15, 35, 255);
+        }
         // 血条(更粗,带底色分层)
         double maxHp = this.g.MonsterMaxHp();
         double p = 0;
@@ -281,14 +527,16 @@ class MinerApp {
         if (p > 1) { p = 1; }
         int bw = w - 48;
         int by = y + 152;
-        Draw.RoundRectFill(this.r, x + 24, by, bw, 22, 10, 46, 20, 30, 255);
-        int br2 = (int)(bw * p);
-        if (br2 > 0) {
-            int cr2 = 235; int cg2 = 70; int cb2 = 90;
-            if (p > 0.5) { cr2 = 235; cg2 = 90; cb2 = 70; }
-            if (p > 0.75) { cr2 = 235; cg2 = 130; cb2 = 70; }
-            Draw.RoundRectFill(this.r, x + 24, by, br2, 22, 10, cr2, cg2, cb2, 255);
-            Draw.RoundRectFill(this.r, x + 24, by + 2, br2, 9, 8, 255, 255, 255, 45);
+        if (!MinerApp.DrawTrough(this.r, this.texBarTrough, this.texBarFill, x + 24, by, bw, 22, p)) {
+            Draw.RoundRectFill(this.r, x + 24, by, bw, 22, 10, 46, 20, 30, 255);
+            int br3 = (int)(bw * p);
+            if (br3 > 0) {
+                int cr3 = 235; int cg3 = 70; int cb3 = 90;
+                if (p > 0.5) { cr3 = 235; cg3 = 90; cb3 = 70; }
+                if (p > 0.75) { cr3 = 235; cg3 = 130; cb3 = 70; }
+                Draw.RoundRectFill(this.r, x + 24, by, br3, 22, 10, cr3, cg3, cb3, 255);
+                Draw.RoundRectFill(this.r, x + 24, by + 2, br3, 9, 8, 255, 255, 255, 45);
+            }
         }
         TextCSh(Game.FmtNum(this.g.monsterHp) + " / " + Game.FmtNum(maxHp), x + w / 2, by + 3, 2, 245, 245, 255);
         // 掉落概率
@@ -321,11 +569,15 @@ class MinerApp {
         Evt e = this.g.ev;
         if (e == null) { return; }
         int h = 78;
-        Th.Panel(this.r, x, y, w, h);
-        // 金色事件描边
-        Draw.RoundRectFill(this.r, x - 2, y - 2, w + 4, h + 4, 15, 255, 200, 90, 110);
-        Draw.RoundRectFill(this.r, x, y, w, h, 14, 26, 28, 44, 0);
-        Draw.RoundRectFill(this.r, x, y, w, h, 14, 46, 38, 30, 235);
+        // 金边横幅背板(banner.png,含金饰边),缺图回退矢量金描边
+        if (this.texBanner != null && this.texBanner.IsValid()) {
+            this.r.DrawTexture(this.texBanner, x, y, w, h);
+        } else {
+            Th.Panel(this.r, x, y, w, h);
+            Draw.RoundRectFill(this.r, x - 2, y - 2, w + 4, h + 4, 15, 255, 200, 90, 110);
+            Draw.RoundRectFill(this.r, x, y, w, h, 14, 26, 28, 44, 0);
+            Draw.RoundRectFill(this.r, x, y, w, h, 14, 46, 38, 30, 235);
+        }
         string[] names = new string[] { "矿脉涌动", "黑市商人", "遗迹探秘", "深渊低语" };
         string[] desc = new string[] {
             "矿脉突然活跃,可立即收获一批铁",
@@ -356,13 +608,18 @@ class MinerApp {
             int cnt = this.g.CrewCount(t);
             if (cnt == 0) { continue; }
             int ry = y + 40 + n * rh;
-            // 图标:彩色圆 + 字
+            // 图标:职业圆徽(生图),失败回退彩色圆 + 字
             int icx = x + 30;
             int icy = ry + rh / 2 - 6;
             int colCode = t + 1;
-            Sprite.Glow(this.r, icx, icy, 17, this.ColR(colCode), this.ColG(colCode), this.ColB(colCode), 60);
-            Sprite.Ball(this.r, icx, icy, 13, this.ColR(colCode), this.ColG(colCode), this.ColB(colCode), 245);
-            TextCSh(this.g.UD[t].name.Substring(0, 1), icx, icy - 9, 2, 22, 22, 32);
+            SdlTexture ct = this.texCrew[t];
+            if (ct != null && ct.IsValid()) {
+                this.r.DrawTexture(ct, icx - 16, icy - 16, 32, 32);
+            } else {
+                Sprite.Glow(this.r, icx, icy, 17, this.ColR(colCode), this.ColG(colCode), this.ColB(colCode), 60);
+                Sprite.Ball(this.r, icx, icy, 13, this.ColR(colCode), this.ColG(colCode), this.ColB(colCode), 245);
+                TextCSh(this.g.UD[t].name.Substring(0, 1), icx, icy - 9, 2, 22, 22, 32);
+            }
             string line = this.g.UD[t].name + " ×" + cnt;
             TextL(line, x + 54, ry + 6, 2, 235, 240, 252, 255);
             // 进度条
@@ -376,11 +633,19 @@ class MinerApp {
                 itv = this.g.UnitInterval(u0) * u0.mult;
             }
             int pw = 150;
-            Draw.RoundRectFill(this.r, x + w - 250, ry + 12, pw, 14, 7, 40, 42, 62, 255);
             double pp = timer / itv;
             if (pp < 0) { pp = 0; }
             if (pp > 1) { pp = 1; }
-            if (pw * pp > 0) {
+            // 图片槽+填充(bar_trough/bar_fill);填充是红系,进度语义染绿
+            if (MinerApp.DrawTrough(this.r, this.texBarTrough, this.texBarFill, x + w - 250, ry + 12, pw, 14, pp)) {
+                this.texBarFill.SetColor(120, 235, 150);
+                int swg = (int)(768 * pp);
+                if (swg < 1) { swg = 1; }
+                this.r.DrawTextureRegion(this.texBarFill, 0, 0, swg, 96, x + w - 250, ry + 12, (int)(pw * pp), 14);
+                this.texBarFill.ResetColor();
+            } else if (pw * pp > 0) {
+                // 缺图:槽一次成型(暗底),绿填在底上,不再双层矢量
+                Draw.RoundRectFill(this.r, x + w - 250, ry + 12, pw, 14, 7, 24, 22, 36, 255);
                 Draw.RoundRectFill(this.r, x + w - 250, ry + 12, (int)(pw * pp), 14, 7, 120, 225, 160, 255);
             }
             string ytext = "+" + Game.FmtNum(this.g.UnitYield(u0 == null ? new Unit() : u0)) + "/次";
@@ -392,19 +657,62 @@ class MinerApp {
         }
     }
 
+    // 矿队作业条第 utype 类矿工行的锚点(飘雪出生坐标)。行布局必须与
+    // DrawMinerStrip 一致:面板 y + 40 + 可见行序 n * 46,锚点取进度条
+    // 上方的行中心;返回 false 表示该类矿工当前不可见(行数超窗)。
+    bool MinerRowAnchor(int utype, int[] outXY) {
+        int x = MinerApp.LX();
+        int ey = this.g.ev != null ? 240 : 152;
+        int y = ey + 222;
+        int w = MinerApp.LW();
+        int n = 0;
+        for (int t = 0; t < 6; t = t + 1) {
+            if (this.g.CrewCount(t) == 0) { continue; }
+            if (t == utype) {
+                outXY[0] = x + w - 250 + 30;
+                outXY[1] = y + 40 + n * 46 + 8;
+                return true;
+            }
+            n = n + 1;
+        }
+        return false;
+    }
+
     void DrawFloats() {
         // 浮字只属于矿井页(page 0,且无浮层)——否则会飘到矿队/设置等页
         if (this.page != 0 || this.floatPage != 0 || this.offlineText.Length > 0) {
             return;
         }
+        bool drew = false;
+        int[] axy = new int[2];
+        double nowS = this.g.playSec;
         for (int i = this.g.floats.Count - 1; i >= 0; i = i + -1) {
             FText f = this.g.floats[i];
-            long age = (long)(this.g.playSec * 1000) - f.bornAt;
-            if (age > 1100) { this.g.floats.RemoveAt(i); continue; }
-            int a = 255 - (int)(age * 255 / 1100);
-            int fy = 340 - (int)(age / 12);
-            TextC(f.text, 400 + (int)((i % 5) * 30) - 60, fy, 3, f.cr, f.cg, f.cb, a);
+            long age = (long)(nowS * 1000) - f.bornAt;
+            if (age > 1400) { this.g.floats.RemoveAt(i); continue; }
+            int a = 255 - (int)(age * 255 / 1400);
+            if (f.utype >= 0) {
+                // 数字飘雪:从矿工行锚点出发,上飘 + 正弦横摆 + 水平漂移,
+                // 出生时用 uiRng 注入各不相同的漂移参数,像矿尘雪片。
+                if (f.vx == 0 && f.sway == 0) {
+                    f.sway = 6 + this.uiRng.Next() % 14;
+                    f.ph = this.uiRng.Next() % 628;
+                    f.vx = (this.uiRng.Next() % 17) - 8;
+                }
+                if (!this.MinerRowAnchor(f.utype, axy)) { continue; }
+                double ts = age / 1000.0;
+                double sx = Math.Sin(ts * 3.0 + f.ph / 100.0) * f.sway;
+                int fx = axy[0] + (int)(f.vx * ts + sx);
+                int fy = axy[1] - (int)(age * 22 / 1000.0);
+                TextC(f.text, fx, fy, 2, f.cr, f.cg, f.cb, a);
+            } else {
+                int fy = 340 - (int)(age / 12);
+                TextC(f.text, 400 + (int)((i % 5) * 30) - 60, fy, 3, f.cr, f.cg, f.cb, a);
+            }
+            drew = true;
         }
+        // 浮字活着 = 有动画在跑,事件驱动重绘要持续到它们淡出为止
+        if (drew) { this.host.MarkEvent(); }
     }
 
     void DrawToasts() {
@@ -412,25 +720,43 @@ class MinerApp {
             Toast t = this.g.toasts[i];
             long age = (long)(this.g.playSec * 1000) - t.bornAt;
             if (age > 3400) { this.g.toasts.RemoveAt(i); continue; }
+            // toast 有退场动画,持续重绘到淡出完成
+            this.host.MarkEvent();
             int a = 255;
             if (age > 2800) { a = 255 - (int)((age - 2800) * 255 / 600); }
-            // 半透明底板让通知在任何背景下可读
+            // 半透明底板让通知在任何背景下可读:石条底(暗染),缺图回退矢量
             int tw = Text.Width(this.r, t.text, 2) + 32;
-            Draw.RoundRectFill(this.r, MinerApp.W() / 2 - tw / 2, 452 + i * 34, tw, 30, 10, 12, 12, 22, a * 3 / 4);
+            SdlTexture row = this.texRowStone;
+            if (row != null && row.IsValid()) {
+                row.SetOpacity(a * 3 / 4);
+                this.r.DrawTextureRegion(row, 8, 8, 400, 144, MinerApp.W() / 2 - tw / 2, 452 + i * 34, tw, 30);
+                row.SetOpacity(255);
+            } else {
+                Draw.RoundRectFill(this.r, MinerApp.W() / 2 - tw / 2, 452 + i * 34, tw, 30, 10, 12, 12, 22, a * 3 / 4);
+            }
             TextCSh(t.text, MinerApp.W() / 2, 458 + i * 34, 2, t.cr, t.cg, t.cb);
         }
     }
 
     void DrawBanner() {
         if ((long)(this.g.playSec * 1000) > this.g.bannerUntil) { return; }
+        this.host.MarkEvent();   // banner 有淡出动画,持续重绘到消失
         long remain = this.g.bannerUntil - (long)(this.g.playSec * 1000);
         // 进场 200ms 放大 + 退场前 300ms 淡出
         int sc = 4;
         int a = 255;
         if (remain < 300) { a = (int)(remain * 255 / 300); }
         int bw = Text.Width(this.r, this.g.bannerText, sc);
-        Draw.RoundRectFill(this.r, MinerApp.W() / 2 - bw / 2 - 24, 132, bw + 48, 62, 16, 15, 13, 28, a * 5 / 6);
-        Draw.RoundRectStroke(this.r, MinerApp.W() / 2 - bw / 2 - 24, 132, bw + 48, 62, 16, 1, 255, 215, 130, a * 3 / 4);
+        int bx = MinerApp.W() / 2 - bw / 2 - 24;
+        if (this.texBanner != null && this.texBanner.IsValid()) {
+            // 横幅背板图,随文字宽度铺放并同步淡出
+            this.texBanner.SetOpacity(a);
+            this.r.DrawTexture(this.texBanner, bx, 126, bw + 48, 74);
+            this.texBanner.SetOpacity(255);
+        } else {
+            Draw.RoundRectFill(this.r, bx, 132, bw + 48, 62, 16, 15, 13, 28, a * 5 / 6);
+            Draw.RoundRectStroke(this.r, bx, 132, bw + 48, 62, 16, 1, 255, 215, 130, a * 3 / 4);
+        }
         TextC(this.g.bannerText, MinerApp.W() / 2, 148, sc, 255, 225, 140, a);
     }
 
@@ -447,11 +773,7 @@ class MinerApp {
             int cx = x + (t % 2) * (cw + 20);
             int cy = y + (t / 2) * 116;
             Th.Panel(this.r, cx, cy, cw, 104);
-            int icx = cx + 34;
-            int icy = cy + 52;
-            Sprite.Glow(this.r, icx, icy, 20, this.ColR(t + 1), this.ColG(t + 1), this.ColB(t + 1), unlocked ? 70 : 25);
-            Sprite.Ball(this.r, icx, icy, 15, this.ColR(t + 1), this.ColG(t + 1), this.ColB(t + 1), unlocked ? 245 : 120);
-            TextCSh(this.g.UD[t].name.Substring(0, 1), icx, icy - 10, 2, 20, 20, 30);
+            this.DrawCrewBadge(cx + 34, cy + 52, 44, t, unlocked);
             TextL(this.g.UD[t].name + "  ×" + this.g.CrewCount(t), cx + 62, cy + 12, 3, 238, 242, 255, 255);
             TextL(this.g.UD[t].desc, cx + 62, cy + 40, 2, 172, 182, 208, 255);
             if (!unlocked) {
@@ -534,6 +856,9 @@ class MinerApp {
         int rx = MinerApp.RX();
         // 左:轮回
         Th.Panel(this.r, x, 154, MinerApp.LW(), 244);
+        if (this.texPrestige != null && this.texPrestige.IsValid()) {
+            this.r.DrawTexture(this.texPrestige, x + MinerApp.LW() - 88, 174, 64, 64);
+        }
         TextL("轮回 · 重入深渊", x + 16, 168, 3, 120, 255, 200, 255);
         TextL("携深渊核心重开一局:雇佣/强化/圣物清空,核心永久保留。", x + 16, 202, 2, 188, 198, 222, 255);
         double n = this.g.CoresFor();
@@ -548,6 +873,9 @@ class MinerApp {
         }
         // 左下:锻造
         Th.Panel(this.r, x, 416, MinerApp.LW(), 148);
+        if (this.texForge != null && this.texForge.IsValid()) {
+            this.r.DrawTexture(this.texForge, x + MinerApp.LW() - 76, 432, 52, 52);
+        }
         TextL("锻造台 · Lv" + this.g.forgeLv, x + 16, 430, 3, 255, 210, 120, 255);
         TextL("每级:伤害 +6%,产出 +4%(消耗萤晶+金)", x + 16, 464, 2, 188, 198, 222, 255);
         string fc = "锻 造  " + Game.FmtNum(this.g.ForgeCost()) + " 萤晶 + " + Game.FmtNum(this.g.ForgeJinCost()) + " 金";
@@ -580,9 +908,11 @@ class MinerApp {
                 }
             }
         }
-        // 右下:星盘(萤晶占星)
+        // 右下:星盘(萤晶占星):空槽用凹座图,点亮用白宝石染色
         Th.Panel(this.r, rx, 584, MinerApp.RW(), 128);
         TextL("星盘 · 同类每颗 +3%", rx + 16, 594, 2, 195, 158, 255, 255);
+        SdlTexture sock = this.texSocket;
+        SdlTexture gem = this.texGem;
         for (int i = 0; i < 12; i = i + 1) {
             int sx = rx + 22 + (i % 6) * 56;
             int sy = 624 + (i / 6) * 40;
@@ -592,15 +922,23 @@ class MinerApp {
                 int cr2 = 255; int cg2 = 110; int cb2 = 110;
                 if (kind == 1) { cr2 = 120; cg2 = 230; cb2 = 130; }
                 if (kind == 2) { cr2 = 130; cg2 = 200; cb2 = 255; }
-                Sprite.Glow(this.r, sx + 14, sy + 14, 19, cr2, cg2, cb2, 90);
-                Sprite.Ball(this.r, sx + 14, sy + 14, 12, cr2, cg2, cb2, 255);
+                if (gem != null && gem.IsValid()) {
+                    gem.SetColor(cr2, cg2, cb2);
+                    this.r.DrawTexture(gem, sx, sy, 28, 28);
+                    gem.ResetColor();
+                } else {
+                    Sprite.Glow(this.r, sx + 14, sy + 14, 19, cr2, cg2, cb2, 90);
+                    Sprite.Ball(this.r, sx + 14, sy + 14, 12, cr2, cg2, cb2, 255);
+                }
+            } else if (sock != null && sock.IsValid()) {
+                this.r.DrawTexture(sock, sx, sy, 28, 28);
             } else {
                 Draw.RoundRectFill(this.r, sx, sy, 28, 28, 8, 46, 48, 70, 255);
                 Draw.RoundRectStroke(this.r, sx, sy, 28, 28, 8, 1, 195, 158, 255, 90);
-                if (Draw.PointIn(this.mouseX, this.mouseY, sx - 8, sy - 8, 44, 44) && this.mouseDown) {
-                    if (this.g.AstroBuy(i)) { this.snd.Tip(); }
-                    this.mouseDown = false;
-                }
+            }
+            if (!on && Draw.PointIn(this.mouseX, this.mouseY, sx - 8, sy - 8, 44, 44) && this.mouseDown) {
+                if (this.g.AstroBuy(i)) { this.snd.Tip(); }
+                this.mouseDown = false;
             }
         }
     }
@@ -608,7 +946,9 @@ class MinerApp {
     // ---------------- 圣物浮层 ----------------
 
     void DrawRelicsOverlay() {
-        Draw.RoundRectFill(this.r, 0, 0, MinerApp.W(), MinerApp.H(), 6, 10, 10, 16, 255);
+        // 暗化遮罩透出背景,与离线弹窗同一语言(整屏纯色矩形)
+        this.r.SetColor(8, 8, 14, 210);
+        this.r.FillRect(0, 0, MinerApp.W(), MinerApp.H());
         int x = 120; int y = 70; int w = MinerApp.W() - 240; int h = MinerApp.H() - 140;
         Th.Panel(this.r, x, y, w, h);
         TextL("圣物背包(" + this.g.relics.Count + " 件,装备 " + this.g.EquippedCount() + "/6)", x + 20, y + 16, 3, 196, 158, 255, 255);
@@ -622,13 +962,29 @@ class MinerApp {
             if (i >= this.g.relics.Count) { break; }
             Relic r = this.g.relics[i];
             int cy = y + 58 + k * 60;
-            Draw.RoundRectFill(this.r, x + 18, cy, w - 36, 52, 11, r.equipped ? 50 : 36, r.equipped ? 44 : 38, r.equipped ? 66 : 56, 255);
-            if (r.equipped) {
-                Draw.RoundRectStroke(this.r, x + 18, cy, w - 36, 52, 11, 1, 255, 215, 130, 130);
+            // 石条行底(row_stone.png),装备中染金;缺图回退矢量底
+            SdlTexture row = this.texRowStone;
+            if (row != null && row.IsValid()) {
+                if (r.equipped) { row.SetColor(255, 215, 140); }
+                this.r.DrawTexture(row, x + 18, cy, w - 36, 52);
+                if (r.equipped) { row.ResetColor(); }
+            } else {
+                Draw.RoundRectFill(this.r, x + 18, cy, w - 36, 52, 11, r.equipped ? 50 : 36, r.equipped ? 44 : 38, r.equipped ? 66 : 56, 255);
+                if (r.equipped) {
+                    Draw.RoundRectStroke(this.r, x + 18, cy, w - 36, 52, 11, 1, 255, 215, 130, 130);
+                }
             }
+            // 品质球:白宝石按品质染色;缺图回退发光球
             int qg = this.RelicQColG(r.quality);
-            Sprite.Glow(this.r, x + 44, cy + 26, 16, 255, qg, 120, 80);
-            Sprite.Ball(this.r, x + 44, cy + 26, 12, 255, qg, 120, 255);
+            SdlTexture gem = this.texGem;
+            if (gem != null && gem.IsValid()) {
+                gem.SetColor(255, qg, 120);
+                this.r.DrawTexture(gem, x + 30, cy + 12, 28, 28);
+                gem.ResetColor();
+            } else {
+                Sprite.Glow(this.r, x + 44, cy + 26, 16, 255, qg, 120, 80);
+                Sprite.Ball(this.r, x + 44, cy + 26, 12, 255, qg, 120, 255);
+            }
             TextL(this.g.RelicName[r.key], x + 68, cy + 5, 2, 238, 238, 252, 255);
             TextL(this.g.RelicDesc[r.key] + " · 品质 " + r.quality + " · " + this.RelicValText(r), x + 68, cy + 30, 2, 178, 188, 212, 255);
             if (this.Btn(x + w - 196, cy + 8, 84, 36, r.equipped ? "卸下" : "装备", 2, true, !r.equipped)) {
@@ -695,14 +1051,28 @@ class MinerApp {
     // ---------------- 离线弹窗 ----------------
 
     void DrawOffline() {
-        Draw.RoundRectFill(this.r, 0, 0, MinerApp.W(), MinerApp.H(), 6, 10, 10, 16, 255);
+        // 暗化遮罩下透出一点背景,弹窗不突兀(整屏纯色矩形)
+        this.r.SetColor(8, 8, 14, 210);
+        this.r.FillRect(0, 0, MinerApp.W(), MinerApp.H());
         int x = 360; int y = 220; int w = 560; int h = 280;
         Th.Panel(this.r, x, y, w, h);
-        Draw.RoundRectStroke(this.r, x, y, w, h, 14, 1, 120, 255, 200, 90);
-        TextCSh("欢 迎 回 来", x + w / 2, y + 24, 5, 120, 255, 200);
+        TextCSh("欢 迎 回 来", x + w / 2, y + 24, 5, 255, 215, 140);
         TextC(this.offlineText, x + w / 2, y + 100, 3, 222, 232, 252, 255);
         TextC("资源已入账,矿队状态保持", x + w / 2, y + 140, 3, 192, 202, 228, 255);
-        if (this.Btn(x + w / 2 - 110, y + 190, 220, 52, "继续挖矿", 3, true, true)) {
+        // 金色大钮(btn_gold.png 九宫格),缺图回退标准按钮
+        int obx = x + w / 2 - 110; int oby = y + 190; int obw = 220; int obh = 52;
+        if (this.texBtnGold != null && this.texBtnGold.IsValid()) {
+            bool hov = Draw.PointIn(this.mouseX, this.mouseY, obx, oby, obw, obh);
+            SdlTexture bt = hov && this.texBtnGoldHi != null && this.texBtnGoldHi.IsValid()
+                ? this.texBtnGoldHi : this.texBtnGold;
+            MinerApp.NineImg(this.r, bt, 768, 192, 128, 14, obx, oby, obw, obh);
+            int lw2 = Text.Width(this.r, "继续挖矿", 3);
+            Text.DrawShadow(this.r, "继续挖矿", x + w / 2 - lw2 / 2, oby + obh / 2 - 12, 3, 255, 224, 150, 2);
+            if (hov && this.mouseDown) {
+                this.offlineText = "";
+                this.mouseDown = false;
+            }
+        } else if (this.BtnIc(obx, oby, obw, obh, "继续挖矿", 3, true, true, this.texTab[0])) {
             this.offlineText = "";
             this.mouseDown = false;
         }
@@ -740,20 +1110,21 @@ class MinerApp {
     // ---------------- 顶栏 + 主渲染 ----------------
 
     void DrawTop() {
-        // 页签(标题栏 40px 之下)
+        // 页签(标题栏 40px 之下):图标 + 文字
         string[] pages = new string[] { "矿井", "矿队", "深渊", "设置" };
         int x = MinerApp.LX();
         for (int i = 0; i < 4; i = i + 1) {
             bool sel = this.page == i;
-            if (this.Btn(x + i * 124, Host.BarH() + 12, 112, 42, pages[i], 2, true, sel)) {
+            int tx = x + i * 124;
+            if (this.BtnIc(tx, Host.BarH() + 12, 112, 42, pages[i], 2, true, sel, this.texTab[i])) {
                 this.page = i;
                 this.floatPage = 0;
                 this.mouseDown = false;
             }
         }
-        // 圣物按钮
+        // 圣物按钮(图标+文字)
         string rt = "圣物 " + this.g.relics.Count + (this.g.EquippedCount() > 0 ? "(" + this.g.EquippedCount() + ")" : "");
-        if (this.Btn(MinerApp.W() - 136, Host.BarH() + 12, 112, 42, rt, 2, true, this.g.relics.Count > 0)) {
+        if (this.BtnIc(MinerApp.W() - 136, Host.BarH() + 12, 112, 42, rt, 2, true, this.g.relics.Count > 0, this.texRelic)) {
             this.floatPage = 1;
             this.mouseDown = false;
         }
@@ -764,51 +1135,75 @@ class MinerApp {
         }
     }
 
-    // 自绘标题栏:chrome 条 + 右侧三枚系统钮(悬停着色,关闭钮悬停变红)
+    // 自绘标题栏:石板条(bar_chrome)打底 + 右侧三枚系统钮。按钮平时只有
+    // 细字形(win_glyphs 图),悬停浮现增亮;关闭钮悬停红染字形。最大化态
+    // 中间钮切"还原"双层窗口格。
     void DrawTitleBar() {
         if (!this.host.HasCustomBar()) { return; }
         int w = MinerApp.W();
-        this.host.DrawTitleBarChrome(this.r, w, 20, 15, 34);
+        SdlTexture ch = this.texChrome;
+        if (ch != null && ch.IsValid()) {
+            this.r.DrawTexture(ch, 0, 0, w, Host.BarH());
+        } else {
+            this.host.DrawTitleBarChrome(this.r, w, 22, 17, 36);
+        }
         int[] rc = new int[6];
         this.host.BarButtons(w, rc);
+        bool maximized = this.host.IsFullscreen();
+        SdlTexture gl = this.texWinGlyphs;
         for (int i = 0; i < 3; i = i + 1) {
             int bx = rc[i * 2];
             int by = rc[i * 2 + 1];
             bool hov = Draw.PointIn(this.mouseX, this.mouseY, bx, by, Host.BtnW(), Host.BtnH());
-            // 按钮底:普通钮悬停微亮,关闭钮悬停红
-            int br = hov ? 58 : 34;
-            int bg2 = hov ? 60 : 36;
-            int bb = hov ? 66 : 52;
-            if (i == 2 && hov) { br = 190; bg2 = 52; bb = 56; }
-            Draw.RoundRectFill(this.r, bx, by, Host.BtnW(), Host.BtnH(), 8, br, bg2, bb, 235);
-            Draw.RoundRectFill(this.r, bx + 2, by + 2, Host.BtnW() - 4, Host.BtnH() / 3, 8, 255, 255, 255, 22);
-            // 字形:– □ ×(当前色画,Rect/Line 用 SetColor+FillRect/DrawRect)
             int cx = bx + Host.BtnW() / 2;
             int cy = by + Host.BtnH() / 2;
-            this.r.SetColor(220, 226, 244, 255);
-            if (i == 0) {
-                this.r.FillRect(cx - 8, cy, 16, 2);
-            } else if (i == 1) {
-                this.r.DrawRect(cx - 7, cy - 7, 14, 14);
+            if (gl != null && gl.IsValid()) {
+                // 三格字形图:减号/方框(或还原双层)/叉,中点缩放到 16px
+                int g = maximized && i == 1 ? 2 : i;
+                if (hov) { gl.SetOpacity(255); } else { gl.SetOpacity(190); }
+                if (hov && i == 2) { gl.SetColor(255, 120, 120); }
+                this.r.DrawTextureRegion(gl, g * 128, 0, 128, 128, cx - 8, cy - 8, 16, 16);
+                if (hov && i == 2) { gl.ResetColor(); }
+                gl.SetOpacity(255);
             } else {
-                this.r.DrawLine(cx - 7, cy - 7, cx + 7, cy + 7);
-                this.r.DrawLine(cx - 7, cy + 7, cx + 7, cy - 7);
+                this.r.SetColor(206, 212, 232, hov ? 255 : 190);
+                if (i == 0) {
+                    this.r.FillRect(cx - 7, cy - 1, 14, 2);
+                } else if (i == 1) {
+                    if (maximized) {
+                        // 还原:前后两层窗口
+                        this.r.DrawRect(cx - 6, cy - 4, 9, 9);
+                        this.r.DrawLine(cx - 3, cy - 4, cx - 3, cy - 7);
+                        this.r.DrawLine(cx - 3, cy - 7, cx + 6, cy - 7);
+                        this.r.DrawLine(cx + 6, cy - 7, cx + 6, cy + 2);
+                        this.r.DrawLine(cx + 3, cy + 2, cx + 6, cy + 2);
+                    } else {
+                        this.r.DrawRect(cx - 6, cy - 6, 12, 12);
+                    }
+                } else {
+                    this.r.DrawLine(cx - 6, cy - 6, cx + 6, cy + 6);
+                    this.r.DrawLine(cx - 6, cy + 6, cx + 6, cy - 6);
+                }
             }
         }
     }
 
     void Render() {
         this.host.Begin(10, 9, 20);
-        // 背景:烘焙渐变 + 星点(一次绘制),前景只画一次滚动光晕
-        if (this.bg == null || !this.bg.IsValid()) {
-            Rng br = Rng.Seed(20260831);
-            this.bg = Ui.BakeBackdrop(this.r, MinerApp.W(), MinerApp.H(), br,
-                26, 20, 44, 9, 8, 18, 90);
-        }
-        if (this.bg != null && this.bg.IsValid()) {
-            this.r.DrawTexture(this.bg, 0, 0, MinerApp.W(), MinerApp.H());
+        // 背景:生图矿洞立绘优先;缺失时回退烘焙渐变 + 星点
+        if (this.texBg != null && this.texBg.IsValid()) {
+            this.r.DrawTexture(this.texBg, 0, 0, MinerApp.W(), MinerApp.H());
         } else {
-            Draw.VGradient(this.r, 0, 0, MinerApp.W(), MinerApp.H(), 26, 20, 44, 9, 8, 18, 255);
+            if (this.bg == null || !this.bg.IsValid()) {
+                Rng br = Rng.Seed(20260831);
+                this.bg = Ui.BakeBackdrop(this.r, MinerApp.W(), MinerApp.H(), br,
+                    26, 20, 44, 9, 8, 18, 90);
+            }
+            if (this.bg != null && this.bg.IsValid()) {
+                this.r.DrawTexture(this.bg, 0, 0, MinerApp.W(), MinerApp.H());
+            } else {
+                Draw.VGradient(this.r, 0, 0, MinerApp.W(), MinerApp.H(), 26, 20, 44, 9, 8, 18, 255);
+            }
         }
         this.DrawTitleBar();
         this.DrawTop();
@@ -867,6 +1262,8 @@ class MinerApp {
         if (sc == 42) {   // B 打开圣物
             this.floatPage = this.floatPage == 1 ? 0 : 1;
         }
+        // 启动画面期间任意键/回车跳过等待
+        if (sc == 40 || sc == 44) { this.splashMin = 0; }
     }
     public void OnWheel(double dy) {
         if (this.page == 1) {
@@ -923,10 +1320,10 @@ class MinerApp {
                 }
                 this.host.MarkEvent();
             }
-            if (this.offlineText.Length == 0 && this.floatPage != 1) {
-                this.Step();
-                this.host.MarkEvent();   // 模拟推进意味着画面/进度可能变了
-            }
+            // 模拟照常推进(挂机游戏离开输入也持续出矿),但它不是"画面
+            // 变了"的渲染理由:进度条/数字本来就是 120ms 重绘节拍的量化
+            // 对象,Step 不 MarkEvent,静止画面走心跳、GPU 几乎归零。
+            this.Step();
             if (this.host.ShouldRender()) {
                 this.Render();
             }
@@ -945,12 +1342,73 @@ class MinerApp {
         h.SetIdleFps(2);   // 最小化时降到 2fps,后台几乎零 GPU/CPU
         h.SetRedrawInterval(120);   // 事件驱动重绘:静止画面不重复渲染(动画 120ms 步进)
         MinerApp a = MinerApp.Create(h);
+        // 启动画面:宿主/窗口就绪后先展示图片化 splash(背景+铭牌+加载条),
+        // 期间完成存档读取;展示满/点击后淡出进主界面。
+        a.splashBorn = Sdl.Ticks();
+        bool[] done = new bool[] { false };
+        while (!done[0]) {
+            a.now = Sdl.Ticks();
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                a.host.OnWindowEvent(ty);
+                if (SdlEvent.IsQuit()) { a.g.SaveGame(); a.host.Quit(); done[0] = true; }
+                if (ty == SdlEventType.MouseButtonDown() && SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                    a.splashMin = 0;   // 点击跳过
+                }
+                if (ty == SdlEventType.KeyDown() && !SdlEvent.IsRepeat()) {
+                    a.splashMin = 0;   // 按键跳过
+                }
+                a.host.MarkEvent();
+            }
+            long seen = a.now - a.splashBorn;
+            if (seen >= a.splashMin) {
+                done[0] = true;
+            }
+            if (a.host.ShouldRender()) {
+                a.RenderSplash(seen);
+            }
+        }
+        if (a.host.Running() == false) { return; }
         double away = a.g.LoadGame();
         if (away > 0) {
             a.offlineText = "离线 " + Game.FmtDur(away) + " 结算完成";
         }
         a.Run();
         _ = a;
+    }
+
+    // 启动画面:全屏暗矿洞背景 + 居中铭牌 + 底部加载条(按展示进度走)。
+    // 纹理缺失逐项回退:无背景用深色渐变,无铭牌直接大字标题。
+    void RenderSplash(long seenMs) {
+        this.host.Begin(6, 6, 11);
+        if (this.texSplashBg != null && this.texSplashBg.IsValid()) {
+            this.r.DrawTexture(this.texSplashBg, 0, 0, MinerApp.W(), MinerApp.H());
+        } else {
+            Draw.VGradient(this.r, 0, 0, MinerApp.W(), MinerApp.H(), 26, 22, 40, 8, 7, 14, 255);
+        }
+        // 铭牌淡入(前 300ms)
+        int pa = seenMs < 300 ? (int)(seenMs * 255 / 300) : 255;
+        int pw = 560; int ph = 190; int px = MinerApp.W() / 2 - pw / 2; int py = 190;
+        if (this.texTitlePlate != null && this.texTitlePlate.IsValid()) {
+            this.texTitlePlate.SetOpacity(pa);
+            MinerApp.NineImg(this.r, this.texTitlePlate, 1408, 384, 176, 20, px, py, pw, ph);
+            this.texTitlePlate.SetOpacity(255);
+        } else {
+            Draw.RoundRectFill(this.r, px, py, pw, ph, 18, 22, 18, 26, pa * 3 / 4);
+        }
+        int sub = seenMs < 600 ? (int)(seenMs * 255 / 600) : 255;
+        TextCSh("深 渊 矿 队", MinerApp.W() / 2, py + 34, 7, 255, 215, 140);
+        TextC("挂机 · 挖矿 · 轮回深渊", MinerApp.W() / 2, py + 116, 3, 205, 212, 235, sub);
+        // 加载条:按展示进度推进,走完即进主界面
+        int lbw = 420; int lbx = MinerApp.W() / 2 - lbw / 2; int lby = 470; int lbh = 26;
+        double p = (double)seenMs / (double)(this.splashMin > 0 ? this.splashMin : 1);
+        if (p > 1) { p = 1; }
+        if (!MinerApp.DrawTroughSrc(this.r, this.texLoadBar, 1024, 72, this.texBarFill, lbx, lby, lbw, lbh, p)) {
+            Draw.RoundRectFill(this.r, lbx, lby, lbw, lbh, 12, 30, 30, 48, 255);
+            Draw.RoundRectFill(this.r, lbx + 3, lby + 3, (int)((lbw - 6) * p), lbh - 6, 9, 255, 200, 110, 255);
+        }
+        TextC("加载中…(点击跳过)", MinerApp.W() / 2, lby + 44, 2, 150, 158, 185, 255);
+        this.host.End();
     }
 
     // ---------------- 无头模拟(平衡自测) ----------------
