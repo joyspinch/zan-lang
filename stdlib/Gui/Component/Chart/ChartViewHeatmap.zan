@@ -13,6 +13,39 @@ partial class ChartView {
         ChartView.HeatmapHover(app, x, y, w, h, o);
     }
 
+    /// 网格每列/行的累计像素边界。与 CatLeft 同样使用整数
+    /// 累计除法，余数落在末端而不是被固定 cell 尺寸吞掉。
+    static int HeatmapCellStart(int dimension, int index, int count) {
+        if (dimension < 1 || count < 1 || index < 0) { return 0; }
+        if (index > count) { index = count; }
+        return (int)((long)dimension * (long)index / (long)count);
+    }
+
+    static int HeatmapCellSize(int dimension, int index, int count) {
+        int a = ChartView.HeatmapCellStart(dimension, index, count);
+        int b = ChartView.HeatmapCellStart(dimension, index + 1, count);
+        if (b < a) { return 0; }
+        return b - a;
+    }
+
+    /// q 是相对网格左/上缘的像素坐标，按累计边界反解类目。
+    static int HeatmapIndexAt(int q, int dimension, int count) {
+        if (dimension < 1 || count < 1 || q < 0 || q >= dimension) { return 0 - 1; }
+        int lo = 0;
+        int hi = count;
+        while (lo + 1 < hi) {
+            int mid = (lo + hi) / 2;
+            if (ChartView.HeatmapCellStart(dimension, mid, count) <= q) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo < 0) { lo = 0; }
+        if (lo > count - 1) { lo = count - 1; }
+        return lo;
+    }
+
     /// 仅热力图主体（面板、表头、色块）—— 不含悬停覆盖层，
     /// 以便 RenderCached 缓存，指针反馈在
     /// 缓存命中后重绘于其上。
@@ -71,8 +104,8 @@ partial class ChartView {
         int gridY = top + colHeadH;
         int gridW = w - pad * 2 - rowLabelW;
         int gridH = (y + h - pad) - gridY;
-        int cellW = gridW / cols;
-        int cellH = gridH / rows;
+        int cellW = ChartView.HeatmapCellSize(gridW, 0, cols);
+        int cellH = ChartView.HeatmapCellSize(gridH, 0, rows);
         if (cellW < 1 || cellH < 1) { return; }
         int cellGap = app.Scale(2);
 
@@ -82,7 +115,9 @@ partial class ChartView {
         if (cellW >= app.Scale(16)) {
             for (int ci = 0; ci < cols; ci = ci + 1) {
                 if (ci < labels.Count) {
-                    c.DrawTextCentered(gridX + ci * cellW, top, cellW, colHeadH,
+                    int colX = gridX + ChartView.HeatmapCellStart(gridW, ci, cols);
+                    int colW = ChartView.HeatmapCellSize(gridW, ci, cols);
+                    c.DrawTextCentered(colX, top, colW, colHeadH,
                         labels[ci],
                         Style.Part(app, "chart", "axis", "", "", "", Style.SNormal()).FgOr(0),
                         Style.FontFallback(app, "small"));
@@ -100,8 +135,10 @@ partial class ChartView {
             }
             // 行标签（序列名）；行太薄放不下文字时跳过
             // —— 密集网格靠颜色辨识，而非行名。
-            if (cellH >= app.Scale(12)) {
-                c.DrawText(x + pad, gridY + r * Canvas.CenterTextY(cellH, cellH, Style.FontFallback(app, "small")),
+            int rowY = gridY + ChartView.HeatmapCellStart(gridH, r, rows);
+            int rowH = ChartView.HeatmapCellSize(gridH, r, rows);
+            if (rowH >= app.Scale(12)) {
+                c.DrawText(x + pad, rowY + Canvas.CenterTextY(rowH, rowH, Style.FontFallback(app, "small")),
                     o.series[r].name,
                     Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0),
                     Style.FontFallback(app, "small"));
@@ -123,10 +160,10 @@ partial class ChartView {
                         Style.Part(app, "chart", "cell", "", "", "", Style.SNormal()).BgOr(0),
                         o.series[r].color, inten);
                 }
-                int bx = gridX + cc * cellW;
-                int by = gridY + r * cellH;
-                int drawW = cellW - cellGap;
-                int drawH = cellH - cellGap;
+                int bx = gridX + ChartView.HeatmapCellStart(gridW, cc, cols);
+                int by = rowY;
+                int drawW = ChartView.HeatmapCellSize(gridW, cc, cols) - cellGap;
+                int drawH = rowH - cellGap;
                 if (drawW < 1) { drawW = 1; }
                 if (drawH < 1) { drawH = 1; }
                 c.FillRoundRect(bx, by, drawW, drawH,
@@ -160,8 +197,8 @@ partial class ChartView {
         int gridY = top + colHeadH;
         int gridW = w - pad * 2 - rowLabelW;
         int gridH = (y + h - pad) - gridY;
-        int cellW = gridW / cols;
-        int cellH = gridH / rows;
+        int cellW = ChartView.HeatmapCellSize(gridW, 0, cols);
+        int cellH = ChartView.HeatmapCellSize(gridH, 0, rows);
         if (cellW < 1 || cellH < 1) { return; }
         int cellGap = app.Scale(2);
 
@@ -195,15 +232,15 @@ partial class ChartView {
         if (span2 < 1) { span2 = 1; }
         if (mx >= gridX && mx < gridX + gridW
             && my >= gridY && my < gridY + gridH) {
-            int cc2 = (mx - gridX) / cellW;
-            int rr2 = (my - gridY) / cellH;
-            int drawW = cellW - cellGap;
-            int drawH = cellH - cellGap;
+            int cc2 = ChartView.HeatmapIndexAt(mx - gridX, gridW, cols);
+            int rr2 = ChartView.HeatmapIndexAt(my - gridY, gridH, rows);
+            int bx = gridX + ChartView.HeatmapCellStart(gridW, cc2, cols);
+            int by = gridY + ChartView.HeatmapCellStart(gridH, rr2, rows);
+            int drawW = ChartView.HeatmapCellSize(gridW, cc2, cols) - cellGap;
+            int drawH = ChartView.HeatmapCellSize(gridH, rr2, rows) - cellGap;
             if (drawW < 1) { drawW = 1; }
             if (drawH < 1) { drawH = 1; }
             if (cc2 >= 0 && cc2 < cols && rr2 >= 0 && rr2 < rows) {
-                int bx = gridX + cc2 * cellW;
-                int by = gridY + rr2 * cellH;
                 bool inCell = mx >= bx && mx < bx + drawW
                     && my >= by && my < by + drawH;
                 ChartSeries hs = o.series[rr2];
