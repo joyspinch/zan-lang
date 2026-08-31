@@ -1,0 +1,214 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Widget;
+
+namespace DataTableRealtimeTest;
+
+class FixedKey : RowKeyProvider {
+    override RowKey Key(DataSource src, int row) {
+        return RowKey.Of("k:" + src.CellText(row, 0));
+    }
+}
+
+class MemoryServer : ServerDataSource {
+    int baseRows;
+    MemoryServer(int n) {
+        this.Setup(4);
+        this.baseRows = n;
+    }
+    override int FillBlock(int start, int count, List<DataRow> dst) {
+        int n = 0;
+        for (int i = start; i < start + count && i < this.baseRows; i = i + 1) {
+            DataRow r = new DataRow();
+            r.Push("s" + Convert.ToString(i));
+            r.Push(Convert.ToString(i));
+            dst.Add(r);
+            n = n + 1;
+        }
+        return n;
+    }
+}
+
+class Program {
+    static DataRow Row(string id, string value) {
+        DataRow row = new DataRow();
+        row.Push(id);
+        row.Push(value);
+        return row;
+    }
+
+    static void Main() {
+        // ---- op construction and batch compression ----
+        List<string> ca = new List<string>();
+        ca.Add("a"); ca.Add("10");
+        DeltaOp upsert = DeltaOp.UpsertRow("k:a", ca, 1);
+        DeltaOp remove = DeltaOp.RemoveRow("k:a", 2);
+        DeltaOp cell = DeltaOp.SetCell("k:a", "value", "99", 3);
+        Console.WriteLine("ops=" + (upsert.Kind() == 0 && upsert.Key() == "k:a"
+            && upsert.Revision() == 1 && upsert.Cells().Count == 2
+            && remove.Kind() == 1 && cell.Kind() == 2
+            && cell.Field() == "value" && cell.Value() == "99"));
+        DeltaBatch batch = DeltaBatch.Create();
+        batch.Add(upsert);
+        batch.Add(cell);
+        batch.Add(DeltaOp.UpsertRow("k:a", ca, 4));
+        batch.Add(cell);
+        Console.WriteLine("add=" + (batch.Count() == 4
+            && batch.At(0).Key() == "k:a"));
+        batch.Compress();
+        Console.WriteLine("compress=" + (batch.Count() == 2
+            && batch.At(0).Kind() == 0 && batch.At(1).Kind() == 2));
+
+        // ---- JSON round trip, strict rejects ----
+        string json = batch.ToJson();
+        DeltaBatch parsed = DeltaBatch.FromJson(json);
+        Console.WriteLine("json=" + (parsed != null && parsed.Count() == 2
+            && parsed.At(0).Cells().Count == 2 && parsed.At(0).Cells()[1] == "10"
+            && parsed.At(1).Field() == "value" && parsed.At(1).Value() == "99"));
+        Console.WriteLine("badVer=" + (DeltaBatch.FromJson("{\"ver\":9,\"ops\":[]}") == null));
+        Console.WriteLine("badJson=" + (DeltaBatch.FromJson("{") == null));
+        Console.WriteLine("badEmpty=" + (DeltaBatch.FromJson("") == null));
+        Console.WriteLine("badOp=" + (DeltaBatch.FromJson(
+            "{\"ver\":1,\"ops\":[{\"op\":7,\"key\":\"k:a\",\"rev\":1}]}") == null));
+        Console.WriteLine("badKey=" + (DeltaBatch.FromJson(
+            "{\"ver\":1,\"ops\":[{\"op\":1,\"key\":\"\",\"rev\":1}]}") == null));
+
+        // ---- LocalDataSource merge: upsert update/insert, remove, cell by field ----
+        List<DataColumn> cols = new List<DataColumn>();
+        cols.Add(DataColumn.Field(new DataColumn("Id", 70), "id"));
+        cols.Add(DataColumn.Field(DataColumn.Numeric("Value", 80), "value"));
+        cols[1].summary = 1;
+
+        List<DataRow> input = new List<DataRow>();
+        input.Add(Row("a", "1"));
+        input.Add(Row("b", "2"));
+        input.Add(Row("c", "3"));
+        LocalDataSource src = new LocalDataSource(input);
+        src.SetKeyProvider(new FixedKey());
+        DataTableState st = new DataTableState();
+        DataTable.EnsureInit(st, cols, src);
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("before=" + (src.RowCount() == 3
+            && st.summaryText[1] == "6"));
+
+        // select 'b' so the removal path can prove key alignment
+        DataTable.SetSelected(st, src, 1, true);
+
+        List<DeltaOp> ops1 = new List<DeltaOp>();
+        List<string> ca2 = new List<string>();
+        ca2.Add("a"); ca2.Add("10");
+        ops1.Add(DeltaOp.UpsertRow("k:a", ca2, 1));
+        List<string> cz = new List<string>();
+        cz.Add("z"); cz.Add("26");
+        ops1.Add(DeltaOp.UpsertRow("k:z", cz, 2));
+        ops1.Add(DeltaOp.RemoveRow("k:b", 3));
+        ops1.Add(DeltaOp.SetCell("k:c", "value", "99", 4));
+        DeltaResult r = DataTable.ApplyDeltas(st, cols, src, ops1);
+        Console.WriteLine("apply=" + (r != null && r.Updated() == 1
+            && r.Inserted() == 1 && r.Removed() == 1 && r.Cells() == 1
+            && r.Missing() == 0));
+        Console.WriteLine("rows=" + (src.RowCount() == 3));
+        Console.WriteLine("cells=" + (src.CellText(0, 0) == "a"
+            && src.CellText(0, 1) == "10"
+            && src.CellText(1, 0) == "c" && src.CellText(1, 1) == "99"
+            && src.CellText(2, 0) == "z" && src.CellText(2, 1) == "26"));
+        Console.WriteLine("gone=" + (DataTable.Selection(st).ContainsKey("k:b") == false));
+
+        // removed row's selection must not leak onto another row
+        bool bSel = false;
+        for (int i = 0; i < src.RowCount(); i = i + 1) {
+            if (src.CellText(i, 0) == "b") { bSel = true; }
+        }
+        Console.WriteLine("noB=" + (bSel == false));
+
+        // recompute picks up the new summary 10+99+26=135
+        DataTable.Recompute(st, cols, src);
+        Console.WriteLine("summary=" + (st.summaryText[1] == "135"));
+
+        // selection survives a delta-update of a selected row
+        DataTable.SetSelected(st, src, 0, true);
+        List<DeltaOp> ops2 = new List<DeltaOp>();
+        List<string> ca3 = new List<string>();
+        ca3.Add("a"); ca3.Add("11");
+        ops2.Add(DeltaOp.UpsertRow("k:a", ca3, 5));
+        DataTable.ApplyDeltas(st, cols, src, ops2);
+        int aRow = -1;
+        for (int i = 0; i < src.RowCount(); i = i + 1) {
+            if (src.CellText(i, 0) == "a") { aRow = i; }
+        }
+        Console.WriteLine("kept=" + (aRow >= 0
+            && DataTable.IsSelected(st, src, aRow)
+            && src.CellText(aRow, 1) == "11"));
+
+        // unknown field and unknown key are counted as missing, not faults
+        List<DeltaOp> ops3 = new List<DeltaOp>();
+        ops3.Add(DeltaOp.SetCell("k:a", "nope", "x", 6));
+        ops3.Add(DeltaOp.RemoveRow("k:ghost", 7));
+        DeltaResult r3 = DataTable.ApplyDeltas(st, cols, src, ops3);
+        Console.WriteLine("missing=" + (r3 != null && r3.Missing() == 2
+            && r3.Cells() == 0 && r3.Removed() == 0));
+
+        // remove is idempotent
+        List<DeltaOp> ops4 = new List<DeltaOp>();
+        ops4.Add(DeltaOp.RemoveRow("k:z", 8));
+        DeltaResult r4 = DataTable.ApplyDeltas(st, cols, src, ops4);
+        DeltaResult r5 = DataTable.ApplyDeltas(st, cols, src, ops4);
+        Console.WriteLine("idem=" + (r4 != null && r5 != null
+            && r4.Removed() == 1 && r5.Removed() == 0));
+
+        // ---- legacy positional keys still work (no KeyProvider) ----
+        List<DataRow> legacyInput = new List<DataRow>();
+        legacyInput.Add(Row("p", "1"));
+        legacyInput.Add(Row("q", "2"));
+        LocalDataSource legacy = new LocalDataSource(legacyInput);
+        List<DeltaOp> ops5 = new List<DeltaOp>();
+        List<string> cq = new List<string>();
+        cq.Add("q"); cq.Add("5");
+        ops5.Add(DeltaOp.UpsertRow("legacy:1", cq, 1));
+        DeltaResult r6 = DataTable.ApplyDeltas(null, null, legacy, ops5);
+        Console.WriteLine("legacy=" + (r6 != null && r6.Updated() == 1
+            && legacy.CellText(1, 1) == "5"));
+
+        // ---- unsupported source returns null and stays untouched ----
+        List<DataRow> plainInput = new List<DataRow>();
+        plainInput.Add(Row("p", "1"));
+        RowListSource plain = new RowListSource(plainInput);
+        DataTableState st2 = new DataTableState();
+        DataTable.EnsureInit(st2, cols, plain);
+        List<DeltaOp> ops6 = new List<DeltaOp>();
+        ops6.Add(DeltaOp.RemoveRow("legacy:0", 1));
+        DeltaResult r7 = DataTable.ApplyDeltas(st2, cols, plain, ops6);
+        Console.WriteLine("unsupported=" + (r7 == null && plain.RowCount() == 1));
+
+        // ---- ServerDataSource merge with legacy positional keys ----
+        ServerDataSource server = new MemoryServer(3);
+        server.SetKnownTotal(3);
+        server.RequestBlock(0);
+        server.Poll();
+        List<DeltaOp> ops7 = new List<DeltaOp>();
+        ops7.Add(DeltaOp.RemoveRow("legacy:2", 1));
+        List<string> csz = new List<string>();
+        csz.Add("s9"); csz.Add("42");
+        ops7.Add(DeltaOp.UpsertRow("legacy:9", csz, 2));
+        DeltaResult r8 = DataTable.ApplyDeltas(null, null, server, ops7);
+        Console.WriteLine("server=" + (r8 != null && r8.Removed() == 1
+            && r8.Inserted() == 1 && server.RowCount() == 3
+            && server.CellText(0, 0) == "s0" && server.CellText(1, 0) == "s1"
+            && server.CellText(2, 0) == "s9" && server.CellText(2, 1) == "42"));
+
+        // cell by pure-numeric field (column index) when no lookup installed.
+        // legacy keys are positional: the appended row now sits at index 3
+        // (3 rows in cache), so its key is legacy:3 -- legacy:9 was a key no
+        // row ever held, and cell on it must count as missing, not fault.
+        List<DeltaOp> ops8 = new List<DeltaOp>();
+        ops8.Add(DeltaOp.SetCell("legacy:9", "1", "43", 3));
+        DeltaResult r9 = DataTable.ApplyDeltas(null, null, server, ops8);
+        Console.WriteLine("serverGhostCell=" + (r9 != null && r9.Missing() == 1));
+        List<DeltaOp> ops9 = new List<DeltaOp>();
+        ops9.Add(DeltaOp.SetCell("legacy:2", "1", "43", 4));
+        DeltaResult r10 = DataTable.ApplyDeltas(null, null, server, ops9);
+        Console.WriteLine("serverCell=" + (r10 != null && r10.Cells() == 1
+            && server.CellText(2, 1) == "43"));
+    }
+}

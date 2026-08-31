@@ -1,0 +1,305 @@
+using System;
+using System.Json;
+
+namespace Gui.Component.DataTable;
+
+/// 一条实时增量操作。`kind`：0 upsert（按键整行写入或更新）、
+/// 1 remove（按键移除）、2 cell（按键修订单列的值）。
+///
+/// 所有操作都以稳定 RowKey 的 canonical 文本为行身份——没有键的行
+/// 无法参与实时合并，调用方必须先为源配置键（KeyProvider 或源的
+/// GetRowKey）。upsert 的整行值放在 `cells`（与列列表按索引对齐）；
+/// cell 操作只写 `field`（列的稳定 Field 名）和 `value`。
+class DeltaOp {
+    static const int Upsert = 0;
+    static const int Remove = 1;
+    static const int Cell = 2;
+
+    int kind;
+    string key;
+    int revision;
+    List<string> cells;
+    string field;
+    string value;
+
+    DeltaOp(int opKind, string rowKey, int rev) {
+        this.kind = opKind;
+        this.key = rowKey;
+        if (this.key == null) { this.key = ""; }
+        this.revision = rev;
+        this.cells = new List<string>();
+        this.field = "";
+        this.value = "";
+    }
+
+    /// 构造按键整行写入（已存在的键被覆盖，缺失的键追加）。
+    static DeltaOp UpsertRow(string rowKey, List<string> values, int rev) {
+        DeltaOp op = new DeltaOp(DeltaOp.Upsert, rowKey, rev);
+        if (values != null) {
+            for (int i = 0; i < values.Count; i = i + 1) {
+                string v = values[i];
+                op.cells.Add(v == null ? "" : v);
+            }
+        }
+        return op;
+    }
+
+    /// 构造按键移除。键不存在时为幂等空操作。
+    static DeltaOp RemoveRow(string rowKey, int rev) {
+        return new DeltaOp(DeltaOp.Remove, rowKey, rev);
+    }
+
+    /// 构造按键修订单列。列用稳定 Field 名寻址，
+    /// 与列的重排/插入无关。
+    static DeltaOp SetCell(string rowKey, string fieldName, string cellValue, int rev) {
+        DeltaOp op = new DeltaOp(DeltaOp.Cell, rowKey, rev);
+        op.field = fieldName;
+        if (op.field == null) { op.field = ""; }
+        op.value = cellValue;
+        if (op.value == null) { op.value = ""; }
+        return op;
+    }
+
+    int Kind() { return this.kind; }
+    string Key() { return this.key; }
+    int Revision() { return this.revision; }
+    string Field() { return this.field; }
+    string Value() { return this.value; }
+    List<string> Cells() { return this.cells; }
+
+    /// 一个 op 的瘦身拷贝：加入批后，调用方对原 cells 列表的
+    /// 后续修改不会影响批内已保存的值。
+    DeltaOp Copy() {
+        DeltaOp op = new DeltaOp(this.kind, this.key, this.revision);
+        for (int i = 0; i < this.cells.Count; i = i + 1) {
+            op.cells.Add(this.cells[i]);
+        }
+        op.field = this.field;
+        op.value = this.value;
+        return op;
+    }
+
+    JsonValue ToJsonValue() {
+        JsonValue root = JsonValue.NewObject();
+        root.Put("op", JsonValue.NewNum(Convert.ToString(this.kind)));
+        root.Put("key", JsonValue.NewStr(this.key));
+        root.Put("rev", JsonValue.NewNum(Convert.ToString(this.revision)));
+        if (this.kind == DeltaOp.Upsert) {
+            JsonValue arr = JsonValue.NewArray();
+            for (int i = 0; i < this.cells.Count; i = i + 1) {
+                arr.Append(JsonValue.NewStr(this.cells[i]));
+            }
+            root.Put("cells", arr);
+        } else if (this.kind == DeltaOp.Cell) {
+            root.Put("field", JsonValue.NewStr(this.field));
+            root.Put("value", JsonValue.NewStr(this.value));
+        }
+        return root;
+    }
+
+    /// 解析单条 op；结构不完整或 kind 未知时返回 null。
+    static DeltaOp FromJsonValue(JsonValue node) {
+        if (node == null || !node.IsObject()) { return null; }
+        if (!node.Has("op") || !node.Has("key")) { return null; }
+        int kind = node.Int("op", -1);
+        if (kind != DeltaOp.Upsert && kind != DeltaOp.Remove
+            && kind != DeltaOp.Cell) { return null; }
+        string key = node.Str("key", "");
+        if (key.Length == 0) { return null; }
+        int rev = node.Int("rev", 0);
+        DeltaOp op = new DeltaOp(kind, key, rev);
+        if (kind == DeltaOp.Upsert) {
+            JsonValue arr = node.Get("cells");
+            if (arr != null && arr.IsArray()) {
+                for (int i = 0; i < arr.Count(); i = i + 1) {
+                    op.cells.Add(arr.At(i).AsString(""));
+                }
+            }
+        } else if (kind == DeltaOp.Cell) {
+            op.field = node.Str("field", "");
+            op.value = node.Str("value", "");
+        }
+        return op;
+    }
+}
+
+/// 一批实时增量。批是应用/传输的最小单元：同批内后面的 op
+/// 可以覆盖前面的（同键 upsert 两次 = 一次最终态），应用方
+/// 只在整批成功后触发一次刷新。
+class DeltaBatch {
+    static const int FormatVersion = 1;
+
+    int version;
+    List<DeltaOp> ops;
+
+    DeltaBatch() {
+        this.version = DeltaBatch.FormatVersion;
+        this.ops = new List<DeltaOp>();
+    }
+
+    static DeltaBatch Create() {
+        return new DeltaBatch();
+    }
+
+    void Add(DeltaOp op) {
+        if (op != null) { this.ops.Add(op.Copy()); }
+    }
+
+    int Count() { return this.ops.Count; }
+    DeltaOp At(int i) { return this.ops[i]; }
+    int Version() { return this.version; }
+
+    /// 同键去重合并：保留每个 (键, 种类, cell 的列) 组合中最后一次
+    /// 出现的 op。批次典型规模是几十条，O(n²) 保序线性扫描足够。
+    void Compress() {
+        List<DeltaOp> kept = new List<DeltaOp>();
+        for (int i = 0; i < this.ops.Count; i = i + 1) {
+            DeltaOp op = this.ops[i];
+            int hit = -1;
+            for (int j = 0; j < kept.Count; j = j + 1) {
+                DeltaOp prior = kept[j];
+                bool sameRow = prior.Key() == op.Key();
+                bool sameKind = prior.Kind() == op.Kind();
+                bool sameField = op.Kind() != DeltaOp.Cell
+                    || prior.Field() == op.Field();
+                if (sameRow && sameKind && sameField) { hit = j; }
+            }
+            if (hit >= 0) { kept[hit] = op; }
+            else { kept.Add(op); }
+        }
+        this.ops = kept;
+    }
+
+    JsonValue ToJsonValue() {
+        JsonValue root = JsonValue.NewObject();
+        root.Put("ver", JsonValue.NewNum(Convert.ToString(this.version)));
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < this.ops.Count; i = i + 1) {
+            arr.Append(this.ops[i].ToJsonValue());
+        }
+        root.Put("ops", arr);
+        return root;
+    }
+
+    string ToJson() { return this.ToJsonValue().ToJson(); }
+
+    /// 解析一批；文本为空、结构不是对象、版本未知或任何一条 op
+    /// 非法时返回 null——部分应用的批次会造成幽灵行，宁缺毋滥。
+    static DeltaBatch FromJson(string text) {
+        if (text == null || text.Length == 0) { return null; }
+        JsonValue root = JsonValue.ParseLenient(text);
+        if (root == null || !root.IsObject()) { return null; }
+        if (!root.Has("ver") || !root.Has("ops")) { return null; }
+        if (root.Int("ver", 0) != DeltaBatch.FormatVersion) { return null; }
+        JsonValue arr = root.Get("ops");
+        if (arr == null || !arr.IsArray()) { return null; }
+        DeltaBatch batch = new DeltaBatch();
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            DeltaOp op = DeltaOp.FromJsonValue(arr.At(i));
+            if (op == null) { return null; }
+            batch.ops.Add(op);
+        }
+        return batch;
+    }
+}
+
+/// 批应用结果的计数快照。调用方据此更新状态栏或写日志；
+/// 同键 upsert 的"更新"与"追加"在 `updated`/`inserted` 中区分。
+class DeltaResult {
+    int inserted;
+    int updated;
+    int removed;
+    int cells;
+    int missing;
+
+    static DeltaResult Create() {
+        return new DeltaResult();
+    }
+
+    int Inserted() { return this.inserted; }
+    int Updated() { return this.updated; }
+    int Removed() { return this.removed; }
+    int Cells() { return this.cells; }
+    /// 键存在但操作未生效的条数（例如 cell 指向未知 Field）。
+    int Missing() { return this.missing; }
+}
+
+/// 实时增量分部：把一批 DeltaOp 按 RowKey 合并进数据源。
+///
+/// 能力探测走虚拟 sentinel：DataSource 上的 `virtual DeltaResult
+/// ApplyDeltas(DeltaBatch)` 默认返回 null（不支持），LocalDataSource /
+/// ServerDataSource 重写它实现真正的合并。Zan 的 `x is Interface`
+/// 目前只做非空检查（编译期已定型），不能用于运行时能力判别，
+/// 所以不用接口探测。
+partial class DataTable {
+    /// 为支持 cell 增量的源安装列 Field 名查找：委托把列索引解析为
+    /// `DataColumn.Field` 稳定名，cell 操作按名寻址，与列重排无关。
+    /// 支持的源类型各自提供 SetCellFieldLookup；不支持的源静默跳过。
+    static void SetCellFieldLookup(DataSource src, CellFieldLookup lookup) {
+        if (src == null) { return; }
+        LocalDataSource local = src as LocalDataSource;
+        if (local != null) { local.SetCellFieldLookup(lookup); return; }
+        ServerDataSource server = src as ServerDataSource;
+        if (server != null) { server.SetCellFieldLookup(lookup); }
+    }
+
+    /// 把列列表包装成 cell 增量的 Field 名查找委托：
+    /// 命名列返回其 Field，未命名/越界列返回空串（cell 视为 missing）。
+    static CellFieldLookup FieldLookupOf(List<DataColumn> cols) {
+        return delegate(int col) {
+            if (col < 0 || col >= cols.Count) { return ""; }
+            return cols[col].field;
+        };
+    }
+
+    /// 把一批增量应用到支持按键合并的数据源，并让表格状态
+    /// 与新数据对齐：键快照重建、已删行的选择/展开状态剔除、
+    /// 新键行的选择投影——稳定键选择与详情展开都按 RowKey
+    /// 对齐，行重排/插删不漂移。显示模型的脏标记已置位，
+    /// 下一帧 Recompute（渲染路径每帧调用）会自动重排。
+    /// 源不支持合并（sentinel null）时返回 null，表格不动。
+    static DeltaResult ApplyDeltas(DataTableState st, List<DataColumn> cols,
+                                   DataSource src, DeltaBatch batch) {
+        if (src == null || batch == null) { return null; }
+        // cell 增量按稳定 Field 名寻址：列列表在手时自动安装
+        // 查找委托，调用方无需手动配置。
+        if (cols != null && cols.Count > 0) {
+            DataTable.SetCellFieldLookup(src, DataTable.FieldLookupOf(cols));
+        }
+        DeltaResult result = src.ApplyDeltas(batch);
+        if (result == null) { return null; }
+        // 源已刷新：键快照、选择模型、显示模型与新数据对齐。
+        // st 为 null（纯源级测试）时只应用数据，不做表格侧对齐。
+        if (st != null) {
+            // 已删行的选择键先剔除（同 DeleteRow 的 ForgetKey 语义），
+            // 再同步投影——避免同步循环又把幽灵键写回。
+            List<string> gone = new List<string>();
+            SelectionModel sel = st.selectionModel != null
+                ? st.selectionModel : DataTable.Selection(st);
+            List<string> held = sel.Keys();
+            if (cols != null) { DataTable.EnsureInit(st, cols, src); }
+            DataTable.RebuildRowKeys(st, src);
+            for (int i = 0; i < held.Count; i = i + 1) {
+                if (DataTable.RowIndexOfKey(st, src, RowKey.Of(held[i])) < 0) {
+                    gone.Add(held[i]);
+                }
+            }
+            for (int i = 0; i < gone.Count; i = i + 1) { sel.ForgetKey(gone[i]); }
+            DataTable.InvalidateData(st);
+            DataTable.PruneExpandedKeys(st, src);
+            DataTable.SyncSelectionModel(st, src);
+        }
+        return result;
+    }
+
+    /// 便捷入口：直接用 op 列表构造并应用一批，顺序即应用顺序。
+    static DeltaResult ApplyDeltas(DataTableState st, List<DataColumn> cols,
+                                   DataSource src, List<DeltaOp> ops) {
+        if (ops == null) { return null; }
+        DeltaBatch batch = DeltaBatch.Create();
+        for (int i = 0; i < ops.Count; i = i + 1) {
+            batch.Add(ops[i]);
+        }
+        return DataTable.ApplyDeltas(st, cols, src, batch);
+    }
+}
