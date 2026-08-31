@@ -85,6 +85,19 @@ ZanIDE禁止任何自绘必须全部用标准库组件来完成
     of scope for the current task, do not silently work around it: record it in
     `TASKS.md` with the probe and the root cause, say so explicitly, and get
     agreement before shipping any temporary shape.
+11. **Concurrent sessions share this working tree — commit finished work the
+    moment it is verified.** Do not accumulate completed changes in the working
+    tree or index across steps: another session's `git stash pop`, `git reset`,
+    or broad `git checkout` can silently overwrite them, which reads as a
+    mass-revert of committed features. Commit (and push) each coherent change
+    as soon as its test tier passes. Stash discipline: before any
+    `git stash`/`push`/`pop`/`apply`, run `git status` — if the tree holds
+    another session's in-flight edits or untracked files, isolate your own work
+    with a targeted path spec (`git stash push -- <paths>`) or use a separate
+    `git worktree`; never pop a stale snapshot over a newer HEAD. If a pop
+    conflicts, resolve by keeping the newer **committed** content and re-applying
+    only genuinely new work — never stage a bulk diff that deletes already
+    committed features.
 
 ## Build / dev quickstart
 
