@@ -48,7 +48,7 @@ Chart 的立即模式入口是 `ChartView.Render(app, x, y, w, h)`，状态使�
 
 带载荷的交互事件通过 `ChartEventType`、`ChartInteractionEvent` 和 `ChartInteractionHandler` 提供。`ChartView` 与 `ChartController` 都支持 `On(type, handler)`、`Off(type, handler)`、`ClearEvents()` 以及 `OnClick`、`OnDoubleClick`、`OnHover`、`OnMouseOut`、`OnLegendSelected`、`OnDataZoom`、`OnDataRange`、`OnRestore`、`OnDataChanged` 便捷入口。line、bar、scatter、heatmap、pie、map 的首批数据点/图元命中会填充 `dataHit`、`elementType`、`seriesIndex`、`seriesName`、源 `dataIndex`、`dataName`、屏幕坐标和兼容的整数 `value`；可用时还填充 `numberValue/numberValueSet`，散点填充 `xValue/yValue`。命中计算独立于 `showTooltip`，关闭 tooltip 不会关闭 Hover、MouseOut 或 Click。点级事件优先于空白图表级事件，点 A 切换到点 B 时先发 A 的 MouseOut 再发 B 的 Hover。事件回调是 Zan typed delegate，不是可执行任意 JavaScript 的 ECharts DOM `on/un`。
 
-`PieSelected` 与 `MapSelected` 表示选择状态变化，保留为独立专用事件；同一次有效主键点击仍可另外收到通用点级 `Click`。右键释放不会触发这些选择事件，地图拖拽释放也不会被误判为区域选择。Chord/Force/Sankey/Treemap 的节点或连线（`Node`/`Link`）、Bubbles 的散点、Sunburst 叶子、Venn 圆/交集（`VennCircle`，dataIndex 0=A/1=B/2=交集）、EventRiver 事件带（`EventBand`，dataIndex 为稳定排序前的源 events 下标）、Radar 轴扇区（`RadarAxis`，dataIndex 为轴下标）、K 线桶（`Candlestick`，dataIndex 为窗口内桶首源下标、value 为桶收盘）、箱线单元（`BoxPlot`）与误差点（`ErrorBar`）均已接入 typed 命中。与 ECharts 的 `resize()`、完整 `on/un` 模型仍有差异，调用方不应假定所有 ECharts 实例方法已经存在。
+`PieSelected` 与 `MapSelected` 表示选择状态变化，保留为独立专用事件；同一次有效主键点击仍可另外收到通用点级 `Click`。右键释放不会触发这些选择事件，地图拖拽释放也不会被误判为区域选择。Chord/Force/Sankey/Treemap 的节点或连线（`Node`/`Link`）、Bubbles 的散点、Sunburst 叶子、Venn 圆/交集（`VennCircle`，dataIndex 0=A/1=B/2=交集）、EventRiver 事件带（`EventBand`，dataIndex 为稳定排序前的源 events 下标）、Radar 轴扇区（`RadarAxis`，dataIndex 为轴下标）、K 线桶（`Candlestick`，dataIndex 为窗口内桶首源下标、value 为桶收盘）、箱线单元（`BoxPlot`）、误差点（`ErrorBar`）、仪表盘（`Gauge`，整盘命中、dataIndex=0）、漏斗阶段（`FunnelStage`）与词云词条（`WordTag`，包围盒命中、dataIndex 回查源 data 下标）均已接入 typed 命中；`ChartElementType` 全部成员都有对应 renderer。堆叠系列的 `CartesianTooltip` 逐段列值并按 stackName 分组追加合计行。与 ECharts 的 `resize()`、完整 `on/un` 模型仍有差异，调用方不应假定所有 ECharts 实例方法已经存在。
 
 ### 缓存帧交互（RenderCached）
 
@@ -84,7 +84,7 @@ Force 使用确定性圆周初值和固定轮数弹簧模拟，以便缓存和�
 | timeline、connect | 已建模 | 立即模式状态持久化 |
 | GeoJSON 与压缩地图坐标 | 已建模 | 运行时解析，见 `ChartGeoJson` |
 | 任意 JavaScript formatter | 不支持 | 使用模板/内置 formatter/后续 Zan delegate |
-| typed Chart 交互事件 | 部分覆盖 | `ChartEventType`/`ChartInteractionEvent` 已提供图表级与 line/bar/scatter/heatmap/pie/map 数据点载荷，覆盖 Chord/Force/Sankey/Treemap/Sunburst 的 Node/Link 命中、Bubbles/Finance 的散点与桶命中，以及 Venn/EventRiver/Radar 的 VennCircle/EventBand/RadarAxis 命中；专用选择事件独立保留，完整 ECharts DOM `event.params` 仍不承诺 |
+| typed Chart 交互事件 | 已覆盖 | `ChartEventType`/`ChartInteractionEvent` 提供图表级与全部 renderer 的数据点/图元载荷：line/bar/scatter/heatmap/pie/map 数据点，Chord/Force/Sankey/Treemap/Sunburst 的 Node/Link，Bubbles/Finance 的散点与桶，Venn/EventRiver/Radar 的 VennCircle/EventBand/RadarAxis，FunnelStage/Candlestick/BoxPlot/ErrorBar/Gauge/WordTag——`ChartElementType` 全成员有 renderer；专用选择事件独立保留，完整 ECharts DOM `event.params` 仍不承诺 |
 | 完整 `on/un` 与实例生命周期 | 建设中 | 当前 API 是 Zan typed delegate + Render/Controller 入口，不承诺任意 ECharts DOM 实例方法 |
 | 任意 magicType 类型互换 | 不支持 | 当前提供有限 line/bar 切换 |
 | calculable 数据孤岛工作流 | 部分 | dataRange 拖拽不等同完整数据孤岛 |

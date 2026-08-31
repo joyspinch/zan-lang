@@ -148,7 +148,8 @@ dataZoom.html / dataZoom1.html / legend.html / dataRange*.html / tooltip.html
 - dataRange：连续 calculable 滑条 + 分段 splitList：批 5 全套。✅
 - `hoverLink`（dataRange↔地图反向联动）：批 A4——悬停 dataRange 条置
   高亮键，地图区域/散点按当前值域窗口描边强调（`HoverHighlight` seam）。✅
-- tooltip：`showTooltip` + 各渲染器 TooltipCard。✅
+- tooltip：`showTooltip` + 各渲染器 TooltipCard；堆叠系列逐段列值 +
+  按 stackName 分组合计行。✅
 
 ## 18. timeline 与 connect（原「有意不做」，已全部落地）
 - **timeline 动态时间轴**（bar11/map14/map19/pie7/scatter4 的 `timeline`）：
