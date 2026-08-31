@@ -962,6 +962,231 @@ static LLVMValueRef emit_eh_thread_id(zan_irgen_t *g) {
     return LLVMBuildPtrToInt(g->builder, self, i64t, "tid");
 }
 
+/* Table globals. The arrays start NULL and the first claimer installs a
+ * ZAN_EH_THREADS-entry pair, so a program that never throws pays nothing; the
+ * cap global lets __zan_eh_state grow the table when the last free slot goes.
+ * Keys and states move together and are only swapped under the spinlock, so
+ * readers either take the lock (slow path, release) or hold it (state). */
+static LLVMValueRef get_eh_tab_keys(zan_irgen_t *g) {
+    LLVMValueRef v = LLVMGetNamedGlobal(g->mod, "__zan_eh_keys");
+    if (v) return v;
+    LLVMTypeRef i64ptr = LLVMPointerType(LLVMInt64TypeInContext(g->ctx), 0);
+    return eh_add_global(g, i64ptr, "__zan_eh_keys", LLVMConstNull(i64ptr));
+}
+
+static LLVMValueRef get_eh_tab_states(zan_irgen_t *g) {
+    LLVMValueRef v = LLVMGetNamedGlobal(g->mod, "__zan_eh_states");
+    if (v) return v;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef ty = LLVMPointerType(i8ptr, 0);
+    return eh_add_global(g, ty, "__zan_eh_states", LLVMConstNull(ty));
+}
+
+static LLVMValueRef get_eh_tab_cap(zan_irgen_t *g) {
+    LLVMValueRef v = LLVMGetNamedGlobal(g->mod, "__zan_eh_cap");
+    if (v) return v;
+    return eh_add_global(g, LLVMInt64TypeInContext(g->ctx), "__zan_eh_cap",
+                         LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0));
+}
+
+/* Spinlock guarding the table arrays and their capacity. Held across a whole
+ * lookup-or-claim-or-grow, released before return; the per-thread cache keeps
+ * every later use of the state block lock-free. Fits in one word, so a
+ * compare-exchange on an i64 global is the whole implementation. */
+static LLVMValueRef get_eh_tab_lock(zan_irgen_t *g) {
+    LLVMValueRef v = LLVMGetNamedGlobal(g->mod, "__zan_eh_tab_lock");
+    if (v) return v;
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef ty = LLVMArrayType(i64t, 8);
+    return eh_add_global(g, ty, "__zan_eh_tab_lock", LLVMConstNull(ty));
+}
+
+/* Acquire the table mutex: one plain call to AcquireSRWLockExclusive /
+ * pthread_mutex_lock into the zero-initialized storage. */
+static void emit_eh_tab_lock_acquire(zan_irgen_t *g, LLVMValueRef lock_gv) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef voidt = LLVMVoidTypeInContext(g->ctx);
+    LLVMTypeRef ty = LLVMFunctionType(voidt, (LLVMTypeRef[]){ i8ptr }, 1, 0);
+    const char *name = g->target_is_windows
+        ? "AcquireSRWLockExclusive" : "pthread_mutex_lock";
+    LLVMValueRef fn = get_libc_fn(g, name, ty);
+    LLVMValueRef p = LLVMBuildBitCast(g->builder, lock_gv,
+        LLVMPointerType(i8ptr, 0), "lock.p");
+    zan_call2(g->builder, ty, fn, &p, 1, "");
+}
+
+/* Release the table mutex. */
+static void emit_eh_tab_lock_release(zan_irgen_t *g, LLVMValueRef lock_gv) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef voidt = LLVMVoidTypeInContext(g->ctx);
+    LLVMTypeRef ty = LLVMFunctionType(voidt, (LLVMTypeRef[]){ i8ptr }, 1, 0);
+    const char *name = g->target_is_windows
+        ? "ReleaseSRWLockExclusive" : "pthread_mutex_unlock";
+    LLVMValueRef fn = get_libc_fn(g, name, ty);
+    LLVMValueRef p = LLVMBuildBitCast(g->builder, lock_gv,
+        LLVMPointerType(i8ptr, 0), "lock.p");
+    zan_call2(g->builder, ty, fn, &p, 1, "");
+}
+
+/* Grow the thread table: calloc a doubled keys/states pair, rehash every live
+ * key into the new arrays (tombstones drop out, which is the point of doing
+ * this here), then install. Called with the spinlock held; the fresh arrays
+ * are unreachable until the pointer stores, so plain stores are enough.
+ * Growers set the lock to 2 first so a spinner can see the delay is bounded
+ * work, not a deadlock. */
+static void emit_eh_oom_abort(zan_irgen_t *g, const char *msg);
+static void emit_eh_tab_grow(zan_irgen_t *g, LLVMTypeRef state_ty,
+                             LLVMValueRef calloc_fn,
+                             LLVMTypeRef free_ty, LLVMValueRef free_fn) {
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64ptr = LLVMPointerType(i64t, 0);
+    LLVMTypeRef states_ptr_ty = LLVMPointerType(i8ptr, 0);
+
+    LLVMValueRef keys_gv = get_eh_tab_keys(g);
+    LLVMValueRef states_gv = get_eh_tab_states(g);
+    LLVMValueRef cap_gv = get_eh_tab_cap(g);
+    LLVMValueRef lock_gv = get_eh_tab_lock(g);
+
+    LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(cur);
+    /* The caller's current block (under the lock) falls into the grow. */
+    LLVMBasicBlockRef head  = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.head");
+    LLVMBasicBlockRef walk  = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.walk");
+    LLVMBasicBlockRef body  = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.body");
+    LLVMBasicBlockRef place = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.place");
+    LLVMBasicBlockRef npos  = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.npos");
+    LLVMBasicBlockRef scan  = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.scan");
+    LLVMBasicBlockRef full  = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.full");
+    LLVMBasicBlockRef bump  = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.bump");
+    LLVMBasicBlockRef fin   = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.fin");
+    LLVMBasicBlockRef done  = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.done");
+
+    LLVMBasicBlockRef src = cur;
+    LLVMPositionBuilderAtEnd(g->builder, cur);
+    LLVMBuildBr(g->builder, head);
+    LLVMPositionBuilderAtEnd(g->builder, head);
+
+    LLVMValueRef oldcap = LLVMBuildLoad2(g->builder, i64t, cap_gv, "gw.oldcap");
+    LLVMValueRef newcap = LLVMBuildSelect(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, oldcap, LLVMConstInt(i64t, 0, 0), "zero"),
+        LLVMConstInt(i64t, ZAN_EH_THREADS, 0),
+        LLVMBuildMul(g->builder, oldcap, LLVMConstInt(i64t, 2, 0), "dbl"),
+        "gw.newcap");
+    LLVMValueRef kb = zan_call2(g->builder,
+        LLVMFunctionType(i64ptr, (LLVMTypeRef[]){ i64t, i64t }, 2, 0),
+        calloc_fn, (LLVMValueRef[]){ newcap,
+            LLVMConstInt(i64t, 8, 0) }, 2, "gw.kb");
+    LLVMValueRef sb = zan_call2(g->builder,
+        LLVMFunctionType(states_ptr_ty, (LLVMTypeRef[]){ i64t, i64t }, 2, 0),
+        calloc_fn, (LLVMValueRef[]){ newcap, LLVMConstInt(i64t, 8, 0) }, 2,
+        "gw.sb");
+    LLVMBasicBlockRef oom = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.oom");
+    LLVMBuildCondBr(g->builder,
+        LLVMBuildOr(g->builder,
+            LLVMBuildIsNull(g->builder, kb, "kn"),
+            LLVMBuildIsNull(g->builder, sb, "sn"), "oom"),
+        oom, walk);
+    LLVMPositionBuilderAtEnd(g->builder, oom);
+    emit_eh_oom_abort(g,
+        "zan: out of memory growing the exception-handling table\n");
+
+    LLVMPositionBuilderAtEnd(g->builder, walk);
+    LLVMValueRef j_slot = LLVMBuildAlloca(g->builder, i64t, "gw.j");
+    LLVMBuildStore(g->builder, LLVMConstInt(i64t, 0, 0), j_slot);
+    LLVMBasicBlockRef head2 = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.head2");
+    LLVMBuildBr(g->builder, head2);
+
+    LLVMPositionBuilderAtEnd(g->builder, head2);
+    LLVMValueRef j = LLVMBuildLoad2(g->builder, i64t, j_slot, "gw.jv");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntULT, j, oldcap, "j.ok"), body, fin);
+
+    LLVMPositionBuilderAtEnd(g->builder, body);
+    LLVMValueRef oldkeys = LLVMBuildLoad2(g->builder, i64ptr, keys_gv, "gw.ok");
+    LLVMValueRef kp = LLVMBuildGEP2(g->builder, i64ptr, oldkeys, &j, 1, "gw.kp");
+    LLVMValueRef k = LLVMBuildLoad2(g->builder, i64t, kp, "gw.k");
+    LLVMValueRef live = LLVMBuildAnd(g->builder,
+        LLVMBuildICmp(g->builder, LLVMIntNE, k, LLVMConstInt(i64t, 0, 0), "nz"),
+        LLVMBuildICmp(g->builder, LLVMIntNE, k,
+            LLVMConstInt(i64t, ZAN_EH_TOMBSTONE, 0), "nt"), "live");
+    LLVMBuildCondBr(g->builder, live, place, bump);
+
+    LLVMPositionBuilderAtEnd(g->builder, place);
+    /* Same mix as the reader: key ^ (key >> 32), masked to the new width. */
+    LLVMValueRef h = zan_and(g->builder,
+        LLVMBuildXor(g->builder, k,
+            LLVMBuildLShr(g->builder, k, LLVMConstInt(i64t, 32, 0), "hi"),
+            "mix"),
+        LLVMBuildSub(g->builder, newcap, LLVMConstInt(i64t, 1, 0), "m1"),
+        "gw.h");
+    LLVMValueRef p_slot = LLVMBuildAlloca(g->builder, i64t, "gw.p");
+    LLVMBuildStore(g->builder, h, p_slot);
+    LLVMBuildBr(g->builder, scan);
+
+    LLVMPositionBuilderAtEnd(g->builder, scan);
+    LLVMValueRef p = LLVMBuildLoad2(g->builder, i64t, p_slot, "gw.pv");
+    LLVMValueRef nkp = LLVMBuildGEP2(g->builder, i64ptr, kb, &p, 1, "gw.nkp");
+    LLVMValueRef nk = LLVMBuildLoad2(g->builder, i64t, nkp, "gw.nk");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, nk, LLVMConstInt(i64t, 0, 0), "free"),
+        full, npos);
+
+    LLVMPositionBuilderAtEnd(g->builder, full);
+    /* Zeroed fresh array: this is a plain store. */
+    LLVMBuildStore(g->builder, k, nkp);
+    /* sb is ptr-to-i8*, so GEP2 with that element type scales p by 8 itself;
+     * multiplying here too wrote new_states[p] at sb + p*64 -- out of bounds
+     * on the first real rehash, and the >1024-thread segfault. */
+    LLVMValueRef nsp = LLVMBuildGEP2(g->builder, states_ptr_ty, sb, &p, 1,
+                                     "gw.nsp");
+    LLVMValueRef osp = LLVMBuildGEP2(g->builder, states_ptr_ty,
+        LLVMBuildLoad2(g->builder, states_ptr_ty, states_gv, "gw.os"), &j, 1,
+        "gw.osp");
+    LLVMValueRef stp = LLVMBuildLoad2(g->builder, states_ptr_ty, osp, "gw.stp");
+    LLVMBuildStore(g->builder, stp, nsp);
+    LLVMBuildBr(g->builder, bump);
+
+    LLVMPositionBuilderAtEnd(g->builder, npos);
+    /* Wrap the probe back to slot 0 at the array end: the start slot is masked
+     * and the reader probes mask every step, so without this mask a collision
+     * chain that crosses the last slot walks off the allocation and writes the
+     * key/state pair into unowned heap -- first reachable once more than
+     * ZAN_EH_THREADS threads claim states, i.e. at the first real rehash. */
+    LLVMValueRef p2 = zan_and(g->builder,
+        zan_add(g->builder, p, LLVMConstInt(i64t, 1, 0), "p.next"),
+        LLVMBuildSub(g->builder, newcap, LLVMConstInt(i64t, 1, 0), "gw.m1b"),
+        "p.wrap");
+    LLVMBuildStore(g->builder, p2, p_slot);
+    LLVMBuildBr(g->builder, scan);
+
+    LLVMPositionBuilderAtEnd(g->builder, bump);
+    LLVMBuildStore(g->builder,
+        zan_add(g->builder, j, LLVMConstInt(i64t, 1, 0), "j.next"), j_slot);
+    LLVMBuildBr(g->builder, head2);
+
+    LLVMPositionBuilderAtEnd(g->builder, fin);
+    /* Install. A stale reader cannot exist: only lock holders read the arrays
+     * (slow path) or the per-thread cache (state), and this thread holds the
+     * lock. Old arrays are freed after the pointer swap. */
+    LLVMValueRef ok = LLVMBuildLoad2(g->builder, i64ptr, keys_gv, "gw.oldk2");
+    LLVMValueRef os = LLVMBuildLoad2(g->builder, states_ptr_ty, states_gv, "gw.olds");
+    /* Plain stores: the mutex that guards them also provides the
+     * visibility ordering between the installer and later claimers. */
+    LLVMBuildStore(g->builder, kb, keys_gv);
+    LLVMBuildStore(g->builder,
+        LLVMBuildBitCast(g->builder, sb, states_ptr_ty, "sb.t"), states_gv);
+    LLVMBuildStore(g->builder, newcap, cap_gv);
+    zan_call2(g->builder, free_ty, free_fn, (LLVMValueRef[]){ ok }, 1, "");
+    zan_call2(g->builder, free_ty, free_fn,
+        (LLVMValueRef[]){ LLVMBuildBitCast(g->builder, os, i8ptr, "os.c") }, 1, "");
+    LLVMBuildBr(g->builder, done);
+    LLVMPositionBuilderAtEnd(g->builder, done);
+    /* The builder is left at gw.done so the caller's next emitted instruction
+     * lands there; the caller re-positions as it needs (it re-probes). */
+    (void)src;
+}
+
 static LLVMValueRef get_eh_state_fn(zan_irgen_t *g);
 static LLVMValueRef get_eh_state_fast_fn(zan_irgen_t *g);
 
@@ -1092,18 +1317,21 @@ static void emit_eh_oom_abort(zan_irgen_t *g, const char *msg) {
  * so a foreign thread (an X11 / SDL / Cocoa callback that ran Zan code) can
  * detach itself via zan_thread_detach. Calling it from a thread that never
  * used the runtime, or twice, is a no-op. */
-static void emit_eh_release_fn(zan_irgen_t *g, LLVMTypeRef keys_ty,
-                               LLVMTypeRef states_ty, LLVMValueRef keys,
-                               LLVMValueRef states) {
+static void emit_eh_release_fn(zan_irgen_t *g) {
     if (LLVMGetNamedFunction(g->mod, "__zan_eh_release")) return;
-    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64ptr = LLVMPointerType(i64t, 0);
+    LLVMTypeRef states_ptr_ty = LLVMPointerType(i8ptr, 0);
     LLVMTypeRef voidt = LLVMVoidTypeInContext(g->ctx);
     LLVMTypeRef state_ty = get_eh_state_ty(g);
     LLVMTypeRef tab_ty = LLVMArrayType(i8ptr, ZAN_EH_CHUNKS);
     LLVMTypeRef free_ty = LLVMFunctionType(voidt, &i8ptr, 1, 0);
     LLVMValueRef free_fn = get_libc_fn(g, "free", free_ty);
+    LLVMValueRef keys_gv = get_eh_tab_keys(g);
+    LLVMValueRef states_gv = get_eh_tab_states(g);
+    LLVMValueRef cap_gv = get_eh_tab_cap(g);
+    LLVMValueRef lock_gv = get_eh_tab_lock(g);
 
     LLVMValueRef fn = LLVMAddFunction(g->mod, "__zan_eh_release",
         LLVMFunctionType(voidt, NULL, 0, 0));
@@ -1120,33 +1348,40 @@ static void emit_eh_release_fn(zan_irgen_t *g, LLVMTypeRef keys_ty,
     LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMValueRef key = zan_add(g->builder, emit_eh_thread_id(g),
         LLVMConstInt(i64t, 1, 0), "key");
-    LLVMValueRef h = zan_and(g->builder,
-        LLVMBuildXor(g->builder, key,
-            LLVMBuildLShr(g->builder, key, LLVMConstInt(i64t, 32, 0), "key.hi"),
-            "key.mix"),
-        LLVMConstInt(i64t, ZAN_EH_THREADS - 1, 0), "h");
     LLVMValueRef i_slot = LLVMBuildAlloca(g->builder, i64t, "i");
     LLVMValueRef c_slot = LLVMBuildAlloca(g->builder, i64t, "c");
     LLVMValueRef sp_slot = LLVMBuildAlloca(g->builder, LLVMPointerType(i8ptr, 0), "spp");
     LLVMValueRef st_slot = LLVMBuildAlloca(g->builder, i8ptr, "stp");
     LLVMValueRef kp_slot = LLVMBuildAlloca(g->builder, LLVMPointerType(i64t, 0), "kpp");
+    /* The lock stays held across the chunk-freeing walk: it is bounded (64
+     * chunk slots) and releasing the block of a live thread's id must not race
+     * with that thread claiming it back. */
+    emit_eh_tab_lock_acquire(g, lock_gv);
+    LLVMValueRef cap = LLVMBuildLoad2(g->builder, i64t, cap_gv, "st.cap");
+    LLVMValueRef capm1 = LLVMBuildSub(g->builder, cap,
+        LLVMConstInt(i64t, 1, 0), "st.capm1");
+    LLVMValueRef h = zan_and(g->builder,
+        LLVMBuildXor(g->builder, key,
+            LLVMBuildLShr(g->builder, key, LLVMConstInt(i64t, 32, 0), "key.hi"),
+            "key.mix"),
+        capm1, "h");
     LLVMBuildStore(g->builder, LLVMConstInt(i64t, 0, 0), i_slot);
+    LLVMValueRef keys = LLVMBuildLoad2(g->builder, i64ptr, keys_gv, "st.keys");
+    LLVMValueRef states = LLVMBuildLoad2(g->builder, states_ptr_ty, states_gv,
+                                         "st.states");
     LLVMBuildBr(g->builder, probe);
 
     LLVMPositionBuilderAtEnd(g->builder, probe);
     LLVMValueRef zero64 = LLVMConstInt(i64t, 0, 0);
     LLVMValueRef i = LLVMBuildLoad2(g->builder, i64t, i_slot, "i.v");
     LLVMValueRef pos = zan_and(g->builder, zan_add(g->builder, h, i, "pos.raw"),
-        LLVMConstInt(i64t, ZAN_EH_THREADS - 1, 0), "pos");
-    LLVMValueRef kp = LLVMBuildGEP2(g->builder, keys_ty, keys,
-        (LLVMValueRef[]){ zero64, pos }, 2, "kp");
-    LLVMValueRef sp = LLVMBuildGEP2(g->builder, states_ty, states,
-        (LLVMValueRef[]){ zero64, pos }, 2, "sp");
+        capm1, "pos");
+    LLVMValueRef kp = LLVMBuildGEP2(g->builder, i64ptr, keys, &pos, 1, "kp");
+    LLVMValueRef sp = LLVMBuildGEP2(g->builder, states_ptr_ty, states, &pos, 1, "sp");
     LLVMBuildStore(g->builder, kp, kp_slot);
     LLVMBuildStore(g->builder, sp, sp_slot);
     LLVMValueRef k = LLVMBuildLoad2(g->builder, i64t, kp, "k");
     LLVMSetAlignment(k, 8);
-    LLVMSetOrdering(k, LLVMAtomicOrderingMonotonic);
     LLVMBuildCondBr(g->builder,
         zan_icmp(g->builder, LLVMIntEQ, k, key, "is.mine"), found, next);
 
@@ -1163,8 +1398,7 @@ static void emit_eh_release_fn(zan_irgen_t *g, LLVMTypeRef keys_ty,
     LLVMBuildCondBr(g->builder,
         LLVMBuildOr(g->builder,
             zan_icmp(g->builder, LLVMIntEQ, k2, zero64, "is.empty"),
-            zan_icmp(g->builder, LLVMIntUGE, ni,
-                LLVMConstInt(i64t, ZAN_EH_THREADS, 0), "wrapped"), "stop"),
+            zan_icmp(g->builder, LLVMIntUGE, ni, cap, "wrapped"), "stop"),
         done, probe);
 
     LLVMPositionBuilderAtEnd(g->builder, found);
@@ -1216,29 +1450,34 @@ static void emit_eh_release_fn(zan_irgen_t *g, LLVMTypeRef keys_ty,
         LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), eh_self);
     LLVMBuildStore(g->builder, LLVMConstNull(i8ptr),
         LLVMBuildLoad2(g->builder, LLVMPointerType(i8ptr, 0), sp_slot, "sp.v2"));
-    LLVMValueRef tomb = LLVMBuildStore(g->builder,
+    LLVMBuildStore(g->builder,
         LLVMConstInt(i64t, ZAN_EH_TOMBSTONE, 0),
         LLVMBuildLoad2(g->builder, LLVMPointerType(i64t, 0), kp_slot, "kp.v2"));
-    LLVMSetAlignment(tomb, 8);
-    LLVMSetOrdering(tomb, LLVMAtomicOrderingRelease);
     LLVMBuildBr(g->builder, done);
 
     LLVMPositionBuilderAtEnd(g->builder, done);
+    emit_eh_tab_lock_release(g, lock_gv);
     LLVMBuildRetVoid(g->builder);
-    (void)i32t;
 }
 
 /* i8* __zan_eh_state(): the calling thread's EH state block, created on that
+/* i8* __zan_eh_state(): the calling thread's EH state block, created on that
  * thread's first use of it.
  *
- * Threads are found in an open-addressed table keyed on the OS thread id. A
- * slot is claimed with one compare-exchange; after that only its owner touches
- * it, so the state pointer itself needs no synchronization. Blocks are never
- * freed: a thread id recycled by the OS reuses the block of the thread that
- * had it, which is correct because a thread that exits with an exception in
- * flight terminates the program. Running out of slots is fatal -- silently
- * sharing one thread's handler stack with another is exactly the corruption
- * this table exists to prevent. */
+ * Threads are found in an open-addressed table keyed on the OS thread id,
+ * guarded by a spinlock (see get_eh_tab_lock). The lock is held across the
+ * whole lookup-or-claim-or-grow: the table arrays can be swapped by a
+ * concurrent rehash mid-probe otherwise. Claim is a plain store (the lock
+ * serializes claimers); after that only the owner touches its slot, so the
+ * state pointer itself needs no synchronization -- and the per-thread cache
+ * keeps every later use lock-free.
+ *
+ * A full table grows instead of failing: ZAN_EH_THREADS (1024) is the initial
+ * capacity only, doubled whenever a probe runs off the end. Blocks are never
+ * freed while claimed: a thread id recycled by the OS reuses the block of the
+ * thread that had it, which is correct because a thread that exits with an
+ * exception in flight terminates the program. __zan_eh_release frees the
+ * block and tombstones the slot. */
 static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_state");
     if (fn) return fn;
@@ -1247,25 +1486,25 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8t, 0);
     LLVMTypeRef state_ty = get_eh_state_ty(g);
-    LLVMTypeRef keys_ty = LLVMArrayType(i64t, ZAN_EH_THREADS);
-    LLVMTypeRef states_ty = LLVMArrayType(i8ptr, ZAN_EH_THREADS);
-    LLVMValueRef keys = LLVMGetNamedGlobal(g->mod, "__zan_eh_tids");
-    if (!keys)
-        keys = eh_add_global(g, keys_ty, "__zan_eh_tids", LLVMConstNull(keys_ty));
-    LLVMValueRef states = LLVMGetNamedGlobal(g->mod, "__zan_eh_states");
-    if (!states)
-        states = eh_add_global(g, states_ty, "__zan_eh_states",
-            LLVMConstNull(states_ty));
+    LLVMTypeRef i64ptr = LLVMPointerType(i64t, 0);
+    LLVMTypeRef states_ptr_ty = LLVMPointerType(i8ptr, 0);
+    LLVMValueRef keys_gv = get_eh_tab_keys(g);
+    LLVMValueRef states_gv = get_eh_tab_states(g);
+    LLVMValueRef cap_gv = get_eh_tab_cap(g);
+    LLVMValueRef lock_gv = get_eh_tab_lock(g);
     fn = LLVMAddFunction(g->mod, "__zan_eh_state",
         LLVMFunctionType(i8ptr, NULL, 0, 0));
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
     LLVMTypeRef caty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64t, i64t }, 2, 0);
     LLVMValueRef calloc_fn = get_libc_fn(g, "calloc", caty);
+    LLVMTypeRef free_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
+    LLVMValueRef free_fn = get_libc_fn(g, "free", free_ty);
     LLVMValueRef self_slot = get_eh_self_slot(g);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef hit   = LLVMAppendBasicBlockInContext(g->ctx, fn, "hit");
     LLVMBasicBlockRef look  = LLVMAppendBasicBlockInContext(g->ctx, fn, "look");
+    LLVMBasicBlockRef retry = LLVMAppendBasicBlockInContext(g->ctx, fn, "retry");
     LLVMBasicBlockRef probe = LLVMAppendBasicBlockInContext(g->ctx, fn, "probe");
     LLVMBasicBlockRef mine  = LLVMAppendBasicBlockInContext(g->ctx, fn, "mine");
     LLVMBasicBlockRef claim = LLVMAppendBasicBlockInContext(g->ctx, fn, "claim");
@@ -1275,6 +1514,7 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef ready = LLVMAppendBasicBlockInContext(g->ctx, fn, "ready");
     LLVMBasicBlockRef next  = LLVMAppendBasicBlockInContext(g->ctx, fn, "next");
     LLVMBasicBlockRef full  = LLVMAppendBasicBlockInContext(g->ctx, fn, "full");
+    LLVMBasicBlockRef probe2 = LLVMAppendBasicBlockInContext(g->ctx, fn, "probe2");
 
     /* Allocas stay in the entry block so mem2reg still promotes them; the
      * thread-local fast path is the entry block's only other content. */
@@ -1293,36 +1533,54 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
         LLVMDeleteBasicBlock(hit);
     }
 
+    /* Slow path: under the table mutex, lookup or claim a slot. The lock is
+     * held for the whole search so a concurrent rehash cannot swap the arrays
+     * mid-probe; the per-thread cache keeps every later use lock-free. */
     LLVMPositionBuilderAtEnd(g->builder, look);
+    emit_eh_tab_lock_acquire(g, lock_gv);
+    LLVMValueRef cap0 = LLVMBuildLoad2(g->builder, i64t, cap_gv, "st.cap0");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, cap0, LLVMConstInt(i64t, 0, 0), "st.fresh"),
+        retry, probe);
+
+    LLVMPositionBuilderAtEnd(g->builder, retry);
+    emit_eh_tab_grow(g, state_ty, calloc_fn, free_ty, free_fn);
+    LLVMBuildBr(g->builder, probe);
+
+    LLVMPositionBuilderAtEnd(g->builder, probe);
     /* Key 0 marks a free slot, so shift the id out of that value. */
     LLVMValueRef key = zan_add(g->builder, emit_eh_thread_id(g),
         LLVMConstInt(i64t, 1, 0), "key");
+    LLVMValueRef cap = LLVMBuildLoad2(g->builder, i64t, cap_gv, "st.cap");
+    LLVMValueRef capm1 = LLVMBuildSub(g->builder, cap,
+        LLVMConstInt(i64t, 1, 0), "st.capm1");
     LLVMValueRef h = zan_and(g->builder,
         LLVMBuildXor(g->builder, key,
             LLVMBuildLShr(g->builder, key, LLVMConstInt(i64t, 32, 0), "key.hi"),
             "key.mix"),
-        LLVMConstInt(i64t, ZAN_EH_THREADS - 1, 0), "h");
+        capm1, "h");
+    LLVMValueRef keys = LLVMBuildLoad2(g->builder, i64ptr, keys_gv, "st.keys");
+    LLVMValueRef states = LLVMBuildLoad2(g->builder, states_ptr_ty, states_gv,
+                                         "st.states");
     LLVMBuildStore(g->builder, LLVMConstInt(i64t, 0, 0), i_slot);
-    LLVMBuildBr(g->builder, probe);
+    LLVMBuildBr(g->builder, probe2);
 
-    LLVMPositionBuilderAtEnd(g->builder, probe);
+    LLVMPositionBuilderAtEnd(g->builder, probe2);
     LLVMValueRef i = LLVMBuildLoad2(g->builder, i64t, i_slot, "i.v");
     LLVMValueRef pos = zan_and(g->builder, zan_add(g->builder, h, i, "pos.raw"),
-        LLVMConstInt(i64t, ZAN_EH_THREADS - 1, 0), "pos");
+        capm1, "pos");
     LLVMValueRef zero64 = LLVMConstInt(i64t, 0, 0);
-    LLVMValueRef kp = LLVMBuildGEP2(g->builder, keys_ty, keys,
-        (LLVMValueRef[]){ zero64, pos }, 2, "kp");
-    LLVMValueRef sp = LLVMBuildGEP2(g->builder, states_ty, states,
-        (LLVMValueRef[]){ zero64, pos }, 2, "sp");
+    LLVMValueRef kp = LLVMBuildGEP2(g->builder, i64ptr, keys, &pos, 1, "kp");
+    LLVMValueRef sp = LLVMBuildGEP2(g->builder, states_ptr_ty, states, &pos, 1, "sp");
     LLVMValueRef k = LLVMBuildLoad2(g->builder, i64t, kp, "k");
     LLVMSetAlignment(k, 8);
-    LLVMSetOrdering(k, LLVMAtomicOrderingMonotonic);
     LLVMBuildCondBr(g->builder,
         zan_icmp(g->builder, LLVMIntEQ, k, key, "is.mine"), mine, claim);
 
     LLVMPositionBuilderAtEnd(g->builder, mine);
     LLVMValueRef st_found = LLVMBuildLoad2(g->builder, i8ptr, sp, "st");
     if (self_slot) LLVMBuildStore(g->builder, st_found, self_slot);
+    emit_eh_tab_lock_release(g, lock_gv);
     LLVMBuildRet(g->builder, st_found);
 
     LLVMPositionBuilderAtEnd(g->builder, claim);
@@ -1365,6 +1623,7 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
                 "st.typed"), EH_F_TOP, "st.top"));
     LLVMBuildStore(g->builder, st, sp);
     if (self_slot) LLVMBuildStore(g->builder, st, self_slot);
+    emit_eh_tab_lock_release(g, lock_gv);
     LLVMBuildRet(g->builder, st);
 
     LLVMPositionBuilderAtEnd(g->builder, next);
@@ -1372,15 +1631,15 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
         LLVMBuildLoad2(g->builder, i64t, i_slot, "i.v2"),
         LLVMConstInt(i64t, 1, 0), "i.next");
     LLVMBuildStore(g->builder, ni, i_slot);
+    LLVMValueRef cap2 = LLVMBuildLoad2(g->builder, i64t, cap_gv, "st.cap2");
     LLVMBuildCondBr(g->builder,
-        zan_icmp(g->builder, LLVMIntUGE, ni,
-            LLVMConstInt(i64t, ZAN_EH_THREADS, 0), "exhausted"), full, probe);
+        zan_icmp(g->builder, LLVMIntUGE, ni, cap2, "exhausted"), full, probe2);
 
+    /* No free slot at the current capacity: double the table (the mutex is
+     * still held) and probe again from the top. */
     LLVMPositionBuilderAtEnd(g->builder, full);
-    emit_eh_oom_abort(g,
-        "zan: too many live threads for the exception-handling table\n");
-
-    emit_eh_release_fn(g, keys_ty, states_ty, keys, states);
+    emit_eh_tab_grow(g, state_ty, calloc_fn, free_ty, free_fn);
+    LLVMBuildBr(g->builder, probe);
 
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
     return fn;

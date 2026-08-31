@@ -22,6 +22,15 @@ typedef struct {
     int          frame_index;
 } zan_async_slot_t;
 
+/* One entry of the compiler-emitted guard-text intern table (see
+ * zan_irgen_intern_string): the source text and the single private global
+ * every identical emit reuses. */
+typedef struct zan_str_intern {
+    char *text;
+    LLVMValueRef gv;
+    struct zan_str_intern *next;
+} zan_str_intern_t;
+
 /* Growth helpers for the generator's heap tables. A fixed-size table that
  * silently stops recording (an un-scrambled literal, a dropped extern lib, a
  * mis-attributed debug file) is far worse than one that reallocs, so every
@@ -382,6 +391,7 @@ struct zan_irgen {
     int          *site_coll;     /* per site: 0=class, 1=List, 2=StringBuilder */
     zan_type_t   **site_coll_elem; /* per site: List element type (for release) */
     int          leak_site_count; /* number of distinct `new` sites assigned */
+    int          leak_site_cap;   /* capacity of the site_* host-side arrays */
     /* Per-shape descriptor globals (non-check-leaks builds): one
      * {dtor, tynames, meta, site_id} record per alloc-site shape, stored in
      * the object header instead of a site index. All three pinning tables
@@ -389,8 +399,17 @@ struct zan_irgen {
      * --gc-sections can drop every descriptor's functions that no live code
      * references. */
     LLVMValueRef *desc_gv;       /* per shape: @__zan_desc_<i> global */
+    int          desc_gv_cap;    /* capacity of desc_gv */
     bool         desc_hdr;       /* header word = descriptor pointer mode */
-    LLVMValueRef fn_report_leaks; /* void __zan_report_leaks(void) */
+    /* Intern table for compiler-emitted runtime-guard texts: identical
+     * "file:line:col: runtime error: msg" strings share one global. LLVM does
+     * not merge identical private string globals at -O0/-O1, so without this
+     * every duplicated emit re-allocates its .rdata copy (~5% of guard volume
+     * on the gallery). Pointer identity also IS the soft-report site identity
+     * (zan_rt_soft_seen), so sharing is semantically exact. */
+    zan_str_intern_t **str_intern; /* chained hash, ZAN_STR_INTERN_BUCKETS */
+                                   /* (bucket array calloc'd on first intern) */
+    int          str_intern_cap; /* allocated bucket count */    LLVMValueRef fn_report_leaks; /* void __zan_report_leaks(void) */
     const char  *src_file;        /* source path, for runtime diagnostics */
     bool         runtime_checks;  /* insert div-by-zero (etc.) guards; default true */
     bool         check_leaks;     /* emit a leak report at program exit */
@@ -683,6 +702,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             bool check_leaks, bool runtime_checks,
                             bool arc_guard);
 void zan_irgen_destroy(zan_irgen_t *g);
+
+/* Intern a compiler-emitted guard text (see irgen.c): identical strings share
+ * one private global instead of each emit site allocating its own .rdata. */
+LLVMValueRef zan_irgen_intern_string(zan_irgen_t *g, const char *text);
 
 /* Abort with "out of memory" when the malloc/realloc result `raw` is null,
  * instead of letting the store that follows write through a null buffer (which

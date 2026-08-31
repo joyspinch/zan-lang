@@ -212,14 +212,59 @@ static LLVMMetadataRef di_file_for(zan_irgen_t *g, uint32_t file_id) {
  * the stdlib pulled in by --auto-stdlib, or the source a design document is
  * projected into) carries its own loc.file_id, so attribute the site to that
  * file instead of the top-level module (g->src_file), which mislabels every
- * site as the program being compiled. */
+ * site as the program being compiled.
+ *
+ * The returned text is baked into every per-access null-guard string, so it
+ * is shortened to the final two path components ("Gui/App.zan") — an absolute
+ * path here duplicates megabytes of .rdata across a large program, and the
+ * shortened form still locates the source inside the known stdlib/project
+ * layout. Compiler diagnostics render from diag->file_names directly and
+ * keep full paths. */
 static const char *loc_site_file(zan_irgen_t *g, zan_loc_t loc) {
+    const char *p = NULL;
     if (g->diag && g->diag->file_names &&
         (int)loc.file_id < g->diag->file_count) {
-        const char *p = g->diag->file_names[loc.file_id];
-        if (p && p[0]) return p;
+        const char *q = g->diag->file_names[loc.file_id];
+        if (q && q[0]) p = q;
     }
-    return g->src_file ? g->src_file : "<unknown>";
+    if (!p) p = g->src_file ? g->src_file : "<unknown>";
+    /* last two components, whichever separator the path uses */
+    const char *slash = NULL, *prev = NULL;
+    for (const char *c = p; *c; c++) {
+        if (*c == '/' || *c == '\\') {
+            prev = slash;
+            slash = c;
+        }
+    }
+    if (slash && prev) return prev + 1;
+    return p;
+}
+
+/* Intern a compiler-emitted guard text: identical strings share one private
+ * global. LLVM does not merge identical string globals at the IR level, so
+ * without this every duplicated emit re-allocates its .rdata copy; pointer
+ * identity also IS the soft-report site identity (the runtime dedups on the
+ * text pointer), so sharing is semantically exact. Lives on the arena. */
+#define ZAN_STR_INTERN_BUCKETS 1024
+LLVMValueRef zan_irgen_intern_string(zan_irgen_t *g, const char *text) {
+    if (!g->str_intern) {
+        g->str_intern = zan_arena_alloc(g->arena,
+            ZAN_STR_INTERN_BUCKETS * sizeof(zan_str_intern_t *));
+        g->str_intern_cap = ZAN_STR_INTERN_BUCKETS;
+    }
+    unsigned h = 5381;
+    for (const char *p = text; *p; p++) h = h * 33 + (unsigned char)*p;
+    unsigned b = h & (ZAN_STR_INTERN_BUCKETS - 1);
+    for (zan_str_intern_t *e = g->str_intern[b]; e; e = e->next)
+        if (strcmp(e->text, text) == 0) return e->gv;
+    zan_str_intern_t *e = zan_arena_alloc(g->arena, sizeof(*e));
+    size_t n = strlen(text) + 1;
+    e->text = zan_arena_alloc(g->arena, n);
+    memcpy(e->text, text, n);
+    e->gv = LLVMBuildGlobalStringPtr(g->builder, text, "rterr");
+    e->next = g->str_intern[b];
+    g->str_intern[b] = e;
+    return e->gv;
 }
 
 /* Return the DISubprogram of the function currently under the builder, creating
@@ -349,7 +394,13 @@ static zan_irgen_t *g_di_emit_ctx = NULL;
 #include "../common/zan_abi.h"
 /* Maximum number of distinct ARC destructor shapes tracked by the runtime.
  * Allocation sites with the same concrete class/generic/collection shape share
- * one slot; aliasing different shapes would dispatch the wrong destructor. */
+ * one slot; aliasing different shapes would dispatch the wrong destructor.
+ *
+ * The cap only limits CHECK-LEAKS builds: those index fixed
+ * [ZAN_MAX_LEAK_SITES x ...] runtime tables keyed on the site id. Every other
+ * build (descriptor mode, the default) stores a per-shape descriptor pointer
+ * in the object header and its host-side site arrays grow dynamically, so
+ * real programs are not bounded here. */
 #define ZAN_MAX_LEAK_SITES 4096
 
 static bool types_equal(zan_type_t *a, zan_type_t *b);
@@ -449,6 +500,53 @@ static LLVMValueRef create_arc_desc(zan_irgen_t *g, int site_idx) {
     return dg;
 }
 
+/* Host-side per-site arrays (the `site_*` parallel tables and, in descriptor
+ * mode, `desc_gv`). Only the check-leaks build indexes a fixed-size LLVM
+ * runtime table, so only it keeps the cap: the runtime arrays are
+ * [ZAN_MAX_LEAK_SITES x ...] there. Every other build grows these to whatever
+ * the program's shape count demands. */
+static bool site_arrays_reserve(zan_irgen_t *g, int want) {
+    if (want <= g->leak_site_cap) return true;
+    int newcap = g->leak_site_cap ? g->leak_site_cap * 2 : 256;
+    while (newcap < want) newcap *= 2;
+    zan_symbol_t **ns = (zan_symbol_t **)realloc(g->site_syms,
+        (size_t)newcap * sizeof(zan_symbol_t *));
+    if (ns) g->site_syms = ns;
+    int *nc = (int *)realloc(g->site_coll, (size_t)newcap * sizeof(int));
+    if (nc) g->site_coll = nc;
+    zan_type_t **nce = (zan_type_t **)realloc(g->site_coll_elem,
+        (size_t)newcap * sizeof(zan_type_t *));
+    if (nce) g->site_coll_elem = nce;
+    zan_type_t **ni = (zan_type_t **)realloc(g->site_inst,
+        (size_t)newcap * sizeof(zan_type_t *));
+    if (ni) g->site_inst = ni;
+    if (!ns || !nc || !nce || !ni) return false;
+    memset(g->site_syms + g->leak_site_cap, 0,
+        (size_t)(newcap - g->leak_site_cap) * sizeof(zan_symbol_t *));
+    memset(g->site_coll + g->leak_site_cap, 0,
+        (size_t)(newcap - g->leak_site_cap) * sizeof(int));
+    memset(g->site_coll_elem + g->leak_site_cap, 0,
+        (size_t)(newcap - g->leak_site_cap) * sizeof(zan_type_t *));
+    memset(g->site_inst + g->leak_site_cap, 0,
+        (size_t)(newcap - g->leak_site_cap) * sizeof(zan_type_t *));
+    g->leak_site_cap = newcap;
+    return true;
+}
+
+static bool desc_gv_reserve(zan_irgen_t *g, int want) {
+    if (want <= g->desc_gv_cap) return true;
+    int newcap = g->desc_gv_cap ? g->desc_gv_cap * 2 : 256;
+    while (newcap < want) newcap *= 2;
+    LLVMValueRef *nd = (LLVMValueRef *)realloc(g->desc_gv,
+        (size_t)newcap * sizeof(LLVMValueRef));
+    if (!nd) return false;
+    g->desc_gv = nd;
+    memset(g->desc_gv + g->desc_gv_cap, 0,
+        (size_t)(newcap - g->desc_gv_cap) * sizeof(LLVMValueRef));
+    g->desc_gv_cap = newcap;
+    return true;
+}
+
 static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
                             zan_type_t *inst, int coll_kind,
                             zan_type_t *coll_elem) {
@@ -465,10 +563,18 @@ static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
             if (existing_sym == sym && types_equal(existing_inst, inst)) return i;
         }
     }
-    if (g->leak_site_count >= ZAN_MAX_LEAK_SITES) {
+    /* check-leaks builds index fixed [ZAN_MAX_LEAK_SITES x ...] runtime
+     * tables, so their cap is real; every other build grows. */
+    if (g->leak_site_count >= ZAN_MAX_LEAK_SITES && g->check_leaks) {
         fprintf(stderr,
-            "zanc: too many distinct ARC destructor shapes (maximum %d)\n",
+            "zanc: too many distinct ARC destructor shapes "
+            "(check-leaks maximum %d)\n",
             ZAN_MAX_LEAK_SITES);
+        exit(1);
+    }
+    if (!site_arrays_reserve(g, g->leak_site_count + 1) ||
+        (g->desc_hdr && !desc_gv_reserve(g, g->leak_site_count + 1))) {
+        fprintf(stderr, "zanc: out of memory growing ARC site tables\n");
         exit(1);
     }
     int site_idx = g->leak_site_count++;
@@ -484,10 +590,16 @@ static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
  * exists only for leak accounting -- and there it must be unique per lambda,
  * otherwise every closure in the program reports under one source location. */
 static int reserve_closure_site(zan_irgen_t *g) {
-    if (g->leak_site_count >= ZAN_MAX_LEAK_SITES) {
+    if (g->leak_site_count >= ZAN_MAX_LEAK_SITES && g->check_leaks) {
         fprintf(stderr,
-            "zanc: too many distinct ARC destructor shapes (maximum %d)\n",
+            "zanc: too many distinct ARC destructor shapes "
+            "(check-leaks maximum %d)\n",
             ZAN_MAX_LEAK_SITES);
+        exit(1);
+    }
+    if (!site_arrays_reserve(g, g->leak_site_count + 1) ||
+        (g->desc_hdr && !desc_gv_reserve(g, g->leak_site_count + 1))) {
+        fprintf(stderr, "zanc: out of memory growing ARC site tables\n");
         exit(1);
     }
     int site_idx = g->leak_site_count++;
@@ -1024,9 +1136,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->diag = diag;
     g->binder = binder;
     /* The ARC runtime functions are emitted from this call, so their guards
-     * have to be decided before it runs -- not by a later field assignment. */
+     * have to be decided before it runs -- not by a later field assignment.
+     * reserve_arc_site also keys on it: only check-leaks builds keep the
+     * fixed-size site tables. */
     g->runtime_checks = runtime_checks;
     g->arc_guard = arc_guard;
+    g->check_leaks = check_leaks;
     /* Set target before runtime codegen so Sleep/poll selection is correct. */
     if (target_triple && target_triple[0])
         snprintf(g->target_triple, sizeof(g->target_triple), "%s", target_triple);
@@ -1102,7 +1217,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 
     /* runtime-diagnostics defaults */
     g->src_file = module_name;
-    g->check_leaks = check_leaks;
 
     /* leak-tracking globals are always created; instrumentation and reporting
      * are gated on g->check_leaks, so normal builds still optimize them away. */
@@ -1114,8 +1228,9 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     /* descriptor mode (default; check_leaks keeps the site-index layout):
      * one record global per alloc-site shape, created lazily at reserve time
      * and initialized at finalize */
-    g->desc_gv = (LLVMValueRef *)calloc(ZAN_MAX_LEAK_SITES, sizeof(LLVMValueRef));
     g->desc_hdr = !check_leaks;
+    g->desc_gv_cap = 0;
+    g->leak_site_cap = 256;
     {
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i8p  = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1150,10 +1265,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMSetInitializer(g->g_site_meta, LLVMConstNull(g->site_meta_type));
             LLVMSetLinkage(g->g_site_meta, LLVMInternalLinkage);
         }
-        g->site_syms = (zan_symbol_t **)calloc(ZAN_MAX_LEAK_SITES, sizeof(zan_symbol_t *));
-        g->site_coll = (int *)calloc(ZAN_MAX_LEAK_SITES, sizeof(int));
-        g->site_coll_elem = (zan_type_t **)calloc(ZAN_MAX_LEAK_SITES, sizeof(zan_type_t *));
-        g->site_inst = (zan_type_t **)calloc(ZAN_MAX_LEAK_SITES, sizeof(zan_type_t *));
+        g->site_syms = (zan_symbol_t **)calloc(g->leak_site_cap, sizeof(zan_symbol_t *));
+        g->site_coll = (int *)calloc(g->leak_site_cap, sizeof(int));
+        g->site_coll_elem = (zan_type_t **)calloc(g->leak_site_cap, sizeof(zan_type_t *));
+        g->site_inst = (zan_type_t **)calloc(g->leak_site_cap, sizeof(zan_type_t *));
     }
 
     /* declare printf */

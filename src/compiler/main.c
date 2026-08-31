@@ -1970,6 +1970,20 @@ int main(int argc, char **argv) {
 #endif
         }
     /* Hoist for the native-driver block below (outside this scope). */
+    /* Collapse any ".." (the exe lives in build\, so the root above is
+     * "D:\proj\build\..\stdlib"): every stdlib file name lands verbatim in
+     * diagnostics, leak-site descriptors and per-access null-guard strings,
+     * and the uncollapsed form bloats each of those by the redundant prefix. */
+    {
+        char norm_root[1024];
+#ifdef _WIN32
+        if (zan_utf8_full_path(stdlib_root, norm_root, sizeof(norm_root)))
+            snprintf(stdlib_root, sizeof(stdlib_root), "%s", norm_root);
+#else
+        if (realpath(stdlib_root, norm_root))
+            snprintf(stdlib_root, sizeof(stdlib_root), "%s", norm_root);
+#endif
+    }
     snprintf(resolved_stdlib_root, sizeof(resolved_stdlib_root), "%s",
              stdlib_root);
 

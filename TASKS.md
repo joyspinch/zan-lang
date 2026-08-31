@@ -3032,3 +3032,94 @@ A71 归因出四条编译器杠杆，本条把能实测的先测掉，用数据�
   （List/Dict/StringBuilder/闭包捕获/foreach ARC）在 **默认 desc 模式、--check-leaks、
   --arc-guard、--publish** 四种模式全部通过；generic_class_instance_generic_method
   golden 一致。
+
+# A78 · 两个不合理硬编码上限拆除 + EH 线程表动态化 + 守卫串体积治理 —— ✅ 已完成（2026-08-31）
+
+## A78-1 · ARC 站点表上限拆除（ZAN_MAX_LEAK_SITES 4096）—— ✅ 已完成
+
+- **背景**：`reserve_arc_site`/`reserve_closure_site` 在站点数达 4096 时
+  `zanc: too many distinct ARC destructor shapes` 直接 exit(1)。desc_hdr
+  模式（默认，A75）下三张钉死表已退役，4096 上限只剩历史惯性；check_leaks
+  模式仍依赖固定站点 id 布局。
+- **修复（irgen.c/irgen.h）**：desc 模式站点表全部动态增长——
+  `site_arrays_reserve`（site_syms/site_coll/site_coll_elem/site_inst 四组
+  realloc 倍增，初始 256，尾段 memset）+ `desc_gv_reserve`（同型倍增），
+  两个 reserve 函数**无条件**调用（此前 desc_gv 只在越 4096 后才补分配，
+  导致 desc_hdr 模式每个新站点 create_arc_desc 写进 NULL 指针表 → 宿主
+  段错误）；check_leaks 保留 4096 硬上限但改为**干净报错**（一行说明
+  check-leaks maximum 4096 后 exit 1），不再隐性越界。
+- **验证**：plain300/plain5000 探针（5000 个 `new` 站点，输出 12497500）在
+  新编译器通过；`--check-leaks` 同探针干净报错退出；`--emit-ir` 口径站点
+  id 单调无洞。
+
+## A78-2 · EH 线程表动态化（ZAN_EH_THREADS 1024）—— ✅ 已完成
+
+- **背景**：`__zan_eh_state` 的线程表（keys/states 并行数组 + 线性探测）
+  固定 1024 槽，第 1025 个并发带 try 的线程 claim 失败时程序 abort
+  （`too many live threads`）。1100 线程探针实测：无 try 全过、带 try 必崩。
+- **修复（irgen_builtins.c）**：表改为**开放寻址哈希**（key = tid+1，
+  0=空、ZAN_EH_TOMBSTONE=可复用墓碑，探测序列 `h+i` 全程按 cap-1 掩码），
+  cap 从 0 起步、满则**倍增重哈希**（`emit_eh_tab_grow`：calloc 新对 →
+  搬运活键/状态、墓碑丢弃 → 装表 → free 旧对）；并发用 64 字节零初始化
+  全局锁存储（Windows SRWLOCK / POSIX pthread_mutex，`AcquireSRWLock…
+  /pthread_mutex_lock` 平铺调用），慢路径（查表/claim/扩容）全程持锁，
+  TLS 缓存命中路径无锁。**调试中揪出两个自埋雷（都只在首次真重哈希时
+  可达，1024 以下永现不了）**：
+  1. 重哈希扫带 `gw.npos` 的 `p+1` **未按 newcap 掩码**——碰撞链跨过
+     末槽即走出分配（实测写到 sb+0x1ce8 段错误，gdb 逐字节定位）；
+  2. `gw.nsp` 用 `GEP2(i8ptr, BitCast(sb), p*8)` **双重步长**——sb 本是
+     `ptr-to-i8*`，GEP2 自带 ×8，再乘 8 即每 64B 写一次，`states[p]` 落
+     `sb+p*64` 越界堆写。
+  修复后 `>`3000 并发带 EH 线程全绿。
+- **验证**：ehstart.zan（1100 并发 try 线程 + Start 失败计数）rc=0
+  `ready 1100 startFails 0`；300/1030/1100/2000/3000 全通过（2000 曾见
+  一条偶发 null-ref 诊断，复跑 4 次未再现）；eh1300 波次 1500 线程
+  `ok 1500`；conformance 全 48 项 exception/thread_*（含 arcguard_/
+  determinism_/leakcheck_ 变体）100% 通过。
+
+## A78-3 · 新发现预置 bug：≥64 个泛型实例化堆损坏（两套编译器皆炸）—— ⏳ 已登记未修
+
+- **现象**：单模块内同一泛型类/方法实例化到 **63 个通过、64 个起堆损坏**
+  （编译器宿主段错误，非确定性、ASLR 相关）。HEAD 编译器与本次改动后
+  的编译器同样炸，与本会话改动无关。
+- **探针**：`_scratch/pb64.zan`（63/64 实例化二分）。方向：泛型实例表
+  容量/索引 63 边界（某 64 槽表零起步减一之类）。
+- **处置**：按 AGENTS.md 规则 10 登记，待专项修复；不绕过。
+
+## A78-4 · 守卫串体积治理（.rdata 里 5 万条 runtime-error 文本）—— ✅ 已完成（第一刀 + 共享去重）
+
+- **背景**：gallery 发布二进制 ~17MB 里 50,779 条守卫串（每处引用类型成员
+  访问一条 `D:\project\zan-lang\build\..\stdlib\Gui\App.zan:818:40: runtime
+  error: null reference where an object is required (member access)`），
+  平均 130B、共 ~6.6MB，随 stdlib/用户代码行数线性增长。
+- **三处修复（全在编译器发射侧，零运行时/ABI 改动）**：
+  1. **路径归一化**（main.c）：`--auto-stdlib` 根解析 `build\..\stdlib`
+     折叠为真实绝对路径（Win32 `zan_utf8_full_path` / POSIX `realpath`），
+     冗长 `build\..` 前缀从所有诊断/泄漏描述/守卫串消失；
+  2. **两级短路径**（irgen.c `loc_site_file`）：守卫串/泄漏站点文本只留
+     末两级路径分量（`Gui/App.zan`）——绝对路径在 5 万条里重复是纯浪费，
+     缩短后仍可在已知 stdlib/项目布局中定位；编译器**诊断输出**走
+     `diag->file_names` 原路径不受影响；
+  3. **同文 intern**（irgen.c `zan_irgen_intern_string` + irgen.h
+     `zan_str_intern_t`）：同一守卫文本（同 file:line:col:msg）只发一个
+     private global——LLVM 在 -O0/-O1 不合并相同字符串全局（gallery 实测
+     1,639 条重复）；指针同一性恰好是 soft 模式站点去重语义
+     （`zan_soft_seen` 按 text 指针判重），共享后语义不变。
+  首版 intern 桶表未分配（`str_intern[b]` 解引用 NULL 表）编译 ZanGen
+  必崩，已补懒分配后全绿——教训：新哈希表先跑大输入。
+- **实测（gui_gallery dev 档）**：守卫串 35,053 条/4,553,890B →
+  **33,414 条/3,005,783B**（−34%），exe 22,330,042 → **20,782,863B**
+  （−1.55MB）。运行行为：soft 模式打印短路径守卫一次后继续（rc=0），
+  `ZAN_RT_HARD=1` exit(70) 不变。
+- **未做（第二刀设计已定，待并行会话编译器在途工作落地后一起做）**：
+  按 (file,line,col) **共享前缀 + 运行期拼接**——前缀
+  `<file>:<line>:<col>: runtime error: ` 与 msg 分开两个 global，新运行时
+  函数合成完整文本。难点：hard 模式 `RaiseException` 崩溃过滤器要单根
+  指针（需运行期缓冲，多线程安全）；`zan_rt_soft_note` 签名变更牵动
+  cross-rt 四后端。预估再省 ~1.2MB（gallery 口径），5 万条 × 35B 前缀。
+- **回归**：conformance 676 项标准档全跑（首跑 30 失败为并行会话同时在
+  途构建的干扰——单独复跑 26/30 即过；余 4 项
+  cef_profile/watermark/sparse_page/wiring 系并行在途既有，bounds_valid
+  系 string 下标语义在途改动，zanc_clean 同样失败）；EH/ARC 探针
+  （isas/cc 四模式、ehstart、eh1300、plain300/5000）全部通过。
+

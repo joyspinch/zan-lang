@@ -2297,6 +2297,24 @@ done:
         zan_diag_emit(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0),
                       "LLVM verification failed%s%s: %s",
                       culprit ? " in " : "", culprit ? culprit : "", error);
+        if (getenv("ZANC_DUMP_BAD_IR")) {
+            for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
+                 fn = LLVMGetNextFunction(fn)) {
+                if (LLVMIsDeclaration(fn)) continue;
+                if (!LLVMVerifyFunction(fn, LLVMReturnStatusAction)) continue;
+                char p[512];
+                snprintf(p, sizeof(p), "_scratch/bad_%s.txt",
+                         LLVMGetValueName(fn));
+                FILE *df = fopen(p, "w");
+                if (df) {
+                    char *txt = LLVMPrintValueToString(fn);
+                    fputs(txt, df);
+                    free(txt);
+                    fclose(df);
+                    fprintf(stderr, "dumped %s\n", p);
+                }
+            }
+        }
         LLVMDisposeMessage(error);
         return ZAN_ERROR;
     }

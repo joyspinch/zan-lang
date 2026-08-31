@@ -1204,7 +1204,7 @@ static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
     const char *file = loc_site_file(g, loc);
     snprintf(buf, sizeof(buf), "%s:%u:%u: runtime error: %s\n",
              file, loc.line, loc.col, msg);
-    LLVMValueRef text = LLVMBuildGlobalStringPtr(g->builder, buf, "rterr");
+    LLVMValueRef text = zan_irgen_intern_string(g, buf);
     emit_guard_report(g, text, loc, msg);
     /* The report leaves the builder in its soft continuation (hard mode
      * never returns), so route it into the join block. */
@@ -1225,7 +1225,7 @@ static void emit_string_null_report(zan_irgen_t *g, LLVMValueRef payload,
              "%s:%u:%u: runtime error: null reference where a string/byte "
              "buffer is required (length probe)\n",
              file, loc.line, loc.col);
-    LLVMValueRef text = LLVMBuildGlobalStringPtr(g->builder, buf, "strnull");
+    LLVMValueRef text = zan_irgen_intern_string(g, buf);
     emit_guard_report(g, text, loc, "null length probe");
 }
 
