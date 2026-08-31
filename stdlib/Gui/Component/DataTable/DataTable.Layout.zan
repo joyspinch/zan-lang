@@ -6,7 +6,8 @@ namespace Gui.Component.DataTable;
 
 /// DataTable 布局持久化：用户手工调整出的视图状态——
 /// 列宽、顺序、可见性、冻结、排序键、分组、逐列
-/// 聚合及完整筛选栈——序列化为 JSON 并读回。
+/// 聚合、完整筛选栈、稳定键选区与展开的详情行——
+/// 序列化为 JSON 并读回。
 ///
 ///   string s = DataTable.SaveLayout(st, cols);   // 例如存入设置文件
 ///   DataTable.LoadLayout(st, cols, s);           // 下次启动时
@@ -108,16 +109,34 @@ partial class DataTable {
         }
         root.Put("bands", bc);
 
-        // ---- 展开的主从详情行，按源行索引 ----
-        // 行索引只对相同数据有意义，因此对稳定表格
-        // 能正确恢复；对行已移动的表格则无害（可能展开无关行）——
-        // 面板本身总是根据
-        // 当前数据重绘。
+        // ---- 展开的主从详情行，按稳定 RowKey ----
+        // 源行索引只对相同数据有意义，行一旦重排/插删
+        // 就指到别的业务行。稳定键源写 canonical key，
+        // 恢复时无论行移动到哪里都展开同一行；没有
+        // 键提供器的旧源回退写 `legacy:` 前缀的索引，
+        // 语义与旧行为一致。
         JsonValue ex = JsonValue.NewArray();
-        for (int e2 = 0; e2 < st.expandedRows.Count; e2 = e2 + 1) {
-            ex.Append(JsonValue.NewNum(Convert.ToString(st.expandedRows[e2])));
+        for (int e2 = 0; e2 < st.expandedKeys.Count; e2 = e2 + 1) {
+            RowKey ek = st.expandedKeys[e2];
+            if (ek != null && ek.Canonical().Length > 0) {
+                ex.Append(JsonValue.NewStr(ek.Canonical()));
+            }
+        }
+        if (ex.Count() == 0 && !st.expandedByKey) {
+            for (int e3 = 0; e3 < st.expandedRows.Count; e3 = e3 + 1) {
+                ex.Append(JsonValue.NewStr("legacy:" + Convert.ToString(st.expandedRows[e3])));
+            }
         }
         root.Put("expanded", ex);
+
+        // ---- 选区快照，由 SelectionModel 序列化 ----
+        // 键集合 / 全选+排除都不物化 bool[N]；临时 key 由
+        // 模型维护方过滤，这里只写业务键。没有键提供器的
+        // 旧源不写选区：legacy 索引不是持久身份，恢复它会
+        // 在数据变化后选错行。
+        if (st.selectionModel != null && st.expandedByKey) {
+            root.Put("selection", JsonValue.ParseLenient(st.selectionModel.ToJson()));
+        }
 
         // ---- 表级开关 ----
         JsonValue v = JsonValue.NewObject();
@@ -202,6 +221,7 @@ partial class DataTable {
         DataTable.LoadGrouping(st, cols, root);
         DataTable.LoadCollapsedBands(st, root);
         DataTable.LoadExpandedRows(st, root);
+        DataTable.LoadSelection(st, root);
         DataTable.LoadViewToggles(st, root);
 
         // 布局同时携带查询（筛选、排序、分组、聚合）和
@@ -316,18 +336,52 @@ partial class DataTable {
         }
     }
 
-    /// 展开的主从详情行（扁平化时仍逐个经 CanExpand 审核）。
+    /// 展开的主从详情行。布局带 `expanded` 键数组：
+    /// 稳定键源写业务 canonical key（`legacy:` 前缀为旧索引
+    /// 格式），恢复时经 RowIndexOfKey 定位——行重排/插删后
+    /// 仍展开同一行。找不到的键被跳过；扁平化时仍逐个
+    /// 经 CanExpand 审核，无法强行展开 provider 拒绝的行。
     static void LoadExpandedRows(DataTableState st, JsonValue root) {
-        // 行在扁平化时仍经 CanExpand 审核，过期的
-        // 索引无法强行展开 provider 拒绝的 band。
         st.expandedRows.Clear();
+        st.expandedKeys.Clear();
         JsonValue ex = root.Get("expanded");
         if (ex != null && ex.IsArray()) {
             for (int e2 = 0; e2 < ex.Count(); e2 = e2 + 1) {
-                int rw = ex.At(e2).AsInt(-1);
-                if (rw >= 0 && st.expandedRows.IndexOf(rw) < 0) { st.expandedRows.Add(rw); }
+                string k = ex.At(e2).AsString("");
+                if (k.Length == 0) { continue; }
+                if (k.Length > 7 && k.Substring(0, 7) == "legacy:") {
+                    int rw = DataTable.ParseInt(k.Substring(7, k.Length - 7));
+                    if (rw >= 0 && st.expandedRows.IndexOf(rw) < 0) {
+                        st.expandedRows.Add(rw);
+                    }
+                } else if (!DataTable.ExpandedKeySeen(st, k)) {
+                    st.expandedKeys.Add(RowKey.Of(k));
+                    st.expandedByKey = true;
+                }
             }
         }
+    }
+
+    /// `k` 是否已在展开键集合里（内容相等；List.IndexOf 是引用
+    /// 比较，对 RowKey 不可用）。
+    static bool ExpandedKeySeen(DataTableState st, string k) {
+        for (int i = 0; i < st.expandedKeys.Count; i = i + 1) {
+            if (st.expandedKeys[i].Canonical() == k) { return true; }
+        }
+        return false;
+    }
+
+    /// 选区快照：从 `selection` 对象重建 SelectionModel。
+    /// 模型缺失或解析失败时保持当前模型不动（和布局中
+    /// 未提到的列一样退化为"无此状态"而非错误）。加载的
+    /// 模型此后权威：首次 SyncSelectionModel 不再把空的
+    /// 旧 bool 数组误导入成"没有选择"。
+    static void LoadSelection(DataTableState st, JsonValue root) {
+        JsonValue sel = root.Get("selection");
+        if (sel == null || !sel.IsObject()) { return; }
+        SelectionModel model = SelectionModel.FromJson(sel.ToJson());
+        if (model == null) { return; }
+        DataTable.SetSelectionModel(st, model);
     }
 
     /// 表级显示开关。
