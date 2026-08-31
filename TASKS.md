@@ -7,15 +7,15 @@
 后续扩展章节：A15-A16（语言缺口/CSS 现状）、A17-A31 与 A35-A42（历史修复，一行摘要）、
 A32（遗留收尾路线）、A33-A47（专项记录）、文末"已撤回的结论"。
 
-**本清单里凡标注〔已实测〕的结论都在机器上跑过验证；未标注的是静态分析结论。**
-早期草稿中的错误结论已作废，见文末"已撤回的结论"。
-
 > 2026-08-03：本文件已清理。已完成的条目压缩为一行摘要（原始详细记录在
 > git 历史与 `_scratch/TASKS.md.bak-2026-08-03`）；未完成/进行中/冻结的条目保留原文。
 > 2026-08-08：第二次清理。全量复核状态与数字（smoke 103/103 全绿为基线），
 > 修正了 A32-1/A32-2/A45 等"实际已完成仍标未完成"的失实条目、更新过时统计数字、
 > 修复 B7-4/B7-7 重复编号（后到者顺延为 B7-8/B7-9），并再次压缩已完成条目
 > （原始详细记录在 git 历史与 `_scratch/TASKS.md.bak-2026-08-08`）。
+> 2026-08-31：第三次清理。全量复核至 A78（含 A52-7/SelectBox/A48-1/A43-B17
+> 等被后续工作关闭的条目），已完成章节全部压缩为一行摘要
+> （原始详细记录在 git 历史与 `_scratch/TASKS.md.bak-2026-08-31`）。
 
 ## 维护约定
 
@@ -237,6 +237,7 @@ A32（遗留收尾路线）、A33-A47（专项记录）、文末"已撤回的结
   改为"当前实现 + 历史路线"分层，新增 exception propagation across suspension。
 
 ---
+
 
 # B. 标准库
 
@@ -579,6 +580,7 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
 
 ---
 
+
 # 建议执行顺序（2026-08-08 更新，只列未完成项）
 
 | 批次 | 内容 | 为什么排这里 |
@@ -679,6 +681,8 @@ overflow/visibility/cursor/accent-color。
   **仍未做**：① 无 Mac 实机执行验证（GUI dylib 已签入，同样缺实机运行）；
   ② 分发用 Developer ID 签名 + 公证未接（需证书 + App Store Connect API key）→ **A32-6**。
 
+---
+
 # A32 · 审计遗留问题彻底收尾路线（2026-07-30，计划）
 
 ## 完成定义与约束
@@ -697,67 +701,8 @@ overflow/visibility/cursor/accent-color。
 每个里程碑单独提交、单独回归。编译器改动只跑受影响子集；全量测试只作为整条路线的
 最终 release gate。
 
-## A32-0 · 冻结基线与失败矩阵（S）—— ✅ 已完成（2026-08-04，随 A32-3 落地）
 
-失败矩阵即 **A43-A 表**（每条带探针编号 + 预期输出）；实例字段初始化器"语义是否执行"
-在 A32-1 落地时确认并同批补齐（此前不执行）；async EH 成本基线记录在 A8-12/A43。
-基线命令与退出标准原文见备份。
-
-## A32-1 · 字段声明初始化器转换与语义补齐（S）—— ✅ 已完成（2026-08-08 复核）
-
-静态字段初始化器接入 main-entry 初始化循环；实例初始化器经 `emit_decl_field_initializers`
-从所有构造入口调用（此前实例初始化器不执行，语义已同批补齐；顺序/继承/每对象一次按
-C# 目标定型）；所有入口在 emit 前先过 `check_implicit_narrowing()`（窄化诊断覆盖
-static/instance/generic 三形态）；RC 字段复用 typed retain/store。
-
-**正式测试**：`tests/conformance/field_decl_initializers.zan`（执行顺序/一次性/RC 字段，
-2026-08-08 golden 实测通过）+ `diag_field_initializer_narrowing_{static,generic}.zan`
-（smoke 全绿）。
-
-## A32-2 · 统一 stride-aware 集合元素操作（L）—— ✅ 已完成（2026-08-08 复核）
-
-### A32-2a List 全操作 ✅
-
-`AddRange`（容量按 count*stride，self-AddRange 源快照）、`Insert`（整元素 stride 右移 +
-typed-store）、`Reverse`（整元素交换，不重复 retain/release）、`IndexOf`/`Contains`
-（typed equality，覆盖 12/32 字节 struct 及自定义 `==`）全部按 `elem_slot_words()` 实现；
-`irgen_call.c` 的 `wide_elem_unsupported()` 拒绝路径已全部删除（复核 0 处残留）。
-
-### A32-2b Dictionary 宽值槽 ✅
-
-`dict_struct_type` 已是 8 字段布局，field 7 = `value_words` stride 指针
-（`irgen.h` 里 334 行的注释仍是旧 4 字段描述，属代码内陈旧注释待清理）；扩容按
-value_words 算字节；new/initializer/indexer set/get/Add/Remove/Clear/扩容/析构全部
-按 stride 读写，同提交内完成全部消费者，无新旧双布局。
-
-**正式测试**：`list_wide_struct_elements.zan`（五个操作）+ `dictionary_wide_values.zan`；
-2026-08-08 实测 24 字节 struct 的 List 五操作与 Dictionary 扩容/覆盖/Remove/Clear
-全链路输出正确。
-
-## A32-3 · 统一「声明类型实例 + 方法类型参数」特化（XL）—— ✅ 已完成（2026-08-04）
-
-**根因**：`zan_method_spec` 只以 `msym + method bind[]` 为 key，泛型声明类型的实例方法被
-拒绝、body emission 又清空 `g->cur_inst`；async 由 `emit_user_methods()` 单独按原方法
-符号建 ramp/frame/resume，无法复用普通 method spec。
-
-### A32-3a 泛型类的实例泛型方法 ✅（详情见备份；正式测试
-`generic_class_instance_generic_method.zan`，三档全过）
-
-特化 key 扩为 `{method symbol, owner instantiation, method type args}`，mangling 同时编码
-`Pool<OwnerT>` 与 `M<U>`（`Pool$int_Echo$$Box`）；显式 substitution context 取代互斥的
-`cur_inst`/`cur_mbind` 隐式状态；`this` 用 owner instantiation 的具体布局，body 内
-self-call 路由到同一特化缓存；`T` 字段的 ARC 与格式化按实例化后具体类型
-（`field_store_type()` + `infer_expr_type` 的 `concretize`）。
-
-### A32-3b async 泛型方法 ✅（详情见备份；正式测试 `async_generic_method.zan` /
-`generic_class_async_generic_method.zan`，三档全过）
-
-`declare_async_method()`/`emit_async_method_ir()` 抽取为可复用 async emitter（Pass A/B
-与方法特化共用同一份 lowering）；async method spec 记录 ramp/resume/frame 布局，key 与
-名字含 owner + method type args（`Pool$string_Wrap$$int$resume` 等，不同特化不共用
-frame）；async scan 改 `resolve_type_ctx()` 解析声明类型；await 结果静态类型经
-`method_ret_type_at()` 绑定方法类型参数。「async generic methods cannot be
-monomorphized」拒绝分支已删除。
+* **A32-0 / A32-1 / A32-2 / A32-3 / A32-7** ✅ 全部完成：失败矩阵基线、字段声明初始化器、stride-aware 集合操作（List 全操作 + Dictionary 宽值槽）、泛型类实例泛型方法 + async 泛型方法统一特化、整数→浮点隐式转换（2026-08-04 ~ 08-08；详情见 git 历史与备份）。
 
 ## A32-4 · await 同步完成 fast path 与无竞争握手（L）
 
@@ -829,14 +774,6 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 4. 最终外部门：取得证书与公证凭据后，对 x64/arm64 GUI 发布包各完成一次签名、公证、staple，
    并在干净 macOS 环境启动。此前 A32-6 状态保持「自动化完成，发布验收 blocked」。
 
-## A32-7 · 整数→浮点隐式转换（S，已完成 2026-08-04）
-
-`double`/`float`/`decimal` 目标遇到整数源时不转换、直接按位落槽（`double b = 1;` 打印
-`4.94066e-324`、`2 * d` LLVM 校验失败）。修法：所有「整数值遇浮点目标」路径补一次
-`sitofp`——`coerce_int_to`/`coerce_int_pair`（混合运算两侧统一浮点后判定）、
-`emit_arg_typed`（浮点形参）、AST_RETURN、`emit_collection_slot_store`
-（List/Dictionary 宽槽，槽物理 i64 转换后再 bitcast）、`zan_store_fit`（数组元素）。
-测试 `tests/conformance/int_to_double.zan`；`ctest -R "double|float|numeric|list|dict|arith|int_to"` 47/47。
 
 ## 依赖与提交顺序（2026-08-08 更新：A32-0/1/2/3/7 已完成，下表只列未完成）
 
@@ -849,6 +786,7 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 每个里程碑按「probe → 根因修复 → conformance → determinism → leakcheck → diff/status」闭环；
 禁止把多阶段揉成一次提交。A32-5 之前不删除现有 EH 保护网，A32-5 完成后也不允许以兼容名义
 保留两套 EH。
+
 
 ---
 
@@ -888,14 +826,8 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 
 ### A33-2b 详情（已完成 2026-08-04）
 
-捕获的是**变量**而不是值：被 lambda 赋值的局部搬进**堆单元**（形状同闭包记录
-`{ fn = null, dtor, target = null, value }`），存储槽变成指向单元内 `value` 的指针，
-外层与闭包的读写落在同一块内存（`emit_boxed_var_decl` / `emit_box_cell` / `box_value_ptr` /
-`local_is_lambda_written`）；生命周期 = 闭包生命周期（声明作用域持一引用、每个捕获闭包各持
-一引用，最后一个出门的跑单元 dtor，闭包活得比栈帧长时变量跟着活）。只装箱**确实被写**的
-局部（`node_writes_ident` 认赋值/`++`/`--`/`ref`/`out`），只读捕获仍按值拷贝；async 局部
-本来就在协程帧里天然共享，跳过。
-正式测试 `closure_mutable_capture.zan`，conformance/determinism/leakcheck 三档全过。
+
+> A33-1 / A33-2 / A33-2b 已完成（2026-08-02 ~ 08-04）：闭包记录（指针 tag 区分裸函数指针与带 receiver/env 的堆记录）、实例方法组 thunk、事件表接管、被写入捕获局部按引用装箱；关闭 A43-A5/A6。详情见备份。
 
 ---
 
@@ -916,15 +848,8 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
    Linux `.so` 走 `ld.lld -shared`、macOS `.dylib` 走 `ld64.lld -dylib` + libSystem.tbd；
    runtime 对象按需链接，纯函数库零 runtime，cross 共享库需要 runtime 时明确报错。
    测试 `tests/emit_lib/` 四件套（static / windows_dll 含消费者 `[DllImport]` 链接运行
-   比对 / linux_so / macos_dylib），`ctest -R emit_lib` 4/4。
-2. [x] **A34-2 IDE 消费库目标（已实现，commit `1fde2b0f`，2026-08-08 复核）**：
-   `RunBuildBegin` 对 `IsLibraryProject` 分支产出 `HostLibExt` 库文件（Build 出库不 Run）；
-   Publish 有 isLib 分支按平台扩展名出共享库 + 可选静态库（`ProjStaticLib`/
-   `StaticLibExtFor`）；`CreateProjectT` 把 `target = <target>` 写进 zan.proj。
-3. [~] **A34-3 库的消费侧（半边完成，2026-08-08 复核）**：`--link-lib <name>` 已实现
-   （`main.c:1457` 参数解析 → `-l<name>`，commit `30d46622` bundled ld 自包含链接）；
-   **仍缺**：`link =` zan.proj 键「引用已编译 .zan 库」的语义——现实现是资源引用
-   （Linked resources），不是库引用。
+
+> A34-1 / A34-2 已完成（2026-08-01 / commit 1fde2b0f）：`-o` 后缀自动切库模式，Windows DLL / Linux .so / macOS dylib / 静态库四件套（`tests/emit_lib/`）；IDE 库目标与 Publish 分支。详情见备份。
 
 ---
 
@@ -967,6 +892,7 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 
 ---
 
+
 # A43 · 相对 C# 的能力差距登记表（2026-08-04 实测，逐条待办）
 
 口径：每条都是在本机 `zanc` 上真编译真运行的结果（探针留在 `_scratch/p/`，编号即
@@ -996,7 +922,7 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 | A43-A17 | codegen 报 `no overload of 'T.M' matches argument type(s)`，实参是**自身即一次方法调用的表达式**（`this.AddClass(this.ActiveSizeCls())`）；同一实参先落 `string` 局部变量再传即正常。typecheck 通过、仅 irgen 拒绝；`Gui.Control` 派生语境下必现（stdlib Switch.zan 两处），但最小探针（继承 + Binding<string> 字段 + 静态映射方法同形写法）不复现，疑与重载集/成员链解析路径有关 | `_scratch/probe_nested.zan`、`_scratch/probe_nested2.zan`（均**不**复现）；复现现场见 Switch.zan 改造（2026-08-29） | ⏳ 未修。暂以局部变量写法绕过（不构成能力缺失，仅诊断误导），排查方向同 A43-A15 的 irgen 实参类型传播 |
 
 > 各条修复细节（根因、落点、探针输出、回归记录）已压缩；原始详细记录在 git 历史与
-> `_scratch/TASKS.md.bak-2026-08-08`。
+> `_scratch/TASKS.md.bak-2026-08-31`。
 
 ## A43-B 语法缺失（parser 层不接受，按价值排序）
 
@@ -1018,9 +944,11 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 | A43-B14 | `checked` / `unchecked` | 02 | ✅ 已修（2026-08-08，`cs_b14_checked.zan`，no-op 纯表达式） |
 | A43-B15 | `Task` / `Task<T>` 类型名与 API | 12,31,32 | ✅ 已修（2026-08-08，`cs_b15_task.zan`）。`Task`/`Task<T>` 成为可用作值的类型（新 `TYPE_TASK` kind，opaque i64 协程句柄；`Task<int>` 携带结果类型），同时保留 builtin 静态 `Task.Spawn/Run/IsDone/Cancel/IsCancellationRequested` 调用面。`Task.Run(delegate(){...})`/`Task.Run(()=>...)`/`Task.Run(Action 变量)`：内联执行 delegate（体内 await 经 root-await 路径泵驱动），返回已完成任务（句柄 0，`__zan_co_isdone(0)` 恒 1）；`t.Wait()`：泵 `zan_co_sched_run` 直到该 frame done（协作式调度下同步上下文等协程的唯一正确方式）；`t.Result`：读 frame 结果槽（`ASYNC_FRAME_RESULT`）解码为 T 后 reap（untrack+free）；`t.IsCompleted`：非泵探针。**Task\<T\> 生命周期**：`Task.Run(<非 void async 调用>)` 不装 reaper、保留 track，frame 活到 `Result`/`Wait` 读取（恰好一个终结任务）；`Task.Spawn` 恒装 reaper（fire-and-forget 不泄漏）；`Task<T>` → `Task` 协变可赋值。**顺带修复 B5 预存缺陷**：`stdlib/System/Threading/Threading.zan` 的 `MacSemWaitUntil(string, long when)`/`MacDispatchTime(long base,...)` 参数名撞 `when`/`base` 保留字，macOS 目标 ABI 测试（stale 构建图掩盖）编译失败——改名 `deadline`/`baseTime`。**回归门禁**：standard 477/480（`cs_b15` 3 项 + 既有 474 项全过）；3 个 `emit_lib_*` 失败均为环境/并行因素，非 B15 回归：(1) `windows_dll` 链接时 `libgcc.a(emutls.o)` 缺 pthread 符号（mingw 交叉工具链无 winpthread stub，B8 时代产物时间戳佐证与本次无关）；(2) `linux_so`/`macos_dylib` 的 cross-shared guard 因 **IDE 改版并行加入的 `stdlib/System/MessageBox.zan`（untracked，17:29 创建）`using System.IO` 把 IO→DirectoryWatcher→Threading 全链拉进 `using System` 闭包**而触发（`zan_thread_*`/`zan_gate_*` extern 置位 `uses_sync_runtime`/`uses_socket_async`；移走该文件 cross-shared 立即通过，B8 时代 16:23 产物无此文件即通过）。IDE 改版合入后应将 MessageBox 移出 `System` 根命名空间（`using System` 会全量拉入 `stdlib/System/*.zan`） |
 | A43-B16 | `KeyValuePair<K,V>` | 27 | ✅ 已修（2026-08-08，`cs_b16_keyvaluepair.zan`） |
-| A43-B17 | LINQ `orderby` / `join` / `let` / `group into` | 14 | [~] **2026-08-27 复核纠正**：parser（`parser.c:521-663`：where/let/orderby 多键与 asc/desc/join…on…equals[…into]/group…by[…into]）与 irgen（`irgen_expr.c:4438+` 的排序、join 行物化、分组三条降级）**都已实现**，"只支持单 from…where…select"已过时。真正的缺口是**没有任何 conformance 覆盖**，补用例时当场撞出三个真缺陷 → 见 **A54**。`orderby` 升序在 **A53** 的 ARC 修复后已正确 |
+
+| A43-B17 | LINQ `orderby` / `join` / `let` / `group into` | 14 | ✅ 已关闭（2026-08-27，**A54**）：parser 与 irgen 降级早已实现（2026-08-27 复核纠正过旧记录），补齐 `linq_query_clauses.zan` conformance（八形态三档孪生）时撞出的七个真缺陷已全部修复。原始复核记录见备份 |
 | A43-B18 | `init` 访问器、`readonly struct` / `ref struct` | 09 | ✅ 已修（2026-08-08，`cs_b18_init.zan`） |
 | A43-B19 | 可空元素数组 `int?[]` | a11b | ✅ 已修（2026-08-08，`cs_b19_nullable_arr.zan`） |
+
 
 ## A43-C1 类型化查询的跨语句组装（dbgen，2026-08-08 前提更新，待重新验证）
 
@@ -1061,6 +989,9 @@ sel = sel.OrderByDescending(x => x.id);   // error: 'string' has no member 'Orde
 调 `checker_check_assignable`（或标量进 object 槽前装箱）。这是 B5 之前的既有缺陷，
 非 B5 引入；B5 conformance 未覆盖该形态。
 
+
+---
+
 # A44 · Chart 组件对照 ECharts 的搁置项（2026-08-06，范围决策记录）
 
 图表组件完善（补齐雷达面积填充/每轴 max、markPoint、嵌套环饼、K 线 dataZoom、
@@ -1084,6 +1015,7 @@ sel = sel.OrderByDescending(x => x.id);   // error: 'string' has no member 'Orde
 * [ ] **Canvas 曲线/旋转原语**：和弦 ribbon、韦恩等用密集折线采样 +
   `FillPolygon`（Zan 侧扫描线）近似，受"不新增原生 Canvas 导出"约束
   （五平台预编译驱动，`Render.zan` 注释）。若未来开放原生导出可替换为真贝塞尔。
+
 
 # A45 · List<T> 实参不做类型实参检查的 typecheck 洞 —— ✅ 已修复（2026-08-07，`2e1fe4b8`）
 
@@ -1268,6 +1200,7 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
   写明。先观察、暂不实现 `Use` 透传——profile 槽位有 `File.TryLock`
   串行化、helper 走 env 兜底够用，没有发现"撞 slot"的实际 bug。
 
+
 # 已撤回的结论（早期草稿中的错误，勿再引用）
 
 1. ~~"无符号/窄类型只是语法别名，IR 层全塌成 i64，语义是假的"~~ ——
@@ -1294,569 +1227,84 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
 > 泛型第 5 条（Dictionary 装泛型类值）与第 6 条（`foreach Dictionary.Keys`）；
 > async 的 try 体 / finally / switch / while / 嵌套 try / 跨协程异常传播。
 
-# A43 · enum.ToString() 返回成员名 —— ✅ 已完成（2026-08-23）
 
-- 根因：irgen 的标量 `ToString()` lowering 把 TYPE_ENUM 接收者与整数同等对待，
-  走 `emit_itoa_into` 数值路径，永远输出数字；标准库因此遍地手写 int→名映射链
-  （`Log.LevelName`、ChartModel 19 处、ChartView 12 处等）。
-- 修复：`src/compiler/irgen_call.c` 新增 `irgen_enum_members()`（C# 运行计数器
-  语义：显式 `= n` 重置、否则 +1，与 EnumType.Member 折叠和反射表三处一致）；
-  enum 接收者生成分支链 + phi join——不能用 select，回退臂的字符串缓冲在命中时
-  也被求值，会泄漏（leakcheck 孪生当场抓住过）。命中返回成员名字面量，未命中
-  回落数值格式；同值别名先声明者胜。
-- 证据：`tests/conformance/enum_tostring.zan`（含 determinism/leakcheck 孪生）、
-  `ctest -R enum` 13/13、smoke 128/128 全过。
-- [x] 后续 —— ✅ 已完成（2026-08-27 复核）：`Color.Red.ToString()` 静态成员链与
-  `Color.TryParse(string, out T)` 都已可用，用例 `tests/conformance/enum_static.zan`
-  （输出 `Green`/`Red`/`true`/`Blue`/`false`）。清单原写"连解析都不过"已过时。
-  **仍待做**：批量清理 stdlib 里手写的 int→名映射链（`Log.LevelName`、ChartModel
-  19 处、ChartView 12 处等），属收尾工作不是能力缺口。
+# 已完成条目（2026-08-23 ~ 08-31 一行摘要）
 
-# B9 · Web 框架现代化：[Tx] 事务作用域 + 签名参数绑定 —— [~]（2026-08-23）
+* **A43 · enum.ToString() 返回成员名** ✅（2026-08-23）：irgen 对 TYPE_ENUM 接收者生成分支链+phi join（select 会双求值回退臂致泄漏），`enum_tostring.zan` 13/13；`Color.Red.ToString()` 静态成员链与 `TryParse` 亦可用（`enum_static.zan`）。**仍待做**：批量清理 stdlib 手写 int→名映射链（`Log.LevelName`、ChartModel 19 处、ChartView 12 处等），收尾项非能力缺口。
+* **B9 · Web 框架现代化** 🟡（2026-08-23，2/3）：① `[Tx]` 事务作用域（Controller 三虚钩子 + GenRoute 生成 Begin/Commit/Rollback）；② 全基元签名参数绑定（蹦床 NeedX，缺失/非法统一 400/0003，参数进路由文档表）。**未做**：③ GenDb 仓储生成——从 genmeta 生成 `XxxDao` CRUD 门面 + 控制器接线，手写 DAO 保留为复杂查询出口，注入点用已落地的 `__Bind`/`__BeforeAsync`。
+* **A44 · 生成器元数据收敛（genmeta calls 裁剪）** ✅（2026-08-24）：`gm_prune_calls()` 只保留生成器消费的调用点 + recv_id 双向闭包保 fluent 链，ZanIDE 整编元数据 14.1MB→1.53MB；顺带 json.c JSON_MAX_DEPTH、genrun 解析失败显式报错。
+* **A51 · `params T[]` 回归 C# 数组语义** ✅（2026-08-27）：parser 保留 `T[]` 声明类型、打包改 `new T[]{...}`、打分按元素类型——修掉全变参调用被毙的回归；Lua/Python 调用点同步。**遗留**：自举编译器仍按 List 降级（见 B6-SH1 追加分叉）。
+* **A52 · 静默错误代码生成封口（第一批）** ✅（2026-08-27）：标量进引用形参报错（class 目标收窄为不判，保单参构造器隐式转换）、校验窗口扩到裸名调用、扩展方法打分全否决不再兜底取首、UI dispatch 队列满不再丢工作（1024 起步按需翻倍到 1M）。剩余子项见下节。
+* **A53 · 被重新赋值的引用参数不拥有其槽位（堆损坏）** ✅（2026-08-27）：`own_written_param()`——体内写过的 rc 参数入口 retain 走 owned 槽，普通方法与泛型特化两条绑定路径都接上；`param_reassign_ownership.zan` 三档孪生。
+* **A54 · LINQ 查询子句八处缺陷** ✅（2026-08-27）：loop_close 双终结符、join into 语义与悬空块、查询序列所有权、Grouping 无类符号、join 左键循环外发射、MergeSortKeys 改写调用方键列表、join 后行物化局部类型未跟换与 struct 双层槽；`linq_query_clauses.zan` 关闭 A43-B17。
+* **A55 · 值类型的类型模式永不匹配** ✅（2026-08-27）：case 匹配只处理 class/string/object，值类型臂恒 false——改为静态类型相等发常量条件；`pattern_value_types.zan`。
 
-1. ✅ **[Tx] 事务作用域**：stdlib `Controller` 新增虚方法
-   `__TxBegin()/__TxCommit()/__TxRollback()`（默认 no-op，普通控制器零感知）；
-   GenRoute 对 `[Tx]` action 生成 Begin→action→Commit，失败路径先 Rollback 再走
-   原 ApiError 应答（Begin 失败抛 503 走同一通道）；server-mvc `AppController`
-   用请求租约的 Begin/Commit/Rollback 覆盖三钩子。`Tx` 列入结构性属性不进文档元数据。
-2. ✅ **签名参数绑定**：全基元签名（int/long/string/double/bool）的实例 action
-   由蹦床按签名生成 `NeedX` 绑定，缺失/非法统一 400/0003，action 体不再手写
-   In() 拉取；同名参数进路由文档表（Controller 补齐 NeedDouble/NeedBool）。
-   静态方法与含不可绑定类型的签名维持原跳过行为，零回归。
-   演示样板：`templates/server/server-mvc/src/Controller/Admin/Dev/TxProbe.zan`。
-   - 证据：`tests/conformance/web_typed_binding.zan`（conformance/determinism/
-     leakcheck 三孪生全过）；`conformance_web_*` 既有 7 项全过；server-mvc 模板
-     215 文件整编通过（AppController 覆盖 + 新控制器）。
-3. [ ] **GenDb 仓储生成**（FreeSql 式体验的最后一块）：从 genmeta 类模型生成
-   `XxxDao` CRUD 门面 + 控制器访问器接线，项目里不再手写 UserDao 样板；
-   手写 DAO 保留为复杂查询出口。纯编译期展开，无运行时反射；
-   注入点用本次已落地的 `__Bind`/`__BeforeAsync` 请求作用域机制。
-4. 备注：`leakcheck_web_framing` 在主干上即失败（Accept 协程驻留使请求对象
-   可达），与本节改动无关；新用例采用进程内直调蹦床规避了该形态。
+## A52 剩余子项（原「下一批待做」）
 
+- [ ] **A52-5 `--publish` 的安全网**：`main.c:2335-2338` 让 `check_leaks` 与
+  `arc_guard` 都只在 `debug_info && !publish_mode` 下开启，发布版本恰好没有
+  over-release/UAF 检测；要定一个"低成本子集在发布版也保留"的方案。
+- [ ] **A52-6 null 解引用守卫**：普通 `obj.f` 直接 fault。〔2026-08-31 复核：A77 已给 `runtime_checks` 档加 null 接收者守卫（成员读/数组/字符串/替换页），出厂档的通用守卫仍未做——取舍见 A58 3.4〕
+- [ ] **A52-8 库内单方面终止进程**：OOM（`host_oom.h`）、契约违反
+  （`rt_sched.c:242`）、slab 一致性（`rt_mem.c:446,453`）共十余处 `abort()`，
+  作为被嵌入的库没有错误码出口。
+- [x] ~~A52-7 EH 线程表 1024 硬顶~~ → **A78-2** 已完成（2026-08-31，动态哈希表）。
 
-# A44 · 生成器元数据收敛（genmeta calls 裁剪）—— ✅ 已完成（2026-08-24）
+---
 
-- 症状：ZanIDE 整编时编译期元数据（`_scratch/ide_meta.json` 快照）达 14.1MB，
-  47435 个调用点被全量序列化，生成器只用到其中极少数。
-- 修复：`src/compiler/genmeta.c` 新增 `gm_prune_calls()`，只保留生成器真正消费的
-  调用点（`Json.Serialize/Deserialize`、Route 的 `In*/Need*/Param/Paged`、DB 的
-  `Query/Select/Insert/Update/Delete/SyncStructure*/Read*`、以及任何带 `Expr<...>`
-  形参的方法），并按 `recv_id` 做双向闭包保留 fluent 链的祖先与后代，避免链式
-  调用被截断。
-- 顺带修根因：`src/common/json.c` 增加 `JSON_MAX_DEPTH 1024` 递归深度上限与
-  realloc 失败检查；`src/compiler/genrun.c` 元数据只解析一次，且解析失败改为显式
-  报错并终止 codegen（此前会静默当作"没有生成器被触发"）。
-- 证据：ZanIDE 整编通过（`IDE_BUILD_OK build\ZanIDE.exe`），本次整编的元数据输入
-  1.53MB（裁剪前同口径 14.1MB）。A/B 判定：同一份 zanc 用环境变量开/关裁剪，各跑
-  一遍那 33 个失败用例，失败集合逐项完全一致，裁剪与这批失败无因果关系。
-- 备注：standard 层 562 项中 33 项失败，属工作树内其它未提交改动（irgen/checker/
-  stdlib 等）的既有问题，本节未定位；`build\ZanIDE.exe` 当前 12.23MB
-  （`dist/win-x64/ZanIDE.exe` 8-15 号快照为 8.2MB），EXE 本体增长来自 GUI/stdlib
-  侧改动，尚未追查。
-  **2026-08-27 复核**：那 33 项已不复存在，当前 standard 582 项只剩 3 项失败
-  （2 项 policy 清单待 `scripts/gen_knowledge.ps1` 收录新控件、1 项 GUI 用例是
-  并发保存 stdlib 造成的瞬时失败，单跑即绿）。
+# A56-A79 · 已完成条目（一行摘要）
 
-# A51 · `params T[]` 回归 C# 数组语义 —— ✅ 已完成（2026-08-27）
+> 详细记录（根因/落点/探针/回归数字）见 git 历史与 `_scratch/TASKS.md.bak-2026-08-31`。⏳ 的为遗留项。
 
-- 根因：`parser.c` 的 `parse_param` 把 `params T[] rest` 的声明类型改写成
-  `List<T>`（当年为补"数组形参没有长度"的缺口，该缺口已随 **A15-8** 修掉），
-  于是三处与 C# 不符：callee 只能写 `rest.Count`；params 束不能传给任何 `T[]`
-  形参；调用方传一个真数组时会被再包一层。同时打分函数拿 `List<T>`/数组类型去比
-  标量实参必然判 -1，与新增的"同 arity 候选全被否决即硬报错"叠加后，**毙掉了
-  全部变参调用**（standard 里 `params_variadic`、`lua_embed_smoke`、
-  `python_embed_smoke` 三项，报 `no overload of 'Calc.Sum' matches argument type(s)`）。
-- 修复：parser 保留声明类型 `T[]`；`pack_params_args`（`irgen_builtins.c`）打包成
-  `new T[]{...}`（`is_array` + `array_init`），单个尾实参已是数组时按 C# 直通；
-  `method_args_score`（`irgen_expr_core.c`）抽出 `concrete_arg_score` 供固定形参与
-  params 尾参共用，尾参**按元素类型**逐个打分——这正是 `op_call(params double[])`
-  与 `op_call(params string[])` 之间选对重载的依据，整束传入记 +4。
-- 标准库同步：`System/Scripting/Lua.zan`（11 处）与 `Python.zan`（8 处）的
-  `args.Count` → `args.Length`，7 处"先建 List 再转交 params"改为直接建
-  `LuaValue[]`/`PyObject[]`。
-- 证据：`tests/conformance/params_variadic.zan` 新增 `Forward(params int[])` 把束
-  转交 `Sum(int[])` 的用例（原先不可能）与数组实参直通用例；
-  `ctest -R "params|opcall|operator_call|lua_embed|python_embed|extension_methods|overload"`
-  full 档 **42/42**（含 determinism/leakcheck 孪生）；standard 582 项余 3 项失败均与本项无关。
-- 遗留：自举编译器仍按 `List<T>` 降级，见 **B6-SH1** 的 2026-08-27 追加分叉。
+* **A56 · using 闭包瘦身第一批** ✅（2026-08-27）：MessageBox→System.Windows、DirectoryWatcher→IO.Watch、RandomNumberGenerator/Guid 解耦、双 Stopwatch 合并——`using System` 从 80 文件 564KB 瘦到 16/393KB，standard 558/558；暴露并修掉 mmap 前缀表、缺 using 声明、测试写 build/_scratch 三类隐藏耦合。**未做**：Automation/Management/Windows 去 Threading+Diagnostics 税（见遗留专项）。
+* **A57 · FormBuilder 逻辑像素重构两处回归** ✅（2026-08-27）：补标题只认真写了 label；SetRowHeight 写入 100% 基准镜像。**遗留**：leakcheck_checkbox_group 引用环（见遗留专项）。
+* **A58 · 全量收口执行计划** 🟡（2026-08-27 定序）：批 1（封死静默产错码，含 1.5 有诊断即停 codegen）与批 2（验证基建：arcguard 435 项档、sanitizer 扩容、前端 fuzz 扩容抓出 41KB lexer 栈帧真 bug）完成；批 3-6 未动。正文见下。
+* **A59 · Gui.Image 图片组件** ✅（2026-08-28）：本地/http/base64/SVG 传地址即渲染。
+* **A60 · 局部帧裁剪吃掉条带外点击 + Switch 禁用可点 + 条件真值化 i0** ✅（2026-08-28）。**遗留未解**：注入点击批次偶发整批丢失（1/40，press 到而 release 未泵出，锁屏/高负载时段），待可复现样本查 `Window.InjectEvent`→原生队列→泵路径。
+* **A60 · PivotTable 整体重写** ✅（2026-08-28）：滚动/选中/百分比/热力/钉住合计；边框二修（底色与窗口同色致断裂观感）+ 悬停越界修同批。
+* **A60 · 百万行×70列导出压测探出 irgen 泄漏（链式调用接收者临时量不释放）** ✅（2026-08-28）。
+* **A61 · DynamicTags 动态标签** ✅（2026-08-28）。
+* **A62 · Watermark 水印组件 + 运行时旋转文字** ✅（2026-08-28）。
+* **A63 · Countdown 倒计时组件** ✅（2026-08-28）。
+* **A64 · System 栈封装审查第一批** ✅（2026-08-28）：MQTT/WebSocket 边界、ORM 错误 DbException 化、HttpClient keep-alive、HttpsServer 二进制体、MVC 参数族、ODBC 诊断、SQLite prepare 缓存。**明确延后**：ODBC prepare 缓存待 live 驱动环境。
+* **A64b · System 栈封装审查第二批（P3 收尾 + accept 唤醒）** ✅（2026-08-28）：CSRF 中间件（opt-in）、WssServer 回调对齐、TcpListener.CancelIoEx 唤醒 accept、MqttBroker 真停机、字符串扫描器沉淀。**遗留**：8 项 leakcheck 仍红待查（见遗留专项）。
+* **A65 · Image 渲染边界 + Carousel 控件页 + HttpClient 二进制 GET** ✅（2026-08-28）。
+* **A66 · gallery Switch/Radio 演示扩充** ✅（2026-08-28）；**A66 · Carousel 纵向方向 + 演示重做 + autoplay 即时模式修复** ✅（2026-08-28）。
+* **A67 · string[i] 静态类型在 irgen 丢失（char 逐字文本化输出十进制码）** ✅（2026-08-28）。**语言级遗留**：字节×码点语义冲突待专项定夺（见遗留专项）。
+* **A68 · null 引用进入字符串头探针（IsBadReadPtr(null-8) 在 KERNEL32 内 AV）** ✅（2026-08-29）：`zan_hdr_read_ok` 判空控制流先行短路，探针调用不发射。
+* **A69 · PivotTable 部分可见行无裁剪（行头/行合计越进表头带）** ✅（2026-08-29）。**遗留观察**：`ResolvedSeries_Of` 读 addr=0x5（null ChartSeries 应用级空引用，1/41），随 gui_charts 重构观察。
+* **A70 · NumberAnimation 数值滚动动画组件** ✅（2026-08-29）。
+* **A71 · Steps 强化 + base.Method()/base.Prop 编译器支持** ✅（2026-08-29）。
+* **A71 · Gui 图标表 JSON 数据包 + zanc 自动内嵌** ✅（2026-08-30）：空窗 2.08MB 里 483KB 图标出体；**后续路线**见遗留专项。
+* **A72 · Pinyin 词典数据文件化** ✅（2026-08-30）：91% 字面量密度出体（6,763 行 GB2312）。
+* **A73 · 优化第一批：inline 阈值按优化档位分档（−23%）+ PIC 假设证伪** ✅（2026-08-30）。
+* **A74 · function-sections + --gc-sections（发布档）+ 三表钉死量化** ✅（2026-08-30）：空窗 -167KB；实锤 895/1010 定义函数被 site_dtors 钉死、~72% .text 可去死。
+* **A75 · ARC 描述符头（per-shape desc 指针，site_dtors/site_tynames/site_meta 三张钉死表退役）** ✅（2026-08-31）：空窗 -3.5%，globaldce 重新生效。
+* **A76 · WSL null 字符串探针受控化 + 崩溃日志双 0x** ✅（2026-08-30）：length 探针/元素访问受控报错，跨平台 408 项批跑；**遗留** 3 个应用层 crasher（见遗留专项）。
+* **A77 · 运行时守卫双路径化（fail-soft 记录不闪退 + ZAN_RT_HARD=1 exit(70)）** ✅（2026-08-31）：soft 路径 stderr 去重一次 + 崩溃日志 + 256B 替身页继续跑；cross-rt 六目标重建（win-arm64 待 CI/CLANGARM64）。
+* **A78-1 · ARC 站点表 4096 上限拆除** ✅（2026-08-31，动态哈希）。
+* **A78-2 · EH 线程表 1024 动态化** ✅（2026-08-31）：开放寻址哈希 + 倍增重哈希（修两个只在首次重哈希可达的自埋雷：扫带未掩码回绕、states 拷贝双重步长），>3000 并发带 EH 线程绿；关闭 A52-7。
+* **A78-4 · 守卫串体积治理** ✅（2026-08-31，两刀）：路径归一化 + 两级短路径 + 同文 intern + msg 模板共享（`zan_rt_soft_note2` 按前缀指针判重、hard 路径函数入口 [1400 x i8] 合成槽）；cross 目标走 merged 回退待 zig 重建后切换。6.6MB→1.5MB（−67%）。
+* **gallery 目录外置化（assets/gallery.json）** ✅（2026-08-31）：84 组件 270 演示卡外置，gui_gallery.zan 1.09→0.67MB。**已知问题**：build_gallery.ps1 手挑 stdlib 文件列表被并行 stdlib 新依赖（System.Json/Mqtt）建挂，待依赖链收口后补文件或改 `--auto-stdlib`。
+* **SelectBox 弹层选项选不中（基线命中）** ✅（2026-08-29，commit 5d11b650）：`HitTestFrom(px,py,from)` 基线命中原语，弹层只匹配自己 blocker 之后注册的区域；无头回归 selectbox_popup_hit_test + 有头探针验证。
+* **Gui/Chart 后续（2.2.7 对齐轮遗留）**：timeline 子系统、connect() 多图联动 ✅（2026-08-30，ECharts 134/134 全 ✅）。**架构注记 A · 共享坐标系共存层** [ ] 仍开放：跨图族混搭需抽共享坐标系/布局层供多渲染器叠画，重构面大于收益，待真实需求立项。
 
-# A52 · 静默错误代码生成的封口（第一批）—— ✅ 已完成（2026-08-27）
+## A78-3 · 新发现预置 bug：≥64 个泛型实例化堆损坏 —— ⏳ 已登记未修
 
-以"编译通过但产错码"这一类为优先，逐条修根因；每项都有探针与用例。
+- **现象**：单模块内同一泛型类/方法实例化到 **63 个通过、64 个起堆损坏**
+  （编译器宿主段错误，非确定性、ASLR 相关）。HEAD 编译器与改动后同样炸。
+- **探针**：`_scratch/pb64.zan`（63/64 实例化二分）。方向：泛型实例表
+  容量/索引 63 边界（某 64 槽表零起步减一之类）。
+- **处置**：按 AGENTS.md 规则 10 登记，待专项修复；不绕过。
 
-1. **标量进引用形参**（A43-B 已知缺陷，登记已久）：`F(object o)` 收标量时 irgen 直接
-   `IntToPtr`（`irgen_arc.c` 的 `emit_boundary_coerce`），之后对该槽做 `is`/模式匹配
-   按指针解引用读 `ptr-8` 即崩。修在 `checker.c::checker_arg_type_mismatch`：标量
-   （numeric/bool/char/enum/nint）遇 `object`/interface/delegate/array 目标一律
-   DIAG_ERROR，与 `object o = 42;` 在赋值处的既有规则一致。
-   **class 目标故意不判**——本语言允许单参构造器做隐式转换
-   （`InitCheckbox(lbl, false)` 造 `SignalBool`），且 `emit_arg_typed` 已在无匹配
-   构造器时报错；第一版把 class 一起判了，standard 里 GUI 全线误报，已收窄。
-   用例 `tests/diag/scalar_argument_to_reference.zan`（smoke 档）。
-2. **校验窗口扩到裸名调用**：`call_arg_signature` 原来只认 `recv.M(a)` 形态，
-   隐式 this / 同类静态的 `M(a)` 完全不过实参校验（正是 A43-A15 那条静默路径的
-   同一盲区）。现按封闭类型的唯一同名方法解析，同名局部/参数/字段存在时让位给
-   委托调用。实测 `Draw(t)`、`Paint(t)`、`Paint(7)` 三种形态都在源码位置报错。
-3. **扩展方法不再"打分全否决仍取第一个"**：`find_extension_method` 删掉 `first`
-   兜底，全否决即返回 NULL（调用方按"没有该成员"报错），与 **A51** 里
-   `resolve_overload_typed` 的处理一致。
-4. **runtime：UI dispatch 队列不再静默丢工作**（`rt_sync.c`）：原固定 1024 环，满则
-   `zan_dispatch_post` 返回 0，而两个 Zan 调用方（`App.Post`、`UiEvent.Post`）都丢弃
-   该返回值——一次超过一帧排空能力的突发就等于"这个点击处理器根本没跑"。现从静态
-   1024 起按需翻倍到 1M（静态段起步，常态零分配），到顶才拒绝并在 stderr 留一行；
-   `zan_dispatch_clear` 改 64 条一批地排空（否则一百万条要一个 8MB 栈数组），
-   仍保持"释放在锁外"。用例 `tests/conformance/dispatch_queue_growth.zan`
-   （5000 条不排空全部入队、clear 清空、清空后仍可用），三档孪生全过。
-- 证据：`ctest -L standard -E "gui|policy"` **556/556**；dispatch/delegate/sync 相关
-  full 档 50/50（含新用例的 determinism/leakcheck 孪生）。GUI 与 policy 用例按
-  用户要求跳过（stdlib/Gui 正在并行改动）。
-- 下一批待做（都需要先定性能/语义取舍，未擅自动手）：
-  - [ ] **A52-5 `--publish` 的安全网**：`main.c:2335-2338` 让 `check_leaks` 与
-    `arc_guard` 都只在 `debug_info && !publish_mode` 下开启，发布版本恰好没有
-    over-release/UAF 检测；要定一个"低成本子集在发布版也保留"的方案。
-  - [ ] **A52-6 null 解引用守卫**：只有 weak 字段、nullable `.Value`、`?.` 有守卫，
-    普通 `obj.f` 直接 fault；opaque string（形参/extern 返回/字段）的下标也不检查
-    （`irgen_expr.c:55-64`）。
-  - [ ] **A52-7 EH 线程表 1024 硬顶**：`zan_abi.h:123` + `irgen_builtins.c` 耗尽即
-    `exit(1)`，且 GUI/外部回调线程从不调 `zan_thread_detach()`（A4-2 遗留）。
-  - [ ] **A52-8 库内单方面终止进程**：OOM（`host_oom.h`）、契约违反
-    （`rt_sched.c:242`）、slab 一致性（`rt_mem.c:446,453`）共十余处 `abort()`，
-    作为被嵌入的库没有错误码出口。
+## A70 · `Thread.Start` 不能携带实例方法组 —— ⏳ 已登记，暂缓修复（2026-08-29）
 
-# A53 · 被重新赋值的引用参数不拥有其槽位（堆损坏）—— ✅ 已修（2026-08-27）
+- **症状**：`Thread.Start(job.Run)`（实例方法组）启动瞬间 SEGFAULT，无诊断；静态方法组同形写法正常（`_scratch/threadjob.zan`）。
+- **根因**：委托 ABI 里实例方法组是带 ZAN_CLOSURE_TAG 的堆记录指针（bit0=1），`rt_sync.c` 的 `zan_thread_start` 把参数原样当裸 `void(*)()` 调用即崩；checker 不拦。
+- **当前回避（stdlib 两处同构）**：`ImageHttp.zan`（下载）与 `Upload.zan`（上传）线程入口用静态方法组 + 队列传实例。
+- **修法建议**：① 运行时 `zan_thread_start` 检查 bit0 解包记录经 trampoline 调用（根治）；② checker 在实参转换点拒绝"实例方法组 → ThreadStart"。
 
-- **症状**：`orderby` 的结果是一个"半归并"的错误序列，随后进程以
-  `0xC0000374`（堆损坏）退出。同一套归并排序手写成非泛型版本结果正确，
-  放进标准库的 `Enumerable.MergeSortKeysInt<T>` 就错——一度误判为泛型缺陷。
-- **根因**（探针 `_scratch/q3..q9.zan`，用 `--emit-ir` 逐指令核对）：实参是**借入**
-  的（调用方持有那一份计数），所以参数槽此前是裸 alloca：写进去既不 retain 新值、
-  也不 release 旧值。于是 `t = p; p = q; q = t;` 之后，**拥有型局部** `q` 里装的是
-  调用方的对象，作用域退出时把它释放掉——调用方的对象在其仍在使用时被 free；
-  同时 `return p` 交出的是刚被 `q = t` 释放掉的新对象（use-after-free）。
-  标准库的自底向上归并排序正是这个形状（`List<int> tk = ka; ka = kb; kb = tk;`，
-  `ka` 是参数），所以 `orderby` 必然踩中。
-- **修复**：`irgen_emit.c` 新增 `own_written_param()`——参数若是 rc 管理的引用类型
-  且**函数体里存在对它的赋值**（新增 `body_writes_ident()`，复用 A33-2b 的
-  capture-scan，把"只看 lambda 内"放宽为任意深度），则入口 retain 一次并走
-  `arc_own_local()`：此后赋值释放前一占用者，作用域退出与异常展开释放最后一个。
-  只读参数保持零开销借入。两条参数绑定路径都接上了——普通方法
-  （`irgen_emit.c:1392`）与**泛型特化**（`:2049`，第一版只改了前者，泛型探针仍崩）。
-  `object` 参数不在范围内（它的所有权由每槽运行时标志 `obj_rc_flag` 动态跟踪），
-  `ref`/`out` 走既有的 `byref_slot` 协议。async 方法本来就把 rc 参数标成
-  `arc_owned`（帧持有），不受影响。
-- **证据**：`tests/conformance/param_reassign_ownership.zan`（类/集合/字符串三种
-  引用的三方交换、纯重新绑定、泛型方法、以及那个会踩雷的泛型归并排序；
-  conformance + determinism + leakcheck 三档孪生全过——leakcheck 通过说明入口
-  retain 与出口 release 配平）；ARC/泛型/闭包相关 full 档 97/97；
-  `ctest -L standard -E "gui|policy"` 556/557（唯一失败 `win_tray_screen_smoke`
-  是已登记的 GUI 环境偶发；`http_forwarder_stream` 并发下偶发、单跑即过）。
-
-# A54 · LINQ 查询子句：八处缺陷全部修复 —— ✅ 已完成（2026-08-27）
-
-补 **A43-B17** 缺失的 conformance 覆盖时，`tests/conformance/linq_query_clauses.zan`
-一路撞出七个真缺陷。**A54-1（descending 空）与 A54-2（let 空）不是独立缺陷**——
-它们是下面 ①③ 的表征，随之消失；**A54-4（扩展调用结果随机）也不是编译器缺陷**，
-根因是 ⑦。
-
-已修：
-
-1. **四处"基本块两个终结符"**：`query_loop_close` 的第一句就是 `br l->inc`，
-   它假定当前块尚未终结；而 join 的四个发射点（`query_final_pass` 的 plain 与
-   `into`、`query_materialize_join` 的 plain 与 `into`）都先手动给 no-match 块补了
-   `br inc`，于是 loop_close 又插一条 → `Terminator found in the middle of a basic
-   block! label %qj.skip / %qm.skip`。修在契约上：`query_loop_close` 当前块已终结
-   时不再补分支，四处一起解决且不会复发。
-2. **`join ... into` 的语义与悬空块**：`query_final_pass` 先开外层循环、发 `eq`
-   判定，再进 `into` 分支——那个 `eq` 的 `qj.skip` **从未被终结**（这才是最初看到的
-   "does not have terminator"），而且语义上错：C# 的 `join into` 对**每个**外层元素
-   产出一个分组（无匹配即空表），不该被 `eq` 门住。现在 `into` 自带循环与匹配判定，
-   不再经过外层 eq。
-3. **查询序列的所有权**（堆损坏）：排序与 join 行物化替换当前序列时**无条件释放
-   旧序列**，而第一次替换时旧序列正是**借入的源集合**——把调用方仍持有的
-   `List` 释放掉，下一次分配即堆损坏（`0xC0000374`）。`query_seq_t` 新增
-   `seq_owned`：只释放本次降级自己分配的列表。
-4. **`Grouping<T>` 没有类符号**：`zan_binder_make_grouping_type` 造的是
-   `sym == NULL` 的裸类型，从不查标准库里真正的 `Grouping` 类。于是
-   `group ... into g select g.Key` 既推断不出类型（回退成组元素类型，
-   `select g.Items.Count` 因此报 "cannot convert List<string> to List<int>"），
-   也发射不出成员读取（落到常量 0 兜底，`g.Key` 打印成 0）。现在附上真实符号。
-5. **左键在循环外发射**：`query_materialize_join` 的注释写"每个外层元素一次"，
-   实现却把 `on p.dept equals ...` 的左键放在外层循环**之前**——那里行变量还没
-   注册，`p` 落到常量 0 兜底。已搬进循环（与 `query_do_group` 的正确形状一致）；
-   顺带删掉那个从未使用、编译器一直在警告的 `lmark`。
-6. **`Enumerable.MergeSortKeys{Int,Long,Num,Str}` 改写调用方的键列表**：两个缓冲区
-   每轮互换，**第二轮之后 `kb` 指向的就是传进来的那个 list**，于是排序把调用方的
-   键列表原地改成排序后的样子。同一个键列表连排两次，第二次拿到的已是被改过的
-   数据——`OrderByKeysStrDescending` 因此给出既非原序也非排序的结果。四个变体
-   都改为先按值拷贝键列表。
-7. 以上 ⑥ 也是 **A54-4** 的真因：那个探针在一个程序里先调静态形态、再调扩展形态，
-   第二次用的键列表已被第一次改写，看起来像"结果随机"。
-
-**证据**：`tests/conformance/linq_query_clauses.zan`（orderby 升/降/多键、let、
-plain join、join into、终端 group、group into 八种形态）三档孪生全过；
-`ctest -R "linq|orm|query|enumerable|group"` full 档 **519/520**（唯一失败
-`leakcheck_checkbox_group` 是 **A57** 记的既有引用环）。**A43-B17 由此关闭**。
-
-8. **A54-5 `join` 后接 `orderby` / `group`（行物化路径）结果为空** —— ✅ 已修。
-   两处叠加：
-   - **序列局部变量的类型没跟着换**：替换为行列表时只 `zan_store_fit` 了槽里的值，
-     没更新该隐藏局部记录的类型，而泛型实参正是从它推断的——IR 里的调用符号是
-     `Enumerable_OrderByKeysStr$$P`（T = 源元素类型 P），于是排序按 1 字长步长
-     去走 2 字长的行。现在两处替换点都同步更新为 `List<row_type>`
-     （修复后符号变为 `...$$__tuple2:P,D`）。
-   - **`query_hold` / `query_declare` 把 struct 值又套了一层槽**：struct 值在本
-     代码库里就是"指向其存储的指针"（`emit_expr` 对元组返回 alloca），而这两个函数
-     用 `LLVMTypeOf(value)`（= ptr）建槽、却按 struct 类型注册局部变量。于是
-     `list.add` 里 `load %struct, ptr %qh` 把**槽里的地址**当结构体内容读——行的
-     字段 0 变成了行构造器那个复用 alloca 的**栈地址**而不是 range 变量，join 键
-     自然永不匹配（常量键时则读到栈地址当指针用，直接访问违例）。现在 struct 类型
-     的 hold 直接把该指针注册为槽。
-   证据：`linq_query_clauses.zan` 补回 `join-sorted`（降序 dee,cid,bob,ann）与
-   `join-group` 两组断言，全部逐行正确。
-
-# A55 · 值类型的类型模式永不匹配 —— ✅ 已修（2026-08-27）
-
-- **症状**：`v switch { int m when m > 3 => "big", _ => "other" }`（v = 5）得到
-  `"other"`；`v switch { int m => ... }` 同样落到 discard 臂；switch **语句**形态的
-  `case int n when n > 3:` 也一样不匹配。类/字符串的类型模式正常，所以此前
-  **A43-B5/B6** 的用例全都没覆盖到这条。
-- **根因**：`irgen_stmt.c` 的 case 匹配条件对类型模式只处理
-  class/string/object/interface，其余（值类型）直接 `cond = false` 硬编码——
-  该臂永远不可达，switch 无声落到 default。
-- **修复**：值类型没有运行期类型变化，匹配是静态决定，按 `AST_IS_EXPR` 已有的同一
-  规则（`types_equal(判别式静态类型, 模式类型)`）发常量条件。switch 表达式降级成
-  switch 语句，所以一处修复覆盖两种形态。
-- **证据**：`tests/conformance/pattern_value_types.zan`（表达式/语句两形态、
-  `when` 守卫、绑定变量、不同值类型不得匹配、以及 string/class/double/bool 判别式）。
-
-# A66 · gallery Switch/Radio 演示扩充：设置卡片行 / 异步 loading / 卡片选择 / RadioGroup 页 —— ✅ 已完成（2026-08-28）
-
-回应用户「Switch Radio 还有更丰富的展示形式」：全部用既有组件能力组合，不改组件、
-不加皮肤规则。
-
-- **Switch.settings（设置卡片行）**：每行一张卡片——`Panel.Column()` 置
-  `style = 0` 得卡片表面，左侧标题 + `hint` 描述、开关用 Flex `grow` 占位标签推到
-  行尾，底部一行实时汇总启用数。行每帧重建，开关保留态（WidgetId 稳定）。
-- **Switch.async（异步切换）**：`loading` 的真实用途——拨动先回卷
-  （`model.asyncOn = applied`）、Loading 点亮 36 帧模拟远端操作、完成那一刻才落值；
-  操作期间的再点击同样被回卷，小状态机单入口、无事件时序假设。
-- **Radio.cards（卡片选择）**：选项整卡可读——单选钮（只画圆点）+ 标题 + 描述，
-  选中卡 `Plain(bgActive)` 内联高亮（优先于样式表，无需新皮肤规则）+ 标题换
-  `primary`；三个保留态 Radio 共享同一模型字段。
-- **RadioGroup 独立组件页**：组容器 `AddOption` + 组排布（宽度不够自动换行）+
-  `Selected()` 共享信号读回；此前该容器只有 CheckboxGroup 有页。
-
-验证：build_gallery 通过；UiDriver 注入四脚本共 12/12 断言——`rg.sel` 0→2→0、
-`switch.setN` 1→2→1、`switch.asyncLoading/asyncOn` false→true→（落值）true→false、
-`radio.pick` 0→2（`clickid` 命中区域注入 + probe 断言，脚本/输出全反斜杠字面路径）；
-settings 卡片 `dump pixels` 目视核对（卡片边框、标题/描述、右对齐开关、汇总行）。
-坑位记录：页面级滚动对代码框声称滚轮的事件敏感，取内容列右缘 (1690,400) 注入
-wheel 才可靠落在页面滚动容器上。
-
-# A60 · 局部帧裁剪吃掉条带外点击 + Switch 禁用可点 + 条件真值化 i0 —— ✅ 已修（2026-08-28）
-
-三个独立暴露、其中两个同根因的缺陷：
-
-- **局部帧只注册条带内命中区，事件解析扑空（Gui 框架）**：损伤条带帧只渲染条带内
-  控件，`HitTester` 池里也只剩条带内区域；事件在 ApplyEvent 里按「上一帧」解析目标，
-  上一帧恰是条带帧时条带外所有点击静默丢失——用户感知为「点了开关半天才反应」，
-  自动化感知为注入点击随机丢（`click.target=-1`，`dump hitregions` 仅 17 个区域可证）。
-  条带裁剪的前提是条带外像素/控件不变，故最近一次整帧的命中区对条带外依然成立。
-  - **修复 1**：`HitTester` 增加「最近完整帧」快照（`KeepFullSnapshot`，整帧
-    PresentFrame 时按值拷贝），`AnchorAt` 改读快照；锚点矩形认领机制不变。
-  - **修复 2**：输入事件（按下/释放/按键）触发的帧禁止条带化——`App.inputNeedsFrame`
-    在 `TakeDueFrame` 裁剪判定与 `BeginFrame` 的 partialPending 继承两处都拦下
-    （后者尤其隐蔽：纯动画帧声明的条带会被下一个输入帧继承，控件照样出不了条带）。
-    悬停条带（kind 1，NoteHoverDamage 自声明）与动画帧优化不受影响。
-  - **证据**：画廊默认模式（局部帧开）`sw14` 四连点 + `assert probe` 8/8 全绿
-    （修复前同脚本 2/4 失败）；`_scratch/uidrv`（已清理）。
-- **Switch 禁用不拦点击**（`Switch.zan`）：`fire = Ui.Clicked(...)` 缺其他控件都有的
-  `&& !IsDisabled()`，灰掉的开关照样翻转。已照 Radio/Checkbox 惯例补上（键盘路径同拦）。
-- **条件真值化铸出非法 i0（编译器）**：非 bool 值直接作条件（类引用/Binding/浮点）
-  时，三元、if/while/do-while/for 的归一化用 `LLVMConstInt(LLVMTypeOf(v),0,0)` 对
-  指针/浮点铸出 `i0` 常量，LLVM verification 失败。统一走新助手 `zan_tobool`
-  （irgen.c：整数比零、指针比 null、浮点 fcmpUNE），六处换用。
-  **证据**：`tests/conformance/truthy_cond.zan`（对象/int/float 条件、
-  while/do/for 退出语义、&&/|| 仍强制 bool）四档（conformance/determinism/
-  leakcheck/arcguard）全绿。
-
-**遗留未解（低频，1/40 量级）**：注入点击批次偶发整批丢失——探针显示 press 已到、
-release 从未被泵出（`click.target=-999`、`delivered=false`），即事件在原生队列与
-ApplyEvent 之间消失，与命中区无关。样本极少且均发生在锁屏/高负载时段，疑环境性；
-待可复现样本再查 `Window.InjectEvent` → 原生队列 → 泵路径。
-
-# A59 · Gui.Image 图片组件：传地址即渲染 —— ✅ 已完成（2026-08-28）
-
-目标：`Gui.Widget.Image` 控件，`Src` 传地址就出图——本地文件路径、
-`http(s)://` URL、`data:image/...;base64,...`、SVG（任意来源）。网页渲染
-不在此列（`CefBrowser`/`WebView` 已覆盖）。
-
-- **解码器 vendor**（`src/runtime/`，带 COPYING/README 记录子集与改动）：
-  libwebp 1.4.0 仅解码子集（src/dec + 标量/SSE2 dsp + utils；无 encoder、
-  SSE41、线程、mux；`src/webp/config.h` 为桩，`HAVE_CONFIG_H` 由
-  gui_runtime.c 定义）+ nanosvg（nanosvg.h/nanosvgrast.h，MIT）。
-  关键约束：~8 个 `build_*.ps1` 都把 `gui_runtime.c` 当**单 TU 无 -I** 编译，
-  所以 vendor 源码全部改成文件相对 include、由 gui_runtime.c unity-include
-  （`gui_image_svg.c` 同理），CMake 与各脚本零改动。unity 里的两个符号冲突
-  处理：`clip_8b` → `clip_8b_ql`（quant_levels_dec_utils.c）；lossless.h 的
-  encoder-only 声明块删除（解码路径不用）。
-- **运行时**（gui_runtime.c）：新增 64 项 `mem:` key 内存注册表（与路径 FIFO
-  并列；`zan_img_load` 先查它，mem key 绝不回落文件打开或负缓存），导出
-  `zan_gui_image_load_mem`（RIFF/WEBP 嗅探 → libwebp，否则 stb
-  load_from_memory）与 `zan_gui_image_load_svg`（nanosvg 解析 + contain
-  光栅 + RGBA→ARGB32；无固有尺寸视为失败而非造 512）；路径缓存 16→64；
-  `zan_gui_image_evict` 同时清 mem 注册表。驱动导出 65→66。
-- **Zan 侧**：`Canvas.ImageLoadMem(key, string|byte[], len)`、
-  `Canvas.ImageLoadSvg(key, string|byte[], len, w, h)`（Render.zan，
-  byte[] 形态用 `EntryPoint` 别名）；新控件 `Widget/Image.zan`（四类地址
-  解析、Fit contain/cover/fill/none、Alt 占位、Loaded/Error 事件、Reload()、
-  SVG 按盒子重光栅 `@WxH` key 并驱逐旧光栅）；`Gui/ImageHttp.zan`
-  （DownloadJob 同款：Mutex 队列 + 单 worker `Thread.Start` + 协程
-  await + `App.Post` 封送回 UI 线程解码注册）；ControlFactory/Kinds 注册；
-  base.css `image {}` 规则。
-- **测试**：`tests/gui/image_test.zan` + golden（无窗口）：程序内合成 P5
-  PNM → ImageLoadMem 尺寸/blit/evict/重注册；垃圾字节 → 0 且不产生尺寸；
-  SVG 固有 48x24、按 32x24 盒 contain → 32x16；坏 SVG → 0；base64 往返；
-  Kind/Props/Events/SetExtra/ControlFactory 往返。注册
-  `conformance_gui_image`；`tools/mcp_server/zform.controls.txt` 补 Image
-  行（policy_zform_schema 守门）。
-- **gallery**：Data Display 加 Image 组件三演示——Data URI（base64 PNM +
-  内联 SVG，全部程序内合成）、Fit modes（同一来源四种 fit 固定盒）、URL
-  （本地回环 HttpServer 127.0.0.1:18747/img.pnm 离线演示后台取回）。
-- **实测**：`zanc tests/gui/image_test.zan --auto-stdlib` → `image_test OK`；
-  `ctest -R 'gui_image|policy_zform_schema'` 全绿；
-  `scripts/build_gallery.ps1` → GALLERY_BUILD_OK；smoke 档全绿。
-- **已知限制**（写进了 gui-development.md）：stb GIF 只取第一帧；位图内容
-  矩形裁剪、CSS 圆角只作用于背景/边框；URL 无磁盘缓存。WebP 真实样本
-  未入库（离线造不出 1x1 webp），解码路径由 RIFF 嗅探单测覆盖在
-  gui_runtime（libwebp 自带上游测试）。
-
-# A60 · PivotTable 整体重写：滚动/选中/百分比/热力/钉住合计 —— ✅ 已完成（2026-08-28）
-
-目标：原 `PivotTable` 只是一个静态聚合网格（4 参构造 + 单度量），按"不兼容直接
-重写"的定调整体换新 API，不对旧签名做任何兼容层。
-
-- **新 API**（`stdlib/Gui/Component/PivotTable.zan`）：
-  `PivotMeasure(field, agg, title, showAs)`（agg：Sum/Count/Avg/Max/Min；
-  showAs：绝对值 / %行 / %列 / %总计）+ `PivotConfig(rowField, colField)`
-  （measures 列表、groupDigits、rowSort：升/降/按值降/按值升、heat）+
-  `PivotState`（scrollX/scrollY、选中格、`TakeClick()` 事件泵——clickR/C/M、
-  clickRowKey/ColKey）。唯一入口
-  `PivotTable.Render(app, x, y, viewW, viewH, rows, cfg, st)`。
-- **能力**：两级表头（组标题行 + 度量子列）随列带横滚；行头列与合计列/合计行
-  钉住（合计行在数据不满一屏时紧跟最后一行，溢出时钉视口下缘）；滚轮垂直可滚
-  则滚垂直、否则横滚（`CaptureWheel`）；悬停行/列十字高亮 + 单元格点击选中；
-  百分比度量在合计上保持同一语义（%行的行合计恒为 100%、%列的列合计恒为
-  100%、其余按占总计换算、基数为 0 显示 "-"）；热力图按度量内 min-max 调
-  `Style.Fade` 着色；列宽自适应（Scale(64)..Scale(220)）、行头自适应
-  （Scale(90)..Scale(260)）；千分位分组；空态（无度量/无数据）。
-- **样式**：base.css 新增 `pivottable::hover`/`pivottable::sel`（两处重复块
-  同步），`tests/gui/css_test.zan` 内嵌表同步。外框线在全部内容之后补画：
-  表头/行/合计的填充都从矩形边缘起笔，先画外框会被整段盖掉（表现为
-  部分布局下边框丢失），钉底合计行与钉右合计列两处尤其明显。
-- **边框二修（同日）**：外框线补画后仍有"部分边框不可见"的观感，根因不在
-  画线而在面板底色——`pivottable::surface` 用 `var(--bg-primary)`，而深色
-  主题里它恰与窗口底色同值，于是 `inner=Scale(2)` 的内边距条带（钉右合计
-  列右侧、钉底合计行下侧）与数据不满一屏时的下方空白全部透出窗口底色，
-  边框内侧隔出一条同色缝，视觉上像边框断裂/悬浮。修法：面板底色改
-  `var(--bg-secondary)`，新增 `pivottable::cell { background:
-  var(--bg-primary) }` 给数据格铺回原底色，保住表头/数据的两级层次
-  （`PushClip` 只有矩形裁剪，圆角处内容不能贴边，内边距必须保留，故从
-  配色入手）。四种布局（高/矮溢出/窄隐藏合计列/空态）`dump pixels` 逐边
-  核对：四边边框除圆角 4px 弧段外无一缺失，缝与空白均呈面板色；
-  smoke gui|css|pivot 30/30。
-- **悬停越界修（同日）**：行悬停只判 Y、列悬停只判 X，指针在表格矩形
-  外（如 gallery 左侧导航栏）扫过同一 Y/X 时，表内同行/列头会被误点亮。
-  主体行/列悬停统一先过 `Ui.Over(app, x, y, viewW, viewH)`；`move 10 200`
-  注入实测表外移动行头保持 head 底色，表内移动十字悬停照旧。
-- **分隔线缺失 + 行悬停不同步修（同日）**：滚动带与合计列的分界线在
-  表头下半段、主体行、总计行整段消失（上半段可见）——线先画、合计格
-  从同一 x 起笔的填充后画，m4=0/m6=0/mj=0 三处把线整段盖掉；三处均改
-  为填充之后压线。行悬停原是"行头 + 合计列亮、数据格只有指针下那格亮"
-  的单格十字，整行半亮半暗观感即"行激活没有同步"；改为整行同步点亮
-  （选中仍单格），gallery/IDE 文案同步改 full-row hover。探针强制
-  mouse 坐标实测：悬停行六格同色 (56,50,50)、邻行不亮、x=752 分界线
-  在悬停行依旧完整；smoke gui|css|pivot 31/31。
-- **横向滚动条拖不住/点不中 + 激活落格漂移修（同日）**：单元格 id 按
-  注册顺序即时分配，可见格数随横滚增减（组边缘进/出滚动带），其后
-  分配的滚动条 id 帧间位移——按压锁存按上一帧 id 解析，拖动滚动条几
-  像素就脱手、悬停闪烁点不中，跨帧点击也会落到邻格或丢失（表现为
-  选中/激活不同步）。修法：Render 为全部 R*C*M 个单元格保留一段固定
-  id（不可见同样占号，`cellBase + (ri*C+cj2)*M + m3`），单元格与两条
-  滚动条的 id 从此与滚动状态无关；HScroll 命中区向上下各放宽
-  Scale(5)。dump hitregions 实测 scrollX=0 与 650 两态：同一逻辑格
-  id 相同、id=48/49 两条滚动条不变、无重复 id。DataTable 组件条的
-  可见行数在纯横滚/纵滚期间不变，id 天然稳定，无需同改。
-- **滚轮损伤矩形过窄 → 滚动时行头/表头/合计不同步修（同日）**：滚轮
-  滚动走 `NoteScrollDamage` 的损伤裁剪帧（kind 13 不像按下/释放/按键
-  那样强制整帧），条带外的像素留在旧帧。垂直滚轮只把滚动带报进损伤，
-  行头列与行合计列同样随 scrollY 平移却写不进去——滚两档后数据格在
-  第 3 行、行头还钉在第 1 行（用户截图"滚动的时候不同步"）。修法：
-  `HandleWheel` 的矩形改传整行区 `(x, bandY, viewW, bandH)`（行头列 +
-  滚动带 + 行合计列，顺带让行头/合计列上的滚轮也能滚行）；水平滚轮
-  损伤改传 `(bandX, y, bandW, headBand + bandH + rowH)`——列标题/组标题
-  随 sx0 平移之外，合计行的合计格也随 sx0 平移且钉在带外，旧矩形两处
-  都漏。探针 A/B（同脚本两档滚轮注入）：旧版纵滚后行头列 0 像素变化、
-  标签与数据错行，横滚后表头带 0 像素变化、合计行新旧两态叠字；新版
-  行头列 2192 px、表头带 3712 px 同步重画，标签/标题/合计与数据格
-  逐行对齐。smoke gui|css|pivot 34/34。
-- **调试期修掉的编译器缺陷**（规则 10，非绕过）：`irgen_call.c` 通用实例方法
-  调用路径无条件把 receiver 压进实参表，`this.StaticMethod()` 形态（静态方法
-  经实例调用）会把 `this` 当首个形参传——已按泛型路径同款语义
-  （`callee_static` → 不发 receiver、`cur_inst` 作 recv_ty、dispatch 传
-  NULL cls）修复。
-- **示例**：`examples/gui_gallery/gui_gallery.zan` 与
-  `src/ide_zan/src/pages/ComponentGallery.zan` 的透视表演示全部改写为新 API
-  （双度量 + 千分位 + 热力 + 值降序）。
-- **实测**：UiDriver 脚本（`ZAN_UI_SCRIPT`）注入真实 `clickid`/`scroll` 事件：
-  点击 North×Q1·Avg·Price → `pivot-click r=5 c=0 m=2 row=North col=Q1` 精确；
-  滚轮横滚后合计行 Q1=403、Q2=416 与可见单元格求和逐一相符；`dump pixels`
-  像素级核对两级表头/钉住合计/热力/选中高亮。
-  `scripts/test.ps1 smoke -Match "gui|css|pivot"` → **25/25 全绿**；
-  `scripts/build_ide.ps1` 编译期 ComponentGallery 零错误（构建挂在旁支
-  ZanIDE.Docs.zan 的进行中改动，与本任务无关）。
-
-# A61 · Gui.Widget.DynamicTags 动态标签（Naive UI n-dynamic-tags）—— ✅ 已完成（2026-08-28）
-
-目标：对应 Naive UI 的 dynamic-tags——一排可增删的 Tag，尾部虚线「+ 新建标签」
-触发器，点击后原位变成输入框，回车/失焦提交、Esc 放弃；对齐其 `closable`
-（默认 true）与 `max`（达到后触发器置灰）语义。
-
-- **组件**（`stdlib/Gui/Widget/DynamicTags.zan`，纯 Zan，零 runtime 改动）：
-  自持 `List<string>`（无列表绑定，与 Tabs/SelectBox 同风格），`Add/RemoveAt/
-  SetItems/Clear/Items()` 模型 API，`Change` 事件同步抛出（移除在标签循环内
-  抛出后立即 break，提交在循环外抛出，处理器改集合安全）。`Size`
-  （tiny/small/medium/large）经 `SizeOf()` 映射 tag 皮肤类；`AddText`/
-  `Placeholder` 定文案（默认文案走 `lang`/`TT`，与 Tabs 同款）。
-- **内联编辑器**：成员 `Input` 保留实例（SessionList 行内重命名同款），占据
-  触发器位置原位渲染，`focus.SetFocused` 同帧接管键盘（IME/选区/剪贴板全由
-  Input 处理）；回车（kind 6 code 13）与 Esc（kind 4 code 27）在它渲染前
-  轮询读取，失焦提交靠"上一帧 IsFocused 快照"（对齐 Naive 的
-  handleInputBlur→handleInputConfirm）。打开同帧即铺开输入框，点一次就处于
-  打字状态。
-- **命中 id**：`WidgetId.Block(1024)` 段按下标分配每标签一对 id（整体
-  tagBase+i、关 x tagBase+512+i），标签增删不挪其他控件 id；关 x 矩形在整体
-  矩形之后注册，命中测试取最后注册者。触发器经 `Ui.Activate`（注册 + 点击 +
-  键盘激活）。
-- **皮肤**：base.css 增 `tag.add`（虚线框触发器，transparent 底、
-  `--border-secondary` 虚线边）与 `:hover`（染主色）、`:disabled` 规则；语义
-  类（primary/error…）作用于整排标签。
-- **注册**：ControlFactory（Kinds + Create）、
-  `tools/mcp_server/zform.controls.txt`（policy_zform_schema 守门）、
-  designer Props（closable/max/addText/placeholder/size）+ `options` 经
-  `GetExtra/SetExtra`（`|` 连接，Tabs.SetItemsText 同款）。
-- **测试**：`tests/gui/dynamictags_test.zan` + golden（无窗口）：默认值、
-  SetItems 不触发 Change、Add/RemoveAt 各触发一次、越界静默、Max 只闸交互
-  不闸程序化 Add、options 往返与空段折叠、未知键返回 false。注册
-  `conformance_gui_dynamictags`。
-- **gallery / IDE**：gallery "Data Display" 增 DynamicTags 组件条目 + 实时
-  预览（保留实例，编辑状态跨帧存活；变更数报进卡片头部事件栏）；IDE 帮助
-  topics.json 增主题（preview=DynamicTags）+ ComponentGallery 演示。
-- **实测**：`zanc tests/gui/dynamictags_test.zan stdlib/Gui/Widget/DynamicTags.zan
-  --auto-stdlib` 输出与 golden 逐行一致；tabs/props/image/icon 同法回归全绿；
-  gallery 以隔离副本编译通过（305 文件）；gallery coverage / css comment
-  hygiene 政策绿。
-- **已知限制**：单行不折行（超宽由容器裁剪，Tag/Tabs 同策略）；标签文本含
-  `|` 会破坏 options 序列化（Tabs items 同款限制）；Esc 放弃是 Naive 没有
-  的桌面补充（Naive 仅回车/失焦）。
-
-# A62 · Gui.Widget.Watermark 水印组件 + 运行时旋转文字 —— ✅ 已完成（2026-08-28）
-
-目标：对应 Naive UI n-watermark——盖在页面内容上的透明平铺层，重复文字或
-图像做"内部资料"式水印；旋转是定义性特征（默认 -22°），运行时此前没有
-旋转文字原语，按规则 10 补运行时而非绕过。
-
-- **运行时**（驱动导出 66→68）：`zan_gui_draw_text_rot(surface, x, y, text,
-  color, size, angle)`，角度限 [-90,90]、0 直接走 `zan_gui_draw_text`。
-  旋转平铺进 glyph atlas：run 瓦片 key = 0xFF 前缀 + 角度 LE 2 字节 + 文本
-  （0xFF 非法 UTF-8，绝不与普通文本 key 碰撞）；glyph 瓦片 key 6 字节
-  （cp + 2 字节角度）。Windows GDI 路径 `GM_ADVANCED` +
-  `SetWorldTransform`（eM11=c/eM12=s/eM21=−s/eM22=c），变换下 GDI 关
-  ClearType → 4bpp 布局灰度 AA（仍正确）；FreeType 路径 `FT_Set_Transform`
-  （矩阵 xx=c·65536, xy=s, yx=−s, yy=c，由 y-up 字形空间 × y-down 设备
-  翻转推导），推进取 `metrics.horiAdvance`（transform 会旋转 slot->advance），
-  基线走点 = anchor + R·(s_acc, asc)。合成器（CPU/GL `glyph_run`）不变——
-  瓦片内已烘焙旋转，只需按 left/top 摆放。macOS 暂回落不旋转（CoreText
-  旋转蒙版未实现，gui-development.md 已记）。
-- **Zan 侧**：`Canvas.DrawTextRot(x, y, text, color, size, angleDeg)`
-  （Render.zan，DllImport + 包装）；新控件 `Widget/Watermark.zan`：
-  `Content`（支持 `\n` 多行）、`Src`（非空改平铺图像，`BlitImage` 按自然
-  尺寸）、`Color`（0=吃 CSS，默认 rgba(0,0,0,0.145)）、`FontPx`（0=CSS→14）、
-  `Rotate`（默认 -22）、`GapX/GapY`（100）、`OffsetX/OffsetY`。绘制：锚点
-  = 未旋转行盒左上，绕其刚体旋转，正角顺时针（CSS 惯例）；组件把"瓦片中
-  心平移 + 运行时锚点旋转"复合成整瓦刚体旋转，瓦片从盒外一格 pitch 起
-  铺满可视区。纯绘制层：不注册命中 id、不 wire 事件（天然点击穿透）。
-- **注册**：ControlFactory（Kinds + Create）、
-  `tools/mcp_server/zform.controls.txt`（10 条 PropSpec：content/src/color/
-  fontpx/rotate/gapx/gapy/offsetx/offsety + class）、base.css `watermark {}`
-  （transparent 底 + 默认色/字号）。
-- **测试**：`tests/gui/watermark_test.zan` + golden（无窗口）：45° 旋转外接
-  盒高 >2× 宽缩、angle=0 与 `DrawText` 逐像素同界、alpha 0x80 全通道
-  [100,254]、组件级四象限都有着色、多行 `\n`、图像瓦片（合成 PNM）、空
-  内容/越界角度 500 钳制不崩、Props 往返（rotate 负数十进制、color 十进制）、
-  ControlFactory/Kinds。注册 `conformance_gui_watermark`。
-- **gallery**：Data Display 增 Watermark 组件条目 + 两演示——text（wm-doc
-  文档面板上 -22° 默认水印）、style（品牌蓝 0°/18px/密距）。
-- **顺手修掉的运行时缺陷**（规则 10，视觉核对时发现）：`zan_gui_surface_dump`
-  把 24 位 BMP 的行字节按 R,G,B 写出，而 BMP 是 B,G,R 序——Dump 出来的图
-  红蓝互换，与它"无头环境比对画布内容与屏幕实际显示"的文档约定相悖（GDI
-  present 路径按小端 B,G,R 直传是对的，Dump 是唯一写错的地方）；已改为
-  B,G,R。无 golden 消费 BMP 字节（断言走进程内 GetPixel），零测试影响。
-- **已知限制**：macOS 文字水印不旋转（回落 DrawText）；ClearType 在旋转
-  路径下不可用（GDI 限制，灰度 AA）；`Src` 平铺按自然尺寸不做缩放。
-- **复盘补丁（同日，用户实测 gallery 水印不显示）**：水印是 0×0 覆盖层，
-  gallery 演示把宿主交给 `LayoutAuto` 按内容测高——两行 Label 撑起的 ~60px
-  全被标签吃掉，`Grow()` 的水印分到 0 高，OnPaint 的 `bh<=0` 守卫直接什么
-  都不画（此前无窗口测试用 `Arrange` 固定矩形，绕过了布局路径，没拦住）。
-  修法：宿主 `doc.Prefer(0, Scale(170))` 定高（stack 面板不吃裸 CSS
-  height——`ApplySelector` 只写 prefH 不置 `prefSet`，`OnMeasure` 无视之；
-  `Prefer` 才是受认可路径）。另 `Panel.Column` 的样式类型是 `stack`，
-  演示皮肤选择器 `panel.wm-doc` 从未命中，已改 `stack.wm-doc`；Comp 代码
-  片段/JSON 同步补宿主高度，agent-kb 增"宿主必须自己有高度"条目。
-  布局路径探针（复刻 LayoutAuto 测量→排布→绘制）实测水印分到 496×42，
-  Dump 目视 -22° 平铺清晰可见。
-
-# A63 · Gui.Widget.Countdown 倒计时组件（Naive UI n-countdown）—— ✅ 已完成（2026-08-28）
-
-目标：纯 Zan 倒计时控件，`Duration` 毫秒倒数、归零触发 `Finish`、`Active` 暂停/恢复、
-`Format` 令牌控制显示位面（`S` 十分位、`SS` 百分位）。零 runtime 改动。
-
-- **组件**（`stdlib/Gui/Widget/Countdown.zan`）：`Duration`（Binding<int>，变化即
-重摆）、`Active`（Binding<bool>，暂停冻结剩余值、恢复不跳变）、`Format`（空串按
-`"HH:mm:ss"`；令牌 `D` 总天数、`HH`/`mm`/`ss` 一律双写、`S` 十分之一秒，其余字符
-原样输出——`"T-minus"` 字面量不被吃掉，`"sss"` 渲染 `"05s"`）；`Restart()` 重摆；
-`Finish` 每轮一次（重摆后再归零会再触发）。计时由 tick 差值推得：`Tick(nowMs)`
-以 `Window.GetTickMs()` 推进（测试可注入确定时刻），掉帧/失焦不走慢。走动期间
-`App.RequestAnimationFrameIn` 限速重绘：秒级格式睡到下一秒边界（`remainingMs %
-1000 + 1`），含 `S` 才 100ms 节奏，并声明损伤矩形只重绘自己。格式化纯函数
-`Countdown.FormatText(fmt, ms)` 供测试与宿主复用。
-
-- **皮肤**：base.css `countdown::value`（字号默认 large 档；`.small`/`.large` 变体；
-`.success`/`.warning`/`.error` 状态色）。
-
-- **注册**：ControlFactory（Kinds + Create）、`tools/mcp_server/zform.controls.txt`
-补 Countdown 行（policy_zform_schema 守门）。
-
-- **运行时节奏**（后续补充）：Win32 后端 Init 补 `timeBeginPeriod(1)`——系统默认时钟中断约 15.6ms 一拍，`MsgWaitForMultipleObjects`/`Sleep` 超时拖到下一拍，动画截止 16ms 实际落在 15.6~31.2ms，帧间隔 16↔31ms 交替即"背景动画一卡一卡"的根因；`SS` 百分位按 60fps 封顶排程（16ms）而非 10ms，显示值由 tick 差值现算逐帧准确。
-- **背景动画互扰根治**（探针实测，`_scratch/cd_fx_probe.zan` 模式）：倒计时走动时背景特效"一卡一卡"的三层根因——① `FxPresent` 被 `ForceFullFrames` 一票否决，默认应用（partialFrames 关）特效快速路径整个失效，空闲背景动画每拍都整窗控件重栅（实测 28s 39 次→修复后 0 次）；② `PresentFrame` 突发判定只看与上次提交的间隔（<120ms），倒计时把页面帧压到 100ms 后快照永不生效；③ 特效拍无法就地呈现时立即再排整窗重栅，与倒计时自己的页面帧叠加打满 CPU。改为按截止时间判突发 + 特效拍等一拍之内的整窗页面帧。修复后：空闲整窗渲染 0 次，倒计时走动期页面帧中位 101ms/max 106ms 零超时。局部帧开启且页面帧只是条带时不延迟（条带外特效会冻结）。
-
-- **测试**：`tests/gui/countdown_test.zan` + golden（无窗口，时刻由测试注入）：
-格式令牌九例（默认/双写/十分位/天/零/负钳制/字面量/尾随 s）、tick 推进/掉帧追平/
-归零 Finish 单次触发、暂停冻结与恢复无跳变、Restart 重摆与重摆后基准重定、
-SetProp 改 Duration 自动重摆、Kind/Props/Events/ControlFactory 往返。注册
-`conformance_gui_countdown`。
-
-- **gallery**：Data Display 增 Countdown 条目（代码/JSON 样例、Props/Events、
-Controls 子演示）+ 两演示——三格式三档字号并排（`mm:ss` 默认、`HH:mm:ss` large、
-`ss.S` small，归零由 Finish 翻 `.error` 色）；Controls（10s `ss.S` + 暂停/继续 + 
-重摆按钮 + Finish 状态行，实例跨帧存活）。
-
-- **实测**：`zanc tests/gui/countdown_test.zan --auto-stdlib` → `countdown_test OK`
-（truthy_cond 编译器修复落地后的 zanc 复验）；gallery 全量编译通过（`gui_gallery.zan
-+ MapChinaData.zan`，306 文件）；policy_gallery_demo_wiring / policy_gallery_coverage /
-policy_no_widget_drawing / policy_css_comment_hygiene 全绿。
-
+---
 
 # A58 · 全量收口执行计划（2026-08-27 定序）
 
@@ -2056,1114 +1504,18 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
 |---|---|---|
 | 4.1 | **A57 遗留** ARC 引用环：`Control.OnChildChanged` 虚钩子取代"子控件事件上挂捕获 this 的闭包"，并全库扫同模式 | `leakcheck_checkbox_group` 转绿；扫描结果登记 |
 | 4.2 | 闭包瘦身第二批：`Automation`(61) / `Management`(68) / `Windows`(71) 去 Threading+Diagnostics 税 | 三者文件数各降一档；standard 全绿 |
-| 4.3 | 选择性属性化：只改尺寸/索引/容量这类"写错就崩"的 public 裸字段（全库 13735 个不无脑重写） | 被改的字段有不变量校验用例 |
-| 4.4 | `App.zan` 5123 行单类拆分（per-panel / per-ribbon partial），连带 36 个 >150 行方法 | `IDE_BUILD_OK` + GUI golden 全绿 |
-| 4.5 | **A47-1** openssl 28.8MB 去重：先补"发布用 Tls 的程序并断言两个库在 exe 旁"的用例，再改清单格式与链接搜索路径 | 新用例绿；win-x64 实测发布可运行；仓库减约 14MB |
-
-## 第 5 批 · 模板与文档
-
-| # | 内容 | 验收 |
-|---|---|---|
-| 5.1 | `templates/server/server-mvc`（70 文件 / 10802 行 / `///` **0 行**）补公开接口与 Framework 层文档；拆 `Feature/Metrics.zan`(978) 与 `Admin/Monitor`(622) | 文档覆盖率 >10%；无 >400 行文件 |
-| 5.2 | 模板验收从"只编译"升级为"能跑"：起进程 + HTTP 断言（复用 `.agents/skills/testing-server-mvc-admin` 的流程） | 新 smoke 用例绿 |
-| 5.3 | **C9 / B1-2** `stdlib/Game` 文档（当前 1.0%） | 覆盖率 >10% |
-| 5.4 | **A2-4** 降级为文档说明（x64 四目标上 `stdcall`/`CallConv` 无行为差异）；SPEC/STDLIB 同步 | 条目关闭，文档有说明 |
-
-## 第 6 批 · 终局里程碑（最高风险，各自独立）
-
-| # | 内容 | 依赖 |
-|---|---|---|
-| 6.1 | **A32-4** await 同步完成 fast path 与无竞争握手 | 现有 async emitter |
-| 6.2 | **A32-5** LLVM 原生 EH 并删除 setjmp/longjmp 补偿层（空 try 2.6x 的终局解） | 6.1 之后 IR/frame 冻结 |
-| 6.3 | **A2-3** FFI 变参 → **A3** bindgen → **A6** 编译器对外 API → **B6** 工具链 Zan 化（LSP/DAP 约 256KB C） | 逐级依赖 |
-| 6.4 | **B6-SH1** 自举编译器补 `ref`/`out` 形参与 params 数组降级 | 与 6.3 并行 |
-| 6.5 | **A32-6** macOS 实机 + 签名公证（外部阻塞：无 Mac/凭据） | 外部 |
-
-# A57 · FormBuilder 逻辑像素重构的两处回归 —— ✅ 已修（2026-08-27）
-
-`conformance_checkbox_group` 在 `FormBuilder.zan` 的"逻辑像素 / 缩放感知"重构
-（工作树未提交改动）下变红，两处根因：
-
-1. **只写了 `name` 的字段被凭空套一层标题行**。重构把写死的白名单
-   （Input/TextArea/SelectBox）换成"控件自己有没有 `label` 属性"来决定是否补标题
-   ——方向对（Switch/Slider/Rate 的 label 此前直接丢了），但判据用了
-   `FormBuilder.Caption(o) != ""`，而 `Caption` 在没有 `label` 时**回退到
-   `name`**。于是任何只有 `name` 的字段都被包进 `FbStack{Label, 控件}`，控件树
-   凭空深一层：`.zform` 里 `host.children[0].children[0]` 拿到的是 FbStack，
-   CheckboxGroup 的聚合 API（`children.Count`、`SetChecked`/`IsChecked`）全落到
-   壳子上——golden 期望 3 个子项、实得 2（Label + 组）。
-   修法：表单补标题只认设计文档里**真的写了** `label`；`name` 回退留给自带
-   label 的控件（`ctl.SetProp("label", cap)`），两边意图都保住。
-2. **`SetRowHeight` 被忽略**。`ResolveMetrics` 改读缩放镜像 `sRowH`，而它只在
-   `OnMeasure(app)` 里刷新；不经测量直接 `Arrange`（本用例、以及任何无头布局）
-   时它还是 0，行高与行内居中一起丢失（期望 y=10/54，实得 y=0/24）。
-   修法：`SetRowHeight` 同时按 100% 基准写入镜像，`OnMeasure` 再按真实缩放覆盖。
-
-证据：`checkbox_group` 输出与 golden 逐行一致；`ctest -L standard`（含 GUI）
-**585/586**，唯一失败 `policy_theme_color_budget` 属 Chart 侧未提交改动
-（`ChartToolbox.zan` 7 处、`ChartViewShared.zan` 11 处、`ChartViewPie.zan` 2 处
-直接读语义色，budget 为 0）。
-
-**顺带定位一个既有泄漏（未修，需设计决定）**：`leakcheck_checkbox_group` 报
-`FormBuilder.zan` 的 `MakeItem` 每个选项泄漏一个闭包（用例造 3+3+5+4 = 15 个
-选项，正好 15 个），根因是**引用环**——组持有子 Checkbox，子的 `Change` 事件表
-持有捕获了组的闭包（`cb.Change.Add(() => { this.Change.Raise(); })`），ARC 不回收
-环。同源还有 `Gui/Event.zan:142` 的 490 个 `List<Action>`。可选修法：给 `Control`
-加一条 `OnChildChanged` 虚钩子，由子控件经 `parent` 反向通知（`parent` 是既有的
-非拥有指针），从而彻底不建闭包；这会动 `Control.zan`，与当前 GUI 改动重叠，
-留待协调后再做。
-
-# A56 · `using` 闭包瘦身：命名空间即目录，一个文件能拖一片 —— ✅ 第一批完成（2026-08-27）
-
-**根因（机制）**：`--auto-stdlib` 把 `using X.Y` 直接映射成目录 `stdlib/X/Y`，
-并把**该目录下所有 `.zan` 全部编进来**，再对新拉入的文件求不动点
-（`main.c:1976-2028` 的注释写明这是有意设计：加模块只需放文件）。后果是
-**目录里任何一个文件的 `using` 都会变成整个命名空间使用者的成本**——一个叶子
-工具引一次 `System.Threading`，所有用该命名空间的程序都跟着链上线程运行时。
-
-**实测（hello world，`using System;` + 一句 `Console.WriteLine`）**：
-
-| 阶段 | 文件数 | exe |
-|---|---|---|
-| 起点 | 80 | 563.7 KB |
-| 移出 `MessageBox`（根目录 → `System.Windows`） | 45 | 400.6 KB |
-| 切断 `Guid` → `System.Security.Cryptography` | **16** | **392.6 KB** |
-
-| 命名空间 | 改前 | 改后 |
-|---|---|---|
-| `using System` | 80 文件 / 564 KB | **16 / 393 KB** |
-| `using System.IO` | 79 / 564 | **34 / 411** |
-| `using System.Threading` | 59 / 558 | **24 / 532** |
-| `using System.Diagnostics` | 79 / 564 | **52 / 524** |
-
-**四处改动**：
-
-1. `stdlib/System/MessageBox.zan` → `stdlib/System/Windows/MessageBox.zan`
-   （`namespace System.Windows;`）。它是根目录唯一带 `System.Diagnostics` +
-   `System.IO` 的文件，于是 IO → DirectoryWatcher → Threading 整条链进了**每个**
-   程序；这也正是 **A43-B15** 记的"让 `emit_lib_linux_so`/`macos_dylib` 交叉共享库
-   用例失败"的那个文件。消费者只有 `ZanIDE.zan` 与 `platform_input_maps.zan`，
-   各加一行 `using System.Windows;`。
-2. `stdlib/System/IO/DirectoryWatcher.zan` → `stdlib/System/IO/Watch/`
-   （`namespace System.IO.Watch;`）。它是 `System.IO` 里唯一 `using System.Threading`
-   的文件——读个文件不该链线程运行时。消费者只有 `dir_watcher.zan`。
-3. `RandomNumberGenerator`（54 行、只依赖 `System`）从
-   `System.Security.Cryptography` 移到根命名空间；`Guid` 随之去掉那条 using，
-   并把 `Hex.nibble` 的十六进制位校验就地写成
-   `(c>=48&&c<=57)||(c>=97&&c<=102)`（原写法 `c == 0 && ch != "0"` 借返回值反推
-   合法性，既绕又是那条 using 的唯一理由）。这条最值：Cryptography 目录连带
-   Json/Text/Threading 共 **29 个文件**。
-4. **两个同名 `Stopwatch` 合并**：`System.Diagnostics.Stopwatch`（QPC /
-   clock_gettime 高分辨率）与 `Threading.zan` 里的第二个 `Stopwatch`
-   （`GetMicroseconds`/`GetMilliseconds`，还在用 B2 本该清零的 `calloc`-as-string
-   手工拼 timespec 字节）按 using 顺序各被一半调用方看见。静态时钟接口并入根
-   `Stopwatch`（新增 `MonoScaled`，先除后乘——QPC 频率下 `ticks*1e6` 在开机约
-   11 天后会溢出 i64），删掉 Threading 里那份 45 行；`Timer.Now()` 从
-   `ServerMetrics.MonoMillis()` 改为 `Stopwatch.GetMilliseconds()`，Diagnostics 从
-   Threading 闭包里彻底移除。`Stopwatch` 自身移到根命名空间。
-
-**证据**：`ctest -L standard -E "gui|policy"` **558/558 全绿**；套件耗时从
-**2262 → 438 sec\*proc**（挂钟 78s → 21s），因为每个用例现在编 16~45 个文件而不是
-45~80 个。
-
-**又暴露并修掉三类隐藏耦合（重新 `cmake -B build` 刷新 stdlib.stamp、缓存全部失效
-后才浮现）**：
-
-* **`zan_mmap_*` 不在 sync-runtime 前缀表里**（`irgen_emit.c`）：
-  `System.IO.MemoryMappedFile` 声明的 `zan_mmap_*` 住在 `rt_sync.c`，但编译器判断
-  "是否链接 rt_sync" 的前缀表只列了 atomic/shared/thread/dispatch/monotonic/plat
-  ——以前每个程序都因 `using System` 顺带拉进 Threading 而碰巧链上，闭包一瘦，
-  所有用内存映射文件的程序直接 `undefined reference to zan_mmap_create`。已按
-  `rt_sync.c` 的实际导出族补齐（`zan_mmap_` / `zan_monitor_` / `zan_exe_dir_` /
-  `zan_dir_list_`，并把 `zan_shared_table_` 放宽为 `zan_shared_`）。
-* **两个测试文件缺 `using System.Diagnostics`**（`dir_watcher.zan`、
-  `shortcut_roundtrip.zan` 用 `ProcessList.SelfPid()`）。
-* **两个测试文件依赖一个恰好存在的目录**：`fileinfoex_mmap.zan` /
-  `openwrite_truncate.zan` 往相对路径 `_scratch/` 写文件，而 ctest 的工作目录是
-  `build/`——它们一直靠 `build/_scratch` 这个历史遗留目录才通过，**在干净克隆上
-  本来就会失败**。已让用例自己 `Directory.CreateDirectory("_scratch")`。
-
-**顺带修掉两处隐藏耦合**：闭包一瘦，两个此前"白拿别人依赖"的文件当场暴露——
-`System/ServiceProcess/ServiceProcess.zan` 用 `Thread.Sleep` 却没写
-`using System.Threading;`；`System/Text/RegularExpressions/RegexProgram.zan` 用
-`Encoding.CharFromCode` 却没写 `using System.Text;`。两处补上声明后，**全部
-`System.*` 命名空间（逐目录扫过一遍）都能被单独 `using` 而编译通过**——
-"每个模块自己声明依赖"这条性质此前并不成立。
-
-**文档同步**：`docs/STDLIB.md` 的目录树（根命名空间新增 `Stopwatch` /
-`RandomNumberGenerator`、`IO/Watch/`、Threading 与 Diagnostics 去掉 Stopwatch）、
-`docs/aardio-capability-migration.md` 的两处路径。
-
-**未做（下一批）**：`System.Automation`(61) / `System.Management`(68) /
-`System.Windows`(71) 仍各带 Threading + Diagnostics，其中 `Automation/Window.zan`
-与 `Management/Cpu.zan` 疑似只为 `Thread.Sleep` 付全价，待核；`System.Net`(97) /
-`System.Web`(108) / `System.Data`(115) 的体量是真实并发/驱动面，不属于误拉。
-
-# A64 · System 栈封装审查修复（网络协议 / ORM / HTTP MVC）—— ✅ 第一批完成（2026-08-28）
-
-对 `stdlib/System` 的封装审查（~75 项，P0→P3）按序修复的第一批。
-
-**P0 · 协议正确性**
-- **MQTT broker 边界检查 + 客户端 varint**：主题/包长越界不再越界读写；
-  `mqtt_loopback` 用例通过。
-- **WebSocket 整改**：帧边界、掩码、关闭握手收口；`ws_loopback` 通过。
-
-**P0/P1 · ORM 错误信号统一**：驱动层失败一律抛 `DbException`（携带驱动
-  原生错误码与文本），不再以 -1 / 空结果集静默表示失败。
-  `db_error_throw` 17/17。`OrmSelect.BuildCount` 派生表别名、
-  `LastIdSql`/CodeFirst 方言补齐（36 用例）。
-
-**P1 · Web/Net**
-- `GenRoute` 表单→对象绑定 + 可选参数（`web_typed_binding` 22/22）。
-- **HttpClient keep-alive 连接复用**：每客户端池化 `HttpFramer` +
-  连接/TLS 上下文；并发请求回退一次性路径（busy 标志）；陈旧池化连接
-  透明重试一次；204/304/HEAD 无体、EOF 定界不复用、`Connection: close`
-  驱动弃池；公开 `Close()` / `DisableKeepAlive()`。新增
-  `tests/conformance/http_client_keepalive.zan`（11 项断言）。
-- **HttpsServer 二进制响应体**：`bodyBytes` 分块发送，与 HttpServer 对齐；
-  新增 `tests/conformance/https_binary_body.zan`（12 项断言，含复用 TLS
-  连接的二次二进制/文本请求）。
-
-**P2 · HTTP MVC 参数族**
-- `InRaw/InInt/InLong/InBool` 统一 route→query→form 优先级与严格解析
-  （全量消费、正负号、溢出保护）；`Input*` 家族收编为一行蹦床，删除约
-  40 行重复实现；`ParseLongStrict` 静默回绕改守卫。
-- `JsonBody()` 惰性缓存（空体返回 null）；multipart/form-data 字段可见
-  于 `In()/Form()`（`ParseMultipartFields`，含带引号 boundary/name）。
-  `http_params` 35 项断言。
-
-**P2 · 数据层**
-- **ODBC 诊断**：`SQLGetDiagRec` 接入两分支（odbc32/odbc），失败消息带
-  驱动原生文本；三个取值循环的每格 4KB 缓冲提升为跨行复用。
-- **SQLite prepare 缓存**（`SqliteConnection`）：同一条 SQL 首次 prepare
-  后缓存，后续 reset + 重绑复用；`stmtBusy` 在途标志使并发同句回退到
-  一次性语句（不碰缓存句柄）；多语句文本（pzTail 非空）不入缓存；
-  `ReleaseStmt` 覆盖全部退出路径；`Close()` 先 finalize 缓存语句再
-  `sqlite3_close`（否则 SQLITE_BUSY）。探针覆盖缓存命中重绑、错误后
-  可用性、多语句路径。
-
-**明确延后（非静默跳过）**
-- **ODBC prepare 缓存**：本机无可用的 live ODBC 驱动验证语句复用语义
-  （SQLExecDirect 与 SQLPrepare/SQLExecute 混用、游标保持行为），
-  不做未验证的优化。待有驱动环境再补。
-- P3（WS 服务器回调风格对齐、HttpClient 错误模型文档、CSRF 中间件、
-  TextByte 扫描器沉淀）在下一批。
-
-**证据**：域内回归 `ctest -L standard -R "db_|orm_|zandb|sqlite|http_|ws_|webdav|mqtt|tls|https"`
-55/56 绿（唯一失败 `policy_zform_schema` 为 Gui WIP 的 zform 清单缺
-Marquee 条目，与本批无关）。
-
-# A64b · System 栈封装审查修复第二批（P3 收尾 + 运行时 accept 唤醒）—— ✅ 已完成（2026-08-28）
-
-**运行时（两处真实缺陷，非测试绕行）**
-- **`TcpListener.Stop()` 先 CancelIoEx 再关句柄（Windows）**：closesocket 不会给
-  挂起的 AcceptEx 投递完成包，accept 里的协程带着整条服务端对象链永远挂起——
-  POSX 侧 dead-fd sweep（io_sweep_entries/io_flush_dead）在 20ms 内救援，Windows
-  侧没有对应机制。与 `Socket.ShutdownBoth` 给 recv 用的 CancelIoEx 同款补法；
-  探针 `_scratch/wake_probe.zan`（已清）验证 `woke=1`、快速干净退出。
-- **`MqttBroker`**：监听句柄从 RunAsync 局部落到字段，`Stop()` 真正关停并唤醒
-  accept（此前只置标志位，句柄永远不关）；`ReadByteAsync` 对死套接字
-  （RST 后恒"可读"）不再无限重试空转，`n<=0` 一律结束会话。
-
-**泄漏收口**：全量 leakcheck 双胎 427 → 433+ 绿。修绿的 10 个：
-http_client_keepalive / http_client_binary / https_binary_body / mqtt_loopback /
-ws_loopback（本工作流创建，补 Stop + 收尾静默窗：关客户端→Delay→停监听→
-再 Delay，让 woken accept 与连接协程在退出前收干净）；http_framing /
-http_server_stress / http_smuggling / web_framing / tls_hostname（既有用例，
-同样模式，静默窗位置必须在 Run 尾部而非辅助函数内）。
-**仍红（待查，非本批范围）**：http_forwarder_keepalive / http_forwarder_tunnel
-（forwarder 自身协程收尾，文件在另一工作流未提交 WIP 中）、checkbox_group（Gui
-WIP）、reflect_members / server_mvc_timezone / sqlserver_tds / tdengine_rest；
-db_error_throw 的 leakcheck 在编译器重链接后出现 5 对象漂移
-（DbParams×2 + Model.IsApplied×2 仍可达），通过/失败随构建指纹翻转，待根因。
-
-**P3 完成**
-- **CSRF 中间件（opt-in）**：`System.Web` 新增 `Csrf` 类——double-submit cookie。
-  `app.Before(Csrf.Guard)` 一行启用：安全方法补发无 HttpOnly 的随机 token
-  cookie（`HttpContext.SetCookieJs`，SameSite=Lax 保留），不安全方法要求
-  X-CSRF-Token 头或 _csrf 字段与 cookie 常时比较相等，不匹配 403 短路；
-  `Csrf.Skip(prefix)` 豁免自带签名校验的回调路由。token 无状态（16 随机字节
-  hex），重启/多 worker 皆有效。`tests/conformance/csrf_guard.zan` 18 项断言，
-  四胎（conformance/determinism/leakcheck/arcguard）全绿。
-- **WS 服务器回调风格对齐**：`WssServer` 补上与 `WebSocketServer` 同款的
-  子类重写路径（未注册委托时消息走 `OnMessage(string)`，默认 echo）。
-- **HttpClient 错误模型文档**：类头补齐三类 API 的三种约定（请求/动词抛
-  HttpRequestException 且 HTTP 状态不视为错误；文件下载返回负数哨兵 -1/-2
-  文本在 GetLastError；SseSink 探测以 "ok"/"err: ..." 标记）。
-- **字符串扫描器沉淀**：`string.IndexOf/LastIndexOf(needle[, from])` 编译器
-  内建（strstr，无分配）早已存在，8 个文件各自手写的 O(n·m) 且每位置
-  Substring 分配的私有副本全部删除，调用点改走内建：ProcessList（IndexOf +
-  LastIndexOf）、Background、Hotkey、Keyboard、IniFile、KnownFolders、PathEx、
-  Cpu、Model.IndexOfSub、ServerMetrics.LastIndexOf；FileInfoEx.LastIndexOfAny
-  保留（内建无 any-of 语义）。覆盖用例 48/48 绿。
-
-**验证**：域内回归 `ctest -L standard -R "db_|orm_|zandb|sqlite|http_|ws_|webdav|mqtt|tls|https|csrf|web_|server_"`
-67/67 绿；泄漏双胎全量 446 项仅剩上述 8 项待查（详见上）。
-
-# A65 · Image 渲染边界修复 + Carousel 控件页 + 二进制取图通道 —— ✅ 已完成（2026-08-28）
-
-A59 的后续：用真实照片（naive-ui carousel 样例四图）压出渲染边界问题并
-修完；gallery 的 Image 演示全部改为标准组件树内嵌（Flex/Panel/Label，
-无自绘）。
-
-- **运行时采样边界**（随 42e5a603 入库）：缩小改盒式滤波——每个目标
-  像素平均全部覆盖到的源像素，细线/文字缩到缩略图不再整列丢失与走样；
-  放大改中心最近邻（不再向一角偏移半像素）。cover 源矩形只裁一个轴且
-  居中（原实现两轴各按比例裁，极端比例下裁错区域）；`ScaleTo` 目标
-  尺寸按源宽高比显式四舍五入。
-- **HttpClient 二进制安全 GET**（随 582a5a1a 入库）：新增
-  `SendBytesAsync`/`SendBytesTlsAsync`——一次性连接 + `HttpFramer` +
-  `ByteBuffer` 按字节累积，`HttpResponse.bodyBytes/bodyBytesLen` 保留
-  NUL（Zan string 是 NUL 结尾，二进制正文经 StringBuilder 组装会被
-  strlen 截短，ImageHttp 取 JPEG 因此只拿到前几个字节）。204/304/HEAD
-  无体；Content-Length/分块/EOF 定界三路齐备。EOF 路径探出 Windows
-  语义：closesocket 时入站请求数据未读会回 RST 并丢弃已排队响应——
-  原始 socket 服务端须先排干请求再关连接。
-  `tests/conformance/http_client_binary.zan`：CL 体逐字节位断言
-  （2500 个 NUL、0..255 图案）、204 无体、文本体、404、原始 HTTP/1.0
-  无 CL 的 EOF 定界体。
-- **编译器：extern 调用实参按形参铸造**（随 07dc1855 入库）：按名字
-  调全局函数的 gcall 路径裸 emit 实参，int 字面量一律铸 i64，形参若是
-  更窄整型/异型指针则 LLVM verification 失败（网络栈压测撞出
-  `X509_NAME_oneline` 的 i64 600 vs i32 形参）。按形参声明类型逐参
-  ZExt/SExt/Trunc/BitCast。
-- **Carousel 控件页**（随 a2f13f80 入库）：`AddSlideView(Control)` 让
-  真实控件（Image）成为页——布局/裁剪/过渡归轮播，每页保留 Image 的
-  四类地址语义（路径/URL/data URI/SVG）。箭头/指示点移入
-  `CarouselChrome` 末位子控件覆盖层：RenderTree 先画父 OnPaint 再画
-  子树，父级画的 chrome 会被控件页盖住；chrome 改首次 Arrange 时惰性
-  挂载，保证排在全部页之后。active 圆点状态改 `Style.SSelected()`
-  （原 `SChecked` 匹配不上皮肤 `:selected` 规则，当前页高亮不亮）。
-- **gallery Image 演示重做**（随 a2f13f80 入库）：Fit modes / URL /
-  Photo fit / Scale quality 四区放大到 560×300 等大幅面并配说明
-  Label；新增 Photo carousel（AddSlideView 四页实拍图、autoplay 3.5s、
-  cover 裁 640×360）与 Photo grid（Flex.Wrapped 200×140 均一瓦片）；
-  资源 `assets/carousel{1..4}.jpeg`。
-- **证据**：smoke 158/158、standard 609/609 绿；
-  `ctest -R conformance_http_client_binary` 绿；gallery 截图核验——
-  轮播箭头/圆点绘制在照片页之上、active 圆点白色加长胶囊、网格四瓦片
-  cover 一致。
-
-# A60 · 百万行×70列导出压测探出 irgen 泄漏：链式调用的接收者临时量不释放 —— ✅ 已修（2026-08-28）
-
-为 DataTable 导出补"异步 + 进度 + 流式落盘"（XlsxBook.SaveStreaming /
-ZipWriter / DeflateChunker，随本次入库）时，百万行×70列压测的私有内存
-随行数线性增长（约 2.3KB/行，全程 2.4GB），而设计上流式路径的驻留内存
-应与行数无关。逐层二分（探针均在 `_scratch/`，已删）：
-
-- 70M 个短命 XlsxCell/字符串纯分配：内存平稳 6MB → ARC 本体无辜；
-- ZipWriter + DeflateChunker + fwrite，50k 次 32KB flush：平稳 6MB →
-  压缩/写盘链路无辜；
-- 纯行组装（拼接 + StringBuilder 累积 + 重赋值 + ColRef）：平稳 7MB →
-  组装侧无辜；
-- 组装 + `body.ToString().ToBytes()`：线性暴涨 → 锁定该形态；
-- 最小探针：`sb.ToString().ToBytes()`（链式）30M 次 1905MB，
-  拆成 `string s = sb.ToString(); byte[] b = s.ToBytes();` 则平稳 →
-  **链式调用中间量泄漏**。
-
-根因：`irgen_expr.c` 的 `emit_bytes_call`（`ToBytes` / `ToStr` 内建降级）
-`emit_expr` 出接收者后直接消费、从不释放；泛型方法路径早有
-`emit_release_owned_call_temp` 惯例（args 与 receiver 都走它），这两个
-内建分支漏了。修法：两个分支在最后一次使用接收者之后补
-`emit_release_owned_call_temp(g, callee->member.object, obj_v, locals)`——
-本地变量接收者经 `expr_is_local_ident` 直通，字面量/非常量路径与既有
-arg 释放同语义。
-
-修复后：90M 次链式调用（三相位）私有内存平稳 1MB；百万行×70列压测
-重跑见下文证据。回归守卫：`tests/conformance/arc_chained_temp.zan`
-（功能断言 + 双链 `Label(7).ToBytes().ToStr()`），其 `leakcheck_` 双胞胎
-以 `--check-leaks` 退出零可达守住。
-
-**范围提示**：此修复惠及所有链式 `ToBytes/ToStr` 调用点（stdlib 里
-`Part(name, xml)`、`xml.ToBytes()` 一类单调用点此前只漏一次、量小；
-真正放大的是循环内的链式转换）。其余内建降级路径的 receiver 释放
-已在 A53/A57 体系内有 arg/receiver 覆盖，未发现同类缺口；如需全量
-审计可另立任务。
-
-# A66 · Carousel 纵向方向 + 演示重做 + autoplay 即时模式修复 —— ✅ 已完成（2026-08-28）
-
-A65 的后续：轮播组件补 Naive UI 的 direction，gallery 的 Carousel 演示页
-从三个纯文字页扩成六个（默认内嵌图片、纵向、自定义组件页等），并修掉
-三个被演示压出来的真问题。
-
-- **direction（纵向轮播）**：`Direction("vertical")` 后过渡沿 y 滑
-  （位移跨度取 bh）、箭头改 ↑/↓ 贴上/下缘居中、皮肤挂 `vertical` 类；
-  `dotPlacement` 四个方位的指示点位置也一并真正落地——此前
-  PaintChrome 把圆点写死在底部居中，`dots-left/top/right` 只挂类没人
-  读，从未生效。指示点左/右竖排时横向箭头内缩让位（否则箭头压在点
-  列上）。
-- **autoplay 在即时模式宿主下永远不动**（演示截出来的）：gallery 每帧
-  重建控件，`lastTickMs` 与 `model` 都是实例状态，一帧一换、计时永远
-  走不完、页码永远归零——四张图卡在第一张，箭头点击也不记忆。修复：
-  autoplay 计时挪进宿主持有的 `CarouselAnim`（新增 tickMs 字段，与
-  shown 同一存活方式）；演示给轮播传入持久的 `SignalInt` 作 model。
-  修复后 4.5s 间隔连拍可见图片页 3→4 翻动、纵向 North→East→South
-  循环回绕。
-- **chrome 次序的晚加页边界**：chrome 惰性挂载后，Arrange 之后再
-  `AddSlideView` 会把页排到覆盖层之后（又被盖住）——AddSlideView 现在
-  把 chrome 挪回末位。无窗口回归 `tests/gui/carousel_test.zan` 钉死：
-  横/纵两轴的 ShowSlides 几何（静止帧/过渡帧/反向往返）、chrome 惰性
-  挂载时序、晚加页后 chrome 仍殿后、重复 Arrange 不重复挂载
-  （`conformance_gui_carousel`）。
-- **gallery Carousel 演示页**（六个）：Basic（双向索引）／Image slides
-  （AddSlideView 四张实拍图 + autoplay 3s，默认推荐用法）／Vertical
-  （Direction("vertical") + autoplay）／Custom component slides
-  （Flex 居中标题页、图文混排页、带按钮交互页三页轮换）／Many slides
-  （指示点随页数伸缩）／Dot placement（left 竖排）。Comp 说明、
-  Props（direction/dotPlacement/autoplay/intervalMs）与代码/JSON 示例
-  同步重写，代码示例示范宿主持有的 SignalInt + CarouselAnim 模式。
-- **证据**：`ctest -R conformance_gui_carousel` 绿；smoke 档除两项
-  既有失败外全绿——`policy_zform_schema`（缺 IconView 清单条目，随
-  f0d544cc 入库时未重新生成）与 `policy_theme_color_budget`
-  （Countdown.zan 4 处语义色直读，工作区 WIP）均为并行 Gui WIP 的
-  既有状态，与本批无关（同 A64 的处理先例）；gallery 截图逐一核验：
-  图片轮播 3→4 翻动、纵向循环回绕、自定义页翻页、dots-left 竖排 +
-  箭头让位。
-
-# A67 · string[i] 静态类型在 irgen 丢失：char 逐字文本化输出十进制码 —— ✅ 已修（2026-08-28）
-
-## 现象与根因
-
-gallery 倒计时场景页的 `"D 天 HH:mm:ss"` 格式串画出 `3 å¤© 13:59:47`
-（UTF-8 三字节被逐个再编码）。顺藤摸出两个叠加缺陷：
-
-1. **`s + s[i]` 把字节当数字格式化**（连 ASCII 都错：'m' 变 "109"）。
-   checker 把 `string[i]` 判为 `char`（checker.c），irgen 的
-   `infer_expr_type` 对 AST_INDEX 落到 `container_elem_type`，对
-   TYPE_STRING 返回 NULL——静态类型丢失，`emit_to_cstr_of` 的
-   `expr_is_char` 判假，走了数值 itoa。修复：irgen 侧对 string 对象的
-   索引同样返回 `binder->type_char`。插值 / String.Format / WriteLine /
-   实参转换同经 `infer_expr_type`，一并修复。
-2. **字节×码点语义冲突（语言级，未改，待定夺）**：`string` 是字节串
-   （索引/NUL 守卫/Length 全按字节；FbReader/TDS 等 codec 按字节长度
-   索引 string 字段），而 `char` 是码点类型，拼接/打印按码点 UTF-8
-   编码（char_and_ulong_text 金测钉死）。于是 `s + s[i]` 对非 ASCII
-   必然膨胀（0xE5 → "å"）——两侧都是有意设计，合在一起即陷阱；修复
-   任何一侧破坏面都大（解码式索引会打断字节偏移与 codec 语义）。故
-   Countdown.FormatText 的字面段改走字节透明的 Substring 整段拷贝
-   （"D 天 HH:mm:ss" 已正确显示），语言级出路（Rune/ByteAt API、
-   解码式索引等）留待专项定夺。
-
-## 证据
-
-- `tests/conformance/string_index_char_text`：拼接/实参/插值/Format/
-  WriteLine 全按字符输出、逐字 roundtrip 相等、`(int)` 仍出字节码。
-- 探针：修复前 `"" + s[i]` 产出 "10910958115115"（len 14），修复后
-  ASCII roundtrip 相等；FormatText 五组格式全对（含 "3 天 14:12:34"）。
-
-# A68 · null 引用进入字符串头探针：IsBadReadPtr(null-8) 在 KERNEL32 内 AV，偶发致命 —— ✅ 已修（2026-08-29）
-
-## 现象与根因
-
-gallery 透视表演示里来回滚动偶发**闪退**（进程死亡，非卡死）。
-`build/zan_crash.log` 41 条记录中 40 条同签名：`DrainPosts → lambda_4`
-（ImageHttp 取回结果封送闭包）读 `0xfffffffffffffff8` AV，
-fault 在 `KERNEL32.DLL+0x15e11`（IsBadReadPtr 内部）、`rcx=-8`。
-
-根因在编译器发射，不在 Gui：`emit_string_len_ex` /
-`emit_string_len_invalidate`（irgen_generics.c）把「对象头可读性探针」
-与「对象非空」用 `and` 融合成一个条件——**IsBadReadPtr(obj-8) 无条件
-执行**，obj 为 null 时探针地址 `null-8` 落进内核空间，本机
-IsBadReadPtr 自身先 AV（其内部 `__try` 通常吞掉，VEH 记一条
-first-chance；偶发窗口内致命即用户看到的闪退）。触发面很宽：调用点
-降序时 callee 若仅有声明（函数体未发射，如定义在调用者之后的
-`ImageHttp.Apply`），string 实参按 extern 语义做 length 缓存失效；
-ImageHttp 二进制路径的 `body` 恰为 null，滚动触发任意页图片取回完成
-即撞一次。修复（irgen.c）：`zan_hdr_read_ok` 改收 payload 对象，
-判空以**控制流**先行短路（null → phi 直接判不可读，探针调用不发射），
-两个调用点改传 `payload`；rt 侧 retain/release 原本就先判空，不动。
-
-## 证据
-
-- 最小复现（`_scratch/post_null_probe2.zan`，纯 System；callee 定义在
-  调用点之后）：旧 zanc 200 万次调用 **13353 条** first-chance AV，
-  签名与 gallery 日志逐字段一致（addr/rcx/rdx/fault 偏移）；新 zanc
-  **0 条**，干净退出。
-- Gui 全链路复现（`_scratch/post_null_probe.zan`，worker Post 20 万
-  个 null 捕获闭包 + UI 循环 DrainPosts）：旧 zanc 20 秒 **5488 条**；
-  新 zanc 20 万条全部 drain、**0 条**，`zan_crash.log` 未生成。
-- 非 GUI smoke **129/129**（`ctest -L smoke -E gui`）。GUI 用例当刻
-  大面积失败系并行 Chart.zan WIP 的语法中间态（报错全在
-  Chart.zan:1110-1127，HEAD 上此前编译通过），与本修复无关。
-- 遗留观察（未修，1/41 记录）：`ResolvedSeries_Of` 读 `addr=0x5`
-  ——null ChartSeries 直接解引用，属应用级空引用，与探针缺陷不同类；
-  该记录出自旧构建，gui_charts 正在重构，随重构观察。
 
 ---
 
-## Gui/Chart 后续（2.2.7 对齐轮遗留）—— ✅ 全部收口（2026-08-30）
-
-ECharts 2.2.7 全 134 示例对齐六批已收口（见 docs/CHART_VS_ECHARTS_227.md）；
-下两项为当时**有意不做**、单独立项的后续，现已落地，账本 134/134 全 ✅：
-
-* [x] **chart timeline 子系统** ✅ 已落地（2026-08-30）：新增
-  `ChartTimeline`——多帧 option 序列 + 底部播放器条（播放/暂停、前/后帧、
-  帧轴点选、帧标签）+ autoPlay（节拍判断用挂钟，帧号/播放态/上拍时刻
-  持久化在 7600000 段 App 状态键，即时模式宿主每帧重建不丢）+ `Merge`
-  帧合并（baseOption 外壳保留、同名系列逐帧换数据）+ JSON
-  `timeline.data[]/options[]` 解析。全链路确定性：帧推进只由显式输入
-  （点击/节拍）驱动。gui_charts pie7 已接线。回归：chart_timeline 17 断言。
-* [x] **connect() 多图联动** ✅ 已落地（2026-08-30）：`ChartOption.connectGroup`
-  + 组长登记（8600000 段组键）+ `ResolvedChart.stateWid` 交互键重定向——
-  dataZoom 窗口/图例开关/十字线悬停类别跨图同帧共享；`CartesianTooltip`
-  兼作联动 seam（指针不在本图上时画跟随十字线）。gui_charts mix9 已接线。
-  回归：chart_option_behavior 补 cg* 四断言。
-* [ ] **架构注记 A：共享坐标系共存层**（仍开放）：2.2.7 跨图族混搭
-  （mix3 地图+饼选、mix11 仪表+漏斗）靠每族自带定位项共存；我们按
-  LeadType 单渲染器分发（ChartView.DispatchKind），一族一画布。做整图族
-  定位共存 = 抽出共享坐标系/布局层供多渲染器叠画，重构面大于收益，待
-  真实需求再立项。注：其原「附带缺口」hoverLink 与 connect() 已分别于
-  批 A4 / 批 C 闭合，本条只剩叠画重构本身。
-
-# A69 · PivotTable 部分可见行无裁剪：行头/行合计格越进表头带，滚动后表头错位 —— ✅ 已修（2026-08-29）
-
-## 现象与根因
-
-透视表演示里往下滚动之后，子表头（Sum · Units…）被首行行头盖掉
-下半截，行合计列的子表头同样被拦腰裁断。像素证据：UiDriver 滚两格
-后 dump 对比，带顶（bandY）以上 1627 px 被改变——垂直滚动时表头带
-应当不动，被改变的全是行内容越界盖上去的。
-
-根因：行循环只对数据格 PushClip（带内），同一行里三处按完整 `ry`
-起笔的绘制没有垂直约束——`sy0` 不与 `rowH` 对齐时首行的 `ry` 落在
-`bandY` 之上：
-1. 行头格填充/文本（画进表头带底部，盖掉子表头下半截）；
-2. 行合计列格（在数据格 PopClip 之后画，画进合计列子表头）；
-3. 行底线（横贯整表，亮线画进表头带中间）。
-末行对称地越进钉住的合计行。命中矩形同样只对列带水平求交，部分行
-的上/下越界段会吃到本该属于表头/合计行的点击。
-
-修复：整行绘制块（行头 + 数据 + 行合计 + 行底线）包进
-`PushClip(x, bandY, viewW, bandH)`；命中矩形与行带垂直求交（与既有
-列带水平求交同款理由）。
-
-## 证据
-
-- 修复前：滚两格后带顶以上 1627 px 系统性破坏；修复后同一脚本再滚，
-  带顶以上仅剩演示页背景脉冲点与侧边栏 hover 高亮（鼠标移动所致）
-  的零散变化（逐簇定位确认，均非表格元素），子表头字形逐像素完整、
-  部分可见行干净裁在带顶边缘（dump 前后帧放大比对）。
-- `ctest -R "conformance_gui_datatable|policy_gallery|…css|carousel|flex"`
-  6/6 绿；menu/input/selectbox 等 4 项失败系并行 Menu/Input WIP 改
-  API 后其测试源未跟上（menu_test.zan 编译错），与本修复无关。
-
-## SelectBox 弹层选项选不中——基线命中修复（已验证、暂缓提交）
-
-现象（gallery 自定义水印演示首报）：下拉弹层打开后点选项毫无反应，
-勾选停在原值、弹层也不关。凡弹层正下方压着可交互控件（滑杆/数字
-输入框/表格行）的 SelectBox 都会中招——水印配置面板每个下拉的正
-下方都是控件，全部选不中。
-
-根因：平铺弹层的输入处理里「释放点落在弹层内已注册控件（内嵌滚动
-条）上时让行给它」的判定用 `HitTestBelowBlockers`，它扫**整帧**区
-域、跳过 blocker 返回第一个命中——覆盖阶段运行时，弹层正下方的内
-容控件早在内容帧注册在前（基线之前），被误判为弹层内部控件，点击
-被 `ClaimClick` 整体吞掉，永远走不到行选择。级联弹层不受影响：它
-的守卫在行处理之后。该守卫由 a44b9f24 引入。
-
-修复：`HitTester.HitTestFrom(px, py, from)`——只匹配 `from` 下标
-之后注册的区域（跳过 blocker）；SelectBox 三处弹层入口（OnPaint
-Overlay / CascadeOverlay）入口记 `overlayBase = RegionCount()`，
-两处守卫改走基线命中。滚动条/搜索框注册在基线之后，让行语义不变。
-
-证据：
-- `tests/gui/selectbox_popup_hit_test.zan`（新增，无窗口）：按真实
-  帧序重放内容滑杆 → 全窗+弹层 blocker → 内嵌滚动条，锁住基线跳过
-  内容区（旧 API 在选项点返回内容控件 id）、滚动条仍让行、blocker
-  不算控件、顶层优先四条语义。
-- 有头探针（_scratch/sb_probe）：弹层盖滑杆+输入框布局，UiDriver 点
-  触发器→点 Center 选项 → `CHANGE align idx=1 text=Center`、弹层关
-  闭；40 项弹层点滚动条条带不误选行、弹层保持开，后续行点击照常。
-- `ctest -R gui_selectbox|gui_menu|gui_datepicker|gui_formgroup|
-  gui_layer` 6/6 绿（含新增 conformance_gui_selectbox_popup_hit，
-  已登记 smoke/standard/full）。
-
-未提交（AGENTS 规则 7 例外）：SelectBox.zan / Event.zan 工作区混有
-另一会话的在途波（SelectBox +689、Event +139 非本修复行；Steps/
-DataGrid 在途编译反复），索引里还有该波的暂存回滚态，hunk 级拆分
-不可行。待该波落地后整文件提交本修复 + 新测试 + CMakeLists 登记。
-
-# A70 · Gui.Widget.NumberAnimation 数值滚动动画组件 —— ✅ 已完成（2026-08-29）
-
-## 组件
-
-`stdlib/Gui/Widget/NumberAnimation.zan`（新建）：在 `Duration` 毫秒内把显示值
-从 `From` 缓动滚到 `To`（countup.js / Element Plus「数值动画」对位），到位触发
-一次 `Finish`。数值模型为 **scaled 定点整数**（显示值 × 10^`Precision`，口径同
-InputNumber）：`Precision` 0..6 补小数位；`Separator` 千分位分组符（`""` 关闭
-分组）；`Decimal` 小数点串（俄语 `Separator=" " Decimal=","` → `699 700,699`）；
-`Prefix`/`Suffix` 贴单位。展示符变化不重摆（只刷新显示），`From/To/Duration`
-变化即重摆重播；`Active` 暂停/恢复——落沿在 `SyncProps` 结算/重锚时间轴，恢复
-第一拍零增量（无跳变）；`Restart()` 手动重播；`SetRange(double, double)` 按当前
-Precision 舍入，宿主免手算缩放。每帧显示值 = `ValueAt(From,To,App.Ease(p))` 现算
-（不逐帧累加，掉帧/失焦不走样），走动期间 `RequestAnimationFrameIn(16,…)` 按
-显示帧率封顶只刷自己条带（Countdown SS 先例）。纯函数静态方法：`ValueAt`
-（千分比插值，远离零四舍五入、long 中间量、精确落点）、`Format`（scaled →
-文本：补零/负号/分组只作用整数段/小数点串可配）、`GroupWith`（sep 参数化分组，
-不动 InputNumber.GroupThousands 的幂等编辑缓冲语义）、`ScaleIt`（double →
-scaled）。缓动全库统一 Smoothstep（App.Ease），不做可配曲线。
-
-## 皮肤
-
-base.css 三处对照 countdown：`numberanim.small/large::value` 字号档；
-`numberanim::value` + success/warning/error 角色类；`numberanim::box/track/fill`
-卡片 + 完成度进度条（角色类重着色已走段）+ `:disabled` 暂停降调档（到位不降调，
-到位是常态）。绘制形态与 Countdown 同构：卡片太小退化裸文本；`OnMeasure` 宽度取
-From/To 端点文本较大者（动画中值单调介于两端、长度不超包络，全程不重排防抖）。
-
-## 注册
-
-ControlFactory（Kinds + Create 各一行）、`tools/mcp_server/zform.controls.txt`
-补 NumberAnimation 行（字母序 Marquee 后）；组件侧 `Kind()/Props()`（10 条：
-to/from/duration/active/precision/separator/decimal/prefix/suffix/class）、
-`Events()` 含 Finish、`BindEvent` 接线。
-
-## 测试
-
-`tests/gui/numberanimation_test.zan` + golden `tests/conformance/gui_numberanimation.out`
-（无窗口，时刻由测试注入）：ValueAt 端点精确/中点/负向对称舍入/极值不溢出/单调
-遍历；Format 八组（分组、补零、负分数、俄语 locale、关闭分组）；GroupWith 尾段
-保护；ScaleIt 舍入；Tick 推进（Ease(500) 中点、到位精确落点、Finish 每轮恰一次、
-续帧不重复）；暂停冻结 + 恢复平移无跳变（落沿结算/重锚）；Restart 重摆可再触发；
-SetProp 改 To 自动重摆；from==to 跑满 Duration 才触发；Duration≤0 钳 1 不除零；
-组件模型往返（Kind/Props 计数/GetProp/Events/ControlFactory.Create）。注册
-`conformance_gui_numberanimation`（名字派生自动进 smoke/standard 档）。
-
-## gallery
-
-`examples/gui_gallery/gui_gallery.zan`：Data Display 类目 NumberAnimation 条目
-（9 AddProp + Finish 事件 + 5 子演示）——基础条（默认/large/small 三档）、
-`.play`（播放按钮 Restart + Finish 状态行）、`.precision`（2400@2 → 24.00）、
-`.separator`（按钮切换 ","↔""，改 Separator 不重摆）、`.locale`（俄语
-699 700,699）、`.callback`（结束后发消息）。`PreviewHeight` 补基础卡条目。
-
-### 目录外置化（assets/gallery.json）· 2026-08-31
-
-组件目录（分类/名称/描述/代码框/JSON 配置/属性表/事件表/演示卡，84 组件
-270 演示卡）全部外置到 `examples/gui_gallery/assets/gallery.json`；
-`BuildComps` 运行时 `JsonValue.Parse` 一次按 `Gallery.lang` 取双语侧，
-8 个 BuildXxx 构造器（约 2100 行）撤除，gui_gallery.zan 1.09MB → 0.67MB
-——剩余几乎全是渲染分发。`withBasicH` 复刻 `WithBasic`：15 个组件的
-「Basic usage」卡（previewId == 组件名）在包里显式落盘。policy
-`run_gallery_demo_wiring.cmake` 改从 JSON 包取注册集（`string(JSON)`
-+ CRLF 归一），新增有效 id 唯一性断言与「无演示又无 code 框」断言；
-mcp seed `gui-gallery` 条目补包文件。构建脚本
-（build_gallery.ps1 / build_gallery_single.ps1）补
-`--embed examples/gui_gallery/assets=assets`；IDE 发布链路
-（CopyResources + StageEmbedArgs）本来就盖住 assets/。
-**已知问题（与本任务无关，HEAD 同样崩）**：`scripts/build_gallery.ps1`
-的手挑 stdlib 文件列表（Gui 顶层 + Widget）在并行会话给 stdlib 引入
-System.Json/Mqtt 等新依赖后已经建不动——`--no-gen` 下是干净的
-`'Json' is not a known namespace` 错误，开 gen 则编译器 0xC0000005；
-等 stdlib 依赖链收口后该脚本要么补文件要么改走 `--auto-stdlib`。
-
-## 实测
-
-`zanc tests/gui/numberanimation_test.zan --auto-stdlib` → `numberanimation_test OK`；
-`ctest -R "numberanimation|conformance_gui_countdown|policy_control_factory|policy_no_widget_drawing|policy_css_comment_hygiene|gui_theme_font_budget|policy_raw_color_budget|conformance_gui_statistic"`
-→ 8/8 全绿。gallery 全量编译通过（311 文件，`_scratch/gallery_probe.exe`）。
-本任务改动与并行会话（InputOtp/otp 皮肤、SelectBox 重构、diag 测试）在工作区混叠
-（ControlFactory/base.css/CMakeLists/gui_gallery 同文件不同 hunk），提交用临时索引
-仅取本任务 hunk。既有欠账（非本任务）：policy_gallery_demo_wiring 报 Menu.expand/
-Pagination/Scrollbar 三个未注册渲染分支；policy_zform_schema 报 ColorPicker 缺清单
-行；smoke 的 cef_profile/gui_input/watermark 三例失败处于并行在途改动区域。
-
-# A71 · Gui.Widget.Steps 强化 + base.Method()/base.Prop 编译器支持 —— ✅ 已完成（2026-08-29）
-
-## 编译器：base 调用族修复（先决条件）
-
-Steps 的 GetProp/SetProp 覆写要走 `base.GetProp(key)` / `base.SetProp(key, val)`
-委托基类，但 base 成员访问在 irgen 有两个致命缺陷（此前会话已发现 base.Method()
-段错误）：
-
-1. **`base.F()` 虚表再入**（`irgen_call.c` emit_expr_call）：接收者是
-   `AST_BASE_EXPR` 时仍把 `recv_cls` 传给 emit_dispatch_call，vtable 槽位仍指向
-   本 override 自身，`base.F()` 递归调回自己直到栈溢出。修法：接收者为
-   `AST_BASE_EXPR` 时传 NULL 静态符号，让 emit_dispatch_call 走直呼静态分支
-   （语义等价 C#：base 调用绑定到最近基类实现的静态版本，非虚分派）。
-2. **`base.Prop` getter 同根**（`irgen_expr.c`）：属性 getter 的 vtable 分派同样
-   再入重写者。属性读取路径新增 AST_BASE_EXPR 分支直呼基类 getter
-   （recv_type 传 NULL 标记 base 读取），`emit_property_getter_call` 里
-   `!recv_type` 与 `is_static` 同走直呼。
-3. **`base` 的静态类型推断**（`irgen_expr_core.c` infer_expr_type）：补
-   AST_BASE_EXPR 分支，有基类时返回 `base_type`（重载解析落在基类符号表），
-   无基类时与 checker 一致落 error。
-
-语义澄清（探针 ov_test60 的 IR 验证）：`base.Reset()` 执行的是基类**方法体**，
-基类体内的字段写入按正常顺序生效——派生类先写、`base.` 调用后写时基类体是
-最后一次写（C# 同款语义），不是 bug。conformance `tests/conformance/base_call.zan`
-锁定：两级 base.Name() 链（"shape/rect"）、base 上 protected 字段读写、
-base 调用后基类体写入生效（void 返回 `[]` 场景）。
-
-## 组件
-
-`stdlib/Gui/Widget/Steps.zan` 对齐 Naive UI n-steps 批量强化：
-
-- **Placement**（""/`"right"`）：次要文字从圆点行下方移到标题右列（`IsRight()`），
-  对位 Naive UI vertical 变体；水平/垂直/右置三套 PaintBody 布局。
-- **Status**（success/error/warning 白名单归一，脏值回 ""）：整条流程的语义状态
-  类（`steps.success` 等）令 done/active 圆点与连接线整体切状态色——回顾完成的
-  向导 / 定位失败的流程只看一个色系；标题只用前景色不与圆点争强调。
-- **FinishIcon / ErrorIcon**：完成态对勾可换任意图标名（如 `"smile"`），错误态
-  默认 `"!"` 亦可换；每步图标 `AddStepIcon(label, icon)` /
-  `AddStepIconDesc(label, desc, icon)` 覆盖默认圆点（咖啡步骤图标演示）。
-- **Clickable + Change**：`Clickable = true` 后点**已到达**（非 error）圆点可回退
-  当前步，经 WidgetId 命中（EnsureIds 稳定 id），触发 `Change` UiEvent；
-  `ClickAvailable` 门控与全局命中规则一致。
-- 组件模型：Props() 10 条（placement/status/finishIcon/errorIcon/clickable 等
-  无字段 prop 由 GetProp/SetProp 钩子应答，走刚修好的 base 委托），ItemsText/
-  SetItemsText 经 GetExtra/SetExtra("items") 往返（"A|B=desc" 编码），
-  Events() 含 Change，BindEvent 接线；`StatusNorm` 白名单静态方法。
-
-## 皮肤
-
-base.css：`steps::marker { height: 26; }` 让圆点直径走 CSS height token
-（small 20 / medium 26 / large 32 与代码侧缺省同源，`steps.small::marker`/
-`steps.large::marker` 覆写）；`steps.success/error/warning::marker.done|active`
-与 `::connector.done|active` 流程级状态色三组 + `::title.active` 前景两行。
-
-## 测试
-
-- `tests/gui/steps_test.zan` + golden `tests/conformance/gui_steps.out`（43 检，
-  无窗口）：StatusNorm 白名单 6 组、StateClass 位置→状态类、ItemsText 往返、
-  GetProp/SetProp 往返（脏 status 归一 + class/name 走基类路径——正是 base
-  修复的端到端验证）、GetExtra/SetExtra、Change 事件接线（静态方法组处理器，
-  Zan lambda 无捕获）+ PropOf（有字段的 size 出 spec，无字段的 status 出 null）、
-  Kind。注册 `conformance_gui_steps`（smoke/standard 档）。
-- `tests/conformance/base_call.zan|.out`：base.Method()/base.Prop 直呼语义
-  回归（两级 base 链、protected 字段、基类体后写生效）。
-
-## gallery
-
-`examples/gui_gallery/gui_gallery.zan` Steps 页扩到 8 演示（GalleryModel 补
-`stepClick` 演示绑定字段，PreviewHeight 420→820，Arrange 380→760）：原三卡
-（水平绑定/错误步/垂直带描述）+ placement right（3 步带描述）+ status
-success/error 双联 + 定制图标（finishIcon=smile + per-step coffee）+ Clickable
-点击回退（LIVE EVENTS 实况）；AddDemo 词条补 9 属性 + Change 事件，
-JSON 补 placement/status/clickable。
-
-## 实测
-
-`ctest --test-dir build -R "conformance_gui_steps|conformance_base_call"` → 2/2 绿；
-`ctest -L smoke` 除 5 例外全绿——这 5 例（cef_profile/gui_input/watermark/
-policy_zform_schema/policy_gallery_demo_wiring）在**不含本任务改动的 HEAD 基线
-上同样失败**（stash 验证），均属并行会话在途区域（ColorPicker 未进清单、
-Menu.expand/Pagination/Scrollbar 渲染分支、Watermark props 计数、cef/input 无头
-环境依赖），与本任务无关。gallery 全量编译通过。工作区混叠并行会话
-（Pagination/QrCode/IconSvg/DataTable 导出/Tooltip/otp 等多处），提交按文件 +
-临时 blob（gui_gallery）/apply --cached 分片（base.css/CMakeLists）仅取本任务
-hunk；既有欠账照录不扩大。
-
-# A70 · `Thread.Start` 不能携带实例方法组（带标记闭包记录 vs 裸函数指针 ABI）—— ⏳ 已登记，暂缓修复（2026-08-29）
-
-- **症状**：`Thread.Start(job.Run)`（`Run` 为实例方法组，`job` 是堆对象）
-  在启动瞬间 SEGFAULT（进程 exit 139），无任何诊断。最小复现
-  `_scratch/threadjob.zan`：`class J { public int v; public void Run(){…} }`
-  → `ThreadStart ts = j.Run; Thread.Start(ts);`。静态方法组同形写法正常。
-- **根因**：A33-2 的委托 ABI 里，静态方法组 = 裸函数指针（可直接交 C），
-  实例方法组 = 堆上带标记闭包记录 `{fn@0, dtor@8, target@16}`（奇数指针，
-  bit0=1，`ZAN_CLOSURE_TAG`，`src/common/zan_abi.h:108-111`；生成端
-  `src/compiler/irgen_arc.c:68-84`）。而 `src/runtime/rt_sync.c:854` 的
-  `zan_thread_start(void*)` 把参数原样强转成裸 `void(*)()` 直接调用——
-  带着 tag 位的记录指针被当代码地址跳进去即崩。`Threading.zan` 文档
-  只写了"委托必须是非捕获的"，checker 也不拦这个调用位置。
-- **当前回避（标准库两处同构）**：线程入口用**静态方法组** + 静态队列/
-  Mutex/workerStarted 单 worker 循环，实例绑定经队列项传递——
-  `stdlib/Gui/Image/ImageHttp.zan`（下载）与 `stdlib/Gui/Widget/Upload.zan`
-  （上传 `UploadJob.Run`）均此形。不违规则 10：组件逻辑仍是 Zan 实现，
-  只是入口形状受 ABI 限制。
-- **修法建议**（二者之一或都做）：① 运行时：`zan_thread_start` 检查
-  bit0，若是带标记记录则解包 `record.fn` 并以 `record.target` 作 receiver
-  经 `emit_delegate_invoke` 同款 trampoline 调用；② checker：在实参转换
-  点拒绝"实例方法组 → ThreadStart"并给出指向日志。建议 ① 为根治，
-  顺带让 `new Thread(instance.Run)` 一类写法全部自然可用。
-
-# A71 · 标准库按需加载第一步：Gui 图标表从编译期代码改为 JSON 数据包 + zanc 自动内嵌 —— ✅ 已完成（2026-08-30）
-
-- **动机**：空窗口 --publish 2.08MB 里 483KB 是 997 个 Tabler 图标的 SVG
-  body——它们原是 `IconSvgData.zan` 里两条巨型 `List<string>` 字面量，被
-  展开成 .data 的 XOR 混淆字符串节（--publish 全量混淆，deobf ctor 启动时
-  整表还原），没画过图标的程序也全款背走，且字符串常量不可按需丢弃。
-- **改造**（stdlib/Gui/IconSvgData.zan 重写为惰性加载器）：
-  · 数据搬进 `stdlib/Gui/icons/tabler.json`（~258KB，`{"名": "SVG body"}`，
-    升序）；`scripts/gen_icons_tabler.py` 改为输出 JSON 包。
-  · `Ensure()` 首次画图标才解析：`ZAN_GUI_ICONS` env（文件或目录）→
-    exe 旁 `icons/`、`assets/icons/` → 内嵌资源 `icons/*.json` →
-    `stdlib/Gui/icons/`（开发树），多包有序合并（先到先得、同名覆盖按
-    "磁盘包 > 内置包"排序保证），插入排序恢复全局升序供二分。
-  · 扩展性：应用丢一个自己的 json（exe 旁 icons/ 或 env 指向）即可追加/
-    覆盖个别图标，无需动标准库。
-- **zanc 自动内嵌**（src/compiler/main.c）：程序镜像真的含有
-  `IconSvgData_` 符号（即 GUI 图标模块被链入）且 stdlib 根存在
-  `Gui/icons/` 时，自动追加 `--embed <stdlib>/Gui/icons=icons`，资源名
-  `icons/<file>` 与读取端 `zan_embed_list("icons/")` 对齐；磁盘包发现序
-  在内嵌之前，替换包仍可覆盖。发布 GUI 程序零侧车文件。
-- **体积**：空窗口 --publish 2,078,720 → 1,995,776 B（-81KB）；.data
-  529→234KB、.rdata 284→521KB（embed 表为只读常量，还顺带把图标字节从
-  可写段挪出）。gallery --publish 11.44→11.37MB。编译期收益：
-  IconSvgData_Ensure 的 92KB .text 代码消失。
-- **回归**：conformance_gui_icon/gui_css/gui_props 等 53 项 GUI standard
-  档仅 3 失败（cef_profile/gui_input/watermark，stash 验证为并行在途既有
-  失败）；clipboard_roundtrip 复跑 5 次全过。发布探针验证：内嵌态 997 枚
-  全可读、ZAN_GUI_ICONS 自定义包合并生效（997+1=998、序保持升序）。
-- **后续路线（按需加载仍未完的部分）**：
-  ① `-ffunction-sections` + `--gc-sections`：LLVM C API（20.1.8）没有
-  function-sections 开关，需在 irgen 每函数设 section 属性
-  (`LLVMSetSection(fn, ".text$<name>")`) 或升级暴露 TargetMachineOptions
-  的 C API；空窗口 .text 1.12MB 预计可砍近半（DataTable/CefCdp/
-  HttpClient 等未被调用的族全在镜像里）。
-  ② globaldce 根因：`zan_opt_strip_unused` 只跑 globaldce，但 vtable/
-  refl mtab/site-dtor 三张全类表把所有类的方法体钉进可达集——按需加载
-  想真正生效必须让这三张表只含被实例化/被反射到的类。
-  ③ auto-embed 泛化：把「stdlib 命名空间数据目录自动烤进镜像」推广成
-  一般机制（skins 已手工做，icons 本次做了），例如约定
-  `stdlib/<Ns>/data/` 自动 `--embed <dir>=<Ns>/data`，新组件的数据文件
-  不再需要每次手接。
-
-# A72 · 标准库按需加载第二步：Pinyin 词典从编译期字符串改为数据文件 + zanc 自动内嵌 —— ✅ 已完成（2026-08-30）
-
-接 A71 的「其他组件 JSON 化」问题。全 stdlib 字面量密度扫描（lit B / src B）：
-Pinyin 91%（45,355B 源码里 41,156B 是 GB2312 词典字符串链）、TDengine 65%（SQL 模板，
-属代码不该动）、Lunar 48%（10.9KB，可选）、CodeEditor.Completion/Intelli 10-22%
-（关键词表，候选但收益小）。皮肤已是数据文件（16 包 733.8KB）。先落最大头 Pinyin。
-
-- **数据出体**：`stdlib/System/Text/data/pinyin.txt`（6,763 行 GB2312
-  "汉字拼音" 行，47.9KB UTF-8），Pinyin.zan 从 131 行/45KB 源码变 256 行
-  加载器，`Data()` 的 33 个巨型字符串字面量整体消失。
-- **零依赖加载器**：Pinyin 刻意不 using System.IO/Diagnostics——原来只
-  `using System`，拉上 IO 会把 27 个文件拖进每个只碰拼音的程序（实测 25→52
-  文件、exe 反涨 66KB）。文件读取走自声明 CRT DllImport（fopen/fread/
-  fclose），exe 路径走 GetModuleFileNameW/readlink（镜像 ProcessHost 但本
-  地实现），UTF-16 转换本地 WideToStr。内嵌 API（zan_embed_has/read）本地
-  声明——同名 DllImport 跨文件重复声明是既有合法形态。
-- **发现链**（对齐图标/皮肤惯例）：env `ZAN_PINYIN_DATA`（文件）→ exe 旁
-  `pinyin.txt` → 内嵌资源 `text/pinyin.txt` → 源码树回溯
-  `stdlib/System/Text/data/`（开发态）。替换文件覆盖内置词典，无需重编译。
-- **zanc 自动内嵌**（main.c，A71 图标钩子旁同款）：镜像含 `Pinyin_` 符号
-  且 stdlib 根存在该文件时，自动 `--embed <stdlib>/System/Text/data/
-  pinyin.txt=text/pinyin.txt`，发布程序零侧车。
-- **体积**：同程序（tryget_pinyin）--publish 251,904 → 221,696 B（-30KB，
-  -11.9%）。分段：.data 55.8→8.2KB（词典从 XOR 混淆可写段挪到只读 embed
-  表）、.text +14.8KB（加载代码）、.rdata +1KB。发布体积与词典大小同阶。
-- **回归**：conformance/determinism/leakcheck tryget_pinyin 3 项全绿；
-  发布态（无 stdlib 树的隔离目录）内嵌读取正确；env 覆盖与 exe 旁覆盖
-  实测生效（中→ZHONGX 触发预期 FAIL）；standard 档 643/647，4 失败
-  （gui_cef_profile/gui_input/gui_watermark/string_index_char_text）stash
-  验证为并行在途既有，与本次无关。
-- **教训**：标准库模块的 using 是传染的——一个 45KB 的词典模块若顺手
-  using System.IO，就让所有拼音用户多链半个 IO 族。数据文件化同时治了
-  这个：加载器只依赖 CRT。
-
-# A73 · 统一优化路线第一批实测：inline 阈值按优化档位分档 + PIC 假设证伪 —— ✅ 已完成（2026-08-30）
-
-A71 归因出四条编译器杠杆，本条把能实测的先测掉，用数据决定取舍。
-
-- **杠杆③ inline 分档（已落地）**：`--publish`（Os）下 alwaysinline 的
-  收录从 ≤4 基本块收紧到 ≤2 块（optimizer.c `small_cap`），其他档位不变。
-  依据：Os 是体积档，3-4 块小函数（ARC 包装、属性 getter）强制内联是
-  .text 膨胀主力之一；inlinehint 扩到 Os 的反向实验证明大函数内联在 Os
-  完全错误（gallery .text +615KB/+55%，已回退）。
-  实测：gallery --publish 11,324,928 → 8,726,528B（**-2.60MB，-23%**，
-  .text 9,072,128→6,473,216）；空窗口 1,947,136→1,779,712B（-167KB，
-  .text -14.7%）。回归：conformance 全套 503/503（首轮 1 个 flaky 复跑
-  过）、smoke 181/184（3 失败为并行在途既有）、determinism/leakcheck
-  抽样全过。折中说明：Os 档放弃 3-4 块内联会有一点调用开销，但该档
-  本来就以体积优先；性能档（O2/O3）的 ≤4bb 内联原样保留。
-- **杠杆② PIC→静态（证伪，未落地）**：irgen_emit.c 硬编码
-  LLVMRelocPIC 疑似白白付 GOT 相对寻址的体积税。实测 RelocDefault vs
-  RelocPIC 在 x64 COFF 上**逐字节一致**（仅 PE 时间戳 4 字节不同）：
-  x64 Windows 的 RIP 相对寻址本就是默认模型，reloc 模式不改变代码形态，
-  MinGW 链接 /DYNAMICBASE 与否也不由这里决定。原假设作废，相关代码
-  保持原样。此结论同时说明：A71 估的 −3~8% 里 PIC 部分不存在，
-  剩余空间必须从 DCE/inline/ARC 拿。
-- **对 A71 估计的修正**：四杠杆中②清零；③实测 −23%（gallery）超出
-  估计的 −5~10%（BB 阈值对 Zan 代码形状的杠杆比预想大——Zan 全虚
-  分发 + ARC 包装使 3-4 块函数密度远高于典型 C）；①（三表钉死 +
-  function-sections）与④（ARC 冗余对消除）仍待做，是下一批。
-
-# A74 · 统一优化第二批：function-sections + --gc-sections（发布档）+ 三表钉死量化 —— ✅ 已完成（2026-08-30）
-
-- **实现**：publish 档（`g->obfuscate_strings` 同源判定）在 write_obj 前给每个
-  有定义函数设独立 COFF 节 `.text.<fn>`（irgen_emit.c，llvm-c
-  `LLVMSetSection`，符号名本就是唯一 mangled 名）；Windows 打包链
-  （bundled ld.exe，main.c）在 publish 时追加 `--gc-sections`。
-- **实测**：空窗口 --publish 1,947,136→1,776,640B（-167KB，.text
-  1,125,888→958,464，-14.9%，.xdata/.rdata 同步缩）；gallery
-  8,726,528→8,723,456B（-3KB——gallery 里几乎所有函数都被真可达路径
-  引用，这与 IR 归因一致）。回归：standard 643/647（4 失败为并行在途
-  既有：cef_profile/gui_input/gui_watermark/string_index_char_text），
-  gc 后探针运行正常。
-- **IR 归因（关键发现）**：空窗口 IR 共 1,010 个定义函数，从 main 做调用图
-  可达性分析**只有 115 个可达，895 个死代码**——它们能进镜像是因为
-  `__zan_site_dtors`（[4096 x ptr] 内部常量数组）以重定位方式钉住 542 个
-  根 + 死簇内部互调传播；globaldce 对内部数组引用无能为力。这就是
-  A71 杠杆①的量化实锤：**空窗口理论上还有 ~72% 的 .text 是可去死的**
-  （当前 gc 只剪掉无表引用的部分）。
-- **去钉路线（未做，需 ARC 站点机制重构）**：site_dtors 在运行期按分配
-  站点 id 动态索引，ld 无法静态判活。两条路：① 分配站点直接内联具体
-  析构调用（放弃动态表，release_dyn 退化为兜底）——最优但动 ARC 核心；
-  ② 表按站点拆成 [1 x ptr] 独立全局（各占一节）+ 二级目录——ld 仍通过
-  目录钉住全部，无效。① 是 A75 候选，预计空窗口再 -500KB 级。
-
-# A77 · 运行时守卫双路径化：兜底记录异常但不闪退（fail-soft），ZAN_RT_HARD=1 恢复 exit(70) —— ✅ 已完成（2026-08-31）
-
-- **背景**：A76 把 null 基址/越界探针改成了受控报错 + exit(70)。受控解决了
-  「查不出在哪崩」，但 exit(70) 本身对常驻服务仍是闪退：凌晨三点守卫命中 →
-  进程退出 → supervisor 拉起 → 再命中 → 崩溃循环。用户指令明确：**要兜底
-  记录异常后续修复，但要确保不闪退**。
-- **设计（编译器发射两条路径，运行时按环境一次性择一）**：每个守卫点位
-  `emit_runtime_check`（irgen_generics.c）现在发射
-  `if (zan_rt_soft_is_hard()) { 致命报告 + exit(70) } else { zan_rt_soft_note(text); 继续 }`。
-  - `zan_rt_soft_note`（rt_timer.c）：stderr 打一次（按站点全局指针去重，
-    256 槽——热循环反复命中同一点位不会刷屏/刷盘），同时追加进崩溃处理器
-    同一份日志（Windows `<exe_dir>\zan_crash.log`；POSIX
-    `<exe_dir>/logs/YYYYMM/DD.log`，尊重 ZAN_LOG_DIR），时间戳 + 源点位
-    行列齐全，事后可 grep 修复。
-  - **scratch 替身页**：soft 路径继续执行时，降级后的 GEP+load 若仍以 null
-    为基址照样段错误。`zan_rt_soft_scratch()`（rt_timer.c）返回 256B 全零
-    静态页，`emit_soft_base_select` 在守卫报告之后把 null 基址 select 成
-    scratch——load 读到 0、store 落进替身页，程序拿「空对象」继续跑。
-    hard 路径在报告内部就 exit，替身页永远不会被选中。
-  - **落点全家福（g->runtime_checks 开启时）**：① 字符串长度探针
-    （emit_string_len_ex raw_bb，null/悬垂 buffer → 报告后返回长度 0，
-    phi join 保持良构）；② string[i] 元素访问（emit_string_elem_guard，
-    null 接收者 + 负索引报告后索钳到 0、基址换 scratch）；③ 数组 .Length
-    null 接收者；④ 成员读接收者（emit_weak_read_guard +
-    emit_guarded_member_object + 本地字段 fast path 三处，null 对象换
-    scratch）；⑤ Substring（slen 负值钳 0 + null 基址换 scratch——
-    否则 bufsz=-1 回绕成巨分配/memcpy）；⑥ extern 调用 string 实参
-    （scall/bcall/全局名解析三路 DllImport 形态全覆盖：null 串报点后传
-    ""字面量，外部函数读空串而不是读 null）。
-  - **ZAN_RT_HARD=1**：`zan_soft_is_hard()` 启动读一次环境变量缓存，
-    所有守卫回到 A76 语义（报告 + exit(70)）——测试套的 fail-fast 契约
-    钉在同一份二进制上，`tests/run_runtime_error.cmake` 已显式
-    `set(ENV{ZAN_RT_HARD} "1")`。
-- **cross-rt**：rt_timer.c 变更后经 zig 重建 6 份工具链目标
-  （linux-musl/arm64/riscv64 + macos x64/arm64 + win-x64）；win-arm64 的
-  zanrt_timer.o 需 MSYS2 CLANGARM64（zig 0.15.1 的 aarch64 mingw 头缺
-  CONTEXT.Rsp/Rip，与 CI 构建器不一致），本次未动、待 CI/CLANGARM64 重出。
-- **验证**：WSL 探针批 8/8（strhead/idx/arrhead/plain/slice/strlen/subnull/
-  plainfield：soft rc=0 + stderr 一次 + 日志落 exe 旁，ZAN_RT_HARD=1
-  rc=70）；Windows 原生 + --target win-x64 交叉同效（dt2/subnull/extnull
-  三探针）。tests/runtime 18/18（剔除 3 个 cef 系，其失败为并行在途
-  ExternalCallPolicy/DownloadJob 重载不一致的 stdlib 编译错，rc=1 非崩溃，
-  determinism_cef_runtime_index 同因）；smoke 198 项并发批 15 失败全部为
-  GUI 用例窗口站资源竞争（串行复跑 12 项自行恢复），余 3 项
-  （cef_profile/watermark/datatable_sparse_page）在案既有与本次无关。
-- **教训（并行会话覆盖）**：本工作窗内 irgen_call.c 的 Substring clamp 与
-  extern arg 守卫曾被并行提交的版本覆盖丢失（WSL subnull 探针复崩发现），
-  已按探针行为重放补齐——多会话并行改同一文件时，提交前须以探针批
-  复验而不仅看 git diff。
-
-# A76 · WSL 内存非法访问排查：null 字符串探针/元素访问受控化 + 崩溃日志双 0x 修复 —— ✅ 已完成（2026-08-30）
-
-- **背景**：线上 Linux MVC 程序崩溃日志 `SIGSEGV(11) addr=0xfffffffffffffffe`，
-  strip+Os 发布二进制无符号无栈。WSL 排查确认这是 **null 基址 + 小负偏移**
-  家族：探针 `char c = s[-2]`（s 为 null static string 字段）逐字节复现该签名
-  （payload-2 的 GEP+load 落在 -2）。同族映射：null 对象字段读 → addr=0x0、
-  null 字符串 .Length/strlen → 0x0、null 数组 .Length → 0xfffffffffffffff0
-  （null-16，数组头）、null string[i] 负索引 → 0xfffffffffffffffe（null-2）。
-- **编译器修复面（runtime_checks 开启时全部受控：`file:line:col: runtime
-  error: …` + exit(70)，Windows 同样走 RaiseException 记崩溃日志）**：
-  - A 面 `emit_string_len_ex`（irgen_generics.c）：null/悬垂 buffer 走到
-    长度探针 raw_bb 时不再裸调 strlen——`emit_string_null_report` 报点位后
-    exit(70)。strhead/slice/subnull/foreach 等 8 处调用点全部穿 loc。
-    `--no-runtime-checks` 保留历史 strlen 行为（调用方自担）。
-  - B 面 string[i] 元素访问：field/参数/extern 接收者被
-    `expr_has_reliable_string_bounds` 判为不可靠（FFI 裸 buffer 可能在
-    NUL 后带数据，strlen 界会误伤 wire codec），读/写/复合赋值 5 处
-    在无 bounds check 分支补 `emit_string_elem_guard`：null 接收者 +
-    负索引受控报错；上界按设计仍不查（可靠界不存在）。idx 探针实测
-    `addr=0xfffffffffffffffe` 签名消除。
-  - C 面 rt_crash.h：`zan__crash_frame` 非 dladdr 分支手工 `"0x"` 前缀与
-    `zan__crash_hex` 自带 `0x` 叠加（线上日志 `0x0x390515` 即此），
-    去手工前缀；cross-rt（linux-musl/arm64/riscv64 + macos x64/arm64）
-    经 build_cross_rt.cmd 重建，实测日志为单 `0x`。
-- **跨平台批跑**：408 个 conformance linux-x64 -g 进 WSL：187 过/18 差异/
-  3 crash，与修复前基线一致（差异为 win 平台性/leakcheck 环境项，
-  crasher 见下，无新增回归）；Windows 侧 hello/idx/strhead/negidx 抽查
-  受控报错同效。
-- **3 个 crasher 根因（属应用层/悬垂问题，非编译器安全面，另行处理）**：
-  - https_binary_body + tls_hostname：`TlsStream.Close`（TlsStream.zan:909）
-    `SSL_free(this.ssl)` 后 crash 于 wbio 悬垂访问（SSL_set_bio 转移了
-    BIO 所有权，但 Zan 侧 `string` 字段仍持指针；libssl 3.x 上
-    BIO_ctrl_pending 段错误 addr=0x75…018 非空非小偏移）。疑 ARC 收走
-    wbio 字符串后 SSL 内部 BIO 悬垂——需按 Ownership 约定重审
-    Setup/Close 的 BIO 生命周期。
-  - sqlserver_tds：`Program_Live$resume`（sqlserver_tds.zan:521 pool.Close
-    场景）写 `(%rax)` 时 addr=0x7754cc964058——协程 resume 路径 null 实例
-    字段（与 TdsBytes.Release 后 Data()/Len() 读悬垂同族），非确定性复现。
-- **desc_hdr 在途 WIP 交接（已撤回）**：排查中段曾发现 desc_hdr 描述符模式
-  使 zanc 启动即崩（`__zan_desc_N` 只 reserve 无 initializer），临时强制
-  `g->desc_hdr = false` 绕行；其后并行 WIP 补上了 create_arc_desc 的
-  全零 initializer（模块死在 finalize 前也取安全回退路径），zanc 恢复
-  正常，本临时关闭随之撤回，desc_hdr 默认开启（check_leaks 仍走
-  site-index 布局）。
-
-# A75 · ARC 描述符头：对象头存 per-shape 描述符指针，三张钉死表（site_dtors/site_tynames/site_meta）整体退役 —— ✅ 已完成（2026-08-31）
-
-- **背景**：A74 实锤空窗口 --publish 895/1010 定义函数从 main 不可达但全款进镜像，根因是
-  `__zan_site_dtors`/`__zan_site_tynames`/`__zan_site_meta` 三张 `[4096 x i8*]` internal
-  常量数组把 542 个根函数钉死（ld 无法对数组元素判活，死簇再传播）。
-- **设计**：对象头第二字（原 site index 槽，ZAN_OBJ_SITE_OFF）改存 **per-shape 描述符指针**：
-  `@__zan_desc_<i> = internal constant {ptr dtor, ptr tynames, ptr meta, i64 site}`，
-  reserve 时创建（全零 initializer：死在 finalize 前也走安全回退——plain release / not-a-T /
-  fallback typeinfo），finalize 时由 `zan_irgen_emit_arc_desc_init`（irgen_reflect.c，需
-  refl_meta_for）一次性填满（dtor 来自 get_class_release_decl/get_collection_release_decl、
-  tynames 照抄 emit_site_tyname_table 的祖先链构造、meta 仅 refl_used 时填）。
-  - 分配点（new/Binding/List/StringBuilder/Dict/closure/box/reflect-ctor thunk 共 6 处
-    rt_alloc 调用点）经 `arc_site_arg()` 统一传参：check_leaks 传站点 id 常量，desc 模式传
-    描述符指针 PtrToInt——rt_alloc 签名不动，运行时只透传一字。
-  - 读者全部双模：`zan_rt_release_dyn`（desc→加载 dtor 字段非空则间接调用，null 回退
-    zan_rt_release）；`emit_runtime_is_check`（desc→加载 tynames 字段（offset 8）后照旧
-    strcmp 祖先链；desc=0 即 not-a-T）；`__zan_refl_obj_type`（desc→加载 meta 字段
-    （offset 16）非空即返回）。字符串 tag 探针（高 32 位 0x5a414e53）先行，描述符指针
-    永不撞 tag；arc-guard quarantine 覆写 site 字照旧安全（两模式都不再依赖其中内容）。
-  - **check_leaks 构建保留全部旧布局**（desc_hdr=false 路径）：site_dtors/tynames/meta
-    三表 + 报表机制原样，`--check-leaks` 语义零变化。
-- **体积实效（--publish）**：空窗口 1,776,640→1,714,688B（−62KB/−3.5%）；gallery
-  9,291,264→9,573,888B（+3%，见下「未达预期」）。IR 口径：空窗口定义函数 1,010→9,975
-  无关紧要，可达根从 542（表数组钉死）降为 desc 引用（仅真正 `is`/release/reflect 用到的
-  形状被引用）；cc.zan 探针 261 定义 222 死，与 A74 前的 IR 可达性对比已无表数组根。
-- **未达预期（诚实记录）**：gallery publish 反涨 3%。原因：A74 的 --gc-sections 在
-  gallery 上本就拿不到多少死代码（A74 实测 gallery -3KB），而描述符 per-shape 常量
-  （3×8B+padding）与 __zan_tynames_<i> 列表全局替换了原三表的对 4096 槽分摊——表模式
-  下 [4096] 数组的 .data 摊销成本低于每形状独立记录。空窗口收益来自 ld 真正删掉了
-  release 函数（此前被表钉死）；gallery 函数几乎全被真可达路径引用（A74 结论），
-  desc 模式既删不掉更多代码，又多付 per-shape 记录的 .data，净 +282KB。后续方向：
-  给 desc 全局加 LLVMSetUnnamedAddr + 合并同形状（已同形状合并）；或 tynames 列表
-  共享（同祖先链只发一份）可再省。
-- **A73 杠杆④预研证伪（2026-08-31，无代码落地）**：估的「ARC 冗余对消除 −10~15%」
-  前提不成立。量化：原始 irgen 输出（-O0 --emit-ir，10,147 函数）里同基本块同操作数
-  retain/release 对**只有 9 对**（全部是 CefOptions 各字符串属性的 getter——先 null
-  检查里 retain、末尾又 release 同一局部）；--publish 过 LLVM Os 管线后余 3 对、
-  同 BB 口径 18 对（JsonReader/Css/File 等，均为 LLVM 本身没合并的跨语句对），
-  对照全模块 3,561 个 ARC 调用（str_release 1,594 / release_dyn 1,104 / str_retain 401），
-  冗余对占比 <0.3%，即便全部消除也不到几 KB。结论：Zan 的 ARC 发射形态（局部
-  retain 立即随语句尾 release）天然不产相邻冗余对，LLVM Os 的 GVN/DSE 已把仅有的
-  几对消化殆尽——独立 ARC-pair pass 无收益，A71 原估的该部分清零。此前的 optimizer.c
-  zan_opt_arc 相邻对消除 pass 保留不动（-O1+ 才跑，当前数对属正常维护面）。
-  四杠杆至此全部落地或证伪：③ inline 分档 −23%（实落地）、① 三表钉死 A75 −3.5%
-  （空窗）、② PIC 证伪、④ 本条证伪。空窗/画廊体积的下一批候选只剩 desc 记录瘦身
-  与 tynames 列表共享（边际收益小），体积优化线暂告一段落。
-- **回归**：standard 643/647、smoke 181/184（失败均为并行在途既有：cef_profile/
-  gui_input/watermark/string_index_char_text）；探针 isas.zan（is 命中/基类 is/as
-  向下转型/object 槽 string is/descriptor 模式 GetType().Name 报 Dog）+ cc.zan
-  （List/Dict/StringBuilder/闭包捕获/foreach ARC）在 **默认 desc 模式、--check-leaks、
-  --arc-guard、--publish** 四种模式全部通过；generic_class_instance_generic_method
-  golden 一致。
-
-# A78 · 两个不合理硬编码上限拆除 + EH 线程表动态化 + 守卫串体积治理 —— ✅ 已完成（2026-08-31）
-
-## A78-1 · ARC 站点表上限拆除（ZAN_MAX_LEAK_SITES 4096）—— ✅ 已完成
-
-- **背景**：`reserve_arc_site`/`reserve_closure_site` 在站点数达 4096 时
-  `zanc: too many distinct ARC destructor shapes` 直接 exit(1)。desc_hdr
-  模式（默认，A75）下三张钉死表已退役，4096 上限只剩历史惯性；check_leaks
-  模式仍依赖固定站点 id 布局。
-- **修复（irgen.c/irgen.h）**：desc 模式站点表全部动态增长——
-  `site_arrays_reserve`（site_syms/site_coll/site_coll_elem/site_inst 四组
-  realloc 倍增，初始 256，尾段 memset）+ `desc_gv_reserve`（同型倍增），
-  两个 reserve 函数**无条件**调用（此前 desc_gv 只在越 4096 后才补分配，
-  导致 desc_hdr 模式每个新站点 create_arc_desc 写进 NULL 指针表 → 宿主
-  段错误）；check_leaks 保留 4096 硬上限但改为**干净报错**（一行说明
-  check-leaks maximum 4096 后 exit 1），不再隐性越界。
-- **验证**：plain300/plain5000 探针（5000 个 `new` 站点，输出 12497500）在
-  新编译器通过；`--check-leaks` 同探针干净报错退出；`--emit-ir` 口径站点
-  id 单调无洞。
-
-## A78-2 · EH 线程表动态化（ZAN_EH_THREADS 1024）—— ✅ 已完成
-
-- **背景**：`__zan_eh_state` 的线程表（keys/states 并行数组 + 线性探测）
-  固定 1024 槽，第 1025 个并发带 try 的线程 claim 失败时程序 abort
-  （`too many live threads`）。1100 线程探针实测：无 try 全过、带 try 必崩。
-- **修复（irgen_builtins.c）**：表改为**开放寻址哈希**（key = tid+1，
-  0=空、ZAN_EH_TOMBSTONE=可复用墓碑，探测序列 `h+i` 全程按 cap-1 掩码），
-  cap 从 0 起步、满则**倍增重哈希**（`emit_eh_tab_grow`：calloc 新对 →
-  搬运活键/状态、墓碑丢弃 → 装表 → free 旧对）；并发用 64 字节零初始化
-  全局锁存储（Windows SRWLOCK / POSIX pthread_mutex，`AcquireSRWLock…
-  /pthread_mutex_lock` 平铺调用），慢路径（查表/claim/扩容）全程持锁，
-  TLS 缓存命中路径无锁。**调试中揪出两个自埋雷（都只在首次真重哈希时
-  可达，1024 以下永现不了）**：
-  1. 重哈希扫带 `gw.npos` 的 `p+1` **未按 newcap 掩码**——碰撞链跨过
-     末槽即走出分配（实测写到 sb+0x1ce8 段错误，gdb 逐字节定位）；
-  2. `gw.nsp` 用 `GEP2(i8ptr, BitCast(sb), p*8)` **双重步长**——sb 本是
-     `ptr-to-i8*`，GEP2 自带 ×8，再乘 8 即每 64B 写一次，`states[p]` 落
-     `sb+p*64` 越界堆写。
-  修复后 `>`3000 并发带 EH 线程全绿。
-- **验证**：ehstart.zan（1100 并发 try 线程 + Start 失败计数）rc=0
-  `ready 1100 startFails 0`；300/1030/1100/2000/3000 全通过（2000 曾见
-  一条偶发 null-ref 诊断，复跑 4 次未再现）；eh1300 波次 1500 线程
-  `ok 1500`；conformance 全 48 项 exception/thread_*（含 arcguard_/
-  determinism_/leakcheck_ 变体）100% 通过。
-
-## A78-3 · 新发现预置 bug：≥64 个泛型实例化堆损坏（两套编译器皆炸）—— ⏳ 已登记未修
-
-- **现象**：单模块内同一泛型类/方法实例化到 **63 个通过、64 个起堆损坏**
-  （编译器宿主段错误，非确定性、ASLR 相关）。HEAD 编译器与本次改动后
-  的编译器同样炸，与本会话改动无关。
-- **探针**：`_scratch/pb64.zan`（63/64 实例化二分）。方向：泛型实例表
-  容量/索引 63 边界（某 64 槽表零起步减一之类）。
-- **处置**：按 AGENTS.md 规则 10 登记，待专项修复；不绕过。
-
-## A78-4 · 守卫串体积治理（.rdata 里 5 万条 runtime-error 文本）—— ✅ 两刀全部完成（2026-08-31）
-
-- **背景**：gallery 发布二进制 ~17MB 里 50,779 条守卫串（每处引用类型成员
-  访问一条 `D:\project\zan-lang\build\..\stdlib\Gui\App.zan:818:40: runtime
-  error: null reference where an object is required (member access)`），
-  平均 130B、共 ~6.6MB，随 stdlib/用户代码行数线性增长。
-- **三处修复（全在编译器发射侧，零运行时/ABI 改动）**：
-  1. **路径归一化**（main.c）：`--auto-stdlib` 根解析 `build\..\stdlib`
-     折叠为真实绝对路径（Win32 `zan_utf8_full_path` / POSIX `realpath`），
-     冗长 `build\..` 前缀从所有诊断/泄漏描述/守卫串消失；
-  2. **两级短路径**（irgen.c `loc_site_file`）：守卫串/泄漏站点文本只留
-     末两级路径分量（`Gui/App.zan`）——绝对路径在 5 万条里重复是纯浪费，
-     缩短后仍可在已知 stdlib/项目布局中定位；编译器**诊断输出**走
-     `diag->file_names` 原路径不受影响；
-  3. **同文 intern**（irgen.c `zan_irgen_intern_string` + irgen.h
-     `zan_str_intern_t`）：同一守卫文本（同 file:line:col:msg）只发一个
-     private global——LLVM 在 -O0/-O1 不合并相同字符串全局（gallery 实测
-     1,639 条重复）；指针同一性恰好是 soft 模式站点去重语义
-     （`zan_soft_seen` 按 text 指针判重），共享后语义不变。
-  首版 intern 桶表未分配（`str_intern[b]` 解引用 NULL 表）编译 ZanGen
-  必崩，已补懒分配后全绿——教训：新哈希表先跑大输入。
-- **实测（gui_gallery dev 档）**：守卫串 35,053 条/4,553,890B →
-  **33,414 条/3,005,783B**（−34%），exe 22,330,042 → **20,782,863B**
-  （−1.55MB）。运行行为：soft 模式打印短路径守卫一次后继续（rc=0），
-  `ZAN_RT_HARD=1` exit(70) 不变。
-- **第二刀 ✅ 已完成（同日）——但实测数据推翻了原设计方向**：gallery 守卫串
-  33,414 条里**前缀只有 4.6% 重复**（31,877 个独立 file:line:col，守卫本就
-  一行一条，"每行 5 条守卫"的假设不成立），而 **msg 模板只有 780 个**、
-  覆盖 1.68MB（占 56%）——所以共享的是 **msg 不是前缀**：
-  - irgen_generics.c：`emit_runtime_check`/`emit_string_null_report` 改发
-    **两个 intern global**（prefix=`<file>:<line>:<col>: runtime error: `
-    每站点一条；msg=共享模板+\n，780 条全程序只发一份）。soft 路径调
-    **`zan_rt_soft_note2(prefix,msg)`**（rt_timer.c 新函数：按 prefix 指针
-    判重——每站点恰一条 prefix global，与旧整文本指针判重语义严格等价；
-    首见在 timer_lock 内合成完整文本后打印+记日志）。hard 路径在**函数
-    入口块的 [1400 x i8] 暂存槽**（`guard_buf_fn/guard_buf_alloca` 缓存，
-    每函数一条 alloca——守卫在循环里触发时复用同一槽，不逐次涨栈；
-    插入点在入口首指令**之前**，追加到末尾会落在 terminator 后面——
-    首版实测 `does not have terminator` 验证失败即此）里
-    strcpy+strcat 合成单根指针供 printf 与 Windows `RaiseException` 崩溃
-    记录用（过滤器同线程同步续跑，栈缓冲在 raise 时有效）。
-  - **cross 目标回退**：`--target` 交叉编译链的是 toolchain/ 下**已提交**
-    的 zanrt_*.o（本机无 zig 无法重建，缺 note2 符号），irgen 按是否
-    cross（`rt_guard_split`）走**merged 整文本回退**（即第一刀形态，
-    `emit_guard_report_merged`）。WSL 实测交叉 linux-x64 二进制：软路径
-    打印后继续、`ZAN_RT_HARD=1` exit(70)，与 host 行为一致；host 侧
-    软/硬两路径同样逐项验证。zig 就位的机器跑一遍
-    `scripts/build_cross_rt.cmd` 重建后即可切全量 split（irgen 侧无需
-    再改，只需去掉 cross 回退或在 note2 存在性上判）。
-- **第二刀实测（gui_gallery dev 档，与第一刀同口径）**：守卫串字节
-  3,005,783 → **1,522,495**（再 −49%，两刀合计 −67%，6.6MB→1.5MB）。
-  exe 总尺寸受并行会话在途改 gallery 源影响不可直接对比，以守卫串字节
-  为准。
-- **回归**：conformance 676 项标准档两轮全跑（每轮的批量为失败均为并行
-  会话同时在途构建的干扰——隔离复跑即过；确认残留
-  determinism/leakcheck_checkbox_group、determinism_bytebuffer_bounds 系
-  `--emit-ir` 宿主崩溃，zanc_clean 同样复现，属并行在途既有）；我的
-  改动面（exception*/thread_*/bounds/closure/bytebuffer conformance、
-  ehstart/eh1300/plain300/5000 探针、guard 软硬行为、cross 软硬行为）
-  全部通过。
+# 遗留专项（未修、需协调或设计决定）
+
+* **leakcheck_checkbox_group 引用环**（A57 顺带定位，未修）：`FormBuilder.zan` 的 `MakeItem` 每个选项泄漏一个闭包（15 选项 15 泄漏）——组持有子 Checkbox、子的 `Change` 事件表持有捕获了组的闭包（ARC 不回收环）；同源 `Gui/Event.zan:142` 的 490 个 `List<Action>`。可选修法：`Control.OnChildChanged` 虚钩子由子控件经 parent 反向通知、彻底不建闭包；会动 `Control.zan`（= A58 4.1），与 GUI 并行编辑协调后做。
+* **A64b leakcheck 仍红（待查）**：http_forwarder_keepalive / http_forwarder_tunnel（forwarder 自身协程收尾，文件在另一工作流 WIP）、reflect_members / server_mvc_timezone / sqlserver_tds / tdengine_rest；`db_error_throw` 的 leakcheck 在编译器重链接后 5 对象漂移（DbParams×2 + Model.IsApplied×2 仍可达），通过/失败随构建指纹翻转，待根因。
+* **A76 crasher（应用层/悬垂，另行处理）**：① `TlsStream.Close`（TlsStream.zan:909）`SSL_free` 后 wbio 悬垂访问崩溃——SSL_set_bio 转移了 BIO 所有权但 Zan 侧 string 字段仍持指针，需按 Ownership 约定重审 Setup/Close 的 BIO 生命周期；② sqlserver_tds `Program_Live$resume`（pool.Close 场景）协程 resume 路径 null 实例字段，非确定性复现。
+* **A67 字节×码点语义冲突（语言级，待定夺）**：string 按字节（索引/NUL 守卫/Length；FbReader/TDS codec 按字节索引），char 按码点（拼接/打印 UTF-8 编码），`s + s[i]` 对非 ASCII 必然膨胀；两侧皆有意设计，修复任何一侧破坏面都大。语言级出路（Rune/ByteAt API、解码式索引等）留待专项。
+* **A56 未做（下一批）**：`System.Automation`(61) / `System.Management`(68) / `System.Windows`(71) 仍各带 Threading + Diagnostics 税（= A58 4.2）；`Automation/Window.zan` 与 `Management/Cpu.zan` 疑似只为 Thread.Sleep 付全价，待核。
+* **A71 后续路线（按需加载未完部分）**：① globaldce 钉死源逐个核（A75 已退役三表，重钉面需复量）；② auto-embed 泛化——`stdlib/<Ns>/data/` 自动烤进镜像的通用机制（skins 手工、icons 已接）。
+* **体积优化线剩余候选（边际收益小）**：desc 记录瘦身、tynames 列表共享；PIC 与 ARC 冗余对两条杠杆已实测证伪。A74 归因的「空窗 ~72% .text 可去死」随 A75 去钉后需复量。
+* **A44(genmeta) 备注（已部分过时）**：`build\ZanIDE.exe` 12.23MB vs dist 快照 8.2MB 的增长未追查（2026-08-24 记录；其后 A71-A75 已大幅优化发布体积，数字需重测）。
+* **determinism/leakcheck_checkbox_group、determinism_bytebuffer_bounds**：`--emit-ir` 宿主崩溃，zanc_clean（HEAD 基线构建）同样复现，属在途既有问题，待查。
 
