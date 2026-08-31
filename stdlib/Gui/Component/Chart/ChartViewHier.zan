@@ -96,15 +96,59 @@ class SankeyNodeLayout {
 }
 
 partial class ChartView {
+    static string TreeNodeName(ChartNode n) {
+        if (n == null || n.name == null) { return ""; }
+        return n.name;
+    }
+
+    static int TreeChildCount(ChartNode n) {
+        if (n == null || n.children == null) { return 0; }
+        return n.children.Count;
+    }
+
+    // Treemap 面积只接受正值；负值/零值不占像素，且累计和饱和到
+    // int 上限，避免异常输入把布局边界推进到负数或溢出。
+    static int TreemapValue(ChartNode n) {
+        if (n == null) { return 0; }
+        int kids = n.children == null ? 0 : n.children.Count;
+        if (kids == 0) { return n.val > 0 ? n.val : 0; }
+        int sum = 0;
+        for (int i = 0; i < kids; i = i + 1) {
+            int v = ChartView.TreemapValue(n.children[i]);
+            if (v > 2147483647 - sum) { return 2147483647; }
+            sum = sum + v;
+        }
+        return sum;
+    }
+
+    static int TreemapTotal(List<ChartNode> nodes) {
+        if (nodes == null) { return 0; }
+        int total = 0;
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            int v = ChartView.TreemapValue(nodes[i]);
+            if (v > 2147483647 - total) { return 2147483647; }
+            total = total + v;
+        }
+        return total;
+    }
+
+    static int TreemapAdd(int left, int right) {
+        if (left < 0) { left = 0; }
+        if (right < 0) { right = 0; }
+        if (right > 2147483647 - left) { return 2147483647; }
+        return left + right;
+    }
+
     // ---- 矩形树图（递归切片，交替分割方向） ----
 
     static void DrawTreemap(App app, int x, int y, int w, int h,
                             ChartOption o, int g) {
         Canvas c = app.canvas;
         Theme t = app.theme;
-        List<ChartSeries> series = o.series;
-        if (series.Count < 1 || series[0].tree.Count < 1) { return; }
-        ChartNode root = series[0].tree[0];
+        ChartSeries lead = ChartView.LeadSeries(o);
+        if (lead == null || lead.tree == null || lead.tree.Count < 1) { return; }
+        ChartNode root = lead.tree[0];
+        if (root == null) { return; }
         int plotTop = ChartView.PanelHead(app, x, y, w, h, o.title);
         int pad = t.paddingMedium;
         int areaX = x + pad;
@@ -120,35 +164,61 @@ partial class ChartView {
         areaH = gh;
         if (areaW < app.Scale(4) || areaH < app.Scale(4)) { return; }
 
-        if (root.children.Count == 0) {
-            c.FillRoundRect(areaX, areaY, areaW, areaH,
-                ChartView.TreemapCornerRadius(0, app.Scale(1)), Chart.Palette(t, 0));
-            ChartView.TreemapCell(app, areaX, areaY, areaW, areaH, root.name,
-                Convert.ToString(root.val));
-            return;
+        int rootValue = ChartView.TreemapValue(root);
+        int rootKids = root.children == null ? 0 : root.children.Count;
+        if (rootKids == 0) {
+            if (rootValue > 0) {
+                c.FillRoundRect(areaX, areaY, areaW, areaH,
+                    ChartView.TreemapCornerRadius(0, app.Scale(1)), Chart.Palette(t, 0));
+                ChartView.TreemapCell(app, areaX, areaY, areaW, areaH,
+                    ChartView.TreeNodeName(root), Convert.ToString(rootValue));
+            }
+        } else {
+            ChartView.TreemapSlice(app, areaX, areaY, areaW, areaH, root.children, 0);
         }
-        ChartView.TreemapSlice(app, areaX, areaY, areaW, areaH, root.children, 0);
 
-        if (o.showTooltip) {
-            int mx = app.mouseX;
-            int my = app.mouseY;
-            if (mx >= areaX && mx < areaX + areaW
-                && my >= areaY && my < areaY + areaH) {
-                ChartView.ttName = "";
-                ChartView.ttVal = 0;
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        ChartView.ttName = "";
+        ChartView.ttVal = 0;
+        ChartView.ttNode = null;
+        int rootRadius = ChartView.TreemapCornerRadius(0, app.Scale(1));
+        if (ChartView.TreemapContains(mx, my, areaX, areaY,
+                areaW, areaH, rootRadius)) {
+            if (rootKids == 0) {
+                if (rootValue > 0) {
+                    ChartView.ttNode = root;
+                    ChartView.ttName = ChartView.TreeNodeName(root);
+                    ChartView.ttVal = rootValue;
+                }
+                ChartView.ttX = areaX;
+                ChartView.ttY = areaY;
+                ChartView.ttW = areaW;
+                ChartView.ttH = areaH;
+                ChartView.ttRadius = rootRadius;
+            } else {
                 ChartView.TreemapHit(app, areaX, areaY, areaW, areaH,
                     root.children, 0, mx, my);
-                if (ChartView.ttName.Length > 0) {
-                    // 描出精确悬停单元格的轮廓。
-                    c.DrawRoundRect(ChartView.ttX, ChartView.ttY,
-                        ChartView.ttW, ChartView.ttH, ChartView.ttRadius,
-                        4294967295, app.Scale(2));
-                    List<TooltipRow> rows = new List<TooltipRow>{
-                        TooltipRow.Of(0, o.title),
-                        TooltipRow.Of(4294967295,
-                            ChartView.ttName + "  " + Convert.ToString(ChartView.ttVal)) };
-                    ChartView.TooltipCard(app, mx, my, x + w, rows);
-                }
+            }
+            if (ChartView.ttNode != null
+                && ChartView.activeEventView != null) {
+                ChartHit th = ChartHit.Of(ChartElementType.Node,
+                    ChartView.SeriesIndexOf(o, lead), lead.name,
+                    ChartView.TreeNodeIndex(root, ChartView.ttNode),
+                    ChartView.ttName, ChartView.ttVal, mx, my);
+                th.axisIndex = lead.axisIndex;
+                ChartView.OfferActiveHit(th);
+            }
+            if (o.showTooltip && ChartView.ttName.Length > 0) {
+                // 描出精确悬停单元格的轮廓。
+                c.DrawRoundRect(ChartView.ttX, ChartView.ttY,
+                    ChartView.ttW, ChartView.ttH, ChartView.ttRadius,
+                    4294967295, app.Scale(2));
+                List<TooltipRow> rows = new List<TooltipRow>{
+                    TooltipRow.Of(0, o.title),
+                    TooltipRow.Of(4294967295,
+                        ChartView.ttName + "  " + Convert.ToString(ChartView.ttVal)) };
+                ChartView.TooltipCard(app, mx, my, x + w, rows);
             }
         }
     }
@@ -159,14 +229,14 @@ partial class ChartView {
                              List<ChartNode> nodes, int depth) {
         Canvas c = app.canvas;
         Theme t = app.theme;
-        int total = 0;
-        for (int i = 0; i < nodes.Count; i = i + 1) { total = total + nodes[i].Total(); }
+        int total = ChartView.TreemapTotal(nodes);
         if (total < 1) { return; }
         bool vert = (depth % 2) == 0;
         int acc = 0;
         for (int j = 0; j < nodes.Count; j = j + 1) {
             ChartNode nd = nodes[j];
-            int v = nd.Total();
+            if (nd == null) { continue; }
+            int v = ChartView.TreemapValue(nd);
             int cell = vert
                 ? ChartView.TreemapSliceSize(h, acc, v, total)
                 : ChartView.TreemapSliceSize(w, acc, v, total);
@@ -179,8 +249,9 @@ partial class ChartView {
             int ch = h;
             if (vert) { ch = cell; cy = y + start; }
             else { cw = cell; cx = x + start; }
-            acc = acc + v;
+            acc = ChartView.TreemapAdd(acc, v);
 
+            if (v < 1) { continue; }
             int col = Chart.Palette(t, j);
             int panelBg = Style.Full(app, "chart", "", "", Style.SNormal()).BgOr(0);
             if (depth > 0) { col = App.LerpColor(col, panelBg, depth * 130); }
@@ -189,12 +260,14 @@ partial class ChartView {
                 c.FillRoundRect(cx, cy, cw, ch, rr, col);
                 c.DrawRoundRect(cx, cy, cw, ch, rr, panelBg, app.Scale(1));
             }
-            if (nd.children.Count > 0 && cw > app.Scale(34) && ch > app.Scale(26)) {
+            int kids = nd.children == null ? 0 : nd.children.Count;
+            if (kids > 0 && cw > app.Scale(34) && ch > app.Scale(26)) {
                 int inset = app.Scale(3);
                 ChartView.TreemapSlice(app, cx + inset, cy + inset,
                     cw - inset * 2, ch - inset * 2, nd.children, depth + 1);
             } else {
-                ChartView.TreemapCell(app, cx, cy, cw, ch, nd.name, Convert.ToString(v));
+                ChartView.TreemapCell(app, cx, cy, cw, ch,
+                    ChartView.TreeNodeName(nd), Convert.ToString(v));
             }
         }
     }
@@ -220,7 +293,8 @@ partial class ChartView {
 
     static int TreeDepth(ChartNode n) {
         int md = 0;
-        for (int i = 0; i < n.children.Count; i = i + 1) {
+        int childCount = ChartView.TreeChildCount(n);
+        for (int i = 0; i < childCount; i = i + 1) {
             int d = ChartView.TreeDepth(n.children[i]);
             if (d > md) { md = d; }
         }
@@ -250,18 +324,78 @@ partial class ChartView {
         return rr;
     }
 
+    static int TreeNodeCount(ChartNode n) {
+        if (n == null || n.children == null) { return n == null ? 0 : 1; }
+        int count = 1;
+        for (int i = 0; i < n.children.Count; i = i + 1) {
+            count = count + ChartView.TreeNodeCount(n.children[i]);
+        }
+        return count;
+    }
+
+    // 稳定 preorder 下标供 Tree/Treemap 的 dataIndex 使用；节点对象
+    // 没有独立 id，因此不能使用每帧重新分配的命中句柄。
+    static int TreeNodeIndex(ChartNode root, ChartNode target) {
+        if (root == null || target == null) { return 0 - 1; }
+        if (root == target) { return 0; }
+        int offset = 1;
+        int childCount = ChartView.TreeChildCount(root);
+        for (int i = 0; i < childCount; i = i + 1) {
+            ChartNode child = root.children[i];
+            int found = ChartView.TreeNodeIndex(child, target);
+            if (found >= 0) { return offset + found; }
+            offset = offset + ChartView.TreeNodeCount(child);
+        }
+        return 0 - 1;
+    }
+
     static bool TreeRoamEnabled(bool roam) { return roam; }
 
+    static int TreeHitRadius(int radius, int zoom, int scale) {
+        if (radius < 0) { radius = 0; }
+        if (scale < 1) { scale = 1; }
+        // 命中热区只补固定的可访问性余量；不能随 zoom 无限扩大，
+        // 否则空白或相邻节点会被远距离圆点吞掉。
+        int extra = scale * 3;
+        if (zoom < 50) { extra = scale * 2; }
+        return radius + extra;
+    }
+
+    static bool TreemapContains(int px, int py, int x, int y, int w, int h, int radius) {
+        if (w < 1 || h < 1 || px < x || px >= x + w || py < y || py >= y + h) {
+            return false;
+        }
+        int rr = radius;
+        if (rr < 0) { rr = 0; }
+        if (rr > w / 2) { rr = w / 2; }
+        if (rr > h / 2) { rr = h / 2; }
+        if (rr < 1) { return true; }
+        int dx = 0;
+        if (px < x + rr) { dx = x + rr - px; }
+        if (px >= x + w - rr) { dx = px - (x + w - rr - 1); }
+        int dy = 0;
+        if (py < y + rr) { dy = y + rr - py; }
+        if (py >= y + h - rr) { dy = py - (y + h - rr - 1); }
+        if (dx > 0 && dy > 0) {
+            return dx * dx + dy * dy <= rr * rr;
+        }
+        return true;
+    }
+
     // 按累计值计算像素边界；绘制和命中必须使用同一组边界，
-    // 避免逐项 floor 后在最后一列/行留下不可命中的空带。
+    // 避免逐项 floor 后在最后一列/最后一行留下不可命中的空带。
     static int TreemapSliceStart(int dimension, int prefix, int total) {
         if (dimension < 1 || prefix < 0 || total < 1) { return 0; }
+        if (prefix > total) { prefix = total; }
         return (int)((long)dimension * (long)prefix / (long)total);
     }
 
     static int TreemapSliceEnd(int dimension, int prefix, int value, int total) {
         if (dimension < 1 || prefix < 0 || value < 0 || total < 1) { return 0; }
-        return (int)((long)dimension * (long)(prefix + value) / (long)total);
+        if (prefix > total) { prefix = total; }
+        long end = (long)prefix + (long)value;
+        if (end > (long)total) { end = (long)total; }
+        return (int)((long)dimension * end / (long)total);
     }
 
     static int TreemapSliceSize(int dimension, int prefix, int value, int total) {
@@ -276,14 +410,14 @@ partial class ChartView {
     // 被分割）时才递归。填充静态命中字段 ttName/ttVal。
     static void TreemapHit(App app, int x, int y, int w, int h,
                            List<ChartNode> nodes, int depth, int px, int py) {
-        int total = 0;
-        for (int i = 0; i < nodes.Count; i = i + 1) { total = total + nodes[i].Total(); }
+        int total = ChartView.TreemapTotal(nodes);
         if (total < 1) { return; }
         bool vert = (depth % 2) == 0;
         int acc = 0;
         for (int j = 0; j < nodes.Count; j = j + 1) {
             ChartNode nd = nodes[j];
-            int v = nd.Total();
+            if (nd == null) { continue; }
+            int v = ChartView.TreemapValue(nd);
             int cell = vert
                 ? ChartView.TreemapSliceSize(h, acc, v, total)
                 : ChartView.TreemapSliceSize(w, acc, v, total);
@@ -296,20 +430,24 @@ partial class ChartView {
             int ch = h;
             if (vert) { ch = cell; cy = y + start; }
             else { cw = cell; cx = x + start; }
-            acc = acc + v;
-            if (px >= cx && px < cx + cw && py >= cy && py < cy + ch) {
-                if (nd.children.Count > 0 && cw > app.Scale(34) && ch > app.Scale(26)) {
+            acc = ChartView.TreemapAdd(acc, v);
+            int rr = ChartView.TreemapCornerRadius(depth, app.Scale(1));
+            if (ChartView.TreemapContains(px, py, cx, cy, cw, ch, rr)) {
+                // 先登记父格作为 fallback；若子格命中，递归会覆盖
+                // 这些字段。父格边框/gutter 因而不会变成无主空带。
+                ChartView.ttNode = nd;
+                ChartView.ttName = ChartView.TreeNodeName(nd);
+                ChartView.ttVal = v;
+                ChartView.ttX = cx;
+                ChartView.ttY = cy;
+                ChartView.ttW = cw;
+                ChartView.ttH = ch;
+                ChartView.ttRadius = rr;
+                int kids = nd.children == null ? 0 : nd.children.Count;
+                if (kids > 0 && cw > app.Scale(34) && ch > app.Scale(26)) {
                     int inset = app.Scale(3);
                     ChartView.TreemapHit(app, cx + inset, cy + inset,
                         cw - inset * 2, ch - inset * 2, nd.children, depth + 1, px, py);
-                } else {
-                    ChartView.ttName = nd.name;
-                    ChartView.ttVal = v;
-                    ChartView.ttX = cx;
-                    ChartView.ttY = cy;
-                    ChartView.ttW = cw;
-                    ChartView.ttH = ch;
-                    ChartView.ttRadius = ChartView.TreemapCornerRadius(depth, app.Scale(1));
                 }
                 return;
             }
@@ -690,9 +828,10 @@ partial class ChartView {
 
     /// 节点下的叶子槽位数（一个叶子 = 1 个槽位）。
     static int TreeLeafCount(ChartNode n) {
-        if (n.children.Count == 0) { return 1; }
+        int childCount = ChartView.TreeChildCount(n);
+        if (childCount == 0) { return 1; }
         int s = 0;
-        for (int i = 0; i < n.children.Count; i = i + 1) { s = s + ChartView.TreeLeafCount(n.children[i]); }
+        for (int i = 0; i < childCount; i = i + 1) { s = s + ChartView.TreeLeafCount(n.children[i]); }
         return s;
     }
 
@@ -702,9 +841,10 @@ partial class ChartView {
     static void TreeAssign(ChartNode n, int lo, int depth,
                            List<TreeLayoutNode> layout) {
         layout.Add(TreeLayoutNode.Of(n, depth, lo, ChartView.TreeLeafCount(n)));
-        if (n.children.Count > 0) {
+        int childCount = ChartView.TreeChildCount(n);
+        if (childCount > 0) {
             int acc = lo;
-            for (int i = 0; i < n.children.Count; i = i + 1) {
+            for (int i = 0; i < childCount; i = i + 1) {
                 ChartView.TreeAssign(n.children[i], acc, depth + 1, layout);
                 acc = acc + ChartView.TreeLeafCount(n.children[i]);
             }
@@ -718,8 +858,9 @@ partial class ChartView {
     }
 
     static int TreeLabelWidth(ChartNode n, int fs) {
-        int widest = Canvas.MeasureText(n.name, fs);
-        for (int i = 0; i < n.children.Count; i = i + 1) {
+        int widest = Canvas.MeasureText(ChartView.TreeNodeName(n), fs);
+        int childCount = ChartView.TreeChildCount(n);
+        for (int i = 0; i < childCount; i = i + 1) {
             int childW = ChartView.TreeLabelWidth(n.children[i], fs);
             if (childW > widest) { widest = childW; }
         }
@@ -986,8 +1127,10 @@ partial class ChartView {
                          ChartOption o, int g) {
         Canvas c = app.canvas;
         Theme t = app.theme;
-        if (o.series.Count < 1 || o.series[0].tree.Count < 1) { return; }
-        ChartNode root = o.series[0].tree[0];
+        ChartSeries lead = ChartView.LeadSeries(o);
+        if (lead == null || lead.tree == null || lead.tree.Count < 1) { return; }
+        ChartNode root = lead.tree[0];
+        if (root == null) { return; }
         int plotTop = ChartView.PanelHead(app, x, y, w, h, o.title);
         int pad = t.paddingMedium;
         int ax = x + pad;
@@ -999,9 +1142,8 @@ partial class ChartView {
         if (ah > hintH + app.Scale(24)) { ah = ah - hintH; }
         if (aw < app.Scale(10) || ah < app.Scale(10)) { return; }
 
-        ChartSeries lead = ChartView.LeadSeries(o);
         bool horiz = false;
-        if (lead != null && lead.treeOrient == "horizontal") { horiz = true; }
+        if (lead.treeOrient == "horizontal") { horiz = true; }
 
         int leaves = ChartView.TreeLeafCount(root);
         int depth = ChartView.TreeDepth(root);
@@ -1098,19 +1240,28 @@ partial class ChartView {
             app.StateSet(Chart.TreeDragYKey(o.iwid), app.mouseY);
             app.StateSet(Chart.TreeDragPanXKey(o.iwid), panX);
             app.StateSet(Chart.TreeDragPanYKey(o.iwid), panY);
+            app.StateSet(Chart.TreeDragMovedKey(o.iwid), 0);
             app.StateSet(Chart.TreeDraggingKey(o.iwid), 1);
         }
-        if (app.EventKind() == 3) {
-            app.StateSet(Chart.TreeDraggingKey(o.iwid), 0);
-        }
-        if (ChartView.TreeRoamEnabled(o.roam)
-            && app.StateGet(Chart.TreeDraggingKey(o.iwid), 0) == 1
+        bool treeDragging = app.StateGet(Chart.TreeDraggingKey(o.iwid), 0) == 1;
+        if (ChartView.TreeRoamEnabled(o.roam) && treeDragging
             && Ui.Pressed(app, panId) && app.EventKind() == 1) {
-            panX = app.StateGet(Chart.TreeDragPanXKey(o.iwid), panX)
-                - (app.mouseX - app.StateGet(Chart.TreeDragXKey(o.iwid), app.mouseX));
-            panY = app.StateGet(Chart.TreeDragPanYKey(o.iwid), panY)
-                - (app.mouseY - app.StateGet(Chart.TreeDragYKey(o.iwid), app.mouseY));
+            int dxMove = app.mouseX - app.StateGet(Chart.TreeDragXKey(o.iwid), app.mouseX);
+            int dyMove = app.mouseY - app.StateGet(Chart.TreeDragYKey(o.iwid), app.mouseY);
+            if (dxMove != 0 || dyMove != 0) {
+                app.StateSet(Chart.TreeDragMovedKey(o.iwid), 1);
+            }
+            panX = app.StateGet(Chart.TreeDragPanXKey(o.iwid), panX) - dxMove;
+            panY = app.StateGet(Chart.TreeDragPanYKey(o.iwid), panY) - dyMove;
             app.RequestRedraw();
+        }
+        if (app.EventKind() == 3) {
+            if (treeDragging
+                && app.StateGet(Chart.TreeDragMovedKey(o.iwid), 0) == 1) {
+                app.ClaimClick();
+            }
+            app.StateSet(Chart.TreeDraggingKey(o.iwid), 0);
+            app.StateSet(Chart.TreeDragMovedKey(o.iwid), 0);
         }
         panX = ChartView.ClampPan(panX, contentW, aw);
         panY = ChartView.ClampPan(panY, contentH, ah);
@@ -1144,10 +1295,11 @@ partial class ChartView {
         while (i < layout.Count) {
             TreeLayoutNode parent = layout[i];
             ChartNode n = parent.node;
-            if (n.children.Count == 0) { i = i + 1; continue; }
+            int childCount = ChartView.TreeChildCount(n);
+            if (childCount == 0) { i = i + 1; continue; }
             int pSpan = ChartView.TreeSpan(parent, spanG, leaves);
             int pDep = parent.depth * gapDep;
-            for (int c0 = 0; c0 < n.children.Count; c0 = c0 + 1) {
+            for (int c0 = 0; c0 < childCount; c0 = c0 + 1) {
                 ChartNode ch = n.children[c0];
                 int ci = 0;
                 for (; ci < layout.Count; ci = ci + 1) {
@@ -1188,7 +1340,7 @@ partial class ChartView {
                 continue;
             }
             c.FillCircle(nx, ny, rad, nodeCol);
-            string lbl = n.name;
+            string lbl = ChartView.TreeNodeName(n);
             int lw = Canvas.MeasureText(lbl, fs);
             int lx = 0;
             int ly = 0;
@@ -1208,38 +1360,65 @@ partial class ChartView {
             Style.Part(app, "chart", "hint", "", "", "", Style.SNormal()).FgOr(0),
             hintFs);
 
-        if (o.showTooltip && app.mouseX >= ax && app.mouseX < ax + aw
+        if (app.mouseX >= ax && app.mouseX < ax + aw
             && app.mouseY >= ay && app.mouseY < ay + ah
             && app.StateGet(Chart.TreeDraggingKey(o.iwid), 0) == 0) {
             int mx = app.mouseX;
             int my = app.mouseY;
             int best = 0 - 1;
-            int hitRad = rad + app.Scale(8);
+            int bestD2 = 0;
+            bool bestDot = false;
+            int hitRad = ChartView.TreeHitRadius(rad, zoom, app.Scale(1));
             for (int k = 0; k < layout.Count; k = k + 1) {
                 TreeLayoutNode item = layout[k];
                 int span = ChartView.TreeSpan(item, spanG, leaves);
                 int d = item.depth * gapDep;
                 int nx = horiz ? dep0 + d : span0 + span;
                 int ny = horiz ? span0 + span : dep0 + d;
-                string lbl = item.node.name;
+                if (nx + hitRad < ax || nx - hitRad >= ax + aw
+                    || ny + hitRad + fh < ay || ny - hitRad >= ay + ah) {
+                    continue;
+                }
+                string lbl = ChartView.TreeNodeName(item.node);
                 int lw = Canvas.MeasureText(lbl, fs);
                 int lx = horiz ? nx + rad + app.Scale(6) : nx - lw / 2;
                 int ly = horiz ? Canvas.CenterTextYAt(ny, fs) : ny + rad + app.Scale(4);
                 int dx = mx - nx;
                 int dy = my - ny;
+                int d2 = dx * dx + dy * dy;
                 bool onDot = dx >= 0 - hitRad && dx <= hitRad
                     && dy >= 0 - hitRad && dy <= hitRad
-                    && dx * dx + dy * dy <= hitRad * hitRad;
+                    && d2 <= hitRad * hitRad;
                 bool onLbl = mx >= lx && mx < lx + lw && my >= ly && my < ly + fh;
-                if (onDot || onLbl) { best = k; break; }
+                bool candidate = onDot || onLbl;
+                if (!candidate) { continue; }
+                // 节点圆点优先于标签；同一优先级取离指针最近者，
+                // 避免低 zoom 时 preorder 的前节点吞掉后节点。
+                bool replace = best < 0;
+                if (!replace && onDot && !bestDot) { replace = true; }
+                if (!replace && onDot == bestDot && d2 < bestD2) { replace = true; }
+                if (replace) {
+                    best = k;
+                    bestD2 = d2;
+                    bestDot = onDot;
+                }
             }
             if (best >= 0) {
                 ChartNode hn = layout[best].node;
-                List<TooltipRow> rows = new List<TooltipRow>();
-                rows.Add(TooltipRow.Of(0, o.title));
-                string tv = Convert.ToString(hn.Total());
-                rows.Add(TooltipRow.Of(col, hn.name + "  " + tv));
-                ChartView.TooltipCard(app, mx, my, x + w, rows);
+                int nodeSeries = ChartView.SeriesIndexOf(o, lead);
+                ChartHit th = ChartHit.Of(ChartElementType.Node,
+                    nodeSeries, lead != null ? lead.name : "", best,
+                    ChartView.TreeNodeName(hn), hn.Total(), mx, my);
+                if (lead != null) { th.axisIndex = lead.axisIndex; }
+                ChartView.OfferActiveHit(th);
+                if (o.showTooltip) {
+                    List<TooltipRow> rows = new List<TooltipRow>();
+                    rows.Add(TooltipRow.Of(0, o.title));
+                    string tv = Convert.ToString(hn.Total());
+                    rows.Add(TooltipRow.Of(col,
+                        ChartView.TreeNodeName(hn) + "  " + tv));
+                    ChartView.TooltipCard(app, mx, my, x + w, rows);
+                }
             }
         }
     }
