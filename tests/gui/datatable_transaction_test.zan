@@ -1,0 +1,104 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Widget;
+
+namespace DataTableTransactionTest;
+
+class Program {
+    static void Main() {
+        RowKey key = RowKey.Of("order:7");
+        TableMutation first = TableMutation.Cell("m-1", key, 2, 4, "42");
+        TableMutation duplicate = TableMutation.Cell("m-1", key, 2, 4, "43");
+        TableMutation invalid = TableMutation.Cell("", key, 2, 4, "");
+        Console.WriteLine("mutationValid=" + first.IsValid());
+        Console.WriteLine("mutationInvalid=" + invalid.IsValid());
+        JsonValue mutationJson = JsonValue.ParseLenient(first.ToJson());
+        Console.WriteLine("mutationJson=" + (mutationJson != null
+            && mutationJson.Str("id", "") == "m-1"
+            && mutationJson.Str("key", "") == "order:7"
+            && mutationJson.Int("rev", -1) == 4));
+        Console.WriteLine("mutationIdentity=" + (first.Key().Same(key)
+            && first.Column() == 2 && first.ExpectedRevision() == 4
+            && first.Value() == "42"));
+
+        TableTransaction defaults = TableTransaction.Create("tx-default", 99);
+        TableTransaction empty = TableTransaction.Create("tx-empty", TransactionMode.AllOrNothing);
+        Console.WriteLine("defaultMode=" + (defaults.Mode() == TransactionMode.AllOrNothing));
+        Console.WriteLine("emptyBegin=" + empty.BeginValidation());
+
+        TableTransaction tx = TableTransaction.Create("tx-1", TransactionMode.BestEffort);
+        Console.WriteLine("add1=" + tx.Add(first));
+        Console.WriteLine("addDuplicate=" + tx.Add(duplicate));
+        Console.WriteLine("addInvalid=" + tx.Add(invalid));
+        Console.WriteLine("count=" + tx.Count());
+        Console.WriteLine("begin=" + tx.BeginValidation());
+        Console.WriteLine("addAfterBegin=" + tx.Add(TableMutation.Cell("m-2", key, 1, 4, "x")));
+        Console.WriteLine("pending=" + tx.MarkPending());
+        Console.WriteLine("ack=" + tx.Ack());
+        Console.WriteLine("terminal=" + tx.IsTerminal());
+        Console.WriteLine("ackAgain=" + tx.Ack());
+        JsonValue txJson = JsonValue.ParseLenient(tx.ToJson());
+        JsonValue txMutations = null;
+        if (txJson != null) { txMutations = txJson.Get("mutations"); }
+        Console.WriteLine("txJson=" + (txJson != null
+            && txJson.Str("id", "") == "tx-1"
+            && txJson.Int("mode", 0) == TransactionMode.BestEffort
+            && txJson.Int("state", 0) == TransactionState.Acked
+            && txMutations != null
+            && txMutations.Count() == 1));
+
+        TableTransaction conflict = TableTransaction.Create("tx-2", TransactionMode.AllOrNothing);
+        conflict.Add(TableMutation.Cell("m-3", key, 0, 9, "new"));
+        Console.WriteLine("conflictBegin=" + conflict.BeginValidation());
+        Console.WriteLine("conflictPending=" + conflict.MarkPending());
+        Console.WriteLine("conflictMark=" + conflict.MarkConflict("revision mismatch"));
+        Console.WriteLine("conflictState=" + Convert.ToString(conflict.State()));
+        Console.WriteLine("conflictError=" + conflict.Error());
+        Console.WriteLine("conflictCancel=" + conflict.Cancel());
+        Console.WriteLine("conflictAck=" + conflict.Ack());
+
+        TableTransaction rejected = TableTransaction.Create("tx-reject", TransactionMode.AllOrNothing);
+        rejected.Add(TableMutation.Cell("m-reject", key, 3, 2, "bad"));
+        rejected.BeginValidation();
+        rejected.MarkPending();
+        Console.WriteLine("reject=" + rejected.Reject("validation failed"));
+        Console.WriteLine("rejectState=" + Convert.ToString(rejected.State()));
+        Console.WriteLine("rejectError=" + rejected.Error());
+
+        TableTransaction pendingCancel = TableTransaction.Create("tx-pending-cancel", TransactionMode.BestEffort);
+        pendingCancel.Add(TableMutation.Cell("m-pending-cancel", key, 1, 5, "later"));
+        pendingCancel.BeginValidation();
+        pendingCancel.MarkPending();
+        Console.WriteLine("pendingCancel=" + pendingCancel.Cancel());
+        Console.WriteLine("pendingCancelState=" + Convert.ToString(pendingCancel.State()));
+
+        TableTransaction cancelled = TableTransaction.Create("tx-3", TransactionMode.AllOrNothing);
+        cancelled.Add(TableMutation.Cell("m-4", key, 0, 9, "cancel"));
+        cancelled.BeginValidation();
+        Console.WriteLine("cancel=" + cancelled.Cancel());
+        Console.WriteLine("cancelState=" + Convert.ToString(cancelled.State()));
+
+        TableTransactionResult result = TableTransactionResult.Create("tx-2", 2);
+        result.Add(MutationResult.AcceptedValue("m-3", "canonical", 10));
+        result.Add(MutationResult.ConflictValue("m-5", "server", 11, "stale"));
+        MutationResult cancelledResult = MutationResult.CancelledValue("m-6", "user cancelled");
+        Console.WriteLine("cancelledResult=" + (cancelledResult.Status() == MutationResult.Cancelled
+            && cancelledResult.ServerRevision() == -1
+            && cancelledResult.Message() == "user cancelled"));
+        Console.WriteLine("resultCounts=" + Convert.ToString(result.Count())
+            + ":" + Convert.ToString(result.AcceptedCount())
+            + ":" + Convert.ToString(result.FailedCount()));
+        MutationResult copy = result.ResultAt(0);
+        Console.WriteLine("resultCopy=" + (copy != null
+            && copy.Status() == MutationResult.Accepted
+            && copy.CanonicalValue() == "canonical"));
+        JsonValue resultJson = JsonValue.ParseLenient(result.ToJson());
+        JsonValue resultValues = null;
+        if (resultJson != null) { resultValues = resultJson.Get("results"); }
+        Console.WriteLine("resultJson=" + (resultJson != null
+            && resultJson.Str("id", "") == "tx-2"
+            && resultValues != null
+            && resultValues.Count() == 2));
+    }
+}

@@ -1,0 +1,306 @@
+using System;
+using System.Json;
+
+namespace Gui.Component.DataTable;
+
+/// 一次远程单元格修改的不可变描述。业务身份使用 RowKey，
+/// expectedRevision 用于服务端乐观并发校验。
+class TableMutation {
+    string mutationId;
+    RowKey rowKey;
+    int column;
+    int expectedRevision;
+    string value;
+
+    TableMutation(string id, RowKey key, int col, int revision, string nextValue) {
+        this.mutationId = id;
+        this.rowKey = key;
+        this.column = col;
+        this.expectedRevision = revision;
+        this.value = nextValue;
+        if (this.mutationId == null) { this.mutationId = ""; }
+        if (this.value == null) { this.value = ""; }
+    }
+
+    static TableMutation Cell(string id, RowKey key, int col,
+                              int revision, string nextValue) {
+        return new TableMutation(id, key, col, revision, nextValue);
+    }
+
+    string MutationId() { return this.mutationId; }
+    RowKey Key() { return this.rowKey; }
+    int Column() { return this.column; }
+    int ExpectedRevision() { return this.expectedRevision; }
+    string Value() { return this.value; }
+
+    bool IsValid() {
+        return this.mutationId.Length > 0 && this.rowKey != null
+            && this.column >= 0 && this.expectedRevision >= 0;
+    }
+
+    string ToJson() {
+        JsonValue root = JsonValue.NewObject();
+        root.Put("id", JsonValue.NewStr(this.mutationId));
+        root.Put("key", JsonValue.NewStr(this.rowKey == null ? "" : this.rowKey.Canonical()));
+        root.Put("col", JsonValue.NewNum(Convert.ToString(this.column)));
+        root.Put("rev", JsonValue.NewNum(Convert.ToString(this.expectedRevision)));
+        root.Put("value", JsonValue.NewStr(this.value));
+        return root.ToJson();
+    }
+}
+
+/// 事务提交策略。
+class TransactionMode {
+    static const int AllOrNothing = 1;
+    static const int BestEffort = 2;
+}
+
+/// 事务生命周期：Draft -> Validating -> Pending -> Acked，
+/// 失败分支为 Rejected/Conflict/Cancelled。
+class TransactionState {
+    static const int Draft = 1;
+    static const int Validating = 2;
+    static const int Pending = 3;
+    static const int Acked = 4;
+    static const int Rejected = 5;
+    static const int Conflict = 6;
+    static const int Cancelled = 7;
+}
+
+/// 一次可批量提交的 mutation 集合。Draft 阶段可追加，进入校验后
+/// 不再接受修改；状态转移是单向的，避免 ACK 覆盖已取消事务。
+class TableTransaction {
+    string transactionId;
+    int mode;
+    int state;
+    List<TableMutation> mutations;
+    string error;
+
+    TableTransaction(string id, int transactionMode) {
+        this.transactionId = id;
+        this.mode = transactionMode;
+        if (this.transactionId == null) { this.transactionId = ""; }
+        if (this.mode != TransactionMode.AllOrNothing
+            && this.mode != TransactionMode.BestEffort) {
+            this.mode = TransactionMode.AllOrNothing;
+        }
+        this.state = TransactionState.Draft;
+        this.mutations = new List<TableMutation>();
+        this.error = "";
+    }
+
+    static TableTransaction Create(string id, int transactionMode) {
+        return new TableTransaction(id, transactionMode);
+    }
+
+    string TransactionId() { return this.transactionId; }
+    int Mode() { return this.mode; }
+    int State() { return this.state; }
+    string Error() { return this.error; }
+    int Count() { return this.mutations.Count; }
+
+    bool Add(TableMutation mutation) {
+        if (this.state != TransactionState.Draft || mutation == null
+            || !mutation.IsValid()) { return false; }
+        for (int i = 0; i < this.mutations.Count; i = i + 1) {
+            if (this.mutations[i].MutationId() == mutation.MutationId()) { return false; }
+        }
+        this.mutations.Add(mutation);
+        return true;
+    }
+
+    TableMutation At(int index) {
+        if (index < 0 || index >= this.mutations.Count) { return null; }
+        TableMutation m = this.mutations[index];
+        return TableMutation.Cell(m.MutationId(), m.Key(), m.Column(),
+            m.ExpectedRevision(), m.Value());
+    }
+
+    bool BeginValidation() {
+        if (this.state != TransactionState.Draft || this.mutations.Count == 0) {
+            return false;
+        }
+        this.state = TransactionState.Validating;
+        return true;
+    }
+
+    bool MarkPending() {
+        if (this.state != TransactionState.Validating) { return false; }
+        this.state = TransactionState.Pending;
+        return true;
+    }
+
+    bool Ack() {
+        if (this.state != TransactionState.Pending) { return false; }
+        this.state = TransactionState.Acked;
+        return true;
+    }
+
+    bool Reject(string message) {
+        if (this.state != TransactionState.Pending) { return false; }
+        this.error = message;
+        if (this.error == null) { this.error = ""; }
+        this.state = TransactionState.Rejected;
+        return true;
+    }
+
+    bool MarkConflict(string message) {
+        if (this.state != TransactionState.Pending) { return false; }
+        this.error = message;
+        if (this.error == null) { this.error = ""; }
+        this.state = TransactionState.Conflict;
+        return true;
+    }
+
+    bool Cancel() {
+        if (this.state != TransactionState.Draft
+            && this.state != TransactionState.Validating
+            && this.state != TransactionState.Pending) { return false; }
+        this.state = TransactionState.Cancelled;
+        return true;
+    }
+
+    bool IsTerminal() {
+        return this.state == TransactionState.Acked
+            || this.state == TransactionState.Rejected
+            || this.state == TransactionState.Conflict
+            || this.state == TransactionState.Cancelled;
+    }
+
+    string ToJson() {
+        JsonValue root = JsonValue.NewObject();
+        root.Put("ver", JsonValue.NewNum("1"));
+        root.Put("id", JsonValue.NewStr(this.transactionId));
+        root.Put("mode", JsonValue.NewNum(Convert.ToString(this.mode)));
+        root.Put("state", JsonValue.NewNum(Convert.ToString(this.state)));
+        root.Put("error", JsonValue.NewStr(this.error));
+        JsonValue values = JsonValue.NewArray();
+        for (int i = 0; i < this.mutations.Count; i = i + 1) {
+            JsonValue value = JsonValue.ParseLenient(this.mutations[i].ToJson());
+            if (value != null) { values.Append(value); }
+        }
+        root.Put("mutations", values);
+        return root.ToJson();
+    }
+}
+
+/// 单个 mutation 的服务端结果。
+class MutationResult {
+    static const int Accepted = 1;
+    static const int Rejected = 2;
+    static const int Conflict = 3;
+    static const int Cancelled = 4;
+
+    string mutationId;
+    int status;
+    string canonicalValue;
+    string serverValue;
+    int serverRevision;
+    string message;
+
+    MutationResult(string id, int resultStatus, string canonical,
+                   string server, int revision, string detail) {
+        this.mutationId = id;
+        this.status = resultStatus;
+        this.canonicalValue = canonical;
+        this.serverValue = server;
+        this.serverRevision = revision;
+        this.message = detail;
+        if (this.mutationId == null) { this.mutationId = ""; }
+        if (this.canonicalValue == null) { this.canonicalValue = ""; }
+        if (this.serverValue == null) { this.serverValue = ""; }
+        if (this.message == null) { this.message = ""; }
+    }
+
+    static MutationResult AcceptedValue(string id, string value, int revision) {
+        return new MutationResult(id, MutationResult.Accepted, value, "", revision, "");
+    }
+    static MutationResult RejectedValue(string id, string detail) {
+        return new MutationResult(id, MutationResult.Rejected, "", "", -1, detail);
+    }
+    static MutationResult ConflictValue(string id, string server, int revision,
+                                        string detail) {
+        return new MutationResult(id, MutationResult.Conflict, "", server, revision, detail);
+    }
+    static MutationResult CancelledValue(string id, string detail) {
+        return new MutationResult(id, MutationResult.Cancelled, "", "", -1, detail);
+    }
+
+    string MutationId() { return this.mutationId; }
+    int Status() { return this.status; }
+    string CanonicalValue() { return this.canonicalValue; }
+    string ServerValue() { return this.serverValue; }
+    int ServerRevision() { return this.serverRevision; }
+    string Message() { return this.message; }
+
+    string ToJson() {
+        JsonValue root = JsonValue.NewObject();
+        root.Put("id", JsonValue.NewStr(this.mutationId));
+        root.Put("status", JsonValue.NewNum(Convert.ToString(this.status)));
+        root.Put("canonical", JsonValue.NewStr(this.canonicalValue));
+        root.Put("server", JsonValue.NewStr(this.serverValue));
+        root.Put("revision", JsonValue.NewNum(Convert.ToString(this.serverRevision)));
+        root.Put("message", JsonValue.NewStr(this.message));
+        return root.ToJson();
+    }
+}
+
+/// 一次事务的不可变结果快照。结果列表通过 Add 只在构造阶段填充，
+/// 读取时使用 ResultAt 的复制值，避免调用方修改内部对象。
+class TableTransactionResult {
+    string transactionId;
+    int status;
+    List<MutationResult> results;
+
+    TableTransactionResult(string id, int resultStatus) {
+        this.transactionId = id;
+        this.status = resultStatus;
+        if (this.transactionId == null) { this.transactionId = ""; }
+        this.results = new List<MutationResult>();
+    }
+
+    static TableTransactionResult Create(string id, int resultStatus) {
+        return new TableTransactionResult(id, resultStatus);
+    }
+
+    string TransactionId() { return this.transactionId; }
+    int Status() { return this.status; }
+    int Count() { return this.results.Count; }
+
+    bool Add(MutationResult result) {
+        if (result == null) { return false; }
+        this.results.Add(result);
+        return true;
+    }
+
+    MutationResult ResultAt(int index) {
+        if (index < 0 || index >= this.results.Count) { return null; }
+        MutationResult r = this.results[index];
+        return new MutationResult(r.MutationId(), r.Status(), r.CanonicalValue(),
+            r.ServerValue(), r.ServerRevision(), r.Message());
+    }
+
+    int AcceptedCount() {
+        int count = 0;
+        for (int i = 0; i < this.results.Count; i = i + 1) {
+            if (this.results[i].Status() == MutationResult.Accepted) { count = count + 1; }
+        }
+        return count;
+    }
+
+    int FailedCount() { return this.results.Count - this.AcceptedCount(); }
+
+    string ToJson() {
+        JsonValue root = JsonValue.NewObject();
+        root.Put("ver", JsonValue.NewNum("1"));
+        root.Put("id", JsonValue.NewStr(this.transactionId));
+        root.Put("status", JsonValue.NewNum(Convert.ToString(this.status)));
+        JsonValue values = JsonValue.NewArray();
+        for (int i = 0; i < this.results.Count; i = i + 1) {
+            JsonValue value = JsonValue.ParseLenient(this.results[i].ToJson());
+            if (value != null) { values.Append(value); }
+        }
+        root.Put("results", values);
+        return root.ToJson();
+    }
+}
