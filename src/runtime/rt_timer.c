@@ -61,6 +61,8 @@ static void timer_unlock(void) {}
 #else
 #include <pthread.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/stat.h>
 typedef pthread_mutex_t zan_timer_mutex_t;
 static zan_timer_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static void timer_lock(void) { pthread_mutex_lock(&g_lock); }
@@ -124,11 +126,159 @@ int zan_utf8_argv(int *argc, char ***argv) {
 }
 
 
+/* ---- Fail-soft fault reports (zan_rt_soft_note) ----
+ *
+ * The compiler's runtime guards used to have one outcome: print and exit(70).
+ * That turns a latent null reference in a long-running service into a crash
+ * loop at 3am: the process dies, the supervisor restarts it, it hits the same
+ * guard and dies again. The soft path instead appends the message to the same
+ * dated log the crash handler already writes (POSIX: <exe_dir>/logs/YYYYMM/
+ * DD.log, Windows: <exe_dir>\zan_crash.log), prints it on stderr once, and
+ * lets the caller continue with a default value; the dedup table keeps a
+ * hot loop that trips the same site from flooding the disk. ZAN_RT_HARD=1
+ * restores the historical hard exit (the compiler test-suite relies on the
+ * exit status to pin the guard behavior).
+ *
+ * Callers run on the guarded thread, not inside a signal handler, so this may
+ * use stdio and the environment freely -- but it must never itself abort:
+ * every allocation/open failure silently degrades to "no log entry". */
+
+#define ZAN_SOFT_MAX_SITES 256
+
+static char *g_soft_seen[ZAN_SOFT_MAX_SITES];
+static int g_soft_seen_count;
+
+static int zan_soft_is_hard(void) {
+    static int hard = -1;
+    if (hard < 0) {
+        const char *env = getenv("ZAN_RT_HARD");
+        hard = (env && *env && *env != '0') ? 1 : 0;
+    }
+    return hard;
+}
+
+int zan_rt_soft_is_hard(void) { return zan_soft_is_hard(); }
+
+/* Scratch substitute for a null base on the soft path (see rt_timer.h). */
+static unsigned char g_soft_scratch[256];
+
+unsigned char *zan_rt_soft_scratch(void) { return g_soft_scratch; }
+
+/* One message per site per process: the same null field hit in a loop would
+ * otherwise append an entry per iteration. Pointer identity of the compiler-
+ * emitted global string is the site identity. */
+static int zan_soft_seen(const char *text) {
+    for (int i = 0; i < g_soft_seen_count; i++)
+        if (g_soft_seen[i] == text) return 1;
+    if (g_soft_seen_count < ZAN_SOFT_MAX_SITES)
+        g_soft_seen[g_soft_seen_count++] = (char *)text;
+    return 0;
+}
+
+#if defined(_WIN32)
+static void zan_soft_log_path(char *path, size_t cap) {
+    DWORD n = GetModuleFileNameA(NULL, path, (DWORD)cap);
+    if (n == 0 || n >= cap) { snprintf(path, cap, "zan_soft.log"); return; }
+    char *slash = strrchr(path, '\\');
+    if (!slash) { snprintf(path, cap, "zan_soft.log"); return; }
+    slash[1] = '\0';
+    strncat(path, "zan_crash.log", cap - strlen(path) - 1);
+}
+#else
+static char g_soft_logdir[4096];
+
+static void zan_soft_init_logdir(void) {
+    const char *env = getenv("ZAN_LOG_DIR");
+    if (env && *env && strlen(env) < sizeof(g_soft_logdir)) {
+        memcpy(g_soft_logdir, env, strlen(env) + 1);
+        return;
+    }
+    memcpy(g_soft_logdir, "logs", 5);
+    ssize_t n = readlink("/proc/self/exe", g_soft_logdir,
+                         sizeof(g_soft_logdir) - 6);
+    if (n <= 0) return;
+    g_soft_logdir[n] = '\0';
+    char *slash = strrchr(g_soft_logdir, '/');
+    if (!slash) { memcpy(g_soft_logdir, "logs", 5); return; }
+    slash[1] = '\0';
+    strncat(g_soft_logdir, "logs", sizeof(g_soft_logdir) - strlen(g_soft_logdir) - 1);
+}
+
+/* <logdir>/<YYYYMM>/<DD>.log -- the same file the crash handler records into,
+ * so a soft report sits between the crash records the operator already reads.
+ * Runs outside a signal handler, so localtime_r is fine here. */
+static void zan_soft_log_path(char *path, size_t cap) {
+    if (!g_soft_logdir[0]) zan_soft_init_logdir();
+    time_t now = time(NULL);
+    struct tm lt;
+    if (!localtime_r(&now, &lt)) { snprintf(path, cap, "zan_soft.log"); return; }
+    char month[16], day[16];
+    strftime(month, sizeof month, "%Y%m", &lt);
+    strftime(day, sizeof day, "%d", &lt);
+    char dir[4096];
+    if ((size_t)snprintf(dir, sizeof dir, "%s/%s", g_soft_logdir, month)
+            >= sizeof dir) { snprintf(path, cap, "zan_soft.log"); return; }
+    mkdir(g_soft_logdir, 0755);
+    mkdir(dir, 0755);
+    snprintf(path, cap, "%s/%s.log", dir, day);
+}
+#endif
+
+static void zan_soft_append(const char *text) {
+    char path[4096];
+    zan_soft_log_path(path, sizeof path);
+    FILE *f = fopen(path, "ab");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    /* Header line once per file (best effort): a fresh log starts with the
+     * exe so a lone soft line is attributable even if the process exits
+     * before anything else logs. */
+    if (size == 0) {
+#if defined(_WIN32)
+        char exe[MAX_PATH];
+        DWORD en = GetModuleFileNameA(NULL, exe, sizeof exe);
+        if (en == 0 || en >= sizeof exe) snprintf(exe, sizeof exe, "<unknown>");
+        fprintf(f, "==== ZAN RUNTIME (soft) ====\nexe=%s\n", exe);
+#else
+        char exe[4096];
+        ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+        if (n > 0) exe[n] = '\0'; else snprintf(exe, sizeof exe, "<unknown>");
+        fprintf(f, "==== ZAN RUNTIME (soft) ====\nexe=%s\n", exe);
+#endif
+    }
+#if defined(_WIN32)
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d.%03d soft runtime error: %s",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+            st.wMilliseconds, text);
+#else
+    char stamp[32];
+    time_t now = time(NULL);
+    struct tm lt;
+    localtime_r(&now, &lt);
+    strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M:%S", &lt);
+    fprintf(f, "%s soft runtime error: %s", stamp, text);
+#endif
+    fclose(f);
+}
+
+void zan_rt_soft_note(const char *text) {
+    if (!text) return;
+    timer_lock();
+    int seen = zan_soft_seen(text);
+    timer_unlock();
+    if (seen) return;
+    fprintf(stderr, "%s", text);
+    fflush(stderr);
+    zan_soft_append(text);
+}
+
 typedef enum zan_timer_kind {
     ZAN_TIMER_DELAY = 0,
     ZAN_TIMER_PUBLIC = 1
 } zan_timer_kind;
-
 typedef struct zan_timer_entry {
     long long due_ms;
     long long id;

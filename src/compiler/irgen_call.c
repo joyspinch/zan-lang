@@ -1709,6 +1709,19 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                            "substring");
                     slen = zan_sub(g->builder, total, start, "subl");
                 }
+                /* A soft-mode report above continues with a null receiver and
+                 * possibly a negative slice: swap the base for the scratch
+                 * page and clamp the length so the alloc/GEP/memcpy below
+                 * stay in-bounds (an empty answer, not a crash). */
+                slen = LLVMBuildSelect(g->builder,
+                    zan_icmp(g->builder, LLVMIntSLT, slen,
+                             LLVMConstInt(i64, 0, 0), "subl.neg"),
+                    LLVMConstInt(i64, 0, 0), slen, "subl.safe");
+                {
+                    LLVMValueRef snull = zan_icmp(g->builder, LLVMIntEQ, s,
+                        LLVMConstNull(LLVMTypeOf(s)), "subnull");
+                    s = emit_soft_base_select(g, s, snull, expr->loc);
+                }
                 LLVMValueRef bufsz = zan_add(g->builder, slen, LLVMConstInt(i64, 1, 0), "bsz");
                 LLVMValueRef buf = emit_string_alloc_rc(g, bufsz);
                 LLVMValueRef srcp = LLVMBuildGEP2(g->builder, i8, s, &start, 1, "srcp");
@@ -4512,6 +4525,34 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     call_args[k] = emit_arg_typed(g, expr->call.args.items[k],
                                         method_param_type_at(g, method_sym, k, expr, NULL, locals), locals);
                                 }
+                                /* A null string handed to a bodyless
+                                 * [DllImport] method (no Zan null checks run
+                                 * inside) is the crash family the soft guards
+                                 * exist for: report it, then pass an empty
+                                 * literal so the callee reads "" instead of
+                                 * faulting. Hard mode exits inside the report;
+                                 * --no-runtime-checks keeps the raw pointer. */
+                                if (g->runtime_checks && g->current_fn &&
+                                    LLVMCountBasicBlocks(g->functions[fi].fn) == 0) {
+                                    for (int k = 0; k < argc; k++) {
+                                        if (LLVMGetTypeKind(LLVMTypeOf(call_args[k]))
+                                                != LLVMPointerTypeKind) continue;
+                                        if (!is_string_expr(g,
+                                                expr->call.args.items[k], locals))
+                                            continue;
+                                        LLVMValueRef isnull = zan_icmp(g->builder,
+                                            LLVMIntEQ, call_args[k],
+                                            LLVMConstNull(LLVMTypeOf(call_args[k])),
+                                            "extarg.null");
+                                        emit_runtime_check(g, isnull, expr->loc,
+                                            "null string passed to an extern function");
+                                        call_args[k] = LLVMBuildSelect(g->builder,
+                                            isnull,
+                                            LLVMBuildGlobalStringPtr(g->builder, "",
+                                                "extarg.empty"),
+                                            call_args[k], "extarg.safe");
+                                    }
+                                }
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "scall";
                                 coerce_args_to_params(g, g->functions[fi].fn_type, call_args, argc);
                                 LLVMValueRef result = zan_call2(g->builder, g->functions[fi].fn_type,
@@ -4664,6 +4705,34 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             LLVMTypeRef mft = g->functions[fi].fn_type;
                             LLVMValueRef mfn = route_generic_method(g, g->cur_inst,
                                 method_sym, g->functions[fi].fn, mft, &mft);
+                            /* A null string handed to a bodyless [DllImport]
+                             * method (no Zan null checks run inside) is the
+                             * crash family the soft guards exist for: report
+                             * it, then pass an empty literal so the callee
+                             * reads "" instead of faulting. Hard mode exits
+                             * inside the report; --no-runtime-checks keeps
+                             * the raw pointer. */
+                            if (g->runtime_checks && g->current_fn &&
+                                LLVMCountBasicBlocks(mfn) == 0) {
+                                for (int k = 0; k < argc; k++) {
+                                    if (LLVMGetTypeKind(LLVMTypeOf(call_args[k + extra]))
+                                            != LLVMPointerTypeKind) continue;
+                                    if (!is_string_expr(g,
+                                            expr->call.args.items[k], locals))
+                                        continue;
+                                    LLVMValueRef isnull = zan_icmp(g->builder,
+                                        LLVMIntEQ, call_args[k + extra],
+                                        LLVMConstNull(LLVMTypeOf(call_args[k + extra])),
+                                        "extarg.null");
+                                    emit_runtime_check(g, isnull, expr->loc,
+                                        "null string passed to an extern function");
+                                    call_args[k + extra] = LLVMBuildSelect(g->builder,
+                                        isnull,
+                                        LLVMBuildGlobalStringPtr(g->builder, "",
+                                            "extarg.empty"),
+                                        call_args[k + extra], "extarg.safe");
+                                }
+                            }
                             const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(mft)) == LLVMVoidTypeKind) ? "" : "bcall";
                             LLVMValueRef result = emit_dispatch_call(g,
                                 is_static ? NULL : g->current_type_sym, method_sym,
@@ -4735,6 +4804,27 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         && LLVMGetTypeKind(pt) == LLVMPointerTypeKind) {
                         call_args[k] = LLVMBuildBitCast(g->builder,
                             call_args[k], pt, "arg.ptrc");
+                    }
+                }
+                /* A null string handed to an extern (whose callee has no Zan
+                 * null checks at all) is the crash family the soft guards
+                 * exist for: report it, then pass an empty literal so the
+                 * callee reads "" instead of faulting. Hard mode exits inside
+                 * the report; --no-runtime-checks keeps the raw pointer. */
+                if (g->runtime_checks && g->current_fn) {
+                    for (int k = 0; k < argc; k++) {
+                        if (LLVMGetTypeKind(LLVMTypeOf(call_args[k]))
+                                != LLVMPointerTypeKind) continue;
+                        if (!is_string_expr(g, expr->call.args.items[k], locals))
+                            continue;
+                        LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ,
+                            call_args[k], LLVMConstNull(LLVMTypeOf(call_args[k])),
+                            "extarg.null");
+                        emit_runtime_check(g, isnull, expr->loc,
+                            "null string passed to an extern function");
+                        call_args[k] = LLVMBuildSelect(g->builder, isnull,
+                            LLVMBuildGlobalStringPtr(g->builder, "", "extarg.empty"),
+                            call_args[k], "extarg.safe");
                     }
                 }
                 const char *gcn = (LLVMGetTypeKind(LLVMGetReturnType(fn_type)) == LLVMVoidTypeKind) ? "" : "gcall";

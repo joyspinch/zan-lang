@@ -12,6 +12,20 @@ typedef void (*zan_timer_callback_t)(void);
 typedef void (*zan_timer_step_t)(void *frame);
 
 void zan_timer_runtime_reset(void);
+/* Fail-soft fault report (see rt_timer.c): append `text` to the runtime log
+ * (deduped per site) and return. The compiler guards call this on the soft
+ * path so a null reference or an out-of-range index logs and lets the program
+ * keep running instead of exiting; ZAN_RT_HARD=1 flips every guard back to
+ * the historical exit(70). */
+void zan_rt_soft_note(const char *text);
+/* Non-zero when ZAN_RT_HARD=1 was set at startup: guards must exit(70)
+ * instead of reporting and continuing. */
+int zan_rt_soft_is_hard(void);
+/* A small zeroed, readable/writable page the soft guards substitute for a
+ * null base before the lowered GEP+load runs: the fault-free load then reads
+ * 0 and stores land in scratch memory instead of page 0. Only the soft path
+ * ever selects it; hard mode exits inside the guard report. */
+unsigned char *zan_rt_soft_scratch(void);
 /* Windows starts a console program through a narrow CRT argv whose encoding
  * follows the active ANSI code page. This helper rebuilds it from the Unicode
  * command line as UTF-8. It returns non-zero on success and otherwise leaves

@@ -2885,6 +2885,56 @@ A71 归因出四条编译器杠杆，本条把能实测的先测掉，用数据�
   ② 表按站点拆成 [1 x ptr] 独立全局（各占一节）+ 二级目录——ld 仍通过
   目录钉住全部，无效。① 是 A75 候选，预计空窗口再 -500KB 级。
 
+# A77 · 运行时守卫双路径化：兜底记录异常但不闪退（fail-soft），ZAN_RT_HARD=1 恢复 exit(70) —— ✅ 已完成（2026-08-31）
+
+- **背景**：A76 把 null 基址/越界探针改成了受控报错 + exit(70)。受控解决了
+  「查不出在哪崩」，但 exit(70) 本身对常驻服务仍是闪退：凌晨三点守卫命中 →
+  进程退出 → supervisor 拉起 → 再命中 → 崩溃循环。用户指令明确：**要兜底
+  记录异常后续修复，但要确保不闪退**。
+- **设计（编译器发射两条路径，运行时按环境一次性择一）**：每个守卫点位
+  `emit_runtime_check`（irgen_generics.c）现在发射
+  `if (zan_rt_soft_is_hard()) { 致命报告 + exit(70) } else { zan_rt_soft_note(text); 继续 }`。
+  - `zan_rt_soft_note`（rt_timer.c）：stderr 打一次（按站点全局指针去重，
+    256 槽——热循环反复命中同一点位不会刷屏/刷盘），同时追加进崩溃处理器
+    同一份日志（Windows `<exe_dir>\zan_crash.log`；POSIX
+    `<exe_dir>/logs/YYYYMM/DD.log`，尊重 ZAN_LOG_DIR），时间戳 + 源点位
+    行列齐全，事后可 grep 修复。
+  - **scratch 替身页**：soft 路径继续执行时，降级后的 GEP+load 若仍以 null
+    为基址照样段错误。`zan_rt_soft_scratch()`（rt_timer.c）返回 256B 全零
+    静态页，`emit_soft_base_select` 在守卫报告之后把 null 基址 select 成
+    scratch——load 读到 0、store 落进替身页，程序拿「空对象」继续跑。
+    hard 路径在报告内部就 exit，替身页永远不会被选中。
+  - **落点全家福（g->runtime_checks 开启时）**：① 字符串长度探针
+    （emit_string_len_ex raw_bb，null/悬垂 buffer → 报告后返回长度 0，
+    phi join 保持良构）；② string[i] 元素访问（emit_string_elem_guard，
+    null 接收者 + 负索引报告后索钳到 0、基址换 scratch）；③ 数组 .Length
+    null 接收者；④ 成员读接收者（emit_weak_read_guard +
+    emit_guarded_member_object + 本地字段 fast path 三处，null 对象换
+    scratch）；⑤ Substring（slen 负值钳 0 + null 基址换 scratch——
+    否则 bufsz=-1 回绕成巨分配/memcpy）；⑥ extern 调用 string 实参
+    （scall/bcall/全局名解析三路 DllImport 形态全覆盖：null 串报点后传
+    ""字面量，外部函数读空串而不是读 null）。
+  - **ZAN_RT_HARD=1**：`zan_soft_is_hard()` 启动读一次环境变量缓存，
+    所有守卫回到 A76 语义（报告 + exit(70)）——测试套的 fail-fast 契约
+    钉在同一份二进制上，`tests/run_runtime_error.cmake` 已显式
+    `set(ENV{ZAN_RT_HARD} "1")`。
+- **cross-rt**：rt_timer.c 变更后经 zig 重建 6 份工具链目标
+  （linux-musl/arm64/riscv64 + macos x64/arm64 + win-x64）；win-arm64 的
+  zanrt_timer.o 需 MSYS2 CLANGARM64（zig 0.15.1 的 aarch64 mingw 头缺
+  CONTEXT.Rsp/Rip，与 CI 构建器不一致），本次未动、待 CI/CLANGARM64 重出。
+- **验证**：WSL 探针批 8/8（strhead/idx/arrhead/plain/slice/strlen/subnull/
+  plainfield：soft rc=0 + stderr 一次 + 日志落 exe 旁，ZAN_RT_HARD=1
+  rc=70）；Windows 原生 + --target win-x64 交叉同效（dt2/subnull/extnull
+  三探针）。tests/runtime 18/18（剔除 3 个 cef 系，其失败为并行在途
+  ExternalCallPolicy/DownloadJob 重载不一致的 stdlib 编译错，rc=1 非崩溃，
+  determinism_cef_runtime_index 同因）；smoke 198 项并发批 15 失败全部为
+  GUI 用例窗口站资源竞争（串行复跑 12 项自行恢复），余 3 项
+  （cef_profile/watermark/datatable_sparse_page）在案既有与本次无关。
+- **教训（并行会话覆盖）**：本工作窗内 irgen_call.c 的 Substring clamp 与
+  extern arg 守卫曾被并行提交的版本覆盖丢失（WSL subnull 探针复崩发现），
+  已按探针行为重放补齐——多会话并行改同一文件时，提交前须以探针批
+  复验而不仅看 git diff。
+
 # A76 · WSL 内存非法访问排查：null 字符串探针/元素访问受控化 + 崩溃日志双 0x 修复 —— ✅ 已完成（2026-08-30）
 
 - **背景**：线上 Linux MVC 程序崩溃日志 `SIGSEGV(11) addr=0xfffffffffffffffe`，
