@@ -126,6 +126,24 @@ else()
     target_link_libraries(zanc PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS} stdc++ m pthread)
 endif()
 target_compile_definitions(zanc PRIVATE ${LLVM_DEFINITIONS})
+if(WIN32)
+    # emit_stmt keeps every AST case in one function, so its frame is ~6KB
+    # (Release) / far larger in Debug; the stdlib carries else-if chains
+    # hundreds of levels deep (Theme.SetToken, IconVector.Draw), and
+    # emit_stmt recurses once per chain level. The default 1MB reserve
+    # overflows mid-compile (c00000fd/c0000005 after the exe is written, in
+    # the next allocation or teardown). The flag depends on the linker clang
+    # drives: MSVC-targeting clang uses lld-link (/STACK:N); mingw clang
+    # uses GNU ld (--stack N).
+    execute_process(COMMAND ${CMAKE_C_COMPILER} -print-target-triple
+                    OUTPUT_VARIABLE _zanc_triple
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(_zanc_triple MATCHES "msvc")
+        target_link_options(zanc PRIVATE -Xlinker;/STACK:33554432)
+    else()
+        target_link_options(zanc PRIVATE -Wl,--stack,33554432)
+    endif()
+endif()
 
 # ---- Socket-async reactor object (S4b-2) ----
 # Programs that use socket await (await Socket.ReadReady/WriteReady) link a
