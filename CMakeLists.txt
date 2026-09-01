@@ -2117,6 +2117,21 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_zform_grid${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # The generated IGameScene adapter: a .zscene projects a nested
+  # `partial class <Name>Scene : Game.Foundation.IGameScene` whose Enter/Exit
+  # route through the code-behind's OnScene* hooks, Doc() exposes the live
+  # document for handler registration, and PendingScene() surfaces the
+  # OpenScene queue to the host. Exercises the whole flow through a
+  # SceneStack headlessly (Update without a host window must no-op).
+  add_test(NAME conformance_gui_scene_adapter
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/scene_adapter_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/scene_adapter.zscene;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/scene_adapter.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_scene_adapter${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   add_test(NAME conformance_gui_props
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>

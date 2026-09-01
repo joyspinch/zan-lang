@@ -3380,6 +3380,18 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
         mods |= MOD_EVENT;
     }
 
+    /* `partial` is contextual here too: only a modifier right before a type
+     * keyword (nested `partial class` parts merge with their top-level
+     * parts once the nested types are hoisted to unit level). */
+    if (parser_check(p, TK_IDENT) && p->current.str_val.len == 7 &&
+        memcmp(p->current.str_val.str, "partial", 7) == 0) {
+        zan_token_kind_t nk = zan_lexer_peek(p->lex).kind;
+        if (nk == TK_CLASS || nk == TK_STRUCT || nk == TK_INTERFACE) {
+            parser_advance(p);
+            mods |= MOD_PARTIAL;
+        }
+    }
+
     /* nested type declaration: `[mods] class|struct|interface|enum Name {...}`
      * inside a class body. The member modifier parser has already consumed
      * `static`/`sealed`/... so the remaining token is the type keyword. */
