@@ -256,7 +256,10 @@ static long long zan_file_attributes_at(const char *path);
  * return value would be released once more than it was retained. */
 const char *zan_file_read_path(const char *path) {
     if (zan_file_attributes_at(path) >= 0) return "";
-    static char alt[4096];
+    /* Thread-local, not a plain static: workers call this concurrently and a
+     * shared buffer would let one thread overwrite the path another is still
+     * returning to its caller (see the same pattern in rt_io.c / rt_sync.c). */
+    static _Thread_local char alt[4096];
     for (int which = 0; which < ZAN_ALT_BASES; which++) {
         const char *p = zan_alt_path(path, which, alt, sizeof(alt));
         if (p && zan_file_attributes_at(p) >= 0) return p;

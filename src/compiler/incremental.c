@@ -1,5 +1,9 @@
 /* incremental.c -- Incremental compilation and parallel build support. */
 
+#if defined(_WIN32) && !defined(_WIN32_WINNT)
+#define _WIN32_WINNT 0x0601 /* Windows 7+: SRW locks */
+#endif
+
 #include "incremental.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -85,6 +89,39 @@ int zan_cpu_count(void) {
 #endif
 }
 
+/* ---- cache lock ----
+ *
+ * The parallel driver (zan_parallel_compile) runs compile workers on
+ * multiple threads that all share one zan_incr_cache_t: workers read it via
+ * zan_incr_get_object and mutate it via zan_incr_register. Without a lock
+ * the units array can be reallocated while another thread reads it and
+ * unit_count can race, corrupting the heap. All entry points that touch the
+ * units array serialize on this mutex; single-threaded callers pay only an
+ * uncontended lock.
+ */
+
+#ifdef _WIN32
+typedef SRWLOCK zan_incr_lock_t;
+static void zan_incr_lock_init(zan_incr_lock_t *l)   { InitializeSRWLock(l); }
+static void zan_incr_lock_acquire(zan_incr_lock_t *l){ AcquireSRWLockExclusive(l); }
+static void zan_incr_lock_release(zan_incr_lock_t *l){ ReleaseSRWLockExclusive(l); }
+#define ZAN_INCR_LOCK_INITIALIZER SRWLOCK_INIT
+#else
+typedef pthread_mutex_t zan_incr_lock_t;
+static void zan_incr_lock_init(zan_incr_lock_t *l)   { pthread_mutex_init(l, NULL); }
+static void zan_incr_lock_acquire(zan_incr_lock_t *l){ pthread_mutex_lock(l); }
+static void zan_incr_lock_release(zan_incr_lock_t *l){ pthread_mutex_unlock(l); }
+#define ZAN_INCR_LOCK_INITIALIZER PTHREAD_MUTEX_INITIALIZER
+#endif
+
+static void zan_incr_lock(zan_incr_cache_t *cache) {
+    zan_incr_lock_acquire((zan_incr_lock_t *)&cache->lock);
+}
+
+static void zan_incr_unlock(zan_incr_cache_t *cache) {
+    zan_incr_lock_release((zan_incr_lock_t *)&cache->lock);
+}
+
 /* ---- cache directory management ---- */
 
 static void ensure_cache_dir(const char *path) {
@@ -97,6 +134,7 @@ static void ensure_cache_dir(const char *path) {
 
 void zan_incr_init(zan_incr_cache_t *cache, const char *project_dir) {
     memset(cache, 0, sizeof(*cache));
+    zan_incr_lock_init((zan_incr_lock_t *)&cache->lock);
     size_t dlen = strlen(project_dir);
     cache->cache_dir = (char *)malloc(dlen + 16);
     snprintf(cache->cache_dir, dlen + 16, "%s" PATH_SEP ".zan-cache", project_dir);
@@ -274,16 +312,28 @@ static zan_compile_unit_t *find_unit(zan_incr_cache_t *cache, const char *path) 
 bool zan_incr_needs_rebuild(zan_incr_cache_t *cache, const char *source_path) {
     if (!cache->cache_valid) return true;
 
+    zan_incr_lock(cache);
     zan_compile_unit_t *unit = find_unit(cache, source_path);
-    if (!unit) return true;
+    if (!unit) { zan_incr_unlock(cache); return true; }
 
-    FILE *f = fopen(unit->object_path, "rb");
+    /* Copy the object path while holding the lock: another worker may
+     * reallocate the units array (register) and invalidate the pointer. */
+    char object_path[1024];
+    snprintf(object_path, sizeof(object_path), "%s", unit->object_path);
+    zan_incr_unlock(cache);
+
+    FILE *f = fopen(object_path, "rb");
     if (!f) return true;
     fclose(f);
 
     uint64_t cur_mtime = zan_file_mtime(source_path);
     uint64_t cur_size = zan_file_size(source_path);
+
+    zan_incr_lock(cache);
+    unit = find_unit(cache, source_path);
+    if (!unit) { zan_incr_unlock(cache); return true; }
     if (cur_mtime == unit->stamp.mtime && cur_size == unit->stamp.size) {
+        zan_incr_unlock(cache);
         return false;
     }
 
@@ -291,14 +341,17 @@ bool zan_incr_needs_rebuild(zan_incr_cache_t *cache, const char *source_path) {
     if (cur_hash == unit->stamp.hash) {
         unit->stamp.mtime = cur_mtime;
         unit->stamp.size = cur_size;
+        zan_incr_unlock(cache);
         return false;
     }
 
+    zan_incr_unlock(cache);
     return true;
 }
 
 void zan_incr_register(zan_incr_cache_t *cache, const char *source_path,
                        const char *object_path, const char **deps, int dep_count) {
+    zan_incr_lock(cache);
     zan_compile_unit_t *existing = find_unit(cache, source_path);
     zan_compile_unit_t *unit;
 
@@ -334,17 +387,45 @@ void zan_incr_register(zan_incr_cache_t *cache, const char *source_path,
     }
 
     cache->cache_valid = true;
+    zan_incr_unlock(cache);
 }
 
 const char *zan_incr_get_object(zan_incr_cache_t *cache, const char *source_path) {
     if (!cache->cache_valid) return NULL;
+    zan_incr_lock(cache);
     zan_compile_unit_t *unit = find_unit(cache, source_path);
-    if (!unit) return NULL;
-    if (zan_incr_needs_rebuild(cache, source_path)) return NULL;
-    return unit->object_path;
+    if (!unit) { zan_incr_unlock(cache); return NULL; }
+
+    /* Copy the stamp and object path out: find_unit pointers do not survive
+     * a concurrent register() that reallocates the units array. */
+    zan_file_stamp_t stamp = unit->stamp;
+    char object_path[1024];
+    snprintf(object_path, sizeof(object_path), "%s", unit->object_path);
+    zan_incr_unlock(cache);
+
+    FILE *f = fopen(object_path, "rb");
+    if (!f) return NULL;
+    fclose(f);
+
+    uint64_t cur_mtime = zan_file_mtime(source_path);
+    uint64_t cur_size = zan_file_size(source_path);
+    if (cur_mtime == stamp.mtime && cur_size == stamp.size)
+        return zan_strdup(object_path);
+
+    uint64_t cur_hash = zan_hash_file(source_path);
+    if (cur_hash == stamp.hash) {
+        zan_incr_lock(cache);
+        unit = find_unit(cache, source_path);
+        if (unit) { unit->stamp.mtime = cur_mtime; unit->stamp.size = cur_size; }
+        zan_incr_unlock(cache);
+        return zan_strdup(object_path);
+    }
+
+    return NULL;
 }
 
 void zan_incr_invalidate(zan_incr_cache_t *cache, const char *changed_file) {
+    zan_incr_lock(cache);
     for (int i = 0; i < cache->unit_count; i++) {
         zan_compile_unit_t *u = &cache->units[i];
         if (strcmp(u->source_path, changed_file) == 0) {
@@ -358,9 +439,11 @@ void zan_incr_invalidate(zan_incr_cache_t *cache, const char *changed_file) {
             }
         }
     }
+    zan_incr_unlock(cache);
 }
 
 void zan_incr_clean(zan_incr_cache_t *cache) {
+    zan_incr_lock(cache);
     for (int i = 0; i < cache->unit_count; i++) {
         if (cache->units[i].object_path) {
             remove(cache->units[i].object_path);
@@ -368,10 +451,12 @@ void zan_incr_clean(zan_incr_cache_t *cache) {
     }
     cache->unit_count = 0;
     cache->cache_valid = false;
+    zan_incr_unlock(cache);
     zan_incr_save(cache);
 }
 
 void zan_incr_destroy(zan_incr_cache_t *cache) {
+    zan_incr_lock(cache);
     for (int i = 0; i < cache->unit_count; i++) {
         free(cache->units[i].source_path);
         free(cache->units[i].object_path);
@@ -381,6 +466,7 @@ void zan_incr_destroy(zan_incr_cache_t *cache) {
     }
     free(cache->units);
     free(cache->cache_dir);
+    zan_incr_unlock(cache);
     memset(cache, 0, sizeof(*cache));
 }
 

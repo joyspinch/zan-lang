@@ -41,6 +41,8 @@ typedef struct {
     int unit_count;
     int unit_cap;
     bool cache_valid;               /* whether cache was loaded successfully */
+    void *lock;                     /* internal mutex; workers may share one
+                                       cache across parallel compile threads */
 } zan_incr_cache_t;
 
 /* Initialize incremental cache for a project directory */

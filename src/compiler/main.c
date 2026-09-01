@@ -983,11 +983,37 @@ static void dump_ast_node(zan_ast_node_t *node, int depth) {
 
 /* ---- main ---- */
 
+/* A [DllImport] library name is interpolated verbatim into the linker command
+ * line (`-l<name>`), and that command line is executed through the host shell
+ * on every cross-compilation target. The name comes straight out of the source
+ * file being compiled, so a name carrying shell metacharacters (`&`, `|`, `;`,
+ * `>`, backticks, quotes, newlines) or a path separator would let a malicious
+ * source file inject arbitrary linker arguments -- and, on the shell-driven
+ * link paths, arbitrary commands. Validating here (rather than at each
+ * `system()` call) covers every target's link line at once.
+ *
+ * Allowed: ASCII letters, digits, and `.` `_` `+` `-`. That set covers every
+ * library the bundled stdlib and examples import (kernel32, ws2_32, libpq,
+ * sqlite3, SDL3, zan_gui, foo.dll, ...). Path separators are deliberately NOT
+ * allowed: a [DllImport] names a library to search for, never a path. */
+static bool zan_dllimport_name_is_safe(const char *name, int len) {
+    if (!name || len <= 0) return false;
+    for (int i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9')) continue;
+        if (c == '.' || c == '_' || c == '+' || c == '-') continue;
+        return false;
+    }
+    return true;
+}
+
 /* Map a [DllImport] name to its linker basename (the -l argument).
  * Strips a leading "lib" so DllImport("libpq") and DllImport("pq") both
  * resolve to libpq, and normalizes identically on every link path
  * (bundled ld, clang fallback, Unix cc). Sets *out_len. Returns NULL for
- * implicit CRT/libc/libm pseudo-libs that must not be emitted as -l. */
+ * implicit CRT/libc/libm pseudo-libs that must not be emitted as -l, and for
+ * names that are unsafe to place on a linker command line (diagnosed here). */
 static const char *zan_dllimport_lname(const char *lib, int lib_len,
                                        int *out_len) {
     if (lib_len == 3 && memcmp(lib, "crt", 3) == 0) return NULL;
@@ -996,6 +1022,17 @@ static const char *zan_dllimport_lname(const char *lib, int lib_len,
     int n = lib_len;
     if (n > 3 && memcmp(name, "lib", 3) == 0) { name += 3; n -= 3; }
     if (n == 1 && (name[0] == 'c' || name[0] == 'm')) return NULL;
+    if (!zan_dllimport_name_is_safe(name, n)) {
+        /* Fail closed: skip the library rather than emit an unverified
+         * argument. The link then fails with an unresolved symbol, which is
+         * a diagnosable error, instead of executing attacker-chosen text. */
+        fprintf(stderr,
+                "error: [DllImport] library name '%.*s' contains characters "
+                "that are not allowed on a linker command line "
+                "(letters, digits, '.', '_', '+', '-' only)\n",
+                n, name);
+        return NULL;
+    }
     *out_len = n;
     return name;
 }
@@ -2087,6 +2124,22 @@ int main(int argc, char **argv) {
             zan_arena_free(arena);
             free(source);
             return 1;
+        }
+        if (fi > 0) {
+            /* Secondary inputs are arena-backed so they are reclaimed with
+             * zan_arena_free() on every exit path below; the read_file() heap
+             * buffer has no other release point. The text must outlive this
+             * loop in either case -- zan_diag_add_file() keeps the pointer to
+             * render source snippets in later diagnostics. */
+            char *heap_src = src;
+            src = zan_arena_strdup(arena, heap_src, slen);
+            free(heap_src);
+            if (!src) {
+                fprintf(stderr, "error: out of memory\n");
+                zan_arena_free(arena);
+                free(source);
+                return 1;
+            }
         }
         {
             /* A .zform/.zscene input is a visual design document: it was

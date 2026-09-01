@@ -48,7 +48,7 @@ struct zan_task {
     int64_t     result;
     void       *arg;
     zan_co_t   *co;
-    zan_co_t   *waiter;
+    zan_co_t   *waiters;   /* LIFO chain of parked awaiters, linked via co->next */
     zan_task_t *all_next;
 };
 
@@ -216,9 +216,24 @@ static void complete_task(zan_task_t *t, int64_t result) {
     if (t->completed) return;
     t->result = result;
     t->completed = 1;
-    if (t->waiter) {
-        ready_push(t->waiter);
-        t->waiter = NULL;
+    /* Wake every awaiter, not just one: several coroutines may await the same
+     * task, and a single waiter slot silently strands all but one -- they
+     * never reach the ready queue again and g_live never drops. The waiters
+     * list is LIFO, so reverse it first to resume in park order (FIFO). */
+    zan_co_t *w = t->waiters;
+    t->waiters = NULL;
+    zan_co_t *rev = NULL;
+    while (w) {
+        zan_co_t *n = w->next;
+        w->next = rev;
+        rev = w;
+        w = n;
+    }
+    while (rev) {
+        zan_co_t *n = rev->next;
+        rev->next = NULL;   /* ready_push takes over `next` */
+        ready_push(rev);
+        rev = n;
     }
 }
 
@@ -328,7 +343,12 @@ void zan_task_return(zan_task_t *task, int64_t result) {
 int64_t zan_task_await(zan_task_t *task) {
     if (!task) return 0;
     if (!task->completed) {
-        task->waiter = g_current;
+        /* Park on the task. A parked coroutine is off the ready queue, so its
+         * `next` link is free to chain the waiter list -- no extra allocation
+         * and no growth of zan_task for the (overwhelmingly common) single
+         * awaiter case. */
+        g_current->next = task->waiters;
+        task->waiters = g_current;
         switch_to_sched();
     }
     return task->result;
@@ -404,7 +424,19 @@ void zan_sched_run(void) {
                 plat_sleep(next_timer);
                 continue;
             } else {
-                break; /* no ready coroutines, no timers, no IO: done */
+                /* No ready coroutine, no timer and no pending IO: nothing can
+                 * ever wake whatever is still parked, so leaving silently
+                 * turns a lost wakeup into a clean-looking exit with no hint
+                 * of the coroutine that never ran. Say so, and name the count
+                 * so the stranded work is at least diagnosable. */
+                if (g_live > 0) {
+                    fprintf(stderr,
+                            "zan runtime: %d coroutine(s) parked with no "
+                            "wakeup source (no ready work, no timers, no IO "
+                            "pending) -- scheduler stopping\n",
+                            g_live);
+                }
+                break;
             }
         } else {
             /* We have a ready coroutine; still do a non-blocking IO poll */
