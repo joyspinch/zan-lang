@@ -1,0 +1,176 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+/// DataTable 模块：筛选条件描述——把单列 ColFilter 的
+/// 六个阶段（值勾选/文本/批量/比较/日期预设/Top-N）与
+/// FilterBuilder 组合树压缩成人类可读短文本，
+/// 供状态栏筛选概览条与外部 UI 显示。
+partial class DataTable {
+    // ---------- 单列条件描述 ----------
+
+    /// 比较运算符的符号（cmpMode 1..8；9/10 由 is empty/not empty 单独表达）。
+    /// 编号对齐 ColFilter 注释：1 >，2 >=，3 <，4 <=，5 =，6 <>，7 介于，8 不介于。
+    static string CmpOpText(int cmpMode) {
+        if (cmpMode == 1) { return ">"; }
+        if (cmpMode == 2) { return ">="; }
+        if (cmpMode == 3) { return "<"; }
+        if (cmpMode == 4) { return "<="; }
+        if (cmpMode == 5) { return "="; }
+        if (cmpMode == 6) { return "<>"; }
+        if (cmpMode == 7) { return "between"; }
+        if (cmpMode == 8) { return "not between"; }
+        return "";
+    }
+
+    /// 日期预设的短标签（datePreset 1..11，与 Rules 页芯片一致）。
+    static string DatePresetText(int preset) {
+        if (preset == 1) { return "Today"; }
+        if (preset == 2) { return "Yesterday"; }
+        if (preset == 3) { return "This week"; }
+        if (preset == 4) { return "Last 7d"; }
+        if (preset == 5) { return "This month"; }
+        if (preset == 6) { return "Last 30d"; }
+        if (preset == 7) { return "Quarter"; }
+        if (preset == 8) { return "This year"; }
+        if (preset == 9) { return "YTD"; }
+        if (preset == 10) { return "Past"; }
+        if (preset == 11) { return "Future"; }
+        return "";
+    }
+
+    /// Top-N 模式的短标签（topMode 5/6；带 N 的四种
+    /// 由 DescribeColFilter 直接拼 N）。
+    static string TopModeText(int topMode) {
+        if (topMode == 5) { return "Above avg"; }
+        if (topMode == 6) { return "Below avg"; }
+        return "";
+    }
+
+    /// 一列筛选条件的短描述，如 `>= 100`、`≠ 2`、
+    /// `contains ab`、`Top 10`。无活动条件返回 ""。
+    static string DescribeColFilter(ColFilter f) {
+        if (!f.Active()) { return ""; }
+        string s = "";
+        // 比较条件优先（最有信息量）
+        if (f.cmpMode != 0) {
+            if (f.cmpMode == 9) { s = "is empty"; }
+            else if (f.cmpMode == 10) { s = "not empty"; }
+            else if (f.cmpMode == 7) { s = "between " + f.cmpA + ".." + f.cmpB; }
+            else if (f.cmpMode == 8) { s = "not between " + f.cmpA + ".." + f.cmpB; }
+            else { s = DataTable.CmpOpText(f.cmpMode) + " " + f.cmpA; }
+        }
+        if (f.datePreset != 0) {
+            if (s.Length > 0) { s = s + " "; }
+            s = s + DataTable.DatePresetText(f.datePreset);
+        }
+        if (f.topMode != 0) {
+            if (s.Length > 0) { s = s + " "; }
+            if (f.topMode == 1) { s = s + "Top " + Convert.ToString(f.topN); }
+            else if (f.topMode == 2) { s = s + "Bottom " + Convert.ToString(f.topN); }
+            else if (f.topMode == 3) { s = s + "Top " + Convert.ToString(f.topN) + "%"; }
+            else if (f.topMode == 4) { s = s + "Bottom " + Convert.ToString(f.topN) + "%"; }
+            else { s = s + DataTable.TopModeText(f.topMode); }
+        }
+        if (f.textQuery.Length > 0) {
+            if (s.Length > 0) { s = s + " "; }
+            string q = f.textQuery;
+            if (q.Length > 12) { q = Text.Left(q, 12) + "…"; }
+            if (f.textMode == 2) { s = s + "=" + q; }
+            else if (f.textMode == 3) { s = s + "starts " + q; }
+            else if (f.textMode == 4) { s = s + "ends " + q; }
+            else { s = s + "contains " + q; }
+        }
+        if (f.hidden.Count > 0) {
+            if (s.Length > 0) { s = s + " "; }
+            s = s + "≠" + Convert.ToString(f.hidden.Count);
+        }
+        if (f.batchTerms.Count > 0) {
+            if (s.Length > 0) { s = s + " "; }
+            s = s + (f.batchKeep ? "keep " : "drop ") + Convert.ToString(f.batchTerms.Count);
+        }
+        return s;
+    }
+
+    // ---------- 概览条数据 ----------
+
+    /// 状态栏筛选概览条的条目：一列一条（标题 + 短描述），
+    /// 另加组合树一条。纯数据面，测试可直接断言。
+    static List<string> FilterSummaryItems(DataTableState st, List<DataColumn> cols) {
+        List<string> items = new List<string>();
+        for (int c = 0; c < cols.Count && c < st.filters.Count; c = c + 1) {
+            string d = DataTable.DescribeColFilter(st.filters[c]);
+            if (d.Length > 0) {
+                string title = cols[c].title;
+                if (title.Length == 0) { title = cols[c].field; }
+                items.Add(title + ": " + d);
+            }
+        }
+        if (st.showFilterRow) {
+            for (int c2 = 0; c2 < cols.Count && c2 < st.filterRowText.Count; c2 = c2 + 1) {
+                string q = st.filterRowText[c2];
+                if (q.Length > 0) {
+                    string title2 = cols[c2].title;
+                    if (title2.Length == 0) { title2 = cols[c2].field; }
+                    items.Add(title2 + " contains " + q);
+                }
+            }
+        }
+        string tree = DataTable.DescribeFilterTree(st, 120);
+        if (tree.Length > 0) { items.Add(tree); }
+        return items;
+    }
+
+    // ---------- 组合树描述 ----------
+
+    /// 组合树的短描述：`region = EU AND (price > 100 OR grade = B)`。
+    /// 子组以括号包住（括号在嵌套与顶层统一）；文本总量截断到
+    /// maxLen（超出加 …，总长恰为 maxLen+1）。
+    static string DescribeFilterTree(DataTableState st, int maxLen) {
+        FilterGroup root = st.filterTree;
+        if (root == null || !DataTable.GroupHasContent(root)) { return ""; }
+        string s = DataTable.DescribeGroup(root, maxLen);
+        if (s.Length > maxLen) { s = Text.Left(s, maxLen) + "…"; }
+        return s;
+    }
+
+    static string DescribeGroup(FilterGroup g, int maxLen) {
+        if (g == null) { return ""; }
+        string joiner = g.IsAnd() ? " AND " : " OR ";
+        string s = "";
+        int cn = g.Conditions().Count;
+        for (int i = 0; i < cn; i = i + 1) {
+            if (s.Length > 0) { s = s + joiner; }
+            s = s + DataTable.DescribeCondition(g.Conditions()[i]);
+        }
+        int gn = g.Groups().Count;
+        for (int gi = 0; gi < gn; gi = gi + 1) {
+            if (s.Length > 0) { s = s + joiner; }
+            string inner = DataTable.DescribeGroup(g.Groups()[gi], maxLen);
+            s = s + "(" + inner + ")";
+        }
+        return s;
+    }
+
+    static string DescribeCondition(FilterCondition c) {
+        string f = c.Field();
+        string a = c.ValueA();
+        string b = c.ValueB();
+        int op = c.Op();
+        if (op == 8) { return f + " is empty"; }
+        if (op == 9) { return f + " not empty"; }
+        if (op == 0) { return f + " contains " + a; }
+        if (op == 10) { return f + " starts " + a; }
+        if (op == 11) { return f + " ends " + a; }
+        if (op == 1) { return f + " = " + a; }
+        if (op == 2) { return f + " <> " + a; }
+        if (op == 3) { return f + " > " + a; }
+        if (op == 4) { return f + " >= " + a; }
+        if (op == 5) { return f + " < " + a; }
+        if (op == 6) { return f + " <= " + a; }
+        if (op == 7) { return f + " between " + a + ".." + b; }
+        return f;
+    }
+}

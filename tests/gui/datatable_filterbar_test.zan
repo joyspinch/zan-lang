@@ -1,0 +1,113 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace DataTableFilterBarTest;
+
+class Program {
+    static DataRow Row(string id, string region, string price, string grade) {
+        DataRow row = new DataRow();
+        row.Push(id);
+        row.Push(region);
+        row.Push(price);
+        row.Push(grade);
+        return row;
+    }
+
+    static string Join(List<string> xs) {
+        string s = "";
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            if (i > 0) { s = s + "|"; }
+            s = s + xs[i];
+        }
+        return s;
+    }
+
+    static void Main() {
+        List<DataRow> rows = new List<DataRow>();
+        rows.Add(Program.Row("a", "EU", "100", "A"));
+        rows.Add(Program.Row("b", "EU", "50", "B"));
+        rows.Add(Program.Row("c", "US", "200", "C"));
+        rows.Add(Program.Row("d", "APAC", "30", "A"));
+        LocalDataSource src = new LocalDataSource(rows);
+
+        List<DataColumn> cols = new List<DataColumn>();
+        cols.Add(DataColumn.Field(new DataColumn("Id", 70), "id"));
+        cols.Add(DataColumn.Field(new DataColumn("Region", 80), "region"));
+        cols.Add(DataColumn.Field(DataColumn.Numeric("Price", 80), "price"));
+        cols.Add(DataColumn.Field(new DataColumn("Grade", 70), "grade"));
+
+        DataTableState st = new DataTableState();
+        DataTable.EnsureInit(st, cols, src);
+        DataTable.Recompute(st, cols, src);
+
+        // ---- 无筛选时概览为空 ----
+        Console.WriteLine("empty=" + (DataTable.FilterSummaryItems(st, cols).Count == 0));
+
+        // ---- 单列条件描述 ----
+        st.filters[2].cmpMode = 2;              // >=（编号对齐 ColFilter 注释）
+        st.filters[2].cmpA = "50";
+        Console.WriteLine("cmp=" + (DataTable.DescribeColFilter(st.filters[2]) == ">= 50"));
+        Console.WriteLine("oneItem=" + (Join(DataTable.FilterSummaryItems(st, cols)) == "Price: >= 50"));
+        st.filters[2].Reset();
+
+        // ---- 值勾选隐藏 -> 计数 ----
+        st.filters[1].Toggle("EU");
+        st.filters[1].Toggle("US");
+        st.filters[1].Toggle("APAC");
+        Console.WriteLine("hidden=" + (DataTable.DescribeColFilter(st.filters[1]) == "≠3"));
+        st.filters[1].Reset();
+
+        // ---- 文本条件（Text.Left 按字符截断，>12 字符截到 12+"…"） ----
+        st.filters[0].textQuery = "startswithquery";
+        st.filters[0].textMode = 3;
+        Console.WriteLine("text=" + (DataTable.DescribeColFilter(st.filters[0]) == "starts startswithqu…"));
+        st.filters[0].Reset();
+
+        // ---- Top-N ----
+        st.filters[2].topMode = 1;
+        Console.WriteLine("top=" + (DataTable.DescribeColFilter(st.filters[2]) == "Top 10"));
+        st.filters[2].topN = 5;
+        Console.WriteLine("top5=" + (DataTable.DescribeColFilter(st.filters[2]) == "Top 5"));
+        st.filters[2].Reset();
+
+        // ---- 组合树描述 ----
+        FilterGroup root = FilterGroup.And();
+        root.Conditions().Add(FilterCondition.Equals("region", "EU"));
+        FilterGroup or = FilterGroup.Or();
+        or.Conditions().Add(FilterCondition.Greater("price", "100"));
+        or.Conditions().Add(FilterCondition.Equals("grade", "B"));
+        root.Groups().Add(or);
+        DataTable.SetFilterTree(st, root);
+        Console.WriteLine("tree=" + (DataTable.DescribeFilterTree(st, 200)
+            == "region = EU AND (price > 100 OR grade = B)"));
+        // 概览条中树条目在列条件之后
+        st.filters[2].cmpMode = 3;
+        st.filters[2].cmpA = "40";
+        Console.WriteLine("barItems=" + (Join(DataTable.FilterSummaryItems(st, cols))
+            == "Price: < 40|region = EU AND (price > 100 OR grade = B)"));
+        // 截断：42 字符树超限 -> Left(20)+"…"（… 多字节按 3 计）总长 23
+        Console.WriteLine("trunc=" + (DataTable.DescribeFilterTree(st, 20).Length == 23));
+        DataTable.SetFilterTree(st, null);
+        st.filters[2].Reset();
+
+        // ---- 筛选行文本进概览 ----
+        st.showFilterRow = true;
+        st.filterRowText[1] = "EU";
+        Console.WriteLine("frow=" + (Join(DataTable.FilterSummaryItems(st, cols)) == "Region contains EU"));
+        st.filterRowText[1] = "";
+        st.showFilterRow = false;
+        Console.WriteLine("cleared=" + (DataTable.FilterSummaryItems(st, cols).Count == 0));
+
+        // ---- 描述不影响筛选语义 ----
+        st.filters[1].Toggle("EU");
+        st.dirty = true;
+        DataTable.Recompute(st, cols, src);
+        string vis = "";
+        for (int i = 0; i < DataTable.DispCount(st); i = i + 1) {
+            vis = vis + src.CellText(DataTable.DispRowOf(st, i), 0);
+        }
+        Console.WriteLine("semantics=" + (vis == "cd"));
+        st.filters[1].Reset();
+    }
+}
