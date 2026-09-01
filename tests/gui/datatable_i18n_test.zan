@@ -1,0 +1,111 @@
+using System;
+using System.Globalization;
+using System.IO;
+using Gui;
+using Gui.Widget;
+
+namespace DataTableI18nTest;
+
+class Program {
+    static DataRow Row(string id, string region, string price, string grade) {
+        DataRow row = new DataRow();
+        row.Push(id);
+        row.Push(region);
+        row.Push(price);
+        row.Push(grade);
+        return row;
+    }
+
+    static string Join(List<string> xs) {
+        string s = "";
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            if (i > 0) { s = s + "|"; }
+            s = s + xs[i];
+        }
+        return s;
+    }
+
+    static void Main() {
+        List<DataRow> rows = new List<DataRow>();
+        rows.Add(Program.Row("a", "EU", "100", "A"));
+        rows.Add(Program.Row("b", "US", "50", "B"));
+        LocalDataSource src = new LocalDataSource(rows);
+
+        List<DataColumn> cols = new List<DataColumn>();
+        cols.Add(DataColumn.Field(new DataColumn("Id", 70), "id"));
+        cols.Add(DataColumn.Field(new DataColumn("Region", 80), "region"));
+        cols.Add(DataColumn.Field(DataColumn.Numeric("Price", 80), "price"));
+
+        DataTableState st = new DataTableState();
+        DataTable.EnsureInit(st, cols, src);
+        DataTable.Recompute(st, cols, src);
+
+        // ---- 源语言（未 Set）：缺省串原样返回，与历史行为一致 ----
+        Console.WriteLine("src=" + (DataTable.DescribeColFilter(st.filters[2]) == ""));
+
+        // ---- 语言包测试目录：运行时写盘（包内容含 zh 译文与孤儿键） ----
+        Directory.CreateDirectory("lang_case");
+        File.WriteAllText("lang_case/zh.json",
+            "{\"Copy\":\"复制\",\"Pasted {n} cells\":\"已粘贴 {n} 个格子\","
+            + "\"Top\":\"前\",\"contains\":\"包含\",\"AND\":\"且\","
+            + "\"OrphanKey\":\"孤儿\"}");
+
+        // ---- 切 zh：命中键用译文 ----
+        Lang.Set("zh");
+        Lang.LoadDir("lang_case");
+        Console.WriteLine("code=" + (Lang.Code() == "zh"));
+
+        // Top-N 描述走包译文：`前 10`
+        st.filters[2].topMode = 1;
+        Console.WriteLine("top=" + (DataTable.DescribeColFilter(st.filters[2]) == "前 10"));
+        st.filters[2].Reset();
+
+        // 文本条件：`包含 ab`（原文 contains）
+        st.filters[1].textQuery = "ab";
+        st.filters[1].textMode = 1;
+        Console.WriteLine("text=" + (DataTable.DescribeColFilter(st.filters[1]) == "包含 ab"));
+        st.filters[1].Reset();
+
+        // 概览条组合树 joiner：`且`（原文 AND）
+        FilterGroup root = FilterGroup.And();
+        root.Conditions().Add(FilterCondition.Equals("region", "EU"));
+        root.Conditions().Add(FilterCondition.Greater("price", "10"));
+        DataTable.SetFilterTree(st, root);
+        Console.WriteLine("tree=" + (DataTable.DescribeFilterTree(st, 120)
+            == "region = EU 且 price > 10"));
+        // 概览条目：筛选行文本也走译文（筛选行条目排在树条目之前）
+        st.showFilterRow = true;
+        st.filterRowText[1] = "EU";
+        Console.WriteLine("frow=" + (Join(DataTable.FilterSummaryItems(st, cols))
+            == "Region 包含 EU|region = EU 且 price > 10"));
+        st.showFilterRow = false;
+        DataTable.SetFilterTree(st, null);
+
+        // ---- 未命中键回缺省串（包只覆盖部分键）----
+        st.filters[2].cmpMode = 7;
+        st.filters[2].cmpA = "1";
+        st.filters[2].cmpB = "9";
+        // between 在包里没写 -> 回内置 "between"
+        Console.WriteLine("miss=" + (DataTable.DescribeColFilter(st.filters[2]) == "between 1..9"));
+        st.filters[2].Reset();
+
+        // ---- 坏包（ja）：逐条回缺省串，不抛异常 ----
+        File.WriteAllText("lang_case/ja.json", "{not valid json");
+        Lang.Set("ja");
+        Console.WriteLine("badpack=" + (DataTable.DescribeFilterTree(st, 120) == ""));
+
+        // ---- 切回 zh：走缓存仍命中；孤儿键不影响 ----
+        Lang.Set("zh");
+        Console.WriteLine("cached=" + (Lang.Tr("Copy", "复制  Copy") == "复制"));
+
+        // ---- TN 占位替换（{n} -> 数值；整句译文）----
+        Console.WriteLine("tn=" + (DataTable.TNPublicForTest(7)
+            == "已粘贴 7 个格子"));
+
+        // ---- 切回源语言：全部回缺省串 ----
+        Lang.Set("");
+        st.filters[2].topMode = 1;
+        Console.WriteLine("back=" + (DataTable.DescribeColFilter(st.filters[2]) == "Top 10"));
+        st.filters[2].Reset();
+    }
+}
