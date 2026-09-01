@@ -2,8 +2,12 @@
 // (the old parser crashed with 'exception unwind stack exhausted' around
 // 200k-400k levels on a ~400KB input). JsonValue.Parse throws JsonException
 // once nesting exceeds the depth limit; ParseLenient degrades gracefully.
+// The serializer is recursive too: ToJson/PrettyToJson on an unbounded tree
+// used to segfault the same way (stack overflow, no crash record), so both
+// now throw JsonException past the same MaxDepth the parser enforces.
 using System;
 using System.Json;
+using System.Text;
 
 class Program {
     static int bad;
@@ -20,16 +24,31 @@ class Program {
         return sb.ToString();
     }
 
+    /// 组装 n 层 {"a": {"a": ... {"leaf":1} ...}}} 的值树。
+    static JsonValue DeepTree(int n) {
+        JsonValue root = JsonValue.NewObject();
+        JsonValue cur = root;
+        for (int i = 0; i < n; i = i + 1) {
+            JsonValue next = JsonValue.NewObject();
+            cur.Put("a", next);
+            cur = next;
+        }
+        cur.Put("leaf", JsonValue.NewNum("1"));
+        return root;
+    }
+
     static void Main() {
         // Normal documents still parse and round-trip.
         JsonValue doc = JsonValue.Parse("{\"a\": [1, 2, {\"b\": \"x\"}]}");
         Check(doc.Int("a", 0) != 0 || doc.Count() == 1, "normal parse");
         JsonValue a = doc.Get("a");
         Check(a != null && a.At(2).Str("b", "") == "x", "nested access");
+        Check(doc.ToJson() == "{\"a\":[1,2,{\"b\":\"x\"}]}", "normal ToJson");
 
-        // Reasonably deep (100 levels) is fine.
+        // Reasonably deep (100 levels) is fine on both sides.
         JsonValue deep = JsonValue.Parse(Nested(100));
         Check(deep.IsArray(), "depth 100 ok");
+        Check(DeepTree(100).ToJson().Length == 610, "serialize depth 100 ok");
 
         // Absurdly deep: strict Parse throws, lenient returns a tree.
         bool threw = false;
@@ -56,6 +75,37 @@ class Program {
             threw2 = true;
         }
         Check(threw2, "object depth 2000 rejected");
+
+        // Serializing an over-deep tree throws instead of segfaulting
+        // (the old WriteTo recursed without a limit and the worker died
+        // with a bare stack overflow -- no exception, no crash record).
+        bool threw3 = false;
+        try {
+            string s = DeepTree(2000).ToJson();
+        } catch (JsonException e) {
+            threw3 = true;
+        }
+        Check(threw3, "ToJson depth 2000 rejected");
+
+        bool threw4 = false;
+        try {
+            string s = DeepTree(2000).PrettyToJson();
+        } catch (JsonException e) {
+            threw4 = true;
+        }
+        Check(threw4, "PrettyToJson depth 2000 rejected");
+
+        // A tree the parser built past MaxDepth serializes bounded too.
+        JsonValue lenientDeep = JsonValue.ParseLenient(Nested(5000));
+        if (lenientDeep != null) {
+            bool threw5 = false;
+            try {
+                string s = lenientDeep.ToJson();
+            } catch (JsonException e) {
+                threw5 = true;
+            }
+            Check(threw5, "lenient tree ToJson bounded");
+        }
 
         Console.WriteLine("json-depth-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
     }

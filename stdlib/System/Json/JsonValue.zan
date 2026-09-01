@@ -22,6 +22,11 @@ class JsonValue {
     List<string> keys;
     List<JsonValue> vals;
 
+    /// 组树（WriteTo/WritePretty）与解析（ReadValueAt）共用的
+    /// 嵌套深度上限。序列化同样是递归的：无界深度的树会在
+    /// WriteTo 里耗尽调用栈直接段错误，所以与解析对称地限制。
+    static int MaxDepth = 512;
+
     static JsonValue NewNull() {
         JsonValue v = new JsonValue();
         v.kind = 0;
@@ -178,7 +183,10 @@ class JsonValue {
 
     /// <summary>将该值序列化为紧凑 JSON 字符串。字符串和
     /// 对象 key 经 Encoding.JsonEscape 转义；数字输出原始
-    /// 字面量（空 -> 0）。是 Parse 对值模型的逆操作。</summary>
+    /// 字面量（空 -> 0）。是 Parse 对值模型的逆操作。嵌套超过
+    /// JsonValue.MaxDepth 层时抛出 JsonException——WriteTo 是
+    /// 递归的，无界深度的树会耗尽调用栈直接段错误（与 Parse 的
+    /// MaxDepth 对称；实际场景 7 对象 x 24 数元也才 2 层深）。</summary>
     string ToJson() {
         StringBuilder sb = new StringBuilder();
         this.WriteTo(sb);
@@ -186,6 +194,13 @@ class JsonValue {
     }
 
     void WriteTo(StringBuilder sb) {
+        this.WriteToAt(sb, 0);
+    }
+
+    void WriteToAt(StringBuilder sb, int depth) {
+        if (depth > JsonValue.MaxDepth) {
+            throw new JsonException("JSON nesting too deep to serialize");
+        }
         if (kind == 0) { sb.Append("null"); return; }
         if (kind == 1) {
             if (boolVal) { sb.Append("true"); } else { sb.Append("false"); }
@@ -205,7 +220,7 @@ class JsonValue {
             sb.Append("[");
             for (int i = 0; i < items.Count; i = i + 1) {
                 if (i > 0) { sb.Append(","); }
-                items[i].WriteTo(sb);
+                items[i].WriteToAt(sb, depth + 1);
             }
             sb.Append("]");
             return;
@@ -217,7 +232,7 @@ class JsonValue {
                 sb.Append("\"");
                 sb.Append(Encoding.JsonEscape(keys[i]));
                 sb.Append("\":");
-                vals[i].WriteTo(sb);
+                vals[i].WriteToAt(sb, depth + 1);
             }
             sb.Append("}");
             return;
@@ -226,7 +241,8 @@ class JsonValue {
 
     /// <summary>序列化为便于阅读的多行 JSON 字符串（两空格
     /// 缩进，每个 key 一行），用于手工编辑的交换文件，如
-    /// .zform / .zscene。与 ToJson 一样可通过 Parse 往返。</summary>
+    /// .zform / .zscene。与 ToJson 一样可通过 Parse 往返。
+    /// 嵌套超限时与 ToJson 一样抛 JsonException。</summary>
     string PrettyToJson() {
         StringBuilder sb = new StringBuilder();
         this.WritePretty(sb, 0);
@@ -234,6 +250,9 @@ class JsonValue {
     }
 
     void WritePretty(StringBuilder sb, int depth) {
+        if (depth > JsonValue.MaxDepth) {
+            throw new JsonException("JSON nesting too deep to serialize");
+        }
         if (kind == 5) {
             if (keys.Count == 0) { sb.Append("{}"); return; }
             sb.Append("{\n");
