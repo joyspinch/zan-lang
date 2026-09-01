@@ -59,6 +59,11 @@ int zan_utf8_argv(int *argc, char ***argv);
 void zan_timer_set_ready_hook(void (*ready)(void *frame, zan_timer_step_t step));
 long long zan_timer_now_ms(void);
 void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step);
+/* Cancel every pending DELAY entry naming `frame` (see zan_timer_delay).
+ * Called on the coroutine frame-release paths: an entry that outlives its
+ * frame would wake freed memory when it comes due. Returns the count of
+ * entries cancelled. */
+int zan_timer_cancel_delay(void *frame);
 long long zan_timer_next_timeout(void);
 /* These return counts; `long long` (not size_t) because the compiler's IR
  * declares them with Zan's 64-bit int and wasm32's size_t is 32-bit. */

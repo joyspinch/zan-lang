@@ -137,6 +137,7 @@ static LLVMValueRef coerce_from_frame_result(zan_irgen_t *g, LLVMValueRef res,
                                              zan_type_t *ty);
 static LLVMValueRef coerce_async_ret(zan_irgen_t *g, LLVMValueRef val);
 static void emit_async_cancel_check(zan_irgen_t *g, local_scope_t *locals);
+static void emit_co_cancel_delay(zan_irgen_t *g, LLVMValueRef frame);
 static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g);
 static LLVMValueRef get_co_isdone_fn(zan_irgen_t *g);
 static LLVMValueRef get_co_reap_fn(zan_irgen_t *g);

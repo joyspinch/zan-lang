@@ -173,6 +173,11 @@ static void emit_async_complete(zan_irgen_t *g, local_scope_t *locals, LLVMValue
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
 
+    /* the frame is done: any pending Task.Delay entry naming it must not
+     * fire again (a frame that completes inside the delay window without
+     * another await would leave a stale entry that wakes freed memory) */
+    emit_co_cancel_delay(g, LLVMBuildBitCast(g->builder, frame, i8ptr, "fr.i8"));
+
     LLVMValueRef res_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
         ASYNC_FRAME_RESULT, "fr.result");
     LLVMBuildStore(g->builder, result_i64 ? result_i64 : LLVMConstInt(i64, 0, 0),
@@ -246,6 +251,19 @@ static LLVMValueRef emit_co_live_has(zan_irgen_t *g, LLVMValueRef frame) {
     LLVMTypeRef ty;
     LLVMValueRef fn = get_co_live_fn(g, "zan_co_live_has", true, &ty);
     return zan_call2(g->builder, ty, fn, &frame, 1, "co.live");
+}
+
+/* Emit `zan_timer_cancel_delay(frame)` at the current insertion point: drop
+ * every pending DELAY timer naming this frame from the runtime's heap (see
+ * irgen_expr.c's Task.Delay lowering). Called on each frame-release path --
+ * the coroutine completes, a reaper frees it, or an unwind skips it -- because
+ * an entry that outlives its frame would wake freed memory when it comes due. */
+static void emit_co_cancel_delay(zan_irgen_t *g, LLVMValueRef frame) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_timer_cancel_delay");
+    if (!fn) fn = LLVMAddFunction(g->mod, "zan_timer_cancel_delay", ty);
+    zan_call2(g->builder, ty, fn, &frame, 1, "");
 }
 
 /* Open an internal `void f(i8*)` helper: creates it, positions the builder in a

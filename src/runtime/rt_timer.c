@@ -531,6 +531,39 @@ void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step) {
     timer_unlock();
 }
 
+/* Cancel every pending DELAY entry naming `frame`.
+ *
+ * A DELAY entry holds a raw coroutine-frame pointer for as long as the
+ * coroutine is suspended at `await Task.Delay`. Whoever releases that frame
+ * must cancel its entries first: an entry that outlives the frame would wake
+ * freed memory when it comes due (the dispatcher reads the frame's scheduler
+ * header, and on the multi-worker driver may re-queue it). The coroutine
+ * drivers call this on every frame-release path, right before the free.
+ * Entries already popped and inside their dispatch window are covered through
+ * g_dispatching -- dispatch_due re-reads `removed` under the lock before
+ * waking the frame. Returns the number of entries cancelled. */
+int zan_timer_cancel_delay(void *frame) {
+    int found = 0;
+    if (!frame) return 0;
+    timer_lock();
+    for (size_t i = 0; i < g_heap_len; i++) {
+        zan_timer_entry *entry = g_heap[i];
+        if (entry->kind == ZAN_TIMER_DELAY && !entry->removed &&
+            entry->frame == frame) {
+            entry->removed = 1;
+            g_live--;
+            found++;
+        }
+    }
+    if (g_dispatching && g_dispatching->kind == ZAN_TIMER_DELAY &&
+        !g_dispatching->removed && g_dispatching->frame == frame) {
+        g_dispatching->removed = 1;
+        found++;
+    }
+    timer_unlock();
+    return found;
+}
+
 static long long timer_add(long long ms, zan_timer_callback_t callback, int repeat) {
     if (ms < 1 || !callback) return 0;
     zan_timer_entry *entry = (zan_timer_entry *)calloc(1, sizeof(*entry));
@@ -596,14 +629,20 @@ long long zan_timer_dispatch_due(void) {
 
         long long started = zan_timer_now_ms();
         if (entry->kind == ZAN_TIMER_DELAY) {
-            /* The hook is installed once at startup but set under the lock;
-             * read it under the same lock so a concurrent install is visible. */
+            /* The frame may have been released after this entry was pushed
+             * (zan_timer_cancel_delay marks entries it cannot reach in the
+             * heap too -- including this one via g_dispatching). Re-read the
+             * flag under the lock: a cancelled DELAY neither wakes the frame
+             * nor steps it. */
             void (*ready)(void *, zan_timer_step_t);
             timer_lock();
             ready = g_ready_hook;
+            int cancelled = entry->removed;
             timer_unlock();
-            if (ready) ready(entry->frame, entry->step);
-            else entry->step(entry->frame);
+            if (!cancelled) {
+                if (ready) ready(entry->frame, entry->step);
+                else entry->step(entry->frame);
+            }
         } else entry->callback();
         long long elapsed = zan_timer_now_ms() - started;
         dispatched++;

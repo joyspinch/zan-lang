@@ -2718,6 +2718,9 @@ static LLVMValueRef get_co_reap_fn(zan_irgen_t *g) {
      * the program kept must stop naming this frame before it is freed */
     LLVMValueRef untrack = get_co_untrack_fn(g);
     zan_call2(g->builder, LLVMGlobalGetValueType(untrack), untrack, &arg, 1, "");
+    /* and drop any DELAY timer still parked on it: the reaper frees the frame
+     * without stepping it again, so a stale entry would wake freed memory */
+    emit_co_cancel_delay(g, arg);
     zan_emit_frame_free(g, arg);
     LLVMBuildRetVoid(g->builder);
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);

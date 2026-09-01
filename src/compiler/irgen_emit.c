@@ -900,6 +900,9 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
                     w->alocals[k].llvm, sp, "cl.lv");
                 emit_rc_release_for_type(g, w->alocals[k].ztype, v);
             }
+            /* an unwound frame is gone without completing: a DELAY entry still
+             * parked on it would wake freed memory when it comes due */
+            emit_co_cancel_delay(g, cparam);
             zan_emit_frame_free(g, cparam);
             LLVMBuildRetVoid(g->builder);
             g->current_fn = saved_cl_fn;
