@@ -1,0 +1,165 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace DataTableMasterDetailTest;
+
+class Program {
+    static DataRow Row(string id, string region, string price, string grade) {
+        DataRow row = new DataRow();
+        row.Push(id);
+        row.Push(region);
+        row.Push(price);
+        row.Push(grade);
+        return row;
+    }
+
+    static DataRow Item(string order, string product, string qty) {
+        DataRow row = new DataRow();
+        row.Push(order);
+        row.Push(product);
+        row.Push(qty);
+        return row;
+    }
+
+    static string Flat(DataTableState st, DataSource src) {
+        string s = "";
+        for (int i = 0; i < DataTable.DispCount(st); i = i + 1) {
+            int k = DataTable.DispKind(st, i);
+            if (k == 0) { s = s + "D" + src.CellText(DataTable.DispRowOf(st, i), 0) + " "; }
+            else if (k == 2) { s = s + "B" + DataTable.DispPart(st, i) + " "; }
+            else { s = s + "G "; }
+        }
+        return s;
+    }
+
+    static void Main() {
+        // ---- 主表：订单；子表：订单行项（order 列指向主键） ----
+        List<DataRow> masters = new List<DataRow>();
+        masters.Add(Program.Row("o1", "EU", "100", "A"));
+        masters.Add(Program.Row("o2", "US", "50", "B"));
+        masters.Add(Program.Row("o3", "APAC", "30", "A"));
+        RowListSource msrc = new RowListSource(masters);
+
+        List<DataRow> items = new List<DataRow>();
+        items.Add(Program.Item("o1", "bolt", "10"));
+        items.Add(Program.Item("o1", "nut", "20"));
+        items.Add(Program.Item("o3", "washer", "5"));
+        items.Add(Program.Item("o3", "screw", "7"));
+        items.Add(Program.Item("o3", "nail", "9"));
+        RowListSource isrc = new RowListSource(items);
+
+        List<DataColumn> mcols = new List<DataColumn>();
+        mcols.Add(DataColumn.Field(new DataColumn("Order", 70), "id"));
+        mcols.Add(DataColumn.Field(new DataColumn("Region", 80), "region"));
+        mcols.Add(DataColumn.Field(DataColumn.Numeric("Price", 80), "price"));
+        mcols.Add(DataColumn.Field(new DataColumn("Grade", 70), "grade"));
+
+        List<DataColumn> icols = new List<DataColumn>();
+        icols.Add(DataColumn.Field(new DataColumn("Order", 70), "order"));
+        icols.Add(DataColumn.Field(new DataColumn("Product", 90), "product"));
+        icols.Add(DataColumn.Field(DataColumn.Numeric("Qty", 60), "qty"));
+
+        DataTableState st = new DataTableState();
+        DataTable.EnsureInit(st, mcols, msrc);
+        DataTable.Recompute(st, mcols, msrc);
+        Console.WriteLine("base=" + (Program.Flat(st, msrc) == "Do1 Do2 Do3 "));
+
+        // ---- ChildGridDetail 装配 ----
+        ChildGridDetail det = ChildGridDetail.Of(icols, isrc, 0);
+        det.masterKeyCol = 0;
+        DataTable.SetDetail(st, det);
+        DataTable.Recompute(st, mcols, msrc);
+        Console.WriteLine("attached=" + (DataTable.HasDetail(st) && DataTable.DispCount(st) == 3));
+
+        // ---- 按主键数子行 ----
+        Console.WriteLine("childCount=" + (det.ChildCount(msrc, 0) == 2
+            && det.ChildCount(msrc, 1) == 0 && det.ChildCount(msrc, 2) == 3));
+
+        // ---- 无子行的主行拒绝展开（CanExpand=false） ----
+        Console.WriteLine("canExpand=" + (DataTable.CanExpand(st, msrc, 0)
+            && DataTable.CanExpand(st, msrc, 1) == false && DataTable.CanExpand(st, msrc, 2)));
+
+        // ---- 槽位数 = 1 表头 + 子行数，clamp 到 maxSlots ----
+        Console.WriteLine("slots=" + (det.Slots(msrc, 0) == 3 && det.Slots(msrc, 2) == 4));
+        det.maxSlots = 3;
+        Console.WriteLine("slotsClamped=" + (det.Slots(msrc, 2) == 3));
+        det.maxSlots = 0;
+
+        // ---- 展开 o1：详情带 2 槽紧跟主行 ----
+        DataTable.ExpandRow(st, msrc, 0);
+        DataTable.Recompute(st, mcols, msrc);
+        Console.WriteLine("expandO1=" + (Program.Flat(st, msrc) == "Do1 B0 B1 B2 Do2 Do3 "));
+        Console.WriteLine("noFooter=" + (DataTable.ExpandedCount(st) == 1));
+
+        // ---- 展开 o3（3 子行）：带 3 槽；o1 折叠 ----
+        DataTable.CollapseRow(st, 0);
+        DataTable.ExpandRow(st, msrc, 2);
+        DataTable.Recompute(st, mcols, msrc);
+        Console.WriteLine("expandO3=" + (Program.Flat(st, msrc) == "Do1 Do2 Do3 B0 B1 B2 B3 "));
+
+        // ---- 键匹配是文本相等：改子行的 order 键后子集跟随 ----
+        isrc.SetCell(0, 0, "o2");              // bolt 移到 o2
+        isrc.SetCell(1, 0, "o2");              // nut 移到 o2
+        DataTable.Recompute(st, mcols, msrc);
+        Console.WriteLine("rekey=" + (det.ChildCount(msrc, 1) == 2 && det.ChildCount(msrc, 0) == 0));
+        // o3 已展开、仍有 3 子行 -> 带 4 槽随行集实时保持
+        Console.WriteLine("bandStays=" + (Program.Flat(st, msrc) == "Do1 Do2 Do3 B0 B1 B2 B3 "));
+        isrc.SetCell(0, 0, "o1");
+        isrc.SetCell(1, 0, "o1");
+        DataTable.CollapseRow(st, 2);
+        DataTable.Recompute(st, mcols, msrc);
+
+        // ---- 拒绝展开的行不产生带区，也不能被 ExpandRow 展开 ----
+        DataTable.ExpandRow(st, msrc, 1);
+        Console.WriteLine("refused=" + (DataTable.ExpandedCount(st) == 0
+            && DataTable.DispCount(st) == 3));
+
+        // ---- 与分组共存：按 region 分组后带在组内主行之后 ----
+        DataTable.SetDetail(st, det);
+        DataTable.GroupBy(st, 1);
+        DataTable.ExpandRow(st, msrc, 0);
+        DataTable.Recompute(st, mcols, msrc);
+        // groups: APAC(o2) EU(o1,o3)（组序按组键升序）；
+        // o1 展开带 3 槽，且带在组内主行之后
+        Console.WriteLine("grouped=" + (Program.Flat(st, msrc)
+            == "G Do3 G Do1 B0 B1 B2 G Do2 "));
+        DataTable.Ungroup(st);
+        DataTable.CollapseAllDetail(st);
+        DataTable.Recompute(st, mcols, msrc);
+        Console.WriteLine("ungrouped=" + (Program.Flat(st, msrc) == "Do1 Do2 Do3 "));
+
+        // ---- 排序把展开行带走：带跟着主行 ----
+        DataTable.ExpandRow(st, msrc, 0);
+        DataTable.SortBy(st, 0, 2);            // k 降序: o3,o2,o1
+        DataTable.Recompute(st, mcols, msrc);
+        Console.WriteLine("sorted=" + (Program.Flat(st, msrc)
+            == "Do3 Do2 Do1 B0 B1 B2 "));
+        DataTable.CollapseAllDetail(st);
+        DataTable.SortBy(st, 0, 1);
+        DataTable.Recompute(st, mcols, msrc);
+        Console.WriteLine("restored=" + (Program.Flat(st, msrc) == "Do1 Do2 Do3 "));
+
+        // ---- 卸载 provider 复位 ----
+        DataTable.SetDetail(st, null);
+        DataTable.Recompute(st, mcols, msrc);
+        Console.WriteLine("detached=" + (DataTable.HasDetail(st) == false
+            && DataTable.DispCount(st) == 3));
+
+        // ---- CardDetail：键值卡片槽位数与装配 ----
+        CardDetail card = CardDetail.Of();
+        card.Add("Region", "EU").Add("Grade", "A").Add("Total", "123.45");
+        Console.WriteLine("cardSlots=" + (card.Slots(msrc, 0) == 3));
+        card.maxSlots = 2;
+        Console.WriteLine("cardClamped=" + (card.Slots(msrc, 0) == 2));
+        DataTable.SetDetail(st, card);
+        DataTable.Recompute(st, mcols, msrc);
+        Console.WriteLine("cardAttach=" + (DataTable.HasDetail(st)));
+        DataTable.ExpandRow(st, msrc, 1);
+        DataTable.Recompute(st, mcols, msrc);
+        Console.WriteLine("cardExpand=" + (Program.Flat(st, msrc) == "Do1 Do2 B0 B1 Do3 "));
+        // 空卡片至少 1 槽，带区永不为零高
+        CardDetail empty = CardDetail.Of();
+        Console.WriteLine("cardEmpty=" + (empty.Slots(msrc, 0) == 1));
+    }
+}

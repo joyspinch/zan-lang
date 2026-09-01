@@ -1,0 +1,238 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Backend;
+
+namespace Gui.Component.DataTable;
+
+/// DataTable 模块：主从明细（Master-Detail）深化——
+/// 在既有 DetailProvider 钩子（SetDetail/ExpandRow/详情带区）
+/// 之上提供一组"子表格"现成实现，让不用手绘 Canvas 的
+/// 业务也能得到 DevExpress 风格的主从网格：
+///
+/// - <see cref="ChildGridDetail"/>：详情带内渲染一张完整的
+///   子表格（列 schema + List&lt;DataRow&gt; 按主行键取子行集），
+///   自带表头、斑马纹与列宽，命中测试由父网格的
+///   BlockHitsRect 屏蔽带区，交互零成本。
+/// - <see cref="CardDetail"/>：键值卡片（label: value 两列），
+///   适合单行摘要（订单头、客户资料）。
+///
+/// 子行集按 `childKeyCol`（子表中指向主行的列）与
+/// `masterKeyCol`（主表中键列）的文本相等匹配；主行键变化
+/// 时子集自动跟随，无需手动刷新。
+partial class DataTable {
+    // ---------- 子行集查找 ----------
+
+    // 与 `master` 主行匹配的子行索引（文本相等匹配）。
+    // 每帧重扫，与 GridSource 的"不复制数据"哲学一致。
+    static void ChildRowsOf(DataSource childSrc, int childKeyCol, string masterKey,
+                            List<int> outIdx) {
+        outIdx.Clear();
+        int n = childSrc.RowCount();
+        for (int r = 0; r < n; r = r + 1) {
+            if (childSrc.CellText(r, childKeyCol) == masterKey) { outIdx.Add(r); }
+        }
+    }
+
+    // ---------- 子表格布局（纯数据面，测试用） ----------
+
+    /// 详情带内子表格需要的行槽数：表头 1 + 子行数，
+    /// 夹取到 [1, maxSlots]。maxSlots <= 0 时用 8（默认上限，
+    /// 防止一条巨型主行把整屏吃掉——超出部分业务自可翻页）。
+    static int ChildGridSlots(DataSource childSrc, int childKeyCol, string masterKey,
+                              int maxSlots) {
+        List<int> idx = new List<int>();
+        DataTable.ChildRowsOf(childSrc, childKeyCol, masterKey, idx);
+        int cap = maxSlots > 0 ? maxSlots : 8;
+        int n = idx.Count + 1;
+        if (n > cap) { n = cap; }
+        if (n < 1) { n = 1; }
+        return n;
+    }
+
+    // ---------- 内置 provider ----------
+
+}
+
+/// 详情带内渲染完整子表格的 DetailProvider。
+///
+/// ```zan
+/// class OrderItems : ChildGridDetail {
+///     // 列 schema 与子行集在子类字段里持有
+/// }
+/// ```
+class ChildGridDetail : DetailProvider {
+    /// 子表列 schema（决定表头与列宽）。
+    public List<DataColumn> childCols;
+    /// 子表数据源。
+    public DataSource childSrc;
+    /// 子表中指向主行键的列。
+    public int childKeyCol;
+    /// 主表中键列（默认 0）。
+    public int masterKeyCol;
+    /// 详情带最多占用的行槽数（0 = 8）。
+    public int maxSlots;
+
+    /// 子行读取钩子：默认从 `childSrc` 文本相等匹配取。
+    /// 返回 false 表示该主行无子行（拒绝展开）。
+    /// Zan 委托不能捕获局部变量，复杂子集请子类化重写
+    /// `Rows`/`CanExpand`，本字段保持简单场景。
+    public List<int> rows = new List<int>();
+
+    ChildGridDetail(List<DataColumn> cols, DataSource src, int keyCol) {
+        this.childCols = cols;
+        this.childSrc = src;
+        this.childKeyCol = keyCol;
+        this.masterKeyCol = 0;
+        this.maxSlots = 0;
+        this.rows = new List<int>();
+    }
+
+    static ChildGridDetail Of(List<DataColumn> cols, DataSource src, int keyCol) {
+        return new ChildGridDetail(cols, src, keyCol);
+    }
+
+    /// 该主行的子行数（按文本相等匹配）。
+    public int ChildCount(DataSource src, int row) {
+        List<int> idx = new List<int>();
+        DataTable.ChildRowsOf(this.childSrc, this.childKeyCol,
+                              src.CellText(row, this.masterKeyCol), idx);
+        return idx.Count;
+    }
+
+    override bool CanExpand(DataSource src, int row) {
+        return DataTable.ChildGridSlots(this.childSrc, this.childKeyCol,
+                                        src.CellText(row, this.masterKeyCol),
+                                        this.maxSlots) > 1;
+    }
+
+    override int Slots(DataSource src, int row) {
+        return DataTable.ChildGridSlots(this.childSrc, this.childKeyCol,
+                                        src.CellText(row, this.masterKeyCol),
+                                        this.maxSlots);
+    }
+
+    override void Paint(App app, DataSource src, int row,
+                        int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        string masterKey = src.CellText(row, this.masterKeyCol);
+        DataTable.ChildRowsOf(this.childSrc, this.childKeyCol, masterKey, this.rows);
+
+        StyleBox sHeader = Style.Part(app, "datatable", "header", "", "", "",
+                                      Style.SNormal());
+        StyleBox sCell = Style.Part(app, "datatable", "cell", "", "", "",
+                                    Style.SNormal());
+        StyleBox sGrid = Style.Part(app, "datatable", "grid", "", "", "",
+                                    Style.SNormal());
+        int rowH = t.heightMedium;
+        int pad = app.Scale(6);
+
+        // 内缩一档，与详情带区视觉分离；再留出子表边框。
+        int tx = x + pad;
+        int ty = y + pad;
+        int tw = w - pad * 2;
+        int th = h - pad * 2;
+
+        int visible = this.childCols.Count;
+        // 表头行
+        int hx = tx;
+        int cw = tw / (visible > 0 ? visible : 1);
+        for (int i = 0; i < visible; i = i + 1) {
+            int w_i = cw;
+            if (i == visible - 1) { w_i = tx + tw - hx; }
+            c.FillRect(hx, ty, w_i, rowH, sHeader.BgOr(0));
+            c.DrawText(hx + t.paddingSmall, Canvas.CenterTextY(ty, rowH, app.Scale(12)),
+                       this.childCols[i].title, sHeader.FgOr(0), app.Scale(12));
+            hx = hx + w_i;
+        }
+        c.FillRect(tx, ty + rowH, tw, 1, sGrid.BgOr(0));
+
+        // 数据行（槽位数 - 1）：空子集时画占位说明
+        int n = this.rows.Count;
+        int cap = this.maxSlots > 0 ? this.maxSlots : 8;
+        int maxRows = cap - 1;
+        if (n == 0) {
+            c.DrawText(tx + t.paddingSmall, ty + rowH + app.Scale(6),
+                       "(no records)", Style.Part(app, "datatable", "hint", "", "", "",
+                                                  Style.SNormal()).FgOr(0), app.Scale(12));
+            return;
+        }
+        for (int r = 0; r < n && r < maxRows; r = r + 1) {
+            int ry = ty + (r + 1) * rowH;
+            if (ry + rowH > ty + th) { break; }
+            if (r % 2 == 1) {
+                c.FillRect(tx, ry, tw, rowH,
+                           Style.Part(app, "datatable", "panel", "", "", "",
+                                      Style.SNormal()).BgOr(0));
+            }
+            int cx = tx;
+            for (int i = 0; i < visible; i = i + 1) {
+                int w_i = cw;
+                if (i == visible - 1) { w_i = tx + tw - cx; }
+                string v = this.childSrc.CellText(this.rows[r], i);
+                c.DrawText(cx + t.paddingSmall, Canvas.CenterTextY(ry, rowH, app.Scale(12)),
+                           v, sCell.FgOr(0), app.Scale(12));
+                cx = cx + w_i;
+            }
+        }
+    }
+}
+
+/// 键值卡片详情：把主行（或任意键值对）渲染为
+/// label: value 两列卡片。子类持有数据，本类只管绘制
+/// 与尺寸（每对一行，clamp 到 maxSlots）。
+class CardDetail : DetailProvider {
+    /// 标签/值两列的文本（子表式按行填充）。
+    public List<string> labels;
+    public List<string> values;
+    public int maxSlots;
+
+    CardDetail() {
+        this.labels = new List<string>();
+        this.values = new List<string>();
+        this.maxSlots = 0;
+    }
+
+    static CardDetail Of() {
+        return new CardDetail();
+    }
+
+    /// 装配一对标签/值；返回 this 便于链式填充。
+    CardDetail Add(string label, string value) {
+        this.labels.Add(label);
+        this.values.Add(value);
+        return this;
+    }
+
+    override int Slots(DataSource src, int row) {
+        int cap = this.maxSlots > 0 ? this.maxSlots : 8;
+        int n = this.labels.Count + 0;
+        if (n > cap) { n = cap; }
+        if (n < 1) { n = 1; }
+        return n;
+    }
+
+    override void Paint(App app, DataSource src, int row,
+                        int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int rowH = t.heightMedium;
+        int pad = app.Scale(8);
+        int fs = app.Scale(12);
+        int cap = this.maxSlots > 0 ? this.maxSlots : 8;
+        int n = this.labels.Count;
+        if (n > cap) { n = cap; }
+        int lw = app.Scale(120);
+        for (int i = 0; i < n; i = i + 1) {
+            int ry = y + pad + i * rowH;
+            if (ry + rowH > y + h) { break; }
+            c.DrawText(x + pad, Canvas.CenterTextY(ry, rowH, fs),
+                       this.labels[i], Style.Part(app, "datatable", "label", "", "", "",
+                                                  Style.SNormal()).FgOr(0), fs);
+            c.DrawText(x + pad + lw, Canvas.CenterTextY(ry, rowH, fs),
+                       this.values[i], Style.Part(app, "datatable", "cell", "", "", "",
+                                                  Style.SNormal()).FgOr(0), fs);
+        }
+    }
+}
