@@ -32,6 +32,17 @@ void zan_rt_soft_note2(const char *prefix, const char *msg);
  * One call site per guard keeps 50k guard sites from each inlining this whole
  * sequence (was several MB of .text across a big program). */
 void zan_rt_guard_fail2(const char *prefix, const char *msg);
+/* Three-part soft/hard report: the compiler interns the file name once per
+ * module and passes line/col as immediates, so thousands of guard sites share
+ * one file string instead of each carrying a "file:line:col: runtime error: "
+ * prefix global (~1 MB of .rdata across a big GUI publish). Dedup keys on the
+ * composed text, exactly one report per site per process. */
+void zan_rt_soft_note3(const char *file, unsigned line, unsigned col,
+                       const char *msg);
+/* The fail path matching note3: soft mode reports (note3) and returns; hard
+ * mode composes, prints, raises the fault record, and exits(70). */
+void zan_rt_guard_fail3(const char *file, unsigned line, unsigned col,
+                        const char *msg);
 /* Non-zero when ZAN_RT_HARD=1 was set at startup: guards must exit(70)
  * instead of reporting and continuing. */
 int zan_rt_soft_is_hard(void);

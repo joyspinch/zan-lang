@@ -45,19 +45,19 @@ if ($LASTEXITCODE -ne 0) { throw "EMBED_GEN_FAILED" }
 
 # ---- static driver dir so zanc's --link-mode static resolves zan_gui ----
 # --driver-dir REPLACES the per-module stdlib driver dirs for every driver
-# the program links, not just zan_gui. The net stack reached from the
-# gallery's Image.url demo (HttpClient -> TlsStream [DllImport("ssl")]) owns
-# static OpenSSL archives under stdlib\System\Net\Tls; stage them too, or
-# the static link finds no libssl.a inside the override dir and dies on
-# -lssl (single-file publish broken).
+# the program links, not just zan_gui. The gallery deliberately does NOT
+# stage the ssl/crypto static archives here: the only https entry point is
+# ImageHttp -> HttpClient.CreateHttps, and the catalog demo fetches images
+# from a local http://127.0.0.1 server, so no TlsStream call site is live.
+# Without the archives, zanc's static-publish stub kicks in: every
+# [DllImport("ssl"/"crypto")] import is stubbed (calls fail at run time) and
+# -lssl/-lcrypto is dropped from the link line, keeping ~5.5 MB of OpenSSL
+# out of the exe. A program that DOES use https stages the archives (or
+# publishes shared) and links the real thing.
 $staticDriver = Join-Path $root "build\static_driver\static"
 New-Item -ItemType Directory -Path $staticDriver -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $root "build\libzan_gui_gallery_gnu.a") `
     -Destination (Join-Path $staticDriver "libzan_gui.a") -Force
-$sslStatic = Join-Path $root "stdlib\System\Net\Tls\drivers\win-x64\static"
-if (Test-Path $sslStatic) {
-    Copy-Item -Path (Join-Path $sslStatic "*") -Destination $staticDriver -Force
-}
 
 # ---- compile + link through zanc (its own bundled ld) --------------------
 Write-Output "[3/4] Compiling and linking gui_gallery (static, single file) ..."
@@ -74,9 +74,10 @@ $outExe = Join-Path $outDir "gui_gallery.exe"
 $zanArgs = @()
 $zanArgs += $files
 $zanArgs += @("-o", $outExe, "--subsystem", "windows")
-# Optimized release: -Os + strip + --gc-sections (zanc --publish semantics),
-# without it the exe keeps the -O0 debug-build size.
-$zanArgs += @("--publish")
+# Optimized release: --publish (strip + --gc-sections) with an explicit -Oz.
+# --publish alone means -Os; -Oz overrides it (main.c honors an explicit -O
+# over the publish default) and buys roughly a tenth of the Gui stdlib text.
+$zanArgs += @("--publish", "-Oz")
 $zanArgs += @("--link-mode", "static", "--driver-dir", (Join-Path $root "build\static_driver"))
 # Demo/props/events catalog + map geometry + photos (assets/) travel inside
 # the exe; File.ReadAllText falls back to the embedded copy when the loose

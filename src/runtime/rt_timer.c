@@ -306,6 +306,31 @@ void zan_rt_soft_note2(const char *prefix, const char *msg) {
     zan_soft_append(buf);
 }
 
+/* Three-part soft report: the emitter interns the file name once per module
+ * (thousands of guard sites share one "Gui/App.zan" global) and passes
+ * line/col as immediate operands, instead of every site carrying its own
+ * "file:line:col: runtime error: " prefix string (~24k strings / ~1 MB of
+ * .rdata in the gui gallery publish). Dedup keys on the composed text via
+ * the same g_soft_seen table as note2 -- one report per site per process. */
+void zan_rt_soft_note3(const char *file, unsigned line, unsigned col,
+                       const char *msg) {
+    char buf[1400];
+    int n = snprintf(buf, sizeof buf, "%s:%u:%u: runtime error: %s",
+                     file ? file : "<unknown>", line, col,
+                     msg ? msg : "");
+    if (n <= 0) return;
+    if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
+    buf[n] = '\n';
+    buf[n + 1] = '\0';
+    timer_lock();
+    int seen = zan_soft_seen(buf);
+    timer_unlock();
+    if (seen) return;
+    fprintf(stderr, "%s", buf);
+    fflush(stderr);
+    zan_soft_append(buf);
+}
+
 void zan_rt_guard_fail2(const char *prefix, const char *msg) {
     if (zan_soft_is_hard()) {
 #if defined(_WIN32)
@@ -337,6 +362,34 @@ void zan_rt_guard_fail2(const char *prefix, const char *msg) {
         exit(70);
     }
     zan_rt_soft_note2(prefix, msg);
+}
+
+void zan_rt_guard_fail3(const char *file, unsigned line, unsigned col,
+                        const char *msg) {
+    if (zan_soft_is_hard()) {
+#if defined(_WIN32)
+        /* Same contract as guard_fail2: compose the text, print it, raise the
+         * fault-message record for the crash log, then exit(70). */
+        char buf[1400];
+        snprintf(buf, sizeof buf, "%s:%u:%u: runtime error: %s",
+                 file ? file : "<unknown>", line, col, msg ? msg : "");
+        size_t n = strlen(buf);
+        if (n && buf[n - 1] != '\n' && n + 1 < sizeof buf) {
+            buf[n] = '\n';
+            buf[n + 1] = '\0';
+        }
+        fprintf(stderr, "%s", buf);
+        fflush(stderr);
+        void (WINAPI *raise)(DWORD, DWORD, DWORD, const ULONG_PTR *) =
+            RaiseException;
+        unsigned long code = 0xE0A2C010u; /* ZAN_RT_FAULT_MESSAGE (keep in sync
+                                             with rt_crash.h / irgen_generics.c) */
+        ULONG_PTR args[2] = { (ULONG_PTR)buf, 70 };
+        raise(code, 0, 2, args);
+#endif
+        exit(70);
+    }
+    zan_rt_soft_note3(file, line, col, msg);
 }
 typedef enum zan_timer_kind {
     ZAN_TIMER_DELAY = 0,

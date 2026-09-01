@@ -2701,6 +2701,78 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* ---- Optional DllImport libraries on a Windows static publish ----
+         * A [DllImport] library whose driver ships neither a static archive
+         * nor a shared DLL in the effective driver dirs cannot be linked --
+         * the Windows static publish is a single self-contained executable,
+         * so there is no runtime loader fallback to resolve the import from.
+         * The cross-compile paths above already stub exactly this situation
+         * out; do the same here instead of failing the whole link: the
+         * stubbed calls fail at run time, which keeps a program that only
+         * *carries* the calling module but never exercises it (gui_gallery
+         * pulls TlsStream through Image.url's https branch without ever
+         * opening an https connection) small and runnable. Without this,
+         * -lssl drags ~4 MB of OpenSSL into every such exe. */
+        if (target.os == ZAN_OS_WINDOWS && link_static_drivers && publish_mode) {
+            /* Backwards: dropping a lib compacts extern_libs and shifts the
+             * remaining slots, which would skip the next entry forwards. */
+            for (int li = irgen.extern_lib_count - 1; li >= 0; li--) {
+                int nlen;
+                const char *nm = zan_dllimport_lname(
+                    irgen.extern_libs[li].str,
+                    (int)irgen.extern_libs[li].len, &nlen);
+                if (!nm || zan_win_system_lib(nm, nlen)) continue;
+                /* Which driver (if any) owns this lib, and where does it
+                 * live? Non-system libs with no owning driver have no
+                 * resolution channel at all on a static publish. */
+                char dir[1200];
+                dir[0] = '\0';
+                for (int d = 0; d < used_driver_count; d++) {
+                    if (used_driver_len[d] == nlen &&
+                        memcmp(used_drivers[d], nm, (size_t)nlen) == 0) {
+                        snprintf(dir, sizeof(dir), "%s", driver_dirs[d]);
+                        break;
+                    }
+                }
+                bool resolvable = false;
+                static const char fmts[6][28] = {
+                    "%s/static/lib%s.a", "%s/static/%s.lib",
+                    "%s/lib%s.a",        "%s/%s.lib",
+                    "%s/lib%s.dll",      "%s/%s.dll"
+                };
+                if (dir[0]) {
+                    for (int f = 0; f < 6 && !resolvable; f++) {
+                        char cand[1300];
+                        snprintf(cand, sizeof(cand), fmts[f], dir, nm);
+                        resolvable = zan_file_exists(cand);
+                    }
+                }
+                if (resolvable) continue;
+                int n = zan_irgen_stub_extern_lib(
+                    &irgen, irgen.extern_libs[li].str,
+                    (int)irgen.extern_libs[li].len);
+                if (n > 0) {
+                    /* The link line must stop asking for the library: with
+                     * every import stubbed there is nothing left for -l<lib>
+                     * to resolve, and a missing archive would fail the link
+                     * anyway ("cannot find -lssl"). Snapshot the name before
+                     * dropping: compacting shifts the array slots. */
+                    char libname[128];
+                    snprintf(libname, sizeof(libname), "%.*s",
+                             (int)irgen.extern_libs[li].len,
+                             irgen.extern_libs[li].str);
+                    zan_irgen_drop_extern_lib(
+                        &irgen, irgen.extern_libs[li].str,
+                        (int)irgen.extern_libs[li].len);
+                    fprintf(stderr,
+                            "warning: no archive or shared library resolved "
+                            "for [DllImport(\"%s\")] in the static publish;"
+                            " its %d function(s) are stubbed and will fail at"
+                            " run time\n", libname, n);
+                }
+            }
+        }
+
         /* ---- Gui icon packs inside the executable ----------------------
          * stdlib/Gui/IconSvgData keeps its icon table in JSON data packs
          * (stdlib/Gui/icons/*.json) and resolves them at run time through the

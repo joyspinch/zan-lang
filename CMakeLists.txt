@@ -1217,6 +1217,12 @@ foreach(_src ${_conf_srcs})
     # they are registered under "assets/..." via --embed.
     set(_extra_args
       "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_assets=assets")
+  elseif(_name STREQUAL "static_publish_tls_stub")
+    # The case pins the Windows static-publish stub: DllImport libraries
+    # (here ssl/crypto) that resolve to no archive and no shared DLL are
+    # stubbed and dropped from the link line instead of failing the link.
+    set(_extra_args
+      "--publish;--link-mode;static;--driver-dir;${CMAKE_SOURCE_DIR}/tests/conformance/empty_driver_dir")
   elseif(_needs_gui_driver)
     set(_extra_args "${_gui_driver_args}")
   else()

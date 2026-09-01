@@ -2388,6 +2388,20 @@ int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len) {
     return stubbed;
 }
 
+int zan_irgen_drop_extern_lib(zan_irgen_t *g, const char *lib, int lib_len) {
+    int kept = 0, dropped = 0;
+    for (int li = 0; li < g->extern_lib_count; li++) {
+        if ((int)g->extern_libs[li].len == lib_len && lib_len > 0 &&
+            memcmp(g->extern_libs[li].str, lib, (size_t)lib_len) == 0) {
+            dropped++;
+            continue;
+        }
+        g->extern_libs[kept++] = g->extern_libs[li];
+    }
+    g->extern_lib_count = kept;
+    return dropped;
+}
+
 int zan_irgen_prune_extern_libs(zan_irgen_t *g) {
     int kept = 0, dropped = 0;
     for (int li = 0; li < g->extern_lib_count; li++) {

@@ -1188,38 +1188,39 @@ static void emit_guard_hard(zan_irgen_t *g, LLVMValueRef text, int exit_code) {
     LLVMBuildUnreachable(g->builder);
 }
 
-/* Guard report over the split (prefix, msg) globals: the whole soft/hard
- * decision and the hard-mode report live in the runtime (zan_rt_guard_fail2);
- * the emitter only produces the call. */
-static void emit_guard_report2(zan_irgen_t *g, LLVMValueRef prefix_gv,
-                               LLVMValueRef msg_gv,
-                               zan_loc_t loc, const char *msg);
+/* Guard report over (file, line, col, msg): the file string is interned once
+ * per module and shared by every guard site in it; line/col travel as
+ * immediates. Same runtime-side split as the old (prefix,msg) form (soft notes
+ * and returns, hard prints/raises/exits), via zan_rt_guard_fail3. */
+static void emit_guard_report3(zan_irgen_t *g, LLVMValueRef file_gv,
+                               unsigned line, unsigned col,
+                               LLVMValueRef msg_gv);
 /* Guard report over a single merged-text global: the cross-target fallback
  * (the committed per-target runtime objects may predate zan_rt_soft_note2).
- * Same split as emit_guard_report2 but the soft path passes the whole text
+ * Same split as emit_guard_report3 but the soft path passes the whole text
  * to the one-arg zan_rt_soft_note. */
 static void emit_guard_report_merged(zan_irgen_t *g, LLVMValueRef text);
-static void emit_guard_report2(zan_irgen_t *g, LLVMValueRef prefix_gv,
-                               LLVMValueRef msg_gv,
-                               zan_loc_t loc, const char *msg) {
-    (void)loc; (void)msg;
+static void emit_guard_report3(zan_irgen_t *g, LLVMValueRef file_gv,
+                               unsigned line, unsigned col,
+                               LLVMValueRef msg_gv) {
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-
-    /* The whole soft/hard decision and the hard-mode report live in the
-     * runtime's zan_rt_guard_fail2 (rt_timer.c): soft mode notes and returns,
-     * hard mode prints, raises the crash-log record, and exits(70). Emitting
-     * just this one call per guard site keeps ~50k sites from each carrying
-     * an inlined is_hard/printf/fflush/RaiseException/exit sequence -- that
-     * inlined form was ~15 lines of IR and ~70 bytes of .text per site. The
-     * runtime object is linked into every program (rt_timer.o is mandatory),
-     * so no availability probe is needed. */
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    /* Same one-call-per-site shape as fail2 (see above); the (file, line,
+     * col, msg) signature lets the runtime compose the prefix, so no site
+     * carries its own "file:line:col: runtime error: " string global. */
     LLVMTypeRef fail_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
-                                           (LLVMTypeRef[]){ i8p, i8p }, 2, 0);
-    LLVMValueRef fail_fn = LLVMGetNamedFunction(g->mod, "zan_rt_guard_fail2");
-    if (!fail_fn) fail_fn = LLVMAddFunction(g->mod, "zan_rt_guard_fail2",
+                                           (LLVMTypeRef[]){ i8p, i32t, i32t,
+                                                            i8p }, 4, 0);
+    LLVMValueRef fail_fn = LLVMGetNamedFunction(g->mod, "zan_rt_guard_fail3");
+    if (!fail_fn) fail_fn = LLVMAddFunction(g->mod, "zan_rt_guard_fail3",
                                             fail_ty);
-    LLVMValueRef fargs[] = { prefix_gv, msg_gv };
-    zan_call2(g->builder, fail_ty, fail_fn, fargs, 2, "");
+    LLVMValueRef fargs[] = {
+        file_gv,
+        LLVMConstInt(i32t, line, 0),
+        LLVMConstInt(i32t, col, 0),
+        msg_gv
+    };
+    zan_call2(g->builder, fail_ty, fail_fn, fargs, 4, "");
 }
 
 /* Guard report over a single merged-text global: the cross-target fallback
@@ -1315,21 +1316,18 @@ static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
     LLVMBuildCondBr(g->builder, is_error, bad_bb, cont_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, bad_bb);
-    /* Split storage: the prefix ("Gui/App.zan:818:40: runtime error: ") is
-     * unique per guard site while the message is one of a few hundred shared
-     * templates (780 distinct messages covered 56% of gallery guard bytes).
-     * Interning them separately stores each message once; the two are joined
-     * at report time -- soft mode composes inside zan_rt_soft_note2, hard
-     * mode into the per-function scratch buffer. */
-    const char *file = loc_site_file(g, loc);
-    char pbuf[640];
-    snprintf(pbuf, sizeof(pbuf), "%s:%u:%u: runtime error: ",
-             file, loc.line, loc.col);
+    /* Split storage, site-slim form: the message is one of a few hundred
+     * shared templates and the file name is one string per module -- both
+     * interned once, shared by every guard site. Only line/col (immediates)
+     * are per-site, so a big GUI program no longer carries ~24k
+     * "file:line:col: runtime error: " prefix globals (~1 MB of .rdata in
+     * the gallery publish). Composed at report time inside
+     * zan_rt_guard_fail3/soft_note3. */
+    LLVMValueRef file_gv = zan_irgen_intern_string(g, loc_site_file(g, loc));
     char mbuf[320];
     snprintf(mbuf, sizeof(mbuf), "%s\n", msg);
-    LLVMValueRef prefix_gv = zan_irgen_intern_string(g, pbuf);
     LLVMValueRef msg_gv = zan_irgen_intern_string(g, mbuf);
-    emit_guard_report2(g, prefix_gv, msg_gv, loc, msg);
+    emit_guard_report3(g, file_gv, loc.line, loc.col, msg_gv);
     /* The report leaves the builder in its soft continuation (hard mode
      * never returns), so route it into the join block. */
     LLVMBuildBr(g->builder, cont_bb);
@@ -1354,13 +1352,10 @@ static void emit_string_null_report(zan_irgen_t *g, LLVMValueRef payload,
         return;
     }
     const char *file = loc_site_file(g, loc);
-    char pbuf[640];
-    snprintf(pbuf, sizeof(pbuf), "%s:%u:%u: runtime error: ",
-             file, loc.line, loc.col);
-    LLVMValueRef prefix_gv = zan_irgen_intern_string(g, pbuf);
+    LLVMValueRef file_gv = zan_irgen_intern_string(g, file);
     LLVMValueRef msg_gv = zan_irgen_intern_string(g,
         "null reference where a string/byte buffer is required (length probe)\n");
-    emit_guard_report2(g, prefix_gv, msg_gv, loc, "null length probe");
+    emit_guard_report3(g, file_gv, loc.line, loc.col, msg_gv);
 }
 
 static LLVMValueRef emit_index_i64(zan_irgen_t *g, LLVMValueRef value,

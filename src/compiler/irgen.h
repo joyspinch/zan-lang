@@ -755,6 +755,13 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path);
  * whole publish failing. Returns the number of functions stubbed. */
 int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len);
 
+/* Removes `lib` from the extern_libs list so the linker line stops asking
+ * for it (-l<lib>). Companion to zan_irgen_stub_extern_lib: once every
+ * import of the library is stubbed, nothing needs the archive/DLL and a
+ * missing one must not fail the link. Returns the number of entries
+ * removed (0 = the lib was not tracked). */
+int zan_irgen_drop_extern_lib(zan_irgen_t *g, const char *lib, int lib_len);
+
 /* Drop from extern_libs every [DllImport] library whose imports were all
  * deleted as unreachable, so a program links only the native libraries it
  * actually calls. Must run after the dead-code sweep. Returns the number of
