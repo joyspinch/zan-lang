@@ -705,7 +705,18 @@ int zan_embed_emit_specs(zan_irgen_t *g, const char *const *specs, int count) {
         snprintf(label, sizeof(label), "zan.embed.d%d", i);
         LLVMValueRef data = embed_bytes_global(g, label, files.v[i].data,
                                                files.v[i].len);
-        if (!name || !data) { free(ents); return -1; }
+        if (!name || !data) {
+            /* Same release discipline as the success tail: free every
+             * remaining entry (name + data) or a ≥4 GiB resource aborts with
+             * the whole list still held. */
+            free(ents);
+            for (int f = 0; f < files.n; f++) {
+                free(files.v[f].name);
+                free(files.v[f].data);
+            }
+            free(files.v);
+            return -1;
+        }
         LLVMValueRef vals[] = { name, data,
             LLVMConstInt(i64, (unsigned long long)files.v[i].len, 0) };
         ents[i] = LLVMConstNamedStruct(ent_ty, vals, 3);
