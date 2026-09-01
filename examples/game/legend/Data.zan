@@ -1,0 +1,537 @@
+// 传奇放置挂机 — 静态数据表。
+// 设计目标:数据与逻辑分离,便于调数值。表中只放常量与索引,所有运行时
+// 计算(伤害公式/经验曲线/离线结算/影子榜种子)走 Game.zan。
+using System;
+
+namespace Legend;
+
+// 三职业:0 战士 / 1 法师 / 2 道士
+class ClassDef {
+    public string name;        // 职业名(显示用)
+    public string attr;        // 主属性缩写("攻击"/"魔法"/"道术")
+    public double hpGrow;      // 每级 HP 增长系数
+    public double mpGrow;      // 每级 MP 增长系数
+    public double acGrow;      // 每级攻击(区间下限)增长
+    public double acRange;     // 攻击浮动幅度(占 acGrow 的比例)
+    public double defGrow;     // 每级防御
+    public double mdefGrow;    // 每级魔防
+}
+
+class Data {
+    // 三职业基础值(等级 1)
+    public static int BASE_HP_W = 80;
+    public static int BASE_HP_M = 60;
+    public static int BASE_HP_T = 70;
+    public static int BASE_MP_W = 30;
+    public static int BASE_MP_M = 90;
+    public static int BASE_MP_T = 70;
+    public static int BASE_AC_W = 12;
+    public static int BASE_AC_M = 6;       // 法师主"魔法",攻击基础低
+    public static int BASE_AC_T = 9;
+    public static int BASE_DEF = 6;
+    public static int BASE_MDEF = 6;
+    public static int BASE_SPEED = 12;      // 出手速度
+
+    // 等级曲线:经验 = BASE * LV ^ POW,LV 上限与转生挂钩
+    public static double EXP_BASE = 80;
+    public static double EXP_POW = 1.45;
+    public static int MAX_LV_PER_TURN_BASE = 80;   // 0 转 80 级封顶
+    public static int MAX_LV_PER_TURN_STEP = 40;   // 每多 1 转 +40 封顶
+    public static int TURN_MAX = 9;                 // 共 9 转(PRD)
+
+    // 转生条件:LV >= 80 且 击杀 BOSS 累计达到阈值
+    public static int[] TURN_REQ_BOSS = new int[10];
+        // index 0 不使用(0 转),i 转需要累计击破 BOSS 层数
+    // 幻境每层基础参数
+    public static int HJ_KILL_TARGET = 10;      // 每层需击杀怪数
+    public static double HJ_HP_BASE = 30.0;      // 第 1 层怪 HP
+    public static double HJ_HP_GROWTH = 1.028;    // 每层 HP 倍率
+    public static double HJ_ATK_BASE = 4.0;
+    public static double HJ_ATK_GROWTH = 1.022;
+    public static int HJ_BOSS_EVERY = 10;        // 每 10 层一只 BOSS
+    public static double HJ_BOSS_HP_MULT = 6.0;
+    public static double HJ_BOSS_ATK_MULT = 2.5;
+    public static double HJ_KILL_GOLD = 18.0;    // 每只怪掉落金币
+    public static double HJ_KILL_XP = 12.0;
+    public static double HJ_KILL_SW = 0.4;       // 声望
+    public static double HJ_BOSS_GOLD_MULT = 8.0;
+    public static double HJ_BOSS_XP_MULT = 6.0;
+    public static double HJ_BOSS_SW_MULT = 10.0;
+    // 在线出手间隔(秒):一次普通攻击。怪 HP 按 ~4 刀击杀调,≈5s/只
+    public static double ATK_INTERVAL = 1.2;
+    // 普通怪掉装备概率(BOSS 必掉)
+    public static double HJ_DROP_RATE = 0.18;
+    // 离线节拍:每 N 秒一只怪
+    public static double OFFLINE_BEAT = 5.0;
+    // 每层收益增长(放缓,避免金币指数爆炸)
+    public static double REWARD_GOLD_GROWTH = 1.030;
+    public static double REWARD_XP_GROWTH = 1.035;
+    public static double REWARD_SW_GROWTH = 1.025;
+
+    // 秘境:转生 1 后解锁
+    public static int MJ_UNLOCK_TURN = 1;
+    public static double MJ_HP_MULT = 2.2;       // 怪 HP 相对同层幻境
+    public static double MJ_ATK_MULT = 1.4;
+    public static double MJ_GOLD_MULT = 1.8;
+    public static double MJ_XP_MULT = 1.6;
+    public static double MJ_DROP_TIER_BIAS = 1.0;
+    // 装备系数随楼层放大的斜率:每 N 层 +1 系数
+    public static int EQUIP_COEF_PER_FLOOR = 10; // +N 系数加成
+
+    // 装备 12 槽顺序
+    public static int SLOT_WEAPON = 0;
+    public static int SLOT_HELMET = 1;
+    public static int SLOT_ARMOR = 2;
+    public static int SLOT_NECK = 3;
+    public static int SLOT_BRACE_L = 4;
+    public static int SLOT_BRACE_R = 5;
+    public static int SLOT_RING_L = 6;
+    public static int SLOT_RING_R = 7;
+    public static int SLOT_BELT = 8;
+    public static int SLOT_SHOES = 9;
+    public static int SLOT_GEM = 10;
+    public static int SLOT_TOME = 11;
+    public static int SLOT_COUNT = 12;
+    public static string[] SLOT_NAMES = new string[12];
+
+    // 装备 8 大类(c0..c7)× 5 品阶(t0..t4),映射到 equip_cN_tM.png
+    public static string[] EQUIP_TIER_NAMES = new string[5];
+    // 8 类装备的伤害主词条
+    public static string[] EQUIP_CLASS_NAMES = new string[8];
+    public static double[] EQUIP_CLASS_ATK_BIAS = new double[8];
+    public static double[] EQUIP_CLASS_DEF_BIAS = new double[8];
+    public static double[] EQUIP_CLASS_HP_BIAS = new double[8];
+    // 品阶基础属性倍率 + 系数上限 + 概率出现
+    public static double[] TIER_ATK = new double[5];
+    public static double[] TIER_DEF = new double[5];
+    public static double[] TIER_HP = new double[5];
+    public static int[] TIER_COEF_CAP = new int[5];
+    public static double[] TIER_DROP_RATE = new double[5];
+    // 符文 1#..14# 商店价格(元宝),3 个同号合成高 1 号
+    public static int RUNE_PRICE_BASE = 100;     // 1#
+    public static int RUNE_PRICE_STEP = 200;     // 每升 1 号 +200 元宝
+    public static double RUNE_UPGRADE_BIAS = 1.0;
+
+    // 20 张地图(经典情怀)
+    public static string[] MAP_NAMES = new string[20];
+    public static int[] MAP_MIN_FLOOR = new int[20];   // 推层门槛
+    // BOSS 之家 8 只(竞品实测顺序)
+    public static string[] BOSS_NAMES = new string[8];
+    public static int[] BOSS_LV = new int[8];
+    public static int[] BOSS_HP_BASE = new int[8];
+    public static double[] BOSS_HP_GROWTH = new double[8];
+    // BOSS 之家每日可挑战次数(基数)
+    public static int BOSS_HOME_TRIES = 3;
+    // 购买额外次数 1 元宝/次
+    public static int BOSS_HOME_EXTRA_PRICE = 50;
+
+    // 世界 BOSS(影子共斗)固定 HP,30 秒战斗窗口
+    public static double WORLD_BOSS_HP = 10000000000.0; // 100 亿
+    public static int WORLD_BOSS_TRIES = 6;
+    public static double[] WORLD_BOSS_DAMAGE_PER_HIT = new double[5];
+    // 玩家战力区间 0..4 对应 5 段伤害(0=新手 4=毕业)
+    public static int WORLD_BOSS_TIER_BOUND4 = 5000;
+    public static int WORLD_BOSS_TIER_BOUND3 = 50000;
+    public static int WORLD_BOSS_TIER_BOUND2 = 500000;
+    public static int WORLD_BOSS_TIER_BOUND1 = 5000000;
+    public static int WORLD_BOSS_TIER_BOUND0 = 50000000;
+
+    // 货币:0 金币 / 1 元宝 / 2 声望 / 3 战功 / 4 灵符 / 5 红包 / 6 积分
+    public static int CUR_GOLD = 0;
+    public static int CUR_YB = 1;
+    public static int CUR_SW = 2;
+    public static int CUR_ZG = 3;
+    public static int CUR_LF = 4;
+    public static int CUR_RB = 5;
+    public static int CUR_JF = 6;
+    public static int CUR_COUNT = 7;
+    public static string[] CUR_NAMES = new string[7];
+    public static string[] CUR_ICONS = new string[7];  // 对应 icon_*.png
+    // 称谓 21 页 × 5 阶 = 105 个(简化版,只取前 21 页的门槛与加成)
+    // 序列:筑基(5)/开光(5)/融合(5)/金丹(5)/元婴(1)。本表只定义总长与抽样。
+    public static int TITLE_TOTAL = 21;
+    public static string[] TITLE_PAGE_NAMES = new string[21];
+    // 爵位 6 档
+    public static int NOBLE_TOTAL = 6;
+    public static string[] NOBLE_NAMES = new string[6];
+    public static int[] NOBLE_DONATE = new int[6];     // 累计元宝门槛
+    public static double[] NOBLE_ALL_PCT = new double[6]; // 全属性 +%
+    public static double[] NOBLE_SPEED_PCT = new double[6];
+    public static double[] NOBLE_XP_PCT = new double[6];
+    // 五行修炼:金/木/水/火/土 5 槽
+    public static string[] WUXING_NAMES = new string[5];
+    // 五行每级产出属性:攻/魔/道/防/魔防(对应五行顺序)
+    public static double WUXING_HOUR_GROW = 0.001; // 每离线 1h 修为 +0.1%
+
+    // 将星图谱:8 卡池(本工程去除 IP 风险,改自研主题)
+    public static string[] CARD_POOL_NAMES = new string[8];
+    public static int CARD_POOL_CARDS = 12;       // 每池 12 张
+    public static int CARD_TIERS = 10;             // 0~9 转分档
+    public static int CARD_ACTIVATE_BASE = 10000;  // 1 万金币起步,翻倍递增
+    // 神兵图鉴:9 组 × 10 槽
+    public static string[] ALBUM_NAMES = new string[9];
+    public static int ALBUM_SLOTS = 10;
+    // 至尊极品殿堂:5 页(武器之攻/法/道/铠甲/头盔)
+    public static string[] DIAN_TANG_NAMES = new string[5];
+    public static int[] DIAN_TANG_COST_LF = new int[5];   // 复制费用(灵符)
+    public static double DIAN_TANG_XP_BONUS = 0.05;       // 登记 1 件 +5% 经验
+    public static int DIAN_TANG_XP_BONUS_CAP = 10;        // 上限 10 件
+    // 寻宝奖池(每日刷新):12 个奖项,概率累加 = 1
+    public static int XB_POOL_SIZE = 12;
+    public static string[] XB_PRIZE_NAMES = new string[12];
+    public static int[] XB_PRIZE_VAL = new int[12];    // 价值(元宝估算)
+    public static double[] XB_PRIZE_RATE = new double[12];
+    // 祭坛:捐献换进度
+    public static int ALTAR_MY_TARGET = 1000;
+    public static int ALTAR_GLOBAL_TARGET = 8000;
+    public static int[] ALTAR_DONATE_GOLD = new int[5];      // 金币/金砖/天书/黑铁/元宝 单位
+    public static int[] ALTAR_DONATE_PROG = new int[5];      // 单次进度
+    // 商店:四货币页签
+    public static int SHOP_YB = 0;
+    public static int SHOP_GOLD = 1;
+    public static int SHOP_LF = 2;
+    public static int SHOP_CODE = 3;
+    public static int SHOP_PAGES = 4;
+
+    // 商店 12 个商品 × 4 页 = 48 个
+    public static string[] SHOP_GOODS_NAME = new string[12];
+    public static int[] SHOP_GOODS_PRICE_YB = new int[12];
+    public static int[] SHOP_GOODS_PRICE_GOLD = new int[12];
+    public static int[] SHOP_GOODS_PRICE_LF = new int[12];
+    // 铁匠铺 11 模式名称(实际只实现金/元宝洗炼 + 升级锻造)
+    public static string[] FORGE_MODES = new string[11];
+    // 金币洗炼概率(系数±5,有 35% 概率降低)
+    public static double GOLD_REFINE_DOWN_RATE = 0.35;
+    public static double GOLD_REFINE_DELTA = 5.0;
+    public static int GOLD_REFINE_COST_BASE = 5000;     // 系数 1 时费用
+    public static double GOLD_REFINE_COST_POW = 1.8;    // 费用按 coef^POW
+    // 元宝洗炼保底
+    public static int YB_REFINE_COST_BASE = 30;
+    public static double YB_REFINE_PCT = 0.10;          // +10% 系数机会
+
+    // 升级锻造(黑铁)
+    public static int UPGRADE_BLACK_IRON_COST = 8;       // 每升 1 级耗黑铁
+    public static double UPGRADE_RATE = 0.7;             // 成功率基础
+
+    // 押镖/劫镖
+    public static int YABIAO_TRIES = 5;
+    public static int JIEBIAO_TRIES = 5;
+    public static int[] YABIAO_GOLD = new int[3];        // 普通/高级/传说
+    // 钱庄
+    public static int CITY_TOTAL = 8;
+    public static int[] CITY_PRODUCE = new int[8];       // 每小时产出金币
+    // 传说塔 5 层
+    public static int TOWER_FLOORS = 5;
+    public static double[] TOWER_HP_MULT = new double[5];
+    // PK 竞技场
+    public static int PK_TRIES = 5;
+    public static int PK_WIN_ZG = 100;
+    public static int PK_LOSE_ZG = 20;
+    // 排名小时薪(战功)
+    public static int[] PK_HOURLY = new int[10];
+    // 师徒
+    public static int TUTOR_LV_REQ = 80;            // 收徒最低 80 级
+    public static int STUDENT_LV_MAX = 60;          // 拜师最高 60 级
+    public static int TUTOR_TURN_REQ = 2;           // 师父需 2 转
+    public static int TUTOR_ACTIVE_MAX = 100;
+    public static int[] TUTOR_OUT_GIFT = new int[3];  // 普通/终身/超会 出师寻宝图
+    // 行会
+    public static int GUILD_CREATE_GOLD = 5000000;
+    public static int GUILD_CREATE_HORN = 1;          // 沃玛号角
+    public static int GUILD_MEMBERS_BASE = 48;
+
+    // 回收 — 单价表(简化版:装备品阶 → 各货币价值)
+    public static double[] RECYCLE_GOLD_PER_TIER = new double[5];
+    public static int[] RECYCLE_EXP_PER_TIER = new int[5];
+    public static int[] RECYCLE_ZG_PER_TIER = new int[5];
+    public static int[] RECYCLE_SW_PER_TIER = new int[5];
+    public static int[] RECYCLE_RB_PER_TIER = new int[5];
+    public static int[] RECYCLE_YB_PER_TIER = new int[5];
+    public static int[] RECYCLE_JF_PER_TIER = new int[5];
+    // 成就(简化为 6 类 × 8 条 = 48)
+    public static int ACHV_COUNT = 48;
+    public static string[] ACHV_CAT_NAMES = new string[6];
+    // 充值档位(7 档,模拟大 R 线)
+    public static int[] CHARGE_TIERS = new int[7];
+    public static int[] CHARGE_YB = new int[7];
+    // 累计充值金额对应 VIP 档
+    public static int[] VIP_THRESHOLD = new int[3];
+    // 离线结算上限(小时)
+    public static int OFFLINE_CAP_HOURS = 24;
+    // VIP 扩展离线上限
+    public static int[] OFFLINE_CAP_VIP = new int[3];
+    // 每日 0 点刷新的时间戳锚(用于寻宝奖池/押镖次数等)
+    public static long DAY_MS = 86400000L;
+
+    // 通用窗口尺寸
+    public static int W = 1280;
+    public static int H = 720;
+
+    // 顶部标题栏
+    public static int TITLE_BAR_H = 40;
+    // 三排导航按钮高
+    public static int NAV_ROW_H = 60;
+    public static int NAV_ROWS = 2;
+    // 底部一排
+    public static int BOTTOM_NAV_H = 70;
+    // 主区
+    public static int MAIN_TOP = 0;
+    public static int MAIN_BOTTOM() {
+        return H - BOTTOM_NAV_H;
+    }
+    public static int MAIN_H() {
+        return MAIN_BOTTOM() - MAIN_TOP;
+    }
+    // ---- 静态初始化(合并) ----
+    static Data() {
+        TURN_REQ_BOSS[1] = 20;
+        TURN_REQ_BOSS[2] = 60;
+        TURN_REQ_BOSS[3] = 120;
+        TURN_REQ_BOSS[4] = 200;
+        TURN_REQ_BOSS[5] = 320;
+        TURN_REQ_BOSS[6] = 480;
+        TURN_REQ_BOSS[7] = 720;
+        TURN_REQ_BOSS[8] = 1000;
+        TURN_REQ_BOSS[9] = 1400;
+        SLOT_NAMES[0] = "武器";
+        SLOT_NAMES[1] = "头盔";
+        SLOT_NAMES[2] = "衣服";
+        SLOT_NAMES[3] = "项链";
+        SLOT_NAMES[4] = "左手镯";
+        SLOT_NAMES[5] = "右手镯";
+        SLOT_NAMES[6] = "左戒指";
+        SLOT_NAMES[7] = "右戒指";
+        SLOT_NAMES[8] = "腰带";
+        SLOT_NAMES[9] = "鞋子";
+        SLOT_NAMES[10] = "宝石";
+        SLOT_NAMES[11] = "天书";
+        EQUIP_TIER_NAMES[0] = "普通";
+        EQUIP_TIER_NAMES[1] = "高级";
+        EQUIP_TIER_NAMES[2] = "稀有";
+        EQUIP_TIER_NAMES[3] = "史诗";
+        EQUIP_TIER_NAMES[4] = "传说";
+        EQUIP_CLASS_NAMES[0] = "祈祷之刃";   // 武器
+        EQUIP_CLASS_NAMES[1] = "祈祷之盔";   // 头盔
+        EQUIP_CLASS_NAMES[2] = "祈祷之袍";   // 衣服
+        EQUIP_CLASS_NAMES[3] = "天玛项链";   // 项链
+        EQUIP_CLASS_NAMES[4] = "符玛手镯";   // 手镯
+        EQUIP_CLASS_NAMES[5] = "圣战腰带";   // 腰带
+        EQUIP_CLASS_NAMES[6] = "法神之靴";   // 鞋子
+        EQUIP_CLASS_NAMES[7] = "天尊印记";   // 宝石/印记
+        EQUIP_CLASS_ATK_BIAS[0] = 1.0; EQUIP_CLASS_ATK_BIAS[1] = 0.3;
+        EQUIP_CLASS_ATK_BIAS[2] = 0.4; EQUIP_CLASS_ATK_BIAS[3] = 0.5;
+        EQUIP_CLASS_ATK_BIAS[4] = 0.5; EQUIP_CLASS_ATK_BIAS[5] = 0.2;
+        EQUIP_CLASS_ATK_BIAS[6] = 0.2; EQUIP_CLASS_ATK_BIAS[7] = 0.6;
+        EQUIP_CLASS_DEF_BIAS[0] = 0.1; EQUIP_CLASS_DEF_BIAS[1] = 0.7;
+        EQUIP_CLASS_DEF_BIAS[2] = 1.0; EQUIP_CLASS_DEF_BIAS[3] = 0.4;
+        EQUIP_CLASS_DEF_BIAS[4] = 0.6; EQUIP_CLASS_DEF_BIAS[5] = 0.7;
+        EQUIP_CLASS_DEF_BIAS[6] = 0.6; EQUIP_CLASS_DEF_BIAS[7] = 0.4;
+        EQUIP_CLASS_HP_BIAS[0] = 0.0; EQUIP_CLASS_HP_BIAS[1] = 0.3;
+        EQUIP_CLASS_HP_BIAS[2] = 0.6; EQUIP_CLASS_HP_BIAS[3] = 0.3;
+        EQUIP_CLASS_HP_BIAS[4] = 0.4; EQUIP_CLASS_HP_BIAS[5] = 0.6;
+        EQUIP_CLASS_HP_BIAS[6] = 0.4; EQUIP_CLASS_HP_BIAS[7] = 0.4;
+        TIER_ATK[0] = 1.0; TIER_ATK[1] = 1.8; TIER_ATK[2] = 3.0;
+        TIER_ATK[3] = 5.5; TIER_ATK[4] = 10.0;
+        TIER_DEF[0] = 1.0; TIER_DEF[1] = 2.0; TIER_DEF[2] = 3.5;
+        TIER_DEF[3] = 6.0; TIER_DEF[4] = 11.0;
+        TIER_HP[0] = 1.0; TIER_HP[1] = 1.5; TIER_HP[2] = 2.2;
+        TIER_HP[3] = 3.5; TIER_HP[4] = 5.0;
+        TIER_COEF_CAP[0] = 3; TIER_COEF_CAP[1] = 5;
+        TIER_COEF_CAP[2] = 7; TIER_COEF_CAP[3] = 9;
+        TIER_COEF_CAP[4] = 12;
+        TIER_DROP_RATE[0] = 0.55; TIER_DROP_RATE[1] = 0.28;
+        TIER_DROP_RATE[2] = 0.12; TIER_DROP_RATE[3] = 0.04;
+        TIER_DROP_RATE[4] = 0.01;
+        MAP_NAMES[0]  = "银杏小村"; MAP_MIN_FLOOR[0]  = 1;
+        MAP_NAMES[1]  = "比奇省";   MAP_MIN_FLOOR[1]  = 5;
+        MAP_NAMES[2]  = "沃玛森林"; MAP_MIN_FLOOR[2]  = 10;
+        MAP_NAMES[3]  = "半兽人古墓"; MAP_MIN_FLOOR[3]  = 20;
+        MAP_NAMES[4]  = "废弃矿洞"; MAP_MIN_FLOOR[4]  = 35;
+        MAP_NAMES[5]  = "未知暗殿"; MAP_MIN_FLOOR[5]  = 50;
+        MAP_NAMES[6]  = "沃玛寺庙"; MAP_MIN_FLOOR[6]  = 70;
+        MAP_NAMES[7]  = "死亡棺材"; MAP_MIN_FLOOR[7]  = 95;
+        MAP_NAMES[8]  = "祖玛寺庙"; MAP_MIN_FLOOR[8]  = 120;
+        MAP_NAMES[9]  = "霸者大厅"; MAP_MIN_FLOOR[9]  = 150;
+        MAP_NAMES[10] = "赤月峡谷"; MAP_MIN_FLOOR[10] = 180;
+        MAP_NAMES[11] = "重装之家"; MAP_MIN_FLOOR[11] = 220;
+        MAP_NAMES[12] = "魔龙岭";   MAP_MIN_FLOOR[12] = 260;
+        MAP_NAMES[13] = "牛魔寺庙"; MAP_MIN_FLOOR[13] = 300;
+        MAP_NAMES[14] = "骨魔洞窟"; MAP_MIN_FLOOR[14] = 350;
+        MAP_NAMES[15] = "圣域回廊"; MAP_MIN_FLOOR[15] = 420;
+        MAP_NAMES[16] = "镇魔神殿"; MAP_MIN_FLOOR[16] = 500;
+        MAP_NAMES[17] = "盘古之地"; MAP_MIN_FLOOR[17] = 620;
+        MAP_NAMES[18] = "上古战场"; MAP_MIN_FLOOR[18] = 780;
+        MAP_NAMES[19] = "诛仙伏魔殿"; MAP_MIN_FLOOR[19] = 1000;
+        BOSS_NAMES[0] = "沃玛教主"; BOSS_LV[0] = 25;
+        BOSS_HP_BASE[0] = 800; BOSS_HP_GROWTH[0] = 1.0;
+        BOSS_NAMES[1] = "祖玛教主"; BOSS_LV[1] = 35;
+        BOSS_HP_BASE[1] = 2400; BOSS_HP_GROWTH[1] = 1.4;
+        BOSS_NAMES[2] = "赤月恶魔"; BOSS_LV[2] = 45;
+        BOSS_HP_BASE[2] = 6000; BOSS_HP_GROWTH[2] = 1.7;
+        BOSS_NAMES[3] = "魔龙教主"; BOSS_LV[3] = 70;
+        BOSS_HP_BASE[3] = 18000; BOSS_HP_GROWTH[3] = 2.1;
+        BOSS_NAMES[4] = "牛魔王"; BOSS_LV[4] = 80;
+        BOSS_HP_BASE[4] = 36000; BOSS_HP_GROWTH[4] = 2.6;
+        BOSS_NAMES[5] = "二转守卫"; BOSS_LV[5] = 100;
+        BOSS_HP_BASE[5] = 80000; BOSS_HP_GROWTH[5] = 3.2;
+        BOSS_NAMES[6] = "五转守卫"; BOSS_LV[6] = 140;
+        BOSS_HP_BASE[6] = 200000; BOSS_HP_GROWTH[6] = 4.0;
+        BOSS_NAMES[7] = "七转守卫"; BOSS_LV[7] = 180;
+        BOSS_HP_BASE[7] = 500000; BOSS_HP_GROWTH[7] = 4.8;
+        WORLD_BOSS_DAMAGE_PER_HIT[0] = 800.0;     // 无装备
+        WORLD_BOSS_DAMAGE_PER_HIT[1] = 6000.0;
+        WORLD_BOSS_DAMAGE_PER_HIT[2] = 40000.0;
+        WORLD_BOSS_DAMAGE_PER_HIT[3] = 200000.0;
+        WORLD_BOSS_DAMAGE_PER_HIT[4] = 1200000.0;
+        CUR_NAMES[0] = "金币"; CUR_NAMES[1] = "元宝"; CUR_NAMES[2] = "声望";
+        CUR_NAMES[3] = "战功"; CUR_NAMES[4] = "灵符"; CUR_NAMES[5] = "红包";
+        CUR_NAMES[6] = "积分";
+        CUR_ICONS[0] = "icon_gold";   CUR_ICONS[1] = "icon_crystal";
+        CUR_ICONS[2] = "icon_iron";   CUR_ICONS[3] = "icon_core";
+        CUR_ICONS[4] = "icon_copper"; CUR_ICONS[5] = "icon_gold";
+        CUR_ICONS[6] = "icon_crystal";
+        TITLE_PAGE_NAMES[0]  = "筑基";  TITLE_PAGE_NAMES[1]  = "开光";
+        TITLE_PAGE_NAMES[2]  = "融合";  TITLE_PAGE_NAMES[3]  = "金丹";
+        TITLE_PAGE_NAMES[4]  = "元婴";  TITLE_PAGE_NAMES[5]  = "出窍";
+        TITLE_PAGE_NAMES[6]  = "分神";  TITLE_PAGE_NAMES[7]  = "合体";
+        TITLE_PAGE_NAMES[8]  = "大乘";  TITLE_PAGE_NAMES[9]  = "渡劫";
+        TITLE_PAGE_NAMES[10] = "地仙";  TITLE_PAGE_NAMES[11] = "天仙";
+        TITLE_PAGE_NAMES[12] = "玄仙";  TITLE_PAGE_NAMES[13] = "金仙";
+        TITLE_PAGE_NAMES[14] = "太乙";  TITLE_PAGE_NAMES[15] = "大罗";
+        TITLE_PAGE_NAMES[16] = "准圣";  TITLE_PAGE_NAMES[17] = "圣人";
+        TITLE_PAGE_NAMES[18] = "天尊";  TITLE_PAGE_NAMES[19] = "道祖";
+        TITLE_PAGE_NAMES[20] = "传奇";
+        NOBLE_NAMES[0] = "男爵";   NOBLE_DONATE[0] = 500;
+        NOBLE_NAMES[1] = "子爵";   NOBLE_DONATE[1] = 2000;
+        NOBLE_NAMES[2] = "伯爵";   NOBLE_DONATE[2] = 8000;
+        NOBLE_NAMES[3] = "侯爵";   NOBLE_DONATE[3] = 30000;
+        NOBLE_NAMES[4] = "公爵";   NOBLE_DONATE[4] = 100000;
+        NOBLE_NAMES[5] = "亲王";   NOBLE_DONATE[5] = 500000;
+        NOBLE_ALL_PCT[0] = 0.02;  NOBLE_ALL_PCT[1] = 0.04;
+        NOBLE_ALL_PCT[2] = 0.07;  NOBLE_ALL_PCT[3] = 0.10;
+        NOBLE_ALL_PCT[4] = 0.15;  NOBLE_ALL_PCT[5] = 0.20;
+        NOBLE_SPEED_PCT[0] = 0.01; NOBLE_SPEED_PCT[1] = 0.02;
+        NOBLE_SPEED_PCT[2] = 0.04; NOBLE_SPEED_PCT[3] = 0.06;
+        NOBLE_SPEED_PCT[4] = 0.08; NOBLE_SPEED_PCT[5] = 0.10;
+        NOBLE_XP_PCT[0] = 0.05;   NOBLE_XP_PCT[1] = 0.10;
+        NOBLE_XP_PCT[2] = 0.20;   NOBLE_XP_PCT[3] = 0.30;
+        NOBLE_XP_PCT[4] = 0.40;   NOBLE_XP_PCT[5] = 0.50;
+        WUXING_NAMES[0] = "金"; WUXING_NAMES[1] = "木";
+        WUXING_NAMES[2] = "水"; WUXING_NAMES[3] = "火";
+        WUXING_NAMES[4] = "土";
+        CARD_POOL_NAMES[0] = "古代神兵";
+        CARD_POOL_NAMES[1] = "上古神器";
+        CARD_POOL_NAMES[2] = "仙道名山";
+        CARD_POOL_NAMES[3] = "洪荒异兽";
+        CARD_POOL_NAMES[4] = "名将传奇";
+        CARD_POOL_NAMES[5] = "修真门派";
+        CARD_POOL_NAMES[6] = "神话传说";
+        CARD_POOL_NAMES[7] = "武林豪杰";
+        ALBUM_NAMES[0] = "祈祷套装";
+        ALBUM_NAMES[1] = "天玛套装";
+        ALBUM_NAMES[2] = "符玛套装";
+        ALBUM_NAMES[3] = "圣战套装";
+        ALBUM_NAMES[4] = "法神套装";
+        ALBUM_NAMES[5] = "天尊套装";
+        ALBUM_NAMES[6] = "战神套装";
+        ALBUM_NAMES[7] = "魔龙套装";
+        ALBUM_NAMES[8] = "传说套装";
+        DIAN_TANG_NAMES[0] = "武器之攻"; DIAN_TANG_NAMES[1] = "武器之法";
+        DIAN_TANG_NAMES[2] = "武器之道"; DIAN_TANG_NAMES[3] = "铠甲之首";
+        DIAN_TANG_NAMES[4] = "头盔之首";
+        DIAN_TANG_COST_LF[0] = 100; DIAN_TANG_COST_LF[1] = 80;
+        DIAN_TANG_COST_LF[2] = 80;  DIAN_TANG_COST_LF[3] = 60;
+        DIAN_TANG_COST_LF[4] = 40;
+        XB_PRIZE_NAMES[0]  = "金币×10万";  XB_PRIZE_VAL[0]  = 5;   XB_PRIZE_RATE[0]  = 0.30;
+        XB_PRIZE_NAMES[1]  = "经验×5万";   XB_PRIZE_VAL[1]  = 5;   XB_PRIZE_RATE[1]  = 0.22;
+        XB_PRIZE_NAMES[2]  = "声望×100";   XB_PRIZE_VAL[2]  = 6;   XB_PRIZE_RATE[2]  = 0.15;
+        XB_PRIZE_NAMES[3]  = "战功×50";    XB_PRIZE_VAL[3]  = 6;   XB_PRIZE_RATE[3]  = 0.08;
+        XB_PRIZE_NAMES[4]  = "黑铁×100";   XB_PRIZE_VAL[4]  = 8;   XB_PRIZE_RATE[4]  = 0.06;
+        XB_PRIZE_NAMES[5]  = "传说矿石×20";XB_PRIZE_VAL[5]  = 10;  XB_PRIZE_RATE[5]  = 0.04;
+        XB_PRIZE_NAMES[6]  = "符文 1#×3";  XB_PRIZE_VAL[6]  = 8;   XB_PRIZE_RATE[6]  = 0.04;
+        XB_PRIZE_NAMES[7]  = "符文 5#×1";  XB_PRIZE_VAL[7]  = 12;  XB_PRIZE_RATE[7]  = 0.015;
+        XB_PRIZE_NAMES[8]  = "龙珠 1★×5"; XB_PRIZE_VAL[8]  = 25;  XB_PRIZE_RATE[8]  = 0.005;
+        XB_PRIZE_NAMES[9]  = "屠龙宝刀";   XB_PRIZE_VAL[9]  = 200; XB_PRIZE_RATE[9]  = 0.0008;
+        XB_PRIZE_NAMES[10] = "元宝×1000";  XB_PRIZE_VAL[10] = 100; XB_PRIZE_RATE[10] = 0.003;
+        XB_PRIZE_NAMES[11] = "灵符×50";    XB_PRIZE_VAL[11] = 20;  XB_PRIZE_RATE[11] = 0.027;
+        ALTAR_DONATE_GOLD[0] = 1;   ALTAR_DONATE_PROG[0] = 1;
+        ALTAR_DONATE_GOLD[1] = 10;  ALTAR_DONATE_PROG[1] = 2;
+        ALTAR_DONATE_GOLD[2] = 100; ALTAR_DONATE_PROG[2] = 1;
+        ALTAR_DONATE_GOLD[3] = 500; ALTAR_DONATE_PROG[3] = 4;
+        ALTAR_DONATE_GOLD[4] = 100; ALTAR_DONATE_PROG[4] = 5; // 100 元宝
+        SHOP_GOODS_NAME[0]  = "改名卡";       SHOP_GOODS_PRICE_YB[0]  = 12800; SHOP_GOODS_PRICE_GOLD[0]  = 0; SHOP_GOODS_PRICE_LF[0] = 0;
+        SHOP_GOODS_NAME[1]  = "黄金钥匙";     SHOP_GOODS_PRICE_YB[1]  = 1000;  SHOP_GOODS_PRICE_GOLD[1]  = 0; SHOP_GOODS_PRICE_LF[1] = 0;
+        SHOP_GOODS_NAME[2]  = "黑铁矿石×10";  SHOP_GOODS_PRICE_YB[2]  = 10;    SHOP_GOODS_PRICE_GOLD[2]  = 0; SHOP_GOODS_PRICE_LF[2] = 0;
+        SHOP_GOODS_NAME[3]  = "符文 1#×1";    SHOP_GOODS_PRICE_YB[3]  = 100;   SHOP_GOODS_PRICE_GOLD[3]  = 0; SHOP_GOODS_PRICE_LF[3] = 0;
+        SHOP_GOODS_NAME[4]  = "符文 10#×1";   SHOP_GOODS_PRICE_YB[4]  = 2000;  SHOP_GOODS_PRICE_GOLD[4]  = 0; SHOP_GOODS_PRICE_LF[4] = 0;
+        SHOP_GOODS_NAME[5]  = "祝福油×10";    SHOP_GOODS_PRICE_YB[5]  = 380;   SHOP_GOODS_PRICE_GOLD[5]  = 0; SHOP_GOODS_PRICE_LF[5] = 0;
+        SHOP_GOODS_NAME[6]  = "超级祝福油×5"; SHOP_GOODS_PRICE_YB[6]  = 998;   SHOP_GOODS_PRICE_GOLD[6]  = 0; SHOP_GOODS_PRICE_LF[6] = 0;
+        SHOP_GOODS_NAME[7]  = "仓库扩充卷×1"; SHOP_GOODS_PRICE_YB[7]  = 5000;  SHOP_GOODS_PRICE_GOLD[7]  = 0; SHOP_GOODS_PRICE_LF[7] = 0;
+        SHOP_GOODS_NAME[8]  = "魂灵×10";     SHOP_GOODS_PRICE_YB[8]  = 1280;  SHOP_GOODS_PRICE_GOLD[8]  = 0; SHOP_GOODS_PRICE_LF[8] = 0;
+        SHOP_GOODS_NAME[9]  = "金砖礼包";     SHOP_GOODS_PRICE_YB[9]  = 1080;  SHOP_GOODS_PRICE_GOLD[9]  = 0; SHOP_GOODS_PRICE_LF[9] = 0;
+        SHOP_GOODS_NAME[10] = "灵石礼包";     SHOP_GOODS_PRICE_YB[10] = 2580;  SHOP_GOODS_PRICE_GOLD[10] = 0; SHOP_GOODS_PRICE_LF[10] = 0;
+        SHOP_GOODS_NAME[11] = "秘境礼包";     SHOP_GOODS_PRICE_YB[11] = 988;   SHOP_GOODS_PRICE_GOLD[11] = 0; SHOP_GOODS_PRICE_LF[11] = 0;
+        FORGE_MODES[0]  = "金币洗炼";  FORGE_MODES[1]  = "元宝洗炼";
+        FORGE_MODES[2]  = "幸运传承";  FORGE_MODES[3]  = "升级锻造";
+        FORGE_MODES[4]  = "淬炼锻造";  FORGE_MODES[5]  = "符文锻造";
+        FORGE_MODES[6]  = "灵符锻造";  FORGE_MODES[7]  = "符文之语";
+        FORGE_MODES[8]  = "龙珠锻造";  FORGE_MODES[9]  = "天书传承";
+        FORGE_MODES[10] = "传说锻造";
+        YABIAO_GOLD[0] = 50000;
+        YABIAO_GOLD[1] = 250000;
+        YABIAO_GOLD[2] = 1000000;
+        CITY_PRODUCE[0] = 500000;  CITY_PRODUCE[1] = 700000;
+        CITY_PRODUCE[2] = 900000;  CITY_PRODUCE[3] = 1200000;
+        CITY_PRODUCE[4] = 1800000; CITY_PRODUCE[5] = 2400000;
+        CITY_PRODUCE[6] = 3500000; CITY_PRODUCE[7] = 5000000;
+        TOWER_HP_MULT[0] = 1.0;  TOWER_HP_MULT[1] = 1.8;
+        TOWER_HP_MULT[2] = 3.2;  TOWER_HP_MULT[3] = 6.0;
+        TOWER_HP_MULT[4] = 12.0;
+        PK_HOURLY[0] = 1000; PK_HOURLY[1] = 800; PK_HOURLY[2] = 600;
+        PK_HOURLY[3] = 500;
+        for (int i = 4; i < 8; i = i + 1) { PK_HOURLY[i] = 400; }
+        for (int i = 8; i < 10; i = i + 1) { PK_HOURLY[i] = 200; }
+        TUTOR_OUT_GIFT[0] = 5; TUTOR_OUT_GIFT[1] = 10; TUTOR_OUT_GIFT[2] = 20;
+        RECYCLE_GOLD_PER_TIER[0] = 800;     RECYCLE_GOLD_PER_TIER[1] = 4500;
+        RECYCLE_GOLD_PER_TIER[2] = 18000;   RECYCLE_GOLD_PER_TIER[3] = 80000;
+        RECYCLE_GOLD_PER_TIER[4] = 320000;
+        RECYCLE_EXP_PER_TIER[0]  = 50;      RECYCLE_EXP_PER_TIER[1]  = 400;
+        RECYCLE_EXP_PER_TIER[2]  = 1800;    RECYCLE_EXP_PER_TIER[3]  = 9000;
+        RECYCLE_EXP_PER_TIER[4]  = 50000;
+        RECYCLE_ZG_PER_TIER[0]   = 0;       RECYCLE_ZG_PER_TIER[1]   = 2;
+        RECYCLE_ZG_PER_TIER[2]   = 8;       RECYCLE_ZG_PER_TIER[3]   = 30;
+        RECYCLE_ZG_PER_TIER[4]   = 120;
+        RECYCLE_SW_PER_TIER[0]   = 5;       RECYCLE_SW_PER_TIER[1]   = 25;
+        RECYCLE_SW_PER_TIER[2]   = 100;     RECYCLE_SW_PER_TIER[3]   = 400;
+        RECYCLE_SW_PER_TIER[4]   = 1500;
+        RECYCLE_RB_PER_TIER[0]   = 0;       RECYCLE_RB_PER_TIER[1]   = 1;
+        RECYCLE_RB_PER_TIER[2]   = 5;       RECYCLE_RB_PER_TIER[3]   = 20;
+        RECYCLE_RB_PER_TIER[4]   = 80;
+        RECYCLE_YB_PER_TIER[0]   = 0;       RECYCLE_YB_PER_TIER[1]   = 0;
+        RECYCLE_YB_PER_TIER[2]   = 1;       RECYCLE_YB_PER_TIER[3]   = 5;
+        RECYCLE_YB_PER_TIER[4]   = 20;
+        RECYCLE_JF_PER_TIER[0]   = 1;       RECYCLE_JF_PER_TIER[1]   = 6;
+        RECYCLE_JF_PER_TIER[2]   = 24;      RECYCLE_JF_PER_TIER[3]   = 100;
+        RECYCLE_JF_PER_TIER[4]   = 400;
+        ACHV_CAT_NAMES[0] = "等级奖励";
+        ACHV_CAT_NAMES[1] = "幻境奖励";
+        ACHV_CAT_NAMES[2] = "属性突破";
+        ACHV_CAT_NAMES[3] = "BOSS 挑战";
+        ACHV_CAT_NAMES[4] = "推图记录";
+        ACHV_CAT_NAMES[5] = "推广拉新";
+        CHARGE_TIERS[0] = 6;     CHARGE_YB[0] = 60;
+        CHARGE_TIERS[1] = 30;    CHARGE_YB[1] = 300;
+        CHARGE_TIERS[2] = 98;    CHARGE_YB[2] = 980;
+        CHARGE_TIERS[3] = 198;   CHARGE_YB[3] = 1980;
+        CHARGE_TIERS[4] = 488;   CHARGE_YB[4] = 4880;
+        CHARGE_TIERS[5] = 988;   CHARGE_YB[5] = 9880;
+        CHARGE_TIERS[6] = 1988;  CHARGE_YB[6] = 19880;
+        VIP_THRESHOLD[0] = 200;     // 会员
+        VIP_THRESHOLD[1] = 2000;    // 终身
+        VIP_THRESHOLD[2] = 20000;   // 超级终身
+        OFFLINE_CAP_VIP[0] = 24;
+        OFFLINE_CAP_VIP[1] = 48;
+        OFFLINE_CAP_VIP[2] = 72;
+        MAIN_TOP = TITLE_BAR_H + NAV_ROW_H * NAV_ROWS;
+    }
+}

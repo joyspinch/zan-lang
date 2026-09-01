@@ -1,0 +1,1761 @@
+// 传奇放置挂机 — 状态模型 + 核心机制。
+// 一切运行时状态、战斗/洗炼/回收/寻宝/影子榜种子都在这里。UI 只读不写,
+// 通过 Game 的 public 方法推进。
+using System;
+using System.IO;
+using SDL3;
+using GameKit;
+
+namespace Legend;
+
+// 单件装备(背包与装备共用)
+class Item {
+    public int slot;       // Data.SLOT_* 槽位
+    public int tier;       // 0..4 (普通..传说)
+    public int coef;       // 系数 (1..TIER_COEF_CAP[tier])
+    public int cls;        // 0..7 EQUIP_CLASS_NAMES
+    public int seed;       // Rng 种子(用于复现属性)
+
+    public static Item New(int slot, int tier, int coef, int cls, int seed) {
+        Item it = new Item();
+        it.slot = slot;
+        it.tier = tier;
+        it.coef = coef;
+        it.cls = cls;
+        it.seed = seed;
+        return it;
+    }
+    public string Name() {
+        return Data.EQUIP_CLASS_NAMES[this.cls] + "+" + this.coef;
+    }
+    public string IconKey() {
+        return "equip_c" + this.cls + "_t" + this.tier;
+    }
+}
+
+// 玩家完整状态(可序列化)
+class Player {
+    public string name;       // 角色名(默认"看见啥的就是")
+    public int cls;           // 0 战士 / 1 法师 / 2 道士
+    public int lv;            // 当前等级
+    public long xp;           // 累计经验
+    public int turn;          // 转生次数(0..9)
+    public long bossKilled;   // 累计击破 BOSS 层数(用于转生判定)
+    public long totalKills;   // 累计击杀数(称谓用)
+    public long[] cur = new long[Data.CUR_COUNT]; // 货币
+    public int vip;           // 0 普通 / 1 终身 / 2 超会
+    public long chargeTotal;  // 累计充值(分)
+
+    // 装备 12 槽
+    public Item[] equip = new Item[Data.SLOT_COUNT];
+    // 背包(最多 60 格)
+    public Item[] bag = new Item[60];
+    public int bagCnt;
+    // 仓库(简化:不单独实现,合并到背包上限 200)
+
+    // 幻境
+    public int hjFloor;        // 当前层
+    public int hjKills;        // 当前层已击杀数
+    public int hjTarget;       // 当前层目标击杀数
+    public int hjBest;         // 历史最高层
+    public long hjKillAcc;     // 幻境累计击杀
+    // 秘境
+    public int mjUnlocked;
+    public int mjBest;
+    public int mjFloor;
+    public int mjKills;
+
+    // BOSS 之家
+    public int[] bhKilled = new int[8];  // 每只击破次数(今日)
+    public int bhTriesLeft;
+    public long lastDayTs;     // 日刷新锚
+    public long lastSeenTs;    // 离线锚
+
+    // 称谓
+    public int titlePage;      // 当前页(0..20)
+    public int titleRank;      // 当前阶(0..4)
+    public long titleMask;     // 21×5 已解锁位图
+
+    // 爵位
+    public long donateAcc;     // 累计捐献元宝
+    public int nobleTier;      // 0..5
+
+    // 五行
+    public long[] wuxingMs = new long[5];   // 各槽累计修炼毫秒
+
+    // 将星图谱:8 池 × 12 卡 × 10 转
+    public int[] cardMask;     // bit = 已激活(8*12*10 = 960 位,需 15 long)
+    public int cardMaskLen = 15;
+    public long tupuScore;     // 图谱积分
+
+    // 图鉴 9 组 × 10 槽(简化:每组记录一个最弱系数)
+    public int[] albumMinCoef = new int[Data.SLOT_COUNT * 9]; // 占位;实存 Item
+
+    // 至尊极品殿堂:5 页(每页只记一件当前最强)
+    public Item[] dtBest = new Item[5];
+    public int dtCount;        // 已登记件数
+
+    // 寻宝
+    public int xbTickets;      // 当前寻宝图
+    public long xbLastDayMs;
+    public int[] xbPool;       // 今日奖池 12 项抽奖次数
+
+    // 祭坛
+    public int altarMyProg;    // 个人进度
+    public int altarGlobalProg;
+
+    // 商店/回收/铁匠铺
+    public long shopLastDayMs;
+
+    // 成就:48 条 → bitmap 用 1 long
+    public long achvMask;
+    public int achvClaimed;
+
+    // 排行榜:自己的快照(用于影子榜生成)
+    public long rkGold;
+    public int rkLevel;
+
+    // PK / 押镖 / 钱庄 / 塔 / 师徒
+    public int pkTriesLeft;
+    public int ybTriesLeft;
+    public int jbTriesLeft;
+    public int towerBest;
+    public int cityOwned;      // -1 无 / 0..7
+    public long cityLastMs;
+    public int masterTier;     // 0=无师父 1=已拜师 2=师父
+    public string masterName;
+    public int studentCount;
+
+    // 邮箱附件(8 格)
+    public Item[] mailAttach = new Item[8];
+    public long[] mailQty = new long[8];
+    public string[] mailTitle = new string[8];
+    public int mailCnt;
+
+    // 聊天/广播 log(最多 80 条)
+    public string[] chatLog = new string[80];
+    public int chatCnt;
+    public long lastBroadcastMs;
+
+    // 世界 BOSS 伤害(今日)
+    public long wbDamage;
+    public int wbTriesLeft;
+
+    // 帮会
+    public bool hasGuild;
+    public string guildName;
+    public long guildGold;
+
+    // 设置
+    public bool bossKey;        // F10 一键隐藏
+    public double uiScale;      // 80..300
+    public bool silent;         // 静默战斗
+    public int filterMinCoef;   // 装备过滤:只保留 ≥ 此系数
+    public int bagSizeBase = 60;
+
+    // 沙巴克、行会战等纯展示用
+    public int pkRankPos;       // 影子榜当前位置
+
+    public Player() {
+        this.cardMask = new int[this.cardMaskLen];
+        this.titleMask = 0;
+        for (int i = 0; i < Data.CUR_COUNT; i = i + 1) { this.cur[i] = 0; }
+    }
+}
+
+// 主游戏逻辑容器(全局单例)
+class Game {
+    public Player p;           // 当前玩家
+    public Rng rng;            // 玩家 Rng(种子由 best 派生)
+    public bool bossMode;      // F10 老板键隐藏态(UI 用)
+
+    // 全服影子榜种子(派生自玩家 best,确定性)
+    public long rkSeed;
+
+    // 战斗瞬时状态
+    public long curMonsterHp;  // 当前怪 HP
+    public long curMonsterHpMax;
+    public int curMonsterLvl;
+    public bool curIsBoss;
+    public int curMonsterIcon; // 0 普通 1 BOSS
+    public string curMonsterName;
+
+    // 飘字 / 战斗日志(简化)
+    public string battleLog;
+    public long lastHitTs;
+    public long totalDamageDealt;
+    // 出手节拍累加器(秒),不存档
+    public double atkAcc;
+    // 自动换装开关(掉落即穿更强的一件)
+    public bool autoEquip;
+
+    public Game() {
+        this.p = new Player();
+        this.bossMode = false;
+        this.autoEquip = true;
+    }
+
+    // ---------------------------------------------------------------
+    // 初始化
+    // ---------------------------------------------------------------
+    public void NewGame(string name, int cls) {
+        this.p = new Player();
+        this.p.name = name;
+        this.p.cls = cls;
+        this.p.lv = 1;
+        this.p.xp = 0;
+        this.p.turn = 0;
+        this.p.bagCnt = 0;
+        for (int i = 0; i < Data.SLOT_COUNT; i = i + 1) { this.p.equip[i] = null; }
+        // 初始货币
+        this.p.cur[Data.CUR_GOLD] = 1000;
+        this.p.cur[Data.CUR_YB] = 100;
+        this.p.cur[Data.CUR_SW] = 50;
+        // 初始幻境
+        this.p.hjFloor = 1;
+        this.p.hjKills = 0;
+        this.p.hjTarget = Data.HJ_KILL_TARGET;
+        // 初始 Rng 种子
+        long seed = 1234567L ^ ((long)cls * 1009L);
+        this.rng = Rng.Seed(seed);
+        this.rkSeed = seed;
+        // 初始怪物
+        this.SpawnMonster(this.p.hjFloor, false);
+        // 初始日锚
+        this.p.lastDayTs = Game.NowMs();
+        this.p.lastSeenTs = this.p.lastDayTs;
+        // 初始寻宝图
+        this.p.xbTickets = 3;
+        // 初始免费装备:1 件 t0 武器
+        Item starter = Item.New(Data.SLOT_WEAPON, 0, 1, 0, 1);
+        this.AddToBag(starter);
+        // BOSS 之家次数
+        this.p.bhTriesLeft = Data.BOSS_HOME_TRIES;
+        // PK 次数
+        this.p.pkTriesLeft = Data.PK_TRIES;
+        // 押镖/劫镖
+        this.p.ybTriesLeft = Data.YABIAO_TRIES;
+        this.p.jbTriesLeft = Data.JIEBIAO_TRIES;
+        // 世界 BOSS
+        this.p.wbTriesLeft = Data.WORLD_BOSS_TRIES;
+        // 邮箱
+        this.p.mailCnt = 0;
+        // 聊天
+        this.p.chatCnt = 0;
+        this.AddChat("欢迎进入传奇世界");
+        this.AddChat("请先到「地图传送」选择地图,然后开始挂机");
+        this.AddChat("提示:点 幻境 可直接进入挂机");
+    }
+
+    // ---------------------------------------------------------------
+    // 时间与日刷新
+    // ---------------------------------------------------------------
+    public static long NowMs() {
+        return (long)(DateTime.UtcNow().ToUnixSeconds() * 1000.0);
+    }
+    public bool IsNewDay() {
+        long now = Game.NowMs();
+        return now - this.p.lastDayTs >= Data.DAY_MS;
+    }
+    public void DayReset() {
+        // 每日刷新的资源
+        this.p.bhTriesLeft = Data.BOSS_HOME_TRIES;
+        this.p.pkTriesLeft = Data.PK_TRIES;
+        this.p.ybTriesLeft = Data.YABIAO_TRIES;
+        this.p.jbTriesLeft = Data.JIEBIAO_TRIES;
+        this.p.wbTriesLeft = Data.WORLD_BOSS_TRIES;
+        this.p.wbDamage = 0;
+        this.p.altarMyProg = 0;
+        this.p.altarGlobalProg = (int)(this.rng.Range(4000, 6500));
+        // 寻宝奖池:清空
+        this.p.xbPool = new int[Data.XB_POOL_SIZE];
+        this.p.xbLastDayMs = Game.NowMs();
+        // 终身会员签到送寻宝图
+        if (this.p.vip >= 1) { this.p.xbTickets = this.p.xbTickets + 2; }
+        if (this.p.vip >= 2) { this.p.xbTickets = this.p.xbTickets + 3; }
+        this.p.lastDayTs = Game.NowMs();
+        this.AddChat("[系统] 每日 0 点刷新:寻宝奖池 / 个人 BOSS 次数 / 押镖次数");
+    }
+
+    // ---------------------------------------------------------------
+    // 玩家属性计算
+    // ---------------------------------------------------------------
+    public int BaseHp() {
+        if (this.p.cls == 0) { return Data.BASE_HP_W + (int)((this.p.lv - 1) * 4.5); }
+        if (this.p.cls == 1) { return Data.BASE_HP_M + (int)((this.p.lv - 1) * 3.0); }
+        return Data.BASE_HP_T + (int)((this.p.lv - 1) * 3.8);
+    }
+    public int BaseMp() {
+        if (this.p.cls == 0) { return Data.BASE_MP_W + (int)((this.p.lv - 1) * 1.0); }
+        if (this.p.cls == 1) { return Data.BASE_MP_M + (int)((this.p.lv - 1) * 4.0); }
+        return Data.BASE_MP_T + (int)((this.p.lv - 1) * 3.2);
+    }
+    public int BaseAcMin() {
+        double b = 0;
+        if (this.p.cls == 0) { b = Data.BASE_AC_W; }
+        else if (this.p.cls == 1) { b = Data.BASE_AC_M; }
+        else { b = Data.BASE_AC_T; }
+        return (int)(b + (this.p.lv - 1) * (1.6 + this.p.turn * 0.4));
+    }
+    public int BaseAcMax() {
+        return (int)(this.BaseAcMin() * 1.18);
+    }
+    public int BaseDef() {
+        return Data.BASE_DEF + (int)((this.p.lv - 1) * 0.8);
+    }
+    public int BaseMDef() {
+        return Data.BASE_MDEF + (int)((this.p.lv - 1) * 0.8);
+    }
+
+    // 装备总加成(12 槽)
+    public int EquipAtk() {
+        int v = 0;
+        for (int i = 0; i < Data.SLOT_COUNT; i = i + 1) {
+            Item it = this.p.equip[i];
+            if (it == null) { continue; }
+            double tierMult = Data.TIER_ATK[it.tier];
+            double clsMult = Data.EQUIP_CLASS_ATK_BIAS[it.cls];
+            v = v + (int)(tierMult * clsMult * it.coef * (1.0 + it.coef * 0.18));
+        }
+        return v;
+    }
+    public int EquipDef() {
+        int v = 0;
+        for (int i = 0; i < Data.SLOT_COUNT; i = i + 1) {
+            Item it = this.p.equip[i];
+            if (it == null) { continue; }
+            double tierMult = Data.TIER_DEF[it.tier];
+            double clsMult = Data.EQUIP_CLASS_DEF_BIAS[it.cls];
+            v = v + (int)(tierMult * clsMult * it.coef * 0.9);
+        }
+        return v;
+    }
+    public int EquipHp() {
+        int v = 0;
+        for (int i = 0; i < Data.SLOT_COUNT; i = i + 1) {
+            Item it = this.p.equip[i];
+            if (it == null) { continue; }
+            double tierMult = Data.TIER_HP[it.tier];
+            double clsMult = Data.EQUIP_CLASS_HP_BIAS[it.cls];
+            v = v + (int)(tierMult * clsMult * it.coef * 12);
+        }
+        return v;
+    }
+
+    // 全属性(基础 + 装备 + 爵位 + 五行 + 将星 + 图鉴 + 殿堂 + 装备基数)
+    public int TotalAcMin() {
+        int raw = this.BaseAcMin() + this.EquipAtk();
+        double pct = this.AllPct();
+        return (int)(raw * (1.0 + pct));
+    }
+    public int TotalAcMax() {
+        int raw = this.BaseAcMax() + this.EquipAtk();
+        double pct = this.AllPct();
+        return (int)(raw * (1.0 + pct));
+    }
+    public int TotalDef() {
+        int raw = this.BaseDef() + this.EquipDef();
+        double pct = this.AllPct();
+        return (int)(raw * (1.0 + pct));
+    }
+    public int TotalMDef() {
+        return (int)((this.BaseMDef() + this.EquipDef() / 2) * (1.0 + this.AllPct()));
+    }
+    public int TotalHp() {
+        return this.BaseHp() + this.EquipHp();
+    }
+    // 出手速度:基础值 + 等级与转生加成(仅用于压缩出手间隔)
+    public int TotalSpeed() {
+        int s = Data.BASE_SPEED;
+        s = s + this.p.lv / 20;
+        s = s + this.p.turn * 2;
+        return s;
+    }
+    public double AllPct() {
+        double pct = 0;
+        if (this.p.nobleTier >= 0) {
+            pct = pct + Data.NOBLE_ALL_PCT[this.p.nobleTier];
+        }
+        // 五行加成(简化为每槽 0.5% × 修为阶)
+        long maxWx = 0;
+        for (int i = 0; i < 5; i = i + 1) {
+            if (this.p.wuxingMs[i] > maxWx) { maxWx = this.p.wuxingMs[i]; }
+        }
+        int wxLvl = (int)(maxWx / 3600000L);  // 1h 修为 = 1 阶
+        if (wxLvl > 100) { wxLvl = 100; }
+        pct = pct + wxLvl * 0.002;
+        // 将星加成(简化:每张已激活 +0.05%)
+        int cards = 0;
+        for (int i = 0; i < this.p.cardMaskLen; i = i + 1) {
+            int m = this.p.cardMask[i];
+            while (m > 0) { cards = cards + (m & 1); m = m >> 1; }
+        }
+        pct = pct + cards * 0.0005;
+        // 殿堂登记 +0.5%
+        pct = pct + this.p.dtCount * 0.005;
+        return pct;
+    }
+
+    // ---------------------------------------------------------------
+    // 经验与升级
+    // ---------------------------------------------------------------
+    public long ExpForLv(int lv) {
+        return (long)(Data.EXP_BASE * Math.Pow(lv, Data.EXP_POW));
+    }
+    public int MaxLv() {
+        return Data.MAX_LV_PER_TURN_BASE + Data.MAX_LV_PER_TURN_STEP * this.p.turn;
+    }
+    public void GainXp(long amount) {
+        if (this.p.lv >= this.MaxLv()) {
+            // 已满级(需转生才能继续升级):经验不再累积,避免数值虚高
+            this.p.xp = 0;
+            return;
+        }
+        this.p.xp = this.p.xp + amount;
+        while (this.p.lv < this.MaxLv()) {
+            long need = this.ExpForLv(this.p.lv);
+            if (this.p.xp < need) { break; }
+            this.p.xp = this.p.xp - need;
+            this.p.lv = this.p.lv + 1;
+            this.AddChat("[系统] 恭喜升级到 " + this.p.lv + " 级");
+            // 升级广播(触发系统广播)
+            this.battleLog = "升级 +" + this.p.lv;
+        }
+    }
+    public bool CanTurn() {
+        if (this.p.turn >= Data.TURN_MAX) { return false; }
+        if (this.p.lv < Data.MAX_LV_PER_TURN_BASE) { return false; }
+        int next = this.p.turn + 1;
+        if (this.p.bossKilled < Data.TURN_REQ_BOSS[next]) { return false; }
+        return true;
+    }
+    public void DoTurn() {
+        if (!this.CanTurn()) { return; }
+        this.p.turn = this.p.turn + 1;
+        // 转生回 1 级,获得转生加成
+        this.p.lv = 1;
+        this.p.xp = 0;
+        // 转生附赠:声望 + 转生 × 1000
+        this.p.cur[Data.CUR_SW] = this.p.cur[Data.CUR_SW] + this.p.turn * 1000;
+        // 激活秘境
+        if (this.p.turn >= Data.MJ_UNLOCK_TURN) { this.p.mjUnlocked = 1; }
+        this.AddChat("[系统] 转生成功!当前 " + this.p.turn + " 转");
+    }
+
+    // ---------------------------------------------------------------
+    // 幻境战斗
+    // ---------------------------------------------------------------
+    // 只算数值、不改动战斗状态(离线结算探层用)
+    public static long MonsterHpOf(int floor, bool isBoss) {
+        if (floor < 1) { floor = 1; }
+        double hp = Data.HJ_HP_BASE * Math.Pow(Data.HJ_HP_GROWTH, floor - 1);
+        if (isBoss) { hp = hp * Data.HJ_BOSS_HP_MULT; }
+        return (long)hp;
+    }
+
+    public void SpawnMonster(int floor, bool isBoss) {
+        this.curIsBoss = isBoss;
+        double hp = Data.HJ_HP_BASE * Math.Pow(Data.HJ_HP_GROWTH, floor - 1);
+        double atk = Data.HJ_ATK_BASE * Math.Pow(Data.HJ_ATK_GROWTH, floor - 1);
+        if (isBoss) {
+            hp = hp * Data.HJ_BOSS_HP_MULT * (1.0 + this.p.turn * 0.4);
+            atk = atk * Data.HJ_BOSS_ATK_MULT * (1.0 + this.p.turn * 0.3);
+        }
+        // 秘境倍率
+        if (floor < 0) {
+            int absF = -floor;
+            hp = hp * Data.MJ_HP_MULT;
+            atk = atk * Data.MJ_ATK_MULT;
+        }
+        this.curMonsterHpMax = (long)hp;
+        this.curMonsterHp = this.curMonsterHpMax;
+        this.curMonsterLvl = (int)(floor * 1.2 + 5);
+        this.curMonsterIcon = isBoss ? 1 : 0;
+        this.curMonsterName = isBoss ? ("层 BOSS·第" + floor + "层") : this.MonsterName(floor);
+    }
+    public string MonsterName(int floor) {
+        // 简易命名:基于楼层取词根
+        string[] pre = new string[10];
+        pre[0] = "半兽人"; pre[1] = "多钩猫"; pre[2] = "钉耙猫";
+        pre[3] = "蝎子";   pre[4] = "稻草人"; pre[5] = "沃玛";
+        pre[6] = "祖玛";   pre[7] = "赤月";   pre[8] = "魔龙";
+        pre[9] = "牛魔";
+        int idx = floor / 20;
+        if (idx > 9) { idx = 9; }
+        string suf = "";
+        int tier = floor / 50;
+        if (tier >= 1) { suf = "·精英"; }
+        if (tier >= 3) { suf = "·强化"; }
+        return pre[idx] + suf;
+    }
+
+    public void StepIdle(double dt) {
+        // 自动战斗:按出手节拍推进,而不是每帧一刀。
+        long now = Game.NowMs();
+        if (this.p.hjFloor <= 0) { this.p.hjFloor = 1; }
+        if (this.curMonsterHp <= 0 || this.curMonsterName == null) {
+            this.SpawnMonster(this.p.hjFloor, this.IsBossFloor(this.p.hjFloor));
+        }
+        this.atkAcc = this.atkAcc + dt;
+        double interval = this.AtkInterval();
+        if (this.atkAcc < interval) { return; }
+        // 一次结算最多补 4 刀(长时间卡顿 / 追帧时防爆炸)
+        int guard = 0;
+        while (this.atkAcc >= interval && guard < 4) {
+            this.atkAcc = this.atkAcc - interval;
+            guard = guard + 1;
+            this.DoOneHit(now);
+        }
+    }
+
+    // 出手间隔:基础 ATK_INTERVAL,受速度属性压缩(下限 0.35s)
+    public double AtkInterval() {
+        double spd = (double)this.TotalSpeed();
+        double iv = Data.ATK_INTERVAL * 12.0 / (12.0 + spd - (double)Data.BASE_SPEED);
+        if (iv < 0.35) { iv = 0.35; }
+        if (iv > Data.ATK_INTERVAL * 2.0) { iv = Data.ATK_INTERVAL * 2.0; }
+        return iv;
+    }
+
+    public void DoOneHit(long now) {
+        // 一刀:先判定是否命中(命中率随等级差),再结算伤害
+        if (this.curMonsterHp <= 0) { return; }
+        int dmgMin = this.TotalAcMin();
+        int dmgMax = this.TotalAcMax();
+        int dmg = (int)(dmgMin + (dmgMax - dmgMin) * this.rng.NextDouble01());
+        if (dmg < 1) { dmg = 1; }
+        long hit = dmg;
+        this.curMonsterHp = this.curMonsterHp - hit;
+        this.lastHitTs = now;
+        this.totalDamageDealt = this.totalDamageDealt + hit;
+        if (this.curMonsterHp <= 0) {
+            this.OnMonsterKilled();
+        }
+    }
+
+    public bool IsBossFloor(int f) {
+        return f > 0 && (f % Data.HJ_BOSS_EVERY) == 0;
+    }
+
+    public void OnMonsterKilled() {
+        bool boss = this.curIsBoss;
+        int floor = this.p.hjFloor;
+        double gold = Data.HJ_KILL_GOLD * Math.Pow(Data.REWARD_GOLD_GROWTH, floor - 1);
+        double xp = Data.HJ_KILL_XP * Math.Pow(Data.REWARD_XP_GROWTH, floor - 1);
+        double sw = Data.HJ_KILL_SW * Math.Pow(Data.REWARD_SW_GROWTH, floor - 1);
+        if (boss) {
+            gold = gold * Data.HJ_BOSS_GOLD_MULT;
+            xp = xp * Data.HJ_BOSS_XP_MULT;
+            sw = sw * Data.HJ_BOSS_SW_MULT;
+        }
+        // 转生加成
+        double turnMult = 1.0 + this.p.turn * 0.25;
+        gold = gold * turnMult;
+        xp = xp * turnMult;
+        sw = sw * turnMult;
+
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] + (long)gold;
+        this.p.cur[Data.CUR_SW] = this.p.cur[Data.CUR_SW] + (long)sw;
+        this.GainXp((long)xp);
+
+        // 击杀计数
+        this.p.hjKillAcc = this.p.hjKillAcc + 1;
+        this.p.totalKills = this.p.totalKills + 1;
+        this.p.hjKills = this.p.hjKills + 1;
+
+        // BOSS 击破 → 累计击破数(转生用)
+        if (boss) {
+            this.p.bossKilled = this.p.bossKilled + 1;
+            // 全服广播
+            string sender = this.ShadowName();
+            this.AddBroadcast("[" + sender + "] 在幻境第 " + floor + " 层击杀 BOSS 获得 "
+                              + (int)gold + " 金币!");
+        }
+
+        // 装备掉落(普通怪 HJ_DROP_RATE,BOSS 必掉)
+        if (boss || this.rng.NextDouble01() < Data.HJ_DROP_RATE) {
+            this.DropEquip(floor, boss);
+        }
+
+        // 当前层目标达成 → 下一层
+        if (this.p.hjKills >= this.p.hjTarget) {
+            this.p.hjFloor = this.p.hjFloor + 1;
+            this.p.hjKills = 0;
+            this.p.hjTarget = Data.HJ_KILL_TARGET + this.p.hjFloor / 4;
+            if (this.p.hjFloor > this.p.hjBest) { this.p.hjBest = this.p.hjFloor; }
+            // 自动重生下一层怪
+            this.SpawnMonster(this.p.hjFloor, this.IsBossFloor(this.p.hjFloor));
+        } else {
+            // 重生同层怪
+            this.SpawnMonster(this.p.hjFloor, this.IsBossFloor(this.p.hjFloor));
+        }
+    }
+
+    public void DropEquip(int floor, bool boss) {
+        // 根据品阶概率表抽取
+        double r = this.rng.NextDouble01();
+        int tier = 0;
+        double cum = 0;
+        for (int t = 0; t < 5; t = t + 1) {
+            cum = cum + Data.TIER_DROP_RATE[t];
+            if (r < cum) { tier = t; break; }
+            tier = t;
+        }
+        // 系数:基于品阶 + 楼层 + BOSS 加成
+        int cap = Data.TIER_COEF_CAP[tier];
+        // 系数随楼层放大:每 10 层 +1,保证高层掉落跟得上 HP 曲线
+        int coef = 1 + floor / Data.EQUIP_COEF_PER_FLOOR + (int)(this.rng.Range(0, cap));
+        if (coef < 1) { coef = 1; }
+        if (boss) {
+            coef = coef + (int)(this.rng.Range(0, 2));
+            if (coef > cap) { coef = cap; }
+        }
+        int cls = (int)this.rng.Range(0, 8);
+        int slot = cls;  // cN 直接映射到 N 槽(简化)
+        if (slot >= Data.SLOT_COUNT) { slot = Data.SLOT_COUNT - 1; }
+        int seed = (int)this.rng.Range(1, 1000000);
+        Item it = Item.New(slot, tier, coef, cls, seed);
+        this.AddToBag(it);
+        if (boss) {
+            this.AddChat("[掉落] 传说!获得 " + it.Name());
+        } else if (tier >= 3) {
+            this.AddChat("[掉落] 高品质 " + it.Name());
+        }
+    }
+
+    public bool AddToBag(Item it) {
+        if (it == null) { return false; }
+        // 自动换装:掉落若为当前槽更强的一件,直接穿上,换下的进背包
+        if (this.autoEquip && it.slot >= 0 && it.slot < Data.SLOT_COUNT) {
+            Item cur = this.p.equip[it.slot];
+            int newScore = it.tier * 1000000 + it.coef;
+            int curScore = -1;
+            if (cur != null) { curScore = cur.tier * 1000000 + cur.coef; }
+            if (newScore > curScore) {
+                Item old = cur;
+                this.p.equip[it.slot] = it;
+                if (old != null) { this.PushBag(old); }
+                return true;
+            }
+        }
+        // 优先堆叠(同类同 tier 同 coef 视为不同件,简化:直接找空位)
+        for (int i = 0; i < this.p.bagCnt; i = i + 1) {
+            if (this.p.bag[i] == null) {
+                this.p.bag[i] = it;
+                return true;
+            }
+        }
+        return this.PushBag(it);
+    }
+
+    // 背包尾部入一件;满了返回 false
+    public bool PushBag(Item it) {
+        if (this.p.bagCnt >= 60) {
+            this.AddChat("[系统] 背包已满,部分装备未获得");
+            return false;
+        }
+        this.p.bag[this.p.bagCnt] = it;
+        this.p.bagCnt = this.p.bagCnt + 1;
+        return true;
+    }
+
+    // ---------------------------------------------------------------
+    // 离线结算
+    // ---------------------------------------------------------------
+    public void OfflineSettle() {
+        long now = Game.NowMs();
+        long ms = now - this.p.lastSeenTs;
+        if (ms < 1000) { ms = 1000; }  // 最小 1s 防止抖动
+        int cap = Data.OFFLINE_CAP_HOURS * 3600 * 1000;
+        if (this.p.vip >= 1) { cap = Data.OFFLINE_CAP_VIP[1] * 3600 * 1000; }
+        if (this.p.vip >= 2) { cap = Data.OFFLINE_CAP_VIP[2] * 3600 * 1000; }
+        if (ms > cap) { ms = cap; }
+        double sec = ms / 1000.0;
+        // 节拍:每 OFFLINE_BEAT 秒一只怪
+        double beat = Data.OFFLINE_BEAT;
+        int kills = (int)(sec / beat);
+        if (kills <= 0) { return; }
+        // 与在线共用同一套结算规则:累计奖励 + 推层 + 掉落(满包自动回收)
+        long totalGold = 0;
+        long totalXp = 0;
+        long totalSw = 0;
+        int floorStart = this.p.hjFloor;
+        int dropped = 0;
+        int recycled = 0;
+        int actualKills = 0;
+        // 防御:离线只结算"打得过"的层。一次战力检查,超出则停在当前层。
+        long atk = this.TotalAcMax();
+        for (int i = 0; i < kills; i = i + 1) {
+            int floor = this.p.hjFloor;
+            // 本层怪 HP 超过战力 * 8 刀 → 卡层,不再往下推
+            long mhp = Game.MonsterHpOf(floor, false);
+            if (mhp > atk * 8 && floor > floorStart) { break; }
+            bool boss = this.IsBossFloor(floor)
+                        && (this.p.hjKills + 1) >= this.p.hjTarget;
+            double gold = Data.HJ_KILL_GOLD * Math.Pow(Data.REWARD_GOLD_GROWTH, floor - 1);
+            double xp = Data.HJ_KILL_XP * Math.Pow(Data.REWARD_XP_GROWTH, floor - 1);
+            double sw = Data.HJ_KILL_SW * Math.Pow(Data.REWARD_SW_GROWTH, floor - 1);
+            if (boss) {
+                gold = gold * Data.HJ_BOSS_GOLD_MULT;
+                xp = xp * Data.HJ_BOSS_XP_MULT;
+                sw = sw * Data.HJ_BOSS_SW_MULT;
+            }
+            double turnMult = 1.0 + this.p.turn * 0.25;
+            totalGold = totalGold + (long)(gold * turnMult);
+            totalXp = totalXp + (long)(xp * turnMult);
+            totalSw = totalSw + (long)(sw * turnMult);
+
+            // 掉落:满包则折算成金币(自动回收),避免离线把包塞死
+            bool drop = boss || this.rng.NextDouble01() < Data.HJ_DROP_RATE;
+            if (drop) {
+                if (this.p.bagCnt < 60) {
+                    this.DropEquip(floor, boss);
+                    dropped = dropped + 1;
+                } else {
+                    totalGold = totalGold + (long)(Data.HJ_KILL_GOLD * Math.Pow(Data.REWARD_GOLD_GROWTH, floor - 1) * 3.0);
+                    recycled = recycled + 1;
+                }
+            }
+
+            // 与 OnMonsterKilled 同一套推层规则
+            actualKills = actualKills + 1;
+            this.p.hjKills = this.p.hjKills + 1;
+            if (boss) { this.p.bossKilled = this.p.bossKilled + 1; }
+            if (this.p.hjKills >= this.p.hjTarget) {
+                this.p.hjFloor = this.p.hjFloor + 1;
+                this.p.hjKills = 0;
+                this.p.hjTarget = Data.HJ_KILL_TARGET + this.p.hjFloor / 4;
+                if (this.p.hjFloor > this.p.hjBest) { this.p.hjBest = this.p.hjFloor; }
+            }
+        }
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] + totalGold;
+        this.p.cur[Data.CUR_SW] = this.p.cur[Data.CUR_SW] + totalSw;
+        this.GainXp(totalXp);
+        this.p.totalKills = this.p.totalKills + actualKills;
+        // 五行修为累积
+        for (int i = 0; i < 5; i = i + 1) {
+            this.p.wuxingMs[i] = this.p.wuxingMs[i] + (long)((double)ms * 0.2);
+        }
+        this.AddChat("[离线] 离线 " + (int)(sec / 3600) + " 时 " + ((int)(sec / 60) % 60)
+                     + " 分,消灭 " + kills + " 怪,获得 " + totalGold + " 金币 / "
+                     + totalXp + " 经验 / " + totalSw + " 声望");
+        if (this.p.hjFloor > floorStart) {
+            this.AddChat("[离线] 幻境推进 " + floorStart + " → " + this.p.hjFloor + " 层");
+        }
+        if (recycled > 0) {
+            this.AddChat("[离线] 背包已满," + recycled + " 件装备自动回收为金币");
+        }
+        // 重生当前层怪,回来即可接着打
+        this.SpawnMonster(this.p.hjFloor, this.IsBossFloor(this.p.hjFloor));
+        this.p.lastSeenTs = now;
+    }
+
+    // ---------------------------------------------------------------
+    // 装备操作
+    // ---------------------------------------------------------------
+    public void EquipFromBag(int bagIdx) {
+        if (bagIdx < 0 || bagIdx >= this.p.bagCnt) { return; }
+        Item it = this.p.bag[bagIdx];
+        if (it == null) { return; }
+        int slot = it.slot;
+        if (slot < 0 || slot >= Data.SLOT_COUNT) { return; }
+        // 卸下原装备 → 背包
+        Item old = this.p.equip[slot];
+        this.p.equip[slot] = it;
+        this.p.bag[bagIdx] = old;
+        if (old != null && this.p.bagCnt < 60) {
+            // 已就位,无需再 add
+        }
+        this.AddChat("[装备] " + it.Name() + " 已装备");
+    }
+    public void UnequipToBag(int slot) {
+        if (slot < 0 || slot >= Data.SLOT_COUNT) { return; }
+        Item it = this.p.equip[slot];
+        if (it == null) { return; }
+        if (this.p.bagCnt >= 60) {
+            this.AddChat("[系统] 背包已满");
+            return;
+        }
+        this.p.bag[this.p.bagCnt] = it;
+        this.p.bagCnt = this.p.bagCnt + 1;
+        this.p.equip[slot] = null;
+    }
+
+    // ---------------------------------------------------------------
+    // 洗炼
+    // ---------------------------------------------------------------
+    public bool RefineGold(int bagIdx) {
+        if (bagIdx < 0 || bagIdx >= this.p.bagCnt) { return false; }
+        Item it = this.p.bag[bagIdx];
+        if (it == null) { return false; }
+        // 洗炼上限 = 当前系数 + 品阶头room(楼层掉落已放大系数,固定上限会把装备削回去)
+        int cap = it.coef + Data.TIER_COEF_CAP[it.tier];
+        int cost = (int)(Data.GOLD_REFINE_COST_BASE * Math.Pow(it.coef, Data.GOLD_REFINE_COST_POW));
+        if (this.p.cur[Data.CUR_GOLD] < cost) {
+            this.AddChat("[系统] 金币不足,需 " + cost);
+            return false;
+        }
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] - cost;
+        double r = this.rng.NextDouble01();
+        int delta = (int)(this.rng.Range(1, (int)Data.GOLD_REFINE_DELTA + 1));
+        if (r < Data.GOLD_REFINE_DOWN_RATE) {
+            // 降低
+            it.coef = it.coef - delta;
+            if (it.coef < 1) { it.coef = 1; }
+            this.AddChat("[洗炼] 系数降低为 +" + it.coef);
+        } else {
+            it.coef = it.coef + delta;
+            if (it.coef > cap) { it.coef = cap; }
+            this.AddChat("[洗炼] 系数提升为 +" + it.coef);
+        }
+        return true;
+    }
+    public bool RefineYb(int bagIdx) {
+        if (bagIdx < 0 || bagIdx >= this.p.bagCnt) { return false; }
+        Item it = this.p.bag[bagIdx];
+        if (it == null) { return false; }
+        int cap = Data.TIER_COEF_CAP[it.tier];
+        int cost = Data.YB_REFINE_COST_BASE + (int)(it.coef * 5);
+        if (this.p.cur[Data.CUR_YB] < cost) {
+            this.AddChat("[系统] 元宝不足,需 " + cost);
+            return false;
+        }
+        this.p.cur[Data.CUR_YB] = this.p.cur[Data.CUR_YB] - cost;
+        // 保底:必定 +1,且有 10% 概率 +5
+        it.coef = it.coef + 1;
+        if (it.coef > cap) { it.coef = cap; }
+        if (this.rng.NextDouble01() < Data.YB_REFINE_PCT) {
+            it.coef = it.coef + 4;
+            if (it.coef > cap) { it.coef = cap; }
+            this.AddChat("[元宝洗炼] 系数跃升为 +" + it.coef);
+        } else {
+            this.AddChat("[元宝洗炼] 系数提升为 +" + it.coef);
+        }
+        return true;
+    }
+    public bool UpgradeEquip(int bagIdx) {
+        if (bagIdx < 0 || bagIdx >= this.p.bagCnt) { return false; }
+        Item it = this.p.bag[bagIdx];
+        if (it == null) { return false; }
+        // 简化:消耗金币代替黑铁
+        long cost = 5000 + it.tier * 3000;
+        if (this.p.cur[Data.CUR_GOLD] < cost) {
+            this.AddChat("[系统] 金币不足,需 " + cost);
+            return false;
+        }
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] - cost;
+        double rate = Data.UPGRADE_RATE + it.tier * 0.05;
+        if (this.rng.NextDouble01() < rate) {
+            it.tier = it.tier + 1;
+            if (it.tier > 4) { it.tier = 4; }
+            this.AddChat("[升级] 装备升阶为 " + Data.EQUIP_TIER_NAMES[it.tier]);
+        } else {
+            this.AddChat("[升级] 锻造失败");
+        }
+        return true;
+    }
+
+    // ---------------------------------------------------------------
+    // 回收
+    // ---------------------------------------------------------------
+    public void Recycle(int bagIdx, int currency) {
+        if (bagIdx < 0 || bagIdx >= this.p.bagCnt) { return; }
+        Item it = this.p.bag[bagIdx];
+        if (it == null) { return; }
+        long amt = 0;
+        if (currency == Data.CUR_GOLD) { amt = (long)Data.RECYCLE_GOLD_PER_TIER[it.tier] * it.coef / 2; }
+        else if (currency == Data.CUR_YB) { amt = Data.RECYCLE_YB_PER_TIER[it.tier]; }
+        else if (currency == Data.CUR_SW) { amt = Data.RECYCLE_SW_PER_TIER[it.tier]; }
+        else if (currency == Data.CUR_ZG) { amt = Data.RECYCLE_ZG_PER_TIER[it.tier]; }
+        else if (currency == Data.CUR_RB) { amt = Data.RECYCLE_RB_PER_TIER[it.tier]; }
+        else if (currency == Data.CUR_JF) { amt = Data.RECYCLE_JF_PER_TIER[it.tier]; }
+        else { amt = Data.RECYCLE_EXP_PER_TIER[it.tier]; }
+        this.p.cur[currency] = this.p.cur[currency] + amt;
+        // 从背包移除
+        for (int i = bagIdx; i < this.p.bagCnt - 1; i = i + 1) {
+            this.p.bag[i] = this.p.bag[i + 1];
+        }
+        this.p.bag[this.p.bagCnt - 1] = null;
+        this.p.bagCnt = this.p.bagCnt - 1;
+        this.AddChat("[回收] " + it.Name() + " → " + Data.CUR_NAMES[currency] + " +" + amt);
+    }
+
+    // 一键换装:每个槽位从背包里挑评分最高的一件穿上,换下的回背包。
+    // 评分 = 品阶 * 100 + 系数(与 TIER_ATK/DEF/HP 单调一致)。
+    public int AutoEquipBest() {
+        int changed = 0;
+        for (int s = 0; s < Data.SLOT_COUNT; s = s + 1) {
+            int bestIdx = -1;
+            int bestScore = -1;
+            for (int i = 0; i < this.p.bagCnt && i < 60; i = i + 1) {
+                Item it = this.p.bag[i];
+                if (it == null) { continue; }
+                if (it.slot != s) { continue; }
+                int sc = it.tier * 100 + it.coef;
+                if (sc > bestScore) { bestScore = sc; bestIdx = i; }
+            }
+            if (bestIdx < 0) { continue; }
+            Item cur = this.p.equip[s];
+            int curScore = -1;
+            if (cur != null) { curScore = cur.tier * 100 + cur.coef; }
+            if (bestScore > curScore) {
+                this.EquipFromBag(bestIdx);
+                changed = changed + 1;
+            }
+        }
+        if (changed > 0) {
+            this.AddChat("[换装] 自动换上 " + changed + " 件更强装备");
+        }
+        return changed;
+    }
+
+    // 一键回收:把背包所有装备折成指定货币(自动拾取 / 清包用)
+    public long RecycleAll(int currency) {
+        long total = 0;
+        int guard = 0;
+        while (this.p.bagCnt > 0 && guard < 128) {
+            guard = guard + 1;
+            // 留一件待回收计数用,先取下标 0
+            Item it = this.p.bag[0];
+            if (it == null) {
+                // 空洞:直接前移
+                for (int i = 0; i < this.p.bagCnt - 1; i = i + 1) { this.p.bag[i] = this.p.bag[i + 1]; }
+                this.p.bag[this.p.bagCnt - 1] = null;
+                this.p.bagCnt = this.p.bagCnt - 1;
+                continue;
+            }
+            long before = this.p.cur[currency];
+            this.Recycle(0, currency);
+            total = total + (this.p.cur[currency] - before);
+        }
+        return total;
+    }
+
+    // ---------------------------------------------------------------
+    // 个人 BOSS 挑战
+    // ---------------------------------------------------------------
+    public bool ChallengeBossHome(int idx) {
+        if (this.p.bhTriesLeft <= 0) {
+            this.AddChat("[系统] 个人 BOSS 次数已用完");
+            return false;
+        }
+        if (idx < 0 || idx >= 8) { return false; }
+        // 战斗:玩家对 BOSS
+        long hp = (long)(Data.BOSS_HP_BASE[idx] * Math.Pow(Data.BOSS_HP_GROWTH[idx], this.p.turn));
+        double atk = Data.HJ_ATK_BASE * (idx + 1) * 2.0;
+        // 玩家必须打出 boss_hp / 自身 dps 秒数
+        int myDps = this.TotalAcMin();
+        int seconds = (int)(hp / Math.Max(1, myDps));
+        if (seconds < 1) { seconds = 1; }
+        // 简化:扣除 HP 表示挑战消耗
+        int myHp = this.TotalHp();
+        long bossDps = (long)atk;
+        int lost = (int)(bossDps * seconds / 4);
+        if (lost > myHp / 2) {
+            this.AddChat("[BOSS] 挑战失败:" + Data.BOSS_NAMES[idx]);
+            this.p.bhTriesLeft = this.p.bhTriesLeft - 1;
+            return false;
+        }
+        // 成功
+        this.p.bhKilled[idx] = this.p.bhKilled[idx] + 1;
+        this.p.bhTriesLeft = this.p.bhTriesLeft - 1;
+        long gold = (long)(Data.HJ_KILL_GOLD * 50 * (idx + 1));
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] + gold;
+        this.p.cur[Data.CUR_YB] = this.p.cur[Data.CUR_YB] + (idx + 1) * 5;
+        // 必掉一件 t3+ 装备
+        Item drop = Item.New(idx % Data.SLOT_COUNT, 3, 5 + idx, idx % 8, (int)this.rng.Range(1, 1000000));
+        this.AddToBag(drop);
+        this.AddChat("[BOSS] 击败 " + Data.BOSS_NAMES[idx] + " 获得 " + gold + " 金币");
+        return true;
+    }
+
+    // ---------------------------------------------------------------
+    // 世界 BOSS(影子)
+    // ---------------------------------------------------------------
+    public long HitWorldBoss() {
+        if (this.p.wbTriesLeft <= 0) {
+            this.AddChat("[系统] 今日世界 BOSS 次数已用完");
+            return 0;
+        }
+        this.p.wbTriesLeft = this.p.wbTriesLeft - 1;
+        long dmg = 0;
+        int myAc = this.TotalAcMin();
+        if (myAc >= Data.WORLD_BOSS_TIER_BOUND0) { dmg = (long)Data.WORLD_BOSS_DAMAGE_PER_HIT[4]; }
+        else if (myAc >= Data.WORLD_BOSS_TIER_BOUND1) { dmg = (long)Data.WORLD_BOSS_DAMAGE_PER_HIT[3]; }
+        else if (myAc >= Data.WORLD_BOSS_TIER_BOUND2) { dmg = (long)Data.WORLD_BOSS_DAMAGE_PER_HIT[2]; }
+        else if (myAc >= Data.WORLD_BOSS_TIER_BOUND3) { dmg = (long)Data.WORLD_BOSS_DAMAGE_PER_HIT[1]; }
+        else { dmg = (long)Data.WORLD_BOSS_DAMAGE_PER_HIT[0]; }
+        // 浮动 50%~120%
+        double r = 0.5 + this.rng.NextDouble01() * 0.7;
+        dmg = (long)(dmg * r);
+        this.p.wbDamage = this.p.wbDamage + dmg;
+        this.AddChat("[世界 BOSS] 打出 " + dmg + " 伤害");
+        return dmg;
+    }
+
+    // ---------------------------------------------------------------
+    // 爵位
+    // ---------------------------------------------------------------
+    public void DonateNoble(long ybAmount) {
+        if (this.p.cur[Data.CUR_YB] < ybAmount) {
+            this.AddChat("[系统] 元宝不足");
+            return;
+        }
+        this.p.cur[Data.CUR_YB] = this.p.cur[Data.CUR_YB] - ybAmount;
+        this.p.donateAcc = this.p.donateAcc + ybAmount;
+        // 检查晋升
+        for (int i = 0; i < Data.NOBLE_TOTAL; i = i + 1) {
+            if (this.p.donateAcc >= Data.NOBLE_DONATE[i]) {
+                if (this.p.nobleTier < i) {
+                    this.p.nobleTier = i;
+                    this.AddChat("[爵位] 晋升为 " + Data.NOBLE_NAMES[i]);
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 五行修炼(注入材料 → 加修为)
+    // ---------------------------------------------------------------
+    public void InjectWuxing(int slot, int amount) {
+        if (slot < 0 || slot >= 5) { return; }
+        // amount 单位 = 金币,1 金币 = 1ms 修为(简化)
+        if (this.p.cur[Data.CUR_GOLD] < amount) {
+            this.AddChat("[系统] 金币不足");
+            return;
+        }
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] - amount;
+        this.p.wuxingMs[slot] = this.p.wuxingMs[slot] + (long)amount * 1000L;
+        this.AddChat("[五行] " + Data.WUXING_NAMES[slot] + " 修为 +" + amount + " 金币");
+    }
+
+    // ---------------------------------------------------------------
+    // 将星图谱
+    // ---------------------------------------------------------------
+    public void ActivateCard(int pool, int card, int tier) {
+        if (pool < 0 || pool >= 8) { return; }
+        if (card < 0 || card >= 12) { return; }
+        if (tier < 0 || tier >= 10) { return; }
+        int idx = pool * 120 + card * 10 + tier;
+        int word = idx / 32;
+        int bit = idx % 32;
+        if (word >= this.p.cardMaskLen) { return; }
+        int mask = 1 << bit;
+        if ((this.p.cardMask[word] & mask) != 0) {
+            this.AddChat("[系统] 已激活");
+            return;
+        }
+        long cost = (long)(Data.CARD_ACTIVATE_BASE * Math.Pow(2, tier));
+        if (this.p.cur[Data.CUR_GOLD] < cost) {
+            this.AddChat("[系统] 金币不足,需 " + cost);
+            return;
+        }
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] - cost;
+        this.p.cardMask[word] = this.p.cardMask[word] | mask;
+        this.p.tupuScore = this.p.tupuScore + (tier + 1) * 100;
+        this.AddChat("[图谱] 激活 " + Data.CARD_POOL_NAMES[pool] + " 卡片 +" + (tier + 1));
+    }
+
+    // ---------------------------------------------------------------
+    // 称谓晋升
+    // ---------------------------------------------------------------
+    public void TryTitleUp() {
+        // 简化:每页 5 阶,晋升门槛 = sw * (rank+1)
+        // 真实计算很复杂,本工程以累计 sw / (lv / 10 + 1) 折算
+        long score = this.p.cur[Data.CUR_SW] + this.p.lv * 200 + this.p.turn * 5000;
+        int page = 0;
+        int rank = 0;
+        long need = 100;
+        while (page < Data.TITLE_TOTAL) {
+            if (score >= need) {
+                page = page + 1;
+                rank = 0;
+                need = need * 8;
+            } else {
+                break;
+            }
+        }
+        if (page > 0) { page = page - 1; }
+        // rank = 当前页累积进度
+        long pageStart = need / 8;
+        long into = score - pageStart;
+        rank = (int)(into * 5 / Math.Max(1, need - pageStart));
+        if (rank > 4) { rank = 4; }
+        if (page > this.p.titlePage || (page == this.p.titlePage && rank > this.p.titleRank)) {
+            this.p.titlePage = page;
+            this.p.titleRank = rank;
+            this.AddChat("[称谓] 晋升为 " + Data.TITLE_PAGE_NAMES[page] + (rank + 1) + " 阶");
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 寻宝
+    // ---------------------------------------------------------------
+    public int XunBao() {
+        if (this.p.xbTickets <= 0) {
+            this.AddChat("[系统] 寻宝图不足");
+            return -1;
+        }
+        this.p.xbTickets = this.p.xbTickets - 1;
+        double r = this.rng.NextDouble01();
+        double cum = 0;
+        for (int i = 0; i < Data.XB_POOL_SIZE; i = i + 1) {
+            cum = cum + Data.XB_PRIZE_RATE[i];
+            if (r < cum) {
+                this.p.xbPool[i] = this.p.xbPool[i] + 1;
+                // 发奖
+                this.GrantPrize(i);
+                return i;
+            }
+        }
+        // 兜底:最后一个
+        this.p.xbPool[Data.XB_POOL_SIZE - 1] = this.p.xbPool[Data.XB_POOL_SIZE - 1] + 1;
+        this.GrantPrize(Data.XB_POOL_SIZE - 1);
+        return Data.XB_POOL_SIZE - 1;
+    }
+    public void GrantPrize(int idx) {
+        long v = Data.XB_PRIZE_VAL[idx];
+        switch (idx) {
+            case 0: this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] + 100000; break;
+            case 1: this.GainXp(50000); break;
+            case 2: this.p.cur[Data.CUR_SW] = this.p.cur[Data.CUR_SW] + 100; break;
+            case 3: this.p.cur[Data.CUR_ZG] = this.p.cur[Data.CUR_ZG] + 50; break;
+            case 6: this.AddChat("[寻宝] 获得符文 1#×3"); break;
+            case 7: this.AddChat("[寻宝] 获得符文 5#×1"); break;
+            case 8: this.AddChat("[寻宝] 获得龙珠 1★×5"); break;
+            case 9: this.AddChat("[寻宝] ★★★ 获得 屠龙宝刀!"); break;
+            case 10: this.p.cur[Data.CUR_YB] = this.p.cur[Data.CUR_YB] + 1000; break;
+            case 11: this.p.cur[Data.CUR_LF] = this.p.cur[Data.CUR_LF] + 50; break;
+            default: break;
+        }
+        this.AddChat("[寻宝] 抽中:" + Data.XB_PRIZE_NAMES[idx]);
+    }
+
+    // ---------------------------------------------------------------
+    // 祭坛
+    // ---------------------------------------------------------------
+    public void AltarDonate(int kind) {
+        if (kind < 0 || kind >= 5) { return; }
+        if (kind == 4) {
+            // 元宝
+            if (this.p.cur[Data.CUR_YB] < 100) {
+                this.AddChat("[系统] 元宝不足");
+                return;
+            }
+            this.p.cur[Data.CUR_YB] = this.p.cur[Data.CUR_YB] - 100;
+            this.p.altarMyProg = this.p.altarMyProg + Data.ALTAR_DONATE_PROG[4];
+        } else if (kind == 2) {
+            // 天书:用声望代替
+            if (this.p.cur[Data.CUR_SW] < 100) { return; }
+            this.p.cur[Data.CUR_SW] = this.p.cur[Data.CUR_SW] - 100;
+            this.p.altarMyProg = this.p.altarMyProg + Data.ALTAR_DONATE_PROG[2];
+        } else {
+            // 金币
+            long cost = Data.ALTAR_DONATE_GOLD[kind];
+            if (this.p.cur[Data.CUR_GOLD] < cost) { return; }
+            this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] - cost;
+            this.p.altarMyProg = this.p.altarMyProg + Data.ALTAR_DONATE_PROG[kind];
+        }
+        this.p.altarGlobalProg = this.p.altarGlobalProg + Data.ALTAR_DONATE_PROG[kind];
+    }
+
+    // ---------------------------------------------------------------
+    // 钱庄
+    // ---------------------------------------------------------------
+    public long CollectCity() {
+        if (this.p.cityOwned < 0 || this.p.cityOwned >= Data.CITY_TOTAL) {
+            this.AddChat("[系统] 未占领任何钱庄");
+            return 0;
+        }
+        long now = Game.NowMs();
+        long ms = now - this.p.cityLastMs;
+        if (ms < 1000) { return 0; }
+        long hours = ms / 3600000L;
+        if (hours < 1) { hours = 1; }
+        long gold = Data.CITY_PRODUCE[this.p.cityOwned] * hours;
+        // 概率被抢(影子 PvP 随机事件):5%
+        if (this.rng.NextDouble01() < 0.05) {
+            this.AddChat("[钱庄] 钱庄被其他玩家夺走!");
+            this.p.cityOwned = -1;
+            return 0;
+        }
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] + gold;
+        this.AddChat("[钱庄] 收取 " + gold + " 金币 (" + hours + " 小时)");
+        this.p.cityLastMs = now;
+        return gold;
+    }
+
+    // ---------------------------------------------------------------
+    // 押镖(影子)
+    // ---------------------------------------------------------------
+    public void SendYabiao() {
+        if (this.p.ybTriesLeft <= 0) {
+            this.AddChat("[系统] 今日押镖次数已用完");
+            return;
+        }
+        this.p.ybTriesLeft = this.p.ybTriesLeft - 1;
+        long gold = Data.YABIAO_GOLD[0] + this.rng.Range(0, Data.YABIAO_GOLD[1]);
+        // 50% 概率被劫
+        if (this.rng.NextDouble01() < 0.5) {
+            gold = gold / 2;
+            this.AddChat("[押镖] 镖车被劫,损失一半");
+        }
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] + gold;
+        this.AddChat("[押镖] 押镖完成,获得 " + gold + " 金币");
+    }
+    public void JieBiao() {
+        if (this.p.jbTriesLeft <= 0) {
+            this.AddChat("[系统] 今日劫镖次数已用完");
+            return;
+        }
+        this.p.jbTriesLeft = this.p.jbTriesLeft - 1;
+        long gold = this.rng.Range(20000, 200000);
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] + gold;
+        this.AddChat("[劫镖] 劫镖成功,掠夺 " + gold + " 金币");
+    }
+
+    // ---------------------------------------------------------------
+    // PK 竞技场
+    // ---------------------------------------------------------------
+    public void PKArena() {
+        if (this.p.pkTriesLeft <= 0) {
+            this.AddChat("[系统] 今日 PK 次数已用完");
+            return;
+        }
+        this.p.pkTriesLeft = this.p.pkTriesLeft - 1;
+        // 50% 胜
+        bool win = this.rng.NextDouble01() < 0.5;
+        if (win) {
+            this.p.cur[Data.CUR_ZG] = this.p.cur[Data.CUR_ZG] + Data.PK_WIN_ZG;
+            this.AddChat("[PK] 胜利 +" + Data.PK_WIN_ZG + " 战功");
+        } else {
+            this.p.cur[Data.CUR_ZG] = this.p.cur[Data.CUR_ZG] + Data.PK_LOSE_ZG;
+            this.AddChat("[PK] 失败 +" + Data.PK_LOSE_ZG + " 战功(安慰奖)");
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 传说塔(影子)
+    // ---------------------------------------------------------------
+    public void TowerClimb() {
+        if (this.p.towerBest >= Data.TOWER_FLOORS) {
+            this.AddChat("[传说塔] 已登顶");
+            return;
+        }
+        int target = this.p.towerBest;
+        long hp = (long)(Data.HJ_HP_BASE * 50 * Data.TOWER_HP_MULT[target]
+                         * Math.Pow(Data.HJ_HP_GROWTH, this.p.hjFloor - 1));
+        int myDps = this.TotalAcMin();
+        if (myDps * 30 >= hp) {
+            this.p.towerBest = target + 1;
+            this.AddChat("[传说塔] 占领第 " + this.p.towerBest + " 层");
+        } else {
+            this.AddChat("[传说塔] 挑战失败");
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 商店
+    // ---------------------------------------------------------------
+    public bool ShopBuy(int idx) {
+        if (idx < 0 || idx >= 12) { return false; }
+        long cost = Data.SHOP_GOODS_PRICE_YB[idx];
+        if (this.p.cur[Data.CUR_YB] < cost) {
+            this.AddChat("[系统] 元宝不足,需 " + cost);
+            return false;
+        }
+        this.p.cur[Data.CUR_YB] = this.p.cur[Data.CUR_YB] - cost;
+        // 给物品(简化:只入背包 1 件或加货币)
+        if (idx == 2) {
+            this.AddChat("[商店] 获得 黑铁矿石×10");
+        } else if (idx == 3) {
+            this.AddChat("[商店] 获得 符文 1#×1");
+        } else if (idx == 5) {
+            this.AddChat("[商店] 获得 祝福油×10");
+        } else if (idx == 6) {
+            this.AddChat("[商店] 获得 超级祝福油×5");
+        } else if (idx == 11) {
+            this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] + 100000;
+        } else {
+            this.AddChat("[商店] 购买 " + Data.SHOP_GOODS_NAME[idx] + " 成功");
+        }
+        return true;
+    }
+
+    // ---------------------------------------------------------------
+    // 充值(模拟)
+    // ---------------------------------------------------------------
+    public void Charge(int tier) {
+        if (tier < 0 || tier >= 7) { return; }
+        this.p.cur[Data.CUR_YB] = this.p.cur[Data.CUR_YB] + Data.CHARGE_YB[tier];
+        this.p.chargeTotal = this.p.chargeTotal + Data.CHARGE_TIERS[tier];
+        // VIP 检查
+        if (this.p.chargeTotal >= Data.VIP_THRESHOLD[2]) { this.p.vip = 2; }
+        else if (this.p.chargeTotal >= Data.VIP_THRESHOLD[1]) { this.p.vip = 1; }
+        else if (this.p.chargeTotal >= Data.VIP_THRESHOLD[0]) { this.p.vip = (int)Math.Max((double)this.p.vip, 0.0); }
+        this.AddChat("[充值] +" + Data.CHARGE_YB[tier] + " 元宝");
+    }
+
+    // ---------------------------------------------------------------
+    // 聊天 / 广播
+    // ---------------------------------------------------------------
+    public void AddChat(string msg) {
+        if (this.p.chatCnt >= 80) {
+            // 滚动
+            for (int i = 0; i < 79; i = i + 1) {
+                this.p.chatLog[i] = this.p.chatLog[i + 1];
+            }
+            this.p.chatCnt = 79;
+        }
+        this.p.chatLog[this.p.chatCnt] = msg;
+        this.p.chatCnt = this.p.chatCnt + 1;
+    }
+    public void AddBroadcast(string msg) {
+        this.AddChat("[广播] " + msg);
+    }
+    public string ShadowName() {
+        // 派生自玩家 best 的影子玩家名
+        string[] pre = new string[8];
+        pre[0] = "万万"; pre[1] = "圣裁"; pre[2] = "龙卫";
+        pre[3] = "大白花"; pre[4] = "上帝菁"; pre[5] = "李星天";
+        pre[6] = "名扬天下"; pre[7] = "无巅峰";
+        int idx = (int)(this.rkSeed % 8);
+        if (idx < 0) { idx = -idx; }
+        return pre[idx];
+    }
+    public void AutoBroadcast() {
+        long now = Game.NowMs();
+        if (now - this.p.lastBroadcastMs < 12000) { return; }
+        this.p.lastBroadcastMs = now;
+        // 模拟其他影子玩家的活动
+        string[] actions = new string[6];
+        actions[0] = "在幻境第 2001 层击杀 BOSS 获得 100 元宝×1";
+        actions[1] = "在铁匠铺洗炼出 +12 屠龙";
+        actions[2] = "完成了 21 页称谓天梯全部解锁";
+        actions[3] = "在 PK 竞技场登顶第 1 名";
+        actions[4] = "在祭坛捐献 1000 元宝帮助全服达标";
+        actions[5] = "在至尊极品殿堂登记了一件铠甲之首";
+        int idx = (int)(this.rng.Range(0, 6));
+        string sender = this.ShadowName();
+        this.AddChat("[" + sender + "] " + actions[idx]);
+    }
+
+    // ---------------------------------------------------------------
+    // 帮会(影子)
+    // ---------------------------------------------------------------
+    public void CreateGuild(string name) {
+        if (this.p.cur[Data.CUR_GOLD] < Data.GUILD_CREATE_GOLD) {
+            this.AddChat("[系统] 金币不足,需 " + Data.GUILD_CREATE_GOLD);
+            return;
+        }
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] - Data.GUILD_CREATE_GOLD;
+        this.p.hasGuild = true;
+        this.p.guildName = name;
+        this.p.guildGold = 0;
+        this.AddChat("[帮会] 创建 " + name);
+    }
+
+    // ---------------------------------------------------------------
+    // 师徒(影子)
+    // ---------------------------------------------------------------
+    public void ApprenticeTo(string name) {
+        if (this.p.lv > Data.STUDENT_LV_MAX) {
+            this.AddChat("[系统] 等级超 60,无法拜师");
+            return;
+        }
+        this.p.masterTier = 1;
+        this.p.masterName = name;
+        this.AddChat("[师徒] 拜师 " + name);
+    }
+    public void TakeApprentice(string name) {
+        if (this.p.turn < Data.TUTOR_TURN_REQ) {
+            this.AddChat("[系统] 需 2 转才能收徒");
+            return;
+        }
+        this.p.masterTier = 2;
+        this.p.studentCount = this.p.studentCount + 1;
+        this.AddChat("[师徒] 收徒 " + name);
+    }
+
+    // ---------------------------------------------------------------
+    // 邮箱
+    // ---------------------------------------------------------------
+    public void SendMailAttach(string title, Item it) {
+        if (this.p.mailCnt >= 8) {
+            this.AddChat("[系统] 邮箱已满");
+            return;
+        }
+        this.p.mailAttach[this.p.mailCnt] = it;
+        this.p.mailQty[this.p.mailCnt] = 1;
+        this.p.mailTitle[this.p.mailCnt] = title;
+        this.p.mailCnt = this.p.mailCnt + 1;
+    }
+    public void ClaimMail(int idx) {
+        if (idx < 0 || idx >= this.p.mailCnt) { return; }
+        Item it = this.p.mailAttach[idx];
+        if (it != null) { this.AddToBag(it); }
+        // 从邮箱移除
+        for (int i = idx; i < this.p.mailCnt - 1; i = i + 1) {
+            this.p.mailAttach[i] = this.p.mailAttach[i + 1];
+            this.p.mailQty[i] = this.p.mailQty[i + 1];
+            this.p.mailTitle[i] = this.p.mailTitle[i + 1];
+        }
+        this.p.mailAttach[this.p.mailCnt - 1] = null;
+        this.p.mailCnt = this.p.mailCnt - 1;
+    }
+
+    // ---------------------------------------------------------------
+    // 辅助方法(格式化)
+    // ---------------------------------------------------------------
+    public string FormatNum(long n) {
+        // 千分位简化:10 万/亿
+        if (n < 0) { n = -n; }
+        if (n >= 100000000L) {
+            long yi = n / 100000000L;
+            long wan = (n % 100000000L) / 10000L;
+            return yi + "." + wan + "亿";
+        }
+        if (n >= 10000L) {
+            long wan = n / 10000L;
+            long qian = (n % 10000L) / 1000L;
+            if (qian > 0) { return wan + "." + qian + "万"; }
+            return wan + "万";
+        }
+        return "" + n;
+    }
+    public string FormatCur(long n) {
+        return this.FormatNum(n);
+    }
+
+    // Parse 辅助(Zan 无 int.Parse/long.Parse)
+    public static int ParseIntS(string s) {
+        if (s == null) { return 0; }
+        int v = 0;
+        bool neg = false;
+        int i = 0;
+        if (s.Length > 0 && s.Substring(0, 1) == "-") { neg = true; i = 1; }
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            int d = Game.DigitOf(ch);
+            if (d < 0) { break; }
+            v = v * 10 + d;
+            i = i + 1;
+        }
+        if (neg) { v = -v; }
+        return v;
+    }
+    public static long ParseLongS(string s) {
+        if (s == null) { return 0; }
+        long v = 0;
+        bool neg = false;
+        int i = 0;
+        if (s.Length > 0 && s.Substring(0, 1) == "-") { neg = true; i = 1; }
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            int d = Game.DigitOf(ch);
+            if (d < 0) { break; }
+            v = v * 10 + d;
+            i = i + 1;
+        }
+        if (neg) { v = -v; }
+        return v;
+    }
+    static int DigitOf(string ch) {
+        if (ch == "0") { return 0; } if (ch == "1") { return 1; }
+        if (ch == "2") { return 2; } if (ch == "3") { return 3; }
+        if (ch == "4") { return 4; } if (ch == "5") { return 5; }
+        if (ch == "6") { return 6; } if (ch == "7") { return 7; }
+        if (ch == "8") { return 8; } if (ch == "9") { return 9; }
+        return -1;
+    }
+    // ---------------------------------------------------------------
+    // 至尊极品殿堂
+    // ---------------------------------------------------------------
+    public bool RegisterDianTang(int page, Item it) {
+        if (page < 0 || page >= 5) { return false; }
+        if (this.p.dtBest[page] != null && this.p.dtBest[page].coef >= it.coef
+            && this.p.dtBest[page].tier >= it.tier) {
+            this.AddChat("[殿堂] 当前最强已优于该装备");
+            return false;
+        }
+        this.p.dtBest[page] = it;
+        this.p.dtCount = this.p.dtCount + 1;
+        if (this.p.dtCount > Data.DIAN_TANG_XP_BONUS_CAP) {
+            this.p.dtCount = Data.DIAN_TANG_XP_BONUS_CAP;
+        }
+        this.AddChat("[殿堂] 登记成功 +5% 经验加成");
+        return true;
+    }
+
+    // ---------------------------------------------------------------
+    // 设置
+    // ---------------------------------------------------------------
+    public void ToggleBossKey() {
+        this.bossMode = !this.bossMode;
+    }
+    public void SetUiScale(double s) {
+        if (s < 0.8) { s = 0.8; }
+        if (s > 3.0) { s = 3.0; }
+        this.p.uiScale = s;
+    }
+    public void ToggleSilent() {
+        this.p.silent = !this.p.silent;
+    }
+
+    // ---------------------------------------------------------------
+    // 存档
+    // ---------------------------------------------------------------
+    public static string SavePath() {
+        return Assets.Find("legend_save.txt");
+    }
+    public void Save() {
+        string sp = Game.SavePath();
+        List<string> lines = new List<string>();
+        lines.Add("v=1");
+        lines.Add("name=" + this.p.name);
+        lines.Add("cls=" + this.p.cls);
+        lines.Add("lv=" + this.p.lv);
+        lines.Add("xp=" + this.p.xp);
+        lines.Add("turn=" + this.p.turn);
+        lines.Add("bossk=" + this.p.bossKilled);
+        lines.Add("kills=" + this.p.totalKills);
+        lines.Add("vip=" + this.p.vip);
+        lines.Add("charge=" + this.p.chargeTotal);
+        for (int i = 0; i < Data.CUR_COUNT; i = i + 1) {
+            lines.Add("cur" + i + "=" + this.p.cur[i]);
+        }
+        lines.Add("hjf=" + this.p.hjFloor);
+        lines.Add("hjk=" + this.p.hjKills);
+        lines.Add("hjt=" + this.p.hjTarget);
+        lines.Add("hjb=" + this.p.hjBest);
+        lines.Add("hjkacc=" + this.p.hjKillAcc);
+        lines.Add("mjf=" + this.p.mjFloor);
+        lines.Add("mjk=" + this.p.mjKills);
+        lines.Add("mjb=" + this.p.mjBest);
+        lines.Add("mju=" + this.p.mjUnlocked);
+        for (int i = 0; i < 8; i = i + 1) {
+            lines.Add("bh" + i + "=" + this.p.bhKilled[i]);
+        }
+        lines.Add("bhl=" + this.p.bhTriesLeft);
+        lines.Add("ts=" + this.p.lastSeenTs);
+        lines.Add("d=" + this.p.lastDayTs);
+        lines.Add("tpage=" + this.p.titlePage);
+        lines.Add("trank=" + this.p.titleRank);
+        lines.Add("don=" + this.p.donateAcc);
+        lines.Add("nt=" + this.p.nobleTier);
+        for (int i = 0; i < 5; i = i + 1) {
+            lines.Add("wx" + i + "=" + this.p.wuxingMs[i]);
+        }
+        for (int i = 0; i < this.p.cardMaskLen; i = i + 1) {
+            lines.Add("cm" + i + "=" + this.p.cardMask[i]);
+        }
+        lines.Add("tupu=" + this.p.tupuScore);
+        lines.Add("dtc=" + this.p.dtCount);
+        lines.Add("xbt=" + this.p.xbTickets);
+        lines.Add("altm=" + this.p.altarMyProg);
+        lines.Add("altg=" + this.p.altarGlobalProg);
+        lines.Add("pkl=" + this.p.pkTriesLeft);
+        lines.Add("ybl=" + this.p.ybTriesLeft);
+        lines.Add("jbl=" + this.p.jbTriesLeft);
+        lines.Add("tow=" + this.p.towerBest);
+        lines.Add("city=" + this.p.cityOwned);
+        lines.Add("cityms=" + this.p.cityLastMs);
+        lines.Add("wbd=" + this.p.wbDamage);
+        lines.Add("wbl=" + this.p.wbTriesLeft);
+        lines.Add("gh=" + (this.p.hasGuild ? 1 : 0));
+        lines.Add("ghn=" + this.p.guildName);
+        lines.Add("stc=" + this.p.studentCount);
+        lines.Add("mc=" + this.p.mailCnt);
+        for (int i = 0; i < 8; i = i + 1) {
+            lines.Add("mt" + i + "=" + this.p.mailTitle[i]);
+        }
+        lines.Add("cc=" + this.p.chatCnt);
+        for (int i = 0; i < this.p.chatCnt && i < 80; i = i + 1) {
+            lines.Add("cl" + i + "=" + this.p.chatLog[i]);
+        }
+        lines.Add("bs=" + this.rkSeed);
+        // 装备
+        string eq = "";
+        for (int i = 0; i < Data.SLOT_COUNT; i = i + 1) {
+            Item it = this.p.equip[i];
+            if (it == null) { eq = eq + "-1"; }
+            else { eq = eq + it.slot + ":" + it.tier + ":" + it.coef + ":" + it.cls + ":" + it.seed; }
+            if (i < Data.SLOT_COUNT - 1) { eq = eq + ";"; }
+        }
+        lines.Add("eq=" + eq);
+        // 背包
+        string bg = "";
+        for (int i = 0; i < this.p.bagCnt && i < 60; i = i + 1) {
+            Item it = this.p.bag[i];
+            if (it == null) { bg = bg + "-1"; }
+            else { bg = bg + it.slot + ":" + it.tier + ":" + it.coef + ":" + it.cls + ":" + it.seed; }
+            if (i < this.p.bagCnt - 1) { bg = bg + ";"; }
+        }
+        lines.Add("bg=" + bg);
+        lines.Add("bgc=" + this.p.bagCnt);
+
+        // 写文件
+        File.WriteAllLines(sp, lines);
+    }
+
+    static int ParseIdx(string s, int start) {
+        int v = 0;
+        bool neg = false;
+        int i = start;
+        if (i < s.Length && s.Substring(i, 1) == "-") { neg = true; i = i + 1; }
+        while (i < s.Length) {
+            string c = s.Substring(i, 1);
+            if (c >= "0" && c <= "9") { v = v * 10 + Game.DigitOf(c); }
+            else { break; }
+            i = i + 1;
+        }
+        if (neg) { v = -v; }
+        return v;
+    }
+    static Item ParseItem(string s) {
+        if (s == null || s.Length < 3) { return null; }
+        if (s.Substring(0, 1) == "-") { return null; }
+        int[] parts = new int[5];
+        int pi = 0;
+        int vi = 0;
+        int cur = 0;
+        int[] vals = new int[5];
+        int nv = 0;
+        while (vi < s.Length && nv < 5) {
+            string c = s.Substring(vi, 1);
+            if (c == ":") {
+                vals[nv] = cur;
+                nv = nv + 1;
+                cur = 0;
+                vi = vi + 1;
+            } else if (c >= "0" && c <= "9") {
+                cur = cur * 10 + Game.DigitOf(c);
+                vi = vi + 1;
+            } else {
+                break;
+            }
+        }
+        if (nv < 4) {
+            vals[nv] = cur;
+        }
+        return Item.New(vals[0], vals[1], vals[2], vals[3], vals[4]);
+    }
+
+    public bool Load() {
+        string sp = Game.SavePath();
+        if (!File.Exists(sp)) { return false; }
+        List<string> lines = File.ReadAllLines(sp);
+        this.p = new Player();
+        for (int li = 0; li < lines.Count; li = li + 1) {
+            string ln = lines[li];
+            int eq = ln.IndexOf("=");
+            if (eq < 0) { continue; }
+            string k = ln.Substring(0, eq);
+            string v = ln.Substring(eq + 1);
+            if (k == "name") { this.p.name = v; }
+            else if (k == "cls") { this.p.cls = Game.ParseIntS(v); }
+            else if (k == "lv") { this.p.lv = Game.ParseIntS(v); }
+            else if (k == "xp") { this.p.xp = Game.ParseLongS(v); }
+            else if (k == "turn") { this.p.turn = Game.ParseIntS(v); }
+            else if (k == "bossk") { this.p.bossKilled = Game.ParseLongS(v); }
+            else if (k == "kills") { this.p.totalKills = Game.ParseLongS(v); }
+            else if (k == "vip") { this.p.vip = Game.ParseIntS(v); }
+            else if (k == "charge") { this.p.chargeTotal = Game.ParseLongS(v); }
+            else if (k.Length == 4 && k.Substring(0, 3) == "cur") {
+                int idx = Game.ParseIntS(k.Substring(3, 1));
+                if (idx >= 0 && idx < Data.CUR_COUNT) { this.p.cur[idx] = Game.ParseLongS(v); }
+            }
+            else if (k == "hjf") { this.p.hjFloor = Game.ParseIntS(v); }
+            else if (k == "hjk") { this.p.hjKills = Game.ParseIntS(v); }
+            else if (k == "hjt") { this.p.hjTarget = Game.ParseIntS(v); }
+            else if (k == "hjb") { this.p.hjBest = Game.ParseIntS(v); }
+            else if (k == "hjkacc") { this.p.hjKillAcc = Game.ParseLongS(v); }
+            else if (k == "mjf") { this.p.mjFloor = Game.ParseIntS(v); }
+            else if (k == "mjk") { this.p.mjKills = Game.ParseIntS(v); }
+            else if (k == "mjb") { this.p.mjBest = Game.ParseIntS(v); }
+            else if (k == "mju") { this.p.mjUnlocked = Game.ParseIntS(v); }
+            else if (k == "bhl") { this.p.bhTriesLeft = Game.ParseIntS(v); }
+            else if (k.Length == 3 && k.Substring(0, 2) == "bh") {
+                int idx = Game.DigitOf(k.Substring(2, 1));
+                if (idx >= 0 && idx < 8) { this.p.bhKilled[idx] = Game.ParseIntS(v); }
+            }
+            else if (k == "ts") { this.p.lastSeenTs = Game.ParseLongS(v); }
+            else if (k == "d") { this.p.lastDayTs = Game.ParseLongS(v); }
+            else if (k == "tpage") { this.p.titlePage = Game.ParseIntS(v); }
+            else if (k == "trank") { this.p.titleRank = Game.ParseIntS(v); }
+            else if (k == "don") { this.p.donateAcc = Game.ParseLongS(v); }
+            else if (k == "nt") { this.p.nobleTier = Game.ParseIntS(v); }
+            else if (k.Length == 3 && k.Substring(0, 2) == "wx") {
+                int idx = Game.DigitOf(k.Substring(2, 1));
+                if (idx >= 0 && idx < 5) { this.p.wuxingMs[idx] = Game.ParseLongS(v); }
+            }
+            else if (k.Length >= 3 && k.Substring(0, 2) == "cm") {
+                int idx = Game.ParseIntS(k.Substring(2, k.Length - 2));
+                if (idx >= 0 && idx < this.p.cardMaskLen) { this.p.cardMask[idx] = Game.ParseIntS(v); }
+            }
+            else if (k == "tupu") { this.p.tupuScore = Game.ParseLongS(v); }
+            else if (k == "dtc") { this.p.dtCount = Game.ParseIntS(v); }
+            else if (k == "xbt") { this.p.xbTickets = Game.ParseIntS(v); }
+            else if (k == "altm") { this.p.altarMyProg = Game.ParseIntS(v); }
+            else if (k == "altg") { this.p.altarGlobalProg = Game.ParseIntS(v); }
+            else if (k == "pkl") { this.p.pkTriesLeft = Game.ParseIntS(v); }
+            else if (k == "ybl") { this.p.ybTriesLeft = Game.ParseIntS(v); }
+            else if (k == "jbl") { this.p.jbTriesLeft = Game.ParseIntS(v); }
+            else if (k == "tow") { this.p.towerBest = Game.ParseIntS(v); }
+            else if (k == "city") { this.p.cityOwned = Game.ParseIntS(v); }
+            else if (k == "cityms") { this.p.cityLastMs = Game.ParseLongS(v); }
+            else if (k == "wbd") { this.p.wbDamage = Game.ParseLongS(v); }
+            else if (k == "wbl") { this.p.wbTriesLeft = Game.ParseIntS(v); }
+            else if (k == "gh") { this.p.hasGuild = (Game.ParseIntS(v) != 0); }
+            else if (k == "ghn") { this.p.guildName = v; }
+            else if (k == "stc") { this.p.studentCount = Game.ParseIntS(v); }
+            else if (k == "mc") { this.p.mailCnt = Game.ParseIntS(v); }
+            else if (k.Length >= 3 && k.Substring(0, 2) == "mt") {
+                int idx = Game.ParseIntS(k.Substring(2, k.Length - 2));
+                if (idx >= 0 && idx < 8) { this.p.mailTitle[idx] = v; }
+            }
+            else if (k == "cc") { this.p.chatCnt = Game.ParseIntS(v); }
+            else if (k.Length >= 3 && k.Substring(0, 2) == "cl") {
+                int idx = Game.ParseIntS(k.Substring(2, k.Length - 2));
+                if (idx >= 0 && idx < 80) { this.p.chatLog[idx] = v; }
+            }
+            else if (k == "bs") { this.rkSeed = Game.ParseLongS(v); }
+            else if (k == "eq") {
+                // parse multi slot
+                string cur = "";
+                for (int j = 0; j <= v.Length; j = j + 1) {
+                    if (j == v.Length || v.Substring(j, 1) == ";") {
+                        if (cur != "") {
+                            int comma = cur.IndexOf(":");
+                            if (comma <= 0) { continue; }
+                            int slot = Game.ParseIntS(cur.Substring(0, comma));
+                            if (slot >= 0 && slot < Data.SLOT_COUNT) {
+                                this.p.equip[slot] = Game.ParseItem(cur);
+                            }
+                        }
+                        cur = "";
+                    } else { cur = cur + v.Substring(j, 1); }
+                }
+            }
+            else if (k == "bg") {
+                int slot = 0;
+                string cur = "";
+                for (int j = 0; j <= v.Length; j = j + 1) {
+                    if (j == v.Length || v.Substring(j, 1) == ";") {
+                        if (cur != "" && slot < 60) {
+                            this.p.bag[slot] = Game.ParseItem(cur);
+                            slot = slot + 1;
+                        }
+                        cur = "";
+                    } else { cur = cur + v.Substring(j, 1); }
+                }
+            }
+            else if (k == "bgc") { this.p.bagCnt = Game.ParseIntS(v); }
+        }
+        // 重建 Rng
+        this.rng = Rng.Seed(this.rkSeed);
+        // 重生怪物
+        this.SpawnMonster(this.p.hjFloor, this.IsBossFloor(this.p.hjFloor));
+        return true;
+    }
+}

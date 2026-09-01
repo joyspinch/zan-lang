@@ -1,0 +1,2191 @@
+// 传奇放置挂机 — SDL3 主机 + UI + 全部面板。
+// 运行:  build/zanc.exe examples/game/legend/main.zan \
+//                examples/game/legend/Game.zan \
+//                examples/game/legend/Data.zan \
+//                examples/game/common/GameKit.zan \
+//                --auto-stdlib -o build/legend.exe
+// 自测:  LEGEND_SIM=1 build/legend.exe  → 无头 60s 离线结算+推层模拟
+using System;
+using System.IO;
+using SDL3;
+using GameKit;
+using Legend;
+
+class Snd {
+    public SdlAudioClip up;
+    public SdlAudioClip box;
+    public SdlAudioClip tip;
+    public SdlAudioClip trade;
+    public SdlAudioClip craft;
+    public bool ready;
+    public bool on;
+
+    public static Snd Create(bool on) {
+        Snd s = new Snd();
+        s.on = on;
+        if (!SdlAudio.Open()) { return s; }
+        s.up = SdlAudioClip.LoadWav(Assets.Find("examples/game/legend/assets/up.wav"));
+        s.box = SdlAudioClip.LoadWav(Assets.Find("examples/game/legend/assets/box.wav"));
+        s.tip = SdlAudioClip.LoadWav(Assets.Find("examples/game/legend/assets/tip.wav"));
+        s.trade = SdlAudioClip.LoadWav(Assets.Find("examples/game/legend/assets/trade.wav"));
+        s.craft = SdlAudioClip.LoadWav(Assets.Find("examples/game/legend/assets/craft.wav"));
+        s.ready = s.up.IsValid() || s.tip.IsValid();
+        return s;
+    }
+    public void Play(SdlAudioClip c, double gain) {
+        if (!this.on || c == null || !c.IsValid()) { return; }
+        c.Play(gain, 0);
+    }
+    public void Up() { this.Play(this.up, 0.7); }
+    public void Craft() { this.Play(this.craft, 0.6); }
+    public void Box() { this.Play(this.box, 0.9); }
+    public void Tip() { this.Play(this.tip, 0.4); }
+    public void Trade() { this.Play(this.trade, 0.7); }
+}
+
+// 顶部 + 底部 30+10 导航按钮名称
+class NavBtn {
+    public static string[] TOP1 = new string[10];   // 顶排 1
+    public static string[] TOP2 = new string[10];   // 顶排 2
+    public static string[] BOT = new string[10];    // 底排
+    public static int[] TOP1_PG = new int[10];      // 对应模态页码
+    public static int[] TOP2_PG = new int[10];
+    public static int[] BOT_PG = new int[10];
+    static NavBtn() {
+        TOP1[0]="地图传送"; TOP1[1]="PK竞技场"; TOP1[2]="幻境";
+        TOP1[3]="BOSS之家"; TOP1[4]="押镖";     TOP1[5]="行会";
+        TOP1[6]="沙巴克";   TOP1[7]="城池争夺";  TOP1[8]="传说塔";
+        TOP1[9]="排行榜";
+        TOP1_PG[0]=27; TOP1_PG[1]=20; TOP1_PG[2]=0;
+        TOP1_PG[3]=1;  TOP1_PG[4]=21; TOP1_PG[5]=25;
+        TOP1_PG[6]=26; TOP1_PG[7]=22; TOP1_PG[8]=23;
+        TOP1_PG[9]=11;
+        TOP2[0]="五行修炼"; TOP2[1]="师徒";    TOP2[2]="秘境";
+        TOP2[3]="世界BOSS"; TOP2[4]="祭坛";    TOP2[5]="寻宝";
+        TOP2[6]="将星图谱"; TOP2[7]="回收系统"; TOP2[8]="发红包";
+        TOP2[9]="至尊极品";
+        TOP2_PG[0]=8; TOP2_PG[1]=24; TOP2_PG[2]=28;
+        TOP2_PG[3]=19; TOP2_PG[4]=5;  TOP2_PG[5]=4;
+        TOP2_PG[6]=9; TOP2_PG[7]=3;  TOP2_PG[8]=29;
+        TOP2_PG[9]=18;
+        BOT[0]="背包"; BOT[1]="铁匠铺"; BOT[2]="交易市场";
+        BOT[3]="图鉴";   BOT[4]="爵位";   BOT[5]="称谓";
+        BOT[6]="成就";   BOT[7]="商店";   BOT[8]="帮助";
+        BOT[9]="邮箱";
+        BOT_PG[0]=16; BOT_PG[1]=2; BOT_PG[2]=30;
+        BOT_PG[3]=17; BOT_PG[4]=7; BOT_PG[5]=6;
+        BOT_PG[6]=10; BOT_PG[7]=12; BOT_PG[8]=15;
+        BOT_PG[9]=13;
+    }
+}
+
+class LegendApp {
+    // SDL scancode for F10 (老板键);stdlib SdlScancode 只有 F1/F5/F11,F10 = F1 + 9 = 67
+    public static int SC_F10 = 67;
+
+    public Host host;
+    public SdlRenderer r;
+    public Game g;
+    public Snd snd;
+    public Rng uiRng;
+
+    public int mouseX;
+    public int mouseY;
+    public bool mouseDown;
+    public bool mouseJustDown;
+    public bool mouseJustUp;
+    public long now;
+    public long lastStepAt;
+    public double simAccum;
+    public int flashRedDot;     // 0 无 / 1 全局红点(有可领取)
+
+    public int modal;           // -1 无 / 0..30 模态页码
+    public int modalSub;        // 子页(如铁匠铺 11 模式子页)
+    public int modalHover;
+    public int bagSel;          // 背包选中索引
+    public int shopPage;        // 商店货币页签
+    public int rankKind;        // 排行榜子榜 0..6
+    public int forgeMode;       // 铁匠铺模式 0..10
+    public bool forgeSel;       // 是否已选一件装备
+    public int refineKind;      // 0 金币 1 元宝
+    public int bossHomeIdx;     // BOSS 之家选中
+    public int albumGroup;      // 图鉴分组
+    public int dtPage;          // 殿堂子页
+    public int towerFloor;      // 传说塔目标层
+    public int cardPool;        // 将星卡池
+    public int wuxingSlot;      // 五行槽
+    public int mapCur;          // 当前地图
+
+    public long splashStart;
+    public long lastBroadcastTick;
+    public string offlineText;
+    public bool showOffline;
+
+    // 资源
+    public SdlTexture texBg;        // 烘焙背景
+    public SdlTexture texSplash;    // 启动画面
+    public SdlTexture texDim;       // 暗化遮罩
+    public SdlTexture texPanel;     // panel_nine 9 宫格
+    public SdlTexture texBtnDark;
+    public SdlTexture texBtnDarkHi;
+    public SdlTexture texBtnGold;
+    public SdlTexture texBtnGoldHi;
+    public SdlTexture texBarChrome;
+    public SdlTexture texBarFill;
+    public SdlTexture texBarTrough;
+    public SdlTexture texRowStone;
+    public SdlTexture texTitlePlate;
+    public SdlTexture[]texIcon;     // 5 货币图标
+    public SdlTexture[]texEquip;    // 8×5 装备图标
+    public SdlTexture texMobNormal;
+    public SdlTexture texMobBoss;
+    public SdlTexture[]texClass;    // 3 职业立绘
+    public SdlTexture[]texBoss;     // 4 大教主立绘
+    public SdlTexture texMapBichon;
+    public SdlTexture texMapStone;
+
+    [DllImport("crt", EntryPoint = "getenv")]
+    static extern string SysGetenvRaw(string name);
+
+    static string SysGetenv(string name) {
+        string v = LegendApp.SysGetenvRaw(name);
+        if (v == null) { return ""; }
+        return v;
+    }
+
+    public static int W() { return Data.W; }
+    public static int H() { return Data.H; }
+    public static int MainTop() { return Data.MAIN_TOP; }
+    public static int MainBottom() { return Data.MAIN_BOTTOM(); }
+
+    public static LegendApp Create(Host h) {
+        LegendApp a = new LegendApp();
+        a.host = h;
+        a.r = h.Renderer();
+        a.uiRng = Rng.Seed(987654321L);
+        // 货币图标(用 5 个,金币/元宝/声望/灵符/积分)
+        a.texIcon = new SdlTexture[5];
+        a.texIcon[0] = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/icon_gold.png"));
+        a.texIcon[1] = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/icon_crystal.png"));
+        a.texIcon[2] = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/icon_iron.png"));
+        a.texIcon[3] = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/icon_copper.png"));
+        a.texIcon[4] = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/icon_core.png"));
+        // 装备 8×5
+        a.texEquip = new SdlTexture[40];
+        for (int c = 0; c < 8; c = c + 1) {
+            for (int t = 0; t < 5; t = t + 1) {
+                string p = "examples/game/legend/assets/equip_c" + c + "_t" + t + ".png";
+                a.texEquip[c * 5 + t] = SdlTexture.LoadImage(a.r, Assets.Find(p));
+            }
+        }
+        // 怪物 / 职业立绘
+        a.texMobNormal = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/monster_normal.png"));
+        a.texMobBoss = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/monster_boss.png"));
+        a.texClass = new SdlTexture[3];
+        a.texClass[0] = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/class_warrior.png"));
+        a.texClass[1] = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/class_mage.png"));
+        a.texClass[2] = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/class_taoist.png"));
+        a.texBoss = new SdlTexture[4];
+        a.texBoss[0] = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/boss_woma.png"));
+        a.texBoss[1] = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/boss_zuma.png"));
+        a.texBoss[2] = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/boss_chiyue.png"));
+        a.texBoss[3] = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/boss_molong.png"));
+        a.texMapBichon = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/map_bichon.png"));
+        a.texMapStone = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/row_stone.png"));
+        a.texBg = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/bg_mine.jpg"));
+        a.texSplash = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/splash.png"));
+        a.texDim = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/dim_bg.jpg"));
+        a.texPanel = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/panel_nine.png"));
+        a.texBtnDark = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/btn_dark.png"));
+        a.texBtnDarkHi = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/btn_dark_hi.png"));
+        a.texBtnGold = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/btn_gold.png"));
+        a.texBtnGoldHi = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/btn_gold_hi.png"));
+        a.texBarChrome = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/bar_chrome.png"));
+        a.texBarFill = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/bar_fill.png"));
+        a.texBarTrough = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/bar_trough.png"));
+        a.texRowStone = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/row_stone.png"));
+        a.texTitlePlate = SdlTexture.LoadImage(a.r, Assets.Find("examples/game/legend/assets/title_plate.png"));
+        if (a.texBg != null && a.texBg.IsValid()) {
+            a.texBg.SetBlendMode(1);
+        }
+        if (a.texSplash != null && a.texSplash.IsValid()) {
+            a.texSplash.SetBlendMode(1);
+        }
+        // 启动游戏
+        a.g = new Game();
+        bool loaded = a.g.Load();
+        if (!loaded) {
+            a.g.NewGame("看见啥的就是", 0);
+        }
+        // 离线结算
+        a.g.OfflineSettle();
+        // 检查日刷新
+        if (a.g.IsNewDay()) { a.g.DayReset(); }
+        a.modal = 31;  // 类选择屏
+        a.splashStart = a.now;
+        return a;
+    }
+
+    public void Tick() {
+        if (this.modal == 31) {
+            this.DrawClassSelect();
+            return;
+        }
+        // 自动战斗(节拍 120ms)
+        if (this.now - this.lastStepAt >= 120) {
+            this.lastStepAt = this.now;
+            this.g.StepIdle(0.12);
+        }
+        // 自动广播
+        this.g.AutoBroadcast();
+        this.DrawAll();
+    }
+
+    public void Save() { this.g.Save(); }
+
+    // ---------------------------------------------------------------
+    // 渲染:全局
+    // ---------------------------------------------------------------
+    public void DrawAll() {
+        int w = LegendApp.W();
+        int h = LegendApp.H();
+        SdlRenderer rd = this.r;
+        // 老板键隐藏
+        if (this.g.bossMode) {
+            rd.SetColor(28, 32, 44, 255);
+            rd.Clear();
+            Text.DrawCentered(rd, "(静默运行中…按 F10 恢复)", w / 2, h / 2, 3,
+                              200, 200, 220, 255);
+            return;
+        }
+        // 背景
+        if (this.texBg != null && this.texBg.IsValid()) {
+            rd.DrawTexture(this.texBg, 0, 0, w, h);
+        } else {
+            Draw.VGradient(rd, 0, 0, w, h, 18, 22, 32, 8, 10, 16, 255);
+        }
+        // 暗化遮罩
+        if (this.texDim != null && this.texDim.IsValid()) {
+            rd.SetColor(255, 255, 255, 80);
+            rd.DrawTexture(this.texDim, 0, 0, w, h);
+            rd.SetColor(255, 255, 255, 255);
+        }
+        // 标题栏
+        this.DrawTitleBar();
+        // 顶部两排导航
+        this.DrawTopNav();
+        // 主区
+        this.DrawMainArea();
+        // 底部导航
+        this.DrawBottomNav();
+        // 模态面板
+        if (this.modal >= 0) { this.DrawModal(); }
+    }
+
+    public void DrawTitleBar() {
+        int w = LegendApp.W();
+        SdlRenderer rd = this.r;
+        Draw.RoundRectFill(rd, 0, 0, w, Data.TITLE_BAR_H, 0, 12, 16, 26, 255);
+        Draw.RoundRectFill(rd, 0, Data.TITLE_BAR_H - 2, w, 2, 0, 198, 158, 80, 220);
+        // 标题
+        Text.DrawShadow(rd, "传奇放置挂机", 16, 12, 2, 230, 198, 130, 255);
+        // 角色信息
+        string[] clsN = new string[3];
+        clsN[0] = "战士"; clsN[1] = "法师"; clsN[2] = "道士";
+        Text.DrawShadow(rd, "Lv." + this.g.p.lv + "  " + clsN[this.g.p.cls],
+                        200, 12, 2, 230, 220, 200, 255);
+        // 货币(右侧 4 个)
+        int mx = w - 600;
+        for (int i = 0; i < 5; i = i + 1) {
+            int idx = i;
+            if (idx == 4) { idx = 6; }  // 积分
+            long v = this.g.p.cur[idx];
+            string s = this.g.FormatCur(v);
+            int tw = Text.Width(rd, s, 2);
+            int ix = mx + i * 120;
+            if (this.texIcon[i] != null && this.texIcon[i].IsValid()) {
+                rd.DrawTexture(this.texIcon[i], ix, 8, 18, 18);
+            }
+            Text.DrawShadow(rd, s, ix + 22, 12, 2, 230, 215, 175, 255);
+        }
+        // 设置齿轮按钮
+        int sx = w - 36;
+        int sy = 4;
+        if (Draw.PointIn(this.mouseX, this.mouseY, sx, sy, 32, 32)) {
+            Draw.RoundRectFill(rd, sx - 2, sy - 2, 36, 36, 6, 90, 110, 140, 220);
+            if (this.mouseJustUp) { this.modal = 14; this.g.ToggleBossKey(); }
+        }
+        Text.DrawCentered(rd, "⚙", sx + 16, sy + 8, 2, 230, 200, 130, 255);
+    }
+
+    public void DrawTopNav() {
+        SdlRenderer rd = this.r;
+        int y0 = Data.TITLE_BAR_H;
+        int by = y0 + 6;
+        int bh = Data.NAV_ROW_H - 12;
+        // 排 1
+        for (int i = 0; i < 10; i = i + 1) {
+            int bx = i * 128 + 4;
+            this.DrawNavBtn(bx, by, 120, bh, NavBtn.TOP1[i], NavBtn.TOP1_PG[i], 0);
+        }
+        // 排 2
+        by = y0 + Data.NAV_ROW_H + 6;
+        for (int i = 0; i < 10; i = i + 1) {
+            int bx = i * 128 + 4;
+            this.DrawNavBtn(bx, by, 120, bh, NavBtn.TOP2[i], NavBtn.TOP2_PG[i], 1);
+        }
+    }
+
+    public void DrawBottomNav() {
+        SdlRenderer rd = this.r;
+        int by = LegendApp.MainBottom() + 4;
+        for (int i = 0; i < 10; i = i + 1) {
+            int bx = i * 128 + 4;
+            this.DrawNavBtn(bx, by, 120, 60, NavBtn.BOT[i], NavBtn.BOT_PG[i], 2);
+        }
+    }
+
+    public void DrawNavBtn(int x, int y, int w, int h, string label, int page, int row) {
+        SdlRenderer rd = this.r;
+        bool hov = Draw.PointIn(this.mouseX, this.mouseY, x, y, w, h);
+        bool sel = (this.modal == page);
+        SdlTexture tex;
+        if (sel) { tex = this.texBtnGoldHi; }
+        else if (hov) { tex = this.texBtnDarkHi; }
+        else if (row == 0) { tex = this.texBtnGold; }
+        else { tex = this.texBtnDark; }
+        if (tex != null && tex.IsValid()) {
+            LegendApp.NineImg(rd, tex, 256, 96, 16, 16, x, y, w, h);
+        } else {
+            Ui.Panel(rd, x, y, w, h, 46, 52, 70, 220);
+        }
+        int tc = sel ? 32 : 230;
+        if (row == 2) { tc = 230; }
+        Text.DrawCenteredShadow(rd, label, x + w / 2, y + h / 2 - 8, 2, tc, tc, tc, 1);
+        if (hov && this.mouseJustUp) {
+            if (this.modal == page) { this.modal = -1; }
+            else { this.modal = page; this.modalSub = 0; }
+            this.snd.Tip();
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 主区
+    // ---------------------------------------------------------------
+    public void DrawMainArea() {
+        int w = LegendApp.W();
+        int y0 = LegendApp.MainTop();
+        int y1 = LegendApp.MainBottom();
+        // 左角色面板
+        this.DrawCharPanel(0, y0, 240, y1 - y0);
+        // 中央:幻境主显示
+        this.DrawHuanJingMain(240, y0, w - 240 - 320, y1 - y0);
+        // 右聊天
+        this.DrawChatPanel(w - 320, y0, 320, y1 - y0);
+    }
+
+    public void DrawCharPanel(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        if (this.texPanel != null && this.texPanel.IsValid()) {
+            LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, x, y, w, h);
+        } else {
+            Ui.Panel(rd, x, y, w, h, 26, 30, 44, 232);
+        }
+        int pad = 12;
+        int cy = y + pad;
+        // 头像
+        if (this.texClass != null && this.texClass[this.g.p.cls] != null
+            && this.texClass[this.g.p.cls].IsValid()) {
+            int ax = x + w / 2 - 36;
+            int ay = cy;
+            rd.DrawTexture(this.texClass[this.g.p.cls], ax, ay, 72, 72);
+            cy = cy + 78;
+        } else {
+            Draw.RoundRectFill(rd, x + w / 2 - 36, cy, 72, 72, 8, 60, 50, 38, 255);
+            cy = cy + 78;
+        }
+        // 角色名 + 转生
+        Text.DrawCentered(rd, this.g.p.name, x + w / 2, cy, 2, 240, 220, 180, 255);
+        cy = cy + 22;
+        Text.DrawCentered(rd, this.g.p.turn + " 转", x + w / 2, cy, 1, 200, 170, 100, 255);
+        cy = cy + 18;
+        // 属性
+        string[] attrs = new string[8];
+        attrs[0] = "生命:" + this.g.TotalHp();
+        attrs[1] = "魔法:" + this.g.BaseMp();
+        attrs[2] = "攻击:" + this.g.TotalAcMin() + "-" + this.g.TotalAcMax();
+        attrs[3] = "防御:" + this.g.TotalDef();
+        attrs[4] = "魔防:" + this.g.TotalMDef();
+        attrs[5] = "幸运:" + this.g.p.titleRank;
+        attrs[6] = "经验:" + this.g.ExpForLv(this.g.p.lv);
+        attrs[7] = "等级:" + this.g.p.lv;
+        for (int i = 0; i < 8; i = i + 1) {
+            Text.DrawShadow(rd, attrs[i], x + pad, cy, 1, 220, 210, 180, 255);
+            cy = cy + 16;
+        }
+        // 经验条
+        cy = cy + 4;
+        LegendApp.BarImg(rd, x + pad, cy, w - pad * 2, 14,
+                         this.g.p.xp, this.g.ExpForLv(this.g.p.lv));
+        cy = cy + 22;
+        // 货币
+        for (int i = 0; i < 4; i = i + 1) {
+            int idx = i;
+            if (idx == 3) { idx = 6; }
+            long v = this.g.p.cur[idx];
+            string s = Data.CUR_NAMES[idx] + ":" + this.g.FormatCur(v);
+            Text.DrawShadow(rd, s, x + pad, cy, 1, 220, 215, 180, 255);
+            cy = cy + 16;
+        }
+        // 称谓 / 爵位
+        cy = cy + 6;
+        string tp = Data.TITLE_PAGE_NAMES[this.g.p.titlePage] + (this.g.p.titleRank + 1) + " 阶";
+        Text.DrawShadow(rd, "称谓:" + tp, x + pad, cy, 1, 230, 200, 120, 255);
+        cy = cy + 16;
+        string np = this.g.p.nobleTier >= 0 ? Data.NOBLE_NAMES[this.g.p.nobleTier] : "平民";
+        Text.DrawShadow(rd, "爵位:" + np, x + pad, cy, 1, 230, 200, 120, 255);
+        cy = cy + 16;
+        // 升级按钮
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + pad, cy, w - pad * 2, 30,
+                      "升级", 2, 1)) {
+            if (this.mouseJustUp) {
+                this.g.TryTitleUp();
+                if (this.g.CanTurn()) { this.g.DoTurn(); }
+                this.snd.Up();
+            }
+        }
+        cy = cy + 36;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + pad, cy, w - pad * 2, 30,
+                      "每日福利", 2, 0)) {
+            if (this.mouseJustUp) {
+                this.g.p.cur[Data.CUR_GOLD] = this.g.p.cur[Data.CUR_GOLD] + 50000;
+                this.g.AddChat("[每日福利] 领取 5 万金币");
+                this.snd.Box();
+            }
+        }
+        cy = cy + 36;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + pad, cy, w - pad * 2, 30,
+                      "充值", 2, 1)) {
+            if (this.mouseJustUp) { this.modal = 40; }
+        }
+    }
+
+    public void DrawHuanJingMain(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        // 顶部 50px:层数 + 切换按钮
+        int ty = y + 6;
+        Text.DrawShadow(rd, "幻境 第 " + this.g.p.hjFloor + " 层 (击杀 " +
+                        this.g.p.hjKills + "/" + this.g.p.hjTarget + ")",
+                        x + 16, ty, 3, 250, 215, 130, 255);
+        ty = ty + 28;
+        // 地图名
+        int mapIdx = 0;
+        for (int i = 0; i < 20; i = i + 1) {
+            if (Data.MAP_MIN_FLOOR[i] <= this.g.p.hjFloor) { mapIdx = i; }
+        }
+        Text.DrawShadow(rd, "当前地图:" + Data.MAP_NAMES[mapIdx],
+                        x + 16, ty, 2, 200, 200, 220, 255);
+        // 自动 / 挑战 / 扫荡 / 说明 按钮
+        int bx = x + w - 380;
+        int by = y + 8;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, bx, by, 80, 28,
+                      "自动重置", 1, 0)) {
+            if (this.mouseJustUp) {
+                this.g.AddChat("[幻境] 已开启自动重置");
+            }
+        }
+        bx = bx + 86;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, bx, by, 80, 28,
+                      "挑战幻境", 1, 1)) {
+            if (this.mouseJustUp) {
+                this.g.StepIdle(0.12);
+                this.snd.Craft();
+            }
+        }
+        bx = bx + 86;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, bx, by, 80, 28,
+                      "扫荡幻境", 1, 2)) {
+            if (this.mouseJustUp) {
+                if (this.g.p.vip >= 1) {
+                    for (int i = 0; i < 5; i = i + 1) { this.g.StepIdle(0.12); }
+                    this.g.AddChat("[幻境] 扫荡 5 次");
+                } else {
+                    this.g.AddChat("[系统] 扫荡为终身会员特权");
+                }
+            }
+        }
+        bx = bx + 86;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, bx, by, 80, 28,
+                      "说明", 1, 0)) {
+            if (this.mouseJustUp) { this.modal = 15; this.modalSub = 1; }
+        }
+        // 怪显示区
+        int mx = x + w / 2;
+        int my = y + 130;
+        SdlTexture mt = this.g.curIsBoss ? this.texMobBoss : this.texMobNormal;
+        if (mt != null && mt.IsValid()) {
+            rd.DrawTexture(mt, mx - 100, my - 60, 200, 200);
+        } else {
+            Draw.RoundRectFill(rd, mx - 60, my, 120, 120, 12, 70, 60, 50, 220);
+        }
+        // 怪名
+        Text.DrawCentered(rd, this.g.curMonsterName, mx, my - 70, 2, 240, 220, 180, 255);
+        // HP bar
+        LegendApp.BarImg(rd, mx - 80, my + 130, 160, 14,
+                         this.g.curMonsterHp, this.g.curMonsterHpMax);
+        Text.DrawCentered(rd, this.g.FormatNum(this.g.curMonsterHp) + "/" +
+                        this.g.FormatNum(this.g.curMonsterHpMax),
+                        mx, my + 148, 1, 220, 215, 180, 255);
+        // 掉落墙(底部 8 格)
+        int dwY = y + h - 100;
+        Text.DrawShadow(rd, "掉落墙", x + 16, dwY - 18, 2, 220, 215, 180, 255);
+        for (int i = 0; i < 12; i = i + 1) {
+            int dx = x + 16 + i * 50;
+            int dy = dwY;
+            // 随机展示一个 ico(模拟最近掉落)
+            int seedIdx = (this.g.p.hjKillAcc + i * 7) % 40;
+            SdlTexture it = this.texEquip[seedIdx];
+            if (it != null && it.IsValid()) {
+                rd.DrawTexture(it, dx, dy, 40, 40);
+            } else {
+                Draw.RoundRectFill(rd, dx, dy, 40, 40, 4, 50, 50, 60, 200);
+            }
+            int tier = seedIdx % 5;
+            int coef = 1 + (i + this.g.p.hjFloor) % 9;
+            Text.DrawCentered(rd, "+" + coef, dx + 20, dy + 42, 1, 230, 220, 160, 255);
+        }
+        // 战斗统计
+        int sy = y + h - 26;
+        Text.DrawShadow(rd, "击杀:" + this.g.p.totalKills + "  BOSS:" + this.g.p.bossKilled
+                        + "  累计伤害:" + this.g.FormatNum(this.g.totalDamageDealt),
+                        x + 16, sy, 1, 180, 180, 200, 255);
+    }
+
+    public void DrawChatPanel(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        if (this.texPanel != null && this.texPanel.IsValid()) {
+            LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, x, y, w, h);
+        } else {
+            Ui.Panel(rd, x, y, w, h, 26, 30, 44, 232);
+        }
+        Text.DrawShadow(rd, "聊天 / 广播", x + 12, y + 8, 2, 230, 200, 130, 255);
+        // tab:世界 / 行会
+        int ty = y + 32;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 12, ty, 60, 22, "世界", 1, 2)) {
+            if (this.mouseJustUp) { this.snd.Tip(); }
+        }
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 80, ty, 60, 22, "行会", 1, 0)) {
+            if (this.mouseJustUp) { this.snd.Tip(); }
+        }
+        ty = ty + 30;
+        // log
+        int maxLines = (h - 80) / 14;
+        int start = this.g.p.chatCnt - maxLines;
+        if (start < 0) { start = 0; }
+        for (int i = start; i < this.g.p.chatCnt; i = i + 1) {
+            string m = this.g.p.chatLog[i];
+            if (m == null) { continue; }
+            int cr = 200; int cg = 200; int cb = 210;
+            if (m.IndexOf("[广播]") >= 0) { cr = 250; cg = 215; cb = 130; }
+            else if (m.IndexOf("[系统]") >= 0) { cr = 240; cg = 180; cb = 90; }
+            else if (m.IndexOf("[掉落]") >= 0 || m.IndexOf("[离线]") >= 0) {
+                cr = 180; cg = 240; cb = 200;
+            }
+            Text.DrawShadow(rd, m, x + 12, ty, 1, cr, cg, cb, 255);
+            ty = ty + 14;
+        }
+        // 输入框(简化)
+        int iy = y + h - 32;
+        Draw.RoundRectFill(rd, x + 12, iy, w - 80, 22, 4, 38, 42, 56, 220);
+        Text.DrawShadow(rd, "(输入栏)", x + 18, iy + 6, 1, 180, 180, 200, 255);
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + w - 60, iy, 48, 22,
+                      "发送", 1, 1)) {
+            if (this.mouseJustUp) { this.snd.Tip(); }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 模态分发
+    // ---------------------------------------------------------------
+    public void DrawModal() {
+        int w = LegendApp.W();
+        int h = LegendApp.H();
+        SdlRenderer rd = this.r;
+        // 暗化
+        if (this.texDim != null && this.texDim.IsValid()) {
+            rd.SetColor(255, 255, 255, 160);
+            rd.DrawTexture(this.texDim, 0, 0, w, h);
+            rd.SetColor(255, 255, 255, 255);
+        } else {
+            Draw.Scrim(rd, w, h);
+        }
+        // 模态矩形(中央)
+        int mw = (int)Math.Min(1100.0, (double)(w - 40));
+        int mh = (int)Math.Min(640.0, (double)(h - 100));
+        int mx = (w - mw) / 2;
+        int my = (h - mh) / 2;
+        if (this.texPanel != null && this.texPanel.IsValid()) {
+            LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, mx, my, mw, mh);
+        } else {
+            Ui.Panel(rd, mx, my, mw, mh, 30, 36, 52, 240);
+        }
+        // 分发
+        if (this.modal == 0) { /* 幻境已在主区 */ this.modal = -1; return; }
+        else if (this.modal == 1) { this.DrawBossHome(mx, my, mw, mh); }
+        else if (this.modal == 2) { this.DrawForge(mx, my, mw, mh); }
+        else if (this.modal == 3) { this.DrawRecycle(mx, my, mw, mh); }
+        else if (this.modal == 4) { this.DrawXunBao(mx, my, mw, mh); }
+        else if (this.modal == 5) { this.DrawAltar(mx, my, mw, mh); }
+        else if (this.modal == 6) { this.DrawTitle(mx, my, mw, mh); }
+        else if (this.modal == 7) { this.DrawNoble(mx, my, mw, mh); }
+        else if (this.modal == 8) { this.DrawWuxing(mx, my, mw, mh); }
+        else if (this.modal == 9) { this.DrawCardAlbum(mx, my, mw, mh); }
+        else if (this.modal == 10) { this.DrawAchievement(mx, my, mw, mh); }
+        else if (this.modal == 11) { this.DrawRanking(mx, my, mw, mh); }
+        else if (this.modal == 12) { this.DrawShop(mx, my, mw, mh); }
+        else if (this.modal == 13) { this.DrawMail(mx, my, mw, mh); }
+        else if (this.modal == 14) { this.DrawSettings(mx, my, mw, mh); }
+        else if (this.modal == 15) { this.DrawHelp(mx, my, mw, mh); }
+        else if (this.modal == 16) { this.DrawBag(mx, my, mw, mh); }
+        else if (this.modal == 17) { this.DrawAlbum(mx, my, mw, mh); }
+        else if (this.modal == 18) { this.DrawDianTang(mx, my, mw, mh); }
+        else if (this.modal == 19) { this.DrawWorldBoss(mx, my, mw, mh); }
+        else if (this.modal == 20) { this.DrawPK(mx, my, mw, mh); }
+        else if (this.modal == 21) { this.DrawYabiao(mx, my, mw, mh); }
+        else if (this.modal == 22) { this.DrawCity(mx, my, mw, mh); }
+        else if (this.modal == 23) { this.DrawTower(mx, my, mw, mh); }
+        else if (this.modal == 24) { this.DrawMaster(mx, my, mw, mh); }
+        else if (this.modal == 25) { this.DrawGuild(mx, my, mw, mh); }
+        else if (this.modal == 26) { this.DrawShabake(mx, my, mw, mh); }
+        else if (this.modal == 27) { this.DrawMap(mx, my, mw, mh); }
+        else if (this.modal == 28) { this.DrawMijing(mx, my, mw, mh); }
+        else if (this.modal == 29) { this.DrawRedBag(mx, my, mw, mh); }
+        else if (this.modal == 30) { this.DrawMarket(mx, my, mw, mh); }
+        else if (this.modal == 40) { this.DrawCharge(mx, my, mw, mh); }
+        else { this.modal = -1; return; }
+        // 关闭按钮(右上)
+        int cx = mx + mw - 36;
+        int cy = my + 6;
+        if (Draw.PointIn(this.mouseX, this.mouseY, cx, cy, 28, 28)) {
+            Draw.RoundRectFill(rd, cx - 2, cy - 2, 32, 32, 6, 200, 80, 80, 220);
+            if (this.mouseJustUp) { this.modal = -1; this.snd.Tip(); }
+        }
+        Text.DrawCentered(rd, "X", cx + 14, cy + 8, 2, 255, 255, 255, 255);
+        // 标题
+        Text.DrawShadow(rd, this.ModalTitle(), mx + 16, my + 12, 3, 250, 215, 130, 255);
+    }
+
+    public string ModalTitle() {
+        if (this.modal == 1) { return "BOSS 之家"; }
+        if (this.modal == 2) { return "铁匠铺"; }
+        if (this.modal == 3) { return "回收系统"; }
+        if (this.modal == 4) { return "寻宝"; }
+        if (this.modal == 5) { return "祭坛"; }
+        if (this.modal == 6) { return "称谓"; }
+        if (this.modal == 7) { return "爵位"; }
+        if (this.modal == 8) { return "五行修炼"; }
+        if (this.modal == 9) { return "将星图谱"; }
+        if (this.modal == 10) { return "成就"; }
+        if (this.modal == 11) { return "排行榜"; }
+        if (this.modal == 12) { return "商店"; }
+        if (this.modal == 13) { return "邮箱"; }
+        if (this.modal == 14) { return "设置"; }
+        if (this.modal == 15) { return "帮助"; }
+        if (this.modal == 16) { return "背包"; }
+        if (this.modal == 17) { return "神兵图鉴"; }
+        if (this.modal == 18) { return "至尊极品殿堂"; }
+        if (this.modal == 19) { return "世界 BOSS"; }
+        if (this.modal == 20) { return "PK 竞技场"; }
+        if (this.modal == 21) { return "押镖 / 劫镖"; }
+        if (this.modal == 22) { return "城池争夺 / 钱庄"; }
+        if (this.modal == 23) { return "传说塔"; }
+        if (this.modal == 24) { return "师徒"; }
+        if (this.modal == 25) { return "行会"; }
+        if (this.modal == 26) { return "沙巴克"; }
+        if (this.modal == 27) { return "地图传送"; }
+        if (this.modal == 28) { return "秘境"; }
+        if (this.modal == 29) { return "发红包"; }
+        if (this.modal == 30) { return "交易市场"; }
+        if (this.modal == 40) { return "充值"; }
+        return "";
+    }
+
+    // 通用面板标题(简化)
+    public void DrawPanelHeader(int x, int y, int w, string subtitle) {
+        SdlRenderer rd = this.r;
+        Draw.RoundRectFill(rd, x + 4, y + 38, w - 8, 24, 6, 38, 30, 22, 180);
+        Text.DrawShadow(rd, subtitle, x + 16, y + 44, 1, 230, 215, 180, 255);
+    }
+
+    // ---------------------------------------------------------------
+    // 模态实现
+    // ---------------------------------------------------------------
+
+    public void DrawBossHome(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "今日剩余次数:" + this.g.p.bhTriesLeft);
+        int yy = y + 76;
+        int cols = 4;
+        for (int i = 0; i < 8; i = i + 1) {
+            int col = i % cols;
+            int row = i / cols;
+            int bx = x + 16 + col * ((w - 32) / cols);
+            int by = yy + row * 110;
+            int bw = (w - 32) / cols - 12;
+            int bh = 100;
+            bool hov = Draw.PointIn(this.mouseX, this.mouseY, bx, by, bw, bh);
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx, by, bw, bh);
+            } else {
+                Ui.Panel(rd, bx, by, bw, bh, 38, 30, 22, 230);
+            }
+            // BOSS 立绘
+            if (this.texBoss != null && i < 4 && this.texBoss[i] != null
+                && this.texBoss[i].IsValid()) {
+                rd.DrawTexture(this.texBoss[i], bx + 4, by + 4, 56, 56);
+            } else if (this.texMobBoss != null && this.texMobBoss.IsValid()) {
+                rd.DrawTexture(this.texMobBoss, bx + 4, by + 4, 56, 56);
+            } else {
+                Draw.RoundRectFill(rd, bx + 4, by + 4, 56, 56, 4, 80, 40, 40, 220);
+            }
+            Text.DrawShadow(rd, Data.BOSS_NAMES[i], bx + 66, by + 8, 1, 240, 220, 180, 255);
+            Text.DrawShadow(rd, "Lv." + Data.BOSS_LV[i], bx + 66, by + 24, 1, 200, 200, 220, 255);
+            Text.DrawShadow(rd, "HP:" + Data.BOSS_HP_BASE[i],
+                            bx + 66, by + 40, 1, 220, 180, 180, 255);
+            Text.DrawShadow(rd, "击杀:" + this.g.p.bhKilled[i],
+                            bx + 66, by + 56, 1, 220, 200, 160, 255);
+            // 挑战按钮
+            if (Ui.Button(rd, this.mouseX, this.mouseY, bx + 4, by + 70, bw - 8, 24,
+                          "挑战", 1, hov ? 1 : 0)) {
+                if (this.mouseJustUp) {
+                    this.g.ChallengeBossHome(i);
+                    this.snd.Craft();
+                }
+            }
+        }
+    }
+
+    public void DrawForge(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "铁匠铺 11 模式 / 当前:" + Data.FORGE_MODES[this.forgeMode]);
+        // 左侧 11 模式按钮(纵排)
+        int lx = x + 16;
+        int ly = y + 76;
+        int lw = 110;
+        int lh = 26;
+        for (int i = 0; i < 11; i = i + 1) {
+            int by = ly + i * (lh + 4);
+            int kind = this.forgeMode == i ? 2 : 0;
+            if (Ui.Button(rd, this.mouseX, this.mouseY, lx, by, lw, lh,
+                          Data.FORGE_MODES[i], 1, kind)) {
+                if (this.mouseJustUp) { this.forgeMode = i; this.forgeSel = false; }
+            }
+        }
+        // 右侧:装备列表面板
+        int rx = lx + lw + 16;
+        int ry = ly;
+        int rw = w - (rx - x) - 16;
+        int rh = h - (ry - y) - 16;
+        if (this.texPanel != null && this.texPanel.IsValid()) {
+            LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, rx, ry, rw, rh);
+        } else {
+            Ui.Panel(rd, rx, ry, rw, rh, 30, 36, 52, 230);
+        }
+        // 标题
+        string title = "选择装备";
+        if (this.forgeMode == 0) { title = "金币洗炼(可能降低)"; }
+        else if (this.forgeMode == 1) { title = "元宝洗炼(保底)"; }
+        else if (this.forgeMode == 3) { title = "升级锻造(耗金币)"; }
+        Text.DrawShadow(rd, title, rx + 12, ry + 8, 2, 230, 215, 180, 255);
+        ry = ry + 36;
+        // 装备 60 格
+        int gx = rx + 12;
+        int gy = ry;
+        for (int i = 0; i < this.g.p.bagCnt && i < 60; i = i + 1) {
+            int c = i % 10;
+            int r = i / 10;
+            int bx = gx + c * 56;
+            int by = gy + r * 56;
+            Item it = this.g.p.bag[i];
+            if (it == null) { continue; }
+            SdlTexture tex = this.texEquip[it.cls * 5 + it.tier];
+            bool hov = Draw.PointIn(this.mouseX, this.mouseY, bx, by, 48, 48);
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx - 2, by - 2, 52, 52);
+            } else {
+                Draw.RoundRectFill(rd, bx, by, 48, 48, 4, 38, 42, 56, 220);
+            }
+            if (tex != null && tex.IsValid()) {
+                rd.DrawTexture(tex, bx, by, 48, 48);
+            }
+            Text.DrawCentered(rd, "+" + it.coef, bx + 24, by + 48, 1, 230, 200, 130, 255);
+            if (hov && this.mouseJustUp) {
+                this.bagSel = i;
+                this.forgeSel = true;
+                this.snd.Tip();
+            }
+        }
+        // 右侧详细 + 操作按钮
+        int dx = rx + rw - 280;
+        int dy = ry;
+        if (this.forgeSel && this.bagSel >= 0 && this.bagSel < this.g.p.bagCnt) {
+            Item it = this.g.p.bag[this.bagSel];
+            if (it != null) {
+                Text.DrawShadow(rd, it.Name(), dx, dy, 2, 240, 220, 180, 255);
+                dy = dy + 26;
+                Text.DrawShadow(rd, "品阶:" + Data.EQUIP_TIER_NAMES[it.tier], dx, dy, 1, 220, 210, 180, 255);
+                dy = dy + 16;
+                Text.DrawShadow(rd, "系数:" + it.coef + "/" + Data.TIER_COEF_CAP[it.tier], dx, dy, 1, 220, 210, 180, 255);
+                dy = dy + 16;
+                Text.DrawShadow(rd, "槽位:" + Data.SLOT_NAMES[it.slot], dx, dy, 1, 220, 210, 180, 255);
+                dy = dy + 24;
+                if (this.forgeMode == 0) {
+                    int cost = (int)(Data.GOLD_REFINE_COST_BASE * Math.Pow(it.coef, Data.GOLD_REFINE_COST_POW));
+                    Text.DrawShadow(rd, "金币洗炼 费用:" + cost, dx, dy, 1, 220, 215, 180, 255);
+                    dy = dy + 18;
+                    if (Ui.Button(rd, this.mouseX, this.mouseY, dx, dy, 240, 30,
+                                  "开始洗炼", 2, 1)) {
+                        if (this.mouseJustUp) {
+                            this.g.RefineGold(this.bagSel);
+                            this.snd.Craft();
+                        }
+                    }
+                } else if (this.forgeMode == 1) {
+                    int cost = Data.YB_REFINE_COST_BASE + it.coef * 5;
+                    Text.DrawShadow(rd, "元宝洗炼 费用:" + cost, dx, dy, 1, 220, 215, 180, 255);
+                    dy = dy + 18;
+                    if (Ui.Button(rd, this.mouseX, this.mouseY, dx, dy, 240, 30,
+                                  "开始洗炼", 2, 1)) {
+                        if (this.mouseJustUp) {
+                            this.g.RefineYb(this.bagSel);
+                            this.snd.Craft();
+                        }
+                    }
+                } else if (this.forgeMode == 3) {
+                    long cost = 5000 + it.tier * 3000;
+                    Text.DrawShadow(rd, "升级 费用:" + cost + " 金币", dx, dy, 1, 220, 215, 180, 255);
+                    dy = dy + 18;
+                    if (Ui.Button(rd, this.mouseX, this.mouseY, dx, dy, 240, 30,
+                                  "锻造", 2, 1)) {
+                        if (this.mouseJustUp) {
+                            this.g.UpgradeEquip(this.bagSel);
+                            this.snd.Craft();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    public void DrawRecycle(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "回收 — 一件装备可换 7 种货币");
+        // 7 货币按钮
+        int my = y + 76;
+        int mx = x + 16;
+        int bw = (w - 32) / 7;
+        for (int i = 0; i < Data.CUR_COUNT; i = i + 1) {
+            int bx = mx + i * bw;
+            int kind = this.bagSel == -100 - i ? 2 : 0;
+            if (Ui.Button(rd, this.mouseX, this.mouseY, bx, my, bw - 4, 28,
+                          Data.CUR_NAMES[i], 1, kind)) {
+                if (this.mouseJustUp) {
+                    this.refineKind = i;
+                    this.bagSel = -100 - i;
+                }
+            }
+        }
+        my = my + 36;
+        // 装备列
+        int gx = mx;
+        int gy = my;
+        for (int i = 0; i < this.g.p.bagCnt && i < 60; i = i + 1) {
+            int c = i % 12;
+            int r = i / 12;
+            int bx = gx + c * 52;
+            int by = gy + r * 52;
+            Item it = this.g.p.bag[i];
+            if (it == null) { continue; }
+            SdlTexture tex = this.texEquip[it.cls * 5 + it.tier];
+            bool hov = Draw.PointIn(this.mouseX, this.mouseY, bx, by, 48, 48);
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx - 2, by - 2, 52, 52);
+            } else {
+                Draw.RoundRectFill(rd, bx, by, 48, 48, 4, 38, 42, 56, 220);
+            }
+            if (tex != null && tex.IsValid()) {
+                rd.DrawTexture(tex, bx, by, 48, 48);
+            }
+            Text.DrawCentered(rd, "+" + it.coef, bx + 24, by + 48, 1, 230, 200, 130, 255);
+            if (hov && this.mouseJustUp && this.refineKind >= 0) {
+                this.g.Recycle(i, this.refineKind);
+                this.snd.Trade();
+            }
+        }
+    }
+
+    public void DrawXunBao(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "寻宝 — 今日寻宝图:" + this.g.p.xbTickets);
+        int cy = y + 76;
+        // 抽一次
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, cy, 160, 40,
+                      "抽一次", 2, 1)) {
+            if (this.mouseJustUp) { this.g.XunBao(); this.snd.Box(); }
+        }
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 184, cy, 160, 40,
+                      "抽十次", 2, 0)) {
+            if (this.mouseJustUp) {
+                for (int i = 0; i < 10; i = i + 1) { this.g.XunBao(); }
+                this.snd.Box();
+            }
+        }
+        // 奖池
+        cy = cy + 60;
+        for (int i = 0; i < Data.XB_POOL_SIZE; i = i + 1) {
+            int col = i % 4;
+            int row = i / 4;
+            int bx = x + 16 + col * 250;
+            int by = cy + row * 90;
+            int bw = 240;
+            int bh = 80;
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx, by, bw, bh);
+            } else {
+                Ui.Panel(rd, bx, by, bw, bh, 38, 30, 22, 220);
+            }
+            Text.DrawShadow(rd, Data.XB_PRIZE_NAMES[i], bx + 10, by + 8, 1, 240, 220, 180, 255);
+            Text.DrawShadow(rd, "价值:" + Data.XB_PRIZE_VAL[i] + " 元宝", bx + 10, by + 26, 1, 200, 200, 220, 255);
+            string pr = "";
+            double r = Data.XB_PRIZE_RATE[i];
+            int r100 = (int)(r * 10000);
+            pr = r100 / 100 + "." + (r100 % 100) + "%";
+            Text.DrawShadow(rd, "概率:" + pr, bx + 10, by + 42, 1, 200, 200, 220, 255);
+            Text.DrawShadow(rd, "今日:" + this.g.p.xbPool[i] + " 次",
+                            bx + 10, by + 58, 1, 230, 200, 130, 255);
+        }
+    }
+
+    public void DrawAltar(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "祭坛 — 个人 + 全服共建");
+        int my = y + 76;
+        Text.DrawShadow(rd, "我的进度:" + this.g.p.altarMyProg + "/" + Data.ALTAR_MY_TARGET,
+                        x + 16, my, 2, 220, 215, 180, 255);
+        LegendApp.BarImg(rd, x + 16, my + 22, w - 32, 14,
+                         this.g.p.altarMyProg, Data.ALTAR_MY_TARGET);
+        my = my + 50;
+        Text.DrawShadow(rd, "全服进度:" + this.g.p.altarGlobalProg + "/" + Data.ALTAR_GLOBAL_TARGET,
+                        x + 16, my, 2, 220, 215, 180, 255);
+        LegendApp.BarImg(rd, x + 16, my + 22, w - 32, 14,
+                         this.g.p.altarGlobalProg, Data.ALTAR_GLOBAL_TARGET);
+        my = my + 60;
+        // 捐献按钮
+        string[] lbl = new string[5];
+        lbl[0] = "金币×1"; lbl[1] = "金砖×1"; lbl[2] = "天书×1";
+        lbl[3] = "黑铁×500"; lbl[4] = "100 元宝";
+        for (int i = 0; i < 5; i = i + 1) {
+            int bx = x + 16 + i * 130;
+            if (Ui.Button(rd, this.mouseX, this.mouseY, bx, my, 120, 30,
+                          lbl[i], 1, 1)) {
+                if (this.mouseJustUp) { this.g.AltarDonate(i); this.snd.Trade(); }
+            }
+        }
+        my = my + 40;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, my, 160, 30,
+                      "补领昨日奖励", 1, 1)) {
+            if (this.mouseJustUp) {
+                this.g.p.cur[Data.CUR_GOLD] = this.g.p.cur[Data.CUR_GOLD] + 30000;
+                this.g.AddChat("[祭坛] 补领 3 万金币");
+            }
+        }
+    }
+
+    public void DrawTitle(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w,
+            "称谓 天梯(21 页 × 5 阶) 当前:" +
+            Data.TITLE_PAGE_NAMES[this.g.p.titlePage] + (this.g.p.titleRank + 1) + " 阶");
+        // 3 列 7 行 = 21 页
+        int gx = x + 16;
+        int gy = y + 76;
+        int cellW = (w - 32) / 3 - 4;
+        int cellH = 30;
+        for (int i = 0; i < Data.TITLE_TOTAL; i = i + 1) {
+            int col = i % 3;
+            int row = i / 3;
+            int bx = gx + col * (cellW + 4);
+            int by = gy + row * (cellH + 4);
+            bool cur = (i == this.g.p.titlePage);
+            int kind = cur ? 2 : 0;
+            if (Ui.Button(rd, this.mouseX, this.mouseY, bx, by, cellW, cellH,
+                          Data.TITLE_PAGE_NAMES[i], 1, kind)) {
+                if (this.mouseJustUp) { this.g.TryTitleUp(); this.snd.Tip(); }
+            }
+        }
+    }
+
+    public void DrawNoble(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w,
+            "爵位 — 当前:" + (this.g.p.nobleTier >= 0 ? Data.NOBLE_NAMES[this.g.p.nobleTier] : "平民")
+            + " 累计捐献:" + this.g.p.donateAcc + " 元宝");
+        int gy = y + 76;
+        for (int i = 0; i < Data.NOBLE_TOTAL; i = i + 1) {
+            int by = gy + i * 50;
+            int bx = x + 16;
+            int bw = w - 32;
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx, by, bw, 46);
+            } else {
+                Ui.Panel(rd, bx, by, bw, 46, 38, 30, 22, 220);
+            }
+            Text.DrawShadow(rd, Data.NOBLE_NAMES[i], bx + 12, by + 6, 2, 240, 220, 180, 255);
+            Text.DrawShadow(rd, "需捐献:" + Data.NOBLE_DONATE[i] + " 元宝",
+                            bx + 100, by + 8, 1, 220, 215, 180, 255);
+            Text.DrawShadow(rd, "全属性+" + (int)(Data.NOBLE_ALL_PCT[i] * 100) + "%" +
+                            " 速度+" + (int)(Data.NOBLE_SPEED_PCT[i] * 100) + "%" +
+                            " 经验+" + (int)(Data.NOBLE_XP_PCT[i] * 100) + "%",
+                            bx + 100, by + 24, 1, 200, 200, 220, 255);
+            if (Ui.Button(rd, this.mouseX, this.mouseY, bx + bw - 120, by + 8, 100, 30,
+                          "捐献 100", 1, 1)) {
+                if (this.mouseJustUp) { this.g.DonateNoble(100); this.snd.Trade(); }
+            }
+        }
+    }
+
+    public void DrawWuxing(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "五行修炼 — 离线时间池");
+        int gy = y + 76;
+        for (int i = 0; i < 5; i = i + 1) {
+            int by = gy + i * 60;
+            int bx = x + 16;
+            int bw = w - 32;
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx, by, bw, 52);
+            } else {
+                Ui.Panel(rd, bx, by, bw, 52, 38, 30, 22, 220);
+            }
+            Text.DrawShadow(rd, Data.WUXING_NAMES[i] + " 行", bx + 12, by + 8, 2, 240, 220, 180, 255);
+            long hours = this.g.p.wuxingMs[i] / 3600000L;
+            Text.DrawShadow(rd, "修为:" + hours + " 小时", bx + 80, by + 12, 1, 220, 215, 180, 255);
+            LegendApp.BarImg(rd, bx + 220, by + 10, bw - 360, 12,
+                             hours, 100);
+            if (Ui.Button(rd, this.mouseX, this.mouseY, bx + bw - 130, by + 10, 120, 32,
+                          "注入 1000 金币", 1, 1)) {
+                if (this.mouseJustUp) { this.g.InjectWuxing(i, 1000); this.snd.Craft(); }
+            }
+        }
+    }
+
+    public void DrawCardAlbum(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "将星图谱 — 8 卡池 × 12 卡 × 10 转");
+        int gy = y + 76;
+        // 卡池选择
+        for (int i = 0; i < 8; i = i + 1) {
+            int bx = x + 16 + i * 100;
+            int kind = this.cardPool == i ? 2 : 0;
+            if (Ui.Button(rd, this.mouseX, this.mouseY, bx, gy, 92, 24,
+                          Data.CARD_POOL_NAMES[i], 1, kind)) {
+                if (this.mouseJustUp) { this.cardPool = i; }
+            }
+        }
+        gy = gy + 32;
+        // 12 卡 × 10 转(简化为 12 卡 1 行,激活费用按 tier 显示)
+        for (int i = 0; i < 12; i = i + 1) {
+            int bx = x + 16 + i * 84;
+            int by = gy;
+            int tier = 0; // 默认显示 0 转
+            int idx = this.cardPool * 120 + i * 10 + tier;
+            int word = idx / 32;
+            int bit = idx % 32;
+            bool on = (word < this.g.p.cardMaskLen
+                       && (this.g.p.cardMask[word] & (1 << bit)) != 0);
+            int kind = on ? 2 : 0;
+            if (Ui.Button(rd, this.mouseX, this.mouseY, bx, by, 76, 24,
+                          "卡 " + (i + 1), 1, kind)) {
+                if (this.mouseJustUp) { this.g.ActivateCard(this.cardPool, i, tier); this.snd.Trade(); }
+            }
+            Text.DrawCentered(rd, "+0转", bx + 38, by + 26, 1, 180, 180, 200, 255);
+        }
+        gy = gy + 36;
+        // tier 选择
+        for (int t = 0; t < 10; t = t + 1) {
+            int bx = x + 16 + t * 84;
+            long cost = (long)(Data.CARD_ACTIVATE_BASE * Math.Pow(2, t));
+            if (Ui.Button(rd, this.mouseX, this.mouseY, bx, gy, 76, 24,
+                          t + "转", 1, 0)) {
+                if (this.mouseJustUp) { /* 切换 tier 提示 */ }
+            }
+            Text.DrawCentered(rd, this.g.FormatCur(cost), bx + 38, gy + 26, 1, 200, 200, 220, 255);
+        }
+    }
+
+    public void DrawAchievement(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "成就 — 48 条 (6 类 × 8 条)");
+        int gy = y + 76;
+        for (int c = 0; c < 6; c = c + 1) {
+            int bx = x + 16 + c * ((w - 32) / 6);
+            int bw = (w - 32) / 6 - 4;
+            Text.DrawShadow(rd, Data.ACHV_CAT_NAMES[c], bx, gy, 1, 230, 200, 130, 255);
+            for (int i = 0; i < 8; i = i + 1) {
+                int by = gy + 20 + i * 36;
+                if (this.texPanel != null && this.texPanel.IsValid()) {
+                    LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx, by, bw, 30);
+                } else {
+                    Draw.RoundRectFill(rd, bx, by, bw, 30, 4, 38, 30, 22, 220);
+                }
+                int lvReq = (c + 1) * 5 + i * 8;
+                Text.DrawShadow(rd, "Lv." + lvReq, bx + 6, by + 8, 1, 220, 215, 180, 255);
+                Text.DrawShadow(rd, "奖励:" + (lvReq * 1000) + " 金",
+                                bx + 6, by + 18, 1, 200, 200, 220, 255);
+            }
+        }
+    }
+
+    public void DrawRanking(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "排行榜 — 影子天梯(10 人)");
+        // 子榜
+        string[] rk = new string[7];
+        rk[0] = "等级榜"; rk[1] = "攻击榜"; rk[2] = "幻境榜";
+        rk[3] = "PK 榜"; rk[4] = "世界 BOSS 榜";
+        rk[5] = "钱庄榜"; rk[6] = "祭坛榜";
+        for (int i = 0; i < 7; i = i + 1) {
+            int bx = x + 16 + i * 110;
+            int kind = this.rankKind == i ? 2 : 0;
+            if (Ui.Button(rd, this.mouseX, this.mouseY, bx, y + 56, 100, 24,
+                          rk[i], 1, kind)) {
+                if (this.mouseJustUp) { this.rankKind = i; }
+            }
+        }
+        // 10 影子玩家
+        int gy = y + 100;
+        for (int i = 0; i < 10; i = i + 1) {
+            int by = gy + i * 38;
+            int bx = x + 16;
+            int bw = w - 32;
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx, by, bw, 32);
+            } else {
+                Draw.RoundRectFill(rd, bx, by, bw, 32, 4, 30, 34, 48, 220);
+            }
+            Text.DrawShadow(rd, (i + 1) + ".", bx + 8, by + 10, 2,
+                            i < 3 ? 250 : 220, i < 3 ? 215 : 210, i < 3 ? 130 : 180, 255);
+            Text.DrawShadow(rd, this.g.ShadowName() + "_" + (i + 1), bx + 50, by + 10, 1,
+                            240, 220, 180, 255);
+            // 数值
+            string val = "";
+            if (this.rankKind == 0) { val = "Lv." + (this.g.p.lv + (10 - i) * 3); }
+            else if (this.rankKind == 1) { val = (this.g.TotalAcMin() + (10 - i) * 200) + "-" + (this.g.TotalAcMax() + (10 - i) * 300); }
+            else if (this.rankKind == 2) { val = "第 " + (this.g.p.hjBest + (10 - i)) + " 层"; }
+            else if (this.rankKind == 3) { val = this.g.FormatNum(500 + (10 - i) * 100) + " 战功"; }
+            else if (this.rankKind == 4) { val = this.g.FormatNum(1000000 - i * 100000) + " 伤害"; }
+            else if (this.rankKind == 5) { val = "钱庄 " + ((i + 1) % 8 + 1); }
+            else { val = "捐献 " + this.g.FormatNum(10000 + i * 1000); }
+            Text.DrawShadow(rd, val, bx + bw - 200, by + 10, 1, 230, 200, 130, 255);
+        }
+    }
+
+    public void DrawShop(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "商店 — " +
+                              (this.shopPage == 0 ? "元宝" :
+                               this.shopPage == 1 ? "金币" :
+                               this.shopPage == 2 ? "灵符" : "激活码"));
+        // 4 页签
+        string[] tab = new string[4];
+        tab[0] = "元宝"; tab[1] = "金币"; tab[2] = "灵符"; tab[3] = "激活码";
+        for (int i = 0; i < 4; i = i + 1) {
+            int bx = x + 16 + i * 100;
+            int kind = this.shopPage == i ? 2 : 0;
+            if (Ui.Button(rd, this.mouseX, this.mouseY, bx, y + 56, 90, 24,
+                          tab[i], 1, kind)) {
+                if (this.mouseJustUp) { this.shopPage = i; }
+            }
+        }
+        // 商品(12 个 4 列 × 3 行)
+        int gy = y + 100;
+        for (int i = 0; i < 12; i = i + 1) {
+            int col = i % 4;
+            int row = i / 4;
+            int bx = x + 16 + col * 220;
+            int by = gy + row * 110;
+            int bw = 210;
+            int bh = 100;
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx, by, bw, bh);
+            } else {
+                Ui.Panel(rd, bx, by, bw, bh, 38, 30, 22, 220);
+            }
+            Text.DrawShadow(rd, Data.SHOP_GOODS_NAME[i], bx + 8, by + 8, 1, 240, 220, 180, 255);
+            int cost = Data.SHOP_GOODS_PRICE_YB[i];
+            Text.DrawShadow(rd, cost + " 元宝", bx + 8, by + 28, 1, 220, 215, 180, 255);
+            if (Ui.Button(rd, this.mouseX, this.mouseY, bx + bw - 70, by + bh - 32, 60, 24,
+                          "购买", 1, 1)) {
+                if (this.mouseJustUp) { this.g.ShopBuy(i); this.snd.Trade(); }
+            }
+        }
+    }
+
+    public void DrawMail(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "邮箱 — 附件 " + this.g.p.mailCnt + "/8");
+        int gy = y + 76;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, gy, 120, 28,
+                      "一键领取", 1, 1)) {
+            if (this.mouseJustUp) {
+                while (this.g.p.mailCnt > 0) { this.g.ClaimMail(0); }
+                this.snd.Box();
+            }
+        }
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 144, gy, 120, 28,
+                      "清空已领", 1, 0)) {
+            if (this.mouseJustUp) {
+                this.g.p.mailCnt = 0;
+                this.snd.Tip();
+            }
+        }
+        gy = gy + 40;
+        for (int i = 0; i < 8; i = i + 1) {
+            int by = gy + i * 50;
+            int bx = x + 16;
+            int bw = w - 32;
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx, by, bw, 44);
+            } else {
+                Ui.Panel(rd, bx, by, bw, 44, 30, 34, 48, 220);
+            }
+            if (i < this.g.p.mailCnt) {
+                Text.DrawShadow(rd, this.g.p.mailTitle[i], bx + 8, by + 6, 1, 240, 220, 180, 255);
+                if (Ui.Button(rd, this.mouseX, this.mouseY, bx + bw - 80, by + 8, 70, 28,
+                              "领取", 1, 1)) {
+                    if (this.mouseJustUp) { this.g.ClaimMail(i); this.snd.Box(); }
+                }
+            } else {
+                Text.DrawShadow(rd, "(空)", bx + 8, by + 14, 1, 100, 100, 120, 255);
+            }
+        }
+    }
+
+    public void DrawSettings(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "设置");
+        int gy = y + 76;
+        // 老板键
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, gy, 220, 32,
+                      "老板键 F10 (当前:" + (this.g.bossMode ? "开" : "关") + ")",
+                      1, this.g.bossMode ? 2 : 0)) {
+            if (this.mouseJustUp) { this.g.ToggleBossKey(); this.snd.Tip(); }
+        }
+        gy = gy + 40;
+        // 界面缩放
+        Text.DrawShadow(rd, "界面缩放:" + (int)(this.g.p.uiScale * 100) + "%",
+                        x + 16, gy, 1, 220, 215, 180, 255);
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 220, gy, 60, 28, "-", 1, 0)) {
+            if (this.mouseJustUp) { this.g.SetUiScale(this.g.p.uiScale - 0.1); }
+        }
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 290, gy, 60, 28, "+", 1, 0)) {
+            if (this.mouseJustUp) { this.g.SetUiScale(this.g.p.uiScale + 0.1); }
+        }
+        gy = gy + 40;
+        // 自动换装
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, gy, 220, 32,
+                      "自动换装 (当前:" + (this.g.autoEquip ? "开" : "关") + ")",
+                      1, this.g.autoEquip ? 2 : 0)) {
+            if (this.mouseJustUp) { this.g.autoEquip = !this.g.autoEquip; this.snd.Tip(); }
+        }
+        gy = gy + 40;
+        // 静默模式
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, gy, 220, 32,
+                      "静默战斗 (当前:" + (this.g.p.silent ? "开" : "关") + ")",
+                      1, this.g.p.silent ? 2 : 0)) {
+            if (this.mouseJustUp) { this.g.ToggleSilent(); this.snd.Tip(); }
+        }
+        gy = gy + 40;
+        // 装备过滤
+        Text.DrawShadow(rd, "装备过滤:只保留 ≥+" + this.g.p.filterMinCoef,
+                        x + 16, gy, 1, 220, 215, 180, 255);
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 220, gy, 60, 28, "-", 1, 0)) {
+            if (this.mouseJustUp) {
+                this.g.p.filterMinCoef = this.g.p.filterMinCoef - 1;
+                if (this.g.p.filterMinCoef < 0) { this.g.p.filterMinCoef = 0; }
+            }
+        }
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 290, gy, 60, 28, "+", 1, 0)) {
+            if (this.mouseJustUp) { this.g.p.filterMinCoef = this.g.p.filterMinCoef + 1; }
+        }
+        gy = gy + 40;
+        // 转永久区
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, gy, 220, 32,
+                      "转永久区", 1, 1)) {
+            if (this.mouseJustUp) {
+                this.g.AddChat("[系统] 已转入永久区(单机版模拟)");
+            }
+        }
+        gy = gy + 40;
+        // 改名
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, gy, 220, 32,
+                      "改名(消耗改名卡)", 1, 1)) {
+            if (this.mouseJustUp) {
+                this.g.p.name = "玩家" + (Game.NowMs() % 1000);
+                this.g.AddChat("[系统] 改名成功");
+            }
+        }
+        gy = gy + 40;
+        // 保存
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, gy, 220, 32,
+                      "保存存档", 1, 1)) {
+            if (this.mouseJustUp) { this.g.Save(); this.g.AddChat("[系统] 存档已保存"); }
+        }
+    }
+
+    public void DrawHelp(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "帮助 — 数值公式全公开");
+        int gy = y + 76;
+        string[] lines = new string[20];
+        lines[0] = "★ 经验曲线:EXP = 80 * LV ^ 1.45";
+        lines[1] = "★ 攻击区间:基础 + 装备,浮动 ±18%";
+        lines[2] = "★ 幻境层 HP:30 * 1.18^(N-1)";
+        lines[3] = "★ 层 BOSS:每 10 层 1 只,HP × 6";
+        lines[4] = "★ 装备品阶:普通/高级/稀有/史诗/传说";
+        lines[5] = "★ 系数公式:效果 = 基础 * (1 + 系数*0.18)";
+        lines[6] = "★ 洗炼概率:金币 35% 概率降低,元宝 100% 提升";
+        lines[7] = "★ 转生:等级 80 + 累计击破 BOSS";
+        lines[8] = "★ 爵位:累计元宝捐献,全属性 +X%";
+        lines[9] = "★ 五行:离线时间池,1h 修为 = 0.2% 加成";
+        lines[10] = "★ 寻宝奖池:每 0 点刷新,12 奖项";
+        lines[11] = "★ 祭坛:个人 1000 进度 + 全服 8000 进度";
+        lines[12] = "★ PK 竞技场:影子天梯,胜+100/负+20";
+        lines[13] = "★ 押镖/劫镖:每日 5+5 次,50% 被劫";
+        lines[14] = "★ 钱庄:8 城,5% 概率被夺";
+        lines[15] = "★ 传说塔:5 层,镜像挑战";
+        lines[16] = "★ 师徒:师父 2 转,拜师 ≤60 级";
+        lines[17] = "★ 帮会:500 万金币 + 沃玛号角创建";
+        lines[18] = "★ 离线结算:24h 上限(终身 48h/超会 72h)";
+        lines[19] = "★ 帮助菜单:进阶玩法 / 公式算法 / 交易权限";
+        for (int i = 0; i < 20; i = i + 1) {
+            Text.DrawShadow(rd, lines[i], x + 16, gy + i * 20, 1, 220, 215, 180, 255);
+        }
+    }
+
+    public void DrawBag(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "背包 — " + this.g.p.bagCnt + "/60");
+        // 12 列(适配宽度)
+        int cols = 12;
+        int gx = x + 16;
+        int gy = y + 76;
+        int cell = (int)Math.Min(48.0, (double)((w - 32) / cols));
+        for (int i = 0; i < this.g.p.bagCnt && i < 60; i = i + 1) {
+            int c = i % cols;
+            int r = i / cols;
+            int bx = gx + c * (cell + 4);
+            int by = gy + r * (cell + 18);
+            Item it = this.g.p.bag[i];
+            if (it == null) { continue; }
+            SdlTexture tex = this.texEquip[it.cls * 5 + it.tier];
+            bool hov = Draw.PointIn(this.mouseX, this.mouseY, bx, by, cell, cell);
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx - 2, by - 2, cell + 4, cell + 4);
+            } else {
+                Draw.RoundRectFill(rd, bx, by, cell, cell, 4, 38, 42, 56, 220);
+            }
+            if (tex != null && tex.IsValid()) {
+                rd.DrawTexture(tex, bx, by, cell, cell);
+            }
+            Text.DrawCentered(rd, "+" + it.coef, bx + cell / 2, by + cell + 4, 1, 230, 200, 130, 255);
+            if (hov && this.mouseJustUp) { this.bagSel = i; this.snd.Tip(); }
+        }
+        // 选中详情
+        if (this.bagSel >= 0 && this.bagSel < this.g.p.bagCnt) {
+            Item it = this.g.p.bag[this.bagSel];
+            int dx = x + w - 280;
+            int dy = y + 76;
+            Text.DrawShadow(rd, it.Name(), dx, dy, 2, 240, 220, 180, 255);
+            dy = dy + 26;
+            Text.DrawShadow(rd, "品阶:" + Data.EQUIP_TIER_NAMES[it.tier], dx, dy, 1, 220, 210, 180, 255);
+            dy = dy + 16;
+            Text.DrawShadow(rd, "系数:" + it.coef + "/" + Data.TIER_COEF_CAP[it.tier], dx, dy, 1, 220, 210, 180, 255);
+            dy = dy + 16;
+            Text.DrawShadow(rd, "槽位:" + Data.SLOT_NAMES[it.slot], dx, dy, 1, 220, 210, 180, 255);
+            dy = dy + 24;
+            if (Ui.Button(rd, this.mouseX, this.mouseY, dx, dy, 240, 30,
+                          "装备", 2, 1)) {
+                if (this.mouseJustUp) { this.g.EquipFromBag(this.bagSel); this.snd.Up(); }
+            }
+            dy = dy + 36;
+            if (Ui.Button(rd, this.mouseX, this.mouseY, dx, dy, 240, 30,
+                          "回收", 2, 0)) {
+                if (this.mouseJustUp) {
+                    this.g.Recycle(this.bagSel, Data.CUR_GOLD);
+                    this.snd.Trade();
+                }
+            }
+        }
+        // 一键操作:换装 / 回收
+        int actY = y + h - 178;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, actY, 150, 30,
+                      "一键换装", 2, 1)) {
+            if (this.mouseJustUp) {
+                int n = this.g.AutoEquipBest();
+                if (n == 0) { this.g.AddChat("[换装] 背包里没有更强的装备"); }
+                this.snd.Up();
+            }
+        }
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 176, actY, 150, 30,
+                      "一键回收(金币)", 2, 0)) {
+            if (this.mouseJustUp) {
+                long got = this.g.RecycleAll(Data.CUR_GOLD);
+                this.g.AddChat("[回收] 清空背包,共获得 " + this.g.FormatNum(got) + " 金币");
+                this.bagSel = -1;
+                this.snd.Trade();
+            }
+        }
+        // 当前已装备
+        int eqY = y + h - 140;
+        Text.DrawShadow(rd, "已装备 (12 槽)", x + 16, eqY, 2, 230, 200, 130, 255);
+        for (int i = 0; i < Data.SLOT_COUNT; i = i + 1) {
+            int bx = x + 16 + i * 84;
+            int by = eqY + 24;
+            Item it = this.g.p.equip[i];
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx, by, 76, 76);
+            } else {
+                Draw.RoundRectFill(rd, bx, by, 76, 76, 4, 36, 30, 22, 220);
+            }
+            if (it != null) {
+                SdlTexture tex = this.texEquip[it.cls * 5 + it.tier];
+                if (tex != null && tex.IsValid()) {
+                    rd.DrawTexture(tex, bx + 4, by + 4, 68, 68);
+                }
+                Text.DrawCentered(rd, "+" + it.coef, bx + 38, by + 56, 1, 230, 200, 130, 255);
+            }
+            Text.DrawCentered(rd, Data.SLOT_NAMES[i], bx + 38, by + 76, 1, 220, 210, 180, 255);
+        }
+    }
+
+    public void DrawAlbum(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "神兵图鉴 — 9 组 × 10 槽");
+        // 9 组选择
+        for (int i = 0; i < 9; i = i + 1) {
+            int bx = x + 16 + i * 100;
+            int kind = this.albumGroup == i ? 2 : 0;
+            if (Ui.Button(rd, this.mouseX, this.mouseY, bx, y + 56, 92, 24,
+                          Data.ALBUM_NAMES[i], 1, kind)) {
+                if (this.mouseJustUp) { this.albumGroup = i; }
+            }
+        }
+        int gy = y + 100;
+        for (int i = 0; i < Data.ALBUM_SLOTS; i = i + 1) {
+            int bx = x + 16 + i * 92;
+            int by = gy;
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx, by, 84, 84);
+            } else {
+                Draw.RoundRectFill(rd, bx, by, 84, 84, 6, 38, 30, 22, 220);
+            }
+            // 占位(未实现收集态,显示空槽)
+            Draw.RoundRectFill(rd, bx + 8, by + 8, 68, 68, 4, 24, 26, 36, 220);
+            Text.DrawCentered(rd, "空槽", bx + 42, by + 38, 1, 100, 100, 120, 255);
+        }
+        Text.DrawCentered(rd, "(放入后无法取出,木桶原理)", x + w / 2, gy + 110, 2, 220, 200, 130, 255);
+    }
+
+    public void DrawDianTang(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w,
+            "至尊极品殿堂 — 登记 +" + (this.g.p.dtCount * 5) + "% 经验(上限 50%)");
+        int gy = y + 76;
+        for (int i = 0; i < 5; i = i + 1) {
+            int bx = x + 16 + i * 200;
+            int by = gy;
+            int bw = 190;
+            int bh = 100;
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx, by, bw, bh);
+            } else {
+                Ui.Panel(rd, bx, by, bw, bh, 38, 30, 22, 220);
+            }
+            Text.DrawShadow(rd, Data.DIAN_TANG_NAMES[i], bx + 10, by + 8, 1, 240, 220, 180, 255);
+            Item dt = this.g.p.dtBest[i];
+            if (dt != null) {
+                SdlTexture tex = this.texEquip[dt.cls * 5 + dt.tier];
+                if (tex != null && tex.IsValid()) {
+                    rd.DrawTexture(tex, bx + 10, by + 30, 48, 48);
+                }
+                Text.DrawShadow(rd, dt.Name(), bx + 64, by + 36, 1, 230, 215, 180, 255);
+                Text.DrawShadow(rd, "主人:玩家_" + (i + 1), bx + 64, by + 52, 1, 200, 200, 220, 255);
+                Text.DrawShadow(rd, "复制:" + Data.DIAN_TANG_COST_LF[i] + " 灵符", bx + 64, by + 68, 1, 230, 200, 130, 255);
+            } else {
+                Text.DrawShadow(rd, "(空)", bx + 64, by + 36, 1, 100, 100, 120, 255);
+            }
+        }
+    }
+
+    public void DrawWorldBoss(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "世界 BOSS — 影子共斗  HP:" +
+                              this.g.FormatNum((long)Data.WORLD_BOSS_HP));
+        int my = y + 76;
+        // BOSS 立绘
+        if (this.texBoss != null && this.texBoss[3] != null && this.texBoss[3].IsValid()) {
+            rd.DrawTexture(this.texBoss[3], x + 16, my, 200, 200);
+        }
+        // 进度
+        long dmg = this.g.p.wbDamage;
+        long total = (long)Data.WORLD_BOSS_HP;
+        double pct = (double)dmg / total;
+        if (pct > 1) { pct = 1; }
+        LegendApp.BarImg(rd, x + 240, my, w - 280, 18, dmg, total);
+        Text.DrawShadow(rd, "已伤害:" + this.g.FormatNum(dmg) + " / " + this.g.FormatNum(total),
+                        x + 240, my + 22, 1, 220, 215, 180, 255);
+        // 操作
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 240, my + 50, 160, 32,
+                      "挑战(剩余 " + this.g.p.wbTriesLeft + ")", 2, 1)) {
+            if (this.mouseJustUp) { this.g.HitWorldBoss(); this.snd.Craft(); }
+        }
+        // 影子榜
+        int sy = my + 100;
+        for (int i = 0; i < 10; i = i + 1) {
+            int sx = x + 240;
+            int sw = w - 280;
+            int sy2 = sy + i * 24;
+            string rankDmg = this.g.FormatNum(1000000000L - i * 100000000L);
+            Text.DrawShadow(rd, (i + 1) + ". " + this.g.ShadowName() + "_" + (i + 1) + "  伤害:" + rankDmg,
+                            sx, sy2, 1, 220, 215, 180, 255);
+        }
+    }
+
+    public void DrawPK(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "PK 竞技场 — 影子天梯  今日次数:" + this.g.p.pkTriesLeft);
+        int gy = y + 76;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, gy, 200, 36,
+                      "挑战影子选手 (剩余 " + this.g.p.pkTriesLeft + ")",
+                      2, 1)) {
+            if (this.mouseJustUp) { this.g.PKArena(); this.snd.Craft(); }
+        }
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 224, gy, 200, 36,
+                      "领取小时薪奖励", 2, 0)) {
+            if (this.mouseJustUp) {
+                this.g.p.cur[Data.CUR_ZG] = this.g.p.cur[Data.CUR_ZG] + 200;
+                this.g.AddChat("[PK] 领取 200 战功");
+            }
+        }
+        gy = gy + 60;
+        // 影子对手列表
+        for (int i = 0; i < 3; i = i + 1) {
+            int by = gy + i * 80;
+            int bx = x + 16;
+            int bw = w - 32;
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx, by, bw, 70);
+            } else {
+                Ui.Panel(rd, bx, by, bw, 70, 38, 30, 22, 220);
+            }
+            Text.DrawShadow(rd, this.g.ShadowName() + "_" + (i + 1), bx + 12, by + 8, 2, 240, 220, 180, 255);
+            Text.DrawShadow(rd, "排名:#" + (i + 1) + " 战力:" + this.g.FormatNum(1000 + i * 500),
+                            bx + 12, by + 30, 1, 220, 215, 180, 255);
+            Text.DrawShadow(rd, "胜 +100 战功 / 负 +20 战功",
+                            bx + 12, by + 50, 1, 200, 200, 220, 255);
+        }
+    }
+
+    public void DrawYabiao(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w,
+            "押镖 / 劫镖 — 押:" + this.g.p.ybTriesLeft + " 劫:" + this.g.p.jbTriesLeft);
+        int gy = y + 76;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, gy, 200, 36,
+                      "押镖 (普通)", 2, 1)) {
+            if (this.mouseJustUp) { this.g.SendYabiao(); this.snd.Trade(); }
+        }
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 224, gy, 200, 36,
+                      "劫镖", 2, 1)) {
+            if (this.mouseJustUp) { this.g.JieBiao(); this.snd.Trade(); }
+        }
+        gy = gy + 60;
+        // 其他玩家镖车列表
+        for (int i = 0; i < 5; i = i + 1) {
+            int by = gy + i * 50;
+            int bx = x + 16;
+            int bw = w - 32;
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx, by, bw, 44);
+            } else {
+                Ui.Panel(rd, bx, by, bw, 44, 38, 30, 22, 220);
+            }
+            Text.DrawShadow(rd, this.g.ShadowName() + "_" + (i + 1) + " 的镖车",
+                            bx + 12, by + 8, 1, 240, 220, 180, 255);
+            Text.DrawShadow(rd, "价值:" + this.g.FormatNum(Data.YABIAO_GOLD[i % 3]) + " 金币",
+                            bx + 12, by + 26, 1, 220, 215, 180, 255);
+        }
+    }
+
+    public void DrawCity(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w,
+            "城池争夺 / 钱庄 — 当前占有:" +
+            (this.g.p.cityOwned >= 0 ? Data.MAP_NAMES[this.g.p.cityOwned] : "无"));
+        int gy = y + 76;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, gy, 200, 32,
+                      "收取金币", 2, 1)) {
+            if (this.mouseJustUp) { this.g.CollectCity(); this.snd.Trade(); }
+        }
+        gy = gy + 40;
+        for (int i = 0; i < Data.CITY_TOTAL; i = i + 1) {
+            int col = i % 4;
+            int row = i / 4;
+            int bx = x + 16 + col * 220;
+            int by = gy + row * 80;
+            int bw = 210;
+            int bh = 70;
+            bool mine = (this.g.p.cityOwned == i);
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx, by, bw, bh);
+            } else {
+                Ui.Panel(rd, bx, by, bw, bh, mine ? 50 : 38, mine ? 40 : 30, mine ? 30 : 22, 220);
+            }
+            Text.DrawShadow(rd, "钱庄 " + (i + 1), bx + 12, by + 8, 2, 240, 220, 180, 255);
+            Text.DrawShadow(rd, "产出:" + this.g.FormatNum(Data.CITY_PRODUCE[i]) + " 金/h",
+                            bx + 12, by + 30, 1, 220, 215, 180, 255);
+            if (mine) {
+                Text.DrawShadow(rd, "[已占领]", bx + 12, by + 50, 1, 230, 200, 130, 255);
+            } else {
+                if (Ui.Button(rd, this.mouseX, this.mouseY, bx + bw - 80, by + 38, 70, 24,
+                              "攻打", 1, 0)) {
+                    if (this.mouseJustUp) {
+                        this.g.p.cityOwned = i;
+                        this.g.p.cityLastMs = Game.NowMs();
+                        this.g.AddChat("[钱庄] 占领 钱庄 " + (i + 1));
+                    }
+                }
+            }
+        }
+    }
+
+    public void DrawTower(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w,
+            "传说塔 — 当前层:" + this.g.p.towerBest + "/" + Data.TOWER_FLOORS);
+        int gy = y + 76;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, gy, 200, 36,
+                      "挑战下一层", 2, 1)) {
+            if (this.mouseJustUp) { this.g.TowerClimb(); this.snd.Craft(); }
+        }
+        gy = gy + 50;
+        for (int i = 0; i < Data.TOWER_FLOORS; i = i + 1) {
+            int by = gy + i * 70;
+            int bx = x + 16;
+            int bw = w - 32;
+            bool hold = (i < this.g.p.towerBest);
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx, by, bw, 60);
+            } else {
+                Ui.Panel(rd, bx, by, bw, 60, hold ? 50 : 38, hold ? 38 : 30, hold ? 28 : 22, 220);
+            }
+            Text.DrawShadow(rd, "第 " + (i + 1) + " 层", bx + 12, by + 8, 2, 240, 220, 180, 255);
+            Text.DrawShadow(rd, "守关:" + this.g.ShadowName() + "_" + (i + 1),
+                            bx + 110, by + 8, 1, 240, 220, 180, 255);
+            Text.DrawShadow(rd, hold ? "[已占领]" : "[未占领]",
+                            bx + bw - 100, by + 22, 1, hold ? 230 : 200, hold ? 200 : 200, hold ? 130 : 220, 255);
+        }
+    }
+
+    public void DrawMaster(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w,
+            "师徒 — 关系:" + (this.g.p.masterTier == 0 ? "无" :
+                              this.g.p.masterTier == 1 ? ("徒弟 师:" + this.g.p.masterName) :
+                              ("师父 徒弟:" + this.g.p.studentCount)));
+        int gy = y + 76;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, gy, 200, 36,
+                      "拜师(需≤60 级)", 2, 1)) {
+            if (this.mouseJustUp) { this.g.ApprenticeTo("影子师父"); this.snd.Up(); }
+        }
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 224, gy, 200, 36,
+                      "收徒(需 2 转)", 2, 1)) {
+            if (this.mouseJustUp) { this.g.TakeApprentice("影子徒弟"); this.snd.Up(); }
+        }
+        gy = gy + 50;
+        Text.DrawShadow(rd, "师父排行榜 (影子)", x + 16, gy, 2, 230, 200, 130, 255);
+        gy = gy + 26;
+        for (int i = 0; i < 5; i = i + 1) {
+            Text.DrawShadow(rd, (i + 1) + ". " + this.g.ShadowName() + "_" + (i + 1)
+                            + "  徒弟:" + (53 - i * 8),
+                            x + 16, gy + i * 22, 1, 220, 215, 180, 255);
+        }
+    }
+
+    public void DrawGuild(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w,
+            "行会 — " + (this.g.p.hasGuild ? this.g.p.guildName : "未加入"));
+        int gy = y + 76;
+        if (!this.g.p.hasGuild) {
+            if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, gy, 200, 36,
+                          "创建行会(500 万金)", 2, 1)) {
+                if (this.mouseJustUp) { this.g.CreateGuild("我的行会"); this.snd.Up(); }
+            }
+            gy = gy + 50;
+            // 行会列表(影子)
+            for (int i = 0; i < 5; i = i + 1) {
+                Text.DrawShadow(rd, (i + 1) + ". " + "行会_" + (i + 1)
+                                + "  成员:" + (48 - i * 4) + "  等级:" + (i + 1),
+                                x + 16, gy + i * 24, 1, 220, 215, 180, 255);
+            }
+        } else {
+            Text.DrawShadow(rd, "资产:" + this.g.FormatNum(this.g.p.guildGold) + " 金币",
+                            x + 16, gy, 1, 220, 215, 180, 255);
+            gy = gy + 30;
+            Text.DrawShadow(rd, "成员上限:" + Data.GUILD_MEMBERS_BASE, x + 16, gy, 1, 220, 215, 180, 255);
+            gy = gy + 30;
+            // 成员列表
+            for (int i = 0; i < 10; i = i + 1) {
+                Text.DrawShadow(rd, "成员_" + i + "  Lv." + (this.g.p.lv + i - 5),
+                                x + 16, gy + i * 22, 1, 220, 215, 180, 255);
+            }
+        }
+    }
+
+    public void DrawShabake(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "沙巴克 — 行会攻城战(单机版仅展示)");
+        int gy = y + 76;
+        Text.DrawShadow(rd, "★ 沙巴克开战时间:每日 18:00-19:00",
+                        x + 16, gy, 2, 250, 215, 130, 255);
+        gy = gy + 30;
+        Text.DrawShadow(rd, "★ 当前占领:影子行会_1", x + 16, gy, 1, 220, 215, 180, 255);
+        gy = gy + 22;
+        Text.DrawShadow(rd, "★ 占领时间:2026-09-01 18:05", x + 16, gy, 1, 220, 215, 180, 255);
+        gy = gy + 30;
+        Text.DrawShadow(rd, "(单机版不实现行会攻城,需联网)",
+                        x + 16, gy, 2, 240, 120, 120, 255);
+        gy = gy + 30;
+        Text.DrawShadow(rd, "占领奖励:宝石 / 技能书 / 金币 / 黑铁 / 金砖 / 魂灵",
+                        x + 16, gy, 1, 220, 215, 180, 255);
+        gy = gy + 22;
+        Text.DrawShadow(rd, "战役中随机:祝福油 / 金砖 / 100 元宝",
+                        x + 16, gy, 1, 220, 215, 180, 255);
+        gy = gy + 30;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, gy, 200, 36,
+                      "膜拜沙巴克城主", 2, 1)) {
+            if (this.mouseJustUp) {
+                this.g.p.cur[Data.CUR_SW] = this.g.p.cur[Data.CUR_SW] + 50;
+                this.g.AddChat("[沙巴克] 膜拜奖励 +50 声望");
+            }
+        }
+    }
+
+    public void DrawMap(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "地图传送 — 20 张经典地图");
+        // 左:比奇省背景
+        if (this.texMapBichon != null && this.texMapBichon.IsValid()) {
+            rd.DrawTexture(this.texMapBichon, x + 16, y + 76, 480, 280);
+        } else {
+            Draw.RoundRectFill(rd, x + 16, y + 76, 480, 280, 8, 36, 38, 48, 220);
+        }
+        Text.DrawShadow(rd, "比奇省 (推荐等级:5+)",
+                        x + 16, y + 76 + 280 + 8, 1, 220, 215, 180, 255);
+        // 右:地图列表
+        int rx = x + 520;
+        int rw = w - 540;
+        for (int i = 0; i < 20; i = i + 1) {
+            int by = y + 76 + i * 24;
+            bool hov = Draw.PointIn(this.mouseX, this.mouseY, rx, by, rw, 22);
+            if (hov) {
+                Draw.RoundRectFill(rd, rx, by, rw, 22, 4, 60, 70, 90, 220);
+            }
+            Text.DrawShadow(rd, Data.MAP_NAMES[i] + "  (推荐 " + Data.MAP_MIN_FLOOR[i] + " 层)",
+                            rx + 8, by + 4, 1, 220, 215, 180, 255);
+        }
+    }
+
+    public void DrawMijing(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w,
+            "秘境 — " + (this.g.p.mjUnlocked > 0 ? "已解锁" : "需 1 转后解锁"));
+        int gy = y + 76;
+        if (this.g.p.mjUnlocked == 0) {
+            Text.DrawShadow(rd, "★ 秘境需要转生 1 后才能进入",
+                            x + 16, gy, 2, 250, 215, 130, 255);
+            gy = gy + 30;
+            Text.DrawShadow(rd, "★ 秘境怪物 HP/攻击 × 2.2,材料掉率更高",
+                            x + 16, gy, 2, 220, 215, 180, 255);
+            return;
+        }
+        // 简易显示当前秘境状态
+        Text.DrawShadow(rd, "当前秘境层:" + this.g.p.mjFloor,
+                        x + 16, gy, 2, 220, 215, 180, 255);
+        gy = gy + 30;
+        Text.DrawShadow(rd, "最高:" + this.g.p.mjBest + "  击杀:" + this.g.p.mjKills,
+                        x + 16, gy, 2, 220, 215, 180, 255);
+        gy = gy + 30;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, gy, 200, 36,
+                      "开始挂机秘境", 2, 1)) {
+            if (this.mouseJustUp) { this.g.AddChat("[秘境] 开始挂机秘境"); }
+        }
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 224, gy, 200, 36,
+                      "扫荡秘境", 2, 0)) {
+            if (this.mouseJustUp) {
+                if (this.g.p.vip >= 1) { this.g.AddChat("[秘境] 扫荡成功"); }
+                else { this.g.AddChat("[系统] 扫荡需终身会员"); }
+            }
+        }
+    }
+
+    public void DrawRedBag(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "发红包 — 元宝红包");
+        int gy = y + 76;
+        Text.DrawShadow(rd, "(单机版:发给自己,演示功能)",
+                        x + 16, gy, 2, 220, 215, 180, 255);
+        gy = gy + 30;
+        if (Ui.Button(rd, this.mouseX, this.mouseY, x + 16, gy, 200, 36,
+                      "发 100 元宝红包", 2, 1)) {
+            if (this.mouseJustUp) {
+                if (this.g.p.cur[Data.CUR_YB] >= 100) {
+                    this.g.p.cur[Data.CUR_YB] = this.g.p.cur[Data.CUR_YB] - 100;
+                    this.g.AddChat("[红包] 你发出了 100 元宝红包");
+                    this.g.p.cur[Data.CUR_RB] = this.g.p.cur[Data.CUR_RB] + 1;
+                } else { this.g.AddChat("[系统] 元宝不足"); }
+            }
+        }
+    }
+
+    public void DrawMarket(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w, "交易市场 — 玩家 C2C(影子)");
+        int gy = y + 76;
+        // 影子挂牌(8 条)
+        string[] heads = new string[5];
+        heads[0] = "全部"; heads[1] = "武器"; heads[2] = "防具";
+        heads[3] = "首饰"; heads[4] = "杂物";
+        for (int i = 0; i < 5; i = i + 1) {
+            int bx = x + 16 + i * 90;
+            int kind = (this.modalSub == i) ? 2 : 0;
+            if (Ui.Button(rd, this.mouseX, this.mouseY, bx, gy, 82, 22,
+                          heads[i], 1, kind)) {
+                if (this.mouseJustUp) { this.modalSub = i; }
+            }
+        }
+        gy = gy + 30;
+        // 表头
+        Text.DrawShadow(rd, "名称                          价格       寄售人",
+                        x + 16, gy, 1, 220, 215, 180, 255);
+        gy = gy + 18;
+        for (int i = 0; i < 8; i = i + 1) {
+            int by = gy + i * 28;
+            int bx = x + 16;
+            int bw = w - 32;
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx, by, bw, 24);
+            } else {
+                Draw.RoundRectFill(rd, bx, by, bw, 24, 3, 36, 38, 50, 220);
+            }
+            Text.DrawShadow(rd, Data.EQUIP_CLASS_NAMES[i % 8] + "+" + (i + 1) + "    "
+                            + this.g.FormatNum(50000 + i * 30000) + "    "
+                            + this.g.ShadowName() + "_" + (i + 1),
+                            bx + 8, by + 6, 1, 220, 215, 180, 255);
+        }
+    }
+
+    public void DrawCharge(int x, int y, int w, int h) {
+        SdlRenderer rd = this.r;
+        this.DrawPanelHeader(x, y, w,
+            "充值 — 累计:" + this.g.p.chargeTotal + " 元  当前 VIP:" +
+            (this.g.p.vip == 0 ? "普通" : this.g.p.vip == 1 ? "终身" : "超级终身"));
+        int gy = y + 76;
+        for (int i = 0; i < 7; i = i + 1) {
+            int col = i % 4;
+            int row = i / 4;
+            int bx = x + 16 + col * 200;
+            int by = gy + row * 80;
+            int bw = 190;
+            int bh = 70;
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, bx, by, bw, bh);
+            } else {
+                Ui.Panel(rd, bx, by, bw, bh, 38, 30, 22, 220);
+            }
+            Text.DrawShadow(rd, Data.CHARGE_TIERS[i] + " 元", bx + 12, by + 8, 2, 240, 220, 180, 255);
+            Text.DrawShadow(rd, "+ " + Data.CHARGE_YB[i] + " 元宝", bx + 12, by + 30, 1, 220, 215, 180, 255);
+            if (Ui.Button(rd, this.mouseX, this.mouseY, bx + bw - 70, by + 38, 60, 24,
+                          "充值", 1, 1)) {
+                if (this.mouseJustUp) { this.g.Charge(i); this.snd.Trade(); }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 类选择(启动画面)
+    // ---------------------------------------------------------------
+    public void DrawClassSelect() {
+        int w = LegendApp.W();
+        int h = LegendApp.H();
+        SdlRenderer rd = this.r;
+        // 启动背景
+        if (this.texSplash != null && this.texSplash.IsValid()) {
+            rd.DrawTexture(this.texSplash, 0, 0, w, h);
+        } else if (this.texBg != null && this.texBg.IsValid()) {
+            rd.DrawTexture(this.texBg, 0, 0, w, h);
+        } else {
+            Draw.VGradient(rd, 0, 0, w, h, 12, 14, 22, 4, 6, 12, 255);
+        }
+        // 暗化
+        if (this.texDim != null && this.texDim.IsValid()) {
+            rd.SetColor(255, 255, 255, 100);
+            rd.DrawTexture(this.texDim, 0, 0, w, h);
+            rd.SetColor(255, 255, 255, 255);
+        }
+        // 标题
+        Text.DrawCenteredShadow(rd, "传奇放置挂机", w / 2, 80, 6,
+                                250, 215, 130, 2);
+        Text.DrawCenteredShadow(rd, "单机版 · 单机影子天梯", w / 2, 130, 3,
+                                220, 220, 220, 1);
+        // 3 职业卡
+        string[] clsName = new string[3];
+        string[] clsDesc = new string[3];
+        clsName[0] = "战士"; clsName[1] = "法师"; clsName[2] = "道士";
+        clsDesc[0] = "近战 物理\n高血量 高攻击";
+        clsDesc[1] = "远程 魔法\n群攻 高蓝量";
+        clsDesc[2] = "辅助 道术\n召唤 治疗";
+        for (int i = 0; i < 3; i = i + 1) {
+            int cx = 160 + i * 320;
+            int cy = 220;
+            int cw = 280;
+            int ch = 400;
+            if (this.texPanel != null && this.texPanel.IsValid()) {
+                LegendApp.NineImg(rd, this.texPanel, 960, 960, 101, 16, cx, cy, cw, ch);
+            } else {
+                Ui.Panel(rd, cx, cy, cw, ch, 36, 30, 22, 230);
+            }
+            if (this.texClass != null && this.texClass[i] != null
+                && this.texClass[i].IsValid()) {
+                rd.DrawTexture(this.texClass[i], cx + 40, cy + 30, 200, 280);
+            }
+            Text.DrawCentered(rd, clsName[i], cx + cw / 2, cy + 320, 3, 240, 220, 180, 255);
+            List<string> lines = clsDesc[i].Split('\n');
+            for (int li = 0; li < lines.Count; li = li + 1) {
+                Text.DrawCentered(rd, lines[li], cx + cw / 2, cy + 348 + li * 18, 1, 220, 215, 180, 255);
+            }
+            if (Ui.Button(rd, this.mouseX, this.mouseY, cx + 60, cy + ch - 40, cw - 120, 32,
+                          "选择 " + clsName[i], 2, 1)) {
+                if (this.mouseJustUp) {
+                    this.g.NewGame("看见啥的就是", i);
+                    this.modal = -1;
+                    this.snd.Up();
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 工具方法
+    // ---------------------------------------------------------------
+    public static void NineImg(SdlRenderer rd, SdlTexture tex, int texW, int texH,
+                                int srcBorder, int dstBorder, int dx, int dy, int dw, int dh) {
+        if (tex == null || !tex.IsValid()) { return; }
+        int tb = srcBorder;
+        int db = dstBorder;
+        if (db > dw / 2) { db = dw / 2; }
+        if (db > dh / 2) { db = dh / 2; }
+        // 9 块
+        // 四角
+        rd.DrawTextureRegion(tex, 0, 0, tb, tb, dx, dy, db, db);
+        rd.DrawTextureRegion(tex, texW - tb, 0, tb, tb, dx + dw - db, dy, db, db);
+        rd.DrawTextureRegion(tex, 0, texH - tb, tb, tb, dx, dy + dh - db, db, db);
+        rd.DrawTextureRegion(tex, texW - tb, texH - tb, tb, tb, dx + dw - db, dy + dh - db, db, db);
+        // 四边
+        rd.DrawTextureRegion(tex, tb, 0, texW - 2 * tb, tb, dx + db, dy, dw - 2 * db, db);
+        rd.DrawTextureRegion(tex, tb, texH - tb, texW - 2 * tb, tb, dx + db, dy + dh - db, dw - 2 * db, db);
+        rd.DrawTextureRegion(tex, 0, tb, tb, texH - 2 * tb, dx, dy + db, db, dh - 2 * db);
+        rd.DrawTextureRegion(tex, texW - tb, tb, tb, texH - 2 * tb, dx + dw - db, dy + db, db, dh - 2 * db);
+        // 中
+        rd.DrawTextureRegion(tex, tb, tb, texW - 2 * tb, texH - 2 * tb, dx + db, dy + db, dw - 2 * db, dh - 2 * db);
+    }
+
+    public static void BarImg(SdlRenderer rd, int x, int y, int w, int h, long val, long max) {
+        if (max <= 0) { max = 1; }
+        double pct = (double)val / max;
+        if (pct < 0) { pct = 0; }
+        if (pct > 1) { pct = 1; }
+        int fw = (int)(w * pct);
+        // 槽
+        Draw.RoundRectFill(rd, x, y, w, h, h / 2, 24, 24, 32, 230);
+        // 填充
+        if (fw > 1) {
+            Draw.RoundRectFill(rd, x + 1, y + 1, fw - 2, h - 2, (h - 2) / 2,
+                               90, 180, 110, 240);
+        }
+        // 文本
+        Text.DrawCenteredShadow(rd, "", x + w / 2, y + h / 2 - 6, 1, 220, 220, 220, 1);
+    }
+
+    // ---------------------------------------------------------------
+    // 入口
+    // ---------------------------------------------------------------
+    static int Main(string[] args) {
+        Host h = Host.CreateFull("传奇放置挂机", Data.W, Data.H, 2, false);
+        h.LimitFps(60);
+        h.SetIdleFps(2);
+        h.SetRedrawInterval(120);
+        LegendApp app = LegendApp.Create(h);
+        app.snd = Snd.Create(true);
+        // 模拟模式
+        bool simMode = (LegendApp.SysGetenv("LEGEND_SIM") == "1");
+        if (simMode) {
+            return LegendApp.SimRun(app);
+        }
+        app.now = Game.NowMs();
+        app.lastStepAt = app.now;
+        // 主循环(显式事件轮询,参照 miner 模式)
+        while (h.Running()) {
+            app.now = Game.NowMs();
+            app.mouseJustDown = false;
+            app.mouseJustUp = false;
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                h.OnWindowEvent(ty);
+                if (SdlEvent.IsQuit()) {
+                    app.Save();
+                    h.Quit();
+                    break;
+                }
+                if (ty == SdlEventType.MouseMotion()) {
+                    app.mouseX = app.host.MouseX();
+                    app.mouseY = app.host.MouseY();
+                }
+                if (ty == SdlEventType.MouseButtonDown()
+                    && SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                    app.mouseX = app.host.MouseX();
+                    app.mouseY = app.host.MouseY();
+                    app.mouseDown = true;
+                    app.mouseJustDown = true;
+                }
+                if (ty == SdlEventType.MouseButtonUp()
+                    && SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                    app.mouseDown = false;
+                    app.mouseJustUp = true;
+                }
+                if (ty == SdlEventType.KeyDown() && !SdlEvent.IsRepeat()) {
+                    int sc = SdlEvent.Scancode();
+                    if (sc == LegendApp.SC_F10) {
+                        app.g.ToggleBossKey();
+                    }
+                    if (sc == SdlScancode.Escape()) {
+                        if (app.modal >= 0) { app.modal = -1; }
+                    }
+                }
+                h.MarkEvent();
+            }
+            // Step(战斗 / 广播)
+            if (app.now - app.lastStepAt >= 120) {
+                app.lastStepAt = app.now;
+                app.g.StepIdle(0.12);
+                app.g.AutoBroadcast();
+            }
+            if (h.ShouldRender()) {
+                app.DrawAll();
+            }
+        }
+        app.Save();
+        return 0;
+    }
+
+    // 无头平衡自测:在线 60s → 离线 8h → 长跑 7 天在线等效 → NaN/越界检查
+    static int SimRun(LegendApp app) {
+        System.IO.StreamWriter log = new System.IO.StreamWriter("build/legend_sim.log");
+        log.WriteLine("=== LEGEND_SIM headless balance ===");
+        // 从干净档开始,不受上次运行的存档干扰(职业:战士)
+        app.g.NewGame("SIM", 0);
+        app.g.AutoEquipBest();
+        LegendApp.SimSnap(log, "T0 建档", app.g);
+
+        // ---- Phase A:在线 60 秒(按 60fps 推进,dt = 1/60) ----
+        for (int f = 0; f < 3600; f = f + 1) {
+            app.g.StepIdle(1.0 / 60.0);
+            if (f % 600 == 0 && app.g.IsNewDay()) { app.g.DayReset(); }
+        }
+        LegendApp.SimSnap(log, "A 在线60s", app.g);
+
+        // ---- Phase B:离线 8 小时 ----
+        long goldB = app.g.p.cur[Data.CUR_GOLD];
+        int floorB = app.g.p.hjFloor;
+        app.g.p.lastSeenTs = Game.NowMs() - 8L * 3600L * 1000L;
+        app.g.OfflineSettle();
+        log.WriteLine("B 离线8h: 金币 +" + (app.g.p.cur[Data.CUR_GOLD] - goldB)
+                      + ", 层 " + floorB + " → " + app.g.p.hjFloor
+                      + ", 包 " + app.g.p.bagCnt + "/60");
+        LegendApp.SimSnap(log, "B 离线8h后", app.g);
+
+        // ---- Phase C:长跑 7 天在线等效(离线结算 + 自动回收满包) ----
+        for (int d = 0; d < 7; d = d + 1) {
+            // 模拟玩家每天上线:先一键换装,再把剩余装备回收,然后挂 24h
+            app.g.AutoEquipBest();
+            app.g.RecycleAll(Data.CUR_GOLD);
+            app.g.p.lastSeenTs = Game.NowMs() - 24L * 3600L * 1000L;
+            app.g.OfflineSettle();
+            if (app.g.IsNewDay()) { app.g.DayReset(); }
+            log.WriteLine("C day" + (d + 1) + ": floor=" + app.g.p.hjFloor
+                          + " best=" + app.g.p.hjBest + " lv=" + app.g.p.lv
+                          + " turn=" + app.g.p.turn
+                          + " bossK=" + app.g.p.bossKilled
+                          + " gold=" + app.g.FormatNum(app.g.p.cur[Data.CUR_GOLD])
+                          + " atk=" + app.g.TotalAcMin() + "~" + app.g.TotalAcMax()
+                          + " hp=" + app.g.TotalHp()
+                          + " bag=" + app.g.p.bagCnt);
+        }
+        LegendApp.SimSnap(log, "C 长跑7天后", app.g);
+
+        // ---- Phase D:转生链路(强推到可转生) ----
+        app.g.p.bossKilled = 5000;
+        for (int t = 0; t < 3 && app.g.CanTurn(); t = t + 1) { app.g.DoTurn(); }
+        log.WriteLine("D 转生: turn=" + app.g.p.turn + " lv=" + app.g.p.lv
+                      + " atk=" + app.g.TotalAcMin() + "~" + app.g.TotalAcMax());
+
+        // ---- 健全性检查 ----
+        LegendApp.SimCheck(log, app.g);
+        log.Close();
+        app.Save();
+        return 0;
+    }
+
+    static void SimSnap(System.IO.StreamWriter log, string tag, Game g) {
+        log.WriteLine("[" + tag + "] floor=" + g.p.hjFloor + " best=" + g.p.hjBest
+                      + " lv=" + g.p.lv + " xp=" + g.p.xp
+                      + " kills=" + g.p.totalKills + " boss=" + g.p.bossKilled
+                      + " gold=" + g.p.cur[Data.CUR_GOLD]
+                      + " atk=" + g.TotalAcMin() + "~" + g.TotalAcMax()
+                      + " def=" + g.TotalDef() + " hp=" + g.TotalHp()
+                      + " bag=" + g.p.bagCnt);
+    }
+
+    static void SimCheck(System.IO.StreamWriter log, Game g) {
+        bool bad = false;
+        for (int i = 0; i < Data.CUR_COUNT; i = i + 1) {
+            if (g.p.cur[i] < 0) { log.WriteLine("!! 货币 " + i + " 为负: " + g.p.cur[i]); bad = true; }
+        }
+        if (g.p.hjFloor < 1) { log.WriteLine("!! 层号非法: " + g.p.hjFloor); bad = true; }
+        if (g.TotalHp() <= 0) { log.WriteLine("!! 总 HP <= 0"); bad = true; }
+        if (g.TotalAcMax() < g.TotalAcMin()) { log.WriteLine("!! 攻击上下限反了"); bad = true; }
+        if (g.p.bagCnt < 0 || g.p.bagCnt > 60) { log.WriteLine("!! 背包越界: " + g.p.bagCnt); bad = true; }
+        for (int i = 0; i < g.p.bagCnt && i < 60; i = i + 1) {
+            Item it = g.p.bag[i];
+            if (it == null) { continue; }
+            if (it.tier < 0 || it.tier > 4) { log.WriteLine("!! 品阶越界 " + it.tier); bad = true; }
+            if (it.coef < 1) { log.WriteLine("!! 系数 < 1: " + it.coef); bad = true; }
+            if (it.slot < 0 || it.slot >= Data.SLOT_COUNT) { log.WriteLine("!! 槽位越界 " + it.slot); bad = true; }
+        }
+        if (g.p.cur[Data.CUR_GOLD] != g.p.cur[Data.CUR_GOLD]) { log.WriteLine("!! 金币 NaN"); bad = true; }
+        if (bad) { log.WriteLine("=== CHECK: FAIL ==="); }
+        else { log.WriteLine("=== CHECK: PASS ==="); }
+    }
+}
