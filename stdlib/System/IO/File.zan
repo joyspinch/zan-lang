@@ -300,6 +300,20 @@ class File {
     static int GetSize(string path) {
         nint fp = zan_pkg_fopen(path, "rb");
         if (fp == 0) {
+            // 与 Exists 的内嵌兜底同口径：盘上没有、内嵌副本有，大小取
+            // 副本长度。单文件发布里照片等二进制资源只存在于镜像中，
+            // 没有可打开的文件句柄（Upload 对内嵌图片取 size 走到这里）。
+            string emb = File.EmbedName(path);
+            byte[] lenBuf = new byte[4];
+            if (zan_embed_bytes(emb, lenBuf) != 0) {
+                return (int)lenBuf[0] + (int)lenBuf[1] * 256
+                    + (int)lenBuf[2] * 65536
+                    + (int)lenBuf[3] * 16777216;
+            }
+            if (zan_embed_has(emb) != 0) {
+                // zan_embed_bytes 缺 driver 时退回文本长度（无 NUL 资源）。
+                return zan_embed_read(emb).Length;
+            }
             throw new FileNotFoundException("Could not open file: " + path);
         }
         fseek(fp, 0, 2);
@@ -407,6 +421,16 @@ class File {
     /// 会被保留，因此可用于图片、可执行文件等任意内容）。
     /// 文件无法打开时抛出 FileNotFoundException。</summary>
     static byte[] ReadAllBytes(string path) {
+        nint fp = zan_pkg_fopen(path, "rb");
+        if (fp == 0) {
+            // 盘上没有、内嵌副本有：直接拷出副本字节（二进制安全，与
+            // GetSize/Exists 的内嵌兜底同口径）。纯文本读走 ReadAllText。
+            string emb = File.EmbedName(path);
+            if (zan_embed_has(emb) != 0) {
+                return File.ReadBytes(emb, 0, File.GetSize(emb));
+            }
+            throw new FileNotFoundException("Could not open file: " + path);
+        }
         int size = File.GetSize(path);
         if (size < 0) {
             throw new FileNotFoundException("Could not open file: " + path);
