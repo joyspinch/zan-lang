@@ -96,26 +96,29 @@ partial class ChartView {
     // 顶边获得亚像素抗锯齿覆盖率。内部以
     // 实心 1px 列填充；每列唯一的边界行按
     // 小数覆盖率混合，使顶部呈现平滑曲线而非阶梯。
-    // 列采用半开区间 [x0,x1)，避免段缝被重复混合。
+    // ox/oy 来自 BuildPath 的整数像素路径。平滑路径细分后
+    // 相邻子步可小于 1px，逐子步只画起点列会在跨像素处成片
+    // 跳列（百叶窗条纹）。按像素列双指针推进：每列在路径上
+    // 找到覆盖该列的子步再插值顶边。
     static void FillUnder(Canvas c, List<int> ox, List<int> oy, int baseY,
                           int color, bool gradient, int topA, int botA) {
         int cnt = ox.Count;
         if (cnt < 2) { return; }
-        for (int ii = 0; ii + 1 < cnt; ii = ii + 1) {
-            int ax0 = ox[ii]; int ay0 = oy[ii];
-            int ax1 = ox[ii + 1]; int ay1 = oy[ii + 1];
-            if (ax1 > ax0) {
-                int pxc = ax0;
-                while (pxc < ax1) {
-                    int yyF = ay0 * 256 + (ay1 - ay0) * (pxc - ax0) * 256 / (ax1 - ax0);
-                    ChartView.FillColumnAA(c, pxc, yyF, baseY, color, gradient, topA, botA, 56);
-                    pxc = pxc + 1;
-                }
+        int ii = 0;
+        for (int pxc = ox[0]; pxc <= ox[cnt - 1]; pxc = pxc + 1) {
+            while (ii + 2 < cnt) {
+                if (ox[ii + 1] > pxc) { break; }
+                ii = ii + 1;
             }
+            int ax0 = ox[ii];
+            int ax1 = ox[ii + 1];
+            int yyF = oy[ii] * 256;
+            if (ax1 > ax0 && pxc > ax0 && pxc < ax1) {
+                yyF = oy[ii] * 256 + (oy[ii + 1] - oy[ii])
+                    * (pxc - ax0) * 256 / (ax1 - ax0);
+            }
+            ChartView.FillColumnAA(c, pxc, yyF, baseY, color, gradient, topA, botA, 56);
         }
-        // 最后一个顶点处的末列（半开循环会跳过它）
-        ChartView.FillColumnAA(c, ox[cnt - 1], oy[cnt - 1] * 256, baseY,
-                               color, gradient, topA, botA, 56);
     }
 
     // 单个抗锯齿填充列。yyF 是以 1/256 px 表示的小数顶部；
@@ -181,31 +184,50 @@ partial class ChartView {
         }
     }
 
+    // 平滑路径经 BuildPathFx 细分成 48 步/段，相邻子步往往不足 1px——
+    // 按子步的半开像素区间 [ceil(ax0/256), ax1/256) 逐段填会整段落空
+    // （区间为空），表现为平滑堆叠面积只剩描边、带间露出大片背景。
+    // 这里改为双指针整列推进：每个像素列在两条边界路径上各找到
+    // 覆盖该列起点的子步，按列起点插值上下边界，一列不漏。
     static void FillBandFx(Canvas c, List<int> topX, List<int> topY,
                            List<int> botX, List<int> botY, int color,
                            bool gradient, int topA, int botA) {
         int cnt = topX.Count;
-        if (botX.Count < cnt) { cnt = botX.Count; }
-        for (int i = 0; i + 1 < cnt; i = i + 1) {
-            int ax0 = topX[i];
-            int ax1 = topX[i + 1];
-            if (ax1 > ax0) {
-                int px = (ax0 + 255) / 256;
-                int pxEnd = ax1 / 256;
-                while (px < pxEnd) {
-                    int xF = px * 256;
-                    int topF = topY[i] + (topY[i + 1] - topY[i]) * (xF - ax0) / (ax1 - ax0);
-                    int bx0 = botX[i];
-                    int bx1 = botX[i + 1];
-                    int bottomF = botY[i];
-                    if (bx1 > bx0) {
-                        bottomF = botY[i] + (botY[i + 1] - botY[i]) * (xF - bx0) / (bx1 - bx0);
-                    }
-                    ChartView.FillBandColumnAA(c, px, topF, bottomF,
-                        color, gradient, topA, botA, 90);
-                    px = px + 1;
-                }
+        if (cnt < 2) { return; }
+        int bcnt = botX.Count;
+        if (bcnt < 2) { return; }
+        int px = (topX[0] + 255) / 256;
+        int pxEnd = topX[cnt - 1] / 256;
+        if (pxEnd * 256 >= topX[cnt - 1]) { pxEnd = pxEnd - 1; }
+        int ti = 0;
+        int bi = 0;
+        while (px <= pxEnd) {
+            int xF = px * 256;
+            while (ti + 2 < cnt) {
+                if (topX[ti + 1] > xF) { break; }
+                ti = ti + 1;
             }
+            while (bi + 2 < bcnt) {
+                if (botX[bi + 1] > xF) { break; }
+                bi = bi + 1;
+            }
+            int tAx0 = topX[ti];
+            int tAx1 = topX[ti + 1];
+            int topF = topY[ti];
+            if (tAx1 > tAx0) {
+                topF = topY[ti] + (topY[ti + 1] - topY[ti]) * (xF - tAx0)
+                    / (tAx1 - tAx0);
+            }
+            int bAx0 = botX[bi];
+            int bAx1 = botX[bi + 1];
+            int bottomF = botY[bi];
+            if (bAx1 > bAx0) {
+                bottomF = botY[bi] + (botY[bi + 1] - botY[bi]) * (xF - bAx0)
+                    / (bAx1 - bAx0);
+            }
+            ChartView.FillBandColumnAA(c, px, topF, bottomF,
+                color, gradient, topA, botA, 90);
+            px = px + 1;
         }
     }
 
