@@ -2044,6 +2044,11 @@ class LegendApp {
         if (tourMode) {
             return LegendApp.TourRun(app);
         }
+        // 动作冒烟模式(逐个调用 Game 动作方法,查状态崩坏)
+        bool actMode = (LegendApp.SysGetenv("LEGEND_ACT") == "1");
+        if (actMode) {
+            return LegendApp.ActionRun(app);
+        }
         // 模拟模式
         bool simMode = (LegendApp.SysGetenv("LEGEND_SIM") == "1");
         if (simMode) {
@@ -2268,5 +2273,145 @@ class LegendApp {
         if (g.p.cur[Data.CUR_GOLD] != g.p.cur[Data.CUR_GOLD]) { log.WriteLine("!! 金币 NaN"); bad = true; }
         if (bad) { log.WriteLine("=== CHECK: FAIL ==="); }
         else { log.WriteLine("=== CHECK: PASS ==="); }
+    }
+
+    // 动作冒烟:逐个调用 Game 的动作方法(玩家点按钮会触发的那些),每个之后查状态不崩坏。
+    // 关注点:① 不崩溃(段错误/异常) ② 关键不变量不被破坏(货币非负 / HP>0 / 攻击上下限 /
+    // 背包与装备索引合法 / cardMask 位宽足够覆盖 960 位)。
+    static int ActionRun(LegendApp app) {
+        System.IO.StreamWriter log = new System.IO.StreamWriter("build/legend_act.log");
+        log.WriteLine("=== LEGEND_ACT action smoke ===");
+        Game g = app.g;
+        // 富档:从干净档开始,造出能触发全部动作分支的状态
+        g.NewGame("ACT", 0);
+        g.AutoEquipBest();
+        LegendApp.TourPrep(app);
+        // 背包塞满各种装备(保证 Equip/Refine/Recycle/Upgrade 有料)
+        for (int i = 0; i < 60; i = i + 1) {
+            Item it = Item.New(i % Data.SLOT_COUNT, i % 5, 1 + (i % 15), i % 8, (i * 7 + 3) % 997);
+            g.AddToBag(it);
+        }
+        g.AutoEquipBest();
+        // 拉满货币,所有消耗类动作都能走到真实分支
+        for (int c = 0; c < Data.CUR_COUNT; c = c + 1) { g.p.cur[c] = 1000000000L; }
+        // 次数类(部分已由 NewGame 给,这里再确认拉满)
+        g.p.bhTriesLeft = 8;
+        g.p.wbTriesLeft = 10;
+        g.p.ybTriesLeft = 10;
+        g.p.jbTriesLeft = 10;
+        g.p.pkTriesLeft = 10;
+        // 展示/解锁类
+        g.p.vip = 3;
+        g.p.nobleTier = 2;
+        g.p.turn = 2;
+        g.p.xbTickets = 12;
+        g.p.altarMyProg = 3333;
+        g.p.cityOwned = 0;
+        g.p.cityLastMs = Game.NowMs() - 7200000L;   // 2h 前占领,使 CollectCity 走真实结算
+        g.p.towerBest = 0;
+        g.p.bossKilled = 5000;
+        for (int i = 0; i < 5; i = i + 1) { g.p.wuxingMs[i] = 1234567L * (i + 1); }
+        for (int i = 0; i < g.p.cardMaskLen; i = i + 1) { g.p.cardMask[i] = 0x55555555; }
+        for (int i = 0; i < 3; i = i + 1) {
+            Item it = Item.New(i % Data.SLOT_COUNT, i % 5, 5, i % 8, (i * 13 + 1) % 997);
+            g.SendMailAttach("测试邮件" + i, it);
+        }
+        if (!LegendApp.ActCheck(log, g, "setup")) { log.Close(); return 1; }
+
+        bool fail = false;
+        int n = 0;
+        // 装备/背包(此时背包满,equip 部分穿上)
+        g.EquipFromBag(0); if (!LegendApp.ActCheck(log, g, "EquipFromBag(0)")) { fail = true; } n = n + 1;
+        g.UnequipToBag(0); if (!LegendApp.ActCheck(log, g, "UnequipToBag(0)")) { fail = true; } n = n + 1;
+        g.RefineGold(0); if (!LegendApp.ActCheck(log, g, "RefineGold(0)")) { fail = true; } n = n + 1;
+        g.RefineYb(0); if (!LegendApp.ActCheck(log, g, "RefineYb(0)")) { fail = true; } n = n + 1;
+        g.UpgradeEquip(0); if (!LegendApp.ActCheck(log, g, "UpgradeEquip(0)")) { fail = true; } n = n + 1;
+        g.Recycle(0, Data.CUR_GOLD); if (!LegendApp.ActCheck(log, g, "Recycle(0,GOLD)")) { fail = true; } n = n + 1;
+        g.Recycle(1, Data.CUR_YB); if (!LegendApp.ActCheck(log, g, "Recycle(1,YB)")) { fail = true; } n = n + 1;
+        int ae = g.AutoEquipBest(); if (!LegendApp.ActCheck(log, g, "AutoEquipBest")) { fail = true; } n = n + 1;
+        // BOSS
+        g.ChallengeBossHome(0); if (!LegendApp.ActCheck(log, g, "ChallengeBossHome(0)")) { fail = true; } n = n + 1;
+        g.ChallengeBossHome(7); if (!LegendApp.ActCheck(log, g, "ChallengeBossHome(7)")) { fail = true; } n = n + 1;
+        g.HitWorldBoss(); if (!LegendApp.ActCheck(log, g, "HitWorldBoss#1")) { fail = true; } n = n + 1;
+        g.HitWorldBoss(); if (!LegendApp.ActCheck(log, g, "HitWorldBoss#2")) { fail = true; } n = n + 1;
+        // 爵位/五行/图谱/称谓
+        g.DonateNoble(1000); if (!LegendApp.ActCheck(log, g, "DonateNoble(1000)")) { fail = true; } n = n + 1;
+        g.InjectWuxing(0, 1000); if (!LegendApp.ActCheck(log, g, "InjectWuxing(0)")) { fail = true; } n = n + 1;
+        g.InjectWuxing(4, 1000); if (!LegendApp.ActCheck(log, g, "InjectWuxing(4)")) { fail = true; } n = n + 1;
+        g.ActivateCard(0, 5, 3); if (!LegendApp.ActCheck(log, g, "ActivateCard(0,5,3)")) { fail = true; } n = n + 1;
+        g.TryTitleUp(); if (!LegendApp.ActCheck(log, g, "TryTitleUp")) { fail = true; } n = n + 1;
+        // 寻宝
+        for (int x = 0; x < 3; x = x + 1) { g.XunBao(); if (!LegendApp.ActCheck(log, g, "XunBao#" + x)) { fail = true; } n = n + 1; }
+        // 祭坛(5 种)
+        for (int k = 0; k < 5; k = k + 1) { g.AltarDonate(k); if (!LegendApp.ActCheck(log, g, "AltarDonate(" + k + ")")) { fail = true; } n = n + 1; }
+        // 钱庄
+        g.CollectCity(); if (!LegendApp.ActCheck(log, g, "CollectCity")) { fail = true; } n = n + 1;
+        // 押镖/劫镖/PK/传说塔
+        g.SendYabiao(); if (!LegendApp.ActCheck(log, g, "SendYabiao")) { fail = true; } n = n + 1;
+        g.JieBiao(); if (!LegendApp.ActCheck(log, g, "JieBiao")) { fail = true; } n = n + 1;
+        g.PKArena(); if (!LegendApp.ActCheck(log, g, "PKArena")) { fail = true; } n = n + 1;
+        g.TowerClimb(); if (!LegendApp.ActCheck(log, g, "TowerClimb")) { fail = true; } n = n + 1;
+        // 商店(12 个)
+        for (int s = 0; s < 12; s = s + 1) { g.ShopBuy(s); if (!LegendApp.ActCheck(log, g, "ShopBuy(" + s + ")")) { fail = true; } n = n + 1; }
+        // 充值(7 档)
+        for (int t = 0; t < 7; t = t + 1) { g.Charge(t); if (!LegendApp.ActCheck(log, g, "Charge(" + t + ")")) { fail = true; } n = n + 1; }
+        // 社交
+        g.CreateGuild("测试行会"); if (!LegendApp.ActCheck(log, g, "CreateGuild")) { fail = true; } n = n + 1;
+        g.ApprenticeTo("名师"); if (!LegendApp.ActCheck(log, g, "ApprenticeTo")) { fail = true; } n = n + 1;
+        g.TakeApprentice("小徒"); if (!LegendApp.ActCheck(log, g, "TakeApprentice")) { fail = true; } n = n + 1;
+        // 邮件
+        Item mailIt = Item.New(Data.SLOT_WEAPON, 2, 6, 1, 42);
+        g.SendMailAttach("冒烟邮件", mailIt); if (!LegendApp.ActCheck(log, g, "SendMailAttach")) { fail = true; } n = n + 1;
+        g.ClaimMail(0); if (!LegendApp.ActCheck(log, g, "ClaimMail(0)")) { fail = true; } n = n + 1;
+        // 殿堂
+        Item dtIt = Item.New(Data.SLOT_WEAPON, 4, 15, 1, 7);
+        g.RegisterDianTang(0, dtIt); if (!LegendApp.ActCheck(log, g, "RegisterDianTang(0)")) { fail = true; } n = n + 1;
+        // 经验/转生/离线
+        g.GainXp(1000000); if (!LegendApp.ActCheck(log, g, "GainXp")) { fail = true; } n = n + 1;
+        g.DoTurn(); if (!LegendApp.ActCheck(log, g, "DoTurn")) { fail = true; } n = n + 1;
+        g.p.lastSeenTs = Game.NowMs() - 8L * 3600L * 1000L;   // 8h 前
+        g.OfflineSettle(); if (!LegendApp.ActCheck(log, g, "OfflineSettle")) { fail = true; } n = n + 1;
+        // 开关类
+        g.ToggleBossKey(); if (!LegendApp.ActCheck(log, g, "ToggleBossKey")) { fail = true; } n = n + 1;
+        g.SetUiScale(1.2); if (!LegendApp.ActCheck(log, g, "SetUiScale")) { fail = true; } n = n + 1;
+        g.ToggleSilent(); if (!LegendApp.ActCheck(log, g, "ToggleSilent")) { fail = true; } n = n + 1;
+        // 一键回收(最后,会清空背包)
+        long rec = g.RecycleAll(Data.CUR_GOLD); if (!LegendApp.ActCheck(log, g, "RecycleAll")) { fail = true; } n = n + 1;
+
+        log.WriteLine("=== ACT ran " + n + " actions ===");
+        if (fail) { log.WriteLine("=== ACT: FAIL ==="); }
+        else { log.WriteLine("=== ACT: PASS ==="); }
+        log.Close();
+        if (fail) { return 1; }
+        return 0;
+    }
+
+    // 检查关键不变量;返回 true=正常,false=发现崩坏
+    static bool ActCheck(System.IO.StreamWriter log, Game g, string tag) {
+        bool bad = false;
+        for (int i = 0; i < Data.CUR_COUNT; i = i + 1) {
+            if (g.p.cur[i] < 0) { log.WriteLine("!! [" + tag + "] 货币#" + i + " 为负: " + g.p.cur[i]); bad = true; }
+        }
+        if (g.p.hjFloor < 1) { log.WriteLine("!! [" + tag + "] 层号非法: " + g.p.hjFloor); bad = true; }
+        if (g.TotalHp() <= 0) { log.WriteLine("!! [" + tag + "] 总HP<=0: " + g.TotalHp()); bad = true; }
+        if (g.TotalAcMax() < g.TotalAcMin()) { log.WriteLine("!! [" + tag + "] 攻击上下限反了"); bad = true; }
+        if (g.p.bagCnt < 0 || g.p.bagCnt > 60) { log.WriteLine("!! [" + tag + "] 背包越界: " + g.p.bagCnt); bad = true; }
+        for (int i = 0; i < g.p.bagCnt && i < 60; i = i + 1) {
+            Item it = g.p.bag[i];
+            if (it == null) { continue; }
+            if (it.tier < 0 || it.tier > 4) { log.WriteLine("!! [" + tag + "] 背包品阶越界 " + it.tier); bad = true; }
+            if (it.coef < 1) { log.WriteLine("!! [" + tag + "] 背包系数<1: " + it.coef); bad = true; }
+            if (it.slot < 0 || it.slot >= Data.SLOT_COUNT) { log.WriteLine("!! [" + tag + "] 背包槽位越界 " + it.slot); bad = true; }
+        }
+        for (int i = 0; i < Data.SLOT_COUNT; i = i + 1) {
+            Item it = g.p.equip[i];
+            if (it == null) { continue; }
+            if (it.slot < 0 || it.slot >= Data.SLOT_COUNT) { log.WriteLine("!! [" + tag + "] 装备槽位越界 " + it.slot); bad = true; }
+            else if (it.slot != i) { log.WriteLine("!! [" + tag + "] 装备装错槽: equip[" + i + "].slot=" + it.slot); bad = true; }
+            if (it.tier < 0 || it.tier > 4) { log.WriteLine("!! [" + tag + "] 装备品阶越界 " + it.tier); bad = true; }
+            if (it.coef < 1) { log.WriteLine("!! [" + tag + "] 装备系数<1: " + it.coef); bad = true; }
+        }
+        if (g.p.cardMaskLen < 30) { log.WriteLine("!! [" + tag + "] cardMask 位宽不足(仅 " + g.p.cardMaskLen + " 字,需 30 字覆盖 960 位)"); bad = true; }
+        return !bad;
     }
 }
