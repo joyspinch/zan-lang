@@ -1,0 +1,176 @@
+using System;
+using System.Threading;
+
+namespace Gui;
+
+/// <summary>
+/// 为每个控件实例提供稳定 id 的单调递增来源。保留式控件
+/// 在工厂（Create）中领取一个 id，使身份在其整个生命周期内固定，
+/// 不受帧间兄弟控件出现或消失的影响
+/// （弹出窗口不再导致其后所有 id 重编号）。id 从高位开始，
+/// 这样它们永远不会与旧式逐帧位置 id 冲突，
+/// 后者由 <see cref="FocusManager.AllocId"/> 分配。
+/// </summary>
+class WidgetId {
+    static int seq;
+    static int frameBase;
+
+    /// 新的、进程唯一的控件 id（在调用方生命周期内稳定）。
+    static int Next() {
+        seq = seq + 1;
+        return 1000000 + seq;
+    }
+
+    /// 将当前计数器记录为逐帧基线。即时模式
+    /// 应用应在所有保留式控件 id 分配完成后调用一次，
+    /// （chrome、常驻控件），这样 ResetFrame() 只会回退到此处，
+    /// 绝不会重复发放已由保留式控件持有的 id。
+    static void Mark() {
+        frameBase = seq;
+    }
+
+    /// 将 id 计数器回退到帧基线（参见 Mark）。纯
+    /// 即时模式 UI（每帧重建控件）每帧调用一次，
+    /// 使按相同顺序绘制的控件在帧间获得相同的 id——
+    /// 否则不断递增的计数器会给每个
+    /// 重建的控件分配新 id，悬停/按压/点击（均按 id 关联）将永远
+    /// 匹配不到上一帧框架解析出的指针目标。
+    /// 保留式控件应用不得调用此方法。
+    static void ResetFrame() {
+        seq = frameBase;
+    }
+
+    /// 当前原始计数器。与 SetSeq 配合使用，使次级即时模式
+    /// 表面（例如渲染在同一共享计数器上的子对话框窗口）
+    /// 可以固定自己的稳定逐帧基线，之后再恢复主
+    /// 应用的计数器。
+    static int SeqValue() { return seq; }
+
+    /// 强制将计数器设为 `v`（参见 SeqValue）。子表面在渲染前设置一个固定的、
+    /// 高位基线，使其控件每帧获得相同 id
+    /// （悬停/按压/点击按 id 关联），且不与主应用冲突。
+    static void SetSeq(int v) { seq = v; }
+
+    /// 预留 `n` 个连续的稳定 id 并返回第一个。需要注册
+    /// 多个命中区域的控件（如 Rate 的每个星）可用它保证
+    /// 子 id 在帧间连续且稳定。
+    static int Block(int n) {
+        int first = 1000000 + seq + 1;
+        seq = seq + n;
+        return first;
+    }
+}
+
+class FocusManager {
+    int focusedId;
+    int hoveredId;
+    int pressedId;
+    // 上一渲染帧结束时三个 id 的快照。
+    // RollFrame()（由 App.PresentFrame 调用）将
+    // 实时 id 复制进来，控件据此比较 IsHovered(id) 与 WasHovered(id) 以检测本帧的
+    // 进入/离开和焦点/失焦转换。
+    int prevFocusedId;
+    int prevHoveredId;
+    int prevPressedId;
+    int nextId;
+    // 本帧可聚焦控件按其注册顺序排列的 id，供 Tab
+    // / Shift+Tab 将焦点移到下一个/上一个。每帧重建。
+    List<int> tabOrder;
+    /// 嵌套的 id 段：PushIds 时压入当前计数器，PopIds 时恢复。
+    List<int> scopeReturn;
+
+    FocusManager() {
+        focusedId = -1;
+        hoveredId = -1;
+        pressedId = -1;
+        prevFocusedId = -1;
+        prevHoveredId = -1;
+        prevPressedId = -1;
+        nextId = 0;
+        tabOrder = new List<int>();
+        scopeReturn = new List<int>();
+    }
+
+    int AllocId() {
+        int id = nextId;
+        nextId = nextId + 1;
+        return id;
+    }
+
+    /// 即时模式 id 按绘制顺序递增，所以一个区域多画 / 少画
+    /// 一个控件，就会把它后面所有控件的 id 整体移位；而指针
+    /// 目标是按上一帧的 id 解析的，于是这一帧的点击会落到
+    /// 另一个控件上（在设计器里点一下就切换了后面的代码页）。
+    /// 宿主把每个大区域（功能区、各面板、标签条、编辑区）包在
+    /// 自己的 id 段里，区域内部的增减就不会惊动其他区域。
+    void PushIds(int first) {
+        scopeReturn.Add(nextId);
+        nextId = first;
+    }
+
+    void PopIds() {
+        if (scopeReturn.Count == 0) { return; }
+        nextId = scopeReturn[scopeReturn.Count - 1];
+        scopeReturn.RemoveAt(scopeReturn.Count - 1);
+    }
+
+    void ResetIds() {
+        nextId = 0;
+        tabOrder = new List<int>();
+        scopeReturn = new List<int>();
+    }
+
+    /// 可聚焦控件每帧（按渲染顺序）记录自身，使键盘
+    /// Tab 遍历拥有稳定、按布局排序的环。
+    void RegisterFocusable(int id) {
+        tabOrder.Add(id);
+    }
+
+    int IndexOf(int id) {
+        for (int i = 0; i < tabOrder.Count; i = i + 1) {
+            if (tabOrder[i] == id) { return i; }
+        }
+        return -1;
+    }
+
+    /// 将焦点移到下一个可聚焦控件（循环）。`dir` 为 +1 表示 Tab，
+    /// -1 表示 Shift+Tab。若无任何可聚焦控件渲染则为空操作。
+    void FocusStep(int dir) {
+        if (tabOrder.Count == 0) { return; }
+        int idx = IndexOf(focusedId);
+        if (idx < 0) {
+            if (dir >= 0) { focusedId = tabOrder[0]; }
+            else { focusedId = tabOrder[tabOrder.Count - 1]; }
+            return;
+        }
+        int n = tabOrder.Count;
+        int next = (idx + dir + n) % n;
+        focusedId = tabOrder[next];
+    }
+
+    bool IsFocused(int id) { return focusedId == id; }
+    bool IsHovered(int id) { return hoveredId == id; }
+    bool IsPressed(int id) { return pressedId == id; }
+
+    bool WasFocused(int id) { return prevFocusedId == id; }
+    bool WasHovered(int id) { return prevHoveredId == id; }
+    bool WasPressed(int id) { return prevPressedId == id; }
+
+    /// 将实时 id 快照为“上一帧”基线。每渲染一帧调用一次，
+    /// （在 App.PresentFrame 中）即控件查询完本帧的
+    /// 进入/离开/焦点转换之后。
+    void RollFrame() {
+        prevFocusedId = focusedId;
+        prevHoveredId = hoveredId;
+        prevPressedId = pressedId;
+    }
+
+    void SetFocused(int id) { focusedId = id; }
+    void SetHovered(int id) { hoveredId = id; }
+    void SetPressed(int id) { pressedId = id; }
+
+    void ClearHover() { hoveredId = -1; }
+    void ClearPress() { pressedId = -1; }
+    void ClearFocus() { focusedId = -1; }
+}
+
