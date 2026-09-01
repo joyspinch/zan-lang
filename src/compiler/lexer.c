@@ -797,12 +797,20 @@ static zan_token_t lexer_string(zan_lexer_t *lex) {
     /* collect into temporary buffer */
     char buf[4096];
     size_t bi = 0;
+    bool truncated = false;
 
     while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '"') {
         if (lexer_peek_ch(lex) == '\\') {
             lexer_advance(lex); /* \ */
+            /* Always run the escape through lexer_escape_char, even when the
+             * buffer is full: it consumes the escaped character, so skipping
+             * it on truncation would let a `\"` be re-read as the closing
+             * quote and desynchronize the lexer for the rest of the file. */
+            char esc = lexer_escape_char(lex);
             if (bi < sizeof(buf) - 1) {
-                buf[bi++] = lexer_escape_char(lex);
+                buf[bi++] = esc;
+            } else {
+                truncated = true;
             }
         } else if (lexer_peek_ch(lex) == '\n') {
             zan_diag_emit(lex->diag, DIAG_ERROR, loc, "unterminated string literal");
@@ -812,8 +820,15 @@ static zan_token_t lexer_string(zan_lexer_t *lex) {
                 buf[bi++] = lexer_advance(lex);
             } else {
                 lexer_advance(lex);
+                truncated = true;
             }
         }
+    }
+
+    if (truncated) {
+        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                      "string literal exceeds %d characters and was truncated",
+                      (int)sizeof(buf) - 1);
     }
 
     if (!lexer_at_end(lex)) {
@@ -868,12 +883,19 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
     zan_loc_t loc = lexer_loc(lex);
     char buf[4096];
     size_t bi = 0;
+    bool truncated = false;
 
     while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '"' && lexer_peek_ch(lex) != '{') {
         if (lexer_peek_ch(lex) == '\\') {
             lexer_advance(lex); /* \ */
+            /* Same desync guard as lexer_string: the escaped character must
+             * be consumed even when the buffer is full, or a truncated `\"`
+             * ends the segment early and everything after is mistokenized. */
+            char esc = lexer_escape_char(lex);
             if (bi < sizeof(buf) - 1) {
-                buf[bi++] = lexer_escape_char(lex);
+                buf[bi++] = esc;
+            } else {
+                truncated = true;
             }
         } else if (lexer_peek_ch(lex) == '\n') {
             zan_diag_emit(lex->diag, DIAG_ERROR, loc, "unterminated interpolated string");
@@ -883,8 +905,15 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
                 buf[bi++] = lexer_advance(lex);
             } else {
                 lexer_advance(lex);
+                truncated = true;
             }
         }
+    }
+
+    if (truncated) {
+        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                      "interpolated string segment exceeds %d characters and was truncated",
+                      (int)sizeof(buf) - 1);
     }
 
     zan_token_kind_t kind;
@@ -925,6 +954,11 @@ static zan_token_t lexer_interp_format(zan_lexer_t *lex, zan_loc_t loc) {
         if (bi < sizeof(buf) - 1) buf[bi++] = lexer_advance(lex);
         else lexer_advance(lex); /* format longer than the buffer: skip it */
     }
+    if (bi >= sizeof(buf) - 1) {
+        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                      "interpolation format specifier exceeds %d characters and was truncated",
+                      (int)sizeof(buf) - 1);
+    }
     zan_token_t tok = lexer_make(lex, TK_INTERP_FMT, loc);
     tok.str_val.str = zan_arena_strdup(lex->arena, buf, bi);
     tok.str_val.len = (uint32_t)bi;
@@ -940,6 +974,7 @@ static zan_token_t lexer_verbatim_string(zan_lexer_t *lex) {
 
     char buf[4096];
     size_t bi = 0;
+    bool truncated = false;
 
     while (!lexer_at_end(lex)) {
         if (lexer_peek_ch(lex) == '"') {
@@ -948,6 +983,7 @@ static zan_token_t lexer_verbatim_string(zan_lexer_t *lex) {
                 lexer_advance(lex);
                 lexer_advance(lex);
                 if (bi < sizeof(buf) - 1) buf[bi++] = '"';
+                else truncated = true;
             } else {
                 lexer_advance(lex); /* closing " */
                 break;
@@ -957,8 +993,15 @@ static zan_token_t lexer_verbatim_string(zan_lexer_t *lex) {
                 buf[bi++] = lexer_advance(lex);
             } else {
                 lexer_advance(lex);
+                truncated = true;
             }
         }
+    }
+
+    if (truncated) {
+        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                      "verbatim string literal exceeds %d characters and was truncated",
+                      (int)sizeof(buf) - 1);
     }
 
     zan_token_t tok = lexer_make(lex, TK_STRING_LIT, loc);
