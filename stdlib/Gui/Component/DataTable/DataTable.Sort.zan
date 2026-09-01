@@ -215,7 +215,20 @@ partial class DataTable {
         foreach (SortKey sk in st.sortKeys) {
             int sc = sk.col;
             if (sc >= 0 && sc < cols.Count) {
-                int cmp = DataTable.CompareCellCol(cols[sc], src.CellText(ra, sc), src.CellText(rb, sc));
+                string ta = src.CellText(ra, sc);
+                string tb = src.CellText(rb, sc);
+                // 计算列：比较公式值（实数）而非源文本。
+                double fa;
+                double fb;
+                if (DataTable.FormulaTryReal(cols, src, ra, sc, out fa)) {
+                    if (DataTable.FormulaTryReal(cols, src, rb, sc, out fb)) {
+                        int cr = fa < fb ? 0 - 1 : (fa > fb ? 1 : 0);
+                        if (sk.dir == 2) { cr = 0 - cr; }
+                        if (cr != 0) { return cr; }
+                        continue;
+                    }
+                }
+                int cmp = DataTable.CompareCellCol(cols[sc], ta, tb);
                 if (sk.dir == 2) { cmp = 0 - cmp; }
                 if (cmp != 0) { return cmp; }
             }
@@ -281,6 +294,10 @@ partial class DataTable {
         List<int> nkey = new List<int>();
         List<string> skey = new List<string>();
         List<double> rkey = new List<double>();
+        // 计算列：按公式实数值排序，与该列 decimals>0 的
+        // 实数路径一致。公式列逐行可能求值失败（显示空），
+        // 失败行键取 0，保持稳定归并的行序不变。
+        bool fcol = DataTable.IsFormula(cols, sc);
         for (int q = 0; q < n; q = q + 1) {
             if (cols[sc].isDate) { nkey.Add(src.CellDay(st.order[q], sc, cols[sc].dateOrder)); }
             else if (cols[sc].isBool) {
@@ -289,7 +306,15 @@ partial class DataTable {
                 nkey.Add(bv);
             }
             else if (kind == 1) { nkey.Add(src.CellNum(st.order[q], sc)); }
-            else if (kind == 2) { rkey.Add(src.CellReal(st.order[q], sc)); }
+            else if (kind == 2) {
+                if (fcol) {
+                    double fv;
+                    if (!DataTable.FormulaTryReal(cols, src, st.order[q], sc, out fv)) { fv = 0.0; }
+                    rkey.Add(fv);
+                } else {
+                    rkey.Add(src.CellReal(st.order[q], sc));
+                }
+            }
             else { skey.Add(src.CellText(st.order[q], sc)); }
         }
 
@@ -405,16 +430,27 @@ partial class DataTable {
     // 当前过滤视图中存在、由 st.order 表示的值。
     // 对 n 个可见行和 u 个唯一值，哈希后仅对唯一值排序，
     // 复杂度为 O(n + u log u)。
-    static List<string> DistinctFiltered(DataTableState st, DataSource src, int col) {
+    static List<string> DistinctFiltered(DataTableState st, List<DataColumn> cols, DataSource src, int col) {
         List<string> vals = new List<string>();
         int i = 0;
         int nrows = st.order.Count;
         List<int> slots = new List<int>();
         int cap = DataTable.DistinctCapacity(nrows);
         for (; i < cap; i = i + 1) { slots.Add(-1); }
+        // 计算列：去重集合取公式文本（与显示一致）；
+        // 求值失败的行显示空，不为集合筛选提供候选。
+        bool fcol = DataTable.IsFormula(cols, col);
         i = 0;
         while (i < nrows) {
-            DataTable.DistinctAdd(vals, slots, src.CellText(st.order[i], col));
+            int row = st.order[i];
+            string v;
+            if (fcol) {
+                v = DataTable.FormulaText(cols, src, row, col);
+                if (v == null) { v = ""; }
+            } else {
+                v = src.CellText(row, col);
+            }
+            if (v.Length > 0) { DataTable.DistinctAdd(vals, slots, v); }
             i = i + 1;
         }
         DataTable.SortStr(vals);

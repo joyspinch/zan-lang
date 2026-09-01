@@ -21,13 +21,14 @@ partial class DataTable {
         if (mode == 5 || mode == 6) {
             // 高于 / 低于幸存行平均值
             double sum = 0.0;
+            bool fcolSet = cols[c].formula.Length > 0;
             for (int i = 0; i < st.order.Count; i = i + 1) {
-                sum = sum + src.CellReal(st.order[i], c);
+                sum = sum + DataTable.SetPassReal(st, cols, src, fcolSet, c, st.order[i]);
             }
             double avg = sum / (double)st.order.Count;
             List<int> kept = new List<int>();
             for (int k = 0; k < st.order.Count; k = k + 1) {
-                double v = src.CellReal(st.order[k], c);
+                double v = DataTable.SetPassReal(st, cols, src, fcolSet, c, st.order[k]);
                 bool ok = v > avg;
                 if (mode == 6) { ok = v < avg; }
                 if (ok) { kept.Add(st.order[k]); }
@@ -46,11 +47,12 @@ partial class DataTable {
         // Bottom 使用“最大值在根”的堆。这样不必把全部候选
         // 排序，扫描复杂度为 O(N log K)，K 很小时内存也保持有界。
         bool desc = (mode == 1 || mode == 3);
+        bool fcolHeap = cols[c].formula.Length > 0;
         List<int> heapRows = new List<int>();
         List<double> heapVals = new List<double>();
         for (int h = 0; h < st.order.Count; h = h + 1) {
             int row = st.order[h];
-            double value = src.CellReal(row, c);
+            double value = DataTable.SetPassReal(st, cols, src, fcolHeap, c, row);
             if (heapRows.Count < n) {
                 heapRows.Add(row);
                 heapVals.Add(value);
@@ -67,12 +69,24 @@ partial class DataTable {
         double cut = heapVals[0];
         List<int> keep = new List<int>();
         for (int m = 0; m < st.order.Count; m = m + 1) {
-            double v = src.CellReal(st.order[m], c);
+            double v = DataTable.SetPassReal(st, cols, src, fcolHeap, c, st.order[m]);
             bool ok = v <= cut;
             if (desc) { ok = v >= cut; }
             if (ok) { keep.Add(st.order[m]); }
         }
         st.order = keep;
+    }
+
+    // Top-N / 高于平均值集合过滤的实数读取：公式列读公式值
+    // （失败行按 0），普通列走源实数路径。
+    static double SetPassReal(DataTableState st, List<DataColumn> cols, DataSource src,
+                              bool fcol, int c, int row) {
+        if (fcol) {
+            double fv;
+            if (!DataTable.FormulaTryReal(cols, src, row, c, out fv)) { return 0.0; }
+            return fv;
+        }
+        return src.CellReal(row, c);
     }
 
     // 堆根始终是当前 K 个候选中的“最差”值：Top-N 为最小值，
@@ -177,7 +191,7 @@ partial class DataTable {
             if (frAny) {
                 List<int> kept = new List<int>();
                 for (int fro = 0; fro < st.order.Count; fro = fro + 1) {
-                    if (DataTable.RowPassesFilterRow(st, src, st.order[fro])) { kept.Add(st.order[fro]); }
+                    if (DataTable.RowPassesFilterRow(st, cols, src, st.order[fro])) { kept.Add(st.order[fro]); }
                 }
                 st.order = kept;
             }
@@ -612,6 +626,9 @@ partial class DataTable {
                 if (src.CellBool(rowIdx, gc)) { return c.boolTrue; }
                 return c.boolFalse;
             }
+            // 计算列：按公式值的格式化文本分桶，与显示一致。
+            string ft = DataTable.FormulaText(cols, src, rowIdx, gc);
+            if (ft != null) { return ft; }
         }
         return src.CellText(rowIdx, gc);
     }
@@ -635,6 +652,13 @@ partial class DataTable {
                     cmp = DataTable.CmpDateGroup(gcol,
                                                  src.CellDay(ra, gc, gcol.dateOrder),
                                                  src.CellDay(rb, gc, gcol.dateOrder));
+                } else if (gcol.formula.Length > 0) {
+                    // 计算列：按公式实数值比较（失败行键 0）。
+                    double fa;
+                    double fb;
+                    if (!DataTable.FormulaTryReal(cols, src, ra, gc, out fa)) { fa = 0.0; }
+                    if (!DataTable.FormulaTryReal(cols, src, rb, gc, out fb)) { fb = 0.0; }
+                    cmp = fa < fb ? 0 - 1 : (fa > fb ? 1 : 0);
                 } else {
                     cmp = DataTable.CompareCellCol(gcol, src.CellText(ra, gc), src.CellText(rb, gc));
                 }
@@ -714,6 +738,7 @@ partial class DataTable {
             gcol = cols[col];
             if (gcol.isDate) { kd = 3; }
             else if (gcol.isBool) { kd = 2; }
+            else if (gcol.formula.Length > 0) { kd = 0; }
             else if (gcol.numeric && gcol.decimals == 0) { kd = 1; }
         }
 
@@ -823,6 +848,7 @@ partial class DataTable {
             if (col < st.aggMode.Count) { m = st.aggMode[col]; }
             if (m == 0 || m == 6) { col = col + 1; continue; }
             int dec = cols[col].decimals;
+            bool fcol = cols[col].formula.Length > 0;
             double s = 0.0;
             double mn = 0.0;
             double mx = 0.0;
@@ -830,7 +856,10 @@ partial class DataTable {
             int k = lo;
             while (k < hi && k < st.order.Count) {
                 double v = 0.0;
-                if (dec > 0) { v = src.CellReal(st.order[k], col); }
+                if (fcol) {
+                    if (!DataTable.FormulaTryReal(cols, src, st.order[k], col, out v)) { v = 0.0; }
+                }
+                else if (dec > 0) { v = src.CellReal(st.order[k], col); }
                 else { v = (double)src.CellNum(st.order[k], col); }
                 if (cnt2 == 0) { mn = v; mx = v; }
                 else { if (v < mn) { mn = v; } if (v > mx) { mx = v; } }
@@ -877,6 +906,13 @@ partial class DataTable {
             return DataTable.CompareStr(
                 DataTable.DateGroupKey(src.CellDay(ra, gc, c.dateOrder), c.dateGroup),
                 DataTable.DateGroupKey(src.CellDay(rb, gc, c.dateOrder), c.dateGroup)) == 0;
+        }
+        // 计算列（kd==0 落到这里）：按公式文本同组判断，
+        // 与 GroupValue 的分桶一致。
+        if (cols[gc].formula.Length > 0) {
+            return DataTable.CompareStr(
+                DataTable.FormulaText(cols, src, ra, gc),
+                DataTable.FormulaText(cols, src, rb, gc)) == 0;
         }
         return DataTable.CompareStr(src.CellText(ra, gc), src.CellText(rb, gc)) == 0;
     }
@@ -983,6 +1019,7 @@ partial class DataTable {
             if (c >= 0 && c < cols.Count) {
                 if (cols[c].isDate) { kd = 3; }
                 else if (cols[c].isBool) { kd = 2; }
+                else if (cols[c].formula.Length > 0) { kd = 0; }
                 else if (cols[c].numeric && cols[c].decimals == 0) { kd = 1; }
             }
             gkind.Add(kd);
@@ -1193,12 +1230,17 @@ partial class DataTable {
         for (int bi = 0; bi < baseCols.Count; bi = bi + 1) {
             int bc = baseCols[bi];
             bool realCol = cols[bc].decimals > 0;
+            bool fcol = cols[bc].formula.Length > 0;
             double s = 0.0;
             double mn = 0.0;
             double mx = 0.0;
             for (int k = 0; k < n; k = k + 1) {
                 double v = 0.0;
-                if (realCol) { v = src.CellReal(st.order[k], bc); }
+                if (fcol) {
+                    // 计算列：聚合公式值；求值失败的行按 0 计入。
+                    if (!DataTable.FormulaTryReal(cols, src, st.order[k], bc, out v)) { v = 0.0; }
+                }
+                else if (realCol) { v = src.CellReal(st.order[k], bc); }
                 else { v = (double)src.CellNum(st.order[k], bc); }
                 s = s + v;
                 if (k == 0) { mn = v; mx = v; }
@@ -1336,9 +1378,13 @@ partial class DataTable {
             double mx = 0.0;
             if (cols[col].cfMode == 1 || cols[col].cfMode == 2) {
                 bool realCol = cols[col].decimals > 0;
+                bool fcol = cols[col].formula.Length > 0;
                 for (int k = 0; k < n; k = k + 1) {
                     double v = 0.0;
-                    if (realCol) { v = src.CellReal(st.order[k], col); }
+                    if (fcol) {
+                        if (!DataTable.FormulaTryReal(cols, src, st.order[k], col, out v)) { v = 0.0; }
+                    }
+                    else if (realCol) { v = src.CellReal(st.order[k], col); }
                     else { v = (double)src.CellNum(st.order[k], col); }
                     if (k == 0) { mn = v; mx = v; }
                     else { if (v < mn) { mn = v; } if (v > mx) { mx = v; } }
