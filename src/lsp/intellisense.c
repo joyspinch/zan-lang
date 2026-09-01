@@ -440,7 +440,9 @@ static void intel_parse_zform(intellisense_t *is, const char *filepath,
  * stdlib/Game/Scene/SceneDoc.zan). The IDE regenerates <Name>.g.zan from it,
  * declaring each validly-named element as `static SceneElement <name>` on
  * `partial class <Name>`, plus the runtime layer helpers (OpenLayer/
- * CloseLayer/ToggleLayer/LayerOpen on SceneDoc). Index that same projection
+ * CloseLayer/ToggleLayer/LayerOpen on SceneDoc) and the on* action keys
+ * (SceneElement.On/OnAction, interpreted by SceneDoc.RunActions /
+ * SceneView.HandleClicks). Index that same projection
  * directly from the JSON so the business file's completion sees the elements
  * even while the generated file is stale or missing. */
 static void intel_parse_zscene(intellisense_t *is, const char *filepath,

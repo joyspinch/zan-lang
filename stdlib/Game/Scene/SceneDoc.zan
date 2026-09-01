@@ -104,6 +104,13 @@ class SceneElement {
     // 归属层名（"" = 基础层）。同一层的元素作为一个浮层整体
     // 显隐（弹窗/菜单页/对话框），运行时按激活层集合过滤渲染。
     string layer;
+    // 声明式事件绑定（on* 键，如 "onClick"），值是动作串。动作串
+    // 可以是内置动作（"ShowLayer:bag"、"HideLayer:self"、
+    // "ToggleLayer:equip"、"CloseTopLayer"）或代码后置方法名
+    // （"OnBuyClicked"，经 handlers 注册的 Action 触发）。
+    // 多个动作用 ';' 串接，按序执行。与 Gui.Designer 的 on<Event>
+    // 键同一形状：存储动作名，运行时解释，设计器只管编辑。
+    JsonValue actions;
     // 设计器未建模的键（未来版本/手写设计稿的额外声明）。
     // 往返时原样写回，使旧运行时打开新设计稿不丢数据——
     // 与 Gui.Designer 的 FormField.extra 同一策略。
@@ -125,6 +132,7 @@ class SceneElement {
         this.items = "";
         this.locked = false;
         this.layer = "";
+        this.actions = null;
     }
 
     SceneElement At(int x, int y) { this.x = x; this.y = y; return this; }
@@ -148,6 +156,23 @@ class SceneElement {
     SceneElement SetItems(string s) { this.items = s; return this; }
     SceneElement SetLocked(bool v) { this.locked = v; return this; }
     SceneElement SetLayer(string layer) { this.layer = layer; return this; }
+
+    /// 绑定一个 on* 动作串（如 On("onClick", "ShowLayer:bag")）。
+    /// 空值清除该事件的绑定。
+    SceneElement On(string evt, string actions) {
+        if (this.actions == null) { this.actions = JsonValue.NewObject(); }
+        this.actions.Set(evt, JsonValue.NewStr(actions == null ? "" : actions));
+        return this;
+    }
+
+    /// 绑定到 `evt` 的动作串（如 "onClick" -> "ShowLayer:bag"），
+    /// 无绑定为 ""。空串视为未绑定。
+    string OnAction(string evt) {
+        if (this.actions == null) { return ""; }
+        JsonValue v = this.actions.Get(evt);
+        if (v == null || !v.IsString()) { return ""; }
+        return v.AsString("");
+    }
 
     string Kind() { return this.kind; }
     string Name() { return this.ename; }
@@ -268,6 +293,38 @@ class SceneDoc {
     // 整份文档工作，纯数据查询）。运行时交互开启后，隐藏层的
     // 元素不响应命中。
     bool layersActive;
+    // 元素 on* 动作串里的方法名 -> 业务 Action 表（与 Gui 的
+    // HandlerRegistry 契约相同）：设计只存名字，代码后置用
+    // SetHandler("OnBuyClicked", ...) 注册；未注册的名字触发时
+    // 自然跳过。
+    List<string> handlerNames;
+    List<Action> handlerFns;
+
+    /// 注册（或替换）动作方法名 `name` 的 Action，供元素
+    /// on* 绑定里的非内置动作触发。
+    void SetHandler(string name, Action a) {
+        if (this.handlerNames == null) {
+            this.handlerNames = new List<string>();
+            this.handlerFns = new List<Action>();
+        }
+        for (int i = 0; i < this.handlerNames.Count; i = i + 1) {
+            if (this.handlerNames[i] == name) { this.handlerFns[i] = a; return; }
+        }
+        this.handlerNames.Add(name);
+        this.handlerFns.Add(a);
+    }
+
+    /// 触发为 `name` 注册的 Action；未注册的名字是空操作。
+    void CallHandler(string name) {
+        if (this.handlerNames == null) { return; }
+        for (int i = 0; i < this.handlerNames.Count; i = i + 1) {
+            if (this.handlerNames[i] == name) {
+                Action a = this.handlerFns[i];
+                if (a != null) { a(); }
+                return;
+            }
+        }
+    }
 
     /// 打开交互模式：LayerHit 开始按激活层过滤。纯渲染
     /// （SceneView.Render）无需开启——渲染本来就按层过滤。
@@ -348,6 +405,78 @@ class SceneDoc {
 
     /// 关闭所有已打开的浮层（回基础层）。
     void CloseAllLayers() { this.openLayers = ""; }
+
+    // ---- 声明式动作（元素 on* 绑定的解释器）-------------------------
+
+    // 场景切换动作（"OpenScene:xxx"）触发时记录目标场景名：
+    // RunActions 自己不能建窗口（它运行在当前窗口的帧循环里），
+    // 由生成的 Run() 循环检查该标记并在帧尾换场景——与
+    // App.isRunning 同一模式。"" = 无待处理切换。
+    string pendingScene;
+
+    /// 待切换的目标场景名（"OpenScene:xxx" 排队的目标）；
+    /// "" = 无待处理切换。生成的主循环读它换场景。
+    string PendingScene() {
+        if (this.pendingScene == null) { return ""; }
+        return this.pendingScene;
+    }
+
+    /// 清除待处理场景切换（主循环消费后调用）。
+    void ClearPendingScene() { this.pendingScene = ""; }
+
+    /// 最近一次 RunActions 执行的内置动作数（测试观测点）。
+    int actionsRun;
+
+    /// 上一帧（每次 HandleClicks）触发的方法名处理器记录的最后
+    /// 一个名字；测试观测点，"" = 未触发方法名。
+    string lastHandler;
+
+    /// 执行一个动作串：内置动作立即生效，方法名查 handlers 表。
+    /// `selfLayer` 是发起元素所属层，供 "HideLayer:self" /
+    /// "ToggleLayer:self" 相对引用。多个动作用 ';' 串接按序执行。
+    void RunActions(string actions, string selfLayer) {
+        if (actions == null || actions.Length == 0) { return; }
+        int start = 0;
+        while (start <= actions.Length) {
+            int end = actions.IndexOf(";", start);
+            string part;
+            if (end < 0) {
+                part = actions.Substring(start, actions.Length - start);
+            } else {
+                part = actions.Substring(start, end - start);
+            }
+            this.RunOneAction(part.Trim(), selfLayer);
+            if (end < 0) { break; }
+            start = end + 1;
+        }
+    }
+
+    void RunOneAction(string act, string selfLayer) {
+        if (act.Length == 0) { return; }
+        // "动作:参数" 与 "动作"（无参）两种形态。
+        string name = act;
+        string arg = "";
+        int colon = act.IndexOf(":");
+        if (colon >= 0) {
+            name = act.Substring(0, colon);
+            arg = act.Substring(colon + 1, act.Length - colon - 1);
+        }
+        if (name == "ShowLayer") {
+            this.OpenLayer(arg);
+        } else if (name == "HideLayer") {
+            this.CloseLayer(arg == "self" ? selfLayer : arg);
+        } else if (name == "ToggleLayer") {
+            this.ToggleLayer(arg == "self" ? selfLayer : arg);
+        } else if (name == "CloseAllLayers") {
+            this.CloseAllLayers();
+        } else if (name == "OpenScene") {
+            if (arg.Length > 0) { this.pendingScene = arg; }
+        } else {
+            // 方法名：代码后置注册的 Action；未注册的名字自然跳过。
+            this.CallHandler(act);
+        }
+        this.actionsRun = this.actionsRun + 1;
+    }
 
     void SetMode(int m) { this.scaleMode = m; }
     void SetBackground(string img) { this.background = img; }
@@ -551,6 +680,7 @@ class SceneDoc {
                 e.items = je.Str("items", "");
                 e.locked = je.Bool("locked", false);
                 e.layer = je.Str("layer", "");
+                e.actions = SceneDoc.OnKeysOf(je);
                 e.extra = SceneDoc.UnmodeledKeys(je);
                 d.elements.Add(e);
             }
@@ -571,9 +701,25 @@ class SceneDoc {
         return extra;
     }
 
+    // 提取元素对象里的 on* 键为 {事件名: 动作串} 对象；没有时为
+    // null。与 Gui.Designer 的 on<Event> 动态键同一约定。
+    static JsonValue OnKeysOf(JsonValue o) {
+        JsonValue acts = null;
+        for (int i = 0; i < o.Count(); i = i + 1) {
+            string key = o.KeyAt(i);
+            if (key.Length < 2 || key.Substring(0, 2) != "on") { continue; }
+            JsonValue v = o.ValAt(i);
+            if (v == null || !v.IsString()) { continue; }
+            if (acts == null) { acts = JsonValue.NewObject(); }
+            acts.Put(key.Substring(2), v);
+        }
+        return acts;
+    }
+
     // SceneElement 读取的所有键。新增建模键时在这里同步加上，
-    // 否则会重复写出。
+    // 否则会重复写出。on* 动作键经 OnKeysOf/写回单独处理。
     static bool IsModeledKey(string k) {
+        if (k.Length > 2 && k.Substring(0, 2) == "on") { return true; }
         return k == "kind" || k == "name" || k == "x" || k == "y"
             || k == "w" || k == "h" || k == "anchorX" || k == "anchorY"
             || k == "z" || k == "image" || k == "text" || k == "color"
@@ -651,6 +797,16 @@ class SceneDoc {
             }
             if (e.Layer().Length > 0) {
                 el.Put("layer", JsonValue.NewStr(e.Layer()));
+            }
+            // on* 动作键原样写回（空串跳过，视为未绑定）。
+            if (e.actions != null && e.actions.IsObject()) {
+                for (int ak = 0; ak < e.actions.Count(); ak = ak + 1) {
+                    JsonValue av = e.actions.ValAt(ak);
+                    if (av == null || !av.IsString()) { continue; }
+                    string hv = av.AsString("");
+                    if (hv.Length == 0) { continue; }
+                    el.Put("on" + e.actions.KeyAt(ak), av);
+                }
             }
             el.Put("visible", JsonValue.NewBool(e.Visible()));
             // 未建模的键原样写回：手写/新版设计稿里运行时
