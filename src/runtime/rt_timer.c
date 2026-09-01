@@ -52,6 +52,8 @@ static void timer_unlock(void) { LeaveCriticalSection(&g_lock); }
 /* Single-threaded wasm (WASI): the sysroot has no pthreads, and none are
  * needed -- one thread cannot race the timer heap. */
 #include <time.h>
+#include <unistd.h>
+#include <sys/stat.h>
 /* cloudlibc's time.h defines CLOCK_MONOTONIC (as a clockid) but does not
  * declare clock_gettime; declare it -- libc.a provides the implementation
  * as a WASI host-import wrapper. */

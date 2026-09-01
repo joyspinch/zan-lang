@@ -1954,6 +1954,18 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * pushes a jmp_buf, `throw` longjmps to the innermost one with the
          * exception object in a global, catch pops the stack and binds the
          * exception local. */
+        if (strstr(g->target_triple, "wasm") != NULL) {
+            /* wasm32 has no setjmp/longjmp to build this on: wasi-libc
+             * deliberately ships none, and the SJLJ backend feature is
+             * unfinished upstream (zig's LLVM 20.1.2 crashes on it, LLVM 19
+             * has no flag). Reject at compile time with a precise message
+             * rather than emit an object that only fails at wasm-ld. */
+            zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                "try/catch is not supported on the wasm32 target yet: the "
+                "exception path needs setjmp/longjmp, which WASI does not "
+                "provide");
+            break;
+        }
         LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         LLVMValueRef top_g, bufs_g, exc_g;

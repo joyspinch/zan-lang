@@ -43,3 +43,13 @@ for %%P in (arm64:aarch64 x64:x86_64) do (
     echo built toolchain\macos\%%A
   )
 )
+
+rem wasm32 (WASI): single-threaded, so no rt_io / rt_sync -- the wasm link
+rem rejects those programs before the object would be needed (see main.c's
+rem wasm_obj_refs_any gates). zanrt_wasm.o holds the libc ABI adapters
+rem (rt_wasm.c) and is compiled by clang from the same sysroot; the file/timer
+rem objects here are what every program links unconditionally.
+if not exist toolchain\wasm32 mkdir toolchain\wasm32
+"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\wasm32\zanrt_file.o  || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\wasm32\zanrt_timer.o || exit /b 1
+echo built toolchain\wasm32

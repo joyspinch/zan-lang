@@ -2586,6 +2586,12 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
              * Interop.Entry relies on instead of a wasm-ld trap stub. */
             { "dlopen", "pip" },     { "dlsym", "ppp" },
             { "dlclose", "ip" },
+            /* the file-IO runtime (rt_file.c) has the same problem: the IR
+             * declares its FILE*-returning entry points as nint (i64), but a
+             * wasm32 pointer is i32 -- adapt the two handles so wasm-ld does
+             * not see mismatched signatures on zan_file_fopen/zan_pkg_fopen. */
+            { "zan_file_fopen", "ppp" },
+            { "zan_pkg_fopen", "ppp" },
             { NULL, NULL }
         };
         LLVMTypeRef w_i32 = LLVMInt32TypeInContext(g->ctx);

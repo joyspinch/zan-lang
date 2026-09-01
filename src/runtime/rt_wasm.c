@@ -32,10 +32,15 @@ int zan_w32_snprintf(char *s, i64 n, const char *fmt, ...) {
  * definitions: on a single-threaded wasm a mutex never needs to block, and
  * reaching longjmp means the program hit a path it cannot take. Programs
  * that actually CALL Thread/AtomicInt/SharedTable APIs are rejected earlier
- * (see main.c's wasm_obj_refs_any check). */
+ * (see main.c's wasm_obj_refs_any check).
+ *
+ * Signature note: irgen emits the EH-table lock calls with a void return
+ * (irgen_builtins.c emit_eh_tab_lock_*), and wasm-ld fails signature
+ * mismatches only as warnings but noise costs every link -- these must be
+ * (i32) -> void, matching that emission. */
 int pthread_mutex_init(void *m, const void *a) { (void)m; (void)a; return 0; }
-int pthread_mutex_lock(void *m) { (void)m; return 0; }
-int pthread_mutex_unlock(void *m) { (void)m; return 0; }
-int pthread_mutex_destroy(void *m) { (void)m; return 0; }
+void pthread_mutex_lock(void *m) { (void)m; }
+void pthread_mutex_unlock(void *m) { (void)m; }
+void pthread_mutex_destroy(void *m) { (void)m; }
 
 void longjmp(void *env, int val) { (void)env; (void)val; abort(); }
