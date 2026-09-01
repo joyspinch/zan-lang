@@ -48,6 +48,7 @@ class SceneDesigner {
     int inpIdText;
     int inpIdBg;
     int inpIdItems;
+    int inpIdLayer;
     List<SceneElement> selExtra;  // 额外的多选元素（Ctrl+点击 / 框选）
     bool marquee;        // 正在进行的橡皮筋框选拖拽
     int mqSX;            // 框选起点（屏幕空间）
@@ -79,12 +80,40 @@ class SceneDesigner {
     int grid;            // 网格尺寸（设计像素）
     string msg;
 
+    // ---- 层编辑（弹窗/菜单页） -------------------------------------
+    // layer 为空 = 基础层，永远渲染；命名层在文档里是元素的
+    // 归属标签，在编辑器里通过 editLayer 决定"正在编辑哪一层"：
+    // 其它层的元素画成半透明幽灵，不参与命中。
+    string editLayer;        // "" = 基础层
+    bool layerMenuOpen;      // 层下拉菜单展开状态
+    bool showGhost;          // 非编辑层幽灵显示开关
+    Input layerIn;           // 检查器"层"行输入框
+
+    /// 文档里出现过的层名列表（保持首次出现顺序；"" 不含）。
+    List<string> DocLayers() {
+        List<string> ls = new List<string>();
+        for (int i = 0; i < this.doc.Count(); i = i + 1) {
+            string ly = this.doc.ElementAt(i).Layer();
+            if (ly.Length == 0) { continue; }
+            bool has = false;
+            for (int k = 0; k < ls.Count; k = k + 1) {
+                if (ls[k] == ly) { has = true; break; }
+            }
+            if (!has) { ls.Add(ly); }
+        }
+        return ls;
+    }
+
+    /// e 是否属于当前编辑层（基础层元素只在编辑基础层时可见可点）。
+    bool InEditLayer(SceneElement e) {
+        return e.Layer() == this.editLayer;
+    }
+
     Input nameIn;
     Input imgIn;
     Input textIn;
     Input bgIn;
     Input itemsIn;
-
     /// 选取当前界面语言对应的字符串。
     static string T(string en, string zh) {
         if (SceneDesigner.lang == 1) { return zh; }
@@ -160,6 +189,10 @@ class SceneDesigner {
         this.snap = true;
         this.grid = 8;
         this.msg = "";
+        this.editLayer = "";
+        this.layerMenuOpen = false;
+        this.showGhost = true;
+        this.layerIn = new Input("(base)");
         this.nameIn = new Input("name");
         this.imgIn = new Input("image / resource id");
         this.textIn = new Input("text");
@@ -186,6 +219,8 @@ class SceneDesigner {
         this.lastSel = null;
         this.selExtra = new List<SceneElement>();
         this.ctxOpen = false;
+        this.editLayer = "";
+        this.layerMenuOpen = false;
         this.undoStack = new List<string>();
         this.redoStack = new List<string>();
         this.bgIn.SetText(this.doc.Background());
@@ -397,6 +432,8 @@ class SceneDesigner {
             - e.AnchorY() * e.TotalH() / 1000;
         e.At(left - baseX, top - baseY);
         e.Order(this.doc.Count());
+        // 新元素落在正在编辑的层上（基础层除外）。
+        e.layer = this.editLayer;
         this.doc.Add(e);
         this.sel = e;
         this.selExtra = new List<SceneElement>();
@@ -413,6 +450,8 @@ class SceneDesigner {
             nn = nn + "_";
         }
         SceneElement e = new SceneElement(s.Kind(), nn);
+        // 克隆件跟随当前编辑层（跨层复制时落到目标层）。
+        e.layer = this.editLayer;
         e.At(s.X() + this.grid * 2, s.Y() + this.grid * 2).Size(s.W(), s.H());
         e.AnchorTo(s.AnchorX(), s.AnchorY());
         e.Order(s.Z() + 1);
@@ -670,6 +709,7 @@ class SceneDesigner {
                 this.imgIn.SetText(this.sel.ImageId());
                 this.textIn.SetText(this.sel.Text());
                 this.itemsIn.SetText(this.sel.Items());
+                this.layerIn.SetText(this.sel.Layer());
             }
             this.lastSel = this.sel;
         }
@@ -706,7 +746,60 @@ class SceneDesigner {
         c.PopClip();
 
         this.RenderContextMenu(app, c, t);
+        this.RenderLayerMenu(app, c, t, x, y, w, h);
         this.RenderResPicker(app, c, t, x, y, w, h);
+    }
+
+    // 层下拉菜单：列出基础层 + 文档里出现过的层名，选择后
+    // 画布切到那一层编辑。菜单浮在功能区"编辑：xx"按钮下。
+    void RenderLayerMenu(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        if (!this.layerMenuOpen) { return; }
+        List<string> ls = new List<string>();
+        ls.Add(SceneDesigner.T("Base layer", "基础层"));
+        List<string> docLs = this.DocLayers();
+        for (int i = 0; i < docLs.Count; i = i + 1) { ls.Add(docLs[i]); }
+        int mw = app.Scale(220);
+        int rowH = app.Scale(26);
+        int mh = app.Scale(8) + ls.Count * rowH + app.Scale(6);
+        // 锚定在功能区左端（层组按钮附近）。
+        int mx = x + app.Scale(12);
+        int my = y + app.Scale(8) + this.BarH(app);
+        Prompt.Surface(app, mx, my, mw, mh, "");
+        Prompt.Caption(app, mx, my,
+            SceneDesigner.T("Edit layer", "编辑层"));
+        app.BlockHitsRect(mx, my, mw, mh);
+        int iy = my + app.Scale(24);
+        for (int i = 0; i < ls.Count; i = i + 1) {
+            bool hover = SceneDesigner.InRect(app.mouseX, app.mouseY,
+                mx + app.Scale(4), iy, mw - app.Scale(8), rowH);
+            if (hover) {
+                c.FillRect(mx + app.Scale(4), iy, mw - app.Scale(8), rowH, t.bgTertiary);
+            }
+            string cur = ls[i];
+            bool active = (i == 0 && this.editLayer.Length == 0)
+                || (i > 0 && this.editLayer == ls[i]);
+            c.DrawText(mx + app.Scale(10),
+                Canvas.CenterTextY(iy, rowH, t.fontSizeSmall), cur,
+                active ? t.primary : t.textPrimary, t.fontSizeSmall);
+            int idx = i;
+            if (Ui.ClickedIn(app, mx + app.Scale(4), iy, mw - app.Scale(8), rowH)) {
+                this.editLayer = idx == 0 ? "" : ls[idx];
+                this.layerMenuOpen = false;
+                this.sel = null;
+                this.selExtra = new List<SceneElement>();
+                this.msg = idx == 0
+                    ? SceneDesigner.T("editing base layer", "正在编辑基础层")
+                    : SceneDesigner.T("editing layer ", "正在编辑层 ") + this.editLayer;
+                app.RequestRedraw();
+            }
+            iy = iy + rowH;
+        }
+        // 点击菜单外关闭。
+        if (app.ClickAvailable()
+            && !SceneDesigner.InRect(app.mouseX, app.mouseY, mx, my, mw, mh)) {
+            this.layerMenuOpen = false;
+            app.RequestRedraw();
+        }
     }
 
     static string AsciiLower(string s) {
@@ -889,6 +982,21 @@ class SceneDesigner {
         this.AddBarItem(groups, grp, idx, gv, hd, 4, 4);
         groups.Add(gv);
 
+        // --- 层（弹窗/菜单页）：下拉选编辑层 + 幽灵显示开关 ---
+        RibbonGroup gl = new RibbonGroup(SceneDesigner.T("Layer", "层"));
+        string lyLabel = this.editLayer.Length == 0
+            ? SceneDesigner.T("Base", "基础层") : this.editLayer;
+        RibbonItem lyPick = RibbonItem.Small("layout",
+            SceneDesigner.T("Edit: ", "编辑：") + lyLabel);
+        lyPick.SetTip(SceneDesigner.T(
+            "Pick the layer to edit; elements on other layers show as ghosts (when Ghost is on) and are not hit by clicks",
+            "选择正在编辑的层；其它层元素以幽灵显示（Ghost 开启时）且不被点击命中"));
+        this.AddBarItem(groups, grp, idx, gl, lyPick, 6, 0);
+        this.AddBarItem(groups, grp, idx, gl,
+            RibbonItem.Toggle("eye", SceneDesigner.T("Ghost", "幽灵"),
+                this.showGhost), 6, 1);
+        groups.Add(gl);
+
         int hit = Ribbon.RenderGroups(app, x, y, w, groups);
         if (hit >= 0 && hit < grp.Count) {
             this.barClickGroup = grp[hit];
@@ -923,6 +1031,11 @@ class SceneDesigner {
                 else if (this.grid == 16) { this.grid = 32; }
                 else { this.grid = 4; }
             } else { this.showTags = !this.showTags; }
+            app.RequestRedraw();
+        }
+        else if (this.barClickGroup == 6) {
+            if (this.barClickIndex == 0) { this.layerMenuOpen = !this.layerMenuOpen; }
+            else { this.showGhost = !this.showGhost; }
             app.RequestRedraw();
         }
         else if (this.barClickGroup == 4) {
@@ -1346,10 +1459,34 @@ class SceneDesigner {
         if (this.panning) { Window.SetCursor(1); }
 
         // 元素从后到前绘制（z 小者先），命中测试从前往后。
+        // 层过滤：只画当前编辑层；其它层在 Ghost 开启时画成
+        // 半透明（单独一遍、不参与命中），关闭时完全不画。
+        // 幽灵透明用每元素 Tint 的 alpha 通道近似（DrawElement
+        // 的填充都吃 e.A()），不改全局合成器。
         List<SceneElement> ordered = this.OrderedByZ();
+        if (this.showGhost && this.editLayer.Length > 0) {
+            c.PushClip(ox, oy, cw, ch);
+            for (int i = 0; i < ordered.Count; i = i + 1) {
+                SceneElement e = ordered[i];
+                if (this.InEditLayer(e)) { continue; }
+                int ex = ox + this.DesignLeft(e) * psMilli / 1000;
+                int ey = oy + this.DesignTop(e) * psMilli / 1000;
+                int exw = e.TotalW() * psMilli / 1000;
+                int exh = e.TotalH() * psMilli / 1000;
+                SceneElement ghost = new SceneElement(e.Kind(), "");
+                ghost.At(e.X(), e.Y()).Size(e.W(), e.H());
+                ghost.Caption(e.Text()).Image(e.ImageId());
+                ghost.Tint(e.R(), e.G(), e.B(), e.A() * 28 / 100);
+                ghost.Grid(e.Rows(), e.Cols(), e.GapX(), e.GapY());
+                ghost.SetValue(e.Value()).SetItems(e.Items());
+                SceneView.DrawElement(app, c, t, ghost, ex, ey, exw, exh, psMilli);
+            }
+            c.PopClip();
+        }
         c.PushClip(ox, oy, cw, ch);
         for (int i = 0; i < ordered.Count; i = i + 1) {
             SceneElement e = ordered[i];
+            if (!this.InEditLayer(e)) { continue; }
             int ex = ox + this.DesignLeft(e) * psMilli / 1000;
             int ey = oy + this.DesignTop(e) * psMilli / 1000;
             int exw = e.TotalW() * psMilli / 1000;
@@ -1446,6 +1583,7 @@ class SceneDesigner {
             int rj = ordered.Count - 1;
             while (rj >= 0) {
                 SceneElement e = ordered[rj];
+                if (!this.InEditLayer(e)) { rj = rj - 1; continue; }
                 int ex = ox + this.DesignLeft(e) * psMilli / 1000;
                 int ey = oy + this.DesignTop(e) * psMilli / 1000;
                 int exw = e.TotalW() * psMilli / 1000;
@@ -1501,6 +1639,7 @@ class SceneDesigner {
                 int j = ordered.Count - 1;
                 while (j >= 0) {
                     SceneElement e = ordered[j];
+                    if (!this.InEditLayer(e)) { j = j - 1; continue; }
                     int ex = ox + this.DesignLeft(e) * psMilli / 1000;
                     int ey = oy + this.DesignTop(e) * psMilli / 1000;
                     int exw = e.TotalW() * psMilli / 1000;
@@ -1996,6 +2135,27 @@ class SceneDesigner {
             app.RequestRedraw();
         } else {
             this.sel.ename = nn;
+        }
+        iy = iy + rowH;
+
+        // 归属层：空 = 基础层。新元素跟随当前编辑层；改层名
+        // 撞上不存在的层就当作新层创建（DocLayers 下次聚合）。
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            ix, iy + app.Scale(6), SceneDesigner.T("layer", "层"),
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        this.inpIdLayer = this.layerIn.Render(app, ix + app.Scale(52), iy,
+            iw - app.Scale(52), app.Scale(28));
+        string lyIn = this.layerIn.GetText();
+        // 输入框回显与真实值不同步：把真实层灌回输入框（选区
+        // 刚切换 / 改名撞回退时）。
+        if (lyIn != this.sel.layer) {
+            this.sel.layer = lyIn;
+        }
+        if (this.sel.layer.Length > 0 && this.editLayer.Length == 0) {
+            // 在基础层上把元素划进命名层后自动切过去，保持可见。
+            this.editLayer = this.sel.layer;
+            this.layerIn.SetText(this.sel.layer);
         }
         iy = iy + rowH;
 

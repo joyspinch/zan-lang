@@ -101,6 +101,9 @@ class SceneElement {
     int val;          // 进度条/滑块/滚动条 0..100，复选框 0/1
     string items;     // 下拉框/列表框/选项卡框的 ';' 分隔条目
     bool locked;      // 仅设计器使用：元素不可移动/缩放
+    // 归属层名（"" = 基础层）。同一层的元素作为一个浮层整体
+    // 显隐（弹窗/菜单页/对话框），运行时按激活层集合过滤渲染。
+    string layer;
     // 设计器未建模的键（未来版本/手写设计稿的额外声明）。
     // 往返时原样写回，使旧运行时打开新设计稿不丢数据——
     // 与 Gui.Designer 的 FormField.extra 同一策略。
@@ -121,6 +124,7 @@ class SceneElement {
         this.val = 0;
         this.items = "";
         this.locked = false;
+        this.layer = "";
     }
 
     SceneElement At(int x, int y) { this.x = x; this.y = y; return this; }
@@ -143,6 +147,7 @@ class SceneElement {
     SceneElement SetValue(int v) { this.val = v; return this; }
     SceneElement SetItems(string s) { this.items = s; return this; }
     SceneElement SetLocked(bool v) { this.locked = v; return this; }
+    SceneElement SetLayer(string layer) { this.layer = layer; return this; }
 
     string Kind() { return this.kind; }
     string Name() { return this.ename; }
@@ -167,6 +172,7 @@ class SceneElement {
     int Value() { return this.val; }
     string Items() { return this.items; }
     bool Locked() { return this.locked; }
+    string Layer() { return this.layer; }
     bool IsGrid() { return this.rows > 1 || this.cols > 1; }
 
     // 元素的总占地：w/h 是单个单元的大小；rows x cols 的网格
@@ -229,6 +235,96 @@ class SceneDoc {
     int WinPosY() { return this.winPosY; }
     void SetWinPos(int x, int y) { this.winPosX = x; this.winPosY = y; }
     string Background() { return this.background; }
+
+    // ---- 运行时层（弹窗/菜单页）激活 --------------------------------
+
+    // 激活的层名集合（';' 分隔）。空串 = 只有基础层（layer == ""
+    // 的元素）可见。基础层永远渲染；这里只列"额外"打开的浮层。
+    string openLayers;
+    // 命中测试/事件分发是否遵循层：默认 false（Find/Resolve 对
+    // 整份文档工作，纯数据查询）。运行时交互开启后，隐藏层的
+    // 元素不响应命中。
+    bool layersActive;
+
+    /// 打开交互模式：LayerHit 开始按激活层过滤。纯渲染
+    /// （SceneView.Render）无需开启——渲染本来就按层过滤。
+    void SetLayersActive(bool v) { this.layersActive = v; }
+
+    /// 命中测试语义下元素是否可交互：visible 且其层处于
+    /// 打开状态。设计器/运行时点击分发共用这一判定。
+    bool ElementHit(SceneElement e) {
+        return e.Visible() && this.LayerOpen(e.Layer());
+    }
+
+    /// layer 的元素是否参与本帧渲染：基础层永远 true，其它层
+    /// 需要被 OpenLayer 打开过。
+    bool LayerOpen(string layer) {
+        if (layer.Length == 0) { return true; }
+        string cur = this.openLayers;
+        if (cur == null || cur.Length == 0) { return false; }
+        int start = 0;
+        while (start <= cur.Length) {
+            int end = cur.IndexOf(";", start);
+            string part;
+            if (end < 0) {
+                part = cur.Substring(start, cur.Length - start);
+            } else {
+                part = cur.Substring(start, end - start);
+            }
+            if (part == layer && part.Length > 0) { return true; }
+            if (end < 0) { break; }
+            start = end + 1;
+        }
+        return false;
+    }
+
+    /// 打开一个层（弹窗/菜单页）；重复打开是幂等的。
+    void OpenLayer(string layer) {
+        if (layer.Length == 0 || this.LayerOpen(layer)) { return; }
+        if (this.openLayers == null || this.openLayers.Length == 0) {
+            this.openLayers = layer;
+        } else {
+            this.openLayers = this.openLayers + ";" + layer;
+        }
+    }
+
+    /// 关闭一个层；本来就没开是幂等的。
+    void CloseLayer(string layer) {
+        if (layer.Length == 0) { return; }
+        string outp = "";
+        string cur = this.openLayers;
+        if (cur == null || cur.Length == 0) { return; }
+        int start = 0;
+        while (start <= cur.Length) {
+            int end = cur.IndexOf(";", start);
+            string part;
+            if (end < 0) {
+                part = cur.Substring(start, cur.Length - start);
+            } else {
+                part = cur.Substring(start, end - start);
+            }
+            if (part.Length > 0 && part != layer) {
+                if (outp.Length > 0) { outp = outp + ";"; }
+                outp = outp + part;
+            }
+            if (end < 0) { break; }
+            start = end + 1;
+        }
+        this.openLayers = outp;
+    }
+
+    /// 层开关切换；返回切换后是否打开。
+    bool ToggleLayer(string layer) {
+        if (this.LayerOpen(layer)) {
+            this.CloseLayer(layer);
+            return false;
+        }
+        this.OpenLayer(layer);
+        return true;
+    }
+
+    /// 关闭所有已打开的浮层（回基础层）。
+    void CloseAllLayers() { this.openLayers = ""; }
 
     void SetMode(int m) { this.scaleMode = m; }
     void SetBackground(string img) { this.background = img; }
@@ -371,6 +467,10 @@ class SceneDoc {
         this.elements = parsed.elements;
     }
 
+    /// 当前激活层集合的快照（';' 分隔，供 SaveJson 之外的
+    /// 调用方检查）；运行时状态，不进 .zscene 文档。
+    string OpenLayers() { return this.openLayers; }
+
     // 从已解析的根对象填充文档字段（Parse / TryParse 共用）。
     static SceneDoc FromRoot(JsonValue root) {
         SceneDoc d = new SceneDoc(
@@ -421,6 +521,7 @@ class SceneDoc {
                 e.val = je.Int("value", 0);
                 e.items = je.Str("items", "");
                 e.locked = je.Bool("locked", false);
+                e.layer = je.Str("layer", "");
                 e.extra = SceneDoc.UnmodeledKeys(je);
                 d.elements.Add(e);
             }
@@ -448,7 +549,8 @@ class SceneDoc {
             || k == "w" || k == "h" || k == "anchorX" || k == "anchorY"
             || k == "z" || k == "image" || k == "text" || k == "color"
             || k == "visible" || k == "rows" || k == "cols" || k == "gapX"
-            || k == "gapY" || k == "value" || k == "items" || k == "locked";
+            || k == "gapY" || k == "value" || k == "items" || k == "locked"
+            || k == "layer";
     }
 
     // 序列化为稳定、便于人工 diff 的 `.zscene` JSON 文档。
@@ -502,6 +604,9 @@ class SceneDoc {
             }
             if (e.Locked()) {
                 el.Put("locked", JsonValue.NewBool(true));
+            }
+            if (e.Layer().Length > 0) {
+                el.Put("layer", JsonValue.NewStr(e.Layer()));
             }
             el.Put("visible", JsonValue.NewBool(e.Visible()));
             // 未建模的键原样写回：手写/新版设计稿里运行时
