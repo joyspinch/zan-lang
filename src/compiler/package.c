@@ -289,10 +289,28 @@ static bool pkg_token_is_shell_safe(const char *s) {
     return true;
 }
 
+/* The dependency name becomes a path segment under cache_dir (pkg_dir,
+ * manifest_path), so it must be a single safe path component: the shell-safe
+ * whitelist alone allows `.` and would let `../../evil` clone a repository
+ * outside the cache directory. Forward declaration below: defined with the
+ * installed-package store helpers. */
+static bool pkg_safe_component(const char *s);
+
 bool zan_pkg_fetch(zan_pkg_registry_t *reg, const zan_dependency_t *dep) {
     char pkg_dir[1024];
     snprintf(pkg_dir, sizeof(pkg_dir), "%s" PATH_SEP "%s", reg->cache_dir, dep->name);
     if (pkg_is_dir(pkg_dir)) return true;
+    /* Path-traversal guard first: `..` or separators in the name would make
+     * pkg_dir escape the cache directory regardless of where the source
+     * points. */
+    if (!pkg_safe_component(dep->name)) {
+        fprintf(stderr,
+                "error: refusing to fetch '%s': package name must be a single "
+                "path component (letters, digits, '.', '_', '-'; no '..', "
+                "'/', '\\\\')\n",
+                dep->name);
+        return false;
+    }
     if (dep->source[0] && (strncmp(dep->source, "http", 4) == 0 ||
                            strncmp(dep->source, "git@", 4) == 0)) {
         char cmd[2048]; char ver_buf[64];
