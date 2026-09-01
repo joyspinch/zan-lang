@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using Gui;
+using Gui.Backend;
 using Gui.Widget;
 
 namespace Gui.Component;
@@ -44,6 +45,14 @@ class FilePicker {
     string title;
     string suffix;
     string selectedPath;
+    /// 多选模式（BeginOpenFileMulti / BeginOpenFileFiltersMulti）：
+    /// Ctrl+点击把文件行加入/移出本集合，Shift+点击从锚点行扩展；
+    /// 确认后经 SelectedPaths() 读回（升序、与列表同序）。单选模式
+    /// 恒空，行为与历史版本完全一致。
+    List<string> selectedPaths;
+    /// Shift+点击范围选择的锚点（列表索引，-1 = 无锚点）。
+    int anchorIdx;
+    bool allowMulti;
     string statusText;
     string lastFilter;
     List<string> expanded;
@@ -85,6 +94,9 @@ class FilePicker {
         this.title = "";
         this.suffix = "";
         this.selectedPath = "";
+        this.selectedPaths = new List<string>();
+        this.anchorIdx = 0 - 1;
+        this.allowMulti = false;
         this.statusText = "";
         this.lastFilter = "";
         this.expanded = new List<string>();
@@ -310,6 +322,8 @@ class FilePicker {
         title = dialogTitle;
         suffix = extension;
         selectedPath = "";
+        selectedPaths = new List<string>();
+        anchorIdx = 0 - 1;
         statusText = "";
         lastFilter = "";
         creatingFolder = false;
@@ -369,6 +383,23 @@ class FilePicker {
         string first = "";
         if (items.Count > 0) { first = FilePicker.FirstExt(items[0].pattern); }
         Begin(1, initial, first, "", dialogTitle);
+    }
+
+    /// 多选打开文件对话框：Ctrl+点击切换选中，Shift+点击范围选择，
+    /// 确认后经 SelectedPaths() 读回全部选中路径。
+    void BeginOpenFileMulti(string initial, string extension, string dialogTitle) {
+        allowMulti = true;
+        Begin(1, initial, extension, "", dialogTitle);
+    }
+
+    /// 多选 + 显式扩展名过滤器集合的打开文件对话框。
+    void BeginOpenFileFiltersMulti(
+        string initial,
+        List<FileFilter> items,
+        string dialogTitle
+    ) {
+        allowMulti = true;
+        BeginOpenFileFilters(initial, items, dialogTitle);
     }
 
     /// ";" 分隔模式中的第一个扩展名（模式为空则为 ""）。
@@ -438,6 +469,9 @@ class FilePicker {
         return popup != null && hwnd == popup.WindowHandle();
     }
     string SelectedPath() { return selectedPath; }
+    /// 多选确认后的全部选中路径（升序、与列表展示同序）。单选模式
+    /// 返回空列表；单选宿主请继续读 SelectedPath()。
+    List<string> SelectedPaths() { return selectedPaths; }
     string CurrentDirectory() {
         return FilePicker.Normalize(pathInput.GetText());
     }
@@ -447,11 +481,39 @@ class FilePicker {
     void Finish(int action) {
         if (!open) { return; }
         result = action;
+        if (action == 1 && allowMulti) {
+            // 多选确认：快照选中集合。没有 Ctrl/Shift 叠选但点过一行时
+            // selectedPaths 已含该行；直接双击/单选后确认也有一条。
+            if (selectedPaths.Count == 0 && selectedPath != ""
+                    && Directory.FileExistsUtf8(selectedPath)) {
+                selectedPaths.Add(selectedPath);
+            }
+        } else if (action != 1) {
+            selectedPaths = new List<string>();
+        }
         open = false;
         closing = true;
         if (popup != null) { popup.window.Close(); }
         if (action == 1) { Accepted.Raise(); } else { Cancelled.Raise(); }
         Closed.Raise();
+    }
+
+    /// `idx` 行在多选集合里时为 true。列表行每帧重建（names/paths
+    /// 是 RenderContent 的局部量），这里按路径字符串比较——多选集合
+    /// 存的本来就是路径。
+    bool InMultiSelection(int idx, List<string> paths) {
+        if (idx < 0 || idx >= paths.Count) { return false; }
+        return selectedPaths.Contains(paths[idx]);
+    }
+
+    /// 从多选集合摘除一条路径（List<string> 无 Remove 成员，
+    /// 手写摘除保持索引连续）。
+    void RemoveSelectedPath(string path) {
+        int i = 0;
+        while (i < selectedPaths.Count) {
+            if (selectedPaths[i] == path) { selectedPaths.RemoveAt(i); return; }
+            i = i + 1;
+        }
     }
 
     void Close() {
@@ -494,6 +556,8 @@ class FilePicker {
         }
         pathInput.SetText(dir);
         selectedPath = "";
+        selectedPaths = new List<string>();
+        anchorIdx = 0 - 1;
         statusText = "";
         listScroll.Set(0);
         PathChanged.Raise();
@@ -686,6 +750,8 @@ class FilePicker {
                         filterSel.Set(fi2);
                         suffix = FilePicker.FirstExt(filters[fi2].pattern);
                         selectedPath = "";
+                        selectedPaths = new List<string>();
+                        anchorIdx = 0 - 1;
                         listScroll.Set(0);
                     }
                 }
@@ -870,7 +936,8 @@ class FilePicker {
             int idx = listOff + shown;
             int rowY = paneY + shown * rowH;
             int rowId = app.focus.AllocId();
-            bool selected = selectedPath == paths[idx];
+            bool selected = selectedPath == paths[idx]
+                || (allowMulti && this.InMultiSelection(idx, paths));
             if (selected) {
                 c.FillRect(
                     listX + 1, rowY, listW - scrollW - 2,
@@ -989,6 +1056,39 @@ class FilePicker {
         } else if (!suppressOthers && clicked >= 0 && clicked < paths.Count) {
             if (kinds[clicked] == 1) {
                 Navigate(paths[clicked]);
+            } else if (allowMulti) {
+                // 多选：普通点击重置为单行；Ctrl+点击切换；Shift+点击
+                // 从锚点扩展。文件夹行永远走 Navigate。
+                int mods = app.window.EventMods();
+                if (Modifiers.HasCtrl(mods)) {
+                    if (this.InMultiSelection(clicked, paths)) {
+                        this.RemoveSelectedPath(paths[clicked]);
+                    } else {
+                        selectedPaths.Add(paths[clicked]);
+                    }
+                    anchorIdx = clicked;
+                } else if (Modifiers.HasShift(mods) && anchorIdx >= 0) {
+                    int a = anchorIdx;
+                    int b = clicked;
+                    if (b < a) { int tmp = a; a = b; b = tmp; }
+                    selectedPaths = new List<string>();
+                    int r = a;
+                    while (r <= b) {
+                        if (r < paths.Count && kinds[r] == 0
+                                && !selectedPaths.Contains(paths[r])) {
+                            selectedPaths.Add(paths[r]);
+                        }
+                        r = r + 1;
+                    }
+                } else {
+                    selectedPaths = new List<string>();
+                    selectedPaths.Add(paths[clicked]);
+                    anchorIdx = clicked;
+                }
+                selectedPath = paths[clicked];
+                nameInput.SetText(names[clicked]);
+                statusText = "";
+                app.RequestRedraw();
             } else {
                 selectedPath = paths[clicked];
                 nameInput.SetText(names[clicked]);
@@ -1089,6 +1189,7 @@ class FilePicker {
         if (!suppressOthers && FilePicker.Clicked(
                 app, cancelX, footerY, buttonW, t.heightMedium)) {
             selectedPath = "";
+            selectedPaths = new List<string>();
             Finish(2);
         } else if (!suppressOthers && FilePicker.Clicked(
                 app, acceptX, footerY, buttonW, t.heightMedium)) {

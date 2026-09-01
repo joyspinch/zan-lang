@@ -214,6 +214,12 @@ class Pagination : Control {
 
     Pagination Jumper(bool v) { jumper = v; return this; }
     bool HasJumper() { return jumper; }
+
+    /// 编程入口：打开/关闭 sizes 下拉弹层（gallery 截图与测试用，
+    /// 用户路径是点击 sizes 框）。
+    void OpenSizes() { sizeOpen = true; }
+    void CloseSizes() { sizeOpen = false; }
+    bool SizesOpen() { return sizeOpen; }
     Pagination ShowSizes(bool v) {
         if (v && pageSizes.Count == 0) {
             pageSizes.Add(10);
@@ -307,6 +313,7 @@ class Pagination : Control {
         int btnSize = t.heightMedium;
         int gap = t.gapSmall;
         List<int> pages = Pagination.BuildPages(totalPages, current);
+        // 默认无自定义文字：两个箭头按钮各占一格方形。
         int count = pages.Count + 2; // 上一页 + 页码 + 下一页
         return count * (btnSize + gap) - gap;
     }
@@ -377,6 +384,15 @@ class Pagination : Control {
     int Radius(App app, StyleBox s, int btnSize) {
         if (Style.Has(Class, "pill")) { return s.RadiusOr(btnSize / 2); }
         return s.RadiusOr(app.theme.borderRadiusSmall);
+    }
+
+    /// 自定义 prev/next 文字的按钮宽度：不小于方形按钮，文字
+    /// 两侧各留一点呼吸边（箭头图标模式恒为方形）。
+    int ArrowWidth(App app, string txt, int btnSize, int fs) {
+        if (txt == "") { return btnSize; }
+        int w = Canvas.MeasureText(txt, fs) + app.Scale(14);
+        if (w < btnSize) { w = btnSize; }
+        return w;
     }
 
     /// Prev、每个窗口条目一个 id（含省略号，使 id 与
@@ -463,7 +479,10 @@ class Pagination : Control {
         if (Style.Has(Class, "simple")) {
             int btnSize = this.ButtonSize(app, s);
             int fieldW = app.Scale(46);
-            return btnSize * 2 + fieldW + gap * 2;
+            // 自定义 prev/next 文字时按钮加宽，与 PaintSimple 一致。
+            int aw = this.ArrowWidth(app, prevText, btnSize, fs)
+                     + this.ArrowWidth(app, nextText, btnSize, fs);
+            return aw + btnSize * 2 + fieldW + gap * 3;
         }
         List<string> segs = this.EffOrder();
         int w = 0;
@@ -508,10 +527,13 @@ class Pagination : Control {
             int textW = Canvas.MeasureText(this.SizeText(pageSize), fs);
             return textW + chev + t.paddingSmall * 2 + app.Scale(8);
         }
-        // pager（simple 模式见 TotalWidth）。
+        // pager（simple 模式见 TotalWidth）。自定义 prev/next 文字
+        // 会加宽对应按钮，与 PaintArrow 的实绘一致。
         List<int> pages = Pagination.BuildPagesSlots(this.TotalPages(),
                                                      model.Get(), pagerCount);
-        return (pages.Count + 2) * (btnSize + gap) - gap;
+        int w = (pages.Count) * (btnSize + gap) - gap;
+        w = w + this.ArrowWidth(app, prevText, btnSize, fs) + gap;
+        return w + this.ArrowWidth(app, nextText, btnSize, fs);
     }
 
     string TotalText() {
@@ -576,9 +598,11 @@ class Pagination : Control {
                            this.TotalText(), lbl.FgOr(0), fontSize);
                 cx = cx + Canvas.MeasureText(this.TotalText(), fontSize) + gap;
             } else if (seg == "pager") {
-                this.PaintArrow(app, "chevron-left", baseId, cx, btnSize,
-                                radius, ico, current <= 1 || off, item, arrow);
-                cx = cx + btnSize + gap;
+                int prevW = this.ArrowWidth(app, prevText, btnSize, fontSize);
+                this.PaintArrow(app, "chevron-left", baseId, cx, prevW, by,
+                                btnSize, radius, ico, current <= 1 || off,
+                                item, arrow);
+                cx = cx + prevW + gap;
                 int i = 0;
                 for (; i < pages.Count; i = i + 1) {
                     int pageId = baseId + 1 + i;
@@ -592,10 +616,12 @@ class Pagination : Control {
                     }
                     cx = cx + btnSize + gap;
                 }
-                this.PaintArrow(app, "chevron-right", nextId, cx, btnSize,
-                                radius, ico, current >= this.TotalPages() || off,
+                int nextW = this.ArrowWidth(app, nextText, btnSize, fontSize);
+                this.PaintArrow(app, "chevron-right", nextId, cx, nextW, by,
+                                btnSize, radius, ico,
+                                current >= this.TotalPages() || off,
                                 item, arrow);
-                cx = cx + btnSize + gap;
+                cx = cx + nextW + gap;
             } else if (seg == "suffix" && suffixText != "") {
                 StyleBox lbl = this.ResolvePartAs(app, "pagination", "label",
                                                   "", Class, Style.SNormal());
@@ -757,11 +783,12 @@ class Pagination : Control {
 
     /// 一个 prev/next 控件：一个表面、一个在范围末端（或整体
     /// 禁用）置灰的箭头 / 自定义文字，以及它的命中区域。
-    void PaintArrow(App app, string glyph, int id, int cx, int btnSize,
-                    int radius, int ico, bool atEnd, StyleBox item,
-                    StyleBox arrow) {
+    /// 自定义文字时按钮加宽为文字宽度（w 传入 ArrowWidth 的值），
+    /// 文字不再溢出方形边界。
+    void PaintArrow(App app, string glyph, int id, int cx, int w, int by,
+                    int btnSize, int radius, int ico, bool atEnd,
+                    StyleBox item, StyleBox arrow) {
         Canvas c = app.canvas;
-        Theme t = app.theme;
         bool off = this.IsDisabled();
         string txt = glyph == "chevron-left" ? prevText : nextText;
         StyleBox st = item;
@@ -772,17 +799,17 @@ class Pagination : Control {
             st = this.ResolvePartAs(app, "pagination", "item", "", Class,
                                     Style.SHover());
         }
-        c.SurfaceRoundRect(cx, by, btnSize, btnSize, radius, st.BgOr(0),
+        c.SurfaceRoundRect(cx, by, w, btnSize, radius, st.BgOr(0),
                            item.BorderOr(0), item.BorderWOr(1));
         if (txt != "") {
             int fs = st.FontOr(this.FontSize(app, item));
-            c.DrawTextCentered(cx, by, btnSize, btnSize, txt, st.FgOr(0), fs);
+            c.DrawTextCentered(cx, by, w, btnSize, txt, st.FgOr(0), fs);
         } else {
             int fg = (atEnd || off) ? st.FgOr(0) : arrow.FgOr(0);
-            c.DrawGlyph(glyph, cx + (btnSize - ico) / 2,
+            c.DrawGlyph(glyph, cx + (w - ico) / 2,
                         by + (btnSize - ico) / 2, ico, fg);
         }
-        app.hitTester.RegisterRect(id, cx, by, btnSize, btnSize, 0);
+        app.hitTester.RegisterRect(id, cx, by, w, btnSize, 0);
     }
 
     /// 省略号：悬停时提示可以整窗翻页（变为箭头），点击翻页。
@@ -887,9 +914,10 @@ class Pagination : Control {
         app.focus.RegisterFocusable(fldId);
 
         int cx = bx;
-        this.PaintArrow(app, "chevron-left", baseId, cx, btnSize, radius, ico,
-                        cur <= 1 || off, item, arrow);
-        cx = cx + btnSize + gap;
+        int prevW = this.ArrowWidth(app, prevText, btnSize, fontSize);
+        this.PaintArrow(app, "chevron-left", baseId, cx, prevW, by, btnSize,
+                        radius, ico, cur <= 1 || off, item, arrow);
+        cx = cx + prevW + gap;
 
         int fieldW = app.Scale(46);
         this.PaintField(app, fldId, cx, by, fieldW, btnSize, radius, fontSize,
@@ -901,12 +929,16 @@ class Pagination : Control {
                                                 Class, Style.SDisabled())
                            : lbl;
         int fs = lb2.FontOr(fontSize);
-        c.DrawTextCentered(cx, by, btnSize * 2, btnSize, totalStr, lb2.FgOr(0),
-                           fs);
+        int totalW = Canvas.MeasureText(totalStr, fs);
+        c.DrawText(cx + (btnSize * 2 - totalW) / 2,
+                   Canvas.CenterTextY(by, btnSize, fs), totalStr, lb2.FgOr(0),
+                   fs);
         cx = cx + btnSize * 2 + gap;
 
-        this.PaintArrow(app, "chevron-right", nextId, cx, btnSize, radius, ico,
-                        cur >= this.TotalPages() || off, item, arrow);
+        int nextW = this.ArrowWidth(app, nextText, btnSize, fontSize);
+        this.PaintArrow(app, "chevron-right", nextId, cx, nextW, by, btnSize,
+                        radius, ico, cur >= this.TotalPages() || off,
+                        item, arrow);
 
         // simple 的输入处理与标准布局共用；pager 段的页码 id
         // 在此布局下不存在，传空表即可。
@@ -978,8 +1010,13 @@ class Pagination : Control {
                                      sizeBoxH, popH);
 
         app.BlockHitsBelow();
+        // 弹层走 :selected 档取 popup 外观（select::popup 同款皮肤规则），
+        // 但兜底必须是次级底色：SSelected 档在皮肤没写
+        // `pagination::popup` 时才会回退到 popup 表面规则，主题的
+        // bgSecondary 与之同族，不会出现选中态的强调色底。
         StyleBox pop = this.ResolvePartAs(app, "pagination", "popup", "popup",
                                           Class, Style.SSelected());
+        if (pop.BgOr(0) == 0) { pop.bg = app.theme.bgSecondary; }
         pop.Paint(app, popX, popY, popW, popH);
         app.BlockHitsRect(popX, popY, popW, popH);
 
