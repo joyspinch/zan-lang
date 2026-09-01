@@ -86,8 +86,10 @@ class MinerApp {
     // UI 状态
     public int page;             // 0 矿井 1 矿队 2 深渊(轮回) 3 设置
     public int[] viewLv;         // 每类矿工当前升级档(轮换显示 3 项)
-    public int floatPage;        // 0 无 1 圣物 2 强化 3 星盘 4 事件
+    public int floatPage;        // 0 无 1 圣物 2 强化 3 星盘 4 事件 5 装备背包
     public int selRelic;
+    public int equipPage;        // 装备背包当前页
+    public int equipHover;       // 装备背包悬停索引(-1 无),详情跟随展示
     public double offlineGain;   // >0 时开场弹离线结算
     public string offlineText;
     // 启动画面:加载纹理前先画 splash,纹理就绪后淡出进主界面
@@ -96,6 +98,7 @@ class MinerApp {
     public long splashStage;     // 0=画 splash 1=已结束
     public SdlTexture bg;        // 烘焙背景(渐变+星点)
     public SdlTexture texBg;       // 生图背景(assets 缺失回退烘焙)
+    public SdlTexture texDim;      // 浮层暗化遮罩贴图(替代整屏纯色矩形)
     public SdlTexture texMobNormal; // 怪物立绘
     public SdlTexture texMobBoss;   // 首领立绘
     public SdlTexture[] texIcon;    // 5 枚货币图标
@@ -120,6 +123,7 @@ class MinerApp {
     public SdlTexture texWinGlyphs; // 最小化/最大化/关闭 字形图(384x128 三格)
     public SdlTexture texSocket;    // 星盘空槽(圆形凹座)
     public SdlTexture texGem;       // 白宝石(可染色:星盘点亮/圣物品质球)
+    public SdlTexture[] texEquip;   // 40 枚装备图标(8 槽位×5 品阶,大图切图)
 
     public static int W() { return 1280; }
     public static int H() { return 720; }
@@ -135,39 +139,42 @@ class MinerApp {
         return t;
     }
 
-    // ---- 九宫格绘制(源为 3x3 满铺格子,四角含圆角+金饰实块) ----
-    // 语义与 GameKit Draw.RoundTex 一致:角块 1:1(源角块整块缩到 k 显示
-    // px,金线/圆角/铆钉比例不变形),边与中心从边/心线取样拉伸。矮面板
-    // 自动收紧 k,防止角块重叠。
+    // ---- 九宫格绘制(源为 3x3 满铺格子:四角含圆角+金饰实块,四边为
+    // 边框带,中心为整块带纹理的内域) ----
+    // 经典九宫语义:角块 1:1 缩到 k 显示 px(金线/圆角/铆钉不变形);
+    // 边带从源四边整条取样横向/纵向拉伸(保留边框纹理走向);
+    // 中心取样整块内域 (k..cell-k)² 缩放到内区——中心自带石纹/金属纹,
+    // 不再是纯色矩形。矮面板自动收紧 k,防止角块重叠。
     static void NineImg(SdlRenderer r, SdlTexture tex, int tw, int th, int cell,
                         int k, int x, int y, int w, int h) {
         if (w <= 0 || h <= 0) { return; }
         int maxK = w / 2; if (maxK > h / 2) { maxK = h / 2; }
-        if (maxK > cell) { maxK = cell; }
+        if (maxK > cell / 2) { maxK = cell / 2; }
         if (k > maxK) { k = maxK; }
         if (k < 2) { k = 2; }
-        int c2 = cell / 2;
+        int mid = cell - k * 2;    // 源内域边长
+        if (mid < 4) { mid = 4; }
         int mx = x + k; int my = y + k;
         int mw = w - k * 2; int mh = h - k * 2;
-        int cx0 = cell - k;    // 右/下角块源起点
-        // 中心
+        int e0 = cell - k;         // 右/下边带源起点
+        // 中心:整块内域(带纹理)缩放铺满
         if (mw > 0 && mh > 0) {
-            r.DrawTextureRegion(tex, c2 - 1, c2 - 1, 2, 2, mx, my, mw, mh);
+            r.DrawTextureRegion(tex, k, k, mid, mid, mx, my, mw, mh);
         }
-        // 上/下边、左/右边(源取边中线 1px 拉伸,只取净区不串角饰)
+        // 四边带:整条取样拉伸(不串角饰)
         if (mw > 0) {
-            r.DrawTextureRegion(tex, c2 - 1, c2, 2, 1, mx, y, mw, k);
-            r.DrawTextureRegion(tex, c2 - 1, cell - c2 - 1, 2, 1, mx, y + h - k, mw, k);
+            r.DrawTextureRegion(tex, k, 0, mid, k, mx, y, mw, k);
+            r.DrawTextureRegion(tex, k, e0, mid, k, mx, y + h - k, mw, k);
         }
         if (mh > 0) {
-            r.DrawTextureRegion(tex, c2, c2 - 1, 1, 2, x, my, k, mh);
-            r.DrawTextureRegion(tex, cell - c2 - 1, c2 - 1, 1, 2, x + w - k, my, k, mh);
+            r.DrawTextureRegion(tex, 0, k, k, mid, x, my, k, mh);
+            r.DrawTextureRegion(tex, e0, k, k, mid, x + w - k, my, k, mh);
         }
         // 四角:源角块(含圆角+金饰)1:1 缩到 k
         r.DrawTextureRegion(tex, 0, 0, k, k, x, y, k, k);
-        r.DrawTextureRegion(tex, cx0, 0, k, k, x + w - k, y, k, k);
-        r.DrawTextureRegion(tex, 0, cx0, k, k, x, y + h - k, k, k);
-        r.DrawTextureRegion(tex, cx0, cx0, k, k, x + w - k, y + h - k, k, k);
+        r.DrawTextureRegion(tex, e0, 0, k, k, x + w - k, y, k, k);
+        r.DrawTextureRegion(tex, 0, e0, k, k, x, y + h - k, k, k);
+        r.DrawTextureRegion(tex, e0, e0, k, k, x + w - k, y + h - k, k, k);
         _ = tw; _ = th;
     }
 
@@ -213,6 +220,8 @@ class MinerApp {
         a.floatPage = 0;
         a.viewLv = new int[6];
         a.selRelic = 0;
+        a.equipPage = 0;
+        a.equipHover = -1;
         a.offlineText = "";
         a.snd = Snd.Create(true);
         // 石板九宫格 + 板材质:Th.texPanel 注入后所有面板统一换肤
@@ -233,6 +242,7 @@ class MinerApp {
         a.texSocket = MinerApp.LoadTex(a.r, "examples/game/miner/assets/astro_socket.png");
         a.texGem = MinerApp.LoadTex(a.r, "examples/game/miner/assets/astro_gem_w.png");
         a.texBg = MinerApp.LoadTex(a.r, "examples/game/miner/assets/bg_mine.jpg");
+        a.texDim = MinerApp.LoadTex(a.r, "examples/game/miner/assets/dim_bg.jpg");
         a.texMobNormal = MinerApp.LoadTex(a.r, "examples/game/miner/assets/monster_normal.png");
         a.texMobBoss = MinerApp.LoadTex(a.r, "examples/game/miner/assets/monster_boss.png");
         a.texIcon = new SdlTexture[5];
@@ -253,6 +263,14 @@ class MinerApp {
         a.texRelic = MinerApp.LoadTex(a.r, "examples/game/miner/assets/ui_relic.png");
         a.texForge = MinerApp.LoadTex(a.r, "examples/game/miner/assets/ui_forge.png");
         a.texPrestige = MinerApp.LoadTex(a.r, "examples/game/miner/assets/ui_prestige.png");
+        // 装备图标 40 枚:equip_c{type}_t{tier}.png(8 槽位×5 品阶)
+        a.texEquip = new SdlTexture[40];
+        for (int c = 0; c < 8; c = c + 1) {
+            for (int t = 0; t < 5; t = t + 1) {
+                a.texEquip[c * 5 + t] = MinerApp.LoadTex(a.r,
+                    "examples/game/miner/assets/equip_c" + c + "_t" + t + ".png");
+            }
+        }
         return a;
     }
 
@@ -471,8 +489,13 @@ class MinerApp {
         // DPS/离线结算挂右上(与徽章同列起点,永不重叠)
         string dps = "DPS " + Game.FmtNum(this.g.EstDps());
         TextR(dps, MinerApp.W() - MinerApp.LX(), ry + 12, 2, 255, 130, 130, 255);
+        // 当前称谓外显(DESIGN.md §4.5):主界面常驻,最高档称谓
+        string tt = this.g.TopTitle();
+        if (tt.Length > 0) {
+            TextR("「" + tt + "」", MinerApp.W() - MinerApp.LX(), ry + 40, 2, 255, 215, 140, 255);
+        }
         if (this.offlineText.Length > 0) {
-            TextR(this.offlineText, MinerApp.W() - MinerApp.LX(), ry + 44, 1, 120, 255, 200, 255);
+            TextR(this.offlineText, MinerApp.W() - MinerApp.LX(), ry + 64, 1, 120, 255, 200, 255);
         }
     }
 
@@ -883,6 +906,18 @@ class MinerApp {
             if (this.g.ForgeBuy()) { this.snd.Craft(); }
             this.mouseDown = false;
         }
+        // 左下:称谓天梯(DESIGN.md §4.5 纯累积里程碑,两行三列)
+        Th.Panel(this.r, x, 576, MinerApp.LW(), 136);
+        TextL("称谓 · 纯累积里程碑,永不掉落", x + 16, 588, 2, 255, 215, 140, 255);
+        for (int i = 0; i < 6; i = i + 1) {
+            int tx = x + 16 + (i % 3) * 280;
+            int ty = 614 + (i / 3) * 46;
+            bool got = (this.g.titleMask & (1 << i)) != 0;
+            TextL((got ? "◆ " : "◇ ") + Game.TitleName[i], tx, ty, 2,
+                got ? 255 : 120, got ? 215 : 128, got ? 140 : 150, 255);
+            TextL(got ? Game.TitleDesc[i] : this.TitleProgress(i), tx, ty + 24, 1,
+                got ? 200 : 140, got ? 208 : 148, got ? 232 : 172, 255);
+        }
         // 右:深渊核心升级
         Th.Panel(this.r, rx, 154, MinerApp.RW(), 412);
         TextL("深渊核心", rx + 16, 166, 3, 120, 255, 200, 255);
@@ -946,9 +981,15 @@ class MinerApp {
     // ---------------- 圣物浮层 ----------------
 
     void DrawRelicsOverlay() {
-        // 暗化遮罩透出背景,与离线弹窗同一语言(整屏纯色矩形)
-        this.r.SetColor(8, 8, 14, 210);
-        this.r.FillRect(0, 0, MinerApp.W(), MinerApp.H());
+        // 暗化遮罩透出背景,与离线弹窗同一语言(遮罩贴图,缺图回退纯色矩形)
+        if (this.texDim != null && this.texDim.IsValid()) {
+            this.texDim.SetOpacity(210);
+            this.r.DrawTexture(this.texDim, 0, 0, MinerApp.W(), MinerApp.H());
+            this.texDim.SetOpacity(255);
+        } else {
+            this.r.SetColor(8, 8, 14, 210);
+            this.r.FillRect(0, 0, MinerApp.W(), MinerApp.H());
+        }
         int x = 120; int y = 70; int w = MinerApp.W() - 240; int h = MinerApp.H() - 140;
         Th.Panel(this.r, x, y, w, h);
         TextL("圣物背包(" + this.g.relics.Count + " 件,装备 " + this.g.EquippedCount() + "/6)", x + 20, y + 16, 3, 196, 158, 255, 255);
@@ -988,7 +1029,7 @@ class MinerApp {
             TextL(this.g.RelicName[r.key], x + 68, cy + 5, 2, 238, 238, 252, 255);
             TextL(this.g.RelicDesc[r.key] + " · 品质 " + r.quality + " · " + this.RelicValText(r), x + 68, cy + 30, 2, 178, 188, 212, 255);
             if (this.Btn(x + w - 196, cy + 8, 84, 36, r.equipped ? "卸下" : "装备", 2, true, !r.equipped)) {
-                if (this.g.EquipToggle(i)) { this.snd.Tip(); }
+                if (this.g.RelicToggle(i)) { this.snd.Tip(); }
                 this.mouseDown = false;
             }
             if (this.Btn(x + w - 102, cy + 8, 84, 36, "出售", 2, !r.equipped, false)) {
@@ -1048,12 +1089,167 @@ class MinerApp {
         return v + "% 窃金";
     }
 
+    // ---------------- 装备背包浮层(MIR 式) ----------------
+
+    int EquipTierCol(int tier) {
+        // 阶 0..4:灰铁/铜/银/金/橙传奇
+        if (tier == 0) { return 0; }
+        if (tier == 1) { return 2; }
+        if (tier == 2) { return 1; }
+        if (tier == 3) { return 3; }
+        return 5;
+    }
+    string EquipStatText(Equip e) {
+        string nm = this.g.EquipName[e.type];
+        double pw = e.roll * (0.4 + e.tier * 0.15);
+        string pwS = Game.FmtNum(pw);
+        if (e.type == 0 || e.type == 5) { return "+" + pwS + "% " + nm + "伤害"; }
+        if (e.type == 1 || e.type == 6) { return "+" + pwS + "% 全员产出"; }
+        if (e.type == 2 || e.type == 7) { return "-" + pwS + "% 挖掘间隔"; }
+        if (e.type == 3) { return "+" + pwS + "% 金矿产出"; }
+        return "+" + pwS + "% 铜/金掉落";
+    }
+    // 槽位图标:空槽画灰暗凹座+槽位名首字;有装备画对应品阶切图
+    void DrawEquipSlotIcon(int type, int tier, int x, int y, int size, bool filled) {
+        SdlTexture tex = filled ? this.texEquip[type * 5 + tier] : null;
+        if (tex != null && tex.IsValid()) {
+            if (!filled) { tex.SetOpacity(80); }
+            this.r.DrawTexture(tex, x, y, size, size);
+            if (!filled) { tex.SetOpacity(255); }
+            return;
+        }
+        // 缺图回退:品阶色圆徽
+        int tc = this.EquipTierCol(filled ? tier : 0);
+        int a2 = filled ? 235 : 70;
+        Sprite.Ball(this.r, x + size / 2, y + size / 2, size / 2 - 2, this.ColR(tc), this.ColG(tc), this.ColB(tc), a2);
+        if (!filled) {
+            TextCSh(this.g.EquipName[type].Substring(0, 1), x + size / 2, y + size / 2 - 9, 2, 150, 155, 175);
+        }
+    }
+
+    void DrawEquipsOverlay() {
+        // 暗化遮罩透出背景,与圣物浮层同一语言(遮罩贴图,缺图回退纯色矩形)
+        if (this.texDim != null && this.texDim.IsValid()) {
+            this.texDim.SetOpacity(210);
+            this.r.DrawTexture(this.texDim, 0, 0, MinerApp.W(), MinerApp.H());
+            this.texDim.SetOpacity(255);
+        } else {
+            this.r.SetColor(8, 8, 14, 210);
+            this.r.FillRect(0, 0, MinerApp.W(), MinerApp.H());
+        }
+        int x = 120; int y = 70; int w = MinerApp.W() - 240; int h = MinerApp.H() - 140;
+        Th.Panel(this.r, x, y, w, h);
+        TextL("装 备 背 包(" + this.g.equips.Count + " 件,穿戴 " + this.g.EquipEquippedCount() + "/8)",
+            x + 20, y + 16, 3, 255, 205, 120, 255);
+        // 左侧 8 槽位穿戴栏(2 列 × 4 行):显示每槽已穿装备
+        int sx = x + 20; int sy = y + 58;
+        for (int s = 0; s < 8; s = s + 1) {
+            int col = s % 2;
+            int row = s / 2;
+            int bx = sx + col * 178;
+            int by = sy + row * 96;
+            int idx = this.g.EquippedIndexOfType(s);
+            bool has = idx >= 0;
+            // 槽位底:石条行,穿戴中染金
+            SdlTexture rowT = this.texRowStone;
+            if (rowT != null && rowT.IsValid()) {
+                if (has) { rowT.SetColor(255, 215, 140); }
+                this.r.DrawTextureRegion(rowT, 8, 8, 400, 144, bx, by, 168, 86);
+                if (has) { rowT.ResetColor(); }
+            } else {
+                Draw.RoundRectFill(this.r, bx, by, 168, 86, 11, has ? 50 : 36, has ? 44 : 38, has ? 66 : 56, 255);
+            }
+            this.DrawEquipSlotIcon(s, has ? this.g.equips[idx].tier : 0, bx + 12, by + 17, 52, has);
+            if (has) {
+                Equip e = this.g.equips[idx];
+                TextL(this.g.EquipFullName(e), bx + 74, by + 12, 2, 238, 238, 252, 255);
+                TextL("+" + e.roll + " · 阶" + e.tier, bx + 74, by + 36, 2, 178, 188, 212, 255);
+                if (this.Btn(bx + 74, by + 54, 78, 26, "卸下", 2, true, false)) {
+                    if (this.g.EquipToggle(idx)) { this.snd.Tip(); }
+                    this.mouseDown = false;
+                }
+            } else {
+                TextL(this.g.EquipName[s], bx + 74, by + 18, 2, 150, 158, 182, 255);
+                TextL("(空)", bx + 74, by + 42, 2, 120, 128, 150, 255);
+            }
+        }
+        // 右侧背包列表(7/页):翻页 + 出售
+        int lx = x + 400; int lw2 = w - 420;
+        int per = 7;
+        int pages = (this.g.equips.Count + per - 1) / per;
+        if (pages == 0) { pages = 1; }
+        if (this.equipPage >= pages) { this.equipPage = 0; }
+        int start = this.equipPage * per;
+        TextL("背 包", lx + 4, sy - 4, 2, 255, 210, 130, 255);
+        this.equipHover = -1;
+        for (int k = 0; k < per; k = k + 1) {
+            int i = start + k;
+            if (i >= this.g.equips.Count) { break; }
+            Equip e = this.g.equips[i];
+            int cy = sy + 18 + k * 62;
+            bool hov = Draw.PointIn(this.mouseX, this.mouseY, lx, cy, lw2 - 96, 54);
+            if (hov) { this.equipHover = i; }
+            // 行底:石条,穿戴中染金
+            SdlTexture rowT = this.texRowStone;
+            if (rowT != null && rowT.IsValid()) {
+                if (e.equipped) { rowT.SetColor(255, 215, 140); }
+                else if (hov) { rowT.SetColor(215, 215, 235); }
+                this.r.DrawTextureRegion(rowT, 8, 8, 400, 144, lx, cy, lw2 - 96, 54);
+                rowT.ResetColor();
+            } else {
+                Draw.RoundRectFill(this.r, lx, cy, lw2 - 96, 54, 11, e.equipped ? 50 : 36, e.equipped ? 44 : 38, e.equipped ? 66 : 56, 255);
+            }
+            this.DrawEquipSlotIcon(e.type, e.tier, lx + 8, cy + 7, 40, true);
+            int tcol = this.EquipTierCol(e.tier);
+            TextL(this.g.EquipFullName(e), lx + 58, cy + 5, 2, this.ColR(tcol), this.ColG(tcol), this.ColB(tcol), 255);
+            TextL(this.EquipStatText(e) + (e.equipped ? " · 已穿戴" : ""), lx + 58, cy + 29, 2, 178, 188, 212, 255);
+            if (this.Btn(lx + lw2 - 186, cy + 9, 84, 36, e.equipped ? "已穿" : "穿戴", 2, !e.equipped, !e.equipped)) {
+                if (this.g.EquipToggle(i)) { this.snd.Tip(); }
+                this.mouseDown = false;
+            }
+            if (this.Btn(lx + lw2 - 92, cy + 9, 84, 36, "出售", 2, !e.equipped, false)) {
+                if (this.g.SellEquip(i)) { this.snd.Trade(); }
+                this.mouseDown = false;
+            }
+        }
+        if (this.g.equips.Count == 0) {
+            TextL("背包空空如也 — 击败深渊怪物有几率掉落装备!", lx + 8, sy + 60, 2, 175, 185, 215, 255);
+        }
+        // 出售最低品质(自动清包)
+        if (this.Btn(x + 20, y + h - 56, 170, 42, "出售最低阶", 2, true, false)) {
+            if (this.g.SellEquipLowest()) { this.snd.Trade(); }
+            this.mouseDown = false;
+        }
+        if (this.Btn(x + w - 116, y + h - 56, 98, 42, "关 闭", 2, true, false)) {
+            this.floatPage = 0;
+            this.mouseDown = false;
+        }
+        // 翻页
+        if (pages > 1) {
+            if (this.Btn(x + w / 2 - 150, y + h - 56, 84, 42, "◀", 2, this.equipPage > 0, false)) {
+                this.equipPage = this.equipPage - 1;
+                this.mouseDown = false;
+            }
+            TextC((this.equipPage + 1) + "/" + pages, x + w / 2, y + h - 50, 2, 212, 217, 238, 255);
+            if (this.Btn(x + w / 2 + 66, y + h - 56, 84, 42, "▶", 2, this.equipPage < pages - 1, false)) {
+                this.equipPage = this.equipPage + 1;
+                this.mouseDown = false;
+            }
+        }
+    }
+
     // ---------------- 离线弹窗 ----------------
 
     void DrawOffline() {
-        // 暗化遮罩下透出一点背景,弹窗不突兀(整屏纯色矩形)
-        this.r.SetColor(8, 8, 14, 210);
-        this.r.FillRect(0, 0, MinerApp.W(), MinerApp.H());
+        // 暗化遮罩下透出一点背景,弹窗不突兀(遮罩贴图,缺图回退纯色矩形)
+        if (this.texDim != null && this.texDim.IsValid()) {
+            this.texDim.SetOpacity(210);
+            this.r.DrawTexture(this.texDim, 0, 0, MinerApp.W(), MinerApp.H());
+            this.texDim.SetOpacity(255);
+        } else {
+            this.r.SetColor(8, 8, 14, 210);
+            this.r.FillRect(0, 0, MinerApp.W(), MinerApp.H());
+        }
         int x = 360; int y = 220; int w = 560; int h = 280;
         Th.Panel(this.r, x, y, w, h);
         TextCSh("欢 迎 回 来", x + w / 2, y + 24, 5, 255, 215, 140);
@@ -1126,6 +1322,12 @@ class MinerApp {
         string rt = "圣物 " + this.g.relics.Count + (this.g.EquippedCount() > 0 ? "(" + this.g.EquippedCount() + ")" : "");
         if (this.BtnIc(MinerApp.W() - 136, Host.BarH() + 12, 112, 42, rt, 2, true, this.g.relics.Count > 0, this.texRelic)) {
             this.floatPage = 1;
+            this.mouseDown = false;
+        }
+        // 装备按钮(图标+文字):第二行右下,与事件倒计时同列
+        string et = "装备 " + this.g.equips.Count + (this.g.EquipEquippedCount() > 0 ? "(" + this.g.EquipEquippedCount() + ")" : "");
+        if (this.BtnIc(MinerApp.W() - 136, Host.BarH() + 62, 112, 42, et, 2, true, this.g.equips.Count > 0, this.texEquip != null && this.texEquip.Length > 0 && this.texEquip[0] != null ? this.texEquip[0] : null)) {
+            this.floatPage = 5;
             this.mouseDown = false;
         }
         // 事件倒计时角标
@@ -1210,6 +1412,9 @@ class MinerApp {
         if (this.floatPage == 1) {
             this.DrawResSilent();
             this.DrawRelicsOverlay();
+        } else if (this.floatPage == 5) {
+            this.DrawResSilent();
+            this.DrawEquipsOverlay();
         } else if (this.offlineText.Length > 0) {
             this.DrawResSilent();
             this.DrawOffline();
@@ -1222,6 +1427,7 @@ class MinerApp {
                 this.DrawMinerStrip(MinerApp.LX(), ey + 222, MinerApp.LW());
                 this.DrawRatesCard(MinerApp.RX(), 152, MinerApp.RW());
                 this.DrawHintCard(MinerApp.RX(), 256, MinerApp.RW());
+                this.DrawContractCard(MinerApp.RX(), 416, MinerApp.RW());
             } else if (this.page == 1) {
                 this.DrawCrewPage();
             } else if (this.page == 2) {
@@ -1254,6 +1460,65 @@ class MinerApp {
         TextL("(上限 " + (8 + this.g.coreLv[5] * 4) + " 小时)。", x + 16, y + 120, 2, 185, 195, 220, 255);
     }
 
+    // 讨伐契约(DESIGN.md §4.2 · PRD 个人 BOSS 单机化):每日 1 次免费,
+    // 萤晶可买第 2 次。目标 = 下一档首领 HP×1.6,30 秒演算定胜负。
+    void DrawContractCard(int x, int y, int w) {
+        int h = 150;
+        Th.Panel(this.r, x, y, w, h);
+        TextL("讨 伐 契 约", x + 16, y + 10, 2, 255, 200, 90, 255);
+        double hp = this.g.ContractHp();
+        double dps = this.g.EstDps();
+        bool canWin = dps * 30 >= hp;
+        TextL("目标 HP " + Game.FmtNum(hp) + " · DPS " + Game.FmtNum(dps),
+            x + 16, y + 34, 2, 185, 195, 220, 255);
+        TextL(canWin ? "胜算:30 秒内可击破" : "胜算不足 — 先强化队伍",
+            x + 16, y + 58, 2, canWin ? 120 : 255, canWin ? 255 : 130, canWin ? 170 : 130, 255);
+        // 定向圣物系(点击轮换)
+        string aim = this.g.contractKey < 0 ? "随机" : this.g.RelicName[this.g.contractKey];
+        if (this.Btn(x + 16, y + 84, 150, 34, "定向:" + aim, 2, true, false)) {
+            this.g.contractKey = this.g.contractKey + 1;
+            if (this.g.contractKey > 5) { this.g.contractKey = -1; }
+            this.mouseDown = false;
+        }
+        // 开战按钮:冷却 > 免费档 > 付费档 > 已用竭
+        double cost = this.g.ContractSecondCost();
+        int cdi = (int)this.g.contractCd;
+        if (cdi > 0) {
+            TextL("冷却 " + cdi + "s", x + w - 110, y + 92, 2, 255, 130, 130, 255);
+        } else if (this.g.ContractFreeReady()) {
+            if (this.Btn(x + w - 176, y + 84, 160, 40, "开 战 · 免费", 2, true, true)) {
+                this.ContractSnd(this.g.ContractFight());
+                this.mouseDown = false;
+            }
+        } else {
+            bool canPay = this.g.cry >= cost;
+            if (this.Btn(x + w - 176, y + 84, 160, 40, "开战 " + Game.FmtNum(cost) + " 萤晶", 2, canPay, canPay)) {
+                this.ContractSnd(this.g.ContractFight());
+                this.mouseDown = false;
+            }
+        }
+        TextL("每日 1 次免费 · 萤晶加 1 次 · 胜掉圣物+萤晶+碎片",
+            x + 16, y + 128, 1, 160, 170, 198, 255);
+    }
+    void ContractSnd(int res) {
+        if (res == 1) { this.snd.Craft(); }
+        else if (res == 0) { this.snd.Tip(); }
+    }
+    // 称谓未达成时的进行度文本(深渊页称谓天梯用)
+    string TitleProgress(int i) {
+        Game g = this.g;
+        if (i == 0) { return "完成一次轮回"; }
+        if (i == 1) { return "击杀 " + Game.FmtNum(g.kills) + "/1000"; }
+        if (i == 2) { return "开采 " + Game.FmtNum(g.oreMined) + "/1M"; }
+        if (i == 3) {
+            int o = 0;
+            for (int k = 0; k < 12; k = k + 1) { if ((g.astroMask & (1 << k)) != 0) { o = o + 1; } }
+            return "星盘 " + o + "/6";
+        }
+        if (i == 4) { return "熔合 " + g.mergeCount + "/50"; }
+        return "击破第 100 层首领";
+    }
+
     // ---------------- 输入 ----------------
 
     public void OnKey(int sc) {
@@ -1261,6 +1526,9 @@ class MinerApp {
         if (sc == 68) { this.host.ToggleFullscreen(); }
         if (sc == 42) {   // B 打开圣物
             this.floatPage = this.floatPage == 1 ? 0 : 1;
+        }
+        if (sc == 43) {   // E 打开装备背包
+            this.floatPage = this.floatPage == 5 ? 0 : 5;
         }
         // 启动画面期间任意键/回车跳过等待
         if (sc == 40 || sc == 44) { this.splashMin = 0; }
@@ -1421,6 +1689,19 @@ class MinerApp {
         Game g2 = Game.New();
         g2.coreLv[6] = 1;
         SimOneWith(g2, "B 自动矿务60min");
+        // 场景 C:二期玩法面(契约/首杀表/称谓/碎片回收)——不影响 A/B 基线
+        Game g3 = Game.New();
+        for (int i = 0; i < 30; i = i + 1) { g3.BuyHire(0); }
+        g3.jin = 1e9; g3.cry = 100;
+        int cF = g3.ContractFight();
+        int cP = g3.ContractFight();
+        g3.floor = 9; g3.killStreak = 99;
+        double cry0 = g3.cry;
+        g3.OnKill(false);
+        Console.WriteLine("-- C 二期玩法: 契约免费=" + cF + " 付费=" + cP
+            + " 首杀位=" + g3.bossKilled + " 契约后萤晶=" + Game.FmtNum(g3.cry)
+            + " 碎片=" + g3.prism + " 称谓mask=" + g3.titleMask
+            + " relics=" + g3.relics.Count);
     }
 
     static void SimOne(string title, bool dummy) {
@@ -1473,6 +1754,7 @@ class MinerApp {
             + " avgCrew=" + Game.FmtNum(g.CrewAvg())
             + " cry=" + Game.FmtNum(g.cry) + " cores=" + Game.FmtNum(g.cores)
             + " relics=" + g.relics.Count + " (eq " + g.EquippedCount() + ")"
+            + " equips=" + g.equips.Count + " (eq " + g.EquipEquippedCount() + ")"
             + " forge=" + g.forgeLv + " astro=" + g.AstroCount(0) + "/" + g.AstroCount(1) + "/" + g.AstroCount(2)
             + " CoresFor=" + Game.FmtNum(g.CoresFor())
             + " buys=" + clicks);

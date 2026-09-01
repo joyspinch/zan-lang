@@ -43,6 +43,16 @@ class Relic {
     public bool equipped;
 }
 
+// 装备(MIR 式 8 槽位)。一张 8×5 装备大图本地切图:type=列(槽位),
+// tier=行(品阶 0..4),roll=词条强度。图标 assets/equip_c{type}_t{tier}.png。
+// 槽位→词条映射见 Game.EquipKind:镐靴伤害/盔袋产出/甲灯间隔/项链金产/戒指掉落。
+class Equip {
+    public int type;       // 0..7 槽位:镐/盔/甲/链/戒/靴/袋/灯
+    public int tier;       // 0..4 品阶:铁/铜/银/金/传奇
+    public int roll;       // 词条强度 1..99
+    public bool equipped;
+}
+
 // 队伍里的一个单位实例。
 class Unit {
     public int type;
@@ -71,6 +81,15 @@ class FText {
 class Toast {
     public string text;
     public long bornAt;
+    public int cr;
+    public int cg;
+    public int cb;
+}
+
+// 战斗日志行(底部日志栏环形缓冲)
+class LogLine {
+    public string text;
+    public long at;
     public int cr;
     public int cg;
     public int cb;
@@ -108,6 +127,7 @@ class Game {
     public List<Unit> crew;
     public int[] upLv;         // [14]
     public List<Relic> relics;
+    public List<Equip> equips; // MIR 式装备背包
     public int forgeLv;
     public int astroMask;
     public int[] coreLv;       // [7] 0攻 1矿 2速 3基金 4圣物 5离线 6自动
@@ -119,8 +139,20 @@ class Game {
     public double relicTimer;
     public double offlineGain; // LoadGame 返回的离线秒数(UI 读取)
 
+    // ---- 二期:首杀/契约/称谓/回收扩币(DESIGN.md §4) ----
+    public int bossKilled;         // 位掩码:bit j = 第 (j+1)*10 层首领首杀(轮回不清)
+    public int titleMask;          // 位掩码:已达成称谓(见 TitleName/TitleDesc 表)
+    public double oreMined;        // 累计矿石产出(铁+铜+金,称谓条件),轮回不清
+    public int mergeCount;         // 累计熔合次数(称谓条件),轮回不清
+    public int prism;              // 圣物碎片(回收品质≥40 给 1 枚,10 枚铸自选系圣物)
+    public int contractDay;        // 免费契约已用的现实日 yyyymmdd(0=未用)
+    public int contractPaid;       // 付费契约已用的现实日 yyyymmdd(0=未用)
+    public double contractCd;      // 战败冷却剩余秒
+    public int contractKey;        // 契约定向圣物系 -1=随机
+
     public List<FText> floats;
     public List<Toast> toasts;
+    public List<LogLine> logs;
     public long lastKillAt;
     public long shakeUntil;
     public string bannerText;
@@ -136,6 +168,9 @@ class Game {
     public int[] CurCost = new int[3];   // 占位
     public static string[] OreName = new string[] { "铁", "铜", "金" };
     public static int[] OreCol = new int[] { 0 };
+    public string[] EquipName;           // 装备槽位名 [8]
+    public string[] EquipStat;           // 装备词条名 [8]
+    public int[] EquipKind;              // 槽位→词条 kind [8]
 
     // ---- 建档 -----------------------------------------------------------
 
@@ -155,6 +190,7 @@ class Game {
         g.crew = new List<Unit>();
         g.upLv = new int[14];
         g.relics = new List<Relic>();
+        g.equips = new List<Equip>();
         g.forgeLv = 0;
         g.astroMask = 0;
         g.coreLv = new int[7];
@@ -164,9 +200,19 @@ class Game {
         g.relicTimer = 0;
         g.floats = new List<FText>();
         g.toasts = new List<Toast>();
+        g.logs = new List<LogLine>();
         g.autoTimer = 0;
         g.bannerText = "";
         g.bannerUntil = 0;
+        g.bossKilled = 0;
+        g.titleMask = 0;
+        g.oreMined = 0;
+        g.mergeCount = 0;
+        g.prism = 0;
+        g.contractDay = 0;
+        g.contractPaid = 0;
+        g.contractCd = 0;
+        g.contractKey = -1;
         g.InitTables();
         g.monsterHp = g.MonsterMaxHp();
         g.killNeed = 3;
@@ -201,6 +247,12 @@ class Game {
 
         RelicName = new string[] { "炽热之刃", "黄金圣杯", "疾风之靴", "狂暴之心", "幸运骰子", "盗贼护符" };
         RelicDesc = new string[] { "每次挖掘额外伤害", "金矿产出提高", "挖掘间隔缩短", "概率双倍伤害", "铜/金掉落提高", "概率直接得金" };
+
+        EquipName = new string[] { "铁镐", "头盔", "胸甲", "项链", "戒指", "靴子", "背包", "矿灯" };
+        EquipStat = new string[] { "伤害", "产出", "间隔", "金产", "掉落", "伤害", "产出", "间隔" };
+        // 槽位→词条 kind:0 镐 1 盔 2 甲 3 链 4 戒 5 靴 6 袋 7 灯
+        // → 0/5 伤害,1/6 产出,2/7 间隔,3 金产,4 掉落
+        EquipKind = new int[] { 0, 1, 2, 3, 4, 0, 1, 2 };
     }
 
     static UnitDef NewUD(string name, string desc, double itv, double y, double dm,
@@ -373,7 +425,7 @@ class Game {
         }
         return n;
     }
-    public bool EquipToggle(int idx) {
+    public bool RelicToggle(int idx) {
         if (idx < 0 || idx >= relics.Count) { return false; }
         Relic r = relics[idx];
         if (!r.equipped && EquippedCount() >= 6) { return false; }
@@ -381,6 +433,7 @@ class Game {
         return true;
     }
     // 熔合:同 key 两件最低品质合成,品质 = 平均 + 3
+    // (mergeCount 累计:称谓「熔炉大师」条件)
     public bool MergeRelics() {
         for (int k = 0; k < 6; k = k + 1) {
             int a = -1; int b = -1; int qa = 999; int qb = 999;
@@ -395,12 +448,18 @@ class Game {
                 if (nq > 99) { nq = 99; }
                 relics[a].quality = nq;
                 relics.RemoveAt(b);
+                mergeCount = mergeCount + 1;
                 return true;
             }
         }
         return false;
     }
-    // 出售:未装备中品质最低的一件,按品质给对应货币
+    // 回收一件圣物的收益(品质段→货币;碎片另计)。outIdx 返回收到的货币
+    // 下标供 UI 展示;返回 false 表示没有可出的货。
+    // 「一物七吃」矿队版(DESIGN.md §4.3):
+    //   q≤20 铁 / q≤40 铜 / q≤60 金 / q≤80 金+萤晶 / q>80 大额金萤晶,
+    //   q≥40 额外返 1 枚圣物碎片(prism)。
+    public static double SellGain(int key, int q) { return Math.Floor((20 + key * 8) * q); }
     public bool SellRelic() {
         int a = -1; int qa = 999;
         for (int i = 0; i < relics.Count; i = i + 1) {
@@ -409,12 +468,32 @@ class Game {
             if (r.quality < qa) { a = i; qa = r.quality; }
         }
         if (a < 0) { return false; }
+        SellRelicIdx(a);
+        return true;
+    }
+    public void SellRelicIdx(int a) {
         Relic r = relics[a];
-        double gain = Math.Floor((20 + r.key * 8) * r.quality);
+        double gain = SellGain(r.key, r.quality);
         if (r.quality <= 20) { AddCur(0, gain); }
         else if (r.quality <= 40) { AddCur(1, gain); }
         else { AddCur(2, gain); }
+        if (r.quality > 60) { AddCur(3, Math.Max(1, Math.Floor(r.quality / 12))); }
+        if (r.quality >= 40) {
+            prism = prism + 1;
+            AddToast("回收返圣物碎片 ×1(现有 " + prism + ")", 186, 148, 255);
+        }
         relics.RemoveAt(a);
+    }
+    // 碎片铸造:10 枚 → 自选系品质 60 圣物一件(对位"攒 10 换自选系")
+    public bool PrismForge(int key) {
+        if (prism < 10 || key < 0 || key > 5) { return false; }
+        prism = prism - 10;
+        Relic r = new Relic();
+        r.key = key;
+        r.quality = 60;
+        r.equipped = false;
+        relics.Add(r);
+        AddToast("碎片铸就:「" + RelicName[key] + "」品质 60", 186, 148, 255);
         return true;
     }
     public Relic RollRelic(int ceng) {
@@ -435,6 +514,216 @@ class Game {
     }
     public int RelicDropChance() {
         return 3 + coreLv[4] * 2;
+    }
+
+    // ---- 首领首杀 + 讨伐契约 + 称谓(DESIGN.md §4.1/§4.5) -----------------
+
+    public static int TodayKey() {
+        DateTime un = DateTime.UtcNow();
+        return un.Year() * 10000 + un.Month() * 100 + un.Day();
+    }
+    // 契约首领 HP:当前层首领(若恰在首领层向上取整到温和怪)抠掉 2 萤晶圣物加成
+    public double ContractHp() {
+        int e = floor;
+        if ((e + 1) % 10 == 0) { e = (e / 10) * 10 + 10; }
+        double rc = RelicPower(2);   // 炽热之刃加成不计(SIM 均匀判负修正)
+        if (rc < 0) { rc = 0; }
+        return 30 * Math.Pow(1.32, e) * (1 + e * 0.18) * SpeedMult() * 1.6 - rc;
+    }
+    // 免费契约:每日一张(以现实日 yyyymmdd 记);付费第二档以萤晶购买
+    public bool ContractFreeReady() {
+        return contractDay != TodayKey();
+    }
+    public bool ContractPaidReady() {
+        if (contractPaid == TodayKey()) { return false; }
+        return cry >= ContractSecondCost();
+    }
+    public double ContractSecondCost() { return 10 + floor / 5; }
+    // 返回:1 胜 0 负 -1 不可用/冷却中
+    public int ContractFight() {
+        if (contractCd > 0) { return -1; }
+        bool freeOk = ContractFreeReady();
+        bool paidOk = !freeOk && ContractPaidReady();
+        if (!freeOk && !paidOk) { return -1; }
+        if (freeOk) { contractDay = TodayKey(); }
+        else { Pay(3, ContractSecondCost()); contractPaid = TodayKey(); }
+        double hp = ContractHp();
+        if (EstDps() * 30.0 >= hp) { OnContractWin(); return 1; }
+        contractCd = 30;
+        AddToast("契约讨伐失败……30 秒后可再试", 255, 130, 130);
+        return 0;
+    }
+    void OnContractWin() {
+        int key = contractKey;
+        if (key < 0) { key = rng.Range(0, 6); }
+        double cn = 20 + floor / 2;
+        AddCur(3, cn);
+        Relic r = new Relic();
+        r.key = key;
+        int bq = (int)(floor * 1.2) + 10;
+        if (bq > 96) { bq = 96; }
+        r.quality = bq + rng.Range(0, 10) - 4;
+        int cap2 = 20 + floor / 2 + 15;
+        if (cap2 > 99) { cap2 = 99; }
+        if (r.quality > cap2) { r.quality = cap2; }
+        if (r.quality < 1) { r.quality = 1; }
+        relics.Add(r);
+        contractKey = -1;
+        prism = prism + 1;
+        AddToast("契约讨伐成功!+" + FmtNum(cn) + " 萤晶,「" + RelicName[key] + "」+" + r.quality, 255, 200, 90);
+        Banner("契约完成 ·「" + RelicName[key] + "」+" + r.quality);
+    }
+
+    // ---- 称谓天梯(纯累积,永不回收) ----
+    // 表:称谓名,条件描述(静态只读,位掩码持久)
+    public static string[] TitleName = new string[] {
+        "见习矿工", "深渊行者", "矿脉之主", "星辰引路人", "熔炉大师", "百层传奇"
+    };
+    public static string[] TitleDesc = new string[] {
+        "首次轮回", "累计击杀 1,000", "累计开采 1,000,000 矿石",
+        "点亮星盘 6 格", "圣物熔合 ≥ 50 次", "击破第 100 层首领"
+    };
+    // 当前达成条件(实时计算,不需存盘,重算由存档/推层调用)
+    public bool TitleCond(int tid) {
+        if (tid == 0) { return prestiges > 0; }
+        if (tid == 1) { return kills >= 1000; }
+        if (tid == 2) { return oreMined >= 1000000; }
+        if (tid == 3) {
+            int o = 0;
+            for (int i = 0; i < 12; i = i + 1) { if ((astroMask & (1 << i)) != 0) { o = o + 1; } }
+            return o >= 6;
+        }
+        if (tid == 4) { return mergeCount >= 50; }
+        return (bossKilled & (1 << 9)) != 0;
+    }
+    // 每帧结算新达成的称谓(横幅 + Toast)
+    public void CheckTitles() {
+        for (int i = 0; i < 6; i = i + 1) {
+            if ((titleMask & (1 << i)) != 0) { continue; }
+            if (TitleCond(i)) {
+                titleMask = titleMask | (1 << i);
+                if (bannerUntil < (long)(playSec * 1000) + 3000) {
+                    bannerText = "获得称谓:「" + TitleName[i] + "」";
+                    bannerUntil = (long)(playSec * 1000) + 3000;
+                }
+                AddToast("获得称谓:「" + TitleName[i] + "」 — " + TitleDesc[i], 255, 215, 140);
+            }
+        }
+    }
+    // 当前最高档称谓(主界面外显):从最高档往回找
+    public string TopTitle() {
+        for (int i = 5; i >= 0; i = i - 1) {
+            if ((titleMask & (1 << i)) != 0) { return TitleName[i]; }
+        }
+        return "";
+    }
+
+    // ---- 装备(MIR 式) ---------------------------------------------------
+
+    // 装备掉落率:基础 2% + 圣物磁石每级 +1%(装备让磁石核心更有性价比)
+    public int EquipDropChance() {
+        return 2 + coreLv[4];
+    }
+    // 品阶权重:深层更容易出高阶。阶 0..4 权重 60/25/10/4/1,深层整体上移。
+    public int RollEquipTier() {
+        int deep = floor / 5;
+        if (deep > 8) { deep = 8; }
+        // 权重表:阶0 60-deep*6,阶1 25,阶2 10+deep,阶3 4+deep/2,阶4 1+deep/4
+        int w0 = 60 - deep * 6; if (w0 < 12) { w0 = 12; }
+        int w1 = 25;
+        int w2 = 10 + deep;
+        int w3 = 4 + deep / 2;
+        int w4 = 1 + deep / 4;
+        int tot = w0 + w1 + w2 + w3 + w4;
+        int rnd = rng.Range(0, tot);
+        if (rnd < w0) { return 0; }
+        if (rnd < w0 + w1) { return 1; }
+        if (rnd < w0 + w1 + w2) { return 2; }
+        if (rnd < w0 + w1 + w2 + w3) { return 3; }
+        return 4;
+    }
+    // 击杀掉落装备
+    public Equip RollEquip() {
+        if (rng.Range(0, 100) >= EquipDropChance()) { return null; }
+        Equip e = new Equip();
+        e.type = rng.Range(0, 8);
+        e.tier = RollEquipTier();
+        // 词条强度:品阶 × (10+层数/4) 基础,±10 浮动,上限 99
+        int baseV = (e.tier + 1) * (10 + floor / 4);
+        int q = baseV + rng.Range(0, 21) - 10;
+        if (q > 99) { q = 99; }
+        if (q < 4) { q = 4; }
+        e.roll = q;
+        e.equipped = false;
+        return e;
+    }
+    // 同槽位已穿戴的旧装备(最多 1 件/槽)
+    public int EquippedIndexOfType(int type) {
+        for (int i = 0; i < equips.Count; i = i + 1) {
+            if (equips[i].equipped && equips[i].type == type) { return i; }
+        }
+        return -1;
+    }
+    // 穿戴/卸下:同槽只能穿一件,穿戴时顶掉旧件(旧件回背包)
+    public bool EquipToggle(int idx) {
+        if (idx < 0 || idx >= equips.Count) { return false; }
+        Equip e = equips[idx];
+        if (!e.equipped) {
+            int old = EquippedIndexOfType(e.type);
+            if (old >= 0) { equips[old].equipped = false; }
+        }
+        e.equipped = !e.equipped;
+        return true;
+    }
+    public int EquipEquippedCount() {
+        int n = 0;
+        for (int i = 0; i < equips.Count; i = i + 1) {
+            if (equips[i].equipped) { n = n + 1; }
+        }
+        return n;
+    }
+    // 词条强度汇总:kind 0 伤害 1 产出 2 间隔 3 金产 4 掉落(槽位→kind 见 EquipKind)
+    // 返回加成数值:伤害/产出/金产/掉落为 %,间隔为 -%
+    public double EquipPower(int kind) {
+        double sum = 0;
+        for (int i = 0; i < equips.Count; i = i + 1) {
+            Equip e = equips[i];
+            if (!e.equipped) { continue; }
+            if (EquipKind[e.type] == kind) { sum = sum + e.roll * (0.4 + e.tier * 0.15); }
+        }
+        return sum;
+    }
+    // 出售装备:按品阶×词条给货币(阶 0-1 铁,2-3 铜,4 金)
+    public bool SellEquip(int idx) {
+        if (idx < 0 || idx >= equips.Count) { return false; }
+        Equip e = equips[idx];
+        if (e.equipped) { return false; }
+        return DoSellEquip(idx);
+    }
+    // 出售未穿戴中品阶最低的一件(一键清包)
+    public bool SellEquipLowest() {
+        int a = -1; int ta = 99;
+        for (int i = 0; i < equips.Count; i = i + 1) {
+            Equip e = equips[i];
+            if (e.equipped) { continue; }
+            if (e.tier < ta) { a = i; ta = e.tier; }
+        }
+        if (a < 0) { return false; }
+        return DoSellEquip(a);
+    }
+    bool DoSellEquip(int idx) {
+        Equip e = equips[idx];
+        double gain = Math.Floor((10 + e.roll * 2) * (1 + e.tier));
+        if (e.tier <= 1) { AddCur(0, gain); }
+        else if (e.tier <= 3) { AddCur(1, gain); }
+        else { AddCur(2, gain); }
+        equips.RemoveAt(idx);
+        return true;
+    }
+    // 装备名:"镀金铁镐" 式 — 品阶前缀 + 槽位名
+    public static string[] EquipTierName = new string[] { "粗制", "精制", "镀银", "镀金", "传奇" };
+    public string EquipFullName(Equip e) {
+        return EquipTierName[e.tier] + EquipName[e.type];
     }
 
     // ---- 怪物/层数 ------------------------------------------------------
@@ -462,6 +751,8 @@ class Game {
         w[2] = (c - 5) * 3;
         if (w[2] < 0) { w[2] = 0; }
         double mult = 1 + upLv[12] * 0.08 + RelicPower(4) / 100;
+        double eqDrop = EquipPower(4);
+        if (eqDrop > 0) { mult = mult * (1 + Math.Min(2.0, eqDrop / 100)); }
         if (isJr && upLv[10] > 0) { mult = mult * (1 + upLv[10] * 0.5); }
         w[1] = w[1] * mult;
         w[2] = w[2] * mult;
@@ -493,6 +784,8 @@ class Game {
         if (u.type == 1) { t = t - upLv[3] * 0.1; }
         double relic = RelicPower(2);
         if (relic > 0) { t = t * (1 - Math.Min(0.8, relic / 100)); }
+        double eqSpd = EquipPower(2);
+        if (eqSpd > 0) { t = t * (1 - Math.Min(0.6, eqSpd / 100)); }
         t = t * SpeedMult();
         t = t * CrowdMult(u.type);
         if (t < 0.1) { t = 0.1; }
@@ -505,6 +798,8 @@ class Game {
         if (u.type == 0) { y = 1 + upLv[0]; }
         if (u.type == 2) { y = 1 + upLv[7]; }
         if (u.type == 4) { y = 20 + upLv[8] * 5; }
+        double eqOre = EquipPower(1);
+        if (eqOre > 0) { y = y * (1 + Math.Min(3.0, eqOre / 100)); }
         return y * CoreOreMult();
     }
     // 单次挖掘的全流程;pushFloat 控制是否喷字(无头模拟时关)
@@ -533,8 +828,11 @@ class Game {
             if (ore == 2) {
                 double rg = RelicPower(1);
                 if (rg > 0) { n = Math.Round(y * (1 + rg / 100)); }
+                double ej = EquipPower(3);
+                if (ej > 0) { n = Math.Round(n * (1 + Math.Min(2.0, ej / 100))); }
             }
             AddCur(ore, n);
+            oreMined = oreMined + n;
             if (fx && rng.Range(0, 3) == 0) {
                 Float("+" + FmtNum(n) + " " + OreName[ore], OreColOf(ore), false);
             }
@@ -550,6 +848,8 @@ class Game {
         if (u.type == 0 && upLv[2] > 0 && rng.NextDouble01() < Math.Min(1, upLv[2] * 0.1)) { dmg = dmg + upLv[2] * 2; }
         if (u.type == 4 && upLv[9] > 0) { dmg = dmg + y * upLv[9]; }
         dmg = dmg * CoreDmgMult();
+        double eqDmg = EquipPower(0);
+        if (eqDmg > 0) { dmg = dmg * (1 + Math.Min(3.0, eqDmg / 100)); }
         double rc = RelicPower(0);
         if (rc > 0) { dmg = dmg + rc; }
         if (RelicPower(3) > 0 && rng.NextDouble01() < RelicPower(3) / 100) { dmg = dmg * 2; }
@@ -603,12 +903,31 @@ class Game {
         }
         killStreak = 0;
         floor = floor + 1;
+        PushLog("推进至第 " + (floor + 1) + " 层", 255, 215, 140);
         if (floor > best) { best = floor; }
         if ((floor % 10) == 0) {
             double n = 6 + floor / 10;   // 首领萤晶:6、7…随深度涨(升核/星盘主力)
             AddCur(3, n);
+            int bIdx = floor / 10 - 1;
+            bool firstKill = bIdx >= 0 && bIdx < 30 && (bossKilled & (1 << bIdx)) == 0;
+            if (firstKill) { bossKilled = bossKilled | (1 << bIdx); }
             AddToast("击破首领!+" + FmtNum(n) + " 萤晶", 255, 200, 90);
             if (fx) { Banner("首领击破!进入第 " + (floor + 1) + " 层"); }
+            // 首杀奖励(DESIGN.md §4.1):一次性大额萤晶 + 保底高品质圣物,
+            // 轮回不清表——每轮的钩子是"冲更深的从未到过的 10 层"
+            if (firstKill) {
+                double nf = 20 + floor / 2;
+                AddCur(3, nf);
+                Relic fr = new Relic();
+                fr.key = rng.Range(0, 6);
+                int fq = 20 + floor / 2 + 15;
+                if (fq > 99) { fq = 99; }
+                fr.quality = fq;
+                fr.equipped = false;
+                relics.Add(fr);
+                AddToast("首杀奖励:+" + FmtNum(nf) + " 萤晶,「" + RelicName[fr.key] + "」品质 " + fr.quality, 255, 215, 140);
+                if (fx) { Banner("首杀首领!获保底圣物「" + RelicName[fr.key] + "」+" + fr.quality); }
+            }
         } else if (fx && floor % 5 == 0) {
             Banner("深入第 " + (floor + 1) + " 层");
         }
@@ -617,6 +936,12 @@ class Game {
             relics.Add(r);
             AddToast("获得圣物「" + RelicName[r.key] + "」品质 " + r.quality, 186, 148, 255);
             if (fx) { Banner("圣物:「" + RelicName[r.key] + "」+" + r.quality); }
+        }
+        Equip e = RollEquip();
+        if (e != null) {
+            equips.Add(e);
+            AddToast("获得装备「" + EquipFullName(e) + "」+" + e.roll, 255, 205, 120);
+            if (fx) { Banner("装备:「" + EquipFullName(e) + "」"); }
         }
         if (floor == 10) { AddToast("轮回已解锁:第 15 层起可轮回取核", 120, 255, 200); }
         monsterHp = MonsterMaxHp();
@@ -709,6 +1034,8 @@ class Game {
         if (ore == 2) {
             double rg = RelicPower(1);
             if (rg > 0) { sum = sum * (1 + rg / 100); }
+            double ej = EquipPower(3);
+            if (ej > 0) { sum = sum * (1 + Math.Min(2.0, ej / 100)); }
         }
         return sum;
     }
@@ -720,7 +1047,10 @@ class Game {
             if (u.type == 4 && upLv[9] > 0) { d = d + UnitYield(u) * upLv[9]; }
             sum = sum + d * (1 + upLv[13] * 0.05) / UnitInterval(u);
         }
-        return sum * CoreDmgMult();
+        double outp = sum * CoreDmgMult();
+        double eqDmg = EquipPower(0);
+        if (eqDmg > 0) { outp = outp * (1 + Math.Min(3.0, eqDmg / 100)); }
+        return outp;
     }
 
     // ---- 主循环 ---------------------------------------------------------
@@ -749,6 +1079,8 @@ class Game {
         }
         MaybeEvent();
         if (ev != null && playSec > ev.until) { ev = null; }
+        if (contractCd > 0) { contractCd = contractCd - dt; }
+        CheckTitles();
         // 自动纪元:每 2s 买最便宜的可用项
         if (coreLv[6] > 0) {
             autoTimer = autoTimer + dt;
@@ -828,6 +1160,15 @@ class Game {
         t.cr = cr; t.cg = cg; t.cb = cb;
         toasts.Add(t);
         if (toasts.Count > 6) { toasts.RemoveAt(0); }
+        PushLog(text, cr, cg, cb);
+    }
+    public void PushLog(string t, int cr, int cg, int cb) {
+        LogLine l = new LogLine();
+        l.text = t;
+        l.at = (long)(playSec * 1000);
+        l.cr = cr; l.cg = cg; l.cb = cb;
+        logs.Add(l);
+        if (logs.Count > 60) { logs.RemoveAt(0); }
     }
     public void Banner(string text) {
         bannerText = text;
@@ -852,6 +1193,7 @@ class Game {
         crew = new List<Unit>();
         upLv = new int[14];
         relics = new List<Relic>();
+        equips = new List<Equip>();
         relicTimer = 0;
         ev = null;
         buffUntil = 0;
@@ -963,8 +1305,9 @@ class Game {
     }
 
     public void SaveGame() {
-        string s = "v=3\n";
+        string s = "v=4\n";
         s = s + "res=" + Dbl2Str(tie) + "," + Dbl2Str(tong) + "," + Dbl2Str(jin) + "," + Dbl2Str(cry) + "," + Dbl2Str(cores) + "\n";
+        s = s + "v2=" + bossKilled + "," + titleMask + "," + Dbl2Str(oreMined) + "," + mergeCount + "," + prism + "," + contractDay + "," + contractPaid + "\n";
         s = s + "prog=" + floor + "," + best + "," + prestiges + "\n";
         s = s + "stat=" + Dbl2Str(playSec) + "," + Dbl2Str(kills) + "," + Dbl2Str(DateTime.UtcNow().ToUnixSeconds()) + "\n";
         string crewS = "";
@@ -985,6 +1328,12 @@ class Game {
             rl = rl + relics[i].key + "," + relics[i].quality + "," + (relics[i].equipped ? 1 : 0);
         }
         s = s + "relics=" + rl + "\n";
+        string eq = "";
+        for (int i = 0; i < equips.Count; i = i + 1) {
+            if (i > 0) { eq = eq + ";"; }
+            eq = eq + equips[i].type + "," + equips[i].tier + "," + equips[i].roll + "," + (equips[i].equipped ? 1 : 0);
+        }
+        s = s + "equips=" + eq + "\n";
         string cl = "";
         for (int i = 0; i < 7; i = i + 1) {
             if (i > 0) { cl = cl + ","; }
@@ -1036,6 +1385,16 @@ class Game {
             jin = NumFrom(parts[2]);
             cry = NumFrom(parts[3]);
             cores = NumFrom(parts[4]);
+        } else if (k == "v2") {
+            parts = SplitChar(v, ',');
+            if (parts.Count < 7) { return; }
+            bossKilled = (int)NumFrom(parts[0]);
+            titleMask = (int)NumFrom(parts[1]);
+            oreMined = NumFrom(parts[2]);
+            mergeCount = (int)NumFrom(parts[3]);
+            prism = (int)NumFrom(parts[4]);
+            contractDay = (int)NumFrom(parts[5]);
+            contractPaid = (int)NumFrom(parts[6]);
         } else if (k == "prog") {
             parts = SplitChar(v, ',');
             if (parts.Count < 3) { return; }
@@ -1078,6 +1437,23 @@ class Game {
                 r.quality = (int)NumFrom(f[1]);
                 r.equipped = NumFrom(f[2]) > 0;
                 relics.Add(r);
+            }
+        } else if (k == "equips") {
+            equips = new List<Equip>();
+            parts = SplitChar(v, ';');
+            for (int i = 0; i < parts.Count; i = i + 1) {
+                if (parts[i].Length == 0) { continue; }
+                List<string> f = SplitChar(parts[i], ',');
+                if (f.Count < 4) { continue; }
+                Equip e = new Equip();
+                e.type = (int)NumFrom(f[0]);
+                e.tier = (int)NumFrom(f[1]);
+                e.roll = (int)NumFrom(f[2]);
+                e.equipped = NumFrom(f[3]) > 0;
+                if (e.type < 0 || e.type > 7) { e.type = 0; }
+                if (e.tier < 0 || e.tier > 4) { e.tier = 0; }
+                if (e.roll < 1) { e.roll = 1; }
+                equips.Add(e);
             }
         } else if (k == "core") {
             parts = SplitChar(v, ',');
