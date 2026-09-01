@@ -109,9 +109,21 @@ class App {
     // 外观抽屉的附加项：强制背景效果类型（-1 = 跟随
     // 皮肤）和强调色覆盖（0 = 皮肤默认），两者都应用在
     // 当前激活的预设之上。
+    /// 外观抽屉的附加项：强制背景效果类型（-1 = 跟随
+    /// 皮肤）和强调色覆盖（0 = 皮肤默认），两者都应用在
+    /// 当前激活的预设之上。
     int fxKindOverride;
     int accentOverride;
     SignalInt themeDrawerTab;
+    // 全局密度档（0 小 / 1 中 / 2 大，见 Theme.DensityPermille）：
+    // 外观抽屉选择、SetDensity API 与皮肤 `--density` token 共用。
+    // 基线度量在换肤/换主题时快照（densityBase），当前 theme 的度量
+    // 永远是"基线 × 密度 × DPI"的乘积，档位切换从基线重推不叠加。
+    // hasSkinDensity：当前皮肤包声明过 `--density`（跟随皮肤，用户
+    // 抽屉选择被皮肤切换覆盖）；false = 用户自主档位。
+    int density;
+    List<int> densityBase;
+    bool hasSkinDensity;
     // 皮肤切换：当 autoSkins 开启时，标题栏主题按钮是一个菜单
     // 其中列出磁盘上的皮肤（Skin.Names），由 App 自行应用所选皮肤
     // （无需每个应用的处理程序）。appliedSkin 是最后应用的索引，这样 RenderChrome
@@ -674,6 +686,9 @@ class App {
         this.fxKindOverride = 0 - 1;
         this.accentOverride = 0;
         this.themeDrawerTab = new SignalInt(0);
+        this.density = 1;
+        this.densityBase = null;
+        this.hasSkinDensity = false;
         this.autoSkins = false;
         this.appliedSkin = -1;
         this.skinPacks = new List<string>();
@@ -823,7 +838,7 @@ class App {
     void SetDark(bool dark) {
         isDark = dark;
         if (dark) { theme = Theme.Dark(); } else { theme = Theme.Light(); }
-        theme.ScaleByDpi(dpiScale);
+        this.ScaleThemeMetrics();
         this.NoteRedrawWhy("SetDark");
         needsRedraw = true;
     }
@@ -833,7 +848,7 @@ class App {
     void ApplyTheme(Theme t, bool dark) {
         isDark = dark;
         theme = t;
-        theme.ScaleByDpi(dpiScale);
+        this.ScaleThemeMetrics();
         // 磨砂玻璃在应用内渲染：在主题壁纸上做软件模糊，
         // 窗口本身不透明。曾尝试原生 OS 亚克力（分层）窗口，
         // 但它改变了外观，并使窗口自行改变大小
@@ -854,6 +869,53 @@ class App {
         this.NoteRedrawWhy("ApplyTheme");
         needsRedraw = true;
     }
+
+    /// 把当前 theme 的度量重算为"基线 × 密度档 × DPI"。基线在换肤 /
+    /// 换主题时快照（theme 实例是新建的），密度切换、DPI 变化从基线
+    /// 重推——两档缩放叠加时不会互相污染，往返切换不累积舍入误差。
+    /// 全部 metric 改写入口（SetDark / ApplyTheme / SetTheme / Show）
+    /// 都走这里，取代散落的 ScaleByDpi 调用。
+    void ScaleThemeMetrics() {
+        if (density < 0) { density = 0; }
+        if (density > 2) { density = 2; }
+        if (theme == null) { return; }
+        // 基线 = 当前主题的原始度量。theme 每次换肤/换主题都被
+        // Skin/调用方重建，所以快照此刻的度量即为未缩放的基线；
+        // 若 theme 被复用（理论上的调用方误用），快照取自
+        // densityBase 仍成立——只在基线缺失时重新记录。
+        if (densityBase == null || densityBase.Count < 24) {
+            densityBase = theme.SnapshotMetrics();
+            if (density == 1) { theme.ScaleByDpi(dpiScale); return; }
+        }
+        theme.ApplyDensityScaled(densityBase, density);
+        theme.ScaleByDpi(dpiScale);
+    }
+
+    /// 全局密度档：0 小（紧凑）/ 1 中（默认）/ 2 大（宽松）。整体
+    /// 缩放字号/控件高度/内边距/间距/图标/圆角——与换肤、DPI 正交，
+    /// 切换后样式缓存按代次作废，下一帧全部控件按新度量重排。
+    void SetDensity(int d) {
+        if (d < 0) { d = 0; }
+        if (d > 2) { d = 2; }
+        if (d == density) { return; }
+        density = d;
+        if (densityBase == null && theme != null) {
+            densityBase = theme.SnapshotMetrics();
+        }
+        this.ScaleThemeMetrics();
+        // 度量进了样式缓存键（dpiScale/metricsScale 桶），但 RootFromTheme
+        // 导出的 :root token 是 base.css 解析时的输入，必须整代作废。
+        bgThemeGen = bgThemeGen + 1;
+        backdropDirty = true;
+        this.NoteRedrawWhy("SetDensity");
+        needsRedraw = true;
+    }
+
+    /// 当前密度档（0/1/2，见 SetDensity）。
+    int Density() { return density; }
+
+    /// 当前密度档的显示名（"Small"/"Medium"/"Large"）。
+    string DensityLabel() { return Theme.DensityName(density); }
 
     /// 加载皮肤包 `name`（`skins/<name>/skin.css` + 美术资源文件夹）
     /// 并应用其令牌、样式表与插图。当
@@ -1004,6 +1066,35 @@ class App {
         }
         themeMenuModel.Set(i);
         appliedSkin = i;
+        // 换肤重建了 theme：密度档立即套到新调色板上（ScaleThemeMetrics
+        // 已在 ApplyTheme 里跑过，但那是用"皮肤尚未带 --density"的旧档；
+        // 皮肤 token 允许逐包改档，这里按当前皮肤再校准一次）。
+        this.SyncSkinDensity();
+    }
+
+    /// 皮肤包可通过 `--density: small|medium|large` 声明默认密度档。
+    /// 未声明时返回 -1（保持用户当前选择）。
+    int SkinDensity() {
+        if (sheet == null) { return 0 - 1; }
+        return Skin.DensityOf(sheet);
+    }
+
+    /// 换肤后校准密度：皮肤声明了 `--density` 则跟随皮肤并记住
+    /// "皮肤说了算"，否则维持用户此前选择的档位。
+    void SyncSkinDensity() {
+        int sd = this.SkinDensity();
+        if (sd < 0) { hasSkinDensity = false; return; }
+        hasSkinDensity = true;
+        if (sd == density) { return; }
+        density = sd;
+        if (densityBase != null && densityBase.Count >= 24 && theme != null) {
+            theme.ApplyDensityScaled(densityBase, density);
+            theme.ScaleByDpi(dpiScale);
+            bgThemeGen = bgThemeGen + 1;
+            backdropDirty = true;
+            this.NoteRedrawWhy("SyncSkinDensity");
+            needsRedraw = true;
+        }
     }
 
     /// 当内置皮肤选择器的选中项变化（用户选择）时应用它。
@@ -2363,7 +2454,7 @@ class App {
             this.SwapCanvas(realW, realH);
         }
         dpiScale = Canvas.GetDpiScale();
-        theme.ScaleByDpi(dpiScale);
+        this.ScaleThemeMetrics();
         scrollSpeed = 40 * dpiScale / 100;
         titlebarH = Window.TitlebarHeight();
         captionBtnW = Window.CaptionButtonWidth();
@@ -3505,7 +3596,7 @@ class App {
 
     void SetTheme(Theme t) {
         theme = t;
-        theme.ScaleByDpi(dpiScale);
+        this.ScaleThemeMetrics();
         this.ApplySurfaceTranslucency();
         bgThemeGen = bgThemeGen + 1;
         // 应用 CSS 里的 var(--token) 是按主题展开的，换了主题就要
