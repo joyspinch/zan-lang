@@ -1212,6 +1212,11 @@ foreach(_src ${_conf_srcs})
   elseif(_name STREQUAL "server_mvc_timezone")
     set(_extra_args
       "${CMAKE_SOURCE_DIR}/templates/server/server-mvc/src/Framework/Fmt.zan")
+  elseif(_name STREQUAL "file_embed_bytes")
+    # The case reads its fixtures back through the embedded-resource API;
+    # they are registered under "assets/..." via --embed.
+    set(_extra_args
+      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_assets=assets")
   elseif(_needs_gui_driver)
     set(_extra_args "${_gui_driver_args}")
   else()
@@ -2031,6 +2036,15 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_filtertree.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_filtertree${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  add_test(NAME conformance_gui_datatable_formula
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_formula_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_formula.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_formula${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # The property protocol (Props() specs -> Control.GetProp/SetProp) is what
