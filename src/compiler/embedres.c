@@ -218,13 +218,16 @@ static LLVMValueRef embed_libc(zan_irgen_t *g, const char *name,
 /* The read API the stdlib calls (Skin.EmbedRead, System.IO's embedded-resource
  * fallback). Emitted into the program's own module rather than linked from the
  * shipped zan_embed_api object, so an embedding program stays linkable for
- * cross targets whose toolchain directory carries no such object. The table is
- * held in a mutable global initialised to this module's own table: a generated
- * data object (scripts/gen_embed.ps1) linked alongside still overrides it from
- * its constructor, exactly as it does with the shipped implementation. */
+ * cross targets whose toolchain directory carries no such object. This
+ * module's own --embed table lives in two immutable slots; a generated data
+ * object (scripts/gen_embed.ps1) linked alongside appends ITS table through
+ * zan_embed_register (slots 2+), and lookups consult every slot with the
+ * registered ones winning duplicate names -- the same accumulate semantics the
+ * shipped runtime implementation (src/runtime/zan_embed_api.c) follows. */
 struct embed_api_ctx {
     LLVMTypeRef  i8, i8p, i32, i64, ent_ty;
     LLVMValueRef gtbl, gcnt, gbuf, empty;
+    LLVMValueRef own_tbl, own_cnt;  /* this module's --embed table (immutable) */
     long long    buf_cap;
 };
 
@@ -234,7 +237,10 @@ static LLVMValueRef embed_entry_at(LLVMBuilderRef b, struct embed_api_ctx *c,
     return LLVMBuildGEP2(b, c->ent_ty, base, &i, 1, "ent");
 }
 
-/* i8* zan.embed.find(i8* name): the entry with that name, or null. */
+/* i8* zan.embed.find(i8* name): the entry with that name, or null. Scans two
+ * slots in turn -- first the table registered through zan_embed_register (a
+ * generated data object's group, which wins duplicate names), then this
+ * module's own --embed table. */
 static LLVMValueRef embed_emit_find(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMTypeRef args[] = { c->i8p };
     LLVMTypeRef fty = LLVMFunctionType(c->i8p, args, 1, 0);
@@ -246,6 +252,8 @@ static LLVMValueRef embed_emit_find(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(g->ctx, fn, "body");
     LLVMBasicBlockRef hit = LLVMAppendBasicBlockInContext(g->ctx, fn, "hit");
     LLVMBasicBlockRef next = LLVMAppendBasicBlockInContext(g->ctx, fn, "next");
+    LLVMBasicBlockRef nextslot = LLVMAppendBasicBlockInContext(g->ctx, fn,
+                                                               "nextslot");
     LLVMBasicBlockRef miss = LLVMAppendBasicBlockInContext(g->ctx, fn, "miss");
 
     LLVMTypeRef scmp_args[] = { c->i8p, c->i8p };
@@ -255,17 +263,26 @@ static LLVMValueRef embed_emit_find(zan_irgen_t *g, struct embed_api_ctx *c) {
 
     LLVMPositionBuilderAtEnd(b, entry);
     LLVMValueRef iv = LLVMBuildAlloca(b, c->i64, "i");
+    LLVMValueRef bv = LLVMBuildAlloca(b, c->i8p, "b");
+    LLVMValueRef nv = LLVMBuildAlloca(b, c->i64, "n");
+    LLVMValueRef sv = LLVMBuildAlloca(b, c->i64, "slot");
     LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), iv);
+    /* slot 0 = registered table (gtbl/gcnt, mutable), slot 1 = this module's
+     * own table (own_tbl/own_cnt, immutable). */
+    LLVMBuildStore(b, LLVMBuildLoad2(b, c->i8p, c->gtbl, "tbl0"), bv);
+    LLVMBuildStore(b, LLVMBuildLoad2(b, c->i64, c->gcnt, "cnt0"), nv);
+    LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), sv);
     LLVMValueRef name = LLVMGetParam(fn, 0);
-    LLVMValueRef base = LLVMBuildLoad2(b, c->i8p, c->gtbl, "tbl");
-    LLVMValueRef nn = LLVMBuildIsNull(b, name, "nullname");
-    LLVMValueRef nb = LLVMBuildIsNull(b, base, "nulltbl");
-    LLVMBuildCondBr(b, LLVMBuildOr(b, nn, nb, "bad"), miss, head);
+    LLVMBuildCondBr(b, LLVMBuildIsNull(b, name, "nullname"), miss, head);
 
     LLVMPositionBuilderAtEnd(b, head);
     LLVMValueRef i = LLVMBuildLoad2(b, c->i64, iv, "iv");
-    LLVMValueRef n = LLVMBuildLoad2(b, c->i64, c->gcnt, "n");
-    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntSLT, i, n, "more"), body, miss);
+    LLVMValueRef n = LLVMBuildLoad2(b, c->i64, nv, "ncur");
+    LLVMValueRef base = LLVMBuildLoad2(b, c->i8p, bv, "bcur");
+    LLVMValueRef ok = LLVMBuildAnd(b,
+        LLVMBuildICmp(b, LLVMIntSLT, i, n, "more"),
+        LLVMBuildIsNotNull(b, base, "hastbl"), "go");
+    LLVMBuildCondBr(b, ok, body, nextslot);
 
     LLVMPositionBuilderAtEnd(b, body);
     i = LLVMBuildLoad2(b, c->i64, iv, "iv2");
@@ -287,6 +304,19 @@ static LLVMValueRef embed_emit_find(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMPositionBuilderAtEnd(b, next);
     i = LLVMBuildLoad2(b, c->i64, iv, "iv3");
     LLVMBuildStore(b, LLVMBuildAdd(b, i, LLVMConstInt(c->i64, 1, 0), "i1"), iv);
+    LLVMBuildBr(b, head);
+
+    /* the current slot is exhausted: advance to slot 1 (own table) or stop */
+    LLVMPositionBuilderAtEnd(b, nextslot);
+    LLVMValueRef s = LLVMBuildLoad2(b, c->i64, sv, "scur");
+    LLVMBasicBlockRef adv = LLVMAppendBasicBlockInContext(g->ctx, fn, "adv");
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, s,
+        LLVMConstInt(c->i64, 0, 0), "was0"), adv, miss);
+    LLVMPositionBuilderAtEnd(b, adv);
+    LLVMBuildStore(b, LLVMConstInt(c->i64, 1, 0), sv);
+    LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), iv);
+    LLVMBuildStore(b, c->own_tbl, bv);
+    LLVMBuildStore(b, c->own_cnt, nv);
     LLVMBuildBr(b, head);
 
     LLVMPositionBuilderAtEnd(b, miss);
@@ -368,7 +398,9 @@ static void embed_emit_read_has_bytes(zan_irgen_t *g, struct embed_api_ctx *c,
 }
 
 /* const char* zan_embed_list(const char* prefix): the matching names joined by
- * '\n' in a lazily allocated buffer sized for this module's own table. */
+ * '\n' in a lazily allocated buffer. Iterates the two lookup slots (registered
+ * table first, then this module's own) and drops names the registered slot
+ * already produced, mirroring find's "registered wins duplicates" order. */
 static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMTypeRef args[] = { c->i8p };
     LLVMTypeRef fty = LLVMFunctionType(c->i8p, args, 1, 0);
@@ -384,6 +416,10 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMTypeRef sncmp_ty;
     LLVMValueRef strncmp_fn = embed_libc(g, "strncmp", c->i32, sncmp_args, 3,
                                          &sncmp_ty);
+    LLVMTypeRef scmp_args[] = { c->i8p, c->i8p };
+    LLVMTypeRef scmp_ty;
+    LLVMValueRef strcmp_fn = embed_libc(g, "strcmp", c->i32, scmp_args, 2,
+                                        &scmp_ty);
     LLVMTypeRef mcpy_args[] = { c->i8p, c->i8p, c->i64 };
     LLVMTypeRef mcpy_ty;
     LLVMValueRef memcpy_fn = embed_libc(g, "memcpy", c->i8p, mcpy_args, 3,
@@ -400,15 +436,28 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(g->ctx, fn, "head");
     LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(g->ctx, fn, "body");
     LLVMBasicBlockRef take = LLVMAppendBasicBlockInContext(g->ctx, fn, "take");
+    LLVMBasicBlockRef take2 = LLVMAppendBasicBlockInContext(g->ctx, fn, "take2");
+    LLVMBasicBlockRef dup = LLVMAppendBasicBlockInContext(g->ctx, fn, "dup");
+    LLVMBasicBlockRef dhead = LLVMAppendBasicBlockInContext(g->ctx, fn, "dhead");
+    LLVMBasicBlockRef dbody = LLVMAppendBasicBlockInContext(g->ctx, fn, "dbody");
     LLVMBasicBlockRef next = LLVMAppendBasicBlockInContext(g->ctx, fn, "next");
+    LLVMBasicBlockRef nextslot = LLVMAppendBasicBlockInContext(g->ctx, fn,
+                                                               "nextslot");
     LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
 
     LLVMPositionBuilderAtEnd(b, entry);
     LLVMValueRef prefix = LLVMGetParam(fn, 0);
     LLVMValueRef ia = LLVMBuildAlloca(b, c->i64, "i");
     LLVMValueRef oa = LLVMBuildAlloca(b, c->i64, "o");
+    LLVMValueRef bva = LLVMBuildAlloca(b, c->i8p, "b");
+    LLVMValueRef nva = LLVMBuildAlloca(b, c->i64, "n");
+    LLVMValueRef sva = LLVMBuildAlloca(b, c->i64, "slot");
+    LLVMValueRef ja = LLVMBuildAlloca(b, c->i64, "j");
     LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), ia);
     LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), oa);
+    LLVMBuildStore(b, LLVMBuildLoad2(b, c->i8p, c->gtbl, "tbl0"), bva);
+    LLVMBuildStore(b, LLVMBuildLoad2(b, c->i64, c->gcnt, "cnt0"), nva);
+    LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), sva);
     LLVMValueRef buf0 = LLVMBuildLoad2(b, c->i8p, c->gbuf, "buf0");
     LLVMBuildCondBr(b, LLVMBuildIsNull(b, buf0, "nobuf"), alloc, ready);
 
@@ -437,12 +486,12 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
 
     LLVMPositionBuilderAtEnd(b, head);
     LLVMValueRef i = LLVMBuildLoad2(b, c->i64, ia, "iv");
-    LLVMValueRef n = LLVMBuildLoad2(b, c->i64, c->gcnt, "n");
-    LLVMValueRef base = LLVMBuildLoad2(b, c->i8p, c->gtbl, "tbl");
+    LLVMValueRef n = LLVMBuildLoad2(b, c->i64, nva, "ncur");
+    LLVMValueRef base = LLVMBuildLoad2(b, c->i8p, bva, "bcur");
     LLVMValueRef more = LLVMBuildICmp(b, LLVMIntSLT, i, n, "more");
     LLVMValueRef ok = LLVMBuildAnd(b, more,
         LLVMBuildIsNotNull(b, base, "hastbl"), "go");
-    LLVMBuildCondBr(b, ok, body, done);
+    LLVMBuildCondBr(b, ok, body, nextslot);
 
     LLVMPositionBuilderAtEnd(b, body);
     i = LLVMBuildLoad2(b, c->i64, ia, "iv2");
@@ -465,7 +514,48 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
         LLVMConstInt(c->i32, 0, 0), "pmatch"), take, next);
 
     LLVMPositionBuilderAtEnd(b, take);
-    LLVMValueRef l = LLVMBuildCall2(b, slen_ty, strlen_fn, &nm, 1, "l");
+    /* In slot 0 (registered table) the name is emitted as-is; in slot 1 (own
+     * table) it is dropped when the registered table also carries it. */
+    LLVMValueRef s0 = LLVMBuildLoad2(b, c->i64, sva, "scur");
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, s0,
+        LLVMConstInt(c->i64, 0, 0), "is0"), take2, dup);
+
+    LLVMPositionBuilderAtEnd(b, dup);
+    LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), ja);
+    LLVMBuildBr(b, dhead);
+
+    LLVMPositionBuilderAtEnd(b, dhead);
+    LLVMValueRef j = LLVMBuildLoad2(b, c->i64, ja, "jv");
+    LLVMValueRef rn = LLVMBuildLoad2(b, c->i64, c->gcnt, "rcnt");
+    LLVMValueRef rtbl = LLVMBuildLoad2(b, c->i8p, c->gtbl, "rtbl");
+    LLVMValueRef dok = LLVMBuildAnd(b,
+        LLVMBuildICmp(b, LLVMIntSLT, j, rn, "jmore"),
+        LLVMBuildIsNotNull(b, rtbl, "rhastbl"), "rgo");
+    LLVMBuildCondBr(b, dok, dbody, take2);
+
+    LLVMPositionBuilderAtEnd(b, dbody);
+    j = LLVMBuildLoad2(b, c->i64, ja, "jv2");
+    LLVMValueRef rent = embed_entry_at(b, c, rtbl, j);
+    LLVMValueRef rnmp = LLVMBuildStructGEP2(b, c->ent_ty, rent, 0, "rnmp");
+    LLVMValueRef rnm = LLVMBuildLoad2(b, c->i8p, rnmp, "rnm");
+    LLVMValueRef req = LLVMBuildCall2(b, scmp_ty, strcmp_fn,
+        (LLVMValueRef[]){ rnm, nm }, 2, "req");
+    LLVMBasicBlockRef rmatch = LLVMAppendBasicBlockInContext(g->ctx, fn,
+                                                             "rmatch");
+    LLVMBuildCondBr(b, LLVMBuildAnd(b,
+        LLVMBuildIsNotNull(b, rnm, "rnonull"),
+        LLVMBuildICmp(b, LLVMIntEQ, req, LLVMConstInt(c->i32, 0, 0), "ris"),
+        "rdup"), next, rmatch);
+    LLVMPositionBuilderAtEnd(b, rmatch);
+    LLVMValueRef j2 = LLVMBuildLoad2(b, c->i64, ja, "jv3");
+    LLVMBuildStore(b, LLVMBuildAdd(b, j2, LLVMConstInt(c->i64, 1, 0), "j1"),
+                   ja);
+    LLVMBuildBr(b, dhead);
+
+    LLVMPositionBuilderAtEnd(b, take2);
+    LLVMValueRef l = LLVMBuildCall2(b, slen_ty, strlen_fn,
+        (LLVMValueRef[]){ nm }, 1, "l");
+
     LLVMValueRef o = LLVMBuildLoad2(b, c->i64, oa, "o");
     LLVMValueRef need = LLVMBuildAdd(b, LLVMBuildAdd(b, o, l, "ol"),
         LLVMConstInt(c->i64, 2, 0), "need");
@@ -488,6 +578,19 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMBuildStore(b, LLVMBuildAdd(b, i, LLVMConstInt(c->i64, 1, 0), "i1"), ia);
     LLVMBuildBr(b, head);
 
+    /* the current slot is exhausted: advance to slot 1 (own table) or stop */
+    LLVMPositionBuilderAtEnd(b, nextslot);
+    LLVMValueRef s = LLVMBuildLoad2(b, c->i64, sva, "sscur");
+    LLVMBasicBlockRef adv = LLVMAppendBasicBlockInContext(g->ctx, fn, "adv");
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, s,
+        LLVMConstInt(c->i64, 0, 0), "was0"), adv, done);
+    LLVMPositionBuilderAtEnd(b, adv);
+    LLVMBuildStore(b, LLVMConstInt(c->i64, 1, 0), sva);
+    LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), ia);
+    LLVMBuildStore(b, c->own_tbl, bva);
+    LLVMBuildStore(b, c->own_cnt, nva);
+    LLVMBuildBr(b, head);
+
     LLVMPositionBuilderAtEnd(b, done);
     LLVMValueRef oend = LLVMBuildLoad2(b, c->i64, oa, "oend");
     LLVMValueRef endp = LLVMBuildGEP2(b, c->i8, buf, &oend, 1, "endp");
@@ -496,7 +599,13 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMDisposeBuilder(b);
 }
 
-/* void zan_embed_register(const zan_embed_ent* tbl, long long n) */
+/* void zan_embed_register(const zan_embed_ent* tbl, long long n)
+ *
+ * Called by a generated data object's constructor (scripts/gen_embed.ps1).
+ * Stores the table in the registered slot (slot 0 of find/list); this module's
+ * own --embed table stays reachable in slot 1, so both groups remain visible.
+ * Re-registering the identical table is a no-op, so two ctors carrying the
+ * same object (a static archive pulled in twice) stay harmless. */
 static void embed_emit_register(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMTypeRef args[] = { c->i8p, c->i64 };
     LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), args, 2, 0);
@@ -504,7 +613,15 @@ static void embed_emit_register(zan_irgen_t *g, struct embed_api_ctx *c) {
     if (!fn) return;
     LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
     LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef same = LLVMAppendBasicBlockInContext(g->ctx, fn, "same");
+    LLVMBasicBlockRef store = LLVMAppendBasicBlockInContext(g->ctx, fn, "store");
     LLVMPositionBuilderAtEnd(b, bb);
+    LLVMValueRef cur = LLVMBuildLoad2(b, c->i8p, c->gtbl, "cur");
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, cur, LLVMGetParam(fn, 0),
+        "issame"), same, store);
+    LLVMPositionBuilderAtEnd(b, same);
+    LLVMBuildRetVoid(b);
+    LLVMPositionBuilderAtEnd(b, store);
     LLVMBuildStore(b, LLVMGetParam(fn, 0), c->gtbl);
     LLVMBuildStore(b, LLVMGetParam(fn, 1), c->gcnt);
     LLVMBuildRetVoid(b);
@@ -585,9 +702,9 @@ int zan_embed_emit_specs(zan_irgen_t *g, const char *const *specs, int count) {
     ents[files.n] = LLVMConstNamedStruct(ent_ty, nulls, 3);
 
     /* With nothing embedded the API is still emitted, with an empty table: a
-     * generated data object linked alongside (scripts/gen_embed.ps1) fills it
-     * in through zan_embed_register, and a program that merely calls the API
-     * reads empty and falls back to the filesystem. */
+     * generated data object linked alongside (scripts/gen_embed.ps1) fills
+     * the registered slot in through zan_embed_register, and a program that
+     * merely calls the API reads empty and falls back to the filesystem. */
     LLVMValueRef tbl0 = LLVMConstNull(i8p);
     if (files.n > 0) {
         LLVMTypeRef tbl_ty = LLVMArrayType(ent_ty, (unsigned)files.n + 1);
@@ -608,16 +725,19 @@ int zan_embed_emit_specs(zan_irgen_t *g, const char *const *specs, int count) {
     c.i32 = LLVMInt32TypeInContext(g->ctx);
     c.i64 = i64;
     c.ent_ty = ent_ty;
-    /* An externally registered table may hold longer names than this module's
-     * own; the list loop stops before it would run past the buffer. */
+    /* The registered slot starts EMPTY (a generated data object fills it in
+     * at startup); this module's own table lives in own_tbl/own_cnt. Two
+     * slots, no clobbering -- the bug that once made a skins-only generated
+     * object hide an --embed-baked assets catalog. */
     c.buf_cap = total_names + 4096;
     c.gtbl = LLVMAddGlobal(g->mod, i8p, "zan.embed.gtbl");
-    LLVMSetInitializer(c.gtbl, tbl0);
+    LLVMSetInitializer(c.gtbl, LLVMConstNull(i8p));
     LLVMSetLinkage(c.gtbl, LLVMInternalLinkage);
     c.gcnt = LLVMAddGlobal(g->mod, i64, "zan.embed.gcnt");
-    LLVMSetInitializer(c.gcnt,
-        LLVMConstInt(i64, (unsigned long long)files.n, 0));
+    LLVMSetInitializer(c.gcnt, LLVMConstInt(i64, 0, 0));
     LLVMSetLinkage(c.gcnt, LLVMInternalLinkage);
+    c.own_tbl = tbl0;
+    c.own_cnt = LLVMConstInt(i64, (unsigned long long)files.n, 0);
     c.gbuf = LLVMAddGlobal(g->mod, i8p, "zan.embed.gbuf");
     LLVMSetInitializer(c.gbuf, LLVMConstNull(i8p));
     LLVMSetLinkage(c.gbuf, LLVMInternalLinkage);
